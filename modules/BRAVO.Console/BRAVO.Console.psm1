@@ -479,14 +479,26 @@ function Write-BRAVOResultField {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Label,
-        [AllowEmptyString()][string]$Value
+        [AllowEmptyString()][string]$Value,
+
+        # Опційно: для полів на кшталт Dry Run "Готовність" (ГОТОВО ДО
+        # ЗАПУСКУ/НЕ ГОТОВО), яким, на відміну від решти domain-specific
+        # полів, потрібен той самий кольоровий акцент, що вже має "Статус"
+        # у Write-BRAVOResultHeader. $null (типове значення) — поведінка
+        # не змінюється для жодного наявного виклику.
+        [Nullable[ConsoleColor]]$Color
     )
 
     if (-not $script:BRAVOConsoleEnabled) {
         return
     }
     $paddedLabel = ("{0}:" -f $Label).PadRight($script:BRAVOResultLabelWidth)
-    Write-Host ("{0}{1}" -f $paddedLabel, $Value)
+    if ($null -ne $Color) {
+        Write-Host $paddedLabel -NoNewline
+        Write-Host $Value -ForegroundColor $Color
+    } else {
+        Write-Host ("{0}{1}" -f $paddedLabel, $Value)
+    }
 }
 
 # Довільний рядок прози всередині блоку РЕЗУЛЬТАТ — без "Підпис:" і без

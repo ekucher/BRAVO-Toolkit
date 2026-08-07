@@ -16,6 +16,13 @@ $null = Start-BRAVOHelperLog `
     -ConfigPath $ConfigPath `
     -QuietConsole:$AsJson
 
+# Імпортується тут, а не після завантаження BRAVO.config: Write-DryRunOutput
+# має вміти намалювати заголовок і РЕЗУЛЬТАТ навіть тоді, коли dry-run
+# провалився ще ДО завантаження конфігурації (єдиний try/catch нижче ловить
+# і цей випадок як звичайний [FAIL] запис).
+$dryRunConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.Console.psd1"
+Import-Module -Name $dryRunConsoleModulePath -ErrorAction Stop
+
 # Безпечна симуляція BRAVO/VETOFFICE:
 # - не створює архіви та каталоги;
 # - не копіює, не синхронізує і не видаляє файли;
@@ -480,26 +487,96 @@ function Write-DryRunOutput {
         return
     }
 
-    Write-Host ""
-    Write-Host "BRAVO — БЕЗПЕЧНИЙ ТЕСТОВИЙ ПРОГІН" -ForegroundColor Cyan
-    Write-Host "Жодні production-операції не виконувалися." -ForegroundColor DarkGray
+    Initialize-BRAVOConsole
+    # Dry-run не малює Write-Progress — без цього Write-BRAVOHeader резервує
+    # 6 порожніх рядків під прогрес-бар, якого тут немає.
+    Initialize-BRAVOProgress -Enabled $false
+
+    # $bravoSettings/$global:ScriptVersion можуть не існувати, якщо dry-run
+    # провалився ще ДО завантаження BRAVO.config (спільний catch вище ловить
+    # це як звичайний [FAIL] запис "Dry-run/Фатальна помилка") — заголовок
+    # має намалюватись і тоді, просто без назви установи.
+    $bravoSettingsVariable = Get-Variable -Name bravoSettings -ErrorAction SilentlyContinue
+    $dryRunInstitutionName = $null
+    $dryRunInstitutionCode = $null
+    if ($null -ne $bravoSettingsVariable -and $null -ne $bravoSettingsVariable.Value) {
+        $dryRunInstitutionName = [string]$bravoSettingsVariable.Value.InstitutionName
+        $dryRunInstitutionCode = [string]$bravoSettingsVariable.Value.InstitutionCode
+    }
+    $dryRunVersionText = if ($global:ScriptVersion) { [string]$global:ScriptVersion } else { 'невідома' }
+    Write-BRAVOHeader `
+        -Title ("BRAVO Dry Run {0}" -f $dryRunVersionText) `
+        -Institution $dryRunInstitutionName `
+        -InstitutionCode $dryRunInstitutionCode `
+        -Mode 'READ-ONLY'
+
+    # Dry Run зберігає власну семантику PASS/WARN/FAIL/PLAN
+    # (docs/OPERATOR_CONSOLE_UX.md §6) — не переводиться силоміць у
+    # Archive-style [N/M] OK/ERROR. Записи групуються за (Статус, Категорія)
+    # у порядку появи: одна перевірка на кшталт "Архівація" з трьома
+    # компонентами (MODEL/BLOG/BRAVOEXCH) — один заголовок [PLAN] Архівація
+    # і три деталі під ним, а не три однакові рядки поспіль.
+    $dryRunGroupOrder = New-Object System.Collections.Generic.List[object]
+    $dryRunGroupIndex = @{}
     foreach ($result in $script:dryRunResults) {
-        $color = switch ($result.Status) {
-            "PASS" { "Green" }
-            "WARN" { "Yellow" }
-            "FAIL" { "Red" }
-            default { "Cyan" }
+        $groupKey = "$($result.Status)|$($result.Category)"
+        if (-not $dryRunGroupIndex.ContainsKey($groupKey)) {
+            $group = [pscustomobject]@{
+                Status = $result.Status
+                Category = $result.Category
+                Entries = New-Object System.Collections.Generic.List[object]
+            }
+            $dryRunGroupIndex[$groupKey] = $group
+            $dryRunGroupOrder.Add($group)
         }
-        Write-Host ("[{0}] {1} / {2}: {3}" -f
-            $result.Status, $result.Category, $result.Name, $result.Detail) `
-            -ForegroundColor $color
+        $dryRunGroupIndex[$groupKey].Entries.Add($result)
+    }
+    $dryRunStatusColors = @{
+        PASS = [ConsoleColor]::Green
+        WARN = [ConsoleColor]::Yellow
+        FAIL = [ConsoleColor]::Red
+        PLAN = [ConsoleColor]::Cyan
+    }
+    Write-Host ''
+    foreach ($group in $dryRunGroupOrder) {
+        Write-Host ("[{0}] {1}" -f $group.Status, $group.Category) -ForegroundColor $dryRunStatusColors[$group.Status]
+        foreach ($entry in $group.Entries) {
+            $entryLine = if (-not [string]::IsNullOrWhiteSpace($entry.Name) -and $entry.Name -ne $group.Category) {
+                if ([string]::IsNullOrWhiteSpace($entry.Detail)) {
+                    $entry.Name
+                } else {
+                    "$($entry.Name): $($entry.Detail)"
+                }
+            } else {
+                $entry.Detail
+            }
+            Write-Host ("       {0}" -f $entryLine)
+        }
+        Write-Host ''
     }
 
-    $failures = @($script:dryRunResults | Where-Object { $_.Status -eq "FAIL" }).Count
-    $warnings = @($script:dryRunResults | Where-Object { $_.Status -eq "WARN" }).Count
-    Write-Host ""
-    Write-Host "Підсумок: помилок — $failures; попереджень — $warnings." `
-        -ForegroundColor $(if ($failures -gt 0) { "Red" } elseif ($warnings -gt 0) { "Yellow" } else { "Green" })
+    $passCount = @($script:dryRunResults | Where-Object { $_.Status -eq 'PASS' }).Count
+    $warnCount = @($script:dryRunResults | Where-Object { $_.Status -eq 'WARN' }).Count
+    $failCount = @($script:dryRunResults | Where-Object { $_.Status -eq 'FAIL' }).Count
+    $planCount = @($script:dryRunResults | Where-Object { $_.Status -eq 'PLAN' }).Count
+    # Контракт незмінний: FAIL > 0 -> "НЕ ГОТОВО" і process exit code
+    # лишається ненульовим (обчислюється нижче, поза цією функцією, так
+    # само, як і раніше).
+    $dryRunReadiness = if ($failCount -gt 0) { 'НЕ ГОТОВО' } else { 'ГОТОВО ДО ЗАПУСКУ' }
+    $dryRunReadinessColor = if ($failCount -gt 0) { [ConsoleColor]::Red } else { [ConsoleColor]::Green }
+
+    Write-BRAVOSeparator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-BRAVOSeparator
+    Write-BRAVOResultField -Label 'Готовність' -Value $dryRunReadiness -Color $dryRunReadinessColor
+    Write-BRAVOResultBlankLine
+    Write-BRAVOResultField -Label 'PASS' -Value ([string]$passCount)
+    Write-BRAVOResultField -Label 'WARN' -Value ([string]$warnCount)
+    Write-BRAVOResultField -Label 'FAIL' -Value ([string]$failCount)
+    Write-BRAVOResultField -Label 'PLAN' -Value ([string]$planCount)
+    Write-BRAVOResultBlankLine
+    Write-BRAVOResultNote -Text 'Production-операції не виконувались.'
+    Write-BRAVOSeparator
 }
 
 try {
