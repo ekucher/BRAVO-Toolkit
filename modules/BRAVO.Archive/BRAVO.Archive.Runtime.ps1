@@ -818,7 +818,8 @@ function Write-BRAVOArchiveStep {
         [Parameter(Mandatory = $true)][string]$Name,
         [ValidateSet('OK', 'SKIPPED', 'WARNING', 'ERROR')]
         [string]$Status = 'OK',
-        [string]$Details
+        [string]$Details,
+        [Nullable[timespan]]$Duration
     )
 
     $script:BRAVOStepCurrent++
@@ -827,7 +828,8 @@ function Write-BRAVOArchiveStep {
         -Total $script:BRAVOStepTotal `
         -Name $Name `
         -Status $Status `
-        -Details $Details
+        -Details $Details `
+        -Duration $Duration
 }
 
 function Show-RunningProgress {
@@ -1455,7 +1457,14 @@ function New-Archive {
         [string]$ArcPath,
         [string]$ArcParams
     )
-    
+
+    # Причина відмови для консольного РЕЗУЛЬТАТ (Причина:/Інструмент:/Код
+    # інструменту:) — New-Archive повертає лише bool, тому деталі
+    # передаються через script-scope, а не через розширення контракту
+    # повернення (BAZA_APP.Sync-Folders/сотні інших викликів так само
+    # читають лише true/false, міняти контракт довелося б скрізь).
+    $script:lastArchiveToolFailure = $null
+
     Write-BRAVOLog -Component 'ARCHIVE' -Message "Створення архiву: $ArchiveName"
     
     $archiveDir = Split-Path $ArchivePath -Parent
@@ -1579,9 +1588,14 @@ function New-Archive {
                 Remove-Item -LiteralPath $fullArchivePath -Force -ErrorAction SilentlyContinue
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Неповний архiв видалено: $fullArchivePath" -Level "WARNING"
             }
+            $script:lastArchiveToolFailure = [pscustomobject]@{
+                Tool = '7-Zip'
+                ToolExitCodeText = $null
+                ReasonText = '7-Zip: перевищено час очікування'
+            }
             return $false
         }
-        
+
         if ($process.ExitCode -eq 0) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено; виконується контроль цiлiсностi: $fullArchivePath" -Level "INFO"
             if (Test-SevenZipArchiveIntegrity `
@@ -1594,10 +1608,15 @@ function New-Archive {
                 return $true
             }
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Пошкоджений або неперевiрений архiв залишено для дiагностики; hash i передача не виконуватимуться: $fullArchivePath" -Level "ERROR"
+            $script:lastArchiveToolFailure = [pscustomobject]@{
+                Tool = '7-Zip'
+                ToolExitCodeText = $null
+                ReasonText = "7-Zip: архів створено, але не пройшов перевірку цілісності"
+            }
             return $false
         } else {
-            $exitDescription = Get-BRAVOSevenZipExitCodeDescription -ExitCode $process.ExitCode
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $exitDescription): $fullArchivePath" -Level "ERROR"
+            $toolExitInfo = Get-BRAVOToolExitCodeDescription -Tool '7-Zip' -ExitCode $process.ExitCode
+            Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $($toolExitInfo.OperatorDescription)): $fullArchivePath" -Level "ERROR"
             Write-SevenZipFailureDiagnostics -Operation "Дiагностика 7-Zip create" -StandardOutput $standardOutput -StandardError $errorOutput
             if ($showSevenZipProgress) {
                 if (-not [string]::IsNullOrWhiteSpace($lastSevenZipOutput)) {
@@ -1608,6 +1627,11 @@ function New-Archive {
                 }
             } else {
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Деталi: $errorOutput" -Level "DEBUG"
+            }
+            $script:lastArchiveToolFailure = [pscustomobject]@{
+                Tool = '7-Zip'
+                ToolExitCodeText = "{0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
+                ReasonText = "7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
             }
             return $false
         }
@@ -3526,6 +3550,7 @@ function Main {
         -Title ("BRAVO ARCHIVE {0}" -f $ScriptVersion) `
         -Institution ([string]$bravoSettings.InstitutionName) `
         -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+        -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
         -StartedAt $scriptStartTime
 
     $processLockResult = Enter-BRAVOArchiveProcessLock
@@ -3934,6 +3959,7 @@ function Main {
         $archiveStepStarted = Get-Date
         $success = $false
         $vssSnapshot = $null
+        $script:lastArchiveToolFailure = $null
         try {
             $vssSnapshot = New-BRAVOVSSSnapshot -SourcePath $archive.Source
             $success = New-Archive `
@@ -3952,7 +3978,7 @@ function Main {
                 }
             }
         }
-        
+
         if ($success) {
             Write-Log "==="
             Write-Log "=== СТВОРЕННЯ ХЕШУ $($archive.Type) ==="
@@ -3972,21 +3998,23 @@ function Main {
             $results[$archive.Type] = @{
                 ArchiveSuccess = $false
                 HashSuccess = $false
+                # Per-компонент, а не єдина script-scope змінна: якщо
+                # відмовить кілька компонентів поспіль, фінальний РЕЗУЛЬТАТ
+                # має показати причину САМЕ першого відмовленого, а не
+                # випадково останню з циклу.
+                ToolFailure = $script:lastArchiveToolFailure
             }
         }
 
-        # Розмір і тривалість показуємо в консолі коротко; повні шляхи,
-        # аргументи 7-Zip і його вивід лишаються в журналі.
+        # Розмір показуємо в консолі коротко (component-блок нижче); повні
+        # шляхи, аргументи 7-Zip і його вивід лишаються в журналі.
         $archiveStepDuration = (Get-Date) - $archiveStepStarted
-        $archiveStepDetails = $archiveStepDuration.ToString($durationFormat)
         $sizeAnomalyResult = $null
+        $createdArchiveSize = $null
         if ($success) {
             $createdArchivePath = Join-Path $archive.Destination $archiveName
             if (Test-Path -LiteralPath $createdArchivePath -PathType Leaf) {
                 $createdArchiveSize = (Get-Item -LiteralPath $createdArchivePath).Length
-                $archiveStepDetails = "{0} / {1}" -f
-                    (Format-BRAVOFileSize -Bytes $createdArchiveSize),
-                    $archiveStepDuration.ToString($durationFormat)
 
                 # AUD-008 (аудит P1.6): sanity-check обсягу — технічно
                 # валідний архів все одно може бути підозріло малим через
@@ -4024,13 +4052,33 @@ function Main {
         } else {
             'OK'
         }
-        if ($null -ne $sizeAnomalyResult -and [bool]$sizeAnomalyResult.IsAnomaly) {
-            $archiveStepDetails = "$archiveStepDetails — $($sizeAnomalyResult.Reason)"
-        }
         Write-BRAVOArchiveStep `
             -Name ("Архівація {0}" -f $archive.Type) `
             -Status $archiveStepStatus `
-            -Details $archiveStepDetails
+            -Duration $archiveStepDuration
+
+        # Component-деталі (docs/OPERATOR_CONSOLE_UX.md §2): показуються
+        # ЛИШЕ коли artifact реально створено — SHA512/Integrity ніколи не
+        # OK, якщо відповідна перевірка не виконувалась. New-Archive
+        # повертає $true лише коли й 7-Zip exit code 0, і post-create
+        # integrity test пройдено — тому "Integrity: OK" тут завжди
+        # правдиве, а не оптимістичний здогад.
+        if ($success) {
+            Write-BRAVOConsoleDetail -Message ("Архів:".PadRight(11) + $archiveName)
+            Write-BRAVOConsoleDetail -Message ("Розмір:".PadRight(11) + (Format-BRAVOFileSize -Bytes $createdArchiveSize))
+            Write-BRAVOConsoleDetail -Message ("SHA512:".PadRight(11) + $(if ($hashSuccess) { 'OK' } else { 'FAILED' }))
+            Write-BRAVOConsoleDetail -Message ("Integrity:".PadRight(11) + 'OK')
+            if ($null -ne $sizeAnomalyResult -and [bool]$sizeAnomalyResult.IsAnomaly) {
+                Write-BRAVOOperatorReason -Reason $sizeAnomalyResult.Reason
+            }
+        } else {
+            $failureReason = if ($null -ne $script:lastArchiveToolFailure) {
+                $script:lastArchiveToolFailure.ReasonText
+            } else {
+                "не вдалося створити архів $($archive.Type)"
+            }
+            Write-BRAVOOperatorReason -Reason $failureReason -Details ("Не вдалося створити архів {0}" -f $archive.Type)
+        }
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
     
@@ -4398,31 +4446,26 @@ function Main {
     } else {
         'УСПІШНО'
     }
-    $summaryMetrics = New-Object System.Collections.Specialized.OrderedDictionary
-    $summaryMetrics.Add('Архівів створено', ("{0} з {1}" -f $successCount, $totalCount))
-    if ($sftpTransferEnabled) {
-        $summaryMetrics.Add('Передача на SFTP', $(if ($sftpStepFailed) { 'з помилками' } else { 'виконано' }))
+    $summaryStatusColor = switch ($summaryResult) {
+        'УСПІШНО'  { 'Green' }
+        'ЧАСТКОВО' { 'Yellow' }
+        default    { 'Red' }
     }
-    if ($smbArchiveCopyEnabled) {
-        $summaryMetrics.Add('Копіювання на NAS/SMB', $(if ($smbStepFailed) { 'з помилками' } else { 'виконано' }))
-    }
-    $summaryMetrics.Add('Попереджень', [string]$logStatistics.Warnings)
-    $summaryMetrics.Add('Помилок', [string]$logStatistics.Errors)
-    Write-BRAVOSummary `
-        -Result $summaryResult `
-        -Duration $duration `
-        -Metrics $summaryMetrics `
-        -LogFile $script:logFile
+
+    # Код завершення в консолі має завжди збігатися з фактичним process
+    # exit code (docs/MANUAL_RUN_CONSOLE_UX.md) — тому обчислюємо його ДО
+    # друку РЕЗУЛЬТАТ, а не після, як було раніше (Write-BRAVOSummary тоді
+    # ще не міг показати код: він з'являвся лише нижче за течією).
+    $anyLocalArchiveFailed = @(
+        $results.Values | Where-Object { -not $_.ArchiveSuccess }
+    ).Count -gt 0
+    $anyIntegrityTestFailed = @(
+        $results.Values | Where-Object { $_.ArchiveSuccess -and -not $_.HashSuccess }
+    ).Count -gt 0
     if ($operationFailed) {
         # Один раз, тут, читаємо вже наявний стан секцій Main і визначаємо
         # найпріоритетнішу категорію відмови — жодна з ~26 точок
         # $operationFailed = $true вище не редагувалась.
-        $anyLocalArchiveFailed = @(
-            $results.Values | Where-Object { -not $_.ArchiveSuccess }
-        ).Count -gt 0
-        $anyIntegrityTestFailed = @(
-            $results.Values | Where-Object { $_.ArchiveSuccess -and -not $_.HashSuccess }
-        ).Count -gt 0
         $script:processExitCode = Resolve-BRAVOExitCode `
             -InvalidConfiguration:(-not $sftpConfigurationValid -or -not $smbConfigurationValid -or -not $archiveConsistencyValid) `
             -CredentialsUnavailable:(-not $archiveCredentialValid) `
@@ -4434,6 +4477,84 @@ function Main {
     } elseif ($logStatistics.Warnings -gt 0) {
         $script:processExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
+
+    # Причина/Інструмент/Код інструменту показуються лише коли головний
+    # результат дійсно спричинений конкретним локальним компонентом
+    # (docs/MANUAL_RUN_CONSOLE_UX.md) — перший відмовлений компонент за
+    # стабільним порядком archiveDefinitions, не випадковий "останній".
+    $firstFailedComponent = $null
+    if ($anyLocalArchiveFailed -or $anyIntegrityTestFailed) {
+        $firstFailedComponent = $archiveDefinitions | Where-Object {
+            $results.ContainsKey($_.Type) -and -not $results[$_.Type].ArchiveSuccess
+        } | Select-Object -First 1
+    }
+    $summaryReason = $null
+    $summaryTool = $null
+    $summaryToolExitCode = $null
+    if ($null -ne $firstFailedComponent) {
+        $summaryReason = "Не вдалося створити архів {0}" -f $firstFailedComponent.Type
+        $toolFailure = $results[$firstFailedComponent.Type].ToolFailure
+        if ($null -ne $toolFailure) {
+            $summaryTool = $toolFailure.Tool
+            $summaryToolExitCode = $toolFailure.ToolExitCodeText
+        }
+    } elseif ([bool]$sftpStepFailed -and -not $operationFailed) {
+        # sftpStepFailed сам по собі не завжди означає $operationFailed
+        # (наприклад, коли health-check пізніше "перекрив" його власною
+        # помилкою) — тут лише типовий випадок "локально все ок, SFTP ні".
+        $summaryReason = "Не вдалося передати архіви на SFTP"
+    }
+
+    Write-BRAVOResultHeader `
+        -Status $summaryResult `
+        -StatusColor $summaryStatusColor `
+        -ExitCode $script:processExitCode `
+        -ExitCodeName (Get-BRAVOExitCodeName -Code $script:processExitCode) `
+        -Reason $summaryReason `
+        -Tool $summaryTool `
+        -ToolExitCode $summaryToolExitCode
+    Write-BRAVOResultField -Label 'Початок' -Value $scriptStartTime.ToString('dd.MM.yyyy HH:mm:ss')
+    Write-BRAVOResultField -Label 'Завершення' -Value $scriptEndTime.ToString('dd.MM.yyyy HH:mm:ss')
+    Write-BRAVOResultField -Label 'Тривалість' -Value (Format-BRAVODuration -Duration $duration)
+    Write-Host ''
+    Write-BRAVOResultField -Label 'Створено архівів' -Value ("{0} з {1}" -f $successCount, $totalCount)
+    # Measure-Object -Property не резолвить ключі Hashtable через reflection
+    # (results зберігає @{...}, не [pscustomobject]) — тому спершу проєктуємо
+    # значення через ForEach-Object, і лише готові числа йдуть у Measure-Object.
+    $totalCreatedBytes = (
+        $results.Values |
+            Where-Object { $_.ArchiveSuccess -and $null -ne $_.Bytes } |
+            ForEach-Object { $_.Bytes } |
+            Measure-Object -Sum
+    ).Sum
+    Write-BRAVOResultField -Label 'Загальний розмір' -Value (Format-BRAVOFileSize -Bytes $totalCreatedBytes)
+    if ($sftpTransferEnabled) {
+        Write-BRAVOResultField -Label 'Передача на SFTP' -Value $(if ($sftpStepFailed) { 'з помилками' } else { 'виконано' })
+    }
+    if ($smbArchiveCopyEnabled) {
+        Write-BRAVOResultField -Label 'Копіювання на NAS/SMB' -Value $(if ($smbStepFailed) { 'з помилками' } else { 'виконано' })
+    }
+
+    # Архіви: усі заплановані компоненти в стабільному порядку
+    # archiveDefinitions — успішний component показує розмір і повний
+    # шлях окремим рядком, невдалий — ERROR без вигаданого шляху.
+    if ($archiveDefinitions.Count -gt 0) {
+        Write-BRAVOResultSection -Title 'Архіви'
+        foreach ($definition in $archiveDefinitions) {
+            if (-not [bool]$definition.Enabled) {
+                continue
+            }
+            $componentResult = $results[$definition.Type]
+            if ($null -ne $componentResult -and [bool]$componentResult.ArchiveSuccess) {
+                Write-Host ("  {0,-12}{1}" -f $definition.Type, (Format-BRAVOFileSize -Bytes $componentResult.Bytes))
+                Write-Host ("    {0}" -f $componentResult.ArchivePath)
+            } else {
+                Write-Host ("  {0,-12}ERROR" -f $definition.Type)
+                Write-Host ("    Архів не створено")
+            }
+        }
+    }
+    Write-BRAVOResultFooter -LogFile $script:logFile
 }
 
 # Запуск головної функції
