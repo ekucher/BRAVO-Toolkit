@@ -56,6 +56,45 @@ function Add-RestoreDrillResult {
     })
 }
 
+# Операторська консоль (docs/OPERATOR_CONSOLE_UX.md §4) — суто рендер поверх
+# уже зібраного Add-RestoreDrillResult; -AsJson не викликає цю функцію
+# взагалі, тому JSON-контракт (-ResultPath/stdout) лишається незмінним.
+function Write-BRAVORestoreDrillStep {
+    param(
+        [Parameter(Mandatory = $true)][int]$Current,
+        [Parameter(Mandatory = $true)][int]$Total,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][ValidateSet('PASS', 'WARN', 'FAIL')][string]$Status,
+        [Nullable[double]]$DurationSeconds,
+        [string]$ArchiveName,
+        [Nullable[bool]]$IntegrityOk,
+        [Nullable[int]]$ExtractedFileCount,
+        [Nullable[int]]$ExtractedDirectoryCount,
+        [string]$Reason
+    )
+
+    $duration = if ($null -ne $DurationSeconds) { [timespan]::FromSeconds($DurationSeconds) } else { $null }
+    Write-BRAVOStepResult -Current $Current -Total $Total -Name $Name -Status $Status -Duration $duration
+
+    # SHA512 тут завжди "OK": Find-BRAVOLatestVerifiedArchive вже перевірив
+    # sidecar-хеш ДО того, як ця функція взагалі дізналась про ArchiveName
+    # — інакше компонент потрапив би у WARN "жодного backup" без імені файлу.
+    if (-not [string]::IsNullOrWhiteSpace($ArchiveName)) {
+        Write-BRAVOConsoleDetail -Message ("Архів:     {0}" -f $ArchiveName)
+        Write-BRAVOConsoleDetail -Message 'SHA512:    OK'
+    }
+    if ($null -ne $IntegrityOk) {
+        Write-BRAVOConsoleDetail -Message ("Integrity: {0}" -f $(if ($IntegrityOk) { 'OK' } else { 'FAIL' }))
+    }
+    if ($null -ne $ExtractedFileCount) {
+        Write-BRAVOConsoleDetail -Message ("Розпаковано: {0} файлів / {1} каталогів" -f $ExtractedFileCount, $ExtractedDirectoryCount)
+    }
+    if ($Status -ne 'PASS' -and -not [string]::IsNullOrWhiteSpace($Reason)) {
+        Write-BRAVOOperatorReason -Reason $Reason
+    }
+    Write-BRAVOResultBlankLine
+}
+
 function Set-BRAVORestoreDrillDirectoryAcl {
     # Той самий патерн, що BRAVO_TASKS_DIAGNOSE.ps1 використовує для своїх
     # ізольованих робочих каталогів: лише SYSTEM і Administrators.
@@ -150,7 +189,7 @@ try {
     $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
     $configRoot = Split-Path $resolvedConfigPath -Parent
 
-    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes')) {
+    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console')) {
         $modulePath = Join-Path $configRoot "modules\$moduleName\$moduleName.psd1"
         if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
             throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -190,10 +229,29 @@ try {
         ($Component -eq "All" -or [string]$_.Type -eq $Component)
     })
 
+    # Заголовок друкується один раз, одразу як відомо, скільки компонентів
+    # реально перевірятиметься — той самий каркас, що Archive/Health
+    # (docs/OPERATOR_CONSOLE_UX.md §1). -AsJson лишається повністю тихим,
+    # як і раніше (жодного виклику BRAVO.Console нижче в цій гілці).
+    if (-not $AsJson) {
+        Initialize-BRAVOConsole
+        # Restore Test не малює Write-Progress — без цього Write-BRAVOHeader
+        # резервує 6 порожніх рядків під прогрес-бар, якого тут немає.
+        Initialize-BRAVOProgress -Enabled $false
+        Write-BRAVOHeader `
+            -Title ("BRAVO Restore Test {0}" -f $global:ScriptVersion) `
+            -Institution ([string]$bravoSettings.InstitutionName) `
+            -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+            -Mode 'READ-ONLY / ISOLATED RESTORE'
+    }
+
     if ($componentsToCheck.Count -eq 0) {
         Add-RestoreDrillResult WARN $Component $null $null 0 0 (
             "жодного увімкненого компонента для перевірки (Component='$Component')"
         )
+        if (-not $AsJson) {
+            Write-BRAVOOperatorReason -Reason "Жодного увімкненого компонента для перевірки (Component='$Component')"
+        }
     }
 
     $drillRoot = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "BRAVO\RestoreDrill"
@@ -201,7 +259,9 @@ try {
         [void](New-Item -ItemType Directory -Path $drillRoot -Force)
     }
 
+    $restoreDrillStepCurrent = 0
     foreach ($archiveDefinition in $componentsToCheck) {
+        $restoreDrillStepCurrent++
         $componentName = [string]$archiveDefinition.Type
         $destinationDir = [string]$archiveDefinition.Destination
         $latestArchive = Find-BRAVOLatestVerifiedArchive `
@@ -213,6 +273,12 @@ try {
             Add-RestoreDrillResult WARN $componentName $null $null 0 0 (
                 "жодного backup із коректним .sha512 не знайдено в '$destinationDir' — restore drill неможливий"
             )
+            if (-not $AsJson) {
+                Write-BRAVORestoreDrillStep `
+                    -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
+                    -Name $componentName -Status WARN `
+                    -Reason "Жодного backup із коректним .sha512 не знайдено в '$destinationDir'"
+            }
             continue
         }
 
@@ -228,9 +294,17 @@ try {
                 -Password $archivePassword `
                 -TimeoutSeconds $TimeoutSeconds
             if (-not $integrityOk) {
+                $integrityDurationSeconds = ((Get-Date) - $startedAt).TotalSeconds
                 Add-RestoreDrillResult FAIL $componentName $latestArchive.Name (
-                    ((Get-Date) - $startedAt).TotalSeconds
+                    $integrityDurationSeconds
                 ) 0 0 "7za t (перевірка цілісності) не пройдено"
+                if (-not $AsJson) {
+                    Write-BRAVORestoreDrillStep `
+                        -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
+                        -Name $componentName -Status FAIL -DurationSeconds $integrityDurationSeconds `
+                        -ArchiveName $latestArchive.Name -IntegrityOk $false `
+                        -Reason '7za t (перевірка цілісності) не пройдено'
+                }
                 continue
             }
 
@@ -241,9 +315,17 @@ try {
                 -ExtractDirectory $workingDirectory `
                 -TimeoutSeconds $TimeoutSeconds
             if (-not $extractionResult.Success) {
+                $extractionDurationSeconds = ((Get-Date) - $startedAt).TotalSeconds
                 Add-RestoreDrillResult FAIL $componentName $latestArchive.Name (
-                    ((Get-Date) - $startedAt).TotalSeconds
+                    $extractionDurationSeconds
                 ) 0 0 "розпакування не вдалося: $($extractionResult.Description)"
+                if (-not $AsJson) {
+                    Write-BRAVORestoreDrillStep `
+                        -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
+                        -Name $componentName -Status FAIL -DurationSeconds $extractionDurationSeconds `
+                        -ArchiveName $latestArchive.Name -IntegrityOk $true `
+                        -Reason "Розпакування не вдалося: $($extractionResult.Description)"
+                }
                 continue
             }
 
@@ -256,16 +338,39 @@ try {
                     $extractedFiles.Count $extractedDirectories.Count (
                     "розпаковано лише $($extractedFiles.Count) файл(ів), очікувалося щонайменше $MinimumFileCount — можлива архівація не того джерела"
                 )
+                if (-not $AsJson) {
+                    Write-BRAVORestoreDrillStep `
+                        -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
+                        -Name $componentName -Status FAIL -DurationSeconds $durationSeconds `
+                        -ArchiveName $latestArchive.Name -IntegrityOk $true `
+                        -ExtractedFileCount $extractedFiles.Count -ExtractedDirectoryCount $extractedDirectories.Count `
+                        -Reason "Розпаковано лише $($extractedFiles.Count) файл(ів), очікувалося щонайменше $MinimumFileCount"
+                }
             } else {
                 Add-RestoreDrillResult PASS $componentName $latestArchive.Name $durationSeconds `
                     $extractedFiles.Count $extractedDirectories.Count (
                     "успішно розпаковано й перевірено"
                 )
+                if (-not $AsJson) {
+                    Write-BRAVORestoreDrillStep `
+                        -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
+                        -Name $componentName -Status PASS -DurationSeconds $durationSeconds `
+                        -ArchiveName $latestArchive.Name -IntegrityOk $true `
+                        -ExtractedFileCount $extractedFiles.Count -ExtractedDirectoryCount $extractedDirectories.Count
+                }
             }
         } catch {
+            $catchDurationSeconds = ((Get-Date) - $startedAt).TotalSeconds
             Add-RestoreDrillResult FAIL $componentName $latestArchive.Name (
-                ((Get-Date) - $startedAt).TotalSeconds
+                $catchDurationSeconds
             ) 0 0 $_.Exception.Message
+            if (-not $AsJson) {
+                Write-BRAVORestoreDrillStep `
+                    -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
+                    -Name $componentName -Status FAIL -DurationSeconds $catchDurationSeconds `
+                    -ArchiveName $latestArchive.Name `
+                    -Reason $_.Exception.Message
+            }
         } finally {
             if (Test-Path -LiteralPath $workingDirectory) {
                 Remove-Item -LiteralPath $workingDirectory -Recurse -Force -ErrorAction SilentlyContinue
@@ -314,25 +419,45 @@ try {
         [IO.File]::WriteAllText($ResultPath, $jsonResult, (New-Object System.Text.UTF8Encoding($false)))
     }
 
-    if ($AsJson) {
-        $script:restoreDrillResults | ConvertTo-Json -Depth 5 | Write-Output
-    } else {
-        foreach ($result in $script:restoreDrillResults) {
-            $color = switch ($result.Status) {
-                "PASS" { "Green" }
-                "WARN" { "Yellow" }
-                "FAIL" { "Red" }
-                default { "White" }
-            }
-            Write-Host "[$($result.Status)] $($result.Component) $($result.ArchiveName): $($result.Detail)" -ForegroundColor $color
-        }
-    }
-
+    # Код завершення обчислюється ДО друку підсумку (той самий принцип, що
+    # в Archive/Health) — сама умова не змінена, лише перенесена вище.
     $failureCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "FAIL" }).Count
     $warningCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "WARN" }).Count
+    $passCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "PASS" }).Count
     $exitCode = Resolve-BRAVOExitCode `
         -IntegrityTestFailed:($failureCount -gt 0) `
         -HasWarnings:($warningCount -gt 0 -and $failureCount -eq 0)
+
+    if ($AsJson) {
+        $script:restoreDrillResults | ConvertTo-Json -Depth 5 | Write-Output
+    } else {
+        $restoreDrillStatus = if ($failureCount -gt 0) { 'ПОМИЛКА' } elseif ($warningCount -gt 0) { 'ЧАСТКОВО' } else { 'УСПІШНО' }
+        $restoreDrillStatusColor = switch ($restoreDrillStatus) {
+            'УСПІШНО'  { [ConsoleColor]::Green }
+            'ЧАСТКОВО' { [ConsoleColor]::Yellow }
+            default    { [ConsoleColor]::Red }
+        }
+        Write-BRAVOResultHeader `
+            -Status $restoreDrillStatus `
+            -StatusColor $restoreDrillStatusColor `
+            -ExitCode $exitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $exitCode)
+        $totalChecked = [Math]::Max($componentsToCheck.Count, $script:restoreDrillResults.Count)
+        Write-BRAVOResultField -Label 'Перевірено' -Value ("{0} з {1}" -f $script:restoreDrillResults.Count, $totalChecked)
+        Write-BRAVOResultField -Label 'PASS' -Value ([string]$passCount)
+        Write-BRAVOResultField -Label 'WARN' -Value ([string]$warningCount)
+        Write-BRAVOResultField -Label 'FAIL' -Value ([string]$failureCount)
+        Write-BRAVOResultBlankLine
+        if ($failureCount -gt 0) {
+            Write-BRAVOResultNote -Text ("Restore test виявив проблеми з відновленням {0} з {1} компонентів." -f $failureCount, $totalChecked)
+        } elseif ($warningCount -gt 0) {
+            Write-BRAVOResultNote -Text 'Restore test не зміг перевірити частину компонентів (немає верифікованого backup).'
+        } else {
+            Write-BRAVOResultNote -Text 'Restore test підтвердив можливість розпакування резервних копій.'
+        }
+        Write-BRAVOResultNote -Text 'Production-дані не змінювались.'
+        Write-BRAVOResultFooter
+    }
     Complete-BRAVOHelperLog -ExitCode $exitCode
 } catch {
     Write-Host "ПОМИЛКА: $($_.Exception.Message)" -ForegroundColor Red

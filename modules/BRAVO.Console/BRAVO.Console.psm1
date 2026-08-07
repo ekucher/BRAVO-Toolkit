@@ -27,6 +27,9 @@ $script:BRAVOConsoleStatusColors = @{
     SKIPPED = 'DarkGray'
     WARNING = 'Yellow'
     ERROR   = 'Red'
+    PASS    = 'Green'
+    WARN    = 'Yellow'
+    FAIL    = 'Red'
 }
 
 function Initialize-BRAVOConsole {
@@ -260,7 +263,7 @@ function Write-BRAVOStepResult {
         [Parameter(Mandatory = $true)][int]$Total,
         [Parameter(Mandatory = $true)][string]$Name,
 
-        [ValidateSet('RUNNING', 'OK', 'SKIPPED', 'WARNING', 'ERROR', 'PASS', 'FAIL')]
+        [ValidateSet('RUNNING', 'OK', 'SKIPPED', 'WARNING', 'ERROR', 'PASS', 'WARN', 'FAIL')]
         [string]$Status = 'OK',
 
         # Сумісність зі старими викликами: короткий текст одразу за статусом
@@ -486,6 +489,19 @@ function Write-BRAVOResultField {
     Write-Host ("{0}{1}" -f $paddedLabel, $Value)
 }
 
+# Довільний рядок прози всередині блоку РЕЗУЛЬТАТ — без "Підпис:" і без
+# відступу (наприклад, "Production-дані не змінювались." у Restore Test,
+# "Production-операції не виконувались." у Dry Run, docs/OPERATOR_CONSOLE_UX.md).
+function Write-BRAVOResultNote {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host $Text
+}
+
 # Відкриває фінальний блок РЕЗУЛЬТАТ: роздільники, Статус (кольоровий,
 # домен сам вирішує колір — словник статусів надто різний між Archive
 # ("УСПІШНО"), Restore Test ("PASS: 3"), Dry Run ("ГОТОВО ДО ЗАПУСКУ") тощо,
@@ -690,6 +706,7 @@ Export-ModuleMember -Function @(
     'Write-BRAVOError',
     'Write-BRAVOSummary',
     'Write-BRAVOResultField',
+    'Write-BRAVOResultNote',
     'Write-BRAVOResultBlankLine',
     'Write-BRAVOResultHeader',
     'Write-BRAVOResultSection',
