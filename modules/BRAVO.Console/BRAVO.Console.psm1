@@ -335,8 +335,10 @@ function Write-BRAVOOperatorReason {
 }
 
 # Пояснення для SKIPPED-етапу: окремий рядок без "Причина:"-підпису, з
-# порожнім рядком перед ним (docs/MANUAL_RUN_CONSOLE_UX.md, приклад SKIPPED
-# — на відміну від WARNING/ERROR, де "Причина:" йде одразу без відступу).
+# порожнім рядком перед ним — БЕЗ додаткового відступу перед текстом
+# (живий прогін показав, що 6-пробільний відступ Write-BRAVOConsoleDetail
+# тут зайвий: SKIPPED і так не претендує на вкладеність під WARNING/ERROR
+# "Причина:"/"Деталі:", які саме тому й мають свій відступ).
 function Write-BRAVOSkipReason {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$Reason)
@@ -345,7 +347,7 @@ function Write-BRAVOSkipReason {
         return
     }
     Write-Host ''
-    Write-BRAVOConsoleDetail -Message $Reason
+    Write-Host $Reason -ForegroundColor DarkGray
 }
 
 function Write-BRAVOConsoleDetail {
