@@ -46,6 +46,12 @@ $null = Start-BRAVOHelperLog `
     -ConfigPath $ConfigPath `
     -QuietConsole:$protectedWorkerMode
 
+# Лише для нового неінтерактивного заголовка/РЕЗУЛЬТАТ нижче — інтерактивне
+# меню (Show-BRAVOCredentialMenu) лишається на власному Clear-Host-банері,
+# не мігрується (докладніше — коментар біля використання).
+$credentialsConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.Console.psd1"
+Import-Module -Name $credentialsConsoleModulePath -ErrorAction Stop
+
 $interactiveMenuRequested = (
     -not $PSBoundParameters.ContainsKey("Action") -and
     -not $PSBoundParameters.ContainsKey("Component") -and
@@ -720,6 +726,115 @@ function Write-OperationResults {
     }
 }
 
+# Фінальний РЕЗУЛЬТАТ неінтерактивного шляху (docs/OPERATOR_CONSOLE_UX.md
+# §8) — Credentials UX ніколи не показує значення секрету: тут, як і в
+# Write-OperationResults вище, друкуються лише Component/Target (назва
+# запису Credential Manager, не сам секрет)/Status/Scope.
+function Write-BRAVOCredentialResultBlock {
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Results,
+        [Parameter(Mandatory = $true)][string]$Action
+    )
+
+    $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $scopeLabelFor = {
+        param($scopeValue)
+        if ([string]$scopeValue -eq $currentIdentity) { return 'Поточний користувач' }
+        if ([string]$scopeValue -eq 'SYSTEM') { return 'NT AUTHORITY\SYSTEM' }
+        return [string]$scopeValue
+    }
+
+    # Групування за Scope у порядку появи — той самий порядок, у якому
+    # $operationResults уже збирає Set-OperationResultScope (спершу
+    # поточний користувач, потім SYSTEM).
+    $scopeOrder = New-Object System.Collections.Generic.List[string]
+    $scopeGroups = @{}
+    foreach ($result in $Results) {
+        $scopeKey = [string]$result.Scope
+        if (-not $scopeGroups.ContainsKey($scopeKey)) {
+            $scopeGroups[$scopeKey] = New-Object System.Collections.Generic.List[object]
+            $scopeOrder.Add($scopeKey)
+        }
+        $scopeGroups[$scopeKey].Add($result)
+    }
+
+    Write-Host ''
+    Write-Host 'Credential Manager:'
+    foreach ($scopeKey in $scopeOrder) {
+        # Set-OperationResultScope викликається лише тоді, коли справді
+        # опитується більше одного scope (Both/SYSTEM-worker) — при
+        # -StoreFor CurrentUser/ScheduledTaskAccount окремо .Scope на
+        # результатах узагалі немає, і підзаголовок групи був би порожнім.
+        if (-not [string]::IsNullOrWhiteSpace($scopeKey)) {
+            Write-BRAVOResultBlankLine
+            Write-Host ("  {0}" -f (& $scopeLabelFor $scopeKey))
+        }
+        foreach ($result in $scopeGroups[$scopeKey]) {
+            $entryLabel = [string]$result.Target
+            if ([string]::IsNullOrWhiteSpace($entryLabel)) {
+                $entryLabel = [string]$result.Component
+            }
+            $dots = '.' * [math]::Max(1, 34 - $entryLabel.Length)
+            $entryColor = switch ($result.Status) {
+                { $_ -in @('Added', 'Updated', 'Stored', 'Found', 'Removed') } { [ConsoleColor]::Green }
+                'Missing' { [ConsoleColor]::Yellow }
+                default { [ConsoleColor]::Red }
+            }
+            Write-Host ("    {0} {1} " -f $entryLabel, $dots) -NoNewline
+            Write-Host ([string]$result.Status).ToUpperInvariant() -ForegroundColor $entryColor
+            if ($result.Error) {
+                Write-BRAVOConsoleDetail -Message $result.Error -Color ([ConsoleColor]::Red)
+            }
+        }
+    }
+
+    $successCount = @($Results | Where-Object { $_.Status -in @('Added', 'Updated', 'Stored', 'Found', 'Removed') }).Count
+    $missingCount = @($Results | Where-Object { $_.Status -eq 'Missing' }).Count
+    $errorCount = @($Results | Where-Object { $_.Status -eq 'Error' }).Count
+    $credentialStatus = if ($errorCount -gt 0) {
+        'ПОМИЛКА'
+    } elseif ($missingCount -gt 0) {
+        'ПОТРЕБУЄ УВАГИ'
+    } else {
+        'УСПІШНО'
+    }
+    $credentialStatusColor = switch ($credentialStatus) {
+        'УСПІШНО' { [ConsoleColor]::Green }
+        'ПОТРЕБУЄ УВАГИ' { [ConsoleColor]::Yellow }
+        default { [ConsoleColor]::Red }
+    }
+
+    Write-BRAVOResultBlankLine
+    Write-BRAVOSeparator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-BRAVOSeparator
+    Write-BRAVOResultField -Label 'Статус' -Value $credentialStatus -Color $credentialStatusColor
+    if ($Action -eq 'Test') {
+        Write-BRAVOResultField -Label 'Знайдено' -Value ([string]$successCount)
+        Write-BRAVOResultField -Label 'Відсутні' -Value ([string]$missingCount)
+    } else {
+        Write-BRAVOResultField -Label 'Успішно' -Value ([string]$successCount)
+        if ($missingCount -gt 0) {
+            Write-BRAVOResultField -Label 'Відсутні' -Value ([string]$missingCount)
+        }
+    }
+    if ($errorCount -gt 0) {
+        Write-BRAVOResultField -Label 'Помилок' -Value ([string]$errorCount)
+    }
+    if ($missingCount -gt 0) {
+        Write-BRAVOResultBlankLine
+        Write-Host 'Відсутній запис:'
+        foreach ($result in @($Results | Where-Object { $_.Status -eq 'Missing' })) {
+            if ([string]::IsNullOrWhiteSpace([string]$result.Scope)) {
+                Write-Host ("  {0}" -f $result.Target)
+            } else {
+                Write-Host ("  {0} -> {1}" -f (& $scopeLabelFor $result.Scope), $result.Target)
+            }
+        }
+    }
+    Write-BRAVOSeparator
+}
+
 function Read-BRAVOMenuNumber {
     param(
         [string]$Prompt,
@@ -1052,6 +1167,16 @@ try {
         $Action = [string]$menuSelection.Action
         $Component = @([string]$menuSelection.Component)
         $StoreFor = [string]$menuSelection.StoreFor
+    } elseif (-not $protectedWorkerMode) {
+        # Заголовок лише для неінтерактивного (CLI-параметри) шляху —
+        # інтерактивне меню вище малює власний Clear-Host-банер, а worker-
+        # режим (ProtectedPayloadPath) не повинен друкувати нічого зайвого
+        # у stdout, який батьківський процес парсить як JSON.
+        Initialize-BRAVOConsole
+        Initialize-BRAVOProgress -Enabled $false
+        Write-BRAVOHeader `
+            -Title ("BRAVO Credentials Setup {0}" -f $global:ScriptVersion) `
+            -Mode ([string]$Action).ToUpperInvariant()
     }
 
     $requestedComponents = @(Resolve-RequestedComponents)
@@ -1241,7 +1366,7 @@ try {
                 -Entries $operationEntries
         )
     }
-    Write-OperationResults -Results $operationResults
+    Write-BRAVOCredentialResultBlock -Results $operationResults -Action $Action
 
     if (@($operationResults | Where-Object { $_.Status -in @("Error", "Missing") }).Count -gt 0) {
         Complete-BRAVOHelperLog -ExitCode 1
