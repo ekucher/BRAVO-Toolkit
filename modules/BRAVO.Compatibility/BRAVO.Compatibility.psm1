@@ -1482,6 +1482,139 @@ function Get-BRAVOSevenZipExitCodeDescription {
     }
 }
 
+# Централізований operator-friendly декодер native exit code зовнішніх
+# інструментів (docs/MANUAL_RUN_CONSOLE_UX.md, розділ "Native exit codes").
+# Один API замість switch($LASTEXITCODE) у кожному runtime окремо — Archive/
+# Health/Maintenance викликають САМЕ цю функцію, а не власні таблиці.
+#
+# 7-Zip: CanonicalName/Severity додано поверх уже наявного
+# Get-BRAVOSevenZipExitCodeDescription (текст не дублюється — читається
+# звідти ж, щоб один код не мав двох різних формулювань).
+$script:BRAVOSevenZipCanonicalNames = @{
+    0 = "NO_ERROR"; 1 = "WARNING"; 2 = "FATAL_ERROR"
+    7 = "COMMAND_LINE_ERROR"; 8 = "NOT_ENOUGH_MEMORY"; 255 = "USER_BREAK"
+}
+$script:BRAVOSevenZipSeverities = @{
+    0 = "success"; 1 = "warning"; 2 = "error"
+    7 = "error"; 8 = "error"; 255 = "error"
+}
+
+# WinSCP.com (scripting mode) документує лише 0 (успіх) і 1 (помилка хоча б
+# однієї операції або сесія не завершилась коректно) — на відміну від 7-Zip
+# і robocopy тут немає розгалуженої таблиці кодів, лише ці два.
+$script:BRAVOWinSCPCanonicalNames = @{ 0 = "SUCCESS"; 1 = "ERROR" }
+$script:BRAVOWinSCPDescriptions = @{
+    0 = "помилок немає"
+    1 = "помилка виконання: з'єднання, автентифікація або передача файлів"
+}
+
+function Get-BRAVOToolExitCodeDescription {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('7-Zip', 'WinSCP', 'robocopy')]
+        [string]$Tool,
+
+        [AllowNull()]
+        [Nullable[int]]$ExitCode,
+
+        [switch]$TimedOut
+    )
+
+    if ($TimedOut) {
+        return [pscustomobject]@{
+            Tool = $Tool
+            ExitCode = $ExitCode
+            CanonicalName = "TIMEOUT"
+            Severity = "error"
+            OperatorDescription = "перевищено час очікування"
+        }
+    }
+    if ($null -eq $ExitCode) {
+        return [pscustomobject]@{
+            Tool = $Tool
+            ExitCode = $null
+            CanonicalName = "NO_EXIT_CODE"
+            Severity = "error"
+            OperatorDescription = "$Tool не повернув код завершення"
+        }
+    }
+
+    $code = [int]$ExitCode
+    switch ($Tool) {
+        '7-Zip' {
+            $canonicalName = if ($script:BRAVOSevenZipCanonicalNames.ContainsKey($code)) {
+                $script:BRAVOSevenZipCanonicalNames[$code]
+            } else {
+                "UNKNOWN($code)"
+            }
+            $severity = if ($script:BRAVOSevenZipSeverities.ContainsKey($code)) {
+                $script:BRAVOSevenZipSeverities[$code]
+            } else {
+                "error"
+            }
+            return [pscustomobject]@{
+                Tool = $Tool
+                ExitCode = $code
+                CanonicalName = $canonicalName
+                Severity = $severity
+                OperatorDescription = (Get-BRAVOSevenZipExitCodeDescription -ExitCode $code)
+            }
+        }
+        'WinSCP' {
+            $canonicalName = if ($script:BRAVOWinSCPCanonicalNames.ContainsKey($code)) {
+                $script:BRAVOWinSCPCanonicalNames[$code]
+            } else {
+                "UNKNOWN($code)"
+            }
+            $description = if ($script:BRAVOWinSCPDescriptions.ContainsKey($code)) {
+                $script:BRAVOWinSCPDescriptions[$code]
+            } else {
+                "невідомий код WinSCP"
+            }
+            return [pscustomobject]@{
+                Tool = $Tool
+                ExitCode = $code
+                CanonicalName = $canonicalName
+                Severity = if ($code -eq 0) { "success" } else { "error" }
+                OperatorDescription = $description
+            }
+        }
+        'robocopy' {
+            # Бітова маска (документація Microsoft): 0-7 = різні відтінки
+            # успіху (0 — нічого копіювати не було потрібно), 8+ — помилка.
+            # $robocopyMaxSuccessExitCode (BRAVO.config) уже кодує саме цю
+            # межу "7" — тут лише пояснювальний текст поверх тих самих бітів.
+            if ($code -ge 16) {
+                return [pscustomobject]@{
+                    Tool = $Tool; ExitCode = $code; CanonicalName = "FATAL_ERROR"
+                    Severity = "error"
+                    OperatorDescription = "серйозна помилка — жодного файлу не скопійовано"
+                }
+            }
+            $bitDescriptions = New-Object System.Collections.Generic.List[string]
+            if (($code -band 1) -ne 0) { $bitDescriptions.Add("скопійовано файли") }
+            if (($code -band 2) -ne 0) { $bitDescriptions.Add("знайдено зайві файли/каталоги в призначенні") }
+            if (($code -band 4) -ne 0) { $bitDescriptions.Add("знайдено розбіжності файлів/каталогів") }
+            if (($code -band 8) -ne 0) { $bitDescriptions.Add("частину файлів не вдалося скопіювати (вичерпано спроби)") }
+            if ($code -eq 0) {
+                return [pscustomobject]@{
+                    Tool = $Tool; ExitCode = 0; CanonicalName = "NO_CHANGES"
+                    Severity = "success"
+                    OperatorDescription = "помилок немає, копіювати не було потрібно"
+                }
+            }
+            $severity = if (($code -band 8) -ne 0) { "error" } else { "success" }
+            $canonicalName = if ($severity -eq "error") { "COPY_ERRORS" } else { "OK" }
+            return [pscustomobject]@{
+                Tool = $Tool; ExitCode = $code; CanonicalName = $canonicalName
+                Severity = $severity
+                OperatorDescription = ($bitDescriptions -join "; ")
+            }
+        }
+    }
+}
+
 function ConvertTo-BRAVOWindowsCommandLineArgument {
     [CmdletBinding()]
     param([AllowEmptyString()][string]$Argument)
