@@ -35,12 +35,20 @@ function Invoke-BRAVOHealth {
 $script:BRAVOHealthStepCurrent = 0
 $script:BRAVOHealthStepTotal = 0
 $script:BRAVOHealthConsoleReady = $false
+$script:BRAVOHealthStepOkCount = 0
+$script:BRAVOHealthStepWarningCount = 0
+$script:BRAVOHealthStepErrorCount = 0
+$script:BRAVOHealthLastStepTime = $null
 
 function Initialize-BRAVOHealthSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
 
     $script:BRAVOHealthStepCurrent = 0
     $script:BRAVOHealthStepTotal = [Math]::Max(1, $Total)
+    $script:BRAVOHealthStepOkCount = 0
+    $script:BRAVOHealthStepWarningCount = 0
+    $script:BRAVOHealthStepErrorCount = 0
+    $script:BRAVOHealthLastStepTime = Get-Date
 }
 
 function Write-BRAVOHealthStep {
@@ -52,6 +60,19 @@ function Write-BRAVOHealthStep {
     )
 
     $script:BRAVOHealthStepCurrent++
+    switch ($Status) {
+        'OK'      { $script:BRAVOHealthStepOkCount++ }
+        'WARNING' { $script:BRAVOHealthStepWarningCount++ }
+        'ERROR'   { $script:BRAVOHealthStepErrorCount++ }
+    }
+    # Тривалість кроку — час від попереднього кроку (чи від Initialize,
+    # для першого). Health не має власного таймера на кожен крок, тому
+    # це найточніша оцінка без додаткової інструментації кожної перевірки.
+    $stepDuration = $null
+    if ($null -ne $script:BRAVOHealthLastStepTime) {
+        $stepDuration = (Get-Date) - $script:BRAVOHealthLastStepTime
+    }
+    $script:BRAVOHealthLastStepTime = Get-Date
     # Вбудований виклик з Archive (SuppressHeader) не друкує власну
     # покрокову нумерацію [N/5]: вона стоїть поряд із власною нумерацією
     # Archive [N/7] і виглядає як другий незалежний прогін замість одного
@@ -65,7 +86,8 @@ function Write-BRAVOHealthStep {
         -Total $script:BRAVOHealthStepTotal `
         -Name $Name `
         -Status $Status `
-        -Details $Details
+        -Details $Details `
+        -Duration $stepDuration
 }
 
 # Health не «виконує» компоненти, а перевіряє їх, тому статус етапу — це
@@ -107,6 +129,33 @@ function Get-BRAVOHealthSummaryResult {
 function Complete-BRAVOHealthResult {
     param([Parameter(Mandatory = $true)]$Result)
 
+    # Код завершення обчислюється тут, ДО друку підсумку — той самий клас
+    # виправлення, що вже застосований в Archive: раніше цей самий switch
+    # стояв у самому кінці файлу й виконувався ПІСЛЯ друку підсумку, тому
+    # підсумок фізично не міг показати правильний "Код завершення:". Через
+    # цю функцію проходить КОЖЕН з 13 шляхів виходу Health, тому обчислення
+    # тут покриває їх усі без дублювання логіки.
+    $healthExitCode = switch ([string]$Result.Status) {
+        'Healthy'            { 0 }
+        'Skipped'            { 0 }
+        'Disabled'           { 0 }
+        'Deferred'           { Resolve-BRAVOExitCode -LockBusy }
+        'ConfigurationError' { Resolve-BRAVOExitCode -InvalidConfiguration }
+        'Critical'           { Resolve-BRAVOExitCode -HealthCritical }
+        'NotificationError'  { Resolve-BRAVOExitCode -HealthCritical }
+        default              { Resolve-BRAVOExitCode -HealthCritical }
+    }
+    if ($healthExitCode -eq 0 -and $script:BRAVOWarningCount -gt 0) {
+        $healthExitCode = Resolve-BRAVOExitCode -HasWarnings
+    }
+    # Порушення цілісності інструментів перекриває будь-який інший
+    # результат Health — те саме застереження, що раніше стояло в кінці
+    # файлу, перенесене сюди без зміни умови.
+    if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
+        $healthExitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
+    }
+    $script:healthRuntimeExitCode = $healthExitCode
+
     # Через цю функцію проходить КОЖЕН шлях виходу Health, тому підсумок тут
     # неможливо забути додати в новій гілці — на відміну від друку підсумку
     # в кінці основного потоку.
@@ -142,10 +191,31 @@ function Complete-BRAVOHealthResult {
         # Сам файл Health-логу як і раніше створюється — просто не
         # анонсується другим "Детальний журнал:" у консолі.
         if (-not $SuppressHeader) {
-            $metrics = New-Object System.Collections.Specialized.OrderedDictionary
-            $metrics.Add('Стан', [string]$Result.Status)
+            $summaryResult = Get-BRAVOHealthSummaryResult `
+                -Status ([string]$Result.Status) `
+                -WarningCount $script:BRAVOWarningCount
+            $summaryStatusColor = switch ($summaryResult) {
+                'УСПІШНО'  { 'Green' }
+                'ЧАСТКОВО' { 'Yellow' }
+                default    { 'Red' }
+            }
+            $healthCheckEnded = Get-Date
+
+            Write-BRAVOResultHeader `
+                -Status $summaryResult `
+                -StatusColor $summaryStatusColor `
+                -ExitCode $healthExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $healthExitCode)
+            Write-BRAVOResultField -Label 'Початок' -Value $healthCheckStarted.ToString('dd.MM.yyyy HH:mm:ss')
+            Write-BRAVOResultField -Label 'Завершення' -Value $healthCheckEnded.ToString('dd.MM.yyyy HH:mm:ss')
+            Write-BRAVOResultField -Label 'Тривалість' -Value (Format-BRAVODuration -Duration ($healthCheckEnded - $healthCheckStarted))
+            Write-BRAVOResultBlankLine
+            Write-BRAVOResultField -Label 'Перевірок' -Value ([string]$script:BRAVOHealthStepCurrent)
+            Write-BRAVOResultField -Label 'Успішно' -Value ([string]$script:BRAVOHealthStepOkCount)
+            Write-BRAVOResultField -Label 'Попереджень' -Value ([string]$script:BRAVOHealthStepWarningCount)
+            Write-BRAVOResultField -Label 'Помилок' -Value ([string]$script:BRAVOHealthStepErrorCount)
             if ($null -ne $Result.PSObject.Properties['IssueCount']) {
-                $metrics.Add('Проблем', [int]$Result.IssueCount)
+                Write-BRAVOResultField -Label 'Проблем' -Value ([string][int]$Result.IssueCount)
             }
             # Метрика вимкненого призначення бреше найгірше з усього виводу:
             # «NAS/SMB: True» читається як «перевірено й усе гаразд», хоча
@@ -161,21 +231,59 @@ function Complete-BRAVOHealthResult {
                 }
                 $property = $Result.PSObject.Properties[$destination.Property]
                 if ($null -ne $property -and $null -ne $property.Value) {
-                    $metrics.Add($destination.Title, $property.Value)
+                    Write-BRAVOResultField -Label $destination.Title -Value ([string]$property.Value)
                 }
             }
             if ($script:BRAVOHealthNotificationStepEnabled -and
                 $null -ne $Result.PSObject.Properties['Notification']) {
-                $metrics.Add('Сповіщення', [string]$Result.Notification)
+                Write-BRAVOResultField -Label 'Сповіщення' -Value ([string]$Result.Notification)
             }
 
-            Write-BRAVOSummary `
-                -Result (Get-BRAVOHealthSummaryResult `
-                    -Status ([string]$Result.Status) `
-                    -WarningCount $script:BRAVOWarningCount) `
-                -Duration ((Get-Date) - $healthCheckStarted) `
-                -Metrics $metrics `
-                -LogFile ([string]$Result.LogPath)
+            # Резервні копії: останній справний архів кожного увімкненого
+            # компонента. $script:healthLatestArchives заповнюється лише для
+            # копій, що пройшли перевірку (Get-BackupHealthIssues) — те саме
+            # джерело даних, що вже йде в успішне Slack-сповіщення.
+            # Глобальна archiveDefinitions ще не існує на ранніх шляхах виходу
+            # (до завантаження BRAVO.config, наприклад ConfigurationError
+            # на відсутній файл конфігурації) — Get-Variable без помилки
+            # повертає $null замість кидати виняток під Set-StrictMode.
+            $archiveDefinitionsVariable = Get-Variable -Name archiveDefinitions -Scope Global -ErrorAction SilentlyContinue
+            if ($null -ne $archiveDefinitionsVariable -and $script:healthLatestArchives.Count -gt 0) {
+                $enabledArchiveDefinitionsForSummary = @($archiveDefinitionsVariable.Value | Where-Object { $_.Enabled })
+                if ($enabledArchiveDefinitionsForSummary.Count -gt 0) {
+                    Write-BRAVOResultSection -Title 'Резервні копії'
+                    foreach ($definition in $enabledArchiveDefinitionsForSummary) {
+                        $archiveInfo = $script:healthLatestArchives[$definition.Type]
+                        if ($null -eq $archiveInfo) {
+                            continue
+                        }
+                        $ageText = Format-BackupAge -LastWriteTime $archiveInfo.LastWriteTime
+                        Write-BRAVOConsoleDetail -Message ("{0,-11}OK   {1,10}   вік {2}" -f $definition.Type, (Format-BRAVOFileSize -Bytes $archiveInfo.SizeBytes), $ageText)
+                    }
+                }
+            }
+
+            # Проблеми: короткий операторський індекс поточного прогону —
+            # лише коли справді є що показати (порожній розділ виглядав би
+            # як прихована помилка форматування, а не підтвердження
+            # відсутності проблем). $healthIssues — локальна змінна
+            # Invoke-BRAVOHealth, існує лише на пізніх шляхах виходу (після
+            # збору всіх перевірок) — той самий захист Get-Variable, що й
+            # вище.
+            $healthIssuesVariable = Get-Variable -Name healthIssues -ErrorAction SilentlyContinue
+            if ($null -ne $healthIssuesVariable -and @($healthIssuesVariable.Value).Count -gt 0) {
+                Write-BRAVOResultSection -Title 'Проблеми'
+                foreach ($issue in @($healthIssuesVariable.Value)) {
+                    $issueLine = Get-BRAVOHealthConsoleIssueLine -Issue $issue
+                    $issueColor = if ($issueLine.Severity -eq 'WARNING') { [ConsoleColor]::Yellow } else { [ConsoleColor]::Red }
+                    Write-BRAVOConsoleDetail -Message ("{0,-7}  {1}" -f $issueLine.Severity, $issueLine.Component) -Color $issueColor
+                    if (-not [string]::IsNullOrWhiteSpace($issueLine.Detail)) {
+                        Write-BRAVOConsoleDetail -Message ("         {0}" -f $issueLine.Detail)
+                    }
+                }
+            }
+
+            Write-BRAVOResultFooter -LogFile ([string]$Result.LogPath)
         }
     }
 
@@ -514,6 +622,7 @@ Write-BRAVOHeader `
     -Title ("BRAVO HEALTH {0}" -f $global:ScriptVersion) `
     -Institution ([string]$bravoSettings.InstitutionName) `
     -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+    -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
     -StartedAt $healthCheckStarted `
     -SuppressText:$SuppressHeader
 $script:BRAVOHealthConsoleReady = $true
@@ -831,6 +940,7 @@ function Get-BackupHealthIssues {
             $script:healthLatestArchives[$archiveDefinition.Type] = [pscustomobject]@{
                 Name = $newestValidArchive.Name
                 SizeBytes = [long]$newestValidArchive.Length
+                LastWriteTime = $newestValidArchive.LastWriteTime
             }
             Write-HealthLog "Бекап $($archiveDefinition.Type) справний: $($newestValidArchive.Name), вік $(Format-BackupAge $newestValidArchive.LastWriteTime), розмір $(Format-FileSize $newestValidArchive.Length)" -Level "SUCCESS"
         }
@@ -3190,6 +3300,34 @@ function Format-CompactSMBIssue {
     return ":x: $componentName — $($Issue.Reason)"
 }
 
+# Операторська консоль ("Проблеми:" в РЕЗУЛЬТАТ) повторно використовує ці
+# самі Format-Compact*-форматтери замість власної класифікації WARNING/ERROR
+# — одна й та сама проблема має показувати однаковий рівень серйозності і в
+# Slack-сповіщенні, і в консолі. Service/невідомі Kind не мають окремого
+# форматтера (див. New-SlackAlertMessage нижче) — там завжди ":x:".
+function Get-BRAVOHealthConsoleIssueLine {
+    param([Parameter(Mandatory = $true)][object]$Issue)
+
+    $compactText = switch ($Issue.Kind) {
+        { $_ -in @('LocalBackup', 'LocalSynchronization') } { Format-CompactLocalIssue -Issue $Issue }
+        { $_ -in @('SFTPArchive', 'SFTPSynchronization', 'SFTPConnection') } { Format-CompactSFTPIssue -Issue $Issue }
+        { $_ -in @('SMBArchive', 'SMBConnection') } { Format-CompactSMBIssue -Issue $Issue }
+        default { ":x: $($Issue.Component) — $($Issue.Reason)" }
+    }
+
+    $severity = if ($compactText.StartsWith(':warning:')) { 'WARNING' } else { 'ERROR' }
+    $text = $compactText -replace '^:(warning|x):\s*', ''
+    $separatorIndex = $text.IndexOf(' — ')
+    if ($separatorIndex -ge 0) {
+        $component = $text.Substring(0, $separatorIndex)
+        $detail = $text.Substring($separatorIndex + 3)
+    } else {
+        $component = $text
+        $detail = $null
+    }
+    return [pscustomobject]@{ Severity = $severity; Component = $component; Detail = $detail }
+}
+
 function New-SlackAlertMessage {
     param(
         [array]$Issues,
@@ -4134,38 +4272,22 @@ if ($MyInvocation.InvocationName -ne '.') {
     # ніколи не чекав на клавішу при ручному запуску. try/finally гарантує
     # паузу і на нормальному завершенні, і на непередбаченому throw
     # усередині Invoke-BRAVOHealth (те саме, що вже робить Archive.Runtime.ps1).
+    # Код завершення обчислюється всередині Complete-BRAVOHealthResult (див.
+    # вище) — САМЕ ДО друку підсумку, а не тут і не після нього, як було
+    # раніше. Deferred — це "пропущено через lock/уже виконується інше
+    # завдання" у сенсі загального контракту кодів, тому окремий код 20, а
+    # не 0/1. Skipped ніколи фактично не породжується цим runtime (мертва
+    # гілка), лишена як безпечний fallback на успіх. Порушення цілісності
+    # інструментів перекриває будь-який інший результат: Health навмисно не
+    # переривається на старті (на відміну від Archive/Maintenance) —
+    # локальні перевірки служб, дисків і віку копій Tools не запускають,
+    # тому лишаються корисними саме тоді, коли підозрюється підміна. Але
+    # SFTP-гілка при цьому пропущена (Test-SFTPHealthConfiguration), і
+    # зовнішній моніторинг має бачити подію безпеки, а не звичайний
+    # health-статус.
     $script:healthRuntimeExitCode = 90
     try {
-        $healthResult = Invoke-BRAVOHealth @healthParameters
-        # Deferred — це саме "пропущено через lock/уже виконується інше завдання"
-        # у сенсі загального контракту кодів, тому окремий код 20, а не 0/1.
-        # Skipped ніколи фактично не породжується цим runtime (мертва гілка),
-        # лишена як безпечний fallback на успіх.
-        $exitCode = switch ([string]$healthResult.Status) {
-            'Healthy'            { 0 }
-            'Skipped'            { 0 }
-            'Disabled'           { 0 }
-            'Deferred'           { Resolve-BRAVOExitCode -LockBusy }
-            'ConfigurationError' { Resolve-BRAVOExitCode -InvalidConfiguration }
-            'Critical'           { Resolve-BRAVOExitCode -HealthCritical }
-            'NotificationError'  { Resolve-BRAVOExitCode -HealthCritical }
-            default              { Resolve-BRAVOExitCode -HealthCritical }
-        }
-        if ($exitCode -eq 0 -and $script:BRAVOWarningCount -gt 0) {
-            $exitCode = Resolve-BRAVOExitCode -HasWarnings
-        }
-
-        # Порушення цілісності інструментів перекриває будь-який інший
-        # результат Health. Health навмисно не переривається на старті (на
-        # відміну від Archive/Maintenance) — локальні перевірки служб,
-        # дисків і віку копій Tools не запускають, тому лишаються корисними
-        # саме тоді, коли підозрюється підміна. Але SFTP-гілка при цьому
-        # пропущена (Test-SFTPHealthConfiguration), і зовнішній моніторинг
-        # має бачити подію безпеки, а не звичайний health-статус.
-        if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
-            $exitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
-        }
-        $script:healthRuntimeExitCode = $exitCode
+        [void](Invoke-BRAVOHealth @healthParameters)
     } finally {
         Wait-BRAVOManualExit -NoPause:$NoPause
     }

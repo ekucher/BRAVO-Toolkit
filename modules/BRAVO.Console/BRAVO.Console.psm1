@@ -550,6 +550,19 @@ function Write-BRAVOResultHeader {
     Write-Host ''
 }
 
+# Порожній рядок усередині блоку РЕЗУЛЬТАТ (наприклад, між основними
+# полями і Перевірок/Успішно/Попереджень/Помилок) — для доменів, які самі
+# не мають права на голий Write-Host (Health: Console/HealthRendersNoRawWriteHost).
+function Write-BRAVOResultBlankLine {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ''
+}
+
 # Заголовок довільної секції всередині блоку РЕЗУЛЬТАТ ("Архіви:",
 # "Резервні копії:", "Проблеми:") — сам вміст секції домен формує
 # самостійно (Write-Host/Write-BRAVOResultField), бо структура списку
@@ -677,6 +690,7 @@ Export-ModuleMember -Function @(
     'Write-BRAVOError',
     'Write-BRAVOSummary',
     'Write-BRAVOResultField',
+    'Write-BRAVOResultBlankLine',
     'Write-BRAVOResultHeader',
     'Write-BRAVOResultSection',
     'Write-BRAVOResultFooter',

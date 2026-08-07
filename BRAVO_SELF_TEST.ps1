@@ -3150,13 +3150,17 @@ try {
         @{ Path = "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"; Title = 'Maintenance' }
     )
     # Мінімальний спільний словник: без будь-якого з цих викликів вивід
-    # runtime перестає бути тим самим виводом.
+    # runtime перестає бути тим самим виводом. Фінальний підсумок має два
+    # рівнозначні варіанти: старий Write-BRAVOSummary (Maintenance і
+    # неммігровані ручні шляхи Archive) або новий блок РЕЗУЛЬТАТ через
+    # Write-BRAVOResultHeader (docs/OPERATOR_CONSOLE_UX.md) — досить
+    # одного з них, обидва проходять через BRAVO.Console.
     $requiredConsoleCommands = @(
         'Initialize-BRAVOConsole',
         'Write-BRAVOHeader',
-        'Write-BRAVOStepResult',
-        'Write-BRAVOSummary'
+        'Write-BRAVOStepResult'
     )
+    $finalSummaryCommandAlternatives = @('Write-BRAVOSummary', 'Write-BRAVOResultHeader')
     $runtimeConsoleAsts = @{}
     $runtimesMissingConsole = @()
     foreach ($runtimeConsoleFile in $runtimeConsoleFiles) {
@@ -3178,6 +3182,12 @@ try {
             if ($invokedCommands -notcontains $requiredConsoleCommand) {
                 $runtimesMissingConsole += "$($runtimeConsoleFile.Title): $requiredConsoleCommand"
             }
+        }
+        $hasFinalSummaryCommand = @(
+            $finalSummaryCommandAlternatives | Where-Object { $invokedCommands -contains $_ }
+        ).Count -gt 0
+        if (-not $hasFinalSummaryCommand) {
+            $runtimesMissingConsole += "$($runtimeConsoleFile.Title): Write-BRAVOSummary/Write-BRAVOResultHeader"
         }
     }
     Test-BRAVOCondition `
@@ -3587,10 +3597,12 @@ try {
         -Failure "Write-BRAVOHealthStep має пропускати власний друк [N/5] при -SuppressHeader (вбудований виклик з Archive), не збиваючи внутрішній лічильник кроків"
 
     # Той самий реальний випадок: власний підсумок Health
-    # (Результат/Тривалість/.../Детальний журнал) усе одно друкувався другим
+    # (РЕЗУЛЬТАТ/Тривалість/.../Детальний журнал) усе одно друкувався другим
     # блоком поряд із підсумком Archive — два "Детальний журнал:" на один
     # прогін. Complete-BRAVOProgress (очищення прогрес-бару) лишається
-    # безумовним — лише текстовий підсумок і Write-BRAVOSummary придушені.
+    # безумовним — лише текстовий підсумок (Write-BRAVOResultHeader і далі,
+    # операторська консоль — TODO_FEATURES.md/docs/OPERATOR_CONSOLE_UX.md)
+    # придушений.
     $completeHealthResultFunctionText = if ($healthRuntimeText -match
         '(?s)function Complete-BRAVOHealthResult \{.*?\n\}') {
         $Matches[0]
@@ -3601,7 +3613,7 @@ try {
         -Condition (
             -not [string]::IsNullOrWhiteSpace($completeHealthResultFunctionText) -and
             $completeHealthResultFunctionText.Contains('if (-not $SuppressHeader) {') -and
-            $completeHealthResultFunctionText.Contains('Write-BRAVOSummary') -and
+            $completeHealthResultFunctionText.Contains('Write-BRAVOResultHeader') -and
             (
                 $completeHealthResultFunctionText.IndexOf('Complete-BRAVOProgress')
             ) -lt (
@@ -3610,11 +3622,11 @@ try {
             (
                 $completeHealthResultFunctionText.IndexOf('if (-not $SuppressHeader) {')
             ) -lt (
-                $completeHealthResultFunctionText.IndexOf('Write-BRAVOSummary')
+                $completeHealthResultFunctionText.IndexOf('Write-BRAVOResultHeader')
             )
         ) `
         -Name "Health/EmbeddedCallSuppressesOwnSummary" `
-        -Failure "Complete-BRAVOHealthResult має придушувати власний Write-BRAVOSummary при -SuppressHeader (вбудований виклик з Archive), не чіпаючи Complete-BRAVOProgress"
+        -Failure "Complete-BRAVOHealthResult має придушувати власний Write-BRAVOResultHeader при -SuppressHeader (вбудований виклик з Archive), не чіпаючи Complete-BRAVOProgress"
 
     # Реальний випадок: "SFTP MODEL: серверний SHA архіву недоступний;
     # використано повний збіг віддаленого hash-файлу" — перевірка все одно
