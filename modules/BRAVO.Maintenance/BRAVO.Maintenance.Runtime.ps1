@@ -886,7 +886,7 @@ function Write-BRAVOMaintenanceStep {
             'SKIPPED' { Write-BRAVOSkipReason -Reason $Details }
             'WARNING' { Write-BRAVOOperatorReason -Reason $Details }
             'ERROR'   { Write-BRAVOOperatorReason -Reason $Details }
-            default   { Write-BRAVOConsoleDetail -Message $Details }
+            default   { Write-BRAVOStepDetail -Message $Details }
         }
     }
 }

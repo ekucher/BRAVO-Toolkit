@@ -616,7 +616,7 @@ try {
             } elseif ($Status -in @('WARNING', 'ERROR')) {
                 Write-BRAVOOperatorReason -Reason $Details
             } else {
-                Write-BRAVOConsoleDetail -Message $Details
+                Write-BRAVOStepDetail -Message $Details
             }
         }
     }

@@ -350,6 +350,21 @@ function Write-BRAVOSkipReason {
     Write-Host $Reason -ForegroundColor DarkGray
 }
 
+# Той самий безвідступний стиль, що Write-BRAVOSkipReason, — для простого
+# пояснення без підпису під кроком з ІНШИМ статусом (наприклад "оброблено
+# файлів: 1" під OK-кроком Maintenance). Live-прогін показав, що такий
+# текст мав виглядати ідентично до пояснення SKIPPED — оператор не
+# розрізняє "тип" анотації, лише бачить непослідовний відступ.
+function Write-BRAVOStepDetail {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host $Message -ForegroundColor DarkGray
+}
+
 function Write-BRAVOConsoleDetail {
     [CmdletBinding()]
     param(
@@ -729,6 +744,7 @@ Export-ModuleMember -Function @(
     'Write-BRAVOStepResult',
     'Write-BRAVOOperatorReason',
     'Write-BRAVOSkipReason',
+    'Write-BRAVOStepDetail',
     'Write-BRAVOConsoleDetail',
     'Write-BRAVOConsoleMessage',
     'Write-BRAVOWarning',
