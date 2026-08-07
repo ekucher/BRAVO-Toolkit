@@ -566,6 +566,21 @@ function Write-BRAVOResultHeader {
     Write-Host ''
 }
 
+# Той самий ASCII-роздільник, що обрамляє заголовок і блок РЕЗУЛЬТАТ, для
+# довільних інших блоків поза ними (наприклад, "План операцій:" у
+# Maintenance, docs/OPERATOR_CONSOLE_UX.md §5) — щоб ширина не розходилась
+# з рештою консолі, якщо $script:BRAVOConsoleSeparatorWidth колись
+# зміниться.
+function Write-BRAVOSeparator {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ('-' * $script:BRAVOConsoleSeparatorWidth)
+}
+
 # Порожній рядок усередині блоку РЕЗУЛЬТАТ (наприклад, між основними
 # полями і Перевірок/Успішно/Попереджень/Помилок) — для доменів, які самі
 # не мають права на голий Write-Host (Health: Console/HealthRendersNoRawWriteHost).
@@ -707,6 +722,7 @@ Export-ModuleMember -Function @(
     'Write-BRAVOSummary',
     'Write-BRAVOResultField',
     'Write-BRAVOResultNote',
+    'Write-BRAVOSeparator',
     'Write-BRAVOResultBlankLine',
     'Write-BRAVOResultHeader',
     'Write-BRAVOResultSection',

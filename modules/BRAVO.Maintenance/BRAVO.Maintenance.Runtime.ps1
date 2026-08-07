@@ -816,12 +816,14 @@ $script:EnableArchiveAfterMaintenance = ($ArchiveAfterMaintenance -eq "on")
 # і Health: заголовок, етапи, підсумок.
 $script:BRAVOMaintenanceStepCurrent = 0
 $script:BRAVOMaintenanceStepTotal = 0
+$script:BRAVOMaintenanceLastStepTime = $null
 
 function Initialize-BRAVOMaintenanceSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
 
     $script:BRAVOMaintenanceStepCurrent = 0
     $script:BRAVOMaintenanceStepTotal = [Math]::Max(1, $Total)
+    $script:BRAVOMaintenanceLastStepTime = Get-Date
 }
 
 # Статус етапу рахується від ЗРІЗУ лічильників перед блоком, а не від
@@ -856,12 +858,37 @@ function Write-BRAVOMaintenanceStep {
     )
 
     $script:BRAVOMaintenanceStepCurrent++
+    # Тривалість кроку — час від попереднього кроку (чи від Initialize, для
+    # першого). Той самий підхід, що в Health: жоден із ~9 кроків не має
+    # власного таймера, і додавати його кожному окремо — набагато більший
+    # ризик регресії, ніж один спільний облік тут.
+    $stepDuration = $null
+    if ($null -ne $script:BRAVOMaintenanceLastStepTime) {
+        $stepDuration = (Get-Date) - $script:BRAVOMaintenanceLastStepTime
+    }
+    $script:BRAVOMaintenanceLastStepTime = Get-Date
     Write-BRAVOStepResult `
         -Current $script:BRAVOMaintenanceStepCurrent `
         -Total $script:BRAVOMaintenanceStepTotal `
         -Name $Name `
         -Status $Status `
-        -Details $Details
+        -Duration $stepDuration
+
+    # -Duration і -Details у Write-BRAVOStepResult взаємовиключні за
+    # дизайном (перше вже зайняло рядок статусу) — тому Details, коли є,
+    # друкується під рядком етапу окремим викликом: SKIPPED без підпису,
+    # WARNING/ERROR як "Причина:", OK/інше — звичайний деталь без підпису.
+    # Це та сама інформація, що раніше йшла інлайн одразу за статусом —
+    # лише перенесена на рядок нижче, жоден з наявних викликів не втрачає
+    # текст.
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        switch ($Status) {
+            'SKIPPED' { Write-BRAVOSkipReason -Reason $Details }
+            'WARNING' { Write-BRAVOOperatorReason -Reason $Details }
+            'ERROR'   { Write-BRAVOOperatorReason -Reason $Details }
+            default   { Write-BRAVOConsoleDetail -Message $Details }
+        }
+    }
 }
 
 # ===== ФУНКЦІЯ ЛОГУВАННЯ =====
@@ -2820,7 +2847,44 @@ Write-BRAVOHeader `
     -Title ("BRAVO MAINTENANCE {0}" -f $global:ScriptVersion) `
     -Institution ([string]$bravoSettings.InstitutionName) `
     -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+    -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
     -StartedAt $script:ScriptStartTime
+
+# AutoShutdown=on вимикає сервер ПІСЛЯ успішного завершення — оператор має
+# побачити це до того, як почнеться виконання, а не дізнатися постфактум
+# із логу (docs/OPERATOR_CONSOLE_UX.md §5, "критичний інваріант": скрипт
+# може змінювати систему).
+if ($script:EnableAutoShutdown) {
+    Write-Host ''
+    Write-Host 'УВАГА:' -ForegroundColor Yellow
+    Write-Host '  Після успішного завершення сервер буде вимкнено.' -ForegroundColor Yellow
+}
+
+# План операцій: те саме "plan-first" правило, що вже застосовано в Dry
+# Run/Setup — оператор бачить, ЩО саме виконуватиметься, ще до першого
+# кроку. Джерело значень — ті самі прапорці, що вже визначають нумерацію
+# кроків нижче (Initialize-BRAVOMaintenanceSteps), тому план і фактичне
+# виконання не можуть розійтися.
+$maintenancePlanEntries = [ordered]@{
+    'Відновлення пропущених операцій' = [bool]$script:BRAVOMaintenanceRestoreStepEnabled
+    'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
+    'Maintenance BRAVO'               = [bool]$BravoMaintenanceEnabled
+    'Архівація після maintenance'     = [bool]$script:BRAVOMaintenanceArchiveStepEnabled
+    'Автоматичне вимкнення сервера'   = [bool]$script:EnableAutoShutdown
+}
+$maintenancePlanLabelWidth = (
+    $maintenancePlanEntries.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum
+).Maximum + 3
+Write-Host ''
+Write-Host 'План операцій:'
+Write-Host ''
+foreach ($planEntry in $maintenancePlanEntries.GetEnumerator()) {
+    $planLabel = ("{0}:" -f $planEntry.Key).PadRight($maintenancePlanLabelWidth)
+    $planValue = if ($planEntry.Value) { 'ТАК' } else { 'НІ' }
+    Write-Host ("  {0}{1}" -f $planLabel, $planValue)
+}
+Write-Host ''
+Write-BRAVOSeparator
 
 Write-Log -Message "==="
 Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАПУЩЕНА ==="
@@ -3818,8 +3882,30 @@ Write-Log -Message "=== СТАТУС: $(if ($script:criticalErrorOccurred) {'З 
 Write-Log -Message "==="
 
 Complete-BRAVOProgress
-$maintenanceMetrics = New-Object System.Collections.Specialized.OrderedDictionary
-$maintenanceMetrics.Add('Попереджень', $script:BRAVOWarningCount)
+
+# Код завершення обчислюється тут, ДО друку РЕЗУЛЬТАТ — той самий принцип,
+# що вже застосований в Archive/Health: раніше ця сама логіка стояла ПІСЛЯ
+# Write-BRAVOSummary (за межами try/finally нижче), тому підсумок фізично
+# не міг показати правильний "Код завершення:". Умови не змінені — лише
+# перенесені й збережені в $script:maintenanceRuntimeExitCode, щоб exit
+# нижче не дублював обчислення. Операції створення/відновлення локального
+# архіву й перевірки його цілісності виділені окремими прапорцями
+# (restoreArchiveFailed/restoreIntegrityFailed, 19 точок) на 40/41; решта
+# ~23 точок criticalErrorOccurred (сервіси, диск, файлове господарство,
+# оркестрація BRAVO_ARCHIV) і далі схлопуються в загальний бакет 60.
+# Resolve-BRAVOExitCode сам віддає пріоритет 40/41 над 60, якщо передані
+# одночасно.
+$script:maintenanceRuntimeExitCode = if ($script:criticalErrorOccurred) {
+    Resolve-BRAVOExitCode `
+        -LocalArchiveFailed:$script:restoreArchiveFailed `
+        -IntegrityTestFailed:$script:restoreIntegrityFailed `
+        -MaintenanceFailed
+} elseif ($script:BRAVOWarningCount -gt 0) {
+    Resolve-BRAVOExitCode -HasWarnings
+} else {
+    0
+}
+
 # ЧАСТКОВО, а не ПОМИЛКА, за самих лише попереджень: обслуговування
 # відпрацювало, але щось потребує уваги. ПОМИЛКА лишається за критичним
 # збоєм — тим самим, що дає ненульовий код завершення.
@@ -3830,31 +3916,28 @@ $maintenanceSummaryResult = if ($script:criticalErrorOccurred) {
 } else {
     'УСПІШНО'
 }
-Write-BRAVOSummary `
-    -Result $maintenanceSummaryResult `
-    -Duration $totalTime `
-    -Metrics $maintenanceMetrics `
-    -LogFile $LOG_FILE
+$maintenanceSummaryStatusColor = switch ($maintenanceSummaryResult) {
+    'УСПІШНО'  { [ConsoleColor]::Green }
+    'ЧАСТКОВО' { [ConsoleColor]::Yellow }
+    default    { [ConsoleColor]::Red }
+}
+Write-BRAVOResultHeader `
+    -Status $maintenanceSummaryResult `
+    -StatusColor $maintenanceSummaryStatusColor `
+    -ExitCode $script:maintenanceRuntimeExitCode `
+    -ExitCodeName (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode)
+Write-BRAVOResultField -Label 'Тривалість' -Value (Format-BRAVODuration -Duration $totalTime)
+Write-BRAVOResultField -Label 'Попереджень' -Value ([string]$script:BRAVOWarningCount)
+Write-BRAVOResultBlankLine
+Write-BRAVOResultField -Label 'Maintenance' -Value $(if ($BravoMaintenanceEnabled) { 'виконано' } else { 'вимкнено' })
+Write-BRAVOResultField -Label 'Архівація' -Value $(if ($script:BRAVOMaintenanceArchiveStepEnabled) { 'виконано' } else { 'вимкнено' })
+Write-BRAVOResultField -Label 'Shutdown' -Value $(if ($script:EnableAutoShutdown) { 'заплановано' } else { 'не заплановано' })
+Write-BRAVOResultFooter -LogFile $LOG_FILE
 } finally {
     Exit-BRAVOMaintenanceOperationLock
 }
 
-# Операції створення/відновлення локального архіву й перевірки його
-# цілісності виділені окремими прапорцями (restoreArchiveFailed/
-# restoreIntegrityFailed, 19 точок) на 40/41; решта ~23 точок
-# criticalErrorOccurred (сервіси, диск, файлове господарство, оркестрація
-# BRAVO_ARCHIV) і далі схлопуються в загальний бакет 60. Resolve-BRAVOExitCode
-# сам віддає пріоритет 40/41 над 60, якщо передані одночасно.
-if ($script:criticalErrorOccurred) {
-    exit (Resolve-BRAVOExitCode `
-        -LocalArchiveFailed:$script:restoreArchiveFailed `
-        -IntegrityTestFailed:$script:restoreIntegrityFailed `
-        -MaintenanceFailed)
-} elseif ($script:BRAVOWarningCount -gt 0) {
-    exit (Resolve-BRAVOExitCode -HasWarnings)
-} else {
-    exit 0
-}
+exit $script:maintenanceRuntimeExitCode
 
 } finally {
     # Закриває try, відкритий одразу після імпорту модулів. exit усередині
