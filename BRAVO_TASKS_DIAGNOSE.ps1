@@ -22,6 +22,15 @@ if (-not (Test-Path -LiteralPath $systemHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль системних helpers: $systemHelpersPath"
 }
 Import-Module -Name $systemHelpersPath -ErrorAction Stop
+# SID-based identity helpers (Test-BRAVOAccountIdentityEquivalent /
+# ConvertTo-BRAVOAccountSidValue) — той самий механізм, що й у Installer:
+# порівняння облікового запису завдання мовно-незалежно (локалізоване
+# "СИСТЕМА" == SYSTEM == S-1-5-18).
+$compatibilityHelpersPath = Join-Path $scriptRoot 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1'
+if (-not (Test-Path -LiteralPath $compatibilityHelpersPath -PathType Leaf)) {
+    throw "Не знайдено PowerShell-модуль сумісності: $compatibilityHelpersPath"
+}
+Import-Module -Name $compatibilityHelpersPath -ErrorAction Stop
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $scriptRoot "BRAVO.config"
 }
@@ -105,7 +114,10 @@ function Test-BRAVOScheduledTaskDefinition {
         [hashtable]$TaskSettings,
         [string]$ExpectedConfigPath,
         [string]$ExpectedExecutable,
-        [string[]]$RequiredArgumentTokens
+        [string[]]$RequiredArgumentTokens,
+        [Parameter(Mandatory = $true)][string]$ExpectedAccount,
+        [Parameter(Mandatory = $true)][int]$ExpectedLogonType,
+        [Parameter(Mandatory = $true)][int]$ExpectedRunLevel
     )
 
     $problems = New-Object System.Collections.Generic.List[string]
@@ -117,14 +129,25 @@ function Test-BRAVOScheduledTaskDefinition {
 
     $principal = $definition.Principal
     $userId = [string]$principal.UserId
-    if ($userId -notin @("SYSTEM", "NT AUTHORITY\SYSTEM", "S-1-5-18")) {
-        $problems.Add("Principal.UserId='$userId', очікується SYSTEM")
+    # Порівняння за SID, а не за текстом: на локалізованій Windows Task
+    # Scheduler повертає локалізовану назву ("СИСТЕМА"), яка мовно-незалежно
+    # відповідає SYSTEM/S-1-5-18. Очікуваний акаунт береться з effective
+    # schedulerSettings (той самий, який застосував Installer), а не хардкодиться.
+    if (-not (Test-BRAVOAccountIdentityEquivalent `
+            -ExpectedAccount $ExpectedAccount `
+            -ActualAccount $userId)) {
+        $expectedSid = ConvertTo-BRAVOAccountSidValue -AccountName $ExpectedAccount
+        $actualSid = ConvertTo-BRAVOAccountSidValue -AccountName $userId
+        $problems.Add(
+            "Principal.UserId='$userId' (SID='$actualSid'), очікується " +
+            "'$ExpectedAccount' (SID='$expectedSid')"
+        )
     }
-    if ([int]$principal.LogonType -ne 5) {
-        $problems.Add("LogonType=$($principal.LogonType), очікується ServiceAccount (5)")
+    if ([int]$principal.LogonType -ne $ExpectedLogonType) {
+        $problems.Add("LogonType=$($principal.LogonType), очікується $ExpectedLogonType")
     }
-    if ([int]$principal.RunLevel -ne 1) {
-        $problems.Add("RunLevel=$($principal.RunLevel), очікується Highest (1)")
+    if ([int]$principal.RunLevel -ne $ExpectedRunLevel) {
+        $problems.Add("RunLevel=$($principal.RunLevel), очікується $ExpectedRunLevel")
     }
 
     $executionTimeLimit = [string]$definition.Settings.ExecutionTimeLimit
@@ -217,7 +240,7 @@ try {
         -RuntimeRoot $scriptRoot
 
     if (-not $InspectOnly -and
-        [string]$schedulerSettings.RunAsUser -in @("SYSTEM", "NT AUTHORITY\SYSTEM")) {
+        (ConvertTo-BRAVOAccountSidValue -AccountName ([string]$schedulerSettings.RunAsUser)) -eq 'S-1-5-18') {
         # Перевіряється розташування КОМПЛЕКТУ, а не каталогу конфігурації:
         # саме комплект виконується від SYSTEM, і саме він має лежати в
         # захищеному каталозі. Конфігурація може лежати де завгодно.
@@ -269,7 +292,10 @@ try {
     if ($null -eq $schedulerSettings) {
         throw "у config відсутній schedulerSettings"
     }
-    $dryRunPath = Join-Path $configRoot "BRAVO_DRY_RUN.ps1"
+    # Dry Run — runtime-ресурс комплекту, тому береться з RuntimeRoot ($scriptRoot),
+    # а не з каталогу конфігурації (config може бути переданий через -ConfigPath
+    # з іншого місця).
+    $dryRunPath = Join-Path $scriptRoot "BRAVO_DRY_RUN.ps1"
     if (-not (Test-Path -LiteralPath $dryRunPath -PathType Leaf)) {
         throw "dry-run не знайдено: $dryRunPath"
     }
@@ -341,15 +367,25 @@ try {
             ([int64]$registeredTask.LastTaskResult) -band 0xffffffffL
         )
         $description = Get-BRAVOTaskResultDescription -ResultCode $lastResult
-        $color = if ($lastResult -in @(0, 0x00041300, 0x00041301, 0x00041303)) {
-            "Green"
+        $lastResultIsBenign = $lastResult -in @(0, 0x00041300, 0x00041301, 0x00041303)
+        $color = if ($lastResultIsBenign) { "Green" } else { "Yellow" }
+        # Recovery — boot-тригер: NextRunTime повертає sentinel 30.12.1899.
+        # LastRunTime для завдання, що ще не запускалося, — так само sentinel.
+        $nextRunRaw = try { $registeredTask.NextRunTime } catch { $null }
+        $nextRunText = Format-BRAVOSchedulerNextRun `
+            -TaskType $taskType `
+            -NextRunTime $nextRunRaw `
+            -StartupDelayMinutes ([int]$settings.StartupDelayMinutes)
+        $lastRunRaw = try { $registeredTask.LastRunTime } catch { $null }
+        $lastRunText = if ($lastRunRaw -is [datetime] -and $lastRunRaw.Year -gt 1900) {
+            $lastRunRaw.ToString('dd.MM.yyyy HH:mm')
         } else {
-            "Yellow"
+            'ще не запускалося'
         }
         Write-Host (
             "[INFO] $($registeredTask.Path): enabled=$($registeredTask.Enabled); " +
             "state=$($registeredTask.State); last=0x$($lastResult.ToString('X8')) ($description); " +
-            "lastRun=$($registeredTask.LastRunTime); nextRun=$($registeredTask.NextRunTime)"
+            "lastRun=$lastRunText; nextRun=$nextRunText"
         ) -ForegroundColor $color
 
         $requiredTokens = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy Bypass')
@@ -359,15 +395,36 @@ try {
         if ($taskType -eq 'Health' -and [bool]$settings.SkipIfBackupTaskRunning) {
             $requiredTokens += '-SkipIfBackupTaskRunning'
         }
+        # Expected principal — той самий канонічний розрахунок, що застосовує
+        # Installer. Diagnose перевіряє фактичне визначення проти НЬОГО, а не
+        # проти жорстко прописаних SYSTEM/5/1.
+        $expectedPrincipal = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings
         $definitionProblems = @(Test-BRAVOScheduledTaskDefinition `
             -TaskType $taskType `
             -RegisteredTask $registeredTask `
             -TaskSettings $settings `
             -ExpectedConfigPath $resolvedConfigPath `
             -ExpectedExecutable ([string]$schedulerSettings.PowerShellExecutable) `
-            -RequiredArgumentTokens $requiredTokens)
+            -RequiredArgumentTokens $requiredTokens `
+            -ExpectedAccount $expectedPrincipal.UserId `
+            -ExpectedLogonType $expectedPrincipal.LogonType `
+            -ExpectedRunLevel $expectedPrincipal.RunLevel)
         if ($definitionProblems.Count -eq 0) {
-            Write-Host "[PASS] ${taskType}: визначення завдання відповідає конфігурації (SYSTEM / ServiceAccount / Highest)" -ForegroundColor Green
+            Write-Host (
+                "[PASS] ${taskType}: визначення завдання відповідає конфігурації " +
+                "(акаунт '$($expectedPrincipal.UserId)' / LogonType=$($expectedPrincipal.LogonType) / RunLevel=$($expectedPrincipal.RunLevel))"
+            ) -ForegroundColor Green
+            # Definition validation і execution history — РІЗНІ поняття. Якщо
+            # поточне визначення правильне, але останній РЕЗУЛЬТАТ ненульовий,
+            # це історія попереднього запуску (можливо, до цього оновлення
+            # definition), а не помилка поточної конфігурації.
+            if (-not $lastResultIsBenign) {
+                Write-Host (
+                    "[INFO] ${taskType}: last=0x$($lastResult.ToString('X8')) ($description) — " +
+                    "результат ОСТАННЬОГО виконання, а не перевірка поточного визначення " +
+                    "(яке щойно пройшло). Якщо definition змінювали, дочекайтеся наступного запуску."
+                ) -ForegroundColor DarkGray
+            }
         } else {
             foreach ($problem in $definitionProblems) {
                 Write-Host "[FAIL] ${taskType}: $problem" -ForegroundColor Red
@@ -432,7 +489,9 @@ try {
         if ($TestAccess) { $argumentParts += "-TestAccess" }
         if ($SendTestNotification) { $argumentParts += "-SendTestNotification" }
         $action.Arguments = $argumentParts -join " "
-        $action.WorkingDirectory = $configRoot
+        # WorkingDirectory тимчасового SYSTEM dry-run — RuntimeRoot (де лежить
+        # BRAVO_DRY_RUN.ps1 і modules), а не каталог конфігурації.
+        $action.WorkingDirectory = $scriptRoot
 
         $temporaryTask = $rootTaskFolder.RegisterTaskDefinition(
             $temporaryTaskName,

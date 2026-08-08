@@ -228,8 +228,7 @@ function Get-RequiredCredentialDescriptors {
     }
 
     $sftpEnabled = (Test-SettingEnabled $componentSettings.SFTP.ArchiveUpload) -or
-        (Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_SFTP) -or
-        (Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_SFTP) -or
+        $bazaSyncEffective.ScheduledSftpSyncRequired -or
         (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
     if ($sftpEnabled) {
         [void]$descriptors.Add([pscustomobject]@{
@@ -525,7 +524,11 @@ function Test-SftpReadOnlyAccess {
         Justification = 'Секрет із Credential Manager; WinSCP.SessionOptions.Password приймає саме рядок.')]
     param(
         [string]$Login,
-        [string]$Password
+        [string]$Password,
+        # Віддалені каталоги призначення для увімкнених SFTP-компонентів
+        # (наприклад "baza_app", "baza_www"). Перевіряються read-only через
+        # FileExists; каталоги НЕ створюються.
+        [string[]]$RequiredDirectories = @()
     )
 
     $hostName = Resolve-SftpHost -Login $Login
@@ -550,7 +553,24 @@ function Test-SftpReadOnlyAccess {
         $options.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
         $session.Open($options)
         [void]$session.ListDirectory(".")
-        return "$hostName`:$port — автентифікація і читання каталогу успішні"
+
+        $present = New-Object System.Collections.Generic.List[string]
+        $missing = New-Object System.Collections.Generic.List[string]
+        foreach ($directory in @($RequiredDirectories)) {
+            if ([string]::IsNullOrWhiteSpace($directory)) { continue }
+            $remotePath = '/' + ($directory.Trim().Trim('/'))
+            # FileExists — read-only stat; Dry Run НІКОЛИ не створює каталоги.
+            if ($session.FileExists($remotePath)) {
+                $present.Add($remotePath)
+            } else {
+                $missing.Add($remotePath)
+            }
+        }
+        return [pscustomobject]@{
+            Detail = "$hostName`:$port — автентифікація і читання каталогу успішні"
+            Present = $present.ToArray()
+            Missing = $missing.ToArray()
+        }
     } finally {
         $session.Dispose()
     }
@@ -923,8 +943,7 @@ try {
     }
 
     $sftpConfigured = (Test-SettingEnabled $componentSettings.SFTP.ArchiveUpload) -or
-        (Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_SFTP) -or
-        (Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_SFTP) -or
+        $bazaSyncEffective.ScheduledSftpSyncRequired -or
         (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
     if ($sftpConfigured) {
         $configuredWinSCPPath = if (-not [string]::IsNullOrWhiteSpace([string]$winSCPPath)) {
@@ -1025,39 +1044,49 @@ try {
         }
     }
 
-    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_LOCAL) {
-        $bazaAppSource = Get-SourceDirectory ([string]$bazaAppPaths.Source)
-        $bazaAppDestination = [string]$bazaAppPaths.Destination
-        if (Test-Path -LiteralPath $bazaAppSource -PathType Container) {
-            Add-DryRunResult PASS "Джерело" "BAZA APP" $bazaAppSource
+    # Джерело кожного УВІМКНЕНОГО BAZA-компонента (LOCAL АБО SFTP) обов'язкове й
+    # має існувати — незалежно від типу призначення. Раніше SFTP-гілка лише
+    # планувала синхронізацію без перевірки джерела, тому порожнє/відсутнє
+    # джерело давало false PASS, хоча production-синхронізація виконатися не
+    # могла. Перелік компонентів і правило enablement беруться з канонічного
+    # $bazaSyncEffective (Config Loader), а не обчислюються тут повторно.
+    foreach ($syncComponent in $bazaSyncEffective.Components) {
+        if (-not $syncComponent.AnyEnabled) { continue }
+
+        $componentSource = [string]$syncComponent.Source
+        if ([string]::IsNullOrWhiteSpace($componentSource)) {
+            $reasonText = if (-not [string]::IsNullOrWhiteSpace([string]$syncComponent.SourceReason)) {
+                [string]$syncComponent.SourceReason
+            } else {
+                'шлях не визначено'
+            }
+            Add-DryRunResult FAIL "Джерело" $syncComponent.DisplayName (
+                "джерело не визначено: $reasonText"
+            )
         } else {
-            Add-DryRunResult FAIL "Джерело" "BAZA APP" "каталог відсутній: $bazaAppSource"
+            $resolvedComponentSource = Get-SourceDirectory $componentSource
+            if (Test-Path -LiteralPath $resolvedComponentSource -PathType Container) {
+                Add-DryRunResult PASS "Джерело" $syncComponent.DisplayName $resolvedComponentSource
+            } else {
+                Add-DryRunResult FAIL "Джерело" $syncComponent.DisplayName "каталог відсутній: $resolvedComponentSource"
+            }
         }
-        Add-DryRunResult PLAN "Синхронізація" "BAZA APP local" (
-            "'$bazaAppSource' -> '$bazaAppDestination'"
-        )
-    }
-    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_SFTP) {
-        Add-DryRunResult PLAN "Синхронізація" "BAZA APP SFTP" (
-            "'$($bazaAppPaths.Source)' -> '/$($sftpDirectories.BAZA)' без -delete"
-        )
-    }
-    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_LOCAL) {
-        $bazaWWWSource = Get-SourceDirectory ([string]$bazaWWWPaths.Source)
-        $bazaWWWDestination = [string]$bazaWWWPaths.Destination
-        if (Test-Path -LiteralPath $bazaWWWSource -PathType Container) {
-            Add-DryRunResult PASS "Джерело" "BAZA WWW" $bazaWWWSource
-        } else {
-            Add-DryRunResult FAIL "Джерело" "BAZA WWW" "каталог відсутній: $bazaWWWSource"
+
+        if ($syncComponent.LocalEnabled) {
+            $localDestination = if ($syncComponent.Name -eq 'BAZA_APP') {
+                [string]$bazaAppPaths.Destination
+            } else {
+                [string]$bazaWWWPaths.Destination
+            }
+            Add-DryRunResult PLAN "Синхронізація" ("{0} local" -f $syncComponent.DisplayName) (
+                "'$componentSource' -> '$localDestination'"
+            )
         }
-        Add-DryRunResult PLAN "Синхронізація" "BAZA WWW local" (
-            "'$bazaWWWSource' -> '$bazaWWWDestination'"
-        )
-    }
-    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_SFTP) {
-        Add-DryRunResult PLAN "Синхронізація" "BAZA WWW SFTP" (
-            "'$($bazaWWWPaths.Source)' -> '/$($sftpDirectories.BAZAWWW)' без -delete"
-        )
+        if ($syncComponent.SftpEnabled) {
+            Add-DryRunResult PLAN "Синхронізація" ("{0} SFTP" -f $syncComponent.DisplayName) (
+                "'$componentSource' -> '/$($syncComponent.SftpRemoteDirectory)' без -delete"
+            )
+        }
     }
 
     if ($null -ne $maintenanceSettings) {
@@ -1212,10 +1241,24 @@ try {
         }
         if ($TestAccess -and $credentialValues.SFTPLogin -and $credentialValues.SFTPPassword) {
             try {
-                $detail = Test-SftpReadOnlyAccess `
+                # Кожен УВІМКНЕНИЙ SFTP-компонент вимагає, щоб його віддалений
+                # каталог призначення вже існував (production sync його не
+                # створює). Перелік — з канонічного $bazaSyncEffective.
+                $requiredSftpDirectories = @($bazaSyncEffective.RequiredSftpDestinations)
+                $sftpResult = Test-SftpReadOnlyAccess `
                     -Login ([string]$credentialValues.SFTPLogin) `
-                    -Password ([string]$credentialValues.SFTPPassword)
-                Add-DryRunResult PASS "SFTP" "Read-only доступ" $detail
+                    -Password ([string]$credentialValues.SFTPPassword) `
+                    -RequiredDirectories $requiredSftpDirectories
+                Add-DryRunResult PASS "SFTP" "Read-only доступ" $sftpResult.Detail
+                foreach ($presentDir in @($sftpResult.Present)) {
+                    Add-DryRunResult PASS "SFTP" "Каталог призначення" "$presentDir існує"
+                }
+                foreach ($missingDir in @($sftpResult.Missing)) {
+                    Add-DryRunResult FAIL "SFTP" "Каталог призначення" (
+                        "SFTP destination '$missingDir' не існує або недоступний. " +
+                        "Dry Run не створює каталоги."
+                    )
+                }
             } catch {
                 Add-DryRunResult FAIL "SFTP" "Read-only доступ" $_.Exception.Message
             }

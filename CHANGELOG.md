@@ -1,5 +1,44 @@
 # Changelog
 
+## 5.0.0-dev.2 — 2026-08-09
+
+Виправлення, виявлені під час тестового розгортання 5.0.0-dev.1. Централізовано
+effective-конфігурацію: Setup, Dry Run, Task Installer, Task Diagnose і
+production runtime тепер користуються однаковими правилами.
+
+- Перевірка облікового запису запланованих завдань — за SID
+  (`Test-BRAVOAccountIdentityEquivalent`), а не за текстом. Локалізована назва
+  Task Scheduler ("СИСТЕМА") мовно-незалежно дорівнює `SYSTEM`/`S-1-5-18`, тому
+  правильно встановлене завдання більше не отримує false FAIL і не валить Setup.
+- `Test-BRAVOScheduledTaskDefinition` перевіряє визначення проти EFFECTIVE
+  `schedulerSettings` (акаунт/LogonType/RunLevel через новий
+  `Get-BRAVOExpectedSchedulerPrincipal`), а не проти хардкоду SYSTEM/5/Highest:
+  прийняте Installer-ом визначення не оголошується invalid у Diagnose.
+- Завершено розділення RuntimeRoot / ConfigRoot. Скрипти-завдання, Dry Run,
+  модулі та ACL-hardening резолвяться з RuntimeRoot (каталог комплекту), а не з
+  каталогу конфігурації; `-ConfigPath` лишається зовнішнім. RuntimeRoot більше
+  не виводиться через `Split-Path $ConfigPath`.
+- Новий канонічний `Get-BRAVOEffectiveSynchronizationConfiguration` (публікується
+  як `$bazaSyncEffective`): чи потрібне BAZASync-завдання (`BAZA_APP_SFTP -or
+  BAZA_WWW_SFTP`), які BAZA-джерела обов'язкові, які SFTP-каталоги потрібні.
+  Валідна пара `BAZA_APP_SFTP=$false`/`BAZA_WWW_SFTP=$true` тепер вмикає
+  заплановану синхронізацію; `BAZASync` визначено в `BRAVO.config`, тому Diagnose
+  його більше не пропускає.
+- Dry Run валідує джерело КОЖНОГО увімкненого BAZA-компонента (LOCAL і SFTP): без
+  джерела — `FAIL` і ненульовий exit, а не `ГОТОВО ДО ЗАПУСКУ`. У `-TestAccess`
+  Dry Run стат-ить кожен увімкнений SFTP-каталог призначення (`/baza_app`,
+  `/baza_www`) через `FileExists`; відсутній — `FAIL` (каталоги не створюються).
+- `BAZA_WWW_SFTP` за замовчуванням `$false` (узгоджено з коментарем і
+  документацією): сервери без BRAVO Web більше не блокуються увімкненим прапорцем
+  із невизначеним джерелом.
+- Recovery (boot-тригер) показує «після наступного старту Windows (+затримка)»
+  замість sentinel `30.12.1899`; `LastTaskResult` подається як історія
+  виконання, окремо від валідації поточного визначення.
+- Провенанс версії: `ci\Update-BRAVOVersionStamp.ps1` відхиляє stamp на брудній
+  копії; self-test `Version/StampConsistency` перевіряє `buildId` як префікс
+  `sourceCommit`; RELEASE_CHECKLIST документує «розгортати тег, а не проміжний
+  коміт коду».
+
 ## 5.0.0-dev.1 — 2026-08-08
 
 Generation-aware backup refactor. Compatibility changes are intentional:

@@ -252,15 +252,9 @@ function ConvertTo-BRAVOMultipleInstancesPolicy {
     }
 }
 
-function ConvertTo-BRAVOLogonType {
-    param([string]$Value)
-
-    switch ($Value) {
-        "Interactive" { return 3 }    # TASK_LOGON_INTERACTIVE_TOKEN
-        "ServiceAccount" { return 5 } # TASK_LOGON_SERVICE_ACCOUNT
-        default { throw "Непідтримуваний LogonType: $Value" }
-    }
-}
+# ConvertTo-BRAVOSchedulerLogonType і Get-BRAVOExpectedSchedulerPrincipal
+# перенесено до модуля BRAVO.System: Installer застосовує expected principal
+# під час створення, а Diagnose перевіряє проти НЬОГО ж — спільне правило.
 
 function New-BRAVOTaskDefinition {
     param(
@@ -296,10 +290,13 @@ function New-BRAVOTaskDefinition {
         )
     }
 
-    $logonType = ConvertTo-BRAVOLogonType -Value ([string]$schedulerSettings.LogonType)
-    $definition.Principal.UserId = [string]$schedulerSettings.RunAsUser
-    $definition.Principal.LogonType = $logonType
-    $definition.Principal.RunLevel = 1 # TASK_RUNLEVEL_HIGHEST
+    # Один канонічний розрахунок principal (BRAVO.System). Diagnose перевіряє
+    # фактичне визначення проти цих самих значень.
+    $expectedPrincipal = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings
+    $logonType = $expectedPrincipal.LogonType
+    $definition.Principal.UserId = $expectedPrincipal.UserId
+    $definition.Principal.LogonType = $expectedPrincipal.LogonType
+    $definition.Principal.RunLevel = $expectedPrincipal.RunLevel
 
     $triggerTime = if ($TaskType -eq "Health" -or $TaskType -eq "BAZASync") {
         ConvertTo-ScheduleTime `
@@ -387,8 +384,8 @@ function New-BRAVOTaskDefinition {
 
     return [pscustomobject]@{
         Definition = $validatedDefinition
-        LogonType = $logonType
-        UserId = [string]$schedulerSettings.RunAsUser
+        LogonType = $expectedPrincipal.LogonType
+        UserId = $expectedPrincipal.UserId
     }
 }
 
@@ -403,7 +400,10 @@ function Test-SchedulerConfiguration {
         -not (Test-Path -LiteralPath $credentialSettings.HelperPath -PathType Leaf)) {
         throw "Не знайдено модуль Credential Manager: $($credentialSettings.HelperPath)"
     }
-    $runtimeRoot = Split-Path -Path $ResolvedConfigPath -Parent
+    # RuntimeRoot — каталог КОМПЛЕКТУ (звідки запущено Installer), а не каталог
+    # конфігурації: модулі є runtime-ресурсами й лежать поруч зі скриптами.
+    # $global:runtimeRoot публікує завантажувач із -RuntimeRoot $bravoScriptDirectory.
+    $runtimeRoot = [string]$global:runtimeRoot
     $requiredModuleNames = @(
         'BRAVO.Compatibility',
         'BRAVO.Credentials',
@@ -560,32 +560,12 @@ try {
         -ConfigPath $resolvedConfigPath `
         -RuntimeRoot $bravoScriptDirectory
 
-    $bazaSftpEnabled = $false
-    if ($null -ne $componentSettings -and
-        $null -ne $componentSettings.Synchronization) {
-        $bazaSftpEnabled = [System.Convert]::ToBoolean(
-            $componentSettings.Synchronization.BAZA_APP_SFTP
-        )
-    }
-
-    if (-not $schedulerSettings.Contains("BAZASync")) {
-        $schedulerSettings.BAZASync = @{
-            Enabled = $bazaSftpEnabled
-            TaskName = "BRAVO BAZA Synchronization"
-            Description = "Синхронізація BAZA_APP із хмарним SFTP кожні 4 години"
-            ScriptPath = [string]$schedulerSettings.Backup.ScriptPath
-            StartAt = "00:00"
-            RepeatEveryHours = 4
-            ExecutionTimeLimitHours = 2
-        }
-    } else {
-        # BAZA Sync не повинен запускатися, якщо SFTP-синхронізацію BAZA_APP
-        # вимкнено у componentSettings.Synchronization.BAZA_APP_SFTP.
-        $schedulerSettings.BAZASync.Enabled = (
-            [System.Convert]::ToBoolean($schedulerSettings.BAZASync.Enabled) -and
-            $bazaSftpEnabled
-        )
-    }
+    # schedulerSettings.BAZASync (разом із його .Enabled) визначає BRAVO.config
+    # через канонічний $bazaSyncEffective (BAZA_APP_SFTP OR BAZA_WWW_SFTP).
+    # Installer більше НЕ синтезує цей вузол і не звужує його лише до
+    # BAZA_APP_SFTP: інакше валідна пара BAZA_APP_SFTP=$false/BAZA_WWW_SFTP=$true
+    # мовчки лишала б BAZA_WWW без запланованої синхронізації, а Diagnose (який
+    # читає config напряму) не бачив би BAZASync взагалі.
 
     # Розклад є єдиним джерелом правди у BRAVO.config. Інсталятор не має
     # непомітно змінювати періодичність health-check під час реєстрації задач.
@@ -663,7 +643,11 @@ try {
         $schedulerSettings.Contains("RequireProtectedRuntime") -and
         [System.Convert]::ToBoolean($schedulerSettings.RequireProtectedRuntime)
     )
-    $runtimeRoot = Split-Path -Path $resolvedConfigPath -Parent
+    # ACL hardening застосовується до RuntimeRoot (каталог, який SYSTEM
+    # виконує), а не до каталогу конфігурації. Раніше тут стояло
+    # Split-Path $resolvedConfigPath, тому при -ConfigPath з іншого каталогу
+    # захищався б не той каталог.
+    $runtimeRoot = [string]$global:runtimeRoot
     if ($requireProtectedRuntime) {
         $profileRoot = [IO.Path]::GetFullPath(
             [Environment]::GetFolderPath("UserProfile")
@@ -817,16 +801,11 @@ try {
             )
         }
         Write-Host "Завдання встановлено: $($registeredTask.Path)" -ForegroundColor Green
-        $nextRunText = try {
-            $nextRunValue = $registeredTask.NextRunTime
-            if ($nextRunValue -is [datetime] -and $nextRunValue -gt [datetime]::MinValue) {
-                $nextRunValue.ToString('dd.MM.yyyy HH:mm')
-            } else {
-                'невідомо'
-            }
-        } catch {
-            'невідомо'
-        }
+        $nextRunRaw = try { $registeredTask.NextRunTime } catch { $null }
+        $nextRunText = Format-BRAVOSchedulerNextRun `
+            -TaskType $taskPlan.Type `
+            -NextRunTime $nextRunRaw `
+            -StartupDelayMinutes ([int]$taskSettings.StartupDelayMinutes)
         $taskSummaries.Add([pscustomobject]@{
             Name = $taskName
             Status = if ($null -eq $existingTaskBeforeChange) { 'INSTALLED' } else { 'UPDATED' }

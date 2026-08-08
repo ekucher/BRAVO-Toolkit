@@ -139,8 +139,11 @@ function Get-SetupConfiguration {
         Root = $runtimeRoot
         CredentialScript = $credentialScript
         DryRunScript = Join-Path $runtimeRoot "BRAVO_DRY_RUN.ps1"
-        TaskInstallScript = Join-Path $configRoot "BRAVO_TASKS_INSTALL.ps1"
-        TaskDiagnoseScript = Join-Path $configRoot "BRAVO_TASKS_DIAGNOSE.ps1"
+        # Task Installer/Diagnose — runtime-ресурси комплекту, тому беруться з
+        # RuntimeRoot, а не з каталогу конфігурації (ConfigRoot може бути іншим
+        # каталогом за -ConfigPath).
+        TaskInstallScript = Join-Path $runtimeRoot "BRAVO_TASKS_INSTALL.ps1"
+        TaskDiagnoseScript = Join-Path $runtimeRoot "BRAVO_TASKS_DIAGNOSE.ps1"
         NotificationsEnabled = (
             ([string]$bravoSettings.NotificationMode).Trim().ToLowerInvariant() -ne "none"
         )

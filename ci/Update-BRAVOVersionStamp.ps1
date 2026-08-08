@@ -1,7 +1,11 @@
 ﻿[CmdletBinding()]
 param(
     [string]$Root,
-    [switch]$Apply
+    [switch]$Apply,
+    # Дозволяє проставити stamp на брудній робочій копії. За замовчуванням це
+    # ЗАБОРОНЕНО: інакше зафіксований sourceCommit не описував би те, що реально
+    # розгортається (саме звідси беруться pre-stamp артефакти).
+    [switch]$Force
 )
 
 # Проставляння sourceCommit і buildId у VERSION.json (аудит P4).
@@ -11,10 +15,23 @@ param(
 # збігатися й не шукаються надійно в історії. sourceCommit — повний
 # 40-символьний git-hash.
 #
-# Запускається на робочій станції ПЕРЕД тегуванням релізу, коли всі
-# зміни вже закомічені: інакше буде зафіксовано hash коміту, який не
-# містить самого VERSION.json з цим hash. Це неминуча природа
-# самопосилання — зафіксований коміт є батьківським для релізного.
+# СХЕМА ПРОВЕНАНСУ (release/dev), щоб НЕ отримати packageVersion=нова +
+# sourceCommit=старий unrelated commit:
+#   1. Закомітьте ВЕСЬ код релізу (включно з bump packageVersion у VERSION.json).
+#      Цей коміт = "код релізу".
+#   2. На ЧИСТІЙ робочій копії запустіть цей скрипт із -Apply: він проставить
+#      sourceCommit = HEAD (коміт коду релізу) і buildId = його short SHA.
+#      Брудну копію скрипт відхиляє (без -Force), тому stamp завжди описує
+#      закомічений код.
+#   3. Перегенеруйте RUNTIME_MANIFEST.json (VERSION.json входить до маніфесту) і
+#      закомітьте VERSION.json + RUNTIME_MANIFEST.json — це "коміт-stamp".
+#   4. Анотований git-tag ставиться на КОМІТ-STAMP.
+# Самопосилання неминуче: у коміті-stamp sourceCommit вказує на його
+# БАТЬКІВСЬКИЙ коміт (код релізу), бо hash самого себе відомий лише після
+# створення. Тому РОЗГОРТАТИ ТРЕБА ТЕГ (=коміт-stamp), а НЕ проміжний коміт
+# коду: інакше на сервер потрапить VERSION.json ще з попереднім (старим) stamp.
+# Внутрішню узгодженість buildId==short(sourceCommit) перевіряє
+# BRAVO_SELF_TEST.ps1 (Version/StampConsistency).
 
 $ErrorActionPreference = 'Stop'
 
@@ -49,6 +66,15 @@ Write-Host "HEAD:                 $headCommit"
 Write-Host "VERSION.sourceCommit: $(if ([string]::IsNullOrWhiteSpace($currentSourceCommit)) { '(не задано)' } else { $currentSourceCommit })"
 Write-Host "VERSION.buildId:      $($version.buildId)"
 
+if ($isDirty -and $Apply -and -not $Force) {
+    # Провенанс: stamp на брудній копії зафіксував би sourceCommit=HEAD, який
+    # НЕ містить незакомічених змін -> pre-stamp/неузгоджений артефакт. Спершу
+    # закомітьте зміни, потім проставляйте stamp на чистій копії.
+    Write-Host ""
+    Write-Host "ЗАБЛОКОВАНО: у робочій копії є незакомічені зміни. Зафіксований hash не описував би те, що розгортається." -ForegroundColor Red
+    Write-Host "Спершу закомітьте код релізу, потім запустіть stamp на чистій копії (або -Force, якщо свідомо)." -ForegroundColor Red
+    exit 1
+}
 if ($isDirty) {
     Write-Host ""
     Write-Host "УВАГА: у робочій копії є незакомічені зміни. Зафіксований hash не описуватиме те, що ви розгорнете." -ForegroundColor Yellow

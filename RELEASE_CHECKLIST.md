@@ -11,6 +11,17 @@
 
 - [ ] `VERSION.json` оновлено: `packageVersion`, `releaseDate`, `buildId`
       (короткий git-hash коміту релізу).
+- [ ] **Провенанс версії** (щоб на сервер не потрапив pre-stamp артефакт —
+      `packageVersion` нова, а `sourceCommit`/`buildId` від старого коміту):
+      1) закомітьте весь код релізу (разом із bump `packageVersion`);
+      2) на **чистій** робочій копії запустіть
+      `.\ci\Update-BRAVOVersionStamp.ps1 -Apply` (брудну копію скрипт
+      відхиляє — це навмисно); 3) перегенеруйте `RUNTIME_MANIFEST.json` і
+      закомітьте `VERSION.json`+`RUNTIME_MANIFEST.json` окремим коміт-stamp;
+      4) тег ставиться на коміт-stamp. **Розгортати треба ТЕГ (коміт-stamp), а
+      не проміжний коміт коду** — інакше `VERSION.json` ще міститиме
+      попередній stamp. `BRAVO_SELF_TEST.ps1` (`Version/StampConsistency`)
+      перевіряє, що `buildId` є префіксом `sourceCommit`.
 - [ ] `ModuleVersion` усіх `modules\*\*.psd1` синхронізовано з
       `VERSION.json.packageVersion` — `BRAVO_SELF_TEST.ps1` перевіряє це
       автоматично (`Version/ModuleManifests`), релізу без збігу не буде.
@@ -71,8 +82,9 @@
       у CI. Вручну звіряти `git diff master developer -- VERSION.json`
       більше не потрібно — навпаки, різниця там тепер обов'язкова
       (розділ 4 політики: однакова версія в обох гілках заборонена).
-- [ ] Git tag `vX.Y.Z` створено на комміті релізу (анотований —
-      `git tag -a`, з описом ключових змін версії).
+- [ ] Git tag `vX.Y.Z` створено на **коміті-stamp** (анотований —
+      `git tag -a`, з описом ключових змін версії). Розгортання бере саме тег,
+      а не проміжний коміт коду (див. «Провенанс версії» вище).
 - [ ] `git diff` перед комітом переглянуто вручну — жодних секретів,
       реальних облікових даних чи production-шляхів у сирцях.
 

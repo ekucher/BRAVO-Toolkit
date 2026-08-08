@@ -1147,6 +1147,83 @@ function Resolve-BRAVOEffectiveBackupRoot {
     }
 }
 
+function ConvertTo-BRAVOSyncFlag {
+    # Захисне приведення прапорця синхронізації до [bool]. Значення в
+    # componentSettings — справжні $true/$false, але Installer історично
+    # застосовував [Convert]::ToBoolean; зберігаємо ту саму толерантність в
+    # одному місці, щоб усі споживачі трактували прапорці однаково.
+    param($Value)
+    if ($Value -is [bool]) { return $Value }
+    if ($null -eq $Value) { return $false }
+    try { return [System.Convert]::ToBoolean($Value) } catch { return $false }
+}
+
+function Get-BRAVOEffectiveSynchronizationConfiguration {
+    # ЄДИНЕ канонічне джерело правди про синхронізацію BAZA. Централізує:
+    #   - чи потрібне заплановане BAZASync-завдання (SFTP-операція за
+    #     визначенням: BRAVO_ARCHIV.ps1 -SyncBAZA синхронізує лише SFTP);
+    #   - які BAZA-джерела обов'язкові (LOCAL АБО SFTP увімкнено -> джерело
+    #     обов'язкове й має існувати);
+    #   - які SFTP-каталоги призначення обов'язкові для preflight.
+    # Однакові вхідні дані -> однаковий результат у Config Loader, Task
+    # Installer, Task Diagnose, Dry Run і production runtime. Жоден скрипт не
+    # повторює вираз "BAZA_APP_SFTP -or BAZA_WWW_SFTP" самостійно (ТЗ:
+    # "Не дублювати ... у 4-5 різних скриптах").
+    [CmdletBinding()]
+    param(
+        [hashtable]$Synchronization,
+        [string]$BazaAppSource,
+        [string]$BazaWWWSource,
+        $BazaWWWDetection,
+        [hashtable]$SftpDirectories
+    )
+
+    if ($null -eq $Synchronization) { $Synchronization = @{} }
+
+    $appLocal = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_APP_LOCAL']
+    $appSftp = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_APP_SFTP']
+    $wwwLocal = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_WWW_LOCAL']
+    $wwwSftp = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_WWW_SFTP']
+
+    $wwwReason = $null
+    if ($null -ne $BazaWWWDetection -and
+        $null -ne $BazaWWWDetection.PSObject.Properties['Reason']) {
+        $wwwReason = [string]$BazaWWWDetection.Reason
+    }
+
+    $appComponent = [pscustomobject]@{
+        Name = 'BAZA_APP'
+        DisplayName = 'BAZA APP'
+        LocalEnabled = $appLocal
+        SftpEnabled = $appSftp
+        AnyEnabled = ($appLocal -or $appSftp)
+        Source = [string]$BazaAppSource
+        SourceReason = $null
+        SftpRemoteDirectory = if ($null -ne $SftpDirectories) { [string]$SftpDirectories['BAZA'] } else { $null }
+    }
+    $wwwComponent = [pscustomobject]@{
+        Name = 'BAZA_WWW'
+        DisplayName = 'BAZA WWW'
+        LocalEnabled = $wwwLocal
+        SftpEnabled = $wwwSftp
+        AnyEnabled = ($wwwLocal -or $wwwSftp)
+        Source = [string]$BazaWWWSource
+        SourceReason = $wwwReason
+        SftpRemoteDirectory = if ($null -ne $SftpDirectories) { [string]$SftpDirectories['BAZAWWW'] } else { $null }
+    }
+
+    $components = @($appComponent, $wwwComponent)
+    return [pscustomobject]@{
+        Components = $components
+        ScheduledSftpSyncRequired = ($appSftp -or $wwwSftp)
+        RequiredSftpDestinations = @(
+            $components |
+                Where-Object { $_.SftpEnabled -and -not [string]::IsNullOrWhiteSpace($_.SftpRemoteDirectory) } |
+                ForEach-Object { $_.SftpRemoteDirectory }
+        )
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOServiceExecutablePath',
     'Find-BRAVOServiceByCandidates',
@@ -1160,6 +1237,7 @@ Export-ModuleMember -Function @(
     'Resolve-BRAVOEffectiveLimsRoot',
     'Resolve-BRAVOEffectiveSystemLogRoot',
     'Resolve-BRAVOEffectiveBackupRoot',
+    'Get-BRAVOEffectiveSynchronizationConfiguration',
     'Test-BRAVODiscoveryResult',
     'Save-BRAVODiscoveryBaseline',
     'Compare-BRAVODiscoveryBaseline'

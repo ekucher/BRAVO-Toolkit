@@ -5358,29 +5358,45 @@ try {
 
     # --- Runtime/06: Task Scheduler action — абсолютні шляхи й SYSTEM ---
     $bravoConfigTextForScheduler = $bravoConfigTextForTools
+    # Principal (акаунт/LogonType/RunLevel) береться з канонічного
+    # Get-BRAVOExpectedSchedulerPrincipal (BRAVO.System), а не хардкодиться в
+    # Installer — той самий розрахунок перевіряє Diagnose. RunLevel=Highest
+    # гарантує сам helper (перевіряє Scheduler/ExpectedPrincipalFromConfig).
+    $systemModuleTextForScheduler = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.System\BRAVO.System.psm1"),
+        [Text.Encoding]::UTF8
+    )
     Test-BRAVOCondition `
         -Condition (
             [regex]::IsMatch($bravoConfigTextForScheduler, 'PowerShellExecutable\s*=\s*Join-Path\s+\$env:SystemRoot\s+"System32\\WindowsPowerShell\\v1\.0\\powershell\.exe"') -and
-            $taskInstallerText.Contains('$definition.Principal.RunLevel = 1') -and
+            $taskInstallerText.Contains('Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings') -and
+            $taskInstallerText.Contains('$definition.Principal.RunLevel = $expectedPrincipal.RunLevel') -and
+            $systemModuleTextForScheduler.Contains('RunLevel = 1') -and
             $taskInstallerText.Contains('$action.WorkingDirectory = Split-Path -Path $scriptPath -Parent') -and
             $taskInstallerText.Contains('$actionArguments += " -File `"$scriptPath`""') -and
             $taskInstallerText.Contains('$actionArguments += " -ConfigPath `"$ResolvedConfigPath`""')
         ) `
         -Name "Runtime/06-SchedulerActionUsesAbsolutePathsAndHighest" `
-        -Failure "дія завдання має використовувати абсолютний powershell.exe, абсолютні -File/-ConfigPath, WorkingDirectory = каталог скрипта і RunLevel Highest"
+        -Failure "дія завдання має використовувати абсолютний powershell.exe, абсолютні -File/-ConfigPath, WorkingDirectory = каталог скрипта; principal (RunLevel Highest) — з Get-BRAVOExpectedSchedulerPrincipal"
 
     # --- Runtime/07: diagnostics покриває всі production-завдання ---
+    # Перевірка визначення тепер SID-based (акаунт) і проти EFFECTIVE expected
+    # значень (той самий Get-BRAVOExpectedSchedulerPrincipal, що й Installer),
+    # а не проти хардкоду SYSTEM/5/Highest — інакше прийняте Installer-ом
+    # визначення могло б оголошуватись invalid у Diagnose.
     Test-BRAVOCondition `
         -Condition (
             $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync")') -and
             $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
             $tasksDiagnoseTextForRuntime.Contains('BAZASync    = @(''-NoPause'', ''-SyncBAZA'')') -and
             $tasksDiagnoseTextForRuntime.Contains('Recovery    = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
-            $tasksDiagnoseTextForRuntime.Contains('LogonType=$($principal.LogonType), очікується ServiceAccount (5)') -and
-            $tasksDiagnoseTextForRuntime.Contains('RunLevel=$($principal.RunLevel), очікується Highest (1)')
+            $tasksDiagnoseTextForRuntime.Contains('Test-BRAVOAccountIdentityEquivalent') -and
+            $tasksDiagnoseTextForRuntime.Contains('Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings') -and
+            $tasksDiagnoseTextForRuntime.Contains('LogonType=$($principal.LogonType), очікується $ExpectedLogonType') -and
+            $tasksDiagnoseTextForRuntime.Contains('RunLevel=$($principal.RunLevel), очікується $ExpectedRunLevel')
         ) `
         -Name "Runtime/07-TaskDiagnosticsCoversAllProductionTasks" `
-        -Failure "діагностика має перевіряти визначення ВСІХ production-завдань, включно з BAZASync: SYSTEM/ServiceAccount/Highest, аргументи, -ConfigPath і WorkingDirectory"
+        -Failure "діагностика має перевіряти визначення ВСІХ production-завдань, включно з BAZASync, SID-based акаунтом і проти effective expected LogonType/RunLevel"
 
     # --- Runtime/08: SYSTEM preflight робить справжній probe запису ---
     $dryRunProbeModule = New-BRAVOSelfTestRuntimeModule `
@@ -5682,6 +5698,208 @@ try {
         -Condition $backupCompositionSafe `
         -Name "Paths/15-BackupCompositionOnAbsentDriveDoesNotThrow" `
         -Failure "побудова BackupRoot і призначень на відсутньому диску (Q:) не має кидати DriveNotFoundException — лише [IO.Path]::Combine, без Join-Path"
+
+    # ===== ВИПРАВЛЕННЯ ПІСЛЯ ТЕСТОВОГО РОЗГОРТАННЯ 5.0.0-dev.1
+    # (SID-акаунти, RuntimeRoot!=ConfigRoot, effective BAZASync, BAZA source
+    # validation, boot-trigger NextRunTime, version provenance) =====
+    Remove-Module -Name 'BRAVO.System' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Discovery\BRAVO.Discovery.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.System\BRAVO.System.psd1") -Force -ErrorAction Stop
+
+    $syncSftpDirs = @{ BAZA = 'baza_app'; BAZAWWW = 'baza_www' }
+
+    # --- Sync/01: BAZA_APP only -> BAZASync потрібне, лише /baza_app ---
+    $syncAppOnly = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $true; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $false; BAZA_WWW_LOCAL = $false } `
+        -BazaAppSource 'D:\LIMS-NEW\BAZA' -BazaWWWSource '' -BazaWWWDetection $null -SftpDirectories $syncSftpDirs
+    $syncAppComp = @($syncAppOnly.Components | Where-Object { $_.Name -eq 'BAZA_APP' })[0]
+    $syncWwwCompA = @($syncAppOnly.Components | Where-Object { $_.Name -eq 'BAZA_WWW' })[0]
+    Test-BRAVOCondition `
+        -Condition (
+            $syncAppOnly.ScheduledSftpSyncRequired -and
+            $syncAppComp.AnyEnabled -and -not $syncWwwCompA.AnyEnabled -and
+            (@($syncAppOnly.RequiredSftpDestinations) -contains 'baza_app') -and
+            (@($syncAppOnly.RequiredSftpDestinations) -notcontains 'baza_www')
+        ) `
+        -Name "Sync/01-BazaAppOnlyEnablesSync" `
+        -Failure "BAZA_APP_SFTP=true (WWW off) має вмикати BAZASync і вимагати лише /baza_app"
+
+    # --- Sync/02: BAZA_WWW only -> BAZASync ТАКОЖ потрібне (регресія) ---
+    $syncWwwOnly = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $false; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $true; BAZA_WWW_LOCAL = $false } `
+        -BazaAppSource '' -BazaWWWSource 'C:\Br-a-vo.web\www\BAZA' -BazaWWWDetection ([pscustomobject]@{ Success = $true; Reason = $null }) -SftpDirectories $syncSftpDirs
+    $syncWwwComp = @($syncWwwOnly.Components | Where-Object { $_.Name -eq 'BAZA_WWW' })[0]
+    Test-BRAVOCondition `
+        -Condition (
+            $syncWwwOnly.ScheduledSftpSyncRequired -and $syncWwwComp.AnyEnabled -and
+            (@($syncWwwOnly.RequiredSftpDestinations) -contains 'baza_www')
+        ) `
+        -Name "Sync/02-BazaWwwOnlyEnablesSync" `
+        -Failure "BAZA_WWW_SFTP=true (APP off) теж має вмикати BAZASync (регресія: Installer дивився лише на BAZA_APP_SFTP)"
+
+    # --- Sync/03: обидва вимкнені -> BAZASync не потрібне ---
+    $syncNone = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $false; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $false; BAZA_WWW_LOCAL = $false } `
+        -BazaAppSource '' -BazaWWWSource '' -BazaWWWDetection $null -SftpDirectories $syncSftpDirs
+    Test-BRAVOCondition `
+        -Condition (-not $syncNone.ScheduledSftpSyncRequired -and @($syncNone.RequiredSftpDestinations).Count -eq 0) `
+        -Name "Sync/03-BothDisabledNoSync" `
+        -Failure "обидва SFTP-прапорці вимкнені -> BAZASync не потрібне, destinations порожні"
+
+    # --- Sync/04: увімкнений компонент із порожнім джерелом -> позначено ---
+    $syncMissingSource = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $false; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $true; BAZA_WWW_LOCAL = $false } `
+        -BazaAppSource '' -BazaWWWSource '' -BazaWWWDetection ([pscustomobject]@{ Success = $false; Reason = 'службу BRAVO Web не знайдено' }) -SftpDirectories $syncSftpDirs
+    $syncMissingComp = @($syncMissingSource.Components | Where-Object { $_.Name -eq 'BAZA_WWW' })[0]
+    Test-BRAVOCondition `
+        -Condition (
+            $syncMissingComp.AnyEnabled -and
+            [string]::IsNullOrWhiteSpace([string]$syncMissingComp.Source) -and
+            ([string]$syncMissingComp.SourceReason -eq 'службу BRAVO Web не знайдено')
+        ) `
+        -Name "Sync/04-EnabledMissingSourceIsFlagged" `
+        -Failure "увімкнений BAZA_WWW із невизначеним джерелом -> AnyEnabled=true з причиною (Dry Run має дати FAIL)"
+
+    # --- Sync/05: ВИМКНЕНИЙ компонент із порожнім джерелом -> не блокує ---
+    $syncDisabledMissing = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $true; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $false; BAZA_WWW_LOCAL = $false } `
+        -BazaAppSource 'D:\LIMS-NEW\BAZA' -BazaWWWSource '' -BazaWWWDetection ([pscustomobject]@{ Success = $false; Reason = 'вимкнено' }) -SftpDirectories $syncSftpDirs
+    $syncDisabledComp = @($syncDisabledMissing.Components | Where-Object { $_.Name -eq 'BAZA_WWW' })[0]
+    Test-BRAVOCondition `
+        -Condition (-not $syncDisabledComp.AnyEnabled) `
+        -Name "Sync/05-DisabledMissingSourceDoesNotBlock" `
+        -Failure "вимкнений BAZA_WWW не має вважатися увімкненим лише через відсутнє джерело"
+
+    # --- Scheduler/ExpectedPrincipalFromConfig: не хардкод, а з effective settings ---
+    $principalService = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings @{ RunAsUser = 'SYSTEM'; LogonType = 'ServiceAccount' }
+    $principalInteractive = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings @{ RunAsUser = 'DOMAIN\svc-bravo'; LogonType = 'Interactive' }
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$principalService.UserId -eq 'SYSTEM' -and [int]$principalService.LogonType -eq 5 -and [int]$principalService.RunLevel -eq 1 -and
+            [string]$principalInteractive.UserId -eq 'DOMAIN\svc-bravo' -and [int]$principalInteractive.LogonType -eq 3
+        ) `
+        -Name "Scheduler/ExpectedPrincipalFromConfig" `
+        -Failure "expected principal (акаунт/LogonType/RunLevel) має братися з schedulerSettings, а не хардкодитися"
+
+    # --- Scheduler/BootTriggerNextRunNo1899: Recovery ніколи не показує 30.12.1899 ---
+    $recoveryNext = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 0
+    $recoveryNextDelay = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 5
+    $dailySentinel = Format-BRAVOSchedulerNextRun -TaskType 'Backup' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 0
+    $dailyValid = Format-BRAVOSchedulerNextRun -TaskType 'Backup' -NextRunTime ([datetime]'2026-08-09T23:00:00') -StartupDelayMinutes 0
+    Test-BRAVOCondition `
+        -Condition (
+            $recoveryNext -eq 'після наступного старту Windows' -and
+            ($recoveryNextDelay -like '*затримка 5 хв.*') -and ($recoveryNext -notmatch '1899') -and
+            ($dailySentinel -eq 'невідомо') -and ($dailySentinel -notmatch '1899') -and
+            ($dailyValid -like '*09.08.2026*')
+        ) `
+        -Name "Scheduler/BootTriggerNextRunNo1899" `
+        -Failure "Recovery (boot) -> 'після наступного старту Windows', ніколи 30.12.1899; sentinel звичайного завдання -> 'невідомо'"
+
+    # --- Deploy/RuntimeRootConfigRootSeparation: runtime-ресурси з RuntimeRoot ---
+    $separateConfigRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CFGROOT_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $separateConfigRoot -Force | Out-Null
+    try {
+        Copy-Item -LiteralPath (Join-Path $root 'BRAVO.config') -Destination (Join-Path $separateConfigRoot 'BRAVO.config') -Force
+        Import-BravoConfiguration `
+            -ConfigRoot $separateConfigRoot `
+            -ConfigPath (Join-Path $separateConfigRoot 'BRAVO.config') `
+            -RuntimeRoot $root | Out-Null
+        $runtimePrefix = ([IO.Path]::GetFullPath($root)).TrimEnd('\') + '\'
+        $configPrefix = ([IO.Path]::GetFullPath($separateConfigRoot)).TrimEnd('\') + '\'
+        $backupScript = [string]$global:schedulerSettings.Backup.ScriptPath
+        $healthScript = [string]$global:schedulerSettings.Health.ScriptPath
+        $bazaScript = [string]$global:schedulerSettings.BAZASync.ScriptPath
+        $runtimeLogRootValue = [string]$global:runtimeLogRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $backupScript.StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                $healthScript.StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                $bazaScript.StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                $runtimeLogRootValue.StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                -not $backupScript.StartsWith($configPrefix, [StringComparison]::OrdinalIgnoreCase)
+            ) `
+            -Name "Deploy/RuntimeRootConfigRootSeparation" `
+            -Failure "коли RuntimeRoot != ConfigRoot, скрипти-завдання й RuntimeLogRoot мають резолвитися з RuntimeRoot, а не з каталогу конфігурації"
+        Test-BRAVOCondition `
+            -Condition ([bool]$global:schedulerSettings.BAZASync.Enabled -eq [bool]$global:bazaSyncEffective.ScheduledSftpSyncRequired) `
+            -Name "Deploy/BazaSyncEnabledFromEffective" `
+            -Failure "schedulerSettings.BAZASync.Enabled має дорівнювати bazaSyncEffective.ScheduledSftpSyncRequired"
+    } finally {
+        Remove-Item -LiteralPath $separateConfigRoot -Recurse -Force -ErrorAction SilentlyContinue
+        # Відновити стандартний стан (RuntimeRoot == ConfigRoot == репозиторій).
+        Import-BravoConfiguration -ConfigRoot $root -ConfigPath (Join-Path $root 'BRAVO.config') -RuntimeRoot $root | Out-Null
+    }
+
+    # --- TaskDefinition/*: синтетична перевірка Test-BRAVOScheduledTaskDefinition ---
+    # Об'єднуємо текст Diagnose (Test-BRAVOScheduledTaskDefinition + залежний
+    # Test-BRAVOMappedNetworkDrive) і Compatibility (SID-хелпери), щоб функція
+    # мала всі залежності у власному module scope.
+    $diagnoseSourceText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1'), [Text.Encoding]::UTF8)
+    $compatibilitySourceText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1'), [Text.Encoding]::UTF8)
+    $taskDefinitionModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($diagnoseSourceText + "`n" + $compatibilitySourceText) `
+        -FunctionNames @('Test-BRAVOMappedNetworkDrive', 'ConvertTo-BRAVOAccountSidValue', 'Test-BRAVOAccountIdentityEquivalent', 'Test-BRAVOScheduledTaskDefinition')
+    $syntheticExecutable = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $newSyntheticTask = {
+        param($UserId, $LogonType, $RunLevel, $ExecutablePath)
+        [pscustomobject]@{
+            Enabled = $true
+            Definition = [pscustomobject]@{
+                Principal = [pscustomobject]@{ UserId = $UserId; LogonType = $LogonType; RunLevel = $RunLevel }
+                Settings = [pscustomobject]@{ ExecutionTimeLimit = 'PT30M' }
+                Actions = @([pscustomobject]@{ Path = $ExecutablePath; Arguments = '-NoProfile -NonInteractive'; WorkingDirectory = $null })
+            }
+        }
+    }
+    $invokeTaskDefinition = {
+        param($Task)
+        Test-BRAVOScheduledTaskDefinition `
+            -TaskType 'Backup' -RegisteredTask $Task -TaskSettings @{} `
+            -ExpectedConfigPath '' -ExpectedExecutable '' -RequiredArgumentTokens @() `
+            -ExpectedAccount 'SYSTEM' -ExpectedLogonType 5 -ExpectedRunLevel 1
+    }
+    # SID-форма SYSTEM — те, що Task Scheduler зберігає для локалізованого "СИСТЕМА".
+    $taskLocalizedSid = (New-Object Security.Principal.SecurityIdentifier('S-1-5-18')).Value
+    $problemsSystem = @(& $taskDefinitionModule $invokeTaskDefinition (& $newSyntheticTask $taskLocalizedSid 5 1 $syntheticExecutable))
+    $problemsMismatch = @(& $taskDefinitionModule $invokeTaskDefinition (& $newSyntheticTask 'S-1-5-19' 5 1 $syntheticExecutable))
+    $problemsLogon = @(& $taskDefinitionModule $invokeTaskDefinition (& $newSyntheticTask $taskLocalizedSid 3 1 $syntheticExecutable))
+    $problemsRunLevel = @(& $taskDefinitionModule $invokeTaskDefinition (& $newSyntheticTask $taskLocalizedSid 5 0 $syntheticExecutable))
+    Test-BRAVOCondition `
+        -Condition (@($problemsSystem | Where-Object { $_ -like '*UserId*' }).Count -eq 0) `
+        -Name "TaskDefinition/SystemAccountBySidPasses" `
+        -Failure "SYSTEM у SID-формі (як на локалізованій Windows) не має давати проблему UserId"
+    Test-BRAVOCondition `
+        -Condition (@($problemsMismatch | Where-Object { $_ -like '*UserId*' }).Count -gt 0) `
+        -Name "TaskDefinition/WrongAccountFails" `
+        -Failure "невідповідний акаунт (LocalService замість SYSTEM) має давати проблему UserId"
+    Test-BRAVOCondition `
+        -Condition (@($problemsLogon | Where-Object { $_ -like '*LogonType*' }).Count -gt 0) `
+        -Name "TaskDefinition/WrongLogonTypeFails" `
+        -Failure "невідповідний LogonType має фіксуватися проти expected"
+    Test-BRAVOCondition `
+        -Condition (@($problemsRunLevel | Where-Object { $_ -like '*RunLevel*' }).Count -gt 0) `
+        -Name "TaskDefinition/WrongRunLevelFails" `
+        -Failure "невідповідний RunLevel має фіксуватися проти expected"
+
+    # --- Version/StampConsistency: buildId є префіксом sourceCommit ---
+    # Ловить неузгоджений/pre-stamp VERSION.json (packageVersion нова, а
+    # build/sourceCommit від іншого коміту). Провенанс детально документовано в
+    # ci\Update-BRAVOVersionStamp.ps1 і RELEASE_CHECKLIST.md.
+    $versionStampJson = [IO.File]::ReadAllText((Join-Path $root 'VERSION.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+    $stampBuildId = [string]$versionStampJson.buildId
+    $stampSourceCommit = [string]$versionStampJson.sourceCommit
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($stampBuildId) -and
+            -not [string]::IsNullOrWhiteSpace($stampSourceCommit) -and
+            ($stampSourceCommit -match '^[0-9a-fA-F]{40}$') -and
+            ($stampBuildId.Length -ge 7) -and
+            $stampSourceCommit.StartsWith($stampBuildId, [StringComparison]::OrdinalIgnoreCase)
+        ) `
+        -Name "Version/StampConsistency" `
+        -Failure "VERSION.json.buildId має бути префіксом 40-символьного sourceCommit; інакше артефакт pre-stamp/неузгоджений"
 
     # ===== РОТАЦІЯ, МІГРАЦІЯ ТА RETENTION ЖУРНАЛІВ: 27 сценаріїв
     # (ТЗ «Production-grade ротація, міграція, архівація та retention
