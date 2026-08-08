@@ -29,6 +29,12 @@ $result = Import-BravoConfiguration `
     -ConfigPath $ConfigPath `
     -PassThru
 
+# Ефективні корені (з урахуванням AUTO) обчислює BRAVO.config і публікує
+# як $global-змінні. Config Test показує саме final effective values, а не
+# лише raw config strings (ТЗ RuntimeRoot/LIMSRoot §53, §88).
+$limsRootResult = $global:limsRootResult
+$systemLogRootResult = $global:systemLogRootResult
+$backupRootResult = $global:backupRootResult
 $validation = [pscustomobject]@{
     Status = 'OK'
     Product = $result.Version.Product
@@ -38,9 +44,19 @@ $validation = [pscustomobject]@{
     ConfigSchemaVersion = $result.Configuration.ConfigSchemaVersion
     ConfigFormat = $result.Configuration.Format
     ConfigPath = $result.Configuration.ConfigPath
-    LIMSRoot = [string]$result.PathSettings.LIMSRoot
-    ArchiveRoot = [string]$result.PathSettings.ArchiveRoot
-    BackupRoot = [string]$result.PathSettings.BackupRoot
+    RuntimeRoot = [string]$global:runtimeRoot
+    RuntimeLogRoot = [string]$global:runtimeLogRoot
+    ConfiguredLIMSRoot = [string]$limsRootResult.ConfiguredPath
+    EffectiveLIMSRoot = [string]$global:effectiveLimsRoot
+    LIMSRootSource = [string]$limsRootResult.Source
+    ConfiguredSystemLogRoot = [string]$systemLogRootResult.ConfiguredPath
+    EffectiveSystemLogRoot = [string]$global:systemLogRoot
+    SystemLogRootSource = [string]$systemLogRootResult.Source
+    ConfiguredBackupRoot = [string]$backupRootResult.ConfiguredPath
+    EffectiveBackupRoot = [string]$global:backupRootPath
+    BackupRootSource = [string]$backupRootResult.Source
+    StateRoot = [string]$global:stateRoot
+    OperationLockPath = [string]$global:operationLockSettings.Path
     LoadedAt = $result.Configuration.LoadedAt
 }
 
@@ -53,9 +69,13 @@ Write-Host ('[INFO] Configuration loaded: {0}' -f $validation.ConfigPath)
 Write-Host ('[INFO] Package version: {0}' -f $validation.PackageVersion)
 Write-Host ('[INFO] Legacy config version: {0}' -f $validation.LegacyScriptVersion)
 Write-Host ('[INFO] Configuration schema: {0}' -f $validation.ConfigSchemaVersion)
-Write-Host ('[INFO] LIMSRoot: {0}' -f $validation.LIMSRoot)
-Write-Host ('[INFO] ArchiveRoot: {0}' -f $validation.ArchiveRoot)
-Write-Host ('[INFO] BackupRoot: {0}' -f $validation.BackupRoot)
+Write-Host ('[INFO] RuntimeRoot: {0}' -f $validation.RuntimeRoot)
+Write-Host ('[INFO] RuntimeLogRoot (script logs): {0}' -f $validation.RuntimeLogRoot)
+Write-Host ('[INFO] LIMSRoot: configured="{0}" effective="{1}" source={2}' -f $validation.ConfiguredLIMSRoot, $validation.EffectiveLIMSRoot, $validation.LIMSRootSource)
+Write-Host ('[INFO] SystemLogRoot: configured="{0}" effective="{1}" source={2}' -f $validation.ConfiguredSystemLogRoot, $validation.EffectiveSystemLogRoot, $validation.SystemLogRootSource)
+Write-Host ('[INFO] BackupRoot: configured="{0}" effective="{1}" source={2}' -f $validation.ConfiguredBackupRoot, $validation.EffectiveBackupRoot, $validation.BackupRootSource)
+Write-Host ('[INFO] StateRoot: {0}' -f $validation.StateRoot)
+Write-Host ('[INFO] Operation lock: {0}' -f $validation.OperationLockPath)
 
 if (-not [string]::IsNullOrWhiteSpace([string]$validation.LegacyScriptVersion) -and
     -not $validation.PackageVersionMatchesLegacyConfig) {

@@ -3,14 +3,13 @@
 # Windows-службами та активним bravo.ini, з повним ручним перевизначенням
 # через BRAVO.config.
 #
-# BRAVO_ROOT — каталог встановлення служби BRAVO (де лежить bravo.exe).
-# Не плутати з pathSettings.ArchiveRoot (BRAVO.config) — каталогом самого
-# скрипта резервного копіювання (де лежать Tools\/LOGS\/TOOLS_MANIFEST.json,
-# завжди поруч зі скриптом, ніколи не через Discovery). BACKUP_ROOT —
-# підкаталог "ARCHIV" усередині BRAVO_ROOT, дефолт для
-# pathSettings.BackupRoot (куди зберігаються самі архіви) — третє окреме
-# поняття, яке легко сплутати з двома першими через спільне слово
-# "ARCHIV"/"архів".
+# BRAVO_ROOT — каталог встановлення служби BRAVO (де лежить bravo.exe); він же
+# EffectiveLIMSRoot при AUTO-визначенні (Resolve-BRAVOEffectiveLimsRoot).
+# Не плутати з RuntimeRoot (BRAVO.config) — каталогом самого комплекту
+# скриптів (де лежать Tools\/modules\/TOOLS_MANIFEST.json, завжди поруч зі
+# скриптом, ніколи не через Discovery), із SystemLogRoot (каталог системних
+# журналів) і з BackupRoot (куди зберігаються самі архіви). Усі чотири —
+# окремі поняття, які легко сплутати через спільне слово "ARCHIV"/"архів".
 #
 # Мінімальна підтримувана версія: Windows PowerShell 3.0.
 #
@@ -365,12 +364,10 @@ function Resolve-BRAVOInstallationDiscovery {
     # 1. CLI-параметри runtime-скриптів — не реалізовано в цій ітерації.
     # 2. Явний override у BRAVO.config (-DiscoverySettings) — виграє й
     #    ніколи не замінюється автоматично знайденим значенням.
-    # 3. Активний bravo.ini, знайдений через встановлену службу BRAVO.
+    # 3. Canonical bravo.ini, визначений лише архітектурою ОС.
     # 4. Похідні значення (MODEL_SOURCE/BLOG_SOURCE/BRAVOEXCH_SOURCE/
     #    BAZA_APP/WEB_ROOT/BAZA_WWW) з даних bravo.ini й Apache-служби.
-    # 5. Legacy fallback — чинна до цієї зміни поведінка
-    #    (LIMSRoot-відносні шляхи), якщо служба/bravo.ini недоступні.
-    # 6. Керована помилка — тут НЕ кидається; повертається DiscoveryResult
+    # 5. Керована помилка — тут НЕ кидається; повертається DiscoveryResult
     #    із Reasons, що пояснюють кожне поле, а остаточне рішення "це
     #    помилка чи ні" ухвалює Test-BRAVODiscoveryResult (validation),
     #    щоб точки виклику самі вирішували критичність.
@@ -455,8 +452,8 @@ function Resolve-BRAVOInstallationDiscovery {
             $bravoRootReason += " [УВАГА: знайдено кілька служб BRAVO з різними виконуваними файлами, обрано першу]"
         }
     } else {
-        $bravoRoot = $LimsRoot
-        $bravoRootReason = "legacy fallback: LIMSRoot (службу BRAVO не знайдено)"
+        $bravoRoot = $null
+        $bravoRootReason = "каталог BRAVO не визначено: немає override або служби з підтвердженими Name/DisplayName"
     }
     $reasons["BravoRoot"] = $bravoRootReason
 
@@ -496,8 +493,7 @@ function Resolve-BRAVOInstallationDiscovery {
             [string]$FieldName,
             [string]$IniSection,
             [string]$IniKey,
-            [scriptblock]$DeriveFromIniValue,
-            [string]$LegacyFallbackPath
+            [scriptblock]$DeriveFromIniValue
         )
 
         if ($sourceOverrides.Contains($FieldName) -and
@@ -520,24 +516,23 @@ function Resolve-BRAVOInstallationDiscovery {
                 Reason = "bravo.ini [$IniSection] $IniKey=$iniValue"
             }
         }
-        return [pscustomobject]@{
-            Value = $LegacyFallbackPath
-            Reason = "legacy fallback: LIMSRoot-відносний шлях (bravo.ini недоступний або без $IniKey)"
+        $missingReason = if ($null -eq $iniData) {
+            "canonical bravo.ini недоступний: $bravoIniReason"
+        } else {
+            "у canonical bravo.ini '$bravoIniPath' немає непорожнього ключа [$IniSection] $IniKey"
         }
+        return [pscustomobject]@{ Value = $null; Reason = $missingReason }
     }
 
     $modelResolved = Resolve-BRAVOSourceField `
         -FieldName "MODEL" -IniSection "model" -IniKey "MODEL" `
-        -DeriveFromIniValue { param($v) (Split-Path -Path $v -Parent) } `
-        -LegacyFallbackPath (Join-Path $LimsRoot "Model")
+        -DeriveFromIniValue { param($v) (Split-Path -Path $v -Parent) }
     $blogResolved = Resolve-BRAVOSourceField `
         -FieldName "BLOG" -IniSection "model" -IniKey "BLOG" `
-        -DeriveFromIniValue { param($v) ($v.TrimEnd("\", "/")) } `
-        -LegacyFallbackPath (Join-Path $LimsRoot "BLOG")
+        -DeriveFromIniValue { param($v) ($v.TrimEnd("\", "/")) }
     $bravoexchResolved = Resolve-BRAVOSourceField `
         -FieldName "BRAVOEXCH" -IniSection "model" -IniKey "BEXCH" `
-        -DeriveFromIniValue { param($v) ($v.TrimEnd("\", "/")) } `
-        -LegacyFallbackPath $null
+        -DeriveFromIniValue { param($v) ($v.TrimEnd("\", "/")) }
 
     $modelProjectFile = Get-BRAVOIniValue -IniData $iniData -Section "model" -Key "MODEL"
 
@@ -608,9 +603,9 @@ function Resolve-BRAVOInstallationDiscovery {
     # сусідній каталог у тому самому корені LIMS-інсталяції, ніж через
     # BRAVO_ROOT: останній залежить від того, чи знайдено саму
     # Windows-службу BRAVO, а MODEL/BLOG з bravo.ini — ні. Реальний
-    # випадок: службу BRAVO не встановлено (лише bravo.ini на диску),
-    # BRAVO_ROOT деградує до LIMSRoot — без цього кроку BAZA_APP шукався
-    # б поруч із LIMSRoot, а не поруч із реальним MODEL/BLOG.
+    # випадок: службу BRAVO не встановлено (лише canonical bravo.ini на
+    # диску). У такому разі BRAVO_ROOT лишається невизначеним, але шлях
+    # MODEL/BLOG все одно дає контрольоване джерело для BAZA_APP.
     $iniInstallationRoot = if ($modelResolved.Reason -like "bravo.ini *") {
         Split-Path -Path $modelResolved.Value -Parent
     } elseif ($blogResolved.Reason -like "bravo.ini *") {
@@ -635,37 +630,35 @@ function Resolve-BRAVOInstallationDiscovery {
             Value = Join-Path $iniInstallationRoot "BAZA"
             Reason = "поруч із MODEL/BLOG з bravo.ini: $iniInstallationRoot"
         }
+    } elseif (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
+        [pscustomobject]@{
+            Value = Join-Path $bravoRoot "BAZA"
+            Reason = "service discovery: каталог інсталяції BRAVO ($bravoRoot)"
+        }
     } else {
         [pscustomobject]@{
-            Value = if (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
-                Join-Path $bravoRoot "BAZA"
-            } else {
-                $null
-            }
-            Reason = "legacy fallback: BRAVO_ROOT-відносний шлях (bravo.ini недоступний)"
+            Value = $null
+            Reason = "BAZA_APP не визначено: немає override, canonical bravo.ini або підтвердженої служби BRAVO"
         }
     }
 
     # --- BACKUP_ROOT: каталог збереження бекапів ---
-    # Джерело істини: каталог "ARCHIV" усередині шляху встановлення служби
-    # BRAVO (той самий каталог, де лежить bravo.exe) — але ЛИШЕ коли
-    # службу дійсно знайдено. Якщо ні — $bravoRoot тут це вже не каталог
-    # BRAVO, а LIMSRoot (legacy fallback, рядок вище): "LIMSRoot\ARCHIV"
-    # для BACKUP_ROOT — це не легша, а ГІРША здогадка за той дефолт, який
-    # BRAVO.config уже має сам (pathSettings.ArchiveRoot — каталог
-    # скрипта). Тому в цьому випадку BACKUP_ROOT лишається $null: нехай
-    # переможе дефолт BRAVO.config, а не другий здогад поверх першого.
-    $backupRootResolved = Resolve-BRAVOSourceField `
-        -FieldName "BACKUP_ROOT" -IniSection "__none__" -IniKey "__none__" `
-        -DeriveFromIniValue $null `
-        -LegacyFallbackPath $(
-            if (-not [string]::IsNullOrWhiteSpace($bravoRoot) -and
-                $bravoRootReason -notmatch '^legacy fallback') {
-                Join-Path $bravoRoot "ARCHIV"
-            } else {
-                $null
-            }
-        )
+    # Discovery не визначає production destination. Єдине джерело істини —
+    # explicit pathSettings.BackupRoot; старий override збережено лише для
+    # діагностики конфігів перехідного періоду.
+    $backupRootResolved = [pscustomobject]@{
+        Value = $(if ($sourceOverrides.Contains('BACKUP_ROOT') -and
+            -not [string]::IsNullOrWhiteSpace([string]$sourceOverrides['BACKUP_ROOT'])) {
+            $overrides['BACKUP_ROOT'] = $true
+            [string]$sourceOverrides['BACKUP_ROOT']
+        } else { $null })
+        Reason = $(if ($sourceOverrides.Contains('BACKUP_ROOT') -and
+            -not [string]::IsNullOrWhiteSpace([string]$sourceOverrides['BACKUP_ROOT'])) {
+            'явний override discoverySettings.Sources.BACKUP_ROOT'
+        } else {
+            'не використовується: BackupRoot задається тільки pathSettings.BackupRoot'
+        })
+    }
 
     # --- WEB_ROOT / BAZA_WWW через Apache-службу ---
     $webRootOverride = if ($normalizedDiscoverySettings.Contains("WebRoot")) {
@@ -737,34 +730,17 @@ function Resolve-BRAVOInstallationDiscovery {
         }
     }
 
-    $bazaWwwResolved = Resolve-BRAVOSourceField `
-        -FieldName "BAZA_WWW" -IniSection "__none__" -IniKey "__none__" `
-        -DeriveFromIniValue $null `
-        -LegacyFallbackPath $(
-            if (-not [string]::IsNullOrWhiteSpace($apacheDocumentRoot)) {
-                Join-Path $apacheDocumentRoot "BAZA"
-            } elseif (-not [string]::IsNullOrWhiteSpace($webRoot)) {
-                # httpd.conf недоступний або без DocumentRoot — деградуємо
-                # до старої здогадки, а не мовчки лишаємо BAZA_WWW порожнім:
-                # причина нижче явно позначає це як fallback, не як норму.
-                Join-Path $webRoot "www\BAZA"
-            } else {
-                $null
-            }
-        )
-    if (-not $overrides.Contains("BAZA_WWW")) {
-        if (-not [string]::IsNullOrWhiteSpace($apacheDocumentRoot)) {
-            $bazaWwwResolved.Reason = $documentRootReason
-        } elseif (-not [string]::IsNullOrWhiteSpace($webRoot)) {
-            $bazaWwwResolved.Reason = (
-                "fallback (не вдалося визначити DocumentRoot: $documentRootReason): " +
-                "<WEB_ROOT>\www\BAZA"
-            )
-        } elseif ([string]::IsNullOrWhiteSpace($bazaWwwResolved.Value)) {
-            $bazaWwwResolved.Reason = $webRootReason
-        }
+    $bazaWwwOverride = if ($sourceOverrides.Contains('BAZA_WWW')) {
+        [string]$sourceOverrides['BAZA_WWW']
+    } else { $null }
+    $bazaWwwResolved = if (-not [string]::IsNullOrWhiteSpace($bazaWwwOverride)) {
+        $overrides['BAZA_WWW'] = $true
+        [pscustomobject]@{ Value = $bazaWwwOverride; Reason = 'явний override discoverySettings.Sources.BAZA_WWW' }
+    } elseif (-not [string]::IsNullOrWhiteSpace($apacheDocumentRoot)) {
+        [pscustomobject]@{ Value = (Join-Path $apacheDocumentRoot 'BAZA'); Reason = $documentRootReason }
+    } else {
+        [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: $documentRootReason" }
     }
-
     # --- ExchangeAPI: лише ідентифікація служби, шлях завжди з bravo.ini ---
     $exchangeApiServices = if (-not [string]::IsNullOrWhiteSpace($ExchangeApiServiceName)) {
         Find-BRAVOServiceByCandidates `
@@ -866,7 +842,7 @@ function Test-BRAVODiscoveryResult {
         $sourceFieldName = $sourceFieldsByComponent[$componentName]
         $sourceValue = $DiscoveryResult.$sourceFieldName
         if ([string]::IsNullOrWhiteSpace([string]$sourceValue)) {
-            $errors.Add("Джерело '$componentName' увімкнено, але шлях не визначено (жодне джерело: override/bravo.ini/legacy fallback не дало значення).")
+            $errors.Add("Джерело '$componentName' увімкнено, але шлях не визначено (немає explicit override або canonical discovery value).")
             continue
         }
         $sourceForTest = ([string]$sourceValue).TrimEnd("*", "\")
@@ -993,6 +969,184 @@ function Compare-BRAVODiscoveryBaseline {
     return $drift.ToArray()
 }
 
+function Resolve-BRAVOEffectiveLimsRoot {
+    # Канонічне визначення кореня production-інсталяції BRAVO (LIMSRoot).
+    #
+    # Порядок строгий (ТЗ RuntimeRoot/LIMSRoot §8-§15):
+    #   1. ConfiguredPath заданий явно -> exact path, Source=ExplicitConfig.
+    #      Discovery НІКОЛИ не перевизначає явний шлях.
+    #   2. ConfiguredPath == "" -> AUTO через встановлену службу BRAVO,
+    #      ідентифіковану ОДНОЧАСНО за Name і DisplayName. EffectiveLIMSRoot =
+    #      каталог виконуваного файла служби (parent of bravo.exe).
+    #   3. Служби немає / без виконуваного файла / кілька служб з різними
+    #      виконуваними файлами -> Source=Error (fail-closed). Технічно
+    #      валідний backup НЕ ТІЄЇ інсталяції гірший за кероване падіння.
+    #
+    # Стан служби (Running/Stopped/Paused/Disabled) НЕ впливає на identity:
+    # шлях встановлення не залежить від того, чи служба зараз запущена.
+    # Тому тут навмисно НЕ використовується Find-BRAVOServiceByCandidates
+    # (він відкидає Disabled) — фільтр лише за Name/DisplayName.
+    #
+    # -Services дозволяє self-test підставити синтетичні Win32_Service-
+    # подібні об'єкти замість WMI (той самий injectable-патерн, що й решта
+    # discovery-функцій).
+    [CmdletBinding()]
+    param(
+        [string]$ConfiguredPath,
+        [string]$BravoServiceName = "BRAVO",
+        [string]$BravoDisplayName = "BRAVO Service",
+        [object[]]$Services
+    )
+
+    $buildResult = {
+        param([string]$EffectivePath, [string]$Source, [object]$Service, [string]$Reason)
+        [pscustomobject]@{
+            ConfiguredPath = $ConfiguredPath
+            EffectivePath = $EffectivePath
+            Source = $Source
+            ServiceName = if ($null -ne $Service) { [string]$Service.Name } else { $null }
+            ServiceDisplayName = if ($null -ne $Service) { [string]$Service.DisplayName } else { $null }
+            ServiceExecutable = if ($null -ne $Service) { [string]$Service.ExecutablePath } else { $null }
+            Reason = $Reason
+        }
+    }
+
+    $expanded = ([Environment]::ExpandEnvironmentVariables([string]$ConfiguredPath)).Trim()
+
+    # 1/2 explicit override.
+    if (-not [string]::IsNullOrWhiteSpace($expanded)) {
+        if (-not (Test-BRAVOAbsolutePath -Path $expanded)) {
+            return (& $buildResult $null 'Error' $null "pathSettings.LIMSRoot задано неабсолютним шляхом: '$ConfiguredPath'")
+        }
+        return (& $buildResult (([IO.Path]::GetFullPath($expanded)).TrimEnd('\', '/')) 'ExplicitConfig' $null 'явно задано в pathSettings.LIMSRoot')
+    }
+
+    # 3 AUTO через службу BRAVO.
+    if ($null -eq $Services) {
+        try {
+            $Services = @(Get-BRAVOWmiInstance -ClassName Win32_Service)
+        } catch {
+            return (& $buildResult $null 'Error' $null "не вдалося перелічити служби Windows для AUTO-визначення LIMSRoot: $($_.Exception.Message)")
+        }
+    }
+
+    $canonical = @(
+        $Services | Where-Object {
+            $_.Name -ieq $BravoServiceName -and $_.DisplayName -ieq $BravoDisplayName
+        } | ForEach-Object {
+            [pscustomobject]@{
+                Name = [string]$_.Name
+                DisplayName = [string]$_.DisplayName
+                State = [string]$_.State
+                StartMode = [string]$_.StartMode
+                ExecutablePath = Get-BRAVOServiceExecutablePath -PathName $_.PathName
+            }
+        } | Where-Object { -not [string]::IsNullOrWhiteSpace($_.ExecutablePath) }
+    )
+
+    if ($canonical.Count -eq 0) {
+        return (& $buildResult $null 'Error' $null "службу BRAVO (Name='$BravoServiceName', DisplayName='$BravoDisplayName') не знайдено або вона без виконуваного файла; задайте pathSettings.LIMSRoot явно")
+    }
+
+    $distinctExecutables = @($canonical | Select-Object -ExpandProperty ExecutablePath -Unique)
+    if ($distinctExecutables.Count -gt 1) {
+        return (& $buildResult $null 'Error' $null "знайдено кілька служб BRAVO з різними виконуваними файлами ($($distinctExecutables -join ', ')); AUTO-визначення неоднозначне — задайте pathSettings.LIMSRoot явно")
+    }
+
+    $match = $canonical | Select-Object -First 1
+    $effectivePath = (Split-Path -Path $match.ExecutablePath -Parent).TrimEnd('\', '/')
+    $reason = "AUTO зі служби '$($match.Name)' -> $($match.ExecutablePath)"
+    if ($match.StartMode -ieq 'Disabled') {
+        $reason += " [УВАГА: служба має тип запуску Disabled]"
+    }
+    return (& $buildResult $effectivePath 'ServiceDiscovery' $match $reason)
+}
+
+function Resolve-BRAVOEffectiveSystemLogRoot {
+    # SystemLogRoot — каталог системних журналів BRAVO (Trace/exchangAPI/
+    # BravoWeb). "" -> <EffectiveLIMSRoot>\ARCHIV\LOGS (Source=AutoFromLIMSRoot);
+    # явне значення використовується ТОЧНО, без дописування ARCHIV\LOGS.
+    [CmdletBinding()]
+    param(
+        [string]$ConfiguredPath,
+        [string]$EffectiveLimsRoot
+    )
+
+    $expanded = ([Environment]::ExpandEnvironmentVariables([string]$ConfiguredPath)).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($expanded)) {
+        if (-not (Test-BRAVOAbsolutePath -Path $expanded)) {
+            return [pscustomobject]@{
+                ConfiguredPath = $ConfiguredPath; EffectivePath = $null
+                Source = 'Error'; Reason = "pathSettings.SystemLogRoot задано неабсолютним шляхом: '$ConfiguredPath'"
+            }
+        }
+        return [pscustomobject]@{
+            ConfiguredPath = $ConfiguredPath
+            EffectivePath = ([IO.Path]::GetFullPath($expanded)).TrimEnd('\', '/')
+            Source = 'ExplicitConfig'
+            Reason = 'явно задано в pathSettings.SystemLogRoot'
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($EffectiveLimsRoot)) {
+        return [pscustomobject]@{
+            ConfiguredPath = $ConfiguredPath; EffectivePath = $null
+            Source = 'Error'; Reason = 'SystemLogRoot="" вимагає визначеного EffectiveLIMSRoot, але його немає'
+        }
+    }
+    return [pscustomobject]@{
+        ConfiguredPath = $ConfiguredPath
+        # [IO.Path]::Combine, а не Join-Path: якщо EffectiveLIMSRoot на диску,
+        # якого зараз немає, Join-Path кинув би DriveNotFoundException під час
+        # завантаження конфігурації. Доступність кореня перевіряє write-probe.
+        EffectivePath = [System.IO.Path]::Combine($EffectiveLimsRoot, 'ARCHIV\LOGS')
+        Source = 'AutoFromLIMSRoot'
+        Reason = "AUTO від EffectiveLIMSRoot: $EffectiveLimsRoot\ARCHIV\LOGS"
+    }
+}
+
+function Resolve-BRAVOEffectiveBackupRoot {
+    # BackupRoot — корінь локальних резервних копій (MODEL/BLOG/BRAVOEXCH/
+    # BAZA_APP/BAZA_WWW). "" -> <EffectiveLIMSRoot>\ARCHIV (co-located з
+    # системними журналами; історичне розкладання). Явне значення — точно.
+    [CmdletBinding()]
+    param(
+        [string]$ConfiguredPath,
+        [string]$EffectiveLimsRoot
+    )
+
+    $expanded = ([Environment]::ExpandEnvironmentVariables([string]$ConfiguredPath)).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($expanded)) {
+        if (-not (Test-BRAVOAbsolutePath -Path $expanded)) {
+            return [pscustomobject]@{
+                ConfiguredPath = $ConfiguredPath; EffectivePath = $null
+                Source = 'Error'; Reason = "pathSettings.BackupRoot задано неабсолютним шляхом: '$ConfiguredPath'"
+            }
+        }
+        return [pscustomobject]@{
+            ConfiguredPath = $ConfiguredPath
+            EffectivePath = ([IO.Path]::GetFullPath($expanded)).TrimEnd('\', '/')
+            Source = 'ExplicitConfig'
+            Reason = 'явно задано в pathSettings.BackupRoot'
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($EffectiveLimsRoot)) {
+        return [pscustomobject]@{
+            ConfiguredPath = $ConfiguredPath; EffectivePath = $null
+            Source = 'Error'; Reason = 'BackupRoot="" вимагає визначеного EffectiveLIMSRoot, але його немає'
+        }
+    }
+    return [pscustomobject]@{
+        ConfiguredPath = $ConfiguredPath
+        # [IO.Path]::Combine — диск LIMSRoot може бути ще не змонтований на
+        # момент завантаження; доступність перевіряє write-probe.
+        EffectivePath = [System.IO.Path]::Combine($EffectiveLimsRoot, 'ARCHIV')
+        Source = 'AutoFromLIMSRoot'
+        Reason = "AUTO від EffectiveLIMSRoot: $EffectiveLimsRoot\ARCHIV"
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOServiceExecutablePath',
     'Find-BRAVOServiceByCandidates',
@@ -1003,6 +1157,9 @@ Export-ModuleMember -Function @(
     'Get-BRAVOApacheDocumentRoot',
     'Get-BRAVOSystemBravoIniPath',
     'Resolve-BRAVOInstallationDiscovery',
+    'Resolve-BRAVOEffectiveLimsRoot',
+    'Resolve-BRAVOEffectiveSystemLogRoot',
+    'Resolve-BRAVOEffectiveBackupRoot',
     'Test-BRAVODiscoveryResult',
     'Save-BRAVODiscoveryBaseline',
     'Compare-BRAVODiscoveryBaseline'

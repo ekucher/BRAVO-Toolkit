@@ -117,7 +117,7 @@ if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
     # Enforce — не зламати його, а розгорнути версію, де його не було.
     $versionState = Test-BRAVOVersionDowngrade `
         -RuntimeRoot $PSScriptRoot `
-        -StatePath (Join-Path $PSScriptRoot 'LOGS\BRAVO_VERSION_STATE.json') `
+        -StatePath (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'BRAVO\State\BRAVO_VERSION_STATE.json') `
         -Mode $runtimeIntegrityMode
     if (-not $versionState.IsValid) {
         $versionColor = if ($versionState.ShouldBlock) { 'Red' } else { 'Yellow' }

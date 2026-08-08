@@ -211,23 +211,28 @@ function Test-BravoLegacyConfiguration {
     }
 }
 
-function Resolve-BravoDataRoot {
-    # Нормалізація production data root: розкриття %ENV%, зняття лапок і
-    # перетворення на канонічний абсолютний шлях.
+function Test-BravoDataRootValue {
+    # Валідація значення production data root. Порожнє значення допустиме
+    # для LIMSRoot і SystemLogRoot (== AUTO); для непорожнього — розкриття
+    # %ENV%, зняття лапок і вимога абсолютного шляху.
     #
     # GetFullPath навмисно застосовується ЛИШЕ до вже абсолютного значення:
     # для відносного він добудував би шлях від поточного каталогу процесу, а
-    # для заплановного завдання це C:\Windows\System32. Саме так «тихий
-    # відносний шлях» перетворюється на кореневий каталог Windows — тому тут
+    # під заплановим завданням це C:\Windows\System32. Саме так «тихий
+    # відносний шлях» перетворюється на кореневий каталог Windows — тому
     # відносне значення є помилкою конфігурації, а не приводом здогадуватись.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Name,
-        [string]$Value
+        [string]$Value,
+        [switch]$AllowEmpty
     )
 
     if ([string]::IsNullOrWhiteSpace($Value)) {
-        throw "pathSettings.$Name не задано. Production-корені (LIMSRoot, ArchiveRoot, BackupRoot) задаються в BRAVO.config явно й не виводяться з розташування самого комплекту."
+        if ($AllowEmpty) {
+            return
+        }
+        throw "pathSettings.$Name не задано. Залиште """" для AUTO-визначення або задайте явний абсолютний шлях."
     }
 
     $normalized = $Value.Trim()
@@ -236,31 +241,36 @@ function Resolve-BravoDataRoot {
     }
     $normalized = [Environment]::ExpandEnvironmentVariables($normalized)
     if ([string]::IsNullOrWhiteSpace($normalized)) {
+        if ($AllowEmpty) {
+            return
+        }
         throw "pathSettings.$Name порожній після розкриття змінних середовища (вихідне значення: '$Value')."
     }
     if ($normalized -notmatch '^([A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])') {
         throw "pathSettings.$Name повинен бути абсолютним шляхом ('D:\LIMS-NEW' або '\\server\share\...'), а не '$Value'."
     }
-
-    try {
-        return ([System.IO.Path]::GetFullPath($normalized)).TrimEnd('\', '/')
-    } catch {
-        throw "pathSettings.$Name не є коректним шляхом ('$Value'): $($_.Exception.Message)"
-    }
 }
 
 function Assert-BravoDataRootsAreIndependent {
     # CODE IS NOT DATA. RuntimeRoot — місце виконуваного комплекту; LIMSRoot,
-    # ArchiveRoot і BackupRoot — місця даних. Жоден із них не повинен
-    # визначатися з фізичного розташування іншого, і саме тому вони
-    # перевіряються тут окремо, а не «як вийде» в кожному скрипті.
+    # SystemLogRoot і BackupRoot — місця даних, які НЕ виводяться з
+    # розташування комплекту.
+    #
+    # Контракт значень (ТЗ RuntimeRoot/LIMSRoot §31-§32; ТЗ "1. LIMSRoot"):
+    #   LIMSRoot      "" = AUTO через службу BRAVO; непорожнє = абсолютний шлях.
+    #   SystemLogRoot "" = <EffectiveLIMSRoot>\ARCHIV\LOGS; непорожнє = абсолютний.
+    #   BackupRoot    "" = <EffectiveLIMSRoot>\ARCHIV;      непорожнє = абсолютний.
+    # Усі три "" — валідна all-AUTO configuration. Перевірка абсолютності
+    # виконується лише для НЕпорожнього значення (звідси -AllowEmpty).
+    # Ефективні значення (з урахуванням AUTO) обчислює сам BRAVO.config через
+    # Resolve-BRAVOEffectiveLimsRoot / Resolve-BRAVOEffectiveSystemLogRoot /
+    # Resolve-BRAVOEffectiveBackupRoot.
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][hashtable]$PathSettings)
 
-    foreach ($rootName in @('LIMSRoot', 'ArchiveRoot', 'BackupRoot')) {
-        $rawValue = if ($PathSettings.Contains($rootName)) { [string]$PathSettings[$rootName] } else { $null }
-        $PathSettings[$rootName] = Resolve-BravoDataRoot -Name $rootName -Value $rawValue
-    }
+    Test-BravoDataRootValue -Name 'LIMSRoot' -Value ([string]$PathSettings['LIMSRoot']) -AllowEmpty
+    Test-BravoDataRootValue -Name 'SystemLogRoot' -Value ([string]$PathSettings['SystemLogRoot']) -AllowEmpty
+    Test-BravoDataRootValue -Name 'BackupRoot' -Value ([string]$PathSettings['BackupRoot']) -AllowEmpty
 }
 
 function Assert-BravoLoadedConfiguration {
@@ -418,6 +428,7 @@ function Import-BravoConfiguration {
         Format = 'legacy-config'
         ConfigPath = $resolvedConfigPath
         ConfigRoot = $resolvedConfigRoot
+        RuntimeRoot = $resolvedRuntimeRoot
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
         LegacyScriptVersion = $legacyScriptVersion
         LegacyScriptVersionPresent = ($null -ne $legacyScriptVersionVariable)

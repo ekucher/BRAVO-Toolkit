@@ -609,10 +609,11 @@ try {
         Test-BRAVOCondition `
             -Condition (
                 $entryPointText.Contains('Test-BRAVOVersionDowngrade') -and
+                $entryPointText.Contains("CommonApplicationData')) 'BRAVO\State\BRAVO_VERSION_STATE.json'") -and
                 $entryPointText.Contains('exit 35')
             ) `
             -Name "VersionState/CheckedInEntryPoint/$entryPointName" `
-            -Failure "$entryPointName має перевіряти відкат версії й завершуватись кодом 35"
+            -Failure "$entryPointName має зберігати machine-wide version state поза RuntimeRoot, перевіряти відкат версії й завершуватись кодом 35"
     }
 
     # Перевірка перемикачів безпеки в BRAVO.config. Конфігурація навмисно
@@ -1045,6 +1046,7 @@ try {
             (Resolve-BRAVOExitCode -CredentialsUnavailable) -eq 31 -and
             (Resolve-BRAVOExitCode -LocalArchiveFailed) -eq 40 -and
             (Resolve-BRAVOExitCode -IntegrityTestFailed) -eq 41 -and
+            (Resolve-BRAVOExitCode -HashValidationFailed) -eq 42 -and
             (Resolve-BRAVOExitCode -SftpFailed) -eq 50 -and
             (Resolve-BRAVOExitCode -SmbFailed) -eq 51 -and
             (Resolve-BRAVOExitCode -MaintenanceFailed) -eq 60 -and
@@ -1058,7 +1060,8 @@ try {
             (Resolve-BRAVOExitCode -SftpFailed -SmbFailed) -eq 50 -and
             (Resolve-BRAVOExitCode -LockBusy -InvalidConfiguration) -eq 20 -and
             (Resolve-BRAVOExitCode -InternalError -SftpFailed -HasWarnings) -eq 90 -and
-            (Resolve-BRAVOExitCode -LocalArchiveFailed -IntegrityTestFailed) -eq 40 -and
+            (Resolve-BRAVOExitCode -LocalArchiveFailed -IntegrityTestFailed -HashValidationFailed) -eq 40 -and
+            (Resolve-BRAVOExitCode -IntegrityTestFailed -HashValidationFailed) -eq 41 -and
             (Resolve-BRAVOExitCode -MaintenanceFailed -HealthCritical) -eq 60 -and
             (Resolve-BRAVOExitCode -InvalidConfiguration -CredentialsUnavailable) -eq 30
         ) `
@@ -1112,6 +1115,7 @@ try {
     Test-BRAVOCondition `
         -Condition (
             (Get-BRAVOExitCodeName -Code 0) -eq "Success" -and
+            (Get-BRAVOExitCodeName -Code 42) -eq "HashValidationFailed" -and
             (Get-BRAVOExitCodeName -Code 50) -eq "SftpFailed" -and
             (Get-BRAVOExitCodeName -Code 999) -eq "Unknown(999)"
         ) `
@@ -1140,6 +1144,14 @@ try {
         ) `
         -Name "Runtime/SharedExitCodeContract" `
         -Failure "Archive/Health/Maintenance мають підключати BRAVO.ExitCodes і формувати підсумковий код через Resolve-BRAVOExitCode"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveRuntimeTextForExitCodes.Contains('$anyHashValidationFailed = @(') -and
+            $archiveRuntimeTextForExitCodes.Contains('-HashValidationFailed:$anyHashValidationFailed') -and
+            $archiveRuntimeTextForExitCodes.Contains("'HASH' { `"SHA512 generation/verification failed")
+        ) `
+        -Name 'Runtime/HashFailureHasDedicatedExitCode' `
+        -Failure 'SHA512 generation/verification failure має мапитись на 42, а не IntegrityTestFailed (41)'
     Test-BRAVOCondition `
         -Condition (
             -not ($archiveRuntimeTextForExitCodes -match 'processExitCode\s*=\s*2\b') -and
@@ -1496,6 +1508,26 @@ try {
         (Join-Path $root "BRAVO.config"),
         [Text.Encoding]::UTF8
     )
+    $bravoExchSelectionStart = $bravoConfigText.IndexOf('$global:bravoExchSourceCandidates')
+    $bravoExchSelectionEnd = $bravoConfigText.IndexOf('$bravoExchArchiveSource', $bravoExchSelectionStart)
+    $bravoExchSelectionText = if (
+        $bravoExchSelectionStart -ge 0 -and
+        $bravoExchSelectionEnd -gt $bravoExchSelectionStart
+    ) {
+        $bravoConfigText.Substring(
+            $bravoExchSelectionStart,
+            $bravoExchSelectionEnd - $bravoExchSelectionStart
+        )
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoExchSelectionText.Contains("Test-Path -LiteralPath `$candidateDirectory -PathType Container") -and
+            -not $bravoExchSelectionText.Contains('Get-ChildItem')
+        ) `
+        -Name 'Discovery/EmptyCanonicalBravoExchDirectoryRemainsEnabled' `
+        -Failure 'canonical BEXCH directory can be an idle queue tree with no files; config must accept the existing directory without a content heuristic'
     # CODE IS NOT DATA: -ConfigRoot береться з фактичного шляху конфігурації
     # (вона може лежати в окремому каталозі, наприклад C:\BRAVO\CONFIGS), а
     # -RuntimeRoot — це завжди каталог самого комплекту, звідки беруться
@@ -1519,6 +1551,21 @@ try {
             "Split-BAZAPendingFilesByCompatibility",
             "Get-BAZASynchronizationOutcome",
             "Get-BRAVOVSSSnapshotSourcePath",
+            "Get-BRAVOVSSVolumeRoot",
+            "Get-BRAVOUniqueVSSVolumes",
+            "Get-BRAVOVSSVolumeIdentityCandidates",
+            "Test-BRAVOVSSShadowMatchesVolume",
+            "New-BRAVOVSSSnapshotSet",
+            "Resolve-BRAVOSnapshotSourcePath",
+            "Remove-BRAVOVSSVolumeShadow",
+            "Remove-BRAVOVSSSnapshotSet",
+            "Get-BRAVOVSSOwnershipStatePath",
+            "Save-BRAVOVSSOwnershipState",
+            "Remove-BRAVOOwnedOrphanVSSResources",
+            "Get-BRAVOCollisionSafeGenerationId",
+            "New-BRAVOTemporaryArchivePath",
+            "Remove-BRAVOTemporaryArchiveArtifacts",
+            "Invoke-BRAVOComponentBackup",
             "Remove-BRAVOWinSCPSensitiveTemporaryScript",
             "Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts",
             "New-BRAVOWinSCPTemporaryScriptPath"
@@ -1739,13 +1786,16 @@ try {
     )
     Test-BRAVOCondition `
         -Condition (
+            $archiveScriptText.Contains('function Remove-BRAVOExpiredBackupGenerations') -and
+            $archiveScriptText.Contains("Get-BRAVOFiles -Path `$BackupRoot -Filter 'BRAVO_BACKUP_*.json'") -and
+            $archiveScriptText.Contains('$record.GenerationId -eq $CurrentGenerationId') -and
+            $archiveScriptText.Contains('$record.GenerationId -notin $protectedGenerationIds') -and
             $archiveScriptText.Contains('minimumRetainedVerifiedBackups') -and
             $archiveScriptText.Contains('Select-Object -First $minimumRetainedCount') -and
-            $archiveScriptText.Contains('Select-Object -Skip $minimumRetainedCount') -and
             $bravoConfigTextForRetention.Contains('$global:minimumRetainedVerifiedBackups')
         ) `
         -Name "BackupConsistency/RetentionNeverDeletesLastVerified" `
-        -Failure "Remove-OldBackupSets має захищати N найновіших перевірених комплектів від видалення незалежно від archiveRetentionDays (аудит P1.7)"
+        -Failure "generation-aware retention має захищати current і N найновіших verified COMPLETE generations незалежно від archiveRetentionDays"
 
     # Archive.Runtime.ps1 безумовно запускає Main при dot-source, тому саму
     # функцію Remove-OldBackupSets тут викликати небезпечно. Натомість
@@ -1779,6 +1829,53 @@ try {
         ) `
         -Name "BackupConsistency/RetentionSelectionAlgorithm" `
         -Failure "алгоритм відбору на видалення (Select-Object -First/-Skip найновіших перевірених комплектів) має завжди виключати найновіший комплект, навіть коли він старший за retention cutoff"
+
+    $generationVerifierModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @('Get-BRAVOGenerationManifestComponents', 'Test-BRAVOGenerationManifestVerified')
+    $generationVerifierRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'BRAVO_GENERATION_VERIFY_{0}' -f [guid]::NewGuid().ToString('N')
+    )
+    try {
+        [void][IO.Directory]::CreateDirectory($generationVerifierRoot)
+        $generationArchivePath = Join-Path $generationVerifierRoot 'MODEL_generation.mdz'
+        $generationHashPath = $generationArchivePath + '.sha512'
+        [IO.File]::WriteAllText($generationArchivePath, 'verified generation payload')
+        $generationHash = (Get-BRAVOFileHash -Path $generationArchivePath -Algorithm SHA512).Hash
+        [IO.File]::WriteAllText(
+            $generationHashPath,
+            ("{0} *{1}" -f $generationHash.ToLowerInvariant(), [IO.Path]::GetFileName($generationArchivePath))
+        )
+        $verifiedGenerationManifest = [pscustomobject]@{
+            status = 'COMPLETE'
+            components = [pscustomobject]@{
+                MODEL = [pscustomobject]@{
+                    CreateSuccess = $true
+                    IntegritySuccess = $true
+                    HashSuccess = $true
+                    ArchivePath = $generationArchivePath
+                    HashPath = $generationHashPath
+                }
+            }
+        }
+        $verifiedGenerationAccepted = & $generationVerifierModule {
+            param($Manifest)
+            Test-BRAVOGenerationManifestVerified -Manifest $Manifest
+        } $verifiedGenerationManifest
+        [IO.File]::AppendAllText($generationArchivePath, 'corruption')
+        $corruptGenerationRejected = -not (& $generationVerifierModule {
+            param($Manifest)
+            Test-BRAVOGenerationManifestVerified -Manifest $Manifest
+        } $verifiedGenerationManifest)
+        Test-BRAVOCondition `
+            -Condition ([bool]$verifiedGenerationAccepted -and [bool]$corruptGenerationRejected) `
+            -Name 'BackupConsistency/GenerationManifestPerformsRealSHA512Comparison' `
+            -Failure 'COMPLETE generation verification має приймати реальний .mdz+.sha512 set і відхиляти його після зміни байтів archive'
+    } finally {
+        if (Test-Path -LiteralPath $generationVerifierRoot) {
+            Remove-Item -LiteralPath $generationVerifierRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     $maintenanceScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
         [Text.Encoding]::UTF8
@@ -2236,15 +2333,397 @@ try {
         ) `
         -Name "SFTP/IncompatibleNamesDoNotRetryWholeBackup" `
         -Failure "несумісні імена BAZA не повинні викликати повтор усієї архівації"
+    $vssRuntimeProbe = & $archiveRuntimeModule {
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Message, [string]$Level)
+        }
+        function Get-WmiObject {
+            param([string]$Namespace, [string]$Class, [string]$Filter, [string]$ErrorAction)
+            if ($Class -eq 'Win32_Volume') {
+                [pscustomobject]@{ DeviceID = '\\?\Volume{D-GUID}\' }
+            }
+        }
+
+        $sameVolumeCalls = New-Object System.Collections.ArrayList
+        $sameVolumeSet = New-BRAVOVSSSnapshotSet `
+            -SourcePaths @('D:\A', 'D:\B', 'D:\C') `
+            -VolumeShadowFactory {
+                param($VolumeRoot)
+                [void]$sameVolumeCalls.Add($VolumeRoot)
+                [pscustomobject]@{
+                    VolumeRoot = $VolumeRoot
+                    ShadowId = "{D-SHADOW}"
+                    SetId = "{D-SET}"
+                    DeviceObject = "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy10"
+                    LinkPath = "C:\BRAVO_VSS_D"
+                    WmiObject = $null
+                }
+            }
+        $sameVolumeResolved = Resolve-BRAVOSnapshotSourcePath `
+            -SnapshotSet $sameVolumeSet `
+            -OriginalPath 'D:\B\file.db'
+
+        $multiVolumeCalls = New-Object System.Collections.ArrayList
+        $multiVolumeSet = New-BRAVOVSSSnapshotSet `
+            -SourcePaths @('D:\A', 'D:\B', 'E:\C') `
+            -VolumeShadowFactory {
+                param($VolumeRoot)
+                [void]$multiVolumeCalls.Add($VolumeRoot)
+                [pscustomobject]@{
+                    VolumeRoot = $VolumeRoot
+                    ShadowId = "{$($VolumeRoot.Substring(0,1))-SHADOW}"
+                    SetId = "{MULTI-SET}"
+                    DeviceObject = "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy$($multiVolumeCalls.Count)"
+                    LinkPath = "C:\BRAVO_VSS_$($VolumeRoot.Substring(0,1))"
+                    WmiObject = $null
+                }
+            }
+
+        $cleanupCalls = New-Object System.Collections.ArrayList
+        [void](Remove-BRAVOVSSSnapshotSet -SnapshotSet $multiVolumeSet)
+        foreach ($volumeShadow in @($multiVolumeSet.Volumes)) {
+            [void]$cleanupCalls.Add($volumeShadow.VolumeRoot)
+        }
+        $guidVolumeMatch = Test-BRAVOVSSShadowMatchesVolume `
+            -Shadow ([pscustomobject]@{ VolumeName = '\\?\Volume{D-GUID}\' }) `
+            -VolumeRoot 'D:\'
+
+        [pscustomobject]@{
+            SameVolumeCallCount = $sameVolumeCalls.Count
+            SameVolumeSetId = $sameVolumeSet.SnapshotSetId
+            SameVolumeResolved = $sameVolumeResolved
+            MultiVolumeCallCount = $multiVolumeCalls.Count
+            MultiVolumeSetId = $multiVolumeSet.SnapshotSetId
+            MultiVolumeUniqueCount = $multiVolumeSet.UniqueVolumeCount
+            CleanupCallCount = $cleanupCalls.Count
+            GuidVolumeMatch = $guidVolumeMatch
+        }
+    }
     Test-BRAVOCondition `
         -Condition (
-            $archiveScriptText.Contains("function New-BRAVOVSSSnapshot") -and
-            $archiveScriptText.Contains("function Remove-BRAVOVSSSnapshot") -and
-            $archiveScriptText.Contains('$vssSnapshot = New-BRAVOVSSSnapshot') -and
-            $archiveScriptText.Contains('live-архівація заборонена')
+            $vssRuntimeProbe.SameVolumeCallCount -eq 1 -and
+            $vssRuntimeProbe.SameVolumeSetId -eq "{D-SET}" -and
+            $vssRuntimeProbe.SameVolumeResolved -eq "C:\BRAVO_VSS_D\B\file.db" -and
+            $vssRuntimeProbe.MultiVolumeCallCount -eq 2 -and
+            $vssRuntimeProbe.MultiVolumeSetId -eq "{MULTI-SET}" -and
+            $vssRuntimeProbe.MultiVolumeUniqueCount -eq 2 -and
+            $vssRuntimeProbe.CleanupCallCount -eq 2 -and
+            $vssRuntimeProbe.GuidVolumeMatch
+        ) `
+        -Name "BackupConsistency/VSSSnapshotSetGeneration" `
+        -Failure "MODEL/BLOG/BRAVOEXCH мають використовувати один VSS Snapshot Set з дедуплікацією томів і cleanup один раз після generation"
+
+    $vssOwnershipTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_VSS_OWNERSHIP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $vssOwnershipProbe = & $archiveRuntimeModule {
+            param($TestRoot)
+            $statePath = Join-Path $TestRoot 'BRAVO_VSS_OWNERSHIP.json'
+            $firstId = '{11111111-1111-1111-1111-111111111111}'
+            $secondId = '{22222222-2222-2222-2222-222222222222}'
+            $snapshotSet = [pscustomobject]@{
+                SnapshotSetId = '{AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA}'
+                Volumes = @(
+                    [pscustomobject]@{ ShadowId = $firstId; LinkPath = (Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_VSS_selftest_1') },
+                    [pscustomobject]@{ ShadowId = $secondId; LinkPath = (Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_VSS_selftest_2') }
+                )
+            }
+            $saved = Save-BRAVOVSSOwnershipState `
+                -StatePath $statePath `
+                -SnapshotSet $snapshotSet `
+                -GenerationId '20260808_180000'
+            $deletedIds = New-Object System.Collections.ArrayList
+            $removedLinks = New-Object System.Collections.ArrayList
+            $cleanup = Remove-BRAVOOwnedOrphanVSSResources `
+                -StatePath $statePath `
+                -DeleteShadowById { param($Id) [void]$deletedIds.Add([string]$Id); return $true } `
+                -RemoveLink { param($Path) [void]$removedLinks.Add([string]$Path) }
+            $stateRemovedAfterCleanup = -not [IO.File]::Exists($statePath)
+
+            [void](Save-BRAVOVSSOwnershipState `
+                -StatePath $statePath `
+                -SnapshotSet $snapshotSet `
+                -GenerationId '20260808_180001')
+            $foreignState = Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json
+            $foreignState.owner = 'OTHER_APPLICATION'
+            [IO.File]::WriteAllText(
+                $statePath,
+                ($foreignState | ConvertTo-Json -Depth 5),
+                (New-Object Text.UTF8Encoding($false))
+            )
+            $foreignDeleteCalls = New-Object System.Collections.ArrayList
+            $foreignCleanup = Remove-BRAVOOwnedOrphanVSSResources `
+                -StatePath $statePath `
+                -DeleteShadowById { param($Id) [void]$foreignDeleteCalls.Add([string]$Id); return $true }
+
+            [pscustomobject]@{
+                SavedOwner = [string]$saved.owner
+                SavedGeneration = [string]$saved.generationId
+                CleanupSuccess = [bool]$cleanup.Success
+                CleanupDeleted = [int]$cleanup.Deleted
+                DeletedIds = @($deletedIds)
+                RemovedLinkCount = $removedLinks.Count
+                StateRemovedAfterCleanup = $stateRemovedAfterCleanup
+                ForeignCleanupBlocked = -not [bool]$foreignCleanup.Success
+                ForeignDeleteCallCount = $foreignDeleteCalls.Count
+                ForeignStateRetained = [IO.File]::Exists($statePath)
+            }
+        } $vssOwnershipTestRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $vssOwnershipProbe.SavedOwner -eq 'BRAVO_ARCHIV' -and
+                $vssOwnershipProbe.SavedGeneration -eq '20260808_180000' -and
+                $vssOwnershipProbe.CleanupSuccess -and
+                $vssOwnershipProbe.CleanupDeleted -eq 2 -and
+                $vssOwnershipProbe.DeletedIds -contains '{11111111-1111-1111-1111-111111111111}' -and
+                $vssOwnershipProbe.DeletedIds -contains '{22222222-2222-2222-2222-222222222222}' -and
+                $vssOwnershipProbe.RemovedLinkCount -eq 2 -and
+                $vssOwnershipProbe.StateRemovedAfterCleanup -and
+                $vssOwnershipProbe.ForeignCleanupBlocked -and
+                $vssOwnershipProbe.ForeignDeleteCallCount -eq 0 -and
+                $vssOwnershipProbe.ForeignStateRetained
+            ) `
+            -Name 'BackupConsistency/BRAVOOwnedOrphanVSSCleanup' `
+            -Failure 'hard-termination cleanup must persist exact BRAVO Shadow IDs, delete only those IDs, and retain foreign/invalid ownership state without issuing delete calls'
+    } finally {
+        if (Test-Path -LiteralPath $vssOwnershipTestRoot -PathType Container) {
+            Remove-Item -LiteralPath $vssOwnershipTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains("New-BRAVOVSSSnapshotSet") -and
+            $archiveScriptText.Contains("Resolve-BRAVOSnapshotSourcePath") -and
+            $archiveScriptText.Contains("Архівацію MODEL/BLOG/BRAVOEXCH скасовано") -and
+            $archiveScriptText.Contains('live-архівація заборонена') -and
+            $archiveScriptText.Contains('Remove-BRAVOVSSSnapshotLink -LinkPath $createdShadow.LinkPath') -and
+            -not $archiveScriptText.Contains('$vssSnapshot = New-BRAVOVSSSnapshot')
         ) `
         -Name "BackupConsistency/VSSFailClosed" `
-        -Failure "BRAVO_ARCHIV має архівувати VSS-знімок і не переходити до live-каталогу при помилці"
+        -Failure "BRAVO_ARCHIV має створювати Snapshot Set до циклу і не переходити до live-каталогу при помилці VSS"
+    $generationCollisionRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_GENERATION_COLLISION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $modelDir = Join-Path $generationCollisionRoot 'MODEL'
+        $blogDir = Join-Path $generationCollisionRoot 'BLOG'
+        $exchDir = Join-Path $generationCollisionRoot 'BRAVOEXCH'
+        [void][IO.Directory]::CreateDirectory($modelDir)
+        [void][IO.Directory]::CreateDirectory($blogDir)
+        [void][IO.Directory]::CreateDirectory($exchDir)
+        [IO.File]::WriteAllText((Join-Path $modelDir 'lab_20260808_154300.mdz'), 'old', (New-Object Text.UTF8Encoding($false)))
+        [IO.File]::WriteAllText((Join-Path $modelDir 'lab_20260808_154300.mdz.sha512'), 'oldhash', (New-Object Text.UTF8Encoding($false)))
+        $safeGenerationId = & $archiveRuntimeModule {
+            param($ModelDir, $BlogDir, $ExchDir)
+            Get-BRAVOCollisionSafeGenerationId `
+                -BaseGenerationId '20260808_154300' `
+                -ArchivePrefix 'lab' `
+                -Archives @(
+                    [pscustomobject]@{ Type = 'MODEL'; Destination = $ModelDir; NameTemplate = '{0}_{1}.mdz' },
+                    [pscustomobject]@{ Type = 'BLOG'; Destination = $BlogDir; NameTemplate = '{0}_blog_{1}.mdz' },
+                    [pscustomobject]@{ Type = 'BRAVOEXCH'; Destination = $ExchDir; NameTemplate = '{0}_bravoexch_{1}.mdz' }
+                )
+        } $modelDir $blogDir $exchDir
+        Test-BRAVOCondition `
+            -Condition (
+                $safeGenerationId -eq '20260808_154300_1' -and
+                [IO.File]::ReadAllText((Join-Path $modelDir 'lab_20260808_154300.mdz')) -eq 'old' -and
+                [IO.File]::ReadAllText((Join-Path $modelDir 'lab_20260808_154300.mdz.sha512')) -eq 'oldhash'
+            ) `
+            -Name "BackupConsistency/GenerationCollisionSuffix" `
+            -Failure "collision suffix має застосовуватись до GenerationId до побудови всіх component filenames, а existing backup/hash мають лишатись незмінними"
+    } finally {
+        if (Test-Path -LiteralPath $generationCollisionRoot -PathType Container) {
+            Remove-Item -LiteralPath $generationCollisionRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $componentBackupTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_COMPONENT_BACKUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $componentSource = Join-Path $componentBackupTestRoot 'SOURCE'
+        [void][IO.Directory]::CreateDirectory($componentSource)
+        [IO.File]::WriteAllText((Join-Path $componentSource 'data.txt'), 'source', (New-Object Text.UTF8Encoding($false)))
+
+        $componentProbe = & $archiveRuntimeModule {
+            param($Root, $Source)
+
+            $script:hashFileExtension = '.sha512'
+            $script:hashFileEncoding = 'utf-8'
+            $script:componentBackupMode = 'success'
+            $knownHash = ('a' * 128).ToUpperInvariant()
+            function Write-BRAVOLog {
+                param([string]$Component, [string]$Message, [string]$Level)
+            }
+            function New-Archive {
+                param([string]$SourcePath, [string]$FullArchivePath, [string]$ArcPath, [string]$ArcParams)
+                [IO.File]::WriteAllText($FullArchivePath, "archive:$script:componentBackupMode", (New-Object Text.UTF8Encoding($false)))
+                if ($script:componentBackupMode -eq 'create-fail') {
+                    return [pscustomobject]@{
+                        CreateSuccess = $false
+                        IntegritySuccess = $false
+                        ErrorStage = 'CREATE'
+                        Error = 'synthetic create failure'
+                    }
+                }
+                if ($script:componentBackupMode -eq 'integrity-fail') {
+                    return [pscustomobject]@{
+                        CreateSuccess = $true
+                        IntegritySuccess = $false
+                        ErrorStage = 'INTEGRITY'
+                        Error = 'synthetic integrity failure'
+                    }
+                }
+                [pscustomobject]@{
+                    CreateSuccess = $true
+                    IntegritySuccess = $true
+                    ErrorStage = $null
+                    Error = $null
+                }
+            }
+            function New-SHA512Hash {
+                param([string]$FilePath, [string]$HashFilePath)
+                if ($script:componentBackupMode -eq 'hash-create-fail') {
+                    return $false
+                }
+                $hashToWrite = if ($script:componentBackupMode -eq 'hash-verify-fail') { 'b' * 128 } else { $knownHash.ToLowerInvariant() }
+                [IO.File]::WriteAllText($HashFilePath, ("{0} *{1}" -f $hashToWrite, [IO.Path]::GetFileName($FilePath)), (New-Object Text.UTF8Encoding($false)))
+                return $true
+            }
+            function Get-BRAVOFileHash {
+                param([string]$Path, [string]$Algorithm)
+                [pscustomobject]@{ Hash = $knownHash }
+            }
+
+            $successDest = Join-Path $Root 'SUCCESS'
+            [void][IO.Directory]::CreateDirectory($successDest)
+            $script:componentBackupMode = 'success'
+            $success = Invoke-BRAVOComponentBackup `
+                -Component 'MODEL' `
+                -GenerationId '20260808_154300' `
+                -OriginalSourcePath $Source `
+                -SourcePath $Source `
+                -DestinationDirectory $successDest `
+                -ArchiveName 'lab_20260808_154300.mdz' `
+                -ArcPath 'fake7za.exe'
+
+            $previousDest = Join-Path $Root 'PREVIOUS'
+            [void][IO.Directory]::CreateDirectory($previousDest)
+            $previousArchive = Join-Path $previousDest 'lab_20260808_154200.mdz'
+            $previousHash = $previousArchive + '.sha512'
+            [IO.File]::WriteAllText($previousArchive, 'previous archive', (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText($previousHash, 'previous hash', (New-Object Text.UTF8Encoding($false)))
+            $script:componentBackupMode = 'create-fail'
+            $createFail = Invoke-BRAVOComponentBackup `
+                -Component 'MODEL' `
+                -GenerationId '20260808_154300' `
+                -OriginalSourcePath $Source `
+                -SourcePath $Source `
+                -DestinationDirectory $previousDest `
+                -ArchiveName 'lab_20260808_154300.mdz' `
+                -ArcPath 'fake7za.exe'
+
+            $integrityDest = Join-Path $Root 'INTEGRITY'
+            [void][IO.Directory]::CreateDirectory($integrityDest)
+            $script:componentBackupMode = 'integrity-fail'
+            $integrityFail = Invoke-BRAVOComponentBackup `
+                -Component 'MODEL' `
+                -GenerationId '20260808_154300' `
+                -OriginalSourcePath $Source `
+                -SourcePath $Source `
+                -DestinationDirectory $integrityDest `
+                -ArchiveName 'lab_20260808_154300.mdz' `
+                -ArcPath 'fake7za.exe'
+
+            $hashCreateDest = Join-Path $Root 'HASH_CREATE'
+            [void][IO.Directory]::CreateDirectory($hashCreateDest)
+            $script:componentBackupMode = 'hash-create-fail'
+            $hashCreateFail = Invoke-BRAVOComponentBackup `
+                -Component 'MODEL' `
+                -GenerationId '20260808_154300' `
+                -OriginalSourcePath $Source `
+                -SourcePath $Source `
+                -DestinationDirectory $hashCreateDest `
+                -ArchiveName 'lab_20260808_154300.mdz' `
+                -ArcPath 'fake7za.exe'
+
+            $hashVerifyDest = Join-Path $Root 'HASH_VERIFY'
+            [void][IO.Directory]::CreateDirectory($hashVerifyDest)
+            $script:componentBackupMode = 'hash-verify-fail'
+            $hashVerifyFail = Invoke-BRAVOComponentBackup `
+                -Component 'MODEL' `
+                -GenerationId '20260808_154300' `
+                -OriginalSourcePath $Source `
+                -SourcePath $Source `
+                -DestinationDirectory $hashVerifyDest `
+                -ArchiveName 'lab_20260808_154300.mdz' `
+                -ArcPath 'fake7za.exe'
+
+            [pscustomobject]@{
+                SuccessCreate = [bool]$success.CreateSuccess
+                SuccessIntegrity = [bool]$success.IntegritySuccess
+                SuccessHash = [bool]$success.HashSuccess
+                SuccessArchiveExists = Test-Path -LiteralPath (Join-Path $successDest 'lab_20260808_154300.mdz') -PathType Leaf
+                SuccessHashExists = Test-Path -LiteralPath ((Join-Path $successDest 'lab_20260808_154300.mdz') + '.sha512') -PathType Leaf
+                SuccessPartialCount = @(Get-ChildItem -LiteralPath $successDest -Recurse -Filter '*.partial.mdz' -ErrorAction SilentlyContinue).Count
+                PreviousArchiveText = [IO.File]::ReadAllText($previousArchive)
+                PreviousHashText = [IO.File]::ReadAllText($previousHash)
+                CreateFailCreate = [bool]$createFail.CreateSuccess
+                CreateFailPartialCount = @(Get-ChildItem -LiteralPath $previousDest -Recurse -Filter '*.partial.mdz' -ErrorAction SilentlyContinue).Count
+                IntegrityCreate = [bool]$integrityFail.CreateSuccess
+                IntegrityIntegrity = [bool]$integrityFail.IntegritySuccess
+                IntegrityHash = [bool]$integrityFail.HashSuccess
+                IntegrityPublished = Test-Path -LiteralPath (Join-Path $integrityDest 'lab_20260808_154300.mdz') -PathType Leaf
+                HashCreateHash = [bool]$hashCreateFail.HashSuccess
+                HashCreatePublished = Test-Path -LiteralPath (Join-Path $hashCreateDest 'lab_20260808_154300.mdz') -PathType Leaf
+                HashVerifyHash = [bool]$hashVerifyFail.HashSuccess
+                HashVerifyPublished = Test-Path -LiteralPath (Join-Path $hashVerifyDest 'lab_20260808_154300.mdz') -PathType Leaf
+            }
+        } $componentBackupTestRoot $componentSource
+
+        Test-BRAVOCondition `
+            -Condition (
+                $componentProbe.SuccessCreate -and
+                $componentProbe.SuccessIntegrity -and
+                $componentProbe.SuccessHash -and
+                $componentProbe.SuccessArchiveExists -and
+                $componentProbe.SuccessHashExists -and
+                $componentProbe.SuccessPartialCount -eq 0
+            ) `
+            -Name "BackupConsistency/AtomicPublishFromEmptyDestination" `
+            -Failure "порожній destination має приймати backup лише після create + integrity + SHA512 verification, без залишених .partial"
+        Test-BRAVOCondition `
+            -Condition (
+                -not $componentProbe.CreateFailCreate -and
+                $componentProbe.PreviousArchiveText -eq 'previous archive' -and
+                $componentProbe.PreviousHashText -eq 'previous hash' -and
+                $componentProbe.CreateFailPartialCount -eq 0
+            ) `
+            -Name "BackupConsistency/FailedSecondRunPreservesPreviousBackup" `
+            -Failure "failed second generation не повинна змінювати previous .mdz/.sha512 і має прибирати тільки свій temporary artifact"
+        Test-BRAVOCondition `
+            -Condition (
+                $componentProbe.IntegrityCreate -and
+                -not $componentProbe.IntegrityIntegrity -and
+                -not $componentProbe.IntegrityHash -and
+                -not $componentProbe.IntegrityPublished
+            ) `
+            -Name "BackupConsistency/IntegrityFailureDoesNotPublish" `
+            -Failure "CreateSuccess=true + IntegritySuccess=false має лишати HashSuccess=false і не публікувати final archive"
+        Test-BRAVOCondition `
+            -Condition (-not $componentProbe.HashCreateHash -and -not $componentProbe.HashCreatePublished) `
+            -Name "BackupConsistency/HashCreationFailureDoesNotPublish" `
+            -Failure "SHA512 create failure має лишати generation невалідною і не публікувати final archive"
+        Test-BRAVOCondition `
+            -Condition (-not $componentProbe.HashVerifyHash -and -not $componentProbe.HashVerifyPublished) `
+            -Name "BackupConsistency/HashVerificationFailureDoesNotPublish" `
+            -Failure "SHA512 verification mismatch має лишати generation невалідною і не публікувати final archive"
+    } finally {
+        if (Test-Path -LiteralPath $componentBackupTestRoot -PathType Container) {
+            Remove-Item -LiteralPath $componentBackupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     $dryRunScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO_DRY_RUN.ps1"),
         [Text.Encoding]::UTF8
@@ -2264,6 +2743,16 @@ try {
         ) `
         -Name "Health/SFTPArchiveNameOnFailures" `
         -Failure "ім'я локального архіву має відображатися для всіх SFTP-помилок"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains("Get-BRAVOFiles -Path `$backupRootPath -Filter 'BRAVO_BACKUP_*.json'") -and
+            $healthScriptText.Contains("[string]`$manifest.status -ne 'COMPLETE'") -and
+            $healthScriptText.Contains('COMPLETE generation $manifestGenerationId') -and
+            $healthScriptText.Contains('$componentsProperty.Value.PSObject.Properties') -and
+            $healthScriptText.Contains('$generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]')
+        ) `
+        -Name 'Health/UsesOneCompleteGeneration' `
+        -Failure 'Health має оцінювати один COMPLETE generation manifest, а не незалежні newest MODEL/BLOG/BRAVOEXCH'
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('function New-BRAVOWinSCPTemporaryScriptPath') -and
@@ -2303,6 +2792,60 @@ try {
         ) `
         -Name "Scheduler/OperationLockMetadata" `
         -Failure "BRAVO_OPERATION.lock має містити pid/processStartTime/hostname/operation/packageVersion (JSON), а не лише голий PID/Started/Config"
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigText.Contains("'BRAVO\Locks\BRAVO_OPERATION.lock'") -and
+            $archiveScriptText.Contains('$lockPath = [string]$operationLockSettings.Path') -and
+            $maintenanceScriptText.Contains('$lockPath = [string]$operationLockSettings.Path') -and
+            $healthScriptText.Contains('$lockPath = [string]$operationLockSettings.Path') -and
+            -not $archiveScriptText.Contains('Join-Path $logPath "BRAVO_OPERATION.lock"') -and
+            -not $maintenanceScriptText.Contains('Join-Path $LOG_DIR "BRAVO_OPERATION.lock"') -and
+            -not $healthScriptText.Contains('Join-Path $logPath "BRAVO_OPERATION.lock"')
+        ) `
+        -Name 'Scheduler/OperationLockIsMachineWide' `
+        -Failure 'Archive і Maintenance мають координуватись одним ProgramData lock, а Health — перевіряти той самий handle незалежно від ArchiveRoot/ConfigPath'
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigText.Contains('$global:logFileDateFormat = "yyyyMMdd_HHmmss"') -and
+            $bravoConfigText.Contains('$global:logFileNameTemplate = "BRAVO_ARCHIV_{0}_PID{1}.log"') -and
+            $archiveScriptText.Contains("`$logTimestamp = `$scriptStartTime.ToString('yyyyMMdd_HHmmss')") -and
+            $archiveScriptText.Contains("`$logFileName = `$logFileNameTemplate -f `$logTimestamp, `$PID")
+        ) `
+        -Name 'Logging/ArchiveExecutionLogsAreUnique' `
+        -Failure 'два запуски в одну хвилину мають отримувати різні execution logs (seconds + PID)'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $bravoConfigText.Contains('google.com') -and
+            -not $archiveScriptText.Contains('function Test-NetworkConnection') -and
+            -not $archiveScriptText.Contains('$networkCheckHost') -and
+            $archiveScriptText.Contains('actual endpoint ${resolvedSftpHost}:$sftpPort')
+        ) `
+        -Name 'SFTP/NoGenericInternetDependency' `
+        -Failure 'SFTP має перевіряти actual endpoint і не залежати від google.com:443'
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains("New-BRAVOTransferOperationResult -Name 'SFTP: резервні копії'") -and
+            $archiveScriptText.Contains("New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_APP'") -and
+            $archiveScriptText.Contains("New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_WWW'") -and
+            $archiveScriptText.Contains("@('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW')")
+        ) `
+        -Name 'SFTP/SeparateArchiveBazaAppBazaWwwStates' `
+        -Failure 'Archive upload, BAZA_APP і BAZA_WWW повинні мати окремі state objects і console steps'
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains("return 'SFTP-ARCHIVE'") -and
+            $archiveScriptText.Contains("return 'BAZA_APP'") -and
+            $archiveScriptText.Contains("return 'BAZA_WWW'")
+        ) `
+        -Name 'Logging/SeparatesSftpSubOperations' `
+        -Failure 'log component mapping має однозначно розрізняти SFTP-ARCHIVE, BAZA_APP і BAZA_WWW'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $archiveScriptText.Contains('$windowsPatchLevel.Message') -and
+            $archiveScriptText.Contains('Get-BRAVOOSSupportTier')
+        ) `
+        -Name 'Runtime/WindowsUpdateAgeDoesNotAffectArchive' `
+        -Failure 'BRAVO_ARCHIV не повинен отримувати warning/exit 10 через patch age; platform compatibility лишається'
     Test-BRAVOCondition `
         -Condition ([bool]$schedulerSettings.RequireProtectedRuntime) `
         -Name "Scheduler/ProtectedRuntime" `
@@ -3735,12 +4278,12 @@ try {
                 $autoDiscovery.BLOG_SOURCE -eq (Join-Path $discoveryTestRoot "BLOG") -and
                 $autoDiscovery.BRAVOEXCH_SOURCE -eq (Join-Path $discoveryTestRoot "bravoexch") -and
                 $autoDiscovery.BAZA_APP -eq (Join-Path $discoveryTestRoot "BAZA") -and
-                $autoDiscovery.BAZA_WWW -eq (Join-Path $discoveryTestRoot "webroot\www\BAZA") -and
+                [string]::IsNullOrWhiteSpace([string]$autoDiscovery.BAZA_WWW) -and
                 $autoDiscovery.MODEL_PROJECT_FILE -eq (Join-Path $discoveryTestRoot "Model\lims") -and
-                $autoDiscovery.BACKUP_ROOT -eq (Join-Path $discoveryTestRoot "ARCHIV")
+                [string]::IsNullOrWhiteSpace([string]$autoDiscovery.BACKUP_ROOT)
             ) `
             -Name "Discovery/ResolvesFromServiceAndIniWithoutOverride" `
-            -Failure "Resolve-BRAVOInstallationDiscovery має обчислювати BRAVO_ROOT/WEB_ROOT/MODEL_SOURCE/BLOG_SOURCE/BRAVOEXCH_SOURCE/BAZA_APP/BAZA_WWW/BACKUP_ROOT із синтетичної служби й bravo.ini без жодного override"
+            -Failure "MODEL/BLOG/BRAVOEXCH мають походити з canonical bravo.ini; BAZA_WWW без DocumentRoot і BACKUP_ROOT без pathSettings не повинні виводитись евристично"
 
         $overriddenDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
@@ -3753,7 +4296,7 @@ try {
             -Condition (
                 $overriddenDiscovery.MODEL_SOURCE -eq "C:\Explicit\Override\Model" -and
                 [bool]$overriddenDiscovery.Overrides["MODEL"] -and
-                $overriddenDiscovery.BLOG_SOURCE -eq (Join-Path $discoveryTestRoot "BLOG")
+                [string]::IsNullOrWhiteSpace([string]$overriddenDiscovery.BLOG_SOURCE)
             ) `
             -Name "Discovery/ExplicitOverrideWinsAndIsNeverReplaced" `
             -Failure "явний discoverySettings.Sources.MODEL override має перемагати над автоматично знайденим значенням, не зачіпаючи інші поля"
@@ -3766,13 +4309,13 @@ try {
             -SystemRoot $noSuchSystemRoot
         Test-BRAVOCondition `
             -Condition (
-                $noServiceDiscovery.BRAVO_ROOT -eq $discoveryTestRoot -and
-                $noServiceDiscovery.MODEL_SOURCE -eq (Join-Path $discoveryTestRoot "Model") -and
-                $noServiceDiscovery.BLOG_SOURCE -eq (Join-Path $discoveryTestRoot "BLOG") -and
+                [string]::IsNullOrWhiteSpace([string]$noServiceDiscovery.BRAVO_ROOT) -and
+                [string]::IsNullOrWhiteSpace([string]$noServiceDiscovery.MODEL_SOURCE) -and
+                [string]::IsNullOrWhiteSpace([string]$noServiceDiscovery.BLOG_SOURCE) -and
                 [string]::IsNullOrWhiteSpace([string]$noServiceDiscovery.WEB_ROOT)
             ) `
-            -Name "Discovery/LegacyFallbackWhenNoServiceFound" `
-            -Failure "без встановленої служби BRAVO/Apache Resolve-BRAVOInstallationDiscovery має fallback-ити на чинну LIMSRoot-відносну поведінку (Model/BLOG у корені), а не повертати порожні значення"
+            -Name "Discovery/NoSilentSourceFallbackWhenCanonicalIniMissing" `
+            -Failure "без canonical bravo.ini MODEL/BLOG мають лишатись невизначеними; LIMSRoot-відносний fallback може архівувати іншу інсталяцію"
 
         # BACKUP_ROOT — інакше, ніж MODEL/BLOG: коли службу BRAVO не
         # знайдено, "LIMSRoot\ARCHIV" — це ГІРШИЙ здогад, ніж дефолт,
@@ -3788,9 +4331,8 @@ try {
         # BRAVO немає взагалі, але системний bravo.ini є — і MODEL/BLOG у
         # ньому вказують на зовсім інший диск/каталог, ніж LimsRoot
         # ("D:\LIMS-NEW\..." проти "C:\Users\...\Documents"). BRAVO_ROOT
-        # тоді деградує до LimsRoot-фолбеку — без цього виправлення
-        # BAZA_APP шукався б поруч із LimsRoot, а не поруч із реальним
-        # MODEL/BLOG, куди насправді дивиться bravo.ini.
+        # тоді лишається невизначеним, але BAZA_APP усе одно має братись
+        # поруч із реальним MODEL/BLOG із canonical bravo.ini.
         $iniOnlyInstallRoot = Join-Path $discoveryTestRoot "IniOnlyInstall"
         [void][IO.Directory]::CreateDirectory($iniOnlyInstallRoot)
         $iniOnlySystemRoot = Join-Path $discoveryTestRoot "IniOnlyWindows"
@@ -3809,13 +4351,13 @@ try {
             -Is64BitOperatingSystem $true
         Test-BRAVOCondition `
             -Condition (
-                $iniOnlyDiscovery.BRAVO_ROOT -eq $discoveryTestRoot -and
+                [string]::IsNullOrWhiteSpace([string]$iniOnlyDiscovery.BRAVO_ROOT) -and
                 $iniOnlyDiscovery.MODEL_SOURCE -eq (Join-Path $iniOnlyInstallRoot "Model") -and
                 $iniOnlyDiscovery.BAZA_APP -eq (Join-Path $iniOnlyInstallRoot "BAZA") -and
                 $iniOnlyDiscovery.Reasons.BAZA_APP.Contains("MODEL/BLOG з bravo.ini")
             ) `
             -Name "Discovery/BazaAppFollowsIniInstallationRootNotBravoRootFallback" `
-            -Failure "коли bravo.ini знайдено, а служби BRAVO немає, BAZA_APP має братись поруч із MODEL/BLOG з bravo.ini, а не поруч із LimsRoot-фолбеком BRAVO_ROOT"
+            -Failure "коли canonical bravo.ini знайдено, а служби BRAVO немає, BRAVO_ROOT має лишитись null, а BAZA_APP — братись поруч із MODEL/BLOG з ini"
 
         # Мінімальний парсер httpd.conf: реальний зразок, наданий
         # користувачем — DocumentRoot у лапках, слеші "/" (Apache на
@@ -3888,11 +4430,11 @@ try {
             -SystemRoot $noSuchSystemRoot
         Test-BRAVOCondition `
             -Condition (
-                $wrongDisplayNameDiscovery.BRAVO_ROOT -eq $discoveryTestRoot -and
-                $wrongDisplayNameDiscovery.Reasons.BravoRoot.Contains("legacy fallback")
+                [string]::IsNullOrWhiteSpace([string]$wrongDisplayNameDiscovery.BRAVO_ROOT) -and
+                $wrongDisplayNameDiscovery.Reasons.BravoRoot.Contains("не визначено")
             ) `
             -Name "Discovery/BravoServiceRequiresNameAndDisplayNameMatch" `
-            -Failure "служба з Name='BRAVO', але іншим Display name не повинна визнаватись службою BRAVO — Resolve-BRAVOInstallationDiscovery має fallback-ити на LIMSRoot, а не використовувати її ExecutablePath"
+            -Failure "служба з Name='BRAVO', але іншим Display name не повинна визнаватись службою BRAVO або спричиняти silent fallback на LIMSRoot"
 
         # bravo.ini — джерело істини системний каталог Windows, НЕ каталог
         # bravo.exe. -SystemRoot/-Is64BitOperatingSystem — ін'єкція для
@@ -3970,12 +4512,11 @@ try {
             -Name "Discovery/NoFallbackNextToExecutableWhenSystemIniMissing" `
             -Failure "за відсутності bravo.ini у системному каталозі має бути помилка з назвою перевіреного шляху, а не мовчазне читання файлу поруч з bravo.exe"
 
-        # BACKUP_ROOT: підкаталог "ARCHIV" усередині BRAVO_ROOT, і той самий
-        # override-механізм, що й решта Sources-полів.
+        # BackupRoot належить pathSettings і не виводиться з BRAVO_ROOT.
         Test-BRAVOCondition `
-            -Condition ($autoDiscovery.BACKUP_ROOT -eq (Join-Path $discoveryTestRoot "ARCHIV")) `
-            -Name "Discovery/BackupRootDerivedFromBravoRoot" `
-            -Failure "BACKUP_ROOT має обчислюватись як підкаталог 'ARCHIV' усередині BRAVO_ROOT — каталогу встановлення служби BRAVO"
+            -Condition ([string]::IsNullOrWhiteSpace([string]$autoDiscovery.BACKUP_ROOT)) `
+            -Name "Discovery/BackupRootNotDerivedFromBravoRoot" `
+            -Failure "BACKUP_ROOT не повинен автоматично виводитись із каталогу служби BRAVO"
         $BackupRootOverrideDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
@@ -4116,24 +4657,27 @@ try {
     # одночасно — має бути прокинуте з BRAVO.config у
     # Resolve-BRAVOInstallationDiscovery, а не лишатись лише в модулі.
     #
-    # BackupRoot при цьому БІЛЬШЕ не перевизначається автоматично з
-    # Discovery: значення в pathSettings обов'язкове й явне, тому мовчазна
-    # заміна означала б, що адміністратор бачить у конфігурації один
-    # каталог, а бекапи їдуть в інший.
+    # BackupRoot НЕ перевизначається мовчки з Discovery джерел
+    # (MODEL/BLOG/BRAVOEXCH): ефективне значення дає резолвер
+    # Resolve-BRAVOEffectiveBackupRoot — явний pathSettings.BackupRoot точно
+    # або детермінований AUTO <EffectiveLIMSRoot>\ARCHIV. Мовчазної заміни
+    # ЯВНОГО значення на Discovery.BACKUP_ROOT немає (адміністратор бачив би
+    # один каталог, а бекапи їхали б в інший).
     Test-BRAVOCondition `
         -Condition (
             $bravoConfigTextForDiscovery.Contains('BravoDisplayName = "BRAVO Service"') -and
             [regex]::IsMatch($bravoConfigTextForDiscovery, '-BravoDisplayName\s+\(\[string\]\$maintenanceSettings\.Services\.BravoDisplayName\)') -and
+            $bravoConfigTextForDiscovery.Contains('Resolve-BRAVOEffectiveBackupRoot') -and
             -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$global:pathSettings\.BackupRoot\s*=\s*\[string\]\$bravoDiscoveryResult\.BACKUP_ROOT')
         ) `
-        -Name "Discovery/ConfigUsesStrictBravoIdentityAndExplicitBackupRoot" `
-        -Failure "BRAVO.config має передавати -BravoDisplayName='BRAVO Service' у Resolve-BRAVOInstallationDiscovery і НЕ перевизначати pathSettings.BackupRoot автоматично з Discovery"
+        -Name "Discovery/ConfigUsesStrictBravoIdentityAndResolvesBackupRoot" `
+        -Failure "BRAVO.config має передавати -BravoDisplayName='BRAVO Service' у Resolve-BRAVOInstallationDiscovery, обчислювати BackupRoot через Resolve-BRAVOEffectiveBackupRoot і НЕ перевизначати pathSettings.BackupRoot мовчки з Discovery.BACKUP_ROOT"
 
-    # CODE IS NOT DATA. Виробничі корені даних задаються явно й не
-    # виводяться ані з розташування комплекту, ані один з одного: для
-    # комплекту в C:\BRAVO старі формули дали б LIMSRoot="C:\" і
-    # ArchiveRoot="C:\BRAVO", тобто журнали писалися б у каталог з
-    # виконуваним кодом, а джерелом LIMS вважався б корінь системного диска.
+    # CODE IS NOT DATA. Виробничі корені даних НЕ виводяться з розташування
+    # комплекту: для комплекту в C:\BRAVO старі формули дали б LIMSRoot="C:\"
+    # і ArchiveRoot="C:\BRAVO", тобто журнали писалися б у каталог з
+    # виконуваним кодом. Тепер усі три корені — валідне "" (all-AUTO від
+    # служби BRAVO) або явний абсолютний шлях; ЖОДНОГО виведення з ConfigRoot.
     $configLoaderTextForRoots = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO_CONFIG_LOADER.ps1"),
         [Text.Encoding]::UTF8
@@ -4142,27 +4686,29 @@ try {
         -Condition (
             -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$defaultLIMSRoot\s*=\s*Split-Path') -and
             -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$defaultArchiveRoot\s*=\s*\$ConfigRoot') -and
-            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*LIMSRoot\s*=\s*"[A-Za-z]:\\') -and
-            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*ArchiveRoot\s*=\s*"[A-Za-z]:\\') -and
-            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*BackupRoot\s*=\s*"[A-Za-z]:\\') -and
-            $configLoaderTextForRoots.Contains('function Resolve-BravoDataRoot') -and
+            -not [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*ArchiveRoot\s*=') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*LIMSRoot\s*=') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*SystemLogRoot\s*=') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*BackupRoot\s*=') -and
+            $configLoaderTextForRoots.Contains('function Test-BravoDataRootValue') -and
+            $configLoaderTextForRoots.Contains("Test-BravoDataRootValue -Name 'BackupRoot' -Value ([string]`$PathSettings['BackupRoot']) -AllowEmpty") -and
             $configLoaderTextForRoots.Contains('Assert-BravoDataRootsAreIndependent -PathSettings $global:pathSettings')
         ) `
         -Name "Discovery/DataRootsAreExplicitAndIndependentOfRuntime" `
-        -Failure "LIMSRoot/ArchiveRoot/BackupRoot мають задаватись у BRAVO.config абсолютними шляхами й перевірятись Resolve-BravoDataRoot, а не виводитись із ConfigRoot"
+        -Failure "pathSettings має містити LIMSRoot/SystemLogRoot/BackupRoot (без ArchiveRoot); усі три перевіряються Test-BravoDataRootValue з -AllowEmpty (all-AUTO валідне), не виводяться з ConfigRoot"
 
-    # Tools\ — runtime-залежність комплекту (виконувані файли під захистом
-    # маніфесту), а не дані архіву: вони мають лежати поруч зі скриптами,
-    # інакше перенесення архівів на інший диск тягне за собою перенесення
-    # виконуваного коду.
+    # Tools\ і логи скриптів — від RuntimeRoot; ArchiveRoot як production-корінь
+    # прибрано. Логи самих скриптів ($logPath) ЗАВЖДИ RuntimeRoot\LOGS
+    # (=runtimeLogRoot), а не ArchiveRoot\LOGS.
     Test-BRAVOCondition `
         -Condition (
             $bravoConfigTextForDiscovery.Contains('$global:toolsPath = Join-Path $runtimeRoot "Tools"') -and
-            -not $bravoConfigTextForDiscovery.Contains('$global:toolsPath = Join-Path $archivPath "Tools"') -and
-            $bravoConfigTextForDiscovery.Contains('$global:logPath = Join-Path $archivPath "LOGS"')
+            -not $bravoConfigTextForDiscovery.Contains('Join-Path $archivPath') -and
+            $bravoConfigTextForDiscovery.Contains('$global:runtimeLogRoot = Join-Path $runtimeRoot "LOGS"') -and
+            $bravoConfigTextForDiscovery.Contains('$global:logPath = $global:runtimeLogRoot')
         ) `
-        -Name "Discovery/ToolsLiveUnderRuntimeRoot" `
-        -Failure "Tools\ мають визначатись від RuntimeRoot (каталог комплекту), а LOGS\ — від ArchiveRoot (каталог даних)"
+        -Name "Discovery/ToolsAndScriptLogsLiveUnderRuntimeRoot" `
+        -Failure "Tools\ і логи скриптів (logPath=runtimeLogRoot) мають визначатись від RuntimeRoot; ArchiveRoot-похідних (archivPath) не повинно лишитись"
 
     # AUD-004 (аудит P0.4): restore drill. Читабельний і навіть SHA512/7za-
     # перевірений архів не доводить відновлюваність — Invoke-BRAVOSevenZipExtraction
@@ -4238,7 +4784,10 @@ try {
     )
     Test-BRAVOCondition `
         -Condition (
-            $restoreTestScriptText.Contains("Find-BRAVOLatestVerifiedArchive") -and
+            $restoreTestScriptText.Contains("Get-BRAVORestoreGenerationManifest") -and
+            $restoreTestScriptText.Contains("Get-BRAVOVerifiedGenerationArchive") -and
+            $restoreTestScriptText.Contains("RequestedGenerationId") -and
+            $restoreTestScriptText.Contains("BRAVO_BACKUP_*.json") -and
             $restoreTestScriptText.Contains("Test-SevenZipArchiveIntegrity") -and
             $restoreTestScriptText.Contains("Invoke-BRAVOSevenZipExtraction") -and
             $restoreTestScriptText.Contains("MinimumFileCount") -and
@@ -4246,7 +4795,7 @@ try {
             $restoreTestScriptText.Contains("Remove-Item -LiteralPath `$workingDirectory -Recurse -Force")
         ) `
         -Name "RestoreDrill/ScriptImplementsFullDrillCycle" `
-        -Failure "BRAVO_RESTORE_TEST.ps1 має знаходити найновіший верифікований backup, перевіряти цілісність 7za, розпаковувати в ізольований каталог, звіряти мінімальну кількість файлів, повертати контрактний exit code і прибирати за собою"
+        -Failure "BRAVO_RESTORE_TEST.ps1 має вибирати один COMPLETE GenerationId для всіх компонентів, перевіряти SHA512/7za, розпаковувати в ізольований каталог, повертати контрактний exit code і прибирати за собою"
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло
@@ -4400,6 +4949,7 @@ try {
 
     foreach ($runtimeFile in @(
             "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1",
+            "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1",
             "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"
         )) {
         $text = [IO.File]::ReadAllText(
@@ -4407,9 +4957,9 @@ try {
             [Text.Encoding]::UTF8
         )
         Test-BRAVOCondition `
-            -Condition ($text.Contains("BRAVO_OPERATION.lock")) `
+            -Condition ($text.Contains('$operationLockSettings.Path')) `
             -Name "SharedLock/$runtimeFile" `
-            -Failure "скрипт не використовує BRAVO_OPERATION.lock"
+            -Failure "скрипт не використовує canonical machine-wide operationLockSettings.Path"
     }
 
     Test-BRAVOCondition `
@@ -4671,67 +5221,75 @@ try {
         [Text.Encoding]::UTF8
     )
 
-    # --- Runtime/01: data roots нормалізуються й перевіряються ---
+    # --- Runtime/01: валідація коренів даних (Test-BravoDataRootValue) ---
+    # Порожнє LIMSRoot/SystemLogRoot/BackupRoot допустиме з -AllowEmpty (=AUTO);
+    # без -AllowEmpty порожнє відхиляється; відносний шлях відхиляється завжди.
     $dataRootModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $configLoaderTextForRuntime `
-        -FunctionNames @('Resolve-BravoDataRoot', 'Assert-BravoDataRootsAreIndependent')
-    $absoluteRoot = & $dataRootModule {
-        param($Value)
-        Resolve-BravoDataRoot -Name 'ArchiveRoot' -Value $Value
-    } 'D:\LIMS-NEW\ARCHIV\'
-    $quotedEnvRoot = & $dataRootModule {
-        param($Value)
-        Resolve-BravoDataRoot -Name 'ArchiveRoot' -Value $Value
-    } '"%SystemDrive%\BRAVO_TEST_ROOT"'
+        -FunctionNames @('Test-BravoDataRootValue', 'Assert-BravoDataRootsAreIndependent')
+    $absoluteAccepted = $true
+    try {
+        & $dataRootModule {
+            param($Value)
+            Test-BravoDataRootValue -Name 'BackupRoot' -Value $Value
+        } '"%SystemDrive%\BRAVO_TEST_ROOT"'
+    } catch { $absoluteAccepted = $false }
+    $emptyLimsAllowed = $true
+    try {
+        & $dataRootModule { Test-BravoDataRootValue -Name 'LIMSRoot' -Value '' -AllowEmpty }
+    } catch { $emptyLimsAllowed = $false }
+    # Новий контракт: порожній BackupRoot із -AllowEmpty дозволений (AUTO).
+    $emptyBackupAllowed = $true
+    try {
+        & $dataRootModule { Test-BravoDataRootValue -Name 'BackupRoot' -Value '' -AllowEmpty }
+    } catch { $emptyBackupAllowed = $false }
+    # Відносний шлях відхиляється НАВІТЬ із -AllowEmpty (порожнє != відносне).
     $relativeRejected = $false
     try {
-        [void](& $dataRootModule {
+        & $dataRootModule {
             param($Value)
-            Resolve-BravoDataRoot -Name 'ArchiveRoot' -Value $Value
-        } 'ARCHIV')
-    } catch {
-        $relativeRejected = $_.Exception.Message -like '*абсолютним шляхом*'
-    }
-    $emptyRejected = $false
+            Test-BravoDataRootValue -Name 'BackupRoot' -Value $Value -AllowEmpty
+        } 'ARCHIV'
+    } catch { $relativeRejected = $_.Exception.Message -like '*абсолютним шляхом*' }
+    # Без -AllowEmpty порожнє все ще відхиляється (перемикач справді працює).
+    $emptyRejectedWithoutSwitch = $false
     try {
-        [void](& $dataRootModule {
-            Resolve-BravoDataRoot -Name 'LIMSRoot' -Value ''
-        })
-    } catch {
-        $emptyRejected = $_.Exception.Message -like '*не задано*'
-    }
+        & $dataRootModule { Test-BravoDataRootValue -Name 'BackupRoot' -Value '' }
+    } catch { $emptyRejectedWithoutSwitch = $_.Exception.Message -like '*не задано*' }
     Test-BRAVOCondition `
         -Condition (
-            $absoluteRoot -eq 'D:\LIMS-NEW\ARCHIV' -and
-            $quotedEnvRoot -eq (Join-Path $env:SystemDrive 'BRAVO_TEST_ROOT') -and
-            $relativeRejected -and
-            $emptyRejected
+            $absoluteAccepted -and $emptyLimsAllowed -and $emptyBackupAllowed -and
+            $relativeRejected -and $emptyRejectedWithoutSwitch
         ) `
-        -Name "Runtime/01-DataRootsAreAbsoluteExpandedAndValidated" `
-        -Failure "Resolve-BravoDataRoot має знімати лапки, розкривати %ENV%, нормалізувати шлях і відхиляти порожнє чи відносне значення явною помилкою конфігурації"
+        -Name "Runtime/01-DataRootValueValidation" `
+        -Failure "Test-BravoDataRootValue: абсолютний+%ENV% приймається, порожнє з -AllowEmpty дозволене (AUTO) для всіх коренів, відносний відхиляється завжди, порожнє без -AllowEmpty відхиляється"
 
-    # --- Runtime/02: relocatable runtime — data roots не залежать від
-    # розташування комплекту. Перевіряється фактом: три різні корені
-    # проходять валідацію незалежно один від одного й від RuntimeRoot.
-    $relocatableRoots = @{
-        LIMSRoot    = 'D:\LIMS-NEW'
-        ArchiveRoot = 'D:\LIMS-NEW\ARCHIV'
-        BackupRoot  = 'E:\BRAVO_BACKUPS'
-    }
-    & $dataRootModule {
-        param($Settings)
-        Assert-BravoDataRootsAreIndependent -PathSettings $Settings
-    } $relocatableRoots
+    # --- Runtime/02: relocatable runtime — незалежні корені на різних дисках ---
+    # Дві валідні крайності: (а) усі три корені explicit на різних дисках;
+    # (б) усі три "" (all-AUTO). RuntimeRoot передається завантажувачу окремим
+    # параметром і не виводиться з жодного кореня даних.
+    $relocatableValid = $true
+    try {
+        & $dataRootModule {
+            param($Settings)
+            Assert-BravoDataRootsAreIndependent -PathSettings $Settings
+        } @{ LIMSRoot = 'D:\LIMS-NEW'; SystemLogRoot = 'E:\BRAVO_LOGS'; BackupRoot = 'F:\BRAVO_BACKUPS' }
+    } catch { $relocatableValid = $false }
+    $allAutoValid = $true
+    try {
+        & $dataRootModule {
+            param($Settings)
+            Assert-BravoDataRootsAreIndependent -PathSettings $Settings
+        } @{ LIMSRoot = ''; SystemLogRoot = ''; BackupRoot = '' }
+    } catch { $allAutoValid = $false }
     Test-BRAVOCondition `
         -Condition (
-            $relocatableRoots.LIMSRoot -eq 'D:\LIMS-NEW' -and
-            $relocatableRoots.ArchiveRoot -eq 'D:\LIMS-NEW\ARCHIV' -and
-            $relocatableRoots.BackupRoot -eq 'E:\BRAVO_BACKUPS' -and
+            $relocatableValid -and $allAutoValid -and
             $configLoaderTextForRuntime.Contains('[string]$RuntimeRoot') -and
             $configLoaderTextForRuntime.Contains('-ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot')
         ) `
         -Name "Runtime/02-RelocatableRuntimeSupportsSeparateDisks" `
-        -Failure "комплект у C:\BRAVO, LIMS на D: і бекапи на E: мають бути повністю підтримані: RuntimeRoot передається окремим параметром і не змішується з коренями даних"
+        -Failure "мають бути валідними обидві крайності: усі три корені explicit на різних дисках І усі три '' (all-AUTO); RuntimeRoot окремим параметром, не з коренів даних"
 
     # --- Runtime/03: effective ConfigPath використовується всюди ---
     $entrypointConfigPathChecks = @(
@@ -4832,6 +5390,9 @@ try {
             'Test-BRAVOFileSystemReadAccess',
             'Test-BRAVOFileSystemWriteAccess'
         )
+    $archiveReadProbeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @('Test-BRAVOSourceReadProbe')
     $preflightTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_PREFLIGHT_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -4864,6 +5425,28 @@ try {
             ) `
             -Name "Runtime/08-SystemPreflightPerformsRealWriteProbe" `
             -Failure "preflight має реально створювати, записувати, зчитувати назад і видаляти probe-файл: наявність каталогу не гарантує право запису під SYSTEM"
+        Test-BRAVOCondition `
+            -Condition (
+                $archiveScriptText.Contains('function Test-BRAVOFileSystemWriteProbe') -and
+                $archiveScriptText.Contains('function Test-BRAVOSourceReadProbe') -and
+                $archiveScriptText.Contains("[IO.FileMode]::CreateNew") -and
+                $archiveScriptText.Contains("[IO.File]::ReadAllBytes(`$probePath)") -and
+                $archiveScriptText.Contains("(Split-Path -Path ([string]`$operationLockSettings.Path) -Parent)") -and
+                $archiveScriptText.Contains("`$writeProbePaths += [System.IO.Path]::Combine([string]`$archive.Destination, '.work')")
+            ) `
+            -Name 'Runtime/08-ProductionSystemPreflightMatchesDryRun' `
+            -Failure 'production Archive має повторювати SYSTEM source-read/write-readback-delete preflight для data roots, destinations, .work і machine lock'
+
+        $emptySourceRoot = Join-Path $preflightTestRoot 'empty-source'
+        New-Item -ItemType Directory -Path $emptySourceRoot -Force | Out-Null
+        $emptySourceProbe = & $archiveReadProbeModule {
+            param($Path)
+            Test-BRAVOSourceReadProbe -Path $Path
+        } $emptySourceRoot
+        Test-BRAVOCondition `
+            -Condition ($emptySourceProbe.Success -and $emptySourceProbe.Empty) `
+            -Name 'Runtime/08-ArchiveSourceProbeAcceptsEmptyDirectory' `
+            -Failure 'доступний порожній BEXCH/BAZA source має проходити preflight; відсутність елементів не є помилкою читання'
 
         # --- Runtime/09: підключені мережеві диски як production-залежність ---
         $networkDriveLetter = @(
@@ -4908,16 +5491,197 @@ try {
     # --- Runtime/10: preflight перевіряє читання й запис усіх коренів ---
     Test-BRAVOCondition `
         -Condition (
+            $dryRunTextForRuntime.Contains('$dryRunRuntimeLogRoot = [string]$global:runtimeLogRoot') -and
+            $dryRunTextForRuntime.Contains('$dryRunLimsRoot = [string]$global:effectiveLimsRoot') -and
+            $dryRunTextForRuntime.Contains('$dryRunSystemLogRoot = [string]$global:systemLogRoot') -and
+            $dryRunTextForRuntime.Contains('$dryRunBackupRoot = [string]$global:backupRootPath') -and
+            $dryRunTextForRuntime.Contains('$dryRunStateRoot = [string]$global:stateRoot') -and
+            $dryRunTextForRuntime.Contains('. $dryRunGuardPath -RuntimeRoot $runtimeRoot') -and
+            $dryRunTextForRuntime.Contains("SFTPLogin = ''") -and
+            $dryRunTextForRuntime.Contains("Webhook = ''") -and
             $dryRunTextForRuntime.Contains("'RuntimeRoot' = `$dryRunRuntimeRoot") -and
             $dryRunTextForRuntime.Contains("'bravo.ini'   = [string]`$bravoDiscoveryResult.BravoIniPath") -and
-            $dryRunTextForRuntime.Contains("'ArchiveRoot'          = `$dryRunArchiveRoot") -and
-            $dryRunTextForRuntime.Contains("'BackupRoot'           = `$dryRunBackupRoot") -and
-            $dryRunTextForRuntime.Contains("'LOGS\Trace'           = (Join-Path `$dryRunLogRoot 'Trace')") -and
-            $dryRunTextForRuntime.Contains("'LOGS\exchangAPI'      = (Join-Path `$dryRunLogRoot 'exchangAPI')") -and
-            $dryRunTextForRuntime.Contains("'LOGS\BravoWeb\Apache' = (Join-Path `$dryRunBravoWebLogRoot 'Apache')")
+            $dryRunTextForRuntime.Contains("'RuntimeRoot\LOGS (script logs)' = `$dryRunRuntimeLogRoot") -and
+            $dryRunTextForRuntime.Contains("'BackupRoot'                     = `$dryRunBackupRoot") -and
+            $dryRunTextForRuntime.Contains("'SystemLogRoot'                  = `$dryRunSystemLogRoot") -and
+            $dryRunTextForRuntime.Contains("[System.IO.Path]::Combine(`$dryRunSystemLogRoot, 'Trace')") -and
+            $dryRunTextForRuntime.Contains("'Machine state'        = `$dryRunStateRoot") -and
+            $dryRunTextForRuntime.Contains("'Operation lock'") -and
+            $dryRunTextForRuntime.Contains('destination"] = [string]$definition.Destination') -and
+            $dryRunTextForRuntime.Contains("work`"] = [System.IO.Path]::Combine([string]`$definition.Destination, '.work')") -and
+            $dryRunTextForRuntime.Contains("Add-DryRunResult FAIL 'VSS' 'Capability' `$vssDetail") -and
+            $dryRunTextForRuntime.Contains('Test-BRAVOToolManifestIntegrity') -and
+            $dryRunTextForRuntime.Contains("Add-DryRunResult PASS 'VSS' 'Capability'") -and
+            $dryRunTextForRuntime.Contains("Add-DryRunResult PASS 'SFTP' 'Actual endpoint'")
         ) `
         -Name "Runtime/10-PreflightCoversAllRequiredRoots" `
         -Failure "SYSTEM preflight має перевіряти читання RuntimeRoot/ConfigPath/modules/Tools/LIMSRoot/bravo.ini і запис ArchiveRoot/BackupRoot/LOGS та всіх каталогів призначення ротації"
+
+    # ===== АРХІТЕКТУРА ШЛЯХІВ: RuntimeRoot/LIMSRoot/SystemLogRoot/BackupRoot
+    # (ТЗ «Рефакторинг архітектури шляхів BRAVO») =====
+    Remove-Module -Name 'BRAVO.Discovery' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Discovery\BRAVO.Discovery.psd1") -Force -ErrorAction Stop
+    $bravoConfigTextForPaths = [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8)
+
+    $svcCanonical = @([pscustomobject]@{ Name='BRAVO'; DisplayName='BRAVO Service'; State='Stopped'; StartMode='Disabled'; PathName='"D:\LIMS-NEW\bravo.exe" -service' })
+    $svcAmbiguous = @(
+        [pscustomobject]@{ Name='BRAVO'; DisplayName='BRAVO Service'; State='Running'; StartMode='Auto'; PathName='"D:\LIMS\bravo.exe"' },
+        [pscustomobject]@{ Name='BRAVO'; DisplayName='BRAVO Service'; State='Stopped'; StartMode='Manual'; PathName='"E:\LIMS\bravo.exe"' })
+
+    # --- Paths/01: AUTO LIMSRoot зі служби (Disabled допустимо) ---
+    $autoLims = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath '' -Services $svcCanonical
+    Test-BRAVOCondition `
+        -Condition ([string]$autoLims.Source -eq 'ServiceDiscovery' -and [string]$autoLims.EffectivePath -eq 'D:\LIMS-NEW') `
+        -Name "Paths/01-AutoLimsRootFromService" `
+        -Failure "LIMSRoot='' має визначатись як каталог bravo.exe встановленої служби (Disabled — теж валідна identity)"
+
+    # --- Paths/02: explicit LIMSRoot має пріоритет над службою ---
+    $explicitLims = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath 'E:\CUSTOM_BRAVO' -Services $svcAmbiguous
+    Test-BRAVOCondition `
+        -Condition ([string]$explicitLims.Source -eq 'ExplicitConfig' -and [string]$explicitLims.EffectivePath -eq 'E:\CUSTOM_BRAVO') `
+        -Name "Paths/02-ExplicitLimsRootWins" `
+        -Failure "явний LIMSRoot має використовуватись точно й не перевизначатись service discovery"
+
+    # --- Paths/03: відсутня служба -> fail-closed ---
+    $noServiceLims = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath '' -Services @()
+    Test-BRAVOCondition `
+        -Condition ([string]$noServiceLims.Source -eq 'Error' -and [string]::IsNullOrWhiteSpace([string]$noServiceLims.EffectivePath)) `
+        -Name "Paths/03-NoServiceFailsClosed" `
+        -Failure "LIMSRoot='' без служби BRAVO має давати керовану помилку, а не fallback на RuntimeRoot/ConfigRoot"
+
+    # --- Paths/04: неоднозначна служба -> fail-closed ---
+    $ambiguousLims = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath '' -Services $svcAmbiguous
+    Test-BRAVOCondition `
+        -Condition ([string]$ambiguousLims.Source -eq 'Error' -and [string]::IsNullOrWhiteSpace([string]$ambiguousLims.EffectivePath)) `
+        -Name "Paths/04-AmbiguousServiceFailsClosed" `
+        -Failure "кілька служб BRAVO з різними виконуваними файлами при LIMSRoot='' мають давати помилку (fail-closed), а не first-match"
+
+    # --- Paths/05: AUTO SystemLogRoot = <LIMSRoot>\ARCHIV\LOGS ---
+    $autoSysLog = Resolve-BRAVOEffectiveSystemLogRoot -ConfiguredPath '' -EffectiveLimsRoot 'D:\LIMS-NEW'
+    Test-BRAVOCondition `
+        -Condition ([string]$autoSysLog.Source -eq 'AutoFromLIMSRoot' -and [string]$autoSysLog.EffectivePath -eq 'D:\LIMS-NEW\ARCHIV\LOGS') `
+        -Name "Paths/05-AutoSystemLogRootFromLims" `
+        -Failure "SystemLogRoot='' має давати <EffectiveLIMSRoot>\ARCHIV\LOGS"
+
+    # --- Paths/06: explicit SystemLogRoot використовується точно ---
+    $explicitSysLog = Resolve-BRAVOEffectiveSystemLogRoot -ConfiguredPath 'E:\BRAVO_SYSTEM_LOGS' -EffectiveLimsRoot 'D:\LIMS-NEW'
+    Test-BRAVOCondition `
+        -Condition ([string]$explicitSysLog.Source -eq 'ExplicitConfig' -and [string]$explicitSysLog.EffectivePath -eq 'E:\BRAVO_SYSTEM_LOGS') `
+        -Name "Paths/06-ExplicitSystemLogRootExact" `
+        -Failure "явний SystemLogRoot має використовуватись точно, без дописування ARCHIV\LOGS"
+
+    # --- Paths/07: BRAVO.config — новий контракт pathSettings ---
+    Test-BRAVOCondition `
+        -Condition (
+            [regex]::IsMatch($bravoConfigTextForPaths, '(?m)^\s*LIMSRoot\s*=') -and
+            [regex]::IsMatch($bravoConfigTextForPaths, '(?m)^\s*SystemLogRoot\s*=') -and
+            [regex]::IsMatch($bravoConfigTextForPaths, '(?m)^\s*BackupRoot\s*=') -and
+            -not [regex]::IsMatch($bravoConfigTextForPaths, '(?m)^\s*ArchiveRoot\s*=') -and
+            $bravoConfigTextForPaths.Contains('Resolve-BRAVOEffectiveLimsRoot') -and
+            $bravoConfigTextForPaths.Contains('Resolve-BRAVOEffectiveSystemLogRoot') -and
+            $bravoConfigTextForPaths.Contains('Resolve-BRAVOEffectiveBackupRoot')
+        ) `
+        -Name "Paths/07-ConfigContractHasNoArchiveRoot" `
+        -Failure "pathSettings має містити LIMSRoot/SystemLogRoot/BackupRoot і викликати Resolve-BRAVOEffective* (Lims/SystemLog/Backup); ArchiveRoot має бути прибраний"
+
+    # --- Paths/08: script logs = RuntimeRoot\LOGS; state = ProgramData\State ---
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigTextForPaths.Contains('$global:runtimeLogRoot = Join-Path $runtimeRoot "LOGS"') -and
+            $bravoConfigTextForPaths.Contains('$global:logPath = $global:runtimeLogRoot') -and
+            $bravoConfigTextForPaths.Contains("`$global:stateRoot = Join-Path `$programDataRoot 'BRAVO\State'") -and
+            $bravoConfigTextForPaths.Contains('$global:systemLogRoot = [string]$systemLogRootResult.EffectivePath')
+        ) `
+        -Name "Paths/08-ScriptLogsRuntimeStateProgramData" `
+        -Failure "логи скриптів мають бути RuntimeRoot\LOGS (logPath=runtimeLogRoot), стан — ProgramData\BRAVO\State, systemLogRoot — окремий"
+
+    # --- Paths/09: Maintenance — Trace/exchangAPI/BravoWeb під SystemLogRoot,
+    # власні логи під RuntimeLogRoot, стан під ProgramData\State ---
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptText.Contains('$SYSTEM_LOG_ROOT = [string]$systemLogRoot') -and
+            $maintenanceScriptText.Contains('$TRACE_DIR = Join-Path $SYSTEM_LOG_ROOT "Trace"') -and
+            $maintenanceScriptText.Contains('$LOG_DIR = [string]$runtimeLogRoot') -and
+            $maintenanceScriptText.Contains("Join-Path `$stateRoot 'BRAVO_RESTORE_STATE.json'") -and
+            $maintenanceScriptText.Contains("Join-Path `$stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'") -and
+            $maintenanceScriptText -notmatch '\$ARCHIVE_ROOT'
+        ) `
+        -Name "Paths/09-MaintenanceSplitsRuntimeSystemState" `
+        -Failure "Maintenance: Trace/exchangAPI/BravoWeb під SystemLogRoot, власні логи під RuntimeLogRoot, стан під ProgramData\State; ARCHIVE_ROOT прибрано"
+
+    # --- Paths/10: Archive backup execution state -> ProgramData\State ---
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains("Join-Path `$stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'") -and
+            -not $archiveScriptText.Contains("Join-Path `$logPath 'BRAVO_TASK_EXECUTION_STATE.json'")
+        ) `
+        -Name "Paths/10-ArchiveStateInProgramData" `
+        -Failure "Archive backup execution state має писатись у ProgramData\BRAVO\State, а не в каталог логів"
+
+    # --- Paths/11: BackupRoot — BAZA_APP/BAZA_WWW роздільно ---
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigTextForPaths.Contains('[System.IO.Path]::Combine($backupRootPath, "BAZA_APP")') -and
+            $bravoConfigTextForPaths.Contains('[System.IO.Path]::Combine($backupRootPath, "BAZA_WWW")') -and
+            $bravoConfigTextForPaths.Contains('[System.IO.Path]::Combine($backupRootPath, "MODEL")')
+        ) `
+        -Name "Paths/11-BackupRootBazaAppWwwDistinct" `
+        -Failure "локальні призначення backup: BackupRoot\{MODEL,BLOG,BRAVOEXCH,BAZA_APP,BAZA_WWW}; BAZA_APP не має зватись просто BAZA"
+
+    # --- Paths/12: AUTO BackupRoot = <EffectiveLIMSRoot>\ARCHIV ---
+    $autoBackup = Resolve-BRAVOEffectiveBackupRoot -ConfiguredPath '' -EffectiveLimsRoot 'D:\LIMS-NEW'
+    Test-BRAVOCondition `
+        -Condition ([string]$autoBackup.Source -eq 'AutoFromLIMSRoot' -and [string]$autoBackup.EffectivePath -eq 'D:\LIMS-NEW\ARCHIV') `
+        -Name "Paths/12-AutoBackupRootFromLims" `
+        -Failure "BackupRoot='' має давати <EffectiveLIMSRoot>\ARCHIV із Source=AutoFromLIMSRoot"
+
+    # --- Paths/13: explicit BackupRoot використовується точно ---
+    $explicitBackup = Resolve-BRAVOEffectiveBackupRoot -ConfiguredPath 'E:\BACKUPS' -EffectiveLimsRoot 'D:\LIMS-NEW'
+    Test-BRAVOCondition `
+        -Condition ([string]$explicitBackup.Source -eq 'ExplicitConfig' -and [string]$explicitBackup.EffectivePath -eq 'E:\BACKUPS') `
+        -Name "Paths/13-ExplicitBackupRootExact" `
+        -Failure "явний BackupRoot має використовуватись точно, без дописування ARCHIV"
+
+    # --- Paths/14: all-AUTO ланцюжок від синтетичної служби BRAVO ---
+    # LIMSRoot=""/SystemLogRoot=""/BackupRoot="" + служба з bravo.exe у
+    # D:\LIMS-NEW мають дати повний детермінований розклад коренів.
+    $chainLims = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath '' -Services $svcCanonical
+    $chainSysLog = Resolve-BRAVOEffectiveSystemLogRoot -ConfiguredPath '' -EffectiveLimsRoot ([string]$chainLims.EffectivePath)
+    $chainBackup = Resolve-BRAVOEffectiveBackupRoot -ConfiguredPath '' -EffectiveLimsRoot ([string]$chainLims.EffectivePath)
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$chainLims.EffectivePath -eq 'D:\LIMS-NEW' -and
+            [string]$chainSysLog.EffectivePath -eq 'D:\LIMS-NEW\ARCHIV\LOGS' -and
+            [string]$chainBackup.EffectivePath -eq 'D:\LIMS-NEW\ARCHIV' -and
+            [string]$chainLims.Source -eq 'ServiceDiscovery' -and
+            [string]$chainSysLog.Source -eq 'AutoFromLIMSRoot' -and
+            [string]$chainBackup.Source -eq 'AutoFromLIMSRoot'
+        ) `
+        -Name "Paths/14-AllAutoLayoutFromService" `
+        -Failure "all-AUTO (усі три '') зі службою bravo.exe у D:\LIMS-NEW має дати LIMS=D:\LIMS-NEW, SystemLog=...\ARCHIV\LOGS, Backup=...\ARCHIV"
+
+    # --- Paths/15: композиція шляху на відсутньому диску не кидає виняток ---
+    # Резолвери мають будувати шлях через [IO.Path]::Combine, тому навіть корінь
+    # на відсутньому диску (Q:) не має давати DriveNotFoundException під час
+    # завантаження — недоступність виявляє write-probe у dry-run, а не резолвер.
+    $qDrivePresent = [bool](Get-PSDrive -Name 'Q' -ErrorAction SilentlyContinue)
+    $backupCompositionSafe = $false
+    if (-not $qDrivePresent) {
+        try {
+            $qBackup = Resolve-BRAVOEffectiveBackupRoot -ConfiguredPath '' -EffectiveLimsRoot 'Q:\LIMS-NEW'
+            $qModel = [System.IO.Path]::Combine([string]$qBackup.EffectivePath, 'MODEL')
+            $backupCompositionSafe = ([string]$qBackup.EffectivePath -eq 'Q:\LIMS-NEW\ARCHIV' -and $qModel -eq 'Q:\LIMS-NEW\ARCHIV\MODEL')
+        } catch { $backupCompositionSafe = $false }
+    } else {
+        # Диск Q: реально існує на цьому хості — сценарій "відсутній диск"
+        # непридатний; тест не має сенсу тут провалювати.
+        $backupCompositionSafe = $true
+    }
+    Test-BRAVOCondition `
+        -Condition $backupCompositionSafe `
+        -Name "Paths/15-BackupCompositionOnAbsentDriveDoesNotThrow" `
+        -Failure "побудова BackupRoot і призначень на відсутньому диску (Q:) не має кидати DriveNotFoundException — лише [IO.Path]::Combine, без Join-Path"
 
     # ===== РОТАЦІЯ, МІГРАЦІЯ ТА RETENTION ЖУРНАЛІВ: 27 сценаріїв
     # (ТЗ «Production-grade ротація, міграція, архівація та retention
@@ -5677,8 +6441,8 @@ try {
         $bravoConfigTextForRetention = [IO.File]::ReadAllText($resolvedConfig, [Text.Encoding]::UTF8)
         Test-BRAVOCondition `
             -Condition (
-                $maintenanceScriptText.Contains('$TRACE_DIR = Join-Path $LOG_DIR "Trace"') -and
-                $maintenanceScriptText.Contains('$EXCHANGE_LOG_DIR = Join-Path $LOG_DIR "exchangAPI"') -and
+                $maintenanceScriptText.Contains('$TRACE_DIR = Join-Path $SYSTEM_LOG_ROOT "Trace"') -and
+                $maintenanceScriptText.Contains('$EXCHANGE_LOG_DIR = Join-Path $SYSTEM_LOG_ROOT "exchangAPI"') -and
                 $maintenanceScriptText.Contains('$APACHE_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Apache"') -and
                 $maintenanceScriptText.Contains('$BRAVOWEB_APP_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Application"') -and
                 $bravoConfigTextForRetention -match 'CompressedLogDays\s*=\s*\d+' -and
@@ -5752,7 +6516,8 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('"Не вдалося передати архіви на SFTP"') -and
-            $archiveScriptText.Contains('[bool]$sftpStepFailed -and -not $operationFailed')
+            $archiveScriptText.Contains('elseif ([bool]$sftpStepFailed)') -and
+            $archiveScriptText.Contains("@('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW')")
         ) `
         -Name "ConsoleUX/03-SftpFailureAfterLocalSuccess" `
         -Failure "SFTP-збій після вдалих локальних архівів має власну Причину, не спільну з локальним провалом"
@@ -5827,17 +6592,16 @@ try {
         -Failure "РЕЗУЛЬТАТ Archive має показувати 'Загальний розмір'"
 
     # 11. SHA512/Integrity ніколи не "OK" без реальної перевірки: обидва
-    # рядки друкуються ЛИШЕ всередині "if ($success)" — New-Archive
-    # повертає $success=$true лише після реального проходження обох
-    # перевірок (7-Zip exit code 0 І post-create integrity test).
+    # рядки друкуються ЛИШЕ після публікації component backup. Публікація
+    # відбувається тільки коли create, 7z t і SHA512 verification успішні.
     $archiveComponentBlockMatch = [regex]::Match(
         $archiveScriptText,
-        '(?s)if \(\$success\) \{.*?SHA512:.*?Integrity:.*?\} else \{'
+        '(?s)if \(\$componentPublished\) \{.*?SHA512:.*?Integrity:.*?\} else \{'
     )
     Test-BRAVOCondition `
         -Condition ($archiveComponentBlockMatch.Success) `
         -Name "ConsoleUX/11-Sha512IntegrityNeverFakedOk" `
-        -Failure "SHA512/Integrity мають друкуватись лише всередині if (`$success), інакше це вигаданий OK"
+        -Failure "SHA512/Integrity мають друкуватись лише після успішної публікації component backup, інакше це вигаданий OK"
 
     # 12/13/14. Ручна пауза / -NoPause / перенаправлений неінтерактивний
     # запуск — усі три керуються спільним Wait-BRAVOManualExit, а не

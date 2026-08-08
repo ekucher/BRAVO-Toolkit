@@ -1,4 +1,4 @@
-# BRAVO 4.5.0-dev.3 — комплексне налаштування і безпечний тестовий прогін
+# BRAVO 5.0.0-dev.1 — комплексне налаштування і безпечний тестовий прогін
 
 Кожен запуск setup і його допоміжних дочірніх скриптів створює окремий
 transcript у `LOGS\HELPERS`. Ім'я містить назву скрипта, timestamp і PID, а
@@ -29,8 +29,9 @@ shutdown та інші production-операції у цьому сценарі�
 ## Розташування runtime і безпека
 
 Не встановлюйте SYSTEM-завдання зі `Desktop`, `Documents`, `Downloads` або
-іншого каталогу профілю користувача. Робочий комплект потрібно розміщувати,
-наприклад, у `C:\LIMS\ARCHIV`.
+іншого каталогу профілю користувача. Робочий комплект (`RuntimeRoot`) потрібно
+розміщувати, наприклад, у `C:\BRAVO`; `LIMSRoot`, `ArchiveRoot` і `BackupRoot`
+задаються окремими абсолютними шляхами в effective `BRAVO.config`.
 
 Під час інсталяції Планувальника `BRAVO_TASKS_INSTALL.ps1` відмовляється
 створювати SYSTEM-завдання з профілю користувача, захищає runtime ACL та
@@ -158,7 +159,8 @@ retention нового запуску шукають уже новий преф�
 
 `-TestAccess` виконує:
 
-- SFTP: TCP-з’єднання, автентифікацію WinSCP і читання каталогу `.`;
+- SFTP: TCP-з’єднання саме з configured endpoint, автентифікацію WinSCP і
+  читання каталогу `.`; generic Internet/`google.com` не є prerequisite;
 - SMB: тимчасове підключення `PSDrive` та читання кореня, після чого drive видаляється;
 - Slack/Discord з `-TestAccess`: лише TCP-доступність HTTPS endpoint;
 - Slack/Discord з `-SendTestNotification`: HTTP POST тестового повідомлення.

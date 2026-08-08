@@ -1,5 +1,70 @@
 # Changelog
 
+## 5.0.0-dev.1 — 2026-08-08
+
+Generation-aware backup refactor. Compatibility changes are intentional:
+Health/Restore now require a `COMPLETE` generation manifest, unsafe discovery
+fallbacks are rejected, and writable machine state no longer lives under code.
+
+- MODEL, BLOG and BRAVOEXCH are archived from one VSS Snapshot Set with one
+  `GenerationId`. Same-volume sources share one shadow copy; multi-volume
+  sources remain in the same set. VSS failure performs zero live archive work.
+- Local publication is atomic and no-overwrite: `.work` -> 7-Zip create ->
+  `7z t` -> SHA512 creation -> real SHA512 comparison -> final `.mdz` and
+  sidecar. Existing valid backups and hashes are never removed first.
+- `BRAVO_BACKUP_<GenerationId>.json` records snapshot, volume and component
+  state, transfer results and Health result. Health evaluates the latest
+  `COMPLETE` generation; Restore Test selects one generation automatically or
+  through `-GenerationId`, so components from different runs cannot be mixed.
+- Path architecture split into four independent roots: **RuntimeRoot**
+  (complect + `Tools\` + version-controlled manifests + script logs
+  `<RuntimeRoot>\LOGS`), **LIMSRoot**, **SystemLogRoot** and **BackupRoot**.
+  `pathSettings.ArchiveRoot` is removed as a production concept.
+  - `LIMSRoot=""` auto-discovers the canonical BRAVO service (Name +
+    DisplayName); Disabled is a valid identity; missing or ambiguous services
+    fail closed; explicit `LIMSRoot` always wins.
+  - `SystemLogRoot=""` resolves to `<EffectiveLIMSRoot>\ARCHIV\LOGS`; an
+    explicit value is used exactly. Trace/exchangAPI/BravoWeb live here.
+  - `BackupRoot=""` resolves to `<EffectiveLIMSRoot>\ARCHIV`; an explicit value
+    is used exactly. All three roots empty is the default all-AUTO layout, so
+    the shipped `pathSettings` carries no machine-specific paths.
+  - PowerShell script execution logs are always `<RuntimeRoot>\LOGS`
+    (helpers: `<RuntimeRoot>\LOGS\HELPERS`), never a data root.
+  - Machine state (`BRAVO_TASK_EXECUTION_STATE.json`,
+    `BRAVO_ARCHIV_HEALTH_ALERT_STATE.json`, restore/version/VSS state) and the
+    operation lock live under `%ProgramData%\BRAVO\{State,Locks}`.
+  - Local backup destinations are `BackupRoot\{MODEL,BLOG,BRAVOEXCH,BAZA_APP,
+    BAZA_WWW}` — the app copy is `BAZA_APP`, not `BAZA`.
+  - Script-log, system-log and backup retention are three independent
+    policies over three separate roots. Tools and manifests resolve from
+    RuntimeRoot; effective ConfigPath is preserved through guard, loader,
+    runtime and scheduled tasks. `BRAVO_CONFIG_TEST` / `BRAVO_DRY_RUN` /
+    `BRAVO_TASKS_DIAGNOSE` report configured vs effective roots and probe them
+    under SYSTEM.
+- Canonical `bravo.ini` is `%SystemRoot%\SysWOW64\bravo.ini` on x64 and
+  `%SystemRoot%\System32\bravo.ini` on x86. Missing service/INI/key now fails
+  controlled; silent `LIMSRoot\Model`, `BLOG`, `bravoexch` and BRAVO_ROOT
+  fallbacks were removed.
+- Production and dry-run perform real SYSTEM source-read and
+  create/write/read/delete probes. Archive and Maintenance share
+  `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock`; execution logs include
+  seconds and PID.
+- SFTP uses the actual configured endpoint, with no `google.com` prerequisite.
+  Archive upload, BAZA_APP and BAZA_WWW have separate result objects, console
+  steps and diagnostics; existing WinSCP post-sync comparison is preserved.
+- Create, `7z t` integrity and SHA512 failures are distinct; SHA512 failure is
+  exit code `42`. Windows Update freshness remains Health-only. A local
+  `COMPLETE` generation stays complete when SFTP/SMB fails.
+- Retention works by generation manifest, protects current and the minimum
+  number of verified complete generations, and applies separate retention to
+  incomplete/failed generations. Remote copies receive the generation manifest.
+- Hard-termination VSS cleanup persists exact BRAVO-owned Shadow IDs in
+  `C:\ProgramData\BRAVO\State\BRAVO_VSS_OWNERSHIP.json`; the next
+  machine-wide lock owner removes only those IDs. Foreign/corrupt state and
+  failed exact-ID deletion are retained and fail closed.
+- Health now checks the same ProgramData operation lock used by Archive and
+  Maintenance instead of the obsolete ArchiveRoot-relative marker.
+
 ## 4.5.0-dev.3 — 2026-08-08
 
 CODE IS NOT DATA. Комплект, LIMS, операційні журнали й резервні копії стали

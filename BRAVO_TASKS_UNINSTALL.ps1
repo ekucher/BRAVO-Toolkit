@@ -95,12 +95,12 @@ if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
 $resolvedConfigPath = (Resolve-Path -Path $ConfigPath).Path
 try {
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $bravoScriptDirectory
     $taskService = New-Object -ComObject "Schedule.Service"
     $taskService.Connect()
     $taskPath = ConvertTo-BRAVOTaskPath -TaskPath $schedulerSettings.TaskPath

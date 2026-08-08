@@ -143,9 +143,10 @@ try {
         throw "У BRAVO.config відсутня секція maintenanceSettings"
     }
     if ($null -eq $pathSettings -or
-        [string]::IsNullOrWhiteSpace([string]$pathSettings.LIMSRoot) -or
-        [string]::IsNullOrWhiteSpace([string]$pathSettings.ArchiveRoot)) {
-        throw "У BRAVO.config відсутня або не заповнена секція pathSettings"
+        [string]::IsNullOrWhiteSpace([string]$effectiveLimsRoot) -or
+        [string]::IsNullOrWhiteSpace([string]$systemLogRoot) -or
+        [string]::IsNullOrWhiteSpace([string]$backupRootPath)) {
+        throw "У BRAVO.config не вдалося визначити ефективні корені (EffectiveLIMSRoot/SystemLogRoot/BackupRoot)"
     }
 } catch {
     Write-Host "ПОМИЛКА читання конфігурації '$ConfigPath': $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
@@ -709,8 +710,15 @@ $script:restoreArchiveFailed = $false
 $script:restoreIntegrityFailed = $false
 
 function Enter-BRAVOMaintenanceOperationLock {
-    $lockPath = Join-Path $LOG_DIR "BRAVO_OPERATION.lock"
+    $lockPath = [string]$operationLockSettings.Path
     try {
+        if ([string]::IsNullOrWhiteSpace($lockPath)) {
+            throw 'operationLockSettings.Path не задано'
+        }
+        $lockDirectory = Split-Path -Path $lockPath -Parent
+        if (-not (Test-Path -LiteralPath $lockDirectory -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $lockDirectory -Force -ErrorAction Stop)
+        }
         $waitMinutes = if ($null -ne $schedulerSettings -and
             $schedulerSettings.Contains("OperationLockWaitMinutes")) {
             [math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)
@@ -753,6 +761,7 @@ function Enter-BRAVOMaintenanceOperationLock {
             startedAt = (Get-Date).ToString("o")
             packageVersion = [string]$script:ScriptVersion
             config = $ConfigPath
+            generationId = $null
         } | ConvertTo-Json -Compress)
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
         $stream.SetLength(0)
@@ -779,15 +788,8 @@ function Exit-BRAVOMaintenanceOperationLock {
         $script:maintenanceOperationLock.Dispose()
         $script:maintenanceOperationLock = $null
     }
-    if (-not [string]::IsNullOrWhiteSpace(
-            [string]$script:maintenanceOperationLockPath
-        ) -and
-        (Test-Path -LiteralPath $script:maintenanceOperationLockPath -PathType Leaf)) {
-        Remove-Item `
-            -LiteralPath $script:maintenanceOperationLockPath `
-            -Force `
-            -ErrorAction SilentlyContinue
-    }
+    # Stale metadata file is expected; only the exclusive handle indicates
+    # that Archive or Maintenance is currently active.
     $script:maintenanceOperationLockPath = $null
 }
 
@@ -1128,7 +1130,7 @@ function Get-BRAVORestoreScheduledOccurrence {
 }
 
 function Read-BRAVORestoreState {
-    $path = Join-Path $LOG_DIR 'BRAVO_RESTORE_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
     catch { Write-Log -Message "Не вдалося прочитати restore state: $($_.Exception.Message)" -Level 'WARNING'; return $null }
@@ -1136,7 +1138,10 @@ function Read-BRAVORestoreState {
 
 function Write-BRAVORestoreState {
     param([datetime]$ScheduledOccurrence, [string]$Status, [string]$Reason)
-    $path = Join-Path $LOG_DIR 'BRAVO_RESTORE_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
     $state = [pscustomobject]@{
         ScheduledOccurrence = $ScheduledOccurrence.ToString('o')
         Status = $Status
@@ -1147,7 +1152,7 @@ function Write-BRAVORestoreState {
 }
 
 function Get-BRAVOTaskExecutionState {
-    $path = Join-Path $LOG_DIR 'BRAVO_TASK_EXECUTION_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
     try {
         $state = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -1157,7 +1162,10 @@ function Get-BRAVOTaskExecutionState {
 
 function Write-BRAVOTaskExecutionState {
     param([ValidateSet('Maintenance')][string]$TaskName)
-    $path = Join-Path $LOG_DIR 'BRAVO_TASK_EXECUTION_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
     $state = Get-BRAVOTaskExecutionState
     $state[$TaskName] = ([datetime]::Now).ToString('o')
     [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
@@ -3666,11 +3674,14 @@ if ($BravoWebMaintenanceEnabled -and (Test-Path $BRAVO_WEB_DIR)) {
 # блокував Maintenance у будь-якому іншому розташуванні (наприклад,
 # git-чекаут з іменем репозиторію) без жодної реальної причини —
 # ArchiveRoot/LIMSRoot і так явно задані нижче.
-$ROOT_LIMS = [Environment]::ExpandEnvironmentVariables([string]$pathSettings.LIMSRoot)
-$ARCHIVE_ROOT = [Environment]::ExpandEnvironmentVariables([string]$pathSettings.ArchiveRoot)
+# Ефективні корені обчислює BRAVO.config: EffectiveLIMSRoot (explicit/AUTO),
+# SystemLogRoot (системні журнали), runtimeLogRoot (журнали скриптів),
+# stateRoot (машинний стан). Maintenance їх лише споживає.
+$ROOT_LIMS = [string]$effectiveLimsRoot
+$SYSTEM_LOG_ROOT = [string]$systemLogRoot
 if ([string]::IsNullOrWhiteSpace($ROOT_LIMS) -or
-    [string]::IsNullOrWhiteSpace($ARCHIVE_ROOT)) {
-    Write-Host "ПОМИЛКА: У BRAVO.config не налаштовано pathSettings.LIMSRoot або pathSettings.ArchiveRoot" -ForegroundColor Red
+    [string]::IsNullOrWhiteSpace($SYSTEM_LOG_ROOT)) {
+    Write-Host "ПОМИЛКА: У BRAVO.config не визначено EffectiveLIMSRoot або SystemLogRoot" -ForegroundColor Red
     exit 30
 }
 # Похідні шляхи
@@ -3702,18 +3713,17 @@ $BRAVOCMD_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryRe
 } else {
     "$ROOT_LIMS\bravocmd.exe"
 }
-# Усі програмні журнали живуть під <ArchiveRoot>\LOGS: там же, де службові
-# журнали самого Maintenance, але кожен компонент у власній гілці. Раніше
-# вони були розкидані по трьох каталогах у корені ArchiveRoot
-# (Trace\, exchangAPI\, Br-a-vo.web\), і "де лежать логи Apache" було
-# питанням, на яке структура каталогів не відповідала.
-#
-# Старі каталоги свідомо не мігруються: вміст, що там уже є, лишається
-# доступним, просто нові журнали більше туди не потрапляють.
-$LOG_DIR = Join-Path $ARCHIVE_ROOT "LOGS"
-$TRACE_DIR = Join-Path $LOG_DIR "Trace"
-$EXCHANGE_LOG_DIR = Join-Path $LOG_DIR "exchangAPI"
-$BRAVOWEB_LOG_DIR = Join-Path $LOG_DIR "BravoWeb"
+# Два різні корені (ТЗ RuntimeRoot/SystemLogRoot):
+#   $LOG_DIR         — власні журнали Maintenance (BRAVO_MAINTENANCE_*.log,
+#                      file_sizes_*.csv, restore_done_*.marker) — RuntimeRoot\LOGS.
+#   $SYSTEM_LOG_ROOT — СИСТЕМНІ журнали BRAVO (Trace/exchangAPI/BravoWeb),
+#                      кожен компонент у власній гілці.
+# Їх навмисно не змішують: script-log retention і system-log retention —
+# дві незалежні політики над двома різними каталогами.
+$LOG_DIR = [string]$runtimeLogRoot
+$TRACE_DIR = Join-Path $SYSTEM_LOG_ROOT "Trace"
+$EXCHANGE_LOG_DIR = Join-Path $SYSTEM_LOG_ROOT "exchangAPI"
+$BRAVOWEB_LOG_DIR = Join-Path $SYSTEM_LOG_ROOT "BravoWeb"
 $APACHE_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Apache"
 $BRAVOWEB_APP_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Application"
 # Сам застосунок уже ротує свої журнали: у робочому каталозі одночасно
@@ -3727,11 +3737,14 @@ $EXCHANGAPI_LOG_FILTERS = @("exchangAPI_*.log", "exchangAPI*.log")
 # файли — це службові файли, які httpd очікує знайти на місці після старту.
 $APACHE_LOG_FILTER = "*.log"
 $BRAVOWEB_APP_LOG_FILTER = "*.log"
+# Каталог контрольних архівів MODEL (before/after реставрації) — той самий
+# BackupRoot\MODEL, що й щоденні backup MODEL (archiveDirs.Model). Fallback
+# лишається BackupRoot-відносним, а не ArchiveRoot-відносним.
 $ARC_DIR = if ($archiveDirs -and
     -not [string]::IsNullOrWhiteSpace([string]$archiveDirs.Model)) {
     [string]$archiveDirs.Model
 } else {
-    Join-Path $ARCHIVE_ROOT "MODEL"
+    Join-Path ([string]$backupRootPath) "MODEL"
 }
 # 7za.exe — runtime-залежність комплекту, тому джерело істини те саме, що й
 # для Archive: $arcPath з BRAVO.config (RuntimeRoot\Tools). Раніше тут стояв
@@ -3860,7 +3873,7 @@ $script:BRAVOMaintenanceArchiveStepEnabled = [bool]$script:EnableArchiveAfterMai
 # тоді, коли хоча б один legacy-каталог справді є на диску: на вже
 # мігрованій інсталяції рядок "нічого не мігровано" щодня не потрібен.
 $script:BRAVOMaintenanceLegacyMigrationPlan = @(
-    Get-BRAVOLegacyLogMigrationPlan -ArchiveRoot $ARCHIVE_ROOT -LogRoot $LOG_DIR |
+    Get-BRAVOLegacyLogMigrationPlan -ArchiveRoot (Split-Path -Path $SYSTEM_LOG_ROOT -Parent) -LogRoot $SYSTEM_LOG_ROOT |
         Where-Object { Test-Path -LiteralPath $_.LegacyPath -PathType Container }
 )
 $script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMigrationPlan.Count -gt 0)

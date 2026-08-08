@@ -112,12 +112,12 @@ function Get-BRAVOCredentialSetupConfiguration {
 
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $root = Split-Path -Path $resolvedPath -Parent
-    $configurationLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $root -ConfigPath $resolvedPath
+    Import-BravoConfiguration -ConfigRoot $root -ConfigPath $resolvedPath -RuntimeRoot $bravoScriptDirectory
 
     if ($null -eq $credentialSettings -or
         [string]::IsNullOrWhiteSpace([string]$credentialSettings.HelperPath) -or

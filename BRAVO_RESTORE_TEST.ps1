@@ -2,6 +2,8 @@
 param(
     [string]$ConfigPath,
 
+    [string]$GenerationId,
+
     [ValidateSet("MODEL", "BLOG", "BRAVOEXCH", "All")]
     [string]$Component = "All",
 
@@ -23,7 +25,8 @@ $null = Start-BRAVOHelperLog `
 # AUD-004 (аудит P0.4): restore drill. Читабельний і навіть SHA512/7za-
 # перевірений архів НЕ доводить, що він відновлюється — лише що байти не
 # пошкоджені. Цей скрипт бере найновіший локальний backup із коректним
-# hash-sidecar для кожного увімкненого компонента (MODEL/BLOG/BRAVOEXCH),
+# hash-sidecar для кожного увімкненого компонента (MODEL/BLOG/BRAVOEXCH)
+# з одного COMPLETE GenerationId,
 # розпаковує його в ІЗОЛЬОВАНИЙ тимчасовий каталог (не production-шлях),
 # рахує розпаковані файли/каталоги проти мінімального порогу, прибирає за
 # собою і повертає JSON-результат + опційне сповіщення. Це read-only
@@ -52,6 +55,7 @@ function Add-RestoreDrillResult {
         ExtractedFileCount = $ExtractedFileCount
         ExtractedDirectoryCount = $ExtractedDirectoryCount
         Detail = $Detail
+        GenerationId = $script:selectedRestoreGenerationId
         CheckedAt = (Get-Date).ToString("o")
     })
 }
@@ -131,47 +135,108 @@ function Set-BRAVORestoreDrillDirectoryAcl {
     Set-Acl -LiteralPath $Path -AclObject $acl
 }
 
-function Find-BRAVOLatestVerifiedArchive {
-    # Найновіший *.mdz у каталозі, чий .sha512-sidecar існує й збігається
-    # з фактичним хешем файлу — той самий алгоритм, що Remove-OldBackupSets
-    # (BRAVO.Archive.Runtime.ps1) використовує для визначення "валідного"
-    # набору при retention, лише тут беремо найсвіжіший, а не всі.
+function Get-BRAVORestoreGenerationManifest {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$Directory,
-        [Parameter(Mandatory = $true)][string]$ArchiveFilter,
-        [Parameter(Mandatory = $true)][string]$HashFileExtension
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [string]$RequestedGenerationId
     )
 
-    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
-        return $null
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        throw "BackupRoot не знайдено: $BackupRoot"
     }
-    $candidates = @(Get-BRAVOFiles -Path $Directory -Filter $ArchiveFilter |
-        Sort-Object -Property LastWriteTime -Descending)
-    foreach ($candidate in $candidates) {
-        $hashPath = "$($candidate.FullName)$HashFileExtension"
-        try {
-            if (-not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
-                continue
-            }
-            $hashText = ([System.IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
-            if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$') {
-                continue
-            }
-            if ($Matches.FileName -cne $candidate.Name) {
-                continue
-            }
-            $expectedHash = $Matches.Hash.ToUpperInvariant()
-            $actualHash = (Get-BRAVOFileHash -Path $candidate.FullName -Algorithm SHA512).Hash.ToUpperInvariant()
-            if ($actualHash -cne $expectedHash) {
-                continue
-            }
-            return $candidate
-        } catch {
-            continue
+    if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId) -and
+        $RequestedGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$') {
+        throw "GenerationId має формат yyyyMMdd_HHmmss або collision-safe variant"
+    }
+
+    $manifestFiles = if ([string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+        @(Get-BRAVOFiles -Path $BackupRoot -Filter 'BRAVO_BACKUP_*.json')
+    } else {
+        $requestedPath = Join-Path $BackupRoot ("BRAVO_BACKUP_{0}.json" -f $RequestedGenerationId)
+        if (Test-Path -LiteralPath $requestedPath -PathType Leaf) {
+            @(Get-Item -LiteralPath $requestedPath)
+        } else {
+            @()
         }
     }
-    return $null
+
+    $candidates = @()
+    foreach ($manifestFile in $manifestFiles) {
+        try {
+            $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$manifest.status -ne 'COMPLETE') { continue }
+            $createdAt = $manifestFile.LastWriteTime
+            foreach ($dateProperty in @('createdAt', 'startedAt')) {
+                $property = $manifest.PSObject.Properties[$dateProperty]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    $createdAt = [datetime]$property.Value
+                    break
+                }
+            }
+            $candidates += [pscustomobject]@{
+                Manifest = $manifest
+                ManifestPath = $manifestFile.FullName
+                CreatedAt = $createdAt
+            }
+        } catch {
+            if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+                throw "Generation manifest не прочитано: $($_.Exception.Message)"
+            }
+        }
+    }
+    $selected = $candidates | Sort-Object CreatedAt -Descending | Select-Object -First 1
+    if ($null -eq $selected) {
+        if ([string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+            throw 'не знайдено жодного COMPLETE generation manifest'
+        }
+        throw "COMPLETE generation '$RequestedGenerationId' не знайдено"
+    }
+    return $selected
+}
+
+function Get-BRAVOVerifiedGenerationArchive {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string]$Component
+    )
+
+    $componentsProperty = $Manifest.PSObject.Properties['components']
+    if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) {
+        throw 'generation manifest не містить components'
+    }
+    $componentProperty = @($componentsProperty.Value.PSObject.Properties | Where-Object {
+        [string]::Equals($_.Name, $Component, [StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1)
+    if ($componentProperty.Count -eq 0) {
+        throw "generation не містить component $Component"
+    }
+    $componentState = $componentProperty[0].Value
+    if (-not [bool]$componentState.Enabled -or
+        -not [bool]$componentState.CreateSuccess -or
+        -not [bool]$componentState.IntegritySuccess -or
+        -not [bool]$componentState.HashSuccess) {
+        throw "component $Component не має COMPLETE archive/integrity/SHA512 state"
+    }
+
+    $archivePath = [string]$componentState.ArchivePath
+    $hashPath = [string]$componentState.HashPath
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
+        throw "component $Component посилається на відсутній archive/hash artifact"
+    }
+    $archive = Get-Item -LiteralPath $archivePath
+    $hashText = ([IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
+    if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$' -or
+        $Matches.FileName -cne $archive.Name) {
+        throw "component $Component має некоректний SHA512 sidecar"
+    }
+    $actualHash = (Get-BRAVOFileHash -Path $archive.FullName -Algorithm SHA512).Hash.ToUpperInvariant()
+    if ($actualHash -cne $Matches.Hash.ToUpperInvariant()) {
+        throw "component $Component не пройшов фактичну SHA512 verification"
+    }
+    return $archive
 }
 
 try {
@@ -188,26 +253,27 @@ try {
     }
     $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
     $configRoot = Split-Path $resolvedConfigPath -Parent
+    $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 
     foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console')) {
-        $modulePath = Join-Path $configRoot "modules\$moduleName\$moduleName.psd1"
+        $modulePath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"
         if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
             throw "Не знайдено спільний PowerShell-модуль: $modulePath"
         }
         Import-Module -Name $modulePath -ErrorAction Stop
     }
-    $archiveHelpersPath = Join-Path $configRoot 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1'
+    $archiveHelpersPath = Join-Path $runtimeRoot 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1'
     if (-not (Test-Path -LiteralPath $archiveHelpersPath -PathType Leaf)) {
         throw "Не знайдено PowerShell-модуль archive helpers: $archiveHelpersPath"
     }
     Import-Module -Name $archiveHelpersPath -ErrorAction Stop
 
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $runtimeRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Не знайдено BRAVO_CONFIG_LOADER.ps1: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $runtimeRoot
 
     if ([string]::IsNullOrWhiteSpace([string]$arcPath) -or
         -not (Test-Path -LiteralPath $arcPath -PathType Leaf)) {
@@ -228,6 +294,20 @@ try {
         [bool]$_.Enabled -and
         ($Component -eq "All" -or [string]$_.Type -eq $Component)
     })
+    $selectedGeneration = $null
+    try {
+        $selectedGeneration = Get-BRAVORestoreGenerationManifest `
+            -BackupRoot $backupRootPath `
+            -RequestedGenerationId $GenerationId
+        $script:selectedRestoreGenerationId = [string]$selectedGeneration.Manifest.generationId
+        if ([string]::IsNullOrWhiteSpace($script:selectedRestoreGenerationId)) {
+            throw "selected COMPLETE generation manifest не містить GenerationId: $($selectedGeneration.ManifestPath)"
+        }
+    } catch {
+        $script:selectedRestoreGenerationId = $GenerationId
+        Add-RestoreDrillResult FAIL 'Generation' $null $null 0 0 $_.Exception.Message
+        $componentsToCheck = @()
+    }
 
     # Заголовок друкується один раз, одразу як відомо, скільки компонентів
     # реально перевірятиметься — той самий каркас, що Archive/Health
@@ -245,7 +325,7 @@ try {
             -Mode 'READ-ONLY / ISOLATED RESTORE'
     }
 
-    if ($componentsToCheck.Count -eq 0) {
+    if ($componentsToCheck.Count -eq 0 -and $script:restoreDrillResults.Count -eq 0) {
         Add-RestoreDrillResult WARN $Component $null $null 0 0 (
             "жодного увімкненого компонента для перевірки (Component='$Component')"
         )
@@ -263,21 +343,18 @@ try {
     foreach ($archiveDefinition in $componentsToCheck) {
         $restoreDrillStepCurrent++
         $componentName = [string]$archiveDefinition.Type
-        $destinationDir = [string]$archiveDefinition.Destination
-        $latestArchive = Find-BRAVOLatestVerifiedArchive `
-            -Directory $destinationDir `
-            -ArchiveFilter $global:archiveFileFilter `
-            -HashFileExtension $global:hashFileExtension
-
-        if ($null -eq $latestArchive) {
-            Add-RestoreDrillResult WARN $componentName $null $null 0 0 (
-                "жодного backup із коректним .sha512 не знайдено в '$destinationDir' — restore drill неможливий"
-            )
+        $latestArchive = $null
+        try {
+            $latestArchive = Get-BRAVOVerifiedGenerationArchive `
+                -Manifest $selectedGeneration.Manifest `
+                -Component $componentName
+        } catch {
+            Add-RestoreDrillResult FAIL $componentName $null $null 0 0 $_.Exception.Message
             if (-not $AsJson) {
                 Write-BRAVORestoreDrillStep `
                     -Current $restoreDrillStepCurrent -Total $componentsToCheck.Count `
-                    -Name $componentName -Status WARN `
-                    -Reason "Жодного backup із коректним .sha512 не знайдено в '$destinationDir'"
+                    -Name $componentName -Status FAIL `
+                    -Reason $_.Exception.Message
             }
             continue
         }
@@ -444,6 +521,7 @@ try {
             -ExitCodeName (Get-BRAVOExitCodeName -Code $exitCode)
         $totalChecked = [Math]::Max($componentsToCheck.Count, $script:restoreDrillResults.Count)
         Write-BRAVOResultField -Label 'Перевірено' -Value ("{0} з {1}" -f $script:restoreDrillResults.Count, $totalChecked)
+        Write-BRAVOResultField -Label 'GenerationId' -Value $(if ([string]::IsNullOrWhiteSpace($script:selectedRestoreGenerationId)) { 'не вибрано' } else { $script:selectedRestoreGenerationId })
         Write-BRAVOResultField -Label 'PASS' -Value ([string]$passCount)
         Write-BRAVOResultField -Label 'WARN' -Value ([string]$warningCount)
         Write-BRAVOResultField -Label 'FAIL' -Value ([string]$failureCount)

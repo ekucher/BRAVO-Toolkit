@@ -844,14 +844,37 @@ function Test-ArchiveFileName {
         return $false
     }
 
+    # Мітка часу може нести collision-safe суфікс: коли фінальне ім'я вже
+    # зайняте наявним валідним backup, BRAVO_ARCHIV публікує копію як
+    # "..._1.mdz". Такий архів — повноцінний кандидат health-check, тому
+    # суфікс відокремлюється до розбору дати, а не робить ім'я «чужим».
+    $timestampValue = $nameMatch.Groups["Timestamp"].Value
+    $collisionMatch = [regex]::Match($timestampValue, '^(?<Timestamp>.+?)_(?<Suffix>\d+)$')
+    $timestampCandidates = @($timestampValue)
+    if ($collisionMatch.Success) {
+        $timestampCandidates += $collisionMatch.Groups["Timestamp"].Value
+    }
+
+    # Приймаються обидва формати: чинний із секундами і той, що діяв до
+    # переходу на GenerationId. Інакше health перестав би бачити всі
+    # backup, створені до оновлення, і звітував би про їх відсутність.
+    $acceptedFormats = @($archiveTimestampFormat, "yyyyMMdd_HHmmss", "yyyyMMdd_HHmm") |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
     $parsedTimestamp = [datetime]::MinValue
-    return [datetime]::TryParseExact(
-        $nameMatch.Groups["Timestamp"].Value,
-        $archiveTimestampFormat,
-        [System.Globalization.CultureInfo]::InvariantCulture,
-        [System.Globalization.DateTimeStyles]::None,
-        [ref]$parsedTimestamp
-    )
+    foreach ($timestampCandidate in $timestampCandidates) {
+        foreach ($acceptedFormat in $acceptedFormats) {
+            if ([datetime]::TryParseExact(
+                    $timestampCandidate,
+                    $acceptedFormat,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::None,
+                    [ref]$parsedTimestamp)) {
+                return $true
+            }
+        }
+    }
+    return $false
 }
 
 function Get-LocalBackupState {
@@ -888,63 +911,155 @@ function Get-BackupHealthIssues {
     $enabledArchiveDefinitions = @($archiveDefinitions | Where-Object { $_.Enabled })
     $maximumAge = [timespan]::FromHours([double]$backupMonitoring.MaxBackupAgeHours)
 
-    foreach ($archiveDefinition in $enabledArchiveDefinitions) {
-        $localState = Get-LocalBackupState -ArchiveDefinition $archiveDefinition
-        $candidates = @($localState.Candidates)
+    if ($enabledArchiveDefinitions.Count -eq 0) {
+        return @()
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$backupRootPath) -or
+        -not (Test-Path -LiteralPath $backupRootPath -PathType Container)) {
+        return @([pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = "BackupRoot не знайдено: $backupRootPath"
+            FileName = 'BRAVO_BACKUP_<GenerationId>.json'
+            LastWriteTime = $null
+            SizeBytes = $null
+        })
+    }
 
-        if ($candidates.Count -eq 0) {
-            $expectedArchiveName = [string]$archiveDefinition.NameTemplate -f $archivePrefix, $archiveTimestampFormat
+    $manifestCandidates = @()
+    foreach ($manifestFile in @(Get-BRAVOFiles -Path $backupRootPath -Filter 'BRAVO_BACKUP_*.json')) {
+        try {
+            $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$manifest.status -ne 'COMPLETE') {
+                continue
+            }
+            $createdAt = $manifestFile.LastWriteTime
+            foreach ($dateProperty in @('createdAt', 'startedAt')) {
+                $property = $manifest.PSObject.Properties[$dateProperty]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    $createdAt = [datetime]$property.Value
+                    break
+                }
+            }
+            $manifestCandidates += [pscustomobject]@{
+                File = $manifestFile
+                Manifest = $manifest
+                CreatedAt = $createdAt
+            }
+        } catch {
+            Write-HealthLog "Generation manifest не прочитано: $($manifestFile.Name): $($_.Exception.Message)" -Level 'WARNING'
+        }
+    }
+
+    $generation = $manifestCandidates | Sort-Object CreatedAt -Descending | Select-Object -First 1
+    if ($null -eq $generation) {
+        return @([pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = 'не знайдено жодного COMPLETE generation manifest'
+            FileName = 'BRAVO_BACKUP_<GenerationId>.json'
+            LastWriteTime = $null
+            SizeBytes = $null
+        })
+    }
+
+    $manifestGenerationId = [string]$generation.Manifest.generationId
+    if ([string]::IsNullOrWhiteSpace($manifestGenerationId)) {
+        $issues += [pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = 'COMPLETE manifest не містить GenerationId'
+            FileName = $generation.File.Name
+            LastWriteTime = $generation.CreatedAt
+            SizeBytes = $generation.File.Length
+        }
+    }
+
+    $componentsProperty = $generation.Manifest.PSObject.Properties['components']
+    if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) {
+        return @($issues) + @([pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = 'COMPLETE manifest не містить components'
+            FileName = $generation.File.Name
+            LastWriteTime = $generation.CreatedAt
+            SizeBytes = $generation.File.Length
+        })
+    }
+
+    foreach ($archiveDefinition in $enabledArchiveDefinitions) {
+        $componentName = [string]$archiveDefinition.Type
+        $componentProperty = @($componentsProperty.Value.PSObject.Properties | Where-Object {
+            [string]::Equals($_.Name, $componentName, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+        if ($componentProperty.Count -eq 0) {
             $issues += [pscustomobject]@{
-                Kind = "LocalBackup"
-                Component = $archiveDefinition.Type
-                Reason = "резервну копію не знайдено"
-                FileName = "не знайдено ($expectedArchiveName)"
-                LastWriteTime = $null
+                Kind = 'LocalBackupGeneration'
+                Component = $componentName
+                Reason = "COMPLETE generation $manifestGenerationId не містить enabled component"
+                FileName = $generation.File.Name
+                LastWriteTime = $generation.CreatedAt
                 SizeBytes = $null
             }
             continue
         }
 
-        $newestValidArchive = $localState.NewestValidArchive
+        $component = $componentProperty[0].Value
+        $archivePath = [string]$component.ArchivePath
+        $hashPath = [string]$component.HashPath
+        $componentValid = [bool]$component.Enabled -and
+            [bool]$component.CreateSuccess -and
+            [bool]$component.IntegritySuccess -and
+            [bool]$component.HashSuccess
+        $archiveFile = $null
+        $invalidReason = $null
+        if (-not $componentValid) {
+            $invalidReason = 'component не пройшов archive/integrity/SHA512 stages'
+        } elseif (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
+            $invalidReason = 'manifest посилається на відсутній archive/hash artifact'
+        } else {
+            $archiveFile = Get-Item -LiteralPath $archivePath
+            $candidateResult = Test-BackupCandidate -Archive $archiveFile
+            if (-not $candidateResult.Valid) {
+                $invalidReason = $candidateResult.Reason
+            }
+        }
 
-        if ($null -eq $newestValidArchive) {
-            $newestCandidate = $candidates[0]
-            $newestCandidateResult = Test-BackupCandidate -Archive $newestCandidate
+        if (-not [string]::IsNullOrWhiteSpace($invalidReason)) {
             $issues += [pscustomobject]@{
-                Kind = "LocalBackup"
-                Component = $archiveDefinition.Type
-                Reason = "немає коректної резервної копії: $($newestCandidateResult.Reason)"
-                FileName = $newestCandidate.Name
-                LastWriteTime = $newestCandidate.LastWriteTime
-                SizeBytes = $newestCandidate.Length
+                Kind = 'LocalBackupGeneration'
+                Component = $componentName
+                Reason = "generation $manifestGenerationId некоректний: $invalidReason"
+                FileName = $(if ($null -ne $archiveFile) { $archiveFile.Name } else { $generation.File.Name })
+                LastWriteTime = $generation.CreatedAt
+                SizeBytes = $(if ($null -ne $archiveFile) { $archiveFile.Length } else { $null })
             }
             continue
         }
 
-        $backupAge = $healthCheckStarted - $newestValidArchive.LastWriteTime
-        if ($backupAge -gt $maximumAge) {
-            $newerInvalidCount = @($candidates | Where-Object { $_.LastWriteTime -gt $newestValidArchive.LastWriteTime }).Count
-            $reason = "остання коректна копія старша за $($backupMonitoring.MaxBackupAgeHours) год."
-            if ($newerInvalidCount -gt 0) {
-                $reason += "; новіші файли не пройшли перевірку"
-            }
-
-            $issues += [pscustomobject]@{
-                Kind = "LocalBackup"
-                Component = $archiveDefinition.Type
-                Reason = $reason
-                FileName = $newestValidArchive.Name
-                LastWriteTime = $newestValidArchive.LastWriteTime
-                SizeBytes = $newestValidArchive.Length
-            }
-        } else {
-            $script:healthLatestArchives[$archiveDefinition.Type] = [pscustomobject]@{
-                Name = $newestValidArchive.Name
-                SizeBytes = [long]$newestValidArchive.Length
-                LastWriteTime = $newestValidArchive.LastWriteTime
-            }
-            Write-HealthLog "Бекап $($archiveDefinition.Type) справний: $($newestValidArchive.Name), вік $(Format-BackupAge $newestValidArchive.LastWriteTime), розмір $(Format-FileSize $newestValidArchive.Length)" -Level "SUCCESS"
+        $script:healthLatestArchives[$componentName] = [pscustomobject]@{
+            Name = $archiveFile.Name
+            FullName = $archiveFile.FullName
+            HashPath = $hashPath
+            SizeBytes = [long]$archiveFile.Length
+            LastWriteTime = $generation.CreatedAt
+            GenerationId = $manifestGenerationId
         }
+        Write-HealthLog "Generation $manifestGenerationId / $componentName справний: $($archiveFile.Name), розмір $(Format-FileSize $archiveFile.Length)" -Level 'SUCCESS'
+    }
+
+    if (($healthCheckStarted - $generation.CreatedAt) -gt $maximumAge) {
+        $issues += [pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = "остання COMPLETE generation старша за $($backupMonitoring.MaxBackupAgeHours) год."
+            FileName = $generation.File.Name
+            LastWriteTime = $generation.CreatedAt
+            SizeBytes = $generation.File.Length
+        }
+    } elseif ($issues.Count -eq 0) {
+        Write-HealthLog "Остання COMPLETE generation $manifestGenerationId справна; one generation = one point-in-time" -Level 'SUCCESS'
     }
 
     return @($issues)
@@ -2607,16 +2722,26 @@ function Get-SFTPHealthIssues {
         $archiveChecks = @()
         $healthTemporaryRoot = Get-BRAVOHealthTemporaryRoot
         foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
-            $localState = Get-LocalBackupState -ArchiveDefinition $archiveDefinition
-            if ($null -eq $localState.NewestValidArchive) {
-                Write-HealthLog "SFTP $($archiveDefinition.Type) пропущено: немає коректної локальної копії для порівняння" -Level "WARNING"
+            $generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]
+            if ($null -eq $generationArchive -or
+                -not (Test-Path -LiteralPath ([string]$generationArchive.FullName) -PathType Leaf)) {
+                $issues += [pscustomobject]@{
+                    Kind = 'SFTPArchive'
+                    Component = "SFTP $($archiveDefinition.Type)"
+                    Reason = 'перевірку пропущено: component відсутній у verified COMPLETE local generation'
+                    FileName = 'немає даних'
+                    LastWriteTime = $null
+                    SizeBytes = $null
+                    Location = [string]$sftpDirectories[$archiveDefinition.Type]
+                }
                 continue
             }
+            $localGenerationArchive = Get-Item -LiteralPath ([string]$generationArchive.FullName)
 
             $remoteDirectory = Normalize-SFTPPath $sftpDirectories[$archiveDefinition.Type]
             $archiveChecks += [pscustomobject]@{
                 Definition = $archiveDefinition
-                LocalArchive = $localState.NewestValidArchive
+                LocalArchive = $localGenerationArchive
                 RemoteDirectory = $remoteDirectory
                 RemoteHashDownloadDirectory = Join-Path `
                     $healthTemporaryRoot `
@@ -2625,7 +2750,7 @@ function Get-SFTPHealthIssues {
             }
             $archiveChecks[-1].RemoteHashDownloadPath = Join-Path `
                 $archiveChecks[-1].RemoteHashDownloadDirectory `
-                "$($localState.NewestValidArchive.Name)$hashFileExtension"
+                "$($localGenerationArchive.Name)$hashFileExtension"
         }
 
         if ($archiveChecks.Count -gt 0) {
@@ -2903,12 +3028,23 @@ function Get-SMBHealthIssues {
     try {
         $drive = New-BRAVOSMBHealthDrive
         foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
-            $localState = Get-LocalBackupState -ArchiveDefinition $archiveDefinition
-            $localArchive = $localState.NewestValidArchive
-            if ($null -eq $localArchive) {
-                Write-HealthLog "NAS/SMB $($archiveDefinition.Type) пропущено: немає коректної локальної копії для порівняння" -Level "WARNING"
+            $generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]
+            if ($null -eq $generationArchive -or
+                -not (Test-Path -LiteralPath ([string]$generationArchive.FullName) -PathType Leaf)) {
+                $issues += [pscustomobject]@{
+                    Kind = 'SMBArchive'
+                    Component = "NAS/SMB $($archiveDefinition.Type)"
+                    Reason = 'перевірку пропущено: component відсутній у verified COMPLETE local generation'
+                    FileName = 'немає даних'
+                    LastWriteTime = $null
+                    SizeBytes = $null
+                    ExpectedSizeBytes = $null
+                    ActualSizeBytes = $null
+                    Location = [string]$smbSettings.RootPath
+                }
                 continue
             }
+            $localArchive = Get-Item -LiteralPath ([string]$generationArchive.FullName)
 
             $remoteDirectory = Join-Path `
                 ([string]$smbSettings.RootPath) `
@@ -3852,7 +3988,13 @@ function Send-SlackAlert {
 }
 
 function Test-BRAVOArchiveProcessLockActive {
-    $lockPath = Join-Path $logPath "BRAVO_OPERATION.lock"
+    # Archive and Maintenance coordinate through the canonical machine-wide
+    # lock. Health does not acquire it, but must inspect that same handle so a
+    # custom ArchiveRoot/ConfigPath cannot make an active backup invisible.
+    $lockPath = [string]$operationLockSettings.Path
+    if ([string]::IsNullOrWhiteSpace($lockPath)) {
+        throw 'operationLockSettings.Path is not configured'
+    }
     if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
         return $false
     }

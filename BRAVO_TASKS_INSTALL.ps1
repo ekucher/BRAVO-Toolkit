@@ -72,7 +72,7 @@ function Set-BRAVOProtectedRuntimeAcl {
         throw (
             "SYSTEM-завдання не можна встановлювати з профілю користувача: " +
             "$resolvedRoot. Перенесіть runtime до захищеного каталогу, " +
-            "наприклад C:\LIMS\ARCHIV."
+            "наприклад C:\BRAVO."
         )
     }
     $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
@@ -550,14 +550,15 @@ if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
 $resolvedConfigPath = (Resolve-Path -Path $ConfigPath).Path
 try {
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
-        -ConfigPath $resolvedConfigPath
+        -ConfigPath $resolvedConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
 
     $bazaSftpEnabled = $false
     if ($null -ne $componentSettings -and
@@ -674,7 +675,7 @@ try {
             $unsafeRuntimeMessage = (
                 "SYSTEM runtime розташований у профілі користувача: " +
                 "$runtimeRoot. Фактична інсталяція буде відхилена; " +
-                "перенесіть комплект до C:\LIMS\ARCHIV."
+                "перенесіть комплект до C:\BRAVO."
             )
             if ($ValidateOnly) {
                 Write-Warning $unsafeRuntimeMessage

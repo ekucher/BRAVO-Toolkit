@@ -22,6 +22,15 @@
       конфігурація, модель безпеки чи підтримувані версії ОС.
 - [ ] `BRAVO_SELF_TEST.ps1` пройдено повністю на Windows PowerShell 5.1
       (`SELF-TEST PASSED`, без жодного `[FAIL]`).
+- [ ] `BRAVO_DRY_RUN.ps1 -TestAccess` пройдено під production task account
+      (`SYSTEM`): source enumerate/metadata read, VSS capability та real
+      create/write/read/delete probes для RuntimeRoot\LOGS, SystemLogRoot,
+      BackupRoot, destinations, `.work`, ProgramData lock/state.
+- [ ] Тестовий backup підтвердив один Snapshot Set/GenerationId для всіх
+      enabled MODEL/BLOG/BRAVOEXCH, `COMPLETE` manifest і відсутність
+      overwrite попереднього valid generation.
+- [ ] Restore drill виконано з explicit `-GenerationId`; MODEL/BLOG/
+      BRAVOEXCH взяті з одного `COMPLETE` manifest, а не independently newest.
 - [ ] Кожен новий self-test підтверджено регресійно: тимчасово зламати
       відповідну логіку, переконатися що самотест червоніє саме на новому
       тесті, відновити, переконатися що знову зелено. (Практика цієї

@@ -31,6 +31,7 @@ $script:BRAVOExitCodeNames = @{
     35 = "VersionDowngradeBlocked"
     40 = "LocalArchiveFailed"
     41 = "IntegrityTestFailed"
+    42 = "HashValidationFailed"
     50 = "SftpFailed"
     51 = "SmbFailed"
     60 = "MaintenanceFailed"
@@ -50,6 +51,7 @@ function Resolve-BRAVOExitCode {
         [switch]$VersionDowngradeBlocked,
         [switch]$LocalArchiveFailed,
         [switch]$IntegrityTestFailed,
+        [switch]$HashValidationFailed,
         [switch]$SftpFailed,
         [switch]$SmbFailed,
         [switch]$MaintenanceFailed,
@@ -85,6 +87,7 @@ function Resolve-BRAVOExitCode {
     if ($CredentialsUnavailable) { return 31 }
     if ($LocalArchiveFailed) { return 40 }
     if ($IntegrityTestFailed) { return 41 }
+    if ($HashValidationFailed) { return 42 }
     if ($SftpFailed) { return 50 }
     if ($SmbFailed) { return 51 }
     if ($MaintenanceFailed) { return 60 }

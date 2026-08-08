@@ -119,25 +119,26 @@ function Get-SetupConfiguration {
     }
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $configRoot = Split-Path $resolvedPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    $configurationLoaderPath = Join-Path $runtimeRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedPath
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedPath -RuntimeRoot $runtimeRoot
 
     $credentialScript = if ($null -ne $credentialSettings -and
         -not [string]::IsNullOrWhiteSpace([string]$credentialSettings.SetupScriptPath)) {
         [string]$credentialSettings.SetupScriptPath
     } else {
-        Join-Path $configRoot "BRAVO_CREDENTIALS_SETUP.ps1"
+        Join-Path $runtimeRoot "BRAVO_CREDENTIALS_SETUP.ps1"
     }
 
     return [pscustomobject]@{
         ConfigPath = $resolvedPath
-        Root = $configRoot
+        Root = $runtimeRoot
         CredentialScript = $credentialScript
-        DryRunScript = Join-Path $configRoot "BRAVO_DRY_RUN.ps1"
+        DryRunScript = Join-Path $runtimeRoot "BRAVO_DRY_RUN.ps1"
         TaskInstallScript = Join-Path $configRoot "BRAVO_TASKS_INSTALL.ps1"
         TaskDiagnoseScript = Join-Path $configRoot "BRAVO_TASKS_DIAGNOSE.ps1"
         NotificationsEnabled = (
@@ -255,7 +256,7 @@ try {
         if ($bravoDiscoveryResult.Services.Count -gt 0) {
             Write-BRAVOResultField -Label 'Знайдені служби' -Value ($($bravoDiscoveryResult.Services | ForEach-Object { "$($_.Name) [$($_.State)]" }) -join ', ')
         } else {
-            Write-BRAVOResultField -Label 'Знайдені служби' -Value 'жодної (усі значення — legacy fallback або override)'
+            Write-BRAVOResultField -Label 'Знайдені служби' -Value 'жодної (доступні лише canonical discovery values або explicit override)'
         }
         if ($bravoDiscoveryResult.Overrides.Count -gt 0) {
             Write-Host "Явні override з discoverySettings: $($bravoDiscoveryResult.Overrides.Keys -join ', ')"

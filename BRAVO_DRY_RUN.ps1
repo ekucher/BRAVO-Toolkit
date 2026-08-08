@@ -108,8 +108,8 @@ function Test-BRAVOFileSystemWriteAccess {
     # на production, а не тут.
     #
     # Каталог створюється, якщо його немає: під час першого розгортання
-    # <ArchiveRoot>\LOGS ще не існує, і "не існує" не має видаватися за
-    # "немає прав".
+    # SystemLogRoot чи каталог призначення ще не існують, і "не існує" не
+    # має видаватися за "немає прав".
     param([string]$Path)
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
@@ -290,6 +290,18 @@ function Get-SourceDirectory {
         return $expanded.Substring(0, $expanded.Length - 2)
     }
     return $expanded
+}
+
+function Get-BRAVODryRunVolumeRoot {
+    param([string]$Path)
+
+    $sourceDirectory = Get-SourceDirectory -Path $Path
+    if ([string]::IsNullOrWhiteSpace($sourceDirectory)) { return $null }
+    try {
+        return [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($sourceDirectory)).TrimEnd('\')
+    } catch {
+        return $null
+    }
 }
 
 function Test-TcpPort {
@@ -700,13 +712,17 @@ try {
     }
 
     $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    $runtimeRoot = (Resolve-Path -LiteralPath $scriptDirectory).Path
     $configRoot = Split-Path $resolvedConfigPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $runtimeRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath
+    Import-BravoConfiguration `
+        -ConfigRoot $configRoot `
+        -ConfigPath $resolvedConfigPath `
+        -RuntimeRoot $runtimeRoot
     Add-DryRunResult PASS "Конфігурація" "Завантаження" $resolvedConfigPath
 
     $requiredScriptNames = @(
@@ -715,7 +731,7 @@ try {
         "BRAVO_HEALTH.ps1"
     )
     foreach ($scriptName in $requiredScriptNames) {
-        $scriptFile = Join-Path $configRoot $scriptName
+        $scriptFile = Join-Path $runtimeRoot $scriptName
         if (Test-Path -LiteralPath $scriptFile -PathType Leaf) {
             Add-DryRunResult PASS "Скрипти" $scriptName $scriptFile
         } else {
@@ -729,13 +745,16 @@ try {
     # рівно це й сталося на тестовому сервері, де в Tools\ лежали залишки
     # старого розкладання. Перевірка готовності, яка не перевіряє те, що
     # перевіряє сам запуск, дає хибну впевненість.
-    $dryRunGuardPath = Join-Path $configRoot 'BRAVO_RUNTIME_GUARD.ps1'
+    $dryRunGuardPath = Join-Path $runtimeRoot 'BRAVO_RUNTIME_GUARD.ps1'
     if (-not (Test-Path -LiteralPath $dryRunGuardPath -PathType Leaf)) {
         Add-DryRunResult FAIL "Цілісність" "Guard" "відсутній: $dryRunGuardPath"
     } else {
         $dryRunGuardLoaded = $false
         try {
-            . $dryRunGuardPath
+            # BRAVO_RUNTIME_GUARD.ps1 has a script-level RuntimeRoot
+            # parameter. Dot-sourcing it without this argument would bind an
+            # empty value into this script's case-insensitive $runtimeRoot.
+            . $dryRunGuardPath -RuntimeRoot $runtimeRoot
             $dryRunGuardLoaded = $null -ne (
                 Get-Command -Name 'Test-BRAVORuntimeManifestIntegrity' `
                     -CommandType Function -ErrorAction SilentlyContinue
@@ -751,8 +770,8 @@ try {
             )
         } else {
             $runtimeIntegrityResult = Test-BRAVORuntimeManifestIntegrity `
-                -RuntimeRoot $configRoot `
-                -ManifestPath (Join-Path $configRoot 'RUNTIME_MANIFEST.json') `
+                -RuntimeRoot $runtimeRoot `
+                -ManifestPath (Join-Path $runtimeRoot 'RUNTIME_MANIFEST.json') `
                 -Mode 'Enforce'
             if ($runtimeIntegrityResult.IsValid) {
                 Add-DryRunResult PASS "Цілісність" "Комплект" "RUNTIME_MANIFEST.json відповідає комплекту"
@@ -772,8 +791,8 @@ try {
             # -NoWrite обов'язковий: dry-run не має права записувати стан
             # версії, інакше він сам фіксує розгортання, яке ще не відбулося.
             $versionStateResult = Test-BRAVOVersionDowngrade `
-                -RuntimeRoot $configRoot `
-                -StatePath (Join-Path $configRoot 'LOGS\BRAVO_VERSION_STATE.json') `
+                -RuntimeRoot $runtimeRoot `
+                -StatePath (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'BRAVO\State\BRAVO_VERSION_STATE.json') `
                 -Mode 'Enforce' `
                 -NoWrite
             if ($versionStateResult.IsValid) {
@@ -788,17 +807,23 @@ try {
     # Виконується під тим самим обліковим записом, що й production-запуск
     # (через тимчасове завдання Планувальника — BRAVO_TASKS_DIAGNOSE.ps1),
     # тому це єдине місце, де "SYSTEM має права" перестає бути припущенням.
-    $dryRunRuntimeRoot = $configRoot
-    $dryRunArchiveRoot = [string]$pathSettings.ArchiveRoot
-    $dryRunBackupRoot = [string]$pathSettings.BackupRoot
-    $dryRunLimsRoot = [string]$pathSettings.LIMSRoot
-    $dryRunLogRoot = Join-Path $dryRunArchiveRoot 'LOGS'
-    $dryRunBravoWebLogRoot = Join-Path $dryRunLogRoot 'BravoWeb'
+    $dryRunRuntimeRoot = $runtimeRoot
+    # Ефективні корені обчислює BRAVO.config і публікує як $global-змінні.
+    # Явний lookup, щоб helper-scope не перетворив валідні корені на порожні.
+    $dryRunRuntimeLogRoot = [string]$global:runtimeLogRoot
+    $dryRunLimsRoot = [string]$global:effectiveLimsRoot
+    $dryRunSystemLogRoot = [string]$global:systemLogRoot
+    $dryRunBackupRoot = [string]$global:backupRootPath
+    $dryRunStateRoot = [string]$global:stateRoot
 
     Add-DryRunResult PASS "Корені" "RuntimeRoot" $dryRunRuntimeRoot
+    Add-DryRunResult PASS "Корені" "RuntimeLogRoot (script logs)" $dryRunRuntimeLogRoot
+    Add-DryRunResult PASS "Корені" ("LIMSRoot [{0}]" -f $global:limsRootResult.Source) $dryRunLimsRoot
+    Add-DryRunResult PASS "Корені" ("SystemLogRoot [{0}]" -f $global:systemLogRootResult.Source) $dryRunSystemLogRoot
+    Add-DryRunResult PASS "Корені" ("BackupRoot [{0}]" -f $global:backupRootResult.Source) $dryRunBackupRoot
     foreach ($rootPair in @(
         @{ Name = 'LIMSRoot'; Path = $dryRunLimsRoot },
-        @{ Name = 'ArchiveRoot'; Path = $dryRunArchiveRoot },
+        @{ Name = 'SystemLogRoot'; Path = $dryRunSystemLogRoot },
         @{ Name = 'BackupRoot'; Path = $dryRunBackupRoot }
     )) {
         if (Test-BRAVOMappedNetworkDrivePath -Path ([string]$rootPair.Path)) {
@@ -806,8 +831,6 @@ try {
                 "$($rootPair.Path) — підключений мережевий диск; SYSTEM його не бачить. " +
                 "Використайте UNC \\server\share\..."
             )
-        } else {
-            Add-DryRunResult PASS "Корені" ([string]$rootPair.Name) ([string]$rootPair.Path)
         }
     }
 
@@ -833,14 +856,29 @@ try {
     }
 
     $writeAccessTargets = [ordered]@{
-        'ArchiveRoot'          = $dryRunArchiveRoot
-        'BackupRoot'           = $dryRunBackupRoot
-        'LOGS'                 = $dryRunLogRoot
-        'LOGS\Trace'           = (Join-Path $dryRunLogRoot 'Trace')
-        'LOGS\exchangAPI'      = (Join-Path $dryRunLogRoot 'exchangAPI')
-        'LOGS\BravoWeb\Apache' = (Join-Path $dryRunBravoWebLogRoot 'Apache')
-        'LOGS\BravoWeb\Application' = (Join-Path $dryRunBravoWebLogRoot 'Application')
+        'RuntimeRoot\LOGS (script logs)' = $dryRunRuntimeLogRoot
+        'BackupRoot'                     = $dryRunBackupRoot
+        'SystemLogRoot'                  = $dryRunSystemLogRoot
+        'SystemLog\Trace'               = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'Trace'))
+        'SystemLog\exchangAPI'          = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'exchangAPI'))
+        'SystemLog\BravoWeb\Apache'     = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'BravoWeb\Apache'))
+        'SystemLog\BravoWeb\Application' = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'BravoWeb\Application'))
         'Тимчасовий каталог'   = ([IO.Path]::GetTempPath())
+        'Operation lock'       = (Split-Path -Path ([string]$operationLockSettings.Path) -Parent)
+        'Machine state'        = $dryRunStateRoot
+    }
+    foreach ($definition in @($archiveDefinitions | Where-Object { Test-SettingEnabled $_.Enabled })) {
+        $writeAccessTargets["$($definition.Type) destination"] = [string]$definition.Destination
+        # [IO.Path]::Combine: диск призначення може ще не існувати — список
+        # шляхів для probe будується без DriveNotFoundException, а недоступність
+        # рапортує сам probe.
+        $writeAccessTargets["$($definition.Type) work"] = [System.IO.Path]::Combine([string]$definition.Destination, '.work')
+    }
+    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_APP_LOCAL) {
+        $writeAccessTargets['BAZA_APP destination'] = [string]$bazaAppPaths.Destination
+    }
+    if (Test-SettingEnabled $componentSettings.Synchronization.BAZA_WWW_LOCAL) {
+        $writeAccessTargets['BAZA_WWW destination'] = [string]$bazaWWWPaths.Destination
     }
     foreach ($writeTarget in $writeAccessTargets.GetEnumerator()) {
         if ([string]::IsNullOrWhiteSpace([string]$writeTarget.Value)) {
@@ -866,6 +904,22 @@ try {
         Add-DryRunResult PASS "Інструменти" "7-Zip" $archiverPath
     } else {
         Add-DryRunResult FAIL "Інструменти" "7-Zip" "не знайдено: $archiverPath"
+    }
+
+    $compatibilityModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1'
+    if (Test-Path -LiteralPath $compatibilityModulePath -PathType Leaf) {
+        Import-Module -Name $compatibilityModulePath -ErrorAction Stop
+        $toolManifestResult = Test-BRAVOToolManifestIntegrity `
+            -ToolsDirectory ([string]$toolsPath) `
+            -ManifestPath ([string]$toolIntegritySettings.ManifestPath) `
+            -Mode 'Enforce'
+        if ($toolManifestResult.IsValid) {
+            Add-DryRunResult PASS 'Цілісність' 'TOOLS_MANIFEST.json' 'runtime tools відповідають version-controlled manifest'
+        } else {
+            Add-DryRunResult FAIL 'Цілісність' 'TOOLS_MANIFEST.json' ([string]$toolManifestResult.Message)
+        }
+    } else {
+        Add-DryRunResult FAIL 'Цілісність' 'Compatibility module' "не знайдено: $compatibilityModulePath"
     }
 
     $sftpConfigured = (Test-SettingEnabled $componentSettings.SFTP.ArchiveUpload) -or
@@ -916,14 +970,48 @@ try {
         }
         $enabledArchiveCount++
         $sourceDirectory = Get-SourceDirectory ([string]$definition.Source)
-        if (Test-Path -LiteralPath $sourceDirectory -PathType Container) {
-            Add-DryRunResult PASS "Джерело" ([string]$definition.Type) $sourceDirectory
+        $sourceReadResult = Test-BRAVOFileSystemReadAccess -Path $sourceDirectory
+        if ($sourceReadResult.Success) {
+            $sourceVolume = Get-BRAVODryRunVolumeRoot -Path $sourceDirectory
+            Add-DryRunResult PASS "Джерело" ([string]$definition.Type) "$($sourceReadResult.Detail); volume=$sourceVolume"
         } else {
-            Add-DryRunResult FAIL "Джерело" ([string]$definition.Type) "каталог відсутній: $sourceDirectory"
+            Add-DryRunResult FAIL "Джерело" ([string]$definition.Type) ([string]$sourceReadResult.Detail)
         }
         Add-DryRunResult PLAN "Архівація" ([string]$definition.Type) (
             "створення архіву в '$($definition.Destination)' і SHA sidecar"
         )
+    }
+
+    if ($enabledArchiveCount -gt 0) {
+        $sourceVolumes = @(
+            $archiveDefinitions |
+                Where-Object { Test-SettingEnabled $_.Enabled } |
+                ForEach-Object { Get-BRAVODryRunVolumeRoot -Path ([string]$_.Source) } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Unique
+        )
+        $vssService = Get-Service -Name VSS -ErrorAction SilentlyContinue
+        $shadowCopyClass = $null
+        $shadowCopyClassError = $null
+        try {
+            $shadowCopyClass = Get-WmiObject -List -Class Win32_ShadowCopy -ErrorAction Stop
+        } catch {
+            # Restricted sessions can deny WMI even when the VSS class exists.
+            # This is a failed capability check, not a reason to abort the rest
+            # of dry-run diagnostics (SFTP, scheduler, credentials, etc.).
+            $shadowCopyClassError = [string]$_.Exception.Message
+        }
+        $diskshadowCommand = Get-Command 'diskshadow.exe' -ErrorAction SilentlyContinue
+        if ($null -eq $vssService -or $null -eq $shadowCopyClass -or
+            ($sourceVolumes.Count -gt 1 -and $null -eq $diskshadowCommand)) {
+            $vssDetail = "volumes=$($sourceVolumes -join ', '); VSS service/class/diskshadow capability incomplete"
+            if (-not [string]::IsNullOrWhiteSpace($shadowCopyClassError)) {
+                $vssDetail += "; Win32_ShadowCopy: $shadowCopyClassError"
+            }
+            Add-DryRunResult FAIL 'VSS' 'Capability' $vssDetail
+        } else {
+            Add-DryRunResult PASS 'VSS' 'Capability' "one Snapshot Set planned for volumes: $($sourceVolumes -join ', '); no snapshot created"
+        }
     }
     if ($enabledArchiveCount -eq 0 -and $null -ne $sourcePaths) {
         foreach ($entry in $sourcePaths.GetEnumerator()) {
@@ -988,7 +1076,7 @@ try {
         Add-DryRunResult PLAN "Backup" "Узгодженість джерел" (
             "режим=$($backupConsistency.Mode); " +
             "контекст=$($backupConsistency.SnapshotContext); " +
-            "окремий VSS-знімок для кожного архіву; " +
+            "один VSS Snapshot Set для всіх enabled archive components; " +
             "спільний BRAVO_OPERATION.lock; очікування до " +
             "$($schedulerSettings.OperationLockWaitMinutes) хв.; служби не змінювалися"
         )
@@ -1045,7 +1133,16 @@ try {
     }
 
     $requiredCredentials = @()
-    $credentialValues = @{}
+    # Keep a stable shape under StrictMode. -SkipCredentials deliberately
+    # leaves values empty, but subsequent SFTP/SMB/notification planning must
+    # still complete instead of reading properties that do not exist.
+    $credentialValues = @{
+        SFTPLogin = ''
+        SFTPPassword = ''
+        SMBLogin = ''
+        SMBPassword = ''
+        Webhook = ''
+    }
     if (-not $SkipCredentials) {
         if ($null -eq $credentialSettings -or
             [string]::IsNullOrWhiteSpace([string]$credentialSettings.HelperPath) -or
@@ -1104,6 +1201,15 @@ try {
     $sftpRequired = $sftpConfigured
     if ($sftpRequired) {
         Add-DryRunResult PLAN "SFTP" "Передача" "upload/synchronize не запускалися"
+        if ($credentialValues.SFTPLogin) {
+            try {
+                $actualSftpHost = Resolve-SftpHost -Login ([string]$credentialValues.SFTPLogin)
+                [void](Test-TcpPort -HostName $actualSftpHost -Port ([int]$sftpPort))
+                Add-DryRunResult PASS 'SFTP' 'Actual endpoint' "${actualSftpHost}:$sftpPort доступний"
+            } catch {
+                Add-DryRunResult FAIL 'SFTP' 'Actual endpoint' $_.Exception.Message
+            }
+        }
         if ($TestAccess -and $credentialValues.SFTPLogin -and $credentialValues.SFTPPassword) {
             try {
                 $detail = Test-SftpReadOnlyAccess `
@@ -1256,7 +1362,14 @@ try {
         }
     }
 } catch {
-    Add-DryRunResult FAIL "Dry-run" "Фатальна помилка" $_.Exception.Message
+    $fatalDetail = [string]$_.Exception.Message
+    if (-not [string]::IsNullOrWhiteSpace([string]$_.InvocationInfo.PositionMessage)) {
+        $fatalDetail += "`n$($_.InvocationInfo.PositionMessage.Trim())"
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$_.ScriptStackTrace)) {
+        $fatalDetail += "`nStack: $($_.ScriptStackTrace)"
+    }
+    Add-DryRunResult FAIL "Dry-run" "Фатальна помилка" $fatalDetail
 }
 
 Write-DryRunOutput

@@ -206,7 +206,7 @@ try {
     }
     $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $scriptRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
@@ -234,7 +234,7 @@ try {
                 "профілю не є для нього захищеним розташуванням. Перенесіть комплект " +
                 "у локальний захищений каталог — наприклад C:\BRAVO, C:\ProgramData\BRAVO " +
                 "або D:\BRAVO_RUNTIME (ACL: SYSTEM/Administrators — FullControl, " +
-                "Users — ReadAndExecute). Корені даних (LIMSRoot/ArchiveRoot/BackupRoot) " +
+                "Users — ReadAndExecute). Корені даних (LIMSRoot/SystemLogRoot/BackupRoot) " +
                 "переносити не потрібно: вони задаються в BRAVO.config незалежно."
             )
         }
@@ -284,11 +284,13 @@ try {
     Write-Host "=== КОРЕНІ ШЛЯХІВ ===" -ForegroundColor Cyan
     $pathRootsFailed = $false
     $diagnosticRoots = [ordered]@{
-        'RuntimeRoot' = $scriptRoot
-        'ConfigPath'  = $resolvedConfigPath
-        'LIMSRoot'    = [string]$pathSettings.LIMSRoot
-        'ArchiveRoot' = [string]$pathSettings.ArchiveRoot
-        'BackupRoot'  = [string]$pathSettings.BackupRoot
+        'RuntimeRoot'      = $scriptRoot
+        'RuntimeLogRoot'   = [string]$global:runtimeLogRoot
+        'ConfigPath'       = $resolvedConfigPath
+        'EffectiveLIMSRoot' = [string]$global:effectiveLimsRoot
+        'SystemLogRoot'    = [string]$global:systemLogRoot
+        'BackupRoot'       = [string]$global:backupRootPath
+        'StateRoot'        = [string]$global:stateRoot
     }
     foreach ($rootEntry in $diagnosticRoots.GetEnumerator()) {
         if (Test-BRAVOMappedNetworkDrive -Path ([string]$rootEntry.Value)) {
