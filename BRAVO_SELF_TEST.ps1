@@ -1496,22 +1496,20 @@ try {
         (Join-Path $root "BRAVO.config"),
         [Text.Encoding]::UTF8
     )
-    $archiveLoaderCalls = @(
-        [regex]::Matches(
-            $archiveScriptText,
-            'Import-BravoConfiguration\s+`?\s*-ConfigRoot\s+\$bravoScriptDirectory\s+`?\s*-ConfigPath\s+\$ConfigPath'
-        )
-    ).Count
-    $healthLoaderCalls = @(
-        [regex]::Matches(
-            $healthScriptText,
-            'Import-BravoConfiguration\s+`?\s*-ConfigRoot\s+\$bravoScriptDirectory\s+`?\s*-ConfigPath\s+\$ConfigPath'
-        )
-    ).Count
+    # CODE IS NOT DATA: -ConfigRoot береться з фактичного шляху конфігурації
+    # (вона може лежати в окремому каталозі, наприклад C:\BRAVO\CONFIGS), а
+    # -RuntimeRoot — це завжди каталог самого комплекту, звідки беруться
+    # modules\, Tools\ і VERSION.json.
+    $loaderCallPattern = 'Import-BravoConfiguration\s+`?\s*' +
+        '-ConfigRoot\s+\(Split-Path[^\r\n]*\)\s+`?\s*' +
+        '-ConfigPath\s+\$ConfigPath\s+`?\s*' +
+        '-RuntimeRoot\s+\$bravoScriptDirectory'
+    $archiveLoaderCalls = @([regex]::Matches($archiveScriptText, $loaderCallPattern)).Count
+    $healthLoaderCalls = @([regex]::Matches($healthScriptText, $loaderCallPattern)).Count
     Test-BRAVOCondition `
         -Condition ($archiveLoaderCalls -eq 1 -and $healthLoaderCalls -eq 1) `
         -Name "ConfigurationLoader/ArchiveAndHealthEntrypoints" `
-        -Failure "BRAVO_ARCHIV і BRAVO_HEALTH повинні окремо завантажувати конфігурацію через loader"
+        -Failure "BRAVO_ARCHIV і BRAVO_HEALTH повинні завантажувати конфігурацію через loader із розділеними -ConfigRoot (каталог конфігурації) і -RuntimeRoot (каталог комплекту)"
     $archiveRuntimeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($archiveScriptText + [Environment]::NewLine + $healthScriptText + [Environment]::NewLine + $notificationScriptText) `
         -FunctionNames @(
@@ -3705,19 +3703,29 @@ try {
             [pscustomobject]@{ Name = "Apache2.4"; DisplayName = "Apache2.4"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeHttpdPath) }
         )
 
-        # -SystemRoot тут навмисно вказує на неіснуючий каталог: без цього
-        # тест підхоплював би РЕАЛЬНИЙ %SystemRoot%\SysWOW64\bravo.ini
-        # поточної машини, якщо він там є (саме так і сталось під час
-        # розробки цієї перевірки — на машині розробника він справді
-        # лежить там), і тест ставав недетермінованим — залежав від
-        # оточення, а не лише від синтетичних фікстур.
+        # -SystemRoot скрізь нижче ін'єктується синтетичним: без цього тест
+        # підхоплював би РЕАЛЬНИЙ %SystemRoot%\SysWOW64\bravo.ini поточної
+        # машини, якщо він там є (саме так і сталось під час розробки цієї
+        # перевірки — на машині розробника він справді лежить там), і тест
+        # ставав недетермінованим — залежав від оточення, а не лише від
+        # синтетичних фікстур.
+        #
+        # $noSuchSystemRoot — для сценаріїв "bravo.ini недоступний";
+        # $fixtureSystemRoot — єдине допустиме місце, звідки bravo.ini
+        # тепер узагалі може бути прочитаний (архітектура ОС визначає
+        # SysWOW64 проти System32, іншого шляху немає).
         $noSuchSystemRoot = Join-Path $discoveryTestRoot "NoSuchSystemRoot"
+        $fixtureSystemRoot = Join-Path $discoveryTestRoot "FixtureWindows"
+        $fixtureSystemIniPath = Join-Path $fixtureSystemRoot "SysWOW64\bravo.ini"
+        [void][IO.Directory]::CreateDirectory((Split-Path -Path $fixtureSystemIniPath -Parent))
+        [IO.File]::WriteAllLines($fixtureSystemIniPath, $discoveryTestIniContent)
         $autoDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
             -WebServiceCandidates @("Apache2.4") `
             -Services $syntheticServices `
-            -SystemRoot $noSuchSystemRoot
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true
 
         Test-BRAVOCondition `
             -Condition (
@@ -3919,10 +3927,10 @@ try {
             -Condition (
                 $systemIniDiscoveryX64.BravoIniPath -eq $systemBravoIniPath -and
                 $systemIniDiscoveryX64.MODEL_SOURCE -eq (Join-Path $discoveryTestRoot "SysWOW64Model") -and
-                $systemIniDiscoveryX64.Reasons.BravoIniPath.Contains("системному каталозі")
+                $systemIniDiscoveryX64.Reasons.BravoIniPath.Contains("системний каталог Windows")
             ) `
-            -Name "Discovery/SystemDirectoryIsPrimaryBravoIniSource" `
-            -Failure "на 64-бітній ОС bravo.ini у %SystemRoot%\SysWOW64 має мати пріоритет над файлом поруч з bravo.exe — так само, як він насправді лежить на реальних інсталяціях"
+            -Name "Discovery/SystemDirectoryIsOnlyBravoIniSource" `
+            -Failure "на 64-бітній ОС bravo.ini береться саме з %SystemRoot%\SysWOW64 — так само, як він насправді лежить на реальних інсталяціях"
 
         $systemIniDiscoveryX86 = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
@@ -3939,9 +3947,12 @@ try {
             -Name "Discovery/Win32UsesSystem32NotSysWOW64" `
             -Failure "на 32-бітній ОС немає шару перенаправлення WOW64 — bravo.ini має шукатись у System32, а не SysWOW64"
 
-        # Каталог доступний лише в SysWOW64 фікстури — якщо системного
-        # bravo.ini немає взагалі (ні System32, ні SysWOW64), має
-        # спрацювати старий fallback поруч з bravo.exe.
+        # Очікуваний шлях bravo.ini рівно один і визначається архітектурою
+        # ОС. Файл поруч з bravo.exe ($fakeBravoIniPath існує весь цей блок)
+        # НЕ є другим джерелом: дві різні конфігурації на одній машині
+        # означали б, що Maintenance читає не ту, якою насправді керується
+        # служба, — мовчки й правдоподібно. Тому тут очікується керована
+        # помилка з назвою перевіреного шляху.
         $noSystemIniDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
@@ -3951,12 +3962,13 @@ try {
             -Is64BitOperatingSystem $true
         Test-BRAVOCondition `
             -Condition (
-                $noSystemIniDiscovery.BravoIniPath -eq $fakeBravoIniPath -and
-                $noSystemIniDiscovery.Reasons.BravoIniPath.Contains("не знайдено в системному каталозі") -and
-                $noSystemIniDiscovery.Reasons.BravoIniPath.Contains("поруч з bravo.exe")
+                (Test-Path -LiteralPath $fakeBravoIniPath) -and
+                [string]::IsNullOrWhiteSpace([string]$noSystemIniDiscovery.BravoIniPath) -and
+                $noSystemIniDiscovery.Reasons.BravoIniPath.Contains("єдиним очікуваним") -and
+                $noSystemIniDiscovery.Reasons.BravoIniPath.Contains("NoSuchWindowsDir\SysWOW64\bravo.ini")
             ) `
-            -Name "Discovery/FallsBackNextToExecutableWhenSystemIniMissing" `
-            -Failure "якщо bravo.ini немає в системному каталозі, Resolve-BRAVOInstallationDiscovery має fallback-ити на файл поруч з bravo.exe (зворотна сумісність)"
+            -Name "Discovery/NoFallbackNextToExecutableWhenSystemIniMissing" `
+            -Failure "за відсутності bravo.ini у системному каталозі має бути помилка з назвою перевіреного шляху, а не мовчазне читання файлу поруч з bravo.exe"
 
         # BACKUP_ROOT: підкаталог "ARCHIV" усередині BRAVO_ROOT, і той самий
         # override-механізм, що й решта Sources-полів.
@@ -4100,35 +4112,57 @@ try {
         -Name "Discovery/WiredIntoConfigLoaderAndSetup" `
         -Failure "BRAVO_CONFIG_LOADER.ps1 має імпортувати BRAVO.Discovery, BRAVO.config має викликати Resolve-BRAVOInstallationDiscovery для sourcePaths, а BRAVO_SETUP.ps1 -ValidateOnly має показувати й перевіряти discovery-результат і дрейф відносно baseline"
 
-    # Джерело істини для служби BRAVO (Service name ТА Display name) і для
-    # каталогу збереження бекапів ARCHIV (підкаталог у шляху встановлення
-    # служби BRAVO, не LIMSRoot-відносний) — обидва мають бути прокинуті
-    # з BRAVO.config у Resolve-BRAVOInstallationDiscovery, а не лишатись
-    # лише в модулі.
+    # Джерело істини для служби BRAVO — Service name ТА Display name
+    # одночасно — має бути прокинуте з BRAVO.config у
+    # Resolve-BRAVOInstallationDiscovery, а не лишатись лише в модулі.
+    #
+    # BackupRoot при цьому БІЛЬШЕ не перевизначається автоматично з
+    # Discovery: значення в pathSettings обов'язкове й явне, тому мовчазна
+    # заміна означала б, що адміністратор бачить у конфігурації один
+    # каталог, а бекапи їдуть в інший.
     Test-BRAVOCondition `
         -Condition (
             $bravoConfigTextForDiscovery.Contains('BravoDisplayName = "BRAVO Service"') -and
             [regex]::IsMatch($bravoConfigTextForDiscovery, '-BravoDisplayName\s+\(\[string\]\$maintenanceSettings\.Services\.BravoDisplayName\)') -and
-            $bravoConfigTextForDiscovery.Contains('$bravoDiscoveryResult.BACKUP_ROOT') -and
-            [regex]::IsMatch($bravoConfigTextForDiscovery, '\$pathSettings\.BackupRoot\s+-eq\s+\$defaultArchiveRoot')
+            -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$global:pathSettings\.BackupRoot\s*=\s*\[string\]\$bravoDiscoveryResult\.BACKUP_ROOT')
         ) `
-        -Name "Discovery/ConfigUsesStrictBravoIdentityAndBackupRoot" `
-        -Failure "BRAVO.config має передавати -BravoDisplayName='BRAVO Service' у Resolve-BRAVOInstallationDiscovery і використовувати BACKUP_ROOT як дефолт pathSettings.BackupRoot, лише якщо адміністратор не змінив його вручну"
+        -Name "Discovery/ConfigUsesStrictBravoIdentityAndExplicitBackupRoot" `
+        -Failure "BRAVO.config має передавати -BravoDisplayName='BRAVO Service' у Resolve-BRAVOInstallationDiscovery і НЕ перевизначати pathSettings.BackupRoot автоматично з Discovery"
 
-    # ArchiveRoot (Tools\/LOGS\/TOOLS_MANIFEST.json) має дефолтитись у
-    # каталог самого скрипта ($ConfigRoot) — НЕ в обчислений здогад
-    # "піднятись на рівень і зайти в підкаталог ARCHIV". Останній
-    # спрацьовував лише випадково, коли комплект розгорнутий у теці, яка
-    # називається буквально "ARCHIV" — на реальному сервері з git-чекаутом
-    # (інша назва теки) TOOLS_MANIFEST.json "губився", хоча фізично лежав
-    # поруч зі скриптом.
+    # CODE IS NOT DATA. Виробничі корені даних задаються явно й не
+    # виводяться ані з розташування комплекту, ані один з одного: для
+    # комплекту в C:\BRAVO старі формули дали б LIMSRoot="C:\" і
+    # ArchiveRoot="C:\BRAVO", тобто журнали писалися б у каталог з
+    # виконуваним кодом, а джерелом LIMS вважався б корінь системного диска.
+    $configLoaderTextForRoots = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_CONFIG_LOADER.ps1"),
+        [Text.Encoding]::UTF8
+    )
     Test-BRAVOCondition `
         -Condition (
-            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\$defaultArchiveRoot\s*=\s*\$ConfigRoot\s*$') -and
-            -not $bravoConfigTextForDiscovery.Contains('Join-Path $defaultLIMSRoot "ARCHIV"')
+            -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$defaultLIMSRoot\s*=\s*Split-Path') -and
+            -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$defaultArchiveRoot\s*=\s*\$ConfigRoot') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*LIMSRoot\s*=\s*"[A-Za-z]:\\') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*ArchiveRoot\s*=\s*"[A-Za-z]:\\') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\s*BackupRoot\s*=\s*"[A-Za-z]:\\') -and
+            $configLoaderTextForRoots.Contains('function Resolve-BravoDataRoot') -and
+            $configLoaderTextForRoots.Contains('Assert-BravoDataRootsAreIndependent -PathSettings $global:pathSettings')
         ) `
-        -Name "Discovery/ArchiveRootDefaultsToScriptDirectory" `
-        -Failure "pathSettings.ArchiveRoot (Tools\, LOGS\, TOOLS_MANIFEST.json) має дефолтитись у `$ConfigRoot — каталог самого скрипта, а не в обчислений LIMSRoot\ARCHIV, який працює лише коли тека випадково називається 'ARCHIV'"
+        -Name "Discovery/DataRootsAreExplicitAndIndependentOfRuntime" `
+        -Failure "LIMSRoot/ArchiveRoot/BackupRoot мають задаватись у BRAVO.config абсолютними шляхами й перевірятись Resolve-BravoDataRoot, а не виводитись із ConfigRoot"
+
+    # Tools\ — runtime-залежність комплекту (виконувані файли під захистом
+    # маніфесту), а не дані архіву: вони мають лежати поруч зі скриптами,
+    # інакше перенесення архівів на інший диск тягне за собою перенесення
+    # виконуваного коду.
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigTextForDiscovery.Contains('$global:toolsPath = Join-Path $runtimeRoot "Tools"') -and
+            -not $bravoConfigTextForDiscovery.Contains('$global:toolsPath = Join-Path $archivPath "Tools"') -and
+            $bravoConfigTextForDiscovery.Contains('$global:logPath = Join-Path $archivPath "LOGS"')
+        ) `
+        -Name "Discovery/ToolsLiveUnderRuntimeRoot" `
+        -Failure "Tools\ мають визначатись від RuntimeRoot (каталог комплекту), а LOGS\ — від ArchiveRoot (каталог даних)"
 
     # AUD-004 (аудит P0.4): restore drill. Читабельний і навіть SHA512/7za-
     # перевірений архів не доводить відновлюваність — Invoke-BRAVOSevenZipExtraction
@@ -4416,17 +4450,22 @@ try {
         (Join-Path $root "BRAVO_TASKS_UNINSTALL.ps1"),
         [Text.Encoding]::UTF8
     )
+    # Свіжість накопичувальних оновлень Windows — health-метрика, а не
+    # умова виконання. В операційних скриптах вона лише додавала WARNING (а
+    # з ним і ненульовий код завершення 10) до дії, на результат якої вік
+    # патчів не впливає. Тому діагностика лишається рівно в одному місці —
+    # BRAVO_HEALTH, який для цього й існує.
     Test-BRAVOCondition `
         -Condition (
-            $archiveScriptText.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
-            $maintenanceScriptText.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
             $healthScriptTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
-            $credentialsSetupTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
-            $tasksInstallTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
-            $tasksUninstallTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation")
+            -not $archiveScriptText.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $maintenanceScriptText.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $credentialsSetupTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $tasksInstallTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation") -and
+            -not $tasksUninstallTextForPatchLevel.Contains("Get-BRAVOWindowsPatchLevelRecommendation")
         ) `
-        -Name "Runtime/SharedWindowsPatchLevelRecommendation" `
-        -Failure "усі точки входу мають попереджати про застарілий рівень оновлень Windows"
+        -Name "Runtime/WindowsPatchLevelOnlyInHealth" `
+        -Failure "діагностика свіжості оновлень Windows має виконуватись лише в BRAVO_HEALTH і не впливати на код завершення Archive/Maintenance/Recovery/Tasks"
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains("Get-BRAVOToolIntegrityRecommendation") -and
@@ -4600,6 +4639,1083 @@ try {
         -Condition ($LASTEXITCODE -eq 0) `
         -Name "Scheduler/ValidateOnly" `
         -Failure "BRAVO_TASKS_INSTALL повернув код $LASTEXITCODE"
+
+    # ===== RUNTIME / DATA ROOTS, EFFECTIVE CONFIGPATH, SYSTEM PREFLIGHT =====
+    # (ТЗ «production-grade runtime, Task Scheduler, log rotation…», §93-§116)
+    # Жоден сценарій не керує реальними службами й не змінює production-дані:
+    # усе перевіряється на тимчасових каталогах і на тексті самих скриптів.
+    $dryRunTextForRuntime = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_DRY_RUN.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $tasksDiagnoseTextForRuntime = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_TASKS_DIAGNOSE.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $configLoaderTextForRuntime = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_CONFIG_LOADER.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    # Саме ФАЙЛИ ТОЧОК ВХОДУ, а не runtime-модулі: effective ConfigPath
+    # визначається до Import-Module, у самому .ps1.
+    $archiveEntrypointText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_ARCHIV.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $maintenanceEntrypointText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_MAINTENANCE.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $healthEntrypointText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_HEALTH.ps1"),
+        [Text.Encoding]::UTF8
+    )
+
+    # --- Runtime/01: data roots нормалізуються й перевіряються ---
+    $dataRootModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $configLoaderTextForRuntime `
+        -FunctionNames @('Resolve-BravoDataRoot', 'Assert-BravoDataRootsAreIndependent')
+    $absoluteRoot = & $dataRootModule {
+        param($Value)
+        Resolve-BravoDataRoot -Name 'ArchiveRoot' -Value $Value
+    } 'D:\LIMS-NEW\ARCHIV\'
+    $quotedEnvRoot = & $dataRootModule {
+        param($Value)
+        Resolve-BravoDataRoot -Name 'ArchiveRoot' -Value $Value
+    } '"%SystemDrive%\BRAVO_TEST_ROOT"'
+    $relativeRejected = $false
+    try {
+        [void](& $dataRootModule {
+            param($Value)
+            Resolve-BravoDataRoot -Name 'ArchiveRoot' -Value $Value
+        } 'ARCHIV')
+    } catch {
+        $relativeRejected = $_.Exception.Message -like '*абсолютним шляхом*'
+    }
+    $emptyRejected = $false
+    try {
+        [void](& $dataRootModule {
+            Resolve-BravoDataRoot -Name 'LIMSRoot' -Value ''
+        })
+    } catch {
+        $emptyRejected = $_.Exception.Message -like '*не задано*'
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $absoluteRoot -eq 'D:\LIMS-NEW\ARCHIV' -and
+            $quotedEnvRoot -eq (Join-Path $env:SystemDrive 'BRAVO_TEST_ROOT') -and
+            $relativeRejected -and
+            $emptyRejected
+        ) `
+        -Name "Runtime/01-DataRootsAreAbsoluteExpandedAndValidated" `
+        -Failure "Resolve-BravoDataRoot має знімати лапки, розкривати %ENV%, нормалізувати шлях і відхиляти порожнє чи відносне значення явною помилкою конфігурації"
+
+    # --- Runtime/02: relocatable runtime — data roots не залежать від
+    # розташування комплекту. Перевіряється фактом: три різні корені
+    # проходять валідацію незалежно один від одного й від RuntimeRoot.
+    $relocatableRoots = @{
+        LIMSRoot    = 'D:\LIMS-NEW'
+        ArchiveRoot = 'D:\LIMS-NEW\ARCHIV'
+        BackupRoot  = 'E:\BRAVO_BACKUPS'
+    }
+    & $dataRootModule {
+        param($Settings)
+        Assert-BravoDataRootsAreIndependent -PathSettings $Settings
+    } $relocatableRoots
+    Test-BRAVOCondition `
+        -Condition (
+            $relocatableRoots.LIMSRoot -eq 'D:\LIMS-NEW' -and
+            $relocatableRoots.ArchiveRoot -eq 'D:\LIMS-NEW\ARCHIV' -and
+            $relocatableRoots.BackupRoot -eq 'E:\BRAVO_BACKUPS' -and
+            $configLoaderTextForRuntime.Contains('[string]$RuntimeRoot') -and
+            $configLoaderTextForRuntime.Contains('-ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot')
+        ) `
+        -Name "Runtime/02-RelocatableRuntimeSupportsSeparateDisks" `
+        -Failure "комплект у C:\BRAVO, LIMS на D: і бекапи на E: мають бути повністю підтримані: RuntimeRoot передається окремим параметром і не змішується з коренями даних"
+
+    # --- Runtime/03: effective ConfigPath використовується всюди ---
+    $entrypointConfigPathChecks = @(
+        @{ Name = 'BRAVO_ARCHIV.ps1'; Text = $archiveEntrypointText },
+        @{ Name = 'BRAVO_MAINTENANCE.ps1'; Text = $maintenanceEntrypointText },
+        @{ Name = 'BRAVO_HEALTH.ps1'; Text = $healthEntrypointText }
+    )
+    $configPathFailures = @(
+        $entrypointConfigPathChecks | Where-Object {
+            -not $_.Text.Contains('$effectiveConfigPath = if ([string]::IsNullOrWhiteSpace($ConfigPath))') -or
+            -not $_.Text.Contains('-ConfigPath $effectiveConfigPath `') -or
+            $_.Text.Contains("-ConfigPath (Join-Path `$PSScriptRoot 'BRAVO.config') ``") -or
+            -not $_.Text.Contains('$ConfigPath = $effectiveConfigPath')
+        } | ForEach-Object { $_.Name }
+    )
+    Test-BRAVOCondition `
+        -Condition ($configPathFailures.Count -eq 0) `
+        -Name "Runtime/03-EffectiveConfigPathUsedBySecurityChecks" `
+        -Failure "перемикачі безпеки мають перевірятись у ТІЙ САМІЙ конфігурації, з якою запущено скрипт (-ConfigPath), а не в захардкоденому `$PSScriptRoot\BRAVO.config; порушено в: $($configPathFailures -join ', ')"
+
+    # --- Runtime/04: Tools і LOGS живуть у різних коренях ---
+    $bravoConfigTextForTools = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO.config"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigTextForTools.Contains('$global:toolsPath = Join-Path $runtimeRoot "Tools"') -and
+            $bravoConfigTextForTools.Contains('$global:arcPath = Join-Path $toolsPath "7za.exe"') -and
+            $bravoConfigTextForTools.Contains('$global:winSCPPath = Join-Path $toolsPath "WinSCP.com"') -and
+            $maintenanceScriptText -notmatch '\$ARC_PATH = Join-Path \$ARCHIVE_ROOT' -and
+            $maintenanceScriptText.Contains('$ARC_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$arcPath))')
+        ) `
+        -Name "Runtime/04-ToolsResolveFromRuntimeRoot" `
+        -Failure "7za.exe/WinSCP — runtime-залежності комплекту: вони мають братись із RuntimeRoot\Tools і з одного джерела в Archive та Maintenance"
+
+    # --- Runtime/05: заборонені інтерактивні залежності під SYSTEM ---
+    $scheduledEntrypoints = @(
+        @{ Name = 'BRAVO_ARCHIV.ps1'; Text = $archiveScriptText },
+        @{ Name = 'BRAVO_MAINTENANCE.ps1'; Text = $maintenanceScriptText },
+        @{ Name = 'BRAVO_HEALTH.ps1'; Text = $healthScriptText }
+    )
+    # Інваріант: якщо runtime взагалі вміє підвищувати права, кожне таке
+    # підвищення має бути закрите перевіркою на SYSTEM. SYSTEM уже має
+    # потрібний контекст, а Start-Process -Verb RunAs там повертає
+    # 0x80070001 — тобто заплановане завдання просто вмирає без сліду.
+    # Runtime, який не елевейтиться взагалі (Health), задовольняє інваріант
+    # за побудовою.
+    $interactiveFailures = @(
+        $scheduledEntrypoints | Where-Object {
+            ($_.Text -match '-Verb\s+RunAs') -and -not (
+                $_.Text.Contains("'S-1-5-18'") -and
+                $_.Text -match '(?:!|-not\s+)\$isLocalSystem\s+-and'
+            )
+        } | ForEach-Object { $_.Name }
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $interactiveFailures.Count -eq 0 -and
+            $taskInstallerText.Contains('$actionArguments += " -NoPause"') -and
+            $taskInstallerText.Contains('-NoLogo -NoProfile -NonInteractive') -and
+            $taskInstallerText.Contains('$actionArguments += " -ExecutionPolicy Bypass"')
+        ) `
+        -Name "Runtime/05-NoInteractiveDependenciesUnderSystem" `
+        -Failure "під SYSTEM (S-1-5-18) не можна викликати Start-Process -Verb RunAs, а кожне заплановане завдання має отримувати -NoProfile/-NonInteractive/-NoPause; порушено в: $($interactiveFailures -join ', ')"
+
+    # --- Runtime/06: Task Scheduler action — абсолютні шляхи й SYSTEM ---
+    $bravoConfigTextForScheduler = $bravoConfigTextForTools
+    Test-BRAVOCondition `
+        -Condition (
+            [regex]::IsMatch($bravoConfigTextForScheduler, 'PowerShellExecutable\s*=\s*Join-Path\s+\$env:SystemRoot\s+"System32\\WindowsPowerShell\\v1\.0\\powershell\.exe"') -and
+            $taskInstallerText.Contains('$definition.Principal.RunLevel = 1') -and
+            $taskInstallerText.Contains('$action.WorkingDirectory = Split-Path -Path $scriptPath -Parent') -and
+            $taskInstallerText.Contains('$actionArguments += " -File `"$scriptPath`""') -and
+            $taskInstallerText.Contains('$actionArguments += " -ConfigPath `"$ResolvedConfigPath`""')
+        ) `
+        -Name "Runtime/06-SchedulerActionUsesAbsolutePathsAndHighest" `
+        -Failure "дія завдання має використовувати абсолютний powershell.exe, абсолютні -File/-ConfigPath, WorkingDirectory = каталог скрипта і RunLevel Highest"
+
+    # --- Runtime/07: diagnostics покриває всі production-завдання ---
+    Test-BRAVOCondition `
+        -Condition (
+            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync")') -and
+            $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
+            $tasksDiagnoseTextForRuntime.Contains('BAZASync    = @(''-NoPause'', ''-SyncBAZA'')') -and
+            $tasksDiagnoseTextForRuntime.Contains('Recovery    = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
+            $tasksDiagnoseTextForRuntime.Contains('LogonType=$($principal.LogonType), очікується ServiceAccount (5)') -and
+            $tasksDiagnoseTextForRuntime.Contains('RunLevel=$($principal.RunLevel), очікується Highest (1)')
+        ) `
+        -Name "Runtime/07-TaskDiagnosticsCoversAllProductionTasks" `
+        -Failure "діагностика має перевіряти визначення ВСІХ production-завдань, включно з BAZASync: SYSTEM/ServiceAccount/Highest, аргументи, -ConfigPath і WorkingDirectory"
+
+    # --- Runtime/08: SYSTEM preflight робить справжній probe запису ---
+    $dryRunProbeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $dryRunTextForRuntime `
+        -FunctionNames @(
+            'Test-BRAVOMappedNetworkDrivePath',
+            'Test-BRAVOFileSystemReadAccess',
+            'Test-BRAVOFileSystemWriteAccess'
+        )
+    $preflightTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_PREFLIGHT_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $missingDirectory = Join-Path $preflightTestRoot "created\by\probe"
+        $writeResult = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemWriteAccess -Path $Path
+        } $missingDirectory
+        $probeLeftovers = @(
+            Get-ChildItem -LiteralPath $missingDirectory -File -ErrorAction SilentlyContinue
+        )
+        $readMissing = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemReadAccess -Path $Path
+        } (Join-Path $preflightTestRoot "no-such-directory")
+        $readExisting = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOFileSystemReadAccess -Path $Path
+        } $missingDirectory
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$writeResult.Success -and
+                ([string]$writeResult.Detail).Contains('запис/читання/видалення підтверджено') -and
+                $probeLeftovers.Count -eq 0 -and
+                -not [bool]$readMissing.Success -and
+                [bool]$readExisting.Success -and
+                $dryRunTextForRuntime.Contains('[IO.File]::WriteAllBytes($probePath, $probeBytes)') -and
+                $dryRunTextForRuntime.Contains('$readBack = [IO.File]::ReadAllBytes($probePath)')
+            ) `
+            -Name "Runtime/08-SystemPreflightPerformsRealWriteProbe" `
+            -Failure "preflight має реально створювати, записувати, зчитувати назад і видаляти probe-файл: наявність каталогу не гарантує право запису під SYSTEM"
+
+        # --- Runtime/09: підключені мережеві диски як production-залежність ---
+        $networkDriveLetter = @(
+            [System.IO.DriveInfo]::GetDrives() |
+                Where-Object { $_.DriveType -eq [System.IO.DriveType]::Network } |
+                Select-Object -First 1
+        )
+        $mappedDriveDetected = if ($networkDriveLetter.Count -gt 0) {
+            & $dryRunProbeModule {
+                param($Path)
+                Test-BRAVOMappedNetworkDrivePath -Path $Path
+            } (Join-Path $networkDriveLetter[0].Name "BRAVO")
+        } else {
+            # На машині без мережевих дисків перевіряємо контракт функції:
+            # локальний шлях і UNC не повинні позначатись як mapped drive.
+            $true
+        }
+        $localNotFlagged = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOMappedNetworkDrivePath -Path $Path
+        } 'C:\BRAVO'
+        $uncNotFlagged = & $dryRunProbeModule {
+            param($Path)
+            Test-BRAVOMappedNetworkDrivePath -Path $Path
+        } '\\server\share\BRAVO'
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$mappedDriveDetected -and
+                -not [bool]$localNotFlagged -and
+                -not [bool]$uncNotFlagged -and
+                $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOMappedNetworkDrive') -and
+                $dryRunTextForRuntime.Contains('підключений мережевий диск')
+            ) `
+            -Name "Runtime/09-MappedNetworkDriveIsRejected" `
+            -Failure "буква підключеного мережевого диска не може бути production-залежністю (SYSTEM її не бачить); локальні шляхи й UNC при цьому мають лишатись дозволеними"
+    } finally {
+        if (Test-Path -LiteralPath $preflightTestRoot) {
+            Remove-Item -LiteralPath $preflightTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Runtime/10: preflight перевіряє читання й запис усіх коренів ---
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunTextForRuntime.Contains("'RuntimeRoot' = `$dryRunRuntimeRoot") -and
+            $dryRunTextForRuntime.Contains("'bravo.ini'   = [string]`$bravoDiscoveryResult.BravoIniPath") -and
+            $dryRunTextForRuntime.Contains("'ArchiveRoot'          = `$dryRunArchiveRoot") -and
+            $dryRunTextForRuntime.Contains("'BackupRoot'           = `$dryRunBackupRoot") -and
+            $dryRunTextForRuntime.Contains("'LOGS\Trace'           = (Join-Path `$dryRunLogRoot 'Trace')") -and
+            $dryRunTextForRuntime.Contains("'LOGS\exchangAPI'      = (Join-Path `$dryRunLogRoot 'exchangAPI')") -and
+            $dryRunTextForRuntime.Contains("'LOGS\BravoWeb\Apache' = (Join-Path `$dryRunBravoWebLogRoot 'Apache')")
+        ) `
+        -Name "Runtime/10-PreflightCoversAllRequiredRoots" `
+        -Failure "SYSTEM preflight має перевіряти читання RuntimeRoot/ConfigPath/modules/Tools/LIMSRoot/bravo.ini і запис ArchiveRoot/BackupRoot/LOGS та всіх каталогів призначення ротації"
+
+    # ===== РОТАЦІЯ, МІГРАЦІЯ ТА RETENTION ЖУРНАЛІВ: 27 сценаріїв
+    # (ТЗ «Production-grade ротація, міграція, архівація та retention
+    # логів BRAVO», §80-§102) =====
+    # Перевіряються на СПРАВЖНІХ файлах у тимчасовому каталозі, а не лише
+    # текстовим пошуком: нумерація, відсутність перезапису, звірка розміру
+    # після Move й ідемпотентність міграції — саме те, чого текстова
+    # перевірка підтвердити не може, а помилка в чому коштує журналів.
+    #
+    # Жоден сценарій не керує реальними службами (ТЗ §103): усе, що
+    # стосується BRAVO/Apache/exchangAPI, перевіряється на синтетичних
+    # об'єктах служб і на файлах у тимчасовому каталозі.
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Discovery\BRAVO.Discovery.psd1") -Force -ErrorAction Stop
+
+    $logRotationModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptText `
+        -FunctionNames @(
+            "Write-BRAVOLogRotationMessage",
+            "Get-BRAVONextLogSequence",
+            "Move-BRAVOLogWithSequence",
+            "New-BRAVOLogRotationSummary",
+            "Get-BRAVOExchangeApiLogFiles",
+            "Get-BRAVOApacheLogFiles",
+            "Get-BRAVOWebApplicationLogFiles",
+            "Write-BRAVOLogRotationSummary",
+            "New-BRAVOLogRotationItem",
+            "Invoke-BRAVOLogRotation",
+            "Invoke-BRAVOTraceRotation",
+            "Invoke-BRAVOExchangeApiLogRotation",
+            "Invoke-BRAVOApacheLogRotation",
+            "Invoke-BRAVOWebApplicationLogRotation",
+            "Get-BRAVOTraceConfiguration",
+            "Get-BRAVOLegacyLogMigrationPlan",
+            "Get-BRAVOFreeMigrationPath",
+            "Move-BRAVOLegacyLogFile",
+            "Remove-BRAVOEmptyLegacyDirectory",
+            "Invoke-BRAVOLegacyLogMigration",
+            "Remove-BRAVOExpiredCompressedLogs",
+            "Resolve-BRAVOExchangeApiRuntimeDirectory"
+        )
+
+    $rotationTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_LOG_ROTATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($rotationTestRoot)
+        $rotationLogMessages = New-Object System.Collections.Generic.List[string]
+        $rotationLogger = {
+            param($Message, $Level)
+            $rotationLogMessages.Add("[$Level] $Message")
+        }
+
+        function New-BRAVOLogRotationFixture {
+            param(
+                [string]$Directory,
+                [string]$Name,
+                [string]$Content = "log",
+                [Nullable[datetime]]$LastWriteTime
+            )
+
+            [void][IO.Directory]::CreateDirectory($Directory)
+            $path = Join-Path $Directory $Name
+            [IO.File]::WriteAllText($path, $Content, (New-Object Text.UTF8Encoding($false)))
+            if ($null -ne $LastWriteTime) {
+                (Get-Item -LiteralPath $path).LastWriteTime = [datetime]$LastWriteTime
+            }
+            return $path
+        }
+
+        function Get-BRAVOLogRotationNames {
+            param([string]$Directory)
+            return @(
+                Get-ChildItem -LiteralPath $Directory -File -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Name |
+                    Sort-Object
+            )
+        }
+
+        function Test-BRAVOLogRotationWarned {
+            param([object]$Messages)
+            return (@($Messages | Where-Object { $_.StartsWith("[WARNING]") }).Count -gt 0)
+        }
+
+        function New-BRAVOSyntheticBravoService {
+            param([string]$ExecutablePath)
+            return [pscustomobject]@{
+                Name = "BRAVO"
+                DisplayName = "BRAVO Service"
+                State = "Running"
+                StartMode = "Auto"
+                PathName = ('"{0}" -k runservice' -f $ExecutablePath)
+            }
+        }
+
+        function Invoke-BRAVORotationHelper {
+            param([scriptblock]$Body, [object[]]$Arguments = @())
+            return (& $logRotationModule $Body @Arguments)
+        }
+
+        # --- Test 1/2: bravo.ini визначається виключно архітектурою ОС ---
+        $iniPathOnX64 = Get-BRAVOSystemBravoIniPath -SystemRoot "C:\WindowsTest" -Is64BitOperatingSystem $true
+        $iniPathOnX86 = Get-BRAVOSystemBravoIniPath -SystemRoot "C:\WindowsTest" -Is64BitOperatingSystem $false
+        Test-BRAVOCondition `
+            -Condition ($iniPathOnX64 -eq "C:\WindowsTest\SysWOW64\bravo.ini") `
+            -Name "LogRotation/01-BravoIniPathOnX64" `
+            -Failure "на 64-бітній ОС очікуваний bravo.ini — рівно %SystemRoot%\SysWOW64\bravo.ini"
+        Test-BRAVOCondition `
+            -Condition ($iniPathOnX86 -eq "C:\WindowsTest\System32\bravo.ini") `
+            -Name "LogRotation/02-BravoIniPathOnX86" `
+            -Failure "на 32-бітній ОС очікуваний bravo.ini — рівно %SystemRoot%\System32\bravo.ini"
+
+        # --- Test 3: відсутній bravo.ini -> помилка з назвою шляху, без
+        # мовчазного fallback на каталог поруч із bravo.exe ---
+        $test3SystemRoot = Join-Path $rotationTestRoot "test03\Windows"
+        [void][IO.Directory]::CreateDirectory((Join-Path $test3SystemRoot "SysWOW64"))
+        $test3InstallDirectory = Join-Path $rotationTestRoot "test03\LIMS"
+        [void](New-BRAVOLogRotationFixture -Directory $test3InstallDirectory -Name "bravo.exe" -Content "exe")
+        # Пастка: поруч із bravo.exe лежить ЧУЖИЙ bravo.ini з іншим trace.
+        [void](New-BRAVOLogRotationFixture `
+            -Directory $test3InstallDirectory `
+            -Name "bravo.ini" `
+            -Content "[Debug]`r`nFILE=D:\WRONG\wrong.out`r`n")
+        $test3Discovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $test3InstallDirectory `
+            -Services @(New-BRAVOSyntheticBravoService -ExecutablePath (Join-Path $test3InstallDirectory "bravo.exe")) `
+            -SystemRoot $test3SystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$test3Discovery.BravoIniPath) -and
+                [string]$test3Discovery.Reasons.BravoIniPath -like "*SysWOW64\bravo.ini*" -and
+                [string]::IsNullOrWhiteSpace([string]$test3Discovery.TRACE_FILE)
+            ) `
+            -Name "LogRotation/03-NoFallbackToBravoExeDirectory" `
+            -Failure "за відсутності bravo.ini у системному каталозі має бути помилка з назвою перевіреного шляху, а не мовчазне читання чужого bravo.ini поруч із bravo.exe"
+
+        # --- Test 4: відносний [Debug]/FILE резолвиться від каталогу
+        # інсталяції BRAVO ---
+        $test4SystemRoot = Join-Path $rotationTestRoot "test04\Windows"
+        $test4InstallDirectory = Join-Path $rotationTestRoot "test04\LIMS-NEW"
+        [void](New-BRAVOLogRotationFixture -Directory $test4InstallDirectory -Name "bravo.exe" -Content "exe")
+        [void](New-BRAVOLogRotationFixture `
+            -Directory (Join-Path $test4SystemRoot "SysWOW64") `
+            -Name "bravo.ini" `
+            -Content "[model]`r`nMODEL=D:\LIMS\MODEL\lims`r`n[Debug]`r`nFILE= `"TraceSRV.out`" `r`n")
+        $test4Discovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $test4InstallDirectory `
+            -Services @(New-BRAVOSyntheticBravoService -ExecutablePath (Join-Path $test4InstallDirectory "bravo.exe")) `
+            -SystemRoot $test4SystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$test4Discovery.TRACE_FILE -eq (Join-Path $test4InstallDirectory "TraceSRV.out") -and
+                -not [bool]$test4Discovery.TRACE_FILE_OUTSIDE_INSTALLATION
+            ) `
+            -Name "LogRotation/04-RelativeTraceResolvedAgainstInstallation" `
+            -Failure "відносний [Debug]/FILE має резолвитись від каталогу інсталяції BRAVO (не від CWD, ArchiveRoot чи SysWOW64), із trim і знятими лапками"
+
+        # --- Test 5: trace поза каталогом інсталяції позначається ---
+        $test5SystemRoot = Join-Path $rotationTestRoot "test05\Windows"
+        $test5InstallDirectory = Join-Path $rotationTestRoot "test05\LIMS-NEW"
+        $test5OutsidePath = Join-Path $rotationTestRoot "test05\Elsewhere\BravoDebug.log"
+        [void](New-BRAVOLogRotationFixture -Directory $test5InstallDirectory -Name "bravo.exe" -Content "exe")
+        [void](New-BRAVOLogRotationFixture `
+            -Directory (Join-Path $test5SystemRoot "SysWOW64") `
+            -Name "bravo.ini" `
+            -Content "[Debug]`r`nFILE=$test5OutsidePath`r`n")
+        $test5Discovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $test5InstallDirectory `
+            -Services @(New-BRAVOSyntheticBravoService -ExecutablePath (Join-Path $test5InstallDirectory "bravo.exe")) `
+            -SystemRoot $test5SystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$test5Discovery.TRACE_FILE -eq $test5OutsidePath -and
+                [bool]$test5Discovery.TRACE_FILE_OUTSIDE_INSTALLATION
+            ) `
+            -Name "LogRotation/05-TraceOutsideInstallationIsFlagged" `
+            -Failure "trace поза каталогом інсталяції BRAVO має бути позначений у діагностиці, але не втрачений"
+
+        # --- Test 6: [Debug] без FILE -> помилка з назвами bravo.ini/[Debug]/FILE ---
+        $test6SystemRoot = Join-Path $rotationTestRoot "test06\Windows"
+        [void](New-BRAVOLogRotationFixture `
+            -Directory (Join-Path $test6SystemRoot "SysWOW64") `
+            -Name "bravo.ini" `
+            -Content "[model]`r`nMODEL=D:\LIMS\MODEL\lims`r`n[Debug]`r`n")
+        $test6Discovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $rotationTestRoot `
+            -Services @() `
+            -SystemRoot $test6SystemRoot `
+            -Is64BitOperatingSystem $true
+        $test6Configuration = Invoke-BRAVORotationHelper -Body {
+            param($DiscoveryResult, $TraceRoot, $DateFolder)
+            Get-BRAVOTraceConfiguration `
+                -DiscoveryResult $DiscoveryResult `
+                -TraceRootDirectory $TraceRoot `
+                -DateFolderName $DateFolder
+        } -Arguments @($test6Discovery, (Join-Path $rotationTestRoot "test06\Trace"), "2026-08-08")
+        $test6Reason = [string]$test6Configuration.Reason
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$test6Configuration.IsValid -and
+                $test6Reason.Contains("bravo.ini") -and
+                $test6Reason.Contains("[Debug]") -and
+                $test6Reason.Contains("FILE")
+            ) `
+            -Name "LogRotation/06-MissingDebugFileIsConfigurationError" `
+            -Failure "без ключа FILE у секції [Debug] має бути помилка конфігурації, у якій названо і bravo.ini, і [Debug], і FILE"
+
+        # --- Test 7: Trace MAX+1, а не перший вільний номер ---
+        $test7Source = Join-Path $rotationTestRoot "test07\src"
+        $test7Destination = Join-Path $rotationTestRoot "test07\dst"
+        foreach ($existingName in @("TraceSRV_1.out", "TraceSRV_2.out", "TraceSRV_5.out")) {
+            [void](New-BRAVOLogRotationFixture -Directory $test7Destination -Name $existingName)
+        }
+        $test7TracePath = New-BRAVOLogRotationFixture -Directory $test7Source -Name "TraceSRV.out" -Content "trace"
+        $test7Summary = Invoke-BRAVORotationHelper -Body {
+            param($TracePath, $Destination, $Logger)
+            Invoke-BRAVOTraceRotation `
+                -TracePath $TracePath `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test7TracePath, $test7Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath (Join-Path $test7Destination "TraceSRV_6.out")) -and
+                [int]$test7Summary.Moved -eq 1
+            ) `
+            -Name "LogRotation/07-TraceMaxPlusOne" `
+            -Failure "за наявних _1/_2/_5 наступним має бути _6 (MAX+1), а не _3 (перший вільний номер)"
+
+        # --- Test 8: порожній Trace лишається в джерелі ---
+        $test8Source = Join-Path $rotationTestRoot "test08\src"
+        $test8Destination = Join-Path $rotationTestRoot "test08\dst"
+        $test8TracePath = New-BRAVOLogRotationFixture -Directory $test8Source -Name "TraceSRV.out" -Content ""
+        $test8Summary = Invoke-BRAVORotationHelper -Body {
+            param($TracePath, $Destination, $Logger)
+            Invoke-BRAVOTraceRotation `
+                -TracePath $TracePath `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test8TracePath, $test8Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath $test8TracePath) -and
+                [int]$test8Summary.Empty -eq 1 -and
+                [int]$test8Summary.Moved -eq 0 -and
+                [int]$test8Summary.Errors -eq 0 -and
+                @(Get-BRAVOLogRotationNames -Directory $test8Destination).Count -eq 0
+            ) `
+            -Name "LogRotation/08-EmptyTraceRemainsInSource" `
+            -Failure "порожній trace не переміщується, не видаляється й не створює файл призначення"
+
+        # --- Test 9: відсутній Trace -> діагностика без фейкового файла ---
+        $rotationLogMessages.Clear()
+        $test9Destination = Join-Path $rotationTestRoot "test09\dst"
+        $test9TracePath = Join-Path $rotationTestRoot "test09\src\TraceSRV.out"
+        $test9Summary = Invoke-BRAVORotationHelper -Body {
+            param($TracePath, $Destination, $Logger)
+            Invoke-BRAVOTraceRotation `
+                -TracePath $TracePath `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test9TracePath, $test9Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test9Summary.Errors -eq 0 -and
+                [int]$test9Summary.Moved -eq 0 -and
+                -not (Test-Path -LiteralPath $test9TracePath) -and
+                @($rotationLogMessages | Where-Object { $_ -like "*ще не створено*" }).Count -gt 0
+            ) `
+            -Name "LogRotation/09-AbsentTraceIsDiagnosticOnly" `
+            -Failure "відсутній trace дає діагностичне повідомлення, не помилку і не створює фейкове джерело"
+
+        # --- Test 10: обидва шаблони exchangAPI + дедуплікація за FullName ---
+        $test10Source = Join-Path $rotationTestRoot "test10\src"
+        foreach ($sourceName in @("exchangAPI.log", "exchangAPI_1.log", "exchangAPI_2.log")) {
+            [void](New-BRAVOLogRotationFixture -Directory $test10Source -Name $sourceName -Content "x")
+        }
+        $test10Files = @(Invoke-BRAVORotationHelper -Body {
+            param($Directory)
+            Get-BRAVOExchangeApiLogFiles -Directory $Directory -Patterns @("exchangAPI_*.log", "exchangAPI*.log")
+        } -Arguments @($test10Source))
+        Test-BRAVOCondition `
+            -Condition (
+                $test10Files.Count -eq 3 -and
+                @($test10Files | Select-Object -ExpandProperty FullName -Unique).Count -eq 3
+            ) `
+            -Name "LogRotation/10-ExchangeApiDualPatternDeduplicated" `
+            -Failure "exchangAPI шукається за обома шаблонами, але exchangAPI_1.log відповідає обом — після merge має лишитись 3 унікальні файли, а не 5"
+
+        # --- Test 11: номер джерела exchangAPI ігнорується ---
+        $test11Source = Join-Path $rotationTestRoot "test11\src"
+        $test11Destination = Join-Path $rotationTestRoot "test11\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test11Source -Name "exchangAPI_25.log" -Content "x")
+        foreach ($existingName in @("exchangAPI_1.log", "exchangAPI_2.log", "exchangAPI_9.log")) {
+            [void](New-BRAVOLogRotationFixture -Directory $test11Destination -Name $existingName)
+        }
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOExchangeApiLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test11Source, $test11Destination, $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_10.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_25.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_25_1.log"))
+            ) `
+            -Name "LogRotation/11-ExchangeApiSourceSequenceIgnored" `
+            -Failure "exchangAPI_25.log має стати exchangAPI_10.log (MAX+1 у призначенні), а не зберегти власний номер чи стати exchangAPI_25_1.log"
+
+        # --- Test 12: кілька файлів exchangAPI у стабільному порядку ---
+        $test12Source = Join-Path $rotationTestRoot "test12\src"
+        $test12Destination = Join-Path $rotationTestRoot "test12\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test12Source -Name "exchangAPI.log" -Content "first" -LastWriteTime ([datetime]"2026-08-08T10:00:00"))
+        [void](New-BRAVOLogRotationFixture -Directory $test12Source -Name "exchangAPI_1.log" -Content "second" -LastWriteTime ([datetime]"2026-08-08T11:00:00"))
+        [void](New-BRAVOLogRotationFixture -Directory $test12Source -Name "exchangAPI_error.log" -Content "third" -LastWriteTime ([datetime]"2026-08-08T12:00:00"))
+        foreach ($existingName in @("exchangAPI_1.log", "exchangAPI_2.log", "exchangAPI_5.log")) {
+            [void](New-BRAVOLogRotationFixture -Directory $test12Destination -Name $existingName)
+        }
+        $test12Summary = Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOExchangeApiLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test12Source, $test12Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test12Summary.Moved -eq 3 -and
+                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_6.log")) -eq "first" -and
+                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_7.log")) -eq "second" -and
+                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_8.log")) -eq "third"
+            ) `
+            -Name "LogRotation/12-ExchangeApiStableSourceOrder" `
+            -Failure "три файли exchangAPI мають отримати _6/_7/_8 у стабільному порядку (LastWriteTime ASC, потім Name ASC)"
+
+        # --- Test 13: Apache бере лише журнали й не заходить у підкаталоги ---
+        $test13Source = Join-Path $rotationTestRoot "test13\src"
+        $test13Destination = Join-Path $rotationTestRoot "test13\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test13Source -Name "access.log" -Content "a")
+        [void](New-BRAVOLogRotationFixture -Directory $test13Source -Name "error.log" -Content "e")
+        [void](New-BRAVOLogRotationFixture -Directory $test13Source -Name "httpd.pid" -Content "1234")
+        [void](New-BRAVOLogRotationFixture -Directory $test13Source -Name "worker.lock" -Content "l")
+        [void](New-BRAVOLogRotationFixture -Directory $test13Source -Name "temp.tmp" -Content "t")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test13Source "old") -Name "nested.log" -Content "n")
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOApacheLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test13Source, $test13Destination, $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                ((Get-BRAVOLogRotationNames -Directory $test13Destination) -join ",") -eq "access_1.log,error_1.log" -and
+                ((Get-BRAVOLogRotationNames -Directory $test13Source) -join ",") -eq "httpd.pid,temp.tmp,worker.lock" -and
+                (Test-Path -LiteralPath (Join-Path $test13Source "old\nested.log"))
+            ) `
+            -Name "LogRotation/13-ApacheFiltersServiceFilesAndStaysFlat" `
+            -Failure "Apache має брати лише *.log безпосередньо з apache\logs: httpd.pid/*.lock/*.tmp і вкладені каталоги лишаються недоторканими"
+
+        # --- Test 14: незалежні послідовності Apache і пропуски в нумерації ---
+        $test14Source = Join-Path $rotationTestRoot "test14\src"
+        $test14Destination = Join-Path $rotationTestRoot "test14\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test14Source -Name "access.log" -Content "a")
+        [void](New-BRAVOLogRotationFixture -Directory $test14Source -Name "error.log" -Content "e")
+        [void](New-BRAVOLogRotationFixture -Directory $test14Source -Name "ssl_error.log" -Content "s")
+        foreach ($existingName in @("access_1.log", "access_3.log", "access_10.log", "error_1.log", "error_9.log")) {
+            [void](New-BRAVOLogRotationFixture -Directory $test14Destination -Name $existingName)
+        }
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOApacheLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test14Source, $test14Destination, $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath (Join-Path $test14Destination "access_11.log")) -and
+                (Test-Path -LiteralPath (Join-Path $test14Destination "error_10.log")) -and
+                (Test-Path -LiteralPath (Join-Path $test14Destination "ssl_error_1.log"))
+            ) `
+            -Name "LogRotation/14-IndependentSequencesAndGapsNeverReused" `
+            -Failure "кожне ім'я має власну послідовність, а пропуски не перевикористовуються: access->_11 (числове порівняння), error->_10, ssl_error->_1"
+
+        # --- Test 15: BRAVO Web зберігає відносну структуру каталогів ---
+        $test15Source = Join-Path $rotationTestRoot "test15\src"
+        $test15Destination = Join-Path $rotationTestRoot "test15\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test15Source -Name "bravoexec.log" -Content "b")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test15Source "API") -Name "request.log" -Content "api")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test15Source "Integration\API") -Name "request.log" -Content "integration")
+        $test15Summary = Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOWebApplicationLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test15Source, $test15Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test15Summary.Moved -eq 3 -and
+                (Test-Path -LiteralPath (Join-Path $test15Destination "bravoexec_1.log")) -and
+                [IO.File]::ReadAllText((Join-Path $test15Destination "API\request_1.log")) -eq "api" -and
+                [IO.File]::ReadAllText((Join-Path $test15Destination "Integration\API\request_1.log")) -eq "integration"
+            ) `
+            -Name "LogRotation/15-BravoWebRecursivePreservesStructure" `
+            -Failure "www\log обходиться рекурсивно зі збереженням відносної структури: однакові імена в різних гілках не повинні колізувати"
+
+        # --- Test 16: незалежна послідовність у кожному підкаталозі ---
+        $test16Source = Join-Path $rotationTestRoot "test16\src"
+        $test16Destination = Join-Path $rotationTestRoot "test16\dst"
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test16Source "API") -Name "request.log" -Content "api")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test16Source "Integration\API") -Name "request.log" -Content "integration")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test16Destination "API") -Name "request_1.log" -Content "old-api")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test16Destination "API") -Name "request_2.log" -Content "old-api-2")
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOWebApplicationLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test16Source, $test16Destination, $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                [IO.File]::ReadAllText((Join-Path $test16Destination "API\request_3.log")) -eq "api" -and
+                [IO.File]::ReadAllText((Join-Path $test16Destination "Integration\API\request_1.log")) -eq "integration" -and
+                [IO.File]::ReadAllText((Join-Path $test16Destination "API\request_1.log")) -eq "old-api"
+            ) `
+            -Name "LogRotation/16-SequencePerRelativeDirectory" `
+            -Failure "послідовність рахується окремо для кожного відносного каталогу призначення: API\request_3.log і Integration\API\request_1.log"
+
+        # --- Test 17: порожній application log лишається в джерелі ---
+        $test17Source = Join-Path $rotationTestRoot "test17\src"
+        $test17Destination = Join-Path $rotationTestRoot "test17\dst"
+        $test17EmptyPath = New-BRAVOLogRotationFixture -Directory $test17Source -Name "errornum.log" -Content ""
+        $test17Summary = Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOWebApplicationLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test17Source, $test17Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test17Summary.Empty -eq 1 -and
+                [int]$test17Summary.Moved -eq 0 -and
+                [int]$test17Summary.Errors -eq 0 -and
+                (Test-Path -LiteralPath $test17EmptyPath)
+            ) `
+            -Name "LogRotation/17-EmptyApplicationLogSkipped" `
+            -Failure "порожній application log лишається в джерелі, не отримує номера й не є помилкою"
+
+        # --- Test 18: жодного перезапису наявного журналу ---
+        $test18Source = Join-Path $rotationTestRoot "test18\src"
+        $test18Destination = Join-Path $rotationTestRoot "test18\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test18Source -Name "access.log" -Content "new-content")
+        [void](New-BRAVOLogRotationFixture -Directory $test18Destination -Name "access_1.log" -Content "must-survive")
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOApacheLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test18Source, $test18Destination, $rotationLogger))
+        $moveWithSequenceBody = [regex]::Match(
+            $maintenanceScriptText,
+            '(?s)function Move-BRAVOLogWithSequence \{.*?\r?\n\}'
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                [IO.File]::ReadAllText((Join-Path $test18Destination "access_1.log")) -eq "must-survive" -and
+                [IO.File]::ReadAllText((Join-Path $test18Destination "access_2.log")) -eq "new-content" -and
+                $moveWithSequenceBody.Success -and
+                $moveWithSequenceBody.Value -notmatch 'Move-Item[^\r\n]*-Force'
+            ) `
+            -Name "LogRotation/18-NoOverwriteOfExistingLog" `
+            -Failure "наявний файл призначення не можна перезаписувати: потрібен новий MAX+1 і жодного Move-Item -Force"
+
+        # --- Test 19: структурований результат і перевірка після move ---
+        $test19Source = Join-Path $rotationTestRoot "test19\src"
+        $test19Destination = Join-Path $rotationTestRoot "test19\dst"
+        $test19Content = "payload-0123456789"
+        $test19SourcePath = New-BRAVOLogRotationFixture -Directory $test19Source -Name "firm.log" -Content $test19Content
+        [void](New-BRAVOLogRotationFixture -Directory $test19Destination -Name "firm_4.log")
+        $test19Result = Invoke-BRAVORotationHelper -Body {
+            param($SourcePath, $Destination, $Logger)
+            Move-BRAVOLogWithSequence `
+                -SourcePath $SourcePath `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test19SourcePath, $test19Destination, $rotationLogger)
+        $test19ExpectedSize = [Text.Encoding]::UTF8.GetByteCount($test19Content)
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$test19Result.Status -eq "MOVED" -and
+                [int]$test19Result.Sequence -eq 5 -and
+                [int]$test19Result.Attempts -eq 1 -and
+                [int64]$test19Result.SourceSize -eq $test19ExpectedSize -and
+                [int64]$test19Result.DestinationSize -eq $test19ExpectedSize -and
+                -not (Test-Path -LiteralPath $test19SourcePath) -and
+                (Test-Path -LiteralPath ([string]$test19Result.DestinationPath))
+            ) `
+            -Name "LogRotation/19-StructuredResultAndPostMoveValidation" `
+            -Failure "результат move має містити Status/Sequence/Attempts/SourceSize/DestinationSize, а сам move — підтверджуватись відсутністю джерела, наявністю призначення й збігом розміру"
+
+        # --- Test 20: журнал показує початкове й кінцеве ім'я, зокрема з підкаталогом ---
+        $rotationLogMessages.Clear()
+        $test20Source = Join-Path $rotationTestRoot "test20\src"
+        $test20Destination = Join-Path $rotationTestRoot "test20\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test20Source -Name "exchangAPI_2.log" -Content "x")
+        foreach ($existingName in @("exchangAPI_1.log", "exchangAPI_5.log")) {
+            [void](New-BRAVOLogRotationFixture -Directory $test20Destination -Name $existingName)
+        }
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOExchangeApiLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test20Source, $test20Destination, $rotationLogger))
+        $test20NestedSource = Join-Path $rotationTestRoot "test20\web"
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test20NestedSource "API") -Name "request.log" -Content "api")
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOWebApplicationLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test20NestedSource, (Join-Path $rotationTestRoot "test20\webdst"), $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                @($rotationLogMessages | Where-Object {
+                    $_ -eq "[SUCCESS] Переміщено exchangAPI_2.log -> exchangAPI_6.log"
+                }).Count -eq 1 -and
+                @($rotationLogMessages | Where-Object {
+                    $_ -eq "[SUCCESS] Переміщено API\request.log -> API\request_1.log"
+                }).Count -eq 1
+            ) `
+            -Name "LogRotation/20-MoveLogShowsBothNames" `
+            -Failure "успішне переміщення має показувати початкове І кінцеве ім'я, а для вкладених журналів — разом із відносним каталогом"
+
+        # --- Test 21: агрегована статистика компонента ---
+        $rotationLogMessages.Clear()
+        $test21Source = Join-Path $rotationTestRoot "test21\src"
+        $test21Destination = Join-Path $rotationTestRoot "test21\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test21Source -Name "access.log" -Content "a")
+        [void](New-BRAVOLogRotationFixture -Directory $test21Source -Name "error.log" -Content "")
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($Source, $Destination, $Logger)
+            Invoke-BRAVOApacheLogRotation `
+                -SourceDirectory $Source `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test21Source, $test21Destination, $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                @($rotationLogMessages | Where-Object {
+                    $_ -eq "[SUCCESS] Apache: знайдено: 2, непорожніх: 1, переміщено: 1, порожніх: 1, пропущено: 1, помилок: 0"
+                }).Count -eq 1
+            ) `
+            -Name "LogRotation/21-AggregatedSummaryIsLogged" `
+            -Failure "кожен компонент має завершуватись агрегованим рядком «знайдено/непорожніх/переміщено/порожніх/пропущено/помилок»"
+
+        # --- Test 22: робочий каталог exchangAPI (NSSM і Win32_Service) ---
+        $test22NssmResult = Invoke-BRAVORotationHelper -Body {
+            param($ServiceInstance, $NssmParameters)
+            Resolve-BRAVOExchangeApiRuntimeDirectory `
+                -ServiceName "exchangAPI" `
+                -FallbackDirectory "D:\LIMS-FALLBACK" `
+                -ServiceInstance $ServiceInstance `
+                -NssmParameters $NssmParameters
+        } -Arguments @(
+            [pscustomobject]@{ PathName = '"C:\nssm\nssm.exe"' },
+            @{ Application = "D:\LIMS-NEW\exchangAPI.exe"; AppDirectory = "D:\LIMS-NEW\" }
+        )
+        $test22ServiceResult = Invoke-BRAVORotationHelper -Body {
+            param($ServiceInstance, $NssmParameters)
+            Resolve-BRAVOExchangeApiRuntimeDirectory `
+                -ServiceName "exchangAPI" `
+                -FallbackDirectory "D:\LIMS-FALLBACK" `
+                -ServiceInstance $ServiceInstance `
+                -NssmParameters $NssmParameters
+        } -Arguments @(
+            [pscustomobject]@{ PathName = '"D:\LIMS-NEW\exchangAPI.exe" -k runservice' },
+            @{}
+        )
+        $test22FallbackResult = Invoke-BRAVORotationHelper -Body {
+            param($ServiceInstance, $NssmParameters)
+            Resolve-BRAVOExchangeApiRuntimeDirectory `
+                -ServiceName "exchangAPI" `
+                -FallbackDirectory "D:\LIMS-FALLBACK" `
+                -ServiceInstance $ServiceInstance `
+                -NssmParameters $NssmParameters
+        } -Arguments @([pscustomobject]@{ PathName = "" }, @{})
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$test22NssmResult.Directory -eq "D:\LIMS-NEW" -and
+                [string]$test22ServiceResult.Directory -eq "D:\LIMS-NEW" -and
+                [string]$test22FallbackResult.Directory -eq "D:\LIMS-FALLBACK" -and
+                ([string]$test22FallbackResult.Reason).Contains("fallback")
+            ) `
+            -Name "LogRotation/22-ExchangeApiRuntimeDirectoryResolution" `
+            -Failure "робочий каталог exchangAPI: NSSM AppDirectory має пріоритет, інакше Win32_Service.PathName, і лише потім явно позначений fallback"
+
+        # --- Test 23: міграція legacy-каталогів, ідемпотентна ---
+        $test23ArchiveRoot = Join-Path $rotationTestRoot "test23\ARCHIV"
+        $test23LogRoot = Join-Path $test23ArchiveRoot "LOGS"
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test23ArchiveRoot "Trace\2026-07-01") -Name "TraceSRV_000001.out" -Content "old-trace")
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test23ArchiveRoot "Trace") -Name "Trace_2026-06-01.mdz" -Content "archive")
+        [void](New-BRAVOLogRotationFixture `
+            -Directory (Join-Path $test23ArchiveRoot "exchangAPI") `
+            -Name "exchangAPI_3.log" `
+            -Content "legacy-loose" `
+            -LastWriteTime ([datetime]"2026-07-05T09:00:00"))
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test23ArchiveRoot "Br-a-vo.web\2026-07-02") -Name "access_000001.log" -Content "web")
+        $test23Plan = @(Invoke-BRAVORotationHelper -Body {
+            param($ArchiveRoot, $LogRoot)
+            Get-BRAVOLegacyLogMigrationPlan -ArchiveRoot $ArchiveRoot -LogRoot $LogRoot
+        } -Arguments @($test23ArchiveRoot, $test23LogRoot))
+        foreach ($migrationPass in @(1, 2)) {
+            foreach ($planEntry in $test23Plan) {
+                [void](Invoke-BRAVORotationHelper -Body {
+                    param($Entry, $Logger)
+                    Invoke-BRAVOLegacyLogMigration `
+                        -LegacyPath $Entry.LegacyPath `
+                        -DestinationPath $Entry.DestinationPath `
+                        -LogicalBaseName ([string]$Entry.LogicalBaseName) `
+                        -RetryCount 1 `
+                        -RetryDelaySeconds 0 `
+                        -Logger $Logger
+                } -Arguments @($planEntry, $rotationLogger))
+            }
+        }
+        $test23MigratedFiles = @(
+            Get-ChildItem -LiteralPath $test23LogRoot -Recurse -File -ErrorAction SilentlyContinue |
+                Select-Object -ExpandProperty Name |
+                Sort-Object
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath (Join-Path $test23LogRoot "Trace\2026-07-01\TraceSRV_000001.out")) -and
+                (Test-Path -LiteralPath (Join-Path $test23LogRoot "Trace\Trace_2026-06-01.mdz")) -and
+                (Test-Path -LiteralPath (Join-Path $test23LogRoot "exchangAPI\2026-07-05\exchangAPI_1.log")) -and
+                (Test-Path -LiteralPath (Join-Path $test23LogRoot "BravoWeb\2026-07-02\access_000001.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test23ArchiveRoot "Trace")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test23ArchiveRoot "exchangAPI")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test23ArchiveRoot "Br-a-vo.web")) -and
+                $test23MigratedFiles.Count -eq 4
+            ) `
+            -Name "LogRotation/23-LegacyMigrationIsIdempotent" `
+            -Failure "legacy-каталоги мають мігрувати під LOGS зі збереженням структури (плоскі журнали — у каталог-дату за LastWriteTime), а повторний запуск не повинен створювати дублікатів"
+
+        # --- Test 24: часткова невдача міграції зберігає джерело ---
+        $test24ArchiveRoot = Join-Path $rotationTestRoot "test24\ARCHIV"
+        $test24LogRoot = Join-Path $test24ArchiveRoot "LOGS"
+        $test24LegacyPath = Join-Path $test24ArchiveRoot "Trace"
+        [void](New-BRAVOLogRotationFixture -Directory (Join-Path $test24LegacyPath "2026-07-01") -Name "TraceSRV_1.out" -Content "movable")
+        $test24LockedPath = New-BRAVOLogRotationFixture -Directory (Join-Path $test24LegacyPath "2026-07-01") -Name "TraceSRV_2.out" -Content "locked"
+        $test24LockStream = [IO.File]::Open($test24LockedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+        try {
+            $test24Result = Invoke-BRAVORotationHelper -Body {
+                param($LegacyPath, $DestinationPath, $Logger)
+                Invoke-BRAVOLegacyLogMigration `
+                    -LegacyPath $LegacyPath `
+                    -DestinationPath $DestinationPath `
+                    -RetryCount 1 `
+                    -RetryDelaySeconds 0 `
+                    -Logger $Logger
+            } -Arguments @($test24LegacyPath, (Join-Path $test24LogRoot "Trace"), $rotationLogger)
+        } finally {
+            $test24LockStream.Dispose()
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test24Result.Failed -ge 1 -and
+                [int]$test24Result.Migrated -ge 1 -and
+                -not [bool]$test24Result.LegacyRemoved -and
+                (Test-Path -LiteralPath $test24LockedPath) -and
+                (Test-Path -LiteralPath (Join-Path $test24LogRoot "Trace\2026-07-01\TraceSRV_1.out"))
+            ) `
+            -Name "LogRotation/24-PartialMigrationRetainsSource" `
+            -Failure "при частковій невдачі міграції невдалий файл і legacy-каталог мають лишитись для наступного запуску, а успішні — залишитись мігрованими"
+
+        # --- Test 25: CompressedLogDays — окрема політика для .mdz ---
+        $test25Path = Join-Path $rotationTestRoot "test25\Trace"
+        $test25FreshDate = (Get-Date).AddDays(-100).ToString("yyyy-MM-dd")
+        $test25ExpiredDate = (Get-Date).AddDays(-200).ToString("yyyy-MM-dd")
+        [void](New-BRAVOLogRotationFixture -Directory $test25Path -Name "Trace_$test25FreshDate.mdz" -Content "fresh")
+        [void](New-BRAVOLogRotationFixture -Directory $test25Path -Name "Trace_$test25ExpiredDate.mdz" -Content "expired")
+        [void](New-BRAVOLogRotationFixture -Directory $test25Path -Name "Apache_$test25ExpiredDate.mdz" -Content "foreign")
+        [void](New-BRAVOLogRotationFixture -Directory $test25Path -Name "Trace_backup.mdz" -Content "no-date")
+        $test25Result = Invoke-BRAVORotationHelper -Body {
+            param($Path, $Logger)
+            Remove-BRAVOExpiredCompressedLogs `
+                -Path $Path `
+                -ArchiveNamePrefix "Trace" `
+                -RetentionDays 180 `
+                -Logger $Logger
+        } -Arguments @($test25Path, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test25Result.Deleted -eq 1 -and
+                (Test-Path -LiteralPath (Join-Path $test25Path "Trace_$test25FreshDate.mdz")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test25Path "Trace_$test25ExpiredDate.mdz")) -and
+                (Test-Path -LiteralPath (Join-Path $test25Path "Apache_$test25ExpiredDate.mdz")) -and
+                (Test-Path -LiteralPath (Join-Path $test25Path "Trace_backup.mdz"))
+            ) `
+            -Name "LogRotation/25-CompressedLogDaysRetention" `
+            -Failure "CompressedLogDays видаляє лише .mdz власного компонента, старші за строк: 100-денний лишається, 200-денний видаляється, чужі й недатовані архіви не чіпаються"
+
+        # --- Test 26: цільова структура, конфігурація і нерекурсивний cleanup ---
+        $removeOldLogFilesBody = [regex]::Match(
+            $maintenanceScriptText,
+            '(?s)function Remove-OldLogFiles \{.*?\r?\n\}'
+        )
+        $removeOldLogFilesCallTargets = @(
+            [regex]::Matches($maintenanceScriptText, 'Remove-OldLogFiles -Path (\$\w+)') |
+                ForEach-Object { $_.Groups[1].Value } |
+                Where-Object { $_ -ne '$LOG_DIR' }
+        )
+        $bravoConfigTextForRetention = [IO.File]::ReadAllText($resolvedConfig, [Text.Encoding]::UTF8)
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceScriptText.Contains('$TRACE_DIR = Join-Path $LOG_DIR "Trace"') -and
+                $maintenanceScriptText.Contains('$EXCHANGE_LOG_DIR = Join-Path $LOG_DIR "exchangAPI"') -and
+                $maintenanceScriptText.Contains('$APACHE_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Apache"') -and
+                $maintenanceScriptText.Contains('$BRAVOWEB_APP_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Application"') -and
+                $bravoConfigTextForRetention -match 'CompressedLogDays\s*=\s*\d+' -and
+                $maintenanceScriptText.Contains('$COMPRESSED_LOG_RETENTION_DAYS') -and
+                $removeOldLogFilesBody.Success -and
+                $removeOldLogFilesBody.Value -notmatch '-Recurse' -and
+                $removeOldLogFilesBody.Value.Contains('BRAVO_MAINTENANCE_*.log') -and
+                $removeOldLogFilesBody.Value -notmatch '"\*\.log"' -and
+                $removeOldLogFilesCallTargets.Count -eq 0
+            ) `
+            -Name "LogRotation/26-LayoutRetentionSettingsAndNonRecursiveCleanup" `
+            -Failure "структура LOGS\{Trace,exchangAPI,BravoWeb\{Apache,Application}}, окремий CompressedLogDays у BRAVO.config і нерекурсивне whitelist-очищення тільки верхнього рівня LOGS"
+
+        # --- Test 27: відновлення служб не залежить від помилок ротації ---
+        # Реальні служби не чіпаємо (ТЗ §103) — перевіряємо структуру:
+        # уся ротація живе всередині try, а запуск служб — у finally, тому
+        # жодна помилка ротації не може залишити production зупиненим.
+        $serviceRestoreBlockIndex = $maintenanceScriptText.IndexOf('=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ===')
+        $finallyIndex = $maintenanceScriptText.LastIndexOf('} finally {', $serviceRestoreBlockIndex)
+        $rotationIndex = $maintenanceScriptText.IndexOf('=== ОБРОБКА TRACE-ФАЙЛІВ ===')
+        Test-BRAVOCondition `
+            -Condition (
+                $serviceRestoreBlockIndex -gt 0 -and
+                $finallyIndex -gt 0 -and
+                $rotationIndex -gt 0 -and
+                $rotationIndex -lt $finallyIndex -and
+                $maintenanceScriptText.Contains('$serviceWasRunning') -and
+                $maintenanceScriptText.Contains('if ($serviceWasRunning.ExchangeApi) {') -and
+                $maintenanceScriptText.Contains('if ($serviceWasRunning.BravoWeb) {')
+            ) `
+            -Name "LogRotation/27-ServiceRestorationIsIndependentOfRotation" `
+            -Failure "ротація має виконуватись усередині try, а відновлення служб — у finally за збереженим початковим станом: помилка ротації не може залишити служби зупиненими"
+    } finally {
+        if (Test-Path -LiteralPath $rotationTestRoot) {
+            Remove-Item -LiteralPath $rotationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # ===== ОПЕРАЦІЙНА КОНСОЛЬ: 21 сценарій (Завдання_ реалізувати
     # уніфікований Operator Console UX для BRAVO.md, §20) =====

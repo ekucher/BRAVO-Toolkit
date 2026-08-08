@@ -346,8 +346,9 @@ try {
     . $loaderPath
 
     Import-BravoConfiguration `
-        -ConfigRoot $bravoScriptDirectory `
-        -ConfigPath $ConfigPath
+        -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
+        -ConfigPath $ConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
 
     $ConfigPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     if ($null -ne $credentialSettings) {

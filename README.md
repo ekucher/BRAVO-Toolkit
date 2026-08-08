@@ -1,4 +1,4 @@
-# BRAVO 4.5.0-dev.1 — архівація, обслуговування та контроль резервних копій
+﻿# BRAVO 4.5.0-dev.3 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -117,38 +117,77 @@ Health при цьому не просто попереджає: він проп
 Це **не** контроль безпеки й не еталон: якщо хеш у ньому розійшовся,
 рішення ухвалює `TOOLS_MANIFEST.json`.
 
-## 2. Рекомендована структура каталогів
+## 2. Чотири корені: код окремо, дані окремо
+
+**CODE IS NOT DATA.** Комплект, LIMS, операційні журнали й резервні копії —
+чотири незалежні поняття. Жодне з них не виводиться з фізичного розташування
+іншого, і всі чотири можуть бути на різних дисках.
+
+| Корінь | Що це | Звідки береться |
+|---|---|---|
+| `RuntimeRoot` | сам комплект: скрипти, `modules\`, `Tools\`, `VERSION.json`, `RUNTIME_MANIFEST.json` | каталог запущеного скрипта (`$PSScriptRoot`) |
+| `LIMSRoot` | інсталяція LIMS/BRAVO: `bravo.exe`, `Model`, `bravoexch` | `pathSettings.LIMSRoot`, задається явно |
+| `ArchiveRoot` | операційні журнали й службові архіви (`LOGS\` і все під ним) | `pathSettings.ArchiveRoot`, задається явно |
+| `BackupRoot` | резервні копії MODEL/BLOG/BRAVOEXCH/BAZA | `pathSettings.BackupRoot`, задається явно |
+
+Від `RuntimeRoot` залежать **лише** ресурси комплекту. Виробничі корені даних
+не мають дефолтів: порожнє, відносне або некоректне значення — помилка
+конфігурації з назвою параметра, а не мовчазний здогад.
+
+Приклад розгортання на різних дисках:
 
 ```text
-C:\LIMS\
-├── Model\                 джерело MODEL
-├── BLOG\                  джерело BLOG
-├── BAZA\                  джерело BAZA, якщо ввімкнено
-└── ARCHIV\
-    ├── README.md, SECURITY.md, CHANGELOG.md, RELEASE_CHECKLIST.md
-    ├── VERSION.json
-    ├── BRAVO.config
-    ├── BRAVO_ARCHIV.ps1, BRAVO_MAINTENANCE.ps1, BRAVO_HEALTH.ps1
-    ├── BRAVO_SETUP.ps1, BRAVO_DRY_RUN.ps1, BRAVO_SELF_TEST.ps1
-    ├── BRAVO_CREDENTIALS_SETUP.ps1, BRAVO_TASKS_INSTALL.ps1,
-    │   BRAVO_TASKS_UNINSTALL.ps1, BRAVO_TASKS_DIAGNOSE.ps1
-    ├── modules\             спільні PowerShell-модулі (розділ 13)
-    ├── Tools\
-    │   ├── 7za.exe
-    │   ├── WinSCP.com
-    │   ├── WinSCP.exe
-    │   └── WinSCPnet.dll
-    ├── LOGS\              створюється автоматично
-    ├── MODEL\             локальні архіви
-    ├── BLOG\
-    ├── BRAVOEXCH\
-    ├── BAZA\              локальна копія BAZA_APP, якщо ввімкнено (BAZA_APP_LOCAL)
-    └── BAZA_WWW\          локальна копія BAZA_WWW, якщо ввімкнено (BAZA_WWW_LOCAL)
+C:\BRAVO\                          RuntimeRoot — комплект
+├── BRAVO_ARCHIV.ps1, BRAVO_MAINTENANCE.ps1, BRAVO_HEALTH.ps1
+├── BRAVO_SETUP.ps1, BRAVO_DRY_RUN.ps1, BRAVO_SELF_TEST.ps1
+├── BRAVO_CREDENTIALS_SETUP.ps1, BRAVO_TASKS_INSTALL.ps1,
+│   BRAVO_TASKS_UNINSTALL.ps1, BRAVO_TASKS_DIAGNOSE.ps1
+├── BRAVO_RUNTIME_GUARD.ps1, BRAVO_CONFIG_LOADER.ps1
+├── BRAVO.config, VERSION.json, RUNTIME_MANIFEST.json
+├── modules\                       спільні PowerShell-модулі (розділ 13)
+└── Tools\                         runtime-залежності, не дані бекапу
+    ├── 7za.exe
+    ├── WinSCP.com
+    ├── WinSCP.exe
+    └── WinSCPnet.dll
+
+D:\LIMS-NEW\                       LIMSRoot — інсталяція LIMS
+├── bravo.exe
+├── Model\
+└── bravoexch\
+
+D:\LIMS-NEW\ARCHIV\                ArchiveRoot — операційні журнали
+└── LOGS\                          Trace\, exchangAPI\, BravoWeb\ (розділ 12)
+
+E:\BRAVO_BACKUPS\                  BackupRoot — резервні копії
+├── MODEL\
+├── BLOG\
+├── BRAVOEXCH\
+└── BAZA\
 ```
 
-За замовчуванням `BRAVO.config` визначає `C:\LIMS` як батьківський каталог
-`ARCHIV`. Якщо скрипти розташовані інакше або резервні копії потрібно зберігати
-на іншому диску, задайте абсолютні значення у `pathSettings`.
+Конфігурація для такого розгортання:
+
+```powershell
+$global:pathSettings = @{
+    LIMSRoot    = "D:\LIMS-NEW"
+    ArchiveRoot = "D:\LIMS-NEW\ARCHIV"
+    BackupRoot  = "E:\BRAVO_BACKUPS"
+}
+```
+
+Комплект і дані можуть лежати й в одному дереві (`C:\LIMS\ARCHIV`) — це
+питання зручності, а не вимога: жодної фізичної залежності між коренями немає.
+
+`RuntimeRoot` для production-завдань має бути захищений ACL (`SYSTEM` і
+`Administrators` — FullControl, `Users` — ReadAndExecute) і не може лежати в
+профілі користувача: заплановані завдання виконуються від
+`NT AUTHORITY\SYSTEM`. Мережеве сховище задається UNC-шляхом
+(`\\server\share\...`), а не буквою підключеного диска — SYSTEM не бачить
+дискових підключень користувача, і такий шлях працює вручну, але мовчки
+зникає вночі. `BRAVO_TASKS_DIAGNOSE.ps1` і `BRAVO_DRY_RUN.ps1` перевіряють
+це окремо, разом із фактичним правом запису під SYSTEM (створити → записати →
+прочитати назад → видалити probe-файл).
 
 ## 3. Що налаштувати у `BRAVO.config`
 
@@ -160,8 +199,8 @@ C:\LIMS\
 | Секція | Що перевірити |
 |---|---|
 | `bravoSettings` | `NotificationProvider` (`slack` або `discord`) і `NotificationMode` |
-| `pathSettings` | `LIMSRoot`, `ArchiveRoot`, `BackupRoot` |
-| `maintenanceSettings` | імена служб, каталог Br-a-vo.web, таймаути та параметри обслуговування |
+| `pathSettings` | `LIMSRoot`, `ArchiveRoot`, `BackupRoot` — **обов'язкові абсолютні шляхи** (розділ 2), дефолтів немає |
+| `maintenanceSettings` | імена служб, каталог Br-a-vo.web, таймаути, `Retention.ArchiveDays` / `Retention.CompressedLogDays` (розділ 12) |
 | `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати |
 | `backupConsistency` | обов'язковий режим `VSS` і контекст `ClientAccessible` для узгоджених архівів |
 | SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey`, віддалені каталоги |
@@ -675,6 +714,76 @@ C:\LIMS\ARCHIV\LOGS
 Marker `restore_done_yyyyMMdd.marker` створюється лише після успішної
 реставрації, перевіреного after-архіву та SHA512. Він записується атомарно у
 UTF-8 і не створюється після примусового `-ForceRestore`.
+
+Програмні журнали BRAVO, `exchangAPI`, Apache і BRAVO Web application logs
+`BRAVO_MAINTENANCE` переносить у власні гілки того самого каталогу:
+
+```text
+<ArchiveRoot>\LOGS\
+├── BRAVO_MAINTENANCE_YYYYMMDD_HHmm.log   службові журнали самого Maintenance
+├── file_sizes_before_YYYYMMDD_HHmm.csv
+├── restore_done_YYYYMMDD.marker
+├── Trace\
+│   ├── YYYY-MM-DD\TraceSRV_1.out, TraceSRV_2.out, …
+│   └── Trace_YYYY-MM-DD.mdz            після Retention.ArchiveDays
+├── exchangAPI\
+│   ├── YYYY-MM-DD\exchangAPI_1.log, exchangAPI_2.log, …
+│   └── exchangAPI_YYYY-MM-DD.mdz
+└── BravoWeb\
+    ├── Apache\
+    │   ├── YYYY-MM-DD\access_1.log, error_1.log, ssl_error_1.log, …
+    │   └── Apache_YYYY-MM-DD.mdz
+    └── Application\
+        ├── YYYY-MM-DD\
+        │   ├── bravoexec_1.log, vet_1.log, …
+        │   └── API\request_1.log        вкладена структура зберігається
+        └── BravoWeb_YYYY-MM-DD.mdz
+```
+
+**Джерела.** Trace береться виключно з `bravo.ini`, секція `[Debug]`, ключ
+`FILE`; у `BRAVO.config` цей параметр не дублюється. Сам `bravo.ini` має рівно
+один очікуваний шлях, визначений архітектурою ОС —
+`%SystemRoot%\SysWOW64\bravo.ini` на x64 і `%SystemRoot%\System32\bravo.ini`
+на x86; інших місць не перевіряється, а відсутність файлу є помилкою
+конфігурації з назвою перевіреного шляху. Відносне значення `FILE` (наприклад
+`FILE=TraceSRV.out`) резолвиться від каталогу інсталяції BRAVO.
+
+`exchangAPI` шукається у фактичному робочому каталозі служби
+(`Win32_Service.PathName`, а для служб під NSSM — `AppDirectory`/`Application`
+з `HKLM\SYSTEM\CurrentControlSet\Services\<ім'я>\Parameters`) за обома
+шаблонами `exchangAPI_*.log` і `exchangAPI*.log` з дедуплікацією за повним
+шляхом. Apache — тільки `*.log` безпосередньо в `apache\logs` (`httpd.pid`,
+`*.lock` і тимчасові файли не чіпаються). `www\log` обходиться рекурсивно, і
+відносна структура каталогів зберігається в призначенні.
+
+**Нумерація.** Номер завжди `MAX(наявних) + 1` у межах конкретного
+каталогу-дати (для BRAVO Web — конкретного відносного підкаталогу всередині
+неї): пропущені номери не перевикористовуються, наявний файл ніколи не
+перезаписується, а порожній журнал лишається в джерелі й номера не отримує.
+Кожен компонент завершується агрегованим рядком
+`знайдено / непорожніх / переміщено / порожніх / пропущено / помилок`.
+
+**Retention** програмних журналів працює за двома незалежними політиками:
+
+| Налаштування | Що визначає |
+|---|---|
+| `Retention.ArchiveDays` | вік каталогу `YYYY-MM-DD`, після якого він пакується в `.mdz` |
+| `Retention.CompressedLogDays` | вік уже стиснутого `.mdz`, після якого архів видаляється |
+| `Retention.LogDays` | вік службових журналів самого Maintenance у корені `LOGS\` |
+
+Каталог-дата видаляється **лише** після успішного створення архіву та
+успішної перевірки `7z t`. Вік `.mdz` рахується за датою в його імені, а не
+за часом файлу, і видаляються лише архіви очікуваного формату свого
+компонента. Очищення службових журналів Maintenance лишається нерекурсивним
+і працює тільки з верхнім рівнем `LOGS\` за whitelist імен, тому до `Trace\`,
+`exchangAPI\` і `BravoWeb\` воно не дістає.
+
+**Міграція.** Старі каталоги `<ArchiveRoot>\Trace`, `<ArchiveRoot>\exchangAPI`
+і `<ArchiveRoot>\Br-a-vo.web` переносяться під `<ArchiveRoot>\LOGS\`
+автоматично при першому ж запуску Maintenance. Міграція ідемпотентна:
+повторний запуск не створює дублікатів, джерело видаляється лише після
+підтвердженого переміщення, а часткова невдача лишає невдалі файли й
+legacy-каталог для наступного запуску.
 
 Допоміжні скрипти `BRAVO_SETUP`, `BRAVO_DRY_RUN`,
 `BRAVO_CREDENTIALS_SETUP`, `BRAVO_TASKS_INSTALL`,

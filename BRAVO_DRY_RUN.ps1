@@ -50,6 +50,113 @@ function Add-DryRunResult {
     })
 }
 
+function Test-BRAVOMappedNetworkDrivePath {
+    # Заплановане завдання від NT AUTHORITY\SYSTEM не бачить дискових
+    # підключень користувача. Шлях на букві мережевого диска працює під час
+    # ручного запуску й мовчки зникає вночі.
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^([A-Za-z]):[\\/]') {
+        return $false
+    }
+    try {
+        $driveInfo = New-Object System.IO.DriveInfo($Matches[1] + ":\")
+        return ($driveInfo.DriveType -eq [System.IO.DriveType]::Network)
+    } catch {
+        return $false
+    }
+}
+
+function Test-BRAVOFileSystemReadAccess {
+    # Перелічення каталогу й читання метаданих — рівно те, що робить
+    # production-код. Test-Path сюди не годиться: він відповідає "шлях
+    # існує", а не "цей обліковий запис може його прочитати", і саме ця
+    # різниця й з'ясовується вночі під SYSTEM.
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ Success = $false; Detail = "шлях не задано" }
+    }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        try {
+            $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+            try {
+                [void]$stream.ReadByte()
+            } finally {
+                $stream.Dispose()
+            }
+            return [pscustomobject]@{ Success = $true; Detail = "читання підтверджено: $Path" }
+        } catch {
+            return [pscustomobject]@{ Success = $false; Detail = "не вдалося прочитати ${Path}: $($_.Exception.Message)" }
+        }
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return [pscustomobject]@{ Success = $false; Detail = "не існує: $Path" }
+    }
+    try {
+        [void]@([IO.Directory]::EnumerateFileSystemEntries($Path) | Select-Object -First 1)
+        return [pscustomobject]@{ Success = $true; Detail = "перелічення підтверджено: $Path" }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Detail = "не вдалося перелічити ${Path}: $($_.Exception.Message)" }
+    }
+}
+
+function Test-BRAVOFileSystemWriteAccess {
+    # Справжній probe: створити -> записати -> прочитати назад -> видалити.
+    # Наявність каталогу нічого не гарантує: ACL може дозволяти перелічення
+    # й забороняти запис саме для SYSTEM, і тоді ротація журналів падає вже
+    # на production, а не тут.
+    #
+    # Каталог створюється, якщо його немає: під час першого розгортання
+    # <ArchiveRoot>\LOGS ще не існує, і "не існує" не має видаватися за
+    # "немає прав".
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ Success = $false; Detail = "шлях не задано" }
+    }
+    if (Test-BRAVOMappedNetworkDrivePath -Path $Path) {
+        return [pscustomobject]@{
+            Success = $false
+            Detail = "$Path — підключений мережевий диск; під SYSTEM він недоступний, використайте UNC \\server\share\..."
+        }
+    }
+    $createdDirectory = $false
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        try {
+            [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
+            $createdDirectory = $true
+        } catch {
+            return [pscustomobject]@{ Success = $false; Detail = "не вдалося створити ${Path}: $($_.Exception.Message)" }
+        }
+    }
+
+    $probePath = Join-Path $Path ("BRAVO_WRITE_PROBE_{0}.tmp" -f [guid]::NewGuid().ToString("N"))
+    $probeBytes = [byte[]](0x42, 0x52, 0x41, 0x56, 0x4F)
+    try {
+        [IO.File]::WriteAllBytes($probePath, $probeBytes)
+        $readBack = [IO.File]::ReadAllBytes($probePath)
+        if ($readBack.Length -ne $probeBytes.Length) {
+            throw "прочитано $($readBack.Length) байт замість $($probeBytes.Length)"
+        }
+        for ($i = 0; $i -lt $probeBytes.Length; $i++) {
+            if ($readBack[$i] -ne $probeBytes[$i]) {
+                throw "вміст probe-файла не збігається"
+            }
+        }
+        return [pscustomobject]@{
+            Success = $true
+            Detail = "запис/читання/видалення підтверджено: $Path$(if ($createdDirectory) { ' (каталог створено)' })"
+        }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Detail = "запис у $Path неможливий: $($_.Exception.Message)" }
+    } finally {
+        if (Test-Path -LiteralPath $probePath -PathType Leaf) {
+            Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Test-SettingEnabled {
     param([object]$Value)
 
@@ -674,6 +781,77 @@ try {
             } else {
                 Add-DryRunResult FAIL "Цілісність" "Версія" ([string]$versionStateResult.Message)
             }
+        }
+    }
+
+    # ===== ФАКТИЧНИЙ ДОСТУП ДО ФАЙЛОВОЇ СИСТЕМИ =====
+    # Виконується під тим самим обліковим записом, що й production-запуск
+    # (через тимчасове завдання Планувальника — BRAVO_TASKS_DIAGNOSE.ps1),
+    # тому це єдине місце, де "SYSTEM має права" перестає бути припущенням.
+    $dryRunRuntimeRoot = $configRoot
+    $dryRunArchiveRoot = [string]$pathSettings.ArchiveRoot
+    $dryRunBackupRoot = [string]$pathSettings.BackupRoot
+    $dryRunLimsRoot = [string]$pathSettings.LIMSRoot
+    $dryRunLogRoot = Join-Path $dryRunArchiveRoot 'LOGS'
+    $dryRunBravoWebLogRoot = Join-Path $dryRunLogRoot 'BravoWeb'
+
+    Add-DryRunResult PASS "Корені" "RuntimeRoot" $dryRunRuntimeRoot
+    foreach ($rootPair in @(
+        @{ Name = 'LIMSRoot'; Path = $dryRunLimsRoot },
+        @{ Name = 'ArchiveRoot'; Path = $dryRunArchiveRoot },
+        @{ Name = 'BackupRoot'; Path = $dryRunBackupRoot }
+    )) {
+        if (Test-BRAVOMappedNetworkDrivePath -Path ([string]$rootPair.Path)) {
+            Add-DryRunResult FAIL "Корені" ([string]$rootPair.Name) (
+                "$($rootPair.Path) — підключений мережевий диск; SYSTEM його не бачить. " +
+                "Використайте UNC \\server\share\..."
+            )
+        } else {
+            Add-DryRunResult PASS "Корені" ([string]$rootPair.Name) ([string]$rootPair.Path)
+        }
+    }
+
+    $readAccessTargets = [ordered]@{
+        'RuntimeRoot' = $dryRunRuntimeRoot
+        'ConfigPath'  = $resolvedConfigPath
+        'modules'     = (Join-Path $dryRunRuntimeRoot 'modules')
+        'Tools'       = [string]$toolsPath
+        'LIMSRoot'    = $dryRunLimsRoot
+        'bravo.ini'   = [string]$bravoDiscoveryResult.BravoIniPath
+    }
+    foreach ($readTarget in $readAccessTargets.GetEnumerator()) {
+        if ([string]::IsNullOrWhiteSpace([string]$readTarget.Value)) {
+            Add-DryRunResult WARN "Доступ (читання)" ([string]$readTarget.Key) "шлях не визначено в конфігурації"
+            continue
+        }
+        $readResult = Test-BRAVOFileSystemReadAccess -Path ([string]$readTarget.Value)
+        if ($readResult.Success) {
+            Add-DryRunResult PASS "Доступ (читання)" ([string]$readTarget.Key) ([string]$readResult.Detail)
+        } else {
+            Add-DryRunResult FAIL "Доступ (читання)" ([string]$readTarget.Key) ([string]$readResult.Detail)
+        }
+    }
+
+    $writeAccessTargets = [ordered]@{
+        'ArchiveRoot'          = $dryRunArchiveRoot
+        'BackupRoot'           = $dryRunBackupRoot
+        'LOGS'                 = $dryRunLogRoot
+        'LOGS\Trace'           = (Join-Path $dryRunLogRoot 'Trace')
+        'LOGS\exchangAPI'      = (Join-Path $dryRunLogRoot 'exchangAPI')
+        'LOGS\BravoWeb\Apache' = (Join-Path $dryRunBravoWebLogRoot 'Apache')
+        'LOGS\BravoWeb\Application' = (Join-Path $dryRunBravoWebLogRoot 'Application')
+        'Тимчасовий каталог'   = ([IO.Path]::GetTempPath())
+    }
+    foreach ($writeTarget in $writeAccessTargets.GetEnumerator()) {
+        if ([string]::IsNullOrWhiteSpace([string]$writeTarget.Value)) {
+            Add-DryRunResult WARN "Доступ (запис)" ([string]$writeTarget.Key) "шлях не визначено в конфігурації"
+            continue
+        }
+        $writeResult = Test-BRAVOFileSystemWriteAccess -Path ([string]$writeTarget.Value)
+        if ($writeResult.Success) {
+            Add-DryRunResult PASS "Доступ (запис)" ([string]$writeTarget.Key) ([string]$writeResult.Detail)
+        } else {
+            Add-DryRunResult FAIL "Доступ (запис)" ([string]$writeTarget.Key) ([string]$writeResult.Detail)
         }
     }
 

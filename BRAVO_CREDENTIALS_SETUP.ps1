@@ -79,7 +79,6 @@ try {
     Assert-BRAVOPowerShellCompatibility
     [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
     $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-    $script:BRAVOWindowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
 } catch {
     Write-Error "Помилка сумісності: $($_.Exception.Message)"
     Complete-BRAVOHelperLog -ExitCode 1
@@ -87,10 +86,11 @@ try {
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
     Write-Warning $BRAVOPowerShellUpdate.Message
 }
-if ($BRAVOWindowsPatchLevel.IsUpdateRecommended) {
-    Write-Warning $BRAVOWindowsPatchLevel.Message
-}
-
+# Свіжість накопичувальних оновлень Windows — health-метрика, а не умова
+# запуску. Її місце в BRAVO_HEALTH, який для цього й існує: тут вона лише
+# додавала WARNING (а отже, ненульовий код завершення 10) до операції, на
+# результат якої вік патчів не впливає жодним чином. Перевірки платформи
+# (ОС, build, PowerShell, .NET, архітектура, API) лишаються на місці.
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }

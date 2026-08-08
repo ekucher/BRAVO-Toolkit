@@ -230,6 +230,51 @@ function Get-BRAVOIniValue {
     return $null
 }
 
+function ConvertTo-BRAVOIniPathValue {
+    # Нормалізація значення-шляху, прочитаного з INI: trim, зняття зовнішніх
+    # лапок, розкриття змінних середовища. Повертає $null, якщо після
+    # нормалізації нічого не лишилось — викликач відрізняє "ключа немає" від
+    # "ключ є, але порожній" за вхідним значенням, а не за результатом.
+    #
+    # Окремо від ConvertFrom-BRAVOIniFile навмисно: парсер повертає значення
+    # як є (це його контракт для всіх ключів), а лапки й %ENV% доречно
+    # розкривати лише там, де значення справді є шляхом.
+    [CmdletBinding()]
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $null
+    }
+    $normalized = $Value.Trim()
+    foreach ($quoteCharacter in @('"', "'")) {
+        if ($normalized.Length -ge 2 -and
+            $normalized.StartsWith($quoteCharacter) -and
+            $normalized.EndsWith($quoteCharacter)) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2).Trim()
+            break
+        }
+    }
+    $normalized = [Environment]::ExpandEnvironmentVariables($normalized)
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $null
+    }
+    return $normalized
+}
+
+function Test-BRAVOAbsolutePath {
+    # Абсолютний = "X:\..." або UNC "\\server\share". [IO.Path]::IsPathRooted
+    # самого по собі недостатньо: воно вважає rooted і "\log\bravo.out", і
+    # "C:bravo.out" — обидва залежать від поточного каталогу процесу, тобто
+    # для шляху з конфігурації служби це не адреса, а лотерея.
+    [CmdletBinding()]
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $false
+    }
+    return ($Path -match '^([A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])')
+}
+
 function Get-BRAVOApacheDocumentRoot {
     # Мінімальний парсер httpd.conf: шукає перше неекрановане "DocumentRoot"
     # (Apache-директиви регістронезалежні). Значення може бути в лапках чи
@@ -415,10 +460,13 @@ function Resolve-BRAVOInstallationDiscovery {
     }
     $reasons["BravoRoot"] = $bravoRootReason
 
-    # Джерело істини — системний каталог Windows (Get-BRAVOSystemBravoIniPath),
-    # НЕ каталог встановлення bravo.exe: bravo.ini туди не пишеться.
-    # Шлях поруч із bravo.exe лишається лише вторинним fallback — на
-    # випадок нетипової інсталяції, де файл справді лежить там.
+    # Джерело істини — рівно ОДИН шлях, визначений архітектурою ОС
+    # (Get-BRAVOSystemBravoIniPath): SysWOW64 на x64, System32 на x86.
+    # Каталог встановлення bravo.exe тут навмисно більше не перевіряється:
+    # альтернативний шлях означає, що на машині можуть співіснувати два
+    # bravo.ini, і Maintenance читатиме не той, який насправді використовує
+    # служба, — мовчки й правдоподібно. Краще керована помилка з назвою
+    # перевіреного шляху, ніж ротація за чужою конфігурацією.
     $systemBravoIniPath = Get-BRAVOSystemBravoIniPath -SystemRoot $SystemRoot -Is64BitOperatingSystem $Is64BitOperatingSystem
     $bravoIniPath = $null
     $bravoIniReason = $null
@@ -426,20 +474,13 @@ function Resolve-BRAVOInstallationDiscovery {
         $bravoIniPath = $bravoIniPathOverride
         $overrides["BravoIniPath"] = $true
         $bravoIniReason = "явний override discoverySettings.BravoIniPath"
-    } elseif (-not [string]::IsNullOrWhiteSpace($systemBravoIniPath) -and
-        (Test-Path -LiteralPath $systemBravoIniPath -PathType Leaf)) {
+    } elseif ([string]::IsNullOrWhiteSpace($systemBravoIniPath)) {
+        $bravoIniReason = "не вдалося визначити системний каталог Windows (%SystemRoot%), тому очікуваний шлях bravo.ini невідомий"
+    } elseif (Test-Path -LiteralPath $systemBravoIniPath -PathType Leaf) {
         $bravoIniPath = $systemBravoIniPath
-        $bravoIniReason = "знайдено в системному каталозі Windows: $systemBravoIniPath"
-    } elseif (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
-        $candidateIniPath = Join-Path $bravoRoot "bravo.ini"
-        if (Test-Path -LiteralPath $candidateIniPath -PathType Leaf) {
-            $bravoIniPath = $candidateIniPath
-            $bravoIniReason = "не знайдено в системному каталозі ($systemBravoIniPath); знайдено поруч з bravo.exe: $candidateIniPath"
-        } else {
-            $bravoIniReason = "bravo.ini не знайдено ні в системному каталозі ($systemBravoIniPath), ні поруч з bravo.exe ($candidateIniPath)"
-        }
+        $bravoIniReason = "системний каталог Windows за архітектурою ОС: $systemBravoIniPath"
     } else {
-        $bravoIniReason = "bravo.ini не знайдено в системному каталозі ($systemBravoIniPath), а BRAVO_ROOT невідомий"
+        $bravoIniReason = "bravo.ini відсутній за єдиним очікуваним для цієї архітектури ОС шляхом: $systemBravoIniPath"
     }
     $reasons["BravoIniPath"] = $bravoIniReason
 
@@ -499,6 +540,67 @@ function Resolve-BRAVOInstallationDiscovery {
         -LegacyFallbackPath $null
 
     $modelProjectFile = Get-BRAVOIniValue -IniData $iniData -Section "model" -Key "MODEL"
+
+    # --- TRACE_FILE: [Debug] FILE ---
+    # Єдине джерело істини для журналу trace BRAVO. Ані BRAVO.config, ані
+    # пошук "*.out" у LIMSRoot: ім'я файлу, розширення й каталог задає сам
+    # BRAVO, і всі три можуть бути будь-якими. Тому тут свідомо НЕМАЄ ні
+    # override з discoverySettings, ні legacy fallback — краще керована
+    # помилка з поясненням, ніж мовчазна ротація не того файлу.
+    #
+    # Відносне значення (FILE=TraceSRV.out) резолвиться відносно каталогу
+    # ІНСТАЛЯЦІЇ BRAVO — не поточного каталогу процесу, не ArchiveRoot і не
+    # System32/SysWOW64, де лежить сам bravo.ini: файл створює bravo.exe,
+    # тому відносний шлях у його конфігурації означає "поруч зі мною".
+    $traceFileRawValue = Get-BRAVOIniValue -IniData $iniData -Section "Debug" -Key "FILE"
+    $traceFileNormalized = ConvertTo-BRAVOIniPathValue -Value $traceFileRawValue
+    $traceFile = $null
+    $traceFileReason = $null
+    $traceFileOutsideInstallation = $false
+    if ($null -eq $iniData) {
+        $traceFileReason = "bravo.ini недоступний: $bravoIniReason"
+    } elseif ([string]::IsNullOrWhiteSpace($traceFileRawValue)) {
+        $traceFileReason = "у '$bravoIniPath' немає непорожнього ключа FILE у секції [Debug]"
+    } elseif ([string]::IsNullOrWhiteSpace($traceFileNormalized)) {
+        $traceFileReason = "ключ FILE секції [Debug] у '$bravoIniPath' порожній після нормалізації (значення: '$traceFileRawValue')"
+    } else {
+        $traceFileResolved = $traceFileNormalized
+        $traceFileResolvedFrom = "абсолютний шлях"
+        if (-not (Test-BRAVOAbsolutePath -Path $traceFileNormalized)) {
+            if ([string]::IsNullOrWhiteSpace($bravoRoot)) {
+                $traceFileResolved = $null
+                $traceFileReason = "ключ FILE секції [Debug] у '$bravoIniPath' задано відносним шляхом ('$traceFileRawValue'), але каталог інсталяції BRAVO невизначений: $bravoRootReason"
+            } else {
+                $traceFileResolved = Join-Path $bravoRoot $traceFileNormalized
+                $traceFileResolvedFrom = "відносний шлях від каталогу інсталяції BRAVO ($bravoRoot)"
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($traceFileResolved)) {
+            try {
+                $traceFileResolved = [System.IO.Path]::GetFullPath($traceFileResolved)
+            } catch {
+                $traceFileResolved = $null
+                $traceFileReason = "ключ FILE секції [Debug] у '$bravoIniPath' не є коректним шляхом: '$traceFileRawValue' ($($_.Exception.Message))"
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($traceFileResolved)) {
+            $traceFile = $traceFileResolved
+            $traceFileReason = "bravo.ini [Debug] FILE=$traceFileRawValue ($bravoIniPath); $traceFileResolvedFrom"
+            # Trace належить каталогу інсталяції BRAVO. Розташування поза ним
+            # не блокує ротацію (шлях може вести на окремий диск свідомо),
+            # але це рівно та розбіжність між конфігурацією й очікуванням,
+            # яку оператор має побачити в журналі, а не з'ясовувати потім.
+            if (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
+                $normalizedInstallationRoot = ([string]$bravoRoot).TrimEnd('\', '/')
+                $traceFileDirectory = ([string](Split-Path -Path $traceFile -Parent)).TrimEnd('\', '/')
+                if (-not [string]::Equals($traceFileDirectory, $normalizedInstallationRoot, [StringComparison]::OrdinalIgnoreCase) -and
+                    -not $traceFileDirectory.StartsWith($normalizedInstallationRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                    $traceFileOutsideInstallation = $true
+                    $traceFileReason += "; УВАГА: поза каталогом інсталяції BRAVO ($bravoRoot)"
+                }
+            }
+        }
+    }
 
     # --- BAZA_APP ---
     # BAZA не має власного ключа в bravo.ini. Коли MODEL/BLOG вже взято з
@@ -686,6 +788,8 @@ function Resolve-BRAVOInstallationDiscovery {
         BravoIniPath = $bravoIniPath
         HttpdConfPath = $httpdConfPath
         MODEL_PROJECT_FILE = $modelProjectFile
+        TRACE_FILE = $traceFile
+        TRACE_FILE_OUTSIDE_INSTALLATION = $traceFileOutsideInstallation
         MODEL_SOURCE = $modelResolved.Value
         BLOG_SOURCE = $blogResolved.Value
         BRAVOEXCH_SOURCE = $bravoexchResolved.Value
@@ -702,6 +806,7 @@ function Resolve-BRAVOInstallationDiscovery {
             BravoRoot = $reasons["BravoRoot"]
             WebRoot = $reasons["WebRoot"]
             BravoIniPath = $reasons["BravoIniPath"]
+            TRACE_FILE = $traceFileReason
             MODEL = $modelResolved.Reason
             BLOG = $blogResolved.Reason
             BRAVOEXCH = $bravoexchResolved.Reason
@@ -892,6 +997,9 @@ Export-ModuleMember -Function @(
     'Get-BRAVOServiceExecutablePath',
     'Find-BRAVOServiceByCandidates',
     'ConvertFrom-BRAVOIniFile',
+    'Get-BRAVOIniValue',
+    'ConvertTo-BRAVOIniPathValue',
+    'Test-BRAVOAbsolutePath',
     'Get-BRAVOApacheDocumentRoot',
     'Get-BRAVOSystemBravoIniPath',
     'Resolve-BRAVOInstallationDiscovery',

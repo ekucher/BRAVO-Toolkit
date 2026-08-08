@@ -43,6 +43,28 @@ function Wait-BRAVOEarlyManualExit {
 # шлях відновлення, задокументований у SECURITY.md. Він не додає нового
 # вектора атаки: хто може змінити змінні середовища запланованого
 # завдання, той уже має права підмінити й сам маніфест.
+
+# Effective ConfigPath визначається ОДИН раз, до будь-якої перевірки, і далі
+# використовується всюди: guard, завантажувач, дочірні скрипти. Раніше
+# перемикачі безпеки перевірялись у "$PSScriptRoot\BRAVO.config" незалежно
+# від -ConfigPath — тобто запуск із власною конфігурацією проходив перевірку
+# ЧУЖОГО файлу: та, за якою реально працює скрипт, лишалась неперевіреною.
+$effectiveConfigPath = if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    Join-Path $PSScriptRoot 'BRAVO.config'
+} else {
+    [Environment]::ExpandEnvironmentVariables($ConfigPath)
+}
+try {
+    $effectiveConfigPath = [System.IO.Path]::GetFullPath($effectiveConfigPath)
+} catch {
+    # Некоректний шлях НЕ обробляється тут виходом: перевірка цілісності
+    # комплекту (код 33) мусить лишатись найпершим бар'єром, інакше запуск
+    # із заздалегідь зіпсованим -ConfigPath дозволяв би обійти guard.
+    # Далі це значення відхилить або сам guard, або завантажувач (код 30).
+    $effectiveConfigPath = [string]$effectiveConfigPath
+}
+$ConfigPath = $effectiveConfigPath
+
 $runtimeGuardPath = Join-Path $PSScriptRoot 'BRAVO_RUNTIME_GUARD.ps1'
 if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
     # Наявності файлу недостатньо: dot-source може не виконатися взагалі —
@@ -87,7 +109,7 @@ if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
     # перемикачі безпеки в ньому перевіряються окремо — інакше рядок у
     # конфігурації лишався б найдешевшим способом тихо вимкнути захист.
     $securitySettings = Test-BRAVORuntimeSecuritySettings `
-        -ConfigPath (Join-Path $PSScriptRoot 'BRAVO.config') `
+        -ConfigPath $effectiveConfigPath `
         -Mode $runtimeIntegrityMode
     if (-not $securitySettings.IsValid) {
         $securityColor = if ($securitySettings.ShouldBlock) { 'Red' } else { 'Yellow' }

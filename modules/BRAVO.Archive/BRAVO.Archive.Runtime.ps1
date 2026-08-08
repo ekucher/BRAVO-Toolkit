@@ -35,8 +35,10 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-$script:BRAVOWindowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
-$archiveHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1'
+# Свіжість накопичувальних оновлень Windows тут навмисно НЕ перевіряється:
+# це health-метрика, а не умова виконання backup. Її місце в BRAVO_HEALTH,
+# який для цього й існує. Перевірки платформи (ОС, build, PowerShell, .NET,
+# архітектура, API) лишаються вище й на місці.$archiveHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1'
 if (-not (Test-Path -LiteralPath $archiveHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль archive helpers: $archiveHelpersPath"
 }
@@ -91,8 +93,9 @@ try {
     . $loaderPath
 
     Import-BravoConfiguration `
-        -ConfigRoot $bravoScriptDirectory `
-        -ConfigPath $ConfigPath
+        -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
+        -ConfigPath $ConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
 
     $configPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     Write-Host "Конфiгурацiю завантажено успiшно: $configPath" -ForegroundColor $logColors.SUCCESS
@@ -469,10 +472,8 @@ function Test-Compatibility {
     Write-BRAVOLog -Component 'STARTUP' -Message "Перевiрка сумiсностi системи..." -Level "INFO"
     $compatibility = Get-BRAVOCompatibilityInfo
     $powerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-    $windowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
     $script:BRAVOCompatibility = $compatibility
     $script:BRAVOPowerShellUpdate = $powerShellUpdate
-    $script:BRAVOWindowsPatchLevel = $windowsPatchLevel
 
     $script:hasFileHash = $compatibility.FileHashProvider -eq "Get-FileHash"
     $script:hasNetConnection = $compatibility.NetworkProvider -eq "Test-NetConnection"
