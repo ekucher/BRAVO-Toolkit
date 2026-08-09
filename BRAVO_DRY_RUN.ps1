@@ -171,6 +171,119 @@ function Test-SettingEnabled {
     )
 }
 
+function Get-BRAVODryRunConfiguredServiceState {
+    # Discovery returns eligible services, but a Disabled installed service is
+    # deliberately absent from that result. Probe only known names so Dry Run
+    # can preserve the distinction without importing Maintenance runtime.
+    param(
+        [string]$DiscoveredServiceName,
+        [string[]]$ServiceCandidates
+    )
+
+    $service = $null
+    foreach ($name in @($DiscoveredServiceName) + @($ServiceCandidates)) {
+        if ([string]::IsNullOrWhiteSpace([string]$name) -or $null -ne $service) {
+            continue
+        }
+        $service = Get-Service -Name ([string]$name) -ErrorAction SilentlyContinue
+    }
+    if ($null -eq $service -and @($ServiceCandidates).Count -gt 0) {
+        $candidateServices = @(Get-Service -ErrorAction SilentlyContinue)
+        $service = $candidateServices | Where-Object {
+            $ServiceCandidates -contains [string]$_.Name -or
+                $ServiceCandidates -contains [string]$_.DisplayName
+        } | Select-Object -First 1
+    }
+
+    $startType = if ($null -ne $service) { [string]$service.StartType } else { '' }
+    if ($null -ne $service -and [string]::IsNullOrWhiteSpace($startType)) {
+        try {
+            $escapedName = ([string]$service.Name).Replace("'", "''")
+            $serviceInfo = Get-WmiObject -Class Win32_Service `
+                -Filter "Name = '$escapedName'" `
+                -ErrorAction Stop | Select-Object -First 1
+            $startType = [string]$serviceInfo.StartMode
+        } catch {
+            # A denied WMI query must not turn an optional component into a
+            # Dry Run failure; Get-Service still establishes its existence.
+        }
+    }
+
+    return [pscustomobject]@{
+        Exists = ($null -ne $service)
+        Disabled = ($startType -ieq 'Disabled')
+        Name = if ($null -ne $service) { [string]$service.Name } else { $null }
+    }
+}
+
+function Get-BRAVODryRunOptionalComponentPlan {
+    param(
+        [bool]$BravoWebEnabled,
+        [bool]$BravoWebServiceExists,
+        [bool]$BravoWebServiceDisabled,
+        [bool]$ExchangeApiServiceExists,
+        [bool]$ExchangeApiServiceDisabled,
+        [string]$SystemLogRoot,
+        [string]$ExchangeApiServiceName
+    )
+
+    $bravoWebEligible = $BravoWebEnabled -and $BravoWebServiceExists -and -not $BravoWebServiceDisabled
+    $exchangeApiEligible = $ExchangeApiServiceExists -and -not $ExchangeApiServiceDisabled
+    $writeAccessTargets = [ordered]@{}
+    if ($exchangeApiEligible) {
+        $writeAccessTargets['SystemLog\exchangAPI'] = [IO.Path]::Combine($SystemLogRoot, 'exchangAPI')
+    }
+    if ($bravoWebEligible) {
+        $writeAccessTargets['SystemLog\BravoWeb\Apache'] = [IO.Path]::Combine($SystemLogRoot, 'BravoWeb\Apache')
+        $writeAccessTargets['SystemLog\BravoWeb\Application'] = [IO.Path]::Combine($SystemLogRoot, 'BravoWeb\Application')
+    }
+
+    $serviceNames = @()
+    if ($bravoWebEligible) { $serviceNames += 'BRAVO Web/Apache (автовизначення)' }
+    if ($exchangeApiEligible -and -not [string]::IsNullOrWhiteSpace($ExchangeApiServiceName)) {
+        $serviceNames += $ExchangeApiServiceName
+    }
+
+    return [pscustomobject]@{
+        BravoWebEligible = $bravoWebEligible
+        BravoWebLegacyDataEligible = $BravoWebEnabled -and $BravoWebServiceExists
+        ExchangeApiEligible = $exchangeApiEligible
+        ExchangeApiLegacyDataEligible = $ExchangeApiServiceExists
+        WriteAccessTargets = $writeAccessTargets
+        ServiceNames = @($serviceNames)
+    }
+}
+
+function Get-BRAVODryRunRangeIdPlan {
+    param(
+        [Parameter(Mandatory = $true)]$RangeIdMonitoring,
+        [string]$SystemRoot,
+        [Nullable[bool]]$Is64BitOperatingSystem,
+        [scriptblock]$TestPath = { param($Path) Test-Path -LiteralPath $Path -PathType Leaf }
+    )
+
+    if (-not (Test-SettingEnabled $RangeIdMonitoring.Enabled)) {
+        return $null
+    }
+
+    $rangeIdLogPath = Get-BRAVOSystemRangeIdLogPath `
+        -SystemRoot $SystemRoot `
+        -Is64BitOperatingSystem $Is64BitOperatingSystem
+    $thresholdPercent = [string]$RangeIdMonitoring.ThresholdPercent
+    if (& $TestPath $rangeIdLogPath) {
+        return [pscustomobject]@{
+            Status = 'PLAN'
+            Path = $rangeIdLogPath
+            Detail = "read-only перевірка canonical '$rangeIdLogPath' при $thresholdPercent%"
+        }
+    }
+    return [pscustomobject]@{
+        Status = 'WARN'
+        Path = $rangeIdLogPath
+        Detail = "canonical range_id_log.json не знайдено: '$rangeIdLogPath'; перевірка буде пропущена при $thresholdPercent%"
+    }
+}
+
 function Get-ConfiguredTarget {
     param(
         [string]$PropertyName,
@@ -835,6 +948,25 @@ try {
     $dryRunSystemLogRoot = [string]$global:systemLogRoot
     $dryRunBackupRoot = [string]$global:backupRootPath
     $dryRunStateRoot = [string]$global:stateRoot
+    $bravoWebEnabled = Test-SettingEnabled $maintenanceSettings.Services.BravoWebEnabled
+    $bravoWebServiceState = if ($bravoWebEnabled) {
+        Get-BRAVODryRunConfiguredServiceState `
+            -DiscoveredServiceName ([string]$bravoDiscoveryResult.WebServiceName) `
+            -ServiceCandidates @($maintenanceSettings.Services.BravoWebCandidates)
+    } else {
+        [pscustomobject]@{ Exists = $false; Disabled = $false; Name = $null }
+    }
+    $exchangeApiServiceName = [string]$maintenanceSettings.Services.ExchangeApiName
+    $exchangeApiServiceState = Get-BRAVODryRunConfiguredServiceState `
+        -ServiceCandidates @($exchangeApiServiceName)
+    $optionalComponentPlan = Get-BRAVODryRunOptionalComponentPlan `
+        -BravoWebEnabled $bravoWebEnabled `
+        -BravoWebServiceExists $bravoWebServiceState.Exists `
+        -BravoWebServiceDisabled $bravoWebServiceState.Disabled `
+        -ExchangeApiServiceExists $exchangeApiServiceState.Exists `
+        -ExchangeApiServiceDisabled $exchangeApiServiceState.Disabled `
+        -SystemLogRoot $dryRunSystemLogRoot `
+        -ExchangeApiServiceName $exchangeApiServiceName
 
     Add-DryRunResult PASS "Корені" "RuntimeRoot" $dryRunRuntimeRoot
     Add-DryRunResult PASS "Корені" "RuntimeLogRoot (script logs)" $dryRunRuntimeLogRoot
@@ -880,12 +1012,12 @@ try {
         'BackupRoot'                     = $dryRunBackupRoot
         'SystemLogRoot'                  = $dryRunSystemLogRoot
         'SystemLog\Trace'               = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'Trace'))
-        'SystemLog\exchangAPI'          = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'exchangAPI'))
-        'SystemLog\BravoWeb\Apache'     = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'BravoWeb\Apache'))
-        'SystemLog\BravoWeb\Application' = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'BravoWeb\Application'))
         'Тимчасовий каталог'   = ([IO.Path]::GetTempPath())
         'Operation lock'       = (Split-Path -Path ([string]$operationLockSettings.Path) -Parent)
         'Machine state'        = $dryRunStateRoot
+    }
+    foreach ($optionalTarget in $optionalComponentPlan.WriteAccessTargets.GetEnumerator()) {
+        $writeAccessTargets[[string]$optionalTarget.Key] = [string]$optionalTarget.Value
     }
     foreach ($definition in @($archiveDefinitions | Where-Object { Test-SettingEnabled $_.Enabled })) {
         $writeAccessTargets["$($definition.Type) destination"] = [string]$definition.Destination
@@ -1091,14 +1223,7 @@ try {
 
     if ($null -ne $maintenanceSettings) {
         $serviceNames = @([string]$maintenanceSettings.Services.BravoName)
-        if (Test-SettingEnabled $maintenanceSettings.Services.BravoWebEnabled) {
-            $serviceNames += "BRAVO Web/Apache (автовизначення)"
-        }
-        if (-not [string]::IsNullOrWhiteSpace(
-            [string]$maintenanceSettings.Services.ExchangeApiName
-        )) {
-            $serviceNames += [string]$maintenanceSettings.Services.ExchangeApiName
-        }
+        $serviceNames += @($optionalComponentPlan.ServiceNames)
         Add-DryRunResult PLAN "Maintenance" "Служби" (
             "контрольована зупинка/запуск: $($serviceNames -join ', '); у dry-run стан не змінювався"
         )
@@ -1120,10 +1245,9 @@ try {
             "нічого не видалено"
         )
         if (Test-SettingEnabled $maintenanceSettings.RangeIdMonitoring.Enabled) {
-            Add-DryRunResult PLAN "Maintenance" "Range ID" (
-                "read-only перевірка '$($maintenanceSettings.RangeIdMonitoring.FilePath)' " +
-                "при $($maintenanceSettings.RangeIdMonitoring.ThresholdPercent)%"
-            )
+            $rangeIdPlan = Get-BRAVODryRunRangeIdPlan `
+                -RangeIdMonitoring $maintenanceSettings.RangeIdMonitoring
+            Add-DryRunResult $rangeIdPlan.Status "Maintenance" "Range ID" $rangeIdPlan.Detail
         }
         Add-DryRunResult PLAN "Maintenance" "Shutdown" (
             "AutoShutdown=$($maintenanceSettings.Automation.AutoShutdown); вимкнення ПК не запускалося"

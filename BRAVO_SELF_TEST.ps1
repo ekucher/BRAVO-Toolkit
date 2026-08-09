@@ -2736,6 +2736,159 @@ try {
         ) `
         -Name "BackupConsistency/DryRunReportsVSS" `
         -Failure "dry-run має показувати фактичний VSS-режим замість видаленого QuiesceForBackup"
+    $dryRunPlanModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $dryRunScriptText `
+        -FunctionNames @(
+            'Test-SettingEnabled',
+            'Get-BRAVODryRunOptionalComponentPlan',
+            'Get-BRAVODryRunRangeIdPlan'
+        )
+    $rangeIdSettingsWithoutFilePath = [pscustomobject]@{
+        Enabled = $true
+        ThresholdPercent = 80
+    }
+    $rangeIdCanonicalPlan = & $dryRunPlanModule {
+        param($Settings)
+        Get-BRAVODryRunRangeIdPlan `
+            -RangeIdMonitoring $Settings `
+            -SystemRoot 'C:\WindowsTest' `
+            -Is64BitOperatingSystem $true `
+            -TestPath { param($Path) $true }
+    } $rangeIdSettingsWithoutFilePath
+    $rangeIdMissingPlan = & $dryRunPlanModule {
+        param($Settings)
+        Get-BRAVODryRunRangeIdPlan `
+            -RangeIdMonitoring $Settings `
+            -SystemRoot 'C:\WindowsTest' `
+            -Is64BitOperatingSystem $true `
+            -TestPath { param($Path) $false }
+    } $rangeIdSettingsWithoutFilePath
+    $rangeIdX86Plan = & $dryRunPlanModule {
+        param($Settings)
+        Get-BRAVODryRunRangeIdPlan `
+            -RangeIdMonitoring $Settings `
+            -SystemRoot 'C:\WindowsTest' `
+            -Is64BitOperatingSystem $false `
+            -TestPath { param($Path) $true }
+    } $rangeIdSettingsWithoutFilePath
+    $legacyRangeIdSettings = [pscustomobject]@{
+        Enabled = $true
+        ThresholdPercent = 80
+        FilePath = 'D:\LIMS\range_id_log.json'
+    }
+    $legacyRangeIdPlan = & $dryRunPlanModule {
+        param($Settings)
+        Get-BRAVODryRunRangeIdPlan `
+            -RangeIdMonitoring $Settings `
+            -SystemRoot 'C:\WindowsTest' `
+            -Is64BitOperatingSystem $true `
+            -TestPath { param($Path) $true }
+    } $legacyRangeIdSettings
+    Test-BRAVOCondition `
+        -Condition ($rangeIdCanonicalPlan.Path -eq 'C:\WindowsTest\SysWOW64\range_id_log.json' -and $rangeIdCanonicalPlan.Status -eq 'PLAN') `
+        -Name 'DryRun/RangeIdUsesCanonicalSystemPath' `
+        -Failure 'Dry Run має використовувати тільки canonical system range_id_log.json'
+    Test-BRAVOCondition `
+        -Condition ($rangeIdCanonicalPlan.Path -eq 'C:\WindowsTest\SysWOW64\range_id_log.json') `
+        -Name 'DryRun/RangeIdUsesSysWow64OnX64' `
+        -Failure 'x64 Dry Run має шукати range_id_log.json у SysWOW64'
+    Test-BRAVOCondition `
+        -Condition ($rangeIdX86Plan.Path -eq 'C:\WindowsTest\System32\range_id_log.json') `
+        -Name 'DryRun/RangeIdUsesSystem32OnX86' `
+        -Failure 'x86 Dry Run має шукати range_id_log.json у System32'
+    Test-BRAVOCondition `
+        -Condition (-not $dryRunScriptText.Contains('RangeIdMonitoring.FilePath')) `
+        -Name 'DryRun/RangeIdDoesNotReferenceLegacyFilePath' `
+        -Failure 'Dry Run не може читати legacy RangeIdMonitoring FilePath'
+    Test-BRAVOCondition `
+        -Condition ($legacyRangeIdPlan.Path -eq $rangeIdCanonicalPlan.Path -and -not $legacyRangeIdPlan.Detail.Contains('D:\LIMS')) `
+        -Name 'DryRun/RangeIdLegacyFilePathCannotOverrideCanonicalPath' `
+        -Failure 'legacy Range ID path не може перевизначати canonical system path'
+    Test-BRAVOCondition `
+        -Condition ($rangeIdMissingPlan.Status -eq 'WARN' -and $rangeIdMissingPlan.Path -eq $rangeIdCanonicalPlan.Path) `
+        -Name 'DryRun/MissingCanonicalRangeIdIsWarningNotFatal' `
+        -Failure 'відсутній canonical range_id_log.json має бути WARN, не fatal'
+    Test-BRAVOCondition `
+        -Condition (-not $rangeIdCanonicalPlan.Path.Contains('LIMS') -and -not $rangeIdCanonicalPlan.Detail.Contains('fallback')) `
+        -Name 'DryRun/RangeIdHasNoLimsRootFallback' `
+        -Failure 'Range ID Dry Run не може мати fallback до LIMSRoot'
+
+    $absentBravoWebDryRunPlan = & $dryRunPlanModule {
+        Get-BRAVODryRunOptionalComponentPlan `
+            -BravoWebEnabled $true `
+            -BravoWebServiceExists $false `
+            -BravoWebServiceDisabled $false `
+            -ExchangeApiServiceExists $false `
+            -ExchangeApiServiceDisabled $false `
+            -SystemLogRoot 'C:\SystemLog' `
+            -ExchangeApiServiceName 'exchangAPI'
+    }
+    $disabledConfigBravoWebDryRunPlan = & $dryRunPlanModule {
+        Get-BRAVODryRunOptionalComponentPlan `
+            -BravoWebEnabled $false `
+            -BravoWebServiceExists $true `
+            -BravoWebServiceDisabled $false `
+            -ExchangeApiServiceExists $false `
+            -ExchangeApiServiceDisabled $false `
+            -SystemLogRoot 'C:\SystemLog' `
+            -ExchangeApiServiceName 'exchangAPI'
+    }
+    $presentExchangeApiDryRunPlan = & $dryRunPlanModule {
+        Get-BRAVODryRunOptionalComponentPlan `
+            -BravoWebEnabled $false `
+            -BravoWebServiceExists $false `
+            -BravoWebServiceDisabled $false `
+            -ExchangeApiServiceExists $true `
+            -ExchangeApiServiceDisabled $false `
+            -SystemLogRoot 'C:\SystemLog' `
+            -ExchangeApiServiceName 'exchangAPI'
+    }
+    $presentBravoWebDryRunPlan = & $dryRunPlanModule {
+        Get-BRAVODryRunOptionalComponentPlan `
+            -BravoWebEnabled $true `
+            -BravoWebServiceExists $true `
+            -BravoWebServiceDisabled $false `
+            -ExchangeApiServiceExists $false `
+            -ExchangeApiServiceDisabled $false `
+            -SystemLogRoot 'C:\SystemLog' `
+            -ExchangeApiServiceName 'exchangAPI'
+    }
+    Test-BRAVOCondition `
+        -Condition ($absentBravoWebDryRunPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\BravoWeb\Apache' -and $absentBravoWebDryRunPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\BravoWeb\Application') `
+        -Name 'DryRun/AbsentBravoWebDoesNotProbeWebDirectories' `
+        -Failure 'відсутній BRAVO Web не може додавати web directories до write probes'
+    Test-BRAVOCondition `
+        -Condition ($absentBravoWebDryRunPlan.ServiceNames -notcontains 'BRAVO Web/Apache (автовизначення)') `
+        -Name 'DryRun/AbsentBravoWebDoesNotEnterServicePlan' `
+        -Failure 'відсутній BRAVO Web не може входити до service plan'
+    Test-BRAVOCondition `
+        -Condition (-not $disabledConfigBravoWebDryRunPlan.BravoWebEligible -and $disabledConfigBravoWebDryRunPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\BravoWeb\Apache') `
+        -Name 'DryRun/DisabledConfigBravoWebDoesNotProbeWebDirectories' `
+        -Failure 'вимкнений у config BRAVO Web не може запускати web probes'
+    Test-BRAVOCondition `
+        -Condition (-not $absentBravoWebDryRunPlan.BravoWebLegacyDataEligible) `
+        -Name 'DryRun/LegacyBravoWebDirectoryDoesNotActivateAbsentComponent' `
+        -Failure 'legacy BravoWeb directory не може активувати absent component'
+    Test-BRAVOCondition `
+        -Condition ($absentBravoWebDryRunPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\exchangAPI') `
+        -Name 'DryRun/AbsentExchangeApiDoesNotProbeLogDirectory' `
+        -Failure 'відсутній exchangAPI не може додавати log directory до write probes'
+    Test-BRAVOCondition `
+        -Condition ($absentBravoWebDryRunPlan.ServiceNames -notcontains 'exchangAPI') `
+        -Name 'DryRun/AbsentExchangeApiDoesNotEnterServicePlan' `
+        -Failure 'відсутній exchangAPI не може входити до service plan'
+    Test-BRAVOCondition `
+        -Condition (-not $absentBravoWebDryRunPlan.ExchangeApiLegacyDataEligible) `
+        -Name 'DryRun/LegacyExchangeApiDirectoryDoesNotActivateAbsentComponent' `
+        -Failure 'legacy exchangAPI directory не може активувати absent component'
+    Test-BRAVOCondition `
+        -Condition ($presentExchangeApiDryRunPlan.WriteAccessTargets.Keys -contains 'SystemLog\exchangAPI' -and $presentExchangeApiDryRunPlan.ServiceNames -contains 'exchangAPI') `
+        -Name 'DryRun/PresentExchangeApiPreservesProbeAndPlan' `
+        -Failure 'встановлений active exchangAPI має зберігати probe і service plan'
+    Test-BRAVOCondition `
+        -Condition ($presentBravoWebDryRunPlan.WriteAccessTargets.Keys -contains 'SystemLog\BravoWeb\Apache' -and $presentBravoWebDryRunPlan.WriteAccessTargets.Keys -contains 'SystemLog\BravoWeb\Application' -and $presentBravoWebDryRunPlan.ServiceNames -contains 'BRAVO Web/Apache (автовизначення)') `
+        -Name 'DryRun/PresentBravoWebPreservesProbeAndPlan' `
+        -Failure 'встановлений active BRAVO Web має зберігати web probes і service plan'
     Test-BRAVOCondition `
         -Condition (
             $healthScriptText.Contains('Format-HealthIssueFileName -Issue $Issue') -and
