@@ -920,7 +920,7 @@ function Get-BackupHealthIssues {
             Kind = 'LocalBackupGeneration'
             Component = 'Generation'
             Reason = "BackupRoot не знайдено: $backupRootPath"
-            FileName = 'BRAVO_BACKUP_<GenerationId>.json'
+            FileName = 'немає даних'
             LastWriteTime = $null
             SizeBytes = $null
         })
@@ -957,7 +957,7 @@ function Get-BackupHealthIssues {
             Kind = 'LocalBackupGeneration'
             Component = 'Generation'
             Reason = 'не знайдено жодного COMPLETE generation manifest'
-            FileName = 'BRAVO_BACKUP_<GenerationId>.json'
+            FileName = 'немає даних'
             LastWriteTime = $null
             SizeBytes = $null
         })

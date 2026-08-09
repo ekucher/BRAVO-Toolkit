@@ -2793,6 +2793,175 @@ try {
         ) `
         -Name 'Health/SFTPArchiveIssueSchemaIsStrictModeSafe' `
         -Failure 'усі SFTPArchive issue-обʼєкти мають містити ExpectedSizeBytes і ActualSizeBytes, бо formatter читає їх під StrictMode'
+    $archiveGenerationStateModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @(
+            'New-BRAVOBackupGenerationState',
+            'Write-BRAVOBackupGenerationManifest',
+            'Get-BRAVOArchiveVSSSummaryValue',
+            'Get-BRAVOArchiveGenerationFailureSummaryReason'
+        )
+    $archiveGenerationTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'BRAVO_GENERATION_MATERIALIZE_{0}' -f [guid]::NewGuid().ToString('N')
+    )
+    try {
+        [void][IO.Directory]::CreateDirectory($archiveGenerationTestRoot)
+        $archiveGenerationProbe = & $archiveGenerationStateModule {
+            param($ManifestRoot)
+            Set-StrictMode -Version Latest
+            $caseResults = New-Object System.Collections.Generic.List[object]
+            foreach ($count in @(0, 1, 3)) {
+                $generationResults = New-Object System.Collections.Generic.List[object]
+                for ($index = 0; $index -lt $count; $index++) {
+                    [void]$generationResults.Add([pscustomobject]@{ Component = "CASE$index" })
+                }
+                $generationResultsArray = $generationResults.ToArray()
+                $state = New-BRAVOBackupGenerationState `
+                    -GenerationId "case_$count" `
+                    -StartedAt (Get-Date) `
+                    -Components $generationResultsArray `
+                    -Status 'COMPLETE'
+                [void]$caseResults.Add([pscustomobject]@{
+                        ExpectedCount = $count
+                        IsArray = $generationResultsArray -is [object[]]
+                        ArrayCount = $generationResultsArray.Count
+                        StateCount = $state.Components.Count
+                    })
+            }
+
+            $snapshotSet = [pscustomobject]@{
+                SnapshotSetId = '{BRAVO-SELF-TEST-SNAPSHOT}'
+                CreatedAt = Get-Date
+                Volumes = @([pscustomobject]@{
+                        VolumeRoot = 'C:\'
+                        DeviceObject = '\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1'
+                        ShadowId = '{BRAVO-SELF-TEST-SHADOW}'
+                        SetId = '{BRAVO-SELF-TEST-SNAPSHOT}'
+                    })
+            }
+            $completeResults = New-Object System.Collections.Generic.List[object]
+            foreach ($componentName in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+                [void]$completeResults.Add([pscustomobject]@{
+                        Component = $componentName
+                        OriginalSourcePath = "C:\Source\$componentName"
+                        SnapshotSourcePath = "\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1\Source\$componentName"
+                        ArchivePath = "C:\Backup\$componentName.mdz"
+                        HashPath = "C:\Backup\$componentName.mdz.sha512"
+                        ArchiveSize = 1
+                        SHA512 = 'self-test'
+                        CreateSuccess = $true
+                        IntegritySuccess = $true
+                        HashSuccess = $true
+                        ErrorStage = $null
+                        Error = $null
+                    })
+            }
+            $completeState = New-BRAVOBackupGenerationState `
+                -GenerationId 'complete_three_components' `
+                -StartedAt (Get-Date) `
+                -SnapshotSet $snapshotSet `
+                -Components $completeResults.ToArray() `
+                -Status 'COMPLETE'
+            $manifestPath = Write-BRAVOBackupGenerationManifest `
+                -GenerationState $completeState `
+                -BackupRoot $ManifestRoot
+            $manifest = [IO.File]::ReadAllText($manifestPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            [pscustomobject]@{
+                Cases = $caseResults.ToArray()
+                StateExists = $null -ne $completeState
+                StateComponentCount = $completeState.Components.Count
+                StateSnapshotSetId = $completeState.SnapshotSetId
+                ManifestExists = Test-Path -LiteralPath $manifestPath -PathType Leaf
+                ManifestStatus = [string]$manifest.status
+                ManifestComponentCount = @($manifest.components.PSObject.Properties).Count
+                ManifestSnapshotSetId = [string]$manifest.snapshotSetId
+                VssAfterStateFailure = Get-BRAVOArchiveVSSSummaryValue `
+                    -SnapshotSet $snapshotSet `
+                    -EnabledArchiveCount 3
+                VssNotCreated = Get-BRAVOArchiveVSSSummaryValue `
+                    -SnapshotSet $null `
+                    -EnabledArchiveCount 3
+                VssSkipped = Get-BRAVOArchiveVSSSummaryValue `
+                    -SnapshotSet $null `
+                    -EnabledArchiveCount 0
+                GenerationFailureReason = Get-BRAVOArchiveGenerationFailureSummaryReason `
+                    -GenerationFinalizationFailed $true `
+                    -GenerationFinalizationFailureReason 'synthetic finalization failure'
+            }
+        } $archiveGenerationTestRoot
+        $archiveGenerationMaterializationWiring = (
+            $archiveScriptText.Contains('$generationResultsArray = $generationResults.ToArray()') -and
+            $archiveScriptText.Contains('-Components $generationResultsArray') -and
+            -not $archiveScriptText.Contains('$script:backupGenerationResults = @($generationResults)') -and
+            -not $archiveScriptText.Contains('-Components @($generationResults)')
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $archiveGenerationMaterializationWiring -and
+                @($archiveGenerationProbe.Cases | Where-Object {
+                    -not $_.IsArray -or $_.ArrayCount -ne $_.ExpectedCount -or $_.StateCount -ne $_.ExpectedCount
+                }).Count -eq 0 -and
+                $archiveGenerationProbe.StateExists -and
+                $archiveGenerationProbe.StateComponentCount -eq 3 -and
+                $archiveGenerationProbe.StateSnapshotSetId -eq '{BRAVO-SELF-TEST-SNAPSHOT}' -and
+                $archiveGenerationProbe.ManifestExists -and
+                $archiveGenerationProbe.ManifestStatus -eq 'COMPLETE' -and
+                $archiveGenerationProbe.ManifestComponentCount -eq 3 -and
+                $archiveGenerationProbe.ManifestSnapshotSetId -eq '{BRAVO-SELF-TEST-SNAPSHOT}'
+            ) `
+            -Name 'Archive/GenerationResultsMaterializeSafely' `
+            -Failure 'List[object] generation results мають безпечно materialize у масив для 0/1/3 елементів; три успішні компоненти мають формувати COMPLETE manifest зі SnapshotSetId'
+        Test-BRAVOCondition `
+            -Condition (
+                $archiveGenerationProbe.VssAfterStateFailure -eq 'OK ({BRAVO-SELF-TEST-SNAPSHOT})' -and
+                $archiveGenerationProbe.VssNotCreated -eq 'FAILED' -and
+                $archiveGenerationProbe.VssSkipped -eq 'SKIPPED' -and
+                $archiveGenerationProbe.GenerationFailureReason -eq 'Generation: FAILED. Причина: synthetic finalization failure' -and
+                (Resolve-BRAVOExitCode -LocalArchiveFailed -HealthCritical) -eq 40
+            ) `
+            -Name 'Archive/GenerationFailurePreservesVssAndPrimaryExit' `
+            -Failure 'VSS summary має залежати від фактичного Snapshot Set, а generation finalization failure має лишатися primary LocalArchiveFailed перед HealthCritical'
+    } finally {
+        if (Test-Path -LiteralPath $archiveGenerationTestRoot -PathType Container) {
+            Remove-Item -LiteralPath $archiveGenerationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BackupHealthIssues')
+    $healthNoGenerationRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'BRAVO_HEALTH_NO_GENERATION_{0}' -f [guid]::NewGuid().ToString('N')
+    )
+    try {
+        [void][IO.Directory]::CreateDirectory($healthNoGenerationRoot)
+        $healthNoGenerationIssue = & $healthGenerationModule {
+            param($BackupRoot)
+            Set-StrictMode -Version Latest
+            $archiveDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Enabled = $true })
+            $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24 }
+            $backupRootPath = $BackupRoot
+            $healthCheckStarted = Get-Date
+            $script:healthLatestArchives = @{}
+            function Get-BRAVOFiles {
+                param([string]$Path, [string]$Filter)
+                return @(Get-ChildItem -LiteralPath $Path -File -Filter $Filter -ErrorAction SilentlyContinue)
+            }
+            function Write-HealthLog { param($Message, $Level) }
+            return @(Get-BackupHealthIssues)[0]
+        } $healthNoGenerationRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $healthNoGenerationIssue.Reason -eq 'не знайдено жодного COMPLETE generation manifest' -and
+                $healthNoGenerationIssue.FileName -eq 'немає даних' -and
+                $healthNoGenerationIssue.FileName -ne 'BRAVO_BACKUP_.json'
+            ) `
+            -Name 'Health/MissingCompleteGenerationHasNoFictitiousFileName' `
+            -Failure 'за відсутності COMPLETE generation Health має показувати причину, але не вигаданий BRAVO_BACKUP_.json'
+    } finally {
+        if (Test-Path -LiteralPath $healthNoGenerationRoot -PathType Container) {
+            Remove-Item -LiteralPath $healthNoGenerationRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     $archiveFatalDiagnosticsModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
         -FunctionNames @('Write-BRAVOArchiveFatalDiagnostics')

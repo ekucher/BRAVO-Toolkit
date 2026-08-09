@@ -775,6 +775,34 @@ function Write-BRAVOArchiveFatalDiagnostics {
     }
 }
 
+function Get-BRAVOArchiveVSSSummaryValue {
+    param(
+        [object]$SnapshotSet,
+        [int]$EnabledArchiveCount
+    )
+
+    if ($null -ne $SnapshotSet -and
+        -not [string]::IsNullOrWhiteSpace([string]$SnapshotSet.SnapshotSetId)) {
+        return "OK ($($SnapshotSet.SnapshotSetId))"
+    }
+    if ($EnabledArchiveCount -eq 0) {
+        return 'SKIPPED'
+    }
+    return 'FAILED'
+}
+
+function Get-BRAVOArchiveGenerationFailureSummaryReason {
+    param(
+        [bool]$GenerationFinalizationFailed,
+        [string]$GenerationFinalizationFailureReason
+    )
+
+    if (-not $GenerationFinalizationFailed) {
+        return $null
+    }
+    return "Generation: FAILED. Причина: $GenerationFinalizationFailureReason"
+}
+
 # Усі три історичні хелпери прогресу тепер малюють одну смугу
 # (BRAVO.Console). Раніше загальна й покомпонентна смуги дублювали одна одну,
 # а індикатор 7-Zip додавав третій вкладений рівень.
@@ -5280,6 +5308,8 @@ function Main {
     $script:backupGenerationId = $generationId
     $generationSnapshotSet = $null
     $generationResults = New-Object System.Collections.Generic.List[object]
+    $generationFinalizationFailed = $false
+    $generationFinalizationFailureReason = $null
 
     try {
         if ($readyArchives.Count -gt 0) {
@@ -5564,12 +5594,16 @@ function Main {
         } else {
             'INCOMPLETE'
         }
-        $script:backupGenerationResults = @($generationResults)
+        # Windows PowerShell 5.1 binder кидає System.ArgumentException
+        # ("Argument types do not match") для @($genericList). Явно
+        # materialize List[object], перш ніж передавати результати у state.
+        $generationResultsArray = $generationResults.ToArray()
+        $script:backupGenerationResults = $generationResultsArray
         $script:backupGenerationState = New-BRAVOBackupGenerationState `
             -GenerationId $generationId `
             -StartedAt $scriptStartTime `
             -SnapshotSet $generationSnapshotSet `
-            -Components @($generationResults) `
+            -Components $generationResultsArray `
             -Status $script:backupGenerationStatus
         if ($enabledArchives.Count -gt 0) {
             try {
@@ -5578,6 +5612,11 @@ function Main {
                     -BackupRoot $backupRootPath
             } catch {
                 Write-Log "Не вдалося записати manifest generation ${generationId}: $($_.Exception.Message)" -Level "WARNING"
+                $generationFinalizationFailed = $true
+                $generationFinalizationFailureReason = $_.Exception.Message
+                $script:backupGenerationStatus = 'FAILED'
+                $script:backupGenerationState.Status = 'FAILED'
+                $generationManifestPath = $null
                 $operationFailed = $true
             }
         }
@@ -5598,6 +5637,8 @@ function Main {
             [string]$script:backupGenerationStatus -eq 'COMPLETE') {
             $script:backupGenerationStatus = 'FAILED'
         }
+        $generationFinalizationFailed = $true
+        $generationFinalizationFailureReason = $_.Exception.Message
         $operationFailed = $true
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
@@ -6092,7 +6133,7 @@ function Main {
         $script:processExitCode = Resolve-BRAVOExitCode `
             -InvalidConfiguration:(-not $sftpConfigurationValid -or -not $smbConfigurationValid -or -not $archiveConsistencyValid -or -not $systemAccessValid) `
             -CredentialsUnavailable:(-not $archiveCredentialValid) `
-            -LocalArchiveFailed:$anyLocalArchiveFailed `
+            -LocalArchiveFailed:($anyLocalArchiveFailed -or $generationFinalizationFailed) `
             -IntegrityTestFailed:$anyIntegrityTestFailed `
             -HashValidationFailed:$anyHashValidationFailed `
             -SftpFailed:([bool]$sftpStepFailed) `
@@ -6115,7 +6156,11 @@ function Main {
     $summaryReason = $null
     $summaryTool = $null
     $summaryToolExitCode = $null
-    if ($null -ne $firstFailedComponent) {
+    if ($generationFinalizationFailed) {
+        $summaryReason = Get-BRAVOArchiveGenerationFailureSummaryReason `
+            -GenerationFinalizationFailed $generationFinalizationFailed `
+            -GenerationFinalizationFailureReason $generationFinalizationFailureReason
+    } elseif ($null -ne $firstFailedComponent) {
         $failedResult = $results[$firstFailedComponent.Type]
         $summaryReason = switch ([string]$failedResult.ErrorStage) {
             'VSS' { "VSS SNAPSHOT SET FAILED for $($firstFailedComponent.Type)" }
@@ -6148,12 +6193,11 @@ function Main {
     Write-BRAVOResultField -Label 'Створено архівів' -Value ("{0} з {1}" -f $successCount, $totalCount)
     Write-BRAVOResultField -Label 'Generation' -Value ([string]$script:backupGenerationId)
     Write-BRAVOResultField -Label 'Generation status' -Value ([string]$script:backupGenerationStatus)
-    Write-BRAVOResultField -Label 'VSS Snapshot Set' -Value $(
-        if ($null -ne $script:backupGenerationState -and
-            -not [string]::IsNullOrWhiteSpace([string]$script:backupGenerationState.SnapshotSetId)) {
-            "OK ($($script:backupGenerationState.SnapshotSetId))"
-        } elseif ($enabledArchives.Count -eq 0) { 'SKIPPED' } else { 'FAILED' }
-    )
+    Write-BRAVOResultField `
+        -Label 'VSS Snapshot Set' `
+        -Value (Get-BRAVOArchiveVSSSummaryValue `
+            -SnapshotSet $generationSnapshotSet `
+            -EnabledArchiveCount $enabledArchives.Count)
     # Measure-Object -Property не резолвить ключі Hashtable через reflection
     # (results зберігає @{...}, не [pscustomobject]) — тому спершу проєктуємо
     # значення через ForEach-Object, і лише готові числа йдуть у Measure-Object.
