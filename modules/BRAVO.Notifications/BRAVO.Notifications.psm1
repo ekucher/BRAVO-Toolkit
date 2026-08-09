@@ -225,6 +225,33 @@ function Format-BRAVOOperatorVersionLine {
     return "$ProductName $versionText · $buildText"
 }
 
+# Discord/Slack рендерять текст пропорційним шрифтом, тому вирівнювання
+# статус-іконки пробілами (PadRight) або фіксованою кількістю пробілів
+# ламається щоразу, коли довжина назви компонента (BLOG/MODEL/BRAVOEXCH/
+# BAZA_APP) відрізняється. Замість вирівнювання — статус завжди перша
+# колонка рядка, без padding.
+function Format-BRAVOOperatorStatusLine {
+    param(
+        [ValidateSet("SUCCESS", "WARNING", "CRITICAL", "ERROR")]
+        [string]$Status = "SUCCESS",
+        [Parameter(Mandatory = $true)][string]$Icon,
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Detail
+    )
+
+    $statusIcon = switch ($Status) {
+        "SUCCESS" { ":white_check_mark:" }
+        "WARNING" { ":warning:" }
+        default { ":x:" }
+    }
+
+    $line = "$statusIcon $Icon $Name"
+    if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+        $line += " — $Detail"
+    }
+    return $line
+}
+
 function New-BRAVOOperatorNotificationMessage {
     param(
         [ValidateSet("SUCCESS", "WARNING", "CRITICAL", "ERROR")]

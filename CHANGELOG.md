@@ -1,5 +1,22 @@
 # Changelog
 
+## 5.0.0-dev.12 — 2026-08-09
+
+Minimal UX fix on top of the dev.11 operator notification unification.
+
+- Component/destination status rows (BLOG/BRAVOEXCH/MODEL, Local, SFTP,
+  BAZA_APP/BAZA_WWW, SMB) are now status-first (`✅ 📦 NAME — detail`) via the
+  new shared `Format-BRAVOOperatorStatusLine` helper, instead of padding the
+  component name with fixed spaces before the status icon. Discord and Slack
+  render with a proportional font, so space-padding never aligned and broke
+  differently depending on component name length.
+- `BRAVO_DRY_RUN.ps1 -SendTestNotification` now converts the Discord test
+  message through the same `ConvertTo-DiscordNotificationText` contract as
+  Archive/Health/Maintenance, instead of sending raw `:emoji:` tokens to the
+  Discord webhook. Slack is unaffected — Slack resolves `:shortcode:` natively.
+- No changes to PASS/WARN/FAIL business logic, archive/VSS/retention/SFTP
+  semantics, exit codes, or NotificationMode behavior.
+
 ## 5.0.0-dev.11 — 2026-08-09
 
 Operator notification UX is unified across Slack and Discord.

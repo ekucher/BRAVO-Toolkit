@@ -1433,6 +1433,22 @@ try {
     $legacyHealthyCopyText = "Остання справна " + "копія"
     Test-BRAVOCondition -Condition (-not ($notifySuccess + $notifyWarning).Contains($legacyHealthyCopyText)) -Name "Notifications/HealthDoesNotUseLastHealthyCopyWording" -Failure "operator notification не має використовувати legacy health wording"
     Test-BRAVOCondition -Condition ($notifySuccess -notmatch "\.mdz") -Name "Notifications/HealthSuccessDoesNotExposeArchiveFilename" -Failure "Health SUCCESS не має показувати archive filename"
+
+    # dev.12: status-first component rows. Discord/Slack рендерять
+    # пропорційним шрифтом, тому padding пробілами (стара :package: NAME
+    # <spaces> :white_check_mark: схема) ламав вирівнювання щоразу, коли
+    # довжина назви компонента відрізнялась (BLOG/MODEL/BRAVOEXCH/BAZA_APP).
+    $statusLineBlog = Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":package:" -Name "BLOG" -Detail "53.88 МБ"
+    $statusLineBravoexch = Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":package:" -Name "BRAVOEXCH" -Detail "29.34 КБ"
+    $statusLineLocal = Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":floppy_disk:" -Name "Local"
+    $statusLineWarning = Format-BRAVOOperatorStatusLine -Status WARNING -Icon ":package:" -Name "MODEL" -Detail "резервна копія прострочена"
+    $statusLineError = Format-BRAVOOperatorStatusLine -Status CRITICAL -Icon ":cloud:" -Name "SFTP" -Detail "синхронізація не виконана"
+    Test-BRAVOCondition -Condition ($statusLineBlog -eq ":white_check_mark: :package: BLOG — 53.88 МБ") -Name "Notifications/StatusLineIsIconFirst" -Failure "Format-BRAVOOperatorStatusLine має ставити статус-іконку першою колонкою без padding пробілами"
+    Test-BRAVOCondition -Condition ($statusLineBlog.IndexOf(":package:") -eq $statusLineBravoexch.IndexOf(":package:")) -Name "Notifications/StatusLineIndependentOfNameLength" -Failure "довжина назви компонента (BLOG/BRAVOEXCH) не повинна впливати на позицію статус-іконки"
+    Test-BRAVOCondition -Condition ($statusLineLocal -eq ":white_check_mark: :floppy_disk: Local") -Name "Notifications/StatusLineOmitsEmptyDetail" -Failure "status line без Detail не повинен додавати зайве тире"
+    Test-BRAVOCondition -Condition ($statusLineWarning.StartsWith(":warning:")) -Name "Notifications/StatusLineWarningIconFirst" -Failure "WARNING status line має починатись з :warning:"
+    Test-BRAVOCondition -Condition ($statusLineError.StartsWith(":x:")) -Name "Notifications/StatusLineErrorIconFirst" -Failure "CRITICAL/ERROR status line має починатись з :x:"
+
     $bazaLines = @(
         "Причина:",
         "Назви 50 файлів перевищують допустиму довжину для передачі через SFTP.",
@@ -1533,6 +1549,54 @@ try {
     $compatibilityNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"), [Text.Encoding]::UTF8)
     $mentionsDisabledPattern = 'allowed_mentions\s*=\s*@\{\s*parse\s*=\s*@\(\)\s*\}'
     Test-BRAVOCondition -Condition ($archiveNotificationTextForMentions.Contains("Send-BRAVOWebhookNotification") -and ($compatibilityNotificationTextForMentions -match $mentionsDisabledPattern) -and ($maintenanceNotificationTextForMentions -match $mentionsDisabledPattern) -and ($dryRunNotificationTextForMentions -match $mentionsDisabledPattern)) -Name "Notifications/DiscordMentionsRemainDisabled" -Failure "Discord payload має забороняти mentions"
+
+    # dev.12: BRAVO_DRY_RUN.ps1 надсилав у Discord сирі ":emoji:" tokens,
+    # бо Send-TestWebhookNotification не проганяв повідомлення через
+    # ConvertTo-DiscordNotificationText, на відміну від Archive/Health/
+    # Maintenance. Slack навпаки має отримувати сирі tokens незмінними —
+    # Slack резолвить ":shortcode:" нативно, Discord-конвертація там зайва.
+    $sendTestWebhookFunctionText = if ($dryRunNotificationTextForMentions -match
+        '(?s)function Send-TestWebhookNotification \{.*?\n\}') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($sendTestWebhookFunctionText) -and
+            $sendTestWebhookFunctionText.Contains("ConvertTo-DiscordNotificationText -Message `$message") -and
+            $sendTestWebhookFunctionText.Contains('content = (ConvertTo-DiscordNotificationText -Message $message)') -and
+            $sendTestWebhookFunctionText.Contains('@{text = $message}')
+        ) `
+        -Name "Notifications/DryRunDiscordUsesConversionContract" `
+        -Failure "BRAVO_DRY_RUN.ps1 -SendTestNotification для provider=discord має конвертувати повідомлення через ConvertTo-DiscordNotificationText (те саме, що Archive/Health/Maintenance), а provider=slack має лишати сирі :emoji: tokens"
+    $dryRunDiscordSample = New-BRAVOOperatorNotificationMessage `
+        -Severity SUCCESS `
+        -Operation "BRAVO DRY RUN — ТЕСТОВЕ СПОВІЩЕННЯ" `
+        -InstitutionName "TEST-COMPANY" `
+        -InstitutionCode "1234567890" `
+        -HostInformation $notifyHostOff `
+        -ResultLines @(
+            "Credential Manager і надсилання webhook працюють.",
+            "Config: BRAVO.config",
+            "Production-операції архівації, копіювання та видалення не запускалися."
+        ) `
+        -Timestamp ([datetime]"2026-08-09T16:15:03") `
+        -ProductName "BRAVO Dry Run" `
+        -Version "5.0.0-dev.12" `
+        -BuildId "testbuild"
+    $dryRunDiscordRendered = ConvertTo-DiscordNotificationText -Message $dryRunDiscordSample
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunDiscordRendered.Contains("✅ BRAVO DRY RUN — ТЕСТОВЕ СПОВІЩЕННЯ") -and
+            $dryRunDiscordRendered.Contains("🏢 TEST-COMPANY [1234567890]") -and
+            $dryRunDiscordRendered.Contains("🖥️ DEV-LIMS") -and
+            -not $dryRunDiscordRendered.Contains(":white_check_mark:") -and
+            -not $dryRunDiscordRendered.Contains(":office:") -and
+            -not $dryRunDiscordRendered.Contains(":desktop_computer:")
+        ) `
+        -Name "Notifications/DryRunDiscordRendersRealEmoji" `
+        -Failure "після ConvertTo-DiscordNotificationText DryRun-повідомлення для Discord не повинно містити сирих :emoji: tokens"
     $legacyHouseToken = ":" + "der" + "elict_house_" + "building:"
     $legacyActionText = "ПОТРЕБУЄ " + "УВАГИ"
     $legacyFileCountText = "файл" + "(ів)"
@@ -1692,6 +1756,28 @@ try {
         (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psm1"),
         [Text.Encoding]::UTF8
     )
+    Test-BRAVOCondition `
+        -Condition ($notificationScriptText.Contains("function Format-BRAVOOperatorStatusLine")) `
+        -Name "Notifications/StatusLineHelperExists" `
+        -Failure "BRAVO.Notifications повинен експортувати Format-BRAVOOperatorStatusLine для status-first component rows"
+    # dev.12: реальні component-рядки Health SUCCESS (BLOG/BRAVOEXCH/MODEL,
+    # Local, SFTP, BAZA_APP/BAZA_WWW, SMB) мають будуватись через helper, а
+    # не через стару схему з фіксованими пробілами перед :white_check_mark:.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":package:" -Name $_.Type -Detail $sizeText') -and
+            $healthScriptText.Contains('Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":floppy_disk:" -Name "Local"') -and
+            $healthScriptText.Contains('Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":cloud:" -Name "SFTP"') -and
+            $healthScriptText.Contains('Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP" -Detail "синхронізовано"') -and
+            $healthScriptText.Contains('Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW" -Detail "синхронізовано"') -and
+            $healthScriptText.Contains('Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":minidisc:" -Name "SMB"')
+        ) `
+        -Name "Health/SuccessRowsUseStatusLineHelper" `
+        -Failure "Health SUCCESS component rows (BLOG/Local/SFTP/BAZA_APP/BAZA_WWW/SMB) мають будуватись через Format-BRAVOOperatorStatusLine"
+    Test-BRAVOCondition `
+        -Condition ($healthScriptText -notmatch '"\s*:\w+:\s+\S[^"]*\S {2,}:white_check_mark:') `
+        -Name "Health/SuccessRowsDoNotPadStatusIcon" `
+        -Failure "BRAVO.Health.Runtime.ps1 не повинен вирівнювати статус-іконку фіксованими пробілами — Discord/Slack рендерять пропорційним шрифтом"
     $bravoConfigText = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO.config"),
         [Text.Encoding]::UTF8

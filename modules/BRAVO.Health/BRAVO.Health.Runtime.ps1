@@ -3532,7 +3532,7 @@ function Get-BRAVOHealthLatestBackupSummary {
             Sort-Object Type |
             ForEach-Object {
                 $sizeText = if ($null -ne $_.SizeBytes) { Format-FileSize -Bytes ([long]$_.SizeBytes) } else { "розмір невідомий" }
-                ":package: $($_.Type)       :white_check_mark: $sizeText"
+                Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":package:" -Name $_.Type -Detail $sizeText
             }
     )
     return [pscustomobject]@{
@@ -3771,33 +3771,33 @@ function New-SlackSuccessMessage {
     }
 
     $resultLines.Add("")
-    $resultLines.Add(":floppy_disk: Local       :white_check_mark:")
+    $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":floppy_disk:" -Name "Local"))
 
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckArchiveUploads -and
         $componentSettings.SFTP.ArchiveUpload) {
-        $resultLines.Add(":cloud: SFTP        :white_check_mark:")
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":cloud:" -Name "SFTP"))
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaAppSFTPHealthEnabled) {
-        $resultLines.Add(":arrows_counterclockwise: BAZA_APP    :white_check_mark: синхронізовано")
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP" -Detail "синхронізовано"))
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaWWWSFTPHealthEnabled) {
-        $resultLines.Add(":arrows_counterclockwise: BAZA_WWW    :white_check_mark: синхронізовано")
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW" -Detail "синхронізовано"))
     }
     if ($bazaAppLocalHealthEnabled) {
-        $resultLines.Add(":arrows_counterclockwise: BAZA_APP local :white_check_mark:")
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP local"))
     }
     if ($bazaWWWLocalHealthEnabled) {
-        $resultLines.Add(":arrows_counterclockwise: BAZA_WWW local :white_check_mark:")
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW local"))
     }
     if ($backupMonitoring.SMB.Enabled -and
         $backupMonitoring.SMB.CheckArchiveCopies -and
         $componentSettings.SMB.ArchiveCopy) {
-        $resultLines.Add(":minidisc: SMB         :white_check_mark:")
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":minidisc:" -Name "SMB"))
     }
 
     $enabledComponentCount = @(Get-EnabledBackupComponentNames).Count

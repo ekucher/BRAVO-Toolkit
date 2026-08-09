@@ -11,6 +11,7 @@
         'Format-BRAVOOperatorHostLine',
         'Get-BRAVOOperatorPublicIpLine',
         'Format-BRAVOOperatorVersionLine',
+        'Format-BRAVOOperatorStatusLine',
         'New-BRAVOOperatorNotificationMessage',
         'ConvertTo-DiscordNotificationText',
         'Split-DiscordNotificationText'

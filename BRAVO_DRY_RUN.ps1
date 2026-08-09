@@ -483,9 +483,15 @@ function Send-TestWebhookNotification {
         -Version $ScriptVersion `
         -BuildId $ScriptBuildId
 
+    # Production notification paths (Archive/Health/Maintenance) конвертують
+    # :emoji: tokens через ConvertTo-DiscordNotificationText перед відправкою
+    # у Discord — сам New-BRAVOOperatorNotificationMessage залишає токени в
+    # текстовому вигляді, бо Slack резолвить їх нативно. DryRun повинен йти
+    # через той самий presentation contract, інакше Discord отримує сирі
+    # ":white_check_mark:" замість ✅.
     $payload = if ($normalizedProvider -eq "discord") {
         @{
-            content = $message
+            content = (ConvertTo-DiscordNotificationText -Message $message)
             allowed_mentions = @{parse = @()}
         }
     } else {
