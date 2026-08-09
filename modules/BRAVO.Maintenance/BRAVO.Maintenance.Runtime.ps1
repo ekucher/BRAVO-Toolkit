@@ -553,11 +553,49 @@ if ($ApacheServiceExists) {
         $serviceStartType -ieq "Disabled"
     )
 }
-$BravoWebMaintenanceEnabled = (
-    $BravoWebComponentEnabled -and
-    $ApacheServiceExists -and
-    -not $BravoWebServiceDisabledBySystem
-)
+function Get-BRAVOBravoWebComponentPlan {
+    [CmdletBinding()]
+    param(
+        [bool]$ComponentEnabled,
+        [bool]$ServiceExists,
+        [bool]$ServiceDisabled,
+        [int]$ServiceMatchCount
+    )
+
+    $manageInstalledService = $ComponentEnabled -and $ServiceExists -and -not $ServiceDisabled
+    return [pscustomobject]@{
+        SilentlySkipped = $ComponentEnabled -and -not $ServiceExists
+        ManageService = $manageInstalledService
+        WarnDuplicateService = $ServiceExists -and $ServiceMatchCount -gt 1
+        WarningCountDelta = 0
+        # Legacy web data is part of the optional component: it is handled
+        # only when BRAVO Web is enabled and an installed service identifies
+        # the component. A disabled installed service still keeps its data.
+        IncludeLegacyWebData = $ComponentEnabled -and $ServiceExists
+    }
+}
+
+function Get-BRAVOOptionalServiceComponentPlan {
+    [CmdletBinding()]
+    param(
+        [bool]$ServiceExists,
+        [bool]$ServiceDisabled
+    )
+
+    return [pscustomobject]@{
+        SilentlySkipped = -not $ServiceExists
+        ManageService = $ServiceExists -and -not $ServiceDisabled
+        IncludeLegacyData = $ServiceExists
+    }
+}
+
+$bravoWebComponentPlan = Get-BRAVOBravoWebComponentPlan `
+    -ComponentEnabled $BravoWebComponentEnabled `
+    -ServiceExists $ApacheServiceExists `
+    -ServiceDisabled $BravoWebServiceDisabledBySystem `
+    -ServiceMatchCount $BravoWebServiceMatchCount
+$BravoWebMaintenanceEnabled = [bool]$bravoWebComponentPlan.ManageService
+$BravoWebLegacyDataEnabled = [bool]$bravoWebComponentPlan.IncludeLegacyWebData
 
 # Стан основних служб визначається до будь-яких дій з їх компонентами.
 # Відсутня або системно відключена служба повністю вимикає свій компонент.
@@ -694,7 +732,11 @@ $BravoMaintenanceEnabled = $bravoServiceState.Enabled
 $exchangAPIServiceState = Get-ConfiguredServiceState -Name $ExchangAPIServiceName
 $exchangAPIService = $exchangAPIServiceState.Service
 $exchangAPIServiceDisabled = $exchangAPIServiceState.Disabled
-$exchangAPIServiceEnabled = $exchangAPIServiceState.Enabled
+$exchangeApiComponentPlan = Get-BRAVOOptionalServiceComponentPlan `
+    -ServiceExists $exchangAPIServiceState.Exists `
+    -ServiceDisabled $exchangAPIServiceDisabled
+$exchangAPIServiceEnabled = [bool]$exchangeApiComponentPlan.ManageService
+$exchangAPILegacyDataEnabled = [bool]$exchangeApiComponentPlan.IncludeLegacyData
 
 # ===== ГЛОБАЛЬНІ ЗМІННІ (НЕ ЗМІНЮВАТИ) =====
 $script:ScriptStartTime = [DateTime]::Now
@@ -3877,7 +3919,11 @@ $script:BRAVOMaintenanceArchiveStepEnabled = [bool]$script:EnableArchiveAfterMai
 # мігрованій інсталяції рядок "нічого не мігровано" щодня не потрібен.
 $script:BRAVOMaintenanceLegacyMigrationPlan = @(
     Get-BRAVOLegacyLogMigrationPlan -ArchiveRoot (Split-Path -Path $SYSTEM_LOG_ROOT -Parent) -LogRoot $SYSTEM_LOG_ROOT |
-        Where-Object { Test-Path -LiteralPath $_.LegacyPath -PathType Container }
+        Where-Object {
+            ($_.ComponentName -ne 'BravoWeb' -or $BravoWebLegacyDataEnabled) -and
+                ($_.ComponentName -ne 'exchangAPI' -or $exchangAPILegacyDataEnabled) -and
+                (Test-Path -LiteralPath $_.LegacyPath -PathType Container)
+        }
 )
 $script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMigrationPlan.Count -gt 0)
 # Вільне місце, директорії, зупинка служб, відновлення служб і очистка
@@ -4019,12 +4065,10 @@ if (-not $BravoWebComponentEnabled) {
     Write-Log -Message "Компонент BRAVO Web: ВИМКНЕНО (служба $BravoWebServiceName має тип запуску Disabled)" -NoTimestamp
 } elseif ($ApacheServiceExists) {
     Write-Log -Message "Служба BRAVO Web: $BravoWebServiceDisplayName [$BravoWebServiceName]" -NoTimestamp
-    if ($BravoWebServiceMatchCount -gt 1) {
+    if ($bravoWebComponentPlan.WarnDuplicateService) {
         Write-Log -Message "Знайдено $BravoWebServiceMatchCount служб для одного httpd.exe; обрано службу [$BravoWebServiceName] зі станом $($ApacheService.Status)" -Level "WARNING"
     }
     Write-Log -Message "Обробка веб-логів: $(if ($ApacheEnabled) {'Увімкнена'} else {'Вимкнена'})" -NoTimestamp
-} else {
-    Write-Log -Message "Службу Apache для BRAVO Web не знайдено" -Level "WARNING"
 }
 
 if ($BravoMaintenanceEnabled) {
@@ -4341,8 +4385,6 @@ if ($exchangAPIServiceEnabled) {
     }
 } elseif ($exchangAPIServiceDisabled) {
     Write-Log -Message "Служба $ExchangAPIServiceName має тип запуску Disabled - керування пропущено" -Level "INFO"
-} else {
-    Write-Log -Message "Службу $ExchangAPIServiceName не встановлено - керування пропущено" -Level "INFO"
 }
 
 # 3. Зупинка служби BRAVO
@@ -4958,7 +5000,10 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 # Каталоги-дати, що приїхали міграцією зі старого <ArchiveRoot>\Br-a-vo.web,
 # лежать безпосередньо в LOGS\BravoWeb (тоді Apache і www\log ще не були
 # розділені). Без окремого рядка вони лишилися б поза будь-яким retention.
-$bravoWebLegacyOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
+$bravoWebLegacyOldDirs = @()
+if ($BravoWebLegacyDataEnabled) {
+    $bravoWebLegacyOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
+}
 
 # Стиснуті .mdz програмних журналів мають ВЛАСНИЙ строк зберігання
 # (CompressedLogDays), незалежний від ArchiveDays: перший визначає, коли
@@ -4976,7 +5021,9 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 }
 # Легасі-каталоги-дати, що переїхали в LOGS\BravoWeb безпосередньо (до
 # розділення на Apache\ і Application\), пакуються з тим самим префіксом.
-$compressedLogRetentionTargets += [pscustomobject]@{ Path = $BRAVOWEB_LOG_DIR; Prefix = 'BravoWeb' }
+if ($BravoWebLegacyDataEnabled) {
+    $compressedLogRetentionTargets += [pscustomobject]@{ Path = $BRAVOWEB_LOG_DIR; Prefix = 'BravoWeb' }
+}
 
 $expiredCompressedLogCount = 0
 $compressedLogCutoff = (Get-Date).AddDays(-$COMPRESSED_LOG_RETENTION_DAYS)
@@ -5033,7 +5080,7 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled -and $apacheOldDirs.Count -g
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled -and $bravoWebAppOldDirs.Count -gt 0) {
     Process-OldData -Path $BRAVOWEB_APP_LOG_DIR -ArchiveNamePrefix "BravoWeb" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
 }
-if ($bravoWebLegacyOldDirs.Count -gt 0) {
+if ($BravoWebLegacyDataEnabled -and $bravoWebLegacyOldDirs.Count -gt 0) {
     Process-OldData -Path $BRAVOWEB_LOG_DIR -ArchiveNamePrefix "BravoWeb" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
 }
 

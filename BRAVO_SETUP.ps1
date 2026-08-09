@@ -111,6 +111,119 @@ function Invoke-ChildPowerShell {
     }
 }
 
+function New-BRAVOManualLauncherContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [ValidateSet('-ForceRestore')][string[]]$Arguments = @(),
+        [switch]$RequiresConfirmation
+    )
+
+    foreach ($path in @($EntryScriptPath, $ConfigPath)) {
+        if (-not [IO.Path]::IsPathRooted($path) -or $path.Contains('"')) {
+            throw "Некоректний шлях для manual launcher: $path"
+        }
+        if ($path -cmatch '[^\x00-\x7F]') {
+            throw "Manual launcher не підтримує не-ASCII шлях: $path"
+        }
+    }
+
+    $commandArguments = if ($Arguments.Count -gt 0) { ' ' + ($Arguments -join ' ') } else { '' }
+    $lines = @(
+        '@echo off',
+        'setlocal'
+    )
+    if ($RequiresConfirmation) {
+        $lines += @(
+            'echo.',
+            'echo WARNING: BRAVO Maintenance will run with FORCED RESTORE.',
+            'echo This operation will perform restore regardless of the normal schedule.',
+            'echo.',
+            'choice /C YN /N /M "Continue? [Y/N]: "',
+            'if errorlevel 2 exit /b 0',
+            ''
+        )
+    }
+    $lines += @(
+        'set "BRAVO_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"',
+        ('"%BRAVO_PS%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}"{2}' -f $EntryScriptPath, $ConfigPath, $commandArguments),
+        'exit /b %ERRORLEVEL%',
+        ''
+    )
+    return ($lines -join "`r`n")
+}
+
+function Write-BRAVOManualLaunchers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
+
+    foreach ($path in @($BackupRoot, $RuntimeRoot, $ConfigPath)) {
+        if (-not [IO.Path]::IsPathRooted($path)) {
+            throw "Очікувався абсолютний шлях для manual launcher: $path"
+        }
+    }
+
+    $resolvedRuntimeRoot = [IO.Path]::GetFullPath($RuntimeRoot)
+    $resolvedConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+    $resolvedBackupRoot = [IO.Path]::GetFullPath($BackupRoot)
+    if (-not (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf)) {
+        throw "Файл конфігурації для manual launcher не знайдено: $resolvedConfigPath"
+    }
+
+    $launchers = @(
+        [pscustomobject]@{ Name = 'BRAVO_ARCHIV.cmd'; Script = 'BRAVO_ARCHIV.ps1'; Arguments = @(); RequiresConfirmation = $false },
+        [pscustomobject]@{ Name = 'BRAVO_MAINTENANCE.cmd'; Script = 'BRAVO_MAINTENANCE.ps1'; Arguments = @(); RequiresConfirmation = $false },
+        [pscustomobject]@{ Name = 'BRAVO_MAINTENANCE_FORCE_RESTORE.cmd'; Script = 'BRAVO_MAINTENANCE.ps1'; Arguments = @('-ForceRestore'); RequiresConfirmation = $true }
+    )
+    $launcherContents = @()
+    foreach ($launcher in $launchers) {
+        $entryScriptPath = Join-Path $resolvedRuntimeRoot $launcher.Script
+        if (-not (Test-Path -LiteralPath $entryScriptPath -PathType Leaf)) {
+            throw "Скрипт для manual launcher не знайдено: $entryScriptPath"
+        }
+        $launcherContents += [pscustomobject]@{
+            Path = Join-Path $resolvedBackupRoot $launcher.Name
+            Content = New-BRAVOManualLauncherContent `
+                -EntryScriptPath $entryScriptPath `
+                -ConfigPath $resolvedConfigPath `
+                -Arguments $launcher.Arguments `
+                -RequiresConfirmation:$launcher.RequiresConfirmation
+        }
+    }
+
+    [void][IO.Directory]::CreateDirectory($resolvedBackupRoot)
+    $ascii = New-Object Text.ASCIIEncoding
+    foreach ($launcher in $launcherContents) {
+        [IO.File]::WriteAllText(
+            $launcher.Path,
+            $launcher.Content,
+            $ascii
+        )
+    }
+}
+
+function Invoke-BRAVOManualLauncherSetup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$SetupConfiguration,
+        [ValidateSet('Full', 'Credentials', 'Scheduler', 'Test')][string]$Action,
+        [switch]$ValidateOnly
+    )
+
+    if ($ValidateOnly -or $Action -ne 'Full') {
+        return
+    }
+    Write-BRAVOManualLaunchers `
+        -BackupRoot $SetupConfiguration.BackupRoot `
+        -RuntimeRoot $SetupConfiguration.Root `
+        -ConfigPath $SetupConfiguration.ConfigPath
+}
+
 function Get-SetupConfiguration {
     param([string]$Path)
 
@@ -137,6 +250,7 @@ function Get-SetupConfiguration {
     return [pscustomobject]@{
         ConfigPath = $resolvedPath
         Root = $runtimeRoot
+        BackupRoot = [string]$global:backupRootPath
         CredentialScript = $credentialScript
         DryRunScript = Join-Path $runtimeRoot "BRAVO_DRY_RUN.ps1"
         # Task Installer/Diagnose — runtime-ресурси комплекту, тому беруться з
@@ -239,6 +353,12 @@ try {
         -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
         -Mode "$Action$(if ($ValidateOnly) { ' / VALIDATE-ONLY' } else { '' })"
     Write-BRAVOResultField -Label 'Config' -Value $setup.ConfigPath
+    if ($Action -eq 'Full' -and -not $ValidateOnly) {
+        Invoke-BRAVOManualLauncherSetup `
+            -SetupConfiguration $setup `
+            -Action $Action `
+            -ValidateOnly:$ValidateOnly
+    }
 
     # Discovery джерел (CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md): показуємо
     # завжди, це лише read-only читання вже обчисленого
