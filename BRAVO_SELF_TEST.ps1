@@ -6401,6 +6401,77 @@ try {
             -Name "LogRotation/02-BravoIniPathOnX86" `
             -Failure "на 32-бітній ОС очікуваний bravo.ini — рівно %SystemRoot%\System32\bravo.ini"
 
+        # range_id_log.json має той самий WOW64-контракт, що й bravo.ini:
+        # один системний каталог, жодного fallback до LIMSRoot або legacy
+        # RangeIdMonitoring.FilePath.
+        $rangeIdPathOnX64 = Get-BRAVOSystemRangeIdLogPath `
+            -SystemRoot "C:\WindowsTest" `
+            -Is64BitOperatingSystem $true
+        $rangeIdPathOnX86 = Get-BRAVOSystemRangeIdLogPath `
+            -SystemRoot "C:\WindowsTest" `
+            -Is64BitOperatingSystem $false
+        Test-BRAVOCondition `
+            -Condition ($rangeIdPathOnX64 -eq "C:\WindowsTest\SysWOW64\range_id_log.json") `
+            -Name "RangeId/01-SystemPathOnX64" `
+            -Failure "на 64-бітній ОС range_id_log.json має визначатись рівно в %SystemRoot%\SysWOW64"
+        Test-BRAVOCondition `
+            -Condition ($rangeIdPathOnX86 -eq "C:\WindowsTest\System32\range_id_log.json") `
+            -Name "RangeId/02-SystemPathOnX86" `
+            -Failure "на 32-бітній ОС range_id_log.json має визначатись рівно в %SystemRoot%\System32"
+        Test-BRAVOCondition `
+            -Condition (
+                (Split-Path -Parent $rangeIdPathOnX64) -eq
+                    (Get-BRAVOSystemDirectoryPath -SystemRoot "C:\WindowsTest" -Is64BitOperatingSystem $true) -and
+                (Split-Path -Parent $rangeIdPathOnX86) -eq
+                    (Get-BRAVOSystemDirectoryPath -SystemRoot "C:\WindowsTest" -Is64BitOperatingSystem $false) -and
+                (Split-Path -Parent $iniPathOnX64) -eq (Split-Path -Parent $rangeIdPathOnX64) -and
+                (Split-Path -Parent $iniPathOnX86) -eq (Split-Path -Parent $rangeIdPathOnX86)
+            ) `
+            -Name "RangeId/03-UsesSameSystemDirectoryContractAsBravoIni" `
+            -Failure "bravo.ini і range_id_log.json мають використовувати один системний каталог для кожної архітектури ОС"
+        $syntheticLimsRoot = Join-Path $rotationTestRoot "RangeIdLimsRoot"
+        $limsRangeIdPath = Join-Path $syntheticLimsRoot "range_id_log.json"
+        [void](New-BRAVOLogRotationFixture -Directory $syntheticLimsRoot -Name "range_id_log.json" -Content '{}')
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath $limsRangeIdPath -PathType Leaf) -and
+                $rangeIdPathOnX64 -ne $limsRangeIdPath -and
+                $rangeIdPathOnX64 -notlike "$syntheticLimsRoot\*"
+            ) `
+            -Name "RangeId/04-LimsRootIsNeverFallback" `
+            -Failure "існування range_id_log.json у LIMSRoot не може підміняти системний шлях"
+        $legacyConfiguredRangeIdPath = "D:\LIMS\range_id_log.json"
+        Test-BRAVOCondition `
+            -Condition (
+                $rangeIdPathOnX64 -ne $legacyConfiguredRangeIdPath -and
+                $maintenanceScriptText.Contains('Get-BRAVOSystemRangeIdLogPath') -and
+                -not $maintenanceScriptText.Contains('RangeIdMonitoring.FilePath')
+            ) `
+            -Name "RangeId/05-LegacyConfiguredFilePathDoesNotOverrideSystemPath" `
+            -Failure "legacy RangeIdMonitoring.FilePath може лишатись у локальному config для сумісності, але не має визначати шлях runtime"
+        $rangeIdUsageModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceScriptText `
+            -FunctionNames @('Test-RangeIdUsage')
+        $missingSystemRangeIdWarning = & $rangeIdUsageModule {
+            param($Path)
+            $messages = New-Object System.Collections.Generic.List[string]
+            function Write-Log {
+                param($Message, $Level)
+                $messages.Add("[$Level] $Message")
+            }
+            function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+            Test-RangeIdUsage -Path $Path -ThresholdPercent 80
+            return @($messages)
+        } $rangeIdPathOnX64
+        Test-BRAVOCondition `
+            -Condition (
+                @($missingSystemRangeIdWarning | Where-Object {
+                    $_ -eq "[WARNING] Файл контролю діапазонів ID не знайдено: $rangeIdPathOnX64"
+                }).Count -eq 1
+            ) `
+            -Name "RangeId/06-MissingSystemFileProducesWarning" `
+            -Failure "відсутній authoritative системний range_id_log.json має давати WARNING з фактичним шляхом без пошуку копій"
+
         # --- Test 3: відсутній bravo.ini -> помилка з назвою шляху, без
         # мовчазного fallback на каталог поруч із bravo.exe ---
         $test3SystemRoot = Join-Path $rotationTestRoot "test03\Windows"

@@ -170,7 +170,6 @@ $requiredConfigPaths = @(
     "Automation.ShutdownTimeoutSeconds",
     "Automation.ArchiveAfterMaintenance",
     "RangeIdMonitoring.Enabled",
-    "RangeIdMonitoring.FilePath",
     "RangeIdMonitoring.ThresholdPercent",
     "RangeIdMonitoring.CheckDelaySeconds",
     "Archiver.Parameters",
@@ -352,7 +351,11 @@ try {
 }
 
 $RangeIdMonitoringEnabled = [System.Convert]::ToBoolean($MaintenanceConfig.RangeIdMonitoring.Enabled)
-$RangeIdLogPath = [Environment]::ExpandEnvironmentVariables([string]$MaintenanceConfig.RangeIdMonitoring.FilePath)
+$RangeIdLogPath = if ($RangeIdMonitoringEnabled) {
+    Get-BRAVOSystemRangeIdLogPath
+} else {
+    $null
+}
 $RangeIdThresholdPercent = [double]$MaintenanceConfig.RangeIdMonitoring.ThresholdPercent
 $RangeIdCheckDelaySeconds = [int]$MaintenanceConfig.RangeIdMonitoring.CheckDelaySeconds
 $arcCommonParams = @($MaintenanceConfig.Archiver.Parameters | ForEach-Object { [string]$_ })
@@ -427,7 +430,7 @@ if ($invalidExcludedDrives.Count -gt 0) {
 }
 
 if ($RangeIdMonitoringEnabled -and [string]::IsNullOrWhiteSpace($RangeIdLogPath)) {
-    Write-Host "ПОМИЛКА: Для моніторингу діапазонів ID потрібно вказати RangeIdMonitoring.FilePath" -ForegroundColor Red
+    Write-Host "ПОМИЛКА: Не вдалося визначити системний шлях до файлу контролю діапазонів ID" -ForegroundColor Red
     exit 30
 }
 

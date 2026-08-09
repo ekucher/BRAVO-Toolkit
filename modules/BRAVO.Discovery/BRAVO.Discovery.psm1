@@ -319,23 +319,12 @@ function Get-BRAVOApacheDocumentRoot {
     return $null
 }
 
-function Get-BRAVOSystemBravoIniPath {
-    # bravo.ini не лежить поруч із bravo.exe — служба BRAVO пише його в
-    # системний каталог Windows. Джерело істини (підтверджено на реальних
-    # інсталяціях): %SystemRoot%\SysWOW64\bravo.ini на 64-бітній Windows,
-    # %SystemRoot%\System32\bravo.ini на 32-бітній.
-    #
-    # Причина розбіжності — WOW64 File System Redirector: BRAVO 32-бітний
-    # процес, і коли він звертається до "System32", 64-бітна Windows
-    # прозоро для нього перенаправляє звернення в SysWOW64. Якщо PowerShell
-    # тут запущено як 64-бітний процес (типово для запланованих завдань),
-    # він бачить СПРАВЖНІй System32 без редиректу — і bravo.ini там просто
-    # немає, бо служба писала його в SysWOW64. На 32-бітній Windows шару
-    # редиректора не існує взагалі, тому System32 — це вже правильний шлях.
-    #
-    # -Is64BitOperatingSystem/-SystemRoot дозволяють self-test підставити
-    # синтетичне значення замість [Environment]::Is64BitOperatingSystem/
-    # $env:SystemRoot — той самий injectable-патерн, що й -Services.
+function Get-BRAVOSystemDirectoryPath {
+    # BRAVO — 32-бітний процес. На x64 Windows звернення служби до
+    # System32 прозоро перенаправляється WOW64 у SysWOW64; на x86 правильним
+    # системним каталогом лишається System32. Системні артефакти BRAVO
+    # (bravo.ini і range_id_log.json) мають один authoritative каталог.
+    # Injectable параметри тримають поведінку детермінованою у self-test.
     [CmdletBinding()]
     param(
         [string]$SystemRoot,
@@ -356,7 +345,39 @@ function Get-BRAVOSystemBravoIniPath {
         [Environment]::Is64BitOperatingSystem
     }
     $systemSubDirectory = if ($resolvedIs64Bit) { 'SysWOW64' } else { 'System32' }
-    return Join-Path $resolvedSystemRoot "$systemSubDirectory\bravo.ini"
+    return Join-Path $resolvedSystemRoot $systemSubDirectory
+}
+
+function Get-BRAVOSystemBravoIniPath {
+    [CmdletBinding()]
+    param(
+        [string]$SystemRoot,
+        [Nullable[bool]]$Is64BitOperatingSystem
+    )
+
+    $systemDirectory = Get-BRAVOSystemDirectoryPath `
+        -SystemRoot $SystemRoot `
+        -Is64BitOperatingSystem $Is64BitOperatingSystem
+    if ([string]::IsNullOrWhiteSpace($systemDirectory)) {
+        return $null
+    }
+    return Join-Path $systemDirectory 'bravo.ini'
+}
+
+function Get-BRAVOSystemRangeIdLogPath {
+    [CmdletBinding()]
+    param(
+        [string]$SystemRoot,
+        [Nullable[bool]]$Is64BitOperatingSystem
+    )
+
+    $systemDirectory = Get-BRAVOSystemDirectoryPath `
+        -SystemRoot $SystemRoot `
+        -Is64BitOperatingSystem $Is64BitOperatingSystem
+    if ([string]::IsNullOrWhiteSpace($systemDirectory)) {
+        return $null
+    }
+    return Join-Path $systemDirectory 'range_id_log.json'
 }
 
 function Resolve-BRAVOInstallationDiscovery {
@@ -1232,7 +1253,9 @@ Export-ModuleMember -Function @(
     'ConvertTo-BRAVOIniPathValue',
     'Test-BRAVOAbsolutePath',
     'Get-BRAVOApacheDocumentRoot',
+    'Get-BRAVOSystemDirectoryPath',
     'Get-BRAVOSystemBravoIniPath',
+    'Get-BRAVOSystemRangeIdLogPath',
     'Resolve-BRAVOInstallationDiscovery',
     'Resolve-BRAVOEffectiveLimsRoot',
     'Resolve-BRAVOEffectiveSystemLogRoot',
