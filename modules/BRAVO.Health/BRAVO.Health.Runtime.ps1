@@ -323,6 +323,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 
 $healthCheckStarted = Get-Date
+$healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
 $script:healthLatestArchives = @{}
 
 if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
@@ -703,14 +704,41 @@ function Format-FileSize {
     return "$Bytes Б"
 }
 
+function ConvertTo-BRAVOUtcDateTime {
+    param([Parameter(Mandatory = $true)][datetime]$Timestamp)
+
+    switch ($Timestamp.Kind) {
+        ([DateTimeKind]::Utc) { return $Timestamp }
+        ([DateTimeKind]::Local) { return $Timestamp.ToUniversalTime() }
+        default {
+            # Generation manifests are produced from local wall-clock time.
+            # Legacy values without an offset are explicitly treated as local.
+            return [datetime]::SpecifyKind($Timestamp, [DateTimeKind]::Local).ToUniversalTime()
+        }
+    }
+}
+
+function Get-BRAVOUtcAge {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Timestamp,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    return (ConvertTo-BRAVOUtcDateTime -Timestamp $NowUtc) -
+        (ConvertTo-BRAVOUtcDateTime -Timestamp $Timestamp)
+}
+
 function Format-BackupAge {
-    param([object]$LastWriteTime)
+    param(
+        [object]$LastWriteTime,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
 
     if ($null -eq $LastWriteTime) {
         return "немає даних"
     }
 
-    $age = (Get-Date) - [datetime]$LastWriteTime
+    $age = Get-BRAVOUtcAge -Timestamp ([datetime]$LastWriteTime) -NowUtc $NowUtc
     if ($age.TotalMinutes -lt 0) {
         return "0 хв."
     }
@@ -933,25 +961,25 @@ function Get-BackupHealthIssues {
             if ([string]$manifest.status -ne 'COMPLETE') {
                 continue
             }
-            $createdAt = $manifestFile.LastWriteTime
+            $createdAtUtc = $manifestFile.LastWriteTimeUtc
             foreach ($dateProperty in @('createdAt', 'startedAt')) {
                 $property = $manifest.PSObject.Properties[$dateProperty]
                 if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                    $createdAt = [datetime]$property.Value
+                    $createdAtUtc = ConvertTo-BRAVOUtcDateTime -Timestamp ([datetime]$property.Value)
                     break
                 }
             }
             $manifestCandidates += [pscustomobject]@{
                 File = $manifestFile
                 Manifest = $manifest
-                CreatedAt = $createdAt
+                CreatedAtUtc = $createdAtUtc
             }
         } catch {
             Write-HealthLog "Generation manifest не прочитано: $($manifestFile.Name): $($_.Exception.Message)" -Level 'WARNING'
         }
     }
 
-    $generation = $manifestCandidates | Sort-Object CreatedAt -Descending | Select-Object -First 1
+    $generation = $manifestCandidates | Sort-Object CreatedAtUtc -Descending | Select-Object -First 1
     if ($null -eq $generation) {
         return @([pscustomobject]@{
             Kind = 'LocalBackupGeneration'
@@ -970,7 +998,7 @@ function Get-BackupHealthIssues {
             Component = 'Generation'
             Reason = 'COMPLETE manifest не містить GenerationId'
             FileName = $generation.File.Name
-            LastWriteTime = $generation.CreatedAt
+            LastWriteTime = $generation.CreatedAtUtc
             SizeBytes = $generation.File.Length
         }
     }
@@ -982,7 +1010,7 @@ function Get-BackupHealthIssues {
             Component = 'Generation'
             Reason = 'COMPLETE manifest не містить components'
             FileName = $generation.File.Name
-            LastWriteTime = $generation.CreatedAt
+            LastWriteTime = $generation.CreatedAtUtc
             SizeBytes = $generation.File.Length
         })
     }
@@ -998,7 +1026,7 @@ function Get-BackupHealthIssues {
                 Component = $componentName
                 Reason = "COMPLETE generation $manifestGenerationId не містить enabled component"
                 FileName = $generation.File.Name
-                LastWriteTime = $generation.CreatedAt
+                LastWriteTime = $generation.CreatedAtUtc
                 SizeBytes = $null
             }
             continue
@@ -1032,7 +1060,7 @@ function Get-BackupHealthIssues {
                 Component = $componentName
                 Reason = "generation $manifestGenerationId некоректний: $invalidReason"
                 FileName = $(if ($null -ne $archiveFile) { $archiveFile.Name } else { $generation.File.Name })
-                LastWriteTime = $generation.CreatedAt
+                LastWriteTime = $generation.CreatedAtUtc
                 SizeBytes = $(if ($null -ne $archiveFile) { $archiveFile.Length } else { $null })
             }
             continue
@@ -1043,19 +1071,19 @@ function Get-BackupHealthIssues {
             FullName = $archiveFile.FullName
             HashPath = $hashPath
             SizeBytes = [long]$archiveFile.Length
-            LastWriteTime = $generation.CreatedAt
+            LastWriteTime = $generation.CreatedAtUtc
             GenerationId = $manifestGenerationId
         }
         Write-HealthLog "Generation $manifestGenerationId / $componentName справний: $($archiveFile.Name), розмір $(Format-FileSize $archiveFile.Length)" -Level 'SUCCESS'
     }
 
-    if (($healthCheckStarted - $generation.CreatedAt) -gt $maximumAge) {
+    if ((Get-BRAVOUtcAge -Timestamp $generation.CreatedAtUtc -NowUtc $healthCheckStartedUtc) -gt $maximumAge) {
         $issues += [pscustomobject]@{
             Kind = 'LocalBackupGeneration'
             Component = 'Generation'
             Reason = "остання COMPLETE generation старша за $($backupMonitoring.MaxBackupAgeHours) год."
             FileName = $generation.File.Name
-            LastWriteTime = $generation.CreatedAt
+            LastWriteTime = $generation.CreatedAtUtc
             SizeBytes = $generation.File.Length
         }
     } elseif ($issues.Count -eq 0) {
@@ -2201,7 +2229,9 @@ function Test-SFTPArchiveCopy {
 
     $remoteLastWriteTime = if ($remoteArchive.Count -gt 0) { $remoteArchive[0].LastWriteTime } else { $null }
     if ($null -ne $remoteLastWriteTime) {
-        $remoteAge = $healthCheckStarted - [datetime]$remoteLastWriteTime
+        $remoteAge = Get-BRAVOUtcAge `
+            -Timestamp ([datetime]$remoteLastWriteTime) `
+            -NowUtc $healthCheckStartedUtc
         if ($remoteAge.TotalHours -gt [double]$backupMonitoring.SFTP.RemoteBackupMaxAgeHours) {
             $problems += "віддалена копія старша за $($backupMonitoring.SFTP.RemoteBackupMaxAgeHours) год."
         }
@@ -2293,7 +2323,9 @@ function Test-BAZAPendingSynchronizationOverdue {
         # вважати новою штатною чергою.
         return $true
     }
-    $pendingAge = $healthCheckStarted - [datetime]$PreviewSummary.OldestLastWriteTime
+    $pendingAge = Get-BRAVOUtcAge `
+        -Timestamp ([datetime]$PreviewSummary.OldestLastWriteTime) `
+        -NowUtc $healthCheckStartedUtc
     return $pendingAge.TotalHours -ge $alertAfterHours
 }
 
@@ -3114,7 +3146,9 @@ function Get-SMBHealthIssues {
 
             $remoteLastWriteTime = if ($remoteArchive) { $remoteArchive.LastWriteTime } else { $null }
             if ($null -ne $remoteLastWriteTime -and
-                ($healthCheckStarted - $remoteLastWriteTime).TotalHours -gt
+                (Get-BRAVOUtcAge `
+                    -Timestamp ([datetime]$remoteLastWriteTime) `
+                    -NowUtc $healthCheckStartedUtc).TotalHours -gt
                 [double]$backupMonitoring.SMB.RemoteBackupMaxAgeHours) {
                 $problems += "віддалена копія старша за $($backupMonitoring.SMB.RemoteBackupMaxAgeHours) год."
             }

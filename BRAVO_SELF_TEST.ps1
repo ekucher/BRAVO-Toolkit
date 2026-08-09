@@ -2793,6 +2793,61 @@ try {
         ) `
         -Name 'Health/SFTPArchiveIssueSchemaIsStrictModeSafe' `
         -Failure 'усі SFTPArchive issue-обʼєкти мають містити ExpectedSizeBytes і ActualSizeBytes, бо formatter читає їх під StrictMode'
+    $healthUtcTimeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'ConvertTo-BRAVOUtcDateTime',
+            'Get-BRAVOUtcAge',
+            'Format-BackupAge'
+        )
+    $healthUtcAgeProbe = & $healthUtcTimeModule {
+        $nowUtc = [datetime]::SpecifyKind([datetime]'2026-08-09T01:52:00', [DateTimeKind]::Utc)
+        $generationUtc = $nowUtc.AddMinutes(-10)
+        $manifestJson = [pscustomobject]@{ createdAt = $generationUtc } | ConvertTo-Json -Compress
+        $manifestTimestamp = [datetime](($manifestJson | ConvertFrom-Json).createdAt)
+        # DateTime subtraction uses ticks, not Kind. This deliberately
+        # simulates a UTC+3 local wall clock without requiring that timezone.
+        $simulatedLocalNow = [datetime]::SpecifyKind($nowUtc.AddHours(3), [DateTimeKind]::Local)
+        $legacyAge = $simulatedLocalNow - $manifestTimestamp
+        $utcAge = Get-BRAVOUtcAge -Timestamp $manifestTimestamp -NowUtc $nowUtc
+        $staleThreshold = [timespan]::FromHours(2)
+        $oldGenerationUtc = $nowUtc.AddHours(-2).AddMinutes(-1)
+        $oldGenerationAge = Get-BRAVOUtcAge -Timestamp $oldGenerationUtc -NowUtc $nowUtc
+        $unspecified = [datetime]::SpecifyKind($generationUtc, [DateTimeKind]::Unspecified)
+        $normalizedUnspecifiedUtc = ConvertTo-BRAVOUtcDateTime -Timestamp $unspecified
+        $expectedUnspecifiedUtc = [datetime]::SpecifyKind(
+            $unspecified,
+            [DateTimeKind]::Local
+        ).ToUniversalTime()
+        [pscustomobject]@{
+            ManifestKind = $manifestTimestamp.Kind
+            UsesMicrosoftDateJson = $manifestJson -match '\\/Date\('
+            LegacyAgeMinutes = [int]$legacyAge.TotalMinutes
+            UtcAgeMinutes = [int]$utcAge.TotalMinutes
+            AgeText = Format-BackupAge -LastWriteTime $manifestTimestamp -NowUtc $nowUtc
+            FreshIsStale = $utcAge -gt $staleThreshold
+            OldIsStale = $oldGenerationAge -gt $staleThreshold
+            UnspecifiedNormalizesToUtc = $normalizedUnspecifiedUtc.Kind -eq [DateTimeKind]::Utc
+            UnspecifiedMatchesLocalContract = $normalizedUnspecifiedUtc -eq $expectedUnspecifiedUtc
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $healthUtcAgeProbe.UsesMicrosoftDateJson -and
+            $healthUtcAgeProbe.ManifestKind -eq [DateTimeKind]::Utc -and
+            $healthUtcAgeProbe.LegacyAgeMinutes -eq 190 -and
+            $healthUtcAgeProbe.UtcAgeMinutes -eq 10 -and
+            $healthUtcAgeProbe.AgeText -eq '10 хв.' -and
+            -not $healthUtcAgeProbe.FreshIsStale -and
+            $healthUtcAgeProbe.OldIsStale -and
+            $healthUtcAgeProbe.UnspecifiedNormalizesToUtc -and
+            $healthUtcAgeProbe.UnspecifiedMatchesLocalContract -and
+            $healthScriptText.Contains('$healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()') -and
+            $healthScriptText.Contains('$manifestFile.LastWriteTimeUtc') -and
+            $healthScriptText.Contains('Get-BRAVOUtcAge -Timestamp $generation.CreatedAtUtc -NowUtc $healthCheckStartedUtc')
+        ) `
+        -Name 'Health/GenerationAgeUsesUtcArithmetic' `
+        -Failure 'generation manifest /Date(...) має нормалізуватися до UTC: 10 хв. не можуть перетворюватися на +timezone offset, а MaxBackupAgeHours має коректно розрізняти fresh і stale generation'
     $archiveGenerationStateModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
         -FunctionNames @(
@@ -2928,7 +2983,11 @@ try {
     }
     $healthGenerationModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $healthScriptText `
-        -FunctionNames @('Get-BackupHealthIssues')
+        -FunctionNames @(
+            'ConvertTo-BRAVOUtcDateTime',
+            'Get-BRAVOUtcAge',
+            'Get-BackupHealthIssues'
+        )
     $healthNoGenerationRoot = Join-Path ([IO.Path]::GetTempPath()) (
         'BRAVO_HEALTH_NO_GENERATION_{0}' -f [guid]::NewGuid().ToString('N')
     )
@@ -2941,6 +3000,7 @@ try {
             $backupMonitoring = [pscustomobject]@{ MaxBackupAgeHours = 24 }
             $backupRootPath = $BackupRoot
             $healthCheckStarted = Get-Date
+            $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
             $script:healthLatestArchives = @{}
             function Get-BRAVOFiles {
                 param([string]$Path, [string]$Filter)
