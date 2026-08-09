@@ -1,5 +1,25 @@
 # Changelog
 
+## 5.0.0-dev.11 — 2026-08-09
+
+Operator notification UX is unified across Slack and Discord.
+
+- Added shared `BRAVO.Notifications` presentation helpers for severity headers,
+  institution/host/public-IP blocks, version/build lines, log references,
+  durations and Ukrainian file-count pluralization.
+- Health success notifications now use `Остання резервна копія`, omit full
+  archive filenames, and show compact component/destination status. Health
+  warning/error notifications use `Остання успішна резервна копія` and put the
+  concrete action before server metadata.
+- BAZA_APP/BAZA_WWW long-name warnings now explain that only problematic files
+  were skipped, show UTF-8 byte actual/limit/overflow, and include at most
+  three examples in Slack/Discord while keeping the full list in logs.
+- Maintenance success notifications are compact, avoid ambiguous restore
+  scheduling text, show only the minimum free-space disk in success, and show
+  disk deficit details for low-space failures.
+- Test/restore/security notifications now use the same operator envelope while
+  preserving NotificationMode, Discord chunking and disabled mentions.
+
 ## 5.0.0-dev.2 — 2026-08-09
 
 Виправлення, виявлені під час тестового розгортання 5.0.0-dev.1. Централізовано

@@ -22,6 +22,8 @@ $null = Start-BRAVOHelperLog `
 # і цей випадок як звичайний [FAIL] запис).
 $dryRunConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.Console.psd1"
 Import-Module -Name $dryRunConsoleModulePath -ErrorAction Stop
+$notificationHelpersPath = Join-Path $PSScriptRoot "modules\BRAVO.Notifications\BRAVO.Notifications.psd1"
+Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 
 # Безпечна симуляція BRAVO/VETOFFICE:
 # - не створює архіви та каталоги;
@@ -465,16 +467,21 @@ function Send-TestWebhookNotification {
     } else {
         "BRAVO"
     }
-    $message = @(
-        "✅ BRAVO — тестове сповіщення"
-        "Об'єкт: $objectText"
-        "Комп'ютер: $env:COMPUTERNAME"
-        "Config: $ConfigFileName"
-        "Час: $((Get-Date).ToString('yyyy-MM-dd HH:mm:ss zzz'))"
-        "🏷️ Версія BRAVO_DRY_RUN: $ScriptVersion від $ScriptDate"
-        "Credential Manager і надсилання webhook працюють."
-        "Production-операції архівації, копіювання та видалення не запускалися."
-    ) -join "`n"
+    $message = New-BRAVOOperatorNotificationMessage `
+        -Severity "SUCCESS" `
+        -Operation "BRAVO DRY RUN — ТЕСТОВЕ СПОВІЩЕННЯ" `
+        -InstitutionName $institution `
+        -InstitutionCode $institutionCode `
+        -HostInformation (Get-HostInformation) `
+        -ResultLines @(
+            "Credential Manager і надсилання webhook працюють.",
+            "Config: $ConfigFileName",
+            "Production-операції архівації, копіювання та видалення не запускалися."
+        ) `
+        -Timestamp (Get-Date) `
+        -ProductName "BRAVO Dry Run" `
+        -Version $ScriptVersion `
+        -BuildId $ScriptBuildId
 
     $payload = if ($normalizedProvider -eq "discord") {
         @{

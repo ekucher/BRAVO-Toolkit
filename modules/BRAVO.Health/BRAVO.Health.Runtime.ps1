@@ -3501,18 +3501,73 @@ function Get-BRAVOHealthConsoleIssueLine {
     return [pscustomobject]@{ Severity = $severity; Component = $component; Detail = $detail }
 }
 
+function Get-BRAVOHealthLatestBackupSummary {
+    $archives = @(
+        $archiveDefinitions |
+            Where-Object { $_.Enabled } |
+            ForEach-Object {
+                $archiveInfo = $script:healthLatestArchives[$_.Type]
+                if ($null -ne $archiveInfo -and $null -ne $archiveInfo.LastWriteTime) {
+                    [pscustomobject]@{
+                        Type = [string]$_.Type
+                        LastWriteTime = [datetime]$archiveInfo.LastWriteTime
+                        SizeBytes = $archiveInfo.SizeBytes
+                        GenerationId = [string]$archiveInfo.GenerationId
+                    }
+                }
+            }
+    )
+    if ($archives.Count -eq 0) {
+        return [pscustomobject]@{
+            Found = $false
+            TimestampText = "не знайдено"
+            AgeText = "немає даних"
+            ComponentLines = @()
+        }
+    }
+
+    $latestTimestamp = @($archives | Sort-Object LastWriteTime -Descending | Select-Object -First 1)[0].LastWriteTime
+    $componentLines = @(
+        $archives |
+            Sort-Object Type |
+            ForEach-Object {
+                $sizeText = if ($null -ne $_.SizeBytes) { Format-FileSize -Bytes ([long]$_.SizeBytes) } else { "розмір невідомий" }
+                ":package: $($_.Type)       :white_check_mark: $sizeText"
+            }
+    )
+    return [pscustomobject]@{
+        Found = $true
+        Timestamp = $latestTimestamp
+        TimestampText = $latestTimestamp.ToString("dd.MM.yyyy HH:mm")
+        AgeText = Format-BackupAge -LastWriteTime $latestTimestamp -NowUtc $healthCheckStartedUtc
+        ComponentLines = $componentLines
+    }
+}
+
+function Get-BRAVOHealthIssueActionText {
+    param([array]$Issues)
+
+    $firstIssue = @($Issues | Select-Object -First 1)
+    if ($firstIssue.Count -eq 0) {
+        return "перевірити журнал BRAVO_HEALTH"
+    }
+    switch ([string]$firstIssue[0].Kind) {
+        "Service" { return "запустити або перевірити службу $($firstIssue[0].Component)" }
+        { $_ -in @("LocalBackup", "LocalBackupGeneration") } { return "перевірити виконання BRAVO_ARCHIV" }
+        { $_ -in @("SFTPArchive", "SFTPSynchronization", "SFTPConnection") } { return "перевірити SFTP-з'єднання та останній запуск BRAVO_ARCHIV" }
+        { $_ -in @("SMBArchive", "SMBConnection") } { return "перевірити NAS/SMB доступ і останній запуск BRAVO_ARCHIV" }
+        default { return "перевірити журнал BRAVO_HEALTH" }
+    }
+}
+
 function New-SlackAlertMessage {
     param(
         [array]$Issues,
         [timespan]$Duration
     )
 
-    $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-    $dateText = $healthCheckStarted.ToString("dd MMMM yyyy", $ukrainianCulture).Replace(" р.", "")
-    $durationSeconds = [math]::Max(0, [math]::Round($Duration.TotalSeconds))
     $hostInformation = Get-HostInformation
     $archiveVersionText = [string]$global:ScriptVersion
-    $archiveScriptDateText = [string]$global:ScriptDate
     $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$global:ScriptBuildId)) {
         "невідома"
     } else {
@@ -3547,59 +3602,66 @@ function New-SlackAlertMessage {
     )
     $otherIssues = @($Issues | Where-Object { $_.Kind -notin $knownKinds })
 
-    $alertTitle = if ($serviceIssues.Count -gt 0 -and $serviceIssues.Count -eq $Issues.Count) {
-        "СЛУЖБИ BRAVO ПОТРЕБУЮТЬ УВАГИ"
+    $operationTitle = if ($serviceIssues.Count -gt 0 -and $serviceIssues.Count -eq $Issues.Count) {
+        "BRAVO SERVICES — ПОТРІБНА ДІЯ"
     } else {
-        "BRAVO ПОТРЕБУЄ УВАГИ"
+        "BRAVO BACKUP — ПОТРІБНА ДІЯ"
     }
-    $lines = @(
-        ":rotating_light: *$alertTitle*",
-        ":derelict_house_building: $($backupMonitoring.InstitutionName) [$($backupMonitoring.InstitutionCode)]",
-        ":desktop_computer: $($hostInformation.MachineName) • $($hostInformation.LocalIP) | $($hostInformation.PublicIP)",
-        ":clock3: $dateText, $($healthCheckStarted.ToString('HH:mm:ss')) • $durationSeconds сек.",
-        "🏷️ Версія BRAVO_ARCHIV: $archiveVersionText від $archiveScriptDateText (build $archiveBuildIdText)",
-        ":pushpin: Проблемних компонентів: $($problemComponentNames.Count) • перевірок: $($Issues.Count)",
-        "",
-        ":package: $($problemComponentNames -join ', ')"
-    )
+    $latestBackup = Get-BRAVOHealthLatestBackupSummary
+    $reasonLines = New-Object System.Collections.Generic.List[string]
+    $firstIssue = @($Issues | Select-Object -First 1)
+    if ($firstIssue.Count -gt 0) {
+        $reasonLines.Add(":x: $(Get-HealthIssueComponentName -Issue $firstIssue[0]): $($firstIssue[0].Reason)")
+    }
+    $resultLines = New-Object System.Collections.Generic.List[string]
+    $resultLines.Add(":clock3: Остання успішна резервна копія: $($latestBackup.TimestampText)")
+    if ($latestBackup.Found) {
+        $resultLines.Add(":hourglass_flowing_sand: Вік копії: $($latestBackup.AgeText)")
+    }
+    if ($null -ne $backupMonitoring.MaxBackupAgeHours) {
+        $resultLines.Add(":warning: Допустимий вік: $($backupMonitoring.MaxBackupAgeHours) год.")
+    }
+    $resultLines.Add("")
+    $resultLines.Add(":pushpin: Проблемних компонентів: $($problemComponentNames.Count) · перевірок: $($Issues.Count)")
+    $resultLines.Add(":package: $($problemComponentNames -join ', ')")
 
     if ($serviceIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":gear: *СЛУЖБИ*"
+        $resultLines.Add("")
+        $resultLines.Add(":gear: СЛУЖБИ")
         foreach ($issue in $serviceIssues) {
-            $lines += ":x: $($issue.Component) — $($issue.Reason)"
+            $resultLines.Add(":x: $($issue.Component) — $($issue.Reason)")
         }
     }
 
     if ($localIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":floppy_disk: *ЛОКАЛЬНІ БЕКАПИ*"
+        $resultLines.Add("")
+        $resultLines.Add(":floppy_disk: ЛОКАЛЬНІ БЕКАПИ")
         foreach ($issue in $localIssues) {
-            $lines += Format-CompactLocalIssue -Issue $issue
+            $resultLines.Add((Format-CompactLocalIssue -Issue $issue))
         }
     }
 
     if ($sftpIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":cloud: *БЕКАПИ У ХМАРІ*"
+        $resultLines.Add("")
+        $resultLines.Add(":cloud: БЕКАПИ У ХМАРІ")
         foreach ($issue in $sftpIssues) {
-            $lines += Format-CompactSFTPIssue -Issue $issue
+            $resultLines.Add((Format-CompactSFTPIssue -Issue $issue))
         }
     }
 
     if ($smbIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":minidisc: *NAS/SMB*"
+        $resultLines.Add("")
+        $resultLines.Add(":minidisc: NAS/SMB")
         foreach ($issue in $smbIssues) {
-            $lines += Format-CompactSMBIssue -Issue $issue
+            $resultLines.Add((Format-CompactSMBIssue -Issue $issue))
         }
     }
 
     if ($otherIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":warning: *ІНШІ ПОМИЛКИ*"
+        $resultLines.Add("")
+        $resultLines.Add(":warning: ІНШІ ПОМИЛКИ")
         foreach ($issue in $otherIssues) {
-            $lines += ":x: $($issue.Component) — $($issue.Reason)"
+            $resultLines.Add(":x: $($issue.Component) — $($issue.Reason)")
         }
     }
 
@@ -3614,13 +3676,13 @@ function New-SlackAlertMessage {
             $_.Component -eq "SFTP BAZA APP" -or $_.Kind -eq "SFTPConnection"
         }).Count -eq 0
     if ($bazaAppLocalHealthy -or $bazaAppSFTPHealthy) {
-        $lines += ""
+        $resultLines.Add("")
         if ($bazaAppLocalHealthy -and $bazaAppSFTPHealthy) {
-            $lines += ":white_check_mark: *BAZA_APP* — локальна копія та SFTP актуальні"
+            $resultLines.Add(":white_check_mark: BAZA_APP — локальна копія та SFTP актуальні")
         } elseif ($bazaAppLocalHealthy) {
-            $lines += ":white_check_mark: *BAZA_APP* — локальна копія актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_APP — локальна копія актуальна")
         } else {
-            $lines += ":white_check_mark: *BAZA_APP* — SFTP актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_APP — SFTP актуальна")
         }
     }
     $bazaWWWLocalHealthy = $bazaWWWLocalHealthEnabled -and
@@ -3635,19 +3697,32 @@ function New-SlackAlertMessage {
             $_.Kind -eq "SFTPConnection"
         }).Count -eq 0
     if ($bazaWWWLocalHealthy -or $bazaWWWSFTPHealthy) {
-        $lines += ""
+        $resultLines.Add("")
         if ($bazaWWWLocalHealthy -and $bazaWWWSFTPHealthy) {
-            $lines += ":white_check_mark: *BAZA_WWW* — локальна копія та SFTP актуальні"
+            $resultLines.Add(":white_check_mark: BAZA_WWW — локальна копія та SFTP актуальні")
         } elseif ($bazaWWWLocalHealthy) {
-            $lines += ":white_check_mark: *BAZA_WWW* — локальна копія актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_WWW — локальна копія актуальна")
         } else {
-            $lines += ":white_check_mark: *BAZA_WWW* — SFTP актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_WWW — SFTP актуальна")
         }
     }
 
-    $lines += ""
-    $lines += ":memo: Журнал: $healthLogFile"
-    return $lines -join [Environment]::NewLine
+    return New-BRAVOOperatorNotificationMessage `
+        -Severity "CRITICAL" `
+        -Operation $operationTitle `
+        -ActionText (Get-BRAVOHealthIssueActionText -Issues $Issues) `
+        -ReasonLines $reasonLines.ToArray() `
+        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines.ToArray() `
+        -Timestamp $healthCheckStarted `
+        -Duration $Duration `
+        -ProductName "BRAVO Archive" `
+        -Version $archiveVersionText `
+        -BuildId $archiveBuildIdText `
+        -LogPath $healthLogFile `
+        -LogLabel "Журнал"
 }
 
 function Get-BRAVOHealthDestinationSummary {
@@ -3677,85 +3752,74 @@ function Get-BRAVOHealthDestinationSummary {
 function New-SlackSuccessMessage {
     param([timespan]$Duration)
 
-    $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-    $dateText = $healthCheckStarted.ToString("dd MMMM yyyy", $ukrainianCulture).Replace(" р.", "")
-    $durationSeconds = [math]::Max(0, [math]::Round($Duration.TotalSeconds))
-    $enabledNames = @(Get-EnabledBackupComponentNames)
-    $enabledComponentsText = if ($enabledNames.Count -gt 0) {
-        $enabledNames -join ', '
-    } else {
-        'немає'
-    }
     $hostInformation = Get-HostInformation
     $archiveVersionText = [string]$global:ScriptVersion
-    $archiveScriptDateText = [string]$global:ScriptDate
     $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$global:ScriptBuildId)) {
         "невідома"
     } else {
         [string]$global:ScriptBuildId
     }
-
-    $lines = @(
-        ":white_check_mark: *РЕЗЕРВНІ КОПІЇ АКТУАЛЬНІ*",
-        ":derelict_house_building: Установа: $($backupMonitoring.InstitutionName) [$($backupMonitoring.InstitutionCode)]",
-        ":desktop_computer: Машина: $($hostInformation.MachineName)",
-        ":globe_with_meridians: IP-адреси: $($hostInformation.LocalIP) | $($hostInformation.PublicIP)",
-        ":spiral_calendar_pad: Дата: $dateText",
-        ":alarm_clock: Час: $($healthCheckStarted.ToString('HH:mm:ss'))",
-        ":hourglass_flowing_sand: Тривалість перевірки: $durationSeconds сек.",
-        "🏷️ Версія BRAVO_ARCHIV: $archiveVersionText від $archiveScriptDateText (build $archiveBuildIdText)",
-        ":package: Увімкнені компоненти для бекапу: $enabledComponentsText",
-        "",
-        ":floppy_disk: Локальні архіви та hash-файли актуальні"
-    )
-
-    $latestArchiveLines = @(
-        $archiveDefinitions |
-            Where-Object { $_.Enabled } |
-            ForEach-Object {
-                $archiveInfo = $script:healthLatestArchives[$_.Type]
-                $archiveName = if ($null -ne $archiveInfo) { [string]$archiveInfo.Name } else { "" }
-                if (-not [string]::IsNullOrWhiteSpace($archiveName)) {
-                    $archiveSizeText = Format-FileSize -Bytes ([long]$archiveInfo.SizeBytes)
-                    "• $($_.Type): $archiveName ($archiveSizeText)"
-                }
-            }
-    )
-    if ($latestArchiveLines.Count -gt 0) {
-        $lines += ":package: Останні локальні архіви:"
-        $lines += $latestArchiveLines
+    $latestBackup = Get-BRAVOHealthLatestBackupSummary
+    $resultLines = New-Object System.Collections.Generic.List[string]
+    if ($latestBackup.Found) {
+        $resultLines.Add(":clock3: Остання резервна копія: $($latestBackup.TimestampText)")
+        $resultLines.Add(":hourglass_flowing_sand: Вік копії: $($latestBackup.AgeText)")
+        $resultLines.Add("")
     }
+    foreach ($componentLine in @($latestBackup.ComponentLines)) {
+        $resultLines.Add($componentLine)
+    }
+
+    $resultLines.Add("")
+    $resultLines.Add(":floppy_disk: Local       :white_check_mark:")
 
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckArchiveUploads -and
         $componentSettings.SFTP.ArchiveUpload) {
-        $lines += ":cloud: Архіви у хмарі актуальні"
+        $resultLines.Add(":cloud: SFTP        :white_check_mark:")
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaAppSFTPHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Синхронізація BAZA_APP з хмарою актуальна"
+        $resultLines.Add(":arrows_counterclockwise: BAZA_APP    :white_check_mark: синхронізовано")
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaWWWSFTPHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Синхронізація BAZA_WWW з хмарою актуальна"
+        $resultLines.Add(":arrows_counterclockwise: BAZA_WWW    :white_check_mark: синхронізовано")
     }
     if ($bazaAppLocalHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Локальна копія BAZA_APP актуальна"
+        $resultLines.Add(":arrows_counterclockwise: BAZA_APP local :white_check_mark:")
     }
     if ($bazaWWWLocalHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Локальна копія BAZA_WWW актуальна"
+        $resultLines.Add(":arrows_counterclockwise: BAZA_WWW local :white_check_mark:")
     }
     if ($backupMonitoring.SMB.Enabled -and
         $backupMonitoring.SMB.CheckArchiveCopies -and
         $componentSettings.SMB.ArchiveCopy) {
-        $lines += ":minidisc: Архіви на NAS/SMB актуальні"
+        $resultLines.Add(":minidisc: SMB         :white_check_mark:")
     }
 
-    $lines += ""
-    $lines += ":memo: Журнал перевірки: $healthLogFile"
-    return $lines -join [Environment]::NewLine
+    $enabledComponentCount = @(Get-EnabledBackupComponentNames).Count
+    if ($enabledComponentCount -gt 0) {
+        $resultLines.Add("")
+        $resultLines.Add("Компоненти: $enabledComponentCount/$enabledComponentCount")
+    }
+
+    return New-BRAVOOperatorNotificationMessage `
+        -Severity "SUCCESS" `
+        -Operation "BRAVO BACKUP — ВСЕ СПРАВНО" `
+        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines.ToArray() `
+        -Timestamp $healthCheckStarted `
+        -Duration $Duration `
+        -ProductName "BRAVO Archive" `
+        -Version $archiveVersionText `
+        -BuildId $archiveBuildIdText `
+        -LogPath $healthLogFile `
+        -LogLabel "Журнал"
 }
 
 # Різні види проблем несуть різний набір полів: об'єкт Kind = "Service"

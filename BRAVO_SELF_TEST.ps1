@@ -1352,6 +1352,194 @@ try {
         -Name "Notifications/PublicIPLookupDisabledByDefault" `
         -Failure "PublicIPLookupEnabled у BRAVO.config має бути \$false за замовчуванням; Get-HostInformation не повинен звертатись до зовнішніх IP-сервісів, доки це не увімкнено свідомо"
 
+    $notifyHostOff = [pscustomobject]@{
+        MachineName = "DEV-LIMS"
+        LocalIP = "10.10.150.102"
+        PublicIP = "вимкнено"
+    }
+    $notifyHostUnavailable = [pscustomobject]@{
+        MachineName = "DEV-LIMS"
+        LocalIP = "10.10.150.102"
+        PublicIP = "недоступна"
+    }
+    $notifyHostPublic = [pscustomobject]@{
+        MachineName = "DATA-SERVER"
+        LocalIP = "10.10.150.102 | 192.168.1.236"
+        PublicIP = "185.189.187.44"
+    }
+    $notifySuccess = New-BRAVOOperatorNotificationMessage `
+        -Severity SUCCESS `
+        -Operation "BRAVO BACKUP — ВСЕ СПРАВНО" `
+        -InstitutionName "TEST-COMPANY" `
+        -InstitutionCode "1234567890" `
+        -HostInformation $notifyHostOff `
+        -ResultLines @(
+            ":clock3: Остання резервна копія: 09.08.2026 14:29",
+            ":alarm_clock: Вік копії: 5 хв.",
+            ":package: MODEL       :white_check_mark: 414.33 МБ",
+            "Компоненти: 4/4"
+        ) `
+        -Timestamp ([datetime]"2026-08-09T14:34:51") `
+        -Duration ([timespan]::FromSeconds(7)) `
+        -ProductName "BRAVO Archive" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild" `
+        -LogPath "D:\BRAVO\LOGS\BRAVO_ARCHIV_HEALTH.log"
+    $notifyWarning = New-BRAVOOperatorNotificationMessage `
+        -Severity CRITICAL `
+        -Operation "BRAVO BACKUP — ПОТРІБНА ДІЯ" `
+        -ActionText "перевірити виконання BRAVO_ARCHIV" `
+        -ReasonLines @(":x: MODEL: резервна копія прострочена") `
+        -InstitutionName "TEST-COMPANY" `
+        -InstitutionCode "1234567890" `
+        -HostInformation $notifyHostOff `
+        -ResultLines @(
+            ":clock3: Остання успішна резервна копія: 08.08.2026 23:00",
+            ":alarm_clock: Вік копії: 15 год. 34 хв.",
+            ":warning: Допустимий вік: 8 год."
+        ) `
+        -Timestamp ([datetime]"2026-08-09T14:34:51") `
+        -ProductName "BRAVO Archive" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild"
+    $notifyPublic = New-BRAVOOperatorNotificationMessage `
+        -Severity SUCCESS `
+        -Operation "BRAVO MAINTENANCE — УСПІШНО" `
+        -InstitutionName "TEST-COMPANY" `
+        -InstitutionCode "1234567890" `
+        -HostInformation $notifyHostPublic `
+        -Timestamp ([datetime]"2026-08-09T23:55:25") `
+        -ProductName "BRAVO Maintenance" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild"
+    $notifyUnavailable = New-BRAVOOperatorNotificationMessage `
+        -Severity SUCCESS `
+        -Operation "BRAVO MAINTENANCE — УСПІШНО" `
+        -InstitutionName "TEST-COMPANY" `
+        -InstitutionCode "1234567890" `
+        -HostInformation $notifyHostUnavailable `
+        -Timestamp ([datetime]"2026-08-09T23:55:25") `
+        -ProductName "BRAVO Maintenance" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild"
+    Test-BRAVOCondition -Condition ($notifySuccess.Contains("Дій не потрібно")) -Name "Notifications/SuccessUsesNoActionRequired" -Failure "SUCCESS notification має явно казати, що дія не потрібна"
+    Test-BRAVOCondition -Condition ($notifyWarning.Contains("Потрібна дія: перевірити виконання BRAVO_ARCHIV")) -Name "Notifications/WarningUsesConcreteAction" -Failure "WARNING/CRITICAL notification має показувати конкретну дію"
+    Test-BRAVOCondition -Condition ($notifySuccess.Contains(":office: TEST-COMPANY [1234567890]")) -Name "Notifications/InstitutionUsesOfficeEmoji" -Failure "institution line має використовувати office token"
+    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("DEV-LIMS") -and $notifySuccess.Contains("10.10.150.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
+    Test-BRAVOCondition -Condition (-not $notifyUnavailable.Contains("Публічна IP")) -Name "Notifications/UnavailablePublicIpIsOmitted" -Failure "PublicIP=недоступна не має показуватись у штатному повідомленні"
+    Test-BRAVOCondition -Condition ($notifyPublic.Contains("Публічна IP: 185.189.187.44") -and $notifyPublic.Contains("DATA-SERVER · 10.10.150.102 · 192.168.1.236")) -Name "Notifications/AvailablePublicIpIsShown" -Failure "valid Public IP має показуватись окремим рядком"
+    Test-BRAVOCondition -Condition ($notifySuccess.Contains("Остання резервна копія:")) -Name "Notifications/HealthSuccessUsesLastBackupTerm" -Failure "Health SUCCESS має використовувати термін Остання резервна копія"
+    Test-BRAVOCondition -Condition ($notifyWarning.Contains("Остання успішна резервна копія:")) -Name "Notifications/HealthFailureUsesLastSuccessfulBackupTerm" -Failure "Health WARNING/ERROR має використовувати термін Остання успішна резервна копія"
+    $legacyHealthyCopyText = "Остання справна " + "копія"
+    Test-BRAVOCondition -Condition (-not ($notifySuccess + $notifyWarning).Contains($legacyHealthyCopyText)) -Name "Notifications/HealthDoesNotUseLastHealthyCopyWording" -Failure "operator notification не має використовувати legacy health wording"
+    Test-BRAVOCondition -Condition ($notifySuccess -notmatch "\.mdz") -Name "Notifications/HealthSuccessDoesNotExposeArchiveFilename" -Failure "Health SUCCESS не має показувати archive filename"
+    $bazaLines = @(
+        "Причина:",
+        "Назви 50 файлів перевищують допустиму довжину для передачі через SFTP.",
+        "Проблемні файли пропущено; інші файли синхронізуються штатно.",
+        "Ліміт: 246 UTF-8 байт",
+        "Проблемних файлів: 50",
+        "Приклади:",
+        ":x: 297/246 байт · перевищення +51 байт",
+        "Методика_выполнения_измерений_...",
+        ":x: 349/246 байт · перевищення +103 байти",
+        "ДИРЕКТИВА_РАДИ_96-22-ЕС_...",
+        ":x: 378/246 байт · перевищення +132 байти",
+        "Инструкция_по_санитарно-..."
+    )
+    $bazaSample = New-BRAVOOperatorNotificationMessage `
+        -Severity WARNING `
+        -Operation "BAZA_APP — 50 ФАЙЛІВ НЕ СИНХРОНІЗОВАНО" `
+        -ActionText "скоротити назви зазначених файлів." `
+        -InstitutionName "МИКОЛАЇВСЬКА РДЛ" `
+        -InstitutionCode "00702245" `
+        -HostInformation $notifyHostPublic `
+        -ResultLines $bazaLines `
+        -Timestamp ([datetime]"2026-08-09T12:00:07") `
+        -ProductName "BRAVO Archive" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild" `
+        -LogPath "D:\BRAVO\LOGS\BRAVO_ARCHIV.log" `
+        -LogLabel "Повний перелік"
+    Test-BRAVOCondition -Condition (([regex]::Matches($bazaSample, "перевищення \+")).Count -eq 3) -Name "Notifications/BazaLongNamesShowsAtMostThreeExamples" -Failure "BAZA notification має показувати максимум 3 приклади"
+    Test-BRAVOCondition -Condition ($bazaSample.Contains("Ліміт: 246 UTF-8 байт")) -Name "Notifications/BazaLongNamesShowsUtf8Limit" -Failure "BAZA notification має показувати UTF-8 limit"
+    Test-BRAVOCondition -Condition ($bazaSample.Contains("297/246 байт") -and $bazaSample.Contains("перевищення +51 байт")) -Name "Notifications/BazaLongNamesShowsByteOverflow" -Failure "BAZA notification має показувати byte overflow"
+    Test-BRAVOCondition -Condition ($bazaSample.Contains("Проблемні файли пропущено; інші файли синхронізуються штатно.")) -Name "Notifications/BazaLongNamesExplainsPartialSkip" -Failure "BAZA notification має пояснювати partial skip"
+    $pluralOk = ((Format-BRAVOUkrainianCount 1 "файл" "файли" "файлів") -eq "1 файл" -and (Format-BRAVOUkrainianCount 2 "файл" "файли" "файлів") -eq "2 файли" -and (Format-BRAVOUkrainianCount 5 "файл" "файли" "файлів") -eq "5 файлів" -and (Format-BRAVOUkrainianCount 21 "файл" "файли" "файлів") -eq "21 файл" -and (Format-BRAVOUkrainianCount 22 "файл" "файли" "файлів") -eq "22 файли" -and (Format-BRAVOUkrainianCount 25 "файл" "файли" "файлів") -eq "25 файлів")
+    Test-BRAVOCondition -Condition $pluralOk -Name "Notifications/UkrainianFilePluralization" -Failure "pluralization helper має підтримувати 1/2/5/21/22/25"
+    $maintSuccess = New-BRAVOOperatorNotificationMessage `
+        -Severity SUCCESS `
+        -Operation "BRAVO MAINTENANCE — УСПІШНО" `
+        -InstitutionName "ЧЕРНІВЕЦЬКА РДЛ" `
+        -InstitutionCode "21430093" `
+        -HostInformation $notifyHostPublic `
+        -ResultLines @(
+            "Виконано:",
+            ":white_check_mark: Реставрація — за планом",
+            ":white_check_mark: .md-файли — перевірено",
+            ":white_check_mark: Інтервали ID — у нормі",
+            ":white_check_mark: Trace — оброблено 2 файли",
+            ":white_check_mark: exchangAPI — оброблено 1 файл",
+            ":white_check_mark: Вільне місце — достатньо",
+            ":floppy_disk: Мінімальний запас:",
+            "C: 468.29 ГБ",
+            "Порогове значення: 20 ГБ",
+            ":arrows_counterclockwise: Остання реставрація: 03.08.2026 00:02"
+        ) `
+        -Timestamp ([datetime]"2026-08-08T23:55:25") `
+        -Duration ([timespan]::FromSeconds(20)) `
+        -ProductName "BRAVO Maintenance" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild" `
+        -LogPath "D:\BRAVO\LOGS\BRAVO_MAINTENANCE.log"
+    $maintLowDisk = New-BRAVOOperatorNotificationMessage `
+        -Severity CRITICAL `
+        -Operation "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ" `
+        -ActionText "звільнити щонайменше 5.4 ГБ." `
+        -ReasonLines @(":x: Недостатньо вільного місця на диску D:") `
+        -InstitutionName "ЧЕРНІВЕЦЬКА РДЛ" `
+        -InstitutionCode "21430093" `
+        -HostInformation $notifyHostPublic `
+        -ResultLines @(
+            ":floppy_disk: D:",
+            "Вільно: 14.6 ГБ",
+            "Мінімум: 20 ГБ",
+            "Дефіцит: 5.4 ГБ"
+        ) `
+        -Timestamp ([datetime]"2026-08-08T23:55:25") `
+        -ProductName "BRAVO Maintenance" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild"
+    Test-BRAVOCondition -Condition ($maintSuccess.Contains("BRAVO MAINTENANCE — УСПІШНО") -and -not $maintSuccess.Contains("Деталі подій") -and -not $maintSuccess.Contains("Регламентні операції")) -Name "Notifications/MaintenanceSuccessIsCompact" -Failure "Maintenance SUCCESS має бути компактним"
+    Test-BRAVOCondition -Condition ($maintSuccess.Contains(":floppy_disk: Мінімальний запас:") -and $maintSuccess.Contains("C: 468.29 ГБ") -and -not $maintSuccess.Contains("D: 500")) -Name "Notifications/MaintenanceSuccessShowsMinimumFreeDiskOnly" -Failure "Maintenance SUCCESS має показувати лише мінімальний healthy disk запас"
+    Test-BRAVOCondition -Condition ($maintLowDisk.Contains("Дефіцит: 5.4 ГБ") -and $maintLowDisk.Contains("Потрібна дія: звільнити щонайменше 5.4 ГБ.")) -Name "Notifications/MaintenanceFailureShowsDiskDeficit" -Failure "Maintenance low-disk має показувати deficit"
+    Test-BRAVOCondition -Condition (-not $maintSuccess.Contains("наступна:") -and -not $maintSuccess.Contains("після 03:00")) -Name "Notifications/MaintenanceDoesNotUseAmbiguousRestoreTime" -Failure "Maintenance notification не має змішувати restore timestamps"
+    $longDiscord = New-BRAVOOperatorNotificationMessage `
+        -Severity WARNING `
+        -Operation "BRAVO BACKUP — ПОТРІБНА ДІЯ" `
+        -ActionText "перевірити журнал BRAVO_ARCHIV." `
+        -InstitutionName "TEST" `
+        -HostInformation $notifyHostOff `
+        -ResultLines @(("x" * 5000)) `
+        -Timestamp ([datetime]"2026-08-09T00:00:00") `
+        -ProductName "BRAVO Archive" `
+        -Version "5.0.0-dev.11" `
+        -BuildId "testbuild"
+    $discordChunks = @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $longDiscord))
+    Test-BRAVOCondition -Condition ($discordChunks.Count -gt 1 -and @($discordChunks | Where-Object { $_.Length -gt 1900 }).Count -eq 0) -Name "Notifications/DiscordChunkingStillWorks" -Failure "long Discord notifications мають chunking"
+    $archiveNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $maintenanceNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $dryRunNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "BRAVO_DRY_RUN.ps1"), [Text.Encoding]::UTF8)
+    $compatibilityNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"), [Text.Encoding]::UTF8)
+    $mentionsDisabledPattern = 'allowed_mentions\s*=\s*@\{\s*parse\s*=\s*@\(\)\s*\}'
+    Test-BRAVOCondition -Condition ($archiveNotificationTextForMentions.Contains("Send-BRAVOWebhookNotification") -and ($compatibilityNotificationTextForMentions -match $mentionsDisabledPattern) -and ($maintenanceNotificationTextForMentions -match $mentionsDisabledPattern) -and ($dryRunNotificationTextForMentions -match $mentionsDisabledPattern)) -Name "Notifications/DiscordMentionsRemainDisabled" -Failure "Discord payload має забороняти mentions"
+    $legacyHouseToken = ":" + "der" + "elict_house_" + "building:"
+    $legacyActionText = "ПОТРЕБУЄ " + "УВАГИ"
+    $legacyFileCountText = "файл" + "(ів)"
+    $legacyIpDisabledRegex = "IP-" + "адреси: .*" + "\| " + "вимкнено"
+    $operatorNotificationSamples = @($notifySuccess, $notifyWarning, $bazaSample, $maintSuccess, $maintLowDisk) -join [Environment]::NewLine
+    Test-BRAVOCondition -Condition (-not $operatorNotificationSamples.Contains($legacyHouseToken) -and -not $operatorNotificationSamples.Contains($legacyHealthyCopyText) -and -not $operatorNotificationSamples.Contains($legacyActionText) -and -not $operatorNotificationSamples.Contains($legacyFileCountText) -and ($operatorNotificationSamples -notmatch $legacyIpDisabledRegex)) -Name "Notifications/OperatorTemplatesDoNotContainLegacyWording" -Failure "operator-visible notification templates не мають містити legacy wording"
+
     # Модель release channel (P0.6 аудиту): developer -> development,
     # master/main -> stable. Перевірка навмисно не обов'язкова — release-пакет
     # без .git (розгорнутий на production-сервері) не повинен через це падати,
@@ -2308,9 +2496,9 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains("Send-BAZAIncompatibleNameAlert") -and
-            $archiveScriptText.Contains("несумісних імен") -and
-            $archiveScriptText.Contains("Select-Object -First 5") -and
-            $archiveScriptText.Contains("Split-DiscordNotificationText -Message `$message") -and
+            $archiveScriptText.Contains("Проблемні файли пропущено; інші файли синхронізуються штатно.") -and
+            $archiveScriptText.Contains("Select-Object -First 3") -and
+            $archiveScriptText.Contains("ConvertTo-DiscordNotificationText -Message `$message") -and
             $archiveScriptText.Contains('$script:notificationWebhookUrl') -and
             $archiveScriptText.Contains('$script:notificationProvider') -and
             $archiveScriptText.Contains('$script:notificationRequestTimeoutSeconds')

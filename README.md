@@ -1,4 +1,4 @@
-﻿# BRAVO 5.0.0-dev.2 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.0.0-dev.11 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -1037,3 +1037,23 @@ health > лише попередження. Код `90` має найвищий 
   `checkip.amazonaws.com`, зайвої зовнішньої залежності, яка розкриває
   стороннім сервісам факт і час запуску backup. Увімкніть свідомо, якщо
   публічна IP-адреса потрібна в сповіщеннях.
+
+## 15. Operator notification UX
+
+Slack/Discord notifications are short operator summaries. The detailed
+technical evidence stays in the referenced log file.
+
+- ✅ SUCCESS: operation/check passed; the message says `Дій не потрібно`.
+- ⚠️ WARNING: BRAVO can continue, but the message gives a concrete
+  `Потрібна дія: ...`.
+- 🚨 CRITICAL: backup, integrity, credentials or maintenance safety is at
+  risk, with the reason and action at the top.
+
+Host information is compact: `🖥️ SERVER · 10.10.150.102`. Public IP is shown
+only when lookup is enabled and a valid address is returned. Institution lines
+use `🏢`.
+
+Backup health terminology:
+
+- SUCCESS: `Остання резервна копія`.
+- WARNING/ERROR: `Остання успішна резервна копія`.

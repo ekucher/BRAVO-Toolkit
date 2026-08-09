@@ -821,3 +821,26 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
 | щомісяця | звірка `VERSION.json.sourceCommit` на сервері з розгорнутим релізом |
 | щокварталу | повне навчальне відновлення на окрему машину |
 | при кожному оновленні Tools | [процедура вище](#оновлення-7zaexe-або-winscp) |
+
+---
+
+## Operator notification UX
+
+Slack/Discord messages are first-response summaries:
+
+- ✅ SUCCESS means the operation/check passed and no action is required.
+- ⚠️ WARNING means BRAVO can continue, but the message names the concrete
+  operator action.
+- 🚨 CRITICAL means backup, integrity, credentials or maintenance safety is at
+  risk. Do not improvise around integrity failures; follow the relevant
+  runbook section and inspect the referenced log.
+
+The top of a warning/critical message contains the reason and action before
+server metadata. The log path at the bottom is the source for full technical
+evidence: long filenames, destination paths, thresholds and tool output remain
+there.
+
+Backup health wording:
+
+- SUCCESS: `Остання резервна копія`.
+- WARNING/ERROR: `Остання успішна резервна копія`.

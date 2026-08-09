@@ -195,6 +195,23 @@ function Get-BRAVORestoreGenerationManifest {
     return $selected
 }
 
+function Format-RestoreFileCount {
+    param([int]$Count)
+
+    $lastTwoDigits = [math]::Abs($Count) % 100
+    $lastDigit = [math]::Abs($Count) % 10
+    $word = if ($lastTwoDigits -ge 11 -and $lastTwoDigits -le 14) {
+        "файлів"
+    } elseif ($lastDigit -eq 1) {
+        "файл"
+    } elseif ($lastDigit -ge 2 -and $lastDigit -le 4) {
+        "файли"
+    } else {
+        "файлів"
+    }
+    return "$Count $word"
+}
+
 function Get-BRAVOVerifiedGenerationArchive {
     [CmdletBinding()]
     param(
@@ -255,7 +272,7 @@ try {
     $configRoot = Split-Path $resolvedConfigPath -Parent
     $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 
-    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console')) {
+    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications')) {
         $modulePath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"
         if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
             throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -411,9 +428,10 @@ try {
             $durationSeconds = ((Get-Date) - $startedAt).TotalSeconds
 
             if ($extractedFiles.Count -lt $MinimumFileCount) {
+                $extractedFilesText = Format-RestoreFileCount -Count $extractedFiles.Count
                 Add-RestoreDrillResult FAIL $componentName $latestArchive.Name $durationSeconds `
                     $extractedFiles.Count $extractedDirectories.Count (
-                    "розпаковано лише $($extractedFiles.Count) файл(ів), очікувалося щонайменше $MinimumFileCount — можлива архівація не того джерела"
+                    "розпаковано лише $extractedFilesText, очікувалося щонайменше $MinimumFileCount — можлива архівація не того джерела"
                 )
                 if (-not $AsJson) {
                     Write-BRAVORestoreDrillStep `
@@ -421,7 +439,7 @@ try {
                         -Name $componentName -Status FAIL -DurationSeconds $durationSeconds `
                         -ArchiveName $latestArchive.Name -IntegrityOk $true `
                         -ExtractedFileCount $extractedFiles.Count -ExtractedDirectoryCount $extractedDirectories.Count `
-                        -Reason "Розпаковано лише $($extractedFiles.Count) файл(ів), очікувалося щонайменше $MinimumFileCount"
+                        -Reason "Розпаковано лише $extractedFilesText, очікувалося щонайменше $MinimumFileCount"
                 }
             } else {
                 Add-RestoreDrillResult PASS $componentName $latestArchive.Name $durationSeconds `
@@ -475,11 +493,19 @@ try {
                     $summaryLines = @($script:restoreDrillResults | ForEach-Object {
                         "[$($_.Status)] $($_.Component): $($_.Detail)"
                     })
-                    $message = (
-                        "🧪 BRAVO RESTORE DRILL — $($env:COMPUTERNAME)`n" +
-                        "FAIL: $failCount, WARN: $warnCount`n" +
-                        ($summaryLines -join "`n")
-                    )
+                    $severity = if ($failCount -gt 0) { "CRITICAL" } else { "WARNING" }
+                    $message = New-BRAVOOperatorNotificationMessage `
+                        -Severity $severity `
+                        -Operation "BRAVO RESTORE DRILL — ПОТРІБНА ДІЯ" `
+                        -ActionText "перевірити restore drill і журнал відновлення." `
+                        -InstitutionName ([string]$bravoSettings.InstitutionName) `
+                        -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+                        -HostInformation (Get-HostInformation) `
+                        -ResultLines (@("FAIL: $failCount, WARN: $warnCount") + $summaryLines) `
+                        -Timestamp (Get-Date) `
+                        -ProductName "BRAVO Restore Drill" `
+                        -Version ([string]$global:ScriptVersion) `
+                        -BuildId ([string]$global:ScriptBuildId)
                     Send-BRAVOWebhookNotification `
                         -Provider $notificationProvider `
                         -WebhookUrl $webhookUrl `

@@ -1,4 +1,4 @@
-# BRAVO 5.0.0-dev.2 — комплексне налаштування і безпечний тестовий прогін
+# BRAVO 5.0.0-dev.11 — комплексне налаштування і безпечний тестовий прогін
 
 Кожен запуск setup і його допоміжних дочірніх скриптів створює окремий
 transcript у `LOGS\HELPERS`. Ім'я містить назву скрипта, timestamp і PID, а
@@ -172,3 +172,17 @@ retention нового запуску шукають уже новий преф�
 Код завершення `0` означає відсутність помилок, `1` — щонайменше одну
 критичну проблему. Рядки `PLAN` описують операції, які production-скрипт
 виконав би, але dry-run їх не запускає.
+
+## Operator notification UX
+
+Setup, Dry Run and Diagnose test notifications use the same operator summary
+style as production runtime notifications:
+
+- ✅ success -> `Дій не потрібно`;
+- ⚠️ warning -> `Потрібна дія: ...`;
+- 🚨 critical -> backup, integrity, credentials or maintenance safety is at risk.
+
+The notification is not a technical log dump. It shows institution `🏢`,
+compact host/IP, optional public IP only when available, version/build and a
+log reference. Backup health uses `Остання резервна копія` for SUCCESS and
+`Остання успішна резервна копія` for WARNING/ERROR.

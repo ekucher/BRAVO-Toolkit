@@ -582,15 +582,26 @@ function Send-ToolIntegrityAlert {
 
     try {
         $hostInformation = Get-HostInformation
-        $alertText = @(
-            ":rotating_light: КРИТИЧНО: порушено цілісність інструментів BRAVO",
-            "Сервер: $($hostInformation.MachineName) (IP: $($hostInformation.LocalIP))",
-            "Час: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-            "",
-            [string]$Result.Message,
-            "",
-            "Архівацію НЕ виконано (код завершення 32)."
-        ) -join "`n"
+        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+            "невідома"
+        } else {
+            [string]$ScriptBuildId
+        }
+        $alertText = New-BRAVOOperatorNotificationMessage `
+            -Severity "CRITICAL" `
+            -Operation "BRAVO — ПОРУШЕНО ЦІЛІСНІСТЬ КОМПЛЕКТУ" `
+            -ActionText "не запускати backup вручну; перевірити RUNTIME_MANIFEST/TOOLS_MANIFEST та походження змінених файлів." `
+            -ReasonLines @([string]$Result.Message) `
+            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -HostInformation $hostInformation `
+            -ResultLines @("Архівацію не виконано (код завершення 32).") `
+            -Timestamp (Get-Date) `
+            -ProductName "BRAVO Archive" `
+            -Version ([string]$global:ScriptVersion) `
+            -BuildId $archiveBuildIdText `
+            -LogPath ([string]$script:logFile) `
+            -LogLabel "Журнал"
 
         # Discord потребує власного форматування й обмежений довжиною
         # повідомлення; Slack приймає текст як є.
@@ -3901,12 +3912,11 @@ function Send-BAZAIncompatibleNameAlert {
 
     $examples = @(
         $Issues |
-            Select-Object -First 5 |
+            Select-Object -First 3 |
             ForEach-Object {
-                $itemType = if ($_.IsDirectory) { "каталог" } else { "файл" }
                 $displayName = [string]$_.Name
-                if ($displayName.Length -gt 180) {
-                    $displayName = $displayName.Substring(0, 177) + "..."
+                if ($displayName.Length -gt 120) {
+                    $displayName = $displayName.Substring(0, 117) + "..."
                 }
 
                 # The health formatter lives in a different function scope.
@@ -3920,69 +3930,60 @@ function Send-BAZAIncompatibleNameAlert {
                     $displayName = $displayName.Replace("|", "\|")
                     $displayName = $displayName.Replace(">", "\>")
                 }
-                (
-                    "• $itemType [довжина: $($_.CharacterCount) символів; " +
-                    "$($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) UTF-8 байт]:`n  " +
-                    $displayName
-                )
+                $overflowBytes = [int]$_.Utf8ByteCount - [int]$_.MaximumUtf8Bytes
+                ":x: $($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) байт · перевищення +$overflowBytes байт`n$displayName"
             }
     )
-    $examplesText = $examples -join "`n"
-    $machineName = [Environment]::MachineName
-    $localIpAddresses = @()
-    try {
-        $localIpAddresses = @(
-            [System.Net.Dns]::GetHostAddresses($machineName) |
-                Where-Object {
-                    $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
-                    -not [System.Net.IPAddress]::IsLoopback($_) -and
-                    -not $_.ToString().StartsWith("169.254.")
-                } |
-                ForEach-Object { $_.ToString() } |
-                Sort-Object -Unique
-        )
-    } catch {
-        # Локальна IP-адреса потрібна лише для тексту сповіщення — без неї
-        # воно надійде без цього рядка. DNS-запит до власного імені падає
-        # на серверах із нестандартною мережевою конфігурацією, тому DEBUG:
-        # це не проблема backup, але діагностика "чому в сповіщенні немає
-        # IP" інакше впирається в порожнечу.
-        Write-BRAVOLog `
-            -Component 'NOTIFY' `
-            -Message "Не вдалося визначити локальну IP-адресу: $($_.Exception.Message)" `
-            -Level "DEBUG"
+    $exampleLines = New-Object System.Collections.Generic.List[string]
+    if ($examples.Count -gt 0) {
+        $exampleLines.Add("Приклади:")
+        $exampleLines.Add("")
+        foreach ($example in $examples) {
+            $exampleLines.Add([string]$example)
+            $exampleLines.Add("")
+        }
     }
-    $localIpText = if ($localIpAddresses.Count -gt 0) {
-        $localIpAddresses -join " | "
-    } else {
-        "недоступні"
-    }
-    $notificationTime = (Get-Date).ToString("dd.MM.yyyy HH:mm:ss")
+    $hostInformation = Get-HostInformation
+    $notificationTime = Get-Date
     $archiveVersionText = [string]$global:ScriptVersion
-    $archiveScriptDateText = [string]$global:ScriptDate
+    $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+        "невідома"
+    } else {
+        [string]$ScriptBuildId
+    }
     $logFilePath = if (-not [string]::IsNullOrWhiteSpace([string]$script:logFile)) {
         [string]$script:logFile
     } else {
         "журнал BRAVO_ARCHIV"
     }
-    $message = @"
-🚨 SFTP-СИНХРОНІЗАЦІЯ $ComponentName ПОТРЕБУЄ УВАГИ
-🏚️ Установа: $($backupMonitoring.InstitutionName) [$($backupMonitoring.InstitutionCode)]
-🖥️ Машина: $machineName
-🌐 IP-адреси: $localIpText
-🕒 Час: $notificationTime
-🏷️ Версія BRAVO_ARCHIV: $archiveVersionText від $archiveScriptDateText
-
-Знайдено несумісних імен: $($Issues.Count). Ці об'єкти не буде передано у хмару, доки локальні імена не буде скорочено.
-Довжину показано в символах; технічний ліміт WinSCP — $($Issues[0].MaximumUtf8Bytes) UTF-8 байт.
-Приклади:
-$examplesText
-📝 Повний перелік: $logFilePath
-"@
+    $fileCountText = Format-BRAVOUkrainianCount -Count $Issues.Count -One "файл" -Few "файли" -Many "файлів"
+    $fileCountHeaderText = $fileCountText.ToUpperInvariant()
+    $resultLines = @(
+        "Причина:",
+        "Назви $fileCountText перевищують допустиму довжину для передачі через SFTP.",
+        "Проблемні файли пропущено; інші файли синхронізуються штатно.",
+        "",
+        "Ліміт: $($Issues[0].MaximumUtf8Bytes) UTF-8 байт",
+        "Проблемних файлів: $($Issues.Count)"
+    ) + $exampleLines.ToArray()
+    $message = New-BRAVOOperatorNotificationMessage `
+        -Severity "WARNING" `
+        -Operation "$ComponentName — $fileCountHeaderText НЕ СИНХРОНІЗОВАНО" `
+        -ActionText "скоротити назви зазначених файлів." `
+        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines `
+        -Timestamp $notificationTime `
+        -ProductName "BRAVO Archive" `
+        -Version $archiveVersionText `
+        -BuildId $archiveBuildIdText `
+        -LogPath $logFilePath `
+        -LogLabel "Повний перелік"
 
     try {
         $outboundMessages = if ($script:notificationProvider -eq "discord") {
-            @(Split-DiscordNotificationText -Message $message)
+            @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $message))
         } else {
             @($message)
         }

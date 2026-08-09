@@ -1229,51 +1229,114 @@ function New-MaintenanceNotificationMessage {
         [string]$LogPath
     )
 
-    $currentTime = Get-Date
-    $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-    $dateText = $currentTime.ToString("dd MMMM yyyy", $ukrainianCulture).Replace(" р.", "")
     $hostInformation = Get-HostInformation
+    $severity = if ($TitleEmoji -eq ":white_check_mark:" -or $Title -match "УСПІШ") {
+        "SUCCESS"
+    } elseif ($TitleEmoji -eq ":warning:") {
+        "WARNING"
+    } else {
+        "CRITICAL"
+    }
+    $operation = if ($severity -eq "SUCCESS") {
+        "BRAVO MAINTENANCE — УСПІШНО"
+    } else {
+        "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ"
+    }
+    $detailsTextForAction = (@($Details) -join "`n")
+    $actionText = if ($severity -eq "SUCCESS") {
+        "Дій не потрібно"
+    } elseif ($Title -match "місц|диск|space" -or $detailsTextForAction -match "Недостатньо вільного місця|залишилось .* потрібно мінімум") {
+        "звільнити місце на проблемному диску або перевірити доступність дисків."
+    } else {
+        "перевірити журнал BRAVO_MAINTENANCE."
+    }
+    $buildIdText = if ([string]::IsNullOrWhiteSpace([string]$script:ScriptBuildId)) {
+        "невідома"
+    } else {
+        [string]$script:ScriptBuildId
+    }
 
-    $lines = @(
-        "$TitleEmoji *$Title*",
-        ":derelict_house_building: Установа: $($script:ObjectName)",
-        ":desktop_computer: Машина: $($hostInformation.MachineName)",
-        ":globe_with_meridians: IP-адреси: $($hostInformation.LocalIP) | $($hostInformation.PublicIP)",
-        ":spiral_calendar_pad: $dateText • $($currentTime.ToString('HH:mm:ss')) • :hourglass_flowing_sand: $(Format-Duration $Duration)",
-        "🏷️ Версія BRAVO_MAINTENANCE: $($script:ScriptVersion) від $($script:ScriptDate) (build $(if ([string]::IsNullOrWhiteSpace($script:ScriptBuildId)) { 'невідома' } else { $script:ScriptBuildId }))"
-    )
-
+    $resultLines = New-Object System.Collections.Generic.List[string]
     $nonEmptyStatusLines = @($StatusLines | Where-Object {
         -not [string]::IsNullOrWhiteSpace([string]$_)
     })
     if ($nonEmptyStatusLines.Count -gt 0) {
-        $lines += ""
-        $lines += $nonEmptyStatusLines
+        foreach ($line in $nonEmptyStatusLines) {
+            $resultLines.Add([string]$line)
+        }
     }
 
-    $detailLines = @()
+    $detailLines = New-Object System.Collections.Generic.List[string]
     foreach ($detail in @($Details)) {
         foreach ($detailLine in ([string]$detail -split "\r?\n")) {
             # При копіюванні деякі клієнти додають коми до порожніх рядків.
             # Нормалізуємо їх і зберігаємо початкове маркування деталей.
             $trimmedDetail = $detailLine.Trim().TrimEnd(",").Trim()
             if (-not [string]::IsNullOrWhiteSpace($trimmedDetail)) {
-                $detailLines += $trimmedDetail
+                $detailLines.Add($trimmedDetail)
             }
         }
     }
     if ($detailLines.Count -gt 0) {
-        $lines += ""
-        $lines += ":pushpin: Деталі подій:"
-        $lines += $detailLines
+        $spaceDetailRendered = $false
+        foreach ($detailLine in $detailLines) {
+            if ($severity -ne "SUCCESS" -and
+                [string]$detailLine -match 'диск\s+([A-Z]:):?\s+залишилось\s+([0-9]+([.,][0-9]+)?)\s+GB,\s+потрібно мінімум\s+([0-9]+([.,][0-9]+)?)\s+GB') {
+                $driveName = [string]$Matches[1]
+                $freeGb = [double](([string]$Matches[2]).Replace(',', '.'))
+                $minimumGb = [double](([string]$Matches[4]).Replace(',', '.'))
+                $deficitGb = [math]::Round(($minimumGb - $freeGb), 2)
+                $resultLines.Add(":x: Недостатньо вільного місця на диску $driveName")
+                $resultLines.Add("Потрібна дія: звільнити щонайменше $deficitGb ГБ.")
+                $resultLines.Add("")
+                $resultLines.Add(":floppy_disk: $driveName")
+                $resultLines.Add("Вільно: $freeGb ГБ")
+                $resultLines.Add("Мінімум: $minimumGb ГБ")
+                $resultLines.Add("Дефіцит: $deficitGb ГБ")
+                $spaceDetailRendered = $true
+            } elseif (-not $spaceDetailRendered) {
+                $resultLines.Add($detailLine)
+            }
+        }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
-        $lines += ""
-        $lines += ":memo: Журнал обслуговування: $LogPath"
-    }
+    return New-BRAVOOperatorNotificationMessage `
+        -Severity $severity `
+        -Operation $operation `
+        -ActionText $actionText `
+        -InstitutionName ([string]$script:ObjectName) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines.ToArray() `
+        -Timestamp (Get-Date) `
+        -Duration $Duration `
+        -TimestampLabel "Перевірено" `
+        -ProductName "BRAVO Maintenance" `
+        -Version ([string]$script:ScriptVersion) `
+        -BuildId $buildIdText `
+        -LogPath $LogPath `
+        -LogLabel "Журнал"
+}
 
-    return $lines -join [Environment]::NewLine
+function Get-MaintenanceMinimumFreeSpaceLines {
+    $minimumLine = $null
+    $minimumFreeGb = $null
+    foreach ($driveLine in @($script:freeSpaceSummary)) {
+        if ([string]$driveLine -match '^([A-Z]:)\s+([0-9]+([.,][0-9]+)?)\s+GB') {
+            $freeGb = [double](([string]$Matches[2]).Replace(',', '.'))
+            if ($null -eq $minimumFreeGb -or $freeGb -lt $minimumFreeGb) {
+                $minimumFreeGb = $freeGb
+                $minimumLine = "$($Matches[1]) $freeGb ГБ"
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($minimumLine)) {
+        return @(":floppy_disk: Мінімальний запас: немає даних")
+    }
+    return @(
+        ":floppy_disk: Мінімальний запас:",
+        $minimumLine,
+        "Порогове значення: $MIN_FREE_SPACE ГБ"
+    )
 }
 
 
@@ -2504,9 +2567,10 @@ function Invoke-BRAVOLegacyLogMigration {
                 -Message "Старий каталог видалено після підтвердженої міграції: $LegacyPath (перенесено файлів: $migratedCount)" `
                 -Level "SUCCESS"
         } else {
+            $migratedCountText = Format-BRAVOUkrainianCount -Count $migratedCount -One "файл" -Few "файли" -Many "файлів"
             Write-BRAVOLogRotationMessage `
                 -Logger $Logger `
-                -Message "Міграцію завершено ($migratedCount файл(ів)), але каталог $LegacyPath не порожній — залишено без змін" `
+                -Message "Міграцію завершено ($migratedCountText), але каталог $LegacyPath не порожній — залишено без змін" `
                 -Level "WARNING"
         }
     } else {
@@ -3544,12 +3608,6 @@ function Send-FinalReport {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
             $completedCheckLines = [System.Collections.Generic.List[string]]::new()
-            $completedCheckLines.Add(":mag: Виконані перевірки та операції:")
-            $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-            $nextRestoreDate = $scheduledOccurrence.Date.AddDays(7)
-            $maintenanceStartTime = [TimeSpan]::Parse([string]$schedulerSettings.Maintenance.DailyAt)
-            $nextRestoreExecution = $nextRestoreDate.Add($maintenanceStartTime)
-            $restoreScheduleText = $nextRestoreExecution.ToString("dddd, dd.MM.yyyy HH:mm", $ukrainianCulture)
             $lastRestoreTime = $restoreCompletedAt
             if ($null -eq $lastRestoreTime) {
                 $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
@@ -3560,72 +3618,58 @@ function Send-FinalReport {
                 }
             }
             $lastRestoreText = if ($null -ne $lastRestoreTime) {
-                $lastRestoreTime.ToString("dd.MM.yyyy HH:mm:ss", $ukrainianCulture)
+                $lastRestoreTime.ToString("dd.MM.yyyy HH:mm")
             } elseif (-not $BravoMaintenanceEnabled) {
                 "немає даних (компонент BRAVO вимкнено)"
             } else {
                 "ще не виконувалася"
             }
-            $completedCheckLines.Add(":arrows_counterclockwise: Реставрація — наступна: $restoreScheduleText (після $RestoreTime) • остання: $lastRestoreText")
+            $completedCheckLines.Add("Виконано:")
+            if ($BravoMaintenanceEnabled) {
+                $completedCheckLines.Add(":white_check_mark: Реставрація — за планом")
+            }
 
-            $mdLimitGb = [math]::Round(([double]$MAX_MD_FILE_SIZE / 1GB), 2)
-            $mdSelectionCriterion = "понад $mdLimitGb ГБ"
-            if ($MD_FILE_SIZE_EXCLUSIONS.Count -gt 0) {
-                $mdSelectionCriterion += "; виключень за конфігурацією: $($MD_FILE_SIZE_EXCLUSIONS.Count)"
-            }
             $mdCheckStatus = if ($BravoMaintenanceEnabled -and $CheckSize) {
-                "пройдено (критерій: $mdSelectionCriterion)"
+                "перевірено"
             } elseif (-not $BravoMaintenanceEnabled) {
-                "вимкнено разом із компонентом BRAVO"
+                $null
             } else {
-                "вимкнено параметром запуску"
+                $null
             }
-            $completedCheckLines.Add(":page_facing_up: Перевірка розміру файлів .md — $mdCheckStatus")
+            if ($mdCheckStatus) {
+                $completedCheckLines.Add(":white_check_mark: .md-файли — $mdCheckStatus")
+            }
 
             $rangeCheckStatus = if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
-                "пройдено"
-            } elseif (-not $RangeIdMonitoringEnabled) {
-                "вимкнено в конфігурації"
+                "у нормі"
             } else {
-                "вимкнено разом із компонентом BRAVO"
+                $null
             }
-            $completedCheckLines.Add(":bar_chart: Перевірка значень інтервалів ID — $rangeCheckStatus")
+            if ($rangeCheckStatus) {
+                $completedCheckLines.Add(":white_check_mark: Інтервали ID — $rangeCheckStatus")
+            }
 
-            $traceOutputStatus = if (-not $BravoMaintenanceEnabled) {
-                "вимкнено разом із компонентом BRAVO"
-            } elseif ($traceOutputProcessed) {
-                "виконано: $traceOutputProcessedCount файл(ів) → $TRACE_ARCHIV_DIR"
-            } else {
-                "нового trace-файлу не знайдено"
+            if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
+                $traceCountText = Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
+                $completedCheckLines.Add(":white_check_mark: Trace — оброблено $traceCountText")
             }
-            $completedCheckLines.Add(":card_file_box: Архівування та обнулення трейс-файлів — $traceOutputStatus")
             if ($exchangAPILogsProcessedCount -gt 0) {
-                $completedCheckLines.Add(":arrows_counterclockwise: Обробка логів exchangAPI — переміщено $exchangAPILogsProcessedCount з $exchangAPILogsFoundCount файл(ів) → $EXCHANGE_DAILY_LOG_DIR")
+                $exchangeCountText = Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
+                $completedCheckLines.Add(":white_check_mark: exchangAPI — оброблено $exchangeCountText")
             }
-            $webLogOperationDetails = [System.Collections.Generic.List[string]]::new()
-            if ($webApacheLogsProcessedCount -gt 0) {
-                $webLogOperationDetails.Add("Apache: $webApacheLogsProcessedCount файл(ів) → $APACHE_DAILY_LOG_DIR")
+            $completedCheckLines.Add(":white_check_mark: Вільне місце — достатньо")
+            $completedCheckLines.Add("")
+            foreach ($freeSpaceLine in @(Get-MaintenanceMinimumFreeSpaceLines)) {
+                $completedCheckLines.Add($freeSpaceLine)
             }
-            if ($webWwwLogsProcessedCount -gt 0) {
-                $webLogOperationDetails.Add("Application: $webWwwLogsProcessedCount файл(ів) → $BRAVOWEB_APP_DAILY_LOG_DIR")
-            }
-            if ($webLogOperationDetails.Count -gt 0) {
-                $completedCheckLines.Add(":globe_with_meridians: Обробка логів BRAVO Web — $($webLogOperationDetails -join '; ')")
-            }
-            $freeSpaceDetails = if ($script:freeSpaceSummary -and $script:freeSpaceSummary.Count -gt 0) {
-                "$($script:freeSpaceSummary -join '; ') (мінімум: $MIN_FREE_SPACE GB)"
-            } else {
-                "усі перевірені диски відповідають мінімуму $MIN_FREE_SPACE GB"
-            }
-            $completedCheckLines.Add(":floppy_disk: Контроль вільного місця на дисках — пройдено: $freeSpaceDetails")
+            $completedCheckLines.Add("")
+            $completedCheckLines.Add(":arrows_counterclockwise: Остання реставрація: $lastRestoreText")
 
             $notificationMessage = New-MaintenanceNotificationMessage `
-                -Title "ОБСЛУГОВУВАННЯ ЗАВЕРШЕНО УСПІШНО" `
+                -Title "BRAVO MAINTENANCE — УСПІШНО" `
                 -TitleEmoji ":white_check_mark:" `
                 -Duration $elapsedTime `
-                -StatusLines @(
-                    ":wrench: Регламентні операції завершено"
-                ) `
+                -StatusLines @() `
                 -Details @($completedCheckLines.ToArray()) `
                 -LogPath $LOG_FILE
             $shouldSend = $true

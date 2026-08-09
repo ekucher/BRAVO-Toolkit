@@ -123,12 +123,201 @@ function Get-HostInformation {
     return $script:CachedHostInformation
 }
 
+function Format-BRAVOUkrainianCount {
+    param(
+        [Parameter(Mandatory = $true)][int]$Count,
+        [Parameter(Mandatory = $true)][string]$One,
+        [Parameter(Mandatory = $true)][string]$Few,
+        [Parameter(Mandatory = $true)][string]$Many
+    )
+
+    $absoluteCount = [math]::Abs($Count)
+    $lastTwoDigits = $absoluteCount % 100
+    $lastDigit = $absoluteCount % 10
+    $word = if ($lastTwoDigits -ge 11 -and $lastTwoDigits -le 14) {
+        $Many
+    } elseif ($lastDigit -eq 1) {
+        $One
+    } elseif ($lastDigit -ge 2 -and $lastDigit -le 4) {
+        $Few
+    } else {
+        $Many
+    }
+    return "$Count $word"
+}
+
+function Format-BRAVOOperatorDuration {
+    param([timespan]$Duration)
+
+    $totalSeconds = [math]::Max(0, [int][math]::Round($Duration.TotalSeconds))
+    if ($totalSeconds -lt 60) {
+        return (Format-BRAVOUkrainianCount -Count $totalSeconds -One "сек." -Few "сек." -Many "сек.")
+    }
+    $minutes = [int][math]::Floor($totalSeconds / 60)
+    $seconds = $totalSeconds % 60
+    if ($minutes -lt 60) {
+        $text = Format-BRAVOUkrainianCount -Count $minutes -One "хв." -Few "хв." -Many "хв."
+        if ($seconds -gt 0) {
+            $text += " " + (Format-BRAVOUkrainianCount -Count $seconds -One "сек." -Few "сек." -Many "сек.")
+        }
+        return $text
+    }
+    $hours = [int][math]::Floor($minutes / 60)
+    $remainingMinutes = $minutes % 60
+    $hourText = Format-BRAVOUkrainianCount -Count $hours -One "год." -Few "год." -Many "год."
+    if ($remainingMinutes -gt 0) {
+        $hourText += " " + (Format-BRAVOUkrainianCount -Count $remainingMinutes -One "хв." -Few "хв." -Many "хв.")
+    }
+    return $hourText
+}
+
+function Test-BRAVOValidIpAddressText {
+    param([string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Value -in @("вимкнено", "недоступна", "недоступні")) { return $false }
+    $parsedAddress = $null
+    return [System.Net.IPAddress]::TryParse($Value.Trim(), [ref]$parsedAddress)
+}
+
+function Format-BRAVOOperatorHostLine {
+    param($HostInformation)
+
+    $machineName = if ($null -ne $HostInformation -and
+        -not [string]::IsNullOrWhiteSpace([string]$HostInformation.MachineName)) {
+        [string]$HostInformation.MachineName
+    } else {
+        [Environment]::MachineName
+    }
+
+    $localParts = @()
+    if ($null -ne $HostInformation) {
+        $localParts = @(
+            ([string]$HostInformation.LocalIP -split '\s*(?:,|\|)\s*') |
+                Where-Object { Test-BRAVOValidIpAddressText -Value ([string]$_) } |
+                Select-Object -Unique
+        )
+    }
+    $parts = @($machineName) + $localParts
+    return ":desktop_computer: " + ($parts -join " · ")
+}
+
+function Get-BRAVOOperatorPublicIpLine {
+    param($HostInformation)
+
+    if ($null -eq $HostInformation) { return $null }
+    $publicIp = [string]$HostInformation.PublicIP
+    if (Test-BRAVOValidIpAddressText -Value $publicIp) {
+        return ":globe_with_meridians: Публічна IP: $publicIp"
+    }
+    return $null
+}
+
+function Format-BRAVOOperatorVersionLine {
+    param(
+        [Parameter(Mandatory = $true)][string]$ProductName,
+        [string]$Version,
+        [string]$BuildId
+    )
+
+    $versionText = if ([string]::IsNullOrWhiteSpace($Version)) { "невідома" } else { $Version }
+    $buildText = if ([string]::IsNullOrWhiteSpace($BuildId)) { "build невідомий" } else { $BuildId }
+    return "$ProductName $versionText · $buildText"
+}
+
+function New-BRAVOOperatorNotificationMessage {
+    param(
+        [ValidateSet("SUCCESS", "WARNING", "CRITICAL", "ERROR")]
+        [string]$Severity = "SUCCESS",
+        [Parameter(Mandatory = $true)][string]$Operation,
+        [string]$ActionText,
+        [string[]]$ReasonLines = @(),
+        [string]$InstitutionName,
+        [string]$InstitutionCode,
+        $HostInformation,
+        [string[]]$ResultLines = @(),
+        [datetime]$Timestamp = (Get-Date),
+        [timespan]$Duration = [timespan]::Zero,
+        [string]$TimestampLabel = "Перевірено",
+        [string]$ProductName = "BRAVO",
+        [string]$Version,
+        [string]$BuildId,
+        [string]$LogPath,
+        [string]$LogLabel = "Журнал"
+    )
+
+    $separator = "━" * 36
+    $severityIcon = switch ($Severity) {
+        "SUCCESS" { ":white_check_mark:" }
+        "WARNING" { ":warning:" }
+        default { ":rotating_light:" }
+    }
+    $defaultAction = if ($Severity -eq "SUCCESS") {
+        "Дій не потрібно"
+    } else {
+        "Потрібна дія: перевірити журнал BRAVO"
+    }
+    $actionLine = if ([string]::IsNullOrWhiteSpace($ActionText)) { $defaultAction } else { $ActionText }
+    if ($Severity -ne "SUCCESS" -and -not $actionLine.StartsWith("Потрібна дія:")) {
+        $actionLine = "Потрібна дія: $actionLine"
+    }
+
+    $institutionLine = if (-not [string]::IsNullOrWhiteSpace($InstitutionCode)) {
+        ":office: $InstitutionName [$InstitutionCode]"
+    } elseif (-not [string]::IsNullOrWhiteSpace($InstitutionName)) {
+        ":office: $InstitutionName"
+    } else {
+        ":office: BRAVO"
+    }
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add($separator)
+    $lines.Add("$severityIcon $Operation")
+    $lines.Add($actionLine)
+    foreach ($reasonLine in @($ReasonLines)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$reasonLine)) {
+            $lines.Add([string]$reasonLine)
+        }
+    }
+    $lines.Add("")
+    $lines.Add($institutionLine)
+    $lines.Add((Format-BRAVOOperatorHostLine -HostInformation $HostInformation))
+    $publicIpLine = Get-BRAVOOperatorPublicIpLine -HostInformation $HostInformation
+    if (-not [string]::IsNullOrWhiteSpace($publicIpLine)) {
+        $lines.Add($publicIpLine)
+    }
+
+    $nonEmptyResultLines = @($ResultLines | Where-Object {
+        -not [string]::IsNullOrWhiteSpace([string]$_)
+    })
+    if ($nonEmptyResultLines.Count -gt 0) {
+        $lines.Add("")
+        foreach ($resultLine in $nonEmptyResultLines) {
+            $lines.Add([string]$resultLine)
+        }
+    }
+
+    $lines.Add("")
+    $timeLine = "${TimestampLabel}: $($Timestamp.ToString('dd.MM.yyyy HH:mm:ss'))"
+    if ($Duration -gt [timespan]::Zero) {
+        $timeLine += " · $(Format-BRAVOOperatorDuration -Duration $Duration)"
+    }
+    $lines.Add($timeLine)
+    $lines.Add((Format-BRAVOOperatorVersionLine -ProductName $ProductName -Version $Version -BuildId $BuildId))
+    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
+        $lines.Add("")
+        $lines.Add(":memo: ${LogLabel}: $LogPath")
+    }
+    $lines.Add($separator)
+    return ($lines.ToArray() -join [Environment]::NewLine)
+}
+
 function ConvertTo-DiscordNotificationText {
     param([string]$Message)
 
     $emojiReplacements = [ordered]@{
         ":rotating_light:" = "🚨"
-        ":derelict_house_building:" = "🏚️"
+        ":office:" = "🏢"
         ":desktop_computer:" = "🖥️"
         ":globe_with_meridians:" = "🌐"
         ":spiral_calendar_pad:" = "🗓️"
