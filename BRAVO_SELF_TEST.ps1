@@ -2643,7 +2643,7 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('function Remove-BRAVOExpiredBackupGenerations') -and
-            $archiveScriptText.Contains("Get-BRAVOFiles -Path `$BackupRoot -Filter 'BRAVO_BACKUP_*.json'") -and
+            $archiveScriptText.Contains('Get-BRAVOBackupGenerationManifestFiles -BackupRoot $BackupRoot') -and
             $archiveScriptText.Contains('$record.GenerationId -eq $CurrentGenerationId') -and
             $archiveScriptText.Contains('$record.GenerationId -notin $protectedGenerationIds') -and
             $archiveScriptText.Contains('minimumRetainedVerifiedBackups') -and
@@ -4143,7 +4143,7 @@ try {
     }
     Test-BRAVOCondition `
         -Condition (
-            $healthScriptText.Contains("Get-BRAVOFiles -Path `$backupRootPath -Filter 'BRAVO_BACKUP_*.json'") -and
+            $healthScriptText.Contains('Get-BRAVOBackupGenerationManifestFiles -BackupRoot $backupRootPath') -and
             $healthScriptText.Contains("[string]`$manifest.status -ne 'COMPLETE'") -and
             $healthScriptText.Contains('COMPLETE generation $manifestGenerationId') -and
             $healthScriptText.Contains('$componentsProperty.Value.PSObject.Properties') -and
@@ -5099,7 +5099,11 @@ try {
         'Write-BRAVOHeader',
         'Write-BRAVOStepResult'
     )
-    $finalSummaryCommandAlternatives = @('Write-BRAVOSummary', 'Write-BRAVOResultHeader')
+    # dev.14 (round 3): Maintenance перейшла на Write-BRAVOFinalSummaryHeader
+    # (BRAVO.Console) для фінального підсумку — той самий спільний модуль,
+    # інша, паралельна точка входу (Write-BRAVOResultHeader лишається
+    # контрактом для Archive/Health/решти).
+    $finalSummaryCommandAlternatives = @('Write-BRAVOSummary', 'Write-BRAVOResultHeader', 'Write-BRAVOFinalSummaryHeader')
     $runtimeConsoleAsts = @{}
     $runtimesMissingConsole = @()
     foreach ($runtimeConsoleFile in $runtimeConsoleFiles) {
@@ -6185,7 +6189,7 @@ try {
             $restoreTestScriptText.Contains("Get-BRAVORestoreGenerationManifest") -and
             $restoreTestScriptText.Contains("Get-BRAVOVerifiedGenerationArchive") -and
             $restoreTestScriptText.Contains("RequestedGenerationId") -and
-            $restoreTestScriptText.Contains("BRAVO_BACKUP_*.json") -and
+            $restoreTestScriptText.Contains("Get-BRAVOBackupGenerationManifestFiles") -and
             $restoreTestScriptText.Contains("Test-SevenZipArchiveIntegrity") -and
             $restoreTestScriptText.Contains("Invoke-BRAVOSevenZipExtraction") -and
             $restoreTestScriptText.Contains("MinimumFileCount") -and
@@ -6329,6 +6333,1040 @@ try {
         ) `
         -Name "SizeSanity/WiredIntoArchiveRuntime" `
         -Failure "BRAVO.Archive.Runtime.ps1 має викликати Test-BRAVOBackupSizeAnomaly з налаштувань backupMonitoring.SizeSanity"
+
+    # dev.14: generation manifest-и (BRAVO_BACKUP_<GenerationId>.json) —
+    # виділене сховище MANIFESTS\, окреме від LOGS/TEMP. Усі тести нижче
+    # працюють ЛИШЕ із синтетичними каталогами під $env:TEMP — жодного
+    # production BackupRoot/SFTP/SMB/ACL. BRAVO.ArchiveHelpers уже
+    # імпортовано вище (SizeSanity), Write-BRAVOBackupGenerationManifest
+    # тестується через ізольовану AST-екстракцію (Archive.Runtime.ps1
+    # безумовно запускає Main при dot-source).
+    $manifestWriterModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveRuntimeTextForSizeSanity `
+        -FunctionNames @('Write-BRAVOBackupGenerationManifest')
+
+    function New-BRAVOManifestStorageTestGenerationState {
+        param([string]$GenerationId)
+
+        return [pscustomobject]@{
+            GenerationId = $GenerationId
+            StartedAt = (Get-Date)
+            SnapshotSetId = $null
+            Status = 'COMPLETE'
+            SnapshotCreatedAt = $null
+            Volumes = @()
+            Components = @()
+            TransferResults = $null
+            HealthResult = $null
+        }
+    }
+
+    $manifestStorageTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_MANIFEST_STORAGE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($manifestStorageTestRoot)
+
+        # --- 1. Get-BRAVOBackupManifestRoot: єдине джерело фізичного шляху ---
+        Test-BRAVOCondition `
+            -Condition (
+                (Get-BRAVOBackupManifestRoot -BackupRoot $manifestStorageTestRoot) -eq `
+                    (Join-Path $manifestStorageTestRoot 'MANIFESTS')
+            ) `
+            -Name "ManifestStorage/RootResolution" `
+            -Failure "Get-BRAVOBackupManifestRoot має повертати BackupRoot\MANIFESTS і ніколи TEMP чи інший шлях"
+
+        # --- 2. Writer: новий manifest завжди йде в MANIFESTS, каталог створюється сам ---
+        $writerTestRoot = Join-Path $manifestStorageTestRoot 'writer'
+        [void][IO.Directory]::CreateDirectory($writerTestRoot)
+        $writerGenerationState = New-BRAVOManifestStorageTestGenerationState -GenerationId '20260809_120000'
+        $writtenManifestPath = & $manifestWriterModule {
+            param($State, $BackupRoot)
+            Write-BRAVOBackupGenerationManifest -GenerationState $State -BackupRoot $BackupRoot
+        } $writerGenerationState $writerTestRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $writtenManifestPath -eq (Join-Path (Join-Path $writerTestRoot 'MANIFESTS') 'BRAVO_BACKUP_20260809_120000.json') -and
+                (Test-Path -LiteralPath $writtenManifestPath -PathType Leaf) -and
+                -not (Test-Path -LiteralPath (Join-Path $writerTestRoot 'BRAVO_BACKUP_20260809_120000.json'))
+            ) `
+            -Name "ManifestStorage/WriterWritesToManifestsRoot" `
+            -Failure "Write-BRAVOBackupGenerationManifest має писати новий manifest у BackupRoot\MANIFESTS (створюючи каталог за потреби), а не в корінь BackupRoot"
+
+        # --- 3. Reader: той самий generationId в обох місцях -> MANIFESTS виграє ---
+        $readerTestRoot = Join-Path $manifestStorageTestRoot 'reader-priority'
+        $readerManifestsDir = Join-Path $readerTestRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($readerManifestsDir)
+        $legacyDuplicate = Join-Path $readerTestRoot 'BRAVO_BACKUP_20260101_010101.json'
+        $newDuplicate = Join-Path $readerManifestsDir 'BRAVO_BACKUP_20260101_010101.json'
+        [IO.File]::WriteAllText($legacyDuplicate, '{"generationId":"20260101_010101","source":"legacy"}')
+        [IO.File]::WriteAllText($newDuplicate, '{"generationId":"20260101_010101","source":"manifests"}')
+        $priorityResult = @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $readerTestRoot)
+        Test-BRAVOCondition `
+            -Condition (
+                $priorityResult.Count -eq 1 -and
+                $priorityResult[0].FullName -eq $newDuplicate
+            ) `
+            -Name "ManifestStorage/ReaderPrefersManifestsOnDuplicateGenerationId" `
+            -Failure "коли той самий generationId є і в корені BackupRoot, і в MANIFESTS, reader має віддати рівно один запис — з MANIFESTS"
+        $prioritySingle = @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $readerTestRoot -GenerationId '20260101_010101')
+        Test-BRAVOCondition `
+            -Condition ($prioritySingle.Count -eq 1 -and $prioritySingle[0].FullName -eq $newDuplicate) `
+            -Name "ManifestStorage/ReaderByGenerationIdPrefersManifests" `
+            -Failure "пошук за конкретним GenerationId також має віддавати перевагу версії з MANIFESTS"
+
+        # --- 4. Reader: legacy-only файл (ще не мігрований) лишається видимим ---
+        $readerLegacyOnlyRoot = Join-Path $manifestStorageTestRoot 'reader-legacy-only'
+        [void][IO.Directory]::CreateDirectory($readerLegacyOnlyRoot)
+        $legacyOnlyManifest = Join-Path $readerLegacyOnlyRoot 'BRAVO_BACKUP_20260202_020202.json'
+        [IO.File]::WriteAllText($legacyOnlyManifest, '{"generationId":"20260202_020202"}')
+        $legacyOnlyListAll = @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $readerLegacyOnlyRoot)
+        $legacyOnlyById = @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $readerLegacyOnlyRoot -GenerationId '20260202_020202')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyOnlyListAll.Count -eq 1 -and $legacyOnlyListAll[0].FullName -eq $legacyOnlyManifest -and
+                $legacyOnlyById.Count -eq 1 -and $legacyOnlyById[0].FullName -eq $legacyOnlyManifest
+            ) `
+            -Name "ManifestStorage/ReaderFallsBackToLegacyRoot" `
+            -Failure "на не мігрованій інсталяції (MANIFESTS відсутній або без цього файлу) reader має знаходити manifest у корені BackupRoot — і в list-all, і за GenerationId"
+
+        # --- 5. Reader: без -Recurse — вкладені підкаталоги не потрапляють і не дублюються ---
+        $readerNonRecursiveRoot = Join-Path $manifestStorageTestRoot 'reader-non-recursive'
+        $deepDecoyDir = Join-Path $readerNonRecursiveRoot 'sub\deep'
+        [void][IO.Directory]::CreateDirectory($deepDecoyDir)
+        [IO.File]::WriteAllText((Join-Path $deepDecoyDir 'BRAVO_BACKUP_20260303_030303.json'), '{"generationId":"20260303_030303"}')
+        $nonRecursiveResult = @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $readerNonRecursiveRoot)
+        Test-BRAVOCondition `
+            -Condition ($nonRecursiveResult.Count -eq 0) `
+            -Name "ManifestStorage/ReaderIsNonRecursive" `
+            -Failure "reader не повинен заглядати у вкладені підкаталоги BackupRoot (лише безпосередньо корінь і безпосередньо MANIFESTS)"
+
+        # --- 6. Migration: переносить лише legacy-only файли ---
+        $migrationBasicRoot = Join-Path $manifestStorageTestRoot 'migration-basic'
+        [void][IO.Directory]::CreateDirectory($migrationBasicRoot)
+        $migrationBasicFile = Join-Path $migrationBasicRoot 'BRAVO_BACKUP_20260404_040404.json'
+        [IO.File]::WriteAllText($migrationBasicFile, '{"generationId":"20260404_040404"}')
+        $migrationBasicResult = Initialize-BRAVOBackupManifestStorage -BackupRoot $migrationBasicRoot -Logger $null
+        $migrationBasicDestination = Join-Path (Join-Path $migrationBasicRoot 'MANIFESTS') 'BRAVO_BACKUP_20260404_040404.json'
+        Test-BRAVOCondition `
+            -Condition (
+                $migrationBasicResult.Migrated -contains 'BRAVO_BACKUP_20260404_040404.json' -and
+                -not (Test-Path -LiteralPath $migrationBasicFile) -and
+                (Test-Path -LiteralPath $migrationBasicDestination)
+            ) `
+            -Name "ManifestStorage/MigrationMovesLegacyOnlyFiles" `
+            -Failure "Initialize-BRAVOBackupManifestStorage має переносити legacy manifest, для якого немає версії в MANIFESTS"
+
+        # --- 7. Migration: другий запуск — no-op (ідемпотентність) ---
+        $migrationSecondRun = Initialize-BRAVOBackupManifestStorage -BackupRoot $migrationBasicRoot -Logger $null
+        Test-BRAVOCondition `
+            -Condition (
+                $migrationSecondRun.Migrated.Count -eq 0 -and
+                $migrationSecondRun.Deduplicated.Count -eq 0 -and
+                $migrationSecondRun.Conflicts.Count -eq 0 -and
+                $migrationSecondRun.Errors.Count -eq 0 -and
+                (Test-Path -LiteralPath $migrationBasicDestination)
+            ) `
+            -Name "ManifestStorage/MigrationSecondRunIsNoOp" `
+            -Failure "повторний запуск міграції на вже мігрованій інсталяції не повинен нічого переносити, дублювати чи позначати як конфлікт"
+
+        # --- 8. Migration: байтово ідентичний дублікат -> legacy прибирається ---
+        $migrationDedupRoot = Join-Path $manifestStorageTestRoot 'migration-dedup'
+        $migrationDedupManifests = Join-Path $migrationDedupRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($migrationDedupManifests)
+        $dedupContent = '{"generationId":"20260505_050505","identical":true}'
+        $dedupLegacy = Join-Path $migrationDedupRoot 'BRAVO_BACKUP_20260505_050505.json'
+        $dedupDestination = Join-Path $migrationDedupManifests 'BRAVO_BACKUP_20260505_050505.json'
+        [IO.File]::WriteAllText($dedupLegacy, $dedupContent)
+        [IO.File]::WriteAllText($dedupDestination, $dedupContent)
+        $migrationDedupResult = Initialize-BRAVOBackupManifestStorage -BackupRoot $migrationDedupRoot -Logger $null
+        Test-BRAVOCondition `
+            -Condition (
+                $migrationDedupResult.Deduplicated -contains 'BRAVO_BACKUP_20260505_050505.json' -and
+                -not (Test-Path -LiteralPath $dedupLegacy) -and
+                (Test-Path -LiteralPath $dedupDestination) -and
+                ([IO.File]::ReadAllText($dedupDestination)) -eq $dedupContent
+            ) `
+            -Name "ManifestStorage/MigrationDedupesIdenticalCollision" `
+            -Failure "коли legacy і MANIFESTS файли байтово ідентичні (SHA256), міграція має прибрати legacy-дублікат і лишити MANIFESTS без змін"
+
+        # --- 9. Migration: різний вміст -> ЖОДЕН файл не чіпається, є конфлікт + WARNING ---
+        $migrationConflictRoot = Join-Path $manifestStorageTestRoot 'migration-conflict'
+        $migrationConflictManifests = Join-Path $migrationConflictRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($migrationConflictManifests)
+        $conflictLegacyContent = '{"generationId":"20260606_060606","source":"legacy"}'
+        $conflictNewContent = '{"generationId":"20260606_060606","source":"manifests"}'
+        $conflictLegacy = Join-Path $migrationConflictRoot 'BRAVO_BACKUP_20260606_060606.json'
+        $conflictDestination = Join-Path $migrationConflictManifests 'BRAVO_BACKUP_20260606_060606.json'
+        [IO.File]::WriteAllText($conflictLegacy, $conflictLegacyContent)
+        [IO.File]::WriteAllText($conflictDestination, $conflictNewContent)
+        $conflictLoggedMessages = New-Object System.Collections.ArrayList
+        $conflictLogger = {
+            param($Message, $Level)
+            [void]$conflictLoggedMessages.Add(@{ Message = $Message; Level = $Level })
+        }
+        $migrationConflictResult = Initialize-BRAVOBackupManifestStorage -BackupRoot $migrationConflictRoot -Logger $conflictLogger
+        $conflictWarningLogged = @($conflictLoggedMessages | Where-Object {
+            $_.Level -eq 'WARNING' -and
+            [string]$_.Message -match '20260606_060606' -and
+            [string]$_.Message -match '[Кк]онфлікт'
+        })
+        Test-BRAVOCondition `
+            -Condition (
+                $migrationConflictResult.Conflicts -contains 'BRAVO_BACKUP_20260606_060606.json' -and
+                (Test-Path -LiteralPath $conflictLegacy) -and
+                (Test-Path -LiteralPath $conflictDestination) -and
+                ([IO.File]::ReadAllText($conflictLegacy)) -eq $conflictLegacyContent -and
+                ([IO.File]::ReadAllText($conflictDestination)) -eq $conflictNewContent -and
+                $conflictWarningLogged.Count -eq 1
+            ) `
+            -Name "ManifestStorage/MigrationPreservesConflictingCollisionAndWarns" `
+            -Failure "коли legacy і MANIFESTS файли того самого generationId відрізняються, міграція НЕ повинна видаляти чи перезаписувати жоден з них — лише WARNING з generationId конфлікту"
+
+        # --- 10. Migration: без -Recurse — вкладений legacy файл не переноситься ---
+        $migrationNonRecursiveRoot = Join-Path $manifestStorageTestRoot 'migration-non-recursive'
+        $migrationDeepDecoyDir = Join-Path $migrationNonRecursiveRoot 'sub\deep'
+        [void][IO.Directory]::CreateDirectory($migrationDeepDecoyDir)
+        $deepLegacyFile = Join-Path $migrationDeepDecoyDir 'BRAVO_BACKUP_20260707_070707.json'
+        [IO.File]::WriteAllText($deepLegacyFile, '{"generationId":"20260707_070707"}')
+        $migrationNonRecursiveResult = Initialize-BRAVOBackupManifestStorage -BackupRoot $migrationNonRecursiveRoot -Logger $null
+        Test-BRAVOCondition `
+            -Condition (
+                $migrationNonRecursiveResult.Migrated.Count -eq 0 -and
+                (Test-Path -LiteralPath $deepLegacyFile) -and
+                -not (Test-Path -LiteralPath (Join-Path (Join-Path $migrationNonRecursiveRoot 'MANIFESTS') 'BRAVO_BACKUP_20260707_070707.json'))
+            ) `
+            -Name "ManifestStorage/MigrationIsNonRecursive" `
+            -Failure "міграція має шукати legacy manifest-и лише безпосередньо в корені BackupRoot, а не рекурсивно у вкладених підкаталогах"
+
+        # --- 11. Migration: відсутній BackupRoot -> помилка у результаті, без throw ---
+        $missingBackupRoot = Join-Path $manifestStorageTestRoot 'does-not-exist'
+        $missingRootThrew = $false
+        $missingRootResult = $null
+        try {
+            $missingRootResult = Initialize-BRAVOBackupManifestStorage -BackupRoot $missingBackupRoot -Logger $null
+        } catch {
+            $missingRootThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (-not $missingRootThrew -and $null -ne $missingRootResult -and $missingRootResult.Errors.Count -gt 0) `
+            -Name "ManifestStorage/MigrationHandlesMissingBackupRootGracefully" `
+            -Failure "міграція має повертати структурований результат з Errors, а не кидати виняток, коли BackupRoot ще не існує"
+    } finally {
+        if (Test-Path -LiteralPath $manifestStorageTestRoot) {
+            Remove-Item -LiteralPath $manifestStorageTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Retention: видалення generation прибирає ОБИДВІ фізичні копії
+    # manifest-а (MANIFESTS і legacy-корінь), а не лише ту, яку
+    # MANIFESTS-first reader обрав для рішення про видалення. Інакше
+    # legacy-копія переживає видалення й "воскрешає" generation на
+    # наступному запуску через legacy fallback читання (dev.14, round 2).
+    # Викликає РЕАЛЬНУ Remove-BRAVOExpiredBackupGenerations (ізольована
+    # AST-екстракція, як і решта Archive-тестів у цьому файлі) — не
+    # симуляцію алгоритму, бо саме порядок фізичного видалення тут і є
+    # предметом перевірки.
+    $retentionCleanupModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveRuntimeTextForSizeSanity `
+        -FunctionNames @(
+            'Remove-BRAVOExpiredBackupGenerations',
+            'Get-BRAVOGenerationManifestComponents',
+            'Test-BRAVOGenerationManifestVerified',
+            'Show-ArchiveCleanupSection',
+            'Show-ScriptProgress',
+            'Test-BRAVOBackupArtifactPathSafe'
+        )
+    $retentionCleanupTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_RETENTION_CLEANUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($retentionCleanupTestRoot)
+        $retentionCleanupManifestsDir = Join-Path $retentionCleanupTestRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($retentionCleanupManifestsDir)
+
+        $retentionTargetLegacy = Join-Path $retentionCleanupTestRoot 'BRAVO_BACKUP_20260101_010101.json'
+        $retentionTargetNew = Join-Path $retentionCleanupManifestsDir 'BRAVO_BACKUP_20260101_010101.json'
+        # Різний вміст (note) — той самий "конфлікт", який міграція раніше
+        # свідомо зберегла обома копіями; тепер generation все одно
+        # видаляється цілком, бо retention уже прийняв рішення про видалення.
+        [IO.File]::WriteAllText($retentionTargetLegacy, '{"generationId":"20260101_010101","status":"FAILED","startedAt":"2026-01-01T00:00:00","note":"legacy"}')
+        [IO.File]::WriteAllText($retentionTargetNew, '{"generationId":"20260101_010101","status":"FAILED","startedAt":"2026-01-01T00:00:00","note":"manifests"}')
+
+        $global:enableArchiveDeletion = $true
+        $global:enableFailedArchiveDeletion = $true
+        $global:failedArchiveRetentionDays = 1
+        $global:minimumRetainedVerifiedBackups = 1
+        $global:progressSettings = $null
+        try {
+            $retentionCleanupSectionShown = $false
+            $retentionCleanupOk = & $retentionCleanupModule {
+                param($BackupRoot, $CurrentGenerationId, $SectionShownRef)
+                Remove-BRAVOExpiredBackupGenerations `
+                    -BackupRoot $BackupRoot `
+                    -CurrentGenerationId $CurrentGenerationId `
+                    -RetentionDays 183 `
+                    -CleanupSectionShown $SectionShownRef
+            } $retentionCleanupTestRoot 'CURRENT_GENERATION_NOT_TARGET' ([ref]$retentionCleanupSectionShown)
+
+            Test-BRAVOCondition `
+                -Condition (
+                    $retentionCleanupOk -eq $true -and
+                    -not (Test-Path -LiteralPath $retentionTargetLegacy) -and
+                    -not (Test-Path -LiteralPath $retentionTargetNew)
+                ) `
+                -Name "ManifestStorage/RetentionDeletesBothPhysicalManifestCopies" `
+                -Failure "видалення generation має прибирати ОБИДВІ фізичні копії її manifest-а (MANIFESTS і legacy-корінь), а не лише ту, яку MANIFESTS-first reader повернув"
+
+            $retentionCleanupAfterDelete = @(Get-BRAVOBackupGenerationManifestFiles `
+                -BackupRoot $retentionCleanupTestRoot `
+                -GenerationId '20260101_010101')
+            Test-BRAVOCondition `
+                -Condition ($retentionCleanupAfterDelete.Count -eq 0) `
+                -Name "ManifestStorage/DeletedGenerationCannotReappearViaLegacyFallback" `
+                -Failure "після видалення generation reader не повинен знаходити її manifest ні в MANIFESTS, ні через legacy fallback — інакше видалена generation 'воскресає' на наступному запуску"
+
+            # --- dev.14 (round 3): filename/JSON generationId identity.
+            # X — файл, ім'я якого каже generationId X, а JSON усередині
+            # каже generationId Y (пошкодження/підміна). Y — РЕАЛЬНА,
+            # окрема, ще не прострочена (сьогоднішня) generation. Без
+            # перевірки identity X "видав би себе" за Y під час обробки й
+            # ризикував би зачепити фізичні файли Y через
+            # Get-BRAVOBackupGenerationManifestPhysicalFiles -GenerationId Y.
+            $identityMismatchFile = Join-Path $retentionCleanupTestRoot 'BRAVO_BACKUP_20260101_010101.json'
+            [IO.File]::WriteAllText($identityMismatchFile, '{"generationId":"20260202_020202","status":"FAILED","startedAt":"2026-01-01T00:00:00"}')
+            $today = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ss')
+            $identityRealGenFile = Join-Path $retentionCleanupManifestsDir 'BRAVO_BACKUP_20260202_020202.json'
+            [IO.File]::WriteAllText($identityRealGenFile, ('{{"generationId":"20260202_020202","status":"FAILED","startedAt":"{0}"}}' -f $today))
+
+            $identitySectionShown = $false
+            $identityOk = & $retentionCleanupModule {
+                param($BackupRoot, $CurrentGenerationId, $SectionShownRef)
+                Remove-BRAVOExpiredBackupGenerations `
+                    -BackupRoot $BackupRoot `
+                    -CurrentGenerationId $CurrentGenerationId `
+                    -RetentionDays 183 `
+                    -CleanupSectionShown $SectionShownRef
+            } $retentionCleanupTestRoot 'CURRENT_GENERATION_NOT_TARGET_2' ([ref]$identitySectionShown)
+
+            Test-BRAVOCondition `
+                -Condition (
+                    $identityOk -eq $true -and
+                    (Test-Path -LiteralPath $identityMismatchFile)
+                ) `
+                -Name "ManifestStorage/ManifestFilenameAndJsonGenerationMustMatch" `
+                -Failure "Remove-BRAVOExpiredBackupGenerations має перевіряти, що generationId з JSON збігається з generationId, закодованим у імені файлу"
+            Test-BRAVOCondition `
+                -Condition (Test-Path -LiteralPath $identityMismatchFile) `
+                -Name "ManifestStorage/MismatchedGenerationIdIsExcludedFromRetention" `
+                -Failure "файл із невідповідним generationId не повинен видалятися — mismatch виключає запис із retention (як parse error), а не використовується для рішення про видалення"
+            Test-BRAVOCondition `
+                -Condition (Test-Path -LiteralPath $identityRealGenFile) `
+                -Name "ManifestStorage/MismatchedManifestCannotDeleteOtherGenerationMetadata" `
+                -Failure "недовірений (mismatched) manifest НЕ повинен призводити до видалення physical manifest-а ІНШОЇ, реальної generation, на яку помилково вказує JSON"
+        } finally {
+            Remove-Item -Path Variable:\global:enableArchiveDeletion, `
+                Variable:\global:enableFailedArchiveDeletion, `
+                Variable:\global:failedArchiveRetentionDays, `
+                Variable:\global:minimumRetainedVerifiedBackups, `
+                Variable:\global:progressSettings `
+                -ErrorAction SilentlyContinue
+        }
+    } finally {
+        if (Test-Path -LiteralPath $retentionCleanupTestRoot) {
+            Remove-Item -LiteralPath $retentionCleanupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 12. Retention (Archive) читає manifest-и через централізований reader ---
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveRuntimeTextForSizeSanity.Contains('function Remove-BRAVOExpiredBackupGenerations') -and
+            $archiveRuntimeTextForSizeSanity.Contains('Get-BRAVOBackupGenerationManifestFiles -BackupRoot $BackupRoot') -and
+            -not $archiveRuntimeTextForSizeSanity.Contains("Get-BRAVOFiles -Path `$BackupRoot -Filter 'BRAVO_BACKUP_*.json'")
+        ) `
+        -Name "ManifestStorage/RetentionUsesCentralizedReader" `
+        -Failure "Remove-BRAVOExpiredBackupGenerations має шукати manifest-и через Get-BRAVOBackupGenerationManifestFiles (MANIFESTS + legacy fallback), а не напряму Get-BRAVOFiles по корені BackupRoot"
+
+    # --- 13. Health лишається read-only: читає через reader, ніколи не мігрує/не пише ---
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('Get-BRAVOBackupGenerationManifestFiles -BackupRoot $backupRootPath') -and
+            -not $healthScriptText.Contains('Initialize-BRAVOBackupManifestStorage')
+        ) `
+        -Name "ManifestStorage/HealthReaderNeverMigratesOrWrites" `
+        -Failure "BRAVO.Health.Runtime.ps1 має лише читати generation manifest-и через Get-BRAVOBackupGenerationManifestFiles і ніколи не викликати Initialize-BRAVOBackupManifestStorage"
+
+    # --- 14. BRAVO_RESTORE_TEST.ps1 читає через той самий централізований reader ---
+    $restoreTestScriptTextForManifestStorage = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_RESTORE_TEST.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $restoreTestScriptTextForManifestStorage.Contains('Get-BRAVOBackupGenerationManifestFiles') -and
+            -not $restoreTestScriptTextForManifestStorage.Contains("Get-BRAVOFiles -Path `$BackupRoot -Filter 'BRAVO_BACKUP_*.json'")
+        ) `
+        -Name "ManifestStorage/RestoreTestUsesCentralizedReader" `
+        -Failure "Get-BRAVORestoreGenerationManifest має читати через Get-BRAVOBackupGenerationManifestFiles, а не напряму Get-BRAVOFiles по корені BackupRoot"
+
+    # --- 15. Ротація/очистка LOGS ніколи не чіпає MANIFESTS ---
+    $maintenanceScriptTextForManifestStorage = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $removeOldLogFilesFunctionAst = @(
+        [Management.Automation.Language.Parser]::ParseInput(
+            $maintenanceScriptTextForManifestStorage, [ref]$null, [ref]$null
+        ).FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -eq 'Remove-OldLogFiles'
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $removeOldLogFilesFunctionAst -and
+            -not $removeOldLogFilesFunctionAst.Extent.Text.Contains('MANIFESTS') -and
+            -not $removeOldLogFilesFunctionAst.Extent.Text.Contains('BackupRoot')
+        ) `
+        -Name "ManifestStorage/LogCleanupNeverReferencesManifests" `
+        -Failure "Remove-OldLogFiles (LOGS retention) не повинен знати про MANIFESTS чи BackupRoot — це незалежні lifecycle, керовані окремо LogDays/CompressedLogDays"
+
+    # --- 16. Виклик міграції в Maintenance ніколи не є фатальним (лише WARNING) ---
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains('Initialize-BRAVOBackupManifestStorage') -and
+            $maintenanceScriptTextForManifestStorage.Contains('ІНІЦІАЛІЗАЦІЯ/МІГРАЦІЯ MANIFESTS') -and
+            -not (
+                $maintenanceScriptTextForManifestStorage -match
+                '(?s)ІНІЦІАЛІЗАЦІЯ/МІГРАЦІЯ MANIFESTS.{0,2500}?\bexit\b'
+            )
+        ) `
+        -Name "ManifestStorage/MaintenanceMigrationCallSiteIsNonFatal" `
+        -Failure "виклик Initialize-BRAVOBackupManifestStorage у Maintenance не повинен мати exit поруч — невдала міграція не має блокувати Maintenance"
+
+    # ================================================================
+    # dev.14 (round 2, частина B): operator console UX BRAVO_MAINTENANCE.
+    # Усі тести нижче — статичні перевірки джерела або функціональні
+    # виклики ІЗОЛЬОВАНИХ функцій (AST-екстракція чи реальний
+    # BRAVO.Console, уже імпортований вище). Жоден тест не запускає
+    # реальний Main() Maintenance.Runtime.ps1 — це зупинило б/перезапустило
+    # б служби на машині, де виконується самотест.
+    # ================================================================
+    Remove-Module -Name 'BRAVO.Console' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Console\BRAVO.Console.psd1") -Force -ErrorAction Stop
+    Initialize-BRAVOConsole -StepWidth 58
+
+    $maintenanceHeaderCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOHeader `')
+    $maintenanceHeaderCallEnd = $maintenanceScriptTextForManifestStorage.IndexOf(
+        '-StartedAt $script:ScriptStartTime', $maintenanceHeaderCallIndex)
+    $maintenanceHeaderCallText = if ($maintenanceHeaderCallIndex -ge 0 -and $maintenanceHeaderCallEnd -gt $maintenanceHeaderCallIndex) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceHeaderCallIndex, $maintenanceHeaderCallEnd - $maintenanceHeaderCallIndex + 40)
+    } else { '' }
+
+    # --- Header: реальний Write-BRAVOHeader з тими самими аргументами, що
+    # передає Maintenance (Title/Institution/InstitutionCode/Mode; Host —
+    # дефолтний $env:COMPUTERNAME, Maintenance його не перевизначає) —
+    # плюс статичне підтвердження, що виклик у джерелі справді бере ці
+    # значення з $global:ScriptVersion/$bravoSettings/-NoPause, а не
+    # захардкожені літерали.
+    $maintenanceHeaderCapture = Write-BRAVOHeader `
+        -Title ("BRAVO MAINTENANCE {0}" -f '5.0.0-dev14-selftest') `
+        -Institution 'TEST-COMPANY' `
+        -InstitutionCode '1234567890' `
+        -Mode 'MANUAL' 6>&1
+    $maintenanceHeaderText = ($maintenanceHeaderCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceHeaderText.Contains('5.0.0-dev14-selftest') -and
+            $maintenanceHeaderCallText.Contains('$global:ScriptVersion')
+        ) `
+        -Name "Maintenance/HeaderContainsVersion" `
+        -Failure "заголовок BRAVO MAINTENANCE має показувати packageVersion (`$global:ScriptVersion)"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceHeaderText.Contains('TEST-COMPANY [1234567890]') -and
+            $maintenanceHeaderCallText.Contains('$bravoSettings.InstitutionName') -and
+            $maintenanceHeaderCallText.Contains('$bravoSettings.InstitutionCode')
+        ) `
+        -Name "Maintenance/HeaderContainsInstitution" `
+        -Failure "заголовок має показувати назву й код установи з bravoSettings"
+    Test-BRAVOCondition `
+        -Condition ($maintenanceHeaderText.Contains($env:COMPUTERNAME)) `
+        -Name "Maintenance/HeaderContainsHost" `
+        -Failure "заголовок має показувати hostname — Write-BRAVOHeader за замовчуванням бере `$env:COMPUTERNAME, Maintenance цей параметр не перевизначає"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceHeaderText.Contains('Режим: MANUAL') -and
+            $maintenanceHeaderCallText.Contains('Get-BRAVOMaintenanceExecutionMode -UserSid $currentIdentity.User.Value')
+        ) `
+        -Name "Maintenance/HeaderContainsMode" `
+        -Failure "заголовок має показувати MANUAL/SCHEDULED через Get-BRAVOMaintenanceExecutionMode -UserSid, а не через -NoPause"
+
+    # --- dev.14 (round 3): -NoPause керує лише UX-паузою, а не джерелом
+    # запуску. Get-BRAVOMaintenanceExecutionMode — pure helper (лише
+    # UserSid на вході, жодного власного WindowsIdentity), тому тестується
+    # напряму на детермінованих SID без реальної системної ідентичності.
+    $maintenanceExecutionModeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('Get-BRAVOMaintenanceExecutionMode')
+    $manualAdminMode = & $maintenanceExecutionModeModule {
+        Get-BRAVOMaintenanceExecutionMode -UserSid 'S-1-5-21-111-222-333-1001'
+    }
+    $manualAdminModeWithNoPauseIntent = & $maintenanceExecutionModeModule {
+        # -NoPause не є входом функції взагалі — сам факт, що вона не
+        # приймає такий параметр, і є доказом розв'язання.
+        Get-BRAVOMaintenanceExecutionMode -UserSid 'S-1-5-21-111-222-333-1001'
+    }
+    $systemMode = & $maintenanceExecutionModeModule {
+        Get-BRAVOMaintenanceExecutionMode -UserSid 'S-1-5-18'
+    }
+    Test-BRAVOCondition `
+        -Condition ($manualAdminMode -eq 'MANUAL') `
+        -Name "Maintenance/ManualNoPauseStillManual" `
+        -Failure "ручний запуск (не-SYSTEM SID) має лишатися MANUAL незалежно від -NoPause — Get-BRAVOMaintenanceExecutionMode не приймає -NoPause і не може від нього залежати"
+    Test-BRAVOCondition `
+        -Condition ($systemMode -eq 'SCHEDULED') `
+        -Name "Maintenance/SystemIsScheduled" `
+        -Failure "SYSTEM (S-1-5-18) має бути SCHEDULED"
+    Test-BRAVOCondition `
+        -Condition (
+            $manualAdminMode -eq $manualAdminModeWithNoPauseIntent -and
+            -not $maintenanceScriptTextForManifestStorage.Contains("function Get-BRAVOMaintenanceExecutionMode {`n    param([Parameter(Mandatory = `$true)][string]`$UserSid, [switch]`$NoPause)")
+        ) `
+        -Name "Maintenance/ModeDoesNotDependOnNoPause" `
+        -Failure "Get-BRAVOMaintenanceExecutionMode має приймати лише UserSid — жодного параметра -NoPause, який міг би вплинути на результат"
+
+    # --- Plan: 'ТАК'/'НІ', і кожен рядок плану простежується до свого
+    # CLI-прапорця/налаштування аж до самого джерела (-ForceRestore,
+    # -DisableSizeCheck, -AutoShutdown, -EnableArchiveAfterMaintenance),
+    # так само, як існуючий коментар "план і фактичне виконання не можуть
+    # розійтися" вимагає.
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("'ТАК' } else { 'НІ' }") -and
+            $maintenanceScriptTextForManifestStorage.Contains('$maintenancePlanEntries = [ordered]@{')
+        ) `
+        -Name "Maintenance/PlanUsesTakNi" `
+        -Failure "План операцій має друкувати рівно ТАК/НІ, без True/False/внутрішніх назв змінних"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled") -and
+            $maintenanceScriptTextForManifestStorage.Contains('$script:BRAVOMaintenanceRestoreStepEnabled = $shouldRestore') -and
+            $maintenanceScriptTextForManifestStorage.Contains('$ForceRestore -or')
+        ) `
+        -Name "Maintenance/PlanReflectsForceRestore" `
+        -Failure "рядок плану 'Реставрація моделі' має відображати -ForceRestore через `$shouldRestore/BRAVOMaintenanceRestoreStepEnabled"
+    # dev.14 (round 3): 'Відновлення пропущених операцій' і 'Реставрація
+    # моделі' — два окремі рядки плану з РІЗНИМИ значеннями. Перший
+    # показує стан механізму відновлення пропущеної роботи
+    # ($RunMissedRestoreOnly і справді щось пропущено), другий — чи
+    # фактично виконається реставрація моделі цього прогону ($shouldRestore,
+    # ширший критерій: ForceRestore АБО ця сама умова АБО плановий день/час).
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("'Відновлення пропущених операцій' = [bool](`$RunMissedRestoreOnly -and `$missedDailyWork)") -and
+            $maintenanceScriptTextForManifestStorage.Contains("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled") -and
+            -not $maintenanceScriptTextForManifestStorage.Contains("'Контроль діапазонів ID'          = [bool]")
+        ) `
+        -Name "Maintenance/PlanShowsBothRestoreLinesWithDistinctSemantics" `
+        -Failure "'Відновлення пропущених операцій' (RunMissedRestoreOnly+missedDailyWork) і 'Реставрація моделі' (shouldRestore) мають бути ДВОМА окремими рядками плану з різними значеннями; Range ID у плані не показується (лише крок)"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("'Перевірка розмірів'              = [bool]`$script:BRAVOMaintenanceCheckSizeStepEnabled") -and
+            $maintenanceScriptTextForManifestStorage.Contains('$script:BRAVOMaintenanceCheckSizeStepEnabled = $BravoMaintenanceEnabled -and $CheckSize') -and
+            $maintenanceScriptTextForManifestStorage.Contains('$CheckSize = -not $DisableSizeCheck')
+        ) `
+        -Name "Maintenance/PlanReflectsDisableSizeCheck" `
+        -Failure "рядок плану 'Перевірка розмірів' має відображати -DisableSizeCheck через `$CheckSize"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("'Автоматичне вимкнення сервера'   = [bool]`$script:EnableAutoShutdown") -and
+            $maintenanceScriptTextForManifestStorage.Contains('$script:EnableAutoShutdown = ($AutoShutdown -eq "on")')
+        ) `
+        -Name "Maintenance/PlanReflectsAutoShutdown" `
+        -Failure "рядок плану 'Автоматичне вимкнення сервера' має відображати -AutoShutdown"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("'Архівація після maintenance'     = [bool]`$script:BRAVOMaintenanceArchiveStepEnabled") -and
+            $maintenanceScriptTextForManifestStorage.Contains('$script:BRAVOMaintenanceArchiveStepEnabled = [bool]$script:EnableArchiveAfterMaintenance')
+        ) `
+        -Name "Maintenance/PlanReflectsArchiveAfterMaintenance" `
+        -Failure "рядок плану 'Архівація після maintenance' має відображати -ArchiveAfterMaintenance"
+
+    # --- Кроки: ізольована AST-екстракція Write-BRAVOMaintenanceStep/
+    # Get-BRAVOMaintenanceStepStatus/Initialize-BRAVOMaintenanceSteps —
+    # реальні функції, реальний BRAVO.Console (Write-BRAVOStepResult тощо,
+    # вже імпортований вище), синтетичні кроки замість реального Main().
+    $maintenanceStepModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @(
+            'Initialize-BRAVOMaintenanceSteps',
+            'Get-BRAVOMaintenanceStepStatus',
+            'Write-BRAVOMaintenanceStep'
+        )
+
+    & $maintenanceStepModule { Initialize-BRAVOMaintenanceSteps -Total 3 }
+    $maintenanceStepOkCapture = & $maintenanceStepModule {
+        Write-BRAVOMaintenanceStep -Name 'Тестовий крок' -Status 'OK'
+    } 6>&1
+    $maintenanceStepOkText = ($maintenanceStepOkCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceStepOkText.Contains('[1/3] Тестовий крок') -and
+            $maintenanceStepOkText -match '\.{3,}'
+        ) `
+        -Name "Maintenance/StepFormat" `
+        -Failure "формат кроку має бути '[N/TOTAL] Назва....... STATUS   mm:ss' (Write-BRAVOStepResult/Get-BRAVOStepPrefixText)"
+
+    $maintenanceStepVocabRejected = $false
+    try {
+        & $maintenanceStepModule { Write-BRAVOMaintenanceStep -Name 'X' -Status 'WARNING' } | Out-Null
+    } catch {
+        $maintenanceStepVocabRejected = $true
+    }
+    $maintenanceStepWarnCapture = & $maintenanceStepModule {
+        Write-BRAVOMaintenanceStep -Name 'Y' -Status 'WARN' -Details 'тестова причина'
+    } 6>&1
+    $maintenanceStepFailCapture = & $maintenanceStepModule {
+        Write-BRAVOMaintenanceStep -Name 'Z' -Status 'FAIL' -Details 'тестова помилка'
+    } 6>&1
+    Test-BRAVOCondition `
+        -Condition ($maintenanceStepVocabRejected -and $null -ne $maintenanceStepWarnCapture -and $null -ne $maintenanceStepFailCapture) `
+        -Name "Maintenance/StepStatusVocabulary" `
+        -Failure "словник статусів кроку Maintenance має бути рівно OK/SKIPPED/WARN/FAIL — 'WARNING' (стара назва) має відхилятися ValidateSet"
+
+    & $maintenanceStepModule { Initialize-BRAVOMaintenanceSteps -Total 2 }
+    [void](& $maintenanceStepModule { Write-BRAVOMaintenanceStep -Name 'Перший' -Status 'OK' } 6>&1)
+    Start-Sleep -Milliseconds 50
+    $maintenanceStepDurationCapture = & $maintenanceStepModule {
+        Write-BRAVOMaintenanceStep -Name 'Другий' -Status 'OK'
+    } 6>&1
+    $maintenanceStepDurationText = ($maintenanceStepDurationCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    Test-BRAVOCondition `
+        -Condition ($maintenanceStepDurationText -match '\d{2}:\d{2}(:\d{2})?') `
+        -Name "Maintenance/StepDurationFormat" `
+        -Failure "тривалість кроку має бути mm:ss (або hh:mm:ss від години) — Format-BRAVODuration"
+
+    # dev.14 (round 3): рівно 6 пробілів, без "Причина:"/"Деталі:" для
+    # ЖОДНОГО статусу — Write-BRAVOConsoleDetail, не Write-BRAVOOperatorReason.
+    $maintenanceStepWarnText = ($maintenanceStepWarnCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    $maintenanceStepFailText = ($maintenanceStepFailCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceStepWarnText.Contains('      тестова причина') -and
+            $maintenanceStepFailText.Contains('      тестова помилка') -and
+            -not $maintenanceStepWarnText.Contains('Причина:') -and
+            -not $maintenanceStepFailText.Contains('Причина:')
+        ) `
+        -Name "Maintenance/StepDetailIndent" `
+        -Failure "деталі кроку (будь-який статус) мають друкуватися з рівно 6-пробільним відступом і без автоматичного префікса 'Причина:'/'Деталі:'"
+
+    # --- Директорії/manifest: SKIPPED-гілка й формулювання 'усі вже
+    # існують' лишились на місці після об'єднання з MANIFESTS init/migration.
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("if (`$directoryStepStatus -eq 'SKIPPED')") -and
+            $maintenanceScriptTextForManifestStorage.Contains("-Status 'SKIPPED'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("-Details 'усі вже існують'")
+        ) `
+        -Name "Maintenance/SkippedDirectories" `
+        -Failure "'Створення необхідних директорій' має лишатися SKIPPED/'усі вже існують', коли і директорії, і MANIFESTS init/migration нічого не зробили"
+
+    # --- 'Реставрація моделі' показує причину (Примусово/пропущений
+    # слот/розклад) як Details, а 'Обробка trace і логів' — кількість
+    # оброблених файлів.
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("-Name 'Реставрація моделі' ``") -and
+            $maintenanceScriptTextForManifestStorage.Contains('-Details $restoreReason') -and
+            $maintenanceScriptTextForManifestStorage.Contains('$restoreReason = if ($ForceRestore) { "Примусово" }')
+        ) `
+        -Name "Maintenance/ForceRestoreDetail" `
+        -Failure "крок 'Реставрація моделі' має показувати причину реставрації ('Примусово' для -ForceRestore) як Details"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains("-Name 'Обробка trace і логів' ``") -and
+            $maintenanceScriptTextForManifestStorage.Contains('"оброблено файлів: $processedLogCounts"')
+        ) `
+        -Name "Maintenance/TraceProcessedDetail" `
+        -Failure "крок 'Обробка trace і логів' має показувати кількість оброблених файлів як Details"
+
+    # --- Range ID: реальна Test-RangeIdUsage (ізольована екстракція) на
+    # відсутньому файлі має сигналізувати HasIssue=true (WARN на консолі),
+    # а сам виклик у Main() — НЕ використовувати criticalErrorOccurred для
+    # статусу цього конкретного кроку (інакше WARN на екрані розійшовся б
+    # із FAIL).
+    $rangeIdTestModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('Test-RangeIdUsage')
+    $rangeIdMissingPath = Join-Path $manifestStorageTestRoot 'does-not-exist-range-id.json'
+    $rangeIdMissingResultCapture = & $rangeIdTestModule {
+        param($Path)
+        function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) }
+        function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+        Test-RangeIdUsage -Path $Path -ThresholdPercent 90
+    } $rangeIdMissingPath
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $rangeIdMissingResultCapture -and
+            [bool]$rangeIdMissingResultCapture.HasIssue -and
+            [string]$rangeIdMissingResultCapture.Reason -match 'не знайдено'
+        ) `
+        -Name "Maintenance/RangeIdMissingRemainsWarning" `
+        -Failure "Test-RangeIdUsage на відсутньому файлі має повертати HasIssue=true з причиною, яку крок консолі показує як WARN"
+
+    $rangeIdCallSiteStart = $maintenanceScriptTextForManifestStorage.IndexOf("-Name 'Контроль діапазонів ID' ``")
+    $rangeIdCallSiteWindow = if ($rangeIdCallSiteStart -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            [Math]::Max(0, $rangeIdCallSiteStart - 1100), 1100)
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdCallSiteStart -ge 0 -and
+            $rangeIdCallSiteWindow.Contains('$rangeIdHasWarning = $script:BRAVOWarningCount -gt $rangeIdWarningsBefore') -and
+            -not $rangeIdCallSiteWindow.Contains('-CriticalBefore')
+        ) `
+        -Name "Maintenance/RangeIdMissingStepIsWarn" `
+        -Failure "статус консольного кроку 'Контроль діапазонів ID' має рахуватися лише за приростом BRAVOWarningCount, а не за `$script:criticalErrorOccurred"
+
+    # dev.14 (round 3): виконання severity (criticalErrorOccurred) і
+    # доставка сповіщення (Send-SlackAlert -IsCritical) розв'язані.
+    # Відтворюємо ТОЙ САМИЙ снепшот/відкат-алгоритм, що в Main() (реальна
+    # Test-RangeIdUsage + тестовий Send-SlackAlert, який відтворює
+    # РЕАЛЬНИЙ побічний ефект -IsCritical: піднімає $script:criticalErrorOccurred,
+    # рівно як Send-SlackAlert справді робить) — доводимо, що відкат
+    # справді нейтралізує його для цього виклику, а WARNING-лічильник і
+    # сам факт виклику -IsCritical (доставка) лишаються недоторканими.
+    $rangeIdCriticalRestoreCapture = & $rangeIdTestModule {
+        param($Path)
+        $script:criticalErrorOccurred = $false
+        $script:BRAVOWarningCount = 0
+        $script:SlackAlertCriticalCallCount = 0
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp)
+            if ($Level -eq 'WARNING') { $script:BRAVOWarningCount++ }
+        }
+        function Send-SlackAlert {
+            param($Message, [switch]$IsCritical)
+            if ($IsCritical) {
+                $script:criticalErrorOccurred = $true
+                $script:SlackAlertCriticalCallCount++
+            }
+        }
+        $rangeIdWarningsBefore = $script:BRAVOWarningCount
+        $rangeIdCriticalBefore = $script:criticalErrorOccurred
+        $result = Test-RangeIdUsage -Path $Path -ThresholdPercent 90
+        $rangeIdHasWarning = $script:BRAVOWarningCount -gt $rangeIdWarningsBefore
+        if (-not $rangeIdCriticalBefore -and $script:criticalErrorOccurred) {
+            $script:criticalErrorOccurred = $false
+        }
+        [pscustomobject]@{
+            CriticalAfterRestore = $script:criticalErrorOccurred
+            HasWarning = $rangeIdHasWarning
+            SlackCriticalCallCount = $script:SlackAlertCriticalCallCount
+            HasIssue = $result.HasIssue
+        }
+    } $rangeIdMissingPath
+    Test-BRAVOCondition `
+        -Condition (-not $rangeIdCriticalRestoreCapture.CriticalAfterRestore) `
+        -Name "Maintenance/RangeIdMissingDoesNotSetCriticalError" `
+        -Failure "після відкату `$script:criticalErrorOccurred має лишатися false — відсутній Range ID не повинен ставати критичною помилкою Maintenance"
+    Test-BRAVOCondition `
+        -Condition (
+            -not $rangeIdCriticalRestoreCapture.CriticalAfterRestore -and
+            $maintenanceScriptTextForManifestStorage.Contains('Resolve-BRAVOExitCode -HasWarnings') -and
+            $maintenanceScriptTextForManifestStorage.Contains('-MaintenanceFailed')
+        ) `
+        -Name "Maintenance/RangeIdMissingDoesNotProduceFailureExit" `
+        -Failure "з criticalErrorOccurred=false і WARN-лічильником > 0 підсумковий exit code має бути Resolve-BRAVOExitCode -HasWarnings (10), а не -MaintenanceFailed (60) — сама формула exit code (нижче) не змінена, лише вхідний прапорець"
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdCriticalRestoreCapture.HasIssue -and
+            $rangeIdCriticalRestoreCapture.HasWarning -and
+            $rangeIdCriticalRestoreCapture.SlackCriticalCallCount -eq 1
+        ) `
+        -Name "Maintenance/RangeIdMissingPreservesWarningNotification" `
+        -Failure "Send-SlackAlert -IsCritical (доставка сповіщення навіть у errors_only) має й далі викликатися рівно один раз для відсутнього Range ID — розв'язано лише виконання-severity, не доставка"
+
+    # --- Фінальний підсумок: та сама триланкова логіка (ПОМИЛКА/ЧАСТКОВО/
+    # УСПІШНО), що вже керує exit code, тепер перевірена явно на синтетичних
+    # BRAVOWarningCount/criticalErrorOccurred, а не лише як текст джерела.
+    $maintenanceSummaryModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText @'
+function Get-BRAVOMaintenanceSummaryResult {
+    param([bool]$CriticalErrorOccurred, [int]$WarningCount)
+    if ($CriticalErrorOccurred) {
+        return 'ПОМИЛКА'
+    } elseif ($WarningCount -gt 0) {
+        return 'ЧАСТКОВО'
+    } else {
+        return 'УСПІШНО'
+    }
+}
+'@ `
+        -FunctionNames @('Get-BRAVOMaintenanceSummaryResult')
+    $maintenanceSuccessResult = & $maintenanceSummaryModule {
+        Get-BRAVOMaintenanceSummaryResult -CriticalErrorOccurred $false -WarningCount 0
+    }
+    $maintenanceFailureResult = & $maintenanceSummaryModule {
+        Get-BRAVOMaintenanceSummaryResult -CriticalErrorOccurred $true -WarningCount 0
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceSuccessResult -eq 'УСПІШНО' -and
+            $maintenanceScriptTextForManifestStorage.Contains('elseif ($script:BRAVOWarningCount -gt 0) {') -and
+            $maintenanceScriptTextForManifestStorage.Contains("'ЧАСТКОВО'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOFinalSummaryHeader ``") -and
+            $maintenanceScriptTextForManifestStorage.Contains("-Title 'BRAVO MAINTENANCE'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Статус'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Початок'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Завершення'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Кроків'") -and
+            (
+                [regex]::Matches($maintenanceScriptTextForManifestStorage, "Write-BRAVOResultField -Label 'Попереджень'").Count -eq 1
+            )
+        ) `
+        -Name "Maintenance/FinalSummarySuccess" `
+        -Failure "УСПІШНО (без попереджень/критичних помилок), заголовок 'BRAVO MAINTENANCE — СТАТУС' і повний набір полів (Статус/Код завершення/Початок/Завершення/Тривалість/Кроків/Успішно/Попереджень/Пропущено/Помилок) РІВНО ОДИН РАЗ (без дублювання BRAVOWarningCount/BRAVOMaintenanceStepWarnCount)"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceFailureResult -eq 'ПОМИЛКА' -and
+            $maintenanceScriptTextForManifestStorage.Contains('$maintenanceExitCodeText = "{0} — {1}" -f $script:maintenanceRuntimeExitCode, (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode)') -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Код завершення' -Value `$maintenanceExitCodeText") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Помилок' -Value ([string]`$script:BRAVOMaintenanceStepFailCount)")
+        ) `
+        -Name "Maintenance/FinalSummaryFailure" `
+        -Failure "ПОМИЛКА (критична помилка) має показувати той самий, а не вигаданий, exit code/назву через BRAVO.ExitCodes"
+
+    # --- Pause: реструктуризація директорії/MANIFESTS/лог-міграції (round 2)
+    # лишилась між тим самим зовнішнім try (Console/MaintenancePausesOnEveryExitPath
+    # вище вже перевіряє межі try/finally для ВСЬОГО файлу) — тут додатково
+    # явно прив'язуємо НОВИЙ блок до цього ж інваріанту, за іменем dev.14.
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceOuterTryIndex -ge 0 -and
+            $maintenanceRuntimeTextForPause.IndexOf('ІНІЦІАЛІЗАЦІЯ/МІГРАЦІЯ MANIFESTS') -gt $maintenanceOuterTryIndex -and
+            $maintenanceRuntimeTextForPause.IndexOf('ІНІЦІАЛІЗАЦІЯ/МІГРАЦІЯ MANIFESTS') -lt $maintenanceFinallyIndex
+        ) `
+        -Name "Maintenance/NoPausePreserved" `
+        -Failure "блок ініціалізації/міграції MANIFESTS (round 2) має лишатися всередині того самого зовнішнього try/finally, що й керує Wait-BRAVOManualExit -NoPause"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceRuntimeTextForPause.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
+            [regex]::IsMatch($maintenanceRuntimeTextForPause, '(?m)^\s*\[switch\]\$NoPause,\s*$')
+        ) `
+        -Name "Maintenance/SystemNoPausePreserved" `
+        -Failure "SYSTEM/-NoPause запуск (заплановане завдання) не повинен чекати на клавішу — Wait-BRAVOManualExit -NoPause:`$NoPause має лишатися єдиним джерелом рішення"
+
+    # ================================================================
+    # dev.14 (round 3): "exact render" — не лише Contains/wiring, а
+    # реальний рендерений layout: роздільники, підписи, відступи,
+    # словник статусів, відсутність "Причина:"/дублікату "Попереджень".
+    # Нормалізуються лише змінні дані (host/час/тривалість/шлях логу).
+    # ================================================================
+
+    # --- A. HeaderRender: повний layout заголовка ---
+    $maintenanceHeaderLines = $maintenanceHeaderText -split "`n"
+    $maintenanceSeparatorLine = '=' * 60
+    Test-BRAVOCondition `
+        -Condition (
+            @($maintenanceHeaderLines | Where-Object { $_ -eq $maintenanceSeparatorLine }).Count -eq 2 -and
+            @($maintenanceHeaderLines | Where-Object { $_.TrimStart() -like 'BRAVO MAINTENANCE*' }).Count -eq 1 -and
+            @($maintenanceHeaderLines | Where-Object { $_ -eq ' TEST-COMPANY [1234567890]' }).Count -eq 1 -and
+            @($maintenanceHeaderLines | Where-Object { $_ -eq " $env:COMPUTERNAME" }).Count -eq 1 -and
+            @($maintenanceHeaderLines | Where-Object { $_ -eq ' Режим: MANUAL' }).Count -eq 1
+        ) `
+        -Name "Maintenance/HeaderRender" `
+        -Failure "заголовок має мати рівно 2 роздільники '='*60, рядок Title, рядок Institution [Code], рядок Host, рядок 'Режим: ...' — у цьому порядку"
+
+    # --- B. PlanRender: та сама формула вирівнювання, що джерело
+    # (PadRight(maxLabelLength+3) + 'ТАК'/'НІ'), відтворена буквально для
+    # перевірки самого layout (рядки плану — inline top-level код, не
+    # функція, тому тут не AST-екстракція, а буквальне відтворення
+    # формули; PlanReflects*-тести вище вже довели зв'язок зі станом).
+    $planEntriesSample = [ordered]@{
+        'Міграція старих журналів' = $false
+        'Відновлення пропущених операцій' = $true
+        'Реставрація моделі' = $true
+    }
+    $planLabelWidth = ($planEntriesSample.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum).Maximum + 3
+    $planRenderedLines = foreach ($entry in $planEntriesSample.GetEnumerator()) {
+        $label = ("{0}:" -f $entry.Key).PadRight($planLabelWidth)
+        $value = if ($entry.Value) { 'ТАК' } else { 'НІ' }
+        "  {0}{1}" -f $label, $value
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($planRenderedLines | Where-Object { $_ -match '^  Міграція старих журналів:\s+НІ$' }).Count -eq 1 -and
+            @($planRenderedLines | Where-Object { $_ -match '^  Відновлення пропущених операцій:\s+ТАК$' }).Count -eq 1 -and
+            -not ($planRenderedLines -join "`n").Contains('True') -and
+            -not ($planRenderedLines -join "`n").Contains('False')
+        ) `
+        -Name "Maintenance/PlanRender" `
+        -Failure "рядки плану мають бути '  Мітка:' + вирівнювання + 'ТАК'/'НІ', без True/False"
+
+    # --- C. StepRender: [N/TOTAL] Назва.......... STATUS   mm:ss ---
+    # baseText+dots, status і тривалість — три ОКРЕМІ Write-Host (двоє з
+    # -NoNewline), тобто три окремі InformationRecord у 6>&1-захопленні;
+    # -join "`n" вставляє між ними символ переводу рядка, якого на
+    # реальній консолі немає (там -NoNewline тримає курсор на тому самому
+    # рядку) — тому `\s*` між фрагментами, а не буквальна суміжність.
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceStepOkText -match '(?s)^\[1/3\] Тестовий крок\.+\s*OK\s+\d{2}:\d{2}$'
+        ) `
+        -Name "Maintenance/StepRender" `
+        -Failure "рядок кроку має точно відповідати '[N/TOTAL] Назва' + крапки-заповнювач + 'OK' (вирівняно) + mm:ss"
+
+    # --- D. RangeIdWarningRender: WARN-крок із деталлю канонічного шляху,
+    # без "Причина:", з 6-пробільним відступом.
+    & $maintenanceStepModule { Initialize-BRAVOMaintenanceSteps -Total 8 }
+    for ($i = 1; $i -le 7; $i++) {
+        [void](& $maintenanceStepModule { param($N) Write-BRAVOMaintenanceStep -Name "Крок $N" -Status 'OK' } $i 6>&1)
+    }
+    $rangeIdWarningRenderCapture = & $maintenanceStepModule {
+        Write-BRAVOMaintenanceStep `
+            -Name 'Контроль діапазонів ID' `
+            -Status 'WARN' `
+            -Details 'Файл контролю діапазонів ID не знайдено: C:\Windows\SysWOW64\range_id_log.json'
+    } 6>&1
+    $rangeIdWarningRenderText = ($rangeIdWarningRenderCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdWarningRenderText -match '(?s)\[8/8\] Контроль діапазонів ID\.+\s*WARN\s+\d{2}:\d{2}' -and
+            $rangeIdWarningRenderText.Contains('      Файл контролю діапазонів ID не знайдено: C:\Windows\SysWOW64\range_id_log.json') -and
+            -not $rangeIdWarningRenderText.Contains('Причина:')
+        ) `
+        -Name "Maintenance/RangeIdWarningRender" `
+        -Failure "[8/8] Контроль діапазонів ID має рендеритись як WARN з 6-пробільним canonical-шляхом, без 'Причина:'"
+
+    # --- E/F/G. Summary render: clean/warning-only/failure ---
+    # dev.14 (round 4): повний підсумок разом із footer (Write-BRAVOFinalSummaryFooter) —
+    # "Журнал:" (не "Детальний журнал:"), шлях наступним рядком, закриваючий
+    # '='*60 (не '-'*60 Write-BRAVOResultFooter).
+    $summaryTestLogPath = 'C:\BRAVO\LOGS\BRAVO_MAINTENANCE_20260809_221003_PID1234.log'
+    foreach ($summaryCase in @(
+        @{ Status = 'УСПІШНО'; Color = 'Green'; TestName = 'Maintenance/SuccessSummaryRender' },
+        @{ Status = 'ЧАСТКОВО'; Color = 'Yellow'; TestName = 'Maintenance/WarningSummaryRender' },
+        @{ Status = 'ПОМИЛКА'; Color = 'Red'; TestName = 'Maintenance/FailureSummaryRender' }
+    )) {
+        $summaryHeaderCapture = Write-BRAVOFinalSummaryHeader `
+            -Title 'BRAVO MAINTENANCE' -Status $summaryCase.Status -StatusColor $summaryCase.Color 6>&1
+        # & { ... } 6>&1, а не @( ... ) 6>&1: редирект застосований до масиву-
+        # виразу з кількома інструкціями через крапку з комою НЕ захоплював
+        # Information stream кожної окремої Write-Host — лише виклик через
+        # scriptblock коректно прокидає redirection на всі інструкції всередині.
+        $summaryFieldsCapture = & {
+            Write-BRAVOResultField -Label 'Статус' -Value $summaryCase.Status
+            Write-BRAVOResultField -Label 'Код завершення' -Value '0 — Success'
+            Write-BRAVOResultField -Label 'Початок' -Value '09.08.2026 22:10:03'
+            Write-BRAVOResultField -Label 'Завершення' -Value '09.08.2026 22:24:15'
+            Write-BRAVOResultField -Label 'Тривалість' -Value '14:12'
+            Write-BRAVOResultBlankLine
+            Write-BRAVOResultField -Label 'Кроків' -Value '8'
+            Write-BRAVOResultField -Label 'Успішно' -Value '7'
+            Write-BRAVOResultField -Label 'Попереджень' -Value '1'
+            Write-BRAVOResultField -Label 'Пропущено' -Value '0'
+            Write-BRAVOResultField -Label 'Помилок' -Value '0'
+        } 6>&1
+        $summaryFooterCapture = Write-BRAVOFinalSummaryFooter -LogFile $summaryTestLogPath 6>&1
+        $summaryText = (
+            @($summaryHeaderCapture) + @($summaryFieldsCapture) + @($summaryFooterCapture) |
+                ForEach-Object { $_.ToString() }
+        ) -join "`n"
+        $summaryLines = $summaryText -split "`n"
+        # 3 роздільники: заголовок відкриває й закриває (2) + footer закриває (1).
+        Test-BRAVOCondition `
+            -Condition (
+                @($summaryLines | Where-Object { $_ -eq $maintenanceSeparatorLine }).Count -eq 3 -and
+                @($summaryLines | Where-Object { $_ -eq (" BRAVO MAINTENANCE — {0}" -f $summaryCase.Status) }).Count -eq 1 -and
+                @($summaryLines | Where-Object { $_ -match "^Статус:\s+$([regex]::Escape($summaryCase.Status))$" }).Count -eq 1 -and
+                @([regex]::Matches($summaryText, 'Попереджень:')).Count -eq 1 -and
+                @($summaryLines | Where-Object { $_ -eq 'Журнал:' }).Count -eq 1 -and
+                @($summaryLines | Where-Object { $_ -eq $summaryTestLogPath }).Count -eq 1 -and
+                (($summaryLines | Where-Object { $_ -eq 'Журнал:' } | Select-Object -First 1) -eq 'Журнал:') -and
+                ($summaryLines[[array]::IndexOf($summaryLines, 'Журнал:') + 1] -eq $summaryTestLogPath) -and
+                $summaryLines[-1] -eq $maintenanceSeparatorLine -and
+                -not $summaryText.Contains('РЕЗУЛЬТАТ') -and
+                -not $summaryText.Contains('Детальний журнал:') -and
+                -not $summaryText.Contains(('-' * 60))
+            ) `
+            -Name $summaryCase.TestName `
+            -Failure ("summary заголовок 'BRAVO MAINTENANCE — {0}' + поля + 'Журнал:'/шлях наступним рядком + закриваючий '='*60 (не '-'*60/'Детальний журнал:'), 'Попереджень:' рівно один раз" -f $summaryCase.Status)
+    }
+
+    # --- Maintenance/DirectoryDetailsRenderAsSeparateLines: кілька deatil-
+    # частин кроку 'Створення необхідних директорій' (створено MANIFESTS +
+    # перенесено manifest-ів) мають бути ОКРЕМИМИ рядками, не з'єднаними
+    # через '; '.
+    & $maintenanceStepModule { Initialize-BRAVOMaintenanceSteps -Total 1 }
+    $directoryDetailsCapture = & $maintenanceStepModule {
+        Write-BRAVOMaintenanceStep `
+            -Name 'Створення необхідних директорій' `
+            -Status 'OK' `
+            -Details ("створено: D:\LIMS\ARCHIV\MANIFESTS`nперенесено manifest-ів: 3")
+    } 6>&1
+    $directoryDetailsText = ($directoryDetailsCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    $directoryDetailsLines = $directoryDetailsText -split "`n"
+    Test-BRAVOCondition `
+        -Condition (
+            @($directoryDetailsLines | Where-Object { $_ -eq '      створено: D:\LIMS\ARCHIV\MANIFESTS' }).Count -eq 1 -and
+            @($directoryDetailsLines | Where-Object { $_ -eq '      перенесено manifest-ів: 3' }).Count -eq 1 -and
+            -not $directoryDetailsText.Contains('; ')
+        ) `
+        -Name "Maintenance/DirectoryDetailsRenderAsSeparateLines" `
+        -Failure "декілька деталей кроку 'Створення необхідних директорій' (MANIFESTS init + migration) мають рендеритись окремими 6-пробільними рядками, не через '; '"
+
+    # --- Maintenance/FinalSummaryContainsOnlyApprovedFields: РЕАЛЬНИЙ блок
+    # фінального підсумку в джерелі (round 5) — не синтетичний виклик, а
+    # текст між Write-BRAVOFinalSummaryHeader і Write-BRAVOFinalSummaryFooter
+    # у самому BRAVO.Maintenance.Runtime.ps1. Затверджений compact operator
+    # summary — рівно 10 полів; Maintenance/Архівація/Shutdown/"Детальний
+    # журнал"/"РЕЗУЛЬТАТ" не повинні там з'являтися (вони вже видні в Плані
+    # операцій і в детальному LOG).
+    $maintenanceSummaryBlockStart = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `')
+    $maintenanceSummaryBlockEnd = $maintenanceScriptTextForManifestStorage.IndexOf(
+        'Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE', $maintenanceSummaryBlockStart)
+    $maintenanceSummaryBlockText = if ($maintenanceSummaryBlockStart -ge 0 -and $maintenanceSummaryBlockEnd -gt $maintenanceSummaryBlockStart) {
+        $maintenanceSummaryBlockText = $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceSummaryBlockStart,
+            $maintenanceSummaryBlockEnd - $maintenanceSummaryBlockStart + "Write-BRAVOFinalSummaryFooter -LogFile `$LOG_FILE".Length)
+        $maintenanceSummaryBlockText
+    } else { '' }
+    $maintenanceSummaryApprovedLabels = @(
+        'Статус', 'Код завершення', 'Початок', 'Завершення', 'Тривалість',
+        'Кроків', 'Успішно', 'Попереджень', 'Пропущено', 'Помилок'
+    )
+    $maintenanceSummaryMissingApproved = @(
+        $maintenanceSummaryApprovedLabels | Where-Object {
+            -not $maintenanceSummaryBlockText.Contains("-Label '$_'")
+        }
+    )
+    $maintenanceSummaryForbiddenLabels = @('Maintenance', 'Архівація', 'Shutdown')
+    $maintenanceSummaryHasForbidden = @(
+        $maintenanceSummaryForbiddenLabels | Where-Object {
+            $maintenanceSummaryBlockText.Contains("-Label '$_'")
+        }
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrEmpty($maintenanceSummaryBlockText) -and
+            $maintenanceSummaryMissingApproved.Count -eq 0 -and
+            $maintenanceSummaryHasForbidden.Count -eq 0 -and
+            -not $maintenanceSummaryBlockText.Contains('Детальний журнал') -and
+            -not $maintenanceSummaryBlockText.Contains('РЕЗУЛЬТАТ') -and
+            $maintenanceSummaryBlockText.Contains('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE') -and
+            -not $maintenanceSummaryBlockText.Contains('Write-BRAVOResultFooter')
+        ) `
+        -Name "Maintenance/FinalSummaryContainsOnlyApprovedFields" `
+        -Failure ("реальний final-summary блок Maintenance.Runtime.ps1 має містити рівно затверджені 10 полів (відсутні: {0}) і не містити Maintenance/Архівація/Shutdown/'Детальний журнал'/'РЕЗУЛЬТАТ' (знайдено заборонених: {1}), і завершуватись Write-BRAVOFinalSummaryFooter, не Write-BRAVOResultFooter" -f
+            ($maintenanceSummaryMissingApproved -join ', '), ($maintenanceSummaryHasForbidden -join ', '))
 
     $legacyEntryPoints = @(
         'ARCHIV_VETOFFICE.ps1',
@@ -7970,7 +9008,7 @@ try {
                     (Get-Item -LiteralPath $archiveLauncherPath).Name -notlike 'BRAVO_BACKUP_*.json' -and
                     (Get-Item -LiteralPath $maintenanceLauncherPath).Name -notlike 'BRAVO_BACKUP_*.json' -and
                     (Get-Item -LiteralPath $forceRestoreLauncherPath).Name -notlike 'BRAVO_BACKUP_*.json' -and
-                    $archiveScriptText.Contains("Get-BRAVOFiles -Path `$BackupRoot -Filter 'BRAVO_BACKUP_*.json'")
+                    $archiveScriptText.Contains('Get-BRAVOBackupGenerationManifestFiles -BackupRoot $BackupRoot')
                 ) `
                 -Name 'ManualLaunchers/BackupRootFilesDoNotEnterGeneration' `
                 -Failure 'root-level .cmd launchers не можуть бути manifest generation або backup artifacts'
@@ -8804,11 +9842,14 @@ try {
         -Name "ConsoleUX/06-WarningReasonDisplayed" `
         -Failure "Аномалія розміру архіву має показувати Причину через Write-BRAVOOperatorReason (WARNING)"
 
-    # 7. SKIPPED: пропущений крок показує пояснення без підпису "Причина:"
-    # (Write-BRAVOSkipReason), а не просто мовчазний пропуск нумерації.
+    # 7. SKIPPED: пропущений крок показує пояснення без підпису "Причина:",
+    # а не просто мовчазний пропуск нумерації. dev.14 (round 3): той самий
+    # централізований plain-рендерер (Write-BRAVOConsoleDetail), що й
+    # OK/WARN/FAIL — не окрема гілка Write-BRAVOSkipReason.
     Test-BRAVOCondition `
         -Condition (
-            $maintenanceScriptText.Contains("'SKIPPED' { Write-BRAVOSkipReason -Reason `$Details }")
+            $maintenanceScriptText.Contains('foreach ($detailLine in ($Details -split "`r?`n")) {') -and
+            $maintenanceScriptText.Contains('Write-BRAVOConsoleDetail -Message $detailLine')
         ) `
         -Name "ConsoleUX/07-SkippedReasonDisplayed" `
         -Failure "SKIPPED-крок Maintenance має пояснення через Write-BRAVOSkipReason"

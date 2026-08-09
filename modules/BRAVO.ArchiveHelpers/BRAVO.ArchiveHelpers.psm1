@@ -250,3 +250,207 @@ function Test-BRAVOBackupSizeAnomaly {
         DropPercent = $dropPercent
     }
 }
+
+function Get-BRAVOBackupManifestRoot {
+    # dev.14: generation manifest-и (BRAVO_BACKUP_<GenerationId>.json)
+    # зберігаються окремо від LOGS/TEMP — їхній lifecycle прив'язаний до
+    # backup generation (видаляються разом з нею), а не до незалежного
+    # LogDays/CompressedLogDays. Єдине місце, що знає фізичний шлях —
+    # інші функції завжди отримують його звідси, а не будують Join-Path самі.
+    param([Parameter(Mandatory = $true)][string]$BackupRoot)
+
+    return (Join-Path $BackupRoot 'MANIFESTS')
+}
+
+function Get-BRAVOBackupGenerationManifestFiles {
+    # Централізований reader generation manifest-ів. MANIFESTS\ — джерело
+    # істини; корінь BackupRoot — fallback для файлів, які ще не мігровані
+    # (Initialize-BRAVOBackupManifestStorage не виконувалась, наприклад одразу
+    # після апгрейду до dev.14) або лишились там після конфлікту міграції.
+    # Корінь читається БЕЗ -Recurse, тому підпапка MANIFESTS у нього фізично
+    # не потрапляє — дублювання виникає лише коли той самий generationId
+    # реально існує в обох місцях, і тоді пріоритет завжди за MANIFESTS.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [string]$GenerationId
+    )
+
+    $manifestRoot = Get-BRAVOBackupManifestRoot -BackupRoot $BackupRoot
+
+    if (-not [string]::IsNullOrWhiteSpace($GenerationId)) {
+        $fileName = "BRAVO_BACKUP_{0}.json" -f $GenerationId
+        $newPath = Join-Path $manifestRoot $fileName
+        if (Test-Path -LiteralPath $newPath -PathType Leaf) {
+            return @(Get-Item -LiteralPath $newPath)
+        }
+        $legacyPath = Join-Path $BackupRoot $fileName
+        if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
+            return @(Get-Item -LiteralPath $legacyPath)
+        }
+        return @()
+    }
+
+    $newManifests = if (Test-Path -LiteralPath $manifestRoot -PathType Container) {
+        @(Get-BRAVOFiles -Path $manifestRoot -Filter 'BRAVO_BACKUP_*.json')
+    } else {
+        @()
+    }
+    $legacyManifests = @(Get-BRAVOFiles -Path $BackupRoot -Filter 'BRAVO_BACKUP_*.json')
+
+    # Дедуплікація за іменем файлу (== generationId): MANIFESTS додається
+    # першим, тому саме він "виграє" колізію, а не порядок файлової системи.
+    $seenNames = New-Object 'System.Collections.Generic.HashSet[string]'
+    $result = New-Object System.Collections.Generic.List[object]
+    foreach ($file in $newManifests) {
+        if ($seenNames.Add($file.Name)) {
+            $result.Add($file)
+        }
+    }
+    foreach ($file in $legacyManifests) {
+        if ($seenNames.Add($file.Name)) {
+            $result.Add($file)
+        }
+    }
+    return $result.ToArray()
+}
+
+function Initialize-BRAVOBackupManifestStorage {
+    # dev.14: одноразова (ідемпотентна) міграція legacy manifest-ів —
+    # BRAVO_BACKUP_*.json безпосередньо в корені BackupRoot — у виділений
+    # MANIFESTS\. Пошук legacy — БЕЗ -Recurse (лише корінь BackupRoot,
+    # підпапка MANIFESTS у нього не потрапляє).
+    #
+    # Колізії при непорожньому destination:
+    #   - файлів немає в MANIFESTS               => Move-Item;
+    #   - є, і байтово ідентичний (SHA256)        => legacy-дублікат
+    #     видаляється, MANIFESTS лишається єдиним джерелом;
+    #   - є, і відрізняється                      => ЖОДЕН файл не
+    #     видаляється й не перезаписується, лише WARNING у лог із
+    #     generationId конфлікту; reader (Get-BRAVOBackupGenerationManifestFiles)
+    #     все одно віддасть перевагу версії з MANIFESTS.
+    #
+    # Нічого з цього не є фатальним для виклику — весь стан повертається
+    # викликачу через результат; невдала міграція нічого не знищує і
+    # повторюється на наступному запуску.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $result = [ordered]@{
+        ManifestRoot = $null
+        ManifestRootCreated = $false
+        Migrated = @()
+        Deduplicated = @()
+        Conflicts = @()
+        Errors = @()
+    }
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        $result.Errors += "BackupRoot не знайдено: $BackupRoot"
+        return [pscustomobject]$result
+    }
+
+    $manifestRoot = Get-BRAVOBackupManifestRoot -BackupRoot $BackupRoot
+    $result.ManifestRoot = $manifestRoot
+    try {
+        if (-not (Test-Path -LiteralPath $manifestRoot -PathType Container)) {
+            New-Item -ItemType Directory -Path $manifestRoot -Force -ErrorAction Stop | Out-Null
+            $result.ManifestRootCreated = $true
+            Write-BRAVOArchiveHelperLog -Logger $Logger `
+                -Message "Створено каталог метаданих backup: $manifestRoot" -Level "SUCCESS"
+        }
+    } catch {
+        $result.Errors += "Не вдалося створити ${manifestRoot}: $($_.Exception.Message)"
+        Write-BRAVOArchiveHelperLog -Logger $Logger -Message $result.Errors[-1] -Level "ERROR"
+        return [pscustomobject]$result
+    }
+
+    foreach ($legacyFile in @(Get-BRAVOFiles -Path $BackupRoot -Filter 'BRAVO_BACKUP_*.json')) {
+        $generationLabel = $legacyFile.Name -replace '^BRAVO_BACKUP_(.+)\.json$', '$1'
+        $destinationPath = Join-Path $manifestRoot $legacyFile.Name
+        try {
+            if (-not (Test-Path -LiteralPath $destinationPath -PathType Leaf)) {
+                Move-Item -LiteralPath $legacyFile.FullName -Destination $destinationPath -ErrorAction Stop
+                $result.Migrated += $legacyFile.Name
+                Write-BRAVOArchiveHelperLog -Logger $Logger `
+                    -Message "Перенесено manifest generation ${generationLabel} у MANIFESTS" -Level "SUCCESS"
+                continue
+            }
+
+            $legacyHash = (Get-BRAVOFileHash -Path $legacyFile.FullName -Algorithm SHA256).Hash
+            $destinationHash = (Get-BRAVOFileHash -Path $destinationPath -Algorithm SHA256).Hash
+            if ([string]::Equals($legacyHash, $destinationHash, [StringComparison]::OrdinalIgnoreCase)) {
+                Remove-Item -LiteralPath $legacyFile.FullName -Force -ErrorAction Stop
+                $result.Deduplicated += $legacyFile.Name
+                Write-BRAVOArchiveHelperLog -Logger $Logger `
+                    -Message "Manifest generation ${generationLabel} уже є в MANIFESTS (ідентичний); legacy-копію в корені прибрано" `
+                    -Level "INFO"
+            } else {
+                $result.Conflicts += $legacyFile.Name
+                Write-BRAVOArchiveHelperLog -Logger $Logger `
+                    -Message "Конфлікт manifest generation ${generationLabel}: версії в корені BackupRoot і в MANIFESTS відрізняються — обидва файли збережено без змін, читання пріоритетно бере версію з MANIFESTS" `
+                    -Level "WARNING"
+            }
+        } catch {
+            $result.Errors += "Не вдалося обробити manifest generation ${generationLabel}: $($_.Exception.Message)"
+            Write-BRAVOArchiveHelperLog -Logger $Logger -Message $result.Errors[-1] -Level "ERROR"
+        }
+    }
+
+    return [pscustomobject]$result
+}
+
+function Get-BRAVOBackupManifestFilenameGenerationId {
+    # dev.14 (round 3): строгий parser/validator generationId, закодованого
+    # у ФІЗИЧНОМУ імені файлу manifest-а (BRAVO_BACKUP_<GenerationId>.json).
+    # Формат GenerationId — yyyyMMdd_HHmmss або той самий з collision-safe
+    # суфіксом (_N) — той самий контракт, що BRAVO_RESTORE_TEST.ps1 вже
+    # валідує для параметра -GenerationId. Повертає $null, якщо ім'я файлу
+    # НЕ відповідає точно цьому формату — викликач тоді не повинен
+    # довіряти файлу як trustworthy retention record.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$FileName)
+
+    if ($FileName -match '^BRAVO_BACKUP_(?<GenerationId>\d{8}_\d{6}(?:_\d+)?)\.json$') {
+        return $Matches.GenerationId
+    }
+    return $null
+}
+
+function Get-BRAVOBackupGenerationManifestPhysicalFiles {
+    # Усі фізичні копії manifest-файлу ОДНІЄЇ generation — на відміну від
+    # Get-BRAVOBackupGenerationManifestFiles (читання, MANIFESTS-first,
+    # дедуплікація ховає legacy-дублікат/конфлікт), ця функція повертає їх
+    # УСІ. Потрібна retention: коли generation підтверджено видаляється,
+    # видалені мають бути ВСІ фізичні представлення її metadata — інакше
+    # legacy-копія переживає видалення MANIFESTS-копії і на наступному
+    # запуску "воскрешає" видалену generation через legacy fallback читання.
+    #
+    # GenerationId походить із вмісту manifest-файлу (JSON, недовірений
+    # вхід відносно файлової системи) — шлях свідомо НЕ конструюється
+    # (Join-Path недовіреного рядка з коренем був би path traversal).
+    # Замість цього кандидати відбираються фільтром .Name серед РЕАЛЬНО
+    # перелічених файлів (Get-BRAVOFiles, лише MANIFESTS + корінь
+    # BackupRoot, без -Recurse) — попадання неможливе поза цими двома
+    # каталогами незалежно від вмісту GenerationId.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$GenerationId
+    )
+
+    $expectedFileName = "BRAVO_BACKUP_{0}.json" -f $GenerationId
+    $manifestRoot = Get-BRAVOBackupManifestRoot -BackupRoot $BackupRoot
+    $allPhysicalFiles = @(
+        $(if (Test-Path -LiteralPath $manifestRoot -PathType Container) {
+            Get-BRAVOFiles -Path $manifestRoot -Filter 'BRAVO_BACKUP_*.json'
+        })
+        $(Get-BRAVOFiles -Path $BackupRoot -Filter 'BRAVO_BACKUP_*.json')
+    )
+    return @($allPhysicalFiles | Where-Object {
+        [string]::Equals($_.Name, $expectedFileName, [StringComparison]::OrdinalIgnoreCase)
+    })
+}

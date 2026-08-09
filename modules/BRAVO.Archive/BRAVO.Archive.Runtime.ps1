@@ -1042,11 +1042,37 @@ function Remove-BRAVOExpiredBackupGenerations {
         $validCutoff = (Get-Date).AddDays(-$validRetentionDays)
         $invalidCutoff = (Get-Date).AddDays(-$invalidRetentionDays)
         $records = @()
-        foreach ($manifestFile in @(Get-BRAVOFiles -Path $BackupRoot -Filter 'BRAVO_BACKUP_*.json')) {
+        # dev.14: MANIFESTS-first reader (з fallback на legacy корінь
+        # BackupRoot) вирішує, ЯКИЙ вміст (Status/StartedAt/VerifiedComplete)
+        # керує рішенням про видалення generation. ManifestPath нижче — лише
+        # шлях ЦІЄЇ конкретної, обраної для рішення копії; фактичне видалення
+        # (нижче) не покладається на це поле — воно шукає й прибирає ВСІ
+        # фізичні копії manifest-а через Get-BRAVOBackupGenerationManifestPhysicalFiles.
+        foreach ($manifestFile in @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $BackupRoot)) {
             try {
                 $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
                 $generationId = [string]$manifest.generationId
                 if ([string]::IsNullOrWhiteSpace($generationId)) { throw 'generationId is empty' }
+
+                # dev.14 (round 3): filename і JSON generationId МАЮТЬ
+                # збігатися. Фізичне видалення (нижче) шукає artifacts і
+                # metadata за GenerationId із ЦЬОГО запису — якщо довіряти
+                # лише вмісту JSON без звірки з іменем файлу, пошкоджений
+                # чи підмінений manifest міг би вказати на ЧУЖУ generation
+                # і призвести до видалення її artifacts/metadata. Mismatch
+                # виключає запис із retention повністю — жодних artifacts
+                # чи metadata не видаляється на основі недовіреного запису.
+                $filenameGenerationId = Get-BRAVOBackupManifestFilenameGenerationId -FileName $manifestFile.Name
+                if ([string]::IsNullOrEmpty($filenameGenerationId) -or
+                    -not [string]::Equals($filenameGenerationId, $generationId, [StringComparison]::Ordinal)) {
+                    Write-BRAVOLog -Component 'CLEANUP' -Message (
+                        "Generation manifest пропущено для retention через невідповідність generationId: " +
+                        "файл '$($manifestFile.Name)' (з імені файлу: '$filenameGenerationId') містить у JSON " +
+                        "generationId '$generationId' — можливе пошкодження чи підміна, файл лишається без змін"
+                    ) -Level 'WARNING'
+                    continue
+                }
+
                 $startedAt = $manifestFile.LastWriteTime
                 try {
                     $startedAt = [datetime]$manifest.startedAt
@@ -1103,7 +1129,19 @@ function Remove-BRAVOExpiredBackupGenerations {
                     Remove-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
                 }
             }
-            Remove-Item -LiteralPath $record.ManifestPath -Force -ErrorAction Stop
+            # dev.14: видаляється КОЖНА фізична копія manifest-а цієї
+            # generation (MANIFESTS і, за наявності, legacy-корінь), а не
+            # лише та, яку MANIFESTS-first reader повернув для рішення про
+            # видалення. Інакше conflict-копія в іншому розташуванні
+            # переживає видалення й на наступному запуску "воскрешає"
+            # видалену generation через legacy fallback читання.
+            foreach ($physicalManifest in @(
+                Get-BRAVOBackupGenerationManifestPhysicalFiles `
+                    -BackupRoot $BackupRoot `
+                    -GenerationId $record.GenerationId
+            )) {
+                Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
+            }
             Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))" -Level 'SUCCESS'
         }
         return $true
@@ -2815,7 +2853,15 @@ function Write-BRAVOBackupGenerationManifest {
         transferResults = $GenerationState.TransferResults
         healthResult = $GenerationState.HealthResult
     }
-    $manifestPath = Join-Path $BackupRoot ("BRAVO_BACKUP_{0}.json" -f $GenerationState.GenerationId)
+    # dev.14: generation manifest-и живуть у виділеному MANIFESTS\, а не
+    # поруч з архівами — lifecycle прив'язаний до generation (retention
+    # видаляє manifest разом з нею), а не до незалежного LogDays. Каталог
+    # створюється тут ідемпотентно (Force), бо Write- не повинен залежати
+    # від того, чи вже відпрацював Initialize-BRAVOBackupManifestStorage
+    # (наприклад одразу після апгрейду, до першого запуску Maintenance).
+    $manifestRoot = Get-BRAVOBackupManifestRoot -BackupRoot $BackupRoot
+    New-Item -ItemType Directory -Path $manifestRoot -Force -ErrorAction Stop | Out-Null
+    $manifestPath = Join-Path $manifestRoot ("BRAVO_BACKUP_{0}.json" -f $GenerationState.GenerationId)
     [IO.File]::WriteAllText(
         $manifestPath,
         (($manifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine),

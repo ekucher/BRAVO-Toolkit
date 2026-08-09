@@ -1,4 +1,4 @@
-# BRAVO 5.0.0-dev.13 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.0.0-dev.14 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -173,7 +173,8 @@ D:\LIMS-NEW\ARCHIV\LOGS\           SystemLogRoot — системні журна
 └── BravoWeb\                      Apache\, Application\ (розділ 12)
 
 E:\BRAVO_BACKUPS\                  BackupRoot — резервні копії
-├── BRAVO_BACKUP_<GenerationId>.json
+├── MANIFESTS\                      generation manifest-и (розділ 12)
+│   └── BRAVO_BACKUP_<GenerationId>.json
 ├── MODEL\
 ├── BLOG\
 ├── BRAVOEXCH\
@@ -852,6 +853,25 @@ Retention системних журналів (`ArchiveDays`/`CompressedLogDays`
 під `SystemLogRoot`; retention логів скриптів (`LogDays`) — лише під
 `<RuntimeRoot>\LOGS`; retention backup — лише під `BackupRoot`. Це три
 незалежні політики, які не заходять у чужі каталоги.
+
+### Manifest-и backup generation (`MANIFESTS`)
+
+`BRAVO_BACKUP_<GenerationId>.json` — manifest конкретної generation backup
+(статус, компоненти, шляхи архівів і хешів) — з dev.14 лежить у
+`<BackupRoot>\MANIFESTS\`, окремо від `LOGS\`/`TEMP\`. Це навмисно третє,
+незалежне сховище: lifecycle manifest-а прив'язаний до generation
+(видаляється разом з нею при retention backup, розділ вище), а не до
+`LogDays`/`CompressedLogDays` — жодна з політик retention журналів на
+`MANIFESTS` не діє й не повинна діяти.
+
+Каталог `MANIFESTS\` створюється автоматично при першому записі нового
+manifest-а. Старі `BRAVO_BACKUP_*.json`, що лишились безпосередньо в
+корені `BackupRoot` з версій до dev.14, переносяться туди ідемпотентно
+першим же запуском `BRAVO_MAINTENANCE.ps1` після оновлення — без ручних
+дій і без production-простою; докладніше й що робити при конфлікті
+перенесення — [OPERATIONS.md](OPERATIONS.md#manifest-и-backup-generation-перенесено-в-manifests-dev14).
+`BRAVO_HEALTH.ps1` читає manifest-и (з `MANIFESTS\` і, для сумісності,
+з кореня `BackupRoot`), але ніколи їх не переносить і не створює.
 
 Каталог-дата видаляється **лише** після успішного створення архіву та
 успішної перевірки `7z t`. Вік `.mdz` рахується за датою в його імені, а не

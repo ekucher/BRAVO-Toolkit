@@ -1,5 +1,152 @@
 # Changelog
 
+## 5.0.0-dev.14 — 2026-08-09
+
+Minimal structural/metadata change on top of dev.13: backup generation
+manifests (`BRAVO_BACKUP_<GenerationId>.json`) now live in a dedicated
+`<BackupRoot>\MANIFESTS\` storage location, separate from operational logs
+(`LOGS\`) and disposable runtime data (`TEMP\`). No change to archive
+contents, 7-Zip, SHA512, VSS, SFTP/SMB, credentials, notifications, Health
+thresholds, backup-age logic, exit-code semantics, or the dev.13 elevation
+contract.
+
+- `modules\BRAVO.ArchiveHelpers`: three new centralized helpers —
+  `Get-BRAVOBackupManifestRoot` (single source of truth for the physical
+  path, `<BackupRoot>\MANIFESTS`), `Get-BRAVOBackupGenerationManifestFiles`
+  (MANIFESTS-first reader with a non-recursive legacy-root fallback, dedup
+  by GenerationId with MANIFESTS priority), and
+  `Initialize-BRAVOBackupManifestStorage` (idempotent, non-recursive
+  migration of legacy root manifests into `MANIFESTS\`: identical files are
+  deduplicated by SHA256, conflicting files are never overwritten or
+  deleted — both are preserved and a WARNING names the GenerationId).
+- `Write-BRAVOBackupGenerationManifest` (`BRAVO.Archive.Runtime.ps1`) now
+  writes new manifests directly into `MANIFESTS\`, creating the directory
+  on first use.
+- `Remove-BRAVOExpiredBackupGenerations` (retention), `Get-BackupHealthIssues`
+  (`BRAVO_HEALTH.ps1`) and `Get-BRAVORestoreGenerationManifest`
+  (`BRAVO_RESTORE_TEST.ps1`) all now discover manifests through the
+  centralized reader instead of independently duplicating the same
+  `Get-BRAVOFiles -Filter 'BRAVO_BACKUP_*.json'` call. `BRAVO_HEALTH.ps1`
+  stays strictly read-only — it never migrates or writes.
+- `BRAVO_MAINTENANCE.ps1` runs the migration once per invocation, under the
+  same operation lock as the existing legacy-log-structure migration, and
+  never fails the run: a migration error or conflict is logged as a
+  WARNING only.
+- `Get-BRAVOBackupGenerationManifestPhysicalFiles` (new): retention now
+  deletes *every* physical copy of a generation's manifest (`MANIFESTS\`
+  and, if still unmigrated, the legacy `BackupRoot` root) when that
+  generation is expired, instead of only the one copy the MANIFESTS-first
+  reader picked for the deletion decision. Previously a conflicting legacy
+  duplicate could survive a generation's deletion and "resurrect" its
+  metadata on the next run through the reader's legacy fallback. The new
+  helper resolves candidates by filename match against real, already-
+  enumerated files — it never builds a filesystem path from the untrusted
+  `generationId` string read out of manifest JSON, so a crafted
+  `generationId` cannot be used for path traversal.
+- `BRAVO_MAINTENANCE.ps1` operator console UX: adopts the same
+  `[N/TOTAL] Назва... STATUS mm:ss` step contract as Archive/Health, with
+  a Maintenance-specific `OK`/`WARN`/`FAIL`/`SKIPPED` vocabulary (renamed
+  from `OK`/`WARNING`/`ERROR`/`SKIPPED`, console-display only — log levels
+  and exit-code semantics are unchanged). MANIFESTS init/migration is now
+  folded into the existing "Створення необхідних директорій" step's detail
+  instead of its own line, so a steady-state run shows nothing new.
+  "Контроль діапазонів ID" gets its own step for the first time (it
+  previously ran silently, log/Slack only); a missing or unreadable
+  `range_id_log.json` shows as `WARN` on the console — the existing
+  `Send-SlackAlert -IsCritical`/exit-code behavior for that condition is
+  unchanged. The plan-preview line for the restore step is renamed
+  "Реставрація моделі" to match the step's actual name (previously
+  "Відновлення пропущених операцій", same underlying flag), and a
+  "Контроль діапазонів ID" line was added so the plan can't diverge from
+  what actually runs. The final `РЕЗУЛЬТАТ` block gains Початок/Завершення
+  and a Кроків/Успішно/Попереджень/Пропущено/Помилок breakdown, mirroring
+  `BRAVO_HEALTH.ps1`'s existing summary counters.
+- Regression tests: 18 `ManifestStorage/*` checks covering root
+  resolution, writer placement, reader priority/fallback/non-recursion,
+  and migration; 2 more (`RetentionDeletesBothPhysicalManifestCopies`,
+  `DeletedGenerationCannotReappearViaLegacyFallback`) covering the
+  retention cleanup fix; 23 new `Maintenance/*` checks covering the header,
+  plan wiring, step format/vocabulary/duration, the folded-in directory/
+  MANIFESTS step, the Range ID step, and the final summary — all via
+  isolated function extraction or static source checks, never by running
+  the real `BRAVO_MAINTENANCE.ps1` `Main()`.
+- Docs: README.md §2/§12 and OPERATIONS.md document the three-part storage
+  split and the upgrade/migration behavior operators will see in the
+  Maintenance log.
+
+Correctness/UX follow-up (round 3):
+- `Get-BRAVOBackupManifestFilenameGenerationId` (new): retention now
+  requires the generationId encoded in a manifest's physical filename to
+  match the generationId inside its JSON content before trusting that
+  manifest for any deletion decision. A mismatch (corruption or tampering)
+  excludes the record from retention entirely -- it can no longer cause
+  deletion of its own artifacts or, via the round-2 physical-cleanup fix,
+  of an unrelated generation's metadata that the JSON happened to name.
+- `Get-BRAVOMaintenanceExecutionMode` (new, pure: takes only a SID):
+  the Maintenance header's MANUAL/SCHEDULED mode no longer depends on
+  `-NoPause` (a UX-only switch an operator can pass manually). It now
+  reflects the actual caller: SYSTEM (S-1-5-18) is SCHEDULED, anyone else
+  is MANUAL.
+- Plan preview: restored `Відновлення пропущених операцій` (state of the
+  missed-operation-recovery mechanism: `-RunMissedRestoreOnly` and actual
+  missed work) as its own line, distinct from `Реставрація моделі` (will
+  the model-restore step actually run this invocation). The two had been
+  collapsed into one line; removed the Range ID line from the plan (the
+  step itself is unaffected).
+- Range ID: a missing/unreadable `range_id_log.json` no longer makes the
+  whole Maintenance run `MaintenanceFailed`. `Send-SlackAlert -IsCritical`
+  still fires (notification delivery in `errors_only` mode is unchanged);
+  only its `criticalErrorOccurred` side effect is reverted for this one
+  call, and only when nothing else had already set it.
+- Migration step status mapping corrected: a manifest-migration conflict
+  or error now maps to `WARN` (matching the non-fatal/retryable contract
+  from round 1), not `FAIL`. `FAIL` is reserved for a real directory-
+  creation failure.
+- Step details (`Write-BRAVOMaintenanceStep`) no longer prefix WARN/FAIL
+  text with "Причина:" -- every status (OK/WARN/FAIL/SKIPPED) now renders
+  through the same plain, 6-space-indented `Write-BRAVOConsoleDetail`.
+- `Write-BRAVOFinalSummaryHeader` (new, `BRAVO.Console`): Maintenance's
+  final summary now opens with "BRAVO MAINTENANCE — <СТАТУС>" under the
+  same `=`-separator style as the run's own header, instead of the
+  generic " РЕЗУЛЬТАТ" block. Archive/Health/other callers keep using
+  `Write-BRAVOResultHeader` unchanged. The summary's "Попереджень" field
+  is reported exactly once (the step-level tally, matching Health's
+  existing counter convention), not duplicated against the separate
+  global warning count.
+- 26 more regression tests: execution-mode (3), plan semantics (1), Range
+  ID severity decoupling (3), retention filename/JSON identity (3), and
+  7 "exact render" checks (header/plan/step/Range-ID-warning/summary x3)
+  that assert actual rendered layout -- separators, label alignment,
+  status vocabulary, absence of "Причина:", no duplicated "Попереджень"
+  -- not just source-text presence.
+
+Final polish (round 4):
+- `Write-BRAVOFinalSummaryFooter` (new, `BRAVO.Console`, pairs with
+  `Write-BRAVOFinalSummaryHeader`): Maintenance's summary now closes with
+  "Журнал:" + the log path on its own line + a closing `=`-separator,
+  matching the run header's style, instead of `Write-BRAVOResultFooter`'s
+  "Детальний журнал:" + `-`-separator. Archive/Health keep
+  `Write-BRAVOResultFooter` unchanged.
+- The folded-in "Створення необхідних директорій" step (directory
+  creation + MANIFESTS init/migration) now renders multiple detail facts
+  as separate 6-space-indented lines, not joined with `; `.
+- 1 more regression test (`Maintenance/DirectoryDetailsRenderAsSeparateLines`);
+  the three summary-render tests now also assert the footer layout
+  (`Журнал:` exactly once, log path on the next line, closing separator,
+  absence of `Детальний журнал:`/`-`-separator).
+
+Compact summary trim (round 5):
+- The `Maintenance`/`Архівація`/`Shutdown` fields are no longer printed in
+  the final compact operator summary -- they weren't part of the approved
+  field set (Статус/Код завершення/Початок/Завершення/Тривалість/Кроків/
+  Успішно/Попереджень/Пропущено/Помилок/Журнал) and duplicated what the
+  "План операцій" block already shows at the start of the run.
+- 1 more regression test (`Maintenance/FinalSummaryContainsOnlyApprovedFields`)
+  reads the real final-summary source block in `BRAVO.Maintenance.Runtime.ps1`
+  and asserts it contains exactly the approved fields and neither the
+  removed ones nor the old `Write-BRAVOResultFooter`/"Детальний журнал"/
+  " РЕЗУЛЬТАТ" contract.
+
 ## 5.0.0-dev.13 — 2026-08-09
 
 Minimal reliability fix on top of the dev.12 UX fixes: manual `BRAVO_HEALTH.ps1`

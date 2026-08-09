@@ -306,7 +306,11 @@ function Complete-BRAVOHealthResult {
 $bravoScriptDirectory = $RuntimeRoot
 
 # Health використовує спільні модулі, а не копії з архіватора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
+# dev.14: BRAVO.ArchiveHelpers додано для Get-BRAVOBackupGenerationManifestFiles
+# (централізований read-only reader generation manifest-ів, MANIFESTS +
+# legacy fallback) — Health лишається read-only, з ArchiveHelpers
+# використовується лише читання; функція міграції/запису сюди не викликається.
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -982,7 +986,11 @@ function Get-BackupHealthIssues {
     }
 
     $manifestCandidates = @()
-    foreach ($manifestFile in @(Get-BRAVOFiles -Path $backupRootPath -Filter 'BRAVO_BACKUP_*.json')) {
+    # dev.14: MANIFESTS-first reader з fallback на legacy корінь BackupRoot.
+    # Health лишається read-only — жодної міграції/запису тут не відбувається;
+    # відсутність MANIFESTS на ще не мігрованій інсталяції не є помилкою, поки
+    # legacy manifest-и в корені BackupRoot доступні для читання.
+    foreach ($manifestFile in @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $backupRootPath)) {
         try {
             $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
             if ([string]$manifest.status -ne 'COMPLETE') {

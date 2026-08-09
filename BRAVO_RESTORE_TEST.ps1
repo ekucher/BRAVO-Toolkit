@@ -150,16 +150,11 @@ function Get-BRAVORestoreGenerationManifest {
         throw "GenerationId має формат yyyyMMdd_HHmmss або collision-safe variant"
     }
 
-    $manifestFiles = if ([string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
-        @(Get-BRAVOFiles -Path $BackupRoot -Filter 'BRAVO_BACKUP_*.json')
-    } else {
-        $requestedPath = Join-Path $BackupRoot ("BRAVO_BACKUP_{0}.json" -f $RequestedGenerationId)
-        if (Test-Path -LiteralPath $requestedPath -PathType Leaf) {
-            @(Get-Item -LiteralPath $requestedPath)
-        } else {
-            @()
-        }
-    }
+    # dev.14: MANIFESTS-first reader з fallback на legacy корінь BackupRoot —
+    # той самий централізований reader, що Archive-retention і Health.
+    $manifestFiles = @(Get-BRAVOBackupGenerationManifestFiles `
+        -BackupRoot $BackupRoot `
+        -GenerationId $RequestedGenerationId)
 
     $candidates = @()
     foreach ($manifestFile in $manifestFiles) {

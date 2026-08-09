@@ -210,6 +210,62 @@ function Write-BRAVOHeader {
     Write-Host ''
 }
 
+# dev.14: деякі entrypoints (Maintenance) хочуть Title і підсумковий статус
+# в ОДНОМУ рядку заголовка ("BRAVO MAINTENANCE — УСПІШНО"), тим самим
+# =-роздільником, що Write-BRAVOHeader — щоб фінальний блок виглядав як
+# продовження того самого титульного контракту, з яким прогін почався, а
+# не як інша "програма". Це НЕ заміна Write-BRAVOResultHeader (" РЕЗУЛЬТАТ",
+# -роздільник, окреме поле "Статус:") — той контракт лишається незмінним
+# і далі використовується Archive/Health/іншими; це окрема, паралельна
+# точка входу для доменів, які свідомо хочуть інший стиль заголовка
+# підсумку. Домен-специфічні поля (Код завершення/Початок/Завершення/...)
+# додаються звичайними Write-BRAVOResultField після цього виклику, так
+# само, як і після Write-BRAVOResultHeader.
+function Write-BRAVOFinalSummaryHeader {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [ConsoleColor]$StatusColor = [ConsoleColor]::White
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if ($script:BRAVOConsoleStepOpen) {
+        Write-Host ''
+        $script:BRAVOConsoleStepOpen = $false
+    }
+
+    $separator = '=' * $script:BRAVOConsoleSeparatorWidth
+    Write-Host ''
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host (" {0} — {1}" -f $Title, $Status) -ForegroundColor $StatusColor
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host ''
+}
+
+# dev.14: парний до Write-BRAVOFinalSummaryHeader — закриває підсумок тим
+# самим =-роздільником, що відкрив заголовок прогону, замість
+# '-'-роздільника й підпису "Детальний журнал:" з Write-BRAVOResultFooter
+# (той контракт лишається незмінним для Archive/Health/інших — окрема,
+# паралельна точка входу, не заміна).
+function Write-BRAVOFinalSummaryFooter {
+    [CmdletBinding()]
+    param([string]$LogFile)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+        Write-Host ''
+        Write-Host 'Журнал:'
+        Write-Host $LogFile -ForegroundColor DarkGray
+    }
+    Write-Host ''
+    Write-Host ('=' * $script:BRAVOConsoleSeparatorWidth) -ForegroundColor Cyan
+}
+
 function Get-BRAVOStepPrefixText {
     param(
         [int]$Current,
@@ -740,6 +796,8 @@ Export-ModuleMember -Function @(
     'Format-BRAVOFileSize',
     'Format-BRAVODuration',
     'Write-BRAVOHeader',
+    'Write-BRAVOFinalSummaryHeader',
+    'Write-BRAVOFinalSummaryFooter',
     'Write-BRAVOStep',
     'Write-BRAVOStepResult',
     'Write-BRAVOOperatorReason',
