@@ -2743,6 +2743,166 @@ try {
         ) `
         -Name "Health/SFTPArchiveNameOnFailures" `
         -Failure "ім'я локального архіву має відображатися для всіх SFTP-помилок"
+    $healthSftpIssueFormatterModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Format-FileSize',
+            'Get-HealthIssueComponentName',
+            'ConvertTo-NotificationLiteralText',
+            'Format-HealthIssueFileName',
+            'Format-CompactSFTPIssue'
+        )
+    $missingGenerationSftpIssue = [pscustomobject]@{
+        Kind = 'SFTPArchive'
+        Component = 'SFTP MODEL'
+        Reason = 'перевірку пропущено: component відсутній у verified COMPLETE local generation'
+        FileName = 'немає даних'
+        LastWriteTime = $null
+        SizeBytes = $null
+        ExpectedSizeBytes = $null
+        ActualSizeBytes = $null
+        Location = '/archive/model'
+    }
+    $missingGenerationSftpProbe = & $healthSftpIssueFormatterModule {
+        param($Issue)
+        Set-StrictMode -Version Latest
+        $script:NotificationProvider = 'slack'
+        try {
+            [pscustomobject]@{
+                Success = $true
+                Text = Format-CompactSFTPIssue -Issue $Issue
+                Error = $null
+            }
+        } catch {
+            [pscustomobject]@{
+                Success = $false
+                Text = $null
+                Error = $_.Exception.Message
+            }
+        }
+    } $missingGenerationSftpIssue
+    $missingGenerationSftpSchema = [regex]::IsMatch(
+        $healthScriptText,
+        "(?s)Kind\s*=\s*'SFTPArchive'.*?component відсутній у verified COMPLETE local generation.*?ExpectedSizeBytes\s*=.*?ActualSizeBytes\s*=.*?Location\s*="
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $missingGenerationSftpSchema -and
+            $missingGenerationSftpProbe.Success -and
+            -not [string]::IsNullOrWhiteSpace([string]$missingGenerationSftpProbe.Text)
+        ) `
+        -Name 'Health/SFTPArchiveIssueSchemaIsStrictModeSafe' `
+        -Failure 'усі SFTPArchive issue-обʼєкти мають містити ExpectedSizeBytes і ActualSizeBytes, бо formatter читає їх під StrictMode'
+    $archiveFatalDiagnosticsModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @('Write-BRAVOArchiveFatalDiagnostics')
+    $archiveFatalErrorRecord = $null
+    try {
+        throw [InvalidOperationException]::new('synthetic archive fatal exception')
+    } catch {
+        $archiveFatalErrorRecord = $_
+    }
+    $archiveFatalLogEvents = @(& $archiveFatalDiagnosticsModule {
+        param($ErrorRecord)
+        $events = New-Object System.Collections.Generic.List[object]
+        function Write-BRAVOLogException {
+            param($ErrorRecord, $Component, $Context)
+            [void]$events.Add([pscustomobject]@{
+                    Kind = 'Exception'
+                    Component = $Component
+                    Context = $Context
+                    Message = $null
+                    Level = $null
+                    NoConsole = $false
+                })
+        }
+        function Write-BRAVOLog {
+            param($Message, $Level, $Component, [switch]$NoConsole)
+            [void]$events.Add([pscustomobject]@{
+                    Kind = 'Log'
+                    Component = $Component
+                    Context = $null
+                    Message = $Message
+                    Level = $Level
+                    NoConsole = [bool]$NoConsole
+                })
+        }
+        Set-StrictMode -Version Latest
+        Write-BRAVOArchiveFatalDiagnostics `
+            -ErrorRecord $ErrorRecord `
+            -Context 'Неочікувана помилка виконання BRAVO_ARCHIV'
+        return $events.ToArray()
+    } $archiveFatalErrorRecord)
+    $archiveFatalExceptionEvents = @($archiveFatalLogEvents | Where-Object { $_.Kind -eq 'Exception' })
+    $archiveFatalDetailEvents = @($archiveFatalLogEvents | Where-Object { $_.Kind -eq 'Log' })
+    $archiveFatalFinalizationWiring = (
+        $archiveScriptText.Contains('$fatalErrorRecord = $_') -and
+        $archiveScriptText.Contains('Write-BRAVOArchiveFatalDiagnostics `') -and
+        $archiveScriptText.Contains('не вдалося записати повну діагностику') -and
+        $archiveScriptText.Contains('-Reason $fatalMessage') -and
+        $archiveScriptText.Contains('Exit $script:processExitCode')
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveFatalFinalizationWiring -and
+            $archiveFatalExceptionEvents.Count -eq 1 -and
+            $archiveFatalExceptionEvents[0].Component -eq 'ARCHIVE' -and
+            $archiveFatalDetailEvents.Count -eq 1 -and
+            $archiveFatalDetailEvents[0].Component -eq 'ARCHIVE' -and
+            $archiveFatalDetailEvents[0].Level -eq 'INFO' -and
+            $archiveFatalDetailEvents[0].NoConsole -and
+            $archiveFatalDetailEvents[0].Message -match 'System\.InvalidOperationException'
+        ) `
+        -Name 'Archive/FatalExceptionIsLoggedAndFinalized' `
+        -Failure 'фатальний Archive exception має зберегти первинну причину, записати file-visible діагностику без дубля в консолі, показати RESULT і завершитись кодом 90 навіть коли logger недоступний'
+    $maintenanceCollectionRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'BRAVO_MAINTENANCE_COLLECTION_{0}' -f [guid]::NewGuid().ToString('N')
+    )
+    try {
+        [void][IO.Directory]::CreateDirectory($maintenanceCollectionRoot)
+        $expiredMaintenanceDirectory = Join-Path $maintenanceCollectionRoot '2020-01-01'
+        [void][IO.Directory]::CreateDirectory($expiredMaintenanceDirectory)
+        (Get-Item -LiteralPath $expiredMaintenanceDirectory).CreationTime = (Get-Date).AddDays(-30)
+        $maintenanceCollectionModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceScriptText `
+            -FunctionNames @('Get-BRAVOExpiredLogDateDirectories')
+        $maintenanceCollectionProbe = & $maintenanceCollectionModule {
+            param($Path)
+            function Get-BRAVODirectories {
+                param([string]$Path)
+                return @(Get-ChildItem -LiteralPath $Path -Directory -ErrorAction SilentlyContinue)
+            }
+            Set-StrictMode -Version Latest
+            $single = @(Get-BRAVOExpiredLogDateDirectories -Path $Path -RetentionDays 1)
+            $empty = @(Get-BRAVOExpiredLogDateDirectories -Path (Join-Path $Path 'missing') -RetentionDays 1)
+            [pscustomobject]@{ SingleCount = $single.Count; EmptyCount = $empty.Count }
+        } $maintenanceCollectionRoot
+        $maintenanceCollectionAssignments = @(
+            'traceOldDirs',
+            'exchangAPIOldDirs',
+            'apacheOldDirs',
+            'bravoWebAppOldDirs',
+            'bravoWebLegacyOldDirs'
+        )
+        $maintenanceCollectionCallersWrapped = @(
+            $maintenanceCollectionAssignments | Where-Object {
+                $pattern = '\$' + [regex]::Escape($_) + '\s*=\s*@\(Get-BRAVOExpiredLogDateDirectories'
+                [regex]::IsMatch($maintenanceScriptText, $pattern)
+            }
+        ).Count -eq $maintenanceCollectionAssignments.Count
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceCollectionProbe.SingleCount -eq 1 -and
+                $maintenanceCollectionProbe.EmptyCount -eq 0 -and
+                $maintenanceCollectionCallersWrapped
+            ) `
+            -Name 'Maintenance/ExpiredDirectoryCollectionsRemainArrays' `
+            -Failure 'результати Get-BRAVOExpiredLogDateDirectories мають завжди присвоюватись як @(...), інакше один каталог не має .Count під PowerShell 5.1 StrictMode'
+    } finally {
+        if (Test-Path -LiteralPath $maintenanceCollectionRoot -PathType Container) {
+            Remove-Item -LiteralPath $maintenanceCollectionRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Test-BRAVOCondition `
         -Condition (
             $healthScriptText.Contains("Get-BRAVOFiles -Path `$backupRootPath -Filter 'BRAVO_BACKUP_*.json'") -and

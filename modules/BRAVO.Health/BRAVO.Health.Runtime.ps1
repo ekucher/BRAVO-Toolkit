@@ -2732,6 +2732,8 @@ function Get-SFTPHealthIssues {
                     FileName = 'немає даних'
                     LastWriteTime = $null
                     SizeBytes = $null
+                    ExpectedSizeBytes = $null
+                    ActualSizeBytes = $null
                     Location = [string]$sftpDirectories[$archiveDefinition.Type]
                 }
                 continue

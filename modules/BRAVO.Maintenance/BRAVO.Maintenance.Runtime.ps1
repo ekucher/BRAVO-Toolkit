@@ -4908,7 +4908,7 @@ $traceOldDirs = @()
 $traceOldLogs = @()
 $groupsToDelete = @()
 if ($BravoMaintenanceEnabled) {
-    $traceOldDirs = Get-BRAVOExpiredLogDateDirectories -Path $TRACE_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS
+    $traceOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $TRACE_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
     $traceOldLogs = @(Get-BRAVOFiles -Path $LOG_DIR |
         Where-Object {
             $_.CreationTime -lt (Get-Date).AddDays(-$LOG_RETENTION_DAYS) -and
@@ -4940,7 +4940,7 @@ if ($BravoMaintenanceEnabled) {
 # Перевірка каталогів-дат exchangAPI лише для активного компонента
 $exchangAPIOldDirs = @()
 if ($exchangAPIServiceEnabled) {
-    $exchangAPIOldDirs = Get-BRAVOExpiredLogDateDirectories -Path $EXCHANGE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS
+    $exchangAPIOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $EXCHANGE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 }
 
 # Перевірка BRAVO Web (якщо Apache встановлений). Apache і application
@@ -4949,13 +4949,13 @@ if ($exchangAPIServiceEnabled) {
 $apacheOldDirs = @()
 $bravoWebAppOldDirs = @()
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
-    $apacheOldDirs = Get-BRAVOExpiredLogDateDirectories -Path $APACHE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS
-    $bravoWebAppOldDirs = Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_APP_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS
+    $apacheOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $APACHE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
+    $bravoWebAppOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_APP_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 }
 # Каталоги-дати, що приїхали міграцією зі старого <ArchiveRoot>\Br-a-vo.web,
 # лежать безпосередньо в LOGS\BravoWeb (тоді Apache і www\log ще не були
 # розділені). Без окремого рядка вони лишилися б поза будь-яким retention.
-$bravoWebLegacyOldDirs = Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS
+$bravoWebLegacyOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 
 # Стиснуті .mdz програмних журналів мають ВЛАСНИЙ строк зберігання
 # (CompressedLogDays), незалежний від ArchiveDays: перший визначає, коли

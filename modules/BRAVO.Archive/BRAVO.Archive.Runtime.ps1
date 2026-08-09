@@ -741,6 +741,40 @@ function Write-Log {
     Write-BRAVOLog -Message $Message -Level $normalizedLevel -Component $component
 }
 
+# Write-BRAVOLogException навмисно зберігає стек на DEBUG для звичайних
+# викликів. Для фатального краху Archive дублюємо лише діагностичні деталі
+# у файл на INFO, без другого операторського повідомлення в консолі.
+function Write-BRAVOArchiveFatalDiagnostics {
+    param(
+        [Parameter(Mandatory = $true)][Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+
+    Write-BRAVOLogException `
+        -ErrorRecord $ErrorRecord `
+        -Component 'ARCHIVE' `
+        -Context $Context
+
+    $details = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $ErrorRecord.Exception) {
+        [void]$details.Add("Тип: $($ErrorRecord.Exception.GetType().FullName)")
+    }
+    if ($null -ne $ErrorRecord.InvocationInfo -and
+        -not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.InvocationInfo.PositionMessage)) {
+        [void]$details.Add("Розташування: $($ErrorRecord.InvocationInfo.PositionMessage)")
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.ScriptStackTrace)) {
+        [void]$details.Add("Стек: $($ErrorRecord.ScriptStackTrace -replace '\r?\n', ' | ')")
+    }
+    if ($details.Count -gt 0) {
+        Write-BRAVOLog `
+            -Message ("$Context. Діагностика: " + ($details -join ' || ')) `
+            -Level 'INFO' `
+            -Component 'ARCHIVE' `
+            -NoConsole
+    }
+}
+
 # Усі три історичні хелпери прогресу тепер малюють одну смугу
 # (BRAVO.Console). Раніше загальна й покомпонентна смуги дублювали одна одну,
 # а індикатор 7-Zip додавав третій вкладений рівень.
@@ -4673,6 +4707,10 @@ function Main {
     $script:backupGenerationId = $backupGenerationId
     $script:backupGenerationStatus = 'FAILED'
     $script:backupGenerationResults = @()
+    # Ініціалізуємо явно: якщо фіналізація generation кине виняток до першого
+    # присвоєння, РЕЗУЛЬТАТ нижче читає $script:backupGenerationState під
+    # Set-StrictMode — неоголошена змінна там була б вторинним крахом.
+    $script:backupGenerationState = $null
     # Uniqueness is a runtime invariant, not a promise delegated to an old
     # external config template. Seconds + PID prevent concurrent executions
     # from interleaving in one file even when ConfigPath points to legacy config.
@@ -5504,43 +5542,63 @@ function Main {
     # Статус generation: COMPLETE лише коли КОЖЕН увімкнений компонент
     # пройшов усі три стадії. INCOMPLETE — знімок був, але щось не дійшло до
     # публікації. FAILED — узгодженої копії не отримано взагалі.
-    $publishedComponentCount = @(
-        $generationResults | Where-Object {
-            [bool]$_.CreateSuccess -and [bool]$_.IntegritySuccess -and [bool]$_.HashSuccess
-        }
-    ).Count
-    $script:backupGenerationStatus = if ($null -eq $generationSnapshotSet -or $publishedComponentCount -eq 0) {
-        'FAILED'
-    } elseif ($publishedComponentCount -eq $enabledArchives.Count) {
-        'COMPLETE'
-    } else {
-        'INCOMPLETE'
-    }
-    $script:backupGenerationResults = @($generationResults)
-    $script:backupGenerationState = New-BRAVOBackupGenerationState `
-        -GenerationId $generationId `
-        -StartedAt $scriptStartTime `
-        -SnapshotSet $generationSnapshotSet `
-        -Components @($generationResults) `
-        -Status $script:backupGenerationStatus
+    #
+    # Уся фіналізація generation (підрахунок опублікованих, побудова state,
+    # запис manifest) обгорнута в try/catch: раніше виняток тут (після
+    # видалення VSS Snapshot Set, до Write-BRAVOBackupGenerationManifest)
+    # тихо обривав увесь прогін — без Generation COMPLETE, без manifest, без
+    # transfer/health, і НЕ потрапляв у BRAVO_ARCHIV log. Тепер повна
+    # діагностика (тип/повідомлення/розташування/стек) гарантовано логується,
+    # статус деградує, а виконання доходить до РЕЗУЛЬТАТ.
     $generationManifestPath = $null
-    if ($enabledArchives.Count -gt 0) {
-        try {
-            $generationManifestPath = Write-BRAVOBackupGenerationManifest `
-                -GenerationState $script:backupGenerationState `
-                -BackupRoot $backupRootPath
-        } catch {
-            Write-Log "Не вдалося записати manifest generation ${generationId}: $($_.Exception.Message)" -Level "WARNING"
-            $operationFailed = $true
+    try {
+        $publishedComponentCount = @(
+            $generationResults | Where-Object {
+                [bool]$_.CreateSuccess -and [bool]$_.IntegritySuccess -and [bool]$_.HashSuccess
+            }
+        ).Count
+        $script:backupGenerationStatus = if ($null -eq $generationSnapshotSet -or $publishedComponentCount -eq 0) {
+            'FAILED'
+        } elseif ($publishedComponentCount -eq $enabledArchives.Count) {
+            'COMPLETE'
+        } else {
+            'INCOMPLETE'
         }
-    }
-    if ($readyArchives.Count -gt 0 -or $enabledArchives.Count -gt 0) {
-        $generationLogLevel = if ($script:backupGenerationStatus -eq 'COMPLETE') { 'SUCCESS' } else { 'WARNING' }
-        Write-Log (
-            "Generation ${generationId}: $($script:backupGenerationStatus) " +
-            "(опубліковано $publishedComponentCount з $($enabledArchives.Count); " +
-            "VSS Snapshot Set: $(if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { 'не створено' }))"
-        ) -Level $generationLogLevel
+        $script:backupGenerationResults = @($generationResults)
+        $script:backupGenerationState = New-BRAVOBackupGenerationState `
+            -GenerationId $generationId `
+            -StartedAt $scriptStartTime `
+            -SnapshotSet $generationSnapshotSet `
+            -Components @($generationResults) `
+            -Status $script:backupGenerationStatus
+        if ($enabledArchives.Count -gt 0) {
+            try {
+                $generationManifestPath = Write-BRAVOBackupGenerationManifest `
+                    -GenerationState $script:backupGenerationState `
+                    -BackupRoot $backupRootPath
+            } catch {
+                Write-Log "Не вдалося записати manifest generation ${generationId}: $($_.Exception.Message)" -Level "WARNING"
+                $operationFailed = $true
+            }
+        }
+        if ($readyArchives.Count -gt 0 -or $enabledArchives.Count -gt 0) {
+            $generationLogLevel = if ($script:backupGenerationStatus -eq 'COMPLETE') { 'SUCCESS' } else { 'WARNING' }
+            Write-Log (
+                "Generation ${generationId}: $($script:backupGenerationStatus) " +
+                "(опубліковано $publishedComponentCount з $($enabledArchives.Count); " +
+                "VSS Snapshot Set: $(if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { 'не створено' }))"
+            ) -Level $generationLogLevel
+        }
+    } catch {
+        Write-BRAVOLogException -ErrorRecord $_ -Component 'GENERATION' -Context "Помилка фіналізації generation ${generationId}"
+        # Фіналізація не завершилась — узгодженого COMPLETE-стану немає.
+        # Деградуємо статус (COMPLETE тут був би неправдою) і продовжуємо до
+        # РЕЗУЛЬТАТ, щоб оператор побачив помилку й код завершення.
+        if ([string]::IsNullOrWhiteSpace([string]$script:backupGenerationStatus) -or
+            [string]$script:backupGenerationStatus -eq 'COMPLETE') {
+            $script:backupGenerationStatus = 'FAILED'
+        }
+        $operationFailed = $true
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
     
@@ -6171,12 +6229,42 @@ $script:archiveProcessLockPath = $null
 try {
     Main
 } catch {
-    # Значення тут здебільшого символічне: throw нижче не дає скрипту дійти
-    # до власного Exit, і саме .psm1-обгортка (try/catch навколо виклику
-    # runtime, коміт 1ba0bbb) визначає код, що реально побачить процес —
-    # вона так само повертає 90. Лишаємо узгодженим із контрактом.
+    # Порядок обробки краху (ТЗ «exception visibility»): спершу повна
+    # діагностика в лог, потім операторський ERROR + код завершення, і лише
+    # ПОТІМ — cleanup і manual pause (у finally). Раніше catch просто робив
+    # throw: пауза у finally спрацьовувала ще до того, як виняток десь
+    # показувався чи логувався, тож оператор бачив "натисніть клавішу" без
+    # жодної причини, а стек не потрапляв у BRAVO_ARCHIV log.
+    $fatalErrorRecord = $_
+    $fatalMessage = [string]$fatalErrorRecord.Exception.Message
     $script:processExitCode = 90
-    throw
+    try {
+        Write-BRAVOArchiveFatalDiagnostics `
+            -ErrorRecord $fatalErrorRecord `
+            -Context 'Неочікувана помилка виконання BRAVO_ARCHIV'
+    } catch {
+        # Ранній збій може статись і до повної ініціалізації log writer.
+        # Не дозволяємо помилці діагностики замаскувати первинний exception.
+        Write-Host (
+            "[ERROR] BRAVO_ARCHIV: $fatalMessage " +
+            "(не вдалося записати повну діагностику: $($_.Exception.Message))"
+        ) -ForegroundColor Red
+    }
+    try {
+        Write-BRAVOResultHeader `
+            -Status 'ERROR' `
+            -StatusColor ([ConsoleColor]::Red) `
+            -ExitCode $script:processExitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $script:processExitCode) `
+            -Reason $fatalMessage
+        Write-BRAVOResultFooter -LogFile $script:logFile
+    } catch {
+        # Консоль могла не встигнути ініціалізуватися (крах на ранній стадії) —
+        # тоді показуємо мінімум, але процес усе одно завершиться кодом 90.
+        Write-Host ("[ERROR] BRAVO_ARCHIV: $fatalMessage (код 90)") -ForegroundColor Red
+    }
+    # НЕ re-throw: скрипт доходить до власного Exit $script:processExitCode
+    # нижче (=90), тож .psm1-обгортка отримує той самий код через $LASTEXITCODE.
 } finally {
     if ($script:archiveProcessLock) {
         $script:archiveProcessLock.Dispose()
