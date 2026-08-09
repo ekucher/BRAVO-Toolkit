@@ -389,6 +389,25 @@ function New-BRAVOTaskDefinition {
     }
 }
 
+function Format-BRAVOInstalledTaskSummaryNextRun {
+    param(
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync")]
+        [string]$TaskType,
+        $TaskSettings,
+        $NextRunTime
+    )
+
+    $nextRunArguments = @{
+        TaskType = $TaskType
+        NextRunTime = $NextRunTime
+    }
+    if ($TaskType -eq "Recovery") {
+        $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
+    }
+
+    return Format-BRAVOSchedulerNextRun @nextRunArguments
+}
+
 function Test-SchedulerConfiguration {
     param([string]$ResolvedConfigPath)
 
@@ -802,10 +821,10 @@ try {
         }
         Write-Host "Завдання встановлено: $($registeredTask.Path)" -ForegroundColor Green
         $nextRunRaw = try { $registeredTask.NextRunTime } catch { $null }
-        $nextRunText = Format-BRAVOSchedulerNextRun `
+        $nextRunText = Format-BRAVOInstalledTaskSummaryNextRun `
             -TaskType $taskPlan.Type `
-            -NextRunTime $nextRunRaw `
-            -StartupDelayMinutes ([int]$taskSettings.StartupDelayMinutes)
+            -TaskSettings $taskSettings `
+            -NextRunTime $nextRunRaw
         $taskSummaries.Add([pscustomobject]@{
             Name = $taskName
             Status = if ($null -eq $existingTaskBeforeChange) { 'INSTALLED' } else { 'UPDATED' }

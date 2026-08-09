@@ -6324,6 +6324,93 @@ try {
         -Name "Scheduler/ExpectedPrincipalFromConfig" `
         -Failure "expected principal (акаунт/LogonType/RunLevel) має братися з schedulerSettings, а не хардкодитися"
 
+    # --- Scheduler/InstallSummary*: actual INSTALL summary path must not read
+    # Recovery-only StartupDelayMinutes for daily/repeating tasks.
+    $systemSourceTextForScheduler = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psm1'),
+        [Text.Encoding]::UTF8
+    )
+    $installSummaryModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($taskInstallerText + "`n" + $systemSourceTextForScheduler) `
+        -FunctionNames @('Format-BRAVOSchedulerNextRun', 'Format-BRAVOInstalledTaskSummaryNextRun')
+    $invokeInstalledTaskSummary = {
+        param($TaskType, $TaskSettings, $NextRunTime)
+        Set-StrictMode -Version Latest
+        Format-BRAVOInstalledTaskSummaryNextRun `
+            -TaskType $TaskType `
+            -TaskSettings $TaskSettings `
+            -NextRunTime $NextRunTime
+    }
+    $backupSummaryOk = $false
+    try {
+        $backupSummary = & $installSummaryModule `
+            $invokeInstalledTaskSummary `
+            'Backup' `
+            @{ DailyAt = '23:00' } `
+            ([datetime]'2026-08-09T23:00:00')
+        $backupSummaryOk = ($backupSummary -eq '09.08.2026 23:00')
+    } catch { $backupSummaryOk = $false }
+    Test-BRAVOCondition `
+        -Condition $backupSummaryOk `
+        -Name "Scheduler/InstallSummaryBackupDoesNotRequireStartupDelay" `
+        -Failure "INSTALL-summary Backup не має читати Recovery.StartupDelayMinutes під Set-StrictMode"
+
+    $maintenanceSummaryOk = $false
+    try {
+        $maintenanceSummary = & $installSummaryModule `
+            $invokeInstalledTaskSummary `
+            'Maintenance' `
+            @{ DailyAt = '01:00' } `
+            ([datetime]'2026-08-10T01:00:00')
+        $maintenanceSummaryOk = ($maintenanceSummary -eq '10.08.2026 01:00')
+    } catch { $maintenanceSummaryOk = $false }
+    Test-BRAVOCondition `
+        -Condition $maintenanceSummaryOk `
+        -Name "Scheduler/InstallSummaryMaintenanceDoesNotRequireStartupDelay" `
+        -Failure "INSTALL-summary Maintenance не має читати Recovery.StartupDelayMinutes під Set-StrictMode"
+
+    $healthSummaryOk = $false
+    try {
+        $healthSummary = & $installSummaryModule `
+            $invokeInstalledTaskSummary `
+            'Health' `
+            @{ StartAt = '08:00'; RepeatEveryMinutes = 60 } `
+            ([datetime]'2026-08-09T08:00:00')
+        $healthSummaryOk = ($healthSummary -eq '09.08.2026 08:00')
+    } catch { $healthSummaryOk = $false }
+    Test-BRAVOCondition `
+        -Condition $healthSummaryOk `
+        -Name "Scheduler/InstallSummaryHealthDoesNotRequireStartupDelay" `
+        -Failure "INSTALL-summary Health не має читати Recovery.StartupDelayMinutes під Set-StrictMode"
+
+    $bazaSyncSummaryOk = $false
+    try {
+        $bazaSyncSummary = & $installSummaryModule `
+            $invokeInstalledTaskSummary `
+            'BAZASync' `
+            @{ StartAt = '08:30'; RepeatEveryHours = 2 } `
+            ([datetime]'2026-08-09T08:30:00')
+        $bazaSyncSummaryOk = ($bazaSyncSummary -eq '09.08.2026 08:30')
+    } catch { $bazaSyncSummaryOk = $false }
+    Test-BRAVOCondition `
+        -Condition $bazaSyncSummaryOk `
+        -Name "Scheduler/InstallSummaryBazaSyncDoesNotRequireStartupDelay" `
+        -Failure "INSTALL-summary BAZASync не має читати Recovery.StartupDelayMinutes під Set-StrictMode"
+
+    $recoverySummaryOk = $false
+    try {
+        $recoverySummary = & $installSummaryModule `
+            $invokeInstalledTaskSummary `
+            'Recovery' `
+            @{ StartupDelayMinutes = 7 } `
+            ([datetime]'1899-12-30T00:00:00')
+        $recoverySummaryOk = ($recoverySummary -eq 'після наступного старту Windows; затримка 7 хв.')
+    } catch { $recoverySummaryOk = $false }
+    Test-BRAVOCondition `
+        -Condition $recoverySummaryOk `
+        -Name "Scheduler/InstallSummaryRecoveryUsesStartupDelay" `
+        -Failure "INSTALL-summary Recovery має передавати налаштовану StartupDelayMinutes у Format-BRAVOSchedulerNextRun"
+
     # --- Scheduler/BootTriggerNextRunNo1899: Recovery ніколи не показує 30.12.1899 ---
     $recoveryNext = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 0
     $recoveryNextDelay = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 5
