@@ -1051,7 +1051,9 @@ try {
             (Resolve-BRAVOExitCode -SmbFailed) -eq 51 -and
             (Resolve-BRAVOExitCode -MaintenanceFailed) -eq 60 -and
             (Resolve-BRAVOExitCode -HealthCritical) -eq 70 -and
-            (Resolve-BRAVOExitCode -InternalError) -eq 90
+            (Resolve-BRAVOExitCode -InternalError) -eq 90 -and
+            (Resolve-BRAVOExitCode -PrivilegeRequired) -eq 36 -and
+            (Resolve-BRAVOExitCode -EnvironmentUnavailable) -eq 37
         ) `
         -Name "ExitCodes/ResolveSingleCategory" `
         -Failure "кожна окрема категорія відмови має повертати свій код із контракту"
@@ -1112,9 +1114,49 @@ try {
         ) `
         -Name "ExitCodes/VersionDowngradePriority" `
         -Failure "відкат версії має давати код 35 і бути нижчим за 34 (там захист уже вимкнено)"
+
+    # dev.13: PrivilegeRequired (36) — той самий клас, що LockBusy/
+    # InvalidConfiguration/CredentialsUnavailable ("чому взагалі не змогли
+    # почати"), тому пріоритетом стоїть серед них і ВИЩЕ за HealthCritical
+    # (70): якщо немає прав писати в LOGS/TEMP, реальні health-checks не
+    # виконувались узагалі — 70 означав би, що їх виконали й щось знайшли.
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVOExitCode -PrivilegeRequired) -eq 36 -and
+            (Get-BRAVOExitCodeName -Code 36) -eq "PrivilegeRequired" -and
+            (Resolve-BRAVOExitCode -PrivilegeRequired -HealthCritical) -eq 36 -and
+            (Resolve-BRAVOExitCode -PrivilegeRequired -LocalArchiveFailed) -eq 36 -and
+            (Resolve-BRAVOExitCode -CredentialsUnavailable -PrivilegeRequired) -eq 31 -and
+            (Resolve-BRAVOExitCode -RuntimeIntegrityViolation -PrivilegeRequired) -eq 33 -and
+            # Реальний HealthCritical (70) сам по собі лишається незмінним —
+            # dev.13 додає нову категорію, а не замінює наявну.
+            (Resolve-BRAVOExitCode -HealthCritical) -eq 70
+        ) `
+        -Name "ExitCodes/PrivilegeRequiredPriority" `
+        -Failure "PrivilegeRequired має давати код 36, перемагати HealthCritical/LocalArchiveFailed (перевірки не виконувались), але програвати RuntimeIntegrityViolation/CredentialsUnavailable (вищі за пріоритетом prerequisite-відмови); окремий реальний HealthCritical=70 має лишитися незмінним"
+
+    # correctness pass: EnvironmentUnavailable (37) — той самий prerequisite
+    # клас і той самий пріоритет-профіль, що PrivilegeRequired (36), але
+    # НЕ privilege-специфічна відмова (диск повний, PathTooLong тощо) —
+    # окремий код, щоб не радити "запустіть адміністратором" помилково.
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVOExitCode -EnvironmentUnavailable) -eq 37 -and
+            (Get-BRAVOExitCodeName -Code 37) -eq "EnvironmentUnavailable" -and
+            (Resolve-BRAVOExitCode -EnvironmentUnavailable -HealthCritical) -eq 37 -and
+            (Resolve-BRAVOExitCode -EnvironmentUnavailable -LocalArchiveFailed) -eq 37 -and
+            (Resolve-BRAVOExitCode -CredentialsUnavailable -EnvironmentUnavailable) -eq 31 -and
+            (Resolve-BRAVOExitCode -RuntimeIntegrityViolation -EnvironmentUnavailable) -eq 33 -and
+            (Resolve-BRAVOExitCode -PrivilegeRequired -EnvironmentUnavailable) -eq 36
+        ) `
+        -Name "ExitCodes/EnvironmentUnavailablePriority" `
+        -Failure "EnvironmentUnavailable має давати код 37 з тим самим пріоритет-профілем, що PrivilegeRequired, і не перемагати PrivilegeRequired (36), коли обидва встановлені"
+
     Test-BRAVOCondition `
         -Condition (
             (Get-BRAVOExitCodeName -Code 0) -eq "Success" -and
+            (Get-BRAVOExitCodeName -Code 36) -eq "PrivilegeRequired" -and
+            (Get-BRAVOExitCodeName -Code 37) -eq "EnvironmentUnavailable" -and
             (Get-BRAVOExitCodeName -Code 42) -eq "HashValidationFailed" -and
             (Get-BRAVOExitCodeName -Code 50) -eq "SftpFailed" -and
             (Get-BRAVOExitCodeName -Code 999) -eq "Unknown(999)"
@@ -1144,6 +1186,83 @@ try {
         ) `
         -Name "Runtime/SharedExitCodeContract" `
         -Failure "Archive/Health/Maintenance мають підключати BRAVO.ExitCodes і формувати підсумковий код через Resolve-BRAVOExitCode"
+
+    # correctness pass (J): реальний Status=Critical/NotificationError мають
+    # лишитися прив'язаними саме до HealthCritical — нова категорія
+    # EnvironmentError додається поруч, а не замінює наявні шляхи, і сама
+    # розгалужується на PrivilegeRequired(36)/EnvironmentUnavailable(37)
+    # за IsPrivilegeFailure, а не завжди на PrivilegeRequired.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForExitCodes.Contains("if ([bool]`$Result.IsPrivilegeFailure) {") -and
+            $healthRuntimeTextForExitCodes.Contains('Resolve-BRAVOExitCode -PrivilegeRequired') -and
+            $healthRuntimeTextForExitCodes.Contains('Resolve-BRAVOExitCode -EnvironmentUnavailable') -and
+            $healthRuntimeTextForExitCodes.Contains("'Critical'           { Resolve-BRAVOExitCode -HealthCritical }") -and
+            $healthRuntimeTextForExitCodes.Contains("'NotificationError'  { Resolve-BRAVOExitCode -HealthCritical }")
+        ) `
+        -Name "Health/EnvironmentErrorMapsToPrivilegeRequired" `
+        -Failure "Complete-BRAVOHealthResult має мапити Status=EnvironmentError на PrivilegeRequired(36)/EnvironmentUnavailable(37) залежно від IsPrivilegeFailure, не чіпаючи реальні Critical/NotificationError -> HealthCritical (70)"
+
+    # dev.13 (G) / correctness pass: при провалі environment preflight
+    # (незалежно від privilege/generic класифікації) SFTP-перевірка не
+    # повинна викликатися взагалі — return відбувається РАНІШЕ за виклик
+    # Get-SFTPHealthIssues у лінійному потоці виконання файлу.
+    $environmentErrorReturnIndex = $healthRuntimeTextForExitCodes.IndexOf('Status = "EnvironmentError"')
+    $sftpCallIndex = $healthRuntimeTextForExitCodes.IndexOf('$sftpHealthIssues = @(Get-SFTPHealthIssues)')
+    Test-BRAVOCondition `
+        -Condition (
+            $environmentErrorReturnIndex -ge 0 -and
+            $sftpCallIndex -ge 0 -and
+            $environmentErrorReturnIndex -lt $sftpCallIndex
+        ) `
+        -Name "Health/EnvironmentFailureNeverCallsSftp" `
+        -Failure "провал environment preflight (LOGS/TEMP, privilege чи generic) має return-увати ДО виклику Get-SFTPHealthIssues — інакше SFTP усе одно викликається на непов'язаній локальній помилці"
+
+    # dev.13 (H): Write-HealthLog не повинен повторно намагатись писати в
+    # недоступний файл (і друкувати ту саму помилку) на кожному виклику
+    # після першого AccessDenied.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForExitCodes.Contains('$script:BRAVOHealthLogWritable = $true') -and
+            $healthRuntimeTextForExitCodes.Contains('if (-not $script:BRAVOHealthLogWritable) {') -and
+            $healthRuntimeTextForExitCodes.Contains('$script:BRAVOHealthLogWritable = $false')
+        ) `
+        -Name "Health/LogWriteFailureDoesNotFlood" `
+        -Failure "Write-HealthLog має припиняти повторні спроби запису й повторний друк помилки після першого AccessDenied (script:BRAVOHealthLogWritable)"
+
+    # Minor 1: якщо health-check лог не вдалося створити/писати (LOGS сам
+    # міг бути недоступним шляхом), сповіщення й консольний підсумок не
+    # повинні заявляти "Журнал: ...", якого фактично немає.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForExitCodes.Contains('if ($script:BRAVOHealthLogWritable) {') -and
+            $healthRuntimeTextForExitCodes.Contains('$environmentNotificationParameters.LogPath = $healthLogFile') -and
+            $healthRuntimeTextForExitCodes.Contains('LogPath = $(if ($script:BRAVOHealthLogWritable) { $healthLogFile } else { $null })')
+        ) `
+        -Name "Health/EnvironmentNotificationOmitsUnavailableLog" `
+        -Failure "environment-notification і Complete-BRAVOHealthResult Result.LogPath мають передавати шлях логу лише коли script:BRAVOHealthLogWritable=true — інакше сповіщення/консоль заявляють журнал, якого немає"
+
+    # correctness pass, 3rd iteration (заміна ACL-тестів): статичний guard
+    # підтверджує САМ МЕХАНІЗМ preservation, а не лише його наслідок —
+    # Get-BRAVOHealthTemporaryRoot зберігає ПЕРШИЙ типізований виняток і
+    # передає його як InnerException (не $_.Exception.Message-рядок), а
+    # виклик з Invoke-BRAVOHealth класифікує саме $_.Exception (що тепер
+    # включає цей InnerException) через Test-BRAVOHealthIsPrivilegeException.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForExitCodes.Contains('$firstCreationException = $null') -and
+            $healthRuntimeTextForExitCodes.Contains('if ($null -eq $firstCreationException) {') -and
+            $healthRuntimeTextForExitCodes.Contains('$firstCreationException = $_.Exception') -and
+            $healthRuntimeTextForExitCodes.Contains('if ($null -ne $firstCreationException) {') -and
+            $healthRuntimeTextForExitCodes.Contains('throw (New-Object System.Management.Automation.RuntimeException(') -and
+            $healthRuntimeTextForExitCodes.Contains('$aggregateMessage, $firstCreationException))') -and
+            (@([regex]::Matches(
+                $healthRuntimeTextForExitCodes,
+                [regex]::Escape('IsPrivilegeFailure = (Test-BRAVOHealthIsPrivilegeException -Exception $_.Exception)')
+            )).Count -eq 2)
+        ) `
+        -Name "Health/TemporaryRootPreservesTypedExceptionForClassification" `
+        -Failure "Get-BRAVOHealthTemporaryRoot має зберігати firstCreationException і передавати його як InnerException агрегованого throw; і Test-BRAVOHealthRuntimePathWritable, і catch-блок навколо Get-BRAVOHealthTemporaryRoot мають класифікувати саме `$_.Exception через Test-BRAVOHealthIsPrivilegeException"
     Test-BRAVOCondition `
         -Condition (
             $archiveRuntimeTextForExitCodes.Contains('$anyHashValidationFailed = @(') -and
@@ -1778,10 +1897,473 @@ try {
         -Condition ($healthScriptText -notmatch '"\s*:\w+:\s+\S[^"]*\S {2,}:white_check_mark:') `
         -Name "Health/SuccessRowsDoNotPadStatusIcon" `
         -Failure "BRAVO.Health.Runtime.ps1 не повинен вирівнювати статус-іконку фіксованими пробілами — Discord/Slack рендерять пропорційним шрифтом"
+
+    # ============================================================
+    # dev.13: manual elevation + environment preflight (BRAVO_HEALTH.ps1
+    # + BRAVO.Health.Runtime.ps1). Root cause: ручний non-elevated запуск
+    # бачив D:\BRAVO\LOGS/TEMP (їх створив SYSTEM), але не міг у них
+    # писати — AccessDenied спливала лише глибоко в SFTP-етапі й ставала
+    # фальшивою "SFTP недоступний".
+    # ============================================================
+
+    # --- F: environment permission classification (write-probe helper) ---
+    $healthPreflightModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Test-BRAVOHealthIsPrivilegeException',
+            'Test-BRAVOHealthRuntimePathWritable',
+            'Test-BRAVOHealthEnvironmentPreflight'
+        )
+
+    # correctness pass: не кожна I/O-відмова означає "потрібні права
+    # адміністратора". Синтетичні exception-об'єкти — детерміновано,
+    # портативно, без реальної зміни ACL (заборонено в self-test).
+    $privilegeClassification = & $healthPreflightModule {
+        Test-BRAVOHealthIsPrivilegeException -Exception (
+            New-Object System.UnauthorizedAccessException("Access is denied.")
+        )
+    }
+    $privilegeClassificationWrapped = & $healthPreflightModule {
+        Test-BRAVOHealthIsPrivilegeException -Exception (
+            New-Object System.InvalidOperationException(
+                "wrap", (New-Object System.UnauthorizedAccessException("inner denied")))
+        )
+    }
+    $genericClassification = & $healthPreflightModule {
+        Test-BRAVOHealthIsPrivilegeException -Exception (
+            New-Object System.IO.IOException("There is not enough space on the disk.")
+        )
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $privilegeClassification -eq $true -and
+            $privilegeClassificationWrapped -eq $true -and
+            $genericClassification -eq $false
+        ) `
+        -Name "Health/PrivilegeFailureClassification" `
+        -Failure "Test-BRAVOHealthIsPrivilegeException має розпізнавати UnauthorizedAccessException (включно із загорнутим в InnerException) як privilege-відмову"
+    Test-BRAVOCondition `
+        -Condition ($genericClassification -eq $false) `
+        -Name "Health/GenericEnvironmentFailureClassification" `
+        -Failure "IOException (диск повний тощо) НЕ повинен класифікуватися як privilege-відмова"
+    $preflightWritableDir = Join-Path $env:TEMP (
+        "bravo_selftest_preflight_{0}" -f ([guid]::NewGuid().ToString("N"))
+    )
+    [void](New-Item -ItemType Directory -Path $preflightWritableDir -Force)
+    try {
+        # NTFS відхиляє "|"/"?" у назві незалежно від прав доступу —
+        # детермінований, портативний спосіб отримати AccessDenied-подібну
+        # відмову без реальної зміни ACL (заборонено в self-test).
+        $preflightInvalidPath = Join-Path $preflightWritableDir "invalid|name?"
+
+        $preflightOkResult = & $healthPreflightModule {
+            param($Path)
+            Test-BRAVOHealthRuntimePathWritable -Path $Path
+        } $preflightWritableDir
+        $preflightArtifactsAfterOk = @(Get-ChildItem -LiteralPath $preflightWritableDir -Force)
+        Test-BRAVOCondition `
+            -Condition (
+                $preflightOkResult.IsWritable -eq $true -and
+                [string]::IsNullOrEmpty($preflightOkResult.ErrorMessage) -and
+                $preflightOkResult.IsPrivilegeFailure -eq $false -and
+                $preflightArtifactsAfterOk.Count -eq 0
+            ) `
+            -Name "Health/PreflightWritableSucceedsAndCleansUp" `
+            -Failure "Test-BRAVOHealthRuntimePathWritable на доступному каталозі має повертати IsWritable=true й не залишати probe-артефакти"
+
+        $preflightFailResult = & $healthPreflightModule {
+            param($Path)
+            Test-BRAVOHealthRuntimePathWritable -Path $Path
+        } $preflightInvalidPath
+        Test-BRAVOCondition `
+            -Condition (
+                $preflightFailResult.IsWritable -eq $false -and
+                -not [string]::IsNullOrWhiteSpace($preflightFailResult.ErrorMessage) -and
+                # Некоректні символи в шляху -> ArgumentException, НЕ
+                # UnauthorizedAccessException -> generic, не privilege.
+                $preflightFailResult.IsPrivilegeFailure -eq $false
+            ) `
+            -Name "Health/PreflightUnwritableFails" `
+            -Failure "Test-BRAVOHealthRuntimePathWritable на недоступному шляху має повертати IsWritable=false з ErrorMessage і коректною (generic, не privilege) класифікацією для ArgumentException"
+
+        # НЕ "SFTP=False": FailedPath має вказувати саме на той каталог
+        # (LOGS чи TEMP), який справді провалився.
+        $preflightBadTemp = & $healthPreflightModule {
+            param($LogPath, $TempPath)
+            Test-BRAVOHealthEnvironmentPreflight -LogPath $LogPath -TemporaryRoot $TempPath
+        } $preflightWritableDir $preflightInvalidPath
+        $preflightBadLog = & $healthPreflightModule {
+            param($LogPath, $TempPath)
+            Test-BRAVOHealthEnvironmentPreflight -LogPath $LogPath -TemporaryRoot $TempPath
+        } $preflightInvalidPath $preflightWritableDir
+        Test-BRAVOCondition `
+            -Condition (
+                $preflightBadTemp.IsWritable -eq $false -and
+                $preflightBadTemp.FailedPath -eq $preflightInvalidPath -and
+                $preflightBadLog.IsWritable -eq $false -and
+                $preflightBadLog.FailedPath -eq $preflightInvalidPath
+            ) `
+            -Name "Health/EnvironmentPreflightIdentifiesFailedPath" `
+            -Failure "Test-BRAVOHealthEnvironmentPreflight має повідомляти саме той шлях (LOGS чи TEMP), що провалився — не узагальнений SFTP/False"
+    } finally {
+        Remove-Item -LiteralPath $preflightWritableDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- correctness pass, 3rd iteration: тести, що раніше напряму
+    # редагували список контролю доступу тимчасового каталогу, видалено —
+    # dev.13 вимагає "не виконувати ACL modifications", і self-test не
+    # повинен чіпати права доступу навіть на власних тимчасових
+    # каталогах: це залежність від NTFS/WRITE_DAC/локальної ACL policy,
+    # якої не повинно бути в детермінованих unit-тестах. Класифікація
+    # перевіряється через ЧИСТУ функцію (Test-BRAVOHealthIsPrivilegeException
+    # бере Exception, не чіпає диск) із синтетичними винятками — той самий
+    # підхід, що вже Health/PrivilegeFailureClassification/
+    # GenericEnvironmentFailureClassification нижче. Лише
+    # "MissingTempGenericIoIsEnvironmentUnavailable" лишається реальним
+    # I/O (некоректні символи в шляху -> ArgumentException) — це не зміна
+    # прав доступу, звичайна відмова створення файлу/каталогу.
+    $classificationTestDir = Join-Path $env:TEMP (
+        "bravo_selftest_classification_{0}" -f ([guid]::NewGuid().ToString("N"))
+    )
+    [void](New-Item -ItemType Directory -Path $classificationTestDir -Force)
+    try {
+        # Health/MissingTempAccessDeniedIsPrivilegeFailure: той самий
+        # exception shape, що Get-BRAVOHealthTemporaryRoot реально кидає,
+        # коли ПЕРШИЙ кандидат TEMP не створюється через AccessDenied —
+        # RuntimeException, чиє InnerException = UnauthorizedAccessException
+        # (не $_.Exception.Message-рядок, типізований об'єкт).
+        # Test-BRAVOHealthIsPrivilegeException має прочитати це через
+        # InnerException chain так само, як прямий (нешорований) виняток.
+        $missingTempWrappedException = New-Object System.Management.Automation.RuntimeException(
+            "не знайдено доступного ASCII-каталогу для тимчасових файлів WinSCP; TEMP: Access is denied.",
+            (New-Object System.UnauthorizedAccessException("Access is denied.")))
+        $missingTempClassification = & $healthPreflightModule {
+            param($Exception) Test-BRAVOHealthIsPrivilegeException -Exception $Exception
+        } $missingTempWrappedException
+        Test-BRAVOCondition `
+            -Condition ($missingTempClassification -eq $true) `
+            -Name "Health/MissingTempAccessDeniedIsPrivilegeFailure" `
+            -Failure "RuntimeException з InnerException=UnauthorizedAccessException (форма, яку реально кидає Get-BRAVOHealthTemporaryRoot при відсутньому TEMP) має класифікуватись як privilege failure (36)"
+
+        # Health/MissingTempGenericIoIsEnvironmentUnavailable: відсутній
+        # каталог, чиє СПРАВЖНЄ створення провалюється НЕ через права
+        # (некоректні символи -> ArgumentException) -> generic (37), не
+        # privilege. Реальний, детермінований I/O; жодної ACL-мутації.
+        $missingTempGenericPath = Join-Path $classificationTestDir "generic-missing-temp|invalid?"
+        $missingTempGenericResult = & $healthPreflightModule {
+            param($Path) Test-BRAVOHealthRuntimePathWritable -Path $Path
+        } $missingTempGenericPath
+        Test-BRAVOCondition `
+            -Condition (
+                $missingTempGenericResult.IsWritable -eq $false -and
+                $missingTempGenericResult.IsPrivilegeFailure -eq $false
+            ) `
+            -Name "Health/MissingTempGenericIoIsEnvironmentUnavailable" `
+            -Failure "New-Item на відсутньому TEMP-каталозі, що провалюється НЕ через права (некоректні символи), має класифікуватись як generic (37), не privilege (36)"
+    } finally {
+        Remove-Item -LiteralPath $classificationTestDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- A/B/C/D/E + UAC cancel: BRAVO_HEALTH.ps1 elevation gate ---
+    $healthEntrypointScriptTextForElevation = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_HEALTH.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $healthElevationModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthEntrypointScriptTextForElevation `
+        -FunctionNames @(
+            'Get-BRAVOHealthElevationState',
+            'Test-BRAVOHealthManualInteractiveSession',
+            'Get-BRAVOHealthElevationAction',
+            'New-BRAVOHealthRelaunchArgumentList',
+            'Test-BRAVOHealthElevationCancelled',
+            'Test-BRAVOHealthExplicitNonInteractive'
+        )
+
+    # correctness pass, 2nd iteration: [Environment]::UserInteractive/
+    # [Console]::IsInputRedirected НЕ доводять, що powershell.exe отримав
+    # -NonInteractive. Перша ітерація читала Win32_Process.CommandLine
+    # через CIM/WMI — видалено: [Environment]::GetCommandLineArgs() (.NET
+    # Framework, вбудований, PS 5.1-сумісний) повертає ВЖЕ розпарсений
+    # argv без жодної залежності від CIM/WMI (перевірено емпірично: лапки
+    # з пробілами лишаються ОДНИМ елементом навіть коли значення містить
+    # підрядок "-NonInteractive"). Порівняння — точне (не substring/-like).
+    $explicitNonInteractiveArgvCases = @(
+        @{ Argv = @('powershell.exe', '-NonInteractive', '-File', 'D:\BRAVO\BRAVO_HEALTH.ps1'); Expected = $true },
+        @{ Argv = @('powershell.exe', '-NoProfile', '-NonInteractive', '-File', 'D:\BRAVO\BRAVO_HEALTH.ps1'); Expected = $true },
+        @{ Argv = @('powershell.exe', '-File', 'D:\BRAVO\BRAVO_HEALTH.ps1'); Expected = $false },
+        @{ Argv = @('powershell.exe', '-File', 'C:\NonInteractive Test\script.ps1'); Expected = $false },
+        @{ Argv = @('powershell.exe', '-File', 'D:\BRAVO\BRAVO_HEALTH.ps1', '-ConfigPath', 'C:\foo\-NonInteractive\bar'); Expected = $false }
+    )
+    $explicitNonInteractiveArgvFailures = @(
+        $explicitNonInteractiveArgvCases | Where-Object {
+            $actual = & $healthElevationModule {
+                param($Argv) Test-BRAVOHealthExplicitNonInteractive -Argv $Argv
+            } $_.Argv
+            $actual -ne $_.Expected
+        } | ForEach-Object { $_.Argv -join ' ' }
+    )
+    Test-BRAVOCondition `
+        -Condition ($explicitNonInteractiveArgvFailures.Count -eq 0) `
+        -Name "Health/ExplicitNonInteractiveUsesProcessArgv" `
+        -Failure "Test-BRAVOHealthExplicitNonInteractive(argv) неправильно класифікував: $($explicitNonInteractiveArgvFailures -join ' | ')"
+
+    # Функція реально виконана в цьому self-test процесі (не лише
+    # синтетичні argv вище) — підтверджує end-to-end, що [Environment]::
+    # GetCommandLineArgs() повертає рядковий масив, який функція приймає
+    # без винятку, і що результат стабільний (той самий процес -> той
+    # самий висновок при повторному виклику).
+    $realArgvResultFirstCall = & $healthElevationModule {
+        Test-BRAVOHealthExplicitNonInteractive -Argv ([Environment]::GetCommandLineArgs())
+    }
+    $realArgvResultSecondCall = & $healthElevationModule {
+        Test-BRAVOHealthExplicitNonInteractive -Argv ([Environment]::GetCommandLineArgs())
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            ($realArgvResultFirstCall -is [bool]) -and
+            ($realArgvResultFirstCall -eq $realArgvResultSecondCall)
+        ) `
+        -Name "Health/ExplicitNonInteractiveDoesNotDependOnWmi" `
+        -Failure "Test-BRAVOHealthExplicitNonInteractive -Argv ([Environment]::GetCommandLineArgs()) має працювати без жодного CIM/WMI виклику й повертати стабільний bool"
+
+    # A: elevated Administrator -> true; SYSTEM -> privileged; звичайний -> false.
+    $elevationStateAdmin = & $healthElevationModule {
+        param($Sid, $IsAdmin) Get-BRAVOHealthElevationState -UserSid $Sid -IsAdministratorRole $IsAdmin
+    } 'S-1-5-21-1111111111-2222222222-3333333333-500' $true
+    $elevationStateSystem = & $healthElevationModule {
+        param($Sid, $IsAdmin) Get-BRAVOHealthElevationState -UserSid $Sid -IsAdministratorRole $IsAdmin
+    } 'S-1-5-18' $true
+    $elevationStateStandard = & $healthElevationModule {
+        param($Sid, $IsAdmin) Get-BRAVOHealthElevationState -UserSid $Sid -IsAdministratorRole $IsAdmin
+    } 'S-1-5-21-1111111111-2222222222-3333333333-1001' $false
+    Test-BRAVOCondition `
+        -Condition (
+            $elevationStateAdmin -eq 'Administrator' -and
+            $elevationStateSystem -eq 'System' -and
+            $elevationStateStandard -eq 'Standard'
+        ) `
+        -Name "Health/ElevationDetectionStates" `
+        -Failure "Get-BRAVOHealthElevationState: elevated Administrator -> Administrator, SYSTEM (S-1-5-18) -> System, звичайний акаунт -> Standard"
+
+    # B: ручний interactive non-elevated -> self-relaunch (Relaunch).
+    $actionManualInteractive = & $healthElevationModule {
+        param($State, $Interactive) Get-BRAVOHealthElevationAction -ElevationState $State -IsManualInteractiveSession $Interactive
+    } 'Standard' $true
+    Test-BRAVOCondition `
+        -Condition ($actionManualInteractive -eq 'Relaunch') `
+        -Name "Health/ElevationManualInteractiveRelaunches" `
+        -Failure "non-elevated + manual interactive сесія має повертати дію Relaunch (self-relaunch через Start-Process -Verb RunAs)"
+
+    # C: SYSTEM/non-interactive НІКОЛИ не запускає -Verb RunAs.
+    $actionStandardNonInteractive = & $healthElevationModule {
+        param($State, $Interactive) Get-BRAVOHealthElevationAction -ElevationState $State -IsManualInteractiveSession $Interactive
+    } 'Standard' $false
+    $actionSystemInteractive = & $healthElevationModule {
+        param($State, $Interactive) Get-BRAVOHealthElevationAction -ElevationState $State -IsManualInteractiveSession $Interactive
+    } 'System' $true
+    $actionSystemNonInteractive = & $healthElevationModule {
+        param($State, $Interactive) Get-BRAVOHealthElevationAction -ElevationState $State -IsManualInteractiveSession $Interactive
+    } 'System' $false
+    Test-BRAVOCondition `
+        -Condition (
+            $actionStandardNonInteractive -eq 'FailFast' -and
+            $actionSystemInteractive -eq 'Proceed' -and
+            $actionSystemNonInteractive -eq 'Proceed'
+        ) `
+        -Name "Health/ElevationSystemNeverRelaunches" `
+        -Failure "SYSTEM (заплановане завдання) має завжди Proceed незалежно від interactive-прапорця; non-elevated non-interactive має FailFast — жодна з цих гілок не відкриває UAC"
+
+    # correctness pass: явний -NonInteractive у власному command line має
+    # ПЕРЕКРИВАТИ "виглядає interactive" (UserInteractive=true) і форсити
+    # FailFast — без цього powershell.exe -NonInteractive -File
+    # BRAVO_HEALTH.ps1, запущений з інтерактивної консолі, помилково
+    # спробував би Start-Process -Verb RunAs.
+    $actionExplicitNonInteractiveOverride = & $healthElevationModule {
+        param($State, $Interactive, $ExplicitNonInteractive)
+        Get-BRAVOHealthElevationAction `
+            -ElevationState $State `
+            -IsManualInteractiveSession $Interactive `
+            -IsExplicitNonInteractive $ExplicitNonInteractive
+    } 'Standard' $true $true
+    $actionExplicitNonInteractiveRunAsCount = 0
+    if ($actionExplicitNonInteractiveOverride -eq 'Relaunch') { $actionExplicitNonInteractiveRunAsCount = 1 }
+    Test-BRAVOCondition `
+        -Condition (
+            $actionExplicitNonInteractiveOverride -eq 'FailFast' -and
+            $actionExplicitNonInteractiveRunAsCount -eq 0
+        ) `
+        -Name "Health/ExplicitNonInteractiveFailsFast" `
+        -Failure "Standard + IsManualInteractiveSession=true + IsExplicitNonInteractive=true має все одно давати FailFast (не Relaunch) — жодного Start-Process -Verb RunAs для явного -NonInteractive"
+
+    # Лише код, без коментарів (два коментарі вище в цьому ж файлі згадують
+    # "-Verb RunAs" у прозі) — інакше підрахунок входжень враховував би їх.
+    $healthElevationCodeOnlyText = (
+        (
+            $healthEntrypointScriptTextForElevation -split "`r?`n" |
+                Where-Object { $_ -notmatch '^\s*#' }
+        ) -join "`n"
+    )
+    $healthElevationRunAsOccurrences = @(
+        [regex]::Matches($healthElevationCodeOnlyText, [regex]::Escape('-Verb RunAs'))
+    ).Count
+    Test-BRAVOCondition `
+        -Condition (
+            $healthElevationRunAsOccurrences -eq 1 -and
+            $healthElevationCodeOnlyText.IndexOf("if (`$healthElevationState -eq 'Standard') {") -lt
+                $healthElevationCodeOnlyText.IndexOf('-Verb RunAs')
+        ) `
+        -Name "Health/RunAsOnlyReachableFromStandardBranch" `
+        -Failure "Start-Process -Verb RunAs має бути рівно один виклик у коді, і він має бути всередині гілки ElevationState -eq 'Standard' — SYSTEM/Administrator ніколи туди не заходять"
+
+    # correctness pass, 2nd iteration: -NonInteractive detection більше НЕ
+    # залежить від CIM/WMI/Win32_Process узагалі — лише вбудований .NET
+    # [Environment]::GetCommandLineArgs(). Перша ітерація йшла через
+    # Get-BRAVOWmiInstance -ClassName Win32_Process; видалено разом з
+    # Import-Module BRAVO.Compatibility (тут більше не потрібен).
+    Test-BRAVOCondition `
+        -Condition (
+            -not $healthElevationCodeOnlyText.Contains('Win32_Process') -and
+            -not $healthElevationCodeOnlyText.Contains('Get-BRAVOWmiInstance') -and
+            -not $healthElevationCodeOnlyText.Contains('Get-CimInstance') -and
+            -not $healthElevationCodeOnlyText.Contains('Get-WmiObject') -and
+            -not $healthElevationCodeOnlyText.Contains("Import-Module -Name (Join-Path `$PSScriptRoot 'modules\BRAVO.Compatibility") -and
+            $healthElevationCodeOnlyText.Contains('[Environment]::GetCommandLineArgs()')
+        ) `
+        -Name "Health/NonInteractiveDetectionHasNoWmiDependency" `
+        -Failure "-NonInteractive detection не повинен залежати від CIM/WMI/Win32_Process чи імпортувати BRAVO.Compatibility — лише [Environment]::GetCommandLineArgs()"
+
+    # D: детерміноване перенесення параметрів (ConfigPath/NoPause/
+    # NotifyOnSuccess/SkipIfBackupTaskRunning) + невказані параметри не
+    # з'являються в дочірньому виклику.
+    $boundAllParameters = @{
+        ConfigPath = 'D:\BRAVO\BRAVO.config'
+        NoPause = [System.Management.Automation.SwitchParameter]::Present
+        NotifyOnSuccess = [System.Management.Automation.SwitchParameter]::Present
+        SkipIfBackupTaskRunning = [System.Management.Automation.SwitchParameter]::Present
+        ForceNotification = [System.Management.Automation.SwitchParameter]$false
+        NoSlack = [System.Management.Automation.SwitchParameter]$false
+    }
+    $relaunchArgsAll = & $healthElevationModule {
+        param($ScriptPath, $Bound, $ResolvedConfig)
+        New-BRAVOHealthRelaunchArgumentList -ScriptPath $ScriptPath -BoundParameters $Bound -ResolvedConfigPath $ResolvedConfig
+    } 'D:\BRAVO\BRAVO_HEALTH.ps1' $boundAllParameters 'D:\BRAVO\BRAVO.config'
+    Test-BRAVOCondition `
+        -Condition (
+            ($relaunchArgsAll -join ' ').Contains('-ConfigPath "D:\BRAVO\BRAVO.config"') -and
+            $relaunchArgsAll -contains '-NoPause' -and
+            $relaunchArgsAll -contains '-NotifyOnSuccess' -and
+            $relaunchArgsAll -contains '-SkipIfBackupTaskRunning' -and
+            $relaunchArgsAll -notcontains '-ForceNotification' -and
+            $relaunchArgsAll -notcontains '-NoSlack'
+        ) `
+        -Name "Health/RelaunchPropagatesBoundParametersOnly" `
+        -Failure "New-BRAVOHealthRelaunchArgumentList має переносити ConfigPath/NoPause/NotifyOnSuccess/SkipIfBackupTaskRunning, коли вони задані, і НЕ додавати switch-параметри, задані як `$false, або взагалі не вказані"
+
+    $relaunchArgsNoSwitches = & $healthElevationModule {
+        param($ScriptPath, $Bound, $ResolvedConfig)
+        New-BRAVOHealthRelaunchArgumentList -ScriptPath $ScriptPath -BoundParameters $Bound -ResolvedConfigPath $ResolvedConfig
+    } 'D:\BRAVO\BRAVO_HEALTH.ps1' @{} 'D:\BRAVO\BRAVO.config'
+    Test-BRAVOCondition `
+        -Condition (
+            $relaunchArgsNoSwitches -notcontains '-NoPause' -and
+            $relaunchArgsNoSwitches -notcontains '-NotifyOnSuccess' -and
+            $relaunchArgsNoSwitches -notcontains '-SkipIfBackupTaskRunning' -and
+            $relaunchArgsNoSwitches -notcontains '-ForceNotification' -and
+            $relaunchArgsNoSwitches -notcontains '-NoSlack'
+        ) `
+        -Name "Health/RelaunchOmitsUnboundNoPause" `
+        -Failure "звичайний ручний запуск без жодного switch (типовий подвійний клік) не повинен додавати -NoPause в дочірній виклик — elevated console має чекати на клавішу так само, як не-elevated"
+
+    # E: ConfigPath із пробілами не має розпастись на кілька argv.
+    # Start-Process -ArgumentList (string[]) НЕ квотує пробіли сам —
+    # перевірено емпірично; New-BRAVOHealthRelaunchArgumentList зобов'язаний
+    # обгортати значення в лапки явно.
+    $spacedConfigPath = 'C:\Program Files\BRAVO Test\BRAVO.config'
+    $relaunchArgsSpaced = & $healthElevationModule {
+        param($ScriptPath, $Bound, $ResolvedConfig)
+        New-BRAVOHealthRelaunchArgumentList -ScriptPath $ScriptPath -BoundParameters $Bound -ResolvedConfigPath $ResolvedConfig
+    } 'D:\BRAVO\BRAVO_HEALTH.ps1' @{} $spacedConfigPath
+    $spacedConfigArgIndex = [array]::IndexOf($relaunchArgsSpaced, '-ConfigPath')
+    Test-BRAVOCondition `
+        -Condition (
+            $spacedConfigArgIndex -ge 0 -and
+            $relaunchArgsSpaced.Count -gt ($spacedConfigArgIndex + 1) -and
+            $relaunchArgsSpaced[$spacedConfigArgIndex + 1] -eq ('"' + $spacedConfigPath + '"')
+        ) `
+        -Name "Health/RelaunchQuotesPathsWithSpaces" `
+        -Failure "-ConfigPath зі пробілами має передаватися одним argv у лапках, а не розпадатися на кілька елементів Start-Process -ArgumentList"
+
+    # UAC Cancel: Win32Exception(1223) = ERROR_CANCELLED, інколи загорнутий.
+    $uacCancelledDetected = & $healthElevationModule {
+        try {
+            throw (New-Object System.InvalidOperationException(
+                "wrap", (New-Object System.ComponentModel.Win32Exception(1223))))
+        } catch {
+            Test-BRAVOHealthElevationCancelled -ErrorRecord $_
+        }
+    }
+    $uacOtherErrorDetected = & $healthElevationModule {
+        try {
+            throw (New-Object System.InvalidOperationException("не пов'язана помилка"))
+        } catch {
+            Test-BRAVOHealthElevationCancelled -ErrorRecord $_
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($uacCancelledDetected -eq $true -and $uacOtherErrorDetected -eq $false) `
+        -Name "Health/ElevationCancelledIsDetectedSpecifically" `
+        -Failure "Test-BRAVOHealthElevationCancelled має розпізнавати саме Win32Exception(1223)/ERROR_CANCELLED (Cancel у UAC), а не будь-яку помилку Start-Process"
+
     $bravoConfigText = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO.config"),
         [Text.Encoding]::UTF8
     )
+
+    # Health/SelfTestDoesNotModifyAcl: регресійний guard проти повернення
+    # ACL-мутації в dev.13 test block (manual elevation + environment
+    # preflight, вище цього рядка — до відповідного маркера-початку).
+    # Розташований СВІДОМО поза межами діапазону, який сам сканує: інакше
+    # власні рядкові літерали цього ж guard-а (назви заборонених команд)
+    # збіглися б із власним пошуком. Читає ВЛАСНИЙ файл self-test із
+    # диска — той самий підхід, що вже використовується для інших файлів
+    # у цьому наборі тестів. НЕ перевіряє файл цілком: Get-Acl/
+    # AddAccessRule/FileSystemAccessRule legітимно існують в інших,
+    # непов'язаних тестах цього файлу (WinSCP temporary script
+    # permissions, Task Installer inheritance probe) — там вони або
+    # read-only (Get-Acl без Set-Acl), або працюють над копією в пам'яті
+    # без персистенції на диск.
+    $selfTestOwnSourceText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_SELF_TEST.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $dev13AclTestBlockStart = $selfTestOwnSourceText.IndexOf(
+        '# dev.13: manual elevation + environment preflight'
+    )
+    $dev13AclTestBlockEnd = $selfTestOwnSourceText.IndexOf(
+        '$bravoConfigText = [IO.File]::ReadAllText(', $dev13AclTestBlockStart
+    )
+    $dev13AclTestBlockText = if ($dev13AclTestBlockStart -ge 0 -and $dev13AclTestBlockEnd -gt $dev13AclTestBlockStart) {
+        $selfTestOwnSourceText.Substring(
+            $dev13AclTestBlockStart, $dev13AclTestBlockEnd - $dev13AclTestBlockStart
+        )
+    } else {
+        # Порожній рядок замість $false: якщо маркери зникли/перейменувались,
+        # .Contains() нижче на порожньому рядку не пройде хибно-позитивно —
+        # -Condition оцінить це як "guard не знайшов свій блок" і впаде.
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrEmpty($dev13AclTestBlockText) -and
+            -not $dev13AclTestBlockText.Contains('Set-Acl') -and
+            -not $dev13AclTestBlockText.Contains('AddAccessRule') -and
+            -not $dev13AclTestBlockText.Contains('RemoveAccessRule') -and
+            -not $dev13AclTestBlockText.Contains('FileSystemAccessRule')
+        ) `
+        -Name "Health/SelfTestDoesNotModifyAcl" `
+        -Failure "dev.13 test block (manual elevation + environment preflight) у BRAVO_SELF_TEST.ps1 не повинен містити Set-Acl/AddAccessRule/RemoveAccessRule/FileSystemAccessRule — класифікація тестується чистими функціями/синтетичними винятками, не ACL-мутацією"
+
     $bravoExchSelectionStart = $bravoConfigText.IndexOf('$global:bravoExchSourceCandidates')
     $bravoExchSelectionEnd = $bravoConfigText.IndexOf('$bravoExchArchiveSource', $bravoExchSelectionStart)
     $bravoExchSelectionText = if (
@@ -6152,8 +6734,13 @@ try {
     # підвищення має бути закрите перевіркою на SYSTEM. SYSTEM уже має
     # потрібний контекст, а Start-Process -Verb RunAs там повертає
     # 0x80070001 — тобто заплановане завдання просто вмирає без сліду.
-    # Runtime, який не елевейтиться взагалі (Health), задовольняє інваріант
-    # за побудовою.
+    # $healthScriptText тут — саме BRAVO.Health.Runtime.ps1 (як і два інші),
+    # і воно й далі не елевейтиться — задовольняє інваріант за побудовою.
+    # dev.13: сам entrypoint BRAVO_HEALTH.ps1 (інший файл, тонкий wrapper,
+    # тут НЕ сканується) тепер елевейтиться самостійно — той самий інваріант
+    # (SYSTEM/-Verb RunAs) для НЬОГО перевіряють окремі тести нижче:
+    # Health/RunAsOnlyReachableFromStandardBranch і
+    # Health/ElevationSystemNeverRelaunches.
     $interactiveFailures = @(
         $scheduledEntrypoints | Where-Object {
             ($_.Text -match '-Verb\s+RunAs') -and -not (

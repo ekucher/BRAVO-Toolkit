@@ -29,6 +29,8 @@ $script:BRAVOExitCodeNames = @{
     33 = "RuntimeIntegrityViolation"
     34 = "SecuritySettingsWeakened"
     35 = "VersionDowngradeBlocked"
+    36 = "PrivilegeRequired"
+    37 = "EnvironmentUnavailable"
     40 = "LocalArchiveFailed"
     41 = "IntegrityTestFailed"
     42 = "HashValidationFailed"
@@ -49,6 +51,8 @@ function Resolve-BRAVOExitCode {
         [switch]$RuntimeIntegrityViolation,
         [switch]$SecuritySettingsWeakened,
         [switch]$VersionDowngradeBlocked,
+        [switch]$PrivilegeRequired,
+        [switch]$EnvironmentUnavailable,
         [switch]$LocalArchiveFailed,
         [switch]$IntegrityTestFailed,
         [switch]$HashValidationFailed,
@@ -85,6 +89,17 @@ function Resolve-BRAVOExitCode {
     if ($LockBusy) { return 20 }
     if ($InvalidConfiguration) { return 30 }
     if ($CredentialsUnavailable) { return 31 }
+    # Той самий клас, що LockBusy/InvalidConfiguration/CredentialsUnavailable:
+    # причина, чому перевірки взагалі не змогли початися (немає OS-права
+    # писати в runtime LOGS/TEMP), а не результат самих перевірок. Тому
+    # HealthCritical (70) для цього не підходить: реальні health-checks
+    # (служби/локальні копії/SFTP/SMB) при цій відмові НЕ виконувались.
+    if ($PrivilegeRequired) { return 36 }
+    # Той самий prerequisite-клас, що PrivilegeRequired, але для відмов,
+    # які НЕ є UnauthorizedAccessException (диск повний, PathTooLong,
+    # пошкоджена файлова система тощо) — "запустіть адміністратором" тут
+    # буде хибною порадою, тому окремий код замість перевикористання 36.
+    if ($EnvironmentUnavailable) { return 37 }
     if ($LocalArchiveFailed) { return 40 }
     if ($IntegrityTestFailed) { return 41 }
     if ($HashValidationFailed) { return 42 }

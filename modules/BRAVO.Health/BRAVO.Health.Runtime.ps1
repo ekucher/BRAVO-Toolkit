@@ -141,6 +141,19 @@ function Complete-BRAVOHealthResult {
         'Disabled'           { 0 }
         'Deferred'           { Resolve-BRAVOExitCode -LockBusy }
         'ConfigurationError' { Resolve-BRAVOExitCode -InvalidConfiguration }
+        # dev.13: локальна AccessDenied (чи інша I/O-відмова) на LOGS/TEMP —
+        # реальні health-checks (служби/локальні копії/SFTP/SMB) не
+        # виконувались, тому це не HealthCritical (70), а окремий
+        # prerequisite-код. IsPrivilegeFailure розрізняє "потрібні права
+        # адміністратора" (36) від "диск повний / шлях зіпсований / інша
+        # I/O-причина" (37) — друге не варто радити "запустити адміністратором".
+        'EnvironmentError'   {
+            if ([bool]$Result.IsPrivilegeFailure) {
+                Resolve-BRAVOExitCode -PrivilegeRequired
+            } else {
+                Resolve-BRAVOExitCode -EnvironmentUnavailable
+            }
+        }
         'Critical'           { Resolve-BRAVOExitCode -HealthCritical }
         'NotificationError'  { Resolve-BRAVOExitCode -HealthCritical }
         default              { Resolve-BRAVOExitCode -HealthCritical }
@@ -409,6 +422,12 @@ $script:BRAVOWarningCount = 0
 # його ще до першого присвоєння, а Set-StrictMode (успадкований від
 # конфігураційного завантажувача) робить читання неоголошеної змінної помилкою.
 $script:bravoHealthTemporaryRoot = $null
+# dev.13: fail-safe запис логу. Write-HealthLog викликається десятки разів
+# за один прогін — без цього прапорця AccessDenied на здоровому (LOGS
+# просто недоступний) запуску друкував ту саму помилку в консоль щоразу.
+# $true, доки перша спроба запису не провалиться; після цього Write-HealthLog
+# більше не намагається писати у файл (і не друкує ту саму помилку знову).
+$script:BRAVOHealthLogWritable = $true
 try {
     if ($null -eq $credentialSettings -or $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
         throw 'вбудований Credential Manager недоступний'
@@ -662,16 +681,24 @@ function Write-HealthLog {
             -Level (Get-BRAVOHealthNormalizedLevel -Level $Level)
     }
 
+    if (-not $script:BRAVOHealthLogWritable) {
+        # Перша спроба вже провалилась цього прогону — не повторюємо той
+        # самий New-Item/Out-File на той самий недоступний файл на кожен
+        # виклик (їх десятки) і не друкуємо ту саму помилку знову.
+        return
+    }
+
     try {
         if (-not (Test-Path -Path $logPath -PathType Container)) {
             New-Item -ItemType Directory -Path $logPath -Force | Out-Null
         }
         $entry | Out-File -FilePath $healthLogFile -Append -Encoding $logFileEncoding
     } catch {
+        $script:BRAVOHealthLogWritable = $false
         # Не через Write-HealthLog: журнал саме зараз недоступний, тому
         # рекурсія лише поглибила б проблему.
         Write-BRAVOConsoleMessage `
-            -Message "Не вдалося записати health-check лог: $($_.Exception.Message)" `
+            -Message "Не вдалося записати health-check лог ($healthLogFile): $($_.Exception.Message). Подальші записи в цей файл у цьому запуску пропускаються." `
             -Level 'WARNING'
     }
 }
@@ -1308,6 +1335,11 @@ function Get-BRAVOHealthTemporaryRoot {
     }
 
     $creationErrors = @()
+    # correctness pass: якщо ВСІ кандидати провалюються, викликач (preflight)
+    # повинен мати змогу класифікувати ПЕРВИННУ причину (privilege чи ні) —
+    # первинний кандидат <RuntimeRoot>\TEMP відповідає реальному сценарію
+    # дефекту (D:\BRAVO\TEMP). Перший captured exception, не останній.
+    $firstCreationException = $null
     foreach ($candidateRoot in @($candidateRoots | Select-Object -Unique)) {
         if (-not (Test-BRAVOAsciiPath -Path $candidateRoot)) {
             continue
@@ -1330,6 +1362,9 @@ function Get-BRAVOHealthTemporaryRoot {
             }
         } catch {
             $creationErrors += "$candidateRoot`: $($_.Exception.Message)"
+            if ($null -eq $firstCreationException) {
+                $firstCreationException = $_.Exception
+            }
         }
     }
 
@@ -1338,10 +1373,19 @@ function Get-BRAVOHealthTemporaryRoot {
     } else {
         ""
     }
-    throw (
+    $aggregateMessage = (
         "не знайдено доступного ASCII-каталогу для тимчасових файлів " +
         "WinSCP$details"
     )
+    # Типізований виняток (наприклад UnauthorizedAccessException створення
+    # <RuntimeRoot>\TEMP) зберігається як InnerException — інакше
+    # Test-BRAVOHealthIsPrivilegeException (яка йде саме по InnerException
+    # chain) на виклику ззовні не мала б звідки його прочитати.
+    if ($null -ne $firstCreationException) {
+        throw (New-Object System.Management.Automation.RuntimeException(
+            $aggregateMessage, $firstCreationException))
+    }
+    throw $aggregateMessage
 }
 
 function Remove-BRAVOHealthTemporaryDirectory {
@@ -1385,6 +1429,81 @@ function Remove-BRAVOHealthTemporaryDirectory {
     } catch {
         Write-HealthLog "Не вдалося очистити тимчасовий каталог health-check: $($_.Exception.Message)" -Level "WARNING"
     }
+}
+
+# correctness pass: не кожна помилка запису означає "потрібні права
+# адміністратора" — диск може бути повний, шлях зіпсований, файлова
+# система пошкоджена. UnauthorizedAccessException (і лише воно, у всьому
+# ланцюжку InnerException — той самий підхід, що Test-BRAVOHealthElevationCancelled
+# у BRAVO_HEALTH.ps1 для Win32Exception 1223) — єдина категорія, яку чесно
+# можна назвати "недостатньо прав".
+function Test-BRAVOHealthIsPrivilegeException {
+    param($Exception)
+
+    $currentException = $Exception
+    while ($null -ne $currentException) {
+        if ($currentException -is [System.UnauthorizedAccessException]) {
+            return $true
+        }
+        $currentException = $currentException.InnerException
+    }
+    return $false
+}
+
+# dev.13: ручний non-elevated запуск міг ЛИСТИНГУВАТИ D:\BRAVO\LOGS/TEMP
+# (каталог уже існує — його створив SYSTEM), але не мати права запису в
+# нього. Get-BRAVOHealthTemporaryRoot вище лише створює каталог, якщо його
+# немає — якщо він уже існує, write-доступ ніколи не перевіряється, і
+# AccessDenied спливає лише глибоко всередині SFTP-етапу (New-Item під lcd
+# WinSCP), де стає фальшивою "SFTP недоступний". Ця функція перевіряє
+# WRITE, а не лише EXISTS: створює унікальний probe-файл і одразу прибирає
+# його в finally.
+function Test-BRAVOHealthRuntimePathWritable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $probeName = "BRAVO_HEALTH_PREFLIGHT_{0}.tmp" -f ([guid]::NewGuid().ToString("N"))
+    $probePath = $null
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        $probePath = Join-Path $Path $probeName
+        [System.IO.File]::WriteAllText($probePath, [string]([guid]::NewGuid()))
+        return [pscustomobject]@{ IsWritable = $true; ErrorMessage = $null; IsPrivilegeFailure = $false }
+    } catch {
+        return [pscustomobject]@{
+            IsWritable = $false
+            ErrorMessage = $_.Exception.Message
+            IsPrivilegeFailure = (Test-BRAVOHealthIsPrivilegeException -Exception $_.Exception)
+        }
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace($probePath)) {
+            Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Обидва шляхи, від яких залежить сам Health (не бізнес-логіка backup) —
+# лог і тимчасовий каталог WinSCP — перевіряються ДО будь-якого реального
+# health-check (служби/локальні копії/SFTP/SMB), а не під час SFTP-етапу.
+function Test-BRAVOHealthEnvironmentPreflight {
+    param(
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot
+    )
+
+    foreach ($candidatePath in @($LogPath, $TemporaryRoot)) {
+        $probeResult = Test-BRAVOHealthRuntimePathWritable -Path $candidatePath
+        if (-not $probeResult.IsWritable) {
+            return [pscustomobject]@{
+                IsWritable = $false
+                FailedPath = $candidatePath
+                ErrorMessage = $probeResult.ErrorMessage
+                IsPrivilegeFailure = $probeResult.IsPrivilegeFailure
+            }
+        }
+    }
+    return [pscustomobject]@{ IsWritable = $true; FailedPath = $null; ErrorMessage = $null; IsPrivilegeFailure = $false }
 }
 
 function ConvertTo-WinSCPScriptArgument {
@@ -4266,10 +4385,135 @@ if ($null -ne $script:BRAVOToolManifest -and -not $script:BRAVOToolManifest.IsVa
     $environmentStepStatus = 'WARNING'
     $environmentStepDetails = "підтримка ОС: $($script:BRAVOOSSupportTier.Tier)"
 }
+
+# dev.13: write-probe у LOGS і TEMP, ДО будь-якого реального health-check
+# (служби/локальні копії/SFTP/SMB). Раніше локальна AccessDenied (ручний
+# запуск без elevation) спливала лише глибоко всередині SFTP-етапу й
+# помилково ставала "SFTP недоступний" — сюди вона не доходить взагалі:
+# при провалі преflight нижче SFTP-перевірка не викликається.
+$environmentPreflight = try {
+    Test-BRAVOHealthEnvironmentPreflight -LogPath $logPath -TemporaryRoot (Get-BRAVOHealthTemporaryRoot)
+} catch {
+    # Get-BRAVOHealthTemporaryRoot сама кидає виняток, якщо жоден кандидат
+    # TEMP не створюється — типізований виняток первинного кандидата
+    # (<RuntimeRoot>\TEMP) зберігається як InnerException саме для цього:
+    # Test-BRAVOHealthIsPrivilegeException іде по InnerException chain так
+    # само, як для прямого провалу Test-BRAVOHealthRuntimePathWritable.
+    [pscustomobject]@{
+        IsWritable = $false
+        FailedPath = 'TEMP'
+        ErrorMessage = $_.Exception.Message
+        IsPrivilegeFailure = (Test-BRAVOHealthIsPrivilegeException -Exception $_.Exception)
+    }
+}
+if (-not $environmentPreflight.IsWritable) {
+    $environmentStepStatus = 'ERROR'
+    $environmentStepDetails = if ($environmentPreflight.IsPrivilegeFailure) {
+        "недостатньо прав запису: $($environmentPreflight.FailedPath)"
+    } else {
+        "не вдалося використати $($environmentPreflight.FailedPath)"
+    }
+}
+
 Write-BRAVOHealthStep `
     -Name 'Середовище й цілісність інструментів' `
     -Status $environmentStepStatus `
     -Details $environmentStepDetails
+
+if (-not $environmentPreflight.IsWritable) {
+    if ($environmentPreflight.IsPrivilegeFailure) {
+        Write-HealthLog (
+            "Недостатньо прав для виконання BRAVO HEALTH: недоступний шлях " +
+            "$($environmentPreflight.FailedPath) ($($environmentPreflight.ErrorMessage)). " +
+            "Для ручного запуску потрібні права адміністратора. SFTP-перевірка не виконувалась."
+        ) -Level "ERROR"
+    } else {
+        Write-HealthLog (
+            "Не вдалося використовувати runtime TEMP/LOGS: " +
+            "$($environmentPreflight.FailedPath) ($($environmentPreflight.ErrorMessage)). " +
+            "SFTP-перевірка не виконувалась."
+        ) -Level "ERROR"
+    }
+
+    # Чесне сповіщення: НЕ "SFTP недоступний" (SFTP-перевірка фактично не
+    # запускалась), а конкретно "середовище виконання" — і текст різний
+    # для privilege/generic, щоб не радити "запустіть адміністратором",
+    # коли причина не в правах. Той самий канал і той самий
+    # NotificationMode/NoSlack-контракт, що й для Critical нижче — нової
+    # notification taxonomy не додається.
+    $environmentNotificationStatus = "NotRequired"
+    if ((-not $NoSlack) -and ($NotificationMode -ne "none")) {
+        $environmentVersionText = [string]$global:ScriptVersion
+        $environmentBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$global:ScriptBuildId)) {
+            "невідома"
+        } else {
+            [string]$global:ScriptBuildId
+        }
+        $environmentActionText = if ($environmentPreflight.IsPrivilegeFailure) {
+            "запустити BRAVO HEALTH з правами адміністратора"
+        } else {
+            "перевірити доступність runtime TEMP/LOGS (диск, шлях, файлова система)"
+        }
+        $environmentReasonLines = if ($environmentPreflight.IsPrivilegeFailure) {
+            @(":x: Середовище виконання — недостатньо прав")
+        } else {
+            @(":x: Середовище виконання — недоступний TEMP/LOGS")
+        }
+        $environmentResultLines = if ($environmentPreflight.IsPrivilegeFailure) {
+            @(
+                "Недоступний шлях: $($environmentPreflight.FailedPath)",
+                "SFTP-перевірка не виконувалась."
+            )
+        } else {
+            @(
+                "Не вдалося використати: $($environmentPreflight.FailedPath)",
+                "Причина: $($environmentPreflight.ErrorMessage)",
+                "SFTP-перевірка не виконувалась."
+            )
+        }
+        # Minor 1: якщо сам health-check лог не вдалося створити/писати
+        # (той самий провал міг зачепити LOGS), не заявляти в сповіщенні
+        # журнал, якого фактично немає.
+        $environmentNotificationParameters = @{
+            Severity = "CRITICAL"
+            Operation = "BRAVO HEALTH — ПОТРІБНА ДІЯ"
+            ActionText = $environmentActionText
+            ReasonLines = $environmentReasonLines
+            InstitutionName = [string]$backupMonitoring.InstitutionName
+            InstitutionCode = [string]$backupMonitoring.InstitutionCode
+            HostInformation = (Get-HostInformation)
+            ResultLines = $environmentResultLines
+            Timestamp = $healthCheckStarted
+            ProductName = "BRAVO Archive"
+            Version = $environmentVersionText
+            BuildId = $environmentBuildIdText
+        }
+        if ($script:BRAVOHealthLogWritable) {
+            $environmentNotificationParameters.LogPath = $healthLogFile
+        }
+        $environmentMessage = New-BRAVOOperatorNotificationMessage @environmentNotificationParameters
+        try {
+            Send-SlackAlert -Message $environmentMessage
+            $environmentNotificationStatus = "Sent"
+            Write-HealthLog "Сповіщення про недоступність середовища відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
+        } catch {
+            $environmentNotificationStatus = "Failed"
+            Write-HealthLog "Не вдалося відправити сповіщення про недоступність середовища у ${NotificationProviderDisplayName}: $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+
+    return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
+        Status = "EnvironmentError"
+        IssueCount = 0
+        Notification = $environmentNotificationStatus
+        # Minor 1: те саме — консольний підсумок (Write-BRAVOResultFooter)
+        # не повинен показувати "Детальний журнал: ..." для файлу, який
+        # фактично не був записаний.
+        LogPath = $(if ($script:BRAVOHealthLogWritable) { $healthLogFile } else { $null })
+        FailedPath = $environmentPreflight.FailedPath
+        IsPrivilegeFailure = $environmentPreflight.IsPrivilegeFailure
+    })
+}
 
 Write-BRAVOProgressPhase -Phase 'Керовані служби' -PercentComplete 15
 $serviceHealthIssues = @(Get-ManagedServiceHealthIssues)

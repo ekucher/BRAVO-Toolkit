@@ -1,5 +1,69 @@
 # Changelog
 
+## 5.0.0-dev.13 — 2026-08-09
+
+Minimal reliability fix on top of the dev.12 UX fixes: manual `BRAVO_HEALTH.ps1`
+runs without administrator rights no longer misreport a local permission
+failure as an SFTP outage.
+
+- `BRAVO_HEALTH.ps1` now detects elevation state (Administrator/SYSTEM/
+  Standard) before doing any work. A manual interactive run without
+  elevation self-relaunches through `Start-Process -Verb RunAs` (UAC),
+  propagating the real `$PSBoundParameters` (ConfigPath, NoPause,
+  NotifyOnSuccess, NoSlack, ForceNotification, SkipIfBackupTaskRunning) as a
+  deterministically built, correctly quoted argument list, then exits with
+  the elevated child's exit code. SYSTEM (scheduled task) and an
+  already-elevated console are unaffected — no relaunch, no UAC, same
+  behavior as dev.12. A cancelled UAC prompt prints a clear message instead
+  of a raw stack trace.
+- Non-interactive detection no longer relies solely on
+  `[Environment]::UserInteractive`/`[Console]::IsInputRedirected` (neither
+  actually proves PowerShell received `-NonInteractive`). The entrypoint now
+  additionally reads its own process argv via the built-in .NET Framework
+  API `[Environment]::GetCommandLineArgs()` — already parsed, Windows
+  PowerShell 5.1-compatible, and, importantly, has no CIM/WMI dependency at
+  all — and does an exact (not substring/`-like`) match for a standalone
+  `-NonInteractive` element, so it does not false-match text inside
+  `-ConfigPath`'s value or a file path. An explicit `-NonInteractive`
+  overrides an otherwise-interactive-looking session and fails fast (exit
+  36) without ever attempting UAC.
+- `BRAVO.Health.Runtime.ps1` now probes write access to the runtime LOGS and
+  TEMP roots before any real health check (services/local backups/SFTP/SMB).
+  Previously a local `AccessDenied` on those paths only surfaced deep inside
+  the SFTP stage's temporary-directory creation and was misclassified as
+  `ERROR SFTP` / `SftpVerified=False`. On a preflight failure, none of the
+  real checks run, and the operator sees an honest environment/privilege
+  message (never "SFTP недоступний"), sent as a notification if configured.
+  The failure is classified: only `UnauthorizedAccessException` (anywhere in
+  the exception chain) is treated as a privilege problem; other I/O failures
+  (disk full, `PathTooLong`, a broken filesystem, ...) are reported as a
+  generic environment problem and do not tell the operator to run as
+  administrator. This holds even when the runtime TEMP directory does not
+  exist yet: the typed exception from a failed directory creation is now
+  preserved end to end (as an `InnerException`) instead of being flattened
+  to plain text before classification.
+- New exit codes in `modules\BRAVO.ExitCodes`, documented in README.md's
+  exit-code tables: `36 = PrivilegeRequired` for the privilege case above
+  (also used by the entrypoint's UAC-cancel/non-interactive-fail-fast
+  paths), and `37 = EnvironmentUnavailable` for the non-privilege
+  environment/I/O case. `70 = HealthCritical` keeps its existing meaning —
+  a real health-check failure that actually ran.
+- If the health-check log itself could not be created/written, the
+  environment notification and the console summary no longer claim a log
+  path that does not exist.
+- `Write-HealthLog` no longer floods the console with the same "не вдалося
+  записати health-check лог" warning on every one of the dozens of calls in
+  a run once the log file has become unwritable — it now warns once and
+  stops retrying the write for the rest of that run.
+- ACL of the runtime root is not weakened anywhere by this change — the fix
+  is elevation on demand, not broader write access for regular users.
+- `BRAVO_ARCHIV.ps1`/`BRAVO_MAINTENANCE.ps1` already had their own, simpler
+  SYSTEM/Administrator self-elevation (predating this change) and were not
+  touched here. Unlike the new Health gate, neither distinguishes
+  interactive from non-interactive before attempting `-Verb RunAs`, and
+  Maintenance has no dedicated handling for a cancelled UAC prompt — noted
+  as a possible follow-up, not fixed here.
+
 ## 5.0.0-dev.12 — 2026-08-09
 
 Minimal UX fix on top of the dev.11 operator notification unification.
