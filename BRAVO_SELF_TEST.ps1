@@ -6411,6 +6411,77 @@ try {
         -Name "Scheduler/InstallSummaryRecoveryUsesStartupDelay" `
         -Failure "INSTALL-summary Recovery має передавати налаштовану StartupDelayMinutes у Format-BRAVOSchedulerNextRun"
 
+    # --- SchedulerDiagnose/*: Diagnose permanent-task next-run formatting has
+    # the same Recovery-only StartupDelayMinutes contract as Installer.
+    $diagnoseNextRunModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($tasksDiagnoseTextForRuntime + "`n" + $systemSourceTextForScheduler) `
+        -FunctionNames @('Format-BRAVOSchedulerNextRun', 'Format-BRAVODiagnoseTaskNextRun')
+    $invokeDiagnoseNextRun = {
+        param($TaskType, $TaskSettings, $NextRunTime)
+        Set-StrictMode -Version Latest
+        Format-BRAVODiagnoseTaskNextRun `
+            -TaskType $TaskType `
+            -TaskSettings $TaskSettings `
+            -NextRunTime $NextRunTime
+    }
+    $diagnoseCases = @(
+        [pscustomobject]@{
+            Name = "SchedulerDiagnose/BackupDoesNotRequireStartupDelay"
+            Type = "Backup"
+            Settings = @{ DailyAt = "23:00" }
+            NextRunTime = [datetime]"2026-08-09T23:00:00"
+            Expected = "09.08.2026 23:00"
+        },
+        [pscustomobject]@{
+            Name = "SchedulerDiagnose/MaintenanceDoesNotRequireStartupDelay"
+            Type = "Maintenance"
+            Settings = @{ DailyAt = "01:00" }
+            NextRunTime = [datetime]"2026-08-10T01:00:00"
+            Expected = "10.08.2026 01:00"
+        },
+        [pscustomobject]@{
+            Name = "SchedulerDiagnose/HealthDoesNotRequireStartupDelay"
+            Type = "Health"
+            Settings = @{ StartAt = "08:00"; RepeatEveryMinutes = 60 }
+            NextRunTime = [datetime]"2026-08-09T08:00:00"
+            Expected = "09.08.2026 08:00"
+        },
+        [pscustomobject]@{
+            Name = "SchedulerDiagnose/BazaSyncDoesNotRequireStartupDelay"
+            Type = "BAZASync"
+            Settings = @{ StartAt = "08:30"; RepeatEveryHours = 2 }
+            NextRunTime = [datetime]"2026-08-09T08:30:00"
+            Expected = "09.08.2026 08:30"
+        },
+        [pscustomobject]@{
+            Name = "SchedulerDiagnose/RecoveryUsesStartupDelay"
+            Type = "Recovery"
+            Settings = @{ StartupDelayMinutes = 7 }
+            NextRunTime = [datetime]"1899-12-30T00:00:00"
+            Expected = "після наступного старту Windows; затримка 7 хв."
+        }
+    )
+    foreach ($diagnoseCase in $diagnoseCases) {
+        $diagnoseNextRunOk = $false
+        try {
+            $diagnoseNextRun = & $diagnoseNextRunModule `
+                $invokeDiagnoseNextRun `
+                $diagnoseCase.Type `
+                $diagnoseCase.Settings `
+                $diagnoseCase.NextRunTime
+            $diagnoseNextRunOk = (
+                $diagnoseNextRun -eq $diagnoseCase.Expected -and
+                ($diagnoseCase.Type -ne "Recovery" -or $diagnoseNextRun -notmatch "1899")
+            )
+        } catch {
+            $diagnoseNextRunOk = $false
+        }
+        Test-BRAVOCondition `
+            -Condition $diagnoseNextRunOk `
+            -Name $diagnoseCase.Name `
+            -Failure "Diagnose next-run formatter має не падати під Set-StrictMode і читати StartupDelayMinutes лише для Recovery"
+    }
+
     # --- Scheduler/BootTriggerNextRunNo1899: Recovery ніколи не показує 30.12.1899 ---
     $recoveryNext = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 0
     $recoveryNextDelay = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 5

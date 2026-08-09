@@ -60,6 +60,25 @@ function Get-BRAVOTaskResultDescription {
     }
 }
 
+function Format-BRAVODiagnoseTaskNextRun {
+    param(
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync")]
+        [string]$TaskType,
+        $TaskSettings,
+        $NextRunTime
+    )
+
+    $nextRunArguments = @{
+        TaskType = $TaskType
+        NextRunTime = $NextRunTime
+    }
+    if ($TaskType -eq "Recovery") {
+        $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
+    }
+
+    return Format-BRAVOSchedulerNextRun @nextRunArguments
+}
+
 function Set-BRAVOPrivateDirectoryAcl {
     param([string]$Path)
 
@@ -372,10 +391,10 @@ try {
         # Recovery — boot-тригер: NextRunTime повертає sentinel 30.12.1899.
         # LastRunTime для завдання, що ще не запускалося, — так само sentinel.
         $nextRunRaw = try { $registeredTask.NextRunTime } catch { $null }
-        $nextRunText = Format-BRAVOSchedulerNextRun `
+        $nextRunText = Format-BRAVODiagnoseTaskNextRun `
             -TaskType $taskType `
-            -NextRunTime $nextRunRaw `
-            -StartupDelayMinutes ([int]$settings.StartupDelayMinutes)
+            -TaskSettings $settings `
+            -NextRunTime $nextRunRaw
         $lastRunRaw = try { $registeredTask.LastRunTime } catch { $null }
         $lastRunText = if ($lastRunRaw -is [datetime] -and $lastRunRaw.Year -gt 1900) {
             $lastRunRaw.ToString('dd.MM.yyyy HH:mm')
