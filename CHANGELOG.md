@@ -1,5 +1,39 @@
 # Changelog
 
+## 5.0.0-dev.17 — 2026-08-10
+
+Minimal correctness fix on top of dev.16, from a real DEV-LIMS
+acceptance run (generation `20260810_185725`, backup ~18:57 local
+server time). Health confirmed all components and SFTP `OK` for that
+generation — but the Discord success notification showed `🕒 Остання
+резервна копія: 10.08.2026 15:57` next to a correct `⏳ Вік копії: 5
+хв.`. Generation selection, backup-age calculation, and UTC
+normalization were all correct; only the human-readable absolute
+timestamp was wrong — it rendered the internally normalized UTC value
+(`15:57`) as if it were the server's local time (`18:57`).
+
+- `Get-BRAVOHealthLatestBackupSummary` (`BRAVO.Health.Runtime.ps1`):
+  `TimestampText` now converts the UTC timestamp to local time
+  (`.ToLocalTime()`) immediately before formatting — the internal
+  model, `AgeText` (still `Format-BackupAge`/`Get-BRAVOUtcAge` on the
+  raw UTC value), and generation selection are all unchanged. This is
+  the single point both the success (`Остання резервна копія`) and
+  problem (`Остання успішна резервна копія`) notification builders
+  read `TimestampText` from, so both are fixed by the one change — no
+  duplicated timezone-conversion logic.
+- Manifest `createdAt`/`startedAt` semantics, `ConvertTo-BRAVOUtcDateTime`,
+  backup generation selection, `MaxBackupAgeHours`, retention, MANIFESTS
+  lifecycle, archive format, VSS, SFTP/SMB, BAZA synchronization, Health
+  PASS/WARN/FAIL logic, notification routing/mode, and exit codes are
+  all unchanged.
+- Tests: `Health/LatestBackupTimestampRendersLocalTime` (functional —
+  reproduces the exact DEV-LIMS numbers via `[datetime]::SpecifyKind`,
+  timezone-independent, no hardcoded UTC+3),
+  `Health/BackupAgeStillUsesUtcSemantics` (confirms `AgeText` is
+  unaffected), `Health/SuccessAndProblemNotificationsReuseLatestBackupTimestamp`
+  (confirms both notification builders share the one conversion point).
+  Full suite: 679/679.
+
 ## 5.0.0-dev.16 — 2026-08-10
 
 Minimal PowerShell 5.1 / `Set-StrictMode` reliability fix on top of the

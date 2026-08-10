@@ -3739,10 +3739,23 @@ function Get-BRAVOHealthLatestBackupSummary {
                 Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":package:" -Name $_.Type -Detail $sizeText
             }
     )
+    # dev.17: $latestTimestamp — це $generation.CreatedAtUtc (нормалізовано
+    # через ConvertTo-BRAVOUtcDateTime, Kind=Utc). Age (AgeText нижче)
+    # правильно рахується у UTC-арифметиці й лишається незмінним. Але
+    # human-facing TimestampText раніше форматував це саме UTC-значення
+    # напряму — оператор бачив UTC замість локального часу сервера
+    # (реальний DEV-LIMS acceptance: generation 18:57 local показувалась
+    # як 15:57). Конвертація в локальний час сервера — єдина зміна:
+    # внутрішня модель лишається UTC, сама конвертація відбувається лише
+    # тут, у presentation layer, в ОДНІЙ спільній точці для обох
+    # notification-повідомлень
+    # ("Остання резервна копія"/"Остання успішна резервна копія" — обидва
+    # читають TimestampText із цього самого summary).
+    $localTimestamp = $latestTimestamp.ToLocalTime()
     return [pscustomobject]@{
         Found = $true
         Timestamp = $latestTimestamp
-        TimestampText = $latestTimestamp.ToString("dd.MM.yyyy HH:mm")
+        TimestampText = $localTimestamp.ToString("dd.MM.yyyy HH:mm")
         AgeText = Format-BackupAge -LastWriteTime $latestTimestamp -NowUtc $healthCheckStartedUtc
         ComponentLines = $componentLines
     }

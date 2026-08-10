@@ -11171,6 +11171,103 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name 'Health/EmbeddedModeDoesNotRenderNestedPlanOrSummary' `
         -Failure 'SuppressHeader має приглушувати і План перевірок, і стандалон-підсумок (Write-BRAVOResultHeader); $script:BRAVOHealthSftpStepEnabled — той самий сигнал для обох (нового split-гейту й старого summary-footer)'
+
+    #####################################################################
+    # dev.17: реальний DEV-LIMS acceptance (generation 20260810_185725) —
+    # Get-BRAVOHealthLatestBackupSummary.TimestampText показував UTC як
+    # локальний час (15:57 замість фактичних 18:57), хоча AgeText (той
+    # самий summary, той самий $healthCheckStartedUtc) рахувався правильно.
+    # Фікс — presentation-only .ToLocalTime() в ОДНІЙ точці перед
+    # ToString(); внутрішня UTC-модель, вік і generation selection
+    # незмінні.
+    #####################################################################
+    $latestBackupSummaryModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($healthScriptText + [Environment]::NewLine + $notificationScriptText) `
+        -FunctionNames @(
+            'Get-BRAVOHealthLatestBackupSummary',
+            'Format-BackupAge',
+            'Get-BRAVOUtcAge',
+            'ConvertTo-BRAVOUtcDateTime',
+            'Format-FileSize',
+            'Format-BRAVOOperatorStatusLine'
+        )
+    $latestBackupSummaryProbe = & $latestBackupSummaryModule {
+        # Ті самі числа, що реальний DEV-LIMS acceptance: generation
+        # 20260810_185725, backup 18:57 local (== 15:57 UTC на UTC+3
+        # сервері), Health-перевірка о 19:02:55 local (== 16:02:55 UTC).
+        # SpecifyKind, а не залежність від timezone тестового runner-а —
+        # той самий прийом, що вже Health/GenerationAgeUsesUtcArithmetic.
+        $simulatedNowUtc = [datetime]::SpecifyKind([datetime]'2026-08-10T16:02:55', [DateTimeKind]::Utc)
+        $simulatedBackupUtc = [datetime]::SpecifyKind([datetime]'2026-08-10T15:57:00', [DateTimeKind]::Utc)
+        $script:archiveDefinitions = @(
+            [pscustomobject]@{ Type = 'MODEL'; Enabled = $true }
+        )
+        $script:healthLatestArchives = @{
+            MODEL = [pscustomobject]@{
+                Name = 'MODEL_20260810_185725.mdz'
+                FullName = 'C:\fake\MODEL_20260810_185725.mdz'
+                HashPath = 'C:\fake\MODEL_20260810_185725.mdz.sha512'
+                SizeBytes = 12345
+                LastWriteTime = $simulatedBackupUtc
+                GenerationId = '20260810_185725'
+            }
+        }
+        $script:healthCheckStartedUtc = $simulatedNowUtc
+        $summary = Get-BRAVOHealthLatestBackupSummary
+        [pscustomobject]@{
+            TimestampText = $summary.TimestampText
+            AgeText = $summary.AgeText
+            RawTimestamp = $summary.Timestamp
+            RawTimestampKind = $summary.Timestamp.Kind
+            # Обчислено НЕЗАЛЕЖНО, тим самим .ToLocalTime(), що очікується
+            # від джерела — детерміновано в будь-якій timezone тестового
+            # runner-а (не hardcode ніякого конкретного offset/рядка):
+            # якщо джерело справді конвертує, обидва значення завжди
+            # збігаються, хоч би яка timezone була в CI/DEV-LIMS/локально.
+            ExpectedLocalText = $simulatedBackupUtc.ToLocalTime().ToString('dd.MM.yyyy HH:mm')
+            # AgeText — чиста UTC-минус-UTC арифметика (не залежить від
+            # timezone runner-а за визначенням), обчислена тут із тих
+            # самих двох фікстур, що передаються в Get-BRAVOHealthLatestBackupSummary,
+            # а не hardcoded рядок.
+            ExpectedAgeText = "$([math]::Floor(($simulatedNowUtc - $simulatedBackupUtc).TotalMinutes)) хв."
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $latestBackupSummaryProbe.TimestampText -eq $latestBackupSummaryProbe.ExpectedLocalText -and
+            $latestBackupSummaryProbe.RawTimestampKind -eq [DateTimeKind]::Utc -and
+            $healthScriptText.Contains('$localTimestamp = $latestTimestamp.ToLocalTime()') -and
+            $healthScriptText.Contains('TimestampText = $localTimestamp.ToString(') -and
+            -not $healthScriptText.Contains('TimestampText = $latestTimestamp.ToString(')
+        ) `
+        -Name 'Health/LatestBackupTimestampRendersLocalTime' `
+        -Failure 'Get-BRAVOHealthLatestBackupSummary.TimestampText має форматуватися ПІСЛЯ .ToLocalTime() — інакше оператор бачить внутрішній UTC як локальний час сервера (реальний DEV-LIMS acceptance: generation 18:57 local показувалась як 15:57); production Timestamp/Kind не повинні мутуватися'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $latestBackupSummaryProbe.AgeText -eq $latestBackupSummaryProbe.ExpectedAgeText -and
+            $latestBackupSummaryProbe.RawTimestampKind -eq [DateTimeKind]::Utc -and
+            $healthScriptText.Contains('AgeText = Format-BackupAge -LastWriteTime $latestTimestamp -NowUtc $healthCheckStartedUtc') -and
+            -not $healthScriptText.Contains('AgeText = Format-BackupAge -LastWriteTime $localTimestamp')
+        ) `
+        -Name 'Health/BackupAgeStillUsesUtcSemantics' `
+        -Failure 'AgeText має рахуватися через Format-BackupAge на СИРОМУ (UTC) $latestTimestamp — не на $localTimestamp і не похідно від TimestampText; TimestampText presentation-фікс не повинен зачіпати age-арифметику'
+
+    # --- Обидва notification-повідомлення (SUCCESS "Остання резервна
+    # копія" і WARNING/ERROR "Остання успішна резервна копія") мають
+    # отримувати TimestampText з ОДНОГО виклику Get-BRAVOHealthLatestBackupSummary
+    # — не дві незалежні timezone-конверсії у двох message builders.
+    $latestBackupCallSites = @([regex]::Matches($healthScriptText, [regex]::Escape('$latestBackup = Get-BRAVOHealthLatestBackupSummary')))
+    $toLocalTimeCallSites = @([regex]::Matches($healthScriptText, [regex]::Escape('.ToLocalTime()')))
+    Test-BRAVOCondition `
+        -Condition (
+            $latestBackupCallSites.Count -eq 2 -and
+            $healthScriptText.Contains('Остання успішна резервна копія: $($latestBackup.TimestampText)') -and
+            $healthScriptText.Contains('Остання резервна копія: $($latestBackup.TimestampText)') -and
+            $toLocalTimeCallSites.Count -eq 1
+        ) `
+        -Name 'Health/SuccessAndProblemNotificationsReuseLatestBackupTimestamp' `
+        -Failure 'success- і problem-повідомлення мають отримувати TimestampText з ОДНОГО виклику Get-BRAVOHealthLatestBackupSummary; .ToLocalTime() має існувати рівно в ОДНІЙ точці джерела (не дубльований у двох message builders)'
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
