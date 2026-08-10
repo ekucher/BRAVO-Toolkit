@@ -958,6 +958,69 @@ function Get-BRAVOMaintenanceStepStatus {
     return 'OK'
 }
 
+# dev.19 (виправлено): ЄДИНА канонічна точка числового exit-code —
+# та сама пріоритетна політика (критичний > попередження > успіх, з
+# розподілом critical на 40/41/60 через Resolve-BRAVOExitCode), яка
+# раніше була inline-блоком нижче ($script:maintenanceRuntimeExitCode =
+# if (...) {...}). Вона не дублюється — і "поточний знімок" для
+# Send-FinalReport (виконується ВСЕРЕДИНІ зовнішнього try, ДО його catch
+# — стан теоретично ще може змінитися до кінця try), і СПРАВЖНЄ фінальне
+# значення (після catch, перед ЗАВЕРШЕННЯМ СКРИПТУ) отримують число
+# через РІВНО цей виклик. Resolve-BRAVOExitCode лишається джерелом істини для самих
+# кодів; тут лише те саме зведення трьох script-scope прапорців, що
+# раніше було записане прямо в місці присвоєння.
+function Get-BRAVOMaintenanceResolvedExitCode {
+    if ($script:criticalErrorOccurred) {
+        return Resolve-BRAVOExitCode `
+            -LocalArchiveFailed:$script:restoreArchiveFailed `
+            -IntegrityTestFailed:$script:restoreIntegrityFailed `
+            -MaintenanceFailed
+    }
+    if ($script:BRAVOWarningCount -gt 0) {
+        return Resolve-BRAVOExitCode -HasWarnings
+    }
+    return 0
+}
+
+# dev.19 (виправлено): єдина канонічна точка "людський текст фінального
+# статусу" — ЛОГ (=== СТАТУС: ... ===), консольне РЕЗУЛЬТАТ (поле
+# "Статус") і фінальне success-повідомлення (Send-FinalReport) читають
+# текст ЗВІДСИ. На відміну від першої версії dev.19, ця функція більше
+# НЕ інспектує $script:criticalErrorOccurred/$script:BRAVOWarningCount
+# самостійно (те була паралельна, хоч і узгоджена, класифікаційна
+# політика) — вона класифікує РЕЗОЛЬВЛЕНИЙ числовий код через
+# Get-BRAVOExitCodeName (BRAVO.ExitCodes, те саме джерело істини, що
+# вже показує "Код завершення:" у РЕЗУЛЬТАТ нижче). default-гілка
+# покриває 40/41/60 і будь-який інший неуспішний/не-warning код без
+# перелічення кожного окремо. Реальний DEV-LIMS запуск: відсутній
+# Range ID log (WARN-only, семантика НЕ змінена) -> exit 10
+# (SuccessWithWarnings), але ЛОГ і фінальне повідомлення раніше
+# незалежно показували "УСПІШНО" без жодної згадки про попередження.
+function Get-BRAVOMaintenanceFinalStatus {
+    param([Parameter(Mandatory = $true)][int]$ExitCode)
+
+    switch (Get-BRAVOExitCodeName -Code $ExitCode) {
+        'Success' {
+            return [pscustomobject]@{
+                Text = 'УСПІШНО'
+                Color = [ConsoleColor]::Green
+            }
+        }
+        'SuccessWithWarnings' {
+            return [pscustomobject]@{
+                Text = 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'
+                Color = [ConsoleColor]::Yellow
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Text = 'ПОМИЛКА'
+                Color = [ConsoleColor]::Red
+            }
+        }
+    }
+}
+
 function Write-BRAVOMaintenanceStep {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
@@ -1074,9 +1137,19 @@ function Write-Log {
     
     # Роздільники й заголовки формували структуру старої консолі. Тепер її
     # задають етапи (Write-BRAVOMaintenanceStep), тому в консоль вони більше
-    # не йдуть — але лишаються у файлі, щоб хронологія читалася як раніше.
+    # не йдуть.
+    # dev.19: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
+    # журнал (той самий підхід, що вже Archive dev.18). Реальний DEV-LIMS
+    # лог показав рядки лише зі 100 символами "=" між звичайними секціями
+    # — без жодної діагностичної цінності, бо кожен такий виклик стоїть
+    # безпосередньо перед "=== ЗАГОЛОВОК ===", який і так фіксує ту саму
+    # мить повним текстом. Застосовано однаково і до звичайних секцій, і
+    # до початкового/фінального банера (той самий виклик, той самий
+    # аргумент "===" — немає окремого "banner-only" шляху в коді; два
+    # сусідні реальні заголовки банера ("СИСТЕМА ОБСЛУГОВУВАННЯ..."/
+    # "УСТАНОВА: ...") лишаються чіткими і без обрамляючих "===" рядків).
+    # Заголовки нижче (гілка "=== ... ===") лишаються повністю без змін.
     if ($Message -eq "=" -or $Message -eq "===") {
-        Write-BRAVOMaintenanceLogFile -Entry ("=" * $SeparatorLength)
         return
     }
 
@@ -1295,10 +1368,19 @@ function New-MaintenanceNotificationMessage {
     )
 
     $hostInformation = Get-HostInformation
-    $severity = if ($TitleEmoji -eq ":white_check_mark:" -or $Title -match "УСПІШ") {
-        "SUCCESS"
-    } elseif ($TitleEmoji -eq ":warning:") {
+    # dev.19 (виправлено): ":warning:" перевіряється ПЕРШИМ. Раніше
+    # "$Title -match 'УСПІШ'" мав пріоритет над TitleEmoji, тому
+    # виклик Send-FinalReport з Title "... УСПІШНО З ПОПЕРЕДЖЕННЯМИ" і
+    # TitleEmoji ":warning:" усе одно отримував би severity=SUCCESS
+    # (Title і далі містить підрядок "УСПІШ") — суперечлива презентація:
+    # ⚠️-іконка зовні, але "Дій не потрібно"/SUCCESS-набір рядків
+    # усередині. Для трьох інших наявних викликів New-MaintenanceNotificationMessage
+    # результат ідентичний обом порядкам (жоден не поєднує ":warning:" з
+    # Title, що містить "УСПІШ").
+    $severity = if ($TitleEmoji -eq ":warning:") {
         "WARNING"
+    } elseif ($TitleEmoji -eq ":white_check_mark:" -or $Title -match "УСПІШ") {
+        "SUCCESS"
     } else {
         "CRITICAL"
     }
@@ -3754,9 +3836,43 @@ function Send-FinalReport {
             $completedCheckLines.Add("")
             $completedCheckLines.Add(":arrows_counterclockwise: Остання реставрація: $lastRestoreText")
 
+            # dev.19 (виправлено): той самий канонічний
+            # Get-BRAVOMaintenanceFinalStatus, що ЛОГ/консоль — раніше
+            # Title завжди був "УСПІШНО" тут, навіть коли резолвиться
+            # exit 10 (SuccessWithWarnings). Ця функція виконується
+            # ВСЕРЕДИНІ зовнішнього try (Main, нижче), ДО його catch і ДО
+            # фінального обчислення $script:maintenanceRuntimeExitCode
+            # (після catch), тому тут беремо
+            # "поточний знімок" через Get-BRAVOMaintenanceResolvedExitCode
+            # — ТУ САМУ пріоритетну політику, не окрему копію; якщо після
+            # цього виклику (напр. у Write-BRAVOTaskExecutionState чи
+            # десь між ним і кінцем try) станеться необроблений виняток,
+            # СПРАВЖНЄ $script:maintenanceRuntimeExitCode (обчислене
+            # пізніше, після catch) може відрізнятися — і саме воно, а не
+            # це повідомлення, керує процесним exit code.
+            #
+            # TitleEmoji тепер узгоджений із самим текстом (не завжди
+            # ":white_check_mark:"): "УСПІШНО З ПОПЕРЕДЖЕННЯМИ" зі
+            # ✅-іконкою була б суперечливою презентацією — канонічний
+            # warning-маркер репозиторію ":warning:" (Send-InactiveServiceWarning
+            # вище, той самий контракт). Це вимагало узгодити й порядок
+            # перевірок severity всередині New-MaintenanceNotificationMessage
+            # (нижче за визначенням) — інакше "$Title -match 'УСПІШ'"
+            # все одно перебивав би ":warning:" і severity лишався б
+            # SUCCESS всупереч TitleEmoji. Ця гілка ніколи не викликається
+            # для critical-помилок (той шлях — окрема, вища за пріоритетом
+            # гілка Send-FinalReport, не змінена); тому тут можливі лише
+            # 'УСПІШНО'/'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'.
+            $maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode
+            $maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot
+            $maintenanceNotificationTitleEmoji = if ($maintenanceNotificationStatus.Text -eq 'УСПІШНО') {
+                ':white_check_mark:'
+            } else {
+                ':warning:'
+            }
             $notificationMessage = New-MaintenanceNotificationMessage `
-                -Title "BRAVO MAINTENANCE — УСПІШНО" `
-                -TitleEmoji ":white_check_mark:" `
+                -Title "BRAVO MAINTENANCE — $($maintenanceNotificationStatus.Text)" `
+                -TitleEmoji $maintenanceNotificationTitleEmoji `
                 -Duration $elapsedTime `
                 -StatusLines @() `
                 -Details @($completedCheckLines.ToArray()) `
@@ -5754,6 +5870,21 @@ if (-not $script:criticalErrorOccurred) {
 }
 
 # ===== ЗАВЕРШЕННЯ СКРИПТУ =====
+# dev.19 (виправлено): $script:maintenanceRuntimeExitCode обчислюється
+# ТУТ — одразу після закриття зовнішнього try/catch вище (усі бізнес-
+# операції й fail-safe обробка, включно з випадком, коли сам catch щойно
+# підняв criticalErrorOccurred, уже завершились) і ДО друку "=== СТАТУС:
+# ... ===" нижче, а не після нього. У першій версії dev.19 ЛОГ-рядок
+# СТАТУС друкувався РАНІШЕ цього обчислення, тому Get-BRAVOMaintenanceFinalStatus
+# незалежно інспектував ті самі прапорці — паралельна, хоч і узгоджена,
+# класифікаційна політика замість фактичного резолвленого коду.
+# Get-BRAVOMaintenanceResolvedExitCode — ТА САМА пріоритетна політика
+# (critical > warnings > success, 40/41/60 через Resolve-BRAVOExitCode),
+# що раніше стояла inline нижче за друком РЕЗУЛЬТАТ; сама формула не
+# змінена, лише піднята вище й винесена в один спільний виклик (той
+# самий, що вже дає "поточний знімок" для Send-FinalReport вище).
+$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
+
 $maintenanceEndedAt = Get-Date
 $totalTime = $maintenanceEndedAt - $script:ScriptStartTime
 
@@ -5762,49 +5893,33 @@ Write-Log -Message "==="
 Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАВЕРШИЛА РОБОТУ ==="
 Write-Log -Message "=== УСТАНОВА: $($script:ObjectName) ==="
 Write-Log -Message "=== ЧАС ВИКОНАННЯ: $(Format-Duration $totalTime) ==="
-Write-Log -Message "=== СТАТУС: $(if ($script:criticalErrorOccurred) {'З ПОМИЛКАМИ'} else {'УСПІШНО'}) ==="
+# dev.19 (виправлено): Get-BRAVOMaintenanceFinalStatus тепер приймає
+# ВЖЕ резолвлений $script:maintenanceRuntimeExitCode (обчислений вище,
+# до цього рядка) — не незалежну перевірку BRAVOWarningCount/
+# criticalErrorOccurred.
+Write-Log -Message "=== СТАТУС: $((Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode).Text) ==="
 Write-Log -Message "==="
 
 Complete-BRAVOProgress
 
-# Код завершення обчислюється тут, ДО друку РЕЗУЛЬТАТ — той самий принцип,
-# що вже застосований в Archive/Health: раніше ця сама логіка стояла ПІСЛЯ
-# Write-BRAVOSummary (за межами try/finally нижче), тому підсумок фізично
-# не міг показати правильний "Код завершення:". Умови не змінені — лише
-# перенесені й збережені в $script:maintenanceRuntimeExitCode, щоб exit
-# нижче не дублював обчислення. Операції створення/відновлення локального
-# архіву й перевірки його цілісності виділені окремими прапорцями
-# (restoreArchiveFailed/restoreIntegrityFailed, 19 точок) на 40/41; решта
-# ~23 точок criticalErrorOccurred (сервіси, диск, файлове господарство,
-# оркестрація BRAVO_ARCHIV) і далі схлопуються в загальний бакет 60.
-# Resolve-BRAVOExitCode сам віддає пріоритет 40/41 над 60, якщо передані
-# одночасно.
-$script:maintenanceRuntimeExitCode = if ($script:criticalErrorOccurred) {
-    Resolve-BRAVOExitCode `
-        -LocalArchiveFailed:$script:restoreArchiveFailed `
-        -IntegrityTestFailed:$script:restoreIntegrityFailed `
-        -MaintenanceFailed
-} elseif ($script:BRAVOWarningCount -gt 0) {
-    Resolve-BRAVOExitCode -HasWarnings
-} else {
-    0
-}
-
-# ЧАСТКОВО, а не ПОМИЛКА, за самих лише попереджень: обслуговування
-# відпрацювало, але щось потребує уваги. ПОМИЛКА лишається за критичним
-# збоєм — тим самим, що дає ненульовий код завершення.
-$maintenanceSummaryResult = if ($script:criticalErrorOccurred) {
-    'ПОМИЛКА'
-} elseif ($script:BRAVOWarningCount -gt 0) {
-    'ЧАСТКОВО'
-} else {
-    'УСПІШНО'
-}
-$maintenanceSummaryStatusColor = switch ($maintenanceSummaryResult) {
-    'УСПІШНО'  { [ConsoleColor]::Green }
-    'ЧАСТКОВО' { [ConsoleColor]::Yellow }
-    default    { [ConsoleColor]::Red }
-}
+# dev.19 (виправлено): раніше тут стояло inline-обчислення
+# $script:maintenanceRuntimeExitCode (переміщено вище, до друку ЛОГ
+# "=== СТАТУС ===" — Get-BRAVOMaintenanceResolvedExitCode, той самий
+# принцип "обчислити ДО друку РЕЗУЛЬТАТ", що вже застосований в
+# Archive/Health, лише тепер поширений і на ЛОГ). Операції створення/
+# відновлення локального архіву й перевірки його цілісності виділені
+# окремими прапорцями (restoreArchiveFailed/restoreIntegrityFailed,
+# 19 точок) на 40/41; решта ~23 точок criticalErrorOccurred (сервіси,
+# диск, файлове господарство, оркестрація BRAVO_ARCHIV) і далі
+# схлопуються в загальний бакет 60. Resolve-BRAVOExitCode сам віддає
+# пріоритет 40/41 над 60, якщо передані одночасно.
+#
+# dev.19 (виправлено): той самий резолвлений $script:maintenanceRuntimeExitCode
+# і той самий Get-BRAVOMaintenanceFinalStatus, що ЛОГ вище — консоль і
+# ЛОГ фізично не можуть розійтися, бо обидва читають ОДНЕ значення.
+$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode
+$maintenanceSummaryResult = $maintenanceFinalStatus.Text
+$maintenanceSummaryStatusColor = $maintenanceFinalStatus.Color
 # dev.14 (round 3): окремий стиль заголовка підсумку для Maintenance —
 # "BRAVO MAINTENANCE — СТАТУС" в одному рядку (Write-BRAVOFinalSummaryHeader,
 # той самий =-роздільник, що заголовок прогону) — плюс окреме поле

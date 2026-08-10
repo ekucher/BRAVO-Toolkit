@@ -3412,6 +3412,16 @@ try {
             function Write-BRAVOLog {
                 param([string]$Component, [string]$Message, [string]$Level)
             }
+            # dev.19: Invoke-BRAVOComponentBackup тепер друкує заголовок
+            # "=== СТВОРЕННЯ ХЕШУ $Component ===" безпосередньо перед
+            # New-SHA512Hash через Write-Log (не Write-BRAVOLog) — цей
+            # ізольований module не має реального Write-Log серед
+            # -FunctionNames (він поза HASH/VSS/hash-persist фокусом цього
+            # фікстура), тому потрібен той самий тип no-op стаба, що вже
+            # Write-BRAVOLog вище.
+            function Write-Log {
+                param([string]$Message, [string]$Level = 'INFO')
+            }
             function New-Archive {
                 param([string]$SourcePath, [string]$FullArchivePath, [string]$ArcPath, [string]$ArcParams)
                 [IO.File]::WriteAllText($FullArchivePath, "archive:$script:componentBackupMode", (New-Object Text.UTF8Encoding($false)))
@@ -7120,9 +7130,15 @@ try {
         -Name "Maintenance/RangeIdMissingPreservesWarningNotification" `
         -Failure "Send-SlackAlert -IsCritical (доставка сповіщення навіть у errors_only) має й далі викликатися рівно один раз для відсутнього Range ID — розв'язано лише виконання-severity, не доставка"
 
-    # --- Фінальний підсумок: та сама триланкова логіка (ПОМИЛКА/ЧАСТКОВО/
-    # УСПІШНО), що вже керує exit code, тепер перевірена явно на синтетичних
-    # BRAVOWarningCount/criticalErrorOccurred, а не лише як текст джерела.
+    # --- Фінальний підсумок: та сама триланкова логіка (ПОМИЛКА/УСПІШНО З
+    # ПОПЕРЕДЖЕННЯМИ/УСПІШНО), що вже керує exit code, тепер перевірена явно
+    # на синтетичних BRAVOWarningCount/criticalErrorOccurred, а не лише як
+    # текст джерела.
+    # dev.19: 'ЧАСТКОВО' — стара, окрема від логу назва тієї самої умови —
+    # замінена на канонічний Get-BRAVOMaintenanceFinalStatus (детально
+    # перевірено нижче, група Maintenance/Exit*); тут лишається лише
+    # верхньорівнева перевірка, що ця консольна секція й далі викликає той
+    # самий канонічний helper, а не власну незалежну гілку.
     $maintenanceSummaryModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText @'
 function Get-BRAVOMaintenanceSummaryResult {
@@ -7130,7 +7146,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     if ($CriticalErrorOccurred) {
         return 'ПОМИЛКА'
     } elseif ($WarningCount -gt 0) {
-        return 'ЧАСТКОВО'
+        return 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'
     } else {
         return 'УСПІШНО'
     }
@@ -7146,8 +7162,9 @@ function Get-BRAVOMaintenanceSummaryResult {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceSuccessResult -eq 'УСПІШНО' -and
-            $maintenanceScriptTextForManifestStorage.Contains('elseif ($script:BRAVOWarningCount -gt 0) {') -and
-            $maintenanceScriptTextForManifestStorage.Contains("'ЧАСТКОВО'") -and
+            $maintenanceScriptTextForManifestStorage.Contains('function Get-BRAVOMaintenanceFinalStatus') -and
+            $maintenanceScriptTextForManifestStorage.Contains('$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus') -and
+            $maintenanceScriptTextForManifestStorage.Contains('$maintenanceSummaryResult = $maintenanceFinalStatus.Text') -and
             $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOFinalSummaryHeader ``") -and
             $maintenanceScriptTextForManifestStorage.Contains("-Title 'BRAVO MAINTENANCE'") -and
             $maintenanceScriptTextForManifestStorage.Contains("Write-BRAVOResultField -Label 'Статус'") -and
@@ -7578,7 +7595,12 @@ function Get-BRAVOMaintenanceSummaryResult {
     # ================================================================
     $maintenanceOuterRangeCatchIndex = $maintenanceScriptTextForManifestStorage.IndexOf('див. коментар біля відкриття try вище')
     $maintenanceEndOfScriptMarkerIndex = $maintenanceScriptTextForManifestStorage.IndexOf('# ===== ЗАВЕРШЕННЯ СКРИПТУ =====')
-    $maintenanceExitCodeCalcIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = if ($script:criticalErrorOccurred) {')
+    # dev.19 (виправлено): inline if/elseif/else замінено на виклик
+    # Get-BRAVOMaintenanceResolvedExitCode (та сама формула, лише
+    # винесена в канонічну функцію й піднята ще вище — тепер ДО друку
+    # ЛОГ "=== СТАТУС ===", не лише ДО РЕЗУЛЬТАТ) — новий буквальний
+    # маркер точки присвоєння.
+    $maintenanceExitCodeCalcIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode')
     # dev.16: обидва пошуки стартують ПІСЛЯ $maintenanceEndOfScriptMarkerIndex,
     # бо Write-BRAVOFinalSummaryHeader/Footer тепер зустрічаються й раніше
     # в файлі — у compact no-op summary (Recovery/RunMissedRestoreOnly) —
@@ -10870,7 +10892,11 @@ function Get-BRAVOMaintenanceSummaryResult {
         @{
             Name = "Maintenance"
             Text = $maintenanceScriptText
-            ExitVar = '$script:maintenanceRuntimeExitCode = if'
+            # dev.19 (виправлено): inline if/elseif/else замінено викликом
+            # Get-BRAVOMaintenanceResolvedExitCode (та сама формула,
+            # піднята ще вище — тепер ДО ЛОГ "=== СТАТУС ===", не лише ДО
+            # РЕЗУЛЬТАТ).
+            ExitVar = '$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode'
         }
     )
     $exitOrderFailures = @(
@@ -11526,6 +11552,482 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name 'Archive/SectionHeadingsRemainLogged' `
         -Failure '"=== ЗАГОЛОВОК ===" записи мають і надалі писатись у журнал повним текстом — незмінено'
+
+    #####################################################################
+    # dev.19: два реальні DEV-LIMS acceptance-прогони виявили чотири
+    # окремі observability/correctness дефекти: (1) Maintenance фінальний
+    # людський статус (ЛОГ/консоль/success-notification) ігнорував
+    # $script:BRAVOWarningCount і завжди показував "УСПІШНО", навіть коли
+    # резолвиться exit 10 (SuccessWithWarnings) через відсутній Range ID
+    # log; (2) Maintenance-журнал мав ті самі голі "==="-роздільники, що
+    # Archive виправив у dev.18, — власна, окрема реалізація Write-Log,
+    # свідомо не займана в dev.18; (3) Archive VSS-діагностика фактично
+    # неправильно стверджувала "окремий знімок на компонент", хоча
+    # runtime завжди створював ОДИН VSS Snapshot Set на generation; (4)
+    # Archive заголовок "=== СТВОРЕННЯ ХЕШУ ===" друкувався в Main ПІСЛЯ
+    # вже виконаної роботи хешування. Backup/restore/VSS-логіка/SHA512/
+    # retention/MANIFESTS/transfer/notification routing/scheduler/
+    # exit-code числовий контракт — не змінені; Range ID лишається
+    # WARN-only.
+    #####################################################################
+
+    # ================================================================
+    # Група 1 — Maintenance: фінальний статус — ЧИСТА функція від
+    # РЕЗОЛЬВЛЕНОГО exit code (Get-BRAVOMaintenanceFinalStatus -ExitCode),
+    # не незалежна інспекція $script:criticalErrorOccurred/
+    # $script:BRAVOWarningCount. Виправлено після REVIEW: перша версія
+    # dev.19 мала ту саму (узгоджену, але) ПАРАЛЕЛЬНУ класифікаційну
+    # політику — тепер єдине джерело істини для самих кодів (0/10/
+    # 40/41/60) — Resolve-BRAVOExitCode (через Get-BRAVOMaintenanceResolvedExitCode
+    # і Get-BRAVOExitCodeName), а Get-BRAVOMaintenanceFinalStatus лише
+    # відображає вже резолвлений код у текст/колір.
+    # ================================================================
+    # Get-BRAVOExitCodeName НЕ входить у -FunctionNames: вона визначена в
+    # BRAVO.ExitCodes (не в Maintenance runtime), і вже реально
+    # імпортована в глобальну сесію вище (Version/*-тести) — ізольований
+    # module резолвить її звичайним пошуком команди, як і Archive-тести
+    # резолвлять Protect-BRAVOLogSecret/Write-BRAVOConsoleMessage з
+    # реально імпортованих BRAVO.Logging/BRAVO.Console.
+    $maintenanceFinalStatusModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('Get-BRAVOMaintenanceFinalStatus')
+    Test-BRAVOCondition `
+        -Condition (
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 0 }).Text -eq 'УСПІШНО' -and
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 0 }).Color -eq [ConsoleColor]::Green
+        ) `
+        -Name 'Maintenance/Exit0RendersSuccess' `
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 0 (Success) має повертати Text='УСПІШНО'/Color=Green"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 10 }).Text -eq 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' -and
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 10 }).Color -eq [ConsoleColor]::Yellow
+        ) `
+        -Name 'Maintenance/Exit10RendersSuccessWithWarnings' `
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 10 (SuccessWithWarnings) має повертати Text='УСПІШНО З ПОПЕРЕДЖЕННЯМИ'/Color=Yellow — реальний DEV-LIMS запуск (LastTaskResult=10, відсутній Range ID log) раніше показував 'УСПІШНО' без жодної згадки про попередження"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 40 }).Text -eq 'ПОМИЛКА' -and
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 40 }).Color -eq [ConsoleColor]::Red
+        ) `
+        -Name 'Maintenance/Exit40RendersFailure' `
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 40 (LocalArchiveFailed) має повертати Text='ПОМИЛКА'/Color=Red"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 41 }).Text -eq 'ПОМИЛКА' -and
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 41 }).Color -eq [ConsoleColor]::Red
+        ) `
+        -Name 'Maintenance/Exit41RendersFailure' `
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 41 (IntegrityTestFailed) має повертати Text='ПОМИЛКА'/Color=Red"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 60 }).Text -eq 'ПОМИЛКА' -and
+            (& $maintenanceFinalStatusModule { Get-BRAVOMaintenanceFinalStatus -ExitCode 60 }).Color -eq [ConsoleColor]::Red
+        ) `
+        -Name 'Maintenance/Exit60RendersFailure' `
+        -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 60 (MaintenanceFailed) має повертати Text='ПОМИЛКА'/Color=Red"
+
+    # --- Структурний доказ РЕАЛЬНОГО потоку даних (не лише "джерело
+    # містить обидва рядки поруч"): (1) Get-BRAVOMaintenanceFinalStatus
+    # взагалі НЕ посилається на $script:criticalErrorOccurred/
+    # $script:BRAVOWarningCount у власному тілі — фізично не може мати
+    # паралельну політику; (2) LOG і консоль передають РІВНО той самий
+    # $script:maintenanceRuntimeExitCode, який РІВНО одним рядком
+    # присвоюється з Get-BRAVOMaintenanceResolvedExitCode ДО обох
+    # споживачів (перевірено індексами позицій у джерелі, не лише
+    # Contains); (3) сам Get-BRAVOMaintenanceResolvedExitCode дійсно
+    # викликає канонічний Resolve-BRAVOExitCode (не вигадує коди сам).
+    # Власний AST-парс (не $maintenanceTotalAst — той визначається нижче,
+    # для Групи 3/4 Archive-тестів; тут потрібен раніше).
+    $maintenanceFinalStatusFlowTokens = $null
+    $maintenanceFinalStatusFlowErrors = $null
+    $maintenanceFinalStatusFlowAst = [Management.Automation.Language.Parser]::ParseInput(
+        $maintenanceScriptTextForManifestStorage, [ref]$maintenanceFinalStatusFlowTokens, [ref]$maintenanceFinalStatusFlowErrors
+    )
+    $maintenanceFinalStatusFunctionAst = $null
+    $maintenanceResolvedExitCodeFunctionAst = $null
+    foreach ($candidateFunctionAst in $maintenanceFinalStatusFlowAst.FindAll(
+        { param($c) $c -is [Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        if ($candidateFunctionAst.Name -eq 'Get-BRAVOMaintenanceFinalStatus') {
+            $maintenanceFinalStatusFunctionAst = $candidateFunctionAst
+        } elseif ($candidateFunctionAst.Name -eq 'Get-BRAVOMaintenanceResolvedExitCode') {
+            $maintenanceResolvedExitCodeFunctionAst = $candidateFunctionAst
+        }
+    }
+    # @() ЗОВНІ всього if/else (не лише всередині кожної гілки) — інакше,
+    # коли гілка з очікуваним НУЛЬОВИМ результатом (саме той випадок,
+    # який ця перевірка й хоче довести) віддає порожній масив у output
+    # stream, PowerShell розгортає його в 0 елементів, і $x = if {...}
+    # присвоює $null, а не порожній масив — .Count на $null падає під
+    # Set-StrictMode (та сама пастка, що вже Maintenance/dev.16
+    # Remove-OldRestoreArchives-тести вище).
+    $maintenanceFinalStatusReferencesFlags = @(if ($null -ne $maintenanceFinalStatusFunctionAst) {
+        $maintenanceFinalStatusFunctionAst.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.VariableExpressionAst] -and
+                ($candidate.VariablePath.UserPath -eq 'script:criticalErrorOccurred' -or
+                 $candidate.VariablePath.UserPath -eq 'script:BRAVOWarningCount')
+            },
+            $true
+        )
+    } else { 'MISSING' })
+    $maintenanceResolvedExitCodeCallsResolver = @(if ($null -ne $maintenanceResolvedExitCodeFunctionAst) {
+        $maintenanceResolvedExitCodeFunctionAst.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -eq 'Resolve-BRAVOExitCode'
+            },
+            $true
+        )
+    })
+    $maintenanceExitCodeAssignIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceLogStatusIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-Log -Message "=== СТАТУС: $((Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode).Text) ==="')
+    $maintenanceConsoleStatusIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode')
+    $maintenanceNotificationSnapshotIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceNotificationStatusIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot')
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceFinalStatusReferencesFlags.Count -eq 0 -and
+            $maintenanceResolvedExitCodeCallsResolver.Count -eq 2 -and
+            $maintenanceExitCodeAssignIndex -ge 0 -and
+            $maintenanceLogStatusIndex -gt $maintenanceExitCodeAssignIndex -and
+            $maintenanceConsoleStatusIndex -gt $maintenanceExitCodeAssignIndex -and
+            $maintenanceNotificationSnapshotIndex -ge 0 -and
+            $maintenanceNotificationStatusIndex -gt $maintenanceNotificationSnapshotIndex
+        ) `
+        -Name 'Maintenance/FinalStatusConsumesResolvedExitCode' `
+        -Failure "Get-BRAVOMaintenanceFinalStatus не повинна посилатись на script:criticalErrorOccurred/script:BRAVOWarningCount (знайдено посилань: $($maintenanceFinalStatusReferencesFlags.Count)); Get-BRAVOMaintenanceResolvedExitCode має викликати Resolve-BRAVOExitCode (знайдено: $($maintenanceResolvedExitCodeCallsResolver.Count) з 2 очікуваних); LOG і консоль мають читати `$script:maintenanceRuntimeExitCode ПІСЛЯ його присвоєння з Get-BRAVOMaintenanceResolvedExitCode, а не незалежно"
+
+    # --- Notification: REAL New-MaintenanceNotificationMessage (ізольована
+    # AST-екстракція; Get-HostInformation/New-BRAVOOperatorNotificationMessage
+    # резолвляться з реально імпортованого вище BRAVO.Notifications). -Title/
+    # -TitleEmoji НЕ друкуються буквально — вони лише визначають $severity,
+    # а рендерений $operation — один із ДВОХ фіксованих рядків ("BRAVO
+    # MAINTENANCE — УСПІШНО" для SUCCESS, "...— ПОТРІБНА ДІЯ" для решти).
+    # Для warnings-виклику (Title містить "УСПІШ", TitleEmoji ':warning:')
+    # рендер МАЄ показувати ⚠️/"BRAVO MAINTENANCE — ПОТРІБНА ДІЯ"/"Потрібна
+    # дія:", а НЕ ✅/"...— УСПІШНО"/"Дій не потрібно" — інакше суперечлива
+    # презентація (canonical warning-маркер репозиторію ':warning:', той
+    # самий, що вже Send-InactiveServiceWarning). Чистий 'УСПІШНО' лишається
+    # ✅/"Дій не потрібно" — перевірено тим самим викликом, щоб довести, що
+    # правка severity-порядку не зачепила звичайний success-шлях.
+    $maintenanceNotificationModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('New-MaintenanceNotificationMessage')
+    $maintenanceWarningsNotificationText = & $maintenanceNotificationModule {
+        New-MaintenanceNotificationMessage `
+            -Title 'BRAVO MAINTENANCE — УСПІШНО З ПОПЕРЕДЖЕННЯМИ' `
+            -TitleEmoji ':warning:' `
+            -Duration ([timespan]::FromMinutes(5)) `
+            -StatusLines @() `
+            -Details @('тестова деталь')
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceWarningsNotificationText.Contains(':warning: BRAVO MAINTENANCE — ПОТРІБНА ДІЯ') -and
+            $maintenanceWarningsNotificationText.Contains('Потрібна дія: перевірити журнал BRAVO_MAINTENANCE.') -and
+            -not $maintenanceWarningsNotificationText.Contains('Дій не потрібно') -and
+            -not $maintenanceWarningsNotificationText.Contains(':white_check_mark:') -and
+            -not $maintenanceWarningsNotificationText.Contains('BRAVO MAINTENANCE — УСПІШНО')
+        ) `
+        -Name 'Maintenance/WarningsNotificationUsesWarningMarkerNotSuccess' `
+        -Failure "Title 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' + TitleEmoji ':warning:' мають рендерити :warning:/'BRAVO MAINTENANCE — ПОТРІБНА ДІЯ'/'Потрібна дія:' — не ✅/'...— УСПІШНО'/'Дій не потрібно' (суперечлива презентація); New-MaintenanceNotificationMessage severity-класифікація має віддавати пріоритет ':warning:' над збігом підрядка 'УСПІШ' у Title"
+
+    $maintenanceSuccessNotificationText = & $maintenanceNotificationModule {
+        New-MaintenanceNotificationMessage `
+            -Title 'BRAVO MAINTENANCE — УСПІШНО' `
+            -TitleEmoji ':white_check_mark:' `
+            -Duration ([timespan]::FromMinutes(5)) `
+            -StatusLines @() `
+            -Details @('тестова деталь')
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceSuccessNotificationText.Contains(':white_check_mark: BRAVO MAINTENANCE — УСПІШНО') -and
+            $maintenanceSuccessNotificationText.Contains('Дій не потрібно') -and
+            -not $maintenanceSuccessNotificationText.Contains('Потрібна дія:')
+        ) `
+        -Name 'Maintenance/PureSuccessNotificationUnaffectedBySeverityReorder' `
+        -Failure "Title 'УСПІШНО' + TitleEmoji ':white_check_mark:' мають і надалі рендерити ✅/'Дій не потрібно' — severity-reorder (':warning:' перевіряється першим) не повинен зачіпати звичайний success-шлях"
+
+    # --- Range ID: dev.19 не мав чіпати WARN-only семантику Test-RangeIdUsage
+    # — жодного auto-create файлу, fallback-пошуку іншого шляху чи
+    # підвищення до критичної помилки. $maintenanceRangeIdFunctionText вже
+    # витягнутий вище (dev.15, Maintenance/RangeIdWarningHasSingleConsoleRender).
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceRangeIdFunctionText.Contains('Write-Log $errorMessage -Level "WARNING" -NoConsole') -and
+            -not $maintenanceRangeIdFunctionText.Contains('New-Item') -and
+            ([regex]::Matches($maintenanceRangeIdFunctionText, 'Test-Path').Count -eq 1) -and
+            $maintenanceRangeIdFunctionText.Contains('HasIssue = $true')
+        ) `
+        -Name 'Maintenance/RangeIdMissingRemainsWarningOnly' `
+        -Failure 'dev.19 не повинен був чіпати Test-RangeIdUsage: відсутній configured Range ID log (напр. C:\Windows\SysWOW64\range_id_log.json) має й далі лишатися WARNING-only (рівно один Test-Path, без New-Item/auto-create, без fallback-пошуку іншого шляху і без підвищення до критичної помилки)'
+
+    # --- Немає ОКРЕМОЇ, незалежної від Get-BRAVOMaintenanceFinalStatus,
+    # "другої" перевірки попереджень для тексту: реальний рядок нового
+    # статусу 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (як STRING-літерал в AST, не
+    # рахуючи пояснювальні коментарі) має існувати РІВНО один раз —
+    # усередині самої Get-BRAVOMaintenanceFinalStatus, — а сама функція
+    # має викликатися рівно тричі поза власним визначенням (ЛОГ/консоль/
+    # notification Title).
+    $maintenanceTotalTokens = $null
+    $maintenanceTotalErrors = $null
+    $maintenanceTotalAst = [Management.Automation.Language.Parser]::ParseInput(
+        $maintenanceScriptTextForManifestStorage, [ref]$maintenanceTotalTokens, [ref]$maintenanceTotalErrors
+    )
+    $maintenanceSuccessWithWarningsLiteralAsts = @($maintenanceTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.StringConstantExpressionAst] -and
+            $candidate.Value -eq 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'
+        },
+        $true
+    ))
+    $maintenanceFinalStatusCallAsts = @($maintenanceTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Get-BRAVOMaintenanceFinalStatus'
+        },
+        $true
+    ))
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceSuccessWithWarningsLiteralAsts.Count -eq 1 -and
+            $maintenanceFinalStatusCallAsts.Count -eq 3
+        ) `
+        -Name 'Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy' `
+        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 3 рази (ЛОГ/консоль/notification), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
+
+    # ================================================================
+    # Група 2 — Maintenance: голий "==="-роздільник більше не пише
+    # окремий рядок у журнал (та сама ідея, що Archive dev.18, але
+    # Maintenance має власну, окрему реалізацію Write-Log/SeparatorLength
+    # — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між
+    # звичайними секціями).
+    # ================================================================
+    $maintenanceBareLogSeparatorBranchMatch = [regex]::Match(
+        $maintenanceScriptTextForManifestStorage,
+        '(?s)if \(\$Message -eq "=" -or \$Message -eq "==="\) \{(.*?)\}'
+    )
+    $maintenanceBareLogSeparatorBranchText = if ($maintenanceBareLogSeparatorBranchMatch.Success) { $maintenanceBareLogSeparatorBranchMatch.Groups[1].Value } else { 'MISSING' }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $maintenanceBareLogSeparatorBranchText.Contains('Write-BRAVOMaintenanceLogFile') -and
+            $maintenanceBareLogSeparatorBranchText.Contains('return')
+        ) `
+        -Name 'Maintenance/SectionSeparatorsDoNotEmitBareLogRecords' `
+        -Failure 'голий роздільник "==="/"=" у Maintenance Write-Log має лише return, без Write-BRAVOMaintenanceLogFile — реальний DEV-LIMS лог показував рядки зі 100 символами "=" між звичайними секціями без жодної діагностичної цінності'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains('if ($Message -match "^=== .* ===$") {') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-BRAVOMaintenanceLogFile -Entry $Message') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ЗУПИНКА СЛУЖБ ==="') -and
+            $maintenanceScriptTextForManifestStorage.Contains('=== ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ ===') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== РЕСТАВРАЦІЯ МОДЕЛІ ==="') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ==="') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="')
+        ) `
+        -Name 'Maintenance/SectionHeadingsRemainLogged' `
+        -Failure '"=== ЗАГОЛОВОК ===" записи (ДЖЕРЕЛА ЖУРНАЛІВ/ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ/ЗУПИНКА СЛУЖБ/ПЕРЕВІРКА РОЗМІРІВ .MD ФАЙЛІВ/РЕСТАВРАЦІЯ МОДЕЛІ/ОБРОБКА TRACE-ФАЙЛІВ/ОБРОБКА ЛОГІВ EXCHANGAPI/ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ/ОЧИСТКА СТАРИХ ДАНИХ/ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ) мають і надалі писатись у журнал повним текстом — незмінено'
+
+    # --- функціональний round-trip через РЕАЛЬНИЙ Maintenance Write-Log
+    # (ізольована AST-екстракція) у тимчасовий файл — жоден фізичний
+    # рядок журналу не повинен бути голим роздільником символів "=".
+    Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psd1') -Force -ErrorAction Stop
+    Remove-Module -Name 'BRAVO.Console' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psd1') -Force -ErrorAction Stop
+    $maintenanceLogRoundTripTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MAINT_LOG_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $maintenanceWriteLogRoundTripModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceScriptTextForManifestStorage `
+            -FunctionNames @('Write-Log', 'Write-BRAVOMaintenanceLogFile')
+        $global:consoleSettings = @{ ConsoleLevel = 'ERROR'; ShowTimestampsInConsole = $false }
+        try {
+            & $maintenanceWriteLogRoundTripModule {
+                param($LogFilePath)
+                $LOG_DIR = [IO.Path]::GetDirectoryName($LogFilePath)
+                $LOG_FILE = $LogFilePath
+                $script:BRAVOWarningCount = 0
+                $script:LogLevel = 'INFO'
+                Write-Log -Message "==="
+                Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="
+                Write-Log -Message "Тестове повідомлення" -Level "INFO"
+                Write-Log -Message "==="
+                Write-Log -Message "=== ЗАВЕРШЕННЯ РОБОТИ СКРИПТА ==="
+            } $maintenanceLogRoundTripTempFile
+        } finally {
+            $global:consoleSettings = $null
+        }
+        $maintenanceLogLines = @(Get-Content -LiteralPath $maintenanceLogRoundTripTempFile -Encoding UTF8)
+        $maintenanceBareSeparatorLines = @($maintenanceLogLines | Where-Object { $_ -match '^=+$' })
+        $maintenanceRealHeadingLines = @($maintenanceLogLines | Where-Object { $_ -eq '=== ДЖЕРЕЛА ЖУРНАЛІВ ===' -or $_ -eq '=== ЗАВЕРШЕННЯ РОБОТИ СКРИПТА ===' })
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceBareSeparatorLines.Count -eq 0 -and
+                $maintenanceRealHeadingLines.Count -eq 2
+            ) `
+            -Name 'Maintenance/RuntimeLogHasNoRedundantSeparatorOnlySections' `
+            -Failure "жоден фізичний рядок Maintenance-журналу не повинен бути голим роздільником символів '='; знайдено таких рядків: $($maintenanceBareSeparatorLines.Count); повноцінних заголовків: $($maintenanceRealHeadingLines.Count) з 2 очікуваних"
+    } finally {
+        Remove-Item -LiteralPath $maintenanceLogRoundTripTempFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # ================================================================
+    # Група 3 — Archive: VSS-діагностика тепер фактично правильна (ОДИН
+    # Snapshot Set на generation, спільний для всіх увімкнених
+    # компонентів) — лише текст, VSS-логіка/lifecycle не змінені.
+    # ================================================================
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Write-Log "Узгодженість архівів: один VSS Snapshot Set для всіх увімкнених компонентів generation" -Level "SUCCESS"')
+        ) `
+        -Name 'Archive/VssDiagnosticDescribesSingleGenerationSnapshotSet' `
+        -Failure 'діагностичний рядок "Узгодженість архівів" має описувати ОДИН VSS Snapshot Set для всіх увімкнених компонентів generation — реальна поведінка New-BRAVOVSSSnapshotSet (спільний знімок), а не окремий на кожен компонент'
+
+    Test-BRAVOCondition `
+        -Condition (
+            -not $archiveScriptText.Contains('окремий VSS-знімок для кожного компонента') -and
+            -not $archiveScriptText.Contains('окремий VSS-знімок для кожного')
+        ) `
+        -Name 'Archive/VssDiagnosticDoesNotClaimPerComponentSnapshots' `
+        -Failure 'стара фактично неправильна фраза "окремий VSS-знімок для кожного компонента" не повинна лишатись у джерелі — runtime ніколи не створював окремий знімок на компонент'
+
+    $archiveVssSnapshotSetCallAsts = @($archiveTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'New-BRAVOVSSSnapshotSet'
+        },
+        $true
+    ))
+    $archiveVssSnapshotSetRemoveCallAsts = @($archiveTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Remove-BRAVOVSSSnapshotSet'
+        },
+        $true
+    ))
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveVssSnapshotSetCallAsts.Count -eq 1 -and
+            $archiveVssSnapshotSetRemoveCallAsts.Count -eq 2
+        ) `
+        -Name 'Archive/VssBehaviorCodeUnchangedByDiagnosticFix' `
+        -Failure "правка діагностичного тексту не повинна була зачепити VSS-логіку: New-BRAVOVSSSnapshotSet має викликатися рівно 1 раз (на generation), Remove-BRAVOVSSSnapshotSet — рівно 2 рази (VSS-failure cleanup path + normal-path cleanup); знайдено $($archiveVssSnapshotSetCallAsts.Count)/$($archiveVssSnapshotSetRemoveCallAsts.Count)"
+
+    # ================================================================
+    # Група 4 — Archive: заголовок "=== СТВОРЕННЯ ХЕШУ $Component ==="
+    # тепер друкується ВСЕРЕДИНІ Invoke-BRAVOComponentBackup, безпосередньо
+    # перед New-SHA512Hash (хронологічно правильна позиція) — не в Main
+    # ПІСЛЯ завершення виклику. Сама послідовність create -> hash ->
+    # verify -> publish не змінена.
+    # ================================================================
+    $archiveComponentBackupFunctionAst = $archiveTotalAst.Find(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq 'Invoke-BRAVOComponentBackup'
+        },
+        $true
+    )
+    $archiveHashHeadingCallAst = if ($null -ne $archiveComponentBackupFunctionAst) {
+        $archiveComponentBackupFunctionAst.Find(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -eq 'Write-Log' -and
+                $candidate.Extent.Text -match 'СТВОРЕННЯ ХЕШУ'
+            },
+            $true
+        )
+    } else { $null }
+    $archiveHashWorkCallAst = if ($null -ne $archiveComponentBackupFunctionAst) {
+        $archiveComponentBackupFunctionAst.Find(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -eq 'New-SHA512Hash'
+            },
+            $true
+        )
+    } else { $null }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $archiveComponentBackupFunctionAst -and
+            $null -ne $archiveHashHeadingCallAst -and
+            $null -ne $archiveHashWorkCallAst -and
+            $archiveHashHeadingCallAst.Extent.StartOffset -lt $archiveHashWorkCallAst.Extent.StartOffset
+        ) `
+        -Name 'Archive/HashHeadingPrecedesHashWork' `
+        -Failure '"=== СТВОРЕННЯ ХЕШУ ... ===" має друкуватись ДО першого виклику New-SHA512Hash всередині Invoke-BRAVOComponentBackup — реальний DEV-LIMS лог показував заголовок ПІСЛЯ вже виконаної роботи (заголовок друкувався в Main, після повного завершення виклику)'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Write-Log "=== СТВОРЕННЯ ХЕШУ $Component ==="') -and
+            $archiveScriptText.Contains('-Component $archive.Type') -and
+            ([regex]::Matches($archiveScriptText, [regex]::Escape('$componentResult = Invoke-BRAVOComponentBackup')).Count -eq 1) -and
+            $archiveScriptText.Contains('foreach ($archive in $readyArchives) {')
+        ) `
+        -Name 'Archive/HashHeadingPrecedesHashWorkForAllEnabledComponents' `
+        -Failure 'заголовок HASH використовує параметр $Component (не буквальний MODEL/BLOG/BRAVOEXCH), а Invoke-BRAVOComponentBackup викликається РІВНО один раз усередині foreach ($archive in $readyArchives) над увімкненими компонентами — тому фікс застосовується однаково до КОЖНОГО увімкненого компонента без per-component дублювання коду'
+
+    $archiveHashComponentModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @('Write-Log', 'Resolve-BRAVOLogComponentFromHeader', 'Set-BRAVOLogComponent')
+    $archiveHashComponentAfterHeading = & $archiveHashComponentModule {
+        $script:BRAVOLogComponent = 'ARCHIVE'
+        $defaultLogLevel = 'INFO'
+        $logSeparatorLength = 100
+        Write-Log "==="
+        Write-Log "=== СТВОРЕННЯ ХЕШУ MODEL ==="
+        $script:BRAVOLogComponent
+    }
+    Test-BRAVOCondition `
+        -Condition ($archiveHashComponentAfterHeading -eq 'HASH') `
+        -Name 'Archive/HashLogsUseHashComponentAfterHeading' `
+        -Failure 'після реального Write-Log "=== СТВОРЕННЯ ХЕШУ MODEL ===" $script:BRAVOLogComponent (через Resolve-BRAVOLogComponentFromHeader/Set-BRAVOLogComponent) має стати HASH — та сама автоматика колонки компонента, що й для інших заголовків; переміщення заголовка в Invoke-BRAVOComponentBackup не повинно було зламати цю атрибуцію'
+
+    $archiveNewSha512HashCallAsts = @($archiveTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'New-SHA512Hash'
+        },
+        $true
+    ))
+    $archiveGetFileHashCallAsts = @($archiveTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Get-BRAVOFileHash'
+        },
+        $true
+    ))
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveNewSha512HashCallAsts.Count -eq 1 -and
+            $archiveGetFileHashCallAsts.Count -eq 4 -and
+            $null -ne $archiveHashWorkCallAst -and
+            $archiveHashWorkCallAst.Extent.StartOffset -eq $archiveNewSha512HashCallAsts[0].Extent.StartOffset
+        ) `
+        -Name 'Archive/HashBusinessCallsRemainUnchanged' `
+        -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red

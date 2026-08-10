@@ -1,5 +1,141 @@
 # Changelog
 
+## 5.0.0-dev.19 — 2026-08-11
+
+Minimal observability/correctness release, from two real DEV-LIMS
+acceptance runs of 5.0.0-dev.18, with a review pass applied before
+release that replaced an initial, still-independent status-classification
+design with one that consumes the actual resolved BRAVO exit code (see
+the first two bullets below). Four focused fixes — no backup, restore,
+VSS, SHA512, retention, MANIFESTS, transfer, notification routing,
+`NotificationMode`, scheduler, or exit-code numerical semantics
+changed; Range ID missing-file warning-only semantics untouched.
+
+- Maintenance's final human-readable status (log `=== СТАТУС: ... ===`,
+  console `РЕЗУЛЬТАТ` "Статус" field, and the success/warnings-branch
+  Discord/Slack notification) now derives from the SAME resolved BRAVO
+  exit code that the process actually exits with — not from an
+  independent re-check of `$script:criticalErrorOccurred`/
+  `$script:BRAVOWarningCount`. `Get-BRAVOMaintenanceResolvedExitCode`
+  is the one place that priority policy (critical > warnings > success,
+  40/41/60 via `Resolve-BRAVOExitCode`) lives; `Get-BRAVOMaintenanceFinalStatus
+  -ExitCode <resolved code>` is a pure function that classifies that
+  number via `Get-BRAVOExitCodeName` (`Success`/`SuccessWithWarnings`/
+  anything else) into text/color — it no longer inspects the two flags
+  itself. The exit-code resolution was also moved earlier: it now runs
+  immediately after the outer try/catch closes (all business operations
+  and fail-safe handling, including the catch's own critical-flag set,
+  have already completed) and before the LOG `=== СТАТУС ===` line is
+  written, not after it as in the first cut of this fix — so the LOG
+  can no longer read a value computed from a different, earlier
+  snapshot than the process's actual exit code. `Send-FinalReport`'s
+  notification runs earlier still (inside the try, before its catch),
+  so it takes its own snapshot through the same canonical resolver;
+  if a later unhandled exception changes the outcome, the real,
+  later-computed `$script:maintenanceRuntimeExitCode` — not this
+  notification — governs the process exit code, exactly as before. A
+  real run with a missing Range ID log (`Test-RangeIdUsage`'s existing
+  `WARNING`-only path — unchanged) resolved exit code 10
+  (`SuccessWithWarnings`), but the LOG/console/notification all said
+  `УСПІШНО` with no mention of the warning; they now say `УСПІШНО З
+  ПОПЕРЕДЖЕННЯМИ` (the console previously said `ЧАСТКОВО` for the same
+  condition). `ПОМИЛКА` (any of 40/41/60, or any other non-success/
+  non-warning code) and plain `УСПІШНО` are unchanged.
+- The warnings notification no longer pairs a ✅ icon with "Дій не
+  потрібно" (no action needed) — `New-MaintenanceNotificationMessage`'s
+  severity classification now checks its canonical `:warning:` marker
+  before the `Title`-text "УСПІШ" match (previously the text match
+  always won, so a warnings-flavored Title with an explicit `:warning:`
+  emoji still classified as SUCCESS). The rendered notification for
+  warnings now shows `:warning: BRAVO MAINTENANCE — ПОТРІБНА ДІЯ` /
+  "Потрібна дія: перевірити журнал BRAVO_MAINTENANCE." — the repository's
+  existing warning-severity wording (same two fixed strings the other
+  `:warning:`-emoji call site, `Send-InactiveServiceWarning`, already
+  produces), not literal Title text. Plain success is unaffected (still
+  `:white_check_mark:` / "Дій не потрібно"); routing, `NotificationMode`,
+  `allowed_mentions`, timeout, and delivery mechanics are untouched.
+- Maintenance runtime-log bare `"==="` separators — Maintenance's own,
+  separate `Write-Log`/`Write-BRAVOMaintenanceLogFile` implementation,
+  not shared with Archive's dev.18 fix — no longer write a log record.
+  Root cause: `Write-BRAVOMaintenanceLogFile -Entry ("=" * $SeparatorLength)`
+  built a literal 100-character `====...====` row with zero diagnostic
+  value, always immediately adjacent to a real `"=== HEADING ==="` call
+  that already logs the same moment with full text. Applied uniformly
+  to every bare `"==="` call site, including the start/end banners —
+  the same call, same `"==="` argument, with no separate "banner-only"
+  code path in the source. Meaningful `=== HEADING ===` records
+  (ДЖЕРЕЛА ЖУРНАЛІВ, ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ, ЗУПИНКА СЛУЖБ, ПЕРЕВІРКА
+  РОЗМІРІВ .MD ФАЙЛІВ, РЕСТАВРАЦІЯ МОДЕЛІ, ОБРОБКА TRACE-ФАЙЛІВ, ОБРОБКА
+  ЛОГІВ EXCHANGAPI, ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ, ОЧИСТКА СТАРИХ
+  ДАНИХ, ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ, and both banner headings)
+  are completely unchanged.
+- Archive's VSS diagnostic log line ("Узгодженість архівів: ...") is
+  now factually correct. It said "окремий VSS-знімок для кожного
+  компонента" (a separate snapshot per component), while the runtime
+  has always created exactly one VSS Snapshot Set per generation
+  (`New-BRAVOVSSSnapshotSet`), shared by every enabled component
+  (MODEL/BLOG/BRAVOEXCH) — the same terminology `BRAVO_DRY_RUN.ps1`
+  already uses. This was flagged as a known, deliberately-deferred
+  issue in the dev.18 changelog entry above; it is fixed here. Text
+  only — VSS creation/cleanup, `SnapshotContext`, `SnapshotSetId`,
+  volume discovery, snapshot lifetime, and generation semantics are
+  unchanged.
+- Archive's `=== СТВОРЕННЯ ХЕШУ <компонент> ===` heading now prints
+  immediately before the first hash-generation action
+  (`New-SHA512Hash`), inside `Invoke-BRAVOComponentBackup` itself,
+  instead of in `Main` after the entire component backup (create +
+  hash + verify + publish) had already finished. A real run's log
+  showed the heading appearing after the work it described. The single
+  call site (`Invoke-BRAVOComponentBackup`, inside the `foreach
+  ($archive in $readyArchives)` loop) means the fix applies uniformly
+  to every enabled component without per-component duplication. Moving
+  the heading also fixes log component attribution for free:
+  `Resolve-BRAVOLogComponentFromHeader`/`Set-BRAVOLogComponent` now
+  switch `$script:BRAVOLogComponent` to `HASH` before, rather than
+  after, the hash work. SHA512 computation, sidecar filename/encoding,
+  integrity verification, archive publication, generation-COMPLETE
+  rules, and transfer ordering are unchanged.
+- Tests: 20 new checks — `Maintenance/Exit0RendersSuccess` /
+  `Exit10RendersSuccessWithWarnings` / `Exit40RendersFailure` /
+  `Exit41RendersFailure` / `Exit60RendersFailure` (functional calls to
+  the real, isolated `Get-BRAVOMaintenanceFinalStatus -ExitCode`, one
+  per code Maintenance can actually produce); `Maintenance/FinalStatusConsumesResolvedExitCode`
+  (AST proof `Get-BRAVOMaintenanceFinalStatus`'s own body never
+  references `$script:criticalErrorOccurred`/`$script:BRAVOWarningCount`,
+  `Get-BRAVOMaintenanceResolvedExitCode` genuinely calls
+  `Resolve-BRAVOExitCode`, and the LOG/console assignments occur in
+  source AFTER `$script:maintenanceRuntimeExitCode`'s one assignment —
+  actual data flow, not just co-located text); `Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy`
+  (the `УСПІШНО З ПОПЕРЕДЖЕННЯМИ` literal exists exactly once in the
+  source, and the helper is called from exactly its three consuming
+  sites); `Maintenance/WarningsNotificationUsesWarningMarkerNotSuccess`
+  / `PureSuccessNotificationUnaffectedBySeverityReorder` (real,
+  isolated `New-MaintenanceNotificationMessage` calls confirming the
+  ✅/⚠️ + operation/action-text consistency fix, and that it leaves the
+  plain-success rendering unchanged); `Maintenance/RangeIdMissingRemainsWarningOnly`
+  (`Test-RangeIdUsage`'s missing-file branch untouched: one `Test-Path`,
+  no `New-Item`, `WARNING`-level); `Maintenance/SectionSeparatorsDoNotEmitBareLogRecords`
+  / `SectionHeadingsRemainLogged` / `RuntimeLogHasNoRedundantSeparatorOnlySections`
+  (structural proof of the bare-separator branch plus a real functional
+  round-trip through Maintenance's own `Write-Log` into a temp file);
+  `Archive/VssDiagnosticDescribesSingleGenerationSnapshotSet` /
+  `VssDiagnosticDoesNotClaimPerComponentSnapshots` /
+  `VssBehaviorCodeUnchangedByDiagnosticFix` (AST call-count proof that
+  `New-BRAVOVSSSnapshotSet`/`Remove-BRAVOVSSSnapshotSet` are untouched);
+  `Archive/HashHeadingPrecedesHashWork` /
+  `HashHeadingPrecedesHashWorkForAllEnabledComponents` /
+  `HashLogsUseHashComponentAfterHeading` /
+  `HashBusinessCallsRemainUnchanged` (AST source-order proof plus a
+  real functional round-trip confirming the HASH component tag). Two
+  pre-existing tests were updated in place: `Maintenance/FinalSummarySuccess`
+  (dev.14, asserted the now-superseded `ЧАСТКОВО`/independent `elseif`
+  wording) and `ConsoleUX/21-ExitCodeComputedBeforeRender` (dev.16,
+  its Maintenance anchor text matched the old inline exit-code
+  assignment); two source-order tests (`Maintenance/FinalSummaryOccursBeforeManualPause`,
+  `Maintenance/PostOperationsPrecedeFinalSummary`, both dev.15) picked
+  up the same new anchor automatically since they reuse the shared
+  index variable. Full suite: 713/713.
+
 ## 5.0.0-dev.18 — 2026-08-10
 
 Minimal operator-flow/observability correctness release, from a real

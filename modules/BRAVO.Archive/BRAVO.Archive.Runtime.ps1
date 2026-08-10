@@ -2718,6 +2718,19 @@ function Invoke-BRAVOComponentBackup {
             return $result
         }
 
+        # dev.19: заголовок секції HASH — САМЕ ТУТ, безпосередньо перед
+        # першою дією хешування (New-SHA512Hash нижче), а не в Main ПІСЛЯ
+        # завершення всього Invoke-BRAVOComponentBackup (де раніше стояв
+        # Write-Log "=== СТВОРЕННЯ ХЕШУ ===" — реальний DEV-LIMS лог
+        # показував заголовок ПІСЛЯ вже виконаної роботи). Той самий
+        # Write-Log (не окрема реалізація), тому Resolve-BRAVOLogComponentFromHeader
+        # так само переводить $script:BRAVOLogComponent на HASH. Друкується
+        # незалежно від подальшого успіху/невдачі хешування — заголовок
+        # описує ПОЧАТОК цієї роботи, не її результат; сама послідовність
+        # create -> hash -> verify -> publish нижче не змінена.
+        Write-Log "==="
+        Write-Log "=== СТВОРЕННЯ ХЕШУ $Component ==="
+
         $temporaryHashPath = $result.TemporaryArchivePath + $hashFileExtension
         if (-not (New-SHA512Hash -FilePath $result.TemporaryArchivePath -HashFilePath $temporaryHashPath)) {
             $result.ErrorStage = 'HASH'
@@ -5163,7 +5176,14 @@ function Main {
             Write-Log "backupConsistency.SnapshotContext повинен мати значення ClientAccessible" -Level "ERROR"
             $archiveConsistencyValid = $false
         } else {
-            Write-Log "Узгодженість архівів: окремий VSS-знімок для кожного компонента" -Level "SUCCESS"
+            # dev.19: фактично виправлений текст — runtime створює ОДИН
+            # VSS Snapshot Set на generation (New-BRAVOVSSSnapshotSet,
+            # рядок ~5540 нижче), який спільно читають усі увімкнені
+            # компоненти (MODEL/BLOG/BRAVOEXCH), а не окремий знімок на
+            # кожен. Термінологія — та сама, що вже BRAVO_DRY_RUN.ps1
+            # ("один VSS Snapshot Set для всіх enabled archive components").
+            # Лише діагностичний текст; сама VSS-логіка не змінена.
+            Write-Log "Узгодженість архівів: один VSS Snapshot Set для всіх увімкнених компонентів generation" -Level "SUCCESS"
         }
     }
 
@@ -5661,8 +5681,11 @@ function Main {
             $componentPublished = $success -and $hashSuccess
 
             if ($componentPublished) {
-                Write-Log "==="
-                Write-Log "=== СТВОРЕННЯ ХЕШУ $($archive.Type) ==="
+                # dev.19: заголовок "=== СТВОРЕННЯ ХЕШУ ===" тепер друкує
+                # сам Invoke-BRAVOComponentBackup, безпосередньо перед
+                # New-SHA512Hash (хронологічно правильна позиція) — не тут,
+                # уже ПІСЛЯ повного завершення виклику. Show-ScriptProgress
+                # нижче — прогрес-бар, не журнал, лишається на своєму місці.
                 $hashProgress = [Math]::Min(69, $archiveProgress + 8)
                 Show-ScriptProgress -Status "SHA512 для $($archive.Type)" -PercentComplete $hashProgress
                 $results[$archive.Type] = @{
