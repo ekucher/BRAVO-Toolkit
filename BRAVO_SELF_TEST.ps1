@@ -5228,11 +5228,19 @@ try {
     # Вимкнений у конфігурації компонент не займає рядка етапу й не входить
     # у знаменник: етап існує лише для того, що справді виконуватиметься.
     # Знаменник тому обчислюваний, а не константа — Archive робив так від
-    # початку, Health і Maintenance підтягнуто до нього.
+    # початку, Health підтягнуто до нього.
+    #
+    # dev.15: Maintenance свідомо ВИКЛЮЧЕНО з цього переліку — затверджений
+    # operator contract тепер рівно 8 стабільних кроків, які рендеряться
+    # ЗАВЖДИ (вимкнений компонент показує SKIPPED 'вимкнено' на своєму
+    # постійному номері, а не зникає з нумерації й не зсуває решту).
+    # Раніше обчислюваний знаменник Maintenance (5+optional) давав
+    # "dynamic total" — саме той дефект, який Maintenance/MainStepTotalIsExactlyEight
+    # нижче тепер явно забороняє через AST. Це не регрес цього тесту, а
+    # свідома відмінність контракту Maintenance від Archive/Health.
     $runtimeStepTotals = @(
-        @{ Title = 'Archive';     Initializer = 'Initialize-BRAVOArchiveSteps' },
-        @{ Title = 'Health';      Initializer = 'Initialize-BRAVOHealthSteps' },
-        @{ Title = 'Maintenance'; Initializer = 'Initialize-BRAVOMaintenanceSteps' }
+        @{ Title = 'Archive'; Initializer = 'Initialize-BRAVOArchiveSteps' },
+        @{ Title = 'Health';  Initializer = 'Initialize-BRAVOHealthSteps' }
     )
     $runtimesWithConstantTotal = @()
     foreach ($runtimeStepTotal in $runtimeStepTotals) {
@@ -7008,7 +7016,18 @@ try {
     $rangeIdMissingPath = Join-Path $manifestStorageTestRoot 'does-not-exist-range-id.json'
     $rangeIdMissingResultCapture = & $rangeIdTestModule {
         param($Path)
-        function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) }
+        # Стаб дзеркалить реальну сигнатуру Write-Log (Message/Level/
+        # NoTimestamp/NoConsole) — тіло порожнє навмисно (нічого не
+        # логує), тому кожен параметр явно "consumed" через $null =,
+        # без нового PSReviewUnusedParameter (без side effects: жодного
+        # Write-Host/Write-Log/throw/exit/return).
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            $null = $Message
+            $null = $Level
+            $null = $NoTimestamp
+            $null = $NoConsole
+        }
         function Send-SlackAlert { param($Message, [switch]$IsCritical) }
         Test-RangeIdUsage -Path $Path -ThresholdPercent 90
     } $rangeIdMissingPath
@@ -7049,7 +7068,14 @@ try {
         $script:BRAVOWarningCount = 0
         $script:SlackAlertCriticalCallCount = 0
         function Write-Log {
-            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp)
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            # Message/NoTimestamp/NoConsole — дзеркалять реальну сигнатуру,
+            # тілу цього стаба вони не потрібні (лише Level впливає на
+            # $script:BRAVOWarningCount); consumed через $null =, без нового
+            # PSReviewUnusedParameter і без side effects.
+            $null = $Message
+            $null = $NoTimestamp
+            $null = $NoConsole
             if ($Level -eq 'WARNING') { $script:BRAVOWarningCount++ }
         }
         function Send-SlackAlert {
@@ -7367,6 +7393,310 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/FinalSummaryContainsOnlyApprovedFields" `
         -Failure ("реальний final-summary блок Maintenance.Runtime.ps1 має містити рівно затверджені 10 полів (відсутні: {0}) і не містити Maintenance/Архівація/Shutdown/'Детальний журнал'/'РЕЗУЛЬТАТ' (знайдено заборонених: {1}), і завершуватись Write-BRAVOFinalSummaryFooter, не Write-BRAVOResultFooter" -f
             ($maintenanceSummaryMissingApproved -join ', '), ($maintenanceSummaryHasForbidden -join ', '))
+
+    # ================================================================
+    # dev.15: затверджений 8-step operator contract — рівно 8 кроків
+    # завжди рендеряться, номер кроку НІКОЛИ не залежить від runtime-стану
+    # (лише SKIPPED/OK/WARN/FAIL), Migration/Cleanup/BRAVO_ARCHIV — поза
+    # цим контрактом (detailed LOG, не numbered main step). Реальний
+    # source/AST Maintenance.Runtime.ps1, БЕЗ запуску production Main().
+    # ================================================================
+    $maintenanceApprovedStepNames = @(
+        'Перевірка вільного місця',
+        'Створення необхідних директорій',
+        'Зупинка служб',
+        'Перевірка розмірів .md',
+        'Реставрація моделі',
+        'Обробка trace і логів',
+        'Відновлення стану служб',
+        'Контроль діапазонів ID'
+    )
+    $maintenanceStepCallNamePattern = "Write-BRAVOMaintenanceStep[\s``]*-Name\s+'([^']+)'"
+    $maintenanceStepCallMatches = [regex]::Matches($maintenanceScriptTextForManifestStorage, $maintenanceStepCallNamePattern)
+    $maintenanceStepCallOrderedNames = @($maintenanceStepCallMatches | ForEach-Object { $_.Groups[1].Value })
+    # Унікальні назви в порядку ПЕРШОЇ появи в джерелі — гілки (OK/WARN/
+    # FAIL/SKIPPED) того самого логічного кроку повторюють ту саму назву.
+    $maintenanceStepCallUniqueOrderedNames = @()
+    $maintenanceStepCallSeenNames = @{}
+    foreach ($stepCallName in $maintenanceStepCallOrderedNames) {
+        if (-not $maintenanceStepCallSeenNames.ContainsKey($stepCallName)) {
+            $maintenanceStepCallSeenNames[$stepCallName] = $true
+            $maintenanceStepCallUniqueOrderedNames += $stepCallName
+        }
+    }
+    $maintenanceStepMissingNames = @($maintenanceApprovedStepNames | Where-Object { $_ -notin $maintenanceStepCallUniqueOrderedNames })
+    $maintenanceStepExtraNames = @($maintenanceStepCallUniqueOrderedNames | Where-Object { $_ -notin $maintenanceApprovedStepNames })
+    $maintenanceStepOrderMatches = $maintenanceStepCallUniqueOrderedNames.Count -eq $maintenanceApprovedStepNames.Count
+    if ($maintenanceStepOrderMatches) {
+        for ($stepOrderIndex = 0; $stepOrderIndex -lt $maintenanceApprovedStepNames.Count; $stepOrderIndex++) {
+            if ($maintenanceStepCallUniqueOrderedNames[$stepOrderIndex] -ne $maintenanceApprovedStepNames[$stepOrderIndex]) {
+                $maintenanceStepOrderMatches = $false
+                break
+            }
+        }
+    }
+
+    # --- AST: Initialize-BRAVOMaintenanceSteps -Total має бути буквальним
+    # літералом 8, не виразом (5+optional/9+optional/dynamic тощо).
+    $maintenanceStepTotalTokens = $null
+    $maintenanceStepTotalErrors = $null
+    $maintenanceStepTotalAst = [Management.Automation.Language.Parser]::ParseInput(
+        $maintenanceScriptTextForManifestStorage,
+        [ref]$maintenanceStepTotalTokens,
+        [ref]$maintenanceStepTotalErrors
+    )
+    $maintenanceInitStepsCallAst = $maintenanceStepTotalAst.Find(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Initialize-BRAVOMaintenanceSteps'
+        },
+        $true
+    )
+    $maintenanceTotalParamValueAst = $null
+    if ($null -ne $maintenanceInitStepsCallAst) {
+        for ($cmdElementIndex = 0; $cmdElementIndex -lt $maintenanceInitStepsCallAst.CommandElements.Count; $cmdElementIndex++) {
+            $cmdElement = $maintenanceInitStepsCallAst.CommandElements[$cmdElementIndex]
+            if ($cmdElement -is [Management.Automation.Language.CommandParameterAst] -and $cmdElement.ParameterName -eq 'Total') {
+                $maintenanceTotalParamValueAst = $maintenanceInitStepsCallAst.CommandElements[$cmdElementIndex + 1]
+                break
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $maintenanceTotalParamValueAst -and
+            $maintenanceTotalParamValueAst -is [Management.Automation.Language.ConstantExpressionAst] -and
+            [int]$maintenanceTotalParamValueAst.Value -eq 8
+        ) `
+        -Name "Maintenance/MainStepTotalIsExactlyEight" `
+        -Failure "Initialize-BRAVOMaintenanceSteps -Total має бути буквальним літералом 8 (реальний AST), не динамічним виразом (5+optional/9+optional/тощо)"
+
+    Test-BRAVOCondition `
+        -Condition ($maintenanceStepMissingNames.Count -eq 0 -and $maintenanceStepExtraNames.Count -eq 0) `
+        -Name "Maintenance/AllEightStepsHaveRenderCall" `
+        -Failure ("кожен із 8 затверджених кроків має мати виклик Write-BRAVOMaintenanceStep з відповідним -Name, і жодних інших numbered кроків (Migration/Cleanup/BRAVO_ARCHIV НЕ мають власного [N/8]); відсутні: {0}; зайві: {1}" -f
+            ($maintenanceStepMissingNames -join ', '), ($maintenanceStepExtraNames -join ', '))
+
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceStepOrderMatches -and
+            $maintenanceStepCallUniqueOrderedNames[-1] -eq 'Контроль діапазонів ID'
+        ) `
+        -Name "Maintenance/LastStepCanReachEightOfEight" `
+        -Failure "останній numbered крок, що фактично рендериться в джерелі, має бути 'Контроль діапазонів ID' на позиції 8 із 8 — інакше Total=8 і фактична нумерація розходяться"
+
+    # --- Restore/SizeCheck/Logs/RangeId disabled -> SKIPPED, той самий
+    # номер кроку не пропускається. Кожен тест шукає gate-умову ЦЬОГО
+    # конкретного кроку (унікальний якір у джерелі), тоді перевіряє, що
+    # SKIPPED/'вимкнено' (чи специфічний Details) прив'язані САМЕ до неї,
+    # не просто десь є у файлі.
+    $maintenanceRestoreGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $restoreStepReported) {')
+    $maintenanceRestoreGateWindow = if ($maintenanceRestoreGateIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceRestoreGateIndex,
+            [Math]::Min(400, $maintenanceScriptTextForManifestStorage.Length - $maintenanceRestoreGateIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceRestoreGateIndex -ge 0 -and
+            $maintenanceRestoreGateWindow.Contains("-Name 'Реставрація моделі' ``") -and
+            $maintenanceRestoreGateWindow.Contains("-Status 'SKIPPED' ``") -and
+            $maintenanceRestoreGateWindow.Contains("'не заплановано на цей запуск'")
+        ) `
+        -Name "Maintenance/RestoreDisabledRendersSkipped" `
+        -Failure "коли реставрація не запланована цього прогону (`$shouldRestore=false), крок 'Реставрація моделі' має рендеритись SKIPPED 'не заплановано на цей запуск', зі своїм номером [5/8]"
+
+    $maintenanceSizeCheckGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {')
+    $maintenanceSizeCheckGateWindow = if ($maintenanceSizeCheckGateIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceSizeCheckGateIndex,
+            [Math]::Min(700, $maintenanceScriptTextForManifestStorage.Length - $maintenanceSizeCheckGateIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceSizeCheckGateIndex -ge 0 -and
+            $maintenanceSizeCheckGateWindow.Contains('} else {') -and
+            $maintenanceSizeCheckGateWindow.Contains("-Name 'Перевірка розмірів .md' ``") -and
+            $maintenanceSizeCheckGateWindow.Contains("-Status 'SKIPPED' ``") -and
+            $maintenanceSizeCheckGateWindow.Contains("-Details 'вимкнено'")
+        ) `
+        -Name "Maintenance/SizeCheckDisabledRendersSkipped" `
+        -Failure "коли перевірку розмірів .md вимкнено, крок 'Перевірка розмірів .md' має рендеритись SKIPPED 'вимкнено', зі своїм номером [4/8]"
+
+    $maintenanceLogsGateIndex = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $script:BRAVOMaintenanceLogsStepEnabled) {')
+    $maintenanceLogsGateWindow = if ($maintenanceLogsGateIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceLogsGateIndex,
+            [Math]::Min(300, $maintenanceScriptTextForManifestStorage.Length - $maintenanceLogsGateIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceLogsGateIndex -ge 0 -and
+            $maintenanceLogsGateWindow.Contains("-Name 'Обробка trace і логів' ``") -and
+            $maintenanceLogsGateWindow.Contains("-Status 'SKIPPED' ``") -and
+            $maintenanceLogsGateWindow.Contains("-Details 'вимкнено'")
+        ) `
+        -Name "Maintenance/LogsDisabledRendersSkipped" `
+        -Failure "коли компонент BRAVO вимкнено, крок 'Обробка trace і логів' має рендеритись SKIPPED 'вимкнено', зі своїм номером [6/8]"
+
+    $maintenanceOuterRangeTryIndex = $maintenanceScriptTextForManifestStorage.IndexOf('усе від Range ID до Send-FinalReport')
+    $maintenanceRangeIdGateIndex = if ($maintenanceOuterRangeTryIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.IndexOf(
+            'if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {',
+            $maintenanceOuterRangeTryIndex)
+    } else { -1 }
+    $maintenanceRangeIdGateWindow = if ($maintenanceRangeIdGateIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceRangeIdGateIndex,
+            [Math]::Min(2500, $maintenanceScriptTextForManifestStorage.Length - $maintenanceRangeIdGateIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceRangeIdGateIndex -ge 0 -and
+            $maintenanceRangeIdGateWindow.Contains('} else {') -and
+            $maintenanceRangeIdGateWindow.Contains("-Name 'Контроль діапазонів ID' ``") -and
+            $maintenanceRangeIdGateWindow.Contains("-Status 'SKIPPED' ``") -and
+            $maintenanceRangeIdGateWindow.Contains("-Details 'вимкнено'")
+        ) `
+        -Name "Maintenance/RangeIdDisabledRendersSkipped" `
+        -Failure "коли компонент BRAVO або контроль діапазонів ID вимкнено, крок 'Контроль діапазонів ID' має рендеритись SKIPPED 'вимкнено', зі своїм номером [8/8]"
+
+    # ================================================================
+    # dev.15: fail-safe finalization — жоден звичайний чи exception-шлях
+    # після відновлення служб не може обійти обчислення exit code і
+    # фінальний summary. Структурна перевірка реального порядку в
+    # джерелі (той самий IndexOf-підхід, що Console/MaintenancePausesOnEveryExitPath
+    # вище), без запуску production Main().
+    # ================================================================
+    $maintenanceOuterRangeCatchIndex = $maintenanceScriptTextForManifestStorage.IndexOf('див. коментар біля відкриття try вище')
+    $maintenanceEndOfScriptMarkerIndex = $maintenanceScriptTextForManifestStorage.IndexOf('# ===== ЗАВЕРШЕННЯ СКРИПТУ =====')
+    $maintenanceExitCodeCalcIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = if ($script:criticalErrorOccurred) {')
+    $maintenanceSummaryHeaderOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `')
+    $maintenanceSummaryFooterOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')
+    $maintenanceManualExitOrderIndex = $maintenanceScriptTextForManifestStorage.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
+    $maintenanceCatchBodyText = if ($maintenanceOuterRangeCatchIndex -ge 0 -and $maintenanceEndOfScriptMarkerIndex -gt $maintenanceOuterRangeCatchIndex) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceOuterRangeCatchIndex,
+            $maintenanceEndOfScriptMarkerIndex - $maintenanceOuterRangeCatchIndex)
+    } else { '' }
+
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceExitCodeCalcIndex -ge 0 -and
+            $maintenanceSummaryHeaderOrderIndex -gt $maintenanceExitCodeCalcIndex -and
+            $maintenanceSummaryFooterOrderIndex -gt $maintenanceSummaryHeaderOrderIndex -and
+            $maintenanceManualExitOrderIndex -gt $maintenanceSummaryFooterOrderIndex
+        ) `
+        -Name "Maintenance/FinalSummaryOccursBeforeManualPause" `
+        -Failure "порядок джерела має бути: обчислення exit code -> Write-BRAVOFinalSummaryHeader -> поля -> Write-BRAVOFinalSummaryFooter -> Wait-BRAVOManualExit — саме в цій послідовності"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceOuterRangeTryIndex -ge 0 -and
+            $maintenanceOuterRangeCatchIndex -gt $maintenanceOuterRangeTryIndex -and
+            $maintenanceEndOfScriptMarkerIndex -gt $maintenanceOuterRangeCatchIndex -and
+            $maintenanceExitCodeCalcIndex -gt $maintenanceEndOfScriptMarkerIndex
+        ) `
+        -Name "Maintenance/NormalCompletionCannotBypassFinalSummary" `
+        -Failure "звичайне (без винятку) завершення має проходити крізь той самий try -> (catch пропущено) -> ЗАВЕРШЕННЯ СКРИПТУ -> обчислення exit code, без окремого return/exit, що обходить summary"
+
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrEmpty($maintenanceCatchBodyText) -and
+            $maintenanceCatchBodyText.Contains('$script:criticalErrorOccurred = $true') -and
+            -not [regex]::IsMatch($maintenanceCatchBodyText, '(?m)^\s*(exit|return)\b')
+        ) `
+        -Name "Maintenance/PostServiceExceptionStillReachesSummary" `
+        -Failure "catch-блок (Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт) має позначати criticalErrorOccurred і НЕ містити return/exit, що обійшов би ЗАВЕРШЕННЯ СКРИПТУ й фінальний summary нижче"
+
+    $maintenanceCatchCriticalFlagIndex = $maintenanceCatchBodyText.IndexOf('$script:criticalErrorOccurred = $true')
+    $maintenanceCatchFirstTryIndex = $maintenanceCatchBodyText.IndexOf('try {')
+    $maintenanceCatchLoggingWrapped = [regex]::IsMatch(
+        $maintenanceCatchBodyText,
+        'try\s*\{\s*Write-Log\s+-Message\s+"ПОМИЛКА: \$errorMsg"\s+-Level\s+"ERROR"\s*\}\s*catch\s*\{\s*#[^\}]*не rethrow[^\}]*\}'
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCatchCriticalFlagIndex -ge 0 -and
+            $maintenanceCatchFirstTryIndex -gt $maintenanceCatchCriticalFlagIndex -and
+            $maintenanceCatchLoggingWrapped
+        ) `
+        -Name "Maintenance/CatchLoggingFailureCannotBypassSummary" `
+        -Failure "criticalErrorOccurred=true має встановлюватись ДО ізольованого Write-Log, і збій самого Write-Log (isolated try/catch, без rethrow) не повинен обійти ЗАВЕРШЕННЯ СКРИПТУ/summary нижче"
+
+    $maintenanceCatchNotificationWrapped = [regex]::IsMatch(
+        $maintenanceCatchBodyText,
+        'try\s*\{\s*Send-SlackAlert\s+-Message\s+\$errorMsg\s+-IsCritical\s*\}\s*catch\s*\{\s*#[^\}]*не rethrow[^\}]*\}'
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCatchCriticalFlagIndex -ge 0 -and
+            $maintenanceCatchFirstTryIndex -gt $maintenanceCatchCriticalFlagIndex -and
+            $maintenanceCatchNotificationWrapped
+        ) `
+        -Name "Maintenance/CatchNotificationFailureCannotBypassSummary" `
+        -Failure "criticalErrorOccurred=true має встановлюватись ДО ізольованого Send-SlackAlert, і збій самого Send-SlackAlert (isolated try/catch, без rethrow) не повинен обійти ЗАВЕРШЕННЯ СКРИПТУ/summary нижче"
+
+    # ================================================================
+    # dev.15: Range ID — WARN не дублюється в консолі (Write-Log -NoConsole
+    # всередині Test-RangeIdUsage), відсутній файл дає multiline Reason.
+    # ================================================================
+    $maintenanceRangeIdFunctionStart = $maintenanceScriptTextForManifestStorage.IndexOf('function Test-RangeIdUsage')
+    $maintenanceRangeIdFunctionEnd = $maintenanceScriptTextForManifestStorage.IndexOf('function Format-CommandOutput', $maintenanceRangeIdFunctionStart)
+    $maintenanceRangeIdFunctionText = if ($maintenanceRangeIdFunctionStart -ge 0 -and $maintenanceRangeIdFunctionEnd -gt $maintenanceRangeIdFunctionStart) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceRangeIdFunctionStart, $maintenanceRangeIdFunctionEnd - $maintenanceRangeIdFunctionStart)
+    } else { '' }
+    # Лише виклики, чиє повідомлення повертається як .Reason (і тому й так
+    # уже показується оператору через -Details кроку [8/8]) мають бути
+    # -NoConsole. "Некоректне значення filled" — окреме per-entry
+    # попередження, яке НЕ потрапляє в Reason/Details і тому законно
+    # лишається звичайним консольним WARNING без -NoConsole.
+    $maintenanceRangeIdReasonWarningCalls = [regex]::Matches(
+        $maintenanceRangeIdFunctionText,
+        'Write-Log\s+\$(errorMessage|readErrorMessage|message)\s+-Level\s+"WARNING"[^\r\n]*'
+    )
+    $maintenanceRangeIdReasonWarningCallsMissingNoConsole = @(
+        $maintenanceRangeIdReasonWarningCalls | Where-Object { $_.Value -notmatch '-NoConsole' }
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceRangeIdReasonWarningCalls.Count -eq 3 -and
+            $maintenanceRangeIdReasonWarningCallsMissingNoConsole.Count -eq 0
+        ) `
+        -Name "Maintenance/RangeIdWarningHasSingleConsoleRender" `
+        -Failure "усі Write-Log виклики, чиє повідомлення повертається як .Reason (errorMessage/readErrorMessage/message), мають бути -NoConsole — інакше WARN дублюється в консолі (раз від Write-Log, раз від Details кроку [8/8])"
+
+    # Той самий виклик/шлях/поріг, що вже захопив $rangeIdMissingResultCapture
+    # вище (RangeIdMissingRemainsWarning) — повторний виклик isolated module
+    # з ідентичними стабами був би чистим дублюванням.
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $rangeIdMissingResultCapture -and
+            [string]$rangeIdMissingResultCapture.Reason -eq "Файл контролю діапазонів ID не знайдено:`n$rangeIdMissingPath"
+        ) `
+        -Name "Maintenance/RangeIdMissingUsesMultilineDetail" `
+        -Failure "Reason відсутнього Range ID файлу має бути multiline (мітка окремим рядком, шлях — наступним), без старого однорядкового варіанту, і без раннього return, що його випереджає"
+
+    # ================================================================
+    # dev.15: План операцій закривається тим самим '='-роздільником
+    # (Write-BRAVOHeaderSeparator), що обрамляє заголовок, а не '-'
+    # (Write-BRAVOSeparator, стиль блоку РЕЗУЛЬТАТ).
+    # ================================================================
+    $maintenanceHeaderSeparatorCapture = Write-BRAVOHeaderSeparator 6>&1
+    $maintenanceHeaderSeparatorText = ($maintenanceHeaderSeparatorCapture | ForEach-Object { $_.ToString() }) -join "`n"
+    # Регекс на РЕАЛЬНИЙ виклик-рядок (не substring), бо коментарі поруч
+    # свідомо згадують стару назву 'Write-BRAVOSeparator' для пояснення —
+    # `.Contains()` на всьому файлі ловив би й коментар.
+    Test-BRAVOCondition `
+        -Condition (
+            [regex]::IsMatch($maintenanceScriptTextForManifestStorage, '(?m)^Write-BRAVOHeaderSeparator\s*$') -and
+            -not [regex]::IsMatch($maintenanceScriptTextForManifestStorage, '(?m)^Write-BRAVOSeparator\s*$') -and
+            $maintenanceHeaderSeparatorText -eq $maintenanceSeparatorLine
+        ) `
+        -Name "Maintenance/PlanUsesEqualsSeparator" `
+        -Failure "роздільник після 'План операцій:' має бути тим самим '='*60 (Write-BRAVOHeaderSeparator), що обрамляє заголовок, а не '-'*60 (Write-BRAVOSeparator)"
 
     $legacyEntryPoints = @(
         'ARCHIV_VETOFFICE.ps1',
@@ -9071,7 +9401,12 @@ function Get-BRAVOMaintenanceSummaryResult {
             param($Path)
             $messages = New-Object System.Collections.Generic.List[string]
             function Write-Log {
-                param($Message, $Level)
+                param($Message, $Level, [switch]$NoTimestamp, [switch]$NoConsole)
+                # NoTimestamp/NoConsole — дзеркалять реальну сигнатуру,
+                # тілу не потрібні (лише Message/Level фіксуються);
+                # consumed через $null =, без нового PSReviewUnusedParameter.
+                $null = $NoTimestamp
+                $null = $NoConsole
                 $messages.Add("[$Level] $Message")
             }
             function Send-SlackAlert { param($Message, [switch]$IsCritical) }

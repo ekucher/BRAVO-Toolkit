@@ -903,7 +903,7 @@ function Get-BRAVOMaintenanceExecutionMode {
 }
 
 # ===== ОПЕРАЦІЙНА КОНСОЛЬ =====
-# Нумерація етапів: [1/9], [2/9], ... Ті самі елементи виводу, що в Archive
+# Нумерація етапів: [1/8], [2/8], ... Ті самі елементи виводу, що в Archive
 # і Health: заголовок, етапи, підсумок.
 $script:BRAVOMaintenanceStepCurrent = 0
 $script:BRAVOMaintenanceStepTotal = 0
@@ -1016,7 +1016,14 @@ function Write-Log {
         [string]$Message,
         [string]$Level = "INFO",
         [int]$SeparatorLength = 100,
-        [switch]$NoTimestamp
+        [switch]$NoTimestamp,
+        # dev.15: для повідомлень, які й так вже показані оператору іншим
+        # шляхом (наприклад Details операційного кроку) — LOG-файл і
+        # сповіщення (Send-SlackAlert викликається окремо, не звідси)
+        # лишаються незмінними, друк у консоль пропускається. За
+        # замовчуванням вимкнено — жоден існуючий виклик Write-Log не змінює
+        # поведінку.
+        [switch]$NoConsole
     )
 
     # Пароль архіву, webhook чи URL з обліковими даними можуть потрапити
@@ -1092,7 +1099,7 @@ function Write-Log {
         }
     }
 
-    if ($messageLevel -ge $consoleThreshold) {
+    if (-not $NoConsole -and $messageLevel -ge $consoleThreshold) {
         Write-BRAVOConsoleMessage -Message $consoleEntry -Level $normalizedLevel
     }
 
@@ -1573,11 +1580,20 @@ function Test-RangeIdUsage {
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         $errorMessage = "Файл контролю діапазонів ID не знайдено: $Path"
-        Write-Log $errorMessage -Level "WARNING"
+        # dev.15: -NoConsole — виклик кроку нижче й так друкує Reason як
+        # Details під рядком [N/8] (WARN), тому голий Write-Log у консоль
+        # був би тим самим повідомленням удруге. LOG-файл і сповіщення
+        # (Send-SlackAlert -IsCritical, errors_only) лишаються незмінними.
+        Write-Log $errorMessage -Level "WARNING" -NoConsole
         # Без вихідного файла неможливо підтвердити стан ID-інтервалів.
         # Критичний статус забезпечує сповіщення і в режимі errors_only.
         Send-SlackAlert -Message $errorMessage -IsCritical
-        return [pscustomobject]@{ HasIssue = $true; Reason = $errorMessage }
+        # Details під кроком — два рядки (мітка + шлях окремо), а не один
+        # довгий рядок; LOG/Slack і далі отримують односрядковий $errorMessage.
+        return [pscustomobject]@{
+            HasIssue = $true
+            Reason = "Файл контролю діапазонів ID не знайдено:`n$Path"
+        }
     }
 
     $rangeData = $null
@@ -1610,7 +1626,7 @@ function Test-RangeIdUsage {
 
     if ($readError -or -not $rangeData) {
         $readErrorMessage = "Не вдалося прочитати файл контролю діапазонів ID '$Path': $($readError.Exception.Message)"
-        Write-Log $readErrorMessage -Level "WARNING"
+        Write-Log $readErrorMessage -Level "WARNING" -NoConsole
         return [pscustomobject]@{ HasIssue = $true; Reason = $readErrorMessage }
     }
 
@@ -1671,7 +1687,7 @@ function Test-RangeIdUsage {
         $message += "`nЧас оновлення даних: $($rangeData.time)"
     }
 
-    Write-Log $message -Level "WARNING"
+    Write-Log $message -Level "WARNING" -NoConsole
     Send-SlackAlert -Message $message -IsCritical
     $exceededSummary = "перевищено поріг {0}%: {1}" -f $thresholdText, ($exceededRanges.Count)
     return [pscustomobject]@{ HasIssue = $true; Reason = $exceededSummary }
@@ -4025,17 +4041,26 @@ $script:BRAVOMaintenanceLegacyMigrationPlan = @(
         }
 )
 $script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMigrationPlan.Count -gt 0)
-# Вільне місце, директорії, зупинка служб, відновлення служб і очистка
-# виконуються завжди.
-Initialize-BRAVOMaintenanceSteps -Total (
-    5 +
-    $(if ($script:BRAVOMaintenanceMigrationStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceCheckSizeStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceRestoreStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceLogsStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceArchiveStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceRangeIdStepEnabled) { 1 } else { 0 })
-)
+# dev.15: стабільний операційний цикл — РІВНО 8 кроків завжди рендеряться,
+# номер кроку НІКОЛИ не пропускається (лише статус OK/WARN/FAIL/SKIPPED
+# залежить від того, чи ввімкнена/потрібна дія цього прогону):
+#   [1/8] Перевірка вільного місця
+#   [2/8] Створення необхідних директорій
+#   [3/8] Зупинка служб
+#   [4/8] Перевірка розмірів .md
+#   [5/8] Реставрація моделі
+#   [6/8] Обробка trace і логів
+#   [7/8] Відновлення стану служб
+#   [8/8] Контроль діапазонів ID
+# Раніше CheckSize/Restore/Logs/RangeId пропускали крок ЦІЛКОМ, коли
+# вимкнені/не заплановані — номер зсувався, і на реальній інсталяції
+# прогін міг "закінчитись" на [7/N] замість очікуваного останнього
+# кроку. Total — буквальний літерал 8, НЕ вираз: Міграція старих
+# журналів, Очистка старих даних і запуск BRAVO_ARCHIV — по-справжньому
+# опційні операції поза цим затвердженим контрактом (detailed LOG,
+# видимі в Плані операцій, але БЕЗ власного [N/8] і без виклику
+# Write-BRAVOMaintenanceStep) — тому не додаються до Total.
+Initialize-BRAVOMaintenanceSteps -Total 8
 Write-BRAVOHeader `
     -Title ("BRAVO MAINTENANCE {0}" -f $global:ScriptVersion) `
     -Institution ([string]$bravoSettings.InstitutionName) `
@@ -4089,7 +4114,11 @@ foreach ($planEntry in $maintenancePlanEntries.GetEnumerator()) {
     Write-Host ("  {0}{1}" -f $planLabel, $planValue)
 }
 Write-Host ''
-Write-BRAVOSeparator
+# dev.15: '='-роздільник (Write-BRAVOHeaderSeparator), не '-'
+# (Write-BRAVOSeparator) — План операцій є продовженням того самого
+# титульного блоку, що відкрив Write-BRAVOHeader вище, а не окремим
+# блоком РЕЗУЛЬТАТ.
+Write-BRAVOHeaderSeparator
 
 Write-Log -Message "==="
 Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАПУЩЕНА ==="
@@ -4426,8 +4455,6 @@ if ($directoryStepStatus -eq 'SKIPPED') {
 # журналів у ArchiveRoot, тримати заради неї BRAVO зупиненим не потрібно.
 # Виконується перед ротацією, щоб нові файли лягали у вже впорядковане дерево.
 if ($script:BRAVOMaintenanceMigrationStepEnabled) {
-    $migrationCriticalBefore = $script:criticalErrorOccurred
-    $migrationWarningsBefore = $script:BRAVOWarningCount
     Write-Log -Message "==="
     Write-Log -Message "=== МІГРАЦІЯ СТАРОЇ СТРУКТУРИ ЖУРНАЛІВ ==="
     $migratedTotal = 0
@@ -4448,19 +4475,17 @@ if ($script:BRAVOMaintenanceMigrationStepEnabled) {
             Write-Log -Message "ПОМИЛКА міграції каталогу $($migrationEntry.LegacyPath): $($_.Exception.Message)" -Level "ERROR"
         }
     }
-    # Невдала міграція не знищує нічого: джерело лишається на місці й
-    # переїде наступного запуску. Тому це не критична помилка комплекту —
-    # достатньо WARN, який уже підняв рівень етапу.
-    Write-BRAVOMaintenanceStep `
-        -Name 'Міграція старих журналів' `
-        -Status (Get-BRAVOMaintenanceStepStatus `
-            -CriticalBefore $migrationCriticalBefore `
-            -WarningsBefore $migrationWarningsBefore) `
-        -Details $(if ($migratedTotal -gt 0 -or $migrationFailedTotal -gt 0) {
-            "перенесено: $migratedTotal; не вдалося: $migrationFailedTotal"
-        } else {
-            'нічого переносити'
-        })
+    # dev.15: міграція — опційна разова операція поза затвердженим [N/8]
+    # контрактом (не numbered main step); підсумок лишається в LOG, без
+    # Write-BRAVOMaintenanceStep і без власного номера кроку. Невдала
+    # міграція не знищує нічого: джерело лишається на місці й переїде
+    # наступного запуску, тому рівень лишається INFO (як і раніше — per-
+    # directory помилки вище вже логуються окремо рівнем ERROR).
+    Write-Log -Message $(if ($migratedTotal -gt 0 -or $migrationFailedTotal -gt 0) {
+        "Міграція старої структури журналів завершена: перенесено $migratedTotal; не вдалося $migrationFailedTotal"
+    } else {
+        "Міграція старої структури журналів: нічого переносити"
+    })
 }
 
 $traceOutputProcessed = $false
@@ -4638,6 +4663,8 @@ Write-BRAVOMaintenanceStep `
 Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 35
 $checkSizeCriticalBefore = $script:criticalErrorOccurred
 $checkSizeWarningsBefore = $script:BRAVOWarningCount
+# dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
+# 'вимкнено', коли перевірку розмірів вимкнено, а не пропуск номера кроку.
 if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
     Check-MdFileSizes -MODEL_PATH $MODEL_PATH -MAX_MD_FILE_SIZE $MAX_MD_FILE_SIZE -ExcludePatterns $MD_FILE_SIZE_EXCLUSIONS
     Write-BRAVOMaintenanceStep `
@@ -4645,6 +4672,11 @@ if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
         -Status (Get-BRAVOMaintenanceStepStatus `
             -CriticalBefore $checkSizeCriticalBefore `
             -WarningsBefore $checkSizeWarningsBefore)
+} else {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Перевірка розмірів .md' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
 }
 
 # ===== ОПЕРАЦІЇ ПІСЛЯ ЗУПИНКИ СЕРВІСІВ =====
@@ -4965,42 +4997,59 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
     }
 }
 
+# Реставрація моделі — стабільний крок [5/8], завжди рендериться, і має
+# рендеритись ДО «Обробка trace і логів» [6/8] — той самий порядок, що в
+# затвердженому operator contract, незалежно від того, чи справді
+# виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
+# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з двох причин,
+# які варто розрізняти в Details:
+# - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
+#   заплановане й невиконане, а не «не настав час»;
+# - $shouldRestore було false від самого початку — реставрація цього
+#   прогону не планувалась взагалі (dev.15: раніше цей випадок не
+#   рендерив крок взагалі, номер кроку "з'їдався").
+# dev.15 (виправлення порядку): цей fallback раніше стояв ПІСЛЯ рендеру
+# «Обробка trace і логів» нижче — коли $shouldRestore=false (типовий
+# щоденний прогін без запланованої реставрації), Logs встигав зайняти
+# номер [5/8], а Restore-SKIPPED зсувався на [6/8], міняючи затверджений
+# порядок місцями. Переміщено вище рендеру Logs, щоб порядок номерів
+# лишався стабільним у БУДЬ-якому сценарії.
+if (-not $restoreStepReported) {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Реставрація моделі' `
+        -Status 'SKIPPED' `
+        -Details $(if ($shouldRestore) { 'службу BRAVO не було зупинено' } else { 'не заплановано на цей запуск' })
+}
+
 # Підсумковий рядок етапу — поза блоком BRAVO Web. Раніше він стояв
 # усередині нього, тому на інсталяції без Apache етап «Обробка trace і
 # логів» щоразу друкувався як SKIPPED «службу BRAVO не було зупинено»,
 # хоча trace і exchangAPI щойно успішно оброблені.
-if ($script:BRAVOMaintenanceLogsStepEnabled) {
-    if ($bravoStatus -eq 'Running') {
-        # Заплановане й невиконане, а не «не настав час»: службу BRAVO не
-        # вдалося зупинити, тому жодного журналу не чіпали.
-        Write-BRAVOMaintenanceStep `
-            -Name 'Обробка trace і логів' `
-            -Status 'SKIPPED' `
-            -Details 'службу BRAVO не було зупинено'
-    } else {
-        $processedLogCounts = $traceOutputProcessedCount +
-            $exchangAPILogsProcessedCount +
-            $webApacheLogsProcessedCount +
-            $webWwwLogsProcessedCount
-        Write-BRAVOMaintenanceStep `
-            -Name 'Обробка trace і логів' `
-            -Status (Get-BRAVOMaintenanceStepStatus `
-                -CriticalBefore $logsCriticalBefore `
-                -WarningsBefore $logsWarningsBefore) `
-            -Details $(if ($processedLogCounts -gt 0) { "оброблено файлів: $processedLogCounts" } else { $null })
-    }
-}
-
-# Реставрація виконується лише при зупиненій службі BRAVO. Сюди потрапляємо,
-# лише якщо етап був порахований, але його гілка не відпрацювала — тобто
-# службу BRAVO не вдалося зупинити. Це не «не настав час» (такий запуск
-# взагалі не рахує реставрацію), а заплановане й невиконане, тому рядок
-# обов'язковий.
-if ($script:BRAVOMaintenanceRestoreStepEnabled -and -not $restoreStepReported) {
+# dev.15: крок завжди рендериться (стабільна нумерація [N/8]); окремий
+# SKIPPED 'вимкнено', коли компонент BRAVO взагалі вимкнено.
+if (-not $script:BRAVOMaintenanceLogsStepEnabled) {
     Write-BRAVOMaintenanceStep `
-        -Name 'Реставрація моделі' `
+        -Name 'Обробка trace і логів' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
+} elseif ($bravoStatus -eq 'Running') {
+    # Заплановане й невиконане, а не «не настав час»: службу BRAVO не
+    # вдалося зупинити, тому жодного журналу не чіпали.
+    Write-BRAVOMaintenanceStep `
+        -Name 'Обробка trace і логів' `
         -Status 'SKIPPED' `
         -Details 'службу BRAVO не було зупинено'
+} else {
+    $processedLogCounts = $traceOutputProcessedCount +
+        $exchangAPILogsProcessedCount +
+        $webApacheLogsProcessedCount +
+        $webWwwLogsProcessedCount
+    Write-BRAVOMaintenanceStep `
+        -Name 'Обробка trace і логів' `
+        -Status (Get-BRAVOMaintenanceStepStatus `
+            -CriticalBefore $logsCriticalBefore `
+            -WarningsBefore $logsWarningsBefore) `
+        -Details $(if ($processedLogCounts -gt 0) { "оброблено файлів: $processedLogCounts" } else { $null })
 }
 
 } finally {
@@ -5107,6 +5156,17 @@ Write-BRAVOMaintenanceStep `
         -WarningsBefore $restoreServicesWarningsBefore)
 }
 
+# dev.15: усе від Range ID до Send-FinalReport раніше не мало жодного
+# захисту від винятків — необроблена помилка будь-де в цьому діапазоні
+# (Cleanup/Archive-launch/AutoShutdown/Send-FinalReport) пропускала решту
+# зовнішнього try (4474) аж до фінального summary й одразу потрапляла у
+# зовнішній finally (Wait-BRAVOManualExit, рядок ~5512) — оператор бачив
+# останній надрукований крок і одразу "Натисніть будь-яку клавішу...",
+# без жодного підсумку. Тепер будь-яка помилка тут логується/позначає
+# criticalErrorOccurred, але виконання ГАРАНТОВАНО доходить до обчислення
+# exit code і друку фінального summary нижче.
+try {
+
 if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
     if ($RangeIdCheckDelaySeconds -gt 0) {
         Start-Sleep -Seconds $RangeIdCheckDelaySeconds
@@ -5141,12 +5201,17 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
         -Name 'Контроль діапазонів ID' `
         -Status $(if ($rangeIdHasWarning) { 'WARN' } else { 'OK' }) `
         -Details $rangeIdDetail
+} else {
+    # dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
+    # 'вимкнено', коли компонент BRAVO або сам контроль діапазонів вимкнено.
+    Write-BRAVOMaintenanceStep `
+        -Name 'Контроль діапазонів ID' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
 }
 
 # ===== ОЧИСТКА СТАРИХ ДАНИХ =====
 Write-BRAVOProgressPhase -Phase 'Очистка старих даних' -PercentComplete 88
-$cleanupCriticalBefore = $script:criticalErrorOccurred
-$cleanupWarningsBefore = $script:BRAVOWarningCount
 
 # Перевіряємо, чи є що очищати
 $hasDataToClean = $false
@@ -5281,6 +5346,10 @@ $hasDataToClean = $hasDataToClean -or
 if ($hasDataToClean) {
     Write-Log -Message "==="
     Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="
+} else {
+    # dev.15: очистка — progress phase поза затвердженим [N/8] контрактом
+    # (не numbered main step); "немає чого видаляти" лишається лише в LOG.
+    Write-Log -Message "Очистка старих даних: немає чого видаляти." -Level "DEBUG"
 }
 
 # Обробка Trace (тільки якщо є що обробляти)
@@ -5335,18 +5404,8 @@ if ($BravoMaintenanceEnabled -and $groupsToDelete.Count -gt 0) {
         -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS
 }
 
-Write-BRAVOMaintenanceStep `
-    -Name 'Очистка старих даних' `
-    -Status (Get-BRAVOMaintenanceStepStatus `
-        -CriticalBefore $cleanupCriticalBefore `
-        -WarningsBefore $cleanupWarningsBefore `
-        -Skipped:(-not $hasDataToClean)) `
-    -Details $(if (-not $hasDataToClean) { 'немає чого видаляти' } else { $null })
-
 # ===== ЗАПУСК ДОДАТКОВОГО СКРИПТУ BRAVO_ARCHIV =====
 Write-BRAVOProgressPhase -Phase 'Запуск BRAVO_ARCHIV' -PercentComplete 95
-$archiveCriticalBefore = $script:criticalErrorOccurred
-$archiveWarningsBefore = $script:BRAVOWarningCount
 if ($script:EnableArchiveAfterMaintenance) {
     # Дочірній BRAVO_ARCHIV сам захоплює той самий lock. Перед передачею
     # керування звільняємо maintenance-lock; служби вже повернуті до
@@ -5383,11 +5442,9 @@ if ($script:EnableArchiveAfterMaintenance) {
         Write-Log -Message "Помилка під час запуску скрипту BRAVO_ARCHIV.ps1: $($_.Exception.Message)" -Level "ERROR"
         $script:criticalErrorOccurred = $true
     }
-    Write-BRAVOMaintenanceStep `
-        -Name 'Запуск BRAVO_ARCHIV' `
-        -Status (Get-BRAVOMaintenanceStepStatus `
-            -CriticalBefore $archiveCriticalBefore `
-            -WarningsBefore $archiveWarningsBefore)
+    # dev.15: запуск BRAVO_ARCHIV — опційна операція поза затвердженим
+    # [N/8] контрактом (не numbered main step); успіх/помилка вже повністю
+    # покриті Write-Log вище (SUCCESS/ERROR), без Write-BRAVOMaintenanceStep.
 } else {
     # Лише у журнал: вимкнений компонент не займає рядка в консолі.
     Write-Log -Message "Запуск BRAVO_ARCHIV: вимкнено" -Level "DEBUG"
@@ -5413,6 +5470,45 @@ if (-not $script:criticalErrorOccurred) {
     # Видаліть перевірку $slackReportSent, оскільки тепер функція нічого не повертає
 #     Write-Log -Message "Фінальний звіт оброблено" -Level "INFO"
 # }
+
+} catch {
+    # dev.15: див. коментар біля відкриття try вище — мета лише в тому,
+    # щоб жодна необроблена помилка тут не "з'їла" код завершення й
+    # фінальний summary нижче. Причина повністю потрапляє в LOG і в
+    # errors_only-сповіщення (той самий Send-SlackAlert -IsCritical
+    # контракт, що й решта критичних помилок Maintenance).
+    #
+    # СПОЧАТКУ безумовно позначаємо критичну помилку — до будь-яких
+    # diagnostic дій нижче, які самі теоретично можуть кинути виняток.
+    # Якщо цього не зробити першим, а Write-Log/Send-SlackAlert кинуть
+    # власний exception, catch завершиться без встановленого прапорця, і
+    # виконання все одно дійде до summary нижче, але зі стертим статусом
+    # помилки.
+    $script:criticalErrorOccurred = $true
+    $errorMsg = "Критична помилка після відновлення служб (Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт): $($_.Exception.Message)"
+
+    # Логування й сповіщення виконуються ІЗОЛЬОВАНО одне від одного: збій
+    # будь-якого з них (наприклад, недоступний LOG-файл або мережева
+    # помилка webhook) не повинен rethrow-нути й обійти обчислення exit
+    # code/фінальний summary нижче.
+    try {
+        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+    } catch {
+        # не rethrow: збій логування не повинен знищити finalization.
+        # Свідомо не Write-Log/Send-SlackAlert/throw/exit/return тут — це
+        # саме той збій, який ця гілка ізолює; лише прибирає порожній catch
+        # (PSAvoidUsingEmptyCatchBlock) без нових side effects.
+        $null = $_
+    }
+    try {
+        Send-SlackAlert -Message $errorMsg -IsCritical
+    } catch {
+        # не rethrow: збій сповіщення не повинен знищити finalization.
+        # Та сама причина, що вище — без Write-Log/Send-SlackAlert/throw/
+        # exit/return.
+        $null = $_
+    }
+}
 
 # ===== ЗАВЕРШЕННЯ СКРИПТУ =====
 $maintenanceEndedAt = Get-Date

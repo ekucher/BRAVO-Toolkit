@@ -1,5 +1,61 @@
 # Changelog
 
+## 5.0.0-dev.15 — 2026-08-10
+
+Stabilizes the `BRAVO_MAINTENANCE.ps1` operator console step contract
+introduced in dev.14 and makes end-of-run finalization resilient to a late
+exception. No change to archive contents, 7-Zip, SHA512, VSS, SFTP/SMB
+paths, credentials, notification routing, Health thresholds, backup-age
+logic, or the exit-code formula.
+
+- **Stable 8-step contract.** `Initialize-BRAVOMaintenanceSteps` now takes a
+  literal `-Total 8`, never a computed expression. The approved operator
+  contract is exactly `[1/8]` Перевірка вільного місця, `[2/8]` Створення
+  необхідних директорій, `[3/8]` Зупинка служб, `[4/8]` Перевірка розмірів
+  `.md`, `[5/8]` Реставрація моделі, `[6/8]` Обробка trace і логів, `[7/8]`
+  Відновлення стану служб, `[8/8]` Контроль діапазонів ID — all eight always
+  render, in this fixed order, on every run; a disabled/not-scheduled step
+  renders `SKIPPED` on its own permanent number instead of shifting the
+  numbering of the steps after it.
+- Legacy log-structure migration, old-data cleanup, and the `BRAVO_ARCHIV.ps1`
+  launch are confirmed non-numbered: each stays a detailed-LOG-only /
+  Плану-операцій-visible operation and no longer calls
+  `Write-BRAVOMaintenanceStep`, so it can never inflate the step count past 8.
+- Fixed an ordering defect where, whenever a restore was not scheduled for
+  the run (the common daily case), `[6/8]` Обробка trace і логів rendered
+  *before* the `[5/8]` Реставрація моделі `SKIPPED` line, swapping the two
+  numbers relative to the approved contract. The restore fallback now always
+  renders first, regardless of scenario.
+- **Fail-safe end-of-run finalization.** The Range ID / cleanup /
+  `BRAVO_ARCHIV` / auto-shutdown / final-report block now runs inside a
+  `try/catch`: any unhandled exception there is caught, still marks the run
+  critical, and execution still reaches exit-code calculation and the final
+  `BRAVO MAINTENANCE — <СТАТУС>` summary, instead of jumping straight past it
+  to `Wait-BRAVOManualExit` with no summary printed at all. Inside the catch,
+  `criticalErrorOccurred` is set unconditionally first, and the diagnostic
+  logging/notification calls are each wrapped in their own isolated,
+  non-rethrowing `try/catch` (each catch body explicitly discards the
+  caught error via `$null = $_` — no `Write-Log`/`Send-SlackAlert`/`throw`/
+  `exit`/`return` inside it) so a failure writing the log or sending the
+  Slack alert cannot itself swallow the summary.
+- `Write-Log` gained an opt-in `-NoConsole` switch (log file and
+  notifications unaffected; no existing call site's behavior changes).
+  `Test-RangeIdUsage` uses it for the three warnings that are already shown
+  to the operator via the `[8/8]` step's `-Details`, so a missing/unreadable/
+  over-threshold `range_id_log.json` no longer prints twice. A missing file
+  now reports a two-line detail (label, then path) instead of one long line.
+- The `План операцій:` block now closes with the same `=`-separator
+  (`Write-BRAVOHeaderSeparator`, new in `BRAVO.Console`) that frames the run
+  header, instead of the `-`-separator used by the unrelated `РЕЗУЛЬТАТ`
+  block style.
+- Tests: 15 new regression checks covering the fixed 8-step total (AST-level,
+  rejects a dynamic `-Total`), each disabled step's `SKIPPED` render, the
+  Restore/Logs step order, the fail-safe catch path (including simulated
+  logging/notification failure inside it), the Range ID single-console-render
+  and multiline-detail behavior, and the plan separator style — all via
+  isolated source/AST extraction, never by running the real
+  `BRAVO_MAINTENANCE.ps1` `Main()`.
+
 ## 5.0.0-dev.14 — 2026-08-09
 
 Minimal structural/metadata change on top of dev.13: backup generation

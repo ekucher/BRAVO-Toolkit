@@ -651,11 +651,14 @@ function Write-BRAVOResultHeader {
     Write-Host ''
 }
 
-# Той самий ASCII-роздільник, що обрамляє заголовок і блок РЕЗУЛЬТАТ, для
-# довільних інших блоків поза ними (наприклад, "План операцій:" у
-# Maintenance, docs/OPERATOR_CONSOLE_UX.md §5) — щоб ширина не розходилась
-# з рештою консолі, якщо $script:BRAVOConsoleSeparatorWidth колись
-# зміниться.
+# Той самий ASCII-роздільник ('-'), що обрамляє блок РЕЗУЛЬТАТ
+# (Write-BRAVOResultHeader/Footer), для довільних інших вторинних блоків
+# поза ним (наприклад "DISCOVERY"/"РЕЗУЛЬТАТ" у Setup, Dry Run) — щоб
+# ширина не розходилась з рештою консолі, якщо
+# $script:BRAVOConsoleSeparatorWidth колись зміниться. Для блоків, що
+# продовжують той самий "титульний" контракт, з яким прогін почався
+# (Write-BRAVOHeader), використовуй Write-BRAVOHeaderSeparator ('=')
+# нижче — два різні контракти, не взаємозамінні.
 function Write-BRAVOSeparator {
     [CmdletBinding()]
     param()
@@ -664,6 +667,25 @@ function Write-BRAVOSeparator {
         return
     }
     Write-Host ('-' * $script:BRAVOConsoleSeparatorWidth)
+}
+
+# Той самий '='-роздільник (Cyan), що обрамляє Write-BRAVOHeader і
+# Write-BRAVOFinalSummaryHeader/Footer, для блоків, які є продовженням
+# того самого титульного контракту прогону, а не окремим блоком
+# РЕЗУЛЬТАТ (наприклад "План операцій:" одразу під заголовком Maintenance,
+# docs/OPERATOR_CONSOLE_UX.md §5) — щоб оператор бачив один суцільний
+# "титульний" блок, не розірваний іншим стилем роздільника.
+function Write-BRAVOHeaderSeparator {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingWriteHost', '',
+        Justification = 'BRAVO.Console — виділена межа рендеру консолі; Write-Host тут архітектурно допустимий, як і в усіх інших Write-BRAVO*-функціях цього модуля (Write-BRAVOSeparator, Write-BRAVOHeader тощо).')]
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ('=' * $script:BRAVOConsoleSeparatorWidth) -ForegroundColor Cyan
 }
 
 # Порожній рядок усередині блоку РЕЗУЛЬТАТ (наприклад, між основними
@@ -811,6 +833,7 @@ Export-ModuleMember -Function @(
     'Write-BRAVOResultField',
     'Write-BRAVOResultNote',
     'Write-BRAVOSeparator',
+    'Write-BRAVOHeaderSeparator',
     'Write-BRAVOResultBlankLine',
     'Write-BRAVOResultHeader',
     'Write-BRAVOResultSection',
