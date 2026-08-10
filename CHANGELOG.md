@@ -1,5 +1,183 @@
 # Changelog
 
+## 5.0.0-dev.16 — 2026-08-10
+
+Minimal PowerShell 5.1 / `Set-StrictMode` reliability fix on top of the
+published dev.15: no operator-console/UX change, no MANIFESTS/retention
+policy/business-semantics change.
+
+Real DEV-LIMS dev.15 acceptance confirmed `[1/8]`..`[8/8]`, the `[5/8]`
+Restore `SKIPPED` line, the `[8/8]` Range ID single-render, and the final
+summary printing before the manual pause — all as designed. But after
+`[8/8]`, cleanup threw `The property 'Count' cannot be found on this
+object. Verify that the property exists.` The dev.15 fail-safe catch
+(finalization block introduced in dev.15) correctly turned this into a
+critical run (exit 60) and still printed the final summary — exactly the
+behavior it was built for — but the underlying exception itself is now
+fixed at its root cause.
+
+- `Remove-OldRestoreArchives`: two `Where-Object` pipelines that can
+  legitimately return exactly one match (`$beforeCount`/`$afterCount`, the
+  before/after archive count for a kept restore session) now materialize
+  their result as an array via `@(...)` before `.Count`. Under
+  PowerShell 5.1 with `Set-StrictMode` active (inherited from the
+  configuration loader, per existing project convention — see the
+  `PropertyNotFoundStrict` precedent already fixed for `$missingDirs` in
+  the same file), a single-result pipeline returns a scalar object instead
+  of a collection, and `.Count` on that scalar throws exactly the observed
+  error. Same fix applied to `$remainingFiles` (the post-deletion "what's
+  left" debug listing), which had the identical `Get-ChildItem` +
+  unwrapped `.Count` shape.
+- Scope: only `Remove-OldRestoreArchives` was audited and only these two
+  call sites needed the fix — every other `.Count` in that function was
+  already array-wrapped at assignment (`$mainArchiveFiles`, `$sortedGroups`,
+  `$groupsToKeep`, `$groupsToDelete`, `$staleInvalidGroups`), and
+  `$group.Count` (a `Group-Object` `GroupInfo.Count`) is a real, always-safe
+  property left untouched. No repository-wide sweep.
+- The dev.15 fail-safe finalization (outer `try/catch` around Range ID /
+  cleanup / `BRAVO_ARCHIV` / auto-shutdown / final-report, non-empty
+  swallow-catch bodies) is unchanged — it already did its job correctly
+  for this exact real-world exception and stays as the safety net for any
+  future one.
+- Tests: 4 new isolated regression checks for `Remove-OldRestoreArchives`
+  (real function via AST extraction, synthetic TEMP directories — never
+  production DEV-LIMS paths — running under a real `Set-StrictMode
+  -Version Latest` inside the invocation, reproducing the exact failure
+  condition rather than simulating it): a single-result `before`/`after`
+  count each reads back as `1` without throwing, a single remaining file
+  after deletion doesn't throw, and the whole call completes cleanly under
+  strict mode with a single-item pipeline result.
+
+**Operator-visibility pass** (still dev.16, unpublished): closes the gap
+where four top-level `BRAVO_MAINTENANCE.ps1` operations that really run
+every time had no console execution result — LOG-only. The approved
+`[1/8]`..`[8/8]` contract, `Initialize-BRAVOMaintenanceSteps -Total 8`
+(literal), MANIFESTS, and retention semantics are all unchanged; none of
+the four gets a `[N/8]` number or touches the step counters.
+
+- `Write-BRAVOOperationResult` (new, `BRAVO.Console`): the same
+  alignment/status/duration/details contract as the numbered-step
+  renderer, minus the `[N/TOTAL]` prefix (6-space indent instead) and
+  without touching step counters — for top-level operations that are
+  real but intentionally outside the numbered contract.
+- Legacy log migration, old-data cleanup, the `BRAVO_ARCHIV.ps1` launch,
+  and auto-shutdown scheduling each now print a `SKIPPED`/`OK`/`WARN`/
+  `FAIL` result line (with a short `-Details` reason on warning/failure),
+  in their existing execution position — migration keeps running between
+  directory creation and service stop, cleanup/archive/shutdown keep
+  running after `[8/8]`. `Invoke-AutoShutdown` now returns a symbolic
+  final state — `Scheduled`/`Cancelled`/`Failed` — instead of a plain
+  boolean, so the console line reflects what actually happened
+  (including the operator interactively cancelling an already-scheduled
+  shutdown) rather than only "the command was issued." The interactive
+  confirm/cancel dialog and the shutdown command itself are untouched.
+- `План операцій:` gained `Очистка старих даних/логів` (always `ТАК` —
+  the check runs unconditionally every invocation, there is no on/off
+  flag for it; a run with nothing stale still renders `SKIPPED` on the
+  operation itself).
+- Exact failure attribution: `$script:currentMaintenanceOperation` is set
+  before Range ID / cleanup / archive / auto-shutdown / final-report, so
+  the dev.15 fail-safe catch now logs "Помилка операції ...<operation
+  name>..." instead of the generic "Range ID/очистка/BRAVO_ARCHIV/
+  AutoShutdown/фінальний звіт" list. If the exception happened inside an
+  operation that has its own result line and that line never printed, the
+  catch prints its `FAIL` exactly once (a `*Reported` flag per operation
+  prevents a double print).
+- The `RunMissedRestoreOnly`-with-nothing-pending recovery path no longer
+  exits with a bare `exit 0` and no summary at all: it now prints a
+  compact `BRAVO MAINTENANCE — УСПІШНО` / `Код завершення` / `Результат`
+  / `Журнал` summary first (still no `[1/8]`..`[8/8]` — there is no real
+  work this run) before the same outer `finally` → `Wait-BRAVOManualExit`
+  as every other exit path.
+- Tests: 21 new checks (plan wiring/order, each operation's unnumbered
+  render and SKIPPED/OK/WARN/FAIL branches, step-total/counter isolation,
+  render ordering after `[8/8]` and before the final summary, exact
+  failure attribution, single-print-on-failure, and the recovery no-op
+  summary) — all via source/AST inspection or direct calls to the real,
+  side-effect-free `Write-BRAVOOperationResult`, never by running the
+  real `Main()` or the real `Invoke-AutoShutdown` (which would issue an
+  actual `shutdown` command). Two pre-existing dev.15 tests
+  (`Maintenance/FinalSummaryOccursBeforeManualPause`,
+  `Maintenance/FinalSummaryContainsOnlyApprovedFields`) had their source
+  search bounded to start after the outer-try marker, since
+  `Write-BRAVOFinalSummaryHeader`/`Footer` now also appear once, earlier,
+  in the new recovery-path summary — both still pass unchanged.
+
+**Archive/Health operator-visibility pass** (still dev.16, unpublished):
+extends the same numbered-step/unnumbered-operation contract to
+`BRAVO_ARCHIV.ps1` and `BRAVO_HEALTH.ps1` so real top-level operations
+and checks stop being LOG-only. No backup format, retention period,
+MANIFESTS lifecycle, SFTP/SMB protocol, notification routing, or
+exit-code semantics change.
+
+- `Write-BRAVOPlan` (new, `BRAVO.Console`): shared `План операцій:`/
+  `План перевірок:` renderer for Archive and Health, matching the
+  Maintenance plan layout/style (Maintenance itself keeps its own
+  existing render, untouched) — both now render through it instead of
+  their own raw `Write-Host` — Health has none at all (`Console/
+  HealthRendersNoRawWriteHost`).
+- Archive: `План операцій:` now reflects the same effective flags that
+  drive the dynamic step `Total` (BAZA_APP/BAZA_WWW local sync,
+  per-archive components, SFTP/SMB transfers, log/retention cleanup,
+  post-backup Health). Local BAZA_APP/BAZA_WWW synchronization each get
+  their own numbered step when enabled. `Перевірка шляхів` now renders
+  strictly after both the path-existence checks and the SYSTEM write/
+  read access preflight complete — previously it rendered `OK` right
+  after the existence checks, before the preflight could still cancel
+  the run. Old-log cleanup (`Remove-OldLogsByAge`) and backup-generation
+  retention cleanup (`Remove-BRAVOExpiredBackupGenerations` +
+  `Remove-OldLunchArchives`, aggregated into one operation, not one row
+  per internal filter) both now print `Write-BRAVOOperationResult` lines;
+  retention renders `OK` with a factual delete-count aggregate only when
+  something was actually removed, `SKIPPED` otherwise — no invented
+  counts. `-SyncBAZA` (a separate, SFTP-only manual-sync flow) is
+  confirmed isolated: its own `Initialize-BRAVOArchiveSteps`/steps run
+  and `return` before the new Plan/Total code path.
+- Health: standalone runs (not embedded in Archive) now show a `План
+  перевірок:` before the first check. The combined `BAZA (локальна
+  копія)` and `SFTP` steps are split into independent dynamic steps —
+  `BAZA_APP (локальна копія)`/`BAZA_WWW (локальна копія)` and `SFTP:
+  резервні копії`/`SFTP: BAZA_APP`/`SFTP: BAZA_WWW` — each gated by its
+  own enable flag and counted in `Total` exactly once;
+  `Get-SFTPHealthIssues` still runs a single WinSCP session per call, its
+  already-returned issue list is partitioned by the existing `Component`
+  field, and a shared connection-prerequisite failure attaches to every
+  enabled SFTP step (logged once, not once per step). `Керовані
+  служби`/`Локальні резервні копії` stay single steps but gain a compact
+  `служби: ...`/`компоненти: ...` detail line built from the issues'
+  existing `Location`/`Component` fields. Dynamic `Total` is now the
+  literal sum of the flags gating each step render
+  (`Health/StepTotalMatchesVisibleEnabledChecks`); the
+  `Complete-BRAVOHealthResult` notification off-by-one invariant, the
+  embedded (`-SuppressHeader`) path, and `$script:BRAVOHealthSftpStepEnabled`
+  (still consumed by the standalone summary footer) are all unchanged.
+- Fixed a real bug introduced while adding the retention-cleanup delete
+  counters: `[ref]`-typed parameters permanently type-constrain the
+  variable for the rest of the function in PowerShell, so a same-named
+  (case-insensitively) local counter silently gets re-wrapped into a new
+  `PSReference` on every assignment instead of staying a plain `int`.
+  `Remove-OldLunchArchives`'s pre-existing `$deletedCount` collided with
+  the first draft of its new `[ref]$DeletedCount` output parameter,
+  which would have made `$deletedCount += 2` throw and every real,
+  successful lunch-archive deletion register as a caught failure.
+  Renamed both new output parameters (`RemovedGenerationCount`/
+  `RemovedFileCount`) to avoid any case-insensitive collision; verified
+  with an isolated repro before and after.
+- Maintenance: renamed a `Main`-scope variable that duplicated
+  `Remove-OldRestoreArchives`'s own local `$groupsToDelete` under a
+  different, unrelated computation (candidate count for console
+  `Details` only, not the function's validity-aware retention decision)
+  to `$restoreArchiveDeleteCandidateGroups`, to remove the confusing
+  same-name/different-scope pattern. `Invoke-AutoShutdown` confirmed to
+  have exactly one production call site (AST-counted).
+- Tests: ~30 new checks across Archive, Health, and Maintenance (Plan
+  reflects effective components, BAZA local/SFTP independent steps,
+  path-step ordering, log/retention cleanup SKIPPED-vs-OK, `-SyncBAZA`
+  isolation, embedded Health stays one step, Health dynamic-Total exact
+  match, embedded Health suppresses Plan/summary, AutoShutdown
+  Scheduled/Cancelled/Failed rendering and single-call-site, cleanup
+  scope isolation). Full suite: 674/674.
+
 ## 5.0.0-dev.15 — 2026-08-10
 
 Stabilizes the `BRAVO_MAINTENANCE.ps1` operator console step contract

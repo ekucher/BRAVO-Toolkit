@@ -107,6 +107,37 @@ function Get-BRAVOHealthStepDetails {
     return $null
 }
 
+# dev.16 (review round 3): компактний per-entity/per-component Details для
+# кроків, що НЕ розділяються на окремі steps ("Керовані служби", "Локальні
+# резервні копії" — залишаються одним кроком, лише отримують перелік
+# зачеплених імен). $EntityProperty бере вже наявне factual поле issue-
+# об'єкта (Location для служб — plain ім'я служби без префікса; Component
+# для локальних резервних копій — plain ім'я компонента MODEL/BLOG/...).
+# Нічого не вигадується: лише унікальні наявні значення, коротко
+# приєднані до вже наявного "проблем: N".
+function Get-BRAVOHealthCompactIssueDetails {
+    param(
+        [array]$Issues,
+        [string]$EntityProperty = 'Component',
+        [string]$Label = 'компоненти'
+    )
+
+    $baseDetails = Get-BRAVOHealthStepDetails -IssueCount $Issues.Count
+    if ($Issues.Count -eq 0) {
+        return $baseDetails
+    }
+    $entityNames = @(
+        $Issues |
+            ForEach-Object { [string]$_.$EntityProperty } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
+    )
+    if ($entityNames.Count -eq 0) {
+        return $baseDetails
+    }
+    return "$baseDetails; ${Label}: $($entityNames -join ', ')"
+}
+
 # Статуси Health -> три результати спільної консолі. Deferred/Skipped/Disabled
 # свідомо не «УСПІШНО»: перевірка не виконувалась, і показувати зелений
 # результат там, де нічого не перевірено, — це рівно той тип брехливого
@@ -483,6 +514,21 @@ if ($NotificationMode -ne "none" -and $credentialHelperLoaded) {
 $script:Login = $null
 $script:resolvedSftpHost = $null
 $script:sftpUrl = $null
+# dev.16 (review round 3): три незалежні флаги — та сама булева логіка,
+# розкладена по компонентах (A OR (B AND (C OR D)) == (A) OR (B AND C) OR
+# (B AND D)), для розділення "SFTP" на 3 dynamic steps нижче.
+# $sftpCredentialRequired (нижче) лишається ЇХНІМ OR — той самий
+# consumer (BRAVOHealthSftpStepEnabled, підсумок Complete-BRAVOHealthResult)
+# і той самий сигнал про потребу в credential, що й раніше.
+$sftpArchivesHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
+    [bool]$backupMonitoring.SFTP.CheckArchiveUploads -and
+    [bool]$componentSettings.SFTP.ArchiveUpload
+$sftpBazaAppHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
+    [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
+    $bazaAppSFTPHealthEnabled
+$sftpBazaWWWHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
+    [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
+    $bazaWWWSFTPHealthEnabled
 $sftpCredentialRequired = [bool]$backupMonitoring.SFTP.Enabled -and
     (([bool]$backupMonitoring.SFTP.CheckArchiveUploads -and [bool]$componentSettings.SFTP.ArchiveUpload) -or
     ([bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
@@ -636,10 +682,17 @@ $script:BRAVOHealthSftpStepEnabled = $sftpCredentialRequired
 $script:BRAVOHealthSmbStepEnabled = $smbCredentialRequired
 $script:BRAVOHealthNotificationStepEnabled = ($NotificationMode -ne 'none') -and (-not $NoSlack)
 # Середовище, керовані служби й локальні копії виконуються завжди.
+# dev.16 (review round 3): BAZA (локальна копія) і SFTP розділені на
+# незалежні dynamic steps — Total тепер точно дорівнює кількості РЕАЛЬНО
+# видимих увімкнених перевірок (Health/StepTotalMatchesVisibleEnabledChecks);
+# кожен доданок тут відповідає РІВНО одному Write-BRAVOHealthStep нижче.
 Initialize-BRAVOHealthSteps -Total (
     3 +
-    $(if ($bazaAppLocalHealthEnabled -or $bazaWWWLocalHealthEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOHealthSftpStepEnabled) { 1 } else { 0 }) +
+    $(if ($bazaAppLocalHealthEnabled) { 1 } else { 0 }) +
+    $(if ($bazaWWWLocalHealthEnabled) { 1 } else { 0 }) +
+    $(if ($sftpArchivesHealthEnabled) { 1 } else { 0 }) +
+    $(if ($sftpBazaAppHealthEnabled) { 1 } else { 0 }) +
+    $(if ($sftpBazaWWWHealthEnabled) { 1 } else { 0 }) +
     $(if ($script:BRAVOHealthSmbStepEnabled) { 1 } else { 0 }) +
     $(if ($script:BRAVOHealthNotificationStepEnabled) { 1 } else { 0 })
 )
@@ -650,6 +703,30 @@ Write-BRAVOHeader `
     -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
     -StartedAt $healthCheckStarted `
     -SuppressText:$SuppressHeader
+
+# dev.16 (review round 3): "План перевірок" — той самий "plan-first"
+# принцип, що Maintenance/Archive, лише коли Health запущено самостійно
+# (не вбудований виклик з Archive: там SuppressHeader вже приглушує
+# заголовок, і другий, вкладений план лише заплутав би оператора). Джерело
+# значень — ті самі прапорці, що вже визначають нумерацію кроків вище
+# (Initialize-BRAVOHealthSteps) і Total вище, тому план і фактичне
+# виконання не можуть розійтися. Рендер через спільний Write-BRAVOPlan
+# (BRAVO.Console) — Health не має права на власний raw Write-Host
+# (Console/HealthRendersNoRawWriteHost).
+if (-not $SuppressHeader) {
+    $healthPlanEntries = [ordered]@{}
+    $healthPlanEntries['Середовище й цілісність інструментів'] = $true
+    $healthPlanEntries['Керовані служби'] = $true
+    $healthPlanEntries['Локальні резервні копії'] = $true
+    $healthPlanEntries['BAZA_APP (локальна копія)'] = [bool]$bazaAppLocalHealthEnabled
+    $healthPlanEntries['BAZA_WWW (локальна копія)'] = [bool]$bazaWWWLocalHealthEnabled
+    $healthPlanEntries['SFTP: резервні копії'] = [bool]$sftpArchivesHealthEnabled
+    $healthPlanEntries['SFTP: BAZA_APP'] = [bool]$sftpBazaAppHealthEnabled
+    $healthPlanEntries['SFTP: BAZA_WWW'] = [bool]$sftpBazaWWWHealthEnabled
+    $healthPlanEntries['NAS/SMB'] = [bool]$script:BRAVOHealthSmbStepEnabled
+    $healthPlanEntries['Сповіщення'] = [bool]$script:BRAVOHealthNotificationStepEnabled
+    Write-BRAVOPlan -Title 'План перевірок:' -Entries $healthPlanEntries
+}
 $script:BRAVOHealthConsoleReady = $true
 
 function Write-HealthLog {
@@ -4528,44 +4605,91 @@ $serviceHealthIssues = @(Get-ManagedServiceHealthIssues)
 Write-BRAVOHealthStep `
     -Name 'Керовані служби' `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $serviceHealthIssues.Count) `
-    -Details (Get-BRAVOHealthStepDetails -IssueCount $serviceHealthIssues.Count)
+    -Details (Get-BRAVOHealthCompactIssueDetails -Issues $serviceHealthIssues -EntityProperty 'Location' -Label 'служби')
 
 Write-BRAVOProgressPhase -Phase 'Локальні резервні копії' -PercentComplete 30
 $localHealthIssues = @(Get-BackupHealthIssues)
 Write-BRAVOHealthStep `
     -Name 'Локальні резервні копії' `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $localHealthIssues.Count) `
-    -Details (Get-BRAVOHealthStepDetails -IssueCount $localHealthIssues.Count)
+    -Details (Get-BRAVOHealthCompactIssueDetails -Issues $localHealthIssues -EntityProperty 'Component' -Label 'компоненти')
 
-Write-BRAVOProgressPhase -Phase 'BAZA (локальна копія)' -PercentComplete 45
+# dev.16 (review round 3): BAZA_APP і BAZA_WWW локальна копія — незалежні
+# dynamic steps (було: один комбінований "BAZA (локальна копія)" рядок,
+# що ховав, ЯКИЙ саме компонент має проблему). Той самий "вимкнений
+# компонент не займає рядка" принцип; Get-BAZALocalSyncHealthIssues
+# викликається так само, як і раніше, для кожного компонента окремо.
+Write-BRAVOProgressPhase -Phase 'BAZA_APP (локальна копія)' -PercentComplete 40
 $bazaAppLocalHealthIssues = @(Get-BAZALocalSyncHealthIssues `
     -Enabled $bazaAppLocalHealthEnabled `
     -SourcePath $bazaAppPaths.Source `
     -DestinationPath $bazaAppPaths.Destination `
     -Label "BAZA APP")
+if ($bazaAppLocalHealthEnabled) {
+    Write-BRAVOHealthStep `
+        -Name 'BAZA_APP (локальна копія)' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $bazaAppLocalHealthIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $bazaAppLocalHealthIssues.Count)
+} else {
+    # Лише у журнал: вимкнений компонент не займає рядка в консолі.
+    Write-HealthLog "Локальну перевірку BAZA APP пропущено: BAZA_APP_LOCAL = `$false"
+}
+
+Write-BRAVOProgressPhase -Phase 'BAZA_WWW (локальна копія)' -PercentComplete 50
 $bazaWWWLocalHealthIssues = @(Get-BAZALocalSyncHealthIssues `
     -Enabled $bazaWWWLocalHealthEnabled `
     -SourcePath $bazaWWWPaths.Source `
     -DestinationPath $bazaWWWPaths.Destination `
     -Label "BAZA WWW")
-$bazaLocalHealthIssues = @($bazaAppLocalHealthIssues) + @($bazaWWWLocalHealthIssues)
-if ($bazaAppLocalHealthEnabled -or $bazaWWWLocalHealthEnabled) {
+if ($bazaWWWLocalHealthEnabled) {
     Write-BRAVOHealthStep `
-        -Name 'BAZA (локальна копія)' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $bazaLocalHealthIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $bazaLocalHealthIssues.Count)
+        -Name 'BAZA_WWW (локальна копія)' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $bazaWWWLocalHealthIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $bazaWWWLocalHealthIssues.Count)
 } else {
-    # Лише у журнал: вимкнений компонент не займає рядка в консолі.
-    Write-HealthLog "Локальну перевірку BAZA пропущено: BAZA_APP_LOCAL = `$false; BAZA_WWW_LOCAL = `$false"
+    Write-HealthLog "Локальну перевірку BAZA WWW пропущено: BAZA_WWW_LOCAL = `$false"
 }
+$bazaLocalHealthIssues = @($bazaAppLocalHealthIssues) + @($bazaWWWLocalHealthIssues)
 
+# dev.16 (review round 3): SFTP розділено на 3 незалежні dynamic steps
+# (резервні копії/BAZA_APP/BAZA_WWW). Get-SFTPHealthIssues викликається
+# ЯК Є, рівно один раз (той самий WinSCP session/connection contract, той
+# самий єдиний виклик Test-SFTPHealthConfiguration всередині) — результат
+# лише партиціонується за вже існуючим полем Component. Спільна
+# prerequisite-помилка з'єднання (Component == 'SFTP', bez суфікса)
+# приєднується до КОЖНОГО увімкненого кроку нижче, щоб оператор бачив її
+# на будь-якому увімкненому SFTP-рядку; сирий виняток лишається
+# залогованим лише ОДИН раз — усередині самої Get-SFTPHealthIssues.
+# $sftpHealthIssues (сирий, неподілений список) і надалі йде в
+# $healthIssues/$destinationSummary нижче без змін — critical/notification/
+# exit-code семантика не зачеплена.
 Write-BRAVOProgressPhase -Phase 'SFTP' -PercentComplete 60
 $sftpHealthIssues = @(Get-SFTPHealthIssues)
-if ($script:BRAVOHealthSftpStepEnabled) {
+$sftpArchiveComponentNames = @(@($archiveDefinitions | ForEach-Object { "SFTP $($_.Type)" }) + @('SFTP архіви'))
+$sftpSharedIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP' })
+$sftpArchivesStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -in $sftpArchiveComponentNames }) + @($sftpSharedIssues)
+$sftpBazaAppStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA APP' }) + @($sftpSharedIssues)
+$sftpBazaWWWStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA WWW' }) + @($sftpSharedIssues)
+if ($sftpArchivesHealthEnabled) {
     Write-BRAVOHealthStep `
-        -Name 'SFTP' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpHealthIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpHealthIssues.Count)
+        -Name 'SFTP: резервні копії' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpArchivesStepIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpArchivesStepIssues.Count)
+}
+if ($sftpBazaAppHealthEnabled) {
+    Write-BRAVOHealthStep `
+        -Name 'SFTP: BAZA_APP' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaAppStepIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaAppStepIssues.Count)
+}
+if ($sftpBazaWWWHealthEnabled) {
+    Write-BRAVOHealthStep `
+        -Name 'SFTP: BAZA_WWW' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaWWWStepIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count)
+}
+if (-not $sftpArchivesHealthEnabled -and -not $sftpBazaAppHealthEnabled -and -not $sftpBazaWWWHealthEnabled) {
+    Write-HealthLog "SFTP health-check пропущено: усі SFTP-перевірки вимкнено в конфігурації"
 }
 
 Write-BRAVOProgressPhase -Phase 'NAS/SMB' -PercentComplete 80

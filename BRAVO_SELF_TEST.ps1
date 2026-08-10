@@ -7356,7 +7356,14 @@ function Get-BRAVOMaintenanceSummaryResult {
     # summary — рівно 10 полів; Maintenance/Архівація/Shutdown/"Детальний
     # журнал"/"РЕЗУЛЬТАТ" не повинні там з'являтися (вони вже видні в Плані
     # операцій і в детальному LOG).
-    $maintenanceSummaryBlockStart = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `')
+    # dev.16: Write-BRAVOFinalSummaryHeader/Footer тепер зустрічаються ДВІЧІ
+    # в реальному джерелі — вдруге в compact no-op summary
+    # (Recovery/RunMissedRestoreOnly, задовго до цього блоку в файлі).
+    # Пошук стартує ПІСЛЯ 'усе від Range ID до Send-FinalReport' (унікальний
+    # якір десь між ними), щоб знайти саме основний 10-field summary, а не
+    # ранній compact recovery-варіант.
+    $maintenanceMainSummarySearchStart = $maintenanceScriptTextForManifestStorage.IndexOf('усе від Range ID до Send-FinalReport')
+    $maintenanceSummaryBlockStart = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `', $maintenanceMainSummarySearchStart)
     $maintenanceSummaryBlockEnd = $maintenanceScriptTextForManifestStorage.IndexOf(
         'Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE', $maintenanceSummaryBlockStart)
     $maintenanceSummaryBlockText = if ($maintenanceSummaryBlockStart -ge 0 -and $maintenanceSummaryBlockEnd -gt $maintenanceSummaryBlockStart) {
@@ -7572,8 +7579,14 @@ function Get-BRAVOMaintenanceSummaryResult {
     $maintenanceOuterRangeCatchIndex = $maintenanceScriptTextForManifestStorage.IndexOf('див. коментар біля відкриття try вище')
     $maintenanceEndOfScriptMarkerIndex = $maintenanceScriptTextForManifestStorage.IndexOf('# ===== ЗАВЕРШЕННЯ СКРИПТУ =====')
     $maintenanceExitCodeCalcIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$script:maintenanceRuntimeExitCode = if ($script:criticalErrorOccurred) {')
-    $maintenanceSummaryHeaderOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `')
-    $maintenanceSummaryFooterOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')
+    # dev.16: обидва пошуки стартують ПІСЛЯ $maintenanceEndOfScriptMarkerIndex,
+    # бо Write-BRAVOFinalSummaryHeader/Footer тепер зустрічаються й раніше
+    # в файлі — у compact no-op summary (Recovery/RunMissedRestoreOnly) —
+    # і незв'язаний неунковий IndexOf знайшов би ЙОГО, а не основний
+    # 10-field summary, чий порядок відносно exit code/Wait-BRAVOManualExit
+    # тут перевіряється.
+    $maintenanceSummaryHeaderOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryHeader `', $maintenanceEndOfScriptMarkerIndex)
+    $maintenanceSummaryFooterOrderIndex = $maintenanceScriptTextForManifestStorage.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE', $maintenanceEndOfScriptMarkerIndex)
     $maintenanceManualExitOrderIndex = $maintenanceScriptTextForManifestStorage.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
     $maintenanceCatchBodyText = if ($maintenanceOuterRangeCatchIndex -ge 0 -and $maintenanceEndOfScriptMarkerIndex -gt $maintenanceOuterRangeCatchIndex) {
         $maintenanceScriptTextForManifestStorage.Substring(
@@ -7697,6 +7710,497 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Maintenance/PlanUsesEqualsSeparator" `
         -Failure "роздільник після 'План операцій:' має бути тим самим '='*60 (Write-BRAVOHeaderSeparator), що обрамляє заголовок, а не '-'*60 (Write-BRAVOSeparator)"
+
+    # ================================================================
+    # dev.16: Remove-OldRestoreArchives — scalar .Count під Set-StrictMode.
+    # Реальний DEV-LIMS acceptance-прогін dev.15 підтвердив [1/8]..[8/8]/
+    # Restore SKIPPED/Range ID single render/final summary before pause —
+    # усе PASS, але після [8/8] cleanup кинув "The property 'Count' cannot
+    # be found on this object": під PowerShell 5.1 + Set-StrictMode
+    # ($beforeCount/$afterCount, $remainingFiles) Where-Object/Get-ChildItem
+    # повертають скалярний FileInfo замість масиву, коли результат рівно
+    # один. dev.15 fail-safe catch перетворив це на exit 60 і все одно
+    # показав summary — правильно, але сам виняток лишався. Тести нижче —
+    # РЕАЛЬНА функція (ізольована AST-екстракція), синтетичний TEMP-каталог
+    # (НЕ production DEV-LIMS), справжній Set-StrictMode -Version Latest
+    # усередині виклику — відтворення точної причини, не симуляція.
+    # ================================================================
+    $restoreCleanupModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('Remove-OldRestoreArchives')
+    $restoreCleanupPrefix = 'RESTORECLEANUP'
+
+    # --- Спільний stub-набір: Write-Log echo-ить у output stream (щоб
+    # Details-рядки можна було перевірити), Get-SHA512HashCompatible —
+    # справжній SHA512 через Get-FileHash (не no-op: без реального хешу
+    # перевірка hash-файлу в Remove-OldRestoreArchives не пройде і група
+    # ніколи не потрапить у valid), Test-BRAVOMaintenanceSevenZipArchiveIntegrity
+    # застабовано (реальний 7-Zip тут не предмет тесту).
+    $restoreCleanupStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            Write-Output "[$Level] $Message"
+        }
+        function Get-SHA512HashCompatible {
+            param([string]$FilePath)
+            return (Get-FileHash -LiteralPath $FilePath -Algorithm SHA512).Hash.ToUpperInvariant()
+        }
+        function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
+            param($SevenZipPath, $ArchivePath)
+            $null = $SevenZipPath
+            $null = $ArchivePath
+            return $true
+        }
+    }.ToString()
+
+    # --- Test 1/2: ДВІ валідні сесії (кожна: один before + один after),
+    # KeepCount=1 -> зберігається лише найновіша. Рівно одна сесія (без
+    # другої, старішої) поверталась би раніше з функції МОВЧКИ
+    # ($groupsToDelete.Count -eq 0 -> return, рядок ~3357) ще ДО цього
+    # циклу — тому для сесії, що потрапляє в $groupsToKeep, обов'язково
+    # потрібна ще одна, старіша, яка йде на видалення. $beforeCount/
+    # $afterCount для збереженої сесії мають бути РІВНО 1 (не кидати
+    # виняток; стара форма без @() кидала б саме тут).
+    $restoreCleanupSingleRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_RESTORE_CLEANUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($restoreCleanupSingleRoot)
+    $restoreCleanupSingleThrew = $false
+    $restoreCleanupSingleErrorMessage = $null
+    $restoreCleanupSingleLogLines = @()
+    try {
+        foreach ($sessionTime in @('20260101_0100', '20260102_0100')) {
+            foreach ($suffix in @('before', 'after')) {
+                $fileName = "${restoreCleanupPrefix}_${suffix}_$sessionTime.mdz"
+                $archivePath = Join-Path $restoreCleanupSingleRoot $fileName
+                Set-Content -LiteralPath $archivePath -Value "synthetic-$suffix-$sessionTime" -Encoding ASCII
+                $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+                "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+            }
+        }
+
+        try {
+            $restoreCleanupSingleLogLines = @(& $restoreCleanupModule {
+                param($Path, $Prefix, $StubScriptText)
+                Set-StrictMode -Version Latest
+                . ([scriptblock]::Create($StubScriptText))
+                $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
+                $script:ARC_PATH = 'unused-stub-path'
+                Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount 1 -InvalidRetentionDays 30
+            } $restoreCleanupSingleRoot $restoreCleanupPrefix $restoreCleanupStubScriptText)
+        } catch {
+            $restoreCleanupSingleThrew = $true
+            $restoreCleanupSingleErrorMessage = $_.Exception.Message
+        }
+    } finally {
+        if (Test-Path -LiteralPath $restoreCleanupSingleRoot) {
+            Remove-Item -LiteralPath $restoreCleanupSingleRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    $restoreCleanupSingleLogText = $restoreCleanupSingleLogLines -join "`n"
+    $restoreCleanupSingleCountMatch = [regex]::Match(
+        $restoreCleanupSingleLogText, 'before: (\d+), after: (\d+)')
+
+    Test-BRAVOCondition `
+        -Condition (
+            -not $restoreCleanupSingleThrew -and
+            $restoreCleanupSingleCountMatch.Success -and
+            $restoreCleanupSingleCountMatch.Groups[1].Value -eq '1'
+        ) `
+        -Name "Maintenance/RestoreCleanupSingleBeforeArchiveHasCountOne" `
+        -Failure ("рівно один 'before'-архів у збереженій сесії має дати `$beforeCount=1 без винятку; кинуто: {0}" -f $restoreCleanupSingleErrorMessage)
+    Test-BRAVOCondition `
+        -Condition (
+            -not $restoreCleanupSingleThrew -and
+            $restoreCleanupSingleCountMatch.Success -and
+            $restoreCleanupSingleCountMatch.Groups[2].Value -eq '1'
+        ) `
+        -Name "Maintenance/RestoreCleanupSingleAfterArchiveHasCountOne" `
+        -Failure ("рівно один 'after'-архів у збереженій сесії має дати `$afterCount=1 без винятку; кинуто: {0}" -f $restoreCleanupSingleErrorMessage)
+    Test-BRAVOCondition `
+        -Condition (-not $restoreCleanupSingleThrew) `
+        -Name "Maintenance/RestoreCleanupStrictModeSingleItemSafe" `
+        -Failure ("Remove-OldRestoreArchives не повинен кидати виняток під Set-StrictMode -Version Latest, коли Where-Object повертає рівно один результат; кинуто: {0}" -f $restoreCleanupSingleErrorMessage)
+
+    # --- Test 3: після видалення залишається РІВНО один файл із префіксом
+    # (Get-ChildItem -Filter повертає скалярний FileInfo, не масив) ->
+    # $remainingFiles.Count не повинен кидати виняток. KeepCount=0 видаляє
+    # єдину валідну сесію (2 архіви + 2 sha512); окремий "сирітський" файл
+    # поза before/after-патерном лишається єдиним, хто підпадає під
+    # `${ArchivePrefix}_*` після видалення.
+    $restoreCleanupRemainingRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_RESTORE_CLEANUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($restoreCleanupRemainingRoot)
+    $restoreCleanupRemainingThrew = $false
+    $restoreCleanupRemainingErrorMessage = $null
+    try {
+        $sessionTime = '20260101_0200'
+        foreach ($suffix in @('before', 'after')) {
+            $fileName = "${restoreCleanupPrefix}_${suffix}_$sessionTime.mdz"
+            $archivePath = Join-Path $restoreCleanupRemainingRoot $fileName
+            Set-Content -LiteralPath $archivePath -Value "synthetic-$suffix-content" -Encoding ASCII
+            $hash = (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash
+            "$hash *$fileName" | Out-File -FilePath "$archivePath.sha512" -Encoding ASCII
+        }
+        # Сирітський файл: не матчиться з "_(before|after)_"-групуванням,
+        # тому ніколи не потрапляє у valid/invalid-групи чи видалення
+        # конкретної сесії — переживає видалення й лишається єдиним
+        # результатом Get-ChildItem -Filter "${Prefix}_*" наприкінці.
+        Set-Content -LiteralPath (Join-Path $restoreCleanupRemainingRoot "${restoreCleanupPrefix}_orphan.mdz") `
+            -Value 'orphan' -Encoding ASCII
+
+        try {
+            [void](& $restoreCleanupModule {
+                param($Path, $Prefix, $StubScriptText)
+                Set-StrictMode -Version Latest
+                . ([scriptblock]::Create($StubScriptText))
+                $script:ArchivePrefixRegex = [regex]::Escape($Prefix)
+                $script:ARC_PATH = 'unused-stub-path'
+                Remove-OldRestoreArchives -Path $Path -ArchivePrefix $Prefix -KeepCount 0 -InvalidRetentionDays 30
+            } $restoreCleanupRemainingRoot $restoreCleanupPrefix $restoreCleanupStubScriptText)
+        } catch {
+            $restoreCleanupRemainingThrew = $true
+            $restoreCleanupRemainingErrorMessage = $_.Exception.Message
+        }
+    } finally {
+        if (Test-Path -LiteralPath $restoreCleanupRemainingRoot) {
+            Remove-Item -LiteralPath $restoreCleanupRemainingRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (-not $restoreCleanupRemainingThrew) `
+        -Name "Maintenance/RestoreCleanupSingleRemainingFileDoesNotThrow" `
+        -Failure ("коли після видалення лишається рівно один файл із префіксом, `$remainingFiles.Count не повинен кидати виняток під Set-StrictMode; кинуто: {0}" -f $restoreCleanupRemainingErrorMessage)
+
+    # ================================================================
+    # dev.16: operator-visibility pass — Migration/Cleanup/Archive/
+    # AutoShutdown реально виконуються щоразу, коли увімкнені, але досі
+    # мали лише LOG-видимість. Реальний source (не Main()) — той самий
+    # AST/IndexOf-підхід, що dev.14/dev.15 тести вище. [1/8]...[8/8]
+    # НЕ чіпались (Maintenance/MainStepTotalIsExactlyEight нижче лишається
+    # без змін і мусить пройти так само).
+    # ================================================================
+
+    # --- Plan: Очистка старих даних/логів присутня й на правильній позиції
+    # (Реставрація моделі -> Очистка -> Архівація після maintenance).
+    $planCleanupIndex = $maintenanceScriptTextForManifestStorage.IndexOf("'Очистка старих даних/логів'      = `$true")
+    $planRestoreIndex = $maintenanceScriptTextForManifestStorage.IndexOf("'Реставрація моделі'              = [bool]`$script:BRAVOMaintenanceRestoreStepEnabled")
+    $planArchiveIndex = $maintenanceScriptTextForManifestStorage.IndexOf("'Архівація після maintenance'     = [bool]`$script:BRAVOMaintenanceArchiveStepEnabled")
+    Test-BRAVOCondition `
+        -Condition (
+            $planCleanupIndex -ge 0 -and
+            $planRestoreIndex -ge 0 -and
+            $planArchiveIndex -gt $planCleanupIndex -and
+            $planCleanupIndex -gt $planRestoreIndex
+        ) `
+        -Name "Maintenance/CleanupAppearsInPlan" `
+        -Failure "План операцій має містити 'Очистка старих даних/логів' = `$true (effective runtime behavior, не UI-only), між 'Реставрація моделі' і 'Архівація після maintenance'"
+
+    # --- Migration/Cleanup/Archive/AutoShutdown рендеряться через
+    # Write-BRAVOOperationResult, не Write-BRAVOMaintenanceStep.
+    foreach ($unnumberedOp in @(
+        @{ Name = 'Міграція старих журналів'; TestName = 'Maintenance/MigrationOperationResultIsUnnumbered' },
+        @{ Name = 'Очистка старих даних/логів'; TestName = 'Maintenance/CleanupOperationResultIsUnnumbered' },
+        @{ Name = 'Архівація після maintenance'; TestName = 'Maintenance/ArchiveAfterMaintenanceResultIsUnnumbered' },
+        @{ Name = 'Автоматичне вимкнення сервера'; TestName = 'Maintenance/AutoShutdownResultIsUnnumbered' }
+    )) {
+        $unnumberedOpPattern = "Write-BRAVOOperationResult[\s``]*-Name\s+'$([regex]::Escape($unnumberedOp.Name))'"
+        Test-BRAVOCondition `
+            -Condition ([regex]::IsMatch($maintenanceScriptTextForManifestStorage, $unnumberedOpPattern)) `
+            -Name $unnumberedOp.TestName `
+            -Failure "'$($unnumberedOp.Name)' має рендеритись через Write-BRAVOOperationResult (без [N/8]), не Write-BRAVOMaintenanceStep"
+    }
+
+    # --- Total лишається буквальним 8 (той самий AST-вузол, що
+    # Maintenance/MainStepTotalIsExactlyEight нижче) — жоден unnumbered
+    # блок не додає доданок.
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $maintenanceTotalParamValueAst -and
+            $maintenanceTotalParamValueAst -is [Management.Automation.Language.ConstantExpressionAst] -and
+            [int]$maintenanceTotalParamValueAst.Value -eq 8
+        ) `
+        -Name "Maintenance/UnnumberedOperationsDoNotIncreaseMainStepTotal" `
+        -Failure "Initialize-BRAVOMaintenanceSteps -Total має лишатися буквальним 8 — жоден unnumbered post-[8/8] блок не повинен додавати доданок до Total"
+
+    # --- Функціональний доказ: реальний Write-BRAVOOperationResult (з уже
+    # імпортованого BRAVO.Console) не чіпає лічильники ізольованого
+    # $maintenanceStepModule — інші модульні scope, фізично неможливо
+    # торкнутися $script:BRAVOMaintenanceStepCurrent/OkCount/... звідти.
+    & $maintenanceStepModule { Initialize-BRAVOMaintenanceSteps -Total 8 }
+    [void](& $maintenanceStepModule { Write-BRAVOMaintenanceStep -Name 'X' -Status 'OK' } 6>&1)
+    $countersBeforeOperationResult = & $maintenanceStepModule {
+        [pscustomobject]@{
+            Current = $script:BRAVOMaintenanceStepCurrent
+            Ok = $script:BRAVOMaintenanceStepOkCount
+            Warn = $script:BRAVOMaintenanceStepWarnCount
+            Skipped = $script:BRAVOMaintenanceStepSkippedCount
+            Fail = $script:BRAVOMaintenanceStepFailCount
+        }
+    }
+    [void](Write-BRAVOOperationResult -Name 'Тест' -Status 'OK' -Duration ([timespan]::Zero) 6>&1)
+    [void](Write-BRAVOOperationResult -Name 'Тест' -Status 'WARN' -Duration ([timespan]::Zero) -Details 'x' 6>&1)
+    [void](Write-BRAVOOperationResult -Name 'Тест' -Status 'FAIL' -Duration ([timespan]::Zero) -Details 'x' 6>&1)
+    [void](Write-BRAVOOperationResult -Name 'Тест' -Status 'SKIPPED' -Duration ([timespan]::Zero) -Details 'x' 6>&1)
+    $countersAfterOperationResult = & $maintenanceStepModule {
+        [pscustomobject]@{
+            Current = $script:BRAVOMaintenanceStepCurrent
+            Ok = $script:BRAVOMaintenanceStepOkCount
+            Warn = $script:BRAVOMaintenanceStepWarnCount
+            Skipped = $script:BRAVOMaintenanceStepSkippedCount
+            Fail = $script:BRAVOMaintenanceStepFailCount
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $countersBeforeOperationResult.Current -eq $countersAfterOperationResult.Current -and
+            $countersBeforeOperationResult.Ok -eq $countersAfterOperationResult.Ok -and
+            $countersBeforeOperationResult.Warn -eq $countersAfterOperationResult.Warn -and
+            $countersBeforeOperationResult.Skipped -eq $countersAfterOperationResult.Skipped -and
+            $countersBeforeOperationResult.Fail -eq $countersAfterOperationResult.Fail
+        ) `
+        -Name "Maintenance/UnnumberedOperationsDoNotChangeStepCounters" `
+        -Failure "Write-BRAVOOperationResult (будь-який статус) не повинен змінювати BRAVOMaintenanceStepCurrent/OkCount/WarnCount/SkippedCount/FailCount"
+
+    # --- Cleanup: SKIPPED/OK/WARN-FAIL wiring у реальному джерелі.
+    $cleanupResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("-Name 'Очистка старих даних/логів' ``", $planCleanupIndex)
+    $cleanupResultCallWindow = if ($cleanupResultCallIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring([Math]::Max(0, $cleanupResultCallIndex - 1400), 1400)
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $cleanupResultCallWindow.Contains("'SKIPPED'") -and
+            $cleanupResultCallWindow.Contains("-not `$hasDataToClean") -and
+            $cleanupResultCallWindow.Contains("'даних для очищення немає'")
+        ) `
+        -Name "Maintenance/CleanupNoDataRendersSkipped" `
+        -Failure "коли `$hasDataToClean=false, 'Очистка старих даних/логів' має рендеритись SKIPPED 'даних для очищення немає'"
+    Test-BRAVOCondition `
+        -Condition (
+            $cleanupResultCallWindow.Contains('Get-BRAVOMaintenanceStepStatus') -and
+            $cleanupResultCallWindow.Contains('$cleanupCriticalBefore') -and
+            $cleanupResultCallWindow.Contains('$cleanupWarningsBefore') -and
+            $cleanupResultCallWindow.Contains('каталогів:') -and
+            $cleanupResultCallWindow.Contains('файлів:')
+        ) `
+        -Name "Maintenance/CleanupSuccessRendersOk" `
+        -Failure "коли є дані для очищення й без нових critical/warning, статус має братися з Get-BRAVOMaintenanceStepStatus (OK), Details — агрегат кандидатів"
+    Test-BRAVOCondition `
+        -Condition (
+            $cleanupResultCallWindow.Contains("-eq 'WARN' -or") -and
+            $cleanupResultCallWindow.Contains("-eq 'FAIL'") -and
+            $cleanupResultCallWindow.Contains("'перевірте LOG для деталей'")
+        ) `
+        -Name "Maintenance/CleanupFailureRendersFail" `
+        -Failure "WARN/FAIL 'Очистка старих даних/логів' має показувати Details 'перевірте LOG для деталей'"
+
+    # --- Archive after maintenance: SKIPPED/OK/FAIL wiring.
+    $archiveResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("`$script:currentMaintenanceOperation = 'Архівація після maintenance'")
+    $archiveResultCallWindow = if ($archiveResultCallIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring($archiveResultCallIndex, [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $archiveResultCallIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveResultCallWindow.Contains("-Status 'SKIPPED' ``") -and
+            $archiveResultCallWindow.Contains("-Details 'вимкнено'") -and
+            $archiveResultCallWindow.Contains('if ($script:EnableArchiveAfterMaintenance)')
+        ) `
+        -Name "Maintenance/ArchiveDisabledRendersSkipped" `
+        -Failure "коли `$script:EnableArchiveAfterMaintenance=false, 'Архівація після maintenance' має рендеритись SKIPPED 'вимкнено'"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveResultCallWindow.Contains('Get-BRAVOMaintenanceStepStatus') -and
+            $archiveResultCallWindow.Contains('$archiveCriticalBefore') -and
+            $archiveResultCallWindow.Contains('$archiveWarningsBefore')
+        ) `
+        -Name "Maintenance/ArchiveSuccessRendersOk" `
+        -Failure "успіх/помилка 'Архівація після maintenance' мають визначатись через Get-BRAVOMaintenanceStepStatus за тим самим `$script:criticalErrorOccurred, що дочірній процес уже виставляє"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveResultCallWindow.Contains('"BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"') -and
+            $archiveResultCallWindow.Contains('"скрипт не знайдено: $bravoArchivePath"') -and
+            $archiveResultCallWindow.Contains("archiveOperationDetail = 'перевірте LOG для деталей'")
+        ) `
+        -Name "Maintenance/ArchiveFailureRendersFail" `
+        -Failure "FAIL 'Архівація після maintenance' (exit!=0/не знайдено/exception) має показувати конкретну коротку причину в Details"
+
+    # --- AutoShutdown: SKIPPED/OK/FAIL wiring (Invoke-AutoShutdown реально
+    # НЕ викликається в тесті — це системна команда shutdown; лише
+    # структурна перевірка джерела, повернення значення й wiring).
+    $autoShutdownResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("`$script:currentMaintenanceOperation = 'Автоматичне вимкнення сервера'")
+    # dev.16 (review round 3): 2200, не 1400 — гілка $script:EnableAutoShutdown
+    # тепер містить 3-way Scheduled/Cancelled/Failed switch (AutoShutdown
+    # final-state rendering), і фіксоване вікно мусить сягати ELSE-гілки
+    # (SKIPPED 'вимкнено') нижче за течією тексту.
+    $autoShutdownResultCallWindow = if ($autoShutdownResultCallIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring($autoShutdownResultCallIndex, [Math]::Min(2200, $maintenanceScriptTextForManifestStorage.Length - $autoShutdownResultCallIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $autoShutdownResultCallWindow.Contains("-Status 'SKIPPED' ``") -and
+            $autoShutdownResultCallWindow.Contains("-Details 'вимкнено'") -and
+            $autoShutdownResultCallWindow.Contains('if ($script:EnableAutoShutdown)')
+        ) `
+        -Name "Maintenance/AutoShutdownDisabledRendersSkipped" `
+        -Failure "коли `$script:EnableAutoShutdown=false, 'Автоматичне вимкнення сервера' має рендеритись SKIPPED 'вимкнено'"
+    Test-BRAVOCondition `
+        -Condition (
+            $autoShutdownResultCallWindow.Contains('$autoShutdownOutcome = Invoke-AutoShutdown') -and
+            $autoShutdownResultCallWindow.Contains("'Scheduled' { 'OK' }") -and
+            $autoShutdownResultCallWindow.Contains('"заплановано через $ShutdownTimeout с"')
+        ) `
+        -Name "Maintenance/AutoShutdownScheduledRendersOk" `
+        -Failure "успішне планування (Invoke-AutoShutdown повертає 'Scheduled') має рендерити OK 'заплановано через N с'"
+    Test-BRAVOCondition `
+        -Condition (
+            $autoShutdownResultCallWindow.Contains("default     { 'FAIL' }") -and
+            $autoShutdownResultCallWindow.Contains("'не вдалося ініціювати вимкнення") -and
+            $maintenanceScriptTextForManifestStorage.Contains('Write-Log -Message "Помилка ініціювання вимкнення системи. Код помилки: $($process.ExitCode)" -Level "ERROR"') -and
+            [regex]::Matches($maintenanceScriptTextForManifestStorage, "(?m)^\s*return 'Failed'\s*`$").Count -ge 2
+        ) `
+        -Name "Maintenance/AutoShutdownFailureRendersFail" `
+        -Failure "невдале планування/виняток (Invoke-AutoShutdown повертає 'Failed') має рендерити FAIL з коротким поясненням; Invoke-AutoShutdown має явно return 'Failed' і на гілці помилки коду виходу, і в catch"
+    Test-BRAVOCondition `
+        -Condition (
+            $autoShutdownResultCallWindow.Contains("'Cancelled' { 'SKIPPED' }") -and
+            $autoShutdownResultCallWindow.Contains("'скасовано користувачем'") -and
+            $maintenanceScriptTextForManifestStorage.Contains("Вимкнення успішно скасовано") -and
+            $maintenanceScriptTextForManifestStorage.Contains("return 'Cancelled'")
+        ) `
+        -Name "Maintenance/AutoShutdownCancelledRendersSkipped" `
+        -Failure "коли оператор інтерактивно скасував заплановане вимкнення (Invoke-AutoShutdown повертає 'Cancelled'), результат має рендеритись SKIPPED 'скасовано користувачем'"
+
+    # --- AutoShutdown: рівно один production call-site (AST, не текстовий
+    # пошук — рахує реальні CommandAst-виклики Invoke-AutoShutdown у
+    # джерелі, ігнорує коментарі; саме визначення function Invoke-
+    # AutoShutdown не є CommandAst і не потрапляє в підрахунок).
+    $autoShutdownCallSiteTokens = $null
+    $autoShutdownCallSiteErrors = $null
+    $autoShutdownCallSiteAst = [Management.Automation.Language.Parser]::ParseInput(
+        $maintenanceScriptTextForManifestStorage,
+        [ref]$autoShutdownCallSiteTokens,
+        [ref]$autoShutdownCallSiteErrors
+    )
+    $autoShutdownCallSites = @($autoShutdownCallSiteAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Invoke-AutoShutdown'
+        },
+        $true
+    ))
+    Test-BRAVOCondition `
+        -Condition ($autoShutdownCallSites.Count -eq 1) `
+        -Name "Maintenance/AutoShutdownInvokedExactlyOnce" `
+        -Failure "Invoke-AutoShutdown має мати рівно один production call site (AST-підрахунок CommandAst); знайдено: $($autoShutdownCallSites.Count)"
+
+    # --- Cleanup details: $groupsToDelete має лишатись строго локальним
+    # для Remove-OldRestoreArchives (AST) — Main обчислює власний,
+    # інакше названий candidate-count для Details, щоб уникнути
+    # оманливого name collision між різними scope/обчисленнями.
+    $cleanupScopeAst = $autoShutdownCallSiteAst
+    $restoreArchivesFunctionAst = $cleanupScopeAst.Find(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq 'Remove-OldRestoreArchives'
+        },
+        $true
+    )
+    $groupsToDeleteReferences = @($cleanupScopeAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.VariableExpressionAst] -and
+            $candidate.VariablePath.UserPath -eq 'groupsToDelete'
+        },
+        $true
+    ))
+    $groupsToDeleteOutsideFunction = @($groupsToDeleteReferences | Where-Object {
+        $null -eq $restoreArchivesFunctionAst -or
+        $_.Extent.StartOffset -lt $restoreArchivesFunctionAst.Extent.StartOffset -or
+        $_.Extent.StartOffset -ge $restoreArchivesFunctionAst.Extent.EndOffset
+    })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $restoreArchivesFunctionAst -and
+            $groupsToDeleteReferences.Count -gt 0 -and
+            $groupsToDeleteOutsideFunction.Count -eq 0
+        ) `
+        -Name "Maintenance/CleanupResultUsesOnlyInScopeVariables" `
+        -Failure "`$groupsToDelete має лишатись строго локальним для Remove-OldRestoreArchives; знайдено використань поза функцією: $($groupsToDeleteOutsideFunction.Count)"
+
+    # --- Порядок: пост-операції рендеряться ПІСЛЯ [8/8], а весь цей блок —
+    # ДО обчислення exit code/фінального summary (доповнює
+    # Maintenance/FinalSummaryOccursBeforeManualPause вище тими самими
+    # якорями).
+    $rangeIdStepCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("-Name 'Контроль діапазонів ID' ``")
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdStepCallIndex -ge 0 -and
+            $cleanupResultCallIndex -gt $rangeIdStepCallIndex -and
+            $archiveResultCallIndex -gt $cleanupResultCallIndex -and
+            $autoShutdownResultCallIndex -gt $archiveResultCallIndex
+        ) `
+        -Name "Maintenance/PostOperationsRenderAfterEightOfEight" `
+        -Failure "Cleanup -> Archive -> AutoShutdown мають рендеритись у цьому порядку, і всі — після [8/8] Контроль діапазонів ID"
+    Test-BRAVOCondition `
+        -Condition (
+            $autoShutdownResultCallIndex -ge 0 -and
+            $maintenanceExitCodeCalcIndex -gt $autoShutdownResultCallIndex -and
+            $maintenanceSummaryHeaderOrderIndex -gt $maintenanceExitCodeCalcIndex
+        ) `
+        -Name "Maintenance/PostOperationsPrecedeFinalSummary" `
+        -Failure "AutoShutdown має рендеритись ДО обчислення exit code, яке, своєю чергою, ДО Write-BRAVOFinalSummaryHeader"
+
+    # --- Exact failure attribution: реальний $errorMsg у catch і
+    # fallback-FAIL "рівно один раз" через прапорці *Reported.
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCatchBodyText.Contains('$errorMsg = "Помилка операції') -and
+            $maintenanceCatchBodyText.Contains('$($script:currentMaintenanceOperation)') -and
+            -not $maintenanceCatchBodyText.Contains('Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт')
+        ) `
+        -Name "Maintenance/UnexpectedPostOperationFailureNamesExactOperation" `
+        -Failure "catch має формувати `$errorMsg із `$script:currentMaintenanceOperation (конкретна назва), не з generic переліку 'Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт'"
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCatchBodyText.Contains("'Очистка старих даних/логів' {") -and
+            $maintenanceCatchBodyText.Contains('if (-not $script:cleanupOperationReported)') -and
+            $maintenanceCatchBodyText.Contains("'Архівація після maintenance' {") -and
+            $maintenanceCatchBodyText.Contains('if (-not $script:archiveOperationReported)') -and
+            $maintenanceCatchBodyText.Contains("'Автоматичне вимкнення сервера' {") -and
+            $maintenanceCatchBodyText.Contains('if (-not $script:autoShutdownOperationReported)') -and
+            ([regex]::Matches($maintenanceCatchBodyText, "Write-BRAVOOperationResult")).Count -eq 3
+        ) `
+        -Name "Maintenance/VisiblePostOperationFailureRendersOnce" `
+        -Failure "outer catch має рендерити FAIL для активної операції (Cleanup/Archive/AutoShutdown) РІВНО ОДИН РАЗ, лише якщо вона ще не відзвітувала сама (*Reported)"
+
+    # --- Recovery no-op: compact success summary ДО exit 0, у межах
+    # того самого зовнішнього try/finally (Wait-BRAVOManualExit — той
+    # самий шлях, що й звичайний прогін).
+    $recoveryNoWorkIndex = $maintenanceScriptTextForManifestStorage.IndexOf('$RunMissedRestoreOnly -and -not $missedDailyWork')
+    $recoveryNoWorkWindow = if ($recoveryNoWorkIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring($recoveryNoWorkIndex, [Math]::Min(1600, $maintenanceScriptTextForManifestStorage.Length - $recoveryNoWorkIndex))
+    } else { '' }
+    $recoveryHeaderIndexInWindow = $recoveryNoWorkWindow.IndexOf('Write-BRAVOFinalSummaryHeader')
+    $recoveryFooterIndexInWindow = $recoveryNoWorkWindow.IndexOf('Write-BRAVOFinalSummaryFooter')
+    # Пошук РЕАЛЬНОГО "exit 0" стартує ПІСЛЯ footer: пояснювальний
+    # коментар вище в цьому ж блоці сам згадує "exit 0" в лапках
+    # (документує старий голий exit), і неунковий пошук знайшов би
+    # текст коментаря, а не справжній statement.
+    $recoveryExitIndexInWindow = $recoveryNoWorkWindow.IndexOf('exit 0', [Math]::Max(0, $recoveryFooterIndexInWindow))
+    Test-BRAVOCondition `
+        -Condition (
+            $recoveryNoWorkIndex -ge 0 -and
+            $recoveryHeaderIndexInWindow -ge 0 -and
+            $recoveryNoWorkWindow.Contains("-Status 'УСПІШНО'") -and
+            $recoveryNoWorkWindow.Contains("-Value 'Пропущених операцій не знайдено'") -and
+            $recoveryFooterIndexInWindow -gt $recoveryHeaderIndexInWindow -and
+            $recoveryExitIndexInWindow -gt $recoveryFooterIndexInWindow -and
+            -not [regex]::IsMatch($recoveryNoWorkWindow.Substring(0, $recoveryExitIndexInWindow), "Write-BRAVOMaintenanceStep ``")
+        ) `
+        -Name "Maintenance/RecoveryNoWorkRendersSuccessSummaryBeforePause" `
+        -Failure "'RunMissedRestoreOnly -and -not `$missedDailyWork' має друкувати compact summary (Write-BRAVOFinalSummaryHeader/Footer, БЕЗ [1/8]...[8/8]) ДО 'exit 0', не голий exit без підсумку"
 
     $legacyEntryPoints = @(
         'ARCHIV_VETOFFICE.ps1',
@@ -10374,6 +10878,299 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition ($exitOrderFailures.Count -eq 0) `
         -Name "ConsoleUX/21-ExitCodeComputedBeforeRender" `
         -Failure "Код завершення має обчислюватись ДО Write-BRAVOResultHeader, інакше підсумок бреше; порушено в: $($exitOrderFailures -join ', ')"
+
+    #####################################################################
+    # dev.16 (review round 3): Archive/Health operator-visibility pass —
+    # Plan, BAZA_APP/BAZA_WWW local numbered steps, path/access ordering,
+    # unnumbered log/retention cleanup results, -SyncBAZA isolation,
+    # Health BAZA/SFTP split, compact details, dynamic Total exactness.
+    #####################################################################
+
+    # --- Console: BRAVO.Console.psd1 (module MANIFEST, не .psm1) реально
+    # експортує нові dev.16 public console functions. Archive/Health
+    # імпортують BRAVO.Console САМЕ через .psd1 (FunctionsToExport), тому
+    # текстова перевірка Export-ModuleMember у .psm1 (нижче) сама по собі
+    # не гарантує, що функція РЕАЛЬНО доступна після Import-Module —
+    # знайдений реальний runtime blocker: Write-BRAVOPlan була в .psm1
+    # Export-ModuleMember, але не в .psd1 FunctionsToExport. Тут — справжній
+    # Import-Module -Force, не текстовий пошук.
+    Remove-Module -Name 'BRAVO.Console' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psd1') -Force -ErrorAction Stop
+    $writeBravoPlanCommand = Get-Command -Name 'Write-BRAVOPlan' -Module 'BRAVO.Console' -ErrorAction SilentlyContinue
+    $writeBravoOperationResultCommand = Get-Command -Name 'Write-BRAVOOperationResult' -Module 'BRAVO.Console' -ErrorAction SilentlyContinue
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $writeBravoPlanCommand -and
+            $null -ne $writeBravoOperationResultCommand
+        ) `
+        -Name 'Console/ManifestExportsWriteBRAVOPlan' `
+        -Failure 'BRAVO.Console.psd1 (module manifest) має реально експортувати Write-BRAVOPlan і Write-BRAVOOperationResult через FunctionsToExport — Archive/Health імпортують саме через .psd1, не напряму .psm1'
+
+    # --- Static guard: кожна нова dev.16 public BRAVO.Console function
+    # (використана в Archive/Health/Maintenance) має бути присутня
+    # ОДНОЧАСНО у .psm1 Export-ModuleMember і .psd1 FunctionsToExport —
+    # інакше саме цей клас розбіжності (psm1 vs psd1) знову пройде повз
+    # текстові тести непоміченим.
+    $consolePsm1TextForExportGuard = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psm1'))
+    $consolePsd1TextForExportGuard = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psd1'))
+    $newDev16ConsolePublicFunctions = @('Write-BRAVOOperationResult', 'Write-BRAVOPlan')
+    $consoleExportMismatches = @($newDev16ConsolePublicFunctions | Where-Object {
+        -not $consolePsm1TextForExportGuard.Contains("'$_'") -or -not $consolePsd1TextForExportGuard.Contains("'$_'")
+    })
+    Test-BRAVOCondition `
+        -Condition ($consoleExportMismatches.Count -eq 0) `
+        -Name 'Console/NewPublicFunctionsExportedInBothPsm1AndPsd1' `
+        -Failure "нові dev.16 public BRAVO.Console functions мають бути в ОБОХ Export-ModuleMember (.psm1) і FunctionsToExport (.psd1); розбіжність: $($consoleExportMismatches -join ', ')"
+
+    # --- Archive: План операцій відображає ті самі прапорці, що керують
+    # Total вище (не hardcoded, не окремі значення, які можуть розійтися).
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('$archivePlanEntries[''Локальна синхронізація BAZA_APP''] = [bool]$bazaAppLocalSyncEnabled') -and
+            $archiveScriptText.Contains('$archivePlanEntries[''Локальна синхронізація BAZA_WWW''] = [bool]$bazaWWWLocalSyncEnabled') -and
+            $archiveScriptText.Contains('$archivePlanEntries[''Очищення старих backup generation''] = [bool](') -and
+            $archiveScriptText.Contains('Write-BRAVOPlan -Title ''План операцій:'' -Entries $archivePlanEntries')
+        ) `
+        -Name 'Archive/PlanReflectsEffectiveComponents' `
+        -Failure 'Archive ''План операцій'' має рендеритись через Write-BRAVOPlan із entries, побудованими з тих самих прапорців, що Total (не raw Write-Host, не окремі значення)'
+
+    # --- Archive: BAZA_APP/BAZA_WWW локальна синхронізація мають власний
+    # numbered step, коли увімкнені (не лише LOG).
+    Test-BRAVOCondition `
+        -Condition (
+            ([regex]::Matches($archiveScriptText, [regex]::Escape('-Name "Локальна синхронізація BAZA_APP"')).Count -eq 2) -and
+            ([regex]::Matches($archiveScriptText, [regex]::Escape('-Name "Локальна синхронізація BAZA_WWW"')).Count -eq 2)
+        ) `
+        -Name 'Archive/BazaLocalSyncHasNumberedSteps' `
+        -Failure 'Локальна синхронізація BAZA_APP/BAZA_WWW має рендерити Write-BRAVOArchiveStep рівно у двох гілках (успіх/attempted і enabled-але-недоступний шлях), не в disabled-гілці'
+
+    # --- Archive: "Перевірка шляхів" рендериться ПІСЛЯ SYSTEM read-probe
+    # перевірки (не одразу після Show-PathCheckSummary/existence-перевірок).
+    $archivePathStepIndex = $archiveScriptText.IndexOf('-Name "Перевірка шляхів"')
+    $archiveReadProbeIndex = $archiveScriptText.IndexOf('SYSTEM source read probe FAILED')
+    $archivePathStepOccurrences = [regex]::Matches($archiveScriptText, [regex]::Escape('-Name "Перевірка шляхів"')).Count
+    Test-BRAVOCondition `
+        -Condition (
+            $archivePathStepIndex -ge 0 -and
+            $archiveReadProbeIndex -ge 0 -and
+            $archivePathStepIndex -gt $archiveReadProbeIndex -and
+            $archivePathStepOccurrences -eq 1 -and
+            $archiveScriptText.Contains('$pathCheckFullyValid = $allPathsExist -and $systemAccessValid')
+        ) `
+        -Name 'Archive/PathStepCannotRenderOkBeforeAccessPreflightCompletes' `
+        -Failure '''Перевірка шляхів'' має рендеритись РІВНО один раз, ПІСЛЯ SYSTEM read-probe (не до SYSTEM access preflight); OK лише коли allPathsExist І systemAccessValid'
+
+    # --- Archive: очищення старих журналів — unnumbered operator operation
+    # (Write-BRAVOOperationResult, не Write-BRAVOArchiveStep — не займає
+    # [N/TOTAL]), reuse того самого formatter, що Maintenance.
+    $archiveLogCleanupIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих журналів''')
+    $archiveLogCleanupWindow = if ($archiveLogCleanupIndex -ge 0) {
+        $archiveScriptText.Substring([Math]::Max(0, $archiveLogCleanupIndex - 400), [Math]::Min(1000, $archiveScriptText.Length - [Math]::Max(0, $archiveLogCleanupIndex - 400)))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveLogCleanupWindow.Contains('Write-BRAVOOperationResult') -and
+            $archiveLogCleanupWindow.Contains('''SKIPPED''') -and
+            $archiveLogCleanupWindow.Contains('''FAIL''') -and
+            $archiveLogCleanupWindow.Contains('журналів старших за retention немає')
+        ) `
+        -Name 'Archive/LogCleanupIsUnnumberedOperation' `
+        -Failure '''Очищення старих журналів'' має рендеритись через Write-BRAVOOperationResult (unnumbered), з SKIPPED коли кандидатів немає'
+
+    # --- Archive: очищення backup generation — ОДНА агрегована unnumbered
+    # операція, що покриває і generation retention, і lunch cleanup (не
+    # окремі рядки на кожен внутрішній фільтр).
+    $archiveRetentionResultIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих backup generation''')
+    $archiveRetentionResultWindow = if ($archiveRetentionResultIndex -ge 0) {
+        $archiveRetentionWindowStart = [Math]::Max(0, $archiveRetentionResultIndex - 3500)
+        $archiveScriptText.Substring($archiveRetentionWindowStart, [Math]::Min(5000, $archiveScriptText.Length - $archiveRetentionWindowStart))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            ([regex]::Matches($archiveScriptText, [regex]::Escape('-Name ''Очищення старих backup generation''')).Count -eq 1) -and
+            $archiveRetentionResultWindow.Contains('Remove-BRAVOExpiredBackupGenerations') -and
+            $archiveRetentionResultWindow.Contains('Remove-OldLunchArchives')
+        ) `
+        -Name 'Archive/BackupRetentionCleanupAggregatesSubCleanup' `
+        -Failure '''Очищення старих backup generation'' має бути ОДНІЄЮ unnumbered операцією, що покриває і Remove-BRAVOExpiredBackupGenerations, і Remove-OldLunchArchives'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveRetentionResultWindow.Contains('backupRetentionCleanupDidDelete') -and
+            $archiveRetentionResultWindow.Contains('elseif (-not $backupRetentionCleanupDidDelete) { ''SKIPPED'' }') -and
+            $archiveRetentionResultWindow.Contains('''даних для очищення немає''')
+        ) `
+        -Name 'Archive/BackupRetentionNoDataRendersSkipped' `
+        -Failure 'коли retention реально перевірено, але нічого не видалено ($archiveCleanupSectionShown=false і lunchCleanupDeletedCount=0), результат має бути SKIPPED ''даних для очищення немає'', не OK'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveRetentionResultWindow.Contains('$generationCleanupDeletedCount -gt 0') -and
+            $archiveRetentionResultWindow.Contains('generation: $generationCleanupDeletedCount') -and
+            $archiveRetentionResultWindow.Contains('$lunchCleanupDeletedCount -gt 0') -and
+            $archiveRetentionResultWindow.Contains('обідніх файлів: $lunchCleanupDeletedCount')
+        ) `
+        -Name 'Archive/BackupRetentionActualCleanupRendersOk' `
+        -Failure 'коли щось РЕАЛЬНО видалено, Details має показувати факт-агрегат (generation: N; обідніх файлів: N) з реальних RemovedGenerationCount/RemovedFileCount сигналів, не вигадані числа'
+
+    # --- Archive: -SyncBAZA лишається ізольованим SFTP-only flow — Plan/
+    # dynamic Total/BAZA local numbered steps НЕ виконуються в цьому режимі
+    # (return відбувається ДО них у джерелі).
+    $archiveMainSyncBazaIndex = $archiveScriptText.IndexOf('if ($SyncBAZA) {', $archiveScriptText.IndexOf('[void](Test-Compatibility)'))
+    $archivePlanCallIndex = $archiveScriptText.IndexOf('Write-BRAVOPlan -Title ''План операцій:''')
+    $archiveMainTotalIndex = $archiveScriptText.IndexOf('Initialize-BRAVOArchiveSteps -Total (', $archiveMainSyncBazaIndex)
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveMainSyncBazaIndex -ge 0 -and
+            $archivePlanCallIndex -ge 0 -and
+            $archiveMainTotalIndex -ge 0 -and
+            $archiveMainSyncBazaIndex -lt $archivePlanCallIndex -and
+            $archiveMainSyncBazaIndex -lt $archiveMainTotalIndex -and
+            $archiveScriptText.Contains('Режим -SyncBAZA: синхронізуються всі увімкнені BAZA_APP/BAZA_WWW; архiвацiю, очищення архiвiв, NAS/SMB та health-check пропущено')
+        ) `
+        -Name 'Archive/SyncBazaModeDoesNotGainNormalArchiveOperations' `
+        -Failure 'if ($SyncBAZA) {...; return} має стояти в джерелі РАНІШЕ, ніж Write-BRAVOPlan/новий Initialize-BRAVOArchiveSteps основного backup-flow — інакше -SyncBAZA показав би План повного backup-flow'
+
+    # --- Archive: embedded Health лишається ОДНИМ Archive-кроком незалежно
+    # від внутрішнього статусу Invoke-BRAVOHealthCheck.
+    Test-BRAVOCondition `
+        -Condition (
+            ([regex]::Matches($archiveScriptText, [regex]::Escape('-Name "Перевірка резервних копій"')).Count -eq 1) -and
+            $archiveScriptText.Contains('Invoke-BRAVOHealthCheck @healthParameters') -and
+            $archiveScriptText.Contains('if ($healthCheckEnabled) {') -and
+            -not $archiveScriptText.Contains('function Invoke-BRAVOEmbeddedHealth')
+        ) `
+        -Name 'Archive/EmbeddedHealthRemainsOneStep' `
+        -Failure '''Перевірка резервних копій'' має рендеритись РІВНО один раз (один Write-BRAVOArchiveStep) незалежно від Invoke-BRAVOHealthCheck.Status — жодного вкладеного Health-виводу'
+
+    # --- Health: "План перевірок" рендериться ЛИШЕ у самостійному запуску
+    # (не при SuppressHeader — вбудований виклик з Archive) і через
+    # спільний Write-BRAVOPlan (Health не має права на raw Write-Host).
+    $healthPlanEntriesIndex = $healthScriptText.IndexOf('$healthPlanEntries = [ordered]@{}')
+    $healthPlanIndex = if ($healthPlanEntriesIndex -ge 0) {
+        $healthScriptText.LastIndexOf('if (-not $SuppressHeader) {', $healthPlanEntriesIndex)
+    } else { -1 }
+    Test-BRAVOCondition `
+        -Condition (
+            $healthPlanIndex -ge 0 -and
+            $healthPlanEntriesIndex -ge 0 -and
+            $healthPlanEntriesIndex -gt $healthPlanIndex -and
+            ($healthPlanEntriesIndex - $healthPlanIndex) -lt 200 -and
+            $healthScriptText.Contains('Write-BRAVOPlan -Title ''План перевірок:'' -Entries $healthPlanEntries') -and
+            $healthScriptText.Contains('$healthPlanEntries[''BAZA_APP (локальна копія)''] = [bool]$bazaAppLocalHealthEnabled') -and
+            $healthScriptText.Contains('$healthPlanEntries[''SFTP: BAZA_WWW''] = [bool]$sftpBazaWWWHealthEnabled')
+        ) `
+        -Name 'Health/PlanRendersStandaloneOnly' `
+        -Failure 'Health ''План перевірок'' має рендеритись через Write-BRAVOPlan лише коли -not $SuppressHeader, з entries з тих самих прапорців, що dynamic Total'
+
+    # --- Health: BAZA_APP/BAZA_WWW локальна копія — незалежні dynamic
+    # steps (кожен зі своїм enable-гейтом, не комбінований рядок).
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('-Name ''BAZA_APP (локальна копія)''') -and
+            $healthScriptText.Contains('-Name ''BAZA_WWW (локальна копія)''') -and
+            $healthScriptText.Contains('if ($bazaAppLocalHealthEnabled) {') -and
+            $healthScriptText.Contains('if ($bazaWWWLocalHealthEnabled) {') -and
+            -not $healthScriptText.Contains('-Name ''BAZA (локальна копія)''')
+        ) `
+        -Name 'Health/BazaLocalHasIndependentSteps' `
+        -Failure 'BAZA_APP/BAZA_WWW (локальна копія) мають бути незалежними dynamic steps, кожен зі своїм enable-гейтом; комбінованого ''BAZA (локальна копія)'' кроку більше не повинно існувати'
+
+    # --- Health: SFTP розділено на 3 незалежні dynamic steps.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('-Name ''SFTP: резервні копії''') -and
+            $healthScriptText.Contains('-Name ''SFTP: BAZA_APP''') -and
+            $healthScriptText.Contains('-Name ''SFTP: BAZA_WWW''') -and
+            $healthScriptText.Contains('if ($sftpArchivesHealthEnabled) {') -and
+            $healthScriptText.Contains('if ($sftpBazaAppHealthEnabled) {') -and
+            $healthScriptText.Contains('if ($sftpBazaWWWHealthEnabled) {') -and
+            -not $healthScriptText.Contains('-Name ''SFTP''')
+        ) `
+        -Name 'Health/SftpHasThreeIndependentSteps' `
+        -Failure 'SFTP має рендерити 3 незалежні dynamic steps (резервні копії/BAZA_APP/BAZA_WWW); комбінованого одного ''SFTP'' кроку більше не повинно існувати'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('$sftpSharedIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq ''SFTP'' })') -and
+            $healthScriptText.Contains('$sftpArchivesStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -in $sftpArchiveComponentNames }) + @($sftpSharedIssues)') -and
+            $healthScriptText.Contains('$sftpBazaAppStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq') -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('Get-SFTPHealthIssues')).Count -ge 1)
+        ) `
+        -Name 'Health/SftpSharedFailurePropagatesToEachEnabledStep' `
+        -Failure 'спільна prerequisite-помилка з''єднання (Component == ''SFTP'', bare) має приєднуватись до КОЖНОГО увімкненого SFTP-кроку через партиціонування вже наявного списку issues (Get-SFTPHealthIssues викликається один раз)'
+
+    # --- Health: dynamic Total точно дорівнює сумі прапорців, що гейтять
+    # кожен Write-BRAVOHealthStep нижче (AST — не рахує сам Total, а
+    # перевіряє, що формула складається лише з очікуваних доданків).
+    $healthTotalTokens = $null
+    $healthTotalErrors = $null
+    $healthTotalAst = [Management.Automation.Language.Parser]::ParseInput(
+        $healthScriptText, [ref]$healthTotalTokens, [ref]$healthTotalErrors
+    )
+    $healthInitStepsCallAst = $healthTotalAst.Find(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Initialize-BRAVOHealthSteps'
+        },
+        $true
+    )
+    $healthTotalParamText = if ($null -ne $healthInitStepsCallAst) {
+        $found = $null
+        for ($i = 0; $i -lt $healthInitStepsCallAst.CommandElements.Count; $i++) {
+            if ($healthInitStepsCallAst.CommandElements[$i] -is [Management.Automation.Language.CommandParameterAst] -and
+                $healthInitStepsCallAst.CommandElements[$i].ParameterName -eq 'Total') {
+                $found = $healthInitStepsCallAst.CommandElements[$i + 1].Extent.Text
+                break
+            }
+        }
+        $found
+    } else { '' }
+    if ($null -eq $healthTotalParamText) { $healthTotalParamText = '' }
+    $healthExpectedTotalTerms = @(
+        'bazaAppLocalHealthEnabled', 'bazaWWWLocalHealthEnabled',
+        'sftpArchivesHealthEnabled', 'sftpBazaAppHealthEnabled', 'sftpBazaWWWHealthEnabled',
+        'BRAVOHealthSmbStepEnabled', 'BRAVOHealthNotificationStepEnabled'
+    )
+    $healthTotalMissingTerms = @($healthExpectedTotalTerms | Where-Object { -not $healthTotalParamText.Contains($_) })
+    # ParenExpressionAst.Extent.Text включає обгортаючі дужки (`( 3 + ... )`),
+    # тому перевіряємо Contains, а не StartsWith буквального "3 +".
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($healthTotalParamText) -and
+            $healthTotalParamText.Contains('3 +') -and
+            $healthTotalMissingTerms.Count -eq 0
+        ) `
+        -Name 'Health/StepTotalMatchesVisibleEnabledChecks' `
+        -Failure "Initialize-BRAVOHealthSteps -Total має дорівнювати 3 (базові кроки) + по одному доданку на кожен реально розділений enable-прапорець кроку; відсутні доданки: $($healthTotalMissingTerms -join ', ')"
+
+    # --- Health: "Керовані служби"/"Локальні резервні копії" лишаються
+    # ОДНИМ кроком кожен (не розділені), але отримують компактні
+    # per-entity/per-component деталі з реальних Component/Location полів.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('function Get-BRAVOHealthCompactIssueDetails') -and
+            $healthScriptText.Contains('-Details (Get-BRAVOHealthCompactIssueDetails -Issues $serviceHealthIssues -EntityProperty ''Location'' -Label ''служби'')') -and
+            $healthScriptText.Contains('-Details (Get-BRAVOHealthCompactIssueDetails -Issues $localHealthIssues -EntityProperty ''Component'' -Label ''компоненти'')') -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('-Name ''Керовані служби''')).Count -eq 1) -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('-Name ''Локальні резервні копії''')).Count -eq 1)
+        ) `
+        -Name 'Health/ManagedServicesAndLocalBackupsHaveCompactDetails' `
+        -Failure '''Керовані служби''/''Локальні резервні копії'' мають лишатись одним кроком кожен, з компактними Details через Get-BRAVOHealthCompactIssueDetails (реальні Component/Location поля, не вигадані)'
+
+    # --- Health: embedded (SuppressHeader) режим лишається компактним —
+    # Complete-BRAVOHealthResult не друкує другий підсумок, а $script:
+    # BRAVOHealthSftpStepEnabled (споживач стандалон-підсумку) не змінений.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('$script:BRAVOHealthSftpStepEnabled = $sftpCredentialRequired') -and
+            $healthScriptText.Contains('Property = ''SftpVerified'';  Title = ''SFTP'';           Enabled = $script:BRAVOHealthSftpStepEnabled') -and
+            $healthScriptText.Contains('if (-not $SuppressHeader) {') -and
+            $healthScriptText.Contains('Write-BRAVOResultHeader')
+        ) `
+        -Name 'Health/EmbeddedModeDoesNotRenderNestedPlanOrSummary' `
+        -Failure 'SuppressHeader має приглушувати і План перевірок, і стандалон-підсумок (Write-BRAVOResultHeader); $script:BRAVOHealthSftpStepEnabled — той самий сигнал для обох (нового split-гейту й старого summary-footer)'
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red

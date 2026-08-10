@@ -368,6 +368,70 @@ function Write-BRAVOStepResult {
     }
 }
 
+# dev.16: рядок top-level операції, яка РЕАЛЬНО виконується, але свідомо
+# поза затвердженим numbered-контрактом [N/TOTAL] (Maintenance: Migration/
+# Cleanup/BRAVO_ARCHIV/AutoShutdown — жодна з них не збільшує TOTAL і не
+# рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок). Той самий
+# словник статусів, ширина, dots-заповнювач і duration-формат, що
+# Write-BRAVOStepResult — але, на відміну від нього, тут -Duration і
+# -Details НЕ взаємовиключні: Duration (якщо задано) завжди йде одразу за
+# статусом на тому самому рядку, а Details (будь-якою кількістю рядків)
+# завжди друкується під ним тим самим Write-BRAVOConsoleDetail, що й під
+# нумерованими кроками — 6 пробілів, без "Причина:"-префікса. Обидва
+# параметри можна передавати одночасно (затверджений render:
+# "Operation.......... OK       mm:ss" + рядок деталей нижче). Замість
+# "[N/TOTAL] Назва" рядок починається з 6-пробільного відступу, щоб
+# оператор одразу бачив: це продовження прогону, не восьмий+ пронумерований
+# крок.
+function Write-BRAVOOperationResult {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingWriteHost', '',
+        Justification = 'BRAVO.Console — виділена межа рендеру консолі; Write-Host тут архітектурно допустимий, як і в усіх інших Write-BRAVO*-функціях цього модуля (Write-BRAVOStepResult, Write-BRAVOHeaderSeparator тощо).')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+
+        [ValidateSet('OK', 'SKIPPED', 'WARN', 'FAIL')]
+        [string]$Status = 'OK',
+
+        [Nullable[timespan]]$Duration,
+
+        [string]$Details
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if ($script:BRAVOConsoleStepOpen) {
+        Write-Host ''
+        $script:BRAVOConsoleStepOpen = $false
+    }
+
+    $baseText = "      $Name"
+    $dots = '.' * [math]::Max(1, $script:BRAVOConsoleStepWidth - $baseText.Length)
+    Write-Host "$baseText$dots " -NoNewline
+
+    $statusColor = if ($script:BRAVOConsoleStatusColors.ContainsKey($Status)) {
+        $script:BRAVOConsoleStatusColors[$Status]
+    } else {
+        'White'
+    }
+    if ($null -ne $Duration) {
+        $durationText = Format-BRAVODuration -Duration $Duration
+        $paddedStatus = $Status.PadRight($script:BRAVOConsoleStatusFieldWidth)
+        Write-Host $paddedStatus -ForegroundColor $statusColor -NoNewline
+        Write-Host $durationText
+    } else {
+        Write-Host $Status -ForegroundColor $statusColor
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        foreach ($detailLine in ($Details -split "`r?`n")) {
+            Write-BRAVOConsoleDetail -Message $detailLine
+        }
+    }
+}
+
 # Причина/деталі під рядком етапу (docs/MANUAL_RUN_CONSOLE_UX.md):
 #   Причина: коротка операторська причина WARNING/ERROR
 #   Деталі:  необов'язковий короткий safe-текст, ніколи не stack trace
@@ -675,6 +739,41 @@ function Write-BRAVOSeparator {
 # РЕЗУЛЬТАТ (наприклад "План операцій:" одразу під заголовком Maintenance,
 # docs/OPERATOR_CONSOLE_UX.md §5) — щоб оператор бачив один суцільний
 # "титульний" блок, не розірваний іншим стилем роздільника.
+# dev.16: спільний рендер "План операцій:"/"План перевірок:" — той самий
+# plan-first паттерн (оператор бачить, ЩО виконуватиметься, ще до першого
+# кроку), який Maintenance/Archive/Health рендерять окремо. Приймає вже
+# готові [ordered]-entries (Label -> bool); сам не вирішує, що увімкнено —
+# лише рендерить ТАК/НІ й закриває блок тим самим '='-роздільником, що
+# Write-BRAVOHeader (Write-BRAVOHeaderSeparator), не '-'*60.
+function Write-BRAVOPlan {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingWriteHost', '',
+        Justification = 'BRAVO.Console — виділена межа рендеру консолі; Write-Host тут архітектурно допустимий, як і в усіх інших Write-BRAVO*-функціях цього модуля.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][System.Collections.Specialized.OrderedDictionary]$Entries
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+
+    $planLabelWidth = (
+        $Entries.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum
+    ).Maximum + 3
+    Write-Host ''
+    Write-Host $Title
+    Write-Host ''
+    foreach ($planEntry in $Entries.GetEnumerator()) {
+        $planLabel = ("{0}:" -f $planEntry.Key).PadRight($planLabelWidth)
+        $planValue = if ($planEntry.Value) { 'ТАК' } else { 'НІ' }
+        Write-Host ("  {0}{1}" -f $planLabel, $planValue)
+    }
+    Write-Host ''
+    Write-BRAVOHeaderSeparator
+}
+
 function Write-BRAVOHeaderSeparator {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingWriteHost', '',
@@ -822,6 +921,8 @@ Export-ModuleMember -Function @(
     'Write-BRAVOFinalSummaryFooter',
     'Write-BRAVOStep',
     'Write-BRAVOStepResult',
+    'Write-BRAVOOperationResult',
+    'Write-BRAVOPlan',
     'Write-BRAVOOperatorReason',
     'Write-BRAVOSkipReason',
     'Write-BRAVOStepDetail',

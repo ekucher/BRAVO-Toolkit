@@ -1158,34 +1158,45 @@ function Invoke-AutoShutdown {
             
             if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
                 Write-Log -Message "Користувач скасував вимкнення системи" -Level "INFO"
-                
+
                 # Скасовуємо вимкнення
                 $cancelProcess = Start-Process "shutdown" -ArgumentList "/a" -Wait -PassThru -NoNewWindow
-                
+
                 if ($cancelProcess.ExitCode -eq 0) {
                     Write-Log -Message "Вимкнення успішно скасовано" -Level "SUCCESS"
-                    [System.Windows.Forms.MessageBox]::Show("Вимкнення скасовано! Система продовжить роботу.", "BravoSoft", 
-                        [System.Windows.Forms.MessageBoxButtons]::OK, 
+                    [System.Windows.Forms.MessageBox]::Show("Вимкнення скасовано! Система продовжить роботу.", "BravoSoft",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Information)
+                    # dev.16: оператор інтерактивно скасував УЖЕ заплановане
+                    # вимкнення, і команда /a відпрацювала штатно — системного
+                    # вимкнення не відбудеться. Відрізняється від "Failed"
+                    # (сама scheduling-команда вище виконалась успішно).
+                    return 'Cancelled'
                 } else {
                     Write-Log -Message "Не вдалося скасувати вимкнення" -Level "ERROR"
-                    [System.Windows.Forms.MessageBox]::Show("Не вдалося скасувати вимкнення. Спробуйте виконати команду вручну: shutdown /a", "Помилка", 
-                        [System.Windows.Forms.MessageBoxButtons]::OK, 
+                    [System.Windows.Forms.MessageBox]::Show("Не вдалося скасувати вимкнення. Спробуйте виконати команду вручну: shutdown /a", "Помилка",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    # Спроба скасування не вдалась — вимкнення лишається
+                    # запланованим (shutdown-команда вище виконалась штатно),
+                    # система фактично вимкнеться.
+                    return 'Scheduled'
                 }
             } else {
                 Write-Log -Message "Користувач підтвердив вимкнення системи" -Level "INFO"
-                [System.Windows.Forms.MessageBox]::Show("Система буде вимкнена через $Timeout секунд.", "BravoSoft", 
-                    [System.Windows.Forms.MessageBoxButtons]::OK, 
+                [System.Windows.Forms.MessageBox]::Show("Система буде вимкнена через $Timeout секунд.", "BravoSoft",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information)
+                return 'Scheduled'
             }
-            
         } else {
             Write-Log -Message "Помилка ініціювання вимкнення системи. Код помилки: $($process.ExitCode)" -Level "ERROR"
+            return 'Failed'
         }
     }
     catch {
         Write-Log -Message "Помилка під час спроби вимкнення системи: $($_.Exception.Message)" -Level "ERROR"
+        return 'Failed'
     }
 }
 
@@ -3366,8 +3377,14 @@ function Remove-OldRestoreArchives {
     Write-Log "Сесії для збереження (найсвіжіші):" -Level "DEBUG"
     foreach ($group in $groupsToKeep) {
         $sessionTime = $group.Name
-        $beforeCount = ($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
-        $afterCount = ($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
+        # dev.16: явна array-матеріалізація через @(...) — під PowerShell
+        # 5.1 + Set-StrictMode, коли Where-Object повертає рівно один
+        # результат, pipeline віддає скалярний FileInfo замість масиву, і
+        # .Count на ньому кидає "The property 'Count' cannot be found on
+        # this object": підтверджено реальним acceptance-прогоном dev.15
+        # на DEV-LIMS (виняток після [8/8], перехоплений fail-safe catch).
+        $beforeCount = @($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
+        $afterCount = @($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
         Write-Log "  - $sessionTime (before: $beforeCount, after: $afterCount)" -Level "DEBUG"
     }
 
@@ -3404,8 +3421,14 @@ function Remove-OldRestoreArchives {
         Write-Log "Видалено $deletedCount файлів зі старих сесій архівів (збережено $KeepCount найсвіжіших сесій)" -Level "SUCCESS"
         
         # Показуємо що залишилось (тільки в режимі DEBUG)
-        $remainingFiles = Get-ChildItem -Path $Path -Filter "${ArchivePrefix}_*" -ErrorAction SilentlyContinue
-        if ($remainingFiles) {
+        # dev.16: та сама scalar-Count проблема, що вище — Get-ChildItem
+        # повертає одиничний FileInfo (не масив), коли залишається рівно
+        # один файл; @(...) гарантує масив незалежно від кількості
+        # результатів (0/1/N), тому .Count і foreach лишаються безпечними.
+        $remainingFiles = @(
+            Get-ChildItem -Path $Path -Filter "${ArchivePrefix}_*" -ErrorAction SilentlyContinue
+        )
+        if ($remainingFiles.Count -gt 0) {
             Write-Log "Залишилось архівів: $($remainingFiles.Count)" -Level "DEBUG"
             foreach ($file in $remainingFiles) {
                 Write-Log "  - $($file.Name)" -Level "DEBUG"
@@ -4099,6 +4122,14 @@ $maintenancePlanEntries = [ordered]@{
     'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
     'Maintenance BRAVO'               = [bool]$BravoMaintenanceEnabled
     'Реставрація моделі'              = [bool]$script:BRAVOMaintenanceRestoreStepEnabled
+    # dev.16: очистка не має власного on/off прапорця — політика
+    # оцінюється КОЖЕН прогін (немає гілки, яка пропускає весь блок
+    # "===== ОЧИСТКА СТАРИХ ДАНИХ ====="), тому це не UI-only "ТАК", а
+    # буквальне відображення того, що секція завжди виконується. ТАК тут
+    # означає "перевірку буде проведено", а не "щось буде видалено" —
+    # порожній результат (немає застарілих даних) рендериться SKIPPED
+    # на самій операції нижче, план про це не сигналить окремо.
+    'Очистка старих даних/логів'      = $true
     'Архівація після maintenance'     = [bool]$script:BRAVOMaintenanceArchiveStepEnabled
     'Автоматичне вимкнення сервера'   = [bool]$script:EnableAutoShutdown
 }
@@ -4189,6 +4220,23 @@ Write-Log -Message "Дата: $($currentDate.ToString('yyyy-MM-dd'))" -NoTimesta
 Write-Log -Message "Час: $($currentDate.ToString('HH:mm:ss'))" -NoTimestamp
 if ($RunMissedRestoreOnly -and -not $missedDailyWork) {
     Write-Log -Message "Recovery: пропущених Backup/Maintenance не знайдено; завершення без дій" -Level 'INFO'
+    # dev.16: раніше тут був голий "exit 0" без жодного підсумку —
+    # оператор бачив заголовок і План операцій (вище), а потім одразу
+    # "Натисніть будь-яку клавішу..." від зовнішнього finally, без
+    # жодного результату. [1/8]...[8/8] свідомо НЕ запускаються: реальних
+    # операцій цього прогону немає, фальшиві numbered steps ввели б в
+    # оману (не основний 8-step run, окремий compact no-op summary).
+    # Зовнішній try/finally (рядок ~55) все одно охоплює цей exit —
+    # Wait-BRAVOManualExit спрацьовує так само, як і завжди.
+    Complete-BRAVOProgress
+    Write-BRAVOFinalSummaryHeader `
+        -Title 'BRAVO MAINTENANCE' `
+        -Status 'УСПІШНО' `
+        -StatusColor Green
+    Write-BRAVOResultField -Label 'Статус' -Value 'УСПІШНО' -Color Green
+    Write-BRAVOResultField -Label 'Код завершення' -Value ("0 — {0}" -f (Get-BRAVOExitCodeName -Code 0))
+    Write-BRAVOResultField -Label 'Результат' -Value 'Пропущених операцій не знайдено'
+    Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
     exit 0
 }
 Write-Log -Message "Повідомлення: $NotificationProviderDisplayName; режим $(switch ($script:SlackMode) {'none' {'ВИМКНЕНО'} 'errors_only' {'ЛИШЕ ПОМИЛКИ'} 'all' {'УСІ ПОВІДОМЛЕННЯ'}})" -NoTimestamp
@@ -4454,6 +4502,7 @@ if ($directoryStepStatus -eq 'SKIPPED') {
 # Під lock, але ДО зупинки служб: міграція торкається лише вже заархівованих
 # журналів у ArchiveRoot, тримати заради неї BRAVO зупиненим не потрібно.
 # Виконується перед ротацією, щоб нові файли лягали у вже впорядковане дерево.
+$migrationOperationStartedAt = Get-Date
 if ($script:BRAVOMaintenanceMigrationStepEnabled) {
     Write-Log -Message "==="
     Write-Log -Message "=== МІГРАЦІЯ СТАРОЇ СТРУКТУРИ ЖУРНАЛІВ ==="
@@ -4486,6 +4535,31 @@ if ($script:BRAVOMaintenanceMigrationStepEnabled) {
     } else {
         "Міграція старої структури журналів: нічого переносити"
     })
+    # dev.16: та сама причина, що execution result нижче для Cleanup/
+    # Archive/AutoShutdown — операція РЕАЛЬНО виконується щоразу, коли
+    # увімкнена, але досі мала лише LOG-видимість. WARN, а не FAIL: невдала
+    # міграція не критична (semantics вище незмінні — це той самий
+    # $migrationFailedTotal, що вже керував рівнем LOG-повідомлення).
+    Write-BRAVOOperationResult `
+        -Name 'Міграція старих журналів' `
+        -Status $(if ($migrationFailedTotal -gt 0) { 'WARN' } else { 'OK' }) `
+        -Duration ((Get-Date) - $migrationOperationStartedAt) `
+        -Details $(if ($migrationFailedTotal -gt 0) {
+            "перенесено: $migratedTotal; не вдалося: $migrationFailedTotal"
+        } elseif ($migratedTotal -gt 0) {
+            "перенесено файлів: $migratedTotal"
+        } else {
+            "нічого переносити"
+        })
+} else {
+    # dev.16: немає застарілих каталогів для міграції цього прогону —
+    # той самий SKIPPED/'не заплановано на цей запуск' контраст, що вже
+    # застосований до Restore/SizeCheck/Logs/RangeId.
+    Write-BRAVOOperationResult `
+        -Name 'Міграція старих журналів' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $migrationOperationStartedAt) `
+        -Details 'не заплановано на цей запуск'
 }
 
 $traceOutputProcessed = $false
@@ -5165,8 +5239,15 @@ Write-BRAVOMaintenanceStep `
 # без жодного підсумку. Тепер будь-яка помилка тут логується/позначає
 # criticalErrorOccurred, але виконання ГАРАНТОВАНО доходить до обчислення
 # exit code і друку фінального summary нижче.
+#
+# dev.16: $script:currentMaintenanceOperation називає активну операцію
+# цього діапазону для catch нижче — щоб повідомлення про необроблену
+# помилку називало конкретну дію ("Помилка операції ..."), а не
+# generic "Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт".
+# Кожен подальший блок оновлює цю змінну перед своїм початком.
 try {
 
+$script:currentMaintenanceOperation = 'Контроль діапазонів ID'
 if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
     if ($RangeIdCheckDelaySeconds -gt 0) {
         Start-Sleep -Seconds $RangeIdCheckDelaySeconds
@@ -5212,6 +5293,18 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
 
 # ===== ОЧИСТКА СТАРИХ ДАНИХ =====
 Write-BRAVOProgressPhase -Phase 'Очистка старих даних' -PercentComplete 88
+# dev.16: точна атрибуція для outer fail-safe catch нижче (рядок ~5180) —
+# якщо необроблена помилка станеться десь у Cleanup/Archive/AutoShutdown/
+# фінальному звіті, catch називає САМЕ цю операцію, а не generic список.
+$script:currentMaintenanceOperation = 'Очистка старих даних/логів'
+$cleanupOperationStartedAt = Get-Date
+$cleanupCriticalBefore = $script:criticalErrorOccurred
+$cleanupWarningsBefore = $script:BRAVOWarningCount
+# "Reported" — чи встиг цей блок надрукувати свій Write-BRAVOOperationResult
+# до того, як (якщо) стався виняток: outer catch перевіряє прапорець, щоб
+# не показати FAIL result двічі й не пропустити його, якщо виняток стався
+# ДО власного рендеру блоку.
+$script:cleanupOperationReported = $false
 
 # Перевіряємо, чи є що очищати
 $hasDataToClean = $false
@@ -5236,7 +5329,13 @@ function Get-BRAVOExpiredLogDateDirectories {
 # Перевірка даних основного компонента BRAVO
 $traceOldDirs = @()
 $traceOldLogs = @()
-$groupsToDelete = @()
+# dev.16: власна, окремо названа Main-scope змінна — НЕ $groupsToDelete
+# (та назва зарезервована за function Remove-OldRestoreArchives, де вона
+# локальна й враховує SHA512/7z-валідність та stale-invalid групи; тут —
+# лише грубий candidate-count для Details нижче, без тієї валідації).
+# Однакова назва в різних scope вводила б в оману, ніби це те саме
+# значення.
+$restoreArchiveDeleteCandidateGroups = @()
 if ($BravoMaintenanceEnabled) {
     $traceOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $TRACE_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
     $traceOldLogs = @(Get-BRAVOFiles -Path $LOG_DIR |
@@ -5262,8 +5361,8 @@ if ($BravoMaintenanceEnabled) {
             }
         }
         $sortedGroups = $archiveGroups | Sort-Object Name -Descending
-        $groupsToDelete = @($sortedGroups | Select-Object -Skip $RESTORE_ARCHIVES_KEEP_COUNT)
-        $hasDataToClean = $hasDataToClean -or ($groupsToDelete.Count -gt 0)
+        $restoreArchiveDeleteCandidateGroups = @($sortedGroups | Select-Object -Skip $RESTORE_ARCHIVES_KEEP_COUNT)
+        $hasDataToClean = $hasDataToClean -or ($restoreArchiveDeleteCandidateGroups.Count -gt 0)
     }
 }
 
@@ -5396,7 +5495,7 @@ if ($expiredCompressedLogCount -gt 0) {
 }
 
 # Видалення старих архівів реставрації - тільки якщо є що видаляти
-if ($BravoMaintenanceEnabled -and $groupsToDelete.Count -gt 0) {
+if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt 0) {
     Remove-OldRestoreArchives `
         -Path $ARC_DIR `
         -ArchivePrefix $ArchivePrefix `
@@ -5404,8 +5503,54 @@ if ($BravoMaintenanceEnabled -and $groupsToDelete.Count -gt 0) {
         -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS
 }
 
+# dev.16: execution result очистки — unnumbered top-level операція (не
+# [N/8], не рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок).
+# Статус — той самий before/after-снепшот, що вже керує 8 numbered
+# кроками (Get-BRAVOMaintenanceStepStatus); SKIPPED, коли перевірка не
+# знайшла нічого застарілого. Details — компактний агрегат КАНДИДАТІВ,
+# знайдених вище (не "видалено": жодна з Process-OldData/Remove-*
+# функцій не повертає структурованих success-лічильників, а вигадувати
+# їх тут — не мета цього proходу); повний перелік файлів і будь-які
+# індивідуальні збої лишаються тільки в LOG, як і раніше.
+$cleanupOperationDirCandidateCount = $traceOldDirs.Count + $exchangAPIOldDirs.Count +
+    $apacheOldDirs.Count + $bravoWebAppOldDirs.Count + $bravoWebLegacyOldDirs.Count
+$cleanupOperationFileCandidateCount = $traceOldLogs.Count + $expiredCompressedLogCount
+$cleanupOperationStatus = Get-BRAVOMaintenanceStepStatus `
+    -CriticalBefore $cleanupCriticalBefore `
+    -WarningsBefore $cleanupWarningsBefore `
+    -Skipped:(-not $hasDataToClean)
+$cleanupOperationDetails = if ($cleanupOperationStatus -eq 'SKIPPED') {
+    'даних для очищення немає'
+} elseif ($cleanupOperationStatus -eq 'WARN' -or $cleanupOperationStatus -eq 'FAIL') {
+    'перевірте LOG для деталей'
+} else {
+    $cleanupDetailParts = @()
+    if ($cleanupOperationDirCandidateCount -gt 0) {
+        $cleanupDetailParts += "каталогів: $cleanupOperationDirCandidateCount"
+    }
+    if ($cleanupOperationFileCandidateCount -gt 0) {
+        $cleanupDetailParts += "файлів: $cleanupOperationFileCandidateCount"
+    }
+    if ($restoreArchiveDeleteCandidateGroups.Count -gt 0) {
+        $cleanupDetailParts += "сесій архівів реставрації: $($restoreArchiveDeleteCandidateGroups.Count)"
+    }
+    if ($cleanupDetailParts.Count -gt 0) { $cleanupDetailParts -join '; ' } else { $null }
+}
+Write-BRAVOOperationResult `
+    -Name 'Очистка старих даних/логів' `
+    -Status $cleanupOperationStatus `
+    -Duration ((Get-Date) - $cleanupOperationStartedAt) `
+    -Details $cleanupOperationDetails
+$script:cleanupOperationReported = $true
+
 # ===== ЗАПУСК ДОДАТКОВОГО СКРИПТУ BRAVO_ARCHIV =====
 Write-BRAVOProgressPhase -Phase 'Запуск BRAVO_ARCHIV' -PercentComplete 95
+$script:currentMaintenanceOperation = 'Архівація після maintenance'
+$archiveOperationStartedAt = Get-Date
+$archiveCriticalBefore = $script:criticalErrorOccurred
+$archiveWarningsBefore = $script:BRAVOWarningCount
+$script:archiveOperationReported = $false
+$archiveOperationDetail = $null
 if ($script:EnableArchiveAfterMaintenance) {
     # Дочірній BRAVO_ARCHIV сам захоплює той самий lock. Перед передачею
     # керування звільняємо maintenance-lock; служби вже повернуті до
@@ -5416,7 +5561,7 @@ if ($script:EnableArchiveAfterMaintenance) {
 
     try {
         $bravoArchivePath = [string]$schedulerSettings.Backup.ScriptPath
-        
+
         if (Test-Path -LiteralPath $bravoArchivePath -PathType Leaf) {
             Write-Log -Message "Запуск скрипту BRAVO_ARCHIV.ps1..." -Level "INFO"
 
@@ -5426,39 +5571,86 @@ if ($script:EnableArchiveAfterMaintenance) {
                 -Wait `
                 -PassThru `
                 -NoNewWindow
-            
+
             if ($archivProcess.ExitCode -eq 0) {
                 Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 успішно виконано" -Level "SUCCESS"
             } else {
                 Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з кодом помилки: $($archivProcess.ExitCode)" -Level "ERROR"
                 $script:criticalErrorOccurred = $true
+                $archiveOperationDetail = "BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"
             }
         } else {
             Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 не знайдено за шляхом: $bravoArchivePath" -Level "ERROR"
             $script:criticalErrorOccurred = $true
+            $archiveOperationDetail = "скрипт не знайдено: $bravoArchivePath"
         }
     }
     catch {
         Write-Log -Message "Помилка під час запуску скрипту BRAVO_ARCHIV.ps1: $($_.Exception.Message)" -Level "ERROR"
         $script:criticalErrorOccurred = $true
+        $archiveOperationDetail = 'перевірте LOG для деталей'
     }
-    # dev.15: запуск BRAVO_ARCHIV — опційна операція поза затвердженим
-    # [N/8] контрактом (не numbered main step); успіх/помилка вже повністю
-    # покриті Write-Log вище (SUCCESS/ERROR), без Write-BRAVOMaintenanceStep.
+    # dev.16: execution result — unnumbered top-level операція (не [N/8],
+    # не рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок).
+    # Дочірній процес/lock/exit-code semantics вище не змінені — лише
+    # обгорнуті трекінгом статусу/тривалості для консолі.
+    Write-BRAVOOperationResult `
+        -Name 'Архівація після maintenance' `
+        -Status (Get-BRAVOMaintenanceStepStatus `
+            -CriticalBefore $archiveCriticalBefore `
+            -WarningsBefore $archiveWarningsBefore) `
+        -Duration ((Get-Date) - $archiveOperationStartedAt) `
+        -Details $archiveOperationDetail
+    $script:archiveOperationReported = $true
 } else {
     # Лише у журнал: вимкнений компонент не займає рядка в консолі.
     Write-Log -Message "Запуск BRAVO_ARCHIV: вимкнено" -Level "DEBUG"
+    Write-BRAVOOperationResult `
+        -Name 'Архівація після maintenance' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $archiveOperationStartedAt) `
+        -Details 'вимкнено'
+    $script:archiveOperationReported = $true
 }
 
 # ===== ВИКЛИК ФУНКЦІЇ АВТОМАТИЧНОГО ВИМКНЕННЯ =====
+$script:currentMaintenanceOperation = 'Автоматичне вимкнення сервера'
+$autoShutdownOperationStartedAt = Get-Date
+$script:autoShutdownOperationReported = $false
 if ($script:EnableAutoShutdown) {
-    Invoke-AutoShutdown -Timeout $ShutdownTimeout
+    # dev.16: Invoke-AutoShutdown повертає фінальний символьний стан
+    # (Scheduled/Cancelled/Failed), не просто "чи команда планування
+    # відпрацювала" — оператор має бачити РЕАЛЬНИЙ результат, включно з
+    # інтерактивним скасуванням, а не тільки той факт, що виклик колись
+    # відбувся. Сама логіка планування/діалогу/скасування не змінена.
+    $autoShutdownOutcome = Invoke-AutoShutdown -Timeout $ShutdownTimeout
+    Write-BRAVOOperationResult `
+        -Name 'Автоматичне вимкнення сервера' `
+        -Status $(switch ($autoShutdownOutcome) {
+            'Scheduled' { 'OK' }
+            'Cancelled' { 'SKIPPED' }
+            default     { 'FAIL' }
+        }) `
+        -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
+        -Details $(switch ($autoShutdownOutcome) {
+            'Scheduled' { "заплановано через $ShutdownTimeout с" }
+            'Cancelled' { 'скасовано користувачем' }
+            default     { 'не вдалося ініціювати вимкнення — перевірте LOG' }
+        })
+    $script:autoShutdownOperationReported = $true
 } else {
     # Мінімальне інформаційне повідомлення без заголовків
     Write-Log -Message "Автоматичне вимкнення: вимкнено" -Level "DEBUG"
+    Write-BRAVOOperationResult `
+        -Name 'Автоматичне вимкнення сервера' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
+        -Details 'вимкнено'
+    $script:autoShutdownOperationReported = $true
 }
 
 # Відправляємо фінальний звіт
+$script:currentMaintenanceOperation = 'Відправлення фінального звіту'
 Send-FinalReport -LOG_FILE $LOG_FILE
 
 if (-not $script:criticalErrorOccurred) {
@@ -5485,7 +5677,13 @@ if (-not $script:criticalErrorOccurred) {
     # виконання все одно дійде до summary нижче, але зі стертим статусом
     # помилки.
     $script:criticalErrorOccurred = $true
-    $errorMsg = "Критична помилка після відновлення служб (Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт): $($_.Exception.Message)"
+    # dev.16: точна атрибуція замість generic "Range ID/очистка/
+    # BRAVO_ARCHIV/AutoShutdown/фінальний звіт" — $script:currentMaintenanceOperation
+    # оновлюється перед кожним блоком вище (Контроль діапазонів ID/
+    # Очистка старих даних/логів/Архівація після maintenance/Автоматичне
+    # вимкнення сервера/Відправлення фінального звіту), тому тут завжди
+    # відома САМЕ активна на момент винятку операція.
+    $errorMsg = "Помилка операції `"$($script:currentMaintenanceOperation)`": $($_.Exception.Message)"
 
     # Логування й сповіщення виконуються ІЗОЛЬОВАНО одне від одного: збій
     # будь-якого з них (наприклад, недоступний LOG-файл або мережева
@@ -5506,6 +5704,51 @@ if (-not $script:criticalErrorOccurred) {
         # не rethrow: збій сповіщення не повинен знищити finalization.
         # Та сама причина, що вище — без Write-Log/Send-SlackAlert/throw/
         # exit/return.
+        $null = $_
+    }
+
+    # dev.16: якщо виняток стався ВСЕРЕДИНІ операції з власним execution
+    # result (Cleanup/Archive/AutoShutdown), її рядок так і не встиг
+    # надрукуватись — оператор побачив би лише generic ПОМИЛКА без
+    # result-рядка для конкретної операції. Друкуємо її FAIL РІВНО ОДИН
+    # РАЗ тут, лише якщо вона ще не відзвітувала сама (прапорець
+    # *Reported, встановлюється в кінці кожного блоку вище). Контроль
+    # діапазонів ID — numbered [8/8] крок, тут не чіпаємо; Відправлення
+    # фінального звіту — notification transport без власного
+    # console-result (лише причина в $errorMsg вище).
+    try {
+        switch ($script:currentMaintenanceOperation) {
+            'Очистка старих даних/логів' {
+                if (-not $script:cleanupOperationReported) {
+                    Write-BRAVOOperationResult `
+                        -Name 'Очистка старих даних/логів' `
+                        -Status 'FAIL' `
+                        -Duration ((Get-Date) - $cleanupOperationStartedAt) `
+                        -Details 'перевірте LOG для деталей'
+                }
+            }
+            'Архівація після maintenance' {
+                if (-not $script:archiveOperationReported) {
+                    Write-BRAVOOperationResult `
+                        -Name 'Архівація після maintenance' `
+                        -Status 'FAIL' `
+                        -Duration ((Get-Date) - $archiveOperationStartedAt) `
+                        -Details 'перевірте LOG для деталей'
+                }
+            }
+            'Автоматичне вимкнення сервера' {
+                if (-not $script:autoShutdownOperationReported) {
+                    Write-BRAVOOperationResult `
+                        -Name 'Автоматичне вимкнення сервера' `
+                        -Status 'FAIL' `
+                        -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
+                        -Details 'перевірте LOG для деталей'
+                }
+            }
+        }
+    } catch {
+        # не rethrow: та сама ізоляція, що Write-Log/Send-SlackAlert вище —
+        # навіть fallback-рендер не повинен знищити finalization.
         $null = $_
     }
 }

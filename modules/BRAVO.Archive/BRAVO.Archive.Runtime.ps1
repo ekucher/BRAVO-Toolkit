@@ -1032,10 +1032,24 @@ function Remove-BRAVOExpiredBackupGenerations {
         [Parameter(Mandatory = $true)][string]$BackupRoot,
         [Parameter(Mandatory = $true)][string]$CurrentGenerationId,
         [int]$RetentionDays,
-        [ref]$CleanupSectionShown
+        [ref]$CleanupSectionShown,
+        # dev.16 (review round 3): опційний факт-сигнал для operator-console
+        # unnumbered result — скільки generation РЕАЛЬНО видалено цим
+        # прогоном (не просто "перевірку виконано"). Той самий мінімальний
+        # ref-out-параметр паттерн, що вже CleanupSectionShown вище; не
+        # змінює retention/delete semantics нижче.
+        # ВАЖЛИВО: ім'я НЕ повинно збігатися (регістр-незалежно) з жодною
+        # локальною змінною нижче — PowerShell типізує параметр-змінну як
+        # [ref] на всю область видимості функції, і будь-яке присвоєння
+        # значення змінній з тим самим (з точністю до регістру) іменем
+        # тихо обгортається назад у НОВИЙ PSReference замість звичайного
+        # int; наступний $x++/$x += кидає "operator works only on numbers"
+        # (підтверджено реальним запуском — саме так спершу й було зроблено).
+        [ref]$RemovedGenerationCount
     )
 
     if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return $false }
+    $deletedGenerationCount = 0
     try {
         $validRetentionDays = if ($RetentionDays -gt 0) { $RetentionDays } else { 183 }
         $invalidRetentionDays = if ($failedArchiveRetentionDays -gt 0) { [int]$failedArchiveRetentionDays } else { 30 }
@@ -1143,9 +1157,12 @@ function Remove-BRAVOExpiredBackupGenerations {
                 Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
             }
             Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))" -Level 'SUCCESS'
+            $deletedGenerationCount++
         }
+        if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
         return $true
     } catch {
+        if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
         Write-BRAVOLog -Component 'CLEANUP' -Message "Generation-aware retention failed: $($_.Exception.Message)" -Level 'ERROR'
         return $false
     }
@@ -1291,11 +1308,23 @@ function Remove-OldLunchArchives {
     param(
         [Parameter(Mandatory = $true)][string]$ArchiveRoot,
         [Parameter(Mandatory = $true)][string[]]$Directories,
-        [int]$RetentionMonths = 2
+        [int]$RetentionMonths = 2,
+        # dev.16 (review round 3): опційний факт-сигнал для operator-console
+        # unnumbered result — скільки файлів РЕАЛЬНО видалено (те саме
+        # $deletedCount, що вже рахується нижче для LOG); мінімальний
+        # ref-out-параметр, не змінює retention/delete semantics.
+        # ВАЖЛИВО: ім'я НЕ Deleted*Count — нижче вже є локальна змінна
+        # $deletedCount; PowerShell типізує параметр-змінну як [ref] на
+        # всю область видимості функції, і регістр-незалежний збіг тихо
+        # ламає $deletedCount += 2 нижче (кидає "operator works only on
+        # numbers", кожне реальне видалення потрапляло б у catch як
+        # false-failure — підтверджено реальним запуском).
+        [ref]$RemovedFileCount
     )
 
     if (-not (Test-Path -LiteralPath $ArchiveRoot -PathType Container)) {
         Write-BRAVOLog -Component 'CLEANUP' -Message "Каталог обідніх архівів не знайдено: $ArchiveRoot" -Level "ERROR"
+        if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = 0 }
         return $false
     }
 
@@ -1375,6 +1404,7 @@ function Remove-OldLunchArchives {
     }
 
     Write-BRAVOLog -Component 'CLEANUP' -Message "Усього видалено обідніх файлів: $deletedCount" -Level "INFO"
+    if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = $deletedCount }
     return (-not $failed)
 }
 
@@ -4891,22 +4921,6 @@ function Main {
     $script:transferResults = $transferResults
     $operationFailed = $false
 
-    # Етапи консолі: середовище + шляхи + по одному на компонент, далі —
-    # лише ті передавання й перевірки, що справді увімкнені в конфігурації.
-    $healthCheckEnabled = (
-        [bool]$backupMonitoring.Enabled -and [bool]$backupMonitoring.RunAfterBackup
-    )
-    $transferResults.Health.Enabled = $healthCheckEnabled
-    Initialize-BRAVOArchiveSteps -Total (
-        2 +
-        $enabledArchives.Count +
-        $(if ($sftpArchiveUploadEnabled) { 1 } else { 0 }) +
-        $(if ($bazaAppSFTPSyncEnabled) { 1 } else { 0 }) +
-        $(if ($bazaWWWSFTPSyncEnabled) { 1 } else { 0 }) +
-        $(if ($smbArchiveCopyEnabled) { 1 } else { 0 }) +
-        $(if ($healthCheckEnabled) { 1 } else { 0 })
-    )
-
     Show-ScriptProgress -Status "Iнiцiалiзацiя" -PercentComplete 2
     
     Write-Log "==="
@@ -4974,7 +4988,73 @@ function Main {
             -LogFile $script:logFile
         return
     }
-    
+
+    # dev.16 (review round 3): План/dynamic Total нижче навмисно
+    # розташовані ПІСЛЯ if ($SyncBAZA) { ...; return } вище, а не до
+    # нього — -SyncBAZA це окремий, ізольований SFTP-only flow (BAZA_APP/
+    # BAZA_WWW через SFTP) зі своїм власним Initialize-BRAVOArchiveSteps
+    # і БЕЗ Плану операцій. Якби цей блок стояв до SyncBAZA-гілки, оператор
+    # у режимі -SyncBAZA побачив би "План операцій" повного backup-flow
+    # (Архівація/SFTP/SMB/очищення), який до -SyncBAZA взагалі не
+    # застосовується. Archive/SyncBazaModeDoesNotGainNormalArchiveOperations
+    # це перевіряє.
+    # Етапи консолі: середовище + шляхи + по одному на компонент, далі —
+    # лише ті передавання й перевірки, що справді увімкнені в конфігурації.
+    $healthCheckEnabled = (
+        [bool]$backupMonitoring.Enabled -and [bool]$backupMonitoring.RunAfterBackup
+    )
+    $transferResults.Health.Enabled = $healthCheckEnabled
+    # dev.16: локальна синхронізація BAZA_APP/BAZA_WWW реально виконується
+    # (Sync-Folders), але досі не мала власного numbered step — додається
+    # до знаменника й отримує рядок нижче лише коли реально увімкнена
+    # (той самий "вимкнений компонент не займає рядка" принцип, що й решта
+    # передавань/перевірок тут).
+    Initialize-BRAVOArchiveSteps -Total (
+        2 +
+        $(if ($bazaAppLocalSyncEnabled) { 1 } else { 0 }) +
+        $(if ($bazaWWWLocalSyncEnabled) { 1 } else { 0 }) +
+        $enabledArchives.Count +
+        $(if ($sftpArchiveUploadEnabled) { 1 } else { 0 }) +
+        $(if ($bazaAppSFTPSyncEnabled) { 1 } else { 0 }) +
+        $(if ($bazaWWWSFTPSyncEnabled) { 1 } else { 0 }) +
+        $(if ($smbArchiveCopyEnabled) { 1 } else { 0 }) +
+        $(if ($healthCheckEnabled) { 1 } else { 0 })
+    )
+
+    # dev.16: План операцій — те саме "plan-first" правило, що вже
+    # застосоване в Maintenance (docs/OPERATOR_CONSOLE_UX.md) — оператор
+    # бачить, ЩО саме виконуватиметься, ще до першого кроку. Джерело
+    # значень — ті самі прапорці, що вже визначають нумерацію кроків вище
+    # (Initialize-BRAVOArchiveSteps) і Total нижче, тому план і фактичне
+    # виконання не можуть розійтися. Внутрішні деталі реалізації (VSS
+    # ownership state, SHA512, manifest writer, lock bookkeeping,
+    # notification transport) свідомо НЕ показуються тут — вони не є
+    # окремими operator decisions, лише частина вже перелічених операцій.
+    # dev.16 (review round 3): рендер через спільний Write-BRAVOPlan
+    # (BRAVO.Console) — той самий helper, що Health, а не власний raw
+    # Write-Host у runtime.
+    $archivePlanEntries = [ordered]@{}
+    $archivePlanEntries['Локальна синхронізація BAZA_APP'] = [bool]$bazaAppLocalSyncEnabled
+    $archivePlanEntries['Локальна синхронізація BAZA_WWW'] = [bool]$bazaWWWLocalSyncEnabled
+    foreach ($archiveDefinition in $archiveDefinitions) {
+        $archivePlanEntries["Архівація $($archiveDefinition.Type)"] = [bool]$archiveDefinition.Enabled
+    }
+    $archivePlanEntries['Завантаження архівів на SFTP'] = [bool]$sftpArchiveUploadEnabled
+    $archivePlanEntries['Синхронізація BAZA_APP на SFTP'] = [bool]$bazaAppSFTPSyncEnabled
+    $archivePlanEntries['Синхронізація BAZA_WWW на SFTP'] = [bool]$bazaWWWSFTPSyncEnabled
+    $archivePlanEntries['Копіювання на NAS/SMB'] = [bool]$smbArchiveCopyEnabled
+    # Очищення старих журналів/backup generation — той самий "завжди
+    # оцінюється" принцип, що Maintenance/Очистка старих даних/логів:
+    # немає власного on/off прапорця, ТАК означає "перевірку буде
+    # проведено", а не "щось буде видалено цього разу" (порожній
+    # результат рендериться SKIPPED на самій unnumbered операції нижче).
+    $archivePlanEntries['Очищення старих журналів'] = $true
+    $archivePlanEntries['Очищення старих backup generation'] = [bool](
+        $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup
+    )
+    $archivePlanEntries['Post-backup Health'] = [bool]$healthCheckEnabled
+    Write-BRAVOPlan -Title 'План операцій:' -Entries $archivePlanEntries
+
     # Використовуємо NoTimestamp для інформаційного блоку
     Write-Log "==="
     Write-Log "=== ОПЦIЇ СКРИПТА ==="
@@ -5108,7 +5188,9 @@ function Main {
         Write-Log "Перевірка NAS/SMB не потрібна: компонент вимкнено" -Level "INFO"
     }
     
+    $oldLogCleanupStartedAt = Get-Date
     $oldLogsToRemove = @()
+    $oldLogCleanupPathMissing = $false
     if (Test-Path -LiteralPath $logPath -PathType Container) {
         $logRetentionCutoff = (Get-Date).AddDays(-$logRetentionDays)
         $oldLogsToRemove = @(Get-BRAVOFiles -Path $logPath -Filter $logFileFilter |
@@ -5116,21 +5198,44 @@ function Main {
     } else {
         Write-Log "Шлях журналів не знайдено: $logPath" -Level "ERROR"
         $operationFailed = $true
+        $oldLogCleanupPathMissing = $true
     }
 
+    $oldLogCleanupSucceeded = $true
     if ($oldLogsToRemove.Count -gt 0) {
         Write-Log "==="
         Write-Log "=== ОЧИЩЕННЯ СТАРИХ ЛОГIВ ==="
         Show-ScriptProgress -Status "Очищення старих логiв" -PercentComplete 12
-        if (-not (Remove-OldLogsByAge `
+        $oldLogCleanupSucceeded = Remove-OldLogsByAge `
                 -Path $logPath `
                 -Filter $logFileFilter `
                 -RetentionDays $logRetentionDays `
-                -Logger { param($Message, $Level) Write-Log $Message -Level $Level })) {
+                -Logger { param($Message, $Level) Write-Log $Message -Level $Level }
+        if (-not $oldLogCleanupSucceeded) {
             $operationFailed = $true
         }
     }
-    
+
+    # dev.16: execution result — unnumbered top-level операція (Archive
+    # реально виконує це щоразу, але досі мала лише progress/log
+    # видимість). Reuse Write-BRAVOOperationResult з BRAVO.Console
+    # (той самий, що Maintenance) — не окремий Archive-specific formatter.
+    # Retention days/filter/delete semantics вище не змінені.
+    Write-BRAVOOperationResult `
+        -Name 'Очищення старих журналів' `
+        -Status $(
+            if ($oldLogCleanupPathMissing -or -not $oldLogCleanupSucceeded) { 'FAIL' }
+            elseif ($oldLogsToRemove.Count -eq 0) { 'SKIPPED' }
+            else { 'OK' }
+        ) `
+        -Duration ((Get-Date) - $oldLogCleanupStartedAt) `
+        -Details $(
+            if ($oldLogCleanupPathMissing) { 'шлях журналів не знайдено; деталі у журналі.' }
+            elseif (-not $oldLogCleanupSucceeded) { 'перевірте LOG для деталей' }
+            elseif ($oldLogsToRemove.Count -eq 0) { 'журналів старших за retention немає' }
+            else { "видалено файлів: $($oldLogsToRemove.Count)" }
+        )
+
     # Перевірка шляхів
     Write-Log "==="
     # Етап 1 підсумовує все, що перевірялося до цього: сумісність, пароль,
@@ -5149,6 +5254,12 @@ function Main {
     Show-ScriptProgress -Status "Перевiрка необхiдних шляхiв" -PercentComplete 15
     $requiredPaths = @($baseRequiredPaths)
     $archiveToolAvailable = $archiveCredentialValid -and $archiveConsistencyValid
+    # dev.16: підсумковий лічильник для compact "Перевірка шляхів" Details
+    # нижче (недоступних шляхів/перевірок: N) — рахує КОЖЕН окремий провал:
+    # Test-PathWithLog і SYSTEM write/read probes. Існуючі bool-прапорці
+    # (basePathsAvailable/sourceAvailable/...) і логіка на їх основі не
+    # змінені — рахунок лише додається поруч.
+    $pathCheckFailureCount = 0
 
     if ($enabledArchives.Count -gt 0) {
         $requiredPaths += @{Path=$arcPath; Description="7-Zip"; CreateIfMissing=$false}
@@ -5161,6 +5272,7 @@ function Main {
             -Description $item.Description `
             -CreateIfMissing ([bool]$item.CreateIfMissing))) {
             $basePathsAvailable = $false
+            $pathCheckFailureCount++
             if ($item.Path -eq $arcPath) {
                 $archiveToolAvailable = $false
             }
@@ -5176,6 +5288,8 @@ function Main {
             -Path $archive.Destination `
             -Description "Каталог архiву $($archive.Type)" `
             -CreateIfMissing $true
+        if (-not $sourceAvailable) { $pathCheckFailureCount++ }
+        if (-not $destinationAvailable) { $pathCheckFailureCount++ }
 
         if ($archiveToolAvailable -and $sourceAvailable -and $destinationAvailable) {
             $readyArchives += $archive
@@ -5196,12 +5310,14 @@ function Main {
             -Path $bazaAppPaths.Source `
             -Description "Каталог BAZA APP" `
             -CreateIfMissing $false
+        if (-not $bazaAppSourceAvailable) { $pathCheckFailureCount++ }
     }
     if ($bazaAppLocalSyncEnabled) {
         $bazaAppDestinationAvailable = Test-PathWithLog `
             -Path $bazaAppPaths.Destination `
             -Description "Каталог архiву BAZA APP" `
             -CreateIfMissing $true
+        if (-not $bazaAppDestinationAvailable) { $pathCheckFailureCount++ }
     }
     $bazaWWWSourceAvailable = $true
     $bazaWWWDestinationAvailable = $true
@@ -5212,9 +5328,11 @@ function Main {
                 -Path $bazaWWWPaths.Source `
                 -Description "Каталог BAZA WWW" `
                 -CreateIfMissing $false
+            if (-not $bazaWWWSourceAvailable) { $pathCheckFailureCount++ }
         } else {
             Write-Log "Каталог BAZA WWW недоступний: $($bazaWWWDetection.Reason)" -Level "ERROR"
             $bazaWWWSourceAvailable = $false
+            $pathCheckFailureCount++
         }
     }
     if ($bazaWWWLocalSyncEnabled) {
@@ -5222,6 +5340,7 @@ function Main {
             -Path $bazaWWWPaths.Destination `
             -Description "Каталог архiву BAZA WWW" `
             -CreateIfMissing $true
+        if (-not $bazaWWWDestinationAvailable) { $pathCheckFailureCount++ }
     }
 
     $allPathsExist = (
@@ -5233,14 +5352,17 @@ function Main {
         $bazaWWWDestinationAvailable
     )
     Show-PathCheckSummary -CheckedPaths $requiredPaths -AllPathsExist $allPathsExist
-    Write-BRAVOArchiveStep `
-        -Name "Перевірка шляхів" `
-        -Status $(if ($allPathsExist) { 'OK' } else { 'ERROR' }) `
-        -Details $(if ($allPathsExist) { '' } else { 'Частина шляхів недоступна; деталі у журналі.' })
 
     # SYSTEM access preflight. Test-Path підтверджує тільки існування, тому
     # перед будь-яким backup виконуємо фактичний write/read-back probe в
     # кожному required writable каталозі й read-only enumeration джерел.
+    #
+    # dev.16: раніше "Перевірка шляхів" рендерилась ТУТ (одразу після
+    # $allPathsExist), ДО цього preflight — оператор бачив OK, а кілька
+    # рядків нижче production операції скасовувались через провал SYSTEM
+    # access probe. Крок тепер рендериться ПІСЛЯ обчислення
+    # $systemAccessValid (нижче), об'єднуючи існування шляхів і фактичний
+    # доступ в один Result.
     $systemAccessValid = $true
     # BRAVO_ARCHIV пише лише власні логи ($logPath = RuntimeRoot\LOGS),
     # backup-дані (BackupRoot) і машинний стан (ProgramData\State). Системні
@@ -5266,6 +5388,7 @@ function Main {
         } else {
             Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe FAILED: $probePath ($($writeProbe.Error))" -Level 'ERROR'
             $systemAccessValid = $false
+            $pathCheckFailureCount++
         }
     }
     $sourceProbePaths = @($enabledArchives | ForEach-Object { [string]$_.Source })
@@ -5280,6 +5403,7 @@ function Main {
         } else {
             Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe FAILED: $probePath ($($readProbe.Error))" -Level 'ERROR'
             $systemAccessValid = $false
+            $pathCheckFailureCount++
         }
     }
     if (-not $systemAccessValid) {
@@ -5292,7 +5416,25 @@ function Main {
         $operationFailed = $true
     }
 
+    # dev.16: "Перевірка шляхів" рендериться ТУТ — ПІСЛЯ і existence-
+    # перевірок (Test-PathWithLog вище), і фактичного SYSTEM write/read
+    # access preflight (щойно вище), не до нього. OK лише коли ОБИДВІ
+    # групи пройшли; Details — компактний підсумок кількості провалів,
+    # повні шляхи й помилки лишаються в LOG (Show-PathCheckSummary/
+    # Write-BRAVOLog вище).
+    $pathCheckFullyValid = $allPathsExist -and $systemAccessValid
+    Write-BRAVOArchiveStep `
+        -Name "Перевірка шляхів" `
+        -Status $(if ($pathCheckFullyValid) { 'OK' } else { 'ERROR' }) `
+        -Details $(if ($pathCheckFullyValid) { '' } else { "недоступних шляхів/перевірок: $pathCheckFailureCount" })
+
     # Синхронізація BAZA APP
+    # dev.16: top-level Archive operation — власний numbered step, коли
+    # реально увімкнена (Total уже враховує це вище); вимкнений компонент
+    # і далі не займає рядка й не входить у знаменник. ERROR/WARNING
+    # відповідно до ІСНУЮЧОЇ семантики нижче (шлях недоступний -> ERROR,
+    # Sync-Folders повернув false -> WARNING) — сама семантика не змінена.
+    $bazaAppSyncStartedAt = Get-Date
     if ($bazaAppLocalSyncEnabled -and $bazaAppSourceAvailable -and $bazaAppDestinationAvailable) {
         Show-ScriptProgress -Status "Локальна синхронiзацiя BAZA APP" -PercentComplete 20
         Write-Log "==="
@@ -5305,14 +5447,24 @@ function Main {
             Write-Log "Помилка синхронiзацiї BAZA APP - архiвацiя може бути неповною" -Level "WARNING"
             $operationFailed = $true
         }
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_APP" `
+            -Status $(if ($syncSuccess) { 'OK' } else { 'WARNING' }) `
+            -Duration ((Get-Date) - $bazaAppSyncStartedAt)
     } elseif ($bazaAppLocalSyncEnabled) {
         Write-Log "Локальну синхронiзацiю BAZA APP пропущено через помилку шляху" -Level "ERROR"
         $operationFailed = $true
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_APP" `
+            -Status 'ERROR' `
+            -Duration ((Get-Date) - $bazaAppSyncStartedAt) `
+            -Details 'недоступне джерело або каталог призначення; деталі у журналі.'
     } else {
         Write-Log "Локальну синхронiзацiю BAZA APP вимкнено в конфiгурацiї" -Level "INFO"
     }
 
     # Синхронізація BAZA WWW (локальна копія)
+    $bazaWWWSyncStartedAt = Get-Date
     if ($bazaWWWLocalSyncEnabled -and $bazaWWWSourceAvailable -and $bazaWWWDestinationAvailable) {
         Show-ScriptProgress -Status "Локальна синхронiзацiя BAZA WWW" -PercentComplete 20
         Write-Log "==="
@@ -5325,13 +5477,22 @@ function Main {
             Write-Log "Помилка синхронiзацiї BAZA WWW - архiвацiя може бути неповною" -Level "WARNING"
             $operationFailed = $true
         }
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_WWW" `
+            -Status $(if ($syncSuccess) { 'OK' } else { 'WARNING' }) `
+            -Duration ((Get-Date) - $bazaWWWSyncStartedAt)
     } elseif ($bazaWWWLocalSyncEnabled) {
         Write-Log "Локальну синхронiзацiю BAZA WWW пропущено через помилку шляху" -Level "ERROR"
         $operationFailed = $true
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_WWW" `
+            -Status 'ERROR' `
+            -Duration ((Get-Date) - $bazaWWWSyncStartedAt) `
+            -Details 'недоступне джерело або каталог призначення; деталі у журналі.'
     } else {
         Write-Log "Локальну синхронiзацiю BAZA WWW вимкнено в конфiгурацiї" -Level "INFO"
     }
-    
+
     # Створення архівів.
     #
     # ОДИН VSS Snapshot Set на всю generation створюється ДО циклу і
@@ -5689,7 +5850,28 @@ function Main {
         $operationFailed = $true
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
-    
+
+    # dev.16: одна аггрегована unnumbered-операція "Очищення старих backup
+    # generation" покриває обидва блоки нижче (generation retention, що
+    # всередині Remove-BRAVOExpiredBackupGenerations також прибирає
+    # invalid/incomplete сети, + очищення обідніх архівів). Жодних окремих
+    # рядків на кожен внутрішній фільтр. Retention days/filters/delete
+    # semantics нижче не змінені.
+    $backupRetentionCleanupStartedAt = Get-Date
+    $backupRetentionCleanupPlanned = [bool]($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup)
+    $generationCleanupAttempted = $false
+    $generationCleanupSucceeded = $true
+    $generationCleanupDeletedCount = 0
+    # dev.16 (review round 3): ініціалізується ТУТ (не лише всередині
+    # if-гілки нижче) — інакше під Set-StrictMode посилання на неї в
+    # агрегованому результаті нижче кидає виняток, коли generation
+    # retention вимкнено/generation ще не COMPLETE цього прогону.
+    $archiveCleanupSectionShown = $false
+    $lunchCleanupAttempted = $false
+    $lunchCleanupSucceeded = $true
+    $lunchCleanupConfigError = $false
+    $lunchCleanupDeletedCount = 0
+
     # Видалення старих архівів: розділ логу з'являється лише перед фактичним видаленням.
     if (($enableArchiveDeletion -or $enableFailedArchiveDeletion) -and
         $script:backupGenerationStatus -eq 'COMPLETE') {
@@ -5713,12 +5895,15 @@ function Main {
             Write-Log "archiveRetentionDays не вдалося прочитати; для безпеки застосовано $effectiveArchiveRetentionDays днів" -Level "WARNING"
         }
         $archiveCleanupSectionShown = $false
+        $generationCleanupAttempted = $true
         if (-not (Remove-BRAVOExpiredBackupGenerations `
                 -BackupRoot $backupRootPath `
                 -CurrentGenerationId $generationId `
                 -RetentionDays $effectiveArchiveRetentionDays `
-                -CleanupSectionShown ([ref]$archiveCleanupSectionShown))) {
+                -CleanupSectionShown ([ref]$archiveCleanupSectionShown) `
+                -RemovedGenerationCount ([ref]$generationCleanupDeletedCount))) {
             $operationFailed = $true
+            $generationCleanupSucceeded = $false
         }
     }
 
@@ -5740,13 +5925,57 @@ function Main {
         if ([string]::IsNullOrWhiteSpace([string]$lunchArchiveCleanupPath) -or $lunchArchiveDirectories.Count -eq 0) {
             Write-Log "Очищення обідніх архівів увімкнено, але lunchArchiveCleanupPath або lunchArchiveCleanupDirectories не налаштовано" -Level "ERROR"
             $operationFailed = $true
-        } elseif (-not (Remove-OldLunchArchives `
-            -ArchiveRoot $lunchArchiveCleanupPath `
-            -Directories $lunchArchiveDirectories `
-            -RetentionMonths $effectiveLunchArchiveRetentionMonths)) {
-            $operationFailed = $true
+            $lunchCleanupAttempted = $true
+            $lunchCleanupConfigError = $true
+        } else {
+            $lunchCleanupAttempted = $true
+            if (-not (Remove-OldLunchArchives `
+                -ArchiveRoot $lunchArchiveCleanupPath `
+                -Directories $lunchArchiveDirectories `
+                -RetentionMonths $effectiveLunchArchiveRetentionMonths `
+                -RemovedFileCount ([ref]$lunchCleanupDeletedCount))) {
+                $operationFailed = $true
+                $lunchCleanupSucceeded = $false
+            }
         }
     }
+
+    $backupRetentionCleanupAttempted = $generationCleanupAttempted -or $lunchCleanupAttempted
+    $backupRetentionCleanupFailed = (-not $generationCleanupSucceeded) -or $lunchCleanupConfigError -or (-not $lunchCleanupSucceeded)
+    # dev.16 (review round 3): OK лише коли щось РЕАЛЬНО видалено —
+    # attempted+succeeded-без-видалень тепер SKIPPED "даних для очищення
+    # немає", не OK. Факт-сигнали: $archiveCleanupSectionShown встановлює
+    # Show-ArchiveCleanupSection ЛИШЕ безпосередньо перед фактичним
+    # видаленням generation (не при самій лише перевірці); $lunchCleanupDeletedCount —
+    # реальний $deletedCount, який Remove-OldLunchArchives вже рахує для
+    # LOG. Обидва значення — факт, не вигадані числа.
+    $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0)
+    Write-BRAVOOperationResult `
+        -Name 'Очищення старих backup generation' `
+        -Status $(
+            if (-not $backupRetentionCleanupPlanned) { 'SKIPPED' }
+            elseif ($backupRetentionCleanupFailed) { 'FAIL' }
+            elseif (-not $backupRetentionCleanupAttempted) { 'SKIPPED' }
+            elseif (-not $backupRetentionCleanupDidDelete) { 'SKIPPED' }
+            else { 'OK' }
+        ) `
+        -Duration ((Get-Date) - $backupRetentionCleanupStartedAt) `
+        -Details $(
+            if (-not $backupRetentionCleanupPlanned) { '' }
+            elseif ($backupRetentionCleanupFailed) { 'перевірте LOG для деталей' }
+            elseif (-not $backupRetentionCleanupAttempted) { 'відкладено: generation не завершено COMPLETE у цьому циклі' }
+            elseif (-not $backupRetentionCleanupDidDelete) { 'даних для очищення немає' }
+            else {
+                $retentionCleanupDetailParts = @()
+                if ($generationCleanupDeletedCount -gt 0) {
+                    $retentionCleanupDetailParts += "generation: $generationCleanupDeletedCount"
+                }
+                if ($lunchCleanupDeletedCount -gt 0) {
+                    $retentionCleanupDetailParts += "обідніх файлів: $lunchCleanupDeletedCount"
+                }
+                $retentionCleanupDetailParts -join '; '
+            }
+        )
     
     # Передача на SFTP
     # Статус етапу визначаємо за приростом кількості ERROR у журналі: прапорець
