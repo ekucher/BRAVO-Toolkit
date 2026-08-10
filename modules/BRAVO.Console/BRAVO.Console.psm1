@@ -846,10 +846,19 @@ function Write-BRAVOResultFooter {
 #   2. consoleSettings.PauseOnExit — ручне вимкнення в BRAVO.config.
 #   3. [Environment]::UserInteractive — false в сесії 0 (SYSTEM-завдання
 #      "Run whether user is logged on or not").
-#   4. [Console]::IsInputRedirected — true, коли stdin перенаправлено
-#      (CI, автоматизація, дочірній процес самотесту).
-# Кожна з трьох останніх перевірок обгорнута в try/catch: будь-яка
-# помилка під час перевірки веде до пропуску паузи, а не до її форсування.
+# dev.18: [Console]::IsInputRedirected навмисно БІЛЬШЕ НЕ окрема
+# самостійна причина пропустити паузу. Реальний ручний DEV-LIMS запуск
+# (заголовок MANUAL, справжня консоль оператора) показав
+# IsInputRedirected=true — і вікно мовчки закривалось одразу після
+# РЕЗУЛЬТАТ, хоча RawUI.ReadKey нижче спрацював би штатно.
+# RawUI.ReadKey читає буфер консолі напряму, не залежить від
+# перенаправленого stdin; якщо він справді недоступний (ISE, фоновий
+# хост), catch нижче сам переходить на Read-Host, а якщо й той не може
+# дочекатись вводу — мовчки продовжує без зависання (як і раніше).
+# Автоматизація захищена пунктом 1 (-NoPause), не цим евристичним
+# сигналом.
+# Кожна з решти перевірок обгорнута в try/catch: будь-яка помилка під
+# час перевірки веде до пропуску паузи, а не до її форсування.
 function Wait-BRAVOManualExit {
     [CmdletBinding()]
     param([switch]$NoPause)
@@ -882,9 +891,6 @@ function Wait-BRAVOManualExit {
 
     try {
         if (-not [Environment]::UserInteractive) {
-            return
-        }
-        if ([Console]::IsInputRedirected) {
             return
         }
     } catch {

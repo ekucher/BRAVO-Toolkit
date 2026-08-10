@@ -719,14 +719,16 @@ function Write-Log {
     $component = $script:BRAVOLogComponent
 
     # Роздільники й заголовки формували структуру старої консолі. Тепер її
-    # задають етапи (Write-BRAVOStepResult), тому в консоль вони не йдуть,
-    # але лишаються в журналі, щоб хронологія читалася як раніше.
+    # задають етапи (Write-BRAVOStepResult), тому в консоль вони не йдуть.
+    # dev.18: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
+    # журнал. Реальний DEV-LIMS лог показав структуровані записи з
+    # timestamp/level/component, але порожнім Message — саме цей виклик
+    # (кожен голий "===" стоїть безпосередньо перед "=== ЗАГОЛОВОК ===",
+    # який і так фіксує ту саму мить і компонент повноцінним текстом;
+    # унікальної хронологічної інформації тут немає). Заголовки нижче
+    # (гілка "=== ... ===") лишаються повністю без змін — вони й далі
+    # пишуться в журнал з повним текстом заголовка.
     if ($Message -eq "=" -or $Message -eq "===") {
-        Write-BRAVOLog `
-            -Message ("=" * $SeparatorLength) `
-            -Level 'INFO' `
-            -Component $component `
-            -NoConsole
         return
     }
     if ($Message -match "^=== .* ===$") {
@@ -5009,11 +5011,18 @@ function Main {
     # до знаменника й отримує рядок нижче лише коли реально увімкнена
     # (той самий "вимкнений компонент не займає рядка" принцип, що й решта
     # передавань/перевірок тут).
+    # dev.18: старе очищення журналів (завжди оцінюється — рівно один
+    # доданок) і очищення backup generation (лише коли реально увімкнене
+    # — той самий вираз, що й План нижче, і сам гейт кроку далі)
+    # мігрували з unnumbered Write-BRAVOOperationResult на numbered
+    # Write-BRAVOArchiveStep; Total має враховувати обидва.
     Initialize-BRAVOArchiveSteps -Total (
         2 +
+        1 +
         $(if ($bazaAppLocalSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWLocalSyncEnabled) { 1 } else { 0 }) +
         $enabledArchives.Count +
+        $(if ($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup) { 1 } else { 0 }) +
         $(if ($sftpArchiveUploadEnabled) { 1 } else { 0 }) +
         $(if ($bazaAppSFTPSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWSFTPSyncEnabled) { 1 } else { 0 }) +
@@ -5047,7 +5056,9 @@ function Main {
     # оцінюється" принцип, що Maintenance/Очистка старих даних/логів:
     # немає власного on/off прапорця, ТАК означає "перевірку буде
     # проведено", а не "щось буде видалено цього разу" (порожній
-    # результат рендериться SKIPPED на самій unnumbered операції нижче).
+    # результат рендериться SKIPPED). dev.18: обидві операції тепер
+    # numbered [N/TOTAL] кроки (Write-BRAVOArchiveStep, той самий Total
+    # вище і той самий вираз нижче, що й тут) — не unnumbered.
     $archivePlanEntries['Очищення старих журналів'] = $true
     $archivePlanEntries['Очищення старих backup generation'] = [bool](
         $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup
@@ -5216,15 +5227,16 @@ function Main {
         }
     }
 
-    # dev.16: execution result — unnumbered top-level операція (Archive
-    # реально виконує це щоразу, але досі мала лише progress/log
-    # видимість). Reuse Write-BRAVOOperationResult з BRAVO.Console
-    # (той самий, що Maintenance) — не окремий Archive-specific formatter.
-    # Retention days/filter/delete semantics вище не змінені.
-    Write-BRAVOOperationResult `
+    # dev.18: numbered [N/TOTAL] крок (Write-BRAVOArchiveStep) — раніше
+    # unnumbered Write-BRAVOOperationResult; реальний DEV-LIMS вивід
+    # показав цю операцію ПОЗА канонічною нумерацією, хоча вона реально
+    # виконується щоразу. Позиція виклику (до "Перевірка середовища")
+    # не змінена — той самий порядок виконання, лише інший renderer.
+    # Retention days/filter/delete semantics не змінені.
+    Write-BRAVOArchiveStep `
         -Name 'Очищення старих журналів' `
         -Status $(
-            if ($oldLogCleanupPathMissing -or -not $oldLogCleanupSucceeded) { 'FAIL' }
+            if ($oldLogCleanupPathMissing -or -not $oldLogCleanupSucceeded) { 'ERROR' }
             elseif ($oldLogsToRemove.Count -eq 0) { 'SKIPPED' }
             else { 'OK' }
         ) `
@@ -5950,32 +5962,39 @@ function Main {
     # реальний $deletedCount, який Remove-OldLunchArchives вже рахує для
     # LOG. Обидва значення — факт, не вигадані числа.
     $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0)
-    Write-BRAVOOperationResult `
-        -Name 'Очищення старих backup generation' `
-        -Status $(
-            if (-not $backupRetentionCleanupPlanned) { 'SKIPPED' }
-            elseif ($backupRetentionCleanupFailed) { 'FAIL' }
-            elseif (-not $backupRetentionCleanupAttempted) { 'SKIPPED' }
-            elseif (-not $backupRetentionCleanupDidDelete) { 'SKIPPED' }
-            else { 'OK' }
-        ) `
-        -Duration ((Get-Date) - $backupRetentionCleanupStartedAt) `
-        -Details $(
-            if (-not $backupRetentionCleanupPlanned) { '' }
-            elseif ($backupRetentionCleanupFailed) { 'перевірте LOG для деталей' }
-            elseif (-not $backupRetentionCleanupAttempted) { 'відкладено: generation не завершено COMPLETE у цьому циклі' }
-            elseif (-not $backupRetentionCleanupDidDelete) { 'даних для очищення немає' }
-            else {
-                $retentionCleanupDetailParts = @()
-                if ($generationCleanupDeletedCount -gt 0) {
-                    $retentionCleanupDetailParts += "generation: $generationCleanupDeletedCount"
+    # dev.18: numbered [N/TOTAL] крок — раніше unnumbered
+    # Write-BRAVOOperationResult. $backupRetentionCleanupPlanned (той
+    # самий вираз, що Total вище і План) тепер вирішує, чи крок
+    # РЕНДЕРИТЬСЯ ВЗАГАЛІ (повністю вимкнено -> жодного рядка, жодного
+    # SKIPPED-заповнювача), а не лише його статус — Total і фактична
+    # наявність рядка більше не можуть розійтися. Позиція виклику (після
+    # публікації всіх component, до "Передача на SFTP") не змінена.
+    if ($backupRetentionCleanupPlanned) {
+        Write-BRAVOArchiveStep `
+            -Name 'Очищення старих backup generation' `
+            -Status $(
+                if ($backupRetentionCleanupFailed) { 'ERROR' }
+                elseif (-not $backupRetentionCleanupAttempted) { 'SKIPPED' }
+                elseif (-not $backupRetentionCleanupDidDelete) { 'SKIPPED' }
+                else { 'OK' }
+            ) `
+            -Duration ((Get-Date) - $backupRetentionCleanupStartedAt) `
+            -Details $(
+                if ($backupRetentionCleanupFailed) { 'перевірте LOG для деталей' }
+                elseif (-not $backupRetentionCleanupAttempted) { 'відкладено: generation не завершено COMPLETE у цьому циклі' }
+                elseif (-not $backupRetentionCleanupDidDelete) { 'даних для очищення немає' }
+                else {
+                    $retentionCleanupDetailParts = @()
+                    if ($generationCleanupDeletedCount -gt 0) {
+                        $retentionCleanupDetailParts += "generation: $generationCleanupDeletedCount"
+                    }
+                    if ($lunchCleanupDeletedCount -gt 0) {
+                        $retentionCleanupDetailParts += "обідніх файлів: $lunchCleanupDeletedCount"
+                    }
+                    $retentionCleanupDetailParts -join '; '
                 }
-                if ($lunchCleanupDeletedCount -gt 0) {
-                    $retentionCleanupDetailParts += "обідніх файлів: $lunchCleanupDeletedCount"
-                }
-                $retentionCleanupDetailParts -join '; '
-            }
-        )
+            )
+    }
     
     # Передача на SFTP
     # Статус етапу визначаємо за приростом кількості ERROR у журналі: прапорець

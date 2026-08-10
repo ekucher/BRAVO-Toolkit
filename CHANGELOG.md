@@ -1,5 +1,90 @@
 # Changelog
 
+## 5.0.0-dev.18 — 2026-08-10
+
+Minimal operator-flow/observability correctness release, from a real
+manual DEV-LIMS `BRAVO_ARCHIV` 5.0.0-dev.17 run. Three related defects,
+tightly scoped — no backup, VSS, retention-policy, MANIFESTS, transfer,
+notification, scheduler, or exit-code semantics changed. (A separate,
+already-known factual VSS diagnostic-wording issue — "Узгодженість
+архівів: окремий VSS-знімок для кожного компонента", while the runtime
+actually uses one Snapshot Set per generation — is intentionally **not**
+addressed here; it will be handled separately.)
+
+- Manual Archive/Health/Maintenance operator executions no longer skip
+  the configured exit pause solely because stdin is reported as
+  redirected when a usable interactive console exists. The real run's
+  header correctly said `MANUAL`, but the window closed immediately
+  after the final RESULT instead of waiting — `Wait-BRAVOManualExit`
+  (`BRAVO.Console`, shared by all three runtimes) treated
+  `[Console]::IsInputRedirected` as an independent, unconditional
+  reason to skip the pause, before `$Host.UI.RawUI.ReadKey(...)` (which
+  reads the console input buffer directly and does not depend on
+  stdin redirection) ever got a chance to run. `-NoPause` remains the
+  authoritative scheduled/automation pause bypass (`BRAVO_TASKS_INSTALL.ps1`
+  adds it to every scheduled task; the Maintenance→Archive child launch
+  and the self-test both already use it explicitly), and
+  `consoleSettings.PauseOnExit = $false` remains the explicit
+  configuration bypass — neither changed. `RawUI.ReadKey` stays
+  primary, `Read-Host` stays its ISE/non-console fallback.
+- Archive old-log cleanup (`Очищення старих журналів`) and
+  backup-generation cleanup (`Очищення старих backup generation`) now
+  participate in the same dynamic `[N/M]` numbered-step sequence as
+  every other operator-visible Archive operation, instead of rendering
+  as unnumbered rows outside the canonical sequence. Old-log cleanup is
+  always evaluated and always occupies one step; generation cleanup
+  occupies one step only when the existing enablement expression
+  (`enableArchiveDeletion -or enableFailedArchiveDeletion -or
+  enableLunchArchiveCleanup` — unchanged) is true, and no step at all
+  when fully disabled. The dynamic step `Total` and the `План операцій:`
+  entries were already driven by the same flags and needed no semantic
+  change, only the two cleanup operations' own render call
+  (`Write-BRAVOOperationResult` → `Write-BRAVOArchiveStep`). Execution
+  order is unchanged — only which renderer each call uses.
+- Empty structured Archive runtime-log records used only as visual
+  section separators (`timestamp [INFO] [COMPONENT]` with a blank
+  Message — one per section transition: STARTUP, CREDENTIALS, VSS,
+  SFTP-ARCHIVE, PATHS, ARCHIVE, HASH, BAZA_APP, SUMMARY, ...) are no
+  longer emitted. Root cause: the bare `"==="` separator (always
+  immediately adjacent to a real `"=== HEADING ==="` call, which
+  already logs the same moment and component with full text) built its
+  log line as `"=" * $SeparatorLength`, and the `$SeparatorLength`
+  default resolved to an empty string in this call path. Rather than
+  chase that resolution further, the bare-separator branch of Archive's
+  `Write-Log` shim now simply does not write a log record at all — the
+  adjacent heading already carries the section-transition information,
+  so no diagnostic value is lost. Meaningful `=== HEADING ===` records
+  (`=== ОПЦІЇ СКРИПТА ===`, `=== АРХІВАЦІЯ MODEL ===`, `=== ЗАВЕРШЕННЯ
+  РОБОТИ СКРИПТА ===`, etc.) are completely unchanged. Timestamp/level/
+  component format, log file paths, retention, and console thresholds
+  are untouched; shared `BRAVO.Logging` was not modified.
+- Tests: ~19 new/updated checks — `Console/ManualExit*` (NoPause and
+  PauseOnExit=false bypass functionally via real, non-blocking calls to
+  `Wait-BRAVOManualExit`; structural proof `IsInputRedirected` is no
+  longer a standalone pre-check while `UserInteractive` remains one;
+  RawUI/Read-Host fallback intact), `Archive/ManualModeAndPauseUseSameNoPauseContract`
+  (Archive/Health/Maintenance all delegate to the one shared helper, no
+  duplicated `RawUI.ReadKey`), `Archive/*CleanupUsesNumberedStep*` /
+  `DynamicTotalIncludesCleanupOperations` / `PlanAndCleanupStepsShareEnablementSemantics`
+  / `CleanupNoWorkRendersSkipped` / `CleanupOperationsNoLongerUseUnnumberedRenderer`,
+  and `Logging/RuntimeLogHasNoEmptyStructuredRecords` (a real functional
+  round-trip through Archive's `Write-Log` and `BRAVO.Logging` into a
+  temp file, asserting no physical line has an empty Message) plus
+  `Archive/SectionSeparatorsDoNotEmitEmptyLogEvents` /
+  `SectionHeadingsRemainLogged`. Two pre-existing dev.16 tests
+  (`Archive/LogCleanupIsUnnumberedOperation`, `Archive/BackupRetentionCleanupAggregatesSubCleanup`)
+  and one dev.16 Console test (`ConsoleUX/13-RedirectedNonInteractiveSkipsWait`)
+  were updated in place, since their assertions encoded exactly the
+  now-corrected (unnumbered renderer / IsInputRedirected-as-blocker)
+  behavior. Full suite: 693/693.
+
+Note: `BRAVO.Maintenance.Runtime.ps1` has its own, separate copy of the
+same bare-`"==="`-separator pattern (`Write-BRAVOMaintenanceLogFile
+-Entry ("=" * $SeparatorLength)`), which may have the same defect. It
+was deliberately left untouched here — out of scope for this
+Archive-focused release ("do not change Maintenance business logic");
+worth a follow-up look separately.
+
 ## 5.0.0-dev.17 — 2026-08-10
 
 Minimal correctness fix on top of dev.16, from a real DEV-LIMS

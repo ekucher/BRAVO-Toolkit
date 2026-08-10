@@ -10753,13 +10753,19 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "ConsoleUX/12-NoPauseSkipsWait" `
         -Failure "Wait-BRAVOManualExit має негайно повертатись при -NoPause"
+    # dev.18: реальний DEV-LIMS ручний (MANUAL) запуск довів, що
+    # [Console]::IsInputRedirected сам по собі помилково відхиляв
+    # справжню операторську консоль ДО спроби RawUI.ReadKey — вікно
+    # закривалось одразу після РЕЗУЛЬТАТ замість очікування. Тепер
+    # [Environment]::UserInteractive лишається єдиною такою pre-check
+    # причиною пропустити паузу; IsInputRedirected більше не окрема
+    # самостійна умова (перевіряється explicit-negative тестом нижче).
     Test-BRAVOCondition `
         -Condition (
-            $waitManualExitText.Contains('[Console]::IsInputRedirected') -and
             $waitManualExitText.Contains('[Environment]::UserInteractive')
         ) `
-        -Name "ConsoleUX/13-RedirectedNonInteractiveSkipsWait" `
-        -Failure "Wait-BRAVOManualExit має пропускати очікування при перенаправленому/неінтерактивному запуску"
+        -Name "ConsoleUX/13-NonInteractiveSessionSkipsWait" `
+        -Failure "Wait-BRAVOManualExit має пропускати очікування, коли [Environment]::UserInteractive=false (SYSTEM-сесія)"
     Test-BRAVOCondition `
         -Condition (
             $waitManualExitText.Contains('$Host.UI.RawUI.ReadKey(') -and
@@ -10960,30 +10966,30 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name 'Archive/PathStepCannotRenderOkBeforeAccessPreflightCompletes' `
         -Failure '''Перевірка шляхів'' має рендеритись РІВНО один раз, ПІСЛЯ SYSTEM read-probe (не до SYSTEM access preflight); OK лише коли allPathsExist І systemAccessValid'
 
-    # --- Archive: очищення старих журналів — unnumbered operator operation
-    # (Write-BRAVOOperationResult, не Write-BRAVOArchiveStep — не займає
-    # [N/TOTAL]), reuse того самого formatter, що Maintenance.
+    # --- Archive: dev.18 — очищення старих журналів мігрувало на numbered
+    # Write-BRAVOArchiveStep (раніше unnumbered Write-BRAVOOperationResult
+    # — реальний DEV-LIMS вивід показав цю операцію поза [N/TOTAL]).
     $archiveLogCleanupIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих журналів''')
     $archiveLogCleanupWindow = if ($archiveLogCleanupIndex -ge 0) {
         $archiveScriptText.Substring([Math]::Max(0, $archiveLogCleanupIndex - 400), [Math]::Min(1000, $archiveScriptText.Length - [Math]::Max(0, $archiveLogCleanupIndex - 400)))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
-            $archiveLogCleanupWindow.Contains('Write-BRAVOOperationResult') -and
+            $archiveLogCleanupWindow.Contains('Write-BRAVOArchiveStep') -and
             $archiveLogCleanupWindow.Contains('''SKIPPED''') -and
-            $archiveLogCleanupWindow.Contains('''FAIL''') -and
+            $archiveLogCleanupWindow.Contains('''ERROR''') -and
             $archiveLogCleanupWindow.Contains('журналів старших за retention немає')
         ) `
-        -Name 'Archive/LogCleanupIsUnnumberedOperation' `
-        -Failure '''Очищення старих журналів'' має рендеритись через Write-BRAVOOperationResult (unnumbered), з SKIPPED коли кандидатів немає'
+        -Name 'Archive/LogCleanupUsesNumberedStep' `
+        -Failure '''Очищення старих журналів'' має рендеритись через numbered Write-BRAVOArchiveStep, з SKIPPED коли кандидатів немає'
 
-    # --- Archive: очищення backup generation — ОДНА агрегована unnumbered
+    # --- Archive: очищення backup generation — ОДНА агрегована numbered
     # операція, що покриває і generation retention, і lunch cleanup (не
     # окремі рядки на кожен внутрішній фільтр).
     $archiveRetentionResultIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих backup generation''')
     $archiveRetentionResultWindow = if ($archiveRetentionResultIndex -ge 0) {
-        $archiveRetentionWindowStart = [Math]::Max(0, $archiveRetentionResultIndex - 3500)
-        $archiveScriptText.Substring($archiveRetentionWindowStart, [Math]::Min(5000, $archiveScriptText.Length - $archiveRetentionWindowStart))
+        $archiveRetentionWindowStart = [Math]::Max(0, $archiveRetentionResultIndex - 4000)
+        $archiveScriptText.Substring($archiveRetentionWindowStart, [Math]::Min(5500, $archiveScriptText.Length - $archiveRetentionWindowStart))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -10992,7 +10998,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             $archiveRetentionResultWindow.Contains('Remove-OldLunchArchives')
         ) `
         -Name 'Archive/BackupRetentionCleanupAggregatesSubCleanup' `
-        -Failure '''Очищення старих backup generation'' має бути ОДНІЄЮ unnumbered операцією, що покриває і Remove-BRAVOExpiredBackupGenerations, і Remove-OldLunchArchives'
+        -Failure '''Очищення старих backup generation'' має бути ОДНІЄЮ numbered операцією, що покриває і Remove-BRAVOExpiredBackupGenerations, і Remove-OldLunchArchives'
 
     Test-BRAVOCondition `
         -Condition (
@@ -11268,6 +11274,258 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name 'Health/SuccessAndProblemNotificationsReuseLatestBackupTimestamp' `
         -Failure 'success- і problem-повідомлення мають отримувати TimestampText з ОДНОГО виклику Get-BRAVOHealthLatestBackupSummary; .ToLocalTime() має існувати рівно в ОДНІЙ точці джерела (не дубльований у двох message builders)'
+
+    #####################################################################
+    # dev.18: реальний DEV-LIMS ручний BRAVO_ARCHIV прогін виявив три
+    # пов'язані дефекти operator-flow/observability: (1) MANUAL-консоль
+    # закривалась без паузи через IsInputRedirected; (2) очищення
+    # журналів/backup generation рендерились ПОЗА канонічною [N/M]
+    # нумерацією; (3) журнал містив структуровані записи з порожнім
+    # Message (голий "===" роздільник). Backup/VSS/retention/MANIFESTS/
+    # SFTP/SMB/notification/exit-code семантика НЕ змінена.
+    #####################################################################
+
+    # --- Console: реальний Wait-BRAVOManualExit (не симуляція) —
+    # -NoPause і PauseOnExit=false обидва повертаються миттєво, безпечно
+    # викликати в самотесті (не чекають на клавішу).
+    Remove-Module -Name 'BRAVO.Console' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psd1') -Force -ErrorAction Stop
+
+    $manualExitNoPauseElapsed = Measure-Command { Wait-BRAVOManualExit -NoPause }
+    Test-BRAVOCondition `
+        -Condition ($manualExitNoPauseElapsed.TotalSeconds -lt 2) `
+        -Name 'Console/ManualExitNoPauseAlwaysBypasses' `
+        -Failure "-NoPause має лишатись авторитетним automation-сигналом і повертатись миттєво; зайняло $($manualExitNoPauseElapsed.TotalSeconds) с"
+
+    $global:consoleSettings = @{ PauseOnExit = $false }
+    try {
+        $manualExitPauseOnExitFalseElapsed = Measure-Command { Wait-BRAVOManualExit }
+    } finally {
+        $global:consoleSettings = $null
+    }
+    Test-BRAVOCondition `
+        -Condition ($manualExitPauseOnExitFalseElapsed.TotalSeconds -lt 2) `
+        -Name 'Console/ManualExitPauseOnExitFalseBypasses' `
+        -Failure "PauseOnExit=`$false (явне налаштування в BRAVO.config) має лишатись bypass-сигналом і повертатись миттєво; зайняло $($manualExitPauseOnExitFalseElapsed.TotalSeconds) с"
+
+    # --- Structural: [Console]::IsInputRedirected більше НЕ окрема
+    # самостійна pre-check причина відхилити операторську консоль ДО
+    # спроби RawUI.ReadKey (реальний DEV-LIMS баг); UserInteractive
+    # лишається єдиною такою причиною.
+    Test-BRAVOCondition `
+        -Condition (
+            -not $waitManualExitText.Contains('[Console]::IsInputRedirected') -and
+            $waitManualExitText.Contains('[Environment]::UserInteractive')
+        ) `
+        -Name 'Console/ManualExitDoesNotPreSkipSolelyForInputRedirected' `
+        -Failure 'Wait-BRAVOManualExit НЕ повинна містити самостійну перевірку [Console]::IsInputRedirected — реальний DEV-LIMS MANUAL-запуск довів, що вона помилково відхиляла справжню операторську консоль до спроби RawUI.ReadKey'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $waitManualExitText.Contains('$Host.UI.RawUI.ReadKey(') -and
+            $waitManualExitText.Contains('[void](Read-Host)')
+        ) `
+        -Name 'Console/ManualExitUsesRawUIWithReadHostFallback' `
+        -Failure 'Wait-BRAVOManualExit має спершу пробувати $Host.UI.RawUI.ReadKey(...), з фолбеком на Read-Host — той самий контракт, що й раніше'
+
+    # --- Archive: власна тонка обгортка Wait-ForManualExit делегує в той
+    # самий спільний Wait-BRAVOManualExit -NoPause:$NoPause (не власна
+    # реалізація); Health/Maintenance також викликають його напряму —
+    # жодного дубльованого RawUI.ReadKey десь ще.
+    # 'RawUI.ReadKey(' (з дужкою) — реальний виклик; без дужки Archive
+    # згадує його лише в поясювальному коментарі до Wait-ForManualExit.
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
+            -not $archiveScriptText.Contains('RawUI.ReadKey(') -and
+            $healthScriptText.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
+            -not $healthScriptText.Contains('RawUI.ReadKey(') -and
+            $maintenanceScriptTextForManifestStorage.Contains('Wait-BRAVOManualExit -NoPause:$NoPause') -and
+            -not $maintenanceScriptTextForManifestStorage.Contains('RawUI.ReadKey(')
+        ) `
+        -Name 'Archive/ManualModeAndPauseUseSameNoPauseContract' `
+        -Failure 'Archive/Health/Maintenance мають викликати ТІЛЬКИ спільний Wait-BRAVOManualExit -NoPause:$NoPause (BRAVO.Console); жоден із трьох runtime не повинен мати власного RawUI.ReadKey'
+
+    # --- Archive: старе очищення журналів мігрувало на numbered
+    # Write-BRAVOArchiveStep (не unnumbered Write-BRAVOOperationResult) —
+    # детально перевірено вище (Archive/LogCleanupUsesNumberedStep);
+    # тут лише позиція, потрібна для CleanupNoWorkRendersSkipped нижче.
+    $oldLogCleanupStepWindow = $archiveScriptText.IndexOf(
+        "-Name 'Очищення старих журналів'",
+        [Math]::Max(0, $archiveScriptText.IndexOf('$oldLogCleanupSucceeded = Remove-OldLogsByAge'))
+    )
+
+    # --- Archive: очищення backup generation — numbered крок, лише коли
+    # $backupRetentionCleanupPlanned (той самий вираз, що Total і План).
+    $generationCleanupPlannedIndex = $archiveScriptText.IndexOf('if ($backupRetentionCleanupPlanned) {')
+    $generationCleanupStepWindow = if ($generationCleanupPlannedIndex -ge 0) {
+        $archiveScriptText.Substring($generationCleanupPlannedIndex, [Math]::Min(700, $archiveScriptText.Length - $generationCleanupPlannedIndex))
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $generationCleanupStepWindow.Contains('Write-BRAVOArchiveStep') -and
+            $generationCleanupStepWindow.Contains('Очищення старих backup generation')
+        ) `
+        -Name 'Archive/GenerationCleanupUsesNumberedStepWhenEnabled' `
+        -Failure "'Очищення старих backup generation' має рендеритись через Write-BRAVOArchiveStep всередині if (`$backupRetentionCleanupPlanned) { ... }"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $generationCleanupPlannedIndex -ge 0 -and
+            -not $archiveScriptText.Contains('$backupRetentionCleanupPlanned) { ''SKIPPED'' }')
+        ) `
+        -Name 'Archive/GenerationCleanupAddsNoStepWhenDisabled' `
+        -Failure "коли generation cleanup повністю вимкнено (`$backupRetentionCleanupPlanned=false), не повинно рендеритись жодного рядка (ні numbered, ні SKIPPED-заповнювача)"
+
+    # --- Archive: dynamic Total включає обидві cleanup-операції — той
+    # самий AST-екстрагований параметр -Total, що й Archive/... тести
+    # dev.16, тепер з "1 +" (завжди) і тим самим generation-cleanup
+    # виразом.
+    $archiveTotalTokens = $null
+    $archiveTotalErrors = $null
+    $archiveTotalAst = [Management.Automation.Language.Parser]::ParseInput(
+        $archiveScriptText, [ref]$archiveTotalTokens, [ref]$archiveTotalErrors
+    )
+    $archiveInitStepsCallAsts = @($archiveTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Initialize-BRAVOArchiveSteps'
+        },
+        $true
+    ))
+    # Два call sites: -SyncBAZA-гілка (окремий, ізольований flow) і
+    # основний backup flow нижче — саме другий (з найбільшою кількістю
+    # доданків) відповідає за цю перевірку.
+    $archiveMainTotalParamText = ''
+    foreach ($callAst in $archiveInitStepsCallAsts) {
+        for ($i = 0; $i -lt $callAst.CommandElements.Count; $i++) {
+            if ($callAst.CommandElements[$i] -is [Management.Automation.Language.CommandParameterAst] -and
+                $callAst.CommandElements[$i].ParameterName -eq 'Total') {
+                $candidateText = $callAst.CommandElements[$i + 1].Extent.Text
+                if ($candidateText.Contains('enabledArchives.Count')) {
+                    $archiveMainTotalParamText = $candidateText
+                }
+                break
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveMainTotalParamText.Contains('1 +') -and
+            $archiveMainTotalParamText.Contains('$enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup')
+        ) `
+        -Name 'Archive/DynamicTotalIncludesCleanupOperations' `
+        -Failure 'Initialize-BRAVOArchiveSteps -Total (основний backup flow) має включати +1 за старе очищення журналів (завжди) і +1 за generation cleanup (той самий enablement-вираз)'
+
+    # --- Archive: План/Total/фактичний гейт кроку читають ОДИН і той
+    # самий буквальний вираз для generation cleanup — не три незалежні
+    # копії, які можуть розійтися.
+    $generationCleanupExpression = '$enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup'
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveMainTotalParamText.Contains($generationCleanupExpression) -and
+            $archiveScriptText.Contains('$archivePlanEntries[''Очищення старих backup generation''] = [bool](') -and
+            $archiveScriptText.Contains('$backupRetentionCleanupPlanned = [bool](' + $generationCleanupExpression + ')')
+        ) `
+        -Name 'Archive/PlanAndCleanupStepsShareEnablementSemantics' `
+        -Failure 'План/dynamic Total/$backupRetentionCleanupPlanned мають читати той самий буквальний enablement-вираз для generation cleanup'
+
+    # --- Archive: SKIPPED збережено для "нічого не видалено" у ОБОХ
+    # мігрованих numbered-кроках.
+    Test-BRAVOCondition `
+        -Condition (
+            $oldLogCleanupStepWindow -ge 0 -and
+            $archiveScriptText.Contains('elseif ($oldLogsToRemove.Count -eq 0) { ''SKIPPED'' }') -and
+            $generationCleanupStepWindow.Contains('''SKIPPED''')
+        ) `
+        -Name 'Archive/CleanupNoWorkRendersSkipped' `
+        -Failure 'обидва мігровані numbered cleanup-кроки мають рендерити SKIPPED, коли перевірку проведено, але нічого не знайдено/не видалено'
+
+    # --- Archive: жодного РЕАЛЬНОГО (не текстового в коментарі) виклику
+    # Write-BRAVOOperationResult не лишилось — AST, щоб не рахувати
+    # згадки у власних dev.18-коментарях.
+    $archiveOperationResultCallAsts = @($archiveTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Write-BRAVOOperationResult'
+        },
+        $true
+    ))
+    Test-BRAVOCondition `
+        -Condition ($archiveOperationResultCallAsts.Count -eq 0) `
+        -Name 'Archive/CleanupOperationsNoLongerUseUnnumberedRenderer' `
+        -Failure "Archive.Runtime.ps1 не повинен мати РЕАЛЬНИХ викликів Write-BRAVOOperationResult після міграції обох cleanup-операцій на Write-BRAVOArchiveStep; знайдено: $($archiveOperationResultCallAsts.Count)"
+
+    # --- Logging: повний функціональний round-trip через РЕАЛЬНИЙ
+    # Archive Write-Log (ізольована AST-екстракція) + РЕАЛЬНИЙ
+    # BRAVO.Logging у тимчасовий файл — жоден фізичний рядок журналу не
+    # повинен мати порожній/whitespace-only Message.
+    Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Logging\BRAVO.Logging.psd1') -Force -ErrorAction Stop
+    $emptyLogRecordsTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_EMPTY_LOG_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void](Initialize-BRAVOLog -LogFile $emptyLogRecordsTempFile -FileLevel INFO -ConsoleLevel ERROR)
+        $writeLogRoundTripModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $archiveScriptText `
+            -FunctionNames @(
+                'Write-Log',
+                'Resolve-BRAVOLogComponentFromHeader',
+                'Set-BRAVOLogComponent'
+            )
+        & $writeLogRoundTripModule {
+            $script:BRAVOLogComponent = 'ARCHIVE'
+            $defaultLogLevel = 'INFO'
+            $logSeparatorLength = 100
+            Write-Log "==="
+            Write-Log "=== ПЕРЕВIРКА СУМIСНОСТI СИСТЕМИ ==="
+            Write-Log "Тестове повідомлення" -Level "INFO"
+            Write-Log "==="
+            Write-Log "=== ЗАВЕРШЕННЯ РОБОТИ СКРИПТА ==="
+        }
+        $emptyLogRecordLines = @(
+            Get-Content -LiteralPath $emptyLogRecordsTempFile -Encoding UTF8 |
+                Where-Object { $_ -match '^\S+ \S+ \[\S+\s*\]\s*\[[^\]]+\]\s*$' }
+        )
+        $realHeadingLines = @(
+            Get-Content -LiteralPath $emptyLogRecordsTempFile -Encoding UTF8 |
+                Where-Object { $_ -match '\[STARTUP\].*ПЕРЕВIРКА СУМIСНОСТI' -or $_ -match '\[SUMMARY\].*ЗАВЕРШЕННЯ РОБОТИ' }
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $emptyLogRecordLines.Count -eq 0 -and
+                $realHeadingLines.Count -eq 2
+            ) `
+            -Name 'Logging/RuntimeLogHasNoEmptyStructuredRecords' `
+            -Failure "жоден фізичний рядок Archive-журналу не повинен мати структурований запис (timestamp/level/component) із порожнім Message; знайдено таких рядків: $($emptyLogRecordLines.Count); повноцінних заголовків: $($realHeadingLines.Count) з 2 очікуваних"
+    } finally {
+        Remove-Item -LiteralPath $emptyLogRecordsTempFile -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Archive: структурна перевірка — голий "==="/"=" роздільник
+    # більше НЕ викликає Write-BRAVOLog взагалі (лише return); заголовки
+    # "=== ... ===" лишаються повністю без змін.
+    $bareLogSeparatorBranchMatch = [regex]::Match(
+        $archiveScriptText,
+        '(?s)if \(\$Message -eq "=" -or \$Message -eq "==="\) \{(.*?)\}'
+    )
+    $bareLogSeparatorBranchText = if ($bareLogSeparatorBranchMatch.Success) { $bareLogSeparatorBranchMatch.Groups[1].Value } else { 'MISSING' }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $bareLogSeparatorBranchText.Contains('Write-BRAVOLog') -and
+            $bareLogSeparatorBranchText.Contains('return')
+        ) `
+        -Name 'Archive/SectionSeparatorsDoNotEmitEmptyLogEvents' `
+        -Failure 'голий роздільник "==="/"=" у Write-Log має лише return, без Write-BRAVOLog — інакше знову структурований запис із порожнім Message'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('if ($Message -match "^=== .* ===$") {') -and
+            $archiveScriptText.Contains('Write-BRAVOLog -Message $Message -Level ''INFO'' -Component $component -NoConsole')
+        ) `
+        -Name 'Archive/SectionHeadingsRemainLogged' `
+        -Failure '"=== ЗАГОЛОВОК ===" записи мають і надалі писатись у журнал повним текстом — незмінено'
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
