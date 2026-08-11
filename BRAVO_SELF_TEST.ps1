@@ -2418,14 +2418,207 @@ try {
             "Get-BRAVOVSSOwnershipStatePath",
             "Save-BRAVOVSSOwnershipState",
             "Remove-BRAVOOwnedOrphanVSSResources",
+            "Get-BRAVOArchiveFreeSpaceResult",
+            "Send-BRAVOArchiveFreeSpaceAlert",
             "Get-BRAVOCollisionSafeGenerationId",
             "New-BRAVOTemporaryArchivePath",
             "Remove-BRAVOTemporaryArchiveArtifacts",
+            "Write-BRAVOFinalHashFile",
             "Invoke-BRAVOComponentBackup",
             "Remove-BRAVOWinSCPSensitiveTemporaryScript",
             "Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts",
             "New-BRAVOWinSCPTemporaryScriptPath"
         )
+
+    $freeSpaceHealthyDrives = @(
+        [pscustomobject]@{
+            Name = 'C:\'
+            DriveType = [System.IO.DriveType]::Fixed
+            IsReady = $true
+            AvailableFreeSpace = 25GB
+            TotalSize = 100GB
+        },
+        [pscustomobject]@{
+            Name = 'D:\'
+            DriveType = [System.IO.DriveType]::Fixed
+            IsReady = $true
+            AvailableFreeSpace = 1GB
+            TotalSize = 100GB
+        },
+        [pscustomobject]@{
+            Name = 'E:\'
+            DriveType = [System.IO.DriveType]::Removable
+            IsReady = $true
+            AvailableFreeSpace = 1GB
+            TotalSize = 10GB
+        }
+    )
+    $freeSpaceHealthy = & $archiveRuntimeModule {
+        param($RootPath, $Drives)
+        Get-BRAVOArchiveFreeSpaceResult `
+            -RootPath $RootPath `
+            -MinimumFreeSpaceGB 20 `
+            -ExcludedDrives @('D:') `
+            -Drives $Drives
+    } $root $freeSpaceHealthyDrives
+    $freeSpaceLow = & $archiveRuntimeModule {
+        param($RootPath)
+        Get-BRAVOArchiveFreeSpaceResult `
+            -RootPath $RootPath `
+            -MinimumFreeSpaceGB 20 `
+            -Drives @([pscustomobject]@{
+                Name = 'C:\'
+                DriveType = [System.IO.DriveType]::Fixed
+                IsReady = $true
+                AvailableFreeSpace = 15GB
+                TotalSize = 100GB
+            })
+    } $root
+    $freeSpaceAllExcluded = & $archiveRuntimeModule {
+        param($RootPath)
+        Get-BRAVOArchiveFreeSpaceResult `
+            -RootPath $RootPath `
+            -MinimumFreeSpaceGB 20 `
+            -ExcludedDrives @('C:') `
+            -Drives @([pscustomobject]@{
+                Name = 'C:\'
+                DriveType = [System.IO.DriveType]::Fixed
+                IsReady = $true
+                AvailableFreeSpace = 1GB
+                TotalSize = 100GB
+            })
+    } $root
+    Test-BRAVOCondition `
+        -Condition (
+            $freeSpaceHealthy.Success -and
+            $freeSpaceHealthy.CheckedDriveCount -eq 1 -and
+            @($freeSpaceHealthy.DriveStatus).Count -eq 1 -and
+            $freeSpaceHealthy.DriveStatus[0].Drive -eq 'C:' -and
+            -not $freeSpaceLow.Success -and
+            $freeSpaceLow.Problems[0] -match 'залишилось 15 GB' -and
+            $freeSpaceAllExcluded.Success -and
+            $freeSpaceAllExcluded.AllExcluded
+        ) `
+        -Name 'Archive/FreeSpacePolicyMatchesMaintenance' `
+        -Failure 'Archive має перевіряти лише Fixed-диски, поважати Maintenance.Limits.ExcludedDrives, блокувати запуск нижче порога та дозволяти конфігурацію, де всі диски явно виключені'
+
+    $freeSpaceNotificationProbe = & $archiveRuntimeModule {
+        param($Result)
+
+        $script:NoSlack = $false
+        $script:notificationMode = 'all'
+        $script:notificationProvider = 'discord'
+        $script:notificationProviderDisplayName = 'Discord'
+        $script:notificationWebhookUrl = 'https://example.invalid/webhook'
+        $script:notificationRequestTimeoutSeconds = 5
+        $script:ScriptBuildId = 'self-test'
+        $script:logFile = 'C:\BRAVO_TEST\BRAVO_ARCHIV.log'
+        $script:backupMonitoring = @{
+            InstitutionName = 'TEST'
+            InstitutionCode = '00000000'
+        }
+        $script:sentMessages = New-Object System.Collections.Generic.List[string]
+        $script:alertLogs = New-Object System.Collections.Generic.List[string]
+
+        function Get-HostInformation {
+            [pscustomobject]@{ MachineName = 'TEST-HOST'; LocalIP = '127.0.0.1'; PublicIP = 'вимкнено' }
+        }
+        function New-BRAVOOperatorNotificationMessage {
+            param(
+                [string]$Severity,
+                [string]$Operation,
+                [string]$ActionText,
+                [string[]]$ReasonLines,
+                [string]$InstitutionName,
+                [string]$InstitutionCode,
+                $HostInformation,
+                [string[]]$ResultLines,
+                [datetime]$Timestamp,
+                [string]$ProductName,
+                [string]$Version,
+                [string]$BuildId,
+                [string]$LogPath,
+                [string]$LogLabel
+            )
+            return (@($Severity, $Operation, $ActionText) + $ReasonLines + $ResultLines) -join "`n"
+        }
+        function ConvertTo-DiscordNotificationText { param([string]$Message) return $Message }
+        function Split-DiscordNotificationText { param([string]$Message) return @($Message) }
+        function Send-BRAVOWebhookNotification {
+            param([string]$Provider, [string]$WebhookUrl, [string]$Message, [int]$TimeoutSeconds)
+            [void]$script:sentMessages.Add($Message)
+        }
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Message, [string]$Level)
+            [void]$script:alertLogs.Add("$Level|$Message")
+        }
+        function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+
+        Send-BRAVOArchiveFreeSpaceAlert -Result $Result -MinimumFreeSpaceGB 20
+        $enabledSentCount = $script:sentMessages.Count
+        $enabledMessage = if ($enabledSentCount -gt 0) { $script:sentMessages[0] } else { '' }
+        $enabledLogs = $script:alertLogs.ToArray()
+
+        $script:notificationMode = 'none'
+        $script:sentMessages.Clear()
+        $script:alertLogs.Clear()
+        Send-BRAVOArchiveFreeSpaceAlert -Result $Result -MinimumFreeSpaceGB 20
+
+        [pscustomobject]@{
+            EnabledSentCount = $enabledSentCount
+            EnabledMessage = $enabledMessage
+            EnabledLogs = $enabledLogs
+            DisabledSentCount = $script:sentMessages.Count
+            DisabledLogs = $script:alertLogs.ToArray()
+        }
+    } ([pscustomobject]@{
+            Problems = @('диск C: залишилось 15 GB, потрібно мінімум 20 GB')
+            DriveStatus = @([pscustomobject]@{
+                    Drive = 'C:'
+                    FreeSpaceGB = 15
+                    TotalSpaceGB = 50
+                })
+        })
+    Test-BRAVOCondition `
+        -Condition (
+            $freeSpaceNotificationProbe.EnabledSentCount -eq 1 -and
+            $freeSpaceNotificationProbe.EnabledMessage.Contains('CRITICAL') -and
+            $freeSpaceNotificationProbe.EnabledMessage.Contains('НЕДОСТАТНЬО ВІЛЬНОГО МІСЦЯ') -and
+            $freeSpaceNotificationProbe.EnabledMessage.Contains('код завершення 40') -and
+            $freeSpaceNotificationProbe.EnabledMessage.Contains('диск C: залишилось 15 GB') -and
+            @($freeSpaceNotificationProbe.EnabledLogs | Where-Object {
+                    $_ -match 'SUCCESS\|Критичне повідомлення \(помилки місця\) відправлено'
+                }).Count -eq 1 -and
+            $freeSpaceNotificationProbe.DisabledSentCount -eq 0 -and
+            @($freeSpaceNotificationProbe.DisabledLogs | Where-Object {
+                    $_ -match 'WARNING\|.*сповіщення вимкнено'
+                }).Count -eq 1
+        ) `
+        -Name 'Archive/FreeSpaceFailureSendsCriticalNotification' `
+        -Failure 'Archive low-disk preflight має надсилати рівно одне CRITICAL Discord/Slack повідомлення з причиною й exit 40, але поважати -NoSlack/NotificationMode=none'
+
+    $archiveFreeSpaceCallIndex = $archiveScriptText.IndexOf(
+        '$archiveFreeSpaceResult = Get-BRAVOArchiveFreeSpaceResult'
+    )
+    $archiveVssCallIndex = $archiveScriptText.IndexOf(
+        '$generationSnapshotSet = New-BRAVOVSSSnapshotSet'
+    )
+    $archiveSyncBazaReturnIndex = $archiveScriptText.IndexOf(
+        '$manualSyncResult = Invoke-ManualBAZASFTPSynchronization'
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveSyncBazaReturnIndex -ge 0 -and
+            $archiveSyncBazaReturnIndex -lt $archiveFreeSpaceCallIndex -and
+            $archiveFreeSpaceCallIndex -lt $archiveVssCallIndex -and
+            $archiveScriptText.Contains("`$script:processExitCode = Resolve-BRAVOExitCode -LocalArchiveFailed") -and
+            $archiveScriptText.Contains('Write-BRAVOArchivePreflightFailureSummary') -and
+            @([regex]::Matches($archiveScriptText, 'Send-BRAVOArchiveFreeSpaceAlert\s+`')).Count -eq 1 -and
+            $archiveScriptText.Contains("'BRAVO.ExitCodes', 'BRAVO.Notifications'") -and
+            $archiveScriptText.Contains("`$archivePlanEntries['Перевірка вільного місця'] = `$true")
+        ) `
+        -Name 'Archive/FreeSpacePreflightRunsBeforeBackupMutation' `
+        -Failure 'звичайний Archive має перевіряти місце після ізольованого SyncBAZA-flow, але до VSS/архівації, завершуватись кодом 40 і показувати стандартний summary'
 
     $literalSourceText = "Методика*виконання_вимірювань.pdf"
     $discordLiteralText = & $archiveRuntimeModule {
@@ -3461,6 +3654,17 @@ try {
                 param([string]$Path, [string]$Algorithm)
                 [pscustomobject]@{ Hash = $knownHash }
             }
+            function Write-BRAVOFinalHashFile {
+                param([string]$Path, [string]$Hash, [string]$ArchiveName)
+                if ($script:componentBackupMode -eq 'final-hash-write-fail') {
+                    throw 'synthetic final hash write failure'
+                }
+                [IO.File]::WriteAllText(
+                    $Path,
+                    ("{0} *{1}" -f $Hash.ToLowerInvariant(), $ArchiveName),
+                    (New-Object Text.UTF8Encoding($false))
+                )
+            }
 
             $successDest = Join-Path $Root 'SUCCESS'
             [void][IO.Directory]::CreateDirectory($successDest)
@@ -3526,6 +3730,18 @@ try {
                 -ArchiveName 'lab_20260808_154300.mdz' `
                 -ArcPath 'fake7za.exe'
 
+            $finalHashWriteDest = Join-Path $Root 'FINAL_HASH_WRITE'
+            [void][IO.Directory]::CreateDirectory($finalHashWriteDest)
+            $script:componentBackupMode = 'final-hash-write-fail'
+            $finalHashWriteFail = Invoke-BRAVOComponentBackup `
+                -Component 'MODEL' `
+                -GenerationId '20260808_154300' `
+                -OriginalSourcePath $Source `
+                -SourcePath $Source `
+                -DestinationDirectory $finalHashWriteDest `
+                -ArchiveName 'lab_20260808_154300.mdz' `
+                -ArcPath 'fake7za.exe'
+
             [pscustomobject]@{
                 SuccessCreate = [bool]$success.CreateSuccess
                 SuccessIntegrity = [bool]$success.IntegritySuccess
@@ -3545,6 +3761,10 @@ try {
                 HashCreatePublished = Test-Path -LiteralPath (Join-Path $hashCreateDest 'lab_20260808_154300.mdz') -PathType Leaf
                 HashVerifyHash = [bool]$hashVerifyFail.HashSuccess
                 HashVerifyPublished = Test-Path -LiteralPath (Join-Path $hashVerifyDest 'lab_20260808_154300.mdz') -PathType Leaf
+                FinalHashWriteHash = [bool]$finalHashWriteFail.HashSuccess
+                FinalHashWriteArchivePublished = Test-Path -LiteralPath (Join-Path $finalHashWriteDest 'lab_20260808_154300.mdz') -PathType Leaf
+                FinalHashWriteSidecarPublished = Test-Path -LiteralPath ((Join-Path $finalHashWriteDest 'lab_20260808_154300.mdz') + '.sha512') -PathType Leaf
+                FinalHashWriteErrorStage = [string]$finalHashWriteFail.ErrorStage
             }
         } $componentBackupTestRoot $componentSource
 
@@ -3585,6 +3805,18 @@ try {
             -Condition (-not $componentProbe.HashVerifyHash -and -not $componentProbe.HashVerifyPublished) `
             -Name "BackupConsistency/HashVerificationFailureDoesNotPublish" `
             -Failure "SHA512 verification mismatch має лишати generation невалідною і не публікувати final archive"
+        Test-BRAVOCondition `
+            -Condition (
+                -not $componentProbe.FinalHashWriteHash -and
+                -not $componentProbe.FinalHashWriteArchivePublished -and
+                -not $componentProbe.FinalHashWriteSidecarPublished -and
+                $componentProbe.FinalHashWriteErrorStage -eq 'PUBLISH' -and
+                (Resolve-BRAVOExitCode `
+                    -LocalArchiveFailed:($componentProbe.FinalHashWriteErrorStage -eq 'PUBLISH') `
+                    -HashValidationFailed:($componentProbe.FinalHashWriteErrorStage -eq 'HASH')) -eq 40
+            ) `
+            -Name 'BackupConsistency/FinalHashWriteFailureRollsBackArchive' `
+            -Failure 'помилка запису фінального .sha512 має бути PUBLISH/exit 40, лишати HashSuccess=false і прибирати вже переміщений archive та частковий sidecar'
     } finally {
         if (Test-Path -LiteralPath $componentBackupTestRoot -PathType Container) {
             Remove-Item -LiteralPath $componentBackupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -3995,6 +4227,106 @@ try {
             ) `
             -Name 'Archive/GenerationFailurePreservesVssAndPrimaryExit' `
             -Failure 'VSS summary має залежати від фактичного Snapshot Set, а generation finalization failure має лишатися primary LocalArchiveFailed перед HealthCritical'
+
+        $successCountAssignment = [regex]::Match(
+            $archiveScriptText,
+            '(?m)^\s*\$successCount\s*=.*$'
+        )
+        $successCountProbe = @()
+        if ($successCountAssignment.Success) {
+            $successCountScript = [scriptblock]::Create(
+                "param(`$results)`nSet-StrictMode -Version 2.0`n$($successCountAssignment.Value)`nreturn `$successCount"
+            )
+            foreach ($case in @(
+                [pscustomobject]@{ Results = @{}; Expected = 0 },
+                [pscustomobject]@{ Results = @{ MODEL = [pscustomobject]@{ ArchiveSuccess = $true } }; Expected = 1 },
+                [pscustomobject]@{
+                    Results = @{
+                        MODEL = [pscustomobject]@{ ArchiveSuccess = $true }
+                        BLOG = [pscustomobject]@{ ArchiveSuccess = $false }
+                        BRAVOEXCH = [pscustomobject]@{ ArchiveSuccess = $true }
+                    }
+                    Expected = 2
+                }
+            )) {
+                $successCountProbe += [pscustomobject]@{
+                    Actual = & $successCountScript $case.Results
+                    Expected = $case.Expected
+                }
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $successCountAssignment.Success -and
+                @($successCountProbe | Where-Object { $_.Actual -ne $_.Expected }).Count -eq 0
+            ) `
+            -Name 'Archive/SuccessCountHandlesZeroOneAndManyResults' `
+            -Failure 'фактичне присвоєння $successCount з Archive Main має працювати під StrictMode для 0/1/N результатів без scalar .Count exception'
+
+        $snapshotLoopStart = $archiveScriptText.IndexOf('foreach ($archive in $readyArchives)')
+        $snapshotResolveIndex = if ($snapshotLoopStart -ge 0) {
+            $archiveScriptText.IndexOf('$snapshotSourcePath = Resolve-BRAVOSnapshotSourcePath', $snapshotLoopStart)
+        } else { -1 }
+        $snapshotInitializationIndex = if ($snapshotResolveIndex -ge 0) {
+            $archiveScriptText.LastIndexOf('$snapshotSourcePath = $null', $snapshotResolveIndex)
+        } else { -1 }
+        Test-BRAVOCondition `
+            -Condition (
+                $snapshotLoopStart -ge 0 -and
+                $snapshotInitializationIndex -gt $snapshotLoopStart -and
+                $snapshotInitializationIndex -lt $snapshotResolveIndex
+            ) `
+            -Name 'Archive/SnapshotPathInitializedPerComponent' `
+            -Failure '$snapshotSourcePath має скидатися в $null у кожній ітерації безпосередньо перед Resolve-BRAVOSnapshotSourcePath, щоб catch не читав uninitialized/stale значення'
+
+        $finalManifestUpdateIndex = $archiveScriptText.IndexOf('$script:backupGenerationState.TransferResults = $transferResults')
+        $exitClassificationIndex = $archiveScriptText.IndexOf('$anyLocalArchiveFailed = @(')
+        $finalManifestUpdateWindow = if (
+            $finalManifestUpdateIndex -ge 0 -and
+            $exitClassificationIndex -gt $finalManifestUpdateIndex
+        ) {
+            $archiveScriptText.Substring(
+                $finalManifestUpdateIndex,
+                $exitClassificationIndex - $finalManifestUpdateIndex
+            )
+        } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                $finalManifestUpdateIndex -ge 0 -and
+                $finalManifestUpdateIndex -lt $exitClassificationIndex -and
+                $finalManifestUpdateWindow.Contains('$generationFinalizationFailed = $true') -and
+                $finalManifestUpdateWindow.Contains('$operationFailed = $true') -and
+                $finalManifestUpdateWindow.Contains("-Level 'ERROR'")
+            ) `
+            -Name 'Archive/FinalManifestFailureAffectsExitCode' `
+            -Failure 'фінальний запис manifest має відбуватися до класифікації exit code, а catch — ставити generationFinalizationFailed/operationFailed і логувати ERROR'
+
+        Test-BRAVOCondition `
+            -Condition (
+                $archiveScriptText -match '(?s)\$anyLocalArchiveFailed\s*=\s*@\(.*?ErrorStage\s*-eq\s*''PUBLISH''.*?\)\.Count' -and
+                $archiveScriptText -match '(?s)\$anyHashValidationFailed\s*=\s*@\(.*?ErrorStage\s*-eq\s*''HASH''.*?\)\.Count'
+            ) `
+            -Name 'Archive/FailureStageMapsToCorrectExitCategory' `
+            -Failure 'PUBLISH має входити до LocalArchiveFailed (40), а HashValidationFailed (41) — лише для ErrorStage=HASH'
+
+        $publishedResultBlock = [regex]::Match(
+            $archiveScriptText,
+            '(?s)if\s*\(\$componentPublished\)\s*\{.*?\$results\[\$archive\.Type\]\s*=\s*@\{(?<Body>.*?)\r?\n\s*\}\s*\}\s*else'
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $publishedResultBlock.Success -and
+                $publishedResultBlock.Groups['Body'].Value.Contains('ErrorStage = $null') -and
+                $publishedResultBlock.Groups['Body'].Value.Contains('Error = $null') -and
+                $publishedResultBlock.Groups['Body'].Value.Contains('ToolFailure = $null')
+            ) `
+            -Name 'Archive/PublishedResultHasStrictModeFailureFields' `
+            -Failure 'успішний запис $results має містити ErrorStage/Error/ToolFailure=$null, інакше фінальна класифікація падає під StrictMode після успішної архівації'
+
+        Test-BRAVOCondition `
+            -Condition ($bravoConfigText -match '(?s)Restore\s*=\s*@\{.*?Day\s*=\s*7\b') `
+            -Name 'Maintenance/DefaultRestoreScheduleRemainsSunday' `
+            -Failure 'BRAVO.config Restore.Day має лишатися 7 (Sunday), як задокументовано для планової реставрації о 03:00'
     } finally {
         if (Test-Path -LiteralPath $archiveGenerationTestRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveGenerationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -6410,6 +6742,60 @@ try {
             ) `
             -Name "ManifestStorage/WriterWritesToManifestsRoot" `
             -Failure "Write-BRAVOBackupGenerationManifest має писати новий manifest у BackupRoot\MANIFESTS (створюючи каталог за потреби), а не в корінь BackupRoot"
+
+        $writerGenerationState.HealthResult = [pscustomobject]@{ Status = 'successful rewrite' }
+        $rewrittenManifestPath = & $manifestWriterModule {
+            param($State, $BackupRoot)
+            Write-BRAVOBackupGenerationManifest -GenerationState $State -BackupRoot $BackupRoot
+        } $writerGenerationState $writerTestRoot
+        $rewrittenManifest = Get-Content -LiteralPath $rewrittenManifestPath -Raw | ConvertFrom-Json
+        $orphanManifestBackups = @(
+            Get-ChildItem -LiteralPath (Split-Path $rewrittenManifestPath -Parent) -File -Filter '.BRAVO_BACKUP_*.bak'
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $rewrittenManifest.healthResult.Status -eq 'successful rewrite' -and
+                $orphanManifestBackups.Count -eq 0
+            ) `
+            -Name 'ManifestStorage/ExistingManifestRewriteSucceedsOnWindowsPowerShell51' `
+            -Failure 'повторний atomic write існуючого manifest має працювати у Windows PowerShell 5.1 і не лишати backup-файл'
+
+        $manifestBeforeFailedReplace = [IO.File]::ReadAllText($writtenManifestPath, [Text.Encoding]::UTF8)
+        $writerGenerationState.HealthResult = [pscustomobject]@{ Status = 'synthetic update' }
+        $manifestReplaceFailed = $false
+        $manifestLock = $null
+        try {
+            $manifestLock = [IO.File]::Open(
+                $writtenManifestPath,
+                [IO.FileMode]::Open,
+                [IO.FileAccess]::Read,
+                [IO.FileShare]::None
+            )
+            try {
+                & $manifestWriterModule {
+                    param($State, $BackupRoot)
+                    Write-BRAVOBackupGenerationManifest -GenerationState $State -BackupRoot $BackupRoot
+                } $writerGenerationState $writerTestRoot
+            } catch {
+                $manifestReplaceFailed = $true
+            }
+        } finally {
+            if ($null -ne $manifestLock) {
+                $manifestLock.Dispose()
+            }
+        }
+        $manifestAfterFailedReplace = [IO.File]::ReadAllText($writtenManifestPath, [Text.Encoding]::UTF8)
+        $orphanManifestTemps = @(
+            Get-ChildItem -LiteralPath (Split-Path $writtenManifestPath -Parent) -File -Filter '.BRAVO_BACKUP_*.tmp'
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $manifestReplaceFailed -and
+                $manifestAfterFailedReplace -ceq $manifestBeforeFailedReplace -and
+                $orphanManifestTemps.Count -eq 0
+            ) `
+            -Name 'ManifestStorage/FailedRewritePreservesPreviousManifest' `
+            -Failure 'невдалий atomic replace має лишати попередній COMPLETE manifest байт-у-байт незмінним і прибирати temporary JSON'
 
         # --- 3. Reader: той самий generationId в обох місцях -> MANIFESTS виграє ---
         $readerTestRoot = Join-Path $manifestStorageTestRoot 'reader-priority'
@@ -9596,6 +9982,26 @@ function Get-BRAVOMaintenanceSummaryResult {
                 'Write-BRAVOManualLaunchers',
                 'Invoke-BRAVOManualLauncherSetup'
             )
+        $setupAstForManualLauncher = [Management.Automation.Language.Parser]::ParseInput(
+            $setupTextForDiscovery, [ref]$null, [ref]$null
+        )
+        $manualLauncherFunctionAst = @(
+            $setupAstForManualLauncher.FindAll({
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -eq 'New-BRAVOManualLauncherContent'
+            }, $true)
+        ) | Select-Object -First 1
+        $manualLauncherFunctionText = if ($null -ne $manualLauncherFunctionAst) {
+            $manualLauncherFunctionAst.Extent.Text
+        } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                @([regex]::Matches($setupTextForDiscovery, '(?i)ExecutionPolicy\s+Bypass')).Count -eq 1 -and
+                $manualLauncherFunctionText -match '(?i)ExecutionPolicy\s+Bypass'
+            ) `
+            -Name 'ManualLaunchers/BypassIsScopedToLauncherGenerator' `
+            -Failure 'BRAVO_SETUP.ps1 може містити рівно один ExecutionPolicy Bypass і лише всередині New-BRAVOManualLauncherContent; ширший allowlist був би security-регресією'
         $manualLauncherRoot = Join-Path ([IO.Path]::GetTempPath()) (
             'BRAVO_MANUAL_LAUNCHERS_{0}' -f [guid]::NewGuid().ToString('N')
         )
@@ -11631,6 +12037,44 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name 'Maintenance/Exit60RendersFailure' `
         -Failure "Get-BRAVOMaintenanceFinalStatus -ExitCode 60 (MaintenanceFailed) має повертати Text='ПОМИЛКА'/Color=Red"
 
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptTextForManifestStorage.Contains(
+                "`$maintenanceLogRunId = `"{0}_PID{1}`" -f `$currentDate.ToString(`"yyyyMMdd_HHmmss`"), `$PID") -and
+            $maintenanceScriptTextForManifestStorage.Contains(
+                "`$LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$maintenanceLogRunId.log`"") -and
+            -not $maintenanceScriptTextForManifestStorage.Contains(
+                "`$LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$NOW.log`"")
+        ) `
+        -Name 'Maintenance/ExecutionLogsAreUniquePerSecondAndProcess' `
+        -Failure 'Maintenance log має містити yyyyMMdd_HHmmss і PID; хвилинна назва змішує два окремі запуски в одному audit log'
+
+    $maintenanceDiskFailureStart = $maintenanceScriptTextForManifestStorage.IndexOf('if (-not $spaceCheckResult) {')
+    $maintenanceDiskFailureEnd = if ($maintenanceDiskFailureStart -ge 0) {
+        $maintenanceScriptTextForManifestStorage.IndexOf("`n}", $maintenanceDiskFailureStart)
+    } else { -1 }
+    $maintenanceDiskFailureBlock = if ($maintenanceDiskFailureEnd -gt $maintenanceDiskFailureStart) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $maintenanceDiskFailureStart,
+            $maintenanceDiskFailureEnd - $maintenanceDiskFailureStart
+        )
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceDiskFailureBlock.Contains(
+                "`$diskPreflightExitCode = Get-BRAVOMaintenanceResolvedExitCode") -and
+            $maintenanceDiskFailureBlock.Contains(
+                "`$script:maintenanceRuntimeExitCode = `$diskPreflightExitCode") -and
+            $maintenanceDiskFailureBlock.Contains('Write-BRAVOMaintenanceEarlyFailureSummary') -and
+            $maintenanceDiskFailureBlock.Contains("Wait-BRAVOManualExit -NoPause:`$NoPause") -and
+            $maintenanceDiskFailureBlock.Contains("exit `$diskPreflightExitCode") -and
+            -not $maintenanceDiskFailureBlock.Contains('exit 60') -and
+            $maintenanceScriptTextForManifestStorage.Contains(
+                'Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')
+        ) `
+        -Name 'Maintenance/DiskPreflightFailureRendersFinalSummary' `
+        -Failure 'нестача місця має резолвити exit 60, надрукувати стандартний summary/журнал, виконати manual-pause contract і лише потім завершити процес'
+
     # --- Структурний доказ РЕАЛЬНОГО потоку даних (не лише "джерело
     # містить обидва рядки поруч"): (1) Get-BRAVOMaintenanceFinalStatus
     # взагалі НЕ посилається на $script:criticalErrorOccurred/
@@ -11775,8 +12219,8 @@ function Get-BRAVOMaintenanceSummaryResult {
     # статусу 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (як STRING-літерал в AST, не
     # рахуючи пояснювальні коментарі) має існувати РІВНО один раз —
     # усередині самої Get-BRAVOMaintenanceFinalStatus, — а сама функція
-    # має викликатися рівно тричі поза власним визначенням (ЛОГ/консоль/
-    # notification Title).
+    # має викликатися рівно чотири рази поза власним визначенням (звичайні
+    # ЛОГ/консоль/notification Title + ранній disk-preflight summary).
     $maintenanceTotalTokens = $null
     $maintenanceTotalErrors = $null
     $maintenanceTotalAst = [Management.Automation.Language.Parser]::ParseInput(
@@ -11801,10 +12245,10 @@ function Get-BRAVOMaintenanceSummaryResult {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceSuccessWithWarningsLiteralAsts.Count -eq 1 -and
-            $maintenanceFinalStatusCallAsts.Count -eq 3
+            $maintenanceFinalStatusCallAsts.Count -eq 4
         ) `
         -Name 'Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy' `
-        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 3 рази (ЛОГ/консоль/notification), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
+        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 4 рази (ЛОГ/консоль/notification/ранній disk-preflight summary), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
 
     # ================================================================
     # Група 2 — Maintenance: голий "==="-роздільник більше не пише

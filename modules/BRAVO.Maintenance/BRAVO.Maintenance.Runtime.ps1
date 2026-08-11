@@ -1290,6 +1290,54 @@ function Format-Duration {
     }
 }
 
+function Write-BRAVOMaintenanceEarlyFailureSummary {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$EndedAt,
+        [Parameter(Mandatory = $true)][int]$ExitCode
+    )
+
+    $duration = $EndedAt - $script:ScriptStartTime
+    $finalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $ExitCode
+
+    Write-Log -Message "==="
+    Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАВЕРШИЛА РОБОТУ ==="
+    Write-Log -Message "=== УСТАНОВА: $($script:ObjectName) ==="
+    Write-Log -Message "=== ЧАС ВИКОНАННЯ: $(Format-Duration $duration) ==="
+    Write-Log -Message "=== СТАТУС: $($finalStatus.Text) ==="
+    Write-Log -Message "==="
+
+    Write-BRAVOFinalSummaryHeader `
+        -Title 'BRAVO MAINTENANCE' `
+        -Status $finalStatus.Text `
+        -StatusColor $finalStatus.Color
+    $earlySummaryFields = [ordered]@{
+        'Статус' = $finalStatus.Text
+        'Код завершення' = ("{0} — {1}" -f $ExitCode, (Get-BRAVOExitCodeName -Code $ExitCode))
+        'Початок' = $script:ScriptStartTime.ToString('dd.MM.yyyy HH:mm:ss')
+        'Завершення' = $EndedAt.ToString('dd.MM.yyyy HH:mm:ss')
+        'Тривалість' = Format-BRAVODuration -Duration $duration
+    }
+    foreach ($field in $earlySummaryFields.GetEnumerator()) {
+        if ($field.Key -eq 'Статус') {
+            Write-BRAVOResultField -Label ([string]$field.Key) -Value ([string]$field.Value) -Color $finalStatus.Color
+        } else {
+            Write-BRAVOResultField -Label ([string]$field.Key) -Value ([string]$field.Value)
+        }
+    }
+    Write-BRAVOResultBlankLine
+    $earlySummaryCounters = [ordered]@{
+        'Кроків' = $script:BRAVOMaintenanceStepCurrent
+        'Успішно' = $script:BRAVOMaintenanceStepOkCount
+        'Попереджень' = $script:BRAVOMaintenanceStepWarnCount
+        'Пропущено' = $script:BRAVOMaintenanceStepSkippedCount
+        'Помилок' = $script:BRAVOMaintenanceStepFailCount
+    }
+    foreach ($counter in $earlySummaryCounters.GetEnumerator()) {
+        Write-BRAVOResultField -Label ([string]$counter.Key) -Value ([string]$counter.Value)
+    }
+    Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
+}
+
 # Перетворення числового дня в об'єкт DayOfWeek
 $restoreDayMap = @{
     1 = [DayOfWeek]::Monday
@@ -4071,6 +4119,7 @@ if (-not (Test-Path $LOG_DIR)) {
 # Ініціалізація дати
 $currentDate = Get-Date
 $NOW = $currentDate.ToString("yyyyMMdd_HHmm")
+$maintenanceLogRunId = "{0}_PID{1}" -f $currentDate.ToString("yyyyMMdd_HHmmss"), $PID
 $YYYY = $currentDate.Year.ToString("0000")
 $MM = $currentDate.Month.ToString("00")
 $DD = $currentDate.Day.ToString("00")
@@ -4121,7 +4170,7 @@ if ($RunMissedRestoreOnly -and $missedDailyWork) {
 # Похідні файлові шляхи
 $ARCH_NAME1 = "${ArchivePrefix}_before_$NOW.mdz"
 $ARCH_NAME2 = "${ArchivePrefix}_after_$NOW.mdz"
-$LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$NOW.log"
+$LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"
 $SIZES_FILE = "$LOG_DIR\file_sizes_before_$NOW.csv"
 # Каталог-дата спільний для всіх компонентів: нумерація журналів рахується
 # в межах конкретної дати, тому TraceSRV_1.out існує і сьогодні, і вчора —
@@ -4454,8 +4503,14 @@ $spaceCheckResult = Check-FreeSpace -ROOT_LIMS $ROOT_LIMS -ExcludedDrives $FREE_
 if (-not $spaceCheckResult) {
     Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'FAIL' -Details 'недостатньо місця'
     Write-Log -Message "Критична помилка перевірки місця. Завершення скрипта." -Level "ERROR"
+    $diskPreflightExitCode = Get-BRAVOMaintenanceResolvedExitCode
+    $script:maintenanceRuntimeExitCode = $diskPreflightExitCode
+    Write-BRAVOMaintenanceEarlyFailureSummary `
+        -EndedAt (Get-Date) `
+        -ExitCode $diskPreflightExitCode
     Complete-BRAVOProgress
-    exit 60
+    Wait-BRAVOManualExit -NoPause:$NoPause
+    exit $diskPreflightExitCode
 }
 Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'OK'
 
