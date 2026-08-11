@@ -40,6 +40,10 @@ protocol, or supported-OS contract changed.
 - The narrowly required `ExecutionPolicy Bypass` allowance for generated
   manual launchers is documented and scoped to `BRAVO_SETUP.ps1`; all other
   forbidden-pattern checks remain blocking.
+- `modules/BRAVO.Notifications/BRAVO.Notifications.psd1` now carries the
+  repository-required UTF-8 BOM. A clean GitHub Actions checkout previously
+  failed both the explicit BOM gate and the Windows PowerShell 5.1 self-test,
+  even though local parser and runtime checks passed on the development host.
 - Regression coverage was added for free-space policy and notifications,
   preflight ordering, atomic state replacement, failed SHA512 publication,
   manifest finalization, failure-stage mapping, StrictMode result handling,
