@@ -1436,16 +1436,28 @@ try {
     if ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Backup) {
         $taskFolder = $null
         $taskServiceError = $null
+        $taskFolderMissing = $false
+        $taskPath = ([string]$schedulerSettings.TaskPath).TrimEnd("\")
+        if ([string]::IsNullOrWhiteSpace($taskPath)) {
+            $taskPath = "\"
+        }
         try {
             $taskService = New-Object -ComObject "Schedule.Service"
             $taskService.Connect()
-            $taskPath = ([string]$schedulerSettings.TaskPath).TrimEnd("\")
-            if ([string]::IsNullOrWhiteSpace($taskPath)) {
-                $taskPath = "\"
-            }
             $taskFolder = $taskService.GetFolder($taskPath)
         } catch {
-            $taskServiceError = $_.Exception.Message
+            # 0x80070002 (ERROR_FILE_NOT_FOUND, як Int32 = -2147024894) від
+            # GetFolder означає лише, що каталогу завдань ще НЕМАЄ — тобто
+            # жодне завдання не встановлювалося. Це штатний стан першої
+            # інсталяції, а не збій служби Планувальника. Раніше оператор
+            # бачив сирий "стан не вдалося прочитати: The system cannot find
+            # the file specified. (Exception from HRESULT: 0x80070002)" —
+            # діагностика, яка не підказує ані причини, ані наступного кроку.
+            if ($_.Exception.HResult -eq -2147024894) {
+                $taskFolderMissing = $true
+            } else {
+                $taskServiceError = $_.Exception.Message
+            }
         }
 
         foreach ($taskName in @("Backup", "Maintenance", "Health")) {
@@ -1487,6 +1499,8 @@ try {
                     $missingStatus = if ($RequireScheduledTasks) { "FAIL" } else { "WARN" }
                     $missingDetail = if ($taskServiceError) {
                         "стан не вдалося прочитати: $taskServiceError"
+                    } elseif ($taskFolderMissing) {
+                        "увімкнене в config завдання ще не зареєстровано: каталог завдань '$taskPath' не створено — запустіть BRAVO_TASKS_INSTALL.ps1"
                     } else {
                         "увімкнене в config завдання ще не зареєстровано"
                     }

@@ -1041,12 +1041,63 @@ function Wait-ForManualExit {
     Wait-BRAVOManualExit -NoPause:$NoPause
 }
 
+function Group-BRAVOProbeTarget {
+    # Один і той самий шлях пробується РІВНО один раз (як і раніше через
+    # Select-Object -Unique), але його провал застосовується до ВСІХ власників
+    # цього шляху: два компоненти можуть мати спільний каталог призначення, і
+    # тоді відмова справедливо стосується обох.
+    param([object[]]$Targets)
+
+    # Hashtable для пошуку + List для порядку, а НЕ [ordered]@{}: доступ до
+    # .Values порожнього OrderedDictionary кидає ArgumentException
+    # ("Argument types do not match") під час загортання в @() — а порожній
+    # набір цілей тут цілком штатний (усі компоненти вимкнені).
+    $probeGroupIndex = @{}
+    $probeGroupList = New-Object System.Collections.Generic.List[object]
+    foreach ($probeTarget in @($Targets)) {
+        $probeTargetPath = [string]$probeTarget.Path
+        if ([string]::IsNullOrWhiteSpace($probeTargetPath)) {
+            continue
+        }
+        $probeGroupKey = $probeTargetPath.ToUpperInvariant()
+        if ($probeGroupIndex.ContainsKey($probeGroupKey)) {
+            [void]$probeGroupIndex[$probeGroupKey].Owners.Add($probeTarget)
+            continue
+        }
+        $probeGroup = [pscustomobject]@{
+            Path = $probeTargetPath
+            Owners = (New-Object System.Collections.Generic.List[object])
+        }
+        [void]$probeGroup.Owners.Add($probeTarget)
+        $probeGroupIndex[$probeGroupKey] = $probeGroup
+        [void]$probeGroupList.Add($probeGroup)
+    }
+    # .ToArray(), а НЕ @($probeGroupList): у Windows PowerShell 5.1 загортання
+    # ПОРОЖНЬОГО System.Collections.Generic.List у @() кидає
+    # ArgumentException "Argument types do not match". Порожній набір цілей
+    # тут штатний (усі компоненти вимкнені), тому це був би краш на рівному місці.
+    return $probeGroupList.ToArray()
+}
+
 function Test-PathWithLog {
     param(
         [string]$Path,
         [string]$Description,
         [bool]$CreateIfMissing = $false
     )
+
+    # Порожній шлях означає нерозв'язане джерело або призначення: напр.
+    # BRAVOEXCH, коли каталог із bravo.ini [model] BEXCH не існує, і
+    # BRAVO.config обнуляє sourcePaths.BravoExch. Раніше таке значення
+    # доходило до Test-Path "" — а той має [ValidateNotNullOrEmpty] на -Path,
+    # тому кидав термінальну помилку "Cannot bind argument to parameter
+    # 'Path' because it is an empty string" і валив УВЕСЬ прогін кодом 90
+    # (InternalError) ще до архівації справних компонентів. Тут це керована
+    # відмова одного шляху: викликач сам вирішує, що з нею робити.
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        Write-BRAVOLog -Component 'PATHS' -Message "$Description не визначено: шлях порожній або не вдалося визначити автоматично" -Level "ERROR"
+        return $false
+    }
 
     if (Test-Path $Path) {
         Write-BRAVOLog -Component 'PATHS' -Message "$Description знайдено: $Path" -Level "DEBUG"
@@ -5759,52 +5810,159 @@ function Main {
     # BRAVO_ARCHIV пише лише власні логи ($logPath = RuntimeRoot\LOGS),
     # backup-дані (BackupRoot) і машинний стан (ProgramData\State). Системні
     # журнали (SystemLogRoot) — зона BRAVO_MAINTENANCE, тому тут не пробуються.
-    $writeProbePaths = @(
+    # Кожна probe-ціль належить конкретному ВЛАСНИКУ.
+    #
+    # 'Shared' — спільна інфраструктура (власні логи, BackupRoot, каталог
+    # lock, machine state). Без неї не може виконатись і чесно записатись
+    # ЖОДНА операція, тому її провал справедливо скасовує все.
+    #
+    # 'Archive'/'BAZA_APP'/'BAZA_WWW' — ресурс КОНКРЕТНОГО компонента. Його
+    # провал вимикає ЛИШЕ цей компонент, а решта виконуються далі.
+    #
+    # Раніше тут був один глобальний $systemAccessValid, і будь-який провал
+    # скасовував усе: відсутня тека опціональної синхронізації BAZA_WWW
+    # давала "опубліковано 0 з 3; VSS Snapshot Set: не створено", хоча
+    # джерела MODEL/BLOG/BRAVOEXCH і BAZA_APP були повністю справні, а
+    # BAZA_APP ще й отримувала оманливе "локальний source path недоступний".
+    # Це суперечило принципу самого циклу архівації: помилка одного
+    # компонента не має псувати решту.
+    $sharedAccessValid = $true
+    $probeFailedComponents = New-Object System.Collections.Generic.List[string]
+
+    $writeProbeTargets = New-Object System.Collections.Generic.List[object]
+    foreach ($sharedWritePath in @(
         [string]$logPath,
         [string]$backupRootPath,
         (Split-Path -Path ([string]$operationLockSettings.Path) -Parent),
         [string]$stateRoot
-    )
-    foreach ($archive in $enabledArchives) {
-        $writeProbePaths += [string]$archive.Destination
-        $writeProbePaths += [System.IO.Path]::Combine([string]$archive.Destination, '.work')
+    )) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = $sharedWritePath; Owner = 'Shared'; Component = $null
+        })
     }
-    if ($bazaAppLocalSyncEnabled) { $writeProbePaths += [string]$bazaAppPaths.Destination }
-    if ($bazaWWWLocalSyncEnabled) { $writeProbePaths += [string]$bazaWWWPaths.Destination }
-    foreach ($probePath in @($writeProbePaths |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            Select-Object -Unique)) {
-        $writeProbe = Test-BRAVOFileSystemWriteProbe -Path ([string]$probePath)
+    foreach ($archive in $enabledArchives) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [string]$archive.Destination; Owner = 'Archive'; Component = [string]$archive.Type
+        })
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [System.IO.Path]::Combine([string]$archive.Destination, '.work'); Owner = 'Archive'; Component = [string]$archive.Type
+        })
+    }
+    if ($bazaAppLocalSyncEnabled) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaAppPaths.Destination; Owner = 'BAZA_APP'; Component = $null
+        })
+    }
+    if ($bazaWWWLocalSyncEnabled) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaWWWPaths.Destination; Owner = 'BAZA_WWW'; Component = $null
+        })
+    }
+    foreach ($probeGroup in (Group-BRAVOProbeTarget -Targets $writeProbeTargets.ToArray())) {
+        $writeProbe = Test-BRAVOFileSystemWriteProbe -Path ([string]$probeGroup.Path)
         if ($writeProbe.Success) {
-            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe OK: $probePath" -Level 'DEBUG'
-        } else {
-            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe FAILED: $probePath ($($writeProbe.Error))" -Level 'ERROR'
-            $systemAccessValid = $false
-            $pathCheckFailureCount++
+            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe OK: $($probeGroup.Path)" -Level 'DEBUG'
+            continue
+        }
+        Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe FAILED: $($probeGroup.Path) ($($writeProbe.Error))" -Level 'ERROR'
+        $systemAccessValid = $false
+        $pathCheckFailureCount++
+        foreach ($probeOwner in $probeGroup.Owners) {
+            switch ([string]$probeOwner.Owner) {
+                'Archive' {
+                    if (-not $probeFailedComponents.Contains([string]$probeOwner.Component)) {
+                        [void]$probeFailedComponents.Add([string]$probeOwner.Component)
+                    }
+                }
+                'BAZA_APP' { $bazaAppDestinationAvailable = $false }
+                'BAZA_WWW' { $bazaWWWDestinationAvailable = $false }
+                default { $sharedAccessValid = $false }
+            }
         }
     }
-    $sourceProbePaths = @($enabledArchives | ForEach-Object { [string]$_.Source })
-    if ($bazaAppLocalSyncEnabled -or $bazaAppSFTPSyncEnabled) { $sourceProbePaths += [string]$bazaAppPaths.Source }
-    if ($bazaWWWLocalSyncEnabled -or $bazaWWWSFTPSyncEnabled) { $sourceProbePaths += [string]$bazaWWWPaths.Source }
-    foreach ($probePath in @($sourceProbePaths |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            Select-Object -Unique)) {
-        $readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probePath)
+
+    $sourceProbeTargets = New-Object System.Collections.Generic.List[object]
+    foreach ($archive in $enabledArchives) {
+        [void]$sourceProbeTargets.Add([pscustomobject]@{
+            Path = [string]$archive.Source; Owner = 'Archive'; Component = [string]$archive.Type
+        })
+    }
+    if ($bazaAppLocalSyncEnabled -or $bazaAppSFTPSyncEnabled) {
+        [void]$sourceProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaAppPaths.Source; Owner = 'BAZA_APP'; Component = $null
+        })
+    }
+    if ($bazaWWWLocalSyncEnabled -or $bazaWWWSFTPSyncEnabled) {
+        [void]$sourceProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaWWWPaths.Source; Owner = 'BAZA_WWW'; Component = $null
+        })
+    }
+    foreach ($probeGroup in (Group-BRAVOProbeTarget -Targets $sourceProbeTargets.ToArray())) {
+        $readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probeGroup.Path)
         if ($readProbe.Success) {
             Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe OK: $($readProbe.Path)" -Level 'DEBUG'
-        } else {
-            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe FAILED: $probePath ($($readProbe.Error))" -Level 'ERROR'
-            $systemAccessValid = $false
-            $pathCheckFailureCount++
+            continue
+        }
+        Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe FAILED: $($probeGroup.Path) ($($readProbe.Error))" -Level 'ERROR'
+        $systemAccessValid = $false
+        $pathCheckFailureCount++
+        foreach ($probeOwner in $probeGroup.Owners) {
+            switch ([string]$probeOwner.Owner) {
+                'Archive' {
+                    if (-not $probeFailedComponents.Contains([string]$probeOwner.Component)) {
+                        [void]$probeFailedComponents.Add([string]$probeOwner.Component)
+                    }
+                }
+                'BAZA_APP' { $bazaAppSourceAvailable = $false }
+                'BAZA_WWW' { $bazaWWWSourceAvailable = $false }
+                default { $sharedAccessValid = $false }
+            }
         }
     }
-    if (-not $systemAccessValid) {
-        Write-BRAVOLog -Component 'PATHS' -Message 'Production operations cancelled because SYSTEM access preflight failed' -Level 'ERROR'
+
+    if (-not $sharedAccessValid) {
+        # Спільна інфраструктура недоступна — виконувати нема куди й нема чим.
+        Write-BRAVOLog -Component 'PATHS' -Message 'Production operations cancelled because SYSTEM access preflight failed for shared infrastructure (logs/BackupRoot/lock/state)' -Level 'ERROR'
+        # Кожен увімкнений компонент отримує явний результат-відмову: інакше
+        # $results лишався порожнім, і РЕЗУЛЬТАТ показував "Створено архівів:
+        # 0 з 0" замість "0 з 3", а причиною відмови помилково ставав перший-
+        # ліпший наступний збій (напр. SFTP) замість справжнього.
+        foreach ($archive in $enabledArchives) {
+            if ($results.ContainsKey([string]$archive.Type)) { continue }
+            $results[[string]$archive.Type] = @{
+                ArchiveSuccess = $false
+                HashSuccess = $false
+                CreateSuccess = $false
+                IntegritySuccess = $false
+                ErrorStage = 'CONFIGURATION'
+                Error = 'SYSTEM access preflight failed for shared infrastructure'
+                ToolFailure = $null
+            }
+        }
         $readyArchives = @()
         $bazaAppSourceAvailable = $false
         $bazaAppDestinationAvailable = $false
         $bazaWWWSourceAvailable = $false
         $bazaWWWDestinationAvailable = $false
+    } elseif ($probeFailedComponents.Count -gt 0) {
+        # Вимикаємо ЛИШЕ ті компоненти, чий власний probe не пройшов: решта
+        # архівуються, а generation стає INCOMPLETE замість FAILED.
+        foreach ($probeFailedComponent in @($probeFailedComponents)) {
+            Write-BRAVOLog -Component 'PATHS' -Message "Компонент ${probeFailedComponent} пропущено: SYSTEM access probe для його шляхів не пройдено" -Level 'ERROR'
+            $results[$probeFailedComponent] = @{
+                ArchiveSuccess = $false
+                HashSuccess = $false
+                CreateSuccess = $false
+                IntegritySuccess = $false
+                ErrorStage = 'CONFIGURATION'
+                Error = 'SYSTEM access preflight failed for this component'
+                ToolFailure = $null
+            }
+        }
+        $failedComponentNames = @($probeFailedComponents)
+        $readyArchives = @($readyArchives | Where-Object { $failedComponentNames -notcontains [string]$_.Type })
+    }
+    if (-not $systemAccessValid) {
         $operationFailed = $true
     }
 
@@ -6881,7 +7039,23 @@ function Main {
             $summaryToolExitCode = $toolFailure.ToolExitCodeText
         }
     } elseif ([bool]$sftpStepFailed) {
-        $summaryReason = "Не вдалося передати архіви на SFTP"
+        # Називаємо САМЕ ті передавання, що впали. Раніше тут завжди стояло
+        # "Не вдалося передати архіви на SFTP" — навіть коли архіви
+        # завантажились успішно, а впала лише синхронізація BAZA_APP/BAZA_WWW.
+        # Через це РЕЗУЛЬТАТ суперечив сам собі: причина говорила про архіви,
+        # а поруч той самий блок показував "SFTP: резервні копії: OK".
+        $failedTransferNames = @(
+            @('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW') |
+                Where-Object {
+                    [bool]$transferResults[$_].Enabled -and -not [bool]$transferResults[$_].Success
+                } |
+                ForEach-Object { [string]$transferResults[$_].Name }
+        )
+        $summaryReason = if ($failedTransferNames.Count -gt 0) {
+            "Не вдалося виконати передавання SFTP: $($failedTransferNames -join ', ')"
+        } else {
+            "Не вдалося передати архіви на SFTP"
+        }
     }
 
     Write-BRAVOResultHeader `

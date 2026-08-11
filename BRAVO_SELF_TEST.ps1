@@ -9169,7 +9169,11 @@ function Get-BRAVOMaintenanceSummaryResult {
                 $archiveScriptText.Contains("[IO.FileMode]::CreateNew") -and
                 $archiveScriptText.Contains("[IO.File]::ReadAllBytes(`$probePath)") -and
                 $archiveScriptText.Contains("(Split-Path -Path ([string]`$operationLockSettings.Path) -Parent)") -and
-                $archiveScriptText.Contains("`$writeProbePaths += [System.IO.Path]::Combine([string]`$archive.Destination, '.work')")
+                # Цілі probe тепер несуть власника (Shared/Archive/BAZA_*), але
+                # склад цілей не змінився: .work кожного destination
+                # залишається серед write-probe цілей.
+                $archiveScriptText.Contains("[System.IO.Path]::Combine([string]`$archive.Destination, '.work'); Owner = 'Archive'") -and
+                $archiveScriptText.Contains('$writeProbeTargets.Add(')
             ) `
             -Name 'Runtime/08-ProductionSystemPreflightMatchesDryRun' `
             -Failure 'production Archive має повторювати SYSTEM source-read/write-readback-delete preflight для data roots, destinations, .work і machine lock'
@@ -11438,6 +11442,115 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name 'Archive/PathStepCannotRenderOkBeforeAccessPreflightCompletes' `
         -Failure '''Перевірка шляхів'' має рендеритись РІВНО один раз, ПІСЛЯ SYSTEM read-probe (не до SYSTEM access preflight); OK лише коли allPathsExist І systemAccessValid'
+
+    # ===== Регресії реального розгортання LIMS (5.0.0-dev.19):
+    # 1) відсутня тека одного компонента валила ВЕСЬ прогін кодом 90;
+    # 2) відсутнє джерело ОПЦІОНАЛЬНОЇ синхронізації скасовувало всю
+    #    архівацію ("опубліковано 0 з 3; VSS Snapshot Set: не створено").
+    $archiveProbeStubSource = @'
+function Write-BRAVOLog {
+    param([string]$Message, [string]$Level, [string]$Component, [switch]$Console, [switch]$NoConsole)
+}
+'@
+    $archivePathProbeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($archiveScriptText + [Environment]::NewLine + $archiveProbeStubSource) `
+        -FunctionNames @('Write-BRAVOLog', 'Test-PathWithLog', 'Group-BRAVOProbeTarget')
+
+    # --- Archive/PathCheck: порожній шлях -> керована відмова, НЕ виняток ---
+    # d:\LIMS\bravoexch з bravo.ini не існував -> BRAVO.config обнуляв
+    # sourcePaths.BravoExch -> Test-Path "" кидав термінальну помилку
+    # "Cannot bind argument to parameter 'Path'" і весь backup падав з 90.
+    $emptyPathProbeThrew = $false
+    $emptyPathProbeResult = $null
+    $nullPathProbeResult = $null
+    try {
+        $emptyPathProbeResult = & $archivePathProbeModule {
+            Test-PathWithLog -Path '' -Description 'Джерело архiву BRAVOEXCH' -CreateIfMissing $false
+        }
+        $nullPathProbeResult = & $archivePathProbeModule {
+            Test-PathWithLog -Path $null -Description 'Джерело архiву BRAVOEXCH' -CreateIfMissing $false
+        }
+    } catch {
+        $emptyPathProbeThrew = $true
+    }
+    $existingPathProbeResult = & $archivePathProbeModule {
+        param($Path)
+        Test-PathWithLog -Path $Path -Description 'Каталог комплекту' -CreateIfMissing $false
+    } $root
+    Test-BRAVOCondition `
+        -Condition (
+            -not $emptyPathProbeThrew -and
+            $false -eq $emptyPathProbeResult -and
+            $false -eq $nullPathProbeResult -and
+            $true -eq $existingPathProbeResult
+        ) `
+        -Name 'Archive/PathCheckEmptyPathIsControlledFailure' `
+        -Failure 'Test-PathWithLog з порожнім/null шляхом має повертати $false із записом у журнал, а не кидати виняток (інакше нерозв''язане джерело валить увесь прогін кодом 90)'
+
+    # --- Archive/ProbeTargets: групування зберігає ВСІХ власників шляху ---
+    $probeGroupsEmpty = @(& $archivePathProbeModule { Group-BRAVOProbeTarget -Targets @() })
+    $probeGroupsMixed = @(& $archivePathProbeModule {
+        Group-BRAVOProbeTarget -Targets @(
+            [pscustomobject]@{ Path = 'E:\BACKUPS\MODEL'; Owner = 'Archive'; Component = 'MODEL' },
+            [pscustomobject]@{ Path = 'e:\backups\model'; Owner = 'Archive'; Component = 'BLOG' },
+            [pscustomobject]@{ Path = '   '; Owner = 'Shared'; Component = $null },
+            [pscustomobject]@{ Path = $null; Owner = 'Shared'; Component = $null },
+            [pscustomobject]@{ Path = 'E:\BACKUPS'; Owner = 'Shared'; Component = $null }
+        )
+    })
+    $sharedProbeGroup = @($probeGroupsMixed | Where-Object { $_.Path -eq 'E:\BACKUPS' })
+    $duplicateProbeGroup = @($probeGroupsMixed | Where-Object { $_.Path -eq 'E:\BACKUPS\MODEL' })
+    Test-BRAVOCondition `
+        -Condition (
+            $probeGroupsEmpty.Count -eq 0 -and
+            $probeGroupsMixed.Count -eq 2 -and
+            $sharedProbeGroup.Count -eq 1 -and
+            $duplicateProbeGroup.Count -eq 1 -and
+            # .Count/конвеєр напряму, БЕЗ @(): Owners це List[object], а
+            # загортання List[object] у @() кидає ArgumentException у
+            # Windows PowerShell 5.1 (та сама пастка, що й у самому рантаймі).
+            $duplicateProbeGroup[0].Owners.Count -eq 2 -and
+            (($duplicateProbeGroup[0].Owners | ForEach-Object { [string]$_.Component }) -contains 'BLOG')
+        ) `
+        -Name 'Archive/ProbeTargetsGroupKeepsEveryOwner' `
+        -Failure 'Group-BRAVOProbeTarget має пробувати кожен шлях один раз (без урахування регістру), відкидати порожні й зберігати ВСІХ власників — спільний каталог призначення означає відмову обох компонентів'
+
+    # --- Archive/ProbeFailureScope: провал компонента не скасовує решту ---
+    # Ключовий інваріант: глобальне скасування ($readyArchives = @() і
+    # обнулення всіх BAZA-прапорців) дозволене ЛИШЕ у гілці спільної
+    # інфраструктури; провал ресурсу компонента прибирає лише його.
+    $sharedCancelIndex = $archiveScriptText.IndexOf('if (-not $sharedAccessValid) {')
+    $componentCancelIndex = $archiveScriptText.IndexOf('} elseif ($probeFailedComponents.Count -gt 0) {')
+    $globalCancelIndex = $archiveScriptText.IndexOf('$readyArchives = @()', $sharedCancelIndex)
+    # --- DryRun: відсутній каталог завдань != збій служби Планувальника ---
+    # На першій інсталяції GetFolder('\BRAVO') кидає 0x80070002, і оператор
+    # бачив сирий HRESULT "стан не вдалося прочитати" замість зрозумілого
+    # "ще не зареєстровано — запустіть BRAVO_TASKS_INSTALL.ps1".
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunTextForRuntime.Contains('$taskFolderMissing = $false') -and
+            $dryRunTextForRuntime.Contains('if ($_.Exception.HResult -eq -2147024894)') -and
+            $dryRunTextForRuntime.Contains("каталог завдань '`$taskPath' не створено — запустіть BRAVO_TASKS_INSTALL.ps1") -and
+            # Сирий текст помилки лишається ЛИШЕ для справжніх збоїв служби.
+            $dryRunTextForRuntime.Contains('"стан не вдалося прочитати: $taskServiceError"')
+        ) `
+        -Name 'DryRun/MissingTaskFolderIsNotServiceFailure' `
+        -Failure 'відсутній каталог завдань (0x80070002) має давати зрозуміле "ще не зареєстровано", а сирий HRESULT лишатися тільки для реальних збоїв служби Планувальника'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $sharedCancelIndex -ge 0 -and
+            $componentCancelIndex -gt $sharedCancelIndex -and
+            $globalCancelIndex -gt $sharedCancelIndex -and
+            $globalCancelIndex -lt $componentCancelIndex -and
+            $archiveScriptText.Contains("Owner = 'Shared'") -and
+            $archiveScriptText.Contains("'BAZA_WWW' { `$bazaWWWSourceAvailable = `$false }") -and
+            $archiveScriptText.Contains("'BAZA_APP' { `$bazaAppSourceAvailable = `$false }") -and
+            $archiveScriptText.Contains('$readyArchives = @($readyArchives | Where-Object { $failedComponentNames -notcontains [string]$_.Type })') -and
+            -not [regex]::IsMatch($archiveScriptText, '(?m)^\s*if \(-not \$systemAccessValid\) \{\s*\r?\n\s*Write-BRAVOLog[^\r\n]*Production operations cancelled')
+        ) `
+        -Name 'Archive/ProbeFailureIsScopedToOwner' `
+        -Failure 'провал SYSTEM probe має вимикати ЛИШЕ власника шляху: скасування всіх архівів дозволене тільки для спільної інфраструктури, а відсутнє джерело BAZA_WWW не має обнуляти BAZA_APP чи readyArchives'
 
     # --- Archive: dev.18 — очищення старих журналів мігрувало на numbered
     # Write-BRAVOArchiveStep (раніше unnumbered Write-BRAVOOperationResult
