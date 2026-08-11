@@ -3,17 +3,21 @@
 Set-StrictMode -Version 2.0
 
 function Resolve-BRAVOReleaseChannelFromGit {
-    # AUD-016 (аудит): releaseChannel раніше зберігався як буквальне
-    # значення у VERSION.json, яке різнилось між гілками master/developer
-    # — кожен merge developer->master вимагав ручного follow-up commit,
-    # інакше fast-forward мовчки протягував "development" на master (і
-    # навпаки — виправлення на master могло так само мовчки протягнутись
-    # назад у developer при наступному злитті). Джерело тепер зберігає
-    # ОДНАКОВЕ значення на обох гілках (нейтральний fallback для
-    # розгорнутих production-копій без .git); коли поруч є .git-каталог
-    # (git-checkout, а не скопійований дистрибутив), реальний release
-    # channel визначається з поточної гілки напряму з файлової системи —
-    # без виклику git.exe (може бути відсутній на production-сервері).
+    # Визначає release channel із поточної гілки напряму з файлової
+    # системи (.git/HEAD), без виклику git.exe — його може не бути на
+    # production-сервері.
+    #
+    # AUD-016 (аудит): певний час ця функція БУЛА джерелом каналу, бо
+    # ручна синхронізація VERSION.json між гілками двічі підвела на
+    # fast-forward merge. RELEASE_POLICY.md (розділи 5.3, 5.4) повернув
+    # джерело істини в пакет: розгорнутий комплект узагалі не має .git,
+    # і канал тоді нізвідки взяти. Причину AUD-016 усунуто інакше —
+    # гілки більше ніколи не містять однакової версії (розділ 4), тому
+    # fast-forward між ними неможливий, а узгодженість гілки, версії та
+    # каналу тепер механічно охороняє ci\Test-BRAVOReleasePolicy.ps1.
+    #
+    # Тут результат лишається як безкоштовна перехресна перевірка: поки
+    # .git поруч, розбіжність із VERSION.json видно (ReleaseChannelMatchesGit).
     #
     # -GitHeadContent дозволяє self-test підставити синтетичний вміст
     # .git/HEAD замість реального файлу (той самий injectable-патерн, що
@@ -78,6 +82,8 @@ function Get-BravoVersionMetadata {
             ReleaseDate = $null
             ReleaseChannel = 'legacy'
             ReleaseChannelSource = 'legacy'
+            GitBranchReleaseChannel = $null
+            ReleaseChannelMatchesGit = $null
             BuildId = $null
             SourceCommit = $null
             VersionFilePath = $versionPath
@@ -133,17 +139,25 @@ function Get-BravoVersionMetadata {
         $null
     }
 
+    # RELEASE_POLICY.md, розділи 5.3-5.4: канал релізу зберігається в
+    # самому пакеті. Пакет на сервері приходить ZIP-ом, копіюванням,
+    # SFTP або SMB — .git там немає, і виведений із гілки канал у
+    # production просто недоступний. .git, коли він поруч, лишається
+    # перехресною перевіркою: розбіжність видно в ReleaseChannelMatchesGit
+    # (у CI її ловить ci\Test-BRAVOReleasePolicy.ps1).
     $staticReleaseChannel = [string]$versionData.releaseChannel
     $gitDetectedReleaseChannel = Resolve-BRAVOReleaseChannelFromGit -ConfigRoot $ConfigRoot
-    $effectiveReleaseChannel = if (-not [string]::IsNullOrWhiteSpace($gitDetectedReleaseChannel)) {
-        $gitDetectedReleaseChannel
+    $effectiveReleaseChannel = $staticReleaseChannel
+    $releaseChannelSource = 'VERSION.json'
+    $releaseChannelMatchesGit = if ([string]::IsNullOrWhiteSpace($gitDetectedReleaseChannel)) {
+        # Гілки немає (розгорнутий пакет, detached HEAD, feature/*) —
+        # порівнювати нема з чим; це не "не збігається".
+        $null
+    } elseif ($gitDetectedReleaseChannel -eq 'stable') {
+        $staticReleaseChannel -eq 'stable'
     } else {
-        $staticReleaseChannel
-    }
-    $releaseChannelSource = if (-not [string]::IsNullOrWhiteSpace($gitDetectedReleaseChannel)) {
-        'git-branch'
-    } else {
-        'VERSION.json'
+        # developer несе і 'development' (dev.N), і 'prerelease' (rc.N).
+        $staticReleaseChannel -in @('development', 'prerelease')
     }
 
     return [pscustomobject]@{
@@ -155,6 +169,8 @@ function Get-BravoVersionMetadata {
         ReleaseDate = [string]$versionData.releaseDate
         ReleaseChannel = $effectiveReleaseChannel
         ReleaseChannelSource = $releaseChannelSource
+        GitBranchReleaseChannel = $gitDetectedReleaseChannel
+        ReleaseChannelMatchesGit = $releaseChannelMatchesGit
         BuildId = $buildId
         SourceCommit = $sourceCommit
         VersionFilePath = $versionPath
@@ -195,6 +211,68 @@ function Test-BravoLegacyConfiguration {
     }
 }
 
+function Test-BravoDataRootValue {
+    # Валідація значення production data root. Порожнє значення допустиме
+    # для LIMSRoot і SystemLogRoot (== AUTO); для непорожнього — розкриття
+    # %ENV%, зняття лапок і вимога абсолютного шляху.
+    #
+    # GetFullPath навмисно застосовується ЛИШЕ до вже абсолютного значення:
+    # для відносного він добудував би шлях від поточного каталогу процесу, а
+    # під заплановим завданням це C:\Windows\System32. Саме так «тихий
+    # відносний шлях» перетворюється на кореневий каталог Windows — тому
+    # відносне значення є помилкою конфігурації, а не приводом здогадуватись.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [string]$Value,
+        [switch]$AllowEmpty
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        if ($AllowEmpty) {
+            return
+        }
+        throw "pathSettings.$Name не задано. Залиште """" для AUTO-визначення або задайте явний абсолютний шлях."
+    }
+
+    $normalized = $Value.Trim()
+    if ($normalized.Length -ge 2 -and $normalized.StartsWith('"') -and $normalized.EndsWith('"')) {
+        $normalized = $normalized.Substring(1, $normalized.Length - 2).Trim()
+    }
+    $normalized = [Environment]::ExpandEnvironmentVariables($normalized)
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        if ($AllowEmpty) {
+            return
+        }
+        throw "pathSettings.$Name порожній після розкриття змінних середовища (вихідне значення: '$Value')."
+    }
+    if ($normalized -notmatch '^([A-Za-z]:[\\/]|\\\\[^\\/]+[\\/])') {
+        throw "pathSettings.$Name повинен бути абсолютним шляхом ('D:\LIMS-NEW' або '\\server\share\...'), а не '$Value'."
+    }
+}
+
+function Assert-BravoDataRootsAreIndependent {
+    # CODE IS NOT DATA. RuntimeRoot — місце виконуваного комплекту; LIMSRoot,
+    # SystemLogRoot і BackupRoot — місця даних, які НЕ виводяться з
+    # розташування комплекту.
+    #
+    # Контракт значень (ТЗ RuntimeRoot/LIMSRoot §31-§32; ТЗ "1. LIMSRoot"):
+    #   LIMSRoot      "" = AUTO через службу BRAVO; непорожнє = абсолютний шлях.
+    #   SystemLogRoot "" = <EffectiveLIMSRoot>\ARCHIV\LOGS; непорожнє = абсолютний.
+    #   BackupRoot    "" = <EffectiveLIMSRoot>\ARCHIV;      непорожнє = абсолютний.
+    # Усі три "" — валідна all-AUTO configuration. Перевірка абсолютності
+    # виконується лише для НЕпорожнього значення (звідси -AllowEmpty).
+    # Ефективні значення (з урахуванням AUTO) обчислює сам BRAVO.config через
+    # Resolve-BRAVOEffectiveLimsRoot / Resolve-BRAVOEffectiveSystemLogRoot /
+    # Resolve-BRAVOEffectiveBackupRoot.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][hashtable]$PathSettings)
+
+    Test-BravoDataRootValue -Name 'LIMSRoot' -Value ([string]$PathSettings['LIMSRoot']) -AllowEmpty
+    Test-BravoDataRootValue -Name 'SystemLogRoot' -Value ([string]$PathSettings['SystemLogRoot']) -AllowEmpty
+    Test-BravoDataRootValue -Name 'BackupRoot' -Value ([string]$PathSettings['BackupRoot']) -AllowEmpty
+}
+
 function Assert-BravoLoadedConfiguration {
     [CmdletBinding()]
     param()
@@ -231,6 +309,8 @@ function Assert-BravoLoadedConfiguration {
     if (-not ($global:componentSettings -is [hashtable])) {
         throw 'componentSettings повинен бути хеш-таблицею.'
     }
+
+    Assert-BravoDataRootsAreIndependent -PathSettings $global:pathSettings
 }
 
 function Import-BravoConfiguration {
@@ -241,10 +321,22 @@ function Import-BravoConfiguration {
 
         [string]$ConfigPath,
 
+        # Каталог самого комплекту (де лежать modules\, Tools\, VERSION.json,
+        # RUNTIME_MANIFEST.json). За замовчуванням збігається з ConfigRoot —
+        # так було й до появи цього параметра. Але -ConfigPath може вказувати
+        # на конфігурацію в іншому каталозі (C:\BRAVO\CONFIGS\SERVER1.config),
+        # і тоді modules\ треба шукати не поруч із нею, а поруч зі скриптами.
+        [string]$RuntimeRoot,
+
         [switch]$PassThru
     )
 
     $resolvedConfigRoot = [System.IO.Path]::GetFullPath($ConfigRoot)
+    $resolvedRuntimeRoot = if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+        $resolvedConfigRoot
+    } else {
+        [System.IO.Path]::GetFullPath($RuntimeRoot)
+    }
 
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
         $ConfigPath = Join-Path $resolvedConfigRoot 'BRAVO.config'
@@ -256,14 +348,14 @@ function Import-BravoConfiguration {
         -ConfigPath $resolvedConfigPath `
         -ConfigRoot $resolvedConfigRoot
 
-    $versionMetadata = Get-BravoVersionMetadata -ConfigRoot $resolvedConfigRoot
+    $versionMetadata = Get-BravoVersionMetadata -ConfigRoot $resolvedRuntimeRoot
 
     # BRAVO.config викликає Resolve-BRAVOInstallationDiscovery, тому цей
     # модуль має бути в scope ще до виконання самого config-скрипта.
     # BRAVO.config сам ніколи не імпортує модулі (покладається на те, що
     # виклик Import-BravoConfiguration уже їх завантажив) — тому це єдина
     # точка, спільна для всіх ~10 entrypoint-ів, які дот-сорсять цей файл.
-    $discoveryModulePath = Join-Path $resolvedConfigRoot 'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'
+    $discoveryModulePath = Join-Path $resolvedRuntimeRoot 'modules\BRAVO.Discovery\BRAVO.Discovery.psd1'
     if (Test-Path -LiteralPath $discoveryModulePath -PathType Leaf) {
         Import-Module -Name $discoveryModulePath -ErrorAction Stop
     }
@@ -279,7 +371,7 @@ function Import-BravoConfiguration {
             -ErrorAction Stop
 
         $legacyConfigScript = [scriptblock]::Create($legacyConfigText)
-        & $legacyConfigScript -ConfigRoot $resolvedConfigRoot
+        & $legacyConfigScript -ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot
     }
     catch {
         throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message)"
@@ -336,6 +428,7 @@ function Import-BravoConfiguration {
         Format = 'legacy-config'
         ConfigPath = $resolvedConfigPath
         ConfigRoot = $resolvedConfigRoot
+        RuntimeRoot = $resolvedRuntimeRoot
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
         LegacyScriptVersion = $legacyScriptVersion
         LegacyScriptVersionPresent = ($null -ne $legacyScriptVersionVariable)

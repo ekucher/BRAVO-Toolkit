@@ -33,9 +33,19 @@ if (-not (Test-Path -LiteralPath (Join-Path $Root 'BRAVO_SELF_TEST.ps1') -PathTy
 # себе через UAC або описує завдання Планувальника (SECURITY.md розділ
 # 4). Мета правила — заблокувати НОВІ файли з Bypass, а не переписати
 # наявний механізм elevation.
+#
+# BRAVO_TASKS_DIAGNOSE.ps1 належить до тієї самої категорії "описує завдання
+# Планувальника": він не запускає нічого з Bypass, а ПЕРЕВІРЯЄ, що вже
+# зареєстровані завдання містять очікувані аргументи. Без цього рядка
+# діагностика не могла б назвати те, чого шукає.
+# BRAVO_SETUP.ps1 є installer-ом і генерує три ручні launcher-и. Self-test
+# окремо вимагає, щоб Bypass існував лише всередині
+# New-BRAVOManualLauncherContent і рівно в одному місці файла.
 $bypassAllowlist = @(
+    'BRAVO_SETUP.ps1',
     'BRAVO_TASKS_INSTALL.ps1',
     'BRAVO_TASKS_UNINSTALL.ps1',
+    'BRAVO_TASKS_DIAGNOSE.ps1',
     'BRAVO_CREDENTIALS_SETUP.ps1',
     'BRAVO_SELF_TEST.ps1',
     'BRAVO.Archive.Runtime.ps1',

@@ -651,7 +651,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     # змінювала б стан, який вона перевіряє.
     $versionResult = Test-BRAVOVersionDowngrade `
         -RuntimeRoot $RuntimeRoot `
-        -StatePath (Join-Path $RuntimeRoot 'LOGS\BRAVO_VERSION_STATE.json') `
+        -StatePath (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'BRAVO\State\BRAVO_VERSION_STATE.json') `
         -Mode $Mode `
         -NoWrite
 

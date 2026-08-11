@@ -46,8 +46,11 @@
 | [`33`](#33--порушено-цілісність-powershell-комплекту) | **цілісність комплекту** | **S1** |
 | [`34`](#34--конфігурація-послаблює-захист) | **конфігурація послаблює захист** | **S1** |
 | [`35`](#35--відкат-на-старішу-версію) | **відкат на старішу версію** | **S1** |
+| [`36`](#36--недостатньо-прав-лише-bravo_healthps1) | недостатньо прав (лише `BRAVO_HEALTH.ps1`) | S3 |
+| [`37`](#37--недоступні-logstemp-не-через-права-лише-bravo_healthps1) | `LOGS`/`TEMP` недоступні не через права (лише `BRAVO_HEALTH.ps1`) | S3 |
 | [`40`](#40--провал-локальної-архівації-часто-vss) | локальна архівація / VSS | S2 |
 | [`41`](#41--не-підтверджено-цілісність-архіву) | архів не пройшов перевірку | S2 |
+| [`42`](#42--помилка-sha512) | SHA512 не створено або не звірено | S2 |
 | [`50`](#50--помилка-sftp) | SFTP | S2 |
 | [`51`](#51--помилка-smbnas) | SMB/NAS | S2 |
 | [`60`](#60--maintenance-служби-місце-файлове-господарство) | Maintenance | S2 |
@@ -59,7 +62,8 @@
 [оновлення 7za/WinSCP](#оновлення-7zaexe-або-winscp) ·
 [Discovery знайшов не те джерело](#discovery-знайшов-не-те-джерело) ·
 [ransomware або масове видалення](#ransomware-або-масове-видалення-копій) ·
-[відновлення на чистий сервер](#відновлення-на-чистий-сервер)
+[відновлення на чистий сервер](#відновлення-на-чистий-сервер) ·
+[manifest-и перенесено в MANIFESTS](#manifest-и-backup-generation-перенесено-в-manifests-dev14)
 
 ---
 
@@ -79,7 +83,7 @@
 **Діагностика.**
 
 ```powershell
-Get-Content "C:\LIMS\ARCHIV\LOGS\BRAVO_OPERATION.lock" | ConvertFrom-Json
+Get-Content "C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock" | ConvertFrom-Json
 Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessName, StartTime
 ```
 
@@ -181,10 +185,10 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 **Діагностика.** Спершу зафіксуйте докази:
 
 ```powershell
-Get-ChildItem "C:\LIMS\ARCHIV\Tools" -File |
+Get-ChildItem "C:\BRAVO\Tools" -File |
     Get-FileHash -Algorithm SHA256 |
     Select-Object Hash, Path | Format-Table -AutoSize
-Get-ChildItem "C:\LIMS\ARCHIV\Tools" -File |
+Get-ChildItem "C:\BRAVO\Tools" -File |
     Select-Object Name, Length, CreationTime, LastWriteTime
 ```
 
@@ -230,7 +234,7 @@ Get-ChildItem "C:\LIMS\ARCHIV\Tools" -File |
 
 ```powershell
 # Guard друкує повний перелік розбіжностей і не вимагає модулів
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\LIMS\ARCHIV\BRAVO_RUNTIME_GUARD.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\BRAVO\BRAVO_RUNTIME_GUARD.ps1"
 ```
 
 Звірте `VERSION.json.sourceCommit` на сервері з тим, що ви розгортали.
@@ -266,9 +270,9 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\LIMS\ARCHIV\BRAVO_RU
 доки не переконаєтесь, що воно нікому не потрібне:
 
 ```powershell
-Get-ChildItem C:\LIMS\ARCHIV\Tools\*.ps1 | Select-Object Name, Length, LastWriteTime
-Move-Item C:\LIMS\ARCHIV\Tools\<файл>.ps1 C:\Temp\ -Force
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\LIMS\ARCHIV\BRAVO_RUNTIME_GUARD.ps1"
+Get-ChildItem C:\BRAVO\Tools\*.ps1 | Select-Object Name, Length, LastWriteTime
+Move-Item C:\BRAVO\Tools\<файл>.ps1 C:\Temp\ -Force
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\BRAVO\BRAVO_RUNTIME_GUARD.ps1"
 ```
 
 **Профілактика.** Розгортайте атомарною заміною каталогу, не
@@ -299,10 +303,10 @@ Get-ExecutionPolicy -List
 **Виправлення — ручний запуск.** Так само, як це робить планувальник:
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\LIMS\ARCHIV\BRAVO_ARCHIV.ps1"
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\BRAVO\BRAVO_ARCHIV.ps1"
 ```
 
-Прямий виклик `C:\LIMS\ARCHIV\BRAVO_ARCHIV.ps1` під `AllSigned` не
+Прямий виклик `C:\BRAVO\BRAVO_ARCHIV.ps1` під `AllSigned` не
 працюватиме й не має працювати.
 
 **Чого не робити.** Не знижуйте `ExecutionPolicy` машини до
@@ -344,7 +348,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\LIMS\ARCHIV\BRAVO_AR
 значення. Далі — хто і коли редагував конфігурацію:
 
 ```powershell
-Get-Item "C:\LIMS\ARCHIV\BRAVO.config" | Select-Object LastWriteTime, Length
+Get-Item "C:\BRAVO\BRAVO.config" | Select-Object LastWriteTime, Length
 git -C <робоча копія> diff -- BRAVO.config   # якщо конфігурація версіонується
 ```
 
@@ -366,7 +370,7 @@ git -C <робоча копія> diff -- BRAVO.config   # якщо конфіг�
 
 **Що означає.** `VERSION.json.packageVersion` розгорнутого комплекту
 нижчий за найвищий, який на цьому сервері колись запускали (записаний у
-`LOGS\BRAVO_VERSION_STATE.json`).
+`C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json`).
 
 Усі інші перевірки звіряють комплект із його **власним** маніфестом.
 Старіший комплект пройде їх бездоганно — разом із вразливостями, які
@@ -382,8 +386,8 @@ git -C <робоча копія> diff -- BRAVO.config   # якщо конфіг�
 **Діагностика.**
 
 ```powershell
-Get-Content "C:\LIMS\ARCHIV\LOGS\BRAVO_VERSION_STATE.json" | ConvertFrom-Json
-Get-Content "C:\LIMS\ARCHIV\VERSION.json" | ConvertFrom-Json |
+Get-Content "C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json" | ConvertFrom-Json
+Get-Content "C:\BRAVO\VERSION.json" | ConvertFrom-Json |
     Select-Object packageVersion, buildId, sourceCommit
 ```
 
@@ -411,12 +415,109 @@ Get-Content "C:\LIMS\ARCHIV\VERSION.json" | ConvertFrom-Json |
 
 ---
 
+## `36` — недостатньо прав (лише `BRAVO_HEALTH.ps1`)
+
+**Симптом.** `КРИТИЧНА ПОМИЛКА: BRAVO HEALTH запущено без прав
+адміністратора...` або `ПОМИЛКА СЕРЕДОВИЩА` / `Недоступний шлях: ...` на
+старті, без жодного `[N/5]`-кроку або лише з `[1/5] Середовище й
+цілісність інструментів ... ERROR`.
+
+**Що означає.** `BRAVO_HEALTH.ps1` запущено вручну без прав
+адміністратора. Один із трьох випадків:
+
+- **Explicit `-NonInteractive` без elevation** — власний argv процесу
+  (`[Environment]::GetCommandLineArgs()`, точний, не substring) містить
+  окремий елемент `-NonInteractive`. UAC свідомо не показується: немає
+  інтерактивної сесії, яка могла б на нього відповісти.
+- **UAC скасовано** — інтерактивний ручний запуск, але користувач
+  натиснув Cancel у діалозі підвищення прав.
+- **`UnauthorizedAccessException` при записі** в `LOGS` / `TEMP` —
+  обліковий запис бачить ці каталоги (їх створив `SYSTEM`), але не може
+  в них писати. Це виявляє ранній preflight, ДО будь-якого реального
+  health-check. Якщо причина НЕ в правах (диск повний, `PathTooLong`,
+  файлова система) — див. [код 37](#37--недоступні-logstemp-не-через-права-лише-bravo_healthps1),
+  не 36.
+
+У всіх трьох випадках жодна реальна перевірка (служби/локальні
+копії/SFTP/SMB) не виконувалась.
+
+**Чого не робити.**
+
+- Не послаблюйте ACL каталогу комплекту (`icacls ... /grant Users:M` і
+  подібне), щоб «дозволити» ручний запуск без адміністратора. Рішення —
+  запускати з правами адміністратора (UAC підхопить це автоматично), а
+  не відкривати запис звичайним користувачам.
+- Не інтерпретуйте цей код як SFTP-проблему: SFTP-перевірка при коді 36
+  не виконувалась узагалі, на відміну від `50`/`70`.
+
+**Діагностика.**
+
+```powershell
+# Заплановане завдання (SYSTEM) цей код НЕ повертає — воно завжди elevated.
+# Якщо код 36 з'явився в історії Планувальника, а не з ручної консолі —
+# перевірте обліковий запис завдання BRAVO_ARCHIV_HEALTH:
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
+```
+
+**Розвилка.**
+
+*Ручний запуск, звичайна консоль:* повторіть запуск від імені
+адміністратора (правою кнопкою → «Запуск від імені адміністратора», або
+підтвердьте запит UAC, який `BRAVO_HEALTH.ps1` тепер показує сам).
+
+*Планове завдання `BRAVO_ARCHIV_HEALTH` повертає 36:* це S2, не S3 —
+завдання від `SYSTEM` ніколи не повинно бачити UAC і не повинно
+провалювати preflight на власних `LOGS`/`TEMP`. Перевірте, чи не
+змінили ACL каталогу комплекту, і чи завдання дійсно виконується від
+`SYSTEM` (`BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess`).
+
+**Ескалація.** Поодинокий код 36 при ручному запуску — S3, очікувана
+поведінка (просто повторіть з правами адміністратора). Якщо цей код
+дає **заплановане** завдання — S2.
+
+---
+
+## `37` — недоступні `LOGS`/`TEMP` не через права (лише `BRAVO_HEALTH.ps1`)
+
+**Симптом.** `ПОМИЛКА СЕРЕДОВИЩА` / `Не вдалося використовувати runtime
+TEMP/LOGS: ...` на старті, з конкретною причиною в тексті (НЕ «потрібні
+права адміністратора»).
+
+**Що означає.** Той самий ранній write-probe у `LOGS`/`TEMP`, що й код
+36, але виняток — **не** `UnauthorizedAccessException`: диск повний,
+`PathTooLong`, пошкоджена файлова система, або жоден кандидат
+тимчасового каталогу взагалі не створюється. Права адміністратора тут
+нічого не виправлять.
+
+**Чого не робити.**
+
+- Не давайте пораду «запустіть адміністратором» — вона правильна для
+  коду 36, але не для 37.
+- Не послаблюйте ACL.
+
+**Діагностика.** Читайте текст помилки дослівно — там конкретна
+`.Exception.Message` (наприклад «There is not enough space on the
+disk», «The specified path, file name, or both are too long»).
+Перевірте вільне місце на диску з `LOGS`/`TEMP` і саму доступність
+шляху (`Test-Path`).
+
+**Розвилка.** Усуньте конкретну причину (звільніть місце, виправте
+шлях, перевірте диск) і повторіть запуск.
+
+**Ескалація.** S3 при разовому диску, що майже заповнений; S2, якщо
+код 37 дає заплановане завдання `BRAVO_ARCHIV_HEALTH` (SYSTEM теж
+залежить від тих самих `LOGS`/`TEMP`).
+
+---
+
 ## `40` — провал локальної архівації (часто VSS)
 
 **Симптом.** `[ERROR]` у секції `АРХІВАЦІЯ <компонент>`.
 
 **Що означає.** Архів не створено. Найчастіша причина — недоступний
-VSS: кожен компонент читається з окремого VSS-знімка, і при
+VSS Snapshot Set. MODEL, BLOG і BRAVOEXCH читаються з одного point-in-time;
+same-volume sources використовують одну shadow copy, multi-volume sources —
+кілька shadow copies в одному set. При
 `backupConsistency.Mode = "VSS"` архівація з live-каталогу **свідомо не
 виконується**. Неузгоджений архів гірший за відсутній, бо створює
 хибну впевненість.
@@ -436,6 +537,13 @@ Get-Service VSS, swprv | Select-Object Name, Status, StartType
 Get-WmiObject Win32_ShadowCopy | Select-Object ID, VolumeName, InstallDate
 ```
 
+Після kill/timeout перевірте
+`C:\ProgramData\BRAVO\State\BRAVO_VSS_OWNERSHIP.json`. Наступний Archive
+після отримання machine-wide lock автоматично прибирає лише записані там
+BRAVO-owned Shadow IDs і видаляє state після успіху. Не редагуйте owner або
+список ID вручну й не запускайте масове `vssadmin delete shadows /all`:
+пошкоджений/чужий state навмисно блокує автоматичне видалення.
+
 **Типові причини.**
 
 | Симптом у лозі | Причина |
@@ -443,7 +551,7 @@ Get-WmiObject Win32_ShadowCopy | Select-Object ID, VolumeName, InstallDate
 | `том не підтримує VSS` | джерело на мережевому диску або non-NTFS томі |
 | `недостатньо місця` | вичерпано shadow storage — розширте `vssadmin resize shadowstorage` |
 | writer у стані `Failed` | перезапустіть відповідну службу, потім `swprv` |
-| накопичились осиротілі знімки | попередні аварійні завершення; приберіть застарілі |
+| persisted orphan cleanup failed | перевірте exact IDs у `BRAVO_VSS_OWNERSHIP.json`, VSS/WMI і права SYSTEM; state не видаляється до успішного cleanup |
 
 **Ескалація.** Якщо VSS не відновлюється — S2, але з жорстким
 дедлайном: доки VSS зламаний, щоденних backup **немає взагалі**.
@@ -455,17 +563,16 @@ Get-WmiObject Win32_ShadowCopy | Select-Object ID, VolumeName, InstallDate
 **Симптом.** `Перевiрка цiлiсностi 7-Zip не пройдена` у секції
 `АРХІВАЦІЯ`.
 
-**Що означає.** Архів створено, але `7z test` або звірка SHA512 не
-підтвердили його придатність.
+**Що означає.** Тимчасовий архів створено, але `7z test` не підтвердив
+його придатність; final `.mdz` не опубліковано.
 
-**Чого не робити.** **Не видаляйте пошкоджений архів.** Він навмисно
-залишається на диску для діагностики. Не приймайте його як робочу
-копію — і не позначайте як перевірений вручну.
+**Чого не робити.** Не намагайтесь перейменувати `.partial`/`.work` у
+final backup і не позначайте неперевірений файл як робочу копію.
 
 **Діагностика.**
 
 ```powershell
-& "C:\LIMS\ARCHIV\Tools\7za.exe" t "<шлях до архіву>"
+& "C:\BRAVO\Tools\7za.exe" t "<шлях до тимчасового архіву>"
 Get-Volume | Select-Object DriveLetter, HealthStatus, SizeRemaining
 Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='disk','Ntfs'} -MaxEvents 50
 ```
@@ -482,10 +589,25 @@ Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='disk','Ntfs'} -M
 
 ---
 
+## `42` — помилка SHA512
+
+**Симптом.** `SHA512 generation/verification failed` або компонент `HASH`
+після успішного `7z t`.
+
+**Що означає.** Не вдалося створити sidecar, прочитати його назад або
+фактичний SHA512 архіву не збігся. Atomic publication не відбулася;
+попередній valid backup лишився незмінним.
+
+**Діагностика.** Перевірте права SYSTEM на destination і `.work`, вільне
+місце та помилки файлової системи. Запустіть `BRAVO_DRY_RUN.ps1` під тим
+самим task account через `BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess`.
+
+---
+
 ## `50` — помилка SFTP
 
-**Симптом.** Секція `ЗАВАНТАЖЕННЯ АРХІВІВ НА SFTP` або
-`СИНХРОНІЗАЦІЯ BAZA НА SFTP`.
+**Симптом.** Один із незалежних етапів `SFTP: резервні копії`,
+`SFTP: BAZA_APP`, `SFTP: BAZA_WWW` має `ERROR` або `WARNING`.
 
 **Що означає.** З'єднання, автентифікація або передача не вдались.
 Локальний архів при цьому вже створено.
@@ -766,14 +888,17 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
    .\BRAVO_SELF_TEST.ps1
    ```
 
-3. Перевірити архів **до** розпакування в production:
+3. Вибрати один `COMPLETE` `GenerationId` і перевірити весь generation
+   **до** розпакування в production:
 
    ```powershell
-   .\BRAVO_RESTORE_TEST.ps1 -ConfigPath ".\BRAVO.config"
+   .\BRAVO_RESTORE_TEST.ps1 -GenerationId "<yyyyMMdd_HHmmss>" -ConfigPath ".\BRAVO.config"
    ```
 
    Це read-only: розпаковує в ізольований тимчасовий каталог, звіряє
-   SHA512 і кількість файлів, нічого не змінює.
+   SHA512 і кількість файлів, нічого не змінює. MODEL, BLOG і BRAVOEXCH
+   мають походити з цього самого GenerationId; independently newest files
+   не утворюють логічно узгодженого restore set.
 
 4. Тільки після `PASS` — відновлювати в production.
 5. Налаштувати credentials (`-StoreFor Both`) і завдання заново.
@@ -786,6 +911,46 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
 
 ---
 
+## Manifest-и backup generation перенесено в `MANIFESTS\` (dev.14)
+
+Починаючи з dev.14, `BRAVO_BACKUP_<GenerationId>.json` (manifest конкретної
+генерації backup: статус, компоненти, шлях кожного архіву й хешу) лежить у
+`<BackupRoot>\MANIFESTS\`, а не безпосередньо в корені `<BackupRoot>`. Це
+третє, окреме сховище — на додачу до `LOGS\` (операційні журнали, розділ
+12) і `TEMP\` (одноразові runtime-файли): lifecycle manifest-а прив'язаний
+до generation (видаляється разом з нею при retention), а не до незалежних
+`LogDays`/`CompressedLogDays`.
+
+**Перенесення старих manifest-ів — автоматичне.** Перший же запуск
+`BRAVO_MAINTENANCE.ps1` після оновлення до dev.14 ідемпотентно переносить
+усі `BRAVO_BACKUP_*.json`, що лежать безпосередньо в корені `BackupRoot`, у
+`MANIFESTS\`. Ручних дій не потрібно. У логу Maintenance з'явиться рядок
+`Міграція manifest-ів backup у MANIFESTS: перенесено N; дедубльовано N;
+конфліктів N`. Повторні запуски після завершеної міграції нічого не
+переносять (idempotent no-op).
+
+**Якщо в логу є "конфліктів" > 0** — для одного й того самого
+`GenerationId` в корені `BackupRoot` і в `MANIFESTS\` лежать РІЗНІ файли
+(різний вміст, не просто дублікат). BRAVO жодного з них не видаляє й не
+перезаписує — обидва лишаються на місці, а читання (retention, `BRAVO_HEALTH`,
+`BRAVO_RESTORE_TEST`) завжди пріоритетно бере версію з `MANIFESTS\`.
+Це нетипова ситуація (звичайно означає, що хтось вручну редагував чи
+копіював manifest) — порівняйте обидва файли вручну (`generationId`,
+`status`, `components`) і видаліть застарілий, коли переконаєтесь, який
+саме коректний.
+
+**`BRAVO_HEALTH.ps1` лишається read-only** щодо цього сховища: він лише
+читає (з fallback на legacy-корінь, якщо `MANIFESTS\` ще не існує), ніколи
+не створює й не переносить файли. Відсутність `MANIFESTS\` одразу після
+оновлення, до першого запуску Maintenance, — не помилка, доки manifest-и
+доступні для читання в старому місці.
+
+Ніщо інше не змінюється: вміст архівів, 7-Zip, SHA512, VSS, SFTP/SMB-шляхи,
+дні retention backup (`archiveRetentionDays`, `minimumRetainedVerifiedBackups`)
+— усе працює так само, лише за іншого фізичного розташування manifest-файлу.
+
+---
+
 ## Регулярна профілактика
 
 | Періодичність | Дія |
@@ -794,3 +959,26 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
 | щомісяця | звірка `VERSION.json.sourceCommit` на сервері з розгорнутим релізом |
 | щокварталу | повне навчальне відновлення на окрему машину |
 | при кожному оновленні Tools | [процедура вище](#оновлення-7zaexe-або-winscp) |
+
+---
+
+## Operator notification UX
+
+Slack/Discord messages are first-response summaries:
+
+- ✅ SUCCESS means the operation/check passed and no action is required.
+- ⚠️ WARNING means BRAVO can continue, but the message names the concrete
+  operator action.
+- 🚨 CRITICAL means backup, integrity, credentials or maintenance safety is at
+  risk. Do not improvise around integrity failures; follow the relevant
+  runbook section and inspect the referenced log.
+
+The top of a warning/critical message contains the reason and action before
+server metadata. The log path at the bottom is the source for full technical
+evidence: long filenames, destination paths, thresholds and tool output remain
+there.
+
+Backup health wording:
+
+- SUCCESS: `Остання резервна копія`.
+- WARNING/ERROR: `Остання успішна резервна копія`.

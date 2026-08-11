@@ -16,6 +16,7 @@ param (
     [ValidateSet("on", "off")]
     [string]$ArchiveAfterMaintenance,
     [string]$ConfigPath,
+    [switch]$NoPause,
     [Parameter(Mandatory = $true)][string]$RuntimeRoot,
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
 )
@@ -23,7 +24,12 @@ param (
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
+# BRAVO.Discovery тут явно, а не "його ж імпортує BRAVO_CONFIG_LOADER.ps1":
+# ротація Trace й exchangAPI читає з нього Get-BRAVOServiceExecutablePath і
+# ConvertTo-BRAVOIniPathValue, а покладатися на порядок чужих імпортів для
+# власних залежностей — рівно та помилка, яку вже задокументовано в шапці
+# самого BRAVO.Discovery.
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -34,12 +40,25 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-$script:BRAVOWindowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
+# Свіжість накопичувальних оновлень Windows тут навмисно НЕ перевіряється:
+# це health-метрика, а не умова виконання обслуговування. Її місце в
+# BRAVO_HEALTH, який для цього й існує. Тут вона лише додавала WARNING (а
+# отже, ненульовий код завершення 10) до операції, на результат якої вік
+# патчів не впливає. Перевірки платформи (ОС, build, PowerShell, .NET,
+# архітектура, API) лишаються вище й на місці.
 $notificationHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Notifications\BRAVO.Notifications.psd1'
 if (-not (Test-Path -LiteralPath $notificationHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль notifications: $notificationHelpersPath"
 }
 Import-Module -Name $notificationHelpersPath -ErrorAction Stop
+
+# Пауза при ручному запуску мала охопити геть усі точки виходу нижче
+# (їх багато, розкидані по всьому файлу), а не лише останню. exit
+# всередині try ГАРАНТОВАНО проходить крізь усі finally на своєму шляху
+# (перевірено емпірично, включно з вкладеними try/catch/finally) — тому
+# один зовнішній try/finally навколо решти файлу безпечніше й надійніше,
+# ніж вставляти виклик паузи перед кожним окремим exit.
+try {
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
@@ -95,14 +114,18 @@ if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
 try {
     $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
     $configRoot = Split-Path -Path $ConfigPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    # Завантажувач і modules\ беруться з КОМПЛЕКТУ, а не з каталогу
+    # конфігурації: -ConfigPath може вказувати на C:\BRAVO\CONFIGS\SERVER1.config,
+    # де немає ні BRAVO_CONFIG_LOADER.ps1, ні modules\.
+    $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
-        -ConfigPath $ConfigPath
+        -ConfigPath $ConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
     $script:ScriptVersion = [string]$global:ScriptVersion
     $script:ScriptDate = [string]$global:ScriptDate
     $script:ScriptBuildId = [string]$global:ScriptBuildId
@@ -120,9 +143,10 @@ try {
         throw "У BRAVO.config відсутня секція maintenanceSettings"
     }
     if ($null -eq $pathSettings -or
-        [string]::IsNullOrWhiteSpace([string]$pathSettings.LIMSRoot) -or
-        [string]::IsNullOrWhiteSpace([string]$pathSettings.ArchiveRoot)) {
-        throw "У BRAVO.config відсутня або не заповнена секція pathSettings"
+        [string]::IsNullOrWhiteSpace([string]$effectiveLimsRoot) -or
+        [string]::IsNullOrWhiteSpace([string]$systemLogRoot) -or
+        [string]::IsNullOrWhiteSpace([string]$backupRootPath)) {
+        throw "У BRAVO.config не вдалося визначити ефективні корені (EffectiveLIMSRoot/SystemLogRoot/BackupRoot)"
     }
 } catch {
     Write-Host "ПОМИЛКА читання конфігурації '$ConfigPath': $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -ForegroundColor Red
@@ -146,7 +170,6 @@ $requiredConfigPaths = @(
     "Automation.ShutdownTimeoutSeconds",
     "Automation.ArchiveAfterMaintenance",
     "RangeIdMonitoring.Enabled",
-    "RangeIdMonitoring.FilePath",
     "RangeIdMonitoring.ThresholdPercent",
     "RangeIdMonitoring.CheckDelaySeconds",
     "Archiver.Parameters",
@@ -207,6 +230,17 @@ $RestoreTime = [string]$MaintenanceConfig.Restore.Time
 $RESTORE_ARCHIVES_KEEP_COUNT = [int]$MaintenanceConfig.Restore.ArchivesKeepCount
 $ARCHIVE_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.ArchiveDays
 $LOG_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.LogDays
+# Скільки днів зберігати вже стиснуті .mdz програмних журналів. Окрема
+# політика від ArchiveDays: та відповідає за момент пакування каталогу-дати,
+# ця — за момент видалення архіву. Старі конфігурації без ключа зберігають
+# архіви за тим самим строком, що й службові журнали Maintenance.
+$COMPRESSED_LOG_RETENTION_DAYS = if ($MaintenanceConfig.Retention -is [System.Collections.IDictionary] -and
+    $MaintenanceConfig.Retention.Contains("CompressedLogDays") -and
+    $null -ne $MaintenanceConfig.Retention.CompressedLogDays) {
+    [math]::Max(1, [int]$MaintenanceConfig.Retention.CompressedLogDays)
+} else {
+    $LOG_RETENTION_DAYS
+}
 $FAILED_ARCHIVE_RETENTION_DAYS = if ($null -ne $MaintenanceConfig.Retention.FailedArchiveDays) {
     [math]::Max(1, [int]$MaintenanceConfig.Retention.FailedArchiveDays)
 } else {
@@ -317,7 +351,11 @@ try {
 }
 
 $RangeIdMonitoringEnabled = [System.Convert]::ToBoolean($MaintenanceConfig.RangeIdMonitoring.Enabled)
-$RangeIdLogPath = [Environment]::ExpandEnvironmentVariables([string]$MaintenanceConfig.RangeIdMonitoring.FilePath)
+$RangeIdLogPath = if ($RangeIdMonitoringEnabled) {
+    Get-BRAVOSystemRangeIdLogPath
+} else {
+    $null
+}
 $RangeIdThresholdPercent = [double]$MaintenanceConfig.RangeIdMonitoring.ThresholdPercent
 $RangeIdCheckDelaySeconds = [int]$MaintenanceConfig.RangeIdMonitoring.CheckDelaySeconds
 $arcCommonParams = @($MaintenanceConfig.Archiver.Parameters | ForEach-Object { [string]$_ })
@@ -392,7 +430,7 @@ if ($invalidExcludedDrives.Count -gt 0) {
 }
 
 if ($RangeIdMonitoringEnabled -and [string]::IsNullOrWhiteSpace($RangeIdLogPath)) {
-    Write-Host "ПОМИЛКА: Для моніторингу діапазонів ID потрібно вказати RangeIdMonitoring.FilePath" -ForegroundColor Red
+    Write-Host "ПОМИЛКА: Не вдалося визначити системний шлях до файлу контролю діапазонів ID" -ForegroundColor Red
     exit 30
 }
 
@@ -515,11 +553,49 @@ if ($ApacheServiceExists) {
         $serviceStartType -ieq "Disabled"
     )
 }
-$BravoWebMaintenanceEnabled = (
-    $BravoWebComponentEnabled -and
-    $ApacheServiceExists -and
-    -not $BravoWebServiceDisabledBySystem
-)
+function Get-BRAVOBravoWebComponentPlan {
+    [CmdletBinding()]
+    param(
+        [bool]$ComponentEnabled,
+        [bool]$ServiceExists,
+        [bool]$ServiceDisabled,
+        [int]$ServiceMatchCount
+    )
+
+    $manageInstalledService = $ComponentEnabled -and $ServiceExists -and -not $ServiceDisabled
+    return [pscustomobject]@{
+        SilentlySkipped = $ComponentEnabled -and -not $ServiceExists
+        ManageService = $manageInstalledService
+        WarnDuplicateService = $ServiceExists -and $ServiceMatchCount -gt 1
+        WarningCountDelta = 0
+        # Legacy web data is part of the optional component: it is handled
+        # only when BRAVO Web is enabled and an installed service identifies
+        # the component. A disabled installed service still keeps its data.
+        IncludeLegacyWebData = $ComponentEnabled -and $ServiceExists
+    }
+}
+
+function Get-BRAVOOptionalServiceComponentPlan {
+    [CmdletBinding()]
+    param(
+        [bool]$ServiceExists,
+        [bool]$ServiceDisabled
+    )
+
+    return [pscustomobject]@{
+        SilentlySkipped = -not $ServiceExists
+        ManageService = $ServiceExists -and -not $ServiceDisabled
+        IncludeLegacyData = $ServiceExists
+    }
+}
+
+$bravoWebComponentPlan = Get-BRAVOBravoWebComponentPlan `
+    -ComponentEnabled $BravoWebComponentEnabled `
+    -ServiceExists $ApacheServiceExists `
+    -ServiceDisabled $BravoWebServiceDisabledBySystem `
+    -ServiceMatchCount $BravoWebServiceMatchCount
+$BravoWebMaintenanceEnabled = [bool]$bravoWebComponentPlan.ManageService
+$BravoWebLegacyDataEnabled = [bool]$bravoWebComponentPlan.IncludeLegacyWebData
 
 # Стан основних служб визначається до будь-яких дій з їх компонентами.
 # Відсутня або системно відключена служба повністю вимикає свій компонент.
@@ -656,7 +732,11 @@ $BravoMaintenanceEnabled = $bravoServiceState.Enabled
 $exchangAPIServiceState = Get-ConfiguredServiceState -Name $ExchangAPIServiceName
 $exchangAPIService = $exchangAPIServiceState.Service
 $exchangAPIServiceDisabled = $exchangAPIServiceState.Disabled
-$exchangAPIServiceEnabled = $exchangAPIServiceState.Enabled
+$exchangeApiComponentPlan = Get-BRAVOOptionalServiceComponentPlan `
+    -ServiceExists $exchangAPIServiceState.Exists `
+    -ServiceDisabled $exchangAPIServiceDisabled
+$exchangAPIServiceEnabled = [bool]$exchangeApiComponentPlan.ManageService
+$exchangAPILegacyDataEnabled = [bool]$exchangeApiComponentPlan.IncludeLegacyData
 
 # ===== ГЛОБАЛЬНІ ЗМІННІ (НЕ ЗМІНЮВАТИ) =====
 $script:ScriptStartTime = [DateTime]::Now
@@ -675,8 +755,15 @@ $script:restoreArchiveFailed = $false
 $script:restoreIntegrityFailed = $false
 
 function Enter-BRAVOMaintenanceOperationLock {
-    $lockPath = Join-Path $LOG_DIR "BRAVO_OPERATION.lock"
+    $lockPath = [string]$operationLockSettings.Path
     try {
+        if ([string]::IsNullOrWhiteSpace($lockPath)) {
+            throw 'operationLockSettings.Path не задано'
+        }
+        $lockDirectory = Split-Path -Path $lockPath -Parent
+        if (-not (Test-Path -LiteralPath $lockDirectory -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $lockDirectory -Force -ErrorAction Stop)
+        }
         $waitMinutes = if ($null -ne $schedulerSettings -and
             $schedulerSettings.Contains("OperationLockWaitMinutes")) {
             [math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)
@@ -719,6 +806,7 @@ function Enter-BRAVOMaintenanceOperationLock {
             startedAt = (Get-Date).ToString("o")
             packageVersion = [string]$script:ScriptVersion
             config = $ConfigPath
+            generationId = $null
         } | ConvertTo-Json -Compress)
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
         $stream.SetLength(0)
@@ -745,15 +833,8 @@ function Exit-BRAVOMaintenanceOperationLock {
         $script:maintenanceOperationLock.Dispose()
         $script:maintenanceOperationLock = $null
     }
-    if (-not [string]::IsNullOrWhiteSpace(
-            [string]$script:maintenanceOperationLockPath
-        ) -and
-        (Test-Path -LiteralPath $script:maintenanceOperationLockPath -PathType Leaf)) {
-        Remove-Item `
-            -LiteralPath $script:maintenanceOperationLockPath `
-            -Force `
-            -ErrorAction SilentlyContinue
-    }
+    # Stale metadata file is expected; only the exclusive handle indicates
+    # that Archive or Maintenance is currently active.
     $script:maintenanceOperationLockPath = $null
 }
 
@@ -802,23 +883,62 @@ if ($ArchiveAfterMaintenance -notin @("on", "off")) {
 
 $script:EnableArchiveAfterMaintenance = ($ArchiveAfterMaintenance -eq "on")
 
+# dev.14 (round 3): -NoPause керує ЛИШЕ тим, чи скрипт чекає на клавішу
+# наприкінці (Wait-BRAVOManualExit) — це UX-перемикач, який адміністратор
+# може передати вручну (наприклад, з CI чи скрипта), не перетворюючись від
+# цього на "заплановане завдання". Режим у заголовку має відображати
+# ФАКТИЧНЕ джерело запуску: SYSTEM (S-1-5-18, той самий SID, що вже
+# визначає гілку елевації вище) — це SCHEDULED; будь-хто інший — MANUAL,
+# незалежно від -NoPause. Pure-функція: жодного власного звернення до
+# WindowsIdentity/WindowsPrincipal — SID завжди приходить від виклику
+# (вже обчислений $currentIdentity.User.Value вище), щоб залишатися
+# тестованою на детермінованих вхідних без реальної системної ідентичності.
+function Get-BRAVOMaintenanceExecutionMode {
+    param([Parameter(Mandatory = $true)][string]$UserSid)
+
+    if ($UserSid -eq 'S-1-5-18') {
+        return 'SCHEDULED'
+    }
+    return 'MANUAL'
+}
+
 # ===== ОПЕРАЦІЙНА КОНСОЛЬ =====
-# Нумерація етапів: [1/9], [2/9], ... Ті самі елементи виводу, що в Archive
+# Нумерація етапів: [1/8], [2/8], ... Ті самі елементи виводу, що в Archive
 # і Health: заголовок, етапи, підсумок.
 $script:BRAVOMaintenanceStepCurrent = 0
 $script:BRAVOMaintenanceStepTotal = 0
+$script:BRAVOMaintenanceLastStepTime = $null
+# dev.14 (round 2): підсумкові лічильники operator console ("Кроків/
+# Успішно/Попереджень/Пропущено/Помилок" у фінальному РЕЗУЛЬТАТ) — той
+# самий підхід, що BRAVOHealthStepOkCount/.../BRAVOHealthStepErrorCount
+# у BRAVO.Health.Runtime.ps1, лише з додатковим SKIPPED-лічильником
+# (Maintenance, на відміну від Health, регулярно показує SKIPPED-кроки).
+$script:BRAVOMaintenanceStepOkCount = 0
+$script:BRAVOMaintenanceStepWarnCount = 0
+$script:BRAVOMaintenanceStepSkippedCount = 0
+$script:BRAVOMaintenanceStepFailCount = 0
 
 function Initialize-BRAVOMaintenanceSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
 
     $script:BRAVOMaintenanceStepCurrent = 0
     $script:BRAVOMaintenanceStepTotal = [Math]::Max(1, $Total)
+    $script:BRAVOMaintenanceLastStepTime = Get-Date
+    $script:BRAVOMaintenanceStepOkCount = 0
+    $script:BRAVOMaintenanceStepWarnCount = 0
+    $script:BRAVOMaintenanceStepSkippedCount = 0
+    $script:BRAVOMaintenanceStepFailCount = 0
 }
 
 # Статус етапу рахується від ЗРІЗУ лічильників перед блоком, а не від
 # їхнього абсолютного значення: $script:criticalErrorOccurred накопичується
 # до кінця запуску, тому без зрізу одна рання помилка пофарбувала б у
 # червоне всі наступні етапи, які насправді відпрацювали.
+#
+# dev.14 (round 2): словник статусів operator console — рівно OK/SKIPPED/
+# WARN/FAIL (docs/OPERATOR_CONSOLE_UX.md), без WARNING/ERROR/SUCCESS/PASS,
+# щоб таблиця кроків Maintenance не змішувала кілька словників в одному
+# прогоні.
 function Get-BRAVOMaintenanceStepStatus {
     param(
         [bool]$CriticalBefore,
@@ -830,29 +950,127 @@ function Get-BRAVOMaintenanceStepStatus {
         return 'SKIPPED'
     }
     if ($script:criticalErrorOccurred -and -not $CriticalBefore) {
-        return 'ERROR'
+        return 'FAIL'
     }
     if ($script:BRAVOWarningCount -gt $WarningsBefore) {
-        return 'WARNING'
+        return 'WARN'
     }
     return 'OK'
+}
+
+# dev.19 (виправлено): ЄДИНА канонічна точка числового exit-code —
+# та сама пріоритетна політика (критичний > попередження > успіх, з
+# розподілом critical на 40/41/60 через Resolve-BRAVOExitCode), яка
+# раніше була inline-блоком нижче ($script:maintenanceRuntimeExitCode =
+# if (...) {...}). Вона не дублюється — і "поточний знімок" для
+# Send-FinalReport (виконується ВСЕРЕДИНІ зовнішнього try, ДО його catch
+# — стан теоретично ще може змінитися до кінця try), і СПРАВЖНЄ фінальне
+# значення (після catch, перед ЗАВЕРШЕННЯМ СКРИПТУ) отримують число
+# через РІВНО цей виклик. Resolve-BRAVOExitCode лишається джерелом істини для самих
+# кодів; тут лише те саме зведення трьох script-scope прапорців, що
+# раніше було записане прямо в місці присвоєння.
+function Get-BRAVOMaintenanceResolvedExitCode {
+    if ($script:criticalErrorOccurred) {
+        return Resolve-BRAVOExitCode `
+            -LocalArchiveFailed:$script:restoreArchiveFailed `
+            -IntegrityTestFailed:$script:restoreIntegrityFailed `
+            -MaintenanceFailed
+    }
+    if ($script:BRAVOWarningCount -gt 0) {
+        return Resolve-BRAVOExitCode -HasWarnings
+    }
+    return 0
+}
+
+# dev.19 (виправлено): єдина канонічна точка "людський текст фінального
+# статусу" — ЛОГ (=== СТАТУС: ... ===), консольне РЕЗУЛЬТАТ (поле
+# "Статус") і фінальне success-повідомлення (Send-FinalReport) читають
+# текст ЗВІДСИ. На відміну від першої версії dev.19, ця функція більше
+# НЕ інспектує $script:criticalErrorOccurred/$script:BRAVOWarningCount
+# самостійно (те була паралельна, хоч і узгоджена, класифікаційна
+# політика) — вона класифікує РЕЗОЛЬВЛЕНИЙ числовий код через
+# Get-BRAVOExitCodeName (BRAVO.ExitCodes, те саме джерело істини, що
+# вже показує "Код завершення:" у РЕЗУЛЬТАТ нижче). default-гілка
+# покриває 40/41/60 і будь-який інший неуспішний/не-warning код без
+# перелічення кожного окремо. Реальний DEV-LIMS запуск: відсутній
+# Range ID log (WARN-only, семантика НЕ змінена) -> exit 10
+# (SuccessWithWarnings), але ЛОГ і фінальне повідомлення раніше
+# незалежно показували "УСПІШНО" без жодної згадки про попередження.
+function Get-BRAVOMaintenanceFinalStatus {
+    param([Parameter(Mandatory = $true)][int]$ExitCode)
+
+    switch (Get-BRAVOExitCodeName -Code $ExitCode) {
+        'Success' {
+            return [pscustomobject]@{
+                Text = 'УСПІШНО'
+                Color = [ConsoleColor]::Green
+            }
+        }
+        'SuccessWithWarnings' {
+            return [pscustomobject]@{
+                Text = 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'
+                Color = [ConsoleColor]::Yellow
+            }
+        }
+        default {
+            return [pscustomobject]@{
+                Text = 'ПОМИЛКА'
+                Color = [ConsoleColor]::Red
+            }
+        }
+    }
 }
 
 function Write-BRAVOMaintenanceStep {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
-        [ValidateSet('OK', 'SKIPPED', 'WARNING', 'ERROR')]
+        [ValidateSet('OK', 'SKIPPED', 'WARN', 'FAIL')]
         [string]$Status = 'OK',
         [string]$Details
     )
 
     $script:BRAVOMaintenanceStepCurrent++
+    switch ($Status) {
+        'OK'      { $script:BRAVOMaintenanceStepOkCount++ }
+        'WARN'    { $script:BRAVOMaintenanceStepWarnCount++ }
+        'SKIPPED' { $script:BRAVOMaintenanceStepSkippedCount++ }
+        'FAIL'    { $script:BRAVOMaintenanceStepFailCount++ }
+    }
+    # Тривалість кроку — час від попереднього кроку (чи від Initialize, для
+    # першого). Той самий підхід, що в Health: жоден із ~9 кроків не має
+    # власного таймера, і додавати його кожному окремо — набагато більший
+    # ризик регресії, ніж один спільний облік тут.
+    $stepDuration = $null
+    if ($null -ne $script:BRAVOMaintenanceLastStepTime) {
+        $stepDuration = (Get-Date) - $script:BRAVOMaintenanceLastStepTime
+    }
+    $script:BRAVOMaintenanceLastStepTime = Get-Date
     Write-BRAVOStepResult `
         -Current $script:BRAVOMaintenanceStepCurrent `
         -Total $script:BRAVOMaintenanceStepTotal `
         -Name $Name `
         -Status $Status `
-        -Details $Details
+        -Duration $stepDuration
+
+    # -Duration і -Details у Write-BRAVOStepResult взаємовиключні за
+    # дизайном (перше вже зайняло рядок статусу) — тому Details, коли є,
+    # друкується під рядком етапу окремим викликом.
+    #
+    # dev.14 (round 3): рівно 6 пробілів відступу, БЕЗ автоматичного
+    # префіксу "Причина:"/"Деталі:" для жодного статусу (OK/WARN/FAIL/
+    # SKIPPED) — сам колір/слово статусу в рядку етапу вище вже пояснює
+    # severity, дублювати її текстовим підписом під деталлю не потрібно.
+    # Write-BRAVOConsoleDetail — єдиний спільний рендерер із таким
+    # відступом (Write-BRAVOStepDetail відступу не додає; Write-BRAVOSkipReason/
+    # Write-BRAVOOperatorReason — не той стиль, що потрібен тут). Details
+    # може бути багаторядковим (наприклад "причина:`nшлях") — Write-Host
+    # додає відступ лише перед ПЕРШИМ рядком свого аргументу, тому кожен
+    # рядок друкується окремим викликом, щоб відступ був однаковий на всіх.
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        foreach ($detailLine in ($Details -split "`r?`n")) {
+            Write-BRAVOConsoleDetail -Message $detailLine
+        }
+    }
 }
 
 # ===== ФУНКЦІЯ ЛОГУВАННЯ =====
@@ -861,7 +1079,14 @@ function Write-Log {
         [string]$Message,
         [string]$Level = "INFO",
         [int]$SeparatorLength = 100,
-        [switch]$NoTimestamp
+        [switch]$NoTimestamp,
+        # dev.15: для повідомлень, які й так вже показані оператору іншим
+        # шляхом (наприклад Details операційного кроку) — LOG-файл і
+        # сповіщення (Send-SlackAlert викликається окремо, не звідси)
+        # лишаються незмінними, друк у консоль пропускається. За
+        # замовчуванням вимкнено — жоден існуючий виклик Write-Log не змінює
+        # поведінку.
+        [switch]$NoConsole
     )
 
     # Пароль архіву, webhook чи URL з обліковими даними можуть потрапити
@@ -912,9 +1137,19 @@ function Write-Log {
     
     # Роздільники й заголовки формували структуру старої консолі. Тепер її
     # задають етапи (Write-BRAVOMaintenanceStep), тому в консоль вони більше
-    # не йдуть — але лишаються у файлі, щоб хронологія читалася як раніше.
+    # не йдуть.
+    # dev.19: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
+    # журнал (той самий підхід, що вже Archive dev.18). Реальний DEV-LIMS
+    # лог показав рядки лише зі 100 символами "=" між звичайними секціями
+    # — без жодної діагностичної цінності, бо кожен такий виклик стоїть
+    # безпосередньо перед "=== ЗАГОЛОВОК ===", який і так фіксує ту саму
+    # мить повним текстом. Застосовано однаково і до звичайних секцій, і
+    # до початкового/фінального банера (той самий виклик, той самий
+    # аргумент "===" — немає окремого "banner-only" шляху в коді; два
+    # сусідні реальні заголовки банера ("СИСТЕМА ОБСЛУГОВУВАННЯ..."/
+    # "УСТАНОВА: ...") лишаються чіткими і без обрамляючих "===" рядків).
+    # Заголовки нижче (гілка "=== ... ===") лишаються повністю без змін.
     if ($Message -eq "=" -or $Message -eq "===") {
-        Write-BRAVOMaintenanceLogFile -Entry ("=" * $SeparatorLength)
         return
     }
 
@@ -937,7 +1172,7 @@ function Write-Log {
         }
     }
 
-    if ($messageLevel -ge $consoleThreshold) {
+    if (-not $NoConsole -and $messageLevel -ge $consoleThreshold) {
         Write-BRAVOConsoleMessage -Message $consoleEntry -Level $normalizedLevel
     }
 
@@ -996,34 +1231,45 @@ function Invoke-AutoShutdown {
             
             if ($result -eq [System.Windows.Forms.DialogResult]::Yes) {
                 Write-Log -Message "Користувач скасував вимкнення системи" -Level "INFO"
-                
+
                 # Скасовуємо вимкнення
                 $cancelProcess = Start-Process "shutdown" -ArgumentList "/a" -Wait -PassThru -NoNewWindow
-                
+
                 if ($cancelProcess.ExitCode -eq 0) {
                     Write-Log -Message "Вимкнення успішно скасовано" -Level "SUCCESS"
-                    [System.Windows.Forms.MessageBox]::Show("Вимкнення скасовано! Система продовжить роботу.", "BravoSoft", 
-                        [System.Windows.Forms.MessageBoxButtons]::OK, 
+                    [System.Windows.Forms.MessageBox]::Show("Вимкнення скасовано! Система продовжить роботу.", "BravoSoft",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Information)
+                    # dev.16: оператор інтерактивно скасував УЖЕ заплановане
+                    # вимкнення, і команда /a відпрацювала штатно — системного
+                    # вимкнення не відбудеться. Відрізняється від "Failed"
+                    # (сама scheduling-команда вище виконалась успішно).
+                    return 'Cancelled'
                 } else {
                     Write-Log -Message "Не вдалося скасувати вимкнення" -Level "ERROR"
-                    [System.Windows.Forms.MessageBox]::Show("Не вдалося скасувати вимкнення. Спробуйте виконати команду вручну: shutdown /a", "Помилка", 
-                        [System.Windows.Forms.MessageBoxButtons]::OK, 
+                    [System.Windows.Forms.MessageBox]::Show("Не вдалося скасувати вимкнення. Спробуйте виконати команду вручну: shutdown /a", "Помилка",
+                        [System.Windows.Forms.MessageBoxButtons]::OK,
                         [System.Windows.Forms.MessageBoxIcon]::Warning)
+                    # Спроба скасування не вдалась — вимкнення лишається
+                    # запланованим (shutdown-команда вище виконалась штатно),
+                    # система фактично вимкнеться.
+                    return 'Scheduled'
                 }
             } else {
                 Write-Log -Message "Користувач підтвердив вимкнення системи" -Level "INFO"
-                [System.Windows.Forms.MessageBox]::Show("Система буде вимкнена через $Timeout секунд.", "BravoSoft", 
-                    [System.Windows.Forms.MessageBoxButtons]::OK, 
+                [System.Windows.Forms.MessageBox]::Show("Система буде вимкнена через $Timeout секунд.", "BravoSoft",
+                    [System.Windows.Forms.MessageBoxButtons]::OK,
                     [System.Windows.Forms.MessageBoxIcon]::Information)
+                return 'Scheduled'
             }
-            
         } else {
             Write-Log -Message "Помилка ініціювання вимкнення системи. Код помилки: $($process.ExitCode)" -Level "ERROR"
+            return 'Failed'
         }
     }
     catch {
         Write-Log -Message "Помилка під час спроби вимкнення системи: $($_.Exception.Message)" -Level "ERROR"
+        return 'Failed'
     }
 }
 
@@ -1042,6 +1288,54 @@ function Format-Duration {
     } else {
         return "$($duration.Seconds) сек."
     }
+}
+
+function Write-BRAVOMaintenanceEarlyFailureSummary {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$EndedAt,
+        [Parameter(Mandatory = $true)][int]$ExitCode
+    )
+
+    $duration = $EndedAt - $script:ScriptStartTime
+    $finalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $ExitCode
+
+    Write-Log -Message "==="
+    Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАВЕРШИЛА РОБОТУ ==="
+    Write-Log -Message "=== УСТАНОВА: $($script:ObjectName) ==="
+    Write-Log -Message "=== ЧАС ВИКОНАННЯ: $(Format-Duration $duration) ==="
+    Write-Log -Message "=== СТАТУС: $($finalStatus.Text) ==="
+    Write-Log -Message "==="
+
+    Write-BRAVOFinalSummaryHeader `
+        -Title 'BRAVO MAINTENANCE' `
+        -Status $finalStatus.Text `
+        -StatusColor $finalStatus.Color
+    $earlySummaryFields = [ordered]@{
+        'Статус' = $finalStatus.Text
+        'Код завершення' = ("{0} — {1}" -f $ExitCode, (Get-BRAVOExitCodeName -Code $ExitCode))
+        'Початок' = $script:ScriptStartTime.ToString('dd.MM.yyyy HH:mm:ss')
+        'Завершення' = $EndedAt.ToString('dd.MM.yyyy HH:mm:ss')
+        'Тривалість' = Format-BRAVODuration -Duration $duration
+    }
+    foreach ($field in $earlySummaryFields.GetEnumerator()) {
+        if ($field.Key -eq 'Статус') {
+            Write-BRAVOResultField -Label ([string]$field.Key) -Value ([string]$field.Value) -Color $finalStatus.Color
+        } else {
+            Write-BRAVOResultField -Label ([string]$field.Key) -Value ([string]$field.Value)
+        }
+    }
+    Write-BRAVOResultBlankLine
+    $earlySummaryCounters = [ordered]@{
+        'Кроків' = $script:BRAVOMaintenanceStepCurrent
+        'Успішно' = $script:BRAVOMaintenanceStepOkCount
+        'Попереджень' = $script:BRAVOMaintenanceStepWarnCount
+        'Пропущено' = $script:BRAVOMaintenanceStepSkippedCount
+        'Помилок' = $script:BRAVOMaintenanceStepFailCount
+    }
+    foreach ($counter in $earlySummaryCounters.GetEnumerator()) {
+        Write-BRAVOResultField -Label ([string]$counter.Key) -Value ([string]$counter.Value)
+    }
+    Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
 }
 
 # Перетворення числового дня в об'єкт DayOfWeek
@@ -1067,7 +1361,7 @@ function Get-BRAVORestoreScheduledOccurrence {
 }
 
 function Read-BRAVORestoreState {
-    $path = Join-Path $LOG_DIR 'BRAVO_RESTORE_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
     try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
     catch { Write-Log -Message "Не вдалося прочитати restore state: $($_.Exception.Message)" -Level 'WARNING'; return $null }
@@ -1075,7 +1369,10 @@ function Read-BRAVORestoreState {
 
 function Write-BRAVORestoreState {
     param([datetime]$ScheduledOccurrence, [string]$Status, [string]$Reason)
-    $path = Join-Path $LOG_DIR 'BRAVO_RESTORE_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
     $state = [pscustomobject]@{
         ScheduledOccurrence = $ScheduledOccurrence.ToString('o')
         Status = $Status
@@ -1086,7 +1383,7 @@ function Write-BRAVORestoreState {
 }
 
 function Get-BRAVOTaskExecutionState {
-    $path = Join-Path $LOG_DIR 'BRAVO_TASK_EXECUTION_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
     try {
         $state = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
@@ -1096,7 +1393,10 @@ function Get-BRAVOTaskExecutionState {
 
 function Write-BRAVOTaskExecutionState {
     param([ValidateSet('Maintenance')][string]$TaskName)
-    $path = Join-Path $LOG_DIR 'BRAVO_TASK_EXECUTION_STATE.json'
+    $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
     $state = Get-BRAVOTaskExecutionState
     $state[$TaskName] = ([datetime]::Now).ToString('o')
     [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
@@ -1115,51 +1415,123 @@ function New-MaintenanceNotificationMessage {
         [string]$LogPath
     )
 
-    $currentTime = Get-Date
-    $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-    $dateText = $currentTime.ToString("dd MMMM yyyy", $ukrainianCulture).Replace(" р.", "")
     $hostInformation = Get-HostInformation
+    # dev.19 (виправлено): ":warning:" перевіряється ПЕРШИМ. Раніше
+    # "$Title -match 'УСПІШ'" мав пріоритет над TitleEmoji, тому
+    # виклик Send-FinalReport з Title "... УСПІШНО З ПОПЕРЕДЖЕННЯМИ" і
+    # TitleEmoji ":warning:" усе одно отримував би severity=SUCCESS
+    # (Title і далі містить підрядок "УСПІШ") — суперечлива презентація:
+    # ⚠️-іконка зовні, але "Дій не потрібно"/SUCCESS-набір рядків
+    # усередині. Для трьох інших наявних викликів New-MaintenanceNotificationMessage
+    # результат ідентичний обом порядкам (жоден не поєднує ":warning:" з
+    # Title, що містить "УСПІШ").
+    $severity = if ($TitleEmoji -eq ":warning:") {
+        "WARNING"
+    } elseif ($TitleEmoji -eq ":white_check_mark:" -or $Title -match "УСПІШ") {
+        "SUCCESS"
+    } else {
+        "CRITICAL"
+    }
+    $operation = if ($severity -eq "SUCCESS") {
+        "BRAVO MAINTENANCE — УСПІШНО"
+    } else {
+        "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ"
+    }
+    $detailsTextForAction = (@($Details) -join "`n")
+    $actionText = if ($severity -eq "SUCCESS") {
+        "Дій не потрібно"
+    } elseif ($Title -match "місц|диск|space" -or $detailsTextForAction -match "Недостатньо вільного місця|залишилось .* потрібно мінімум") {
+        "звільнити місце на проблемному диску або перевірити доступність дисків."
+    } else {
+        "перевірити журнал BRAVO_MAINTENANCE."
+    }
+    $buildIdText = if ([string]::IsNullOrWhiteSpace([string]$script:ScriptBuildId)) {
+        "невідома"
+    } else {
+        [string]$script:ScriptBuildId
+    }
 
-    $lines = @(
-        "$TitleEmoji *$Title*",
-        ":derelict_house_building: Установа: $($script:ObjectName)",
-        ":desktop_computer: Машина: $($hostInformation.MachineName)",
-        ":globe_with_meridians: IP-адреси: $($hostInformation.LocalIP) | $($hostInformation.PublicIP)",
-        ":spiral_calendar_pad: $dateText • $($currentTime.ToString('HH:mm:ss')) • :hourglass_flowing_sand: $(Format-Duration $Duration)",
-        "🏷️ Версія BRAVO_MAINTENANCE: $($script:ScriptVersion) від $($script:ScriptDate) (build $(if ([string]::IsNullOrWhiteSpace($script:ScriptBuildId)) { 'невідома' } else { $script:ScriptBuildId }))"
-    )
-
+    $resultLines = New-Object System.Collections.Generic.List[string]
     $nonEmptyStatusLines = @($StatusLines | Where-Object {
         -not [string]::IsNullOrWhiteSpace([string]$_)
     })
     if ($nonEmptyStatusLines.Count -gt 0) {
-        $lines += ""
-        $lines += $nonEmptyStatusLines
+        foreach ($line in $nonEmptyStatusLines) {
+            $resultLines.Add([string]$line)
+        }
     }
 
-    $detailLines = @()
+    $detailLines = New-Object System.Collections.Generic.List[string]
     foreach ($detail in @($Details)) {
         foreach ($detailLine in ([string]$detail -split "\r?\n")) {
             # При копіюванні деякі клієнти додають коми до порожніх рядків.
             # Нормалізуємо їх і зберігаємо початкове маркування деталей.
             $trimmedDetail = $detailLine.Trim().TrimEnd(",").Trim()
             if (-not [string]::IsNullOrWhiteSpace($trimmedDetail)) {
-                $detailLines += $trimmedDetail
+                $detailLines.Add($trimmedDetail)
             }
         }
     }
     if ($detailLines.Count -gt 0) {
-        $lines += ""
-        $lines += ":pushpin: Деталі подій:"
-        $lines += $detailLines
+        $spaceDetailRendered = $false
+        foreach ($detailLine in $detailLines) {
+            if ($severity -ne "SUCCESS" -and
+                [string]$detailLine -match 'диск\s+([A-Z]:):?\s+залишилось\s+([0-9]+([.,][0-9]+)?)\s+GB,\s+потрібно мінімум\s+([0-9]+([.,][0-9]+)?)\s+GB') {
+                $driveName = [string]$Matches[1]
+                $freeGb = [double](([string]$Matches[2]).Replace(',', '.'))
+                $minimumGb = [double](([string]$Matches[4]).Replace(',', '.'))
+                $deficitGb = [math]::Round(($minimumGb - $freeGb), 2)
+                $resultLines.Add(":x: Недостатньо вільного місця на диску $driveName")
+                $resultLines.Add("Потрібна дія: звільнити щонайменше $deficitGb ГБ.")
+                $resultLines.Add("")
+                $resultLines.Add(":floppy_disk: $driveName")
+                $resultLines.Add("Вільно: $freeGb ГБ")
+                $resultLines.Add("Мінімум: $minimumGb ГБ")
+                $resultLines.Add("Дефіцит: $deficitGb ГБ")
+                $spaceDetailRendered = $true
+            } elseif (-not $spaceDetailRendered) {
+                $resultLines.Add($detailLine)
+            }
+        }
     }
 
-    if (-not [string]::IsNullOrWhiteSpace($LogPath)) {
-        $lines += ""
-        $lines += ":memo: Журнал обслуговування: $LogPath"
-    }
+    return New-BRAVOOperatorNotificationMessage `
+        -Severity $severity `
+        -Operation $operation `
+        -ActionText $actionText `
+        -InstitutionName ([string]$script:ObjectName) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines.ToArray() `
+        -Timestamp (Get-Date) `
+        -Duration $Duration `
+        -TimestampLabel "Перевірено" `
+        -ProductName "BRAVO Maintenance" `
+        -Version ([string]$script:ScriptVersion) `
+        -BuildId $buildIdText `
+        -LogPath $LogPath `
+        -LogLabel "Журнал"
+}
 
-    return $lines -join [Environment]::NewLine
+function Get-MaintenanceMinimumFreeSpaceLines {
+    $minimumLine = $null
+    $minimumFreeGb = $null
+    foreach ($driveLine in @($script:freeSpaceSummary)) {
+        if ([string]$driveLine -match '^([A-Z]:)\s+([0-9]+([.,][0-9]+)?)\s+GB') {
+            $freeGb = [double](([string]$Matches[2]).Replace(',', '.'))
+            if ($null -eq $minimumFreeGb -or $freeGb -lt $minimumFreeGb) {
+                $minimumFreeGb = $freeGb
+                $minimumLine = "$($Matches[1]) $freeGb ГБ"
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($minimumLine)) {
+        return @(":floppy_disk: Мінімальний запас: немає даних")
+    }
+    return @(
+        ":floppy_disk: Мінімальний запас:",
+        $minimumLine,
+        "Порогове значення: $MIN_FREE_SPACE ГБ"
+    )
 }
 
 
@@ -1349,11 +1721,20 @@ function Test-RangeIdUsage {
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         $errorMessage = "Файл контролю діапазонів ID не знайдено: $Path"
-        Write-Log $errorMessage -Level "WARNING"
+        # dev.15: -NoConsole — виклик кроку нижче й так друкує Reason як
+        # Details під рядком [N/8] (WARN), тому голий Write-Log у консоль
+        # був би тим самим повідомленням удруге. LOG-файл і сповіщення
+        # (Send-SlackAlert -IsCritical, errors_only) лишаються незмінними.
+        Write-Log $errorMessage -Level "WARNING" -NoConsole
         # Без вихідного файла неможливо підтвердити стан ID-інтервалів.
         # Критичний статус забезпечує сповіщення і в режимі errors_only.
         Send-SlackAlert -Message $errorMessage -IsCritical
-        return
+        # Details під кроком — два рядки (мітка + шлях окремо), а не один
+        # довгий рядок; LOG/Slack і далі отримують односрядковий $errorMessage.
+        return [pscustomobject]@{
+            HasIssue = $true
+            Reason = "Файл контролю діапазонів ID не знайдено:`n$Path"
+        }
     }
 
     $rangeData = $null
@@ -1385,8 +1766,9 @@ function Test-RangeIdUsage {
     }
 
     if ($readError -or -not $rangeData) {
-        Write-Log "Не вдалося прочитати файл контролю діапазонів ID '$Path': $($readError.Exception.Message)" -Level "WARNING"
-        return
+        $readErrorMessage = "Не вдалося прочитати файл контролю діапазонів ID '$Path': $($readError.Exception.Message)"
+        Write-Log $readErrorMessage -Level "WARNING" -NoConsole
+        return [pscustomobject]@{ HasIssue = $true; Reason = $readErrorMessage }
     }
 
     $rangeEntries = @()
@@ -1428,7 +1810,7 @@ function Test-RangeIdUsage {
 
     if ($exceededRanges.Count -eq 0) {
         Write-Log "Діапазони ID не перевищують поріг $($ThresholdPercent)% (файл: $Path, кодування: $detectedEncoding)" -Level "INFO"
-        return
+        return [pscustomobject]@{ HasIssue = $false; Reason = $null }
     }
 
     $thresholdText = $ThresholdPercent.ToString("0.##", [System.Globalization.CultureInfo]::InvariantCulture)
@@ -1446,8 +1828,10 @@ function Test-RangeIdUsage {
         $message += "`nЧас оновлення даних: $($rangeData.time)"
     }
 
-    Write-Log $message -Level "WARNING"
+    Write-Log $message -Level "WARNING" -NoConsole
     Send-SlackAlert -Message $message -IsCritical
+    $exceededSummary = "перевищено поріг {0}%: {1}" -f $thresholdText, ($exceededRanges.Count)
+    return [pscustomobject]@{ HasIssue = $true; Reason = $exceededSummary }
 }
 
 # Функція форматування виводу команд
@@ -1467,76 +1851,1108 @@ function Format-FileSize {
     }
 }
 
-# Функція переміщення файлів з послідовністю
-function Move-WithSequence {
+# ===== РОТАЦІЯ ПРОГРАМНИХ ЖУРНАЛІВ =====
+# Спільний механізм для BRAVO Trace, exchangAPI, Apache і BRAVO Web
+# application logs: одна нумерація, одна перевірка результату переміщення,
+# один формат журналювання. Раніше кожен компонент мав власну копію циклу
+# переміщення — і саме тому вони розійшлися в поведінці: exchangAPI
+# перезаписував файл призначення (-Force з тим самим іменем), Trace
+# нумерував як _000001, а джерела шукались за здогадками відносно LIMSRoot.
+#
+# Функції навмисно не читають ані script-scope змінні, ані Write-Log:
+# retry-політика й журналювання приходять параметрами. Це те, що робить їх
+# перевіряними в BRAVO_SELF_TEST.ps1 на справжніх файлах у тимчасовому
+# каталозі, а не лише текстовим пошуком по вихідному коду.
+
+function Write-BRAVOLogRotationMessage {
     param(
-        [string]$sourcePath,
-        [string]$destDir,
-        [switch]$SkipIfEmpty
+        [AllowNull()][scriptblock]$Logger,
+        [string]$Message,
+        [string]$Level = "INFO"
     )
-    
-    if (-not (Test-Path $sourcePath)) {
-        Write-Log "Файл $([System.IO.Path]::GetFileName($sourcePath)) не знайдено" -Level "ERROR"
-        return $false
+
+    if ($null -ne $Logger) {
+        # [void] обов'язковий: функції ротації повертають об'єкт-підсумок
+        # через конвеєр, тому будь-який вихід журнального адаптера домішався
+        # б до результату й перетворив підсумок на масив.
+        [void](& $Logger $Message $Level)
     }
-    
-    $fileInfo = Get-Item $sourcePath
-    if ($fileInfo.Length -eq 0 -and $SkipIfEmpty) {
-        Write-Log "Пропущено порожній файл: $([System.IO.Path]::GetFileName($sourcePath))" -Level "INFO"
-        return $false
+}
+
+function Get-BRAVONextLogSequence {
+    # MAX(існуючих) + 1, а НЕ перший вільний номер: пропуск у нумерації
+    # (файл видалили вручну, каталог частково заархівували) не має
+    # перевикористовуватись — інакше новий журнал отримає ім'я, яке в
+    # історії вже означало іншу подію, і порядок імен перестане
+    # відповідати порядку записів.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [Parameter(Mandatory = $true)][string]$BaseName,
+        [string]$Extension = ""
+    )
+
+    if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+        return 1
     }
-    
-    New-Item -Path $destDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-    
-    $fileName = [System.IO.Path]::GetFileNameWithoutExtension($sourcePath)
-    $fileExt = [System.IO.Path]::GetExtension($sourcePath)
-    
-    $existingFiles = Get-BRAVOFiles -Path $destDir -Filter "${fileName}_*$fileExt"
-    $maxNumber = 0
-    
-    foreach ($file in $existingFiles) {
-        $baseName = $file.BaseName
-        if ($baseName -match "${fileName}_(\d{6})$") {
-            $num = [int]$Matches[1]
-            if ($num -gt $maxNumber) { $maxNumber = $num }
+
+    # Regex.Escape обов'язковий з обох боків: і BaseName ("ssl_error",
+    # "exchangAPI"), і Extension (".out") містять символи, які інакше
+    # тлумачаться як метасимволи регулярного виразу.
+    $sequencePattern = '^' + [regex]::Escape($BaseName) + '_(\d+)' + [regex]::Escape($Extension) + '$'
+    $maxSequence = 0
+    foreach ($existingFile in @(Get-BRAVOFiles -LiteralPath $DestinationDirectory)) {
+        $sequenceMatch = [regex]::Match(
+            $existingFile.Name,
+            $sequencePattern,
+            [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
+        )
+        if (-not $sequenceMatch.Success) {
+            continue
+        }
+        $parsedSequence = 0
+        # TryParse, а не [int]: номер із занадто довгих цифр (пошкоджене
+        # ім'я) не повинен валити ротацію винятком переповнення.
+        if (-not [int]::TryParse($sequenceMatch.Groups[1].Value, [ref]$parsedSequence)) {
+            continue
+        }
+        if ($parsedSequence -gt $maxSequence) {
+            $maxSequence = $parsedSequence
+        }
+    }
+    return ($maxSequence + 1)
+}
+
+function Move-BRAVOLogWithSequence {
+    # Переміщення одного журналу в <DestinationDirectory>\<BaseName>_<N><Ext>.
+    #
+    # LogicalBaseName потрібен для exchangAPI: у джерелі лежать exchangAPI.log,
+    # exchangAPI_1.log, exchangAPI_2.log — усі це один логічний журнал, і без
+    # явного логічного імені другий із них перетворився б на exchangAPI_1_1.log.
+    # Номер джерела ніколи не переноситься в призначення: там діє власна
+    # нумерація каталогу-дати.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [string]$LogicalBaseName,
+        # Лише для журналу: відносний підкаталог у дереві BRAVO Web, щоб
+        # рядок читався як "API\request.log -> API\request_2.log", а не як
+        # два однакові "request.log" з різних гілок.
+        [string]$RelativeDirectory,
+        [bool]$SkipIfEmpty = $true,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $sourceName = [System.IO.Path]::GetFileName($SourcePath)
+    $displayPrefix = if ([string]::IsNullOrWhiteSpace($RelativeDirectory)) {
+        ""
+    } else {
+        ($RelativeDirectory.Trim('\', '/') + '\')
+    }
+    $attemptsUsed = 0
+    $buildResult = {
+        param(
+            [string]$Status,
+            [string]$DestinationName,
+            [string]$DestinationPath,
+            [int64]$SourceSize,
+            [Nullable[int64]]$DestinationSize,
+            [Nullable[int]]$Sequence,
+            [string]$ErrorText
+        )
+        [pscustomobject]@{
+            Status = $Status
+            SourceName = $sourceName
+            SourcePath = $SourcePath
+            RelativeDirectory = $RelativeDirectory
+            DestinationName = $DestinationName
+            DestinationPath = $DestinationPath
+            SourceSize = $SourceSize
+            DestinationSize = $DestinationSize
+            Sequence = $Sequence
+            Attempts = $attemptsUsed
+            Error = $ErrorText
         }
     }
 
-    $nextNumber = $maxNumber + 1
-
-    if ($nextNumber -gt 999999) {
-        Write-Log "Досягнуто максимальну кількість архівних файлів (999999) для $fileName" -Level "ERROR"
-        return $false
+    if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+        return (& $buildResult 'MISSING' $null $null 0 $null $null "файл не знайдено")
     }
 
-    $suffix = $nextNumber.ToString("000000")
-    $newName = "${fileName}_${suffix}${fileExt}"
-    $destPath = Join-Path -Path $destDir -ChildPath $newName
+    $sourceItem = Get-Item -LiteralPath $SourcePath -ErrorAction SilentlyContinue
+    if ($null -eq $sourceItem) {
+        return (& $buildResult 'MISSING' $null $null 0 $null $null "файл не знайдено")
+    }
+    $originalLength = [int64]$sourceItem.Length
+    if ($originalLength -eq 0 -and $SkipIfEmpty) {
+        # Порожній файл лишається на місці: не переміщується, не видаляється,
+        # не перейменовується і не займає номер у послідовності.
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "Файл порожній, ротацію пропущено: $SourcePath" `
+            -Level "INFO"
+        return (& $buildResult 'SKIPPED_EMPTY' $null $null 0 $null $null $null)
+    }
 
-    for ($attempt = 1; $attempt -le $MoveRetryCount; $attempt++) {
+    if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
         try {
-            Move-Item -Path $sourcePath -Destination $destPath -Force -ErrorAction Stop
-            if (-not (Test-Path -LiteralPath $destPath -PathType Leaf)) {
-                throw "файл призначення не створено"
-            }
-            Write-Log "Переміщено $([System.IO.Path]::GetFileName($sourcePath)) до $newName" -Level "SUCCESS"
-            return $true
+            [void](New-Item -Path $DestinationDirectory -ItemType Directory -Force -ErrorAction Stop)
+        } catch {
+            $createError = "не вдалося створити каталог призначення $DestinationDirectory : $($_.Exception.Message)"
+            Write-BRAVOLogRotationMessage -Logger $Logger -Message "ПОМИЛКА: $createError" -Level "ERROR"
+            return (& $buildResult 'ERROR' $null $null $originalLength $null $null $createError)
         }
-        catch {
-            if ($attempt -lt $MoveRetryCount) {
-                Write-Log "Файл $([System.IO.Path]::GetFileName($sourcePath)) зайнятий або недоступний; повторна спроба $($attempt + 1) з $MoveRetryCount через $MoveRetryDelaySeconds сек." -Level "WARNING"
-                if ($MoveRetryDelaySeconds -gt 0) {
-                    Start-Sleep -Seconds $MoveRetryDelaySeconds
+    }
+
+    $extension = [System.IO.Path]::GetExtension($sourceName)
+    $baseName = if (-not [string]::IsNullOrWhiteSpace($LogicalBaseName)) {
+        $LogicalBaseName
+    } else {
+        [System.IO.Path]::GetFileNameWithoutExtension($sourceName)
+    }
+
+    $attemptLimit = [math]::Max(1, $RetryCount)
+    $lastError = $null
+    for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
+        $attemptsUsed = $attempt
+        # Ім'я підбирається безпосередньо перед КОЖНОЮ спробою: між
+        # обчисленням MAX+1 і самим Move файл із цим номером міг з'явитися
+        # (паралельний запуск, ручне копіювання в каталог). Перезапис
+        # існуючого журналу неприпустимий, тому -Force тут немає й не буде:
+        # замість нього — новий номер.
+        $destinationName = $null
+        $destinationPath = $null
+        $destinationSequence = $null
+        for ($nameAttempt = 1; $nameAttempt -le 100; $nameAttempt++) {
+            $nextSequence = Get-BRAVONextLogSequence `
+                -DestinationDirectory $DestinationDirectory `
+                -BaseName $baseName `
+                -Extension $extension
+            $candidateName = "${baseName}_${nextSequence}${extension}"
+            $candidatePath = Join-Path -Path $DestinationDirectory -ChildPath $candidateName
+            if (-not (Test-Path -LiteralPath $candidatePath)) {
+                $destinationName = $candidateName
+                $destinationPath = $candidatePath
+                $destinationSequence = [int]$nextSequence
+                break
+            }
+        }
+        if ($null -eq $destinationPath) {
+            $lastError = "не вдалося підібрати вільне ім'я для $sourceName у $DestinationDirectory"
+            break
+        }
+
+        try {
+            Move-Item -LiteralPath $SourcePath -Destination $destinationPath -ErrorAction Stop
+            # Перевірка результату (а не лише відсутності винятку): джерело
+            # зникло, призначення існує, розмір збігся. Move-Item мовчки
+            # "успішний" при частковому переміщенні мережевого файлу — саме
+            # тут це виявляється, доки джерело ще можна відновити.
+            if (-not (Test-Path -LiteralPath $destinationPath -PathType Leaf)) {
+                throw "файл призначення $destinationName не створено"
+            }
+            if (Test-Path -LiteralPath $SourcePath) {
+                throw "джерело $sourceName залишилося на місці після переміщення"
+            }
+            $movedItem = Get-Item -LiteralPath $destinationPath -ErrorAction Stop
+            if ([int64]$movedItem.Length -ne $originalLength) {
+                throw "розмір після переміщення ($($movedItem.Length) байт) не збігається з вихідним ($originalLength байт)"
+            }
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "Переміщено ${displayPrefix}${sourceName} -> ${displayPrefix}${destinationName}" `
+                -Level "SUCCESS"
+            return (& $buildResult 'MOVED' $destinationName $destinationPath $originalLength ([int64]$movedItem.Length) $destinationSequence $null)
+        } catch {
+            $lastError = $_.Exception.Message
+            if (-not (Test-Path -LiteralPath $SourcePath -PathType Leaf)) {
+                # Джерела вже немає — повторна спроба нічого не виправить,
+                # лише замінить справжню причину на "файл не знайдено".
+                break
+            }
+            if ($attempt -lt $attemptLimit) {
+                Write-BRAVOLogRotationMessage `
+                    -Logger $Logger `
+                    -Message "Не вдалося перемістити ${displayPrefix}${sourceName} ($lastError); спроба $($attempt + 1) з ${attemptLimit} через $RetryDelaySeconds сек." `
+                    -Level "WARNING"
+                if ($RetryDelaySeconds -gt 0) {
+                    Start-Sleep -Seconds $RetryDelaySeconds
                 }
-            } else {
-                Write-Log "Не вдалося перемістити $([System.IO.Path]::GetFileName($sourcePath)) після $MoveRetryCount спроб: $($_.Exception.Message)" -Level "ERROR"
-                $script:criticalErrorOccurred = $true
-                return $false
             }
         }
     }
 
-    return $false
+    Write-BRAVOLogRotationMessage `
+        -Logger $Logger `
+        -Message "ПОМИЛКА: не вдалося перемістити ${displayPrefix}${sourceName} до $DestinationDirectory після $attemptsUsed спроб: $lastError" `
+        -Level "ERROR"
+    return (& $buildResult 'ERROR' $null $null $originalLength $null $null $lastError)
+}
+
+function New-BRAVOLogRotationSummary {
+    param(
+        [string]$ComponentName,
+        [int]$Found = 0,
+        [int]$NonEmpty = 0,
+        [int]$Moved = 0,
+        [int]$Empty = 0,
+        [int]$Missing = 0,
+        [int]$Errors = 0,
+        [string]$Note
+    )
+
+    [pscustomobject]@{
+        ComponentName = $ComponentName
+        Found = $Found
+        NonEmpty = $NonEmpty
+        Moved = $Moved
+        Empty = $Empty
+        Missing = $Missing
+        # Пропущено = порожні + зниклі між discovery і переміщенням. Обидва
+        # випадки не є помилкою, але й не є переміщенням — без окремого
+        # лічильника "знайдено 5, переміщено 3" читалося б як утрата двох.
+        Skipped = ($Empty + $Missing)
+        Errors = $Errors
+        Note = $Note
+    }
+}
+
+function Get-BRAVOExchangeApiLogFiles {
+    # Історично журнали exchangAPI траплялися під двома шаблонами імен, і
+    # жоден із них не є надмножиною іншого в намірі: "exchangAPI_*.log" не
+    # ловить поточний exchangAPI.log, а "exchangAPI*.log" писався не всюди.
+    # Тому шукаємо за обома й ОБОВ'ЯЗКОВО дедуплікуємо за FullName —
+    # exchangAPI_1.log відповідає обом, і без дедуплікації той самий
+    # фізичний файл потрапив би в обробку двічі.
+    #
+    # Пошук лише по безпосередніх файлах каталогу: підкаталоги службі не
+    # належать, і рекурсія тут означала б чужі журнали.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [string[]]$Patterns = @("exchangAPI_*.log", "exchangAPI*.log")
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return @()
+    }
+
+    $seenPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $uniqueFiles = New-Object System.Collections.Generic.List[object]
+    foreach ($pattern in @($Patterns)) {
+        foreach ($file in @(Get-BRAVOFiles -LiteralPath $Directory -Filter $pattern)) {
+            if ($seenPaths.Add([string]$file.FullName)) {
+                $uniqueFiles.Add($file)
+            }
+        }
+    }
+
+    return @($uniqueFiles | Sort-Object -Property LastWriteTime, Name)
+}
+
+function Get-BRAVOApacheLogFiles {
+    # Тільки журнали. У apache\logs поруч лежать httpd.pid, *.lock і
+    # тимчасові файли: переміщення httpd.pid зупиненого Apache — це
+    # службовий файл, який httpd очікує знайти на місці після старту.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [string]$Filter = "*.log"
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return @()
+    }
+    return @(Get-BRAVOFiles -LiteralPath $Directory -Filter $Filter |
+        Sort-Object -Property LastWriteTime, Name)
+}
+
+function Get-BRAVOWebApplicationLogFiles {
+    # На відміну від Apache, www\log має вкладені каталоги (API\,
+    # Integration\API\ тощо), і в різних гілках трапляються файли з
+    # однаковим іменем. Тому обхід рекурсивний, а разом із файлом
+    # повертається його відносний каталог: сплющування дерева в один
+    # каталог-дату склеїло б різні request.log в одну послідовність і
+    # знищило б контекст походження.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [string]$Filter = "*.log"
+    )
+
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) {
+        return @()
+    }
+
+    $rootFullPath = ([string](Get-Item -LiteralPath $Directory).FullName).TrimEnd('\', '/')
+    $items = New-Object System.Collections.Generic.List[object]
+    foreach ($file in @(Get-BRAVOFiles -LiteralPath $Directory -Filter $Filter -Recurse)) {
+        $parentPath = ([string](Split-Path -Path $file.FullName -Parent)).TrimEnd('\', '/')
+        $relativeDirectory = if ([string]::Equals($parentPath, $rootFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+            ""
+        } elseif ($parentPath.StartsWith($rootFullPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            $parentPath.Substring($rootFullPath.Length + 1)
+        } else {
+            # Junction/симлінк вивів обхід за межі кореня — такий файл не
+            # належить дереву журналів застосунку, і його відносний шлях
+            # обчислити чесно неможливо.
+            continue
+        }
+        $items.Add([pscustomobject]@{
+            File = $file
+            RelativeDirectory = $relativeDirectory
+        })
+    }
+
+    return @($items | Sort-Object -Property @{ Expression = { $_.RelativeDirectory } }, @{ Expression = { $_.File.LastWriteTime } }, @{ Expression = { $_.File.Name } })
+}
+
+function Write-BRAVOLogRotationSummary {
+    # Агрегований результат замість мовчазного пропуску (ТЗ §17):
+    # оператор бачить усі чотири числа навіть тоді, коли переміщувати не
+    # було чого — саме це відрізняє "нічого не знайдено" від "не дійшли".
+    param(
+        [Parameter(Mandatory = $true)][object]$Summary,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $level = if ($Summary.Errors -gt 0) {
+        "ERROR"
+    } elseif ($Summary.Moved -gt 0) {
+        "SUCCESS"
+    } else {
+        "INFO"
+    }
+    Write-BRAVOLogRotationMessage `
+        -Logger $Logger `
+        -Message ("{0}: знайдено: {1}, непорожніх: {2}, переміщено: {3}, порожніх: {4}, пропущено: {5}, помилок: {6}" -f `
+            $Summary.ComponentName, $Summary.Found, $Summary.NonEmpty, $Summary.Moved,
+            $Summary.Empty, $Summary.Skipped, $Summary.Errors) `
+        -Level $level
+}
+
+function New-BRAVOLogRotationItem {
+    # Одиниця роботи рушія ротації: фізичний файл + відносний підкаталог,
+    # у який він має лягти всередині каталогу-дати. Для Trace/exchangAPI/
+    # Apache відносний підкаталог завжди порожній, для BRAVO Web — шлях
+    # усередині www\log.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$RelativeDirectory = ""
+    )
+
+    [pscustomobject]@{
+        Path = $Path
+        RelativeDirectory = $RelativeDirectory
+    }
+}
+
+function Invoke-BRAVOLogRotation {
+    # Спільний рушій для всіх чотирьох компонентів. Три-чотири окремі майже
+    # однакові функції (як пропонує ТЗ) розійшлися б так само, як розійшлися
+    # старі Move-WithSequence/Move-ExchangAPILogs: різниця між компонентами
+    # вичерпується списком файлів, логічним іменем і вкладеністю — усе інше
+    # (нумерація, перевірка після Move, підсумок) має бути одним кодом.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ComponentName,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Items,
+        [Parameter(Mandatory = $true)][string]$DestinationRoot,
+        [string]$LogicalBaseName,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if (@($Items).Count -eq 0) {
+        $emptySummary = New-BRAVOLogRotationSummary -ComponentName $ComponentName -Note 'файлів немає'
+        Write-BRAVOLogRotationSummary -Summary $emptySummary -Logger $Logger
+        return $emptySummary
+    }
+
+    $foundCount = 0
+    $nonEmptyCount = 0
+    $movedCount = 0
+    $emptyCount = 0
+    $missingCount = 0
+    $errorCount = 0
+    foreach ($item in @($Items)) {
+        $foundCount++
+        $relativeDirectory = [string]$item.RelativeDirectory
+        # Кожен відносний підкаталог має власну послідовність: request_1.log
+        # в API\ і request_1.log в Integration\API\ — різні журнали, і
+        # спільна нумерація злила б їх в один ряд.
+        $destinationDirectory = if ([string]::IsNullOrWhiteSpace($relativeDirectory)) {
+            $DestinationRoot
+        } else {
+            Join-Path $DestinationRoot $relativeDirectory
+        }
+
+        $moveResult = Move-BRAVOLogWithSequence `
+            -SourcePath ([string]$item.Path) `
+            -DestinationDirectory $destinationDirectory `
+            -LogicalBaseName $LogicalBaseName `
+            -RelativeDirectory $relativeDirectory `
+            -RetryCount $RetryCount `
+            -RetryDelaySeconds $RetryDelaySeconds `
+            -Logger $Logger
+        switch ([string]$moveResult.Status) {
+            'MOVED' { $nonEmptyCount++; $movedCount++ }
+            'SKIPPED_EMPTY' { $emptyCount++ }
+            'MISSING' { $missingCount++ }
+            default { $nonEmptyCount++; $errorCount++ }
+        }
+    }
+
+    $summary = New-BRAVOLogRotationSummary `
+        -ComponentName $ComponentName `
+        -Found $foundCount `
+        -NonEmpty $nonEmptyCount `
+        -Moved $movedCount `
+        -Empty $emptyCount `
+        -Missing $missingCount `
+        -Errors $errorCount
+    Write-BRAVOLogRotationSummary -Summary $summary -Logger $Logger
+    return $summary
+}
+
+function Invoke-BRAVOTraceRotation {
+    # BRAVO Trace — рівно один файл, шлях і назва якого відомі з
+    # bravo.ini [Debug] FILE. Ані відсутній, ані порожній trace не є
+    # помилкою обслуговування: BRAVO міг просто не писати його від минулого
+    # запуску, і це не привід ані піднімати тривогу, ані — тим паче —
+    # залишити службу зупиненою.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TracePath,
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if (-not (Test-Path -LiteralPath $TracePath -PathType Leaf)) {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "BRAVO Trace: файл $TracePath ще не створено — ротація не потрібна" `
+            -Level "INFO"
+        return (New-BRAVOLogRotationSummary -ComponentName 'Trace' -Note 'джерело відсутнє')
+    }
+
+    return (Invoke-BRAVOLogRotation `
+        -ComponentName 'Trace' `
+        -Items @(New-BRAVOLogRotationItem -Path $TracePath) `
+        -DestinationRoot $DestinationDirectory `
+        -RetryCount $RetryCount `
+        -RetryDelaySeconds $RetryDelaySeconds `
+        -Logger $Logger)
+}
+
+function Invoke-BRAVOExchangeApiLogRotation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDirectory,
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [string[]]$Patterns = @("exchangAPI_*.log", "exchangAPI*.log"),
+        [string]$LogicalBaseName = "exchangAPI",
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "exchangAPI: робочий каталог $SourceDirectory не знайдено — ротація пропущена" `
+            -Level "WARNING"
+        return (New-BRAVOLogRotationSummary -ComponentName 'exchangAPI' -Note 'каталог джерела відсутній')
+    }
+
+    $sourceFiles = @(Get-BRAVOExchangeApiLogFiles -Directory $SourceDirectory -Patterns $Patterns)
+    Write-BRAVOLogRotationMessage `
+        -Logger $Logger `
+        -Message "exchangAPI: унікальних файлів знайдено: $($sourceFiles.Count)" `
+        -Level "INFO"
+    return (Invoke-BRAVOLogRotation `
+        -ComponentName 'exchangAPI' `
+        -Items @($sourceFiles | ForEach-Object { New-BRAVOLogRotationItem -Path $_.FullName }) `
+        -DestinationRoot $DestinationDirectory `
+        -LogicalBaseName $LogicalBaseName `
+        -RetryCount $RetryCount `
+        -RetryDelaySeconds $RetryDelaySeconds `
+        -Logger $Logger)
+}
+
+function Invoke-BRAVOApacheLogRotation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDirectory,
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [string]$Filter = "*.log",
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "Apache: каталог джерела $SourceDirectory не знайдено — ротація пропущена" `
+            -Level "WARNING"
+        return (New-BRAVOLogRotationSummary -ComponentName 'Apache' -Note 'каталог джерела відсутній')
+    }
+
+    $sourceFiles = @(Get-BRAVOApacheLogFiles -Directory $SourceDirectory -Filter $Filter)
+    return (Invoke-BRAVOLogRotation `
+        -ComponentName 'Apache' `
+        -Items @($sourceFiles | ForEach-Object { New-BRAVOLogRotationItem -Path $_.FullName }) `
+        -DestinationRoot $DestinationDirectory `
+        -RetryCount $RetryCount `
+        -RetryDelaySeconds $RetryDelaySeconds `
+        -Logger $Logger)
+}
+
+function Invoke-BRAVOWebApplicationLogRotation {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourceDirectory,
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [string]$Filter = "*.log",
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDirectory -PathType Container)) {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "BravoWeb: каталог джерела $SourceDirectory не знайдено — ротація пропущена" `
+            -Level "WARNING"
+        return (New-BRAVOLogRotationSummary -ComponentName 'BravoWeb' -Note 'каталог джерела відсутній')
+    }
+
+    $sourceItems = @(Get-BRAVOWebApplicationLogFiles -Directory $SourceDirectory -Filter $Filter)
+    return (Invoke-BRAVOLogRotation `
+        -ComponentName 'BravoWeb' `
+        -Items @($sourceItems | ForEach-Object {
+            New-BRAVOLogRotationItem -Path $_.File.FullName -RelativeDirectory $_.RelativeDirectory
+        }) `
+        -DestinationRoot $DestinationDirectory `
+        -RetryCount $RetryCount `
+        -RetryDelaySeconds $RetryDelaySeconds `
+        -Logger $Logger)
+}
+
+function Get-BRAVOTraceConfiguration {
+    # Runtime-контекст ротації Trace, який має бути відомий ДО зупинки
+    # BRAVO (ТЗ §7): сам bravo.ini, значення [Debug] FILE і каталог
+    # призначення. Джерело — Resolve-BRAVOInstallationDiscovery, той самий,
+    # з якого вже беруться MODEL/BLOG: другого читача bravo.ini в комплекті
+    # бути не повинно.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        [Parameter(Mandatory = $true)][string]$TraceRootDirectory,
+        [Parameter(Mandatory = $true)][string]$DateFolderName
+    )
+
+    $iniPath = [string]$DiscoveryResult.BravoIniPath
+    $tracePath = [string]$DiscoveryResult.TRACE_FILE
+    $reason = [string]$DiscoveryResult.Reasons.TRACE_FILE
+    $installationDirectory = [string]$DiscoveryResult.BRAVO_ROOT
+    $outsideInstallation = [bool]$DiscoveryResult.TRACE_FILE_OUTSIDE_INSTALLATION
+
+    if ([string]::IsNullOrWhiteSpace($tracePath)) {
+        return [pscustomobject]@{
+            IsValid = $false
+            IniPath = $iniPath
+            InstallationDirectory = $installationDirectory
+            TracePath = $null
+            DestinationDirectory = $null
+            IsOutsideInstallation = $false
+            Reason = $reason
+        }
+    }
+
+    return [pscustomobject]@{
+        IsValid = $true
+        IniPath = $iniPath
+        InstallationDirectory = $installationDirectory
+        TracePath = $tracePath
+        DestinationDirectory = (Join-Path $TraceRootDirectory $DateFolderName)
+        IsOutsideInstallation = $outsideInstallation
+        Reason = $reason
+    }
+}
+
+
+# ===== МІГРАЦІЯ СТАРОЇ СТРУКТУРИ ЖУРНАЛІВ =====
+# До переїзду під <ArchiveRoot>\LOGS програмні журнали лежали у трьох
+# каталогах кореня ArchiveRoot. Просто перестати туди писати недостатньо:
+# накопичена історія (каталоги-дати й .mdz) залишилася б поза retention і
+# поза очима оператора — тобто вічно займала б місце й ніколи не знайшлася б
+# при розборі інциденту.
+#
+# Міграція навмисно ідемпотентна й неруйнівна: джерело видаляється лише
+# після підтвердженого переміщення, часткова невдача лишає решту для
+# наступного запуску, перезапис призначення неможливий у жодному випадку.
+
+function Get-BRAVOLegacyLogMigrationPlan {
+    # Пари "старий корінь -> новий корінь". Окремою функцією, щоб і
+    # Maintenance, і self-тести бачили один і той самий список, а не дві
+    # копії, які згодом розійдуться.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ArchiveRoot, [Parameter(Mandatory = $true)][string]$LogRoot)
+
+    return @(
+        [pscustomobject]@{
+            ComponentName = 'Trace'
+            LegacyPath = (Join-Path $ArchiveRoot 'Trace')
+            DestinationPath = (Join-Path $LogRoot 'Trace')
+            LogicalBaseName = $null
+        },
+        [pscustomobject]@{
+            ComponentName = 'exchangAPI'
+            LegacyPath = (Join-Path $ArchiveRoot 'exchangAPI')
+            DestinationPath = (Join-Path $LogRoot 'exchangAPI')
+            # У старому каталозі exchangAPI лежали ПЛОСКІ файли з іменами
+            # джерела (exchangAPI_1.log). Логічне ім'я потрібне, щоб вони
+            # влилися в ту саму послідовність, а не стали exchangAPI_1_1.log.
+            LogicalBaseName = 'exchangAPI'
+        },
+        [pscustomobject]@{
+            ComponentName = 'BravoWeb'
+            LegacyPath = (Join-Path $ArchiveRoot 'Br-a-vo.web')
+            DestinationPath = (Join-Path $LogRoot 'BravoWeb')
+            LogicalBaseName = $null
+        }
+    )
+}
+
+function Get-BRAVOFreeMigrationPath {
+    # Безконфліктне ім'я для файла, який НЕ є журналом (насамперед .mdz):
+    # sequence engine тут не підходить, бо "Trace_2026-07-01.mdz" це не
+    # <BaseName>_<N>.<ext>, а дата в імені. Тому — суфікс _migrated_N,
+    # який ніколи не збігається з робочим форматом імен.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$DestinationPath)
+
+    if (-not (Test-Path -LiteralPath $DestinationPath)) {
+        return $DestinationPath
+    }
+    $directory = Split-Path -Path $DestinationPath -Parent
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($DestinationPath)
+    $extension = [System.IO.Path]::GetExtension($DestinationPath)
+    for ($suffix = 1; $suffix -le 1000; $suffix++) {
+        $candidate = Join-Path $directory ("{0}_migrated_{1}{2}" -f $baseName, $suffix, $extension)
+        if (-not (Test-Path -LiteralPath $candidate)) {
+            return $candidate
+        }
+    }
+    return $null
+}
+
+function Move-BRAVOLegacyLogFile {
+    # Один файл legacy -> нове дерево. Повертає $true лише тоді, коли
+    # призначення реально існує, джерела вже немає і розміри збіглися:
+    # видаляти щось на підставі "Move-Item не кинув винятку" — саме той
+    # клас рішень, через який зникають архіви.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $sourceItem = Get-Item -LiteralPath $SourcePath -ErrorAction SilentlyContinue
+    if ($null -eq $sourceItem) {
+        return $false
+    }
+    $sourceLength = [int64]$sourceItem.Length
+
+    $destinationDirectory = Split-Path -Path $DestinationPath -Parent
+    if (-not (Test-Path -LiteralPath $destinationDirectory -PathType Container)) {
+        try {
+            [void](New-Item -Path $destinationDirectory -ItemType Directory -Force -ErrorAction Stop)
+        } catch {
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "ПОМИЛКА міграції: не вдалося створити каталог $destinationDirectory : $($_.Exception.Message)" `
+                -Level "ERROR"
+            return $false
+        }
+    }
+
+    $freePath = Get-BRAVOFreeMigrationPath -DestinationPath $DestinationPath
+    if ([string]::IsNullOrWhiteSpace($freePath)) {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "ПОМИЛКА міграції: не вдалося підібрати вільне ім'я для $SourcePath у $destinationDirectory" `
+            -Level "ERROR"
+        return $false
+    }
+
+    try {
+        Move-Item -LiteralPath $SourcePath -Destination $freePath -ErrorAction Stop
+    } catch {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "ПОМИЛКА міграції: $SourcePath -> $freePath : $($_.Exception.Message)" `
+            -Level "ERROR"
+        return $false
+    }
+
+    $movedItem = Get-Item -LiteralPath $freePath -ErrorAction SilentlyContinue
+    if ($null -eq $movedItem -or
+        (Test-Path -LiteralPath $SourcePath) -or
+        [int64]$movedItem.Length -ne $sourceLength) {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "ПОМИЛКА міграції: результат переміщення $SourcePath не підтверджено (призначення: $freePath)" `
+            -Level "ERROR"
+        return $false
+    }
+
+    Write-BRAVOLogRotationMessage `
+        -Logger $Logger `
+        -Message "Мігровано: $SourcePath -> $freePath" `
+        -Level "SUCCESS"
+    return $true
+}
+
+function Remove-BRAVOEmptyLegacyDirectory {
+    # Порожні каталоги знизу вгору. Каталог із залишками не видаляється
+    # НІКОЛИ: те, що не мігрувало, має дочекатися наступного запуску, а не
+    # зникнути разом із текою.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $true
+    }
+    foreach ($childDirectory in @(Get-BRAVODirectories -Path $Path)) {
+        [void](Remove-BRAVOEmptyLegacyDirectory -Path $childDirectory.FullName -Logger $Logger)
+    }
+    $remaining = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    if ($remaining.Count -gt 0) {
+        return $false
+    }
+    try {
+        Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+        return $true
+    } catch {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "Не вдалося видалити порожній legacy-каталог ${Path}: $($_.Exception.Message)" `
+            -Level "WARNING"
+        return $false
+    }
+}
+
+function Invoke-BRAVOLegacyLogMigration {
+    # Один legacy-корінь -> нове дерево.
+    #
+    # Правила розкладки:
+    #   * усе, що лежить у підкаталогах, зберігає відносний шлях —
+    #     каталоги-дати переїжджають як є;
+    #   * .mdz у корені legacy переїжджає в корінь призначення (там на нього
+    #     вже чекає retention стиснутих архівів);
+    #   * решта файлів У КОРЕНІ legacy — це плоскі журнали старого формату
+    #     (так їх складав колишній exchangAPI-код). Вони отримують каталог-дату
+    #     за власним LastWriteTime і проходять через sequence engine, тобто
+    #     одразу стають частиною нормального життєвого циклу, а не осідають
+    #     назавжди поза межами будь-якої політики.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LegacyPath,
+        [Parameter(Mandatory = $true)][string]$DestinationPath,
+        [string]$LogicalBaseName,
+        [int]$RetryCount = 3,
+        [int]$RetryDelaySeconds = 5,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $summary = [pscustomobject]@{
+        LegacyPath = $LegacyPath
+        DestinationPath = $DestinationPath
+        Migrated = 0
+        Failed = 0
+        LegacyRemoved = $false
+        Performed = $false
+    }
+
+    if (-not (Test-Path -LiteralPath $LegacyPath -PathType Container)) {
+        return $summary
+    }
+
+    $legacyFullPath = ([string](Get-Item -LiteralPath $LegacyPath).FullName).TrimEnd('\', '/')
+    $destinationFullPath = if (Test-Path -LiteralPath $DestinationPath -PathType Container) {
+        ([string](Get-Item -LiteralPath $DestinationPath).FullName).TrimEnd('\', '/')
+    } else {
+        ([string]$DestinationPath).TrimEnd('\', '/')
+    }
+    if ([string]::Equals($legacyFullPath, $destinationFullPath, [StringComparison]::OrdinalIgnoreCase)) {
+        return $summary
+    }
+
+    $legacyFiles = @(Get-BRAVOFiles -LiteralPath $LegacyPath -Recurse -Force)
+    if ($legacyFiles.Count -eq 0) {
+        # Каталог порожній: лишилася сама тека від попереднього успішного
+        # запуску — прибираємо й нічого не рахуємо як міграцію.
+        $summary.LegacyRemoved = Remove-BRAVOEmptyLegacyDirectory -Path $LegacyPath -Logger $Logger
+        return $summary
+    }
+
+    $summary.Performed = $true
+    Write-BRAVOLogRotationMessage `
+        -Logger $Logger `
+        -Message "Міграція старого каталогу журналів: $LegacyPath -> $DestinationPath (файлів: $($legacyFiles.Count))" `
+        -Level "INFO"
+
+    $migratedCount = 0
+    $failedCount = 0
+    foreach ($legacyFile in $legacyFiles) {
+        $parentPath = ([string](Split-Path -Path $legacyFile.FullName -Parent)).TrimEnd('\', '/')
+        $isAtLegacyRoot = [string]::Equals($parentPath, $legacyFullPath, [StringComparison]::OrdinalIgnoreCase)
+        $relativeDirectory = if ($isAtLegacyRoot) {
+            ""
+        } elseif ($parentPath.StartsWith($legacyFullPath + '\', [StringComparison]::OrdinalIgnoreCase)) {
+            $parentPath.Substring($legacyFullPath.Length + 1)
+        } else {
+            continue
+        }
+
+        $isLooseLogAtRoot = $isAtLegacyRoot -and
+            ([string]$legacyFile.Extension) -ine '.mdz'
+        if ($isLooseLogAtRoot) {
+            $dateFolder = $legacyFile.LastWriteTime.ToString('yyyy-MM-dd')
+            $moveResult = Move-BRAVOLogWithSequence `
+                -SourcePath $legacyFile.FullName `
+                -DestinationDirectory (Join-Path $DestinationPath $dateFolder) `
+                -LogicalBaseName $LogicalBaseName `
+                -SkipIfEmpty $false `
+                -RetryCount $RetryCount `
+                -RetryDelaySeconds $RetryDelaySeconds `
+                -Logger $Logger
+            if ([string]$moveResult.Status -eq 'MOVED') {
+                $migratedCount++
+            } else {
+                $failedCount++
+            }
+            continue
+        }
+
+        $targetDirectory = if ([string]::IsNullOrWhiteSpace($relativeDirectory)) {
+            $DestinationPath
+        } else {
+            Join-Path $DestinationPath $relativeDirectory
+        }
+        if (Move-BRAVOLegacyLogFile `
+                -SourcePath $legacyFile.FullName `
+                -DestinationPath (Join-Path $targetDirectory $legacyFile.Name) `
+                -Logger $Logger) {
+            $migratedCount++
+        } else {
+            $failedCount++
+        }
+    }
+
+    $summary.Migrated = $migratedCount
+    $summary.Failed = $failedCount
+
+    if ($failedCount -eq 0) {
+        $summary.LegacyRemoved = Remove-BRAVOEmptyLegacyDirectory -Path $LegacyPath -Logger $Logger
+        if ($summary.LegacyRemoved) {
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "Старий каталог видалено після підтвердженої міграції: $LegacyPath (перенесено файлів: $migratedCount)" `
+                -Level "SUCCESS"
+        } else {
+            $migratedCountText = Format-BRAVOUkrainianCount -Count $migratedCount -One "файл" -Few "файли" -Many "файлів"
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "Міграцію завершено ($migratedCountText), але каталог $LegacyPath не порожній — залишено без змін" `
+                -Level "WARNING"
+        }
+    } else {
+        Write-BRAVOLogRotationMessage `
+            -Logger $Logger `
+            -Message "Міграція неповна: перенесено $migratedCount, не вдалося $failedCount; $LegacyPath збережено для наступного запуску" `
+            -Level "WARNING"
+    }
+
+    return $summary
+}
+
+function Remove-BRAVOExpiredCompressedLogs {
+    # Retention стиснутих архівів — окрема політика від ArchiveDays.
+    # ArchiveDays відповідає на питання "коли пакувати каталог-дату",
+    # CompressedLogDays — "коли видаляти вже спакований .mdz". Змішувати їх
+    # не можна: перше вимірюється тижнями, друге — місяцями, і спільне
+    # число означало б або роздутий диск, або втрату історії.
+    #
+    # Фільтр строго за очікуваним іменем компонента: узагальнене "*.mdz"
+    # у цьому ж дереві зачепило б чужі архіви, які сюди не належать.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$ArchiveNamePrefix,
+        [Parameter(Mandatory = $true)][int]$RetentionDays,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $result = [pscustomobject]@{
+        Deleted = 0
+        Failed = 0
+        Candidates = 0
+    }
+
+    if ($RetentionDays -le 0 -or -not (Test-Path -LiteralPath $Path -PathType Container)) {
+        return $result
+    }
+
+    $cutoffDate = (Get-Date).AddDays(-$RetentionDays)
+    $archivePattern = '^' + [regex]::Escape($ArchiveNamePrefix) + '_(\d{4}-\d{2}-\d{2})\.mdz$'
+    foreach ($archiveFile in @(Get-BRAVOFiles -LiteralPath $Path -Filter "*.mdz")) {
+        $archiveMatch = [regex]::Match($archiveFile.Name, $archivePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $archiveMatch.Success) {
+            continue
+        }
+        # Вік визначається за датою В ІМЕНІ архіву, а не за LastWriteTime:
+        # час файлу змінює будь-яке копіювання комплекту, а дата в імені —
+        # це фактичний період, за який журнали були зібрані.
+        [datetime]$archiveDate = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact(
+                $archiveMatch.Groups[1].Value,
+                'yyyy-MM-dd',
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None,
+                [ref]$archiveDate)) {
+            continue
+        }
+        $result.Candidates++
+        if ($archiveDate -ge $cutoffDate) {
+            continue
+        }
+        try {
+            Remove-Item -LiteralPath $archiveFile.FullName -Force -ErrorAction Stop
+            $result.Deleted++
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "Видалено стиснутий журнал за retention ($RetentionDays дн.): $($archiveFile.Name)" `
+                -Level "SUCCESS"
+        } catch {
+            $result.Failed++
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "ПОМИЛКА видалення стиснутого журналу $($archiveFile.Name): $($_.Exception.Message)" `
+                -Level "ERROR"
+        }
+    }
+
+    return $result
+}
+function Resolve-BRAVOExchangeApiRuntimeDirectory {
+    # Робочий каталог служби exchangAPI, а не глобальний LIMSRoot: журнали
+    # лежать поруч із самим застосунком, і збіг цих двох шляхів — окремий
+    # факт конкретної інсталяції, а не правило.
+    #
+    # Служба може бути обгорнута NSSM: тоді Win32_Service.PathName вказує на
+    # nssm.exe (каталог самого NSSM, не застосунку), а справжні шляхи лежать
+    # у HKLM\SYSTEM\CurrentControlSet\Services\<Name>\Parameters:
+    # AppDirectory (робочий каталог) і Application (виконуваний файл).
+    #
+    # -ServiceInstance/-NssmParameters дозволяють self-test підставити
+    # синтетичні значення замість WMI й реєстру — той самий injectable-
+    # патерн, що вже застосований у BRAVO.Discovery (-Services).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ServiceName,
+        [string]$FallbackDirectory,
+        [object]$ServiceInstance,
+        [hashtable]$NssmParameters
+    )
+
+    $buildResult = {
+        param([string]$Directory, [string]$Reason)
+        [pscustomobject]@{
+            Directory = $Directory
+            Reason = $Reason
+        }
+    }
+
+    $servicePathName = $null
+    if ($null -ne $ServiceInstance) {
+        $servicePathName = [string]$ServiceInstance.PathName
+    } else {
+        try {
+            $wmiService = @(
+                Get-BRAVOWmiInstance -ClassName Win32_Service |
+                    Where-Object { $_.Name -ieq $ServiceName }
+            ) | Select-Object -First 1
+            if ($null -ne $wmiService) {
+                $servicePathName = [string]$wmiService.PathName
+            }
+        } catch {
+            $servicePathName = $null
+        }
+    }
+
+    $resolvedNssmParameters = $NssmParameters
+    if ($null -eq $resolvedNssmParameters) {
+        $resolvedNssmParameters = @{}
+        $nssmRegistryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName\Parameters"
+        try {
+            if (Test-Path -LiteralPath $nssmRegistryPath) {
+                $nssmProperties = Get-ItemProperty -LiteralPath $nssmRegistryPath -ErrorAction Stop
+                foreach ($parameterName in @('Application', 'AppDirectory')) {
+                    if ($null -ne $nssmProperties.PSObject.Properties[$parameterName]) {
+                        $resolvedNssmParameters[$parameterName] = [string]$nssmProperties.$parameterName
+                    }
+                }
+            }
+        } catch {
+            # Немає доступу до гілки служби — не привід валити ротацію:
+            # нижче лишаються PathName і явний fallback.
+            $resolvedNssmParameters = @{}
+        }
+    }
+
+    $nssmAppDirectory = if ($resolvedNssmParameters.ContainsKey('AppDirectory')) {
+        ConvertTo-BRAVOIniPathValue -Value ([string]$resolvedNssmParameters['AppDirectory'])
+    } else {
+        $null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($nssmAppDirectory)) {
+        return (& $buildResult $nssmAppDirectory.TrimEnd('\', '/') "NSSM AppDirectory служби '$ServiceName'")
+    }
+
+    $nssmApplication = if ($resolvedNssmParameters.ContainsKey('Application')) {
+        ConvertTo-BRAVOIniPathValue -Value ([string]$resolvedNssmParameters['Application'])
+    } else {
+        $null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($nssmApplication)) {
+        return (& $buildResult (Split-Path -Path $nssmApplication -Parent) "NSSM Application служби '$ServiceName': $nssmApplication")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($servicePathName)) {
+        $serviceExecutable = Get-BRAVOServiceExecutablePath -PathName $servicePathName
+        if (-not [string]::IsNullOrWhiteSpace($serviceExecutable)) {
+            return (& $buildResult (Split-Path -Path $serviceExecutable -Parent) "Win32_Service.PathName служби '$ServiceName': $serviceExecutable")
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($FallbackDirectory)) {
+        return (& $buildResult $FallbackDirectory "fallback: LIMSRoot (робочий каталог служби '$ServiceName' не визначено)")
+    }
+    return (& $buildResult $null "робочий каталог служби '$ServiceName' не визначено")
 }
 
 # Функція порівняння розмірів файлів
@@ -1823,35 +3239,6 @@ function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
     return $integrityValid
 }
 
-# Функція обробки лог-файлів
-function Process-Logs {
-    param(
-        [string]$LogType,
-        [string]$SourceDir,
-        [string]$DestDir
-    )
-    
-    if (-not (Test-Path $SourceDir)) {
-        Write-Log "Директорія $SourceDir не знайдена. Обробка логів $LogType пропущена." -Level "ERROR"
-        return
-    }
-    
-    $logFiles = @(Get-BRAVOFiles -Path $SourceDir |
-        Where-Object { $_.Length -gt 0 })
-    
-    if (-not $logFiles) {
-        Write-Log "У директорії $SourceDir немає файлів логів для обробки ($LogType)." -Level "INFO"
-        return
-    }
-    
-    New-Item -Path $DestDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-    
-    foreach ($file in $logFiles) {
-        [void](Move-WithSequence -sourcePath $file.FullName -destDir $DestDir -SkipIfEmpty)
-    }
-    Write-Log "Оброблено $($logFiles.Count) $LogType файлів" -Level "SUCCESS"
-}
-
 # Функція архівації старих даних
 function Compress-OldData {
     param(
@@ -2120,8 +3507,14 @@ function Remove-OldRestoreArchives {
     Write-Log "Сесії для збереження (найсвіжіші):" -Level "DEBUG"
     foreach ($group in $groupsToKeep) {
         $sessionTime = $group.Name
-        $beforeCount = ($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
-        $afterCount = ($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
+        # dev.16: явна array-матеріалізація через @(...) — під PowerShell
+        # 5.1 + Set-StrictMode, коли Where-Object повертає рівно один
+        # результат, pipeline віддає скалярний FileInfo замість масиву, і
+        # .Count на ньому кидає "The property 'Count' cannot be found on
+        # this object": підтверджено реальним acceptance-прогоном dev.15
+        # на DEV-LIMS (виняток після [8/8], перехоплений fail-safe catch).
+        $beforeCount = @($group.Group | Where-Object { $_.Name -like "*_before_*" }).Count
+        $afterCount = @($group.Group | Where-Object { $_.Name -like "*_after_*" }).Count
         Write-Log "  - $sessionTime (before: $beforeCount, after: $afterCount)" -Level "DEBUG"
     }
 
@@ -2158,8 +3551,14 @@ function Remove-OldRestoreArchives {
         Write-Log "Видалено $deletedCount файлів зі старих сесій архівів (збережено $KeepCount найсвіжіших сесій)" -Level "SUCCESS"
         
         # Показуємо що залишилось (тільки в режимі DEBUG)
-        $remainingFiles = Get-ChildItem -Path $Path -Filter "${ArchivePrefix}_*" -ErrorAction SilentlyContinue
-        if ($remainingFiles) {
+        # dev.16: та сама scalar-Count проблема, що вище — Get-ChildItem
+        # повертає одиничний FileInfo (не масив), коли залишається рівно
+        # один файл; @(...) гарантує масив незалежно від кількості
+        # результатів (0/1/N), тому .Count і foreach лишаються безпечними.
+        $remainingFiles = @(
+            Get-ChildItem -Path $Path -Filter "${ArchivePrefix}_*" -ErrorAction SilentlyContinue
+        )
+        if ($remainingFiles.Count -gt 0) {
             Write-Log "Залишилось архівів: $($remainingFiles.Count)" -Level "DEBUG"
             foreach ($file in $remainingFiles) {
                 Write-Log "  - $($file.Name)" -Level "DEBUG"
@@ -2399,48 +3798,6 @@ function Check-MdFileSizes {
     }
 }
 
-# Функція обробки логів ExchangAPI
-function Move-ExchangAPILogs {
-    param(
-        [string]$sourcePath,
-        [string]$destDir
-    )
-    
-    if (-not (Test-Path $sourcePath)) {
-        Write-Log "Файл $([System.IO.Path]::GetFileName($sourcePath)) не знайдено" -Level "ERROR"
-        return
-    }
-    
-    New-Item -Path $destDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-    
-    $destPath = Join-Path -Path $destDir -ChildPath ([System.IO.Path]::GetFileName($sourcePath))
-    
-    for ($attempt = 1; $attempt -le $MoveRetryCount; $attempt++) {
-        try {
-            Move-Item -Path $sourcePath -Destination $destPath -Force -ErrorAction Stop
-            if (-not (Test-Path -LiteralPath $destPath -PathType Leaf)) {
-                throw "файл призначення не створено"
-            }
-            Write-Log "Переміщено $([System.IO.Path]::GetFileName($sourcePath)) до $destDir" -Level "SUCCESS"
-            return $true
-        }
-        catch {
-            if ($attempt -lt $MoveRetryCount) {
-                Write-Log "Лог $([System.IO.Path]::GetFileName($sourcePath)) зайнятий або недоступний; повторна спроба $($attempt + 1) з $MoveRetryCount через $MoveRetryDelaySeconds сек." -Level "WARNING"
-                if ($MoveRetryDelaySeconds -gt 0) {
-                    Start-Sleep -Seconds $MoveRetryDelaySeconds
-                }
-            } else {
-                Write-Log "Не вдалося перемістити $([System.IO.Path]::GetFileName($sourcePath)) після $MoveRetryCount спроб: $($_.Exception.Message)" -Level "ERROR"
-                $script:criticalErrorOccurred = $true
-                return $false
-            }
-        }
-    }
-
-    return $false
-}
-
 # Функція для відправки фінального звіту
 function Send-FinalReport {
     param(
@@ -2470,12 +3827,6 @@ function Send-FinalReport {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
             $completedCheckLines = [System.Collections.Generic.List[string]]::new()
-            $completedCheckLines.Add(":mag: Виконані перевірки та операції:")
-            $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-            $nextRestoreDate = $scheduledOccurrence.Date.AddDays(7)
-            $maintenanceStartTime = [TimeSpan]::Parse([string]$schedulerSettings.Maintenance.DailyAt)
-            $nextRestoreExecution = $nextRestoreDate.Add($maintenanceStartTime)
-            $restoreScheduleText = $nextRestoreExecution.ToString("dddd, dd.MM.yyyy HH:mm", $ukrainianCulture)
             $lastRestoreTime = $restoreCompletedAt
             if ($null -eq $lastRestoreTime) {
                 $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
@@ -2486,72 +3837,92 @@ function Send-FinalReport {
                 }
             }
             $lastRestoreText = if ($null -ne $lastRestoreTime) {
-                $lastRestoreTime.ToString("dd.MM.yyyy HH:mm:ss", $ukrainianCulture)
+                $lastRestoreTime.ToString("dd.MM.yyyy HH:mm")
             } elseif (-not $BravoMaintenanceEnabled) {
                 "немає даних (компонент BRAVO вимкнено)"
             } else {
                 "ще не виконувалася"
             }
-            $completedCheckLines.Add(":arrows_counterclockwise: Реставрація — наступна: $restoreScheduleText (після $RestoreTime) • остання: $lastRestoreText")
+            $completedCheckLines.Add("Виконано:")
+            if ($BravoMaintenanceEnabled) {
+                $completedCheckLines.Add(":white_check_mark: Реставрація — за планом")
+            }
 
-            $mdLimitGb = [math]::Round(([double]$MAX_MD_FILE_SIZE / 1GB), 2)
-            $mdSelectionCriterion = "понад $mdLimitGb ГБ"
-            if ($MD_FILE_SIZE_EXCLUSIONS.Count -gt 0) {
-                $mdSelectionCriterion += "; виключень за конфігурацією: $($MD_FILE_SIZE_EXCLUSIONS.Count)"
-            }
             $mdCheckStatus = if ($BravoMaintenanceEnabled -and $CheckSize) {
-                "пройдено (критерій: $mdSelectionCriterion)"
+                "перевірено"
             } elseif (-not $BravoMaintenanceEnabled) {
-                "вимкнено разом із компонентом BRAVO"
+                $null
             } else {
-                "вимкнено параметром запуску"
+                $null
             }
-            $completedCheckLines.Add(":page_facing_up: Перевірка розміру файлів .md — $mdCheckStatus")
+            if ($mdCheckStatus) {
+                $completedCheckLines.Add(":white_check_mark: .md-файли — $mdCheckStatus")
+            }
 
             $rangeCheckStatus = if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
-                "пройдено"
-            } elseif (-not $RangeIdMonitoringEnabled) {
-                "вимкнено в конфігурації"
+                "у нормі"
             } else {
-                "вимкнено разом із компонентом BRAVO"
+                $null
             }
-            $completedCheckLines.Add(":bar_chart: Перевірка значень інтервалів ID — $rangeCheckStatus")
+            if ($rangeCheckStatus) {
+                $completedCheckLines.Add(":white_check_mark: Інтервали ID — $rangeCheckStatus")
+            }
 
-            $traceOutputStatus = if (-not $BravoMaintenanceEnabled) {
-                "вимкнено разом із компонентом BRAVO"
-            } elseif ($traceOutputProcessed) {
-                "виконано: $traceOutputProcessedCount файл(ів) → $TRACE_ARCHIV_DIR"
-            } else {
-                "нових TraceSRV.out/.out файлів не знайдено"
+            if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
+                $traceCountText = Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
+                $completedCheckLines.Add(":white_check_mark: Trace — оброблено $traceCountText")
             }
-            $completedCheckLines.Add(":card_file_box: Архівування та обнулення трейс-файлів — $traceOutputStatus")
             if ($exchangAPILogsProcessedCount -gt 0) {
-                $completedCheckLines.Add(":arrows_counterclockwise: Обробка логів exchangAPI — переміщено $exchangAPILogsProcessedCount з $exchangAPILogsFoundCount файл(ів) → $EXCHANGAPI_ARCHIV_DIR")
+                $exchangeCountText = Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
+                $completedCheckLines.Add(":white_check_mark: exchangAPI — оброблено $exchangeCountText")
             }
-            $webLogOperationDetails = [System.Collections.Generic.List[string]]::new()
-            if ($webApacheLogsProcessedCount -gt 0) {
-                $webLogOperationDetails.Add("Apache: $webApacheLogsProcessedCount файл(ів)")
+            $completedCheckLines.Add(":white_check_mark: Вільне місце — достатньо")
+            $completedCheckLines.Add("")
+            foreach ($freeSpaceLine in @(Get-MaintenanceMinimumFreeSpaceLines)) {
+                $completedCheckLines.Add($freeSpaceLine)
             }
-            if ($webWwwLogsProcessedCount -gt 0) {
-                $webLogOperationDetails.Add("WWW: $webWwwLogsProcessedCount файл(ів)")
-            }
-            if ($webLogOperationDetails.Count -gt 0) {
-                $completedCheckLines.Add(":globe_with_meridians: Обробка логів BRAVO Web — $($webLogOperationDetails -join '; ') → $BRAVO_WEB_DAILY_DIR")
-            }
-            $freeSpaceDetails = if ($script:freeSpaceSummary -and $script:freeSpaceSummary.Count -gt 0) {
-                "$($script:freeSpaceSummary -join '; ') (мінімум: $MIN_FREE_SPACE GB)"
-            } else {
-                "усі перевірені диски відповідають мінімуму $MIN_FREE_SPACE GB"
-            }
-            $completedCheckLines.Add(":floppy_disk: Контроль вільного місця на дисках — пройдено: $freeSpaceDetails")
+            $completedCheckLines.Add("")
+            $completedCheckLines.Add(":arrows_counterclockwise: Остання реставрація: $lastRestoreText")
 
+            # dev.19 (виправлено): той самий канонічний
+            # Get-BRAVOMaintenanceFinalStatus, що ЛОГ/консоль — раніше
+            # Title завжди був "УСПІШНО" тут, навіть коли резолвиться
+            # exit 10 (SuccessWithWarnings). Ця функція виконується
+            # ВСЕРЕДИНІ зовнішнього try (Main, нижче), ДО його catch і ДО
+            # фінального обчислення $script:maintenanceRuntimeExitCode
+            # (після catch), тому тут беремо
+            # "поточний знімок" через Get-BRAVOMaintenanceResolvedExitCode
+            # — ТУ САМУ пріоритетну політику, не окрему копію; якщо після
+            # цього виклику (напр. у Write-BRAVOTaskExecutionState чи
+            # десь між ним і кінцем try) станеться необроблений виняток,
+            # СПРАВЖНЄ $script:maintenanceRuntimeExitCode (обчислене
+            # пізніше, після catch) може відрізнятися — і саме воно, а не
+            # це повідомлення, керує процесним exit code.
+            #
+            # TitleEmoji тепер узгоджений із самим текстом (не завжди
+            # ":white_check_mark:"): "УСПІШНО З ПОПЕРЕДЖЕННЯМИ" зі
+            # ✅-іконкою була б суперечливою презентацією — канонічний
+            # warning-маркер репозиторію ":warning:" (Send-InactiveServiceWarning
+            # вище, той самий контракт). Це вимагало узгодити й порядок
+            # перевірок severity всередині New-MaintenanceNotificationMessage
+            # (нижче за визначенням) — інакше "$Title -match 'УСПІШ'"
+            # все одно перебивав би ":warning:" і severity лишався б
+            # SUCCESS всупереч TitleEmoji. Ця гілка ніколи не викликається
+            # для critical-помилок (той шлях — окрема, вища за пріоритетом
+            # гілка Send-FinalReport, не змінена); тому тут можливі лише
+            # 'УСПІШНО'/'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'.
+            $maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode
+            $maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot
+            $maintenanceNotificationTitleEmoji = if ($maintenanceNotificationStatus.Text -eq 'УСПІШНО') {
+                ':white_check_mark:'
+            } else {
+                ':warning:'
+            }
             $notificationMessage = New-MaintenanceNotificationMessage `
-                -Title "ОБСЛУГОВУВАННЯ ЗАВЕРШЕНО УСПІШНО" `
-                -TitleEmoji ":white_check_mark:" `
+                -Title "BRAVO MAINTENANCE — $($maintenanceNotificationStatus.Text)" `
+                -TitleEmoji $maintenanceNotificationTitleEmoji `
                 -Duration $elapsedTime `
-                -StatusLines @(
-                    ":wrench: Регламентні операції завершено"
-                ) `
+                -StatusLines @() `
                 -Details @($completedCheckLines.ToArray()) `
                 -LogPath $LOG_FILE
             $shouldSend = $true
@@ -2637,39 +4008,98 @@ if ($BravoWebMaintenanceEnabled -and (Test-Path $BRAVO_WEB_DIR)) {
     }
 }
 
-# Каталог розташування скрипта перевіряється окремо, а робочі шляхи
-# беруться зі спільної секції pathSettings у BRAVO.config.
-$scriptPath = $bravoScriptDirectory
-
-if ((Split-Path -Leaf $scriptPath) -ne "ARCHIV") {
-    $errorMessage = "ПОМИЛКА: Скрипт має запускатись лише з папки ARCHIV!"
-    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $errorMessage" | Out-File "$env:TEMP\lims_error.log" -Append
-    Write-Host $errorMessage -ForegroundColor Red
-    exit 90
-}
-
-$ROOT_LIMS = [Environment]::ExpandEnvironmentVariables([string]$pathSettings.LIMSRoot)
-$ARCHIVE_ROOT = [Environment]::ExpandEnvironmentVariables([string]$pathSettings.ArchiveRoot)
+# Робочі шляхи беруться зі спільної секції pathSettings у BRAVO.config,
+# а не з імені каталогу скрипта. Раніше тут була жорстка вимога "каталог
+# скрипта має називатись буквально ARCHIV" — той самий крихкий здогад,
+# що вже прибрано з ArchiveRoot (pathSettings): він працював лише
+# випадково, коли комплект справді розгорнутий у теці з таким іменем, і
+# блокував Maintenance у будь-якому іншому розташуванні (наприклад,
+# git-чекаут з іменем репозиторію) без жодної реальної причини —
+# ArchiveRoot/LIMSRoot і так явно задані нижче.
+# Ефективні корені обчислює BRAVO.config: EffectiveLIMSRoot (explicit/AUTO),
+# SystemLogRoot (системні журнали), runtimeLogRoot (журнали скриптів),
+# stateRoot (машинний стан). Maintenance їх лише споживає.
+$ROOT_LIMS = [string]$effectiveLimsRoot
+$SYSTEM_LOG_ROOT = [string]$systemLogRoot
 if ([string]::IsNullOrWhiteSpace($ROOT_LIMS) -or
-    [string]::IsNullOrWhiteSpace($ARCHIVE_ROOT)) {
-    Write-Host "ПОМИЛКА: У BRAVO.config не налаштовано pathSettings.LIMSRoot або pathSettings.ArchiveRoot" -ForegroundColor Red
+    [string]::IsNullOrWhiteSpace($SYSTEM_LOG_ROOT)) {
+    Write-Host "ПОМИЛКА: У BRAVO.config не визначено EffectiveLIMSRoot або SystemLogRoot" -ForegroundColor Red
     exit 30
 }
 # Похідні шляхи
-$MODEL_PATH = "$ROOT_LIMS\Model"
-$LOG_DIR = Join-Path $ARCHIVE_ROOT "LOGS"
-$TRACE_DIR = Join-Path $ARCHIVE_ROOT "Trace"
+# MODEL_PATH: джерело істини — Resolve-BRAVOInstallationDiscovery
+# (bravoDiscoveryResult.MODEL_SOURCE, той самий, що вже читає Archive).
+# Discovery сам деградує до "$ROOT_LIMS\Model", якщо bravo.ini недоступний
+# — тому це не звужує сумісність, лише замінює локальний здогад на вже
+# перевірене джерело: раніше LIMSRoot-відносний шлях завжди мав збігатися
+# з реальним розташуванням MODEL випадково (лише коли LIMSRoot і справді
+# вказує на корінь інсталяції), а на цій-таки машині вже не збігався.
+$MODEL_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.MODEL_SOURCE)) {
+    [string]$bravoDiscoveryResult.MODEL_SOURCE
+} else {
+    "$ROOT_LIMS\Model"
+}
+# Повний шлях до файлу проєкту (значення MODEL= з bravo.ini як є) — саме
+# те, що приймає bravocmd.exe. Без bravo.ini (Discovery не дав значення)
+# лишається старий здогад "$ROOT_LIMS\MODEL\lims".
+$MODEL_PROJECT_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.MODEL_PROJECT_FILE)) {
+    [string]$bravoDiscoveryResult.MODEL_PROJECT_FILE
+} else {
+    "$ROOT_LIMS\MODEL\lims"
+}
+# bravocmd.exe стоїть поруч із bravo.exe (BRAVO_ROOT), не обов'язково в
+# LIMSRoot. Discovery сам деградує BRAVO_ROOT до LIMSRoot, коли служби
+# BRAVO не знайдено — той самий фолбек, що й був тут раніше.
+$BRAVOCMD_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BRAVO_ROOT)) {
+    Join-Path ([string]$bravoDiscoveryResult.BRAVO_ROOT) "bravocmd.exe"
+} else {
+    "$ROOT_LIMS\bravocmd.exe"
+}
+# Два різні корені (ТЗ RuntimeRoot/SystemLogRoot):
+#   $LOG_DIR         — власні журнали Maintenance (BRAVO_MAINTENANCE_*.log,
+#                      file_sizes_*.csv, restore_done_*.marker) — RuntimeRoot\LOGS.
+#   $SYSTEM_LOG_ROOT — СИСТЕМНІ журнали BRAVO (Trace/exchangAPI/BravoWeb),
+#                      кожен компонент у власній гілці.
+# Їх навмисно не змішують: script-log retention і system-log retention —
+# дві незалежні політики над двома різними каталогами.
+$LOG_DIR = [string]$runtimeLogRoot
+$TRACE_DIR = Join-Path $SYSTEM_LOG_ROOT "Trace"
+$EXCHANGE_LOG_DIR = Join-Path $SYSTEM_LOG_ROOT "exchangAPI"
+$BRAVOWEB_LOG_DIR = Join-Path $SYSTEM_LOG_ROOT "BravoWeb"
+$APACHE_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Apache"
+$BRAVOWEB_APP_LOG_DIR = Join-Path $BRAVOWEB_LOG_DIR "Application"
+# Сам застосунок уже ротує свої журнали: у робочому каталозі одночасно
+# лежать exchangAPI.log, exchangAPI_1.log, exchangAPI_2.log. Історично
+# траплялися обидва шаблони імен, тому шукаємо за обома — з обов'язковою
+# дедуплікацією за FullName усередині Get-BRAVOExchangeApiLogFiles: старий
+# фільтр "exchangAPI_*.log" пропускав саме поточний файл (без номера), а
+# сам по собі "exchangAPI*.log" не покриває історичних розгортань.
+$EXCHANGAPI_LOG_FILTERS = @("exchangAPI_*.log", "exchangAPI*.log")
+# Apache тримає в apache\logs не лише журнали: httpd.pid, *.lock і тимчасові
+# файли — це службові файли, які httpd очікує знайти на місці після старту.
+$APACHE_LOG_FILTER = "*.log"
+$BRAVOWEB_APP_LOG_FILTER = "*.log"
+# Каталог контрольних архівів MODEL (before/after реставрації) — той самий
+# BackupRoot\MODEL, що й щоденні backup MODEL (archiveDirs.Model). Fallback
+# лишається BackupRoot-відносним, а не ArchiveRoot-відносним.
 $ARC_DIR = if ($archiveDirs -and
     -not [string]::IsNullOrWhiteSpace([string]$archiveDirs.Model)) {
     [string]$archiveDirs.Model
 } else {
-    Join-Path $ARCHIVE_ROOT "MODEL"
+    Join-Path ([string]$backupRootPath) "MODEL"
 }
-$ARC_PATH = Join-Path $ARCHIVE_ROOT "Tools\7za.exe"
-$EXCHANGAPI_ARCHIV_DIR = Join-Path $ARCHIVE_ROOT "exchangAPI"
+# 7za.exe — runtime-залежність комплекту, тому джерело істини те саме, що й
+# для Archive: $arcPath з BRAVO.config (RuntimeRoot\Tools). Раніше тут стояв
+# власний Join-Path від ARCHIVE_ROOT — і на розгортанні, де архіви лежать не
+# поруч зі скриптами, Maintenance шукав архіватор там, де його немає, тоді як
+# Archive у тому самому запуску знаходив його правильно.
+$ARC_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$arcPath)) {
+    [string]$arcPath
+} else {
+    Join-Path $bravoScriptDirectory "Tools\7za.exe"
+}
 
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
-    $BRAVO_WEB_ARCHIV_DIR = Join-Path $ARCHIVE_ROOT "Br-a-vo.web"
     $APACHE_LOGS_DIR = "$BRAVO_WEB_DIR\apache\logs"
     $WWW_LOGS_DIR = "$BRAVO_WEB_DIR\www\log"
 }
@@ -2689,6 +4119,7 @@ if (-not (Test-Path $LOG_DIR)) {
 # Ініціалізація дати
 $currentDate = Get-Date
 $NOW = $currentDate.ToString("yyyyMMdd_HHmm")
+$maintenanceLogRunId = "{0}_PID{1}" -f $currentDate.ToString("yyyyMMdd_HHmmss"), $PID
 $YYYY = $currentDate.Year.ToString("0000")
 $MM = $currentDate.Month.ToString("00")
 $DD = $currentDate.Day.ToString("00")
@@ -2739,9 +4170,16 @@ if ($RunMissedRestoreOnly -and $missedDailyWork) {
 # Похідні файлові шляхи
 $ARCH_NAME1 = "${ArchivePrefix}_before_$NOW.mdz"
 $ARCH_NAME2 = "${ArchivePrefix}_after_$NOW.mdz"
-$LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$NOW.log"
+$LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"
 $SIZES_FILE = "$LOG_DIR\file_sizes_before_$NOW.csv"
-$TRACE_ARCHIV_DIR = "$TRACE_DIR\$YYYY-$MM-$DD"
+# Каталог-дата спільний для всіх компонентів: нумерація журналів рахується
+# в межах конкретної дати, тому TraceSRV_1.out існує і сьогодні, і вчора —
+# у різних каталогах, без жодного зв'язку між номерами.
+$LOG_DATE_FOLDER = "$YYYY-$MM-$DD"
+$TRACE_ARCHIV_DIR = Join-Path $TRACE_DIR $LOG_DATE_FOLDER
+$EXCHANGE_DAILY_LOG_DIR = Join-Path $EXCHANGE_LOG_DIR $LOG_DATE_FOLDER
+$APACHE_DAILY_LOG_DIR = Join-Path $APACHE_LOG_DIR $LOG_DATE_FOLDER
+$BRAVOWEB_APP_DAILY_LOG_DIR = Join-Path $BRAVOWEB_APP_LOG_DIR $LOG_DATE_FOLDER
 $freeSpaceExclusionsText = if ($FREE_SPACE_EXCLUDED_DRIVES.Count -gt 0) {
     $FREE_SPACE_EXCLUDED_DRIVES -join ", "
 } else {
@@ -2774,20 +4212,109 @@ $script:BRAVOMaintenanceCheckSizeStepEnabled = $BravoMaintenanceEnabled -and $Ch
 $script:BRAVOMaintenanceRestoreStepEnabled = $shouldRestore
 $script:BRAVOMaintenanceLogsStepEnabled = $BravoMaintenanceEnabled
 $script:BRAVOMaintenanceArchiveStepEnabled = [bool]$script:EnableArchiveAfterMaintenance
-# Вільне місце, директорії, зупинка служб, відновлення служб і очистка
-# виконуються завжди.
-Initialize-BRAVOMaintenanceSteps -Total (
-    5 +
-    $(if ($script:BRAVOMaintenanceCheckSizeStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceRestoreStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceLogsStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOMaintenanceArchiveStepEnabled) { 1 } else { 0 })
+# dev.14 (round 2): контроль діапазонів ID раніше не мав власного
+# консольного кроку — Test-RangeIdUsage виконувалась мовчки для оператора
+# (лише лог і Slack). Той самий "вимкнене — не рахується" принцип, що й
+# решта опційних кроків вище.
+$script:BRAVOMaintenanceRangeIdStepEnabled = $BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled
+# Міграція старої структури журналів — разова операція. Етап існує лише
+# тоді, коли хоча б один legacy-каталог справді є на диску: на вже
+# мігрованій інсталяції рядок "нічого не мігровано" щодня не потрібен.
+$script:BRAVOMaintenanceLegacyMigrationPlan = @(
+    Get-BRAVOLegacyLogMigrationPlan -ArchiveRoot (Split-Path -Path $SYSTEM_LOG_ROOT -Parent) -LogRoot $SYSTEM_LOG_ROOT |
+        Where-Object {
+            ($_.ComponentName -ne 'BravoWeb' -or $BravoWebLegacyDataEnabled) -and
+                ($_.ComponentName -ne 'exchangAPI' -or $exchangAPILegacyDataEnabled) -and
+                (Test-Path -LiteralPath $_.LegacyPath -PathType Container)
+        }
 )
+$script:BRAVOMaintenanceMigrationStepEnabled = ($script:BRAVOMaintenanceLegacyMigrationPlan.Count -gt 0)
+# dev.15: стабільний операційний цикл — РІВНО 8 кроків завжди рендеряться,
+# номер кроку НІКОЛИ не пропускається (лише статус OK/WARN/FAIL/SKIPPED
+# залежить від того, чи ввімкнена/потрібна дія цього прогону):
+#   [1/8] Перевірка вільного місця
+#   [2/8] Створення необхідних директорій
+#   [3/8] Зупинка служб
+#   [4/8] Перевірка розмірів .md
+#   [5/8] Реставрація моделі
+#   [6/8] Обробка trace і логів
+#   [7/8] Відновлення стану служб
+#   [8/8] Контроль діапазонів ID
+# Раніше CheckSize/Restore/Logs/RangeId пропускали крок ЦІЛКОМ, коли
+# вимкнені/не заплановані — номер зсувався, і на реальній інсталяції
+# прогін міг "закінчитись" на [7/N] замість очікуваного останнього
+# кроку. Total — буквальний літерал 8, НЕ вираз: Міграція старих
+# журналів, Очистка старих даних і запуск BRAVO_ARCHIV — по-справжньому
+# опційні операції поза цим затвердженим контрактом (detailed LOG,
+# видимі в Плані операцій, але БЕЗ власного [N/8] і без виклику
+# Write-BRAVOMaintenanceStep) — тому не додаються до Total.
+Initialize-BRAVOMaintenanceSteps -Total 8
 Write-BRAVOHeader `
     -Title ("BRAVO MAINTENANCE {0}" -f $global:ScriptVersion) `
-    -Institution ([string]$script:ObjectName) `
+    -Institution ([string]$bravoSettings.InstitutionName) `
     -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+    -Mode (Get-BRAVOMaintenanceExecutionMode -UserSid $currentIdentity.User.Value) `
     -StartedAt $script:ScriptStartTime
+
+# AutoShutdown=on вимикає сервер ПІСЛЯ успішного завершення — оператор має
+# побачити це до того, як почнеться виконання, а не дізнатися постфактум
+# із логу (docs/OPERATOR_CONSOLE_UX.md §5, "критичний інваріант": скрипт
+# може змінювати систему).
+if ($script:EnableAutoShutdown) {
+    Write-Host ''
+    Write-Host 'УВАГА:' -ForegroundColor Yellow
+    Write-Host '  Після успішного завершення сервер буде вимкнено.' -ForegroundColor Yellow
+}
+
+# План операцій: те саме "plan-first" правило, що вже застосовано в Dry
+# Run/Setup — оператор бачить, ЩО саме виконуватиметься, ще до першого
+# кроку. Джерело значень — ті самі прапорці, що вже визначають нумерацію
+# кроків нижче (Initialize-BRAVOMaintenanceSteps), тому план і фактичне
+# виконання не можуть розійтися.
+$maintenancePlanEntries = [ordered]@{
+    'Міграція старих журналів'        = [bool]$script:BRAVOMaintenanceMigrationStepEnabled
+    # dev.14 (round 3): два окремі operator decisions, не один bool.
+    # "Відновлення пропущених операцій" — чи активний цього прогону
+    # механізм відновлення пропущеної роботи ($RunMissedRestoreOnly і
+    # справді щось пропущено, $missedDailyWork) — та сама умова, що вище
+    # (рядок ~3957) вмикає EnableArchiveAfterMaintenance для recovery, і
+    # нижче (~4151, ~4467) керує іншими recovery-гілками; це ширше, ніж
+    # сама реставрація моделі. "Реставрація моделі" — чи фактично
+    # виконається крок реставрації в ЦЬОМУ прогоні ($shouldRestore:
+    # -ForceRestore АБО ця сама missed-recovery умова, АБО плановий
+    # день/час) — саме те, що показує крок [N/TOTAL] нижче.
+    'Відновлення пропущених операцій' = [bool]($RunMissedRestoreOnly -and $missedDailyWork)
+    'Перевірка розмірів'              = [bool]$script:BRAVOMaintenanceCheckSizeStepEnabled
+    'Maintenance BRAVO'               = [bool]$BravoMaintenanceEnabled
+    'Реставрація моделі'              = [bool]$script:BRAVOMaintenanceRestoreStepEnabled
+    # dev.16: очистка не має власного on/off прапорця — політика
+    # оцінюється КОЖЕН прогін (немає гілки, яка пропускає весь блок
+    # "===== ОЧИСТКА СТАРИХ ДАНИХ ====="), тому це не UI-only "ТАК", а
+    # буквальне відображення того, що секція завжди виконується. ТАК тут
+    # означає "перевірку буде проведено", а не "щось буде видалено" —
+    # порожній результат (немає застарілих даних) рендериться SKIPPED
+    # на самій операції нижче, план про це не сигналить окремо.
+    'Очистка старих даних/логів'      = $true
+    'Архівація після maintenance'     = [bool]$script:BRAVOMaintenanceArchiveStepEnabled
+    'Автоматичне вимкнення сервера'   = [bool]$script:EnableAutoShutdown
+}
+$maintenancePlanLabelWidth = (
+    $maintenancePlanEntries.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum
+).Maximum + 3
+Write-Host ''
+Write-Host 'План операцій:'
+Write-Host ''
+foreach ($planEntry in $maintenancePlanEntries.GetEnumerator()) {
+    $planLabel = ("{0}:" -f $planEntry.Key).PadRight($maintenancePlanLabelWidth)
+    $planValue = if ($planEntry.Value) { 'ТАК' } else { 'НІ' }
+    Write-Host ("  {0}{1}" -f $planLabel, $planValue)
+}
+Write-Host ''
+# dev.15: '='-роздільник (Write-BRAVOHeaderSeparator), не '-'
+# (Write-BRAVOSeparator) — План операцій є продовженням того самого
+# титульного блоку, що відкрив Write-BRAVOHeader вище, а не окремим
+# блоком РЕЗУЛЬТАТ.
+Write-BRAVOHeaderSeparator
 
 Write-Log -Message "==="
 Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАПУЩЕНА ==="
@@ -2798,9 +4325,6 @@ Write-Log -Message "Конфігурація: $ConfigPath" -NoTimestamp
 Write-Log -Message "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); Hash=$($BRAVOCompatibility.FileHashProvider); Files=$($BRAVOCompatibility.ChildItemProvider)" -NoTimestamp
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
     Write-Log -Message $BRAVOPowerShellUpdate.Message -Level "WARNING"
-}
-if ($BRAVOWindowsPatchLevel.IsUpdateRecommended) {
-    Write-Log -Message $BRAVOWindowsPatchLevel.Message -Level "WARNING"
 }
 $script:BRAVOOSSupportTier = Get-BRAVOOSSupportTier
 Write-Log -Message "Підтримка ОС: $($script:BRAVOOSSupportTier.Tier) — Windows $($script:BRAVOOSSupportTier.OperatingSystem) ($($script:BRAVOOSSupportTier.OperatingSystemVersion), build $($script:BRAVOOSSupportTier.Build)); PowerShell $($script:BRAVOOSSupportTier.PowerShellVersion); .NET release $($script:BRAVOOSSupportTier.DotNetRelease)" -NoTimestamp
@@ -2825,7 +4349,7 @@ if ($script:BRAVOToolIntegrity.HasIntegrityIssue) {
 # здатний заблокувати запуск. Maintenance викликає архіватор і WinSCP,
 # тому підмінений інструмент так само отримав би права SYSTEM.
 $script:BRAVOToolManifestMode = 'Enforce'
-$script:BRAVOToolManifestPath = Join-Path $bravoScriptDirectory "TOOLS_MANIFEST.json"
+$script:BRAVOToolManifestPath = Join-Path $toolsPath "TOOLS_MANIFEST.json"
 if ($toolIntegritySettings -is [System.Collections.IDictionary]) {
     if (-not [string]::IsNullOrWhiteSpace([string]$toolIntegritySettings.Mode)) {
         $script:BRAVOToolManifestMode = [string]$toolIntegritySettings.Mode
@@ -2861,6 +4385,23 @@ Write-Log -Message "Дата: $($currentDate.ToString('yyyy-MM-dd'))" -NoTimesta
 Write-Log -Message "Час: $($currentDate.ToString('HH:mm:ss'))" -NoTimestamp
 if ($RunMissedRestoreOnly -and -not $missedDailyWork) {
     Write-Log -Message "Recovery: пропущених Backup/Maintenance не знайдено; завершення без дій" -Level 'INFO'
+    # dev.16: раніше тут був голий "exit 0" без жодного підсумку —
+    # оператор бачив заголовок і План операцій (вище), а потім одразу
+    # "Натисніть будь-яку клавішу..." від зовнішнього finally, без
+    # жодного результату. [1/8]...[8/8] свідомо НЕ запускаються: реальних
+    # операцій цього прогону немає, фальшиві numbered steps ввели б в
+    # оману (не основний 8-step run, окремий compact no-op summary).
+    # Зовнішній try/finally (рядок ~55) все одно охоплює цей exit —
+    # Wait-BRAVOManualExit спрацьовує так само, як і завжди.
+    Complete-BRAVOProgress
+    Write-BRAVOFinalSummaryHeader `
+        -Title 'BRAVO MAINTENANCE' `
+        -Status 'УСПІШНО' `
+        -StatusColor Green
+    Write-BRAVOResultField -Label 'Статус' -Value 'УСПІШНО' -Color Green
+    Write-BRAVOResultField -Label 'Код завершення' -Value ("0 — {0}" -f (Get-BRAVOExitCodeName -Code 0))
+    Write-BRAVOResultField -Label 'Результат' -Value 'Пропущених операцій не знайдено'
+    Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
     exit 0
 }
 Write-Log -Message "Повідомлення: $NotificationProviderDisplayName; режим $(switch ($script:SlackMode) {'none' {'ВИМКНЕНО'} 'errors_only' {'ЛИШЕ ПОМИЛКИ'} 'all' {'УСІ ПОВІДОМЛЕННЯ'}})" -NoTimestamp
@@ -2877,12 +4418,10 @@ if (-not $BravoWebComponentEnabled) {
     Write-Log -Message "Компонент BRAVO Web: ВИМКНЕНО (служба $BravoWebServiceName має тип запуску Disabled)" -NoTimestamp
 } elseif ($ApacheServiceExists) {
     Write-Log -Message "Служба BRAVO Web: $BravoWebServiceDisplayName [$BravoWebServiceName]" -NoTimestamp
-    if ($BravoWebServiceMatchCount -gt 1) {
+    if ($bravoWebComponentPlan.WarnDuplicateService) {
         Write-Log -Message "Знайдено $BravoWebServiceMatchCount служб для одного httpd.exe; обрано службу [$BravoWebServiceName] зі станом $($ApacheService.Status)" -Level "WARNING"
     }
     Write-Log -Message "Обробка веб-логів: $(if ($ApacheEnabled) {'Увімкнена'} else {'Вимкнена'})" -NoTimestamp
-} else {
-    Write-Log -Message "Службу Apache для BRAVO Web не знайдено" -Level "WARNING"
 }
 
 if ($BravoMaintenanceEnabled) {
@@ -2894,6 +4433,67 @@ if ($BravoMaintenanceEnabled) {
     Write-Log -Message "Перевірка розмірів файлів: $(if ($CheckSize) {'УВІМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
     Write-Log -Message "Умови: заданий день=$isRestoreDay, після $RestoreTime=$isAfterRestoreTime" -NoTimestamp
 }
+# ===== ВИЯВЛЕННЯ ДЖЕРЕЛ ЖУРНАЛІВ =====
+# Виконується ДО зупинки служб і до будь-якого переміщення: коли служби вже
+# зупинені, з'ясовувати "а звідки взагалі брати trace" пізно — кожна секунда
+# тут це простій BRAVO. Мовчазного пропуску немає: журнал показує і джерело,
+# і призначення для кожного з чотирьох компонентів, навіть якщо джерела
+# зараз немає.
+Write-Log -Message "==="
+Write-Log -Message "=== ДЖЕРЕЛА ЖУРНАЛІВ ==="
+
+$traceConfiguration = $null
+if ($BravoMaintenanceEnabled) {
+    $traceConfiguration = Get-BRAVOTraceConfiguration `
+        -DiscoveryResult $bravoDiscoveryResult `
+        -TraceRootDirectory $TRACE_DIR `
+        -DateFolderName $LOG_DATE_FOLDER
+    $bravoIniDisplayPath = if ([string]::IsNullOrWhiteSpace($traceConfiguration.IniPath)) {
+        "не знайдено"
+    } else {
+        $traceConfiguration.IniPath
+    }
+    Write-Log -Message "BRAVO INI: $bravoIniDisplayPath" -Level "INFO"
+    Write-Log -Message "Каталог інсталяції BRAVO: $(if ([string]::IsNullOrWhiteSpace($traceConfiguration.InstallationDirectory)) { 'не визначено' } else { $traceConfiguration.InstallationDirectory })" -Level "INFO"
+    if ($traceConfiguration.IsValid) {
+        Write-Log -Message "BRAVO Trace [Debug]/FILE: $($traceConfiguration.TracePath)" -Level "INFO"
+        Write-Log -Message "BRAVO Trace призначення: $($traceConfiguration.DestinationDirectory)" -Level "INFO"
+        if ([bool]$traceConfiguration.IsOutsideInstallation) {
+            Write-Log -Message "BRAVO Trace розташований поза каталогом інсталяції BRAVO ($($traceConfiguration.InstallationDirectory)): $($traceConfiguration.TracePath)" -Level "WARNING"
+        }
+    } else {
+        # ТЗ §22: неможливість визначити trace — саме конфігураційна
+        # помилка, а не інформаційне повідомлення. Обслуговування далі
+        # виконується (реставрація важливіша за ротацію), але запуск
+        # завершиться ненульовим кодом, а причина названа поіменно.
+        $traceConfigurationError = (
+            "Не вдалося визначити журнал BRAVO Trace: файл конфігурації bravo.ini, " +
+            "секція [Debug], ключ FILE. Причина: $($traceConfiguration.Reason)"
+        )
+        Write-Log -Message "ПОМИЛКА: $traceConfigurationError" -Level "ERROR"
+        Send-SlackAlert -Message $traceConfigurationError -IsCritical
+        $script:criticalErrorOccurred = $true
+    }
+}
+
+$exchangeApiRuntime = $null
+if ($exchangAPIServiceEnabled) {
+    $exchangeApiRuntime = Resolve-BRAVOExchangeApiRuntimeDirectory `
+        -ServiceName $ExchangAPIServiceName `
+        -FallbackDirectory $ROOT_LIMS
+    Write-Log -Message "exchangAPI робочий каталог: $($exchangeApiRuntime.Directory) ($($exchangeApiRuntime.Reason))" -Level "INFO"
+    Write-Log -Message "exchangAPI шаблони джерела: $($EXCHANGAPI_LOG_FILTERS -join '; ')" -Level "INFO"
+    Write-Log -Message "exchangAPI призначення: $EXCHANGE_DAILY_LOG_DIR" -Level "INFO"
+}
+
+if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
+    Write-Log -Message "Apache джерело: $APACHE_LOGS_DIR (фільтр: $APACHE_LOG_FILTER, без рекурсії)" -Level "INFO"
+    Write-Log -Message "Apache призначення: $APACHE_DAILY_LOG_DIR" -Level "INFO"
+    Write-Log -Message "BravoWeb корінь журналів: $WWW_LOGS_DIR (фільтр: $BRAVOWEB_APP_LOG_FILTER)" -Level "INFO"
+    Write-Log -Message "BravoWeb рекурсивний обхід: увімкнено (відносна структура каталогів зберігається)" -Level "INFO"
+    Write-Log -Message "BravoWeb призначення: $BRAVOWEB_APP_DAILY_LOG_DIR" -Level "INFO"
+}
+
 Write-Log -Message "==="
 Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="
 Write-BRAVOProgressPhase -Phase 'Перевірка вільного місця' -PercentComplete 5
@@ -2901,10 +4501,16 @@ $spaceCheckResult = Check-FreeSpace -ROOT_LIMS $ROOT_LIMS -ExcludedDrives $FREE_
 
 # Перевірка критичних помилок після перевірки місця
 if (-not $spaceCheckResult) {
-    Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'ERROR' -Details 'недостатньо місця'
+    Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'FAIL' -Details 'недостатньо місця'
     Write-Log -Message "Критична помилка перевірки місця. Завершення скрипта." -Level "ERROR"
+    $diskPreflightExitCode = Get-BRAVOMaintenanceResolvedExitCode
+    $script:maintenanceRuntimeExitCode = $diskPreflightExitCode
+    Write-BRAVOMaintenanceEarlyFailureSummary `
+        -EndedAt (Get-Date) `
+        -ExitCode $diskPreflightExitCode
     Complete-BRAVOProgress
-    exit 60
+    Wait-BRAVOManualExit -NoPause:$NoPause
+    exit $diskPreflightExitCode
 }
 Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'OK'
 
@@ -2912,14 +4518,20 @@ Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця
 # Перевіряємо, чи потрібно створювати будь-які директорії
 $dirsToCreate = @()
 if ($BravoMaintenanceEnabled) {
-    $dirsToCreate += $TRACE_DIR, $ARC_DIR, $TRACE_ARCHIV_DIR
+    $dirsToCreate += $ARC_DIR
+    # Каталог-дата Trace створюється лише тоді, коли є що в нього класти:
+    # без валідного [Debug]/FILE він був би порожньою теку-обіцянкою, яку
+    # потім довелося б архівувати як "старі дані".
+    if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
+        $dirsToCreate += $TRACE_DIR, $TRACE_ARCHIV_DIR
+    }
 }
 if ($exchangAPIServiceEnabled) {
-    $dirsToCreate += $EXCHANGAPI_ARCHIV_DIR
+    $dirsToCreate += $EXCHANGE_LOG_DIR, $EXCHANGE_DAILY_LOG_DIR
 }
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
-    $BRAVO_WEB_DAILY_DIR = "$BRAVO_WEB_ARCHIV_DIR\$YYYY-$MM-$DD"
-    $dirsToCreate += $BRAVO_WEB_ARCHIV_DIR, $BRAVO_WEB_DAILY_DIR
+    $dirsToCreate += $BRAVOWEB_LOG_DIR, $APACHE_LOG_DIR, $APACHE_DAILY_LOG_DIR,
+        $BRAVOWEB_APP_LOG_DIR, $BRAVOWEB_APP_DAILY_LOG_DIR
 }
 
 # Перевіряємо, які директорії потрібно створити.
@@ -2927,11 +4539,16 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 # рівно один, і тоді .Count під Set-StrictMode кидає PropertyNotFoundStrict.
 $missingDirs = @($dirsToCreate | Where-Object { -not (Test-Path $_) })
 
+# dev.14 (round 2): консольний крок 'Створення необхідних директорій'
+# друкується НИЖЧЕ, після lock — об'єднаний з ініціалізацією/міграцією
+# MANIFESTS в один рядок оператора (Не створювати окремий шумний крок
+# щодня). Тут лише виконання й накопичення результату; сам New-Item і
+# позиція відносно lock не змінені.
+$createdDirs = New-Object 'System.Collections.Generic.List[string]'
 if ($missingDirs.Count -gt 0 -or $script:criticalErrorOccurred) {
     Write-Log -Message "==="
     Write-Log -Message "=== СТВОРЕННЯ НЕОБХІДНИХ ДИРЕКТОРІЙ ==="
 
-    $createdDirs = New-Object 'System.Collections.Generic.List[string]'
     foreach ($dir in $dirsToCreate) {
         if (-not (Test-Path $dir)) {
             try {
@@ -2952,16 +4569,8 @@ if ($missingDirs.Count -gt 0 -or $script:criticalErrorOccurred) {
     if ($createdDirs.Count -gt 0) {
         Write-Log -Message "Створено $($createdDirs.Count) директорій" -Level "SUCCESS"
     }
-    Write-BRAVOMaintenanceStep `
-        -Name 'Створення необхідних директорій' `
-        -Status $(if ($script:criticalErrorOccurred) { 'ERROR' } else { 'OK' }) `
-        -Details $(if ($createdDirs.Count -gt 0) { "створено: $($createdDirs.Count)" } else { $null })
-} else {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Створення необхідних директорій' `
-        -Status 'SKIPPED' `
-        -Details 'усі вже існують'
 }
+$directoryCreationFailed = $script:criticalErrorOccurred
 
 Write-BRAVOProgressPhase -Phase 'Зупинка служб' -PercentComplete 20
 $maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock
@@ -2975,6 +4584,155 @@ if (-not $maintenanceLockResult.Success) {
 }
 $script:maintenanceOperationLock = $maintenanceLockResult.Stream
 $script:maintenanceOperationLockPath = $maintenanceLockResult.Path
+
+$bravoLogRotationLogger = { param($Message, $Level) Write-Log -Message $Message -Level $Level }
+
+# ===== ІНІЦІАЛІЗАЦІЯ/МІГРАЦІЯ MANIFESTS (dev.14) =====
+# Під lock, але ДО зупинки служб — та сама причина, що й міграція старих
+# журналів нижче: не потребує зупинених служб. Ідемпотентно переносить
+# legacy BRAVO_BACKUP_*.json з кореня BackupRoot у MANIFESTS\
+# (BRAVO.ArchiveHelpers). Ніколи не блокує Maintenance — конфлікт (різні
+# версії того самого generationId в корені й у MANIFESTS) чи помилка лишає
+# legacy-файл на місці й лише пишеться у лог; наступний запуск повторить
+# спробу. Консольний результат — не окремий крок, а деталь кроку
+# 'Створення необхідних директорій' нижче: на вже мігрованій інсталяції
+# тут щодня немає чого показувати оператору.
+$manifestMigrationResult = Initialize-BRAVOBackupManifestStorage `
+    -BackupRoot $backupRootPath `
+    -Logger $bravoLogRotationLogger
+if ($manifestMigrationResult.Errors.Count -gt 0) {
+    foreach ($manifestMigrationError in $manifestMigrationResult.Errors) {
+        Write-Log -Message "Міграція manifest-ів backup: $manifestMigrationError" -Level "WARNING"
+    }
+}
+if ($manifestMigrationResult.Migrated.Count -gt 0 -or
+    $manifestMigrationResult.Deduplicated.Count -gt 0 -or
+    $manifestMigrationResult.Conflicts.Count -gt 0) {
+    Write-Log -Message (
+        "Міграція manifest-ів backup у MANIFESTS: перенесено " +
+        "$($manifestMigrationResult.Migrated.Count); дедубльовано " +
+        "$($manifestMigrationResult.Deduplicated.Count); конфліктів " +
+        "$($manifestMigrationResult.Conflicts.Count)"
+    ) -Level $(if ($manifestMigrationResult.Conflicts.Count -gt 0) { "WARNING" } else { "SUCCESS" })
+}
+
+# Об'єднаний консольний результат кроку 'Створення необхідних директорій':
+# звичайне створення LOGS-каталогів (вище, до lock) + MANIFESTS init/
+# migration (вище, після lock) — оператор бачить один рядок, а не два
+# майже завжди порожніх кроки. FAIL має пріоритет (реальна відмова), потім
+# WARN (конфлікт міграції — нічого не втрачено, але потребує уваги),
+# інакше OK, інакше SKIPPED, коли жодна з двох дій нічого не зробила.
+$directoryStepDetailParts = New-Object System.Collections.Generic.List[string]
+if ($createdDirs.Count -gt 0) {
+    $directoryStepDetailParts.Add("створено директорій: $($createdDirs.Count)")
+}
+if ($manifestMigrationResult.ManifestRootCreated) {
+    $directoryStepDetailParts.Add("створено: $($manifestMigrationResult.ManifestRoot)")
+}
+if ($manifestMigrationResult.Migrated.Count -gt 0) {
+    $directoryStepDetailParts.Add("перенесено manifest-ів: $($manifestMigrationResult.Migrated.Count)")
+}
+if ($manifestMigrationResult.Deduplicated.Count -gt 0) {
+    $directoryStepDetailParts.Add("дедубльовано manifest-ів: $($manifestMigrationResult.Deduplicated.Count)")
+}
+if ($manifestMigrationResult.Conflicts.Count -gt 0) {
+    $directoryStepDetailParts.Add("конфліктів manifest-ів: $($manifestMigrationResult.Conflicts.Count)")
+}
+if ($manifestMigrationResult.Errors.Count -gt 0) {
+    $directoryStepDetailParts.Add("помилок міграції manifest-ів: $($manifestMigrationResult.Errors.Count)")
+}
+
+# dev.14 (round 3): manifest migration контракт лишається non-fatal/
+# retryable (round 1) — FAIL тут означає лише РЕАЛЬНУ відмову створення
+# LOGS-каталогів (директорія, потрібна Maintenance/трасуванню, не
+# з'явилась). Конфлікт чи помилка міграції manifest-ів — WARN: нічого не
+# втрачено (legacy-файл лишається на місці, наступний запуск повторить
+# спробу), Maintenance через це не вважається failed.
+$directoryStepStatus = if ($directoryCreationFailed) {
+    'FAIL'
+} elseif ($manifestMigrationResult.Conflicts.Count -gt 0 -or $manifestMigrationResult.Errors.Count -gt 0) {
+    'WARN'
+} elseif ($directoryStepDetailParts.Count -gt 0) {
+    'OK'
+} else {
+    'SKIPPED'
+}
+if ($directoryStepStatus -eq 'SKIPPED') {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Створення необхідних директорій' `
+        -Status 'SKIPPED' `
+        -Details 'усі вже існують'
+} else {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Створення необхідних директорій' `
+        -Status $directoryStepStatus `
+        -Details ($directoryStepDetailParts -join "`n")
+}
+
+# ===== МІГРАЦІЯ СТАРОЇ СТРУКТУРИ ЖУРНАЛІВ =====
+# Під lock, але ДО зупинки служб: міграція торкається лише вже заархівованих
+# журналів у ArchiveRoot, тримати заради неї BRAVO зупиненим не потрібно.
+# Виконується перед ротацією, щоб нові файли лягали у вже впорядковане дерево.
+$migrationOperationStartedAt = Get-Date
+if ($script:BRAVOMaintenanceMigrationStepEnabled) {
+    Write-Log -Message "==="
+    Write-Log -Message "=== МІГРАЦІЯ СТАРОЇ СТРУКТУРИ ЖУРНАЛІВ ==="
+    $migratedTotal = 0
+    $migrationFailedTotal = 0
+    foreach ($migrationEntry in $script:BRAVOMaintenanceLegacyMigrationPlan) {
+        try {
+            $migrationResult = Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $migrationEntry.LegacyPath `
+                -DestinationPath $migrationEntry.DestinationPath `
+                -LogicalBaseName ([string]$migrationEntry.LogicalBaseName) `
+                -RetryCount $MoveRetryCount `
+                -RetryDelaySeconds $MoveRetryDelaySeconds `
+                -Logger $bravoLogRotationLogger
+            $migratedTotal += [int]$migrationResult.Migrated
+            $migrationFailedTotal += [int]$migrationResult.Failed
+        } catch {
+            $migrationFailedTotal++
+            Write-Log -Message "ПОМИЛКА міграції каталогу $($migrationEntry.LegacyPath): $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    # dev.15: міграція — опційна разова операція поза затвердженим [N/8]
+    # контрактом (не numbered main step); підсумок лишається в LOG, без
+    # Write-BRAVOMaintenanceStep і без власного номера кроку. Невдала
+    # міграція не знищує нічого: джерело лишається на місці й переїде
+    # наступного запуску, тому рівень лишається INFO (як і раніше — per-
+    # directory помилки вище вже логуються окремо рівнем ERROR).
+    Write-Log -Message $(if ($migratedTotal -gt 0 -or $migrationFailedTotal -gt 0) {
+        "Міграція старої структури журналів завершена: перенесено $migratedTotal; не вдалося $migrationFailedTotal"
+    } else {
+        "Міграція старої структури журналів: нічого переносити"
+    })
+    # dev.16: та сама причина, що execution result нижче для Cleanup/
+    # Archive/AutoShutdown — операція РЕАЛЬНО виконується щоразу, коли
+    # увімкнена, але досі мала лише LOG-видимість. WARN, а не FAIL: невдала
+    # міграція не критична (semantics вище незмінні — це той самий
+    # $migrationFailedTotal, що вже керував рівнем LOG-повідомлення).
+    Write-BRAVOOperationResult `
+        -Name 'Міграція старих журналів' `
+        -Status $(if ($migrationFailedTotal -gt 0) { 'WARN' } else { 'OK' }) `
+        -Duration ((Get-Date) - $migrationOperationStartedAt) `
+        -Details $(if ($migrationFailedTotal -gt 0) {
+            "перенесено: $migratedTotal; не вдалося: $migrationFailedTotal"
+        } elseif ($migratedTotal -gt 0) {
+            "перенесено файлів: $migratedTotal"
+        } else {
+            "нічого переносити"
+        })
+} else {
+    # dev.16: немає застарілих каталогів для міграції цього прогону —
+    # той самий SKIPPED/'не заплановано на цей запуск' контраст, що вже
+    # застосований до Restore/SizeCheck/Logs/RangeId.
+    Write-BRAVOOperationResult `
+        -Name 'Міграція старих журналів' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $migrationOperationStartedAt) `
+        -Details 'не заплановано на цей запуск'
+}
+
 $traceOutputProcessed = $false
 $traceOutputProcessedCount = 0
 $exchangAPILogsFoundCount = 0
@@ -3088,8 +4846,6 @@ if ($exchangAPIServiceEnabled) {
     }
 } elseif ($exchangAPIServiceDisabled) {
     Write-Log -Message "Служба $ExchangAPIServiceName має тип запуску Disabled - керування пропущено" -Level "INFO"
-} else {
-    Write-Log -Message "Службу $ExchangAPIServiceName не встановлено - керування пропущено" -Level "INFO"
 }
 
 # 3. Зупинка служби BRAVO
@@ -3152,6 +4908,8 @@ Write-BRAVOMaintenanceStep `
 Write-BRAVOProgressPhase -Phase 'Перевірка розмірів .md' -PercentComplete 35
 $checkSizeCriticalBefore = $script:criticalErrorOccurred
 $checkSizeWarningsBefore = $script:BRAVOWarningCount
+# dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
+# 'вимкнено', коли перевірку розмірів вимкнено, а не пропуск номера кроку.
 if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
     Check-MdFileSizes -MODEL_PATH $MODEL_PATH -MAX_MD_FILE_SIZE $MAX_MD_FILE_SIZE -ExcludePatterns $MD_FILE_SIZE_EXCLUSIONS
     Write-BRAVOMaintenanceStep `
@@ -3159,6 +4917,11 @@ if ($script:BRAVOMaintenanceCheckSizeStepEnabled) {
         -Status (Get-BRAVOMaintenanceStepStatus `
             -CriticalBefore $checkSizeCriticalBefore `
             -WarningsBefore $checkSizeWarningsBefore)
+} else {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Перевірка розмірів .md' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
 }
 
 # ===== ОПЕРАЦІЇ ПІСЛЯ ЗУПИНКИ СЕРВІСІВ =====
@@ -3166,7 +4929,11 @@ Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentCo
 $restoreCriticalBefore = $script:criticalErrorOccurred
 $restoreWarningsBefore = $script:BRAVOWarningCount
 $restoreStepReported = $false
-$logsStepReported = $false
+# Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
+# станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
+# коли BRAVO зупинити не вдалося.
+$logsCriticalBefore = $script:criticalErrorOccurred
+$logsWarningsBefore = $script:BRAVOWarningCount
 $bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
 if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
     if ($shouldRestore) {
@@ -3239,8 +5006,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 Write-Log -Message "Архів моделі перед реставрацією створено та перевірено -> $beforeArchivePath" -Level "SUCCESS"
                 
                 # Виконання реставрації через bravocmd.exe (як в еталоні)
-                $restoreArgs = @("r", "null", "$ROOT_LIMS\MODEL\lims")
-                $exitCode = Invoke-CommandWithLog -Command "$ROOT_LIMS\bravocmd.exe" -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
+                $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
                 
                 if ($exitCode -eq 0) {
                     $restoreCompletedAt = Get-Date
@@ -3359,26 +5126,20 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
 
     # Обробка Trace належить лише до компонента основної служби BRAVO.
     Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
-    $logsCriticalBefore = $script:criticalErrorOccurred
-    $logsWarningsBefore = $script:BRAVOWarningCount
     try {
-        $outFiles = Get-ChildItem -Path "$ROOT_LIMS" -Filter "*.out" -ErrorAction SilentlyContinue
-        if ($outFiles) {
+        if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
             Write-Log -Message "==="
             Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"
-            $movedTraceCount = 0
-            foreach ($file in $outFiles) {
-                if (Move-WithSequence -sourcePath $file.FullName -destDir $TRACE_ARCHIV_DIR -SkipIfEmpty) {
-                    $movedTraceCount++
-                }
-            }
-            if ($movedTraceCount -gt 0) {
-                $traceOutputProcessed = $true
-                $traceOutputProcessedCount = $movedTraceCount
-                Write-Log -Message "Оброблено $movedTraceCount з $($outFiles.Count) trace-файлів" -Level "SUCCESS"
-            }
-            if ($movedTraceCount -lt $outFiles.Count) {
-                Write-Log -Message "Не переміщено $($outFiles.Count - $movedTraceCount) з $($outFiles.Count) trace-файлів" -Level "WARNING"
+            $traceRotationSummary = Invoke-BRAVOTraceRotation `
+                -TracePath $traceConfiguration.TracePath `
+                -DestinationDirectory $traceConfiguration.DestinationDirectory `
+                -RetryCount $MoveRetryCount `
+                -RetryDelaySeconds $MoveRetryDelaySeconds `
+                -Logger $bravoLogRotationLogger
+            $traceOutputProcessedCount = [int]$traceRotationSummary.Moved
+            $traceOutputProcessed = ($traceOutputProcessedCount -gt 0)
+            if ([int]$traceRotationSummary.Errors -gt 0) {
+                $script:criticalErrorOccurred = $true
             }
         }
     }
@@ -3397,70 +5158,133 @@ elseif ($BravoMaintenanceEnabled) {
 }
 
 # Компонент exchangAPI обробляється незалежно, але лише за наявності
-# встановленої та не відключеної служби.
+# встановленої та не відключеної служби — і лише коли вона фактично
+# зупинена: переміщувати журнал з-під працюючого застосунку означає або
+# отримати відмову доступу, або відрізати частину записів.
 if ($exchangAPIServiceEnabled) {
-    try {
-        $exchangAPILogs = Get-ChildItem -Path "$ROOT_LIMS" -Filter "exchangAPI_*.log" -ErrorAction SilentlyContinue
-        if ($exchangAPILogs) {
-            $exchangAPILogsFoundCount = @($exchangAPILogs).Count
+    $exchangAPIStatus = try {
+        [string](Get-Service -Name $ExchangAPIServiceName -ErrorAction Stop).Status
+    } catch {
+        'Unknown'
+    }
+    if ($exchangAPIStatus -eq 'Stopped') {
+        try {
             Write-Log "==="
             Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"
-            foreach ($file in $exchangAPILogs) {
-                if (Move-ExchangAPILogs -sourcePath $file.FullName -destDir $EXCHANGAPI_ARCHIV_DIR) {
-                    $exchangAPILogsProcessedCount++
-                }
+            $exchangeRotationSummary = Invoke-BRAVOExchangeApiLogRotation `
+                -SourceDirectory ([string]$exchangeApiRuntime.Directory) `
+                -DestinationDirectory $EXCHANGE_DAILY_LOG_DIR `
+                -Patterns $EXCHANGAPI_LOG_FILTERS `
+                -RetryCount $MoveRetryCount `
+                -RetryDelaySeconds $MoveRetryDelaySeconds `
+                -Logger $bravoLogRotationLogger
+            $exchangAPILogsFoundCount = [int]$exchangeRotationSummary.Found
+            $exchangAPILogsProcessedCount = [int]$exchangeRotationSummary.Moved
+            if ([int]$exchangeRotationSummary.Errors -gt 0) {
+                $script:criticalErrorOccurred = $true
             }
-            if ($exchangAPILogsProcessedCount -gt 0) {
-                Write-Log -Message "Оброблено $exchangAPILogsProcessedCount з $exchangAPILogsFoundCount лог-файлів exchangAPI" -Level "SUCCESS"
-            }
-            if ($exchangAPILogsProcessedCount -lt $exchangAPILogsFoundCount) {
-                Write-Log -Message "Не переміщено $($exchangAPILogsFoundCount - $exchangAPILogsProcessedCount) з $exchangAPILogsFoundCount лог-файлів exchangAPI" -Level "WARNING"
-            }
+        } catch {
+            $errorMsg = "Помилка при обробці логів exchangAPI: $($_.Exception.Message)"
+            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+            Send-SlackAlert -Message $errorMsg
+            $script:criticalErrorOccurred = $true
         }
-    } catch {
-        $errorMsg = "Помилка при обробці логів exchangAPI: $($_.Exception.Message)"
-        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-        Send-SlackAlert -Message $errorMsg
-        $script:criticalErrorOccurred = $true
+    } else {
+        Write-Log -Message "Ротацію логів exchangAPI пропущено: службу $ExchangAPIServiceName не зупинено (стан: $exchangAPIStatus)" -Level "WARNING"
     }
 }
 
-# Компонент BRAVO Web обробляється лише за наявності активної служби
-# та необхідних каталогів.
+# Компонент BRAVO Web обробляється лише за наявності активної служби,
+# необхідних каталогів і фактично зупиненого Apache: httpd тримає
+# access.log/error.log відкритими, доки працює.
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
-    try {
-        $apacheLogFiles = @(Get-BRAVOFiles -Path $APACHE_LOGS_DIR |
-            Where-Object { $_.Length -gt 0 })
-        if ($apacheLogFiles) {
+    $bravoWebStatus = try {
+        [string](Get-Service -Name $BravoWebServiceName -ErrorAction Stop).Status
+    } catch {
+        'Unknown'
+    }
+    if ($bravoWebStatus -eq 'Stopped') {
+        try {
             Write-Log "==="
             Write-Log -Message "=== ОБРОБКА ЛОГІВ APACHE ===" -Level "INFO"
-            foreach ($file in $apacheLogFiles) {
-                if (Move-WithSequence -sourcePath $file.FullName -destDir $BRAVO_WEB_DAILY_DIR -SkipIfEmpty) {
-                    $webApacheLogsProcessedCount++
-                }
-            }
-            Write-Log -Message "Оброблено $webApacheLogsProcessedCount з $($apacheLogFiles.Count) Apache файлів" -Level "SUCCESS"
-        }
+            $apacheRotationSummary = Invoke-BRAVOApacheLogRotation `
+                -SourceDirectory $APACHE_LOGS_DIR `
+                -DestinationDirectory $APACHE_DAILY_LOG_DIR `
+                -Filter $APACHE_LOG_FILTER `
+                -RetryCount $MoveRetryCount `
+                -RetryDelaySeconds $MoveRetryDelaySeconds `
+                -Logger $bravoLogRotationLogger
+            $webApacheLogsProcessedCount = [int]$apacheRotationSummary.Moved
 
-        $wwwLogFiles = @(Get-BRAVOFiles -Path $WWW_LOGS_DIR |
-            Where-Object { $_.Length -gt 0 })
-        if ($wwwLogFiles) {
             Write-Log -Message "==="
-            Write-Log -Message "=== ОБРОБКА ЛОГІВ WWW ===" -Level "INFO"
-            foreach ($file in $wwwLogFiles) {
-                if (Move-WithSequence -sourcePath $file.FullName -destDir $BRAVO_WEB_DAILY_DIR -SkipIfEmpty) {
-                    $webWwwLogsProcessedCount++
-                }
-            }
-            Write-Log -Message "Оброблено $webWwwLogsProcessedCount з $($wwwLogFiles.Count) WWW файлів" -Level "SUCCESS"
-        }
-    } catch {
-        $errorMsg = "Помилка при обробці логів BRAVO Web: $($_.Exception.Message)"
-        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-        Send-SlackAlert -Message $errorMsg
-        $script:criticalErrorOccurred = $true
-    }
+            Write-Log -Message "=== ОБРОБКА ЛОГІВ BRAVO WEB APPLICATION ===" -Level "INFO"
+            $webApplicationRotationSummary = Invoke-BRAVOWebApplicationLogRotation `
+                -SourceDirectory $WWW_LOGS_DIR `
+                -DestinationDirectory $BRAVOWEB_APP_DAILY_LOG_DIR `
+                -Filter $BRAVOWEB_APP_LOG_FILTER `
+                -RetryCount $MoveRetryCount `
+                -RetryDelaySeconds $MoveRetryDelaySeconds `
+                -Logger $bravoLogRotationLogger
+            $webWwwLogsProcessedCount = [int]$webApplicationRotationSummary.Moved
 
+            if ([int]$apacheRotationSummary.Errors -gt 0 -or
+                [int]$webApplicationRotationSummary.Errors -gt 0) {
+                $script:criticalErrorOccurred = $true
+            }
+        } catch {
+            $errorMsg = "Помилка при обробці логів BRAVO Web: $($_.Exception.Message)"
+            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+            Send-SlackAlert -Message $errorMsg
+            $script:criticalErrorOccurred = $true
+        }
+    } else {
+        Write-Log -Message "Ротацію логів BRAVO Web пропущено: службу $BravoWebServiceName не зупинено (стан: $bravoWebStatus)" -Level "WARNING"
+    }
+}
+
+# Реставрація моделі — стабільний крок [5/8], завжди рендериться, і має
+# рендеритись ДО «Обробка trace і логів» [6/8] — той самий порядок, що в
+# затвердженому operator contract, незалежно від того, чи справді
+# виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
+# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з двох причин,
+# які варто розрізняти в Details:
+# - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
+#   заплановане й невиконане, а не «не настав час»;
+# - $shouldRestore було false від самого початку — реставрація цього
+#   прогону не планувалась взагалі (dev.15: раніше цей випадок не
+#   рендерив крок взагалі, номер кроку "з'їдався").
+# dev.15 (виправлення порядку): цей fallback раніше стояв ПІСЛЯ рендеру
+# «Обробка trace і логів» нижче — коли $shouldRestore=false (типовий
+# щоденний прогін без запланованої реставрації), Logs встигав зайняти
+# номер [5/8], а Restore-SKIPPED зсувався на [6/8], міняючи затверджений
+# порядок місцями. Переміщено вище рендеру Logs, щоб порядок номерів
+# лишався стабільним у БУДЬ-якому сценарії.
+if (-not $restoreStepReported) {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Реставрація моделі' `
+        -Status 'SKIPPED' `
+        -Details $(if ($shouldRestore) { 'службу BRAVO не було зупинено' } else { 'не заплановано на цей запуск' })
+}
+
+# Підсумковий рядок етапу — поза блоком BRAVO Web. Раніше він стояв
+# усередині нього, тому на інсталяції без Apache етап «Обробка trace і
+# логів» щоразу друкувався як SKIPPED «службу BRAVO не було зупинено»,
+# хоча trace і exchangAPI щойно успішно оброблені.
+# dev.15: крок завжди рендериться (стабільна нумерація [N/8]); окремий
+# SKIPPED 'вимкнено', коли компонент BRAVO взагалі вимкнено.
+if (-not $script:BRAVOMaintenanceLogsStepEnabled) {
+    Write-BRAVOMaintenanceStep `
+        -Name 'Обробка trace і логів' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
+} elseif ($bravoStatus -eq 'Running') {
+    # Заплановане й невиконане, а не «не настав час»: службу BRAVO не
+    # вдалося зупинити, тому жодного журналу не чіпали.
+    Write-BRAVOMaintenanceStep `
+        -Name 'Обробка trace і логів' `
+        -Status 'SKIPPED' `
+        -Details 'службу BRAVO не було зупинено'
+} else {
     $processedLogCounts = $traceOutputProcessedCount +
         $exchangAPILogsProcessedCount +
         $webApacheLogsProcessedCount +
@@ -3471,29 +5295,6 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
             -CriticalBefore $logsCriticalBefore `
             -WarningsBefore $logsWarningsBefore) `
         -Details $(if ($processedLogCounts -gt 0) { "оброблено файлів: $processedLogCounts" } else { $null })
-    $logsStepReported = $true
-}
-
-# Реставрація й обробка логів виконуються лише при зупиненій службі BRAVO.
-# Кожен прапорець окремий: спільний давав би подвійний рядок «Обробка trace
-# і логів» у найзвичайнішому випадку — служба зупинена, реставрація сьогодні
-# не запланована.
-#
-# Сюди потрапляємо, лише якщо етап був порахований, але його гілка не
-# відпрацювала — тобто службу BRAVO не вдалося зупинити. Це не «не настав
-# час» (такий запуск взагалі не рахує реставрацію), а заплановане й
-# невиконане, тому рядок обов'язковий.
-if ($script:BRAVOMaintenanceRestoreStepEnabled -and -not $restoreStepReported) {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Реставрація моделі' `
-        -Status 'SKIPPED' `
-        -Details 'службу BRAVO не було зупинено'
-}
-if ($script:BRAVOMaintenanceLogsStepEnabled -and -not $logsStepReported) {
-    Write-BRAVOMaintenanceStep `
-        -Name 'Обробка trace і логів' `
-        -Status 'SKIPPED' `
-        -Details 'службу BRAVO не було зупинено'
 }
 
 } finally {
@@ -3526,6 +5327,17 @@ try {
     Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
     Send-SlackAlert -Message $errorMsg -IsCritical
     $script:criticalErrorOccurred = $true
+}
+
+# Діагностика, не перевірка: BRAVO створює trace лише під час першої
+# debug-події, тому його відсутність одразу після старту нормальна. Рядок
+# у журналі потрібен лише для того, щоб при розборі інциденту було видно
+# фактичний стан, а не доводилося здогадуватись. На exit code не впливає.
+if ($BravoMaintenanceEnabled -and $null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
+    $traceRecreated = Test-Path -LiteralPath $traceConfiguration.TracePath -PathType Leaf
+    Write-Log -Message (
+        "BRAVO Trace після запуску служби: $(if ($traceRecreated) { 'створено заново' } else { 'ще не створено (очікувано до першої debug-події)' }) — $($traceConfiguration.TracePath)"
+    ) -Level "INFO"
 }
 
 # 2. Запуск exchangAPI лише через встановлену та не відключену Windows-службу
@@ -3589,28 +5401,114 @@ Write-BRAVOMaintenanceStep `
         -WarningsBefore $restoreServicesWarningsBefore)
 }
 
+# dev.15: усе від Range ID до Send-FinalReport раніше не мало жодного
+# захисту від винятків — необроблена помилка будь-де в цьому діапазоні
+# (Cleanup/Archive-launch/AutoShutdown/Send-FinalReport) пропускала решту
+# зовнішнього try (4474) аж до фінального summary й одразу потрапляла у
+# зовнішній finally (Wait-BRAVOManualExit, рядок ~5512) — оператор бачив
+# останній надрукований крок і одразу "Натисніть будь-яку клавішу...",
+# без жодного підсумку. Тепер будь-яка помилка тут логується/позначає
+# criticalErrorOccurred, але виконання ГАРАНТОВАНО доходить до обчислення
+# exit code і друку фінального summary нижче.
+#
+# dev.16: $script:currentMaintenanceOperation називає активну операцію
+# цього діапазону для catch нижче — щоб повідомлення про необроблену
+# помилку називало конкретну дію ("Помилка операції ..."), а не
+# generic "Range ID/очистка/BRAVO_ARCHIV/AutoShutdown/фінальний звіт".
+# Кожен подальший блок оновлює цю змінну перед своїм початком.
+try {
+
+$script:currentMaintenanceOperation = 'Контроль діапазонів ID'
 if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
     if ($RangeIdCheckDelaySeconds -gt 0) {
         Start-Sleep -Seconds $RangeIdCheckDelaySeconds
     }
-    Test-RangeIdUsage -Path $RangeIdLogPath -ThresholdPercent $RangeIdThresholdPercent
+    # dev.14 (round 3): відсутній/непрочитаний/перевищений Range ID —
+    # non-blocking WARN, а не критична помилка Maintenance. Test-RangeIdUsage
+    # усередині й далі викликає Send-SlackAlert -IsCritical — це навмисно
+    # НЕ чіпаємо (delivery severity): -IsCritical гарантує, що сповіщення
+    # дійде навіть у NotificationMode=errors_only, і ця частина поведінки
+    # незмінна. Але Send-SlackAlert -IsCritical заразом ставить
+    # $script:criticalErrorOccurred = $true — а ЦЕ вже execution severity
+    # Maintenance (веде до "ПОМИЛКА"/exit 60). Ці два свідомо розв'язані:
+    # снепшот/відкат нижче скасовує ЛИШЕ прапорець критичності, і ЛИШЕ якщо
+    # саме цей виклик його підняв (якщо він уже був true до виклику —
+    # від чогось іншого, — не займаємо його). CriticalErrorsList/сповіщення
+    # errors_only Send-SlackAlert формує так само, як і раніше.
+    $rangeIdWarningsBefore = $script:BRAVOWarningCount
+    $rangeIdCriticalBefore = $script:criticalErrorOccurred
+    $rangeIdCheckResult = Test-RangeIdUsage -Path $RangeIdLogPath -ThresholdPercent $RangeIdThresholdPercent
+    $rangeIdHasWarning = $script:BRAVOWarningCount -gt $rangeIdWarningsBefore
+    if (-not $rangeIdCriticalBefore -and $script:criticalErrorOccurred) {
+        $script:criticalErrorOccurred = $false
+    }
+    $rangeIdDetail = if (-not $rangeIdHasWarning) {
+        $null
+    } elseif ($null -ne $rangeIdCheckResult -and -not [string]::IsNullOrWhiteSpace([string]$rangeIdCheckResult.Reason)) {
+        [string]$rangeIdCheckResult.Reason
+    } else {
+        'перевірте лог для деталей'
+    }
+    Write-BRAVOMaintenanceStep `
+        -Name 'Контроль діапазонів ID' `
+        -Status $(if ($rangeIdHasWarning) { 'WARN' } else { 'OK' }) `
+        -Details $rangeIdDetail
+} else {
+    # dev.15: крок завжди рендериться (стабільна нумерація [N/8]) — SKIPPED
+    # 'вимкнено', коли компонент BRAVO або сам контроль діапазонів вимкнено.
+    Write-BRAVOMaintenanceStep `
+        -Name 'Контроль діапазонів ID' `
+        -Status 'SKIPPED' `
+        -Details 'вимкнено'
 }
 
 # ===== ОЧИСТКА СТАРИХ ДАНИХ =====
 Write-BRAVOProgressPhase -Phase 'Очистка старих даних' -PercentComplete 88
+# dev.16: точна атрибуція для outer fail-safe catch нижче (рядок ~5180) —
+# якщо необроблена помилка станеться десь у Cleanup/Archive/AutoShutdown/
+# фінальному звіті, catch називає САМЕ цю операцію, а не generic список.
+$script:currentMaintenanceOperation = 'Очистка старих даних/логів'
+$cleanupOperationStartedAt = Get-Date
 $cleanupCriticalBefore = $script:criticalErrorOccurred
 $cleanupWarningsBefore = $script:BRAVOWarningCount
+# "Reported" — чи встиг цей блок надрукувати свій Write-BRAVOOperationResult
+# до того, як (якщо) стався виняток: outer catch перевіряє прапорець, щоб
+# не показати FAIL result двічі й не пропустити його, якщо виняток стався
+# ДО власного рендеру блоку.
+$script:cleanupOperationReported = $false
 
 # Перевіряємо, чи є що очищати
 $hasDataToClean = $false
 
+# Каталоги-дати програмних журналів старші за retention. Перевіряються
+# лише БЕЗПОСЕРЕДНІ дочірні каталоги кожної гілки (Get-BRAVODirectories
+# без -Recurse) — обхід від <ArchiveRoot>\LOGS вниз зачепив би службові
+# журнали самого Maintenance, які живуть на верхньому рівні.
+function Get-BRAVOExpiredLogDateDirectories {
+    param([string]$Path, [int]$RetentionDays)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return @()
+    }
+    $cutoff = (Get-Date).AddDays(-$RetentionDays)
+    return @(Get-BRAVODirectories -Path $Path |
+        Where-Object {
+            $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.CreationTime -lt $cutoff
+        })
+}
+
 # Перевірка даних основного компонента BRAVO
 $traceOldDirs = @()
 $traceOldLogs = @()
-$groupsToDelete = @()
+# dev.16: власна, окремо названа Main-scope змінна — НЕ $groupsToDelete
+# (та назва зарезервована за function Remove-OldRestoreArchives, де вона
+# локальна й враховує SHA512/7z-валідність та stale-invalid групи; тут —
+# лише грубий candidate-count для Details нижче, без тієї валідації).
+# Однакова назва в різних scope вводила б в оману, ніби це те саме
+# значення.
+$restoreArchiveDeleteCandidateGroups = @()
 if ($BravoMaintenanceEnabled) {
-    $traceOldDirs = @(Get-BRAVODirectories -Path $TRACE_DIR |
-        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.CreationTime -lt (Get-Date).AddDays(-$ARCHIVE_RETENTION_DAYS) })
+    $traceOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $TRACE_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
     $traceOldLogs = @(Get-BRAVOFiles -Path $LOG_DIR |
         Where-Object {
             $_.CreationTime -lt (Get-Date).AddDays(-$LOG_RETENTION_DAYS) -and
@@ -3634,54 +5532,141 @@ if ($BravoMaintenanceEnabled) {
             }
         }
         $sortedGroups = $archiveGroups | Sort-Object Name -Descending
-        $groupsToDelete = @($sortedGroups | Select-Object -Skip $RESTORE_ARCHIVES_KEEP_COUNT)
-        $hasDataToClean = $hasDataToClean -or ($groupsToDelete.Count -gt 0)
+        $restoreArchiveDeleteCandidateGroups = @($sortedGroups | Select-Object -Skip $RESTORE_ARCHIVES_KEEP_COUNT)
+        $hasDataToClean = $hasDataToClean -or ($restoreArchiveDeleteCandidateGroups.Count -gt 0)
     }
 }
 
-# Перевірка логів exchangAPI лише для активного компонента
-$exchangAPIOldLogs = @()
+# Перевірка каталогів-дат exchangAPI лише для активного компонента
+$exchangAPIOldDirs = @()
 if ($exchangAPIServiceEnabled) {
-    $exchangAPIOldLogs = @(Get-BRAVOFiles -Path $EXCHANGAPI_ARCHIV_DIR |
-        Where-Object {
-            $_.CreationTime -lt (Get-Date).AddDays(-$LOG_RETENTION_DAYS) -and
-            $_.Name -like "exchangAPI_*.log"
-        })
+    $exchangAPIOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $EXCHANGE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 }
 
-# Перевірка Br-a-vo.web (якщо Apache встановлений)
+# Перевірка BRAVO Web (якщо Apache встановлений). Apache і application
+# logs — дві незалежні гілки з власними .mdz: змішувати їх в один архів
+# означало б розпаковувати весь веб-компонент, щоб дістати один access.log.
+$apacheOldDirs = @()
+$bravoWebAppOldDirs = @()
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
-    $bravoWebOldDirs = @(Get-BRAVODirectories -Path $BRAVO_WEB_ARCHIV_DIR |
-        Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and $_.CreationTime -lt (Get-Date).AddDays(-$ARCHIVE_RETENTION_DAYS) })
-    $hasDataToClean = $hasDataToClean -or ($bravoWebOldDirs.Count -gt 0)
+    $apacheOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $APACHE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
+    $bravoWebAppOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_APP_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
+}
+# Каталоги-дати, що приїхали міграцією зі старого <ArchiveRoot>\Br-a-vo.web,
+# лежать безпосередньо в LOGS\BravoWeb (тоді Apache і www\log ще не були
+# розділені). Без окремого рядка вони лишилися б поза будь-яким retention.
+$bravoWebLegacyOldDirs = @()
+if ($BravoWebLegacyDataEnabled) {
+    $bravoWebLegacyOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
+}
+
+# Стиснуті .mdz програмних журналів мають ВЛАСНИЙ строк зберігання
+# (CompressedLogDays), незалежний від ArchiveDays: перший визначає, коли
+# каталог-дата пакується, другий — коли спакований архів видаляється.
+$compressedLogRetentionTargets = @()
+if ($BravoMaintenanceEnabled) {
+    $compressedLogRetentionTargets += [pscustomobject]@{ Path = $TRACE_DIR; Prefix = 'Trace' }
+}
+if ($exchangAPIServiceEnabled) {
+    $compressedLogRetentionTargets += [pscustomobject]@{ Path = $EXCHANGE_LOG_DIR; Prefix = 'exchangAPI' }
+}
+if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
+    $compressedLogRetentionTargets += [pscustomobject]@{ Path = $APACHE_LOG_DIR; Prefix = 'Apache' }
+    $compressedLogRetentionTargets += [pscustomobject]@{ Path = $BRAVOWEB_APP_LOG_DIR; Prefix = 'BravoWeb' }
+}
+# Легасі-каталоги-дати, що переїхали в LOGS\BravoWeb безпосередньо (до
+# розділення на Apache\ і Application\), пакуються з тим самим префіксом.
+if ($BravoWebLegacyDataEnabled) {
+    $compressedLogRetentionTargets += [pscustomobject]@{ Path = $BRAVOWEB_LOG_DIR; Prefix = 'BravoWeb' }
+}
+
+$expiredCompressedLogCount = 0
+$compressedLogCutoff = (Get-Date).AddDays(-$COMPRESSED_LOG_RETENTION_DAYS)
+foreach ($compressedTarget in $compressedLogRetentionTargets) {
+    if (-not (Test-Path -LiteralPath $compressedTarget.Path -PathType Container)) {
+        continue
+    }
+    $archivePattern = '^' + [regex]::Escape([string]$compressedTarget.Prefix) + '_(\d{4}-\d{2}-\d{2})\.mdz$'
+    foreach ($archiveFile in @(Get-BRAVOFiles -LiteralPath ([string]$compressedTarget.Path) -Filter "*.mdz")) {
+        $archiveMatch = [regex]::Match($archiveFile.Name, $archivePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+        if (-not $archiveMatch.Success) { continue }
+        [datetime]$archiveDate = [datetime]::MinValue
+        if ([datetime]::TryParseExact(
+                $archiveMatch.Groups[1].Value,
+                'yyyy-MM-dd',
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [System.Globalization.DateTimeStyles]::None,
+                [ref]$archiveDate) -and $archiveDate -lt $compressedLogCutoff) {
+            $expiredCompressedLogCount++
+        }
+    }
 }
 
 # Загальна перевірка наявності даних для очищення
-$hasDataToClean = $hasDataToClean -or ($traceOldDirs.Count -gt 0) -or ($traceOldLogs.Count -gt 0) -or ($exchangAPIOldLogs.Count -gt 0)
+$hasDataToClean = $hasDataToClean -or
+    ($traceOldDirs.Count -gt 0) -or
+    ($traceOldLogs.Count -gt 0) -or
+    ($exchangAPIOldDirs.Count -gt 0) -or
+    ($apacheOldDirs.Count -gt 0) -or
+    ($bravoWebAppOldDirs.Count -gt 0) -or
+    ($bravoWebLegacyOldDirs.Count -gt 0) -or
+    ($expiredCompressedLogCount -gt 0)
 
 # Якщо є дані для очищення - показуємо заголовок
 if ($hasDataToClean) {
     Write-Log -Message "==="
     Write-Log -Message "=== ОЧИСТКА СТАРИХ ДАНИХ ==="
+} else {
+    # dev.15: очистка — progress phase поза затвердженим [N/8] контрактом
+    # (не numbered main step); "немає чого видаляти" лишається лише в LOG.
+    Write-Log -Message "Очистка старих даних: немає чого видаляти." -Level "DEBUG"
 }
 
 # Обробка Trace (тільки якщо є що обробляти)
-if ($BravoMaintenanceEnabled -and ($traceOldDirs.Count -gt 0 -or $traceOldLogs.Count -gt 0)) {
+if ($BravoMaintenanceEnabled -and $traceOldDirs.Count -gt 0) {
     Process-OldData -Path $TRACE_DIR -ArchiveNamePrefix "Trace" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
 }
 
-# Обробка логів Br-a-vo.web (лише якщо служба Apache встановлена і є дані)
-if ($BravoWebMaintenanceEnabled -and $ApacheEnabled -and $bravoWebOldDirs.Count -gt 0) {
-    Process-OldData -Path $BRAVO_WEB_ARCHIV_DIR -ArchiveNamePrefix "WebLogs" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
+# Обробка каталогів-дат exchangAPI
+if ($exchangAPIServiceEnabled -and $exchangAPIOldDirs.Count -gt 0) {
+    Process-OldData -Path $EXCHANGE_LOG_DIR -ArchiveNamePrefix "exchangAPI" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
 }
 
-# Очистка старих лог-файлів (всіх типів) - тільки якщо є що видаляти
+# Обробка логів BRAVO Web (лише якщо служба Apache встановлена і є дані)
+if ($BravoWebMaintenanceEnabled -and $ApacheEnabled -and $apacheOldDirs.Count -gt 0) {
+    Process-OldData -Path $APACHE_LOG_DIR -ArchiveNamePrefix "Apache" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
+}
+if ($BravoWebMaintenanceEnabled -and $ApacheEnabled -and $bravoWebAppOldDirs.Count -gt 0) {
+    Process-OldData -Path $BRAVOWEB_APP_LOG_DIR -ArchiveNamePrefix "BravoWeb" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
+}
+if ($BravoWebLegacyDataEnabled -and $bravoWebLegacyOldDirs.Count -gt 0) {
+    Process-OldData -Path $BRAVOWEB_LOG_DIR -ArchiveNamePrefix "BravoWeb" -RetentionDays $ARCHIVE_RETENTION_DAYS -arcCommonParams $arcCommonParams -ARC_PATH $ARC_PATH
+}
+
+# Очистка службових журналів самого Maintenance — суворо верхній рівень
+# <ArchiveRoot>\LOGS і суворо за whitelist імен. Ані -Recurse, ані
+# узагальненого "*.log": і те, і те дотягнулося б до Trace\, exchangAPI\
+# та BravoWeb\, тобто видаляло б програмні журнали за політикою, писаною
+# для власних логів скрипта.
 if ($BravoMaintenanceEnabled -and $traceOldLogs.Count -gt 0) {
     Remove-OldLogFiles -Path $LOG_DIR -RetentionDays $LOG_RETENTION_DAYS
 }
 
+# Видалення стиснутих журналів, старших за CompressedLogDays. Виконується
+# ПІСЛЯ Process-OldData: спочатку сьогоднішні застарілі каталоги-дати стають
+# архівами, і лише потім перевіряється вік самих архівів.
+if ($expiredCompressedLogCount -gt 0) {
+    foreach ($compressedTarget in $compressedLogRetentionTargets) {
+        [void](Remove-BRAVOExpiredCompressedLogs `
+            -Path ([string]$compressedTarget.Path) `
+            -ArchiveNamePrefix ([string]$compressedTarget.Prefix) `
+            -RetentionDays $COMPRESSED_LOG_RETENTION_DAYS `
+            -Logger $bravoLogRotationLogger)
+    }
+}
+
 # Видалення старих архівів реставрації - тільки якщо є що видаляти
-if ($BravoMaintenanceEnabled -and $groupsToDelete.Count -gt 0) {
+if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt 0) {
     Remove-OldRestoreArchives `
         -Path $ARC_DIR `
         -ArchivePrefix $ArchivePrefix `
@@ -3689,23 +5674,54 @@ if ($BravoMaintenanceEnabled -and $groupsToDelete.Count -gt 0) {
         -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS
 }
 
-# Видалення старих логів exchangAPI - тільки якщо є що видаляти
-if ($exchangAPIServiceEnabled -and $exchangAPIOldLogs.Count -gt 0) {
-    Remove-OldLogFiles -Path $EXCHANGAPI_ARCHIV_DIR -RetentionDays $LOG_RETENTION_DAYS
+# dev.16: execution result очистки — unnumbered top-level операція (не
+# [N/8], не рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок).
+# Статус — той самий before/after-снепшот, що вже керує 8 numbered
+# кроками (Get-BRAVOMaintenanceStepStatus); SKIPPED, коли перевірка не
+# знайшла нічого застарілого. Details — компактний агрегат КАНДИДАТІВ,
+# знайдених вище (не "видалено": жодна з Process-OldData/Remove-*
+# функцій не повертає структурованих success-лічильників, а вигадувати
+# їх тут — не мета цього proходу); повний перелік файлів і будь-які
+# індивідуальні збої лишаються тільки в LOG, як і раніше.
+$cleanupOperationDirCandidateCount = $traceOldDirs.Count + $exchangAPIOldDirs.Count +
+    $apacheOldDirs.Count + $bravoWebAppOldDirs.Count + $bravoWebLegacyOldDirs.Count
+$cleanupOperationFileCandidateCount = $traceOldLogs.Count + $expiredCompressedLogCount
+$cleanupOperationStatus = Get-BRAVOMaintenanceStepStatus `
+    -CriticalBefore $cleanupCriticalBefore `
+    -WarningsBefore $cleanupWarningsBefore `
+    -Skipped:(-not $hasDataToClean)
+$cleanupOperationDetails = if ($cleanupOperationStatus -eq 'SKIPPED') {
+    'даних для очищення немає'
+} elseif ($cleanupOperationStatus -eq 'WARN' -or $cleanupOperationStatus -eq 'FAIL') {
+    'перевірте LOG для деталей'
+} else {
+    $cleanupDetailParts = @()
+    if ($cleanupOperationDirCandidateCount -gt 0) {
+        $cleanupDetailParts += "каталогів: $cleanupOperationDirCandidateCount"
+    }
+    if ($cleanupOperationFileCandidateCount -gt 0) {
+        $cleanupDetailParts += "файлів: $cleanupOperationFileCandidateCount"
+    }
+    if ($restoreArchiveDeleteCandidateGroups.Count -gt 0) {
+        $cleanupDetailParts += "сесій архівів реставрації: $($restoreArchiveDeleteCandidateGroups.Count)"
+    }
+    if ($cleanupDetailParts.Count -gt 0) { $cleanupDetailParts -join '; ' } else { $null }
 }
-
-Write-BRAVOMaintenanceStep `
-    -Name 'Очистка старих даних' `
-    -Status (Get-BRAVOMaintenanceStepStatus `
-        -CriticalBefore $cleanupCriticalBefore `
-        -WarningsBefore $cleanupWarningsBefore `
-        -Skipped:(-not $hasDataToClean)) `
-    -Details $(if (-not $hasDataToClean) { 'немає чого видаляти' } else { $null })
+Write-BRAVOOperationResult `
+    -Name 'Очистка старих даних/логів' `
+    -Status $cleanupOperationStatus `
+    -Duration ((Get-Date) - $cleanupOperationStartedAt) `
+    -Details $cleanupOperationDetails
+$script:cleanupOperationReported = $true
 
 # ===== ЗАПУСК ДОДАТКОВОГО СКРИПТУ BRAVO_ARCHIV =====
 Write-BRAVOProgressPhase -Phase 'Запуск BRAVO_ARCHIV' -PercentComplete 95
+$script:currentMaintenanceOperation = 'Архівація після maintenance'
+$archiveOperationStartedAt = Get-Date
 $archiveCriticalBefore = $script:criticalErrorOccurred
 $archiveWarningsBefore = $script:BRAVOWarningCount
+$script:archiveOperationReported = $false
+$archiveOperationDetail = $null
 if ($script:EnableArchiveAfterMaintenance) {
     # Дочірній BRAVO_ARCHIV сам захоплює той самий lock. Перед передачею
     # керування звільняємо maintenance-lock; служби вже повернуті до
@@ -3716,7 +5732,7 @@ if ($script:EnableArchiveAfterMaintenance) {
 
     try {
         $bravoArchivePath = [string]$schedulerSettings.Backup.ScriptPath
-        
+
         if (Test-Path -LiteralPath $bravoArchivePath -PathType Leaf) {
             Write-Log -Message "Запуск скрипту BRAVO_ARCHIV.ps1..." -Level "INFO"
 
@@ -3726,41 +5742,86 @@ if ($script:EnableArchiveAfterMaintenance) {
                 -Wait `
                 -PassThru `
                 -NoNewWindow
-            
+
             if ($archivProcess.ExitCode -eq 0) {
                 Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 успішно виконано" -Level "SUCCESS"
             } else {
                 Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з кодом помилки: $($archivProcess.ExitCode)" -Level "ERROR"
                 $script:criticalErrorOccurred = $true
+                $archiveOperationDetail = "BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"
             }
         } else {
             Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 не знайдено за шляхом: $bravoArchivePath" -Level "ERROR"
             $script:criticalErrorOccurred = $true
+            $archiveOperationDetail = "скрипт не знайдено: $bravoArchivePath"
         }
     }
     catch {
         Write-Log -Message "Помилка під час запуску скрипту BRAVO_ARCHIV.ps1: $($_.Exception.Message)" -Level "ERROR"
         $script:criticalErrorOccurred = $true
+        $archiveOperationDetail = 'перевірте LOG для деталей'
     }
-    Write-BRAVOMaintenanceStep `
-        -Name 'Запуск BRAVO_ARCHIV' `
+    # dev.16: execution result — unnumbered top-level операція (не [N/8],
+    # не рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок).
+    # Дочірній процес/lock/exit-code semantics вище не змінені — лише
+    # обгорнуті трекінгом статусу/тривалості для консолі.
+    Write-BRAVOOperationResult `
+        -Name 'Архівація після maintenance' `
         -Status (Get-BRAVOMaintenanceStepStatus `
             -CriticalBefore $archiveCriticalBefore `
-            -WarningsBefore $archiveWarningsBefore)
+            -WarningsBefore $archiveWarningsBefore) `
+        -Duration ((Get-Date) - $archiveOperationStartedAt) `
+        -Details $archiveOperationDetail
+    $script:archiveOperationReported = $true
 } else {
     # Лише у журнал: вимкнений компонент не займає рядка в консолі.
     Write-Log -Message "Запуск BRAVO_ARCHIV: вимкнено" -Level "DEBUG"
+    Write-BRAVOOperationResult `
+        -Name 'Архівація після maintenance' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $archiveOperationStartedAt) `
+        -Details 'вимкнено'
+    $script:archiveOperationReported = $true
 }
 
 # ===== ВИКЛИК ФУНКЦІЇ АВТОМАТИЧНОГО ВИМКНЕННЯ =====
+$script:currentMaintenanceOperation = 'Автоматичне вимкнення сервера'
+$autoShutdownOperationStartedAt = Get-Date
+$script:autoShutdownOperationReported = $false
 if ($script:EnableAutoShutdown) {
-    Invoke-AutoShutdown -Timeout $ShutdownTimeout
+    # dev.16: Invoke-AutoShutdown повертає фінальний символьний стан
+    # (Scheduled/Cancelled/Failed), не просто "чи команда планування
+    # відпрацювала" — оператор має бачити РЕАЛЬНИЙ результат, включно з
+    # інтерактивним скасуванням, а не тільки той факт, що виклик колись
+    # відбувся. Сама логіка планування/діалогу/скасування не змінена.
+    $autoShutdownOutcome = Invoke-AutoShutdown -Timeout $ShutdownTimeout
+    Write-BRAVOOperationResult `
+        -Name 'Автоматичне вимкнення сервера' `
+        -Status $(switch ($autoShutdownOutcome) {
+            'Scheduled' { 'OK' }
+            'Cancelled' { 'SKIPPED' }
+            default     { 'FAIL' }
+        }) `
+        -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
+        -Details $(switch ($autoShutdownOutcome) {
+            'Scheduled' { "заплановано через $ShutdownTimeout с" }
+            'Cancelled' { 'скасовано користувачем' }
+            default     { 'не вдалося ініціювати вимкнення — перевірте LOG' }
+        })
+    $script:autoShutdownOperationReported = $true
 } else {
     # Мінімальне інформаційне повідомлення без заголовків
     Write-Log -Message "Автоматичне вимкнення: вимкнено" -Level "DEBUG"
+    Write-BRAVOOperationResult `
+        -Name 'Автоматичне вимкнення сервера' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
+        -Details 'вимкнено'
+    $script:autoShutdownOperationReported = $true
 }
 
 # Відправляємо фінальний звіт
+$script:currentMaintenanceOperation = 'Відправлення фінального звіту'
 Send-FinalReport -LOG_FILE $LOG_FILE
 
 if (-not $script:criticalErrorOccurred) {
@@ -3773,53 +5834,196 @@ if (-not $script:criticalErrorOccurred) {
 #     Write-Log -Message "Фінальний звіт оброблено" -Level "INFO"
 # }
 
+} catch {
+    # dev.15: див. коментар біля відкриття try вище — мета лише в тому,
+    # щоб жодна необроблена помилка тут не "з'їла" код завершення й
+    # фінальний summary нижче. Причина повністю потрапляє в LOG і в
+    # errors_only-сповіщення (той самий Send-SlackAlert -IsCritical
+    # контракт, що й решта критичних помилок Maintenance).
+    #
+    # СПОЧАТКУ безумовно позначаємо критичну помилку — до будь-яких
+    # diagnostic дій нижче, які самі теоретично можуть кинути виняток.
+    # Якщо цього не зробити першим, а Write-Log/Send-SlackAlert кинуть
+    # власний exception, catch завершиться без встановленого прапорця, і
+    # виконання все одно дійде до summary нижче, але зі стертим статусом
+    # помилки.
+    $script:criticalErrorOccurred = $true
+    # dev.16: точна атрибуція замість generic "Range ID/очистка/
+    # BRAVO_ARCHIV/AutoShutdown/фінальний звіт" — $script:currentMaintenanceOperation
+    # оновлюється перед кожним блоком вище (Контроль діапазонів ID/
+    # Очистка старих даних/логів/Архівація після maintenance/Автоматичне
+    # вимкнення сервера/Відправлення фінального звіту), тому тут завжди
+    # відома САМЕ активна на момент винятку операція.
+    $errorMsg = "Помилка операції `"$($script:currentMaintenanceOperation)`": $($_.Exception.Message)"
+
+    # Логування й сповіщення виконуються ІЗОЛЬОВАНО одне від одного: збій
+    # будь-якого з них (наприклад, недоступний LOG-файл або мережева
+    # помилка webhook) не повинен rethrow-нути й обійти обчислення exit
+    # code/фінальний summary нижче.
+    try {
+        Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+    } catch {
+        # не rethrow: збій логування не повинен знищити finalization.
+        # Свідомо не Write-Log/Send-SlackAlert/throw/exit/return тут — це
+        # саме той збій, який ця гілка ізолює; лише прибирає порожній catch
+        # (PSAvoidUsingEmptyCatchBlock) без нових side effects.
+        $null = $_
+    }
+    try {
+        Send-SlackAlert -Message $errorMsg -IsCritical
+    } catch {
+        # не rethrow: збій сповіщення не повинен знищити finalization.
+        # Та сама причина, що вище — без Write-Log/Send-SlackAlert/throw/
+        # exit/return.
+        $null = $_
+    }
+
+    # dev.16: якщо виняток стався ВСЕРЕДИНІ операції з власним execution
+    # result (Cleanup/Archive/AutoShutdown), її рядок так і не встиг
+    # надрукуватись — оператор побачив би лише generic ПОМИЛКА без
+    # result-рядка для конкретної операції. Друкуємо її FAIL РІВНО ОДИН
+    # РАЗ тут, лише якщо вона ще не відзвітувала сама (прапорець
+    # *Reported, встановлюється в кінці кожного блоку вище). Контроль
+    # діапазонів ID — numbered [8/8] крок, тут не чіпаємо; Відправлення
+    # фінального звіту — notification transport без власного
+    # console-result (лише причина в $errorMsg вище).
+    try {
+        switch ($script:currentMaintenanceOperation) {
+            'Очистка старих даних/логів' {
+                if (-not $script:cleanupOperationReported) {
+                    Write-BRAVOOperationResult `
+                        -Name 'Очистка старих даних/логів' `
+                        -Status 'FAIL' `
+                        -Duration ((Get-Date) - $cleanupOperationStartedAt) `
+                        -Details 'перевірте LOG для деталей'
+                }
+            }
+            'Архівація після maintenance' {
+                if (-not $script:archiveOperationReported) {
+                    Write-BRAVOOperationResult `
+                        -Name 'Архівація після maintenance' `
+                        -Status 'FAIL' `
+                        -Duration ((Get-Date) - $archiveOperationStartedAt) `
+                        -Details 'перевірте LOG для деталей'
+                }
+            }
+            'Автоматичне вимкнення сервера' {
+                if (-not $script:autoShutdownOperationReported) {
+                    Write-BRAVOOperationResult `
+                        -Name 'Автоматичне вимкнення сервера' `
+                        -Status 'FAIL' `
+                        -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
+                        -Details 'перевірте LOG для деталей'
+                }
+            }
+        }
+    } catch {
+        # не rethrow: та сама ізоляція, що Write-Log/Send-SlackAlert вище —
+        # навіть fallback-рендер не повинен знищити finalization.
+        $null = $_
+    }
+}
+
 # ===== ЗАВЕРШЕННЯ СКРИПТУ =====
-$totalTime = (Get-Date) - $script:ScriptStartTime
+# dev.19 (виправлено): $script:maintenanceRuntimeExitCode обчислюється
+# ТУТ — одразу після закриття зовнішнього try/catch вище (усі бізнес-
+# операції й fail-safe обробка, включно з випадком, коли сам catch щойно
+# підняв criticalErrorOccurred, уже завершились) і ДО друку "=== СТАТУС:
+# ... ===" нижче, а не після нього. У першій версії dev.19 ЛОГ-рядок
+# СТАТУС друкувався РАНІШЕ цього обчислення, тому Get-BRAVOMaintenanceFinalStatus
+# незалежно інспектував ті самі прапорці — паралельна, хоч і узгоджена,
+# класифікаційна політика замість фактичного резолвленого коду.
+# Get-BRAVOMaintenanceResolvedExitCode — ТА САМА пріоритетна політика
+# (critical > warnings > success, 40/41/60 через Resolve-BRAVOExitCode),
+# що раніше стояла inline нижче за друком РЕЗУЛЬТАТ; сама формула не
+# змінена, лише піднята вище й винесена в один спільний виклик (той
+# самий, що вже дає "поточний знімок" для Send-FinalReport вище).
+$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
+
+$maintenanceEndedAt = Get-Date
+$totalTime = $maintenanceEndedAt - $script:ScriptStartTime
 
 # ФІНАЛЬНИЙ БЛОК ЗАВЕРШЕННЯ
 Write-Log -Message "==="
 Write-Log -Message "=== СИСТЕМА ОБСЛУГОВУВАННЯ BRAVOSOFT ЗАВЕРШИЛА РОБОТУ ==="
 Write-Log -Message "=== УСТАНОВА: $($script:ObjectName) ==="
 Write-Log -Message "=== ЧАС ВИКОНАННЯ: $(Format-Duration $totalTime) ==="
-Write-Log -Message "=== СТАТУС: $(if ($script:criticalErrorOccurred) {'З ПОМИЛКАМИ'} else {'УСПІШНО'}) ==="
+# dev.19 (виправлено): Get-BRAVOMaintenanceFinalStatus тепер приймає
+# ВЖЕ резолвлений $script:maintenanceRuntimeExitCode (обчислений вище,
+# до цього рядка) — не незалежну перевірку BRAVOWarningCount/
+# criticalErrorOccurred.
+Write-Log -Message "=== СТАТУС: $((Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode).Text) ==="
 Write-Log -Message "==="
 
 Complete-BRAVOProgress
-$maintenanceMetrics = New-Object System.Collections.Specialized.OrderedDictionary
-$maintenanceMetrics.Add('Попереджень', $script:BRAVOWarningCount)
-$maintenanceMetrics.Add('Установа', [string]$script:ObjectName)
-# ЧАСТКОВО, а не ПОМИЛКА, за самих лише попереджень: обслуговування
-# відпрацювало, але щось потребує уваги. ПОМИЛКА лишається за критичним
-# збоєм — тим самим, що дає ненульовий код завершення.
-$maintenanceSummaryResult = if ($script:criticalErrorOccurred) {
-    'ПОМИЛКА'
-} elseif ($script:BRAVOWarningCount -gt 0) {
-    'ЧАСТКОВО'
-} else {
-    'УСПІШНО'
-}
-Write-BRAVOSummary `
-    -Result $maintenanceSummaryResult `
-    -Duration $totalTime `
-    -Metrics $maintenanceMetrics `
-    -LogFile $LOG_FILE
+
+# dev.19 (виправлено): раніше тут стояло inline-обчислення
+# $script:maintenanceRuntimeExitCode (переміщено вище, до друку ЛОГ
+# "=== СТАТУС ===" — Get-BRAVOMaintenanceResolvedExitCode, той самий
+# принцип "обчислити ДО друку РЕЗУЛЬТАТ", що вже застосований в
+# Archive/Health, лише тепер поширений і на ЛОГ). Операції створення/
+# відновлення локального архіву й перевірки його цілісності виділені
+# окремими прапорцями (restoreArchiveFailed/restoreIntegrityFailed,
+# 19 точок) на 40/41; решта ~23 точок criticalErrorOccurred (сервіси,
+# диск, файлове господарство, оркестрація BRAVO_ARCHIV) і далі
+# схлопуються в загальний бакет 60. Resolve-BRAVOExitCode сам віддає
+# пріоритет 40/41 над 60, якщо передані одночасно.
+#
+# dev.19 (виправлено): той самий резолвлений $script:maintenanceRuntimeExitCode
+# і той самий Get-BRAVOMaintenanceFinalStatus, що ЛОГ вище — консоль і
+# ЛОГ фізично не можуть розійтися, бо обидва читають ОДНЕ значення.
+$maintenanceFinalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $script:maintenanceRuntimeExitCode
+$maintenanceSummaryResult = $maintenanceFinalStatus.Text
+$maintenanceSummaryStatusColor = $maintenanceFinalStatus.Color
+# dev.14 (round 3): окремий стиль заголовка підсумку для Maintenance —
+# "BRAVO MAINTENANCE — СТАТУС" в одному рядку (Write-BRAVOFinalSummaryHeader,
+# той самий =-роздільник, що заголовок прогону) — плюс окреме поле
+# "Статус:" нижче, той самий текст "N — Назва", що Write-BRAVOResultHeader
+# формував для "Код завершення" (BRAVO.ExitCodes, ніколи native tool code).
+Write-BRAVOFinalSummaryHeader `
+    -Title 'BRAVO MAINTENANCE' `
+    -Status $maintenanceSummaryResult `
+    -StatusColor $maintenanceSummaryStatusColor
+Write-BRAVOResultField -Label 'Статус' -Value $maintenanceSummaryResult -Color $maintenanceSummaryStatusColor
+$maintenanceExitCodeText = "{0} — {1}" -f $script:maintenanceRuntimeExitCode, (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode)
+Write-BRAVOResultField -Label 'Код завершення' -Value $maintenanceExitCodeText
+Write-BRAVOResultField -Label 'Початок' -Value $script:ScriptStartTime.ToString('dd.MM.yyyy HH:mm:ss')
+Write-BRAVOResultField -Label 'Завершення' -Value $maintenanceEndedAt.ToString('dd.MM.yyyy HH:mm:ss')
+Write-BRAVOResultField -Label 'Тривалість' -Value (Format-BRAVODuration -Duration $totalTime)
+Write-BRAVOResultBlankLine
+# dev.14 (round 2): той самий підхід, що Health (Перевірок/Успішно/
+# Попереджень/Помилок, ConsoleUX/15-HealthSummaryCounters) — тут ще й
+# Пропущено, бо, на відміну від Health, Maintenance регулярно показує
+# SKIPPED-кроки. Лічильники накопичуються у Write-BRAVOMaintenanceStep.
+Write-BRAVOResultField -Label 'Кроків' -Value ([string]$script:BRAVOMaintenanceStepCurrent)
+Write-BRAVOResultField -Label 'Успішно' -Value ([string]$script:BRAVOMaintenanceStepOkCount)
+Write-BRAVOResultField -Label 'Попереджень' -Value ([string]$script:BRAVOMaintenanceStepWarnCount)
+Write-BRAVOResultField -Label 'Пропущено' -Value ([string]$script:BRAVOMaintenanceStepSkippedCount)
+Write-BRAVOResultField -Label 'Помилок' -Value ([string]$script:BRAVOMaintenanceStepFailCount)
+# dev.14 (round 5): Maintenance/Архівація/Shutdown прибрано з compact
+# operator summary — не входять у затверджений набір полів (Статус/Код
+# завершення/Початок/Завершення/Тривалість/Кроків/Успішно/Попереджень/
+# Пропущено/Помилок/Журнал). Ці факти вже видно в "Плані операцій" на
+# початку прогону (Maintenance BRAVO/Архівація після maintenance/
+# Автоматичне вимкнення сервера — ті самі прапорці) і в детальному
+# LOG-файлі — тут вони лише дублювали б інформацію, а не додавали нову.
+# dev.14 (round 4): парний до Write-BRAVOFinalSummaryHeader — мітка
+# "Журнал" і шлях, закриваючий =-роздільник, той самий стиль, що заголовок
+# прогону. Старий '-'-роздільник і довший підпис лишаються контрактом
+# Archive/Health/інших — тут навмисно окрема функція, не той самий виклик.
+Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
 } finally {
     Exit-BRAVOMaintenanceOperationLock
 }
 
-# Операції створення/відновлення локального архіву й перевірки його
-# цілісності виділені окремими прапорцями (restoreArchiveFailed/
-# restoreIntegrityFailed, 19 точок) на 40/41; решта ~23 точок
-# criticalErrorOccurred (сервіси, диск, файлове господарство, оркестрація
-# BRAVO_ARCHIV) і далі схлопуються в загальний бакет 60. Resolve-BRAVOExitCode
-# сам віддає пріоритет 40/41 над 60, якщо передані одночасно.
-if ($script:criticalErrorOccurred) {
-    exit (Resolve-BRAVOExitCode `
-        -LocalArchiveFailed:$script:restoreArchiveFailed `
-        -IntegrityTestFailed:$script:restoreIntegrityFailed `
-        -MaintenanceFailed)
-} elseif ($script:BRAVOWarningCount -gt 0) {
-    exit (Resolve-BRAVOExitCode -HasWarnings)
-} else {
-    exit 0
+exit $script:maintenanceRuntimeExitCode
+
+} finally {
+    # Закриває try, відкритий одразу після імпорту модулів. exit усередині
+    # try проходить крізь finally перед тим, як процес справді завершиться
+    # (перевірено емпірично) — тому це охоплює геть усі ~28 точок exit
+    # вище, включно з рідко відвідуваними (config не знайдено, lock
+    # зайнятий, tool integrity) — саме там, де оператору найпотрібніше
+    # встигнути прочитати повідомлення до закриття вікна.
+    Wait-BRAVOManualExit -NoPause:$NoPause
 }
