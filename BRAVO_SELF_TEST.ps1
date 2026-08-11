@@ -1439,10 +1439,47 @@ try {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    $loadedConfiguration = Import-BravoConfiguration `
-        -ConfigRoot $configRoot `
-        -ConfigPath $resolvedConfig `
-        -PassThru
+    $versionConfigRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        'BRAVO_VERSION_CONFIG_' + [guid]::NewGuid().ToString('N')
+    )
+    $versionConfigPath = Join-Path $versionConfigRoot 'BRAVO.config'
+    [void][IO.Directory]::CreateDirectory($versionConfigRoot)
+    try {
+        $versionConfigText = [IO.File]::ReadAllText(
+            $resolvedConfig,
+            [Text.Encoding]::UTF8
+        )
+        $explicitLimsRoot = $versionConfigRoot.Replace("'", "''")
+        $limsRootReplacement = [Text.RegularExpressions.MatchEvaluator] {
+            param($match)
+            return $match.Groups[1].Value + "'$explicitLimsRoot'"
+        }
+        $versionConfigText = [regex]::Replace(
+            $versionConfigText,
+            '(?m)^(\s*LIMSRoot\s*=\s*)""\s*$',
+            $limsRootReplacement,
+            1
+        )
+        $explicitLimsRootPattern = "(?m)^\s*LIMSRoot\s*=\s*'" +
+            [regex]::Escape($explicitLimsRoot) + "'\s*$"
+        if ($versionConfigText -notmatch $explicitLimsRootPattern) {
+            throw 'Не вдалося підготувати ізольовану конфігурацію для version self-test.'
+        }
+        [IO.File]::WriteAllText(
+            $versionConfigPath,
+            $versionConfigText,
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $loadedConfiguration = Import-BravoConfiguration `
+            -ConfigRoot $versionConfigRoot `
+            -ConfigPath $versionConfigPath `
+            -RuntimeRoot $configRoot `
+            -PassThru
+    } finally {
+        if ([IO.Directory]::Exists($versionConfigRoot)) {
+            [IO.Directory]::Delete($versionConfigRoot, $true)
+        }
+    }
 
     Test-BRAVOCondition `
         -Condition (
