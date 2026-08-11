@@ -1,5 +1,51 @@
 # Changelog
 
+## 5.0.0-rc.1 — 2026-08-11
+
+First release candidate for the 5.0.0 production cycle. This promotion
+contains the complete dev.19 functionality plus the release-blocking fixes
+found during log review and local acceptance checks. No configuration schema,
+state schema, credential target, archive format, retention default, transfer
+protocol, or supported-OS contract changed.
+
+- Archive now performs the same fixed-drive free-space preflight as
+  Maintenance before cleanup, local synchronization, VSS, or archive
+  generation can mutate state. It uses `Limits.MinimumFreeSpaceGB` and
+  `Limits.ExcludedDrives`, reports every checked drive, stops with the
+  canonical local-archive exit code `40`, and renders a normal final failure
+  summary instead of ending without an operator result.
+- A failed Archive free-space preflight now sends one immediate `CRITICAL`
+  Discord/Slack notification in `errors_only` or `all` mode. The message
+  identifies the affected drive, free/total space, configured threshold,
+  action required, log path and exit code. `NotificationMode=none` and
+  `-NoSlack` remain authoritative; webhook failure is logged with protected
+  secrets and never replaces the primary exit code.
+- VSS ownership state and generation manifests are now written through
+  temporary files and atomically replaced with legal backup paths compatible
+  with Windows PowerShell 5.1/.NET Framework. A failed replacement preserves
+  the previous valid state/manifest and cleans temporary backup files.
+- Archive publication is fail-closed when the final `.sha512` sidecar cannot
+  be written. The already moved archive and any partial sidecar are rolled
+  back, published paths/hash fields are cleared, and the failure is classified
+  as `PUBLISH`/exit `40` rather than a misleading hash-validation failure.
+- Generation finalization now occurs before exit-code calculation and the
+  operator summary. Failure to persist the final transfer/health state marks
+  the run failed. Result objects also carry stable failure fields, scalar
+  success counts are StrictMode-safe, and snapshot paths are initialized per
+  component so stale values cannot leak into an exception path.
+- Maintenance low-disk termination now renders the standard final summary,
+  uses the resolved BRAVO exit code, respects `-NoPause`, and writes unique
+  second-and-PID log names. The default scheduled restore day is explicitly
+  Sunday (`7`).
+- The narrowly required `ExecutionPolicy Bypass` allowance for generated
+  manual launchers is documented and scoped to `BRAVO_SETUP.ps1`; all other
+  forbidden-pattern checks remain blocking.
+- Regression coverage was added for free-space policy and notifications,
+  preflight ordering, atomic state replacement, failed SHA512 publication,
+  manifest finalization, failure-stage mapping, StrictMode result handling,
+  Maintenance early summaries/log naming/default schedule, and launcher
+  policy. `RUNTIME_MANIFEST.json` is regenerated from the final RC files.
+
 ## 5.0.0-dev.19 — 2026-08-11
 
 Minimal observability/correctness release, from two real DEV-LIMS
