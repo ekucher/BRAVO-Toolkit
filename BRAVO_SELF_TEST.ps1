@@ -17,6 +17,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root "BRAVO.config"
 }
 $script:failures = New-Object System.Collections.ArrayList
+$script:selfTestConfigRoot = $null
 
 function Test-BRAVOCondition {
     param(
@@ -1432,8 +1433,8 @@ try {
         -Name "Scheduler/SystemSidMismatch" `
         -Failure "SYSTEM не повинен збігатися з NETWORK SERVICE"
 
-    $resolvedConfig = (Resolve-Path -LiteralPath $ConfigPath).Path
-    $configRoot = Split-Path -Path $resolvedConfig -Parent
+    $sourceConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    $configRoot = Split-Path -Path $sourceConfigPath -Parent
     $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
@@ -1444,9 +1445,10 @@ try {
     )
     $versionConfigPath = Join-Path $versionConfigRoot 'BRAVO.config'
     [void][IO.Directory]::CreateDirectory($versionConfigRoot)
+    $script:selfTestConfigRoot = $versionConfigRoot
     try {
         $versionConfigText = [IO.File]::ReadAllText(
-            $resolvedConfig,
+            $sourceConfigPath,
             [Text.Encoding]::UTF8
         )
         $explicitLimsRoot = $versionConfigRoot.Replace("'", "''")
@@ -1470,15 +1472,14 @@ try {
             $versionConfigText,
             (New-Object Text.UTF8Encoding($false))
         )
+        $resolvedConfig = $versionConfigPath
         $loadedConfiguration = Import-BravoConfiguration `
             -ConfigRoot $versionConfigRoot `
             -ConfigPath $versionConfigPath `
             -RuntimeRoot $configRoot `
             -PassThru
-    } finally {
-        if ([IO.Directory]::Exists($versionConfigRoot)) {
-            [IO.Directory]::Delete($versionConfigRoot, $true)
-        }
+    } catch {
+        throw
     }
 
     Test-BRAVOCondition `
@@ -9679,7 +9680,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     $separateConfigRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CFGROOT_" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $separateConfigRoot -Force | Out-Null
     try {
-        Copy-Item -LiteralPath (Join-Path $root 'BRAVO.config') -Destination (Join-Path $separateConfigRoot 'BRAVO.config') -Force
+        Copy-Item -LiteralPath $resolvedConfig -Destination (Join-Path $separateConfigRoot 'BRAVO.config') -Force
         Import-BravoConfiguration `
             -ConfigRoot $separateConfigRoot `
             -ConfigPath (Join-Path $separateConfigRoot 'BRAVO.config') `
@@ -9706,8 +9707,11 @@ function Get-BRAVOMaintenanceSummaryResult {
             -Failure "schedulerSettings.BAZASync.Enabled має дорівнювати bazaSyncEffective.ScheduledSftpSyncRequired"
     } finally {
         Remove-Item -LiteralPath $separateConfigRoot -Recurse -Force -ErrorAction SilentlyContinue
-        # Відновити стандартний стан (RuntimeRoot == ConfigRoot == репозиторій).
-        Import-BravoConfiguration -ConfigRoot $root -ConfigPath (Join-Path $root 'BRAVO.config') -RuntimeRoot $root | Out-Null
+        # Відновити ізольований стан без залежності від служби BRAVO на CI runner.
+        Import-BravoConfiguration `
+            -ConfigRoot (Split-Path -Path $resolvedConfig -Parent) `
+            -ConfigPath $resolvedConfig `
+            -RuntimeRoot $root | Out-Null
     }
 
     # --- TaskDefinition/*: синтетична перевірка Test-BRAVOScheduledTaskDefinition ---
@@ -12512,6 +12516,11 @@ function Get-BRAVOMaintenanceSummaryResult {
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
+}
+
+if (-not [string]::IsNullOrWhiteSpace([string]$script:selfTestConfigRoot) -and
+    [IO.Directory]::Exists($script:selfTestConfigRoot)) {
+    [IO.Directory]::Delete($script:selfTestConfigRoot, $true)
 }
 
 if ($script:failures.Count -gt 0) {
