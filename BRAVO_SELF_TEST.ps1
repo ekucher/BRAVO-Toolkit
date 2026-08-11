@@ -889,13 +889,42 @@ try {
     if (Test-Path -LiteralPath $repositoryToolsDirectory -PathType Container) {
         $repositoryManifestRun = Test-BRAVOToolManifestIntegrity `
             -ToolsDirectory $repositoryToolsDirectory `
-            -ManifestPath (Join-Path $root "TOOLS_MANIFEST.json") `
+            -ManifestPath (Join-Path $repositoryToolsDirectory "TOOLS_MANIFEST.json") `
             -Mode Enforce
         Test-BRAVOCondition `
             -Condition $repositoryManifestRun.IsValid `
             -Name "ToolManifest/RepositoryManifestMatchesTools" `
             -Failure "TOOLS_MANIFEST.json не відповідає реальним Tools у репозиторії: $($repositoryManifestRun.Message)"
     }
+
+    # Маніфест шукається в тому самому каталозі, що й самі утиліти
+    # (Tools\), а не поруч зі скриптом — BRAVO.config і всі три runtime
+    # (fallback на випадок непридатної конфігурації) мають бути
+    # узгоджені: жоден не повинен лишитись зі старим $archivPath/
+    # $bravoScriptDirectory-відносним шляхом.
+    $toolManifestLocationSources = @{
+        'BRAVO.config' = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+        'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
+        'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
+        'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    }
+    $filesWithWrongManifestLocation = @(
+        $toolManifestLocationSources.Keys | Where-Object {
+            -not [regex]::IsMatch($toolManifestLocationSources[$_], 'Join-Path\s+\$toolsPath\s+"TOOLS_MANIFEST\.json"')
+        }
+    )
+    Test-BRAVOCondition `
+        -Condition ($filesWithWrongManifestLocation.Count -eq 0) `
+        -Name "ToolManifest/ManifestPathIsInsideToolsDirectory" `
+        -Failure "TOOLS_MANIFEST.json має шукатись через Join-Path `$toolsPath 'TOOLS_MANIFEST.json' (той самий каталог, що й утиліти), а не поруч зі скриптом; не узгоджені: $($filesWithWrongManifestLocation -join ', ')"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-Path -LiteralPath (Join-Path $root 'Tools\TOOLS_MANIFEST.json') -PathType Leaf) -and
+            -not (Test-Path -LiteralPath (Join-Path $root 'TOOLS_MANIFEST.json') -PathType Leaf)
+        ) `
+        -Name "ToolManifest/ManifestFileLivesInsideTools" `
+        -Failure "TOOLS_MANIFEST.json має фізично лежати в Tools\, а не в корені репозиторію"
 
     Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
     Import-Module -Name (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psd1") -Force -ErrorAction Stop
@@ -1463,6 +1492,10 @@ try {
         (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psm1"),
         [Text.Encoding]::UTF8
     )
+    $bravoConfigText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO.config"),
+        [Text.Encoding]::UTF8
+    )
     $archiveLoaderCalls = @(
         [regex]::Matches(
             $archiveScriptText,
@@ -1772,6 +1805,20 @@ try {
         -Name "Secrets/SevenZipPasswordUsesStdin" `
         -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу"
 
+    # Реальний випадок: власний прогрес-бокс Test-NetConnection
+    # ("Attempting TCP connect", "Waiting for response") усе одно
+    # з'являвся в консолі поверх кроків BRAVO, хоча мав бути прихованим.
+    # Локальне присвоєння $ProgressPreference (без $global:) не
+    # придушує його надійно — відомий нюанс Windows PowerShell 5.1.
+    Test-BRAVOCondition `
+        -Condition (
+            $compatibilityScriptText.Contains('$previousGlobalProgressPreference = $global:ProgressPreference') -and
+            $compatibilityScriptText.Contains("`$global:ProgressPreference = 'SilentlyContinue'") -and
+            $compatibilityScriptText.Contains('$global:ProgressPreference = $previousGlobalProgressPreference')
+        ) `
+        -Name "Compatibility/TcpConnectionSuppressesGlobalProgress" `
+        -Failure "Test-BRAVOTcpConnection має тимчасово підміняти ГЛОБАЛЬНЕ `$ProgressPreference (і гарантовано відновлювати його в finally) — лише локальне присвоєння не придушує власний прогрес-бокс Test-NetConnection"
+
     # Аудит #5: секрет із Credential Manager більше не матеріалізується як
     # звичайний managed string у джерелі. У .NET рядок незмінний, тому його
     # неможливо занулити — копія пароля лишалась у керованій купі до збирання
@@ -1847,6 +1894,183 @@ try {
         -Condition $secureSecretCredentialWorks `
         -Name "Secrets/SecureCredentialSkipsPlainText" `
         -Failure "New-BRAVOSecureCredential має будувати PSCredential напряму з SecureString, без проміжного плейнтексту"
+
+    # Ручний запуск з вiдсутнiми обов'язковими credentials пропонує
+    # налаштувати їх одразу — але лише коли за клавіатурою реально людина,
+    # лише для поточного користувача, і лише запитуючи те, чого справдi
+    # бракує (не перезаписуючи вже наявне). AST/regex-перевірка, бо живий
+    # функціональний тест вимагав би реальної інтерактивної консолі та
+    # довiльного доступу до Credential Manager під час CI.
+    # Якір навмисно від САМОГО КОДУ (умова if), а не від пояснювального
+    # коментаря вище: коментар навмисно згадує і "-StoreFor CurrentUser",
+    # і "-StoreFor ScheduledTaskAccount" прозою, і перша ж спроба цієї
+    # перевірки зловила власний коментар замість реального виклику.
+    $archiveCredentialSetupBlockText = if ($archiveScriptText -match
+        '(?s)if \(\$credentialHelperLoaded -and -not \$NoPause.*?-StoreFor CurrentUser') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($archiveCredentialSetupBlockText) -and
+            $archiveCredentialSetupBlockText.Contains('-not $NoPause') -and
+            $archiveCredentialSetupBlockText.Contains('[Environment]::UserInteractive') -and
+            $archiveCredentialSetupBlockText.Contains('[Console]::IsInputRedirected')
+        ) `
+        -Name "Console/ArchiveOffersCredentialSetupOnlyWhenInteractive" `
+        -Failure "автозапуск BRAVO_CREDENTIALS_SETUP.ps1 має спрацьовувати лише коли НЕ -NoPause, [Environment]::UserInteractive і НЕ [Console]::IsInputRedirected — інакше заплановане завдання чи дочірній процес автоматизації зависне на Read-Host"
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($archiveCredentialSetupBlockText) -and
+            $archiveCredentialSetupBlockText.Contains('-Action Ensure') -and
+            $archiveCredentialSetupBlockText.Contains('-Component Required') -and
+            $archiveCredentialSetupBlockText.Contains('-StoreFor CurrentUser') -and
+            -not $archiveCredentialSetupBlockText.Contains('ScheduledTaskAccount') -and
+            -not $archiveCredentialSetupBlockText.Contains('-StoreFor Both')
+        ) `
+        -Name "Console/ArchiveCredentialSetupUsesEnsureAndCurrentUserOnly" `
+        -Failure "автозапуск має викликати BRAVO_CREDENTIALS_SETUP.ps1 з -Action Ensure (запитати лише відсутнє, не перезаписувати наявне) -Component Required -StoreFor CurrentUser — ніколи ScheduledTaskAccount/Both зі скрипта, що виконує архівацію"
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($archiveCredentialSetupBlockText) -and
+            [regex]::IsMatch($archiveCredentialSetupBlockText, '&\s+powershell\.exe\s+-NoProfile\s+-ExecutionPolicy Bypass[^\r\n]*\r?\n\s*-File \$credentialsSetupPath')
+        ) `
+        -Name "Console/ArchiveCredentialSetupRunsAsIsolatedProcess" `
+        -Failure "BRAVO_CREDENTIALS_SETUP.ps1 має запускатись окремим процесом (powershell.exe -File), а не &/dot-source: інакше він перезапише глобальний стан BRAVO.config поточного запуску Archive"
+
+    # Лог-файл мав показувати лише "УВIМКНЕНО"/"ВИМКНЕНО" для MODEL/BLOG/
+    # BAZA — без самого шляху оператор не міг перевірити, який каталог
+    # discovery (bravo.ini) реально обрав джерелом, не заглядаючи в код.
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('if ([bool]$componentSettings.Archive.MODEL) {') -and
+            $archiveScriptText.Contains('Джерело MODEL: $($bravoDiscoveryResult.MODEL_SOURCE) ($($bravoDiscoveryResult.Reasons.MODEL))') -and
+            $archiveScriptText.Contains('Джерело MODEL не визначено: $($bravoDiscoveryResult.Reasons.MODEL)')
+        ) `
+        -Name "Console/ArchiveLogsModelSource" `
+        -Failure "лог-файл має показувати обране джерело MODEL (bravoDiscoveryResult.MODEL_SOURCE) і причину вибору, коли компонент увімкнено"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('if ([bool]$componentSettings.Archive.BLOG) {') -and
+            $archiveScriptText.Contains('Джерело BLOG: $($bravoDiscoveryResult.BLOG_SOURCE) ($($bravoDiscoveryResult.Reasons.BLOG))') -and
+            $archiveScriptText.Contains('Джерело BLOG не визначено: $($bravoDiscoveryResult.Reasons.BLOG)')
+        ) `
+        -Name "Console/ArchiveLogsBlogSource" `
+        -Failure "лог-файл має показувати обране джерело BLOG (bravoDiscoveryResult.BLOG_SOURCE) і причину вибору, коли компонент увімкнено"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Джерело BAZA APP: $($bazaAppPaths.Source) ($($bravoDiscoveryResult.Reasons.BAZA_APP))') -and
+            $archiveScriptText.Contains('Джерело BAZA APP не визначено: $($bravoDiscoveryResult.Reasons.BAZA_APP)')
+        ) `
+        -Name "Console/ArchiveLogsBazaLocalSource" `
+        -Failure "лог-файл має показувати обране джерело локальної синхронізації BAZA APP (bazaAppPaths.Source) і причину вибору, коли вона увімкнена"
+
+    # "Визначення BAZA може бути лише декількома значеннями": рівно
+    # чотири незалежні прапорці, без старих скорочених назв, що змішували
+    # APP/WWW в одному бареному "BAZA".
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigText.Contains("BAZA_APP_LOCAL =") -and
+            $bravoConfigText.Contains("BAZA_APP_SFTP =") -and
+            $bravoConfigText.Contains("BAZA_WWW_SFTP =") -and
+            $bravoConfigText.Contains("BAZA_WWW_LOCAL =") -and
+            -not $bravoConfigText.Contains("BAZALocal") -and
+            -not $bravoConfigText.Contains("BAZASFTP") -and
+            -not $bravoConfigText.Contains("BAZAWWWSFTP")
+        ) `
+        -Name "Discovery/ConfigDefinesExactlyFourBazaSyncFlags" `
+        -Failure "componentSettings.Synchronization має рівно 4 прапорці BAZA: BAZA_APP_LOCAL/BAZA_APP_SFTP/BAZA_WWW_SFTP/BAZA_WWW_LOCAL, без старих скорочених імен"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('$bazaAppLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_LOCAL') -and
+            $archiveScriptText.Contains('$bazaAppSFTPSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_SFTP') -and
+            $archiveScriptText.Contains('$bazaWWWSFTPSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_SFTP') -and
+            $archiveScriptText.Contains('$bazaWWWLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL')
+        ) `
+        -Name "Discovery/ArchiveReadsExactlyFourBazaSyncFlags" `
+        -Failure "BRAVO.Archive.Runtime.ps1 має читати всі 4 прапорці BAZA окремими змінними"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('=== СИНХРОНIЗАЦIЯ BAZA WWW ===') -and
+            $archiveScriptText.Contains('$syncSuccess = Sync-Folders -SourcePath $bazaWWWPaths.Source -DestinationPath $bazaWWWPaths.Destination') -and
+            $archiveScriptText.Contains('if ($bazaWWWLocalSyncEnabled -and $bazaWWWSourceAvailable -and $bazaWWWDestinationAvailable)')
+        ) `
+        -Name "Console/ArchiveSyncsBazaWwwLocally" `
+        -Failure "BAZA_WWW_LOCAL має синхронізувати bazaWWWPaths.Source -> bazaWWWPaths.Destination через Sync-Folders, за аналогією з BAZA_APP_LOCAL"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('function Get-BAZALocalSyncHealthIssues') -and
+            $healthScriptText.Contains('-SourcePath $bazaAppPaths.Source') -and
+            $healthScriptText.Contains('-SourcePath $bazaWWWPaths.Source') -and
+            $healthScriptText.Contains('-Label "BAZA APP"') -and
+            $healthScriptText.Contains('-Label "BAZA WWW"')
+        ) `
+        -Name "Health/BazaWwwLocalHealthCheckWired" `
+        -Failure "Health має перевіряти локальну копію BAZA_WWW тим самим read-only robocopy /L порівнянням, що й BAZA_APP (Get-BAZALocalSyncHealthIssues)"
+
+    # Реальний випадок: WinSCP явно повідомляв "Error listing directory
+    # '/baza_app'. No such file or directory" — самі каталоги на SFTP
+    # ніколи не створювались. option batch continue навмисно: mkdir на
+    # вже наявному каталозі повертає помилку, а після першого успішного
+    # запуску каталоги вже існують щоразу — тому виклик не має впливати
+    # на підсумковий код завершення реальної передачі.
+    $sftpMkdirFunctionText = if ($archiveScriptText -match
+        '(?s)function Initialize-BRAVOSFTPRemoteDirectories \{.*?\n\}') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    $sftpMkdirCallCount = @(
+        [regex]::Matches($archiveScriptText, 'Initialize-BRAVOSFTPRemoteDirectories\s+`')
+    ).Count
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($sftpMkdirFunctionText) -and
+            $sftpMkdirFunctionText.Contains('option batch continue') -and
+            $sftpMkdirFunctionText.Contains('mkdir') -and
+            $sftpMkdirCallCount -eq 2
+        ) `
+        -Name "Console/ArchiveEnsuresSFTPDirectoriesBeforeTransfer" `
+        -Failure "Initialize-BRAVOSFTPRemoteDirectories (mkdir з option batch continue) має існувати й викликатись і в автоматичному потоці завантаження/синхронізації, і в ручній -SyncBAZA — інакше відсутні каталоги на SFTP і далі валять кожну передачу"
+
+    # $difference.Local з WinSCP CompareDirectories — це RemoteFileInfo
+    # навіть для локальної сторони порівняння, а не System.IO.FileInfo:
+    # .FullName на ньому немає, лише .FileName (той самий API, що вже
+    # коректно працює через $side.FileName у Health.Runtime.ps1). Реальний
+    # випадок: щойно створений на SFTP каталог /baza_app вперше зробив цю
+    # гілку досяжною — раніше порівняння падало на "каталог не знайдено"
+    # раніше, ніж доходило сюди.
+    # $localItem — не унікальна назва змінної в цьому файлі (та сама
+    # назва коректно використовує .FullName в Get-BAZARemoteNameCompatibilityIssues
+    # для звичайних Get-ChildItem-результатів) — тому перевірка обмежена
+    # саме тілом Get-BAZASFTPComparison, а не всім файлом.
+    $bazaComparisonFunctionText = if ($archiveScriptText -match
+        '(?s)function Get-BAZASFTPComparison \{.*?\n\}') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($bazaComparisonFunctionText) -and
+            -not [regex]::IsMatch($bazaComparisonFunctionText, '\$localItem\.FullName\b') -and
+            $bazaComparisonFunctionText.Contains("PSObject.Properties['FileName']")
+        ) `
+        -Name "Console/BazaComparisonReadsFileNameSafely" `
+        -Failure "Get-BAZASFTPComparison має читати ім'я локального елемента через .FileName (PSObject.Properties, безпечно під Set-StrictMode), а не через неіснуючий .FullName на WinSCP.RemoteFileInfo"
+
+    # -FileOnly існує лише на локальному шимі Write-Log (транслює його в
+    # Write-BRAVOLog -NoConsole) — сам Write-BRAVOLog такого параметра не
+    # має. Реальний випадок: аудит BAZA з 374 елементами вперше зробив
+    # цей цикл досяжним і одразу провалив весь runtime помилкою "A
+    # parameter cannot be found that matches parameter name 'FileOnly'" —
+    # два попередніх краші того самого аудиту (відсутній каталог, потім
+    # .FullName) не давали дійти сюди раніше.
+    Test-BRAVOCondition `
+        -Condition (-not [regex]::IsMatch($archiveScriptText, "Write-BRAVOLog[^\r\n]*-FileOnly\b")) `
+        -Name "Console/BazaAuditUsesNoConsoleNotFileOnly" `
+        -Failure "прямі виклики Write-BRAVOLog у Write-BAZASFTPComparisonAudit/Write-BAZARemoteNameCompatibilityAudit мають використовувати -NoConsole — -FileOnly існує лише на локальному шимі Write-Log і на Write-BRAVOLog падає з InputValidationError"
 
     # SMB-шлях плейнтексту не потребує взагалі: далі використовується лише
     # PSCredential. Регресія тут означала б повернення незанулюваної копії
@@ -2052,7 +2276,7 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains("function Invoke-ManualBAZASFTPSynchronization") -and
-            $archiveScriptText.Contains("Synchronization.BAZAWWWSFTP") -and
+            $archiveScriptText.Contains("Synchronization.BAZA_WWW_SFTP") -and
             $archiveScriptText.Contains("BAZA_APP / BAZA_WWW") -and
             $archiveScriptText.Contains("-SynchronizationOnly")
         ) `
@@ -3273,6 +3497,142 @@ try {
         -Name "Health/AlertFingerprintToleratesMissingIssueFields" `
         -Failure "Get-AlertFingerprint має читати поля проблеми через Get-BRAVOHealthIssueField — пряме звернення падає під Set-StrictMode для проблем без DifferenceCount"
 
+    # Той самий клас бага, інше поле: лише ОДНА з чотирьох гілок побудови
+    # проблеми "SFTPSynchronization" (Get-SFTPHealthIssues, "у хмарі
+    # відсутні...") насправді встановлює ActionCounts. Реальний прогін
+    # (BAZA-SFTP синхронізація увімкнена, локальний каталог BAZA відсутній)
+    # падав із "The property 'ActionCounts' cannot be found on this
+    # object" — Archive ловив це як відмову всього health-check, а не як
+    # окрему проблему в звіті.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeText.Contains('function Get-BRAVOHealthIssueActionCounts') -and
+            $healthRuntimeText.Contains("`$property = `$Issue.PSObject.Properties['ActionCounts']") -and
+            $healthRuntimeText.Contains('Get-BRAVOHealthIssueActionCounts -Issue $healthIssue') -and
+            $healthRuntimeText.Contains('Get-BRAVOHealthIssueActionCounts -Issue $Issue') -and
+            -not [regex]::IsMatch($healthRuntimeText, '\$healthIssue\.ActionCounts\b') -and
+            -not [regex]::IsMatch($healthRuntimeText, '\$Issue\.ActionCounts\b')
+        ) `
+        -Name "Health/SFTPSynchronizationToleratesMissingActionCounts" `
+        -Failure "три з чотирьох видів проблем SFTPSynchronization не несуть ActionCounts — читання має йти через Get-BRAVOHealthIssueActionCounts, пряме `$Issue.ActionCounts`/`$healthIssue.ActionCounts` падає під Set-StrictMode ще на порівнянні з `$null"
+
+    # Реальний випадок (скріншот користувача): Archive викликає Health
+    # усередині власного кроку "Перевірка резервних копій", і Health
+    # безумовно друкував ПОВНИЙ заголовок "BRAVO HEALTH X.X.X / Установа /
+    # Початок" — виглядало як друга незалежна програма всередині виводу
+    # Archive. -SuppressHeader вимикає лише текст заголовка (не резервування
+    # місця під прогрес-бар — Write-BRAVOHeader продовжує друкувати порожні
+    # рядки навіть коли текст придушено), і передається лише зі шляху
+    # Invoke-BRAVOHealthCheck (вбудований виклик з Archive) — самостійний
+    # запуск BRAVO_HEALTH.ps1 його не бачить, заголовок там лишається.
+    $healthPsmText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Health\BRAVO.Health.psm1"),
+        [Text.Encoding]::UTF8
+    )
+    $consoleScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Console\BRAVO.Console.psm1"),
+        [Text.Encoding]::UTF8
+    )
+    $writeBravoHeaderFunctionText = if ($consoleScriptText -match
+        '(?s)function Write-BRAVOHeader \{.*?\n\}') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeText.Contains('[switch]$SuppressHeader') -and
+            $healthRuntimeText.Contains('-SuppressText:$SuppressHeader') -and
+            [regex]::IsMatch($healthPsmText, '-SkipIfBackupTaskRunning:\$SkipIfBackupTaskRunning\s*`\r?\n\s*-SuppressHeader\r?\n') -and
+            -not [string]::IsNullOrWhiteSpace($writeBravoHeaderFunctionText) -and
+            $writeBravoHeaderFunctionText.Contains('[switch]$SuppressText') -and
+            $writeBravoHeaderFunctionText.Contains('if ($SuppressText) {') -and
+            # Реальний випадок: фіксований блок порожніх рядків (раніше
+            # безумовний) лишався видимим розривом навіть без жодного
+            # тексту заголовка для захисту — SuppressText тепер вимикає
+            # ВЕСЬ вивід Write-BRAVOHeader, і перевірка на це має стояти
+            # РАНІШЕ за цикл резервування рядків, а не після нього.
+            (
+                $writeBravoHeaderFunctionText.IndexOf('if ($SuppressText) {')
+            ) -lt (
+                $writeBravoHeaderFunctionText.IndexOf('for ($i = 0; $i -lt $script:BRAVOConsoleProgressReservedLines')
+            )
+        ) `
+        -Name "Console/EmbeddedHealthSuppressesDuplicateHeader" `
+        -Failure "Invoke-BRAVOHealthCheck (вбудований виклик Health з Archive) має передавати -SuppressHeader у Invoke-BRAVOHealth, а Write-BRAVOHeader — повністю пропускати вивід (і текст, і резервування рядків під прогрес-бар), коли текст придушено"
+
+    # Реальний випадок (скріншот користувача, після прибирання заголовка):
+    # вбудований виклик Health усередині Archive все одно друкував ВЛАСНУ
+    # покрокову нумерацію [N/5] поряд із нумерацією Archive [N/7] — виглядало
+    # як два незалежні прогони. -SuppressHeader тепер вимикає й це.
+    $writeBravoHealthStepFunctionText = if ($healthRuntimeText -match
+        '(?s)function Write-BRAVOHealthStep \{.*?\n\}') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($writeBravoHealthStepFunctionText) -and
+            $writeBravoHealthStepFunctionText.Contains('if ($SuppressHeader) {') -and
+            # Лічильник кроків має інкрементуватись РАНІШЕ за перевірку —
+            # інакше номер кроку "Сповіщення" в кінці зіб'ється.
+            (
+                $writeBravoHealthStepFunctionText.IndexOf('$script:BRAVOHealthStepCurrent++')
+            ) -lt (
+                $writeBravoHealthStepFunctionText.IndexOf('if ($SuppressHeader) {')
+            )
+        ) `
+        -Name "Health/EmbeddedCallSuppressesStepNumbering" `
+        -Failure "Write-BRAVOHealthStep має пропускати власний друк [N/5] при -SuppressHeader (вбудований виклик з Archive), не збиваючи внутрішній лічильник кроків"
+
+    # Той самий реальний випадок: власний підсумок Health
+    # (Результат/Тривалість/.../Детальний журнал) усе одно друкувався другим
+    # блоком поряд із підсумком Archive — два "Детальний журнал:" на один
+    # прогін. Complete-BRAVOProgress (очищення прогрес-бару) лишається
+    # безумовним — лише текстовий підсумок і Write-BRAVOSummary придушені.
+    $completeHealthResultFunctionText = if ($healthRuntimeText -match
+        '(?s)function Complete-BRAVOHealthResult \{.*?\n\}') {
+        $Matches[0]
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($completeHealthResultFunctionText) -and
+            $completeHealthResultFunctionText.Contains('if (-not $SuppressHeader) {') -and
+            $completeHealthResultFunctionText.Contains('Write-BRAVOSummary') -and
+            (
+                $completeHealthResultFunctionText.IndexOf('Complete-BRAVOProgress')
+            ) -lt (
+                $completeHealthResultFunctionText.IndexOf('if (-not $SuppressHeader) {')
+            ) -and
+            (
+                $completeHealthResultFunctionText.IndexOf('if (-not $SuppressHeader) {')
+            ) -lt (
+                $completeHealthResultFunctionText.IndexOf('Write-BRAVOSummary')
+            )
+        ) `
+        -Name "Health/EmbeddedCallSuppressesOwnSummary" `
+        -Failure "Complete-BRAVOHealthResult має придушувати власний Write-BRAVOSummary при -SuppressHeader (вбудований виклик з Archive), не чіпаючи Complete-BRAVOProgress"
+
+    # Реальний випадок: "SFTP MODEL: серверний SHA архіву недоступний;
+    # використано повний збіг віддаленого hash-файлу" — перевірка все одно
+    # УСПІШНА (через .sha512), тому це нотатка про метод, а не WARNING, що
+    # привертає увагу оператора без причини.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeText.Contains(
+                '"SFTP $($ArchiveDefinition.Type): серверний SHA архіву недоступний; " +'
+            ) -and
+            [regex]::IsMatch(
+                $healthRuntimeText,
+                '(?s)серверний SHA архіву недоступний.*?використано повний збіг віддаленого hash-файлу"\s*\)\s*-Level "INFO"'
+            )
+        ) `
+        -Name "Health/ServerSideHashFallbackIsInfoNotWarning" `
+        -Failure "фолбек на .sha512-файл — це успішна перевірка іншим методом, а не WARNING; має логуватись як INFO"
+
     # CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md: автоматичний Discovery джерел
     # (BRAVO_ROOT/WEB_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP/BAZA_WWW) за
     # встановленою службою BRAVO і активним bravo.ini, з повним ручним
@@ -3329,15 +3689,23 @@ try {
         [IO.File]::WriteAllLines($fakeBravoIniPath, $discoveryTestIniContent)
 
         $syntheticServices = @(
-            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) },
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) },
             [pscustomobject]@{ Name = "Apache2.4"; DisplayName = "Apache2.4"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeHttpdPath) }
         )
 
+        # -SystemRoot тут навмисно вказує на неіснуючий каталог: без цього
+        # тест підхоплював би РЕАЛЬНИЙ %SystemRoot%\SysWOW64\bravo.ini
+        # поточної машини, якщо він там є (саме так і сталось під час
+        # розробки цієї перевірки — на машині розробника він справді
+        # лежить там), і тест ставав недетермінованим — залежав від
+        # оточення, а не лише від синтетичних фікстур.
+        $noSuchSystemRoot = Join-Path $discoveryTestRoot "NoSuchSystemRoot"
         $autoDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
             -WebServiceCandidates @("Apache2.4") `
-            -Services $syntheticServices
+            -Services $syntheticServices `
+            -SystemRoot $noSuchSystemRoot
 
         Test-BRAVOCondition `
             -Condition (
@@ -3348,16 +3716,18 @@ try {
                 $autoDiscovery.BRAVOEXCH_SOURCE -eq (Join-Path $discoveryTestRoot "bravoexch") -and
                 $autoDiscovery.BAZA_APP -eq (Join-Path $discoveryTestRoot "BAZA") -and
                 $autoDiscovery.BAZA_WWW -eq (Join-Path $discoveryTestRoot "webroot\www\BAZA") -and
-                $autoDiscovery.MODEL_PROJECT_FILE -eq (Join-Path $discoveryTestRoot "Model\lims")
+                $autoDiscovery.MODEL_PROJECT_FILE -eq (Join-Path $discoveryTestRoot "Model\lims") -and
+                $autoDiscovery.BACKUP_ROOT -eq (Join-Path $discoveryTestRoot "ARCHIV")
             ) `
             -Name "Discovery/ResolvesFromServiceAndIniWithoutOverride" `
-            -Failure "Resolve-BRAVOInstallationDiscovery має обчислювати BRAVO_ROOT/WEB_ROOT/MODEL_SOURCE/BLOG_SOURCE/BRAVOEXCH_SOURCE/BAZA_APP/BAZA_WWW із синтетичної служби й bravo.ini без жодного override"
+            -Failure "Resolve-BRAVOInstallationDiscovery має обчислювати BRAVO_ROOT/WEB_ROOT/MODEL_SOURCE/BLOG_SOURCE/BRAVOEXCH_SOURCE/BAZA_APP/BAZA_WWW/BACKUP_ROOT із синтетичної служби й bravo.ini без жодного override"
 
         $overriddenDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
             -WebServiceCandidates @("Apache2.4") `
             -Services $syntheticServices `
+            -SystemRoot $noSuchSystemRoot `
             -DiscoverySettings @{ Sources = @{ MODEL = "C:\Explicit\Override\Model" } }
         Test-BRAVOCondition `
             -Condition (
@@ -3372,7 +3742,8 @@ try {
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO_NOT_INSTALLED" `
             -WebServiceCandidates @("Apache2.4") `
-            -Services @()
+            -Services @() `
+            -SystemRoot $noSuchSystemRoot
         Test-BRAVOCondition `
             -Condition (
                 $noServiceDiscovery.BRAVO_ROOT -eq $discoveryTestRoot -and
@@ -3382,6 +3753,219 @@ try {
             ) `
             -Name "Discovery/LegacyFallbackWhenNoServiceFound" `
             -Failure "без встановленої служби BRAVO/Apache Resolve-BRAVOInstallationDiscovery має fallback-ити на чинну LIMSRoot-відносну поведінку (Model/BLOG у корені), а не повертати порожні значення"
+
+        # BACKUP_ROOT — інакше, ніж MODEL/BLOG: коли службу BRAVO не
+        # знайдено, "LIMSRoot\ARCHIV" — це ГІРШИЙ здогад, ніж дефолт,
+        # який BRAVO.config уже має сам (каталог скрипта). Тому в цьому
+        # випадку BACKUP_ROOT має лишатись порожнім, а не пропонувати
+        # другу здогадку поверх першої.
+        Test-BRAVOCondition `
+            -Condition ([string]::IsNullOrWhiteSpace([string]$noServiceDiscovery.BACKUP_ROOT)) `
+            -Name "Discovery/BackupRootStaysEmptyWithoutRealService" `
+            -Failure "без реально знайденої служби BRAVO BACKUP_ROOT має лишатись порожнім — LIMSRoot-відносна здогадка гірша за власний дефолт BRAVO.config (pathSettings.ArchiveRoot)"
+
+        # Реальний випадок (звіт користувача, реальна dev-машина): служби
+        # BRAVO немає взагалі, але системний bravo.ini є — і MODEL/BLOG у
+        # ньому вказують на зовсім інший диск/каталог, ніж LimsRoot
+        # ("D:\LIMS-NEW\..." проти "C:\Users\...\Documents"). BRAVO_ROOT
+        # тоді деградує до LimsRoot-фолбеку — без цього виправлення
+        # BAZA_APP шукався б поруч із LimsRoot, а не поруч із реальним
+        # MODEL/BLOG, куди насправді дивиться bravo.ini.
+        $iniOnlyInstallRoot = Join-Path $discoveryTestRoot "IniOnlyInstall"
+        [void][IO.Directory]::CreateDirectory($iniOnlyInstallRoot)
+        $iniOnlySystemRoot = Join-Path $discoveryTestRoot "IniOnlyWindows"
+        $iniOnlySysWow64Dir = Join-Path $iniOnlySystemRoot "SysWOW64"
+        [void][IO.Directory]::CreateDirectory($iniOnlySysWow64Dir)
+        [IO.File]::WriteAllLines((Join-Path $iniOnlySysWow64Dir "bravo.ini"), @(
+            '[model]',
+            ("MODEL={0}" -f (Join-Path $iniOnlyInstallRoot "Model\lims")),
+            ("BLOG={0}\" -f (Join-Path $iniOnlyInstallRoot "BLOG"))
+        ))
+        $iniOnlyDiscovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO_NOT_INSTALLED" `
+            -Services @() `
+            -SystemRoot $iniOnlySystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                $iniOnlyDiscovery.BRAVO_ROOT -eq $discoveryTestRoot -and
+                $iniOnlyDiscovery.MODEL_SOURCE -eq (Join-Path $iniOnlyInstallRoot "Model") -and
+                $iniOnlyDiscovery.BAZA_APP -eq (Join-Path $iniOnlyInstallRoot "BAZA") -and
+                $iniOnlyDiscovery.Reasons.BAZA_APP.Contains("MODEL/BLOG з bravo.ini")
+            ) `
+            -Name "Discovery/BazaAppFollowsIniInstallationRootNotBravoRootFallback" `
+            -Failure "коли bravo.ini знайдено, а служби BRAVO немає, BAZA_APP має братись поруч із MODEL/BLOG з bravo.ini, а не поруч із LimsRoot-фолбеком BRAVO_ROOT"
+
+        # Мінімальний парсер httpd.conf: реальний зразок, наданий
+        # користувачем — DocumentRoot у лапках, слеші "/" (Apache на
+        # Windows традиційно пише шлях так, навіть коли сам процес — Win32).
+        $sampleHttpdConfContent = @(
+            '# приклад, наданий користувачем',
+            '',
+            'ServerRoot "c:/br-a-vo.web/apache"',
+            'Listen 80',
+            'DocumentRoot "c:/br-a-vo.web/www"',
+            '<Directory "c:/br-a-vo.web/www">',
+            '    Require all granted',
+            '</Directory>'
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                (Get-BRAVOApacheDocumentRoot -Content $sampleHttpdConfContent) -eq 'c:\br-a-vo.web\www'
+            ) `
+            -Name "Discovery/ApacheDocumentRootParserReadsQuotedForwardSlashPath" `
+            -Failure "Get-BRAVOApacheDocumentRoot має правильно розбирати DocumentRoot у лапках зі слешами '/' (реальний формат httpd.conf) і конвертувати їх у '\'"
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq (Get-BRAVOApacheDocumentRoot -Content @('# DocumentRoot "c:/ignored"', 'Listen 80'))
+            ) `
+            -Name "Discovery/ApacheDocumentRootParserIgnoresCommentedDirective" `
+            -Failure "Get-BRAVOApacheDocumentRoot не повинен сприймати закоментовану директиву DocumentRoot"
+
+        # BAZA_WWW має братись САМЕ з DocumentRoot реального httpd.conf, а
+        # не з фолбек-здогадки "<WEB_ROOT>\www" — попередній тест вище
+        # (без httpd.conf на диску) уже перевірив саму здогадку; тут
+        # httpd.conf з'являється на диску вперше й має її перебити.
+        $fakeApacheConfDir = Join-Path $discoveryTestRoot "webroot\apache\conf"
+        [void][IO.Directory]::CreateDirectory($fakeApacheConfDir)
+        $fakeHttpdConfPath = Join-Path $fakeApacheConfDir "httpd.conf"
+        $fakeDocumentRoot = Join-Path $discoveryTestRoot "custom-web-root"
+        [IO.File]::WriteAllLines($fakeHttpdConfPath, @(
+            'ServerRoot "c:/br-a-vo.web/apache"',
+            ("DocumentRoot ""{0}""" -f $fakeDocumentRoot.Replace('\', '/'))
+        ))
+        $discoveryWithHttpdConf = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -WebServiceCandidates @("Apache2.4") `
+            -Services $syntheticServices `
+            -SystemRoot $noSuchSystemRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $discoveryWithHttpdConf.HttpdConfPath -eq $fakeHttpdConfPath -and
+                $discoveryWithHttpdConf.BAZA_WWW -eq (Join-Path $fakeDocumentRoot "BAZA") -and
+                $discoveryWithHttpdConf.WebServiceName -eq "Apache2.4" -and
+                $discoveryWithHttpdConf.WebServiceExecutable -eq $fakeHttpdPath -and
+                $discoveryWithHttpdConf.Reasons.BAZA_WWW.Contains("httpd.conf") -and
+                $discoveryWithHttpdConf.Reasons.BAZA_WWW.Contains("DocumentRoot=$fakeDocumentRoot")
+            ) `
+            -Name "Discovery/BazaWwwUsesHttpdConfDocumentRoot" `
+            -Failure "BAZA_WWW має братись з DocumentRoot реального httpd.conf встановленої Apache-служби, а не з фолбек-здогадки <WEB_ROOT>\www"
+
+        # Джерело істини — Service name ТА Display name одночасно.
+        # Сторонній сервіс із Name="BRAVO", але іншим Display name (типова
+        # підстава для помилкового спрацювання) не повинен визнаватись
+        # службою BRAVO.
+        $wrongDisplayNameServices = @(
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "Якийсь Інший Сервіс"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) }
+        )
+        $wrongDisplayNameDiscovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -BravoDisplayName "BRAVO Service" `
+            -Services $wrongDisplayNameServices `
+            -SystemRoot $noSuchSystemRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $wrongDisplayNameDiscovery.BRAVO_ROOT -eq $discoveryTestRoot -and
+                $wrongDisplayNameDiscovery.Reasons.BravoRoot.Contains("legacy fallback")
+            ) `
+            -Name "Discovery/BravoServiceRequiresNameAndDisplayNameMatch" `
+            -Failure "служба з Name='BRAVO', але іншим Display name не повинна визнаватись службою BRAVO — Resolve-BRAVOInstallationDiscovery має fallback-ити на LIMSRoot, а не використовувати її ExecutablePath"
+
+        # bravo.ini — джерело істини системний каталог Windows, НЕ каталог
+        # bravo.exe. -SystemRoot/-Is64BitOperatingSystem — ін'єкція для
+        # детермінованості: реальний %SystemRoot% цієї машини не повинен
+        # впливати на результат тесту. SysWOW64 і System32 фікстури містять
+        # РІЗНИЙ MODEL=, щоб однозначно довести, який саме каталог обрано —
+        # а не лише що "якийсь" bravo.ini знайдено.
+        $fakeSystemRoot = Join-Path $discoveryTestRoot "FakeWindows"
+        $fakeSysWow64Dir = Join-Path $fakeSystemRoot "SysWOW64"
+        $fakeSystem32Dir = Join-Path $fakeSystemRoot "System32"
+        [void][IO.Directory]::CreateDirectory($fakeSysWow64Dir)
+        [void][IO.Directory]::CreateDirectory($fakeSystem32Dir)
+        $systemBravoIniPath = Join-Path $fakeSysWow64Dir "bravo.ini"
+        [IO.File]::WriteAllLines($systemBravoIniPath, @(
+            '[model]',
+            ("MODEL={0}" -f (Join-Path $discoveryTestRoot "SysWOW64Model\lims"))
+        ))
+        $system32BravoIniPath = Join-Path $fakeSystem32Dir "bravo.ini"
+        [IO.File]::WriteAllLines($system32BravoIniPath, @(
+            '[model]',
+            ("MODEL={0}" -f (Join-Path $discoveryTestRoot "System32Model\lims"))
+        ))
+
+        $systemIniDiscoveryX64 = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -BravoDisplayName "BRAVO Service" `
+            -Services $syntheticServices `
+            -SystemRoot $fakeSystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                $systemIniDiscoveryX64.BravoIniPath -eq $systemBravoIniPath -and
+                $systemIniDiscoveryX64.MODEL_SOURCE -eq (Join-Path $discoveryTestRoot "SysWOW64Model") -and
+                $systemIniDiscoveryX64.Reasons.BravoIniPath.Contains("системному каталозі")
+            ) `
+            -Name "Discovery/SystemDirectoryIsPrimaryBravoIniSource" `
+            -Failure "на 64-бітній ОС bravo.ini у %SystemRoot%\SysWOW64 має мати пріоритет над файлом поруч з bravo.exe — так само, як він насправді лежить на реальних інсталяціях"
+
+        $systemIniDiscoveryX86 = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -BravoDisplayName "BRAVO Service" `
+            -Services $syntheticServices `
+            -SystemRoot $fakeSystemRoot `
+            -Is64BitOperatingSystem $false
+        Test-BRAVOCondition `
+            -Condition (
+                $systemIniDiscoveryX86.BravoIniPath -eq $system32BravoIniPath -and
+                $systemIniDiscoveryX86.MODEL_SOURCE -eq (Join-Path $discoveryTestRoot "System32Model")
+            ) `
+            -Name "Discovery/Win32UsesSystem32NotSysWOW64" `
+            -Failure "на 32-бітній ОС немає шару перенаправлення WOW64 — bravo.ini має шукатись у System32, а не SysWOW64"
+
+        # Каталог доступний лише в SysWOW64 фікстури — якщо системного
+        # bravo.ini немає взагалі (ні System32, ні SysWOW64), має
+        # спрацювати старий fallback поруч з bravo.exe.
+        $noSystemIniDiscovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -BravoDisplayName "BRAVO Service" `
+            -Services $syntheticServices `
+            -SystemRoot (Join-Path $discoveryTestRoot "NoSuchWindowsDir") `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                $noSystemIniDiscovery.BravoIniPath -eq $fakeBravoIniPath -and
+                $noSystemIniDiscovery.Reasons.BravoIniPath.Contains("не знайдено в системному каталозі") -and
+                $noSystemIniDiscovery.Reasons.BravoIniPath.Contains("поруч з bravo.exe")
+            ) `
+            -Name "Discovery/FallsBackNextToExecutableWhenSystemIniMissing" `
+            -Failure "якщо bravo.ini немає в системному каталозі, Resolve-BRAVOInstallationDiscovery має fallback-ити на файл поруч з bravo.exe (зворотна сумісність)"
+
+        # BACKUP_ROOT: підкаталог "ARCHIV" усередині BRAVO_ROOT, і той самий
+        # override-механізм, що й решта Sources-полів.
+        Test-BRAVOCondition `
+            -Condition ($autoDiscovery.BACKUP_ROOT -eq (Join-Path $discoveryTestRoot "ARCHIV")) `
+            -Name "Discovery/BackupRootDerivedFromBravoRoot" `
+            -Failure "BACKUP_ROOT має обчислюватись як підкаталог 'ARCHIV' усередині BRAVO_ROOT — каталогу встановлення служби BRAVO"
+        $BackupRootOverrideDiscovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -BravoDisplayName "BRAVO Service" `
+            -Services $syntheticServices `
+            -SystemRoot $noSuchSystemRoot `
+            -DiscoverySettings @{ Sources = @{ BACKUP_ROOT = "D:\Explicit\Backups" } }
+        Test-BRAVOCondition `
+            -Condition (
+                $BackupRootOverrideDiscovery.BACKUP_ROOT -eq "D:\Explicit\Backups" -and
+                [bool]$BackupRootOverrideDiscovery.Overrides["BACKUP_ROOT"]
+            ) `
+            -Name "Discovery/BackupRootOverrideWins" `
+            -Failure "явний discoverySettings.Sources.BACKUP_ROOT override має перемагати над автоматично обчисленим підкаталогом BRAVO_ROOT"
 
         $missingSourceResult = [pscustomobject]@{
             MODEL_SOURCE = Join-Path $discoveryTestRoot "__DOES_NOT_EXIST__"
@@ -3409,13 +3993,15 @@ try {
         $ambiguousExePathB = Join-Path $discoveryTestRoot "bravo_instance_b.exe"
         [IO.File]::WriteAllText($ambiguousExePathB, "stub")
         $ambiguousBravoServices = @(
-            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $ambiguousExePathA) },
-            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $ambiguousExePathB) }
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $ambiguousExePathA) },
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $ambiguousExePathB) }
         )
         $ambiguousDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
-            -Services $ambiguousBravoServices
+            -BravoDisplayName "BRAVO Service" `
+            -Services $ambiguousBravoServices `
+            -SystemRoot $noSuchSystemRoot
         Test-BRAVOCondition `
             -Condition (
                 [bool]$ambiguousDiscovery.Ambiguous["BravoRoot"] -and
@@ -3455,6 +4041,7 @@ try {
             BRAVOEXCH_SOURCE = $autoDiscovery.BRAVOEXCH_SOURCE
             BAZA_APP = $autoDiscovery.BAZA_APP
             BAZA_WWW = $autoDiscovery.BAZA_WWW
+            BACKUP_ROOT = $autoDiscovery.BACKUP_ROOT
         }
         $driftResult = @(Compare-BRAVODiscoveryBaseline -DiscoveryResult $driftedDiscovery -BaselinePath $baselineTestPath)
         $noBaselineYetResult = @(Compare-BRAVODiscoveryBaseline -DiscoveryResult $autoDiscovery -BaselinePath (Join-Path $discoveryTestRoot "__NO_SUCH_BASELINE__.json"))
@@ -3500,6 +4087,36 @@ try {
         ) `
         -Name "Discovery/WiredIntoConfigLoaderAndSetup" `
         -Failure "BRAVO_CONFIG_LOADER.ps1 має імпортувати BRAVO.Discovery, BRAVO.config має викликати Resolve-BRAVOInstallationDiscovery для sourcePaths, а BRAVO_SETUP.ps1 -ValidateOnly має показувати й перевіряти discovery-результат і дрейф відносно baseline"
+
+    # Джерело істини для служби BRAVO (Service name ТА Display name) і для
+    # каталогу збереження бекапів ARCHIV (підкаталог у шляху встановлення
+    # служби BRAVO, не LIMSRoot-відносний) — обидва мають бути прокинуті
+    # з BRAVO.config у Resolve-BRAVOInstallationDiscovery, а не лишатись
+    # лише в модулі.
+    Test-BRAVOCondition `
+        -Condition (
+            $bravoConfigTextForDiscovery.Contains('BravoDisplayName = "BRAVO Service"') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '-BravoDisplayName\s+\(\[string\]\$maintenanceSettings\.Services\.BravoDisplayName\)') -and
+            $bravoConfigTextForDiscovery.Contains('$bravoDiscoveryResult.BACKUP_ROOT') -and
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '\$pathSettings\.BackupRoot\s+-eq\s+\$defaultArchiveRoot')
+        ) `
+        -Name "Discovery/ConfigUsesStrictBravoIdentityAndBackupRoot" `
+        -Failure "BRAVO.config має передавати -BravoDisplayName='BRAVO Service' у Resolve-BRAVOInstallationDiscovery і використовувати BACKUP_ROOT як дефолт pathSettings.BackupRoot, лише якщо адміністратор не змінив його вручну"
+
+    # ArchiveRoot (Tools\/LOGS\/TOOLS_MANIFEST.json) має дефолтитись у
+    # каталог самого скрипта ($ConfigRoot) — НЕ в обчислений здогад
+    # "піднятись на рівень і зайти в підкаталог ARCHIV". Останній
+    # спрацьовував лише випадково, коли комплект розгорнутий у теці, яка
+    # називається буквально "ARCHIV" — на реальному сервері з git-чекаутом
+    # (інша назва теки) TOOLS_MANIFEST.json "губився", хоча фізично лежав
+    # поруч зі скриптом.
+    Test-BRAVOCondition `
+        -Condition (
+            [regex]::IsMatch($bravoConfigTextForDiscovery, '(?m)^\$defaultArchiveRoot\s*=\s*\$ConfigRoot\s*$') -and
+            -not $bravoConfigTextForDiscovery.Contains('Join-Path $defaultLIMSRoot "ARCHIV"')
+        ) `
+        -Name "Discovery/ArchiveRootDefaultsToScriptDirectory" `
+        -Failure "pathSettings.ArchiveRoot (Tools\, LOGS\, TOOLS_MANIFEST.json) має дефолтитись у `$ConfigRoot — каталог самого скрипта, а не в обчислений LIMSRoot\ARCHIV, який працює лише коли тека випадково називається 'ARCHIV'"
 
     # AUD-004 (аудит P0.4): restore drill. Читабельний і навіть SHA512/7za-
     # перевірений архів не доводить відновлюваність — Invoke-BRAVOSevenZipExtraction
