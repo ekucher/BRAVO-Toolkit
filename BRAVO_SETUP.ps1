@@ -35,6 +35,12 @@ $helperLoggingPath = Join-Path $PSScriptRoot "modules\BRAVO.HelperLogging\BRAVO.
 Import-Module -Name $helperLoggingPath -ErrorAction Stop
 $null = Start-BRAVOHelperLog -ScriptPath $PSCommandPath -ConfigPath $ConfigPath
 
+# Імпортується тут, а не після завантаження BRAVO.config: заголовок і
+# РЕЗУЛЬТАТ мають намалюватись навіть тоді, коли Setup провалюється ще ДО
+# конфігурації (catch-блок нижче).
+$setupConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.Console.psd1"
+Import-Module -Name $setupConsoleModulePath -ErrorAction Stop
+
 # Єдина точка налаштування BRAVO:
 # 1. fail-closed preflight без production-операцій;
 # 2. додавання/оновлення параметрів установи та секретів у Credential Manager;
@@ -68,11 +74,20 @@ function Invoke-ChildPowerShell {
     param(
         [string]$ScriptPath,
         [string[]]$Arguments,
-        [string]$StepName
+        [string]$StepName,
+        [int]$Current,
+        [int]$Total
     )
 
-    Write-Host ""
-    Write-Host "=== $StepName ===" -ForegroundColor Cyan
+    # Дочірній процес стрімить власний повний вивід (заголовок/кроки/
+    # РЕЗУЛЬТАТ, після міграції кожного з них — той самий каркас
+    # BRAVO.Console) прямо в консоль без перехоплення — тому тут лише
+    # заголовок кроку [N/M], а не Write-BRAVOStepResult з одним фінальним
+    # OK/ERROR: це вимагало б ковтати діагностику дочірнього скрипта
+    # (Credential Manager FOUND/MISSING, Dry Run PASS/WARN/FAIL/PLAN тощо),
+    # яку оператор зараз бачить наживо.
+    Write-Host ''
+    Write-Host ("[{0}/{1}] {2}" -f $Current, $Total, $StepName) -ForegroundColor Cyan
     $powerShellPath = Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe"
     if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
         throw "Windows PowerShell не знайдено: $powerShellPath"
@@ -96,6 +111,119 @@ function Invoke-ChildPowerShell {
     }
 }
 
+function New-BRAVOManualLauncherContent {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath,
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [ValidateSet('-ForceRestore')][string[]]$Arguments = @(),
+        [switch]$RequiresConfirmation
+    )
+
+    foreach ($path in @($EntryScriptPath, $ConfigPath)) {
+        if (-not [IO.Path]::IsPathRooted($path) -or $path.Contains('"')) {
+            throw "Некоректний шлях для manual launcher: $path"
+        }
+        if ($path -cmatch '[^\x00-\x7F]') {
+            throw "Manual launcher не підтримує не-ASCII шлях: $path"
+        }
+    }
+
+    $commandArguments = if ($Arguments.Count -gt 0) { ' ' + ($Arguments -join ' ') } else { '' }
+    $lines = @(
+        '@echo off',
+        'setlocal'
+    )
+    if ($RequiresConfirmation) {
+        $lines += @(
+            'echo.',
+            'echo WARNING: BRAVO Maintenance will run with FORCED RESTORE.',
+            'echo This operation will perform restore regardless of the normal schedule.',
+            'echo.',
+            'choice /C YN /N /M "Continue? [Y/N]: "',
+            'if errorlevel 2 exit /b 0',
+            ''
+        )
+    }
+    $lines += @(
+        'set "BRAVO_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"',
+        ('"%BRAVO_PS%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}"{2}' -f $EntryScriptPath, $ConfigPath, $commandArguments),
+        'exit /b %ERRORLEVEL%',
+        ''
+    )
+    return ($lines -join "`r`n")
+}
+
+function Write-BRAVOManualLaunchers {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$ConfigPath
+    )
+
+    foreach ($path in @($BackupRoot, $RuntimeRoot, $ConfigPath)) {
+        if (-not [IO.Path]::IsPathRooted($path)) {
+            throw "Очікувався абсолютний шлях для manual launcher: $path"
+        }
+    }
+
+    $resolvedRuntimeRoot = [IO.Path]::GetFullPath($RuntimeRoot)
+    $resolvedConfigPath = [IO.Path]::GetFullPath($ConfigPath)
+    $resolvedBackupRoot = [IO.Path]::GetFullPath($BackupRoot)
+    if (-not (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf)) {
+        throw "Файл конфігурації для manual launcher не знайдено: $resolvedConfigPath"
+    }
+
+    $launchers = @(
+        [pscustomobject]@{ Name = 'BRAVO_ARCHIV.cmd'; Script = 'BRAVO_ARCHIV.ps1'; Arguments = @(); RequiresConfirmation = $false },
+        [pscustomobject]@{ Name = 'BRAVO_MAINTENANCE.cmd'; Script = 'BRAVO_MAINTENANCE.ps1'; Arguments = @(); RequiresConfirmation = $false },
+        [pscustomobject]@{ Name = 'BRAVO_MAINTENANCE_FORCE_RESTORE.cmd'; Script = 'BRAVO_MAINTENANCE.ps1'; Arguments = @('-ForceRestore'); RequiresConfirmation = $true }
+    )
+    $launcherContents = @()
+    foreach ($launcher in $launchers) {
+        $entryScriptPath = Join-Path $resolvedRuntimeRoot $launcher.Script
+        if (-not (Test-Path -LiteralPath $entryScriptPath -PathType Leaf)) {
+            throw "Скрипт для manual launcher не знайдено: $entryScriptPath"
+        }
+        $launcherContents += [pscustomobject]@{
+            Path = Join-Path $resolvedBackupRoot $launcher.Name
+            Content = New-BRAVOManualLauncherContent `
+                -EntryScriptPath $entryScriptPath `
+                -ConfigPath $resolvedConfigPath `
+                -Arguments $launcher.Arguments `
+                -RequiresConfirmation:$launcher.RequiresConfirmation
+        }
+    }
+
+    [void][IO.Directory]::CreateDirectory($resolvedBackupRoot)
+    $ascii = New-Object Text.ASCIIEncoding
+    foreach ($launcher in $launcherContents) {
+        [IO.File]::WriteAllText(
+            $launcher.Path,
+            $launcher.Content,
+            $ascii
+        )
+    }
+}
+
+function Invoke-BRAVOManualLauncherSetup {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$SetupConfiguration,
+        [ValidateSet('Full', 'Credentials', 'Scheduler', 'Test')][string]$Action,
+        [switch]$ValidateOnly
+    )
+
+    if ($ValidateOnly -or $Action -ne 'Full') {
+        return
+    }
+    Write-BRAVOManualLaunchers `
+        -BackupRoot $SetupConfiguration.BackupRoot `
+        -RuntimeRoot $SetupConfiguration.Root `
+        -ConfigPath $SetupConfiguration.ConfigPath
+}
+
 function Get-SetupConfiguration {
     param([string]$Path)
 
@@ -104,27 +232,32 @@ function Get-SetupConfiguration {
     }
     $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
     $configRoot = Split-Path $resolvedPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
+    $configurationLoaderPath = Join-Path $runtimeRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedPath
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedPath -RuntimeRoot $runtimeRoot
 
     $credentialScript = if ($null -ne $credentialSettings -and
         -not [string]::IsNullOrWhiteSpace([string]$credentialSettings.SetupScriptPath)) {
         [string]$credentialSettings.SetupScriptPath
     } else {
-        Join-Path $configRoot "BRAVO_CREDENTIALS_SETUP.ps1"
+        Join-Path $runtimeRoot "BRAVO_CREDENTIALS_SETUP.ps1"
     }
 
     return [pscustomobject]@{
         ConfigPath = $resolvedPath
-        Root = $configRoot
+        Root = $runtimeRoot
+        BackupRoot = [string]$global:backupRootPath
         CredentialScript = $credentialScript
-        DryRunScript = Join-Path $configRoot "BRAVO_DRY_RUN.ps1"
-        TaskInstallScript = Join-Path $configRoot "BRAVO_TASKS_INSTALL.ps1"
-        TaskDiagnoseScript = Join-Path $configRoot "BRAVO_TASKS_DIAGNOSE.ps1"
+        DryRunScript = Join-Path $runtimeRoot "BRAVO_DRY_RUN.ps1"
+        # Task Installer/Diagnose — runtime-ресурси комплекту, тому беруться з
+        # RuntimeRoot, а не з каталогу конфігурації (ConfigRoot може бути іншим
+        # каталогом за -ConfigPath).
+        TaskInstallScript = Join-Path $runtimeRoot "BRAVO_TASKS_INSTALL.ps1"
+        TaskDiagnoseScript = Join-Path $runtimeRoot "BRAVO_TASKS_DIAGNOSE.ps1"
         NotificationsEnabled = (
             ([string]$bravoSettings.NotificationMode).Trim().ToLowerInvariant() -ne "none"
         )
@@ -212,31 +345,41 @@ try {
         Restart-SetupElevated -SetupConfiguration $setup
     }
 
-    Write-Host ""
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host " BRAVO — КОМПЛЕКСНЕ НАЛАШТУВАННЯ" -ForegroundColor Cyan
-    Write-Host "============================================================" -ForegroundColor Cyan
-    Write-Host "Config: $($setup.ConfigPath)"
-    Write-Host "Режим: $Action$(if ($ValidateOnly) { ' (лише перевірка)' } else { '' })"
+    Initialize-BRAVOConsole
+    Initialize-BRAVOProgress -Enabled $false
+    Write-BRAVOHeader `
+        -Title ("BRAVO Setup {0}" -f $global:ScriptVersion) `
+        -Institution ([string]$bravoSettings.InstitutionName) `
+        -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+        -Mode "$Action$(if ($ValidateOnly) { ' / VALIDATE-ONLY' } else { '' })"
+    Write-BRAVOResultField -Label 'Config' -Value $setup.ConfigPath
+    if ($Action -eq 'Full' -and -not $ValidateOnly) {
+        Invoke-BRAVOManualLauncherSetup `
+            -SetupConfiguration $setup `
+            -Action $Action `
+            -ValidateOnly:$ValidateOnly
+    }
 
     # Discovery джерел (CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md): показуємо
     # завжди, це лише read-only читання вже обчисленого
     # $global:bravoDiscoveryResult з BRAVO.config — жодних нових операцій.
     if ($null -ne $global:bravoDiscoveryResult) {
-        Write-Host ""
-        Write-Host "=== DISCOVERY ДЖЕРЕЛ ===" -ForegroundColor Cyan
-        Write-Host "BRAVO_ROOT: $($bravoDiscoveryResult.BRAVO_ROOT) ($($bravoDiscoveryResult.Reasons.BravoRoot))"
-        Write-Host "bravo.ini: $(if ([string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BravoIniPath)) { 'не знайдено' } else { [string]$bravoDiscoveryResult.BravoIniPath }) ($($bravoDiscoveryResult.Reasons.BravoIniPath))"
-        Write-Host "MODEL_SOURCE: $($bravoDiscoveryResult.MODEL_SOURCE) ($($bravoDiscoveryResult.Reasons.MODEL))"
-        Write-Host "BLOG_SOURCE: $($bravoDiscoveryResult.BLOG_SOURCE) ($($bravoDiscoveryResult.Reasons.BLOG))"
-        Write-Host "BRAVOEXCH_SOURCE: $($bravoDiscoveryResult.BRAVOEXCH_SOURCE) ($($bravoDiscoveryResult.Reasons.BRAVOEXCH))"
-        Write-Host "BAZA_APP: $($bravoDiscoveryResult.BAZA_APP) ($($bravoDiscoveryResult.Reasons.BAZA_APP))"
-        Write-Host "WEB_ROOT: $(if ([string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.WEB_ROOT)) { 'не визначено' } else { [string]$bravoDiscoveryResult.WEB_ROOT }) ($($bravoDiscoveryResult.Reasons.WebRoot))"
-        Write-Host "BAZA_WWW: $(if ([string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BAZA_WWW)) { 'не визначено' } else { [string]$bravoDiscoveryResult.BAZA_WWW }) ($($bravoDiscoveryResult.Reasons.BAZA_WWW))"
+        Write-BRAVOResultBlankLine
+        Write-BRAVOSeparator
+        Write-Host ' DISCOVERY'
+        Write-BRAVOSeparator
+        Write-BRAVOResultField -Label 'BRAVO_ROOT' -Value "$($bravoDiscoveryResult.BRAVO_ROOT) ($($bravoDiscoveryResult.Reasons.BravoRoot))"
+        Write-BRAVOResultField -Label 'bravo.ini' -Value "$(if ([string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BravoIniPath)) { 'не знайдено' } else { [string]$bravoDiscoveryResult.BravoIniPath }) ($($bravoDiscoveryResult.Reasons.BravoIniPath))"
+        Write-BRAVOResultField -Label 'MODEL' -Value "$($bravoDiscoveryResult.MODEL_SOURCE) ($($bravoDiscoveryResult.Reasons.MODEL))"
+        Write-BRAVOResultField -Label 'BLOG' -Value "$($bravoDiscoveryResult.BLOG_SOURCE) ($($bravoDiscoveryResult.Reasons.BLOG))"
+        Write-BRAVOResultField -Label 'BRAVOEXCH' -Value "$($bravoDiscoveryResult.BRAVOEXCH_SOURCE) ($($bravoDiscoveryResult.Reasons.BRAVOEXCH))"
+        Write-BRAVOResultField -Label 'BAZA_APP' -Value "$($bravoDiscoveryResult.BAZA_APP) ($($bravoDiscoveryResult.Reasons.BAZA_APP))"
+        Write-BRAVOResultField -Label 'WEB_ROOT' -Value "$(if ([string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.WEB_ROOT)) { 'не визначено' } else { [string]$bravoDiscoveryResult.WEB_ROOT }) ($($bravoDiscoveryResult.Reasons.WebRoot))"
+        Write-BRAVOResultField -Label 'BAZA_WWW' -Value "$(if ([string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BAZA_WWW)) { 'не визначено' } else { [string]$bravoDiscoveryResult.BAZA_WWW }) ($($bravoDiscoveryResult.Reasons.BAZA_WWW))"
         if ($bravoDiscoveryResult.Services.Count -gt 0) {
-            Write-Host "Знайдені служби: $(($bravoDiscoveryResult.Services | ForEach-Object { "$($_.Name) [$($_.State)]" }) -join ', ')"
+            Write-BRAVOResultField -Label 'Знайдені служби' -Value ($($bravoDiscoveryResult.Services | ForEach-Object { "$($_.Name) [$($_.State)]" }) -join ', ')
         } else {
-            Write-Host "Знайдені служби: жодної (усі значення — legacy fallback або override)"
+            Write-BRAVOResultField -Label 'Знайдені служби' -Value 'жодної (доступні лише canonical discovery values або explicit override)'
         }
         if ($bravoDiscoveryResult.Overrides.Count -gt 0) {
             Write-Host "Явні override з discoverySettings: $($bravoDiscoveryResult.Overrides.Keys -join ', ')"
@@ -301,13 +444,15 @@ try {
                 Write-Host "Результат перевірки discovery: OK" -ForegroundColor Green
             }
         }
+        Write-BRAVOSeparator
     }
 
     # Preflight не читає секрети й ніколи не робить мережеві або production-операції.
     Invoke-ChildPowerShell `
         -ScriptPath $setup.DryRunScript `
         -Arguments @("-ConfigPath", $setup.ConfigPath, "-SkipCredentials") `
-        -StepName "1/5. Локальний preflight / симуляція"
+        -StepName "Локальний preflight / симуляція" `
+        -Current 1 -Total 5
 
     if ($credentialWorkRequested) {
         if (-not $ValidateOnly) {
@@ -320,10 +465,11 @@ try {
             Invoke-ChildPowerShell `
                 -ScriptPath $setup.CredentialScript `
                 -Arguments $credentialArguments `
-                -StepName "2/5. Додавання або оновлення Credential Manager"
+                -StepName "Додавання або оновлення Credential Manager" `
+                -Current 2 -Total 5
         } else {
-            Write-Host ""
-            Write-Host "=== 2/5. Credential Manager ===" -ForegroundColor Cyan
+            Write-Host ''
+            Write-Host '[2/5] Credential Manager' -ForegroundColor Cyan
             Write-Host "[ПЕРЕВІРКА] Записи не створюються і не змінюються." -ForegroundColor Yellow
         }
     }
@@ -346,7 +492,8 @@ try {
         Invoke-ChildPowerShell `
             -ScriptPath $setup.CredentialScript `
             -Arguments $credentialTestArguments `
-            -StepName "3/5. Перевірка читання Credential Manager"
+            -StepName "Перевірка читання Credential Manager" `
+            -Current 3 -Total 5
     }
 
     if ($schedulerWorkRequested -or $Action -eq "Test") {
@@ -359,13 +506,15 @@ try {
             Invoke-ChildPowerShell `
                 -ScriptPath $setup.TaskInstallScript `
                 -Arguments @("-ConfigPath", $setup.ConfigPath, "-ValidateOnly") `
-                -StepName "4/5. Валідація Планувальника завдань"
+                -StepName "Валідація Планувальника завдань" `
+                -Current 4 -Total 5
 
             if ($schedulerWorkRequested -and -not $ValidateOnly) {
                 Invoke-ChildPowerShell `
                     -ScriptPath $setup.TaskInstallScript `
                     -Arguments @("-ConfigPath", $setup.ConfigPath) `
-                    -StepName "4/5. Встановлення/оновлення Планувальника завдань"
+                    -StepName "Встановлення/оновлення Планувальника завдань" `
+                    -Current 4 -Total 5
             }
         }
     }
@@ -386,7 +535,8 @@ try {
         Invoke-ChildPowerShell `
             -ScriptPath $setup.TaskDiagnoseScript `
             -Arguments $dryRunArguments `
-            -StepName "5/5. SYSTEM dry-run і діагностика Планувальника"
+            -StepName "SYSTEM dry-run і діагностика Планувальника" `
+            -Current 5 -Total 5
     } else {
         if ($schedulerWorkRequested -and
             -not $ValidateOnly -and
@@ -396,24 +546,34 @@ try {
         Invoke-ChildPowerShell `
             -ScriptPath $setup.DryRunScript `
             -Arguments $dryRunArguments `
-            -StepName "5/5. Фінальний безпечний тестовий прогін"
+            -StepName "Фінальний безпечний тестовий прогін" `
+            -Current 5 -Total 5
     }
 
-    Write-Host ""
-    Write-Host "Комплексне налаштування завершено успішно." -ForegroundColor Green
-    if ($ValidateOnly) {
-        Write-Host "Секрети й завдання не змінювалися; production-операції не запускалися." `
-            -ForegroundColor Green
+    Write-BRAVOResultBlankLine
+    Write-BRAVOSeparator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-BRAVOSeparator
+    Write-BRAVOResultField -Label 'Статус' -Value 'НАЛАШТУВАННЯ ЗАВЕРШЕНО' -Color ([ConsoleColor]::Green)
+    Write-BRAVOResultBlankLine
+    Write-BRAVOResultNote -Text $(if ($ValidateOnly) {
+        'Секрети й завдання не змінювалися; production-операції не запускалися.'
     } else {
-        Write-Host "Production-операції архівації/копіювання/видалення не запускалися." `
-            -ForegroundColor Green
-    }
+        'Production-операції архівації/копіювання/видалення не запускалися.'
+    })
+    Write-BRAVOSeparator
     Wait-BRAVOSetupCompletion
     Complete-BRAVOHelperLog -ExitCode 0
 } catch {
-    Write-Host ""
-    Write-Host "ПОМИЛКА НАЛАШТУВАННЯ: $($_.Exception.Message)" -ForegroundColor Red
-    Write-Host "Подальші етапи зупинено (fail-closed)." -ForegroundColor Yellow
+    Write-BRAVOResultBlankLine
+    Write-BRAVOSeparator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-BRAVOSeparator
+    Write-BRAVOResultField -Label 'Статус' -Value 'ПОМИЛКА' -Color ([ConsoleColor]::Red)
+    Write-BRAVOResultField -Label 'Причина' -Value $_.Exception.Message
+    Write-BRAVOResultBlankLine
+    Write-BRAVOResultNote -Text 'Подальші етапи зупинено (fail-closed).'
+    Write-BRAVOSeparator
     Wait-BRAVOSetupCompletion
     Complete-BRAVOHelperLog -ExitCode 1
 }

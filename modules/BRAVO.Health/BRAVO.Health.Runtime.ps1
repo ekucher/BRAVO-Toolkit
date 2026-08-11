@@ -35,12 +35,20 @@ function Invoke-BRAVOHealth {
 $script:BRAVOHealthStepCurrent = 0
 $script:BRAVOHealthStepTotal = 0
 $script:BRAVOHealthConsoleReady = $false
+$script:BRAVOHealthStepOkCount = 0
+$script:BRAVOHealthStepWarningCount = 0
+$script:BRAVOHealthStepErrorCount = 0
+$script:BRAVOHealthLastStepTime = $null
 
 function Initialize-BRAVOHealthSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
 
     $script:BRAVOHealthStepCurrent = 0
     $script:BRAVOHealthStepTotal = [Math]::Max(1, $Total)
+    $script:BRAVOHealthStepOkCount = 0
+    $script:BRAVOHealthStepWarningCount = 0
+    $script:BRAVOHealthStepErrorCount = 0
+    $script:BRAVOHealthLastStepTime = Get-Date
 }
 
 function Write-BRAVOHealthStep {
@@ -52,6 +60,19 @@ function Write-BRAVOHealthStep {
     )
 
     $script:BRAVOHealthStepCurrent++
+    switch ($Status) {
+        'OK'      { $script:BRAVOHealthStepOkCount++ }
+        'WARNING' { $script:BRAVOHealthStepWarningCount++ }
+        'ERROR'   { $script:BRAVOHealthStepErrorCount++ }
+    }
+    # Тривалість кроку — час від попереднього кроку (чи від Initialize,
+    # для першого). Health не має власного таймера на кожен крок, тому
+    # це найточніша оцінка без додаткової інструментації кожної перевірки.
+    $stepDuration = $null
+    if ($null -ne $script:BRAVOHealthLastStepTime) {
+        $stepDuration = (Get-Date) - $script:BRAVOHealthLastStepTime
+    }
+    $script:BRAVOHealthLastStepTime = Get-Date
     # Вбудований виклик з Archive (SuppressHeader) не друкує власну
     # покрокову нумерацію [N/5]: вона стоїть поряд із власною нумерацією
     # Archive [N/7] і виглядає як другий незалежний прогін замість одного
@@ -65,7 +86,8 @@ function Write-BRAVOHealthStep {
         -Total $script:BRAVOHealthStepTotal `
         -Name $Name `
         -Status $Status `
-        -Details $Details
+        -Details $Details `
+        -Duration $stepDuration
 }
 
 # Health не «виконує» компоненти, а перевіряє їх, тому статус етапу — це
@@ -83,6 +105,37 @@ function Get-BRAVOHealthStepDetails {
 
     if ($IssueCount -gt 0) { return "проблем: $IssueCount" }
     return $null
+}
+
+# dev.16 (review round 3): компактний per-entity/per-component Details для
+# кроків, що НЕ розділяються на окремі steps ("Керовані служби", "Локальні
+# резервні копії" — залишаються одним кроком, лише отримують перелік
+# зачеплених імен). $EntityProperty бере вже наявне factual поле issue-
+# об'єкта (Location для служб — plain ім'я служби без префікса; Component
+# для локальних резервних копій — plain ім'я компонента MODEL/BLOG/...).
+# Нічого не вигадується: лише унікальні наявні значення, коротко
+# приєднані до вже наявного "проблем: N".
+function Get-BRAVOHealthCompactIssueDetails {
+    param(
+        [array]$Issues,
+        [string]$EntityProperty = 'Component',
+        [string]$Label = 'компоненти'
+    )
+
+    $baseDetails = Get-BRAVOHealthStepDetails -IssueCount $Issues.Count
+    if ($Issues.Count -eq 0) {
+        return $baseDetails
+    }
+    $entityNames = @(
+        $Issues |
+            ForEach-Object { [string]$_.$EntityProperty } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
+    )
+    if ($entityNames.Count -eq 0) {
+        return $baseDetails
+    }
+    return "$baseDetails; ${Label}: $($entityNames -join ', ')"
 }
 
 # Статуси Health -> три результати спільної консолі. Deferred/Skipped/Disabled
@@ -106,6 +159,46 @@ function Get-BRAVOHealthSummaryResult {
 
 function Complete-BRAVOHealthResult {
     param([Parameter(Mandatory = $true)]$Result)
+
+    # Код завершення обчислюється тут, ДО друку підсумку — той самий клас
+    # виправлення, що вже застосований в Archive: раніше цей самий switch
+    # стояв у самому кінці файлу й виконувався ПІСЛЯ друку підсумку, тому
+    # підсумок фізично не міг показати правильний "Код завершення:". Через
+    # цю функцію проходить КОЖЕН з 13 шляхів виходу Health, тому обчислення
+    # тут покриває їх усі без дублювання логіки.
+    $healthExitCode = switch ([string]$Result.Status) {
+        'Healthy'            { 0 }
+        'Skipped'            { 0 }
+        'Disabled'           { 0 }
+        'Deferred'           { Resolve-BRAVOExitCode -LockBusy }
+        'ConfigurationError' { Resolve-BRAVOExitCode -InvalidConfiguration }
+        # dev.13: локальна AccessDenied (чи інша I/O-відмова) на LOGS/TEMP —
+        # реальні health-checks (служби/локальні копії/SFTP/SMB) не
+        # виконувались, тому це не HealthCritical (70), а окремий
+        # prerequisite-код. IsPrivilegeFailure розрізняє "потрібні права
+        # адміністратора" (36) від "диск повний / шлях зіпсований / інша
+        # I/O-причина" (37) — друге не варто радити "запустити адміністратором".
+        'EnvironmentError'   {
+            if ([bool]$Result.IsPrivilegeFailure) {
+                Resolve-BRAVOExitCode -PrivilegeRequired
+            } else {
+                Resolve-BRAVOExitCode -EnvironmentUnavailable
+            }
+        }
+        'Critical'           { Resolve-BRAVOExitCode -HealthCritical }
+        'NotificationError'  { Resolve-BRAVOExitCode -HealthCritical }
+        default              { Resolve-BRAVOExitCode -HealthCritical }
+    }
+    if ($healthExitCode -eq 0 -and $script:BRAVOWarningCount -gt 0) {
+        $healthExitCode = Resolve-BRAVOExitCode -HasWarnings
+    }
+    # Порушення цілісності інструментів перекриває будь-який інший
+    # результат Health — те саме застереження, що раніше стояло в кінці
+    # файлу, перенесене сюди без зміни умови.
+    if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
+        $healthExitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
+    }
+    $script:healthRuntimeExitCode = $healthExitCode
 
     # Через цю функцію проходить КОЖЕН шлях виходу Health, тому підсумок тут
     # неможливо забути додати в новій гілці — на відміну від друку підсумку
@@ -142,10 +235,31 @@ function Complete-BRAVOHealthResult {
         # Сам файл Health-логу як і раніше створюється — просто не
         # анонсується другим "Детальний журнал:" у консолі.
         if (-not $SuppressHeader) {
-            $metrics = New-Object System.Collections.Specialized.OrderedDictionary
-            $metrics.Add('Стан', [string]$Result.Status)
+            $summaryResult = Get-BRAVOHealthSummaryResult `
+                -Status ([string]$Result.Status) `
+                -WarningCount $script:BRAVOWarningCount
+            $summaryStatusColor = switch ($summaryResult) {
+                'УСПІШНО'  { 'Green' }
+                'ЧАСТКОВО' { 'Yellow' }
+                default    { 'Red' }
+            }
+            $healthCheckEnded = Get-Date
+
+            Write-BRAVOResultHeader `
+                -Status $summaryResult `
+                -StatusColor $summaryStatusColor `
+                -ExitCode $healthExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $healthExitCode)
+            Write-BRAVOResultField -Label 'Початок' -Value $healthCheckStarted.ToString('dd.MM.yyyy HH:mm:ss')
+            Write-BRAVOResultField -Label 'Завершення' -Value $healthCheckEnded.ToString('dd.MM.yyyy HH:mm:ss')
+            Write-BRAVOResultField -Label 'Тривалість' -Value (Format-BRAVODuration -Duration ($healthCheckEnded - $healthCheckStarted))
+            Write-BRAVOResultBlankLine
+            Write-BRAVOResultField -Label 'Перевірок' -Value ([string]$script:BRAVOHealthStepCurrent)
+            Write-BRAVOResultField -Label 'Успішно' -Value ([string]$script:BRAVOHealthStepOkCount)
+            Write-BRAVOResultField -Label 'Попереджень' -Value ([string]$script:BRAVOHealthStepWarningCount)
+            Write-BRAVOResultField -Label 'Помилок' -Value ([string]$script:BRAVOHealthStepErrorCount)
             if ($null -ne $Result.PSObject.Properties['IssueCount']) {
-                $metrics.Add('Проблем', [int]$Result.IssueCount)
+                Write-BRAVOResultField -Label 'Проблем' -Value ([string][int]$Result.IssueCount)
             }
             # Метрика вимкненого призначення бреше найгірше з усього виводу:
             # «NAS/SMB: True» читається як «перевірено й усе гаразд», хоча
@@ -161,21 +275,59 @@ function Complete-BRAVOHealthResult {
                 }
                 $property = $Result.PSObject.Properties[$destination.Property]
                 if ($null -ne $property -and $null -ne $property.Value) {
-                    $metrics.Add($destination.Title, $property.Value)
+                    Write-BRAVOResultField -Label $destination.Title -Value ([string]$property.Value)
                 }
             }
             if ($script:BRAVOHealthNotificationStepEnabled -and
                 $null -ne $Result.PSObject.Properties['Notification']) {
-                $metrics.Add('Сповіщення', [string]$Result.Notification)
+                Write-BRAVOResultField -Label 'Сповіщення' -Value ([string]$Result.Notification)
             }
 
-            Write-BRAVOSummary `
-                -Result (Get-BRAVOHealthSummaryResult `
-                    -Status ([string]$Result.Status) `
-                    -WarningCount $script:BRAVOWarningCount) `
-                -Duration ((Get-Date) - $healthCheckStarted) `
-                -Metrics $metrics `
-                -LogFile ([string]$Result.LogPath)
+            # Резервні копії: останній справний архів кожного увімкненого
+            # компонента. $script:healthLatestArchives заповнюється лише для
+            # копій, що пройшли перевірку (Get-BackupHealthIssues) — те саме
+            # джерело даних, що вже йде в успішне Slack-сповіщення.
+            # Глобальна archiveDefinitions ще не існує на ранніх шляхах виходу
+            # (до завантаження BRAVO.config, наприклад ConfigurationError
+            # на відсутній файл конфігурації) — Get-Variable без помилки
+            # повертає $null замість кидати виняток під Set-StrictMode.
+            $archiveDefinitionsVariable = Get-Variable -Name archiveDefinitions -Scope Global -ErrorAction SilentlyContinue
+            if ($null -ne $archiveDefinitionsVariable -and $script:healthLatestArchives.Count -gt 0) {
+                $enabledArchiveDefinitionsForSummary = @($archiveDefinitionsVariable.Value | Where-Object { $_.Enabled })
+                if ($enabledArchiveDefinitionsForSummary.Count -gt 0) {
+                    Write-BRAVOResultSection -Title 'Резервні копії'
+                    foreach ($definition in $enabledArchiveDefinitionsForSummary) {
+                        $archiveInfo = $script:healthLatestArchives[$definition.Type]
+                        if ($null -eq $archiveInfo) {
+                            continue
+                        }
+                        $ageText = Format-BackupAge -LastWriteTime $archiveInfo.LastWriteTime
+                        Write-BRAVOConsoleDetail -Message ("{0,-11}OK   {1,10}   вік {2}" -f $definition.Type, (Format-BRAVOFileSize -Bytes $archiveInfo.SizeBytes), $ageText)
+                    }
+                }
+            }
+
+            # Проблеми: короткий операторський індекс поточного прогону —
+            # лише коли справді є що показати (порожній розділ виглядав би
+            # як прихована помилка форматування, а не підтвердження
+            # відсутності проблем). $healthIssues — локальна змінна
+            # Invoke-BRAVOHealth, існує лише на пізніх шляхах виходу (після
+            # збору всіх перевірок) — той самий захист Get-Variable, що й
+            # вище.
+            $healthIssuesVariable = Get-Variable -Name healthIssues -ErrorAction SilentlyContinue
+            if ($null -ne $healthIssuesVariable -and @($healthIssuesVariable.Value).Count -gt 0) {
+                Write-BRAVOResultSection -Title 'Проблеми'
+                foreach ($issue in @($healthIssuesVariable.Value)) {
+                    $issueLine = Get-BRAVOHealthConsoleIssueLine -Issue $issue
+                    $issueColor = if ($issueLine.Severity -eq 'WARNING') { [ConsoleColor]::Yellow } else { [ConsoleColor]::Red }
+                    Write-BRAVOConsoleDetail -Message ("{0,-7}  {1}" -f $issueLine.Severity, $issueLine.Component) -Color $issueColor
+                    if (-not [string]::IsNullOrWhiteSpace($issueLine.Detail)) {
+                        Write-BRAVOConsoleDetail -Message ("         {0}" -f $issueLine.Detail)
+                    }
+                }
+            }
+
+            Write-BRAVOResultFooter -LogFile ([string]$Result.LogPath)
         }
     }
 
@@ -185,7 +337,11 @@ function Complete-BRAVOHealthResult {
 $bravoScriptDirectory = $RuntimeRoot
 
 # Health використовує спільні модулі, а не копії з архіватора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
+# dev.14: BRAVO.ArchiveHelpers додано для Get-BRAVOBackupGenerationManifestFiles
+# (централізований read-only reader generation manifest-ів, MANIFESTS +
+# legacy fallback) — Health лишається read-only, з ArchiveHelpers
+# використовується лише читання; функція міграції/запису сюди не викликається.
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -215,6 +371,7 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 }
 
 $healthCheckStarted = Get-Date
+$healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
 $script:healthLatestArchives = @{}
 
 if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
@@ -238,8 +395,9 @@ try {
     . $loaderPath
 
     Import-BravoConfiguration `
-        -ConfigRoot $bravoScriptDirectory `
-        -ConfigPath $ConfigPath
+        -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
+        -ConfigPath $ConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
 
     $ConfigPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     if ($null -ne $credentialSettings) {
@@ -299,6 +457,12 @@ $script:BRAVOWarningCount = 0
 # його ще до першого присвоєння, а Set-StrictMode (успадкований від
 # конфігураційного завантажувача) робить читання неоголошеної змінної помилкою.
 $script:bravoHealthTemporaryRoot = $null
+# dev.13: fail-safe запис логу. Write-HealthLog викликається десятки разів
+# за один прогін — без цього прапорця AccessDenied на здоровому (LOGS
+# просто недоступний) запуску друкував ту саму помилку в консоль щоразу.
+# $true, доки перша спроба запису не провалиться; після цього Write-HealthLog
+# більше не намагається писати у файл (і не друкує ту саму помилку знову).
+$script:BRAVOHealthLogWritable = $true
 try {
     if ($null -eq $credentialSettings -or $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
         throw 'вбудований Credential Manager недоступний'
@@ -350,6 +514,21 @@ if ($NotificationMode -ne "none" -and $credentialHelperLoaded) {
 $script:Login = $null
 $script:resolvedSftpHost = $null
 $script:sftpUrl = $null
+# dev.16 (review round 3): три незалежні флаги — та сама булева логіка,
+# розкладена по компонентах (A OR (B AND (C OR D)) == (A) OR (B AND C) OR
+# (B AND D)), для розділення "SFTP" на 3 dynamic steps нижче.
+# $sftpCredentialRequired (нижче) лишається ЇХНІМ OR — той самий
+# consumer (BRAVOHealthSftpStepEnabled, підсумок Complete-BRAVOHealthResult)
+# і той самий сигнал про потребу в credential, що й раніше.
+$sftpArchivesHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
+    [bool]$backupMonitoring.SFTP.CheckArchiveUploads -and
+    [bool]$componentSettings.SFTP.ArchiveUpload
+$sftpBazaAppHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
+    [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
+    $bazaAppSFTPHealthEnabled
+$sftpBazaWWWHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
+    [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
+    $bazaWWWSFTPHealthEnabled
 $sftpCredentialRequired = [bool]$backupMonitoring.SFTP.Enabled -and
     (([bool]$backupMonitoring.SFTP.CheckArchiveUploads -and [bool]$componentSettings.SFTP.ArchiveUpload) -or
     ([bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
@@ -503,10 +682,17 @@ $script:BRAVOHealthSftpStepEnabled = $sftpCredentialRequired
 $script:BRAVOHealthSmbStepEnabled = $smbCredentialRequired
 $script:BRAVOHealthNotificationStepEnabled = ($NotificationMode -ne 'none') -and (-not $NoSlack)
 # Середовище, керовані служби й локальні копії виконуються завжди.
+# dev.16 (review round 3): BAZA (локальна копія) і SFTP розділені на
+# незалежні dynamic steps — Total тепер точно дорівнює кількості РЕАЛЬНО
+# видимих увімкнених перевірок (Health/StepTotalMatchesVisibleEnabledChecks);
+# кожен доданок тут відповідає РІВНО одному Write-BRAVOHealthStep нижче.
 Initialize-BRAVOHealthSteps -Total (
     3 +
-    $(if ($bazaAppLocalHealthEnabled -or $bazaWWWLocalHealthEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOHealthSftpStepEnabled) { 1 } else { 0 }) +
+    $(if ($bazaAppLocalHealthEnabled) { 1 } else { 0 }) +
+    $(if ($bazaWWWLocalHealthEnabled) { 1 } else { 0 }) +
+    $(if ($sftpArchivesHealthEnabled) { 1 } else { 0 }) +
+    $(if ($sftpBazaAppHealthEnabled) { 1 } else { 0 }) +
+    $(if ($sftpBazaWWWHealthEnabled) { 1 } else { 0 }) +
     $(if ($script:BRAVOHealthSmbStepEnabled) { 1 } else { 0 }) +
     $(if ($script:BRAVOHealthNotificationStepEnabled) { 1 } else { 0 })
 )
@@ -514,8 +700,33 @@ Write-BRAVOHeader `
     -Title ("BRAVO HEALTH {0}" -f $global:ScriptVersion) `
     -Institution ([string]$bravoSettings.InstitutionName) `
     -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+    -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
     -StartedAt $healthCheckStarted `
     -SuppressText:$SuppressHeader
+
+# dev.16 (review round 3): "План перевірок" — той самий "plan-first"
+# принцип, що Maintenance/Archive, лише коли Health запущено самостійно
+# (не вбудований виклик з Archive: там SuppressHeader вже приглушує
+# заголовок, і другий, вкладений план лише заплутав би оператора). Джерело
+# значень — ті самі прапорці, що вже визначають нумерацію кроків вище
+# (Initialize-BRAVOHealthSteps) і Total вище, тому план і фактичне
+# виконання не можуть розійтися. Рендер через спільний Write-BRAVOPlan
+# (BRAVO.Console) — Health не має права на власний raw Write-Host
+# (Console/HealthRendersNoRawWriteHost).
+if (-not $SuppressHeader) {
+    $healthPlanEntries = [ordered]@{}
+    $healthPlanEntries['Середовище й цілісність інструментів'] = $true
+    $healthPlanEntries['Керовані служби'] = $true
+    $healthPlanEntries['Локальні резервні копії'] = $true
+    $healthPlanEntries['BAZA_APP (локальна копія)'] = [bool]$bazaAppLocalHealthEnabled
+    $healthPlanEntries['BAZA_WWW (локальна копія)'] = [bool]$bazaWWWLocalHealthEnabled
+    $healthPlanEntries['SFTP: резервні копії'] = [bool]$sftpArchivesHealthEnabled
+    $healthPlanEntries['SFTP: BAZA_APP'] = [bool]$sftpBazaAppHealthEnabled
+    $healthPlanEntries['SFTP: BAZA_WWW'] = [bool]$sftpBazaWWWHealthEnabled
+    $healthPlanEntries['NAS/SMB'] = [bool]$script:BRAVOHealthSmbStepEnabled
+    $healthPlanEntries['Сповіщення'] = [bool]$script:BRAVOHealthNotificationStepEnabled
+    Write-BRAVOPlan -Title 'План перевірок:' -Entries $healthPlanEntries
+}
 $script:BRAVOHealthConsoleReady = $true
 
 function Write-HealthLog {
@@ -551,16 +762,24 @@ function Write-HealthLog {
             -Level (Get-BRAVOHealthNormalizedLevel -Level $Level)
     }
 
+    if (-not $script:BRAVOHealthLogWritable) {
+        # Перша спроба вже провалилась цього прогону — не повторюємо той
+        # самий New-Item/Out-File на той самий недоступний файл на кожен
+        # виклик (їх десятки) і не друкуємо ту саму помилку знову.
+        return
+    }
+
     try {
         if (-not (Test-Path -Path $logPath -PathType Container)) {
             New-Item -ItemType Directory -Path $logPath -Force | Out-Null
         }
         $entry | Out-File -FilePath $healthLogFile -Append -Encoding $logFileEncoding
     } catch {
+        $script:BRAVOHealthLogWritable = $false
         # Не через Write-HealthLog: журнал саме зараз недоступний, тому
         # рекурсія лише поглибила б проблему.
         Write-BRAVOConsoleMessage `
-            -Message "Не вдалося записати health-check лог: $($_.Exception.Message)" `
+            -Message "Не вдалося записати health-check лог ($healthLogFile): $($_.Exception.Message). Подальші записи в цей файл у цьому запуску пропускаються." `
             -Level 'WARNING'
     }
 }
@@ -593,14 +812,41 @@ function Format-FileSize {
     return "$Bytes Б"
 }
 
+function ConvertTo-BRAVOUtcDateTime {
+    param([Parameter(Mandatory = $true)][datetime]$Timestamp)
+
+    switch ($Timestamp.Kind) {
+        ([DateTimeKind]::Utc) { return $Timestamp }
+        ([DateTimeKind]::Local) { return $Timestamp.ToUniversalTime() }
+        default {
+            # Generation manifests are produced from local wall-clock time.
+            # Legacy values without an offset are explicitly treated as local.
+            return [datetime]::SpecifyKind($Timestamp, [DateTimeKind]::Local).ToUniversalTime()
+        }
+    }
+}
+
+function Get-BRAVOUtcAge {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Timestamp,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
+
+    return (ConvertTo-BRAVOUtcDateTime -Timestamp $NowUtc) -
+        (ConvertTo-BRAVOUtcDateTime -Timestamp $Timestamp)
+}
+
 function Format-BackupAge {
-    param([object]$LastWriteTime)
+    param(
+        [object]$LastWriteTime,
+        [datetime]$NowUtc = (Get-Date).ToUniversalTime()
+    )
 
     if ($null -eq $LastWriteTime) {
         return "немає даних"
     }
 
-    $age = (Get-Date) - [datetime]$LastWriteTime
+    $age = Get-BRAVOUtcAge -Timestamp ([datetime]$LastWriteTime) -NowUtc $NowUtc
     if ($age.TotalMinutes -lt 0) {
         return "0 хв."
     }
@@ -734,14 +980,37 @@ function Test-ArchiveFileName {
         return $false
     }
 
+    # Мітка часу може нести collision-safe суфікс: коли фінальне ім'я вже
+    # зайняте наявним валідним backup, BRAVO_ARCHIV публікує копію як
+    # "..._1.mdz". Такий архів — повноцінний кандидат health-check, тому
+    # суфікс відокремлюється до розбору дати, а не робить ім'я «чужим».
+    $timestampValue = $nameMatch.Groups["Timestamp"].Value
+    $collisionMatch = [regex]::Match($timestampValue, '^(?<Timestamp>.+?)_(?<Suffix>\d+)$')
+    $timestampCandidates = @($timestampValue)
+    if ($collisionMatch.Success) {
+        $timestampCandidates += $collisionMatch.Groups["Timestamp"].Value
+    }
+
+    # Приймаються обидва формати: чинний із секундами і той, що діяв до
+    # переходу на GenerationId. Інакше health перестав би бачити всі
+    # backup, створені до оновлення, і звітував би про їх відсутність.
+    $acceptedFormats = @($archiveTimestampFormat, "yyyyMMdd_HHmmss", "yyyyMMdd_HHmm") |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -Unique
     $parsedTimestamp = [datetime]::MinValue
-    return [datetime]::TryParseExact(
-        $nameMatch.Groups["Timestamp"].Value,
-        $archiveTimestampFormat,
-        [System.Globalization.CultureInfo]::InvariantCulture,
-        [System.Globalization.DateTimeStyles]::None,
-        [ref]$parsedTimestamp
-    )
+    foreach ($timestampCandidate in $timestampCandidates) {
+        foreach ($acceptedFormat in $acceptedFormats) {
+            if ([datetime]::TryParseExact(
+                    $timestampCandidate,
+                    $acceptedFormat,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::None,
+                    [ref]$parsedTimestamp)) {
+                return $true
+            }
+        }
+    }
+    return $false
 }
 
 function Get-LocalBackupState {
@@ -778,62 +1047,159 @@ function Get-BackupHealthIssues {
     $enabledArchiveDefinitions = @($archiveDefinitions | Where-Object { $_.Enabled })
     $maximumAge = [timespan]::FromHours([double]$backupMonitoring.MaxBackupAgeHours)
 
-    foreach ($archiveDefinition in $enabledArchiveDefinitions) {
-        $localState = Get-LocalBackupState -ArchiveDefinition $archiveDefinition
-        $candidates = @($localState.Candidates)
+    if ($enabledArchiveDefinitions.Count -eq 0) {
+        return @()
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$backupRootPath) -or
+        -not (Test-Path -LiteralPath $backupRootPath -PathType Container)) {
+        return @([pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = "BackupRoot не знайдено: $backupRootPath"
+            FileName = 'немає даних'
+            LastWriteTime = $null
+            SizeBytes = $null
+        })
+    }
 
-        if ($candidates.Count -eq 0) {
-            $expectedArchiveName = [string]$archiveDefinition.NameTemplate -f $archivePrefix, $archiveTimestampFormat
+    $manifestCandidates = @()
+    # dev.14: MANIFESTS-first reader з fallback на legacy корінь BackupRoot.
+    # Health лишається read-only — жодної міграції/запису тут не відбувається;
+    # відсутність MANIFESTS на ще не мігрованій інсталяції не є помилкою, поки
+    # legacy manifest-и в корені BackupRoot доступні для читання.
+    foreach ($manifestFile in @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $backupRootPath)) {
+        try {
+            $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$manifest.status -ne 'COMPLETE') {
+                continue
+            }
+            $createdAtUtc = $manifestFile.LastWriteTimeUtc
+            foreach ($dateProperty in @('createdAt', 'startedAt')) {
+                $property = $manifest.PSObject.Properties[$dateProperty]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    $createdAtUtc = ConvertTo-BRAVOUtcDateTime -Timestamp ([datetime]$property.Value)
+                    break
+                }
+            }
+            $manifestCandidates += [pscustomobject]@{
+                File = $manifestFile
+                Manifest = $manifest
+                CreatedAtUtc = $createdAtUtc
+            }
+        } catch {
+            Write-HealthLog "Generation manifest не прочитано: $($manifestFile.Name): $($_.Exception.Message)" -Level 'WARNING'
+        }
+    }
+
+    $generation = $manifestCandidates | Sort-Object CreatedAtUtc -Descending | Select-Object -First 1
+    if ($null -eq $generation) {
+        return @([pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = 'не знайдено жодного COMPLETE generation manifest'
+            FileName = 'немає даних'
+            LastWriteTime = $null
+            SizeBytes = $null
+        })
+    }
+
+    $manifestGenerationId = [string]$generation.Manifest.generationId
+    if ([string]::IsNullOrWhiteSpace($manifestGenerationId)) {
+        $issues += [pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = 'COMPLETE manifest не містить GenerationId'
+            FileName = $generation.File.Name
+            LastWriteTime = $generation.CreatedAtUtc
+            SizeBytes = $generation.File.Length
+        }
+    }
+
+    $componentsProperty = $generation.Manifest.PSObject.Properties['components']
+    if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) {
+        return @($issues) + @([pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = 'COMPLETE manifest не містить components'
+            FileName = $generation.File.Name
+            LastWriteTime = $generation.CreatedAtUtc
+            SizeBytes = $generation.File.Length
+        })
+    }
+
+    foreach ($archiveDefinition in $enabledArchiveDefinitions) {
+        $componentName = [string]$archiveDefinition.Type
+        $componentProperty = @($componentsProperty.Value.PSObject.Properties | Where-Object {
+            [string]::Equals($_.Name, $componentName, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+        if ($componentProperty.Count -eq 0) {
             $issues += [pscustomobject]@{
-                Kind = "LocalBackup"
-                Component = $archiveDefinition.Type
-                Reason = "резервну копію не знайдено"
-                FileName = "не знайдено ($expectedArchiveName)"
-                LastWriteTime = $null
+                Kind = 'LocalBackupGeneration'
+                Component = $componentName
+                Reason = "COMPLETE generation $manifestGenerationId не містить enabled component"
+                FileName = $generation.File.Name
+                LastWriteTime = $generation.CreatedAtUtc
                 SizeBytes = $null
             }
             continue
         }
 
-        $newestValidArchive = $localState.NewestValidArchive
+        $component = $componentProperty[0].Value
+        $archivePath = [string]$component.ArchivePath
+        $hashPath = [string]$component.HashPath
+        $componentValid = [bool]$component.Enabled -and
+            [bool]$component.CreateSuccess -and
+            [bool]$component.IntegritySuccess -and
+            [bool]$component.HashSuccess
+        $archiveFile = $null
+        $invalidReason = $null
+        if (-not $componentValid) {
+            $invalidReason = 'component не пройшов archive/integrity/SHA512 stages'
+        } elseif (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
+            $invalidReason = 'manifest посилається на відсутній archive/hash artifact'
+        } else {
+            $archiveFile = Get-Item -LiteralPath $archivePath
+            $candidateResult = Test-BackupCandidate -Archive $archiveFile
+            if (-not $candidateResult.Valid) {
+                $invalidReason = $candidateResult.Reason
+            }
+        }
 
-        if ($null -eq $newestValidArchive) {
-            $newestCandidate = $candidates[0]
-            $newestCandidateResult = Test-BackupCandidate -Archive $newestCandidate
+        if (-not [string]::IsNullOrWhiteSpace($invalidReason)) {
             $issues += [pscustomobject]@{
-                Kind = "LocalBackup"
-                Component = $archiveDefinition.Type
-                Reason = "немає коректної резервної копії: $($newestCandidateResult.Reason)"
-                FileName = $newestCandidate.Name
-                LastWriteTime = $newestCandidate.LastWriteTime
-                SizeBytes = $newestCandidate.Length
+                Kind = 'LocalBackupGeneration'
+                Component = $componentName
+                Reason = "generation $manifestGenerationId некоректний: $invalidReason"
+                FileName = $(if ($null -ne $archiveFile) { $archiveFile.Name } else { $generation.File.Name })
+                LastWriteTime = $generation.CreatedAtUtc
+                SizeBytes = $(if ($null -ne $archiveFile) { $archiveFile.Length } else { $null })
             }
             continue
         }
 
-        $backupAge = $healthCheckStarted - $newestValidArchive.LastWriteTime
-        if ($backupAge -gt $maximumAge) {
-            $newerInvalidCount = @($candidates | Where-Object { $_.LastWriteTime -gt $newestValidArchive.LastWriteTime }).Count
-            $reason = "остання коректна копія старша за $($backupMonitoring.MaxBackupAgeHours) год."
-            if ($newerInvalidCount -gt 0) {
-                $reason += "; новіші файли не пройшли перевірку"
-            }
-
-            $issues += [pscustomobject]@{
-                Kind = "LocalBackup"
-                Component = $archiveDefinition.Type
-                Reason = $reason
-                FileName = $newestValidArchive.Name
-                LastWriteTime = $newestValidArchive.LastWriteTime
-                SizeBytes = $newestValidArchive.Length
-            }
-        } else {
-            $script:healthLatestArchives[$archiveDefinition.Type] = [pscustomobject]@{
-                Name = $newestValidArchive.Name
-                SizeBytes = [long]$newestValidArchive.Length
-            }
-            Write-HealthLog "Бекап $($archiveDefinition.Type) справний: $($newestValidArchive.Name), вік $(Format-BackupAge $newestValidArchive.LastWriteTime), розмір $(Format-FileSize $newestValidArchive.Length)" -Level "SUCCESS"
+        $script:healthLatestArchives[$componentName] = [pscustomobject]@{
+            Name = $archiveFile.Name
+            FullName = $archiveFile.FullName
+            HashPath = $hashPath
+            SizeBytes = [long]$archiveFile.Length
+            LastWriteTime = $generation.CreatedAtUtc
+            GenerationId = $manifestGenerationId
         }
+        Write-HealthLog "Generation $manifestGenerationId / $componentName справний: $($archiveFile.Name), розмір $(Format-FileSize $archiveFile.Length)" -Level 'SUCCESS'
+    }
+
+    if ((Get-BRAVOUtcAge -Timestamp $generation.CreatedAtUtc -NowUtc $healthCheckStartedUtc) -gt $maximumAge) {
+        $issues += [pscustomobject]@{
+            Kind = 'LocalBackupGeneration'
+            Component = 'Generation'
+            Reason = "остання COMPLETE generation старша за $($backupMonitoring.MaxBackupAgeHours) год."
+            FileName = $generation.File.Name
+            LastWriteTime = $generation.CreatedAtUtc
+            SizeBytes = $generation.File.Length
+        }
+    } elseif ($issues.Count -eq 0) {
+        Write-HealthLog "Остання COMPLETE generation $manifestGenerationId справна; one generation = one point-in-time" -Level 'SUCCESS'
     }
 
     return @($issues)
@@ -1054,6 +1420,11 @@ function Get-BRAVOHealthTemporaryRoot {
     }
 
     $creationErrors = @()
+    # correctness pass: якщо ВСІ кандидати провалюються, викликач (preflight)
+    # повинен мати змогу класифікувати ПЕРВИННУ причину (privilege чи ні) —
+    # первинний кандидат <RuntimeRoot>\TEMP відповідає реальному сценарію
+    # дефекту (D:\BRAVO\TEMP). Перший captured exception, не останній.
+    $firstCreationException = $null
     foreach ($candidateRoot in @($candidateRoots | Select-Object -Unique)) {
         if (-not (Test-BRAVOAsciiPath -Path $candidateRoot)) {
             continue
@@ -1076,6 +1447,9 @@ function Get-BRAVOHealthTemporaryRoot {
             }
         } catch {
             $creationErrors += "$candidateRoot`: $($_.Exception.Message)"
+            if ($null -eq $firstCreationException) {
+                $firstCreationException = $_.Exception
+            }
         }
     }
 
@@ -1084,10 +1458,19 @@ function Get-BRAVOHealthTemporaryRoot {
     } else {
         ""
     }
-    throw (
+    $aggregateMessage = (
         "не знайдено доступного ASCII-каталогу для тимчасових файлів " +
         "WinSCP$details"
     )
+    # Типізований виняток (наприклад UnauthorizedAccessException створення
+    # <RuntimeRoot>\TEMP) зберігається як InnerException — інакше
+    # Test-BRAVOHealthIsPrivilegeException (яка йде саме по InnerException
+    # chain) на виклику ззовні не мала б звідки його прочитати.
+    if ($null -ne $firstCreationException) {
+        throw (New-Object System.Management.Automation.RuntimeException(
+            $aggregateMessage, $firstCreationException))
+    }
+    throw $aggregateMessage
 }
 
 function Remove-BRAVOHealthTemporaryDirectory {
@@ -1131,6 +1514,81 @@ function Remove-BRAVOHealthTemporaryDirectory {
     } catch {
         Write-HealthLog "Не вдалося очистити тимчасовий каталог health-check: $($_.Exception.Message)" -Level "WARNING"
     }
+}
+
+# correctness pass: не кожна помилка запису означає "потрібні права
+# адміністратора" — диск може бути повний, шлях зіпсований, файлова
+# система пошкоджена. UnauthorizedAccessException (і лише воно, у всьому
+# ланцюжку InnerException — той самий підхід, що Test-BRAVOHealthElevationCancelled
+# у BRAVO_HEALTH.ps1 для Win32Exception 1223) — єдина категорія, яку чесно
+# можна назвати "недостатньо прав".
+function Test-BRAVOHealthIsPrivilegeException {
+    param($Exception)
+
+    $currentException = $Exception
+    while ($null -ne $currentException) {
+        if ($currentException -is [System.UnauthorizedAccessException]) {
+            return $true
+        }
+        $currentException = $currentException.InnerException
+    }
+    return $false
+}
+
+# dev.13: ручний non-elevated запуск міг ЛИСТИНГУВАТИ D:\BRAVO\LOGS/TEMP
+# (каталог уже існує — його створив SYSTEM), але не мати права запису в
+# нього. Get-BRAVOHealthTemporaryRoot вище лише створює каталог, якщо його
+# немає — якщо він уже існує, write-доступ ніколи не перевіряється, і
+# AccessDenied спливає лише глибоко всередині SFTP-етапу (New-Item під lcd
+# WinSCP), де стає фальшивою "SFTP недоступний". Ця функція перевіряє
+# WRITE, а не лише EXISTS: створює унікальний probe-файл і одразу прибирає
+# його в finally.
+function Test-BRAVOHealthRuntimePathWritable {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $probeName = "BRAVO_HEALTH_PREFLIGHT_{0}.tmp" -f ([guid]::NewGuid().ToString("N"))
+    $probePath = $null
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop | Out-Null
+        }
+        $probePath = Join-Path $Path $probeName
+        [System.IO.File]::WriteAllText($probePath, [string]([guid]::NewGuid()))
+        return [pscustomobject]@{ IsWritable = $true; ErrorMessage = $null; IsPrivilegeFailure = $false }
+    } catch {
+        return [pscustomobject]@{
+            IsWritable = $false
+            ErrorMessage = $_.Exception.Message
+            IsPrivilegeFailure = (Test-BRAVOHealthIsPrivilegeException -Exception $_.Exception)
+        }
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace($probePath)) {
+            Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# Обидва шляхи, від яких залежить сам Health (не бізнес-логіка backup) —
+# лог і тимчасовий каталог WinSCP — перевіряються ДО будь-якого реального
+# health-check (служби/локальні копії/SFTP/SMB), а не під час SFTP-етапу.
+function Test-BRAVOHealthEnvironmentPreflight {
+    param(
+        [Parameter(Mandatory = $true)][string]$LogPath,
+        [Parameter(Mandatory = $true)][string]$TemporaryRoot
+    )
+
+    foreach ($candidatePath in @($LogPath, $TemporaryRoot)) {
+        $probeResult = Test-BRAVOHealthRuntimePathWritable -Path $candidatePath
+        if (-not $probeResult.IsWritable) {
+            return [pscustomobject]@{
+                IsWritable = $false
+                FailedPath = $candidatePath
+                ErrorMessage = $probeResult.ErrorMessage
+                IsPrivilegeFailure = $probeResult.IsPrivilegeFailure
+            }
+        }
+    }
+    return [pscustomobject]@{ IsWritable = $true; FailedPath = $null; ErrorMessage = $null; IsPrivilegeFailure = $false }
 }
 
 function ConvertTo-WinSCPScriptArgument {
@@ -1975,7 +2433,9 @@ function Test-SFTPArchiveCopy {
 
     $remoteLastWriteTime = if ($remoteArchive.Count -gt 0) { $remoteArchive[0].LastWriteTime } else { $null }
     if ($null -ne $remoteLastWriteTime) {
-        $remoteAge = $healthCheckStarted - [datetime]$remoteLastWriteTime
+        $remoteAge = Get-BRAVOUtcAge `
+            -Timestamp ([datetime]$remoteLastWriteTime) `
+            -NowUtc $healthCheckStartedUtc
         if ($remoteAge.TotalHours -gt [double]$backupMonitoring.SFTP.RemoteBackupMaxAgeHours) {
             $problems += "віддалена копія старша за $($backupMonitoring.SFTP.RemoteBackupMaxAgeHours) год."
         }
@@ -2067,7 +2527,9 @@ function Test-BAZAPendingSynchronizationOverdue {
         # вважати новою штатною чергою.
         return $true
     }
-    $pendingAge = $healthCheckStarted - [datetime]$PreviewSummary.OldestLastWriteTime
+    $pendingAge = Get-BRAVOUtcAge `
+        -Timestamp ([datetime]$PreviewSummary.OldestLastWriteTime) `
+        -NowUtc $healthCheckStartedUtc
     return $pendingAge.TotalHours -ge $alertAfterHours
 }
 
@@ -2496,16 +2958,28 @@ function Get-SFTPHealthIssues {
         $archiveChecks = @()
         $healthTemporaryRoot = Get-BRAVOHealthTemporaryRoot
         foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
-            $localState = Get-LocalBackupState -ArchiveDefinition $archiveDefinition
-            if ($null -eq $localState.NewestValidArchive) {
-                Write-HealthLog "SFTP $($archiveDefinition.Type) пропущено: немає коректної локальної копії для порівняння" -Level "WARNING"
+            $generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]
+            if ($null -eq $generationArchive -or
+                -not (Test-Path -LiteralPath ([string]$generationArchive.FullName) -PathType Leaf)) {
+                $issues += [pscustomobject]@{
+                    Kind = 'SFTPArchive'
+                    Component = "SFTP $($archiveDefinition.Type)"
+                    Reason = 'перевірку пропущено: component відсутній у verified COMPLETE local generation'
+                    FileName = 'немає даних'
+                    LastWriteTime = $null
+                    SizeBytes = $null
+                    ExpectedSizeBytes = $null
+                    ActualSizeBytes = $null
+                    Location = [string]$sftpDirectories[$archiveDefinition.Type]
+                }
                 continue
             }
+            $localGenerationArchive = Get-Item -LiteralPath ([string]$generationArchive.FullName)
 
             $remoteDirectory = Normalize-SFTPPath $sftpDirectories[$archiveDefinition.Type]
             $archiveChecks += [pscustomobject]@{
                 Definition = $archiveDefinition
-                LocalArchive = $localState.NewestValidArchive
+                LocalArchive = $localGenerationArchive
                 RemoteDirectory = $remoteDirectory
                 RemoteHashDownloadDirectory = Join-Path `
                     $healthTemporaryRoot `
@@ -2514,7 +2988,7 @@ function Get-SFTPHealthIssues {
             }
             $archiveChecks[-1].RemoteHashDownloadPath = Join-Path `
                 $archiveChecks[-1].RemoteHashDownloadDirectory `
-                "$($localState.NewestValidArchive.Name)$hashFileExtension"
+                "$($localGenerationArchive.Name)$hashFileExtension"
         }
 
         if ($archiveChecks.Count -gt 0) {
@@ -2792,12 +3266,23 @@ function Get-SMBHealthIssues {
     try {
         $drive = New-BRAVOSMBHealthDrive
         foreach ($archiveDefinition in @($archiveDefinitions | Where-Object { $_.Enabled })) {
-            $localState = Get-LocalBackupState -ArchiveDefinition $archiveDefinition
-            $localArchive = $localState.NewestValidArchive
-            if ($null -eq $localArchive) {
-                Write-HealthLog "NAS/SMB $($archiveDefinition.Type) пропущено: немає коректної локальної копії для порівняння" -Level "WARNING"
+            $generationArchive = $script:healthLatestArchives[[string]$archiveDefinition.Type]
+            if ($null -eq $generationArchive -or
+                -not (Test-Path -LiteralPath ([string]$generationArchive.FullName) -PathType Leaf)) {
+                $issues += [pscustomobject]@{
+                    Kind = 'SMBArchive'
+                    Component = "NAS/SMB $($archiveDefinition.Type)"
+                    Reason = 'перевірку пропущено: component відсутній у verified COMPLETE local generation'
+                    FileName = 'немає даних'
+                    LastWriteTime = $null
+                    SizeBytes = $null
+                    ExpectedSizeBytes = $null
+                    ActualSizeBytes = $null
+                    Location = [string]$smbSettings.RootPath
+                }
                 continue
             }
+            $localArchive = Get-Item -LiteralPath ([string]$generationArchive.FullName)
 
             $remoteDirectory = Join-Path `
                 ([string]$smbSettings.RootPath) `
@@ -2865,7 +3350,9 @@ function Get-SMBHealthIssues {
 
             $remoteLastWriteTime = if ($remoteArchive) { $remoteArchive.LastWriteTime } else { $null }
             if ($null -ne $remoteLastWriteTime -and
-                ($healthCheckStarted - $remoteLastWriteTime).TotalHours -gt
+                (Get-BRAVOUtcAge `
+                    -Timestamp ([datetime]$remoteLastWriteTime) `
+                    -NowUtc $healthCheckStartedUtc).TotalHours -gt
                 [double]$backupMonitoring.SMB.RemoteBackupMaxAgeHours) {
                 $problems += "віддалена копія старша за $($backupMonitoring.SMB.RemoteBackupMaxAgeHours) год."
             }
@@ -3190,18 +3677,114 @@ function Format-CompactSMBIssue {
     return ":x: $componentName — $($Issue.Reason)"
 }
 
+# Операторська консоль ("Проблеми:" в РЕЗУЛЬТАТ) повторно використовує ці
+# самі Format-Compact*-форматтери замість власної класифікації WARNING/ERROR
+# — одна й та сама проблема має показувати однаковий рівень серйозності і в
+# Slack-сповіщенні, і в консолі. Service/невідомі Kind не мають окремого
+# форматтера (див. New-SlackAlertMessage нижче) — там завжди ":x:".
+function Get-BRAVOHealthConsoleIssueLine {
+    param([Parameter(Mandatory = $true)][object]$Issue)
+
+    $compactText = switch ($Issue.Kind) {
+        { $_ -in @('LocalBackup', 'LocalSynchronization') } { Format-CompactLocalIssue -Issue $Issue }
+        { $_ -in @('SFTPArchive', 'SFTPSynchronization', 'SFTPConnection') } { Format-CompactSFTPIssue -Issue $Issue }
+        { $_ -in @('SMBArchive', 'SMBConnection') } { Format-CompactSMBIssue -Issue $Issue }
+        default { ":x: $($Issue.Component) — $($Issue.Reason)" }
+    }
+
+    $severity = if ($compactText.StartsWith(':warning:')) { 'WARNING' } else { 'ERROR' }
+    $text = $compactText -replace '^:(warning|x):\s*', ''
+    $separatorIndex = $text.IndexOf(' — ')
+    if ($separatorIndex -ge 0) {
+        $component = $text.Substring(0, $separatorIndex)
+        $detail = $text.Substring($separatorIndex + 3)
+    } else {
+        $component = $text
+        $detail = $null
+    }
+    return [pscustomobject]@{ Severity = $severity; Component = $component; Detail = $detail }
+}
+
+function Get-BRAVOHealthLatestBackupSummary {
+    $archives = @(
+        $archiveDefinitions |
+            Where-Object { $_.Enabled } |
+            ForEach-Object {
+                $archiveInfo = $script:healthLatestArchives[$_.Type]
+                if ($null -ne $archiveInfo -and $null -ne $archiveInfo.LastWriteTime) {
+                    [pscustomobject]@{
+                        Type = [string]$_.Type
+                        LastWriteTime = [datetime]$archiveInfo.LastWriteTime
+                        SizeBytes = $archiveInfo.SizeBytes
+                        GenerationId = [string]$archiveInfo.GenerationId
+                    }
+                }
+            }
+    )
+    if ($archives.Count -eq 0) {
+        return [pscustomobject]@{
+            Found = $false
+            TimestampText = "не знайдено"
+            AgeText = "немає даних"
+            ComponentLines = @()
+        }
+    }
+
+    $latestTimestamp = @($archives | Sort-Object LastWriteTime -Descending | Select-Object -First 1)[0].LastWriteTime
+    $componentLines = @(
+        $archives |
+            Sort-Object Type |
+            ForEach-Object {
+                $sizeText = if ($null -ne $_.SizeBytes) { Format-FileSize -Bytes ([long]$_.SizeBytes) } else { "розмір невідомий" }
+                Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":package:" -Name $_.Type -Detail $sizeText
+            }
+    )
+    # dev.17: $latestTimestamp — це $generation.CreatedAtUtc (нормалізовано
+    # через ConvertTo-BRAVOUtcDateTime, Kind=Utc). Age (AgeText нижче)
+    # правильно рахується у UTC-арифметиці й лишається незмінним. Але
+    # human-facing TimestampText раніше форматував це саме UTC-значення
+    # напряму — оператор бачив UTC замість локального часу сервера
+    # (реальний DEV-LIMS acceptance: generation 18:57 local показувалась
+    # як 15:57). Конвертація в локальний час сервера — єдина зміна:
+    # внутрішня модель лишається UTC, сама конвертація відбувається лише
+    # тут, у presentation layer, в ОДНІЙ спільній точці для обох
+    # notification-повідомлень
+    # ("Остання резервна копія"/"Остання успішна резервна копія" — обидва
+    # читають TimestampText із цього самого summary).
+    $localTimestamp = $latestTimestamp.ToLocalTime()
+    return [pscustomobject]@{
+        Found = $true
+        Timestamp = $latestTimestamp
+        TimestampText = $localTimestamp.ToString("dd.MM.yyyy HH:mm")
+        AgeText = Format-BackupAge -LastWriteTime $latestTimestamp -NowUtc $healthCheckStartedUtc
+        ComponentLines = $componentLines
+    }
+}
+
+function Get-BRAVOHealthIssueActionText {
+    param([array]$Issues)
+
+    $firstIssue = @($Issues | Select-Object -First 1)
+    if ($firstIssue.Count -eq 0) {
+        return "перевірити журнал BRAVO_HEALTH"
+    }
+    switch ([string]$firstIssue[0].Kind) {
+        "Service" { return "запустити або перевірити службу $($firstIssue[0].Component)" }
+        { $_ -in @("LocalBackup", "LocalBackupGeneration") } { return "перевірити виконання BRAVO_ARCHIV" }
+        { $_ -in @("SFTPArchive", "SFTPSynchronization", "SFTPConnection") } { return "перевірити SFTP-з'єднання та останній запуск BRAVO_ARCHIV" }
+        { $_ -in @("SMBArchive", "SMBConnection") } { return "перевірити NAS/SMB доступ і останній запуск BRAVO_ARCHIV" }
+        default { return "перевірити журнал BRAVO_HEALTH" }
+    }
+}
+
 function New-SlackAlertMessage {
     param(
         [array]$Issues,
         [timespan]$Duration
     )
 
-    $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-    $dateText = $healthCheckStarted.ToString("dd MMMM yyyy", $ukrainianCulture).Replace(" р.", "")
-    $durationSeconds = [math]::Max(0, [math]::Round($Duration.TotalSeconds))
     $hostInformation = Get-HostInformation
     $archiveVersionText = [string]$global:ScriptVersion
-    $archiveScriptDateText = [string]$global:ScriptDate
     $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$global:ScriptBuildId)) {
         "невідома"
     } else {
@@ -3236,59 +3819,66 @@ function New-SlackAlertMessage {
     )
     $otherIssues = @($Issues | Where-Object { $_.Kind -notin $knownKinds })
 
-    $alertTitle = if ($serviceIssues.Count -gt 0 -and $serviceIssues.Count -eq $Issues.Count) {
-        "СЛУЖБИ BRAVO ПОТРЕБУЮТЬ УВАГИ"
+    $operationTitle = if ($serviceIssues.Count -gt 0 -and $serviceIssues.Count -eq $Issues.Count) {
+        "BRAVO SERVICES — ПОТРІБНА ДІЯ"
     } else {
-        "BRAVO ПОТРЕБУЄ УВАГИ"
+        "BRAVO BACKUP — ПОТРІБНА ДІЯ"
     }
-    $lines = @(
-        ":rotating_light: *$alertTitle*",
-        ":derelict_house_building: $($backupMonitoring.InstitutionName) [$($backupMonitoring.InstitutionCode)]",
-        ":desktop_computer: $($hostInformation.MachineName) • $($hostInformation.LocalIP) | $($hostInformation.PublicIP)",
-        ":clock3: $dateText, $($healthCheckStarted.ToString('HH:mm:ss')) • $durationSeconds сек.",
-        "🏷️ Версія BRAVO_ARCHIV: $archiveVersionText від $archiveScriptDateText (build $archiveBuildIdText)",
-        ":pushpin: Проблемних компонентів: $($problemComponentNames.Count) • перевірок: $($Issues.Count)",
-        "",
-        ":package: $($problemComponentNames -join ', ')"
-    )
+    $latestBackup = Get-BRAVOHealthLatestBackupSummary
+    $reasonLines = New-Object System.Collections.Generic.List[string]
+    $firstIssue = @($Issues | Select-Object -First 1)
+    if ($firstIssue.Count -gt 0) {
+        $reasonLines.Add(":x: $(Get-HealthIssueComponentName -Issue $firstIssue[0]): $($firstIssue[0].Reason)")
+    }
+    $resultLines = New-Object System.Collections.Generic.List[string]
+    $resultLines.Add(":clock3: Остання успішна резервна копія: $($latestBackup.TimestampText)")
+    if ($latestBackup.Found) {
+        $resultLines.Add(":hourglass_flowing_sand: Вік копії: $($latestBackup.AgeText)")
+    }
+    if ($null -ne $backupMonitoring.MaxBackupAgeHours) {
+        $resultLines.Add(":warning: Допустимий вік: $($backupMonitoring.MaxBackupAgeHours) год.")
+    }
+    $resultLines.Add("")
+    $resultLines.Add(":pushpin: Проблемних компонентів: $($problemComponentNames.Count) · перевірок: $($Issues.Count)")
+    $resultLines.Add(":package: $($problemComponentNames -join ', ')")
 
     if ($serviceIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":gear: *СЛУЖБИ*"
+        $resultLines.Add("")
+        $resultLines.Add(":gear: СЛУЖБИ")
         foreach ($issue in $serviceIssues) {
-            $lines += ":x: $($issue.Component) — $($issue.Reason)"
+            $resultLines.Add(":x: $($issue.Component) — $($issue.Reason)")
         }
     }
 
     if ($localIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":floppy_disk: *ЛОКАЛЬНІ БЕКАПИ*"
+        $resultLines.Add("")
+        $resultLines.Add(":floppy_disk: ЛОКАЛЬНІ БЕКАПИ")
         foreach ($issue in $localIssues) {
-            $lines += Format-CompactLocalIssue -Issue $issue
+            $resultLines.Add((Format-CompactLocalIssue -Issue $issue))
         }
     }
 
     if ($sftpIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":cloud: *БЕКАПИ У ХМАРІ*"
+        $resultLines.Add("")
+        $resultLines.Add(":cloud: БЕКАПИ У ХМАРІ")
         foreach ($issue in $sftpIssues) {
-            $lines += Format-CompactSFTPIssue -Issue $issue
+            $resultLines.Add((Format-CompactSFTPIssue -Issue $issue))
         }
     }
 
     if ($smbIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":minidisc: *NAS/SMB*"
+        $resultLines.Add("")
+        $resultLines.Add(":minidisc: NAS/SMB")
         foreach ($issue in $smbIssues) {
-            $lines += Format-CompactSMBIssue -Issue $issue
+            $resultLines.Add((Format-CompactSMBIssue -Issue $issue))
         }
     }
 
     if ($otherIssues.Count -gt 0) {
-        $lines += ""
-        $lines += ":warning: *ІНШІ ПОМИЛКИ*"
+        $resultLines.Add("")
+        $resultLines.Add(":warning: ІНШІ ПОМИЛКИ")
         foreach ($issue in $otherIssues) {
-            $lines += ":x: $($issue.Component) — $($issue.Reason)"
+            $resultLines.Add(":x: $($issue.Component) — $($issue.Reason)")
         }
     }
 
@@ -3303,13 +3893,13 @@ function New-SlackAlertMessage {
             $_.Component -eq "SFTP BAZA APP" -or $_.Kind -eq "SFTPConnection"
         }).Count -eq 0
     if ($bazaAppLocalHealthy -or $bazaAppSFTPHealthy) {
-        $lines += ""
+        $resultLines.Add("")
         if ($bazaAppLocalHealthy -and $bazaAppSFTPHealthy) {
-            $lines += ":white_check_mark: *BAZA_APP* — локальна копія та SFTP актуальні"
+            $resultLines.Add(":white_check_mark: BAZA_APP — локальна копія та SFTP актуальні")
         } elseif ($bazaAppLocalHealthy) {
-            $lines += ":white_check_mark: *BAZA_APP* — локальна копія актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_APP — локальна копія актуальна")
         } else {
-            $lines += ":white_check_mark: *BAZA_APP* — SFTP актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_APP — SFTP актуальна")
         }
     }
     $bazaWWWLocalHealthy = $bazaWWWLocalHealthEnabled -and
@@ -3324,19 +3914,32 @@ function New-SlackAlertMessage {
             $_.Kind -eq "SFTPConnection"
         }).Count -eq 0
     if ($bazaWWWLocalHealthy -or $bazaWWWSFTPHealthy) {
-        $lines += ""
+        $resultLines.Add("")
         if ($bazaWWWLocalHealthy -and $bazaWWWSFTPHealthy) {
-            $lines += ":white_check_mark: *BAZA_WWW* — локальна копія та SFTP актуальні"
+            $resultLines.Add(":white_check_mark: BAZA_WWW — локальна копія та SFTP актуальні")
         } elseif ($bazaWWWLocalHealthy) {
-            $lines += ":white_check_mark: *BAZA_WWW* — локальна копія актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_WWW — локальна копія актуальна")
         } else {
-            $lines += ":white_check_mark: *BAZA_WWW* — SFTP актуальна"
+            $resultLines.Add(":white_check_mark: BAZA_WWW — SFTP актуальна")
         }
     }
 
-    $lines += ""
-    $lines += ":memo: Журнал: $healthLogFile"
-    return $lines -join [Environment]::NewLine
+    return New-BRAVOOperatorNotificationMessage `
+        -Severity "CRITICAL" `
+        -Operation $operationTitle `
+        -ActionText (Get-BRAVOHealthIssueActionText -Issues $Issues) `
+        -ReasonLines $reasonLines.ToArray() `
+        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines.ToArray() `
+        -Timestamp $healthCheckStarted `
+        -Duration $Duration `
+        -ProductName "BRAVO Archive" `
+        -Version $archiveVersionText `
+        -BuildId $archiveBuildIdText `
+        -LogPath $healthLogFile `
+        -LogLabel "Журнал"
 }
 
 function Get-BRAVOHealthDestinationSummary {
@@ -3366,85 +3969,74 @@ function Get-BRAVOHealthDestinationSummary {
 function New-SlackSuccessMessage {
     param([timespan]$Duration)
 
-    $ukrainianCulture = [System.Globalization.CultureInfo]::GetCultureInfo("uk-UA")
-    $dateText = $healthCheckStarted.ToString("dd MMMM yyyy", $ukrainianCulture).Replace(" р.", "")
-    $durationSeconds = [math]::Max(0, [math]::Round($Duration.TotalSeconds))
-    $enabledNames = @(Get-EnabledBackupComponentNames)
-    $enabledComponentsText = if ($enabledNames.Count -gt 0) {
-        $enabledNames -join ', '
-    } else {
-        'немає'
-    }
     $hostInformation = Get-HostInformation
     $archiveVersionText = [string]$global:ScriptVersion
-    $archiveScriptDateText = [string]$global:ScriptDate
     $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$global:ScriptBuildId)) {
         "невідома"
     } else {
         [string]$global:ScriptBuildId
     }
-
-    $lines = @(
-        ":white_check_mark: *РЕЗЕРВНІ КОПІЇ АКТУАЛЬНІ*",
-        ":derelict_house_building: Установа: $($backupMonitoring.InstitutionName) [$($backupMonitoring.InstitutionCode)]",
-        ":desktop_computer: Машина: $($hostInformation.MachineName)",
-        ":globe_with_meridians: IP-адреси: $($hostInformation.LocalIP) | $($hostInformation.PublicIP)",
-        ":spiral_calendar_pad: Дата: $dateText",
-        ":alarm_clock: Час: $($healthCheckStarted.ToString('HH:mm:ss'))",
-        ":hourglass_flowing_sand: Тривалість перевірки: $durationSeconds сек.",
-        "🏷️ Версія BRAVO_ARCHIV: $archiveVersionText від $archiveScriptDateText (build $archiveBuildIdText)",
-        ":package: Увімкнені компоненти для бекапу: $enabledComponentsText",
-        "",
-        ":floppy_disk: Локальні архіви та hash-файли актуальні"
-    )
-
-    $latestArchiveLines = @(
-        $archiveDefinitions |
-            Where-Object { $_.Enabled } |
-            ForEach-Object {
-                $archiveInfo = $script:healthLatestArchives[$_.Type]
-                $archiveName = if ($null -ne $archiveInfo) { [string]$archiveInfo.Name } else { "" }
-                if (-not [string]::IsNullOrWhiteSpace($archiveName)) {
-                    $archiveSizeText = Format-FileSize -Bytes ([long]$archiveInfo.SizeBytes)
-                    "• $($_.Type): $archiveName ($archiveSizeText)"
-                }
-            }
-    )
-    if ($latestArchiveLines.Count -gt 0) {
-        $lines += ":package: Останні локальні архіви:"
-        $lines += $latestArchiveLines
+    $latestBackup = Get-BRAVOHealthLatestBackupSummary
+    $resultLines = New-Object System.Collections.Generic.List[string]
+    if ($latestBackup.Found) {
+        $resultLines.Add(":clock3: Остання резервна копія: $($latestBackup.TimestampText)")
+        $resultLines.Add(":hourglass_flowing_sand: Вік копії: $($latestBackup.AgeText)")
+        $resultLines.Add("")
     }
+    foreach ($componentLine in @($latestBackup.ComponentLines)) {
+        $resultLines.Add($componentLine)
+    }
+
+    $resultLines.Add("")
+    $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":floppy_disk:" -Name "Local"))
 
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckArchiveUploads -and
         $componentSettings.SFTP.ArchiveUpload) {
-        $lines += ":cloud: Архіви у хмарі актуальні"
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":cloud:" -Name "SFTP"))
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaAppSFTPHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Синхронізація BAZA_APP з хмарою актуальна"
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP" -Detail "синхронізовано"))
     }
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckBAZASynchronization -and
         $bazaWWWSFTPHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Синхронізація BAZA_WWW з хмарою актуальна"
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW" -Detail "синхронізовано"))
     }
     if ($bazaAppLocalHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Локальна копія BAZA_APP актуальна"
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_APP local"))
     }
     if ($bazaWWWLocalHealthEnabled) {
-        $lines += ":arrows_counterclockwise: Локальна копія BAZA_WWW актуальна"
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":arrows_counterclockwise:" -Name "BAZA_WWW local"))
     }
     if ($backupMonitoring.SMB.Enabled -and
         $backupMonitoring.SMB.CheckArchiveCopies -and
         $componentSettings.SMB.ArchiveCopy) {
-        $lines += ":minidisc: Архіви на NAS/SMB актуальні"
+        $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":minidisc:" -Name "SMB"))
     }
 
-    $lines += ""
-    $lines += ":memo: Журнал перевірки: $healthLogFile"
-    return $lines -join [Environment]::NewLine
+    $enabledComponentCount = @(Get-EnabledBackupComponentNames).Count
+    if ($enabledComponentCount -gt 0) {
+        $resultLines.Add("")
+        $resultLines.Add("Компоненти: $enabledComponentCount/$enabledComponentCount")
+    }
+
+    return New-BRAVOOperatorNotificationMessage `
+        -Severity "SUCCESS" `
+        -Operation "BRAVO BACKUP — ВСЕ СПРАВНО" `
+        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines.ToArray() `
+        -Timestamp $healthCheckStarted `
+        -Duration $Duration `
+        -ProductName "BRAVO Archive" `
+        -Version $archiveVersionText `
+        -BuildId $archiveBuildIdText `
+        -LogPath $healthLogFile `
+        -LogLabel "Журнал"
 }
 
 # Різні види проблем несуть різний набір полів: об'єкт Kind = "Service"
@@ -3713,7 +4305,13 @@ function Send-SlackAlert {
 }
 
 function Test-BRAVOArchiveProcessLockActive {
-    $lockPath = Join-Path $logPath "BRAVO_OPERATION.lock"
+    # Archive and Maintenance coordinate through the canonical machine-wide
+    # lock. Health does not acquire it, but must inspect that same handle so a
+    # custom ArchiveRoot/ConfigPath cannot make an active backup invisible.
+    $lockPath = [string]$operationLockSettings.Path
+    if ([string]::IsNullOrWhiteSpace($lockPath)) {
+        throw 'operationLockSettings.Path is not configured'
+    }
     if (-not (Test-Path -LiteralPath $lockPath -PathType Leaf)) {
         return $false
     }
@@ -3885,54 +4483,226 @@ if ($null -ne $script:BRAVOToolManifest -and -not $script:BRAVOToolManifest.IsVa
     $environmentStepStatus = 'WARNING'
     $environmentStepDetails = "підтримка ОС: $($script:BRAVOOSSupportTier.Tier)"
 }
+
+# dev.13: write-probe у LOGS і TEMP, ДО будь-якого реального health-check
+# (служби/локальні копії/SFTP/SMB). Раніше локальна AccessDenied (ручний
+# запуск без elevation) спливала лише глибоко всередині SFTP-етапу й
+# помилково ставала "SFTP недоступний" — сюди вона не доходить взагалі:
+# при провалі преflight нижче SFTP-перевірка не викликається.
+$environmentPreflight = try {
+    Test-BRAVOHealthEnvironmentPreflight -LogPath $logPath -TemporaryRoot (Get-BRAVOHealthTemporaryRoot)
+} catch {
+    # Get-BRAVOHealthTemporaryRoot сама кидає виняток, якщо жоден кандидат
+    # TEMP не створюється — типізований виняток первинного кандидата
+    # (<RuntimeRoot>\TEMP) зберігається як InnerException саме для цього:
+    # Test-BRAVOHealthIsPrivilegeException іде по InnerException chain так
+    # само, як для прямого провалу Test-BRAVOHealthRuntimePathWritable.
+    [pscustomobject]@{
+        IsWritable = $false
+        FailedPath = 'TEMP'
+        ErrorMessage = $_.Exception.Message
+        IsPrivilegeFailure = (Test-BRAVOHealthIsPrivilegeException -Exception $_.Exception)
+    }
+}
+if (-not $environmentPreflight.IsWritable) {
+    $environmentStepStatus = 'ERROR'
+    $environmentStepDetails = if ($environmentPreflight.IsPrivilegeFailure) {
+        "недостатньо прав запису: $($environmentPreflight.FailedPath)"
+    } else {
+        "не вдалося використати $($environmentPreflight.FailedPath)"
+    }
+}
+
 Write-BRAVOHealthStep `
     -Name 'Середовище й цілісність інструментів' `
     -Status $environmentStepStatus `
     -Details $environmentStepDetails
+
+if (-not $environmentPreflight.IsWritable) {
+    if ($environmentPreflight.IsPrivilegeFailure) {
+        Write-HealthLog (
+            "Недостатньо прав для виконання BRAVO HEALTH: недоступний шлях " +
+            "$($environmentPreflight.FailedPath) ($($environmentPreflight.ErrorMessage)). " +
+            "Для ручного запуску потрібні права адміністратора. SFTP-перевірка не виконувалась."
+        ) -Level "ERROR"
+    } else {
+        Write-HealthLog (
+            "Не вдалося використовувати runtime TEMP/LOGS: " +
+            "$($environmentPreflight.FailedPath) ($($environmentPreflight.ErrorMessage)). " +
+            "SFTP-перевірка не виконувалась."
+        ) -Level "ERROR"
+    }
+
+    # Чесне сповіщення: НЕ "SFTP недоступний" (SFTP-перевірка фактично не
+    # запускалась), а конкретно "середовище виконання" — і текст різний
+    # для privilege/generic, щоб не радити "запустіть адміністратором",
+    # коли причина не в правах. Той самий канал і той самий
+    # NotificationMode/NoSlack-контракт, що й для Critical нижче — нової
+    # notification taxonomy не додається.
+    $environmentNotificationStatus = "NotRequired"
+    if ((-not $NoSlack) -and ($NotificationMode -ne "none")) {
+        $environmentVersionText = [string]$global:ScriptVersion
+        $environmentBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$global:ScriptBuildId)) {
+            "невідома"
+        } else {
+            [string]$global:ScriptBuildId
+        }
+        $environmentActionText = if ($environmentPreflight.IsPrivilegeFailure) {
+            "запустити BRAVO HEALTH з правами адміністратора"
+        } else {
+            "перевірити доступність runtime TEMP/LOGS (диск, шлях, файлова система)"
+        }
+        $environmentReasonLines = if ($environmentPreflight.IsPrivilegeFailure) {
+            @(":x: Середовище виконання — недостатньо прав")
+        } else {
+            @(":x: Середовище виконання — недоступний TEMP/LOGS")
+        }
+        $environmentResultLines = if ($environmentPreflight.IsPrivilegeFailure) {
+            @(
+                "Недоступний шлях: $($environmentPreflight.FailedPath)",
+                "SFTP-перевірка не виконувалась."
+            )
+        } else {
+            @(
+                "Не вдалося використати: $($environmentPreflight.FailedPath)",
+                "Причина: $($environmentPreflight.ErrorMessage)",
+                "SFTP-перевірка не виконувалась."
+            )
+        }
+        # Minor 1: якщо сам health-check лог не вдалося створити/писати
+        # (той самий провал міг зачепити LOGS), не заявляти в сповіщенні
+        # журнал, якого фактично немає.
+        $environmentNotificationParameters = @{
+            Severity = "CRITICAL"
+            Operation = "BRAVO HEALTH — ПОТРІБНА ДІЯ"
+            ActionText = $environmentActionText
+            ReasonLines = $environmentReasonLines
+            InstitutionName = [string]$backupMonitoring.InstitutionName
+            InstitutionCode = [string]$backupMonitoring.InstitutionCode
+            HostInformation = (Get-HostInformation)
+            ResultLines = $environmentResultLines
+            Timestamp = $healthCheckStarted
+            ProductName = "BRAVO Archive"
+            Version = $environmentVersionText
+            BuildId = $environmentBuildIdText
+        }
+        if ($script:BRAVOHealthLogWritable) {
+            $environmentNotificationParameters.LogPath = $healthLogFile
+        }
+        $environmentMessage = New-BRAVOOperatorNotificationMessage @environmentNotificationParameters
+        try {
+            Send-SlackAlert -Message $environmentMessage
+            $environmentNotificationStatus = "Sent"
+            Write-HealthLog "Сповіщення про недоступність середовища відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
+        } catch {
+            $environmentNotificationStatus = "Failed"
+            Write-HealthLog "Не вдалося відправити сповіщення про недоступність середовища у ${NotificationProviderDisplayName}: $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+
+    return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
+        Status = "EnvironmentError"
+        IssueCount = 0
+        Notification = $environmentNotificationStatus
+        # Minor 1: те саме — консольний підсумок (Write-BRAVOResultFooter)
+        # не повинен показувати "Детальний журнал: ..." для файлу, який
+        # фактично не був записаний.
+        LogPath = $(if ($script:BRAVOHealthLogWritable) { $healthLogFile } else { $null })
+        FailedPath = $environmentPreflight.FailedPath
+        IsPrivilegeFailure = $environmentPreflight.IsPrivilegeFailure
+    })
+}
 
 Write-BRAVOProgressPhase -Phase 'Керовані служби' -PercentComplete 15
 $serviceHealthIssues = @(Get-ManagedServiceHealthIssues)
 Write-BRAVOHealthStep `
     -Name 'Керовані служби' `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $serviceHealthIssues.Count) `
-    -Details (Get-BRAVOHealthStepDetails -IssueCount $serviceHealthIssues.Count)
+    -Details (Get-BRAVOHealthCompactIssueDetails -Issues $serviceHealthIssues -EntityProperty 'Location' -Label 'служби')
 
 Write-BRAVOProgressPhase -Phase 'Локальні резервні копії' -PercentComplete 30
 $localHealthIssues = @(Get-BackupHealthIssues)
 Write-BRAVOHealthStep `
     -Name 'Локальні резервні копії' `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $localHealthIssues.Count) `
-    -Details (Get-BRAVOHealthStepDetails -IssueCount $localHealthIssues.Count)
+    -Details (Get-BRAVOHealthCompactIssueDetails -Issues $localHealthIssues -EntityProperty 'Component' -Label 'компоненти')
 
-Write-BRAVOProgressPhase -Phase 'BAZA (локальна копія)' -PercentComplete 45
+# dev.16 (review round 3): BAZA_APP і BAZA_WWW локальна копія — незалежні
+# dynamic steps (було: один комбінований "BAZA (локальна копія)" рядок,
+# що ховав, ЯКИЙ саме компонент має проблему). Той самий "вимкнений
+# компонент не займає рядка" принцип; Get-BAZALocalSyncHealthIssues
+# викликається так само, як і раніше, для кожного компонента окремо.
+Write-BRAVOProgressPhase -Phase 'BAZA_APP (локальна копія)' -PercentComplete 40
 $bazaAppLocalHealthIssues = @(Get-BAZALocalSyncHealthIssues `
     -Enabled $bazaAppLocalHealthEnabled `
     -SourcePath $bazaAppPaths.Source `
     -DestinationPath $bazaAppPaths.Destination `
     -Label "BAZA APP")
+if ($bazaAppLocalHealthEnabled) {
+    Write-BRAVOHealthStep `
+        -Name 'BAZA_APP (локальна копія)' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $bazaAppLocalHealthIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $bazaAppLocalHealthIssues.Count)
+} else {
+    # Лише у журнал: вимкнений компонент не займає рядка в консолі.
+    Write-HealthLog "Локальну перевірку BAZA APP пропущено: BAZA_APP_LOCAL = `$false"
+}
+
+Write-BRAVOProgressPhase -Phase 'BAZA_WWW (локальна копія)' -PercentComplete 50
 $bazaWWWLocalHealthIssues = @(Get-BAZALocalSyncHealthIssues `
     -Enabled $bazaWWWLocalHealthEnabled `
     -SourcePath $bazaWWWPaths.Source `
     -DestinationPath $bazaWWWPaths.Destination `
     -Label "BAZA WWW")
-$bazaLocalHealthIssues = @($bazaAppLocalHealthIssues) + @($bazaWWWLocalHealthIssues)
-if ($bazaAppLocalHealthEnabled -or $bazaWWWLocalHealthEnabled) {
+if ($bazaWWWLocalHealthEnabled) {
     Write-BRAVOHealthStep `
-        -Name 'BAZA (локальна копія)' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $bazaLocalHealthIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $bazaLocalHealthIssues.Count)
+        -Name 'BAZA_WWW (локальна копія)' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $bazaWWWLocalHealthIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $bazaWWWLocalHealthIssues.Count)
 } else {
-    # Лише у журнал: вимкнений компонент не займає рядка в консолі.
-    Write-HealthLog "Локальну перевірку BAZA пропущено: BAZA_APP_LOCAL = `$false; BAZA_WWW_LOCAL = `$false"
+    Write-HealthLog "Локальну перевірку BAZA WWW пропущено: BAZA_WWW_LOCAL = `$false"
 }
+$bazaLocalHealthIssues = @($bazaAppLocalHealthIssues) + @($bazaWWWLocalHealthIssues)
 
+# dev.16 (review round 3): SFTP розділено на 3 незалежні dynamic steps
+# (резервні копії/BAZA_APP/BAZA_WWW). Get-SFTPHealthIssues викликається
+# ЯК Є, рівно один раз (той самий WinSCP session/connection contract, той
+# самий єдиний виклик Test-SFTPHealthConfiguration всередині) — результат
+# лише партиціонується за вже існуючим полем Component. Спільна
+# prerequisite-помилка з'єднання (Component == 'SFTP', bez суфікса)
+# приєднується до КОЖНОГО увімкненого кроку нижче, щоб оператор бачив її
+# на будь-якому увімкненому SFTP-рядку; сирий виняток лишається
+# залогованим лише ОДИН раз — усередині самої Get-SFTPHealthIssues.
+# $sftpHealthIssues (сирий, неподілений список) і надалі йде в
+# $healthIssues/$destinationSummary нижче без змін — critical/notification/
+# exit-code семантика не зачеплена.
 Write-BRAVOProgressPhase -Phase 'SFTP' -PercentComplete 60
 $sftpHealthIssues = @(Get-SFTPHealthIssues)
-if ($script:BRAVOHealthSftpStepEnabled) {
+$sftpArchiveComponentNames = @(@($archiveDefinitions | ForEach-Object { "SFTP $($_.Type)" }) + @('SFTP архіви'))
+$sftpSharedIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP' })
+$sftpArchivesStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -in $sftpArchiveComponentNames }) + @($sftpSharedIssues)
+$sftpBazaAppStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA APP' }) + @($sftpSharedIssues)
+$sftpBazaWWWStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA WWW' }) + @($sftpSharedIssues)
+if ($sftpArchivesHealthEnabled) {
     Write-BRAVOHealthStep `
-        -Name 'SFTP' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpHealthIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpHealthIssues.Count)
+        -Name 'SFTP: резервні копії' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpArchivesStepIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpArchivesStepIssues.Count)
+}
+if ($sftpBazaAppHealthEnabled) {
+    Write-BRAVOHealthStep `
+        -Name 'SFTP: BAZA_APP' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaAppStepIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaAppStepIssues.Count)
+}
+if ($sftpBazaWWWHealthEnabled) {
+    Write-BRAVOHealthStep `
+        -Name 'SFTP: BAZA_WWW' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaWWWStepIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count)
+}
+if (-not $sftpArchivesHealthEnabled -and -not $sftpBazaAppHealthEnabled -and -not $sftpBazaWWWHealthEnabled) {
+    Write-HealthLog "SFTP health-check пропущено: усі SFTP-перевірки вимкнено в конфігурації"
 }
 
 Write-BRAVOProgressPhase -Phase 'NAS/SMB' -PercentComplete 80
@@ -4134,38 +4904,22 @@ if ($MyInvocation.InvocationName -ne '.') {
     # ніколи не чекав на клавішу при ручному запуску. try/finally гарантує
     # паузу і на нормальному завершенні, і на непередбаченому throw
     # усередині Invoke-BRAVOHealth (те саме, що вже робить Archive.Runtime.ps1).
+    # Код завершення обчислюється всередині Complete-BRAVOHealthResult (див.
+    # вище) — САМЕ ДО друку підсумку, а не тут і не після нього, як було
+    # раніше. Deferred — це "пропущено через lock/уже виконується інше
+    # завдання" у сенсі загального контракту кодів, тому окремий код 20, а
+    # не 0/1. Skipped ніколи фактично не породжується цим runtime (мертва
+    # гілка), лишена як безпечний fallback на успіх. Порушення цілісності
+    # інструментів перекриває будь-який інший результат: Health навмисно не
+    # переривається на старті (на відміну від Archive/Maintenance) —
+    # локальні перевірки служб, дисків і віку копій Tools не запускають,
+    # тому лишаються корисними саме тоді, коли підозрюється підміна. Але
+    # SFTP-гілка при цьому пропущена (Test-SFTPHealthConfiguration), і
+    # зовнішній моніторинг має бачити подію безпеки, а не звичайний
+    # health-статус.
     $script:healthRuntimeExitCode = 90
     try {
-        $healthResult = Invoke-BRAVOHealth @healthParameters
-        # Deferred — це саме "пропущено через lock/уже виконується інше завдання"
-        # у сенсі загального контракту кодів, тому окремий код 20, а не 0/1.
-        # Skipped ніколи фактично не породжується цим runtime (мертва гілка),
-        # лишена як безпечний fallback на успіх.
-        $exitCode = switch ([string]$healthResult.Status) {
-            'Healthy'            { 0 }
-            'Skipped'            { 0 }
-            'Disabled'           { 0 }
-            'Deferred'           { Resolve-BRAVOExitCode -LockBusy }
-            'ConfigurationError' { Resolve-BRAVOExitCode -InvalidConfiguration }
-            'Critical'           { Resolve-BRAVOExitCode -HealthCritical }
-            'NotificationError'  { Resolve-BRAVOExitCode -HealthCritical }
-            default              { Resolve-BRAVOExitCode -HealthCritical }
-        }
-        if ($exitCode -eq 0 -and $script:BRAVOWarningCount -gt 0) {
-            $exitCode = Resolve-BRAVOExitCode -HasWarnings
-        }
-
-        # Порушення цілісності інструментів перекриває будь-який інший
-        # результат Health. Health навмисно не переривається на старті (на
-        # відміну від Archive/Maintenance) — локальні перевірки служб,
-        # дисків і віку копій Tools не запускають, тому лишаються корисними
-        # саме тоді, коли підозрюється підміна. Але SFTP-гілка при цьому
-        # пропущена (Test-SFTPHealthConfiguration), і зовнішній моніторинг
-        # має бачити подію безпеки, а не звичайний health-статус.
-        if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
-            $exitCode = Resolve-BRAVOExitCode -ToolIntegrityViolation
-        }
-        $script:healthRuntimeExitCode = $exitCode
+        [void](Invoke-BRAVOHealth @healthParameters)
     } finally {
         Wait-BRAVOManualExit -NoPause:$NoPause
     }

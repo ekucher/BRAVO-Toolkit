@@ -35,7 +35,10 @@ Assert-BRAVOPowerShellCompatibility
 [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
 $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
 $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-$script:BRAVOWindowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
+# Свіжість накопичувальних оновлень Windows тут навмисно НЕ перевіряється:
+# це health-метрика, а не умова виконання backup. Її місце в BRAVO_HEALTH,
+# який для цього й існує. Перевірки платформи (ОС, build, PowerShell, .NET,
+# архітектура, API) лишаються вище й на місці.
 $archiveHelpersPath = Join-Path $bravoScriptDirectory 'modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1'
 if (-not (Test-Path -LiteralPath $archiveHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль archive helpers: $archiveHelpersPath"
@@ -91,8 +94,9 @@ try {
     . $loaderPath
 
     Import-BravoConfiguration `
-        -ConfigRoot $bravoScriptDirectory `
-        -ConfigPath $ConfigPath
+        -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
+        -ConfigPath $ConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
 
     $configPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     Write-Host "Конфiгурацiю завантажено успiшно: $configPath" -ForegroundColor $logColors.SUCCESS
@@ -469,10 +473,8 @@ function Test-Compatibility {
     Write-BRAVOLog -Component 'STARTUP' -Message "Перевiрка сумiсностi системи..." -Level "INFO"
     $compatibility = Get-BRAVOCompatibilityInfo
     $powerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-    $windowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
     $script:BRAVOCompatibility = $compatibility
     $script:BRAVOPowerShellUpdate = $powerShellUpdate
-    $script:BRAVOWindowsPatchLevel = $windowsPatchLevel
 
     $script:hasFileHash = $compatibility.FileHashProvider -eq "Get-FileHash"
     $script:hasNetConnection = $compatibility.NetworkProvider -eq "Test-NetConnection"
@@ -489,10 +491,6 @@ function Test-Compatibility {
     if ($powerShellUpdate.IsUpdateRecommended) {
         Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING"
     }
-    if ($windowsPatchLevel.IsUpdateRecommended) {
-        Write-BRAVOLog -Component 'STARTUP' -Message $windowsPatchLevel.Message -Level "WARNING"
-    }
-
     $osSupportTier = Get-BRAVOOSSupportTier
     $script:BRAVOOSSupportTier = $osSupportTier
     Write-BRAVOLog -Component 'STARTUP' -Message "Підтримка ОС: $($osSupportTier.Tier) — Windows $($osSupportTier.OperatingSystem) ($($osSupportTier.OperatingSystemVersion), build $($osSupportTier.Build)); PowerShell $($osSupportTier.PowerShellVersion); .NET release $($osSupportTier.DotNetRelease)" -Level "INFO"
@@ -584,15 +582,26 @@ function Send-ToolIntegrityAlert {
 
     try {
         $hostInformation = Get-HostInformation
-        $alertText = @(
-            ":rotating_light: КРИТИЧНО: порушено цілісність інструментів BRAVO",
-            "Сервер: $($hostInformation.MachineName) (IP: $($hostInformation.LocalIP))",
-            "Час: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')",
-            "",
-            [string]$Result.Message,
-            "",
-            "Архівацію НЕ виконано (код завершення 32)."
-        ) -join "`n"
+        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+            "невідома"
+        } else {
+            [string]$ScriptBuildId
+        }
+        $alertText = New-BRAVOOperatorNotificationMessage `
+            -Severity "CRITICAL" `
+            -Operation "BRAVO — ПОРУШЕНО ЦІЛІСНІСТЬ КОМПЛЕКТУ" `
+            -ActionText "не запускати backup вручну; перевірити RUNTIME_MANIFEST/TOOLS_MANIFEST та походження змінених файлів." `
+            -ReasonLines @([string]$Result.Message) `
+            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -HostInformation $hostInformation `
+            -ResultLines @("Архівацію не виконано (код завершення 32).") `
+            -Timestamp (Get-Date) `
+            -ProductName "BRAVO Archive" `
+            -Version ([string]$global:ScriptVersion) `
+            -BuildId $archiveBuildIdText `
+            -LogPath ([string]$script:logFile) `
+            -LogLabel "Журнал"
 
         # Discord потребує власного форматування й обмежений довжиною
         # повідомлення; Slack приймає текст як є.
@@ -653,27 +662,6 @@ function New-SHA512HashLegacy {
     }
 }
 
-function Test-NetworkConnectionLegacy {
-    try {
-        Write-BRAVOLog -Component 'NETWORK' -Message "Перевiрка мережевого з'єднання (сумiсний режим)..." -Level "DEBUG"
-        
-        # Альтернативнi методи перевiрки мережi
-        $ping = New-Object System.Net.NetworkInformation.Ping
-        $result = $ping.Send($networkCheckHost, $networkPingTimeoutMilliseconds)
-        
-        if ($result.Status -eq "Success") {
-            Write-BRAVOLog -Component 'NETWORK' -Message "Мережеве з'єднання доступне (сумiсний режим)" -Level "SUCCESS"
-            return $true
-        } else {
-            Write-BRAVOLog -Component 'NETWORK' -Message "Мережеве з'єднання недоступне (сумiсний режим)" -Level "ERROR"
-            return $false
-        }
-    } catch {
-        Write-BRAVOLog -Component 'NETWORK' -Message "Помилка перевiрки мережевого з'єднання (сумiсний режим): $($_.Exception.Message)" -Level "ERROR"
-        return $false
-    }
-}
-
 # =============================================
 # ДОПОМІЖНІ ФУНКЦІЇ
 # =============================================
@@ -697,7 +685,9 @@ function Resolve-BRAVOLogComponentFromHeader {
     param([Parameter(Mandatory = $true)][string]$Header)
 
     switch -regex ($Header) {
-        'SFTP|BAZA_APP'                 { return 'SFTP' }
+        '(?i)BAZA[_ ]APP'               { return 'BAZA_APP' }
+        '(?i)BAZA[_ ]WWW'               { return 'BAZA_WWW' }
+        '(?i)SFTP'                      { return 'SFTP-ARCHIVE' }
         'SMB|NAS'                       { return 'SMB' }
         '(?i)АРХ[IІ]ВАЦ[IІ]Я'           { return 'ARCHIVE' }
         '(?i)ХЕШУ'                      { return 'HASH' }
@@ -729,14 +719,16 @@ function Write-Log {
     $component = $script:BRAVOLogComponent
 
     # Роздільники й заголовки формували структуру старої консолі. Тепер її
-    # задають етапи (Write-BRAVOStepResult), тому в консоль вони не йдуть,
-    # але лишаються в журналі, щоб хронологія читалася як раніше.
+    # задають етапи (Write-BRAVOStepResult), тому в консоль вони не йдуть.
+    # dev.18: голий роздільник "==="/"=" БІЛЬШЕ НЕ пише окремий запис у
+    # журнал. Реальний DEV-LIMS лог показав структуровані записи з
+    # timestamp/level/component, але порожнім Message — саме цей виклик
+    # (кожен голий "===" стоїть безпосередньо перед "=== ЗАГОЛОВОК ===",
+    # який і так фіксує ту саму мить і компонент повноцінним текстом;
+    # унікальної хронологічної інформації тут немає). Заголовки нижче
+    # (гілка "=== ... ===") лишаються повністю без змін — вони й далі
+    # пишуться в журнал з повним текстом заголовка.
     if ($Message -eq "=" -or $Message -eq "===") {
-        Write-BRAVOLog `
-            -Message ("=" * $SeparatorLength) `
-            -Level 'INFO' `
-            -Component $component `
-            -NoConsole
         return
     }
     if ($Message -match "^=== .* ===$") {
@@ -760,6 +752,68 @@ function Write-Log {
         return
     }
     Write-BRAVOLog -Message $Message -Level $normalizedLevel -Component $component
+}
+
+# Write-BRAVOLogException навмисно зберігає стек на DEBUG для звичайних
+# викликів. Для фатального краху Archive дублюємо лише діагностичні деталі
+# у файл на INFO, без другого операторського повідомлення в консолі.
+function Write-BRAVOArchiveFatalDiagnostics {
+    param(
+        [Parameter(Mandatory = $true)][Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory = $true)][string]$Context
+    )
+
+    Write-BRAVOLogException `
+        -ErrorRecord $ErrorRecord `
+        -Component 'ARCHIVE' `
+        -Context $Context
+
+    $details = New-Object System.Collections.Generic.List[string]
+    if ($null -ne $ErrorRecord.Exception) {
+        [void]$details.Add("Тип: $($ErrorRecord.Exception.GetType().FullName)")
+    }
+    if ($null -ne $ErrorRecord.InvocationInfo -and
+        -not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.InvocationInfo.PositionMessage)) {
+        [void]$details.Add("Розташування: $($ErrorRecord.InvocationInfo.PositionMessage)")
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.ScriptStackTrace)) {
+        [void]$details.Add("Стек: $($ErrorRecord.ScriptStackTrace -replace '\r?\n', ' | ')")
+    }
+    if ($details.Count -gt 0) {
+        Write-BRAVOLog `
+            -Message ("$Context. Діагностика: " + ($details -join ' || ')) `
+            -Level 'INFO' `
+            -Component 'ARCHIVE' `
+            -NoConsole
+    }
+}
+
+function Get-BRAVOArchiveVSSSummaryValue {
+    param(
+        [object]$SnapshotSet,
+        [int]$EnabledArchiveCount
+    )
+
+    if ($null -ne $SnapshotSet -and
+        -not [string]::IsNullOrWhiteSpace([string]$SnapshotSet.SnapshotSetId)) {
+        return "OK ($($SnapshotSet.SnapshotSetId))"
+    }
+    if ($EnabledArchiveCount -eq 0) {
+        return 'SKIPPED'
+    }
+    return 'FAILED'
+}
+
+function Get-BRAVOArchiveGenerationFailureSummaryReason {
+    param(
+        [bool]$GenerationFinalizationFailed,
+        [string]$GenerationFinalizationFailureReason
+    )
+
+    if (-not $GenerationFinalizationFailed) {
+        return $null
+    }
+    return "Generation: FAILED. Причина: $GenerationFinalizationFailureReason"
 }
 
 # Усі три історичні хелпери прогресу тепер малюють одну смугу
@@ -818,7 +872,8 @@ function Write-BRAVOArchiveStep {
         [Parameter(Mandatory = $true)][string]$Name,
         [ValidateSet('OK', 'SKIPPED', 'WARNING', 'ERROR')]
         [string]$Status = 'OK',
-        [string]$Details
+        [string]$Details,
+        [Nullable[timespan]]$Duration
     )
 
     $script:BRAVOStepCurrent++
@@ -827,7 +882,8 @@ function Write-BRAVOArchiveStep {
         -Total $script:BRAVOStepTotal `
         -Name $Name `
         -Status $Status `
-        -Details $Details
+        -Details $Details `
+        -Duration $Duration
 }
 
 function Show-RunningProgress {
@@ -910,6 +966,207 @@ function Show-ArchiveCleanupSection {
         Write-BRAVOLog -Component 'CLEANUP' -Message "=== ОЧИЩЕННЯ СТАРИХ АРХIВIВ ==="
         Show-ScriptProgress -Status "Очищення старих архiвiв" -PercentComplete 72
         $SectionShown.Value = $true
+    }
+}
+
+function Test-BRAVOBackupArtifactPathSafe {
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][string]$BackupRoot
+    )
+
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+        $fullRoot = [IO.Path]::GetFullPath($BackupRoot).TrimEnd('\', '/')
+        return $fullPath.StartsWith(
+            $fullRoot + [IO.Path]::DirectorySeparatorChar,
+            [StringComparison]::OrdinalIgnoreCase
+        )
+    } catch {
+        return $false
+    }
+}
+
+function Get-BRAVOGenerationManifestComponents {
+    param([object]$Manifest)
+
+    if ($null -eq $Manifest -or $null -eq $Manifest.PSObject.Properties['components']) {
+        return @()
+    }
+    return @($Manifest.components.PSObject.Properties | ForEach-Object { $_.Value })
+}
+
+function Test-BRAVOGenerationManifestVerified {
+    param([object]$Manifest)
+
+    if ([string]$Manifest.status -ne 'COMPLETE') { return $false }
+    $components = @(Get-BRAVOGenerationManifestComponents -Manifest $Manifest)
+    if ($components.Count -eq 0) { return $false }
+    foreach ($component in $components) {
+        if (-not [bool]$component.CreateSuccess -or
+            -not [bool]$component.IntegritySuccess -or
+            -not [bool]$component.HashSuccess) {
+            return $false
+        }
+        $archivePath = [string]$component.ArchivePath
+        $hashPath = [string]$component.HashPath
+        if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+            -not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
+            return $false
+        }
+        try {
+            $hashText = ([IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
+            if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$' -or
+                $Matches.FileName -cne [IO.Path]::GetFileName($archivePath)) {
+                return $false
+            }
+            $actualHash = (Get-BRAVOFileHash -Path $archivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+            if ($actualHash -cne $Matches.Hash.ToUpperInvariant()) { return $false }
+        } catch {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Remove-BRAVOExpiredBackupGenerations {
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [Parameter(Mandatory = $true)][string]$CurrentGenerationId,
+        [int]$RetentionDays,
+        [ref]$CleanupSectionShown,
+        # dev.16 (review round 3): опційний факт-сигнал для operator-console
+        # unnumbered result — скільки generation РЕАЛЬНО видалено цим
+        # прогоном (не просто "перевірку виконано"). Той самий мінімальний
+        # ref-out-параметр паттерн, що вже CleanupSectionShown вище; не
+        # змінює retention/delete semantics нижче.
+        # ВАЖЛИВО: ім'я НЕ повинно збігатися (регістр-незалежно) з жодною
+        # локальною змінною нижче — PowerShell типізує параметр-змінну як
+        # [ref] на всю область видимості функції, і будь-яке присвоєння
+        # значення змінній з тим самим (з точністю до регістру) іменем
+        # тихо обгортається назад у НОВИЙ PSReference замість звичайного
+        # int; наступний $x++/$x += кидає "operator works only on numbers"
+        # (підтверджено реальним запуском — саме так спершу й було зроблено).
+        [ref]$RemovedGenerationCount
+    )
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return $false }
+    $deletedGenerationCount = 0
+    try {
+        $validRetentionDays = if ($RetentionDays -gt 0) { $RetentionDays } else { 183 }
+        $invalidRetentionDays = if ($failedArchiveRetentionDays -gt 0) { [int]$failedArchiveRetentionDays } else { 30 }
+        $validCutoff = (Get-Date).AddDays(-$validRetentionDays)
+        $invalidCutoff = (Get-Date).AddDays(-$invalidRetentionDays)
+        $records = @()
+        # dev.14: MANIFESTS-first reader (з fallback на legacy корінь
+        # BackupRoot) вирішує, ЯКИЙ вміст (Status/StartedAt/VerifiedComplete)
+        # керує рішенням про видалення generation. ManifestPath нижче — лише
+        # шлях ЦІЄЇ конкретної, обраної для рішення копії; фактичне видалення
+        # (нижче) не покладається на це поле — воно шукає й прибирає ВСІ
+        # фізичні копії manifest-а через Get-BRAVOBackupGenerationManifestPhysicalFiles.
+        foreach ($manifestFile in @(Get-BRAVOBackupGenerationManifestFiles -BackupRoot $BackupRoot)) {
+            try {
+                $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
+                $generationId = [string]$manifest.generationId
+                if ([string]::IsNullOrWhiteSpace($generationId)) { throw 'generationId is empty' }
+
+                # dev.14 (round 3): filename і JSON generationId МАЮТЬ
+                # збігатися. Фізичне видалення (нижче) шукає artifacts і
+                # metadata за GenerationId із ЦЬОГО запису — якщо довіряти
+                # лише вмісту JSON без звірки з іменем файлу, пошкоджений
+                # чи підмінений manifest міг би вказати на ЧУЖУ generation
+                # і призвести до видалення її artifacts/metadata. Mismatch
+                # виключає запис із retention повністю — жодних artifacts
+                # чи metadata не видаляється на основі недовіреного запису.
+                $filenameGenerationId = Get-BRAVOBackupManifestFilenameGenerationId -FileName $manifestFile.Name
+                if ([string]::IsNullOrEmpty($filenameGenerationId) -or
+                    -not [string]::Equals($filenameGenerationId, $generationId, [StringComparison]::Ordinal)) {
+                    Write-BRAVOLog -Component 'CLEANUP' -Message (
+                        "Generation manifest пропущено для retention через невідповідність generationId: " +
+                        "файл '$($manifestFile.Name)' (з імені файлу: '$filenameGenerationId') містить у JSON " +
+                        "generationId '$generationId' — можливе пошкодження чи підміна, файл лишається без змін"
+                    ) -Level 'WARNING'
+                    continue
+                }
+
+                $startedAt = $manifestFile.LastWriteTime
+                try {
+                    $startedAt = [datetime]$manifest.startedAt
+                } catch {
+                    # Invalid timestamp does not authorize deletion; file time
+                    # is the conservative fallback and the manifest is retained
+                    # unless it independently satisfies the age policy.
+                }
+                $records += [pscustomobject]@{
+                    GenerationId = $generationId
+                    Status = [string]$manifest.status
+                    StartedAt = $startedAt
+                    Manifest = $manifest
+                    ManifestPath = $manifestFile.FullName
+                    VerifiedComplete = Test-BRAVOGenerationManifestVerified -Manifest $manifest
+                }
+            } catch {
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Generation manifest збережено без змін через parse error: $($manifestFile.FullName) ($($_.Exception.Message))" -Level 'WARNING'
+            }
+        }
+
+        $minimumRetainedCount = if ($minimumRetainedVerifiedBackups -gt 0) {
+            [int]$minimumRetainedVerifiedBackups
+        } else { 1 }
+        $protectedGenerationIds = @(
+            $records |
+                Where-Object { $_.VerifiedComplete } |
+                Sort-Object StartedAt -Descending |
+                Select-Object -First $minimumRetainedCount |
+                ForEach-Object { $_.GenerationId }
+        )
+
+        foreach ($record in @($records | Sort-Object StartedAt)) {
+            if ($record.GenerationId -eq $CurrentGenerationId) { continue }
+            $deleteGeneration = $false
+            if ($record.VerifiedComplete) {
+                $deleteGeneration = [bool]$enableArchiveDeletion -and
+                    $record.StartedAt -lt $validCutoff -and
+                    $record.GenerationId -notin $protectedGenerationIds
+            } else {
+                $deleteGeneration = [bool]$enableFailedArchiveDeletion -and
+                    $record.StartedAt -lt $invalidCutoff
+            }
+            if (-not $deleteGeneration) { continue }
+
+            Show-ArchiveCleanupSection -SectionShown $CleanupSectionShown
+            foreach ($component in @(Get-BRAVOGenerationManifestComponents -Manifest $record.Manifest)) {
+                foreach ($artifactPath in @([string]$component.ArchivePath, [string]$component.HashPath)) {
+                    if ([string]::IsNullOrWhiteSpace($artifactPath) -or
+                        -not (Test-Path -LiteralPath $artifactPath -PathType Leaf)) { continue }
+                    if (-not (Test-BRAVOBackupArtifactPathSafe -Path $artifactPath -BackupRoot $BackupRoot)) {
+                        throw "manifest references artifact outside BackupRoot: $artifactPath"
+                    }
+                    Remove-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
+                }
+            }
+            # dev.14: видаляється КОЖНА фізична копія manifest-а цієї
+            # generation (MANIFESTS і, за наявності, legacy-корінь), а не
+            # лише та, яку MANIFESTS-first reader повернув для рішення про
+            # видалення. Інакше conflict-копія в іншому розташуванні
+            # переживає видалення й на наступному запуску "воскрешає"
+            # видалену generation через legacy fallback читання.
+            foreach ($physicalManifest in @(
+                Get-BRAVOBackupGenerationManifestPhysicalFiles `
+                    -BackupRoot $BackupRoot `
+                    -GenerationId $record.GenerationId
+            )) {
+                Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
+            }
+            Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))" -Level 'SUCCESS'
+            $deletedGenerationCount++
+        }
+        if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
+        return $true
+    } catch {
+        if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
+        Write-BRAVOLog -Component 'CLEANUP' -Message "Generation-aware retention failed: $($_.Exception.Message)" -Level 'ERROR'
+        return $false
     }
 }
 
@@ -1053,11 +1310,23 @@ function Remove-OldLunchArchives {
     param(
         [Parameter(Mandatory = $true)][string]$ArchiveRoot,
         [Parameter(Mandatory = $true)][string[]]$Directories,
-        [int]$RetentionMonths = 2
+        [int]$RetentionMonths = 2,
+        # dev.16 (review round 3): опційний факт-сигнал для operator-console
+        # unnumbered result — скільки файлів РЕАЛЬНО видалено (те саме
+        # $deletedCount, що вже рахується нижче для LOG); мінімальний
+        # ref-out-параметр, не змінює retention/delete semantics.
+        # ВАЖЛИВО: ім'я НЕ Deleted*Count — нижче вже є локальна змінна
+        # $deletedCount; PowerShell типізує параметр-змінну як [ref] на
+        # всю область видимості функції, і регістр-незалежний збіг тихо
+        # ламає $deletedCount += 2 нижче (кидає "operator works only on
+        # numbers", кожне реальне видалення потрапляло б у catch як
+        # false-failure — підтверджено реальним запуском).
+        [ref]$RemovedFileCount
     )
 
     if (-not (Test-Path -LiteralPath $ArchiveRoot -PathType Container)) {
         Write-BRAVOLog -Component 'CLEANUP' -Message "Каталог обідніх архівів не знайдено: $ArchiveRoot" -Level "ERROR"
+        if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = 0 }
         return $false
     }
 
@@ -1137,6 +1406,7 @@ function Remove-OldLunchArchives {
     }
 
     Write-BRAVOLog -Component 'CLEANUP' -Message "Усього видалено обідніх файлів: $deletedCount" -Level "INFO"
+    if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = $deletedCount }
     return (-not $failed)
 }
 
@@ -1334,15 +1604,44 @@ function Remove-BRAVOVSSSnapshotLink {
     }
 }
 
-function New-BRAVOVSSSnapshot {
-    param([Parameter(Mandatory = $true)][string]$SourcePath)
+function Get-BRAVOVSSVolumeRoot {
+    # Корінь тому ("D:\") для шляху джерела. VSS працює томами, а не
+    # каталогами: саме тому три джерела на одному диску мають дати ОДИН
+    # знімок, а не три.
+    param([Parameter(Mandatory = $true)][string]$Path)
 
-    $normalizedSourcePath = $SourcePath.Replace("/", "\")
-    $volumeRoot = [IO.Path]::GetPathRoot($normalizedSourcePath)
+    $normalizedPath = ([string]$Path).Replace("/", "\").TrimEnd("*")
+    $volumeRoot = [IO.Path]::GetPathRoot($normalizedPath)
     if ([string]::IsNullOrWhiteSpace($volumeRoot) -or
         $volumeRoot -notmatch '^[A-Za-z]:\\$') {
-        throw "Не вдалося визначити локальний том VSS для джерела: $SourcePath"
+        throw "Не вдалося визначити локальний том VSS для джерела: $Path"
     }
+    return $volumeRoot.ToUpperInvariant()
+}
+
+function Get-BRAVOUniqueVSSVolumes {
+    # Дедуплікація томів ДО створення знімків. Без неї MODEL, BLOG і
+    # BRAVOEXCH з одного диска давали три окремі shadow copies — три різні
+    # моменти часу для того, що логічно є одним backup.
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SourcePaths)
+
+    $uniqueVolumes = New-Object System.Collections.Generic.List[string]
+    foreach ($sourcePath in @($SourcePaths)) {
+        if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+            continue
+        }
+        $volumeRoot = Get-BRAVOVSSVolumeRoot -Path $sourcePath
+        if (-not $uniqueVolumes.Contains($volumeRoot)) {
+            $uniqueVolumes.Add($volumeRoot)
+        }
+    }
+    return @($uniqueVolumes | Sort-Object)
+}
+
+function New-BRAVOVSSVolumeShadow {
+    # Один shadow copy одного тому через Win32_ShadowCopy + символічне
+    # посилання, щоб 7-Zip міг читати вміст звичайним шляхом.
+    param([Parameter(Mandatory = $true)][string]$VolumeRoot)
 
     $snapshotContext = [string]$backupConsistency.SnapshotContext
     if ([string]::IsNullOrWhiteSpace($snapshotContext)) {
@@ -1352,19 +1651,16 @@ function New-BRAVOVSSSnapshot {
     $shadowId = $null
     $snapshotLinkPath = $null
     try {
-        Write-BRAVOLog -Component 'VSS' -Message "Створення VSS-знімка тому $volumeRoot для узгодженої архівації" -Level "INFO"
         $shadowClass = [wmiclass]"\\.\root\cimv2:Win32_ShadowCopy"
-        $createResult = $shadowClass.Create($volumeRoot, $snapshotContext)
+        $createResult = $shadowClass.Create($VolumeRoot, $snapshotContext)
         if ($null -eq $createResult) {
             throw "Win32_ShadowCopy.Create не повернув результат"
         }
-
         $returnCode = [int]$createResult.ReturnValue
         if ($returnCode -ne 0) {
             $description = Get-BRAVOVSSReturnCodeDescription -ReturnCode $returnCode
             throw "Win32_ShadowCopy.Create повернув код $returnCode ($description)"
         }
-
         $shadowId = [string]$createResult.ShadowID
         if ([string]::IsNullOrWhiteSpace($shadowId)) {
             throw "VSS не повернув ідентифікатор створеного знімка"
@@ -1382,16 +1678,16 @@ function New-BRAVOVSSSnapshot {
         }
 
         $snapshotLinkPath = New-BRAVOVSSSnapshotLink -DeviceObject ([string]$shadow.DeviceObject)
-        $snapshotSourcePath = Get-BRAVOVSSSnapshotSourcePath `
-            -SourcePath $SourcePath `
-            -DeviceObject $snapshotLinkPath
-        Write-BRAVOLog -Component 'VSS' -Message "VSS-знімок створено: $shadowId" -Level "SUCCESS"
         return [pscustomobject]@{
-            Id = $shadowId
-            VolumeRoot = $volumeRoot
+            VolumeRoot = $VolumeRoot
+            OriginalVolume = $VolumeRoot
+            ShadowId = $shadowId
+            SnapshotId = $shadowId
+            SetId = [string]$shadow.SetID
+            SnapshotSetId = [string]$shadow.SetID
             DeviceObject = [string]$shadow.DeviceObject
+            SnapshotDeviceObject = [string]$shadow.DeviceObject
             LinkPath = $snapshotLinkPath
-            SourcePath = $snapshotSourcePath
             WmiObject = $shadow
         }
     } catch {
@@ -1422,28 +1718,703 @@ function New-BRAVOVSSSnapshot {
     }
 }
 
-function Remove-BRAVOVSSSnapshot {
-    param([Parameter(Mandatory = $true)][object]$Snapshot)
+function Test-BRAVOFileSystemWriteProbe {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $probePath = $null
+    try {
+        if (-not (Test-Path -LiteralPath $Path -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $Path -Force -ErrorAction Stop)
+        }
+        $probePath = Join-Path $Path ('.bravo_write_probe_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+        $expected = [Text.Encoding]::UTF8.GetBytes('BRAVO_SYSTEM_WRITE_PROBE')
+        $stream = [IO.File]::Open(
+            $probePath,
+            [IO.FileMode]::CreateNew,
+            [IO.FileAccess]::Write,
+            [IO.FileShare]::None
+        )
+        try {
+            $stream.Write($expected, 0, $expected.Length)
+            $stream.Flush()
+        } finally {
+            $stream.Dispose()
+        }
+        $actual = [IO.File]::ReadAllBytes($probePath)
+        if ($actual.Length -ne $expected.Length -or
+            [Convert]::ToBase64String($actual) -cne [Convert]::ToBase64String($expected)) {
+            throw 'read-back content does not match the probe payload'
+        }
+        return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Success = $false; Path = $Path; Error = $_.Exception.Message }
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace($probePath) -and
+            [IO.File]::Exists($probePath)) {
+            try {
+                [IO.File]::Delete($probePath)
+            } catch {
+                # Probe result already records the access failure; cleanup is
+                # best-effort and must not hide the original diagnostic.
+            }
+        }
+    }
+}
+
+function Test-BRAVOSourceReadProbe {
+    param([Parameter(Mandatory = $true)][string]$Path)
 
     try {
-        Remove-BRAVOVSSSnapshotLink -LinkPath $Snapshot.LinkPath
+        $sourceDirectory = $Path.TrimEnd('*', '\', '/')
+        if (-not [IO.Directory]::Exists($sourceDirectory)) {
+            throw "source directory does not exist: $sourceDirectory"
+        }
+        [void][IO.File]::GetAttributes($sourceDirectory)
+        $firstEntry = [IO.Directory]::EnumerateFileSystemEntries($sourceDirectory) |
+            Select-Object -First 1
+        $isEmpty = [string]::IsNullOrWhiteSpace([string]$firstEntry)
+        if (-not $isEmpty) {
+            [void][IO.File]::GetAttributes([string]$firstEntry)
+        }
+        return [pscustomobject]@{
+            Success = $true
+            Path = $sourceDirectory
+            Empty = $isEmpty
+            Error = $null
+        }
     } catch {
-        Write-BRAVOLog -Component 'VSS' -Message "Не вдалося прибрати символiчне посилання на VSS-знiмок $($Snapshot.Id): $($_.Exception.Message)" -Level "WARNING"
+        return [pscustomobject]@{
+            Success = $false
+            Path = $Path
+            Empty = $null
+            Error = $_.Exception.Message
+        }
+    }
+}
+
+function Get-BRAVOVSSVolumeIdentityCandidates {
+    param([Parameter(Mandatory = $true)][string]$VolumeRoot)
+
+    $candidates = New-Object System.Collections.ArrayList
+    $normalizedVolumeRoot = ([string]$VolumeRoot).TrimEnd("\") + "\"
+    [void]$candidates.Add($normalizedVolumeRoot.ToUpperInvariant())
+    [void]$candidates.Add($normalizedVolumeRoot.TrimEnd("\").ToUpperInvariant())
+
+    try {
+        $volume = Get-WmiObject `
+            -Namespace "root\cimv2" `
+            -Class "Win32_Volume" `
+            -Filter ("DriveLetter='{0}'" -f $normalizedVolumeRoot.TrimEnd("\")) `
+            -ErrorAction Stop |
+            Select-Object -First 1
+        if ($null -ne $volume -and -not [string]::IsNullOrWhiteSpace([string]$volume.DeviceID)) {
+            $volumeDeviceId = ([string]$volume.DeviceID).TrimEnd("\") + "\"
+            [void]$candidates.Add($volumeDeviceId.ToUpperInvariant())
+            [void]$candidates.Add($volumeDeviceId.TrimEnd("\").ToUpperInvariant())
+        }
+    } catch {
+        # Drive-letter identity is still usable; Win32_Volume is best-effort for GUID-style VolumeName.
     }
 
+    return @($candidates | Select-Object -Unique)
+}
+
+function Test-BRAVOVSSShadowMatchesVolume {
+    param(
+        [Parameter(Mandatory = $true)][object]$Shadow,
+        [Parameter(Mandatory = $true)][string]$VolumeRoot
+    )
+
+    $candidates = @(Get-BRAVOVSSVolumeIdentityCandidates -VolumeRoot $VolumeRoot)
+    foreach ($shadowVolumeName in @($Shadow.VolumeName)) {
+        if ([string]::IsNullOrWhiteSpace([string]$shadowVolumeName)) {
+            continue
+        }
+        $normalizedShadowVolume = ([string]$shadowVolumeName).TrimEnd("\") + "\"
+        if ($candidates -contains $normalizedShadowVolume.ToUpperInvariant()) {
+            return $true
+        }
+        if ($candidates -contains $normalizedShadowVolume.TrimEnd("\").ToUpperInvariant()) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function New-BRAVOVSSDiskshadowSnapshotSet {
+    param([Parameter(Mandatory = $true)][string[]]$VolumeRoots)
+
+    $diskshadowPath = Join-Path $env:SystemRoot "System32\diskshadow.exe"
+    if (-not (Test-Path -LiteralPath $diskshadowPath -PathType Leaf)) {
+        throw (
+            "Джерела backup розташовані на кількох томах ($($VolumeRoots -join ', ')), " +
+            "а атомарний багатотомний VSS Snapshot Set потребує diskshadow.exe, якого немає в системі. " +
+            "Окремі знімки кожного тому дали б різні моменти часу для однієї generation, тому архівацію зупинено."
+        )
+    }
+
+    $scriptPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_{0}.txt" -f [guid]::NewGuid().ToString("N"))
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add("SET CONTEXT PERSISTENT NOWRITERS")
+    $lines.Add("SET VERBOSE ON")
+    $lines.Add("BEGIN BACKUP")
+    $index = 0
+    foreach ($volumeRoot in @($VolumeRoots)) {
+        $index++
+        $volumeName = ([string]$volumeRoot).TrimEnd("\")
+        $lines.Add(("ADD VOLUME {0} ALIAS BRAVOVolume{1}" -f $volumeName, $index))
+    }
+    $lines.Add("CREATE")
+    $lines.Add("END BACKUP")
+
+    $volumeShadows = $null
     try {
-        $deleteResult = $Snapshot.WmiObject.Delete()
+        [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), (New-Object Text.UTF8Encoding($false)))
+
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $diskshadowPath
+        $processInfo.Arguments = "/s `"$scriptPath`""
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
+        [void]$process.Start()
+        if (-not $process.WaitForExit(300000)) {
+            try { $process.Kill() } catch {
+                # Основна помилка timeout важливіша: процес міг завершитись між WaitForExit і Kill.
+            }
+            throw "diskshadow.exe не завершився протягом 300 секунд"
+        }
+        $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $outputCapture
+        if ($process.ExitCode -ne 0) {
+            throw "diskshadow.exe повернув код $($process.ExitCode): $($capturedOutput.StandardError) $($capturedOutput.StandardOutput)"
+        }
+
+        $snapshotSetMatch = [regex]::Match(
+            ($capturedOutput.StandardOutput + "`n" + $capturedOutput.StandardError),
+            '(?im)Shadow copy set ID:\s*(?<SetId>\{[0-9a-fA-F-]+\})'
+        )
+        if (-not $snapshotSetMatch.Success) {
+            throw "diskshadow.exe не повідомив Shadow copy set ID"
+        }
+        $snapshotSetId = $snapshotSetMatch.Groups["SetId"].Value.ToUpperInvariant()
+        $escapedSetId = $snapshotSetId.Replace("'", "''")
+        $wmiShadows = @(
+            Get-WmiObject `
+                -Namespace "root\cimv2" `
+                -Class "Win32_ShadowCopy" `
+                -Filter ("SetID='{0}'" -f $escapedSetId) `
+                -ErrorAction Stop
+        )
+        if ($wmiShadows.Count -ne $VolumeRoots.Count) {
+            throw "VSS Snapshot Set $snapshotSetId містить $($wmiShadows.Count) shadow copies замість $($VolumeRoots.Count)"
+        }
+
+        $volumeShadows = New-Object System.Collections.ArrayList
+        foreach ($volumeRoot in @($VolumeRoots)) {
+            $shadow = @(
+                $wmiShadows | Where-Object {
+                    Test-BRAVOVSSShadowMatchesVolume -Shadow $_ -VolumeRoot $volumeRoot
+                }
+            ) | Select-Object -First 1
+            if ($null -eq $shadow) {
+                throw "у Snapshot Set $snapshotSetId не знайдено shadow copy для тому $volumeRoot"
+            }
+            $snapshotLinkPath = New-BRAVOVSSSnapshotLink -DeviceObject ([string]$shadow.DeviceObject)
+            [void]$volumeShadows.Add([pscustomobject]@{
+                VolumeRoot = $volumeRoot
+                OriginalVolume = $volumeRoot
+                ShadowId = [string]$shadow.ID
+                SnapshotId = [string]$shadow.ID
+                SetId = [string]$shadow.SetID
+                SnapshotSetId = [string]$shadow.SetID
+                DeviceObject = [string]$shadow.DeviceObject
+                SnapshotDeviceObject = [string]$shadow.DeviceObject
+                LinkPath = $snapshotLinkPath
+                WmiObject = $shadow
+            })
+        }
+        return [pscustomobject]@{
+            SnapshotSetId = $snapshotSetId
+            Volumes = @($volumeShadows)
+            UniqueVolumeCount = $VolumeRoots.Count
+            CreatedAt = Get-Date
+        }
+    } catch {
+        foreach ($createdShadow in @($volumeShadows)) {
+            try {
+                Remove-BRAVOVSSSnapshotLink -LinkPath $createdShadow.LinkPath
+            } catch {
+                # Best-effort cleanup після частково створених link-ів; первинна помилка лишається нижче.
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($snapshotSetId)) {
+            try {
+                $escapedSetId = $snapshotSetId.Replace("'", "''")
+                foreach ($orphanedShadow in @(
+                        Get-WmiObject `
+                            -Namespace "root\cimv2" `
+                            -Class "Win32_ShadowCopy" `
+                            -Filter ("SetID='{0}'" -f $escapedSetId) `
+                            -ErrorAction SilentlyContinue
+                    )) {
+                    try { [void]$orphanedShadow.Delete() } catch {
+                        # Best-effort cleanup після невдалого створення; первинна помилка лишається нижче.
+                    }
+                }
+            } catch {
+                # Не перекриваємо первинну помилку diskshadow/WMI вторинною помилкою cleanup.
+            }
+        }
+        throw
+    } finally {
+        if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
+            Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function New-BRAVOVSSSnapshotSet {
+    # ОДИН snapshot set на всю generation: MODEL, BLOG і BRAVOEXCH мають
+    # відповідати одному point-in-time. Раніше знімок створювався всередині
+    # циклу перед кожним компонентом, тому MODEL, BLOG і BRAVOEXCH одного
+    # "backup" фіксували стан системи з різницею в хвилини — поки BRAVO
+    # працює, це три різні бази, а не одна узгоджена копія.
+    #
+    # Win32_ShadowCopy.Create вміє лише один том за виклик і не має способу
+    # додати том до вже початого набору — атомарний багатотомний Snapshot Set
+    # доступний тільки через VSS COM API або diskshadow.exe. Тому:
+    #   * один том    -> один Create, справжній єдиний point-in-time;
+    #   * кілька томів -> diskshadow.exe, якщо він є в системі;
+    #   * кілька томів без diskshadow.exe -> керована помилка.
+    # Тихо створити кілька незалежних знімків і назвати це "набором" не
+    # можна: це та сама розсинхронізація, заради усунення якої все й робиться.
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$SourcePaths,
+        # Ін'єкція для self-тестів: дозволяє перевірити дедуплікацію,
+        # мапування шляхів і cleanup без створення реальних shadow copies.
+        [scriptblock]$VolumeShadowFactory
+    )
+
+    $uniqueVolumes = @(Get-BRAVOUniqueVSSVolumes -SourcePaths $SourcePaths)
+    if ($uniqueVolumes.Count -eq 0) {
+        throw "Для VSS-набору не визначено жодного тому: перевірте шляхи джерел"
+    }
+
+    Write-BRAVOLog -Component 'VSS' -Message "Створення VSS Snapshot Set для томів: $($uniqueVolumes -join ', ')" -Level "INFO"
+    if ($uniqueVolumes.Count -gt 1 -and $null -eq $VolumeShadowFactory) {
+        $snapshotSet = New-BRAVOVSSDiskshadowSnapshotSet -VolumeRoots $uniqueVolumes
+        Write-BRAVOLog -Component 'VSS' -Message "VSS Snapshot Set створено: $($snapshotSet.SnapshotSetId) (томів: $($uniqueVolumes.Count))" -Level "SUCCESS"
+        return $snapshotSet
+    }
+
+    $volumeShadows = New-Object System.Collections.ArrayList
+    try {
+        foreach ($volumeRoot in $uniqueVolumes) {
+            $volumeShadow = if ($null -ne $VolumeShadowFactory) {
+                & $VolumeShadowFactory $volumeRoot
+            } else {
+                New-BRAVOVSSVolumeShadow -VolumeRoot $volumeRoot
+            }
+            if ($null -eq $volumeShadow) {
+                throw "не вдалося створити знімок тому $volumeRoot"
+            }
+            [void]$volumeShadows.Add($volumeShadow)
+        }
+
+        # SetID від VSS, коли він єдиний для всіх томів; інакше — власний
+        # кореляційний ідентифікатор, щоб журнал і manifest могли пов'язати
+        # знімки однієї generation між собою.
+        $distinctSetIds = @(
+            $volumeShadows |
+                ForEach-Object { [string]$_.SetId } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Unique
+        )
+        $snapshotSetId = if ($distinctSetIds.Count -eq 1) {
+            $distinctSetIds[0]
+        } else {
+            "{" + [guid]::NewGuid().ToString().ToUpperInvariant() + "}"
+        }
+
+        $snapshotSet = [pscustomobject]@{
+            SnapshotSetId = $snapshotSetId
+            Volumes = @($volumeShadows)
+            UniqueVolumeCount = $uniqueVolumes.Count
+            CreatedAt = Get-Date
+        }
+        Write-BRAVOLog -Component 'VSS' -Message "VSS Snapshot Set створено: $snapshotSetId (томів: $($uniqueVolumes.Count))" -Level "SUCCESS"
+        return $snapshotSet
+    } catch {
+        foreach ($createdShadow in @($volumeShadows)) {
+            try {
+                [void](Remove-BRAVOVSSVolumeShadow -VolumeShadow $createdShadow)
+            } catch {
+                # Основна помилка створення набору важливіша за помилку cleanup.
+            }
+        }
+        throw
+    }
+}
+
+function Resolve-BRAVOSnapshotSourcePath {
+    # Оригінальний шлях -> шлях усередині знімка ТОГО САМОГО набору.
+    # Якщо тому джерела в наборі немає, це помилка: архівувати "живий" шлях
+    # замість знімка означало б мовчки повернути неузгоджену копію.
+    param(
+        [Parameter(Mandatory = $true)][object]$SnapshotSet,
+        [Parameter(Mandatory = $true)][string]$OriginalPath
+    )
+
+    $volumeRoot = Get-BRAVOVSSVolumeRoot -Path $OriginalPath
+    $volumeShadow = @(
+        $SnapshotSet.Volumes | Where-Object {
+            [string]::Equals([string]$_.VolumeRoot, $volumeRoot, [StringComparison]::OrdinalIgnoreCase)
+        }
+    ) | Select-Object -First 1
+    if ($null -eq $volumeShadow) {
+        throw "У VSS-наборі $($SnapshotSet.SnapshotSetId) немає знімка тому $volumeRoot для джерела: $OriginalPath"
+    }
+
+    return Get-BRAVOVSSSnapshotSourcePath `
+        -SourcePath $OriginalPath `
+        -DeviceObject ([string]$volumeShadow.LinkPath)
+}
+
+function Remove-BRAVOVSSVolumeShadow {
+    param([Parameter(Mandatory = $true)][object]$VolumeShadow)
+
+    try {
+        Remove-BRAVOVSSSnapshotLink -LinkPath $VolumeShadow.LinkPath
+    } catch {
+        Write-BRAVOLog -Component 'VSS' -Message "Не вдалося прибрати символiчне посилання на VSS-знiмок $($VolumeShadow.ShadowId): $($_.Exception.Message)" -Level "WARNING"
+    }
+
+    if ($null -eq $VolumeShadow.WmiObject) {
+        return $true
+    }
+    try {
+        $deleteResult = $VolumeShadow.WmiObject.Delete()
         if ($null -ne $deleteResult -and [int]$deleteResult.ReturnValue -ne 0) {
             $returnCode = [int]$deleteResult.ReturnValue
             $description = Get-BRAVOVSSReturnCodeDescription -ReturnCode $returnCode
-            Write-BRAVOLog -Component 'VSS' -Message "Не вдалося видалити VSS-знімок $($Snapshot.Id): код $returnCode ($description)" -Level "ERROR"
+            Write-BRAVOLog -Component 'VSS' -Message "Не вдалося видалити VSS-знімок $($VolumeShadow.ShadowId): код $returnCode ($description)" -Level "ERROR"
             return $false
         }
-        Write-BRAVOLog -Component 'VSS' -Message "VSS-знімок видалено: $($Snapshot.Id)" -Level "SUCCESS"
         return $true
     } catch {
-        Write-BRAVOLog -Component 'VSS' -Message "Не вдалося видалити VSS-знімок $($Snapshot.Id): $($_.Exception.Message)" -Level "ERROR"
+        Write-BRAVOLog -Component 'VSS' -Message "Не вдалося видалити VSS-знімок $($VolumeShadow.ShadowId): $($_.Exception.Message)" -Level "ERROR"
         return $false
+    }
+}
+
+function Remove-BRAVOVSSSnapshotSet {
+    # Викликається ЛИШЕ у finally після завершення всіх компонентів:
+    # видалити знімок після MODEL означало б архівувати BLOG уже з іншого
+    # стану системи.
+    param([Parameter(Mandatory = $true)][object]$SnapshotSet)
+
+    $allRemoved = $true
+    foreach ($volumeShadow in @($SnapshotSet.Volumes)) {
+        if (-not (Remove-BRAVOVSSVolumeShadow -VolumeShadow $volumeShadow)) {
+            $allRemoved = $false
+        }
+    }
+    if ($allRemoved) {
+        Write-BRAVOLog -Component 'VSS' -Message "VSS Snapshot Set видалено: $($SnapshotSet.SnapshotSetId)" -Level "SUCCESS"
+    }
+    return $allRemoved
+}
+
+function Get-BRAVOVSSOwnershipStatePath {
+    $programDataRoot = [Environment]::GetFolderPath('CommonApplicationData')
+    if ([string]::IsNullOrWhiteSpace($programDataRoot)) {
+        throw 'CommonApplicationData path is unavailable for VSS ownership state'
+    }
+    return Join-Path $programDataRoot 'BRAVO\State\BRAVO_VSS_OWNERSHIP.json'
+}
+
+function Save-BRAVOVSSOwnershipState {
+    param(
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        [Parameter(Mandatory = $true)][object]$SnapshotSet,
+        [Parameter(Mandatory = $true)][string]$GenerationId
+    )
+
+    $shadowIds = @(
+        $SnapshotSet.Volumes |
+            ForEach-Object { [string]$_.ShadowId } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            Select-Object -Unique
+    )
+    if ($shadowIds.Count -eq 0) {
+        throw 'VSS Snapshot Set does not expose any ShadowId for ownership tracking'
+    }
+
+    $stateDirectory = Split-Path -Path $StatePath -Parent
+    if (-not [IO.Directory]::Exists($stateDirectory)) {
+        [void][IO.Directory]::CreateDirectory($stateDirectory)
+    }
+    $state = [ordered]@{
+        schemaVersion = 1
+        owner = 'BRAVO_ARCHIV'
+        hostname = [Environment]::MachineName
+        pid = $PID
+        processStartTime = $(try { (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToString('o') } catch { $null })
+        generationId = $GenerationId
+        snapshotSetId = [string]$SnapshotSet.SnapshotSetId
+        createdAt = (Get-Date).ToString('o')
+        shadowIds = $shadowIds
+        linkPaths = @(
+            $SnapshotSet.Volumes |
+                ForEach-Object { [string]$_.LinkPath } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                Select-Object -Unique
+        )
+    }
+    $temporaryStatePath = Join-Path $stateDirectory ('.BRAVO_VSS_OWNERSHIP_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    try {
+        $json = $state | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($temporaryStatePath, $json, (New-Object Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($StatePath)) {
+            [IO.File]::Replace($temporaryStatePath, $StatePath, $null)
+        } else {
+            [IO.File]::Move($temporaryStatePath, $StatePath)
+        }
+    } finally {
+        if ([IO.File]::Exists($temporaryStatePath)) {
+            [IO.File]::Delete($temporaryStatePath)
+        }
+    }
+    return $state
+}
+
+function Remove-BRAVOOwnedOrphanVSSResources {
+    param(
+        [Parameter(Mandatory = $true)][string]$StatePath,
+        # Injectable exact-ID deleter for self-test. It must return $true when
+        # the shadow is absent or was deleted successfully.
+        [scriptblock]$DeleteShadowById,
+        [scriptblock]$RemoveLink
+    )
+
+    if (-not [IO.File]::Exists($StatePath)) {
+        return [pscustomobject]@{ Success = $true; Found = $false; Deleted = 0; Error = $null }
+    }
+    try {
+        $state = Get-Content -LiteralPath $StatePath -Raw -Encoding UTF8 -ErrorAction Stop |
+            ConvertFrom-Json -ErrorAction Stop
+        if ([int]$state.schemaVersion -ne 1 -or [string]$state.owner -ne 'BRAVO_ARCHIV') {
+            throw 'VSS ownership state has an unsupported schema or owner'
+        }
+        if (-not [string]::Equals([string]$state.hostname, [Environment]::MachineName, [StringComparison]::OrdinalIgnoreCase)) {
+            throw "VSS ownership state belongs to another host: $($state.hostname)"
+        }
+
+        $shadowIds = @($state.shadowIds)
+        if ($shadowIds.Count -eq 0) {
+            throw 'VSS ownership state does not contain Shadow IDs'
+        }
+        $deletedCount = 0
+        foreach ($rawShadowId in $shadowIds) {
+            $shadowId = [string]$rawShadowId
+            [guid]$parsedShadowId = [guid]::Empty
+            if (-not [guid]::TryParse($shadowId.Trim('{', '}'), [ref]$parsedShadowId)) {
+                throw "invalid BRAVO-owned Shadow ID in state: $shadowId"
+            }
+            $deleted = if ($null -ne $DeleteShadowById) {
+                [bool](& $DeleteShadowById $shadowId)
+            } else {
+                $escapedShadowId = $shadowId.Replace("'", "''")
+                $shadow = Get-WmiObject `
+                    -Namespace 'root\cimv2' `
+                    -Class 'Win32_ShadowCopy' `
+                    -Filter ("ID='{0}'" -f $escapedShadowId) `
+                    -ErrorAction Stop |
+                    Select-Object -First 1
+                if ($null -eq $shadow) {
+                    $true
+                } else {
+                    $deleteResult = $shadow.Delete()
+                    $null -eq $deleteResult -or [int]$deleteResult.ReturnValue -eq 0
+                }
+            }
+            if (-not $deleted) {
+                throw "failed to delete BRAVO-owned VSS shadow $shadowId"
+            }
+            $deletedCount++
+        }
+
+        $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
+        foreach ($rawLinkPath in @($state.linkPaths)) {
+            $linkPath = [string]$rawLinkPath
+            if ([string]::IsNullOrWhiteSpace($linkPath)) { continue }
+            $fullLinkPath = [IO.Path]::GetFullPath($linkPath)
+            if (-not $fullLinkPath.StartsWith($temporaryRoot, [StringComparison]::OrdinalIgnoreCase) -or
+                -not ([IO.Path]::GetFileName($fullLinkPath)).StartsWith('BRAVO_VSS_', [StringComparison]::OrdinalIgnoreCase)) {
+                throw "unsafe VSS link path in ownership state: $linkPath"
+            }
+            if ($null -ne $RemoveLink) {
+                & $RemoveLink $fullLinkPath
+            } else {
+                Remove-BRAVOVSSSnapshotLink -LinkPath $fullLinkPath
+            }
+        }
+
+        [IO.File]::Delete($StatePath)
+        return [pscustomobject]@{ Success = $true; Found = $true; Deleted = $deletedCount; Error = $null }
+    } catch {
+        # Retain the state file. A later run or an operator can retry exact-ID
+        # cleanup; deleting the record would lose the ownership boundary.
+        return [pscustomobject]@{ Success = $false; Found = $true; Deleted = 0; Error = $_.Exception.Message }
+    }
+}
+
+function New-BRAVOBackupGenerationId {
+    # Один ідентифікатор generation на весь запуск: усі компоненти однієї
+    # копії мають нести його в імені, щоб MODEL, BLOG і BRAVOEXCH одного
+    # backup можна було впізнати як комплект, а не збирати за часом файлів.
+    param([datetime]$Timestamp = (Get-Date))
+
+    return $Timestamp.ToString("yyyyMMdd_HHmmss")
+}
+
+function Get-BRAVOCollisionSafeGenerationId {
+    param(
+        [Parameter(Mandatory = $true)][string]$BaseGenerationId,
+        [Parameter(Mandatory = $true)][object[]]$Archives,
+        [Parameter(Mandatory = $true)][string]$ArchivePrefix,
+        [string]$HashExtension = ".sha512",
+        [int]$MaxAttempts = 1000
+    )
+
+    for ($suffix = 0; $suffix -le $MaxAttempts; $suffix++) {
+        $candidateGenerationId = if ($suffix -eq 0) {
+            $BaseGenerationId
+        } else {
+            "{0}_{1}" -f $BaseGenerationId, $suffix
+        }
+        $hasCollision = $false
+        foreach ($archive in @($Archives)) {
+            $candidateName = $archive.NameTemplate -f $ArchivePrefix, $candidateGenerationId
+            $candidatePath = Join-Path ([string]$archive.Destination) $candidateName
+            if ((Test-Path -LiteralPath $candidatePath) -or
+                (Test-Path -LiteralPath ($candidatePath + $HashExtension))) {
+                $hasCollision = $true
+                break
+            }
+        }
+        if (-not $hasCollision) {
+            return $candidateGenerationId
+        }
+    }
+    throw "Не вдалося підібрати вільний GenerationId для $BaseGenerationId"
+}
+
+function Get-BRAVOCollisionSafeArchivePath {
+    # Наявний валідний backup недоторканний. Навіть із секундами в імені
+    # збіг можливий (повторний запуск у ту саму секунду, ручне копіювання),
+    # тому фінальне ім'я підбирається так, щоб не існувало ані .mdz, ані
+    # відповідного .sha512: hash попередньої generation теж є частиною
+    # набору, який не можна перезаписати.
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$FileName,
+        [string]$HashExtension = ".sha512",
+        [int]$MaxAttempts = 1000
+    )
+
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($FileName)
+    $extension = [IO.Path]::GetExtension($FileName)
+    for ($suffix = 0; $suffix -le $MaxAttempts; $suffix++) {
+        $candidateName = if ($suffix -eq 0) {
+            $FileName
+        } else {
+            "${baseName}_${suffix}${extension}"
+        }
+        $candidatePath = Join-Path $Directory $candidateName
+        if (-not (Test-Path -LiteralPath $candidatePath) -and
+            -not (Test-Path -LiteralPath ($candidatePath + $HashExtension))) {
+            return $candidatePath
+        }
+    }
+    throw "Не вдалося підібрати вільне ім'я архіву для $FileName у $Directory"
+}
+
+function New-BRAVOTemporaryArchivePath {
+    # Тимчасовий артефакт у підкаталозі .work поруч із призначенням: той
+    # самий том, тому публікація — це перейменування, а не копіювання через
+    # мережу чи диск. GUID в імені гарантує, що паралельний або перерваний
+    # запуск не зустріне чужий .partial.
+    param(
+        [Parameter(Mandatory = $true)][string]$Directory,
+        [Parameter(Mandatory = $true)][string]$FileName
+    )
+
+    $workDirectory = Join-Path $Directory ".work"
+    if (-not (Test-Path -LiteralPath $workDirectory -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $workDirectory -Force -ErrorAction Stop)
+    }
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($FileName)
+    $extension = [IO.Path]::GetExtension($FileName)
+    $temporaryName = "{0}.{1}.partial{2}" -f $baseName, [guid]::NewGuid().ToString("N"), $extension
+    return (Join-Path $workDirectory $temporaryName)
+}
+
+function Remove-BRAVOTemporaryArchiveArtifacts {
+    # Прибирає ЛИШЕ артефакти поточної temporary generation. Попередні
+    # валідні backup недоторканні за будь-якої помилки.
+    param([string]$TemporaryArchivePath)
+
+    if ([string]::IsNullOrWhiteSpace($TemporaryArchivePath)) {
+        return
+    }
+    foreach ($artifactPath in @($TemporaryArchivePath, ($TemporaryArchivePath + $hashFileExtension))) {
+        if (Test-Path -LiteralPath $artifactPath -PathType Leaf) {
+            try {
+                Remove-Item -LiteralPath $artifactPath -Force -ErrorAction Stop
+            } catch {
+                Write-BRAVOLog -Component 'ARCHIVE' -Message "Не вдалося прибрати тимчасовий артефакт ${artifactPath}: $($_.Exception.Message)" -Level "WARNING"
+            }
+        }
+    }
+    $workDirectory = Split-Path -Path $TemporaryArchivePath -Parent
+    if ((Split-Path -Path $workDirectory -Leaf) -eq ".work" -and
+        (Test-Path -LiteralPath $workDirectory -PathType Container) -and
+        @(Get-ChildItem -LiteralPath $workDirectory -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+        try {
+            Remove-Item -LiteralPath $workDirectory -Force -ErrorAction Stop
+        } catch {
+            # Порожній .work нікому не заважає — це не привід для помилки.
+        }
+    }
+}
+
+function New-BRAVOArchiveCreationResult {
+    # Створення й перевірка цілісності — ДВІ різні події, а не одна.
+    # Раніше New-Archive повертав один bool на обидві, тому "архів створено,
+    # але 7z t не пройшов" було неможливо відрізнити від "7-Zip не зміг
+    # створити архів" — а це різні причини й різна реакція оператора.
+    param(
+        [bool]$CreateSuccess = $false,
+        [bool]$IntegritySuccess = $false,
+        [string]$ArchivePath,
+        [Nullable[int]]$ExitCode,
+        [string]$ErrorStage,
+        [string]$Error
+    )
+
+    [pscustomobject]@{
+        CreateSuccess = $CreateSuccess
+        IntegritySuccess = $IntegritySuccess
+        ArchivePath = $ArchivePath
+        ExitCode = $ExitCode
+        ErrorStage = $ErrorStage
+        Error = $Error
     }
 }
 
@@ -1453,37 +2424,50 @@ function New-Archive {
         [string]$ArchivePath,
         [string]$ArchiveName,
         [string]$ArcPath,
-        [string]$ArcParams
+        [string]$ArcParams,
+        # Точний шлях створюваного файла. Використовується atomic-конвеєром:
+        # архів спершу створюється як тимчасовий артефакт у .work і лише
+        # після всіх перевірок публікується під фінальним іменем.
+        [string]$FullArchivePath
     )
-    
-    Write-BRAVOLog -Component 'ARCHIVE' -Message "Створення архiву: $ArchiveName"
-    
-    $archiveDir = Split-Path $ArchivePath -Parent
+
+    # Причина відмови для консольного РЕЗУЛЬТАТ (Причина:/Інструмент:/Код
+    # інструменту:) — деталі передаються через script-scope, бо той самий
+    # механізм уже читають BAZA_APP.Sync-Folders та інші виклики.
+    $script:lastArchiveToolFailure = $null
+
+    $fullArchivePath = if (-not [string]::IsNullOrWhiteSpace($FullArchivePath)) {
+        $FullArchivePath
+    } else {
+        Join-Path $ArchivePath $ArchiveName
+    }
+    $displayName = [IO.Path]::GetFileName($fullArchivePath)
+    Write-BRAVOLog -Component 'ARCHIVE' -Message "Створення архiву: $displayName"
+
+    $archiveDir = Split-Path $fullArchivePath -Parent
     if (-not (Test-Path $archiveDir)) {
         try {
             New-Item -ItemType Directory -Path $archiveDir -Force | Out-Null
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Каталог створено: $archiveDir" -Level "SUCCESS"
         } catch {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка при створеннi каталогу: $($_.Exception.Message)" -Level "ERROR"
-            return $false
+            return (New-BRAVOArchiveCreationResult -ArchivePath $fullArchivePath -ErrorStage 'CREATE' -Error $_.Exception.Message)
         }
     }
-    
+
     if (-not (Test-Path $SourcePath)) {
         Write-BRAVOLog -Component 'ARCHIVE' -Message "Джерело не знайдено: $SourcePath" -Level "ERROR"
-        return $false
+        return (New-BRAVOArchiveCreationResult -ArchivePath $fullArchivePath -ErrorStage 'CREATE' -Error "джерело не знайдено: $SourcePath")
     }
-    
-    $fullArchivePath = Join-Path $ArchivePath $ArchiveName
-    
+
     try {
         if ([string]::IsNullOrWhiteSpace($script:archivePassword)) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Пароль архiву не завантажено з Windows Credential Manager" -Level "ERROR"
-            return $false
+            return (New-BRAVOArchiveCreationResult -ArchivePath $fullArchivePath -ErrorStage 'CREATE' -Error "пароль архіву не завантажено")
         }
         if ($script:archivePassword.IndexOfAny([char[]]"`r`n") -ge 0) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Пароль архiву не може мiстити символи нового рядка" -Level "ERROR"
-            return $false
+            return (New-BRAVOArchiveCreationResult -ArchivePath $fullArchivePath -ErrorStage 'CREATE' -Error "пароль архіву містить символ нового рядка")
         }
 
         $effectiveArcParams = $ArcParams
@@ -1496,11 +2480,12 @@ function New-Archive {
             43200
         }
 
-        $staleHashPath = "$fullArchivePath$hashFileExtension"
-        if (Test-Path -LiteralPath $staleHashPath -PathType Leaf) {
-            Remove-Item -LiteralPath $staleHashPath -Force -ErrorAction Stop
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "Видалено попереднiй hash-файл перед повторним створенням архiву: $staleHashPath" -Level "WARNING"
-        }
+        # Видалення "застарілого" hash-файла перед створенням архіву тут
+        # більше немає й бути не може: до цієї зміни повторний запуск міг
+        # прибрати .sha512 попередньої валідної generation, а потім впасти —
+        # і залишити backup без підтвердження цілісності. Тепер архів
+        # створюється як тимчасовий артефакт і публікується під іменем,
+        # якого ще не існує, тому чіпати чужі hash-файли не потрібно взагалі.
 
         # -p без значення вмикає шифрування і читає пароль зі stdin.
         $arguments = "$effectiveArcParams -p `"$fullArchivePath`" `"$SourcePath`""
@@ -1574,14 +2559,19 @@ function New-Archive {
         } | Select-Object -Last 1)
 
         if ($archiveTimedOut) {
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiвацiю перервано: перевищено таймаут $archiveTimeoutSeconds сек.: $ArchiveName" -Level "ERROR"
+            Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiвацiю перервано: перевищено таймаут $archiveTimeoutSeconds сек.: $displayName" -Level "ERROR"
             if (Test-Path -LiteralPath $fullArchivePath -PathType Leaf) {
                 Remove-Item -LiteralPath $fullArchivePath -Force -ErrorAction SilentlyContinue
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Неповний архiв видалено: $fullArchivePath" -Level "WARNING"
             }
-            return $false
+            $script:lastArchiveToolFailure = [pscustomobject]@{
+                Tool = '7-Zip'
+                ToolExitCodeText = $null
+                ReasonText = '7-Zip: перевищено час очікування'
+            }
+            return (New-BRAVOArchiveCreationResult -ArchivePath $fullArchivePath -ErrorStage 'CREATE' -Error "перевищено таймаут $archiveTimeoutSeconds сек.")
         }
-        
+
         if ($process.ExitCode -eq 0) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено; виконується контроль цiлiсностi: $fullArchivePath" -Level "INFO"
             if (Test-SevenZipArchiveIntegrity `
@@ -1591,13 +2581,31 @@ function New-Archive {
                 -TimeoutSeconds $integrityTestTimeoutSeconds `
                 -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level }) {
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено та перевiрено: $fullArchivePath" -Level "SUCCESS"
-                return $true
+                return (New-BRAVOArchiveCreationResult `
+                    -CreateSuccess $true `
+                    -IntegritySuccess $true `
+                    -ArchivePath $fullArchivePath `
+                    -ExitCode 0)
             }
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "Пошкоджений або неперевiрений архiв залишено для дiагностики; hash i передача не виконуватимуться: $fullArchivePath" -Level "ERROR"
-            return $false
+            Write-BRAVOLog -Component 'ARCHIVE' -Message "Пошкоджений або неперевiрений архiв не буде опублiковано як backup: $fullArchivePath" -Level "ERROR"
+            $script:lastArchiveToolFailure = [pscustomobject]@{
+                Tool = '7-Zip'
+                ToolExitCodeText = $null
+                ReasonText = "7-Zip: архів створено, але не пройшов перевірку цілісності"
+            }
+            # CreateSuccess=true при IntegritySuccess=false — не суперечність,
+            # а найважливіша для діагностики пара станів: 7-Zip завершився
+            # кодом 0, але вміст архіву не читається.
+            return (New-BRAVOArchiveCreationResult `
+                -CreateSuccess $true `
+                -IntegritySuccess $false `
+                -ArchivePath $fullArchivePath `
+                -ExitCode 0 `
+                -ErrorStage 'INTEGRITY' `
+                -Error "архів не пройшов перевірку 7z t")
         } else {
-            $exitDescription = Get-BRAVOSevenZipExitCodeDescription -ExitCode $process.ExitCode
-            Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $exitDescription): $fullArchivePath" -Level "ERROR"
+            $toolExitInfo = Get-BRAVOToolExitCodeDescription -Tool '7-Zip' -ExitCode $process.ExitCode
+            Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї 7-Zip (код: $($process.ExitCode) — $($toolExitInfo.OperatorDescription)): $fullArchivePath" -Level "ERROR"
             Write-SevenZipFailureDiagnostics -Operation "Дiагностика 7-Zip create" -StandardOutput $standardOutput -StandardError $errorOutput
             if ($showSevenZipProgress) {
                 if (-not [string]::IsNullOrWhiteSpace($lastSevenZipOutput)) {
@@ -1609,12 +2617,302 @@ function New-Archive {
             } else {
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Деталi: $errorOutput" -Level "DEBUG"
             }
-            return $false
+            $script:lastArchiveToolFailure = [pscustomobject]@{
+                Tool = '7-Zip'
+                ToolExitCodeText = "{0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
+                ReasonText = "7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription
+            }
+            return (New-BRAVOArchiveCreationResult `
+                -ArchivePath $fullArchivePath `
+                -ExitCode ([int]$process.ExitCode) `
+                -ErrorStage 'CREATE' `
+                -Error ("7-Zip код {0} — {1}" -f $toolExitInfo.ExitCode, $toolExitInfo.OperatorDescription))
         }
     } catch {
         Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка архiвацiї: $($_.Exception.Message)" -Level "ERROR"
-        return $false
+        return (New-BRAVOArchiveCreationResult -ArchivePath $fullArchivePath -ErrorStage 'CREATE' -Error $_.Exception.Message)
     }
+}
+
+function Invoke-BRAVOComponentBackup {
+    # Atomic-конвеєр однієї копії компонента:
+    #
+    #   тимчасовий архів -> 7-Zip код 0 -> 7z t -> SHA512 -> звірка SHA512
+    #   -> публікація .mdz -> публікація .sha512
+    #
+    # Фінальний артефакт з'являється в каталозі backup ЛИШЕ після того, як
+    # усі перевірки пройдені. Доти будь-яка відмова торкається виключно
+    # тимчасових файлів поточної generation: попередній валідний backup і
+    # його hash лишаються байт-у-байт незмінними.
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][string]$GenerationId,
+        [string]$OriginalSourcePath,
+        [Parameter(Mandatory = $true)][string]$SourcePath,
+        [Parameter(Mandatory = $true)][string]$DestinationDirectory,
+        [Parameter(Mandatory = $true)][string]$ArchiveName,
+        [Parameter(Mandatory = $true)][string]$ArcPath,
+        [string]$ArcParams
+    )
+
+    $result = [pscustomobject]@{
+        Component = $Component
+        GenerationId = $GenerationId
+        OriginalSourcePath = $(if ([string]::IsNullOrWhiteSpace($OriginalSourcePath)) { $SourcePath } else { $OriginalSourcePath })
+        SnapshotSourcePath = $SourcePath
+        TemporaryArchivePath = $null
+        ArchivePath = Join-Path $DestinationDirectory $ArchiveName
+        HashPath = (Join-Path $DestinationDirectory $ArchiveName) + $hashFileExtension
+        CreateSuccess = $false
+        IntegritySuccess = $false
+        HashSuccess = $false
+        ArchiveSize = $null
+        SHA512 = $null
+        ErrorStage = $null
+        Error = $null
+    }
+
+    if (-not (Test-Path -LiteralPath $DestinationDirectory -PathType Container)) {
+        try {
+            [void](New-Item -ItemType Directory -Path $DestinationDirectory -Force -ErrorAction Stop)
+        } catch {
+            $result.ErrorStage = 'CREATE'
+            $result.Error = "не вдалося створити каталог призначення ${DestinationDirectory}: $($_.Exception.Message)"
+            Write-BRAVOLog -Component 'ARCHIVE' -Message $result.Error -Level "ERROR"
+            return $result
+        }
+    }
+
+    try {
+        $result.TemporaryArchivePath = New-BRAVOTemporaryArchivePath `
+            -Directory $DestinationDirectory `
+            -FileName $ArchiveName
+    } catch {
+        $result.ErrorStage = 'CREATE'
+        $result.Error = "не вдалося підготувати тимчасовий артефакт: $($_.Exception.Message)"
+        Write-BRAVOLog -Component 'ARCHIVE' -Message $result.Error -Level "ERROR"
+        return $result
+    }
+
+    try {
+        if ((Test-Path -LiteralPath $result.ArchivePath) -or
+            (Test-Path -LiteralPath $result.HashPath)) {
+            $result.ErrorStage = 'PUBLISH'
+            $result.Error = "фінальний backup уже існує: $($result.ArchivePath)"
+            Write-BRAVOLog -Component 'ARCHIVE' -Message $result.Error -Level "ERROR"
+            Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+            return $result
+        }
+
+        $creationResult = New-Archive `
+            -SourcePath $SourcePath `
+            -FullArchivePath $result.TemporaryArchivePath `
+            -ArcPath $ArcPath `
+            -ArcParams $ArcParams
+        $result.CreateSuccess = [bool]$creationResult.CreateSuccess
+        $result.IntegritySuccess = [bool]$creationResult.IntegritySuccess
+        if (-not $result.CreateSuccess -or -not $result.IntegritySuccess) {
+            $result.ErrorStage = ([string]$creationResult.ErrorStage).ToUpperInvariant()
+            $result.Error = [string]$creationResult.Error
+            Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+            return $result
+        }
+
+        # dev.19: заголовок секції HASH — САМЕ ТУТ, безпосередньо перед
+        # першою дією хешування (New-SHA512Hash нижче), а не в Main ПІСЛЯ
+        # завершення всього Invoke-BRAVOComponentBackup (де раніше стояв
+        # Write-Log "=== СТВОРЕННЯ ХЕШУ ===" — реальний DEV-LIMS лог
+        # показував заголовок ПІСЛЯ вже виконаної роботи). Той самий
+        # Write-Log (не окрема реалізація), тому Resolve-BRAVOLogComponentFromHeader
+        # так само переводить $script:BRAVOLogComponent на HASH. Друкується
+        # незалежно від подальшого успіху/невдачі хешування — заголовок
+        # описує ПОЧАТОК цієї роботи, не її результат; сама послідовність
+        # create -> hash -> verify -> publish нижче не змінена.
+        Write-Log "==="
+        Write-Log "=== СТВОРЕННЯ ХЕШУ $Component ==="
+
+        $temporaryHashPath = $result.TemporaryArchivePath + $hashFileExtension
+        if (-not (New-SHA512Hash -FilePath $result.TemporaryArchivePath -HashFilePath $temporaryHashPath)) {
+            $result.ErrorStage = 'HASH'
+            $result.Error = "не вдалося створити SHA512"
+            Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+            return $result
+        }
+
+        # Звірка створеного hash із фактичним вмістом файла: hash, який
+        # ніхто не перевірив, підтверджує лише те, що його записали.
+        $hashText = ([IO.File]::ReadAllText($temporaryHashPath)).Trim([char]0xFEFF).Trim()
+        if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$') {
+            $result.ErrorStage = 'HASH'
+            $result.Error = "некоректний формат SHA512-файла"
+            Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+            return $result
+        }
+        $recordedHash = $Matches.Hash.ToUpperInvariant()
+        $actualHash = (Get-BRAVOFileHash -Path $result.TemporaryArchivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+        if ($recordedHash -cne $actualHash) {
+            $result.ErrorStage = 'HASH'
+            $result.Error = "SHA512 не збігається з вмістом створеного архіву"
+            Write-BRAVOLog -Component 'HASH' -Message "$Component`: $($result.Error)" -Level "ERROR"
+            Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+            return $result
+        }
+        $result.HashSuccess = $true
+        $result.SHA512 = $recordedHash
+
+        # Публікація. Ім'я підбирається так, щоб не існувало ані .mdz, ані
+        # .sha512 — наявний валідний набір ніколи не перезаписується.
+        $finalArchivePath = Join-Path $DestinationDirectory $ArchiveName
+        $finalHashPath = $finalArchivePath + $hashFileExtension
+        $finalArchiveName = [IO.Path]::GetFileName($finalArchivePath)
+        if ((Test-Path -LiteralPath $finalArchivePath) -or
+            (Test-Path -LiteralPath $finalHashPath)) {
+            $result.ErrorStage = 'PUBLISH'
+            $result.Error = "фінальний backup уже існує: $finalArchivePath"
+            Write-BRAVOLog -Component 'ARCHIVE' -Message $result.Error -Level "ERROR"
+            Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+            return $result
+        }
+
+        Move-Item -LiteralPath $result.TemporaryArchivePath -Destination $finalArchivePath -ErrorAction Stop
+        $result.ArchivePath = $finalArchivePath
+        # Hash-файл містить ім'я архіву, тому після перейменування він
+        # переписується під фінальне ім'я, а не просто переноситься.
+        [IO.File]::WriteAllText(
+            $finalHashPath,
+            ("{0} *{1}" -f $recordedHash.ToLowerInvariant(), $finalArchiveName),
+            [System.Text.Encoding]::GetEncoding($hashFileEncoding)
+        )
+        $result.HashPath = $finalHashPath
+        if (Test-Path -LiteralPath $temporaryHashPath -PathType Leaf) {
+            Remove-Item -LiteralPath $temporaryHashPath -Force -ErrorAction SilentlyContinue
+        }
+        Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+        $result.ArchiveSize = (Get-Item -LiteralPath $finalArchivePath).Length
+        Write-BRAVOLog -Component 'ARCHIVE' -Message "Backup опубліковано: $finalArchiveName (generation $GenerationId)" -Level "SUCCESS"
+        return $result
+    } catch {
+        $result.ErrorStage = if ([string]::IsNullOrWhiteSpace($result.ErrorStage)) { 'PUBLISH' } else { ([string]$result.ErrorStage).ToUpperInvariant() }
+        $result.Error = $_.Exception.Message
+        Write-BRAVOLog -Component 'ARCHIVE' -Message "Помилка публікації backup ${Component}: $($_.Exception.Message)" -Level "ERROR"
+        Remove-BRAVOTemporaryArchiveArtifacts -TemporaryArchivePath $result.TemporaryArchivePath
+        return $result
+    }
+}
+
+function New-BRAVOBackupGenerationState {
+    param(
+        [Parameter(Mandatory = $true)][string]$GenerationId,
+        [Parameter(Mandatory = $true)][datetime]$StartedAt,
+        [object]$SnapshotSet,
+        [object[]]$Components,
+        [Parameter(Mandatory = $true)][string]$Status
+    )
+
+    [pscustomobject]@{
+        GenerationId = $GenerationId
+        StartedAt = $StartedAt
+        SnapshotSetId = $(if ($null -ne $SnapshotSet) { [string]$SnapshotSet.SnapshotSetId } else { $null })
+        SnapshotCreatedAt = $(if ($null -ne $SnapshotSet) { $SnapshotSet.CreatedAt } else { $null })
+        Volumes = @(
+            if ($null -ne $SnapshotSet) {
+                $SnapshotSet.Volumes | ForEach-Object {
+                    [pscustomobject]@{
+                        OriginalVolume = [string]$_.VolumeRoot
+                        SnapshotDeviceObject = [string]$_.DeviceObject
+                        SnapshotId = [string]$_.ShadowId
+                        SnapshotSetId = [string]$_.SetId
+                    }
+                }
+            }
+        )
+        Components = @($Components)
+        TransferResults = $null
+        HealthResult = $null
+        Status = $Status
+    }
+}
+
+function Write-BRAVOBackupGenerationManifest {
+    param(
+        [Parameter(Mandatory = $true)][object]$GenerationState,
+        [Parameter(Mandatory = $true)][string]$BackupRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        return
+    }
+
+    $components = [ordered]@{}
+    foreach ($component in @($GenerationState.Components)) {
+        if ($null -eq $component -or [string]::IsNullOrWhiteSpace([string]$component.Component)) {
+            continue
+        }
+        $sourceVolume = $null
+        try {
+            $sourceVolume = Get-BRAVOVSSVolumeRoot -Path ([string]$component.OriginalSourcePath)
+        } catch {
+            # A failed component may not have a resolvable source volume.
+        }
+        $volumeState = @($GenerationState.Volumes | Where-Object {
+            [string]::Equals(
+                [string]$_.OriginalVolume,
+                [string]$sourceVolume,
+                [StringComparison]::OrdinalIgnoreCase
+            )
+        } | Select-Object -First 1)
+        $componentStatus = if (
+            [bool]$component.CreateSuccess -and
+            [bool]$component.IntegritySuccess -and
+            [bool]$component.HashSuccess
+        ) { 'COMPLETE' } elseif ([bool]$component.CreateSuccess) { 'INCOMPLETE' } else { 'FAILED' }
+        $components[[string]$component.Component] = [ordered]@{
+            Name = [string]$component.Component
+            Enabled = $true
+            SourcePath = [string]$component.OriginalSourcePath
+            SourceVolume = $sourceVolume
+            SnapshotDevice = $(if ($volumeState.Count -gt 0) { [string]$volumeState[0].SnapshotDeviceObject } else { $null })
+            SnapshotSourcePath = [string]$component.SnapshotSourcePath
+            ArchivePath = [string]$component.ArchivePath
+            HashPath = [string]$component.HashPath
+            ArchiveSize = $component.ArchiveSize
+            SHA512 = [string]$component.SHA512
+            CreateSuccess = [bool]$component.CreateSuccess
+            IntegritySuccess = [bool]$component.IntegritySuccess
+            HashSuccess = [bool]$component.HashSuccess
+            Status = $componentStatus
+            ErrorStage = [string]$component.ErrorStage
+            Error = [string]$component.Error
+        }
+    }
+
+    $manifest = [ordered]@{
+        generationId = [string]$GenerationState.GenerationId
+        createdAt = $GenerationState.StartedAt
+        snapshotSetId = $GenerationState.SnapshotSetId
+        status = [string]$GenerationState.Status
+        startedAt = $GenerationState.StartedAt
+        snapshotCreatedAt = $GenerationState.SnapshotCreatedAt
+        volumes = @($GenerationState.Volumes)
+        components = $components
+        transferResults = $GenerationState.TransferResults
+        healthResult = $GenerationState.HealthResult
+    }
+    # dev.14: generation manifest-и живуть у виділеному MANIFESTS\, а не
+    # поруч з архівами — lifecycle прив'язаний до generation (retention
+    # видаляє manifest разом з нею), а не до незалежного LogDays. Каталог
+    # створюється тут ідемпотентно (Force), бо Write- не повинен залежати
+    # від того, чи вже відпрацював Initialize-BRAVOBackupManifestStorage
+    # (наприклад одразу після апгрейду, до першого запуску Maintenance).
+    $manifestRoot = Get-BRAVOBackupManifestRoot -BackupRoot $BackupRoot
+    New-Item -ItemType Directory -Path $manifestRoot -Force -ErrorAction Stop | Out-Null
+    $manifestPath = Join-Path $manifestRoot ("BRAVO_BACKUP_{0}.json" -f $GenerationState.GenerationId)
+    [IO.File]::WriteAllText(
+        $manifestPath,
+        (($manifest | ConvertTo-Json -Depth 8) + [Environment]::NewLine),
+        (New-Object Text.UTF8Encoding($false))
+    )
+    return $manifestPath
 }
 
 function New-SHA512Hash {
@@ -1654,6 +2952,26 @@ function New-SHA512Hash {
             Write-BRAVOLog -Component 'HASH' -Message "Помилка створення хешу: $($_.Exception.Message)" -Level "ERROR"
             return $false
         }
+    }
+}
+
+function New-BRAVOTransferOperationResult {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [bool]$Enabled
+    )
+
+    [pscustomobject]@{
+        Name = $Name
+        Enabled = $Enabled
+        Attempted = $false
+        Success = $null
+        Degraded = $false
+        Total = 0
+        Completed = 0
+        Remaining = $null
+        IncompatibleNames = 0
+        Error = $null
     }
 }
 
@@ -1854,7 +3172,10 @@ function Copy-FileToSMBWithProgress {
 }
 
 function Copy-ArchivesToSMB {
-    param([hashtable]$ArchiveResults)
+    param(
+        [hashtable]$ArchiveResults,
+        [string]$GenerationManifestPath
+    )
 
     $drive = $null
     $copySuccess = 0
@@ -1879,6 +3200,15 @@ function Copy-ArchivesToSMB {
                 DestinationDirectory = $destinationDirectory
                 Component = [string]$archive.Type
             }
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($GenerationManifestPath) -and
+        (Test-Path -LiteralPath $GenerationManifestPath -PathType Leaf)) {
+        $copyQueue += [pscustomobject]@{
+            SourcePath = $GenerationManifestPath
+            DestinationDirectory = Join-Path ([string]$smbSettings.RootPath) 'manifests'
+            Component = 'MANIFEST'
         }
     }
 
@@ -1931,27 +3261,6 @@ function Copy-ArchivesToSMB {
     return [pscustomobject]@{
         Total = $copyTotal
         Success = $copySuccess
-    }
-}
-
-function Test-NetworkConnection {
-    try {
-        Write-BRAVOLog -Component 'NETWORK' -Message "Перевiрка мережевого з'єднання..." -Level "DEBUG"
-        
-        $connection = Test-BRAVOTcpConnection `
-            -ComputerName $networkCheckHost `
-            -Port $networkCheckPort `
-            -TimeoutMilliseconds $networkPingTimeoutMilliseconds
-        if ($connection) {
-            Write-BRAVOLog -Component 'NETWORK' -Message "Мережеве з'єднання доступне ($($BRAVOCompatibility.NetworkProvider))" -Level "SUCCESS"
-            return $true
-        } else {
-            Write-BRAVOLog -Component 'NETWORK' -Message "Мережеве з'єднання недоступне" -Level "ERROR"
-            return $false
-        }
-    } catch {
-        Write-BRAVOLog -Component 'NETWORK' -Message "Помилка перевiрки мережевого з'єднання: $($_.Exception.Message)" -Level "ERROR"
-        return $false
     }
 }
 
@@ -2085,7 +3394,7 @@ function Test-SFTPConnection {
         [string]$HostKey
     )
     
-    Write-BRAVOLog -Component 'SFTP' -Message "Перевiрка пiдключення до SFTP сервера" -Level "DEBUG"
+    Write-BRAVOLog -Component 'SFTP' -Message "Перевiрка пiдключення до actual endpoint ${resolvedSftpHost}:$sftpPort" -Level "DEBUG"
     
     if (-not (Test-Path $WinSCPPath)) {
         Write-BRAVOLog -Component 'SFTP' -Message "WinSCP не знайдено: $WinSCPPath" -Level "ERROR"
@@ -2694,12 +4003,11 @@ function Send-BAZAIncompatibleNameAlert {
 
     $examples = @(
         $Issues |
-            Select-Object -First 5 |
+            Select-Object -First 3 |
             ForEach-Object {
-                $itemType = if ($_.IsDirectory) { "каталог" } else { "файл" }
                 $displayName = [string]$_.Name
-                if ($displayName.Length -gt 180) {
-                    $displayName = $displayName.Substring(0, 177) + "..."
+                if ($displayName.Length -gt 120) {
+                    $displayName = $displayName.Substring(0, 117) + "..."
                 }
 
                 # The health formatter lives in a different function scope.
@@ -2713,69 +4021,60 @@ function Send-BAZAIncompatibleNameAlert {
                     $displayName = $displayName.Replace("|", "\|")
                     $displayName = $displayName.Replace(">", "\>")
                 }
-                (
-                    "• $itemType [довжина: $($_.CharacterCount) символів; " +
-                    "$($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) UTF-8 байт]:`n  " +
-                    $displayName
-                )
+                $overflowBytes = [int]$_.Utf8ByteCount - [int]$_.MaximumUtf8Bytes
+                ":x: $($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) байт · перевищення +$overflowBytes байт`n$displayName"
             }
     )
-    $examplesText = $examples -join "`n"
-    $machineName = [Environment]::MachineName
-    $localIpAddresses = @()
-    try {
-        $localIpAddresses = @(
-            [System.Net.Dns]::GetHostAddresses($machineName) |
-                Where-Object {
-                    $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork -and
-                    -not [System.Net.IPAddress]::IsLoopback($_) -and
-                    -not $_.ToString().StartsWith("169.254.")
-                } |
-                ForEach-Object { $_.ToString() } |
-                Sort-Object -Unique
-        )
-    } catch {
-        # Локальна IP-адреса потрібна лише для тексту сповіщення — без неї
-        # воно надійде без цього рядка. DNS-запит до власного імені падає
-        # на серверах із нестандартною мережевою конфігурацією, тому DEBUG:
-        # це не проблема backup, але діагностика "чому в сповіщенні немає
-        # IP" інакше впирається в порожнечу.
-        Write-BRAVOLog `
-            -Component 'NOTIFY' `
-            -Message "Не вдалося визначити локальну IP-адресу: $($_.Exception.Message)" `
-            -Level "DEBUG"
+    $exampleLines = New-Object System.Collections.Generic.List[string]
+    if ($examples.Count -gt 0) {
+        $exampleLines.Add("Приклади:")
+        $exampleLines.Add("")
+        foreach ($example in $examples) {
+            $exampleLines.Add([string]$example)
+            $exampleLines.Add("")
+        }
     }
-    $localIpText = if ($localIpAddresses.Count -gt 0) {
-        $localIpAddresses -join " | "
-    } else {
-        "недоступні"
-    }
-    $notificationTime = (Get-Date).ToString("dd.MM.yyyy HH:mm:ss")
+    $hostInformation = Get-HostInformation
+    $notificationTime = Get-Date
     $archiveVersionText = [string]$global:ScriptVersion
-    $archiveScriptDateText = [string]$global:ScriptDate
+    $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+        "невідома"
+    } else {
+        [string]$ScriptBuildId
+    }
     $logFilePath = if (-not [string]::IsNullOrWhiteSpace([string]$script:logFile)) {
         [string]$script:logFile
     } else {
         "журнал BRAVO_ARCHIV"
     }
-    $message = @"
-🚨 SFTP-СИНХРОНІЗАЦІЯ $ComponentName ПОТРЕБУЄ УВАГИ
-🏚️ Установа: $($backupMonitoring.InstitutionName) [$($backupMonitoring.InstitutionCode)]
-🖥️ Машина: $machineName
-🌐 IP-адреси: $localIpText
-🕒 Час: $notificationTime
-🏷️ Версія BRAVO_ARCHIV: $archiveVersionText від $archiveScriptDateText
-
-Знайдено несумісних імен: $($Issues.Count). Ці об'єкти не буде передано у хмару, доки локальні імена не буде скорочено.
-Довжину показано в символах; технічний ліміт WinSCP — $($Issues[0].MaximumUtf8Bytes) UTF-8 байт.
-Приклади:
-$examplesText
-📝 Повний перелік: $logFilePath
-"@
+    $fileCountText = Format-BRAVOUkrainianCount -Count $Issues.Count -One "файл" -Few "файли" -Many "файлів"
+    $fileCountHeaderText = $fileCountText.ToUpperInvariant()
+    $resultLines = @(
+        "Причина:",
+        "Назви $fileCountText перевищують допустиму довжину для передачі через SFTP.",
+        "Проблемні файли пропущено; інші файли синхронізуються штатно.",
+        "",
+        "Ліміт: $($Issues[0].MaximumUtf8Bytes) UTF-8 байт",
+        "Проблемних файлів: $($Issues.Count)"
+    ) + $exampleLines.ToArray()
+    $message = New-BRAVOOperatorNotificationMessage `
+        -Severity "WARNING" `
+        -Operation "$ComponentName — $fileCountHeaderText НЕ СИНХРОНІЗОВАНО" `
+        -ActionText "скоротити назви зазначених файлів." `
+        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+        -HostInformation $hostInformation `
+        -ResultLines $resultLines `
+        -Timestamp $notificationTime `
+        -ProductName "BRAVO Archive" `
+        -Version $archiveVersionText `
+        -BuildId $archiveBuildIdText `
+        -LogPath $logFilePath `
+        -LogLabel "Повний перелік"
 
     try {
         $outboundMessages = if ($script:notificationProvider -eq "discord") {
-            @(Split-DiscordNotificationText -Message $message)
+            @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $message))
         } else {
             @($message)
         }
@@ -3032,6 +4331,7 @@ function Sync-FolderToSFTP {
         [string]$ComponentName = "BAZA"
     )
 
+    $script:lastBAZASyncOutcome = $null
     $normalizedRemoteDirectory = $RemoteDirectory.Replace("\", "/").Trim("/")
     $remotePath = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) {
         "/"
@@ -3227,6 +4527,7 @@ exit
             -ComparisonBefore $comparisonBefore `
             -ComparisonAfter $comparisonAfter `
             -IncompatibleIssues $(if ($nameCompatibility.Success) { @($nameCompatibility.Issues) } else { @() })
+        $script:lastBAZASyncOutcome = $syncOutcome
 
         if (-not $syncOutcome.VerificationSucceeded) {
             Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося пiдтвердити результат синхронiзацiї $ComponentName повторним порiвнянням; результат вважається помилкою" -Level "ERROR"
@@ -3291,6 +4592,11 @@ function Invoke-ManualBAZASFTPSynchronization {
     Write-BRAVOLog -Component 'SFTP' -Message "Режим -SyncBAZA: синхронізуються всі увімкнені BAZA_APP/BAZA_WWW; архiвацiю, очищення архiвiв, NAS/SMB та health-check пропущено" -Level "INFO"
     Show-ScriptProgress -Status "Ручна синхронiзацiя BAZA_APP / BAZA_WWW на SFTP" -PercentComplete 20
 
+    $manualResults = [ordered]@{
+        SFTPConnection = New-BRAVOTransferOperationResult -Name 'SFTP connection' -Enabled $true
+        BAZA_APP = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_APP' -Enabled ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP)
+        BAZA_WWW = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_WWW' -Enabled ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP)
+    }
     $syncTargets = @()
     $sourceConfigurationFailed = $false
     if ([bool]$componentSettings.Synchronization.BAZA_APP_SFTP) {
@@ -3302,6 +4608,8 @@ function Invoke-ManualBAZASFTPSynchronization {
             }
         } else {
             $sourceConfigurationFailed = $true
+            $manualResults.BAZA_APP.Success = $false
+            $manualResults.BAZA_APP.Error = 'локальний каталог недоступний'
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронізацію BAZA_APP пропущено: локальний каталог недоступний" -Level "ERROR"
         }
     }
@@ -3318,31 +4626,35 @@ function Invoke-ManualBAZASFTPSynchronization {
             $sourceConfigurationFailed = $true
             $detectionReason = if ($bazaWWWDetection.Success) { "локальний каталог недоступний" } else { [string]$bazaWWWDetection.Reason }
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронізацію BAZA_WWW пропущено: $detectionReason" -Level "ERROR"
+            $manualResults.BAZA_WWW.Success = $false
+            $manualResults.BAZA_WWW.Error = $detectionReason
         }
     }
     if ($syncTargets.Count -eq 0) {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронізацію скасовано: BAZA_APP_SFTP і BAZA_WWW_SFTP вимкнені або їхні джерела недоступні" -Level "ERROR"
-        return $false
+        return [pscustomobject]@{ Success = $false; Results = $manualResults }
     }
 
     if (-not (Test-SFTPConfig -SynchronizationOnly)) {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено через помилки конфiгурацiї SFTP" -Level "ERROR"
-        return $false
+        $manualResults.SFTPConnection.Success = $false
+        $manualResults.SFTPConnection.Error = 'SFTP configuration invalid'
+        return [pscustomobject]@{ Success = $false; Results = $manualResults }
     }
 
     Show-ScriptProgress -Status "Перевiрка з'єднання з SFTP" -PercentComplete 35
-    if (-not (Test-NetworkConnection)) {
-        Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено: мережеве з'єднання недоступне" -Level "ERROR"
-        return $false
-    }
-
     if (-not (Test-SFTPConnection `
         -WinSCPPath $winSCPPath `
         -RepositorySFTPUrl $sftpUrl `
         -HostKey $sftpHostKey)) {
         Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю BAZA_APP / BAZA_WWW зупинено: не вдалося пiдключитися до SFTP" -Level "ERROR"
-        return $false
+        $manualResults.SFTPConnection.Attempted = $true
+        $manualResults.SFTPConnection.Success = $false
+        $manualResults.SFTPConnection.Error = 'actual SFTP endpoint unavailable'
+        return [pscustomobject]@{ Success = $false; Results = $manualResults }
     }
+    $manualResults.SFTPConnection.Attempted = $true
+    $manualResults.SFTPConnection.Success = $true
 
     Initialize-BRAVOSFTPRemoteDirectories `
         -WinSCPPath $winSCPPath `
@@ -3363,26 +4675,40 @@ function Invoke-ManualBAZASFTPSynchronization {
             -LocalDirectory $syncTarget.Source `
             -RemoteDirectory $syncTarget.Destination `
             -ComponentName $syncTarget.Name
+        $targetResult = $manualResults[$syncTarget.Name]
+        $targetResult.Attempted = $true
+        $targetResult.Success = [bool]$syncSuccess
+        if ($null -ne $script:lastBAZASyncOutcome) {
+            $targetResult.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+            $targetResult.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+            $targetResult.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+            $targetResult.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+        }
         if ($syncSuccess) {
             Write-BRAVOLog -Component 'SFTP' -Message "Ручну синхронiзацiю $($syncTarget.Name) на SFTP завершено успiшно" -Level "SUCCESS"
         } else {
             $syncFailed = $true
+            $targetResult.Error = 'post-sync verification failed'
             Write-BRAVOLog -Component 'SFTP' -Message "Ручна синхронiзацiя $($syncTarget.Name) на SFTP завершилася з помилкою" -Level "ERROR"
         }
     }
 
-    return (-not $syncFailed)
+    return [pscustomobject]@{ Success = (-not $syncFailed); Results = $manualResults }
 }
 
 function Enter-BRAVOArchiveProcessLock {
     # Спільний lock для BRAVO_ARCHIV і BRAVO_MAINTENANCE. Він не дозволяє
     # maintenance зупиняти служби або змінювати джерела під час backup.
-    $lockPath = Join-Path $logPath "BRAVO_OPERATION.lock"
+    $lockPath = [string]$operationLockSettings.Path
     try {
-        if (-not (Test-Path -LiteralPath $logPath -PathType Container)) {
+        if ([string]::IsNullOrWhiteSpace($lockPath)) {
+            throw 'operationLockSettings.Path не задано'
+        }
+        $lockDirectory = Split-Path -Path $lockPath -Parent
+        if (-not (Test-Path -LiteralPath $lockDirectory -PathType Container)) {
             New-Item `
                 -ItemType Directory `
-                -Path $logPath `
+                -Path $lockDirectory `
                 -Force `
                 -ErrorAction Stop |
                 Out-Null
@@ -3432,6 +4758,7 @@ function Enter-BRAVOArchiveProcessLock {
             startedAt = (Get-Date).ToString("o")
             packageVersion = [string]$ScriptVersion
             config = $configPath
+            generationId = [string]$script:backupGenerationId
         } | ConvertTo-Json -Compress)
         $lockBytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
         $lockStream.SetLength(0)
@@ -3462,7 +4789,13 @@ function Enter-BRAVOArchiveProcessLock {
 # =============================================
 
 function Write-BRAVOBackupExecutionState {
-    $path = Join-Path $logPath 'BRAVO_TASK_EXECUTION_STATE.json'
+    # Машинний стан — у %ProgramData%\BRAVO\State (той самий stateRoot, що й
+    # restore/task-execution стан Maintenance та version state), а не в
+    # каталозі логів: стан не є журналом і не підлягає log-retention.
+    $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
     $state = @{}
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         try {
@@ -3487,9 +4820,29 @@ function Write-BRAVOBackupExecutionState {
 function Main {
     # Ініціалізація
     $scriptStartTime = Get-Date
-    $now = $scriptStartTime.ToString($archiveTimestampFormat)
-    $logTimestamp = $scriptStartTime.ToString($logFileDateFormat)
-    $script:logFile = Join-Path $logPath ($logFileNameTemplate -f $logTimestamp)
+    # ОДИН GenerationId на весь запуск: усі компоненти однієї копії несуть
+    # його в імені, тому MODEL, BLOG і BRAVOEXCH одного backup впізнаються
+    # як комплект, а не збираються за близькістю часу створення файлів.
+    $backupGenerationId = New-BRAVOBackupGenerationId -Timestamp $scriptStartTime
+    $script:backupGenerationId = $backupGenerationId
+    $script:backupGenerationStatus = 'FAILED'
+    $script:backupGenerationResults = @()
+    # Ініціалізуємо явно: якщо фіналізація generation кине виняток до першого
+    # присвоєння, РЕЗУЛЬТАТ нижче читає $script:backupGenerationState під
+    # Set-StrictMode — неоголошена змінна там була б вторинним крахом.
+    $script:backupGenerationState = $null
+    # Uniqueness is a runtime invariant, not a promise delegated to an old
+    # external config template. Seconds + PID prevent concurrent executions
+    # from interleaving in one file even when ConfigPath points to legacy config.
+    $logTimestamp = $scriptStartTime.ToString('yyyyMMdd_HHmmss')
+    $logFileName = $logFileNameTemplate -f $logTimestamp, $PID
+    if ($logFileName -notmatch ("PID{0}(?:\.|$)" -f $PID)) {
+        $logFileName = "{0}_PID{1}{2}" -f `
+            [IO.Path]::GetFileNameWithoutExtension($logFileName), `
+            $PID, `
+            [IO.Path]::GetExtension($logFileName)
+    }
+    $script:logFile = Join-Path $logPath $logFileName
 
     # Журнал і консоль — два незалежні канали з власними порогами.
     $configuredFileLevel = if ($null -ne $consoleSettings.FileLevel) {
@@ -3526,6 +4879,7 @@ function Main {
         -Title ("BRAVO ARCHIVE {0}" -f $ScriptVersion) `
         -Institution ([string]$bravoSettings.InstitutionName) `
         -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+        -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
         -StartedAt $scriptStartTime
 
     $processLockResult = Enter-BRAVOArchiveProcessLock
@@ -3539,6 +4893,23 @@ function Main {
     }
     $script:archiveProcessLock = $processLockResult.Stream
     $script:archiveProcessLockPath = $processLockResult.Path
+
+    # A hard process termination skips PowerShell finally blocks. Persisted
+    # ownership lets the next lock owner remove only the exact VSS Shadow IDs
+    # previously created by BRAVO, without touching snapshots from other apps.
+    $vssOwnershipStatePath = Get-BRAVOVSSOwnershipStatePath
+    $orphanCleanupResult = Remove-BRAVOOwnedOrphanVSSResources -StatePath $vssOwnershipStatePath
+    if (-not $orphanCleanupResult.Success) {
+        Write-BRAVOLog -Component 'VSS' -Message (
+            "BRAVO-owned orphan VSS cleanup failed; backup blocked to avoid accumulating untracked snapshots: " +
+            $orphanCleanupResult.Error
+        ) -Level 'ERROR'
+        $script:processExitCode = Resolve-BRAVOExitCode -LocalArchiveFailed
+        return
+    }
+    if ($orphanCleanupResult.Found) {
+        Write-BRAVOLog -Component 'VSS' -Message "Removed $($orphanCleanupResult.Deleted) BRAVO-owned orphan VSS shadow(s) from persisted state" -Level 'SUCCESS'
+    }
 
     $enabledArchives = @($archiveDefinitions | Where-Object { $_.Enabled })
     $readyArchives = @()
@@ -3554,20 +4925,16 @@ function Main {
         $bazaAppSFTPSyncEnabled -or
         $bazaWWWSFTPSyncEnabled
     )
+    $transferResults = [ordered]@{
+        ArchiveUpload = New-BRAVOTransferOperationResult -Name 'SFTP: резервні копії' -Enabled $sftpArchiveUploadEnabled
+        BAZA_APP = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_APP' -Enabled $bazaAppSFTPSyncEnabled
+        BAZA_WWW = New-BRAVOTransferOperationResult -Name 'SFTP: BAZA_WWW' -Enabled $bazaWWWSFTPSyncEnabled
+        SMB = New-BRAVOTransferOperationResult -Name 'SMB' -Enabled $smbArchiveCopyEnabled
+        Health = New-BRAVOTransferOperationResult -Name 'Post-backup health' -Enabled $false
+        Notification = New-BRAVOTransferOperationResult -Name 'Notification' -Enabled $false
+    }
+    $script:transferResults = $transferResults
     $operationFailed = $false
-
-    # Етапи консолі: середовище + шляхи + по одному на компонент, далі —
-    # лише ті передавання й перевірки, що справді увімкнені в конфігурації.
-    $healthCheckEnabled = (
-        [bool]$backupMonitoring.Enabled -and [bool]$backupMonitoring.RunAfterBackup
-    )
-    Initialize-BRAVOArchiveSteps -Total (
-        2 +
-        $enabledArchives.Count +
-        $(if ($sftpTransferEnabled) { 1 } else { 0 }) +
-        $(if ($smbArchiveCopyEnabled) { 1 } else { 0 }) +
-        $(if ($healthCheckEnabled) { 1 } else { 0 })
-    )
 
     Show-ScriptProgress -Status "Iнiцiалiзацiя" -PercentComplete 2
     
@@ -3586,7 +4953,8 @@ function Main {
 
     if ($SyncBAZA) {
         $manualSyncStarted = Get-Date
-        $manualSyncSuccess = Invoke-ManualBAZASFTPSynchronization
+        $manualSyncResult = Invoke-ManualBAZASFTPSynchronization
+        $manualSyncSuccess = [bool]$manualSyncResult.Success
         $manualSyncFinished = Get-Date
         $manualSyncDuration = $manualSyncFinished - $manualSyncStarted
 
@@ -3599,6 +4967,27 @@ function Main {
         $script:processExitCode = if ($manualSyncSuccess) { 0 } else { Resolve-BRAVOExitCode -SftpFailed }
         Show-ScriptProgress -Status "Завершено" -PercentComplete 100
         Complete-BRAVOProgress
+
+        Initialize-BRAVOArchiveSteps -Total (1 + @(
+            @('BAZA_APP', 'BAZA_WWW') | Where-Object {
+                [bool]$manualSyncResult.Results[$_].Enabled
+            }
+        ).Count)
+        foreach ($manualResultKey in @('SFTPConnection', 'BAZA_APP', 'BAZA_WWW')) {
+            $manualResult = $manualSyncResult.Results[$manualResultKey]
+            if (-not [bool]$manualResult.Enabled) { continue }
+            $manualStepStatus = if (-not [bool]$manualResult.Success) {
+                'ERROR'
+            } elseif ([bool]$manualResult.Degraded) {
+                'WARNING'
+            } else {
+                'OK'
+            }
+            Write-BRAVOArchiveStep `
+                -Name ([string]$manualResult.Name) `
+                -Status $manualStepStatus `
+                -Details ([string]$manualResult.Error)
+        }
 
         # Ручна синхронізація завершується до етапів, тому підсумок тут
         # окремий: інакше в консолі не лишилося б жодного зворотного звʼязку.
@@ -3614,7 +5003,82 @@ function Main {
             -LogFile $script:logFile
         return
     }
-    
+
+    # dev.16 (review round 3): План/dynamic Total нижче навмисно
+    # розташовані ПІСЛЯ if ($SyncBAZA) { ...; return } вище, а не до
+    # нього — -SyncBAZA це окремий, ізольований SFTP-only flow (BAZA_APP/
+    # BAZA_WWW через SFTP) зі своїм власним Initialize-BRAVOArchiveSteps
+    # і БЕЗ Плану операцій. Якби цей блок стояв до SyncBAZA-гілки, оператор
+    # у режимі -SyncBAZA побачив би "План операцій" повного backup-flow
+    # (Архівація/SFTP/SMB/очищення), який до -SyncBAZA взагалі не
+    # застосовується. Archive/SyncBazaModeDoesNotGainNormalArchiveOperations
+    # це перевіряє.
+    # Етапи консолі: середовище + шляхи + по одному на компонент, далі —
+    # лише ті передавання й перевірки, що справді увімкнені в конфігурації.
+    $healthCheckEnabled = (
+        [bool]$backupMonitoring.Enabled -and [bool]$backupMonitoring.RunAfterBackup
+    )
+    $transferResults.Health.Enabled = $healthCheckEnabled
+    # dev.16: локальна синхронізація BAZA_APP/BAZA_WWW реально виконується
+    # (Sync-Folders), але досі не мала власного numbered step — додається
+    # до знаменника й отримує рядок нижче лише коли реально увімкнена
+    # (той самий "вимкнений компонент не займає рядка" принцип, що й решта
+    # передавань/перевірок тут).
+    # dev.18: старе очищення журналів (завжди оцінюється — рівно один
+    # доданок) і очищення backup generation (лише коли реально увімкнене
+    # — той самий вираз, що й План нижче, і сам гейт кроку далі)
+    # мігрували з unnumbered Write-BRAVOOperationResult на numbered
+    # Write-BRAVOArchiveStep; Total має враховувати обидва.
+    Initialize-BRAVOArchiveSteps -Total (
+        2 +
+        1 +
+        $(if ($bazaAppLocalSyncEnabled) { 1 } else { 0 }) +
+        $(if ($bazaWWWLocalSyncEnabled) { 1 } else { 0 }) +
+        $enabledArchives.Count +
+        $(if ($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup) { 1 } else { 0 }) +
+        $(if ($sftpArchiveUploadEnabled) { 1 } else { 0 }) +
+        $(if ($bazaAppSFTPSyncEnabled) { 1 } else { 0 }) +
+        $(if ($bazaWWWSFTPSyncEnabled) { 1 } else { 0 }) +
+        $(if ($smbArchiveCopyEnabled) { 1 } else { 0 }) +
+        $(if ($healthCheckEnabled) { 1 } else { 0 })
+    )
+
+    # dev.16: План операцій — те саме "plan-first" правило, що вже
+    # застосоване в Maintenance (docs/OPERATOR_CONSOLE_UX.md) — оператор
+    # бачить, ЩО саме виконуватиметься, ще до першого кроку. Джерело
+    # значень — ті самі прапорці, що вже визначають нумерацію кроків вище
+    # (Initialize-BRAVOArchiveSteps) і Total нижче, тому план і фактичне
+    # виконання не можуть розійтися. Внутрішні деталі реалізації (VSS
+    # ownership state, SHA512, manifest writer, lock bookkeeping,
+    # notification transport) свідомо НЕ показуються тут — вони не є
+    # окремими operator decisions, лише частина вже перелічених операцій.
+    # dev.16 (review round 3): рендер через спільний Write-BRAVOPlan
+    # (BRAVO.Console) — той самий helper, що Health, а не власний raw
+    # Write-Host у runtime.
+    $archivePlanEntries = [ordered]@{}
+    $archivePlanEntries['Локальна синхронізація BAZA_APP'] = [bool]$bazaAppLocalSyncEnabled
+    $archivePlanEntries['Локальна синхронізація BAZA_WWW'] = [bool]$bazaWWWLocalSyncEnabled
+    foreach ($archiveDefinition in $archiveDefinitions) {
+        $archivePlanEntries["Архівація $($archiveDefinition.Type)"] = [bool]$archiveDefinition.Enabled
+    }
+    $archivePlanEntries['Завантаження архівів на SFTP'] = [bool]$sftpArchiveUploadEnabled
+    $archivePlanEntries['Синхронізація BAZA_APP на SFTP'] = [bool]$bazaAppSFTPSyncEnabled
+    $archivePlanEntries['Синхронізація BAZA_WWW на SFTP'] = [bool]$bazaWWWSFTPSyncEnabled
+    $archivePlanEntries['Копіювання на NAS/SMB'] = [bool]$smbArchiveCopyEnabled
+    # Очищення старих журналів/backup generation — той самий "завжди
+    # оцінюється" принцип, що Maintenance/Очистка старих даних/логів:
+    # немає власного on/off прапорця, ТАК означає "перевірку буде
+    # проведено", а не "щось буде видалено цього разу" (порожній
+    # результат рендериться SKIPPED). dev.18: обидві операції тепер
+    # numbered [N/TOTAL] кроки (Write-BRAVOArchiveStep, той самий Total
+    # вище і той самий вираз нижче, що й тут) — не unnumbered.
+    $archivePlanEntries['Очищення старих журналів'] = $true
+    $archivePlanEntries['Очищення старих backup generation'] = [bool](
+        $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup
+    )
+    $archivePlanEntries['Post-backup Health'] = [bool]$healthCheckEnabled
+    Write-BRAVOPlan -Title 'План операцій:' -Entries $archivePlanEntries
+
     # Використовуємо NoTimestamp для інформаційного блоку
     Write-Log "==="
     Write-Log "=== ОПЦIЇ СКРИПТА ==="
@@ -3712,7 +5176,14 @@ function Main {
             Write-Log "backupConsistency.SnapshotContext повинен мати значення ClientAccessible" -Level "ERROR"
             $archiveConsistencyValid = $false
         } else {
-            Write-Log "Узгодженість архівів: окремий VSS-знімок для кожного компонента" -Level "SUCCESS"
+            # dev.19: фактично виправлений текст — runtime створює ОДИН
+            # VSS Snapshot Set на generation (New-BRAVOVSSSnapshotSet,
+            # рядок ~5540 нижче), який спільно читають усі увімкнені
+            # компоненти (MODEL/BLOG/BRAVOEXCH), а не окремий знімок на
+            # кожен. Термінологія — та сама, що вже BRAVO_DRY_RUN.ps1
+            # ("один VSS Snapshot Set для всіх enabled archive components").
+            # Лише діагностичний текст; сама VSS-логіка не змінена.
+            Write-Log "Узгодженість архівів: один VSS Snapshot Set для всіх увімкнених компонентів generation" -Level "SUCCESS"
         }
     }
 
@@ -3733,11 +5204,14 @@ function Main {
 
     $smbConfigurationValid = $true
     if ($smbArchiveCopyEnabled) {
+        $transferResults.SMB.Attempted = $true
         Show-ScriptProgress -Status "Перевірка конфігурації NAS/SMB" -PercentComplete 11
         Write-Log "==="
         Write-Log "=== ПЕРЕВІРКА КОНФІГУРАЦІЇ NAS/SMB ==="
         $smbConfigurationValid = Test-SMBConfig
         if (-not $smbConfigurationValid) {
+            $transferResults.SMB.Success = $false
+            $transferResults.SMB.Error = 'SMB configuration invalid'
             Write-Log "Копіювання на NAS/SMB буде пропущено; локальна архівація продовжиться" -Level "WARNING"
             $operationFailed = $true
         }
@@ -3745,7 +5219,9 @@ function Main {
         Write-Log "Перевірка NAS/SMB не потрібна: компонент вимкнено" -Level "INFO"
     }
     
+    $oldLogCleanupStartedAt = Get-Date
     $oldLogsToRemove = @()
+    $oldLogCleanupPathMissing = $false
     if (Test-Path -LiteralPath $logPath -PathType Container) {
         $logRetentionCutoff = (Get-Date).AddDays(-$logRetentionDays)
         $oldLogsToRemove = @(Get-BRAVOFiles -Path $logPath -Filter $logFileFilter |
@@ -3753,21 +5229,45 @@ function Main {
     } else {
         Write-Log "Шлях журналів не знайдено: $logPath" -Level "ERROR"
         $operationFailed = $true
+        $oldLogCleanupPathMissing = $true
     }
 
+    $oldLogCleanupSucceeded = $true
     if ($oldLogsToRemove.Count -gt 0) {
         Write-Log "==="
         Write-Log "=== ОЧИЩЕННЯ СТАРИХ ЛОГIВ ==="
         Show-ScriptProgress -Status "Очищення старих логiв" -PercentComplete 12
-        if (-not (Remove-OldLogsByAge `
+        $oldLogCleanupSucceeded = Remove-OldLogsByAge `
                 -Path $logPath `
                 -Filter $logFileFilter `
                 -RetentionDays $logRetentionDays `
-                -Logger { param($Message, $Level) Write-Log $Message -Level $Level })) {
+                -Logger { param($Message, $Level) Write-Log $Message -Level $Level }
+        if (-not $oldLogCleanupSucceeded) {
             $operationFailed = $true
         }
     }
-    
+
+    # dev.18: numbered [N/TOTAL] крок (Write-BRAVOArchiveStep) — раніше
+    # unnumbered Write-BRAVOOperationResult; реальний DEV-LIMS вивід
+    # показав цю операцію ПОЗА канонічною нумерацією, хоча вона реально
+    # виконується щоразу. Позиція виклику (до "Перевірка середовища")
+    # не змінена — той самий порядок виконання, лише інший renderer.
+    # Retention days/filter/delete semantics не змінені.
+    Write-BRAVOArchiveStep `
+        -Name 'Очищення старих журналів' `
+        -Status $(
+            if ($oldLogCleanupPathMissing -or -not $oldLogCleanupSucceeded) { 'ERROR' }
+            elseif ($oldLogsToRemove.Count -eq 0) { 'SKIPPED' }
+            else { 'OK' }
+        ) `
+        -Duration ((Get-Date) - $oldLogCleanupStartedAt) `
+        -Details $(
+            if ($oldLogCleanupPathMissing) { 'шлях журналів не знайдено; деталі у журналі.' }
+            elseif (-not $oldLogCleanupSucceeded) { 'перевірте LOG для деталей' }
+            elseif ($oldLogsToRemove.Count -eq 0) { 'журналів старших за retention немає' }
+            else { "видалено файлів: $($oldLogsToRemove.Count)" }
+        )
+
     # Перевірка шляхів
     Write-Log "==="
     # Етап 1 підсумовує все, що перевірялося до цього: сумісність, пароль,
@@ -3786,6 +5286,12 @@ function Main {
     Show-ScriptProgress -Status "Перевiрка необхiдних шляхiв" -PercentComplete 15
     $requiredPaths = @($baseRequiredPaths)
     $archiveToolAvailable = $archiveCredentialValid -and $archiveConsistencyValid
+    # dev.16: підсумковий лічильник для compact "Перевірка шляхів" Details
+    # нижче (недоступних шляхів/перевірок: N) — рахує КОЖЕН окремий провал:
+    # Test-PathWithLog і SYSTEM write/read probes. Існуючі bool-прапорці
+    # (basePathsAvailable/sourceAvailable/...) і логіка на їх основі не
+    # змінені — рахунок лише додається поруч.
+    $pathCheckFailureCount = 0
 
     if ($enabledArchives.Count -gt 0) {
         $requiredPaths += @{Path=$arcPath; Description="7-Zip"; CreateIfMissing=$false}
@@ -3798,6 +5304,7 @@ function Main {
             -Description $item.Description `
             -CreateIfMissing ([bool]$item.CreateIfMissing))) {
             $basePathsAvailable = $false
+            $pathCheckFailureCount++
             if ($item.Path -eq $arcPath) {
                 $archiveToolAvailable = $false
             }
@@ -3813,6 +5320,8 @@ function Main {
             -Path $archive.Destination `
             -Description "Каталог архiву $($archive.Type)" `
             -CreateIfMissing $true
+        if (-not $sourceAvailable) { $pathCheckFailureCount++ }
+        if (-not $destinationAvailable) { $pathCheckFailureCount++ }
 
         if ($archiveToolAvailable -and $sourceAvailable -and $destinationAvailable) {
             $readyArchives += $archive
@@ -3833,12 +5342,14 @@ function Main {
             -Path $bazaAppPaths.Source `
             -Description "Каталог BAZA APP" `
             -CreateIfMissing $false
+        if (-not $bazaAppSourceAvailable) { $pathCheckFailureCount++ }
     }
     if ($bazaAppLocalSyncEnabled) {
         $bazaAppDestinationAvailable = Test-PathWithLog `
             -Path $bazaAppPaths.Destination `
             -Description "Каталог архiву BAZA APP" `
             -CreateIfMissing $true
+        if (-not $bazaAppDestinationAvailable) { $pathCheckFailureCount++ }
     }
     $bazaWWWSourceAvailable = $true
     $bazaWWWDestinationAvailable = $true
@@ -3849,9 +5360,11 @@ function Main {
                 -Path $bazaWWWPaths.Source `
                 -Description "Каталог BAZA WWW" `
                 -CreateIfMissing $false
+            if (-not $bazaWWWSourceAvailable) { $pathCheckFailureCount++ }
         } else {
             Write-Log "Каталог BAZA WWW недоступний: $($bazaWWWDetection.Reason)" -Level "ERROR"
             $bazaWWWSourceAvailable = $false
+            $pathCheckFailureCount++
         }
     }
     if ($bazaWWWLocalSyncEnabled) {
@@ -3859,6 +5372,7 @@ function Main {
             -Path $bazaWWWPaths.Destination `
             -Description "Каталог архiву BAZA WWW" `
             -CreateIfMissing $true
+        if (-not $bazaWWWDestinationAvailable) { $pathCheckFailureCount++ }
     }
 
     $allPathsExist = (
@@ -3870,12 +5384,89 @@ function Main {
         $bazaWWWDestinationAvailable
     )
     Show-PathCheckSummary -CheckedPaths $requiredPaths -AllPathsExist $allPathsExist
+
+    # SYSTEM access preflight. Test-Path підтверджує тільки існування, тому
+    # перед будь-яким backup виконуємо фактичний write/read-back probe в
+    # кожному required writable каталозі й read-only enumeration джерел.
+    #
+    # dev.16: раніше "Перевірка шляхів" рендерилась ТУТ (одразу після
+    # $allPathsExist), ДО цього preflight — оператор бачив OK, а кілька
+    # рядків нижче production операції скасовувались через провал SYSTEM
+    # access probe. Крок тепер рендериться ПІСЛЯ обчислення
+    # $systemAccessValid (нижче), об'єднуючи існування шляхів і фактичний
+    # доступ в один Result.
+    $systemAccessValid = $true
+    # BRAVO_ARCHIV пише лише власні логи ($logPath = RuntimeRoot\LOGS),
+    # backup-дані (BackupRoot) і машинний стан (ProgramData\State). Системні
+    # журнали (SystemLogRoot) — зона BRAVO_MAINTENANCE, тому тут не пробуються.
+    $writeProbePaths = @(
+        [string]$logPath,
+        [string]$backupRootPath,
+        (Split-Path -Path ([string]$operationLockSettings.Path) -Parent),
+        [string]$stateRoot
+    )
+    foreach ($archive in $enabledArchives) {
+        $writeProbePaths += [string]$archive.Destination
+        $writeProbePaths += [System.IO.Path]::Combine([string]$archive.Destination, '.work')
+    }
+    if ($bazaAppLocalSyncEnabled) { $writeProbePaths += [string]$bazaAppPaths.Destination }
+    if ($bazaWWWLocalSyncEnabled) { $writeProbePaths += [string]$bazaWWWPaths.Destination }
+    foreach ($probePath in @($writeProbePaths |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique)) {
+        $writeProbe = Test-BRAVOFileSystemWriteProbe -Path ([string]$probePath)
+        if ($writeProbe.Success) {
+            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe OK: $probePath" -Level 'DEBUG'
+        } else {
+            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe FAILED: $probePath ($($writeProbe.Error))" -Level 'ERROR'
+            $systemAccessValid = $false
+            $pathCheckFailureCount++
+        }
+    }
+    $sourceProbePaths = @($enabledArchives | ForEach-Object { [string]$_.Source })
+    if ($bazaAppLocalSyncEnabled -or $bazaAppSFTPSyncEnabled) { $sourceProbePaths += [string]$bazaAppPaths.Source }
+    if ($bazaWWWLocalSyncEnabled -or $bazaWWWSFTPSyncEnabled) { $sourceProbePaths += [string]$bazaWWWPaths.Source }
+    foreach ($probePath in @($sourceProbePaths |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
+            Select-Object -Unique)) {
+        $readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probePath)
+        if ($readProbe.Success) {
+            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe OK: $($readProbe.Path)" -Level 'DEBUG'
+        } else {
+            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe FAILED: $probePath ($($readProbe.Error))" -Level 'ERROR'
+            $systemAccessValid = $false
+            $pathCheckFailureCount++
+        }
+    }
+    if (-not $systemAccessValid) {
+        Write-BRAVOLog -Component 'PATHS' -Message 'Production operations cancelled because SYSTEM access preflight failed' -Level 'ERROR'
+        $readyArchives = @()
+        $bazaAppSourceAvailable = $false
+        $bazaAppDestinationAvailable = $false
+        $bazaWWWSourceAvailable = $false
+        $bazaWWWDestinationAvailable = $false
+        $operationFailed = $true
+    }
+
+    # dev.16: "Перевірка шляхів" рендериться ТУТ — ПІСЛЯ і existence-
+    # перевірок (Test-PathWithLog вище), і фактичного SYSTEM write/read
+    # access preflight (щойно вище), не до нього. OK лише коли ОБИДВІ
+    # групи пройшли; Details — компактний підсумок кількості провалів,
+    # повні шляхи й помилки лишаються в LOG (Show-PathCheckSummary/
+    # Write-BRAVOLog вище).
+    $pathCheckFullyValid = $allPathsExist -and $systemAccessValid
     Write-BRAVOArchiveStep `
         -Name "Перевірка шляхів" `
-        -Status $(if ($allPathsExist) { 'OK' } else { 'ERROR' }) `
-        -Details $(if ($allPathsExist) { '' } else { 'Частина шляхів недоступна; деталі у журналі.' })
+        -Status $(if ($pathCheckFullyValid) { 'OK' } else { 'ERROR' }) `
+        -Details $(if ($pathCheckFullyValid) { '' } else { "недоступних шляхів/перевірок: $pathCheckFailureCount" })
 
     # Синхронізація BAZA APP
+    # dev.16: top-level Archive operation — власний numbered step, коли
+    # реально увімкнена (Total уже враховує це вище); вимкнений компонент
+    # і далі не займає рядка й не входить у знаменник. ERROR/WARNING
+    # відповідно до ІСНУЮЧОЇ семантики нижче (шлях недоступний -> ERROR,
+    # Sync-Folders повернув false -> WARNING) — сама семантика не змінена.
+    $bazaAppSyncStartedAt = Get-Date
     if ($bazaAppLocalSyncEnabled -and $bazaAppSourceAvailable -and $bazaAppDestinationAvailable) {
         Show-ScriptProgress -Status "Локальна синхронiзацiя BAZA APP" -PercentComplete 20
         Write-Log "==="
@@ -3888,14 +5479,24 @@ function Main {
             Write-Log "Помилка синхронiзацiї BAZA APP - архiвацiя може бути неповною" -Level "WARNING"
             $operationFailed = $true
         }
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_APP" `
+            -Status $(if ($syncSuccess) { 'OK' } else { 'WARNING' }) `
+            -Duration ((Get-Date) - $bazaAppSyncStartedAt)
     } elseif ($bazaAppLocalSyncEnabled) {
         Write-Log "Локальну синхронiзацiю BAZA APP пропущено через помилку шляху" -Level "ERROR"
         $operationFailed = $true
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_APP" `
+            -Status 'ERROR' `
+            -Duration ((Get-Date) - $bazaAppSyncStartedAt) `
+            -Details 'недоступне джерело або каталог призначення; деталі у журналі.'
     } else {
         Write-Log "Локальну синхронiзацiю BAZA APP вимкнено в конфiгурацiї" -Level "INFO"
     }
 
     # Синхронізація BAZA WWW (локальна копія)
+    $bazaWWWSyncStartedAt = Get-Date
     if ($bazaWWWLocalSyncEnabled -and $bazaWWWSourceAvailable -and $bazaWWWDestinationAvailable) {
         Show-ScriptProgress -Status "Локальна синхронiзацiя BAZA WWW" -PercentComplete 20
         Write-Log "==="
@@ -3908,134 +5509,407 @@ function Main {
             Write-Log "Помилка синхронiзацiї BAZA WWW - архiвацiя може бути неповною" -Level "WARNING"
             $operationFailed = $true
         }
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_WWW" `
+            -Status $(if ($syncSuccess) { 'OK' } else { 'WARNING' }) `
+            -Duration ((Get-Date) - $bazaWWWSyncStartedAt)
     } elseif ($bazaWWWLocalSyncEnabled) {
         Write-Log "Локальну синхронiзацiю BAZA WWW пропущено через помилку шляху" -Level "ERROR"
         $operationFailed = $true
+        Write-BRAVOArchiveStep `
+            -Name "Локальна синхронізація BAZA_WWW" `
+            -Status 'ERROR' `
+            -Duration ((Get-Date) - $bazaWWWSyncStartedAt) `
+            -Details 'недоступне джерело або каталог призначення; деталі у журналі.'
     } else {
         Write-Log "Локальну синхронiзацiю BAZA WWW вимкнено в конфiгурацiї" -Level "INFO"
     }
-    
-    # Створення архівів
+
+    # Створення архівів.
+    #
+    # ОДИН VSS Snapshot Set на всю generation створюється ДО циклу і
+    # видаляється лише після нього. Раніше знімок робився всередині циклу
+    # перед кожним компонентом — MODEL о 15:43, BLOG о 15:51, BRAVOEXCH о
+    # 15:55 — і три файли одного "backup" фіксували три різні стани
+    # працюючої системи. Відновлення з такого комплекту дає неузгоджену базу.
     $archiveIndex = 0
+    $generationId = if ($readyArchives.Count -gt 0) {
+        Get-BRAVOCollisionSafeGenerationId `
+            -BaseGenerationId $backupGenerationId `
+            -Archives $readyArchives `
+            -ArchivePrefix $archivePrefix `
+            -HashExtension $hashFileExtension
+    } else {
+        $backupGenerationId
+    }
+    if ($generationId -ne $backupGenerationId) {
+        Write-Log "GenerationId $backupGenerationId уже має фінальні backup-артефакти; нову generation заплановано як $generationId" -Level "WARNING"
+    }
+    $script:backupGenerationId = $generationId
+    $generationSnapshotSet = $null
+    $generationResults = New-Object System.Collections.Generic.List[object]
+    $generationFinalizationFailed = $false
+    $generationFinalizationFailureReason = $null
 
-    foreach ($archive in $readyArchives) {
-        $archiveIndex++
-        $archiveProgress = 30 + [Math]::Floor((($archiveIndex - 1) / [Math]::Max(1, $readyArchives.Count)) * 40)
-        Show-ScriptProgress -Status "Архiвацiя $($archive.Type) ($archiveIndex з $($readyArchives.Count))" -PercentComplete $archiveProgress
-        Show-ItemProgress `
-            -Id 10 `
-            -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" `
-            -Item $archive.Type `
-            -Current $archiveIndex `
-            -Total $readyArchives.Count
-        $archiveName = $archive.NameTemplate -f $archivePrefix, $now
-        Write-Log "==="
-        Write-Log "=== АРХIВАЦIЯ $($archive.Type) ==="
-        $archiveStepStarted = Get-Date
-        $success = $false
-        $vssSnapshot = $null
-        try {
-            $vssSnapshot = New-BRAVOVSSSnapshot -SourcePath $archive.Source
-            $success = New-Archive `
-                -SourcePath $vssSnapshot.SourcePath `
-                -ArchivePath $archive.Destination `
-                -ArchiveName $archiveName `
-                -ArcPath $arcPath `
-                -ArcParams $archiveParams
-        } catch {
-            Write-Log "Не вдалося виконати узгоджену VSS-архівацію $($archive.Type): $($_.Exception.Message)" -Level "ERROR"
-            $success = $false
-        } finally {
-            if ($null -ne $vssSnapshot) {
-                if (-not (Remove-BRAVOVSSSnapshot -Snapshot $vssSnapshot)) {
-                    $operationFailed = $true
-                }
-            }
-        }
-        
-        if ($success) {
+    try {
+        if ($readyArchives.Count -gt 0) {
             Write-Log "==="
-            Write-Log "=== СТВОРЕННЯ ХЕШУ $($archive.Type) ==="
-            $hashProgress = [Math]::Min(69, $archiveProgress + 8)
-            Show-ScriptProgress -Status "Створення SHA512 для $($archive.Type)" -PercentComplete $hashProgress
-            $archivePath = Join-Path $archive.Destination $archiveName
-            $hashPath = "$archivePath$hashFileExtension"
-            $hashSuccess = New-SHA512Hash -FilePath $archivePath -HashFilePath $hashPath
-            
-            $results[$archive.Type] = @{
-                ArchivePath = $archivePath
-                HashPath = $hashPath
-                ArchiveSuccess = $success
-                HashSuccess = $hashSuccess
-            }
-        } else {
-            $results[$archive.Type] = @{
-                ArchiveSuccess = $false
-                HashSuccess = $false
-            }
-        }
-
-        # Розмір і тривалість показуємо в консолі коротко; повні шляхи,
-        # аргументи 7-Zip і його вивід лишаються в журналі.
-        $archiveStepDuration = (Get-Date) - $archiveStepStarted
-        $archiveStepDetails = $archiveStepDuration.ToString($durationFormat)
-        $sizeAnomalyResult = $null
-        if ($success) {
-            $createdArchivePath = Join-Path $archive.Destination $archiveName
-            if (Test-Path -LiteralPath $createdArchivePath -PathType Leaf) {
-                $createdArchiveSize = (Get-Item -LiteralPath $createdArchivePath).Length
-                $archiveStepDetails = "{0} / {1}" -f
-                    (Format-BRAVOFileSize -Bytes $createdArchiveSize),
-                    $archiveStepDuration.ToString($durationFormat)
-
-                # AUD-008 (аудит P1.6): sanity-check обсягу — технічно
-                # валідний архів все одно може бути підозріло малим через
-                # неправильне джерело чи зламані permissions. Не блокує
-                # (лишає ArchiveSuccess/HashSuccess як є), лише сигналізує.
-                if ($hashSuccess -and
-                    [bool]$backupMonitoring.SizeSanity.Enabled) {
-                    try {
-                        $sizeAnomalyResult = Test-BRAVOBackupSizeAnomaly `
-                            -NewArchiveBytes $createdArchiveSize `
-                            -HistoryDirectory $archive.Destination `
-                            -ArchiveFilter $archiveFileFilter `
-                            -HashFileExtension $hashFileExtension `
-                            -ExcludeArchivePath $createdArchivePath `
-                            -HistoryCount ([int]$backupMonitoring.SizeSanity.HistoryCount) `
-                            -MinimumBytes ([int64]$backupMonitoring.SizeSanity.MinimumBytes) `
-                            -MaxSizeDropPercent ([int]$backupMonitoring.SizeSanity.MaxSizeDropPercent)
-                        if ([bool]$sizeAnomalyResult.IsAnomaly) {
-                            Write-Log "Підозрілий розмір архіву $($archive.Type): $($sizeAnomalyResult.Reason)" -Level "WARNING"
-                        }
-                    } catch {
-                        Write-Log "Не вдалося виконати sanity-check обсягу для $($archive.Type): $($_.Exception.Message)" -Level "WARNING"
-                    }
+            Write-Log "=== VSS SNAPSHOT SET ДЛЯ GENERATION $generationId ==="
+            Show-ScriptProgress -Status "Створення VSS Snapshot Set" -PercentComplete 28
+            try {
+                $generationSnapshotSet = New-BRAVOVSSSnapshotSet `
+                    -SourcePaths @($readyArchives | ForEach-Object { [string]$_.Source })
+                try {
+                    [void](Save-BRAVOVSSOwnershipState `
+                        -StatePath $vssOwnershipStatePath `
+                        -SnapshotSet $generationSnapshotSet `
+                        -GenerationId $generationId)
+                } catch {
+                    # Continuing without an ownership record would make a
+                    # hard-killed process leave snapshots that cannot be
+                    # distinguished safely from third-party VSS resources.
+                    [void](Remove-BRAVOVSSSnapshotSet -SnapshotSet $generationSnapshotSet)
+                    $generationSnapshotSet = $null
+                    throw "VSS ownership state could not be persisted: $($_.Exception.Message)"
                 }
-                $results[$archive.Type].Bytes = $createdArchiveSize
-                $results[$archive.Type].SizeAnomaly = $sizeAnomalyResult
+            } catch {
+                # Жодного live fallback: архівувати робочі каталоги замість
+                # знімка означало б віддати неузгоджену копію під виглядом
+                # backup. Краще не мати нового backup, ніж мати такий.
+                Write-Log "VSS SNAPSHOT SET FAILED: $($_.Exception.Message)" -Level "ERROR"
+                Write-Log "Архівацію MODEL/BLOG/BRAVOEXCH скасовано: узгоджена копія без VSS неможлива, а архівація «живих» каталогів заборонена" -Level "ERROR"
+                $generationSnapshotSet = $null
+                $operationFailed = $true
+                foreach ($archive in $readyArchives) {
+                    $vssFailureResult = [pscustomobject]@{
+                        Component = $archive.Type
+                        GenerationId = $generationId
+                        OriginalSourcePath = [string]$archive.Source
+                        SnapshotSourcePath = $null
+                        TemporaryArchivePath = $null
+                        ArchivePath = $null
+                        HashPath = $null
+                        CreateSuccess = $false
+                        IntegritySuccess = $false
+                        HashSuccess = $false
+                        ArchiveSize = $null
+                        SHA512 = $null
+                        ErrorStage = 'VSS'
+                        Error = $_.Exception.Message
+                    }
+                    $generationResults.Add($vssFailureResult)
+                    $results[$archive.Type] = @{
+                        ArchiveSuccess = $false
+                        HashSuccess = $false
+                        CreateSuccess = $false
+                        IntegritySuccess = $false
+                        GenerationId = $generationId
+                        ErrorStage = 'VSS'
+                        Error = $_.Exception.Message
+                        ToolFailure = [pscustomobject]@{
+                            Tool = 'VSS'
+                            ToolExitCodeText = $null
+                            ReasonText = "VSS: $($_.Exception.Message)"
+                        }
+                    }
+                    Write-BRAVOArchiveStep `
+                        -Name ("Архівація {0}" -f $archive.Type) `
+                        -Status 'ERROR' `
+                        -Duration ([timespan]::Zero)
+                    Write-BRAVOOperatorReason `
+                        -Reason "VSS Snapshot Set не створено — архівація без узгодженого знімка заборонена" `
+                        -Details ("Не вдалося створити архів {0}" -f $archive.Type)
+                }
+                $readyArchives = @()
             }
         }
-        $archiveStepStatus = if (-not $success) {
-            'ERROR'
-        } elseif (-not $hashSuccess) {
-            'WARNING'
-        } elseif ($null -ne $sizeAnomalyResult -and [bool]$sizeAnomalyResult.IsAnomaly) {
-            'WARNING'
+
+        foreach ($archive in $readyArchives) {
+            $archiveIndex++
+            $archiveProgress = 30 + [Math]::Floor((($archiveIndex - 1) / [Math]::Max(1, $readyArchives.Count)) * 40)
+            Show-ScriptProgress -Status "Архiвацiя $($archive.Type) ($archiveIndex з $($readyArchives.Count))" -PercentComplete $archiveProgress
+            Show-ItemProgress `
+                -Id 10 `
+                -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" `
+                -Item $archive.Type `
+                -Current $archiveIndex `
+                -Total $readyArchives.Count
+            $archiveName = $archive.NameTemplate -f $archivePrefix, $generationId
+            Write-Log "==="
+            Write-Log "=== АРХIВАЦIЯ $($archive.Type) ==="
+            $archiveStepStarted = Get-Date
+            $script:lastArchiveToolFailure = $null
+            $componentResult = $null
+            try {
+                $snapshotSourcePath = Resolve-BRAVOSnapshotSourcePath `
+                    -SnapshotSet $generationSnapshotSet `
+                    -OriginalPath $archive.Source
+                $componentResult = Invoke-BRAVOComponentBackup `
+                    -Component $archive.Type `
+                    -GenerationId $generationId `
+                    -OriginalSourcePath ([string]$archive.Source) `
+                    -SourcePath $snapshotSourcePath `
+                    -DestinationDirectory $archive.Destination `
+                    -ArchiveName $archiveName `
+                    -ArcPath $arcPath `
+                    -ArcParams $archiveParams
+            } catch {
+                Write-Log "Не вдалося виконати узгоджену VSS-архівацію $($archive.Type): $($_.Exception.Message)" -Level "ERROR"
+                $componentResult = [pscustomobject]@{
+                    Component = $archive.Type
+                    GenerationId = $generationId
+                    OriginalSourcePath = [string]$archive.Source
+                    SnapshotSourcePath = $snapshotSourcePath
+                    TemporaryArchivePath = $null
+                    ArchivePath = $null
+                    HashPath = $null
+                    CreateSuccess = $false
+                    IntegritySuccess = $false
+                    HashSuccess = $false
+                    ArchiveSize = $null
+                    SHA512 = $null
+                    ErrorStage = 'VSS'
+                    Error = $_.Exception.Message
+                }
+            }
+            $generationResults.Add($componentResult)
+
+            $success = [bool]$componentResult.CreateSuccess -and [bool]$componentResult.IntegritySuccess
+            $hashSuccess = [bool]$componentResult.HashSuccess
+            # Публікація відбувається лише після SHA512, тому "архів є" і
+            # "hash є" — тепер одна подія, а не дві незалежні.
+            $componentPublished = $success -and $hashSuccess
+
+            if ($componentPublished) {
+                # dev.19: заголовок "=== СТВОРЕННЯ ХЕШУ ===" тепер друкує
+                # сам Invoke-BRAVOComponentBackup, безпосередньо перед
+                # New-SHA512Hash (хронологічно правильна позиція) — не тут,
+                # уже ПІСЛЯ повного завершення виклику. Show-ScriptProgress
+                # нижче — прогрес-бар, не журнал, лишається на своєму місці.
+                $hashProgress = [Math]::Min(69, $archiveProgress + 8)
+                Show-ScriptProgress -Status "SHA512 для $($archive.Type)" -PercentComplete $hashProgress
+                $results[$archive.Type] = @{
+                    ArchivePath = $componentResult.ArchivePath
+                    HashPath = $componentResult.HashPath
+                    ArchiveSuccess = $true
+                    HashSuccess = $true
+                    CreateSuccess = $true
+                    IntegritySuccess = $true
+                    GenerationId = $generationId
+                    SHA512 = $componentResult.SHA512
+                }
+            } else {
+                $results[$archive.Type] = @{
+                    ArchiveSuccess = $false
+                    HashSuccess = $false
+                    CreateSuccess = [bool]$componentResult.CreateSuccess
+                    IntegritySuccess = [bool]$componentResult.IntegritySuccess
+                    GenerationId = $generationId
+                    ErrorStage = [string]$componentResult.ErrorStage
+                    Error = [string]$componentResult.Error
+                    # Per-компонент, а не єдина script-scope змінна: якщо
+                    # відмовить кілька компонентів поспіль, фінальний РЕЗУЛЬТАТ
+                    # має показати причину САМЕ першого відмовленого, а не
+                    # випадково останню з циклу.
+                    ToolFailure = $script:lastArchiveToolFailure
+                }
+                $operationFailed = $true
+            }
+
+            # Розмір показуємо в консолі коротко (component-блок нижче); повні
+            # шляхи, аргументи 7-Zip і його вивід лишаються в журналі.
+            $archiveStepDuration = (Get-Date) - $archiveStepStarted
+            $sizeAnomalyResult = $null
+            $createdArchiveSize = $null
+            if ($componentPublished) {
+                $createdArchivePath = [string]$componentResult.ArchivePath
+                if (Test-Path -LiteralPath $createdArchivePath -PathType Leaf) {
+                    $createdArchiveSize = [int64]$componentResult.ArchiveSize
+
+                    # AUD-008 (аудит P1.6): sanity-check обсягу — технічно
+                    # валідний архів все одно може бути підозріло малим через
+                    # неправильне джерело чи зламані permissions. Не блокує
+                    # (лишає ArchiveSuccess/HashSuccess як є), лише сигналізує.
+                    if ([bool]$backupMonitoring.SizeSanity.Enabled) {
+                        try {
+                            $sizeAnomalyResult = Test-BRAVOBackupSizeAnomaly `
+                                -NewArchiveBytes $createdArchiveSize `
+                                -HistoryDirectory $archive.Destination `
+                                -ArchiveFilter $archiveFileFilter `
+                                -HashFileExtension $hashFileExtension `
+                                -ExcludeArchivePath $createdArchivePath `
+                                -HistoryCount ([int]$backupMonitoring.SizeSanity.HistoryCount) `
+                                -MinimumBytes ([int64]$backupMonitoring.SizeSanity.MinimumBytes) `
+                                -MaxSizeDropPercent ([int]$backupMonitoring.SizeSanity.MaxSizeDropPercent)
+                            if ([bool]$sizeAnomalyResult.IsAnomaly) {
+                                Write-Log "Підозрілий розмір архіву $($archive.Type): $($sizeAnomalyResult.Reason)" -Level "WARNING"
+                            }
+                        } catch {
+                            Write-Log "Не вдалося виконати sanity-check обсягу для $($archive.Type): $($_.Exception.Message)" -Level "WARNING"
+                        }
+                    }
+                    $results[$archive.Type].Bytes = $createdArchiveSize
+                    $results[$archive.Type].SizeAnomaly = $sizeAnomalyResult
+                }
+            }
+            $archiveStepStatus = if (-not $success) {
+                'ERROR'
+            } elseif (-not $hashSuccess) {
+                'ERROR'
+            } elseif ($null -ne $sizeAnomalyResult -and [bool]$sizeAnomalyResult.IsAnomaly) {
+                'WARNING'
+            } else {
+                'OK'
+            }
+            Write-BRAVOArchiveStep `
+                -Name ("Архівація {0}" -f $archive.Type) `
+                -Status $archiveStepStatus `
+                -Duration $archiveStepDuration
+
+            # Component-деталі (docs/OPERATOR_CONSOLE_UX.md §2): показуються
+            # ЛИШЕ коли artifact реально опубліковано. Створення, перевірка
+            # цілісності й SHA512 — три окремі факти, тому в рядках нижче
+            # немає жодного оптимістичного здогаду.
+            if ($componentPublished) {
+                Write-BRAVOConsoleDetail -Message ("Архів:".PadRight(11) + [IO.Path]::GetFileName([string]$componentResult.ArchivePath))
+                Write-BRAVOConsoleDetail -Message ("Розмір:".PadRight(11) + (Format-BRAVOFileSize -Bytes $createdArchiveSize))
+                Write-BRAVOConsoleDetail -Message ("SHA512:".PadRight(11) + 'OK')
+                Write-BRAVOConsoleDetail -Message ("Integrity:".PadRight(11) + 'OK')
+                if ($null -ne $sizeAnomalyResult -and [bool]$sizeAnomalyResult.IsAnomaly) {
+                    Write-BRAVOOperatorReason -Reason $sizeAnomalyResult.Reason
+                }
+            } else {
+                $failureReason = if ($null -ne $script:lastArchiveToolFailure) {
+                    $script:lastArchiveToolFailure.ReasonText
+                } elseif (-not [string]::IsNullOrWhiteSpace([string]$componentResult.Error)) {
+                    "$($componentResult.ErrorStage): $($componentResult.Error)"
+                } else {
+                    "не вдалося створити архів $($archive.Type)"
+                }
+                Write-BRAVOOperatorReason -Reason $failureReason -Details ("Не вдалося створити архів {0}" -f $archive.Type)
+            }
+        }
+    } finally {
+        # Знімки живуть до кінця циклу й видаляються тут за будь-якого
+        # результату: помилка одного компонента не має ані залишати shadow
+        # copies в системі, ані псувати вже створені артефакти.
+        if ($null -ne $generationSnapshotSet) {
+            if (Remove-BRAVOVSSSnapshotSet -SnapshotSet $generationSnapshotSet) {
+                try {
+                    if ([IO.File]::Exists($vssOwnershipStatePath)) {
+                        [IO.File]::Delete($vssOwnershipStatePath)
+                    }
+                } catch {
+                    # Exact ownership metadata may safely survive cleanup. On
+                    # the next run, absent IDs are treated as already removed.
+                    Write-BRAVOLog -Component 'VSS' -Message "VSS ownership state cleanup deferred: $($_.Exception.Message)" -Level 'WARNING'
+                }
+            } else {
+                # Keep ownership state so the next machine-wide lock owner can
+                # retry deletion of these exact BRAVO-created Shadow IDs.
+                $operationFailed = $true
+            }
+        }
+    }
+
+    # Статус generation: COMPLETE лише коли КОЖЕН увімкнений компонент
+    # пройшов усі три стадії. INCOMPLETE — знімок був, але щось не дійшло до
+    # публікації. FAILED — узгодженої копії не отримано взагалі.
+    #
+    # Уся фіналізація generation (підрахунок опублікованих, побудова state,
+    # запис manifest) обгорнута в try/catch: раніше виняток тут (після
+    # видалення VSS Snapshot Set, до Write-BRAVOBackupGenerationManifest)
+    # тихо обривав увесь прогін — без Generation COMPLETE, без manifest, без
+    # transfer/health, і НЕ потрапляв у BRAVO_ARCHIV log. Тепер повна
+    # діагностика (тип/повідомлення/розташування/стек) гарантовано логується,
+    # статус деградує, а виконання доходить до РЕЗУЛЬТАТ.
+    $generationManifestPath = $null
+    try {
+        $publishedComponentCount = @(
+            $generationResults | Where-Object {
+                [bool]$_.CreateSuccess -and [bool]$_.IntegritySuccess -and [bool]$_.HashSuccess
+            }
+        ).Count
+        $script:backupGenerationStatus = if ($null -eq $generationSnapshotSet -or $publishedComponentCount -eq 0) {
+            'FAILED'
+        } elseif ($publishedComponentCount -eq $enabledArchives.Count) {
+            'COMPLETE'
         } else {
-            'OK'
+            'INCOMPLETE'
         }
-        if ($null -ne $sizeAnomalyResult -and [bool]$sizeAnomalyResult.IsAnomaly) {
-            $archiveStepDetails = "$archiveStepDetails — $($sizeAnomalyResult.Reason)"
+        # Windows PowerShell 5.1 binder кидає System.ArgumentException
+        # ("Argument types do not match") для @($genericList). Явно
+        # materialize List[object], перш ніж передавати результати у state.
+        $generationResultsArray = $generationResults.ToArray()
+        $script:backupGenerationResults = $generationResultsArray
+        $script:backupGenerationState = New-BRAVOBackupGenerationState `
+            -GenerationId $generationId `
+            -StartedAt $scriptStartTime `
+            -SnapshotSet $generationSnapshotSet `
+            -Components $generationResultsArray `
+            -Status $script:backupGenerationStatus
+        if ($enabledArchives.Count -gt 0) {
+            try {
+                $generationManifestPath = Write-BRAVOBackupGenerationManifest `
+                    -GenerationState $script:backupGenerationState `
+                    -BackupRoot $backupRootPath
+            } catch {
+                Write-Log "Не вдалося записати manifest generation ${generationId}: $($_.Exception.Message)" -Level "WARNING"
+                $generationFinalizationFailed = $true
+                $generationFinalizationFailureReason = $_.Exception.Message
+                $script:backupGenerationStatus = 'FAILED'
+                $script:backupGenerationState.Status = 'FAILED'
+                $generationManifestPath = $null
+                $operationFailed = $true
+            }
         }
-        Write-BRAVOArchiveStep `
-            -Name ("Архівація {0}" -f $archive.Type) `
-            -Status $archiveStepStatus `
-            -Details $archiveStepDetails
+        if ($readyArchives.Count -gt 0 -or $enabledArchives.Count -gt 0) {
+            $generationLogLevel = if ($script:backupGenerationStatus -eq 'COMPLETE') { 'SUCCESS' } else { 'WARNING' }
+            Write-Log (
+                "Generation ${generationId}: $($script:backupGenerationStatus) " +
+                "(опубліковано $publishedComponentCount з $($enabledArchives.Count); " +
+                "VSS Snapshot Set: $(if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { 'не створено' }))"
+            ) -Level $generationLogLevel
+        }
+    } catch {
+        Write-BRAVOLogException -ErrorRecord $_ -Component 'GENERATION' -Context "Помилка фіналізації generation ${generationId}"
+        # Фіналізація не завершилась — узгодженого COMPLETE-стану немає.
+        # Деградуємо статус (COMPLETE тут був би неправдою) і продовжуємо до
+        # РЕЗУЛЬТАТ, щоб оператор побачив помилку й код завершення.
+        if ([string]::IsNullOrWhiteSpace([string]$script:backupGenerationStatus) -or
+            [string]$script:backupGenerationStatus -eq 'COMPLETE') {
+            $script:backupGenerationStatus = 'FAILED'
+        }
+        $generationFinalizationFailed = $true
+        $generationFinalizationFailureReason = $_.Exception.Message
+        $operationFailed = $true
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
-    
+
+    # dev.16: одна аггрегована unnumbered-операція "Очищення старих backup
+    # generation" покриває обидва блоки нижче (generation retention, що
+    # всередині Remove-BRAVOExpiredBackupGenerations також прибирає
+    # invalid/incomplete сети, + очищення обідніх архівів). Жодних окремих
+    # рядків на кожен внутрішній фільтр. Retention days/filters/delete
+    # semantics нижче не змінені.
+    $backupRetentionCleanupStartedAt = Get-Date
+    $backupRetentionCleanupPlanned = [bool]($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup)
+    $generationCleanupAttempted = $false
+    $generationCleanupSucceeded = $true
+    $generationCleanupDeletedCount = 0
+    # dev.16 (review round 3): ініціалізується ТУТ (не лише всередині
+    # if-гілки нижче) — інакше під Set-StrictMode посилання на неї в
+    # агрегованому результаті нижче кидає виняток, коли generation
+    # retention вимкнено/generation ще не COMPLETE цього прогону.
+    $archiveCleanupSectionShown = $false
+    $lunchCleanupAttempted = $false
+    $lunchCleanupSucceeded = $true
+    $lunchCleanupConfigError = $false
+    $lunchCleanupDeletedCount = 0
+
     # Видалення старих архівів: розділ логу з'являється лише перед фактичним видаленням.
-    if ($enableArchiveDeletion) {
+    if (($enableArchiveDeletion -or $enableFailedArchiveDeletion) -and
+        $script:backupGenerationStatus -eq 'COMPLETE') {
         $effectiveArchiveRetentionDays = 183
         # archiveVersions є лише у старих конфігах, тому читаємо його безпечно:
         # пряме звернення до неоголошеної змінної переривало б цю гілку.
@@ -4056,10 +5930,15 @@ function Main {
             Write-Log "archiveRetentionDays не вдалося прочитати; для безпеки застосовано $effectiveArchiveRetentionDays днів" -Level "WARNING"
         }
         $archiveCleanupSectionShown = $false
-        foreach ($archive in $enabledArchives) {
-            if (-not (Remove-OldBackupSets -Path $archive.Destination -RetentionDays $effectiveArchiveRetentionDays -Component $archive.Type -CleanupSectionShown ([ref]$archiveCleanupSectionShown))) {
-                $operationFailed = $true
-            }
+        $generationCleanupAttempted = $true
+        if (-not (Remove-BRAVOExpiredBackupGenerations `
+                -BackupRoot $backupRootPath `
+                -CurrentGenerationId $generationId `
+                -RetentionDays $effectiveArchiveRetentionDays `
+                -CleanupSectionShown ([ref]$archiveCleanupSectionShown) `
+                -RemovedGenerationCount ([ref]$generationCleanupDeletedCount))) {
+            $operationFailed = $true
+            $generationCleanupSucceeded = $false
         }
     }
 
@@ -4081,12 +5960,63 @@ function Main {
         if ([string]::IsNullOrWhiteSpace([string]$lunchArchiveCleanupPath) -or $lunchArchiveDirectories.Count -eq 0) {
             Write-Log "Очищення обідніх архівів увімкнено, але lunchArchiveCleanupPath або lunchArchiveCleanupDirectories не налаштовано" -Level "ERROR"
             $operationFailed = $true
-        } elseif (-not (Remove-OldLunchArchives `
-            -ArchiveRoot $lunchArchiveCleanupPath `
-            -Directories $lunchArchiveDirectories `
-            -RetentionMonths $effectiveLunchArchiveRetentionMonths)) {
-            $operationFailed = $true
+            $lunchCleanupAttempted = $true
+            $lunchCleanupConfigError = $true
+        } else {
+            $lunchCleanupAttempted = $true
+            if (-not (Remove-OldLunchArchives `
+                -ArchiveRoot $lunchArchiveCleanupPath `
+                -Directories $lunchArchiveDirectories `
+                -RetentionMonths $effectiveLunchArchiveRetentionMonths `
+                -RemovedFileCount ([ref]$lunchCleanupDeletedCount))) {
+                $operationFailed = $true
+                $lunchCleanupSucceeded = $false
+            }
         }
+    }
+
+    $backupRetentionCleanupAttempted = $generationCleanupAttempted -or $lunchCleanupAttempted
+    $backupRetentionCleanupFailed = (-not $generationCleanupSucceeded) -or $lunchCleanupConfigError -or (-not $lunchCleanupSucceeded)
+    # dev.16 (review round 3): OK лише коли щось РЕАЛЬНО видалено —
+    # attempted+succeeded-без-видалень тепер SKIPPED "даних для очищення
+    # немає", не OK. Факт-сигнали: $archiveCleanupSectionShown встановлює
+    # Show-ArchiveCleanupSection ЛИШЕ безпосередньо перед фактичним
+    # видаленням generation (не при самій лише перевірці); $lunchCleanupDeletedCount —
+    # реальний $deletedCount, який Remove-OldLunchArchives вже рахує для
+    # LOG. Обидва значення — факт, не вигадані числа.
+    $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0)
+    # dev.18: numbered [N/TOTAL] крок — раніше unnumbered
+    # Write-BRAVOOperationResult. $backupRetentionCleanupPlanned (той
+    # самий вираз, що Total вище і План) тепер вирішує, чи крок
+    # РЕНДЕРИТЬСЯ ВЗАГАЛІ (повністю вимкнено -> жодного рядка, жодного
+    # SKIPPED-заповнювача), а не лише його статус — Total і фактична
+    # наявність рядка більше не можуть розійтися. Позиція виклику (після
+    # публікації всіх component, до "Передача на SFTP") не змінена.
+    if ($backupRetentionCleanupPlanned) {
+        Write-BRAVOArchiveStep `
+            -Name 'Очищення старих backup generation' `
+            -Status $(
+                if ($backupRetentionCleanupFailed) { 'ERROR' }
+                elseif (-not $backupRetentionCleanupAttempted) { 'SKIPPED' }
+                elseif (-not $backupRetentionCleanupDidDelete) { 'SKIPPED' }
+                else { 'OK' }
+            ) `
+            -Duration ((Get-Date) - $backupRetentionCleanupStartedAt) `
+            -Details $(
+                if ($backupRetentionCleanupFailed) { 'перевірте LOG для деталей' }
+                elseif (-not $backupRetentionCleanupAttempted) { 'відкладено: generation не завершено COMPLETE у цьому циклі' }
+                elseif (-not $backupRetentionCleanupDidDelete) { 'даних для очищення немає' }
+                else {
+                    $retentionCleanupDetailParts = @()
+                    if ($generationCleanupDeletedCount -gt 0) {
+                        $retentionCleanupDetailParts += "generation: $generationCleanupDeletedCount"
+                    }
+                    if ($lunchCleanupDeletedCount -gt 0) {
+                        $retentionCleanupDetailParts += "обідніх файлів: $lunchCleanupDeletedCount"
+                    }
+                    $retentionCleanupDetailParts -join '; '
+                }
+            )
     }
     
     # Передача на SFTP
@@ -4103,9 +6033,6 @@ function Main {
         if (-not $sftpConfigurationValid) {
             Write-Log "Передачу на SFTP пропущено через помилки конфiгурацiї" -Level "ERROR"
             $operationFailed = $true
-        } elseif (-not (Test-NetworkConnection)) {
-            Write-Log "Мережеве з'єднання недоступне - пропускаємо передачу на SFTP" -Level "ERROR"
-            $operationFailed = $true
         } elseif (-not (Test-SFTPConnection -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey)) {
             Write-Log "Помилка пiдключення до SFTP - пропускаємо передачу" -Level "ERROR"
             $operationFailed = $true
@@ -4115,6 +6042,9 @@ function Main {
                 $requiredSFTPDirectories += @(
                     $enabledArchives | ForEach-Object { [string]$sftpDirectories[$_.Type] }
                 )
+                if (-not [string]::IsNullOrWhiteSpace($generationManifestPath)) {
+                    $requiredSFTPDirectories += [string]$sftpDirectories.Manifest
+                }
             }
             if ($bazaAppSFTPSyncEnabled) {
                 $requiredSFTPDirectories += [string]$sftpDirectories.BAZA
@@ -4129,6 +6059,7 @@ function Main {
                 -RemoteDirectories $requiredSFTPDirectories
 
             if ($sftpArchiveUploadEnabled) {
+                $transferResults.ArchiveUpload.Attempted = $true
                 $uploadSuccess = 0
                 $uploadQueue = @()
 
@@ -4149,8 +6080,16 @@ function Main {
                         }
                     }
                 }
+                if (-not [string]::IsNullOrWhiteSpace($generationManifestPath) -and
+                    (Test-Path -LiteralPath $generationManifestPath -PathType Leaf)) {
+                    $uploadQueue += [pscustomobject]@{
+                        LocalPath = $generationManifestPath
+                        RemoteDirectory = [string]$sftpDirectories.Manifest
+                    }
+                }
 
                 $uploadTotal = $uploadQueue.Count
+                $transferResults.ArchiveUpload.Total = $uploadTotal
                 if ($uploadTotal -gt 0) {
                     Show-ScriptProgress -Status "Завантаження архiвiв на SFTP" -PercentComplete 82
                     Write-Log "==="
@@ -4179,14 +6118,21 @@ function Main {
                 Show-ItemProgress -Id 13 -Activity "BRAVO_ARCHIV — завантаження на SFTP" -Completed
 
                 if ($uploadTotal -gt 0) {
+                    $transferResults.ArchiveUpload.Completed = $uploadSuccess
+                    $transferResults.ArchiveUpload.Remaining = $uploadTotal - $uploadSuccess
+                    $transferResults.ArchiveUpload.Success = ($uploadSuccess -eq $uploadTotal)
                     $uploadLevel = if ($uploadSuccess -eq $uploadTotal) { "SUCCESS" } else { "ERROR" }
                     Write-Log "Завантажено $uploadSuccess з $uploadTotal файлiв на SFTP" -Level $uploadLevel
                     if ($uploadSuccess -ne $uploadTotal) {
+                        $transferResults.ArchiveUpload.Error = "завантажено $uploadSuccess з $uploadTotal файлів"
                         $operationFailed = $true
                     }
                 } else {
+                    $transferResults.ArchiveUpload.Success = ($enabledArchives.Count -eq 0)
+                    $transferResults.ArchiveUpload.Remaining = 0
                     Write-Log "Немає успiшно створених архiвiв для завантаження на SFTP" -Level "WARNING"
                     if ($enabledArchives.Count -gt 0) {
+                        $transferResults.ArchiveUpload.Error = 'немає опублікованих локальних архівів для передачі'
                         $operationFailed = $true
                     }
                 }
@@ -4195,15 +6141,26 @@ function Main {
             }
 
             if ($bazaAppSFTPSyncEnabled -and $bazaAppSourceAvailable) {
+                $transferResults.BAZA_APP.Attempted = $true
                 Show-ScriptProgress -Status "Синхронiзацiя BAZA APP на SFTP" -PercentComplete 90
                 Write-Log "==="
                 Write-Log "=== СИНХРОНIЗАЦIЯ BAZA APP НА SFTP ==="
                 $bazaAppSFTPSync = Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
+                $transferResults.BAZA_APP.Success = [bool]$bazaAppSFTPSync
+                if ($null -ne $script:lastBAZASyncOutcome) {
+                    $transferResults.BAZA_APP.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+                    $transferResults.BAZA_APP.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+                    $transferResults.BAZA_APP.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+                    $transferResults.BAZA_APP.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+                }
                 if (-not $bazaAppSFTPSync) {
+                    $transferResults.BAZA_APP.Error = 'post-sync verification failed'
                     Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP" -Level "WARNING"
                     $operationFailed = $true
                 }
             } elseif ($bazaAppSFTPSyncEnabled) {
+                $transferResults.BAZA_APP.Success = $false
+                $transferResults.BAZA_APP.Error = 'локальний source path недоступний'
                 Write-Log "Синхронiзацiю BAZA APP на SFTP пропущено через помилку локального шляху" -Level "ERROR"
                 $operationFailed = $true
             } else {
@@ -4211,6 +6168,7 @@ function Main {
             }
 
             if ($bazaWWWSFTPSyncEnabled -and $bazaWWWSourceAvailable) {
+                $transferResults.BAZA_WWW.Attempted = $true
                 Show-ScriptProgress -Status "Синхронiзацiя BAZA WWW на SFTP" -PercentComplete 91
                 Write-Log "==="
                 Write-Log "=== СИНХРОНIЗАЦIЯ BAZA WWW НА SFTP ==="
@@ -4221,11 +6179,21 @@ function Main {
                     -LocalDirectory $bazaWWWPaths.Source `
                     -RemoteDirectory $sftpDirectories.BAZAWWW `
                     -ComponentName "BAZA WWW"
+                $transferResults.BAZA_WWW.Success = [bool]$bazaWWWSFTPSync
+                if ($null -ne $script:lastBAZASyncOutcome) {
+                    $transferResults.BAZA_WWW.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+                    $transferResults.BAZA_WWW.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+                    $transferResults.BAZA_WWW.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+                    $transferResults.BAZA_WWW.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+                }
                 if (-not $bazaWWWSFTPSync) {
+                    $transferResults.BAZA_WWW.Error = 'post-sync verification failed'
                     Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP" -Level "WARNING"
                     $operationFailed = $true
                 }
             } elseif ($bazaWWWSFTPSyncEnabled) {
+                $transferResults.BAZA_WWW.Success = $false
+                $transferResults.BAZA_WWW.Error = 'локальний source path недоступний'
                 Write-Log "Синхронiзацiю BAZA WWW на SFTP пропущено через помилку автоматичного визначення шляху" -Level "ERROR"
                 $operationFailed = $true
             } else {
@@ -4235,13 +6203,34 @@ function Main {
     } else {
         Write-Log "Усi компоненти передачi на SFTP вимкнено в конфiгурацiї" -Level "INFO"
     }
-    if ($sftpTransferEnabled) {
-        $sftpStepFailed = (Get-BRAVOLogStatistics).Errors -gt $errorsBeforeSftp
-        Write-BRAVOArchiveStep `
-            -Name "Передача архівів на SFTP" `
-            -Status $(if ($sftpStepFailed) { 'ERROR' } else { 'OK' }) `
-            -Details $(if ($sftpStepFailed) { 'Деталі записано у журнал.' } else { '' })
+    foreach ($transferKey in @('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW')) {
+        $transferResult = $transferResults[$transferKey]
+        if (-not [bool]$transferResult.Enabled) { continue }
+        if ($null -eq $transferResult.Success) {
+            $transferResult.Success = $false
+            if ([string]::IsNullOrWhiteSpace([string]$transferResult.Error)) {
+                $transferResult.Error = 'SFTP configuration or connection failed before this operation'
+            }
+        }
+        $transferStepStatus = if (-not [bool]$transferResult.Success) {
+            'ERROR'
+        } elseif ([bool]$transferResult.Degraded) {
+            'WARNING'
+        } else {
+            'OK'
+        }
+        $transferStepDetails = if ([bool]$transferResult.Degraded) {
+            "сумісні об'єкти синхронізовано; несумісних імен: $($transferResult.IncompatibleNames)"
+        } else {
+            [string]$transferResult.Error
+        }
+        Write-BRAVOArchiveStep -Name ([string]$transferResult.Name) -Status $transferStepStatus -Details $transferStepDetails
     }
+    $sftpStepFailed = @(
+        @('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW') | Where-Object {
+            [bool]$transferResults[$_].Enabled -and -not [bool]$transferResults[$_].Success
+        }
+    ).Count -gt 0
 
     # Копіювання успішно створених архівів та hash-файлів на NAS/SMB
     $errorsBeforeSmb = (Get-BRAVOLogStatistics).Errors
@@ -4255,15 +6244,25 @@ function Main {
             Write-Log "Копіювання на NAS/SMB пропущено через помилки конфігурації" -Level "ERROR"
             $operationFailed = $true
         } else {
-            $smbCopyResult = Copy-ArchivesToSMB -ArchiveResults $results
+            $smbCopyResult = Copy-ArchivesToSMB `
+                -ArchiveResults $results `
+                -GenerationManifestPath $generationManifestPath
+            $transferResults.SMB.Total = [int]$smbCopyResult.Total
+            $transferResults.SMB.Completed = [int]$smbCopyResult.Success
+            $transferResults.SMB.Remaining = [int]$smbCopyResult.Total - [int]$smbCopyResult.Success
             if ($smbCopyResult.Total -eq 0) {
+                $transferResults.SMB.Success = ($enabledArchives.Count -eq 0)
+                $transferResults.SMB.Error = 'немає опублікованих локальних архівів для копіювання'
                 Write-Log "Немає успішно створених архівів для копіювання на NAS/SMB" -Level "WARNING"
                 if ($enabledArchives.Count -gt 0) {
                     $operationFailed = $true
                 }
             } elseif ($smbCopyResult.Success -eq $smbCopyResult.Total) {
+                $transferResults.SMB.Success = $true
                 Write-Log "Скопійовано $($smbCopyResult.Success) з $($smbCopyResult.Total) файлів на NAS/SMB" -Level "SUCCESS"
             } else {
+                $transferResults.SMB.Success = $false
+                $transferResults.SMB.Error = "скопійовано $($smbCopyResult.Success) з $($smbCopyResult.Total) файлів"
                 Write-Log "Скопійовано $($smbCopyResult.Success) з $($smbCopyResult.Total) файлів на NAS/SMB" -Level "ERROR"
                 $operationFailed = $true
             }
@@ -4272,7 +6271,7 @@ function Main {
         Write-Log "Копіювання архівів на NAS/SMB вимкнено в конфігурації" -Level "INFO"
     }
     if ($smbArchiveCopyEnabled) {
-        $smbStepFailed = (Get-BRAVOLogStatistics).Errors -gt $errorsBeforeSmb
+        $smbStepFailed = -not [bool]$transferResults.SMB.Success
         Write-BRAVOArchiveStep `
             -Name "Копіювання архівів на NAS/SMB" `
             -Status $(if ($smbStepFailed) { 'ERROR' } else { 'OK' }) `
@@ -4306,7 +6305,10 @@ function Main {
     # Читається у фінальному резолвері коду виходу нижче незалежно від того,
     # чи здійснювалась перевірка health-check.
     $healthCriticalFailure = $false
+    $notificationFailure = $false
+    $healthCheckResult = $null
     if ($healthCheckEnabled) {
+        $transferResults.Health.Attempted = $true
         Show-ScriptProgress -Status "Перевiрка стану резервних копiй" -PercentComplete 96
         Write-Log "==="
         Write-Log "=== ПЕРЕВIРКА СТАНУ РЕЗЕРВНИХ КОПIЙ ==="
@@ -4333,36 +6335,55 @@ function Main {
                 $healthCheckResult = Invoke-BRAVOHealthCheck @healthParameters
                 switch ($healthCheckResult.Status) {
                     "Healthy" {
+                        $transferResults.Health.Success = $true
                         Write-Log "Health-check: усi резервнi копiї актуальнi; повідомлення: $($healthCheckResult.Notification)" -Level "SUCCESS"
                     }
                     "Disabled" {
+                        $transferResults.Health.Success = $true
                         # Сам Health вважає це безпечним станом (вимкнено в
                         # конфігурації) і завершується з exit 0 — Archive не
                         # повинен трактувати чужий "вимкнено" як власну відмову.
                         Write-Log "Health-check вимкнено в конфігурації" -Level "INFO"
                     }
                     "Deferred" {
+                        $transferResults.Health.Success = $true
                         # Аналогічно: відкладено через паралельне завдання чи
                         # зайнятий lock — це не відмова, а штатне пропускання.
                         Write-Log "Health-check відкладено: інше завдання вже виконується" -Level "INFO"
                     }
                     "Critical" {
+                        $transferResults.Health.Success = $false
+                        $transferResults.Health.Error = "issues: $($healthCheckResult.IssueCount)"
                         Write-Log "Health-check: знайдено проблем: $($healthCheckResult.IssueCount); повідомлення: $($healthCheckResult.Notification)" -Level "ERROR"
                         $operationFailed = $true
                         $healthCriticalFailure = $true
                     }
                     "NotificationError" {
-                        Write-Log "Health-check завершився, але повідомлення не вiдправлено: $($healthCheckResult.Error)" -Level "ERROR"
-                        $operationFailed = $true
-                        $healthCriticalFailure = $true
+                        $healthHasIssues = [int]$healthCheckResult.IssueCount -gt 0
+                        $transferResults.Health.Success = -not $healthHasIssues
+                        $transferResults.Health.Error = $(if ($healthHasIssues) { "issues: $($healthCheckResult.IssueCount)" } else { $null })
+                        $transferResults.Notification.Enabled = $true
+                        $transferResults.Notification.Attempted = $true
+                        $transferResults.Notification.Success = $false
+                        $transferResults.Notification.Error = [string]$healthCheckResult.Error
+                        Write-Log "Health-check завершився; notification failed: $($healthCheckResult.Error)" -Level "WARNING"
+                        $notificationFailure = $true
+                        if ($healthHasIssues) {
+                            $operationFailed = $true
+                            $healthCriticalFailure = $true
+                        }
                     }
                     default {
+                        $transferResults.Health.Success = $false
+                        $transferResults.Health.Error = "unexpected status: $($healthCheckResult.Status)"
                         Write-Log "Health-check завершився зі статусом: $($healthCheckResult.Status)" -Level "WARNING"
                         $operationFailed = $true
                         $healthCriticalFailure = $true
                     }
                 }
         } catch {
+            $transferResults.Health.Success = $false
+            $transferResults.Health.Error = $_.Exception.Message
             Write-Log "Помилка запуску окремого health-check: $($_.Exception.Message)" -Level "ERROR"
             $operationFailed = $true
             $healthCriticalFailure = $true
@@ -4385,7 +6406,7 @@ function Main {
     Set-BRAVOLogComponent -Component 'SUMMARY'
     Write-Log "Результат: $(if ($operationFailed) {'ПОМИЛКА'} else {'УСПIШНО'})" -NoTimestamp
     Write-Log "==="
-    if (-not $operationFailed) {
+    if ($script:backupGenerationStatus -eq 'COMPLETE') {
         Write-BRAVOBackupExecutionState
     }
     Show-ScriptProgress -Status "Завершено" -PercentComplete 100
@@ -4398,42 +6419,169 @@ function Main {
     } else {
         'УСПІШНО'
     }
-    $summaryMetrics = New-Object System.Collections.Specialized.OrderedDictionary
-    $summaryMetrics.Add('Архівів створено', ("{0} з {1}" -f $successCount, $totalCount))
-    if ($sftpTransferEnabled) {
-        $summaryMetrics.Add('Передача на SFTP', $(if ($sftpStepFailed) { 'з помилками' } else { 'виконано' }))
+    $summaryStatusColor = switch ($summaryResult) {
+        'УСПІШНО'  { 'Green' }
+        'ЧАСТКОВО' { 'Yellow' }
+        default    { 'Red' }
     }
-    if ($smbArchiveCopyEnabled) {
-        $summaryMetrics.Add('Копіювання на NAS/SMB', $(if ($smbStepFailed) { 'з помилками' } else { 'виконано' }))
-    }
-    $summaryMetrics.Add('Попереджень', [string]$logStatistics.Warnings)
-    $summaryMetrics.Add('Помилок', [string]$logStatistics.Errors)
-    Write-BRAVOSummary `
-        -Result $summaryResult `
-        -Duration $duration `
-        -Metrics $summaryMetrics `
-        -LogFile $script:logFile
+
+    # Код завершення в консолі має завжди збігатися з фактичним process
+    # exit code (docs/MANUAL_RUN_CONSOLE_UX.md) — тому обчислюємо його ДО
+    # друку РЕЗУЛЬТАТ, а не після, як було раніше (Write-BRAVOSummary тоді
+    # ще не міг показати код: він з'являвся лише нижче за течією).
+    $anyLocalArchiveFailed = @(
+        $results.Values | Where-Object { -not [bool]$_.CreateSuccess }
+    ).Count -gt 0
+    $anyIntegrityTestFailed = @(
+        $results.Values | Where-Object {
+            [bool]$_.CreateSuccess -and -not [bool]$_.IntegritySuccess
+        }
+    ).Count -gt 0
+    $anyHashValidationFailed = @(
+        $results.Values | Where-Object {
+            [bool]$_.CreateSuccess -and
+            [bool]$_.IntegritySuccess -and
+            -not [bool]$_.HashSuccess
+        }
+    ).Count -gt 0
     if ($operationFailed) {
         # Один раз, тут, читаємо вже наявний стан секцій Main і визначаємо
         # найпріоритетнішу категорію відмови — жодна з ~26 точок
         # $operationFailed = $true вище не редагувалась.
-        $anyLocalArchiveFailed = @(
-            $results.Values | Where-Object { -not $_.ArchiveSuccess }
-        ).Count -gt 0
-        $anyIntegrityTestFailed = @(
-            $results.Values | Where-Object { $_.ArchiveSuccess -and -not $_.HashSuccess }
-        ).Count -gt 0
         $script:processExitCode = Resolve-BRAVOExitCode `
-            -InvalidConfiguration:(-not $sftpConfigurationValid -or -not $smbConfigurationValid -or -not $archiveConsistencyValid) `
+            -InvalidConfiguration:(-not $sftpConfigurationValid -or -not $smbConfigurationValid -or -not $archiveConsistencyValid -or -not $systemAccessValid) `
             -CredentialsUnavailable:(-not $archiveCredentialValid) `
-            -LocalArchiveFailed:$anyLocalArchiveFailed `
+            -LocalArchiveFailed:($anyLocalArchiveFailed -or $generationFinalizationFailed) `
             -IntegrityTestFailed:$anyIntegrityTestFailed `
+            -HashValidationFailed:$anyHashValidationFailed `
             -SftpFailed:([bool]$sftpStepFailed) `
             -SmbFailed:([bool]$smbStepFailed) `
             -HealthCritical:$healthCriticalFailure
     } elseif ($logStatistics.Warnings -gt 0) {
         $script:processExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
+
+    # Причина/Інструмент/Код інструменту показуються лише коли головний
+    # результат дійсно спричинений конкретним локальним компонентом
+    # (docs/MANUAL_RUN_CONSOLE_UX.md) — перший відмовлений компонент за
+    # стабільним порядком archiveDefinitions, не випадковий "останній".
+    $firstFailedComponent = $null
+    if ($anyLocalArchiveFailed -or $anyIntegrityTestFailed -or $anyHashValidationFailed) {
+        $firstFailedComponent = $archiveDefinitions | Where-Object {
+            $results.ContainsKey($_.Type) -and -not $results[$_.Type].ArchiveSuccess
+        } | Select-Object -First 1
+    }
+    $summaryReason = $null
+    $summaryTool = $null
+    $summaryToolExitCode = $null
+    if ($generationFinalizationFailed) {
+        $summaryReason = Get-BRAVOArchiveGenerationFailureSummaryReason `
+            -GenerationFinalizationFailed $generationFinalizationFailed `
+            -GenerationFinalizationFailureReason $generationFinalizationFailureReason
+    } elseif ($null -ne $firstFailedComponent) {
+        $failedResult = $results[$firstFailedComponent.Type]
+        $summaryReason = switch ([string]$failedResult.ErrorStage) {
+            'VSS' { "VSS SNAPSHOT SET FAILED for $($firstFailedComponent.Type)" }
+            'INTEGRITY' { "Integrity test failed for $($firstFailedComponent.Type)" }
+            'HASH' { "SHA512 generation/verification failed for $($firstFailedComponent.Type)" }
+            'PUBLISH' { "Atomic publish failed for $($firstFailedComponent.Type)" }
+            default { "Не вдалося створити архів $($firstFailedComponent.Type)" }
+        }
+        $toolFailure = $results[$firstFailedComponent.Type].ToolFailure
+        if ($null -ne $toolFailure) {
+            $summaryTool = $toolFailure.Tool
+            $summaryToolExitCode = $toolFailure.ToolExitCodeText
+        }
+    } elseif ([bool]$sftpStepFailed) {
+        $summaryReason = "Не вдалося передати архіви на SFTP"
+    }
+
+    Write-BRAVOResultHeader `
+        -Status $summaryResult `
+        -StatusColor $summaryStatusColor `
+        -ExitCode $script:processExitCode `
+        -ExitCodeName (Get-BRAVOExitCodeName -Code $script:processExitCode) `
+        -Reason $summaryReason `
+        -Tool $summaryTool `
+        -ToolExitCode $summaryToolExitCode
+    Write-BRAVOResultField -Label 'Початок' -Value $scriptStartTime.ToString('dd.MM.yyyy HH:mm:ss')
+    Write-BRAVOResultField -Label 'Завершення' -Value $scriptEndTime.ToString('dd.MM.yyyy HH:mm:ss')
+    Write-BRAVOResultField -Label 'Тривалість' -Value (Format-BRAVODuration -Duration $duration)
+    Write-Host ''
+    Write-BRAVOResultField -Label 'Створено архівів' -Value ("{0} з {1}" -f $successCount, $totalCount)
+    Write-BRAVOResultField -Label 'Generation' -Value ([string]$script:backupGenerationId)
+    Write-BRAVOResultField -Label 'Generation status' -Value ([string]$script:backupGenerationStatus)
+    Write-BRAVOResultField `
+        -Label 'VSS Snapshot Set' `
+        -Value (Get-BRAVOArchiveVSSSummaryValue `
+            -SnapshotSet $generationSnapshotSet `
+            -EnabledArchiveCount $enabledArchives.Count)
+    # Measure-Object -Property не резолвить ключі Hashtable через reflection
+    # (results зберігає @{...}, не [pscustomobject]) — тому спершу проєктуємо
+    # значення через ForEach-Object, і лише готові числа йдуть у Measure-Object.
+    $totalCreatedBytes = (
+        $results.Values |
+            Where-Object { $_.ArchiveSuccess -and $null -ne $_.Bytes } |
+            ForEach-Object { $_.Bytes } |
+            Measure-Object -Sum
+    ).Sum
+    Write-BRAVOResultField -Label 'Загальний розмір' -Value (Format-BRAVOFileSize -Bytes $totalCreatedBytes)
+    foreach ($transferKey in @('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW')) {
+        $transferResult = $transferResults[$transferKey]
+        if (-not [bool]$transferResult.Enabled) { continue }
+        $transferValue = if (-not [bool]$transferResult.Success) {
+            'ERROR'
+        } elseif ([bool]$transferResult.Degraded) {
+            "WARNING (несумісних імен: $($transferResult.IncompatibleNames))"
+        } else { 'OK' }
+        Write-BRAVOResultField -Label ([string]$transferResult.Name) -Value $transferValue
+    }
+
+    # Локальний manifest є фінальним state object для generation. Remote
+    # copy, переданий раніше разом з архівами, фіксує publish-time стан;
+    # локальна версія після transfer/health містить повний operational result.
+    if ($null -ne $script:backupGenerationState -and
+        -not [string]::IsNullOrWhiteSpace($generationManifestPath)) {
+        $script:backupGenerationState.TransferResults = $transferResults
+        $script:backupGenerationState.HealthResult = $healthCheckResult
+        try {
+            $generationManifestPath = Write-BRAVOBackupGenerationManifest `
+                -GenerationState $script:backupGenerationState `
+                -BackupRoot $backupRootPath
+        } catch {
+            Write-BRAVOLog -Component 'SUMMARY' -Message "Не вдалося фіналізувати generation manifest: $($_.Exception.Message)" -Level 'WARNING'
+        }
+    }
+    if ($smbArchiveCopyEnabled) {
+        Write-BRAVOResultField -Label 'SMB' -Value $(if ($smbStepFailed) { 'ERROR' } else { 'OK' })
+    }
+    if ($healthCheckEnabled) {
+        Write-BRAVOResultField -Label 'Post-backup health' -Value $(if ([bool]$transferResults.Health.Success) { 'OK' } else { 'CRITICAL' })
+    }
+    if ($notificationFailure) {
+        Write-BRAVOResultField -Label 'Notification' -Value 'ERROR (backup data unaffected)'
+    }
+
+    # Архіви: усі заплановані компоненти в стабільному порядку
+    # archiveDefinitions — успішний component показує розмір і повний
+    # шлях окремим рядком, невдалий — ERROR без вигаданого шляху.
+    if ($archiveDefinitions.Count -gt 0) {
+        Write-BRAVOResultSection -Title 'Архіви'
+        foreach ($definition in $archiveDefinitions) {
+            if (-not [bool]$definition.Enabled) {
+                continue
+            }
+            $componentResult = $results[$definition.Type]
+            if ($null -ne $componentResult -and [bool]$componentResult.ArchiveSuccess) {
+                Write-Host ("  {0,-12}{1}" -f $definition.Type, (Format-BRAVOFileSize -Bytes $componentResult.Bytes))
+                Write-Host ("    {0}" -f $componentResult.ArchivePath)
+            } else {
+                Write-Host ("  {0,-12}ERROR" -f $definition.Type)
+                Write-Host ("    Архів не створено")
+            }
+        }
+    }
+    Write-BRAVOResultFooter -LogFile $script:logFile
 }
 
 # Запуск головної функції
@@ -4443,26 +6591,49 @@ $script:archiveProcessLockPath = $null
 try {
     Main
 } catch {
-    # Значення тут здебільшого символічне: throw нижче не дає скрипту дійти
-    # до власного Exit, і саме .psm1-обгортка (try/catch навколо виклику
-    # runtime, коміт 1ba0bbb) визначає код, що реально побачить процес —
-    # вона так само повертає 90. Лишаємо узгодженим із контрактом.
+    # Порядок обробки краху (ТЗ «exception visibility»): спершу повна
+    # діагностика в лог, потім операторський ERROR + код завершення, і лише
+    # ПОТІМ — cleanup і manual pause (у finally). Раніше catch просто робив
+    # throw: пауза у finally спрацьовувала ще до того, як виняток десь
+    # показувався чи логувався, тож оператор бачив "натисніть клавішу" без
+    # жодної причини, а стек не потрапляв у BRAVO_ARCHIV log.
+    $fatalErrorRecord = $_
+    $fatalMessage = [string]$fatalErrorRecord.Exception.Message
     $script:processExitCode = 90
-    throw
+    try {
+        Write-BRAVOArchiveFatalDiagnostics `
+            -ErrorRecord $fatalErrorRecord `
+            -Context 'Неочікувана помилка виконання BRAVO_ARCHIV'
+    } catch {
+        # Ранній збій може статись і до повної ініціалізації log writer.
+        # Не дозволяємо помилці діагностики замаскувати первинний exception.
+        Write-Host (
+            "[ERROR] BRAVO_ARCHIV: $fatalMessage " +
+            "(не вдалося записати повну діагностику: $($_.Exception.Message))"
+        ) -ForegroundColor Red
+    }
+    try {
+        Write-BRAVOResultHeader `
+            -Status 'ERROR' `
+            -StatusColor ([ConsoleColor]::Red) `
+            -ExitCode $script:processExitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $script:processExitCode) `
+            -Reason $fatalMessage
+        Write-BRAVOResultFooter -LogFile $script:logFile
+    } catch {
+        # Консоль могла не встигнути ініціалізуватися (крах на ранній стадії) —
+        # тоді показуємо мінімум, але процес усе одно завершиться кодом 90.
+        Write-Host ("[ERROR] BRAVO_ARCHIV: $fatalMessage (код 90)") -ForegroundColor Red
+    }
+    # НЕ re-throw: скрипт доходить до власного Exit $script:processExitCode
+    # нижче (=90), тож .psm1-обгортка отримує той самий код через $LASTEXITCODE.
 } finally {
     if ($script:archiveProcessLock) {
         $script:archiveProcessLock.Dispose()
         $script:archiveProcessLock = $null
     }
-    if (-not [string]::IsNullOrWhiteSpace(
-            [string]$script:archiveProcessLockPath
-        ) -and
-        (Test-Path -LiteralPath $script:archiveProcessLockPath -PathType Leaf)) {
-        Remove-Item `
-            -LiteralPath $script:archiveProcessLockPath `
-            -Force `
-            -ErrorAction SilentlyContinue
-    }
+    # Lock-файл з останньою metadata лишається на диску. Його існування не
+    # означає активного процесу; авторитетним є лише exclusive handle.
     if ($script:smbCredential -and $script:smbCredential.Password) {
         $script:smbCredential.Password.Dispose()
         $script:smbCredential = $null

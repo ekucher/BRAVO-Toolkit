@@ -8,6 +8,9 @@ $helperLoggingPath = Join-Path $PSScriptRoot "modules\BRAVO.HelperLogging\BRAVO.
 Import-Module -Name $helperLoggingPath -ErrorAction Stop
 $null = Start-BRAVOHelperLog -ScriptPath $PSCommandPath -ConfigPath $ConfigPath
 
+$tasksInstallConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.Console.psd1"
+Import-Module -Name $tasksInstallConsoleModulePath -ErrorAction Stop
+
 $bravoScriptDirectory = if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
     Split-Path -Path $PSCommandPath -Parent
 } elseif (-not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)) {
@@ -35,7 +38,6 @@ try {
     [void](Initialize-BRAVOConsoleEncoding -CodePage 65001)
     $script:BRAVOCompatibility = Get-BRAVOCompatibilityInfo
     $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
-    $script:BRAVOWindowsPatchLevel = Get-BRAVOWindowsPatchLevelRecommendation
 } catch {
     Write-Error "Помилка сумісності: $($_.Exception.Message)"
     Complete-BRAVOHelperLog -ExitCode 1
@@ -43,10 +45,11 @@ try {
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
     Write-Warning $BRAVOPowerShellUpdate.Message
 }
-if ($BRAVOWindowsPatchLevel.IsUpdateRecommended) {
-    Write-Warning $BRAVOWindowsPatchLevel.Message
-}
-
+# Свіжість накопичувальних оновлень Windows — health-метрика, а не умова
+# запуску. Її місце в BRAVO_HEALTH, який для цього й існує: тут вона лише
+# додавала WARNING (а отже, ненульовий код завершення 10) до операції, на
+# результат якої вік патчів не впливає жодним чином. Перевірки платформи
+# (ОС, build, PowerShell, .NET, архітектура, API) лишаються на місці.
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -69,7 +72,7 @@ function Set-BRAVOProtectedRuntimeAcl {
         throw (
             "SYSTEM-завдання не можна встановлювати з профілю користувача: " +
             "$resolvedRoot. Перенесіть runtime до захищеного каталогу, " +
-            "наприклад C:\LIMS\ARCHIV."
+            "наприклад C:\BRAVO."
         )
     }
     $inheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
@@ -249,15 +252,9 @@ function ConvertTo-BRAVOMultipleInstancesPolicy {
     }
 }
 
-function ConvertTo-BRAVOLogonType {
-    param([string]$Value)
-
-    switch ($Value) {
-        "Interactive" { return 3 }    # TASK_LOGON_INTERACTIVE_TOKEN
-        "ServiceAccount" { return 5 } # TASK_LOGON_SERVICE_ACCOUNT
-        default { throw "Непідтримуваний LogonType: $Value" }
-    }
-}
+# ConvertTo-BRAVOSchedulerLogonType і Get-BRAVOExpectedSchedulerPrincipal
+# перенесено до модуля BRAVO.System: Installer застосовує expected principal
+# під час створення, а Diagnose перевіряє проти НЬОГО ж — спільне правило.
 
 function New-BRAVOTaskDefinition {
     param(
@@ -293,10 +290,13 @@ function New-BRAVOTaskDefinition {
         )
     }
 
-    $logonType = ConvertTo-BRAVOLogonType -Value ([string]$schedulerSettings.LogonType)
-    $definition.Principal.UserId = [string]$schedulerSettings.RunAsUser
-    $definition.Principal.LogonType = $logonType
-    $definition.Principal.RunLevel = 1 # TASK_RUNLEVEL_HIGHEST
+    # Один канонічний розрахунок principal (BRAVO.System). Diagnose перевіряє
+    # фактичне визначення проти цих самих значень.
+    $expectedPrincipal = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings
+    $logonType = $expectedPrincipal.LogonType
+    $definition.Principal.UserId = $expectedPrincipal.UserId
+    $definition.Principal.LogonType = $expectedPrincipal.LogonType
+    $definition.Principal.RunLevel = $expectedPrincipal.RunLevel
 
     $triggerTime = if ($TaskType -eq "Health" -or $TaskType -eq "BAZASync") {
         ConvertTo-ScheduleTime `
@@ -384,9 +384,28 @@ function New-BRAVOTaskDefinition {
 
     return [pscustomobject]@{
         Definition = $validatedDefinition
-        LogonType = $logonType
-        UserId = [string]$schedulerSettings.RunAsUser
+        LogonType = $expectedPrincipal.LogonType
+        UserId = $expectedPrincipal.UserId
     }
+}
+
+function Format-BRAVOInstalledTaskSummaryNextRun {
+    param(
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync")]
+        [string]$TaskType,
+        $TaskSettings,
+        $NextRunTime
+    )
+
+    $nextRunArguments = @{
+        TaskType = $TaskType
+        NextRunTime = $NextRunTime
+    }
+    if ($TaskType -eq "Recovery") {
+        $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
+    }
+
+    return Format-BRAVOSchedulerNextRun @nextRunArguments
 }
 
 function Test-SchedulerConfiguration {
@@ -400,7 +419,10 @@ function Test-SchedulerConfiguration {
         -not (Test-Path -LiteralPath $credentialSettings.HelperPath -PathType Leaf)) {
         throw "Не знайдено модуль Credential Manager: $($credentialSettings.HelperPath)"
     }
-    $runtimeRoot = Split-Path -Path $ResolvedConfigPath -Parent
+    # RuntimeRoot — каталог КОМПЛЕКТУ (звідки запущено Installer), а не каталог
+    # конфігурації: модулі є runtime-ресурсами й лежать поруч зі скриптами.
+    # $global:runtimeRoot публікує завантажувач із -RuntimeRoot $bravoScriptDirectory.
+    $runtimeRoot = [string]$global:runtimeRoot
     $requiredModuleNames = @(
         'BRAVO.Compatibility',
         'BRAVO.Credentials',
@@ -547,44 +569,57 @@ if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
 $resolvedConfigPath = (Resolve-Path -Path $ConfigPath).Path
 try {
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
-    $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
+    $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
-        -ConfigPath $resolvedConfigPath
+        -ConfigPath $resolvedConfigPath `
+        -RuntimeRoot $bravoScriptDirectory
 
-    $bazaSftpEnabled = $false
-    if ($null -ne $componentSettings -and
-        $null -ne $componentSettings.Synchronization) {
-        $bazaSftpEnabled = [System.Convert]::ToBoolean(
-            $componentSettings.Synchronization.BAZA_APP_SFTP
-        )
-    }
-
-    if (-not $schedulerSettings.Contains("BAZASync")) {
-        $schedulerSettings.BAZASync = @{
-            Enabled = $bazaSftpEnabled
-            TaskName = "BRAVO BAZA Synchronization"
-            Description = "Синхронізація BAZA_APP із хмарним SFTP кожні 4 години"
-            ScriptPath = [string]$schedulerSettings.Backup.ScriptPath
-            StartAt = "00:00"
-            RepeatEveryHours = 4
-            ExecutionTimeLimitHours = 2
-        }
-    } else {
-        # BAZA Sync не повинен запускатися, якщо SFTP-синхронізацію BAZA_APP
-        # вимкнено у componentSettings.Synchronization.BAZA_APP_SFTP.
-        $schedulerSettings.BAZASync.Enabled = (
-            [System.Convert]::ToBoolean($schedulerSettings.BAZASync.Enabled) -and
-            $bazaSftpEnabled
-        )
-    }
+    # schedulerSettings.BAZASync (разом із його .Enabled) визначає BRAVO.config
+    # через канонічний $bazaSyncEffective (BAZA_APP_SFTP OR BAZA_WWW_SFTP).
+    # Installer більше НЕ синтезує цей вузол і не звужує його лише до
+    # BAZA_APP_SFTP: інакше валідна пара BAZA_APP_SFTP=$false/BAZA_WWW_SFTP=$true
+    # мовчки лишала б BAZA_WWW без запланованої синхронізації, а Diagnose (який
+    # читає config напряму) не бачив би BAZASync взагалі.
 
     # Розклад є єдиним джерелом правди у BRAVO.config. Інсталятор не має
     # непомітно змінювати періодичність health-check під час реєстрації задач.
+
+    Initialize-BRAVOConsole
+    Initialize-BRAVOProgress -Enabled $false
+    Write-BRAVOHeader `
+        -Title ("BRAVO Tasks Setup {0}" -f $global:ScriptVersion) `
+        -Institution ([string]$bravoSettings.InstitutionName) `
+        -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+        -Mode $(if ($ValidateOnly) { 'VALIDATE' } else { 'INSTALL' })
+    $script:BRAVOTasksInstallStepTotal = 4
+    $script:BRAVOTasksInstallStepCurrent = 0
+    function Write-BRAVOTasksInstallStep {
+        param(
+            [Parameter(Mandatory = $true)][string]$Name,
+            [ValidateSet('OK', 'SKIPPED', 'WARNING', 'ERROR')][string]$Status = 'OK',
+            [string]$Details
+        )
+        $script:BRAVOTasksInstallStepCurrent++
+        Write-BRAVOStepResult `
+            -Current $script:BRAVOTasksInstallStepCurrent `
+            -Total $script:BRAVOTasksInstallStepTotal `
+            -Name $Name `
+            -Status $Status
+        if (-not [string]::IsNullOrWhiteSpace($Details)) {
+            if ($Status -eq 'SKIPPED') {
+                Write-BRAVOSkipReason -Reason $Details
+            } elseif ($Status -in @('WARNING', 'ERROR')) {
+                Write-BRAVOOperatorReason -Reason $Details
+            } else {
+                Write-BRAVOStepDetail -Message $Details
+            }
+        }
+    }
 
     $taskPath = ConvertTo-BRAVOTaskPath -TaskPath $schedulerSettings.TaskPath
     Test-SchedulerConfiguration -ResolvedConfigPath $resolvedConfigPath
@@ -627,7 +662,11 @@ try {
         $schedulerSettings.Contains("RequireProtectedRuntime") -and
         [System.Convert]::ToBoolean($schedulerSettings.RequireProtectedRuntime)
     )
-    $runtimeRoot = Split-Path -Path $resolvedConfigPath -Parent
+    # ACL hardening застосовується до RuntimeRoot (каталог, який SYSTEM
+    # виконує), а не до каталогу конфігурації. Раніше тут стояло
+    # Split-Path $resolvedConfigPath, тому при -ConfigPath з іншого каталогу
+    # захищався б не той каталог.
+    $runtimeRoot = [string]$global:runtimeRoot
     if ($requireProtectedRuntime) {
         $profileRoot = [IO.Path]::GetFullPath(
             [Environment]::GetFolderPath("UserProfile")
@@ -639,7 +678,7 @@ try {
             $unsafeRuntimeMessage = (
                 "SYSTEM runtime розташований у профілі користувача: " +
                 "$runtimeRoot. Фактична інсталяція буде відхилена; " +
-                "перенесіть комплект до C:\LIMS\ARCHIV."
+                "перенесіть комплект до C:\BRAVO."
             )
             if ($ValidateOnly) {
                 Write-Warning $unsafeRuntimeMessage
@@ -650,15 +689,20 @@ try {
     }
     if ($ValidateOnly) {
         if ($requireProtectedRuntime) {
-            Write-Host "[ПЕРЕВІРКА] Перед інсталяцією буде захищено ACL runtime: $runtimeRoot" -ForegroundColor Cyan
+            Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status SKIPPED -Details "лише перевірка: $runtimeRoot"
+        } else {
+            Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status SKIPPED -Details 'лише перевірка'
         }
+        Write-BRAVOTasksInstallStep -Name 'Task Scheduler Operational log' -Status SKIPPED -Details 'лише перевірка'
     } else {
         if ($requireProtectedRuntime) {
             Set-BRAVOProtectedRuntimeAcl -RuntimeRoot $runtimeRoot
+            Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status OK
         } else {
-            Write-Warning "RequireProtectedRuntime=false: SYSTEM виконуватиме файли без автоматичного hardening ACL."
+            Write-BRAVOTasksInstallStep -Name 'Захист runtime ACL' -Status WARNING -Details 'RequireProtectedRuntime=false: SYSTEM виконуватиме файли без автоматичного hardening ACL.'
         }
         Enable-BRAVOTaskSchedulerOperationalLog
+        Write-BRAVOTasksInstallStep -Name 'Task Scheduler Operational log' -Status OK
     }
 
     $taskFolder = Get-BRAVOScheduledTaskFolder -TaskService $taskService -TaskPath $taskPath
@@ -666,6 +710,12 @@ try {
         $taskFolder = Ensure-ScheduledTaskFolder -TaskService $taskService -TaskPath $taskPath
     }
 
+    # Банер-перед-циклом (той самий патерн, що Setup для дочірніх процесів):
+    # кожен запис завдання друкує власний "[ПЕРЕВІРКА]"/"встановлено" рядок
+    # усередині цього кроку, тому "OK" з'являється ПІСЛЯ них, а не ковтає їх.
+    $script:BRAVOTasksInstallStepCurrent++
+    Write-Host ("[{0}/{1}] Створення завдань" -f $script:BRAVOTasksInstallStepCurrent, $script:BRAVOTasksInstallStepTotal) -ForegroundColor Cyan
+    $taskSummaries = New-Object System.Collections.Generic.List[object]
     foreach ($taskPlan in $taskPlans) {
         $taskSettings = $taskPlan.Settings
         $taskName = [string]$taskSettings.TaskName
@@ -698,6 +748,12 @@ try {
                     $existingTask.Enabled = $false
                     Write-Host "Завдання вимкнено: $taskPath$taskName" -ForegroundColor Yellow
                 }
+                $taskSummaries.Add([pscustomobject]@{
+                    Name = $taskName
+                    Status = if ($ValidateOnly) { 'БУДЕ ВИМКНЕНО' } else { 'DISABLED' }
+                    Account = $null
+                    NextRun = $null
+                })
             } else {
                 Write-Host "Завдання вимкнено в конфігурації: $taskPath$taskName" -ForegroundColor DarkGray
             }
@@ -725,6 +781,12 @@ try {
                 }
             }
             Write-Host "[ПЕРЕВІРКА] $taskPath$taskName — $scheduleText" -ForegroundColor Cyan
+            $taskSummaries.Add([pscustomobject]@{
+                Name = $taskName
+                Status = 'БУДЕ ВСТАНОВЛЕНО'
+                Account = [string]$schedulerSettings.RunAsUser
+                NextRun = $scheduleText
+            })
             continue
         }
 
@@ -758,39 +820,90 @@ try {
             )
         }
         Write-Host "Завдання встановлено: $($registeredTask.Path)" -ForegroundColor Green
+        $nextRunRaw = try { $registeredTask.NextRunTime } catch { $null }
+        $nextRunText = Format-BRAVOInstalledTaskSummaryNextRun `
+            -TaskType $taskPlan.Type `
+            -TaskSettings $taskSettings `
+            -NextRunTime $nextRunRaw
+        $taskSummaries.Add([pscustomobject]@{
+            Name = $taskName
+            Status = if ($null -eq $existingTaskBeforeChange) { 'INSTALLED' } else { 'UPDATED' }
+            Account = $actualTaskUser
+            NextRun = $nextRunText
+        })
     }
 
     $installationCommitted = $true
 
-    if ($ValidateOnly) {
-        Write-Host "Конфігурація планувальника коректна. Системні зміни не виконувалися." -ForegroundColor Green
-    } else {
-        if ($schedulerSettings.LegacyTaskPath -and $schedulerSettings.LegacyTaskNames) {
-            $legacyTaskPath = ConvertTo-BRAVOTaskPath -TaskPath ([string]$schedulerSettings.LegacyTaskPath)
-            $legacyFolder = Get-BRAVOScheduledTaskFolder `
-                -TaskService $taskService `
-                -TaskPath $legacyTaskPath
-            foreach ($legacyTaskName in @($schedulerSettings.LegacyTaskNames)) {
-                $legacyTask = Get-BRAVORegisteredTask `
-                    -TaskFolder $legacyFolder `
-                    -TaskName ([string]$legacyTaskName)
-                if (-not $legacyTask) {
-                    continue
-                }
-                if ([int]$legacyTask.State -eq 4) {
-                    Write-Host "Старе завдання зараз виконується і залишене без змін: $legacyTaskPath$legacyTaskName" -ForegroundColor Yellow
-                    continue
-                }
-                try {
-                    $legacyFolder.DeleteTask([string]$legacyTaskName, 0)
-                    Write-Host "Старе завдання видалено після міграції: $legacyTaskPath$legacyTaskName" -ForegroundColor Yellow
-                } catch {
-                    Write-Warning "Нове завдання вже встановлено, але старе '$legacyTaskPath$legacyTaskName' не видалено: $($_.Exception.Message)"
-                }
+    if (-not $ValidateOnly -and
+        $schedulerSettings.LegacyTaskPath -and $schedulerSettings.LegacyTaskNames) {
+        $legacyTaskPath = ConvertTo-BRAVOTaskPath -TaskPath ([string]$schedulerSettings.LegacyTaskPath)
+        $legacyFolder = Get-BRAVOScheduledTaskFolder `
+            -TaskService $taskService `
+            -TaskPath $legacyTaskPath
+        foreach ($legacyTaskName in @($schedulerSettings.LegacyTaskNames)) {
+            $legacyTask = Get-BRAVORegisteredTask `
+                -TaskFolder $legacyFolder `
+                -TaskName ([string]$legacyTaskName)
+            if (-not $legacyTask) {
+                continue
+            }
+            if ([int]$legacyTask.State -eq 4) {
+                Write-Host "Старе завдання зараз виконується і залишене без змін: $legacyTaskPath$legacyTaskName" -ForegroundColor Yellow
+                continue
+            }
+            try {
+                $legacyFolder.DeleteTask([string]$legacyTaskName, 0)
+                Write-Host "Старе завдання видалено після міграції: $legacyTaskPath$legacyTaskName" -ForegroundColor Yellow
+            } catch {
+                Write-Warning "Нове завдання вже встановлено, але старе '$legacyTaskPath$legacyTaskName' не видалено: $($_.Exception.Message)"
             }
         }
-        Write-Host "Налаштування планувальника BRAVO завершено." -ForegroundColor Green
     }
+    Write-BRAVOTasksInstallStep -Name 'Перевірка конфігурації' -Status OK -Details $(
+        if ($ValidateOnly) { 'Конфігурація планувальника коректна. Системні зміни не виконувалися.' }
+        else { 'Налаштування планувальника BRAVO завершено.' }
+    )
+
+    if ($taskSummaries.Count -gt 0) {
+        Write-BRAVOResultBlankLine
+        Write-Host 'Завдання:'
+        foreach ($taskSummary in $taskSummaries) {
+            Write-BRAVOResultBlankLine
+            Write-Host ("  {0}" -f $taskSummary.Name)
+            $taskStatusColor = switch ($taskSummary.Status) {
+                { $_ -in @('INSTALLED', 'UPDATED') } { [ConsoleColor]::Green }
+                'БУДЕ ВСТАНОВЛЕНО' { [ConsoleColor]::Cyan }
+                default { [ConsoleColor]::Yellow }
+            }
+            Write-Host '    Статус:       ' -NoNewline
+            Write-Host $taskSummary.Status -ForegroundColor $taskStatusColor
+            if (-not [string]::IsNullOrWhiteSpace($taskSummary.Account)) {
+                Write-Host ("    Обліковий:    {0}" -f $taskSummary.Account)
+            }
+            if (-not [string]::IsNullOrWhiteSpace($taskSummary.NextRun)) {
+                Write-Host ("    Наступний:    {0}" -f $taskSummary.NextRun)
+            }
+        }
+    }
+
+    $installedCount = @($taskSummaries | Where-Object { $_.Status -eq 'INSTALLED' }).Count
+    $updatedCount = @($taskSummaries | Where-Object { $_.Status -eq 'UPDATED' }).Count
+    $plannedCount = @($taskSummaries | Where-Object { $_.Status -in @('БУДЕ ВСТАНОВЛЕНО', 'БУДЕ ВИМКНЕНО') }).Count
+
+    Write-BRAVOResultBlankLine
+    Write-BRAVOSeparator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-BRAVOSeparator
+    Write-BRAVOResultField -Label 'Статус' -Value 'УСПІШНО' -Color ([ConsoleColor]::Green)
+    if ($ValidateOnly) {
+        Write-BRAVOResultField -Label 'Заплановано' -Value ([string]$plannedCount)
+    } else {
+        Write-BRAVOResultField -Label 'Встановлено' -Value ([string]$installedCount)
+        Write-BRAVOResultField -Label 'Оновлено' -Value ([string]$updatedCount)
+        Write-BRAVOResultField -Label 'Помилок' -Value '0'
+    }
+    Write-BRAVOSeparator
     Complete-BRAVOHelperLog -ExitCode 0
 } catch {
     if (-not $ValidateOnly -and
@@ -826,6 +939,13 @@ try {
             }
         }
     }
+    Write-BRAVOResultBlankLine
+    Write-BRAVOSeparator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-BRAVOSeparator
+    Write-BRAVOResultField -Label 'Статус' -Value 'ПОМИЛКА' -Color ([ConsoleColor]::Red)
+    Write-BRAVOResultField -Label 'Причина' -Value $_.Exception.Message
+    Write-BRAVOSeparator
     Write-Error "Не вдалося налаштувати завдання: $($_.Exception.Message)"
     Complete-BRAVOHelperLog -ExitCode 1
 }

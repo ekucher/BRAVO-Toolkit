@@ -27,6 +27,9 @@ $script:BRAVOConsoleStatusColors = @{
     SKIPPED = 'DarkGray'
     WARNING = 'Yellow'
     ERROR   = 'Red'
+    PASS    = 'Green'
+    WARN    = 'Yellow'
+    FAIL    = 'Red'
 }
 
 function Initialize-BRAVOConsole {
@@ -130,6 +133,10 @@ function Format-BRAVOFileSize {
 # смугу, тому нічого не перекривається.
 $script:BRAVOConsoleProgressReservedLines = 6
 
+# Ширина ASCII-роздільників header/result block — той самий контракт для
+# усіх operator-facing скриптів (docs/OPERATOR_CONSOLE_UX.md, спільний каркас).
+$script:BRAVOConsoleSeparatorWidth = 60
+
 function Write-BRAVOHeader {
     [CmdletBinding()]
     param(
@@ -140,6 +147,19 @@ function Write-BRAVOHeader {
 
         [string]$InstitutionCode,
 
+        # За контрактом (docs/OPERATOR_CONSOLE_UX.md §1) заголовок завжди
+        # показує hostname — оператор, що дивиться на кілька відкритих
+        # консолей різних серверів, інакше не відрізнить їх на перший погляд.
+        [string]$ComputerName = $env:COMPUTERNAME,
+
+        # Режим запуску (MANUAL/SCHEDULED/READ-ONLY/... — довільний текст,
+        # кожен entrypoint визначає свій набір значень).
+        [string]$Mode,
+
+        # Час старту більше НЕ рендериться в заголовку (докладний Початок/
+        # Завершення/Тривалість — лише у фінальному РЕЗУЛЬТАТ, щоб не
+        # дублювати ту саму інформацію двічі). Параметр лишається заради
+        # сумісності викликів, які ще передають -StartedAt.
         [datetime]$StartedAt = (Get-Date),
 
         # Вбудований виклик (Health усередині кроку Archive) не повинен
@@ -168,18 +188,82 @@ function Write-BRAVOHeader {
         }
     }
 
+    $separator = '=' * $script:BRAVOConsoleSeparatorWidth
     Write-Host ''
-    Write-Host $Title -ForegroundColor Cyan
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host " $Title" -ForegroundColor Cyan
     if (-not [string]::IsNullOrWhiteSpace($Institution)) {
         $institutionLine = if ([string]::IsNullOrWhiteSpace($InstitutionCode)) {
-            "Установа: $Institution"
+            " $Institution"
         } else {
-            "Установа: $Institution [$InstitutionCode]"
+            " $Institution [$InstitutionCode]"
         }
         Write-Host $institutionLine
     }
-    Write-Host ("Початок: {0}" -f $StartedAt.ToString('yyyy-MM-dd HH:mm:ss'))
+    if (-not [string]::IsNullOrWhiteSpace($ComputerName)) {
+        Write-Host " $ComputerName"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Mode)) {
+        Write-Host " Режим: $Mode"
+    }
+    Write-Host $separator -ForegroundColor Cyan
     Write-Host ''
+}
+
+# dev.14: деякі entrypoints (Maintenance) хочуть Title і підсумковий статус
+# в ОДНОМУ рядку заголовка ("BRAVO MAINTENANCE — УСПІШНО"), тим самим
+# =-роздільником, що Write-BRAVOHeader — щоб фінальний блок виглядав як
+# продовження того самого титульного контракту, з яким прогін почався, а
+# не як інша "програма". Це НЕ заміна Write-BRAVOResultHeader (" РЕЗУЛЬТАТ",
+# -роздільник, окреме поле "Статус:") — той контракт лишається незмінним
+# і далі використовується Archive/Health/іншими; це окрема, паралельна
+# точка входу для доменів, які свідомо хочуть інший стиль заголовка
+# підсумку. Домен-специфічні поля (Код завершення/Початок/Завершення/...)
+# додаються звичайними Write-BRAVOResultField після цього виклику, так
+# само, як і після Write-BRAVOResultHeader.
+function Write-BRAVOFinalSummaryHeader {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][string]$Status,
+        [ConsoleColor]$StatusColor = [ConsoleColor]::White
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if ($script:BRAVOConsoleStepOpen) {
+        Write-Host ''
+        $script:BRAVOConsoleStepOpen = $false
+    }
+
+    $separator = '=' * $script:BRAVOConsoleSeparatorWidth
+    Write-Host ''
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host (" {0} — {1}" -f $Title, $Status) -ForegroundColor $StatusColor
+    Write-Host $separator -ForegroundColor Cyan
+    Write-Host ''
+}
+
+# dev.14: парний до Write-BRAVOFinalSummaryHeader — закриває підсумок тим
+# самим =-роздільником, що відкрив заголовок прогону, замість
+# '-'-роздільника й підпису "Детальний журнал:" з Write-BRAVOResultFooter
+# (той контракт лишається незмінним для Archive/Health/інших — окрема,
+# паралельна точка входу, не заміна).
+function Write-BRAVOFinalSummaryFooter {
+    [CmdletBinding()]
+    param([string]$LogFile)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+        Write-Host ''
+        Write-Host 'Журнал:'
+        Write-Host $LogFile -ForegroundColor DarkGray
+    }
+    Write-Host ''
+    Write-Host ('=' * $script:BRAVOConsoleSeparatorWidth) -ForegroundColor Cyan
 }
 
 function Get-BRAVOStepPrefixText {
@@ -211,6 +295,23 @@ function Write-BRAVOStep {
     $script:BRAVOConsoleStepOpen = $true
 }
 
+# Коротка тривалість mm:ss, довга (від години) HH:mm:ss — той самий поріг,
+# що docs/MANUAL_RUN_CONSOLE_UX.md задає для рядка етапу й для підсумку.
+function Format-BRAVODuration {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][timespan]$Duration)
+
+    if ($Duration.TotalHours -ge 1) {
+        return '{0:00}:{1:mm}:{1:ss}' -f [int][math]::Floor($Duration.TotalHours), $Duration
+    }
+    return '{0:mm}:{0:ss}' -f $Duration
+}
+
+# Ширина, до якої лівим краєм доповнюється текст статусу перед тривалістю —
+# "OK"/"WARNING"/"ERROR"/"PASS"/"SKIPPED" усі вирівнюються по одній колонці
+# (docs/MANUAL_RUN_CONSOLE_UX.md: "OK       09:41", "ERROR    00:07").
+$script:BRAVOConsoleStatusFieldWidth = 9
+
 function Write-BRAVOStepResult {
     [CmdletBinding()]
     param(
@@ -218,10 +319,18 @@ function Write-BRAVOStepResult {
         [Parameter(Mandatory = $true)][int]$Total,
         [Parameter(Mandatory = $true)][string]$Name,
 
-        [ValidateSet('RUNNING', 'OK', 'SKIPPED', 'WARNING', 'ERROR')]
+        [ValidateSet('RUNNING', 'OK', 'SKIPPED', 'WARNING', 'ERROR', 'PASS', 'WARN', 'FAIL')]
         [string]$Status = 'OK',
 
-        [string]$Details
+        # Сумісність зі старими викликами: короткий текст одразу за статусом
+        # на тому самому рядку. Нові виклики, що дотримуються повного
+        # контракту (docs/MANUAL_RUN_CONSOLE_UX.md), використовують окремо
+        # -Duration тут і Write-BRAVOOperatorReason під рядком етапу —
+        # -Details і -Duration навмисно взаємовиключні (Details лишається
+        # для короткого inline-випадку на кшталт "SKIPPED  усі вже існують").
+        [string]$Details,
+
+        [Nullable[timespan]]$Duration
     )
 
     if (-not $script:BRAVOConsoleEnabled) {
@@ -242,12 +351,138 @@ function Write-BRAVOStepResult {
     } else {
         'White'
     }
-    if ([string]::IsNullOrWhiteSpace($Details)) {
+    if ($null -ne $Duration) {
+        # PowerShell розгортає Nullable[timespan] у звичайний [timespan]
+        # одразу після успішного біндингу параметра — $Duration тут це вже
+        # НЕ обгортка Nullable, а сам TimeSpan (.Value кинув би помилку
+        # прив'язки аргументу в Format-BRAVODuration нижче).
+        $durationText = Format-BRAVODuration -Duration $Duration
+        $paddedStatus = $Status.PadRight($script:BRAVOConsoleStatusFieldWidth)
+        Write-Host $paddedStatus -ForegroundColor $statusColor -NoNewline
+        Write-Host $durationText
+    } elseif ([string]::IsNullOrWhiteSpace($Details)) {
         Write-Host $Status -ForegroundColor $statusColor
     } else {
         Write-Host $Status -ForegroundColor $statusColor -NoNewline
         Write-Host "  $Details" -ForegroundColor DarkGray
     }
+}
+
+# dev.16: рядок top-level операції, яка РЕАЛЬНО виконується, але свідомо
+# поза затвердженим numbered-контрактом [N/TOTAL] (Maintenance: Migration/
+# Cleanup/BRAVO_ARCHIV/AutoShutdown — жодна з них не збільшує TOTAL і не
+# рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок). Той самий
+# словник статусів, ширина, dots-заповнювач і duration-формат, що
+# Write-BRAVOStepResult — але, на відміну від нього, тут -Duration і
+# -Details НЕ взаємовиключні: Duration (якщо задано) завжди йде одразу за
+# статусом на тому самому рядку, а Details (будь-якою кількістю рядків)
+# завжди друкується під ним тим самим Write-BRAVOConsoleDetail, що й під
+# нумерованими кроками — 6 пробілів, без "Причина:"-префікса. Обидва
+# параметри можна передавати одночасно (затверджений render:
+# "Operation.......... OK       mm:ss" + рядок деталей нижче). Замість
+# "[N/TOTAL] Назва" рядок починається з 6-пробільного відступу, щоб
+# оператор одразу бачив: це продовження прогону, не восьмий+ пронумерований
+# крок.
+function Write-BRAVOOperationResult {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingWriteHost', '',
+        Justification = 'BRAVO.Console — виділена межа рендеру консолі; Write-Host тут архітектурно допустимий, як і в усіх інших Write-BRAVO*-функціях цього модуля (Write-BRAVOStepResult, Write-BRAVOHeaderSeparator тощо).')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+
+        [ValidateSet('OK', 'SKIPPED', 'WARN', 'FAIL')]
+        [string]$Status = 'OK',
+
+        [Nullable[timespan]]$Duration,
+
+        [string]$Details
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if ($script:BRAVOConsoleStepOpen) {
+        Write-Host ''
+        $script:BRAVOConsoleStepOpen = $false
+    }
+
+    $baseText = "      $Name"
+    $dots = '.' * [math]::Max(1, $script:BRAVOConsoleStepWidth - $baseText.Length)
+    Write-Host "$baseText$dots " -NoNewline
+
+    $statusColor = if ($script:BRAVOConsoleStatusColors.ContainsKey($Status)) {
+        $script:BRAVOConsoleStatusColors[$Status]
+    } else {
+        'White'
+    }
+    if ($null -ne $Duration) {
+        $durationText = Format-BRAVODuration -Duration $Duration
+        $paddedStatus = $Status.PadRight($script:BRAVOConsoleStatusFieldWidth)
+        Write-Host $paddedStatus -ForegroundColor $statusColor -NoNewline
+        Write-Host $durationText
+    } else {
+        Write-Host $Status -ForegroundColor $statusColor
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        foreach ($detailLine in ($Details -split "`r?`n")) {
+            Write-BRAVOConsoleDetail -Message $detailLine
+        }
+    }
+}
+
+# Причина/деталі під рядком етапу (docs/MANUAL_RUN_CONSOLE_UX.md):
+#   Причина: коротка операторська причина WARNING/ERROR
+#   Деталі:  необов'язковий короткий safe-текст, ніколи не stack trace
+# Обидва підписи вирівняні до однієї ширини, щоб текст після них починався
+# з однієї колонки незалежно від того, показано "Деталі" чи ні.
+function Write-BRAVOOperatorReason {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Reason,
+        [string]$Details,
+        [ConsoleColor]$Color = [ConsoleColor]::DarkGray
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-BRAVOConsoleDetail -Message ("Причина: {0}" -f $Reason) -Color $Color
+    if (-not [string]::IsNullOrWhiteSpace($Details)) {
+        Write-BRAVOConsoleDetail -Message ("Деталі:  {0}" -f $Details) -Color $Color
+    }
+}
+
+# Пояснення для SKIPPED-етапу: окремий рядок без "Причина:"-підпису, з
+# порожнім рядком перед ним — БЕЗ додаткового відступу перед текстом
+# (живий прогін показав, що 6-пробільний відступ Write-BRAVOConsoleDetail
+# тут зайвий: SKIPPED і так не претендує на вкладеність під WARNING/ERROR
+# "Причина:"/"Деталі:", які саме тому й мають свій відступ).
+function Write-BRAVOSkipReason {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Reason)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ''
+    Write-Host $Reason -ForegroundColor DarkGray
+}
+
+# Той самий безвідступний стиль, що Write-BRAVOSkipReason, — для простого
+# пояснення без підпису під кроком з ІНШИМ статусом (наприклад "оброблено
+# файлів: 1" під OK-кроком Maintenance). Live-прогін показав, що такий
+# текст мав виглядати ідентично до пояснення SKIPPED — оператор не
+# розрізняє "тип" анотації, лише бачить непослідовний відступ.
+function Write-BRAVOStepDetail {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host $Message -ForegroundColor DarkGray
 }
 
 function Write-BRAVOConsoleDetail {
@@ -369,6 +604,234 @@ function Write-BRAVOSummary {
     Write-Host ''
 }
 
+# Ширина поля підпису в блоці РЕЗУЛЬТАТ ("Статус:", "Код завершення:",
+# "Код інструменту:" — усі вирівнюються по одній колонці значення).
+$script:BRAVOResultLabelWidth = 18
+
+# Один рядок "Підпис: значення" у блоці РЕЗУЛЬТАТ — та сама колонка
+# вирівнювання, що й спільні поля Write-BRAVOResultHeader (Статус/Код
+# завершення/Причина/Інструмент), щоб домен-специфічні поля (Початок/
+# Завершення/Тривалість, Створено архівів, Перевірок тощо) не "спливали".
+function Write-BRAVOResultField {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [AllowEmptyString()][string]$Value,
+
+        # Опційно: для полів на кшталт Dry Run "Готовність" (ГОТОВО ДО
+        # ЗАПУСКУ/НЕ ГОТОВО), яким, на відміну від решти domain-specific
+        # полів, потрібен той самий кольоровий акцент, що вже має "Статус"
+        # у Write-BRAVOResultHeader. $null (типове значення) — поведінка
+        # не змінюється для жодного наявного виклику.
+        [Nullable[ConsoleColor]]$Color
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    $paddedLabel = ("{0}:" -f $Label).PadRight($script:BRAVOResultLabelWidth)
+    if ($null -ne $Color) {
+        Write-Host $paddedLabel -NoNewline
+        Write-Host $Value -ForegroundColor $Color
+    } else {
+        Write-Host ("{0}{1}" -f $paddedLabel, $Value)
+    }
+}
+
+# Довільний рядок прози всередині блоку РЕЗУЛЬТАТ — без "Підпис:" і без
+# відступу (наприклад, "Production-дані не змінювались." у Restore Test,
+# "Production-операції не виконувались." у Dry Run, docs/OPERATOR_CONSOLE_UX.md).
+function Write-BRAVOResultNote {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host $Text
+}
+
+# Відкриває фінальний блок РЕЗУЛЬТАТ: роздільники, Статус (кольоровий,
+# домен сам вирішує колір — словник статусів надто різний між Archive
+# ("УСПІШНО"), Restore Test ("PASS: 3"), Dry Run ("ГОТОВО ДО ЗАПУСКУ") тощо,
+# щоб тримати єдиний lookup тут) і спільні для будь-якого failure поля:
+# Код завершення (BRAVO.ExitCodes, ніколи не native tool code), Причина,
+# Інструмент/Код інструменту — лише коли головний результат дійсно
+# спричинений зовнішнім tool (docs/MANUAL_RUN_CONSOLE_UX.md).
+# Домен-специфічні поля (Початок/Завершення/Тривалість, Створено архівів,
+# Перевірок тощо) додаються окремими викликами Write-BRAVOResultField ПІСЛЯ
+# цього виклику, до Write-BRAVOResultFooter.
+function Write-BRAVOResultHeader {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Status,
+        [ConsoleColor]$StatusColor = [ConsoleColor]::White,
+
+        # BRAVO exit code (BRAVO.ExitCodes) — ніколи native tool code.
+        [Nullable[int]]$ExitCode,
+        [string]$ExitCodeName,
+
+        [string]$Reason,
+        [string]$Tool,
+
+        # Уже сформований текст "N — опис" (Get-BRAVOToolExitCodeDescription)
+        # — сама функція нічого не знає про конкретні tools.
+        [string]$ToolExitCode
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if ($script:BRAVOConsoleStepOpen) {
+        Write-Host ''
+        $script:BRAVOConsoleStepOpen = $false
+    }
+
+    $separator = '-' * $script:BRAVOConsoleSeparatorWidth
+    Write-Host ''
+    Write-Host $separator
+    Write-Host ' РЕЗУЛЬТАТ'
+    Write-Host $separator
+    Write-Host (("{0}:" -f 'Статус').PadRight($script:BRAVOResultLabelWidth)) -NoNewline
+    Write-Host $Status -ForegroundColor $StatusColor
+
+    if ($null -ne $ExitCode) {
+        $exitText = if ([string]::IsNullOrWhiteSpace($ExitCodeName)) {
+            [string]$ExitCode
+        } else {
+            "{0} — {1}" -f $ExitCode, $ExitCodeName
+        }
+        Write-BRAVOResultField -Label 'Код завершення' -Value $exitText
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+        Write-BRAVOResultField -Label 'Причина' -Value $Reason
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Tool)) {
+        Write-BRAVOResultField -Label 'Інструмент' -Value $Tool
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ToolExitCode)) {
+        Write-BRAVOResultField -Label 'Код інструменту' -Value $ToolExitCode
+    }
+    Write-Host ''
+}
+
+# Той самий ASCII-роздільник ('-'), що обрамляє блок РЕЗУЛЬТАТ
+# (Write-BRAVOResultHeader/Footer), для довільних інших вторинних блоків
+# поза ним (наприклад "DISCOVERY"/"РЕЗУЛЬТАТ" у Setup, Dry Run) — щоб
+# ширина не розходилась з рештою консолі, якщо
+# $script:BRAVOConsoleSeparatorWidth колись зміниться. Для блоків, що
+# продовжують той самий "титульний" контракт, з яким прогін почався
+# (Write-BRAVOHeader), використовуй Write-BRAVOHeaderSeparator ('=')
+# нижче — два різні контракти, не взаємозамінні.
+function Write-BRAVOSeparator {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ('-' * $script:BRAVOConsoleSeparatorWidth)
+}
+
+# Той самий '='-роздільник (Cyan), що обрамляє Write-BRAVOHeader і
+# Write-BRAVOFinalSummaryHeader/Footer, для блоків, які є продовженням
+# того самого титульного контракту прогону, а не окремим блоком
+# РЕЗУЛЬТАТ (наприклад "План операцій:" одразу під заголовком Maintenance,
+# docs/OPERATOR_CONSOLE_UX.md §5) — щоб оператор бачив один суцільний
+# "титульний" блок, не розірваний іншим стилем роздільника.
+# dev.16: спільний рендер "План операцій:"/"План перевірок:" — той самий
+# plan-first паттерн (оператор бачить, ЩО виконуватиметься, ще до першого
+# кроку), який Maintenance/Archive/Health рендерять окремо. Приймає вже
+# готові [ordered]-entries (Label -> bool); сам не вирішує, що увімкнено —
+# лише рендерить ТАК/НІ й закриває блок тим самим '='-роздільником, що
+# Write-BRAVOHeader (Write-BRAVOHeaderSeparator), не '-'*60.
+function Write-BRAVOPlan {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingWriteHost', '',
+        Justification = 'BRAVO.Console — виділена межа рендеру консолі; Write-Host тут архітектурно допустимий, як і в усіх інших Write-BRAVO*-функціях цього модуля.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Title,
+        [Parameter(Mandatory = $true)][System.Collections.Specialized.OrderedDictionary]$Entries
+    )
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+
+    $planLabelWidth = (
+        $Entries.Keys | ForEach-Object { $_.Length } | Measure-Object -Maximum
+    ).Maximum + 3
+    Write-Host ''
+    Write-Host $Title
+    Write-Host ''
+    foreach ($planEntry in $Entries.GetEnumerator()) {
+        $planLabel = ("{0}:" -f $planEntry.Key).PadRight($planLabelWidth)
+        $planValue = if ($planEntry.Value) { 'ТАК' } else { 'НІ' }
+        Write-Host ("  {0}{1}" -f $planLabel, $planValue)
+    }
+    Write-Host ''
+    Write-BRAVOHeaderSeparator
+}
+
+function Write-BRAVOHeaderSeparator {
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingWriteHost', '',
+        Justification = 'BRAVO.Console — виділена межа рендеру консолі; Write-Host тут архітектурно допустимий, як і в усіх інших Write-BRAVO*-функціях цього модуля (Write-BRAVOSeparator, Write-BRAVOHeader тощо).')]
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ('=' * $script:BRAVOConsoleSeparatorWidth) -ForegroundColor Cyan
+}
+
+# Порожній рядок усередині блоку РЕЗУЛЬТАТ (наприклад, між основними
+# полями і Перевірок/Успішно/Попереджень/Помилок) — для доменів, які самі
+# не мають права на голий Write-Host (Health: Console/HealthRendersNoRawWriteHost).
+function Write-BRAVOResultBlankLine {
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ''
+}
+
+# Заголовок довільної секції всередині блоку РЕЗУЛЬТАТ ("Архіви:",
+# "Резервні копії:", "Проблеми:") — сам вміст секції домен формує
+# самостійно (Write-Host/Write-BRAVOResultField), бо структура списку
+# надто різна між скриптами, щоб узагальнювати в один helper.
+function Write-BRAVOResultSection {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Title)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    Write-Host ''
+    Write-Host ("{0}:" -f $Title)
+}
+
+# Закриває блок РЕЗУЛЬТАТ: нижній роздільник, опційно шлях до журналу.
+function Write-BRAVOResultFooter {
+    [CmdletBinding()]
+    param([string]$LogFile)
+
+    if (-not $script:BRAVOConsoleEnabled) {
+        return
+    }
+    if (-not [string]::IsNullOrWhiteSpace($LogFile)) {
+        Write-Host ''
+        Write-Host 'Детальний журнал:'
+        Write-Host $LogFile -ForegroundColor DarkGray
+    }
+    Write-Host ('-' * $script:BRAVOConsoleSeparatorWidth)
+    Write-Host ''
+}
+
 # Пауза перед закриттям вікна консолі при ручному запуску — інакше вікно,
 # відкрите подвійним кліком чи ярликом, зникає разом з помилкою, щойно
 # скрипт завершується, і оператор нічого не встигає прочитати.
@@ -383,10 +846,19 @@ function Write-BRAVOSummary {
 #   2. consoleSettings.PauseOnExit — ручне вимкнення в BRAVO.config.
 #   3. [Environment]::UserInteractive — false в сесії 0 (SYSTEM-завдання
 #      "Run whether user is logged on or not").
-#   4. [Console]::IsInputRedirected — true, коли stdin перенаправлено
-#      (CI, автоматизація, дочірній процес самотесту).
-# Кожна з трьох останніх перевірок обгорнута в try/catch: будь-яка
-# помилка під час перевірки веде до пропуску паузи, а не до її форсування.
+# dev.18: [Console]::IsInputRedirected навмисно БІЛЬШЕ НЕ окрема
+# самостійна причина пропустити паузу. Реальний ручний DEV-LIMS запуск
+# (заголовок MANUAL, справжня консоль оператора) показав
+# IsInputRedirected=true — і вікно мовчки закривалось одразу після
+# РЕЗУЛЬТАТ, хоча RawUI.ReadKey нижче спрацював би штатно.
+# RawUI.ReadKey читає буфер консолі напряму, не залежить від
+# перенаправленого stdin; якщо він справді недоступний (ISE, фоновий
+# хост), catch нижче сам переходить на Read-Host, а якщо й той не може
+# дочекатись вводу — мовчки продовжує без зависання (як і раніше).
+# Автоматизація захищена пунктом 1 (-NoPause), не цим евристичним
+# сигналом.
+# Кожна з решти перевірок обгорнута в try/catch: будь-яка помилка під
+# час перевірки веде до пропуску паузи, а не до її форсування.
 function Wait-BRAVOManualExit {
     [CmdletBinding()]
     param([switch]$NoPause)
@@ -421,9 +893,6 @@ function Wait-BRAVOManualExit {
         if (-not [Environment]::UserInteractive) {
             return
         }
-        if ([Console]::IsInputRedirected) {
-            return
-        }
     } catch {
         # Немає доступу до консолі взагалі (нетиповий хост) — не блокуємо.
         return
@@ -452,13 +921,29 @@ Export-ModuleMember -Function @(
     'Write-BRAVOProgressDetail',
     'Complete-BRAVOProgress',
     'Format-BRAVOFileSize',
+    'Format-BRAVODuration',
     'Write-BRAVOHeader',
+    'Write-BRAVOFinalSummaryHeader',
+    'Write-BRAVOFinalSummaryFooter',
     'Write-BRAVOStep',
     'Write-BRAVOStepResult',
+    'Write-BRAVOOperationResult',
+    'Write-BRAVOPlan',
+    'Write-BRAVOOperatorReason',
+    'Write-BRAVOSkipReason',
+    'Write-BRAVOStepDetail',
     'Write-BRAVOConsoleDetail',
     'Write-BRAVOConsoleMessage',
     'Write-BRAVOWarning',
     'Write-BRAVOError',
     'Write-BRAVOSummary',
+    'Write-BRAVOResultField',
+    'Write-BRAVOResultNote',
+    'Write-BRAVOSeparator',
+    'Write-BRAVOHeaderSeparator',
+    'Write-BRAVOResultBlankLine',
+    'Write-BRAVOResultHeader',
+    'Write-BRAVOResultSection',
+    'Write-BRAVOResultFooter',
     'Wait-BRAVOManualExit'
 )

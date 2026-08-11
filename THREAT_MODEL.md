@@ -156,8 +156,11 @@ offline-копії, немає версіонування на боці прий
 не створюється.
 
 **Що реалізовано.** Fail-closed: без VSS архівація не підміняється
-«копіюванням як є» (`BackupConsistency/VSSFailClosed`), `BRAVO_DRY_RUN`
-явно звітує стан VSS.
+«копіюванням як є» (`BackupConsistency/VSSFailClosed`). MODEL, BLOG і
+BRAVOEXCH входять до одного Snapshot Set та одного `GenerationId`; VSS
+failure означає zero live archive operations. Публікація atomic:
+temporary -> create -> `7z t` -> SHA512 -> verify -> final, без overwrite
+попереднього valid backup. `BRAVO_DRY_RUN` явно звітує стан VSS.
 
 **Залишковий ризик.** Низький. Основний наслідок — відсутність backup у
 вікні, що видно в моніторингу.
@@ -168,8 +171,10 @@ offline-копії, немає версіонування на боці прий
 призначення — копії йдуть до зловмисника.
 
 **Що реалізовано.** SFTP host key звіряється (`sftpHostKey`), що ловить
-MITM і підміну хоста; health-check перевіряє контрольні суми **віддалених**
-копій, а не лише факт передачі.
+MITM і підміну хоста; connectivity gate перевіряє actual SFTP endpoint,
+а не `google.com` чи generic Internet. Archive upload, BAZA_APP і BAZA_WWW
+мають окремі result states. Health-check перевіряє контрольні суми
+**віддалених** копій, а не лише факт передачі.
 
 **Залишковий ризик.** `BRAVO.config` не входить до
 `RUNTIME_MANIFEST.json`; перевірка коду `34` стежить лише за
@@ -188,12 +193,12 @@ MITM і підміну хоста; health-check перевіряє контро�
 старий комплект несе старі маніфести — вони узгоджені між собою.
 
 `Test-BRAVOVersionDowngrade` запам'ятовує найвищу бачену версію в
-`LOGS\BRAVO_VERSION_STATE.json` (`highestVersion`, `sourceCommit`,
+`C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json` (`highestVersion`, `sourceCommit`,
 `recordedAt`) і блокує запуск старішого комплекту з кодом `35`.
 Свідомий відкат вимагає `BRAVO_ALLOW_DOWNGRADE=1`.
 
-**Залишковий ризик.** Файл стану лежить у `LOGS\` на тому самому сервері,
-тому той, хто вже має право писати в каталог BRAVO, видалить або
+**Залишковий ризик.** Файл стану лежить у machine-wide `ProgramData` на тому самому сервері,
+тому локальний адміністратор або SYSTEM може видалити чи
 відредагує і його — відсутній чи пошкоджений стан **свідомо не блокує**
 (інакше перший запуск був би неможливий). Тобто це захист від помилкового
 відкату, не від зловмисного. Немає підписаного git tag, тому й сам тег не
@@ -204,11 +209,21 @@ MITM і підміну хоста; health-check перевіряє контро�
 **Вектор.** Одночасне виконання пошкоджує архів або дає хибний
 health-результат; два WinSCP.com одночасно змінюють той самий каталог.
 
-**Що реалізовано.** Спільний `BRAVO_OPERATION.lock` з метаданими (PID,
-хост, операція, час) і очікуванням; окремий атомарний lock саме для
+**Що реалізовано.** Спільний machine-wide
+`C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock` з метаданими (PID,
+хост, операція, час, package version, config, GenerationId) і очікуванням;
+авторитетним є exclusive handle, а не існування stale file. Окремий атомарний lock саме для
 `WinSCP.com`; `Test-BRAVOWinSCPAvailable` відмовляє, якщо активний
 сторонній процес WinSCP; код завершення `20` відрізняє «пропущено через
 lock» від помилки.
+
+Hard termination, де `finally` не виконався, покривається окремим атомарним
+ownership state у
+`C:\ProgramData\BRAVO\State\BRAVO_VSS_OWNERSHIP.json`. Він містить exact
+Shadow IDs, створені BRAVO. Cleanup запускається лише після отримання
+machine-wide lock, перевіряє schema/owner/hostname і ніколи не видаляє VSS
+ресурси через широкий фільтр. Невідомий owner, небезпечний link path або
+помилка exact-ID delete зберігають state і блокують новий backup.
 
 **Залишковий ризик.** Низький. Lock — файловий, тому непрацездатний для
 кількох серверів, що пишуть в одне SFTP-призначення (сценарій поза
