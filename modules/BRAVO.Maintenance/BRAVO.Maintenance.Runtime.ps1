@@ -435,6 +435,28 @@ function Test-BRAVORestoreTimeWindow {
     return ($nowSpan -ge $WindowStart -or $nowSpan -lt $WindowEnd)
 }
 
+# TOCTOU-бар'єр: $shouldRestore/$restoreWindowOpen обчислюються один раз, до
+# Enter-BRAVOMaintenanceOperationLock (очікування до OperationLockWaitMinutes,
+# типово 360 хв), зупинки служб і архівації моделі перед реставрацією. За цей
+# час вікно могло закритися — стара перевірка НЕ є остаточним дозволом на
+# деструктивний bravocmd.exe. Тому це окрема, injectable-за-часом функція:
+# викликається ЗАНОВО безпосередньо перед входом у restore sequence і ще раз
+# безпосередньо перед самим bravocmd.exe (два незалежних бар'єри, той самий
+# критерій). -ForceRestore жодним із них не обмежується — свідома дія
+# оператора. $NowProvider — єдина точка ін'єкції часу для self-test (не
+# підміняє глобальний Get-Date).
+function Test-BRAVORestoreExecutionStillAllowed {
+    param(
+        [Parameter(Mandatory = $true)][TimeSpan]$WindowStart,
+        [Parameter(Mandatory = $true)][TimeSpan]$WindowEnd,
+        [bool]$ForceRestore,
+        [scriptblock]$NowProvider = { Get-Date }
+    )
+    if ($ForceRestore) { return $true }
+    $now = & $NowProvider
+    return Test-BRAVORestoreTimeWindow -Now $now -WindowStart $WindowStart -WindowEnd $WindowEnd
+}
+
 $parsedRestoreTime = [TimeSpan]::Zero
 $parsedRestoreWindowStart = [TimeSpan]::Zero
 $parsedRestoreWindowEnd = [TimeSpan]::Zero
@@ -4370,12 +4392,16 @@ $restoreWindowOpen = Test-BRAVORestoreTimeWindow `
     -Now $currentDate `
     -WindowStart $parsedRestoreWindowStart `
     -WindowEnd $parsedRestoreWindowEnd
-# Легка перевірка узгодженості конфігурації: нічне підхоплення пропущеної
-# реставрації ($missedRestoreDue нижче) покладається на те, що
-# Maintenance.DailyAt справді потрапляє у вікно Restore.WindowStart/WindowEnd.
-# Якщо оператор рознесе ці два налаштування, єдиним шляхом підхоплення
-# лишиться Recovery/boot з його обмеженим 8-годинним ретраєм — про це варто
-# попередити, а не мовчати чи падати фатально.
+# Легка перевірка узгодженості конфігурації: якщо Maintenance.DailyAt НЕ
+# потрапляє у вікно Restore.WindowStart/WindowEnd, ЦЕЙ конкретний нічний
+# прогін Maintenance не підхопить $missedRestoreDue — але це вже не
+# втрата автоматики: Recovery-завдання має власний, безумовний daily
+# trigger рівно на Restore.WindowStart (BRAVO_TASKS_INSTALL.ps1,
+# New-BRAVOTaskDefinition), незалежний від Maintenance.DailyAt і від
+# Restore.RunMissedOnStartup (той керує лише додатковим boot-trigger).
+# Попередження нижче ($maintenanceDailyAtInsideRestoreWindow) лишається
+# інформаційним — не про втрату шляху, а про те, що саме ЦЕЙ прогін
+# участі не бере.
 $maintenanceDailyAtSpan = [TimeSpan]::Zero
 $maintenanceDailyAtInsideRestoreWindow = [TimeSpan]::TryParse([string]$schedulerSettings.Maintenance.DailyAt, [ref]$maintenanceDailyAtSpan) -and
     (Test-BRAVORestoreTimeWindow -Now $currentDate.Date.Add($maintenanceDailyAtSpan) -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd)
@@ -4383,16 +4409,20 @@ $maintenanceDailyAtInsideRestoreWindow = [TimeSpan]::TryParse([string]$scheduler
 # найімовірніше джерело випадкового денного запуску: сервер вмикають уранці,
 # і без цієї умови реставрація почалася б на робочій моделі о 09:00.
 $scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Path $MARKER_FILE)
-# НЕ прив'язуємо до -RunMissedRestoreOnly: той прапорець виставляє лише
-# boot-triggered Recovery, який ретраїть 8 годин ПІСЛЯ старту й потім
-# зупиняється до наступного boot. Якщо сервер не перезавантажується,
-# пропущений слот так і лишився б невідновленим. Щоденний таск Maintenance
-# (23:55, за замовчуванням у самому вікні) виконується щоночі незалежно від
-# boot — саме він і є надійним шляхом "наступного дня у дозволеному вікні".
-# $missedRestore вже сам по собі персистентний (BRAVO_RESTORE_STATE.json /
-# маркер конкретного $scheduledOccurrence), тому повторна перевірка цієї
-# умови на звичайному нічному прогоні не створює дублювання — лише дозволяє
-# підхопити пропущений слот без Recovery/boot.
+# НЕ прив'язуємо до -RunMissedRestoreOnly: той прапорець позначає лише те,
+# що цей конкретний прогін BRAVO_MAINTENANCE.ps1 стартував через Recovery
+# (daily АБО boot trigger — обидва передають той самий прапорець, обидва
+# викликають той самий Action). Надійний "наступного дня у дозволеному
+# вікні" шлях сьогодні НЕ один: (1) Recovery-завдання має власний,
+# безумовний daily trigger на Restore.WindowStart (не залежить від
+# Maintenance.DailyAt чи reboot), і (2) опційно ще й boot-trigger, коли
+# Restore.RunMissedOnStartup=true (швидша реакція одразу після
+# перезавантаження). Щоденний таск Maintenance (23:55, за замовчуванням у
+# самому вікні) — ТРЕТІЙ, додатковий шлях, коли DailyAt збігається з
+# вікном, але вже не єдиний і не обов'язковий. $missedRestore сам по собі
+# персистентний (BRAVO_RESTORE_STATE.json / маркер конкретного
+# $scheduledOccurrence), тому перевірка на будь-якому з цих прогонів не
+# створює дублювання.
 $missedRestoreDue = $missedRestore
 $automaticRestoreDue = $scheduledRestoreDue -or $missedRestoreDue
 $restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore
@@ -5203,6 +5233,11 @@ Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentCo
 $restoreCriticalBefore = $script:criticalErrorOccurred
 $restoreWarningsBefore = $script:BRAVOWarningCount
 $restoreStepReported = $false
+# Ініціалізується безумовно (не лише всередині бар'єрів нижче) — інакше під
+# Set-StrictMode посилання на неї у fallback Details ('Реставрація моделі')
+# кидає виняток, коли до бар'єрів узагалі не доходимо ($shouldRestore=false
+# від самого початку, або службу BRAVO не вдалося зупинити).
+$restorePostponedByWindowClosing = $false
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
 # коли BRAVO зупинити не вдалося.
@@ -5210,6 +5245,23 @@ $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
 $bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
 if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
+    # P0 TOCTOU barrier 1 (перед входом у restore sequence): $shouldRestore
+    # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
+    # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
+    # — вікно могло вже закритися. Переоцінюємо ЗАРАЗ, а не довіряємо
+    # старому знімку. -ForceRestore барʼєром не обмежується.
+    if ($shouldRestore -and -not $ForceRestore -and
+        -not (Test-BRAVORestoreExecutionStillAllowed `
+            -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
+            -ForceRestore $ForceRestore)) {
+        $restorePostponedByWindowClosing = $true
+        $shouldRestore = $false
+        Write-Log -Message (
+            "Реставрацію відкладено: вікно $RestoreWindowStart-$RestoreWindowEnd закрилося під час " +
+            "очікування lock/підготовки (заплановано було: $restoreReason). Плановий слот лишається " +
+            "непозначеним як виконаний — наступний daily Recovery-тригер повторить спробу в межах вікна."
+        ) -Level "WARNING"
+    }
     if ($shouldRestore) {
         try {
             Write-Log -Message "==="
@@ -5278,12 +5330,36 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 $script:restoreIntegrityFailed = $true
             } else {
                 Write-Log -Message "Архів моделі перед реставрацією створено та перевірено -> $beforeArchivePath" -Level "SUCCESS"
-                
-                # Виконання реставрації через bravocmd.exe (як в еталоні)
-                $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
-                $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
-                
-                if ($exitCode -eq 0) {
+
+                # P0 TOCTOU barrier 2 (point-of-no-return): останній момент
+                # перед ДЕСТРУКТИВНИМ bravocmd.exe. Barrier 1 (перед входом у
+                # цю послідовність) не покриває час самої архівації моделі
+                # перед реставрацією (7-Zip на великій моделі може тривати
+                # довго) — вікно могло закритися саме тут. -ForceRestore
+                # барʼєром не обмежується.
+                if (-not (Test-BRAVORestoreExecutionStillAllowed `
+                        -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
+                        -ForceRestore $ForceRestore)) {
+                    $restorePostponedByWindowClosing = $true
+                    $exitCode = $null
+                    Write-Log -Message (
+                        "Реставрацію скасовано безпосередньо перед bravocmd.exe: вікно " +
+                        "$RestoreWindowStart-$RestoreWindowEnd закрилося під час архівації моделі перед " +
+                        "реставрацією. bravocmd.exe НЕ викликано; архів перед реставрацією збережено: " +
+                        "$beforeArchivePath. Плановий слот лишається непозначеним як виконаний — " +
+                        "наступний daily Recovery-тригер повторить спробу в межах вікна."
+                    ) -Level "WARNING"
+                } else {
+                    # Виконання реставрації через bravocmd.exe (як в еталоні)
+                    $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
+                    $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                }
+
+                if ($restorePostponedByWindowClosing) {
+                    # Постановка на паузу — НЕ помилка: bravocmd не викликаний,
+                    # маркер/state не пишуться, гілки exitCode -eq/-ne 0 нижче
+                    # свідомо не виконуються (exitCode -eq $null для обох).
+                } elseif ($exitCode -eq 0) {
                     $restoreCompletedAt = Get-Date
                     Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"
                     
@@ -5520,8 +5596,10 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 # рендеритись ДО «Обробка trace і логів» [6/8] — той самий порядок, що в
 # затвердженому operator contract, незалежно від того, чи справді
 # виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
-# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з двох причин,
+# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з трьох причин,
 # які варто розрізняти в Details:
+# - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
+#   заплановано, безпечно відкладено, наступний daily Recovery повторить;
 # - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
 #   заплановане й невиконане, а не «не настав час»;
 # - $shouldRestore було false від самого початку — реставрація цього
@@ -5537,7 +5615,11 @@ if (-not $restoreStepReported) {
     Write-BRAVOMaintenanceStep `
         -Name 'Реставрація моделі' `
         -Status 'SKIPPED' `
-        -Details $(if ($shouldRestore) { 'службу BRAVO не було зупинено' } else { 'не заплановано на цей запуск' })
+        -Details $(
+            if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
+            elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
+            else { 'не заплановано на цей запуск' }
+        )
 }
 
 # Підсумковий рядок етапу — поза блоком BRAVO Web. Раніше він стояв

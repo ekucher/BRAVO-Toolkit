@@ -4424,6 +4424,104 @@ try {
             -Name 'Maintenance/RestoreWindowGatesAutomaticButNotForce' `
             -Failure 'вікно має обмежувати лише автоматичні шляхи (плановий слот і boot-recovery); -ForceRestore лишається доступним у будь-який час'
 
+        # --- P0 TOCTOU: $shouldRestore/$restoreWindowOpen обчислюються
+        # ЗАДОВГО до Enter-BRAVOMaintenanceOperationLock (до
+        # OperationLockWaitMinutes очікування, типово 360 хв) і зупинки
+        # служб/архівації моделі — старий знімок часу НЕ є остаточним
+        # дозволом на деструктивний bravocmd.exe.
+        # Test-BRAVORestoreExecutionStillAllowed — та сама функція, яку
+        # реально викликають ОБИДВА бар'єри в BRAVO_MAINTENANCE.ps1
+        # (перед restore sequence і безпосередньо перед bravocmd.exe) —
+        # реальний виклик через NowProvider-ін'єкцію часу, не regex.
+        $toctouModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceRestoreWindowText `
+            -FunctionNames @('Test-BRAVORestoreTimeWindow', 'Test-BRAVORestoreExecutionStillAllowed')
+        $toctouResult = & $toctouModule {
+            $start = [TimeSpan]::Parse('21:00')
+            $end = [TimeSpan]::Parse('03:00')
+            $insideWindow = [datetime]'2026-08-12 22:00:00'
+            $outsideWindow = [datetime]'2026-08-13 09:00:00'
+            [pscustomobject]@{
+                # Сценарій: спочатку всередині вікна (запланована спроба)...
+                InitialInsideWindow = Test-BRAVORestoreExecutionStillAllowed `
+                    -WindowStart $start -WindowEnd $end -ForceRestore $false -NowProvider { $insideWindow }
+                # ...час "просунувся" (очікування lock/підготовка) — вікно вже закрилося.
+                AdvancedOutsideWindowAutomatic = Test-BRAVORestoreExecutionStillAllowed `
+                    -WindowStart $start -WindowEnd $end -ForceRestore $false -NowProvider { $outsideWindow }
+                # -ForceRestore і поза вікном лишається дозволеним — свідома дія оператора.
+                AdvancedOutsideWindowForced = Test-BRAVORestoreExecutionStillAllowed `
+                    -WindowStart $start -WindowEnd $end -ForceRestore $true -NowProvider { $outsideWindow }
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $toctouResult.InitialInsideWindow -eq $true -and
+                $toctouResult.AdvancedOutsideWindowAutomatic -eq $false -and
+                $toctouResult.AdvancedOutsideWindowForced -eq $true
+            ) `
+            -Name "Maintenance/RestoreExecutionRevalidatesWindowAtBarrier" `
+            -Failure "Test-BRAVORestoreExecutionStillAllowed (спільна для обох TOCTOU-бар'єрів перед bravocmd.exe) має дозволяти автоматичну реставрацію лише всередині вікна ЗАРАЗ (не за старим знімком часу з початку прогону), і завжди дозволяти -ForceRestore незалежно від вікна"
+
+        # Structural: обидва бар'єри реально СТОЯТЬ там, де мають — перед
+        # входом у restore sequence і безпосередньо перед bravocmd.exe, а не
+        # десь-інде чи взагалі відсутні. AST-звуження до конкретних
+        # текстових вікон (той самий idiom, що інші структурні тести цього
+        # файлу) — не "чи існує рядок десь у файлі", а "чи стоїть він у
+        # правильному місці відносно правильних сусідів".
+        $barrier1WindowStart = $maintenanceRestoreWindowText.IndexOf(
+            '$bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { ''Unavailable'' }'
+        )
+        $barrier1EntryIndex = $maintenanceRestoreWindowText.IndexOf(
+            "if (`$shouldRestore) {", [Math]::Max(0, $barrier1WindowStart)
+        )
+        $barrier1Window = if ($barrier1WindowStart -ge 0 -and $barrier1EntryIndex -gt $barrier1WindowStart) {
+            $maintenanceRestoreWindowText.Substring($barrier1WindowStart, $barrier1EntryIndex - $barrier1WindowStart)
+        } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                $barrier1WindowStart -ge 0 -and $barrier1EntryIndex -gt $barrier1WindowStart -and
+                $barrier1Window.Contains('Test-BRAVORestoreExecutionStillAllowed') -and
+                $barrier1Window.Contains('$shouldRestore = $false') -and
+                $barrier1Window.Contains('-not $ForceRestore')
+            ) `
+            -Name "Maintenance/RestoreBarrier1PrecedesRestoreSequenceEntry" `
+            -Failure "Barrier 1 (Test-BRAVORestoreExecutionStillAllowed + `$shouldRestore = `$false на відмову) має стояти ПЕРЕД 'if (`$shouldRestore) {' — інакше restore sequence входить на застарілому дозволі"
+
+        $barrier2WindowStart = $maintenanceRestoreWindowText.IndexOf(
+            'Архів моделі перед реставрацією створено та перевірено -> $beforeArchivePath'
+        )
+        $bravocmdCallIndex = $maintenanceRestoreWindowText.IndexOf(
+            'Invoke-CommandWithLog -Command $BRAVOCMD_PATH', [Math]::Max(0, $barrier2WindowStart)
+        )
+        $barrier2Window = if ($barrier2WindowStart -ge 0 -and $bravocmdCallIndex -gt $barrier2WindowStart) {
+            $maintenanceRestoreWindowText.Substring($barrier2WindowStart, $bravocmdCallIndex - $barrier2WindowStart)
+        } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                $barrier2WindowStart -ge 0 -and $bravocmdCallIndex -gt $barrier2WindowStart -and
+                $barrier2Window.Contains('Test-BRAVORestoreExecutionStillAllowed') -and
+                $barrier2Window.Contains('$restorePostponedByWindowClosing = $true') -and
+                $barrier2Window.Contains('$exitCode = $null')
+            ) `
+            -Name "Maintenance/RestoreBarrier2PrecedesBravocmdInvocation" `
+            -Failure "Barrier 2 (point-of-no-return) має стояти БЕЗПОСЕРЕДНЬО перед Invoke-CommandWithLog -Command `$BRAVOCMD_PATH — інакше deструктивний виклик можливий на застарілому дозволі"
+
+        # Success-marker/state-запис (наслідок автоматичної УСПІШНОЇ
+        # реставрації) синтаксично досяжний лише через elseif ($exitCode -eq 0),
+        # а НЕ через порожню гілку if ($restorePostponedByWindowClosing) —
+        # тобто postponement за конструкцією не може лишити після себе
+        # позначку "виконано".
+        $postponedBranchIndex = $maintenanceRestoreWindowText.IndexOf('if ($restorePostponedByWindowClosing) {')
+        $successStateWriteIndex = $maintenanceRestoreWindowText.IndexOf(
+            "Write-BRAVORestoreState -ScheduledOccurrence `$scheduledOccurrence -Status 'Succeeded'"
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $postponedBranchIndex -ge 0 -and $successStateWriteIndex -gt $postponedBranchIndex
+            ) `
+            -Name "Maintenance/PostponedRestoreCannotReachSuccessStateWrite" `
+            -Failure "'Succeeded'-запис у BRAVO_RESTORE_STATE.json має бути синтаксично ПІСЛЯ гілки постановки на паузу (elseif `$exitCode -eq 0, не сама ця гілка) — postponement не повинен мати шляху до маркування слоту виконаним"
+
         # Регресія: пропущену реставрацію раніше підхоплював лише
         # boot-triggered Recovery (-RunMissedRestoreOnly), який ретраїть
         # лише 8 годин після старту й потім мовчить до наступного
@@ -7421,15 +7519,39 @@ try {
             -Name "BackupConsistency/OrphanTempSweepNeverTouchesFilesOutsideWorkDirectory" `
             -Failure "opублiкований .mdz поза .work\ не повинен зачіпатися orphan-sweep'ом, навіть якщо він старий"
 
-        # Регресія: SilentlyContinue на Get-ChildItem мовчки перетворював би
-        # access denied/I-O error на .work у "0 кандидатів" — функція
-        # рапортувала б успіх, хоча sweep фактично не відбувся. Локальний
+        # Регресія (P1, три окремі, точно класифіковані сценарії — БЕЗ
+        # окремого Test-Path gate, підтверджено видаленим з реалізації):
+        # Get-ChildItem сам класифікує причину невдачі через тип винятку.
+
+        # 1) .work справді відсутній (ItemNotFoundException) — доброякісний
+        # SKIP, а не помилка. Окремий Destination без .work\ узагалі.
+        $orphanNoWorkDestination = Join-Path $orphanSweepTestRoot 'BLOG'
+        [void][IO.Directory]::CreateDirectory($orphanNoWorkDestination)
+        $orphanNoWorkDefinitions = @(
+            [pscustomobject]@{ Type = 'BLOG'; Enabled = $true; Destination = $orphanNoWorkDestination }
+        )
+        $orphanNoWorkRemovedCount = -1
+        $orphanNoWorkOk = & $orphanSweepModule {
+            param($Definitions, $Hours, $CountRef)
+            Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
+                -ArchiveDefinitions $Definitions -RetentionHours $Hours -RemovedFileCount $CountRef
+        } $orphanNoWorkDefinitions 48 ([ref]$orphanNoWorkRemovedCount)
+        Test-BRAVOCondition `
+            -Condition ($orphanNoWorkOk -eq $true -and $orphanNoWorkRemovedCount -eq 0) `
+            -Name "BackupConsistency/OrphanTempSweepMissingWorkDirectoryIsBenignSkip" `
+            -Failure "коли .work справді не існує (ItemNotFoundException/DirectoryNotFoundException), sweep має повернути `$true — не трактувати відсутність каталогу як помилку"
+
+        # 2) .work існує, але доступ заборонено (UnauthorizedAccessException,
+        # той самий тип, що реально кидає Get-ChildItem для pure ACL
+        # access-denied — на відміну від Test-Path, який просто повернув би
+        # $false і НЕ дав би це відрізнити від "не існує"; підтверджено
+        # видаленням Test-Path gate з реалізації цієї сесії). Локальний
         # override Get-ChildItem усередині виклику через & $module { ... }
         # реально підміняє команду, яку викликає дот-сорсена функція
-        # (перевірено емпірично в цій сесії) — той самий принцип, що
-        # InModuleScope+Mock, без нової залежності для репозиторію.
-        $orphanFailureRemovedCount = 0
-        $orphanFailureResult = & $orphanSweepModule {
+        # (перевірено емпірично) — той самий принцип, що InModuleScope+Mock,
+        # без нової залежності для репозиторію.
+        $orphanAccessDeniedRemovedCount = 0
+        $orphanAccessDeniedResult = & $orphanSweepModule {
             param($Definitions, $Hours, $CountRef)
             function Get-ChildItem {
                 param(
@@ -7448,48 +7570,81 @@ try {
             }
             Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
                 -ArchiveDefinitions $Definitions -RetentionHours $Hours -RemovedFileCount $CountRef
-        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanFailureRemovedCount)
-
+        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanAccessDeniedRemovedCount)
         Test-BRAVOCondition `
-            -Condition ($orphanFailureResult -eq $false) `
-            -Name "BackupConsistency/OrphanTempSweepEnumerationFailureIsFailVisible" `
-            -Failure "помилка enumeration .work (access denied/I-O error) має повертати `$false (fail-visible), а не мовчки трактуватися як 0 кандидатів чи порожній каталог"
+            -Condition ($orphanAccessDeniedResult -eq $false) `
+            -Name "BackupConsistency/OrphanTempSweepAccessDeniedIsFailVisible" `
+            -Failure "UnauthorizedAccessException на .work (pure ACL access-denied) має повертати `$false (fail-visible), а не мовчки трактуватися як 'каталогу немає'"
 
-        # Регресія: Test-Path сам по собі НЕ fail-visible (.NET
-        # Directory.Exists ковтає UnauthorizedAccess і повертає $false), але
-        # провайдерські/мережеві помилки (відключений диск, недоступний UNC)
-        # реально кидають виняток — той самий override-принцип, що вище,
-        # тепер для Test-Path, з передачею через до реального cmdlet для
-        # будь-якого іншого шляху (щоб не зачепити Test-BRAVOBackupArtifactPathSafe).
-        $orphanTestPathFailureRemovedCount = 0
-        $orphanTestPathFailureResult = & $orphanSweepModule {
+        # 3) .work існує, але провайдер/мережа падає з ІНШИМ типом винятку
+        # (IOException — відключений диск, недоступний UNC) — так само
+        # $failed=true/ERROR, доводить, що класифікація не звужена лише до
+        # UnauthorizedAccessException.
+        $orphanIoFailureRemovedCount = 0
+        $orphanIoFailureResult = & $orphanSweepModule {
             param($Definitions, $Hours, $CountRef)
-            function Test-Path {
+            function Get-ChildItem {
                 param(
                     [string]$LiteralPath,
-                    [string]$PathType,
+                    [switch]$File,
+                    [switch]$Force,
+                    [string]$Filter,
                     [string]$ErrorAction
                 )
                 if ($LiteralPath -like '*\.work') {
                     throw [System.IO.IOException]::new(
-                        "simulated: provider error checking $LiteralPath"
+                        "simulated: provider I/O error enumerating $LiteralPath"
                     )
                 }
-                Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+                Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
             }
             Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
                 -ArchiveDefinitions $Definitions -RetentionHours $Hours -RemovedFileCount $CountRef
-        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanTestPathFailureRemovedCount)
-
+        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanIoFailureRemovedCount)
         Test-BRAVOCondition `
-            -Condition ($orphanTestPathFailureResult -eq $false) `
-            -Name "BackupConsistency/OrphanTempSweepTestPathFailureIsFailVisible" `
-            -Failure "провайдерська помилка Test-Path на .work (мережа/диск) має повертати `$false (fail-visible), а не мовчки трактуватися як 'каталогу немає'"
+            -Condition ($orphanIoFailureResult -eq $false) `
+            -Name "BackupConsistency/OrphanTempSweepProviderIOFailureIsFailVisible" `
+            -Failure "IOException на .work (відключений диск/недоступний UNC) має повертати `$false (fail-visible), а не мовчки трактуватися як 0 кандидатів"
     } finally {
         if (Test-Path -LiteralPath $orphanSweepTestRoot) {
             Remove-Item -LiteralPath $orphanSweepTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # --- Структурно: Remove-BRAVOOrphanedTemporaryArchiveArtifacts більше
+    # НЕ використовує Test-Path узагалі (AST-звуження до тіла функції, не
+    # "рядок десь у файлі" — той самий idiom, що інші структурні тести).
+    # Test-Path не fail-visible для pure ACL access-denied за конструкцією
+    # (.NET Directory.Exists ковтає UnauthorizedAccessException), тому
+    # єдиний надійний спосіб — не мати цього виклику взагалі.
+    $orphanSweepAstErrors = $null
+    $orphanSweepAstTokens = $null
+    $orphanSweepAst = [Management.Automation.Language.Parser]::ParseInput(
+        $archiveScriptText, [ref]$orphanSweepAstTokens, [ref]$orphanSweepAstErrors
+    )
+    $orphanSweepFunctionAst = $orphanSweepAst.Find(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq 'Remove-BRAVOOrphanedTemporaryArchiveArtifacts'
+        },
+        $true
+    )
+    $orphanSweepTestPathCalls = @($orphanSweepFunctionAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Test-Path'
+        },
+        $true
+    ))
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $orphanSweepFunctionAst -and
+            $orphanSweepTestPathCalls.Count -eq 0
+        ) `
+        -Name "BackupConsistency/OrphanTempSweepDoesNotUseTestPathGate" `
+        -Failure "Remove-BRAVOOrphanedTemporaryArchiveArtifacts не повинна викликати Test-Path узагалі — він не fail-visible для pure ACL access-denied (.NET Directory.Exists ковтає UnauthorizedAccessException)"
 
     # --- Retention audit summary: один підсумковий рядок на прогін
     # (скільки generation оцінено/захищено/видалено і чому) доповнює вже
@@ -10285,6 +10440,48 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition $recoveryTriggersFalseOk `
         -Name "TaskDefinition/RecoveryBootTriggerGatedByRunMissedOnStartup" `
         -Failure "коли Restore.RunMissedOnStartup=false, Recovery має мати ЛИШЕ daily trigger (0 boot, 1 daily), а саме завдання (Scheduler.Recovery.Enabled) лишається true — не вимикається повністю"
+
+    # --- TaskDefinition/RecoveryStartWhenAvailableIsAlwaysTrue: якщо daily
+    # trigger на Restore.WindowStart пропущено через sleep/offline, а
+    # система стає доступною ще ВСЕРЕДИНІ вікна, Task Scheduler повинен
+    # наздогнати пропущений запуск негайно (не чекати наступного дня) —
+    # безпечно лише разом із P0 TOCTOU-бар'єрами (Maintenance/RestoreBarrier*
+    # вище), які no-op'ають запізнілий catch-up ПОЗА вікном. Recovery — це
+    # StartWhenAvailable=true НЕЗАЛЕЖНО від глобального
+    # schedulerSettings.StartWhenAvailable (типово false для інших типів
+    # завдань — Backup тут як контрольний приклад, щоб довести, що це
+    # саме Recovery-специфічний override, а не зміна глобальної поведінки).
+    $startWhenAvailableTaskServiceForTest = New-Object -ComObject "Schedule.Service"
+    $startWhenAvailableTaskServiceForTest.Connect()
+    $recoveryStartWhenAvailableOk = $false
+    try {
+        $startWhenAvailableInfo = & $recoveryTriggerModule {
+            param($TaskService, $RecoverySettings, $BackupSettings, $ConfigPath)
+            $recoveryDefinition = New-BRAVOTaskDefinition `
+                -TaskService $TaskService -TaskSettings $RecoverySettings `
+                -TaskType 'Recovery' -ResolvedConfigPath $ConfigPath
+            $backupDefinition = New-BRAVOTaskDefinition `
+                -TaskService $TaskService -TaskSettings $BackupSettings `
+                -TaskType 'Backup' -ResolvedConfigPath $ConfigPath
+            [pscustomobject]@{
+                RecoveryStartWhenAvailable = $recoveryDefinition.Definition.Settings.StartWhenAvailable
+                BackupStartWhenAvailable = $backupDefinition.Definition.Settings.StartWhenAvailable
+            }
+        } $startWhenAvailableTaskServiceForTest $global:schedulerSettings.Recovery $global:schedulerSettings.Backup $resolvedConfig
+
+        $recoveryStartWhenAvailableOk = (
+            [bool]$startWhenAvailableInfo.RecoveryStartWhenAvailable -eq $true -and
+            [bool]$startWhenAvailableInfo.BackupStartWhenAvailable -eq [bool]$global:schedulerSettings.StartWhenAvailable
+        )
+    } catch {
+        $recoveryStartWhenAvailableOk = $false
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($startWhenAvailableTaskServiceForTest)
+    }
+    Test-BRAVOCondition `
+        -Condition $recoveryStartWhenAvailableOk `
+        -Name "TaskDefinition/RecoveryStartWhenAvailableIsAlwaysTrue" `
+        -Failure "Recovery має StartWhenAvailable=true незалежно від глобального schedulerSettings.StartWhenAvailable; інші типи завдань (Backup — контрольний приклад) мають читати глобальне значення без змін"
 
     # --- Version/StampConsistency: buildId є префіксом sourceCommit ---
     # Ловить неузгоджений/pre-stamp VERSION.json (packageVersion нова, а

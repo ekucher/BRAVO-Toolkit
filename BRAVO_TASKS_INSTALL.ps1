@@ -271,7 +271,22 @@ function New-BRAVOTaskDefinition {
     $definition.RegistrationInfo.Description = [string]$TaskSettings.Description
 
     $definition.Settings.Enabled = $true
-    $definition.Settings.StartWhenAvailable = [bool]$schedulerSettings.StartWhenAvailable
+    # Recovery окремо від інших task types: StartWhenAvailable=true, а не
+    # глобальний schedulerSettings.StartWhenAvailable (типово false). Якщо
+    # daily trigger на Restore.WindowStart пропущено через sleep/offline, а
+    # система стає доступною ще ВСЕРЕДИНІ вікна, Task Scheduler повинен
+    # наздогнати пропущений запуск негайно, а не чекати наступного дня.
+    # Безпечно ЛИШЕ разом із P0 TOCTOU-переперевіркою в
+    # BRAVO_MAINTENANCE.ps1 (Test-BRAVORestoreExecutionStillAllowed,
+    # обидва бар'єри): запізніле надолуження ПОЗА вікном коректно no-op,
+    # без деструктивного bravocmd.exe. На boot-trigger (той самий task,
+    # той самий Settings) StartWhenAvailable семантично не впливає — це
+    # властивість "пропущений запланований момент", а не подієвий тригер.
+    $definition.Settings.StartWhenAvailable = if ($TaskType -eq "Recovery") {
+        $true
+    } else {
+        [bool]$schedulerSettings.StartWhenAvailable
+    }
     $definition.Settings.WakeToRun = [bool]$schedulerSettings.WakeToRun
     $definition.Settings.Hidden = [bool]$schedulerSettings.Hidden
     $definition.Settings.DisallowStartIfOnBatteries =

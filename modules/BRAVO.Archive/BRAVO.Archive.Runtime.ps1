@@ -2612,31 +2612,25 @@ function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
             $destination = [string]$archive.Destination
             if ([string]::IsNullOrWhiteSpace($destination)) { continue }
             $workDirectory = Join-Path $destination ".work"
-            # Test-Path сам по собі НЕ fail-visible для access-denied: .NET
-            # Directory.Exists (на якому базується файловий провайдер) за
-            # дизайном ковтає UnauthorizedAccess і повертає $false — межу
-            # "не існує" і "заборонено" Test-Path принципово не розрізняє.
-            # -ErrorAction Stop все одно ловить провайдерські/мережеві
-            # помилки (відключений диск, недоступний UNC-шлях тощо), які
-            # інакше так само мовчки читались би як "каталогу немає".
-            $workDirectoryExists = $false
-            try {
-                $workDirectoryExists = Test-Path -LiteralPath $workDirectory -PathType Container -ErrorAction Stop
-            } catch {
-                $failed = $true
-                Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося перевірити наявність $workDirectory для orphan-sweep: $($_.Exception.Message)" -Level 'ERROR'
-                continue
-            }
-            if (-not $workDirectoryExists) { continue }
-
-            # Fail-visible enumeration: SilentlyContinue тут означав би, що
-            # access denied/I-O error на .work мовчки повертає 0 кандидатів,
-            # і функція рапортувала б успіх, хоча sweep фактично не відбувся.
+            # Свідомо БЕЗ окремого Test-Path gate: .NET Directory.Exists (на
+            # якому базується файловий провайдер) за дизайном ковтає
+            # UnauthorizedAccessException і повертає $false — pure ACL
+            # access-denied на ІСНУЮЧОМУ каталозі принципово нерозрізнюване
+            # від "не існує" через Test-Path, з -ErrorAction Stop чи без.
+            # Замість цього єдине джерело істини — сам Get-ChildItem: він
+            # РЕАЛЬНО кидає (підтверджено емпірично в цій сесії), і catch
+            # явно класифікує причину:
+            # - ItemNotFoundException/DirectoryNotFoundException — .work
+            #   справді відсутній, доброякісний SKIP, не помилка sweep'у;
+            # - будь-що інше (UnauthorizedAccessException, IOException,
+            #   мережева/провайдерська помилка) — fail-visible: $failed=true.
             try {
                 $partialFiles = @(
                     Get-ChildItem -LiteralPath $workDirectory -File -Force `
                         -Filter "*.partial*" -ErrorAction Stop
                 )
+            } catch [System.Management.Automation.ItemNotFoundException], [System.IO.DirectoryNotFoundException] {
+                continue
             } catch {
                 $failed = $true
                 Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося прочитати $workDirectory для orphan-sweep: $($_.Exception.Message)" -Level 'ERROR'
@@ -2657,12 +2651,15 @@ function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
                     Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося видалити осиротілий артефакт $($file.FullName): $($_.Exception.Message)" -Level 'ERROR'
                 }
             }
-            # Так само fail-visible: помилка enumeration тут НЕ повинна
-            # трактуватися як "каталог порожній" — інакше рішення видалити (чи
-            # НЕ видалити, помилково повідомивши про це) .work спиралося б на
-            # недостовірний .Count.
+            # Так само класифіковано, а не Test-Path: помилка enumeration тут
+            # НЕ повинна трактуватися як "каталог порожній" — інакше рішення
+            # видалити .work спиралося б на недостовірний .Count. Зникнення
+            # каталогу МІЖ enumeration вище і цією перевіркою (конкурентний
+            # процес) — доброякісний SKIP (нічого видаляти), не помилка.
             try {
                 $remainingItems = @(Get-ChildItem -LiteralPath $workDirectory -Force -ErrorAction Stop)
+            } catch [System.Management.Automation.ItemNotFoundException], [System.IO.DirectoryNotFoundException] {
+                continue
             } catch {
                 $failed = $true
                 Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося перевірити, чи $workDirectory порожній: $($_.Exception.Message)" -Level 'ERROR'
