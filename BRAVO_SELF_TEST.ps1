@@ -9806,6 +9806,9 @@ function Get-BRAVOMaintenanceSummaryResult {
         -FunctionNames @(
             "Write-BRAVOLogRotationMessage",
             "Get-BRAVONextLogSequence",
+            # Move-BRAVOLogWithSequence викликає її на фінальній відмові, тому
+            # без неї синтетичний модуль ротації впав би на CommandNotFound.
+            "Get-BRAVOFileLockingProcess",
             "Move-BRAVOLogWithSequence",
             "New-BRAVOLogRotationSummary",
             "Get-BRAVOExchangeApiLogFiles",
@@ -11522,6 +11525,61 @@ function Write-BRAVOLog {
     $sharedCancelIndex = $archiveScriptText.IndexOf('if (-not $sharedAccessValid) {')
     $componentCancelIndex = $archiveScriptText.IndexOf('} elseif ($probeFailedComponents.Count -gt 0) {')
     $globalCancelIndex = $archiveScriptText.IndexOf('$readyArchives = @()', $sharedCancelIndex)
+    # --- Maintenance: заблокований журнал називає ТРИМАЧА файлу ---
+    # Реальний випадок LIMS: невдала реставрація лишала процес, що тримав
+    # TraceSRV.out, і ротація писала лише "used by another process" — без
+    # жодної підказки, кого зупиняти. Перевіряємо на СПРАВЖНЬОМУ блокуванні:
+    # відкриваємо файл ексклюзивно й вимагаємо, щоб діагностика назвала
+    # поточний процес (його PID).
+    $lockProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_LOCKPROBE_" + [guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $lockProbeRoot -Force | Out-Null
+    $lockProbeFile = Join-Path $lockProbeRoot 'TraceSRV.out'
+    [IO.File]::WriteAllText($lockProbeFile, 'locked payload', (New-Object Text.UTF8Encoding($false)))
+    $lockProbeHolders = @()
+    $lockProbeUnlockedHolders = @()
+    $lockProbeStream = $null
+    try {
+        $lockProbeStream = [IO.File]::Open(
+            $lockProbeFile,
+            [IO.FileMode]::Open,
+            [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None
+        )
+        $lockProbeHolders = @(& $logRotationModule {
+            param($Path)
+            Get-BRAVOFileLockingProcess -Path $Path
+        } $lockProbeFile)
+    } finally {
+        if ($null -ne $lockProbeStream) { $lockProbeStream.Dispose() }
+    }
+    # Після звільнення тримачів бути не повинно — інакше тест підтверджував би
+    # будь-який непорожній результат, а не саме виявлення блокування.
+    $lockProbeUnlockedHolders = @(& $logRotationModule {
+        param($Path)
+        Get-BRAVOFileLockingProcess -Path $Path
+    } $lockProbeFile)
+    Remove-Item -LiteralPath $lockProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Test-BRAVOCondition `
+        -Condition (
+            $lockProbeHolders.Count -gt 0 -and
+            (($lockProbeHolders -join ' ') -match ("PID\s+" + [regex]::Escape([string]$PID))) -and
+            $lockProbeUnlockedHolders.Count -eq 0
+        ) `
+        -Name 'Maintenance/LockedLogNamesHoldingProcess' `
+        -Failure "заблокований журнал має називати процес-тримач (ім'я + PID) через Restart Manager, а на вільному файлі не повідомляти жодного тримача; отримано: [$($lockProbeHolders -join ', ')] / вільний: [$($lockProbeUnlockedHolders -join ', ')]"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceScriptText.Contains('function Get-BRAVOFileLockingProcess') -and
+            $maintenanceScriptText.Contains('$lockingProcesses = @(Get-BRAVOFileLockingProcess -Path $SourcePath)') -and
+            $maintenanceScriptText.Contains('; тримача файлу визначити не вдалося') -and
+            # Діагностика не має ані зупиняти процеси, ані нарощувати ретраї.
+            -not $maintenanceScriptText.Contains('[BRAVOFileLockInspector]::Kill') -and
+            $maintenanceScriptText.Contains('RmEndSession')
+        ) `
+        -Name 'Maintenance/LockDiagnosticIsReadOnly' `
+        -Failure 'діагностика тримача файлу має лише ЧИТАТИ список через Restart Manager (із коректним RmEndSession) і не зупиняти процеси та не маскувати відмову додатковими спробами'
+
     # --- DryRun: відсутній каталог завдань != збій служби Планувальника ---
     # На першій інсталяції GetFolder('\BRAVO') кидає 0x80070002, і оператор
     # бачив сирий HRESULT "стан не вдалося прочитати" замість зрозумілого

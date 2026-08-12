@@ -1923,6 +1923,154 @@ function Get-BRAVONextLogSequence {
     return ($maxSequence + 1)
 }
 
+function Get-BRAVOFileLockingProcess {
+    # Хто саме тримає файл. Windows повідомляє лише "The process cannot access
+    # the file because it is being used by another process", не називаючи
+    # винуватця — і оператор лишається без єдиного факту, потрібного для
+    # рішення. Реальний випадок: невдала реставрація (bravocmd.exe) залишала
+    # процес, який тримав TraceSRV.out, і ротація trace падала вже після того,
+    # як служби були зупинені.
+    #
+    # Restart Manager (rstrtmgr.dll) — штатний API Windows саме для цього
+    # питання; він лише ЧИТАЄ список і нічого не зупиняє. Функція суто
+    # діагностична: будь-яка її помилка не має впливати на результат ротації,
+    # тому вона ніколи не кидає виняток і повертає порожній масив, коли
+    # визначити тримача не вдалося.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lockingProcesses = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $lockingProcesses.ToArray()
+    }
+
+    try {
+        if (-not ('BRAVOFileLockInspector' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class BRAVOFileLockInspector
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RM_UNIQUE_PROCESS
+    {
+        public int dwProcessId;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+    }
+
+    private const int CCH_RM_MAX_APP_NAME = 255;
+    private const int CCH_RM_MAX_SVC_NAME = 63;
+    private const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct RM_PROCESS_INFO
+    {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+        public string strServiceShortName;
+        public int ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmEndSession(uint pSessionHandle);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
+        uint nApplications, [In] RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded,
+        ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+
+    public static List<string> GetHolders(string path)
+    {
+        List<string> holders = new List<string>();
+        uint sessionHandle;
+        if (RmStartSession(out sessionHandle, 0, Guid.NewGuid().ToString()) != 0)
+        {
+            return holders;
+        }
+        try
+        {
+            string[] resources = new string[] { path };
+            if (RmRegisterResources(sessionHandle, (uint)resources.Length, resources, 0, null, 0, null) != 0)
+            {
+                return holders;
+            }
+            uint needed = 0;
+            uint count = 0;
+            uint reasons = 0;
+            int result = RmGetList(sessionHandle, out needed, ref count, null, ref reasons);
+            if (result != ERROR_MORE_DATA || needed == 0)
+            {
+                return holders;
+            }
+            RM_PROCESS_INFO[] infos = new RM_PROCESS_INFO[needed];
+            count = needed;
+            if (RmGetList(sessionHandle, out needed, ref count, infos, ref reasons) != 0)
+            {
+                return holders;
+            }
+            for (int i = 0; i < count; i++)
+            {
+                string name = infos[i].strAppName;
+                try
+                {
+                    name = System.Diagnostics.Process.GetProcessById(infos[i].Process.dwProcessId).ProcessName;
+                }
+                catch
+                {
+                    // Процес міг завершитися між запитом і уточненням імені —
+                    // тоді лишається ім'я, яке повернув Restart Manager.
+                }
+                string service = infos[i].strServiceShortName;
+                if (!string.IsNullOrEmpty(service))
+                {
+                    holders.Add(name + " (PID " + infos[i].Process.dwProcessId + ", служба " + service + ")");
+                }
+                else
+                {
+                    holders.Add(name + " (PID " + infos[i].Process.dwProcessId + ")");
+                }
+            }
+        }
+        finally
+        {
+            RmEndSession(sessionHandle);
+        }
+        return holders;
+    }
+}
+'@
+        }
+        foreach ($holder in [BRAVOFileLockInspector]::GetHolders($Path)) {
+            if (-not [string]::IsNullOrWhiteSpace($holder)) {
+                [void]$lockingProcesses.Add([string]$holder)
+            }
+        }
+    } catch {
+        # Restart Manager недоступний, компіляція не вдалася або доступ
+        # обмежено. Це лише діагностика — мовчки віддаємо порожній результат,
+        # а викликач напише, що тримача визначити не вдалося.
+    }
+
+    # .ToArray(), а не @($lockingProcesses): загортання порожнього
+    # System.Collections.Generic.List[string]... тут безпечне, але масив
+    # робить контракт функції однозначним для викликача під Set-StrictMode.
+    return $lockingProcesses.ToArray()
+}
+
 function Move-BRAVOLogWithSequence {
     # Переміщення одного журналу в <DestinationDirectory>\<BaseName>_<N><Ext>.
     #
@@ -2085,11 +2233,25 @@ function Move-BRAVOLogWithSequence {
         }
     }
 
+    # Тримача файлу з'ясовуємо РІВНО один раз — на фінальній відмові, а не в
+    # кожній спробі: запит до Restart Manager коштує часу, а для рішення
+    # оператора достатньо одного разу. Перевірка не залежить від тексту
+    # системного повідомлення (він локалізований і покладатися на англійський
+    # рядок не можна) — тому виконується завжди, поки джерело ще на місці.
+    $lockingSuffix = ''
+    if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
+        $lockingProcesses = @(Get-BRAVOFileLockingProcess -Path $SourcePath)
+        $lockingSuffix = if ($lockingProcesses.Count -gt 0) {
+            "; файл утримує: $($lockingProcesses -join ', ')"
+        } else {
+            '; тримача файлу визначити не вдалося'
+        }
+    }
     Write-BRAVOLogRotationMessage `
         -Logger $Logger `
-        -Message "ПОМИЛКА: не вдалося перемістити ${displayPrefix}${sourceName} до $DestinationDirectory після $attemptsUsed спроб: $lastError" `
+        -Message "ПОМИЛКА: не вдалося перемістити ${displayPrefix}${sourceName} до $DestinationDirectory після $attemptsUsed спроб: ${lastError}${lockingSuffix}" `
         -Level "ERROR"
-    return (& $buildResult 'ERROR' $null $null $originalLength $null $null $lastError)
+    return (& $buildResult 'ERROR' $null $null $originalLength $null $null "${lastError}${lockingSuffix}")
 }
 
 function New-BRAVOLogRotationSummary {
