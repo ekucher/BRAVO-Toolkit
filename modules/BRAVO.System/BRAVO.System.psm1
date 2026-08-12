@@ -51,14 +51,24 @@ function Format-BRAVOSchedulerNextRun {
     param(
         [string]$TaskType,
         $NextRunTime,
-        [int]$StartupDelayMinutes = 0
+        [int]$StartupDelayMinutes = 0,
+        # Recovery тепер має ДВА trigger на одному завданні: boot (сентинел
+        # NextRunTime, тому й лишається окремим текстом нижче) і daily о
+        # Restore.WindowStart. Без цього параметра текст описував би лише
+        # половину реального розкладу.
+        [string]$DailyWindowStart
     )
 
     if ($TaskType -eq 'Recovery') {
-        if ($StartupDelayMinutes -gt 0) {
-            return "після наступного старту Windows; затримка $StartupDelayMinutes хв."
+        $bootText = if ($StartupDelayMinutes -gt 0) {
+            "після наступного старту Windows; затримка $StartupDelayMinutes хв."
+        } else {
+            "після наступного старту Windows"
         }
-        return "після наступного старту Windows"
+        if (-not [string]::IsNullOrWhiteSpace($DailyWindowStart)) {
+            return "$bootText та щодня о $DailyWindowStart"
+        }
+        return $bootText
     }
 
     try {

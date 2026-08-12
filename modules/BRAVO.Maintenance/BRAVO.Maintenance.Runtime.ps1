@@ -4695,11 +4695,16 @@ if ($BravoMaintenanceEnabled) {
         ) -Level "WARNING"
     }
     if (-not $maintenanceDailyAtInsideRestoreWindow) {
+        # INFO, не WARNING: Recovery-таск має власний daily trigger саме на
+        # Restore.WindowStart (BRAVO_TASKS_INSTALL.ps1, New-BRAVOTaskDefinition),
+        # тому підхоплення пропущеної реставрації НЕ втрачається через
+        # розсинхронізацію Maintenance.DailyAt і вікна — лише не бере участі
+        # цей конкретний нічний прогін.
         Write-Log -Message (
             "Maintenance.DailyAt ($($schedulerSettings.Maintenance.DailyAt)) поза вікном Restore " +
-            "$RestoreWindowStart-${RestoreWindowEnd}: щоденне автоматичне підхоплення пропущеної " +
-            "реставрації недоступне, лишається лише Recovery/boot."
-        ) -Level "WARNING"
+            "$RestoreWindowStart-${RestoreWindowEnd}: підхоплення пропущеної реставрації цим нічним " +
+            "прогоном недоступне; використовується daily Recovery-тригер о $RestoreWindowStart і boot-recovery."
+        ) -Level "INFO"
     }
 }
 # ===== ВИЯВЛЕННЯ ДЖЕРЕЛ ЖУРНАЛІВ =====

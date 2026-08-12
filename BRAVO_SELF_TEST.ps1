@@ -4454,20 +4454,23 @@ try {
             -Name 'Maintenance/RecoveryEarlyExitHonorsActionableMissedRestore' `
             -Failure 'Recovery не має мовчки виходити без дій, коли пропущену реставрацію вже можна виконати (вікно відкрите) — early-exit має перевіряти й $missedRestoreDue, не лише $missedDailyWork'
 
-        # Регресія: щоденне підхоплення пропущеної реставрації покладається
-        # на те, що Maintenance.DailyAt справді потрапляє у вікно Restore.
-        # Якщо адміністратор рознесе ці налаштування, автоматичне підхоплення
-        # замовкне без жодного попередження в журналі.
+        # Регресія: коли Maintenance.DailyAt не потрапляє у вікно Restore,
+        # оператор має бути поінформований, що САМЕ цей нічний прогін не
+        # підхоплює пропущену реставрацію. Це вже НЕ WARNING (даний ризик
+        # закритий окремим daily Recovery-тригером на Restore.WindowStart —
+        # BRAVO_TASKS_INSTALL.ps1), тому рівень INFO і текст не повинні
+        # неправдиво стверджувати "лишається лише Recovery/boot".
         Test-BRAVOCondition `
             -Condition (
                 $maintenanceRestoreWindowText -match
                 '\$maintenanceDailyAtInsideRestoreWindow\s*=\s*\[TimeSpan\]::TryParse' -and
                 $maintenanceRestoreWindowText -match
                 'if\s*\(-not\s*\$maintenanceDailyAtInsideRestoreWindow\)' -and
-                $maintenanceRestoreWindowText.Contains('щоденне автоматичне підхоплення пропущеної')
+                $maintenanceRestoreWindowText.Contains('використовується daily Recovery-тригер') -and
+                -not $maintenanceRestoreWindowText.Contains('лишається лише Recovery/boot')
             ) `
             -Name 'Maintenance/WarnsWhenDailyMaintenanceOutsideRestoreWindow' `
-            -Failure 'має бути WARNING, якщо Maintenance.DailyAt не потрапляє у вікно Restore.WindowStart/WindowEnd — інакше втрата нічного шляху підхоплення пропущеної реставрації лишається непоміченою'
+            -Failure 'коли Maintenance.DailyAt поза вікном Restore.WindowStart/WindowEnd, повідомлення має згадувати daily Recovery-тригер і не стверджувати, що лишається лише Recovery/boot (цей шлях уже покритий окремим щоденним тригером)'
 
         # Вивід зовнішнього інструмента на шляху ПОМИЛКИ не має писатися в
         # DEBUG: промислові розгортання працюють на INFO, і причина падіння
@@ -9918,7 +9921,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             'Recovery' `
             @{ StartupDelayMinutes = 7 } `
             ([datetime]'1899-12-30T00:00:00')
-        $recoverySummaryOk = ($recoverySummary -eq 'після наступного старту Windows; затримка 7 хв.')
+        $recoverySummaryOk = ($recoverySummary -eq 'після наступного старту Windows; затримка 7 хв. та щодня о 21:00')
     } catch { $recoverySummaryOk = $false }
     Test-BRAVOCondition `
         -Condition $recoverySummaryOk `
@@ -9972,7 +9975,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             Type = "Recovery"
             Settings = @{ StartupDelayMinutes = 7 }
             NextRunTime = [datetime]"1899-12-30T00:00:00"
-            Expected = "після наступного старту Windows; затримка 7 хв."
+            Expected = "після наступного старту Windows; затримка 7 хв. та щодня о 21:00"
         }
     )
     foreach ($diagnoseCase in $diagnoseCases) {
@@ -10010,6 +10013,23 @@ function Get-BRAVOMaintenanceSummaryResult {
         ) `
         -Name "Scheduler/BootTriggerNextRunNo1899" `
         -Failure "Recovery (boot) -> 'після наступного старту Windows', ніколи 30.12.1899; sentinel звичайного завдання -> 'невідомо'"
+
+    # --- Scheduler/RecoveryNextRunMentionsDailyWindowTrigger: Recovery тепер
+    # має ДВА trigger на одному завданні (boot + daily на Restore.WindowStart)
+    # — текст має описувати обидва, а без -DailyWindowStart лишатися таким, як
+    # був (зворотна сумісність виклику без нового параметра).
+    $recoveryWithDaily = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 0 -DailyWindowStart '21:00'
+    $recoveryWithDailyAndDelay = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 7 -DailyWindowStart '21:00'
+    $recoveryWithoutDailyParam = Format-BRAVOSchedulerNextRun -TaskType 'Recovery' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 0
+    Test-BRAVOCondition `
+        -Condition (
+            $recoveryWithDaily -eq 'після наступного старту Windows та щодня о 21:00' -and
+            $recoveryWithDailyAndDelay -eq 'після наступного старту Windows; затримка 7 хв. та щодня о 21:00' -and
+            $recoveryWithoutDailyParam -eq 'після наступного старту Windows' -and
+            $recoveryWithDaily -notmatch '1899'
+        ) `
+        -Name "Scheduler/RecoveryNextRunMentionsDailyWindowTrigger" `
+        -Failure "коли задано -DailyWindowStart, текст Recovery має згадувати і boot, і daily-тригер; без параметра поведінка має лишатися незмінною"
 
     # --- Deploy/RuntimeRootConfigRootSeparation: runtime-ресурси з RuntimeRoot ---
     $separateConfigRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CFGROOT_" + [guid]::NewGuid().ToString('N'))
@@ -10099,6 +10119,58 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (@($problemsRunLevel | Where-Object { $_ -like '*RunLevel*' }).Count -gt 0) `
         -Name "TaskDefinition/WrongRunLevelFails" `
         -Failure "невідповідний RunLevel має фіксуватися проти expected"
+
+    # --- TaskDefinition/RecoveryHasBootAndDailyWindowTriggers: реальний COM
+    # Schedule.Service.NewTask(0) будує ITaskDefinition лише в пам'яті (не
+    # реєструє нічого через RegisterTaskDefinition), тому безпечно для CI —
+    # не чіпає фактичний Task Scheduler. Доводить, що Recovery отримує ДВА
+    # trigger на ОДНОМУ завданні: boot (як і раніше) і daily на
+    # Restore.WindowStart — інакше пропущена реставрація знов залежала б
+    # лише від Maintenance.DailyAt чи від найближчого перезавантаження.
+    $recoveryTriggerModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $taskInstallerText `
+        -FunctionNames @('New-BRAVOTaskDefinition', 'ConvertTo-ScheduleTime', 'ConvertTo-BRAVOMultipleInstancesPolicy')
+    $recoveryTaskServiceForTest = New-Object -ComObject "Schedule.Service"
+    $recoveryTaskServiceForTest.Connect()
+    $recoveryTriggersOk = $false
+    try {
+        $recoveryTriggerInfo = @(& $recoveryTriggerModule {
+            param($TaskService, $TaskSettings, $ConfigPath)
+            $result = New-BRAVOTaskDefinition `
+                -TaskService $TaskService `
+                -TaskSettings $TaskSettings `
+                -TaskType 'Recovery' `
+                -ResolvedConfigPath $ConfigPath
+            @($result.Definition.Triggers) | ForEach-Object {
+                [pscustomobject]@{
+                    Type = $_.Type
+                    StartBoundary = $_.StartBoundary
+                    DaysInterval = $_.DaysInterval
+                    Enabled = $_.Enabled
+                }
+            }
+        } $recoveryTaskServiceForTest $global:schedulerSettings.Recovery $resolvedConfig)
+
+        $bootTriggers = @($recoveryTriggerInfo | Where-Object { $_.Type -eq 8 })
+        $dailyTriggers = @($recoveryTriggerInfo | Where-Object { $_.Type -eq 2 })
+        $expectedWindowStart = [string]$global:maintenanceSettings.Restore.WindowStart
+        $recoveryTriggersOk = (
+            $recoveryTriggerInfo.Count -eq 2 -and
+            $bootTriggers.Count -eq 1 -and
+            $dailyTriggers.Count -eq 1 -and
+            [bool]$dailyTriggers[0].Enabled -and
+            [int]$dailyTriggers[0].DaysInterval -eq 1 -and
+            ([datetime]$dailyTriggers[0].StartBoundary).ToString('HH:mm') -eq $expectedWindowStart
+        )
+    } catch {
+        $recoveryTriggersOk = $false
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($recoveryTaskServiceForTest)
+    }
+    Test-BRAVOCondition `
+        -Condition $recoveryTriggersOk `
+        -Name "TaskDefinition/RecoveryHasBootAndDailyWindowTriggers" `
+        -Failure "Recovery-завдання має мати РІВНО два trigger: boot (Type=8, без змін) і daily (Type=2) зі StartBoundary=Restore.WindowStart, DaysInterval=1, Enabled=true"
 
     # --- Version/StampConsistency: buildId є префіксом sourceCommit ---
     # Ловить неузгоджений/pre-stamp VERSION.json (packageVersion нова, а

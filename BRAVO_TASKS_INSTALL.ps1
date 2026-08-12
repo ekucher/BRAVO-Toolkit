@@ -345,6 +345,32 @@ function New-BRAVOTaskDefinition {
             [timespan]::FromHours([double]$TaskSettings.RetryDurationHours)
         )
         $trigger.Repetition.StopAtDurationEnd = $false
+
+        # Другий trigger на ТОМУ САМОМУ Recovery-завданні (той самий Action,
+        # -RunMissedRestoreOnly) — не окремий Windows task. Boot-trigger вище
+        # ловить пропущену реставрацію лише в перші 8 год після старту; якщо
+        # сервер не перезавантажується, а Maintenance.DailyAt не потрапляє у
+        # Restore.WindowStart-WindowEnd, жоден щоденний прогін узагалі не
+        # трапляється у вікні. Daily-trigger тут гарантує спробу щодня саме о
+        # Restore.WindowStart — той самий "safety barrier" $restoreWindowOpen
+        # у BRAVO_MAINTENANCE.ps1 і так відкидає спроби поза вікном, тому цей
+        # trigger лише забезпечує, що спроба СТАНЕТЬСЯ, а не визначає, чи вона
+        # дозволена. Час НЕ хардкодиться: береться з Restore.WindowStart (той
+        # самий default "21:00" за відсутності ключа, що й
+        # BRAVO.Maintenance.Runtime.ps1 застосовує до вікна).
+        $restoreWindowStartSetting = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
+            -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
+            [string]$maintenanceSettings.Restore.WindowStart
+        } else {
+            "21:00"
+        }
+        $dailyRecoveryTime = ConvertTo-ScheduleTime `
+            -Value $restoreWindowStartSetting `
+            -SettingName "Restore.WindowStart"
+        $dailyRecoveryTrigger = $definition.Triggers.Create(2) # TASK_TRIGGER_DAILY
+        $dailyRecoveryTrigger.StartBoundary = $dailyRecoveryTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
+        $dailyRecoveryTrigger.Enabled = $true
+        $dailyRecoveryTrigger.DaysInterval = 1
     }
 
     $scriptPath = (Resolve-Path -Path $TaskSettings.ScriptPath).Path
@@ -403,6 +429,12 @@ function Format-BRAVOInstalledTaskSummaryNextRun {
     }
     if ($TaskType -eq "Recovery") {
         $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
+        $nextRunArguments.DailyWindowStart = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
+            -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
+            [string]$maintenanceSettings.Restore.WindowStart
+        } else {
+            "21:00"
+        }
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments
@@ -770,7 +802,13 @@ try {
             $scheduleText = if ($taskPlan.Type -eq "Backup" -or $taskPlan.Type -eq "Maintenance") {
                 "щодня о $($taskSettings.DailyAt)"
             } elseif ($taskPlan.Type -eq "Recovery") {
-                "після старту сервера; затримка $($taskSettings.StartupDelayMinutes) хв."
+                $previewRestoreWindowStart = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
+                    -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
+                    [string]$maintenanceSettings.Restore.WindowStart
+                } else {
+                    "21:00"
+                }
+                "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.) та щодня о $previewRestoreWindowStart"
             } elseif ($taskPlan.Type -eq "BAZASync") {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
             } else {
