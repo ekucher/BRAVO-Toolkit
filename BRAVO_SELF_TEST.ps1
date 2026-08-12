@@ -4365,6 +4365,155 @@ try {
             -Condition ($bravoConfigText -match '(?s)Restore\s*=\s*@\{.*?Day\s*=\s*7\b') `
             -Name 'Maintenance/DefaultRestoreScheduleRemainsSunday' `
             -Failure 'BRAVO.config Restore.Day має лишатися 7 (Sunday), як задокументовано для планової реставрації о 03:00'
+
+        # --- Безпечне вікно автоматичної реставрації ---
+        # Реставрація зупиняє служби BRAVO і монопольно тримає модель.
+        # Регресія, яку це закриває: boot-recovery пропущеного слоту
+        # стартував о будь-якій годині, зокрема вранці на робочій моделі.
+        $maintenanceRestoreWindowText = [IO.File]::ReadAllText(
+            (Join-Path $PSScriptRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1')
+        )
+
+        Test-BRAVOCondition `
+            -Condition (
+                $bravoConfigText -match '(?s)Restore\s*=\s*@\{.*?WindowStart\s*=\s*"21:00".*?WindowEnd\s*=\s*"03:00"'
+            ) `
+            -Name 'Maintenance/RestoreWindowIsConfigured' `
+            -Failure 'BRAVO.config Restore має містити WindowStart/WindowEnd — без них автоматична реставрація не має межі робочого часу'
+
+        $restoreWindowModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceRestoreWindowText `
+            -FunctionNames @('Test-BRAVORestoreTimeWindow')
+        $restoreWindowProbe = & $restoreWindowModule {
+            $start = [TimeSpan]::Parse('21:00')
+            $end = [TimeSpan]::Parse('03:00')
+            $at = { param($hhmm) [datetime]('2026-08-12 ' + $hhmm) }
+            [pscustomobject]@{
+                # Вікно перетинає північ: обидві половини мають бути відкриті.
+                LateEvening = Test-BRAVORestoreTimeWindow -Now (& $at '22:30') -WindowStart $start -WindowEnd $end
+                AfterMidnight = Test-BRAVORestoreTimeWindow -Now (& $at '01:15') -WindowStart $start -WindowEnd $end
+                StartBoundary = Test-BRAVORestoreTimeWindow -Now (& $at '21:00') -WindowStart $start -WindowEnd $end
+                # Робочий час і межі, що мають лишатися зачиненими.
+                WorkingHours = Test-BRAVORestoreTimeWindow -Now (& $at '09:00') -WindowStart $start -WindowEnd $end
+                EndBoundary = Test-BRAVORestoreTimeWindow -Now (& $at '03:00') -WindowStart $start -WindowEnd $end
+                JustBeforeStart = Test-BRAVORestoreTimeWindow -Now (& $at '20:59') -WindowStart $start -WindowEnd $end
+                # Рівні межі = обмеження фактично вимкнене.
+                EqualBounds = Test-BRAVORestoreTimeWindow -Now (& $at '12:00') `
+                    -WindowStart ([TimeSpan]::Parse('00:00')) -WindowEnd ([TimeSpan]::Parse('00:00'))
+            }
+        }
+
+        Test-BRAVOCondition `
+            -Condition (
+                $restoreWindowProbe.LateEvening -and
+                $restoreWindowProbe.AfterMidnight -and
+                $restoreWindowProbe.StartBoundary -and
+                -not $restoreWindowProbe.WorkingHours -and
+                -not $restoreWindowProbe.EndBoundary -and
+                -not $restoreWindowProbe.JustBeforeStart -and
+                $restoreWindowProbe.EqualBounds
+            ) `
+            -Name 'Maintenance/RestoreWindowWrapsMidnight' `
+            -Failure 'вікно 21:00-03:00 має бути відкрите о 22:30/01:15/21:00 і зачинене о 09:00/03:00/20:59; рівні межі означають цілодобовий дозвіл'
+
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceRestoreWindowText -match
+                '\$shouldRestore\s*=\s*\$BravoMaintenanceEnabled\s*-and\s*\(\s*\$ForceRestore\s*-or\s*\(\$automaticRestoreDue\s*-and\s*\$restoreWindowOpen\)\s*\)'
+            ) `
+            -Name 'Maintenance/RestoreWindowGatesAutomaticButNotForce' `
+            -Failure 'вікно має обмежувати лише автоматичні шляхи (плановий слот і boot-recovery); -ForceRestore лишається доступним у будь-який час'
+
+        # Регресія: пропущену реставрацію раніше підхоплював лише
+        # boot-triggered Recovery (-RunMissedRestoreOnly), який ретраїть
+        # лише 8 годин після старту й потім мовчить до наступного
+        # перезавантаження. Щоденний Maintenance (у вікні) має підхоплювати
+        # той самий пропущений слот самостійно.
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceRestoreWindowText -match
+                '(?m)^\$missedRestoreDue\s*=\s*\$missedRestore\s*$' -and
+                $maintenanceRestoreWindowText -notmatch
+                '\$missedRestoreDue\s*=\s*\$RunMissedRestoreOnly\s*-and\s*\$missedRestore'
+            ) `
+            -Name 'Maintenance/MissedRestoreRetriesNightlyNotOnlyOnBoot' `
+            -Failure 'пропущену реставрацію має підхоплювати БУДЬ-ЯКИЙ прогін (нічний Maintenance у вікні), не лише Recovery після boot — інакше пропуск компенсується лише після перезавантаження сервера'
+
+        # Регресія: Recovery раніше виходив без дій (compact no-op), якщо
+        # $missedDailyWork було false, — НАВІТЬ коли $missedRestoreDue було
+        # true і вікно вже відкрите. Early-exit має враховувати обидва
+        # сигнали, інакше boot-recovery ніколи не доходить до кроку
+        # реставрації в сценарії "пропущена лише реставрація".
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceRestoreWindowText -match
+                '\$missedRestoreActionableNow\s*=\s*\$missedRestoreDue\s*-and\s*\$restoreWindowOpen' -and
+                $maintenanceRestoreWindowText -match
+                '\$RunMissedRestoreOnly\s*-and\s*-not\s*\$missedDailyWork\s*-and\s*-not\s*\$missedRestoreActionableNow'
+            ) `
+            -Name 'Maintenance/RecoveryEarlyExitHonorsActionableMissedRestore' `
+            -Failure 'Recovery не має мовчки виходити без дій, коли пропущену реставрацію вже можна виконати (вікно відкрите) — early-exit має перевіряти й $missedRestoreDue, не лише $missedDailyWork'
+
+        # Регресія: щоденне підхоплення пропущеної реставрації покладається
+        # на те, що Maintenance.DailyAt справді потрапляє у вікно Restore.
+        # Якщо адміністратор рознесе ці налаштування, автоматичне підхоплення
+        # замовкне без жодного попередження в журналі.
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceRestoreWindowText -match
+                '\$maintenanceDailyAtInsideRestoreWindow\s*=\s*\[TimeSpan\]::TryParse' -and
+                $maintenanceRestoreWindowText -match
+                'if\s*\(-not\s*\$maintenanceDailyAtInsideRestoreWindow\)' -and
+                $maintenanceRestoreWindowText.Contains('щоденне автоматичне підхоплення пропущеної')
+            ) `
+            -Name 'Maintenance/WarnsWhenDailyMaintenanceOutsideRestoreWindow' `
+            -Failure 'має бути WARNING, якщо Maintenance.DailyAt не потрапляє у вікно Restore.WindowStart/WindowEnd — інакше втрата нічного шляху підхоплення пропущеної реставрації лишається непоміченою'
+
+        # Вивід зовнішнього інструмента на шляху ПОМИЛКИ не має писатися в
+        # DEBUG: промислові розгортання працюють на INFO, і причина падіння
+        # (наприклад bravocmd з кодом 11153) губилася разом з ним.
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceRestoreWindowText -match
+                '\$outputLevel\s*=\s*if\s*\(\$exitCode\s*-eq\s*0\)\s*\{\s*"DEBUG"\s*\}\s*else\s*\{\s*"ERROR"\s*\}' -and
+                $maintenanceRestoreWindowText -match
+                'Write-Log\s+"Деталі виконання:\$formattedOutput"\s+-Level\s+\$outputLevel'
+            ) `
+            -Name 'Maintenance/FailedCommandOutputIsNotDebugOnly' `
+            -Failure 'вивід зовнішньої команди на шляху помилки має логуватися рівнем ERROR, інакше діагностика зникає при LogLevel=INFO'
+
+        # --- Ранні виходи Health ---
+        # Регресія: Complete-BRAVOHealthResult читає $script:BRAVOToolManifest,
+        # який присвоюється значно нижче. Під StrictMode 2.0 це термінальна
+        # помилка на КОЖНОМУ ранньому виході, а в гілці "відкладено" її
+        # ковтав catch — і Health працював одночасно з архівацією.
+        $healthEarlyExitText = [IO.File]::ReadAllText(
+            (Join-Path $PSScriptRoot 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1')
+        )
+        $toolManifestInitIndex = $healthEarlyExitText.IndexOf('$script:BRAVOToolManifest = $null')
+        $completeFunctionIndex = $healthEarlyExitText.IndexOf('function Complete-BRAVOHealthResult')
+
+        Test-BRAVOCondition `
+            -Condition (
+                $toolManifestInitIndex -ge 0 -and
+                $completeFunctionIndex -ge 0 -and
+                $toolManifestInitIndex -lt $completeFunctionIndex
+            ) `
+            -Name 'Health/ToolManifestInitializedBeforeAnyEarlyExit' `
+            -Failure '$script:BRAVOToolManifest має бути ініціалізований до Complete-BRAVOHealthResult, інакше кожен ранній вихід Health падає під StrictMode'
+
+        $deferralSegmentMatch = [regex]::Match(
+            $healthEarlyExitText,
+            '(?s)if \(\$SkipIfBackupTaskRunning\) \{(.*?)Status = "Deferred"'
+        )
+
+        Test-BRAVOCondition `
+            -Condition (
+                $deferralSegmentMatch.Success -and
+                $deferralSegmentMatch.Groups[1].Value.Contains('} catch {')
+            ) `
+            -Name 'Health/DeferralDecisionIsOutsideTryCatch' `
+            -Failure 'рішення про відкладення й повернення Deferred мають бути поза try/catch: інакше помилка у формуванні результату скасовує вже ухвалене відкладення'
     } finally {
         if (Test-Path -LiteralPath $archiveGenerationTestRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveGenerationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -7119,6 +7268,188 @@ try {
             Remove-Item -LiteralPath $retentionCleanupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # --- Retention Safety Invariants (roadmap Етап 4): пошкоджена НАЙНОВІША
+    # generation (manifest каже COMPLETE, але байти archive змінені після
+    # запису .sha512) не повинна витісняти справді валідну СТАРІШУ
+    # generation із захищеного (protected) набору. VerifiedComplete
+    # переперевіряє SHA512 на диску (не лише вірить полю status), тому
+    # пошкоджена generation падає у failed/incomplete-гілку, а старша валідна
+    # лишається захищеною — цей сценарій раніше не мав ЄДИНОГО end-to-end
+    # тесту (окремо тестувались пошкодження хешу й окремо selection-алгоритм).
+    $corruptNewestTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_CORRUPT_NEWEST_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($corruptNewestTestRoot)
+        $corruptNewestManifestsDir = Join-Path $corruptNewestTestRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($corruptNewestManifestsDir)
+
+        function New-BRAVORetentionFixtureGeneration {
+            param([string]$Root, [string]$GenerationId, [datetime]$StartedAt, [switch]$Corrupt)
+            $archivePath = Join-Path $Root ("MODEL_{0}.mdz" -f $GenerationId)
+            $hashPath = $archivePath + '.sha512'
+            [IO.File]::WriteAllText($archivePath, ("payload-{0}" -f $GenerationId))
+            $hash = (Get-BRAVOFileHash -Path $archivePath -Algorithm SHA512).Hash
+            [IO.File]::WriteAllText($hashPath, ("{0} *{1}" -f $hash.ToLowerInvariant(), [IO.Path]::GetFileName($archivePath)))
+            if ($Corrupt) {
+                [IO.File]::AppendAllText($archivePath, 'corruption')
+            }
+            $manifestJson = (
+                '{{"generationId":"{0}","status":"COMPLETE","startedAt":"{1}",' +
+                '"components":{{"MODEL":{{"CreateSuccess":true,"IntegritySuccess":true,"HashSuccess":true,' +
+                '"ArchivePath":"{2}","HashPath":"{3}"}}}}}}'
+            ) -f $GenerationId, $StartedAt.ToString('yyyy-MM-ddTHH:mm:ss'),
+                $archivePath.Replace('\', '\\'), $hashPath.Replace('\', '\\')
+            [IO.File]::WriteAllText(
+                (Join-Path $Root ("MANIFESTS\BRAVO_BACKUP_{0}.json" -f $GenerationId)),
+                $manifestJson
+            )
+            return @{ ArchivePath = $archivePath; HashPath = $hashPath }
+        }
+
+        $olderValidGenerationId = '20250101_010000'
+        $newestCorruptedGenerationId = '20250601_010000'
+        $olderValidFiles = New-BRAVORetentionFixtureGeneration `
+            -Root $corruptNewestTestRoot -GenerationId $olderValidGenerationId `
+            -StartedAt (Get-Date).AddDays(-200)
+        $newestCorruptedFiles = New-BRAVORetentionFixtureGeneration `
+            -Root $corruptNewestTestRoot -GenerationId $newestCorruptedGenerationId `
+            -StartedAt (Get-Date).AddDays(-190) -Corrupt
+
+        $global:enableArchiveDeletion = $true
+        $global:enableFailedArchiveDeletion = $true
+        $global:failedArchiveRetentionDays = 30
+        $global:minimumRetainedVerifiedBackups = 1
+        $global:progressSettings = $null
+        try {
+            $corruptNewestSectionShown = $false
+            $corruptNewestOk = & $retentionCleanupModule {
+                param($BackupRoot, $CurrentGenerationId, $SectionShownRef)
+                Remove-BRAVOExpiredBackupGenerations `
+                    -BackupRoot $BackupRoot `
+                    -CurrentGenerationId $CurrentGenerationId `
+                    -RetentionDays 183 `
+                    -CleanupSectionShown $SectionShownRef
+            } $corruptNewestTestRoot 'CURRENT_GENERATION_NOT_TARGET_3' ([ref]$corruptNewestSectionShown)
+
+            Test-BRAVOCondition `
+                -Condition (
+                    $corruptNewestOk -eq $true -and
+                    -not (Test-Path -LiteralPath $newestCorruptedFiles.ArchivePath) -and
+                    -not (Test-Path -LiteralPath $newestCorruptedFiles.HashPath) -and
+                    (Test-Path -LiteralPath $olderValidFiles.ArchivePath) -and
+                    (Test-Path -LiteralPath $olderValidFiles.HashPath)
+                ) `
+                -Name "BackupConsistency/CorruptNewestGenerationFallsToFailedBranchAndOlderVerifiedSurvives" `
+                -Failure "пошкоджена НАЙНОВІША generation (SHA512 не збігається) має падати у failed/incomplete-гілку і видалятись за failedArchiveRetentionDays, а СТАРІША справді валідна generation має лишатись захищеною, попри те, що вона хронологічно старіша"
+        } finally {
+            Remove-Item -Path Variable:\global:enableArchiveDeletion, `
+                Variable:\global:enableFailedArchiveDeletion, `
+                Variable:\global:failedArchiveRetentionDays, `
+                Variable:\global:minimumRetainedVerifiedBackups, `
+                Variable:\global:progressSettings `
+                -ErrorAction SilentlyContinue
+        }
+    } finally {
+        if (Test-Path -LiteralPath $corruptNewestTestRoot) {
+            Remove-Item -LiteralPath $corruptNewestTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Orphan temp-artifact sweep (roadmap Етап 4: OrphanTempRetention).
+    # .work\*.partial* лишається назавжди, якщо процес вбито між створенням
+    # тимчасового файлу й Remove-BRAVOTemporaryArchiveArtifacts (та прибирає
+    # лише in-process). Reused module: реальні функції, реальне тимчасове
+    # дерево каталогів — не текстова перевірка.
+    $orphanSweepModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @('Remove-BRAVOOrphanedTemporaryArchiveArtifacts', 'Test-BRAVOBackupArtifactPathSafe')
+    $orphanSweepTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_ORPHAN_SWEEP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($orphanSweepTestRoot)
+        $orphanSweepDestination = Join-Path $orphanSweepTestRoot 'MODEL'
+        [void][IO.Directory]::CreateDirectory($orphanSweepDestination)
+        $orphanSweepWorkDir = Join-Path $orphanSweepDestination '.work'
+        [void][IO.Directory]::CreateDirectory($orphanSweepWorkDir)
+
+        $orphanOldFile = Join-Path $orphanSweepWorkDir 'MODEL.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.partial.mdz'
+        $orphanOldHash = $orphanOldFile + '.sha512'
+        [IO.File]::WriteAllText($orphanOldFile, 'stale partial payload')
+        [IO.File]::WriteAllText($orphanOldHash, 'stale partial hash sidecar')
+        $staleTimestamp = (Get-Date).AddHours(-72)
+        (Get-Item -LiteralPath $orphanOldFile).LastWriteTime = $staleTimestamp
+        (Get-Item -LiteralPath $orphanOldHash).LastWriteTime = $staleTimestamp
+
+        $orphanFreshFile = Join-Path $orphanSweepWorkDir 'MODEL.bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.partial.mdz'
+        [IO.File]::WriteAllText($orphanFreshFile, 'fresh partial payload')
+
+        $orphanOutsideWorkFile = Join-Path $orphanSweepDestination 'MODEL_20250101_010000.mdz'
+        [IO.File]::WriteAllText($orphanOutsideWorkFile, 'published archive, must never be touched')
+        (Get-Item -LiteralPath $orphanOutsideWorkFile).LastWriteTime = $staleTimestamp
+
+        $orphanSweepArchiveDefinitions = @(
+            [pscustomobject]@{ Type = 'MODEL'; Enabled = $true; Destination = $orphanSweepDestination }
+        )
+        $orphanSweepRemovedCount = 0
+        $orphanSweepOk = & $orphanSweepModule {
+            param($Definitions, $Hours, $CountRef)
+            Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
+                -ArchiveDefinitions $Definitions -RetentionHours $Hours -RemovedFileCount $CountRef
+        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanSweepRemovedCount)
+
+        Test-BRAVOCondition `
+            -Condition (
+                $orphanSweepOk -eq $true -and
+                $orphanSweepRemovedCount -eq 2 -and
+                -not (Test-Path -LiteralPath $orphanOldFile) -and
+                -not (Test-Path -LiteralPath $orphanOldHash)
+            ) `
+            -Name "BackupConsistency/OrphanTempSweepDeletesFilesOlderThanThreshold" `
+            -Failure "осиротілі .work\*.partial* файли старші за RetentionHours мають видалятися (і .mdz, і .sha512 sidecar)"
+        Test-BRAVOCondition `
+            -Condition (Test-Path -LiteralPath $orphanFreshFile) `
+            -Name "BackupConsistency/OrphanTempSweepPreservesFreshFiles" `
+            -Failure "свіжий .work\*.partial* файл (новіший за RetentionHours) не повинен видалятися — процес може ще легітимно тривати"
+        Test-BRAVOCondition `
+            -Condition (Test-Path -LiteralPath $orphanOutsideWorkFile) `
+            -Name "BackupConsistency/OrphanTempSweepNeverTouchesFilesOutsideWorkDirectory" `
+            -Failure "opублiкований .mdz поза .work\ не повинен зачіпатися orphan-sweep'ом, навіть якщо він старий"
+    } finally {
+        if (Test-Path -LiteralPath $orphanSweepTestRoot) {
+            Remove-Item -LiteralPath $orphanSweepTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Retention audit summary: один підсумковий рядок на прогін
+    # (скільки generation оцінено/захищено/видалено і чому) доповнює вже
+    # наявні per-deletion рядки. AST-звужений до тіла самої функції — той
+    # самий idiom, що ManifestStorage/RetentionUsesCentralizedReader нижче.
+    $auditParseErrors = $null
+    $auditParseTokens = $null
+    $archiveAstForAudit = [Management.Automation.Language.Parser]::ParseInput(
+        $archiveScriptText, [ref]$auditParseTokens, [ref]$auditParseErrors
+    )
+    $removeExpiredFunctionAst = $archiveAstForAudit.Find(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $candidate.Name -eq 'Remove-BRAVOExpiredBackupGenerations'
+        },
+        $true
+    )
+    $removeExpiredFunctionText = if ($null -ne $removeExpiredFunctionAst) { $removeExpiredFunctionAst.Extent.Text } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $removeExpiredFunctionText.Contains('Аудит retention:') -and
+            $removeExpiredFunctionText.Contains('$deletedVerifiedExpiredCount') -and
+            $removeExpiredFunctionText.Contains('$deletedFailedIncompleteCount') -and
+            $removeExpiredFunctionText.Contains('$protectedGenerationIds.Count')
+        ) `
+        -Name "ManifestStorage/RetentionEmitsAuditSummaryLog" `
+        -Failure "Remove-BRAVOExpiredBackupGenerations має писати один підсумковий 'Аудит retention' рядок (оцінено/захищено/видалено з розбивкою verified vs failed/incomplete) перед return"
 
     # --- 12. Retention (Archive) читає manifest-и через централізований reader ---
     Test-BRAVOCondition `
@@ -11628,21 +11959,25 @@ function Write-BRAVOLog {
         -Failure '''Очищення старих журналів'' має рендеритись через numbered Write-BRAVOArchiveStep, з SKIPPED коли кандидатів немає'
 
     # --- Archive: очищення backup generation — ОДНА агрегована numbered
-    # операція, що покриває і generation retention, і lunch cleanup (не
-    # окремі рядки на кожен внутрішній фільтр).
+    # операція, що покриває generation retention, lunch cleanup і orphan
+    # temp-artifact sweep (не окремі рядки на кожен внутрішній фільтр).
+    # Вікно назад свідомо ширше за відстань до найдальшого виклику
+    # (Remove-BRAVOExpiredBackupGenerations, перший із трьох блоків) —
+    # відкалібровано по факту, не навмання.
     $archiveRetentionResultIndex = $archiveScriptText.IndexOf('-Name ''Очищення старих backup generation''')
     $archiveRetentionResultWindow = if ($archiveRetentionResultIndex -ge 0) {
-        $archiveRetentionWindowStart = [Math]::Max(0, $archiveRetentionResultIndex - 4000)
-        $archiveScriptText.Substring($archiveRetentionWindowStart, [Math]::Min(5500, $archiveScriptText.Length - $archiveRetentionWindowStart))
+        $archiveRetentionWindowStart = [Math]::Max(0, $archiveRetentionResultIndex - 6000)
+        $archiveScriptText.Substring($archiveRetentionWindowStart, [Math]::Min(7500, $archiveScriptText.Length - $archiveRetentionWindowStart))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
             ([regex]::Matches($archiveScriptText, [regex]::Escape('-Name ''Очищення старих backup generation''')).Count -eq 1) -and
             $archiveRetentionResultWindow.Contains('Remove-BRAVOExpiredBackupGenerations') -and
-            $archiveRetentionResultWindow.Contains('Remove-OldLunchArchives')
+            $archiveRetentionResultWindow.Contains('Remove-OldLunchArchives') -and
+            $archiveRetentionResultWindow.Contains('Remove-BRAVOOrphanedTemporaryArchiveArtifacts')
         ) `
         -Name 'Archive/BackupRetentionCleanupAggregatesSubCleanup' `
-        -Failure '''Очищення старих backup generation'' має бути ОДНІЄЮ numbered операцією, що покриває і Remove-BRAVOExpiredBackupGenerations, і Remove-OldLunchArchives'
+        -Failure '''Очищення старих backup generation'' має бути ОДНІЄЮ numbered операцією, що покриває Remove-BRAVOExpiredBackupGenerations, Remove-OldLunchArchives і Remove-BRAVOOrphanedTemporaryArchiveArtifacts'
 
     Test-BRAVOCondition `
         -Condition (
@@ -12062,10 +12397,21 @@ function Write-BRAVOLog {
         -Name 'Archive/DynamicTotalIncludesCleanupOperations' `
         -Failure 'Initialize-BRAVOArchiveSteps -Total (основний backup flow) має включати +1 за старе очищення журналів (завжди) і +1 за generation cleanup (той самий enablement-вираз)'
 
+    # --- Archive: осиротілий .work-sweep фолднутий у ТОЙ САМИЙ numbered
+    # крок "Очищення старих backup generation" (не власний окремий крок —
+    # інакше довелось би синхронізувати ще одне місце Total), тому й Total
+    # має враховувати enableOrphanTempCleanup у тому самому доданку.
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveMainTotalParamText.Contains('$enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup')
+        ) `
+        -Name 'Archive/DynamicTotalIncludesOrphanCleanup' `
+        -Failure 'той самий +1 доданок generation cleanup у Total має враховувати й enableOrphanTempCleanup — інакше orphan-only сценарій (усе інше вимкнено) рендерить крок без місця в нумерації'
+
     # --- Archive: План/Total/фактичний гейт кроку читають ОДИН і той
     # самий буквальний вираз для generation cleanup — не три незалежні
     # копії, які можуть розійтися.
-    $generationCleanupExpression = '$enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup'
+    $generationCleanupExpression = '$enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup'
     Test-BRAVOCondition `
         -Condition (
             $archiveMainTotalParamText.Contains($generationCleanupExpression) -and

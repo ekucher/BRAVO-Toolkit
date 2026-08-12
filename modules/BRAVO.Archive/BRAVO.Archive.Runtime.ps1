@@ -1227,6 +1227,8 @@ function Remove-BRAVOExpiredBackupGenerations {
 
     if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return $false }
     $deletedGenerationCount = 0
+    $deletedVerifiedExpiredCount = 0
+    $deletedFailedIncompleteCount = 0
     try {
         $validRetentionDays = if ($RetentionDays -gt 0) { $RetentionDays } else { 183 }
         $invalidRetentionDays = if ($failedArchiveRetentionDays -gt 0) { [int]$failedArchiveRetentionDays } else { 30 }
@@ -1334,9 +1336,20 @@ function Remove-BRAVOExpiredBackupGenerations {
                 Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
             }
             Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))" -Level 'SUCCESS'
+            if ($record.VerifiedComplete) { $deletedVerifiedExpiredCount++ } else { $deletedFailedIncompleteCount++ }
             $deletedGenerationCount++
         }
         if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
+        # Один підсумковий рядок на прогін: скільки generation оцінено,
+        # скільки захищено мінімальним порогом verified-копій (і які саме —
+        # для forensic-діагностики), скільки реально видалено з розбивкою за
+        # причиною. Доповнює вже наявні per-deletion рядки вище, не замінює.
+        Write-BRAVOLog -Component 'CLEANUP' -Message (
+            "Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
+            "видалено (verified, прострочено)={3}; видалено (failed/incomplete, прострочено)={4}" -f
+            $records.Count, $protectedGenerationIds.Count, ($protectedGenerationIds -join ', '),
+            $deletedVerifiedExpiredCount, $deletedFailedIncompleteCount
+        ) -Level 'INFO'
         return $true
     } catch {
         if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
@@ -2573,6 +2586,63 @@ function Remove-BRAVOTemporaryArchiveArtifacts {
         } catch {
             # Порожній .work нікому не заважає — це не привід для помилки.
         }
+    }
+}
+
+function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
+    # Осиротілі .work\*.partial* — залишки перерваного (крах/force-kill/
+    # втрата живлення) минулого прогону: Remove-BRAVOTemporaryArchiveArtifacts
+    # вище прибирає такі артефакти лише in-process (finally/catch того
+    # самого прогону), тому вбитий процес лишає їх назавжди без цієї функції.
+    # НІКОЛИ не виходить за межі .work\ конкретного Destination: MANIFESTS\ і
+    # опубліковані .mdz/.sha512 поза дією цієї функції (їх коректність і
+    # ретеншн гарантує окремо Remove-BRAVOExpiredBackupGenerations).
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions,
+        [int]$RetentionHours,
+        [ref]$RemovedFileCount
+    )
+
+    $deletedCount = 0
+    $failed = $false
+    try {
+        $effectiveRetentionHours = if ($RetentionHours -gt 0) { $RetentionHours } else { 48 }
+        $cutoff = (Get-Date).AddHours(-$effectiveRetentionHours)
+        foreach ($archive in @($ArchiveDefinitions)) {
+            $destination = [string]$archive.Destination
+            if ([string]::IsNullOrWhiteSpace($destination)) { continue }
+            $workDirectory = Join-Path $destination ".work"
+            if (-not (Test-Path -LiteralPath $workDirectory -PathType Container)) { continue }
+
+            foreach ($file in @(Get-ChildItem -LiteralPath $workDirectory -File -Force `
+                    -Filter "*.partial*" -ErrorAction SilentlyContinue)) {
+                if ($file.LastWriteTime -ge $cutoff) { continue }
+                if (-not (Test-BRAVOBackupArtifactPathSafe -Path $file.FullName -BackupRoot $workDirectory)) {
+                    throw "orphan sweep candidate outside .work: $($file.FullName)"
+                }
+                try {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                    $deletedCount++
+                    Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено осиротілий тимчасовий артефакт: $($file.FullName)" -Level 'SUCCESS'
+                } catch {
+                    $failed = $true
+                    Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося видалити осиротілий артефакт $($file.FullName): $($_.Exception.Message)" -Level 'ERROR'
+                }
+            }
+            if (@(Get-ChildItem -LiteralPath $workDirectory -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+                try {
+                    Remove-Item -LiteralPath $workDirectory -Force -ErrorAction Stop
+                } catch {
+                    # Порожній .work нікому не заважає — це не привід для помилки.
+                }
+            }
+        }
+        if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = $deletedCount }
+        return (-not $failed)
+    } catch {
+        if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = $deletedCount }
+        Write-BRAVOLog -Component 'CLEANUP' -Message "Orphan temp artifact sweep failed: $($_.Exception.Message)" -Level 'ERROR'
+        return $false
     }
 }
 
@@ -5374,7 +5444,7 @@ function Main {
         $(if ($bazaAppLocalSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWLocalSyncEnabled) { 1 } else { 0 }) +
         $enabledArchives.Count +
-        $(if ($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup) { 1 } else { 0 }) +
+        $(if ($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup) { 1 } else { 0 }) +
         $(if ($sftpArchiveUploadEnabled) { 1 } else { 0 }) +
         $(if ($bazaAppSFTPSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWSFTPSyncEnabled) { 1 } else { 0 }) +
@@ -5414,7 +5484,7 @@ function Main {
     # вище і той самий вираз нижче, що й тут) — не unnumbered.
     $archivePlanEntries['Очищення старих журналів'] = $true
     $archivePlanEntries['Очищення старих backup generation'] = [bool](
-        $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup
+        $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup
     )
     $archivePlanEntries['Post-backup Health'] = [bool]$healthCheckEnabled
     Write-BRAVOPlan -Title 'План операцій:' -Entries $archivePlanEntries
@@ -6415,7 +6485,7 @@ function Main {
     # рядків на кожен внутрішній фільтр. Retention days/filters/delete
     # semantics нижче не змінені.
     $backupRetentionCleanupStartedAt = Get-Date
-    $backupRetentionCleanupPlanned = [bool]($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup)
+    $backupRetentionCleanupPlanned = [bool]($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup)
     $generationCleanupAttempted = $false
     $generationCleanupSucceeded = $true
     $generationCleanupDeletedCount = 0
@@ -6497,8 +6567,33 @@ function Main {
         }
     }
 
-    $backupRetentionCleanupAttempted = $generationCleanupAttempted -or $lunchCleanupAttempted
-    $backupRetentionCleanupFailed = (-not $generationCleanupSucceeded) -or $lunchCleanupConfigError -or (-not $lunchCleanupSucceeded)
+    # Осиротілі .work\*.partial* — залишок МИНУЛОГО перерваного прогону, не
+    # результат СЬОГОДНІШНЬОГО backupGenerationStatus, тому цей блок свідомо
+    # НЕ вкладений у "-and $script:backupGenerationStatus -eq 'COMPLETE'"
+    # вище: сьогоднішня невдача не повинна блокувати прибирання чужого
+    # минулого сміття. Ексклюзивний Enter-BRAVOArchiveProcessLock (тримається
+    # увесь прогін) виключає паралельний другий Archive/Maintenance —
+    # orphanTempRetentionHours лише додатковий запобіжник проти видалення
+    # артефакту повільного, але ще легітимно активного прогону.
+    $orphanCleanupAttempted = $false
+    $orphanCleanupSucceeded = $true
+    $orphanCleanupDeletedCount = 0
+    if ($enableOrphanTempCleanup) {
+        $orphanCleanupAttempted = $true
+        $effectiveOrphanTempRetentionHours = if ($null -ne $orphanTempRetentionHours -and [int]$orphanTempRetentionHours -gt 0) {
+            [int]$orphanTempRetentionHours
+        } else { 48 }
+        if (-not (Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
+                -ArchiveDefinitions $archiveDefinitions `
+                -RetentionHours $effectiveOrphanTempRetentionHours `
+                -RemovedFileCount ([ref]$orphanCleanupDeletedCount))) {
+            $operationFailed = $true
+            $orphanCleanupSucceeded = $false
+        }
+    }
+
+    $backupRetentionCleanupAttempted = $generationCleanupAttempted -or $lunchCleanupAttempted -or $orphanCleanupAttempted
+    $backupRetentionCleanupFailed = (-not $generationCleanupSucceeded) -or $lunchCleanupConfigError -or (-not $lunchCleanupSucceeded) -or (-not $orphanCleanupSucceeded)
     # dev.16 (review round 3): OK лише коли щось РЕАЛЬНО видалено —
     # attempted+succeeded-без-видалень тепер SKIPPED "даних для очищення
     # немає", не OK. Факт-сигнали: $archiveCleanupSectionShown встановлює
@@ -6506,7 +6601,7 @@ function Main {
     # видаленням generation (не при самій лише перевірці); $lunchCleanupDeletedCount —
     # реальний $deletedCount, який Remove-OldLunchArchives вже рахує для
     # LOG. Обидва значення — факт, не вигадані числа.
-    $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0)
+    $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0) -or ($orphanCleanupDeletedCount -gt 0)
     # dev.18: numbered [N/TOTAL] крок — раніше unnumbered
     # Write-BRAVOOperationResult. $backupRetentionCleanupPlanned (той
     # самий вираз, що Total вище і План) тепер вирішує, чи крок
@@ -6535,6 +6630,9 @@ function Main {
                     }
                     if ($lunchCleanupDeletedCount -gt 0) {
                         $retentionCleanupDetailParts += "обідніх файлів: $lunchCleanupDeletedCount"
+                    }
+                    if ($orphanCleanupDeletedCount -gt 0) {
+                        $retentionCleanupDetailParts += "осиротілих артефактів: $orphanCleanupDeletedCount"
                     }
                     $retentionCleanupDetailParts -join '; '
                 }

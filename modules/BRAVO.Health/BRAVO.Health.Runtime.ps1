@@ -39,6 +39,15 @@ $script:BRAVOHealthStepOkCount = 0
 $script:BRAVOHealthStepWarningCount = 0
 $script:BRAVOHealthStepErrorCount = 0
 $script:BRAVOHealthLastStepTime = $null
+# Перевірка цілісності інструментів виконується значно нижче, але
+# Complete-BRAVOHealthResult читає її результат — а через цю функцію
+# проходить КОЖЕН вихід Health, зокрема ранні (моніторинг вимкнено,
+# некоректний webhook, відкладено через архівацію, непідтримана ОС).
+# Під Set-StrictMode 2.0 звернення до неприсвоєної змінної є термінальною
+# помилкою, тому без цієї ініціалізації ранні виходи падали: у гілці
+# "відкладено" виняток ковтав catch, і Health продовжував роботу під час
+# архівації замість того, щоб відкластися.
+$script:BRAVOToolManifest = $null
 
 function Initialize-BRAVOHealthSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
@@ -4360,33 +4369,45 @@ if ($NotificationProvider -notin @("slack", "discord") -or
 }
 
 if ($SkipIfBackupTaskRunning) {
+    # Два НЕЗАЛЕЖНІ сигнали. Запит стану завдання може впасти (COM/ACL), і
+    # тоді єдиним свідченням лишається lock — тому він перевіряється поза
+    # тим самим try, а не після невдалого запиту в спільному блоці.
+    $backupTaskRunning = $false
     try {
         $backupTaskState = Get-BRAVOScheduledTaskState `
             -TaskPath ([string]$schedulerSettings.TaskPath) `
             -TaskName ([string]$schedulerSettings.Backup.TaskName)
         Write-HealthLog "Перевірка стану завдання архівації: $($backupTaskState.Provider)" -Level "DEBUG"
-
-        $archiveProcessLockActive = Test-BRAVOArchiveProcessLockActive
-        if ($backupTaskState.IsRunning -or $archiveProcessLockActive) {
-            $runningIndicator = if (
-                $backupTaskState.IsRunning -and $archiveProcessLockActive
-            ) {
-                "стан завдання та блокування процесу"
-            } elseif ($backupTaskState.IsRunning) {
-                "стан завдання"
-            } else {
-                "блокування процесу"
-            }
-            Write-HealthLog "Health-check відкладено: архівація зараз виконується ($runningIndicator)" -Level "INFO"
-            return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
-                Status = "Deferred"
-                IssueCount = 0
-                Notification = "NotRequired"
-                LogPath = $healthLogFile
-            })
-        }
+        $backupTaskRunning = [bool]$backupTaskState.IsRunning
     } catch {
-        Write-HealthLog "Не вдалося перевірити стан завдання архівації; health-check продовжується: $($_.Exception.Message)" -Level "WARNING"
+        Write-HealthLog "Не вдалося прочитати стан завдання архівації; рішення за блокуванням процесу: $($_.Exception.Message)" -Level "WARNING"
+    }
+
+    $archiveProcessLockActive = $false
+    try {
+        $archiveProcessLockActive = Test-BRAVOArchiveProcessLockActive
+    } catch {
+        Write-HealthLog "Не вдалося перевірити блокування архівації: $($_.Exception.Message)" -Level "WARNING"
+    }
+
+    # Рішення й повернення — ПОЗА try: вже ухвалене й залоговане відкладення
+    # не має скасовуватись помилкою у формуванні результату. Саме так
+    # Health продовжував роботу під час архівації, ковтаючи виняток.
+    if ($backupTaskRunning -or $archiveProcessLockActive) {
+        $runningIndicator = if ($backupTaskRunning -and $archiveProcessLockActive) {
+            "стан завдання та блокування процесу"
+        } elseif ($backupTaskRunning) {
+            "стан завдання"
+        } else {
+            "блокування процесу"
+        }
+        Write-HealthLog "Health-check відкладено: архівація зараз виконується ($runningIndicator)" -Level "INFO"
+        return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
+            Status = "Deferred"
+            IssueCount = 0
+            Notification = "NotRequired"
+            LogPath = $healthLogFile
+        })
     }
 }
 
