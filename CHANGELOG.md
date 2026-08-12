@@ -25,23 +25,52 @@ Invariants below).
   unconditional, and `Restore.RunMissedOnStartup` now only controls whether
   the additional boot trigger is also created — previously setting it to
   `false` disabled the daily safety net along with the boot retry.
+- Automatic restore now re-validates `Restore.WindowStart`/`WindowEnd`
+  immediately before the destructive `bravocmd.exe` call, not only once at
+  the start of the run. `$shouldRestore` was computed before
+  `Enter-BRAVOMaintenanceOperationLock` (up to `OperationLockWaitMinutes`,
+  360 min by default), service stop, and the before-restore archive — the
+  window could close during that wait and the old check was never a final
+  authorization. Two barriers (before entering the restore sequence, and
+  immediately before `bravocmd.exe`) call the same `Test-BRAVORestoreExecutionStillAllowed`
+  check; a window that closes in between now postpones the restore (clear
+  `WARNING`, no `bravocmd.exe` call, no success marker/state write, the
+  scheduled slot stays retryable) instead of running past the window.
+  `-ForceRestore` is unaffected by either barrier.
 - `Remove-BRAVOOrphanedTemporaryArchiveArtifacts` (orphaned `.work\*.partial*`
-  cleanup, introduced in 5.0.0) is now fail-visible: an enumeration error on
-  `.work`, or on the `.work` existence check itself (access denied, I/O
-  error), is logged and marks the operation failed instead of silently
-  being treated as "nothing to clean up" or "the directory doesn't exist."
+  cleanup, introduced in 5.0.0) no longer uses `Test-Path` to check whether
+  `.work` exists. `Test-Path` cannot be fail-visible for a pure local ACL
+  access-denied on an existing directory — `.NET Directory.Exists` (which
+  the filesystem provider uses) swallows `UnauthorizedAccessException` by
+  design and returns `$false`, indistinguishable from "doesn't exist." The
+  existence check is now folded into the same `Get-ChildItem` call that
+  already enumerates `.partial*` files, classified by exception type:
+  `ItemNotFoundException`/`DirectoryNotFoundException` is a benign skip,
+  anything else (`UnauthorizedAccessException`, `IOException`, provider/
+  network errors) marks the operation failed and logs `ERROR`.
+- `Recovery`'s daily trigger now has `StartWhenAvailable=true` (every other
+  task type keeps the global default of `false`): if the trigger is missed
+  because the server was asleep/offline, Task Scheduler catches it up as
+  soon as the server is available again, instead of waiting for the next
+  scheduled occurrence. Safe only because of the two TOCTOU barriers above
+  — a late catch-up that lands outside the window now correctly no-ops.
 - Retention Safety Invariants: generation-aware backup retention now also
   sweeps orphaned `.work\*.partial*` temporary archive artifacts left behind
   by a killed process, raises the default minimum retained verified
   generations from 1 to 2, and emits a single per-run retention audit log
   line (evaluated/protected/deleted counts).
 - Regression coverage: real COM `Schedule.Service` tests prove the
-  `Recovery` task registers boot+daily triggers when `RunMissedOnStartup=true`
-  and daily-only (task still registered, not disabled) when `false`;
-  behavioral tests prove orphan-sweep enumeration and existence-check
-  failures are both fail-visible; a composite test proves a corrupted
-  newest backup generation cannot evict an older verified-valid one from
-  the retention-protected set.
+  `Recovery` task registers boot+daily triggers when `RunMissedOnStartup=true`,
+  daily-only (task still registered, not disabled) when `false`, and
+  `StartWhenAvailable=true` only for `Recovery`; a behavioral test with an
+  injectable time provider proves the TOCTOU re-check blocks automatic
+  restore once the window has passed while still allowing `-ForceRestore`;
+  structural tests prove both barriers sit exactly where they must, ahead
+  of the destructive call; four behavioral orphan-sweep cases cover
+  missing `.work` (benign), access-denied, and a distinct I/O failure type,
+  plus a structural test proving `Test-Path` is no longer called at all;
+  a composite test proves a corrupted newest backup generation cannot
+  evict an older verified-valid one from the retention-protected set.
 
 ## 5.0.0 — 2026-08-11
 
