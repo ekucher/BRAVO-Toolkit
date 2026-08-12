@@ -59,6 +59,32 @@ Invariants below).
   by a killed process, raises the default minimum retained verified
   generations from 1 to 2, and emits a single per-run retention audit log
   line (evaluated/protected/deleted counts).
+- Windows service run-state (`Running`/`Stopped`/`Disabled`/not installed)
+  can no longer gate backup — only the operations that genuinely require a
+  stopped service (destructive restore, other destructive MODEL operations,
+  open application-log rotation) may depend on it; this is now a documented
+  architectural contract (`OPERATIONS.md`, "Стан служб не визначає політику
+  backup"). `Find-BRAVOServiceByCandidates` (used by installation-path
+  discovery for `BRAVO_ROOT`, `WEB_ROOT`/`BAZA_WWW`) previously excluded any
+  service with `StartMode=Disabled`, conflating "administratively disabled"
+  with "not installed": a `Disabled` BRAVO Web/Apache service made
+  `BAZA_WWW` backup (both SFTP and local synchronization) silently
+  unresolvable even though its `DocumentRoot` directory remained fully
+  readable on disk — a service-state gate with no underlying filesystem
+  error. The `Disabled` exclusion is removed; service state no longer
+  affects path identity (the same principle `Resolve-BRAVOEffectiveLimsRoot`
+  already documented for `LIMSRoot`), and a `Disabled` match now appends a
+  diagnostic-only `[УВАГА: служба має тип запуску Disabled]` note to
+  `BRAVO_ROOT`/`WEB_ROOT` reasons instead of failing discovery. When the
+  BRAVO Web/Apache service is genuinely absent (not just disabled) and no
+  `discoverySettings.Sources.BAZA_WWW`/`.WebRoot` override is configured,
+  `BAZA_WWW`'s discovery-failure reason now explicitly says the service
+  could not be found (previously a dangling, unexplained "BAZA_WWW не
+  визначено: ") — a controlled "source unknown" failure, never phrased as
+  a service-state policy denial. Regular backup generation (MODEL/BLOG/
+  BRAVOEXCH, sourced only from `bravo.ini`), pre-/post-restore MODEL
+  backups, and `ArchiveAfterMaintenance` were already service-state
+  independent; audited and confirmed with new regression coverage.
 - Regression coverage: real COM `Schedule.Service` tests prove the
   `Recovery` task registers boot+daily triggers when `RunMissedOnStartup=true`,
   daily-only (task still registered, not disabled) when `false`, and
@@ -70,7 +96,29 @@ Invariants below).
   missing `.work` (benign), access-denied, and a distinct I/O failure type,
   plus a structural test proving `Test-Path` is no longer called at all;
   a composite test proves a corrupted newest backup generation cannot
-  evict an older verified-valid one from the retention-protected set.
+  evict an older verified-valid one from the retention-protected set;
+  behavioral `Resolve-BRAVOInstallationDiscovery` tests (`Discovery/
+  BackupSourcesResolveWhenBravo*`) prove `BRAVO_ROOT`/`MODEL`/`BLOG`/
+  `BRAVOEXCH`/`BAZA_APP` resolve identically across all three BRAVO service
+  states, and `BAZA_WWW` (`Discovery/BazaWWWResolvesWhenApache*`) resolves
+  identically from the same `httpd.conf` across all three BravoWeb/Apache
+  service states; two more cover the service-genuinely-absent case
+  distinctly from "disabled" (explicit override still resolves `BAZA_WWW`;
+  no override gives a controlled "source not found" failure, not a
+  service-denial message), and one proves `MODEL`/`BLOG`/`BRAVOEXCH` still
+  resolve from `bravo.ini` with the BRAVO service entirely absent. Beyond
+  discovery, three genuinely behavioral tests (`Backup/
+  ArchiveInvokedWhenBravoService*`) drive the real, unmocked
+  `Invoke-BRAVOComponentBackup` production pipeline (only the 7-Zip child
+  process itself is stubbed) from a discovered source through to a
+  published archive on disk, once per BRAVO service state, confirming the
+  archiver is actually invoked and the archive actually exists regardless
+  of service state. Structural tests (clearly labeled as such, not
+  behavioral) separately prove the pre-/post-restore archive calls and the
+  `ArchiveAfterMaintenance` launch decision contain no service-status
+  re-check; a true behavioral invocation test for the latter was judged
+  impractical without restructuring `BRAVO_MAINTENANCE.ps1`'s monolithic
+  top-level flow into a callable function purely for testability.
 
 ## 5.0.0 — 2026-08-11
 

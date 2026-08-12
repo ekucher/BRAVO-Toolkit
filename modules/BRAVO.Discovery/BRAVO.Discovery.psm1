@@ -46,12 +46,27 @@ function Get-BRAVOServiceExecutablePath {
 
 function Find-BRAVOServiceByCandidates {
     # Generic-версія enumerate-частини Find-BRAVOWebBAZASource: знаходить
-    # встановлені (не Disabled) служби за списком кандидатів імен
-    # (Name/DisplayName, case-insensitive), опційно доповнює список
-    # службами, які запускають виконуваний файл із заданою назвою
-    # (ExecutableNameFallback), незалежно від імені самої служби —
-    # той самий підхід, що вже застосований для httpd.exe. Активні
-    # (Running) служби завжди йдуть перед зупиненими.
+    # встановлені служби за списком кандидатів імен (Name/DisplayName,
+    # case-insensitive), опційно доповнює список службами, які запускають
+    # виконуваний файл із заданою назвою (ExecutableNameFallback),
+    # незалежно від імені самої служби — той самий підхід, що вже
+    # застосований для httpd.exe. Активні (Running) служби завжди йдуть
+    # перед зупиненими.
+    #
+    # Стан служби (Running/Stopped/Disabled) НЕ впливає на identity — той
+    # самий принцип, що вже документує Resolve-BRAVOEffectiveLimsRoot:
+    # шлях встановлення не залежить від того, чи служба зараз запущена, чи
+    # дозволено її автозапуск. Раніше тут відкидались служби зі
+    # StartMode=Disabled ("встановлені (не Disabled)"), що фактично
+    # плутало "Disabled" із "не встановлено": Disabled-служба лишається
+    # зареєстрованою в SCM із тим самим PathName, лише не запускається
+    # автоматично/вручну. Наслідок (audit safety-review): адміністративне
+    # вимкнення служби BRAVO Web (напр. планове обслуговування) непомітно
+    # вимикало BAZA_WWW backup — service-state гейтив backup без жодної
+    # реальної файлової помилки, хоча каталог DocumentRoot на диску лишався
+    # доступним. Фільтр знято; недоступність каталогу тепер виявляє
+    # виключно downstream файлова перевірка (Test-PathWithLog), а не WMI
+    # StartMode.
     #
     # -Services дозволяє self-test підставити синтетичні Win32_Service-
     # подібні об'єкти замість реального WMI-запиту — той самий injectable-
@@ -69,7 +84,6 @@ function Find-BRAVOServiceByCandidates {
             $Services = @(
                 Get-BRAVOWmiInstance -ClassName Win32_Service |
                     Where-Object {
-                        [string]$_.StartMode -ne "Disabled" -and
                         -not [string]::IsNullOrWhiteSpace([string]$_.PathName)
                     }
             )
@@ -79,7 +93,6 @@ function Find-BRAVOServiceByCandidates {
     } else {
         $Services = @(
             $Services | Where-Object {
-                [string]$_.StartMode -ne "Disabled" -and
                 -not [string]::IsNullOrWhiteSpace([string]$_.PathName)
             }
         )
@@ -472,6 +485,12 @@ function Resolve-BRAVOInstallationDiscovery {
         if ($bravoRootAmbiguous) {
             $bravoRootReason += " [УВАГА: знайдено кілька служб BRAVO з різними виконуваними файлами, обрано першу]"
         }
+        if ($bravoServiceMatch.StartMode -ieq 'Disabled') {
+            # Лише діагностика для оператора (той самий патерн, що
+            # Resolve-BRAVOEffectiveLimsRoot) — Disabled НЕ блокує
+            # визначення BRAVO_ROOT/backup, але оператор має бачити стан.
+            $bravoRootReason += " [УВАГА: служба має тип запуску Disabled]"
+        }
     } else {
         $bravoRoot = $null
         $bravoRootReason = "каталог BRAVO не визначено: немає override або служби з підтвердженими Name/DisplayName"
@@ -723,6 +742,12 @@ function Resolve-BRAVOInstallationDiscovery {
         if ($webRootAmbiguous) {
             $webRootReason += " [УВАГА: знайдено кілька Apache-подібних служб з різними виконуваними файлами, обрано першу]"
         }
+        if ($webServiceMatch.StartMode -ieq 'Disabled') {
+            # Лише діагностика для оператора — Disabled НЕ блокує
+            # визначення WEB_ROOT/BAZA_WWW backup, той самий патерн, що й
+            # BravoRoot вище.
+            $webRootReason += " [УВАГА: служба має тип запуску Disabled]"
+        }
     } else {
         $webRootReason = "Apache-службу не знайдено; BAZA_WWW недоступний"
     }
@@ -749,6 +774,20 @@ function Resolve-BRAVOInstallationDiscovery {
         } else {
             $documentRootReason = "httpd.conf не знайдено за очікуваним шляхом: $httpdConfPath"
         }
+    } elseif ([string]::IsNullOrWhiteSpace($webRootOverride)) {
+        # Apache-службу взагалі не знайдено (не Disabled — просто немає
+        # жодного кандидата з підтвердженим виконуваним файлом): без цієї
+        # гілки Reasons.BAZA_WWW лишався "BAZA_WWW не визначено: " з
+        # порожнім хвостом — оператор бачив причину лише в Reasons.WebRoot,
+        # окремому полі. Дублюємо той самий текст сюди, а не окрему
+        # формулу: причина одна ("службу не знайдено"), не дві різні.
+        # (elseif, а не else: коли WEB_ROOT задано явним override,
+        # $apacheServerRoot теж лишається null, але причина інша — немає
+        # ServerRoot/conf\httpd.conf для читання, а не "службу не знайдено"
+        # — той випадок нижче отримує власне явне формулювання.)
+        $documentRootReason = $webRootReason
+    } else {
+        $documentRootReason = "WEB_ROOT заданий явним override, тому httpd.conf службою не шукається; для BAZA_WWW потрібен окремий discoverySettings.Sources.BAZA_WWW"
     }
 
     $bazaWwwOverride = if ($sourceOverrides.Contains('BAZA_WWW')) {

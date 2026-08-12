@@ -4537,6 +4537,107 @@ try {
             -Name 'Maintenance/MissedRestoreRetriesNightlyNotOnlyOnBoot' `
             -Failure 'пропущену реставрацію має підхоплювати БУДЬ-ЯКИЙ прогін (нічний Maintenance у вікні), не лише Recovery після boot — інакше пропуск компенсується лише після перезавантаження сервера'
 
+        # Архітектурний інваріант (safety-review): стан служб керує ЛИШЕ
+        # тим, що реально його потребує (зупинка перед деструктивним
+        # bravocmd.exe) — не самою архівацією MODEL до/після реставрації.
+        #
+        # STRUCTURAL guard, НЕ behavioral: доводить лише позицію в тексті
+        # файлу (немає повторного Get-Service між точками X і Y), а не
+        # реальне виконання архівації. Ці два кроки (pre-/post-restore
+        # архів) уже й так виконуються ЛИШЕ коли служби підтверджено
+        # зупинені (сам restore-flow це вимагає, і контракт дозволяє це
+        # для restore) — тому "behavioral: works with services running"
+        # тут немає сенсу як тест; мета цього guard-а — зафіксувати, що
+        # НІЯКОЇ додаткової/повторної перевірки стану служб не додасться
+        # згодом і не стане прихованим третім бар'єром. Реальне
+        # (немокнуте) виконання archive-шляху перевіряють окремі
+        # behavioral тести "Backup/ArchiveInvokedWhenBravoService*" нижче
+        # (Discovery -> Invoke-BRAVOComponentBackup -> archive на диску).
+        #
+        # Between Barrier 1 (службу вже підтверджено зупиненою,
+        # `if ($shouldRestore) {`) і фактичним викликом 7-Zip для
+        # pre-restore архіву немає ЖОДНОЇ повторної Get-Service перевірки —
+        # архівація виконується безумовно (по 7-Zip exit code, не по стану
+        # служб).
+        $preRestoreArchiveCallIndex = $maintenanceRestoreWindowText.IndexOf(
+            '-Description "Архівація моделі перед реставрацією"'
+        )
+        $preRestoreServiceGateWindow = if ($barrier1EntryIndex -ge 0 -and $preRestoreArchiveCallIndex -gt $barrier1EntryIndex) {
+            $maintenanceRestoreWindowText.Substring($barrier1EntryIndex, $preRestoreArchiveCallIndex - $barrier1EntryIndex)
+        } else { $null }
+        Test-BRAVOCondition `
+            -Condition (
+                $barrier1EntryIndex -ge 0 -and $preRestoreArchiveCallIndex -gt $barrier1EntryIndex -and
+                $null -ne $preRestoreServiceGateWindow -and
+                -not $preRestoreServiceGateWindow.Contains('Get-Service') -and
+                $preRestoreServiceGateWindow.Contains('Invoke-CommandWithLog')
+            ) `
+            -Name 'PreRestoreBackup/WorksWithServicesStopped' `
+            -Failure 'архівація моделі перед реставрацією (після Barrier 1) не повинна мати повторної перевірки стану служб між входом у restore sequence і викликом 7-Zip — лише файлова операція'
+
+        # Те саме для post-restore архіву: між підтвердженням успішного
+        # bravocmd.exe і фактичним викликом 7-Zip для after-restore архіву
+        # також немає повторної Get-Service перевірки.
+        $restoreSuccessLogIndex = $maintenanceRestoreWindowText.IndexOf(
+            'Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"'
+        )
+        $postRestoreArchiveCallIndex = $maintenanceRestoreWindowText.IndexOf(
+            '-Description "Архівація моделі після реставрації"'
+        )
+        $postRestoreServiceGateWindow = if ($restoreSuccessLogIndex -ge 0 -and $postRestoreArchiveCallIndex -gt $restoreSuccessLogIndex) {
+            $maintenanceRestoreWindowText.Substring($restoreSuccessLogIndex, $postRestoreArchiveCallIndex - $restoreSuccessLogIndex)
+        } else { $null }
+        Test-BRAVOCondition `
+            -Condition (
+                $restoreSuccessLogIndex -ge 0 -and $postRestoreArchiveCallIndex -gt $restoreSuccessLogIndex -and
+                $null -ne $postRestoreServiceGateWindow -and
+                -not $postRestoreServiceGateWindow.Contains('Get-Service') -and
+                $postRestoreServiceGateWindow.Contains('Invoke-CommandWithLog')
+            ) `
+            -Name 'PostRestoreBackup/WorksWithServicesStopped' `
+            -Failure 'архівація моделі після реставрації не повинна мати повторної перевірки стану служб між успішним bravocmd.exe і викликом 7-Zip — лише файлова операція'
+
+        # ArchiveAfterMaintenance: рішення запускати BRAVO_ARCHIV.ps1
+        # ($script:EnableArchiveAfterMaintenance) має РІВНО 2 присвоєння в
+        # усьому файлі (config-флаг на старті скрипта; RunMissedRestoreOnly
+        # override), обидва — ДО "=== ЗУПИНКА СЛУЖБ ===" (першої роботи зі
+        # станом служб у файлі), і жодного разу не перевизначається після.
+        # Тобто службовий стан фізично не може вплинути на це рішення:
+        # значення вже остаточне задовго до Get-Service/зупинки/реставрації.
+        #
+        # STRUCTURAL guard, НЕ behavioral invocation. Справжній behavioral
+        # тест (мокнутий Get-Service Running vs Stopped -> реально
+        # запускається дочірній BRAVO_ARCHIV.ps1 через Start-Process)
+        # вимагав би виділити рішення в окрему функцію — BRAVO_MAINTENANCE
+        # зараз послідовний top-level скрипт (params -> ~6000 рядків
+        # виконання), не набір викликаних функцій, як restore-логіка вище
+        # чи Invoke-BRAVOComponentBackup. New-BRAVOSelfTestRuntimeModule
+        # витягує ІМЕНОВАНІ функції через AST, а не довільний top-level
+        # фрагмент, і виділення нової функції ЛИШЕ заради тестованості
+        # означало б рефакторити production-код поза межами цього
+        # safety-review (порушення "мінімальний обсяг змін"). Тому цей
+        # інваріант лишається доведеним structural-способом: та сама схема
+        # (позиція в тексті відносно Get-Service), що вже прийнята для
+        # restore-бар'єрів вище.
+        $archiveEnableAssignmentMatches = @([regex]::Matches(
+            $maintenanceRestoreWindowText, '\$script:EnableArchiveAfterMaintenance\s*='
+        ))
+        $stopServicesHeaderIndex = $maintenanceRestoreWindowText.IndexOf('=== ЗУПИНКА СЛУЖБ ===')
+        $archiveConsumptionIndex = $maintenanceRestoreWindowText.IndexOf('if ($script:EnableArchiveAfterMaintenance) {')
+        $lastArchiveEnableAssignmentIndex = if ($archiveEnableAssignmentMatches.Count -gt 0) {
+            ($archiveEnableAssignmentMatches | Select-Object -Last 1).Index
+        } else { -1 }
+        Test-BRAVOCondition `
+            -Condition (
+                $archiveEnableAssignmentMatches.Count -eq 2 -and
+                $stopServicesHeaderIndex -gt 0 -and
+                $lastArchiveEnableAssignmentIndex -ge 0 -and
+                $lastArchiveEnableAssignmentIndex -lt $stopServicesHeaderIndex -and
+                $archiveConsumptionIndex -gt $stopServicesHeaderIndex
+            ) `
+            -Name 'ArchiveAfterMaintenance/DoesNotDependOnServiceInitialState' `
+            -Failure '$script:EnableArchiveAfterMaintenance має остаточно визначатись ДО будь-якої роботи зі станом служб (перед "=== ЗУПИНКА СЛУЖБ ===") і не перевизначатись після — інакше запуск BRAVO_ARCHIV міг би залежати від початкового стану служб BRAVO/exchangAPI/BravoWeb'
+
         # Регресія: Recovery раніше виходив без дій (compact no-op), якщо
         # $missedDailyWork було false, — НАВІТЬ коли $missedRestoreDue було
         # true і вікно вже відкрите. Early-exit має враховувати обидва
@@ -6454,6 +6555,266 @@ try {
             ) `
             -Name "Discovery/BazaWwwUsesHttpdConfDocumentRoot" `
             -Failure "BAZA_WWW має братись з DocumentRoot реального httpd.conf встановленої Apache-служби, а не з фолбек-здогадки <WEB_ROOT>\www"
+
+        # Архітектурний інваріант (safety-review): стан Windows-служб не
+        # повинен керувати можливістю створення backup. Ці тести — про
+        # DISCOVERY (Resolve-BRAVOInstallationDiscovery: чи резолвиться
+        # джерело), НЕ про виконання backup — тому в просторі назв
+        # "Discovery/", а не "Backup/" (виправлення після ревʼю: попередня
+        # назва "Backup/WorksWhenBravoService*" оманливо звучала як
+        # перевірка виконання; реальна перевірка "backup command/archive
+        # invoked" — окремо нижче, "Backup/ArchiveInvokedWhenBravoService*").
+        # MODEL/BLOG/BRAVOEXCH/BAZA_APP/BRAVO_ROOT мають резолвитись
+        # ОДНАКОВО незалежно від Running/Stopped/Disabled служби BRAVO —
+        # варіюємо лише службу BRAVO, Apache фіксований Running, щоб
+        # ізолювати саме цю змінну.
+        foreach ($bravoServiceStateCase in @(
+            @{ Name = 'Running'; State = 'Running'; StartMode = 'Auto' },
+            @{ Name = 'Stopped'; State = 'Stopped'; StartMode = 'Manual' },
+            @{ Name = 'Disabled'; State = 'Stopped'; StartMode = 'Disabled' }
+        )) {
+            $servicesForBravoStateCase = @(
+                [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = $bravoServiceStateCase.State; StartMode = $bravoServiceStateCase.StartMode; PathName = ('"{0}"' -f $fakeBravoExePath) },
+                [pscustomobject]@{ Name = "Apache2.4"; DisplayName = "Apache2.4"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeHttpdPath) }
+            )
+            $discoveryForBravoStateCase = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $discoveryTestRoot `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Apache2.4") `
+                -Services $servicesForBravoStateCase `
+                -SystemRoot $fixtureSystemRoot `
+                -Is64BitOperatingSystem $true
+            Test-BRAVOCondition `
+                -Condition (
+                    $discoveryForBravoStateCase.BRAVO_ROOT -eq $discoveryTestRoot -and
+                    $discoveryForBravoStateCase.MODEL_SOURCE -eq (Join-Path $discoveryTestRoot "Model") -and
+                    $discoveryForBravoStateCase.BLOG_SOURCE -eq (Join-Path $discoveryTestRoot "BLOG") -and
+                    $discoveryForBravoStateCase.BRAVOEXCH_SOURCE -eq (Join-Path $discoveryTestRoot "bravoexch") -and
+                    $discoveryForBravoStateCase.BAZA_APP -eq (Join-Path $discoveryTestRoot "BAZA")
+                ) `
+                -Name "Discovery/BackupSourcesResolveWhenBravo$($bravoServiceStateCase.Name)" `
+                -Failure "стан служби BRAVO ($($bravoServiceStateCase.Name)) не повинен впливати на резолвінг джерел backup (BRAVO_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP мають лишатись визначеними так само, як і для Running)"
+        }
+
+        # Дзеркальна перевірка для BRAVO Web/Apache (BAZA_WWW) — УСІ ТРИ
+        # стани (не лише Disabled): це саме той шлях, де до фіксу
+        # StartMode=Disabled повністю блокував BAZA_WWW backup
+        # (Find-BRAVOServiceByCandidates відкидав службу як "не
+        # встановлену"), хоча DocumentRoot на диску лишався доступним.
+        # BRAVO фіксований Running, варіюємо лише Apache; усі три стани
+        # мають резолвити BAZA_WWW з ОДНОГО Й ТОГО САМОГО httpd.conf.
+        foreach ($apacheServiceStateCase in @(
+            @{ Name = 'Running'; State = 'Running'; StartMode = 'Auto' },
+            @{ Name = 'Stopped'; State = 'Stopped'; StartMode = 'Manual' },
+            @{ Name = 'Disabled'; State = 'Stopped'; StartMode = 'Disabled' }
+        )) {
+            $servicesForApacheStateCase = @(
+                [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) },
+                [pscustomobject]@{ Name = "Apache2.4"; DisplayName = "Apache2.4"; State = $apacheServiceStateCase.State; StartMode = $apacheServiceStateCase.StartMode; PathName = ('"{0}"' -f $fakeHttpdPath) }
+            )
+            $discoveryForApacheStateCase = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $discoveryTestRoot `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Apache2.4") `
+                -Services $servicesForApacheStateCase `
+                -SystemRoot $fixtureSystemRoot `
+                -Is64BitOperatingSystem $true
+            $expectApacheDisabledNote = ($apacheServiceStateCase.StartMode -ieq 'Disabled')
+            Test-BRAVOCondition `
+                -Condition (
+                    $discoveryForApacheStateCase.BAZA_WWW -eq (Join-Path $fakeDocumentRoot "BAZA") -and
+                    $discoveryForApacheStateCase.HttpdConfPath -eq $fakeHttpdConfPath -and
+                    -not $discoveryForApacheStateCase.Reasons.WebRoot.Contains("не знайдено") -and
+                    ($discoveryForApacheStateCase.Reasons.WebRoot.Contains("Disabled") -eq $expectApacheDisabledNote)
+                ) `
+                -Name "Discovery/BazaWWWResolvesWhenApache$($apacheServiceStateCase.Name)" `
+                -Failure "BAZA_WWW має резолвитись з того самого httpd.conf DocumentRoot незалежно від стану служби Apache/BravoWeb ($($apacheServiceStateCase.Name)); діагностичне [УВАГА: Disabled] має з'являтись лише коли служба справді Disabled"
+        }
+
+        # Service-absent (не Disabled — служби взагалі немає в WMI) — ДВІ
+        # явно різні поведінки:
+        #  1) явний override discoverySettings.Sources.BAZA_WWW заданий ->
+        #     BAZA_WWW доступний, backup дозволений, override діє
+        #     незалежно від того, що служби немає;
+        #  2) override відсутній -> керована discovery-помилка з причиною
+        #     "службу не знайдено" — навмисно НЕ сформульована як "backup
+        #     заборонено через зупинену/вимкнену службу" (це відрізняється
+        #     семантично: "невідомо, де шукати" != "заборонено політикою").
+        $servicesWithoutApache = @(
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) }
+        )
+        $bazaWwwOverridePath = Join-Path $discoveryTestRoot "ExplicitBazaWWW"
+        $discoveryApacheAbsentWithOverride = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -WebServiceCandidates @("Apache2.4") `
+            -Services $servicesWithoutApache `
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true `
+            -DiscoverySettings @{ Sources = @{ BAZA_WWW = $bazaWwwOverridePath } }
+        Test-BRAVOCondition `
+            -Condition (
+                $discoveryApacheAbsentWithOverride.BAZA_WWW -eq $bazaWwwOverridePath -and
+                [bool]$discoveryApacheAbsentWithOverride.Overrides["BAZA_WWW"] -and
+                $discoveryApacheAbsentWithOverride.Reasons.BAZA_WWW.Contains("override")
+            ) `
+            -Name "Discovery/BazaWWWResolvesFromExplicitOverrideWhenApacheAbsent" `
+            -Failure "коли служби Apache/BravoWeb взагалі немає (не Disabled — відсутня), явний discoverySettings.Sources.BAZA_WWW має все одно робити BAZA_WWW доступним для backup"
+        $discoveryApacheAbsentNoOverride = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -WebServiceCandidates @("Apache2.4") `
+            -Services $servicesWithoutApache `
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$discoveryApacheAbsentNoOverride.BAZA_WWW) -and
+                $discoveryApacheAbsentNoOverride.Reasons.WebRoot.Contains("не знайдено") -and
+                $discoveryApacheAbsentNoOverride.Reasons.BAZA_WWW.Contains("не знайдено") -and
+                $discoveryApacheAbsentNoOverride.Reasons.BAZA_WWW -notmatch '(?i)stopped|running|disabled|заборонен' -and
+                $discoveryApacheAbsentNoOverride.Reasons.WebRoot -notmatch '(?i)заборонен'
+            ) `
+            -Name "Discovery/BazaWWWAbsentApacheIsControlledFailureNotServiceDenial" `
+            -Failure "коли служби Apache/BravoWeb немає і override не задано, причина має бути 'службу не знайдено' (джерело невідоме), а НЕ формулюванням на кшталт 'backup заборонено через stopped/disabled службу' — це різна семантика"
+
+        # Аналогічно для BRAVO: коли служба взагалі не встановлена,
+        # MODEL/BLOG/BRAVOEXCH мають лишатись доступними через незалежне
+        # authoritative джерело (canonical bravo.ini) — BRAVO_ROOT сам по
+        # собі при цьому лишається невизначеним (немає служби -> немає
+        # каталогу інсталяції), але це НЕ блокує backup MODEL/BLOG/BRAVOEXCH.
+        $discoveryBravoAbsent = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO_NOT_INSTALLED" `
+            -Services @() `
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$discoveryBravoAbsent.BRAVO_ROOT) -and
+                $discoveryBravoAbsent.MODEL_SOURCE -eq (Join-Path $discoveryTestRoot "Model") -and
+                $discoveryBravoAbsent.BLOG_SOURCE -eq (Join-Path $discoveryTestRoot "BLOG") -and
+                $discoveryBravoAbsent.BRAVOEXCH_SOURCE -eq (Join-Path $discoveryTestRoot "bravoexch") -and
+                $discoveryBravoAbsent.Reasons.MODEL.StartsWith("bravo.ini")
+            ) `
+            -Name "Discovery/BravoServiceAbsentModelBlogBravoexchResolveFromIni" `
+            -Failure "коли службу BRAVO не встановлено, MODEL/BLOG/BRAVOEXCH мають резолвитись з canonical bravo.ini (незалежне authoritative джерело) — відсутність служби не повинна блокувати ці backup-джерела, лише BRAVO_ROOT (похідне від служби значення)"
+
+        # === Behavioral: реальний archive-generation path, не лише
+        # Discovery ===
+        # Вище доведено, що Discovery резолвить ОДНАКОВЕ джерело для
+        # Running/Stopped/Disabled. Тут доводимо, що ТЕ САМЕ джерело,
+        # передане в РЕАЛЬНУ (немокнуту) Invoke-BRAVOComponentBackup —
+        # ту саму production-функцію atomic create->hash->verify->publish,
+        # яку вже покриває BackupConsistency/* вище — реально доходить до
+        # виклику архіватора й публікує archive на диску, для ВСІХ трьох
+        # станів служби BRAVO, з ідентичним результатом. Мокнутий лише сам
+        # процес 7-Zip (New-Archive) — його власна коректність доведена
+        # окремо реальним Tools\7za.exe round-trip тестом (Runtime/
+        # Seven-Zip...) і повним CI-прогоном; те, що тут під сумнівом і
+        # перевіряється реально, — це чи service-стан здатний перервати
+        # шлях "джерело -> Invoke-BRAVOComponentBackup -> опублікований
+        # archive на диску".
+        $serviceStateBackupTestRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_SERVICE_STATE_BACKUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($serviceStateBackupTestRoot)
+            $serviceStateModelDir = Join-Path $serviceStateBackupTestRoot "Model"
+            [void][IO.Directory]::CreateDirectory($serviceStateModelDir)
+            [IO.File]::WriteAllText((Join-Path $serviceStateModelDir "data.txt"), "model-content", (New-Object Text.UTF8Encoding($false)))
+            $serviceStateFakeBravoExePath = Join-Path $serviceStateBackupTestRoot "bravo.exe"
+            [IO.File]::WriteAllText($serviceStateFakeBravoExePath, "stub")
+            $serviceStateSystemRoot = Join-Path $serviceStateBackupTestRoot "FixtureWindows"
+            $serviceStateSysWow64Dir = Join-Path $serviceStateSystemRoot "SysWOW64"
+            [void][IO.Directory]::CreateDirectory($serviceStateSysWow64Dir)
+            [IO.File]::WriteAllLines((Join-Path $serviceStateSysWow64Dir "bravo.ini"), @(
+                '[model]',
+                ("MODEL={0}" -f (Join-Path $serviceStateModelDir "lims"))
+            ))
+
+            foreach ($backupStateCase in @(
+                @{ Name = 'Running'; State = 'Running'; StartMode = 'Auto' },
+                @{ Name = 'Stopped'; State = 'Stopped'; StartMode = 'Manual' },
+                @{ Name = 'Disabled'; State = 'Stopped'; StartMode = 'Disabled' }
+            )) {
+                $servicesForBackupStateCase = @(
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = $backupStateCase.State; StartMode = $backupStateCase.StartMode; PathName = ('"{0}"' -f $serviceStateFakeBravoExePath) }
+                )
+                $discoveryForBackupStateCase = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $serviceStateBackupTestRoot `
+                    -BravoServiceName "BRAVO" `
+                    -Services $servicesForBackupStateCase `
+                    -SystemRoot $serviceStateSystemRoot `
+                    -Is64BitOperatingSystem $true
+
+                $stateDest = Join-Path $serviceStateBackupTestRoot ("DEST_{0}" -f $backupStateCase.Name)
+                [void][IO.Directory]::CreateDirectory($stateDest)
+                $archiveFileName = "model_20260813_000000.mdz"
+
+                $backupExecutionResult = & $archiveRuntimeModule {
+                    param($SourcePath, $DestinationDirectory, $ArchiveName)
+                    $script:hashFileExtension = '.sha512'
+                    $script:hashFileEncoding = 'utf-8'
+                    $knownHash = ('c' * 128).ToUpperInvariant()
+                    $script:archiveInvocationCount = 0
+                    function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+                    function Write-Log { param([string]$Message, [string]$Level = 'INFO') }
+                    function New-Archive {
+                        # Мокнутий лише сам зовнішній процес 7-Zip (немає
+                        # сенсу залежати від реального пароля/Tools\7za.exe
+                        # тут — його коректність доводить окремий real-7za
+                        # round-trip тест); рахуємо виклики, щоб довести
+                        # "команда/archive invoked", а не мовчазний skip.
+                        param([string]$SourcePath, [string]$FullArchivePath, [string]$ArcPath, [string]$ArcParams)
+                        $script:archiveInvocationCount++
+                        [IO.File]::WriteAllText($FullArchivePath, "archive-content", (New-Object Text.UTF8Encoding($false)))
+                        [pscustomobject]@{ CreateSuccess = $true; IntegritySuccess = $true; ErrorStage = $null; Error = $null }
+                    }
+                    function New-SHA512Hash {
+                        param([string]$FilePath, [string]$HashFilePath)
+                        [IO.File]::WriteAllText($HashFilePath, ("{0} *{1}" -f $knownHash.ToLowerInvariant(), [IO.Path]::GetFileName($FilePath)), (New-Object Text.UTF8Encoding($false)))
+                        return $true
+                    }
+                    function Get-BRAVOFileHash { param([string]$Path, [string]$Algorithm) [pscustomobject]@{ Hash = $knownHash } }
+                    function Write-BRAVOFinalHashFile {
+                        param([string]$Path, [string]$Hash, [string]$ArchiveName)
+                        [IO.File]::WriteAllText($Path, ("{0} *{1}" -f $Hash.ToLowerInvariant(), $ArchiveName), (New-Object Text.UTF8Encoding($false)))
+                    }
+                    $result = Invoke-BRAVOComponentBackup `
+                        -Component 'MODEL' `
+                        -GenerationId '20260813_000000' `
+                        -OriginalSourcePath $SourcePath `
+                        -SourcePath $SourcePath `
+                        -DestinationDirectory $DestinationDirectory `
+                        -ArchiveName $ArchiveName `
+                        -ArcPath 'fake7za.exe'
+                    [pscustomobject]@{
+                        CreateSuccess = [bool]$result.CreateSuccess
+                        IntegritySuccess = [bool]$result.IntegritySuccess
+                        HashSuccess = [bool]$result.HashSuccess
+                        ArchiveInvocationCount = $script:archiveInvocationCount
+                        ArchiveFileExists = Test-Path -LiteralPath (Join-Path $DestinationDirectory $ArchiveName) -PathType Leaf
+                    }
+                } (Join-Path $discoveryForBackupStateCase.MODEL_SOURCE '*') $stateDest $archiveFileName
+
+                Test-BRAVOCondition `
+                    -Condition (
+                        $discoveryForBackupStateCase.MODEL_SOURCE -eq $serviceStateModelDir -and
+                        $backupExecutionResult.CreateSuccess -and
+                        $backupExecutionResult.IntegritySuccess -and
+                        $backupExecutionResult.HashSuccess -and
+                        $backupExecutionResult.ArchiveInvocationCount -eq 1 -and
+                        $backupExecutionResult.ArchiveFileExists
+                    ) `
+                    -Name "Backup/ArchiveInvokedWhenBravoService$($backupStateCase.Name)" `
+                    -Failure "стан служби BRAVO ($($backupStateCase.Name)) не повинен перешкоджати реальному шляху 'discovered source -> Invoke-BRAVOComponentBackup -> опублікований archive': команда архівації має бути реально викликана (лічильник =1) і archive-файл має фізично зʼявитись на диску, так само, як для Running"
+            }
+        } finally {
+            if (Test-Path -LiteralPath $serviceStateBackupTestRoot -PathType Container) {
+                Remove-Item -LiteralPath $serviceStateBackupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
 
         # Джерело істини — Service name ТА Display name одночасно.
         # Сторонній сервіс із Name="BRAVO", але іншим Display name (типова
