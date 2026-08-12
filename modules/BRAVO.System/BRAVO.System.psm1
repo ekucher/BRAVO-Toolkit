@@ -52,14 +52,19 @@ function Format-BRAVOSchedulerNextRun {
         [string]$TaskType,
         $NextRunTime,
         [int]$StartupDelayMinutes = 0,
-        # Recovery тепер має ДВА trigger на одному завданні: boot (сентинел
+        # Recovery може мати ДВА trigger на одному завданні: boot (сентинел
         # NextRunTime, тому й лишається окремим текстом нижче) і daily о
-        # Restore.WindowStart. Без цього параметра текст описував би лише
+        # Restore.WindowStart. Без DailyWindowStart текст описував би лише
         # половину реального розкладу.
-        [string]$DailyWindowStart
+        [string]$DailyWindowStart,
+        # Boot-trigger сам New-BRAVOTaskDefinition створює лише коли
+        # Restore.RunMissedOnStartup=true (BRAVO.config). За замовчуванням
+        # $true — зберігає попередню поведінку викликів без цього параметра
+        # (усі наявні виклики й тести передбачали boot-trigger присутнім).
+        [bool]$HasBootTrigger = $true
     )
 
-    if ($TaskType -eq 'Recovery') {
+    if ($TaskType -eq 'Recovery' -and $HasBootTrigger) {
         $bootText = if ($StartupDelayMinutes -gt 0) {
             "після наступного старту Windows; затримка $StartupDelayMinutes хв."
         } else {
@@ -70,6 +75,9 @@ function Format-BRAVOSchedulerNextRun {
         }
         return $bootText
     }
+    # Recovery БЕЗ boot-trigger (RunMissedOnStartup=false) має лише daily
+    # trigger — NextRunTime для нього РЕАЛЬНА дата (не сентинел 1899), тому
+    # форматується так само, як звичайне щоденне завдання нижче.
 
     try {
         # .Year -gt 1900 відкидає sentinel 30.12.1899 (він БІЛЬШИЙ за

@@ -6,7 +6,9 @@ Opens the next development cycle on top of the 5.0.0 stable baseline
 (`master` merged into `developer`). Minor version: this cycle already
 carries new functionality (Retention Safety Invariants), not only fixes.
 No configuration schema, state schema, credential target, archive format,
-retention default, transfer protocol, or supported-OS contract changed.
+transfer protocol, or supported-OS contract changed. The default minimum
+retained verified generations did change (1 -> 2, see Retention Safety
+Invariants below).
 
 - Automatic restore recovery now guarantees a daily retry inside the
   configured `Restore.WindowStart`/`WindowEnd` window regardless of
@@ -17,22 +19,29 @@ retention default, transfer protocol, or supported-OS contract changed.
   hours) existed, so a server that stayed up with `Maintenance.DailyAt`
   outside the restore window could skip a missed restore indefinitely.
   The Maintenance.DailyAt-outside-window log message no longer claims the
-  daily path is lost and is downgraded from `WARNING` to `INFO`.
+  daily path is lost and is downgraded from `WARNING` to `INFO`. The
+  `Recovery` task itself is now always registered (`Scheduler.Recovery.Enabled`
+  is no longer tied to `Restore.RunMissedOnStartup`): the daily trigger is
+  unconditional, and `Restore.RunMissedOnStartup` now only controls whether
+  the additional boot trigger is also created — previously setting it to
+  `false` disabled the daily safety net along with the boot retry.
 - `Remove-BRAVOOrphanedTemporaryArchiveArtifacts` (orphaned `.work\*.partial*`
   cleanup, introduced in 5.0.0) is now fail-visible: an enumeration error on
-  `.work` (access denied, I/O error) is logged and marks the operation
-  failed instead of silently being treated as "nothing to clean up" or "the
-  directory is empty."
+  `.work`, or on the `.work` existence check itself (access denied, I/O
+  error), is logged and marks the operation failed instead of silently
+  being treated as "nothing to clean up" or "the directory doesn't exist."
 - Retention Safety Invariants: generation-aware backup retention now also
   sweeps orphaned `.work\*.partial*` temporary archive artifacts left behind
   by a killed process, raises the default minimum retained verified
   generations from 1 to 2, and emits a single per-run retention audit log
   line (evaluated/protected/deleted counts).
-- Regression coverage: a real COM `Schedule.Service` test proves the
-  `Recovery` task registers exactly one boot and one daily trigger; a
-  behavioral test proves orphan-sweep enumeration failures are fail-visible;
-  a composite test proves a corrupted newest backup generation cannot evict
-  an older verified-valid one from the retention-protected set.
+- Regression coverage: real COM `Schedule.Service` tests prove the
+  `Recovery` task registers boot+daily triggers when `RunMissedOnStartup=true`
+  and daily-only (task still registered, not disabled) when `false`;
+  behavioral tests prove orphan-sweep enumeration and existence-check
+  failures are both fail-visible; a composite test proves a corrupted
+  newest backup generation cannot evict an older verified-valid one from
+  the retention-protected set.
 
 ## 5.0.0 — 2026-08-11
 

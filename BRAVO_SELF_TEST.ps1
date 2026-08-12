@@ -7454,6 +7454,37 @@ try {
             -Condition ($orphanFailureResult -eq $false) `
             -Name "BackupConsistency/OrphanTempSweepEnumerationFailureIsFailVisible" `
             -Failure "помилка enumeration .work (access denied/I-O error) має повертати `$false (fail-visible), а не мовчки трактуватися як 0 кандидатів чи порожній каталог"
+
+        # Регресія: Test-Path сам по собі НЕ fail-visible (.NET
+        # Directory.Exists ковтає UnauthorizedAccess і повертає $false), але
+        # провайдерські/мережеві помилки (відключений диск, недоступний UNC)
+        # реально кидають виняток — той самий override-принцип, що вище,
+        # тепер для Test-Path, з передачею через до реального cmdlet для
+        # будь-якого іншого шляху (щоб не зачепити Test-BRAVOBackupArtifactPathSafe).
+        $orphanTestPathFailureRemovedCount = 0
+        $orphanTestPathFailureResult = & $orphanSweepModule {
+            param($Definitions, $Hours, $CountRef)
+            function Test-Path {
+                param(
+                    [string]$LiteralPath,
+                    [string]$PathType,
+                    [string]$ErrorAction
+                )
+                if ($LiteralPath -like '*\.work') {
+                    throw [System.IO.IOException]::new(
+                        "simulated: provider error checking $LiteralPath"
+                    )
+                }
+                Microsoft.PowerShell.Management\Test-Path @PSBoundParameters
+            }
+            Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
+                -ArchiveDefinitions $Definitions -RetentionHours $Hours -RemovedFileCount $CountRef
+        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanTestPathFailureRemovedCount)
+
+        Test-BRAVOCondition `
+            -Condition ($orphanTestPathFailureResult -eq $false) `
+            -Name "BackupConsistency/OrphanTempSweepTestPathFailureIsFailVisible" `
+            -Failure "провайдерська помилка Test-Path на .work (мережа/диск) має повертати `$false (fail-visible), а не мовчки трактуватися як 'каталогу немає'"
     } finally {
         if (Test-Path -LiteralPath $orphanSweepTestRoot) {
             Remove-Item -LiteralPath $orphanSweepTestRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -10205,6 +10236,55 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition $recoveryTriggersOk `
         -Name "TaskDefinition/RecoveryHasBootAndDailyWindowTriggers" `
         -Failure "Recovery-завдання має мати РІВНО два trigger: boot (Type=8, без змін) і daily (Type=2) зі StartBoundary=Restore.WindowStart, DaysInterval=1, Enabled=true"
+
+    # --- TaskDefinition/RecoveryBootTriggerGatedByRunMissedOnStartup: коли
+    # Restore.RunMissedOnStartup=false, Recovery-завдання лишається
+    # ЗАРЕЄСТРОВАНИМ (Scheduler.Recovery.Enabled більше не прив'язаний до
+    # цього прапорця), але БЕЗ boot-trigger — лишається лише daily. Daily —
+    # єдиний безумовний safety net, тому вимикання RunMissedOnStartup не
+    # повинно вимикати все Recovery-завдання.
+    $recoveryTaskServiceForFalseTest = New-Object -ComObject "Schedule.Service"
+    $recoveryTaskServiceForFalseTest.Connect()
+    $recoveryTriggersFalseOk = $false
+    $savedRunMissedOnStartup = $global:maintenanceSettings.Restore.RunMissedOnStartup
+    try {
+        $global:maintenanceSettings.Restore.RunMissedOnStartup = $false
+        $recoveryTriggerInfoFalse = @(& $recoveryTriggerModule {
+            param($TaskService, $TaskSettings, $ConfigPath)
+            $result = New-BRAVOTaskDefinition `
+                -TaskService $TaskService `
+                -TaskSettings $TaskSettings `
+                -TaskType 'Recovery' `
+                -ResolvedConfigPath $ConfigPath
+            @($result.Definition.Triggers) | ForEach-Object {
+                [pscustomobject]@{
+                    Type = $_.Type
+                    StartBoundary = $_.StartBoundary
+                    DaysInterval = $_.DaysInterval
+                    Enabled = $_.Enabled
+                }
+            }
+        } $recoveryTaskServiceForFalseTest $global:schedulerSettings.Recovery $resolvedConfig)
+
+        $bootTriggersFalse = @($recoveryTriggerInfoFalse | Where-Object { $_.Type -eq 8 })
+        $dailyTriggersFalse = @($recoveryTriggerInfoFalse | Where-Object { $_.Type -eq 2 })
+        $recoveryTriggersFalseOk = (
+            $recoveryTriggerInfoFalse.Count -eq 1 -and
+            $bootTriggersFalse.Count -eq 0 -and
+            $dailyTriggersFalse.Count -eq 1 -and
+            [bool]$dailyTriggersFalse[0].Enabled -and
+            [bool]$global:schedulerSettings.Recovery.Enabled
+        )
+    } catch {
+        $recoveryTriggersFalseOk = $false
+    } finally {
+        $global:maintenanceSettings.Restore.RunMissedOnStartup = $savedRunMissedOnStartup
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($recoveryTaskServiceForFalseTest)
+    }
+    Test-BRAVOCondition `
+        -Condition $recoveryTriggersFalseOk `
+        -Name "TaskDefinition/RecoveryBootTriggerGatedByRunMissedOnStartup" `
+        -Failure "коли Restore.RunMissedOnStartup=false, Recovery має мати ЛИШЕ daily trigger (0 boot, 1 daily), а саме завдання (Scheduler.Recovery.Enabled) лишається true — не вимикається повністю"
 
     # --- Version/StampConsistency: buildId є префіксом sourceCommit ---
     # Ловить неузгоджений/pre-stamp VERSION.json (packageVersion нова, а

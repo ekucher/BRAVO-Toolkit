@@ -80,6 +80,7 @@ function Format-BRAVODiagnoseTaskNextRun {
         } else {
             "21:00"
         }
+        $nextRunArguments.HasBootTrigger = [bool]$maintenanceSettings.Restore.RunMissedOnStartup
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments

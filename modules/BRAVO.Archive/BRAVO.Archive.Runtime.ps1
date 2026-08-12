@@ -2612,7 +2612,22 @@ function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
             $destination = [string]$archive.Destination
             if ([string]::IsNullOrWhiteSpace($destination)) { continue }
             $workDirectory = Join-Path $destination ".work"
-            if (-not (Test-Path -LiteralPath $workDirectory -PathType Container)) { continue }
+            # Test-Path сам по собі НЕ fail-visible для access-denied: .NET
+            # Directory.Exists (на якому базується файловий провайдер) за
+            # дизайном ковтає UnauthorizedAccess і повертає $false — межу
+            # "не існує" і "заборонено" Test-Path принципово не розрізняє.
+            # -ErrorAction Stop все одно ловить провайдерські/мережеві
+            # помилки (відключений диск, недоступний UNC-шлях тощо), які
+            # інакше так само мовчки читались би як "каталогу немає".
+            $workDirectoryExists = $false
+            try {
+                $workDirectoryExists = Test-Path -LiteralPath $workDirectory -PathType Container -ErrorAction Stop
+            } catch {
+                $failed = $true
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося перевірити наявність $workDirectory для orphan-sweep: $($_.Exception.Message)" -Level 'ERROR'
+                continue
+            }
+            if (-not $workDirectoryExists) { continue }
 
             # Fail-visible enumeration: SilentlyContinue тут означав би, що
             # access denied/I-O error на .work мовчки повертає 0 кандидатів,

@@ -307,7 +307,19 @@ function New-BRAVOTaskDefinition {
     } else {
         ConvertTo-ScheduleTime -Value $TaskSettings.DailyAt -SettingName "$TaskType.DailyAt"
     }
-    if ($TaskType -eq "Recovery") {
+    # Recovery-завдання тепер завжди зареєстроване (Scheduler.Recovery.Enabled
+    # більше не залежить від Restore.RunMissedOnStartup — див. BRAVO.config):
+    # daily trigger на Restore.WindowStart — безумовний, постійний safety net.
+    # Boot-trigger (швидша реакція одразу після перезавантаження) — лише коли
+    # оператор явно хоче цю поведінку через Restore.RunMissedOnStartup=true.
+    # Обидва trigger викликають ТОЙ САМИЙ Action (-RunMissedRestoreOnly) —
+    # нового коду реставрації немає.
+    $recoveryRunMissedOnStartup = if ($TaskType -eq "Recovery") {
+        [bool]$maintenanceSettings.Restore.RunMissedOnStartup
+    } else {
+        $false
+    }
+    if ($TaskType -eq "Recovery" -and $recoveryRunMissedOnStartup) {
         $trigger = $definition.Triggers.Create(8) # TASK_TRIGGER_BOOT
         $delayMinutes = [math]::Max(0, [int]$TaskSettings.StartupDelayMinutes)
         if ($delayMinutes -gt 0) {
@@ -316,7 +328,7 @@ function New-BRAVOTaskDefinition {
             )
         }
         $trigger.Enabled = $true
-    } else {
+    } elseif ($TaskType -ne "Recovery") {
         $trigger = $definition.Triggers.Create(2) # TASK_TRIGGER_DAILY
         $trigger.StartBoundary = $triggerTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
         $trigger.Enabled = $true
@@ -337,7 +349,7 @@ function New-BRAVOTaskDefinition {
         $trigger.Repetition.Duration = "P1D"
         $trigger.Repetition.StopAtDurationEnd = $false
     }
-    if ($TaskType -eq "Recovery") {
+    if ($TaskType -eq "Recovery" -and $recoveryRunMissedOnStartup) {
         $trigger.Repetition.Interval = [System.Xml.XmlConvert]::ToString(
             [timespan]::FromMinutes([int]$TaskSettings.RetryEveryMinutes)
         )
@@ -345,18 +357,16 @@ function New-BRAVOTaskDefinition {
             [timespan]::FromHours([double]$TaskSettings.RetryDurationHours)
         )
         $trigger.Repetition.StopAtDurationEnd = $false
-
-        # Другий trigger на ТОМУ САМОМУ Recovery-завданні (той самий Action,
-        # -RunMissedRestoreOnly) — не окремий Windows task. Boot-trigger вище
-        # ловить пропущену реставрацію лише в перші 8 год після старту; якщо
-        # сервер не перезавантажується, а Maintenance.DailyAt не потрапляє у
-        # Restore.WindowStart-WindowEnd, жоден щоденний прогін узагалі не
-        # трапляється у вікні. Daily-trigger тут гарантує спробу щодня саме о
-        # Restore.WindowStart — той самий "safety barrier" $restoreWindowOpen
-        # у BRAVO_MAINTENANCE.ps1 і так відкидає спроби поза вікном, тому цей
-        # trigger лише забезпечує, що спроба СТАНЕТЬСЯ, а не визначає, чи вона
-        # дозволена. Час НЕ хардкодиться: береться з Restore.WindowStart (той
-        # самий default "21:00" за відсутності ключа, що й
+    }
+    if ($TaskType -eq "Recovery") {
+        # Daily trigger на ТОМУ САМОМУ Recovery-завданні (той самий Action,
+        # -RunMissedRestoreOnly) — не окремий Windows task, і БЕЗУМОВНИЙ:
+        # єдиний надійний щоденний шлях підхоплення пропущеної реставрації
+        # незалежно від Maintenance.DailyAt, reboot і RunMissedOnStartup.
+        # $restoreWindowOpen у BRAVO_MAINTENANCE.ps1 і так відкидає спроби
+        # поза вікном — цей trigger лише забезпечує, що спроба СТАНЕТЬСЯ.
+        # Час НЕ хардкодиться: береться з Restore.WindowStart (той самий
+        # default "21:00" за відсутності ключа, що й
         # BRAVO.Maintenance.Runtime.ps1 застосовує до вікна).
         $restoreWindowStartSetting = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
             -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
@@ -435,6 +445,7 @@ function Format-BRAVOInstalledTaskSummaryNextRun {
         } else {
             "21:00"
         }
+        $nextRunArguments.HasBootTrigger = [bool]$maintenanceSettings.Restore.RunMissedOnStartup
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments
@@ -808,7 +819,11 @@ try {
                 } else {
                     "21:00"
                 }
-                "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.) та щодня о $previewRestoreWindowStart"
+                if ([bool]$maintenanceSettings.Restore.RunMissedOnStartup) {
+                    "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.) та щодня о $previewRestoreWindowStart"
+                } else {
+                    "щодня о $previewRestoreWindowStart (Restore.RunMissedOnStartup=false: без boot-trigger)"
+                }
             } elseif ($taskPlan.Type -eq "BAZASync") {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
             } else {
