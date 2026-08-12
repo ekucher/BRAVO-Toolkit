@@ -5608,8 +5608,20 @@ function Main {
         "виключення: $freeSpaceExclusionsText"
     ) -Level 'INFO'
     try {
+        # -RootPath тут лише sanity-перевірка "SOME каталог доступний"
+        # (сама функція перевіряє ВСІ Fixed-диски, а не лише диск $RootPath)
+        # — Test-Path з порожнім рядком кидає виняток, а $rootPath може
+        # бути порожнім, коли LIMSRoot не визначено (служба BRAVO
+        # відсутня; safety-review "service state != backup policy").
+        # $runtimeRoot гарантовано існує (звідти виконується сам скрипт)
+        # незалежно від LIMSRoot і не змінює перелік перевірених дисків.
+        $archiveFreeSpaceRootPath = if ([string]::IsNullOrWhiteSpace([string]$rootPath)) {
+            $runtimeRoot
+        } else {
+            $rootPath
+        }
         $archiveFreeSpaceResult = Get-BRAVOArchiveFreeSpaceResult `
-            -RootPath $rootPath `
+            -RootPath $archiveFreeSpaceRootPath `
             -MinimumFreeSpaceGB $archiveMinimumFreeSpaceGB `
             -ExcludedDrives $archiveFreeSpaceExcludedDrives
     } catch {

@@ -405,9 +405,20 @@ function Resolve-BRAVOInstallationDiscovery {
     #    із Reasons, що пояснюють кожне поле, а остаточне рішення "це
     #    помилка чи ні" ухвалює Test-BRAVODiscoveryResult (validation),
     #    щоб точки виклику самі вирішували критичність.
+    #
+    # -LimsRoot НЕ Mandatory (safety-review): параметр ніде не
+    # використовується в тілі функції (застаріла спадщина евристик
+    # "<LIMSRoot>\Model" тощо, які свідомо прибрані — див. коментарі нижче
+    # про MODEL/BLOG/BRAVOEXCH виключно з bravo.ini). Mandatory на
+    # [string]-параметрі PowerShell відхиляє ПОРОЖНІЙ рядок як "не
+    # передано значення" (BindArgument-помилка), а BRAVO.config тепер
+    # легітимно передає сюди порожній $rootPath, коли LIMSRoot не
+    # визначено (служба BRAVO відсутня) — Discovery за задумом мусить
+    # відпрацювати й без нього, тому Mandatory тут суперечив би пункту 5
+    # вище.
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$LimsRoot,
+        [string]$LimsRoot,
         [hashtable]$DiscoverySettings,
         [string]$BravoServiceName = "BRAVO",
         # Джерело істини для ідентифікації служби BRAVO — Service name

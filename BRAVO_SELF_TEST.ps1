@@ -6700,6 +6700,345 @@ try {
             -Name "Discovery/BravoServiceAbsentModelBlogBravoexchResolveFromIni" `
             -Failure "коли службу BRAVO не встановлено, MODEL/BLOG/BRAVOEXCH мають резолвитись з canonical bravo.ini (незалежне authoritative джерело) — відсутність служби не повинна блокувати ці backup-джерела, лише BRAVO_ROOT (похідне від служби значення)"
 
+        # =====================================================================
+        # PRODUCTION CONFIG LOADER: service-not-installed acceptance tests
+        # =====================================================================
+        # Усі тести Discovery/* вище викликають Resolve-BRAVOInstallationDiscovery
+        # НАПРЯМУ — доводять коректність самого helper'а, але НЕ доводять, що
+        # РЕАЛЬНИЙ виробничий шлях завантаження конфігурації взагалі ДІЙДЕ до
+        # цього коду. BRAVO.config СПОЧАТКУ (до Discovery) викликає
+        # Resolve-BRAVOEffectiveLimsRoot; за замовчуванням
+        # pathSettings.LIMSRoot="", і коли служби BRAVO немає, це РАНІШЕ
+        # завершувалось `throw` ще ДО виклику Discovery — helper-тести цього
+        # взагалі не бачили, бо викликали Discovery в обхід BRAVO.config.
+        #
+        # Тести нижче йдуть через РЕАЛЬНИЙ Import-BravoConfiguration з
+        # РЕАЛЬНИМ текстом BRAVO.config: targeted-регекс підміна КОНКРЕТНИХ
+        # значень конфігурації (той самий прийом, що Version/AuthoritativeLoader
+        # вище вже застосовує для LIMSRoot), і РЕАЛЬНИМ Get-CimInstance/
+        # Get-WmiObject, перевизначеними в global scope — єдиний надійний
+        # спосіб контролювати "яких служб не існує" для коду всередині
+        # ІМПОРТОВАНОГО модуля BRAVO.Discovery: shadow інших BRAVO-функцій між
+        # модулями НЕ працює (кожен модуль має власний session state — див.
+        # коментар на початку BRAVO.Discovery.psm1), але Get-CimInstance —
+        # чужий cmdlet, не BRAVO-функція, тому глобальний shadow дійсно
+        # перехоплює виклик з середини чужого модуля.
+        #
+        # Регресія, знайдена САМЕ цим підходом (а не helper-тестами): коли
+        # LIMSRoot дійсно порожній, BRAVO.config передає порожній рядок у
+        # Resolve-BRAVOInstallationDiscovery -LimsRoot, чий параметр був
+        # Mandatory — PowerShell відхиляє Mandatory [string] з порожнім
+        # значенням окремою помилкою біндингу, іншою за симптомом, ніж
+        # оригінальний LIMSRoot-throw. Виправлено (LimsRoot прибрано з
+        # Mandatory — параметр і так ніде не використовується в тілі функції).
+        function New-BRAVOProductionConfigFixtureResult {
+            param(
+                [Parameter(Mandatory = $true)][string]$Root,
+                [Parameter(Mandatory = $true)][string]$SourceConfigPath,
+                [Parameter(Mandatory = $true)][string]$ConfigLoaderPath,
+                [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+                [object[]]$Services = @(),
+                [hashtable]$PathSettingsOverrides = @{},
+                [hashtable]$DiscoverySettingsOverrides = @{},
+                # Булеві componentSettings.Synchronization.* флаги (напр.
+                # BAZA_WWW_LOCAL/BAZA_WWW_SFTP, обидва $false за замовчуванням)
+                # — без хоча б одного $true бекап-детекція BAZA_WWW взагалі не
+                # виконується ("синхронізацію вимкнено"), незалежно від служби.
+                [hashtable]$ComponentSyncFlagOverrides = @{}
+            )
+
+            $script:prodLoaderFixtureServices = @($Services)
+            function global:Get-CimInstance {
+                param([string]$ClassName, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
+                if ($ClassName -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
+                Microsoft.Management.Infrastructure.CimCmdlets\Get-CimInstance @PSBoundParameters
+            }
+            function global:Get-WmiObject {
+                param([string]$Class, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
+                if ($Class -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
+                Microsoft.PowerShell.Management\Get-WmiObject @PSBoundParameters
+            }
+
+            try {
+                $configText = [IO.File]::ReadAllText($SourceConfigPath, [Text.Encoding]::UTF8)
+                foreach ($key in $PathSettingsOverrides.Keys) {
+                    $escapedValue = ([string]$PathSettingsOverrides[$key]).Replace("'", "''")
+                    $pattern = '(?m)^(\s*' + [regex]::Escape($key) + '\s*=\s*)""\s*$'
+                    $evaluator = [Text.RegularExpressions.MatchEvaluator] {
+                        param($match) $match.Groups[1].Value + "'$escapedValue'"
+                    }
+                    $replacedText = [regex]::Replace($configText, $pattern, $evaluator, 1)
+                    if ($replacedText -eq $configText) {
+                        throw "pathSettings.$key substitution matched nothing (fixture BRAVO.config may have drifted)"
+                    }
+                    $configText = $replacedText
+                }
+                foreach ($key in $DiscoverySettingsOverrides.Keys) {
+                    $simpleName = ($key -split '\.')[-1]
+                    $escapedValue = ([string]$DiscoverySettingsOverrides[$key]).Replace("'", "''")
+                    $pattern = '(?m)^(\s*' + [regex]::Escape($simpleName) + '\s*=\s*)\$null\s*$'
+                    $evaluator = [Text.RegularExpressions.MatchEvaluator] {
+                        param($match) $match.Groups[1].Value + "'$escapedValue'"
+                    }
+                    $replacedText = [regex]::Replace($configText, $pattern, $evaluator, 1)
+                    if ($replacedText -eq $configText) {
+                        throw "discoverySettings.$key substitution matched nothing (fixture BRAVO.config may have drifted)"
+                    }
+                    $configText = $replacedText
+                }
+                foreach ($key in $ComponentSyncFlagOverrides.Keys) {
+                    $boolValue = if ([bool]$ComponentSyncFlagOverrides[$key]) { '$true' } else { '$false' }
+                    $pattern = '(?m)^(\s*' + [regex]::Escape($key) + '\s*=\s*)\$(true|false)\s*$'
+                    $evaluator = [Text.RegularExpressions.MatchEvaluator] {
+                        param($match) $match.Groups[1].Value + $boolValue
+                    }
+                    $replacedText = [regex]::Replace($configText, $pattern, $evaluator, 1)
+                    if ($replacedText -eq $configText) {
+                        throw "componentSettings.Synchronization.$key substitution matched nothing (fixture BRAVO.config may have drifted)"
+                    }
+                    $configText = $replacedText
+                }
+
+                $fixtureConfigPath = Join-Path $Root 'BRAVO.config'
+                [IO.File]::WriteAllText($fixtureConfigPath, $configText, (New-Object Text.UTF8Encoding($false)))
+
+                . $ConfigLoaderPath
+
+                $result = [pscustomobject]@{
+                    Threw = $false
+                    ExceptionMessage = $null
+                    EffectiveLimsRoot = $null
+                    LimsRootSource = $null
+                    BackupRootPath = $null
+                    ArchiveDefinitions = $null
+                    BazaWWWDetection = $null
+                    BravoDiscoveryResult = $null
+                }
+                try {
+                    Import-BravoConfiguration `
+                        -ConfigRoot $Root `
+                        -ConfigPath $fixtureConfigPath `
+                        -RuntimeRoot $RuntimeRoot `
+                        -ErrorAction Stop
+                    $result.EffectiveLimsRoot = [string]$global:effectiveLimsRoot
+                    $result.LimsRootSource = [string]$global:limsRootResult.Source
+                    $result.BackupRootPath = [string]$global:backupRootPath
+                    $result.ArchiveDefinitions = $global:archiveDefinitions
+                    $result.BazaWWWDetection = $global:bazaWWWDetection
+                    $result.BravoDiscoveryResult = $global:bravoDiscoveryResult
+                } catch {
+                    $result.Threw = $true
+                    $result.ExceptionMessage = $_.Exception.Message
+                }
+                return $result
+            } finally {
+                Remove-Item -Path function:global:Get-CimInstance -ErrorAction SilentlyContinue
+                Remove-Item -Path function:global:Get-WmiObject -ErrorAction SilentlyContinue
+            }
+        }
+
+        $prodLoaderConfigLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
+        $prodLoaderSourceConfigPath = Join-Path $root 'BRAVO.config'
+        $prodLoaderRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_PRODLOADER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($prodLoaderRoot)
+            $prodLoaderIniPath = Join-Path $prodLoaderRoot 'bravo.ini'
+            [IO.File]::WriteAllLines($prodLoaderIniPath, @(
+                '[model]',
+                ("MODEL={0}" -f (Join-Path $prodLoaderRoot "Model\lims")),
+                ("BLOG={0}\" -f (Join-Path $prodLoaderRoot "BLOG")),
+                ("BEXCH={0}" -f (Join-Path $prodLoaderRoot "bravoexch"))
+            ))
+            $prodLoaderBackupRoot = Join-Path $prodLoaderRoot 'Backup'
+            [void][IO.Directory]::CreateDirectory($prodLoaderBackupRoot)
+            $prodLoaderModelSourceExpected = Join-Path $prodLoaderRoot 'Model'
+            $prodLoaderExplicitModelSource = Join-Path $prodLoaderRoot 'ExplicitModel'
+            $prodLoaderExplicitBlogSource = Join-Path $prodLoaderRoot 'ExplicitBlog'
+            $prodLoaderExplicitBravoexchSource = Join-Path $prodLoaderRoot 'ExplicitBravoexch'
+            $prodLoaderBazaWWWOverride = Join-Path $prodLoaderRoot 'ExplicitBazaWWW'
+            $prodLoaderNoSuchIniPath = Join-Path $prodLoaderRoot 'NoSuchDir\bravo.ini'
+
+            # --- Acceptance 1: BRAVO absent + canonical bravo.ini + usable
+            # BackupRoot -> production config loader succeeds, archive
+            # generation input (archiveDefinitions[MODEL].Source) is ready.
+            $prodLoader1 = New-BRAVOProductionConfigFixtureResult `
+                -Root $prodLoaderRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $prodLoaderBackupRoot } `
+                -DiscoverySettingsOverrides @{ BravoIniPath = $prodLoaderIniPath }
+            $prodLoader1ModelDefinition = if ($null -ne $prodLoader1.ArchiveDefinitions) {
+                @($prodLoader1.ArchiveDefinitions | Where-Object { $_.Type -eq 'MODEL' })[0]
+            } else { $null }
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $prodLoader1.Threw -and
+                    $prodLoader1.LimsRootSource -eq 'Error' -and
+                    $prodLoader1.BackupRootPath -eq $prodLoaderBackupRoot -and
+                    $null -ne $prodLoader1ModelDefinition -and
+                    [bool]$prodLoader1ModelDefinition.Enabled -and
+                    $prodLoader1ModelDefinition.Source -eq (Join-Path $prodLoaderModelSourceExpected '*')
+                ) `
+                -Name 'ProductionConfig/BravoAbsentIniSourcesReachArchiveGeneration' `
+                -Failure 'служба BRAVO відсутня + canonical bravo.ini з валідними MODEL/BLOG/BRAVOEXCH + явний BackupRoot -> Import-BravoConfiguration має succeed, а archiveDefinitions[MODEL].Source має вказувати на реальне джерело з ini (LIMSRoot може лишатись Error — MODEL generation це не блокує)'
+
+            # --- Acceptance 2: BRAVO absent + explicit source overrides ->
+            # Archive works without service (ini deliberately unreadable).
+            $prodLoader2 = New-BRAVOProductionConfigFixtureResult `
+                -Root $prodLoaderRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $prodLoaderBackupRoot } `
+                -DiscoverySettingsOverrides @{
+                    BravoIniPath = $prodLoaderNoSuchIniPath
+                    'Sources.MODEL' = $prodLoaderExplicitModelSource
+                    'Sources.BLOG' = $prodLoaderExplicitBlogSource
+                    'Sources.BRAVOEXCH' = $prodLoaderExplicitBravoexchSource
+                }
+            $prodLoader2ModelDefinition = if ($null -ne $prodLoader2.ArchiveDefinitions) {
+                @($prodLoader2.ArchiveDefinitions | Where-Object { $_.Type -eq 'MODEL' })[0]
+            } else { $null }
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $prodLoader2.Threw -and
+                    $null -ne $prodLoader2ModelDefinition -and
+                    $prodLoader2ModelDefinition.Source -eq (Join-Path $prodLoaderExplicitModelSource '*') -and
+                    $prodLoader2.BravoDiscoveryResult.BLOG_SOURCE -eq $prodLoaderExplicitBlogSource -and
+                    $prodLoader2.BravoDiscoveryResult.BRAVOEXCH_SOURCE -eq $prodLoaderExplicitBravoexchSource -and
+                    [bool]$prodLoader2.BravoDiscoveryResult.Overrides['MODEL']
+                ) `
+                -Name 'ProductionConfig/BravoAbsentExplicitSourceOverridesWork' `
+                -Failure 'служба BRAVO відсутня + явні discoverySettings.Sources.MODEL/BLOG/BRAVOEXCH (без canonical bravo.ini) -> Archive має працювати повністю без служби через явний override'
+
+            # --- Acceptance 3: BRAVO absent + source genuinely unavailable
+            # (no ini, no override) -> controlled "source unknown" failure,
+            # NOT phrased as a service-state denial.
+            $prodLoader3 = New-BRAVOProductionConfigFixtureResult `
+                -Root $prodLoaderRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $prodLoaderBackupRoot } `
+                -DiscoverySettingsOverrides @{ BravoIniPath = $prodLoaderNoSuchIniPath }
+            $prodLoader3ModelDefinition = if ($null -ne $prodLoader3.ArchiveDefinitions) {
+                @($prodLoader3.ArchiveDefinitions | Where-Object { $_.Type -eq 'MODEL' })[0]
+            } else { $null }
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $prodLoader3.Threw -and
+                    $null -ne $prodLoader3ModelDefinition -and
+                    [string]::IsNullOrWhiteSpace([string]$prodLoader3ModelDefinition.Source) -and
+                    $prodLoader3.BravoDiscoveryResult.Reasons.MODEL -match '(?i)не(\s|-)?вдал|недоступ|немає|відсутн' -and
+                    $prodLoader3.BravoDiscoveryResult.Reasons.MODEL -notmatch '(?i)stopped|running|disabled|заборонен|служб[а-яіїу]*\s+(зупин|вимкнен)'
+                ) `
+                -Name 'ProductionConfig/BravoAbsentSourceUnknownFailsClosedNotServiceDenial' `
+                -Failure 'без служби BRAVO, без bravo.ini і без override MODEL_SOURCE має лишатись невизначеним з причиною "джерело недоступне/не знайдено", а НЕ формулюванням про stopped/disabled/заборонену службу'
+
+            # --- Acceptance 4: Apache absent + Sources.BAZA_WWW explicit ->
+            # production config loader + BAZA_WWW backup/sync path succeeds.
+            $prodLoader4 = New-BRAVOProductionConfigFixtureResult `
+                -Root $prodLoaderRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $prodLoaderBackupRoot } `
+                -DiscoverySettingsOverrides @{
+                    BravoIniPath = $prodLoaderIniPath
+                    'Sources.BAZA_WWW' = $prodLoaderBazaWWWOverride
+                } `
+                -ComponentSyncFlagOverrides @{ BAZA_WWW_LOCAL = $true }
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $prodLoader4.Threw -and
+                    $prodLoader4.BazaWWWDetection.Success -and
+                    $prodLoader4.BazaWWWDetection.Source -eq $prodLoaderBazaWWWOverride
+                ) `
+                -Name 'ProductionConfig/ApacheAbsentExplicitBazaWWWSourceWorks' `
+                -Failure 'служба BravoWeb/Apache відсутня + явний discoverySettings.Sources.BAZA_WWW -> BAZA_WWW має бути доступним через production config loader без служби'
+
+            # --- Acceptance 5: Apache absent + no BAZA_WWW authoritative
+            # source -> controlled source-discovery failure.
+            $prodLoader5 = New-BRAVOProductionConfigFixtureResult `
+                -Root $prodLoaderRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $prodLoaderBackupRoot } `
+                -DiscoverySettingsOverrides @{ BravoIniPath = $prodLoaderIniPath } `
+                -ComponentSyncFlagOverrides @{ BAZA_WWW_LOCAL = $true }
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $prodLoader5.Threw -and
+                    -not $prodLoader5.BazaWWWDetection.Success -and
+                    [string]::IsNullOrWhiteSpace([string]$prodLoader5.BazaWWWDetection.Source) -and
+                    $prodLoader5.BazaWWWDetection.Reason -match '(?i)не знайдено' -and
+                    $prodLoader5.BazaWWWDetection.Reason -notmatch '(?i)stopped|disabled|заборонен'
+                ) `
+                -Name 'ProductionConfig/ApacheAbsentNoBazaWWWSourceIsControlledFailure' `
+                -Failure 'служба BravoWeb/Apache відсутня, без override -> BAZA_WWW має лишатись контрольовано недоступним ("службу не знайдено"), а не сформульованим як service-state заборона'
+
+            # --- Acceptance 6: Running/Stopped/Disabled behavior from
+            # 231a423 remains unchanged through the FULL production loader
+            # (not just the Discovery helper).
+            foreach ($prodLoaderStateCase in @(
+                @{ Name = 'Running'; State = 'Running'; StartMode = 'Auto' },
+                @{ Name = 'Stopped'; State = 'Stopped'; StartMode = 'Manual' },
+                @{ Name = 'Disabled'; State = 'Stopped'; StartMode = 'Disabled' }
+            )) {
+                $prodLoaderFakeBravoExe = Join-Path $prodLoaderRoot 'bravo.exe'
+                if (-not (Test-Path -LiteralPath $prodLoaderFakeBravoExe)) {
+                    [IO.File]::WriteAllText($prodLoaderFakeBravoExe, 'stub')
+                }
+                $prodLoaderStateServices = @(
+                    [pscustomobject]@{ Name = 'BRAVO'; DisplayName = 'BRAVO Service'; State = $prodLoaderStateCase.State; StartMode = $prodLoaderStateCase.StartMode; PathName = ('"{0}"' -f $prodLoaderFakeBravoExe) }
+                )
+                $prodLoaderStateResult = New-BRAVOProductionConfigFixtureResult `
+                    -Root $prodLoaderRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                    -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                    -Services $prodLoaderStateServices `
+                    -PathSettingsOverrides @{ BackupRoot = $prodLoaderBackupRoot } `
+                    -DiscoverySettingsOverrides @{ BravoIniPath = $prodLoaderIniPath }
+                $prodLoaderStateModelDefinition = if ($null -ne $prodLoaderStateResult.ArchiveDefinitions) {
+                    @($prodLoaderStateResult.ArchiveDefinitions | Where-Object { $_.Type -eq 'MODEL' })[0]
+                } else { $null }
+                Test-BRAVOCondition `
+                    -Condition (
+                        -not $prodLoaderStateResult.Threw -and
+                        $null -ne $prodLoaderStateModelDefinition -and
+                        $prodLoaderStateModelDefinition.Source -eq (Join-Path $prodLoaderModelSourceExpected '*')
+                    ) `
+                    -Name "ProductionConfig/RunningStoppedDisabledUnchanged$($prodLoaderStateCase.Name)" `
+                    -Failure "стан служби BRAVO ($($prodLoaderStateCase.Name)) через ПОВНИЙ виробничий шлях завантаження конфігурації (не лише helper) не повинен впливати на archiveDefinitions[MODEL].Source — поведінка 231a423 має лишатись незмінною"
+            }
+        } finally {
+            if (Test-Path -LiteralPath $prodLoaderRoot -PathType Container) {
+                Remove-Item -LiteralPath $prodLoaderRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Maintenance safety NOT weakened: власна явна перевірка
+        # BRAVO_MAINTENANCE.ps1 (effectiveLimsRoot/systemLogRoot/backupRootPath
+        # непорожні одразу після Import-BravoConfiguration, exit 30 інакше)
+        # лишається на місці буквально — саме вона, а не BRAVO.config-throw,
+        # тепер єдиний захист Maintenance від запуску без визначеного
+        # installation root.
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceRestoreWindowText.Contains(
+                    "[string]::IsNullOrWhiteSpace([string]`$effectiveLimsRoot) -or"
+                ) -and
+                $maintenanceRestoreWindowText.Contains(
+                    "[string]::IsNullOrWhiteSpace([string]`$systemLogRoot) -or"
+                ) -and
+                $maintenanceRestoreWindowText.Contains(
+                    "[string]::IsNullOrWhiteSpace([string]`$backupRootPath)"
+                ) -and
+                $maintenanceRestoreWindowText.Contains(
+                    'throw "У BRAVO.config не вдалося визначити ефективні корені (EffectiveLIMSRoot/SystemLogRoot/BackupRoot)"'
+                )
+            ) `
+            -Name 'ProductionConfig/MaintenanceOwnLimsRootGuardStillBlocks' `
+            -Failure 'BRAVO_MAINTENANCE.ps1 має власну явну перевірку effectiveLimsRoot/systemLogRoot/backupRootPath одразу після завантаження конфігурації — вона не повинна бути ослаблена чи видалена, інакше Maintenance міг би почати керувати службами/reставрацією без визначеного installation root'
+
         # === Behavioral: реальний archive-generation path, не лише
         # Discovery ===
         # Вище доведено, що Discovery резолвить ОДНАКОВЕ джерело для

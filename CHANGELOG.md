@@ -85,6 +85,39 @@ Invariants below).
   BRAVOEXCH, sourced only from `bravo.ini`), pre-/post-restore MODEL
   backups, and `ArchiveAfterMaintenance` were already service-state
   independent; audited and confirmed with new regression coverage.
+- Closed a second, deeper instance of the same invariant: `BRAVO.config`
+  called `Resolve-BRAVOEffectiveLimsRoot` for `pathSettings.LIMSRoot`
+  (default `""` = AUTO from the BRAVO service) and `throw`n immediately
+  when the service was absent — before `Resolve-BRAVOInstallationDiscovery`
+  (MODEL/BLOG/BRAVOEXCH) ever ran. A production-loader-level test (driving
+  the real `Import-BravoConfiguration` + `BRAVO.config`, not the Discovery
+  helper directly) confirmed this: with the BRAVO service absent, a
+  perfectly valid canonical `bravo.ini`, and an explicit `BackupRoot`,
+  config loading still failed on the LIMSRoot check alone. `LIMSRoot`/
+  `SystemLogRoot` resolution no longer throws inside `BRAVO.config` itself;
+  each consumer now decides its own criticality. `BRAVO_ARCHIV` reads
+  neither value (confirmed by grep: MODEL/BLOG/BRAVOEXCH come only from
+  `bravo.ini`, `BackupRoot` has its own independent explicit-or-AUTO
+  resolution with its own `Error`/throw, and `BRAVO_HEALTH` reads neither
+  value either — it already only requires `BackupRoot`). `BRAVO_MAINTENANCE`
+  is unaffected: it already had its own explicit, independent guard
+  (`effectiveLimsRoot`/`systemLogRoot`/`backupRootPath` non-empty, `exit 30`
+  otherwise) immediately after loading configuration, so Maintenance's
+  fail-closed behavior when it genuinely needs the installation root is
+  unchanged — now protected by a regression test
+  (`ProductionConfig/MaintenanceOwnLimsRootGuardStillBlocks`) so it cannot
+  be silently weakened later. Two related latent bugs, both surfaced only
+  by testing the real config-loader path (not the Discovery helper in
+  isolation): `Resolve-BRAVOInstallationDiscovery`'s unused `-LimsRoot`
+  parameter was `Mandatory`, so passing the now-legitimately-empty
+  `$rootPath` threw a parameter-binding error instead of proceeding — fixed
+  by dropping `Mandatory` from a parameter the function body never reads;
+  and Archive's free-space preflight passed the same possibly-empty
+  `$rootPath` as `-RootPath` to `Get-BRAVOArchiveFreeSpaceResult`, whose own
+  sanity `Test-Path` throws on an empty string — fixed by falling back to
+  `$runtimeRoot` (always valid) when `$rootPath` is empty; the free-space
+  check itself already evaluates every fixed drive regardless of
+  `-RootPath`, so this changes no free-space behavior.
 - Regression coverage: real COM `Schedule.Service` tests prove the
   `Recovery` task registers boot+daily triggers when `RunMissedOnStartup=true`,
   daily-only (task still registered, not disabled) when `false`, and
@@ -96,29 +129,51 @@ Invariants below).
   missing `.work` (benign), access-denied, and a distinct I/O failure type,
   plus a structural test proving `Test-Path` is no longer called at all;
   a composite test proves a corrupted newest backup generation cannot
-  evict an older verified-valid one from the retention-protected set;
-  behavioral `Resolve-BRAVOInstallationDiscovery` tests (`Discovery/
-  BackupSourcesResolveWhenBravo*`) prove `BRAVO_ROOT`/`MODEL`/`BLOG`/
-  `BRAVOEXCH`/`BAZA_APP` resolve identically across all three BRAVO service
-  states, and `BAZA_WWW` (`Discovery/BazaWWWResolvesWhenApache*`) resolves
-  identically from the same `httpd.conf` across all three BravoWeb/Apache
-  service states; two more cover the service-genuinely-absent case
-  distinctly from "disabled" (explicit override still resolves `BAZA_WWW`;
-  no override gives a controlled "source not found" failure, not a
-  service-denial message), and one proves `MODEL`/`BLOG`/`BRAVOEXCH` still
-  resolve from `bravo.ini` with the BRAVO service entirely absent. Beyond
-  discovery, three genuinely behavioral tests (`Backup/
-  ArchiveInvokedWhenBravoService*`) drive the real, unmocked
-  `Invoke-BRAVOComponentBackup` production pipeline (only the 7-Zip child
-  process itself is stubbed) from a discovered source through to a
-  published archive on disk, once per BRAVO service state, confirming the
-  archiver is actually invoked and the archive actually exists regardless
-  of service state. Structural tests (clearly labeled as such, not
-  behavioral) separately prove the pre-/post-restore archive calls and the
-  `ArchiveAfterMaintenance` launch decision contain no service-status
-  re-check; a true behavioral invocation test for the latter was judged
-  impractical without restructuring `BRAVO_MAINTENANCE.ps1`'s monolithic
-  top-level flow into a callable function purely for testability.
+  evict an older verified-valid one from the retention-protected set.
+  Service-state independence has two coverage layers, named to match what
+  each actually proves: `Discovery/BackupSourcesResolveWhenBravo*` and
+  `Discovery/BazaWWWResolvesWhenApache*` are behavioral tests of
+  `Resolve-BRAVOInstallationDiscovery` alone (all three BRAVO/BravoWeb
+  service states resolve `BRAVO_ROOT`/`MODEL`/`BLOG`/`BRAVOEXCH`/
+  `BAZA_APP`/`BAZA_WWW` identically, `BAZA_WWW` from the same `httpd.conf`
+  in every case) — an earlier round of these tests was named
+  `Backup/WorksWhenBravoService*`, which misleadingly implied execution
+  coverage for what was actually discovery-only coverage; renamed. Two more
+  Discovery-level tests cover the service-genuinely-absent case distinctly
+  from "disabled" (explicit override still resolves `BAZA_WWW`; no override
+  gives a controlled "source not found" failure, not a service-denial
+  message), and one proves `MODEL`/`BLOG`/`BRAVOEXCH` still resolve from
+  `bravo.ini` with the BRAVO service entirely absent. Beyond discovery,
+  three genuinely behavioral tests (`Backup/ArchiveInvokedWhenBravoService*`)
+  drive the real Invoke-BRAVOComponentBackup control flow — its own atomic
+  create/hash/verify/publish orchestration is exercised unmocked; only the
+  archive/hash primitives (`New-Archive`, `New-SHA512Hash`,
+  `Get-BRAVOFileHash`, `Write-BRAVOFinalHashFile`) are stubbed — from a
+  discovered source through to a published archive on disk, once per BRAVO
+  service state, confirming the archiver is actually invoked (a call
+  counter proves it) and the archive actually exists regardless of service
+  state. A third layer (`ProductionConfig/*`) goes one level deeper still:
+  nine tests drive the real `Import-BravoConfiguration` against the real
+  `BRAVO.config` text (targeted, verified regex substitution of specific
+  config values only — the same technique `Version/AuthoritativeLoader`
+  already used for `LIMSRoot`), with `Get-CimInstance`/`Get-WmiObject`
+  shadowed at global scope to control service presence deterministically
+  (the only reliable interception point across a module boundary — BRAVO's
+  own functions cannot be shadowed that way, each module keeps its own
+  session state, but foreign cmdlets resolve through the caller's scope
+  chain). These prove, end to end: BRAVO absent + canonical `bravo.ini` +
+  explicit `BackupRoot` reaches a ready `archiveDefinitions[MODEL].Source`;
+  BRAVO absent + explicit source overrides work with no `bravo.ini` at all;
+  BRAVO absent + no source of any kind fails closed with a "source unknown"
+  reason, never a service-state one; the same two contrasting outcomes for
+  Apache-absent `BAZA_WWW`; and Running/Stopped/Disabled remain unchanged
+  through the full loader, not just the Discovery helper. Structural tests
+  (clearly labeled as such, not behavioral) separately prove the
+  pre-/post-restore archive calls and the `ArchiveAfterMaintenance` launch
+  decision contain no service-status re-check; a true behavioral invocation
+  test for the latter was judged impractical without restructuring
+  `BRAVO_MAINTENANCE.ps1`'s monolithic top-level flow into a callable
+  function purely for testability.
 
 ## 5.0.0 — 2026-08-11
 

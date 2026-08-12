@@ -862,10 +862,31 @@ BRAVO/LIMS, не backup. Змінивши її, ви вплинете на ро�
 повністю придатною для цього — вона зареєстрована в SCM з тим самим
 `PathName`, лише не запускається автоматично/вручну. Єдиний стан, який
 робить автоматичне виявлення неможливим, — служба СПРАВДІ не
-зареєстрована (не встановлена) і немає явного override; у такому разі
-`BRAVO.config` (`$global:discoverySettings.WebRoot` /
-`.Sources.BAZA_WWW` /  `.BravoRoot`) дозволяє задати джерело вручну —
-backup після цього так само не залежить від служби.
+зареєстрована (не встановлена) і немає явного override.
+
+Override-и — окремі одне від одного налаштування, не взаємозамінні:
+
+- **BAZA_WWW.** `discoverySettings.WebRoot` задає лише поле `WEB_ROOT`
+  (діагностика/похідні обчислення) і сам по собі `httpd.conf` НЕ шукає —
+  без зареєстрованої служби `BAZA_WWW` лишиться невизначеним, навіть якщо
+  `WebRoot` заданий. Потрібен саме `discoverySettings.Sources.BAZA_WWW` —
+  прямий шлях до каталогу `BAZA` під DocumentRoot.
+- **MODEL/BLOG/BRAVOEXCH/BAZA_APP.** `discoverySettings.BravoRoot`
+  перевизначає лише `BRAVO_ROOT` усередині Discovery (звідти похідні —
+  `TRACE_FILE` за відносним шляхом і fallback `BAZA_APP`, коли навіть
+  MODEL/BLOG не взяті з bravo.ini). MODEL/BLOG/BRAVOEXCH завжди самі
+  походять з canonical bravo.ini (або `discoverySettings.Sources.MODEL`/
+  `.BLOG`/`.BRAVOEXCH`), а НЕ з `BravoRoot`.
+- **LIMSRoot — окреме налаштування, не discoverySettings.** `pathSettings.
+  LIMSRoot` (продукційний корінь інсталяції, потрібен переважно
+  `BRAVO_MAINTENANCE`) резолвиться `Resolve-BRAVOEffectiveLimsRoot`
+  НЕЗАЛЕЖНО від блоку `discoverySettings` — `discoverySettings.BravoRoot`
+  його НЕ встановлює і НЕ обходить. Якщо служби BRAVO немає, а LIMSRoot
+  дійсно потрібен (Maintenance), задайте явно `pathSettings.LIMSRoot`.
+  `BRAVO_ARCHIV` LIMSRoot не читає — там ця відсутність не блокує backup.
+
+Коли потрібне джерело задано override-ом, backup так само не залежить від
+служби.
 
 ---
 
