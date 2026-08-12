@@ -971,10 +971,11 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    4.4.2   (stable)
-developer: 4.5.0-dev.1 (development)
+master:    5.0.0   (stable)
+developer: 5.1.0-dev.1 (development)
 ```
 
-`4.5.0` — minor-цикл: у `developer` заплановано автоматичний discovery
-джерел архівації (нова функціональність зі збереженням сумісності), тому
-відкрито `4.5.0-dev.1`, а не `4.4.3-dev.1`.
+`5.1.0` — minor-цикл: цикл вже містить нову функціональність (Retention
+Safety Invariants — orphan-temp cleanup, retention audit, daily
+Recovery-тригер для автоматичної реставрації в межах вікна), а не лише
+виправлення, тому відкрито `5.1.0-dev.1`, а не `5.0.1-dev.1`.

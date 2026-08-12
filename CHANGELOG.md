@@ -1,5 +1,39 @@
 # Changelog
 
+## 5.1.0-dev.1 — 2026-08-12
+
+Opens the next development cycle on top of the 5.0.0 stable baseline
+(`master` merged into `developer`). Minor version: this cycle already
+carries new functionality (Retention Safety Invariants), not only fixes.
+No configuration schema, state schema, credential target, archive format,
+retention default, transfer protocol, or supported-OS contract changed.
+
+- Automatic restore recovery now guarantees a daily retry inside the
+  configured `Restore.WindowStart`/`WindowEnd` window regardless of
+  `Maintenance.DailyAt` or server reboots. The `Recovery` scheduled task
+  gains a second, daily trigger at `Restore.WindowStart` on the same task
+  definition (same `-RunMissedRestoreOnly` action as the existing
+  boot trigger) — previously only a boot-triggered retry (15 min for 8
+  hours) existed, so a server that stayed up with `Maintenance.DailyAt`
+  outside the restore window could skip a missed restore indefinitely.
+  The Maintenance.DailyAt-outside-window log message no longer claims the
+  daily path is lost and is downgraded from `WARNING` to `INFO`.
+- `Remove-BRAVOOrphanedTemporaryArchiveArtifacts` (orphaned `.work\*.partial*`
+  cleanup, introduced in 5.0.0) is now fail-visible: an enumeration error on
+  `.work` (access denied, I/O error) is logged and marks the operation
+  failed instead of silently being treated as "nothing to clean up" or "the
+  directory is empty."
+- Retention Safety Invariants: generation-aware backup retention now also
+  sweeps orphaned `.work\*.partial*` temporary archive artifacts left behind
+  by a killed process, raises the default minimum retained verified
+  generations from 1 to 2, and emits a single per-run retention audit log
+  line (evaluated/protected/deleted counts).
+- Regression coverage: a real COM `Schedule.Service` test proves the
+  `Recovery` task registers exactly one boot and one daily trigger; a
+  behavioral test proves orphan-sweep enumeration failures are fail-visible;
+  a composite test proves a corrupted newest backup generation cannot evict
+  an older verified-valid one from the retention-protected set.
+
 ## 5.0.0 — 2026-08-11
 
 Stable production release promoted from the verified 5.0.0-rc.1 candidate.
