@@ -1,12 +1,14 @@
 # Changelog
 
-## 5.0.0-rc.1 — 2026-08-11
+## 5.0.0 — 2026-08-11
 
-First release candidate for the 5.0.0 production cycle. This promotion
-contains the complete dev.19 functionality plus the release-blocking fixes
-found during log review and local acceptance checks. No configuration schema,
-state schema, credential target, archive format, retention default, transfer
-protocol, or supported-OS contract changed.
+Stable production release promoted from the verified 5.0.0-rc.1 candidate.
+The candidate passed the complete Windows CI pipeline and real-server checks
+on Windows Server 2022 / Windows PowerShell 5.1: archive generation and 7-Zip
+validation, SHA512 publication, SFTP upload, health-check, maintenance and
+notifications. No configuration schema, state schema, credential target,
+archive format, retention default, transfer protocol, or supported-OS contract
+changed during promotion.
 
 - Archive now performs the same fixed-drive free-space preflight as
   Maintenance before cleanup, local synchronization, VSS, or archive
