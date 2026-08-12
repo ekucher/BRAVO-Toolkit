@@ -7420,6 +7420,40 @@ try {
             -Condition (Test-Path -LiteralPath $orphanOutsideWorkFile) `
             -Name "BackupConsistency/OrphanTempSweepNeverTouchesFilesOutsideWorkDirectory" `
             -Failure "opублiкований .mdz поза .work\ не повинен зачіпатися orphan-sweep'ом, навіть якщо він старий"
+
+        # Регресія: SilentlyContinue на Get-ChildItem мовчки перетворював би
+        # access denied/I-O error на .work у "0 кандидатів" — функція
+        # рапортувала б успіх, хоча sweep фактично не відбувся. Локальний
+        # override Get-ChildItem усередині виклику через & $module { ... }
+        # реально підміняє команду, яку викликає дот-сорсена функція
+        # (перевірено емпірично в цій сесії) — той самий принцип, що
+        # InModuleScope+Mock, без нової залежності для репозиторію.
+        $orphanFailureRemovedCount = 0
+        $orphanFailureResult = & $orphanSweepModule {
+            param($Definitions, $Hours, $CountRef)
+            function Get-ChildItem {
+                param(
+                    [string]$LiteralPath,
+                    [switch]$File,
+                    [switch]$Force,
+                    [string]$Filter,
+                    [string]$ErrorAction
+                )
+                if ($LiteralPath -like '*\.work') {
+                    throw [System.UnauthorizedAccessException]::new(
+                        "simulated: access denied enumerating $LiteralPath"
+                    )
+                }
+                Microsoft.PowerShell.Management\Get-ChildItem @PSBoundParameters
+            }
+            Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
+                -ArchiveDefinitions $Definitions -RetentionHours $Hours -RemovedFileCount $CountRef
+        } $orphanSweepArchiveDefinitions 48 ([ref]$orphanFailureRemovedCount)
+
+        Test-BRAVOCondition `
+            -Condition ($orphanFailureResult -eq $false) `
+            -Name "BackupConsistency/OrphanTempSweepEnumerationFailureIsFailVisible" `
+            -Failure "помилка enumeration .work (access denied/I-O error) має повертати `$false (fail-visible), а не мовчки трактуватися як 0 кандидатів чи порожній каталог"
     } finally {
         if (Test-Path -LiteralPath $orphanSweepTestRoot) {
             Remove-Item -LiteralPath $orphanSweepTestRoot -Recurse -Force -ErrorAction SilentlyContinue

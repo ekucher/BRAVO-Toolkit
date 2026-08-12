@@ -2614,8 +2614,21 @@ function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
             $workDirectory = Join-Path $destination ".work"
             if (-not (Test-Path -LiteralPath $workDirectory -PathType Container)) { continue }
 
-            foreach ($file in @(Get-ChildItem -LiteralPath $workDirectory -File -Force `
-                    -Filter "*.partial*" -ErrorAction SilentlyContinue)) {
+            # Fail-visible enumeration: SilentlyContinue тут означав би, що
+            # access denied/I-O error на .work мовчки повертає 0 кандидатів,
+            # і функція рапортувала б успіх, хоча sweep фактично не відбувся.
+            try {
+                $partialFiles = @(
+                    Get-ChildItem -LiteralPath $workDirectory -File -Force `
+                        -Filter "*.partial*" -ErrorAction Stop
+                )
+            } catch {
+                $failed = $true
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося прочитати $workDirectory для orphan-sweep: $($_.Exception.Message)" -Level 'ERROR'
+                continue
+            }
+
+            foreach ($file in $partialFiles) {
                 if ($file.LastWriteTime -ge $cutoff) { continue }
                 if (-not (Test-BRAVOBackupArtifactPathSafe -Path $file.FullName -BackupRoot $workDirectory)) {
                     throw "orphan sweep candidate outside .work: $($file.FullName)"
@@ -2629,7 +2642,18 @@ function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
                     Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося видалити осиротілий артефакт $($file.FullName): $($_.Exception.Message)" -Level 'ERROR'
                 }
             }
-            if (@(Get-ChildItem -LiteralPath $workDirectory -Force -ErrorAction SilentlyContinue).Count -eq 0) {
+            # Так само fail-visible: помилка enumeration тут НЕ повинна
+            # трактуватися як "каталог порожній" — інакше рішення видалити (чи
+            # НЕ видалити, помилково повідомивши про це) .work спиралося б на
+            # недостовірний .Count.
+            try {
+                $remainingItems = @(Get-ChildItem -LiteralPath $workDirectory -Force -ErrorAction Stop)
+            } catch {
+                $failed = $true
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося перевірити, чи $workDirectory порожній: $($_.Exception.Message)" -Level 'ERROR'
+                continue
+            }
+            if ($remainingItems.Count -eq 0) {
                 try {
                     Remove-Item -LiteralPath $workDirectory -Force -ErrorAction Stop
                 } catch {
