@@ -3877,9 +3877,16 @@ try {
         -FunctionNames @(
             'Test-SettingEnabled',
             'Get-BRAVODryRunOptionalComponentPlan',
-            'Get-BRAVODryRunRangeIdPlan',
-            'Get-BRAVODryRunRootReadinessResults'
+            'Get-BRAVODryRunRangeIdPlan'
         )
+    # Get-BRAVOTaskRootReadinessResults більше НЕ живе в BRAVO_DRY_RUN.ps1 —
+    # спільна з BRAVO_TASKS_INSTALL.ps1 canonical точка інтерпретації
+    # (BRAVO.System, P1 safety-review: Installer теж має блокувати
+    # реєстрацію Maintenance/Recovery з нерозв'язаними коренями, а не лише
+    # DryRun-preflight). Реальний експортований модуль — без dot-source
+    # extraction, на відміну від функцій, що досі живуть у монолітних
+    # entrypoint-скриптах.
+    Import-Module -Name (Join-Path $root "modules\BRAVO.System\BRAVO.System.psd1") -Force -ErrorAction Stop
     $rangeIdSettingsWithoutFilePath = [pscustomobject]@{
         Enabled = $true
         ThresholdPercent = 80
@@ -4056,41 +4063,31 @@ try {
 
     # --- Root readiness: BackupRoot mandatory, LIMSRoot/SystemLogRoot
     # Archive-only WARN, Maintenance/Recovery-enabled FAIL.
-    $rootReadinessBackupUnresolved = & $dryRunPlanModule {
-        Get-BRAVODryRunRootReadinessResults `
-            -BackupRootSource 'Error' -BackupRootValue '' -BackupRootReason 'не задано' `
-            -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS' -LimsRootReason 'ok' `
-            -SystemLogRootSource 'AutoFromLIMSRoot' -SystemLogRootValue 'D:\LIMS\ARCHIV\LOGS' -SystemLogRootReason 'ok' `
-            -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $false
-    }
-    $rootReadinessArchiveOnly = & $dryRunPlanModule {
-        Get-BRAVODryRunRootReadinessResults `
-            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
-            -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
-            -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
-            -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $false
-    }
-    $rootReadinessMaintenanceEnabled = & $dryRunPlanModule {
-        Get-BRAVODryRunRootReadinessResults `
-            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
-            -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
-            -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
-            -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $false
-    }
-    $rootReadinessRecoveryEnabled = & $dryRunPlanModule {
-        Get-BRAVODryRunRootReadinessResults `
-            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
-            -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
-            -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
-            -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $true
-    }
-    $rootReadinessAllResolved = & $dryRunPlanModule {
-        Get-BRAVODryRunRootReadinessResults `
-            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
-            -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS' -LimsRootReason 'ok' `
-            -SystemLogRootSource 'AutoFromLIMSRoot' -SystemLogRootValue 'D:\LIMS\ARCHIV\LOGS' -SystemLogRootReason 'ok' `
-            -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $true
-    }
+    $rootReadinessBackupUnresolved = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'Error' -BackupRootValue '' -BackupRootReason 'не задано' `
+        -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS' -LimsRootReason 'ok' `
+        -SystemLogRootSource 'AutoFromLIMSRoot' -SystemLogRootValue 'D:\LIMS\ARCHIV\LOGS' -SystemLogRootReason 'ok' `
+        -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $false
+    $rootReadinessArchiveOnly = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+        -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+        -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+        -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $false
+    $rootReadinessMaintenanceEnabled = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+        -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+        -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+        -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $false
+    $rootReadinessRecoveryEnabled = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+        -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+        -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+        -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $true
+    $rootReadinessAllResolved = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+        -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS' -LimsRootReason 'ok' `
+        -SystemLogRootSource 'AutoFromLIMSRoot' -SystemLogRootValue 'D:\LIMS\ARCHIV\LOGS' -SystemLogRootReason 'ok' `
+        -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $true
     Test-BRAVOCondition `
         -Condition (
             @($rootReadinessBackupUnresolved | Where-Object { $_.Label -like 'BackupRoot*' }).Status -eq 'FAIL'
@@ -4125,6 +4122,46 @@ try {
         ) `
         -Name 'DryRun/ResolvedRootsAreAlwaysPass' `
         -Failure 'визначені LIMSRoot/SystemLogRoot/BackupRoot мають бути PASS незалежно від Maintenance/Recovery'
+
+    # P1 (safety-review): BRAVO_TASKS_INSTALL.ps1 сам має блокувати
+    # реєстрацію Maintenance/Recovery з нерозв'язаними LIMSRoot/SystemLogRoot
+    # (не лише BRAVO_SETUP через свій перший DryRun-preflight). SystemLogRoot
+    # окремо від LIMSRoot неможливо відтворити через реальне завантаження
+    # BRAVO.config (Resolve-BRAVOEffectiveSystemLogRoot успадковує помилку
+    # ЛИШЕ від непорожнього EffectiveLimsRoot, а некоректне ЯВНЕ значення
+    # відхиляється ще раніше в BRAVO_CONFIG_LOADER.ps1) — тому цей конкретний
+    # розріз перевіряється на рівні самої canonical функції; наскрізна
+    # інтеграція з Test-SchedulerConfiguration перевіряється нижче через
+    # реальний subprocess BRAVO_TASKS_INSTALL.ps1 -ValidateOnly (LIMSRoot
+    # зламаний через неіснуючу службу).
+    $rootReadinessSystemLogRootAlone = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+        -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS-NEW' -LimsRootReason 'ok' `
+        -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'імітована помилка' `
+        -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $false
+    $systemLogRootAloneRow = @($rootReadinessSystemLogRootAlone | Where-Object { $_.Label -like 'SystemLogRoot*' })
+    $limsRootStillPassRow = @($rootReadinessSystemLogRootAlone | Where-Object { $_.Label -like 'LIMSRoot*' })
+    Test-BRAVOCondition `
+        -Condition (
+            $systemLogRootAloneRow.Status -eq 'FAIL' -and
+            $systemLogRootAloneRow.Detail -match 'BRAVO_MAINTENANCE' -and
+            $limsRootStillPassRow.Status -eq 'PASS'
+        ) `
+        -Name 'Scheduler/MaintenanceEnabledMissingSystemLogRootFailsValidation' `
+        -Failure "SystemLogRoot=Error окремо від резолвленого LIMSRoot має дати FAIL з іменем BRAVO_MAINTENANCE, а LIMSRoot лишитись PASS; отримано SystemLogRoot.Status=$($systemLogRootAloneRow.Status) LIMSRoot.Status=$($limsRootStillPassRow.Status)"
+
+    $rootReadinessRecoveryOnlyName = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+        -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+        -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+        -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $true
+    Test-BRAVOCondition `
+        -Condition (
+            @($rootReadinessRecoveryOnlyName | Where-Object { $_.Label -like 'LIMSRoot*' }).Detail -match 'BRAVO_RESTORE_RECOVERY' -and
+            @($rootReadinessRecoveryOnlyName | Where-Object { $_.Label -like 'LIMSRoot*' }).Detail -notmatch 'BRAVO_MAINTENANCE'
+        ) `
+        -Name 'Scheduler/RootFailureNamesOnlyTheActuallyEnabledTaskType' `
+        -Failure 'коли увімкнено лише Recovery (Maintenance вимкнено), повідомлення має називати ЛИШЕ BRAVO_RESTORE_RECOVERY, а не обидва task type одразу'
 
     Test-BRAVOCondition `
         -Condition (
@@ -10424,6 +10461,124 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition ($LASTEXITCODE -eq 0) `
         -Name "Scheduler/ValidateOnly" `
         -Failure "BRAVO_TASKS_INSTALL повернув код $LASTEXITCODE"
+
+    # P1 (safety-review): наскрізна перевірка, що BRAVO_TASKS_INSTALL.ps1
+    # САМ (не лише BRAVO_SETUP через свій перший DryRun-preflight) блокує
+    # реєстрацію Maintenance/Recovery, коли effectiveLimsRoot/systemLogRoot
+    # не резолвляться — інакше ручний прямий виклик міг зареєструвати
+    # завдання, приречене на негайний exit 30 при кожному запуску, і
+    # завершитися "Статус: УСПІШНО".
+    #
+    # Фікстура НЕ може підставити довільний неабсолютний LIMSRoot/
+    # SystemLogRoot напряму: BRAVO_CONFIG_LOADER.ps1 відхиляє некоректне
+    # ЯВНЕ значення ще ДО Resolve-BRAVOEffectiveLimsRoot окремою (і
+    # навмисно відмінною) помилкою. Єдиний реалістичний шлях до
+    # Source=Error — AUTO-виявлення (pathSettings.LIMSRoot="") служби, якої
+    # не існує: підміна maintenanceSettings.Services.BravoName на
+    # завідомо неіснуюче ім'я детерміновано відтворює "службу BRAVO не
+    # знайдено", незалежно від того, чи встановлена реальна служба BRAVO на
+    # машині, де виконується цей self-test.
+    function New-BRAVOSelfTestSchedulerFixtureConfig {
+        param(
+            [bool]$BreakLimsRootViaFakeService,
+            [bool]$MaintenanceEnabled = $true,
+            [bool]$RecoveryEnabled = $true
+        )
+        $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SCHED_FIXTURE_' + [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($fixtureRoot)
+        $fixtureConfigPath = Join-Path $fixtureRoot 'BRAVO.config'
+        $fixtureConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+
+        # BackupRoot: завжди явний і валідний, незалежний від LIMSRoot/
+        # service discovery — інакше безумовний throw BRAVO.config на
+        # нерозв'язаний BackupRoot заглушив би саме те, що ця фікстура
+        # перевіряє.
+        $fixtureBackupRootLiteral = $fixtureRoot.Replace("'", "''")
+        $fixtureConfigText = [regex]::Replace(
+            $fixtureConfigText, '(?m)^(\s*BackupRoot\s*=\s*)""\s*$', "`$1'$fixtureBackupRootLiteral'", 1)
+
+        if ($BreakLimsRootViaFakeService) {
+            $fixtureConfigText = [regex]::Replace(
+                $fixtureConfigText,
+                '(?m)^(\s*BravoName\s*=\s*)"BRAVO"\s*$',
+                '$1"BRAVO_SELFTEST_NONEXISTENT_SERVICE_XYZ"',
+                1)
+        }
+
+        $fixtureMaintenanceFlag = if ($MaintenanceEnabled) { '$true' } else { '$false' }
+        $fixtureConfigText = [regex]::Replace(
+            $fixtureConfigText, '(?s)(Maintenance = @\{\r?\n\s*Enabled = )\$true', "`$1$fixtureMaintenanceFlag", 1)
+        $fixtureRecoveryFlag = if ($RecoveryEnabled) { '$true' } else { '$false' }
+        $fixtureConfigText = [regex]::Replace(
+            $fixtureConfigText, '(?s)(Recovery = @\{\r?\n\s*Enabled = )\$true', "`$1$fixtureRecoveryFlag", 1)
+
+        [IO.File]::WriteAllText($fixtureConfigPath, $fixtureConfigText, (New-Object Text.UTF8Encoding($false)))
+        return [pscustomobject]@{ ConfigPath = $fixtureConfigPath; Root = $fixtureRoot }
+    }
+    function Invoke-BRAVOSelfTestTaskInstallValidateOnly {
+        param([string]$ConfigPath)
+        # Викликається лише як зовнішній процес: BRAVO_TASKS_INSTALL.ps1
+        # завершується через Complete-BRAVOHelperLog -ExitCode, і саме
+        # stderr/exit code (не повернене значення функції) є контрактом,
+        # який реально перевіряє production Task Scheduler.
+        $previousSchedFixtureErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $fixtureOutput = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File $taskInstaller -ConfigPath $ConfigPath -ValidateOnly 2>&1
+        } finally {
+            $ErrorActionPreference = $previousSchedFixtureErrorActionPreference
+        }
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($fixtureOutput | Out-String) }
+    }
+
+    $schedFixtureMaintenance = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $true -MaintenanceEnabled $true -RecoveryEnabled $false
+    $schedResultMaintenance = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureMaintenance.ConfigPath
+    Test-BRAVOCondition `
+        -Condition (
+            $schedResultMaintenance.ExitCode -ne 0 -and
+            $schedResultMaintenance.Output -match 'BRAVO_MAINTENANCE' -and
+            $schedResultMaintenance.Output -match 'LIMSRoot'
+        ) `
+        -Name 'Scheduler/MaintenanceEnabledMissingLimsRootFailsValidation' `
+        -Failure "BRAVO_TASKS_INSTALL.ps1 -ValidateOnly з Maintenance.Enabled=true і нерозв'язаним LIMSRoot має завершитись ненульовим кодом і назвати BRAVO_MAINTENANCE+LIMSRoot; ExitCode=$($schedResultMaintenance.ExitCode)"
+
+    $schedFixtureRecovery = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $true -MaintenanceEnabled $false -RecoveryEnabled $true
+    $schedResultRecovery = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureRecovery.ConfigPath
+    Test-BRAVOCondition `
+        -Condition (
+            $schedResultRecovery.ExitCode -ne 0 -and
+            $schedResultRecovery.Output -match 'BRAVO_RESTORE_RECOVERY'
+        ) `
+        -Name 'Scheduler/RecoveryEnabledMissingRootsFailsValidation' `
+        -Failure "BRAVO_TASKS_INSTALL.ps1 -ValidateOnly з Recovery.Enabled=true і нерозв'язаними коренями має завершитись ненульовим кодом і назвати BRAVO_RESTORE_RECOVERY; ExitCode=$($schedResultRecovery.ExitCode)"
+
+    $schedFixtureDisabled = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $true -MaintenanceEnabled $false -RecoveryEnabled $false
+    $schedResultDisabled = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureDisabled.ConfigPath
+    Test-BRAVOCondition `
+        -Condition ($schedResultDisabled.ExitCode -eq 0) `
+        -Name 'Scheduler/ArchiveOnlyMissingRootsDoesNotBlockBackupTask' `
+        -Failure "Backup (Archive) не залежить від LIMSRoot/SystemLogRoot — має пройти -ValidateOnly навіть коли вони не резолвляться; ExitCode=$($schedResultDisabled.ExitCode) Output=$($schedResultDisabled.Output.Substring(0, [Math]::Min(500, $schedResultDisabled.Output.Length)))"
+    Test-BRAVOCondition `
+        -Condition ($schedResultDisabled.ExitCode -eq 0 -and $schedResultDisabled.Output -match 'BRAVO_ARCHIV_HEALTH') `
+        -Name 'Scheduler/HealthMissingLimsRootDoesNotBlock' `
+        -Failure "Health не залежить від LIMSRoot — реєстрація має завершитись успішно навіть коли він не резолвляться; ExitCode=$($schedResultDisabled.ExitCode)"
+    Test-BRAVOCondition `
+        -Condition ($schedResultDisabled.ExitCode -eq 0) `
+        -Name 'Scheduler/DisabledMaintenanceRecoveryDoNotRequireRoots' `
+        -Failure "Maintenance.Enabled=false і Recovery.Enabled=false разом мають повністю знімати вимогу до LIMSRoot/SystemLogRoot; ExitCode=$($schedResultDisabled.ExitCode)"
+    foreach ($schedFixtureRootToClean in @(
+        $schedFixtureMaintenance.Root, $schedFixtureRecovery.Root, $schedFixtureDisabled.Root
+    )) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$schedFixtureRootToClean) -and
+            (Test-Path -LiteralPath $schedFixtureRootToClean -PathType Container)) {
+            Remove-Item -LiteralPath $schedFixtureRootToClean -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # ===== RUNTIME / DATA ROOTS, EFFECTIVE CONFIGPATH, SYSTEM PREFLIGHT =====
     # (ТЗ «production-grade runtime, Task Scheduler, log rotation…», §93-§116)

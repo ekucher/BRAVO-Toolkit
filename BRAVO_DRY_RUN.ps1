@@ -24,6 +24,10 @@ $dryRunConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.
 Import-Module -Name $dryRunConsoleModulePath -ErrorAction Stop
 $notificationHelpersPath = Join-Path $PSScriptRoot "modules\BRAVO.Notifications\BRAVO.Notifications.psd1"
 Import-Module -Name $notificationHelpersPath -ErrorAction Stop
+# Get-BRAVOTaskRootReadinessResults: canonical LIMSRoot/SystemLogRoot/
+# BackupRoot readiness, спільна з BRAVO_TASKS_INSTALL.ps1 (не дублюється).
+$dryRunSystemModulePath = Join-Path $PSScriptRoot "modules\BRAVO.System\BRAVO.System.psd1"
+Import-Module -Name $dryRunSystemModulePath -ErrorAction Stop
 
 # Безпечна симуляція BRAVO/VETOFFICE:
 # - не створює архіви, не копіює, не синхронізує і не видаляє файли;
@@ -267,94 +271,6 @@ function Get-BRAVODryRunConfiguredServiceState {
         Disabled = ($startType -ieq 'Disabled')
         Name = if ($null -ne $service) { [string]$service.Name } else { $null }
     }
-}
-
-function Get-BRAVODryRunRootReadinessResults {
-    # Обчислює PASS/WARN/FAIL для LIMSRoot/SystemLogRoot/BackupRoot без
-    # побічних ефектів (Add-DryRunResult) — так само, як
-    # Get-BRAVODryRunOptionalComponentPlan, чиста функція для тестованості.
-    #
-    # BackupRoot — mandatory для BRAVO_ARCHIV/BRAVO_ARCHIV_HEALTH (обидва
-    # реально пишуть/читають туди): невизначений завжди FAIL, незалежно від
-    # служб чи увімкнених завдань.
-    #
-    # LIMSRoot/SystemLogRoot — НЕ mandatory для BRAVO_ARCHIV/
-    # BRAVO_ARCHIV_HEALTH (safety-review "service state != backup policy":
-    # жоден з них LIMSRoot не читає, SystemLogRoot читає лише
-    # BRAVO_MAINTENANCE), тому невизначений корінь сам по собі — НЕ FAIL для
-    # backup readiness. Але BRAVO_MAINTENANCE/BRAVO_RESTORE_RECOVERY реально
-    # керують службою й ротацією системних журналів — якщо ЦІ завдання
-    # увімкнені в schedulerSettings, невизначений корінь є справжньою
-    # readiness-помилкою САМЕ для них і рапортується як FAIL, а не мовчазний
-    # PASS чи непомітний WARN.
-    # Жоден зі string-параметрів НЕ Mandatory (той самий урок, що вже
-    # закрито для Resolve-BRAVOInstallationDiscovery -LimsRoot): порожній
-    # рядок — легітимне, ОЧІКУВАНЕ значення (unresolved root), а
-    # PowerShell's Mandatory-string-параметр відхиляє порожній рядок
-    # окремою помилкою біндингу, а не просто "не передано".
-    param(
-        [string]$BackupRootSource,
-        [string]$BackupRootValue,
-        [string]$BackupRootReason,
-        [string]$LimsRootSource,
-        [string]$LimsRootValue,
-        [string]$LimsRootReason,
-        [string]$SystemLogRootSource,
-        [string]$SystemLogRootValue,
-        [string]$SystemLogRootReason,
-        [bool]$MaintenanceTaskEnabled,
-        [bool]$RecoveryTaskEnabled
-    )
-
-    $results = New-Object System.Collections.Generic.List[object]
-    $backupRootUnresolved = ($BackupRootSource -eq 'Error' -or [string]::IsNullOrWhiteSpace($BackupRootValue))
-    if ($backupRootUnresolved) {
-        $results.Add([pscustomobject]@{
-            Status = 'FAIL'; Category = 'Корені'; Label = "BackupRoot [$BackupRootSource]"
-            Detail = "не визначено: $BackupRootReason. BackupRoot обов'язковий для BRAVO_ARCHIV/BRAVO_ARCHIV_HEALTH."
-        })
-    } else {
-        $results.Add([pscustomobject]@{
-            Status = 'PASS'; Category = 'Корені'; Label = "BackupRoot [$BackupRootSource]"; Detail = $BackupRootValue
-        })
-    }
-
-    $maintenanceOrRecoveryEnabled = $MaintenanceTaskEnabled -or $RecoveryTaskEnabled
-    foreach ($rootReport in @(
-        @{ Name = 'LIMSRoot'; Source = $LimsRootSource; Value = $LimsRootValue; Reason = $LimsRootReason },
-        @{ Name = 'SystemLogRoot'; Source = $SystemLogRootSource; Value = $SystemLogRootValue; Reason = $SystemLogRootReason }
-    )) {
-        $rootUnresolved = ([string]$rootReport.Source -eq 'Error' -or [string]::IsNullOrWhiteSpace([string]$rootReport.Value))
-        if (-not $rootUnresolved) {
-            $results.Add([pscustomobject]@{
-                Status = 'PASS'; Category = 'Корені'
-                Label = "$($rootReport.Name) [$($rootReport.Source)]"; Detail = $rootReport.Value
-            })
-            continue
-        }
-        if ($maintenanceOrRecoveryEnabled) {
-            $results.Add([pscustomobject]@{
-                Status = 'FAIL'; Category = 'Корені'
-                Label = "$($rootReport.Name) [$($rootReport.Source)]"
-                Detail = (
-                    "не визначено: $($rootReport.Reason). " +
-                    "BRAVO_MAINTENANCE/BRAVO_RESTORE_RECOVERY увімкнені в schedulerSettings і реально потребують " +
-                    "$($rootReport.Name) — задайте pathSettings.$($rootReport.Name) явно або встановіть службу BRAVO."
-                )
-            })
-        } else {
-            $results.Add([pscustomobject]@{
-                Status = 'WARN'; Category = 'Корені'
-                Label = "$($rootReport.Name) [$($rootReport.Source)]"
-                Detail = (
-                    "не визначено: $($rootReport.Reason). " +
-                    "BRAVO_ARCHIV/BRAVO_ARCHIV_HEALTH не потребують $($rootReport.Name) — backup лишається дозволеним; " +
-                    "Maintenance/Recovery наразі вимкнені в schedulerSettings."
-                )
-            })
-        }
-    }
-    return $results.ToArray()
 }
 
 function Get-BRAVODryRunOptionalComponentPlan {
@@ -1132,13 +1048,14 @@ try {
     Add-DryRunResult PASS "Корені" "RuntimeLogRoot (script logs)" $dryRunRuntimeLogRoot
 
     # LIMSRoot/SystemLogRoot/BackupRoot readiness — чиста функція
-    # Get-BRAVODryRunRootReadinessResults (вище) обчислює PASS/WARN/FAIL,
-    # тут лише рендеримо через Add-DryRunResult.
+    # Get-BRAVOTaskRootReadinessResults (BRAVO.System, спільна з
+    # BRAVO_TASKS_INSTALL.ps1) обчислює PASS/WARN/FAIL, тут лише рендеримо
+    # через Add-DryRunResult.
     $maintenanceTaskEnabled = ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Maintenance -and
         (Test-SettingEnabled $schedulerSettings.Maintenance.Enabled))
     $recoveryTaskEnabled = ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Recovery -and
         (Test-SettingEnabled $schedulerSettings.Recovery.Enabled))
-    $rootReadinessResults = Get-BRAVODryRunRootReadinessResults `
+    $rootReadinessResults = Get-BRAVOTaskRootReadinessResults `
         -BackupRootSource ([string]$global:backupRootResult.Source) `
         -BackupRootValue $dryRunBackupRoot `
         -BackupRootReason ([string]$global:backupRootResult.Reason) `

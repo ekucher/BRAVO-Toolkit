@@ -614,6 +614,53 @@ function Test-SchedulerConfiguration {
          [int]$schedulerSettings.Recovery.RetryDurationHours -lt 1)) {
         throw "Recovery retry має мати інтервал і тривалість не менше 1"
     }
+
+    # P1 (safety-review): BRAVO_MAINTENANCE/BRAVO_RESTORE_RECOVERY реально
+    # керують службою й ротацією системних журналів — якщо вони увімкнені, а
+    # effectiveLimsRoot/systemLogRoot не резолвляться, реєстрація завдання
+    # гарантовано створює завдання, приречене на негайний exit 30 при
+    # КОЖНОМУ запуску (BRAVO_MAINTENANCE.ps1 має власну guard-перевірку
+    # одразу після Import-BravoConfiguration). BRAVO_SETUP вже захищений
+    # своїм першим DryRun-preflight (той самий Get-BRAVOTaskRootReadinessResults),
+    # але цей скрипт можна викликати напряму, в обхід Setup — тому перевірка
+    # МАЄ стояти й тут, а не лише в DryRun. Спільна функція (BRAVO.System,
+    # уже імпортована вище) — та сама, що BRAVO_DRY_RUN.ps1, щоб правило не
+    # розходилось між ними.
+    #
+    # НЕ throw на BackupRoot тут: BRAVO.config уже безумовно throw-ить на
+    # нього під час Import-BravoConfiguration (виконання не дійшло б навіть
+    # до цієї функції, якби BackupRoot не резолвився) — дублювати цю
+    # перевірку нема сенсу. Backup/Health/BAZASync НЕ вимагають LIMSRoot/
+    # SystemLogRoot (service state != backup policy) — їх реєстрація
+    # лишається дозволеною незалежно від цих коренів.
+    $maintenanceTaskEnabled = [bool]$schedulerSettings.Maintenance.Enabled
+    $recoveryTaskEnabled = [bool]$schedulerSettings.Recovery.Enabled
+    if ($maintenanceTaskEnabled -or $recoveryTaskEnabled) {
+        $taskRootReadiness = Get-BRAVOTaskRootReadinessResults `
+            -BackupRootSource ([string]$global:backupRootResult.Source) `
+            -BackupRootValue ([string]$global:backupRootPath) `
+            -BackupRootReason ([string]$global:backupRootResult.Reason) `
+            -LimsRootSource ([string]$global:limsRootResult.Source) `
+            -LimsRootValue ([string]$global:effectiveLimsRoot) `
+            -LimsRootReason ([string]$global:limsRootResult.Reason) `
+            -SystemLogRootSource ([string]$global:systemLogRootResult.Source) `
+            -SystemLogRootValue ([string]$global:systemLogRoot) `
+            -SystemLogRootReason ([string]$global:systemLogRootResult.Reason) `
+            -MaintenanceTaskEnabled $maintenanceTaskEnabled `
+            -RecoveryTaskEnabled $recoveryTaskEnabled
+        $blockingRootFailures = @(
+            $taskRootReadiness | Where-Object {
+                $_.Status -eq 'FAIL' -and ($_.Label -like 'LIMSRoot*' -or $_.Label -like 'SystemLogRoot*')
+            }
+        )
+        if ($blockingRootFailures.Count -gt 0) {
+            throw (
+                "Реєстрацію Maintenance/Recovery заблоковано — обов'язковий корінь не визначено: " +
+                (($blockingRootFailures | ForEach-Object { "$($_.Label): $($_.Detail)" }) -join ' | ')
+            )
+        }
+    }
+
     if (-not (Test-Path -Path $ResolvedConfigPath -PathType Leaf)) {
         throw "Файл конфігурації не знайдено"
     }
