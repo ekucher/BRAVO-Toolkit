@@ -9202,6 +9202,183 @@ try {
         -Name "Maintenance/RangeIdMissingPreservesWarningNotification" `
         -Failure "Send-SlackAlert -IsCritical (доставка сповіщення навіть у errors_only) має й далі викликатися рівно один раз для відсутнього Range ID — розв'язано лише виконання-severity, не доставка"
 
+    # --- Range ID bounded-очікування після запуску служби BRAVO: служба
+    # створює range_id_log.json асинхронно після старту, тому одразу після
+    # Start-Service файла може ще не бути — Wait-BRAVORangeIdLogFile чекає
+    # обмежений час замість негайного false WARNING. Поведінкові тести на
+    # реальній екстракції функції; Start-Sleep підмінюється в module scope,
+    # щоб тести були детермінованими і не спали по-справжньому.
+    $rangeIdWaitModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('Wait-BRAVORangeIdLogFile')
+    # Корінь уже прибраний finally-блоком manifest-storage тестів вище —
+    # створюємо заново для реальних файлів цих тестів і прибираємо в кінці.
+    [void][IO.Directory]::CreateDirectory($manifestStorageTestRoot)
+
+    # 1) Файл уже існує (звичайний maintenance) — повернення одразу,
+    # Start-Sleep не викликається взагалі: жодної доданої затримки.
+    $rangeIdExistingFilePath = Join-Path $manifestStorageTestRoot 'existing-range-id.json'
+    Set-Content -LiteralPath $rangeIdExistingFilePath -Value '{}' -Encoding Ascii
+    $rangeIdWaitExistingCapture = & $rangeIdWaitModule {
+        param($Path)
+        $script:RangeIdWaitSleepCalls = 0
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            $null = $Message; $null = $Level; $null = $NoTimestamp; $null = $NoConsole
+        }
+        function Start-Sleep { param($Seconds) $null = $Seconds; $script:RangeIdWaitSleepCalls++ }
+        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 30 -IntervalSeconds 5
+        [pscustomobject]@{ Appeared = $appeared; SleepCalls = $script:RangeIdWaitSleepCalls }
+    } $rangeIdExistingFilePath
+    Test-BRAVOCondition `
+        -Condition ($rangeIdWaitExistingCapture.Appeared -and $rangeIdWaitExistingCapture.SleepCalls -eq 0) `
+        -Name "Maintenance/RangeIdWaitSkipsDelayWhenFileExists" `
+        -Failure "з наявним range_id_log.json Wait-BRAVORangeIdLogFile має повертати true одразу, без жодного Start-Sleep — звичайний maintenance не отримує доданої затримки"
+
+    # 2) Файл з'являється ПІД ЧАС очікування (BRAVO створив його асинхронно
+    # після старту): фейковий Start-Sleep створює файл — детермінована
+    # модель "файл з'явився через 5-20 сек.". Результат true, без WARNING.
+    $rangeIdLateFilePath = Join-Path $manifestStorageTestRoot 'late-range-id.json'
+    if (Test-Path -LiteralPath $rangeIdLateFilePath) { Remove-Item -LiteralPath $rangeIdLateFilePath -Force }
+    $rangeIdWaitLateCapture = & $rangeIdWaitModule {
+        param($Path)
+        $script:RangeIdWaitLogLevels = @()
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            $null = $Message; $null = $NoTimestamp; $null = $NoConsole
+            $script:RangeIdWaitLogLevels += $Level
+        }
+        function Start-Sleep {
+            param($Seconds)
+            $null = $Seconds
+            Set-Content -LiteralPath $Path -Value '{}' -Encoding Ascii
+        }
+        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 30 -IntervalSeconds 5
+        [pscustomobject]@{ Appeared = $appeared; Levels = $script:RangeIdWaitLogLevels }
+    } $rangeIdLateFilePath
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdWaitLateCapture.Appeared -and
+            @($rangeIdWaitLateCapture.Levels | Where-Object { $_ -eq 'WARNING' }).Count -eq 0 -and
+            @($rangeIdWaitLateCapture.Levels | Where-Object { $_ -eq 'INFO' }).Count -eq 2
+        ) `
+        -Name "Maintenance/RangeIdWaitDetectsLateFile" `
+        -Failure "якщо файл з'явився під час bounded-очікування, Wait-BRAVORangeIdLogFile має повернути true з двома INFO (початок очікування + поява файла) і жодного WARNING — штатна перевірка далі йде без false WARNING"
+
+    # 3) Файл так і не з'явився: цикл обмежений дедлайном (реальний таймаут
+    # 1 сек. — тест швидкий), повертає false; сам helper WARNING не пише
+    # (рівно один фінальний WARNING формує Test-RangeIdUsage за таймаутом).
+    $rangeIdNeverFilePath = Join-Path $manifestStorageTestRoot 'never-range-id.json'
+    if (Test-Path -LiteralPath $rangeIdNeverFilePath) { Remove-Item -LiteralPath $rangeIdNeverFilePath -Force }
+    $rangeIdWaitTimeoutCapture = & $rangeIdWaitModule {
+        param($Path)
+        $script:RangeIdWaitLogLevels = @()
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            $null = $Message; $null = $NoTimestamp; $null = $NoConsole
+            $script:RangeIdWaitLogLevels += $Level
+        }
+        function Start-Sleep { param($Seconds) $null = $Seconds }
+        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 1 -IntervalSeconds 1
+        [pscustomobject]@{ Appeared = $appeared; Levels = $script:RangeIdWaitLogLevels }
+    } $rangeIdNeverFilePath
+    Test-BRAVOCondition `
+        -Condition (
+            -not $rangeIdWaitTimeoutCapture.Appeared -and
+            @($rangeIdWaitTimeoutCapture.Levels | Where-Object { $_ -eq 'WARNING' }).Count -eq 0
+        ) `
+        -Name "Maintenance/RangeIdWaitTimesOutBounded" `
+        -Failure "якщо файл не з'явився до дедлайну, Wait-BRAVORangeIdLogFile має повернути false за скінченний час і не писати WARNING сам — інакше було б два WARNING за один цикл"
+
+    # 4) Після невдалого очікування Test-RangeIdUsage -WaitedForFileSeconds
+    # формує саме таймаут-текст (лог/Slack — один рядок, Reason кроку — два).
+    $rangeIdTimeoutMessageCapture = & $rangeIdTestModule {
+        param($Path)
+        $script:RangeIdWarningMessages = @()
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            $null = $NoTimestamp; $null = $NoConsole
+            if ($Level -eq 'WARNING') { $script:RangeIdWarningMessages += [string]$Message }
+        }
+        function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+        $result = Test-RangeIdUsage -Path $Path -ThresholdPercent 90 -WaitedForFileSeconds 30
+        [pscustomobject]@{
+            HasIssue = $result.HasIssue
+            Reason = $result.Reason
+            WarningMessages = $script:RangeIdWarningMessages
+        }
+    } $rangeIdMissingPath
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdTimeoutMessageCapture.HasIssue -and
+            [string]$rangeIdTimeoutMessageCapture.Reason -eq "Файл контролю діапазонів ID не з'явився протягом 30 сек. після запуску BRAVO:`n$rangeIdMissingPath" -and
+            @($rangeIdTimeoutMessageCapture.WarningMessages).Count -eq 1 -and
+            [string]@($rangeIdTimeoutMessageCapture.WarningMessages)[0] -eq "Файл контролю діапазонів ID не з'явився протягом 30 сек. після запуску BRAVO: $rangeIdMissingPath"
+        ) `
+        -Name "Maintenance/RangeIdTimeoutWarningNamesStartupWait" `
+        -Failure "після марного bounded-очікування WARNING має пояснювати таймаут появи файла після запуску BRAVO (рівно один WARNING), а Reason кроку — та сама мітка + шлях окремим рядком"
+
+    # 5) Структурно: очікування підключене саме в гейті [8/8] і застосовує
+    # 30-сек. таймаут ЛИШЕ коли службу BRAVO запустив цей прогін; прапорець
+    # ставиться рівно один раз — у success-гілці запуску служби BRAVO.
+    $rangeIdWaitTryIndex = $maintenanceScriptTextForManifestStorage.IndexOf('усе від Range ID до Send-FinalReport')
+    $rangeIdWaitGateIndex = if ($rangeIdWaitTryIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.IndexOf(
+            'if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {',
+            $rangeIdWaitTryIndex)
+    } else { -1 }
+    $rangeIdWaitGateWindow = if ($rangeIdWaitGateIndex -ge 0) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $rangeIdWaitGateIndex,
+            [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $rangeIdWaitGateIndex))
+    } else { '' }
+    $rangeIdStartFlagAssignments = [regex]::Matches(
+        $maintenanceScriptTextForManifestStorage,
+        [regex]::Escape('$script:bravoServiceStartedThisRun = $true'))
+    $rangeIdStartSuccessIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
+        'Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"')
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdWaitGateIndex -ge 0 -and
+            $rangeIdWaitGateWindow.Contains('$rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }') -and
+            $rangeIdWaitGateWindow.Contains('Wait-BRAVORangeIdLogFile') -and
+            $rangeIdWaitGateWindow.Contains('-WaitedForFileSeconds $rangeIdWaitedForFileSeconds') -and
+            $rangeIdStartFlagAssignments.Count -eq 1 -and
+            $rangeIdStartSuccessIndex -ge 0 -and
+            $rangeIdStartFlagAssignments[0].Index -gt $rangeIdStartSuccessIndex -and
+            $rangeIdStartFlagAssignments[0].Index - $rangeIdStartSuccessIndex -lt 300 -and
+            $maintenanceScriptTextForManifestStorage.Contains('$script:bravoServiceStartedThisRun = $false')
+        ) `
+        -Name "Maintenance/RangeIdWaitOnlyAfterBravoServiceStart" `
+        -Failure "30-сек. bounded-очікування має вмикатися лише коли `$script:bravoServiceStartedThisRun=true, а сам прапорець — ставитися рівно один раз у success-гілці запуску служби BRAVO і скидатися у false на старті прогону"
+
+    # 6) Guard тексту helper-а: без WARNING/Slack усередині (гарантія рівно
+    # одного WARNING за цикл), цикл жорстко обмежений дедлайном, обидва
+    # Test-Path — на тому самому -LiteralPath $Path (без fallback-пошуку).
+    $rangeIdWaitFunctionStart = $maintenanceScriptTextForManifestStorage.IndexOf('function Wait-BRAVORangeIdLogFile')
+    $rangeIdWaitFunctionEnd = $maintenanceScriptTextForManifestStorage.IndexOf('function Test-RangeIdUsage', [Math]::Max(0, $rangeIdWaitFunctionStart))
+    $rangeIdWaitFunctionText = if ($rangeIdWaitFunctionStart -ge 0 -and $rangeIdWaitFunctionEnd -gt $rangeIdWaitFunctionStart) {
+        $maintenanceScriptTextForManifestStorage.Substring(
+            $rangeIdWaitFunctionStart, $rangeIdWaitFunctionEnd - $rangeIdWaitFunctionStart)
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $rangeIdWaitFunctionText.Length -gt 0 -and
+            -not $rangeIdWaitFunctionText.Contains('-Level "WARNING"') -and
+            -not $rangeIdWaitFunctionText.Contains('Send-SlackAlert') -and
+            $rangeIdWaitFunctionText.Contains('while ((Get-Date) -lt $deadline)') -and
+            ([regex]::Matches($rangeIdWaitFunctionText, [regex]::Escape('Test-Path -LiteralPath $Path -PathType Leaf')).Count -eq 2) -and
+            ([regex]::Matches($rangeIdWaitFunctionText, 'Test-Path').Count -eq 2)
+        ) `
+        -Name "Maintenance/RangeIdWaitHelperIsBoundedAndSilent" `
+        -Failure "Wait-BRAVORangeIdLogFile не має писати WARNING/Slack (фінальний WARNING — лише з Test-RangeIdUsage), цикл має бути обмежений дедлайном (без нескінченних циклів), а обидва Test-Path — перевіряти один і той самий -LiteralPath `$Path без fallback-шляхів"
+
+    # Прибирання файлів bounded-очікування — повертаємо стан "корінь
+    # відсутній", як його лишив finally manifest-storage тестів вище.
+    if (Test-Path -LiteralPath $manifestStorageTestRoot) {
+        Remove-Item -LiteralPath $manifestStorageTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- Фінальний підсумок: та сама триланкова логіка (ПОМИЛКА/УСПІШНО З
     # ПОПЕРЕДЖЕННЯМИ/УСПІШНО), що вже керує exit code, тепер перевірена явно
     # на синтетичних BRAVOWarningCount/criticalErrorOccurred, а не лише як
@@ -9642,10 +9819,13 @@ function Get-BRAVOMaintenanceSummaryResult {
             'if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {',
             $maintenanceOuterRangeTryIndex)
     } else { -1 }
+    # 3600 (було 2500): гейт тепер містить bounded-очікування
+    # Wait-BRAVORangeIdLogFile перед Test-RangeIdUsage — else-гілка SKIPPED
+    # змістилась далі від початку гейта, але лишається в цьому ж блоці.
     $maintenanceRangeIdGateWindow = if ($maintenanceRangeIdGateIndex -ge 0) {
         $maintenanceScriptTextForManifestStorage.Substring(
             $maintenanceRangeIdGateIndex,
-            [Math]::Min(2500, $maintenanceScriptTextForManifestStorage.Length - $maintenanceRangeIdGateIndex))
+            [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $maintenanceRangeIdGateIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (

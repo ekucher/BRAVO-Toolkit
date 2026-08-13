@@ -694,6 +694,29 @@ Invariants below).
   upload and legacy-sync monitor loops. Documented in
   `docs/MANUAL_RUN_CONSOLE_UX.md`; 6 new self-tests cover the helper
   formats and the component-not-files wiring.
+- Maintenance no longer emits a false `WARNING` when
+  `range_id_log.json` is checked seconds after this run itself started
+  the BRAVO service (observed on the DEV-LIMS acceptance run right after
+  a full model restore: service started at 00:09:24, warning at
+  00:09:26, file present again minutes later — the service creates the
+  file asynchronously after startup). The `[8/8]` range-ID step now
+  waits for the file with a bounded retry (up to 30 s, 5 s interval,
+  deadline-limited loop) — but ONLY when the file is missing AND the
+  BRAVO service was started by this very run; a normal run with the
+  file present gets zero added delay, and a run that never touched the
+  service keeps the immediate warning as before. Intermediate states
+  are logged at `INFO`; if the file still hasn't appeared, exactly one
+  `WARNING` explains the startup-wait timeout
+  (`Файл контролю діапазонів ID не з'явився протягом 30 сек. після
+  запуску BRAVO`) instead of the generic "not found". The startup
+  summary line is also reworded — `Контроль діапазонів ID: УВІМКНЕНО;
+  поріг >80%; файл: …` — because the old `понад 80% у …` read as if
+  usage had already exceeded the threshold, when it only described the
+  monitoring threshold. Threshold evaluation, `range_id_log.json`
+  format, restore scheduling and WARN-only severity semantics are
+  unchanged. New behavioral self-tests cover the no-delay/late-file/
+  timeout paths plus structural guards (single final `WARNING`, wait
+  gated on the service-start flag, no fallback paths).
 
 ## 5.0.0 — 2026-08-11
 

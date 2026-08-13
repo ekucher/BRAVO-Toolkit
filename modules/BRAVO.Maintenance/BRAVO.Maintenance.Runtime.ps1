@@ -1774,15 +1774,61 @@ function Send-InactiveServiceWarning {
     }
 }
 
+# Bounded-очікування появи файла контролю діапазонів ID після запуску
+# служби BRAVO. Служба створює range_id_log.json асинхронно вже після
+# старту, тому одразу після Start-Service (особливо перший старт після
+# реставрації) файл може ще не існувати — одноразова перевірка давала
+# false WARNING. Цикл жорстко обмежений дедлайном (без нескінченних
+# циклів); проміжні стани — лише INFO (жодного WARNING звідси: фінальний
+# WARNING за таймаутом формує Test-RangeIdUsage нижче, рівно один раз).
+# Якщо файл уже існує — повертається одразу, без жодної затримки.
+function Wait-BRAVORangeIdLogFile {
+    param(
+        [string]$Path,
+        [int]$TimeoutSeconds,
+        [int]$IntervalSeconds = 5
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return $true
+    }
+    if ($TimeoutSeconds -le 0) {
+        return $false
+    }
+
+    Write-Log -Message "Файл контролю діапазонів ID ще не створено службою BRAVO; очікування до $TimeoutSeconds сек. (інтервал $IntervalSeconds сек.): $Path" -Level "INFO"
+    $waitStartedAt = Get-Date
+    $deadline = $waitStartedAt.AddSeconds($TimeoutSeconds)
+    $interval = [Math]::Max(1, $IntervalSeconds)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $waitedSeconds = [int][Math]::Ceiling(((Get-Date) - $waitStartedAt).TotalSeconds)
+            Write-Log -Message "Файл контролю діапазонів ID з'явився через $waitedSeconds сек. після запуску BRAVO: $Path" -Level "INFO"
+            return $true
+        }
+    }
+    return $false
+}
+
 # Перевірка заповнення діапазонів ID за даними служби BRAVO
 function Test-RangeIdUsage {
     param(
         [string]$Path,
-        [double]$ThresholdPercent
+        [double]$ThresholdPercent,
+        # > 0 — call-site уже виконав bounded-очікування файла після запуску
+        # служби BRAVO (Wait-BRAVORangeIdLogFile) і не дочекався; WARNING
+        # тоді пояснює таймаут очікування, а не просто "не знайдено".
+        [int]$WaitedForFileSeconds = 0
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        $errorMessage = "Файл контролю діапазонів ID не знайдено: $Path"
+        $missingLabel = if ($WaitedForFileSeconds -gt 0) {
+            "Файл контролю діапазонів ID не з'явився протягом $WaitedForFileSeconds сек. після запуску BRAVO"
+        } else {
+            "Файл контролю діапазонів ID не знайдено"
+        }
+        $errorMessage = "${missingLabel}: $Path"
         # dev.15: -NoConsole — виклик кроку нижче й так друкує Reason як
         # Details під рядком [N/8] (WARN), тому голий Write-Log у консоль
         # був би тим самим повідомленням удруге. LOG-файл і сповіщення
@@ -1795,7 +1841,7 @@ function Test-RangeIdUsage {
         # довгий рядок; LOG/Slack і далі отримують односрядковий $errorMessage.
         return [pscustomobject]@{
             HasIssue = $true
-            Reason = "Файл контролю діапазонів ID не знайдено:`n$Path"
+            Reason = "${missingLabel}:`n$Path"
         }
     }
 
@@ -4646,7 +4692,9 @@ if (-not $script:BRAVOToolManifest.IsValid) {
 }
 Write-Log -Message "Перевірка вільного місця: усі локальні диски; виключення: $freeSpaceExclusionsText" -NoTimestamp
 if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
-    Write-Log -Message "Контроль діапазонів ID: понад $($RangeIdThresholdPercent)% у $RangeIdLogPath" -NoTimestamp
+    # Формулювання називає поріг контролю, а не поточний стан: старий текст
+    # "понад N% у <файл>" читався так, ніби використання ВЖЕ перевищило поріг.
+    Write-Log -Message "Контроль діапазонів ID: УВІМКНЕНО; поріг >$($RangeIdThresholdPercent)%; файл: $RangeIdLogPath" -NoTimestamp
 }
 Write-Log -Message "Дата: $($currentDate.ToString('yyyy-MM-dd'))" -NoTimestamp
 Write-Log -Message "Час: $($currentDate.ToString('HH:mm:ss'))" -NoTimestamp
@@ -5044,6 +5092,11 @@ $exchangAPILogsProcessedCount = 0
 $webApacheLogsProcessedCount = 0
 $webWwwLogsProcessedCount = 0
 $restoreCompletedAt = $null
+# Чи запускала службу BRAVO САМЕ ця сесія maintenance (блок відновлення
+# стану служб нижче). Одразу після такого старту range_id_log.json може ще
+# не існувати (служба створює його асинхронно) — крок контролю діапазонів
+# ID використовує прапорець, щоб дочекатися файла замість false WARNING.
+$script:bravoServiceStartedThisRun = $false
 
 try {
 $serviceWasRunning = @{
@@ -5671,6 +5724,7 @@ try {
             -PollIntervalSeconds $ServicePollIntervalSeconds
         if ($serviceResult.Success) {
             Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"
+            $script:bravoServiceStartedThisRun = $true
         } else {
             $errorMsg = "$BravoServiceName не запустився автоматично: $($serviceResult.Error)"
             Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
@@ -5791,9 +5845,25 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
     # саме цей виклик його підняв (якщо він уже був true до виклику —
     # від чогось іншого, — не займаємо його). CriticalErrorsList/сповіщення
     # errors_only Send-SlackAlert формує так само, як і раніше.
+    # Якщо службу BRAVO запускав саме цей прогін, файл діапазонів ID може
+    # ще не існувати — BRAVO створює його асинхронно після старту. Bounded-
+    # очікування (до 30 сек., крок 5 сек.) застосовується ЛИШЕ коли файл
+    # відсутній І службу запускали ми: звичайний прогін з наявним файлом не
+    # отримує жодної затримки, а прогін без рестарту служби зберігає
+    # негайний WARNING, як раніше. Якщо файл так і не з'явився —
+    # Test-RangeIdUsage нижче формує рівно один WARNING з текстом таймауту.
+    $rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }
+    $rangeIdFileAppeared = Wait-BRAVORangeIdLogFile `
+        -Path $RangeIdLogPath `
+        -TimeoutSeconds $rangeIdWaitTimeoutSeconds
+    $rangeIdWaitedForFileSeconds = if (-not $rangeIdFileAppeared -and $rangeIdWaitTimeoutSeconds -gt 0) {
+        $rangeIdWaitTimeoutSeconds
+    } else {
+        0
+    }
     $rangeIdWarningsBefore = $script:BRAVOWarningCount
     $rangeIdCriticalBefore = $script:criticalErrorOccurred
-    $rangeIdCheckResult = Test-RangeIdUsage -Path $RangeIdLogPath -ThresholdPercent $RangeIdThresholdPercent
+    $rangeIdCheckResult = Test-RangeIdUsage -Path $RangeIdLogPath -ThresholdPercent $RangeIdThresholdPercent -WaitedForFileSeconds $rangeIdWaitedForFileSeconds
     $rangeIdHasWarning = $script:BRAVOWarningCount -gt $rangeIdWarningsBefore
     if (-not $rangeIdCriticalBefore -and $script:criticalErrorOccurred) {
         $script:criticalErrorOccurred = $false
