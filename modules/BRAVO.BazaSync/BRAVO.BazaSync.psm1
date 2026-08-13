@@ -484,12 +484,22 @@ function ConvertTo-BRAVOBazaFullAuditResult {
         }
     }
 
+    # Обидві сторони порівняння нормалізуються ЧЕРЕЗ ТУ САМУ функцію
+    # (GetFullPath), а не лише корінь: production PendingFiles[].Path
+    # (Get-BAZASFTPComparison) будується через Join-Path $LocalPath
+    # $childPath — без канонізації. Якщо нормалізувати лише $normalizedRoot,
+    # а pendingFile.Path лишити як є, префіксне порівняння могло мовчки не
+    # спрацювати на будь-якому non-canonical вхідному $LocalDirectory
+    # (кінцевий "\", змішані роздільники) — файл тоді помилково потрапляв
+    # би в "already matching" замість "pending", і drift не виявлявся б.
     $normalizedRoot = ([IO.Path]::GetFullPath($LocalDirectory)).TrimEnd('\', '/')
     $pendingRelativePaths = New-Object System.Collections.Generic.HashSet[string]
     foreach ($pendingFile in $PendingFiles) {
         if ([bool]$pendingFile.IsDirectory) { continue }
-        $absolutePath = [string]$pendingFile.Path
-        if ([string]::IsNullOrWhiteSpace($absolutePath) -or -not $absolutePath.StartsWith($normalizedRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $rawPath = [string]$pendingFile.Path
+        if ([string]::IsNullOrWhiteSpace($rawPath)) { continue }
+        $absolutePath = try { [IO.Path]::GetFullPath($rawPath) } catch { $rawPath }
+        if (-not $absolutePath.StartsWith($normalizedRoot, [StringComparison]::OrdinalIgnoreCase)) {
             continue
         }
         $relative = $absolutePath.Substring($normalizedRoot.Length).TrimStart('\', '/')
