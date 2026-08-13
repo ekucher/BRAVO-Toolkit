@@ -1660,7 +1660,7 @@ function Sync-Folders {
                 Show-RunningProgress `
                     -Id 3 `
                     -Activity "Robocopy — синхронiзацiя BAZA" `
-                    -Status "Виконується, минуло $elapsed сек." `
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsed) `
                     -PercentComplete -1
                 if (-not $process.HasExited) {
                     Start-Sleep -Milliseconds 500
@@ -2822,7 +2822,7 @@ function New-Archive {
                 Show-RunningProgress `
                     -Id $sevenZipProgressId `
                     -Activity $progressActivity `
-                    -Status "Виконується $elapsedSeconds сек.; $currentSizeText" `
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsedSeconds -Detail $currentSizeText) `
                     -PercentComplete -1
             }
 
@@ -3561,16 +3561,29 @@ function Copy-ArchivesToSMB {
         $drive = New-BRAVOSMBDrive
         Write-BRAVOLog -Component 'SMB' -Message "Підключення до NAS/SMB успішне: $($smbSettings.RootPath)" -Level "SUCCESS"
 
-        $copyIndex = 0
+        $copyComponentOrder = @(
+            $copyQueue | Where-Object { $_.Component -ne 'MANIFEST' } |
+                ForEach-Object { $_.Component } | Select-Object -Unique
+        )
+        $copyComponentTotal = $copyComponentOrder.Count
+        $currentCopyComponent = $null
         foreach ($copyItem in $copyQueue) {
-            $copyIndex++
             $copyFileName = Split-Path $copyItem.SourcePath -Leaf
-            Show-ItemProgress `
-                -Id 14 `
-                -Activity "BRAVO_ARCHIV — копіювання на NAS/SMB" `
-                -Item $copyFileName `
-                -Current $copyIndex `
-                -Total $copyTotal
+            # Операторський підетап — КОМПОНЕНТ (mdz+sha512 = один visible
+            # підетап; MANIFEST — коротка фаза без позиції), як і для
+            # архівації та SFTP upload.
+            if ($copyItem.Component -ne $currentCopyComponent) {
+                $currentCopyComponent = $copyItem.Component
+                if ($currentCopyComponent -eq 'MANIFEST') {
+                    Show-ScriptProgress -Status "Копіювання manifest на NAS/SMB" -PercentComplete 95
+                } else {
+                    $copyComponentIndex = ([array]::IndexOf($copyComponentOrder, $currentCopyComponent) + 1)
+                    $copyComponentProgress = 92 + [Math]::Floor((($copyComponentIndex - 1) * 3) / [Math]::Max(1, $copyComponentTotal))
+                    Show-ScriptProgress `
+                        -Status (Format-BRAVOSubstepPhase -Name "Копіювання $currentCopyComponent на NAS/SMB" -Current $copyComponentIndex -Total $copyComponentTotal) `
+                        -PercentComplete $copyComponentProgress
+                }
+            }
 
             if (-not (Test-Path -LiteralPath $copyItem.DestinationDirectory -PathType Container)) {
                 New-Item -ItemType Directory -Path $copyItem.DestinationDirectory -Force -ErrorAction Stop | Out-Null
@@ -4563,6 +4576,15 @@ exit
     $showWinSCPProgress = $progressSettings.Enabled -and $progressSettings.ShowWinSCPOutput
     $transferFileName = Split-Path $LocalFilePath -Leaf
     $transferActivity = "WinSCP — передача $transferFileName"
+    # Розмір локального файлу вже відомий (жодного remote-запиту заради UI):
+    # корисна деталь running-рядка для великих mdz-архівів.
+    $transferSizeText = $null
+    try {
+        $transferSizeText = Format-BRAVOFileSize -Bytes ((Get-Item -LiteralPath $LocalFilePath).Length)
+    } catch {
+        # Розмір -- лише UI-деталь; його відсутність не має впливати на передачу.
+        $transferSizeText = $null
+    }
     try {
         $winscpCommand | Out-File -FilePath $tempScript -Encoding $winSCPScriptEncoding -Force
         Write-BRAVOLog -Component 'SFTP' -Message "Створено тимчасовий скрипт WinSCP: $tempScript" -Level "DEBUG"
@@ -4598,7 +4620,7 @@ exit
                 Show-RunningProgress `
                     -Id 11 `
                     -Activity $transferActivity `
-                    -Status "Виконується, минуло $elapsedSeconds сек."
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsedSeconds -Detail $transferSizeText)
             }
             if ($elapsedSeconds -ge $operationTimeoutSeconds) {
                 $transferTimedOut = $true
@@ -4799,7 +4821,7 @@ exit
                 Show-RunningProgress `
                     -Id 12 `
                     -Activity $syncActivity `
-                    -Status "Виконується, минуло $elapsedSeconds сек."
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsedSeconds)
             }
             if ($elapsedSeconds -ge $operationTimeoutSeconds) {
                 $syncTimedOut = $true
@@ -6364,13 +6386,12 @@ function Main {
         foreach ($archive in $readyArchives) {
             $archiveIndex++
             $archiveProgress = 30 + [Math]::Floor((($archiveIndex - 1) / [Math]::Max(1, $readyArchives.Count)) * 40)
-            Show-ScriptProgress -Status "Архiвацiя $($archive.Type) ($archiveIndex з $($readyArchives.Count))" -PercentComplete $archiveProgress
-            Show-ItemProgress `
-                -Id 10 `
-                -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" `
-                -Item $archive.Type `
-                -Current $archiveIndex `
-                -Total $readyArchives.Count
+            # Канонічний формат підетапу (Format-BRAVOSubstepPhase) — той
+            # самий для архівації/SFTP/NAS: оператор завжди бачить, ЯКИЙ
+            # компонент виконується і його позицію (N з Total).
+            Show-ScriptProgress `
+                -Status (Format-BRAVOSubstepPhase -Name "Архiвацiя $($archive.Type)" -Current $archiveIndex -Total $readyArchives.Count) `
+                -PercentComplete $archiveProgress
             $archiveName = $archive.NameTemplate -f $archivePrefix, $generationId
             Write-Log "==="
             Write-Log "=== АРХIВАЦIЯ $($archive.Type) ==="
@@ -6425,7 +6446,9 @@ function Main {
                 # уже ПІСЛЯ повного завершення виклику. Show-ScriptProgress
                 # нижче — прогрес-бар, не журнал, лишається на своєму місці.
                 $hashProgress = [Math]::Min(69, $archiveProgress + 8)
-                Show-ScriptProgress -Status "SHA512 для $($archive.Type)" -PercentComplete $hashProgress
+                Show-ScriptProgress `
+                    -Status (Format-BRAVOSubstepPhase -Name "SHA512 для $($archive.Type)" -Current $archiveIndex -Total $readyArchives.Count) `
+                    -PercentComplete $hashProgress
                 $results[$archive.Type] = @{
                     ArchivePath = $componentResult.ArchivePath
                     HashPath = $componentResult.HashPath
@@ -6842,10 +6865,12 @@ function Main {
                         $uploadQueue += [pscustomobject]@{
                             LocalPath = [string]$results[$archiveType].ArchivePath
                             RemoteDirectory = [string]$sftpDirectories[$archiveType]
+                            Component = [string]$archiveType
                         }
                         $uploadQueue += [pscustomobject]@{
                             LocalPath = [string]$results[$archiveType].HashPath
                             RemoteDirectory = [string]$sftpDirectories[$archiveType]
+                            Component = [string]$archiveType
                         }
                     }
                 }
@@ -6854,26 +6879,41 @@ function Main {
                     $uploadQueue += [pscustomobject]@{
                         LocalPath = $generationManifestPath
                         RemoteDirectory = [string]$sftpDirectories.Manifest
+                        Component = 'manifest'
                     }
                 }
 
                 $uploadTotal = $uploadQueue.Count
                 $transferResults.ArchiveUpload.Total = $uploadTotal
+                # Операторський рівень прогресу — КОМПОНЕНТНИЙ (MODEL/BLOG/
+                # BRAVOEXCH), а не файловий: mdz+sha512 одного компонента —
+                # один visible підетап; manifest — окрема коротка фаза без
+                # позиції. Тому "(1 з 3)", а не "(1 з 7)". Файлові операції
+                # й далі детально логуються у файл, як раніше.
+                $uploadComponentOrder = @(
+                    $uploadQueue | Where-Object { $_.Component -ne 'manifest' } |
+                        ForEach-Object { $_.Component } | Select-Object -Unique
+                )
+                $uploadComponentTotal = $uploadComponentOrder.Count
                 if ($uploadTotal -gt 0) {
                     Show-ScriptProgress -Status "Завантаження архiвiв на SFTP" -PercentComplete 82
                     Write-Log "==="
                     Write-Log "=== ЗАВАНТАЖЕННЯ АРХIВIВ НА SFTP ==="
                 }
-                $uploadIndex = 0
+                $currentUploadComponent = $null
                 foreach ($uploadItem in $uploadQueue) {
-                    $uploadIndex++
-                    $uploadFileName = Split-Path $uploadItem.LocalPath -Leaf
-                    Show-ItemProgress `
-                        -Id 13 `
-                        -Activity "BRAVO_ARCHIV — завантаження на SFTP" `
-                        -Item $uploadFileName `
-                        -Current $uploadIndex `
-                        -Total $uploadTotal
+                    if ($uploadItem.Component -ne $currentUploadComponent) {
+                        $currentUploadComponent = $uploadItem.Component
+                        if ($currentUploadComponent -eq 'manifest') {
+                            Show-ScriptProgress -Status "Завантаження manifest на SFTP" -PercentComplete 89
+                        } else {
+                            $uploadComponentIndex = ([array]::IndexOf($uploadComponentOrder, $currentUploadComponent) + 1)
+                            $uploadComponentProgress = 82 + [Math]::Floor((($uploadComponentIndex - 1) * 7) / [Math]::Max(1, $uploadComponentTotal))
+                            Show-ScriptProgress `
+                                -Status (Format-BRAVOSubstepPhase -Name "Завантаження $currentUploadComponent на SFTP" -Current $uploadComponentIndex -Total $uploadComponentTotal) `
+                                -PercentComplete $uploadComponentProgress
+                        }
+                    }
                     $fileUploaded = Send-FileViaWinSCP `
                         -WinSCPPath $winSCPPath `
                         -RepositorySFTPUrl $sftpUrl `
@@ -6884,7 +6924,6 @@ function Main {
                         $uploadSuccess++
                     }
                 }
-                Show-ItemProgress -Id 13 -Activity "BRAVO_ARCHIV — завантаження на SFTP" -Completed
 
                 if ($uploadTotal -gt 0) {
                     $transferResults.ArchiveUpload.Completed = $uploadSuccess

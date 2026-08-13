@@ -14482,6 +14482,74 @@ function Write-BRAVOLog {
     }
 
     # ================================================================
+    # Console progress: канонічні multi-substep хелпери + wiring.
+    # Правило: якщо один numbered етап має кілька значущих підетапів,
+    # оператор бачить "<Підетап> (N з Total) — Виконується T; деталь".
+    # ================================================================
+    Test-BRAVOCondition `
+        -Condition (
+            (Format-BRAVOElapsedText -TotalSeconds 7) -eq '7 сек.' -and
+            (Format-BRAVOElapsedText -TotalSeconds 84) -eq '1 хв. 24 сек.' -and
+            (Format-BRAVOElapsedText -TotalSeconds 0) -eq '0 сек.' -and
+            (Format-BRAVOElapsedText -TotalSeconds 3725) -eq '1 год. 02 хв. 05 сек.'
+        ) `
+        -Name 'ConsoleUx/ElapsedTextCanonicalFormat' `
+        -Failure "канонічний elapsed-формат: '7 сек.' / '1 хв. 24 сек.' / '1 год. 02 хв. 05 сек.'; отримано: '$(Format-BRAVOElapsedText -TotalSeconds 7)' / '$(Format-BRAVOElapsedText -TotalSeconds 84)' / '$(Format-BRAVOElapsedText -TotalSeconds 3725)'"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (Format-BRAVOSubstepPhase -Name 'Архiвацiя MODEL' -Current 1 -Total 3) -eq 'Архiвацiя MODEL (1 з 3)' -and
+            (Format-BRAVOSubstepPhase -Name 'Завантаження BLOG на SFTP' -Current 2 -Total 3) -eq 'Завантаження BLOG на SFTP (2 з 3)' -and
+            (Format-BRAVOSubstepPhase -Name 'Одиночний етап' -Current 1 -Total 1) -eq 'Одиночний етап'
+        ) `
+        -Name 'ConsoleUx/SubstepPhaseIncludesPosition' `
+        -Failure "підетап має формат '<Назва> (N з Total)', для Total<=1 суфікс опускається; отримано: '$(Format-BRAVOSubstepPhase -Name 'Архiвацiя MODEL' -Current 1 -Total 3)'"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (Format-BRAVORunningDetail -ElapsedSeconds 23 -Detail 'поточний розмiр: 44,0 МБ') -eq 'Виконується 23 сек.; поточний розмiр: 44,0 МБ' -and
+            (Format-BRAVORunningDetail -ElapsedSeconds 84) -eq 'Виконується 1 хв. 24 сек.'
+        ) `
+        -Name 'ConsoleUx/RunningDetailCanonicalWording' `
+        -Failure "єдине формулювання running-рядка: 'Виконується <час>[; деталь]' (НЕ 'Виконується, минуло'); отримано: '$(Format-BRAVORunningDetail -ElapsedSeconds 23 -Detail 'поточний розмiр: 44,0 МБ')'"
+
+    # SFTP upload: visible підетапи — КОМПОНЕНТИ (MODEL/BLOG/BRAVOEXCH),
+    # а не файли: mdz+sha512+manifest НЕ перетворюються на "(1 з 7)";
+    # manifest — окрема коротка фаза без позиції.
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Format-BRAVOSubstepPhase -Name "Завантаження $currentUploadComponent на SFTP" -Current $uploadComponentIndex -Total $uploadComponentTotal') -and
+            $archiveScriptText.Contains("Component = 'manifest'") -and
+            $archiveScriptText.Contains('Show-ScriptProgress -Status "Завантаження manifest на SFTP"') -and
+            -not $archiveScriptText.Contains('-Total $uploadTotal')
+        ) `
+        -Name 'ConsoleUx/SftpUploadSubstepsAreComponentsNotFiles' `
+        -Failure 'SFTP upload має показувати компонентні підетапи "Завантаження <COMPONENT> на SFTP (N з Total)" (mdz+sha512 одного компонента = один підетап, manifest — окрема фаза), а не файловий лічильник із $uploadTotal'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Format-BRAVOSubstepPhase -Name "Архiвацiя $($archive.Type)"') -and
+            $archiveScriptText.Contains('Format-BRAVOSubstepPhase -Name "SHA512 для $($archive.Type)"') -and
+            $archiveScriptText.Contains('Format-BRAVOSubstepPhase -Name "Копіювання $currentCopyComponent на NAS/SMB"') -and
+            -not $archiveScriptText.Contains('Виконується, минуло')
+        ) `
+        -Name 'ConsoleUx/MultiSubstepStagesUseCanonicalHelper' `
+        -Failure "усі multi-substep етапи (архівація, SHA512, SFTP, NAS/SMB) мають формувати фазу через Format-BRAVOSubstepPhase, а формулювання 'Виконується, минуло' повністю вилучене"
+
+    $consoleUxModuleText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Console\BRAVO.Console.psm1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $consoleUxModuleText.Contains('function Format-BRAVOElapsedText') -and
+            $consoleUxModuleText.Contains('function Format-BRAVOSubstepPhase') -and
+            $consoleUxModuleText.Contains('function Format-BRAVORunningDetail') -and
+            -not $archiveScriptText.Contains('function Format-BRAVOElapsedText') -and
+            -not $archiveScriptText.Contains('function Format-BRAVOSubstepPhase') -and
+            -not $archiveScriptText.Contains('function Format-BRAVORunningDetail')
+        ) `
+        -Name 'ConsoleUx/NoDuplicateProgressImplementations' `
+        -Failure 'канонічні progress-хелпери визначаються РІВНО один раз у BRAVO.Console і використовуються (не дублюються) в Runtime-скриптах'
+
+    # ================================================================
     # Група 3 — Archive: VSS-діагностика тепер фактично правильна (ОДИН
     # Snapshot Set на generation, спільний для всіх увімкнених
     # компонентів) — лише текст, VSS-логіка/lifecycle не змінені.

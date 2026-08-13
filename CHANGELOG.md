@@ -624,6 +624,24 @@ Invariants below).
   explanatory `ERROR` instead of hanging. Behavioral + structural tests
   added (`ComStubExecutableFailsFastInsteadOfHanging`,
   `ArchiveWiringResolvesRealWinSCPExeForEngine`).
+- Unified console progress for multi-substep stages in `BRAVO_ARCHIV`
+  (UI-only refactor — no backup/VSS/SFTP/BAZA/retention semantics
+  changed). New canonical helpers in `BRAVO.Console`
+  (`Format-BRAVOSubstepPhase`, `Format-BRAVOElapsedText`,
+  `Format-BRAVORunningDetail`) replace ad-hoc phase/elapsed strings
+  scattered across the runtime. SFTP archive upload now shows
+  component-level substeps (`Завантаження MODEL на SFTP (1 з 3)` with
+  the already-known local file size as detail) instead of one generic
+  phase — `mdz`+`sha512` of a component are one visible substep and the
+  manifest is a separate short phase, so the operator-visible count
+  stays `(1 з 3)` rather than `(1 з 7)`; NAS/SMB copy gained the same
+  component-level phases; the SHA512 phase carries its component
+  position. The running-line wording is unified to `Виконується 7 сек.`
+  / `Виконується 1 хв. 24 сек.` (the mixed `Виконується, минуло …`
+  variant is removed everywhere) across the 7-Zip, Robocopy, WinSCP
+  upload and legacy-sync monitor loops. Documented in
+  `docs/MANUAL_RUN_CONSOLE_UX.md`; 6 new self-tests cover the helper
+  formats and the component-not-files wiring.
 
 ## 5.0.0 — 2026-08-11
 
