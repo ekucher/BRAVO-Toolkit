@@ -9373,6 +9373,43 @@ try {
         -Name "Maintenance/RangeIdWaitHelperIsBoundedAndSilent" `
         -Failure "Wait-BRAVORangeIdLogFile не має писати WARNING/Slack (фінальний WARNING — лише з Test-RangeIdUsage), цикл має бути обмежений дедлайном (без нескінченних циклів), а обидва Test-Path — перевіряти один і той самий -LiteralPath `$Path без fallback-шляхів"
 
+    # 7) Deadline-семантика: TimeoutSeconds — справжня верхня межа, а не
+    # "дедлайн + ще один повний інтервал". Фейковий годинник (Get-Date і
+    # Start-Sleep підмінені в module scope; fake-sleep просуває годинник на
+    # запитану кількість секунд) робить перевірку детермінованою: з
+    # Timeout=13/Interval=5 послідовність sleep-ів має бути 5,5,3 — останній
+    # sleep обрізаний до залишку бюджету (3, а не повний інтервал 5), сума
+    # рівно 13 і жодної секунди понад Timeout.
+    $rangeIdWaitClampCapture = & $rangeIdWaitModule {
+        param($Path)
+        $script:RangeIdFakeNow = [datetime]'2026-01-01T00:00:00'
+        $script:RangeIdSleepLog = @()
+        function Get-Date { return $script:RangeIdFakeNow }
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole)
+            $null = $Message; $null = $Level; $null = $NoTimestamp; $null = $NoConsole
+        }
+        function Start-Sleep {
+            param($Seconds)
+            $script:RangeIdSleepLog += [int]$Seconds
+            $script:RangeIdFakeNow = $script:RangeIdFakeNow.AddSeconds([int]$Seconds)
+        }
+        $appeared = Wait-BRAVORangeIdLogFile -Path $Path -TimeoutSeconds 13 -IntervalSeconds 5
+        [pscustomobject]@{
+            Appeared = $appeared
+            Sleeps = @($script:RangeIdSleepLog)
+            TotalSleptSeconds = [int](@($script:RangeIdSleepLog) | Measure-Object -Sum).Sum
+        }
+    } $rangeIdNeverFilePath
+    Test-BRAVOCondition `
+        -Condition (
+            -not $rangeIdWaitClampCapture.Appeared -and
+            (@($rangeIdWaitClampCapture.Sleeps) -join ',') -eq '5,5,3' -and
+            $rangeIdWaitClampCapture.TotalSleptSeconds -eq 13
+        ) `
+        -Name "Maintenance/RangeIdWaitLastSleepClampedToDeadline" `
+        -Failure "з Timeout=13/Interval=5 сума sleep-ів має бути рівно 13 (5,5,3): останній sleep обрізається до залишку бюджету, а не спить повний інтервал понад дедлайн"
+
     # Прибирання файлів bounded-очікування — повертаємо стан "корінь
     # відсутній", як його лишив finally manifest-storage тестів вище.
     if (Test-Path -LiteralPath $manifestStorageTestRoot) {

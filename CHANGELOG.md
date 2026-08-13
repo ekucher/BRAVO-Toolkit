@@ -716,7 +716,12 @@ Invariants below).
   format, restore scheduling and WARN-only severity semantics are
   unchanged. New behavioral self-tests cover the no-delay/late-file/
   timeout paths plus structural guards (single final `WARNING`, wait
-  gated on the service-start flag, no fallback paths).
+  gated on the service-start flag, no fallback paths). `TimeoutSeconds`
+  is a true upper bound: each sleep is clamped to the remaining budget
+  (`min(interval, remaining)`), so the loop can never overshoot the
+  deadline by a full extra interval — deadline semantics are
+  regression-tested deterministically with a fake clock
+  (`Timeout=13/Interval=5` must sleep exactly `5,5,3`).
 
 ## 5.0.0 — 2026-08-11
 

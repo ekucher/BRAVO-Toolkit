@@ -1801,7 +1801,13 @@ function Wait-BRAVORangeIdLogFile {
     $deadline = $waitStartedAt.AddSeconds($TimeoutSeconds)
     $interval = [Math]::Max(1, $IntervalSeconds)
     while ((Get-Date) -lt $deadline) {
-        Start-Sleep -Seconds $interval
+        # TimeoutSeconds — справжня верхня межа: кожен sleep обмежується
+        # залишком бюджету, інакше останній повний інтервал міг би
+        # перевищити дедлайн на величину до IntervalSeconds.
+        $remainingSeconds = ($deadline - (Get-Date)).TotalSeconds
+        if ($remainingSeconds -le 0) { break }
+        $sleepSeconds = [Math]::Min($interval, [Math]::Max(1, [int][Math]::Ceiling($remainingSeconds)))
+        Start-Sleep -Seconds $sleepSeconds
         if (Test-Path -LiteralPath $Path -PathType Leaf) {
             $waitedSeconds = [int][Math]::Ceiling(((Get-Date) - $waitStartedAt).TotalSeconds)
             Write-Log -Message "Файл контролю діапазонів ID з'явився через $waitedSeconds сек. після запуску BRAVO: $Path" -Level "INFO"
