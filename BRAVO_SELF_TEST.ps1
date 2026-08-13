@@ -854,6 +854,41 @@ try {
         -Name "Diagnostics/NoKeywordParsedAsCommand" `
         -Failure "statement-keyword у позиції команди (напр. if усередині (...) замість `$(...)) валідно парситься і падає ЛИШЕ в рантаймі CommandNotFoundException; знайдено: $($keywordAsCommandFindings.ToArray() -join ', ')"
 
+    # Acceptance DEV-LIMS (2026-08-13, той самий прогін): "a{0}" + "b{3}" -f args
+    # форматує ЛИШЕ правий рядок (-f зв'язується сильніше за +) — перша
+    # половина retention-аудиту вийшла в лог з літеральними {0}/{1}/{2}.
+    # Guard: жодного Plus-виразу, чий ПРАВИЙ операнд — Format (-f), а лівий
+    # бік містить непідставлені {N}-плейсхолдери (правильна форма —
+    # ("a{0}" + "b{3}") -f args).
+    $halfFormattedFindings = New-Object System.Collections.ArrayList
+    foreach ($analyzedFile in $powerShellFiles) {
+        if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
+
+        $formatTokens = $null
+        $formatErrors = $null
+        $formatAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $analyzedFile.FullName, [ref]$formatTokens, [ref]$formatErrors)
+        if ($null -eq $formatAst) { continue }
+
+        $suspectNodes = @($formatAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+            $node.Operator -eq 'Plus' -and
+            $node.Right -is [System.Management.Automation.Language.BinaryExpressionAst] -and
+            $node.Right.Operator -eq 'Format'
+        }, $true))
+        foreach ($suspectNode in $suspectNodes) {
+            if ($suspectNode.Left.Extent.Text -match '\{\d+\}') {
+                [void]$halfFormattedFindings.Add(
+                    ("{0}:{1}" -f $analyzedFile.Name, $suspectNode.Extent.StartLineNumber))
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($halfFormattedFindings.Count -eq 0) `
+        -Name "Diagnostics/NoHalfFormattedStringConcatenation" `
+        -Failure "конкатенація з -f без дужок форматує лише правий рядок, лівий лишає з літеральними {N} (потрібно (`"a{0}`" + `"b{1}`") -f ...); знайдено: $($halfFormattedFindings.ToArray() -join ', ')"
+
     # Рядок, що ВИГЛЯДАЄ як облікові дані, — це справжній секрет для будь-якого
     # сканера, навіть якщо значення вигадане. Такі фікстури вже кілька разів
     # піднімали інциденти GitGuardian, які доводилось закривати вручну;

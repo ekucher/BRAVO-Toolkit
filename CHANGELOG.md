@@ -597,6 +597,14 @@ Invariants below).
   (`if`/`elseif`/`else`/`switch`/`while`/`do`/`try`/`catch`/`finally`/`until`;
   `foreach`/`where` deliberately excluded as valid pipeline aliases) —
   this guard would have caught the bug at commit time.
+- Fix a second defect visible in the same DEV-LIMS acceptance log: the
+  per-run retention audit line printed literal `{0}/{1}/{2}` placeholders
+  for its first half (`Аудит retention: generation оцінено={0}; …`) —
+  `-f` binds tighter than `+`, so only the second concatenated string was
+  formatted. Parenthesized the concatenation; a second whole-bundle
+  guard (`Diagnostics/NoHalfFormattedStringConcatenation`) now fails on
+  any `+` expression whose right operand is a `-f` format while the left
+  side still contains unformatted `{N}` placeholders.
 
 ## 5.0.0 — 2026-08-11
 

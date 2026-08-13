@@ -1344,9 +1344,13 @@ function Remove-BRAVOExpiredBackupGenerations {
         # скільки захищено мінімальним порогом verified-копій (і які саме —
         # для forensic-діагностики), скільки реально видалено з розбивкою за
         # причиною. Доповнює вже наявні per-deletion рядки вище, не замінює.
+        # Внутрішні дужки навколо конкатенації обов'язкові: -f зв'язується
+        # сильніше за +, тому без них форматувався ЛИШЕ другий рядок — в
+        # операторському лозі DEV-LIMS перша половина вийшла з літеральними
+        # "{0}/{1}/{2}" (діагностика без чисел, помічено на acceptance).
         Write-BRAVOLog -Component 'CLEANUP' -Message (
-            "Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
-            "видалено (verified, прострочено)={3}; видалено (failed/incomplete, прострочено)={4}" -f
+            ("Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
+             "видалено (verified, прострочено)={3}; видалено (failed/incomplete, прострочено)={4}") -f
             $records.Count, $protectedGenerationIds.Count, ($protectedGenerationIds -join ', '),
             $deletedVerifiedExpiredCount, $deletedFailedIncompleteCount
         ) -Level 'INFO'
