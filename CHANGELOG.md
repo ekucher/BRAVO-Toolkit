@@ -426,6 +426,43 @@ Invariants below).
   corrupt-state reconciliation, lock Busy-vs-Error, Fast Health success
   whitelist, no full `CompareDirectories` on normal cycles, no `-delete`)
   re-verified by the existing suite.
+- `BRAVO.BazaSync` hardening round 3 (independent post-review before
+  production acceptance). (P1) IncrementalAppendOnly can no longer
+  silently overwrite an already existing remote BAZA file: WinSCP's
+  `TransferOptions.OverwriteMode` defaults to `Overwrite` and the targeted
+  upload had no pre-upload check of the remote file itself, so a candidate
+  not yet `Verified` in local state whose remote path already existed
+  (most importantly the crash window: remote `PutFiles` succeeded →
+  `Save-BRAVOBazaState` failed → next cycle re-sees the candidate) would
+  be re-uploaded over the existing immutable file. Each `ToUpload`
+  candidate now gets one targeted `FileExists` first: remote absent →
+  normal upload; remote present with the same size → recovered without
+  any `PutFiles` call, committed `Verified=true` and counted as
+  `RecoveredRemote` (the cycle can be `COMPLETE`); remote present with a
+  different size → explicit `Status=REMOTE_CONFLICT` with
+  `RelativePath`/`LocalSize`/`RemoteSize` per conflict, zero `PutFiles`
+  for that candidate, no successful-cycle provenance advance, no
+  checkpoint publication, Health `CRITICAL` naming the exact path and
+  both sizes. Overwriting is never a default policy — any future
+  overwrite support would have to be a separate, explicitly named
+  operator policy. Verified/TrustedSkip entries get no remote lookup at
+  all, preserving the 100000-verified-plus-10-candidates cost profile (no
+  `CompareDirectories`, no `synchronize -preview`, no full tree scan).
+  (P2) The checkpoint-replacement `RemoveFiles` result is no longer
+  discarded: WinSCP reports per-file removal failures in the operation
+  result without throwing, so a failed removal now yields
+  `CheckpointPublished=false` (WARNING; the previous checkpoint stays
+  intact) instead of claiming a successful replacement.
+  (P2) `Update-BRAVOBazaSyncResultNewAfterCutoff` now also counts the
+  local-only NewAfterCutoff diagnostic for `INCOMPATIBLE_NAME` and
+  `REMOTE_CONFLICT` cycles (state is saved in both). (P2) When mutation
+  violations and incompatible names (and/or remote conflicts) coexist in
+  one cycle, Fast Health surfaces every non-empty category in the same
+  run — one remains the primary Status/Message, the others appear in
+  Info instead of being discovered only on the next cycle. 14 new
+  behavioral self-tests, including the crash-recovery acceptance
+  (`CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload`) and
+  remote-lookup scoping proofs.
 
 ## 5.0.0 — 2026-08-11
 

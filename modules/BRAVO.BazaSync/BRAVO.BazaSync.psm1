@@ -483,6 +483,26 @@ function Invoke-BRAVOBazaFileUpload {
     # candidate, не O(усі файли). $Session — injectable (WinSCP.Session або
     # тестовий duck-typed об'єкт з тими самими методами: PutFiles/FileExists/
     # GetFileInfo/CreateDirectory).
+    #
+    # P1 (hardening round 3): перед PutFiles — цільова перевірка існування
+    # САМОГО remote-файлу. WinSCP TransferOptions.OverwriteMode типово =
+    # Overwrite, тобто без цієї перевірки кандидат, чий remote-шлях ВЖЕ
+    # зайнятий, мовчки ПЕРЕЗАПИСАВ би наявний immutable BAZA-файл. Типовий
+    # реальний випадок — crash-вікно: PutFiles попереднього циклу встиг,
+    # Save-BRAVOBazaState — ні; наступний цикл знову бачить кандидата.
+    # Append-only контракт:
+    #   remote відсутній        -> звичайний targeted upload (Outcome=Uploaded)
+    #   remote є, розмір збігся -> визнаємо файл уже присутнім/відновленим,
+    #                              НУЛЬ PutFiles (Outcome=AlreadyRemote)
+    #   remote є, розмір інший  -> Outcome=RemoteConflict, НУЛЬ PutFiles,
+    #                              fail visible — ЖОДНОГО overwrite за
+    #                              замовчуванням. Якщо колись знадобиться
+    #                              overwrite — це мусить бути ОКРЕМА, явно
+    #                              названа операторська політика, не тихий
+    #                              OverwriteMode=Overwrite.
+    # Перевірка цільова (один FileExists, і лише за потреби один GetFileInfo,
+    # на КАНДИДАТА): TrustedSkip-записи в цю функцію взагалі не потрапляють,
+    # тож O(Verified) remote-викликів не з'являється.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Session,
@@ -497,6 +517,21 @@ function Invoke-BRAVOBazaFileUpload {
     $remoteDirectory = if ([string]::IsNullOrWhiteSpace($remoteDirectory)) { $RemoteRootPath } else { $remoteDirectory.Replace('\', '/') }
 
     try {
+        if ([bool]$Session.FileExists($remoteFullPath)) {
+            $existingRemoteInfo = $Session.GetFileInfo($remoteFullPath)
+            $existingRemoteSize = if ($null -ne $existingRemoteInfo) { [int64]$existingRemoteInfo.Length } else { [int64](-1) }
+            if ($existingRemoteSize -eq [int64]$Entry.Size) {
+                return [pscustomobject]@{
+                    RelativePath = $Entry.RelativePath; Success = $true; Outcome = 'AlreadyRemote'
+                    Error = $null; Bytes = 0; RemoteSize = $existingRemoteSize
+                }
+            }
+            return [pscustomobject]@{
+                RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'RemoteConflict'
+                Error = "remote-файл уже існує з іншим розміром (local $($Entry.Size) байт, remote $existingRemoteSize байт) — перезапис заборонено append-only контрактом"
+                Bytes = 0; RemoteSize = $existingRemoteSize
+            }
+        }
         New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $remoteDirectory
         $transferOptions = New-Object WinSCP.TransferOptions
         $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
@@ -517,7 +552,7 @@ function Invoke-BRAVOBazaFileUpload {
                     ForEach-Object { [string]$_.Error.Message }
             )
             $detail = if ($failureMessages.Count -gt 0) { $failureMessages -join '; ' } else { 'невідома помилка передачі' }
-            return [pscustomobject]@{ RelativePath = $Entry.RelativePath; Success = $false; Error = $detail; Bytes = 0 }
+            return [pscustomobject]@{ RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'Failed'; Error = $detail; Bytes = 0; RemoteSize = $null }
         }
 
         # Легка remote-верифікація: розмір, не checksum (checksum на
@@ -526,13 +561,13 @@ function Invoke-BRAVOBazaFileUpload {
         $remoteInfo = $Session.GetFileInfo($remoteFullPath)
         if ($null -eq $remoteInfo -or [int64]$remoteInfo.Length -ne [int64]$Entry.Size) {
             return [pscustomobject]@{
-                RelativePath = $Entry.RelativePath; Success = $false
-                Error = "remote розмір не збігається після передачі (очікувалось $($Entry.Size))"; Bytes = 0
+                RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'Failed'
+                Error = "remote розмір не збігається після передачі (очікувалось $($Entry.Size))"; Bytes = 0; RemoteSize = $null
             }
         }
-        return [pscustomobject]@{ RelativePath = $Entry.RelativePath; Success = $true; Error = $null; Bytes = [int64]$Entry.Size }
+        return [pscustomobject]@{ RelativePath = $Entry.RelativePath; Success = $true; Outcome = 'Uploaded'; Error = $null; Bytes = [int64]$Entry.Size; RemoteSize = [int64]$Entry.Size }
     } catch {
-        return [pscustomobject]@{ RelativePath = $Entry.RelativePath; Success = $false; Error = $_.Exception.Message; Bytes = 0 }
+        return [pscustomobject]@{ RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'Failed'; Error = $_.Exception.Message; Bytes = 0; RemoteSize = $null }
     }
 }
 
@@ -569,6 +604,15 @@ function New-BRAVOBazaSyncResult {
         # (це не транзієнтна помилка передачі, перезапуск сам по собі
         # нічого не виправить, доки оператор не скоротить ім'я).
         IncompatibleFiles = @()
+        # P1 (hardening round 3): захист від перезапису наявних remote-файлів.
+        # RecoveredRemote — кандидати, чий remote-шлях уже існував із ТИМ
+        # САМИМ розміром (типово: crash-вікно "PutFiles встиг, Save-State ні")
+        # — визнані Verified без повторної передачі. RemoteConflicts —
+        # кандидати, чий remote-шлях зайнятий файлом ІНШОГО розміру:
+        # перезапис заборонено, кожен запис несе RelativePath/LocalSize/
+        # RemoteSize.
+        RecoveredRemote = 0
+        RemoteConflicts = @()
         Status = 'ERROR'
         Error = $null
         Bootstrap = $false
@@ -945,8 +989,10 @@ function Invoke-BRAVOBazaSynchronization {
 
     $uploadedCount = 0
     $uploadedBytes = [int64]0
+    $recoveredRemoteCount = 0
     $failedFiles = New-Object System.Collections.Generic.List[object]
     $incompatibleFiles = New-Object System.Collections.Generic.List[object]
+    $remoteConflicts = New-Object System.Collections.Generic.List[object]
 
     foreach ($candidate in $plan.ToUpload) {
         # P2 (deep review): SFTP filename-compatibility — локальна ЛИШЕ
@@ -966,7 +1012,30 @@ function Invoke-BRAVOBazaSynchronization {
             continue
         }
         $uploadOutcome = Invoke-BRAVOBazaFileUpload -Session $Session -Entry $candidate -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath
-        if ($uploadOutcome.Success) {
+        if ($uploadOutcome.Outcome -eq 'AlreadyRemote') {
+            # P1 (round 3): remote-файл уже існує з тим самим розміром —
+            # crash-recovery випадок (upload попереднього циклу пройшов, а
+            # state тоді не зберігся). Визнаємо Verified БЕЗ повторної
+            # передачі — нуль PutFiles, наявний файл не перезаписується.
+            $recoveredRemoteCount++
+            $state.Files[$candidate.RelativePath] = [pscustomobject]@{
+                Size = $candidate.Size
+                LastWriteTimeUtc = $candidate.LastWriteTimeUtc
+                UploadedUtc = (Get-Date).ToUniversalTime().ToString('o')
+                Verified = $true
+            }
+        } elseif ($uploadOutcome.Outcome -eq 'RemoteConflict') {
+            # P1 (round 3): remote-шлях зайнятий файлом ІНШОГО розміру —
+            # перезапис заборонено. Стан для кандидата НЕ пишеться (як і
+            # для несумісних імен): наступний цикл знову побачить конфлікт
+            # тією самою цільовою перевіркою, доки оператор не вирішить.
+            $remoteConflicts.Add([pscustomobject]@{
+                RelativePath = $candidate.RelativePath
+                LocalSize = [int64]$candidate.Size
+                RemoteSize = $uploadOutcome.RemoteSize
+                Error = $uploadOutcome.Error
+            })
+        } elseif ($uploadOutcome.Success) {
             $uploadedCount++
             $uploadedBytes += $uploadOutcome.Bytes
             $state.Files[$candidate.RelativePath] = [pscustomobject]@{
@@ -990,10 +1059,12 @@ function Invoke-BRAVOBazaSynchronization {
 
     $result.Uploaded = $uploadedCount
     $result.UploadedBytes = $uploadedBytes
+    $result.RecoveredRemote = $recoveredRemoteCount
     $result.Failed = $failedFiles.Count
     $result.FailedFiles = $failedFiles.ToArray()
     $result.PendingWithinCutoff = $failedFiles.Count
     $result.IncompatibleFiles = $incompatibleFiles.ToArray()
+    $result.RemoteConflicts = $remoteConflicts.ToArray()
 
     $completedUtc = (Get-Date).ToUniversalTime()
     $result.CompletedUtc = $completedUtc
@@ -1002,6 +1073,20 @@ function Invoke-BRAVOBazaSynchronization {
         $result.Status = 'INCOMPLETE'
     } elseif ($plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail') {
         $result.Status = 'MUTATION_VIOLATION'
+    } elseif ($remoteConflicts.Count -gt 0) {
+        # P1 (round 3): конфлікт із наявним remote-файлом іншого розміру —
+        # явний не-COMPLETE статус: provenance успішного циклу не
+        # просувається, checkpoint не публікується, Health -> CRITICAL.
+        $result.Status = 'REMOTE_CONFLICT'
+        $conflictPreview = @(
+            $remoteConflicts | Select-Object -First 3 | ForEach-Object {
+                "$($_.RelativePath) (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)"
+            }
+        ) -join '; '
+        $result.Error = (
+            "$($remoteConflicts.Count) кандидат(ів) конфліктують з уже наявними remote-файлами іншого розміру: " +
+            "$conflictPreview — перезапис заборонено append-only контрактом, цикл не вважається успішним"
+        )
     } elseif ($incompatibleFiles.Count -gt 0) {
         # P1 (hardening round 2): несумісні імена НЕ дають успішного циклу.
         # Раніше Failed=0 при пропущених несумісних кандидатах давав
@@ -1117,9 +1202,23 @@ function Write-BRAVOBazaRemoteCheckpoint {
         try {
             # Явна заміна попереднього checkpoint: RemoveFiles лише для
             # ВЛАСНОГО телеметрійного файлу двигуна — жодні дані бекапів
-            # цим шляхом не видаляються ніколи.
+            # цим шляхом не видаляються ніколи. P2 (round 3): результат
+            # RemoveFiles НЕ відкидається — WinSCP репортує per-file збої в
+            # RemovalOperationResult без винятку; ігнорування означало б
+            # "заміна вдалася", хоча стара ціль лишилась і MoveFile нижче
+            # впаде або, гірше, репортнеться неправда.
             if ([bool]$Session.FileExists($canonicalRemoteCheckpointPath)) {
-                [void]$Session.RemoveFiles($canonicalRemoteCheckpointPath)
+                $canonicalRemovalResult = $Session.RemoveFiles($canonicalRemoteCheckpointPath)
+                if ($null -eq $canonicalRemovalResult -or -not [bool]$canonicalRemovalResult.IsSuccess) {
+                    try { [void]$Session.RemoveFiles($temporaryRemoteCheckpointPath) } catch {
+                        # Best-effort cleanup tmp-файлу: першопричина (збій
+                        # видалення попереднього checkpoint) важливіша.
+                    }
+                    return [pscustomobject]@{
+                        Attempted = $true; Published = $false
+                        Error = 'не вдалося прибрати попередній checkpoint перед заміною — заміну НЕ виконано, канонічний шлях лишився зі старим checkpoint'
+                    }
+                }
             }
             $Session.MoveFile($temporaryRemoteCheckpointPath, $canonicalRemoteCheckpointPath)
         } catch {
@@ -1165,9 +1264,12 @@ function Update-BRAVOBazaSyncResultNewAfterCutoff {
         [Parameter(Mandatory = $true)][string]$StateRoot
     )
 
-    if ($SyncResult.Status -notin @('COMPLETE', 'INCOMPLETE', 'MUTATION_VIOLATION')) {
+    if ($SyncResult.Status -notin @('COMPLETE', 'INCOMPLETE', 'MUTATION_VIOLATION', 'INCOMPATIBLE_NAME', 'REMOTE_CONFLICT')) {
         # ERROR/STATE_INVALID: стан ненадійний або синхронізація взагалі не
         # відбулась — NewAfterCutoff тут не має сенсу, лишаємо 0.
+        # INCOMPATIBLE_NAME/REMOTE_CONFLICT (P2, round 3) дозволені: цикл
+        # реально відбувся і state збережено — локальна діагностика "скільки
+        # файлів з'явилось після cutoff" для них так само валідна.
         return $SyncResult
     }
 
@@ -1310,12 +1412,43 @@ function Get-BRAVOBazaFastHealthResult {
             Info = @()
         }
     }
+    # P2 (round 3): якщо в одному циклі співіснують кілька категорій
+    # (мутації, remote-конфлікти, несумісні імена) — одна лишається
+    # основним Status/Message, але решта НЕ мають зникати до наступного
+    # прогону: кожна гілка нижче додає ІНШІ непорожні категорії в Info.
+    $mutationSummary = if (@($SyncResult.MutationViolations).Count -gt 0) {
+        $names = ($SyncResult.MutationViolations | Select-Object -First 5 | ForEach-Object { $_.RelativePath }) -join ', '
+        "append-only мутації: $(@($SyncResult.MutationViolations).Count) файл(ів) ($names)"
+    } else { $null }
+    $conflictSummary = if (@($SyncResult.RemoteConflicts).Count -gt 0) {
+        $names = ($SyncResult.RemoteConflicts | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; '
+        "remote-конфлікти розміру: $(@($SyncResult.RemoteConflicts).Count) файл(ів) — $names"
+    } else { $null }
+    $incompatibleSummary = if (@($SyncResult.IncompatibleFiles).Count -gt 0) {
+        $names = ($SyncResult.IncompatibleFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) ($($_.Reason))" }) -join '; '
+        "несумісні з SFTP імена: $(@($SyncResult.IncompatibleFiles).Count) файл(ів) — $names"
+    } else { $null }
+
     if ($SyncResult.Status -eq 'MUTATION_VIOLATION') {
         $names = ($SyncResult.MutationViolations | Select-Object -First 5 | ForEach-Object { $_.RelativePath }) -join ', '
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
             Message = "$($SyncResult.Component) — виявлено append-only invariant violation ($($SyncResult.MutationViolations.Count) файл(ів), напр.: $names) — передачу заблоковано, потрібне ручне рішення"
-            Info = @()
+            Info = @(@($conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
+        }
+    }
+    if (@($SyncResult.RemoteConflicts).Count -gt 0) {
+        # P1 (round 3): remote-шлях кандидата зайнятий файлом іншого
+        # розміру — перезапис заборонено; точний шлях і обидва розміри в
+        # повідомленні, щоб оператор бачив, ЩО саме конфліктує.
+        return [pscustomobject]@{
+            Level = 'CRITICAL'; Healthy = $false
+            Message = (
+                "$($SyncResult.Component) — $(@($SyncResult.RemoteConflicts).Count) кандидат(ів) конфліктують з уже наявними remote-файлами: " +
+                (($SyncResult.RemoteConflicts | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; ') +
+                " — перезапис заборонено append-only контрактом, потрібне ручне рішення оператора"
+            )
+            Info = @(@($mutationSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
         }
     }
     if ($SyncResult.Failed -gt 0 -or $SyncResult.PendingWithinCutoff -gt 0) {
@@ -1327,7 +1460,7 @@ function Get-BRAVOBazaFastHealthResult {
                 "Виявлено: $($SyncResult.DiscoveredWithinCutoff) • Передано: $($SyncResult.Uploaded) • " +
                 "Не передано: $($SyncResult.Failed)$(if ($failedNames) { " ($failedNames)" })"
             )
-            Info = @()
+            Info = @(@($mutationSummary, $conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
         }
     }
     if (@($SyncResult.IncompatibleFiles).Count -gt 0) {
@@ -1338,7 +1471,7 @@ function Get-BRAVOBazaFastHealthResult {
                 "$($SyncResult.Component) — $(@($SyncResult.IncompatibleFiles).Count) файл(ів) не передано через несумісність імені з SFTP " +
                 "(потребує ручного скорочення локального імені): $incompatibleNames"
             )
-            Info = @()
+            Info = @(@($mutationSummary, $conflictSummary) | Where-Object { $null -ne $_ })
         }
     }
 
