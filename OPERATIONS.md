@@ -883,7 +883,10 @@ Override-и — окремі одне від одного налаштуванн
   НЕЗАЛЕЖНО від блоку `discoverySettings` — `discoverySettings.BravoRoot`
   його НЕ встановлює і НЕ обходить. Якщо служби BRAVO немає, а LIMSRoot
   дійсно потрібен (Maintenance), задайте явно `pathSettings.LIMSRoot`.
-  `BRAVO_ARCHIV` LIMSRoot не читає — там ця відсутність не блокує backup.
+  `BRAVO_ARCHIV` НЕ ВИМАГАЄ LIMSRoot (не залежить від нього як від
+  результату backup — free-space preflight технічно читає значення для
+  sanity-перевірки, з fallback на RuntimeRoot, коли воно порожнє) — його
+  відсутність не блокує backup.
 
 Коли потрібне джерело задано override-ом, backup так само не залежить від
 служби.

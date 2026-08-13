@@ -95,11 +95,13 @@ Invariants below).
   perfectly valid canonical `bravo.ini`, and an explicit `BackupRoot`,
   config loading still failed on the LIMSRoot check alone. `LIMSRoot`/
   `SystemLogRoot` resolution no longer throws inside `BRAVO.config` itself;
-  each consumer now decides its own criticality. `BRAVO_ARCHIV` reads
-  neither value (confirmed by grep: MODEL/BLOG/BRAVOEXCH come only from
+  each consumer now decides its own criticality. `BRAVO_ARCHIV` does not
+  *require* `LIMSRoot`/`SystemLogRoot` (MODEL/BLOG/BRAVOEXCH come only from
   `bravo.ini`, `BackupRoot` has its own independent explicit-or-AUTO
-  resolution with its own `Error`/throw, and `BRAVO_HEALTH` reads neither
-  value either — it already only requires `BackupRoot`). `BRAVO_MAINTENANCE`
+  resolution with its own `Error`/throw) — `$rootPath` is still technically
+  read for an informational log line and as a free-space-preflight sanity
+  fallback, it just never gates the backup result. `BRAVO_HEALTH` reads
+  neither value at all — it already only requires `BackupRoot`. `BRAVO_MAINTENANCE`
   is unaffected: it already had its own explicit, independent guard
   (`effectiveLimsRoot`/`systemLogRoot`/`backupRootPath` non-empty, `exit 30`
   otherwise) immediately after loading configuration, so Maintenance's
@@ -174,6 +176,62 @@ Invariants below).
   test for the latter was judged impractical without restructuring
   `BRAVO_MAINTENANCE.ps1`'s monolithic top-level flow into a callable
   function purely for testability.
+- Closed three post-fix regressions surfaced by review of the LIMSRoot fix
+  above. `BRAVO_DRY_RUN.ps1` unconditionally reported `PASS` for
+  `LIMSRoot`/`SystemLogRoot` even when unresolved (`Source -eq 'Error'`),
+  which would have hidden a genuine `BRAVO_MAINTENANCE`/
+  `BRAVO_RESTORE_RECOVERY` readiness problem behind a green result. New
+  `Get-BRAVODryRunRootReadinessResults` (pure, unit-tested) now reports:
+  `BackupRoot` unresolved is always `FAIL` (mandatory for
+  `BRAVO_ARCHIV`/`BRAVO_ARCHIV_HEALTH`); `LIMSRoot`/`SystemLogRoot`
+  unresolved is `WARN` when `Maintenance`/`Recovery` are both disabled in
+  `schedulerSettings` (Archive-only context — backup stays allowed) and
+  `FAIL` when either is enabled (they genuinely need the root, and
+  `BRAVO_DRY_RUN.ps1`'s own overall readiness verdict already turns "НЕ
+  ГОТОВО" on any `FAIL`, so this alone makes Maintenance/Recovery
+  explicitly not-ready without touching `BRAVO_TASKS_INSTALL.ps1`, whose
+  job is task registration, not runtime readiness).
+  Second, `[System.IO.Path]::Combine($SystemLogRoot, 'Trace')` (and the
+  equivalent for the optional exchangAPI/BravoWeb log directories) silently
+  returns a *relative* path when `$SystemLogRoot` is empty instead of
+  throwing or returning empty — the subsequent write-probe would have
+  created a stray `.\Trace` in the process's current directory.
+  `Get-BRAVODryRunOptionalComponentPlan` and the `SystemLog\Trace` target
+  are now both guarded on a non-empty `SystemLogRoot`. Third,
+  `Test-BRAVOFileSystemWriteAccess` created missing destination directories
+  as part of its readiness probe but never removed them, contradicting Dry
+  Run's own documented "does not create directories" contract; it now
+  removes a directory it created if the directory is still empty once the
+  probe file is deleted (a directory with unrelated content left in it by
+  something else is never touched). Also renamed
+  `Get-BRAVODryRunConfiguredServiceState`'s comment, which still claimed
+  Discovery "deliberately" excludes `Disabled` services — no longer true
+  after the fix above. Regression coverage: `DryRun/
+  UnresolvedBackupRootIsAlwaysFail`, `DryRun/
+  UnresolvedLimsRootIsWarnWhenMaintenanceRecoveryDisabled`, `DryRun/
+  UnresolvedLimsRootIsFailWhenMaintenanceEnabled`, `DryRun/
+  UnresolvedLimsRootIsFailWhenRecoveryEnabled`, `DryRun/
+  ResolvedRootsAreAlwaysPass` (all behavioral, against the extracted pure
+  function); `DryRun/EmptySystemLogRootProducesNoRelativeWriteTargets`
+  (behavioral, proves no relative write target is ever produced) and
+  `Runtime/08-WriteProbeCleansUpEmptyCreatedDirectory` (behavioral, proves
+  the probe removes a directory it created once it's confirmed empty).
+  Two more close the remaining coverage gaps this same review round
+  flagged: `ProductionConfig/BravoAbsentCanonicalAutoDiscoveredIniWorks`
+  drives the real production loader with `$env:SystemRoot` pointed at a
+  fixture `SysWOW64\bravo.ini` and *no* `discoverySettings.BravoIniPath`
+  override, proving ordinary canonical auto-discovery works, not only the
+  explicit-override path every other `ProductionConfig/*` test used
+  (x86/`System32` coverage would need `BRAVO.config` to pass
+  `-Is64BitOperatingSystem` through explicitly, which it does not — out of
+  scope without a production change); and `Backup/
+  ArchiveInvokedWhenBravoServiceAbsent` extends the `Backup/
+  ArchiveInvokedWhenBravoService{Running,Stopped,Disabled}` behavioral
+  chain (production loader -> `archiveDefinitions[MODEL].Source` ->
+  `Invoke-BRAVOComponentBackup` -> published archive) to the
+  service-genuinely-absent case, which the renamed `ProductionConfig/
+  BravoAbsentIniSourcesPrepareArchiveDefinition` only proved up to
+  `archiveDefinitions` being ready, not backup execution itself.
 
 ## 5.0.0 — 2026-08-11
 

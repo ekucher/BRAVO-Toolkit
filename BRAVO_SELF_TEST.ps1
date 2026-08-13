@@ -3877,7 +3877,8 @@ try {
         -FunctionNames @(
             'Test-SettingEnabled',
             'Get-BRAVODryRunOptionalComponentPlan',
-            'Get-BRAVODryRunRangeIdPlan'
+            'Get-BRAVODryRunRangeIdPlan',
+            'Get-BRAVODryRunRootReadinessResults'
         )
     $rangeIdSettingsWithoutFilePath = [pscustomobject]@{
         Enabled = $true
@@ -4025,6 +4026,106 @@ try {
         -Condition ($presentBravoWebDryRunPlan.WriteAccessTargets.Keys -contains 'SystemLog\BravoWeb\Apache' -and $presentBravoWebDryRunPlan.WriteAccessTargets.Keys -contains 'SystemLog\BravoWeb\Application' -and $presentBravoWebDryRunPlan.ServiceNames -contains 'BRAVO Web/Apache (автовизначення)') `
         -Name 'DryRun/PresentBravoWebPreservesProbeAndPlan' `
         -Failure 'встановлений active BRAVO Web має зберігати web probes і service plan'
+
+    # --- Post-review round: SystemLogRoot="" не повинен формувати ВІДНОСНИЙ
+    # похідний шлях (Trace/exchangAPI/BravoWeb) — [IO.Path]::Combine("", X)
+    # мовчки повертає X (не порожній рядок, не виняток), і подальший
+    # write-probe реально створив би X у поточній директорії процесу.
+    $emptySystemLogRootBravoWebPlan = & $dryRunPlanModule {
+        Get-BRAVODryRunOptionalComponentPlan `
+            -BravoWebEnabled $true `
+            -BravoWebServiceExists $true `
+            -BravoWebServiceDisabled $false `
+            -ExchangeApiServiceExists $true `
+            -ExchangeApiServiceDisabled $false `
+            -SystemLogRoot '' `
+            -ExchangeApiServiceName 'exchangAPI'
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $emptySystemLogRootBravoWebPlan.BravoWebEligible -and
+            $emptySystemLogRootBravoWebPlan.ExchangeApiEligible -and
+            $emptySystemLogRootBravoWebPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\BravoWeb\Apache' -and
+            $emptySystemLogRootBravoWebPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\BravoWeb\Application' -and
+            $emptySystemLogRootBravoWebPlan.WriteAccessTargets.Keys -notcontains 'SystemLog\exchangAPI' -and
+            $emptySystemLogRootBravoWebPlan.WriteAccessTargets.Values -notcontains 'Trace' -and
+            @($emptySystemLogRootBravoWebPlan.WriteAccessTargets.Values | Where-Object { -not (Split-Path -Path ([string]$_) -IsAbsolute) }).Count -eq 0
+        ) `
+        -Name 'DryRun/EmptySystemLogRootProducesNoRelativeWriteTargets' `
+        -Failure 'SystemLogRoot="" не повинен формувати ЖОДНОГО відносного write-probe шляху (exchangAPI/BravoWeb), навіть коли компоненти самі по собі eligible — [IO.Path]::Combine("", X) мовчки дає відносний X'
+
+    # --- Root readiness: BackupRoot mandatory, LIMSRoot/SystemLogRoot
+    # Archive-only WARN, Maintenance/Recovery-enabled FAIL.
+    $rootReadinessBackupUnresolved = & $dryRunPlanModule {
+        Get-BRAVODryRunRootReadinessResults `
+            -BackupRootSource 'Error' -BackupRootValue '' -BackupRootReason 'не задано' `
+            -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS' -LimsRootReason 'ok' `
+            -SystemLogRootSource 'AutoFromLIMSRoot' -SystemLogRootValue 'D:\LIMS\ARCHIV\LOGS' -SystemLogRootReason 'ok' `
+            -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $false
+    }
+    $rootReadinessArchiveOnly = & $dryRunPlanModule {
+        Get-BRAVODryRunRootReadinessResults `
+            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+            -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+            -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+            -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $false
+    }
+    $rootReadinessMaintenanceEnabled = & $dryRunPlanModule {
+        Get-BRAVODryRunRootReadinessResults `
+            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+            -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+            -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+            -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $false
+    }
+    $rootReadinessRecoveryEnabled = & $dryRunPlanModule {
+        Get-BRAVODryRunRootReadinessResults `
+            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+            -LimsRootSource 'Error' -LimsRootValue '' -LimsRootReason 'службу BRAVO не знайдено' `
+            -SystemLogRootSource 'Error' -SystemLogRootValue '' -SystemLogRootReason 'вимагає LIMSRoot' `
+            -MaintenanceTaskEnabled $false -RecoveryTaskEnabled $true
+    }
+    $rootReadinessAllResolved = & $dryRunPlanModule {
+        Get-BRAVODryRunRootReadinessResults `
+            -BackupRootSource 'ExplicitConfig' -BackupRootValue 'E:\Backup' -BackupRootReason 'ok' `
+            -LimsRootSource 'ServiceDiscovery' -LimsRootValue 'D:\LIMS' -LimsRootReason 'ok' `
+            -SystemLogRootSource 'AutoFromLIMSRoot' -SystemLogRootValue 'D:\LIMS\ARCHIV\LOGS' -SystemLogRootReason 'ok' `
+            -MaintenanceTaskEnabled $true -RecoveryTaskEnabled $true
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($rootReadinessBackupUnresolved | Where-Object { $_.Label -like 'BackupRoot*' }).Status -eq 'FAIL'
+        ) `
+        -Name 'DryRun/UnresolvedBackupRootIsAlwaysFail' `
+        -Failure 'невизначений BackupRoot має бути FAIL завжди — BackupRoot mandatory для Archive/Health незалежно від служб чи Maintenance/Recovery'
+    Test-BRAVOCondition `
+        -Condition (
+            (@($rootReadinessArchiveOnly | Where-Object { $_.Label -like 'LIMSRoot*' }).Status -eq 'WARN') -and
+            (@($rootReadinessArchiveOnly | Where-Object { $_.Label -like 'SystemLogRoot*' }).Status -eq 'WARN') -and
+            (@($rootReadinessArchiveOnly | Where-Object { $_.Status -eq 'FAIL' }).Count -eq 0)
+        ) `
+        -Name 'DryRun/UnresolvedLimsRootIsWarnWhenMaintenanceRecoveryDisabled' `
+        -Failure 'невизначені LIMSRoot/SystemLogRoot мають бути WARN (не FAIL, не мовчазний PASS), коли Maintenance і Recovery вимкнені — Archive/Health їх не потребують'
+    Test-BRAVOCondition `
+        -Condition (
+            (@($rootReadinessMaintenanceEnabled | Where-Object { $_.Label -like 'LIMSRoot*' }).Status -eq 'FAIL') -and
+            (@($rootReadinessMaintenanceEnabled | Where-Object { $_.Label -like 'SystemLogRoot*' }).Status -eq 'FAIL')
+        ) `
+        -Name 'DryRun/UnresolvedLimsRootIsFailWhenMaintenanceEnabled' `
+        -Failure 'невизначені LIMSRoot/SystemLogRoot мають бути явним FAIL, коли Maintenance увімкнено в schedulerSettings — це readiness-помилка САМЕ для нього'
+    Test-BRAVOCondition `
+        -Condition (
+            (@($rootReadinessRecoveryEnabled | Where-Object { $_.Label -like 'LIMSRoot*' }).Status -eq 'FAIL') -and
+            (@($rootReadinessRecoveryEnabled | Where-Object { $_.Label -like 'SystemLogRoot*' }).Status -eq 'FAIL')
+        ) `
+        -Name 'DryRun/UnresolvedLimsRootIsFailWhenRecoveryEnabled' `
+        -Failure 'невизначені LIMSRoot/SystemLogRoot мають бути явним FAIL, коли Recovery увімкнено в schedulerSettings, навіть якщо Maintenance вимкнено'
+    Test-BRAVOCondition `
+        -Condition (
+            @($rootReadinessAllResolved | Where-Object { $_.Status -ne 'PASS' }).Count -eq 0
+        ) `
+        -Name 'DryRun/ResolvedRootsAreAlwaysPass' `
+        -Failure 'визначені LIMSRoot/SystemLogRoot/BackupRoot мають бути PASS незалежно від Maintenance/Recovery'
+
     Test-BRAVOCondition `
         -Condition (
             $healthScriptText.Contains('Format-HealthIssueFileName -Issue $Issue') -and
@@ -6881,8 +6982,8 @@ try {
                     [bool]$prodLoader1ModelDefinition.Enabled -and
                     $prodLoader1ModelDefinition.Source -eq (Join-Path $prodLoaderModelSourceExpected '*')
                 ) `
-                -Name 'ProductionConfig/BravoAbsentIniSourcesReachArchiveGeneration' `
-                -Failure 'служба BRAVO відсутня + canonical bravo.ini з валідними MODEL/BLOG/BRAVOEXCH + явний BackupRoot -> Import-BravoConfiguration має succeed, а archiveDefinitions[MODEL].Source має вказувати на реальне джерело з ini (LIMSRoot може лишатись Error — MODEL generation це не блокує)'
+                -Name 'ProductionConfig/BravoAbsentIniSourcesPrepareArchiveDefinition' `
+                -Failure 'служба BRAVO відсутня + canonical bravo.ini з валідними MODEL/BLOG/BRAVOEXCH + явний BackupRoot -> Import-BravoConfiguration має succeed, а archiveDefinitions[MODEL].Source має вказувати на реальне джерело з ini (LIMSRoot може лишатись Error — MODEL generation це не блокує). Це доводить лише що archiveDefinitions ГОТОВИЙ — реальний виклик Invoke-BRAVOComponentBackup перевіряє окремий behavioral тест Backup/ArchiveInvokedWhenBravoServiceAbsent'
 
             # --- Acceptance 2: BRAVO absent + explicit source overrides ->
             # Archive works without service (ini deliberately unreadable).
@@ -7012,6 +7113,67 @@ try {
         } finally {
             if (Test-Path -LiteralPath $prodLoaderRoot -PathType Container) {
                 Remove-Item -LiteralPath $prodLoaderRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # --- Acceptance 7 (canonical, non-override coverage): БЕЗ
+        # discoverySettings.BravoIniPath override. Усі acceptance-тести вище
+        # передають явний BravoIniPath override — це доводить лише "override
+        # працює", НЕ доводить, що звичайний production auto-discovery (те,
+        # що реально станеться на сервері, де ніхто нічого не налаштовував
+        # вручну в discoverySettings) так само знаходить bravo.ini. Коли
+        # BRAVO.config викликає Resolve-BRAVOInstallationDiscovery без
+        # -SystemRoot, вона сама падає на $env:SystemRoot
+        # (Get-BRAVOSystemDirectoryPath) — єдина легітимна точка ін'єкції
+        # для ЦЬОГО шляху без зміни виробничого коду. x64 SysWOW64 —
+        # Is64BitOperatingSystem теж не передається BRAVO.config, тому бере
+        # РЕАЛЬНУ бітність ОС; x86/System32 покриття вимагало б передавати
+        # -Is64BitOperatingSystem $false, для чого BRAVO.config не має
+        # параметра — тому НЕ покривається (немає fixture-точки без зміни
+        # production-коду, як і застережено в завданні).
+        $canonicalIniTestRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_CANONICAL_INI_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        $canonicalIniOriginalSystemRoot = $env:SystemRoot
+        try {
+            [void][IO.Directory]::CreateDirectory($canonicalIniTestRoot)
+            $canonicalIniBackupRoot = Join-Path $canonicalIniTestRoot 'Backup'
+            [void][IO.Directory]::CreateDirectory($canonicalIniBackupRoot)
+            $canonicalIniModelDir = Join-Path $canonicalIniTestRoot 'Model'
+            [void][IO.Directory]::CreateDirectory($canonicalIniModelDir)
+            $canonicalIniFixtureSystemRoot = Join-Path $canonicalIniTestRoot 'FixtureWindowsX64'
+            $canonicalIniSysWow64Dir = Join-Path $canonicalIniFixtureSystemRoot 'SysWOW64'
+            [void][IO.Directory]::CreateDirectory($canonicalIniSysWow64Dir)
+            [IO.File]::WriteAllLines((Join-Path $canonicalIniSysWow64Dir 'bravo.ini'), @(
+                '[model]',
+                ("MODEL={0}" -f (Join-Path $canonicalIniModelDir 'lims')),
+                ("BLOG={0}\" -f (Join-Path $canonicalIniTestRoot 'BLOG')),
+                ("BEXCH={0}" -f (Join-Path $canonicalIniTestRoot 'bravoexch'))
+            ))
+
+            $env:SystemRoot = $canonicalIniFixtureSystemRoot
+            $canonicalIniResult = New-BRAVOProductionConfigFixtureResult `
+                -Root $canonicalIniTestRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $canonicalIniBackupRoot }
+            $canonicalIniModelDefinition = if ($null -ne $canonicalIniResult.ArchiveDefinitions) {
+                @($canonicalIniResult.ArchiveDefinitions | Where-Object { $_.Type -eq 'MODEL' })[0]
+            } else { $null }
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $canonicalIniResult.Threw -and
+                    $null -ne $canonicalIniModelDefinition -and
+                    $canonicalIniModelDefinition.Source -eq (Join-Path $canonicalIniModelDir '*') -and
+                    $canonicalIniResult.BravoDiscoveryResult.Reasons.MODEL.StartsWith('bravo.ini') -and
+                    $canonicalIniResult.BravoDiscoveryResult.BravoIniPath -eq (Join-Path $canonicalIniSysWow64Dir 'bravo.ini')
+                ) `
+                -Name 'ProductionConfig/BravoAbsentCanonicalAutoDiscoveredIniWorks' `
+                -Failure 'служба BRAVO відсутня, pathSettings.LIMSRoot="", БЕЗ discoverySettings.BravoIniPath override -> canonical auto-discovery ($env:SystemRoot\SysWOW64\bravo.ini) все одно має дати MODEL_SOURCE — звичайний production-сценарій без ручного discoverySettings, не лише override-шлях'
+        } finally {
+            $env:SystemRoot = $canonicalIniOriginalSystemRoot
+            if (Test-Path -LiteralPath $canonicalIniTestRoot -PathType Container) {
+                Remove-Item -LiteralPath $canonicalIniTestRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
 
@@ -7152,6 +7314,109 @@ try {
         } finally {
             if (Test-Path -LiteralPath $serviceStateBackupTestRoot -PathType Container) {
                 Remove-Item -LiteralPath $serviceStateBackupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # --- Behavioral: NotInstalled (служби взагалі немає), через РЕАЛЬНИЙ
+        # production loader, не лише Discovery helper. Три стани вище
+        # (Running/Stopped/Disabled) резолвлять джерело через
+        # Resolve-BRAVOInstallationDiscovery напряму — тут той самий
+        # ланцюжок "discovered source -> Invoke-BRAVOComponentBackup ->
+        # опублікований archive", але джерело виходить з РЕАЛЬНОГО
+        # Import-BravoConfiguration (New-BRAVOProductionConfigFixtureResult,
+        # той самий helper, що ProductionConfig/* тести вище), коли служби
+        # немає взагалі — найглибша можлива перевірка цього шляху.
+        $absentBackupTestRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_ABSENT_BACKUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($absentBackupTestRoot)
+            $absentBackupIniPath = Join-Path $absentBackupTestRoot 'bravo.ini'
+            $absentBackupModelDir = Join-Path $absentBackupTestRoot 'Model'
+            [void][IO.Directory]::CreateDirectory($absentBackupModelDir)
+            [IO.File]::WriteAllText((Join-Path $absentBackupModelDir 'data.txt'), 'model-content', (New-Object Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllLines($absentBackupIniPath, @(
+                '[model]',
+                ("MODEL={0}" -f (Join-Path $absentBackupModelDir 'lims'))
+            ))
+            $absentBackupRoot = Join-Path $absentBackupTestRoot 'Backup'
+            [void][IO.Directory]::CreateDirectory($absentBackupRoot)
+
+            $absentProdLoaderResult = New-BRAVOProductionConfigFixtureResult `
+                -Root $absentBackupTestRoot -SourceConfigPath $prodLoaderSourceConfigPath `
+                -ConfigLoaderPath $prodLoaderConfigLoaderPath -RuntimeRoot $root `
+                -Services @() `
+                -PathSettingsOverrides @{ BackupRoot = $absentBackupRoot } `
+                -DiscoverySettingsOverrides @{ BravoIniPath = $absentBackupIniPath }
+            $absentModelDefinition = if ($null -ne $absentProdLoaderResult.ArchiveDefinitions) {
+                @($absentProdLoaderResult.ArchiveDefinitions | Where-Object { $_.Type -eq 'MODEL' })[0]
+            } else { $null }
+
+            $absentStateDest = Join-Path $absentBackupTestRoot 'DEST_Absent'
+            [void][IO.Directory]::CreateDirectory($absentStateDest)
+            $absentArchiveFileName = 'model_20260813_000000.mdz'
+
+            $absentBackupExecutionResult = if ($null -ne $absentModelDefinition -and
+                -not [string]::IsNullOrWhiteSpace([string]$absentModelDefinition.Source)) {
+                & $archiveRuntimeModule {
+                    param($SourcePath, $DestinationDirectory, $ArchiveName)
+                    $script:hashFileExtension = '.sha512'
+                    $script:hashFileEncoding = 'utf-8'
+                    $knownHash = ('d' * 128).ToUpperInvariant()
+                    $script:archiveInvocationCount = 0
+                    function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+                    function Write-Log { param([string]$Message, [string]$Level = 'INFO') }
+                    function New-Archive {
+                        param([string]$SourcePath, [string]$FullArchivePath, [string]$ArcPath, [string]$ArcParams)
+                        $script:archiveInvocationCount++
+                        [IO.File]::WriteAllText($FullArchivePath, "archive-content", (New-Object Text.UTF8Encoding($false)))
+                        [pscustomobject]@{ CreateSuccess = $true; IntegritySuccess = $true; ErrorStage = $null; Error = $null }
+                    }
+                    function New-SHA512Hash {
+                        param([string]$FilePath, [string]$HashFilePath)
+                        [IO.File]::WriteAllText($HashFilePath, ("{0} *{1}" -f $knownHash.ToLowerInvariant(), [IO.Path]::GetFileName($FilePath)), (New-Object Text.UTF8Encoding($false)))
+                        return $true
+                    }
+                    function Get-BRAVOFileHash { param([string]$Path, [string]$Algorithm) [pscustomobject]@{ Hash = $knownHash } }
+                    function Write-BRAVOFinalHashFile {
+                        param([string]$Path, [string]$Hash, [string]$ArchiveName)
+                        [IO.File]::WriteAllText($Path, ("{0} *{1}" -f $Hash.ToLowerInvariant(), $ArchiveName), (New-Object Text.UTF8Encoding($false)))
+                    }
+                    $result = Invoke-BRAVOComponentBackup `
+                        -Component 'MODEL' `
+                        -GenerationId '20260813_000000' `
+                        -OriginalSourcePath $SourcePath `
+                        -SourcePath $SourcePath `
+                        -DestinationDirectory $DestinationDirectory `
+                        -ArchiveName $ArchiveName `
+                        -ArcPath 'fake7za.exe'
+                    [pscustomobject]@{
+                        CreateSuccess = [bool]$result.CreateSuccess
+                        IntegritySuccess = [bool]$result.IntegritySuccess
+                        HashSuccess = [bool]$result.HashSuccess
+                        ArchiveInvocationCount = $script:archiveInvocationCount
+                        ArchiveFileExists = Test-Path -LiteralPath (Join-Path $DestinationDirectory $ArchiveName) -PathType Leaf
+                    }
+                } (Join-Path $absentModelDefinition.Source '*') $absentStateDest $absentArchiveFileName
+            } else { $null }
+
+            Test-BRAVOCondition `
+                -Condition (
+                    -not $absentProdLoaderResult.Threw -and
+                    $null -ne $absentModelDefinition -and
+                    $absentModelDefinition.Source -eq (Join-Path $absentBackupModelDir '*') -and
+                    $null -ne $absentBackupExecutionResult -and
+                    $absentBackupExecutionResult.CreateSuccess -and
+                    $absentBackupExecutionResult.IntegritySuccess -and
+                    $absentBackupExecutionResult.HashSuccess -and
+                    $absentBackupExecutionResult.ArchiveInvocationCount -eq 1 -and
+                    $absentBackupExecutionResult.ArchiveFileExists
+                ) `
+                -Name 'Backup/ArchiveInvokedWhenBravoServiceAbsent' `
+                -Failure 'служба BRAVO взагалі відсутня (не Disabled — не встановлена): production loader (Import-BravoConfiguration) -> archiveDefinitions[MODEL].Source -> Invoke-BRAVOComponentBackup має реально дійти до виклику архіватора (лічильник =1) і опублікувати archive на диску, так само, як для Running/Stopped/Disabled'
+        } finally {
+            if (Test-Path -LiteralPath $absentBackupTestRoot -PathType Container) {
+                Remove-Item -LiteralPath $absentBackupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
 
@@ -10400,10 +10665,16 @@ function Get-BRAVOMaintenanceSummaryResult {
             param($Path)
             Test-BRAVOFileSystemReadAccess -Path $Path
         } (Join-Path $preflightTestRoot "no-such-directory")
+        # $preflightTestRoot (не $missingDirectory) — після фікса "cleanup
+        # порожнього probe-каталогу" сам $missingDirectory (лист .\created\
+        # by\probe) прибирається, якщо лишився порожнім; батьківський
+        # $preflightTestRoot прибирання не чіпає (лише сам $Path, не
+        # предків), тому лишається надійною ціллю для "read access на
+        # каталог, що реально існує".
         $readExisting = & $dryRunProbeModule {
             param($Path)
             Test-BRAVOFileSystemReadAccess -Path $Path
-        } $missingDirectory
+        } $preflightTestRoot
         Test-BRAVOCondition `
             -Condition (
                 [bool]$writeResult.Success -and
@@ -10416,6 +10687,17 @@ function Get-BRAVOMaintenanceSummaryResult {
             ) `
             -Name "Runtime/08-SystemPreflightPerformsRealWriteProbe" `
             -Failure "preflight має реально створювати, записувати, зчитувати назад і видаляти probe-файл: наявність каталогу не гарантує право запису під SYSTEM"
+        # Post-review round: тимчасовий probe не повинен лишати production
+        # каталог, якого до нього не існувало — якщо він створив $Path і
+        # після видалення probe-файла той лишився порожнім, сам probe має
+        # прибрати й $Path.
+        Test-BRAVOCondition `
+            -Condition (
+                -not (Test-Path -LiteralPath $missingDirectory) -and
+                ([string]$writeResult.Detail).Contains('тимчасово створювався для перевірки й прибраний після неї')
+            ) `
+            -Name 'Runtime/08-WriteProbeCleansUpEmptyCreatedDirectory' `
+            -Failure 'write-probe має прибирати за собою каталог, який САМ створив, якщо після перевірки він лишився порожнім — "dry" run не повинен лишати побічний production-каталог на диску'
         Test-BRAVOCondition `
             -Condition (
                 $archiveScriptText.Contains('function Test-BRAVOFileSystemWriteProbe') -and
