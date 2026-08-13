@@ -658,6 +658,24 @@ Invariants below).
   pending-marker recovery chain is re-verified end-to-end with the
   production provider boundary
   (`PendingMarkerRecoveryWorksWithProductionProviderBoundary`).
+- Fix the fifth real-SFTP acceptance finding (DEV-LIMS, 2026-08-13):
+  the standalone-fallback BAZA sync in `BRAVO.Health.Runtime` passed the
+  raw bundle `$winSCPPath` (`Tools\WinSCP.com`) into the engine's
+  `-WinSCPExecutablePath` — the same defect as acceptance blocker #3,
+  in the second wiring call site. It normally never executes (Health
+  reuses the Archive-provided SyncResult), and surfaced only when an
+  SFTP authentication failure made Archive skip the BAZA phase, sending
+  post-backup Health down its fallback path — where the round-3
+  defense-in-depth guard caught the `.com` stub in production and
+  failed fast with the exact remediation message instead of hanging.
+  The Health wiring now resolves the same dll+exe pair via
+  `Get-BRAVOWinSCPDotNetComponents` (controlled `ERROR` SyncResult when
+  no compatible pair exists), mirroring the Archive fix. New structural
+  test for the Health branch wiring plus a whole-bundle guard
+  (`Diagnostics/NoRawWinSCPComPathPassedToEngine`) that forbids passing
+  raw `$winSCPPath` into `-WinSCPExecutablePath` anywhere — the same
+  defect appeared in two independent call sites, so the class is now
+  closed bundle-wide.
 - Unified console progress for multi-substep stages in `BRAVO_ARCHIV`
   (UI-only refactor — no backup/VSS/SFTP/BAZA/retention semantics
   changed). New canonical helpers in `BRAVO.Console`

@@ -854,6 +854,26 @@ try {
         -Name "Diagnostics/NoKeywordParsedAsCommand" `
         -Failure "statement-keyword у позиції команди (напр. if усередині (...) замість `$(...)) валідно парситься і падає ЛИШЕ в рантаймі CommandNotFoundException; знайдено: $($keywordAsCommandFindings.ToArray() -join ', ')"
 
+    # Acceptance DEV-LIMS (знахідки #3 і #5): сирий $winSCPPath (Tools\
+    # WinSCP.com -- CLI-стаб legacy-шляхів) НЕ сміє потрапляти у
+    # -WinSCPExecutablePath двигуна В ЖОДНОМУ call-site комплекту: .NET-
+    # асемблі потрібен winscp.exe (пара резолвиться через
+    # Get-BRAVOWinSCPDotNetComponents). Той самий дефект уже двічі виринав
+    # у двох різних wiring-точках (Archive, Health) -- guard закриває клас.
+    $rawComPathFindings = New-Object System.Collections.ArrayList
+    foreach ($analyzedFile in $powerShellFiles) {
+        if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
+        # Сам self-test містить цей літерал у заборонних asserts.
+        if ($analyzedFile.Name -eq 'BRAVO_SELF_TEST.ps1') { continue }
+        foreach ($rawComPathMatch in @(Select-String -Path $analyzedFile.FullName -Pattern '-WinSCPExecutablePath $winSCPPath' -SimpleMatch)) {
+            [void]$rawComPathFindings.Add(("{0}:{1}" -f $analyzedFile.Name, $rawComPathMatch.LineNumber))
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($rawComPathFindings.Count -eq 0) `
+        -Name "Diagnostics/NoRawWinSCPComPathPassedToEngine" `
+        -Failure "жоден call-site не сміє передавати сирий `$winSCPPath у -WinSCPExecutablePath (WinSCP.com != winscp.exe; резолвіть пару через Get-BRAVOWinSCPDotNetComponents); знайдено: $($rawComPathFindings.ToArray() -join ', ')"
+
     # Acceptance DEV-LIMS (2026-08-13, той самий прогін): "a{0}" + "b{3}" -f args
     # форматує ЛИШЕ правий рядок (-f зв'язується сильніше за +) — перша
     # половина retention-аудиту вийшла в лог з літеральними {0}/{1}/{2}.
@@ -15179,6 +15199,17 @@ function Write-BRAVOLog {
 
             Test-BRAVOCondition -Condition ($bazaIncrementalBranchText.Contains('$script:bazaSyncResults') -and $bazaIncrementalBranchText.Contains('ContainsKey($folderCheck.ComponentKey)')) `
                 -Name 'BazaSync/HealthChecksArchivePassedResultFirst' -Failure 'Health must check $script:bazaSyncResults (Archive-provided) before falling back to its own sync'
+
+            # Acceptance DEV-LIMS знахідка #5: fallback-шлях Health передавав
+            # сирий $winSCPPath (WinSCP.com) у двигун -- guard session-функції
+            # зловив це в production (fail-fast замість зависання), але wiring
+            # мусить резолвити пару dll+exe так само, як Archive.
+            Test-BRAVOCondition -Condition (
+                $bazaIncrementalBranchText.Contains('Get-BRAVOWinSCPDotNetComponents') -and
+                $bazaIncrementalBranchText.Contains('-WinSCPExecutablePath $winSCPComponents.ExecutablePath') -and
+                $bazaIncrementalBranchText.Contains('-WinSCPAssemblyPath $winSCPComponents.AssemblyPath') -and
+                -not $bazaIncrementalBranchText.Contains('-WinSCPExecutablePath $winSCPPath')
+            ) -Name 'BazaSync/HealthWiringResolvesRealWinSCPExeForEngine' -Failure 'standalone-fallback Health має резолвити winscp.exe через Get-BRAVOWinSCPDotNetComponents (як Archive-wiring), а не передавати сирий $winSCPPath (WinSCP.com)'
         }
 
         # =======================================================================

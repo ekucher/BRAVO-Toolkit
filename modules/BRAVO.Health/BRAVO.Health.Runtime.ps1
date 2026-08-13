@@ -3182,19 +3182,41 @@ function Get-SFTPHealthIssues {
                 $bazaSyncResult = $script:bazaSyncResults[$folderCheck.ComponentKey]
             }
             if ($null -eq $bazaSyncResult) {
-                $bazaSyncResult = Invoke-BRAVOBazaComponentSyncSession `
-                    -Component $folderCheck.ComponentKey `
-                    -LocalDirectory $folderCheck.LocalPath `
-                    -RemoteRootPath $folderCheck.RemotePath `
-                    -RepositorySFTPUrl $sftpUrl `
-                    -HostKey $sftpHostKey `
-                    -WinSCPAssemblyPath $winSCPAssemblyPath `
-                    -WinSCPExecutablePath $winSCPPath `
-                    -StateRoot $bazaSettingsEffective.StateRoot `
-                    -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
-                    -OperationTimeoutSeconds ([math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)) `
-                    -MutationPolicy $bazaSettingsEffective.MutationPolicy `
-                    -WriteCheckpoint
+                # Acceptance DEV-LIMS (2026-08-13, знахідка #5): .NET-асемблі
+                # потрібен winscp.exe, а $winSCPPath — це Tools\WinSCP.com;
+                # цей fallback-шлях зазвичай не виконується (Health
+                # переви­користовує SyncResult від Archive), тому дефект
+                # виринув лише коли Archive пропустив BAZA через збій
+                # SFTP-автентифікації, і його зловив fail-fast guard
+                # session-функції. Резолвимо ТУ САМУ пару dll+exe, що й
+                # Archive-wiring (Invoke-BRAVOBazaIncrementalSync).
+                $winSCPComponents = Get-BRAVOWinSCPDotNetComponents `
+                    -WinSCPAssemblyPath ([string]$winSCPAssemblyPath) `
+                    -WinSCPPath ([string]$winSCPPath)
+                if ($null -eq $winSCPComponents) {
+                    $bazaSyncResult = New-BRAVOBazaSyncResult `
+                        -Component $folderCheck.ComponentKey `
+                        -CycleId (New-BRAVOBazaCycleId) `
+                        -StartedUtc (Get-Date).ToUniversalTime() `
+                        -CutoffUtc (Get-Date).ToUniversalTime()
+                    $bazaSyncResult.Status = 'ERROR'
+                    $bazaSyncResult.Error = 'не знайдено сумісну пару WinSCPnet.dll та WinSCP.exe для incremental BAZA sync'
+                    $bazaSyncResult.CompletedUtc = (Get-Date).ToUniversalTime()
+                } else {
+                    $bazaSyncResult = Invoke-BRAVOBazaComponentSyncSession `
+                        -Component $folderCheck.ComponentKey `
+                        -LocalDirectory $folderCheck.LocalPath `
+                        -RemoteRootPath $folderCheck.RemotePath `
+                        -RepositorySFTPUrl $sftpUrl `
+                        -HostKey $sftpHostKey `
+                        -WinSCPAssemblyPath $winSCPComponents.AssemblyPath `
+                        -WinSCPExecutablePath $winSCPComponents.ExecutablePath `
+                        -StateRoot $bazaSettingsEffective.StateRoot `
+                        -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
+                        -OperationTimeoutSeconds ([math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)) `
+                        -MutationPolicy $bazaSettingsEffective.MutationPolicy `
+                        -WriteCheckpoint
+                }
             }
             $bazaSyncResult = Update-BRAVOBazaSyncResultNewAfterCutoff `
                 -SyncResult $bazaSyncResult `
