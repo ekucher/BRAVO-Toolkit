@@ -4945,6 +4945,61 @@ exit
     }
 }
 
+function New-BRAVOBazaArchiveFullAuditProvider {
+    # Acceptance DEV-LIMS blocker #4 (2026-08-13): на Windows PowerShell 5.1
+    # .GetNewClosure() прив'язує scriptblock до НОВОГО dynamic module —
+    # захоплені ЗМІННІ копіюються, але command-lookup приватних функцій
+    # цього runtime (Get-BAZASFTPComparison — script-scope, не exported)
+    # у dynamic module НЕ резолвиться. Перший реальний виклик провайдера
+    # (bootstrap Full Audit через межу модуля BRAVO.BazaSync) падав
+    # CommandNotFoundException — підтверджено відтворенням механізму на
+    # PS 5.1 і поведінковим self-test-ом (FullAuditProviderCrossesModuleBoundary).
+    #
+    # Тому ВСІ command-references захоплюються ЯВНО як FunctionInfo ДО
+    # створення closure і викликаються через call operator (&): виклик
+    # FunctionInfo виконується в session state, де функцію визначено, —
+    # незалежно від scope, з якого викликають closure. Це стосується ОБОХ
+    # викликів (і ConvertTo-BRAVOBazaFullAuditResult теж: nested-import
+    # модуля так само може бути невидимим із dynamic module). Аналогічно
+    # всі значення (URL/host key/шляхи) — явні параметри, а не dynamic
+    # lookup script-scope змінних.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [Parameter(Mandatory = $true)][string]$RemotePath,
+        [Parameter(Mandatory = $true)][string]$RepositorySFTPUrl,
+        [Parameter(Mandatory = $true)][string]$HostKey
+    )
+
+    $capturedComparisonCommand = Get-Command `
+        -Name 'Get-BAZASFTPComparison' `
+        -CommandType Function `
+        -ErrorAction Stop
+    $capturedConvertAuditCommand = Get-Command `
+        -Name 'ConvertTo-BRAVOBazaFullAuditResult' `
+        -CommandType Function `
+        -ErrorAction Stop
+    $capturedLocalDirectory = $LocalDirectory
+    $capturedRemotePath = $RemotePath
+    $capturedSftpUrl = $RepositorySFTPUrl
+    $capturedHostKey = $HostKey
+
+    return {
+        param($Snapshot)
+        $comparison = & $capturedComparisonCommand `
+            -LocalPath $capturedLocalDirectory `
+            -RemotePath $capturedRemotePath `
+            -RepositorySFTPUrl $capturedSftpUrl `
+            -HostKey $capturedHostKey
+        return & $capturedConvertAuditCommand `
+            -ComparisonSuccess $comparison.Success `
+            -ComparisonError $comparison.Error `
+            -PendingFiles $comparison.PendingFiles `
+            -LocalDirectory $capturedLocalDirectory `
+            -LocalSnapshot $Snapshot
+    }.GetNewClosure()
+}
+
 function Invoke-BRAVOBazaIncrementalSync {
     # Спільна orchestration-точка Archive/Health (ТЗ п.9: ONE synchronization,
     # ONE SyncResult) — FullAuditProvider будується НАВКОЛО вже наявної
@@ -4960,23 +5015,12 @@ function Invoke-BRAVOBazaIncrementalSync {
 
     $normalizedRemoteDirectory = $RemoteDirectory.Replace("\", "/").Trim("/")
     $remotePath = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { "/" } else { "/$normalizedRemoteDirectory" }
-    $capturedLocalDirectory = $LocalDirectory
-    $capturedRemotePath = $remotePath
 
-    $fullAuditProvider = {
-        param($Snapshot)
-        $comparison = Get-BAZASFTPComparison `
-            -LocalPath $capturedLocalDirectory `
-            -RemotePath $capturedRemotePath `
-            -RepositorySFTPUrl $sftpUrl `
-            -HostKey $sftpHostKey
-        return ConvertTo-BRAVOBazaFullAuditResult `
-            -ComparisonSuccess $comparison.Success `
-            -ComparisonError $comparison.Error `
-            -PendingFiles $comparison.PendingFiles `
-            -LocalDirectory $capturedLocalDirectory `
-            -LocalSnapshot $Snapshot
-    }.GetNewClosure()
+    $fullAuditProvider = New-BRAVOBazaArchiveFullAuditProvider `
+        -LocalDirectory $LocalDirectory `
+        -RemotePath $remotePath `
+        -RepositorySFTPUrl $sftpUrl `
+        -HostKey $sftpHostKey
 
     # Одна canonical точка інтерпретації для Archive/Health/DryRun
     # (Get-BRAVOBazaSettingsEffective, BRAVO.ArchiveRuntime) — StateRoot з

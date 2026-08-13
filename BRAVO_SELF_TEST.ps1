@@ -16571,6 +16571,113 @@ function Write-BRAVOLog {
             $bazaArchiveScriptText.Contains('-WinSCPAssemblyPath $winSCPComponents.AssemblyPath') -and
             -not $bazaArchiveScriptText.Contains('-WinSCPExecutablePath $winSCPPath')
         ) -Name 'BazaSync/ArchiveWiringResolvesRealWinSCPExeForEngine' -Failure 'Invoke-BRAVOBazaIncrementalSync має резолвити пару dll+exe через Get-BRAVOWinSCPDotNetComponents (та сама, що legacy Get-BAZASFTPComparison), а НЕ передавати сирий $winSCPPath (WinSCP.com) у -WinSCPExecutablePath'
+
+        # =======================================================================
+        # ACCEPTANCE DEV-LIMS blocker #4: .GetNewClosure() на PS 5.1 губить
+        # command-lookup ПРИВАТНИХ функцій runtime (Get-BAZASFTPComparison) --
+        # провайдер, викликаний через межу модуля BRAVO.BazaSync, падав
+        # CommandNotFoundException. Поведінковий тест іде через РЕАЛЬНУ
+        # production-функцію New-BRAVOBazaArchiveFullAuditProvider: приватний
+        # fake у module scope -> провайдер створюється всередині модуля ->
+        # ВИКОНУЄТЬСЯ ззовні (та сама межа, що в production).
+        # =======================================================================
+        $hr7ProviderModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $bazaArchiveScriptText `
+            -FunctionNames @('New-BRAVOBazaArchiveFullAuditProvider')
+        $hr7Probe = @{ Invoked = 0; Url = $null; HostKey = $null; LocalPath = $null }
+        $hr7ProducedProvider = & $hr7ProviderModule {
+            param($Probe)
+            $script:HR7ProviderProbe = $Probe
+            # Приватний (module-scope, НЕ exported) двійник Get-BAZASFTPComparison
+            # -- рівно та сама видимість, що в production runtime.
+            function Get-BAZASFTPComparison {
+                param([string]$LocalPath, [string]$RemotePath, [string]$RepositorySFTPUrl, [string]$HostKey)
+                $script:HR7ProviderProbe.Invoked++
+                $script:HR7ProviderProbe.Url = $RepositorySFTPUrl
+                $script:HR7ProviderProbe.HostKey = $HostKey
+                $script:HR7ProviderProbe.LocalPath = $LocalPath
+                return [pscustomobject]@{ Success = $true; Error = $null; PendingFiles = @() }
+            }
+            New-BRAVOBazaArchiveFullAuditProvider `
+                -LocalDirectory 'C:\fake\hr7local' `
+                -RemotePath '/baza_app' `
+                -RepositorySFTPUrl 'sftp://hr7-fake-url' `
+                -HostKey 'hr7-fake-hostkey'
+        } $hr7Probe
+        $hr7Snapshot = [pscustomobject]@{ SnapshotUtc = (Get-Date).ToUniversalTime(); Entries = @{}; Success = $true; Error = $null }
+        $hr7ProviderError = $null
+        $hr7ProviderResult = $null
+        try {
+            $hr7ProviderResult = & $hr7ProducedProvider $hr7Snapshot
+        } catch {
+            $hr7ProviderError = $_.Exception.Message
+        }
+        Test-BRAVOCondition -Condition (
+            $null -eq $hr7ProviderError -and
+            $hr7Probe.Invoked -eq 1 -and
+            $hr7Probe.Url -eq 'sftp://hr7-fake-url' -and
+            $hr7Probe.HostKey -eq 'hr7-fake-hostkey' -and
+            $hr7Probe.LocalPath -eq 'C:\fake\hr7local' -and
+            $null -ne $hr7ProviderResult -and [bool]$hr7ProviderResult.Success -eq $true -and
+            $null -ne $hr7ProviderResult.PSObject.Properties['PendingItems']
+        ) -Name 'BazaSync/FullAuditProviderCrossesModuleBoundary' -Failure "production-провайдер, виконаний ЗЗОВНІ модуля-творця, має без CommandNotFoundException викликати захоплені референси з явними значеннями; Error=$hr7ProviderError Invoked=$($hr7Probe.Invoked) Url=$($hr7Probe.Url)"
+
+        # Guard скоупиться на ТІЛО closure провайдера: legacy-шляхи (before/
+        # after аудити) легітимно викликають Get-BAZASFTPComparison у
+        # ВЛАСНОМУ scope -- заборона стосується лише GetNewClosure-тіла.
+        $hr7ClosureMatch = [regex]::Match(
+            $bazaArchiveScriptText,
+            '(?s)function New-BRAVOBazaArchiveFullAuditProvider.*?return \{(.*?)\}\.GetNewClosure\(\)'
+        )
+        Test-BRAVOCondition -Condition (
+            $hr7ClosureMatch.Success -and
+            $hr7ClosureMatch.Groups[1].Value.Contains('& $capturedComparisonCommand') -and
+            $hr7ClosureMatch.Groups[1].Value.Contains('& $capturedConvertAuditCommand') -and
+            -not $hr7ClosureMatch.Groups[1].Value.Contains('Get-BAZASFTPComparison') -and
+            -not $hr7ClosureMatch.Groups[1].Value.Contains('ConvertTo-BRAVOBazaFullAuditResult') -and
+            $bazaArchiveScriptText.Contains("-Name 'Get-BAZASFTPComparison'") -and
+            $bazaArchiveScriptText.Contains("-Name 'ConvertTo-BRAVOBazaFullAuditResult'")
+        ) -Name 'BazaSync/FullAuditProviderDoesNotUseBarePrivateCommandLookup' -Failure 'тіло GetNewClosure-провайдера НЕ сміє містити bare-імена Get-BAZASFTPComparison/ConvertTo-BRAVOBazaFullAuditResult -- лише виклики через захоплені Get-Command референси (& $captured...)'
+
+        # Recovery-ланцюг із PRODUCTION provider-boundary: маркер на диску ->
+        # наступний Archive-прогін примусово реконсилюється РЕАЛЬНИМ
+        # провайдером (fake лише на рівні приватного порівняння) -> COMPLETE,
+        # маркер знято.
+        $hr7RecRoot = Join-Path $bazaSyncTestRoot "HR7_Recovery"
+        $hr7RecLocal = Join-Path $hr7RecRoot "local"
+        $hr7RecState = Join-Path $hr7RecRoot "state"
+        New-Item -ItemType Directory -Path $hr7RecLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr7RecLocal -RelativePath "m7.txt" -SizeBytes 30 | Out-Null
+        [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr7RecLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr7RecState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider)
+        $hr7RecStatePath = Get-BRAVOBazaStatePath -StateRoot $hr7RecState -Component 'BAZA_APP'
+        $hr7RecStateRead = Read-BRAVOBazaState -Path $hr7RecStatePath
+        $hr7RecStateRead.State.AuditReconciliationPending = $true
+        Save-BRAVOBazaState -Path $hr7RecStatePath -State $hr7RecStateRead.State
+
+        $hr7RecProbe = @{ Invoked = 0; Url = $null; HostKey = $null; LocalPath = $null }
+        $hr7RecProvider = & $hr7ProviderModule {
+            param($Probe, $LocalDirectory)
+            $script:HR7ProviderProbe = $Probe
+            function Get-BAZASFTPComparison {
+                param([string]$LocalPath, [string]$RemotePath, [string]$RepositorySFTPUrl, [string]$HostKey)
+                $script:HR7ProviderProbe.Invoked++
+                return [pscustomobject]@{ Success = $true; Error = $null; PendingFiles = @() }
+            }
+            New-BRAVOBazaArchiveFullAuditProvider `
+                -LocalDirectory $LocalDirectory `
+                -RemotePath '/baza_app' `
+                -RepositorySFTPUrl 'sftp://hr7-fake-url' `
+                -HostKey 'hr7-fake-hostkey'
+        } $hr7RecProbe $hr7RecLocal
+        $hr7RecCycle = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr7RecLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr7RecState -BootstrapIfNeeded -FullAuditProvider $hr7RecProvider
+        $hr7RecStateAfter = Read-BRAVOBazaState -Path $hr7RecStatePath
+        Test-BRAVOCondition -Condition (
+            $hr7RecCycle.Status -eq 'COMPLETE' -and
+            $hr7RecCycle.FullAuditAttempted -eq $true -and
+            $hr7RecProbe.Invoked -eq 1 -and
+            [bool]$hr7RecStateAfter.State.AuditReconciliationPending -eq $false -and
+            [bool]$hr7RecStateAfter.State.Files['m7.txt'].Verified -eq $true
+        ) -Name 'BazaSync/PendingMarkerRecoveryWorksWithProductionProviderBoundary' -Failure "маркер на диску -> наступний Archive-прогін з PRODUCTION-провайдером (реальна межа модуля) реконсилюється: аудит виконано, COMPLETE, маркер false; Status=$($hr7RecCycle.Status) Invoked=$($hr7RecProbe.Invoked) Pending=$($hr7RecStateAfter.State.AuditReconciliationPending)"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

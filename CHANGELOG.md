@@ -624,6 +624,40 @@ Invariants below).
   explanatory `ERROR` instead of hanging. Behavioral + structural tests
   added (`ComStubExecutableFailsFastInsteadOfHanging`,
   `ArchiveWiringResolvesRealWinSCPExeForEngine`).
+- Fix the fourth real-SFTP acceptance blocker (DEV-LIMS, 2026-08-13,
+  scenario 1 retry after the winscp.exe fix). Run facts: MODEL/BLOG/
+  BRAVOEXCH archives 3/3, generation COMPLETE, VSS OK, archive SFTP
+  upload OK, the WinSCP .NET session reached the real BAZA Full Audit
+  path — then `BAZA_APP` incremental ended `ERROR` with
+  `CommandNotFoundException: Get-BAZASFTPComparison` raised from inside
+  `FullAuditProvider`, post-backup Health `CRITICAL`, exit 50
+  `SftpFailed`; scenario 1 is NOT yet PASS. Root cause (reproduced
+  empirically on Windows PowerShell 5.1): `.GetNewClosure()` binds the
+  provider scriptblock to a new dynamic module — captured variables are
+  copied, but command-name lookup of the runtime's private (script-
+  scope, non-exported) `Get-BAZASFTPComparison` does not resolve there,
+  so the provider failed on its first-ever real invocation across the
+  `BRAVO.BazaSync` module boundary. The provider is now built by
+  `New-BRAVOBazaArchiveFullAuditProvider`, which captures explicit
+  `Get-Command` FunctionInfo references for BOTH calls
+  (`Get-BAZASFTPComparison` and `ConvertTo-BRAVOBazaFullAuditResult` —
+  a nested module import can be equally invisible from a dynamic
+  module) and invokes them via the call operator, and takes URL/host
+  key/paths as explicit captured parameters instead of dynamic
+  script-scope lookups; `Get-BAZASFTPComparison` stays private. A
+  narrow error boundary in the engine now normalizes a provider
+  exception into a structured audit failure (`Success=$false`,
+  exact cause in `FullAuditError`) instead of a generic session error;
+  the write-ahead `AuditReconciliationPending` order is unchanged, so
+  the failed DEV-LIMS run correctly left the marker fail-closed on disk
+  and the next Archive run force-reconciles. New behavioral tests: the
+  production provider is created inside a module with a private fake
+  comparison and executed across the module boundary
+  (`FullAuditProviderCrossesModuleBoundary`), the closure body is
+  guarded against returning to bare private command lookups, and the
+  pending-marker recovery chain is re-verified end-to-end with the
+  production provider boundary
+  (`PendingMarkerRecoveryWorksWithProductionProviderBoundary`).
 - Unified console progress for multi-substep stages in `BRAVO_ARCHIV`
   (UI-only refactor — no backup/VSS/SFTP/BAZA/retention semantics
   changed). New canonical helpers in `BRAVO.Console`

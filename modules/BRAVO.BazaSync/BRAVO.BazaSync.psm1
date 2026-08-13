@@ -877,7 +877,19 @@ function Invoke-BRAVOBazaSynchronization {
             return $result
         }
         $fullAuditAttemptedThisCycle = $true
-        $recoveryAudit = & $FullAuditProvider $recoverySnapshot
+        # Error boundary (round 7): виняток провайдера (напр. scope-дефект
+        # closure) — це ПРОВАЛ АУДИТУ, а не крах сесії: нормалізуємо в
+        # структурований Success=false з точною причиною у FullAuditError,
+        # і далі працює звичайний fail-closed шлях провалу аудиту.
+        $recoveryAudit = try {
+            & $FullAuditProvider $recoverySnapshot
+        } catch {
+            [pscustomobject]@{
+                Success = $false
+                Error = "FullAuditProvider кинув виняток: $($_.Exception.Message)"
+                AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{}; PendingItems = @()
+            }
+        }
         if (-not $recoveryAudit.Success) {
             # Стара пошкоджена evidence лишається НЕТОРКНУТОЮ на
             # канонічному шляху (ми ще НЕ карантинили її — карантин лише
@@ -1065,7 +1077,19 @@ function Invoke-BRAVOBazaSynchronization {
                     return $result
                 }
                 $fullAuditAttemptedThisCycle = $true
-                $auditResult = & $FullAuditProvider $snapshot
+                # Error boundary (round 7): див. коментар у recovery-гілці —
+                # виняток провайдера нормалізується у провал аудиту
+                # (fail-closed: write-ahead маркер уже на диску; для
+                # першого запуску цикл поверне ERROR, маркер лишиться true).
+                $auditResult = try {
+                    & $FullAuditProvider $snapshot
+                } catch {
+                    [pscustomobject]@{
+                        Success = $false
+                        Error = "FullAuditProvider кинув виняток: $($_.Exception.Message)"
+                        AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{}; PendingItems = @()
+                    }
+                }
                 if (-not $auditResult.Success) {
                     $fullAuditErrorThisCycle = [string]$auditResult.Error
                     # Audit провалився -> жодного trust-переходу НЕ було —
