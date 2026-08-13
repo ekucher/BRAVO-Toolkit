@@ -1412,6 +1412,91 @@ try {
         }
     }
 
+    # BAZA incremental append-only engine (safety-review): читає лише
+    # persisted state (Read-BRAVOBazaState) — жодного SFTP-з'єднання,
+    # жодного sync не виконується. Одна canonical точка інтерпретації
+    # (Get-BRAVOBazaSettingsEffective) — та сама, що Archive і Health.
+    $bazaSftpComponents = @($bazaSyncEffective.Components | Where-Object { $_.AnyEnabled -and $_.SftpEnabled })
+    if ($bazaSftpComponents.Count -gt 0) {
+        $bazaArchiveRuntimeModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1'
+        $bazaSyncModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1'
+        if ((Test-Path -LiteralPath $bazaArchiveRuntimeModulePath -PathType Leaf) -and
+            (Test-Path -LiteralPath $bazaSyncModulePath -PathType Leaf)) {
+            Import-Module -Name $bazaArchiveRuntimeModulePath -ErrorAction Stop
+            Import-Module -Name $bazaSyncModulePath -ErrorAction Stop
+
+            $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+            if ($bazaSettingsEffective.Mode -eq 'IncrementalAppendOnly') {
+                Add-DryRunResult PASS "BAZA sync" "Режим" (
+                    "IncrementalAppendOnly; SynchronizeBeforeHealth=$($bazaSettingsEffective.SynchronizeBeforeHealth); " +
+                    "FastHealthEnabled=$($bazaSettingsEffective.FastHealthEnabled); MutationPolicy=$($bazaSettingsEffective.MutationPolicy)"
+                )
+                if ($bazaSettingsEffective.FullAuditEnabled) {
+                    Add-DryRunResult PASS "BAZA sync" "Full Audit" (
+                        "увімкнено; кожні $($bazaSettingsEffective.FullAuditEveryDays) дн."
+                    )
+                } else {
+                    Add-DryRunResult WARN "BAZA sync" "Full Audit" (
+                        "вимкнено (FullAuditEnabled=false) — дрейф стану проти реального SFTP не виявлятиметься автоматично"
+                    )
+                }
+
+                foreach ($bazaComponent in $bazaSftpComponents) {
+                    $bazaStatePath = Get-BRAVOBazaStatePath -StateRoot $bazaSettingsEffective.StateRoot -Component $bazaComponent.Name
+                    $bazaStateRead = Read-BRAVOBazaState -Path $bazaStatePath
+                    if ($bazaStateRead.Corrupt) {
+                        Add-DryRunResult FAIL "BAZA sync" ("{0} стан" -f $bazaComponent.DisplayName) (
+                            "$bazaStatePath пошкоджено/несумісний: $($bazaStateRead.Reason) -- потрібна повна реконсиляція (Full Audit)"
+                        )
+                        continue
+                    }
+                    if (-not $bazaStateRead.Exists) {
+                        Add-DryRunResult WARN "BAZA sync" ("{0} стан" -f $bazaComponent.DisplayName) (
+                            "$bazaStatePath ще не створено -- перший запуск BRAVO_ARCHIV виконає bootstrap Full Audit"
+                        )
+                        continue
+                    }
+
+                    $lastSyncText = if ([string]::IsNullOrWhiteSpace([string]$bazaStateRead.State.LastSuccessfulSyncUtc)) {
+                        "ще не було успішного циклу"
+                    } else {
+                        [string]$bazaStateRead.State.LastSuccessfulSyncUtc
+                    }
+                    $lastAuditText = if ([string]::IsNullOrWhiteSpace([string]$bazaStateRead.State.LastFullAuditUtc)) {
+                        "ще не виконувався"
+                    } else {
+                        [string]$bazaStateRead.State.LastFullAuditUtc
+                    }
+                    $nextAuditText = if (-not $bazaSettingsEffective.FullAuditEnabled) {
+                        "вимкнено"
+                    } elseif ([string]::IsNullOrWhiteSpace([string]$bazaStateRead.State.LastFullAuditUtc)) {
+                        "при наступному циклі (ще не було жодного Full Audit)"
+                    } else {
+                        try {
+                            $lastAuditUtc = [DateTime]::Parse(
+                                [string]$bazaStateRead.State.LastFullAuditUtc,
+                                [System.Globalization.CultureInfo]::InvariantCulture,
+                                [System.Globalization.DateTimeStyles]::RoundtripKind)
+                            $lastAuditUtc.AddDays($bazaSettingsEffective.FullAuditEveryDays).ToString('o')
+                        } catch {
+                            "не вдалося обчислити (LastFullAuditUtc у нерозпізнаваному форматі)"
+                        }
+                    }
+                    Add-DryRunResult PASS "BAZA sync" ("{0} стан" -f $bazaComponent.DisplayName) (
+                        "$bazaStatePath; файлів у стані: $($bazaStateRead.State.Files.Count); " +
+                        "останній успішний цикл: $lastSyncText; останній Full Audit: $lastAuditText; наступний Full Audit: $nextAuditText"
+                    )
+                }
+            } else {
+                Add-DryRunResult PASS "BAZA sync" "Режим" (
+                    "$($bazaSettingsEffective.Mode) (legacy) -- incremental append-only engine вимкнено"
+                )
+            }
+        } else {
+            Add-DryRunResult WARN "BAZA sync" "Модулі" "BRAVO.ArchiveRuntime/BRAVO.BazaSync не знайдено -- діагностика режиму BAZA пропущена"
+        }
+    }
+
     if ($null -ne $maintenanceSettings) {
         $serviceNames = @([string]$maintenanceSettings.Services.BravoName)
         $serviceNames += @($optionalComponentPlan.ServiceNames)

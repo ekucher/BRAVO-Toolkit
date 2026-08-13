@@ -24,7 +24,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -4919,6 +4919,78 @@ exit
     }
 }
 
+function Invoke-BRAVOBazaIncrementalSync {
+    # Спільна orchestration-точка Archive/Health (ТЗ п.9: ONE synchronization,
+    # ONE SyncResult) — FullAuditProvider будується НАВКОЛО вже наявної
+    # Get-BAZASFTPComparison (не дублює її), і використовується лише для
+    # bootstrap першого запуску або періодичного Full Audit.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [Parameter(Mandatory = $true)][string]$RemoteDirectory,
+        [switch]$ForceFullAudit
+    )
+
+    $normalizedRemoteDirectory = $RemoteDirectory.Replace("\", "/").Trim("/")
+    $remotePath = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { "/" } else { "/$normalizedRemoteDirectory" }
+    $capturedLocalDirectory = $LocalDirectory
+    $capturedRemotePath = $remotePath
+
+    $fullAuditProvider = {
+        param($Snapshot)
+        $comparison = Get-BAZASFTPComparison `
+            -LocalPath $capturedLocalDirectory `
+            -RemotePath $capturedRemotePath `
+            -RepositorySFTPUrl $sftpUrl `
+            -HostKey $sftpHostKey
+        return ConvertTo-BRAVOBazaFullAuditResult `
+            -ComparisonSuccess $comparison.Success `
+            -ComparisonError $comparison.Error `
+            -PendingFiles $comparison.PendingFiles `
+            -LocalDirectory $capturedLocalDirectory `
+            -LocalSnapshot $Snapshot
+    }.GetNewClosure()
+
+    # Одна canonical точка інтерпретації для Archive/Health/DryRun
+    # (Get-BRAVOBazaSettingsEffective, BRAVO.ArchiveRuntime) — StateRoot з
+    # можливим override, MutationPolicy, FullAuditEnabled/EveryDays.
+    $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+    $mutationPolicy = $bazaSettingsEffective.MutationPolicy
+    $stateRootPath = $bazaSettingsEffective.StateRoot
+    # FullAuditEnabled=$false вимикає ПЕРІОДИЧНИЙ audit (FullAuditEveryDays=0
+    # для модуля) — bootstrap першого запуску лишається обов'язковим і від
+    # цього прапорця не залежить (без нього перший запуск не має звідки
+    # взяти seed-стан, ТЗ п.15).
+    $fullAuditEveryDays = $bazaSettingsEffective.FullAuditEveryDays
+
+    $operationTimeoutSeconds = [int](
+        if ([int]$backupMonitoring.SFTP.SynchronizationTimeoutSeconds -gt 0) {
+            $backupMonitoring.SFTP.SynchronizationTimeoutSeconds
+        } else {
+            [math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)
+        }
+    )
+
+    return Invoke-BRAVOBazaComponentSyncSession `
+        -Component $Component `
+        -LocalDirectory $LocalDirectory `
+        -RemoteRootPath $remotePath `
+        -RepositorySFTPUrl $sftpUrl `
+        -HostKey $sftpHostKey `
+        -WinSCPAssemblyPath $winSCPAssemblyPath `
+        -WinSCPExecutablePath $winSCPPath `
+        -StateRoot $stateRootPath `
+        -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
+        -OperationTimeoutSeconds $operationTimeoutSeconds `
+        -MutationPolicy $mutationPolicy `
+        -BootstrapIfNeeded `
+        -FullAuditProvider $fullAuditProvider `
+        -FullAuditEveryDays $fullAuditEveryDays `
+        -ForceFullAudit:$ForceFullAudit `
+        -WriteCheckpoint
+}
+
 function Invoke-ManualBAZASFTPSynchronization {
     Write-BRAVOLog -Component 'SFTP' -Message "==="
     Write-BRAVOLog -Component 'SFTP' -Message "=== РУЧНА СИНХРОНIЗАЦIЯ BAZA_APP / BAZA_WWW НА SFTP ==="
@@ -6813,18 +6885,40 @@ function Main {
                 Show-ScriptProgress -Status "Синхронiзацiя BAZA APP на SFTP" -PercentComplete 90
                 Write-Log "==="
                 Write-Log "=== СИНХРОНIЗАЦIЯ BAZA APP НА SFTP ==="
-                $bazaAppSFTPSync = Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
-                $transferResults.BAZA_APP.Success = [bool]$bazaAppSFTPSync
-                if ($null -ne $script:lastBAZASyncOutcome) {
-                    $transferResults.BAZA_APP.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
-                    $transferResults.BAZA_APP.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
-                    $transferResults.BAZA_APP.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
-                    $transferResults.BAZA_APP.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
-                }
-                if (-not $bazaAppSFTPSync) {
-                    $transferResults.BAZA_APP.Error = 'post-sync verification failed'
-                    Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP" -Level "WARNING"
-                    $operationFailed = $true
+                if (Test-BRAVOBazaIncrementalModeEnabled) {
+                    # Incremental append-only режим (safety-review): targeted
+                    # upload лише нових/pending/failed файлів замість повного
+                    # synchronize/CompareDirectories на весь каталог. Відома
+                    # прогалина відносно legacy Sync-FolderToSFTP: перевірка
+                    # сумісності імен для SFTP (Get-BAZARemoteNameCompatibilityIssues)
+                    # цим шляхом поки НЕ виконується — IncompatibleNames
+                    # завжди 0 у цьому режимі.
+                    $script:bazaAppSyncResult = Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_APP' -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
+                    $bazaAppSFTPSync = ($script:bazaAppSyncResult.Status -eq 'COMPLETE')
+                    $transferResults.BAZA_APP.Success = $bazaAppSFTPSync
+                    $transferResults.BAZA_APP.Completed = [int]($script:bazaAppSyncResult.Uploaded + $script:bazaAppSyncResult.AlreadyVerified)
+                    $transferResults.BAZA_APP.Remaining = [int]$script:bazaAppSyncResult.Failed
+                    if (-not $bazaAppSFTPSync) {
+                        $transferResults.BAZA_APP.Error = [string]$script:bazaAppSyncResult.Error
+                        Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP (incremental): $($script:bazaAppSyncResult.Status)" -Level "WARNING"
+                        $operationFailed = $true
+                    } else {
+                        Write-Log "BAZA APP: cycle $($script:bazaAppSyncResult.CycleId) — передано $($script:bazaAppSyncResult.Uploaded), вже підтверджено $($script:bazaAppSyncResult.AlreadyVerified), помилок 0" -Level "SUCCESS"
+                    }
+                } else {
+                    $bazaAppSFTPSync = Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
+                    $transferResults.BAZA_APP.Success = [bool]$bazaAppSFTPSync
+                    if ($null -ne $script:lastBAZASyncOutcome) {
+                        $transferResults.BAZA_APP.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+                        $transferResults.BAZA_APP.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+                        $transferResults.BAZA_APP.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+                        $transferResults.BAZA_APP.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+                    }
+                    if (-not $bazaAppSFTPSync) {
+                        $transferResults.BAZA_APP.Error = 'post-sync verification failed'
+                        Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP" -Level "WARNING"
+                        $operationFailed = $true
+                    }
                 }
             } elseif ($bazaAppSFTPSyncEnabled) {
                 $transferResults.BAZA_APP.Success = $false
@@ -6840,24 +6934,41 @@ function Main {
                 Show-ScriptProgress -Status "Синхронiзацiя BAZA WWW на SFTP" -PercentComplete 91
                 Write-Log "==="
                 Write-Log "=== СИНХРОНIЗАЦIЯ BAZA WWW НА SFTP ==="
-                $bazaWWWSFTPSync = Sync-FolderToSFTP `
-                    -WinSCPPath $winSCPPath `
-                    -RepositorySFTPUrl $sftpUrl `
-                    -HostKey $sftpHostKey `
-                    -LocalDirectory $bazaWWWPaths.Source `
-                    -RemoteDirectory $sftpDirectories.BAZAWWW `
-                    -ComponentName "BAZA WWW"
-                $transferResults.BAZA_WWW.Success = [bool]$bazaWWWSFTPSync
-                if ($null -ne $script:lastBAZASyncOutcome) {
-                    $transferResults.BAZA_WWW.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
-                    $transferResults.BAZA_WWW.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
-                    $transferResults.BAZA_WWW.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
-                    $transferResults.BAZA_WWW.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
-                }
-                if (-not $bazaWWWSFTPSync) {
-                    $transferResults.BAZA_WWW.Error = 'post-sync verification failed'
-                    Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP" -Level "WARNING"
-                    $operationFailed = $true
+                if (Test-BRAVOBazaIncrementalModeEnabled) {
+                    # Той самий incremental append-only режим, що BAZA APP
+                    # вище — див. коментар там.
+                    $script:bazaWWWSyncResult = Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_WWW' -LocalDirectory $bazaWWWPaths.Source -RemoteDirectory $sftpDirectories.BAZAWWW
+                    $bazaWWWSFTPSync = ($script:bazaWWWSyncResult.Status -eq 'COMPLETE')
+                    $transferResults.BAZA_WWW.Success = $bazaWWWSFTPSync
+                    $transferResults.BAZA_WWW.Completed = [int]($script:bazaWWWSyncResult.Uploaded + $script:bazaWWWSyncResult.AlreadyVerified)
+                    $transferResults.BAZA_WWW.Remaining = [int]$script:bazaWWWSyncResult.Failed
+                    if (-not $bazaWWWSFTPSync) {
+                        $transferResults.BAZA_WWW.Error = [string]$script:bazaWWWSyncResult.Error
+                        Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP (incremental): $($script:bazaWWWSyncResult.Status)" -Level "WARNING"
+                        $operationFailed = $true
+                    } else {
+                        Write-Log "BAZA WWW: cycle $($script:bazaWWWSyncResult.CycleId) — передано $($script:bazaWWWSyncResult.Uploaded), вже підтверджено $($script:bazaWWWSyncResult.AlreadyVerified), помилок 0" -Level "SUCCESS"
+                    }
+                } else {
+                    $bazaWWWSFTPSync = Sync-FolderToSFTP `
+                        -WinSCPPath $winSCPPath `
+                        -RepositorySFTPUrl $sftpUrl `
+                        -HostKey $sftpHostKey `
+                        -LocalDirectory $bazaWWWPaths.Source `
+                        -RemoteDirectory $sftpDirectories.BAZAWWW `
+                        -ComponentName "BAZA WWW"
+                    $transferResults.BAZA_WWW.Success = [bool]$bazaWWWSFTPSync
+                    if ($null -ne $script:lastBAZASyncOutcome) {
+                        $transferResults.BAZA_WWW.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+                        $transferResults.BAZA_WWW.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+                        $transferResults.BAZA_WWW.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+                        $transferResults.BAZA_WWW.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+                    }
+                    if (-not $bazaWWWSFTPSync) {
+                        $transferResults.BAZA_WWW.Error = 'post-sync verification failed'
+                        Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP" -Level "WARNING"
+                        $operationFailed = $true
+                    }
                 }
             } elseif ($bazaWWWSFTPSyncEnabled) {
                 $transferResults.BAZA_WWW.Success = $false
@@ -7000,6 +7111,21 @@ function Main {
                 Import-Module -Name $healthModulePath -ErrorAction Stop
                 $healthParameters.RuntimeRoot = $bravoScriptDirectory
                 $healthParameters.EntryScriptPath = Join-Path $bravoScriptDirectory 'BRAVO_HEALTH.ps1'
+                # ONE synchronization, ONE SyncResult (safety-review ТЗ п.9):
+                # якщо ЦЕЙ прогін щойно виконав incremental BAZA sync, Health
+                # отримує вже готовий результат і НЕ повторює його сам —
+                # передається лише те, що реально було спробувано (Attempted),
+                # інакше Health сам вирішує, чи потрібна власна синхронізація.
+                $bazaSyncResultsForHealth = @{}
+                if ($transferResults.BAZA_APP.Attempted -and $null -ne $script:bazaAppSyncResult) {
+                    $bazaSyncResultsForHealth['BAZA_APP'] = $script:bazaAppSyncResult
+                }
+                if ($transferResults.BAZA_WWW.Attempted -and $null -ne $script:bazaWWWSyncResult) {
+                    $bazaSyncResultsForHealth['BAZA_WWW'] = $script:bazaWWWSyncResult
+                }
+                if ($bazaSyncResultsForHealth.Count -gt 0) {
+                    $healthParameters.BazaSyncResults = $bazaSyncResultsForHealth
+                }
                 $healthCheckResult = Invoke-BRAVOHealthCheck @healthParameters
                 switch ($healthCheckResult.Status) {
                     "Healthy" {

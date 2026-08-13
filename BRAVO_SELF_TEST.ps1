@@ -14395,6 +14395,473 @@ function Write-BRAVOLog {
         ) `
         -Name 'Archive/HashBusinessCallsRemainUnchanged' `
         -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
+
+    # =====================================================================
+    # BAZA SYNC: incremental append-only synchronization engine
+    # (BRAVO.BazaSync) -- Sync Cycle/Cutoff, persisted state, Fast Health
+    # vs Full Audit, mutation detection, concurrency lock, performance
+    # regression. Categories A-G per safety-review specification.
+    # =====================================================================
+    try {
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+        Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1") -Force -ErrorAction Stop
+        Import-Module -Name (Join-Path $root "modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1") -Force -ErrorAction Stop
+        if ($null -eq ('WinSCP.Session' -as [type])) {
+            Add-Type -Path (Join-Path $root "Tools\WinSCPnet.dll") -ErrorAction Stop
+        }
+
+        # ---------------------------------------------------------------------
+        # Fake WinSCP session factory
+        # ---------------------------------------------------------------------
+        function New-BRAVOSelfTestFakeBazaSession {
+            param(
+                [string[]]$FailOnRelativePaths = @(),
+                [switch]$AllTransfersFail
+            )
+            $state = [pscustomobject]@{
+                PutFilesCallCount = 0
+                PutFilesCalledFor = New-Object System.Collections.Generic.List[string]
+                KnownRemoteDirs = New-Object System.Collections.Generic.HashSet[string]
+                RemoteSizes = @{}
+            }
+            $session = New-Object psobject
+            $session | Add-Member -MemberType NoteProperty -Name State -Value $state
+            $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
+                param($path)
+                return $this.State.KnownRemoteDirs.Contains($path)
+            }
+            $session | Add-Member -MemberType ScriptMethod -Name CreateDirectory -Value {
+                param($path)
+                [void]$this.State.KnownRemoteDirs.Add($path)
+            }
+            $failSet = New-Object System.Collections.Generic.HashSet[string]
+            foreach ($p in $FailOnRelativePaths) { [void]$failSet.Add($p.Replace('\','/')) }
+            $allFail = [bool]$AllTransfersFail
+            $putFilesScript = {
+                param($localPath, $remotePath, $remove, $options)
+                $this.State.PutFilesCallCount++
+                [void]$this.State.PutFilesCalledFor.Add($remotePath)
+                $localSize = (Get-Item -LiteralPath $localPath).Length
+                $normalizedRemote = [string]$remotePath
+                $shouldFail = $allFail
+                foreach ($f in $failSet) {
+                    if ($normalizedRemote.EndsWith($f)) { $shouldFail = $true }
+                }
+                if ($shouldFail) {
+                    $errObj = [pscustomobject]@{ Error = [pscustomobject]@{ Message = "simulated transfer failure" } }
+                    return [pscustomobject]@{ IsSuccess = $false; Transfers = @($errObj) }
+                }
+                $this.State.RemoteSizes[$normalizedRemote] = $localSize
+                return [pscustomobject]@{ IsSuccess = $true; Transfers = @() }
+            }.GetNewClosure()
+            $session | Add-Member -MemberType ScriptMethod -Name PutFiles -Value $putFilesScript
+            $session | Add-Member -MemberType ScriptMethod -Name GetFileInfo -Value {
+                param($remotePath)
+                $size = $this.State.RemoteSizes[[string]$remotePath]
+                if ($null -eq $size) { $size = 0 }
+                return [pscustomobject]@{ Length = $size }
+            }
+            return $session
+        }
+
+        function New-BRAVOSelfTestBazaFile {
+            param([string]$Directory, [string]$RelativePath, [int]$SizeBytes = 100, [datetime]$LastWriteTimeUtc)
+            $fullPath = Join-Path $Directory $RelativePath
+            $parent = Split-Path -Path $fullPath -Parent
+            if (-not (Test-Path -LiteralPath $parent)) { New-Item -ItemType Directory -Path $parent -Force | Out-Null }
+            [IO.File]::WriteAllBytes($fullPath, (New-Object byte[] $SizeBytes))
+            if ($PSBoundParameters.ContainsKey('LastWriteTimeUtc')) {
+                (Get-Item -LiteralPath $fullPath).LastWriteTimeUtc = $LastWriteTimeUtc
+            }
+            return $fullPath
+        }
+
+        $bazaSyncTestRoot = Join-Path $env:TEMP ("bazasynctest_" + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path $bazaSyncTestRoot -Force | Out-Null
+
+        # =======================================================================
+        # CONFIG
+        # =======================================================================
+        $bravoConfigText = [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition -Condition (
+            $bravoConfigText.Contains('BAZA = @{') -and
+            $bravoConfigText.Contains('Mode = "IncrementalAppendOnly"') -and
+            $bravoConfigText.Contains('SynchronizeBeforeHealth = $true') -and
+            $bravoConfigText.Contains('FastHealthEnabled = $true') -and
+            $bravoConfigText.Contains('FullAuditEnabled = $true') -and
+            $bravoConfigText.Contains('FullAuditEveryDays = 7') -and
+            $bravoConfigText.Contains('MutationPolicy = "Fail"') -and
+            $bravoConfigText.Contains('StateRoot = $stateRoot')
+        ) -Name 'BazaSync/ConfigDefinesBazaBlock' -Failure 'BRAVO.config має містити backupMonitoring.SFTP.BAZA з Mode/SynchronizeBeforeHealth/FastHealthEnabled/FullAuditEnabled/FullAuditEveryDays/MutationPolicy/StateRoot'
+
+        # =======================================================================
+        # MODE RESOLUTION
+        # =======================================================================
+        $global:backupMonitoring = @{ SFTP = @{ } }
+        Test-BRAVOCondition -Condition ((Get-BRAVOBazaSyncModeEffective) -eq 'IncrementalAppendOnly' -and (Test-BRAVOBazaIncrementalModeEnabled) -eq $true) `
+            -Name 'BazaSync/SyncModeDefaultsToIncrementalAppendOnly' -Failure 'без BAZA.Mode в конфігурації ефективний режим має бути IncrementalAppendOnly'
+
+        $global:backupMonitoring = @{ SFTP = @{ BAZA = @{ Mode = "Legacy" } } }
+        Test-BRAVOCondition -Condition ((Test-BRAVOBazaIncrementalModeEnabled) -eq $false) `
+            -Name 'BazaSync/SyncModeRespectsLegacyOverride' -Failure 'BAZA.Mode="Legacy" має вимикати Test-BRAVOBazaIncrementalModeEnabled'
+        $global:backupMonitoring = $null
+
+        # =======================================================================
+        # STATE (category F)
+        # =======================================================================
+        $stateTestRoot = Join-Path $bazaSyncTestRoot "F_State"
+        New-Item -ItemType Directory -Path $stateTestRoot -Force | Out-Null
+
+        $missingRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $stateTestRoot -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition ($missingRead.Exists -eq $false -and $missingRead.Corrupt -eq $false) `
+            -Name 'BazaSync/StateFirstRunNotExists' -Failure 'відсутній файл стану має бути Exists=false,Corrupt=false (легітимний перший запуск), а не помилка'
+
+        $garbagePath = Get-BRAVOBazaStatePath -StateRoot $stateTestRoot -Component 'BAZA_GARBAGE'
+        New-Item -ItemType Directory -Path (Split-Path $garbagePath -Parent) -Force | Out-Null
+        [IO.File]::WriteAllText($garbagePath, "{ not valid json !!!", (New-Object Text.UTF8Encoding($false)))
+        $garbageRead = Read-BRAVOBazaState -Path $garbagePath
+        Test-BRAVOCondition -Condition ($garbageRead.Exists -eq $true -and $garbageRead.Corrupt -eq $true) `
+            -Name 'BazaSync/StateCorruptGarbageJsonDetected' -Failure 'непарсований JSON має Corrupt=true -- старі файли НЕ вважаються automatically verified'
+
+        $schemaPath = Get-BRAVOBazaStatePath -StateRoot $stateTestRoot -Component 'BAZA_SCHEMA'
+        New-Item -ItemType Directory -Path (Split-Path $schemaPath -Parent) -Force | Out-Null
+        [IO.File]::WriteAllText($schemaPath, '{"SchemaVersion":99,"Component":"BAZA_SCHEMA","Files":{}}', (New-Object Text.UTF8Encoding($false)))
+        $schemaRead = Read-BRAVOBazaState -Path $schemaPath
+        Test-BRAVOCondition -Condition ($schemaRead.Corrupt -eq $true -and $schemaRead.Reason -match 'schemaVersion') `
+            -Name 'BazaSync/StateUnsupportedSchemaVersionFailsVisible' -Failure 'непідтримувана SchemaVersion має Corrupt=true з поясненням, а не мовчазну міграцію/скидання'
+
+        $roundTripPath = Get-BRAVOBazaStatePath -StateRoot $stateTestRoot -Component 'BAZA_ROUNDTRIP'
+        $roundTripState = New-BRAVOBazaEmptyState -Component 'BAZA_ROUNDTRIP'
+        $roundTripState.Files['a.txt'] = [pscustomobject]@{ Size = 123; LastWriteTimeUtc = '2026-01-01T00:00:00.0000000Z'; UploadedUtc = '2026-01-01T00:00:01.0000000Z'; Verified = $true }
+        Save-BRAVOBazaState -Path $roundTripPath -State $roundTripState
+        $roundTripRead = Read-BRAVOBazaState -Path $roundTripPath
+        Test-BRAVOCondition -Condition (
+            $roundTripRead.Exists -and -not $roundTripRead.Corrupt -and
+            $roundTripRead.State.Files.ContainsKey('a.txt') -and
+            [int64]$roundTripRead.State.Files['a.txt'].Size -eq 123 -and
+            [bool]$roundTripRead.State.Files['a.txt'].Verified -eq $true
+        ) -Name 'BazaSync/StateRoundTripPreservesFilesAndFields' -Failure 'Save->Read має зберегти Files/Size/Verified без втрат'
+
+        # Atomic update interruption: valid state must remain usable even if a stray .tmp exists alongside it
+        $interruptedPath = Get-BRAVOBazaStatePath -StateRoot $stateTestRoot -Component 'BAZA_INTERRUPTED'
+        $interruptedState = New-BRAVOBazaEmptyState -Component 'BAZA_INTERRUPTED'
+        $interruptedState.Files['ok.txt'] = [pscustomobject]@{ Size = 10; LastWriteTimeUtc = '2026-01-01T00:00:00.0000000Z'; UploadedUtc = '2026-01-01T00:00:00.0000000Z'; Verified = $true }
+        Save-BRAVOBazaState -Path $interruptedPath -State $interruptedState
+        $strayTempPath = Join-Path (Split-Path $interruptedPath -Parent) ('.BRAVO_BAZA_STATE_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+        [IO.File]::WriteAllText($strayTempPath, "{ partial", (New-Object Text.UTF8Encoding($false)))
+        $afterInterruptRead = Read-BRAVOBazaState -Path $interruptedPath
+        Test-BRAVOCondition -Condition (
+            $afterInterruptRead.Exists -and -not $afterInterruptRead.Corrupt -and
+            $afterInterruptRead.State.Files.ContainsKey('ok.txt')
+        ) -Name 'BazaSync/StateAtomicUpdateInterruptionPreservesPreviousValidState' -Failure 'наявність стороннього .tmp поряд не повинна впливати на читання останнього ВАЛІДНОГО стану'
+
+        # =======================================================================
+        # INCREMENTAL SYNC (category A) + CUTOFF (category B)
+        # =======================================================================
+        $incRoot = Join-Path $bazaSyncTestRoot "A_Incremental"
+        $incLocal = Join-Path $incRoot "local"
+        $incState = Join-Path $incRoot "state"
+        New-Item -ItemType Directory -Path $incLocal -Force | Out-Null
+
+        New-BRAVOSelfTestBazaFile -Directory $incLocal -RelativePath "f1.txt" -SizeBytes 100 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $incLocal -RelativePath "sub\f2.txt" -SizeBytes 200 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $incLocal -RelativePath "f3.txt" -SizeBytes 300 | Out-Null
+
+        $session1 = New-BRAVOSelfTestFakeBazaSession
+        $result1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $incLocal -RemoteRootPath '/baza_app' -Session $session1 -StateRoot $incState
+        Test-BRAVOCondition -Condition (
+            $result1.Status -eq 'COMPLETE' -and $result1.Uploaded -eq 3 -and $result1.Failed -eq 0 -and
+            $session1.State.PutFilesCallCount -eq 3 -and $result1.DiscoveredWithinCutoff -eq 3
+        ) -Name 'BazaSync/FirstSyncUploadsAllDiscoveredFiles' -Failure "очікувалось Status=COMPLETE,Uploaded=3,PutFiles=3; отримано Status=$($result1.Status),Uploaded=$($result1.Uploaded),PutFiles=$($session1.State.PutFilesCallCount),Error=$($result1.Error)"
+
+        $session2 = New-BRAVOSelfTestFakeBazaSession
+        $result2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $incLocal -RemoteRootPath '/baza_app' -Session $session2 -StateRoot $incState
+        Test-BRAVOCondition -Condition (
+            $result2.Status -eq 'COMPLETE' -and $result2.Uploaded -eq 0 -and $result2.AlreadyVerified -eq 3 -and
+            $session2.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/SecondSyncNoChangesSkipsAllRemoteCalls' -Failure "очікувалось 0 upload/0 PutFiles на незмінних verified файлах (trusted skip); отримано Uploaded=$($result2.Uploaded),PutFiles=$($session2.State.PutFilesCallCount)"
+
+        New-BRAVOSelfTestBazaFile -Directory $incLocal -RelativePath "f4_new.txt" -SizeBytes 50 | Out-Null
+        $session3 = New-BRAVOSelfTestFakeBazaSession
+        $result3 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $incLocal -RemoteRootPath '/baza_app' -Session $session3 -StateRoot $incState
+        Test-BRAVOCondition -Condition (
+            $result3.Status -eq 'COMPLETE' -and $result3.Uploaded -eq 1 -and $result3.AlreadyVerified -eq 3 -and
+            $session3.State.PutFilesCallCount -eq 1
+        ) -Name 'BazaSync/OneNewFileTriggersOnlyThatUpload' -Failure "очікувалось рівно 1 upload для нового файла; отримано Uploaded=$($result3.Uploaded),PutFiles=$($session3.State.PutFilesCallCount)"
+
+        # Crash-during-upload: simulate failure for f4_new on a DIFFERENT clean run
+        $crashRoot = Join-Path $bazaSyncTestRoot "A_Crash"
+        $crashLocal = Join-Path $crashRoot "local"
+        $crashState = Join-Path $crashRoot "state"
+        New-Item -ItemType Directory -Path $crashLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $crashLocal -RelativePath "willfail.txt" -SizeBytes 40 | Out-Null
+        $crashSession1 = New-BRAVOSelfTestFakeBazaSession -FailOnRelativePaths @('willfail.txt')
+        $crashResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $crashLocal -RemoteRootPath '/baza_app' -Session $crashSession1 -StateRoot $crashState
+        $crashStateRead1 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $crashState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $crashResult1.Status -eq 'INCOMPLETE' -and $crashResult1.Failed -eq 1 -and $crashResult1.PendingWithinCutoff -eq 1 -and
+            $crashStateRead1.State.Files.ContainsKey('willfail.txt') -and
+            [bool]$crashStateRead1.State.Files['willfail.txt'].Verified -eq $false
+        ) -Name 'BazaSync/FailedUploadNotCommittedAsVerified' -Failure "невдалий upload не повинен позначатись Verified=true в state; Status=$($crashResult1.Status),Failed=$($crashResult1.Failed)"
+
+        $crashSession2 = New-BRAVOSelfTestFakeBazaSession
+        $crashResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $crashLocal -RemoteRootPath '/baza_app' -Session $crashSession2 -StateRoot $crashState
+        Test-BRAVOCondition -Condition (
+            $crashResult2.Status -eq 'COMPLETE' -and $crashResult2.Uploaded -eq 1 -and $crashSession2.State.PutFilesCallCount -eq 1
+        ) -Name 'BazaSync/RetriedUploadSucceedsNextRun' -Failure "наступний прогін має повторити pending-файл і успішно його передати; Status=$($crashResult2.Status),Uploaded=$($crashResult2.Uploaded)"
+
+        # Mutation detection: change size of an already-verified file
+        $mutationRoot = Join-Path $bazaSyncTestRoot "A_Mutation"
+        $mutationLocal = Join-Path $mutationRoot "local"
+        $mutationState = Join-Path $mutationRoot "state"
+        New-Item -ItemType Directory -Path $mutationLocal -Force | Out-Null
+        $mutFile = New-BRAVOSelfTestBazaFile -Directory $mutationLocal -RelativePath "verified.txt" -SizeBytes 500
+        $mutSession1 = New-BRAVOSelfTestFakeBazaSession
+        $mutResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mutationLocal -RemoteRootPath '/baza_app' -Session $mutSession1 -StateRoot $mutationState
+        Test-BRAVOCondition -Condition ($mutResult1.Status -eq 'COMPLETE' -and $mutResult1.Uploaded -eq 1) `
+            -Name 'BazaSync/MutationSetupInitialUploadSucceeds' -Failure 'setup: перший upload має пройти успішно перед тестом мутації'
+
+        # now mutate: change local file size (append-only violation)
+        [IO.File]::WriteAllBytes($mutFile, (New-Object byte[] 999))
+        $mutSession2 = New-BRAVOSelfTestFakeBazaSession
+        $mutResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mutationLocal -RemoteRootPath '/baza_app' -Session $mutSession2 -StateRoot $mutationState
+        Test-BRAVOCondition -Condition (
+            $mutResult2.Status -eq 'MUTATION_VIOLATION' -and $mutResult2.MutationViolations.Count -eq 1 -and
+            $mutResult2.MutationViolations[0].RelativePath -eq 'verified.txt' -and
+            $mutResult2.MutationViolations[0].PreviousSize -eq 500 -and $mutResult2.MutationViolations[0].CurrentSize -eq 999 -and
+            $mutSession2.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/MutationDetectedBlocksSilentOverwrite' -Failure "зміна розміру verified-файлу має бути виявлена як MutationViolation і НЕ призводити до silent re-upload; Status=$($mutResult2.Status),Violations=$($mutResult2.MutationViolations.Count),PutFiles=$($mutSession2.State.PutFilesCallCount)"
+
+        $fastHealthMutation = Get-BRAVOBazaFastHealthResult -SyncResult $mutResult2
+        Test-BRAVOCondition -Condition ($fastHealthMutation.Healthy -eq $false -and $fastHealthMutation.Level -eq 'CRITICAL' -and $fastHealthMutation.Message -match 'verified\.txt') `
+            -Name 'BazaSync/MutationViolationIsHealthCritical' -Failure 'MUTATION_VIOLATION має бути CRITICAL/unhealthy з іменем файлу в повідомленні'
+
+        # New file with OLD LastWriteTime must still be discovered (timestamp is a hint, not source of truth)
+        $oldTsRoot = Join-Path $bazaSyncTestRoot "A_OldTimestamp"
+        $oldTsLocal = Join-Path $oldTsRoot "local"
+        $oldTsState = Join-Path $oldTsRoot "state"
+        New-Item -ItemType Directory -Path $oldTsLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $oldTsLocal -RelativePath "ancient_but_new.txt" -SizeBytes 77 -LastWriteTimeUtc ([datetime]::Parse('2001-01-01T00:00:00Z').ToUniversalTime()) | Out-Null
+        $oldTsSession = New-BRAVOSelfTestFakeBazaSession
+        $oldTsResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $oldTsLocal -RemoteRootPath '/baza_app' -Session $oldTsSession -StateRoot $oldTsState
+        Test-BRAVOCondition -Condition ($oldTsResult.Status -eq 'COMPLETE' -and $oldTsResult.Uploaded -eq 1 -and $oldTsSession.State.PutFilesCallCount -eq 1) `
+            -Name 'BazaSync/NewFileWithOldLastWriteTimeStillDiscovered' -Failure "новий файл зі старим LastWriteTime має бути завантажений як звичайний новий файл; Uploaded=$($oldTsResult.Uploaded)"
+
+        # =======================================================================
+        # CUTOFF (category B): NewAfterCutoff is INFO-only, does not fail Health
+        # =======================================================================
+        $cutoffRoot = Join-Path $bazaSyncTestRoot "B_Cutoff"
+        $cutoffLocal = Join-Path $cutoffRoot "local"
+        $cutoffState = Join-Path $cutoffRoot "state"
+        New-Item -ItemType Directory -Path $cutoffLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $cutoffLocal -RelativePath "before1.txt" -SizeBytes 10 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $cutoffLocal -RelativePath "before2.txt" -SizeBytes 10 | Out-Null
+        $cutoffSession = New-BRAVOSelfTestFakeBazaSession
+        $cutoffResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $cutoffLocal -RemoteRootPath '/baza_app' -Session $cutoffSession -StateRoot $cutoffState
+        Test-BRAVOCondition -Condition ($cutoffResult.Status -eq 'COMPLETE' -and $cutoffResult.DiscoveredWithinCutoff -eq 2) `
+            -Name 'BazaSync/CutoffCapturesOnlyFilesPresentAtSnapshotTime' -Failure "DiscoveredWithinCutoff має дорівнювати кількості файлів на момент знімку (2); отримано $($cutoffResult.DiscoveredWithinCutoff)"
+
+        # a file appears AFTER the sync completed
+        New-BRAVOSelfTestBazaFile -Directory $cutoffLocal -RelativePath "after_cutoff.txt" -SizeBytes 10 | Out-Null
+        $cutoffResultWithNew = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $cutoffResult -LocalDirectory $cutoffLocal -StateRoot $cutoffState
+        $cutoffFastHealth = Get-BRAVOBazaFastHealthResult -SyncResult $cutoffResultWithNew
+        Test-BRAVOCondition -Condition (
+            $cutoffResultWithNew.NewAfterCutoff -eq 1 -and $cutoffResultWithNew.DiscoveredWithinCutoff -eq 2 -and
+            $cutoffFastHealth.Healthy -eq $true -and $cutoffFastHealth.Level -eq 'OK' -and
+            ($cutoffFastHealth.Info -join ' ') -match 'нові після cutoff'
+        ) -Name 'BazaSync/NewAfterCutoffIsInfoOnlyNeverFailsHealth' -Failure "файл, що з'явився ПІСЛЯ sync, має бути NewAfterCutoff=1 (INFO), а НЕ впливати на Healthy; NewAfterCutoff=$($cutoffResultWithNew.NewAfterCutoff),Healthy=$($cutoffFastHealth.Healthy),Level=$($cutoffFastHealth.Level)"
+
+        # a pre-cutoff FAILED upload must trigger a Health alert with cycle/discovered/uploaded/failed detail
+        $cutoffFailRoot = Join-Path $bazaSyncTestRoot "B_CutoffFail"
+        $cutoffFailLocal = Join-Path $cutoffFailRoot "local"
+        $cutoffFailState = Join-Path $cutoffFailRoot "state"
+        New-Item -ItemType Directory -Path $cutoffFailLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $cutoffFailLocal -RelativePath "ok1.txt" -SizeBytes 10 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $cutoffFailLocal -RelativePath "bad1.txt" -SizeBytes 10 | Out-Null
+        $cutoffFailSession = New-BRAVOSelfTestFakeBazaSession -FailOnRelativePaths @('bad1.txt')
+        $cutoffFailResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $cutoffFailLocal -RemoteRootPath '/baza_app' -Session $cutoffFailSession -StateRoot $cutoffFailState
+        $cutoffFailHealth = Get-BRAVOBazaFastHealthResult -SyncResult $cutoffFailResult
+        Test-BRAVOCondition -Condition (
+            $cutoffFailResult.PendingWithinCutoff -eq 1 -and $cutoffFailResult.Failed -eq 1 -and
+            $cutoffFailHealth.Healthy -eq $false -and $cutoffFailHealth.Level -eq 'CRITICAL' -and
+            $cutoffFailHealth.Message -match [regex]::Escape($cutoffFailResult.CycleId) -and
+            $cutoffFailHealth.Message -match 'Виявлено' -and $cutoffFailHealth.Message -match 'Передано' -and $cutoffFailHealth.Message -match 'Не передано'
+        ) -Name 'BazaSync/PreCutoffFailedUploadTriggersHealthAlertWithDetail' -Failure "pending/failed в межах cutoff має alert-увати з cycle/discovered/uploaded/failed деталями; PendingWithinCutoff=$($cutoffFailResult.PendingWithinCutoff),Healthy=$($cutoffFailHealth.Healthy),Msg=$($cutoffFailHealth.Message)"
+
+        # =======================================================================
+        # FULL AUDIT / BOOTSTRAP (category E, G)
+        # =======================================================================
+        $bootstrapRoot = Join-Path $bazaSyncTestRoot "G_Bootstrap"
+        $bootstrapLocal = Join-Path $bootstrapRoot "local"
+        $bootstrapState = Join-Path $bootstrapRoot "state"
+        New-Item -ItemType Directory -Path $bootstrapLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $bootstrapLocal -RelativePath "existing1.txt" -SizeBytes 111 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $bootstrapLocal -RelativePath "existing2.txt" -SizeBytes 222 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $bootstrapLocal -RelativePath "existing3.txt" -SizeBytes 333 | Out-Null
+
+        $bootstrapAuditProvider = {
+            param($Snapshot)
+            # Simulate: remote already has ALL of these files (fixture already
+            # matches production reality) -- PendingFiles empty means everything
+            # already matches, nothing needs (re)upload.
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $bootstrapLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+
+        $bootstrapSession = New-BRAVOSelfTestFakeBazaSession
+        $bootstrapResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $bootstrapLocal -RemoteRootPath '/baza_app' -Session $bootstrapSession -StateRoot $bootstrapState -BootstrapIfNeeded -FullAuditProvider $bootstrapAuditProvider
+        $bootstrapStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $bootstrapState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $bootstrapResult.Status -eq 'COMPLETE' -and $bootstrapResult.Bootstrap -eq $true -and
+            $bootstrapResult.Uploaded -eq 0 -and $bootstrapSession.State.PutFilesCallCount -eq 0 -and
+            $bootstrapStateRead.State.Files.Count -eq 3
+        ) -Name 'BazaSync/BootstrapReconciliationSkipsAlreadyMatchingFiles' -Failure "bootstrap над вже-наявним на SFTP fixture НЕ має re-upload-ити файли; Uploaded=$($bootstrapResult.Uploaded),PutFiles=$($bootstrapSession.State.PutFilesCallCount),StateFiles=$($bootstrapStateRead.State.Files.Count)"
+
+        # first run WITHOUT FullAuditProvider (but WITH -BootstrapIfNeeded) must error, not silently skip verification
+        $noProviderResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $bootstrapLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot (Join-Path $bootstrapRoot "state_noaudit") -BootstrapIfNeeded
+        Test-BRAVOCondition -Condition ($noProviderResult.Status -eq 'ERROR' -and $noProviderResult.Error -match 'FullAuditProvider') `
+            -Name 'BazaSync/FirstRunBootstrapWithoutProviderFailsVisible' -Failure "перший запуск з -BootstrapIfNeeded, але без FullAuditProvider, має чесно повернути ERROR, а не мовчки пропустити bootstrap; Status=$($noProviderResult.Status)"
+
+        # Full Audit periodic drift reconciliation: a file WAS verified, but audit now reports it pending (someone deleted it remotely)
+        $driftRoot = Join-Path $bazaSyncTestRoot "E_Drift"
+        $driftLocal = Join-Path $driftRoot "local"
+        $driftState = Join-Path $driftRoot "state"
+        New-Item -ItemType Directory -Path $driftLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $driftLocal -RelativePath "stable.txt" -SizeBytes 50 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $driftLocal -RelativePath "driftedaway.txt" -SizeBytes 60 | Out-Null
+        $driftSession1 = New-BRAVOSelfTestFakeBazaSession
+        $driftResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $driftLocal -RemoteRootPath '/baza_app' -Session $driftSession1 -StateRoot $driftState
+        Test-BRAVOCondition -Condition ($driftResult1.Status -eq 'COMPLETE' -and $driftResult1.Uploaded -eq 2) `
+            -Name 'BazaSync/DriftSetupInitialUploadSucceeds' -Failure 'setup: обидва файли мають спершу успішно завантажитись'
+
+        $driftAuditProvider = {
+            param($Snapshot)
+            # Simulate WinSCP full compare now reporting driftedaway.txt as PENDING
+            # (i.e. it no longer matches remote -- someone deleted/changed it there).
+            $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $driftLocal "driftedaway.txt") }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $driftLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $driftSession2 = New-BRAVOSelfTestFakeBazaSession
+        $driftResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $driftLocal -RemoteRootPath '/baza_app' -Session $driftSession2 -StateRoot $driftState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $driftAuditProvider
+        Test-BRAVOCondition -Condition (
+            $driftResult2.Status -eq 'COMPLETE' -and $driftResult2.Uploaded -eq 1 -and
+            $driftSession2.State.PutFilesCalledFor -match 'driftedaway'
+        ) -Name 'BazaSync/FullAuditDetectsOldRemoteFileGoneMissingAndReUploads' -Failure "Full Audit має виявити зниклий на remote файл і повторно завантажити САМЕ його; Status=$($driftResult2.Status),Uploaded=$($driftResult2.Uploaded),PutFilesFor=$($driftSession2.State.PutFilesCalledFor -join ',')"
+
+        # =======================================================================
+        # CONCURRENCY (section 17)
+        # =======================================================================
+        $lockRoot = Join-Path $bazaSyncTestRoot "Concurrency"
+        $lock1 = Enter-BRAVOBazaSyncLock -StateRoot $lockRoot -Component 'BAZA_APP'
+        $lock2 = Enter-BRAVOBazaSyncLock -StateRoot $lockRoot -Component 'BAZA_APP'
+        Test-BRAVOCondition -Condition ($lock1.Success -eq $true -and $lock2.Success -eq $false) `
+            -Name 'BazaSync/SyncLockPreventsConcurrentSameComponentSync' -Failure 'другий Enter-BRAVOBazaSyncLock на той самий компонент, поки перший тримає lock, має провалитись'
+        $lock3 = Enter-BRAVOBazaSyncLock -StateRoot $lockRoot -Component 'BAZA_WWW'
+        Test-BRAVOCondition -Condition ($lock3.Success -eq $true) `
+            -Name 'BazaSync/SyncLockIsIndependentPerComponent' -Failure 'BAZA_APP і BAZA_WWW мають незалежні locks'
+        $lock1.Stream.Dispose(); $lock3.Stream.Dispose()
+
+        $skippedResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'x' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
+        $skippedResult.Status = 'SKIPPED_CONCURRENT'
+        $skippedResult.Error = 'lock held'
+        $skippedHealth = Get-BRAVOBazaFastHealthResult -SyncResult $skippedResult
+        Test-BRAVOCondition -Condition ($skippedHealth.Healthy -eq $true -and $skippedHealth.Level -eq 'INFO') `
+            -Name 'BazaSync/SkippedConcurrentIsHealthyInfoNotAlert' -Failure 'SKIPPED_CONCURRENT не повинен бути alert -- це ознака активної роботи іншого процесу'
+
+        # =======================================================================
+        # PERFORMANCE REGRESSION (section 22)
+        # =======================================================================
+        $perfSnapshotEntries = @{}
+        $perfStateFiles = @{}
+        for ($i = 0; $i -lt 100000; $i++) {
+            $relPath = "verified_$i.dat"
+            $perfSnapshotEntries[$relPath] = [pscustomobject]@{ RelativePath = $relPath; Size = 1000; LastWriteTimeUtc = '2026-01-01T00:00:00.0000000Z'; FullPath = "C:\fake\$relPath" }
+            $perfStateFiles[$relPath] = [pscustomobject]@{ Size = 1000; LastWriteTimeUtc = '2026-01-01T00:00:00.0000000Z'; UploadedUtc = '2026-01-01T00:00:01.0000000Z'; Verified = $true }
+        }
+        for ($i = 0; $i -lt 10; $i++) {
+            $relPath = "brandnew_$i.dat"
+            $perfSnapshotEntries[$relPath] = [pscustomobject]@{ RelativePath = $relPath; Size = 500; LastWriteTimeUtc = '2026-01-01T00:00:00.0000000Z'; FullPath = "C:\fake\$relPath" }
+        }
+        $perfSnapshot = [pscustomobject]@{ SnapshotUtc = (Get-Date).ToUniversalTime(); Entries = $perfSnapshotEntries; Success = $true; Error = $null }
+        $perfState = [pscustomobject]@{ Files = $perfStateFiles }
+
+        $perfStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $perfPlan = Get-BRAVOBazaSyncPlan -Snapshot $perfSnapshot -State $perfState -MutationPolicy 'Fail'
+        $perfStopwatch.Stop()
+
+        Test-BRAVOCondition -Condition (
+            $perfPlan.ToUpload.Count -eq 10 -and $perfPlan.TrustedSkip.Count -eq 100000 -and $perfPlan.MutationViolations.Count -eq 0
+        ) -Name 'BazaSync/PerformancePlanScalesWithNewFilesNotTotalFiles' -Failure "план над 100000 verified + 10 нових файлів має дати ToUpload=10 (не торкаючись 100000 verified remote-ами); ToUpload=$($perfPlan.ToUpload.Count),TrustedSkip=$($perfPlan.TrustedSkip.Count)"
+
+        Test-BRAVOCondition -Condition ($perfStopwatch.Elapsed.TotalSeconds -lt 30) `
+            -Name 'BazaSync/PerformancePlanCompletesQuicklyOn100kFiles' -Failure "план над 100010 файлами тривав $($perfStopwatch.Elapsed.TotalSeconds) с -- підозра на випадкову O(n^2) регресію"
+
+        $bazaHealthScriptText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1"), [Text.Encoding]::UTF8)
+        $bazaIncrementalBranchMatch = [regex]::Match(
+            $bazaHealthScriptText,
+            '(?s)\} elseif \(Test-BRAVOBazaIncrementalModeEnabled\) \{(.*?)\r?\n        \} else \{'
+        )
+        Test-BRAVOCondition -Condition $bazaIncrementalBranchMatch.Success `
+            -Name 'BazaSync/HealthHasIncrementalFastPathBranch' -Failure 'not found: elseif(Test-BRAVOBazaIncrementalModeEnabled) branch in Get-SFTPHealthIssues'
+
+        if ($bazaIncrementalBranchMatch.Success) {
+            $bazaIncrementalBranchText = $bazaIncrementalBranchMatch.Groups[1].Value
+
+            Test-BRAVOCondition -Condition (-not $bazaIncrementalBranchText.Contains('Invoke-WinSCPBAZAComparison')) `
+                -Name 'BazaSync/FastHealthDoesNotRunFullPreviewComparison' -Failure 'Fast Health branch must not call Invoke-WinSCPBAZAComparison (full tree comparison)'
+
+            Test-BRAVOCondition -Condition (
+                $bazaIncrementalBranchText.Contains('if ($null -eq $bazaSyncResult) {') -and
+                $bazaIncrementalBranchText.Contains('Invoke-BRAVOBazaComponentSyncSession')
+            ) -Name 'BazaSync/HealthSynchronizesBazaBeforeCheckingWhenNoFreshResult' -Failure 'Health must call Invoke-BRAVOBazaComponentSyncSession when no fresh SyncResult is available'
+
+            $noFreshResultGuardIndex = $bazaIncrementalBranchText.IndexOf('if ($null -eq $bazaSyncResult) {')
+            $syncSessionCallIndex = $bazaIncrementalBranchText.IndexOf('Invoke-BRAVOBazaComponentSyncSession')
+            Test-BRAVOCondition -Condition ($noFreshResultGuardIndex -ge 0 -and $syncSessionCallIndex -gt $noFreshResultGuardIndex) `
+                -Name 'BazaSync/HealthFallbackSyncOnlyWhenNoFreshResultReused' -Failure 'Invoke-BRAVOBazaComponentSyncSession must be nested inside the null-check guard, not called unconditionally (ONE synchronization reuse)'
+
+            Test-BRAVOCondition -Condition (
+                -not $bazaIncrementalBranchText.Contains('-BootstrapIfNeeded') -and
+                -not $bazaIncrementalBranchText.Contains('-FullAuditProvider')
+            ) -Name 'BazaSync/HealthFallbackSyncNeverBootstraps' -Failure 'standalone Health fallback sync must not pass -BootstrapIfNeeded/-FullAuditProvider (Archive-exclusive responsibility)'
+
+            Test-BRAVOCondition -Condition ($bazaIncrementalBranchText.Contains('$script:bazaSyncResults') -and $bazaIncrementalBranchText.Contains('ContainsKey($folderCheck.ComponentKey)')) `
+                -Name 'BazaSync/HealthChecksArchivePassedResultFirst' -Failure 'Health must check $script:bazaSyncResults (Archive-provided) before falling back to its own sync'
+        }
+
+        # =======================================================================
+        # Archive-side wiring: legacy path preserved, incremental path used when
+        # enabled, SyncResult passed to Health only when actually attempted.
+        # =======================================================================
+        $bazaArchiveScriptText = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+
+        foreach ($component in @(
+            @{ Key = 'BAZA_APP'; IncrementalCall = "Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_APP'"; LegacyCall = 'Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source' }
+            @{ Key = 'BAZA_WWW'; IncrementalCall = "Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_WWW'"; LegacyCall = '$bazaWWWSFTPSync = Sync-FolderToSFTP `' }
+        )) {
+            Test-BRAVOCondition -Condition ($bazaArchiveScriptText.Contains($component.IncrementalCall)) `
+                -Name "BazaSync/Archive$($component.Key)UsesIncrementalSyncFunction" -Failure "не знайдено виклик $($component.IncrementalCall) в Archive.Runtime.ps1"
+            Test-BRAVOCondition -Condition ($bazaArchiveScriptText.Contains($component.LegacyCall)) `
+                -Name "BazaSync/Archive$($component.Key)PreservesLegacySyncFolderToSFTPPath" -Failure "legacy Sync-FolderToSFTP шлях для $($component.Key) має лишитись незмінним (backward-compat fallback при Mode != IncrementalAppendOnly)"
+        }
+
+        Test-BRAVOCondition -Condition (
+            $bazaArchiveScriptText.Contains('$bazaSyncResultsForHealth = @{}') -and
+            $bazaArchiveScriptText.Contains("if (`$transferResults.BAZA_APP.Attempted -and `$null -ne `$script:bazaAppSyncResult) {") -and
+            $bazaArchiveScriptText.Contains("`$bazaSyncResultsForHealth['BAZA_APP'] = `$script:bazaAppSyncResult") -and
+            $bazaArchiveScriptText.Contains("if (`$transferResults.BAZA_WWW.Attempted -and `$null -ne `$script:bazaWWWSyncResult) {") -and
+            $bazaArchiveScriptText.Contains("`$bazaSyncResultsForHealth['BAZA_WWW'] = `$script:bazaWWWSyncResult") -and
+            $bazaArchiveScriptText.Contains('$healthParameters.BazaSyncResults = $bazaSyncResultsForHealth')
+        ) -Name 'BazaSync/ArchivePassesSyncResultToHealthOnlyWhenAttempted' -Failure 'Archive має передавати BazaSyncResults у $healthParameters лише для компонентів, де Attempted=true -- інакше Health отримав би застарілий/нульовий результат'
+
+        $healthReuseIndex = $bazaArchiveScriptText.IndexOf('$bazaSyncResultsForHealth = @{}')
+        $healthCheckCallIndex = $bazaArchiveScriptText.IndexOf('$healthCheckResult = Invoke-BRAVOHealthCheck @healthParameters')
+        Test-BRAVOCondition -Condition ($healthReuseIndex -ge 0 -and $healthCheckCallIndex -gt $healthReuseIndex) `
+            -Name 'BazaSync/ArchiveBuildsBazaSyncResultsBeforeInvokingHealth' -Failure 'BazaSyncResults має бути побудовано ДО виклику Invoke-BRAVOHealthCheck'
+    } finally {
+        if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
+            Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red

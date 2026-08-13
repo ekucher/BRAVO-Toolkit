@@ -232,6 +232,94 @@ Invariants below).
   service-genuinely-absent case, which the renamed `ProductionConfig/
   BravoAbsentIniSourcesPrepareArchiveDefinition` only proved up to
   `archiveDefinitions` being ready, not backup execution itself.
+- BAZA_APP/BAZA_WWW synchronization/verification rearchitected around an
+  incremental, append-only-aware engine (new `BRAVO.BazaSync` module),
+  replacing full-tree `synchronize`/`synchronize -preview` comparisons on
+  every cycle for this specific (>50 GB, hundreds of thousands of files,
+  files never modified after arrival, remote `-delete` never used) workload.
+  The old cost was listing/stat/compare operation *count*, not bytes
+  transferred, and it was the source of false-positive Health alerts for
+  legitimately new files that appeared between sync and health-check.
+  Core invariant: `SYNC -> VERIFY -> HEALTH RESULT`, not "Health finds new
+  local files -> alert". Each sync cycle (`CycleId`) snapshots the local
+  directory once (the `Cutoff`); files present in that snapshot belong to
+  the cycle, files appearing after it are `NewAfterCutoff` — always `INFO`,
+  never a Health alert, regardless of how long ago the cycle finished. A
+  persisted per-component index (`%ProgramData%\BRAVO\State\BAZA\
+  <Component>.state.json`, `BAZA.StateRoot`-configurable; explicitly *not*
+  a Durable Operation Journal, which remains unstarted) records
+  RelativePath/Size/LastWriteTimeUtc/UploadedUtc/Verified per file already
+  confirmed transferred; a file with `Verified=true` and an unchanged local
+  size needs zero remote calls on subsequent cycles (`AlreadyVerified`) —
+  `LastWriteTime` is only ever an optimization hint, never the sole
+  correctness signal, so a new file with an old timestamp is still
+  discovered. State writes are atomic (temp file + `[IO.File]::Replace`,
+  matching the existing `Save-BRAVOVSSOwnershipState` pattern); a crash mid-
+  upload leaves the file `Verified=false` and it is retried, never silently
+  marked successful. A size change on an already-`Verified` file is an
+  append-only invariant violation (mutation): `BAZA.MutationPolicy = "Fail"`
+  (default) blocks it from silent re-upload and reports
+  `Status=MUTATION_VIOLATION` with the previous/current size and timestamp
+  instead. State absent/corrupt/schema-mismatched never causes old files to
+  be silently trusted (`Status=STATE_INVALID`) — it requires a full
+  reconciliation. First run reconciles the existing SFTP tree via one
+  expensive Full Audit (reusing the existing `Get-BAZASFTPComparison`/WinSCP
+  `CompareDirectories` mechanism through a pure adapter,
+  `ConvertTo-BRAVOBazaFullAuditResult`, rather than duplicating it) that
+  seeds already-matching files as verified without re-uploading them;
+  Full Audit also re-runs periodically (`BAZA.FullAuditEveryDays`, default
+  7, or `-ForceFullAudit`) to catch drift a pure incremental plan cannot see
+  on its own (e.g. a previously-verified file manually deleted on the
+  remote side is detected and re-queued for upload) — never on every cycle.
+  Bootstrap/Full Audit is `BRAVO_ARCHIV`'s exclusive responsibility (it
+  always runs first on schedule); a standalone `BRAVO_HEALTH.ps1` with no
+  state yet returns a clear `Status=ERROR` instead of silently re-uploading
+  everything. `BRAVO_HEALTH` now synchronizes BAZA before evaluating it
+  (`BAZA.SynchronizeBeforeHealth`, default `true`): if `BRAVO_ARCHIV` already
+  produced a `SyncResult` in the same run it is reused as-is (no second
+  sync — `Invoke-BRAVOBazaComponentSyncSession` is the one shared
+  session/sync/checkpoint entry point both callers use); a standalone Health
+  run with no fresh result performs exactly one sync itself before
+  evaluating, never a stale-comparison-first alert. Fast Health
+  (`Get-BRAVOBazaFastHealthResult`) evaluates only the already-computed
+  `SyncResult` — no new remote comparison — and distinguishes normal new
+  data (`NewAfterCutoff`, info-only) from a genuinely failed/incomplete
+  sync (`Failed`/`PendingWithinCutoff` > 0, alert with cycle/discovered/
+  uploaded/failed detail) from sync-not-completed
+  (`ERROR`/`STATE_INVALID`, alert stating synchronization did not complete,
+  never "N files missing"). A small remote checkpoint
+  (`/baza_app/.bravo-sync.json`, metadata only — no credentials) is
+  published as the last step of a successful sync only; a failed/partial
+  cycle never publishes one. Concurrency: a per-component file lock
+  (`<StateRoot>\BAZA\<Component>.sync.lock`, fail-fast, no retry loop) is a
+  second, unconditional barrier around the state read-modify-write section,
+  independent of the existing `SkipIfBackupTaskRunning`/
+  `BRAVO_OPERATION.lock` coordination that already keeps a normally
+  scheduled standalone Health run from overlapping `BRAVO_ARCHIV`; a lock
+  conflict returns `Status=SKIPPED_CONCURRENT`, which Health treats as
+  healthy/`INFO` (evidence another process is actively syncing, not a
+  problem). New `backupMonitoring.SFTP.BAZA` config block (`Mode` — default
+  `"IncrementalAppendOnly"`, any other value fully preserves the previous
+  `Sync-FolderToSFTP`/`Invoke-WinSCPBAZAComparison` code paths unchanged;
+  `SynchronizeBeforeHealth`; `FastHealthEnabled`; `FullAuditEnabled`;
+  `FullAuditEveryDays`; `MutationPolicy`; `StateRoot`) is interpreted from
+  exactly one place (`Get-BRAVOBazaSettingsEffective`,
+  `Get-BRAVOBazaSyncModeEffective`, `Test-BRAVOBazaIncrementalModeEnabled`,
+  all in the already-shared `BRAVO.ArchiveRuntime` module) that
+  `BRAVO_ARCHIV`, `BRAVO_HEALTH`, and `BRAVO_DRY_RUN` all call — closing a
+  real inconsistency found during this work, where `BRAVO_ARCHIV` already
+  respected a `BAZA.StateRoot` override but `BRAVO_HEALTH`'s standalone
+  fallback sync did not, which would have made the two write/read two
+  different state files for the same component if that setting were ever
+  changed from its default. `BRAVO_DRY_RUN.ps1` reports BAZA mode, state
+  path, state readability, last successful cycle, last Full Audit, and next
+  scheduled Full Audit purely by reading persisted state — it never opens
+  an SFTP session or performs a sync. Known residual gap: the incremental
+  path does not yet carry over legacy SFTP filename-compatibility checking
+  (`Get-BAZARemoteNameCompatibilityIssues`); `IncompatibleNames` stays 0
+  when `Mode = "IncrementalAppendOnly"`. This is not the start of a Durable
+  Operation Journal — the persisted state here is a narrow index scoped
+  only to BAZA synchronization optimization/reliability.
 
 ## 5.0.0 — 2026-08-11
 

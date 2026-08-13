@@ -3,6 +3,86 @@
 $compatibilityManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Compatibility\BRAVO.Compatibility.psd1'
 Import-Module -Name $compatibilityManifest -ErrorAction Stop
 
+function Get-BRAVOBazaSyncModeEffective {
+    # Одна canonical точка інтерпретації (safety-review ТЗ п.20: "не
+    # дублювати business rules у Archive/Health/DryRun/Diagnose — один
+    # canonical config interpretation") — Archive, Health і DryRun читають
+    # РІВНО цю функцію (спільний модуль, вже імпортований обома), а не
+    # $backupMonitoring.SFTP.BAZA напряму кожен по-своєму.
+    $bazaSettings = $backupMonitoring.SFTP.BAZA
+    $mode = if ($null -ne $bazaSettings -and $bazaSettings.Contains('Mode')) {
+        [string]$bazaSettings.Mode
+    } else {
+        'IncrementalAppendOnly'
+    }
+    return $mode
+}
+
+function Test-BRAVOBazaIncrementalModeEnabled {
+    return ((Get-BRAVOBazaSyncModeEffective) -eq 'IncrementalAppendOnly')
+}
+
+function Get-BRAVOBazaSettingsEffective {
+    # Одна canonical точка інтерпретації ВСІХ backupMonitoring.SFTP.BAZA
+    # налаштувань (ТЗ п.20/25) — StateRoot/MutationPolicy/FullAuditEveryDays/
+    # SynchronizeBeforeHealth/FastHealthEnabled. Раніше Archive
+    # (Invoke-BRAVOBazaIncrementalSync) і Health (fallback-sync у
+    # Get-SFTPHealthIssues) обчислювали ці fallback-и НЕЗАЛЕЖНО одне від
+    # одного: Archive поважав можливий BAZA.StateRoot override, а Health —
+    # ні (завжди йшов у типовий $stateRoot). Якщо оператор колись
+    # налаштує нетиповий StateRoot, Archive і Health писали б і читали б
+    # ДВА РІЗНІ файли стану того самого компонента — тихе розходження
+    # стану без жодної помилки. Спільна функція усуває цей клас багів
+    # структурно: обидва викликачі (і DryRun) читають РІВНО цю точку.
+    $bazaSettings = $backupMonitoring.SFTP.BAZA
+
+    $stateRootEffective = if ($null -ne $bazaSettings -and $bazaSettings.Contains('StateRoot') -and
+        -not [string]::IsNullOrWhiteSpace([string]$bazaSettings.StateRoot)) {
+        [string]$bazaSettings.StateRoot
+    } else {
+        [string]$stateRoot
+    }
+    $mutationPolicyEffective = if ($null -ne $bazaSettings -and $bazaSettings.Contains('MutationPolicy') -and
+        -not [string]::IsNullOrWhiteSpace([string]$bazaSettings.MutationPolicy)) {
+        [string]$bazaSettings.MutationPolicy
+    } else {
+        'Fail'
+    }
+    $fullAuditEnabledEffective = if ($null -ne $bazaSettings -and $bazaSettings.Contains('FullAuditEnabled')) {
+        [bool]$bazaSettings.FullAuditEnabled
+    } else {
+        $true
+    }
+    $fullAuditEveryDaysEffective = if ($fullAuditEnabledEffective -and $null -ne $bazaSettings -and
+        $bazaSettings.Contains('FullAuditEveryDays') -and [double]$bazaSettings.FullAuditEveryDays -gt 0) {
+        [double]$bazaSettings.FullAuditEveryDays
+    } elseif ($fullAuditEnabledEffective) {
+        7
+    } else {
+        0
+    }
+    $synchronizeBeforeHealthEffective = if ($null -ne $bazaSettings -and $bazaSettings.Contains('SynchronizeBeforeHealth')) {
+        [bool]$bazaSettings.SynchronizeBeforeHealth
+    } else {
+        $true
+    }
+    $fastHealthEnabledEffective = if ($null -ne $bazaSettings -and $bazaSettings.Contains('FastHealthEnabled')) {
+        [bool]$bazaSettings.FastHealthEnabled
+    } else {
+        $true
+    }
+
+    return [pscustomobject]@{
+        Mode = Get-BRAVOBazaSyncModeEffective
+        StateRoot = $stateRootEffective
+        MutationPolicy = $mutationPolicyEffective
+        FullAuditEnabled = $fullAuditEnabledEffective
+        FullAuditEveryDays = $fullAuditEveryDaysEffective
+        SynchronizeBeforeHealth = $synchronizeBeforeHealthEffective
+        FastHealthEnabled = $fastHealthEnabledEffective
+    }
+}
+
 function Get-BRAVOWinSCPDotNetComponents {
     [CmdletBinding()]
     param(

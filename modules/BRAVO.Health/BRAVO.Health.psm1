@@ -27,7 +27,12 @@ function Invoke-BRAVOHealthCheck {
         [switch]$NoSlack,
         [switch]$SkipIfBackupTaskRunning,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [string]$EntryScriptPath
+        [string]$EntryScriptPath,
+        # ONE synchronization, ONE SyncResult (safety-review): якщо Archive
+        # щойно виконав BAZA sync у ЦЬОМУ прогоні, Health переоцінює вже
+        # готовий результат замість повторної синхронізації. Ключі —
+        # 'BAZA_APP'/'BAZA_WWW', значення — SyncResult з BRAVO.BazaSync.
+        [hashtable]$BazaSyncResults
     )
 
     if ([string]::IsNullOrWhiteSpace($EntryScriptPath)) {
@@ -58,6 +63,7 @@ function Invoke-BRAVOHealthCheck {
             -ForceNotification:$ForceNotification `
             -NotifyOnSuccess:$NotifyOnSuccess `
             -NoSlack:$NoSlack `
+            -BazaSyncResults $BazaSyncResults `
             -SkipIfBackupTaskRunning:$SkipIfBackupTaskRunning `
             -SuppressHeader
     } finally {

@@ -27,8 +27,19 @@ function Invoke-BRAVOHealth {
         # друга незалежна програма всередині виводу Archive. Самостійний
         # запуск (BRAVO_HEALTH.ps1) цей параметр не передає — заголовок там
         # лишається.
-        [switch]$SuppressHeader
+        [switch]$SuppressHeader,
+        # ONE synchronization, ONE SyncResult (safety-review): якщо Archive
+        # щойно виконав BAZA sync, тут — уже готовий результат. Ключі
+        # 'BAZA_APP'/'BAZA_WWW'. Самостійний запуск BRAVO_HEALTH.ps1 не
+        # передає це — Health сам вирішує, чи потрібна власна синхронізація.
+        [hashtable]$BazaSyncResults
     )
+
+# ONE synchronization, ONE SyncResult (safety-review): script-scope, щоб
+# Get-SFTPHealthIssues (окрема функція нижче, без власних параметрів —
+# той самий стиль, що решта health-check функцій цього файлу) міг його
+# прочитати без протягування через кожен виклик у стеку.
+$script:bazaSyncResults = $BazaSyncResults
 
 # Нумерація етапів операційної консолі: [1/7], [2/7], ... Health має рівно
 # ті самі елементи виводу, що й Archive: заголовок, етапи, підсумок.
@@ -350,7 +361,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -3099,6 +3110,7 @@ function Get-SFTPHealthIssues {
         $folderSynchronizationChecks += [pscustomobject]@{
             Name = "BAZA APP"
             Component = "SFTP BAZA APP"
+            ComponentKey = "BAZA_APP"
             LocalPath = [string]$bazaAppPaths.Source
             RemotePath = Normalize-SFTPPath $sftpDirectories.BAZA
             DetectionError = $null
@@ -3108,6 +3120,7 @@ function Get-SFTPHealthIssues {
         $folderSynchronizationChecks += [pscustomobject]@{
             Name = "BAZA WWW"
             Component = "SFTP BAZA WWW"
+            ComponentKey = "BAZA_WWW"
             LocalPath = [string]$bazaWWWPaths.Source
             RemotePath = Normalize-SFTPPath $sftpDirectories.BAZAWWW
             DetectionError = if ($bazaWWWDetection.Success) {
@@ -3144,6 +3157,70 @@ function Get-SFTPHealthIssues {
                 DifferenceCount = $null
                 Details = @()
                 Location = $folderCheck.RemotePath
+            }
+        } elseif (Test-BRAVOBazaIncrementalModeEnabled) {
+            # Incremental append-only fast path (safety-review ТЗ п.2/п.8):
+            # SYNC -> VERIFY -> HEALTH RESULT з уже готового SyncResult, а
+            # не нове повне порівняння дерева. ONE synchronization (ТЗ п.9):
+            # якщо Archive ЩОЙНО передав SyncResult у ЦЬОМУ ж прогоні
+            # (script:bazaSyncResults) — переоцінюємо його; інакше (справді
+            # standalone BRAVO_HEALTH.ps1) виконуємо ОДИН incremental sync
+            # самі. Bootstrap НЕ виконується тут навмисно: перший (дорогий)
+            # цикл — виключно відповідальність BRAVO_ARCHIV, який завжди
+            # виконується першим за розкладом; якщо стану справді ще немає
+            # (Archive жодного разу не запускався), SyncResult.Status=ERROR
+            # чесно про це повідомить, а не мовчки перезавантажить 50+ GB.
+            # StateRoot -- та сама canonical точка (Get-BRAVOBazaSettingsEffective,
+            # BRAVO.ArchiveRuntime), що й Archive: інакше можливий
+            # BAZA.StateRoot override спричинив би, що Archive і Health
+            # тихо пишуть/читають ДВА РІЗНІ файли стану того самого
+            # компонента.
+            $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+            $bazaSyncResult = $null
+            if ($null -ne $script:bazaSyncResults -and
+                $script:bazaSyncResults.ContainsKey($folderCheck.ComponentKey)) {
+                $bazaSyncResult = $script:bazaSyncResults[$folderCheck.ComponentKey]
+            }
+            if ($null -eq $bazaSyncResult) {
+                $bazaSyncResult = Invoke-BRAVOBazaComponentSyncSession `
+                    -Component $folderCheck.ComponentKey `
+                    -LocalDirectory $folderCheck.LocalPath `
+                    -RemoteRootPath $folderCheck.RemotePath `
+                    -RepositorySFTPUrl $sftpUrl `
+                    -HostKey $sftpHostKey `
+                    -WinSCPAssemblyPath $winSCPAssemblyPath `
+                    -WinSCPExecutablePath $winSCPPath `
+                    -StateRoot $bazaSettingsEffective.StateRoot `
+                    -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
+                    -OperationTimeoutSeconds ([math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)) `
+                    -MutationPolicy $bazaSettingsEffective.MutationPolicy `
+                    -WriteCheckpoint
+            }
+            $bazaSyncResult = Update-BRAVOBazaSyncResultNewAfterCutoff `
+                -SyncResult $bazaSyncResult `
+                -LocalDirectory $folderCheck.LocalPath `
+                -StateRoot $bazaSettingsEffective.StateRoot
+            $fastHealthResult = Get-BRAVOBazaFastHealthResult -SyncResult $bazaSyncResult
+            if (-not $fastHealthResult.Healthy) {
+                $issues += [pscustomobject]@{
+                    Kind = "SFTPSynchronization"
+                    Component = $folderCheck.Component
+                    Reason = $fastHealthResult.Message
+                    FileName = "немає даних"
+                    LastWriteTime = $null
+                    SizeBytes = $null
+                    DifferenceCount = $null
+                    Details = @()
+                    Location = $folderCheck.RemotePath
+                }
+            } else {
+                # SKIPPED_CONCURRENT (інший процес синхронізує зараз) — INFO,
+                # не SUCCESS: healthy, але не є підтвердженням актуальності копії.
+                $healthyLogLevel = if ($fastHealthResult.Level -eq 'INFO') { "INFO" } else { "SUCCESS" }
+                Write-HealthLog $fastHealthResult.Message -Level $healthyLogLevel
+                foreach ($infoLine in @($fastHealthResult.Info)) {
+                    Write-HealthLog "SFTP $($folderCheck.Name): $infoLine" -Level "INFO"
+                }
             }
         } else {
             $previewSummary = Invoke-WinSCPBAZAComparison `
