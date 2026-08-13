@@ -842,8 +842,10 @@ function Invoke-BRAVOBazaSynchronization {
     # позначив pending (напр. UploadUpdate: той самий розмір, інший mtime),
     # НЕ має права на generic AlreadyRemote same-size recovery — інакше
     # цикл мовчки скасовував би щойно отриманий audit-вердикт. Мапа
-    # СВІДОМО scope-иться на поточний цикл (вердикти не персистяться в
-    # state) — між аудитами діє звичайна round-3 семантика.
+    # тримає лише СВІЖИЙ вердикт циклу, в якому audit виконався;
+    # СТІЙКІСТЬ між циклами забезпечує НЕ вона, а персистований блокер
+    # BlockReason=AuditDrift у state-записі шляху (round 5), включно з
+    # випадком, коли локальний шлях зник зі знімка (окремий скан, round 6).
     $currentAuditPendingByPath = @{}
 
     if ($stateRead.Corrupt) {
@@ -1391,11 +1393,16 @@ function Invoke-BRAVOBazaSynchronization {
     try {
         Save-BRAVOBazaState -Path $statePath -State $state
     } catch {
-        # Стан не вдалось зберегти — наступний цикл побачить старий (менш
-        # повний, але не пошкоджений) стан і повторить upload вже переданих
-        # у ЦЬОМУ циклі файлів. Це безпечний degrade (зайва, а не втрачена
-        # робота), тому не перетворюємо успішний sync на ERROR лише через
-        # це, але результат мусить це відобразити.
+        # Стан не вдалось зберегти — для ЗВИЧАЙНОГО циклу наступний прогін
+        # побачить старий (менш повний, але не пошкоджений) стан і визнає
+        # вже передані файли через targeted same-size перевірку
+        # (AlreadyRemote, round 3) — безпечний degrade (зайва перевірка, не
+        # втрачена робота), тому успішний sync не стає ERROR лише через
+        # це, але результат мусить це відобразити. Для циклів із Full
+        # Audit безпека trust-переходу тримається НЕ на цьому: write-ahead
+        # маркер AuditReconciliationPending (round 6) у такому випадку
+        # лишається true на диску, і наступний цикл реконсилюється
+        # fail-closed замість довіри застарілим Verified-записам.
         if ($result.Status -eq 'COMPLETE') {
             $result.Status = 'INCOMPLETE'
         }
