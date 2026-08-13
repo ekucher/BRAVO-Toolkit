@@ -120,6 +120,12 @@ function New-BRAVOBazaEmptyState {
         LastCycleId = $null
         LastSuccessfulSyncUtc = $null
         LastFullAuditUtc = $null
+        # P1-2 (round 6): вузький write-ahead маркер trust-переходу Full
+        # Audit (НЕ project-wide Durable Journal). true на диску означає:
+        # audit розпочався/інтегрувався, але ФІНАЛЬНЕ збереження стану
+        # могло не відбутися — старим Verified-записам довіряти не можна,
+        # доки Archive не заверше реконсиляцію і не збереже стан успішно.
+        AuditReconciliationPending = $false
         # Hashtable, не array: O(1) lookup за RelativePath — критично для
         # сотень тисяч файлів (план інкременту читає це на КОЖЕН локальний
         # файл, щоб вирішити trusted-skip чи candidate).
@@ -169,6 +175,9 @@ function Read-BRAVOBazaState {
             LastCycleId = [string]$parsed.LastCycleId
             LastSuccessfulSyncUtc = [string]$parsed.LastSuccessfulSyncUtc
             LastFullAuditUtc = [string]$parsed.LastFullAuditUtc
+            # Старі файли стану без цього поля -> $false (додаткове поле,
+            # без підняття SchemaVersion).
+            AuditReconciliationPending = [bool]$parsed.AuditReconciliationPending
             Files = $filesHashtable
         }
         return [pscustomobject]@{ Exists = $true; Corrupt = $false; State = $state; Reason = $null }
@@ -199,6 +208,7 @@ function Save-BRAVOBazaState {
         LastCycleId = $State.LastCycleId
         LastSuccessfulSyncUtc = $State.LastSuccessfulSyncUtc
         LastFullAuditUtc = $State.LastFullAuditUtc
+        AuditReconciliationPending = [bool]$State.AuditReconciliationPending
         Files = $State.Files
     }
     $temporaryPath = Join-Path $stateDirectory ('.BRAVO_BAZA_STATE_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
@@ -939,6 +949,29 @@ function Invoke-BRAVOBazaSynchronization {
 
         $state = if ($stateRead.Exists) { $stateRead.State } else { New-BRAVOBazaEmptyState -Component $Component }
 
+        # P1-2 (round 6): незавершений trust-перехід Full Audit на диску.
+        # Маркер true означає: попередній цикл РОЗПОЧАВ audit-реконсиляцію
+        # (write-ahead запис нижче), але фінальне збереження стану могло
+        # не відбутись — Verified-записи на диску можуть бути ЗАСТАРІЛОЮ
+        # довірою, яку audit уже скасував у пам'яті. Старим записам
+        # довіряти не можна, доки реконсиляція не завершиться успішним
+        # збереженням.
+        $auditReconciliationForced = $false
+        if ([bool]$state.AuditReconciliationPending) {
+            if (-not $BootstrapIfNeeded -or $null -eq $FullAuditProvider) {
+                # Standalone Health: fail closed ДО планувальника — нуль
+                # upload, нуль TrustedSkip старих Verified-записів.
+                $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+                $result.Status = 'RECONCILIATION_REQUIRED'
+                $result.Error = "$Component — стан у незавершеній Full Audit реконсиляції (AuditReconciliationPending=true у $statePath): попередній audit міг скасувати довіру до Verified-записів, але фінальне збереження не підтверджене. Потрібен прогін BRAVO_ARCHIV (FullAuditProvider) для повторної реконсиляції."
+                $result.CompletedUtc = (Get-Date).ToUniversalTime()
+                return $result
+            }
+            # Archive: примусово повторюємо Full Audit цього ж циклу —
+            # маркер знімається лише після успішного ФІНАЛЬНОГО збереження.
+            $auditReconciliationForced = $true
+        }
+
         # Знімок ОДИН для всього циклу (і для bootstrap seed, і для плану,
         # і як сам Cutoff) — узгодженість: bootstrap ніколи не бачить
         # ІНШИЙ перелік каталогу, ніж той, що потім планується до upload.
@@ -958,7 +991,7 @@ function Invoke-BRAVOBazaSynchronization {
         # цикл). FullAuditEveryDays <= 0 вимикає періодичний шлях;
         # лишається лише bootstrap першого запуску.
         $fullAuditOverdue = $false
-        if (-not $isFirstRun -and $ForceFullAudit) {
+        if (-not $isFirstRun -and ($ForceFullAudit -or $auditReconciliationForced)) {
             $fullAuditOverdue = $true
         } elseif (-not $isFirstRun -and $FullAuditEveryDays -gt 0) {
             $lastFullAuditUtc = $null
@@ -1005,11 +1038,45 @@ function Invoke-BRAVOBazaSynchronization {
                 # без audit, а прострочення лишається до наступного разу,
                 # коли виклик матиме провайдера.
             } else {
+                # P1-2 (round 6): write-ahead маркер ПЕРЕД trust-changing
+                # Full Audit. Якщо audit скасує довіру до Verified-записів
+                # у пам'яті, а фінальне Save-BRAVOBazaState впаде — атомарний
+                # запис збереже на диску ПОПЕРЕДНІЙ стан (стара довіра без
+                # блокерів), і наступний цикл TrustedSkip-нув би файли,
+                # які audit щойно визнав розбіжними. Маркер на диску до
+                # аудиту робить це вікно fail-closed: наступний standalone
+                # Health відмовляється (RECONCILIATION_REQUIRED), Archive
+                # повторює реконсиляцію. Звичайні (без аудиту) цикли
+                # маркер НЕ пишуть — їхній збій збереження безпечний
+                # (INCOMPLETE, зайва повторна робота, не втрачена довіра).
+                $state.AuditReconciliationPending = $true
+                try {
+                    Save-BRAVOBazaState -Path $statePath -State $state
+                } catch {
+                    # Маркер зберегти не вдалося -> audit НЕ запускається:
+                    # без write-ahead запису trust-перехід був би
+                    # незахищеним від збою фінального збереження.
+                    $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $snapshot.SnapshotUtc
+                    $result.Status = 'ERROR'
+                    $result.Error = "не вдалося зберегти write-ahead маркер audit-реконсиляції ($statePath): $($_.Exception.Message) — Full Audit НЕ запускався"
+                    $result.CompletedUtc = (Get-Date).ToUniversalTime()
+                    return $result
+                }
                 $fullAuditAttemptedThisCycle = $true
                 $auditResult = & $FullAuditProvider $snapshot
                 if (-not $auditResult.Success) {
                     $fullAuditErrorThisCycle = [string]$auditResult.Error
+                    # Audit провалився -> жодного trust-переходу НЕ було —
+                    # маркер знімається (фінальне збереження нижче його
+                    # персистує; якщо і воно впаде — на диску лишиться
+                    # true, наступний цикл консервативно повторить
+                    # реконсиляцію: зайвий audit, не втрачена довіра).
+                    $state.AuditReconciliationPending = $false
                     if ($isFirstRun) {
+                        # На диску лишається маркер true (записаний вище) —
+                        # навмисно: наступний standalone Health на такому
+                        # стані відмовиться fail-closed, а Archive повторить
+                        # bootstrap-реконсиляцію.
                         $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $snapshot.SnapshotUtc
                         $result.Status = 'ERROR'
                         $result.Error = "bootstrap Full Audit не вдався: $($auditResult.Error)"
@@ -1060,6 +1127,14 @@ function Invoke-BRAVOBazaSynchronization {
                     }
                     $state.LastFullAuditUtc = $startedUtc.ToString('o')
                     $bootstrapPerformed = $true
+                    # P1-2 (round 6): результати audit інтегровано в
+                    # пам'ять — маркер знімається В ПАМ'ЯТІ; на диск false
+                    # потрапить лише разом з успішним ФІНАЛЬНИМ
+                    # Save-BRAVOBazaState наприкінці циклу. Якщо фінальне
+                    # збереження впаде — на диску лишиться true (write-
+                    # ahead запис вище), і жоден наступний цикл не
+                    # довіриться застарілим Verified-записам мовчки.
+                    $state.AuditReconciliationPending = $false
                 }
             }
         }
@@ -1086,6 +1161,30 @@ function Invoke-BRAVOBazaSynchronization {
     $incompatibleFiles = New-Object System.Collections.Generic.List[object]
     $remoteConflicts = New-Object System.Collections.Generic.List[object]
     $auditDriftFiles = New-Object System.Collections.Generic.List[object]
+
+    # P1-1 (round 6): планувальник ітерує ЛИШЕ знімок, тому persisted
+    # AuditDrift-блокер, чий локальний шлях ЗНИК з каталогу, без цього
+    # скану ніколи не виринав би — цикл ставав би COMPLETE/Healthy, хоча
+    # авторитетний audit-вердикт не розв'язано (локальне зникнення — НЕ
+    # позитивна розв'язка). Скан суто локальний по вже завантаженому
+    # state (жодного remote-виклику); блокер лишається в state
+    # недоторканим, доки оператор не розв'яже розбіжність.
+    foreach ($blockedRelativePath in @($state.Files.Keys)) {
+        if ($snapshot.Entries.ContainsKey($blockedRelativePath)) { continue }
+        $blockedEntry = $state.Files[$blockedRelativePath]
+        if ($null -eq $blockedEntry -or
+            $null -eq $blockedEntry.PSObject.Properties['BlockReason'] -or
+            [string]$blockedEntry.BlockReason -ne 'AuditDrift') { continue }
+        $auditDriftFiles.Add([pscustomobject]@{
+            RelativePath = $blockedRelativePath
+            Action = if ($null -ne $blockedEntry.PSObject.Properties['AuditAction']) { [string]$blockedEntry.AuditAction } else { $null }
+            Reason = if ($null -ne $blockedEntry.PSObject.Properties['AuditReason']) { [string]$blockedEntry.AuditReason } else { $null }
+            LocalSize = $null
+            RemoteSize = $null
+            LocalMissing = $true
+            Error = 'локальний файл зник, але audit-drift блокер не розв''язано — зникнення джерела не є позитивною розв''язкою'
+        })
+    }
 
     foreach ($candidate in $plan.ToUpload) {
         # P2 (deep review): SFTP filename-compatibility — локальна ЛИШЕ
@@ -1147,6 +1246,7 @@ function Invoke-BRAVOBazaSynchronization {
                 Reason = $blockReasonText
                 LocalSize = [int64]$candidate.Size
                 RemoteSize = $uploadOutcome.RemoteSize
+                LocalMissing = $false
                 Error = $uploadOutcome.Error
             })
             # Персистуємо блокер (Verified=false + мінімальний audit-доказ).
@@ -1237,11 +1337,15 @@ function Invoke-BRAVOBazaSynchronization {
         $result.Status = 'AUDIT_DRIFT'
         $auditDriftPreview = @(
             $auditDriftFiles | Select-Object -First 3 | ForEach-Object {
-                "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)"
+                if ($_.LocalMissing) {
+                    "$($_.RelativePath) [$($_.Action)] (ЛОКАЛЬНЕ ДЖЕРЕЛО ВІДСУТНЄ, блокер не розв'язано)"
+                } else {
+                    "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)"
+                }
             }
         ) -join '; '
         $result.Error = (
-            "$($auditDriftFiles.Count) кандидат(ів) позначені поточним Full Audit як pending, але їхні remote-шляхи вже зайняті: " +
+            "$($auditDriftFiles.Count) шлях(ів) з нерозв'язаним Full Audit drift-вердиктом: " +
             "$auditDriftPreview — перезапис заборонено, generic same-size recovery не застосовується, цикл не вважається успішним"
         )
     } elseif ($remoteConflicts.Count -gt 0) {
@@ -1556,6 +1660,16 @@ function Get-BRAVOBazaFastHealthResult {
             Info = @()
         }
     }
+    if ($SyncResult.Status -eq 'RECONCILIATION_REQUIRED') {
+        # P1-2 (round 6): незавершений trust-перехід Full Audit — старим
+        # Verified-записам довіряти не можна, доки Archive не заверше
+        # реконсиляцію успішним збереженням стану. Fail closed, не warning.
+        return [pscustomobject]@{
+            Level = 'CRITICAL'; Healthy = $false
+            Message = "$($SyncResult.Component) — потрібна повторна Full Audit реконсиляція (незавершений trust-перехід попереднього аудиту). $($SyncResult.Error)"
+            Info = @()
+        }
+    }
     if ($SyncResult.Status -eq 'ERROR') {
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
@@ -1627,8 +1741,11 @@ function Get-BRAVOBazaFastHealthResult {
         "несумісні з SFTP імена: $(@($SyncResult.IncompatibleFiles).Count) файл(ів) — $names"
     } else { $null }
     $auditDriftSummary = if (@($SyncResult.AuditDriftFiles).Count -gt 0) {
-        $names = ($SyncResult.AuditDriftFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; '
-        "audit-pending кандидати із зайнятим remote-шляхом: $(@($SyncResult.AuditDriftFiles).Count) файл(ів) — $names"
+        $names = ($SyncResult.AuditDriftFiles | Select-Object -First 5 | ForEach-Object {
+            if ($_.LocalMissing) { "$($_.RelativePath) [$($_.Action)] (локальне джерело відсутнє)" }
+            else { "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }
+        }) -join '; '
+        "нерозв'язані audit-drift шляхи: $(@($SyncResult.AuditDriftFiles).Count) файл(ів) — $names"
     } else { $null }
 
     if ($SyncResult.Status -eq 'MUTATION_VIOLATION') {
@@ -1647,8 +1764,11 @@ function Get-BRAVOBazaFastHealthResult {
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
             Message = (
-                "$($SyncResult.Component) — $(@($SyncResult.AuditDriftFiles).Count) кандидат(ів) позначені поточним Full Audit як pending, але їхні remote-шляхи вже зайняті: " +
-                (($SyncResult.AuditDriftFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; ') +
+                "$($SyncResult.Component) — $(@($SyncResult.AuditDriftFiles).Count) шлях(ів) з нерозв'язаним Full Audit drift-вердиктом: " +
+                (($SyncResult.AuditDriftFiles | Select-Object -First 5 | ForEach-Object {
+                    if ($_.LocalMissing) { "$($_.RelativePath) [$($_.Action)] (локальне джерело відсутнє, блокер не розв'язано)" }
+                    else { "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }
+                }) -join '; ') +
                 " — перезапис заборонено, потрібне ручне рішення оператора"
             )
             Info = @(@($mutationSummary, $conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })

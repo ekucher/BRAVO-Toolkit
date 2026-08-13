@@ -722,8 +722,9 @@ RESULT` — Health оцінює результат КОНКРЕТНОГО зав
   `Status=COMPLETE`; `INCOMPLETE` (напр. збій запису стану після
   успішних передач), `ERROR`, `STATE_INVALID`, `STATE_NOT_INITIALIZED`,
   `MUTATION_VIOLATION`, `INCOMPATIBLE_NAME`, `REMOTE_CONFLICT`,
-  `AUDIT_DRIFT` і будь-який невідомий/майбутній статус — завжди
-  unhealthy (fail visible, не fail open). Якщо в одному циклі
+  `AUDIT_DRIFT`, `RECONCILIATION_REQUIRED` і будь-який
+  невідомий/майбутній статус — завжди unhealthy (fail visible, не fail
+  open). Якщо в одному циклі
   співіснують кілька категорій проблем (мутації, audit-drift,
   remote-конфлікти, несумісні імена) — одна визначає Status/Message, а
   решта видимі в Info того самого прогону.
@@ -879,11 +880,32 @@ BAZA-файл). Перевірка стосується **лише** канди�
   `Verified=true`, блокер зникає; або (B) remote-файл прибрано —
   звичайна цільова передача з верифікацією, `Verified=true`. Збіг
   розміру блокер не знімає ніколи — саме цей доказ audit уже визнав
-  недостатнім. Звичайні unverified/pending записи (без блокера)
-  зберігають повну round-3 crash-recovery семантику.
+  недостатнім. **Зникнення локального джерела — теж не розв'язка**:
+  заблокований шлях, що зник з локального каталогу, все одно виринає
+  щоциклу як `AUDIT_DRIFT` з позначкою «локальне джерело відсутнє»
+  (цикл не COMPLETE, Health CRITICAL), а пізніший Full Audit не знімає
+  такий блокер мовчки — розбіжність мусить вирішити оператор. Звичайні
+  unverified/pending записи (без блокера) зберігають повну round-3
+  crash-recovery семантику.
   `LastFullAuditUtc` при `AUDIT_DRIFT` просувається (audit **успішно**
   завершився і виявив дрейф) — це свіжість аудиту, НЕ успішність
   синхронізації (`LastSuccessfulSyncUtc` не просувається).
+
+**Write-ahead маркер Full Audit (`RECONCILIATION_REQUIRED`).** Перед
+кожним Full Audit (bootstrap чи періодичним) у файл стану атомарно
+записується маркер `AuditReconciliationPending=true`; якщо цей запис не
+вдався — audit **не запускається** (контрольований ERROR). Маркер
+знімається лише разом з успішним **фінальним** збереженням стану після
+інтеграції результатів. Тому crash або збій запису МІЖ аудитом і
+фінальним збереженням не може «забути» вердикт: на диску лишається
+маркер, і наступний standalone Health відмовляється fail-closed
+(`Status=RECONCILIATION_REQUIRED`, CRITICAL, нуль передач, нуль
+TrustedSkip старих Verified-записів), а наступний прогін `BRAVO_ARCHIV`
+примусово повторює Full Audit-реконсиляцію. Звичайних (без аудиту)
+циклів маркер не стосується — їхній збій збереження безпечний
+(INCOMPLETE: зайва повторна робота, не втрачена довіра). Це вузький
+маркер trust-переходу в state одного компонента, **не** Durable
+Operation Journal.
 
 **Один writer на remote root.** Пара `FileExists → PutFiles` — не
 розподілена атомарна операція, а lock BAZA-синхронізації — machine-wide

@@ -15742,22 +15742,28 @@ function Write-BRAVOLog {
         ) -Name 'BazaSync/RemoteConflictHealthIsCriticalWithExactPathAndSizes' -Failure "Health для REMOTE_CONFLICT має бути CRITICAL з точним шляхом і обома розмірами; Healthy=$($hr3ConfHealth.Healthy) Level=$($hr3ConfHealth.Level) Message=$($hr3ConfHealth.Message)"
 
         # НАЙВАЖЛИВІШЕ: crash-вікно "PutFiles встиг, Save-State ні" НЕ
-        # призводить до повторної передачі (і тим паче до перезапису)
+        # призводить до повторної передачі (і тим паче до перезапису).
+        # Round 6: crash-цикл — ЗВИЧАЙНИЙ (без Full Audit), бо bootstrap-
+        # цикл із непрацюючим збереженням тепер коректно відмовляє ще на
+        # write-ahead маркері (P1-2) і до передач не доходить. Збій
+        # фінального збереження моделюється ReadOnly-атрибутом на файлі
+        # стану ([IO.File]::Replace вимагає write-доступу до цілі).
         $hr3CrashRoot = Join-Path $bazaSyncTestRoot "HR3_Crash"
         $hr3CrashLocal = Join-Path $hr3CrashRoot "local"
         $hr3CrashState = Join-Path $hr3CrashRoot "state"
         New-Item -ItemType Directory -Path $hr3CrashLocal -Force | Out-Null
-        New-BRAVOSelfTestBazaFile -Directory $hr3CrashLocal -RelativePath "d.txt" -SizeBytes 40 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr3CrashLocal -RelativePath "seed.txt" -SizeBytes 15 | Out-Null
+        [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr3CrashLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr3CrashState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider)
         $hr3CrashStatePath = Get-BRAVOBazaStatePath -StateRoot $hr3CrashState -Component 'BAZA_APP'
-        # КАТАЛОГ на місці файлу стану -> Save-BRAVOBazaState гарантовано
-        # провалиться ПІСЛЯ успішної передачі (модель crash-вікна зі спеки)
-        New-Item -ItemType Directory -Path $hr3CrashStatePath -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr3CrashLocal -RelativePath "d.txt" -SizeBytes 40 | Out-Null
+        [IO.File]::SetAttributes($hr3CrashStatePath, [IO.FileAttributes]::ReadOnly)
         $hr3CrashSession = New-BRAVOSelfTestFakeBazaSession
-        $hr3CrashCycleN = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr3CrashLocal -RemoteRootPath '/baza_app' -Session $hr3CrashSession -StateRoot $hr3CrashState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $hr3CrashCycleN = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr3CrashLocal -RemoteRootPath '/baza_app' -Session $hr3CrashSession -StateRoot $hr3CrashState
         $hr3CrashPutFilesAfterCycleN = $hr3CrashSession.State.PutFilesCallCount
-        Remove-Item -LiteralPath $hr3CrashStatePath -Force
-        # ТА САМА сесія = той самий "remote": файл уже там після циклу N
-        $hr3CrashCycleN1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr3CrashLocal -RemoteRootPath '/baza_app' -Session $hr3CrashSession -StateRoot $hr3CrashState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        [IO.File]::SetAttributes($hr3CrashStatePath, [IO.FileAttributes]::Normal)
+        # ТА САМА сесія = той самий "remote": d.txt уже там після циклу N,
+        # а стан на диску його не пам'ятає (старий, до збою)
+        $hr3CrashCycleN1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr3CrashLocal -RemoteRootPath '/baza_app' -Session $hr3CrashSession -StateRoot $hr3CrashState
         $hr3CrashStateRead = Read-BRAVOBazaState -Path $hr3CrashStatePath
         Test-BRAVOCondition -Condition (
             $hr3CrashCycleN.Status -eq 'INCOMPLETE' -and $hr3CrashCycleN.Error -match 'зберегти стан' -and
@@ -15766,7 +15772,7 @@ function Write-BRAVOLog {
             $hr3CrashSession.State.PutFilesCallCount -eq 1 -and
             $hr3CrashStateRead.State.Files.ContainsKey('d.txt') -and
             [bool]$hr3CrashStateRead.State.Files['d.txt'].Verified -eq $true
-        ) -Name 'BazaSync/CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload' -Failure "цикл N: upload OK + збій save (INCOMPLETE); цикл N+1: той самий remote-файл, розмір збігся -> 0 нових PutFiles, Verified=true, COMPLETE; CycleN=$($hr3CrashCycleN.Status) CycleN1=$($hr3CrashCycleN1.Status) PutFilesTotal=$($hr3CrashSession.State.PutFilesCallCount) Recovered=$($hr3CrashCycleN1.RecoveredRemote)"
+        ) -Name 'BazaSync/CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload' -Failure "цикл N (звичайний, без audit): upload OK + збій save (INCOMPLETE); цикл N+1: той самий remote-файл, розмір збігся, блокера немає -> 0 нових PutFiles, Verified=true, COMPLETE; CycleN=$($hr3CrashCycleN.Status) CycleN1=$($hr3CrashCycleN1.Status) PutFilesTotal=$($hr3CrashSession.State.PutFilesCallCount) Recovered=$($hr3CrashCycleN1.RecoveredRemote)"
 
         # remote-перевірка існування -- ЛИШЕ для кандидатів, не для Verified
         $hr3ScopeRoot = Join-Path $bazaSyncTestRoot "HR3_Scope"
@@ -16231,6 +16237,178 @@ function Write-BRAVOLog {
         $hr5EmpWithXY = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr5EmpCycle2 -LocalDirectory $hr5EmpLocal -StateRoot $hr5EmpState
         Test-BRAVOCondition -Condition ($hr5EmpWithXY.NewAfterCutoff -eq 2) `
             -Name 'BazaSync/EmptySnapshotDoesNotFallbackToOldPersistedState' -Failure "порожній знімок НЕ падає у fallback на старий persisted state: x.txt, що повернувся після cutoff, теж рахується (2, не 1); отримано $($hr5EmpWithXY.NewAfterCutoff)"
+
+        # =======================================================================
+        # HARDENING ROUND 6, P1-1: sticky AuditDrift-блокер НЕ зникає разом
+        # із локальним шляхом (зникнення джерела -- не позитивна розв'язка)
+        # =======================================================================
+        $hr6MisRoot = Join-Path $bazaSyncTestRoot "HR6_Missing"
+        $hr6MisLocal = Join-Path $hr6MisRoot "local"
+        $hr6MisState = Join-Path $hr6MisRoot "state"
+        New-Item -ItemType Directory -Path $hr6MisLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr6MisLocal -RelativePath "ok0.txt" -SizeBytes 20 | Out-Null
+        [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr6MisState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider)
+        $hr6MisStatePath = Get-BRAVOBazaStatePath -StateRoot $hr6MisState -Component 'BAZA_APP'
+        $hr6MisProvenance = [string](Read-BRAVOBazaState -Path $hr6MisStatePath).State.LastSuccessfulSyncUtc
+
+        $hr6MisGone = New-BRAVOSelfTestBazaFile -Directory $hr6MisLocal -RelativePath "gone.txt" -SizeBytes 90
+        $hr6MisProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr6MisLocal "gone.txt"); Action = 'UploadUpdate'; Reason = 'drift' }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr6MisLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr6MisSession = New-BRAVOSelfTestFakeBazaSession
+        $hr6MisSession.State.RemoteSizes['/baza_app/gone.txt'] = [int64]90
+        $hr6MisCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session $hr6MisSession -StateRoot $hr6MisState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MisProvider
+
+        Remove-Item -LiteralPath $hr6MisGone -Force
+        $hr6MisCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session $hr6MisSession -StateRoot $hr6MisState
+        Test-BRAVOCondition -Condition (
+            $hr6MisCycle1.Status -eq 'AUDIT_DRIFT' -and
+            $hr6MisCycle2.Status -eq 'AUDIT_DRIFT' -and $hr6MisCycle2.Status -ne 'COMPLETE' -and
+            (@($hr6MisCycle2.AuditDriftFiles).Count -eq 1) -and
+            $hr6MisCycle2.AuditDriftFiles[0].RelativePath -eq 'gone.txt' -and
+            [bool]$hr6MisCycle2.AuditDriftFiles[0].LocalMissing -eq $true
+        ) -Name 'BazaSync/PersistedAuditDriftMissingLocalNeverProducesComplete' -Failure "блокер зі зниклим локальним шляхом мусить виринати як AUDIT_DRIFT/LocalMissing, ніколи COMPLETE; C1=$($hr6MisCycle1.Status) C2=$($hr6MisCycle2.Status) Drift=$(@($hr6MisCycle2.AuditDriftFiles).Count)"
+
+        $hr6MisHealth = Get-BRAVOBazaFastHealthResult -SyncResult $hr6MisCycle2
+        Test-BRAVOCondition -Condition (
+            $hr6MisHealth.Healthy -eq $false -and $hr6MisHealth.Level -eq 'CRITICAL' -and
+            $hr6MisHealth.Message -match 'gone\.txt'
+        ) -Name 'BazaSync/PersistedAuditDriftMissingLocalRemainsUnhealthy' -Failure "Health для missing-local блокера: CRITICAL з точним шляхом; Healthy=$($hr6MisHealth.Healthy) Message=$($hr6MisHealth.Message)"
+
+        $hr6MisStateAfter2 = Read-BRAVOBazaState -Path $hr6MisStatePath
+        Test-BRAVOCondition -Condition (
+            -not [string]::IsNullOrWhiteSpace($hr6MisProvenance) -and
+            [string]$hr6MisStateAfter2.State.LastSuccessfulSyncUtc -ceq $hr6MisProvenance
+        ) -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotAdvanceProvenance' -Failure "missing-local блокер не просуває LastSuccessfulSyncUtc; було=$hr6MisProvenance стало=$($hr6MisStateAfter2.State.LastSuccessfulSyncUtc)"
+
+        $hr6MisCpSession = New-BRAVOSelfTestFakeBazaSession
+        $hr6MisCpOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr6MisCpSession -RemoteRootPath '/baza_app' -SyncResult $hr6MisCycle2
+        Test-BRAVOCondition -Condition ($hr6MisCpOutcome.Attempted -eq $false -and $hr6MisCpSession.State.PutFilesCallCount -eq 0) `
+            -Name 'BazaSync/PersistedAuditDriftMissingLocalDoesNotPublishCheckpoint' -Failure "missing-local блокер не публікує checkpoint; Attempted=$($hr6MisCpOutcome.Attempted)"
+
+        $hr6MisMatchProvider = {
+            param($Snapshot)
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr6MisLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr6MisCycle3 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session $hr6MisSession -StateRoot $hr6MisState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MisMatchProvider
+        $hr6MisStateAfter3 = Read-BRAVOBazaState -Path $hr6MisStatePath
+        Test-BRAVOCondition -Condition (
+            $hr6MisCycle3.Status -eq 'AUDIT_DRIFT' -and
+            [string]$hr6MisStateAfter3.State.Files['gone.txt'].BlockReason -eq 'AuditDrift'
+        ) -Name 'BazaSync/PersistedAuditDriftMissingLocalSurvivesFullAudit' -Failure "пізніший Full Audit (шлях відсутній у знімку) НЕ сміє мовчки зняти блокер; C3=$($hr6MisCycle3.Status) BlockReason=$($hr6MisStateAfter3.State.Files['gone.txt'].BlockReason)"
+
+        New-BRAVOSelfTestBazaFile -Directory $hr6MisLocal -RelativePath "gone.txt" -SizeBytes 90 | Out-Null
+        $hr6MisCycle4 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MisLocal -RemoteRootPath '/baza_app' -Session $hr6MisSession -StateRoot $hr6MisState
+        Test-BRAVOCondition -Condition (
+            $hr6MisCycle4.Status -eq 'AUDIT_DRIFT' -and
+            $hr6MisSession.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/RestoredLocalPathStillCarriesAuditBlockUntilResolved' -Failure "відновлений локальний шлях досі під блокером (remote зайнятий) -- AUDIT_DRIFT без передач; C4=$($hr6MisCycle4.Status) PutFiles=$($hr6MisSession.State.PutFilesCallCount)"
+
+        # =======================================================================
+        # HARDENING ROUND 6, P1-2: write-ahead маркер trust-переходу Full Audit
+        # =======================================================================
+        $hr6MkRoot = Join-Path $bazaSyncTestRoot "HR6_Marker"
+        $hr6MkLocal = Join-Path $hr6MkRoot "local"
+        $hr6MkState = Join-Path $hr6MkRoot "state"
+        New-Item -ItemType Directory -Path $hr6MkLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr6MkLocal -RelativePath "m1.txt" -SizeBytes 25 | Out-Null
+        [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr6MkState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider)
+        $hr6MkStatePath = Get-BRAVOBazaStatePath -StateRoot $hr6MkState -Component 'BAZA_APP'
+
+        # маркер неможливо зберегти -> audit НЕ запускається взагалі
+        $hr6MkProbe = @{ Invoked = 0 }
+        $hr6MkProbeProvider = {
+            param($Snapshot)
+            $hr6MkProbe.Invoked++
+            return [pscustomobject]@{ Success = $true; Error = $null; AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{}; PendingItems = @() }
+        }.GetNewClosure()
+        [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::ReadOnly)
+        $hr6MkCycleA = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr6MkState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MkProbeProvider
+        [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::Normal)
+        $hr6MkStateAfterA = Read-BRAVOBazaState -Path $hr6MkStatePath
+        Test-BRAVOCondition -Condition (
+            $hr6MkCycleA.Status -eq 'ERROR' -and $hr6MkCycleA.Error -match 'маркер' -and
+            $hr6MkProbe.Invoked -eq 0 -and
+            [bool]$hr6MkStateAfterA.State.AuditReconciliationPending -eq $false
+        ) -Name 'BazaSync/FullAuditDoesNotRunIfPendingMarkerCannotBeSaved' -Failure "без збереженого write-ahead маркера Full Audit НЕ запускається (контрольований ERROR, провайдер не викликано); Status=$($hr6MkCycleA.Status) Invoked=$($hr6MkProbe.Invoked)"
+
+        # маркер на диску = true САМЕ на момент виконання audit
+        $hr6MkCapture = @{ PendingAtAudit = $null }
+        $hr6MkCaptureProvider = {
+            param($Snapshot)
+            $diskState = Read-BRAVOBazaState -Path $hr6MkStatePath
+            $hr6MkCapture.PendingAtAudit = [bool]$diskState.State.AuditReconciliationPending
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr6MkLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr6MkCycleB = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr6MkState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MkCaptureProvider
+        $hr6MkStateAfterB = Read-BRAVOBazaState -Path $hr6MkStatePath
+        Test-BRAVOCondition -Condition (
+            $hr6MkCycleB.Status -eq 'COMPLETE' -and
+            $hr6MkCapture.PendingAtAudit -eq $true -and
+            [bool]$hr6MkStateAfterB.State.AuditReconciliationPending -eq $false
+        ) -Name 'BazaSync/FullAuditWritesPendingMarkerBeforeAudit' -Failure "на момент виконання audit маркер на ДИСКУ мусить бути true, після успішного циклу -- false; PendingAtAudit=$($hr6MkCapture.PendingAtAudit) After=$($hr6MkStateAfterB.State.AuditReconciliationPending)"
+
+        # збій ФІНАЛЬНОГО збереження після audit-drift -> маркер лишається true
+        New-BRAVOSelfTestBazaFile -Directory $hr6MkLocal -RelativePath "m2.txt" -SizeBytes 35 | Out-Null
+        $hr6MkSession = New-BRAVOSelfTestFakeBazaSession
+        $hr6MkSession.State.RemoteSizes['/baza_app/m2.txt'] = [int64]35
+        $hr6MkDriftProvider = {
+            param($Snapshot)
+            # ReadOnly ставиться ПІД ЧАС audit (маркер уже збережено) --
+            # модель: audit пройшов, фінальне збереження впаде
+            [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::ReadOnly)
+            $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr6MkLocal "m2.txt"); Action = 'UploadUpdate'; Reason = 'drift' }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr6MkLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr6MkCycleC = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session $hr6MkSession -StateRoot $hr6MkState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr6MkDriftProvider
+        $hr6MkStateAfterC = Read-BRAVOBazaState -Path $hr6MkStatePath
+        Test-BRAVOCondition -Condition (
+            $hr6MkCycleC.Status -eq 'AUDIT_DRIFT' -and
+            [bool]$hr6MkStateAfterC.State.AuditReconciliationPending -eq $true -and
+            [bool]$hr6MkStateAfterC.State.Files['m1.txt'].Verified -eq $true
+        ) -Name 'BazaSync/AuditDriftFinalStateSaveFailureLeavesPendingMarker' -Failure "збій фінального збереження після audit лишає на диску маркер true (стара довіра на диску захищена маркером); Status=$($hr6MkCycleC.Status) Pending=$($hr6MkStateAfterC.State.AuditReconciliationPending)"
+
+        [IO.File]::SetAttributes($hr6MkStatePath, [IO.FileAttributes]::Normal)
+
+        # standalone на pending-стані: fail closed, нуль upload/TrustedSkip
+        $hr6MkStandaloneSession = New-BRAVOSelfTestFakeBazaSession
+        $hr6MkCycleD = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session $hr6MkStandaloneSession -StateRoot $hr6MkState
+        $hr6MkCycleDHealth = Get-BRAVOBazaFastHealthResult -SyncResult $hr6MkCycleD
+        Test-BRAVOCondition -Condition (
+            $hr6MkCycleD.Status -eq 'RECONCILIATION_REQUIRED' -and
+            $hr6MkStandaloneSession.State.PutFilesCallCount -eq 0 -and
+            $hr6MkCycleD.Uploaded -eq 0 -and
+            $hr6MkCycleDHealth.Healthy -eq $false -and $hr6MkCycleDHealth.Level -eq 'CRITICAL'
+        ) -Name 'BazaSync/PendingAuditMarkerStandaloneHealthFailsClosed' -Failure "standalone на pending-маркері: RECONCILIATION_REQUIRED, нуль передач, CRITICAL; Status=$($hr6MkCycleD.Status) PutFiles=$($hr6MkStandaloneSession.State.PutFilesCallCount) Healthy=$($hr6MkCycleDHealth.Healthy)"
+
+        Test-BRAVOCondition -Condition ($hr6MkCycleD.AlreadyVerified -eq 0) `
+            -Name 'BazaSync/PendingAuditMarkerNeverTrustedSkipsOldVerifiedEntries' -Failure "pending-маркер: жодного TrustedSkip старих Verified-записів (відмова ДО планувальника); AlreadyVerified=$($hr6MkCycleD.AlreadyVerified)"
+
+        Test-BRAVOCondition -Condition ($hr6MkCycleDHealth.Healthy -eq $false) `
+            -Name 'BazaSync/CrashBetweenAuditAndFinalStateSaveCannotBecomeHealthy' -Failure "crash між audit і фінальним збереженням НІКОЛИ не дає Healthy на наступному циклі; Healthy=$($hr6MkCycleDHealth.Healthy)"
+
+        # Archive на pending-стані: реконсиляція примусова (без -ForceFullAudit),
+        # маркер знімається лише після успішного фінального збереження
+        $hr6MkMatchProbe = @{ Invoked = 0 }
+        $hr6MkMatchProvider = {
+            param($Snapshot)
+            $hr6MkMatchProbe.Invoked++
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr6MkLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr6MkCycleE = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr6MkLocal -RemoteRootPath '/baza_app' -Session $hr6MkSession -StateRoot $hr6MkState -BootstrapIfNeeded -FullAuditProvider $hr6MkMatchProvider
+        $hr6MkStateAfterE = Read-BRAVOBazaState -Path $hr6MkStatePath
+        Test-BRAVOCondition -Condition (
+            $hr6MkCycleE.Status -eq 'COMPLETE' -and
+            $hr6MkMatchProbe.Invoked -eq 1 -and
+            $hr6MkCycleE.FullAuditAttempted -eq $true
+        ) -Name 'BazaSync/PendingAuditMarkerArchiveReconcilesWithFullAudit' -Failure "Archive на pending-маркері примусово повторює Full Audit (навіть без -ForceFullAudit) і завершує реконсиляцію; Status=$($hr6MkCycleE.Status) Invoked=$($hr6MkMatchProbe.Invoked)"
+
+        Test-BRAVOCondition -Condition (
+            [bool]$hr6MkStateAfterC.State.AuditReconciliationPending -eq $true -and
+            [bool]$hr6MkStateAfterE.State.AuditReconciliationPending -eq $false
+        ) -Name 'BazaSync/PendingAuditMarkerClearsOnlyAfterSuccessfulFinalSave' -Failure "маркер знімається ЛИШЕ успішним фінальним збереженням: після збою -- true, після успішної реконсиляції -- false; AfterC=$($hr6MkStateAfterC.State.AuditReconciliationPending) AfterE=$($hr6MkStateAfterE.State.AuditReconciliationPending)"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -165,7 +165,7 @@ function Test-BRAVORuntimeManifestIntegrity {
             $relative = $scriptPath.Substring($rootPrefixLength)
             # Каталоги, які не є частиною комплекту: логи й локальні
             # робочі копії розробника.
-            if ($relative -match '^(LOGS|\.git|\.vscode|local-backups)[\\/]') {
+            if ($relative -match '^(LOGS|\.git|\.vscode|\.claude|local-backups)[\\/]') {
                 continue
             }
             if (-not $expected.ContainsKey($relative)) {

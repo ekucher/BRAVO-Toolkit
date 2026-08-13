@@ -544,6 +544,42 @@ Invariants below).
   snapshot is authoritative, so a file (re)appearing after it counts as
   new even if an older persisted state still remembers it. 12 new
   behavioral self-tests.
+- `BRAVO.BazaSync` hardening round 6 (production-acceptance review of
+  the sticky-blocker failure paths). (P1) A persisted AuditDrift blocker
+  no longer disappears with its local path: the planner iterates only
+  the snapshot, so a blocked entry whose local file vanished was never
+  inspected — the cycle could go `COMPLETE`/healthy and publish a
+  checkpoint while the authoritative audit verdict stayed unresolved
+  (local disappearance is not a positive resolution). Every cycle now
+  additionally scans the already-loaded state (purely local, no remote
+  calls) for AuditDrift blockers absent from the current snapshot and
+  surfaces them as `AUDIT_DRIFT` entries with `LocalMissing=$true` and
+  the exact relative path: the cycle stays non-COMPLETE, provenance
+  does not advance, no checkpoint publishes, Health stays `CRITICAL`,
+  the blocker is retained, and a later Full Audit does not silently
+  clear it merely because the source is gone (a restored local path
+  remains blocked until genuinely resolved). (P1) A Full Audit trust
+  transition now survives a failed final state save via a narrow
+  write-ahead marker (`AuditReconciliationPending` in the component
+  state — deliberately not a project-wide Durable Journal). Before a
+  trust-changing audit the marker is atomically persisted; if that
+  persistence fails the audit does not run at all (controlled error).
+  The marker is cleared in memory only after integrating audit results
+  and reaches disk only with the successful final save — so a crash or
+  save failure between the audit and the final save leaves the marker
+  on disk, and the previously dangerous window (atomic save preserved
+  the old `Verified=true` trust the audit had just revoked in memory,
+  letting the next cycle TrustedSkip it back to healthy) is now fail
+  closed: standalone Health returns `RECONCILIATION_REQUIRED`
+  (CRITICAL, zero uploads, zero TrustedSkip of old Verified entries)
+  and the next `BRAVO_ARCHIV` run force-reruns the Full Audit
+  reconciliation, clearing the marker only after its own successful
+  final save. Ordinary non-audit cycles never write the marker, so
+  plain upload state-save failures keep their cheap `INCOMPLETE`
+  semantics, and the round-3 crash-recovery acceptance
+  (`CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload`) is
+  re-modeled as the ordinary-cycle scenario it always described and
+  still passes. 14 new behavioral self-tests.
 
 ## 5.0.0 — 2026-08-11
 
