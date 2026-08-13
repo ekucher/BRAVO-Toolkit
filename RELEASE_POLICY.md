@@ -972,10 +972,14 @@ developer: 4.5.1-dev.1
 
 ```text
 master:    5.0.0   (stable)
-developer: 5.1.0-dev.1 (development)
+developer: 5.1.0-rc.1 (prerelease)
 ```
 
 `5.1.0` — minor-цикл: цикл вже містить нову функціональність (Retention
 Safety Invariants — orphan-temp cleanup, retention audit, daily
-Recovery-тригер для автоматичної реставрації в межах вікна), а не лише
-виправлення, тому відкрито `5.1.0-dev.1`, а не `5.0.1-dev.1`.
+Recovery-тригер для автоматичної реставрації в межах вікна; BAZA_APP/
+BAZA_WWW incremental append-only sync engine), а не лише виправлення,
+тому відкрито `5.1.0-dev.1`, а не `5.0.1-dev.1`. Функціональна розробка
+циклу завершена й перевірена (real-SFTP acceptance, DEV-LIMS
+2026-08-13); `developer` промотовано до `5.1.0-rc.1` для перевірки на
+реальному сервері перед promotion у `master` (розділ 8).

@@ -1,5 +1,19 @@
 # Changelog
 
+## 5.1.0-rc.1 — 2026-08-14
+
+Release-metadata-only promotion of the `5.1.0-dev.1` cycle (below) to
+Release Candidate: `packageVersion`/`releaseChannel` bump per
+`RELEASE_POLICY.md` section 8, no functional runtime changes relative to
+the `5.1.0-dev.1` commit this promotes (`9256e56`). Functional
+development for this cycle is complete; real-SFTP BAZA acceptance
+(DEV-LIMS, 2026-08-13) passed across all 10 scenarios (iterative
+acceptance+fix — see `docs/BAZA_SFTP_ACCEPTANCE.md` section 13), and the
+two outstanding documentation findings from release-readiness review
+(stale acceptance stamp in the runbook precondition, real institution
+name in console UX examples) are closed. `5.1.0-rc.1` is ready for
+verification on a real server per `RELEASE_POLICY.md` section 9.
+
 ## 5.1.0-dev.1 — 2026-08-12
 
 Opens the next development cycle on top of the 5.0.0 stable baseline
