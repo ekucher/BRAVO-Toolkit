@@ -277,22 +277,22 @@ function Get-BRAVOBazaSyncPlan {
     #                         locally незмінні відносно запису в state.
     #                         Жодного remote-виклику не потрібно (ТЗ п.5).
     #   ToUpload            — немає в state, або в state Verified=false
-    #                         (попередній pending/failed), або present, але
-    #                         Verified=true з ІНШИМ size (mutation — див.
-    #                         нижче: mutation іде окремим списком, а не сюди,
-    #                         якщо MutationPolicy=Fail).
-    #   MutationViolation   — state.Verified=true, розмір локально ЗМІНИВСЯ.
-    #                         Append-only порушено. MutationPolicy=Fail (типово)
-    #                         -> файл НЕ включається до ToUpload (без мовчазного
-    #                         перезапису remote), лише репортується.
+    #                         (попередній pending/failed).
+    #   MutationViolation   — state.Verified=true, а size АБО LastWriteTimeUtc
+    #                         локально ЗМІНИВСЯ (P2, hardening round 2: раніше
+    #                         порівнювався лише size, всупереч цьому ж
+    #                         контракту — append-only файл, переписаний тим
+    #                         самим розміром, але з новим mtime, мовчки
+    #                         отримував trusted skip). MutationPolicy=Fail
+    #                         (типово) -> файл НЕ включається до ToUpload (без
+    #                         мовчазного перезапису remote), лише репортується.
     #
-    # LastWriteTimeUtc порівнюється лише як ДОДАТКОВИЙ сигнал зміни (ТЗ п.7:
-    # timestamp — optimization hint, не єдине джерело істини) — САМЕ size
-    # є вирішальним для mutation-детекції, бо старий/перенесений timestamp
-    # з незмінним розміром НЕ вважається mutation (не можна відрізнити його
-    # від легітимного відновлення файла з тим самим вмістом), а НОВИЙ файл
-    # (відсутній у state) підхоплюється ЗАВЖДИ, незалежно від того, який у
-    # нього LastWriteTime — старий timestamp не може приховати нового файла.
+    # Це НЕ timestamp-only discovery (ТЗ п.7 лишається в силі): рішення
+    # "новий чи ні" ухвалюється ВИКЛЮЧНО за присутністю шляху в state —
+    # новий файл (відсутній у state) підхоплюється ЗАВЖДИ, хоч би який
+    # старий LastWriteTime він мав. Timestamp бере участь лише в
+    # mutation-детекції ВЖЕ Verified шляху, як другий сигнал зміни поряд
+    # із розміром.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$Snapshot,
@@ -323,12 +323,38 @@ function Get-BRAVOBazaSyncPlan {
             continue
         }
 
-        if ($stateSize -ne $localEntry.Size) {
+        $sizeChanged = ($stateSize -ne $localEntry.Size)
+        $mtimeChanged = $false
+        $stateMtimeRaw = [string]$stateEntry.LastWriteTimeUtc
+        $localMtimeRaw = [string]$localEntry.LastWriteTimeUtc
+        if ($stateMtimeRaw -cne $localMtimeRaw) {
+            # Швидкий шлях вище: обидва значення пишуться одним і тим самим
+            # ToString('o'), тож для незмінного файлу рядки збігаються без
+            # парсингу (важливо на 100k+ Verified записів). Парсимо лише
+            # при розбіжності рядків, щоб відрізнити реальну зміну mtime
+            # від суто форматної відмінності історичного запису.
+            $stateMtimeParsed = [datetime]::MinValue
+            $localMtimeParsed = [datetime]::MinValue
+            $bothParsed = (
+                [datetime]::TryParse($stateMtimeRaw, [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref]$stateMtimeParsed) -and
+                [datetime]::TryParse($localMtimeRaw, [Globalization.CultureInfo]::InvariantCulture,
+                    [Globalization.DateTimeStyles]::RoundtripKind, [ref]$localMtimeParsed)
+            )
+            # Непарсований запис = не можемо ДОВЕСТИ незмінність -> fail
+            # visible (mutation), не мовчазний trusted skip.
+            $mtimeChanged = -not (
+                $bothParsed -and
+                $stateMtimeParsed.ToUniversalTime().Ticks -eq $localMtimeParsed.ToUniversalTime().Ticks
+            )
+        }
+
+        if ($sizeChanged -or $mtimeChanged) {
             $mutation = [pscustomobject]@{
                 RelativePath = $relativePath
                 PreviousSize = $stateSize
                 CurrentSize = $localEntry.Size
-                PreviousLastWriteTimeUtc = [string]$stateEntry.LastWriteTimeUtc
+                PreviousLastWriteTimeUtc = $stateMtimeRaw
                 CurrentLastWriteTimeUtc = $localEntry.LastWriteTimeUtc
             }
             $mutations.Add($mutation)
@@ -341,9 +367,7 @@ function Get-BRAVOBazaSyncPlan {
             continue
         }
 
-        # Розмір збігається і Verified=true -> trusted skip незалежно від
-        # LastWriteTimeUtc (ТЗ п.7 explicitly forbids timestamp-only logic,
-        # тут ми йдемо СТРОГІШИМ шляхом: size — авторитетний сигнал).
+        # Verified=true, size і LastWriteTimeUtc незмінні -> trusted skip.
         $trustedSkip.Add($localEntry)
     }
 
@@ -368,10 +392,19 @@ function Test-BRAVOBazaRemoteNameCompatibility {
     # НЕ для всього локального дерева на кожному циклі — інакше сотні тисяч
     # уже Verified файлів отримували б зайву перевірку щоцикл, та сама
     # O(усі файли) вартість, якої incremental engine навмисно уникає.
+    #
+    # Ліміт ФАЙЛА = 246, а не 255 (P1, hardening round 2): цільовий upload
+    # явно вмикає ResumeSupport (див. Invoke-BRAVOBazaFileUpload), а WinSCP
+    # при resume додає ".filepart" — 9 UTF-8 байт — до тимчасового імені.
+    # Це ТА САМА пара значень, що її роками використовує legacy-шлях
+    # (BRAVO.Archive.Runtime.ps1: 246 при -resumesupport=on, інакше 255):
+    # ім'я на 247..255 байт пройшло б валідацію і впало б уже ПІД ЧАС
+    # передачі, коли сервер відхилить "<ім'я>.filepart". Каталогів resume
+    # не стосується — для них лишається 255.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$RelativePath,
-        [int]$MaximumFileUtf8Bytes = 255,
+        [int]$MaximumFileUtf8Bytes = 246,
         [int]$MaximumDirectoryUtf8Bytes = 255
     )
 
@@ -467,6 +500,16 @@ function Invoke-BRAVOBazaFileUpload {
         New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $remoteDirectory
         $transferOptions = New-Object WinSCP.TransferOptions
         $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
+        # P1 (hardening round 2): resume вмикається ЯВНО, а не через
+        # built-in default WinSCP (той сам вирішує за порогом розміру,
+        # використовувати чи ні тимчасове ".filepart"-ім'я). Явний On
+        # робить контракт детермінованим і узгодженим із валідатором імен
+        # (Test-BRAVOBazaRemoteNameCompatibility, ліміт файла 246 байт =
+        # 255 - 9 байт ".filepart") — legacy-шлях так само працює в парі
+        # resumesupport=on + ліміт 246. Свідомо НЕ вимикаємо resume заради
+        # "довших імен": обрив передачі великого BAZA-файлу без resume
+        # коштує дорожче, ніж 9 байт запасу в імені.
+        $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
         $transferResult = $Session.PutFiles($Entry.FullPath, $remoteFullPath, $false, $transferOptions)
         if (-not $transferResult.IsSuccess) {
             $failureMessages = @(
@@ -959,6 +1002,26 @@ function Invoke-BRAVOBazaSynchronization {
         $result.Status = 'INCOMPLETE'
     } elseif ($plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail') {
         $result.Status = 'MUTATION_VIOLATION'
+    } elseif ($incompatibleFiles.Count -gt 0) {
+        # P1 (hardening round 2): несумісні імена НЕ дають успішного циклу.
+        # Раніше Failed=0 при пропущених несумісних кандидатах давав
+        # COMPLETE: LastSuccessfulSyncUtc просувався і публікувався
+        # "успішний" checkpoint, хоча частину даних свідомо НЕ передано.
+        # Явний статус (а не INCOMPLETE) — щоб оператор одразу бачив
+        # причину: це не мережевий збій, а імена, які треба скоротити.
+        # Provenance успішного циклу (LastCycleId/LastSuccessfulSyncUtc)
+        # НЕ просувається; checkpoint не публікується (gate на COMPLETE у
+        # Invoke-BRAVOBazaComponentSyncSession); сумісні файли цього ж
+        # циклу передано і закомічено в state вище — повторно вони не
+        # передаватимуться.
+        $result.Status = 'INCOMPATIBLE_NAME'
+        $incompatibleNamesPreview = @(
+            $incompatibleFiles | Select-Object -First 3 | ForEach-Object { $_.RelativePath }
+        ) -join ', '
+        $result.Error = (
+            "$($incompatibleFiles.Count) кандидат(ів) не передано через несумісні з SFTP імена " +
+            "(напр.: $incompatibleNamesPreview) — цикл не вважається успішним"
+        )
     } else {
         $result.Status = 'COMPLETE'
         $state.LastCycleId = $cycleId
@@ -1007,12 +1070,19 @@ function Write-BRAVOBazaRemoteCheckpoint {
     # Attempted/Published/Error, який Invoke-BRAVOBazaComponentSyncSession
     # переносить у SyncResult.
     #
-    # Атомарна публікація: завантажуємо під ТИМЧАСОВИМ remote-іменем,
-    # потім Session.MoveFile перейменовує на канонічне — читач канонічного
-    # шляху бачить або СТАРИЙ checkpoint, або ПОВНІСТЮ записаний новий,
-    # ніколи частково завантажений. Без цього crash/розрив мережі ПОСЕРЕД
-    # PutFiles напряму в .bravo-sync.json міг би лишити там частково
-    # записаний JSON.
+    # Публікація через ТИМЧАСОВЕ remote-ім'я + явна заміна (P2, hardening
+    # round 2): вміст завжди спершу ПОВНІСТЮ лягає під тимчасовим іменем —
+    # канонічний шлях ніколи не містить частково записаного JSON (crash/
+    # розрив мережі посеред PutFiles напряму в .bravo-sync.json лишив би
+    # там обрізаний файл). Далі, якщо канонічний checkpoint від
+    # попереднього циклу ВЖЕ існує, він явно видаляється перед
+    # MoveFile(temp -> canonical): SFTP-rename переносимо НЕ гарантує
+    # перезапису наявної цілі (перший цикл проходив, а кожен наступний
+    # падав би на rename). Свідомо НЕ заявляємо атомарності заміни:
+    # generic SFTP її не дає, а checkpoint — write-only телеметрія для
+    # зовнішнього спостерігача, НЕ джерело correctness для Health. Вікно
+    # неатомарності вузьке і чесне: між RemoveFiles та MoveFile читач може
+    # побачити checkpoint ВІДСУТНІМ — але ніколи частковим.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Session,
@@ -1045,18 +1115,23 @@ function Write-BRAVOBazaRemoteCheckpoint {
             return [pscustomobject]@{ Attempted = $true; Published = $false; Error = 'не вдалося завантажити тимчасовий checkpoint' }
         }
         try {
+            # Явна заміна попереднього checkpoint: RemoveFiles лише для
+            # ВЛАСНОГО телеметрійного файлу двигуна — жодні дані бекапів
+            # цим шляхом не видаляються ніколи.
+            if ([bool]$Session.FileExists($canonicalRemoteCheckpointPath)) {
+                [void]$Session.RemoveFiles($canonicalRemoteCheckpointPath)
+            }
             $Session.MoveFile($temporaryRemoteCheckpointPath, $canonicalRemoteCheckpointPath)
         } catch {
-            # Rename не вдався — прибираємо тимчасовий файл (best-effort),
+            # Заміна не вдалася — прибираємо тимчасовий файл (best-effort),
             # щоб не лишати сміття на SFTP; checkpoint вважається
-            # неопублікованим (канонічний шлях лишається зі СТАРИМ
-            # checkpoint або взагалі відсутній — ніколи частковим).
+            # неопублікованим.
             try { [void]$Session.RemoveFiles($temporaryRemoteCheckpointPath) } catch {
                 # Best-effort cleanup: збій прибирання tmp-файлу не
-                # важливіший за ПЕРШУ помилку (збій rename), яку повертаємо
+                # важливіший за ПЕРШУ помилку (збій заміни), яку повертаємо
                 # нижче. Осиротілий .tmp-* на SFTP нешкідливий.
             }
-            return [pscustomobject]@{ Attempted = $true; Published = $false; Error = "не вдалося перейменувати checkpoint на канонічне ім'я: $($_.Exception.Message)" }
+            return [pscustomobject]@{ Attempted = $true; Published = $false; Error = "не вдалося замінити checkpoint на канонічному імені: $($_.Exception.Message)" }
         }
         return [pscustomobject]@{ Attempted = $true; Published = $true; Error = $null }
     } catch {

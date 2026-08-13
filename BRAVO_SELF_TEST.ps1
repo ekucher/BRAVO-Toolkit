@@ -14582,12 +14582,14 @@ function Write-BRAVOLog {
                 MoveFileCalls = New-Object System.Collections.Generic.List[string]
                 RemoveFilesCalls = New-Object System.Collections.Generic.List[string]
                 MoveFileShouldFail = [bool]$MoveFileShouldFail
+                LastResumeSupportState = $null
             }
             $session = New-Object psobject
             $session | Add-Member -MemberType NoteProperty -Name State -Value $state
             $session | Add-Member -MemberType ScriptMethod -Name FileExists -Value {
                 param($path)
-                return $this.State.KnownRemoteDirs.Contains($path)
+                # Як і реальний WinSCP Session.FileExists — і каталоги, і файли.
+                return ($this.State.KnownRemoteDirs.Contains($path) -or $this.State.RemoteSizes.ContainsKey($path))
             }
             $session | Add-Member -MemberType ScriptMethod -Name CreateDirectory -Value {
                 param($path)
@@ -14600,6 +14602,9 @@ function Write-BRAVOLog {
                 param($localPath, $remotePath, $remove, $options)
                 $this.State.PutFilesCallCount++
                 [void]$this.State.PutFilesCalledFor.Add($remotePath)
+                if ($null -ne $options -and $null -ne $options.ResumeSupport) {
+                    $this.State.LastResumeSupportState = [string]$options.ResumeSupport.State
+                }
                 $localSize = (Get-Item -LiteralPath $localPath).Length
                 $normalizedRemote = [string]$remotePath
                 $shouldFail = $allFail
@@ -14620,12 +14625,18 @@ function Write-BRAVOLog {
                 if ($null -eq $size) { $size = 0 }
                 return [pscustomobject]@{ Length = $size }
             }
-            # P2 (deep review): checkpoint atomic-publish (temp remote name
-            # -> MoveFile) і lock/no-delete structural coverage.
+            # P2 (deep review): checkpoint publish/replace і no-delete
+            # structural coverage. MoveFile навмисно моделює SFTP-семантику
+            # "rename НЕ перезаписує наявну ціль" (hardening round 2) — щоб
+            # production-код, який покладався б на rename-overwrite, падав
+            # у тестах, а не на реальному сервері на другому циклі.
             $session | Add-Member -MemberType ScriptMethod -Name MoveFile -Value {
                 param($sourcePath, $targetPath)
                 [void]$this.State.MoveFileCalls.Add("$sourcePath -> $targetPath")
                 if ($this.State.MoveFileShouldFail) { throw "simulated MoveFile failure" }
+                if ($this.State.RemoteSizes.ContainsKey($targetPath)) {
+                    throw "simulated rename failure: target already exists: $targetPath"
+                }
                 if ($this.State.RemoteSizes.ContainsKey($sourcePath)) {
                     $this.State.RemoteSizes[$targetPath] = $this.State.RemoteSizes[$sourcePath]
                     $this.State.RemoteSizes.Remove($sourcePath)
@@ -14634,6 +14645,7 @@ function Write-BRAVOLog {
             $session | Add-Member -MemberType ScriptMethod -Name RemoveFiles -Value {
                 param($path)
                 [void]$this.State.RemoveFilesCalls.Add($path)
+                $this.State.RemoteSizes.Remove($path)
                 return [pscustomobject]@{ IsSuccess = $true }
             }
             return $session
@@ -15436,19 +15448,215 @@ function Write-BRAVOLog {
         # =======================================================================
         # DEEP REVIEW acceptance 10: жодного -delete / remote-видалення даних
         # =======================================================================
-        $drRemoveFilesMatches = [regex]::Matches($bazaSyncModuleText, '\.RemoveFiles\(')
+        # Кожен RemoveFiles у модулі сміє торкатись ЛИШЕ власних
+        # checkpoint-артефактів двигуна (tmp-файл або канонічний
+        # .bravo-sync.json при явній заміні) -- ЖОДНОГО видалення даних.
+        $drRemoveFilesLines = @(
+            ($bazaSyncModuleText -split "`n") | Where-Object { $_ -match '\.RemoveFiles\(' }
+        )
+        $drRemoveFilesOffCheckpoint = @($drRemoveFilesLines | Where-Object { $_ -notmatch 'RemoteCheckpointPath' })
         Test-BRAVOCondition -Condition (
             -not $bazaSyncModuleText.Contains('SynchronizeDirectories') -and
             -not $bazaSyncModuleText.Contains('SynchronizationMode') -and
-            $drRemoveFilesMatches.Count -eq 1 -and
-            $bazaSyncModuleText.Contains('[void]$Session.RemoveFiles($temporaryRemoteCheckpointPath)')
-        ) -Name 'BazaSync/NoDeleteAnywhereInIncrementalEngine' -Failure "інкрементальний engine НЕ має жодного remote-видалення даних: без SynchronizeDirectories/SynchronizationMode, єдиний RemoveFiles -- прибирання ВЛАСНОГО tmp-checkpoint; RemoveFilesMatches=$($drRemoveFilesMatches.Count)"
+            $drRemoveFilesLines.Count -eq 2 -and
+            $drRemoveFilesOffCheckpoint.Count -eq 0 -and
+            $bazaSyncModuleText.Contains('[void]$Session.RemoveFiles($temporaryRemoteCheckpointPath)') -and
+            $bazaSyncModuleText.Contains('[void]$Session.RemoveFiles($canonicalRemoteCheckpointPath)')
+        ) -Name 'BazaSync/NoDeleteAnywhereInIncrementalEngine' -Failure "інкрементальний engine НЕ має жодного remote-видалення даних: без SynchronizeDirectories/SynchronizationMode, RemoveFiles лише для ВЛАСНИХ checkpoint-артефактів (tmp + канонічний при заміні); RemoveFilesLines=$($drRemoveFilesLines.Count), поза checkpoint: $($drRemoveFilesOffCheckpoint.Count)"
 
         $drPutFilesCalls = @([regex]::Matches($bazaSyncModuleText, '\$Session\.PutFiles\([^\r\n]*'))
         Test-BRAVOCondition -Condition (
             $drPutFilesCalls.Count -ge 2 -and
             (@($drPutFilesCalls | Where-Object { $_.Value -notmatch ',\s*\$false,' }).Count -eq 0)
         ) -Name 'BazaSync/PutFilesNeverDeletesLocalSource' -Failure "кожен PutFiles має передавати remove=`$false (ніколи не видаляти локальне джерело після upload); calls=$($drPutFilesCalls.Count)"
+
+        # =======================================================================
+        # HARDENING ROUND 2, P1: несумісні імена НЕ дають успішного циклу
+        # (без COMPLETE, без просування LastSuccessfulSyncUtc/LastCycleId,
+        # без "успішного" checkpoint; сумісні файли того ж циклу передаються)
+        # =======================================================================
+        $hr2NameRoot = Join-Path $bazaSyncTestRoot "HR2_Name"
+        $hr2NameLocal = Join-Path $hr2NameRoot "local"
+        $hr2NameState = Join-Path $hr2NameRoot "state"
+        New-Item -ItemType Directory -Path $hr2NameLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr2NameLocal -RelativePath "compatible_seed.txt" -SizeBytes 10 | Out-Null
+
+        # цикл 1: лише сумісний файл -> COMPLETE, provenance просувається
+        $hr2Cycle1Result = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2NameLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr2NameState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $hr2StateAfterCycle1 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr2NameState -Component 'BAZA_APP')
+        $hr2ProvenanceUtc = [string]$hr2StateAfterCycle1.State.LastSuccessfulSyncUtc
+        $hr2ProvenanceCycleId = [string]$hr2StateAfterCycle1.State.LastCycleId
+
+        # цикл 2: додається несумісний кандидат (260 UTF-8 байтів > 246)
+        New-BRAVOSelfTestBazaFile -Directory $hr2NameLocal -RelativePath "$drUtf8Name.txt" -SizeBytes 20 | Out-Null
+        $hr2Cycle2Session = New-BRAVOSelfTestFakeBazaSession
+        $hr2Cycle2Result = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2NameLocal -RemoteRootPath '/baza_app' -Session $hr2Cycle2Session -StateRoot $hr2NameState
+        Test-BRAVOCondition -Condition (
+            $hr2Cycle1Result.Status -eq 'COMPLETE' -and
+            $hr2Cycle2Result.Status -eq 'INCOMPATIBLE_NAME' -and
+            $hr2Cycle2Result.Status -ne 'COMPLETE' -and
+            $hr2Cycle2Result.Error -match [regex]::Escape($drUtf8Name.Substring(0, 20))
+        ) -Name 'BazaSync/IncompatibleCandidateDoesNotProduceComplete' -Failure "цикл із несумісним кандидатом має явний статус INCOMPATIBLE_NAME, ніколи COMPLETE; Cycle1=$($hr2Cycle1Result.Status) Cycle2=$($hr2Cycle2Result.Status) Error=$($hr2Cycle2Result.Error)"
+
+        $hr2StateAfterCycle2 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr2NameState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            -not [string]::IsNullOrWhiteSpace($hr2ProvenanceUtc) -and
+            [string]$hr2StateAfterCycle2.State.LastSuccessfulSyncUtc -ceq $hr2ProvenanceUtc -and
+            [string]$hr2StateAfterCycle2.State.LastCycleId -ceq $hr2ProvenanceCycleId -and
+            [string]$hr2Cycle2Result.LastSuccessfulSyncUtc -ceq $hr2ProvenanceUtc
+        ) -Name 'BazaSync/IncompatibleCandidateDoesNotAdvanceLastSuccessfulSyncUtc' -Failure "LastSuccessfulSyncUtc/LastCycleId НЕ мають просуватись циклом з несумісними іменами; було=$hr2ProvenanceUtc стало=$($hr2StateAfterCycle2.State.LastSuccessfulSyncUtc)"
+
+        # checkpoint для такого циклу: Write-BRAVOBazaRemoteCheckpoint сам
+        # відмовляється (Status != COMPLETE -> Attempted=false, нуль
+        # звернень до сесії), а session-обгортка додатково гейтить виклик.
+        $hr2CheckpointSession = New-BRAVOSelfTestFakeBazaSession
+        $hr2CheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr2CheckpointSession -RemoteRootPath '/baza_app' -SyncResult $hr2Cycle2Result
+        Test-BRAVOCondition -Condition (
+            $hr2CheckpointOutcome.Attempted -eq $false -and $hr2CheckpointOutcome.Published -eq $false -and
+            $hr2CheckpointSession.State.PutFilesCallCount -eq 0 -and
+            $hr2CheckpointSession.State.MoveFileCalls.Count -eq 0 -and
+            $bazaSyncModuleText.Contains('if ($WriteCheckpoint -and $syncResult.Status -eq ''COMPLETE'')')
+        ) -Name 'BazaSync/IncompatibleCandidateDoesNotPublishSuccessfulCheckpoint' -Failure "INCOMPATIBLE_NAME цикл не має публікувати successful checkpoint (обидва gate: сам Write-* і session-обгортка); Attempted=$($hr2CheckpointOutcome.Attempted) PutFiles=$($hr2CheckpointSession.State.PutFilesCallCount)"
+
+        # змішаний цикл: сумісний новий файл передається, стан для нього
+        # комітиться, але цикл усе одно НЕ COMPLETE
+        New-BRAVOSelfTestBazaFile -Directory $hr2NameLocal -RelativePath "compatible_new.txt" -SizeBytes 30 | Out-Null
+        $hr2MixedSession = New-BRAVOSelfTestFakeBazaSession
+        $hr2MixedResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2NameLocal -RemoteRootPath '/baza_app' -Session $hr2MixedSession -StateRoot $hr2NameState
+        $hr2MixedStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr2NameState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $hr2MixedResult.Status -eq 'INCOMPATIBLE_NAME' -and
+            $hr2MixedResult.Uploaded -eq 1 -and
+            $hr2MixedSession.State.PutFilesCallCount -eq 1 -and
+            ($hr2MixedSession.State.PutFilesCalledFor -match 'compatible_new') -and
+            $hr2MixedStateRead.State.Files.ContainsKey('compatible_new.txt') -and
+            [bool]$hr2MixedStateRead.State.Files['compatible_new.txt'].Verified -eq $true -and
+            -not $hr2MixedStateRead.State.Files.ContainsKey("$drUtf8Name.txt")
+        ) -Name 'BazaSync/MixedCompatibleAndIncompatibleUploadsCompatibleButCycleNotComplete' -Failure "сумісний кандидат того ж циклу має передатись і закомітитись у state, але цикл НЕ COMPLETE; Status=$($hr2MixedResult.Status) Uploaded=$($hr2MixedResult.Uploaded) PutFiles=$($hr2MixedSession.State.PutFilesCallCount)"
+
+        # =======================================================================
+        # HARDENING ROUND 2, P1: явний ResumeSupport=On + легасі-ліміт 246
+        # UTF-8 байтів на ім'я файлу (255 - 9 байт ".filepart")
+        # =======================================================================
+        Test-BRAVOCondition -Condition ($hr2MixedSession.State.LastResumeSupportState -eq 'On') `
+            -Name 'BazaSync/ResumeSupportExplicitlyEnabledForTargetedUpload' -Failure "цільовий upload має ЯВНО вмикати TransferOptions.ResumeSupport.State=On (легасі-семантика resumesupport=on); отримано '$($hr2MixedSession.State.LastResumeSupportState)'"
+
+        Test-BRAVOCondition -Condition ((Test-BRAVOBazaRemoteNameCompatibility -RelativePath ('a' * 246)).Compatible -eq $true) `
+            -Name 'BazaSync/FileName246Utf8BytesAccepted' -Failure "ім'я файлу рівно в 246 UTF-8 байтів має проходити (246 = 255 - 9 байт '.filepart')"
+
+        # 247 байтів: чиста перевірка на ASCII-рядку + поведінкова на
+        # РЕАЛЬНОМУ файлі (123 кириличні + 1 ASCII = 247 UTF-8 байтів, але
+        # лише 124 символи -- безпечно для Windows MAX_PATH)
+        $hr2Name247 = (([string]([char]0x0410)) * 123) + 'a'
+        $hr2Limit247Root = Join-Path $bazaSyncTestRoot "HR2_247"
+        $hr2Limit247Local = Join-Path $hr2Limit247Root "local"
+        New-Item -ItemType Directory -Path $hr2Limit247Local -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr2Limit247Local -RelativePath $hr2Name247 -SizeBytes 10 | Out-Null
+        $hr2Limit247Session = New-BRAVOSelfTestFakeBazaSession
+        $hr2Limit247Result = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2Limit247Local -RemoteRootPath '/baza_app' -Session $hr2Limit247Session -StateRoot (Join-Path $hr2Limit247Root "state") -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition (
+            (Test-BRAVOBazaRemoteNameCompatibility -RelativePath ('a' * 247)).Compatible -eq $false -and
+            $hr2Limit247Result.Status -eq 'INCOMPATIBLE_NAME' -and
+            $hr2Limit247Session.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/FileName247Utf8BytesRejectedBeforePutFiles' -Failure "247 UTF-8 байтів має відхилятись ДО PutFiles (валідація узгоджена з '.filepart'); Compatible247=$((Test-BRAVOBazaRemoteNameCompatibility -RelativePath ('a' * 247)).Compatible) Status=$($hr2Limit247Result.Status) PutFiles=$($hr2Limit247Session.State.PutFilesCallCount)"
+
+        $hr2MultibyteCheck = Test-BRAVOBazaRemoteNameCompatibility -RelativePath (([string]([char]0x0410)) * 124)
+        Test-BRAVOCondition -Condition (
+            $hr2MultibyteCheck.Compatible -eq $false -and $hr2MultibyteCheck.Utf8ByteCount -eq 248
+        ) -Name 'BazaSync/MultibyteUtf8FilenameUsesByteCount' -Failure "ліміт рахується в UTF-8 БАЙТАХ: 124 кириличні символи = 248 байтів > 246, хоча символів лише 124; Compatible=$($hr2MultibyteCheck.Compatible) Bytes=$($hr2MultibyteCheck.Utf8ByteCount)"
+
+        Test-BRAVOCondition -Condition ($hr2Limit247Session.State.PutFilesCallCount -eq 0 -and $hr2Limit247Session.State.MoveFileCalls.Count -eq 0) `
+            -Name 'BazaSync/IncompatibleNameMakesZeroRemoteUploadCalls' -Failure "цикл, де єдиний кандидат несумісний, має зробити НУЛЬ remote-викликів передачі; PutFiles=$($hr2Limit247Session.State.PutFilesCallCount)"
+
+        # =======================================================================
+        # HARDENING ROUND 2, P2: заміна checkpoint ПІСЛЯ першого циклу
+        # (fake MoveFile моделює SFTP "rename не перезаписує наявну ціль")
+        # =======================================================================
+        $hr2CpResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'hr2-cp' -StartedUtc (Get-Date).ToUniversalTime() -CutoffUtc (Get-Date).ToUniversalTime()
+        $hr2CpResult.Status = 'COMPLETE'
+        $hr2CpResult.CompletedUtc = (Get-Date).ToUniversalTime()
+        $hr2CpSession = New-BRAVOSelfTestFakeBazaSession
+        $hr2CpCanonicalPath = '/baza_app/.bravo-sync.json'
+
+        $hr2CpFirst = Write-BRAVOBazaRemoteCheckpoint -Session $hr2CpSession -RemoteRootPath '/baza_app' -SyncResult $hr2CpResult
+        Test-BRAVOCondition -Condition (
+            $hr2CpFirst.Published -eq $true -and
+            $hr2CpSession.State.RemoteSizes.ContainsKey($hr2CpCanonicalPath)
+        ) -Name 'BazaSync/CheckpointFirstPublishSucceeds' -Failure "перша публікація checkpoint має пройти (канонічної цілі ще немає); Published=$($hr2CpFirst.Published) Error=$($hr2CpFirst.Error)"
+
+        $hr2CpSecond = Write-BRAVOBazaRemoteCheckpoint -Session $hr2CpSession -RemoteRootPath '/baza_app' -SyncResult $hr2CpResult
+        Test-BRAVOCondition -Condition (
+            $hr2CpSecond.Published -eq $true -and
+            $hr2CpSession.State.RemoteSizes.ContainsKey($hr2CpCanonicalPath)
+        ) -Name 'BazaSync/CheckpointSecondPublishReplacesOrSupersedesExisting' -Failure "друга публікація (канонічний checkpoint ВЖЕ існує) має замінити його, а не падати щоциклу; Published=$($hr2CpSecond.Published) Error=$($hr2CpSecond.Error)"
+
+        Test-BRAVOCondition -Condition (
+            (@($hr2CpSession.State.RemoveFilesCalls) -contains $hr2CpCanonicalPath) -and
+            $hr2CpSession.State.MoveFileCalls.Count -eq 2
+        ) -Name 'BazaSync/CheckpointDoesNotDependOnServerRenameOverwrite' -Failure "заміна має йти явним шляхом (RemoveFiles наявної цілі перед MoveFile), НЕ покладаючись на rename-overwrite сервера (fake навмисно кидає виняток при move у наявну ціль); RemoveFilesCalls=$($hr2CpSession.State.RemoveFilesCalls -join ', ')"
+
+        $hr2CpFailSession = New-BRAVOSelfTestFakeBazaSession -MoveFileShouldFail
+        $hr2CpFailOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr2CpFailSession -RemoteRootPath '/baza_app' -SyncResult $hr2CpResult
+        $hr2CpFailHealthResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'hr2-cp-fail' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
+        $hr2CpFailHealthResult.Status = 'COMPLETE'
+        $hr2CpFailHealthResult.CheckpointAttempted = $hr2CpFailOutcome.Attempted
+        $hr2CpFailHealthResult.CheckpointPublished = $hr2CpFailOutcome.Published
+        $hr2CpFailHealthResult.CheckpointError = $hr2CpFailOutcome.Error
+        $hr2CpFailHealth = Get-BRAVOBazaFastHealthResult -SyncResult $hr2CpFailHealthResult
+        Test-BRAVOCondition -Condition (
+            $hr2CpFailOutcome.Published -eq $false -and
+            $hr2CpFailHealth.Healthy -eq $true -and $hr2CpFailHealth.Level -eq 'WARNING'
+        ) -Name 'BazaSync/CheckpointFailureStillOnlyWarning' -Failure "збій заміни checkpoint при успішному циклі лишається WARNING (телеметрія, не correctness-джерело); Published=$($hr2CpFailOutcome.Published) Healthy=$($hr2CpFailHealth.Healthy) Level=$($hr2CpFailHealth.Level)"
+
+        # =======================================================================
+        # HARDENING ROUND 2, P2: mutation-контракт = size АБО LastWriteTimeUtc
+        # (для вже Verified шляху); відсутній у state шлях -- NEW незалежно
+        # від timestamp
+        # =======================================================================
+        $hr2MtimeRoot = Join-Path $bazaSyncTestRoot "HR2_Mtime"
+        $hr2MtimeLocal = Join-Path $hr2MtimeRoot "local"
+        $hr2MtimeState = Join-Path $hr2MtimeRoot "state"
+        New-Item -ItemType Directory -Path $hr2MtimeLocal -Force | Out-Null
+        $hr2MtimeFile = New-BRAVOSelfTestBazaFile -Directory $hr2MtimeLocal -RelativePath "steady.txt" -SizeBytes 100
+        $hr2MtimeSetup = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2MtimeLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr2MtimeState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+
+        # незмінені size+mtime -> trusted skip (нуль remote-викликів)
+        $hr2MtimeSkipSession = New-BRAVOSelfTestFakeBazaSession
+        $hr2MtimeSkipResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2MtimeLocal -RemoteRootPath '/baza_app' -Session $hr2MtimeSkipSession -StateRoot $hr2MtimeState
+        Test-BRAVOCondition -Condition (
+            $hr2MtimeSetup.Status -eq 'COMPLETE' -and
+            $hr2MtimeSkipResult.Status -eq 'COMPLETE' -and $hr2MtimeSkipResult.AlreadyVerified -eq 1 -and
+            $hr2MtimeSkipSession.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/VerifiedSameSizeSameMtimeIsTrustedSkip' -Failure "Verified + незмінені size і mtime = trusted skip без remote-викликів; Status=$($hr2MtimeSkipResult.Status) AlreadyVerified=$($hr2MtimeSkipResult.AlreadyVerified) PutFiles=$($hr2MtimeSkipSession.State.PutFilesCallCount)"
+
+        # той самий розмір, НОВИЙ mtime -> mutation (перезапис тим самим обсягом)
+        [IO.File]::SetLastWriteTimeUtc($hr2MtimeFile, (Get-Date).ToUniversalTime().AddMinutes(5))
+        $hr2MtimeMutSession = New-BRAVOSelfTestFakeBazaSession
+        $hr2MtimeMutResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2MtimeLocal -RemoteRootPath '/baza_app' -Session $hr2MtimeMutSession -StateRoot $hr2MtimeState
+        Test-BRAVOCondition -Condition (
+            $hr2MtimeMutResult.Status -eq 'MUTATION_VIOLATION' -and
+            $hr2MtimeMutResult.MutationViolations.Count -eq 1 -and
+            $hr2MtimeMutResult.MutationViolations[0].RelativePath -eq 'steady.txt' -and
+            [int64]$hr2MtimeMutResult.MutationViolations[0].PreviousSize -eq [int64]$hr2MtimeMutResult.MutationViolations[0].CurrentSize -and
+            $hr2MtimeMutResult.MutationViolations[0].PreviousLastWriteTimeUtc -cne $hr2MtimeMutResult.MutationViolations[0].CurrentLastWriteTimeUtc -and
+            $hr2MtimeMutSession.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/VerifiedSameSizeChangedMtimeIsMutation' -Failure "Verified шлях зі зміненим ЛИШЕ mtime (той самий size) має бути MutationViolation, не мовчазний trusted skip; Status=$($hr2MtimeMutResult.Status) Violations=$($hr2MtimeMutResult.MutationViolations.Count) PutFiles=$($hr2MtimeMutSession.State.PutFilesCallCount)"
+
+        # NEW-файл зі старим timestamp -- НЕ timestamp-only discovery:
+        # відсутність у state вирішує, upload відбувається
+        $hr2OldTsRoot = Join-Path $bazaSyncTestRoot "HR2_OldTs"
+        $hr2OldTsLocal = Join-Path $hr2OldTsRoot "local"
+        $hr2OldTsState = Join-Path $hr2OldTsRoot "state"
+        New-Item -ItemType Directory -Path $hr2OldTsLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr2OldTsLocal -RelativePath "seed.txt" -SizeBytes 10 | Out-Null
+        [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2OldTsLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr2OldTsState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider)
+        New-BRAVOSelfTestBazaFile -Directory $hr2OldTsLocal -RelativePath "ancient_new.txt" -SizeBytes 20 -LastWriteTimeUtc ([datetime]::Parse('2001-06-15T12:00:00Z').ToUniversalTime()) | Out-Null
+        $hr2OldTsSession = New-BRAVOSelfTestFakeBazaSession
+        $hr2OldTsResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr2OldTsLocal -RemoteRootPath '/baza_app' -Session $hr2OldTsSession -StateRoot $hr2OldTsState
+        Test-BRAVOCondition -Condition (
+            $hr2OldTsResult.Status -eq 'COMPLETE' -and $hr2OldTsResult.Uploaded -eq 1 -and
+            ($hr2OldTsSession.State.PutFilesCalledFor -match 'ancient_new')
+        ) -Name 'BazaSync/NewFileWithOldTimestampStillUploads' -Failure "новий (відсутній у state) файл зі старим LastWriteTime має передаватись -- рішення ухвалюється за присутністю в state, не за timestamp; Status=$($hr2OldTsResult.Status) Uploaded=$($hr2OldTsResult.Uploaded)"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

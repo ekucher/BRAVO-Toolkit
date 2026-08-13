@@ -354,8 +354,9 @@ Invariants below).
   with an actionable error pointing to `Mode = "Legacy"` as the explicit
   path to the old behavior (`BRAVO_DRY_RUN` reports this as a scoped FAIL
   for the BAZA section without aborting unrelated checks). (P2) The remote
-  checkpoint is published atomically (upload to `.bravo-sync.json.tmp-<guid>`,
-  then rename) and its outcome is no longer discarded:
+  checkpoint is published via a temporary remote name (upload to
+  `.bravo-sync.json.tmp-<guid>`, then an explicit replace — see the
+  round-2 entry below) and its outcome is no longer discarded:
   `CheckpointAttempted`/`CheckpointPublished`/`CheckpointError` live on the
   SyncResult, and a publish failure on an otherwise-successful cycle is a
   `WARNING` (write-only operator telemetry — production Health never reads
@@ -364,8 +365,9 @@ Invariants below).
   `FullAuditAttempted`/`FullAuditSucceeded`/`FullAuditError`/`LastFullAuditUtc`
   are surfaced on the SyncResult and sync-succeeded-but-audit-failed is at
   least a `WARNING`, never silently "fully verified". (P2) Legacy SFTP
-  filename-compatibility checking (255 UTF-8 *bytes* per path segment) now
-  applies to incremental upload candidates (O(candidates), purely local, no
+  filename-compatibility checking (UTF-8 *byte* limits per path segment —
+  since round 2: 246 for file names, 255 for directories) now applies to
+  incremental upload candidates (O(candidates), purely local, no
   remote tree scan, zero remote calls for an incompatible file): the file
   is skipped with an explicit `IncompatibleFiles` entry naming the exact
   relative path and reason, and Health raises `CRITICAL` — closing the
@@ -376,9 +378,54 @@ Invariants below).
   the normal "хмарна копія актуальна" message is never produced for it.
   ~48 new behavioral self-tests cover all of the above through the real
   planner/synchronization path (no WinSCP session needed), including
-  structural no-delete guarantees (no `SynchronizeDirectories`, the single
-  `RemoveFiles` call only ever removes the engine's own temporary
-  checkpoint, every `PutFiles` passes `remove=$false`).
+  structural no-delete guarantees (no `SynchronizeDirectories`,
+  `RemoveFiles` only ever touches the engine's own checkpoint artifacts,
+  every `PutFiles` passes `remove=$false`).
+- `BRAVO.BazaSync` hardening round 2 (final pre-rollout review findings).
+  (P1) Incompatible SFTP names no longer produce a successful cycle:
+  previously a skipped incompatible candidate left `Failed=0`, the cycle
+  became `COMPLETE`, `LastSuccessfulSyncUtc` advanced and a "successful"
+  remote checkpoint could be published even though data was knowingly not
+  transferred. Such a cycle now ends with an explicit
+  `Status=INCOMPATIBLE_NAME`: successful-cycle provenance
+  (`LastCycleId`/`LastSuccessfulSyncUtc`) does not advance, no checkpoint
+  is published (both the session-level gate and
+  `Write-BRAVOBazaRemoteCheckpoint` itself refuse non-`COMPLETE` results),
+  Health stays `CRITICAL` with the exact offending paths, and compatible
+  candidates of the same cycle still upload and commit to state normally
+  (`BRAVO_ARCHIV` already treats any non-`COMPLETE` status as a
+  not-synchronized component). (P1) Real legacy ResumeSupport semantics
+  restored: the targeted upload now explicitly sets
+  `TransferOptions.ResumeSupport.State = On` (instead of relying on
+  WinSCP's size-threshold default), and the filename validator's file-name
+  limit is 246 UTF-8 bytes (255 − 9 bytes for the `.filepart` suffix
+  WinSCP appends during resumable transfers; directories remain 255) —
+  the exact pair the legacy path has always used with `-resumesupport=on`.
+  Previously a 247–255-byte name passed validation and would fail
+  mid-transfer; resume support is deliberately not disabled to win those
+  9 bytes back. (P2) Checkpoint replacement now works after the first
+  cycle: `Session.MoveFile` cannot portably overwrite an existing target
+  on SFTP, so from the second cycle on every publish would have failed.
+  The publish flow is now upload-to-temp, explicit `RemoveFiles` of the
+  existing canonical checkpoint (engine-owned telemetry only — never data),
+  then rename. This is deliberately documented as non-atomic: a reader may
+  briefly observe the checkpoint absent during replacement, but never a
+  partially written one; the self-test fake session now models the
+  rename-target-exists failure so any code relying on rename-overwrite
+  fails in tests rather than in production. (P2) Mutation detection now
+  matches its own stated contract: a `Verified` path whose size OR
+  `LastWriteTimeUtc` changed is a `MUTATION_VIOLATION` under
+  `MutationPolicy = "Fail"` (previously only size was compared, so an
+  append-only file rewritten with identical size but a new mtime silently
+  kept its trusted skip). String-equality fast path keeps the 100k-file
+  plan cost unchanged; unparseable historical timestamps fail visible as
+  mutation rather than being silently trusted. This is still not
+  timestamp-only discovery: a path absent from state remains NEW and
+  uploads regardless of its timestamp. 15 new behavioral self-tests; all
+  round-1 invariants (STATE_NOT_INITIALIZED zero-upload, Archive-only
+  corrupt-state reconciliation, lock Busy-vs-Error, Fast Health success
+  whitelist, no full `CompareDirectories` on normal cycles, no `-delete`)
+  re-verified by the existing suite.
 
 ## 5.0.0 — 2026-08-11
 
