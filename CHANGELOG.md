@@ -463,6 +463,50 @@ Invariants below).
   behavioral self-tests, including the crash-recovery acceptance
   (`CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload`) and
   remote-lookup scoping proofs.
+- `BRAVO.BazaSync` hardening round 4 (independent post-review of the
+  Full Audit × AlreadyRemote interaction). (P1) A current-cycle Full
+  Audit pending verdict now overrides generic same-size AlreadyRemote
+  recovery. Production Full Audit compares with `-criteria=time,size`
+  and reports both `UploadNew` and `UploadUpdate`, but
+  `ConvertTo-BRAVOBazaFullAuditResult` reduced everything to
+  "already matching" and lost the pending action — so a file the audit
+  explicitly flagged as `UploadUpdate` (same size, different mtime on
+  the remote) would fall through the planner to the round-3 candidate
+  precheck, match by size, be "recovered" as `AlreadyRemote`/`Verified`
+  and silently cancel the audit's own drift finding (the same flaw
+  applied to bootstrap seeding of pending-but-size-matching remote
+  files). The adapter now preserves `PendingItems`
+  (`RelativePath`/`Action`/`Reason`); the synchronization cycle keeps a
+  current-audit pending map, and any pending candidate is excluded from
+  generic recovery: remote absent → normal upload + verification;
+  remote present → explicit `Status=AUDIT_DRIFT` carrying the audit
+  Action/Reason and local/remote sizes, zero `PutFiles`, never an
+  overwrite, no successful-cycle provenance advance, no checkpoint,
+  Health `CRITICAL` naming the path, action and both sizes.
+  `LastFullAuditUtc` still advances on such a cycle (the audit itself
+  completed successfully and found drift — audit freshness is not
+  synchronization success and is deliberately not conflated with
+  `LastSuccessfulSyncUtc`). The verdict is scoped to the cycle the audit
+  ran in — a later plain incremental cycle without its own audit falls
+  back to round-3 semantics, and the next periodic audit re-detects the
+  same drift; no extra remote scans are introduced. When no current
+  audit flags the candidate, same-size crash recovery keeps working
+  unchanged. (P2) `NewAfterCutoff` now means actually-after-cutoff:
+  membership is decided by the cycle snapshot (a lightweight
+  `CutoffSnapshotRelativePaths` list on the SyncResult) instead of
+  "absent from persisted state" — pre-cutoff candidates deliberately
+  not stored in state (incompatible names, remote conflicts, audit
+  drift, failed/pending) are no longer miscounted as new, while a file
+  added after the snapshot with a backdated `LastWriteTime` still
+  counts (timestamps are never the membership test); the previous
+  round-3 expectation was corrected accordingly. (P2) The single-writer
+  assumption is now documented: `FileExists → PutFiles` is not a
+  distributed atomic operation and the BAZA lock is machine-wide, so
+  IncrementalAppendOnly requires exactly one writer per managed BAZA
+  remote root; the target-existence check is additionally repeated
+  immediately before `PutFiles` (after remote directory preparation) to
+  minimize the TOCTOU window, and no absolute distributed no-overwrite
+  guarantee is claimed. 13 new/updated behavioral self-tests.
 
 ## 5.0.0 — 2026-08-11
 

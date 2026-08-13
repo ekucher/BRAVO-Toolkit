@@ -478,6 +478,45 @@ function New-BRAVOBazaRemoteDirectoryRecursive {
     }
 }
 
+function Get-BRAVOBazaExistingRemoteUploadOutcome {
+    # Приватний хелпер (свідомо НЕ експортується): класифікація випадку
+    # "remote-шлях кандидата вже зайнятий". Викликається ДВІЧІ на
+    # кандидата — рання дешева перевірка і повторна безпосередньо перед
+    # PutFiles (мінімізація TOCTOU-вікна). Повертає $null, якщо remote
+    # відсутній (звичайний upload дозволено).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][object]$Entry,
+        [Parameter(Mandatory = $true)][string]$RemoteFullPath,
+        [switch]$DisallowRecovery
+    )
+
+    if (-not [bool]$Session.FileExists($RemoteFullPath)) {
+        return $null
+    }
+    $existingRemoteInfo = $Session.GetFileInfo($RemoteFullPath)
+    $existingRemoteSize = if ($null -ne $existingRemoteInfo) { [int64]$existingRemoteInfo.Length } else { [int64](-1) }
+    if ($DisallowRecovery) {
+        return [pscustomobject]@{
+            RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'AuditDrift'
+            Error = "remote-файл існує, але ПОТОЧНИЙ Full Audit явно позначив кандидата як pending — generic same-size recovery заборонено, перезапис заборонено (local $($Entry.Size) байт, remote $existingRemoteSize байт)"
+            Bytes = 0; RemoteSize = $existingRemoteSize
+        }
+    }
+    if ($existingRemoteSize -eq [int64]$Entry.Size) {
+        return [pscustomobject]@{
+            RelativePath = $Entry.RelativePath; Success = $true; Outcome = 'AlreadyRemote'
+            Error = $null; Bytes = 0; RemoteSize = $existingRemoteSize
+        }
+    }
+    return [pscustomobject]@{
+        RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'RemoteConflict'
+        Error = "remote-файл уже існує з іншим розміром (local $($Entry.Size) байт, remote $existingRemoteSize байт) — перезапис заборонено append-only контрактом"
+        Bytes = 0; RemoteSize = $existingRemoteSize
+    }
+}
+
 function Invoke-BRAVOBazaFileUpload {
     # Один цільовий upload + легка remote-верифікація (розмір) — O(1) per
     # candidate, не O(усі файли). $Session — injectable (WinSCP.Session або
@@ -508,7 +547,15 @@ function Invoke-BRAVOBazaFileUpload {
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][object]$Entry,
         [Parameter(Mandatory = $true)][string]$LocalDirectory,
-        [Parameter(Mandatory = $true)][string]$RemoteRootPath
+        [Parameter(Mandatory = $true)][string]$RemoteRootPath,
+        # P1 (round 4): кандидат, якого ПОТОЧНИЙ Full Audit явно позначив
+        # pending (UploadNew/UploadUpdate), не має права на generic
+        # AlreadyRemote same-size recovery: audit уже порівняв за
+        # -criteria=time,size і виніс вердикт "не збігається" — збіг ЛИШЕ
+        # розміру не сміє його мовчки скасувати. remote відсутній ->
+        # звичайний upload; remote існує -> Outcome=AuditDrift (нуль
+        # PutFiles, без перезапису).
+        [switch]$DisallowExistingRemoteRecovery
     )
 
     $remoteRelative = $Entry.RelativePath.Replace('\', '/')
@@ -517,22 +564,17 @@ function Invoke-BRAVOBazaFileUpload {
     $remoteDirectory = if ([string]::IsNullOrWhiteSpace($remoteDirectory)) { $RemoteRootPath } else { $remoteDirectory.Replace('\', '/') }
 
     try {
-        if ([bool]$Session.FileExists($remoteFullPath)) {
-            $existingRemoteInfo = $Session.GetFileInfo($remoteFullPath)
-            $existingRemoteSize = if ($null -ne $existingRemoteInfo) { [int64]$existingRemoteInfo.Length } else { [int64](-1) }
-            if ($existingRemoteSize -eq [int64]$Entry.Size) {
-                return [pscustomobject]@{
-                    RelativePath = $Entry.RelativePath; Success = $true; Outcome = 'AlreadyRemote'
-                    Error = $null; Bytes = 0; RemoteSize = $existingRemoteSize
-                }
-            }
-            return [pscustomobject]@{
-                RelativePath = $Entry.RelativePath; Success = $false; Outcome = 'RemoteConflict'
-                Error = "remote-файл уже існує з іншим розміром (local $($Entry.Size) байт, remote $existingRemoteSize байт) — перезапис заборонено append-only контрактом"
-                Bytes = 0; RemoteSize = $existingRemoteSize
-            }
-        }
+        $existingOutcome = Get-BRAVOBazaExistingRemoteUploadOutcome -Session $Session -Entry $Entry -RemoteFullPath $remoteFullPath -DisallowRecovery:$DisallowExistingRemoteRecovery
+        if ($null -ne $existingOutcome) { return $existingOutcome }
         New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $remoteDirectory
+        # P2 (round 4): повторна перевірка існування якнайближче до
+        # PutFiles (після підготовки remote-каталогів) — звужує TOCTOU-
+        # вікно FileExists...PutFiles. Це НЕ розподілена атомарна
+        # гарантія: локальний lock — machine-wide, не SFTP-wide;
+        # IncrementalAppendOnly вимагає РІВНО ОДНОГО writer-а на кожен
+        # керований BAZA remote root (див. OPERATIONS).
+        $existingOutcome = Get-BRAVOBazaExistingRemoteUploadOutcome -Session $Session -Entry $Entry -RemoteFullPath $remoteFullPath -DisallowRecovery:$DisallowExistingRemoteRecovery
+        if ($null -ne $existingOutcome) { return $existingOutcome }
         $transferOptions = New-Object WinSCP.TransferOptions
         $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
         # P1 (hardening round 2): resume вмикається ЯВНО, а не через
@@ -613,6 +655,16 @@ function New-BRAVOBazaSyncResult {
         # RemoteSize.
         RecoveredRemote = 0
         RemoteConflicts = @()
+        # P1 (round 4): кандидати, яких ПОТОЧНИЙ Full Audit позначив
+        # pending, але їхній remote-шлях зайнятий — generic same-size
+        # recovery для них заборонено (Action/Reason з audit + розміри).
+        AuditDriftFiles = @()
+        # P2 (round 4): відносні шляхи, ПРИСУТНІ у знімку цього циклу
+        # (cutoff-membership) — health-time NewAfterCutoff рахує лише
+        # файли, яких НЕ БУЛО в знімку, а не "відсутні в persisted state"
+        # (несумісні/конфліктні кандидати свідомо не потрапляють у state,
+        # але вони існували ДО cutoff і новими не є).
+        CutoffSnapshotRelativePaths = @()
         Status = 'ERROR'
         Error = $null
         Bootstrap = $false
@@ -663,6 +715,7 @@ function ConvertTo-BRAVOBazaFullAuditResult {
         return [pscustomobject]@{
             Success = $false; Error = $ComparisonError
             AlreadyMatchingRelativePaths = @(); LocalSizes = @{}; LastWriteTimesUtc = @{}
+            PendingItems = @()
         }
     }
 
@@ -676,6 +729,12 @@ function ConvertTo-BRAVOBazaFullAuditResult {
     # би в "already matching" замість "pending", і drift не виявлявся б.
     $normalizedRoot = ([IO.Path]::GetFullPath($LocalDirectory)).TrimEnd('\', '/')
     $pendingRelativePaths = New-Object System.Collections.Generic.HashSet[string]
+    # P1 (round 4): pending-вердикт БІЛЬШЕ НЕ втрачається редукцією до
+    # "already matching": PendingItems зберігає RelativePath + Action
+    # (UploadNew/UploadUpdate з WinSCP ComparisonDifference) + Reason, щоб
+    # цикл, який щойно отримав audit-вердикт, міг заборонити generic
+    # AlreadyRemote same-size recovery для явно pending кандидатів.
+    $pendingItems = New-Object System.Collections.Generic.List[object]
     foreach ($pendingFile in $PendingFiles) {
         if ([bool]$pendingFile.IsDirectory) { continue }
         $rawPath = [string]$pendingFile.Path
@@ -686,6 +745,13 @@ function ConvertTo-BRAVOBazaFullAuditResult {
         }
         $relative = $absolutePath.Substring($normalizedRoot.Length).TrimStart('\', '/')
         [void]$pendingRelativePaths.Add($relative)
+        $pendingAction = if ($null -ne $pendingFile.PSObject.Properties['Action']) { [string]$pendingFile.Action } else { $null }
+        $pendingReason = if ($null -ne $pendingFile.PSObject.Properties['Reason']) { [string]$pendingFile.Reason } else { $null }
+        [void]$pendingItems.Add([pscustomobject]@{
+            RelativePath = $relative
+            Action = $pendingAction
+            Reason = $pendingReason
+        })
     }
 
     $alreadyMatching = New-Object System.Collections.Generic.List[string]
@@ -704,6 +770,7 @@ function ConvertTo-BRAVOBazaFullAuditResult {
         AlreadyMatchingRelativePaths = $alreadyMatching.ToArray()
         LocalSizes = $localSizes
         LastWriteTimesUtc = $lastWriteTimesUtc
+        PendingItems = $pendingItems.ToArray()
     }
 }
 
@@ -756,6 +823,14 @@ function Invoke-BRAVOBazaSynchronization {
     $fullAuditAttemptedThisCycle = $false
     $fullAuditSucceededThisCycle = $false
     $fullAuditErrorThisCycle = $null
+    # P1 (round 4): вердикт Full Audit ЦЬОГО циклу — RelativePath ->
+    # PendingItem (Action/Reason). Кандидат, якого ПОТОЧНИЙ audit явно
+    # позначив pending (напр. UploadUpdate: той самий розмір, інший mtime),
+    # НЕ має права на generic AlreadyRemote same-size recovery — інакше
+    # цикл мовчки скасовував би щойно отриманий audit-вердикт. Мапа
+    # СВІДОМО scope-иться на поточний цикл (вердикти не персистяться в
+    # state) — між аудитами діє звичайна round-3 семантика.
+    $currentAuditPendingByPath = @{}
 
     if ($stateRead.Corrupt) {
         # P1-4 (deep review): пошкоджений/несумісний стан раніше ЗАВЖДИ
@@ -832,6 +907,12 @@ function Invoke-BRAVOBazaSynchronization {
         $isFirstRun = $false
         $bootstrapPerformed = $true
         $fullAuditSucceededThisCycle = $true
+        if ($null -ne $recoveryAudit.PSObject.Properties['PendingItems']) {
+            foreach ($auditPendingItem in @($recoveryAudit.PendingItems)) {
+                if ($null -eq $auditPendingItem) { continue }
+                $currentAuditPendingByPath[[string]$auditPendingItem.RelativePath] = $auditPendingItem
+            }
+        }
         $snapshot = $recoverySnapshot
     } else {
         $isFirstRun = -not $stateRead.Exists
@@ -942,6 +1023,12 @@ function Invoke-BRAVOBazaSynchronization {
                     # зникати мовчки.
                 } else {
                     $fullAuditSucceededThisCycle = $true
+                    if ($null -ne $auditResult.PSObject.Properties['PendingItems']) {
+                        foreach ($auditPendingItem in @($auditResult.PendingItems)) {
+                            if ($null -eq $auditPendingItem) { continue }
+                            $currentAuditPendingByPath[[string]$auditPendingItem.RelativePath] = $auditPendingItem
+                        }
+                    }
                     $auditMatchedSet = New-Object System.Collections.Generic.HashSet[string]
                     foreach ($matchedRelativePath in $auditResult.AlreadyMatchingRelativePaths) {
                         [void]$auditMatchedSet.Add($matchedRelativePath)
@@ -980,6 +1067,7 @@ function Invoke-BRAVOBazaSynchronization {
     $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $cutoffUtc
     $result.Bootstrap = $bootstrapPerformed
     $result.DiscoveredWithinCutoff = $snapshot.Entries.Count
+    $result.CutoffSnapshotRelativePaths = @($snapshot.Entries.Keys)
     $result.AlreadyVerified = $plan.TrustedSkip.Count
     $result.MutationViolations = $plan.MutationViolations
     $result.FullAuditAttempted = $fullAuditAttemptedThisCycle
@@ -993,6 +1081,7 @@ function Invoke-BRAVOBazaSynchronization {
     $failedFiles = New-Object System.Collections.Generic.List[object]
     $incompatibleFiles = New-Object System.Collections.Generic.List[object]
     $remoteConflicts = New-Object System.Collections.Generic.List[object]
+    $auditDriftFiles = New-Object System.Collections.Generic.List[object]
 
     foreach ($candidate in $plan.ToUpload) {
         # P2 (deep review): SFTP filename-compatibility — локальна ЛИШЕ
@@ -1011,8 +1100,22 @@ function Invoke-BRAVOBazaSynchronization {
             # мережеву/SFTP помилку, якої насправді не було.
             continue
         }
-        $uploadOutcome = Invoke-BRAVOBazaFileUpload -Session $Session -Entry $candidate -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath
-        if ($uploadOutcome.Outcome -eq 'AlreadyRemote') {
+        $candidateAuditPending = $currentAuditPendingByPath[$candidate.RelativePath]
+        $uploadOutcome = Invoke-BRAVOBazaFileUpload -Session $Session -Entry $candidate -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath -DisallowExistingRemoteRecovery:($null -ne $candidateAuditPending)
+        if ($uploadOutcome.Outcome -eq 'AuditDrift') {
+            # P1 (round 4): поточний audit явно позначив кандидата pending,
+            # а remote-шлях зайнятий — вердикт audit НЕ скасовується
+            # збігом розміру. Стан для кандидата не пишеться (Verified
+            # лишається false/відсутнім — чесний вердикт audit).
+            $auditDriftFiles.Add([pscustomobject]@{
+                RelativePath = $candidate.RelativePath
+                Action = if ($null -ne $candidateAuditPending) { $candidateAuditPending.Action } else { $null }
+                Reason = if ($null -ne $candidateAuditPending) { $candidateAuditPending.Reason } else { $null }
+                LocalSize = [int64]$candidate.Size
+                RemoteSize = $uploadOutcome.RemoteSize
+                Error = $uploadOutcome.Error
+            })
+        } elseif ($uploadOutcome.Outcome -eq 'AlreadyRemote') {
             # P1 (round 3): remote-файл уже існує з тим самим розміром —
             # crash-recovery випадок (upload попереднього циклу пройшов, а
             # state тоді не зберігся). Визнаємо Verified БЕЗ повторної
@@ -1065,6 +1168,7 @@ function Invoke-BRAVOBazaSynchronization {
     $result.PendingWithinCutoff = $failedFiles.Count
     $result.IncompatibleFiles = $incompatibleFiles.ToArray()
     $result.RemoteConflicts = $remoteConflicts.ToArray()
+    $result.AuditDriftFiles = $auditDriftFiles.ToArray()
 
     $completedUtc = (Get-Date).ToUniversalTime()
     $result.CompletedUtc = $completedUtc
@@ -1073,6 +1177,22 @@ function Invoke-BRAVOBazaSynchronization {
         $result.Status = 'INCOMPLETE'
     } elseif ($plan.MutationViolations.Count -gt 0 -and $MutationPolicy -eq 'Fail') {
         $result.Status = 'MUTATION_VIOLATION'
+    } elseif ($auditDriftFiles.Count -gt 0) {
+        # P1 (round 4): audit-вердикт не скасовано, але й не виконано —
+        # явний не-COMPLETE статус: provenance не просувається, checkpoint
+        # не публікується, Health -> CRITICAL. LastFullAuditUtc при цьому
+        # МІГ просунутись вище (audit УСПІШНО завершився і виявив drift) —
+        # це свіжість аудиту, НЕ успішність синхронізації.
+        $result.Status = 'AUDIT_DRIFT'
+        $auditDriftPreview = @(
+            $auditDriftFiles | Select-Object -First 3 | ForEach-Object {
+                "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)"
+            }
+        ) -join '; '
+        $result.Error = (
+            "$($auditDriftFiles.Count) кандидат(ів) позначені поточним Full Audit як pending, але їхні remote-шляхи вже зайняті: " +
+            "$auditDriftPreview — перезапис заборонено, generic same-size recovery не застосовується, цикл не вважається успішним"
+        )
     } elseif ($remoteConflicts.Count -gt 0) {
         # P1 (round 3): конфлікт із наявним remote-файлом іншого розміру —
         # явний не-COMPLETE статус: provenance успішного циклу не
@@ -1264,10 +1384,10 @@ function Update-BRAVOBazaSyncResultNewAfterCutoff {
         [Parameter(Mandatory = $true)][string]$StateRoot
     )
 
-    if ($SyncResult.Status -notin @('COMPLETE', 'INCOMPLETE', 'MUTATION_VIOLATION', 'INCOMPATIBLE_NAME', 'REMOTE_CONFLICT')) {
+    if ($SyncResult.Status -notin @('COMPLETE', 'INCOMPLETE', 'MUTATION_VIOLATION', 'INCOMPATIBLE_NAME', 'REMOTE_CONFLICT', 'AUDIT_DRIFT')) {
         # ERROR/STATE_INVALID: стан ненадійний або синхронізація взагалі не
         # відбулась — NewAfterCutoff тут не має сенсу, лишаємо 0.
-        # INCOMPATIBLE_NAME/REMOTE_CONFLICT (P2, round 3) дозволені: цикл
+        # INCOMPATIBLE_NAME/REMOTE_CONFLICT/AUDIT_DRIFT дозволені: цикл
         # реально відбувся і state збережено — локальна діагностика "скільки
         # файлів з'явилось після cutoff" для них так само валідна.
         return $SyncResult
@@ -1284,9 +1404,29 @@ function Update-BRAVOBazaSyncResultNewAfterCutoff {
         return $SyncResult
     }
 
+    # P2 (round 4): cutoff-membership — ЧЛЕНСТВО У ЗНІМКУ ЦЬОГО ЦИКЛУ, а
+    # не "відсутність у persisted state". Несумісні/конфліктні/audit-drift
+    # кандидати свідомо НЕ записуються в state, але вони існували ДО
+    # cutoff — "новими після cutoff" вони не є. І навпаки: файл, доданий
+    # ПІСЛЯ знімка з навмисно старим LastWriteTime (backdated), у знімку
+    # відсутній — отже, рахується (timestamp ніколи не є критерієм
+    # членства). Fallback на persisted state лишається лише для
+    # результатів без записаного знімка (порожній каталог на cutoff або
+    # синтетичний результат) — там обидва підходи еквівалентні.
+    $cutoffMembership = New-Object System.Collections.Generic.HashSet[string]
+    foreach ($cutoffSeenPath in @($SyncResult.CutoffSnapshotRelativePaths)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$cutoffSeenPath)) {
+            [void]$cutoffMembership.Add([string]$cutoffSeenPath)
+        }
+    }
+
     $newCount = 0
     foreach ($relativePath in $freshSnapshot.Entries.Keys) {
-        if (-not $stateRead.State.Files.ContainsKey($relativePath)) {
+        if ($cutoffMembership.Count -gt 0) {
+            if (-not $cutoffMembership.Contains($relativePath)) {
+                $newCount++
+            }
+        } elseif (-not $stateRead.State.Files.ContainsKey($relativePath)) {
             $newCount++
         }
     }
@@ -1428,13 +1568,32 @@ function Get-BRAVOBazaFastHealthResult {
         $names = ($SyncResult.IncompatibleFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) ($($_.Reason))" }) -join '; '
         "несумісні з SFTP імена: $(@($SyncResult.IncompatibleFiles).Count) файл(ів) — $names"
     } else { $null }
+    $auditDriftSummary = if (@($SyncResult.AuditDriftFiles).Count -gt 0) {
+        $names = ($SyncResult.AuditDriftFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; '
+        "audit-pending кандидати із зайнятим remote-шляхом: $(@($SyncResult.AuditDriftFiles).Count) файл(ів) — $names"
+    } else { $null }
 
     if ($SyncResult.Status -eq 'MUTATION_VIOLATION') {
         $names = ($SyncResult.MutationViolations | Select-Object -First 5 | ForEach-Object { $_.RelativePath }) -join ', '
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
             Message = "$($SyncResult.Component) — виявлено append-only invariant violation ($($SyncResult.MutationViolations.Count) файл(ів), напр.: $names) — передачу заблоковано, потрібне ручне рішення"
-            Info = @(@($conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
+            Info = @(@($auditDriftSummary, $conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
+        }
+    }
+    if (@($SyncResult.AuditDriftFiles).Count -gt 0) {
+        # P1 (round 4): поточний Full Audit позначив кандидата pending, а
+        # його remote-шлях зайнятий — вердикт audit не можна мовчки
+        # скасувати збігом розміру; точний шлях, audit Action і обидва
+        # розміри у повідомленні.
+        return [pscustomobject]@{
+            Level = 'CRITICAL'; Healthy = $false
+            Message = (
+                "$($SyncResult.Component) — $(@($SyncResult.AuditDriftFiles).Count) кандидат(ів) позначені поточним Full Audit як pending, але їхні remote-шляхи вже зайняті: " +
+                (($SyncResult.AuditDriftFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) [$($_.Action)] (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; ') +
+                " — перезапис заборонено, потрібне ручне рішення оператора"
+            )
+            Info = @(@($mutationSummary, $conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
         }
     }
     if (@($SyncResult.RemoteConflicts).Count -gt 0) {
@@ -1448,7 +1607,7 @@ function Get-BRAVOBazaFastHealthResult {
                 (($SyncResult.RemoteConflicts | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) (local $($_.LocalSize) байт, remote $($_.RemoteSize) байт)" }) -join '; ') +
                 " — перезапис заборонено append-only контрактом, потрібне ручне рішення оператора"
             )
-            Info = @(@($mutationSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
+            Info = @(@($mutationSummary, $auditDriftSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
         }
     }
     if ($SyncResult.Failed -gt 0 -or $SyncResult.PendingWithinCutoff -gt 0) {
@@ -1460,7 +1619,7 @@ function Get-BRAVOBazaFastHealthResult {
                 "Виявлено: $($SyncResult.DiscoveredWithinCutoff) • Передано: $($SyncResult.Uploaded) • " +
                 "Не передано: $($SyncResult.Failed)$(if ($failedNames) { " ($failedNames)" })"
             )
-            Info = @(@($mutationSummary, $conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
+            Info = @(@($mutationSummary, $auditDriftSummary, $conflictSummary, $incompatibleSummary) | Where-Object { $null -ne $_ })
         }
     }
     if (@($SyncResult.IncompatibleFiles).Count -gt 0) {
@@ -1471,7 +1630,7 @@ function Get-BRAVOBazaFastHealthResult {
                 "$($SyncResult.Component) — $(@($SyncResult.IncompatibleFiles).Count) файл(ів) не передано через несумісність імені з SFTP " +
                 "(потребує ручного скорочення локального імені): $incompatibleNames"
             )
-            Info = @(@($mutationSummary, $conflictSummary) | Where-Object { $null -ne $_ })
+            Info = @(@($mutationSummary, $auditDriftSummary, $conflictSummary) | Where-Object { $null -ne $_ })
         }
     }
 

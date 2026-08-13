@@ -15843,7 +15843,10 @@ function Write-BRAVOLog {
             $hr3CpFailHealth.Healthy -eq $true -and $hr3CpFailHealth.Level -eq 'WARNING'
         ) -Name 'BazaSync/CheckpointRemovalFailureReportsPublishedFalse' -Failure "збій RemoveFiles попереднього checkpoint (IsSuccess=false, без винятку) має дати Published=false + WARNING, старий checkpoint лишається; First=$($hr3CpFirst.Published) Second=$($hr3CpSecond.Published) Error=$($hr3CpSecond.Error) Healthy=$($hr3CpFailHealth.Healthy) Level=$($hr3CpFailHealth.Level)"
 
-        # NewAfterCutoff діагностика доступна і для INCOMPATIBLE_NAME циклів
+        # NewAfterCutoff діагностика доступна і для INCOMPATIBLE_NAME циклів.
+        # P2 (round 4): membership рахується за ЗНІМКОМ ЦИКЛУ, не за
+        # persisted state -- pre-cutoff несумісний файл (свідомо не
+        # записаний у state) НЕ є "новим після cutoff".
         $hr3NacRoot = Join-Path $bazaSyncTestRoot "HR3_Nac"
         $hr3NacLocal = Join-Path $hr3NacRoot "local"
         $hr3NacState = Join-Path $hr3NacRoot "state"
@@ -15851,12 +15854,15 @@ function Write-BRAVOLog {
         New-BRAVOSelfTestBazaFile -Directory $hr3NacLocal -RelativePath "f_ok.txt" -SizeBytes 10 | Out-Null
         New-BRAVOSelfTestBazaFile -Directory $hr3NacLocal -RelativePath "$drUtf8Name.txt" -SizeBytes 10 | Out-Null
         $hr3NacResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr3NacLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr3NacState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
-        New-BRAVOSelfTestBazaFile -Directory $hr3NacLocal -RelativePath "extra_after.txt" -SizeBytes 10 | Out-Null
-        $hr3NacUpdated = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr3NacResult -LocalDirectory $hr3NacLocal -StateRoot $hr3NacState
+        $hr3NacBeforeExtra = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr3NacResult -LocalDirectory $hr3NacLocal -StateRoot $hr3NacState
         Test-BRAVOCondition -Condition (
             $hr3NacResult.Status -eq 'INCOMPATIBLE_NAME' -and
-            $hr3NacUpdated.NewAfterCutoff -eq 2
-        ) -Name 'BazaSync/NewAfterCutoffCountsForIncompatibleNameCycles' -Failure "INCOMPATIBLE_NAME цикл має отримувати ту саму локальну NewAfterCutoff-діагностику (тут: несумісний файл поза state + 1 новий = 2); Status=$($hr3NacResult.Status) NewAfterCutoff=$($hr3NacUpdated.NewAfterCutoff)"
+            $hr3NacBeforeExtra.NewAfterCutoff -eq 0
+        ) -Name 'BazaSync/IncompatibleBeforeCutoffNotCountedAsNewAfterCutoff' -Failure "pre-cutoff несумісний файл був у знімку циклу -- він НЕ 'новий після cutoff', хоч і відсутній у state; Status=$($hr3NacResult.Status) NewAfterCutoff=$($hr3NacBeforeExtra.NewAfterCutoff)"
+        New-BRAVOSelfTestBazaFile -Directory $hr3NacLocal -RelativePath "extra_after.txt" -SizeBytes 10 | Out-Null
+        $hr3NacUpdated = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr3NacResult -LocalDirectory $hr3NacLocal -StateRoot $hr3NacState
+        Test-BRAVOCondition -Condition ($hr3NacUpdated.NewAfterCutoff -eq 1) `
+            -Name 'BazaSync/NewAfterCutoffCountsForIncompatibleNameCycles' -Failure "INCOMPATIBLE_NAME цикл отримує NewAfterCutoff-діагностику: лише РЕАЛЬНО доданий після знімка файл (1), БЕЗ pre-cutoff несумісного; NewAfterCutoff=$($hr3NacUpdated.NewAfterCutoff)"
 
         # мутації та несумісні імена в одному циклі: обидві категорії видимі
         $hr3DualResult = New-BRAVOBazaSyncResult -Component 'BAZA_APP' -CycleId 'hr3-dual' -StartedUtc (Get-Date) -CutoffUtc (Get-Date)
@@ -15869,6 +15875,165 @@ function Write-BRAVOLog {
             $hr3DualHealth.Message -match 'mutated\.txt' -and
             (($hr3DualHealth.Info -join ' ') -match 'badname\.txt')
         ) -Name 'BazaSync/MutationAndIncompatibleBothSurfacedInHealth' -Failure "при співіснуванні мутацій і несумісних імен ОБИДВІ категорії мають бути видимі (одна в Message, друга в Info); Message=$($hr3DualHealth.Message) Info=$($hr3DualHealth.Info -join '; ')"
+
+        # =======================================================================
+        # HARDENING ROUND 4, P1: вердикт ПОТОЧНОГО Full Audit переважає
+        # generic AlreadyRemote same-size recovery (audit порівнює за
+        # time,size -- збіг ЛИШЕ розміру не сміє скасувати його вердикт)
+        # =======================================================================
+        # bootstrap: audit явно позначив drifted.txt як UploadUpdate (той
+        # самий розмір, інший mtime на remote) -- recovery заборонено
+        $hr4BootRoot = Join-Path $bazaSyncTestRoot "HR4_Boot"
+        $hr4BootLocal = Join-Path $hr4BootRoot "local"
+        $hr4BootState = Join-Path $hr4BootRoot "state"
+        New-Item -ItemType Directory -Path $hr4BootLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4BootLocal -RelativePath "drifted.txt" -SizeBytes 100 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4BootLocal -RelativePath "other.txt" -SizeBytes 60 | Out-Null
+        $hr4BootProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{
+                IsDirectory = $false
+                Path = (Join-Path $hr4BootLocal "drifted.txt")
+                Action = 'UploadUpdate'
+                Reason = 'розбіжність часу (той самий розмір)'
+            }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr4BootLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr4BootSession = New-BRAVOSelfTestFakeBazaSession
+        $hr4BootSession.State.RemoteSizes['/baza_app/drifted.txt'] = [int64]100
+        $hr4BootResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4BootLocal -RemoteRootPath '/baza_app' -Session $hr4BootSession -StateRoot $hr4BootState -BootstrapIfNeeded -FullAuditProvider $hr4BootProvider
+        $hr4BootStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr4BootState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $hr4BootResult.Status -eq 'AUDIT_DRIFT' -and
+            $hr4BootResult.RecoveredRemote -eq 0 -and $hr4BootResult.Uploaded -eq 0 -and
+            (@($hr4BootResult.AuditDriftFiles).Count -eq 1) -and
+            $hr4BootResult.AuditDriftFiles[0].RelativePath -eq 'drifted.txt' -and
+            [int64]$hr4BootResult.AuditDriftFiles[0].RemoteSize -eq 100 -and
+            $hr4BootStateRead.State.Files.ContainsKey('other.txt') -and
+            [bool]$hr4BootStateRead.State.Files['other.txt'].Verified -eq $true -and
+            -not $hr4BootStateRead.State.Files.ContainsKey('drifted.txt')
+        ) -Name 'BazaSync/BootstrapAuditPendingSameSizeRemoteIsNotRecovered' -Failure "bootstrap: audit-pending кандидат із same-size remote НЕ recovery-иться і НЕ сідиться Verified (non-pending other.txt сідиться нормально); Status=$($hr4BootResult.Status) Recovered=$($hr4BootResult.RecoveredRemote) Drift=$(@($hr4BootResult.AuditDriftFiles).Count)"
+
+        Test-BRAVOCondition -Condition (
+            $hr4BootResult.RecoveredRemote -eq 0 -and
+            $hr4BootResult.AuditDriftFiles[0].Action -eq 'UploadUpdate'
+        ) -Name 'BazaSync/FullAuditUploadUpdateCandidateNeverBecomesAlreadyRemote' -Failure "UploadUpdate-кандидат НІКОЛИ не стає AlreadyRemote (audit Action зберігається у драфт-записі); Recovered=$($hr4BootResult.RecoveredRemote) Action=$($hr4BootResult.AuditDriftFiles[0].Action)"
+
+        Test-BRAVOCondition -Condition ($hr4BootSession.State.PutFilesCallCount -eq 0) `
+            -Name 'BazaSync/AuditPendingRemoteExistingMakesZeroPutFilesCalls' -Failure "audit-pending + remote існує -> НУЛЬ PutFiles (жодного перезапису); отримано $($hr4BootSession.State.PutFilesCallCount)"
+
+        Test-BRAVOCondition -Condition ($hr4BootResult.Status -ne 'COMPLETE' -and $hr4BootResult.Status -eq 'AUDIT_DRIFT') `
+            -Name 'BazaSync/AuditPendingDoesNotProduceComplete' -Failure "audit-pending drift не сміє давати COMPLETE; Status=$($hr4BootResult.Status)"
+
+        $hr4BootCheckpointSession = New-BRAVOSelfTestFakeBazaSession
+        $hr4BootCheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr4BootCheckpointSession -RemoteRootPath '/baza_app' -SyncResult $hr4BootResult
+        Test-BRAVOCondition -Condition (
+            $hr4BootCheckpointOutcome.Attempted -eq $false -and $hr4BootCheckpointOutcome.Published -eq $false -and
+            $hr4BootCheckpointSession.State.PutFilesCallCount -eq 0 -and
+            $hr4BootCheckpointSession.State.MoveFileCalls.Count -eq 0
+        ) -Name 'BazaSync/AuditPendingDoesNotPublishCheckpoint' -Failure "AUDIT_DRIFT цикл не публікує successful checkpoint; Attempted=$($hr4BootCheckpointOutcome.Attempted)"
+
+        $hr4BootHealth = Get-BRAVOBazaFastHealthResult -SyncResult $hr4BootResult
+        Test-BRAVOCondition -Condition (
+            $hr4BootHealth.Healthy -eq $false -and $hr4BootHealth.Level -eq 'CRITICAL' -and
+            $hr4BootHealth.Message -match 'drifted\.txt' -and $hr4BootHealth.Message -match 'UploadUpdate'
+        ) -Name 'BazaSync/AuditDriftHealthIsCriticalWithActionAndSizes' -Failure "Health для AUDIT_DRIFT: CRITICAL з точним шляхом і audit Action; Healthy=$($hr4BootHealth.Healthy) Level=$($hr4BootHealth.Level) Message=$($hr4BootHealth.Message)"
+
+        # періодичний audit: той самий same-size drift на вже Verified файлі
+        $hr4PerRoot = Join-Path $bazaSyncTestRoot "HR4_Periodic"
+        $hr4PerLocal = Join-Path $hr4PerRoot "local"
+        $hr4PerState = Join-Path $hr4PerRoot "state"
+        New-Item -ItemType Directory -Path $hr4PerLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4PerLocal -RelativePath "drifted2.txt" -SizeBytes 80 | Out-Null
+        $hr4PerCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4PerLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr4PerState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $hr4PerStateBefore = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr4PerState -Component 'BAZA_APP')
+        $hr4PerProvenanceUtc = [string]$hr4PerStateBefore.State.LastSuccessfulSyncUtc
+        $hr4PerAuditUtcBefore = [string]$hr4PerStateBefore.State.LastFullAuditUtc
+        $hr4PerProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{
+                IsDirectory = $false
+                Path = (Join-Path $hr4PerLocal "drifted2.txt")
+                Action = 'UploadUpdate'
+                Reason = 'remote mtime відрізняється'
+            }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr4PerLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr4PerSession2 = New-BRAVOSelfTestFakeBazaSession
+        $hr4PerSession2.State.RemoteSizes['/baza_app/drifted2.txt'] = [int64]80
+        $hr4PerResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4PerLocal -RemoteRootPath '/baza_app' -Session $hr4PerSession2 -StateRoot $hr4PerState -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr4PerProvider
+        $hr4PerStateAfter = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr4PerState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $hr4PerCycle1.Status -eq 'COMPLETE' -and
+            $hr4PerResult2.Status -eq 'AUDIT_DRIFT' -and
+            $hr4PerSession2.State.PutFilesCallCount -eq 0 -and
+            $hr4PerStateAfter.State.Files.ContainsKey('drifted2.txt') -and
+            [bool]$hr4PerStateAfter.State.Files['drifted2.txt'].Verified -eq $false
+        ) -Name 'BazaSync/PeriodicFullAuditSameSizeDriftIsNotRecovered' -Failure "періодичний audit-pending drift (same size) НЕ recovery-иться: AUDIT_DRIFT, 0 PutFiles, Verified лишається false; Status=$($hr4PerResult2.Status) PutFiles=$($hr4PerSession2.State.PutFilesCallCount)"
+
+        Test-BRAVOCondition -Condition (
+            -not [string]::IsNullOrWhiteSpace($hr4PerProvenanceUtc) -and
+            [string]$hr4PerStateAfter.State.LastSuccessfulSyncUtc -ceq $hr4PerProvenanceUtc -and
+            [string]$hr4PerStateAfter.State.LastFullAuditUtc -cne $hr4PerAuditUtcBefore
+        ) -Name 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc' -Failure "AUDIT_DRIFT: LastSuccessfulSyncUtc НЕ просувається, але LastFullAuditUtc МОЖЕ (audit успішно завершився і виявив drift -- свіжість аудиту != успіх синхронізації); Provenance=$($hr4PerStateAfter.State.LastSuccessfulSyncUtc) було=$hr4PerProvenanceUtc AuditUtc=$($hr4PerStateAfter.State.LastFullAuditUtc)"
+
+        # audit підтвердив збіг -> сідиться Verified без жодного upload
+        $hr4SeedRoot = Join-Path $bazaSyncTestRoot "HR4_Seed"
+        $hr4SeedLocal = Join-Path $hr4SeedRoot "local"
+        New-Item -ItemType Directory -Path $hr4SeedLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4SeedLocal -RelativePath "match.txt" -SizeBytes 70 | Out-Null
+        $hr4SeedProvider = {
+            param($Snapshot)
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr4SeedLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr4SeedSession = New-BRAVOSelfTestFakeBazaSession
+        $hr4SeedResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4SeedLocal -RemoteRootPath '/baza_app' -Session $hr4SeedSession -StateRoot (Join-Path $hr4SeedRoot "state") -BootstrapIfNeeded -FullAuditProvider $hr4SeedProvider
+        $hr4SeedStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot (Join-Path $hr4SeedRoot "state") -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $hr4SeedResult.Status -eq 'COMPLETE' -and $hr4SeedResult.Uploaded -eq 0 -and
+            $hr4SeedSession.State.PutFilesCallCount -eq 0 -and
+            [bool]$hr4SeedStateRead.State.Files['match.txt'].Verified -eq $true
+        ) -Name 'BazaSync/FullAuditMatchingFileSeedsVerifiedWithZeroUpload' -Failure "файл, який audit підтвердив як matching, сідиться Verified=true з НУЛЕМ upload; Status=$($hr4SeedResult.Status) Uploaded=$($hr4SeedResult.Uploaded) PutFiles=$($hr4SeedSession.State.PutFilesCallCount)"
+
+        # =======================================================================
+        # HARDENING ROUND 4, P2: NewAfterCutoff = членство у знімку циклу
+        # =======================================================================
+        Test-BRAVOCondition -Condition (
+            ((Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr3ConfResult -LocalDirectory $hr3ConfLocal -StateRoot $hr3ConfState).NewAfterCutoff) -eq 0
+        ) -Name 'BazaSync/RemoteConflictBeforeCutoffNotCountedAsNewAfterCutoff' -Failure "pre-cutoff конфліктний кандидат був у знімку циклу -- він НЕ 'новий після cutoff', хоч і відсутній у state; NewAfterCutoff=$($hr3ConfResult.NewAfterCutoff)"
+
+        $hr4PendRoot = Join-Path $bazaSyncTestRoot "HR4_Pend"
+        $hr4PendLocal = Join-Path $hr4PendRoot "local"
+        $hr4PendState = Join-Path $hr4PendRoot "state"
+        New-Item -ItemType Directory -Path $hr4PendLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4PendLocal -RelativePath "bad_p.txt" -SizeBytes 10 | Out-Null
+        $hr4PendResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4PendLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession -FailOnRelativePaths @('bad_p.txt')) -StateRoot $hr4PendState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $hr4PendUpdated = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr4PendResult -LocalDirectory $hr4PendLocal -StateRoot $hr4PendState
+        Test-BRAVOCondition -Condition (
+            $hr4PendResult.Status -eq 'INCOMPLETE' -and $hr4PendUpdated.NewAfterCutoff -eq 0
+        ) -Name 'BazaSync/PendingBeforeCutoffNotCountedAsNewAfterCutoff' -Failure "pre-cutoff failed/pending файл був у знімку циклу -- він НЕ 'новий після cutoff'; Status=$($hr4PendResult.Status) NewAfterCutoff=$($hr4PendUpdated.NewAfterCutoff)"
+
+        $hr4NacRoot = Join-Path $bazaSyncTestRoot "HR4_Nac"
+        $hr4NacLocal = Join-Path $hr4NacRoot "local"
+        $hr4NacState = Join-Path $hr4NacRoot "state"
+        New-Item -ItemType Directory -Path $hr4NacLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4NacLocal -RelativePath "a.txt" -SizeBytes 10 | Out-Null
+        $hr4NacResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4NacLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr4NacState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        New-BRAVOSelfTestBazaFile -Directory $hr4NacLocal -RelativePath "fresh_new.txt" -SizeBytes 10 | Out-Null
+        $hr4NacUpdated = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr4NacResult -LocalDirectory $hr4NacLocal -StateRoot $hr4NacState
+        Test-BRAVOCondition -Condition ($hr4NacUpdated.NewAfterCutoff -eq 1) `
+            -Name 'BazaSync/OneActuallyNewAfterCutoffCountsOne' -Failure "рівно один РЕАЛЬНО доданий після знімка файл -> NewAfterCutoff=1; отримано $($hr4NacUpdated.NewAfterCutoff)"
+
+        $hr4BackRoot = Join-Path $bazaSyncTestRoot "HR4_Back"
+        $hr4BackLocal = Join-Path $hr4BackRoot "local"
+        $hr4BackState = Join-Path $hr4BackRoot "state"
+        New-Item -ItemType Directory -Path $hr4BackLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr4BackLocal -RelativePath "b.txt" -SizeBytes 10 | Out-Null
+        $hr4BackResult = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr4BackLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr4BackState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        New-BRAVOSelfTestBazaFile -Directory $hr4BackLocal -RelativePath "backdated_new.txt" -SizeBytes 10 -LastWriteTimeUtc ([datetime]::Parse('2001-03-03T03:03:03Z').ToUniversalTime()) | Out-Null
+        $hr4BackUpdated = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr4BackResult -LocalDirectory $hr4BackLocal -StateRoot $hr4BackState
+        Test-BRAVOCondition -Condition ($hr4BackUpdated.NewAfterCutoff -eq 1) `
+            -Name 'BazaSync/BackdatedFileAddedAfterSnapshotStillCountsAsNewAfterCutoff' -Failure "файл, доданий ПІСЛЯ знімка зі старим LastWriteTime, все одно рахується (membership -- знімок, не timestamp); отримано $($hr4BackUpdated.NewAfterCutoff)"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue
