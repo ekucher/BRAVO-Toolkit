@@ -1940,6 +1940,14 @@ function Invoke-BRAVOBazaComponentSyncSession {
 
     $session = $null
     try {
+        # Guard (acceptance DEV-LIMS, 2026-08-13): .NET-асемблі потрібен
+        # САМЕ winscp.exe. Якщо сюди передати WinSCP.com (консольний
+        # CLI-стаб), Session.Open запускає ІНТЕРАКТИВНУ консоль — у вікні
+        # оператора з'являється голий промпт "winscp>", а сесія висне з
+        # CPU~0 до таймауту. Fail fast із точною причиною замість зависання.
+        if ([IO.Path]::GetFileName($WinSCPExecutablePath) -match '(?i)^winscp\.com$') {
+            throw "WinSCPExecutablePath вказує на WinSCP.com ($WinSCPExecutablePath) — .NET-асемблі WinSCP потрібен winscp.exe; з .com-стабом сесія зависає на інтерактивному промпті winscp>. Використайте Get-BRAVOWinSCPDotNetComponents для резолвінгу пари dll+exe."
+        }
         if ($null -eq ('WinSCP.Session' -as [type])) {
             Add-Type -Path $WinSCPAssemblyPath -ErrorAction Stop
         }

@@ -16481,6 +16481,28 @@ function Write-BRAVOLog {
             [bool]$hr6MkStateAfterC.State.AuditReconciliationPending -eq $true -and
             [bool]$hr6MkStateAfterE.State.AuditReconciliationPending -eq $false
         ) -Name 'BazaSync/PendingAuditMarkerClearsOnlyAfterSuccessfulFinalSave' -Failure "маркер знімається ЛИШЕ успішним фінальним збереженням: після збою -- true, після успішної реконсиляції -- false; AfterC=$($hr6MkStateAfterC.State.AuditReconciliationPending) AfterE=$($hr6MkStateAfterE.State.AuditReconciliationPending)"
+
+        # =======================================================================
+        # ACCEPTANCE DEV-LIMS: WinSCP.com-стаб замість winscp.exe -- сесія
+        # зависала на інтерактивному промпті "winscp>" (CPU~0)
+        # =======================================================================
+        $accComStubResult = Invoke-BRAVOBazaComponentSyncSession `
+            -Component 'BAZA_APP' -LocalDirectory $bazaSyncTestRoot -RemoteRootPath '/baza_app' `
+            -RepositorySFTPUrl 'sftp://fake' -HostKey 'fake' `
+            -WinSCPAssemblyPath 'unused' -WinSCPExecutablePath 'C:\fake\Tools\WinSCP.com' `
+            -StateRoot (Join-Path $bazaSyncTestRoot "ACC_ComStub")
+        Test-BRAVOCondition -Condition (
+            $accComStubResult.Status -eq 'ERROR' -and
+            $accComStubResult.Error -match 'winscp\.exe' -and
+            $accComStubResult.Error -match 'WinSCP\.com'
+        ) -Name 'BazaSync/ComStubExecutableFailsFastInsteadOfHanging' -Failure "WinSCP.com як ExecutablePath має давати миттєвий контрольований ERROR з поясненням (потрібен winscp.exe), а не зависання на промпті winscp>; Status=$($accComStubResult.Status) Error=$($accComStubResult.Error)"
+
+        Test-BRAVOCondition -Condition (
+            $bazaArchiveScriptText.Contains('$winSCPComponents = Get-BRAVOWinSCPDotNetComponents') -and
+            $bazaArchiveScriptText.Contains('-WinSCPExecutablePath $winSCPComponents.ExecutablePath') -and
+            $bazaArchiveScriptText.Contains('-WinSCPAssemblyPath $winSCPComponents.AssemblyPath') -and
+            -not $bazaArchiveScriptText.Contains('-WinSCPExecutablePath $winSCPPath')
+        ) -Name 'BazaSync/ArchiveWiringResolvesRealWinSCPExeForEngine' -Failure 'Invoke-BRAVOBazaIncrementalSync має резолвити пару dll+exe через Get-BRAVOWinSCPDotNetComponents (та сама, що legacy Get-BAZASFTPComparison), а НЕ передавати сирий $winSCPPath (WinSCP.com) у -WinSCPExecutablePath'
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

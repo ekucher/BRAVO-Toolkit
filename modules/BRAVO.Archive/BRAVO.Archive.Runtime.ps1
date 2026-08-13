@@ -4981,14 +4981,34 @@ function Invoke-BRAVOBazaIncrementalSync {
         }
     )
 
+    # Acceptance DEV-LIMS (2026-08-13): .NET-асемблі потрібен winscp.exe,
+    # а $winSCPPath комплекту — це Tools\WinSCP.com (CLI-стаб для
+    # legacy-шляхів): із ним Session.Open зависав на інтерактивному
+    # промпті "winscp>" (CPU~0, лог мовчить). Резолвимо ТУ САМУ пару
+    # dll+exe, що її вже роками використовує Get-BAZASFTPComparison.
+    $winSCPComponents = Get-BRAVOWinSCPDotNetComponents `
+        -WinSCPAssemblyPath ([string]$winSCPAssemblyPath) `
+        -WinSCPPath ([string]$winSCPPath)
+    if ($null -eq $winSCPComponents) {
+        $componentsFailure = New-BRAVOBazaSyncResult `
+            -Component $Component `
+            -CycleId (New-BRAVOBazaCycleId) `
+            -StartedUtc (Get-Date).ToUniversalTime() `
+            -CutoffUtc (Get-Date).ToUniversalTime()
+        $componentsFailure.Status = 'ERROR'
+        $componentsFailure.Error = 'не знайдено сумісну пару WinSCPnet.dll та WinSCP.exe для incremental BAZA sync'
+        $componentsFailure.CompletedUtc = (Get-Date).ToUniversalTime()
+        return $componentsFailure
+    }
+
     return Invoke-BRAVOBazaComponentSyncSession `
         -Component $Component `
         -LocalDirectory $LocalDirectory `
         -RemoteRootPath $remotePath `
         -RepositorySFTPUrl $sftpUrl `
         -HostKey $sftpHostKey `
-        -WinSCPAssemblyPath $winSCPAssemblyPath `
-        -WinSCPExecutablePath $winSCPPath `
+        -WinSCPAssemblyPath $winSCPComponents.AssemblyPath `
+        -WinSCPExecutablePath $winSCPComponents.ExecutablePath `
         -StateRoot $stateRootPath `
         -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
         -OperationTimeoutSeconds $operationTimeoutSeconds `

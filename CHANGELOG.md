@@ -605,6 +605,25 @@ Invariants below).
   guard (`Diagnostics/NoHalfFormattedStringConcatenation`) now fails on
   any `+` expression whose right operand is a `-f` format while the left
   side still contains unformatted `{N}` placeholders.
+- Fix the third real-SFTP acceptance blocker (DEV-LIMS, scenario 1
+  retry): after the if-as-command fix the BAZA phase started but hung
+  indefinitely — bare interactive `winscp>` prompts leaked to the
+  operator console, spawned WinSCP processes sat at ~0 CPU and the log
+  stopped at the BAZA sync section header. Root cause:
+  `Invoke-BRAVOBazaIncrementalSync` passed the bundle's `$winSCPPath`
+  (`Tools\WinSCP.com`, the console CLI stub used by legacy flows)
+  straight into `Session.ExecutablePath`, while the WinSCP .NET assembly
+  requires `winscp.exe` — with the `.com` stub the child starts an
+  interactive console and the session handshake never completes. The
+  wiring now resolves the same dll+exe pair the legacy
+  `Get-BAZASFTPComparison` has always used
+  (`Get-BRAVOWinSCPDotNetComponents`), with a controlled `ERROR`
+  SyncResult when no compatible pair is found, and
+  `Invoke-BRAVOBazaComponentSyncSession` gained a defense-in-depth
+  guard: an ExecutablePath pointing at `WinSCP.com` fails fast with an
+  explanatory `ERROR` instead of hanging. Behavioral + structural tests
+  added (`ComStubExecutableFailsFastInsteadOfHanging`,
+  `ArchiveWiringResolvesRealWinSCPExeForEngine`).
 
 ## 5.0.0 — 2026-08-11
 
