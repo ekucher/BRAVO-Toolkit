@@ -664,7 +664,11 @@ function New-BRAVOBazaSyncResult {
         # файли, яких НЕ БУЛО в знімку, а не "відсутні в persisted state"
         # (несумісні/конфліктні кандидати свідомо не потрапляють у state,
         # але вони існували ДО cutoff і новими не є).
-        CutoffSnapshotRelativePaths = @()
+        # P2 (round 5): $null — СЕНТИНЕЛ "знімок недоступний" (цикл не
+        # дійшов до знімка або результат синтетичний) -> fallback на
+        # persisted state; @() — ВАЛІДНИЙ знімок порожнього каталогу,
+        # membership авторитетний (порожній != недоступний).
+        CutoffSnapshotRelativePaths = $null
         Status = 'ERROR'
         Error = $null
         Bootstrap = $false
@@ -1101,20 +1105,67 @@ function Invoke-BRAVOBazaSynchronization {
             continue
         }
         $candidateAuditPending = $currentAuditPendingByPath[$candidate.RelativePath]
-        $uploadOutcome = Invoke-BRAVOBazaFileUpload -Session $Session -Entry $candidate -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath -DisallowExistingRemoteRecovery:($null -ne $candidateAuditPending)
+        # P1 (round 5): audit-вердикт СТІЙКИЙ між циклами. Раніше заборона
+        # generic recovery жила лише в пам'яті циклу, в якому audit
+        # виконався: НАСТУПНИЙ звичайний цикл (без власного аудиту) бачив
+        # Verified=false, remote same-size — і мовчки "відновлював" файл,
+        # скасовуючи авторитетний вердикт попереднього Full Audit
+        # (false-green вікно до наступного планового аудиту). Тепер
+        # AUDIT_DRIFT персистує мінімальний блокер у state-записі шляху —
+        # звичайні unverified/pending записи (без BlockReason) лишаються
+        # придатними до звичайного crash-recovery.
+        $candidateStateEntry = $state.Files[$candidate.RelativePath]
+        $persistedAuditBlock = (
+            $null -ne $candidateStateEntry -and
+            $null -ne $candidateStateEntry.PSObject.Properties['BlockReason'] -and
+            [string]$candidateStateEntry.BlockReason -eq 'AuditDrift'
+        )
+        $recoveryDisallowed = ($null -ne $candidateAuditPending) -or $persistedAuditBlock
+        $uploadOutcome = Invoke-BRAVOBazaFileUpload -Session $Session -Entry $candidate -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath -DisallowExistingRemoteRecovery:$recoveryDisallowed
         if ($uploadOutcome.Outcome -eq 'AuditDrift') {
-            # P1 (round 4): поточний audit явно позначив кандидата pending,
-            # а remote-шлях зайнятий — вердикт audit НЕ скасовується
-            # збігом розміру. Стан для кандидата не пишеться (Verified
-            # лишається false/відсутнім — чесний вердикт audit).
+            $blockAction = if ($null -ne $candidateAuditPending) {
+                $candidateAuditPending.Action
+            } elseif ($persistedAuditBlock -and $null -ne $candidateStateEntry.PSObject.Properties['AuditAction']) {
+                [string]$candidateStateEntry.AuditAction
+            } else { $null }
+            $blockReasonText = if ($null -ne $candidateAuditPending) {
+                $candidateAuditPending.Reason
+            } elseif ($persistedAuditBlock -and $null -ne $candidateStateEntry.PSObject.Properties['AuditReason']) {
+                [string]$candidateStateEntry.AuditReason
+            } else { $null }
+            $blockDetectedUtc = if ($persistedAuditBlock -and $null -ne $candidateStateEntry.PSObject.Properties['AuditDetectedUtc'] -and
+                -not [string]::IsNullOrWhiteSpace([string]$candidateStateEntry.AuditDetectedUtc)) {
+                # Первинна дата виявлення дрейфу зберігається — доказ віку
+                # проблеми, а не дата останнього повторного спрацювання.
+                [string]$candidateStateEntry.AuditDetectedUtc
+            } else {
+                $startedUtc.ToString('o')
+            }
             $auditDriftFiles.Add([pscustomobject]@{
                 RelativePath = $candidate.RelativePath
-                Action = if ($null -ne $candidateAuditPending) { $candidateAuditPending.Action } else { $null }
-                Reason = if ($null -ne $candidateAuditPending) { $candidateAuditPending.Reason } else { $null }
+                Action = $blockAction
+                Reason = $blockReasonText
                 LocalSize = [int64]$candidate.Size
                 RemoteSize = $uploadOutcome.RemoteSize
                 Error = $uploadOutcome.Error
             })
+            # Персистуємо блокер (Verified=false + мінімальний audit-доказ).
+            # Очищення — ЛИШЕ позитивною розв'язкою: (A) пізніший Full
+            # Audit підтвердив збіг — seed перезапише запис начисто; або
+            # (B) remote зник — успішний targeted upload + верифікація
+            # перезапишуть запис як Verified=true. Збіг розміру НІКОЛИ не
+            # очищає блокер — саме цей доказ попередній audit уже визнав
+            # недостатнім.
+            $state.Files[$candidate.RelativePath] = [pscustomobject]@{
+                Size = $candidate.Size
+                LastWriteTimeUtc = $candidate.LastWriteTimeUtc
+                UploadedUtc = $null
+                Verified = $false
+                BlockReason = 'AuditDrift'
+                AuditAction = $blockAction
+                AuditReason = $blockReasonText
+                AuditDetectedUtc = $blockDetectedUtc
+            }
         } elseif ($uploadOutcome.Outcome -eq 'AlreadyRemote') {
             # P1 (round 3): remote-файл уже існує з тим самим розміром —
             # crash-recovery випадок (upload попереднього циклу пройшов, а
@@ -1410,19 +1461,26 @@ function Update-BRAVOBazaSyncResultNewAfterCutoff {
     # cutoff — "новими після cutoff" вони не є. І навпаки: файл, доданий
     # ПІСЛЯ знімка з навмисно старим LastWriteTime (backdated), у знімку
     # відсутній — отже, рахується (timestamp ніколи не є критерієм
-    # членства). Fallback на persisted state лишається лише для
-    # результатів без записаного знімка (порожній каталог на cutoff або
-    # синтетичний результат) — там обидва підходи еквівалентні.
+    # членства).
+    # P2 (round 5): "порожній знімок" != "знімка немає". $null у
+    # CutoffSnapshotRelativePaths — сентинел "недоступно" (лише тоді
+    # fallback на persisted state); @() — валідний знімок ПОРОЖНЬОГО
+    # каталогу, membership авторитетний: файл, що з'явився після такого
+    # cutoff, рахується новим навіть якщо старий persisted state ще
+    # пам'ятає його з давніших циклів.
+    $cutoffSnapshotCaptured = ($null -ne $SyncResult.CutoffSnapshotRelativePaths)
     $cutoffMembership = New-Object System.Collections.Generic.HashSet[string]
-    foreach ($cutoffSeenPath in @($SyncResult.CutoffSnapshotRelativePaths)) {
-        if (-not [string]::IsNullOrWhiteSpace([string]$cutoffSeenPath)) {
-            [void]$cutoffMembership.Add([string]$cutoffSeenPath)
+    if ($cutoffSnapshotCaptured) {
+        foreach ($cutoffSeenPath in @($SyncResult.CutoffSnapshotRelativePaths)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$cutoffSeenPath)) {
+                [void]$cutoffMembership.Add([string]$cutoffSeenPath)
+            }
         }
     }
 
     $newCount = 0
     foreach ($relativePath in $freshSnapshot.Entries.Keys) {
-        if ($cutoffMembership.Count -gt 0) {
+        if ($cutoffSnapshotCaptured) {
             if (-not $cutoffMembership.Contains($relativePath)) {
                 $newCount++
             }

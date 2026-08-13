@@ -15911,8 +15911,10 @@ function Write-BRAVOLog {
             [int64]$hr4BootResult.AuditDriftFiles[0].RemoteSize -eq 100 -and
             $hr4BootStateRead.State.Files.ContainsKey('other.txt') -and
             [bool]$hr4BootStateRead.State.Files['other.txt'].Verified -eq $true -and
-            -not $hr4BootStateRead.State.Files.ContainsKey('drifted.txt')
-        ) -Name 'BazaSync/BootstrapAuditPendingSameSizeRemoteIsNotRecovered' -Failure "bootstrap: audit-pending кандидат із same-size remote НЕ recovery-иться і НЕ сідиться Verified (non-pending other.txt сідиться нормально); Status=$($hr4BootResult.Status) Recovered=$($hr4BootResult.RecoveredRemote) Drift=$(@($hr4BootResult.AuditDriftFiles).Count)"
+            $hr4BootStateRead.State.Files.ContainsKey('drifted.txt') -and
+            [bool]$hr4BootStateRead.State.Files['drifted.txt'].Verified -eq $false -and
+            [string]$hr4BootStateRead.State.Files['drifted.txt'].BlockReason -eq 'AuditDrift'
+        ) -Name 'BazaSync/BootstrapAuditPendingSameSizeRemoteIsNotRecovered' -Failure "bootstrap: audit-pending кандидат із same-size remote НЕ recovery-иться і НЕ сідиться Verified -- натомість персистується AuditDrift-блокер (round 5), non-pending other.txt сідиться нормально; Status=$($hr4BootResult.Status) Recovered=$($hr4BootResult.RecoveredRemote) Drift=$(@($hr4BootResult.AuditDriftFiles).Count)"
 
         Test-BRAVOCondition -Condition (
             $hr4BootResult.RecoveredRemote -eq 0 -and
@@ -16034,6 +16036,201 @@ function Write-BRAVOLog {
         $hr4BackUpdated = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr4BackResult -LocalDirectory $hr4BackLocal -StateRoot $hr4BackState
         Test-BRAVOCondition -Condition ($hr4BackUpdated.NewAfterCutoff -eq 1) `
             -Name 'BazaSync/BackdatedFileAddedAfterSnapshotStillCountsAsNewAfterCutoff' -Failure "файл, доданий ПІСЛЯ знімка зі старим LastWriteTime, все одно рахується (membership -- знімок, не timestamp); отримано $($hr4BackUpdated.NewAfterCutoff)"
+
+        # =======================================================================
+        # HARDENING ROUND 5, P1: AUDIT_DRIFT стійкий МІЖ циклами -- persisted
+        # блокер у state-записі шляху; очищення лише позитивною розв'язкою
+        # =======================================================================
+        # головна модель: цикл 0 (успіх, provenance) -> цикл 1 (audit drift)
+        # -> цикли 2..3 БЕЗ аудиту мусять лишатись заблокованими
+        $hr5Root = Join-Path $bazaSyncTestRoot "HR5_Sticky"
+        $hr5Local = Join-Path $hr5Root "local"
+        $hr5State = Join-Path $hr5Root "state"
+        New-Item -ItemType Directory -Path $hr5Local -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr5Local -RelativePath "ok.txt" -SizeBytes 30 | Out-Null
+        $hr5Cycle0 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5Local -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr5State -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        $hr5StateAfter0 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5State -Component 'BAZA_APP')
+        $hr5ProvenanceUtc = [string]$hr5StateAfter0.State.LastSuccessfulSyncUtc
+        $hr5ProvenanceCycleId = [string]$hr5StateAfter0.State.LastCycleId
+
+        New-BRAVOSelfTestBazaFile -Directory $hr5Local -RelativePath "sticky.txt" -SizeBytes 90 | Out-Null
+        $hr5StickyProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{
+                IsDirectory = $false
+                Path = (Join-Path $hr5Local "sticky.txt")
+                Action = 'UploadUpdate'
+                Reason = 'remote mtime відрізняється (той самий розмір)'
+            }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5Local -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        # ОДНА сесія на всі наступні цикли = персистентний remote
+        $hr5Session = New-BRAVOSelfTestFakeBazaSession
+        $hr5Session.State.RemoteSizes['/baza_app/sticky.txt'] = [int64]90
+        $hr5Cycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5Local -RemoteRootPath '/baza_app' -Session $hr5Session -StateRoot $hr5State -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr5StickyProvider
+        $hr5StateAfter1 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5State -Component 'BAZA_APP')
+
+        # цикл 2: ЗВИЧАЙНИЙ (без Full Audit) -- блокер із state мусить діяти
+        $hr5Cycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5Local -RemoteRootPath '/baza_app' -Session $hr5Session -StateRoot $hr5State
+        $hr5StateAfter2 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5State -Component 'BAZA_APP')
+        $hr5Cycle2Health = Get-BRAVOBazaFastHealthResult -SyncResult $hr5Cycle2
+        Test-BRAVOCondition -Condition (
+            $hr5Cycle1.Status -eq 'AUDIT_DRIFT' -and
+            [string]$hr5StateAfter1.State.Files['sticky.txt'].BlockReason -eq 'AuditDrift' -and
+            $hr5Cycle2.Status -eq 'AUDIT_DRIFT' -and
+            $hr5Session.State.PutFilesCallCount -eq 0 -and
+            [bool]$hr5StateAfter2.State.Files['sticky.txt'].Verified -eq $false -and
+            $hr5Cycle2Health.Healthy -eq $false -and $hr5Cycle2Health.Level -eq 'CRITICAL' -and
+            $hr5Cycle2Health.Message -match 'sticky\.txt'
+        ) -Name 'BazaSync/AuditDriftRemainsBlockedOnNextNormalCycle' -Failure "цикл N+1 БЕЗ Full Audit мусить лишатись AUDIT_DRIFT через persisted блокер (0 PutFiles, Verified=false, Health CRITICAL); Cycle1=$($hr5Cycle1.Status) Cycle2=$($hr5Cycle2.Status) PutFiles=$($hr5Session.State.PutFilesCallCount) Healthy=$($hr5Cycle2Health.Healthy)"
+
+        $hr5Cycle3 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5Local -RemoteRootPath '/baza_app' -Session $hr5Session -StateRoot $hr5State
+        Test-BRAVOCondition -Condition (
+            $hr5Cycle3.Status -eq 'AUDIT_DRIFT' -and
+            (@($hr5Cycle3.AuditDriftFiles).Count -eq 1) -and
+            $hr5Cycle3.AuditDriftFiles[0].Action -eq 'UploadUpdate' -and
+            $hr5Session.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/AuditDriftPersistsAcrossMultipleNormalCycles' -Failure "блокер діє й на N+2 (Action із persisted блокера зберігається); Cycle3=$($hr5Cycle3.Status) Action=$($hr5Cycle3.AuditDriftFiles[0].Action) PutFiles=$($hr5Session.State.PutFilesCallCount)"
+
+        Test-BRAVOCondition -Condition (
+            $hr5Cycle2.RecoveredRemote -eq 0 -and $hr5Cycle3.RecoveredRemote -eq 0 -and
+            $hr5Session.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/PersistedAuditDriftNeverUsesAlreadyRemoteRecovery' -Failure "persisted блокер повністю виключає AlreadyRemote-recovery (RecoveredRemote=0, PutFiles=0 на всіх циклах); C2=$($hr5Cycle2.RecoveredRemote) C3=$($hr5Cycle3.RecoveredRemote) PutFiles=$($hr5Session.State.PutFilesCallCount)"
+
+        $hr5StateAfter3 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5State -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            -not [string]::IsNullOrWhiteSpace($hr5ProvenanceUtc) -and
+            [string]$hr5StateAfter3.State.LastSuccessfulSyncUtc -ceq $hr5ProvenanceUtc -and
+            [string]$hr5StateAfter3.State.LastCycleId -ceq $hr5ProvenanceCycleId
+        ) -Name 'BazaSync/AuditDriftDoesNotAdvanceProvenanceOnLaterNormalCycle' -Failure "пізніші заблоковані цикли НЕ просувають LastSuccessfulSyncUtc/LastCycleId; було=$hr5ProvenanceUtc стало=$($hr5StateAfter3.State.LastSuccessfulSyncUtc)"
+
+        $hr5CheckpointSession = New-BRAVOSelfTestFakeBazaSession
+        $hr5CheckpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $hr5CheckpointSession -RemoteRootPath '/baza_app' -SyncResult $hr5Cycle2
+        Test-BRAVOCondition -Condition (
+            $hr5CheckpointOutcome.Attempted -eq $false -and $hr5CheckpointOutcome.Published -eq $false -and
+            $hr5CheckpointSession.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/AuditDriftDoesNotPublishCheckpointOnLaterNormalCycle' -Failure "заблокований пізніший цикл не публікує checkpoint; Attempted=$($hr5CheckpointOutcome.Attempted)"
+
+        # розв'язка A: пізніший Full Audit підтверджує збіг -> блокер знято
+        $hr5MatchProvider = {
+            param($Snapshot)
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @() -LocalDirectory $hr5Local -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr5Cycle4 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5Local -RemoteRootPath '/baza_app' -Session $hr5Session -StateRoot $hr5State -BootstrapIfNeeded -ForceFullAudit -FullAuditProvider $hr5MatchProvider
+        $hr5StateAfter4 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5State -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $hr5Cycle4.Status -eq 'COMPLETE' -and
+            [bool]$hr5StateAfter4.State.Files['sticky.txt'].Verified -eq $true -and
+            $null -eq $hr5StateAfter4.State.Files['sticky.txt'].PSObject.Properties['BlockReason'] -and
+            [string]$hr5StateAfter4.State.LastSuccessfulSyncUtc -cne $hr5ProvenanceUtc
+        ) -Name 'BazaSync/AuditDriftClearedWhenLaterFullAuditMatches' -Failure "пізніший audit, що підтвердив збіг, знімає блокер (Verified=true, без BlockReason) і цикл COMPLETE; Status=$($hr5Cycle4.Status) Verified=$($hr5StateAfter4.State.Files['sticky.txt'].Verified)"
+
+        # розв'язка B: remote прибрано -> targeted upload + верифікація -> блокер знято
+        $hr5ResBRoot = Join-Path $bazaSyncTestRoot "HR5_ResB"
+        $hr5ResBLocal = Join-Path $hr5ResBRoot "local"
+        $hr5ResBState = Join-Path $hr5ResBRoot "state"
+        New-Item -ItemType Directory -Path $hr5ResBLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr5ResBLocal -RelativePath "stickyB.txt" -SizeBytes 70 | Out-Null
+        $hr5ResBProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr5ResBLocal "stickyB.txt"); Action = 'UploadUpdate'; Reason = 'drift' }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5ResBLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr5ResBSession = New-BRAVOSelfTestFakeBazaSession
+        $hr5ResBSession.State.RemoteSizes['/baza_app/stickyB.txt'] = [int64]70
+        $hr5ResBCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5ResBLocal -RemoteRootPath '/baza_app' -Session $hr5ResBSession -StateRoot $hr5ResBState -BootstrapIfNeeded -FullAuditProvider $hr5ResBProvider
+        $hr5ResBSession.State.RemoteSizes.Remove('/baza_app/stickyB.txt')
+        $hr5ResBCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5ResBLocal -RemoteRootPath '/baza_app' -Session $hr5ResBSession -StateRoot $hr5ResBState
+        $hr5ResBStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $hr5ResBState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $hr5ResBCycle1.Status -eq 'AUDIT_DRIFT' -and
+            $hr5ResBCycle2.Status -eq 'COMPLETE' -and $hr5ResBCycle2.Uploaded -eq 1 -and
+            $hr5ResBSession.State.PutFilesCallCount -eq 1 -and
+            [bool]$hr5ResBStateRead.State.Files['stickyB.txt'].Verified -eq $true -and
+            $null -eq $hr5ResBStateRead.State.Files['stickyB.txt'].PSObject.Properties['BlockReason']
+        ) -Name 'BazaSync/AuditDriftClearedAfterRemoteRemovedAndSuccessfulUpload' -Failure "remote зник -> звичайний targeted upload + верифікація -> Verified=true, блокер знято; C1=$($hr5ResBCycle1.Status) C2=$($hr5ResBCycle2.Status) PutFiles=$($hr5ResBSession.State.PutFilesCallCount)"
+
+        # bootstrap-drift персистує в наступний цикл
+        $hr5BootRoot = Join-Path $bazaSyncTestRoot "HR5_Boot"
+        $hr5BootLocal = Join-Path $hr5BootRoot "local"
+        $hr5BootState = Join-Path $hr5BootRoot "state"
+        New-Item -ItemType Directory -Path $hr5BootLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr5BootLocal -RelativePath "bdrift.txt" -SizeBytes 40 | Out-Null
+        $hr5BootProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr5BootLocal "bdrift.txt"); Action = 'UploadUpdate'; Reason = 'drift при bootstrap' }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5BootLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr5BootSession = New-BRAVOSelfTestFakeBazaSession
+        $hr5BootSession.State.RemoteSizes['/baza_app/bdrift.txt'] = [int64]40
+        $hr5BootCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5BootLocal -RemoteRootPath '/baza_app' -Session $hr5BootSession -StateRoot $hr5BootState -BootstrapIfNeeded -FullAuditProvider $hr5BootProvider
+        $hr5BootCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5BootLocal -RemoteRootPath '/baza_app' -Session $hr5BootSession -StateRoot $hr5BootState
+        Test-BRAVOCondition -Condition (
+            $hr5BootCycle1.Status -eq 'AUDIT_DRIFT' -and
+            $hr5BootCycle2.Status -eq 'AUDIT_DRIFT' -and
+            $hr5BootSession.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/BootstrapAuditDriftPersistsIntoNextCycle' -Failure "bootstrap-drift мусить персистувати в наступний звичайний цикл; C1=$($hr5BootCycle1.Status) C2=$($hr5BootCycle2.Status) PutFiles=$($hr5BootSession.State.PutFilesCallCount)"
+
+        # corrupt-реконсиляція: drift-блокер персистує так само
+        $hr5CorRoot = Join-Path $bazaSyncTestRoot "HR5_Corrupt"
+        $hr5CorLocal = Join-Path $hr5CorRoot "local"
+        $hr5CorState = Join-Path $hr5CorRoot "state"
+        New-Item -ItemType Directory -Path $hr5CorLocal -Force | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr5CorLocal -RelativePath "goodC.txt" -SizeBytes 20 | Out-Null
+        New-BRAVOSelfTestBazaFile -Directory $hr5CorLocal -RelativePath "stickyC.txt" -SizeBytes 50 | Out-Null
+        $hr5CorStatePath = Get-BRAVOBazaStatePath -StateRoot $hr5CorState -Component 'BAZA_APP'
+        New-Item -ItemType Directory -Path (Split-Path $hr5CorStatePath -Parent) -Force | Out-Null
+        [IO.File]::WriteAllText($hr5CorStatePath, "{ corrupt for hr5", (New-Object Text.UTF8Encoding($false)))
+        $hr5CorProvider = {
+            param($Snapshot)
+            $pendingFile = [pscustomobject]@{ IsDirectory = $false; Path = (Join-Path $hr5CorLocal "stickyC.txt"); Action = 'UploadUpdate'; Reason = 'drift при реконсиляції' }
+            return ConvertTo-BRAVOBazaFullAuditResult -ComparisonSuccess $true -ComparisonError $null -PendingFiles @($pendingFile) -LocalDirectory $hr5CorLocal -LocalSnapshot $Snapshot
+        }.GetNewClosure()
+        $hr5CorSession = New-BRAVOSelfTestFakeBazaSession
+        $hr5CorSession.State.RemoteSizes['/baza_app/stickyC.txt'] = [int64]50
+        $hr5CorCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5CorLocal -RemoteRootPath '/baza_app' -Session $hr5CorSession -StateRoot $hr5CorState -BootstrapIfNeeded -FullAuditProvider $hr5CorProvider
+        $hr5CorCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5CorLocal -RemoteRootPath '/baza_app' -Session $hr5CorSession -StateRoot $hr5CorState
+        $hr5CorStateRead = Read-BRAVOBazaState -Path $hr5CorStatePath
+        Test-BRAVOCondition -Condition (
+            $hr5CorCycle1.Status -eq 'AUDIT_DRIFT' -and
+            $hr5CorCycle2.Status -eq 'AUDIT_DRIFT' -and
+            $hr5CorSession.State.PutFilesCallCount -eq 0 -and
+            [bool]$hr5CorStateRead.State.Files['goodC.txt'].Verified -eq $true -and
+            [string]$hr5CorStateRead.State.Files['stickyC.txt'].BlockReason -eq 'AuditDrift'
+        ) -Name 'BazaSync/CorruptStateReconciliationAuditDriftPersists' -Failure "drift, виявлений при corrupt-реконсиляції, персистує в наступний цикл (блокер у свіжому state); C1=$($hr5CorCycle1.Status) C2=$($hr5CorCycle2.Status) PutFiles=$($hr5CorSession.State.PutFilesCallCount)"
+
+        # =======================================================================
+        # HARDENING ROUND 5, P2: порожній знімок -- авторитетний; $null --
+        # сентинел "знімка немає" (лише тоді fallback на persisted state)
+        # =======================================================================
+        $hr5EmpRoot = Join-Path $bazaSyncTestRoot "HR5_Empty"
+        $hr5EmpLocal = Join-Path $hr5EmpRoot "local"
+        $hr5EmpState = Join-Path $hr5EmpRoot "state"
+        New-Item -ItemType Directory -Path $hr5EmpLocal -Force | Out-Null
+        $hr5EmpFile = New-BRAVOSelfTestBazaFile -Directory $hr5EmpLocal -RelativePath "x.txt" -SizeBytes 10
+        [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5EmpLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr5EmpState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider)
+        Remove-Item -LiteralPath $hr5EmpFile -Force
+        $hr5EmpCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $hr5EmpLocal -RemoteRootPath '/baza_app' -Session (New-BRAVOSelfTestFakeBazaSession) -StateRoot $hr5EmpState
+        $hr5EmpNoChange = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr5EmpCycle2 -LocalDirectory $hr5EmpLocal -StateRoot $hr5EmpState
+        Test-BRAVOCondition -Condition (
+            $hr5EmpCycle2.Status -eq 'COMPLETE' -and
+            $hr5EmpCycle2.DiscoveredWithinCutoff -eq 0 -and
+            $null -ne $hr5EmpCycle2.CutoffSnapshotRelativePaths -and
+            $hr5EmpNoChange.NewAfterCutoff -eq 0
+        ) -Name 'BazaSync/EmptyCutoffSnapshotIsAuthoritative' -Failure "валідний ПОРОЖНІЙ знімок (не-null, 0 шляхів) авторитетний: без нових файлів NewAfterCutoff=0; Status=$($hr5EmpCycle2.Status) Captured=$($null -ne $hr5EmpCycle2.CutoffSnapshotRelativePaths) NewAfterCutoff=$($hr5EmpNoChange.NewAfterCutoff)"
+
+        New-BRAVOSelfTestBazaFile -Directory $hr5EmpLocal -RelativePath "y.txt" -SizeBytes 10 | Out-Null
+        $hr5EmpWithY = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr5EmpCycle2 -LocalDirectory $hr5EmpLocal -StateRoot $hr5EmpState
+        Test-BRAVOCondition -Condition ($hr5EmpWithY.NewAfterCutoff -eq 1) `
+            -Name 'BazaSync/FileAddedAfterEmptySnapshotCountsAsNew' -Failure "файл, доданий після порожнього знімка, рахується новим; отримано $($hr5EmpWithY.NewAfterCutoff)"
+
+        # x.txt повертається ПІСЛЯ порожнього cutoff: старий persisted state
+        # досі пам'ятає x.txt -- state-fallback дав би 1 (лише y), membership
+        # порожнього знімка чесно дає 2 (x знову з'явився ПІСЛЯ cutoff)
+        New-BRAVOSelfTestBazaFile -Directory $hr5EmpLocal -RelativePath "x.txt" -SizeBytes 10 | Out-Null
+        $hr5EmpWithXY = Update-BRAVOBazaSyncResultNewAfterCutoff -SyncResult $hr5EmpCycle2 -LocalDirectory $hr5EmpLocal -StateRoot $hr5EmpState
+        Test-BRAVOCondition -Condition ($hr5EmpWithXY.NewAfterCutoff -eq 2) `
+            -Name 'BazaSync/EmptySnapshotDoesNotFallbackToOldPersistedState' -Failure "порожній знімок НЕ падає у fallback на старий persisted state: x.txt, що повернувся після cutoff, теж рахується (2, не 1); отримано $($hr5EmpWithXY.NewAfterCutoff)"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

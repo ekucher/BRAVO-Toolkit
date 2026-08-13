@@ -486,10 +486,9 @@ Invariants below).
   `LastFullAuditUtc` still advances on such a cycle (the audit itself
   completed successfully and found drift — audit freshness is not
   synchronization success and is deliberately not conflated with
-  `LastSuccessfulSyncUtc`). The verdict is scoped to the cycle the audit
-  ran in — a later plain incremental cycle without its own audit falls
-  back to round-3 semantics, and the next periodic audit re-detects the
-  same drift; no extra remote scans are introduced. When no current
+  `LastSuccessfulSyncUtc`). Since round 5 the verdict is persisted per path (see the round-5
+  entry below) rather than scoped to the audit cycle only; no extra
+  remote scans are introduced. When no current
   audit flags the candidate, same-size crash recovery keeps working
   unchanged. (P2) `NewAfterCutoff` now means actually-after-cutoff:
   membership is decided by the cycle snapshot (a lightweight
@@ -507,6 +506,44 @@ Invariants below).
   immediately before `PutFiles` (after remote directory preparation) to
   minimize the TOCTOU window, and no absolute distributed no-overwrite
   guarantee is claimed. 13 new/updated behavioral self-tests.
+- `BRAVO.BazaSync` hardening round 5 (final production-acceptance
+  review). (P1) `AUDIT_DRIFT` is now sticky across cycles. Round 4 kept
+  the audit pending map only in memory for the cycle the audit ran in,
+  so after an `AUDIT_DRIFT` cycle the persisted state carried only
+  `Verified=false` — the next plain incremental cycle (no audit of its
+  own) saw an ordinary unverified candidate, found the remote path
+  existing with a matching size and generic-recovered it to
+  `Verified=true`, allowing a `COMPLETE`/healthy cycle even though
+  nothing changed since the authoritative audit reported drift (a
+  false-green window until the next periodic audit, explicitly called
+  out as unacceptable). An `AUDIT_DRIFT` outcome now persists a minimal
+  per-path blocker inside the file's state entry
+  (`BlockReason="AuditDrift"`, `AuditAction`, `AuditReason`,
+  `AuditDetectedUtc` — the original detection time is preserved on
+  re-encounters; the state file's Save/Read pass extra entry fields
+  through unchanged, so no schema bump). Every upload-phase candidate
+  check now consults both the current-cycle audit map and the persisted
+  blocker: a blocked path with the remote still present stays
+  `AUDIT_DRIFT` (zero `PutFiles`, no provenance advance, no checkpoint,
+  Health `CRITICAL`) on every subsequent normal cycle. The blocker is
+  cleared only by positive resolution: a later Full Audit confirming
+  the path as matching re-seeds a clean `Verified=true` entry, or the
+  remote file disappearing followed by a successful targeted
+  upload+verification; a mere size match never clears it — that is
+  precisely the evidence the audit already proved insufficient.
+  Bootstrap and corrupt-state reconciliation persist the same blocker
+  (an audit-pending path is never left absent from state where the next
+  cycle could generic-recover it). Ordinary unverified/pending entries
+  carry no blocker, so round-3 crash recovery
+  (upload-succeeded/state-save-failed → same-size `AlreadyRemote`)
+  is preserved and re-verified. (P2) `NewAfterCutoff` now distinguishes
+  a valid empty snapshot from an unavailable one:
+  `CutoffSnapshotRelativePaths` is `$null` when no snapshot was
+  captured (only then does the legacy persisted-state fallback apply)
+  and `@()` for a genuinely empty directory at cutoff — an empty
+  snapshot is authoritative, so a file (re)appearing after it counts as
+  new even if an older persisted state still remembers it. 12 new
+  behavioral self-tests.
 
 ## 5.0.0 — 2026-08-11
 
