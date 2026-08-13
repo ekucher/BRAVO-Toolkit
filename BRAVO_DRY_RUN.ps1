@@ -1342,8 +1342,23 @@ try {
             Import-Module -Name $bazaArchiveRuntimeModulePath -ErrorAction Stop
             Import-Module -Name $bazaSyncModulePath -ErrorAction Stop
 
-            $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
-            if ($bazaSettingsEffective.Mode -eq 'IncrementalAppendOnly') {
+            # Get-BRAVOBazaSettingsEffective тепер може throw-нути на
+            # несумісній комбінації (SynchronizeBeforeHealth/FastHealthEnabled
+            # =$false разом із Mode="IncrementalAppendOnly" — P2 deep review:
+            # ці налаштування більше не тихо ігноруються). Локальний
+            # try/catch, а не єдиний catch усього dry-run: одна помилка
+            # конфігурації BAZA не повинна обривати РЕШТУ незалежних
+            # перевірок dry-run.
+            $bazaSettingsEffective = $null
+            try {
+                $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+            } catch {
+                Add-DryRunResult FAIL "BAZA sync" "Конфігурація" $_.Exception.Message
+            }
+            if ($null -eq $bazaSettingsEffective) {
+                # Помилку вже додано вище — решта секції BAZA не має сенсу
+                # без effective settings.
+            } elseif ($bazaSettingsEffective.Mode -eq 'IncrementalAppendOnly') {
                 Add-DryRunResult PASS "BAZA sync" "Режим" (
                     "IncrementalAppendOnly; SynchronizeBeforeHealth=$($bazaSettingsEffective.SynchronizeBeforeHealth); " +
                     "FastHealthEnabled=$($bazaSettingsEffective.FastHealthEnabled); MutationPolicy=$($bazaSettingsEffective.MutationPolicy)"

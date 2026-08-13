@@ -57,11 +57,27 @@ function Enter-BRAVOBazaSyncLock {
     # BRAVO_HEALTH.ps1 без цього прапорця — цей lock є другим, безумовним
     # рубежем саме навколо read-modify-write persisted state.
     #
-    # Fail-fast (без очікування/Start-Sleep): якщо lock зайнятий, це означає,
-    # що ІНШИЙ процес щойно синхронізує той самий компонент прямо зараз —
-    # чекати нема сенсу, викликач має трактувати це як "пропущено цим
-    # циклом", а не як помилку (Get-BRAVOBazaFastHealthResult: Status
-    # SKIPPED_CONCURRENT -> INFO, не ALERT).
+    # Fail-fast (без очікування/Start-Sleep): якщо lock зайнятий іншим
+    # процесом, чекати нема сенсу — викликач трактує це як "пропущено цим
+    # циклом" (Classification=Busy -> SKIPPED_CONCURRENT -> INFO).
+    #
+    # P1-3 (deep review): Classification РОЗРІЗНЯЄ genuine contention від
+    # інфраструктурної помилки. Раніше БУДЬ-ЯКИЙ виняток (ACL denied,
+    # каталог стану недоступний, зіпсований шлях, диск відсутній) ставав
+    # Success=$false без різниці — виклик-точка тоді ЗАВЖДИ перетворювала
+    # це на SKIPPED_CONCURRENT, а Fast Health трактує SKIPPED_CONCURRENT як
+    # healthy/INFO. Це маскувало реальні інфраструктурні збої під "просто
+    # інший процес зараз синхронізує". Емпірично підтверджено (.NET,
+    # Windows): genuine sharing violation (другий File.Open на вже
+    # відкритий з FileShare.None файл) дає РІВНО System.IO.IOException з
+    # HResult -2147024864 (Win32 ERROR_SHARING_VIOLATION=32, він же
+    # 0x80070020) — і ЛИШЕ це вважається Busy. Будь-яка інша IOException
+    # (DirectoryNotFoundException — підтверджено емпірично, коли батько
+    # шляху насправді файл, не каталог; PathTooLongException; диск
+    # від'єднаний), UnauthorizedAccessException (ACL, read-only файл,
+    # спроба відкрити каталог як файл — підтверджено емпірично) чи
+    # будь-що інше (ArgumentException на некоректних символах шляху) —
+    # завжди Error, ніколи Busy.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$StateRoot,
@@ -79,9 +95,19 @@ function Enter-BRAVOBazaSyncLock {
             [System.IO.FileAccess]::ReadWrite,
             [System.IO.FileShare]::None
         )
-        return [pscustomobject]@{ Success = $true; Stream = $lockStream; Path = $lockPath; Error = $null }
+        return [pscustomobject]@{ Success = $true; Stream = $lockStream; Path = $lockPath; Classification = 'Acquired'; Error = $null }
+    } catch [System.IO.IOException] {
+        $isSharingViolation = ($_.Exception.HResult -eq -2147024864)
+        return [pscustomobject]@{
+            Success = $false; Stream = $null; Path = $lockPath
+            Classification = if ($isSharingViolation) { 'Busy' } else { 'Error' }
+            Error = $_.Exception.Message
+        }
     } catch {
-        return [pscustomobject]@{ Success = $false; Stream = $null; Path = $lockPath; Error = $_.Exception.Message }
+        # UnauthorizedAccessException і все інше (ArgumentException тощо) —
+        # ніколи не "інший процес синхронізує", завжди інфраструктурна
+        # помилка.
+        return [pscustomobject]@{ Success = $false; Stream = $null; Path = $lockPath; Classification = 'Error'; Error = $_.Exception.Message }
     }
 }
 
@@ -328,6 +354,51 @@ function Get-BRAVOBazaSyncPlan {
     }
 }
 
+function Test-BRAVOBazaRemoteNameCompatibility {
+    # Локальна ЛИШЕ перевірка (жодного SFTP I/O, жодного remote listing) —
+    # порт того самого правила, що вже роками застосовує legacy
+    # Get-BAZARemoteNameCompatibilityIssues (BRAVO.Archive.Runtime.ps1):
+    # кожен СЕГМЕНТ відносного шляху (і кожен проміжний каталог, і сам
+    # файл) не повинен перевищувати типову межу довжини імені на SFTP-
+    # серверах (255 байт у UTF-8). ТЗ P2 ("Preserve SFTP filename
+    # compatibility safety"): incremental-шлях раніше повністю пропускав
+    # цю перевірку.
+    #
+    # Викликається ЛИШЕ для кандидатів у ToUpload (Invoke-BRAVOBazaSynchronization),
+    # НЕ для всього локального дерева на кожному циклі — інакше сотні тисяч
+    # уже Verified файлів отримували б зайву перевірку щоцикл, та сама
+    # O(усі файли) вартість, якої incremental engine навмисно уникає.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RelativePath,
+        [int]$MaximumFileUtf8Bytes = 255,
+        [int]$MaximumDirectoryUtf8Bytes = 255
+    )
+
+    $segments = @(
+        $RelativePath.Replace('\', '/').Split('/') | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    )
+    for ($segmentIndex = 0; $segmentIndex -lt $segments.Count; $segmentIndex++) {
+        $segment = $segments[$segmentIndex]
+        $isLeaf = ($segmentIndex -eq ($segments.Count - 1))
+        $maximumUtf8Bytes = if ($isLeaf) { $MaximumFileUtf8Bytes } else { $MaximumDirectoryUtf8Bytes }
+        $utf8ByteCount = [System.Text.Encoding]::UTF8.GetByteCount($segment)
+        if ($utf8ByteCount -gt $maximumUtf8Bytes) {
+            return [pscustomobject]@{
+                Compatible = $false
+                Segment = $segment
+                IsDirectory = -not $isLeaf
+                Utf8ByteCount = $utf8ByteCount
+                MaximumUtf8Bytes = $maximumUtf8Bytes
+                Reason = "ім'я '$segment' довше за допустимі $maximumUtf8Bytes байт у UTF-8 (фактично $utf8ByteCount)"
+            }
+        }
+    }
+    return [pscustomobject]@{
+        Compatible = $true; Segment = $null; IsDirectory = $false; Utf8ByteCount = 0; MaximumUtf8Bytes = 0; Reason = $null
+    }
+}
+
 # =====================================================================
 # TARGETED UPLOAD (не whole-tree synchronize/CompareDirectories)
 # =====================================================================
@@ -449,9 +520,33 @@ function New-BRAVOBazaSyncResult {
         PendingWithinCutoff = 0
         NewAfterCutoff = 0
         MutationViolations = @()
+        # P2 (deep review): IncompatibleFiles — кандидати, чиє ім'я/каталог
+        # порушує SFTP-обмеження довжини (Test-BRAVOBazaRemoteNameCompatibility)
+        # — НЕ upload-яться і НЕ рахуються як Failed/PendingWithinCutoff
+        # (це не транзієнтна помилка передачі, перезапуск сам по собі
+        # нічого не виправить, доки оператор не скоротить ім'я).
+        IncompatibleFiles = @()
         Status = 'ERROR'
         Error = $null
         Bootstrap = $false
+        # P1-3/SKIPPED_CONCURRENT hardening: останній ПІДТВЕРДЖЕНИЙ успішний
+        # цикл за даними persisted state (не обов'язково ЦЬОГО результату —
+        # для SKIPPED_CONCURRENT це єдиний доступний сигнал "чи є взагалі
+        # чому довіряти").
+        LastSuccessfulSyncUtc = $null
+        # P2 (deep review): видимість періодичного Full Audit — раніше
+        # провал НЕ-bootstrap Full Audit залишав LastFullAuditUtc
+        # застарілим, але СЛІД цього в SyncResult зникав повністю.
+        FullAuditAttempted = $false
+        FullAuditSucceeded = $false
+        FullAuditError = $null
+        LastFullAuditUtc = $null
+        # P2 (deep review): видимість публікації remote checkpoint — раніше
+        # Write-BRAVOBazaRemoteCheckpoint викликався як [void](...), і
+        # Health не мав жодного способу дізнатися, чи публікація вдалась.
+        CheckpointAttempted = $false
+        CheckpointPublished = $false
+        CheckpointError = $null
     }
 }
 
@@ -564,127 +659,235 @@ function Invoke-BRAVOBazaSynchronization {
     $statePath = Get-BRAVOBazaStatePath -StateRoot $StateRoot -Component $Component
     $stateRead = Read-BRAVOBazaState -Path $statePath
 
-    if ($stateRead.Corrupt) {
-        $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
-        $result.Status = 'STATE_INVALID'
-        $result.Error = "стан BAZA пошкоджено або несумісний ($statePath): $($stateRead.Reason). Потрібна повна реконсиляція (Full Audit) — старі файли НЕ вважаються автоматично verified."
-        $result.CompletedUtc = (Get-Date).ToUniversalTime()
-        return $result
-    }
-
-    $isFirstRun = -not $stateRead.Exists
-    $state = if ($stateRead.Exists) { $stateRead.State } else { New-BRAVOBazaEmptyState -Component $Component }
-
-    # Знімок ОДИН для всього циклу (і для bootstrap seed, і для плану, і як
-    # сам Cutoff) — узгодженість: bootstrap ніколи не бачить ІНШИЙ перелік
-    # каталогу, ніж той, що потім планується до upload.
-    $snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
-    if (-not $snapshot.Success) {
-        $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
-        $result.Status = 'ERROR'
-        $result.Error = "не вдалося прочитати локальний каталог: $($snapshot.Error)"
-        $result.CompletedUtc = (Get-Date).ToUniversalTime()
-        return $result
-    }
-    $cutoffUtc = $snapshot.SnapshotUtc
-
-    # Full Audit тригериться або на першому запуску (bootstrap, ТЗ п.15),
-    # або періодично, коли попередній Full Audit застарів (ТЗ п.12/13:
-    # "Full Audit НЕ запускати після кожного Archive/Health" — тому це
-    # виключно ВІК останнього LastFullAuditUtc, а не кожен цикл).
-    # FullAuditEveryDays <= 0 вимикає періодичний шлях; лишається лише
-    # bootstrap першого запуску.
-    $fullAuditOverdue = $false
-    if (-not $isFirstRun -and $ForceFullAudit) {
-        $fullAuditOverdue = $true
-    } elseif (-not $isFirstRun -and $FullAuditEveryDays -gt 0) {
-        $lastFullAuditUtc = $null
-        if (-not [string]::IsNullOrWhiteSpace([string]$state.LastFullAuditUtc)) {
-            try {
-                $lastFullAuditUtc = [DateTime]::Parse(
-                    [string]$state.LastFullAuditUtc,
-                    [System.Globalization.CultureInfo]::InvariantCulture,
-                    [System.Globalization.DateTimeStyles]::RoundtripKind)
-            } catch {
-                $lastFullAuditUtc = $null
-            }
-        }
-        # Відсутній/непарсований LastFullAuditUtc у вже-існуючому state
-        # (напр. state, створений до появи цього поля) трактується як
-        # "прострочено" — консервативно, а не мовчки пропускається назавжди.
-        if ($null -eq $lastFullAuditUtc) {
-            $fullAuditOverdue = $true
-        } else {
-            $fullAuditOverdue = ($startedUtc - $lastFullAuditUtc).TotalDays -ge $FullAuditEveryDays
-        }
-    }
-
+    # Спільні прапорці, що заповнюються ОБОМА гілками нижче (пошкоджений
+    # стан -> реконсиляція, або звичайний шлях -> можливий bootstrap/
+    # periodic audit), і читаються уніфіковано після if/else.
+    $isFirstRun = $false
+    $state = $null
+    $snapshot = $null
     $bootstrapPerformed = $false
-    if (($isFirstRun -or $fullAuditOverdue) -and $BootstrapIfNeeded) {
-        # Bootstrap/періодичний Full Audit: одна дорога Full Audit (повне
-        # порівняння), щоб НЕ завантажувати повторно файли, які вже
-        # фактично є на SFTP (ТЗ п.15), і щоб виявити дрейф (напр. хтось
-        # вручну видалив файл на SFTP) — seed/refresh VERIFIED-записів для
-        # того, що вже збігається, без жодного upload для них.
-        if ($null -eq $FullAuditProvider) {
-            if ($isFirstRun) {
-                $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $cutoffUtc
-                $result.Status = 'ERROR'
-                $result.Error = 'перший запуск без persisted state вимагає bootstrap Full Audit, але FullAuditProvider не передано'
-                $result.CompletedUtc = (Get-Date).ToUniversalTime()
-                return $result
+    $fullAuditAttemptedThisCycle = $false
+    $fullAuditSucceededThisCycle = $false
+    $fullAuditErrorThisCycle = $null
+
+    if ($stateRead.Corrupt) {
+        # P1-4 (deep review): пошкоджений/несумісний стан раніше ЗАВЖДИ
+        # повертав STATE_INVALID негайно, ще ДО того, як -ForceFullAudit/
+        # -BootstrapIfNeeded/FullAuditProvider взагалі мали шанс щось
+        # виправити — OPERATIONS хибно стверджував, що "наступний Full
+        # Audit відновить стан", хоча виконання НІКОЛИ туди не доходило.
+        if (-not $BootstrapIfNeeded -or $null -eq $FullAuditProvider) {
+            # Health / no recovery authorization: без ОБОХ прапорців немає
+            # звідки взяти нове довірене джерело істини — контрольована
+            # відмова, старі файли НІКОЛИ не вважаються automatically
+            # verified.
+            $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+            $result.Status = 'STATE_INVALID'
+            $result.Error = "стан BAZA пошкоджено або несумісний ($statePath): $($stateRead.Reason). Потрібна повна реконсиляція (Full Audit) — старі файли НЕ вважаються автоматично verified."
+            $result.CompletedUtc = (Get-Date).ToUniversalTime()
+            return $result
+        }
+
+        # Archive / explicit reconciliation path: ОБИДВА -BootstrapIfNeeded
+        # і FullAuditProvider присутні — контрольоване відновлення.
+        $recoverySnapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+        if (-not $recoverySnapshot.Success) {
+            $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+            $result.Status = 'STATE_INVALID'
+            $result.Error = "стан пошкоджено ($($stateRead.Reason)); реконсиляцію не вдалося навіть розпочати — не вдалося прочитати локальний каталог: $($recoverySnapshot.Error)"
+            $result.CompletedUtc = (Get-Date).ToUniversalTime()
+            return $result
+        }
+        $fullAuditAttemptedThisCycle = $true
+        $recoveryAudit = & $FullAuditProvider $recoverySnapshot
+        if (-not $recoveryAudit.Success) {
+            # Стара пошкоджена evidence лишається НЕТОРКНУТОЮ на
+            # канонічному шляху (ми ще НЕ карантинили її — карантин лише
+            # на успішному шляху нижче). Наступне читання знову побачить
+            # Corrupt=true, доки причину провалу Full Audit не усунуто.
+            $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $recoverySnapshot.SnapshotUtc
+            $result.Status = 'STATE_INVALID'
+            $result.Error = "стан пошкоджено ($($stateRead.Reason)); реконсиляція через Full Audit також не вдалася: $($recoveryAudit.Error). Стара evidence збережена без змін ($statePath) — жоден файл не вважається verified."
+            $result.FullAuditAttempted = $true
+            $result.FullAuditSucceeded = $false
+            $result.FullAuditError = [string]$recoveryAudit.Error
+            $result.CompletedUtc = (Get-Date).ToUniversalTime()
+            return $result
+        }
+
+        # Full Audit успішний — карантинимо СТАРИЙ пошкоджений файл
+        # (forensic evidence; best-effort — провал карантину НЕ зупиняє
+        # реконсиляцію, бо Save-BRAVOBazaState нижче однаково атомарно
+        # перезапише канонічний шлях новим, довіреним станом) і будуємо
+        # СВІЖИЙ стан ВИКЛЮЧНО з audit result — жоден запис зі старого
+        # (пошкодженого, отже недовіреного) файлу не переноситься.
+        $quarantinePath = Join-Path (Split-Path -Path $statePath -Parent) (
+            '{0}.state.corrupt.{1}.json' -f $Component, $startedUtc.ToString('yyyyMMdd_HHmmss')
+        )
+        try {
+            if ([IO.File]::Exists($statePath)) {
+                [IO.File]::Move($statePath, $quarantinePath)
             }
-            # Періодичний Full Audit прострочено, але провайдера немає
-            # (напр. виклик з Health, де bootstrap/Full Audit свідомо не
-            # передається — Archive's exclusive responsibility). Це НЕ
-            # помилка цього циклу: incremental sync продовжується без
-            # audit, а прострочення лишається до наступного разу, коли
-            # виклик матиме провайдера.
-        } else {
-            $auditResult = & $FullAuditProvider $snapshot
-            if (-not $auditResult.Success) {
+        } catch {
+            # Best-effort forensic copy — див. коментар вище.
+        }
+
+        $state = New-BRAVOBazaEmptyState -Component $Component
+        foreach ($matchedRelativePath in $recoveryAudit.AlreadyMatchingRelativePaths) {
+            $state.Files[$matchedRelativePath] = [pscustomobject]@{
+                Size = $recoveryAudit.LocalSizes[$matchedRelativePath]
+                LastWriteTimeUtc = $recoveryAudit.LastWriteTimesUtc[$matchedRelativePath]
+                UploadedUtc = $startedUtc.ToString('o')
+                Verified = $true
+            }
+        }
+        $state.LastFullAuditUtc = $startedUtc.ToString('o')
+        $isFirstRun = $false
+        $bootstrapPerformed = $true
+        $fullAuditSucceededThisCycle = $true
+        $snapshot = $recoverySnapshot
+    } else {
+        $isFirstRun = -not $stateRead.Exists
+
+        # P1-1 (deep review): без -BootstrapIfNeeded (типовий standalone
+        # Health fallback, де bootstrap лишається виключною
+        # відповідальністю Archive) перший запуск раніше мовчки провалювався
+        # у порожній $state -> Get-BRAVOBazaSyncPlan, де КОЖЕН локальний
+        # файл виглядав би як "новий" -> ToUpload — для 50+ ГБ дерева це
+        # означало б спробу standalone Health перезавантажити ВСЕ заново.
+        # Контрольована відмова ДО планувальника/upload — жодного
+        # PutFiles-виклику, UploadInvocationCount=0.
+        if ($isFirstRun -and -not $BootstrapIfNeeded) {
+            $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+            $result.Status = 'STATE_NOT_INITIALIZED'
+            $result.Error = "$Component — incremental стан не ініціалізовано ($statePath). Спершу виконайте bootstrap через BRAVO_ARCHIV/BAZA."
+            $result.CompletedUtc = (Get-Date).ToUniversalTime()
+            return $result
+        }
+
+        $state = if ($stateRead.Exists) { $stateRead.State } else { New-BRAVOBazaEmptyState -Component $Component }
+
+        # Знімок ОДИН для всього циклу (і для bootstrap seed, і для плану,
+        # і як сам Cutoff) — узгодженість: bootstrap ніколи не бачить
+        # ІНШИЙ перелік каталогу, ніж той, що потім планується до upload.
+        $snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+        if (-not $snapshot.Success) {
+            $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
+            $result.Status = 'ERROR'
+            $result.Error = "не вдалося прочитати локальний каталог: $($snapshot.Error)"
+            $result.CompletedUtc = (Get-Date).ToUniversalTime()
+            return $result
+        }
+
+        # Full Audit тригериться або на першому запуску (bootstrap, ТЗ
+        # п.15), або періодично, коли попередній Full Audit застарів (ТЗ
+        # п.12/13: "Full Audit НЕ запускати після кожного Archive/Health" —
+        # тому це виключно ВІК останнього LastFullAuditUtc, а не кожен
+        # цикл). FullAuditEveryDays <= 0 вимикає періодичний шлях;
+        # лишається лише bootstrap першого запуску.
+        $fullAuditOverdue = $false
+        if (-not $isFirstRun -and $ForceFullAudit) {
+            $fullAuditOverdue = $true
+        } elseif (-not $isFirstRun -and $FullAuditEveryDays -gt 0) {
+            $lastFullAuditUtc = $null
+            if (-not [string]::IsNullOrWhiteSpace([string]$state.LastFullAuditUtc)) {
+                try {
+                    $lastFullAuditUtc = [DateTime]::Parse(
+                        [string]$state.LastFullAuditUtc,
+                        [System.Globalization.CultureInfo]::InvariantCulture,
+                        [System.Globalization.DateTimeStyles]::RoundtripKind)
+                } catch {
+                    $lastFullAuditUtc = $null
+                }
+            }
+            # Відсутній/непарсований LastFullAuditUtc у вже-існуючому state
+            # (напр. state, створений до появи цього поля) трактується як
+            # "прострочено" — консервативно, а не мовчки пропускається
+            # назавжди.
+            if ($null -eq $lastFullAuditUtc) {
+                $fullAuditOverdue = $true
+            } else {
+                $fullAuditOverdue = ($startedUtc - $lastFullAuditUtc).TotalDays -ge $FullAuditEveryDays
+            }
+        }
+
+        if (($isFirstRun -or $fullAuditOverdue) -and $BootstrapIfNeeded) {
+            # Bootstrap/періодичний Full Audit: одна дорога Full Audit
+            # (повне порівняння), щоб НЕ завантажувати повторно файли, які
+            # вже фактично є на SFTP (ТЗ п.15), і щоб виявити дрейф (напр.
+            # хтось вручну видалив файл на SFTP) — seed/refresh VERIFIED-
+            # записів для того, що вже збігається, без жодного upload для
+            # них.
+            if ($null -eq $FullAuditProvider) {
                 if ($isFirstRun) {
-                    $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $cutoffUtc
+                    $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $snapshot.SnapshotUtc
                     $result.Status = 'ERROR'
-                    $result.Error = "bootstrap Full Audit не вдався: $($auditResult.Error)"
+                    $result.Error = 'перший запуск без persisted state вимагає bootstrap Full Audit, але FullAuditProvider не передано'
                     $result.CompletedUtc = (Get-Date).ToUniversalTime()
                     return $result
                 }
-                # Періодичний (не-bootstrap) Full Audit, що провалився, не
-                # має блокувати вже-працюючий incremental sync — стан і
-                # далі вважається валідним, LastFullAuditUtc НЕ оновлюється
-                # (наступний цикл спробує знову).
+                # Періодичний Full Audit прострочено, але провайдера немає
+                # (напр. виклик з Health, де bootstrap/Full Audit свідомо
+                # не передається — Archive's exclusive responsibility). Це
+                # НЕ помилка цього циклу: incremental sync продовжується
+                # без audit, а прострочення лишається до наступного разу,
+                # коли виклик матиме провайдера.
             } else {
-                $auditMatchedSet = New-Object System.Collections.Generic.HashSet[string]
-                foreach ($matchedRelativePath in $auditResult.AlreadyMatchingRelativePaths) {
-                    [void]$auditMatchedSet.Add($matchedRelativePath)
-                    $state.Files[$matchedRelativePath] = [pscustomobject]@{
-                        Size = $auditResult.LocalSizes[$matchedRelativePath]
-                        LastWriteTimeUtc = $auditResult.LastWriteTimesUtc[$matchedRelativePath]
-                        UploadedUtc = $startedUtc.ToString('o')
-                        Verified = $true
+                $fullAuditAttemptedThisCycle = $true
+                $auditResult = & $FullAuditProvider $snapshot
+                if (-not $auditResult.Success) {
+                    $fullAuditErrorThisCycle = [string]$auditResult.Error
+                    if ($isFirstRun) {
+                        $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $snapshot.SnapshotUtc
+                        $result.Status = 'ERROR'
+                        $result.Error = "bootstrap Full Audit не вдався: $($auditResult.Error)"
+                        $result.FullAuditAttempted = $true
+                        $result.FullAuditSucceeded = $false
+                        $result.FullAuditError = $fullAuditErrorThisCycle
+                        $result.CompletedUtc = (Get-Date).ToUniversalTime()
+                        return $result
                     }
-                }
-                # Дрейф-реконсиляція: файл, який РАНІШЕ був Verified=true в
-                # state, але повний audit (напр. хтось вручну видалив його на
-                # SFTP) НЕ підтвердив його серед AlreadyMatchingRelativePaths
-                # — це саме "старий remote-об'єкт зник" (ТЗ п.13). Скидаємо
-                # Verified, щоб звичайний incremental-план цього ж циклу
-                # підхопив його як ToUpload — без цього периодичний Full
-                # Audit був би лише "seed", а не справжньою реконсиляцією.
-                foreach ($localRelativePath in $snapshot.Entries.Keys) {
-                    if ($auditMatchedSet.Contains($localRelativePath)) { continue }
-                    $existingStateEntry = $state.Files[$localRelativePath]
-                    if ($null -ne $existingStateEntry -and [bool]$existingStateEntry.Verified) {
-                        $existingStateEntry.Verified = $false
+                    # Періодичний (не-bootstrap) Full Audit, що провалився,
+                    # не має блокувати вже-працюючий incremental sync —
+                    # стан і далі вважається валідним, LastFullAuditUtc НЕ
+                    # оновлюється (наступний цикл спробує знову), але це
+                    # ПОВИННО бути видимим у SyncResult (P2 review) — не
+                    # зникати мовчки.
+                } else {
+                    $fullAuditSucceededThisCycle = $true
+                    $auditMatchedSet = New-Object System.Collections.Generic.HashSet[string]
+                    foreach ($matchedRelativePath in $auditResult.AlreadyMatchingRelativePaths) {
+                        [void]$auditMatchedSet.Add($matchedRelativePath)
+                        $state.Files[$matchedRelativePath] = [pscustomobject]@{
+                            Size = $auditResult.LocalSizes[$matchedRelativePath]
+                            LastWriteTimeUtc = $auditResult.LastWriteTimesUtc[$matchedRelativePath]
+                            UploadedUtc = $startedUtc.ToString('o')
+                            Verified = $true
+                        }
                     }
+                    # Дрейф-реконсиляція: файл, який РАНІШЕ був Verified=true
+                    # в state, але повний audit (напр. хтось вручну видалив
+                    # його на SFTP) НЕ підтвердив його серед
+                    # AlreadyMatchingRelativePaths — це саме "старий
+                    # remote-об'єкт зник" (ТЗ п.13). Скидаємо Verified, щоб
+                    # звичайний incremental-план цього ж циклу підхопив
+                    # його як ToUpload — без цього периодичний Full Audit
+                    # був би лише "seed", а не справжньою реконсиляцією.
+                    foreach ($localRelativePath in $snapshot.Entries.Keys) {
+                        if ($auditMatchedSet.Contains($localRelativePath)) { continue }
+                        $existingStateEntry = $state.Files[$localRelativePath]
+                        if ($null -ne $existingStateEntry -and [bool]$existingStateEntry.Verified) {
+                            $existingStateEntry.Verified = $false
+                        }
+                    }
+                    $state.LastFullAuditUtc = $startedUtc.ToString('o')
+                    $bootstrapPerformed = $true
                 }
-                $state.LastFullAuditUtc = $startedUtc.ToString('o')
-                $bootstrapPerformed = $true
             }
         }
     }
 
+    $cutoffUtc = $snapshot.SnapshotUtc
     $plan = Get-BRAVOBazaSyncPlan -Snapshot $snapshot -State $state -MutationPolicy $MutationPolicy
 
     $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $cutoffUtc
@@ -692,12 +895,33 @@ function Invoke-BRAVOBazaSynchronization {
     $result.DiscoveredWithinCutoff = $snapshot.Entries.Count
     $result.AlreadyVerified = $plan.TrustedSkip.Count
     $result.MutationViolations = $plan.MutationViolations
+    $result.FullAuditAttempted = $fullAuditAttemptedThisCycle
+    $result.FullAuditSucceeded = $fullAuditSucceededThisCycle
+    $result.FullAuditError = $fullAuditErrorThisCycle
+    $result.LastFullAuditUtc = $state.LastFullAuditUtc
 
     $uploadedCount = 0
     $uploadedBytes = [int64]0
     $failedFiles = New-Object System.Collections.Generic.List[object]
+    $incompatibleFiles = New-Object System.Collections.Generic.List[object]
 
     foreach ($candidate in $plan.ToUpload) {
+        # P2 (deep review): SFTP filename-compatibility — локальна ЛИШЕ
+        # перевірка (жоден remote listing, жоден зайвий stat), рахується
+        # лише для candidates у ToUpload, НЕ для сотень тисяч уже Verified
+        # файлів.
+        $nameCompatibility = Test-BRAVOBazaRemoteNameCompatibility -RelativePath $candidate.RelativePath
+        if (-not $nameCompatibility.Compatible) {
+            $incompatibleFiles.Add([pscustomobject]@{ RelativePath = $candidate.RelativePath; Reason = $nameCompatibility.Reason })
+            # НЕ upload, НЕ Verified=false-pending-retry-forever: ім'я не
+            # стане сумісним само по собі, повторна спроба передачі
+            # безглузда, доки оператор не скоротить ім'я локально. Стан
+            # для нього НЕ записується — наступний цикл побачить того
+            # самого кандидата знову (видимий щоразу, точне ім'я в
+            # повідомленні), без хибних "upload failed" повідомлень про
+            # мережеву/SFTP помилку, якої насправді не було.
+            continue
+        }
         $uploadOutcome = Invoke-BRAVOBazaFileUpload -Session $Session -Entry $candidate -LocalDirectory $LocalDirectory -RemoteRootPath $RemoteRootPath
         if ($uploadOutcome.Success) {
             $uploadedCount++
@@ -726,6 +950,7 @@ function Invoke-BRAVOBazaSynchronization {
     $result.Failed = $failedFiles.Count
     $result.FailedFiles = $failedFiles.ToArray()
     $result.PendingWithinCutoff = $failedFiles.Count
+    $result.IncompatibleFiles = $incompatibleFiles.ToArray()
 
     $completedUtc = (Get-Date).ToUniversalTime()
     $result.CompletedUtc = $completedUtc
@@ -754,6 +979,11 @@ function Invoke-BRAVOBazaSynchronization {
         $result.Error = "передачу завершено, але не вдалося зберегти стан: $($_.Exception.Message)"
     }
 
+    # P1-3/SKIPPED_CONCURRENT hardening: LastSuccessfulSyncUtc З ЦЬОГО
+    # стану (після можливого оновлення вище) — доступний навіть коли
+    # ЦЕЙ цикл сам не COMPLETE, як довідка "коли востаннє точно вдалось".
+    $result.LastSuccessfulSyncUtc = $state.LastSuccessfulSyncUtc
+
     return $result
 }
 
@@ -769,6 +999,20 @@ function Write-BRAVOBazaRemoteCheckpoint {
     # Публікується ЛИШЕ як останній крок УСПІШНОГО sync (ТЗ п.11) — partial/
     # failed цикл не повинен публікувати "successful" checkpoint. Метадані
     # лише: жодних credentials/webhook/secret значень (ТЗ п.24).
+    #
+    # P2 (deep review): результат більше НЕ [bool] — виклик-точка раніше
+    # обгортала виклик у [void](...) і повністю викидала результат: Health
+    # не мав способу дізнатись, чи публікація насправді вдалась
+    # ("write-only" checkpoint). Тепер повертається структурований
+    # Attempted/Published/Error, який Invoke-BRAVOBazaComponentSyncSession
+    # переносить у SyncResult.
+    #
+    # Атомарна публікація: завантажуємо під ТИМЧАСОВИМ remote-іменем,
+    # потім Session.MoveFile перейменовує на канонічне — читач канонічного
+    # шляху бачить або СТАРИЙ checkpoint, або ПОВНІСТЮ записаний новий,
+    # ніколи частково завантажений. Без цього crash/розрив мережі ПОСЕРЕД
+    # PutFiles напряму в .bravo-sync.json міг би лишити там частково
+    # записаний JSON.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)]$Session,
@@ -776,7 +1020,7 @@ function Write-BRAVOBazaRemoteCheckpoint {
         [Parameter(Mandatory = $true)][object]$SyncResult
     )
     if ($SyncResult.Status -ne 'COMPLETE') {
-        return $false
+        return [pscustomobject]@{ Attempted = $false; Published = $false; Error = $null }
     }
     $checkpoint = [ordered]@{
         cycleId = $SyncResult.CycleId
@@ -792,13 +1036,31 @@ function Write-BRAVOBazaRemoteCheckpoint {
     try {
         $json = $checkpoint | ConvertTo-Json -Depth 3
         [IO.File]::WriteAllText($tempLocalPath, $json, (New-Object Text.UTF8Encoding($false)))
-        $remoteCheckpointPath = ($RemoteRootPath.TrimEnd('/') + '/' + (Get-BRAVOBazaRemoteCheckpointName))
+        $canonicalRemoteCheckpointPath = ($RemoteRootPath.TrimEnd('/') + '/' + (Get-BRAVOBazaRemoteCheckpointName))
+        $temporaryRemoteCheckpointPath = ($RemoteRootPath.TrimEnd('/') + '/.bravo-sync.json.tmp-' + [guid]::NewGuid().ToString('N'))
         $transferOptions = New-Object WinSCP.TransferOptions
         $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
-        $transferResult = $Session.PutFiles($tempLocalPath, $remoteCheckpointPath, $false, $transferOptions)
-        return [bool]$transferResult.IsSuccess
+        $transferResult = $Session.PutFiles($tempLocalPath, $temporaryRemoteCheckpointPath, $false, $transferOptions)
+        if (-not $transferResult.IsSuccess) {
+            return [pscustomobject]@{ Attempted = $true; Published = $false; Error = 'не вдалося завантажити тимчасовий checkpoint' }
+        }
+        try {
+            $Session.MoveFile($temporaryRemoteCheckpointPath, $canonicalRemoteCheckpointPath)
+        } catch {
+            # Rename не вдався — прибираємо тимчасовий файл (best-effort),
+            # щоб не лишати сміття на SFTP; checkpoint вважається
+            # неопублікованим (канонічний шлях лишається зі СТАРИМ
+            # checkpoint або взагалі відсутній — ніколи частковим).
+            try { [void]$Session.RemoveFiles($temporaryRemoteCheckpointPath) } catch {
+                # Best-effort cleanup: збій прибирання tmp-файлу не
+                # важливіший за ПЕРШУ помилку (збій rename), яку повертаємо
+                # нижче. Осиротілий .tmp-* на SFTP нешкідливий.
+            }
+            return [pscustomobject]@{ Attempted = $true; Published = $false; Error = "не вдалося перейменувати checkpoint на канонічне ім'я: $($_.Exception.Message)" }
+        }
+        return [pscustomobject]@{ Attempted = $true; Published = $true; Error = $null }
     } catch {
-        return $false
+        return [pscustomobject]@{ Attempted = $true; Published = $false; Error = $_.Exception.Message }
     } finally {
         if (Test-Path -LiteralPath $tempLocalPath -PathType Leaf) {
             Remove-Item -LiteralPath $tempLocalPath -Force -ErrorAction SilentlyContinue
@@ -879,35 +1141,98 @@ function Get-BRAVOBazaFastHealthResult {
     #
     # Явне розрізнення (ТЗ п.18):
     #   A. NORMAL NEW DATA (NewAfterCutoff)  -> INFO, не alert;
-    #   B. SYNC FAILED (Status != COMPLETE/MUTATION_VIOLATION зі своєю
-    #      причиною)                          -> ALERT, "синхронізація не
-    #                                            завершена", не "N файлів
-    #                                            відсутні";
+    #   B. SYNC FAILED (Status != COMPLETE зі своєю причиною) -> ALERT,
+    #      "синхронізація не завершена", не "N файлів відсутні";
     #   C. CURRENT CYCLE INCOMPLETE (Failed>0
     #      або PendingWithinCutoff>0)          -> ALERT з деталями what/why.
+    #
+    # P1-2 (deep review): SUCCESS WHITELIST, не blacklist. Раніше нове/
+    # незнайоме значення Status (напр. INCOMPLETE з Failed=0 і
+    # PendingWithinCutoff=0 — саме такий стан лишає провал
+    # Save-BRAVOBazaState ПІСЛЯ вже успішних uploads) не перехоплювалось
+    # ЖОДНИМ if і мовчки провалювалось у фінальну "OK"-гілку. Тепер ЛИШЕ
+    # Status=COMPLETE (і без IncompatibleFiles) проходить до звичайної
+    # Healthy-оцінки; SKIPPED_CONCURRENT має власну (freshness-aware)
+    # гілку; УСЕ інше, включно з будь-яким незнайомим значенням, —
+    # Healthy=false. Unknown status fails visible, не fail open.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][object]$SyncResult)
+    param(
+        [Parameter(Mandatory = $true)][object]$SyncResult,
+        # SKIPPED_CONCURRENT hardening: "інший процес синхронізує зараз"
+        # НЕ є доказом, що хмарна копія актуальна, якщо останній
+        # ПІДТВЕРДЖЕНИЙ успішний цикл був давно (або взагалі не було
+        # жодного). Той самий порядок величини, що вже усталений в цьому
+        # комплекті для "наскільки стара копія — ще нормально"
+        # (backupMonitoring.SFTP.RemoteBackupMaxAgeHours = 24 типово).
+        [double]$ConcurrentStalenessThresholdHours = 24
+    )
 
     if ($SyncResult.Status -eq 'STATE_INVALID') {
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
             Message = "$($SyncResult.Component): стан синхронізації пошкоджено — потрібна повна реконсиляція. $($SyncResult.Error)"
+            Info = @()
+        }
+    }
+    if ($SyncResult.Status -eq 'STATE_NOT_INITIALIZED') {
+        return [pscustomobject]@{
+            Level = 'CRITICAL'; Healthy = $false
+            Message = "$($SyncResult.Component) — incremental стан не ініціалізовано. Спершу виконайте bootstrap через BRAVO_ARCHIV/BAZA. $($SyncResult.Error)"
+            Info = @()
         }
     }
     if ($SyncResult.Status -eq 'ERROR') {
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
             Message = "$($SyncResult.Component) — синхронізація не завершена: $($SyncResult.Error)"
+            Info = @()
         }
     }
     if ($SyncResult.Status -eq 'SKIPPED_CONCURRENT') {
         # Інший процес (напр. Archive) якраз синхронізує той самий
-        # компонент (Enter-BRAVOBazaSyncLock, ТЗ п.17) — це ознака, що
-        # система АКТИВНО працює, а не проблема цього циклу; ALERT тут був
-        # би саме тим false positive, якого весь цей safety-review уникає.
+        # компонент (Enter-BRAVOBazaSyncLock, Classification=Busy, ТЗ
+        # п.17) — саме по собі НЕ проблема. Але "хтось зараз працює" і
+        # "хмара актуальна" — РІЗНІ твердження: якщо останній підтверджений
+        # успішний цикл або відсутній, або застарів, "пропущено цим
+        # циклом" не повинно тихо читатися як "усе гаразд".
+        $lastSuccessfulSyncUtcRaw = [string]$SyncResult.LastSuccessfulSyncUtc
+        $isFresh = $false
+        if (-not [string]::IsNullOrWhiteSpace($lastSuccessfulSyncUtcRaw)) {
+            try {
+                $lastSuccessfulSyncUtc = [DateTime]::Parse(
+                    $lastSuccessfulSyncUtcRaw,
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::RoundtripKind)
+                $ageHours = ((Get-Date).ToUniversalTime() - $lastSuccessfulSyncUtc).TotalHours
+                $isFresh = ($ageHours -ge 0 -and $ageHours -le $ConcurrentStalenessThresholdHours)
+            } catch {
+                $isFresh = $false
+            }
+        }
+        if ($isFresh) {
+            return [pscustomobject]@{
+                Level = 'INFO'; Healthy = $true
+                Message = "$($SyncResult.Component) — синхронізацію виконує інший процес одночасно; пропущено цим циклом, останній підтверджений успішний цикл: $lastSuccessfulSyncUtcRaw ($($SyncResult.Error))"
+                Info = @()
+            }
+        }
+        # Навмисно НЕ використовується фраза "хмарна копія актуальна" (навіть
+        # у запереченні) — рядкове сканування логів/дашбордів за цією
+        # фразою не повинно випадково зачепити застережний WARNING як
+        # "усе гаразд" (ТЗ: "Do not produce the normal 'хмарна копія
+        # актуальна' message for SKIPPED_CONCURRENT").
         return [pscustomobject]@{
-            Level = 'INFO'; Healthy = $true
-            Message = "$($SyncResult.Component) — синхронізацію виконує інший процес одночасно; пропущено цим циклом ($($SyncResult.Error))"
+            Level = 'WARNING'; Healthy = $false
+            Message = (
+                "$($SyncResult.Component) — синхронізацію виконує інший процес одночасно, і " +
+                $(if ([string]::IsNullOrWhiteSpace($lastSuccessfulSyncUtcRaw)) {
+                    "жодного підтвердженого успішного циклу ще не було"
+                } else {
+                    "останній підтверджений успішний цикл застарів ($lastSuccessfulSyncUtcRaw)"
+                }) +
+                " — стан хмарної копії цим циклом НЕ підтверджено ($($SyncResult.Error))"
+            )
+            Info = @()
         }
     }
     if ($SyncResult.Status -eq 'MUTATION_VIOLATION') {
@@ -915,6 +1240,7 @@ function Get-BRAVOBazaFastHealthResult {
         return [pscustomobject]@{
             Level = 'CRITICAL'; Healthy = $false
             Message = "$($SyncResult.Component) — виявлено append-only invariant violation ($($SyncResult.MutationViolations.Count) файл(ів), напр.: $names) — передачу заблоковано, потрібне ручне рішення"
+            Info = @()
         }
     }
     if ($SyncResult.Failed -gt 0 -or $SyncResult.PendingWithinCutoff -gt 0) {
@@ -926,6 +1252,39 @@ function Get-BRAVOBazaFastHealthResult {
                 "Виявлено: $($SyncResult.DiscoveredWithinCutoff) • Передано: $($SyncResult.Uploaded) • " +
                 "Не передано: $($SyncResult.Failed)$(if ($failedNames) { " ($failedNames)" })"
             )
+            Info = @()
+        }
+    }
+    if (@($SyncResult.IncompatibleFiles).Count -gt 0) {
+        $incompatibleNames = ($SyncResult.IncompatibleFiles | Select-Object -First 5 | ForEach-Object { "$($_.RelativePath) ($($_.Reason))" }) -join '; '
+        return [pscustomobject]@{
+            Level = 'CRITICAL'; Healthy = $false
+            Message = (
+                "$($SyncResult.Component) — $(@($SyncResult.IncompatibleFiles).Count) файл(ів) не передано через несумісність імені з SFTP " +
+                "(потребує ручного скорочення локального імені): $incompatibleNames"
+            )
+            Info = @()
+        }
+    }
+
+    if ($SyncResult.Status -ne 'COMPLETE') {
+        # Дійшли сюди з Failed=0, PendingWithinCutoff=0, IncompatibleFiles
+        # порожній, АЛЕ Status все одно НЕ COMPLETE — типовий приклад: усі
+        # upload УСПІШНІ, але сам Save-BRAVOBazaState провалився
+        # (Invoke-BRAVOBazaSynchronization понижує такий цикл до
+        # INCOMPLETE саме для цього випадку). "Failed=0" тут НЕ означає
+        # "усе гаразд": стан не підтверджено збереженим. Будь-який інший/
+        # незнайомий Status так само НЕ проходить мовчки — Healthy=true
+        # можливий ЛИШЕ для явного COMPLETE.
+        $statusDetail = if ([string]::IsNullOrWhiteSpace([string]$SyncResult.Error)) {
+            "Status=$($SyncResult.Status)"
+        } else {
+            "Status=$($SyncResult.Status): $($SyncResult.Error)"
+        }
+        return [pscustomobject]@{
+            Level = 'CRITICAL'; Healthy = $false
+            Message = "$($SyncResult.Component) — синхронізація не в стані COMPLETE, хмарна копія НЕ підтверджена актуальною. $statusDetail"
+            Info = @()
         }
     }
 
@@ -933,8 +1292,22 @@ function Get-BRAVOBazaFastHealthResult {
     if ($SyncResult.NewAfterCutoff -gt 0) {
         [void]$infoParts.Add("нові після cutoff: $($SyncResult.NewAfterCutoff) файл(ів) — будуть передані наступним циклом")
     }
+    # P2 (deep review): успішний sync-цикл (Status=COMPLETE) не повинен
+    # мовчки звітувати "усе повністю перевірено", коли periodic Full Audit
+    # чи checkpoint-публікація цього ж циклу насправді провалились —
+    # дані УСЕ ОДНО в хмарі (сам upload успішний), тому це WARNING
+    # (Healthy лишається true), а НЕ CRITICAL, але воно МАЄ бути видимим.
+    $level = 'OK'
+    if ($SyncResult.FullAuditAttempted -and -not $SyncResult.FullAuditSucceeded) {
+        $level = 'WARNING'
+        [void]$infoParts.Add("періодичний Full Audit цього циклу не вдався: $($SyncResult.FullAuditError)")
+    }
+    if ($SyncResult.CheckpointAttempted -and -not $SyncResult.CheckpointPublished) {
+        $level = 'WARNING'
+        [void]$infoParts.Add("публікація remote checkpoint цього циклу не вдалася: $($SyncResult.CheckpointError)")
+    }
     return [pscustomobject]@{
-        Level = 'OK'; Healthy = $true
+        Level = $level; Healthy = $true
         Message = "$($SyncResult.Component) — хмарна копія актуальна. Cycle: $($SyncResult.CycleId). Передано: $($SyncResult.Uploaded) файл(ів) • $($SyncResult.UploadedBytes) байт. Помилок: 0."
         Info = $infoParts.ToArray()
     }
@@ -978,11 +1351,37 @@ function Invoke-BRAVOBazaComponentSyncSession {
     # відкриття WinSCP-сесії, щоб не платити за зайве з'єднання, коли інший
     # процес (напр. Archive, поки standalone Health запущено вручну без
     # -SkipIfBackupTaskRunning) вже синхронізує той самий компонент.
+    #
+    # P1-3 (deep review): лише Classification=Busy (genuine sharing
+    # violation — інший процес ЗАРАЗ тримає lock) стає SKIPPED_CONCURRENT.
+    # Classification=Error (ACL, недоступний каталог стану, зіпсований
+    # шлях) — це ERROR: інфраструктурна помилка НІКОЛИ не маскується під
+    # "просто інший процес синхронізує".
     $syncLock = Enter-BRAVOBazaSyncLock -StateRoot $StateRoot -Component $Component
     if (-not $syncLock.Success) {
         $result = New-BRAVOBazaSyncResult -Component $Component -CycleId $cycleId -StartedUtc $startedUtc -CutoffUtc $startedUtc
-        $result.Status = 'SKIPPED_CONCURRENT'
-        $result.Error = "інший процес зараз синхронізує $Component ($($syncLock.Path)): $($syncLock.Error)"
+        if ($syncLock.Classification -eq 'Busy') {
+            $result.Status = 'SKIPPED_CONCURRENT'
+            $result.Error = "інший процес зараз синхронізує $Component ($($syncLock.Path)): $($syncLock.Error)"
+            # SKIPPED_CONCURRENT hardening: сам факт "зайнято" не є доказом,
+            # що хмарна копія актуальна — читаємо LastSuccessfulSyncUtc
+            # (read-only, без lock — читання persisted state не потребує
+            # ексклюзивного доступу) для health-time freshness-рішення
+            # (Get-BRAVOBazaFastHealthResult).
+            try {
+                $concurrentStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $StateRoot -Component $Component)
+                if ($concurrentStateRead.Exists -and -not $concurrentStateRead.Corrupt) {
+                    $result.LastSuccessfulSyncUtc = $concurrentStateRead.State.LastSuccessfulSyncUtc
+                }
+            } catch {
+                # Читання стану під час SKIPPED_CONCURRENT — best-effort
+                # діагностика; провал не повинен перетворювати "зайнято" на
+                # щось інше.
+            }
+        } else {
+            $result.Status = 'ERROR'
+            $result.Error = "не вдалося отримати lock синхронізації для ${Component}: $($syncLock.Error)"
+        }
         $result.CompletedUtc = (Get-Date).ToUniversalTime()
         return $result
     }
@@ -1015,7 +1414,12 @@ function Invoke-BRAVOBazaComponentSyncSession {
             -ForceFullAudit:$ForceFullAudit
 
         if ($WriteCheckpoint -and $syncResult.Status -eq 'COMPLETE') {
-            [void](Write-BRAVOBazaRemoteCheckpoint -Session $session -RemoteRootPath $RemoteRootPath -SyncResult $syncResult)
+            # P2 (deep review): результат публікації більше НЕ відкидається
+            # — Health бачить, чи checkpoint дійсно опублікувався.
+            $checkpointOutcome = Write-BRAVOBazaRemoteCheckpoint -Session $session -RemoteRootPath $RemoteRootPath -SyncResult $syncResult
+            $syncResult.CheckpointAttempted = $checkpointOutcome.Attempted
+            $syncResult.CheckpointPublished = $checkpointOutcome.Published
+            $syncResult.CheckpointError = $checkpointOutcome.Error
         }
         return $syncResult
     } catch {
@@ -1051,6 +1455,7 @@ Export-ModuleMember -Function @(
     'New-BRAVOBazaCycleId',
     'Get-BRAVOBazaLocalSnapshot',
     'Get-BRAVOBazaSyncPlan',
+    'Test-BRAVOBazaRemoteNameCompatibility',
     'Test-BRAVOBazaRemoteDirectoryExists',
     'New-BRAVOBazaRemoteDirectoryRecursive',
     'Invoke-BRAVOBazaFileUpload',

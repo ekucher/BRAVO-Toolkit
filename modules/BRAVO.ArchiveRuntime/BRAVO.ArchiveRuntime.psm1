@@ -35,6 +35,7 @@ function Get-BRAVOBazaSettingsEffective {
     # стану без жодної помилки. Спільна функція усуває цей клас багів
     # структурно: обидва викликачі (і DryRun) читають РІВНО цю точку.
     $bazaSettings = $backupMonitoring.SFTP.BAZA
+    $mode = Get-BRAVOBazaSyncModeEffective
 
     $stateRootEffective = if ($null -ne $bazaSettings -and $bazaSettings.Contains('StateRoot') -and
         -not [string]::IsNullOrWhiteSpace([string]$bazaSettings.StateRoot)) {
@@ -72,8 +73,41 @@ function Get-BRAVOBazaSettingsEffective {
         $true
     }
 
+    # P2 (deep review): раніше production Health БЕЗУМОВНО синхронізувала
+    # BAZA перед перевіркою і завжди йшла Fast Health-шляхом — SynchronizeBeforeHealth/
+    # FastHealthEnabled лише ВІДОБРАЖАЛИСЬ (DryRun), але жоден рантайм-код
+    # їх фактично не читав як умову. Config, що обіцяє контроль, якого
+    # немає, — гірше за відсутність config: оператор міг поставити
+    # SynchronizeBeforeHealth=$false, очікуючи іншої поведінки, і
+    # мовчки отримати ту саму стару (обов'язкову sync-before-check).
+    #
+    # Для Mode=IncrementalAppendOnly ОБИДВА є mandatory-інваріантами, а не
+    # звичайним opt-out (ТЗ: "SynchronizeBeforeHealth should NOT be a
+    # normal opt-out"; "Do NOT let FastHealthEnabled=false silently
+    # restore a full 50+GB preview... unless explicitly Legacy mode") —
+    # Legacy-поведінка (повний preview, без обов'язкового sync-перед-
+    # перевіркою) уже доступна явно через Mode="Legacy", тому false тут
+    # не ігнорується мовчки, а відхиляється з чіткою вказівкою, як
+    # виправити.
+    if ($mode -eq 'IncrementalAppendOnly' -and -not $synchronizeBeforeHealthEffective) {
+        throw (
+            "backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth=`$false несумісний з Mode=`"IncrementalAppendOnly`": " +
+            "sync-перед-перевіркою — обов'язковий інваріант цього режиму, не звичайний opt-out. " +
+            "Якщо потрібна стара поведінка (без гарантії sync-перед-Health) — встановіть " +
+            "backupMonitoring.SFTP.BAZA.Mode=`"Legacy`" явно, а не лише SynchronizeBeforeHealth=`$false."
+        )
+    }
+    if ($mode -eq 'IncrementalAppendOnly' -and -not $fastHealthEnabledEffective) {
+        throw (
+            "backupMonitoring.SFTP.BAZA.FastHealthEnabled=`$false несумісний з Mode=`"IncrementalAppendOnly`": " +
+            "немає підтримуваного «гібридного» режиму (incremental sync, але повний 50+ ГБ preview на Health). " +
+            "Якщо потрібен старий full-preview шлях — встановіть backupMonitoring.SFTP.BAZA.Mode=`"Legacy`" явно, " +
+            "а не лише FastHealthEnabled=`$false."
+        )
+    }
+
     return [pscustomobject]@{
-        Mode = Get-BRAVOBazaSyncModeEffective
+        Mode = $mode
         StateRoot = $stateRootEffective
         MutationPolicy = $mutationPolicyEffective
         FullAuditEnabled = $fullAuditEnabledEffective

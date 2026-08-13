@@ -273,8 +273,10 @@ Invariants below).
   remote side is detected and re-queued for upload) — never on every cycle.
   Bootstrap/Full Audit is `BRAVO_ARCHIV`'s exclusive responsibility (it
   always runs first on schedule); a standalone `BRAVO_HEALTH.ps1` with no
-  state yet returns a clear `Status=ERROR` instead of silently re-uploading
-  everything. `BRAVO_HEALTH` now synchronizes BAZA before evaluating it
+  state yet stops before any planning/upload with a controlled
+  `Status=STATE_NOT_INITIALIZED` and zero transfer invocations instead of
+  silently re-uploading everything (hardened by the deep-review entry
+  below). `BRAVO_HEALTH` now synchronizes BAZA before evaluating it
   (`BAZA.SynchronizeBeforeHealth`, default `true`): if `BRAVO_ARCHIV` already
   produced a `SyncResult` in the same run it is reused as-is (no second
   sync — `Invoke-BRAVOBazaComponentSyncSession` is the one shared
@@ -295,10 +297,11 @@ Invariants below).
   second, unconditional barrier around the state read-modify-write section,
   independent of the existing `SkipIfBackupTaskRunning`/
   `BRAVO_OPERATION.lock` coordination that already keeps a normally
-  scheduled standalone Health run from overlapping `BRAVO_ARCHIV`; a lock
-  conflict returns `Status=SKIPPED_CONCURRENT`, which Health treats as
-  healthy/`INFO` (evidence another process is actively syncing, not a
-  problem). New `backupMonitoring.SFTP.BAZA` config block (`Mode` — default
+  scheduled standalone Health run from overlapping `BRAVO_ARCHIV`; a
+  genuine lock-contention conflict returns `Status=SKIPPED_CONCURRENT`
+  (weighed by Health against last-successful-cycle freshness — see the
+  deep-review entry below), while lock infrastructure failures
+  (ACL/path/I-O) are a real `ERROR`, never masked as concurrency. New `backupMonitoring.SFTP.BAZA` config block (`Mode` — default
   `"IncrementalAppendOnly"`, any other value fully preserves the previous
   `Sync-FolderToSFTP`/`Invoke-WinSCPBAZAComparison` code paths unchanged;
   `SynchronizeBeforeHealth`; `FastHealthEnabled`; `FullAuditEnabled`;
@@ -314,12 +317,68 @@ Invariants below).
   changed from its default. `BRAVO_DRY_RUN.ps1` reports BAZA mode, state
   path, state readability, last successful cycle, last Full Audit, and next
   scheduled Full Audit purely by reading persisted state — it never opens
-  an SFTP session or performs a sync. Known residual gap: the incremental
-  path does not yet carry over legacy SFTP filename-compatibility checking
-  (`Get-BAZARemoteNameCompatibilityIssues`); `IncompatibleNames` stays 0
-  when `Mode = "IncrementalAppendOnly"`. This is not the start of a Durable
+  an SFTP session or performs a sync. This is not the start of a Durable
   Operation Journal — the persisted state here is a narrow index scoped
   only to BAZA synchronization optimization/reliability.
+- `BRAVO.BazaSync` production-gap hardening after an independent deep
+  review, closing every finding before production rollout. (P1) A missing
+  state without bootstrap authorization now stops *before* the planner with
+  `Status=STATE_NOT_INITIALIZED` and a guaranteed zero upload invocations —
+  previously a standalone Health run on a fresh install fell through to a
+  plan where every local file looked new and could attempt to upload the
+  complete 50+ GB tree. (P1) Fast Health switched from a status blacklist
+  to a success whitelist: only `Status=COMPLETE` can reach the normal
+  healthy evaluation; `INCOMPLETE` (e.g. state-save failure *after* all
+  uploads succeeded, which previously fell through to "cloud copy current"
+  because `Failed=0`), `ERROR`, `STATE_INVALID`, `STATE_NOT_INITIALIZED`,
+  `MUTATION_VIOLATION`, and any unknown/future status fail visible, never
+  open. (P1) `Enter-BRAVOBazaSyncLock` now classifies failures: only a
+  genuine sharing violation (Win32 `ERROR_SHARING_VIOLATION`) is `Busy` →
+  `SKIPPED_CONCURRENT`; access-denied/ACL, state-directory-creation
+  failures, invalid paths, and generic I/O errors are `Error` →
+  `Status=ERROR` and a Health issue — previously every lock exception was
+  masked as "another process is syncing". (P1) Corrupt/unsupported-schema
+  state is now genuinely recoverable, but only on the Archive path
+  (`-BootstrapIfNeeded` + `FullAuditProvider`): Full Audit runs first, and
+  only on success the corrupt file is quarantined beside the canonical
+  path (`<Component>.state.corrupt.<timestamp>.json`) and a fresh state is
+  built exclusively from the audit result (already-matching remote files
+  seeded verified, only remote-missing files uploaded); a failed audit
+  leaves the corrupt evidence untouched, trusts no files, uploads nothing,
+  and honestly returns `STATE_INVALID`. Standalone Health keeps the
+  previous safe behavior (`STATE_INVALID`, zero uploads, alert, file
+  untouched). (P2) The config contract is now enforced instead of silently
+  ignored: `BAZA.SynchronizeBeforeHealth = $false` or
+  `BAZA.FastHealthEnabled = $false` combined with
+  `Mode = "IncrementalAppendOnly"` is rejected at configuration validation
+  with an actionable error pointing to `Mode = "Legacy"` as the explicit
+  path to the old behavior (`BRAVO_DRY_RUN` reports this as a scoped FAIL
+  for the BAZA section without aborting unrelated checks). (P2) The remote
+  checkpoint is published atomically (upload to `.bravo-sync.json.tmp-<guid>`,
+  then rename) and its outcome is no longer discarded:
+  `CheckpointAttempted`/`CheckpointPublished`/`CheckpointError` live on the
+  SyncResult, and a publish failure on an otherwise-successful cycle is a
+  `WARNING` (write-only operator telemetry — production Health never reads
+  the remote checkpoint back, and docs no longer claim it does). (P2) A
+  failed periodic Full Audit no longer disappears:
+  `FullAuditAttempted`/`FullAuditSucceeded`/`FullAuditError`/`LastFullAuditUtc`
+  are surfaced on the SyncResult and sync-succeeded-but-audit-failed is at
+  least a `WARNING`, never silently "fully verified". (P2) Legacy SFTP
+  filename-compatibility checking (255 UTF-8 *bytes* per path segment) now
+  applies to incremental upload candidates (O(candidates), purely local, no
+  remote tree scan, zero remote calls for an incompatible file): the file
+  is skipped with an explicit `IncompatibleFiles` entry naming the exact
+  relative path and reason, and Health raises `CRITICAL` — closing the
+  previously documented residual gap. `SKIPPED_CONCURRENT` hardening:
+  "another process is active" is no longer proof the cloud copy is current —
+  Health weighs it against the persisted `LastSuccessfulSyncUtc` (fresh
+  within 24 h → `INFO`/deferred; stale or never succeeded → `WARNING`), and
+  the normal "хмарна копія актуальна" message is never produced for it.
+  ~48 new behavioral self-tests cover all of the above through the real
+  planner/synchronization path (no WinSCP session needed), including
+  structural no-delete guarantees (no `SynchronizeDirectories`, the single
+  `RemoveFiles` call only ever removes the engine's own temporary
+  checkpoint, every `PutFiles` passes `remove=$false`).
 
 ## 5.0.0 — 2026-08-11
 
