@@ -817,6 +817,43 @@ try {
             }
         }
     }
+
+    # Acceptance DEV-LIMS (2026-08-13): `[int]( if ... )` у
+    # Invoke-BRAVOBazaIncrementalSync ВАЛІДНО парсився (if у звичайних
+    # дужках — це КОМАНДА з іменем "if", не keyword) і падав лише в
+    # рантаймі CommandNotFoundException на першому реальному прогоні —
+    # AST-парсер, CI і self-test мовчали, бо клас помилки не синтаксичний.
+    # Guard: жодного CommandAst, чиє ім'я — statement-keyword, який
+    # НІКОЛИ не буває легітимною командою (foreach/where свідомо поза
+    # списком — це валідні alias-и ForEach-Object/Where-Object у pipeline).
+    $keywordAsCommandFindings = New-Object System.Collections.ArrayList
+    $neverCommandKeywords = @('if', 'elseif', 'else', 'switch', 'while', 'do', 'try', 'catch', 'finally', 'until')
+    foreach ($analyzedFile in $powerShellFiles) {
+        if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
+
+        $keywordTokens = $null
+        $keywordErrors = $null
+        $keywordAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $analyzedFile.FullName, [ref]$keywordTokens, [ref]$keywordErrors)
+        if ($null -eq $keywordAst) { continue }
+
+        $commandNodes = @($keywordAst.FindAll({
+            param($node)
+            $node -is [System.Management.Automation.Language.CommandAst]
+        }, $true))
+        foreach ($commandNode in $commandNodes) {
+            $commandName = $commandNode.GetCommandName()
+            if ($null -ne $commandName -and $neverCommandKeywords -contains $commandName.ToLowerInvariant()) {
+                [void]$keywordAsCommandFindings.Add(
+                    ("{0}:{1} ({2})" -f $analyzedFile.Name, $commandNode.Extent.StartLineNumber, $commandName))
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($keywordAsCommandFindings.Count -eq 0) `
+        -Name "Diagnostics/NoKeywordParsedAsCommand" `
+        -Failure "statement-keyword у позиції команди (напр. if усередині (...) замість `$(...)) валідно парситься і падає ЛИШЕ в рантаймі CommandNotFoundException; знайдено: $($keywordAsCommandFindings.ToArray() -join ', ')"
+
     # Рядок, що ВИГЛЯДАЄ як облікові дані, — це справжній секрет для будь-якого
     # сканера, навіть якщо значення вигадане. Такі фікстури вже кілька разів
     # піднімали інциденти GitGuardian, які доводилось закривати вручну;

@@ -4964,7 +4964,12 @@ function Invoke-BRAVOBazaIncrementalSync {
     # взяти seed-стан, ТЗ п.15).
     $fullAuditEveryDays = $bazaSettingsEffective.FullAuditEveryDays
 
-    $operationTimeoutSeconds = [int](
+    # $(...), не (...): усередині звичайних дужок if парситься як КОМАНДА
+    # з іменем "if" (валідно для парсера!) і падає лише в рантаймі
+    # CommandNotFoundException — саме так упав перший реальний прогін
+    # BRAVO_ARCHIV на DEV-LIMS (SFTP acceptance, сценарій 1). Guard на цей
+    # клас: Diagnostics/NoKeywordParsedAsCommand у BRAVO_SELF_TEST.
+    $operationTimeoutSeconds = [int]$(
         if ([int]$backupMonitoring.SFTP.SynchronizationTimeoutSeconds -gt 0) {
             $backupMonitoring.SFTP.SynchronizationTimeoutSeconds
         } else {

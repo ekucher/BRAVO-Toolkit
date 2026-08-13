@@ -580,6 +580,23 @@ Invariants below).
   (`CrashAfterRemoteUploadBeforeStateCommitDoesNotReupload`) is
   re-modeled as the ordinary-cycle scenario it always described and
   still passes. 14 new behavioral self-tests.
+- Fix the first real-SFTP acceptance blocker (DEV-LIMS, scenario 1):
+  `BRAVO_ARCHIV` crashed with exit 90 (`The term 'if' is not
+  recognized…`) before the BAZA sync phase ever ran.
+  `Invoke-BRAVOBazaIncrementalSync` computed its operation timeout as
+  `[int]( if … )` — inside plain parentheses `if` parses as a COMMAND
+  named "if" (perfectly valid to the AST parser, CI and every syntax
+  gate) and only fails at runtime with CommandNotFoundException. The
+  self-test suite never executes this wiring function by design (it
+  opens a real WinSCP session; everything below it is tested through
+  injected fake sessions), so the first execution ever was the real
+  server. Fixed to `[int]$( if … )`. A permanent whole-bundle guard now
+  closes the entire class: `Diagnostics/NoKeywordParsedAsCommand` parses
+  every production script and fails on any `CommandAst` whose command
+  name is a statement keyword that can never be a legitimate command
+  (`if`/`elseif`/`else`/`switch`/`while`/`do`/`try`/`catch`/`finally`/`until`;
+  `foreach`/`where` deliberately excluded as valid pipeline aliases) —
+  this guard would have caught the bug at commit time.
 
 ## 5.0.0 — 2026-08-11
 
