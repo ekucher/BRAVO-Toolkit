@@ -1,18 +1,20 @@
 # Changelog
 
-## 5.1.0-rc.1 — 2026-08-14
+## 5.1.0 — 2026-08-14
 
-Release-metadata-only promotion of the `5.1.0-dev.1` cycle (below) to
-Release Candidate: `packageVersion`/`releaseChannel` bump per
-`RELEASE_POLICY.md` section 8, no functional runtime changes relative to
-the `5.1.0-dev.1` commit this promotes (`9256e56`). Functional
-development for this cycle is complete; real-SFTP BAZA acceptance
-(DEV-LIMS, 2026-08-13) passed across all 10 scenarios (iterative
-acceptance+fix — see `docs/BAZA_SFTP_ACCEPTANCE.md` section 13), and the
-two outstanding documentation findings from release-readiness review
-(stale acceptance stamp in the runbook precondition, real institution
-name in console UX examples) are closed. `5.1.0-rc.1` is ready for
-verification on a real server per `RELEASE_POLICY.md` section 9.
+Stable production release promoted from the verified `5.1.0-rc.1`
+candidate (accepted HEAD `852a0b9`, CI run 31755546128 SUCCESS,
+real-server acceptance verdict PROMOTE). The candidate passed the
+complete Windows CI pipeline and real-server acceptance on Windows
+PowerShell 5.1, including real-SFTP BAZA acceptance across all 10
+scenarios (DEV-LIMS, 2026-08-13 — see `docs/BAZA_SFTP_ACCEPTANCE.md`
+section 13). This promotion contains no functional runtime changes
+relative to the accepted candidate: it removes the prerelease suffix,
+sets the stable release channel, updates operator documentation
+headers, and regenerates the runtime integrity manifest. No
+configuration schema, state schema, credential target, archive format,
+retention default, transfer protocol, or supported-OS contract changed
+during promotion.
 
 ## 5.1.0-dev.1 — 2026-08-12
 
