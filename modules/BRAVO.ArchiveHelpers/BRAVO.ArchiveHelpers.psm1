@@ -454,3 +454,114 @@ function Get-BRAVOBackupGenerationManifestPhysicalFiles {
         [string]::Equals($_.Name, $expectedFileName, [StringComparison]::OrdinalIgnoreCase)
     })
 }
+
+function Get-BRAVORestoreGenerationManifest {
+    # Selector generation для restore-інструментів (BRAVO_RESTORE_TEST і
+    # BRAVO_DATA_RESTORE): найновіший COMPLETE generation manifest або точний
+    # -RequestedGenerationId. Живе тут, а не в кожному скрипті окремо, щоб
+    # обидва restore-потоки гарантовано вибирали generation за одними й тими
+    # самими правилами (MANIFESTS-first читання, лише status=COMPLETE,
+    # сортування за createdAt/startedAt/LastWriteTime).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [string]$RequestedGenerationId
+    )
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        throw "BackupRoot не знайдено: $BackupRoot"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId) -and
+        $RequestedGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$') {
+        throw "GenerationId має формат yyyyMMdd_HHmmss або collision-safe variant"
+    }
+
+    # dev.14: MANIFESTS-first reader з fallback на legacy корінь BackupRoot —
+    # той самий централізований reader, що Archive-retention і Health.
+    $manifestFiles = @(Get-BRAVOBackupGenerationManifestFiles `
+        -BackupRoot $BackupRoot `
+        -GenerationId $RequestedGenerationId)
+
+    $candidates = @()
+    foreach ($manifestFile in $manifestFiles) {
+        try {
+            $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$manifest.status -ne 'COMPLETE') { continue }
+            $createdAt = $manifestFile.LastWriteTime
+            foreach ($dateProperty in @('createdAt', 'startedAt')) {
+                $property = $manifest.PSObject.Properties[$dateProperty]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    $createdAt = [datetime]$property.Value
+                    break
+                }
+            }
+            $candidates += [pscustomobject]@{
+                Manifest = $manifest
+                ManifestPath = $manifestFile.FullName
+                CreatedAt = $createdAt
+            }
+        } catch {
+            if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+                throw "Generation manifest не прочитано: $($_.Exception.Message)"
+            }
+        }
+    }
+    $selected = $candidates | Sort-Object CreatedAt -Descending | Select-Object -First 1
+    if ($null -eq $selected) {
+        if ([string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+            throw 'не знайдено жодного COMPLETE generation manifest'
+        }
+        throw "COMPLETE generation '$RequestedGenerationId' не знайдено"
+    }
+    return $selected
+}
+
+function Get-BRAVOVerifiedGenerationArchive {
+    # Строгий per-component gate для restore-інструментів: прапорці manifest
+    # (Enabled/CreateSuccess/IntegritySuccess/HashSuccess), фізична наявність
+    # архіву й sidecar, коректний формат sidecar із case-sensitive збігом
+    # імені файлу та ФАКТИЧНИЙ перерахунок SHA512. Будь-яка розбіжність —
+    # throw: компонент не можна ані вважати відновлюваним (RESTORE_TEST),
+    # ані відновлювати (DATA_RESTORE).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string]$Component
+    )
+
+    $componentsProperty = $Manifest.PSObject.Properties['components']
+    if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) {
+        throw 'generation manifest не містить components'
+    }
+    $componentProperty = @($componentsProperty.Value.PSObject.Properties | Where-Object {
+        [string]::Equals($_.Name, $Component, [StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1)
+    if ($componentProperty.Count -eq 0) {
+        throw "generation не містить component $Component"
+    }
+    $componentState = $componentProperty[0].Value
+    if (-not [bool]$componentState.Enabled -or
+        -not [bool]$componentState.CreateSuccess -or
+        -not [bool]$componentState.IntegritySuccess -or
+        -not [bool]$componentState.HashSuccess) {
+        throw "component $Component не має COMPLETE archive/integrity/SHA512 state"
+    }
+
+    $archivePath = [string]$componentState.ArchivePath
+    $hashPath = [string]$componentState.HashPath
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
+        throw "component $Component посилається на відсутній archive/hash artifact"
+    }
+    $archive = Get-Item -LiteralPath $archivePath
+    $hashText = ([IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
+    if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$' -or
+        $Matches.FileName -cne $archive.Name) {
+        throw "component $Component має некоректний SHA512 sidecar"
+    }
+    $actualHash = (Get-BRAVOFileHash -Path $archive.FullName -Algorithm SHA512).Hash.ToUpperInvariant()
+    if ($actualHash -cne $Matches.Hash.ToUpperInvariant()) {
+        throw "component $Component не пройшов фактичну SHA512 verification"
+    }
+    return $archive
+}

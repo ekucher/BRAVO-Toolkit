@@ -49,7 +49,10 @@ $bypassAllowlist = @(
     'BRAVO_CREDENTIALS_SETUP.ps1',
     'BRAVO_SELF_TEST.ps1',
     'BRAVO.Archive.Runtime.ps1',
-    'BRAVO.Maintenance.Runtime.ps1'
+    'BRAVO.Maintenance.Runtime.ps1',
+    # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той
+    # самий патерн, що в Archive/Maintenance runtime.
+    'BRAVO.DataRestore.Runtime.ps1'
 )
 
 $forbiddenRules = @(
