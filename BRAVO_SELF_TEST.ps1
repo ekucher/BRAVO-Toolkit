@@ -10823,10 +10823,20 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             }
         }
     } | ConvertTo-Json -Depth 6)
-    $rebaseDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Destination = 'F:\RECOVERY_BACKUP\MODEL' })
+    # $env:SystemDrive (не жорстко закодований F:) — Join-Path у
+    # ConvertTo-BRAVODataRestoreRebasedLocalManifest резолвиться через
+    # provider і вимагає, щоб буква диска була наявним PSDrive; довільна
+    # незамаплена буква (F:) є на робочій станції розробника, але
+    # відсутня на CI runner-і — SystemDrive гарантовано існує всюди.
+    # "Інший корінь" тут — інший ПІДКАТАЛОГ (RECOVERY_BACKUP замість
+    # OLD_BACKUP), той самий сценарій relocation, що й у фіндингу.
+    $rebaseDestinationRoot = Join-Path $env:SystemDrive 'RECOVERY_BACKUP\MODEL'
+    $rebaseDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Destination = $rebaseDestinationRoot })
     $rebasedManifest = & $rebaseInvoke $dataRestoreModule $rebaseManifest @('MODEL') $rebaseDefinitions
     $rebasedArchivePath = [string]$rebasedManifest.components.MODEL.ArchivePath
     $rebasedHashPath = [string]$rebasedManifest.components.MODEL.HashPath
+    $expectedRebasedArchivePath = Join-Path $rebaseDestinationRoot 'OLDPREFIX_20260815_120000.mdz'
+    $expectedRebasedHashPath = Join-Path $rebaseDestinationRoot 'OLDPREFIX_20260815_120000.mdz.sha512'
 
     Test-BRAVOCondition `
         -Condition (
@@ -10834,8 +10844,8 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             $leafTraversal -eq 'evil.dll' -and
             $null -eq $leafEmpty -and
             $null -eq $leafDotDot -and
-            $rebasedArchivePath -eq 'F:\RECOVERY_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz' -and
-            $rebasedHashPath -eq 'F:\RECOVERY_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz.sha512'
+            $rebasedArchivePath -eq $expectedRebasedArchivePath -and
+            $rebasedHashPath -eq $expectedRebasedHashPath
         ) `
         -Name "DataRestore/LocalManifestRebasedOntoCurrentComponentDestination" `
         -Failure "Get-BRAVODataRestoreValidatedArtifactLeafName має витягувати БЕЗПЕЧНЕ leaf-ім'я (traversal-сегменти відкидаються Split-Path -Leaf, порожнє/'.'/'..' відхиляється), а ConvertTo-BRAVODataRestoreRebasedLocalManifest — переписувати ArchivePath/HashPath на ПОТОЧНИЙ canonical каталог компонента (archiveDefinitions[Type].Destination) + це ім'я, а не довіряти старому абсолютному шляху продюсера — інакше скопійований під іншим коренем backup-репозиторій відхиляється, хоча архів/sidecar/manifest валідні"
