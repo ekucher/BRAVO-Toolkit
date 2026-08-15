@@ -546,7 +546,17 @@ function Get-BRAVOVerifiedGenerationArchive {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$Manifest,
-        [Parameter(Mandatory = $true)][string]$Component
+        [Parameter(Mandatory = $true)][string]$Component,
+        # Canonical naming policy of the backup PRODUCER (той самий
+        # NameTemplate/ArchivePrefix, яким генерувалось ім'я архіву —
+        # BRAVO.config archiveDefinitions[Type].NameTemplate -f
+        # archivePrefix, generationId). Без цього manifest, у якого
+        # component-запис MODEL посилається на реальний, криптографічно
+        # валідний BLOG-архів (чи MODEL-архів ІНШОЇ generation), пройшов
+        # би integrity/SHA512-перевірки нижче — вони доводять, що файл не
+        # пошкоджений, але НЕ що він належить саме цьому Component+generation.
+        [Parameter(Mandatory = $true)][string]$NameTemplate,
+        [Parameter(Mandatory = $true)][string]$ArchivePrefix
     )
 
     $componentsProperty = $Manifest.PSObject.Properties['components']
@@ -574,6 +584,18 @@ function Get-BRAVOVerifiedGenerationArchive {
         throw "component $Component посилається на відсутній archive/hash artifact"
     }
     $archive = Get-Item -LiteralPath $archivePath
+
+    # Identity binding: ім'я артефакта має ТОЧНО відповідати тому, що
+    # producer згенерував би САМЕ для цього Component і САМЕ для цього
+    # generationId — інакше пошкоджений/підмінений manifest міг би
+    # підставити валідний архів ІНШОГО компонента чи ІНШОЇ generation,
+    # і кожна перевірка нижче (SHA512, sidecar) пройшла б, бо файл сам
+    # по собі не пошкоджений.
+    $manifestGenerationId = [string]$Manifest.generationId
+    $expectedArchiveName = $NameTemplate -f $ArchivePrefix, $manifestGenerationId
+    if (-not [string]::Equals($archive.Name, $expectedArchiveName, [StringComparison]::Ordinal)) {
+        throw "component ${Component}: ім'я артефакта '$($archive.Name)' не відповідає очікуваному для Component+generation ('$expectedArchiveName') — можлива підміна компонента/generation у manifest"
+    }
     $hashText = ([IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
     if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$' -or
         $Matches.FileName -cne $archive.Name) {

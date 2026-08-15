@@ -266,7 +266,9 @@ try {
         try {
             $latestArchive = Get-BRAVOVerifiedGenerationArchive `
                 -Manifest $selectedGeneration.Manifest `
-                -Component $componentName
+                -Component $componentName `
+                -NameTemplate ([string]$archiveDefinition.NameTemplate) `
+                -ArchivePrefix ([string]$global:archivePrefix)
         } catch {
             Add-RestoreDrillResult FAIL $componentName $null $null 0 0 $_.Exception.Message
             if (-not $AsJson) {

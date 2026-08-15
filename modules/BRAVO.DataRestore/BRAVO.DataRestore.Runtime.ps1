@@ -377,6 +377,43 @@ function Test-BRAVODataRestoreGenerationIdFormat {
     return [bool]($GenerationId -match '^\d{8}_\d{6}(?:_\d+)?$')
 }
 
+function Get-BRAVODataRestoreGenerationIdSortKey {
+    # Канонічний ключ хронологічного сортування generationId: timestamp
+    # (yyyyMMdd_HHmmss) як [datetime] + collision-safe суфікс (_N, за
+    # замовчуванням 0) як [int] — НЕ lexicographic порівняння рядка, де
+    # "..._9" помилково сортується ПІСЛЯ "..._10". Некоректний формат
+    # (не мало б статись після Test-BRAVODataRestoreGenerationIdFormat, але
+    # fail-safe і тут) дає найстарший можливий ключ — програє будь-якому
+    # валідному значенню, а не випадково виграє.
+    param([Parameter(Mandatory = $true)][string]$GenerationId)
+
+    $match = [regex]::Match($GenerationId, '^(?<ts>\d{8}_\d{6})(?:_(?<suffix>\d+))?$')
+    if (-not $match.Success) {
+        return [pscustomobject]@{ Timestamp = [datetime]::MinValue; Suffix = 0 }
+    }
+    $timestamp = try {
+        [datetime]::ParseExact($match.Groups['ts'].Value, 'yyyyMMdd_HHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+    } catch {
+        [datetime]::MinValue
+    }
+    $suffix = if ($match.Groups['suffix'].Success) { [int]$match.Groups['suffix'].Value } else { 0 }
+    return [pscustomobject]@{ Timestamp = $timestamp; Suffix = $suffix }
+}
+
+function Sort-BRAVODataRestoreManifestNamesByGenerationDescending {
+    # Сортує ІМЕНА manifest-файлів (BRAVO_BACKUP_<generationId>.json) за
+    # канонічним хронологічним ключем (timestamp DESC, suffix numeric
+    # DESC), а не за лексикографічним порядком самого рядка імені файлу.
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ManifestNames)
+
+    return @($ManifestNames | ForEach-Object {
+        $generationId = [IO.Path]::GetFileNameWithoutExtension($_) -replace '^BRAVO_BACKUP_', ''
+        $sortKey = Get-BRAVODataRestoreGenerationIdSortKey -GenerationId $generationId
+        [pscustomobject]@{ Name = $_; Timestamp = $sortKey.Timestamp; Suffix = $sortKey.Suffix }
+    } | Sort-Object -Property @{Expression = 'Timestamp'; Descending = $true }, @{Expression = 'Suffix'; Descending = $true } |
+        Select-Object -ExpandProperty Name)
+}
+
 function Test-BRAVODataRestoreAsciiPath {
     param([string]$Path)
     if ([string]::IsNullOrEmpty($Path)) { return $false }
@@ -632,16 +669,39 @@ function Get-BRAVODataRestorePlan {
         [Parameter(Mandatory = $true)][string]$RuntimeRootPath,
         [Parameter(Mandatory = $true)][string]$StagingRoot,
         [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions,
+        # Canonical restore-target каталоги (Type -> шлях), НЕЗАЛЕЖНІ від
+        # фізичної наявності: напр. bravoDiscoveryResult.BRAVOEXCH_SOURCE.
+        # ArchiveDefinitions.Source для BRAVOEXCH навмисно existence-
+        # qualified у BRAVO.config (порожній Source, коли черговий каталог
+        # зараз відсутній — легітимний стан для idle-черги), але саме
+        # ВІДСУТНІЙ production-каталог і є типовим disaster-restore
+        # сценарієм: InPlace-ціль має братись із canonical discovery, а не
+        # з backup-orientованого Source. Коли ключ відсутній/порожній —
+        # fallback на ArchiveDefinitions.Source (стара поведінка).
+        [hashtable]$RestoreTargetDirectories,
         [Parameter(Mandatory = $true)][string]$RunStamp
     )
 
     $liveSources = @{}
     foreach ($definition in $ArchiveDefinitions) {
+        $definitionType = [string]$definition.Type
         $definitionSource = [string]$definition.Source
-        $liveSources[[string]$definition.Type] = if ([string]::IsNullOrWhiteSpace($definitionSource)) {
+        $backupDerivedDirectory = if ([string]::IsNullOrWhiteSpace($definitionSource)) {
             $null
         } else {
             Split-Path $definitionSource -Parent
+        }
+        $canonicalTargetDirectory = if ($null -ne $RestoreTargetDirectories -and
+            $RestoreTargetDirectories.ContainsKey($definitionType) -and
+            -not [string]::IsNullOrWhiteSpace([string]$RestoreTargetDirectories[$definitionType])) {
+            [string]$RestoreTargetDirectories[$definitionType]
+        } else {
+            $null
+        }
+        $liveSources[$definitionType] = if (-not [string]::IsNullOrWhiteSpace($canonicalTargetDirectory)) {
+            $canonicalTargetDirectory
+        } else {
+            $backupDerivedDirectory
         }
     }
 
@@ -730,6 +790,31 @@ function Get-BRAVODataRestorePlan {
             LiveSourceDirectory = $liveSource
             TargetDirectory = $liveSource
             PrerestoreDirectory = $prerestoreDirectory
+        }
+    }
+    # Попарна перевірка: жодні два обрані live-джерела не можуть збігатися
+    # чи бути одне всередині іншого (в БУДЬ-ЯКУ сторону). Інакше move-aside
+    # компонента, обробленого пізніше, знесе вбік ЦІЛИЙ батьківський
+    # каталог — включно з уже відновленим раніше компонентом і його
+    # prerestore-копією — і прогон міг би завершитись success, хоча
+    # раніший компонент фізично зник, а записаний для нього
+    # PrerestoreDirectory більше не існує.
+    for ($outerIndex = 0; $outerIndex -lt $planComponents.Count; $outerIndex++) {
+        for ($innerIndex = $outerIndex + 1; $innerIndex -lt $planComponents.Count; $innerIndex++) {
+            $outerComponent = $planComponents[$outerIndex]
+            $innerComponent = $planComponents[$innerIndex]
+            $outerDirectory = [string]$outerComponent.LiveSourceDirectory
+            $innerDirectory = [string]$innerComponent.LiveSourceDirectory
+            if ((Test-BRAVODataRestorePathEquals -First $outerDirectory -Second $innerDirectory) -or
+                (Test-BRAVODataRestorePathWithin -Path $outerDirectory -Directory $innerDirectory) -or
+                (Test-BRAVODataRestorePathWithin -Path $innerDirectory -Directory $outerDirectory)) {
+                return [pscustomobject]@{
+                    Success = $false
+                    Error = "live-джерела компонентів $($outerComponent.Type) ($outerDirectory) і $($innerComponent.Type) ($innerDirectory) перетинаються — InPlace неможливий: move-aside одного знищив би дані іншого"
+                    TargetRoot = $null
+                    Components = @()
+                }
+            }
         }
     }
     return [pscustomobject]@{ Success = $true; Error = $null; TargetRoot = $null; Components = @($planComponents) }
@@ -1774,6 +1859,32 @@ function Get-BRAVODataRestoreWinSCPListingNames {
     return @($names)
 }
 
+function Test-BRAVODataRestoreWinSCPListingSucceeded {
+    # Invoke-BRAVODataRestoreWinSCPScript навмисно повертає Success=true,
+    # якщо XML-журнал існує, НАВІТЬ коли сам WinSCP.com завершився з
+    # ненульовим кодом (per-operation результати живуть у самому журналі —
+    # той самий контракт, що вже перевіряється для download через
+    # Get-BRAVODataRestoreWinSCPDownloads). Для ls-лістингу без цієї
+    # перевірки перерваний/частковий перелік manifest-ів міг би мовчазно
+    # приховати найновіші файли — автоматичний вибір довірився б неповному
+    # списку і обрав би старішу generation. Fail-closed: відсутність
+    # жодного <ls>-результату або хоча б один result success!=true —
+    # трактується як невдала операція лістингу.
+    param([System.Xml.XmlDocument]$Xml)
+
+    if ($null -eq $Xml) { return $false }
+    $namespaceManager = New-BRAVODataRestoreWinSCPNamespaceManager -Xml $Xml
+    $listingNodes = @($Xml.SelectNodes("//w:ls", $namespaceManager))
+    if ($listingNodes.Count -eq 0) { return $false }
+    foreach ($listingNode in $listingNodes) {
+        $resultNode = $listingNode.SelectSingleNode("w:result", $namespaceManager)
+        if ($null -eq $resultNode -or $resultNode.GetAttribute("success") -ne "true") {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Get-BRAVODataRestoreWinSCPDownloads {
     param([System.Xml.XmlDocument]$Xml)
 
@@ -1870,9 +1981,17 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
         if (-not $listingSession.Success) {
             throw "не вдалося отримати перелік manifest-ів з SFTP: $($listingSession.Error)"
         }
-        $allManifestNames = @(Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
-            Where-Object { $_ -match '^BRAVO_BACKUP_\d{8}_\d{6}(?:_\d+)?\.json$' } |
-            Sort-Object -Descending)
+        # Invoke-BRAVODataRestoreWinSCPScript Success=true не гарантує, що
+        # сама ls-операція завершилась успішно (той самий контракт, що вже
+        # перевіряється для download): перерваний/частковий лістинг міг би
+        # мовчазно приховати найновіші manifest-и і призвести до вибору
+        # старішої generation.
+        if (-not (Test-BRAVODataRestoreWinSCPListingSucceeded -Xml $listingSession.Xml)) {
+            throw 'перелік manifest-ів з SFTP не підтверджено (ls-операція не позначена як успішна в XML-журналі WinSCP)'
+        }
+        $allManifestNames = @(Sort-BRAVODataRestoreManifestNamesByGenerationDescending -ManifestNames @(
+            Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
+                Where-Object { $_ -match '^BRAVO_BACKUP_\d{8}_\d{6}(?:_\d+)?\.json$' }))
         if ($allManifestNames.Count -eq 0) {
             throw "на SFTP ($remoteManifestDirectory) не знайдено жодного generation manifest"
         }
@@ -1956,7 +2075,11 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
                 Name = $manifestName
             }
         }
-        $selected = $candidates | Sort-Object Name -Descending | Select-Object -First 1
+        $selected = $null
+        foreach ($orderedCandidateName in @(Sort-BRAVODataRestoreManifestNamesByGenerationDescending -ManifestNames @($candidates | Select-Object -ExpandProperty Name))) {
+            $selected = @($candidates | Where-Object { $_.Name -eq $orderedCandidateName }) | Select-Object -First 1
+            if ($null -ne $selected) { break }
+        }
         if ($null -ne $selected) { break }
     }
     if ($null -eq $selected) {
@@ -2226,9 +2349,9 @@ if ($ListGenerations) {
         if (-not $listingSession.Success) {
             throw "не вдалося отримати перелік manifest-ів з SFTP: $($listingSession.Error)"
         }
-        $remoteManifestNames = @(Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
-            Where-Object { $_ -match '^BRAVO_BACKUP_\d{8}_\d{6}(?:_\d+)?\.json$' } |
-            Sort-Object -Descending |
+        $remoteManifestNames = @(Sort-BRAVODataRestoreManifestNamesByGenerationDescending -ManifestNames @(
+            Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
+                Where-Object { $_ -match '^BRAVO_BACKUP_\d{8}_\d{6}(?:_\d+)?\.json$' }) |
             Select-Object -First 10)
         Write-BRAVOResultSection -Title "Доступні generation на SFTP ($remoteManifestDirectory)"
         if ($remoteManifestNames.Count -eq 0) {
@@ -2379,6 +2502,16 @@ try {
         }
 
         # --- 3. План цілей ---
+        # Canonical restore-target каталоги (незалежні від фізичної
+        # наявності) — той самий bravoDiscoveryResult, що вже формує
+        # ArchiveDefinitions.Source, але без existence-якісного фільтра
+        # BRAVOEXCH (BRAVO.config): для InPlace саме відсутній production-
+        # каталог і є типовим disaster-restore сценарієм.
+        $restoreTargetDirectories = @{
+            MODEL = [string]$global:bravoDiscoveryResult.MODEL_SOURCE
+            BLOG = [string]$global:bravoDiscoveryResult.BLOG_SOURCE
+            BRAVOEXCH = [string]$global:bravoDiscoveryResult.BRAVOEXCH_SOURCE
+        }
         $restorePlan = Get-BRAVODataRestorePlan `
             -ComponentTypes $componentTypes `
             -RestoreMode $Mode `
@@ -2387,6 +2520,7 @@ try {
             -RuntimeRootPath $bravoScriptDirectory `
             -StagingRoot $stagingRootPath `
             -ArchiveDefinitions @($global:archiveDefinitions) `
+            -RestoreTargetDirectories $restoreTargetDirectories `
             -RunStamp $runTimestamp
         if (-not $restorePlan.Success) {
             Stop-BRAVODataRestoreRun -Category InvalidConfiguration -Reason $restorePlan.Error
@@ -2474,10 +2608,15 @@ try {
             # 5c. Спільний строгий gate (sidecar + фактичний SHA512). Після
             # пре-перевірок вище будь-яка його відмова — саме хеш-клас (42).
             $verifiedArchive = $null
+            $componentNameTemplate = [string]@($global:archiveDefinitions | Where-Object {
+                [string]::Equals([string]$_.Type, $componentType, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1).NameTemplate
             try {
                 $verifiedArchive = Get-BRAVOVerifiedGenerationArchive `
                     -Manifest $selectedManifest `
-                    -Component $componentType
+                    -Component $componentType `
+                    -NameTemplate $componentNameTemplate `
+                    -ArchivePrefix ([string]$global:archivePrefix)
             } catch {
                 Stop-BRAVODataRestoreRun -Category HashValidationFailed -Reason $_.Exception.Message
             }
@@ -2633,8 +2772,22 @@ try {
             try {
                 Set-BRAVODataRestoreCreatedDirectoryAcl -Path $restorePlan.TargetRoot
             } catch {
-                $script:dataRestoreWarningCount++
-                Write-DataRestoreLog -Message "Не вдалося застосувати захисний ACL до $($restorePlan.TargetRoot): $($_.Exception.Message)" -Level 'WARNING'
+                # Захисний ACL — ЄДИНИЙ контроль конфіденційності для щойно
+                # створеного out-of-place кореня (видобуті LIMS-дані інакше
+                # лишаються лише з успадкованими, потенційно широкодоступними
+                # правами каталогу). Провал не може бути WARNING із
+                # продовженням extraction — це fail-open. Прибираємо ЛИШЕ
+                # щойно створений цим прогоном (ще порожній, $createdTargetRoot=true)
+                # корінь — ніколи наявний оператор-owned каталог.
+                $aclFailureReason = $_.Exception.Message
+                try {
+                    if (Test-Path -LiteralPath $restorePlan.TargetRoot) {
+                        Remove-Item -LiteralPath $restorePlan.TargetRoot -Recurse -Force -ErrorAction Stop
+                    }
+                } catch {
+                    $aclFailureReason = "$aclFailureReason; додатково не вдалося прибрати щойно створений незахищений корінь $($restorePlan.TargetRoot): $($_.Exception.Message)"
+                }
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "захисний ACL для нового out-of-place кореня не застосовано: $aclFailureReason"
             }
         }
         foreach ($planComponent in $restorePlan.Components) {
