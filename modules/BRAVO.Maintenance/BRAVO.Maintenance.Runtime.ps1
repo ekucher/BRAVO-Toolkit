@@ -763,6 +763,12 @@ $script:ScriptStartTime = [DateTime]::Now
 $script:SlackMessageBuffer = New-Object 'System.Collections.Generic.List[string]'
 $script:CriticalErrors = $false
 $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]'
+# Окрема черга для notification-only WARNING/ERROR (Send-SlackAlert
+# -Severity без -IsCritical): CriticalErrorsList лишається виключно для
+# фактичних execution-critical подій (-IsCritical/$isSpaceError), щоб
+# Send-FinalReport не ескалював notification-severity WARNING до
+# "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ"/CRITICAL (review finding #2).
+$script:NotificationAlertQueue = New-Object 'System.Collections.Generic.List[object]'
 $script:criticalErrorOccurred = $false
 # Лічильник WARNING для контракту кодів завершення: успіх без жодного
 # попередження -> 0, успіх із попередженнями -> 10 (Resolve-BRAVOExitCode).
@@ -1672,11 +1678,21 @@ function Send-SlackAlert {
             Write-Log "ПОМИЛКА негайної відправки: $($_.Exception.Message)" -Level "ERROR"
         }
     }
-    else {
-        # Групування для Send-FinalReport — та сама черга, що й раніше для
-        # -IsCritical; тепер доступна й для -Severity WARNING/ERROR без
-        # побічного впливу на OperationSeverity.
+    elseif ($IsCritical) {
+        # Фактична execution-critical подія — та сама черга, що й раніше,
+        # без жодної зміни (CriticalErrorsList лишається виключно для
+        # -IsCritical, review finding #2).
         $script:CriticalErrorsList.Add($Message)
+    }
+    else {
+        # Notification-only WARNING/ERROR (-Severity, без -IsCritical) —
+        # окрема черга: NotificationSeverity лишається WARNING/ERROR аж до
+        # Send-FinalReport, не "успадковує" CRITICAL-презентацію
+        # CriticalErrorsList.
+        $script:NotificationAlertQueue.Add([pscustomobject]@{
+            Severity = $effectiveSeverity
+            Message = $Message
+        })
     }
 }
 
@@ -3831,6 +3847,25 @@ function Send-FinalReport {
         $notificationSeverity = "CRITICAL"
         $shouldSend = $true
     }
+    elseif ($script:NotificationAlertQueue.Count -gt 0) {
+        # Notification-only WARNING/ERROR (Send-SlackAlert -Severity, без
+        # -IsCritical) — окрема гілка від CRITICAL вище: NotificationSeverity
+        # лишається WARNING/ERROR, а не успадковує CRITICAL-презентацію
+        # (review finding #2). Відправляється так само в режимах
+        # "errors_only" та "all" (WARNING/ERROR завжди -> ALERTS).
+        $notificationSeverity = if (@($script:NotificationAlertQueue | Where-Object { $_.Severity -eq "ERROR" }).Count -gt 0) {
+            "ERROR"
+        } else {
+            "WARNING"
+        }
+        $notificationMessage = New-MaintenanceNotificationMessage `
+            -Title "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ" `
+            -TitleEmoji ":warning:" `
+            -Duration $elapsedTime `
+            -Details @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) `
+            -LogPath $LOG_FILE
+        $shouldSend = $true
+    }
     else {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
@@ -3921,11 +3956,18 @@ function Send-FinalReport {
             # 'УСПІШНО'/'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'.
             $maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode
             $maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot
-            $maintenanceNotificationTitleEmoji = if ($maintenanceNotificationStatus.Text -eq 'УСПІШНО') {
+            # NotificationSeverity (маршрутизація) виводиться з ТОГО САМОГО
+            # канонічного final status, що визначає TitleEmoji/текст
+            # повідомлення — єдине джерело істини, щоб фактичний вміст
+            # ("УСПІШНО З ПОПЕРЕДЖЕННЯМИ" + :warning:) і канал доставки
+            # (GENERAL/ALERTS) ніколи не розходились (review finding #1).
+            $maintenanceIsPureSuccess = $maintenanceNotificationStatus.Text -eq 'УСПІШНО'
+            $maintenanceNotificationTitleEmoji = if ($maintenanceIsPureSuccess) {
                 ':white_check_mark:'
             } else {
                 ':warning:'
             }
+            $notificationSeverity = if ($maintenanceIsPureSuccess) { "SUCCESS" } else { "WARNING" }
             $notificationMessage = New-MaintenanceNotificationMessage `
                 -Title "BRAVO MAINTENANCE — $($maintenanceNotificationStatus.Text)" `
                 -TitleEmoji $maintenanceNotificationTitleEmoji `

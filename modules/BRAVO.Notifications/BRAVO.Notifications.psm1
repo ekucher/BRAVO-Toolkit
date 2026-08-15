@@ -474,18 +474,26 @@ function Resolve-BRAVONotificationRoute {
         $script:BRAVODefaultNotificationRouting
     }
 
+    # Semantics самого NotificationMode пріоритетніші за (можливо
+    # нестандартну/користувацьку) RoutingTable — custom-таблиця не повинна
+    # мати змоги обійти контракт errors_only:
+    #   SUCCESS                  -> none (незалежно від таблиці)
+    #   WARNING/ERROR/CRITICAL   -> alerts (незалежно від таблиці)
+    # Це узгоджено з Health/Maintenance preflight, який під errors_only
+    # резолвить лише ALERTS endpoint — custom-маршрут у "general" для
+    # non-SUCCESS severity там просто не мав би webhook для доставки.
+    if ($NotificationMode -eq "errors_only") {
+        if ($Severity -eq "SUCCESS") {
+            return "none"
+        }
+        return "alerts"
+    }
+
     $route = if ($effectiveTable.Contains($Severity) -and
         -not [string]::IsNullOrWhiteSpace([string]$effectiveTable[$Severity])) {
         ([string]$effectiveTable[$Severity]).ToLowerInvariant()
     } else {
         $script:BRAVODefaultNotificationRouting[$Severity]
-    }
-
-    # errors_only: SUCCESS ніколи не йде в GENERAL, незалежно від того, що
-    # каже (можливо нестандартна/користувацька) RoutingTable — це семантика
-    # самого Mode, а не маршрутизації по каналах.
-    if ($NotificationMode -eq "errors_only" -and $Severity -eq "SUCCESS") {
-        return "none"
     }
 
     if ($route -notin @("general", "alerts")) {
