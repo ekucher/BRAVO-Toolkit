@@ -1,7 +1,20 @@
-﻿# Shared BRAVO notification helpers with an explicit Compatibility dependency.
+﻿# Shared BRAVO notification helpers with explicit Compatibility/Credentials dependencies.
 
 $compatibilityManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Compatibility\BRAVO.Compatibility.psd1'
 Import-Module -Name $compatibilityManifest -ErrorAction Stop
+
+$credentialsManifest = Join-Path (Split-Path $PSScriptRoot -Parent) 'BRAVO.Credentials\BRAVO.Credentials.psd1'
+Import-Module -Name $credentialsManifest -ErrorAction Stop
+
+# Безпечна дефолтна routing-таблиця severity -> канал. Використовується,
+# коли викликач не передав -RoutingTable (стара конфігурація без
+# NotificationRouting) або передав щось не-hashtable.
+$script:BRAVODefaultNotificationRouting = @{
+    SUCCESS  = "general"
+    WARNING  = "alerts"
+    ERROR    = "alerts"
+    CRITICAL = "alerts"
+}
 
 function Get-HostInformation {
     if ($null -ne $script:CachedHostInformation) {
@@ -426,4 +439,216 @@ function Split-DiscordNotificationText {
         $chunks.Add($currentChunk.ToString())
     }
     return $chunks.ToArray()
+}
+
+# ---------------------------------------------------------------------------
+# Централізована severity-based маршрутизація сповіщень (GENERAL/ALERTS).
+#
+# Pipeline: Severity -> (Resolve-BRAVONotificationRoute) -> Route ->
+#           (Resolve-BRAVONotificationEndpoint) -> WebhookUrl ->
+#           (ConvertTo-BRAVONotificationPayloadText) -> chunks ->
+#           (Send-BRAVONotificationChunks) -> delivery.
+# Send-BRAVONotification композує всі стадії для типового виклику з runtime.
+# ---------------------------------------------------------------------------
+
+function Resolve-BRAVONotificationRoute {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("SUCCESS", "WARNING", "ERROR", "CRITICAL")]
+        [string]$Severity,
+
+        [ValidateSet("none", "errors_only", "all")]
+        [string]$NotificationMode = "all",
+
+        [hashtable]$RoutingTable
+    )
+
+    if ($NotificationMode -eq "none") {
+        return "none"
+    }
+
+    $effectiveTable = if ($RoutingTable -is [hashtable] -and $RoutingTable.Count -gt 0) {
+        $RoutingTable
+    } else {
+        $script:BRAVODefaultNotificationRouting
+    }
+
+    $route = if ($effectiveTable.Contains($Severity) -and
+        -not [string]::IsNullOrWhiteSpace([string]$effectiveTable[$Severity])) {
+        ([string]$effectiveTable[$Severity]).ToLowerInvariant()
+    } else {
+        $script:BRAVODefaultNotificationRouting[$Severity]
+    }
+
+    # errors_only: SUCCESS ніколи не йде в GENERAL, незалежно від того, що
+    # каже (можливо нестандартна/користувацька) RoutingTable — це семантика
+    # самого Mode, а не маршрутизації по каналах.
+    if ($NotificationMode -eq "errors_only" -and $Severity -eq "SUCCESS") {
+        return "none"
+    }
+
+    if ($route -notin @("general", "alerts")) {
+        $route = $script:BRAVODefaultNotificationRouting[$Severity]
+    }
+
+    return $route
+}
+
+function Resolve-BRAVONotificationEndpoint {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("slack", "discord")]
+        [string]$Provider,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("general", "alerts")]
+        [string]$Route,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$CredentialTargets
+    )
+
+    $normalizedProvider = $Provider.ToLowerInvariant()
+    $routeKey = if ($Route -eq "general") { "General" } else { "Alerts" }
+
+    # Route-специфічний target -> legacy provider-wide target -> жорсткий
+    # літерал. Це і є backward-compatibility fallback: сервер, де
+    # налаштовано лише BRAVO_DISCORD_URL/BRAVO_SLACK_URL, продовжує
+    # отримувати сповіщення в обидва канали через один legacy webhook.
+    $candidateTargetNames = New-Object System.Collections.Generic.List[string]
+
+    if ($normalizedProvider -eq "discord") {
+        $routeSpecificKey = "DiscordWebhook$routeKey"
+        $legacyKey = "DiscordWebhook"
+        $legacyLiteral = "BRAVO_DISCORD_URL"
+    } else {
+        $routeSpecificKey = "SlackWebhook$routeKey"
+        $legacyKey = "SlackWebhook"
+        $legacyLiteral = "BRAVO_SLACK_URL"
+    }
+
+    if ($CredentialTargets.Contains($routeSpecificKey) -and
+        -not [string]::IsNullOrWhiteSpace([string]$CredentialTargets[$routeSpecificKey])) {
+        $candidateTargetNames.Add([string]$CredentialTargets[$routeSpecificKey])
+    }
+    if ($CredentialTargets.Contains($legacyKey) -and
+        -not [string]::IsNullOrWhiteSpace([string]$CredentialTargets[$legacyKey])) {
+        $candidateTargetNames.Add([string]$CredentialTargets[$legacyKey])
+    }
+    $candidateTargetNames.Add($legacyLiteral)
+
+    $lastError = $null
+    foreach ($targetName in ($candidateTargetNames | Select-Object -Unique)) {
+        try {
+            $secret = Get-BRAVOCredentialSecret -Target $targetName
+        } catch {
+            $lastError = $_
+            $secret = $null
+        }
+        if (-not [string]::IsNullOrWhiteSpace($secret)) {
+            return $secret
+        }
+    }
+
+    if ($lastError) {
+        throw "Не вдалося отримати webhook для $Provider/$Route з Credential Manager: $($lastError.Exception.Message)"
+    }
+    throw "Webhook для $Provider/$Route не налаштовано в Credential Manager (перевірені targets: $($candidateTargetNames -join ', '))"
+}
+
+function ConvertTo-BRAVONotificationPayloadText {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("slack", "discord")]
+        [string]$Provider,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ($Provider.ToLowerInvariant() -eq "discord") {
+        $discordText = ConvertTo-DiscordNotificationText -Message $Message
+        return @(Split-DiscordNotificationText -Message $discordText)
+    }
+    return @($Message)
+}
+
+function Send-BRAVONotificationChunks {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("slack", "discord")]
+        [string]$Provider,
+
+        [Parameter(Mandatory = $true)]
+        [string]$WebhookUrl,
+
+        [Parameter(Mandatory = $true)]
+        [string[]]$MessageChunks,
+
+        [int]$TimeoutSeconds = 30
+    )
+
+    foreach ($chunk in $MessageChunks) {
+        Send-BRAVOWebhookNotification -Provider $Provider -WebhookUrl $WebhookUrl -Message $chunk -TimeoutSeconds $TimeoutSeconds
+    }
+}
+
+function Send-BRAVONotification {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("SUCCESS", "WARNING", "ERROR", "CRITICAL")]
+        [string]$Severity,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Message,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("slack", "discord")]
+        [string]$Provider,
+
+        [ValidateSet("none", "errors_only", "all")]
+        [string]$NotificationMode = "all",
+
+        [hashtable]$RoutingTable,
+
+        [Parameter(Mandatory = $true)]
+        [hashtable]$CredentialTargets,
+
+        [int]$TimeoutSeconds = 30,
+
+        [switch]$PassThru
+    )
+
+    $route = Resolve-BRAVONotificationRoute -Severity $Severity -NotificationMode $NotificationMode -RoutingTable $RoutingTable
+
+    if ($route -eq "none") {
+        if ($PassThru) {
+            return [pscustomobject]@{
+                Sent = $false
+                Route = "none"
+                Reason = "NotificationMode/RoutingTable придушили доставку для severity $Severity"
+                ChunkCount = 0
+            }
+        }
+        return $null
+    }
+
+    $webhookUrl = Resolve-BRAVONotificationEndpoint -Provider $Provider -Route $route -CredentialTargets $CredentialTargets
+    $chunks = ConvertTo-BRAVONotificationPayloadText -Provider $Provider -Message $Message
+    Send-BRAVONotificationChunks -Provider $Provider -WebhookUrl $webhookUrl -MessageChunks $chunks -TimeoutSeconds $TimeoutSeconds
+
+    if ($PassThru) {
+        return [pscustomobject]@{
+            Sent = $true
+            Route = $route
+            Reason = $null
+            ChunkCount = $chunks.Count
+        }
+    }
+    return $null
 }

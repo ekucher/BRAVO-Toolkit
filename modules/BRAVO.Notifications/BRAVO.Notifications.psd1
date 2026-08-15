@@ -14,7 +14,12 @@
         'Format-BRAVOOperatorStatusLine',
         'New-BRAVOOperatorNotificationMessage',
         'ConvertTo-DiscordNotificationText',
-        'Split-DiscordNotificationText'
+        'Split-DiscordNotificationText',
+        'Resolve-BRAVONotificationRoute',
+        'Resolve-BRAVONotificationEndpoint',
+        'ConvertTo-BRAVONotificationPayloadText',
+        'Send-BRAVONotificationChunks',
+        'Send-BRAVONotification'
     )
     VariablesToExport = @()
     CmdletsToExport = @()
