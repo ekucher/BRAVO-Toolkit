@@ -314,7 +314,26 @@ $script:effectiveSevenZipTimeoutSeconds = if ($TimeoutSeconds -gt 0) {
 $stagingRootPath = if ([string]::IsNullOrWhiteSpace($StagingPath)) {
     Join-Path $backupRootPath 'RESTORE_STAGING'
 } else {
-    [System.IO.Path]::GetFullPath([Environment]::ExpandEnvironmentVariables($StagingPath))
+    # Абсолютність вимагається явно (round-7 P2): на відміну від -TargetPath
+    # (Get-BRAVODataRestorePlan уже вимагає IsPathRooted), -StagingPath
+    # раніше йшов напряму в GetFullPath без цієї перевірки — відносне
+    # значення резолвилось відносно робочого каталогу ЕЛЕВОВАНОГО процесу
+    # (типово системний/runtime каталог, не те, що оператор мав на увазі),
+    # і SFTP-завантаження та рекурсивне очищення generation відбувались би
+    # саме там. Некоректний/невирішуваний шлях тут МУСИТЬ класифікуватись
+    # як InvalidConfiguration (exit 30), а не провалюватись у
+    # generic catch-all InternalError (exit 90) нижче за файлом.
+    $expandedStagingPath = [Environment]::ExpandEnvironmentVariables($StagingPath)
+    if (-not [System.IO.Path]::IsPathRooted($expandedStagingPath)) {
+        Write-Host "ПОМИЛКА: -StagingPath має бути абсолютним шляхом: $StagingPath" -ForegroundColor Red
+        exit 30
+    }
+    try {
+        [System.IO.Path]::GetFullPath($expandedStagingPath)
+    } catch {
+        Write-Host "ПОМИЛКА: -StagingPath некоректний: $($_.Exception.Message)" -ForegroundColor Red
+        exit 30
+    }
 }
 $serviceStartTimeoutSeconds = if ([int]$maintenanceSettings.Services.StartTimeoutSeconds -gt 0) {
     [int]$maintenanceSettings.Services.StartTimeoutSeconds
@@ -1462,6 +1481,7 @@ function Get-BRAVODataRestoreServiceSnapshot {
             Exists = ($null -ne $service)
             Disabled = ($startMode -ieq 'Disabled')
             Running = ($null -ne $service -and [string]$service.Status -eq 'Running')
+            Status = if ($null -ne $service) { [string]$service.Status } else { $null }
         }
     }
 
@@ -1493,17 +1513,33 @@ function Get-BRAVODataRestoreServiceSnapshot {
         $stateExists = $false
         $stateDisabled = $false
         $stateRunning = $false
+        $stateStatus = $null
         if ($definition.ComponentEnabled -and -not [string]::IsNullOrWhiteSpace([string]$definition.Name)) {
             $state = & $resolveServiceState ([string]$definition.Name)
             $stateExists = [bool]$state.Exists
             $stateDisabled = [bool]$state.Disabled
             $stateRunning = [bool]$state.Running
+            $stateStatus = [string]$state.Status
         }
+        # Restart-intent policy (сьомий review): WasRunning (точний Running на
+        # момент знімка) лишається як є для діагностичного відображення, але
+        # НЕ визначає, чи відновлювати службу після restore — інакше служба,
+        # що на момент знімка лише розпочала запуск (StartPending), назавжди
+        # лишилась би Stopped (quiescence коректно зупиняє її перед move-aside,
+        # але старий гейт restart "-not WasRunning" пропускав запуск назад).
+        # Консервативна, задокументована політика:
+        #   Running / StartPending -> намір "працювати", відновлюємо Running;
+        #   Stopped / StopPending / Paused / ContinuePending / PausePending /
+        #   будь-що інше -> НЕ відновлюємо (найближчий безпечний за
+        #   замовчуванням стан лишається Stopped, а не вгадування).
+        # StartupType служби ця політика НІКОЛИ не змінює.
+        $shouldRestartAfterRestore = ($stateStatus -eq 'Running' -or $stateStatus -eq 'StartPending')
         $entries += [pscustomobject]@{
             Key = [string]$definition.Key
             Name = [string]$definition.Name
             Managed = ($definition.ComponentEnabled -and $stateExists -and -not $stateDisabled)
             WasRunning = $stateRunning
+            ShouldRestartAfterRestore = $shouldRestartAfterRestore
             KillProcesses = @($definition.KillProcesses)
         }
     }
@@ -1586,15 +1622,30 @@ function Stop-BRAVODataRestoreServices {
         # Обов'язок ЗУПИНКИ служби переоцінюється за ПОТОЧНИМ станом (запит
         # ПІСЛЯ спроби завершення процесів — термінація процесу могла
         # змінити стан пов'язаної служби), а не за WasRunning знімка:
-        # WasRunning визначає лише намір ЗАПУСКУ ПІСЛЯ відновлення
-        # (Restore-BRAVODataRestoreServices нижче), тоді як службу, що на
-        # знімку була Stopped/StartPending, але встигла чи встигає перейти
-        # у Running до цього виклику (гонитва зі знімком), усе одно
-        # потрібно зупинити — інакше вона могла б читати/писати у дерево
-        # під час move-aside/розпакування. Get-Service тут — новий запит,
-        # не кеш зі знімка.
-        $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
-        if ($null -eq $currentService) { continue }
+        # WasRunning визначає лише діагностичне відображення знімка, тоді як
+        # службу, що на знімку була Stopped/StartPending, але встигла чи
+        # встигає перейти у Running до цього виклику (гонитва зі знімком),
+        # усе одно потрібно зупинити — інакше вона могла б читати/писати у
+        # дерево під час move-aside/розпакування. Get-Service тут — новий
+        # запит, не кеш зі знімка.
+        #
+        # Служба вже позначена Managed=true знімком (існувала й не Disabled
+        # на момент знімка). Якщо ПОВТОРНИЙ запит зараз повертає null АБО
+        # кидає виняток (транзієнтна помилка SCM) — це зміна стану/
+        # невизначеність, а НЕ доказ безпеки: fail-closed як провал тиші,
+        # не мовчазний "continue" (round-7 P1: попередня поведінка трактувала
+        # непроверену службу як тиху).
+        $currentService = $null
+        try {
+            $currentService = Get-Service -Name $entry.Name -ErrorAction Stop
+        } catch {
+            $currentService = $null
+        }
+        if ($null -eq $currentService) {
+            $failures += "не вдалося опитати поточний стан керованої служби $($entry.Name) (Get-Service повернув null/кинув виняток) — тиша не підтверджена"
+            Write-DataRestoreLog -Message "ПОМИЛКА: не вдалося опитати поточний стан керованої служби $($entry.Name)" -Level 'ERROR'
+            continue
+        }
         $currentService.Refresh()
         if ([string]$currentService.Status -eq 'Stopped') { continue }
         Write-DataRestoreLog -Message "Зупинка служби $($entry.Name)..." -Level 'INFO'
@@ -1631,8 +1682,19 @@ function Test-BRAVODataRestoreServicesAllStopped {
     $unsafeEntries = @()
     foreach ($entry in $Snapshot) {
         if (-not $entry.Managed) { continue }
-        $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
-        if ($null -ne $currentService) {
+        # Той самий fail-closed контракт, що й Stop-BRAVODataRestoreServices:
+        # null/виняток для раніше Managed служби — невизначеність, а не доказ
+        # Stopped, тож бар'єр МУСИТЬ додати unsafe-запис, а не мовчки
+        # пропустити перевірку.
+        $currentService = $null
+        try {
+            $currentService = Get-Service -Name $entry.Name -ErrorAction Stop
+        } catch {
+            $currentService = $null
+        }
+        if ($null -eq $currentService) {
+            $unsafeEntries += "$($entry.Name): не вдалося опитати поточний стан (Get-Service повернув null/кинув виняток) — тиша не підтверджена"
+        } else {
             $currentService.Refresh()
             if ([string]$currentService.Status -ne 'Stopped') {
                 $unsafeEntries += "$($entry.Name) (поточний стан: $($currentService.Status))"
@@ -1673,8 +1735,10 @@ function Invoke-BRAVODataRestoreQuiescence {
 }
 
 function Restore-BRAVODataRestoreServices {
-    # Відновлення СТАНУ (не сліпий запуск): стартують лише ті служби, які
-    # працювали на момент знімка, у зворотному до зупинки порядку.
+    # Відновлення НАМІРУ (не сліпий запуск і не буквальний Running-знімок):
+    # стартують лише ті служби, чий початковий стан означав намір "працювати"
+    # (Running АБО StartPending — див. ShouldRestartAfterRestore у
+    # Get-BRAVODataRestoreServiceSnapshot), у зворотному до зупинки порядку.
     param(
         [Parameter(Mandatory = $true)][object[]]$Snapshot,
         [Parameter(Mandatory = $true)][int]$StartTimeoutSeconds,
@@ -1685,7 +1749,7 @@ function Restore-BRAVODataRestoreServices {
     $reversed = @($Snapshot)
     [array]::Reverse($reversed)
     foreach ($entry in $reversed) {
-        if (-not $entry.Managed -or -not $entry.WasRunning) { continue }
+        if (-not $entry.Managed -or -not $entry.ShouldRestartAfterRestore) { continue }
         Write-DataRestoreLog -Message "Запуск служби $($entry.Name)..." -Level 'INFO'
         $startResult = Invoke-BRAVODataRestoreServiceStateChange `
             -Name $entry.Name `
@@ -1894,14 +1958,36 @@ function Invoke-BRAVODataRestoreMoveAside {
 function Undo-BRAVODataRestoreMoveAside {
     # Rollback невдалого InPlace-відновлення: прибрати частково розпакований
     # свіжий каталог і повернути prerestore-копію на original ім'я.
+    #
+    # round-7 P2 (два окремі findings, виправлені разом у цій функції):
+    #
+    # 1. Каталог за LiveDirectory видаляється ЛИШЕ якщо ЦЕЙ ПРОГІН сам його
+    #    створив (TargetCreatedByThisRun). Якщо unmanaged-процес/watchdog
+    #    відновив live-каталог ПІСЛЯ move-aside, але New-Item без -Force
+    #    (виклик вище) провалився через це — TargetCreatedByThisRun=false,
+    #    і видаляти/перезаписувати чужий каталог заборонено: це стан, що
+    #    вимагає ручного втручання, а не "часткового результату" цього
+    #    прогону.
+    #
+    # 2. Manual-recovery повідомлення при провалі самого rollback залежить
+    #    від MoveAsidePerformed. Коли live-каталог був ВІДСУТНІЙ ще до
+    #    move-aside (типовий disaster-сценарій, особливо для BRAVOEXCH),
+    #    MoveAsidePerformed=false і жодної prerestore-копії НІКОЛИ не
+    #    існувало — повідомлення про "дані збережені у PrerestoreDirectory"
+    #    і команда Rename-Item на неіснуючий шлях були б хибними й могли б
+    #    змусити оператора шукати дані, яких ніколи не було.
     param(
         [Parameter(Mandatory = $true)][string]$LiveDirectory,
         [Parameter(Mandatory = $true)][string]$PrerestoreDirectory,
-        [Parameter(Mandatory = $true)][bool]$MoveAsidePerformed
+        [Parameter(Mandatory = $true)][bool]$MoveAsidePerformed,
+        [Parameter(Mandatory = $true)][bool]$TargetCreatedByThisRun
     )
 
     try {
         if (Test-Path -LiteralPath $LiveDirectory -PathType Container) {
+            if (-not $TargetCreatedByThisRun) {
+                throw "за адресою $LiveDirectory існує каталог, якого цей прогін НЕ створював (з'явився після move-aside) — автоматичне видалення чи перезапис заборонено"
+            }
             Remove-Item -LiteralPath $LiveDirectory -Recurse -Force -ErrorAction Stop
         }
         if ($MoveAsidePerformed) {
@@ -1910,10 +1996,18 @@ function Undo-BRAVODataRestoreMoveAside {
         Write-DataRestoreLog -Message "Rollback виконано: $LiveDirectory повернуто до стану перед відновленням" -Level 'SUCCESS'
         return [pscustomobject]@{ Success = $true; Error = $null }
     } catch {
-        # Найгірший сценарій: rollback теж не вдався. Дані НЕ втрачені —
-        # prerestore-копія на місці; оператору потрібна точна ручна команда.
-        $manualCommand = "Rename-Item -LiteralPath `"$PrerestoreDirectory`" -NewName `"$(Split-Path $LiveDirectory -Leaf)`""
-        $message = "rollback не вдався: $($_.Exception.Message). Дані збережені у $PrerestoreDirectory. Ручне повернення: $manualCommand"
+        # Найгірший сценарій: rollback теж не вдався.
+        if ($MoveAsidePerformed) {
+            # Оригінальні дані РЕАЛЬНО збережені у PrerestoreDirectory —
+            # можна безпечно вказати точну ручну команду повернення.
+            $manualCommand = "Rename-Item -LiteralPath `"$PrerestoreDirectory`" -NewName `"$(Split-Path $LiveDirectory -Leaf)`""
+            $message = "rollback не вдався: $($_.Exception.Message). Дані збережені у $PrerestoreDirectory. Ручне повернення: $manualCommand"
+        } else {
+            # Live-каталог був відсутній ще ДО цього прогону — move-aside
+            # нічого не переносив, prerestore-копії не існує. НЕ стверджуємо
+            # протилежне й НЕ пропонуємо команду на неіснуючий шлях.
+            $message = "rollback не вдався: $($_.Exception.Message). Live-каталог $LiveDirectory був відсутній ще ДО цього прогону (move-aside нічого не переносив) — жодної prerestore-копії не існує; перевірте поточний частковий стан $LiveDirectory вручну."
+        }
         Write-DataRestoreLog -Message "КРИТИЧНО: $message" -Level 'ERROR'
         return [pscustomobject]@{ Success = $false; Error = $message }
     }
@@ -1948,10 +2042,15 @@ function Undo-BRAVODataRestoreCompletedComponents {
     foreach ($completed in $reversed) {
         $componentType = [string]$completed.Type
         Write-DataRestoreLog -Message "Відкат раніше відновленого компонента $componentType (збій іншого компонента цього прогону)..." -Level 'WARNING'
+        # TargetCreatedByThisRun завжди true тут: компонент потрапив у
+        # $completedInPlaceComponents лише ПІСЛЯ успішного extraction/
+        # verification у власну ціль цього прогону — за конструкцією її
+        # створив саме цей прогін.
         $undoResult = Undo-BRAVODataRestoreMoveAside `
             -LiveDirectory ([string]$completed.LiveDirectory) `
             -PrerestoreDirectory ([string]$completed.PrerestoreDirectory) `
-            -MoveAsidePerformed ([bool]$completed.MoveAsidePerformed)
+            -MoveAsidePerformed ([bool]$completed.MoveAsidePerformed) `
+            -TargetCreatedByThisRun $true
         if ($undoResult.Success) {
             $rolledBack += $componentType
         } else {
@@ -2607,6 +2706,93 @@ function ConvertTo-BRAVODataRestoreStagedManifest {
     return $clone
 }
 
+function Get-BRAVODataRestoreValidatedArtifactLeafName {
+    # Витягує ІМ'Я файлу з недовіреного manifest-шляху (round-7 P2) і
+    # підтверджує, що воно безпечне для Join-Path з канонічним каталогом
+    # компонента: САМЕ leaf-ім'я бере участь у реконструкції шляху, ніколи
+    # решта каталогів зі старого/чужого manifest-шляху.
+    #
+    # [System.IO.Path]::GetFileName — ЧИСТА рядкова операція (лише те, що
+    # після останнього роздільника), а НЕ Split-Path -Leaf: Split-Path є
+    # provider-aware й резолвить відносні сегменти (напр. буквальний "..")
+    # проти ПОТОЧНОГО робочого каталогу процесу, тому для значення ".."
+    # повернув би ім'я батьківського каталогу поточного $PWD (недетерміновано
+    # й ніяк не пов'язано зі змістом самого manifest-рядка) замість
+    # відхилення traversal-сегмента як такого. GetFileName трактує "..\..\"
+    # суто текстово й повертає порожній/traversal-фрагмент без звернення до
+    # файлової системи — саме це й потрібно для недовіреного вхідного рядка.
+    # Порожнє значення, "."/"..", чи ім'я з недопустимими символами
+    # файлової системи — відхиляється (повертає $null).
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $leaf = $null
+    try {
+        $leaf = [System.IO.Path]::GetFileName($Value)
+    } catch {
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($leaf)) { return $null }
+    if ($leaf -eq '.' -or $leaf -eq '..') { return $null }
+    if ($leaf.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) { return $null }
+    return $leaf
+}
+
+function ConvertTo-BRAVODataRestoreRebasedLocalManifest {
+    # Local-дзеркало ConvertTo-BRAVODataRestoreStagedManifest: SFTP завжди
+    # переписує ArchivePath/HashPath на власний staging ДО строгого gate
+    # (крок 5), тому pipeline нижче вже source-agnostic для SFTP. Local
+    # цього НЕ робив — строгий gate довіряв повному manifest-шляху,
+    # записаному ПРОДЮСЕРОМ (інший сервер), і ДО того, як canonical
+    # каталог поточного компонента (archiveDefinitions[Type].Destination)
+    # взагалі консультувався. Якщо репозиторій резервних копій
+    # скопійовано/змонтовано під іншим диском/коренем (документований
+    # disaster-recovery сценарій), manifest.ArchivePath фізично не існує
+    # за старою адресою — generation відхилялась би, навіть коли байти
+    # архіву, sidecar і сам manifest валідні під ПОТОЧНИМ BackupRoot.
+    #
+    # Manifest-шлях лишається НЕДОВІРЕНИМ: з нього беруться ЛИШЕ leaf-імена
+    # (Get-BRAVODataRestoreValidatedArtifactLeafName), решта шляху
+    # відкидається. Нове ArchivePath/HashPath — canonical каталог
+    # компонента (archiveDefinitions[Type].Destination, довірене значення з
+    # BRAVO.config, завжди всередині BackupRoot) + validated leaf-ім'я.
+    # Прив'язку компонент+generation і надалі перевіряє
+    # Get-BRAVOVerifiedGenerationArchive (round-3/4, незмінно), rotated
+    # ArchivePrefix (round-4) теж незмінно підтримується — тут ЛИШЕ
+    # переписуються шляхи, історичний basename з manifest-а НЕ
+    # реконструюється з поточного префіксу.
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string[]]$ComponentTypes,
+        [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions
+    )
+
+    $clone = $Manifest | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    foreach ($componentType in $ComponentTypes) {
+        $componentProperty = @($clone.components.PSObject.Properties | Where-Object {
+            [string]::Equals($_.Name, $componentType, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+        if ($componentProperty.Count -eq 0) { continue }
+
+        $componentDestination = [string]@($ArchiveDefinitions | Where-Object {
+            [string]::Equals([string]$_.Type, $componentType, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1).Destination
+        if ([string]::IsNullOrWhiteSpace($componentDestination)) { continue }
+
+        $archiveLeaf = Get-BRAVODataRestoreValidatedArtifactLeafName -Value ([string]$componentProperty[0].Value.ArchivePath)
+        $hashLeaf = Get-BRAVODataRestoreValidatedArtifactLeafName -Value ([string]$componentProperty[0].Value.HashPath)
+        if ($null -eq $archiveLeaf -or $null -eq $hashLeaf) {
+            # Небезпечне/непарсиме ім'я — НЕ переписуємо; нижчий строгий
+            # gate однаково відхилить компонент (Test-Path на оригінальному
+            # значенні не пройде, або containment-перевірка провалиться) —
+            # fail-safe, не мовчазний пропуск.
+            continue
+        }
+        $componentProperty[0].Value.ArchivePath = Join-Path $componentDestination $archiveLeaf
+        $componentProperty[0].Value.HashPath = Join-Path $componentDestination $hashLeaf
+    }
+    return $clone
+}
+
 function Invoke-BRAVODataRestorePostHealth {
     # Health після InPlace-відновлення — дочірнім процесом (той самий
     # прецедент, що запуск BRAVO_ARCHIV із Maintenance), ПІСЛЯ звільнення
@@ -3086,6 +3272,16 @@ try {
             $selectedManifest = ConvertTo-BRAVODataRestoreStagedManifest `
                 -Manifest $selectedManifest `
                 -StagedPaths $stagedPaths
+        } else {
+            # Local (round-7 P2): та сама ідея, що ConvertTo-BRAVODataRestoreStagedManifest
+            # для SFTP — переписати ArchivePath/HashPath на canonical
+            # каталог компонента ДО строгого gate нижче, щоб репозиторій
+            # резервних копій, скопійований/змонтований під іншим
+            # диском/коренем, лишався придатним для відновлення.
+            $selectedManifest = ConvertTo-BRAVODataRestoreRebasedLocalManifest `
+                -Manifest $selectedManifest `
+                -ComponentTypes $componentTypes `
+                -ArchiveDefinitions @($global:archiveDefinitions)
         }
 
         # --- 5. Строгий gate по кожному компоненту ---
@@ -3352,6 +3548,13 @@ try {
             # планування (TOCTOU-вікно між Get-BRAVODataRestorePlan і цим
             # моментом).
             $outOfPlaceTargetCreatedByThisRun = $false
+            # InPlace-дзеркало тієї самої гарантії володіння: якщо
+            # unmanaged-процес/watchdog відновить live-каталог ПІСЛЯ
+            # move-aside, але ДО створення цілі нижче, цей прогін не має
+            # права ані розпаковувати поверх нього (fresh-empty-target
+            # інваріант), ані пізніше видаляти його як "частковий
+            # результат" під час rollback — round-7 P2.
+            $inPlaceTargetCreatedByThisRun = $false
             try {
                 if ($Mode -eq 'InPlace') {
                     # Re-встановлення інваріанту тиші БЕЗПОСЕРЕДНЬО перед
@@ -3399,7 +3602,17 @@ try {
                     [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -ErrorAction Stop)
                     $outOfPlaceTargetCreatedByThisRun = $true
                 } else {
-                    [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -Force -ErrorAction Stop)
+                    # InPlace, БЕЗ -Force (round-7 P2): якщо unmanaged-процес
+                    # чи watchdog відновив live-каталог ПІСЛЯ підтвердженого
+                    # move-aside (наприклад, служба чи сторонній моніторинг
+                    # відтворили порожню робочу директорію), New-Item без
+                    # -Force провалюється замість мовчазного прийняття цього
+                    # чужого каталогу — extraction ніколи не пише поверх
+                    # даних, які цей прогін не створював, і $inPlaceTargetCreatedByThisRun
+                    # лишається false, тож catch нижче не видалить/не
+                    # перезапише його як "власний частковий результат".
+                    [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -ErrorAction Stop)
+                    $inPlaceTargetCreatedByThisRun = $true
                 }
                 if ($Mode -eq 'InPlace' -and $moveAsidePerformed) {
                     # ACL знесеного попередника (не батьківського каталогу)
@@ -3475,7 +3688,8 @@ try {
                         $rollback = Undo-BRAVODataRestoreMoveAside `
                             -LiveDirectory $planComponent.TargetDirectory `
                             -PrerestoreDirectory $planComponent.PrerestoreDirectory `
-                            -MoveAsidePerformed $moveAsidePerformed
+                            -MoveAsidePerformed $moveAsidePerformed `
+                            -TargetCreatedByThisRun $inPlaceTargetCreatedByThisRun
                         if (-not $rollback.Success) {
                             $componentFailureReason = "$componentFailureReason; $($rollback.Error)"
                             # Rollback самого компонента не завершився: копія
