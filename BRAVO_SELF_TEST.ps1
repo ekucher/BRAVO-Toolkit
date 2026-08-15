@@ -1705,7 +1705,12 @@ try {
     $dryRunNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "BRAVO_DRY_RUN.ps1"), [Text.Encoding]::UTF8)
     $compatibilityNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"), [Text.Encoding]::UTF8)
     $mentionsDisabledPattern = 'allowed_mentions\s*=\s*@\{\s*parse\s*=\s*@\(\)\s*\}'
-    Test-BRAVOCondition -Condition ($archiveNotificationTextForMentions.Contains("Send-BRAVOWebhookNotification") -and ($compatibilityNotificationTextForMentions -match $mentionsDisabledPattern) -and ($maintenanceNotificationTextForMentions -match $mentionsDisabledPattern) -and ($dryRunNotificationTextForMentions -match $mentionsDisabledPattern)) -Name "Notifications/DiscordMentionsRemainDisabled" -Failure "Discord payload має забороняти mentions"
+    # Archive/Maintenance більше не будують Discord payload самостійно —
+    # обидва делегують через централізований BRAVO.Notifications
+    # (Send-BRAVONotification*) до єдиної canonical реалізації payload
+    # (BRAVO.Compatibility::Send-BRAVOWebhookNotification, де й перевіряється
+    # сам літерал allowed_mentions). DryRun лишається незалежним, як і раніше.
+    Test-BRAVOCondition -Condition ($archiveNotificationTextForMentions.Contains("Send-BRAVONotification") -and ($compatibilityNotificationTextForMentions -match $mentionsDisabledPattern) -and $maintenanceNotificationTextForMentions.Contains("Send-BRAVONotification") -and ($dryRunNotificationTextForMentions -match $mentionsDisabledPattern)) -Name "Notifications/DiscordMentionsRemainDisabled" -Failure "Discord payload має забороняти mentions"
 
     # dev.12: BRAVO_DRY_RUN.ps1 надсилав у Discord сирі ":emoji:" tokens,
     # бо Send-TestWebhookNotification не проганяв повідомлення через
@@ -1760,6 +1765,421 @@ try {
     $legacyIpDisabledRegex = "IP-" + "адреси: .*" + "\| " + "вимкнено"
     $operatorNotificationSamples = @($notifySuccess, $notifyWarning, $bazaSample, $maintSuccess, $maintLowDisk) -join [Environment]::NewLine
     Test-BRAVOCondition -Condition (-not $operatorNotificationSamples.Contains($legacyHouseToken) -and -not $operatorNotificationSamples.Contains($legacyHealthyCopyText) -and -not $operatorNotificationSamples.Contains($legacyActionText) -and -not $operatorNotificationSamples.Contains($legacyFileCountText) -and ($operatorNotificationSamples -notmatch $legacyIpDisabledRegex)) -Name "Notifications/OperatorTemplatesDoNotContainLegacyWording" -Failure "operator-visible notification templates не мають містити legacy wording"
+
+    # --- Severity-based routing (GENERAL/ALERTS) ---------------------------
+    # Resolve-BRAVONotificationRoute — pure-функція, реального Credential
+    # Manager не торкається; тестуємо прямо на вже імпортованому модулі
+    # (Import-Module BRAVO.Notifications вище).
+    $allRoutingTable = @{ SUCCESS = "general"; WARNING = "alerts"; ERROR = "alerts"; CRITICAL = "alerts" }
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVONotificationRoute -Severity SUCCESS -NotificationMode all -RoutingTable $allRoutingTable) -eq "general" -and
+            (Resolve-BRAVONotificationRoute -Severity WARNING -NotificationMode all -RoutingTable $allRoutingTable) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity ERROR -NotificationMode all -RoutingTable $allRoutingTable) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity CRITICAL -NotificationMode all -RoutingTable $allRoutingTable) -eq "alerts"
+        ) `
+        -Name "Notifications/RoutingMatrixModeAll" `
+        -Failure "Mode=all: SUCCESS->general, WARNING/ERROR/CRITICAL->alerts"
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVONotificationRoute -Severity SUCCESS -NotificationMode errors_only -RoutingTable $allRoutingTable) -eq "none" -and
+            (Resolve-BRAVONotificationRoute -Severity WARNING -NotificationMode errors_only -RoutingTable $allRoutingTable) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity ERROR -NotificationMode errors_only -RoutingTable $allRoutingTable) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity CRITICAL -NotificationMode errors_only -RoutingTable $allRoutingTable) -eq "alerts"
+        ) `
+        -Name "Notifications/RoutingMatrixModeErrorsOnly" `
+        -Failure "Mode=errors_only: SUCCESS->none, WARNING/ERROR/CRITICAL->alerts"
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVONotificationRoute -Severity SUCCESS -NotificationMode none -RoutingTable $allRoutingTable) -eq "none" -and
+            (Resolve-BRAVONotificationRoute -Severity WARNING -NotificationMode none -RoutingTable $allRoutingTable) -eq "none" -and
+            (Resolve-BRAVONotificationRoute -Severity ERROR -NotificationMode none -RoutingTable $allRoutingTable) -eq "none" -and
+            (Resolve-BRAVONotificationRoute -Severity CRITICAL -NotificationMode none -RoutingTable $allRoutingTable) -eq "none"
+        ) `
+        -Name "Notifications/RoutingMatrixModeNone" `
+        -Failure "Mode=none: усі severity -> none"
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVONotificationRoute -Severity SUCCESS -NotificationMode all -RoutingTable $null) -eq "general" -and
+            (Resolve-BRAVONotificationRoute -Severity WARNING -NotificationMode all -RoutingTable $null) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity CRITICAL -NotificationMode errors_only -RoutingTable @{}) -eq "alerts"
+        ) `
+        -Name "Notifications/RoutingMatrixSafeDefault" `
+        -Failure "відсутня/порожня RoutingTable (стара конфігурація) має застосовувати безпечний дефолт SUCCESS=general, WARNING/ERROR/CRITICAL=alerts"
+    # errors_only — mode contract сильніший за custom RoutingTable: навіть
+    # якщо оператор налаштував WARNING/ERROR/CRITICAL -> general, під
+    # errors_only вони все одно мають йти в alerts (інакше не було б
+    # webhook-а для доставки — Health/Maintenance preflight під errors_only
+    # резолвить лише ALERTS endpoint). SUCCESS завжди -> none.
+    $errorsOnlyEscapeAttemptTable = @{ SUCCESS = "alerts"; WARNING = "general"; ERROR = "general"; CRITICAL = "general" }
+    Test-BRAVOCondition `
+        -Condition (
+            (Resolve-BRAVONotificationRoute -Severity SUCCESS -NotificationMode errors_only -RoutingTable $errorsOnlyEscapeAttemptTable) -eq "none" -and
+            (Resolve-BRAVONotificationRoute -Severity WARNING -NotificationMode errors_only -RoutingTable $errorsOnlyEscapeAttemptTable) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity ERROR -NotificationMode errors_only -RoutingTable $errorsOnlyEscapeAttemptTable) -eq "alerts" -and
+            (Resolve-BRAVONotificationRoute -Severity CRITICAL -NotificationMode errors_only -RoutingTable $errorsOnlyEscapeAttemptTable) -eq "alerts" -and
+            # Mode=all і надалі застосовує custom RoutingTable без обмежень
+            # (обмеження стосується лише errors_only semantics).
+            (Resolve-BRAVONotificationRoute -Severity WARNING -NotificationMode all -RoutingTable $errorsOnlyEscapeAttemptTable) -eq "general"
+        ) `
+        -Name "Notifications/ErrorsOnlyIgnoresCustomRoutingOverride" `
+        -Failure "errors_only має ігнорувати custom RoutingTable для WARNING/ERROR/CRITICAL (завжди alerts) і для SUCCESS (завжди none) — mode contract пріоритетніший за таблицю; Mode=all і надалі застосовує таблицю без обмежень"
+
+    # --- Endpoint fallback (route-специфічний credential -> legacy webhook
+    # -> жорсткий літерал), повністю ізольовано від реального Credential
+    # Manager: Resolve-BRAVONotificationEndpoint екстрагується з джерела й
+    # виконується в окремому module scope зі stub Get-BRAVOCredentialSecret,
+    # який ніколи не звертається до Windows Credential Manager.
+    $notificationsModuleSourceText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psm1"), [Text.Encoding]::UTF8)
+    $notificationEndpointTestModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $notificationsModuleSourceText `
+        -FunctionNames @('Resolve-BRAVONotificationEndpoint')
+    # Явно вивантажуємо реальні BRAVO.Credentials/BRAVO.Compatibility з
+    # процесу перед ізольованим тестом: якщо stub Get-BRAVOCredentialSecret
+    # нижче з якоїсь причини НЕ перекриє виклик (module-scoping edge case),
+    # відсутність реального модуля гарантує "command not found" замість
+    # мовчазного звернення до Windows Credential Manager.
+    Remove-Module -Name 'BRAVO.Credentials' -Force -ErrorAction SilentlyContinue
+    Remove-Module -Name 'BRAVO.Compatibility' -Force -ErrorAction SilentlyContinue
+    $endpointFallbackCapture = & $notificationEndpointTestModule {
+        function Get-BRAVOCredentialSecret {
+            param([string]$Target)
+            # Ізольований stub: жодного реального доступу до Windows
+            # Credential Manager — лише синтетичні значення нижче.
+            $stubs = @{
+                'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS'
+                'BRAVO_DISCORD_URL' = 'STUB-LEGACY'
+                'BRAVO_SLACK_GENERAL_URL' = 'STUB-SLACK-GENERAL'
+            }
+            if ($stubs.Contains($Target)) { return $stubs[$Target] }
+            return $null
+        }
+        $targetsBothPresent = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
+        # Назва target-а навмисно НЕ у ключах $stubs вище (Get-BRAVOCredentialSecret
+        # поверне $null) — симулює "route-специфічний Credential Manager
+        # запис не налаштований", щоб перевірити fallback на legacy.
+        # (Значення НЕ 32 символи навмисно: gitleaks' "discord-client-secret"
+        # rule false-positive спрацьовує на 32-символьні рядки поруч із
+        # "Discord"+"=" — це назва Credential Manager target-а, не секрет.)
+        $targetsLegacyOnly = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL_NOT_CONFIGURED'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
+        $targetsNoneConfigured = @{}
+        $newTargetWins = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsBothPresent
+        $legacyFallback = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsLegacyOnly
+        $literalFallback = $null
+        $literalFallbackThrew = $false
+        try {
+            $literalFallback = Resolve-BRAVONotificationEndpoint -Provider discord -Route general -CredentialTargets $targetsNoneConfigured
+        } catch { $literalFallbackThrew = $true }
+        $slackGeneral = Resolve-BRAVONotificationEndpoint -Provider slack -Route general -CredentialTargets @{ SlackWebhookGeneral = 'BRAVO_SLACK_GENERAL_URL' }
+        $allMissingThrew = $false
+        try {
+            Resolve-BRAVONotificationEndpoint -Provider slack -Route alerts -CredentialTargets @{}
+        } catch { $allMissingThrew = $true }
+        [pscustomobject]@{
+            NewTargetWins = $newTargetWins
+            LegacyFallback = $legacyFallback
+            LiteralFallbackThrew = $literalFallbackThrew
+            SlackGeneral = $slackGeneral
+            AllMissingThrew = $allMissingThrew
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($endpointFallbackCapture.NewTargetWins -eq 'STUB-ALERTS') `
+        -Name "Notifications/EndpointPrefersRouteSpecificTarget" `
+        -Failure "коли налаштовано і route-специфічний, і legacy target, має використовуватись route-специфічний"
+    Test-BRAVOCondition `
+        -Condition ($endpointFallbackCapture.LegacyFallback -eq 'STUB-LEGACY') `
+        -Name "Notifications/EndpointFallsBackToLegacyWebhook" `
+        -Failure "коли route-специфічний credential відсутній, має використовуватись legacy BRAVO_DISCORD_URL/BRAVO_SLACK_URL (backward compatibility)"
+    Test-BRAVOCondition `
+        -Condition ($endpointFallbackCapture.SlackGeneral -eq 'STUB-SLACK-GENERAL') `
+        -Name "Notifications/EndpointResolvesSlackGeneralTarget" `
+        -Failure "Slack GENERAL route має резолвитись через SlackWebhookGeneral target"
+    Test-BRAVOCondition `
+        -Condition ($endpointFallbackCapture.AllMissingThrew) `
+        -Name "Notifications/EndpointThrowsWhenNothingConfigured" `
+        -Failure "коли жоден target (новий і legacy) не налаштований, має кидатись виняток, а не мовчки повертатись порожній webhook"
+    # Відновлюємо реальні модулі для решти self-test (наступні секції
+    # покладаються на їх наявність, як і до цього ізольованого блоку).
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Credentials\BRAVO.Credentials.psd1") -Force -ErrorAction Stop
+
+    # --- Maintenance: NotificationSeverity (маршрутизація + CONTENT
+    # severity) відокремлена від OperationSeverity
+    # ($script:criticalErrorOccurred) через ПОВНИЙ lifecycle: Send-SlackAlert
+    # -> Send-FinalReport -> route resolution -> New-MaintenanceNotificationMessage
+    # -> delivery stub. Стаб New-MaintenanceNotificationMessage відтворює
+    # -Severity у поверненому тексті (SEVERITY=...), щоб тести перевіряли
+    # не лише webhook route, а й фактичну content-severity, передану далі в
+    # New-BRAVOOperatorNotificationMessage (review: ERROR/CRITICAL
+    # notification-only не повинні downgrade-итись до WARNING лише через
+    # спільний TitleEmoji).
+    $maintenanceRuntimeSourceForSeverity = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $sendSlackAlertTestModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @('Send-SlackAlert', 'Send-FinalReport')
+
+    function Invoke-MaintenanceSeverityLifecycleScenario {
+        param([scriptblock]$SendCalls)
+        & $sendSlackAlertTestModule {
+            param($SendCallsInner)
+            $script:SlackMode = "errors_only"
+            $script:CriticalErrors = $false
+            $script:criticalErrorOccurred = $false
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:SlackMessageBuffer = New-Object System.Collections.Generic.List[string]
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $LOG_FILE = "STUB-LOG-PATH"
+            $NotificationProviderDisplayName = "STUB"
+            $script:deliveredMessages = New-Object System.Collections.Generic.List[object]
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                if ($NotificationMode -eq "none") { return "none" }
+                if ($Severity -eq "SUCCESS") {
+                    if ($NotificationMode -eq "errors_only") { return "none" }
+                    return "general"
+                }
+                return "alerts"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredMessages.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
+            }
+
+            & $SendCallsInner
+
+            Send-FinalReport -LOG_FILE $LOG_FILE
+
+            [pscustomobject]@{
+                CriticalErrorOccurred = $script:criticalErrorOccurred
+                CriticalErrorsListCount = $script:CriticalErrorsList.Count
+                NotificationAlertQueueCount = $script:NotificationAlertQueue.Count
+                DeliveredCount = $script:deliveredMessages.Count
+                DeliveredMessage = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].Message } else { $null }
+                DeliveredWebhook = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].WebhookUrl } else { $null }
+            }
+        } $SendCalls
+    }
+
+    # notification-only WARNING: content SEVERITY=WARNING, route alerts,
+    # execution critical=false, NotificationAlertQueue (не CriticalErrorsList).
+    $warningLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "range id warning" -Severity "WARNING"
+    }
+    Test-BRAVOCondition `
+        -Condition (-not $warningLifecycle.CriticalErrorOccurred) `
+        -Name "Maintenance/NotificationOnlyWarning_ExecutionNotCritical" `
+        -Failure "Send-SlackAlert -Severity WARNING (без -IsCritical) НЕ повинен встановлювати `$script:criticalErrorOccurred"
+    Test-BRAVOCondition `
+        -Condition ($warningLifecycle.CriticalErrorsListCount -eq 0 -and $warningLifecycle.NotificationAlertQueueCount -eq 1) `
+        -Name "Maintenance/NotificationOnlyWarning_UsesAlertQueueNotCriticalList" `
+        -Failure "notification-only WARNING має чергуватись в NotificationAlertQueue, а не в CriticalErrorsList"
+    Test-BRAVOCondition `
+        -Condition ($warningLifecycle.DeliveredCount -eq 1 -and $warningLifecycle.DeliveredWebhook -eq "STUB-ALERTS-URL") `
+        -Name "Maintenance/NotificationOnlyWarning_RoutesToAlerts" `
+        -Failure "Send-SlackAlert -Severity WARNING під errors_only має бути доставлено рівно один раз на ALERTS webhook"
+    Test-BRAVOCondition `
+        -Condition ($null -ne $warningLifecycle.DeliveredMessage -and $warningLifecycle.DeliveredMessage.Contains("SEVERITY=WARNING")) `
+        -Name "Maintenance/NotificationOnlyWarning_ContentSeverityStaysWarning" `
+        -Failure "фінальне повідомлення для notification-only WARNING має мати -Severity WARNING, передану в New-MaintenanceNotificationMessage (не inferred з emoji)"
+
+    # notification-only ERROR: content SEVERITY=ERROR (НЕ WARNING), route
+    # alerts, execution critical=false.
+    $errorLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "notification-only error" -Severity "ERROR"
+    }
+    Test-BRAVOCondition `
+        -Condition (-not $errorLifecycle.CriticalErrorOccurred) `
+        -Name "Maintenance/NotificationOnlyError_ExecutionNotCritical" `
+        -Failure "Send-SlackAlert -Severity ERROR (без -IsCritical) НЕ повинен встановлювати `$script:criticalErrorOccurred"
+    Test-BRAVOCondition `
+        -Condition ($errorLifecycle.CriticalErrorsListCount -eq 0 -and $errorLifecycle.NotificationAlertQueueCount -eq 1) `
+        -Name "Maintenance/NotificationOnlyError_UsesAlertQueueNotCriticalList" `
+        -Failure "notification-only ERROR має чергуватись в NotificationAlertQueue, а не в CriticalErrorsList"
+    Test-BRAVOCondition `
+        -Condition ($errorLifecycle.DeliveredCount -eq 1 -and $errorLifecycle.DeliveredWebhook -eq "STUB-ALERTS-URL") `
+        -Name "Maintenance/NotificationOnlyError_RoutesToAlerts" `
+        -Failure "Send-SlackAlert -Severity ERROR має бути доставлено на ALERTS webhook"
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $errorLifecycle.DeliveredMessage -and
+            $errorLifecycle.DeliveredMessage.Contains("SEVERITY=ERROR") -and
+            -not $errorLifecycle.DeliveredMessage.Contains("SEVERITY=WARNING")
+        ) `
+        -Name "Maintenance/NotificationOnlyError_ContentSeverityIsErrorNotWarning" `
+        -Failure "notification-only ERROR не повинен downgrade-итись до -Severity WARNING лише через спільний TitleEmoji ':warning:' (review, повторна знахідка після 95c05d7)"
+
+    # notification-only CRITICAL (без -IsCritical): content SEVERITY=CRITICAL,
+    # route alerts, execution critical=false, CriticalErrorsList не використана.
+    $criticalOnlyLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "notification-only critical" -Severity "CRITICAL"
+    }
+    Test-BRAVOCondition `
+        -Condition (-not $criticalOnlyLifecycle.CriticalErrorOccurred) `
+        -Name "Maintenance/NotificationOnlyCritical_ExecutionNotCritical" `
+        -Failure "Send-SlackAlert -Severity CRITICAL (без -IsCritical) НЕ повинен встановлювати `$script:criticalErrorOccurred — це відрізняє NotificationSeverity від OperationSeverity навіть на межі CRITICAL"
+    Test-BRAVOCondition `
+        -Condition ($criticalOnlyLifecycle.CriticalErrorsListCount -eq 0 -and $criticalOnlyLifecycle.NotificationAlertQueueCount -eq 1) `
+        -Name "Maintenance/NotificationOnlyCritical_UsesAlertQueueNotCriticalList" `
+        -Failure "notification-only CRITICAL (без -IsCritical) має чергуватись в NotificationAlertQueue, а не в CriticalErrorsList — інакше він би непомітно почав впливати на execution exit code"
+    Test-BRAVOCondition `
+        -Condition ($criticalOnlyLifecycle.DeliveredCount -eq 1 -and $criticalOnlyLifecycle.DeliveredWebhook -eq "STUB-ALERTS-URL") `
+        -Name "Maintenance/NotificationOnlyCritical_RoutesToAlerts" `
+        -Failure "Send-SlackAlert -Severity CRITICAL (без -IsCritical) має бути доставлено на ALERTS webhook"
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $criticalOnlyLifecycle.DeliveredMessage -and
+            $criticalOnlyLifecycle.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            -not $criticalOnlyLifecycle.DeliveredMessage.Contains("SEVERITY=WARNING")
+        ) `
+        -Name "Maintenance/NotificationOnlyCritical_ContentSeverityStaysCritical" `
+        -Failure "notification-only CRITICAL не повинен downgrade-итись до -Severity WARNING у фінальному контенті лише через спільний TitleEmoji ':warning:' (review, повторна знахідка після 95c05d7)"
+
+    # legacy -IsCritical: content SEVERITY=CRITICAL, route alerts, execution
+    # critical=true, CriticalErrorsList використовується (не змінено).
+    $criticalLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "generic critical" -IsCritical
+    }
+    Test-BRAVOCondition `
+        -Condition ($criticalLifecycle.CriticalErrorOccurred) `
+        -Name "Maintenance/LegacyIsCritical_ExecutionIsCritical" `
+        -Failure "Send-SlackAlert -IsCritical (без -Severity) має й далі встановлювати criticalErrorOccurred — так само, як до додавання -Severity"
+    Test-BRAVOCondition `
+        -Condition ($criticalLifecycle.CriticalErrorsListCount -eq 1 -and $criticalLifecycle.NotificationAlertQueueCount -eq 0) `
+        -Name "Maintenance/LegacyIsCritical_UsesCriticalErrorsList" `
+        -Failure "Send-SlackAlert -IsCritical має й далі ставити повідомлення в CriticalErrorsList (не в NotificationAlertQueue) — легасі-поведінка не повинна змінитися"
+    Test-BRAVOCondition `
+        -Condition (
+            $criticalLifecycle.DeliveredCount -eq 1 -and
+            $criticalLifecycle.DeliveredWebhook -eq "STUB-ALERTS-URL" -and
+            $criticalLifecycle.DeliveredMessage.Contains("SEVERITY=CRITICAL") -and
+            $criticalLifecycle.DeliveredMessage.Contains("КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ")
+        ) `
+        -Name "Maintenance/LegacyIsCritical_ContentSeverityStaysCritical" `
+        -Failure "-IsCritical (справжня execution-critical подія) має й надалі формувати CRITICAL-презентацію 'КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ'/-Severity CRITICAL у фінальному звіті"
+
+    # --- Mixed NotificationAlertQueue: пріоритет CRITICAL > ERROR > WARNING
+    # для CONTENT severity фінального повідомлення (жоден з них не -IsCritical,
+    # тому execution лишається некритичним для всіх трьох комбінацій) -------
+    $mixedWarningErrorLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "w1" -Severity "WARNING"
+        Send-SlackAlert -Message "e1" -Severity "ERROR"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $mixedWarningErrorLifecycle.CriticalErrorOccurred -and
+            $mixedWarningErrorLifecycle.NotificationAlertQueueCount -eq 2 -and
+            $mixedWarningErrorLifecycle.DeliveredMessage.Contains("SEVERITY=ERROR") -and
+            -not $mixedWarningErrorLifecycle.DeliveredMessage.Contains("SEVERITY=WARNING")
+        ) `
+        -Name "Maintenance/MixedAlertQueue_WarningPlusErrorResolvesToError" `
+        -Failure "черга WARNING+ERROR має дати підсумкову content-severity ERROR (пріоритет CRITICAL > ERROR > WARNING), execution лишається некритичним"
+
+    $mixedWarningCriticalLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "w1" -Severity "WARNING"
+        Send-SlackAlert -Message "c1" -Severity "CRITICAL"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $mixedWarningCriticalLifecycle.CriticalErrorOccurred -and
+            $mixedWarningCriticalLifecycle.NotificationAlertQueueCount -eq 2 -and
+            $mixedWarningCriticalLifecycle.DeliveredMessage.Contains("SEVERITY=CRITICAL")
+        ) `
+        -Name "Maintenance/MixedAlertQueue_WarningPlusCriticalResolvesToCritical" `
+        -Failure "черга WARNING+CRITICAL (обидва без -IsCritical) має дати підсумкову content-severity CRITICAL, execution лишається некритичним (жоден запис не -IsCritical)"
+
+    $mixedErrorCriticalLifecycle = Invoke-MaintenanceSeverityLifecycleScenario -SendCalls {
+        Send-SlackAlert -Message "e1" -Severity "ERROR"
+        Send-SlackAlert -Message "c1" -Severity "CRITICAL"
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $mixedErrorCriticalLifecycle.CriticalErrorOccurred -and
+            $mixedErrorCriticalLifecycle.NotificationAlertQueueCount -eq 2 -and
+            $mixedErrorCriticalLifecycle.DeliveredMessage.Contains("SEVERITY=CRITICAL")
+        ) `
+        -Name "Maintenance/MixedAlertQueue_ErrorPlusCriticalResolvesToCritical" `
+        -Failure "черга ERROR+CRITICAL має дати підсумкову content-severity CRITICAL, execution лишається некритичним"
+
+    # --- Maintenance: фінальний status "УСПІШНО З ПОПЕРЕДЖЕННЯМИ" (mode=all,
+    # немає жодного critical/alert-queue запису) має маршрутизуватись як
+    # WARNING/ALERTS, а не як SUCCESS/GENERAL (review finding #1) ----------
+    $finalStatusModuleForSeverity = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @('Send-FinalReport')
+    $successWithWarningsRouteCapture = & $finalStatusModuleForSeverity {
+        $script:SlackMode = "all"
+        $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+        $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+        $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+        $script:ScriptStartTime = Get-Date
+        $bravoSettings = @{ NotificationRouting = @{} }
+        $NotificationProviderDisplayName = "STUB"
+        $script:deliveredMessages = New-Object System.Collections.Generic.List[object]
+        $LOG_DIR = "STUB-LOG-DIR"
+        $BravoMaintenanceEnabled = $true
+        $CheckSize = $false
+        $RangeIdMonitoringEnabled = $false
+        $traceOutputProcessed = $false
+        $exchangAPILogsProcessedCount = 0
+        $restoreCompletedAt = Get-Date
+
+        function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+        function Get-BRAVOFiles { param($Path, $Filter) return @() }
+        function Get-MaintenanceMinimumFreeSpaceLines { return @() }
+        function Format-BRAVOUkrainianCount { param([int]$Count, [string]$One, [string]$Few, [string]$Many) return "$Count" }
+        function Resolve-BRAVONotificationRoute {
+            param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+            if ($NotificationMode -eq "none") { return "none" }
+            if ($Severity -eq "SUCCESS") {
+                if ($NotificationMode -eq "errors_only") { return "none" }
+                return "general"
+            }
+            return "alerts"
+        }
+        function Invoke-NotificationWebhook {
+            param([string]$Message, [string]$WebhookUrl)
+            $script:deliveredMessages.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+        }
+        function New-MaintenanceNotificationMessage {
+            param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+            return "TITLE=$Title|EMOJI=$TitleEmoji|SEVERITY=$Severity|DETAILS=$($Details -join ';')"
+        }
+        # Реальна Get-BRAVOMaintenanceResolvedExitCode/Get-BRAVOMaintenanceFinalStatus
+        # тут НЕ витягуються (щоб не тягнути весь exit-code граф залежностей
+        # цього ізольованого тесту) — стаб відтворює саме ту пару
+        # "WARNING-статус" (exit 10 -> SuccessWithWarnings), яку й перевіряє
+        # цей regression-тест.
+        function Get-BRAVOMaintenanceResolvedExitCode { return 10 }
+        function Get-BRAVOMaintenanceFinalStatus { param($ExitCode) return [pscustomobject]@{ Text = 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' } }
+
+        Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+
+        [pscustomobject]@{
+            DeliveredCount = $script:deliveredMessages.Count
+            DeliveredMessage = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].Message } else { $null }
+            DeliveredWebhook = if ($script:deliveredMessages.Count -gt 0) { $script:deliveredMessages[0].WebhookUrl } else { $null }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $successWithWarningsRouteCapture.DeliveredCount -eq 1 -and
+            $successWithWarningsRouteCapture.DeliveredWebhook -eq "STUB-ALERTS-URL" -and
+            $successWithWarningsRouteCapture.DeliveredMessage.Contains("SEVERITY=WARNING")
+        ) `
+        -Name "Maintenance/SuccessWithWarningsRoutesToAlertsNotGeneral" `
+        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (:warning:) має маршрутизуватись через notificationSeverity=WARNING на ALERTS webhook, а не через SUCCESS на GENERAL (review finding #1: routing severity мав завжди збігатися з фактичним final status)"
 
     # Модель release channel (P0.6 аудиту): developer -> development,
     # master/main -> stable. Перевірка навмисно не обов'язкова — release-пакет
@@ -2440,7 +2860,10 @@ try {
         -SourceText ($archiveScriptText + [Environment]::NewLine + $healthScriptText + [Environment]::NewLine + $notificationScriptText) `
         -FunctionNames @(
             "ConvertTo-NotificationLiteralText",
+            "ConvertTo-DiscordNotificationText",
             "Split-DiscordNotificationText",
+            "ConvertTo-BRAVONotificationPayloadText",
+            "Send-BRAVONotificationChunks",
             "Test-BAZAPathBlockedByIncompatibleName",
             "Split-BAZAPendingFilesByCompatibility",
             "Get-BAZASynchronizationOutcome",
@@ -2458,6 +2881,7 @@ try {
             "Remove-BRAVOOwnedOrphanVSSResources",
             "Get-BRAVOArchiveFreeSpaceResult",
             "Send-BRAVOArchiveFreeSpaceAlert",
+            "Resolve-BRAVONotificationRoute",
             "Get-BRAVOCollisionSafeGenerationId",
             "New-BRAVOTemporaryArchivePath",
             "Remove-BRAVOTemporaryArchiveArtifacts",
@@ -2547,19 +2971,27 @@ try {
         $script:notificationMode = 'all'
         $script:notificationProvider = 'discord'
         $script:notificationProviderDisplayName = 'Discord'
-        $script:notificationWebhookUrl = 'https://example.invalid/webhook'
         $script:notificationRequestTimeoutSeconds = 5
         $script:ScriptBuildId = 'self-test'
         $script:logFile = 'C:\BRAVO_TEST\BRAVO_ARCHIV.log'
         $script:backupMonitoring = @{
             InstitutionName = 'TEST'
             InstitutionCode = '00000000'
+            NotificationRouting = @{ SUCCESS = 'general'; WARNING = 'alerts'; ERROR = 'alerts'; CRITICAL = 'alerts' }
+            NotificationCredentialTargets = @{}
         }
         $script:sentMessages = New-Object System.Collections.Generic.List[string]
         $script:alertLogs = New-Object System.Collections.Generic.List[string]
 
         function Get-HostInformation {
             [pscustomobject]@{ MachineName = 'TEST-HOST'; LocalIP = '127.0.0.1'; PublicIP = 'вимкнено' }
+        }
+        # Resolve-BRAVONotificationEndpoint — єдина функція в цьому ланцюжку,
+        # яка звертається до Credential Manager; тут вона навмисно
+        # заглушена (ізольований тест, без реального Get-BRAVOCredentialSecret).
+        function Resolve-BRAVONotificationEndpoint {
+            param([string]$Provider, [string]$Route, [hashtable]$CredentialTargets)
+            return 'https://example.invalid/webhook'
         }
         function New-BRAVOOperatorNotificationMessage {
             param(
@@ -3397,8 +3829,8 @@ try {
             $archiveScriptText.Contains("Send-BAZAIncompatibleNameAlert") -and
             $archiveScriptText.Contains("Проблемні файли пропущено; інші файли синхронізуються штатно.") -and
             $archiveScriptText.Contains("Select-Object -First 3") -and
-            $archiveScriptText.Contains("ConvertTo-DiscordNotificationText -Message `$message") -and
-            $archiveScriptText.Contains('$script:notificationWebhookUrl') -and
+            $archiveScriptText.Contains("ConvertTo-BRAVONotificationPayloadText -Provider `$script:notificationProvider -Message `$message") -and
+            $archiveScriptText.Contains('Resolve-BRAVONotificationEndpoint') -and
             $archiveScriptText.Contains('$script:notificationProvider') -and
             $archiveScriptText.Contains('$script:notificationRequestTimeoutSeconds')
         ) `

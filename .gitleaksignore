@@ -1,0 +1,19 @@
+# gitleaks fingerprint allowlist — по одному fingerprint на рядок.
+#
+# Кожен запис нижче — підтверджений false positive, не секрет.
+# Формат: <commit-sha>:<file>:<rule-id>:<line>, точно як друкує сам
+# gitleaks у полі "Fingerprint:" при знахідці.
+#
+# 90e0eafab8c543be6612fd28716759f4115a304a:BRAVO_SELF_TEST.ps1:discord-client-secret:1841
+# BRAVO_SELF_TEST.ps1 (feature/notification-severity-routing) — ізольований
+# self-test для fallback-логіки Resolve-BRAVONotificationEndpoint. Значення
+# 'BRAVO_DISCORD_ALERTS_URL_MISSING' — НАЗВА Credential Manager target-а
+# (симулює "route-специфічний запис не налаштований"), не секрет; реального
+# Credential Manager цей тест не торкається (Get-BRAVOCredentialSecret
+# повністю замокана в ізольованому module scope). Рядок випадково має
+# рівно 32 символи, що поруч із ключем "DiscordWebhookAlerts" і "="
+# збігається з дефолтним правилом gitleaks discord-client-secret
+# (entropy-евристика). Наступний коміт (545bc44) перейменував це значення
+# в поточному стані файлу; цей запис ігнорує лише історичну знахідку в
+# уже опублікованому комміті 90e0eaf (без rebase/force-push).
+90e0eafab8c543be6612fd28716759f4115a304a:BRAVO_SELF_TEST.ps1:discord-client-secret:1841

@@ -302,6 +302,16 @@ function Assert-BravoLoadedConfiguration {
         throw 'bravoSettings повинен бути хеш-таблицею.'
     }
 
+    # NotificationRouting — необов'язковий підключ (старі config без нього
+    # лишаються валідними; BRAVO.Notifications і backupMonitoring-проєкція
+    # застосовують безпечний дефолт). Тут лише м'яке попередження, якщо
+    # ключ присутній, але має неправильний тип — не throw, щоб не зробити
+    # стару/помилкову конфігурацію фатальною через опційне налаштування.
+    if ($global:bravoSettings.Contains('NotificationRouting') -and
+        -not ($global:bravoSettings.NotificationRouting -is [hashtable])) {
+        Write-Warning 'bravoSettings.NotificationRouting має бути хеш-таблицею — застосовується дефолтна маршрутизація (SUCCESS=general, WARNING/ERROR/CRITICAL=alerts).'
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }
