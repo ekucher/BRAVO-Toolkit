@@ -1856,7 +1856,13 @@ try {
             return $null
         }
         $targetsBothPresent = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
-        $targetsLegacyOnly = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL_MISSING'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
+        # Назва target-а навмисно НЕ у ключах $stubs вище (Get-BRAVOCredentialSecret
+        # поверне $null) — симулює "route-специфічний Credential Manager
+        # запис не налаштований", щоб перевірити fallback на legacy.
+        # (Значення НЕ 32 символи навмисно: gitleaks' "discord-client-secret"
+        # rule false-positive спрацьовує на 32-символьні рядки поруч із
+        # "Discord"+"=" — це назва Credential Manager target-а, не секрет.)
+        $targetsLegacyOnly = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL_NOT_CONFIGURED'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
         $targetsNoneConfigured = @{}
         $newTargetWins = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsBothPresent
         $legacyFallback = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsLegacyOnly
