@@ -374,7 +374,28 @@ function Test-BRAVODataRestoreGenerationIdFormat {
     # "..\..\Windows") могло б вивести обчислений шлях за межі staging root.
     param([string]$GenerationId)
     if ([string]::IsNullOrWhiteSpace($GenerationId)) { return $false }
-    return [bool]($GenerationId -match '^\d{8}_\d{6}(?:_\d+)?$')
+    $formatMatch = [regex]::Match($GenerationId, '^\d{8}_\d{6}(?:_(?<suffix>\d+))?$')
+    if (-not $formatMatch.Success) { return $false }
+    # Продюсер (Get-BRAVOCollisionSafeGenerationId, BRAVO.Archive.Runtime.ps1)
+    # генерує суфікс лише обмеженим циклом [int] (0..MaxAttempts). Regex вище
+    # НЕ обмежує кількість цифр, тому недовірене (особливо SFTP-manifest чи
+    # remote-listing) ім'я на кшталт "..._2147483648" пройшло б формат, але
+    # звалило б подальший [int]-каст у Get-BRAVODataRestoreGenerationIdSortKey
+    # необробленим OverflowException. TryParse тут — non-throwing перевірка,
+    # що значення взагалі влазить у той самий числовий тип, яким оперує
+    # sort-key/продюсер; неприйнятний суфікс — це недопустимий формат, а не
+    # crash.
+    if ($formatMatch.Groups['suffix'].Success) {
+        $parsedSuffix = 0
+        if (-not [int]::TryParse(
+                $formatMatch.Groups['suffix'].Value,
+                [System.Globalization.NumberStyles]::None,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsedSuffix)) {
+            return $false
+        }
+    }
+    return $true
 }
 
 function Get-BRAVODataRestoreGenerationIdSortKey {
@@ -396,7 +417,20 @@ function Get-BRAVODataRestoreGenerationIdSortKey {
     } catch {
         [datetime]::MinValue
     }
-    $suffix = if ($match.Groups['suffix'].Success) { [int]$match.Groups['suffix'].Value } else { 0 }
+    # [int]::TryParse замість прямого [int]-касту: цю функцію може викликати
+    # хтось напряму (не лише після Test-BRAVODataRestoreGenerationIdFormat),
+    # а недовірений suffix поза Int32-діапазоном не повинен валити сортування
+    # необробленим OverflowException — некоректний suffix трактується так
+    # само fail-safe, як і некоректний формат вище (найстарший ключ).
+    $suffix = 0
+    if ($match.Groups['suffix'].Success -and
+        -not [int]::TryParse(
+            $match.Groups['suffix'].Value,
+            [System.Globalization.NumberStyles]::None,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$suffix)) {
+        return [pscustomobject]@{ Timestamp = [datetime]::MinValue; Suffix = 0 }
+    }
     return [pscustomobject]@{ Timestamp = $timestamp; Suffix = $suffix }
 }
 
@@ -412,6 +446,38 @@ function Sort-BRAVODataRestoreManifestNamesByGenerationDescending {
         [pscustomobject]@{ Name = $_; Timestamp = $sortKey.Timestamp; Suffix = $sortKey.Suffix }
     } | Sort-Object -Property @{Expression = 'Timestamp'; Descending = $true }, @{Expression = 'Suffix'; Descending = $true } |
         Select-Object -ExpandProperty Name)
+}
+
+function Test-BRAVODataRestoreArchiveSize {
+    # Канонічна перевірка недовіреного component.ArchiveSize зі ЗМІСТУ
+    # manifest-а (особливо SFTP-джерела) ПЕРЕД тим, як значення бере участь
+    # у розрахунку вимог до вільного місця в staging. Без цієї перевірки
+    # відсутнє/нульове/від'ємне значення пропускає або занижує free-space
+    # preflight, і завантаження великого архіву може вичерпати staging-том
+    # раніше, ніж спрацюють подальші hash/inventory перевірки.
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][ref]$ValidatedBytes
+    )
+    $ValidatedBytes.Value = [long]0
+    if ($null -eq $Value) { return $false }
+    # Скалярне значення (не масив/об'єкт/hashtable) — недовірений JSON може
+    # містити довільну структуру замість числа.
+    if (($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) -or
+        $Value -is [pscustomobject] -or $Value -is [hashtable]) {
+        return $false
+    }
+    $parsedBytes = [long]0
+    if (-not [long]::TryParse(
+            [string]$Value,
+            [System.Globalization.NumberStyles]::Integer,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [ref]$parsedBytes)) {
+        return $false
+    }
+    if ($parsedBytes -le 0) { return $false }
+    $ValidatedBytes.Value = $parsedBytes
+    return $true
 }
 
 function Test-BRAVODataRestoreAsciiPath {
@@ -748,14 +814,16 @@ function Get-BRAVODataRestorePlan {
         }
         foreach ($componentType in $ComponentTypes) {
             $componentTarget = Join-Path $targetRoot $componentType
-            if (Test-Path -LiteralPath $componentTarget -PathType Leaf) {
-                return [pscustomobject]@{ Success = $false; Error = "ціль компонента існує як файл: $componentTarget"; TargetRoot = $null; Components = @() }
-            }
-            if (Test-Path -LiteralPath $componentTarget -PathType Container) {
-                $existingChildren = @(Get-ChildItem -LiteralPath $componentTarget -Force -ErrorAction Stop)
-                if ($existingChildren.Count -gt 0) {
-                    return [pscustomobject]@{ Success = $false; Error = "ціль компонента не порожня (нічого не перезаписуємо): $componentTarget"; TargetRoot = $null; Components = @() }
-                }
+            # Ціль компонента МУСИТЬ бути відсутньою (не лише "порожньою, якщо
+            # існує"): якщо дозволити наперед існуючий ПОРОЖНІЙ каталог, run
+            # не може відрізнити "каталог створив я" від "каталог належить
+            # оператору" (напр. з власним ACL) у ТІЙ Ж САМІЙ точці, звідки
+            # cleanup при відмові пізніше безумовно видаляв би target. Runtime
+            # створює компонентний каталог сам і явно володіє ним — інакше
+            # відмова компонента могла б знищити чужий, не створений цим
+            # прогоном каталог.
+            if (Test-Path -LiteralPath $componentTarget) {
+                return [pscustomobject]@{ Success = $false; Error = "ціль компонента вже існує (має бути відсутньою — runtime створює її сам): $componentTarget"; TargetRoot = $null; Components = @() }
             }
             $planComponents += [pscustomobject]@{
                 Type = $componentType
@@ -792,25 +860,48 @@ function Get-BRAVODataRestorePlan {
             PrerestoreDirectory = $prerestoreDirectory
         }
     }
-    # Попарна перевірка: жодні два обрані live-джерела не можуть збігатися
-    # чи бути одне всередині іншого (в БУДЬ-ЯКУ сторону). Інакше move-aside
-    # компонента, обробленого пізніше, знесе вбік ЦІЛИЙ батьківський
-    # каталог — включно з уже відновленим раніше компонентом і його
-    # prerestore-копією — і прогон міг би завершитись success, хоча
-    # раніший компонент фізично зник, а записаний для нього
-    # PrerestoreDirectory більше не існує.
-    for ($outerIndex = 0; $outerIndex -lt $planComponents.Count; $outerIndex++) {
-        for ($innerIndex = $outerIndex + 1; $innerIndex -lt $planComponents.Count; $innerIndex++) {
-            $outerComponent = $planComponents[$outerIndex]
-            $innerComponent = $planComponents[$innerIndex]
-            $outerDirectory = [string]$outerComponent.LiveSourceDirectory
-            $innerDirectory = [string]$innerComponent.LiveSourceDirectory
-            if ((Test-BRAVODataRestorePathEquals -First $outerDirectory -Second $innerDirectory) -or
-                (Test-BRAVODataRestorePathWithin -Path $outerDirectory -Directory $innerDirectory) -or
-                (Test-BRAVODataRestorePathWithin -Path $innerDirectory -Directory $outerDirectory)) {
+    # Кожне ОБРАНЕ live-джерело перевіряється проти УСІХ discovered
+    # live-джерел ($liveSources), а не лише проти інших ОБРАНИХ компонентів:
+    # коли -Component вибирає лише один компонент, цикл вище будує
+    # $planComponents лише з нього, і попарна перевірка лише всередині
+    # $planComponents не побачила б перетину з НЕобраним компонентом
+    # (напр. обраний MODEL = C:\LIMS, необраний BLOG = C:\LIMS\BLOG).
+    # Рівність/вкладеність у БУДЬ-ЯКУ сторону з будь-яким іншим discovered
+    # компонентом однаково небезпечна: move-aside обраного компонента
+    # знесе вбік чужий (можливо, необраний і тому взагалі не відновлюваний
+    # цим прогоном) live-каталог.
+    foreach ($planComponent in $planComponents) {
+        $selectedDirectory = [string]$planComponent.LiveSourceDirectory
+        foreach ($otherType in @($liveSources.Keys)) {
+            if ($otherType -eq $planComponent.Type) { continue }
+            $otherDirectory = [string]$liveSources[$otherType]
+            if ([string]::IsNullOrWhiteSpace($otherDirectory)) { continue }
+            if ((Test-BRAVODataRestorePathEquals -First $selectedDirectory -Second $otherDirectory) -or
+                (Test-BRAVODataRestorePathWithin -Path $selectedDirectory -Directory $otherDirectory) -or
+                (Test-BRAVODataRestorePathWithin -Path $otherDirectory -Directory $selectedDirectory)) {
                 return [pscustomobject]@{
                     Success = $false
-                    Error = "live-джерела компонентів $($outerComponent.Type) ($outerDirectory) і $($innerComponent.Type) ($innerDirectory) перетинаються — InPlace неможливий: move-aside одного знищив би дані іншого"
+                    Error = "live-джерело компонента $($planComponent.Type) ($selectedDirectory) перетинається з live-джерелом $otherType ($otherDirectory) — InPlace неможливий: move-aside одного знищив би дані іншого (незалежно від того, чи $otherType обрано для відновлення)"
+                    TargetRoot = $null
+                    Components = @()
+                }
+            }
+        }
+        # Той самий інваріант, що вже діє для OutOfPlace: обраний InPlace
+        # target (він же live-джерело) не може перетинатись з BackupRoot,
+        # RuntimeRoot чи staging — інакше move-aside/rollback знищив би
+        # комплект резервних копій, runtime чи проміжні дані відновлення.
+        foreach ($forbidden in @(
+            @{ Name = 'BackupRoot'; Path = $BackupRoot },
+            @{ Name = 'RuntimeRoot'; Path = $RuntimeRootPath },
+            @{ Name = 'staging'; Path = $StagingRoot }
+        )) {
+            if ((Test-BRAVODataRestorePathEquals -First $selectedDirectory -Second $forbidden.Path) -or
+                (Test-BRAVODataRestorePathWithin -Path $selectedDirectory -Directory $forbidden.Path) -or
+                (Test-BRAVODataRestorePathWithin -Path $forbidden.Path -Directory $selectedDirectory)) {
+                return [pscustomobject]@{
+                    Success = $false
+                    Error = "live-джерело компонента $($planComponent.Type) ($selectedDirectory) перетинається з захищеним розташуванням ($($forbidden.Name)): $($forbidden.Path)"
                     TargetRoot = $null
                     Components = @()
                 }
@@ -2147,6 +2238,20 @@ function Invoke-BRAVODataRestoreSftpArchiveFetch {
             -not (Test-Path -LiteralPath $localHashPath -PathType Leaf)) {
             throw "після завантаження $componentType відсутній архів або sidecar у staging"
         }
+        # Фактичний розмір завантаженого файлу мусить ТОЧНО збігатися з
+        # валідованим ArchiveSize із manifest-а: WinSCP може повідомити
+        # "успіх" при частковому/пошкодженому transfer-і, а сам ArchiveSize —
+        # недовірене поле, тому теж проходить ту саму канонічну перевірку
+        # перед порівнянням. SHA512/integrity-перевірка нижче лишається
+        # обов'язковою і НЕ замінюється цим size-check-ом.
+        $validatedArchiveSizeBytes = [long]0
+        if (-not (Test-BRAVODataRestoreArchiveSize -Value $componentState.ArchiveSize -ValidatedBytes ([ref]$validatedArchiveSizeBytes))) {
+            throw "manifest містить некоректний ArchiveSize для компонента ${componentType}: '$($componentState.ArchiveSize)'"
+        }
+        $actualArchiveSizeBytes = [long](Get-Item -LiteralPath $localArchivePath).Length
+        if ($actualArchiveSizeBytes -ne $validatedArchiveSizeBytes) {
+            throw "завантажений розмір архіву $componentType ($actualArchiveSizeBytes байт) не збігається з ArchiveSize у manifest ($validatedArchiveSizeBytes байт)"
+        }
         $stagedPaths[$componentType] = [pscustomobject]@{
             ArchivePath = $localArchivePath
             HashPath = $localHashPath
@@ -2349,6 +2454,15 @@ if ($ListGenerations) {
         if (-not $listingSession.Success) {
             throw "не вдалося отримати перелік manifest-ів з SFTP: $($listingSession.Error)"
         }
+        # Той самий контракт, що вже застосовується для вибору generation
+        # (Invoke-BRAVODataRestoreSftpManifestFetch): Success=true від
+        # Invoke-BRAVODataRestoreWinSCPScript НЕ гарантує, що сама ls-операція
+        # завершилась успішно — без цієї перевірки перерваний/частковий
+        # лістинг міг би мовчазно показати оператору неповний inventory як
+        # нібито повний перелік доступних generation.
+        if (-not (Test-BRAVODataRestoreWinSCPListingSucceeded -Xml $listingSession.Xml)) {
+            throw 'перелік manifest-ів з SFTP не підтверджено (ls-операція не позначена як успішна в XML-журналі WinSCP)'
+        }
         $remoteManifestNames = @(Sort-BRAVODataRestoreManifestNamesByGenerationDescending -ManifestNames @(
             Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
                 Where-Object { $_ -match '^BRAVO_BACKUP_\d{8}_\d{6}(?:_\d+)?\.json$' }) |
@@ -2370,13 +2484,36 @@ if ($ListGenerations) {
             if (-not $listDownloadSession.Success) {
                 throw "не вдалося завантажити manifest-и: $($listDownloadSession.Error)"
             }
+            # Per-download результати з XML-журналу (той самий контракт, що
+            # вже застосовується для вибору generation): один частково
+            # завантажений manifest у батчі не повинен мовчазно показуватись
+            # як "(не прочитано)" поруч із рештою, ніби це звичайний
+            # нечитабельний файл, а не наслідок збою transfer-у.
+            $listDownloadResults = @(Get-BRAVODataRestoreWinSCPDownloads -Xml $listDownloadSession.Xml)
             foreach ($remoteManifestName in $remoteManifestNames) {
                 $localListManifestPath = Join-Path $listStagingDirectory $remoteManifestName
+                $matchingListDownload = @($listDownloadResults | Where-Object {
+                    ([string]$_.RemotePath) -like "*$remoteManifestName"
+                } | Select-Object -First 1)
+                if ($matchingListDownload.Count -eq 0 -or -not [bool]$matchingListDownload[0].Success) {
+                    Write-BRAVOResultNote -Text "  $remoteManifestName  (ЗАВАНТАЖЕННЯ НЕ ПІДТВЕРДЖЕНО)"
+                    continue
+                }
                 $listLine = "  $remoteManifestName"
                 if (Test-Path -LiteralPath $localListManifestPath -PathType Leaf) {
                     try {
                         $listManifest = [IO.File]::ReadAllText($localListManifestPath) | ConvertFrom-Json -ErrorAction Stop
-                        $listLine = ("  {0}  {1,-10}" -f [string]$listManifest.generationId, [string]$listManifest.status)
+                        # Ім'я файлу vs generationId у ЗМІСТІ manifest-а — той
+                        # самий identity-контракт, що вже застосовується при
+                        # виборі generation (Get-BRAVORestoreGenerationManifest):
+                        # розбіжність не повинна показуватись оператору як
+                        # звичайний валідний запис переліку.
+                        $filenameGenerationId = [IO.Path]::GetFileNameWithoutExtension($remoteManifestName) -replace '^BRAVO_BACKUP_', ''
+                        if (-not [string]::Equals($filenameGenerationId, [string]$listManifest.generationId, [StringComparison]::Ordinal)) {
+                            $listLine = "  $remoteManifestName  (НЕЗБІЖНІСТЬ generationId: файл='$filenameGenerationId' JSON='$([string]$listManifest.generationId)')"
+                        } else {
+                            $listLine = ("  {0}  {1,-10}" -f [string]$listManifest.generationId, [string]$listManifest.status)
+                        }
                     } catch {
                         $listLine = "  $remoteManifestName  (не прочитано)"
                     }
@@ -2534,9 +2671,16 @@ try {
                 $componentStateForSize = @($componentsPropertyForSizes.Value.PSObject.Properties | Where-Object {
                     [string]::Equals($_.Name, $componentType, [StringComparison]::OrdinalIgnoreCase)
                 } | Select-Object -First 1)[0].Value
+                # ArchiveSize зі ЗМІСТУ manifest-а — недовірений вхід (SFTP):
+                # відсутнє/нульове/від'ємне/нечислове значення відхиляємо
+                # ДО того, як воно занизить free-space preflight.
+                $validatedArchiveSizeBytes = [long]0
+                if (-not (Test-BRAVODataRestoreArchiveSize -Value $componentStateForSize.ArchiveSize -ValidatedBytes ([ref]$validatedArchiveSizeBytes))) {
+                    Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "manifest містить некоректний ArchiveSize для компонента ${componentType}: '$($componentStateForSize.ArchiveSize)'"
+                }
                 $stagingRequirements += [pscustomobject]@{
                     TargetDirectory = Join-Path (Join-Path $stagingRootPath $script:dataRestoreSelectedGenerationId) $componentType
-                    RequiredBytes = [long]$componentStateForSize.ArchiveSize
+                    RequiredBytes = $validatedArchiveSizeBytes
                 }
             }
             $stagingSpaceCheck = Test-BRAVODataRestoreFreeSpace `
@@ -2611,12 +2755,25 @@ try {
             $componentNameTemplate = [string]@($global:archiveDefinitions | Where-Object {
                 [string]::Equals([string]$_.Type, $componentType, [StringComparison]::OrdinalIgnoreCase)
             } | Select-Object -First 1).NameTemplate
+            # Canonical каталог цього Component: для Local — production
+            # Destination з BRAVO.config (те саме джерело істини, куди
+            # Archive реально пише); для SFTP — per-component підкаталог
+            # staging generation root, куди Invoke-BRAVODataRestoreSftpArchiveFetch
+            # завантажив саме цей компонент (ArchivePath у $selectedManifest
+            # уже переписаний на staging через ConvertTo-BRAVODataRestoreStagedManifest).
+            $componentExpectedDirectory = if ($Source -eq 'Local') {
+                [string]@($global:archiveDefinitions | Where-Object {
+                    [string]::Equals([string]$_.Type, $componentType, [StringComparison]::OrdinalIgnoreCase)
+                } | Select-Object -First 1).Destination
+            } else {
+                Join-Path $script:dataRestoreStagingGenerationRoot $componentType
+            }
             try {
                 $verifiedArchive = Get-BRAVOVerifiedGenerationArchive `
                     -Manifest $selectedManifest `
                     -Component $componentType `
                     -NameTemplate $componentNameTemplate `
-                    -ArchivePrefix ([string]$global:archivePrefix)
+                    -ComponentDirectory $componentExpectedDirectory
             } catch {
                 Stop-BRAVODataRestoreRun -Category HashValidationFailed -Reason $_.Exception.Message
             }
@@ -2802,6 +2959,14 @@ try {
             # live-каталог, який на цей момент навіть НЕ торкався — catch-гілка
             # нижче не має права видаляти його як "частковий результат".
             $moveAsideArmed = $false
+            # OutOfPlace: cleanup при відмові компонента має право видалити
+            # ЛИШЕ target-каталог, який СТВОРИВ цей прогін (New-Item нижче),
+            # а не будь-який каталог, що опинився за цим шляхом — інакше
+            # відмова компонента могла б знищити operator-owned каталог
+            # (власний ACL/файли), який з'явився за цим шляхом уже ПІСЛЯ
+            # планування (TOCTOU-вікно між Get-BRAVODataRestorePlan і цим
+            # моментом).
+            $outOfPlaceTargetCreatedByThisRun = $false
             try {
                 if ($Mode -eq 'InPlace') {
                     $moveAsideResult = Invoke-BRAVODataRestoreMoveAside `
@@ -2821,7 +2986,21 @@ try {
                 }
                 # Свіжий порожній каталог цілі — нічого не перезаписується
                 # за конструкцією.
-                [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -Force -ErrorAction Stop)
+                if ($Mode -eq 'OutOfPlace') {
+                    # Повторна (race-safe) перевірка відсутності безпосередньо
+                    # перед створенням: план вимагав відсутності цілі, але між
+                    # плануванням і цим моментом каталог міг з'явитися (інший
+                    # процес/оператор) — тоді ми НЕ можемо претендувати на
+                    # володіння ним і мусимо відмовити компонент, а не мовчки
+                    # extract-ити в чужий каталог чи пізніше видалити його.
+                    if (Test-Path -LiteralPath $planComponent.TargetDirectory) {
+                        throw "ціль компонента з'явилася між плануванням і відновленням (не створено цим прогоном): $($planComponent.TargetDirectory)"
+                    }
+                    [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -ErrorAction Stop)
+                    $outOfPlaceTargetCreatedByThisRun = $true
+                } else {
+                    [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -Force -ErrorAction Stop)
+                }
                 if ($Mode -eq 'InPlace' -and $moveAsidePerformed) {
                     # ACL знесеного попередника (не батьківського каталогу)
                     # — це production access control (напр. обліковий запис
@@ -2961,13 +3140,22 @@ try {
                         [void]$completedInPlaceComponents.Clear()
                     }
                 } else {
-                    try {
-                        if (Test-Path -LiteralPath $planComponent.TargetDirectory) {
-                            Remove-Item -LiteralPath $planComponent.TargetDirectory -Recurse -Force -ErrorAction Stop
+                    # Видаляємо ЛИШЕ каталог, який СТВОРИВ цей прогін
+                    # (outOfPlaceTargetCreatedByThisRun): наперед існуючий
+                    # (operator-owned) каталог за цим шляхом сюди дійти не
+                    # може — планування вимагає його відсутності, а якщо він
+                    # з'явився пізніше, New-Item вище вже кинув виняток ДО
+                    # встановлення прапорця, і виконання сюди не дійшло б із
+                    # $outOfPlaceTargetCreatedByThisRun = $true.
+                    if ($outOfPlaceTargetCreatedByThisRun) {
+                        try {
+                            if (Test-Path -LiteralPath $planComponent.TargetDirectory) {
+                                Remove-Item -LiteralPath $planComponent.TargetDirectory -Recurse -Force -ErrorAction Stop
+                            }
+                        } catch {
+                            $script:dataRestoreWarningCount++
+                            Write-DataRestoreLog -Message "Не вдалося прибрати частковий результат $($planComponent.TargetDirectory): $($_.Exception.Message)" -Level 'WARNING'
                         }
-                    } catch {
-                        $script:dataRestoreWarningCount++
-                        Write-DataRestoreLog -Message "Не вдалося прибрати частковий результат $($planComponent.TargetDirectory): $($_.Exception.Message)" -Level 'WARNING'
                     }
                 }
                 $existingResult = @($script:dataRestoreComponentResults | Where-Object { $_.Component -eq $componentType })[0]

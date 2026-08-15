@@ -8016,6 +8016,7 @@ function Format-BRAVOFileSize {
             'Format-BRAVODataRestoreRollbackFailureText',
             'Invoke-BRAVODataRestoreTestFailPoint',
             'Test-BRAVODataRestoreWinSCPListingSucceeded',
+            'Test-BRAVODataRestoreArchiveSize',
             'Get-BRAVODataRestoreGenerationIdSortKey',
             'Sort-BRAVODataRestoreManifestNamesByGenerationDescending',
             'New-BRAVODataRestoreWinSCPNamespaceManager'
@@ -8127,6 +8128,20 @@ function Format-BRAVOFileSize {
             ) `
             -Name "DataRestore/PlanRejectsUnsafeOutOfPlaceTargets" `
             -Failure "Get-BRAVODataRestorePlan має відхиляти -TargetPath, що перетинається із захищеним розташуванням у БУДЬ-ЯКУ сторону вкладеності (BackupRoot/RuntimeRoot/staging/live-джерело), відносний шлях і непорожню ціль компонента"
+
+        # Fourth restore safety review (PR #40): наперед існуюча, але
+        # ПОРОЖНЯ ціль компонента теж має відхилятись (не лише непорожня) —
+        # інакше runtime не міг би достовірно відрізнити "каталог створив
+        # я" від "operator-owned каталог" у тому самому місці, звідки
+        # cleanup при відмові пізніше безумовно видаляв би target.
+        $planEmptyTargetRoot = Join-Path $planTestRoot 'TARGET_EMPTY'
+        [void][IO.Directory]::CreateDirectory($planEmptyTargetRoot)
+        [void][IO.Directory]::CreateDirectory((Join-Path $planEmptyTargetRoot 'MODEL'))
+        $planPreExistingEmptyTarget = & $planInvoke $dataRestoreModule 'OutOfPlace' $planEmptyTargetRoot $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+        Test-BRAVOCondition `
+            -Condition (-not $planPreExistingEmptyTarget.Success) `
+            -Name "DataRestore/PlanRejectsPreExistingEmptyOutOfPlaceComponentTarget" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) має відхиляти наперед існуючу ціль компонента, НАВІТЬ ПОРОЖНЮ — target МУСИТЬ бути відсутнім, щоб runtime міг створити й гарантовано володіти ним (і безпечно видалити лише його при відмові, не чіпаючи operator-owned каталог)"
 
         Test-BRAVOCondition `
             -Condition (
@@ -9415,6 +9430,67 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Name "DataRestore/GenerationIdSortKeyParsesTimestampAndNumericSuffix" `
         -Failure "Get-BRAVODataRestoreGenerationIdSortKey має розбирати timestamp окремо від suffix (числовий int, 0 за замовчуванням без suffix), а не порівнювати рядок"
 
+    # --- 6.19c. Fourth restore safety review (PR #40): collision-suffix
+    # ПОЗА Int32-діапазоном (недовірене SFTP-ім'я) не повинен валити ані
+    # формат-валідацію, ані sort-key необробленим OverflowException. ------
+    $genIdFormatSuffixMax = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260815_120000_2147483647' }
+    $genIdFormatSuffixOverflow = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260815_120000_2147483648' }
+    $genIdFormatSuffixHugeOverflow = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260815_120000_999999999999999999999' }
+    $sortKeyOverflowThrew = $false
+    $sortKeyOverflow = $null
+    try {
+        $sortKeyOverflow = & $dataRestoreModule { Get-BRAVODataRestoreGenerationIdSortKey -GenerationId '20260815_120000_2147483648' }
+    } catch { $sortKeyOverflowThrew = $true }
+    Test-BRAVOCondition `
+        -Condition (
+            $genIdFormatSuffixMax -eq $true -and
+            $genIdFormatSuffixOverflow -eq $false -and
+            $genIdFormatSuffixHugeOverflow -eq $false -and
+            -not $sortKeyOverflowThrew -and $null -ne $sortKeyOverflow -and
+            $sortKeyOverflow.Timestamp -eq [datetime]::MinValue -and $sortKeyOverflow.Suffix -eq 0
+        ) `
+        -Name "DataRestore/GenerationIdSuffixOverflowNeverThrows" `
+        -Failure "Test-BRAVODataRestoreGenerationIdFormat має приймати suffix у межах Int32 (напр. 2147483647) і відхиляти будь-який суфікс поза цим діапазоном як недопустимий формат; Get-BRAVODataRestoreGenerationIdSortKey не повинен кидати OverflowException навіть при виклику напряму з недовіреним suffix — некоректний формат трактується як найстаріший ключ, а не crash"
+
+    # --- 6.19d. Fourth restore safety review (PR #40): недовірений
+    # component.ArchiveSize (SFTP manifest) — відсутнє/нульове/від'ємне/
+    # нечислове значення відхиляється ДО участі в free-space preflight. ----
+    $archiveSizeValidBytes = [long]0
+    $archiveSizeValidOk = & $dataRestoreModule {
+        param($value, [ref]$out)
+        Test-BRAVODataRestoreArchiveSize -Value $value -ValidatedBytes $out
+    } 123456789 ([ref]$archiveSizeValidBytes)
+    $archiveSizeMissingBytes = [long]0
+    $archiveSizeMissingOk = & $dataRestoreModule {
+        param($value, [ref]$out)
+        Test-BRAVODataRestoreArchiveSize -Value $value -ValidatedBytes $out
+    } $null ([ref]$archiveSizeMissingBytes)
+    $archiveSizeZeroBytes = [long]0
+    $archiveSizeZeroOk = & $dataRestoreModule {
+        param($value, [ref]$out)
+        Test-BRAVODataRestoreArchiveSize -Value $value -ValidatedBytes $out
+    } 0 ([ref]$archiveSizeZeroBytes)
+    $archiveSizeNegativeBytes = [long]0
+    $archiveSizeNegativeOk = & $dataRestoreModule {
+        param($value, [ref]$out)
+        Test-BRAVODataRestoreArchiveSize -Value $value -ValidatedBytes $out
+    } (-1) ([ref]$archiveSizeNegativeBytes)
+    $archiveSizeNonNumericBytes = [long]0
+    $archiveSizeNonNumericOk = & $dataRestoreModule {
+        param($value, [ref]$out)
+        Test-BRAVODataRestoreArchiveSize -Value $value -ValidatedBytes $out
+    } 'not-a-number' ([ref]$archiveSizeNonNumericBytes)
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveSizeValidOk -eq $true -and $archiveSizeValidBytes -eq 123456789 -and
+            $archiveSizeMissingOk -eq $false -and $archiveSizeMissingBytes -eq 0 -and
+            $archiveSizeZeroOk -eq $false -and $archiveSizeZeroBytes -eq 0 -and
+            $archiveSizeNegativeOk -eq $false -and $archiveSizeNegativeBytes -eq 0 -and
+            $archiveSizeNonNumericOk -eq $false -and $archiveSizeNonNumericBytes -eq 0
+        ) `
+        -Name "DataRestore/ArchiveSizeValidationRejectsUntrustedValues" `
+        -Failure "Test-BRAVODataRestoreArchiveSize має приймати лише додатне ціле; відсутнє/нульове/від'ємне/нечислове значення component.ArchiveSize (недовірений SFTP manifest) має відхилятись ДО участі у free-space preflight"
+
     $unorderedManifestNames = @(
         'BRAVO_BACKUP_20260815_120000_9.json',
         'BRAVO_BACKUP_20260815_120000_10.json',
@@ -9527,6 +9603,93 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         }
     }
 
+    # --- 6.19b. Fourth restore safety review (PR #40): коли -Component
+    # обирає ЛИШЕ ОДИН компонент, InPlace-план має відхиляти перетин із
+    # НЕвибраним компонентом теж — не лише з іншими вибраними. -----------
+    $singleSelectIntersectRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_SINGLE_SELECT_INTERSECT_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $singleSelectBackupRoot = Join-Path $singleSelectIntersectRoot 'BACKUP'
+        $singleSelectRuntimeRoot = Join-Path $singleSelectIntersectRoot 'RUNTIME'
+        $singleSelectStagingRoot = Join-Path $singleSelectBackupRoot 'RESTORE_STAGING'
+        foreach ($singleSelectDirectory in @($singleSelectBackupRoot, $singleSelectRuntimeRoot, $singleSelectStagingRoot)) {
+            [void][IO.Directory]::CreateDirectory($singleSelectDirectory)
+        }
+        $singleSelectPlanInvoke = {
+            param($Module, $ComponentTypes, $Definitions)
+            & $Module {
+                param($b, $r, $s, $d, $c)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes $c `
+                    -RestoreMode 'InPlace' `
+                    -RequestedTargetPath '' `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260815_190000'
+            } $singleSelectBackupRoot $singleSelectRuntimeRoot $singleSelectStagingRoot $Definitions $ComponentTypes
+        }
+        # MODEL (обраний, самотньо) = C:\LIMS (батько); BLOG (НЕ обраний) =
+        # C:\LIMS\BLOG (дитина обраного). Discovery/ArchiveDefinitions
+        # завжди містять ОБИДВА (реальна поведінка), навіть коли -Component
+        # запитав лише MODEL.
+        $singleSelectRoot = Join-Path $singleSelectIntersectRoot 'LIMS'
+        [void][IO.Directory]::CreateDirectory((Join-Path $singleSelectRoot 'BLOG'))
+        $singleSelectDefinitions = @(
+            [pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $singleSelectRoot 'model.gdb') },
+            [pscustomobject]@{ Type = 'BLOG'; Source = (Join-Path $singleSelectRoot 'BLOG\blog.db') }
+        )
+        $singleSelectModelOnlyPlan = & $singleSelectPlanInvoke $dataRestoreModule @('MODEL') $singleSelectDefinitions
+        $singleSelectAllPlan = & $singleSelectPlanInvoke $dataRestoreModule @('MODEL', 'BLOG') $singleSelectDefinitions
+
+        # Контроль: той самий -Component MODEL, але BLOG (НЕ обраний) —
+        # безпечний сусідній каталог, має ПРОЙТИ.
+        $singleSelectSafeRoot = Join-Path $singleSelectIntersectRoot 'SAFE'
+        [void][IO.Directory]::CreateDirectory((Join-Path $singleSelectSafeRoot 'Model'))
+        [void][IO.Directory]::CreateDirectory((Join-Path $singleSelectSafeRoot 'Blog'))
+        $singleSelectSafeDefinitions = @(
+            [pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $singleSelectSafeRoot 'Model\model.gdb') },
+            [pscustomobject]@{ Type = 'BLOG'; Source = (Join-Path $singleSelectSafeRoot 'Blog\blog.db') }
+        )
+        $singleSelectSafePlan = & $singleSelectPlanInvoke $dataRestoreModule @('MODEL') $singleSelectSafeDefinitions
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not $singleSelectModelOnlyPlan.Success -and
+                -not $singleSelectAllPlan.Success -and
+                $singleSelectSafePlan.Success
+            ) `
+            -Name "DataRestore/InPlacePlanChecksSelectedComponentAgainstAllDiscoveredLiveSources" `
+            -Failure "коли -Component обирає ЛИШЕ MODEL, а НЕвибраний BLOG фізично вкладений у MODEL (чи навпаки), Get-BRAVODataRestorePlan має відхиляти план так само, як при явному виборі обох — попарна перевірка лише серед ВИБРАНИХ компонентів пропустила б цей випадок; безпечний (непересічний) сусідній BLOG має й далі проходити при виборі лише MODEL"
+    } finally {
+        if (Test-Path -LiteralPath $singleSelectIntersectRoot) {
+            Remove-Item -LiteralPath $singleSelectIntersectRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.19e. Fourth restore safety review (PR #40): -ListGenerations
+    # -Source SFTP (окрема preview-гілка від вибору generation при
+    # відновленні) має підтверджувати ls-результат через
+    # Test-BRAVODataRestoreWinSCPListingSucceeded, перевіряти per-download
+    # результат кожного запитаного manifest-а й не показувати запис із
+    # розбіжністю filename/JSON generationId як звичайний валідний. Повний
+    # інтерактивний CLI-потік не витягується за AST (не чиста функція) —
+    # текстова перевірка коду, той самий підхід, що вже застосовується для
+    # ACL-fatal перевірки (6.17) у цьому файлі. ---------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('-Commands @("ls `"$remoteManifestDirectory`"")') -and
+            ($dataRestoreRuntimeTextForTests.IndexOf(
+                'if (-not (Test-BRAVODataRestoreWinSCPListingSucceeded -Xml $listingSession.Xml)) {',
+                $dataRestoreRuntimeTextForTests.IndexOf('SFTP-перегляд: завантажуємо до 10 найновіших')
+            )) -gt 0 -and
+            $dataRestoreRuntimeTextForTests.Contains('$listDownloadResults = @(Get-BRAVODataRestoreWinSCPDownloads -Xml $listDownloadSession.Xml)') -and
+            $dataRestoreRuntimeTextForTests.Contains('ЗАВАНТАЖЕННЯ НЕ ПІДТВЕРДЖЕНО') -and
+            $dataRestoreRuntimeTextForTests.Contains('НЕЗБІЖНІСТЬ generationId')
+        ) `
+        -Name "DataRestore/ListGenerationsSftpValidatesListingAndPerDownloadResults" `
+        -Failure "-ListGenerations -Source SFTP має підтверджувати ls-результат через Test-BRAVODataRestoreWinSCPListingSucceeded (той самий контракт, що вже застосовується при виборі generation), перевіряти per-download результат КОЖНОГО запитаного manifest-а через Get-BRAVODataRestoreWinSCPDownloads, і не показувати manifest із розбіжністю ім'я-файлу/JSON generationId як звичайний валідний запис"
+
     # --- 6.17. Third restore safety review (PR #40): OutOfPlace protective
     # ACL failure має бути fatal (fail-closed), не WARNING+continue. --------
     Test-BRAVOCondition `
@@ -9617,10 +9780,13 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         }
     }
 
-    # --- 6.19. Third restore safety review (PR #40): verified archive має
-    # бути прив'язаний до Component+generationId (canonical NameTemplate/
-    # ArchivePrefix), не лише до integrity/SHA512. Реальний Import-Module
-    # ArchiveHelpers, синтетичні артефакти на TEMP. --------------------------
+    # --- 6.19. Third/fourth restore safety review (PR #40): verified archive
+    # має бути прив'язаний до Component+generationId через canonical
+    # per-component каталог (НЕ через поточне значення ArchivePrefix —
+    # четверта хвиля review: ArchivePrefix ротується з часом (README.md),
+    # старі архіви лишаються legitimate під СТАРИМ префіксом), і не лише до
+    # integrity/SHA512. Реальний Import-Module ArchiveHelpers, синтетичні
+    # артефакти на TEMP. --------------------------
     Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
     Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
 
@@ -9640,12 +9806,18 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         [void][IO.Directory]::CreateDirectory($bindingTestRoot)
         $modelNameTemplate = '{0}_{1}.mdz'
         $blogNameTemplate = '{0}_blog_{1}.mdz'
-        $archivePrefixFixture = 'INST'
         $generationIdFixture = '20260815_150000'
+        # Canonical per-component каталоги (аналог archiveDefinitions[Type].Destination) —
+        # ЄДИНЕ джерело component identity в новій реалізації.
+        $modelComponentDirectory = Join-Path $bindingTestRoot 'MODEL'
+        $blogComponentDirectory = Join-Path $bindingTestRoot 'BLOG'
 
-        # PASS: справжній MODEL-архів поточної generation, з canonical ім'ям.
-        $correctModelName = $modelNameTemplate -f $archivePrefixFixture, $generationIdFixture
-        $correctModelArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory (Join-Path $bindingTestRoot 'case_pass') -ArchiveName $correctModelName
+        # PASS: справжній MODEL-архів поточної generation у СВОЄМУ каталозі,
+        # з canonical ім'ям (довільний ArchivePrefix — параметр більше не
+        # впливає на результат).
+        $currentPrefixFixture = 'INST'
+        $correctModelName = $modelNameTemplate -f $currentPrefixFixture, $generationIdFixture
+        $correctModelArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory $modelComponentDirectory -ArchiveName $correctModelName
         $passManifest = ConvertFrom-Json (@{
             generationId = $generationIdFixture
             components = @{
@@ -9655,13 +9827,41 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         $passResult = $null
         $passThrew = $false
         try {
-            $passResult = Get-BRAVOVerifiedGenerationArchive -Manifest $passManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ArchivePrefix $archivePrefixFixture
+            $passResult = Get-BRAVOVerifiedGenerationArchive -Manifest $passManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ComponentDirectory $modelComponentDirectory
         } catch { $passThrew = $true }
 
+        # PASS (четверта хвиля review — ArchivePrefix rotation): архів
+        # тієї самої generation, у ТОМУ Ж каталозі компонента, але
+        # створений під СТАРИМ, ІНШИМ за поточний, префіксом — має
+        # ЛИШАТИСЬ відновлюваним, бо identity більше не залежить від
+        # конкретного значення ArchivePrefix.
+        $rotatedPrefixFixture = 'OLDPREFIX'
+        $rotatedModelName = $modelNameTemplate -f $rotatedPrefixFixture, $generationIdFixture
+        $rotatedModelArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory (Join-Path $bindingTestRoot 'MODEL_rotated') -ArchiveName $rotatedModelName
+        # Той самий canonical каталог компонента, лише інша generation-тека
+        # (ізольований тимчасовий каталог заради чистоти фікстури) — ключове:
+        # ComponentDirectory нижче ВКАЗУЄ саме на каталог, де фізично лежить
+        # цей ротований архів, так само як реальний Destination завжди
+        # вказує на каталог компонента незалежно від того, під яким
+        # ArchivePrefix у ньому історично накопичувались архіви.
+        $rotatedManifest = ConvertFrom-Json (@{
+            generationId = $generationIdFixture
+            components = @{
+                MODEL = @{ Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true; ArchivePath = $rotatedModelArtifact.ArchivePath; HashPath = $rotatedModelArtifact.HashPath }
+            }
+        } | ConvertTo-Json -Depth 5)
+        $rotatedResult = $null
+        $rotatedThrew = $false
+        try {
+            $rotatedResult = Get-BRAVOVerifiedGenerationArchive -Manifest $rotatedManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ComponentDirectory (Join-Path $bindingTestRoot 'MODEL_rotated')
+        } catch { $rotatedThrew = $true }
+
         # REJECT: MODEL-запис вказує на реальний, криптографічно валідний
-        # BLOG-артефакт (та узгоджений sidecar) тієї самої generation.
-        $substitutedBlogName = $blogNameTemplate -f $archivePrefixFixture, $generationIdFixture
-        $substitutedBlogArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory (Join-Path $bindingTestRoot 'case_substituted') -ArchiveName $substitutedBlogName
+        # BLOG-артефакт (та узгоджений sidecar) тієї самої generation, що
+        # фізично лежить у СВОЄМУ (BLOG) каталозі — не в canonical
+        # каталозі MODEL, переданому як ComponentDirectory.
+        $substitutedBlogName = $blogNameTemplate -f $currentPrefixFixture, $generationIdFixture
+        $substitutedBlogArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory $blogComponentDirectory -ArchiveName $substitutedBlogName
         $substitutedManifest = ConvertFrom-Json (@{
             generationId = $generationIdFixture
             components = @{
@@ -9670,13 +9870,14 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         } | ConvertTo-Json -Depth 5)
         $substitutedThrew = $false
         try {
-            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $substitutedManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ArchivePrefix $archivePrefixFixture)
+            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $substitutedManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ComponentDirectory $modelComponentDirectory)
         } catch { $substitutedThrew = $true }
 
-        # REJECT: валідний MODEL-артефакт, але ІНШОЇ generation.
+        # REJECT: валідний MODEL-артефакт у СВОЄМУ каталозі, але ІНШОЇ
+        # generation.
         $wrongGenerationId = '20260810_000000'
-        $wrongGenerationName = $modelNameTemplate -f $archivePrefixFixture, $wrongGenerationId
-        $wrongGenerationArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory (Join-Path $bindingTestRoot 'case_wrong_generation') -ArchiveName $wrongGenerationName
+        $wrongGenerationName = $modelNameTemplate -f $currentPrefixFixture, $wrongGenerationId
+        $wrongGenerationArtifact = New-BRAVOSelfTestVerifiedArchiveFixture -Directory $modelComponentDirectory -ArchiveName $wrongGenerationName
         $wrongGenerationManifest = ConvertFrom-Json (@{
             generationId = $generationIdFixture
             components = @{
@@ -9685,17 +9886,18 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         } | ConvertTo-Json -Depth 5)
         $wrongGenerationThrew = $false
         try {
-            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $wrongGenerationManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ArchivePrefix $archivePrefixFixture)
+            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $wrongGenerationManifest -Component 'MODEL' -NameTemplate $modelNameTemplate -ComponentDirectory $modelComponentDirectory)
         } catch { $wrongGenerationThrew = $true }
 
         Test-BRAVOCondition `
             -Condition (
                 -not $passThrew -and $null -ne $passResult -and ([string]$passResult.Name) -eq $correctModelName -and
+                -not $rotatedThrew -and $null -ne $rotatedResult -and ([string]$rotatedResult.Name) -eq $rotatedModelName -and
                 $substitutedThrew -and
                 $wrongGenerationThrew
             ) `
             -Name "DataRestore/VerifiedArchiveBoundToComponentAndGeneration" `
-            -Failure "Get-BRAVOVerifiedGenerationArchive має приймати лише артефакт, чиє ім'я ТОЧНО відповідає canonical NameTemplate для запитаного Component і Manifest.generationId — правильний MODEL проходить; криптографічно валідний, але ПІДСТАВЛЕНИЙ BLOG-артефакт під MODEL-записом і валідний MODEL-артефакт ІНШОЇ generation мають відхилятись, навіть попри коректний SHA512/sidecar"
+            -Failure "Get-BRAVOVerifiedGenerationArchive має приймати лише артефакт, що фізично лежить у canonical каталозі запитаного Component і чиє ім'я закінчується суфіксом Manifest.generationId — правильний MODEL (будь-яким ArchivePrefix, у т.ч. відмінним від поточного — ротація префіксу) проходить; криптографічно валідний, але ПІДСТАВЛЕНИЙ BLOG-артефакт (лежить у СВОЄМУ каталозі, не в MODEL) і валідний MODEL-артефакт ІНШОЇ generation мають відхилятись, навіть попри коректний SHA512/sidecar"
     } finally {
         Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
         if (Test-Path -LiteralPath $bindingTestRoot) {

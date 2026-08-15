@@ -548,15 +548,24 @@ function Get-BRAVOVerifiedGenerationArchive {
         [Parameter(Mandatory = $true)][object]$Manifest,
         [Parameter(Mandatory = $true)][string]$Component,
         # Canonical naming policy of the backup PRODUCER (той самий
-        # NameTemplate/ArchivePrefix, яким генерувалось ім'я архіву —
-        # BRAVO.config archiveDefinitions[Type].NameTemplate -f
-        # archivePrefix, generationId). Без цього manifest, у якого
-        # component-запис MODEL посилається на реальний, криптографічно
-        # валідний BLOG-архів (чи MODEL-архів ІНШОЇ generation), пройшов
-        # би integrity/SHA512-перевірки нижче — вони доводять, що файл не
-        # пошкоджений, але НЕ що він належить саме цьому Component+generation.
+        # NameTemplate, яким генерувалось ім'я архіву — BRAVO.config
+        # archiveDefinitions[Type].NameTemplate -f archivePrefix,
+        # generationId). Використовується лише для СТРУКТУРИ суфіксу
+        # (роздільник + generationId + розширення), НЕ для конкретного
+        # значення ArchivePrefix — див. коментар нижче.
         [Parameter(Mandatory = $true)][string]$NameTemplate,
-        [Parameter(Mandatory = $true)][string]$ArchivePrefix
+        # Canonical (не мутований поточними налаштуваннями) каталог, де
+        # ЛЕГІТИМНО зберігаються артефакти САМЕ цього Component — для
+        # Local це archiveDefinitions[Type].Destination, для SFTP-staging
+        # це per-component підкаталог staging generation root
+        # (Invoke-BRAVODataRestoreSftpArchiveFetch кладе кожен компонент
+        # у власний підкаталог). Основа identity-binding: ArchivePrefix —
+        # оператор-конфігурований рядок, що ЗМІНЮЄТЬСЯ з часом (ротація);
+        # README.md документує, що архіви, створені під СТАРИМ префіксом,
+        # лишаються legitimate й мають лишатись відновлюваними. Каталог,
+        # натомість, детермінований типом компонента і не залежить від
+        # поточного значення ArchivePrefix.
+        [Parameter(Mandatory = $true)][string]$ComponentDirectory
     )
 
     $componentsProperty = $Manifest.PSObject.Properties['components']
@@ -585,16 +594,32 @@ function Get-BRAVOVerifiedGenerationArchive {
     }
     $archive = Get-Item -LiteralPath $archivePath
 
-    # Identity binding: ім'я артефакта має ТОЧНО відповідати тому, що
-    # producer згенерував би САМЕ для цього Component і САМЕ для цього
-    # generationId — інакше пошкоджений/підмінений manifest міг би
-    # підставити валідний архів ІНШОГО компонента чи ІНШОЇ generation,
-    # і кожна перевірка нижче (SHA512, sidecar) пройшла б, бо файл сам
-    # по собі не пошкоджений.
+    # Component identity binding: артефакт МУСИТЬ фізично лежати в
+    # canonical каталозі саме цього Component — інакше пошкоджений/
+    # підмінений manifest міг би підставити реальний, криптографічно
+    # валідний архів ІНШОГО компонента (він лежить у СВОЄМУ каталозі, не
+    # в цьому), і кожна перевірка нижче (SHA512, sidecar) пройшла б, бо
+    # файл сам по собі не пошкоджений. На відміну від попередньої
+    # реалізації (порівняння повного імені файлу з поточним ArchivePrefix),
+    # ця перевірка НЕ залежить від того, яким був ArchivePrefix у момент
+    # створення архіву — ротація префіксу не інвалідує старі backup.
+    $archiveDirectoryFull = try { [System.IO.Path]::GetFullPath($archive.DirectoryName).TrimEnd('\', '/') } catch { $archive.DirectoryName }
+    $expectedDirectoryFull = try { [System.IO.Path]::GetFullPath($ComponentDirectory).TrimEnd('\', '/') } catch { $ComponentDirectory }
+    if (-not [string]::Equals($archiveDirectoryFull, $expectedDirectoryFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "component ${Component}: артефакт '$($archive.FullName)' лежить поза canonical каталогом цього компонента ('$ComponentDirectory') — можлива підміна компонента у manifest"
+    }
+
+    # Generation identity binding: ім'я артефакта має закінчуватись саме
+    # тим суфіксом (роздільник(и) + generationId + розширення), який
+    # NameTemplate виробляє для CIЄЇ generationId — це прив'язує до
+    # generation, знову ж НЕЗАЛЕЖНО від значення ArchivePrefix (підставляємо
+    # порожній рядок у позицію {0}, суфікс — те, що лишається праворуч).
     $manifestGenerationId = [string]$Manifest.generationId
-    $expectedArchiveName = $NameTemplate -f $ArchivePrefix, $manifestGenerationId
-    if (-not [string]::Equals($archive.Name, $expectedArchiveName, [StringComparison]::Ordinal)) {
-        throw "component ${Component}: ім'я артефакта '$($archive.Name)' не відповідає очікуваному для Component+generation ('$expectedArchiveName') — можлива підміна компонента/generation у manifest"
+    $expectedNameSuffix = $NameTemplate -f '', $manifestGenerationId
+    if ([string]::IsNullOrEmpty($expectedNameSuffix) -or
+        $archive.Name.Length -le $expectedNameSuffix.Length -or
+        -not $archive.Name.EndsWith($expectedNameSuffix, [StringComparison]::Ordinal)) {
+        throw "component ${Component}: ім'я артефакта '$($archive.Name)' не відповідає generation '$manifestGenerationId' за canonical NameTemplate — можлива підміна generation у manifest"
     }
     $hashText = ([IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
     if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$' -or

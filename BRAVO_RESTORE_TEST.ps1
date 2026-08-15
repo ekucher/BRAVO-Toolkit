@@ -268,7 +268,7 @@ try {
                 -Manifest $selectedGeneration.Manifest `
                 -Component $componentName `
                 -NameTemplate ([string]$archiveDefinition.NameTemplate) `
-                -ArchivePrefix ([string]$global:archivePrefix)
+                -ComponentDirectory ([string]$archiveDefinition.Destination)
         } catch {
             Add-RestoreDrillResult FAIL $componentName $null $null 0 0 $_.Exception.Message
             if (-not $AsJson) {
