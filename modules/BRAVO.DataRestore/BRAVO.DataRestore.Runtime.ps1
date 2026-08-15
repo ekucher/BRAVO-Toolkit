@@ -271,6 +271,24 @@ function Invoke-BRAVODataRestoreTestFailPoint {
         return
     }
 
+    # Canonical allowlist: жоден Point/Component поза цим переліком не
+    # активує failpoint, навіть якщо конфігурація точно збігається з
+    # аргументами виклику. Це виключає випадкову активацію на
+    # некалонічних значеннях (напр. синтетичний "BAZA", який раніше
+    # використовувався у тестах, або майбутня точка, якої ще немає в
+    # production pipeline).
+    $canonicalPoints = @('AfterMoveAside')
+    $canonicalComponents = @('MODEL', 'BLOG', 'BRAVOEXCH')
+    $isCanonicalPoint = @($canonicalPoints | Where-Object {
+        [string]::Equals($_, $configuredPoint, [StringComparison]::OrdinalIgnoreCase)
+    }).Count -gt 0
+    $isCanonicalComponent = @($canonicalComponents | Where-Object {
+        [string]::Equals($_, $configuredComponent, [StringComparison]::OrdinalIgnoreCase)
+    }).Count -gt 0
+    if (-not $isCanonicalPoint -or -not $isCanonicalComponent) {
+        return
+    }
+
     if (-not [string]::Equals($configuredPoint, $Point, [StringComparison]::OrdinalIgnoreCase)) {
         return
     }
@@ -339,6 +357,20 @@ function Test-BRAVODataRestorePathEquals {
     } catch {
         return $true
     }
+}
+
+function Test-BRAVODataRestoreGenerationIdFormat {
+    # Канонічний формат generationId: yyyyMMdd_HHmmss з опційним
+    # collision-safe суфіксом _N. Єдина реалізація перевірки — той самий
+    # контракт застосовується і до -GenerationId з командного рядка, і до
+    # generationId, прочитаного зі ЗМІСТУ manifest-а (локального або,
+    # особливо, SFTP-завантаженого) ПЕРЕД тим, як значення бере участь у
+    # Join-Path/створенні каталогів. Manifest — недовірений вхід: без цієї
+    # перевірки шкідливе чи пошкоджене значення generationId (напр.
+    # "..\..\Windows") могло б вивести обчислений шлях за межі staging root.
+    param([string]$GenerationId)
+    if ([string]::IsNullOrWhiteSpace($GenerationId)) { return $false }
+    return [bool]($GenerationId -match '^\d{8}_\d{6}(?:_\d+)?$')
 }
 
 function Test-BRAVODataRestoreAsciiPath {
@@ -634,9 +666,13 @@ function Get-BRAVODataRestorePlan {
             @{ Name = 'RuntimeRoot'; Path = $RuntimeRootPath },
             @{ Name = 'staging'; Path = $StagingRoot }
         )
-        foreach ($componentType in $ComponentTypes) {
-            if (-not [string]::IsNullOrWhiteSpace([string]$liveSources[$componentType])) {
-                $forbiddenDirectories += @{ Name = "live-джерело $componentType"; Path = [string]$liveSources[$componentType] }
+        # УСІ discovered live-джерела (MODEL/BLOG/BRAVOEXCH), а не лише
+        # запитаний -Component: ціль OutOfPlace не має права влучити навіть
+        # у production-джерело компонента, який зараз НЕ відновлюється —
+        # інакше відновлення MODEL могло б випадково знищити live BLOG.
+        foreach ($liveSourceType in @($liveSources.Keys)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$liveSources[$liveSourceType])) {
+                $forbiddenDirectories += @{ Name = "live-джерело $liveSourceType"; Path = [string]$liveSources[$liveSourceType] }
             }
         }
         foreach ($forbidden in $forbiddenDirectories) {
@@ -1779,9 +1815,10 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
     }
     $operationTimeout = Get-BRAVODataRestoreSftpOperationTimeoutSeconds
 
-    $manifestNames = @()
-    if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
-        $manifestNames = @("BRAVO_BACKUP_{0}.json" -f $RequestedGenerationId)
+    $isExplicitRequest = -not [string]::IsNullOrWhiteSpace($RequestedGenerationId)
+    $candidateBatches = @()
+    if ($isExplicitRequest) {
+        $candidateBatches = @(, @("BRAVO_BACKUP_{0}.json" -f $RequestedGenerationId))
     } else {
         $listingSession = Invoke-BRAVODataRestoreWinSCPScript `
             -Commands @("ls `"$remoteManifestDirectory`"") `
@@ -1789,50 +1826,63 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
         if (-not $listingSession.Success) {
             throw "не вдалося отримати перелік manifest-ів з SFTP: $($listingSession.Error)"
         }
-        $manifestNames = @(Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
+        $allManifestNames = @(Get-BRAVODataRestoreWinSCPListingNames -Xml $listingSession.Xml |
             Where-Object { $_ -match '^BRAVO_BACKUP_\d{8}_\d{6}(?:_\d+)?\.json$' } |
-            Sort-Object -Descending |
-            Select-Object -First 10)
-        if ($manifestNames.Count -eq 0) {
+            Sort-Object -Descending)
+        if ($allManifestNames.Count -eq 0) {
             throw "на SFTP ($remoteManifestDirectory) не знайдено жодного generation manifest"
         }
+        # Батчами по 10 (замість жорсткого Select-Object -First 10) — корисне
+        # для мережевої ефективності, але БЕЗ обмеження коректності: якщо
+        # серед перших 10 немає жодного COMPLETE, пошук продовжується на
+        # наступних батчах, доки не переглянуто всі кандидати або не
+        # знайдено найновіший COMPLETE.
+        $manifestBatchSize = 10
+        for ($batchStart = 0; $batchStart -lt $allManifestNames.Count; $batchStart += $manifestBatchSize) {
+            $batchEnd = [math]::Min($batchStart + $manifestBatchSize, $allManifestNames.Count) - 1
+            $candidateBatches += , @($allManifestNames[$batchStart..$batchEnd])
+        }
     }
 
-    $getCommands = @()
-    foreach ($manifestName in $manifestNames) {
-        $localManifestPath = Join-Path $StagingManifestDirectory $manifestName
-        if (Test-Path -LiteralPath $localManifestPath) {
-            Remove-Item -LiteralPath $localManifestPath -Force -ErrorAction SilentlyContinue
+    $selected = $null
+    foreach ($manifestNameBatch in $candidateBatches) {
+        $getCommands = @()
+        foreach ($manifestName in $manifestNameBatch) {
+            $localManifestPath = Join-Path $StagingManifestDirectory $manifestName
+            if (Test-Path -LiteralPath $localManifestPath) {
+                Remove-Item -LiteralPath $localManifestPath -Force -ErrorAction SilentlyContinue
+            }
+            $getCommands += "get `"$remoteManifestDirectory/$manifestName`" `"$localManifestPath`""
         }
-        $getCommands += "get `"$remoteManifestDirectory/$manifestName`" `"$localManifestPath`""
-    }
-    $downloadSession = Invoke-BRAVODataRestoreWinSCPScript `
-        -Commands $getCommands `
-        -TimeoutSeconds $operationTimeout
-    if (-not $downloadSession.Success) {
-        throw "не вдалося завантажити manifest-и з SFTP: $($downloadSession.Error)"
-    }
+        $downloadSession = Invoke-BRAVODataRestoreWinSCPScript `
+            -Commands $getCommands `
+            -TimeoutSeconds $operationTimeout
+        if (-not $downloadSession.Success) {
+            throw "не вдалося завантажити manifest-и з SFTP: $($downloadSession.Error)"
+        }
 
-    # Найновіший COMPLETE серед завантажених (або точно запитаний).
-    $candidates = @()
-    foreach ($manifestName in $manifestNames) {
-        $localManifestPath = Join-Path $StagingManifestDirectory $manifestName
-        if (-not (Test-Path -LiteralPath $localManifestPath -PathType Leaf)) { continue }
-        try {
-            $manifest = [IO.File]::ReadAllText($localManifestPath) | ConvertFrom-Json -ErrorAction Stop
-        } catch {
-            continue
+        # Найновіший COMPLETE серед завантажених у цьому батчі (або точно запитаний).
+        $candidates = @()
+        foreach ($manifestName in $manifestNameBatch) {
+            $localManifestPath = Join-Path $StagingManifestDirectory $manifestName
+            if (-not (Test-Path -LiteralPath $localManifestPath -PathType Leaf)) { continue }
+            try {
+                $manifest = [IO.File]::ReadAllText($localManifestPath) | ConvertFrom-Json -ErrorAction Stop
+            } catch {
+                continue
+            }
+            if ([string]$manifest.status -ne 'COMPLETE') { continue }
+            $candidates += [pscustomobject]@{
+                Manifest = $manifest
+                ManifestPath = $localManifestPath
+                Name = $manifestName
+            }
         }
-        if ([string]$manifest.status -ne 'COMPLETE') { continue }
-        $candidates += [pscustomobject]@{
-            Manifest = $manifest
-            ManifestPath = $localManifestPath
-            Name = $manifestName
-        }
+        $selected = $candidates | Sort-Object Name -Descending | Select-Object -First 1
+        if ($null -ne $selected) { break }
     }
-    $selected = $candidates | Sort-Object Name -Descending | Select-Object -First 1
     if ($null -eq $selected) {
-        if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+        if ($isExplicitRequest) {
             throw "COMPLETE generation '$RequestedGenerationId' не знайдено на SFTP"
         }
         throw 'серед завантажених manifest-ів немає жодного COMPLETE'
@@ -2019,7 +2069,7 @@ Write-DataRestoreLog -Message "BRAVO Data Restore $script:ScriptVersion (build $
 
 # Ранні інваріанти параметрів — до lock і будь-яких дій.
 if (-not [string]::IsNullOrWhiteSpace($GenerationId) -and
-    $GenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$') {
+    -not (Test-BRAVODataRestoreGenerationIdFormat -GenerationId $GenerationId)) {
     Write-Host "ПОМИЛКА: GenerationId має формат yyyyMMdd_HHmmss (або collision-safe variant): '$GenerationId'" -ForegroundColor Red
     Write-DataRestoreLog -Message "Некоректний GenerationId: '$GenerationId'" -Level 'ERROR'
     exit 30
@@ -2219,6 +2269,13 @@ try {
         if ([string]::IsNullOrWhiteSpace($script:dataRestoreSelectedGenerationId)) {
             Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason 'обраний manifest не містить generationId'
         }
+        # generationId зі ЗМІСТУ manifest-а — недовірений вхід (особливо для
+        # Source=SFTP, де manifest завантажується із зовнішнього хоста): перш
+        # ніж значення бере участь у Join-Path для staging-каталогу нижче,
+        # воно мусить пройти той самий канонічний формат, що й -GenerationId.
+        if (-not (Test-BRAVODataRestoreGenerationIdFormat -GenerationId $script:dataRestoreSelectedGenerationId)) {
+            Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "generationId з manifest-а має недопустимий формат: '$($script:dataRestoreSelectedGenerationId)'"
+        }
         Write-BRAVOOperationResult `
             -Name 'Вибір generation' `
             -Status 'OK' `
@@ -2275,6 +2332,13 @@ try {
                 Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("staging: " + ($stagingSpaceCheck.Problems -join '; '))
             }
             $script:dataRestoreStagingGenerationRoot = Join-Path $stagingRootPath $script:dataRestoreSelectedGenerationId
+            # Defense-in-depth поверх формат-перевірки generationId вище:
+            # обчислений шлях мусить фізично лежати всередині staging root
+            # (canonical containment-перевірка, той самий Test-BRAVODataRestorePathWithin,
+            # що й для OutOfPlace -TargetPath).
+            if (-not (Test-BRAVODataRestorePathWithin -Path $script:dataRestoreStagingGenerationRoot -Directory $stagingRootPath)) {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "обчислений staging-шлях generation виходить за межі staging root: $($script:dataRestoreStagingGenerationRoot)"
+            }
             $stageStartedAt = Get-Date
             $stagedPaths = $null
             try {
@@ -2486,6 +2550,14 @@ try {
             $componentType = [string]$planComponent.Type
             $componentStartedAt = Get-Date
             $moveAsidePerformed = $false
+            # Транзакція компонента вважається "armed" ЛИШЕ після підтвердженого
+            # move-aside Success=true — незалежно від Performed (Performed=false
+            # ще й тоді, коли live-джерела не існувало, і transaction все одно
+            # володіє щойно створеною ціллю). Якщо move-aside сам провалився
+            # (Success=false), TargetDirectory для InPlace === оригінальний
+            # live-каталог, який на цей момент навіть НЕ торкався — catch-гілка
+            # нижче не має права видаляти його як "частковий результат".
+            $moveAsideArmed = $false
             try {
                 if ($Mode -eq 'InPlace') {
                     $moveAsideResult = Invoke-BRAVODataRestoreMoveAside `
@@ -2494,6 +2566,7 @@ try {
                     if (-not $moveAsideResult.Success) {
                         throw $moveAsideResult.Error
                     }
+                    $moveAsideArmed = $true
                     $moveAsidePerformed = [bool]$moveAsideResult.Performed
                     # Test-only deterministic failpoint (B20 acceptance):
                     # ПІСЛЯ підтвердженого move-aside SUCCESS (компонент уже
@@ -2561,19 +2634,36 @@ try {
                 }
             } catch {
                 $componentFailureReason = $_.Exception.Message
+                $currentComponentStatus = 'FAILED'
+                $currentComponentPrerestoreDirectory = $null
                 # Rollback: InPlace повертає prerestore-копію; OutOfPlace
                 # прибирає частково розпакований підкаталог, який створили ми.
                 if ($Mode -eq 'InPlace') {
-                    $rollback = Undo-BRAVODataRestoreMoveAside `
-                        -LiveDirectory $planComponent.TargetDirectory `
-                        -PrerestoreDirectory $planComponent.PrerestoreDirectory `
-                        -MoveAsidePerformed $moveAsidePerformed
-                    if (-not $rollback.Success) {
-                        $componentFailureReason = "$componentFailureReason; $($rollback.Error)"
-                        Send-BRAVODataRestoreNotification `
-                            -Severity 'CRITICAL' `
-                            -ResultLines @("Rollback компонента $componentType не вдався", [string]$rollback.Error) `
-                            -ActionText 'негайно перевірити стан каталогів компонента вручну.'
+                    if ($moveAsideArmed) {
+                        $rollback = Undo-BRAVODataRestoreMoveAside `
+                            -LiveDirectory $planComponent.TargetDirectory `
+                            -PrerestoreDirectory $planComponent.PrerestoreDirectory `
+                            -MoveAsidePerformed $moveAsidePerformed
+                        if (-not $rollback.Success) {
+                            $componentFailureReason = "$componentFailureReason; $($rollback.Error)"
+                            # Rollback самого компонента не завершився: копія
+                            # лишається на місці (Undo-BRAVODataRestoreMoveAside
+                            # нічого не видаляє при власному провалі) — статус
+                            # має явно відрізнятись від "FAILED, чисто відкочено",
+                            # інакше оператор не побачить, що потрібне ручне
+                            # втручання саме для ЦЬОГО компонента.
+                            $currentComponentStatus = 'ROLLBACK_FAILED'
+                            $currentComponentPrerestoreDirectory = $planComponent.PrerestoreDirectory
+                            Send-BRAVODataRestoreNotification `
+                                -Severity 'CRITICAL' `
+                                -ResultLines @("Rollback компонента $componentType не вдався", [string]$rollback.Error) `
+                                -ActionText 'негайно перевірити стан каталогів компонента вручну.'
+                        }
+                    } else {
+                        # Move-aside сам провалився ДО будь-якої мутації —
+                        # оригінальний live-каталог не торкався, видаляти
+                        # чи повертати нічого не потрібно.
+                        Write-DataRestoreLog -Message "Move-aside компонента $componentType не вдався до жодної мутації файлової системи — оригінальні дані незмінені, відкат поточного компонента не потрібен." -Level 'WARNING'
                     }
                     # Крос-компонентний rollback: production не можна лишати
                     # зі змішаними generation (частина компонентів з backup,
@@ -2629,8 +2719,9 @@ try {
                 [void]$script:dataRestoreComponentResults.Remove($existingResult)
                 Add-BRAVODataRestoreComponentResult `
                     -ComponentType $componentType `
-                    -Status 'FAILED' `
+                    -Status $currentComponentStatus `
                     -TargetDirectory $planComponent.TargetDirectory `
+                    -PrerestoreDirectory $currentComponentPrerestoreDirectory `
                     -DurationSeconds ((Get-Date) - $componentStartedAt).TotalSeconds `
                     -Detail $componentFailureReason
                 Write-BRAVOOperationResult `

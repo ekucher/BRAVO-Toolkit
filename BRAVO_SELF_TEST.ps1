@@ -7995,11 +7995,13 @@ function Format-BRAVOFileSize {
             'Format-BRAVOFileSize',
             'Test-BRAVODataRestorePathWithin',
             'Test-BRAVODataRestorePathEquals',
+            'Test-BRAVODataRestoreGenerationIdFormat',
             'Get-BRAVODataRestoreComponentSelection',
             'Get-BRAVODataRestorePlan',
             'Test-BRAVODataRestoreFreeSpace',
             'Test-BRAVODataRestoreExtractionResult',
             'Get-BRAVODataRestoreLockingProcessText',
+            'Invoke-BRAVODataRestoreMoveAside',
             'Undo-BRAVODataRestoreMoveAside',
             'Undo-BRAVODataRestoreCompletedComponents',
             'Get-BRAVODataRestoreRollbackStatusUpdates',
@@ -8390,46 +8392,50 @@ function Format-BRAVOFileSize {
 
         # A. guard відсутній, failpoint заданий -> NO THROW.
         Reset-BRAVODataRestoreTestFailPointEnv
-        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BLOG'
         $threwA = $false
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwA = $true }
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG' }) } catch { $threwA = $true }
 
         # B. guard неправильний -> NO THROW.
         Reset-BRAVODataRestoreTestFailPointEnv
         $env:BRAVO_DATARESTORE_TEST_HOOKS = 'wrong'
-        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BLOG'
         $threwB = $false
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwB = $true }
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG' }) } catch { $threwB = $true }
 
         # C. guard валідний, failpoint відсутній -> NO THROW.
         Reset-BRAVODataRestoreTestFailPointEnv
         $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
         $threwC = $false
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwC = $true }
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG' }) } catch { $threwC = $true }
 
         # D. malformed failpoint (без ':') -> NO THROW.
         Reset-BRAVODataRestoreTestFailPointEnv
         $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
-        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAsideBAZA'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAsideBLOG'
         $threwD = $false
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwD = $true }
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG' }) } catch { $threwD = $true }
 
         # E. point mismatch -> NO THROW.
         Reset-BRAVODataRestoreTestFailPointEnv
         $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
-        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BLOG'
         $threwE = $false
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'BeforeExtraction' -Component 'BAZA' }) } catch { $threwE = $true }
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'BeforeExtraction' -Component 'BLOG' }) } catch { $threwE = $true }
 
         # F. component mismatch -> NO THROW.
         $threwF = $false
         try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'MODEL' }) } catch { $threwF = $true }
 
-        # G. точний (case-insensitive) збіг -> THROW із синтетичним маркером,
-        # без реального шляху/пароля/webhook/секрету в тексті винятку.
+        # G. точний (case-insensitive) збіг на КАНОНІЧНИХ Point/Component ->
+        # THROW із синтетичним маркером, без реального шляху/пароля/
+        # webhook/секрету в тексті винятку.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BLOG'
         $threwG = $false
         $exceptionMessageG = $null
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch {
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG' }) } catch {
             $threwG = $true
             $exceptionMessageG = [string]$_.Exception.Message
         }
@@ -8439,7 +8445,25 @@ function Format-BRAVOFileSize {
         $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
         $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:*'
         $threwH = $false
-        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwH = $true }
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG' }) } catch { $threwH = $true }
+
+        # I. canonical allowlist: НЕканонічний Component (синтетичний BAZA)
+        # -> NO THROW, навіть попри валідний guard і точний self-match
+        # Point/Component. Component-allowlist: лише MODEL/BLOG/BRAVOEXCH.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $threwI = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwI = $true }
+
+        # J. canonical allowlist: НЕканонічна Point (BeforeExtraction — точки
+        # такої немає у виклику production pipeline) -> NO THROW, навіть із
+        # канонічним Component і точним self-match.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'BeforeExtraction:BLOG'
+        $threwJ = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'BeforeExtraction' -Component 'BLOG' }) } catch { $threwJ = $true }
 
         Test-BRAVOCondition `
             -Condition (-not $threwA -and -not $threwB -and -not $threwC -and -not $threwD -and -not $threwE -and -not $threwF -and -not $threwH) `
@@ -8452,7 +8476,11 @@ function Format-BRAVOFileSize {
                 -not ($exceptionMessageG -match 'E:\\|\\LIMS|password|pwd|secret|token|https?://')
             ) `
             -Name "DataRestore/TestFailPointThrowsOnExactMatch" `
-            -Failure "при ТОЧНОМУ (case-insensitive) збігу Point+Component з двома валідними guard-змінними Invoke-BRAVODataRestoreTestFailPoint має кинути виняток із синтетичним маркером BRAVO_DATARESTORE_TEST_FAILPOINT, без жодного реального шляху/секрету в тексті"
+            -Failure "при ТОЧНОМУ (case-insensitive) збігу канонічних Point+Component (AfterMoveAside/BLOG) з двома валідними guard-змінними Invoke-BRAVODataRestoreTestFailPoint має кинути виняток із синтетичним маркером BRAVO_DATARESTORE_TEST_FAILPOINT, без жодного реального шляху/секрету в тексті"
+        Test-BRAVOCondition `
+            -Condition (-not $threwI -and -not $threwJ) `
+            -Name "DataRestore/TestFailPointRejectsNonCanonicalPointOrComponent" `
+            -Failure "Invoke-BRAVODataRestoreTestFailPoint має лишатися no-op для НЕканонічного Component (I: синтетичний BAZA, поза MODEL/BLOG/BRAVOEXCH) і НЕканонічної Point (J: BeforeExtraction, якої немає в production pipeline) — навіть при валідному guard і точному self-match аргументів виклику"
 
         # --- Поведінковий тест: production-подібна послідовність
         # MoveAside:A -> MoveAside:B -> FailPoint:B(throw) -> ІСНУЮЧИЙ catch
@@ -8465,12 +8493,12 @@ function Format-BRAVOFileSize {
             [void][IO.Directory]::CreateDirectory($sequenceRoot)
             $liveSeqA = Join-Path $sequenceRoot 'MODEL'
             $prerestoreSeqA = Join-Path $sequenceRoot 'MODEL.prerestore_20260815_000000'
-            $liveSeqB = Join-Path $sequenceRoot 'BAZA'
-            $prerestoreSeqB = Join-Path $sequenceRoot 'BAZA.prerestore_20260815_000000'
+            $liveSeqB = Join-Path $sequenceRoot 'BLOG'
+            $prerestoreSeqB = Join-Path $sequenceRoot 'BLOG.prerestore_20260815_000000'
 
             Reset-BRAVODataRestoreTestFailPointEnv
             $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
-            $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+            $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BLOG'
 
             $sequenceResult = & $dataRestoreModule {
                 param($liveA, $prerestoreA, $liveB, $prerestoreB)
@@ -8493,15 +8521,15 @@ function Format-BRAVOFileSize {
                 # --- Component B: move-aside реальний, успішний, ПОТІМ
                 # ТОЙ САМИЙ виклик failpoint, що й у production-циклі ---
                 [void][IO.Directory]::CreateDirectory($liveB)
-                [IO.File]::WriteAllText((Join-Path $liveB 'original.txt'), 'old-baza')
+                [IO.File]::WriteAllText((Join-Path $liveB 'original.txt'), 'old-blog')
                 [IO.Directory]::Move($liveB, $prerestoreB)
                 [void][IO.Directory]::CreateDirectory($liveB)
-                [IO.File]::WriteAllText((Join-Path $liveB 'restored.txt'), 'new-baza')
+                [IO.File]::WriteAllText((Join-Path $liveB 'restored.txt'), 'new-blog')
                 $sequenceLog.Add('MoveAside:B')
 
                 $caughtHere = $false
                 try {
-                    Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA'
+                    Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BLOG'
                     $sequenceLog.Add('Extraction:B (НЕ МАЄ ВІДБУТИСЯ)')
                 } catch {
                     # ТОЙ САМИЙ catch, що в production: спершу rollback
@@ -8547,6 +8575,404 @@ function Format-BRAVOFileSize {
         }
     } finally {
         Reset-BRAVODataRestoreTestFailPointEnv
+    }
+
+    # --- 6.2. Restore safety review (PR #40): move-aside FAILURE ніколи не
+    # має видаляти оригінальні live-дані. Для InPlace TargetDirectory ===
+    # LiveSourceDirectory — якщо move-aside провалюється (Success=false),
+    # ЖОДНОЇ мутації ще не відбулось: production-catch не має права
+    # викликати Undo-BRAVODataRestoreMoveAside (яка Remove-Item-ить
+    # $LiveDirectory) на ще незайманому оригіналі. Реальна
+    # Invoke-BRAVODataRestoreMoveAside на заблокованому каталозі + точна
+    # armed-гілка з production-циклу (structural-перевірка нижче). ---------
+    $moveAsideFailureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_MOVEASIDE_FAIL_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    $lockedLiveStream = $null
+    try {
+        [void][IO.Directory]::CreateDirectory($moveAsideFailureRoot)
+        $liveFail = Join-Path $moveAsideFailureRoot 'MODEL'
+        $prerestoreFail = Join-Path $moveAsideFailureRoot 'MODEL.prerestore_20260815_010000'
+        [void][IO.Directory]::CreateDirectory($liveFail)
+        [IO.File]::WriteAllText((Join-Path $liveFail 'production.txt'), 'live-data-must-survive')
+        # Ексклюзивний handle на файл ВСЕРЕДИНІ live-каталогу: на NTFS
+        # Directory.Move каталогу з відкритим файлом усередині провалюється
+        # (файл, не сам каталог, тримає handle) — той самий сценарій, що й
+        # реальний "щось тримає дерево" з production.
+        $lockedLiveStream = [IO.File]::Open(
+            (Join-Path $liveFail 'production.txt'),
+            [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+
+        $moveAsideOutcome = & $dataRestoreModule {
+            param($live, $prerestore)
+            Invoke-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore
+        } $liveFail $prerestoreFail
+
+        # Точна гілка з production-циклу (BRAVO.DataRestore.Runtime.ps1):
+        # `$moveAsideArmed` стає true ЛИШЕ після Success=true; catch викликає
+        # Undo-BRAVODataRestoreMoveAside ЛИШЕ якщо armed. Тут Success=false
+        # -> Undo НЕ викликається, що й перевіряється нижче.
+        $moveAsideArmedForTest = [bool]$moveAsideOutcome.Success
+        if ($moveAsideArmedForTest) {
+            [void](& $dataRestoreModule {
+                param($live, $prerestore, $performed)
+                Undo-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore -MoveAsidePerformed $performed
+            } $liveFail $prerestoreFail ([bool]$moveAsideOutcome.Performed))
+        }
+
+        $lockedLiveStream.Dispose()
+        $lockedLiveStream = $null
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$moveAsideOutcome.Success -and
+                -not [bool]$moveAsideOutcome.Performed -and
+                -not $moveAsideArmedForTest -and
+                (Test-Path -LiteralPath $liveFail -PathType Container) -and
+                (Test-Path -LiteralPath (Join-Path $liveFail 'production.txt')) -and
+                ([IO.File]::ReadAllText((Join-Path $liveFail 'production.txt'))) -eq 'live-data-must-survive' -and
+                -not (Test-Path -LiteralPath $prerestoreFail)
+            ) `
+            -Name "DataRestore/MoveAsideFailurePreservesOriginalLiveData" `
+            -Failure "коли move-aside провалюється (Success=false), транзакція компонента НЕ armed: production-catch не має права викликати Undo-BRAVODataRestoreMoveAside на оригінальному live-каталозі (TargetDirectory===LiveDirectory для InPlace) — інакше реальні production-дані видаляються, хоча жодна мутація ще не відбулась"
+
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreRuntimeTextForTests.Contains('$moveAsideArmed = $false') -and
+                $dataRestoreRuntimeTextForTests.Contains('$moveAsideArmed = $true') -and
+                $dataRestoreRuntimeTextForTests.Contains('if ($moveAsideArmed) {') -and
+                ($dataRestoreRuntimeTextForTests.IndexOf('$moveAsideArmed = $true') -lt $dataRestoreRuntimeTextForTests.IndexOf("Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside'"))
+            ) `
+            -Name "DataRestore/MoveAsideArmedFlagGatesCurrentComponentRollback" `
+            -Failure "production-цикл має явний `$moveAsideArmed прапорець (false за замовчуванням, true лише після move-aside Success=true, до failpoint-виклику), і catch-гілка має перевіряти його ПЕРЕД викликом Undo-BRAVODataRestoreMoveAside для поточного компонента"
+    } finally {
+        if ($null -ne $lockedLiveStream) { $lockedLiveStream.Dispose() }
+        if (Test-Path -LiteralPath $moveAsideFailureRoot) {
+            Remove-Item -LiteralPath $moveAsideFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.3. Restore safety review (PR #40): відкат САМОГО поточного
+    # компонента, що провалився, теж може не завершитись — статус має
+    # явно стати ROLLBACK_FAILED (не generic FAILED), а PrerestoreDirectory
+    # — зберегтися для ручного повернення. ---------------------------------
+    $currentRollbackFailureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_CURRENT_ROLLBACK_FAIL_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    $lockedPartialStream = $null
+    try {
+        [void][IO.Directory]::CreateDirectory($currentRollbackFailureRoot)
+        $liveRB = Join-Path $currentRollbackFailureRoot 'MODEL'
+        $prerestoreRB = Join-Path $currentRollbackFailureRoot 'MODEL.prerestore_20260815_020000'
+        # Стан ПІСЛЯ успішного move-aside + New-Item нової цілі + часткової
+        # (невдалої) extraction — саме те, що бачить production-catch.
+        [void][IO.Directory]::CreateDirectory($prerestoreRB)
+        [IO.File]::WriteAllText((Join-Path $prerestoreRB 'original.txt'), 'old')
+        [void][IO.Directory]::CreateDirectory($liveRB)
+        [IO.File]::WriteAllText((Join-Path $liveRB 'partial.txt'), 'partial-extraction')
+        $lockedPartialStream = [IO.File]::Open(
+            (Join-Path $liveRB 'partial.txt'),
+            [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+
+        $rollbackOutcome = & $dataRestoreModule {
+            param($live, $prerestore)
+            Undo-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore -MoveAsidePerformed $true
+        } $liveRB $prerestoreRB
+
+        $lockedPartialStream.Dispose()
+        $lockedPartialStream = $null
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$rollbackOutcome.Success -and
+                (Test-Path -LiteralPath $prerestoreRB) -and
+                ([string]$rollbackOutcome.Error).Contains($prerestoreRB)
+            ) `
+            -Name "DataRestore/CurrentComponentRollbackFailurePreservesPrerestoreCopy" `
+            -Failure "коли rollback самого поточного компонента (Undo-BRAVODataRestoreMoveAside) не вдається, prerestore-копія має лишитись на диску, а помилка — містити шлях до неї для ручного повернення"
+
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreRuntimeTextForTests.Contains("`$currentComponentStatus = 'ROLLBACK_FAILED'") -and
+                $dataRestoreRuntimeTextForTests.Contains('$currentComponentPrerestoreDirectory = $planComponent.PrerestoreDirectory') -and
+                $dataRestoreRuntimeTextForTests.Contains('-Status $currentComponentStatus') -and
+                $dataRestoreRuntimeTextForTests.Contains('-PrerestoreDirectory $currentComponentPrerestoreDirectory')
+            ) `
+            -Name "DataRestore/CurrentComponentOwnRollbackFailureYieldsRollbackFailedStatus" `
+            -Failure "коли rollback ПОТОЧНОГО (провального) компонента сам не завершується, його термінальний статус має стати ROLLBACK_FAILED (не generic FAILED), а PrerestoreDirectory — потрапити в Add-BRAVODataRestoreComponentResult для показу оператору"
+    } finally {
+        if ($null -ne $lockedPartialStream) { $lockedPartialStream.Dispose() }
+        if (Test-Path -LiteralPath $currentRollbackFailureRoot) {
+            Remove-Item -LiteralPath $currentRollbackFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.4. Restore safety review (PR #40): generationId зі ЗМІСТУ
+    # manifest-а (недовірений вхід, особливо Source=SFTP) має пройти
+    # канонічну формат-перевірку ПЕРЕД участю в Join-Path/staging-шляхах. ---
+    $genIdValid1 = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260814_230004' }
+    $genIdValid2 = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260814_230004_1' }
+    $genIdTraversal1 = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '..\victim' }
+    $genIdTraversal2 = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '../victim' }
+    $genIdAbsolute = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId 'C:\victim' }
+    $genIdUnc = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '\\server\share' }
+    $genIdWrongSeparator = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260814-230004' }
+    $genIdArbitrary = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId 'arbitrary text' }
+    $genIdEmpty = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $genIdValid1 -eq $true -and
+            $genIdValid2 -eq $true -and
+            $genIdTraversal1 -eq $false -and
+            $genIdTraversal2 -eq $false -and
+            $genIdAbsolute -eq $false -and
+            $genIdUnc -eq $false -and
+            $genIdWrongSeparator -eq $false -and
+            $genIdArbitrary -eq $false -and
+            $genIdEmpty -eq $false
+        ) `
+        -Name "DataRestore/GenerationIdFormatRejectsPathTraversal" `
+        -Failure "Test-BRAVODataRestoreGenerationIdFormat має приймати лише yyyyMMdd_HHmmss(_N) і відхиляти будь-що інше — відносні/абсолютні/UNC шляхи, неправильний роздільник, довільний текст, порожній рядок"
+
+    # Containment-перевірка (defense-in-depth поверх формату): обчислений
+    # staging-шлях generation має лежати ВСЕРЕДИНІ staging root — той самий
+    # Test-BRAVODataRestorePathWithin, що й для OutOfPlace -TargetPath.
+    $genIdContainmentOk = & $dataRestoreModule {
+        Test-BRAVODataRestorePathWithin -Path 'C:\BACKUP\RESTORE_STAGING\20260814_230004' -Directory 'C:\BACKUP\RESTORE_STAGING'
+    }
+    $genIdContainmentEscape = & $dataRestoreModule {
+        Test-BRAVODataRestorePathWithin -Path 'C:\BACKUP\RESTORE_STAGING\..\..\Windows\System32' -Directory 'C:\BACKUP\RESTORE_STAGING'
+    }
+    Test-BRAVOCondition `
+        -Condition ($genIdContainmentOk -eq $true -and $genIdContainmentEscape -eq $false) `
+        -Name "DataRestore/GenerationIdStagingPathContainmentAssertion" `
+        -Failure "обчислений staging-шлях generation (stagingRoot + generationId) має проходити containment-перевірку Test-BRAVODataRestorePathWithin відносно staging root"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('-not (Test-BRAVODataRestoreGenerationIdFormat -GenerationId $GenerationId)') -and
+            $dataRestoreRuntimeTextForTests.Contains('-not (Test-BRAVODataRestoreGenerationIdFormat -GenerationId $script:dataRestoreSelectedGenerationId)') -and
+            $dataRestoreRuntimeTextForTests.Contains('-not (Test-BRAVODataRestorePathWithin -Path $script:dataRestoreStagingGenerationRoot -Directory $stagingRootPath)')
+        ) `
+        -Name "DataRestore/GenerationIdValidatedAtCliAndManifestSelection" `
+        -Failure "той самий канонічний Test-BRAVODataRestoreGenerationIdFormat має застосовуватись і до -GenerationId з командного рядка, і до generationId, прочитаного зі ЗМІСТУ обраного manifest-а, ПЕРЕД побудовою staging-шляху, плюс containment-перевірка обчисленого шляху"
+
+    # --- 6.5. Restore safety review (PR #40): OutOfPlace має захищати УСІ
+    # discovered live-джерела (MODEL/BLOG/BRAVOEXCH), а не лише запитаний
+    # -Component — інакше відновлення MODEL могло б влучити у live BLOG. ---
+    $multiSourceTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_MULTI_SOURCE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $multiBackupRoot = Join-Path $multiSourceTestRoot 'BACKUP'
+        $multiRuntimeRoot = Join-Path $multiSourceTestRoot 'RUNTIME'
+        $multiStagingRoot = Join-Path $multiBackupRoot 'RESTORE_STAGING'
+        $multiLiveRoot = Join-Path $multiSourceTestRoot 'LIVE'
+        $multiLiveModel = Join-Path $multiLiveRoot 'MODEL'
+        $multiLiveBlog = Join-Path $multiLiveRoot 'BLOG'
+        $multiLiveBravoexch = Join-Path $multiLiveRoot 'BRAVOEXCH'
+        foreach ($multiDirectory in @($multiBackupRoot, $multiRuntimeRoot, $multiStagingRoot, $multiLiveModel, $multiLiveBlog, $multiLiveBravoexch)) {
+            [void][IO.Directory]::CreateDirectory($multiDirectory)
+        }
+        $multiDefinitions = @(
+            [pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $multiLiveModel 'model.gdb') },
+            [pscustomobject]@{ Type = 'BLOG'; Source = (Join-Path $multiLiveBlog 'blog.db') },
+            [pscustomobject]@{ Type = 'BRAVOEXCH'; Source = (Join-Path $multiLiveBravoexch 'exch.db') }
+        )
+        $multiPlanInvoke = {
+            param($Module, $TargetPath, $Definitions)
+            & $Module {
+                param($t, $b, $r, $s, $d)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes @('MODEL') `
+                    -RestoreMode 'OutOfPlace' `
+                    -RequestedTargetPath $t `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260814_120000'
+            } $TargetPath $multiBackupRoot $multiRuntimeRoot $multiStagingRoot $Definitions
+        }
+        # Запитано лише MODEL, але ціль перетинається з BLOG/BRAVOEXCH.
+        $multiIntoBlog = & $multiPlanInvoke $dataRestoreModule (Join-Path $multiLiveBlog 'OUT') $multiDefinitions
+        $multiEqualsBravoexch = & $multiPlanInvoke $dataRestoreModule $multiLiveBravoexch $multiDefinitions
+        $multiParentOfBlog = & $multiPlanInvoke $dataRestoreModule $multiLiveRoot $multiDefinitions
+        $multiSafeTarget = & $multiPlanInvoke $dataRestoreModule (Join-Path $multiSourceTestRoot 'SAFE_TARGET') $multiDefinitions
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not $multiIntoBlog.Success -and
+                -not $multiEqualsBravoexch.Success -and
+                -not $multiParentOfBlog.Success -and
+                $multiSafeTarget.Success
+            ) `
+            -Name "DataRestore/OutOfPlaceProtectsAllDiscoveredLiveSourcesNotOnlyRequested" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) має відхиляти -TargetPath, що влучає в БУДЬ-ЯКЕ discovered live-джерело (навіть НЕ запитаного зараз компонента) — ціль всередині live BLOG, точний збіг з live BRAVOEXCH, і батьківський каталог, що містить live BLOG, мають відхилятись попри запит лише -Component MODEL; безпечна ціль поза всіма джерелами — приймається"
+    } finally {
+        if (Test-Path -LiteralPath $multiSourceTestRoot) {
+            Remove-Item -LiteralPath $multiSourceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.6. Restore safety review (PR #40): SFTP пошук COMPLETE generation
+    # не має обриватись на перших 10 manifest-ах. Ізольований модуль:
+    # реальна Invoke-BRAVODataRestoreSftpManifestFetch (той самий батчинг-
+    # алгоритм), але з test double замість WinSCP.com (жодного мережевого
+    # виклику). ------------------------------------------------------------
+    $sftpFetchParseTokens = $null
+    $sftpFetchParseErrors = $null
+    $sftpFetchAst = [Management.Automation.Language.Parser]::ParseInput(
+        $dataRestoreRuntimeTextForTests, [ref]$sftpFetchParseTokens, [ref]$sftpFetchParseErrors)
+    $sftpFetchFunctionNames = @('Invoke-BRAVODataRestoreSftpManifestFetch', 'Get-BRAVODataRestoreSftpOperationTimeoutSeconds')
+    $sftpFetchFunctionTexts = @()
+    foreach ($sftpFetchFunctionName in $sftpFetchFunctionNames) {
+        $sftpFetchFunctionAst = @($sftpFetchAst.FindAll({
+            param($candidate) $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -eq $sftpFetchFunctionName
+        }, $true)) | Select-Object -First 1
+        if ($null -eq $sftpFetchFunctionAst) { throw "function not found for SFTP fetch isolation test: $sftpFetchFunctionName" }
+        $sftpFetchFunctionTexts += $sftpFetchFunctionAst.Extent.Text
+    }
+    $sftpFetchStubs = @'
+function Invoke-BRAVODataRestoreWinSCPScript {
+    # Test double: без реального WinSCP.com/мережі. 'ls' повертає
+    # маркерний Xml (парситься нижче тестовим Get-BRAVODataRestoreWinSCPListingNames);
+    # 'get' матеріалізує локальний manifest-файл із фікстур сценарію.
+    param([string[]]$Commands, [int]$TimeoutSeconds)
+    if (@($Commands) -match '^ls ') {
+        return [pscustomobject]@{ Success = $true; Xml = 'listing'; Error = $null }
+    }
+    foreach ($command in @($Commands)) {
+        if ($command -match 'get "[^"]*/(?<name>[^"/]+)" "(?<local>[^"]+)"') {
+            $manifestContent = $script:BRAVOSelfTestSftpManifestContent[$Matches['name']]
+            if ($null -ne $manifestContent) {
+                [IO.File]::WriteAllText($Matches['local'], $manifestContent)
+            }
+        }
+    }
+    return [pscustomobject]@{ Success = $true; Xml = 'downloaded'; Error = $null }
+}
+function Get-BRAVODataRestoreWinSCPListingNames {
+    param([string]$Xml)
+    return @($script:BRAVOSelfTestSftpListingNames)
+}
+'@
+    $sftpFetchModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($sftpFetchStubs + [Environment]::NewLine + ($sftpFetchFunctionTexts -join [Environment]::NewLine)) `
+        -FunctionNames (@('Invoke-BRAVODataRestoreWinSCPScript', 'Get-BRAVODataRestoreWinSCPListingNames') + $sftpFetchFunctionNames)
+
+    function New-BRAVOSelfTestSftpManifestFixture {
+        param([string]$GenerationId, [string]$Status)
+        return (@{ generationId = $GenerationId; status = $Status } | ConvertTo-Json -Compress)
+    }
+
+    $sftpFetchTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_SFTP_FETCH_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($sftpFetchTestRoot)
+
+        # #1: найновіший manifest уже COMPLETE -> обирається без додаткових батчів.
+        $stagingDir1 = Join-Path $sftpFetchTestRoot 'case1'
+        $names1 = @("BRAVO_BACKUP_20260814_100000.json", "BRAVO_BACKUP_20260813_100000.json")
+        $content1 = @{
+            'BRAVO_BACKUP_20260814_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_100000' 'COMPLETE')
+            'BRAVO_BACKUP_20260813_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260813_100000' 'COMPLETE')
+        }
+        $result1 = & $sftpFetchModule {
+            param($dir, $names, $content)
+            $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+            $script:BRAVOSelfTestSftpListingNames = $names
+            $script:BRAVOSelfTestSftpManifestContent = $content
+            Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+        } $stagingDir1 $names1 $content1
+
+        # #2: перші 10 (batch 1) — INCOMPLETE/FAILED, 11-й (batch 2) — COMPLETE.
+        $stagingDir2 = Join-Path $sftpFetchTestRoot 'case2'
+        $names2 = New-Object System.Collections.Generic.List[string]
+        $content2 = @{}
+        for ($i = 1; $i -le 10; $i++) {
+            $genId = "202608{0:D2}_100000" -f (30 - $i)
+            $name = "BRAVO_BACKUP_$genId.json"
+            $names2.Add($name)
+            $content2[$name] = (New-BRAVOSelfTestSftpManifestFixture $genId 'INCOMPLETE')
+        }
+        $oldestGenId = '20260801_090000'
+        $oldestName = "BRAVO_BACKUP_$oldestGenId.json"
+        $names2.Add($oldestName)
+        $content2[$oldestName] = (New-BRAVOSelfTestSftpManifestFixture $oldestGenId 'COMPLETE')
+        $result2 = & $sftpFetchModule {
+            param($dir, $names, $content)
+            $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+            $script:BRAVOSelfTestSftpListingNames = @($names)
+            $script:BRAVOSelfTestSftpManifestContent = $content
+            Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+        } $stagingDir2 $names2.ToArray() $content2
+
+        # #3: декілька COMPLETE -> обирається найновіший.
+        $stagingDir3 = Join-Path $sftpFetchTestRoot 'case3'
+        $names3 = @("BRAVO_BACKUP_20260814_100000.json", "BRAVO_BACKUP_20260813_100000.json", "BRAVO_BACKUP_20260812_100000.json")
+        $content3 = @{
+            'BRAVO_BACKUP_20260814_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_100000' 'COMPLETE')
+            'BRAVO_BACKUP_20260813_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260813_100000' 'COMPLETE')
+            'BRAVO_BACKUP_20260812_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260812_100000' 'INCOMPLETE')
+        }
+        $result3 = & $sftpFetchModule {
+            param($dir, $names, $content)
+            $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+            $script:BRAVOSelfTestSftpListingNames = $names
+            $script:BRAVOSelfTestSftpManifestContent = $content
+            Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+        } $stagingDir3 $names3 $content3
+
+        # #4: жодного COMPLETE серед усіх кандидатів -> коректна відмова.
+        $stagingDir4 = Join-Path $sftpFetchTestRoot 'case4'
+        $names4 = @("BRAVO_BACKUP_20260814_100000.json")
+        $content4 = @{ 'BRAVO_BACKUP_20260814_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_100000' 'INCOMPLETE') }
+        $threw4 = $false
+        $errorMessage4 = $null
+        try {
+            [void](& $sftpFetchModule {
+                param($dir, $names, $content)
+                $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+                $script:BRAVOSelfTestSftpListingNames = $names
+                $script:BRAVOSelfTestSftpManifestContent = $content
+                Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+            } $stagingDir4 $names4 $content4)
+        } catch {
+            $threw4 = $true
+            $errorMessage4 = [string]$_.Exception.Message
+        }
+
+        # #5: явний GenerationId -> точна поведінка одного generation (batch-логіка не задіяна).
+        $stagingDir5 = Join-Path $sftpFetchTestRoot 'case5'
+        $names5 = @('BRAVO_BACKUP_20260810_100000.json')
+        $content5 = @{ 'BRAVO_BACKUP_20260810_100000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260810_100000' 'COMPLETE') }
+        $result5 = & $sftpFetchModule {
+            param($dir, $names, $content)
+            $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+            $script:BRAVOSelfTestSftpListingNames = $names
+            $script:BRAVOSelfTestSftpManifestContent = $content
+            Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId '20260810_100000'
+        } $stagingDir5 $names5 $content5
+
+        Test-BRAVOCondition `
+            -Condition ([string]$result1.Manifest.generationId -eq '20260814_100000') `
+            -Name "DataRestore/SftpManifestSearchSelectsNewestComplete" `
+            -Failure "коли найновіший manifest уже COMPLETE, саме він має бути обраний"
+        Test-BRAVOCondition `
+            -Condition ([string]$result2.Manifest.generationId -eq $oldestGenId) `
+            -Name "DataRestore/SftpManifestSearchContinuesBeyondFirstBatchOfTen" `
+            -Failure "коли серед перших 10 (найновіших) manifest-ів немає COMPLETE, пошук має продовжуватись на наступний батч, а не обриватись жорстким Select-Object -First 10"
+        Test-BRAVOCondition `
+            -Condition ([string]$result3.Manifest.generationId -eq '20260814_100000') `
+            -Name "DataRestore/SftpManifestSearchSelectsNewestAmongMultipleComplete" `
+            -Failure "коли COMPLETE декілька, має обиратись найновіший з-поміж них"
+        Test-BRAVOCondition `
+            -Condition ($threw4 -and -not [string]::IsNullOrWhiteSpace($errorMessage4)) `
+            -Name "DataRestore/SftpManifestSearchFailsCorrectlyWhenNoComplete" `
+            -Failure "коли серед УСІХ переглянутих кандидатів немає жодного COMPLETE, функція має завершитись зрозумілою помилкою, а не мовчазним null"
+        Test-BRAVOCondition `
+            -Condition ([string]$result5.Manifest.generationId -eq '20260810_100000') `
+            -Name "DataRestore/SftpManifestSearchExplicitGenerationIdUnaffectedByBatching" `
+            -Failure "явний -RequestedGenerationId (генерація #5) має зберігати точну поведінку одного generation, не зачеплену батч-пошуком"
+    } finally {
+        if (Test-Path -LiteralPath $sftpFetchTestRoot) {
+            Remove-Item -LiteralPath $sftpFetchTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
