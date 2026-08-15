@@ -15,6 +15,10 @@ param(
         "SMB",
         "Slack",
         "Discord",
+        "Slack.General",
+        "Slack.Alerts",
+        "Discord.General",
+        "Discord.Alerts",
         "Archive",
         "Institution",
         "BRAVO_7Z_PASSWORD",
@@ -24,6 +28,10 @@ param(
         "BRAVO_SMB_PASSWORD",
         "BRAVO_SLACK_URL",
         "BRAVO_DISCORD_URL",
+        "BRAVO_SLACK_GENERAL_URL",
+        "BRAVO_SLACK_ALERTS_URL",
+        "BRAVO_DISCORD_GENERAL_URL",
+        "BRAVO_DISCORD_ALERTS_URL",
         "BRAVO_INSTITUTION_NAME",
         "BRAVO_INSTITUTION_CODE",
         "BRAVO_ARCHIVE_PREFIX"
@@ -159,18 +167,33 @@ function Resolve-RequestedComponents {
                 $notificationMode = ([string]$bravoSettings.NotificationMode).ToLowerInvariant()
                 if ($notificationMode -ne "none") {
                     $configuredProvider = ([string]$bravoSettings.NotificationProvider).ToLowerInvariant()
-                    $providerComponent = if ($configuredProvider -eq "slack") {
-                        "Slack"
-                    } else {
-                        "Discord"
+                    $providerPrefix = if ($configuredProvider -eq "slack") { "Slack" } else { "Discord" }
+
+                    # ALERTS потрібен завжди, доки NotificationMode != none
+                    # (WARNING/ERROR/CRITICAL завжди туди маршрутизуються).
+                    $alertsComponent = "$providerPrefix.Alerts"
+                    if (-not $resolved.Contains($alertsComponent)) {
+                        [void]$resolved.Add($alertsComponent)
                     }
-                    if (-not $resolved.Contains($providerComponent)) {
-                        [void]$resolved.Add($providerComponent)
+
+                    # GENERAL потрібен лише коли SUCCESS реально туди
+                    # доходить — тобто лише в режимі "all" (у errors_only
+                    # SUCCESS завжди придушується).
+                    if ($notificationMode -eq "all") {
+                        $generalComponent = "$providerPrefix.General"
+                        if (-not $resolved.Contains($generalComponent)) {
+                            [void]$resolved.Add($generalComponent)
+                        }
                     }
                 }
             }
             "All" {
-                $allNames = @("Archive", "SFTP", "SMB", "Slack", "Discord")
+                $allNames = @(
+                    "Archive", "SFTP", "SMB",
+                    "Slack", "Discord",
+                    "Slack.General", "Slack.Alerts",
+                    "Discord.General", "Discord.Alerts"
+                )
                 if ($null -ne $bravoSettings.InstitutionName -and
                     $null -ne $bravoSettings.InstitutionCode -and
                     $null -ne $bravoSettings.ArchivePrefix) {
@@ -203,6 +226,10 @@ function Get-CredentialTarget {
         "SMBPassword" { return $(if ($credentialSettings.Targets.SMBPassword) { [string]$credentialSettings.Targets.SMBPassword } else { "BRAVO_SMB_PASSWORD" }) }
         "Slack" { return $(if ($credentialSettings.Targets.SlackWebhook) { [string]$credentialSettings.Targets.SlackWebhook } else { "BRAVO_SLACK_URL" }) }
         "Discord" { return $(if ($credentialSettings.Targets.DiscordWebhook) { [string]$credentialSettings.Targets.DiscordWebhook } else { "BRAVO_DISCORD_URL" }) }
+        "Slack.General" { return $(if ($credentialSettings.Targets.SlackWebhookGeneral) { [string]$credentialSettings.Targets.SlackWebhookGeneral } else { "BRAVO_SLACK_GENERAL_URL" }) }
+        "Slack.Alerts" { return $(if ($credentialSettings.Targets.SlackWebhookAlerts) { [string]$credentialSettings.Targets.SlackWebhookAlerts } else { "BRAVO_SLACK_ALERTS_URL" }) }
+        "Discord.General" { return $(if ($credentialSettings.Targets.DiscordWebhookGeneral) { [string]$credentialSettings.Targets.DiscordWebhookGeneral } else { "BRAVO_DISCORD_GENERAL_URL" }) }
+        "Discord.Alerts" { return $(if ($credentialSettings.Targets.DiscordWebhookAlerts) { [string]$credentialSettings.Targets.DiscordWebhookAlerts } else { "BRAVO_DISCORD_ALERTS_URL" }) }
         "Archive" { return $(if ($credentialSettings.Targets.ArchivePassword) { [string]$credentialSettings.Targets.ArchivePassword } else { "BRAVO_7Z_PASSWORD" }) }
         "InstitutionName" { return $(if ($credentialSettings.Targets.InstitutionName) { [string]$credentialSettings.Targets.InstitutionName } else { "BRAVO_INSTITUTION_NAME" }) }
         "InstitutionCode" { return $(if ($credentialSettings.Targets.InstitutionCode) { [string]$credentialSettings.Targets.InstitutionCode } else { "BRAVO_INSTITUTION_CODE" }) }
@@ -282,6 +309,34 @@ function Get-CredentialDescriptors {
                     Prompt = "Discord webhook URL"
                 })
             }
+            "Slack.General" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "Slack.General"
+                    Target = Get-CredentialTarget -Name "Slack.General"
+                    Prompt = "Slack webhook — загальні повідомлення"
+                })
+            }
+            "Slack.Alerts" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "Slack.Alerts"
+                    Target = Get-CredentialTarget -Name "Slack.Alerts"
+                    Prompt = "Slack webhook — проблеми та аварії"
+                })
+            }
+            "Discord.General" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "Discord.General"
+                    Target = Get-CredentialTarget -Name "Discord.General"
+                    Prompt = "Discord webhook — загальні повідомлення"
+                })
+            }
+            "Discord.Alerts" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "Discord.Alerts"
+                    Target = Get-CredentialTarget -Name "Discord.Alerts"
+                    Prompt = "Discord webhook — проблеми та аварії"
+                })
+            }
             "Archive" {
                 [void]$descriptors.Add([pscustomobject]@{
                     Component = "BRAVO_7Z_PASSWORD"
@@ -336,6 +391,34 @@ function Get-CredentialDescriptors {
                     Component = "BRAVO_DISCORD_URL"
                     Target = Get-CredentialTarget -Name "Discord"
                     Prompt = "Discord webhook URL"
+                })
+            }
+            "BRAVO_SLACK_GENERAL_URL" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "BRAVO_SLACK_GENERAL_URL"
+                    Target = Get-CredentialTarget -Name "Slack.General"
+                    Prompt = "Slack webhook — загальні повідомлення"
+                })
+            }
+            "BRAVO_SLACK_ALERTS_URL" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "BRAVO_SLACK_ALERTS_URL"
+                    Target = Get-CredentialTarget -Name "Slack.Alerts"
+                    Prompt = "Slack webhook — проблеми та аварії"
+                })
+            }
+            "BRAVO_DISCORD_GENERAL_URL" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "BRAVO_DISCORD_GENERAL_URL"
+                    Target = Get-CredentialTarget -Name "Discord.General"
+                    Prompt = "Discord webhook — загальні повідомлення"
+                })
+            }
+            "BRAVO_DISCORD_ALERTS_URL" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "BRAVO_DISCORD_ALERTS_URL"
+                    Target = Get-CredentialTarget -Name "Discord.Alerts"
+                    Prompt = "Discord webhook — проблеми та аварії"
                 })
             }
             "BRAVO_INSTITUTION_NAME" {
@@ -883,7 +966,11 @@ function Show-BRAVOCredentialMenu {
         [pscustomobject]@{ Number = 15; Value = "BRAVO_DISCORD_URL"; Label = "BRAVO_DISCORD_URL" },
         [pscustomobject]@{ Number = 16; Value = "BRAVO_INSTITUTION_NAME"; Label = "BRAVO_INSTITUTION_NAME" },
         [pscustomobject]@{ Number = 17; Value = "BRAVO_INSTITUTION_CODE"; Label = "BRAVO_INSTITUTION_CODE" },
-        [pscustomobject]@{ Number = 18; Value = "BRAVO_ARCHIVE_PREFIX"; Label = "BRAVO_ARCHIVE_PREFIX" }
+        [pscustomobject]@{ Number = 18; Value = "BRAVO_ARCHIVE_PREFIX"; Label = "BRAVO_ARCHIVE_PREFIX" },
+        [pscustomobject]@{ Number = 19; Value = "Slack.General"; Label = "Slack webhook — загальні повідомлення" },
+        [pscustomobject]@{ Number = 20; Value = "Slack.Alerts"; Label = "Slack webhook — проблеми та аварії" },
+        [pscustomobject]@{ Number = 21; Value = "Discord.General"; Label = "Discord webhook — загальні повідомлення" },
+        [pscustomobject]@{ Number = 22; Value = "Discord.Alerts"; Label = "Discord webhook — проблеми та аварії" }
     )
 
     :ActionMenu while ($true) {
@@ -919,7 +1006,7 @@ function Show-BRAVOCredentialMenu {
 
             $targetNumber = Read-BRAVOMenuNumber `
                 -Prompt "Запис" `
-                -AllowedValues @(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18)
+                -AllowedValues @(0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22)
             if ($targetNumber -eq 0) {
                 continue ActionMenu
             }
