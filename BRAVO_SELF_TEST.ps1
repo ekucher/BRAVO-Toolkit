@@ -7995,18 +7995,79 @@ function Format-BRAVOFileSize {
     param([long]$Bytes)
     return ("{0} B" -f $Bytes)
 }
+# Стан для round-5 симуляції служб (fifth restore safety review): реальні
+# Get-Service/Stop-Service/Start-Service НІКОЛИ не викликаються цим
+# самотестом — ці стаб-функції затінюють однойменні cmdlet-и лише
+# всередині ізольованого $dataRestoreModule. New-BRAVOSelfTestRuntimeModule
+# екстрагує ЛИШЕ визначення функцій (FunctionDefinitionAst) — верхньорівневі
+# `$script:X = @{}` НЕ потрапили б у модуль, тому кожна стаб-функція сама
+# лінькво ініціалізує обидва словники при першому виклику.
+function Initialize-BRAVOSelfTestServiceState {
+    if ($null -eq $script:BRAVOSelfTestServiceStates) { $script:BRAVOSelfTestServiceStates = @{} }
+    if ($null -eq $script:BRAVOSelfTestServiceStuck) { $script:BRAVOSelfTestServiceStuck = @{} }
+}
+function Set-BRAVOSelfTestServiceState {
+    param([string]$Name, [string]$Status)
+    Initialize-BRAVOSelfTestServiceState
+    $script:BRAVOSelfTestServiceStates[$Name] = $Status
+}
+function Set-BRAVOSelfTestServiceStuck {
+    param([string]$Name, [bool]$Stuck)
+    Initialize-BRAVOSelfTestServiceState
+    $script:BRAVOSelfTestServiceStuck[$Name] = $Stuck
+}
+function Get-Service {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Name)
+    Initialize-BRAVOSelfTestServiceState
+    if (-not $script:BRAVOSelfTestServiceStates.ContainsKey($Name)) { return $null }
+    # Status уже свіжий на момент створення об'єкта (читання з
+    # $script:BRAVOSelfTestServiceStates щойно вище) — Refresh() тут
+    # безпечний no-op, а не closure над module-scope зі свого боку.
+    $serviceObject = [pscustomobject]@{ Name = $Name; Status = $script:BRAVOSelfTestServiceStates[$Name] }
+    Add-Member -InputObject $serviceObject -MemberType ScriptMethod -Name Refresh -Value { }
+    return $serviceObject
+}
+function Stop-Service {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Name, [switch]$Force)
+    Initialize-BRAVOSelfTestServiceState
+    if (-not ($script:BRAVOSelfTestServiceStuck.ContainsKey($Name) -and $script:BRAVOSelfTestServiceStuck[$Name])) {
+        $script:BRAVOSelfTestServiceStates[$Name] = 'Stopped'
+    }
+}
+function Start-Service {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Name)
+    Initialize-BRAVOSelfTestServiceState
+    $script:BRAVOSelfTestServiceStates[$Name] = 'Running'
+}
 '@
     $dataRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($dataRestoreRuntimeTextForTests + [Environment]::NewLine + $dataRestoreTestStubs) `
         -FunctionNames @(
             'Write-DataRestoreLog',
             'Format-BRAVOFileSize',
+            'Initialize-BRAVOSelfTestServiceState',
+            'Set-BRAVOSelfTestServiceState',
+            'Set-BRAVOSelfTestServiceStuck',
+            'Get-Service',
+            'Stop-Service',
+            'Start-Service',
             'Test-BRAVODataRestorePathWithin',
             'Test-BRAVODataRestorePathEquals',
+            'Test-BRAVODataRestorePathHasReparseAncestor',
             'Test-BRAVODataRestoreGenerationIdFormat',
+            'Test-BRAVODataRestoreMinimumFreeSpaceGB',
+            'ConvertTo-BRAVODataRestoreElevationArgument',
             'Get-BRAVODataRestoreComponentSelection',
+            'Get-BRAVODataRestoreLiveSourceMap',
+            'Test-BRAVODataRestoreStagingSafe',
             'Get-BRAVODataRestorePlan',
             'Test-BRAVODataRestoreFreeSpace',
+            'Test-BRAVODataRestoreServicesAllStopped',
+            'Stop-BRAVODataRestoreServices',
+            'Invoke-BRAVODataRestoreServiceStateChange',
             'Test-BRAVODataRestoreExtractionResult',
             'Get-BRAVODataRestoreLockingProcessText',
             'Invoke-BRAVODataRestoreMoveAside',
@@ -9904,6 +9965,308 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $bindingTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # ================================================================
+    # Fifth restore safety review (PR #40): 5 нових findings (1 P1, 4 P2)
+    # понад попередні 25. Усі тести нижче — детерміновані, ізольовані
+    # (temp-дерева, реальні production-функції через AST-екстракцію того
+    # самого $dataRestoreModule; служби симулюються стаб-функціями, що
+    # затінюють Get-Service/Stop-Service/Start-Service лише всередині
+    # модуля — жодна реальна служба/UAC/SFTP не використовується).
+    # ================================================================
+
+    # --- 6.20a. Staging-preflight МУСИТЬ відхиляти -StagingPath, що
+    # перетинається з live MODEL/BLOG/BRAVOEXCH, ДО будь-якого SFTP
+    # filesystem-запису; типовий staging усередині BackupRoot має
+    # проходити. -----------------------------------------------------
+    $stagingSafetyTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_STAGING_SAFETY_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $stagingSafetyBackupRoot = Join-Path $stagingSafetyTestRoot 'BACKUP'
+        $stagingSafetyRuntimeRoot = Join-Path $stagingSafetyTestRoot 'RUNTIME'
+        $stagingSafetyModel = Join-Path $stagingSafetyTestRoot 'LIVE\MODEL'
+        $stagingSafetyBlog = Join-Path $stagingSafetyTestRoot 'LIVE\BLOG'
+        $stagingSafetyBravoexch = Join-Path $stagingSafetyTestRoot 'LIVE\BRAVOEXCH'
+        foreach ($stagingSafetyDirectory in @($stagingSafetyBackupRoot, $stagingSafetyRuntimeRoot, $stagingSafetyModel, $stagingSafetyBlog, $stagingSafetyBravoexch)) {
+            [void][IO.Directory]::CreateDirectory($stagingSafetyDirectory)
+        }
+        $stagingSafetyLiveSources = @{
+            MODEL = $stagingSafetyModel
+            BLOG = $stagingSafetyBlog
+            BRAVOEXCH = $stagingSafetyBravoexch
+        }
+        $stagingSafetyInvoke = {
+            param($Module, $Staging, $Runtime, $LiveSources)
+            & $Module {
+                param($s, $r, $l)
+                Test-BRAVODataRestoreStagingSafe -StagingRoot $s -RuntimeRootPath $r -LiveSources $l
+            } $Staging $Runtime $LiveSources
+        }
+        $stagingEqualsModel = & $stagingSafetyInvoke $dataRestoreModule $stagingSafetyModel $stagingSafetyRuntimeRoot $stagingSafetyLiveSources
+        $stagingInsideBlog = & $stagingSafetyInvoke $dataRestoreModule (Join-Path $stagingSafetyBlog 'sub') $stagingSafetyRuntimeRoot $stagingSafetyLiveSources
+        $stagingParentOfBravoexch = & $stagingSafetyInvoke $dataRestoreModule (Split-Path $stagingSafetyBravoexch -Parent) $stagingSafetyRuntimeRoot $stagingSafetyLiveSources
+        $stagingSafeDefault = Join-Path $stagingSafetyBackupRoot 'RESTORE_STAGING'
+        [void][IO.Directory]::CreateDirectory($stagingSafeDefault)
+        $stagingSafeResult = & $stagingSafetyInvoke $dataRestoreModule $stagingSafeDefault $stagingSafetyRuntimeRoot $stagingSafetyLiveSources
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not $stagingEqualsModel.Success -and
+                -not $stagingInsideBlog.Success -and
+                -not $stagingParentOfBravoexch.Success -and
+                $stagingSafeResult.Success
+            ) `
+            -Name "DataRestore/StagingSafetyRejectsIntersectionWithLiveSources" `
+            -Failure "Test-BRAVODataRestoreStagingSafe має відхиляти -StagingPath, що дорівнює, вкладений у, чи є батьківським до будь-якого live MODEL/BLOG/BRAVOEXCH; типовий staging усередині BackupRoot\RESTORE_STAGING має прийматись"
+    } finally {
+        if (Test-Path -LiteralPath $stagingSafetyTestRoot) {
+            Remove-Item -LiteralPath $stagingSafetyTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.20b. Ordering: staging-preflight МУСИТЬ виконуватись у
+    # основному pipeline ДО Invoke-BRAVODataRestoreSftpManifestFetch
+    # (перший SFTP filesystem-запис) — текстова перевірка порядку, той
+    # самий підхід, що вже застосовується для інших pipeline-інваріантів у
+    # цьому файлі. -----------------------------------------------------
+    $stagingPreflightCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$stagingSafety = Test-BRAVODataRestoreStagingSafe')
+    $manifestFetchCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$sftpSelected = Invoke-BRAVODataRestoreSftpManifestFetch')
+    Test-BRAVOCondition `
+        -Condition (
+            $stagingPreflightCallIndex -gt 0 -and
+            $manifestFetchCallIndex -gt $stagingPreflightCallIndex
+        ) `
+        -Name "DataRestore/StagingSafetyPreflightRunsBeforeSftpManifestFetch" `
+        -Failure "Test-BRAVODataRestoreStagingSafe має викликатись у основному pipeline ДО Invoke-BRAVODataRestoreSftpManifestFetch — інакше зловмисний/помилковий -StagingPath міг би отримати SFTP-запис ДО перевірки перетину з live-джерелами"
+
+    # --- 6.21a. Reparse-point (junction) alias не повинен обходити
+    # перевірку live-джерела/StagingPath — Test-BRAVODataRestorePathHasReparseAncestor
+    # має fail-closed відхиляти шлях, чий наявний предок (включно із самим
+    # шляхом) є reparse-точкою; звичайний фізичний каталог без
+    # reparse-предків має проходити. -----------------------------------
+    $reparseTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_REPARSE_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $reparseLiveBlog = Join-Path $reparseTestRoot 'LIVE\BLOG'
+        $reparseSafeParent = Join-Path $reparseTestRoot 'SAFE'
+        [void][IO.Directory]::CreateDirectory($reparseLiveBlog)
+        [void][IO.Directory]::CreateDirectory($reparseSafeParent)
+        $reparseDirectLink = Join-Path $reparseTestRoot 'DIRECT_LINK'
+        [void](New-Item -ItemType Junction -Path $reparseDirectLink -Target $reparseLiveBlog -ErrorAction Stop)
+        $reparseParentLink = Join-Path $reparseTestRoot 'PARENT_LINK'
+        [void](New-Item -ItemType Junction -Path $reparseParentLink -Target (Join-Path $reparseTestRoot 'LIVE') -ErrorAction Stop)
+
+        $reparseInvoke = {
+            param($Module, $Path)
+            & $Module { param($p) Test-BRAVODataRestorePathHasReparseAncestor -Path $p } $Path
+        }
+        $reparseDirectResult = & $reparseInvoke $dataRestoreModule $reparseDirectLink
+        $reparseChildOfDirectResult = & $reparseInvoke $dataRestoreModule (Join-Path $reparseDirectLink 'NEW')
+        $reparseChildOfParentLinkResult = & $reparseInvoke $dataRestoreModule (Join-Path $reparseParentLink 'BLOG\NEW')
+        $reparseSafeChildResult = & $reparseInvoke $dataRestoreModule (Join-Path $reparseSafeParent 'NEW')
+        $reparseMalformedResult = & $reparseInvoke $dataRestoreModule "C:\`0invalid"
+
+        Test-BRAVOCondition `
+            -Condition (
+                $reparseDirectResult -eq $true -and
+                $reparseChildOfDirectResult -eq $true -and
+                $reparseChildOfParentLinkResult -eq $true -and
+                $reparseSafeChildResult -eq $false -and
+                $reparseMalformedResult -eq $true
+            ) `
+            -Name "DataRestore/ReparseAncestorDetectionFailsClosed" `
+            -Failure "Test-BRAVODataRestorePathHasReparseAncestor має fail-closed відхиляти (true) сам junction, дитину під ним, дитину під junction-предком і некоректний шлях; звичайний фізичний каталог без reparse-предків має проходити (false)"
+
+        # --- 6.21b. Інтеграція: OutOfPlace -TargetPath, що є junction-
+        # аліасом на live BLOG, має відхилятись планом — лексична
+        # перевірка (GetFullPath) не бачить фізичної цілі. -------------
+        $reparsePlanInvoke = {
+            param($Module, $Target, $Definitions, $Backup, $Runtime, $Staging)
+            & $Module {
+                param($t, $d, $b, $r, $s)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes @('BLOG') `
+                    -RestoreMode 'OutOfPlace' `
+                    -RequestedTargetPath $t `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260816_090000'
+            } $Target $Definitions $Backup $Runtime $Staging
+        }
+        $reparsePlanBackup = Join-Path $reparseTestRoot 'BACKUP'
+        $reparsePlanRuntime = Join-Path $reparseTestRoot 'RUNTIME'
+        $reparsePlanStaging = Join-Path $reparsePlanBackup 'RESTORE_STAGING'
+        foreach ($reparsePlanDirectory in @($reparsePlanBackup, $reparsePlanRuntime, $reparsePlanStaging)) {
+            [void][IO.Directory]::CreateDirectory($reparsePlanDirectory)
+        }
+        $reparsePlanDefinitions = @(
+            [pscustomobject]@{ Type = 'BLOG'; Source = (Join-Path $reparseLiveBlog 'blog.db') }
+        )
+        $reparsePlanResult = & $reparsePlanInvoke $dataRestoreModule $reparseDirectLink $reparsePlanDefinitions $reparsePlanBackup $reparsePlanRuntime $reparsePlanStaging
+
+        Test-BRAVOCondition `
+            -Condition (-not $reparsePlanResult.Success) `
+            -Name "DataRestore/PlanRejectsJunctionAliasedOutOfPlaceTarget" `
+            -Failure "Get-BRAVODataRestorePlan (OutOfPlace) має відхиляти -TargetPath, що фізично є junction/symlink (чи має reparse-предка) — лексичне порівняння GetFullPath не бачить фізичної цілі, яка може вести всередину live production-дерева"
+    } finally {
+        if (Test-Path -LiteralPath $reparseTestRoot) {
+            Remove-Item -LiteralPath $reparseTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.22. Служба, чий знімок мав WasRunning=$false (Stopped/
+    # StartPending), але яка встигла перейти у нестабільний стан ДО
+    # виклику зупинки (гонитва зі знімком), усе одно має бути зупинена;
+    # неможливість зупинити (stuck) має провалювати
+    # Stop-BRAVODataRestoreServices; фінальний бар'єр
+    # Test-BRAVODataRestoreServicesAllStopped має бачити той самий
+    # поточний стан. -----------------------------------------------------
+    $serviceStopInvoke = {
+        param($Module, $Snapshot, $StopTimeout, $PollInterval)
+        & $Module {
+            param($snap, $stopT, $poll)
+            Stop-BRAVODataRestoreServices -Snapshot $snap -StopTimeoutSeconds $stopT -PollIntervalSeconds $poll
+        } $Snapshot $StopTimeout $PollInterval
+    }
+    $serviceBarrierInvoke = {
+        param($Module, $Snapshot)
+        & $Module { param($snap) Test-BRAVODataRestoreServicesAllStopped -Snapshot $snap } $Snapshot
+    }
+    $serviceSetStateInvoke = {
+        param($Module, $Name, $Status)
+        & $Module { param($n, $st) Set-BRAVOSelfTestServiceState -Name $n -Status $st } $Name $Status
+    }
+    $serviceSetStuckInvoke = {
+        param($Module, $Name, $Stuck)
+        & $Module { param($n, $s) Set-BRAVOSelfTestServiceStuck -Name $n -Stuck $s } $Name $Stuck
+    }
+
+    # Сценарій A: WasRunning=$true (Running на знімку) -> зупиняється, як і раніше.
+    [void](& $serviceSetStateInvoke $dataRestoreModule 'SVC_RUNNING' 'Running')
+    $snapshotRunning = @([pscustomobject]@{ Key = 'A'; Name = 'SVC_RUNNING'; Managed = $true; WasRunning = $true; KillProcesses = @() })
+    $failuresRunning = & $serviceStopInvoke $dataRestoreModule $snapshotRunning 5 1
+
+    # Сценарій B: WasRunning=$false (Stopped на знімку), АЛЕ фактичний
+    # поточний стан на момент зупинки — Running (гонитва зі знімком).
+    [void](& $serviceSetStateInvoke $dataRestoreModule 'SVC_RACE' 'Running')
+    $snapshotRace = @([pscustomobject]@{ Key = 'B'; Name = 'SVC_RACE'; Managed = $true; WasRunning = $false; KillProcesses = @() })
+    $failuresRace = & $serviceStopInvoke $dataRestoreModule $snapshotRace 5 1
+    $barrierAfterRace = & $serviceBarrierInvoke $dataRestoreModule $snapshotRace
+
+    # Сценарій C: Managed=$true, WasRunning=$false, поточний стан уже
+    # Stopped -> без помилок, бар'єр проходить.
+    [void](& $serviceSetStateInvoke $dataRestoreModule 'SVC_ALREADY_STOPPED' 'Stopped')
+    $snapshotAlreadyStopped = @([pscustomobject]@{ Key = 'C'; Name = 'SVC_ALREADY_STOPPED'; Managed = $true; WasRunning = $false; KillProcesses = @() })
+    $failuresAlreadyStopped = & $serviceStopInvoke $dataRestoreModule $snapshotAlreadyStopped 5 1
+    $barrierAlreadyStopped = & $serviceBarrierInvoke $dataRestoreModule $snapshotAlreadyStopped
+
+    # Сценарій D: StartPending на знімку (WasRunning=$false), фактичний
+    # стан StartPending і НЕ переходить у Stopped (stuck) ->
+    # Stop-BRAVODataRestoreServices повертає помилку, фінальний бар'єр теж
+    # бачить небезпечний стан.
+    [void](& $serviceSetStateInvoke $dataRestoreModule 'SVC_STUCK' 'StartPending')
+    [void](& $serviceSetStuckInvoke $dataRestoreModule 'SVC_STUCK' $true)
+    $snapshotStuck = @([pscustomobject]@{ Key = 'D'; Name = 'SVC_STUCK'; Managed = $true; WasRunning = $false; KillProcesses = @() })
+    $failuresStuck = & $serviceStopInvoke $dataRestoreModule $snapshotStuck 1 1
+    $barrierStuck = & $serviceBarrierInvoke $dataRestoreModule $snapshotStuck
+
+    Test-BRAVOCondition `
+        -Condition (
+            @($failuresRunning).Count -eq 0 -and
+            @($failuresRace).Count -eq 0 -and
+            @($barrierAfterRace).Count -eq 0 -and
+            @($failuresAlreadyStopped).Count -eq 0 -and
+            @($barrierAlreadyStopped).Count -eq 0 -and
+            @($failuresStuck).Count -gt 0 -and
+            @($barrierStuck).Count -gt 0
+        ) `
+        -Name "DataRestore/StopServicesReevaluatesCurrentStateNotSnapshotIntent" `
+        -Failure "Stop-BRAVODataRestoreServices має зупиняти КОЖНУ керовану службу, чий ПОТОЧНИЙ стан відмінний від Stopped, незалежно від WasRunning знімка (гонитва зі знімком), і повертати помилку, якщо службу не вдалось перевести у Stopped; фінальний бар'єр Test-BRAVODataRestoreServicesAllStopped має відображати той самий поточний стан"
+
+    # --- 6.23a. Елевований дочірній процес: GenerationId з впровадженим
+    # перемикачем МУСИТЬ провалювати той самий канонічний
+    # Test-BRAVODataRestoreGenerationIdFormat, що застосовується скрізь
+    # інде — це і є перевірка "ДО елевації" з правильним значенням. -----
+    $elevationGenIdInjectedForce = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260815_120000 -Force' }
+    $elevationGenIdInjectedSkipHealth = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260815_120000 -SkipHealthCheck' }
+    $elevationGenIdValid = & $dataRestoreModule { Test-BRAVODataRestoreGenerationIdFormat -GenerationId '20260815_120000' }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $elevationGenIdInjectedForce -and
+            -not $elevationGenIdInjectedSkipHealth -and
+            $elevationGenIdValid
+        ) `
+        -Name "DataRestore/ElevationGenerationIdInjectionRejected" `
+        -Failure "GenerationId з впровадженим перемикачем ('20260815_120000 -Force' чи '...-SkipHealthCheck') має провалювати Test-BRAVODataRestoreGenerationIdFormat — той самий канонічний контракт, що застосовується ДО елевації; валідний '20260815_120000' має проходити"
+
+    # --- 6.23b. Ordering: канонічна перевірка формату МУСИТЬ виконуватись
+    # ДО побудови $elevatedArguments і Start-Process — інакше рядок уже
+    # розщепив би CreateProcess дочірнього процесу до моменту перевірки. --
+    $elevationValidationIndex = $dataRestoreRuntimeTextForTests.IndexOf('-not (Test-BRAVODataRestoreGenerationIdFormat -GenerationId $GenerationId)) {')
+    $elevationArgumentsBuildIndex = $dataRestoreRuntimeTextForTests.IndexOf('$elevatedArguments = @(')
+    $elevationStartProcessIndex = $dataRestoreRuntimeTextForTests.IndexOf('Start-Process powershell.exe -ArgumentList $elevatedArguments -Verb RunAs')
+    Test-BRAVOCondition `
+        -Condition (
+            $elevationValidationIndex -gt 0 -and
+            $elevationArgumentsBuildIndex -gt $elevationValidationIndex -and
+            $elevationStartProcessIndex -gt $elevationArgumentsBuildIndex
+        ) `
+        -Name "DataRestore/ElevationValidatesGenerationIdBeforeBuildingArguments" `
+        -Failure "-GenerationId має валідуватись Test-BRAVODataRestoreGenerationIdFormat ДО побудови `$elevatedArguments і ДО Start-Process -Verb RunAs — перевірка ПІСЛЯ елевації вже не бачить впровадженого вмісту, бо рядок уже розщепив CreateProcess дочірнього процесу"
+
+    # --- 6.23c. ConvertTo-BRAVODataRestoreElevationArgument: кожне
+    # значення стає РІВНО одним елементом командного рядка (Win32/
+    # CommandLineToArgvW round-trip правило) незалежно від вмісту. -------
+    $elevationArgSpace = & $dataRestoreModule { ConvertTo-BRAVODataRestoreElevationArgument -Value '20260815_120000 -Force' }
+    $elevationArgPath = & $dataRestoreModule { ConvertTo-BRAVODataRestoreElevationArgument -Value 'C:\Program Files\BRAVO' }
+    $elevationArgTrailingBackslash = & $dataRestoreModule { ConvertTo-BRAVODataRestoreElevationArgument -Value 'C:\Program Files\BRAVO\' }
+    $elevationArgEmbeddedQuote = & $dataRestoreModule { ConvertTo-BRAVODataRestoreElevationArgument -Value 'C:\evil"desc' }
+    Test-BRAVOCondition `
+        -Condition (
+            $elevationArgSpace -ceq '"20260815_120000 -Force"' -and
+            $elevationArgPath -ceq '"C:\Program Files\BRAVO"' -and
+            $elevationArgTrailingBackslash -ceq '"C:\Program Files\BRAVO\\"' -and
+            $elevationArgEmbeddedQuote -ceq '"C:\evil\"desc"'
+        ) `
+        -Name "DataRestore/ElevationArgumentQuotingIsSingleTokenSafe" `
+        -Failure "ConvertTo-BRAVODataRestoreElevationArgument має обгортати значення в лапки за Win32/CommandLineToArgvW правилом (подвоєння trailing backslash перед закриваючою лапкою, екранування вбудованих лапок) — значення з пробілом (напр. впроваджений перемикач) має ставати РІВНО одним дочірнім аргументом, а не розщеплюватись на кілька"
+
+    # --- 6.23d. Кожне forwarded-значення (GenerationId, TargetPath,
+    # StagingPath, ConfigPath, EntryScriptPath) проходить через той самий
+    # канонічний ConvertTo-BRAVODataRestoreElevationArgument. -------------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('(ConvertTo-BRAVODataRestoreElevationArgument -Value $EntryScriptPath)') -and
+            $dataRestoreRuntimeTextForTests.Contains('(ConvertTo-BRAVODataRestoreElevationArgument -Value $GenerationId)') -and
+            $dataRestoreRuntimeTextForTests.Contains('(ConvertTo-BRAVODataRestoreElevationArgument -Value $TargetPath)') -and
+            $dataRestoreRuntimeTextForTests.Contains('(ConvertTo-BRAVODataRestoreElevationArgument -Value $StagingPath)') -and
+            $dataRestoreRuntimeTextForTests.Contains('(ConvertTo-BRAVODataRestoreElevationArgument -Value $ConfigPath)')
+        ) `
+        -Name "DataRestore/ElevationForwardsEveryValueThroughCanonicalQuoting" `
+        -Failure "Усі значення, що форвардяться елевованому дочірньому процесу (EntryScriptPath/GenerationId/TargetPath/StagingPath/ConfigPath), мають проходити через один канонічний ConvertTo-BRAVODataRestoreElevationArgument — без цього одне значення могло б стати кількома child-аргументами"
+
+    # --- 6.24. MinimumFreeSpaceGB: 0/позитивне приймається;
+    # від'ємне/NaN/+Inf/-Inf/непарсиме відхиляється. ----------------------
+    $freeSpaceGbZero = [double]0
+    $minFreeGbZeroOk = & $dataRestoreModule { param($v) $out = [double]0; $r = Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out); [pscustomobject]@{ Result = $r; Validated = $out } } 0
+    $minFreeGbPositiveOk = & $dataRestoreModule { param($v) $out = [double]0; $r = Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out); [pscustomobject]@{ Result = $r; Validated = $out } } 20
+    $minFreeGbNegativeRejected = & $dataRestoreModule { param($v) $out = [double]0; Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out) } (-100)
+    $minFreeGbNaNRejected = & $dataRestoreModule { param($v) $out = [double]0; Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out) } ([double]::NaN)
+    $minFreeGbPositiveInfinityRejected = & $dataRestoreModule { param($v) $out = [double]0; Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out) } ([double]::PositiveInfinity)
+    $minFreeGbNegativeInfinityRejected = & $dataRestoreModule { param($v) $out = [double]0; Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out) } ([double]::NegativeInfinity)
+    $minFreeGbUnparseableRejected = & $dataRestoreModule { param($v) $out = [double]0; Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $v -ValidatedGigabytes ([ref]$out) } 'not-a-number'
+    Test-BRAVOCondition `
+        -Condition (
+            $minFreeGbZeroOk.Result -eq $true -and $minFreeGbZeroOk.Validated -eq 0 -and
+            $minFreeGbPositiveOk.Result -eq $true -and $minFreeGbPositiveOk.Validated -eq 20 -and
+            -not $minFreeGbNegativeRejected -and
+            -not $minFreeGbNaNRejected -and
+            -not $minFreeGbPositiveInfinityRejected -and
+            -not $minFreeGbNegativeInfinityRejected -and
+            -not $minFreeGbUnparseableRejected
+        ) `
+        -Name "DataRestore/MinimumFreeSpaceGBRejectsNegativeNonFiniteValues" `
+        -Failure "Test-BRAVODataRestoreMinimumFreeSpaceGB має приймати 0 і додатні значення, і відхиляти від'ємні, NaN, +Infinity, -Infinity та непарсимі значення — інакше free-space preflight міг би хибно пройти з від'ємним резервом"
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло

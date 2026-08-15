@@ -65,6 +65,94 @@ if (-not (Test-Path -LiteralPath $notificationHelpersPath -PathType Leaf)) {
 }
 Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 
+# Test-BRAVODataRestoreGenerationIdFormat визначена ТУТ (а не серед інших
+# функцій нижче за текстом файлу), бо потрібна ДО елевації — єдина
+# канонічна реалізація застосовується і до значення, яке ще належить
+# передати елевованому дочірньому процесу.
+function Test-BRAVODataRestoreGenerationIdFormat {
+    # Канонічний формат generationId: yyyyMMdd_HHmmss з опційним
+    # collision-safe суфіксом _N. Єдина реалізація перевірки — той самий
+    # контракт застосовується і до -GenerationId з командного рядка (до
+    # елевації та після), і до generationId, прочитаного зі ЗМІСТУ
+    # manifest-а (локального або, особливо, SFTP-завантаженого) ПЕРЕД тим,
+    # як значення бере участь у Join-Path/створенні каталогів. Manifest —
+    # недовірений вхід: без цієї перевірки шкідливе чи пошкоджене значення
+    # generationId (напр. "..\..\Windows") могло б вивести обчислений шлях
+    # за межі staging root.
+    param([string]$GenerationId)
+    if ([string]::IsNullOrWhiteSpace($GenerationId)) { return $false }
+    $formatMatch = [regex]::Match($GenerationId, '^\d{8}_\d{6}(?:_(?<suffix>\d+))?$')
+    if (-not $formatMatch.Success) { return $false }
+    # Продюсер (Get-BRAVOCollisionSafeGenerationId, BRAVO.Archive.Runtime.ps1)
+    # генерує суфікс лише обмеженим циклом [int] (0..MaxAttempts). Regex вище
+    # НЕ обмежує кількість цифр, тому недовірене (особливо SFTP-manifest чи
+    # remote-listing) ім'я на кшталт "..._2147483648" пройшло б формат, але
+    # звалило б подальший [int]-каст у Get-BRAVODataRestoreGenerationIdSortKey
+    # необробленим OverflowException. TryParse тут — non-throwing перевірка,
+    # що значення взагалі влазить у той самий числовий тип, яким оперує
+    # sort-key/продюсер; неприйнятний суфікс — це недопустимий формат, а не
+    # crash.
+    if ($formatMatch.Groups['suffix'].Success) {
+        $parsedSuffix = 0
+        if (-not [int]::TryParse(
+                $formatMatch.Groups['suffix'].Value,
+                [System.Globalization.NumberStyles]::None,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$parsedSuffix)) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Test-BRAVODataRestoreMinimumFreeSpaceGB {
+    # Канонічна перевірка maintenanceSettings.Limits.MinimumFreeSpaceGB ПЕРЕД
+    # тим, як значення бере участь у Test-BRAVODataRestoreFreeSpace як
+    # резервний поріг. Від'ємний/нескінченний/NaN поріг зробив би перевірку
+    # "$availableBytes - $requiredBytes -lt $floorBytes" хибно успішною:
+    # з від'ємним $floorBytes том, на якому реально бракує місця, міг би
+    # пройти preflight. Визначена ТУТ (до "try {" нижче), бо конфігурація
+    # завантажується й перевіряється одразу на початку try-блоку. [double]-
+    # каст (не string round-trip через культуру) — щоб числове значення з
+    # JSON-конфігурації не залежало від поточної локалі виконання.
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][ref]$ValidatedGigabytes
+    )
+    $ValidatedGigabytes.Value = [double]0
+    if ($null -eq $Value) { return $false }
+    $parsedValue = $null
+    try {
+        $parsedValue = [double]$Value
+    } catch {
+        return $false
+    }
+    if ([double]::IsNaN($parsedValue) -or [double]::IsInfinity($parsedValue) -or $parsedValue -lt 0) {
+        return $false
+    }
+    $ValidatedGigabytes.Value = $parsedValue
+    return $true
+}
+
+function ConvertTo-BRAVODataRestoreElevationArgument {
+    # Безпечна серіалізація ОДНОГО значення в ОДИН елемент командного рядка
+    # для Start-Process -ArgumentList: масив рядків, переданий у
+    # -ArgumentList, з'єднується у рядок командного рядка без додаткового
+    # екранування з боку Start-Process. Без цього недовірене значення з
+    # пробілом (напр. GenerationId "20260815_120000 -Force") дочірній
+    # елевований процес зв'язав би як ДВА окремих аргументи — валідний
+    # -GenerationId плюс впроваджений перемикач. Обгортання в лапки за
+    # стандартним Win32/CommandLineToArgvW правилом (подвоєння backslash
+    # перед лапкою чи в кінці рядка, екранування самих лапок) гарантує, що
+    # одне батьківське значення завжди стає РІВНО одним дочірнім аргументом
+    # незалежно від вмісту.
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Value)
+
+    $escaped = [regex]::Replace($Value, '(\\*)"', '$1$1\"')
+    $escaped = [regex]::Replace($escaped, '(\\+)$', '$1$1')
+    return '"' + $escaped + '"'
+}
+
 # Один зовнішній try/finally: exit усередині try гарантовано проходить крізь
 # усі finally на своєму шляху, тому ручна пауза охоплює кожну точку виходу
 # (той самий принцип, що BRAVO_MAINTENANCE).
@@ -82,16 +170,30 @@ $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
 $isLocalSystem = $currentIdentity.User.Value -eq 'S-1-5-18'
 if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    $elevatedArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "`"$EntryScriptPath`"")
-    if (-not [string]::IsNullOrWhiteSpace($GenerationId)) { $elevatedArguments += @("-GenerationId", $GenerationId) }
+    # ДО побудови аргументів елевації: значення, ще не розщеплене ОС на
+    # окремі argv-токени, або відповідає канонічному формату generationId,
+    # або цілком відхиляється тут, ДО Start-Process. Перевірка ПІСЛЯ
+    # елевації (нижче за текстом файлу) вже НЕ бачить впровадженого вмісту
+    # — до того моменту рядок уже розщепив CreateProcess дочірнього
+    # процесу.
+    if (-not [string]::IsNullOrWhiteSpace($GenerationId) -and
+        -not (Test-BRAVODataRestoreGenerationIdFormat -GenerationId $GenerationId)) {
+        Write-Host "ПОМИЛКА: -GenerationId має недопустимий формат (yyyyMMdd_HHmmss, опційно з collision-safe суфіксом _N): '$GenerationId'" -ForegroundColor Red
+        exit 30
+    }
+    $elevatedArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (ConvertTo-BRAVODataRestoreElevationArgument -Value $EntryScriptPath))
+    if (-not [string]::IsNullOrWhiteSpace($GenerationId)) { $elevatedArguments += @("-GenerationId", (ConvertTo-BRAVODataRestoreElevationArgument -Value $GenerationId)) }
+    # Component/Mode/Source — типізовано обмежені [ValidateSet] у param()
+    # цього ж скрипта: значення, що досягло цієї точки, вже гарантовано
+    # належить фіксованому переліку без пробілів/спецсимволів.
     $elevatedArguments += @("-Component", $Component, "-Mode", $Mode, "-Source", $Source)
-    if (-not [string]::IsNullOrWhiteSpace($TargetPath)) { $elevatedArguments += @("-TargetPath", "`"$TargetPath`"") }
-    if (-not [string]::IsNullOrWhiteSpace($StagingPath)) { $elevatedArguments += @("-StagingPath", "`"$StagingPath`"") }
+    if (-not [string]::IsNullOrWhiteSpace($TargetPath)) { $elevatedArguments += @("-TargetPath", (ConvertTo-BRAVODataRestoreElevationArgument -Value $TargetPath)) }
+    if (-not [string]::IsNullOrWhiteSpace($StagingPath)) { $elevatedArguments += @("-StagingPath", (ConvertTo-BRAVODataRestoreElevationArgument -Value $StagingPath)) }
     if ($Force) { $elevatedArguments += "-Force" }
     if ($SkipHealthCheck) { $elevatedArguments += "-SkipHealthCheck" }
     if ($TimeoutSeconds -gt 0) { $elevatedArguments += @("-TimeoutSeconds", [string]$TimeoutSeconds) }
     if ($NoPause) { $elevatedArguments += "-NoPause" }
-    $elevatedArguments += @("-ConfigPath", "`"$ConfigPath`"")
+    $elevatedArguments += @("-ConfigPath", (ConvertTo-BRAVODataRestoreElevationArgument -Value $ConfigPath))
     $elevatedProcess = Start-Process powershell.exe -ArgumentList $elevatedArguments -Verb RunAs -Wait -PassThru
     Exit $elevatedProcess.ExitCode
 }
@@ -183,6 +285,14 @@ try {
     }
     if ($null -eq $maintenanceSettings.Limits -or $null -eq $maintenanceSettings.Limits.MinimumFreeSpaceGB) {
         throw "У конфігурації відсутній обов'язковий параметр 'maintenanceSettings.Limits.MinimumFreeSpaceGB'"
+    }
+    # Від'ємний/нескінченний/NaN поріг зробив би free-space preflight
+    # (Test-BRAVODataRestoreFreeSpace) хибно успішним: перевірка
+    # "$availableBytes - $requiredBytes -lt $floorBytes" з від'ємним
+    # $floorBytes могла б пропустити том, на якому реально бракує місця.
+    $parsedMinimumFreeSpaceGB = [double]0
+    if (-not (Test-BRAVODataRestoreMinimumFreeSpaceGB -Value $maintenanceSettings.Limits.MinimumFreeSpaceGB -ValidatedGigabytes ([ref]$parsedMinimumFreeSpaceGB))) {
+        throw "'maintenanceSettings.Limits.MinimumFreeSpaceGB' має бути невід'ємним скінченним числом: '$($maintenanceSettings.Limits.MinimumFreeSpaceGB)'"
     }
     if ($null -eq $global:progressSettings -or $null -eq $progressSettings.SevenZipTimeoutSeconds) {
         throw "У конфігурації відсутній обов'язковий параметр 'progressSettings.SevenZipTimeoutSeconds'"
@@ -363,39 +473,52 @@ function Test-BRAVODataRestorePathEquals {
     }
 }
 
-function Test-BRAVODataRestoreGenerationIdFormat {
-    # Канонічний формат generationId: yyyyMMdd_HHmmss з опційним
-    # collision-safe суфіксом _N. Єдина реалізація перевірки — той самий
-    # контракт застосовується і до -GenerationId з командного рядка, і до
-    # generationId, прочитаного зі ЗМІСТУ manifest-а (локального або,
-    # особливо, SFTP-завантаженого) ПЕРЕД тим, як значення бере участь у
-    # Join-Path/створенні каталогів. Manifest — недовірений вхід: без цієї
-    # перевірки шкідливе чи пошкоджене значення generationId (напр.
-    # "..\..\Windows") могло б вивести обчислений шлях за межі staging root.
-    param([string]$GenerationId)
-    if ([string]::IsNullOrWhiteSpace($GenerationId)) { return $false }
-    $formatMatch = [regex]::Match($GenerationId, '^\d{8}_\d{6}(?:_(?<suffix>\d+))?$')
-    if (-not $formatMatch.Success) { return $false }
-    # Продюсер (Get-BRAVOCollisionSafeGenerationId, BRAVO.Archive.Runtime.ps1)
-    # генерує суфікс лише обмеженим циклом [int] (0..MaxAttempts). Regex вище
-    # НЕ обмежує кількість цифр, тому недовірене (особливо SFTP-manifest чи
-    # remote-listing) ім'я на кшталт "..._2147483648" пройшло б формат, але
-    # звалило б подальший [int]-каст у Get-BRAVODataRestoreGenerationIdSortKey
-    # необробленим OverflowException. TryParse тут — non-throwing перевірка,
-    # що значення взагалі влазить у той самий числовий тип, яким оперує
-    # sort-key/продюсер; неприйнятний суфікс — це недопустимий формат, а не
-    # crash.
-    if ($formatMatch.Groups['suffix'].Success) {
-        $parsedSuffix = 0
-        if (-not [int]::TryParse(
-                $formatMatch.Groups['suffix'].Value,
-                [System.Globalization.NumberStyles]::None,
-                [System.Globalization.CultureInfo]::InvariantCulture,
-                [ref]$parsedSuffix)) {
-            return $false
-        }
+function Test-BRAVODataRestorePathHasReparseAncestor {
+    # Test-BRAVODataRestorePathWithin/-PathEquals — лише лексична
+    # нормалізація (GetFullPath): вони НЕ бачать, що каталог фізично є
+    # junction/symlink/mount point на іншу ціль. Шлях-псевдонім (напр.
+    # D:\RESTORE_LINK -> junction на C:\LIMS\BLOG) пройшов би обидві
+    # перевірки, реально вказуючи всередину live production-дерева.
+    # Надійне вирішення фізичної цілі reparse-точки в .NET Framework 4.x
+    # (Windows PowerShell 5.1) вимагало б P/Invoke до
+    # GetFinalPathNameByHandle; замість крихкого часткового парсера ця
+    # перевірка — fail-closed (Option B): якщо сам шлях АБО будь-який
+    # НАЯВНИЙ предок є reparse-точкою, шлях відхиляється як небезпечний
+    # для запису/знищення незалежно від того, куди саме він фізично веде.
+    # Компонент цілі, що ще НЕ існує (нормальний випадок — план вимагає
+    # відсутності), не заважає перевірці: цикл підіймається до першого
+    # НАЯВНОГО предка.
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    try {
+        $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/')
+    } catch {
+        # Шлях, що не парситься — безпечніше відхилити.
+        return $true
     }
-    return $true
+
+    $current = $fullPath
+    while (-not [string]::IsNullOrWhiteSpace($current)) {
+        try {
+            if (Test-Path -LiteralPath $current) {
+                $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+                if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                    return $true
+                }
+            }
+        } catch {
+            # Недоступний/аномальний стан предка (напр. permission denied,
+            # broken reparse target) — безпечніше відхилити, ніж дозволити.
+            return $true
+        }
+        $parent = Split-Path -Path $current -Parent
+        if ([string]::IsNullOrWhiteSpace($parent) -or
+            [string]::Equals($parent, $current, [StringComparison]::OrdinalIgnoreCase)) {
+            break
+        }
+        $current = $parent
+    }
+    return $false
 }
 
 function Get-BRAVODataRestoreGenerationIdSortKey {
@@ -723,6 +846,92 @@ function Get-BRAVODataRestoreComponentSelection {
     return @($enabledTypes)
 }
 
+function Get-BRAVODataRestoreLiveSourceMap {
+    # Канонічне обчислення live-джерела кожного компонента: пріоритет —
+    # canonical discovery-каталог (RestoreTargetDirectories, existence-
+    # independent, напр. bravoDiscoveryResult.BRAVOEXCH_SOURCE), fallback —
+    # ArchiveDefinitions.Source-похідний каталог, коли ключ discovery
+    # відсутній/порожній. Один канонічний власник — використовується і
+    # плануванням (Get-BRAVODataRestorePlan), і staging-preflight
+    # (Test-BRAVODataRestoreStagingSafe, виконується ДО будь-якого SFTP
+    # filesystem-запису), щоб обидва місця бачили той самий набір
+    # live-джерел без дублювання логіки виведення.
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions,
+        [hashtable]$RestoreTargetDirectories
+    )
+
+    $liveSources = @{}
+    foreach ($definition in $ArchiveDefinitions) {
+        $definitionType = [string]$definition.Type
+        $definitionSource = [string]$definition.Source
+        $backupDerivedDirectory = if ([string]::IsNullOrWhiteSpace($definitionSource)) {
+            $null
+        } else {
+            Split-Path $definitionSource -Parent
+        }
+        $canonicalTargetDirectory = if ($null -ne $RestoreTargetDirectories -and
+            $RestoreTargetDirectories.ContainsKey($definitionType) -and
+            -not [string]::IsNullOrWhiteSpace([string]$RestoreTargetDirectories[$definitionType])) {
+            [string]$RestoreTargetDirectories[$definitionType]
+        } else {
+            $null
+        }
+        $liveSources[$definitionType] = if (-not [string]::IsNullOrWhiteSpace($canonicalTargetDirectory)) {
+            $canonicalTargetDirectory
+        } else {
+            $backupDerivedDirectory
+        }
+    }
+    return $liveSources
+}
+
+function Test-BRAVODataRestoreStagingSafe {
+    # Preflight, що МУСИТЬ пройти ДО будь-якого SFTP filesystem-запису
+    # (створення _manifests, завантаження generation-архівів). Без цієї
+    # перевірки Invoke-BRAVODataRestoreSftpManifestFetch писав би у
+    # StagingPath ДО того, як Get-BRAVODataRestorePlan (пізніший крок
+    # pipeline) взагалі перевіряє шляхи — зловмисний/помилковий
+    # -StagingPath, що дорівнює, містить чи вкладений у live
+    # MODEL/BLOG/BRAVOEXCH, дав би змогу запис/подальше рекурсивне
+    # очищення staging знищити production-дані ще до будь-якої перевірки.
+    # Типовий (StagingPath не задано) staging НАВМИСНО лежить УСЕРЕДИНІ
+    # BackupRoot (<BackupRoot>\RESTORE_STAGING) — це підтримувана поведінка
+    # за замовчуванням, тому, на відміну від OutOfPlace -TargetPath,
+    # BackupRoot тут НЕ у забороненому списку.
+    param(
+        [Parameter(Mandatory = $true)][string]$StagingRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRootPath,
+        [Parameter(Mandatory = $true)][hashtable]$LiveSources
+    )
+
+    $protectedDirectories = @(
+        @{ Name = 'RuntimeRoot'; Path = $RuntimeRootPath }
+    )
+    foreach ($liveSourceType in @($LiveSources.Keys)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$LiveSources[$liveSourceType])) {
+            $protectedDirectories += @{ Name = "live-джерело $liveSourceType"; Path = [string]$LiveSources[$liveSourceType] }
+        }
+    }
+    foreach ($protectedDirectory in $protectedDirectories) {
+        if ((Test-BRAVODataRestorePathEquals -First $StagingRoot -Second $protectedDirectory.Path) -or
+            (Test-BRAVODataRestorePathWithin -Path $StagingRoot -Directory $protectedDirectory.Path) -or
+            (Test-BRAVODataRestorePathWithin -Path $protectedDirectory.Path -Directory $StagingRoot)) {
+            return [pscustomobject]@{
+                Success = $false
+                Error = "staging-шлях перетинається з захищеним розташуванням ($($protectedDirectory.Name)): $($protectedDirectory.Path)"
+            }
+        }
+    }
+    if (Test-BRAVODataRestorePathHasReparseAncestor -Path $StagingRoot) {
+        return [pscustomobject]@{
+            Success = $false
+            Error = "staging-шлях (або його наявний предок) є reparse-точкою (junction/symlink) — фізична ціль не може бути надійно перевірена: $StagingRoot"
+        }
+    }
+    return [pscustomobject]@{ Success = $true; Error = $null }
+}
+
 function Get-BRAVODataRestorePlan {
     # План цілей відновлення: для кожного компонента — куди розпаковувати і
     # (для InPlace) куди зносити вбік поточні дані. Уся валідація шляхів
@@ -748,28 +957,9 @@ function Get-BRAVODataRestorePlan {
         [Parameter(Mandatory = $true)][string]$RunStamp
     )
 
-    $liveSources = @{}
-    foreach ($definition in $ArchiveDefinitions) {
-        $definitionType = [string]$definition.Type
-        $definitionSource = [string]$definition.Source
-        $backupDerivedDirectory = if ([string]::IsNullOrWhiteSpace($definitionSource)) {
-            $null
-        } else {
-            Split-Path $definitionSource -Parent
-        }
-        $canonicalTargetDirectory = if ($null -ne $RestoreTargetDirectories -and
-            $RestoreTargetDirectories.ContainsKey($definitionType) -and
-            -not [string]::IsNullOrWhiteSpace([string]$RestoreTargetDirectories[$definitionType])) {
-            [string]$RestoreTargetDirectories[$definitionType]
-        } else {
-            $null
-        }
-        $liveSources[$definitionType] = if (-not [string]::IsNullOrWhiteSpace($canonicalTargetDirectory)) {
-            $canonicalTargetDirectory
-        } else {
-            $backupDerivedDirectory
-        }
-    }
+    $liveSources = Get-BRAVODataRestoreLiveSourceMap `
+        -ArchiveDefinitions $ArchiveDefinitions `
+        -RestoreTargetDirectories $RestoreTargetDirectories
 
     $planComponents = @()
     if ($RestoreMode -eq 'OutOfPlace') {
@@ -787,6 +977,13 @@ function Get-BRAVODataRestorePlan {
         }
         if (Test-Path -LiteralPath $targetRoot -PathType Leaf) {
             return [pscustomobject]@{ Success = $false; Error = "-TargetPath вказує на файл, а не каталог: $targetRoot"; TargetRoot = $null; Components = @() }
+        }
+        # Лексична нормалізація (GetFullPath) вище не бачить, що
+        # -TargetPath фізично є junction/symlink: перевірки нижче
+        # порівнюють лише лексичний шлях і могли б пропустити ціль, що
+        # насправді веде всередину live production-дерева.
+        if (Test-BRAVODataRestorePathHasReparseAncestor -Path $targetRoot) {
+            return [pscustomobject]@{ Success = $false; Error = "-TargetPath (або його наявний предок) є reparse-точкою (junction/symlink) — фізична ціль не може бути надійно перевірена: $targetRoot"; TargetRoot = $null; Components = @() }
         }
         # Заборонені цілі: комплект, резервні копії, staging, live-джерела —
         # у будь-який бік вкладеності. Відновлення ПОВЕРХ цих місць або
@@ -1320,7 +1517,19 @@ function Stop-BRAVODataRestoreServices {
 
     $failures = @()
     foreach ($entry in $Snapshot) {
-        if (-not $entry.Managed -or -not $entry.WasRunning) { continue }
+        if (-not $entry.Managed) { continue }
+        # Обов'язок ЗУПИНКИ переоцінюється за ПОТОЧНИМ станом служби, а не
+        # за WasRunning знімка: WasRunning визначає лише намір ЗАПУСКУ
+        # ПІСЛЯ відновлення (Restore-BRAVODataRestoreServices нижче), тоді
+        # як службу, що на знімку була Stopped/StartPending, але встигла чи
+        # встигає перейти у Running до цього виклику (гонитва зі знімком),
+        # усе одно потрібно зупинити — інакше вона могла б читати/писати у
+        # дерево під час move-aside/розпакування. Get-Service тут — новий
+        # запит, не кеш зі знімка.
+        $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
+        if ($null -eq $currentService) { continue }
+        $currentService.Refresh()
+        if ([string]$currentService.Status -eq 'Stopped') { continue }
         foreach ($processName in @($entry.KillProcesses)) {
             $lingeringProcess = Get-Process -Name $processName -ErrorAction SilentlyContinue
             if ($lingeringProcess) {
@@ -1344,6 +1553,31 @@ function Stop-BRAVODataRestoreServices {
         }
     }
     return @($failures)
+}
+
+function Test-BRAVODataRestoreServicesAllStopped {
+    # Фінальний бар'єр БЕЗПОСЕРЕДНЬО перед першою деструктивною дією
+    # (move-aside): Stop-BRAVODataRestoreServices вище вже зупинила й
+    # дочекалась Stopped для кожної керованої служби, але між її return і
+    # цим викликом лишається вузьке вікно, у якому служба теоретично могла
+    # перейти назад у нестабільний стан. Це НЕ спроба зупинки — лише
+    # re-query поточного стану кожної керованої служби безпосередньо перед
+    # мутацією filesystem; будь-який стан, відмінний від Stopped (Running,
+    # StartPending, StopPending, Paused тощо), — привід перервати прогін ДО
+    # move-aside/extraction.
+    param([Parameter(Mandatory = $true)][object[]]$Snapshot)
+
+    $unsafeEntries = @()
+    foreach ($entry in $Snapshot) {
+        if (-not $entry.Managed) { continue }
+        $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
+        if ($null -eq $currentService) { continue }
+        $currentService.Refresh()
+        if ([string]$currentService.Status -ne 'Stopped') {
+            $unsafeEntries += "$($entry.Name) (поточний стан: $($currentService.Status))"
+        }
+    }
+    return @($unsafeEntries)
 }
 
 function Restore-BRAVODataRestoreServices {
@@ -2564,6 +2798,41 @@ if ($Source -eq 'SFTP' -and
     exit 30
 }
 
+# Canonical restore-target каталоги (незалежні від фізичної наявності) —
+# той самий bravoDiscoveryResult, що вже формує ArchiveDefinitions.Source,
+# але без existence-якісного фільтра BRAVOEXCH (BRAVO.config): для InPlace
+# саме відсутній production-каталог і є типовим disaster-restore
+# сценарієм. Обчислено РАНО (до staging-preflight нижче й до кроку 3
+# основного pipeline), щоб обидва місця бачили той самий набір
+# live-джерел.
+$restoreTargetDirectories = @{
+    MODEL = [string]$global:bravoDiscoveryResult.MODEL_SOURCE
+    BLOG = [string]$global:bravoDiscoveryResult.BLOG_SOURCE
+    BRAVOEXCH = [string]$global:bravoDiscoveryResult.BRAVOEXCH_SOURCE
+}
+
+# Staging-preflight МУСИТЬ пройти ДО будь-якого SFTP filesystem-запису
+# (нижче за pipeline: вибір generation для Source=SFTP створює
+# _manifests і завантажує через WinSCP ДО того, як Get-BRAVODataRestorePlan
+# взагалі перевіряє шляхи). Без цієї перевірки зловмисний/помилковий
+# -StagingPath, що перетинається з live MODEL/BLOG/BRAVOEXCH, дав би змогу
+# запис/подальше рекурсивне очищення staging знищити production-дані ще до
+# першої перевірки плану.
+if ($Source -eq 'SFTP') {
+    $dataRestoreStagingLiveSources = Get-BRAVODataRestoreLiveSourceMap `
+        -ArchiveDefinitions @($global:archiveDefinitions) `
+        -RestoreTargetDirectories $restoreTargetDirectories
+    $stagingSafety = Test-BRAVODataRestoreStagingSafe `
+        -StagingRoot $stagingRootPath `
+        -RuntimeRootPath $bravoScriptDirectory `
+        -LiveSources $dataRestoreStagingLiveSources
+    if (-not $stagingSafety.Success) {
+        Write-Host "ПОМИЛКА: $($stagingSafety.Error)" -ForegroundColor Red
+        Write-DataRestoreLog -Message "Staging preflight: $($stagingSafety.Error)" -Level 'ERROR'
+        exit 30
+    }
+}
+
 # ===== OPERATION LOCK =====
 $lockAcquisition = Enter-BRAVODataRestoreOperationLock
 if (-not $lockAcquisition.Success) {
@@ -2639,16 +2908,6 @@ try {
         }
 
         # --- 3. План цілей ---
-        # Canonical restore-target каталоги (незалежні від фізичної
-        # наявності) — той самий bravoDiscoveryResult, що вже формує
-        # ArchiveDefinitions.Source, але без existence-якісного фільтра
-        # BRAVOEXCH (BRAVO.config): для InPlace саме відсутній production-
-        # каталог і є типовим disaster-restore сценарієм.
-        $restoreTargetDirectories = @{
-            MODEL = [string]$global:bravoDiscoveryResult.MODEL_SOURCE
-            BLOG = [string]$global:bravoDiscoveryResult.BLOG_SOURCE
-            BRAVOEXCH = [string]$global:bravoDiscoveryResult.BRAVOEXCH_SOURCE
-        }
         $restorePlan = Get-BRAVODataRestorePlan `
             -ComponentTypes $componentTypes `
             -RestoreMode $Mode `
@@ -2915,6 +3174,15 @@ try {
                 -Name 'Зупинка служб' `
                 -Status $(if ($servicesToStop.Count -gt 0) { 'OK' } else { 'SKIPPED' }) `
                 -Duration ((Get-Date) - $stageStartedAt)
+
+            # Фінальний бар'єр: re-query ПОТОЧНОГО стану кожної керованої
+            # служби безпосередньо перед move-aside (перша деструктивна
+            # дія). Stop-BRAVODataRestoreServices вище вже дочекалась
+            # Stopped, але залишає вузьке вікно між return і цим місцем.
+            $finalStopBarrier = Test-BRAVODataRestoreServicesAllStopped -Snapshot $script:dataRestoreServiceSnapshot
+            if (@($finalStopBarrier).Count -gt 0) {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("служби не в стані Stopped безпосередньо перед відновленням: " + ($finalStopBarrier -join '; '))
+            }
         }
 
         # --- 9. Відновлення по компонентах (fail-fast) ---
