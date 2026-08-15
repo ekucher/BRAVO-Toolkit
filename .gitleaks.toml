@@ -20,7 +20,7 @@ useDefault = true
 # який випадково потрапить у ці ж файли, майже напевно не матиме форми
 # рівно 64 hex-символів; будь-який секрет у будь-якому іншому файлі
 # сканується як і раніше.
-[[allowlists]]
+[allowlist]
 description = "SHA-256 у маніфестах цілісності не є секретами"
 condition = "AND"
 paths = [
@@ -29,31 +29,4 @@ paths = [
 ]
 regexes = [
     '''\b[A-Fa-f0-9]{64}\b'''
-]
-
-# BRAVO_SELF_TEST.ps1 (feature/notification-severity-routing, commit
-# 90e0eaf) містить ізольований self-test для fallback-логіки
-# Resolve-BRAVONotificationEndpoint. Тестова fixture-строка
-# 'BRAVO_DISCORD_ALERTS_URL_MISSING' — це НАЗВА Credential Manager
-# target-а (симулює "route-специфічний запис не налаштований"), не
-# секрет: реального Credential Manager цей тест не торкається
-# (Get-BRAVOCredentialSecret повністю замокана в ізольованому module
-# scope). Рядок випадково має РІВНО 32 символи, що поруч із ключем
-# "DiscordWebhookAlerts" і "=" збігається з дефолтним правилом gitleaks
-# discord-client-secret (entropy-евристика на 32-символьні значення
-# біля слова "discord"). Виняток максимально вузький — condition =
-# "AND" по ВСІХ трьох критеріях: тільки цей комміт, тільки цей файл,
-# тільки цей точний літерал. Жодного впливу на сканування секретів у
-# будь-якому іншому файлі, комміті чи рядку.
-[[allowlists]]
-description = "BRAVO_SELF_TEST.ps1 notification-endpoint fixture — назва Credential Manager target-а, не секрет (32-символьний збіг з discord-client-secret)"
-condition = "AND"
-commits = [
-    "90e0eafab8c543be6612fd28716759f4115a304a"
-]
-paths = [
-    '''(^|/)BRAVO_SELF_TEST\.ps1$'''
-]
-regexes = [
-    '''BRAVO_DISCORD_ALERTS_URL_MISSING'''
 ]
