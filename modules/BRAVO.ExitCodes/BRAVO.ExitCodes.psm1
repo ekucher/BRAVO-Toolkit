@@ -34,6 +34,7 @@ $script:BRAVOExitCodeNames = @{
     40 = "LocalArchiveFailed"
     41 = "IntegrityTestFailed"
     42 = "HashValidationFailed"
+    43 = "RestoreFailed"
     50 = "SftpFailed"
     51 = "SmbFailed"
     60 = "MaintenanceFailed"
@@ -56,6 +57,7 @@ function Resolve-BRAVOExitCode {
         [switch]$LocalArchiveFailed,
         [switch]$IntegrityTestFailed,
         [switch]$HashValidationFailed,
+        [switch]$RestoreFailed,
         [switch]$SftpFailed,
         [switch]$SmbFailed,
         [switch]$MaintenanceFailed,
@@ -103,6 +105,15 @@ function Resolve-BRAVOExitCode {
     if ($LocalArchiveFailed) { return 40 }
     if ($IntegrityTestFailed) { return 41 }
     if ($HashValidationFailed) { return 42 }
+    # Відновлення даних (BRAVO_DATA_RESTORE): відмова самої операції
+    # відновлення — generation не знайдена/INCOMPLETE, бракує артефактів,
+    # недостатньо місця, move-aside/extraction/post-verify/rollback,
+    # відмова служб. СПЕЦИФІЧНІШІ причини стоять вище: пошкоджений архів
+    # (41) і невалідний SHA512 (42) точніше називають, ЩО саме зламано,
+    # ніж загальне "відновлення не вдалося". SFTP-джерело (50) — нижче:
+    # якщо помилка і в завантаженні, і у відновленні, первинна причина —
+    # відновлення, яке так і не відбулося.
+    if ($RestoreFailed) { return 43 }
     if ($SftpFailed) { return 50 }
     if ($SmbFailed) { return 51 }
     if ($MaintenanceFailed) { return 60 }

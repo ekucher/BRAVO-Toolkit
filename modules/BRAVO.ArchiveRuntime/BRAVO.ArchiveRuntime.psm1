@@ -315,3 +315,129 @@ function Get-SanitizedWinSCPDiagnostic {
     return ($lines -join [Environment]::NewLine)
 }
 
+function Remove-BRAVOWinSCPSensitiveTemporaryScript {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return
+    }
+
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([char[]]"\/")
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $expectedPrefix = $temporaryRoot + [IO.Path]::DirectorySeparatorChar
+    $fileName = [IO.Path]::GetFileName($fullPath)
+    if (-not $fullPath.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -or
+        $fileName -notmatch '^BRAVO_WinSCP_[0-9a-f]{32}\.txt$') {
+        throw "відхилено небезпечний шлях тимчасового WinSCP-файла: $Path"
+    }
+
+    if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
+        # Спершу прибираємо вміст із доступного файлового запису, потім файл.
+        [IO.File]::WriteAllText($fullPath, "", [Text.Encoding]::ASCII)
+        Remove-Item -LiteralPath $fullPath -Force -ErrorAction Stop
+    }
+}
+
+function Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts {
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $staleBefore = (Get-Date).AddDays(-1)
+    foreach ($file in @(
+            Get-ChildItem `
+                -LiteralPath $temporaryRoot `
+                -Filter "BRAVO_WinSCP_*.txt" `
+                -ErrorAction SilentlyContinue |
+                Where-Object { -not $_.PSIsContainer -and $_.LastWriteTime -lt $staleBefore }
+        )) {
+        try {
+            Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $file.FullName
+        } catch {
+            # Файл іншого облікового запису може мати закритий ACL.
+        }
+    }
+}
+
+function New-BRAVOWinSCPTemporaryScriptPath {
+    # WinSCP script містить URL з обліковими даними, тому файл створюється
+    # ОДРАЗУ з фінальним DACL — доступ лише поточному користувачу, SYSTEM і
+    # Administrators.
+    #
+    # ЧОМУ НЕ "створити, потім Set-Acl" (аудит Low #9): між створенням файлу
+    # й накладанням ACL файл існує з успадкованими від %TEMP% правами. Для
+    # запланованого завдання %TEMP% — це C:\Windows\Temp, куди має доступ
+    # значно ширше коло. Порожній файл у цьому вікні секрету ще не містить,
+    # але Windows перевіряє права в момент ВІДКРИТТЯ дескриптора, а не при
+    # кожному читанні: відкритий у цьому вікні дескриптор переживе зміну ACL
+    # і прочитає облікові дані, які запише сюди викликач. Передача
+    # FileSecurity у конструктор FileStream прибирає вікно повністю — файл
+    # ніколи не існує з успадкованими правами.
+    #
+    # Спільний для Archive і DataRestore (обидва створюють WinSCP-скрипти з
+    # SFTP URL, що містить облікові дані) — canonical owner: BRAVO.ArchiveRuntime.
+    Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts
+    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
+    $temporaryPath = Join-Path `
+        -Path $temporaryRoot `
+        -ChildPath ("BRAVO_WinSCP_{0}.txt" -f [guid]::NewGuid().ToString("N"))
+
+    # DACL будується ДО створення файлу.
+    $security = New-Object System.Security.AccessControl.FileSecurity
+    $security.SetAccessRuleProtection($true, $false)
+    $uniqueSids = @{}
+    foreach ($sid in @(
+            [Security.Principal.WindowsIdentity]::GetCurrent().User,
+            (New-Object Security.Principal.SecurityIdentifier("S-1-5-18")),
+            (New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544"))
+        )) {
+        if ($null -eq $sid -or $uniqueSids.ContainsKey($sid.Value)) {
+            continue
+        }
+        $uniqueSids[$sid.Value] = $true
+        $rule = New-Object `
+            -TypeName System.Security.AccessControl.FileSystemAccessRule `
+            -ArgumentList @(
+                $sid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.AccessControlType]::Allow
+            )
+        [void]$security.AddAccessRule($rule)
+    }
+
+    $stream = $null
+    try {
+        $stream = New-Object `
+            -TypeName System.IO.FileStream `
+            -ArgumentList @(
+                $temporaryPath,
+                [IO.FileMode]::CreateNew,
+                [Security.AccessControl.FileSystemRights]::Write,
+                [IO.FileShare]::None,
+                4096,
+                [IO.FileOptions]::None,
+                $security
+            )
+        $stream.Dispose()
+        $stream = $null
+
+        return $temporaryPath
+    } catch {
+        if ($null -ne $stream) {
+            $stream.Dispose()
+        }
+        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
+            try {
+                Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $temporaryPath
+            } catch {
+                # WARNING, а не мовчазний пропуск: цей файл містить облікові
+                # дані SFTP. Якщо його не вдалося затерти й видалити, секрет
+                # лишився в %TEMP% — оператор має про це дізнатися саме
+                # зараз, а не під час розслідування витоку.
+                Write-BRAVOLog `
+                    -Component 'SFTP' `
+                    -Message "Не вдалося прибрати тимчасовий WinSCP-скрипт з обліковими даними ($temporaryPath): $($_.Exception.Message). Видаліть файл вручну." `
+                    -Level "WARNING"
+            }
+        }
+        throw
+    }
+}
+

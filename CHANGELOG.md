@@ -1,18 +1,77 @@
 # Changelog
 
-## 5.1.0-rc.1 — 2026-08-14
+## 5.1.0-rc.2 — 2026-08-14 (candidate, NOT accepted)
 
-Release-metadata-only promotion of the `5.1.0-dev.1` cycle (below) to
-Release Candidate: `packageVersion`/`releaseChannel` bump per
-`RELEASE_POLICY.md` section 8, no functional runtime changes relative to
-the `5.1.0-dev.1` commit this promotes (`9256e56`). Functional
-development for this cycle is complete; real-SFTP BAZA acceptance
-(DEV-LIMS, 2026-08-13) passed across all 10 scenarios (iterative
-acceptance+fix — see `docs/BAZA_SFTP_ACCEPTANCE.md` section 13), and the
-two outstanding documentation findings from release-readiness review
-(stale acceptance stamp in the runbook precondition, real institution
-name in console UX examples) are closed. `5.1.0-rc.1` is ready for
-verification on a real server per `RELEASE_POLICY.md` section 9.
+Second release candidate of the 5.1.0 line. Unlike a typical RC, rc.2
+carries a functional addition: completion of BRAVO_DATA_RESTORE, which
+the project decided to ship inside stable 5.1.0. Because of this
+functional change, the 5.1.0-rc.1 acceptance evidence no longer covers
+the runtime: **rc.2 requires a new full acceptance run** (including the
+real DEV-LIMS restore acceptance) before any stable promotion. This
+candidate has NOT been accepted yet. The earlier local, unpublished
+5.1.0 stable promotion produced from rc.1 (commit `ac07f55`) is
+superseded and must not be pushed, merged, tagged, or released; the
+"5.1.0" section below describes that unpublished promotion and stable
+5.1.0 will be re-promoted from an accepted rc.2.
+
+- New `BRAVO_DATA_RESTORE.ps1` entrypoint (thin orchestration over the
+  new `modules/BRAVO.DataRestore` domain module): real data restore of
+  MODEL/BLOG/BRAVOEXCH components from a verified COMPLETE backup
+  generation — out-of-place by default, in-place with move-aside and
+  rollback, local BackupRoot or SFTP source, `-ListGenerations`
+  inventory mode. Runs the same runtime-integrity guard chain before
+  `Import-Module` as the other entrypoints.
+- Generation selection and per-component verification
+  (`Get-BRAVORestoreGenerationManifest`,
+  `Get-BRAVOVerifiedGenerationArchive`) promoted from
+  `BRAVO_RESTORE_TEST.ps1` into `modules/BRAVO.ArchiveHelpers` as the
+  single canonical selector/gate shared by the restore drill and the
+  real restore; the drill script now calls the shared functions instead
+  of local copies (no behavior change).
+- New exit code `43 RestoreFailed` in `modules/BRAVO.ExitCodes`: failure
+  of the restore operation itself. More specific archive causes keep
+  priority (41 IntegrityTestFailed, 42 HashValidationFailed win over
+  43); 43 wins over 50 SftpFailed and warnings.
+- In-place restore now rolls back the **whole run**, not just the failing
+  component. Previously a failure on the second or third component left
+  production mixed: earlier components already replaced from the backup
+  generation, the rest still on their old data — an inconsistent
+  MODEL/BLOG/BRAVOEXCH set. Components restored earlier in the same run
+  are now moved back to their pre-restore state in reverse order and
+  reported as `ВІДКОЧЕНО` (`ROLLED_BACK`); a failure to roll back one
+  component does not stop the rollback of the others and raises a CRITICAL
+  notification with the exact manual recovery command. A component whose
+  rollback did not complete is never left reported as restored: it gets the
+  terminal status `ПОМИЛКА ВІДКАТУ` (`ROLLBACK_FAILED`) carrying the
+  concrete failure reason, keeps its `.prerestore_*` copy listed for manual
+  recovery, and the run still exits `43 RestoreFailed`. No `.prerestore_*`
+  copy is ever deleted automatically.
+- Self-test extended to cover the new entrypoint (guard-before-import,
+  build-id surfacing, exit-code priority profile, shared restore
+  selector ownership) and, behaviourally, the restore logic itself:
+  path guards, component selection, target planning (protected-location
+  and non-empty-target rejection, in-place discovery targets), free-space
+  preflight, post-extraction verification, and cross-component rollback
+  including the partial-failure path.
+- Operator documentation: `OPERATIONS.md` gains an exit code `43` runbook
+  section, including recovery steps for a restore interrupted mid-flight
+  (process killed, reboot, BSOD) where services stay stopped and the live
+  directory may be missing; `README.md` documents the restore workflow
+  (section 6.2) and its invariants.
+
+Stable production release promoted from the verified `5.1.0-rc.1`
+candidate (accepted HEAD `852a0b9`, CI run 31755546128 SUCCESS,
+real-server acceptance verdict PROMOTE). The candidate passed the
+complete Windows CI pipeline and real-server acceptance on Windows
+PowerShell 5.1, including real-SFTP BAZA acceptance across all 10
+scenarios (DEV-LIMS, 2026-08-13 — see `docs/BAZA_SFTP_ACCEPTANCE.md`
+section 13). This promotion contains no functional runtime changes
+relative to the accepted candidate: it removes the prerelease suffix,
+sets the stable release channel, updates operator documentation
+headers, and regenerates the runtime integrity manifest. No
+configuration schema, state schema, credential target, archive format,
+retention default, transfer protocol, or supported-OS contract changed
+during promotion.
 
 ## 5.1.0-dev.1 — 2026-08-12
 

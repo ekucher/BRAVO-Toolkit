@@ -972,14 +972,18 @@ developer: 4.5.1-dev.1
 
 ```text
 master:    5.0.0   (stable)
-developer: 5.1.0-rc.1 (prerelease)
+developer: 5.1.0-rc.2 (prerelease, у розробці — acceptance ще не пройдено)
 ```
 
-`5.1.0` — minor-цикл: цикл вже містить нову функціональність (Retention
-Safety Invariants — orphan-temp cleanup, retention audit, daily
-Recovery-тригер для автоматичної реставрації в межах вікна; BAZA_APP/
-BAZA_WWW incremental append-only sync engine), а не лише виправлення,
-тому відкрито `5.1.0-dev.1`, а не `5.0.1-dev.1`. Функціональна розробка
-циклу завершена й перевірена (real-SFTP acceptance, DEV-LIMS
-2026-08-13); `developer` промотовано до `5.1.0-rc.1` для перевірки на
-реальному сервері перед promotion у `master` (розділ 8).
+`5.1.0-rc.1` пройшов real-SFTP acceptance на DEV-LIMS (2026-08-13),
+але ДО публікації stable вирішено включити у 5.1.0 нову
+функціональність — BRAVO_DATA_RESTORE (реальне відновлення даних із
+верифікованої COMPLETE generation). Функціональна зміна робить
+acceptance rc.1 недійсним як release evidence (розділ 3), тому
+відкрито наступний candidate `5.1.0-rc.2`, який потребує повного
+повторного acceptance (включно з реальним restore-acceptance на
+DEV-LIMS) перед promotion у stable.
+
+Локальний, ніде не опублікований коміт stable-промоушену з rc.1
+(`ac07f55`) НЕ є фінальним stable: його не можна push/merge/tag/
+release. Stable `5.1.0` буде промотовано заново з прийнятого rc.2.
