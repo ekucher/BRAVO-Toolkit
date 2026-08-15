@@ -1438,7 +1438,18 @@ function New-MaintenanceNotificationMessage {
         [string]$DurationLabel = "Тривалість виконання",
         [string[]]$StatusLines = @(),
         [string[]]$Details = @(),
-        [string]$LogPath
+        [string]$LogPath,
+
+        # Явна канонічна NotificationSeverity. Якщо caller уже знає точну
+        # severity (напр. Send-FinalReport для NotificationAlertQueue —
+        # WARNING/ERROR/CRITICAL, review finding: notification-only
+        # ERROR/CRITICAL не повинні "downgrade"-итись до WARNING лише
+        # через спільний TitleEmoji ":warning:"), її треба передавати сюди
+        # напряму — вона стає source of truth і inference з TitleEmoji/Title
+        # нижче пропускається. Якщо не передано — поведінка ідентична
+        # попередній (backward compatibility для наявних викликів).
+        [ValidateSet("SUCCESS", "WARNING", "ERROR", "CRITICAL")]
+        [string]$Severity
     )
 
     $hostInformation = Get-HostInformation
@@ -1451,7 +1462,9 @@ function New-MaintenanceNotificationMessage {
     # усередині. Для трьох інших наявних викликів New-MaintenanceNotificationMessage
     # результат ідентичний обом порядкам (жоден не поєднує ":warning:" з
     # Title, що містить "УСПІШ").
-    $severity = if ($TitleEmoji -eq ":warning:") {
+    $severity = if ($Severity) {
+        $Severity
+    } elseif ($TitleEmoji -eq ":warning:") {
         "WARNING"
     } elseif ($TitleEmoji -eq ":white_check_mark:" -or $Title -match "УСПІШ") {
         "SUCCESS"
@@ -1663,11 +1676,27 @@ function Send-SlackAlert {
     }
 
     if ($isSpaceError) {
-        # Для помилок місця - негайна відправка (незмінно)
+        # Для помилок місця - негайна відправка (незмінно для legacy
+        # -IsCritical/дефолтного шляху — effectiveSeverity=CRITICAL, той
+        # самий Title/TitleEmoji, що й завжди). Якщо викликач явно передав
+        # -Severity (WARNING/ERROR, без -IsCritical) для повідомлення, яке
+        # ЗБІГАЄТЬСЯ з space-error регексом — Title/TitleEmoji/-Severity
+        # узгоджені з effectiveSeverity, а не жорстко CRITICAL.
+        $spaceErrorTitleEmoji = switch ($effectiveSeverity) {
+            "WARNING" { ":warning:" }
+            "ERROR" { ":x:" }
+            default { ":rotating_light:" }
+        }
+        $spaceErrorTitle = if ($effectiveSeverity -eq "CRITICAL") {
+            "КРИТИЧНА ПОМИЛКА ОБСЛУГОВУВАННЯ"
+        } else {
+            "ПОМИЛКА ОБСЛУГОВУВАННЯ"
+        }
         try {
             $outboundMessage = New-MaintenanceNotificationMessage `
-                -Title "КРИТИЧНА ПОМИЛКА ОБСЛУГОВУВАННЯ" `
-                -TitleEmoji ":rotating_light:" `
+                -Title $spaceErrorTitle `
+                -TitleEmoji $spaceErrorTitleEmoji `
+                -Severity $effectiveSeverity `
                 -Duration ((Get-Date) - $script:ScriptStartTime) `
                 -Details @($Message) `
                 -LogPath $LOG_FILE
@@ -1717,6 +1746,7 @@ function Send-InactiveServiceWarning {
         $notificationMessage = New-MaintenanceNotificationMessage `
             -Title "СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE" `
             -TitleEmoji ":warning:" `
+            -Severity "WARNING" `
             -Duration ((Get-Date) - $script:ScriptStartTime) `
             -Details @(
                 "Служби: $serviceList",
@@ -3841,6 +3871,7 @@ function Send-FinalReport {
         $notificationMessage = New-MaintenanceNotificationMessage `
             -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
             -TitleEmoji ":rotating_light:" `
+            -Severity "CRITICAL" `
             -Duration $elapsedTime `
             -Details @($script:CriticalErrorsList.ToArray()) `
             -LogPath $LOG_FILE
@@ -3848,19 +3879,43 @@ function Send-FinalReport {
         $shouldSend = $true
     }
     elseif ($script:NotificationAlertQueue.Count -gt 0) {
-        # Notification-only WARNING/ERROR (Send-SlackAlert -Severity, без
-        # -IsCritical) — окрема гілка від CRITICAL вище: NotificationSeverity
-        # лишається WARNING/ERROR, а не успадковує CRITICAL-презентацію
-        # (review finding #2). Відправляється так само в режимах
-        # "errors_only" та "all" (WARNING/ERROR завжди -> ALERTS).
-        $notificationSeverity = if (@($script:NotificationAlertQueue | Where-Object { $_.Severity -eq "ERROR" }).Count -gt 0) {
+        # Notification-only WARNING/ERROR/CRITICAL (Send-SlackAlert
+        # -Severity, без -IsCritical) — окрема гілка від справжніх
+        # execution-critical подій (CriticalErrorsList) вище: жодна з них
+        # не встановлює criticalErrorOccurred і не потрапляє в
+        # CriticalErrorsList/execution exit code (review finding #2), але
+        # CONTENT-severity в самому повідомленні має відповідати
+        # НАЙВИЩІЙ severity у черзі (CRITICAL > ERROR > WARNING) — не
+        # downgrade-итись до WARNING лише тому, що всі вони маршрутизуються
+        # в один ALERTS-канал (review, повторна знахідка після 95c05d7).
+        # Відправляється в режимах "errors_only" та "all" (WARNING/ERROR/
+        # CRITICAL завжди -> ALERTS).
+        $queuedSeverities = @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Severity })
+        $notificationSeverity = if ($queuedSeverities -contains "CRITICAL") {
+            "CRITICAL"
+        } elseif ($queuedSeverities -contains "ERROR") {
             "ERROR"
         } else {
             "WARNING"
         }
+        # Title/TitleEmoji узгоджені з тією самою обчисленою
+        # notificationSeverity (не окремий, розбіжний inference) —
+        # New-MaintenanceNotificationMessage отримує -Severity явно, тому
+        # TitleEmoji тут суто презентаційний і не впливає на content severity.
+        $alertQueueTitleEmoji = switch ($notificationSeverity) {
+            "CRITICAL" { ":rotating_light:" }
+            "ERROR" { ":x:" }
+            default { ":warning:" }
+        }
+        $alertQueueTitle = if ($notificationSeverity -eq "CRITICAL") {
+            "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ (CRITICAL)"
+        } else {
+            "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ"
+        }
         $notificationMessage = New-MaintenanceNotificationMessage `
-            -Title "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ" `
-            -TitleEmoji ":warning:" `
+            -Title $alertQueueTitle `
+            -TitleEmoji $alertQueueTitleEmoji `
+            -Severity $notificationSeverity `
             -Duration $elapsedTime `
             -Details @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) `
             -LogPath $LOG_FILE
@@ -3971,6 +4026,7 @@ function Send-FinalReport {
             $notificationMessage = New-MaintenanceNotificationMessage `
                 -Title "BRAVO MAINTENANCE — $($maintenanceNotificationStatus.Text)" `
                 -TitleEmoji $maintenanceNotificationTitleEmoji `
+                -Severity $notificationSeverity `
                 -Duration $elapsedTime `
                 -StatusLines @() `
                 -Details @($completedCheckLines.ToArray()) `
