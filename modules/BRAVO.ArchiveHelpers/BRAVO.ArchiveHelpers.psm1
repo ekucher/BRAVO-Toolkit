@@ -487,6 +487,26 @@ function Get-BRAVORestoreGenerationManifest {
         try {
             $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
             if ([string]$manifest.status -ne 'COMPLETE') { continue }
+            # Identity invariant: ім'я файлу (BRAVO_BACKUP_<generationId>.json)
+            # і generationId усередині JSON мають бути ТОЧНО тим самим
+            # значенням. Без цієї перевірки пошкоджений/перейменований
+            # manifest міг би пройти лише format-валідацію RequestedGenerationId
+            # (яка звіряється із самим ІМ'ЯМ файлу — Get-BRAVOBackupGenerationManifestFiles
+            # будує ім'я з нього), а фактично відновити зовсім іншу
+            # generation, вказану всередині файлу.
+            $filenameGenerationId = [IO.Path]::GetFileNameWithoutExtension($manifestFile.Name) -replace '^BRAVO_BACKUP_', ''
+            $jsonGenerationId = [string]$manifest.generationId
+            if ([string]::IsNullOrWhiteSpace($jsonGenerationId) -or
+                $jsonGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$' -or
+                -not [string]::Equals($filenameGenerationId, $jsonGenerationId, [StringComparison]::Ordinal)) {
+                if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+                    throw "manifest '$($manifestFile.Name)' не пройшов перевірку ідентичності: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
+                }
+                # Автоматичний вибір (без explicit -RequestedGenerationId):
+                # fail-closed — пропускаємо підозрілий manifest, а не
+                # ризикуємо вибрати generation, вказану лише в JSON.
+                continue
+            }
             $createdAt = $manifestFile.LastWriteTime
             foreach ($dateProperty in @('createdAt', 'startedAt')) {
                 $property = $manifest.PSObject.Properties[$dateProperty]

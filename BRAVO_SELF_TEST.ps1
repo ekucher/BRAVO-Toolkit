@@ -2022,6 +2022,14 @@ try {
         (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
         [Text.Encoding]::UTF8
     )
+    # New-BRAVOWinSCPTemporaryScriptPath / Remove-BRAVOWinSCPSensitiveTemporaryScript /
+    # Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts живуть тут (canonical
+    # shared owner, спільний для Archive і DataRestore) — НЕ в
+    # $archiveScriptText.
+    $archiveRuntimeModuleText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psm1"),
+        [Text.Encoding]::UTF8
+    )
     $healthScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1"),
         [Text.Encoding]::UTF8
@@ -2554,7 +2562,7 @@ try {
         -Name "ConfigurationLoader/ArchiveAndHealthEntrypoints" `
         -Failure "BRAVO_ARCHIV і BRAVO_HEALTH повинні завантажувати конфігурацію через loader із розділеними -ConfigRoot (каталог конфігурації) і -RuntimeRoot (каталог комплекту)"
     $archiveRuntimeModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText ($archiveScriptText + [Environment]::NewLine + $healthScriptText + [Environment]::NewLine + $notificationScriptText) `
+        -SourceText ($archiveScriptText + [Environment]::NewLine + $healthScriptText + [Environment]::NewLine + $notificationScriptText + [Environment]::NewLine + $archiveRuntimeModuleText) `
         -FunctionNames @(
             "ConvertTo-NotificationLiteralText",
             "Split-DiscordNotificationText",
@@ -2924,7 +2932,7 @@ try {
     # ACL і прочитає облікові дані, які запише туди викликач.
     $temporaryScriptFunctionAst = @(
         [Management.Automation.Language.Parser]::ParseInput(
-            $archiveScriptText, [ref]$null, [ref]$null
+            $archiveRuntimeModuleText, [ref]$null, [ref]$null
         ).FindAll({
             param($candidate)
             $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -5139,7 +5147,7 @@ try {
         -Failure 'Health має оцінювати один COMPLETE generation manifest, а не незалежні newest MODEL/BLOG/BRAVOEXCH'
     Test-BRAVOCondition `
         -Condition (
-            $archiveScriptText.Contains('function New-BRAVOWinSCPTemporaryScriptPath') -and
+            $archiveRuntimeModuleText.Contains('function New-BRAVOWinSCPTemporaryScriptPath') -and
             -not $archiveScriptText.Contains('GetTempFileName() + ".txt"')
         ) `
         -Name "SFTP/NoOrphanedTemporaryScripts" `
@@ -8818,7 +8826,7 @@ function Format-BRAVOFileSize {
     $sftpFetchParseErrors = $null
     $sftpFetchAst = [Management.Automation.Language.Parser]::ParseInput(
         $dataRestoreRuntimeTextForTests, [ref]$sftpFetchParseTokens, [ref]$sftpFetchParseErrors)
-    $sftpFetchFunctionNames = @('Invoke-BRAVODataRestoreSftpManifestFetch', 'Get-BRAVODataRestoreSftpOperationTimeoutSeconds')
+    $sftpFetchFunctionNames = @('Invoke-BRAVODataRestoreSftpManifestFetch', 'Get-BRAVODataRestoreSftpOperationTimeoutSeconds', 'Get-BRAVODataRestoreWinSCPDownloads', 'New-BRAVODataRestoreWinSCPNamespaceManager')
     $sftpFetchFunctionTexts = @()
     foreach ($sftpFetchFunctionName in $sftpFetchFunctionNames) {
         $sftpFetchFunctionAst = @($sftpFetchAst.FindAll({
@@ -8832,20 +8840,43 @@ function Format-BRAVOFileSize {
 function Invoke-BRAVODataRestoreWinSCPScript {
     # Test double: без реального WinSCP.com/мережі. 'ls' повертає
     # маркерний Xml (парситься нижче тестовим Get-BRAVODataRestoreWinSCPListingNames);
-    # 'get' матеріалізує локальний manifest-файл із фікстур сценарію.
+    # 'get' матеріалізує локальний manifest-файл із фікстур сценарію і
+    # будує СПРАВЖНІЙ XmlDocument у WinSCP-схемі (w:download/w:filename/
+    # w:result), щоб РЕАЛЬНА Get-BRAVODataRestoreWinSCPDownloads могла його
+    # розпарсити — саме так перевіряється fail-closed поведінка на
+    # per-download відмові. Файл, відсутній у $script:BRAVOSelfTestSftpManifestContent,
+    # симулює провалене завантаження (result success="false").
     param([string[]]$Commands, [int]$TimeoutSeconds)
     if (@($Commands) -match '^ls ') {
         return [pscustomobject]@{ Success = $true; Xml = 'listing'; Error = $null }
     }
+    $namespaceUri = 'http://winscp.net/schema/session/1.0'
+    $xmlDocument = New-Object System.Xml.XmlDocument
+    $sessionNode = $xmlDocument.CreateElement('session', $namespaceUri)
+    [void]$xmlDocument.AppendChild($sessionNode)
     foreach ($command in @($Commands)) {
         if ($command -match 'get "[^"]*/(?<name>[^"/]+)" "(?<local>[^"]+)"') {
-            $manifestContent = $script:BRAVOSelfTestSftpManifestContent[$Matches['name']]
+            $manifestName = $Matches['name']
+            $manifestContent = $script:BRAVOSelfTestSftpManifestContent[$manifestName]
+            $downloadNode = $xmlDocument.CreateElement('download', $namespaceUri)
+            $filenameNode = $xmlDocument.CreateElement('filename', $namespaceUri)
+            [void]$filenameNode.SetAttribute('value', $manifestName)
+            [void]$downloadNode.AppendChild($filenameNode)
+            $resultNode = $xmlDocument.CreateElement('result', $namespaceUri)
             if ($null -ne $manifestContent) {
                 [IO.File]::WriteAllText($Matches['local'], $manifestContent)
+                [void]$resultNode.SetAttribute('success', 'true')
+            } else {
+                [void]$resultNode.SetAttribute('success', 'false')
+                $messageNode = $xmlDocument.CreateElement('message', $namespaceUri)
+                $messageNode.InnerText = 'simulated download failure'
+                [void]$resultNode.AppendChild($messageNode)
             }
+            [void]$downloadNode.AppendChild($resultNode)
+            [void]$sessionNode.AppendChild($downloadNode)
         }
     }
-    return [pscustomobject]@{ Success = $true; Xml = 'downloaded'; Error = $null }
+    return [pscustomobject]@{ Success = $true; Xml = $xmlDocument; Error = $null }
 }
 function Get-BRAVODataRestoreWinSCPListingNames {
     param([string]$Xml)
@@ -8974,6 +9005,285 @@ function Get-BRAVODataRestoreWinSCPListingNames {
             Remove-Item -LiteralPath $sftpFetchTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # --- 6.7. Second restore safety review (PR #40): SFTP batch identity +
+    # fail-closed on partial download failure. Той самий ізольований
+    # $sftpFetchModule (реальна Invoke-BRAVODataRestoreSftpManifestFetch),
+    # доповнений сценаріями: (a) filename generationId != JSON generationId,
+    # (b) найновіший manifest у батчі FAILED завантаження. -----------------
+    $sftpFetchTestRoot2 = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_SFTP_FETCH2_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($sftpFetchTestRoot2)
+
+        # #6: explicit RequestedGenerationId, filename matches, JSON content
+        # generationId is a DIFFERENT (but validly-formatted) generation ->
+        # REJECT (не accepted лише тому, що формат валідний).
+        $stagingDir6 = Join-Path $sftpFetchTestRoot2 'case6'
+        $names6 = @('BRAVO_BACKUP_20260815_120000.json')
+        $content6 = @{ 'BRAVO_BACKUP_20260815_120000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_230004' 'COMPLETE') }
+        $threw6 = $false
+        try {
+            [void](& $sftpFetchModule {
+                param($dir, $names, $content)
+                $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+                $script:BRAVOSelfTestSftpListingNames = $names
+                $script:BRAVOSelfTestSftpManifestContent = $content
+                Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId '20260815_120000'
+            } $stagingDir6 $names6 $content6)
+        } catch { $threw6 = $true }
+
+        # #7: automatic selection (no RequestedGenerationId) — newest manifest
+        # has mismatched filename/JSON identity, older one is genuinely
+        # COMPLETE and consistent -> fail-closed skip of the suspicious one,
+        # older valid one selected (not silently trusting the mismatched JSON).
+        $stagingDir7 = Join-Path $sftpFetchTestRoot2 'case7'
+        $names7 = @('BRAVO_BACKUP_20260815_120000.json', 'BRAVO_BACKUP_20260814_090000.json')
+        $content7 = @{
+            'BRAVO_BACKUP_20260815_120000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_230004' 'COMPLETE')
+            'BRAVO_BACKUP_20260814_090000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_090000' 'COMPLETE')
+        }
+        $result7 = & $sftpFetchModule {
+            param($dir, $names, $content)
+            $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+            $script:BRAVOSelfTestSftpListingNames = $names
+            $script:BRAVOSelfTestSftpManifestContent = $content
+            Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+        } $stagingDir7 $names7 $content7
+
+        Test-BRAVOCondition `
+            -Condition ($threw6) `
+            -Name "DataRestore/SftpManifestRejectsFilenameJsonIdentityMismatchExplicit" `
+            -Failure "явний -RequestedGenerationId має відхилятись, якщо ім'я файлу manifest-а і generationId усередині JSON не збігаються, навіть якщо обидва мають валідний формат"
+        Test-BRAVOCondition `
+            -Condition ([string]$result7.Manifest.generationId -eq '20260814_090000') `
+            -Name "DataRestore/SftpManifestAutomaticSelectionSkipsIdentityMismatch" `
+            -Failure "автоматичний вибір (без explicit GenerationId) має пропускати manifest із розбіжністю ім'я/JSON generationId fail-closed і обирати наступний дійсно узгоджений COMPLETE"
+
+        # #8: newest manifest download FAILS in WinSCP per-download XML
+        # (Success=true overall, per-file result failed) while an OLDER
+        # manifest in the SAME batch downloads fine and is COMPLETE ->
+        # MUST throw (fail closed), must NOT silently select the older one.
+        $stagingDir8 = Join-Path $sftpFetchTestRoot2 'case8'
+        $names8 = @('BRAVO_BACKUP_20260815_120000.json', 'BRAVO_BACKUP_20260814_090000.json')
+        $content8 = @{
+            # newest deliberately NOT materialized locally (simulates failed download)
+            'BRAVO_BACKUP_20260814_090000.json' = (New-BRAVOSelfTestSftpManifestFixture '20260814_090000' 'COMPLETE')
+        }
+        $threw8 = $false
+        $errorMessage8 = $null
+        try {
+            [void](& $sftpFetchModule {
+                param($dir, $names, $content)
+                $script:sftpDirectories = @{ Manifest = '/remote/manifests' }
+                $script:BRAVOSelfTestSftpListingNames = $names
+                $script:BRAVOSelfTestSftpManifestContent = $content
+                Invoke-BRAVODataRestoreSftpManifestFetch -StagingManifestDirectory $dir -RequestedGenerationId $null
+            } $stagingDir8 $names8 $content8)
+        } catch {
+            $threw8 = $true
+            $errorMessage8 = [string]$_.Exception.Message
+        }
+        Test-BRAVOCondition `
+            -Condition ($threw8 -and -not [string]::IsNullOrWhiteSpace($errorMessage8)) `
+            -Name "DataRestore/SftpManifestBatchFailsClosedOnPartialDownloadFailure" `
+            -Failure "коли завантаження НАЙНОВІШОГО manifest-а в батчі не підтверджено XML-журналом WinSCP (навіть якщо старіший у тому ж батчі завантажився й є COMPLETE), функція має ЗАВЕРШИТИСЬ ПОМИЛКОЮ — не тихо понижуватись до старішої generation через transient мережеву відмову"
+    } finally {
+        if (Test-Path -LiteralPath $sftpFetchTestRoot2) {
+            Remove-Item -LiteralPath $sftpFetchTestRoot2 -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.8. Second restore safety review (PR #40): Local manifest identity
+    # (canonical Get-BRAVORestoreGenerationManifest, BRAVO.ArchiveHelpers —
+    # спільний з BRAVO_RESTORE_TEST.ps1, тому виправлення тут закриває обидва
+    # споживачі одразу). Реальний Import-Module, реальні файли на диску. ----
+    Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+
+    function New-BRAVOSelfTestLocalManifestFixture {
+        param([string]$ManifestsRoot, [string]$FileNameGenerationId, [string]$JsonGenerationId, [string]$Status)
+        $manifestPath = Join-Path $ManifestsRoot ("BRAVO_BACKUP_{0}.json" -f $FileNameGenerationId)
+        $manifestBody = @{ generationId = $JsonGenerationId; status = $Status } | ConvertTo-Json -Compress
+        [IO.File]::WriteAllText($manifestPath, $manifestBody)
+    }
+
+    $localIdentityTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_LOCAL_IDENTITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        # Case A: requested=X, filename=X, JSON=X -> PASS.
+        $caseARoot = Join-Path $localIdentityTestRoot 'caseA'
+        $caseAManifests = Join-Path $caseARoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($caseAManifests)
+        New-BRAVOSelfTestLocalManifestFixture -ManifestsRoot $caseAManifests -FileNameGenerationId '20260814_100000' -JsonGenerationId '20260814_100000' -Status 'COMPLETE'
+        $selectedA = Get-BRAVORestoreGenerationManifest -BackupRoot $caseARoot -RequestedGenerationId '20260814_100000'
+
+        # Case B: requested=X, filename=X, JSON=Y (mismatch) -> REJECT.
+        $caseBRoot = Join-Path $localIdentityTestRoot 'caseB'
+        $caseBManifests = Join-Path $caseBRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($caseBManifests)
+        New-BRAVOSelfTestLocalManifestFixture -ManifestsRoot $caseBManifests -FileNameGenerationId '20260814_100000' -JsonGenerationId '20260813_090000' -Status 'COMPLETE'
+        $threwB = $false
+        try { [void](Get-BRAVORestoreGenerationManifest -BackupRoot $caseBRoot -RequestedGenerationId '20260814_100000') } catch { $threwB = $true }
+
+        # Case C: automatic selection — newest filename=X/JSON=Y mismatched,
+        # older filename=Z/JSON=Z consistent -> older selected, fail-closed
+        # skip of the mismatched newest (никогда не обираємо lишень за JSON).
+        $caseCRoot = Join-Path $localIdentityTestRoot 'caseC'
+        $caseCManifests = Join-Path $caseCRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($caseCManifests)
+        New-BRAVOSelfTestLocalManifestFixture -ManifestsRoot $caseCManifests -FileNameGenerationId '20260815_100000' -JsonGenerationId '20260814_010000' -Status 'COMPLETE'
+        New-BRAVOSelfTestLocalManifestFixture -ManifestsRoot $caseCManifests -FileNameGenerationId '20260814_090000' -JsonGenerationId '20260814_090000' -Status 'COMPLETE'
+        $selectedC = Get-BRAVORestoreGenerationManifest -BackupRoot $caseCRoot
+
+        # Case D: malformed JSON generationId (не проходить canonical формат) -> REJECT.
+        $caseDRoot = Join-Path $localIdentityTestRoot 'caseD'
+        $caseDManifests = Join-Path $caseDRoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($caseDManifests)
+        New-BRAVOSelfTestLocalManifestFixture -ManifestsRoot $caseDManifests -FileNameGenerationId '20260814_100000' -JsonGenerationId 'not-a-generation-id' -Status 'COMPLETE'
+        $threwD = $false
+        try { [void](Get-BRAVORestoreGenerationManifest -BackupRoot $caseDRoot -RequestedGenerationId '20260814_100000') } catch { $threwD = $true }
+
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$selectedA.Manifest.generationId -eq '20260814_100000' -and
+                $threwB -and
+                [string]$selectedC.Manifest.generationId -eq '20260814_090000' -and
+                $threwD
+            ) `
+            -Name "DataRestore/LocalManifestIdentityMustMatchFilenameAndRequested" `
+            -Failure "Get-BRAVORestoreGenerationManifest (BRAVO.ArchiveHelpers, canonical для Local і SFTP) має вимагати ТОЧНОГО збігу filename-generationId і JSON generationId: (A) requested=filename=JSON проходить; (B) requested=filename != JSON відхиляється; (C) автоматичний вибір пропускає невідповідний найновіший і бере наступний узгоджений; (D) невалідний формат JSON generationId відхиляється"
+    } finally {
+        Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $localIdentityTestRoot) {
+            Remove-Item -LiteralPath $localIdentityTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.9. Second restore safety review (PR #40): ACL copy failure must
+    # roll back the component (not continue extraction with only inherited
+    # permissions). Structural: throw replaces silent WARNING+continue, and
+    # flows into the SAME catch that already performs Undo-BRAVODataRestoreMoveAside
+    # / cross-component rollback — no new ACL-only rollback path. ----------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('throw "перенесення ACL на $($planComponent.TargetDirectory) не вдалося: $($_.Exception.Message)"') -and
+            -not $dataRestoreRuntimeTextForTests.Contains('Не вдалося перенести ACL на $($planComponent.TargetDirectory)')
+        ) `
+        -Name "DataRestore/AclCopyFailureIsComponentFailureNotWarning" `
+        -Failure "провал Copy-BRAVODataRestoreDirectoryAcl для InPlace має кидати виняток (component failure), а не зводитись до WARNING із продовженням extraction у каталог лише з успадкованими правами"
+    $aclThrowIndex = $dataRestoreRuntimeTextForTests.IndexOf('throw "перенесення ACL на $($planComponent.TargetDirectory) не вдалося')
+    $extractionCallIndexForAcl = $dataRestoreRuntimeTextForTests.IndexOf('Invoke-BRAVOSevenZipExtraction `')
+    $catchBlockIndexForAcl = $dataRestoreRuntimeTextForTests.IndexOf('$currentComponentStatus = ''FAILED''')
+    Test-BRAVOCondition `
+        -Condition (
+            $aclThrowIndex -gt 0 -and
+            $extractionCallIndexForAcl -gt $aclThrowIndex -and
+            $catchBlockIndexForAcl -gt 0 -and
+            $catchBlockIndexForAcl -gt $aclThrowIndex
+        ) `
+        -Name "DataRestore/AclCopyFailureOccursBeforeExtractionAndReusesExistingCatch" `
+        -Failure "ACL copy має відбуватись ДО Invoke-BRAVOSevenZipExtraction, а throw при її провалі має потрапляти в ТОЙ САМИЙ catch, що вже виконує rollback (без окремого ACL-only rollback шляху)"
+
+    # --- 6.10. Second restore safety review (PR #40): write-probe не має
+    # створюватись усередині InPlace live-каталогу — лише в батьківському. --
+    $probeTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_PROBE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $probeLiveParent = Join-Path $probeTestRoot 'LIVE_PARENT'
+        $probeLiveDirectory = Join-Path $probeLiveParent 'MODEL'
+        [void][IO.Directory]::CreateDirectory($probeLiveDirectory)
+        [IO.File]::WriteAllText((Join-Path $probeLiveDirectory 'production.txt'), 'live-data')
+
+        # Без ProbeDirectory (старий контракт / OutOfPlace) — тест лише
+        # підтверджує, що явний ProbeDirectory ПЕРЕВАЖАЄ TargetDirectory.
+        $probeResultWithDirective = & $dataRestoreModule {
+            param($liveDir, $parentDir)
+            Test-BRAVODataRestoreFreeSpace `
+                -Requirements @([pscustomobject]@{ TargetDirectory = $liveDir; RequiredBytes = [long]1024; ProbeDirectory = $parentDir }) `
+                -MinimumFreeGigabytes 0.001
+        } $probeLiveDirectory $probeLiveParent
+
+        $liveTreeEntriesAfterProbe = @(Get-ChildItem -LiteralPath $probeLiveDirectory -Force)
+        $probeArtifactsLeftInParent = @(Get-ChildItem -LiteralPath $probeLiveParent -Filter 'BRAVO_DATA_RESTORE_PROBE_*.tmp' -File -ErrorAction SilentlyContinue)
+
+        Test-BRAVOCondition `
+            -Condition (
+                $probeResultWithDirective.Success -and
+                $liveTreeEntriesAfterProbe.Count -eq 1 -and
+                $liveTreeEntriesAfterProbe[0].Name -eq 'production.txt' -and
+                $probeArtifactsLeftInParent.Count -eq 0
+            ) `
+            -Name "DataRestore/FreeSpaceProbeHonorsExplicitProbeDirectoryOutsideLiveTree" `
+            -Failure "коли Requirements містить ProbeDirectory, Test-BRAVODataRestoreFreeSpace має писати write-probe ТУДИ (і гарантовано прибирати його), а НЕ всередину live TargetDirectory — live-дерево має лишитись незмінним (лише production.txt)"
+
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreRuntimeTextForTests.Contains('$requirementProbeDirectory = Split-Path -Path ([string]$planComponent.TargetDirectory) -Parent') -and
+                $dataRestoreRuntimeTextForTests.Contains('if ($Mode -eq ''InPlace'') {') -and
+                $dataRestoreRuntimeTextForTests.Contains('ProbeDirectory = $requirementProbeDirectory')
+            ) `
+            -Name "DataRestore/InPlacePreflightPassesParentAsProbeDirectory" `
+            -Failure "виклик Test-BRAVODataRestoreFreeSpace для InPlace має передавати ProbeDirectory = батьківський каталог live-джерела, а не (мовчазний дефолт) сам TargetDirectory"
+    } finally {
+        if (Test-Path -LiteralPath $probeTestRoot) {
+            Remove-Item -LiteralPath $probeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.11. Second restore safety review (PR #40): WinSCP-скрипт
+    # DataRestore тепер створюється через canonical New-BRAVOWinSCPTemporaryScriptPath
+    # (protected DACL з моменту створення), а прибирається через
+    # Remove-BRAVOWinSCPSensitiveTemporaryScript — не raw WriteAllLines/Remove-Item. --
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('$temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath') -and
+            $dataRestoreRuntimeTextForTests.Contains('Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $temporaryScriptPath') -and
+            -not $dataRestoreRuntimeTextForTests.Contains('$temporaryScriptPath = Join-Path $temporaryRoot "$temporaryName.txt"')
+        ) `
+        -Name "DataRestore/WinSCPScriptUsesProtectedCanonicalCreation" `
+        -Failure "Invoke-BRAVODataRestoreWinSCPScript має створювати командний файл (містить SFTP URL з обліковими даними) через canonical New-BRAVOWinSCPTemporaryScriptPath (BRAVO.ArchiveRuntime, той самий helper, що Archive) — не через звичайний Join-Path+WriteAllLines у потенційно широкодоступному temp-каталозі"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveRuntimeModuleText.Contains('function New-BRAVOWinSCPTemporaryScriptPath') -and
+            $archiveRuntimeModuleText.Contains('function Remove-BRAVOWinSCPSensitiveTemporaryScript') -and
+            $archiveRuntimeModuleText.Contains('function Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts') -and
+            -not $archiveScriptText.Contains('function New-BRAVOWinSCPTemporaryScriptPath')
+        ) `
+        -Name "DataRestore/ProtectedWinSCPScriptCreationIsCanonicalSharedOwner" `
+        -Failure "protected WinSCP script creation має мати ОДНУ canonical реалізацію в BRAVO.ArchiveRuntime (спільній для Archive і DataRestore), а не окрему копію в Archive.Runtime.ps1"
+
+    $dataRestoreImportsArchiveRuntime = $dataRestoreRuntimeTextForTests -match "'BRAVO\.ArchiveRuntime'"
+    Test-BRAVOCondition `
+        -Condition ([bool]$dataRestoreImportsArchiveRuntime) `
+        -Name "DataRestore/ImportsArchiveRuntimeForSharedWinSCPScriptHelper" `
+        -Failure "BRAVO.DataRestore.Runtime.ps1 має імпортувати BRAVO.ArchiveRuntime, щоб мати доступ до canonical New-BRAVOWinSCPTemporaryScriptPath/Remove-BRAVOWinSCPSensitiveTemporaryScript"
+
+    # --- 6.12. Second restore safety review (PR #40): служби мають
+    # лишатись зупиненими, якщо rollback (поточного компонента або раніше
+    # завершених) не гарантовано довершився. Structural: явний прапорець
+    # виставляється у ROZNI відповідних точках і гейтить фінальний finally. --
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('$script:dataRestoreRollbackIncomplete = $false') -and
+            $dataRestoreRuntimeTextForTests.Contains('if ($script:dataRestoreRollbackIncomplete) {') -and
+            $dataRestoreRuntimeTextForTests.Contains('} elseif ($script:dataRestoreServicesStopped -and $null -ne $script:dataRestoreServiceSnapshot) {')
+        ) `
+        -Name "DataRestore/RollbackIncompleteFlagGatesServiceRestoration" `
+        -Failure "фінальний finally має пропускати Restore-BRAVODataRestoreServices, коли `$script:dataRestoreRollbackIncomplete=true (elseif, не окрема безумовна гілка) — інакше служби можуть піднятись поверх невизначеного стану filesystem"
+    $rollbackIncompleteSetCount = @([regex]::Matches($dataRestoreRuntimeTextForTests, '\$script:dataRestoreRollbackIncomplete = \$true')).Count
+    Test-BRAVOCondition `
+        -Condition ($rollbackIncompleteSetCount -eq 2) `
+        -Name "DataRestore/RollbackIncompleteFlagSetOnBothCurrentAndCrossRollbackFailure" `
+        -Failure "`$script:dataRestoreRollbackIncomplete має виставлятись РІВНО у двох місцях: провал rollback поточного компонента і провал крос-компонентного rollback"
+
+    # --- 6.13. Second restore safety review (PR #40): -ListGenerations не
+    # має вимагати 7za.exe (лише WinSCP для SFTP-лістингу, якщо взагалі). ---
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('$requiredTools = @()') -and
+            $dataRestoreRuntimeTextForTests.Contains('if (-not $ListGenerations) { $requiredTools += ''7za.exe'' }') -and
+            $dataRestoreRuntimeTextForTests.Contains("if (`$Source -eq 'SFTP') { `$requiredTools += 'WinSCP.com' }")
+        ) `
+        -Name "DataRestore/ListGenerationsDoesNotRequireSevenZip" `
+        -Failure "required tools мають похідати з фактичної операції: -ListGenerations (Local або SFTP) ніколи не має вимагати 7za.exe; лише реальне відновлення (не -ListGenerations) додає 7za.exe, а SFTP окремо додає WinSCP.com"
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло

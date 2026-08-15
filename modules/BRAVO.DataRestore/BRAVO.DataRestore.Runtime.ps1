@@ -120,6 +120,10 @@ $script:dataRestoreOperationLock = $null
 $script:dataRestoreOperationLockPath = $null
 $script:dataRestoreServiceSnapshot = $null
 $script:dataRestoreServicesStopped = $false
+# true, якщо відкат (поточного компонента АБО раніше завершених) не
+# гарантовано довершився — тоді live filesystem у невизначеному стані, і
+# служби НЕ можна запускати поверх нього (див. фінальний finally нижче).
+$script:dataRestoreRollbackIncomplete = $false
 $script:dataRestoreHealthExitCode = $null
 $script:dataRestoreSelectedGenerationId = $null
 $script:dataRestoreStagingGenerationRoot = $null
@@ -907,7 +911,19 @@ function Test-BRAVODataRestoreFreeSpace {
         }
     }
     foreach ($requirement in $Requirements) {
-        $probeDirectory = [string]$requirement.TargetDirectory
+        # Optional ProbeDirectory: для InPlace TargetDirectory ВЖЕ існує як
+        # live production-каталог (MODEL/BLOG/BRAVOEXCH), тому пробний файл
+        # там писати не можна — служби ще працюють, оператор ще не
+        # підтвердив відновлення, і watcher-и на production-дереві можуть
+        # побачити транзієнтний файл. Викликач для InPlace передає
+        # ProbeDirectory = батьківський каталог live-джерела; за
+        # замовчуванням (OutOfPlace/staging) поведінка не змінюється.
+        $requirementProbeDirectory = [string]$requirement.ProbeDirectory
+        $probeDirectory = if (-not [string]::IsNullOrWhiteSpace($requirementProbeDirectory)) {
+            $requirementProbeDirectory
+        } else {
+            [string]$requirement.TargetDirectory
+        }
         try {
             $probeDirectory = [System.IO.Path]::GetFullPath($probeDirectory)
         } catch {
@@ -924,9 +940,20 @@ function Test-BRAVODataRestoreFreeSpace {
         $probeFile = Join-Path $probeDirectory ("BRAVO_DATA_RESTORE_PROBE_{0}.tmp" -f ([guid]::NewGuid().ToString('N')))
         try {
             [IO.File]::WriteAllText($probeFile, 'probe')
-            Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
         } catch {
             $problems += "write-probe не пройдено для ${probeDirectory}: $($_.Exception.Message)"
+        } finally {
+            # Гарантована спроба прибрати probe навіть якщо запис вище
+            # провалився частково (файл міг бути створений і залишений
+            # порожнім) — інакше скасоване відновлення лишає слід у
+            # (потенційно production) probe-каталозі.
+            if (Test-Path -LiteralPath $probeFile -PathType Leaf) {
+                try {
+                    Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
+                } catch {
+                    $problems += "write-probe файл не прибрано (${probeFile}): $($_.Exception.Message)"
+                }
+            }
         }
     }
     return [pscustomobject]@{
@@ -1619,13 +1646,23 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         [Parameter(Mandatory = $true)][int]$TimeoutSeconds
     )
 
+    # Командний файл містить SFTP URL з обліковими даними (open ...) —
+    # створюється через canonical New-BRAVOWinSCPTemporaryScriptPath
+    # (BRAVO.ArchiveRuntime, той самий helper, що Archive), яка одразу
+    # накладає protected DACL (лише поточний обліковий запис/SYSTEM/
+    # Administrators) у момент створення файлу — без вікна, коли файл
+    # існує з успадкованими правами каталогу (Get-BRAVODataRestoreTemporaryRoot
+    # може fallback-нути у %TEMP%\BRAVO, для запланованого завдання це
+    # C:\Windows\Temp, доступний значно ширшому колу). XML-журнал секретів
+    # не містить — лишається у звичайному ASCII-безпечному temp-каталозі.
     $temporaryName = "BRAVO_DATA_RESTORE_$([guid]::NewGuid().ToString('N'))"
     $temporaryRoot = Get-BRAVODataRestoreTemporaryRoot
-    $temporaryScriptPath = Join-Path $temporaryRoot "$temporaryName.txt"
     $temporaryXmlPath = Join-Path $temporaryRoot "$temporaryName.xml"
+    $temporaryScriptPath = $null
     $process = $null
     $outputCapture = $null
     try {
+        $temporaryScriptPath = New-BRAVOWinSCPTemporaryScriptPath
         $scriptLines = @(
             "option batch continue",
             "option confirm off",
@@ -1697,7 +1734,14 @@ function Invoke-BRAVODataRestoreWinSCPScript {
                 # маскувати первинний exception, який зараз летить нагору.
             }
         }
-        foreach ($temporaryPath in @($temporaryScriptPath, $temporaryXmlPath)) {
+        if (-not [string]::IsNullOrWhiteSpace($temporaryScriptPath)) {
+            try {
+                Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $temporaryScriptPath
+            } catch {
+                Write-DataRestoreLog -Message "Не вдалося прибрати тимчасовий WinSCP-скрипт з обліковими даними ($temporaryScriptPath): $($_.Exception.Message). Видаліть файл вручну." -Level 'WARNING'
+            }
+        }
+        foreach ($temporaryPath in @($temporaryXmlPath)) {
             if (Test-Path -LiteralPath $temporaryPath) {
                 Remove-Item -LiteralPath $temporaryPath -Force -ErrorAction SilentlyContinue
             }
@@ -1861,6 +1905,25 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
             throw "не вдалося завантажити manifest-и з SFTP: $($downloadSession.Error)"
         }
 
+        # Invoke-BRAVODataRestoreWinSCPScript навмисно повертає Success=true,
+        # якщо WinSCP.com завершився з ненульовим кодом, але XML-журнал
+        # усе одно існує (per-operation результати в самому журналі) — тому
+        # тут ОБОВ'ЯЗКОВО перевіряється кожен per-download результат.
+        # Без цього transient збій завантаження НАЙНОВІШОГО manifest-а в
+        # батчі міг би мовчазно "провалитись" до старішого COMPLETE:
+        # restore тихо понизився б до застарілої generation через мережеву
+        # помилку, а не явну відмову.
+        $downloadResults = @(Get-BRAVODataRestoreWinSCPDownloads -Xml $downloadSession.Xml)
+        foreach ($manifestName in $manifestNameBatch) {
+            $matchingDownload = @($downloadResults | Where-Object {
+                ([string]$_.RemotePath) -like "*$manifestName"
+            } | Select-Object -First 1)
+            if ($matchingDownload.Count -eq 0 -or -not [bool]$matchingDownload[0].Success) {
+                $downloadFailureDetail = if ($matchingDownload.Count -gt 0) { [string]$matchingDownload[0].Error } else { 'відсутній результат завантаження в XML-журналі' }
+                throw "завантаження manifest-а '$manifestName' з SFTP не підтверджено: $downloadFailureDetail"
+            }
+        }
+
         # Найновіший COMPLETE серед завантажених у цьому батчі (або точно запитаний).
         $candidates = @()
         foreach ($manifestName in $manifestNameBatch) {
@@ -1872,6 +1935,21 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
                 continue
             }
             if ([string]$manifest.status -ne 'COMPLETE') { continue }
+            # Identity invariant (той самий контракт, що canonical
+            # Get-BRAVORestoreGenerationManifest для Local): ім'я файлу і
+            # generationId усередині JSON мають ТОЧНО збігатись — інакше
+            # пошкоджений/підмінений SFTP-manifest міг би змусити відновити
+            # generation, вказану лише в JSON.
+            $filenameGenerationId = [IO.Path]::GetFileNameWithoutExtension($manifestName) -replace '^BRAVO_BACKUP_', ''
+            $jsonGenerationId = [string]$manifest.generationId
+            if ([string]::IsNullOrWhiteSpace($jsonGenerationId) -or
+                $jsonGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$' -or
+                -not [string]::Equals($filenameGenerationId, $jsonGenerationId, [StringComparison]::Ordinal)) {
+                if ($isExplicitRequest) {
+                    throw "manifest '$manifestName' не пройшов перевірку ідентичності: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
+                }
+                continue
+            }
             $candidates += [pscustomobject]@{
                 Manifest = $manifest
                 ManifestPath = $localManifestPath
@@ -2087,8 +2165,13 @@ if (-not $ListGenerations) {
     }
 }
 
-# Цілісність інструментів перед їх запуском від імені адміністратора.
-$requiredTools = @('7za.exe')
+# Цілісність інструментів перед їх запуском від імені адміністратора —
+# лише тих, що реально будуть запущені для ЦІЄЇ операції. -ListGenerations
+# — read-only перегляд (Local: файлова система/JSON, без 7-Zip; SFTP:
+# лише WinSCP-лістинг) — вимога 7za.exe заблокувала б перегляд наявних
+# backup-ів саме тоді, коли інструмент розпакування потребує ремонту.
+$requiredTools = @()
+if (-not $ListGenerations) { $requiredTools += '7za.exe' }
 if ($Source -eq 'SFTP') { $requiredTools += 'WinSCP.com' }
 $toolIntegrity = Test-BRAVODataRestoreToolIntegrity -ToolNames $requiredTools
 if (@($toolIntegrity.Problems).Count -gt 0) {
@@ -2451,9 +2534,17 @@ try {
         $stageStartedAt = Get-Date
         $targetRequirements = @()
         foreach ($planComponent in $restorePlan.Components) {
+            $requirementProbeDirectory = $null
+            if ($Mode -eq 'InPlace') {
+                # InPlace TargetDirectory === live production-каталог (ще
+                # існує, служби ще працюють, оператор ще не підтвердив) —
+                # write-probe туди не пишемо; пробуємо батьківський каталог.
+                $requirementProbeDirectory = Split-Path -Path ([string]$planComponent.TargetDirectory) -Parent
+            }
             $targetRequirements += [pscustomobject]@{
                 TargetDirectory = [string]$planComponent.TargetDirectory
                 RequiredBytes = [long]$componentInventories[[string]$planComponent.Type].TotalUncompressedBytes
+                ProbeDirectory = $requirementProbeDirectory
             }
         }
         $targetSpaceCheck = Test-BRAVODataRestoreFreeSpace `
@@ -2579,13 +2670,22 @@ try {
                 # за конструкцією.
                 [void](New-Item -ItemType Directory -Path $planComponent.TargetDirectory -Force -ErrorAction Stop)
                 if ($Mode -eq 'InPlace' -and $moveAsidePerformed) {
+                    # ACL знесеного попередника (не батьківського каталогу)
+                    # — це production access control (напр. обліковий запис
+                    # служби BRAVO). Провал переносу ACL раніше зводився до
+                    # WARNING і extraction продовжувалась у каталог із лише
+                    # успадкованими правами — служба могла піднятись, не
+                    # маючи доступу до власних відновлених даних. Тепер це
+                    # трактується як відмова компонента: throw летить у той
+                    # самий catch нижче, що й будь-яка інша відмова
+                    # (existing rollback/cross-component rollback), без
+                    # окремого ACL-only rollback шляху.
                     try {
                         Copy-BRAVODataRestoreDirectoryAcl `
                             -SourceDirectory $planComponent.PrerestoreDirectory `
                             -DestinationDirectory $planComponent.TargetDirectory
                     } catch {
-                        $script:dataRestoreWarningCount++
-                        Write-DataRestoreLog -Message "Не вдалося перенести ACL на $($planComponent.TargetDirectory): $($_.Exception.Message)" -Level 'WARNING'
+                        throw "перенесення ACL на $($planComponent.TargetDirectory) не вдалося: $($_.Exception.Message)"
                     }
                 }
                 $extractionResult = Invoke-BRAVOSevenZipExtraction `
@@ -2654,6 +2754,7 @@ try {
                             # втручання саме для ЦЬОГО компонента.
                             $currentComponentStatus = 'ROLLBACK_FAILED'
                             $currentComponentPrerestoreDirectory = $planComponent.PrerestoreDirectory
+                            $script:dataRestoreRollbackIncomplete = $true
                             Send-BRAVODataRestoreNotification `
                                 -Severity 'CRITICAL' `
                                 -ResultLines @("Rollback компонента $componentType не вдався", [string]$rollback.Error) `
@@ -2698,6 +2799,7 @@ try {
                         if (@($crossRollback.Failures).Count -gt 0) {
                             $crossRollbackFailureText = @(Format-BRAVODataRestoreRollbackFailureText -Failures @($crossRollback.Failures))
                             $componentFailureReason = "$componentFailureReason; $($crossRollbackFailureText -join '; ')"
+                            $script:dataRestoreRollbackIncomplete = $true
                             Send-BRAVODataRestoreNotification `
                                 -Severity 'CRITICAL' `
                                 -ResultLines (@('Відкат раніше відновлених компонентів не завершився') + $crossRollbackFailureText) `
@@ -2760,7 +2862,25 @@ try {
     } finally {
         # Відновлення стану служб — гарантовано, навіть після необробленої
         # помилки: запускаються лише ті, що працювали на момент знімка.
-        if ($script:dataRestoreServicesStopped -and $null -ne $script:dataRestoreServiceSnapshot) {
+        #
+        # ВИНЯТОК: якщо rollback (поточного компонента або раніше
+        # завершених) не гарантовано довершився, live filesystem у
+        # невизначеному стані — каталог може бути відсутній або містити
+        # лише часткову extraction, а відновлювані дані лежать окремо в
+        # prerestore-копії. Запускати служби поверх цього не можна: BRAVO
+        # чи Exchange можуть ініціалізуватись/записати в цей каталог ДО
+        # того, як оператор виконає задокументоване ручне відновлення.
+        # Наразі немає надійного відображення компонент->служба, тому
+        # безпечніше лишити ВСІ служби зі знімка зупиненими, а не запускати
+        # частину.
+        if ($script:dataRestoreRollbackIncomplete) {
+            $script:flagRestoreFailed = $true
+            if ([string]::IsNullOrWhiteSpace([string]$script:dataRestoreAbortReason)) {
+                $script:dataRestoreAbortReason = 'відкат не гарантовано довершився — служби навмисно залишено зупиненими, потрібне ручне відновлення (OPERATIONS.md, код 43)'
+            }
+            Write-DataRestoreLog -Message 'Служби НАВМИСНО залишено зупиненими: відкат не гарантовано довершився, live filesystem у невизначеному стані. Потрібне ручне відновлення перед запуском служб.' -Level 'ERROR' -Console
+            Write-BRAVOOperationResult -Name 'Відновлення стану служб' -Status 'SKIPPED' -Details 'служби навмисно залишено зупиненими через незавершений rollback — ручне відновлення обов''язкове'
+        } elseif ($script:dataRestoreServicesStopped -and $null -ne $script:dataRestoreServiceSnapshot) {
             $restoreServicesStartedAt = Get-Date
             $startFailures = Restore-BRAVODataRestoreServices `
                 -Snapshot $script:dataRestoreServiceSnapshot `
