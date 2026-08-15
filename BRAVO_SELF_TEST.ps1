@@ -8003,7 +8003,8 @@ function Format-BRAVOFileSize {
             'Undo-BRAVODataRestoreMoveAside',
             'Undo-BRAVODataRestoreCompletedComponents',
             'Get-BRAVODataRestoreRollbackStatusUpdates',
-            'Format-BRAVODataRestoreRollbackFailureText'
+            'Format-BRAVODataRestoreRollbackFailureText',
+            'Invoke-BRAVODataRestoreTestFailPoint'
         )
 
     # --- 1. Path guards: некоректний шлях трактується як заборонений ---
@@ -8347,6 +8348,205 @@ function Format-BRAVOFileSize {
         if (Test-Path -LiteralPath $crossRollbackRoot) {
             Remove-Item -LiteralPath $crossRollbackRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+    }
+
+    # --- 6.1. B20 testability: deterministic cross-component rollback
+    # failpoint (Invoke-BRAVODataRestoreTestFailPoint). Ізольовано, без
+    # реального restore/Credential Manager/live E:\LIMS. Env-змінні
+    # (two-factor guard) очищаються в finally, щоб не протекти в подальші
+    # self-tests цього ж процесу. ---------------------------------------
+    function Reset-BRAVODataRestoreTestFailPointEnv {
+        Remove-Item -Path 'Env:\BRAVO_DATARESTORE_TEST_HOOKS' -ErrorAction SilentlyContinue
+        Remove-Item -Path 'Env:\BRAVO_DATARESTORE_TEST_FAILPOINT' -ErrorAction SilentlyContinue
+    }
+    try {
+        # Структурна перевірка: failpoint стоїть ПІСЛЯ підтвердженого
+        # move-aside SUCCESS і ДО Invoke-BRAVOSevenZipExtraction, всередині
+        # ТОГО САМОГО InPlace-блоку/try, що й реальне відновлення — без
+        # окремого test-only catch навколо самого виклику.
+        $moveAsideCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('Invoke-BRAVODataRestoreMoveAside `')
+        $moveAsidePerformedAssignIndex = $dataRestoreRuntimeTextForTests.IndexOf("`$moveAsidePerformed = [bool]`$moveAsideResult.Performed")
+        $failPointCallIndex = $dataRestoreRuntimeTextForTests.IndexOf("Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component `$componentType")
+        $extractionCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('Invoke-BRAVOSevenZipExtraction `')
+        # Немає окремого catch МІЖ MoveAside-блоком (де стоїть failpoint) і
+        # самим циклом: перевіряємо, що між присвоєнням moveAsidePerformed і
+        # викликом failpoint немає закриття try/відкриття нового catch —
+        # тобто вони лишаються в одному блоці.
+        $textBetweenAssignAndFailPoint = if ($moveAsidePerformedAssignIndex -ge 0 -and $failPointCallIndex -gt $moveAsidePerformedAssignIndex) {
+            $dataRestoreRuntimeTextForTests.Substring($moveAsidePerformedAssignIndex, $failPointCallIndex - $moveAsidePerformedAssignIndex)
+        } else { $null }
+        Test-BRAVOCondition `
+            -Condition (
+                $moveAsideCallIndex -ge 0 -and
+                $moveAsidePerformedAssignIndex -gt $moveAsideCallIndex -and
+                $failPointCallIndex -gt $moveAsidePerformedAssignIndex -and
+                $extractionCallIndex -gt $failPointCallIndex -and
+                $null -ne $textBetweenAssignAndFailPoint -and
+                -not $textBetweenAssignAndFailPoint.Contains('} catch {') -and
+                -not $textBetweenAssignAndFailPoint.Contains('} try {')
+            ) `
+            -Name "DataRestore/TestFailPointCalledAfterMoveAsideBeforeExtraction" `
+            -Failure "Invoke-BRAVODataRestoreTestFailPoint має викликатися СТРОГО між підтвердженим move-aside SUCCESS (`$moveAsidePerformed-присвоєнням) і Invoke-BRAVOSevenZipExtraction, у тому самому try/InPlace-блоці — без окремого test-only catch"
+
+        # A. guard відсутній, failpoint заданий -> NO THROW.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $threwA = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwA = $true }
+
+        # B. guard неправильний -> NO THROW.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'wrong'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $threwB = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwB = $true }
+
+        # C. guard валідний, failpoint відсутній -> NO THROW.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $threwC = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwC = $true }
+
+        # D. malformed failpoint (без ':') -> NO THROW.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAsideBAZA'
+        $threwD = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwD = $true }
+
+        # E. point mismatch -> NO THROW.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+        $threwE = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'BeforeExtraction' -Component 'BAZA' }) } catch { $threwE = $true }
+
+        # F. component mismatch -> NO THROW.
+        $threwF = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'MODEL' }) } catch { $threwF = $true }
+
+        # G. точний (case-insensitive) збіг -> THROW із синтетичним маркером,
+        # без реального шляху/пароля/webhook/секрету в тексті винятку.
+        $threwG = $false
+        $exceptionMessageG = $null
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch {
+            $threwG = $true
+            $exceptionMessageG = [string]$_.Exception.Message
+        }
+
+        # H. wildcard відхиляється (не exact match) -> NO THROW.
+        Reset-BRAVODataRestoreTestFailPointEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:*'
+        $threwH = $false
+        try { [void](& $dataRestoreModule { Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA' }) } catch { $threwH = $true }
+
+        Test-BRAVOCondition `
+            -Condition (-not $threwA -and -not $threwB -and -not $threwC -and -not $threwD -and -not $threwE -and -not $threwF -and -not $threwH) `
+            -Name "DataRestore/TestFailPointFailClosedOnGuardOrFormatMismatch" `
+            -Failure "Invoke-BRAVODataRestoreTestFailPoint має лишатися no-op (без throw), якщо: guard відсутній (A), guard неправильний (B), failpoint відсутній при валідному guard (C), формат некоректний (D), Point не збігається (E), Component не збігається (F), або задано wildcard замість точного значення (H) — жодна з цих ситуацій не повинна активувати injection"
+        Test-BRAVOCondition `
+            -Condition (
+                $threwG -and
+                $exceptionMessageG.Contains('BRAVO_DATARESTORE_TEST_FAILPOINT') -and
+                -not ($exceptionMessageG -match 'E:\\|\\LIMS|password|pwd|secret|token|https?://')
+            ) `
+            -Name "DataRestore/TestFailPointThrowsOnExactMatch" `
+            -Failure "при ТОЧНОМУ (case-insensitive) збігу Point+Component з двома валідними guard-змінними Invoke-BRAVODataRestoreTestFailPoint має кинути виняток із синтетичним маркером BRAVO_DATARESTORE_TEST_FAILPOINT, без жодного реального шляху/секрету в тексті"
+
+        # --- Поведінковий тест: production-подібна послідовність
+        # MoveAside:A -> MoveAside:B -> FailPoint:B(throw) -> ІСНУЮЧИЙ catch
+        # -> Rollback:B (Undo-BRAVODataRestoreMoveAside) -> completed A існує
+        # -> Rollback:Completed A (Undo-BRAVODataRestoreCompletedComponents).
+        # Використовує РЕАЛЬНІ production-функції (той самий $dataRestoreModule,
+        # що й вище) на тимчасових каталогах — не копіює/не дублює алгоритм.
+        $sequenceRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_FAILPOINT_SEQ_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            [void][IO.Directory]::CreateDirectory($sequenceRoot)
+            $liveSeqA = Join-Path $sequenceRoot 'MODEL'
+            $prerestoreSeqA = Join-Path $sequenceRoot 'MODEL.prerestore_20260815_000000'
+            $liveSeqB = Join-Path $sequenceRoot 'BAZA'
+            $prerestoreSeqB = Join-Path $sequenceRoot 'BAZA.prerestore_20260815_000000'
+
+            Reset-BRAVODataRestoreTestFailPointEnv
+            $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+            $env:BRAVO_DATARESTORE_TEST_FAILPOINT = 'AfterMoveAside:BAZA'
+
+            $sequenceResult = & $dataRestoreModule {
+                param($liveA, $prerestoreA, $liveB, $prerestoreB)
+
+                $sequenceLog = New-Object System.Collections.Generic.List[string]
+                $completedInPlaceComponents = New-Object System.Collections.Generic.List[object]
+
+                # --- Component A: move-aside реальний, успішний (real fixture,
+                # не production-loop, лише прямий виклик реальної функції) ---
+                [void][IO.Directory]::CreateDirectory($liveA)
+                [IO.File]::WriteAllText((Join-Path $liveA 'original.txt'), 'old-model')
+                [IO.Directory]::Move($liveA, $prerestoreA)
+                [void][IO.Directory]::CreateDirectory($liveA)
+                [IO.File]::WriteAllText((Join-Path $liveA 'restored.txt'), 'new-model')
+                $sequenceLog.Add('MoveAside:A')
+                $completedInPlaceComponents.Add([pscustomobject]@{
+                    Type = 'MODEL'; LiveDirectory = $liveA; PrerestoreDirectory = $prerestoreA; MoveAsidePerformed = $true
+                })
+
+                # --- Component B: move-aside реальний, успішний, ПОТІМ
+                # ТОЙ САМИЙ виклик failpoint, що й у production-циклі ---
+                [void][IO.Directory]::CreateDirectory($liveB)
+                [IO.File]::WriteAllText((Join-Path $liveB 'original.txt'), 'old-baza')
+                [IO.Directory]::Move($liveB, $prerestoreB)
+                [void][IO.Directory]::CreateDirectory($liveB)
+                [IO.File]::WriteAllText((Join-Path $liveB 'restored.txt'), 'new-baza')
+                $sequenceLog.Add('MoveAside:B')
+
+                $caughtHere = $false
+                try {
+                    Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component 'BAZA'
+                    $sequenceLog.Add('Extraction:B (НЕ МАЄ ВІДБУТИСЯ)')
+                } catch {
+                    # ТОЙ САМИЙ catch, що в production: спершу rollback
+                    # поточного компонента B, потім — уже завершених (A).
+                    $sequenceLog.Add('FailPoint:B')
+                    $rollbackB = Undo-BRAVODataRestoreMoveAside `
+                        -LiveDirectory $liveB -PrerestoreDirectory $prerestoreB -MoveAsidePerformed $true
+                    if ($rollbackB.Success) { $sequenceLog.Add('Rollback:B') }
+                    if ($completedInPlaceComponents.Count -gt 0) {
+                        $crossRollback = Undo-BRAVODataRestoreCompletedComponents `
+                            -CompletedComponents @($completedInPlaceComponents.ToArray())
+                        if (@($crossRollback.RolledBack) -contains 'MODEL') { $sequenceLog.Add('RollbackCompleted:A') }
+                    }
+                    $caughtHere = $true
+                }
+
+                [pscustomobject]@{
+                    CaughtHere = $caughtHere
+                    Sequence = $sequenceLog.ToArray()
+                    LiveAHasOriginal = (Test-Path -LiteralPath (Join-Path $liveA 'original.txt'))
+                    LiveAHasRestored = (Test-Path -LiteralPath (Join-Path $liveA 'restored.txt'))
+                    LiveBHasOriginal = (Test-Path -LiteralPath (Join-Path $liveB 'original.txt'))
+                    LiveBHasRestored = (Test-Path -LiteralPath (Join-Path $liveB 'restored.txt'))
+                    PrerestoreAGone = -not (Test-Path -LiteralPath $prerestoreA)
+                    PrerestoreBGone = -not (Test-Path -LiteralPath $prerestoreB)
+                }
+            } $liveSeqA $prerestoreSeqA $liveSeqB $prerestoreSeqB
+
+            Test-BRAVOCondition `
+                -Condition (
+                    $sequenceResult.CaughtHere -and
+                    (($sequenceResult.Sequence) -join ',') -eq 'MoveAside:A,MoveAside:B,FailPoint:B,Rollback:B,RollbackCompleted:A' -and
+                    $sequenceResult.LiveAHasOriginal -and -not $sequenceResult.LiveAHasRestored -and
+                    $sequenceResult.LiveBHasOriginal -and -not $sequenceResult.LiveBHasRestored -and
+                    $sequenceResult.PrerestoreAGone -and $sequenceResult.PrerestoreBGone
+                ) `
+                -Name "DataRestore/TestFailPointFlowsIntoExistingCrossComponentRollback" `
+                -Failure "Injected failpoint після move-aside компонента B має потрапляти в ІСНУЮЧИЙ production catch (без окремого test-only rollback шляху): спершу rollback поточного B, потім rollback уже завершеного A (реальні Undo-BRAVODataRestoreMoveAside/Undo-BRAVODataRestoreCompletedComponents) — обидва компоненти мають повернутися РІВНО до pre-run стану"
+        } finally {
+            if (Test-Path -LiteralPath $sequenceRoot) {
+                Remove-Item -LiteralPath $sequenceRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } finally {
+        Reset-BRAVODataRestoreTestFailPointEnv
     }
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний

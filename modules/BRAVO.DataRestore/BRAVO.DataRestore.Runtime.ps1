@@ -226,6 +226,61 @@ function Write-DataRestoreLog {
     Write-BRAVOLog -Message $Message -Level $Level -Component 'DATARESTORE' -Console:$Console
 }
 
+# Test-only deterministic failpoint для acceptance-тестів cross-component
+# rollback (B20 і подібні). НЕ CLI-параметр, НЕ config-ключ, НЕ
+# документована production-функція — активується виключно двома явними
+# process environment variables, обидва мають точно збігтися. За
+# відсутності/некоректності будь-якого з двох факторів — no-op, БЕЗ жодного
+# side effect (файлова система/служби/мережа/config не торкаються).
+#
+# TWO-FACTOR guard (жодна змінна сама по собі недостатня):
+#   BRAVO_DATARESTORE_TEST_HOOKS     — має дорівнювати РІВНО "ACCEPTANCE_ONLY"
+#                                       (case-sensitive sentinel).
+#   BRAVO_DATARESTORE_TEST_FAILPOINT — canonical форма "Point:Component",
+#                                       напр. "AfterMoveAside:BAZA".
+#
+# Порівняння Point/Component — точна case-insensitive рівність (жодних
+# wildcard/regex/substring/"All"). Викликається виключно з існуючого
+# production pipeline у точці, де реальна помилка мала б статися
+# природно — throw тут не створює окремого test-only rollback шляху:
+# виняток летить у той самий catch, що обробляє й реальні відмови.
+function Invoke-BRAVODataRestoreTestFailPoint {
+    param(
+        [Parameter(Mandatory = $true)][string]$Point,
+        [Parameter(Mandatory = $true)][string]$Component
+    )
+
+    $hooksGuard = [string]$env:BRAVO_DATARESTORE_TEST_HOOKS
+    if (-not [string]::Equals($hooksGuard, 'ACCEPTANCE_ONLY', [StringComparison]::Ordinal)) {
+        return
+    }
+
+    $failPointRaw = [string]$env:BRAVO_DATARESTORE_TEST_FAILPOINT
+    if ([string]::IsNullOrWhiteSpace($failPointRaw)) {
+        return
+    }
+
+    $failPointParts = $failPointRaw -split ':', 2
+    if ($failPointParts.Count -ne 2) {
+        return
+    }
+
+    $configuredPoint = $failPointParts[0].Trim()
+    $configuredComponent = $failPointParts[1].Trim()
+    if ([string]::IsNullOrWhiteSpace($configuredPoint) -or [string]::IsNullOrWhiteSpace($configuredComponent)) {
+        return
+    }
+
+    if (-not [string]::Equals($configuredPoint, $Point, [StringComparison]::OrdinalIgnoreCase)) {
+        return
+    }
+    if (-not [string]::Equals($configuredComponent, $Component, [StringComparison]::OrdinalIgnoreCase)) {
+        return
+    }
+
+    throw "BRAVO_DATARESTORE_TEST_FAILPOINT: deterministic test-injected failure at $configuredPoint for component $configuredComponent"
+}
+
 # Контрольоване переривання пайплайна: виставляє категорію для контракту
 # кодів завершення й кидає виняток, який головний catch розпізнає як
 # заплановану зупинку (не InternalError). Використовується ПІСЛЯ захоплення
@@ -2440,6 +2495,12 @@ try {
                         throw $moveAsideResult.Error
                     }
                     $moveAsidePerformed = [bool]$moveAsideResult.Performed
+                    # Test-only deterministic failpoint (B20 acceptance):
+                    # ПІСЛЯ підтвердженого move-aside SUCCESS (компонент уже
+                    # мутований), ДО створення цільового каталогу й
+                    # extraction. No-op у будь-якому production/normal
+                    # test-запуску — див. Invoke-BRAVODataRestoreTestFailPoint.
+                    Invoke-BRAVODataRestoreTestFailPoint -Point 'AfterMoveAside' -Component $componentType
                 }
                 # Свіжий порожній каталог цілі — нічого не перезаписується
                 # за конструкцією.
