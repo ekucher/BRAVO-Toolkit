@@ -231,7 +231,7 @@ $global:pathSettings = @{
 
 | Секція | Що перевірити |
 |---|---|
-| `bravoSettings` | `NotificationProvider` (`slack` або `discord`) і `NotificationMode` |
+| `bravoSettings` | `NotificationProvider` (`slack` або `discord`), `NotificationMode` і `NotificationRouting` (severity → GENERAL/ALERTS, розділ 4) |
 | `pathSettings` | `LIMSRoot`/`SystemLogRoot`/`BackupRoot` — усі три `""`=AUTO (розділ 2); `ArchiveRoot` більше немає |
 | `maintenanceSettings` | імена служб, каталог Br-a-vo.web, таймаути, `Retention.ArchiveDays` / `Retention.CompressedLogDays` (розділ 12) |
 | `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати |
@@ -382,12 +382,46 @@ backup — лише пише `WARNING` у журнал (`Write-Log`) і підн
 | `BRAVO_SFTP_PASSWORD` | пароль SFTP |
 | `BRAVO_SMB_LOGIN` | логін SMB/NAS |
 | `BRAVO_SMB_PASSWORD` | пароль SMB/NAS |
-| `BRAVO_SLACK_URL` | Slack webhook |
-| `BRAVO_DISCORD_URL` | Discord webhook |
+| `BRAVO_SLACK_URL` | Slack webhook (legacy, спільний для GENERAL і ALERTS) |
+| `BRAVO_DISCORD_URL` | Discord webhook (legacy, спільний для GENERAL і ALERTS) |
+| `BRAVO_SLACK_GENERAL_URL` | Slack webhook — лише штатні (SUCCESS) сповіщення |
+| `BRAVO_SLACK_ALERTS_URL` | Slack webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
+| `BRAVO_DISCORD_GENERAL_URL` | Discord webhook — лише штатні (SUCCESS) сповіщення |
+| `BRAVO_DISCORD_ALERTS_URL` | Discord webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
 
 Значення `InstitutionName`, `InstitutionCode` і `ArchivePrefix` у
 `BRAVO.config` — лише fallback для першого запуску. Після налаштування
 використовуються записи Credential Manager.
+
+### Маршрутизація сповіщень (GENERAL/ALERTS)
+
+`BRAVO.Notifications` централізовано маршрутизує сповіщення за severity у два
+канали:
+
+| Severity | Канал |
+|---|---|
+| `SUCCESS` | GENERAL |
+| `WARNING` / `ERROR` / `CRITICAL` | ALERTS |
+
+Маршрутизація за `NotificationMode` (`bravoSettings.NotificationMode`
+у `BRAVO.config`):
+
+| Mode | SUCCESS | WARNING/ERROR/CRITICAL |
+|---|---|---|
+| `none` | не надсилається | не надсилається |
+| `errors_only` | не надсилається | ALERTS |
+| `all` | GENERAL | ALERTS |
+
+Таблицю severity → канал можна перевизначити через
+`bravoSettings.NotificationRouting` у `BRAVO.config` (безпечний дефолт вище
+застосовується автоматично, якщо ключ відсутній — стара конфігурація без
+`NotificationRouting` лишається валідною).
+
+**Backward compatibility**: якщо `BRAVO_*_GENERAL_URL`/`BRAVO_*_ALERTS_URL` не
+налаштовані в Credential Manager, обидва канали автоматично використовують
+legacy `BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL`. Оновлення не вимагає негайного
+переналаштування вже працюючих серверів — вони продовжують отримувати всі
+сповіщення через один legacy webhook, як і раніше.
 
 `ArchivePrefix` може містити латинські літери, цифри, `.`, `_` і `-`. Після
 зміни префікса старі архіви не видаляються, але новий health-check і retention
