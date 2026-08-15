@@ -2990,7 +2990,7 @@ try {
         # яка звертається до Credential Manager; тут вона навмисно
         # заглушена (ізольований тест, без реального Get-BRAVOCredentialSecret).
         function Resolve-BRAVONotificationEndpoint {
-            param([string]$Provider, [string]$Route, $CredentialTargets)
+            param([string]$Provider, [string]$Route, [hashtable]$CredentialTargets)
             return 'https://example.invalid/webhook'
         }
         function New-BRAVOOperatorNotificationMessage {
