@@ -702,25 +702,38 @@ function Enter-BRAVODataRestoreOperationLock {
         if ($null -eq $stream) {
             throw "lock не звільнився за $waitMinutes хв.: $lastLockError"
         }
-        $lockProcessStartTime = try {
-            (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToString("o")
+        # Від цього моменту $stream належить ЦІЙ функції, доки метадані не
+        # записано успішно — власність переходить до викликача лише разом
+        # з успішним return нижче. Якщо SetLength/Write/Flush провалиться
+        # (напр. диск заповнено), відкритий handle МУСИТЬ бути звільнений
+        # тут-таки: зовнішній catch знає лише повернути Success=false і не
+        # має посилання на $stream, інакше machine-wide lock лишився б
+        # захопленим до непередбачуваного GC і блокував би подальші
+        # Archive/Maintenance/restore-прогони.
+        try {
+            $lockProcessStartTime = try {
+                (Get-Process -Id $PID -ErrorAction Stop).StartTime.ToString("o")
+            } catch {
+                $null
+            }
+            $lockText = ([pscustomobject]@{
+                pid = $PID
+                processStartTime = $lockProcessStartTime
+                hostname = [Environment]::MachineName
+                operation = "DataRestore"
+                startedAt = (Get-Date).ToString("o")
+                packageVersion = [string]$script:ScriptVersion
+                config = $ConfigPath
+                generationId = $null
+            } | ConvertTo-Json -Compress)
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
+            $stream.SetLength(0)
+            $stream.Write($bytes, 0, $bytes.Length)
+            $stream.Flush()
         } catch {
-            $null
+            $stream.Dispose()
+            throw
         }
-        $lockText = ([pscustomobject]@{
-            pid = $PID
-            processStartTime = $lockProcessStartTime
-            hostname = [Environment]::MachineName
-            operation = "DataRestore"
-            startedAt = (Get-Date).ToString("o")
-            packageVersion = [string]$script:ScriptVersion
-            config = $ConfigPath
-            generationId = $null
-        } | ConvertTo-Json -Compress)
-        $bytes = [System.Text.Encoding]::UTF8.GetBytes($lockText)
-        $stream.SetLength(0)
-        $stream.Write($bytes, 0, $bytes.Length)
-        $stream.Flush()
         return [pscustomobject]@{
             Success = $true
             Stream = $stream
@@ -801,8 +814,27 @@ function Get-BRAVODataRestoreGenerationCandidates {
                 $componentSummaries += ("{0}:{1}" -f $componentProperty.Name, $summary)
             }
         }
+        # Ім'я файлу vs generationId у ЗМІСТІ manifest-а — той самий
+        # identity-контракт, що вже застосовується при виборі generation
+        # (Get-BRAVORestoreGenerationManifest) і в SFTP-перегляді
+        # (нижче за файлом): без цієї перевірки BRAVO_BACKUP_A.json з
+        # JSON generationId=B показувався б як звичайний кандидат B, хоча
+        # точний вибір -GenerationId B шукає САМЕ BRAVO_BACKUP_B.json і
+        # не знайде його. Канонічний парсер імені файлу — спільний з
+        # BRAVO.ArchiveHelpers (Get-BRAVOBackupManifestFilenameGenerationId),
+        # а не окрема regex-копія в DataRestore.
+        $filenameGenerationId = Get-BRAVOBackupManifestFilenameGenerationId -FileName $manifestFile.Name
+        $jsonGenerationId = [string]$manifest.generationId
+        $identityMismatch = [string]::IsNullOrWhiteSpace($filenameGenerationId) -or
+            -not [string]::Equals($filenameGenerationId, $jsonGenerationId, [StringComparison]::Ordinal)
+        $displayGenerationId = if ($identityMismatch) {
+            $filenameLabel = if ([string]::IsNullOrWhiteSpace($filenameGenerationId)) { $manifestFile.Name } else { $filenameGenerationId }
+            "$jsonGenerationId  (НЕЗБІЖНІСТЬ generationId: файл='$filenameLabel' JSON='$jsonGenerationId')"
+        } else {
+            $jsonGenerationId
+        }
         $candidates += [pscustomobject]@{
-            GenerationId = [string]$manifest.generationId
+            GenerationId = $displayGenerationId
             Status = [string]$manifest.status
             CreatedAt = $createdAt
             ComponentSummary = ($componentSummaries -join '  ')
@@ -1037,6 +1069,27 @@ function Get-BRAVODataRestorePlan {
     # однозначно визначене — мовчазний fallback заборонений проєктом.
     if (-not [string]::IsNullOrWhiteSpace($RequestedTargetPath)) {
         return [pscustomobject]@{ Success = $false; Error = 'для режиму InPlace параметр -TargetPath заборонений: ціль визначає discovery (bravo.ini)'; TargetRoot = $null; Components = @() }
+    }
+    # Лексичні Test-BRAVODataRestorePathEquals/-PathWithin нижче (і
+    # intersection-перевірка після цього циклу) не бачать junction/symlink-
+    # аліасів. КОЖНЕ discovered live-джерело (не лише обране цим прогоном)
+    # бере участь як межа безпеки в подальших перевірках — reparse-аліас на
+    # будь-якому з них (обраному чи ні) міг би дати move-aside обраного
+    # компонента фізично влучити в інший захищений каталог, лишаючись
+    # лексично "непересічним" (напр. D:\LIMS_LINK\MODEL, де D:\LIMS_LINK —
+    # junction на НЕобраний BLOG). Перевірка виконується ДО побудови
+    # PrerestoreDirectory/TargetDirectory нижче.
+    foreach ($liveSourceType in @($liveSources.Keys)) {
+        $liveSourcePathForReparseCheck = [string]$liveSources[$liveSourceType]
+        if ([string]::IsNullOrWhiteSpace($liveSourcePathForReparseCheck)) { continue }
+        if (Test-BRAVODataRestorePathHasReparseAncestor -Path $liveSourcePathForReparseCheck) {
+            return [pscustomobject]@{
+                Success = $false
+                Error = "live-джерело $liveSourceType ($liveSourcePathForReparseCheck) (або його наявний предок) є reparse-точкою (junction/symlink) — фізична ціль не може бути надійно перевірена: InPlace неможливий"
+                TargetRoot = $null
+                Components = @()
+            }
+        }
     }
     foreach ($componentType in $ComponentTypes) {
         $liveSource = [string]$liveSources[$componentType]
@@ -1518,26 +1571,32 @@ function Stop-BRAVODataRestoreServices {
     $failures = @()
     foreach ($entry in $Snapshot) {
         if (-not $entry.Managed) { continue }
-        # Обов'язок ЗУПИНКИ переоцінюється за ПОТОЧНИМ станом служби, а не
-        # за WasRunning знімка: WasRunning визначає лише намір ЗАПУСКУ
-        # ПІСЛЯ відновлення (Restore-BRAVODataRestoreServices нижче), тоді
-        # як службу, що на знімку була Stopped/StartPending, але встигла чи
-        # встигає перейти у Running до цього виклику (гонитва зі знімком),
-        # усе одно потрібно зупинити — інакше вона могла б читати/писати у
-        # дерево під час move-aside/розпакування. Get-Service тут — новий
-        # запит, не кеш зі знімка.
-        $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
-        if ($null -eq $currentService) { continue }
-        $currentService.Refresh()
-        if ([string]$currentService.Status -eq 'Stopped') { continue }
+        # KillProcesses тепер перевіряються ЗАВЖДИ, незалежно від того, чи
+        # Windows-служба вже Stopped: orphan/вручну запущений процес (напр.
+        # Bis.exe) може тримати MODEL/файлові handle-и незалежно від служби
+        # — "служба вже Stopped" нічого не каже про такий процес.
         foreach ($processName in @($entry.KillProcesses)) {
             $lingeringProcess = Get-Process -Name $processName -ErrorAction SilentlyContinue
             if ($lingeringProcess) {
-                Write-DataRestoreLog -Message "Завершення процесу $processName перед зупинкою $($entry.Name)..." -Level 'INFO'
+                Write-DataRestoreLog -Message "Завершення процесу $processName ($($entry.Name))..." -Level 'INFO'
                 $lingeringProcess | Stop-Process -Force
                 Start-Sleep -Seconds 1
             }
         }
+        # Обов'язок ЗУПИНКИ служби переоцінюється за ПОТОЧНИМ станом (запит
+        # ПІСЛЯ спроби завершення процесів — термінація процесу могла
+        # змінити стан пов'язаної служби), а не за WasRunning знімка:
+        # WasRunning визначає лише намір ЗАПУСКУ ПІСЛЯ відновлення
+        # (Restore-BRAVODataRestoreServices нижче), тоді як службу, що на
+        # знімку була Stopped/StartPending, але встигла чи встигає перейти
+        # у Running до цього виклику (гонитва зі знімком), усе одно
+        # потрібно зупинити — інакше вона могла б читати/писати у дерево
+        # під час move-aside/розпакування. Get-Service тут — новий запит,
+        # не кеш зі знімка.
+        $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
+        if ($null -eq $currentService) { continue }
+        $currentService.Refresh()
+        if ([string]$currentService.Status -eq 'Stopped') { continue }
         Write-DataRestoreLog -Message "Зупинка служби $($entry.Name)..." -Level 'INFO'
         $stopResult = Invoke-BRAVODataRestoreServiceStateChange `
             -Name $entry.Name `
@@ -1556,28 +1615,61 @@ function Stop-BRAVODataRestoreServices {
 }
 
 function Test-BRAVODataRestoreServicesAllStopped {
-    # Фінальний бар'єр БЕЗПОСЕРЕДНЬО перед першою деструктивною дією
-    # (move-aside): Stop-BRAVODataRestoreServices вище вже зупинила й
-    # дочекалась Stopped для кожної керованої служби, але між її return і
-    # цим викликом лишається вузьке вікно, у якому служба теоретично могла
-    # перейти назад у нестабільний стан. Це НЕ спроба зупинки — лише
-    # re-query поточного стану кожної керованої служби безпосередньо перед
-    # мутацією filesystem; будь-який стан, відмінний від Stopped (Running,
-    # StartPending, StopPending, Paused тощо), — привід перервати прогін ДО
-    # move-aside/extraction.
+    # Фінальний бар'єр БЕЗПОСЕРЕДНЬО перед деструктивною дією (move-aside):
+    # Stop-BRAVODataRestoreServices вище вже зупинила й дочекалась Stopped
+    # для кожної керованої служби та завершила configured KillProcesses,
+    # але між її return і цим викликом лишається вузьке вікно, у якому
+    # служба теоретично могла перейти назад у нестабільний стан, а процес —
+    # перезапуститись. Це НЕ спроба зупинки — лише re-query ОБОХ умов тиші
+    # безпосередньо перед мутацією filesystem: (1) кожна керована служба —
+    # Stopped (будь-який інший стан: Running, StartPending, StopPending,
+    # Paused тощо — привід перервати прогін); (2) жоден configured
+    # KillProcesses-процес не активний (перевіряється незалежно від стану
+    # пов'язаної служби — орфан-процес не зникає разом зі "Stopped").
     param([Parameter(Mandatory = $true)][object[]]$Snapshot)
 
     $unsafeEntries = @()
     foreach ($entry in $Snapshot) {
         if (-not $entry.Managed) { continue }
         $currentService = Get-Service -Name $entry.Name -ErrorAction SilentlyContinue
-        if ($null -eq $currentService) { continue }
-        $currentService.Refresh()
-        if ([string]$currentService.Status -ne 'Stopped') {
-            $unsafeEntries += "$($entry.Name) (поточний стан: $($currentService.Status))"
+        if ($null -ne $currentService) {
+            $currentService.Refresh()
+            if ([string]$currentService.Status -ne 'Stopped') {
+                $unsafeEntries += "$($entry.Name) (поточний стан: $($currentService.Status))"
+            }
+        }
+        foreach ($processName in @($entry.KillProcesses)) {
+            if (Get-Process -Name $processName -ErrorAction SilentlyContinue) {
+                $unsafeEntries += "процес $processName (пов'язаний із $($entry.Name)) усе ще активний"
+            }
         }
     }
     return @($unsafeEntries)
+}
+
+function Invoke-BRAVODataRestoreQuiescence {
+    # Єдина точка примусової тиші: re-stop будь-якої керованої служби, що
+    # наразі не Stopped, термінація configured KillProcesses (незалежно від
+    # стану служби), і фінальна re-query перевірка ОБОХ умов
+    # (Test-BRAVODataRestoreServicesAllStopped). Викликається ОДИН РАЗ
+    # перед підтвердженням InPlace, і ПОВТОРНО безпосередньо перед КОЖНИМ
+    # деструктивним component-переходом (move-aside) у циклі нижче: MODEL
+    # extraction може тривати довго, і watchdog/оператор/інший контролер
+    # може перезапустити службу чи запустити процес між компонентами —
+    # інваріант "усе тихо" мусить бути re-встановлений, а не перевірений
+    # лише один раз на початку транзакції.
+    param(
+        [Parameter(Mandatory = $true)][object[]]$Snapshot,
+        [Parameter(Mandatory = $true)][int]$StopTimeoutSeconds,
+        [Parameter(Mandatory = $true)][int]$PollIntervalSeconds
+    )
+
+    $stopFailures = @(Stop-BRAVODataRestoreServices `
+        -Snapshot $Snapshot `
+        -StopTimeoutSeconds $StopTimeoutSeconds `
+        -PollIntervalSeconds $PollIntervalSeconds)
+    $barrierFailures = @(Test-BRAVODataRestoreServicesAllStopped -Snapshot $Snapshot)
+    return @($stopFailures + $barrierFailures)
 }
 
 function Restore-BRAVODataRestoreServices {
@@ -2647,6 +2739,23 @@ if (@($toolIntegrity.Problems).Count -gt 0) {
     $script:dataRestoreWarningCount++
 }
 
+# Canonical restore-target каталоги (незалежні від фізичної наявності) —
+# той самий bravoDiscoveryResult, що вже формує ArchiveDefinitions.Source,
+# але без existence-якісного фільтра BRAVOEXCH (BRAVO.config): для InPlace
+# саме відсутній production-каталог і є типовим disaster-restore
+# сценарієм. Обчислено РАНО (до режиму перегляду й staging-preflight
+# нижче, і до кроку 3 основного pipeline), щоб УСІ місця — включно з
+# read-only -ListGenerations -Source SFTP — бачили той самий набір
+# live-джерел без повторного виведення.
+$restoreTargetDirectories = @{
+    MODEL = [string]$global:bravoDiscoveryResult.MODEL_SOURCE
+    BLOG = [string]$global:bravoDiscoveryResult.BLOG_SOURCE
+    BRAVOEXCH = [string]$global:bravoDiscoveryResult.BRAVOEXCH_SOURCE
+}
+$dataRestoreStagingLiveSources = Get-BRAVODataRestoreLiveSourceMap `
+    -ArchiveDefinitions @($global:archiveDefinitions) `
+    -RestoreTargetDirectories $restoreTargetDirectories
+
 # ===== РЕЖИМ ПЕРЕГЛЯДУ =====
 if ($ListGenerations) {
     if ($Source -eq 'Local') {
@@ -2677,6 +2786,20 @@ if ($ListGenerations) {
     } catch {
         Write-Host "ПОМИЛКА: $($_.Exception.Message)" -ForegroundColor Red
         exit 31
+    }
+    # Той самий staging-preflight, що захищає нормальний SFTP restore-потік
+    # нижче за pipeline — без нього read-only "-ListGenerations -Source
+    # SFTP" міг би все одно писати/рекурсивно очищати "_list_<guid>"
+    # всередині live MODEL/BLOG/BRAVOEXCH чи RuntimeRoot ще ДО будь-якої
+    # перевірки шляхів.
+    $listStagingSafety = Test-BRAVODataRestoreStagingSafe `
+        -StagingRoot $stagingRootPath `
+        -RuntimeRootPath $bravoScriptDirectory `
+        -LiveSources $dataRestoreStagingLiveSources
+    if (-not $listStagingSafety.Success) {
+        Write-Host "ПОМИЛКА: $($listStagingSafety.Error)" -ForegroundColor Red
+        Write-DataRestoreLog -Message "Staging preflight (ListGenerations): $($listStagingSafety.Error)" -Level 'ERROR'
+        exit 30
     }
     $listStagingDirectory = Join-Path $stagingRootPath ("_list_{0}" -f ([guid]::NewGuid().ToString('N')))
     try {
@@ -2798,30 +2921,16 @@ if ($Source -eq 'SFTP' -and
     exit 30
 }
 
-# Canonical restore-target каталоги (незалежні від фізичної наявності) —
-# той самий bravoDiscoveryResult, що вже формує ArchiveDefinitions.Source,
-# але без existence-якісного фільтра BRAVOEXCH (BRAVO.config): для InPlace
-# саме відсутній production-каталог і є типовим disaster-restore
-# сценарієм. Обчислено РАНО (до staging-preflight нижче й до кроку 3
-# основного pipeline), щоб обидва місця бачили той самий набір
-# live-джерел.
-$restoreTargetDirectories = @{
-    MODEL = [string]$global:bravoDiscoveryResult.MODEL_SOURCE
-    BLOG = [string]$global:bravoDiscoveryResult.BLOG_SOURCE
-    BRAVOEXCH = [string]$global:bravoDiscoveryResult.BRAVOEXCH_SOURCE
-}
-
 # Staging-preflight МУСИТЬ пройти ДО будь-якого SFTP filesystem-запису
 # (нижче за pipeline: вибір generation для Source=SFTP створює
 # _manifests і завантажує через WinSCP ДО того, як Get-BRAVODataRestorePlan
 # взагалі перевіряє шляхи). Без цієї перевірки зловмисний/помилковий
 # -StagingPath, що перетинається з live MODEL/BLOG/BRAVOEXCH, дав би змогу
 # запис/подальше рекурсивне очищення staging знищити production-дані ще до
-# першої перевірки плану.
+# першої перевірки плану. ($dataRestoreStagingLiveSources обчислено раніше
+# — той самий live-source map, що вже перевірив -ListGenerations -Source
+# SFTP вище.)
 if ($Source -eq 'SFTP') {
-    $dataRestoreStagingLiveSources = Get-BRAVODataRestoreLiveSourceMap `
-        -ArchiveDefinitions @($global:archiveDefinitions) `
-        -RestoreTargetDirectories $restoreTargetDirectories
     $stagingSafety = Test-BRAVODataRestoreStagingSafe `
         -StagingRoot $stagingRootPath `
         -RuntimeRootPath $bravoScriptDirectory `
@@ -3159,30 +3268,24 @@ try {
                 Stop-BRAVODataRestoreRun -Category InvalidConfiguration -Reason 'підтвердження оператора не отримано — відновлення скасовано, жодних змін не виконано'
             }
 
-            # Зупинка служб.
+            # Зупинка служб + процесів (Invoke-BRAVODataRestoreQuiescence:
+            # зупинка/термінація + фінальний бар'єр в одному виклику — той
+            # самий композит повторно викликається перед КОЖНИМ компонентом
+            # у циклі нижче).
             $stageStartedAt = Get-Date
             $script:dataRestoreServicesStopped = $true
-            $stopFailures = Stop-BRAVODataRestoreServices `
+            $quiescenceFailures = Invoke-BRAVODataRestoreQuiescence `
                 -Snapshot $script:dataRestoreServiceSnapshot `
                 -StopTimeoutSeconds $serviceStopTimeoutSeconds `
                 -PollIntervalSeconds $servicePollIntervalSeconds
-            if (@($stopFailures).Count -gt 0) {
+            if (@($quiescenceFailures).Count -gt 0) {
                 Write-BRAVOOperationResult -Name 'Зупинка служб' -Status 'FAIL' -Duration ((Get-Date) - $stageStartedAt)
-                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ($stopFailures -join '; ')
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ($quiescenceFailures -join '; ')
             }
             Write-BRAVOOperationResult `
                 -Name 'Зупинка служб' `
                 -Status $(if ($servicesToStop.Count -gt 0) { 'OK' } else { 'SKIPPED' }) `
                 -Duration ((Get-Date) - $stageStartedAt)
-
-            # Фінальний бар'єр: re-query ПОТОЧНОГО стану кожної керованої
-            # служби безпосередньо перед move-aside (перша деструктивна
-            # дія). Stop-BRAVODataRestoreServices вище вже дочекалась
-            # Stopped, але залишає вузьке вікно між return і цим місцем.
-            $finalStopBarrier = Test-BRAVODataRestoreServicesAllStopped -Snapshot $script:dataRestoreServiceSnapshot
-            if (@($finalStopBarrier).Count -gt 0) {
-                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason ("служби не в стані Stopped безпосередньо перед відновленням: " + ($finalStopBarrier -join '; '))
-            }
         }
 
         # --- 9. Відновлення по компонентах (fail-fast) ---
@@ -3192,7 +3295,21 @@ try {
         $completedInPlaceComponents = New-Object System.Collections.ArrayList
         $createdTargetRoot = $false
         if ($Mode -eq 'OutOfPlace' -and -not (Test-Path -LiteralPath $restorePlan.TargetRoot -PathType Container)) {
-            [void](New-Item -ItemType Directory -Path $restorePlan.TargetRoot -Force -ErrorAction Stop)
+            # БЕЗ -Force: якщо TargetRoot з'явився паралельно (інший
+            # процес/оператор) у вузькому вікні між Test-Path вище і цим
+            # викликом, New-Item провалюється замість мовчазного прийняття
+            # наявного каталогу як "щойно створеного цим прогоном" — з
+            # -Force цей прогін позначив би чужий каталог $createdTargetRoot
+            # =true й пізніше міг би замінити його ACL чи рекурсивно
+            # видалити при провалі захисного ACL, знищивши файли, які
+            # з'явилися там від іншого власника. $createdTargetRoot
+            # встановлюється в true ЛИШЕ після підтвердженого успішного
+            # створення нижче.
+            try {
+                [void](New-Item -ItemType Directory -Path $restorePlan.TargetRoot -ErrorAction Stop)
+            } catch {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "ціль out-of-place кореня з'явилася між плануванням і створенням (не створено цим прогоном): $($restorePlan.TargetRoot) ($($_.Exception.Message))"
+            }
             $createdTargetRoot = $true
             try {
                 Set-BRAVODataRestoreCreatedDirectoryAcl -Path $restorePlan.TargetRoot
@@ -3237,6 +3354,21 @@ try {
             $outOfPlaceTargetCreatedByThisRun = $false
             try {
                 if ($Mode -eq 'InPlace') {
+                    # Re-встановлення інваріанту тиші БЕЗПОСЕРЕДНЬО перед
+                    # move-aside ЦЬОГО компонента (не лише один раз на
+                    # початку транзакції): для багатокомпонентного
+                    # відновлення MODEL extraction може тривати довго, і
+                    # служба/процес могли повернутись у активний стан до
+                    # того, як черга дійде до BLOG/BRAVOEXCH. Виняток летить
+                    # у той самий catch, що й реальні відмови move-aside —
+                    # без окремого test-only шляху.
+                    $componentQuiescenceFailures = Invoke-BRAVODataRestoreQuiescence `
+                        -Snapshot $script:dataRestoreServiceSnapshot `
+                        -StopTimeoutSeconds $serviceStopTimeoutSeconds `
+                        -PollIntervalSeconds $servicePollIntervalSeconds
+                    if (@($componentQuiescenceFailures).Count -gt 0) {
+                        throw ("тиша служб/процесів не підтверджена перед компонентом ${componentType}: " + ($componentQuiescenceFailures -join '; '))
+                    }
                     $moveAsideResult = Invoke-BRAVODataRestoreMoveAside `
                         -LiveDirectory $planComponent.LiveSourceDirectory `
                         -PrerestoreDirectory $planComponent.PrerestoreDirectory

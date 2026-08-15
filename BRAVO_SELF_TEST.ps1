@@ -8042,6 +8042,48 @@ function Start-Service {
     Initialize-BRAVOSelfTestServiceState
     $script:BRAVOSelfTestServiceStates[$Name] = 'Running'
 }
+# Стан для round-6 симуляції KillProcesses (fifth/sixth review): реальні
+# Get-Process/Stop-Process НІКОЛИ не викликаються цим самотестом — ті самі
+# стаб-функції затінюють однойменні cmdlet-и лише всередині ізольованого
+# $dataRestoreModule, ніякий реальний процес не завершується.
+function Initialize-BRAVOSelfTestProcessState {
+    if ($null -eq $script:BRAVOSelfTestRunningProcessNames) { $script:BRAVOSelfTestRunningProcessNames = @{} }
+    if ($null -eq $script:BRAVOSelfTestUnkillableProcessNames) { $script:BRAVOSelfTestUnkillableProcessNames = @{} }
+}
+function Set-BRAVOSelfTestProcessRunning {
+    param([string]$Name, [bool]$Running)
+    Initialize-BRAVOSelfTestProcessState
+    $script:BRAVOSelfTestRunningProcessNames[$Name] = $Running
+}
+function Set-BRAVOSelfTestProcessUnkillable {
+    param([string]$Name, [bool]$Unkillable)
+    Initialize-BRAVOSelfTestProcessState
+    $script:BRAVOSelfTestUnkillableProcessNames[$Name] = $Unkillable
+}
+function Get-Process {
+    [CmdletBinding()]
+    param([Parameter(Position = 0)][string]$Name)
+    Initialize-BRAVOSelfTestProcessState
+    if ($script:BRAVOSelfTestRunningProcessNames.ContainsKey($Name) -and $script:BRAVOSelfTestRunningProcessNames[$Name]) {
+        return [pscustomobject]@{ Name = $Name; Id = 999999 }
+    }
+    return $null
+}
+function Stop-Process {
+    [CmdletBinding()]
+    param(
+        [Parameter(ValueFromPipeline = $true)][object]$InputObject,
+        [switch]$Force
+    )
+    process {
+        Initialize-BRAVOSelfTestProcessState
+        if ($null -eq $InputObject) { return }
+        $procName = [string]$InputObject.Name
+        if (-not ($script:BRAVOSelfTestUnkillableProcessNames.ContainsKey($procName) -and $script:BRAVOSelfTestUnkillableProcessNames[$procName])) {
+            $script:BRAVOSelfTestRunningProcessNames[$procName] = $false
+        }
+    }
+}
 '@
     $dataRestoreModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText ($dataRestoreRuntimeTextForTests + [Environment]::NewLine + $dataRestoreTestStubs) `
@@ -8054,6 +8096,11 @@ function Start-Service {
             'Get-Service',
             'Stop-Service',
             'Start-Service',
+            'Initialize-BRAVOSelfTestProcessState',
+            'Set-BRAVOSelfTestProcessRunning',
+            'Set-BRAVOSelfTestProcessUnkillable',
+            'Get-Process',
+            'Stop-Process',
             'Test-BRAVODataRestorePathWithin',
             'Test-BRAVODataRestorePathEquals',
             'Test-BRAVODataRestorePathHasReparseAncestor',
@@ -8064,9 +8111,11 @@ function Start-Service {
             'Get-BRAVODataRestoreLiveSourceMap',
             'Test-BRAVODataRestoreStagingSafe',
             'Get-BRAVODataRestorePlan',
+            'Get-BRAVODataRestoreGenerationCandidates',
             'Test-BRAVODataRestoreFreeSpace',
             'Test-BRAVODataRestoreServicesAllStopped',
             'Stop-BRAVODataRestoreServices',
+            'Invoke-BRAVODataRestoreQuiescence',
             'Invoke-BRAVODataRestoreServiceStateChange',
             'Test-BRAVODataRestoreExtractionResult',
             'Get-BRAVODataRestoreLockingProcessText',
@@ -10267,6 +10316,233 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/MinimumFreeSpaceGBRejectsNegativeNonFiniteValues" `
         -Failure "Test-BRAVODataRestoreMinimumFreeSpaceGB має приймати 0 і додатні значення, і відхиляти від'ємні, NaN, +Infinity, -Infinity та непарсимі значення — інакше free-space preflight міг би хибно пройти з від'ємним резервом"
+
+    # ================================================================
+    # Sixth restore safety review (PR #40): 7 нових findings (2 P1, 5 P2)
+    # понад попередні 30. Усі тести нижче — детерміновані, ізольовані;
+    # служби/процеси симулюються стаб-функціями всередині того самого
+    # $dataRestoreModule — жодна реальна служба/процес/UAC/SFTP не
+    # використовується.
+    # ================================================================
+
+    # --- 6.25a. InPlace live-джерело, що фізично є junction (чи має
+    # reparse-предка), має відхилятись планом — той самий канонічний
+    # Test-BRAVODataRestorePathHasReparseAncestor, що вже захищає
+    # OutOfPlace/staging. -------------------------------------------------
+    $inPlaceReparseTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_INPLACE_REPARSE_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $inPlaceReparseBackupRoot = Join-Path $inPlaceReparseTestRoot 'BACKUP'
+        $inPlaceReparseRuntimeRoot = Join-Path $inPlaceReparseTestRoot 'RUNTIME'
+        $inPlaceReparseStagingRoot = Join-Path $inPlaceReparseBackupRoot 'RESTORE_STAGING'
+        $inPlaceReparseRealBlog = Join-Path $inPlaceReparseTestRoot 'REAL\BLOG'
+        $inPlaceReparseSafeModel = Join-Path $inPlaceReparseTestRoot 'SAFE\MODEL'
+        foreach ($inPlaceReparseDirectory in @($inPlaceReparseBackupRoot, $inPlaceReparseRuntimeRoot, $inPlaceReparseStagingRoot, $inPlaceReparseRealBlog, $inPlaceReparseSafeModel)) {
+            [void][IO.Directory]::CreateDirectory($inPlaceReparseDirectory)
+        }
+        $inPlaceReparseLink = Join-Path $inPlaceReparseTestRoot 'MODEL_LINK'
+        [void](New-Item -ItemType Junction -Path $inPlaceReparseLink -Target $inPlaceReparseRealBlog -ErrorAction Stop)
+
+        $inPlacePlanInvoke = {
+            param($Module, $Definitions, $Backup, $Runtime, $Staging)
+            & $Module {
+                param($d, $b, $r, $s)
+                Get-BRAVODataRestorePlan `
+                    -ComponentTypes @('MODEL') `
+                    -RestoreMode 'InPlace' `
+                    -RequestedTargetPath '' `
+                    -BackupRoot $b `
+                    -RuntimeRootPath $r `
+                    -StagingRoot $s `
+                    -ArchiveDefinitions $d `
+                    -RunStamp '20260816_100000'
+            } $Definitions $Backup $Runtime $Staging
+        }
+
+        $reparseDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $inPlaceReparseLink 'model.gdb') })
+        $reparsePlanResult = & $inPlacePlanInvoke $dataRestoreModule $reparseDefinitions $inPlaceReparseBackupRoot $inPlaceReparseRuntimeRoot $inPlaceReparseStagingRoot
+
+        $safeDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Source = (Join-Path $inPlaceReparseSafeModel 'model.gdb') })
+        $safePlanResult = & $inPlacePlanInvoke $dataRestoreModule $safeDefinitions $inPlaceReparseBackupRoot $inPlaceReparseRuntimeRoot $inPlaceReparseStagingRoot
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not $reparsePlanResult.Success -and
+                $safePlanResult.Success
+            ) `
+            -Name "DataRestore/InPlacePlanRejectsReparseAliasedLiveSource" `
+            -Failure "Get-BRAVODataRestorePlan (InPlace) має відхиляти обране live-джерело, що фізично є junction/symlink (чи має reparse-предка) — лексичні Test-BRAVODataRestorePathEquals/-PathWithin не бачать, що такий шлях реально веде в інший захищений каталог; звичайне фізичне джерело має проходити"
+    } finally {
+        if (Test-Path -LiteralPath $inPlaceReparseTestRoot) {
+            Remove-Item -LiteralPath $inPlaceReparseTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 6.25b. Ordering: staging-preflight для -ListGenerations -Source
+    # SFTP МУСИТЬ виконуватись ДО створення "_list_<guid>", і той самий
+    # live-source map, обчислений один раз, використовується і тут, і
+    # пізніше нормальним SFTP-потоком (без дублювання виведення). ---------
+    $dataRestoreStagingLiveSourcesIndex = $dataRestoreRuntimeTextForTests.IndexOf('$dataRestoreStagingLiveSources = Get-BRAVODataRestoreLiveSourceMap')
+    $listModeHeaderIndex = $dataRestoreRuntimeTextForTests.IndexOf('РЕЖИМ ПЕРЕГЛЯДУ')
+    $listStagingSafetyCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$listStagingSafety = Test-BRAVODataRestoreStagingSafe')
+    $listStagingDirectoryCreateIndex = $dataRestoreRuntimeTextForTests.IndexOf('$listStagingDirectory = Join-Path')
+    $normalStagingSafetyCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$stagingSafety = Test-BRAVODataRestoreStagingSafe')
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreStagingLiveSourcesIndex -gt 0 -and
+            $listModeHeaderIndex -gt $dataRestoreStagingLiveSourcesIndex -and
+            $listStagingSafetyCallIndex -gt $listModeHeaderIndex -and
+            $listStagingDirectoryCreateIndex -gt $listStagingSafetyCallIndex -and
+            $normalStagingSafetyCallIndex -gt $listStagingDirectoryCreateIndex
+        ) `
+        -Name "DataRestore/ListGenerationsSftpAppliesStagingSafetyBeforeListDirectory" `
+        -Failure "-ListGenerations -Source SFTP має викликати Test-BRAVODataRestoreStagingSafe ДО створення _list_<guid> — той самий live-source map (Get-BRAVODataRestoreLiveSourceMap), обчислений один раз РАНІШЕ за режим перегляду, має повторно використовуватись і нормальним SFTP restore-потоком нижче, без дублювання виведення"
+
+    # --- 6.25c. Атомарне володіння новим OutOfPlace TargetRoot: без
+    # -Force New-Item провалюється, якщо каталог з'явився паралельно —
+    # $createdTargetRoot встановлюється в true ЛИШЕ після підтвердженого
+    # створення, а не мовчазного прийняття чужого каталогу. ----------------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('[void](New-Item -ItemType Directory -Path $restorePlan.TargetRoot -ErrorAction Stop)') -and
+            -not $dataRestoreRuntimeTextForTests.Contains('New-Item -ItemType Directory -Path $restorePlan.TargetRoot -Force') -and
+            $dataRestoreRuntimeTextForTests.Contains('Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "ціль out-of-place кореня з''явилася між плануванням і створенням (не створено цим прогоном)') -and
+            ($dataRestoreRuntimeTextForTests.IndexOf('$createdTargetRoot = $true', $dataRestoreRuntimeTextForTests.IndexOf('[void](New-Item -ItemType Directory -Path $restorePlan.TargetRoot -ErrorAction Stop)'))) -gt 0
+        ) `
+        -Name "DataRestore/OutOfPlaceTargetRootCreationIsRaceSafe" `
+        -Failure "Створення нового OutOfPlace TargetRoot має відбуватись БЕЗ -Force (щоб New-Item провалився, якщо каталог з'явився паралельно між Test-Path і цим викликом) і абортувати через Stop-BRAVODataRestoreRun замість мовчазного прийняття чужого каталогу як `$createdTargetRoot=true"
+
+    # --- 6.26a. Invoke-BRAVODataRestoreQuiescence: configured KillProcesses
+    # завершуються НЕЗАЛЕЖНО від того, чи пов'язана служба вже Stopped. ----
+    $quiescenceSetStateInvoke = {
+        param($Module, $Name, $Status)
+        & $Module { param($n, $st) Set-BRAVOSelfTestServiceState -Name $n -Status $st } $Name $Status
+    }
+    $quiescenceSetProcessInvoke = {
+        param($Module, $Name, $Running)
+        & $Module { param($n, $r) Set-BRAVOSelfTestProcessRunning -Name $n -Running $r } $Name $Running
+    }
+    $quiescenceSetUnkillableInvoke = {
+        param($Module, $Name, $Unkillable)
+        & $Module { param($n, $u) Set-BRAVOSelfTestProcessUnkillable -Name $n -Unkillable $u } $Name $Unkillable
+    }
+    $quiescenceProcessRunningInvoke = {
+        param($Module, $Name)
+        & $Module { param($n) [bool](Get-Process -Name $n -ErrorAction SilentlyContinue) } $Name
+    }
+    $quiescenceInvoke = {
+        param($Module, $Snapshot, $StopTimeout, $PollInterval)
+        & $Module {
+            param($snap, $stopT, $poll)
+            Invoke-BRAVODataRestoreQuiescence -Snapshot $snap -StopTimeoutSeconds $stopT -PollIntervalSeconds $poll
+        } $Snapshot $StopTimeout $PollInterval
+    }
+
+    # A: служба вже Stopped, orphan-процес живий -> процес завершується
+    # навіть без потреби зупиняти службу.
+    [void](& $quiescenceSetStateInvoke $dataRestoreModule 'SVC_Q_A' 'Stopped')
+    [void](& $quiescenceSetProcessInvoke $dataRestoreModule 'Bis_Q_A' $true)
+    $snapshotQA = @([pscustomobject]@{ Key = 'A'; Name = 'SVC_Q_A'; Managed = $true; WasRunning = $false; KillProcesses = @('Bis_Q_A') })
+    $failuresQA = & $quiescenceInvoke $dataRestoreModule $snapshotQA 5 1
+    $processStillRunningQA = & $quiescenceProcessRunningInvoke $dataRestoreModule 'Bis_Q_A'
+
+    # B: служба Running + процес живий -> обидва приводяться в тишу.
+    [void](& $quiescenceSetStateInvoke $dataRestoreModule 'SVC_Q_B' 'Running')
+    [void](& $quiescenceSetProcessInvoke $dataRestoreModule 'Bis_Q_B' $true)
+    $snapshotQB = @([pscustomobject]@{ Key = 'B'; Name = 'SVC_Q_B'; Managed = $true; WasRunning = $true; KillProcesses = @('Bis_Q_B') })
+    $failuresQB = & $quiescenceInvoke $dataRestoreModule $snapshotQB 5 1
+    $processStillRunningQB = & $quiescenceProcessRunningInvoke $dataRestoreModule 'Bis_Q_B'
+
+    # C: процес неможливо завершити (симуляція) -> Invoke-BRAVODataRestoreQuiescence
+    # має провалитись через фінальний бар'єр, навіть якщо служба в нормі.
+    [void](& $quiescenceSetStateInvoke $dataRestoreModule 'SVC_Q_C' 'Stopped')
+    [void](& $quiescenceSetProcessInvoke $dataRestoreModule 'Bis_Q_C' $true)
+    [void](& $quiescenceSetUnkillableInvoke $dataRestoreModule 'Bis_Q_C' $true)
+    $snapshotQC = @([pscustomobject]@{ Key = 'C'; Name = 'SVC_Q_C'; Managed = $true; WasRunning = $false; KillProcesses = @('Bis_Q_C') })
+    $failuresQC = & $quiescenceInvoke $dataRestoreModule $snapshotQC 1 1
+
+    Test-BRAVOCondition `
+        -Condition (
+            @($failuresQA).Count -eq 0 -and -not $processStillRunningQA -and
+            @($failuresQB).Count -eq 0 -and -not $processStillRunningQB -and
+            @($failuresQC).Count -gt 0
+        ) `
+        -Name "DataRestore/QuiescenceTerminatesLingeringProcessesIndependentOfServiceState" `
+        -Failure "Invoke-BRAVODataRestoreQuiescence (через Stop-BRAVODataRestoreServices) має завершувати configured KillProcesses незалежно від того, чи пов'язана служба вже Stopped — orphan-процес не зникає разом зі станом 'Stopped'; процес, що неможливо завершити, має провалювати фінальний бар'єр"
+
+    # --- 6.26b. Ordering: Invoke-BRAVODataRestoreQuiescence МУСИТЬ
+    # викликатись ВСЕРЕДИНІ циклу foreach по компонентах, безпосередньо
+    # перед move-aside КОЖНОГО компонента — не лише один раз перед усією
+    # транзакцією. -----------------------------------------------------
+    $componentForeachIndex = $dataRestoreRuntimeTextForTests.IndexOf('foreach ($planComponent in $restorePlan.Components) {')
+    $perComponentQuiescenceCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$componentQuiescenceFailures = Invoke-BRAVODataRestoreQuiescence', $componentForeachIndex)
+    $moveAsideCallIndexInLoop = $dataRestoreRuntimeTextForTests.IndexOf('$moveAsideResult = Invoke-BRAVODataRestoreMoveAside', $componentForeachIndex)
+    Test-BRAVOCondition `
+        -Condition (
+            $componentForeachIndex -gt 0 -and
+            $perComponentQuiescenceCallIndex -gt $componentForeachIndex -and
+            $moveAsideCallIndexInLoop -gt $perComponentQuiescenceCallIndex
+        ) `
+        -Name "DataRestore/QuiescenceReestablishedInsideComponentLoopBeforeMoveAside" `
+        -Failure "Invoke-BRAVODataRestoreQuiescence має викликатись ВСЕРЕДИНІ циклу foreach по компонентах, безпосередньо перед Invoke-BRAVODataRestoreMoveAside КОЖНОГО компонента — не лише один раз перед усією транзакцією, інакше довга MODEL-екстракція лишає вікно для перезапуску служби/процесу перед BLOG/BRAVOEXCH"
+
+    # --- 6.27. Operation lock: провал запису метаданих (SetLength/Write/
+    # Flush) має звільнити відкритий $stream ДО того, як зовнішній catch
+    # поверне Success=false — інакше machine-wide lock лишився б захопленим
+    # до непередбачуваного GC. -------------------------------------------
+    $lockDisposeSetupIndex = $dataRestoreRuntimeTextForTests.IndexOf('Від цього моменту $stream належить ЦІЙ функції')
+    $lockDisposeWriteIndex = $dataRestoreRuntimeTextForTests.IndexOf('$stream.SetLength(0)', $lockDisposeSetupIndex)
+    $lockDisposeCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$stream.Dispose()', $lockDisposeWriteIndex)
+    $lockDisposeSuccessReturnIndex = $dataRestoreRuntimeTextForTests.IndexOf('Success = $true', $lockDisposeCallIndex)
+    Test-BRAVOCondition `
+        -Condition (
+            $lockDisposeSetupIndex -gt 0 -and
+            $lockDisposeWriteIndex -gt $lockDisposeSetupIndex -and
+            $lockDisposeCallIndex -gt $lockDisposeWriteIndex -and
+            $lockDisposeSuccessReturnIndex -gt $lockDisposeCallIndex
+        ) `
+        -Name "DataRestore/OperationLockDisposesStreamOnMetadataWriteFailure" `
+        -Failure "Enter-BRAVODataRestoreOperationLock має обгортати SetLength/Write/Flush у try/catch, що викликає `$stream.Dispose() ПЕРЕД success-return-ом (і перед виходом у зовнішній catch) — інакше провал запису метаданих лишає machine-wide lock захопленим до непередбачуваного GC"
+
+    # --- 6.28. Local -ListGenerations не повинен показувати JSON-only
+    # generationId як звичайного selectable candidate, коли filename-
+    # identity не збігається — той самий контракт, що вже застосовує SFTP-
+    # перегляд, через канонічний Get-BRAVOBackupManifestFilenameGenerationId
+    # (BRAVO.ArchiveHelpers, без дублювання regex у DataRestore). --------
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    $localIdentityTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_LOCAL_IDENTITY_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($localIdentityTestRoot)
+        $matchName = 'BRAVO_BACKUP_20260810_100000.json'
+        [IO.File]::WriteAllText(
+            (Join-Path $localIdentityTestRoot $matchName),
+            (@{ generationId = '20260810_100000'; status = 'COMPLETE' } | ConvertTo-Json -Compress))
+        $mismatchName = 'BRAVO_BACKUP_20260811_100000.json'
+        [IO.File]::WriteAllText(
+            (Join-Path $localIdentityTestRoot $mismatchName),
+            (@{ generationId = '20260812_999999'; status = 'COMPLETE' } | ConvertTo-Json -Compress))
+
+        $localIdentityCandidates = @(& $dataRestoreModule {
+            param($backupRoot)
+            Get-BRAVODataRestoreGenerationCandidates -BackupRoot $backupRoot -Limit 25
+        } $localIdentityTestRoot)
+
+        $matchCandidate = @($localIdentityCandidates | Where-Object { [string]$_.GenerationId -eq '20260810_100000' })
+        $mismatchCandidate = @($localIdentityCandidates | Where-Object { ([string]$_.GenerationId) -match 'НЕЗБІЖНІСТЬ' })
+
+        Test-BRAVOCondition `
+            -Condition (
+                $matchCandidate.Count -eq 1 -and
+                $mismatchCandidate.Count -eq 1 -and
+                ([string]$mismatchCandidate[0].GenerationId).Contains('20260812_999999')
+            ) `
+            -Name "DataRestore/LocalListingFlagsFilenameJsonIdentityMismatch" `
+            -Failure "Get-BRAVODataRestoreGenerationCandidates має явно позначати кандидата, чий filename generationId (канонічний Get-BRAVOBackupManifestFilenameGenerationId) не збігається з JSON generationId, а не показувати JSON-значення як звичайний selectable candidate; коректний збіг має відображатись нормально"
+    } finally {
+        Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
+        if (Test-Path -LiteralPath $localIdentityTestRoot) {
+            Remove-Item -LiteralPath $localIdentityTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло
