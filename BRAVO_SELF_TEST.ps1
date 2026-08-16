@@ -10826,6 +10826,84 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Name "DataRestore/StagingPathRejectsDriveAndRootRelativeForms" `
         -Failure "Test-BRAVODataRestoreFullyQualifiedWindowsPath має приймати лише 'C:\...'/'C:/...' та валідний UNC '\\сервер\ресурс\...', і відхиляти голе ім'я, '.\...', диск-відносне 'C:...' (без роздільника після ':'), корінь-відносне '\...' (без другого провідного backslash), неповний UNC (лише сервер, без ресурсу) та порожнє значення"
 
+    # --- 7.4c. P1 follow-up (review 4945915094, thread 3791473832):
+    # Win32 File/Device Namespace префікси ('\\?\...', '\\.\...',
+    # включно з device-wrapped UNC '\\?\UNC\сервер\ресурс\...') МУСЯТЬ
+    # бути відхилені — GetFullPath зберігає їх дослівно, тому такий
+    # псевдонім не збігається лексично зі звичайною формою того самого
+    # фізичного шляху в подальших перевірках перетину. -------------------
+    $fqDeviceFileNamespace = & $fqInvoke $dataRestoreModule '\\?\C:\RESTORE_STAGING'
+    $fqDeviceNamespace = & $fqInvoke $dataRestoreModule '\\.\C:\RESTORE_STAGING'
+    $fqDeviceWrappedUncFile = & $fqInvoke $dataRestoreModule '\\?\UNC\server\share\RESTORE_STAGING'
+    $fqDeviceWrappedUncDevice = & $fqInvoke $dataRestoreModule '\\.\UNC\server\share\RESTORE_STAGING'
+    Test-BRAVOCondition `
+        -Condition (
+            $fqDeviceFileNamespace -eq $false -and
+            $fqDeviceNamespace -eq $false -and
+            $fqDeviceWrappedUncFile -eq $false -and
+            $fqDeviceWrappedUncDevice -eq $false
+        ) `
+        -Name "DataRestore/StagingPathRejectsDeviceNamespaceForms" `
+        -Failure "Test-BRAVODataRestoreFullyQualifiedWindowsPath має відхиляти Win32 File Namespace ('\\?\...') і Device Namespace ('\\.\...') префікси, включно з device-wrapped UNC ('\\?\UNC\...', '\\.\UNC\...') — наївний UNC-regex трактував '?'/'.' як звичайний односимвольний 'сервер', а GetFullPath зберігає ці префікси дослівно замість нормалізації, тому такий псевдонім не збігається лексично зі звичайною формою того самого фізичного шляху"
+
+    # --- 7.4d. P1 follow-up: критичний alias-сценарій — device-namespace
+    # псевдонім захищеного live-шляху МУСИТЬ бути відхилений
+    # Test-BRAVODataRestoreStagingSafe (defense-in-depth усередині самої
+    # функції, не лише на вході pipeline), і жодної filesystem-мутації
+    # (New-Item) при цьому статися НЕ повинно — перевіряємо целим
+    # відсутність побічних ефектів. --------------------------------------
+    $stagingSafeInvoke = {
+        param($Module, $StagingRoot, $RuntimeRootPath, $LiveSources)
+        & $Module {
+            param($s, $r, $l)
+            Test-BRAVODataRestoreStagingSafe -StagingRoot $s -RuntimeRootPath $r -LiveSources $l
+        } $StagingRoot $RuntimeRootPath $LiveSources
+    }
+    $aliasProtectedLive = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DEVICE_NAMESPACE_ALIAS_LIVE_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($aliasProtectedLive)
+        $aliasLiveSources = @{ MODEL = $aliasProtectedLive }
+        $aliasRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DEVICE_NAMESPACE_ALIAS_RUNTIME_{0}" -f [guid]::NewGuid().ToString('N'))
+
+        # Device File Namespace псевдонім ('\\?\' + той самий фізичний шлях).
+        # "Відсутність мутації" перевіряємо через $aliasRuntimeRoot — свіжий
+        # guid-шлях, що НІКОЛИ не створювався: якби Test-BRAVODataRestoreStagingSafe
+        # (read-only preflight, жодного New-Item у власному тілі) чи будь-
+        # який виклик у цьому тесті торкнувся файлової системи за межами
+        # завідомо існуючого $aliasProtectedLive, цей шлях перестав би бути
+        # відсутнім. (Test-Path на самому $aliasFileNamespaceStaging НЕ
+        # підходить для цієї перевірки: він фізично ІСНУЄ від початку —
+        # це той самий каталог, що й $aliasProtectedLive, під псевдонімом.)
+        $aliasFileNamespaceStaging = "\\?\$aliasProtectedLive"
+        $aliasFileNamespaceResult = & $stagingSafeInvoke $dataRestoreModule $aliasFileNamespaceStaging $aliasRuntimeRoot $aliasLiveSources
+        $aliasNoMutationAfterFileNamespace = -not (Test-Path -LiteralPath $aliasRuntimeRoot -ErrorAction SilentlyContinue)
+
+        # Device Namespace псевдонім ('\\.\' + той самий фізичний шлях).
+        $aliasDeviceNamespaceStaging = "\\.\$aliasProtectedLive"
+        $aliasDeviceNamespaceResult = & $stagingSafeInvoke $dataRestoreModule $aliasDeviceNamespaceStaging $aliasRuntimeRoot $aliasLiveSources
+        $aliasNoMutationAfterDeviceNamespace = -not (Test-Path -LiteralPath $aliasRuntimeRoot -ErrorAction SilentlyContinue)
+
+        # Контроль: звичайна форма того самого шляху й далі коректно
+        # відхиляється як "перетинається з live-джерелом" (регресія
+        # попереднього раунду не зламана цим фіксом).
+        $aliasNormalFormResult = & $stagingSafeInvoke $dataRestoreModule $aliasProtectedLive $aliasRuntimeRoot $aliasLiveSources
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$aliasFileNamespaceResult.Success -and
+                $aliasNoMutationAfterFileNamespace -and
+                -not [bool]$aliasDeviceNamespaceResult.Success -and
+                $aliasNoMutationAfterDeviceNamespace -and
+                -not [bool]$aliasNormalFormResult.Success
+            ) `
+            -Name "DataRestore/StagingSafeRejectsDeviceNamespaceAliasOfLiveSource" `
+            -Failure "Test-BRAVODataRestoreStagingSafe МУСИТЬ відхиляти StagingRoot, переданий у формі Win32 File/Device Namespace ('\\?\...'/'\\.\...'), навіть коли він фізично збігається із захищеним live-джерелом — інакше лексичне порівняння (GetFullPath) не бачить перетину і псевдонім проходить preflight; жодної filesystem-мутації (New-Item) відбуватись не повинно"
+    } finally {
+        if (Test-Path -LiteralPath $aliasProtectedLive) {
+            Remove-Item -LiteralPath $aliasProtectedLive -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # --- 7.5. P2: локальні артефакти мають переживати relocation
     # backup-root — leaf-ім'я з manifest-шляху (недовірений вхід)
     # переприв'язується до ПОТОЧНОГО canonical каталогу компонента, а не

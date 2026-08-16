@@ -146,11 +146,32 @@ function Test-BRAVODataRestoreFullyQualifiedWindowsPath {
     # відносних шляхів без провідного роздільника).
     # [System.IO.Path]::IsPathFullyQualified() існує лише в .NET Core/5+,
     # недоступний у Windows PowerShell 5.1 (.NET Framework) — тому явна
-    # перевірка на regex двох дозволених канонічних форм:
+    # перевірка на regex ДВОХ дозволених канонічних форм (позитивна
+    # граматика — приймається ЛИШЕ те, що явно описано нижче, усе інше
+    # відхиляється за замовчуванням):
     #   локальний диск: <Буква>:\ або <Буква>:/, одразу роздільник після ":"
     #   UNC:            \\сервер\ресурс з непорожнім ім'ям сервера й ресурсу
+    #
+    # P1 follow-up (review 4945915094): Win32 File Namespace ('\\?\...')
+    # і Win32 Device Namespace ('\\.\...') префікси — включно з
+    # device-wrapped UNC формою '\\?\UNC\сервер\ресурс\...' —
+    # НАВМИСНО і БЕЗУМОВНО відхиляються ПЕРЕД позитивною граматикою
+    # нижче, незалежно від того, що йде після префікса. Наївний UNC-
+    # regex '^\\\\[^\\/]+\\[^\\/]+' трактує "?" чи "." як звичайний
+    # "сервер" (односимвольний, без \ чи /) — тому '\\?\C:\LIMS\MODEL'
+    # раніше проходив як "валідний UNC". Небезпека НЕ в самому прийнятті
+    # рядка: [System.IO.Path]::GetFullPath() ЗБЕРІГАЄ ці префікси
+    # дослівно (не нормалізує до звичайної форми диска/UNC), тому
+    # лексичні перевірки перетину (Test-BRAVODataRestorePathEquals/
+    # PathWithin у Test-BRAVODataRestoreStagingSafe) порівнюють рядки
+    # '\\?\C:\LIMS\MODEL' і 'C:\LIMS\MODEL' як РІЗНІ шляхи, хоча
+    # фізично це ОДНЕ Й ТЕ САМЕ розташування — namespace-псевдонім міг
+    # би пройти перевірку "не перетинається із захищеним live-джерелом",
+    # і подальше створення/рекурсивне очищення staging реально
+    # торкнулося б production-даних через псевдонім.
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Value -match '^\\\\[?.]\\') { return $false }
     if ($Value -match '^[A-Za-z]:[\\/]') { return $true }
     if ($Value -match '^\\\\[^\\/]+\\[^\\/]+') { return $true }
     return $false
@@ -983,6 +1004,27 @@ function Test-BRAVODataRestoreStagingSafe {
         [Parameter(Mandatory = $true)][string]$RuntimeRootPath,
         [Parameter(Mandatory = $true)][hashtable]$LiveSources
     )
+
+    # Defense-in-depth (P1 follow-up, review 4945915094): усі перевірки
+    # нижче — суто лексичні (GetFullPath) через
+    # Test-BRAVODataRestorePathEquals/PathWithin. Win32 File/Device
+    # Namespace префікси ('\\?\...', '\\.\...', включно з device-wrapped
+    # UNC '\\?\UNC\сервер\ресурс\...') GetFullPath ЗБЕРІГАЄ дослівно
+    # замість нормалізації до звичайної форми диска/UNC — тому '\\?\C:\LIMS\MODEL'
+    # і 'C:\LIMS\MODEL' дають РІЗНІ рядки в порівнянні нижче, хоча
+    # фізично це ОДНЕ Й ТЕ САМЕ розташування: staging під таким
+    # namespace-псевдонімом пройшов би лексичну перевірку перетину, хоча
+    # реально збігається із захищеним live-шляхом. Той самий canonical
+    # валідатор, що й для -StagingPath на вході pipeline (не окрема
+    # копія regex-політики) — виклик тут ловить БУДЬ-якого майбутнього/
+    # іншого викликача цієї функції, що міг би обійти вхідну перевірку
+    # -StagingPath.
+    if (-not (Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $StagingRoot)) {
+        return [pscustomobject]@{
+            Success = $false
+            Error = "staging-шлях не є підтримуваною повністю кваліфікованою формою (буква-диска:\ або звичайний UNC \\сервер\ресурс) — Windows device/file namespace префікси ('\\?\', '\\.\') заборонені: $StagingRoot"
+        }
+    }
 
     $protectedDirectories = @(
         @{ Name = 'RuntimeRoot'; Path = $RuntimeRootPath }
