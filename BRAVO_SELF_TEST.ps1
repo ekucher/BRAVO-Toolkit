@@ -8005,6 +8005,7 @@ function Format-BRAVOFileSize {
 function Initialize-BRAVOSelfTestServiceState {
     if ($null -eq $script:BRAVOSelfTestServiceStates) { $script:BRAVOSelfTestServiceStates = @{} }
     if ($null -eq $script:BRAVOSelfTestServiceStuck) { $script:BRAVOSelfTestServiceStuck = @{} }
+    if ($null -eq $script:BRAVOSelfTestServiceQueryThrows) { $script:BRAVOSelfTestServiceQueryThrows = @{} }
 }
 function Set-BRAVOSelfTestServiceState {
     param([string]$Name, [string]$Status)
@@ -8016,10 +8017,21 @@ function Set-BRAVOSelfTestServiceStuck {
     Initialize-BRAVOSelfTestServiceState
     $script:BRAVOSelfTestServiceStuck[$Name] = $Stuck
 }
+function Set-BRAVOSelfTestServiceQueryThrows {
+    param([string]$Name, [bool]$Throws)
+    Initialize-BRAVOSelfTestServiceState
+    $script:BRAVOSelfTestServiceQueryThrows[$Name] = $Throws
+}
 function Get-Service {
     [CmdletBinding()]
     param([Parameter(Position = 0)][string]$Name)
     Initialize-BRAVOSelfTestServiceState
+    # round-7 P1: симуляція транзієнтної помилки SCM-запиту — окремо від
+    # "null" (сервіс невідомий), щоб тест міг перевірити both null AND
+    # throw незалежно.
+    if ($script:BRAVOSelfTestServiceQueryThrows.ContainsKey($Name) -and $script:BRAVOSelfTestServiceQueryThrows[$Name]) {
+        throw "симульована транзієнтна помилка SCM для $Name"
+    }
     if (-not $script:BRAVOSelfTestServiceStates.ContainsKey($Name)) { return $null }
     # Status уже свіжий на момент створення об'єкта (читання з
     # $script:BRAVOSelfTestServiceStates щойно вище) — Refresh() тут
@@ -8093,6 +8105,7 @@ function Stop-Process {
             'Initialize-BRAVOSelfTestServiceState',
             'Set-BRAVOSelfTestServiceState',
             'Set-BRAVOSelfTestServiceStuck',
+            'Set-BRAVOSelfTestServiceQueryThrows',
             'Get-Service',
             'Stop-Service',
             'Start-Service',
@@ -8106,6 +8119,7 @@ function Stop-Process {
             'Test-BRAVODataRestorePathHasReparseAncestor',
             'Test-BRAVODataRestoreGenerationIdFormat',
             'Test-BRAVODataRestoreMinimumFreeSpaceGB',
+            'Test-BRAVODataRestoreFullyQualifiedWindowsPath',
             'ConvertTo-BRAVODataRestoreElevationArgument',
             'Get-BRAVODataRestoreComponentSelection',
             'Get-BRAVODataRestoreLiveSourceMap',
@@ -8115,6 +8129,7 @@ function Stop-Process {
             'Test-BRAVODataRestoreFreeSpace',
             'Test-BRAVODataRestoreServicesAllStopped',
             'Stop-BRAVODataRestoreServices',
+            'Restore-BRAVODataRestoreServices',
             'Invoke-BRAVODataRestoreQuiescence',
             'Invoke-BRAVODataRestoreServiceStateChange',
             'Test-BRAVODataRestoreExtractionResult',
@@ -8673,7 +8688,7 @@ function Stop-Process {
                     # поточного компонента B, потім — уже завершених (A).
                     $sequenceLog.Add('FailPoint:B')
                     $rollbackB = Undo-BRAVODataRestoreMoveAside `
-                        -LiveDirectory $liveB -PrerestoreDirectory $prerestoreB -MoveAsidePerformed $true
+                        -LiveDirectory $liveB -PrerestoreDirectory $prerestoreB -MoveAsidePerformed $true -TargetCreatedByThisRun $true
                     if ($rollbackB.Success) { $sequenceLog.Add('Rollback:B') }
                     if ($completedInPlaceComponents.Count -gt 0) {
                         $crossRollback = Undo-BRAVODataRestoreCompletedComponents `
@@ -8751,7 +8766,7 @@ function Stop-Process {
         if ($moveAsideArmedForTest) {
             [void](& $dataRestoreModule {
                 param($live, $prerestore, $performed)
-                Undo-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore -MoveAsidePerformed $performed
+                Undo-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore -MoveAsidePerformed $performed -TargetCreatedByThisRun $true
             } $liveFail $prerestoreFail ([bool]$moveAsideOutcome.Performed))
         }
 
@@ -8809,7 +8824,7 @@ function Stop-Process {
 
         $rollbackOutcome = & $dataRestoreModule {
             param($live, $prerestore)
-            Undo-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore -MoveAsidePerformed $true
+            Undo-BRAVODataRestoreMoveAside -LiveDirectory $live -PrerestoreDirectory $prerestore -MoveAsidePerformed $true -TargetCreatedByThisRun $true
         } $liveRB $prerestoreRB
 
         $lockedPartialStream.Dispose()
@@ -10543,6 +10558,650 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $localIdentityTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # ================================================================
+    # Seventh restore safety review (PR #40 -> developer, post-merge round):
+    # 7 нових findings (2 P1, 5 P2) понад попередні 37. Усі тести нижче —
+    # детерміновані, ізольовані; служби/процеси симулюються стаб-функціями
+    # всередині того самого $dataRestoreModule — жодна реальна служба/
+    # процес/UAC/SFTP не використовується.
+    # ================================================================
+
+    # --- 7.1. P1: Managed-служба, яку неможливо опитати (null АБО throw),
+    # МУСИТЬ трактуватись як провал тиші (fail-closed), а не мовчазний
+    # "continue". ------------------------------------------------------
+    $svcQueryInvoke = {
+        param($Module, $Snapshot, $StopTimeout, $PollInterval)
+        & $Module {
+            param($snap, $stopT, $poll)
+            Stop-BRAVODataRestoreServices -Snapshot $snap -StopTimeoutSeconds $stopT -PollIntervalSeconds $poll
+        } $Snapshot $StopTimeout $PollInterval
+    }
+    $svcBarrierInvoke = {
+        param($Module, $Snapshot)
+        & $Module { param($snap) Test-BRAVODataRestoreServicesAllStopped -Snapshot $snap } $Snapshot
+    }
+    $svcQuiesceInvoke = {
+        param($Module, $Snapshot, $StopTimeout, $PollInterval)
+        & $Module {
+            param($snap, $stopT, $poll)
+            Invoke-BRAVODataRestoreQuiescence -Snapshot $snap -StopTimeoutSeconds $stopT -PollIntervalSeconds $poll
+        } $Snapshot $StopTimeout $PollInterval
+    }
+
+    # A: Managed, служба взагалі невідома стабу (Get-Service -> null,
+    # НІКОЛИ не викликався Set-BRAVOSelfTestServiceState) -> fail-closed.
+    $snapshotUnknown = @([pscustomobject]@{ Key = 'A'; Name = 'SVC_UNKNOWN_Q7'; Managed = $true; WasRunning = $false; ShouldRestartAfterRestore = $false; KillProcesses = @() })
+    $failuresUnknown = & $svcQueryInvoke $dataRestoreModule $snapshotUnknown 1 1
+    $barrierUnknown = & $svcBarrierInvoke $dataRestoreModule $snapshotUnknown
+
+    # B: Managed, запит кидає виняток (симуляція транзієнтної помилки SCM)
+    # -> fail-closed так само, як і null.
+    [void](& $dataRestoreModule { param($n, $t) Set-BRAVOSelfTestServiceQueryThrows -Name $n -Throws $t } 'SVC_THROWS_Q7' $true)
+    $snapshotThrows = @([pscustomobject]@{ Key = 'B'; Name = 'SVC_THROWS_Q7'; Managed = $true; WasRunning = $false; ShouldRestartAfterRestore = $false; KillProcesses = @() })
+    $failuresThrows = & $svcQueryInvoke $dataRestoreModule $snapshotThrows 1 1
+    $barrierThrows = & $svcBarrierInvoke $dataRestoreModule $snapshotThrows
+
+    # C: контроль — Managed, служба нормально Running -> досі зупиняється
+    # (регресія: fail-closed для null/throw не повинен був зламати
+    # звичайний happy-path зупинки).
+    [void](& $dataRestoreModule { param($n, $s) Set-BRAVOSelfTestServiceState -Name $n -Status $s } 'SVC_NORMAL_Q7' 'Running')
+    $snapshotNormal = @([pscustomobject]@{ Key = 'C'; Name = 'SVC_NORMAL_Q7'; Managed = $true; WasRunning = $true; ShouldRestartAfterRestore = $true; KillProcesses = @() })
+    $failuresNormal = & $svcQueryInvoke $dataRestoreModule $snapshotNormal 5 1
+    $barrierNormal = & $svcBarrierInvoke $dataRestoreModule $snapshotNormal
+
+    # D: Unmanaged -> як і раніше, повністю ігнорується (жодного запиту).
+    $snapshotUnmanaged = @([pscustomobject]@{ Key = 'D'; Name = 'SVC_UNMANAGED_Q7'; Managed = $false; WasRunning = $false; ShouldRestartAfterRestore = $false; KillProcesses = @() })
+    $failuresUnmanaged = & $svcQueryInvoke $dataRestoreModule $snapshotUnmanaged 1 1
+    $barrierUnmanaged = & $svcBarrierInvoke $dataRestoreModule $snapshotUnmanaged
+
+    # E: той самий контракт через композитний Invoke-BRAVODataRestoreQuiescence
+    # (per-component виклик у циклі) — throw теж має провалити композит.
+    $quiesceThrowsFailures = & $svcQuiesceInvoke $dataRestoreModule $snapshotThrows 1 1
+
+    Test-BRAVOCondition `
+        -Condition (
+            @($failuresUnknown).Count -gt 0 -and @($barrierUnknown).Count -gt 0 -and
+            @($failuresThrows).Count -gt 0 -and @($barrierThrows).Count -gt 0 -and
+            @($failuresNormal).Count -eq 0 -and @($barrierNormal).Count -eq 0 -and
+            @($failuresUnmanaged).Count -eq 0 -and @($barrierUnmanaged).Count -eq 0 -and
+            @($quiesceThrowsFailures).Count -gt 0
+        ) `
+        -Name "DataRestore/ManagedServiceQueryFailureFailsClosed" `
+        -Failure "Stop-BRAVODataRestoreServices/Test-BRAVODataRestoreServicesAllStopped мають трактувати null АБО виняток від Get-Service для Managed-запису як провал тиші (unsafe/failure), а не мовчазний 'continue'; unmanaged-записи лишаються повністю ігнорованими, а нормальна Running-служба й далі зупиняється без помилок"
+
+    # --- 7.2a. P2: Restore-BRAVODataRestoreServices відновлює службу за
+    # ShouldRestartAfterRestore (намір "працювати": Running АБО StartPending
+    # на знімку), а НЕ за буквальним WasRunning — інакше служба, що на
+    # знімку лише розпочала запуск (StartPending), назавжди лишалась би
+    # Stopped. ------------------------------------------------------------
+    $restoreInvoke = {
+        param($Module, $Snapshot, $StartTimeout, $PollInterval)
+        & $Module {
+            param($snap, $startT, $poll)
+            Restore-BRAVODataRestoreServices -Snapshot $snap -StartTimeoutSeconds $startT -PollIntervalSeconds $poll
+        } $Snapshot $StartTimeout $PollInterval
+    }
+    $svcStatusInvoke = {
+        param($Module, $Name)
+        & $Module { param($n) $s = Get-Service -Name $n -ErrorAction SilentlyContinue; if ($null -eq $s) { $null } else { [string]$s.Status } } $Name
+    }
+
+    # Running на знімку -> ShouldRestartAfterRestore=true -> відновлюється.
+    [void](& $dataRestoreModule { param($n, $s) Set-BRAVOSelfTestServiceState -Name $n -Status $s } 'SVC_RESTART_RUNNING' 'Stopped')
+    $snapshotRestartRunning = @([pscustomobject]@{ Key = 'R1'; Name = 'SVC_RESTART_RUNNING'; Managed = $true; WasRunning = $true; ShouldRestartAfterRestore = $true; KillProcesses = @() })
+    [void](& $restoreInvoke $dataRestoreModule $snapshotRestartRunning 5 1)
+    $stateAfterRestartRunning = & $svcStatusInvoke $dataRestoreModule 'SVC_RESTART_RUNNING'
+
+    # StartPending на знімку -> WasRunning=false, АЛЕ ShouldRestartAfterRestore=true
+    # (StartPending = намір "працювати") -> МУСИТЬ відновитись.
+    [void](& $dataRestoreModule { param($n, $s) Set-BRAVOSelfTestServiceState -Name $n -Status $s } 'SVC_RESTART_STARTPENDING' 'Stopped')
+    $snapshotRestartStartPending = @([pscustomobject]@{ Key = 'R2'; Name = 'SVC_RESTART_STARTPENDING'; Managed = $true; WasRunning = $false; ShouldRestartAfterRestore = $true; KillProcesses = @() })
+    [void](& $restoreInvoke $dataRestoreModule $snapshotRestartStartPending 5 1)
+    $stateAfterRestartStartPending = & $svcStatusInvoke $dataRestoreModule 'SVC_RESTART_STARTPENDING'
+
+    # Stopped на знімку -> WasRunning=false, ShouldRestartAfterRestore=false
+    # -> лишається Stopped (не запускається).
+    [void](& $dataRestoreModule { param($n, $s) Set-BRAVOSelfTestServiceState -Name $n -Status $s } 'SVC_RESTART_STOPPED' 'Stopped')
+    $snapshotRestartStopped = @([pscustomobject]@{ Key = 'R3'; Name = 'SVC_RESTART_STOPPED'; Managed = $true; WasRunning = $false; ShouldRestartAfterRestore = $false; KillProcesses = @() })
+    [void](& $restoreInvoke $dataRestoreModule $snapshotRestartStopped 5 1)
+    $stateAfterRestartStopped = & $svcStatusInvoke $dataRestoreModule 'SVC_RESTART_STOPPED'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $stateAfterRestartRunning -eq 'Running' -and
+            $stateAfterRestartStartPending -eq 'Running' -and
+            $stateAfterRestartStopped -eq 'Stopped'
+        ) `
+        -Name "DataRestore/RestoreServicesUsesRestartIntentNotLiteralWasRunning" `
+        -Failure "Restore-BRAVODataRestoreServices має відновлювати службу за ShouldRestartAfterRestore (намір 'працювати': Running або StartPending на знімку), а не за буквальним WasRunning — інакше служба, що лише розпочала запуск на момент знімка, назавжди лишається Stopped після відновлення"
+
+    # --- 7.2b. Текстова перевірка політики мапування в
+    # Get-BRAVODataRestoreServiceSnapshot: Running/StartPending -> true,
+    # поле зберігається як ShouldRestartAfterRestore і саме воно (а не
+    # WasRunning) використовується гейтом Restore-BRAVODataRestoreServices.
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains("`$shouldRestartAfterRestore = (`$stateStatus -eq 'Running' -or `$stateStatus -eq 'StartPending')") -and
+            $dataRestoreRuntimeTextForTests.Contains('ShouldRestartAfterRestore = $shouldRestartAfterRestore') -and
+            $dataRestoreRuntimeTextForTests.Contains('-not $entry.Managed -or -not $entry.ShouldRestartAfterRestore')
+        ) `
+        -Name "DataRestore/ShouldRestartAfterRestorePolicyDocumentedAndUsed" `
+        -Failure "Get-BRAVODataRestoreServiceSnapshot має обчислювати ShouldRestartAfterRestore як Running-АБО-StartPending, і саме це поле (не WasRunning) має гейтувати Restore-BRAVODataRestoreServices"
+
+    # --- 7.3+7.6. P2: InPlace-ціль, що з'явилася ПІСЛЯ move-aside (чужий
+    # каталог), НІКОЛИ не видаляється й не перезаписується під час
+    # rollback; повідомлення про відновлення НЕ стверджує існування
+    # prerestore-копії, якої не було (MoveAsidePerformed=false). ----------
+    $undoOwnershipRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_UNDO_OWNERSHIP_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($undoOwnershipRoot)
+        $undoInvoke = {
+            param($Module, $Live, $Prerestore, $Performed, $CreatedByThisRun)
+            & $Module {
+                param($l, $p, $mp, $c)
+                Undo-BRAVODataRestoreMoveAside -LiveDirectory $l -PrerestoreDirectory $p -MoveAsidePerformed $mp -TargetCreatedByThisRun $c
+            } $Live $Prerestore $Performed $CreatedByThisRun
+        }
+
+        # A: TargetCreatedByThisRun=false, чужий каталог існує на місці
+        # LiveDirectory (watchdog відновив після move-aside) — MUST NOT
+        # delete/overwrite; rollback провалюється явним повідомленням.
+        $foreignLive = Join-Path $undoOwnershipRoot 'MODEL_A'
+        $foreignPrerestore = Join-Path $undoOwnershipRoot 'MODEL_A.prerestore_20260816_010000'
+        [void][IO.Directory]::CreateDirectory($foreignLive)
+        [IO.File]::WriteAllText((Join-Path $foreignLive 'foreign.txt'), 'not-ours')
+        [void][IO.Directory]::CreateDirectory($foreignPrerestore)
+        [IO.File]::WriteAllText((Join-Path $foreignPrerestore 'original.txt'), 'old')
+        $undoForeign = & $undoInvoke $dataRestoreModule $foreignLive $foreignPrerestore $true $false
+        $foreignStillIntact = (Test-Path -LiteralPath (Join-Path $foreignLive 'foreign.txt')) -and
+            ([IO.File]::ReadAllText((Join-Path $foreignLive 'foreign.txt'))) -eq 'not-ours'
+        $prerestoreUntouchedAfterForeign = Test-Path -LiteralPath (Join-Path $foreignPrerestore 'original.txt')
+
+        # B: TargetCreatedByThisRun=true, звичайний власний частковий
+        # результат — видаляється, prerestore переноситься назад (щасливий
+        # шлях без регресії).
+        $ownLive = Join-Path $undoOwnershipRoot 'MODEL_B'
+        $ownPrerestore = Join-Path $undoOwnershipRoot 'MODEL_B.prerestore_20260816_010000'
+        [void][IO.Directory]::CreateDirectory($ownLive)
+        [IO.File]::WriteAllText((Join-Path $ownLive 'partial.txt'), 'partial')
+        [void][IO.Directory]::CreateDirectory($ownPrerestore)
+        [IO.File]::WriteAllText((Join-Path $ownPrerestore 'original.txt'), 'old')
+        $undoOwn = & $undoInvoke $dataRestoreModule $ownLive $ownPrerestore $true $true
+        $ownRestored = (Test-Path -LiteralPath (Join-Path $ownLive 'original.txt')) -and
+            -not (Test-Path -LiteralPath $ownPrerestore)
+
+        # C: MoveAsidePerformed=false (live був відсутній ще ДО прогону,
+        # типовий disaster-сценарій для BRAVOEXCH) + подальший провал ->
+        # повідомлення НЕ стверджує "дані збережені" і НЕ містить Rename-Item.
+        $absentLive = Join-Path $undoOwnershipRoot 'BRAVOEXCH_C'
+        $neverExistedPrerestore = Join-Path $undoOwnershipRoot 'BRAVOEXCH_C.prerestore_20260816_010000'
+        # Чужий каталог на місці live -> Test-Path -PathType Container true,
+        # TargetCreatedByThisRun=false -> внутрішній throw -> catch-гілка
+        # повідомлення.
+        [void][IO.Directory]::CreateDirectory($absentLive)
+        [IO.File]::WriteAllText((Join-Path $absentLive 'foreign.txt'), 'not-ours')
+        $undoNeverExisted = & $undoInvoke $dataRestoreModule $absentLive $neverExistedPrerestore $false $false
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$undoForeign.Success -and
+                ([string]$undoForeign.Error) -match 'не створював' -and
+                $foreignStillIntact -and
+                $prerestoreUntouchedAfterForeign -and
+                [bool]$undoOwn.Success -and
+                $ownRestored -and
+                -not [bool]$undoNeverExisted.Success -and
+                -not (([string]$undoNeverExisted.Error) -match 'Дані збережені') -and
+                -not (([string]$undoNeverExisted.Error) -match 'Rename-Item') -and
+                (([string]$undoNeverExisted.Error) -match 'був відсутній')
+            ) `
+            -Name "DataRestore/UndoMoveAsideRespectsOwnershipAndPrerestoreExistence" `
+            -Failure "Undo-BRAVODataRestoreMoveAside НЕ повинен видаляти/перезаписувати каталог, якого цей прогін не створював (TargetCreatedByThisRun=false), і НЕ повинен стверджувати наявність prerestore-копії чи пропонувати Rename-Item на неіснуючий шлях, коли MoveAsidePerformed=false (live був відсутній ще до прогону); звичайний власний rollback (TargetCreatedByThisRun=true) має продовжувати працювати без регресії"
+    } finally {
+        if (Test-Path -LiteralPath $undoOwnershipRoot) {
+            Remove-Item -LiteralPath $undoOwnershipRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 7.3c. Текстова перевірка: InPlace-створення цілі в основному
+    # pipeline тепер БЕЗ -Force, і $inPlaceTargetCreatedByThisRun
+    # передається в Undo-BRAVODataRestoreMoveAside. ------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            -not $dataRestoreRuntimeTextForTests.Contains('New-Item -ItemType Directory -Path $planComponent.TargetDirectory -Force -ErrorAction Stop') -and
+            $dataRestoreRuntimeTextForTests.Contains('$inPlaceTargetCreatedByThisRun = $true') -and
+            $dataRestoreRuntimeTextForTests.Contains('-TargetCreatedByThisRun $inPlaceTargetCreatedByThisRun')
+        ) `
+        -Name "DataRestore/InPlaceTargetCreationOmitsForce" `
+        -Failure "InPlace-створення TargetDirectory (після move-aside) не повинно використовувати -Force (інакше чужий каталог, що з'явився після move-aside, приймається мовчазно); `$inPlaceTargetCreatedByThisRun має передаватись у Undo-BRAVODataRestoreMoveAside як -TargetCreatedByThisRun"
+
+    # --- 7.4. P2: -StagingPath МУСИТЬ бути абсолютним; відносний/malformed
+    # шлях -> InvalidConfiguration (exit 30), не generic internal error 90. -
+    $stagingRootedCheckIndex = $dataRestoreRuntimeTextForTests.IndexOf('Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $expandedStagingPath')
+    $stagingExit30Index = $dataRestoreRuntimeTextForTests.IndexOf('exit 30', $stagingRootedCheckIndex)
+    $stagingGetFullPathTryIndex = $dataRestoreRuntimeTextForTests.IndexOf('[System.IO.Path]::GetFullPath($expandedStagingPath)', $stagingRootedCheckIndex)
+    Test-BRAVOCondition `
+        -Condition (
+            $stagingRootedCheckIndex -gt 0 -and
+            $stagingExit30Index -gt $stagingRootedCheckIndex -and
+            $stagingGetFullPathTryIndex -gt $stagingExit30Index -and
+            $dataRestoreRuntimeTextForTests.Contains('-StagingPath має бути повністю кваліфікованим шляхом')
+        ) `
+        -Name "DataRestore/StagingPathMustBeAbsolute" `
+        -Failure "Ненульовий -StagingPath має проходити Test-BRAVODataRestoreFullyQualifiedWindowsPath ДО GetFullPath і провалюватись через InvalidConfiguration (exit 30) при відносному/диск-відносному/корінь-відносному чи некоректному значенні — інакше такий шлях резолвиться відносно поточного (диска/елевованого процесу) контексту, а malformed шлях провалюється як generic internal error"
+
+    # --- 7.4b. P2 follow-up: Test-BRAVODataRestoreFullyQualifiedWindowsPath
+    # приймає лише СПРАВДІ фіксовані форми (буква-диска:\ або UNC
+    # \\сервер\ресурс) — IsPathRooted() сам по собі вважав rooted і
+    # диск-відносні ('C:RESTORE_STAGING'), і корінь-відносні
+    # ('\RESTORE_STAGING') значення, хоча обидва фактично резолвуються
+    # відносно поточного диска/контексту процесу (той самий клас
+    # небезпеки, що round-7 уже закрив для звичайних відносних шляхів). ---
+    $fqInvoke = {
+        param($Module, $Value)
+        & $Module { param($v) Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $v } $Value
+    }
+    $fqDriveBackslash = & $fqInvoke $dataRestoreModule 'C:\RESTORE_STAGING'
+    $fqDriveForwardSlash = & $fqInvoke $dataRestoreModule 'C:/RESTORE_STAGING'
+    $fqUnc = & $fqInvoke $dataRestoreModule '\\server\share\RESTORE_STAGING'
+    $fqBareRelative = & $fqInvoke $dataRestoreModule 'RESTORE_STAGING'
+    $fqDotRelative = & $fqInvoke $dataRestoreModule '.\RESTORE_STAGING'
+    $fqDriveRelative = & $fqInvoke $dataRestoreModule 'C:RESTORE_STAGING'
+    $fqRootRelative = & $fqInvoke $dataRestoreModule '\RESTORE_STAGING'
+    $fqMalformedUncShareOnly = & $fqInvoke $dataRestoreModule '\\server'
+    $fqEmpty = & $fqInvoke $dataRestoreModule ''
+    Test-BRAVOCondition `
+        -Condition (
+            $fqDriveBackslash -eq $true -and
+            $fqDriveForwardSlash -eq $true -and
+            $fqUnc -eq $true -and
+            $fqBareRelative -eq $false -and
+            $fqDotRelative -eq $false -and
+            $fqDriveRelative -eq $false -and
+            $fqRootRelative -eq $false -and
+            $fqMalformedUncShareOnly -eq $false -and
+            $fqEmpty -eq $false
+        ) `
+        -Name "DataRestore/StagingPathRejectsDriveAndRootRelativeForms" `
+        -Failure "Test-BRAVODataRestoreFullyQualifiedWindowsPath має приймати лише 'C:\...'/'C:/...' та валідний UNC '\\сервер\ресурс\...', і відхиляти голе ім'я, '.\...', диск-відносне 'C:...' (без роздільника після ':'), корінь-відносне '\...' (без другого провідного backslash), неповний UNC (лише сервер, без ресурсу) та порожнє значення"
+
+    # --- 7.4c. P1 follow-up (review 4945915094, thread 3791473832):
+    # Win32 File/Device Namespace префікси ('\\?\...', '\\.\...',
+    # включно з device-wrapped UNC '\\?\UNC\сервер\ресурс\...') МУСЯТЬ
+    # бути відхилені — GetFullPath зберігає їх дослівно, тому такий
+    # псевдонім не збігається лексично зі звичайною формою того самого
+    # фізичного шляху в подальших перевірках перетину. -------------------
+    $fqDeviceFileNamespace = & $fqInvoke $dataRestoreModule '\\?\C:\RESTORE_STAGING'
+    $fqDeviceNamespace = & $fqInvoke $dataRestoreModule '\\.\C:\RESTORE_STAGING'
+    $fqDeviceWrappedUncFile = & $fqInvoke $dataRestoreModule '\\?\UNC\server\share\RESTORE_STAGING'
+    $fqDeviceWrappedUncDevice = & $fqInvoke $dataRestoreModule '\\.\UNC\server\share\RESTORE_STAGING'
+    Test-BRAVOCondition `
+        -Condition (
+            $fqDeviceFileNamespace -eq $false -and
+            $fqDeviceNamespace -eq $false -and
+            $fqDeviceWrappedUncFile -eq $false -and
+            $fqDeviceWrappedUncDevice -eq $false
+        ) `
+        -Name "DataRestore/StagingPathRejectsDeviceNamespaceForms" `
+        -Failure "Test-BRAVODataRestoreFullyQualifiedWindowsPath має відхиляти Win32 File Namespace ('\\?\...') і Device Namespace ('\\.\...') префікси, включно з device-wrapped UNC ('\\?\UNC\...', '\\.\UNC\...') — наївний UNC-regex трактував '?'/'.' як звичайний односимвольний 'сервер', а GetFullPath зберігає ці префікси дослівно замість нормалізації, тому такий псевдонім не збігається лексично зі звичайною формою того самого фізичного шляху"
+
+    # --- 7.4d. P1 follow-up: критичний alias-сценарій — device-namespace
+    # псевдонім захищеного live-шляху МУСИТЬ бути відхилений
+    # Test-BRAVODataRestoreStagingSafe (defense-in-depth усередині самої
+    # функції, не лише на вході pipeline), і жодної filesystem-мутації
+    # (New-Item) при цьому статися НЕ повинно — перевіряємо целим
+    # відсутність побічних ефектів. --------------------------------------
+    $stagingSafeInvoke = {
+        param($Module, $StagingRoot, $RuntimeRootPath, $LiveSources)
+        & $Module {
+            param($s, $r, $l)
+            Test-BRAVODataRestoreStagingSafe -StagingRoot $s -RuntimeRootPath $r -LiveSources $l
+        } $StagingRoot $RuntimeRootPath $LiveSources
+    }
+    $aliasProtectedLive = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DEVICE_NAMESPACE_ALIAS_LIVE_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($aliasProtectedLive)
+        $aliasLiveSources = @{ MODEL = $aliasProtectedLive }
+        $aliasRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DEVICE_NAMESPACE_ALIAS_RUNTIME_{0}" -f [guid]::NewGuid().ToString('N'))
+
+        # Device File Namespace псевдонім ('\\?\' + той самий фізичний шлях).
+        # "Відсутність мутації" перевіряємо через $aliasRuntimeRoot — свіжий
+        # guid-шлях, що НІКОЛИ не створювався: якби Test-BRAVODataRestoreStagingSafe
+        # (read-only preflight, жодного New-Item у власному тілі) чи будь-
+        # який виклик у цьому тесті торкнувся файлової системи за межами
+        # завідомо існуючого $aliasProtectedLive, цей шлях перестав би бути
+        # відсутнім. (Test-Path на самому $aliasFileNamespaceStaging НЕ
+        # підходить для цієї перевірки: він фізично ІСНУЄ від початку —
+        # це той самий каталог, що й $aliasProtectedLive, під псевдонімом.)
+        $aliasFileNamespaceStaging = "\\?\$aliasProtectedLive"
+        $aliasFileNamespaceResult = & $stagingSafeInvoke $dataRestoreModule $aliasFileNamespaceStaging $aliasRuntimeRoot $aliasLiveSources
+        $aliasNoMutationAfterFileNamespace = -not (Test-Path -LiteralPath $aliasRuntimeRoot -ErrorAction SilentlyContinue)
+
+        # Device Namespace псевдонім ('\\.\' + той самий фізичний шлях).
+        $aliasDeviceNamespaceStaging = "\\.\$aliasProtectedLive"
+        $aliasDeviceNamespaceResult = & $stagingSafeInvoke $dataRestoreModule $aliasDeviceNamespaceStaging $aliasRuntimeRoot $aliasLiveSources
+        $aliasNoMutationAfterDeviceNamespace = -not (Test-Path -LiteralPath $aliasRuntimeRoot -ErrorAction SilentlyContinue)
+
+        # Контроль: звичайна форма того самого шляху й далі коректно
+        # відхиляється як "перетинається з live-джерелом" (регресія
+        # попереднього раунду не зламана цим фіксом).
+        $aliasNormalFormResult = & $stagingSafeInvoke $dataRestoreModule $aliasProtectedLive $aliasRuntimeRoot $aliasLiveSources
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not [bool]$aliasFileNamespaceResult.Success -and
+                $aliasNoMutationAfterFileNamespace -and
+                -not [bool]$aliasDeviceNamespaceResult.Success -and
+                $aliasNoMutationAfterDeviceNamespace -and
+                -not [bool]$aliasNormalFormResult.Success
+            ) `
+            -Name "DataRestore/StagingSafeRejectsDeviceNamespaceAliasOfLiveSource" `
+            -Failure "Test-BRAVODataRestoreStagingSafe МУСИТЬ відхиляти StagingRoot, переданий у формі Win32 File/Device Namespace ('\\?\...'/'\\.\...'), навіть коли він фізично збігається із захищеним live-джерелом — інакше лексичне порівняння (GetFullPath) не бачить перетину і псевдонім проходить preflight; жодної filesystem-мутації (New-Item) відбуватись не повинно"
+    } finally {
+        if (Test-Path -LiteralPath $aliasProtectedLive) {
+            Remove-Item -LiteralPath $aliasProtectedLive -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 7.5. P2: локальні артефакти мають переживати relocation
+    # backup-root — leaf-ім'я з manifest-шляху (недовірений вхід)
+    # переприв'язується до ПОТОЧНОГО canonical каталогу компонента, а не
+    # довіряється старому абсолютному шляху продюсера. Post-round-7
+    # follow-up (review 4945879933): ці функції promoted у
+    # BRAVO.ArchiveHelpers (Get-BRAVOVerifiedArtifactLeafName,
+    # ConvertTo-BRAVORebasedLocalGenerationManifest) — реальний
+    # Import-Module, не ізольований $dataRestoreModule (canonical
+    # implementation тепер спільна з BRAVO_RESTORE_TEST.ps1). -------------
+    Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+
+    $leafNormal = Get-BRAVOVerifiedArtifactLeafName -Value 'E:\OLD_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz'
+    $leafTraversal = Get-BRAVOVerifiedArtifactLeafName -Value '..\..\Windows\System32\evil.dll'
+    $leafEmpty = Get-BRAVOVerifiedArtifactLeafName -Value ''
+    $leafDotDot = Get-BRAVOVerifiedArtifactLeafName -Value '..'
+
+    $rebaseManifest = ConvertFrom-Json (@{
+        generationId = '20260815_120000'
+        status = 'COMPLETE'
+        components = @{
+            MODEL = @{
+                Enabled = $true
+                ArchivePath = 'E:\OLD_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz'
+                HashPath = 'E:\OLD_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz.sha512'
+            }
+        }
+    } | ConvertTo-Json -Depth 6)
+    # $env:SystemDrive (не жорстко закодований F:) — Join-Path у
+    # ConvertTo-BRAVORebasedLocalGenerationManifest резолвиться через
+    # provider і вимагає, щоб буква диска була наявним PSDrive; довільна
+    # незамаплена буква (F:) є на робочій станції розробника, але
+    # відсутня на CI runner-і — SystemDrive гарантовано існує всюди.
+    # "Інший корінь" тут — інший ПІДКАТАЛОГ (RECOVERY_BACKUP замість
+    # OLD_BACKUP), той самий сценарій relocation, що й у фіндингу.
+    $rebaseDestinationRoot = Join-Path $env:SystemDrive 'RECOVERY_BACKUP\MODEL'
+    $rebaseDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Destination = $rebaseDestinationRoot })
+    $rebasedManifest = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $rebaseManifest -ComponentTypes @('MODEL') -ArchiveDefinitions $rebaseDefinitions
+    $rebasedArchivePath = [string]$rebasedManifest.components.MODEL.ArchivePath
+    $rebasedHashPath = [string]$rebasedManifest.components.MODEL.HashPath
+    $expectedRebasedArchivePath = Join-Path $rebaseDestinationRoot 'OLDPREFIX_20260815_120000.mdz'
+    $expectedRebasedHashPath = Join-Path $rebaseDestinationRoot 'OLDPREFIX_20260815_120000.mdz.sha512'
+
+    Test-BRAVOCondition `
+        -Condition (
+            $leafNormal -eq 'OLDPREFIX_20260815_120000.mdz' -and
+            $leafTraversal -eq 'evil.dll' -and
+            $null -eq $leafEmpty -and
+            $null -eq $leafDotDot -and
+            $rebasedArchivePath -eq $expectedRebasedArchivePath -and
+            $rebasedHashPath -eq $expectedRebasedHashPath
+        ) `
+        -Name "DataRestore/LocalManifestRebasedOntoCurrentComponentDestination" `
+        -Failure "Get-BRAVOVerifiedArtifactLeafName (BRAVO.ArchiveHelpers) має витягувати БЕЗПЕЧНЕ leaf-ім'я (traversal-сегменти відкидаються GetFileName, порожнє/'.'/'..' відхиляється), а ConvertTo-BRAVORebasedLocalGenerationManifest — переписувати ArchivePath/HashPath на ПОТОЧНИЙ canonical каталог компонента (archiveDefinitions[Type].Destination) + це ім'я, а не довіряти старому абсолютному шляху продюсера — інакше скопійований під іншим коренем backup-репозиторій відхиляється, хоча архів/sidecar/manifest валідні"
+
+    # Ordering: рескладка Local-манифесту в BRAVO_DATA_RESTORE МУСИТЬ
+    # відбуватись ДО строгого gate (крок 5), той самий момент, що вже
+    # застосовує SFTP-рескладку.
+    $localRebaseCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('ConvertTo-BRAVORebasedLocalGenerationManifest ')
+    $strictGateCommentIndex = $dataRestoreRuntimeTextForTests.IndexOf('Строгий gate по кожному компоненту')
+    Test-BRAVOCondition `
+        -Condition (
+            $localRebaseCallIndex -gt 0 -and
+            $strictGateCommentIndex -gt $localRebaseCallIndex
+        ) `
+        -Name "DataRestore/LocalManifestRebaseRunsBeforeStrictGate" `
+        -Failure "ConvertTo-BRAVORebasedLocalGenerationManifest має викликатись ДО строгого gate (крок 5) в BRAVO_DATA_RESTORE — той самий момент pipeline, де SFTP вже переписує шляхи на staging"
+
+    # --- 7.5b. Post-round-7 follow-up (P2, review 4945879933, thread
+    # 3791434142): BRAVO_RESTORE_TEST.ps1 (pre-restore drill) МУСИТЬ
+    # застосовувати ТУ САМУ canonical rebasing-політику ДО виклику
+    # Get-BRAVOVerifiedGenerationArchive, а не довіряти сирому manifest-у —
+    # інакше relocated local repository проходить BRAVO_DATA_RESTORE, але
+    # провалює drill. Текстова перевірка + перевірка порядку (rebasing ДО
+    # виклику Get-BRAVOVerifiedGenerationArchive в циклі компонентів). ----
+    $restoreTestScriptTextForRebaseParity = [IO.File]::ReadAllText((Join-Path $root "BRAVO_RESTORE_TEST.ps1"), [Text.Encoding]::UTF8)
+    $restoreTestRebaseCallIndex = $restoreTestScriptTextForRebaseParity.IndexOf('ConvertTo-BRAVORebasedLocalGenerationManifest')
+    # Файл згадує Get-BRAVOVerifiedGenerationArchive і в doc-коментарі на
+    # початку (спільний selector/gate) — шукаємо ФАКТИЧНИЙ виклик у циклі
+    # компонентів, тобто ПІСЛЯ виклику rebasing, а не перше входження.
+    $restoreTestVerifyLoopIndex = $restoreTestScriptTextForRebaseParity.IndexOf('Get-BRAVOVerifiedGenerationArchive', [Math]::Max($restoreTestRebaseCallIndex, 0))
+    Test-BRAVOCondition `
+        -Condition (
+            $restoreTestRebaseCallIndex -gt 0 -and
+            $restoreTestVerifyLoopIndex -gt $restoreTestRebaseCallIndex -and
+            -not $restoreTestScriptTextForRebaseParity.Contains('function ConvertTo-BRAVORebasedLocalGenerationManifest') -and
+            -not $restoreTestScriptTextForRebaseParity.Contains('function Get-BRAVOVerifiedArtifactLeafName')
+        ) `
+        -Name "RestoreTest/UsesCanonicalLocalManifestRebasingBeforeVerification" `
+        -Failure "BRAVO_RESTORE_TEST.ps1 має викликати спільний ConvertTo-BRAVORebasedLocalGenerationManifest (BRAVO.ArchiveHelpers) ДО Get-BRAVOVerifiedGenerationArchive в циклі компонентів, і НЕ визначати власну копію rebasing-логіки — інакше drill і реальне відновлення (BRAVO_DATA_RESTORE) можуть розійтися в поведінці для relocated local repository"
+
+    # Behavioral parity: обидва споживачі отримують ІДЕНТИЧНИЙ результат
+    # rebasing для того самого relocated-сценарію (E: OLD_BACKUP -> поточний
+    # SystemDrive RECOVERY_BACKUP), включно з BLOG/BRAVOEXCH, і rebased
+    # шлях і надалі проходить звичайну Get-BRAVOVerifiedGenerationArchive
+    # перевірку (containment/generation/hash), а не якийсь спрощений шлях.
+    $parityFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RESTORE_TEST_REBASE_PARITY_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($parityFixtureRoot)
+        $parityComponentDirs = @{}
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            $parityComponentDirs[$parityType] = Join-Path $parityFixtureRoot $parityType
+            [void][IO.Directory]::CreateDirectory($parityComponentDirs[$parityType])
+        }
+        $parityNameTemplates = @{ MODEL = '{0}_{1}.mdz'; BLOG = '{0}_blog_{1}.mdz'; BRAVOEXCH = '{0}_exch_{1}.mdz' }
+        $parityGenerationId = '20260816_090000'
+        $parityManifestComponents = @{}
+        $parityArchiveDefinitions = @()
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            $parityArchiveName = $parityNameTemplates[$parityType] -f 'INST', $parityGenerationId
+            $parityArchivePath = Join-Path $parityComponentDirs[$parityType] $parityArchiveName
+            [IO.File]::WriteAllBytes($parityArchivePath, (New-Object byte[] 32))
+            $parityHash = (Get-BRAVOFileHash -Path $parityArchivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+            $parityHashPath = "$parityArchivePath.sha512"
+            [IO.File]::WriteAllText($parityHashPath, "$parityHash *$parityArchiveName")
+            # Manifest-шлях НАВМИСНО вказує на неіснуючий старий продюсер-
+            # корінь — саме сценарій, що провалював drill до цього фіксу.
+            $parityManifestComponents[$parityType] = @{
+                Enabled = $true
+                CreateSuccess = $true
+                IntegritySuccess = $true
+                HashSuccess = $true
+                ArchivePath = "Z:\OBSOLETE_PRODUCER_ROOT\$parityType\$parityArchiveName"
+                HashPath = "Z:\OBSOLETE_PRODUCER_ROOT\$parityType\$parityArchiveName.sha512"
+                SHA512 = $parityHash
+            }
+            $parityArchiveDefinitions += [pscustomobject]@{ Type = $parityType; Destination = $parityComponentDirs[$parityType]; NameTemplate = $parityNameTemplates[$parityType] }
+        }
+        $parityManifest = ConvertFrom-Json (@{
+            generationId = $parityGenerationId
+            status = 'COMPLETE'
+            components = $parityManifestComponents
+        } | ConvertTo-Json -Depth 8)
+
+        $parityRebased = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $parityManifest -ComponentTypes @('MODEL', 'BLOG', 'BRAVOEXCH') -ArchiveDefinitions $parityArchiveDefinitions
+        $parityVerifiedResults = @{}
+        $parityVerifyFailed = $false
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            try {
+                $parityVerifiedResults[$parityType] = Get-BRAVOVerifiedGenerationArchive `
+                    -Manifest $parityRebased `
+                    -Component $parityType `
+                    -NameTemplate $parityNameTemplates[$parityType] `
+                    -ComponentDirectory $parityComponentDirs[$parityType]
+            } catch {
+                $parityVerifyFailed = $true
+            }
+        }
+
+        # Path-escape manifest value (malicious/traversal ArchivePath) —
+        # leaf-валідатор (Get-BRAVOVerifiedArtifactLeafName) бере ЛИШЕ
+        # ім'я файлу після останнього роздільника ([System.IO.Path]::GetFileName,
+        # чиста рядкова операція), тому traversal-СЕГМЕНТИ ('..\..\..\Windows\System32\')
+        # відкидаються цілком — rebased ArchivePath стає leaf-only шляхом
+        # УСЕРЕДИНІ canonical каталогу компонента (не "неперезаписаним", як
+        # можна було б наївно очікувати: сам "evil.mdz" — валідне ім'я
+        # файлу). Це й Є захист: жоден traversal-сегмент фізично не
+        # потрапляє в результуючий шлях. Файл із таким ім'ям фізично НЕ
+        # існує в canonical каталозі компонента, тому подальший
+        # Get-BRAVOVerifiedGenerationArchive все одно провалюється
+        # (Test-Path на відсутньому артефакті) — REJECT, не silent
+        # fallback на producer-шлях і не траверсал за межі каталогу.
+        $parityEscapeManifest = ConvertFrom-Json (@{
+            generationId = $parityGenerationId
+            status = 'COMPLETE'
+            components = @{
+                MODEL = @{
+                    Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true
+                    ArchivePath = '..\..\..\Windows\System32\evil.mdz'
+                    HashPath = '..\..\..\Windows\System32\evil.mdz.sha512'
+                    SHA512 = 'DEADBEEF'
+                }
+            }
+        } | ConvertTo-Json -Depth 8)
+        $parityEscapeRebased = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $parityEscapeManifest -ComponentTypes @('MODEL') -ArchiveDefinitions @([pscustomobject]@{ Type = 'MODEL'; Destination = $parityComponentDirs['MODEL'] })
+        $parityEscapeRebasedPath = [string]$parityEscapeRebased.components.MODEL.ArchivePath
+        $parityEscapeContainedSafely = ($parityEscapeRebasedPath -eq (Join-Path $parityComponentDirs['MODEL'] 'evil.mdz')) -and
+            (-not $parityEscapeRebasedPath.Contains('..')) -and
+            (-not $parityEscapeRebasedPath.Contains('System32'))
+        $parityEscapeRejected = $false
+        try {
+            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $parityEscapeRebased -Component 'MODEL' -NameTemplate $parityNameTemplates['MODEL'] -ComponentDirectory $parityComponentDirs['MODEL'])
+        } catch {
+            $parityEscapeRejected = $true
+        }
+
+        # Missing archive after legitimate rebasing (component directory
+        # exists, canonical, але артефакт фізично відсутній) -> FAIL, не
+        # silent fallback на (недосяжний) producer-шлях.
+        $parityMissingComponentDir = Join-Path $parityFixtureRoot 'MODEL_EMPTY'
+        [void][IO.Directory]::CreateDirectory($parityMissingComponentDir)
+        $parityMissingManifest = ConvertFrom-Json (@{
+            generationId = $parityGenerationId
+            status = 'COMPLETE'
+            components = @{
+                MODEL = @{
+                    Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true
+                    ArchivePath = 'Z:\OBSOLETE_PRODUCER_ROOT\MODEL\missing.mdz'
+                    HashPath = 'Z:\OBSOLETE_PRODUCER_ROOT\MODEL\missing.mdz.sha512'
+                    SHA512 = 'DEADBEEF'
+                }
+            }
+        } | ConvertTo-Json -Depth 8)
+        $parityMissingRebased = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $parityMissingManifest -ComponentTypes @('MODEL') -ArchiveDefinitions @([pscustomobject]@{ Type = 'MODEL'; Destination = $parityMissingComponentDir })
+        $parityMissingRejected = $false
+        try {
+            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $parityMissingRebased -Component 'MODEL' -NameTemplate $parityNameTemplates['MODEL'] -ComponentDirectory $parityMissingComponentDir)
+        } catch {
+            $parityMissingRejected = $true
+        }
+
+        # Жоден зі старих producer-шляхів (Z:\OBSOLETE_PRODUCER_ROOT) не
+        # використовується після rebasing — перевіряємо, що успішно
+        # верифікований архів фізично лежить у НОВОМУ canonical каталозі.
+        $parityNoProducerPathAccessed = $true
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            if ($null -ne $parityVerifiedResults[$parityType]) {
+                if (([string]$parityVerifiedResults[$parityType].FullName).StartsWith('Z:\OBSOLETE_PRODUCER_ROOT', [StringComparison]::OrdinalIgnoreCase)) {
+                    $parityNoProducerPathAccessed = $false
+                }
+            }
+        }
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not $parityVerifyFailed -and
+                $parityVerifiedResults.Count -eq 3 -and
+                $parityNoProducerPathAccessed -and
+                $parityEscapeContainedSafely -and
+                $parityEscapeRejected -and
+                $parityMissingRejected
+            ) `
+            -Name "RestoreTest/LocalManifestRebasingParityAcrossComponentsAndFailureModes" `
+            -Failure "ConvertTo-BRAVORebasedLocalGenerationManifest + Get-BRAVOVerifiedGenerationArchive мають: (a) успішно верифікувати MODEL/BLOG/BRAVOEXCH після rebasing на новий canonical каталог, без жодного звернення до старого producer-кореня; (b) traversal-сегменти path-escape ArchivePath МАЮТЬ бути відкинуті (leaf-only rebased шлях суворо всередині canonical каталогу компонента), і подальша верифікація МУСИТЬ провалитись (файла з таким ім'ям там немає), а не silently fallback на producer-шлях; (c) відхиляти легітимно rebased, але фізично відсутній архів явним FAIL"
+    } finally {
+        if (Test-Path -LiteralPath $parityFixtureRoot) {
+            Remove-Item -LiteralPath $parityFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- 7.7. P1 (документація): OPERATIONS.md більше не радить брати
+    # "найстаріший" .prerestore_* — це відкочує компонент на generation
+    # далі, ніж треба, коли ПІЗНІШИЙ прогін перервався. -------------------
+    $operationsTextForRound7 = [IO.File]::ReadAllText((Join-Path $root "OPERATIONS.md"), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            -not $operationsTextForRound7.Contains('беріть **найстаріший**') -and
+            ($operationsTextForRound7 -match 'НІКОЛИ не беріть\s+найстаріший') -and
+            $operationsTextForRound7.Contains('Поточні дані знесено вбік')
+        ) `
+        -Name "DataRestore/OperationsRunbookRecoversInterruptedRunCopyNotOldest" `
+        -Failure "OPERATIONS.md не повинен радити брати найстаріший .prerestore_* при відновленні після переривання — потрібна прив'язка до ТОЧНОГО прогону через рядок 'Поточні дані знесено вбік' у журналі саме перерваного прогону (Крок 0), інакше компонент відкочується на generation далі, ніж треба"
+
+    # --- 7.8. P2 follow-up: Get-BRAVODataRestoreServiceSnapshot зберігає
+    # InitialStatus у кожному записі знімка (окремо від WasRunning/
+    # ShouldRestartAfterRestore) — саме воно потрібне для точного
+    # операторського аудиту (не лише true/false Running). ------------------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('Status = if ($null -ne $service) { [string]$service.Status } else { $null }') -and
+            $dataRestoreRuntimeTextForTests.Contains('InitialStatus = $stateStatus')
+        ) `
+        -Name "DataRestore/ServiceSnapshotPreservesInitialStatus" `
+        -Failure "Get-BRAVODataRestoreServiceSnapshot має зберігати InitialStatus (точний рядок стану служби на момент знімка, напр. 'StartPending') у кожному записі — потрібно для операторського аудиту, а не лише булевого WasRunning"
+
+    # --- 7.9. P2 follow-up: план/лог перед move-aside НЕ повинен зводити
+    # "служби для зупинки" до фільтра WasRunning — квієсценція діє на ВСІ
+    # Managed-записи (initially-Stopped служба, що встигла запуститись до
+    # move-aside, теж має бути зупинена). Restart-intent показується
+    # ОКРЕМО. Аудиторський рядок пишеться в ЛОГ (Write-DataRestoreLog) ДО
+    # move-aside, щоб пережити переривання прогону до фінального
+    # restart-кроку. -------------------------------------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            -not $dataRestoreRuntimeTextForTests.Contains('$servicesToStop = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed -and $_.WasRunning })') -and
+            $dataRestoreRuntimeTextForTests.Contains('$managedServicesForQuiescence = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed })') -and
+            $dataRestoreRuntimeTextForTests.Contains('$servicesWithRestartIntent = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed -and $_.ShouldRestartAfterRestore })') -and
+            $dataRestoreRuntimeTextForTests.Contains('Знімок служби {0}: initial={1}, restart-after-recovery={2}') -and
+            $dataRestoreRuntimeTextForTests.IndexOf('Write-DataRestoreLog -Message ("Знімок служби') -lt $dataRestoreRuntimeTextForTests.IndexOf('Invoke-BRAVODataRestoreMoveAside `')
+        ) `
+        -Name "DataRestore/ServiceSnapshotAuditTrailPrecedesMoveAside" `
+        -Failure "Операторський план/лог не повинен зводити квієсценцію до 'лише WasRunning'-фільтра (вона діє на ВСІ Managed-записи); restart-intent має показуватись окремо; кожен Managed-запис має логуватись ('Знімок служби {Name}: initial=..., restart-after-recovery=...') через Write-DataRestoreLog СТРОГО ДО першого move-aside — інакше запис може ніколи не потрапити в лог, якщо прогін перерветься раніше"
+
+    # --- 7.10. P2 follow-up: OPERATIONS.md більше не радить '"лише
+    # Running"'/"BRAVO зупиняє тільки Running-служби" — квієсценція діє на
+    # всі Managed-служби, а restart-intent (Running АБО StartPending)
+    # береться саме з залогованого запису знімка, не з поточного стану
+    # служб після аварії/перезавантаження. ---------------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            -not $operationsTextForRound7.Contains('BRAVO зупиняє тільки Running-служби') -and
+            -not $operationsTextForRound7.Contains('ТІЛЬКИ ті, що були Running') -and
+            $operationsTextForRound7.Contains('StartPending') -and
+            $operationsTextForRound7.Contains('restart-after-recovery') -and
+            $operationsTextForRound7.Contains('Знімок служби')
+        ) `
+        -Name "DataRestore/OperationsRunbookRestartGuidanceMatchesStartPendingPolicy" `
+        -Failure "OPERATIONS.md не повинен стверджувати, що BRAVO зупиняє/відновлює лише Running-служби (квієсценція діє на всі Managed, а restart-intent = Running АБО StartPending); операторська інструкція має спиратись на залогований запис 'Знімок служби ...: restart-after-recovery=...' точно перерваного прогону, а не на поточний стан служб після аварії"
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло

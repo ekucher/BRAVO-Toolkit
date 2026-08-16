@@ -694,11 +694,14 @@ Select-String -Path $log.FullName -Pattern 'знесено вбік|Відкат
 ```
 
 Крок 1. Задайте шляхи одного компонента (повторіть процедуру для кожного,
-який був у роботі) і **перевірте, що саме є на диску**:
+який був у роботі) і **перевірте, що саме є на диску**. `$prerestore` —
+ТОЧНЕ значення з рядка `Поточні дані знесено вбік: <live> -> <prerestore>`,
+знайденого у журналі перерваного прогону в Кроці 0 (не вигадане/підставлене
+ім'я):
 
 ```powershell
-$live = "<live-каталог>"                              # напр. D:\LIMS\MODEL
-$prerestore = "<live-каталог>.prerestore_<timestamp>" # копія попередніх даних
+$live = "<live-каталог>"                                       # напр. D:\LIMS\MODEL
+$prerestore = "<точний шлях .prerestore_* з рядка Кроку 0>"     # копія попередніх даних
 
 Test-Path -LiteralPath $live
 Test-Path -LiteralPath $prerestore
@@ -748,23 +751,58 @@ if (Test-Path -LiteralPath $live) {
 Rename-Item -LiteralPath $prerestore -NewName (Split-Path $live -Leaf)
 ```
 
-Крок 6. Запустіть **лише ті** служби, які працювали до відновлення
-(BRAVO зупиняє тільки Running-служби, тож решту чіпати не треба). Що саме
-було зупинено — видно в журналі прогону:
+Крок 6. Запустіть **лише ті** служби, чий залогований намір відновлення
+(`restart-after-recovery`) дорівнює `YES` — **не** ті, що були буквально
+`Running` на момент аварії. BRAVO примусово зупиняє (квієсценція) УСІ
+керовані служби перед move-aside, незалежно від їхнього стану на момент
+знімка, а не лише ті, що вже працювали. Поточна політика наміру
+відновлення (`Get-BRAVODataRestoreServiceSnapshot`):
+
+- `Running` на момент знімка → restart intent `YES`;
+- `StartPending` на момент знімка → restart intent `YES` (служба ще
+  тільки запускалась, але оператор мав намір, щоб вона працювала);
+- `Stopped` / `StopPending` / `Paused` / `ContinuePending` /
+  `PausePending` / будь-який інший стан → restart intent `NO`.
+
+Точний запис для КОЖНОЇ керованої служби пишеться в журнал одразу після
+знімка стану, ще ДО move-aside (саме тому доступний навіть якщо прогін
+перервався до фінального автоматичного restart-кроку — kill/BSOD/
+завершення PowerShell):
 
 ```powershell
-Select-String -Path $log.FullName -Pattern 'Зупинка служби'
-
-# Поточний стан для порівняння:
-Get-Service '<BravoName>', '<ExchangeApiName>' | Select-Object Name, Status, StartType
-
-# Запускати у зворотному до зупинки порядку і ТІЛЬКИ ті, що були Running:
-Start-Service '<BravoName>'
-Start-Service '<ExchangeApiName>'
+Select-String -Path $log.FullName -Pattern 'Знімок служби'
+# Приклад рядка:
+#   Знімок служби BRAVO: initial=Running, restart-after-recovery=YES
+#   Знімок служби ExchangeApi: initial=StartPending, restart-after-recovery=YES
+#   Знімок служби BravoWeb: initial=Stopped, restart-after-recovery=NO
 ```
 
-Служба, яка була `Stopped` до відновлення, має залишитися зупиненою —
-її стан не є наслідком аварії. Службу зі `StartType = Disabled` не
+Використовуйте **виключно** запис саме цього перерваного прогону (той
+самий лог-файл, що й Крок 0/`$prerestore`) — так само, як для вибору
+`.prerestore_*`-копії, ніколи не вгадуйте намір відновлення за поточним
+станом служб після перезавантаження/аварії: він міг змінитися незалежно
+від того, що BRAVO мала намір відновити. Якщо очікуваний запис "Знімок
+служби" відсутній або неповний (наприклад, прогін перервався ще до
+знімка стану служб) — **зупиніться** і розберіться вручну, не
+запускайте служби навмання.
+
+```powershell
+# Поточний стан для порівняння (включно з BravoWeb, якщо вона керована —
+# Get-BRAVODataRestoreServiceSnapshot зупиняє й відновлює її так само, як
+# BRAVO і exchangAPI, коли BravoWebEnabled увімкнено в конфігурації):
+Get-Service '<BravoName>', '<ExchangeApiName>', '<BravoWebName>' | Select-Object Name, Status, StartType
+
+# Запускати у зворотному до зупинки порядку (canonical: BRAVO -> exchangAPI
+# -> BravoWeb, той самий порядок, що Restore-BRAVODataRestoreServices
+# застосовує автоматично) і ТІЛЬКИ ті, у яких restart-after-recovery=YES
+# у знайденому запису:
+Start-Service '<BravoName>'
+Start-Service '<ExchangeApiName>'
+Start-Service '<BravoWebName>'
+```
+
+Служба з `restart-after-recovery=NO` має залишитися зупиненою — її
+стан не є наслідком аварії. Службу зі `StartType = Disabled` не
 намагайтеся піднімати: її відключив адміністратор, і `Start-Service`
 все одно завершиться помилкою.
 
@@ -774,9 +812,20 @@ Start-Service '<ExchangeApiName>'
 .\BRAVO_HEALTH.ps1 -ConfigPath ".\BRAVO.config" -NoPause
 ```
 
-Якщо `.prerestore_*` кілька (від різних спроб) — беріть **найстаріший**:
-він містить дані, які були до першого відновлення. Timestamp у назві —
-час запуску відповідного прогону.
+**Якщо `.prerestore_*` кілька (від різних спроб) — НІКОЛИ не беріть
+найстаріший чи найновіший "за замовчуванням".** Приклад, чому це небезпечно:
+успішне відновлення №1 лишає `.prerestore_t1`; пізніше відновлення №2
+створює `.prerestore_t2` і саме воно переривається. Production
+безпосередньо перед перериванням — це стан, знесений у `.prerestore_t2`,
+а не `.prerestore_t1`: узявши найстаріший `t1`, ви відкотите компонент на
+ОДНУ generation далі, ніж треба, а для кількох компонентів так можна
+отримати змішаний набір generation (MODEL з однієї, BLOG з іншої).
+
+Timestamp у назві — лише допоміжний доказ, не самостійний алгоритм вибору.
+Єдине правильне джерело — рядок `Поточні дані знесено вбік: <live> ->
+<prerestore>` у журналі САМЕ ТОГО перерваного прогону (Крок 0). Якщо
+журнал не дає однозначної відповіді, ЯКА копія належить перерваному
+прогону, — **зупиніться й розберіться вручну**, не вгадуйте.
 
 **Ніколи не видаляйте `.prerestore_*` під час цієї процедури.** Після
 успішного кроку 5 копія перестає існувати під старим іменем сама (її

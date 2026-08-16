@@ -228,6 +228,25 @@ try {
         $componentsToCheck = @()
     }
 
+    # Post-round-7 follow-up (P2, review 4945879933): та сама rebasing-
+    # політика, яку BRAVO_DATA_RESTORE застосовує до Local-джерела ДО
+    # строгого gate (Get-BRAVOVerifiedGenerationArchive нижче) — інакше
+    # relocated local backup repository (скопійований/змонтований під
+    # іншим диском/коренем) проходив би реальне відновлення, але
+    # провалював би цей drill: manifest.ArchivePath/HashPath, записані
+    # ПРОДЮСЕРОМ, фізично не існують за старою адресою. Canonical
+    # ConvertTo-BRAVORebasedLocalGenerationManifest (BRAVO.ArchiveHelpers)
+    # переписує їх на canonical каталог компонента + validated leaf-ім'я
+    # ДО того, як Get-BRAVOVerifiedGenerationArchive нижче виконає
+    # containment/generation/hash перевірки — той самий canonical
+    # implementation, що й BRAVO_DATA_RESTORE, жодної окремої копії.
+    if ($componentsToCheck.Count -gt 0 -and $null -ne $selectedGeneration) {
+        $selectedGeneration.Manifest = ConvertTo-BRAVORebasedLocalGenerationManifest `
+            -Manifest $selectedGeneration.Manifest `
+            -ComponentTypes @($componentsToCheck | ForEach-Object { [string]$_.Type }) `
+            -ArchiveDefinitions @($global:archiveDefinitions)
+    }
+
     # Заголовок друкується один раз, одразу як відомо, скільки компонентів
     # реально перевірятиметься — той самий каркас, що Archive/Health
     # (docs/OPERATOR_CONSOLE_UX.md §1). -AsJson лишається повністю тихим,
