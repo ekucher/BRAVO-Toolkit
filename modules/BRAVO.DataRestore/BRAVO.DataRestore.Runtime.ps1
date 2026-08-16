@@ -2735,92 +2735,16 @@ function ConvertTo-BRAVODataRestoreStagedManifest {
     return $clone
 }
 
-function Get-BRAVODataRestoreValidatedArtifactLeafName {
-    # Витягує ІМ'Я файлу з недовіреного manifest-шляху (round-7 P2) і
-    # підтверджує, що воно безпечне для Join-Path з канонічним каталогом
-    # компонента: САМЕ leaf-ім'я бере участь у реконструкції шляху, ніколи
-    # решта каталогів зі старого/чужого manifest-шляху.
-    #
-    # [System.IO.Path]::GetFileName — ЧИСТА рядкова операція (лише те, що
-    # після останнього роздільника), а НЕ Split-Path -Leaf: Split-Path є
-    # provider-aware й резолвить відносні сегменти (напр. буквальний "..")
-    # проти ПОТОЧНОГО робочого каталогу процесу, тому для значення ".."
-    # повернув би ім'я батьківського каталогу поточного $PWD (недетерміновано
-    # й ніяк не пов'язано зі змістом самого manifest-рядка) замість
-    # відхилення traversal-сегмента як такого. GetFileName трактує "..\..\"
-    # суто текстово й повертає порожній/traversal-фрагмент без звернення до
-    # файлової системи — саме це й потрібно для недовіреного вхідного рядка.
-    # Порожнє значення, "."/"..", чи ім'я з недопустимими символами
-    # файлової системи — відхиляється (повертає $null).
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
-    $leaf = $null
-    try {
-        $leaf = [System.IO.Path]::GetFileName($Value)
-    } catch {
-        return $null
-    }
-    if ([string]::IsNullOrWhiteSpace($leaf)) { return $null }
-    if ($leaf -eq '.' -or $leaf -eq '..') { return $null }
-    if ($leaf.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) { return $null }
-    return $leaf
-}
-
-function ConvertTo-BRAVODataRestoreRebasedLocalManifest {
-    # Local-дзеркало ConvertTo-BRAVODataRestoreStagedManifest: SFTP завжди
-    # переписує ArchivePath/HashPath на власний staging ДО строгого gate
-    # (крок 5), тому pipeline нижче вже source-agnostic для SFTP. Local
-    # цього НЕ робив — строгий gate довіряв повному manifest-шляху,
-    # записаному ПРОДЮСЕРОМ (інший сервер), і ДО того, як canonical
-    # каталог поточного компонента (archiveDefinitions[Type].Destination)
-    # взагалі консультувався. Якщо репозиторій резервних копій
-    # скопійовано/змонтовано під іншим диском/коренем (документований
-    # disaster-recovery сценарій), manifest.ArchivePath фізично не існує
-    # за старою адресою — generation відхилялась би, навіть коли байти
-    # архіву, sidecar і сам manifest валідні під ПОТОЧНИМ BackupRoot.
-    #
-    # Manifest-шлях лишається НЕДОВІРЕНИМ: з нього беруться ЛИШЕ leaf-імена
-    # (Get-BRAVODataRestoreValidatedArtifactLeafName), решта шляху
-    # відкидається. Нове ArchivePath/HashPath — canonical каталог
-    # компонента (archiveDefinitions[Type].Destination, довірене значення з
-    # BRAVO.config, завжди всередині BackupRoot) + validated leaf-ім'я.
-    # Прив'язку компонент+generation і надалі перевіряє
-    # Get-BRAVOVerifiedGenerationArchive (round-3/4, незмінно), rotated
-    # ArchivePrefix (round-4) теж незмінно підтримується — тут ЛИШЕ
-    # переписуються шляхи, історичний basename з manifest-а НЕ
-    # реконструюється з поточного префіксу.
-    param(
-        [Parameter(Mandatory = $true)][object]$Manifest,
-        [Parameter(Mandatory = $true)][string[]]$ComponentTypes,
-        [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions
-    )
-
-    $clone = $Manifest | ConvertTo-Json -Depth 12 | ConvertFrom-Json
-    foreach ($componentType in $ComponentTypes) {
-        $componentProperty = @($clone.components.PSObject.Properties | Where-Object {
-            [string]::Equals($_.Name, $componentType, [StringComparison]::OrdinalIgnoreCase)
-        } | Select-Object -First 1)
-        if ($componentProperty.Count -eq 0) { continue }
-
-        $componentDestination = [string]@($ArchiveDefinitions | Where-Object {
-            [string]::Equals([string]$_.Type, $componentType, [StringComparison]::OrdinalIgnoreCase)
-        } | Select-Object -First 1).Destination
-        if ([string]::IsNullOrWhiteSpace($componentDestination)) { continue }
-
-        $archiveLeaf = Get-BRAVODataRestoreValidatedArtifactLeafName -Value ([string]$componentProperty[0].Value.ArchivePath)
-        $hashLeaf = Get-BRAVODataRestoreValidatedArtifactLeafName -Value ([string]$componentProperty[0].Value.HashPath)
-        if ($null -eq $archiveLeaf -or $null -eq $hashLeaf) {
-            # Небезпечне/непарсиме ім'я — НЕ переписуємо; нижчий строгий
-            # gate однаково відхилить компонент (Test-Path на оригінальному
-            # значенні не пройде, або containment-перевірка провалиться) —
-            # fail-safe, не мовчазний пропуск.
-            continue
-        }
-        $componentProperty[0].Value.ArchivePath = Join-Path $componentDestination $archiveLeaf
-        $componentProperty[0].Value.HashPath = Join-Path $componentDestination $hashLeaf
-    }
-    return $clone
-}
+# Get-BRAVODataRestoreValidatedArtifactLeafName і
+# ConvertTo-BRAVODataRestoreRebasedLocalManifest (round-7 P2) промоутнуті
+# в modules\BRAVO.ArchiveHelpers як Get-BRAVOVerifiedArtifactLeafName і
+# ConvertTo-BRAVORebasedLocalGenerationManifest (post-round-7 follow-up
+# P2, review 4945879933) — BRAVO_RESTORE_TEST.ps1 не мав доступу до цих
+# приватних функцій цього runtime (окремий елевований дочірній процес),
+# тому pre-restore drill і реальне відновлення застосовували РІЗНУ
+# rebasing-політику для relocated local repository. Один canonical
+# implementation тепер спільний для обох споживачів через уже імпортований
+# нижче BRAVO.ArchiveHelpers.
 
 function Invoke-BRAVODataRestorePostHealth {
     # Health після InPlace-відновлення — дочірнім процесом (той самий
@@ -3302,12 +3226,17 @@ try {
                 -Manifest $selectedManifest `
                 -StagedPaths $stagedPaths
         } else {
-            # Local (round-7 P2): та сама ідея, що ConvertTo-BRAVODataRestoreStagedManifest
-            # для SFTP — переписати ArchivePath/HashPath на canonical
-            # каталог компонента ДО строгого gate нижче, щоб репозиторій
-            # резервних копій, скопійований/змонтований під іншим
-            # диском/коренем, лишався придатним для відновлення.
-            $selectedManifest = ConvertTo-BRAVODataRestoreRebasedLocalManifest `
+            # Local (round-7 P2, canonical implementation promoted до
+            # BRAVO.ArchiveHelpers у post-round-7 follow-up): та сама
+            # ідея, що ConvertTo-BRAVODataRestoreStagedManifest для SFTP —
+            # переписати ArchivePath/HashPath на canonical каталог
+            # компонента ДО строгого gate нижче, щоб репозиторій резервних
+            # копій, скопійований/змонтований під іншим диском/коренем,
+            # лишався придатним для відновлення. Той самий
+            # ConvertTo-BRAVORebasedLocalGenerationManifest використовує й
+            # BRAVO_RESTORE_TEST.ps1 (pre-restore drill) — одна rebasing-
+            # політика для обох споживачів generation-manifest.
+            $selectedManifest = ConvertTo-BRAVORebasedLocalGenerationManifest `
                 -Manifest $selectedManifest `
                 -ComponentTypes $componentTypes `
                 -ArchiveDefinitions @($global:archiveDefinitions)

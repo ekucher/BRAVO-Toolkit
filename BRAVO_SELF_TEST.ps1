@@ -8126,8 +8126,6 @@ function Stop-Process {
             'Test-BRAVODataRestoreStagingSafe',
             'Get-BRAVODataRestorePlan',
             'Get-BRAVODataRestoreGenerationCandidates',
-            'Get-BRAVODataRestoreValidatedArtifactLeafName',
-            'ConvertTo-BRAVODataRestoreRebasedLocalManifest',
             'Test-BRAVODataRestoreFreeSpace',
             'Test-BRAVODataRestoreServicesAllStopped',
             'Stop-BRAVODataRestoreServices',
@@ -10831,23 +10829,20 @@ function Invoke-BRAVODataRestoreWinSCPScript {
     # --- 7.5. P2: локальні артефакти мають переживати relocation
     # backup-root — leaf-ім'я з manifest-шляху (недовірений вхід)
     # переприв'язується до ПОТОЧНОГО canonical каталогу компонента, а не
-    # довіряється старому абсолютному шляху продюсера. -------------------
-    $leafInvoke = {
-        param($Module, $Value)
-        & $Module { param($v) Get-BRAVODataRestoreValidatedArtifactLeafName -Value $v } $Value
-    }
-    $leafNormal = & $leafInvoke $dataRestoreModule 'E:\OLD_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz'
-    $leafTraversal = & $leafInvoke $dataRestoreModule '..\..\Windows\System32\evil.dll'
-    $leafEmpty = & $leafInvoke $dataRestoreModule ''
-    $leafDotDot = & $leafInvoke $dataRestoreModule '..'
+    # довіряється старому абсолютному шляху продюсера. Post-round-7
+    # follow-up (review 4945879933): ці функції promoted у
+    # BRAVO.ArchiveHelpers (Get-BRAVOVerifiedArtifactLeafName,
+    # ConvertTo-BRAVORebasedLocalGenerationManifest) — реальний
+    # Import-Module, не ізольований $dataRestoreModule (canonical
+    # implementation тепер спільна з BRAVO_RESTORE_TEST.ps1). -------------
+    Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
 
-    $rebaseInvoke = {
-        param($Module, $Manifest, $ComponentTypes, $ArchiveDefinitions)
-        & $Module {
-            param($m, $c, $d)
-            ConvertTo-BRAVODataRestoreRebasedLocalManifest -Manifest $m -ComponentTypes $c -ArchiveDefinitions $d
-        } $Manifest $ComponentTypes $ArchiveDefinitions
-    }
+    $leafNormal = Get-BRAVOVerifiedArtifactLeafName -Value 'E:\OLD_BACKUP\MODEL\OLDPREFIX_20260815_120000.mdz'
+    $leafTraversal = Get-BRAVOVerifiedArtifactLeafName -Value '..\..\Windows\System32\evil.dll'
+    $leafEmpty = Get-BRAVOVerifiedArtifactLeafName -Value ''
+    $leafDotDot = Get-BRAVOVerifiedArtifactLeafName -Value '..'
+
     $rebaseManifest = ConvertFrom-Json (@{
         generationId = '20260815_120000'
         status = 'COMPLETE'
@@ -10860,7 +10855,7 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         }
     } | ConvertTo-Json -Depth 6)
     # $env:SystemDrive (не жорстко закодований F:) — Join-Path у
-    # ConvertTo-BRAVODataRestoreRebasedLocalManifest резолвиться через
+    # ConvertTo-BRAVORebasedLocalGenerationManifest резолвиться через
     # provider і вимагає, щоб буква диска була наявним PSDrive; довільна
     # незамаплена буква (F:) є на робочій станції розробника, але
     # відсутня на CI runner-і — SystemDrive гарантовано існує всюди.
@@ -10868,7 +10863,7 @@ function Invoke-BRAVODataRestoreWinSCPScript {
     # OLD_BACKUP), той самий сценарій relocation, що й у фіндингу.
     $rebaseDestinationRoot = Join-Path $env:SystemDrive 'RECOVERY_BACKUP\MODEL'
     $rebaseDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Destination = $rebaseDestinationRoot })
-    $rebasedManifest = & $rebaseInvoke $dataRestoreModule $rebaseManifest @('MODEL') $rebaseDefinitions
+    $rebasedManifest = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $rebaseManifest -ComponentTypes @('MODEL') -ArchiveDefinitions $rebaseDefinitions
     $rebasedArchivePath = [string]$rebasedManifest.components.MODEL.ArchivePath
     $rebasedHashPath = [string]$rebasedManifest.components.MODEL.HashPath
     $expectedRebasedArchivePath = Join-Path $rebaseDestinationRoot 'OLDPREFIX_20260815_120000.mdz'
@@ -10884,11 +10879,12 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             $rebasedHashPath -eq $expectedRebasedHashPath
         ) `
         -Name "DataRestore/LocalManifestRebasedOntoCurrentComponentDestination" `
-        -Failure "Get-BRAVODataRestoreValidatedArtifactLeafName має витягувати БЕЗПЕЧНЕ leaf-ім'я (traversal-сегменти відкидаються Split-Path -Leaf, порожнє/'.'/'..' відхиляється), а ConvertTo-BRAVODataRestoreRebasedLocalManifest — переписувати ArchivePath/HashPath на ПОТОЧНИЙ canonical каталог компонента (archiveDefinitions[Type].Destination) + це ім'я, а не довіряти старому абсолютному шляху продюсера — інакше скопійований під іншим коренем backup-репозиторій відхиляється, хоча архів/sidecar/manifest валідні"
+        -Failure "Get-BRAVOVerifiedArtifactLeafName (BRAVO.ArchiveHelpers) має витягувати БЕЗПЕЧНЕ leaf-ім'я (traversal-сегменти відкидаються GetFileName, порожнє/'.'/'..' відхиляється), а ConvertTo-BRAVORebasedLocalGenerationManifest — переписувати ArchivePath/HashPath на ПОТОЧНИЙ canonical каталог компонента (archiveDefinitions[Type].Destination) + це ім'я, а не довіряти старому абсолютному шляху продюсера — інакше скопійований під іншим коренем backup-репозиторій відхиляється, хоча архів/sidecar/manifest валідні"
 
-    # Ordering: рескладка Local-манифесту МУСИТЬ відбуватись ДО строгого
-    # gate (крок 5), той самий момент, що вже застосовує SFTP-рескладку.
-    $localRebaseCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('ConvertTo-BRAVODataRestoreRebasedLocalManifest ')
+    # Ordering: рескладка Local-манифесту в BRAVO_DATA_RESTORE МУСИТЬ
+    # відбуватись ДО строгого gate (крок 5), той самий момент, що вже
+    # застосовує SFTP-рескладку.
+    $localRebaseCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('ConvertTo-BRAVORebasedLocalGenerationManifest ')
     $strictGateCommentIndex = $dataRestoreRuntimeTextForTests.IndexOf('Строгий gate по кожному компоненту')
     Test-BRAVOCondition `
         -Condition (
@@ -10896,7 +10892,179 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             $strictGateCommentIndex -gt $localRebaseCallIndex
         ) `
         -Name "DataRestore/LocalManifestRebaseRunsBeforeStrictGate" `
-        -Failure "ConvertTo-BRAVODataRestoreRebasedLocalManifest має викликатись ДО строгого gate (крок 5) — той самий момент pipeline, де SFTP вже переписує шляхи на staging"
+        -Failure "ConvertTo-BRAVORebasedLocalGenerationManifest має викликатись ДО строгого gate (крок 5) в BRAVO_DATA_RESTORE — той самий момент pipeline, де SFTP вже переписує шляхи на staging"
+
+    # --- 7.5b. Post-round-7 follow-up (P2, review 4945879933, thread
+    # 3791434142): BRAVO_RESTORE_TEST.ps1 (pre-restore drill) МУСИТЬ
+    # застосовувати ТУ САМУ canonical rebasing-політику ДО виклику
+    # Get-BRAVOVerifiedGenerationArchive, а не довіряти сирому manifest-у —
+    # інакше relocated local repository проходить BRAVO_DATA_RESTORE, але
+    # провалює drill. Текстова перевірка + перевірка порядку (rebasing ДО
+    # виклику Get-BRAVOVerifiedGenerationArchive в циклі компонентів). ----
+    $restoreTestScriptTextForRebaseParity = [IO.File]::ReadAllText((Join-Path $root "BRAVO_RESTORE_TEST.ps1"), [Text.Encoding]::UTF8)
+    $restoreTestRebaseCallIndex = $restoreTestScriptTextForRebaseParity.IndexOf('ConvertTo-BRAVORebasedLocalGenerationManifest')
+    # Файл згадує Get-BRAVOVerifiedGenerationArchive і в doc-коментарі на
+    # початку (спільний selector/gate) — шукаємо ФАКТИЧНИЙ виклик у циклі
+    # компонентів, тобто ПІСЛЯ виклику rebasing, а не перше входження.
+    $restoreTestVerifyLoopIndex = $restoreTestScriptTextForRebaseParity.IndexOf('Get-BRAVOVerifiedGenerationArchive', [Math]::Max($restoreTestRebaseCallIndex, 0))
+    Test-BRAVOCondition `
+        -Condition (
+            $restoreTestRebaseCallIndex -gt 0 -and
+            $restoreTestVerifyLoopIndex -gt $restoreTestRebaseCallIndex -and
+            -not $restoreTestScriptTextForRebaseParity.Contains('function ConvertTo-BRAVORebasedLocalGenerationManifest') -and
+            -not $restoreTestScriptTextForRebaseParity.Contains('function Get-BRAVOVerifiedArtifactLeafName')
+        ) `
+        -Name "RestoreTest/UsesCanonicalLocalManifestRebasingBeforeVerification" `
+        -Failure "BRAVO_RESTORE_TEST.ps1 має викликати спільний ConvertTo-BRAVORebasedLocalGenerationManifest (BRAVO.ArchiveHelpers) ДО Get-BRAVOVerifiedGenerationArchive в циклі компонентів, і НЕ визначати власну копію rebasing-логіки — інакше drill і реальне відновлення (BRAVO_DATA_RESTORE) можуть розійтися в поведінці для relocated local repository"
+
+    # Behavioral parity: обидва споживачі отримують ІДЕНТИЧНИЙ результат
+    # rebasing для того самого relocated-сценарію (E: OLD_BACKUP -> поточний
+    # SystemDrive RECOVERY_BACKUP), включно з BLOG/BRAVOEXCH, і rebased
+    # шлях і надалі проходить звичайну Get-BRAVOVerifiedGenerationArchive
+    # перевірку (containment/generation/hash), а не якийсь спрощений шлях.
+    $parityFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RESTORE_TEST_REBASE_PARITY_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($parityFixtureRoot)
+        $parityComponentDirs = @{}
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            $parityComponentDirs[$parityType] = Join-Path $parityFixtureRoot $parityType
+            [void][IO.Directory]::CreateDirectory($parityComponentDirs[$parityType])
+        }
+        $parityNameTemplates = @{ MODEL = '{0}_{1}.mdz'; BLOG = '{0}_blog_{1}.mdz'; BRAVOEXCH = '{0}_exch_{1}.mdz' }
+        $parityGenerationId = '20260816_090000'
+        $parityManifestComponents = @{}
+        $parityArchiveDefinitions = @()
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            $parityArchiveName = $parityNameTemplates[$parityType] -f 'INST', $parityGenerationId
+            $parityArchivePath = Join-Path $parityComponentDirs[$parityType] $parityArchiveName
+            [IO.File]::WriteAllBytes($parityArchivePath, (New-Object byte[] 32))
+            $parityHash = (Get-BRAVOFileHash -Path $parityArchivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+            $parityHashPath = "$parityArchivePath.sha512"
+            [IO.File]::WriteAllText($parityHashPath, "$parityHash *$parityArchiveName")
+            # Manifest-шлях НАВМИСНО вказує на неіснуючий старий продюсер-
+            # корінь — саме сценарій, що провалював drill до цього фіксу.
+            $parityManifestComponents[$parityType] = @{
+                Enabled = $true
+                CreateSuccess = $true
+                IntegritySuccess = $true
+                HashSuccess = $true
+                ArchivePath = "Z:\OBSOLETE_PRODUCER_ROOT\$parityType\$parityArchiveName"
+                HashPath = "Z:\OBSOLETE_PRODUCER_ROOT\$parityType\$parityArchiveName.sha512"
+                SHA512 = $parityHash
+            }
+            $parityArchiveDefinitions += [pscustomobject]@{ Type = $parityType; Destination = $parityComponentDirs[$parityType]; NameTemplate = $parityNameTemplates[$parityType] }
+        }
+        $parityManifest = ConvertFrom-Json (@{
+            generationId = $parityGenerationId
+            status = 'COMPLETE'
+            components = $parityManifestComponents
+        } | ConvertTo-Json -Depth 8)
+
+        $parityRebased = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $parityManifest -ComponentTypes @('MODEL', 'BLOG', 'BRAVOEXCH') -ArchiveDefinitions $parityArchiveDefinitions
+        $parityVerifiedResults = @{}
+        $parityVerifyFailed = $false
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            try {
+                $parityVerifiedResults[$parityType] = Get-BRAVOVerifiedGenerationArchive `
+                    -Manifest $parityRebased `
+                    -Component $parityType `
+                    -NameTemplate $parityNameTemplates[$parityType] `
+                    -ComponentDirectory $parityComponentDirs[$parityType]
+            } catch {
+                $parityVerifyFailed = $true
+            }
+        }
+
+        # Path-escape manifest value (malicious/traversal ArchivePath) —
+        # leaf-валідатор (Get-BRAVOVerifiedArtifactLeafName) бере ЛИШЕ
+        # ім'я файлу після останнього роздільника ([System.IO.Path]::GetFileName,
+        # чиста рядкова операція), тому traversal-СЕГМЕНТИ ('..\..\..\Windows\System32\')
+        # відкидаються цілком — rebased ArchivePath стає leaf-only шляхом
+        # УСЕРЕДИНІ canonical каталогу компонента (не "неперезаписаним", як
+        # можна було б наївно очікувати: сам "evil.mdz" — валідне ім'я
+        # файлу). Це й Є захист: жоден traversal-сегмент фізично не
+        # потрапляє в результуючий шлях. Файл із таким ім'ям фізично НЕ
+        # існує в canonical каталозі компонента, тому подальший
+        # Get-BRAVOVerifiedGenerationArchive все одно провалюється
+        # (Test-Path на відсутньому артефакті) — REJECT, не silent
+        # fallback на producer-шлях і не траверсал за межі каталогу.
+        $parityEscapeManifest = ConvertFrom-Json (@{
+            generationId = $parityGenerationId
+            status = 'COMPLETE'
+            components = @{
+                MODEL = @{
+                    Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true
+                    ArchivePath = '..\..\..\Windows\System32\evil.mdz'
+                    HashPath = '..\..\..\Windows\System32\evil.mdz.sha512'
+                    SHA512 = 'DEADBEEF'
+                }
+            }
+        } | ConvertTo-Json -Depth 8)
+        $parityEscapeRebased = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $parityEscapeManifest -ComponentTypes @('MODEL') -ArchiveDefinitions @([pscustomobject]@{ Type = 'MODEL'; Destination = $parityComponentDirs['MODEL'] })
+        $parityEscapeRebasedPath = [string]$parityEscapeRebased.components.MODEL.ArchivePath
+        $parityEscapeContainedSafely = ($parityEscapeRebasedPath -eq (Join-Path $parityComponentDirs['MODEL'] 'evil.mdz')) -and
+            (-not $parityEscapeRebasedPath.Contains('..')) -and
+            (-not $parityEscapeRebasedPath.Contains('System32'))
+        $parityEscapeRejected = $false
+        try {
+            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $parityEscapeRebased -Component 'MODEL' -NameTemplate $parityNameTemplates['MODEL'] -ComponentDirectory $parityComponentDirs['MODEL'])
+        } catch {
+            $parityEscapeRejected = $true
+        }
+
+        # Missing archive after legitimate rebasing (component directory
+        # exists, canonical, але артефакт фізично відсутній) -> FAIL, не
+        # silent fallback на (недосяжний) producer-шлях.
+        $parityMissingComponentDir = Join-Path $parityFixtureRoot 'MODEL_EMPTY'
+        [void][IO.Directory]::CreateDirectory($parityMissingComponentDir)
+        $parityMissingManifest = ConvertFrom-Json (@{
+            generationId = $parityGenerationId
+            status = 'COMPLETE'
+            components = @{
+                MODEL = @{
+                    Enabled = $true; CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true
+                    ArchivePath = 'Z:\OBSOLETE_PRODUCER_ROOT\MODEL\missing.mdz'
+                    HashPath = 'Z:\OBSOLETE_PRODUCER_ROOT\MODEL\missing.mdz.sha512'
+                    SHA512 = 'DEADBEEF'
+                }
+            }
+        } | ConvertTo-Json -Depth 8)
+        $parityMissingRebased = ConvertTo-BRAVORebasedLocalGenerationManifest -Manifest $parityMissingManifest -ComponentTypes @('MODEL') -ArchiveDefinitions @([pscustomobject]@{ Type = 'MODEL'; Destination = $parityMissingComponentDir })
+        $parityMissingRejected = $false
+        try {
+            [void](Get-BRAVOVerifiedGenerationArchive -Manifest $parityMissingRebased -Component 'MODEL' -NameTemplate $parityNameTemplates['MODEL'] -ComponentDirectory $parityMissingComponentDir)
+        } catch {
+            $parityMissingRejected = $true
+        }
+
+        # Жоден зі старих producer-шляхів (Z:\OBSOLETE_PRODUCER_ROOT) не
+        # використовується після rebasing — перевіряємо, що успішно
+        # верифікований архів фізично лежить у НОВОМУ canonical каталозі.
+        $parityNoProducerPathAccessed = $true
+        foreach ($parityType in @('MODEL', 'BLOG', 'BRAVOEXCH')) {
+            if ($null -ne $parityVerifiedResults[$parityType]) {
+                if (([string]$parityVerifiedResults[$parityType].FullName).StartsWith('Z:\OBSOLETE_PRODUCER_ROOT', [StringComparison]::OrdinalIgnoreCase)) {
+                    $parityNoProducerPathAccessed = $false
+                }
+            }
+        }
+
+        Test-BRAVOCondition `
+            -Condition (
+                -not $parityVerifyFailed -and
+                $parityVerifiedResults.Count -eq 3 -and
+                $parityNoProducerPathAccessed -and
+                $parityEscapeContainedSafely -and
+                $parityEscapeRejected -and
+                $parityMissingRejected
+            ) `
+            -Name "RestoreTest/LocalManifestRebasingParityAcrossComponentsAndFailureModes" `
+            -Failure "ConvertTo-BRAVORebasedLocalGenerationManifest + Get-BRAVOVerifiedGenerationArchive мають: (a) успішно верифікувати MODEL/BLOG/BRAVOEXCH після rebasing на новий canonical каталог, без жодного звернення до старого producer-кореня; (b) traversal-сегменти path-escape ArchivePath МАЮТЬ бути відкинуті (leaf-only rebased шлях суворо всередині canonical каталогу компонента), і подальша верифікація МУСИТЬ провалитись (файла з таким ім'ям там немає), а не silently fallback на producer-шлях; (c) відхиляти легітимно rebased, але фізично відсутній архів явним FAIL"
+    } finally {
+        if (Test-Path -LiteralPath $parityFixtureRoot) {
+            Remove-Item -LiteralPath $parityFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # --- 7.7. P1 (документація): OPERATIONS.md більше не радить брати
     # "найстаріший" .prerestore_* — це відкочує компонент на generation
