@@ -751,23 +751,53 @@ if (Test-Path -LiteralPath $live) {
 Rename-Item -LiteralPath $prerestore -NewName (Split-Path $live -Leaf)
 ```
 
-Крок 6. Запустіть **лише ті** служби, які працювали до відновлення
-(BRAVO зупиняє тільки Running-служби, тож решту чіпати не треба). Що саме
-було зупинено — видно в журналі прогону:
+Крок 6. Запустіть **лише ті** служби, чий залогований намір відновлення
+(`restart-after-recovery`) дорівнює `YES` — **не** ті, що були буквально
+`Running` на момент аварії. BRAVO примусово зупиняє (квієсценція) УСІ
+керовані служби перед move-aside, незалежно від їхнього стану на момент
+знімка, а не лише ті, що вже працювали. Поточна політика наміру
+відновлення (`Get-BRAVODataRestoreServiceSnapshot`):
+
+- `Running` на момент знімка → restart intent `YES`;
+- `StartPending` на момент знімка → restart intent `YES` (служба ще
+  тільки запускалась, але оператор мав намір, щоб вона працювала);
+- `Stopped` / `StopPending` / `Paused` / `ContinuePending` /
+  `PausePending` / будь-який інший стан → restart intent `NO`.
+
+Точний запис для КОЖНОЇ керованої служби пишеться в журнал одразу після
+знімка стану, ще ДО move-aside (саме тому доступний навіть якщо прогін
+перервався до фінального автоматичного restart-кроку — kill/BSOD/
+завершення PowerShell):
 
 ```powershell
-Select-String -Path $log.FullName -Pattern 'Зупинка служби'
+Select-String -Path $log.FullName -Pattern 'Знімок служби'
+# Приклад рядка:
+#   Знімок служби BRAVO: initial=Running, restart-after-recovery=YES
+#   Знімок служби ExchangeApi: initial=StartPending, restart-after-recovery=YES
+#   Знімок служби BravoWeb: initial=Stopped, restart-after-recovery=NO
+```
 
+Використовуйте **виключно** запис саме цього перерваного прогону (той
+самий лог-файл, що й Крок 0/`$prerestore`) — так само, як для вибору
+`.prerestore_*`-копії, ніколи не вгадуйте намір відновлення за поточним
+станом служб після перезавантаження/аварії: він міг змінитися незалежно
+від того, що BRAVO мала намір відновити. Якщо очікуваний запис "Знімок
+служби" відсутній або неповний (наприклад, прогін перервався ще до
+знімка стану служб) — **зупиніться** і розберіться вручну, не
+запускайте служби навмання.
+
+```powershell
 # Поточний стан для порівняння:
 Get-Service '<BravoName>', '<ExchangeApiName>' | Select-Object Name, Status, StartType
 
-# Запускати у зворотному до зупинки порядку і ТІЛЬКИ ті, що були Running:
+# Запускати у зворотному до зупинки порядку і ТІЛЬКИ ті, у яких
+# restart-after-recovery=YES у знайденому запису:
 Start-Service '<BravoName>'
 Start-Service '<ExchangeApiName>'
 ```
 
-Служба, яка була `Stopped` до відновлення, має залишитися зупиненою —
-її стан не є наслідком аварії. Службу зі `StartType = Disabled` не
+Служба з `restart-after-recovery=NO` має залишитися зупиненою — її
+стан не є наслідком аварії. Службу зі `StartType = Disabled` не
 намагайтеся піднімати: її відключив адміністратор, і `Start-Service`
 все одно завершиться помилкою.
 

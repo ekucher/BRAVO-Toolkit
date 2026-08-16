@@ -8119,6 +8119,7 @@ function Stop-Process {
             'Test-BRAVODataRestorePathHasReparseAncestor',
             'Test-BRAVODataRestoreGenerationIdFormat',
             'Test-BRAVODataRestoreMinimumFreeSpaceGB',
+            'Test-BRAVODataRestoreFullyQualifiedWindowsPath',
             'ConvertTo-BRAVODataRestoreElevationArgument',
             'Get-BRAVODataRestoreComponentSelection',
             'Get-BRAVODataRestoreLiveSourceMap',
@@ -10779,7 +10780,7 @@ function Invoke-BRAVODataRestoreWinSCPScript {
 
     # --- 7.4. P2: -StagingPath МУСИТЬ бути абсолютним; відносний/malformed
     # шлях -> InvalidConfiguration (exit 30), не generic internal error 90. -
-    $stagingRootedCheckIndex = $dataRestoreRuntimeTextForTests.IndexOf('[System.IO.Path]::IsPathRooted($expandedStagingPath)')
+    $stagingRootedCheckIndex = $dataRestoreRuntimeTextForTests.IndexOf('Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $expandedStagingPath')
     $stagingExit30Index = $dataRestoreRuntimeTextForTests.IndexOf('exit 30', $stagingRootedCheckIndex)
     $stagingGetFullPathTryIndex = $dataRestoreRuntimeTextForTests.IndexOf('[System.IO.Path]::GetFullPath($expandedStagingPath)', $stagingRootedCheckIndex)
     Test-BRAVOCondition `
@@ -10787,10 +10788,45 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             $stagingRootedCheckIndex -gt 0 -and
             $stagingExit30Index -gt $stagingRootedCheckIndex -and
             $stagingGetFullPathTryIndex -gt $stagingExit30Index -and
-            $dataRestoreRuntimeTextForTests.Contains('-StagingPath має бути абсолютним шляхом')
+            $dataRestoreRuntimeTextForTests.Contains('-StagingPath має бути повністю кваліфікованим шляхом')
         ) `
         -Name "DataRestore/StagingPathMustBeAbsolute" `
-        -Failure "Ненульовий -StagingPath має проходити IsPathRooted ДО GetFullPath і провалюватись через InvalidConfiguration (exit 30) при відносному чи некоректному значенні — інакше відносний шлях резолвиться відносно робочого каталогу елевованого процесу, а malformed шлях провалюється як generic internal error"
+        -Failure "Ненульовий -StagingPath має проходити Test-BRAVODataRestoreFullyQualifiedWindowsPath ДО GetFullPath і провалюватись через InvalidConfiguration (exit 30) при відносному/диск-відносному/корінь-відносному чи некоректному значенні — інакше такий шлях резолвиться відносно поточного (диска/елевованого процесу) контексту, а malformed шлях провалюється як generic internal error"
+
+    # --- 7.4b. P2 follow-up: Test-BRAVODataRestoreFullyQualifiedWindowsPath
+    # приймає лише СПРАВДІ фіксовані форми (буква-диска:\ або UNC
+    # \\сервер\ресурс) — IsPathRooted() сам по собі вважав rooted і
+    # диск-відносні ('C:RESTORE_STAGING'), і корінь-відносні
+    # ('\RESTORE_STAGING') значення, хоча обидва фактично резолвуються
+    # відносно поточного диска/контексту процесу (той самий клас
+    # небезпеки, що round-7 уже закрив для звичайних відносних шляхів). ---
+    $fqInvoke = {
+        param($Module, $Value)
+        & $Module { param($v) Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $v } $Value
+    }
+    $fqDriveBackslash = & $fqInvoke $dataRestoreModule 'C:\RESTORE_STAGING'
+    $fqDriveForwardSlash = & $fqInvoke $dataRestoreModule 'C:/RESTORE_STAGING'
+    $fqUnc = & $fqInvoke $dataRestoreModule '\\server\share\RESTORE_STAGING'
+    $fqBareRelative = & $fqInvoke $dataRestoreModule 'RESTORE_STAGING'
+    $fqDotRelative = & $fqInvoke $dataRestoreModule '.\RESTORE_STAGING'
+    $fqDriveRelative = & $fqInvoke $dataRestoreModule 'C:RESTORE_STAGING'
+    $fqRootRelative = & $fqInvoke $dataRestoreModule '\RESTORE_STAGING'
+    $fqMalformedUncShareOnly = & $fqInvoke $dataRestoreModule '\\server'
+    $fqEmpty = & $fqInvoke $dataRestoreModule ''
+    Test-BRAVOCondition `
+        -Condition (
+            $fqDriveBackslash -eq $true -and
+            $fqDriveForwardSlash -eq $true -and
+            $fqUnc -eq $true -and
+            $fqBareRelative -eq $false -and
+            $fqDotRelative -eq $false -and
+            $fqDriveRelative -eq $false -and
+            $fqRootRelative -eq $false -and
+            $fqMalformedUncShareOnly -eq $false -and
+            $fqEmpty -eq $false
+        ) `
+        -Name "DataRestore/StagingPathRejectsDriveAndRootRelativeForms" `
+        -Failure "Test-BRAVODataRestoreFullyQualifiedWindowsPath має приймати лише 'C:\...'/'C:/...' та валідний UNC '\\сервер\ресурс\...', і відхиляти голе ім'я, '.\...', диск-відносне 'C:...' (без роздільника після ':'), корінь-відносне '\...' (без другого провідного backslash), неповний UNC (лише сервер, без ресурсу) та порожнє значення"
 
     # --- 7.5. P2: локальні артефакти мають переживати relocation
     # backup-root — leaf-ім'я з manifest-шляху (недовірений вхід)
@@ -10874,6 +10910,52 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/OperationsRunbookRecoversInterruptedRunCopyNotOldest" `
         -Failure "OPERATIONS.md не повинен радити брати найстаріший .prerestore_* при відновленні після переривання — потрібна прив'язка до ТОЧНОГО прогону через рядок 'Поточні дані знесено вбік' у журналі саме перерваного прогону (Крок 0), інакше компонент відкочується на generation далі, ніж треба"
+
+    # --- 7.8. P2 follow-up: Get-BRAVODataRestoreServiceSnapshot зберігає
+    # InitialStatus у кожному записі знімка (окремо від WasRunning/
+    # ShouldRestartAfterRestore) — саме воно потрібне для точного
+    # операторського аудиту (не лише true/false Running). ------------------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('Status = if ($null -ne $service) { [string]$service.Status } else { $null }') -and
+            $dataRestoreRuntimeTextForTests.Contains('InitialStatus = $stateStatus')
+        ) `
+        -Name "DataRestore/ServiceSnapshotPreservesInitialStatus" `
+        -Failure "Get-BRAVODataRestoreServiceSnapshot має зберігати InitialStatus (точний рядок стану служби на момент знімка, напр. 'StartPending') у кожному записі — потрібно для операторського аудиту, а не лише булевого WasRunning"
+
+    # --- 7.9. P2 follow-up: план/лог перед move-aside НЕ повинен зводити
+    # "служби для зупинки" до фільтра WasRunning — квієсценція діє на ВСІ
+    # Managed-записи (initially-Stopped служба, що встигла запуститись до
+    # move-aside, теж має бути зупинена). Restart-intent показується
+    # ОКРЕМО. Аудиторський рядок пишеться в ЛОГ (Write-DataRestoreLog) ДО
+    # move-aside, щоб пережити переривання прогону до фінального
+    # restart-кроку. -------------------------------------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            -not $dataRestoreRuntimeTextForTests.Contains('$servicesToStop = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed -and $_.WasRunning })') -and
+            $dataRestoreRuntimeTextForTests.Contains('$managedServicesForQuiescence = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed })') -and
+            $dataRestoreRuntimeTextForTests.Contains('$servicesWithRestartIntent = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed -and $_.ShouldRestartAfterRestore })') -and
+            $dataRestoreRuntimeTextForTests.Contains('Знімок служби {0}: initial={1}, restart-after-recovery={2}') -and
+            $dataRestoreRuntimeTextForTests.IndexOf('Write-DataRestoreLog -Message ("Знімок служби') -lt $dataRestoreRuntimeTextForTests.IndexOf('Invoke-BRAVODataRestoreMoveAside `')
+        ) `
+        -Name "DataRestore/ServiceSnapshotAuditTrailPrecedesMoveAside" `
+        -Failure "Операторський план/лог не повинен зводити квієсценцію до 'лише WasRunning'-фільтра (вона діє на ВСІ Managed-записи); restart-intent має показуватись окремо; кожен Managed-запис має логуватись ('Знімок служби {Name}: initial=..., restart-after-recovery=...') через Write-DataRestoreLog СТРОГО ДО першого move-aside — інакше запис може ніколи не потрапити в лог, якщо прогін перерветься раніше"
+
+    # --- 7.10. P2 follow-up: OPERATIONS.md більше не радить '"лише
+    # Running"'/"BRAVO зупиняє тільки Running-служби" — квієсценція діє на
+    # всі Managed-служби, а restart-intent (Running АБО StartPending)
+    # береться саме з залогованого запису знімка, не з поточного стану
+    # служб після аварії/перезавантаження. ---------------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            -not $operationsTextForRound7.Contains('BRAVO зупиняє тільки Running-служби') -and
+            -not $operationsTextForRound7.Contains('ТІЛЬКИ ті, що були Running') -and
+            $operationsTextForRound7.Contains('StartPending') -and
+            $operationsTextForRound7.Contains('restart-after-recovery') -and
+            $operationsTextForRound7.Contains('Знімок служби')
+        ) `
+        -Name "DataRestore/OperationsRunbookRestartGuidanceMatchesStartPendingPolicy" `
+        -Failure "OPERATIONS.md не повинен стверджувати, що BRAVO зупиняє/відновлює лише Running-служби (квієсценція діє на всі Managed, а restart-intent = Running АБО StartPending); операторська інструкція має спиратись на залогований запис 'Знімок служби ...: restart-after-recovery=...' точно перерваного прогону, а не на поточний стан служб після аварії"
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло

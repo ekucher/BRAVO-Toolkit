@@ -134,6 +134,28 @@ function Test-BRAVODataRestoreMinimumFreeSpaceGB {
     return $true
 }
 
+function Test-BRAVODataRestoreFullyQualifiedWindowsPath {
+    # PS 5.1-сумісна валідація "справді абсолютного" Windows-шляху (round-7
+    # follow-up P2): [System.IO.Path]::IsPathRooted() вважає '\RESTORE_STAGING'
+    # і 'C:RESTORE_STAGING' rooted, хоча обидва насправді ВІДНОСНІ —
+    # 'C:RESTORE_STAGING' резолвиться відносно поточного робочого каталогу
+    # ДИСКА C: (per-drive current directory, який зберігає процес), а
+    # '\RESTORE_STAGING' — відносно кореня ПОТОЧНОГО диска (може не
+    # збігатися з наміром оператора, особливо в елевованому дочірньому
+    # процесі — саме той клас небезпеки, який round-7 уже закрив для
+    # відносних шляхів без провідного роздільника).
+    # [System.IO.Path]::IsPathFullyQualified() існує лише в .NET Core/5+,
+    # недоступний у Windows PowerShell 5.1 (.NET Framework) — тому явна
+    # перевірка на regex двох дозволених канонічних форм:
+    #   локальний диск: <Буква>:\ або <Буква>:/, одразу роздільник після ":"
+    #   UNC:            \\сервер\ресурс з непорожнім ім'ям сервера й ресурсу
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    if ($Value -match '^[A-Za-z]:[\\/]') { return $true }
+    if ($Value -match '^\\\\[^\\/]+\\[^\\/]+') { return $true }
+    return $false
+}
+
 function ConvertTo-BRAVODataRestoreElevationArgument {
     # Безпечна серіалізація ОДНОГО значення в ОДИН елемент командного рядка
     # для Start-Process -ArgumentList: масив рядків, переданий у
@@ -314,18 +336,24 @@ $script:effectiveSevenZipTimeoutSeconds = if ($TimeoutSeconds -gt 0) {
 $stagingRootPath = if ([string]::IsNullOrWhiteSpace($StagingPath)) {
     Join-Path $backupRootPath 'RESTORE_STAGING'
 } else {
-    # Абсолютність вимагається явно (round-7 P2): на відміну від -TargetPath
-    # (Get-BRAVODataRestorePlan уже вимагає IsPathRooted), -StagingPath
-    # раніше йшов напряму в GetFullPath без цієї перевірки — відносне
-    # значення резолвилось відносно робочого каталогу ЕЛЕВОВАНОГО процесу
-    # (типово системний/runtime каталог, не те, що оператор мав на увазі),
-    # і SFTP-завантаження та рекурсивне очищення generation відбувались би
-    # саме там. Некоректний/невирішуваний шлях тут МУСИТЬ класифікуватись
-    # як InvalidConfiguration (exit 30), а не провалюватись у
-    # generic catch-all InternalError (exit 90) нижче за файлом.
+    # Абсолютність вимагається явно (round-7 P2, посилено follow-up P2):
+    # на відміну від -TargetPath (Get-BRAVODataRestorePlan уже вимагає
+    # IsPathRooted), -StagingPath раніше йшов напряму в GetFullPath без цієї
+    # перевірки — відносне значення резолвилось відносно робочого каталогу
+    # ЕЛЕВОВАНОГО процесу (типово системний/runtime каталог, не те, що
+    # оператор мав на увазі), і SFTP-завантаження та рекурсивне очищення
+    # generation відбувались би саме там. [System.IO.Path]::IsPathRooted()
+    # САМ ПО СОБІ недостатній: він вважає диск-відносні ('C:RESTORE_STAGING')
+    # і корінь-відносні ('\RESTORE_STAGING') значення "rooted", хоча обидва
+    # фактично резолвяться відносно поточного (диска/елевованого процесу)
+    # контексту — той самий клас небезпеки. Test-BRAVODataRestoreFullyQualifiedWindowsPath
+    # приймає лише справді фіксовані форми (буква-диска:\ або UNC \\сервер\ресурс).
+    # Некоректний/невирішуваний шлях тут МУСИТЬ класифікуватись як
+    # InvalidConfiguration (exit 30), а не провалюватись у generic
+    # catch-all InternalError (exit 90) нижче за файлом.
     $expandedStagingPath = [Environment]::ExpandEnvironmentVariables($StagingPath)
-    if (-not [System.IO.Path]::IsPathRooted($expandedStagingPath)) {
-        Write-Host "ПОМИЛКА: -StagingPath має бути абсолютним шляхом: $StagingPath" -ForegroundColor Red
+    if (-not (Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $expandedStagingPath)) {
+        Write-Host "ПОМИЛКА: -StagingPath має бути повністю кваліфікованим шляхом (буква-диска:\ або UNC \\сервер\ресурс): $StagingPath" -ForegroundColor Red
         exit 30
     }
     try {
@@ -1539,6 +1567,7 @@ function Get-BRAVODataRestoreServiceSnapshot {
             Name = [string]$definition.Name
             Managed = ($definition.ComponentEnabled -and $stateExists -and -not $stateDisabled)
             WasRunning = $stateRunning
+            InitialStatus = $stateStatus
             ShouldRestartAfterRestore = $shouldRestartAfterRestore
             KillProcesses = @($definition.KillProcesses)
         }
@@ -3450,8 +3479,37 @@ try {
             $stageStartedAt = Get-Date
             $script:dataRestoreServiceSnapshot = Get-BRAVODataRestoreServiceSnapshot `
                 -ServicesSettings $maintenanceSettings.Services
-            $servicesToStop = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed -and $_.WasRunning })
-            Write-BRAVOResultNote -Text ("  Служби для зупинки: {0}" -f $(if ($servicesToStop.Count -gt 0) { @($servicesToStop | ForEach-Object { $_.Name }) -join ', ' } else { 'немає (жодна не працює)' }))
+            # Два РІЗНІ набори (round-7 follow-up P2 — не плутати їх):
+            #   $managedServicesForQuiescence — ВСІ Managed-служби: саме на
+            #     них діє примусова Stopped-квієсценція нижче, і вона
+            #     повторно перевіряє ПОТОЧНИЙ стан (а не WasRunning зі
+            #     знімка) — initially-Stopped служба, що встигла запуститись
+            #     до квієсценції, так само буде зупинена (гонитву це вже
+            #     закрито раніше). Стара назва "$servicesToStop" з фільтром
+            #     "WasRunning" оманливо натякала, що квієсценція торкається
+            #     лише службу, яка вже працювала на момент знімка.
+            #   $servicesWithRestartIntent — підмножина Managed, де
+            #     ShouldRestartAfterRestore=true (Running АБО StartPending на
+            #     момент знімка) — саме ці служби буде запущено назад після
+            #     restore, незалежно від літерального WasRunning.
+            $managedServicesForQuiescence = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed })
+            $servicesWithRestartIntent = @($script:dataRestoreServiceSnapshot | Where-Object { $_.Managed -and $_.ShouldRestartAfterRestore })
+            Write-BRAVOResultNote -Text ("  Керовані служби (підлягають примусовій зупинці): {0}" -f $(if ($managedServicesForQuiescence.Count -gt 0) { @($managedServicesForQuiescence | ForEach-Object { $_.Name }) -join ', ' } else { 'немає' }))
+            Write-BRAVOResultNote -Text ("  Намір відновлення після restore (Running/StartPending на момент знімка): {0}" -f $(if ($servicesWithRestartIntent.Count -gt 0) { @($servicesWithRestartIntent | ForEach-Object { $_.Name }) -join ', ' } else { 'немає' }))
+            # Аудиторський запис у ФАЙЛ ЛОГУ (не лише консоль), ДО move-aside
+            # (round-7 follow-up P2): якщо процес переривається (kill/BSOD/
+            # закриття PowerShell) до фінального finally-кроку запуску служб,
+            # автоматичний restart-крок може НІКОЛИ не виконатись. Оператор
+            # МУСИТЬ мати змогу відновити restart-intent саме з ЛОГУ цього
+            # конкретного перерваного прогону — не з ефемерного in-memory
+            # ShouldRestartAfterRestore і не вгадуванням з поточного стану
+            # служб після перезавантаження (те й інше вже заборонено
+            # OPERATIONS.md для .prerestore_* вибору з тієї ж причини).
+            foreach ($snapshotEntry in $managedServicesForQuiescence) {
+                $auditInitialStatus = if ([string]::IsNullOrWhiteSpace([string]$snapshotEntry.InitialStatus)) { 'Unknown' } else { [string]$snapshotEntry.InitialStatus }
+                $auditRestartIntent = if ($snapshotEntry.ShouldRestartAfterRestore) { 'YES' } else { 'NO' }
+                Write-DataRestoreLog -Message ("Знімок служби {0}: initial={1}, restart-after-recovery={2}" -f $snapshotEntry.Name, $auditInitialStatus, $auditRestartIntent)
+            }
             Write-BRAVOOperationResult `
                 -Name 'Знімок стану служб' `
                 -Status 'OK' `
@@ -3480,7 +3538,7 @@ try {
             }
             Write-BRAVOOperationResult `
                 -Name 'Зупинка служб' `
-                -Status $(if ($servicesToStop.Count -gt 0) { 'OK' } else { 'SKIPPED' }) `
+                -Status $(if ($managedServicesForQuiescence.Count -gt 0) { 'OK' } else { 'SKIPPED' }) `
                 -Duration ((Get-Date) - $stageStartedAt)
         }
 
