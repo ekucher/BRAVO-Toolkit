@@ -787,13 +787,18 @@ Select-String -Path $log.FullName -Pattern 'Знімок служби'
 запускайте служби навмання.
 
 ```powershell
-# Поточний стан для порівняння:
-Get-Service '<BravoName>', '<ExchangeApiName>' | Select-Object Name, Status, StartType
+# Поточний стан для порівняння (включно з BravoWeb, якщо вона керована —
+# Get-BRAVODataRestoreServiceSnapshot зупиняє й відновлює її так само, як
+# BRAVO і exchangAPI, коли BravoWebEnabled увімкнено в конфігурації):
+Get-Service '<BravoName>', '<ExchangeApiName>', '<BravoWebName>' | Select-Object Name, Status, StartType
 
-# Запускати у зворотному до зупинки порядку і ТІЛЬКИ ті, у яких
-# restart-after-recovery=YES у знайденому запису:
+# Запускати у зворотному до зупинки порядку (canonical: BRAVO -> exchangAPI
+# -> BravoWeb, той самий порядок, що Restore-BRAVODataRestoreServices
+# застосовує автоматично) і ТІЛЬКИ ті, у яких restart-after-recovery=YES
+# у знайденому запису:
 Start-Service '<BravoName>'
 Start-Service '<ExchangeApiName>'
+Start-Service '<BravoWebName>'
 ```
 
 Служба з `restart-after-recovery=NO` має залишитися зупиненою — її
