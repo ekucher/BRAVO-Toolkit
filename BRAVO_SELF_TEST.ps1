@@ -9401,6 +9401,63 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         }
     }
 
+    # --- 6.10.1. B4 acceptance defect (9257157/PHASE 3): SFTP staging
+    # free-space requirement (stagingRequirements) МАЄ оголошувати
+    # ProbeDirectory на кожному requirement-об'єкті. Set-StrictMode
+    # успадковується від конфігураційного завантажувача (див. коментар на
+    # початку Runtime.ps1) — звернення до НЕОГОЛОШЕНОЇ властивості
+    # pscustomobject під StrictMode кидає PropertyNotFoundException, а не
+    # мовчазно повертає $null. До фіксу stagingRequirements будувався БЕЗ
+    # ProbeDirectory -> Test-BRAVODataRestoreFreeSpace падав на першому ж
+    # requirement -> НЕОЧІКУВАНА ПОМИЛКА -> exit 90 ще ДО завантаження
+    # staging-даних (кожен -Source SFTP restore). Тест відтворює саме цей
+    # механізм на РЕАЛЬНІЙ Test-BRAVODataRestoreFreeSpace під явним
+    # Set-StrictMode: без ProbeDirectory — кидає; з ProbeDirectory (навіть
+    # $null, як фактично будує стейджинг-код) — проходить.
+    $stagingProbeTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DATA_RESTORE_STAGING_PROBE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        [void][IO.Directory]::CreateDirectory($stagingProbeTestRoot)
+
+        $stagingProbeMissingThrew = & $dataRestoreModule {
+            param($dir)
+            Set-StrictMode -Version Latest
+            try {
+                # Той самий "голий" літерал, який мав stagingRequirements ДО
+                # фіксу — без властивості ProbeDirectory.
+                $requirement = [pscustomobject]@{ TargetDirectory = $dir; RequiredBytes = [long]1024 }
+                Test-BRAVODataRestoreFreeSpace -Requirements @($requirement) -MinimumFreeGigabytes 0.001 | Out-Null
+                return $false
+            } catch [System.Management.Automation.PropertyNotFoundException] {
+                return $true
+            }
+        } $stagingProbeTestRoot
+
+        $stagingProbeDeclaredResult = & $dataRestoreModule {
+            param($dir)
+            Set-StrictMode -Version Latest
+            # Та сама форма, яку зараз (після фіксу) реально будує SFTP
+            # staging-preflight: ProbeDirectory явно оголошено як $null
+            # (staging-каталог — не live production-джерело, walk-up до
+            # найближчого наявного батьківського каталогу лишається у силі).
+            $requirement = [pscustomobject]@{ TargetDirectory = $dir; RequiredBytes = [long]1024; ProbeDirectory = $null }
+            Test-BRAVODataRestoreFreeSpace -Requirements @($requirement) -MinimumFreeGigabytes 0.001
+        } $stagingProbeTestRoot
+
+        Test-BRAVOCondition `
+            -Condition (
+                $stagingProbeMissingThrew -and
+                $stagingProbeDeclaredResult.Success -and
+                $dataRestoreRuntimeTextForTests.Contains('$stagingRequirements += [pscustomobject]@{') -and
+                $dataRestoreRuntimeTextForTests.Contains('ProbeDirectory = $null')
+            ) `
+            -Name "DataRestore/SftpStagingFreeSpaceRequirementDeclaresProbeDirectory" `
+            -Failure "SFTP staging free-space requirement (stagingRequirements) МАЄ оголошувати ProbeDirectory (навіть `$null) на кожному об'єкті — під успадкованим Set-StrictMode звернення до неоголошеної властивості кидає PropertyNotFoundException -> InternalError exit 90 ще ДО завантаження staging-даних (regression B4, 9257157 PHASE 3 acceptance)"
+    } finally {
+        if (Test-Path -LiteralPath $stagingProbeTestRoot) {
+            Remove-Item -LiteralPath $stagingProbeTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # --- 6.11. Second restore safety review (PR #40): WinSCP-скрипт
     # DataRestore тепер створюється через canonical New-BRAVOWinSCPTemporaryScriptPath
     # (protected DACL з моменту створення), а прибирається через

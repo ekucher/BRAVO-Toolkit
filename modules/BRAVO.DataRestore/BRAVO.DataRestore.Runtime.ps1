@@ -3230,6 +3230,16 @@ try {
                 $stagingRequirements += [pscustomobject]@{
                     TargetDirectory = Join-Path (Join-Path $stagingRootPath $script:dataRestoreSelectedGenerationId) $componentType
                     RequiredBytes = $validatedArchiveSizeBytes
+                    # Staging-каталог — не live production-джерело (на
+                    # відміну від InPlace TargetDirectory), тому явного
+                    # ProbeDirectory не потрібно: Test-BRAVODataRestoreFreeSpace
+                    # сам піднімається до найближчого наявного батьківського
+                    # каталогу, коли TargetDirectory ще не створено. Властивість
+                    # усе одно МАЄ бути оголошена — Set-StrictMode успадковується
+                    # від конфігураційного завантажувача, і звернення до
+                    # невідомої властивості pscustomobject кидає
+                    # PropertyNotFoundException (це й був корінь дефекту B4).
+                    ProbeDirectory = $null
                 }
             }
             $stagingSpaceCheck = Test-BRAVODataRestoreFreeSpace `
