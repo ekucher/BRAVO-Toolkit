@@ -682,7 +682,7 @@ function Test-BRAVODataRestoreToolIntegrity {
     # runtime виконує 7za.exe/WinSCP.com від імені адміністратора, тому
     # перед запуском інструмент звіряється з version-controlled
     # TOOLS_MANIFEST.json.
-    param([Parameter(Mandatory = $true)][string[]]$ToolNames)
+    param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ToolNames)
 
     $integrityMode = 'Enforce'
     $manifestPath = $null

@@ -9458,6 +9458,25 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Name "DataRestore/ListGenerationsDoesNotRequireSevenZip" `
         -Failure "required tools мають похідати з фактичної операції: -ListGenerations (Local або SFTP) ніколи не має вимагати 7za.exe; лише реальне відновлення (не -ListGenerations) додає 7za.exe, а SFTP окремо додає WinSCP.com"
 
+    # --- 6.13b. DEV-LIMS acceptance defect (5.1.0-rc.2, exit 90): для
+    # -ListGenerations -Source Local $requiredTools legitimately обчислюється
+    # як порожній масив (див. 6.13 вище), але Test-BRAVODataRestoreToolIntegrity
+    # мала [Parameter(Mandatory=$true)][string[]]$ToolNames БЕЗ
+    # AllowEmptyCollection() — PowerShell 5.1 відхиляє порожній масив, поданий
+    # у mandatory-параметр, як "значення не надано", що падало з
+    # ParameterBindingException ще ДО Enter-BRAVODataRestoreOperationLock
+    # (canonical InternalError, exit 90). Той самий контракт
+    # [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]] вже
+    # використовується у цьому файлі для ManifestNames/CompletedComponents/
+    # Failures — тепер ToolNames узгоджений з ними. ---------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            $dataRestoreRuntimeTextForTests.Contains('function Test-BRAVODataRestoreToolIntegrity {') -and
+            $dataRestoreRuntimeTextForTests.Contains('param([Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ToolNames)')
+        ) `
+        -Name "DataRestore/ToolIntegrityAllowsEmptyToolSet" `
+        -Failure 'Test-BRAVODataRestoreToolIntegrity -ToolNames $ToolNames мусить мати [AllowEmptyCollection()] — для -ListGenerations -Source Local $requiredTools=@() є легітимним, задокументованим (не помилковим) входом; без цього атрибута PowerShell 5.1 відхиляє порожній масив у mandatory string[]-параметрі й canonical B1 (-ListGenerations) завершується exit 90 ще до захоплення operation lock'
+
     # --- 6.14. Third restore safety review (PR #40): SFTP ls-лістинг має
     # бути fail-closed (Success=true журналу WinSCP не гарантує, що сама
     # ls-операція успішна — той самий контракт, що вже перевіряється для
