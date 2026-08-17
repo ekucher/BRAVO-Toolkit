@@ -140,16 +140,23 @@ try {
 
     # Фактична безпечна властивість — "DataRestore ніколи не зупиняв
     # реальну службу" (Managed=false у fixture-конфізі це гарантує на
-    # рівні коду; тут — belt-and-suspenders підтвердження). Служба, що
-    # САМА стартувала під час прогону (Stopped -> Running), — типовий
-    # фоновий шум ОС (PnP/device enumeration/заплановане обслуговування),
-    # не пов'язаний із цим скриптом: DataRestore ніколи не викликає
-    # Start-Service на нічому, крім своїх (тут — неіснуючих) Managed-
-    # служб. Лише перехід ІЗ Running в будь-який інший стан — реальний
-    # сигнал.
-    $realServiceSnapshotAfter = @(Get-Service | Select-Object Name, Status)
+    # рівні коду; тут — belt-and-suspenders підтвердження). Загальний
+    # знімок УСІХ служб виявився ненадійним на реальних машинах (CI і
+    # локально): demand/trigger-start служби ОС (DsmSvc, NgcSvc тощо)
+    # самі стартують/зупиняються протягом кількох хвилин прогону з
+    # причин, що не мають нічого спільного з цим скриптом — двічі
+    # підтверджено в обидва боки на PR #44. DataRestore структурно не
+    # може викликати Start-/Stop-Service на нічому, крім імен, явно
+    # заданих у maintenanceSettings.Services/BravoWebCandidates (тут —
+    # навмисно неіснуючих fixture-імен) — тому перевірка звужена саме до
+    # реальних production-імен (значення за замовчуванням із самого
+    # BRAVO.config), а не до кожної служби в системі.
+    $watchedRealServiceNames = @('BRAVO', 'exchangAPI', 'BRAVOWeb', 'BRAVO Web', 'Br-a-vo.web', 'Apache2.4', 'Apache24', 'Apache')
+    $realServiceSnapshotAfter = @(Get-Service | Where-Object { $watchedRealServiceNames -contains $_.Name } | Select-Object Name, Status)
     $beforeByName = @{}
-    foreach ($entry in $realServiceSnapshotBefore) { $beforeByName[$entry.Name] = $entry.Status }
+    foreach ($entry in $realServiceSnapshotBefore) {
+        if ($watchedRealServiceNames -contains $entry.Name) { $beforeByName[$entry.Name] = $entry.Status }
+    }
     $stoppedDuringRun = @(
         foreach ($entry in $realServiceSnapshotAfter) {
             $priorStatus = $beforeByName[$entry.Name]
@@ -159,7 +166,7 @@ try {
         }
     )
     if ($stoppedDuringRun.Count -gt 0) {
-        Write-Host "УВАГА: реальна Windows-служба зупинилась під час прогону (не мало статися):" -ForegroundColor Red
+        Write-Host "УВАГА: реальна BRAVO-пов'язана Windows-служба зупинилась під час прогону (не мало статися):" -ForegroundColor Red
         $stoppedDuringRun | Format-Table | Out-String | Write-Host
         $aggregateExitCode = 1
     }
