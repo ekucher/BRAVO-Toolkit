@@ -52,7 +52,13 @@ $bypassAllowlist = @(
     'BRAVO.Maintenance.Runtime.ps1',
     # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той
     # самий патерн, що в Archive/Maintenance runtime.
-    'BRAVO.DataRestore.Runtime.ps1'
+    'BRAVO.DataRestore.Runtime.ps1',
+    # Ручний E2E-матричний тест DataRestore: кожна комбінація — окремий
+    # дочірній powershell.exe того самого довіреного комплекту (Runtime.ps1
+    # робить рядковий exit, тому in-process виклик неможливий), той самий
+    # елевований self-relaunch патерн, що BRAVO_SELF_TEST.ps1 і
+    # BRAVO.DataRestore.Runtime.ps1 вище.
+    'BRAVO.DataRestore.MatrixTest.psm1'
 )
 
 $forbiddenRules = @(
