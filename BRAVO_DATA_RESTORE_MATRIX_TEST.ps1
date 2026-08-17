@@ -1,19 +1,30 @@
 ﻿[CmdletBinding()]
 param(
     [switch]$KeepFixture,
-    [int]$ComboTimeoutSeconds = 180
+    [int]$ComboTimeoutSeconds = 180,
+    # Стабільний каталог для stdout/stderr кожної комбінації — поза
+    # fixture-коренем (який прибирається в finally). LOGS\ уже
+    # gitignored, тому це не засмічує репозиторій при ручному запуску;
+    # CI завантажує цей каталог як артефакт при падінні job'а. Порожнє за
+    # замовчуванням і resolved нижче в тілі скрипта: $PSScriptRoot
+    # недоступний під час обчислення default-значень у param()-блоці.
+    [string]$ComboLogDirectory
 )
 
-# Ручний, повністю себестоятний end-to-end матричний тест BRAVO_DATA_RESTORE
+if ([string]::IsNullOrWhiteSpace($ComboLogDirectory)) {
+    $ComboLogDirectory = Join-Path $PSScriptRoot 'LOGS\DataRestoreMatrixTest'
+}
+
+# Повністю себестоятний end-to-end матричний тест BRAVO_DATA_RESTORE
 # (-Source Local): будує ізольований TEMP-sandbox (fixture BRAVO.config,
 # синтетичні "live"-джерела компонентів, дві реальні генерації через
 # справжній BRAVO_ARCHIV.ps1), прожинає курований набір комбінацій
 # Component×Mode×outcome через окремі дочірні powershell.exe-процеси й
 # звіряє файловий/стан-результат проти очікуваного контракту
-# (BRAVO.ExitCodes). НЕ підключено до CI — лише ручний запуск з елевованої
-# сесії. -Source SFTP поза обсягом (уже покрито unit-тестами
-# BRAVO_SELF_TEST.ps1). Деталі проєктування: план сесії
-# "synchronous-swinging-charm".
+# (BRAVO.ExitCodes). Запускається і вручну (елевована сесія), і в CI
+# (job datarestore-matrix-test у .github/workflows/ci.yml). -Source SFTP
+# поза обсягом (уже покрито unit-тестами BRAVO_SELF_TEST.ps1). Деталі
+# проєктування: план сесії "synchronous-swinging-charm".
 #
 # Уся логіка фікстур/матриці/асертів — у modules\BRAVO.DataRestore.MatrixTest
 # (канонічний власник відповідальності); цей файл — лише оркестрація.
@@ -108,7 +119,9 @@ try {
             -ConfigPath ([string]$combo.ConfigPath) `
             -Arguments $combo.Arguments `
             -FailpointComponent $combo.FailpointComponent `
-            -TimeoutSeconds $ComboTimeoutSeconds
+            -TimeoutSeconds $ComboTimeoutSeconds `
+            -LogDirectory $ComboLogDirectory `
+            -ComboName $combo.Name
         $assertion = Assert-BRAVODataRestoreMatrixComboResult `
             -Combo $combo `
             -Result $comboResult `
@@ -125,11 +138,36 @@ try {
 
     $aggregateExitCode = Write-BRAVODataRestoreMatrixSummary -Results $results.ToArray()
 
-    $realServiceSnapshotAfter = @(Get-Service | Select-Object Name, Status)
-    $serviceDiff = Compare-Object -ReferenceObject $realServiceSnapshotBefore -DifferenceObject $realServiceSnapshotAfter -Property Name, Status
-    if ($serviceDiff) {
-        Write-Host "УВАГА: стан реальних Windows-служб змінився під час прогону (не мало статися):" -ForegroundColor Red
-        $serviceDiff | Format-Table | Out-String | Write-Host
+    # Фактична безпечна властивість — "DataRestore ніколи не зупиняв
+    # реальну службу" (Managed=false у fixture-конфізі це гарантує на
+    # рівні коду; тут — belt-and-suspenders підтвердження). Загальний
+    # знімок УСІХ служб виявився ненадійним на реальних машинах (CI і
+    # локально): demand/trigger-start служби ОС (DsmSvc, NgcSvc тощо)
+    # самі стартують/зупиняються протягом кількох хвилин прогону з
+    # причин, що не мають нічого спільного з цим скриптом — двічі
+    # підтверджено в обидва боки на PR #44. DataRestore структурно не
+    # може викликати Start-/Stop-Service на нічому, крім імен, явно
+    # заданих у maintenanceSettings.Services/BravoWebCandidates (тут —
+    # навмисно неіснуючих fixture-імен) — тому перевірка звужена саме до
+    # реальних production-імен (значення за замовчуванням із самого
+    # BRAVO.config), а не до кожної служби в системі.
+    $watchedRealServiceNames = @('BRAVO', 'exchangAPI', 'BRAVOWeb', 'BRAVO Web', 'Br-a-vo.web', 'Apache2.4', 'Apache24', 'Apache')
+    $realServiceSnapshotAfter = @(Get-Service | Where-Object { $watchedRealServiceNames -contains $_.Name } | Select-Object Name, Status)
+    $beforeByName = @{}
+    foreach ($entry in $realServiceSnapshotBefore) {
+        if ($watchedRealServiceNames -contains $entry.Name) { $beforeByName[$entry.Name] = $entry.Status }
+    }
+    $stoppedDuringRun = @(
+        foreach ($entry in $realServiceSnapshotAfter) {
+            $priorStatus = $beforeByName[$entry.Name]
+            if ($null -ne $priorStatus -and [string]$priorStatus -eq 'Running' -and [string]$entry.Status -ne 'Running') {
+                $entry
+            }
+        }
+    )
+    if ($stoppedDuringRun.Count -gt 0) {
+        Write-Host "УВАГА: реальна BRAVO-пов'язана Windows-служба зупинилась під час прогону (не мало статися):" -ForegroundColor Red
+        $stoppedDuringRun | Format-Table | Out-String | Write-Host
         $aggregateExitCode = 1
     }
     $realLockTimestampAfter = if (Test-Path -LiteralPath $realLockPath -PathType Leaf) { (Get-Item -LiteralPath $realLockPath).LastWriteTimeUtc } else { $null }
