@@ -138,11 +138,29 @@ try {
 
     $aggregateExitCode = Write-BRAVODataRestoreMatrixSummary -Results $results.ToArray()
 
+    # Фактична безпечна властивість — "DataRestore ніколи не зупиняв
+    # реальну службу" (Managed=false у fixture-конфізі це гарантує на
+    # рівні коду; тут — belt-and-suspenders підтвердження). Служба, що
+    # САМА стартувала під час прогону (Stopped -> Running), — типовий
+    # фоновий шум ОС (PnP/device enumeration/заплановане обслуговування),
+    # не пов'язаний із цим скриптом: DataRestore ніколи не викликає
+    # Start-Service на нічому, крім своїх (тут — неіснуючих) Managed-
+    # служб. Лише перехід ІЗ Running в будь-який інший стан — реальний
+    # сигнал.
     $realServiceSnapshotAfter = @(Get-Service | Select-Object Name, Status)
-    $serviceDiff = Compare-Object -ReferenceObject $realServiceSnapshotBefore -DifferenceObject $realServiceSnapshotAfter -Property Name, Status
-    if ($serviceDiff) {
-        Write-Host "УВАГА: стан реальних Windows-служб змінився під час прогону (не мало статися):" -ForegroundColor Red
-        $serviceDiff | Format-Table | Out-String | Write-Host
+    $beforeByName = @{}
+    foreach ($entry in $realServiceSnapshotBefore) { $beforeByName[$entry.Name] = $entry.Status }
+    $stoppedDuringRun = @(
+        foreach ($entry in $realServiceSnapshotAfter) {
+            $priorStatus = $beforeByName[$entry.Name]
+            if ($null -ne $priorStatus -and [string]$priorStatus -eq 'Running' -and [string]$entry.Status -ne 'Running') {
+                $entry
+            }
+        }
+    )
+    if ($stoppedDuringRun.Count -gt 0) {
+        Write-Host "УВАГА: реальна Windows-служба зупинилась під час прогону (не мало статися):" -ForegroundColor Red
+        $stoppedDuringRun | Format-Table | Out-String | Write-Host
         $aggregateExitCode = 1
     }
     $realLockTimestampAfter = if (Test-Path -LiteralPath $realLockPath -PathType Leaf) { (Get-Item -LiteralPath $realLockPath).LastWriteTimeUtc } else { $null }
