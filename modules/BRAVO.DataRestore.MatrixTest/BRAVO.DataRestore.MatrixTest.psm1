@@ -248,7 +248,15 @@ function Invoke-BRAVODataRestoreMatrixCombo {
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [Parameter(Mandatory = $true)][hashtable]$Arguments,
         [string]$FailpointComponent,
-        [int]$TimeoutSeconds = 180
+        [int]$TimeoutSeconds = 180,
+        # Стабільний каталог ПОЗА fixture-коренем (який прибирається в
+        # finally, якщо не -KeepFixture) — щоб CI міг завантажити stdout/
+        # stderr кожної комбінації як артефакт при падінні, а не втратити
+        # їх разом із видаленою TEMP-фікстурою. Комбінація ще й іменем
+        # файлу описує себе, тому оператору не треба співвідносити з
+        # порядком запуску.
+        [string]$LogDirectory,
+        [string]$ComboName
     )
 
     $scriptPath = Join-Path $RepoRoot 'BRAVO_DATA_RESTORE.ps1'
@@ -294,6 +302,13 @@ function Invoke-BRAVODataRestoreMatrixCombo {
         return [pscustomobject]@{ ExitCode = -1; TimedOut = $true; StandardOutput = $null; StandardError = $null }
     }
     $output = Complete-BRAVOProcessOutputCapture -Capture $capture
+    if (-not [string]::IsNullOrWhiteSpace($LogDirectory) -and -not [string]::IsNullOrWhiteSpace($ComboName)) {
+        if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $LogDirectory -Force -ErrorAction Stop)
+        }
+        Set-Content -LiteralPath (Join-Path $LogDirectory "$ComboName.stdout.log") -Value ([string]$output.StandardOutput) -Encoding UTF8
+        Set-Content -LiteralPath (Join-Path $LogDirectory "$ComboName.stderr.log") -Value ([string]$output.StandardError) -Encoding UTF8
+    }
     return [pscustomobject]@{
         ExitCode = $process.ExitCode
         TimedOut = $false

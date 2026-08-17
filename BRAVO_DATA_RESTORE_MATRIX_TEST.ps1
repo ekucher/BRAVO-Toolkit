@@ -1,19 +1,30 @@
 ﻿[CmdletBinding()]
 param(
     [switch]$KeepFixture,
-    [int]$ComboTimeoutSeconds = 180
+    [int]$ComboTimeoutSeconds = 180,
+    # Стабільний каталог для stdout/stderr кожної комбінації — поза
+    # fixture-коренем (який прибирається в finally). LOGS\ уже
+    # gitignored, тому це не засмічує репозиторій при ручному запуску;
+    # CI завантажує цей каталог як артефакт при падінні job'а. Порожнє за
+    # замовчуванням і resolved нижче в тілі скрипта: $PSScriptRoot
+    # недоступний під час обчислення default-значень у param()-блоці.
+    [string]$ComboLogDirectory
 )
 
-# Ручний, повністю себестоятний end-to-end матричний тест BRAVO_DATA_RESTORE
+if ([string]::IsNullOrWhiteSpace($ComboLogDirectory)) {
+    $ComboLogDirectory = Join-Path $PSScriptRoot 'LOGS\DataRestoreMatrixTest'
+}
+
+# Повністю себестоятний end-to-end матричний тест BRAVO_DATA_RESTORE
 # (-Source Local): будує ізольований TEMP-sandbox (fixture BRAVO.config,
 # синтетичні "live"-джерела компонентів, дві реальні генерації через
 # справжній BRAVO_ARCHIV.ps1), прожинає курований набір комбінацій
 # Component×Mode×outcome через окремі дочірні powershell.exe-процеси й
 # звіряє файловий/стан-результат проти очікуваного контракту
-# (BRAVO.ExitCodes). НЕ підключено до CI — лише ручний запуск з елевованої
-# сесії. -Source SFTP поза обсягом (уже покрито unit-тестами
-# BRAVO_SELF_TEST.ps1). Деталі проєктування: план сесії
-# "synchronous-swinging-charm".
+# (BRAVO.ExitCodes). Запускається і вручну (елевована сесія), і в CI
+# (job datarestore-matrix-test у .github/workflows/ci.yml). -Source SFTP
+# поза обсягом (уже покрито unit-тестами BRAVO_SELF_TEST.ps1). Деталі
+# проєктування: план сесії "synchronous-swinging-charm".
 #
 # Уся логіка фікстур/матриці/асертів — у modules\BRAVO.DataRestore.MatrixTest
 # (канонічний власник відповідальності); цей файл — лише оркестрація.
@@ -108,7 +119,9 @@ try {
             -ConfigPath ([string]$combo.ConfigPath) `
             -Arguments $combo.Arguments `
             -FailpointComponent $combo.FailpointComponent `
-            -TimeoutSeconds $ComboTimeoutSeconds
+            -TimeoutSeconds $ComboTimeoutSeconds `
+            -LogDirectory $ComboLogDirectory `
+            -ComboName $combo.Name
         $assertion = Assert-BRAVODataRestoreMatrixComboResult `
             -Combo $combo `
             -Result $comboResult `

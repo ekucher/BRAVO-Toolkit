@@ -185,6 +185,49 @@ jobs:
           path: LOGS/HELPERS/BRAVO_SELF_TEST_*.log
           if-no-files-found: ignore
 
+  datarestore-matrix-test:
+    name: BRAVO_DATA_RESTORE_MATRIX_TEST.ps1
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # BRAVO_ARCHIV.ps1 (used by the matrix test to produce genuine
+      # fixture generations) unconditionally requires an ArchivePassword
+      # Credential Manager entry whenever any Archive component is
+      # enabled. The value is never read back or verified against
+      # anything real -- it only protects a throwaway sandbox archive
+      # that this job deletes at the end of its own run -- so a fresh
+      # random value generated in-job is fine; no repository secret is
+      # involved.
+      - name: Provision throwaway 7z credential
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $randomPassword = [guid]::NewGuid().ToString('N')
+          cmdkey /generic:BRAVO_7Z_PASSWORD /user:BRAVO_7Z_PASSWORD /pass:$randomPassword
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::cmdkey failed to provision BRAVO_7Z_PASSWORD"
+              exit 1
+          }
+
+      - name: Запуск матричного E2E-тесту DataRestore
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\BRAVO_DATA_RESTORE_MATRIX_TEST.ps1
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::BRAVO_DATA_RESTORE_MATRIX_TEST.ps1 exited with code $LASTEXITCODE"
+              exit 1
+          }
+
+      - name: Логи комбінацій (артефакт при падінні)
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: datarestore-matrix-test-log
+          path: LOGS/DataRestoreMatrixTest/*.log
+          if-no-files-found: ignore
+
   secret-scan:
     name: Secret scanning (gitleaks)
     runs-on: ubuntu-latest
