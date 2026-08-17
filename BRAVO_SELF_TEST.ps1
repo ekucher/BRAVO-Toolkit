@@ -2109,6 +2109,93 @@ try {
         -Name "Maintenance/MixedAlertQueue_ErrorPlusCriticalResolvesToCritical" `
         -Failure "черга ERROR+CRITICAL має дати підсумкову content-severity CRITICAL, execution лишається некритичним"
 
+    # --- Maintenance: -EnableAllSlack/-DisableAllSlack ефективний режим
+    # обчислюється ОДИН раз, ДО webhook-route preflight (регресійний тест
+    # хотфіксу 5.0.1: PR #39 резолвив reachable-маршрути за сирим
+    # $SlackMode ДО override-блоку, а рантайм-споживачі вже читали
+    # $script:SlackMode ПІСЛЯ — тому -EnableAllSlack при NotificationMode
+    # none/errors_only мовчки ставав no-op). Тест працює з РЕАЛЬНИМ AST
+    # найденого вузла присвоєння (не переписаною вручну копією логіки).
+    $maintenanceRuntimeTokensForOverride = $null
+    $maintenanceRuntimeParseErrorsForOverride = $null
+    $maintenanceRuntimeAstForOverride = [Management.Automation.Language.Parser]::ParseInput(
+        $maintenanceRuntimeSourceForSeverity,
+        [ref]$maintenanceRuntimeTokensForOverride,
+        [ref]$maintenanceRuntimeParseErrorsForOverride)
+    $effectiveModeAssignmentAst = @(
+        $maintenanceRuntimeAstForOverride.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                $candidate.Left.Extent.Text -eq '$script:SlackMode' -and
+                $candidate.Right.Extent.Text -match '^\s*if\s*\(\$DisableAllSlack\)'
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition ($null -ne $effectiveModeAssignmentAst) `
+        -Name "Maintenance/EffectiveSlackModeComputedOnce" `
+        -Failure "не знайдено канонічне присвоєння `$script:SlackMode = if (`$DisableAllSlack) {...} elseif (`$EnableAllSlack) {...} else {...} у Maintenance.Runtime.ps1"
+
+    if ($null -ne $effectiveModeAssignmentAst) {
+        $effectiveModeExpressionText = $effectiveModeAssignmentAst.Extent.Text
+        $effectiveModeStartOffset = $effectiveModeAssignmentAst.Extent.StartOffset
+
+        # Обидва preflight-блоки (резолв webhook-route + exit-31 валідація)
+        # мають читати $script:SlackMode (ефективний), не сирий $SlackMode,
+        # і фізично розташовуватись ПІСЛЯ обчислення вище в тексті файлу.
+        # Пошук звужено до сегмента ДО автовизначення служби BRAVO Web
+        # (одразу за другим preflight-блоком) — далі в 4000+ рядків файлу
+        # трапляються й інші, непов'язані перевірки того самого патерна
+        # (усередині функцій-відправників, де вона й раніше була коректною).
+        $preflightSegmentBoundary = $maintenanceRuntimeSourceForSeverity.IndexOf(
+            "Автоматичне визначення служби Apache для BRAVO Web")
+        Test-BRAVOCondition `
+            -Condition ($preflightSegmentBoundary -gt 0) `
+            -Name "Maintenance/PreflightSegmentBoundaryFound" `
+            -Failure "не знайдено орієнтир кінця preflight-секції ('Автоматичне визначення служби Apache для BRAVO Web') -- тест потребує оновлення межі пошуку"
+        $preflightSegmentText = if ($preflightSegmentBoundary -gt 0) {
+            $maintenanceRuntimeSourceForSeverity.Substring(0, $preflightSegmentBoundary)
+        } else {
+            $maintenanceRuntimeSourceForSeverity
+        }
+        $webhookPreflightMatches = @([regex]::Matches(
+            $preflightSegmentText, 'if \(\$script:SlackMode -ne "none"\) \{'))
+        Test-BRAVOCondition `
+            -Condition ($webhookPreflightMatches.Count -eq 2) `
+            -Name "Maintenance/BothWebhookPreflightGatesUseEffectiveSlackMode" `
+            -Failure "очікувалось рівно 2 preflight-блоки (резолв routes + exit-31 валідація), що перевіряють `$script:SlackMode -ne 'none'; знайдено $($webhookPreflightMatches.Count) -- ordering-фікс міг регресувати назад на сирий `$SlackMode"
+        if ($webhookPreflightMatches.Count -gt 0) {
+            $earliestPreflightOffset = ($webhookPreflightMatches | Measure-Object -Property Index -Minimum).Minimum
+            Test-BRAVOCondition `
+                -Condition ($effectiveModeStartOffset -lt $earliestPreflightOffset) `
+                -Name "Maintenance/EffectiveSlackModeComputedBeforeWebhookPreflight" `
+                -Failure "обчислення ефективного `$script:SlackMode має передувати першому webhook-preflight-блоку в тексті скрипта -- інакше -EnableAllSlack/-DisableAllSlack знову стане no-op для NotificationMode=none/errors_only"
+        }
+
+        # Поведінковий тест: РЕАЛЬНИЙ текст присвоєння виконується
+        # ізольовано (окремий New-Module) для 3 комбінацій прапорців.
+        $overrideScenarios = @(
+            @{ Disable = $true; Enable = $false; Raw = 'errors_only'; Expected = 'none' }
+            @{ Disable = $false; Enable = $true; Raw = 'none'; Expected = 'all' }
+            @{ Disable = $false; Enable = $false; Raw = 'errors_only'; Expected = 'errors_only' }
+        )
+        foreach ($scenario in $overrideScenarios) {
+            $overrideEvalModule = New-Module -ScriptBlock {}
+            $scenarioResult = & $overrideEvalModule {
+                param($DisableAllSlack, $EnableAllSlack, $SlackMode, $ExpressionText)
+                . ([scriptblock]::Create($ExpressionText))
+                return $script:SlackMode
+            } $scenario.Disable $scenario.Enable $scenario.Raw $effectiveModeExpressionText
+            Remove-Module -ModuleInfo $overrideEvalModule -ErrorAction SilentlyContinue
+            Test-BRAVOCondition `
+                -Condition ($scenarioResult -eq $scenario.Expected) `
+                -Name "Maintenance/EffectiveSlackMode_Disable=$($scenario.Disable)_Enable=$($scenario.Enable)_Raw=$($scenario.Raw)" `
+                -Failure "очікувано `$script:SlackMode = '$($scenario.Expected)', отримано '$scenarioResult'"
+        }
+    }
+
     # --- Maintenance: фінальний status "УСПІШНО З ПОПЕРЕДЖЕННЯМИ" (mode=all,
     # немає жодного critical/alert-queue запису) має маршрутизуватись як
     # WARNING/ALERTS, а не як SUCCESS/GENERAL (review finding #1) ----------
