@@ -1,5 +1,32 @@
 # Changelog
 
+## 5.0.1-rc.1 — 2026-08-18
+
+Hotfix candidate (RELEASE_POLICY.md §12) for a notification-delivery
+regression introduced by the 5.0.0 GENERAL/ALERTS severity-based webhook
+routing.
+
+- Fixed `-EnableAllSlack`/`-DisableAllSlack` in `BRAVO_MAINTENANCE.ps1`:
+  the effective notification mode override was applied to `$script:SlackMode`
+  after the GENERAL/ALERTS webhook-route preflight had already resolved
+  (and validated) only the routes reachable under the pre-override mode.
+  With `NotificationMode` set to `none` or `errors_only` in `BRAVO.config`,
+  `-EnableAllSlack` silently became a no-op: every notification attempt
+  looked up a route the preflight never resolved, got a `$null` webhook URL,
+  and failed silently in the surrounding `try/catch`. The effective mode is
+  now computed once, immediately after the raw configured value, and used
+  consistently by both the preflight resolution/validation and all runtime
+  senders.
+- Removed a dead, duplicate notification-webhook resolution block left
+  behind in `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1` by the 5.0.0
+  migration to the centralized `BRAVO.Notifications` delivery pipeline — no
+  sender read its result; it only performed a redundant Credential Manager
+  lookup on every Archive startup.
+- Added `.claude` to the runtime-manifest/guard exclusion pattern
+  (`ci\Update-BRAVORuntimeManifest.ps1`, `BRAVO_RUNTIME_GUARD.ps1`),
+  matching the existing `.git`/`.vscode`/`local-backups` exclusions — AI
+  assistant session tooling, not part of the shipped runtime.
+
 ## 5.0.0 — 2026-08-11
 
 Stable production release promoted from the verified 5.0.0-rc.1 candidate.

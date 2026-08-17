@@ -1017,9 +1017,6 @@ try {
             $archiveScriptTextForSecretMasking.Contains(
                 "`$script:smbCredentialInitializationError = Protect-BRAVOLogSecret -Text `$_.Exception.Message"
             ) -and
-            $archiveScriptTextForSecretMasking.Contains(
-                "`$script:notificationCredentialInitializationError = Protect-BRAVOLogSecret -Text `$_.Exception.Message"
-            ) -and
             $healthScriptTextForSecretMasking.Contains(
                 "Write-Error `"Не вдалося завантажити конфігурацію: `$(Protect-BRAVOLogSecret -Text `$_.Exception.Message)`""
             ) -and

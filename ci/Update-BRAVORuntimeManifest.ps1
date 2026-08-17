@@ -36,7 +36,7 @@ $includedExtensions = @('.ps1', '.psm1', '.psd1')
 # Відносні шляхи, не самі лише імена: TOOLS_MANIFEST.json лежить у
 # Tools\ (поруч із самими утилітами), а не в корені комплекту.
 $includedExtraFiles = @('VERSION.json', 'Tools\TOOLS_MANIFEST.json')
-$excludedDirectoryPattern = '^(LOGS|\.git|\.vscode|local-backups)[\\/]'
+$excludedDirectoryPattern = '^(LOGS|\.git|\.vscode|\.claude|local-backups)[\\/]'
 
 $rootPrefixLength = $Root.TrimEnd('\', '/').Length + 1
 $currentHashes = [ordered]@{}
