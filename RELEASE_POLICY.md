@@ -3,7 +3,7 @@
 ## 1. Призначення документа
 
 Цей документ визначає політику розробки, тестування та випуску релізів у
-репозиторії `ARCHIV_LIMS_MONOLITH`.
+репозиторії `BRAVO-Toolkit`.
 
 Основні цілі:
 
@@ -262,7 +262,7 @@ Development-реліз:
 
 ```json
 {
-  "product": "BRAVO Archive",
+  "product": "BRAVO-Toolkit",
   "packageVersion": "4.5.0-dev.1",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
@@ -278,7 +278,7 @@ Release Candidate:
 
 ```json
 {
-  "product": "BRAVO Archive",
+  "product": "BRAVO-Toolkit",
   "packageVersion": "4.5.0-rc.1",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
@@ -294,7 +294,7 @@ Release Candidate:
 
 ```json
 {
-  "product": "BRAVO Archive",
+  "product": "BRAVO-Toolkit",
   "packageVersion": "4.5.0",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
@@ -449,7 +449,7 @@ developer: 4.6.0-dev.1
 Тег:
 
 ```bash
-git tag -a v4.5.0-dev.1 -m "BRAVO Archive 4.5.0-dev.1"
+git tag -a v4.5.0-dev.1 -m "BRAVO-Toolkit 4.5.0-dev.1"
 git push origin v4.5.0-dev.1
 ```
 
@@ -486,7 +486,7 @@ RC створюється після завершення функціональ
 Тег:
 
 ```bash
-git tag -a v4.5.0-rc.1 -m "BRAVO Archive 4.5.0-rc.1"
+git tag -a v4.5.0-rc.1 -m "BRAVO-Toolkit 4.5.0-rc.1"
 git push origin v4.5.0-rc.1
 ```
 
@@ -623,7 +623,7 @@ Merge виконується лише через Pull Request.
 ```bash
 git switch master
 git pull --ff-only origin master
-git tag -a v4.5.0 -m "BRAVO Archive 4.5.0"
+git tag -a v4.5.0 -m "BRAVO-Toolkit 4.5.0"
 git push origin v4.5.0
 ```
 
@@ -849,7 +849,7 @@ v4.5.0
 Теги повинні бути анотованими:
 
 ```bash
-git tag -a v4.5.0 -m "BRAVO Archive 4.5.0"
+git tag -a v4.5.0 -m "BRAVO-Toolkit 4.5.0"
 ```
 
 Перезапис опублікованих тегів заборонений.
