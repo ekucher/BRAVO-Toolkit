@@ -95,6 +95,16 @@ jobs:
         shell: powershell
         run: .\ci\Test-BRAVOReleasePolicy.ps1
 
+      # RELEASE_POLICY.md SS2.2/SS12: master accepts code only via stable
+      # promotion from developer or a documented hotfix/* branch, never a
+      # direct feature PR -- nothing technical enforced this before (a
+      # feature branch merged straight into master, unversioned, is exactly
+      # how a notification-routing regression reached production untested).
+      # Same ASCII-only reason as the steps above: keep `run:` ASCII.
+      - name: Master merge policy (source branch / version bump)
+        shell: powershell
+        run: .\ci\Test-BRAVOMasterMergePolicy.ps1
+
       # Integrity manifests must stay in sync with what they describe.
       # A stale manifest would make a freshly deployed kit block itself
       # on the very first run, so this is a build failure, not a warning.
