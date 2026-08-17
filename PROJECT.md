@@ -18,3 +18,7 @@
 До функціональних областей toolkit належать Archive, Health, Maintenance, DataRestore, Notifications, Credentials, Configuration, Console, Compatibility та інші модулі простору імен `BRAVO.*`.
 
 Назва `Archive` використовується для конкретної функції резервного копіювання і не є назвою всього проєкту.
+
+## План розвитку
+
+Актуальний порядок пріоритетів і послідовність реалізації визначені в [ROADMAP.md](ROADMAP.md). Детальні технічні design notes для великих функцій зберігаються в [TODO_FEATURES.md](TODO_FEATURES.md); якщо порядок у цих документах відрізняється, пріоритет має `ROADMAP.md`.
