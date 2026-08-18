@@ -81,9 +81,20 @@ Authenticode, підписані git tags і криптографічно під
 
 Критерії завершення:
 
-- [ ] Обрано конкретну схему для Hetzner Storage Box/вторинного сховища.
-- [ ] Задокументовано threat model і recovery procedure.
+- [x] Обрано конкретну схему для Hetzner Storage Box/вторинного сховища:
+      вбудовані Hetzner Storage Box Snapshots (20 знімків, щоденно
+      о 05:00 UTC, керовані окремо через Hetzner Robot — credentials,
+      відсутні на LIMS-сервері й у Credential Manager). Другий,
+      pull-based/offline шар (окрема система з окремими credentials)
+      свідомо відкладено на P1.3 — снапшоти вже закривають найгостріший
+      сценарій розділу 5 `THREAT_MODEL.md` самостійно.
+- [x] Задокументовано threat model і recovery procedure —
+      `THREAT_MODEL.md` розділ 5 (мітигація/залишковий ризик) і
+      розділ 12 (Recovery procedure).
 - [ ] Проведено тест: компрометований/видалений primary backup не знищує незалежну історичну копію.
+      **Ще не виконано** — production-операція на Hetzner-акаунті,
+      запланована окремо (видалити тестовий файл через SFTP,
+      підтвердити відновлюваність зі снапшоту через Robot).
 
 ## P1 — доказова відновлюваність і deployment quality
 
