@@ -646,11 +646,14 @@ function Send-ToolIntegrityAlert {
 
         # Discord потребує власного форматування й обмежений довжиною
         # повідомлення; Slack приймає текст як є.
-        $outboundMessages = if ($script:notificationProvider -eq "discord") {
-            @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $alertText))
+        # @() ЗОВНІ if/else: одноелементний результат гілки інакше
+        # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult,
+        # production-інцидент 2026-08-19).
+        $outboundMessages = @(if ($script:notificationProvider -eq "discord") {
+            Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $alertText)
         } else {
-            @($alertText)
-        }
+            $alertText
+        })
         foreach ($outboundMessage in $outboundMessages) {
             Send-BRAVOWebhookNotification `
                 -Provider $script:notificationProvider `
@@ -723,11 +726,14 @@ function Send-BRAVOArchiveFreeSpaceAlert {
             -LogPath ([string]$script:logFile) `
             -LogLabel 'Журнал'
 
-        $outboundMessages = if ($script:notificationProvider -eq 'discord') {
-            @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $alertText))
+        # @() ЗОВНІ if/else: одноелементний результат гілки інакше
+        # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult,
+        # production-інцидент 2026-08-19).
+        $outboundMessages = @(if ($script:notificationProvider -eq 'discord') {
+            Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $alertText)
         } else {
-            @($alertText)
-        }
+            $alertText
+        })
         foreach ($outboundMessage in $outboundMessages) {
             Send-BRAVOWebhookNotification `
                 -Provider $script:notificationProvider `
@@ -4307,11 +4313,20 @@ function Send-BAZAIncompatibleNameAlert {
         -LogLabel "Повний перелік"
 
     try {
-        $outboundMessages = if ($script:notificationProvider -eq "discord") {
-            @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $message))
+        # @() ЗОВНІ if/else, НЕ в гілках: у Windows PowerShell 5.1
+        # одноелементний результат if/else-виразу розгортається назад у
+        # скаляр попри @() усередині гілки, і $outboundMessages.Count нижче
+        # кидав PropertyNotFoundException під Set-StrictMode -Version 2.0
+        # (BRAVO_CONFIG_LOADER.ps1) для КОЖНОГО одно-чанкового сповіщення
+        # (Slack — завжди; короткий Discord — теж): повідомлення реально
+        # надсилалось у foreach, але catch нижче хибно логував "Не вдалося
+        # відправити". Той самий клас дефекту, що й production-інцидент
+        # 2026-08-19 у Get-BRAVOArchiveFreeSpaceResult.
+        $outboundMessages = @(if ($script:notificationProvider -eq "discord") {
+            Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $message)
         } else {
-            @($message)
-        }
+            $message
+        })
         foreach ($outboundMessage in $outboundMessages) {
             Send-BRAVOWebhookNotification `
                 -Provider $script:notificationProvider `

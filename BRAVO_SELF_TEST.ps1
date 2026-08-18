@@ -2703,6 +2703,33 @@ try {
         -Name 'Archive/FreeSpaceSingleFixedDriveSurvivesStrictMode' `
         -Failure 'Get-BRAVOArchiveFreeSpaceResult має коректно обробляти РІВНО один Fixed-диск під Set-StrictMode -Version 2.0 (production-рівень) — якщо if/else-присвоєння $localDrives колись знову втратить масивність для одноелементного результату, .Count вище кине PropertyNotFoundException і заблокує архівацію на будь-якому сервері з одним диском'
 
+    # Той самий клас дефекту (2026-08-19): $outboundMessages будувався як
+    # `= if(...){@(...)}else{@(...)}` у 5 місцях (Archive x3, Health x1,
+    # Maintenance x1); на єдиному сайті з наступним .Count (Archive,
+    # сповіщення про несумісні імена) одно-чанкове повідомлення реально
+    # надсилалось, але .Count кидав виняток під StrictMode 2.0 і catch
+    # хибно логував "Не вдалося відправити". Форму нормалізовано на
+    # зовнішній `@(if ...)` в усіх 5 сайтах; цей структурний тест блокує
+    # повернення небезпечної форми в будь-якому з трьох Runtime-файлів.
+    # Усі три файли читаються локально й явно: $archiveRuntimeModuleText
+    # вище — це BRAVO.ArchiveRuntime.psm1 (інший модуль), а сайти
+    # $outboundMessages живуть саме в BRAVO.Archive.Runtime.ps1.
+    $outboundMessagesRuntimeTexts = @(
+        [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'))
+        [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'))
+        [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'))
+    )
+    $unsafeOutboundAssignmentCount = 0
+    $safeOutboundAssignmentCount = 0
+    foreach ($outboundRuntimeText in $outboundMessagesRuntimeTexts) {
+        $unsafeOutboundAssignmentCount += ([regex]::Matches($outboundRuntimeText, '\$outboundMessages\s*=\s*if\s*\(')).Count
+        $safeOutboundAssignmentCount += ([regex]::Matches($outboundRuntimeText, '\$outboundMessages\s*=\s*@\(if\s*\(')).Count
+    }
+    Test-BRAVOCondition `
+        -Condition ($unsafeOutboundAssignmentCount -eq 0 -and $safeOutboundAssignmentCount -eq 5) `
+        -Name 'Notifications/OutboundMessagesAssignmentsKeepOuterArrayWrapper' `
+        -Failure "кожне присвоєння `$outboundMessages в Archive/Health/Maintenance Runtime має бути `$outboundMessages = @(if ...) — зовнішній @() навколо всього if/else; форма `= if(...){@(...)}` розгортає одно-чанкове повідомлення в скаляр, і .Count після неї кидає PropertyNotFoundException під Set-StrictMode 2.0 (очікувано safe=5, unsafe=0; фактично safe=$safeOutboundAssignmentCount, unsafe=$unsafeOutboundAssignmentCount)"
+
     $freeSpaceNotificationProbe = & $archiveRuntimeModule {
         param($Result)
 

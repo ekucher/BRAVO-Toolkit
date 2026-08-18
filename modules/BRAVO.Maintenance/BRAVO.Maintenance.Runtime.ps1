@@ -1614,12 +1614,15 @@ function Invoke-NotificationWebhook {
     } else {
         "$notificationSeparator`n$Message"
     }
-    $outboundMessages = if ($NotificationProvider -eq "discord") {
+    # @() ЗОВНІ if/else: одноелементний результат гілки інакше
+    # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult в
+    # BRAVO.Archive.Runtime.ps1, production-інцидент 2026-08-19).
+    $outboundMessages = @(if ($NotificationProvider -eq "discord") {
         $discordMessage = ConvertTo-DiscordNotificationText -Message $messageForWebhook
-        @(Split-DiscordNotificationText -Message $discordMessage)
+        Split-DiscordNotificationText -Message $discordMessage
     } else {
-        @($messageForWebhook)
-    }
+        $messageForWebhook
+    })
 
     foreach ($outboundMessage in $outboundMessages) {
         # Інший код або завантажений модуль міг змінити глобальний протокол,
