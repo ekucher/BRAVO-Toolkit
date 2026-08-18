@@ -3048,6 +3048,44 @@ try {
         -Name 'Archive/FreeSpacePolicyMatchesMaintenance' `
         -Failure 'Archive має перевіряти лише Fixed-диски, поважати Maintenance.Limits.ExcludedDrives, блокувати запуск нижче порога та дозволяти конфігурацію, де всі диски явно виключені'
 
+    # Регресія 2026-08-19 (production incident, реальний сервер з рівно
+    # ОДНИМ Fixed-диском): $localDrives = if(...){@(...)}else{@(...)} у
+    # Windows PowerShell 5.1 "розгортає" одноелементний масив назад у
+    # скаляр при виході з if/else-виразу — навіть попри власний @() у
+    # кожній гілці, лише зовнішній @() навколо ВСЬОГО if/else надійно
+    # гарантує масив. Без Set-StrictMode це проходить непомітно
+    # (PowerShell додає синтетичний .Count=1 скаляру, foreach і так
+    # ітерує скаляр як один елемент), тому попередній тест вище
+    # (FreeSpacePolicyMatchesMaintenance, теж з одноелементним -Drives)
+    # не міг це впіймати — self-test не відтворює Set-StrictMode -Version
+    # 2.0, який BRAVO_CONFIG_LOADER.ps1 встановлює для реального запуску.
+    # Тут це відтворено явно: якщо регресія повернеться, $localDrives.Count
+    # кине "The property 'Count' cannot be found on this object" і зупинить
+    # архівацію на будь-якому сервері рівно з одним Fixed-диском.
+    $freeSpaceSingleDriveUnderStrictMode = & $archiveRuntimeModule {
+        param($RootPath)
+        Set-StrictMode -Version 2.0
+        Get-BRAVOArchiveFreeSpaceResult `
+            -RootPath $RootPath `
+            -MinimumFreeSpaceGB 20 `
+            -Drives @([pscustomobject]@{
+                Name = 'C:\'
+                DriveType = [System.IO.DriveType]::Fixed
+                IsReady = $true
+                AvailableFreeSpace = 25GB
+                TotalSize = 100GB
+            })
+    } $root
+    Test-BRAVOCondition `
+        -Condition (
+            $freeSpaceSingleDriveUnderStrictMode.Success -and
+            $freeSpaceSingleDriveUnderStrictMode.CheckedDriveCount -eq 1 -and
+            @($freeSpaceSingleDriveUnderStrictMode.DriveStatus).Count -eq 1 -and
+            $freeSpaceSingleDriveUnderStrictMode.DriveStatus[0].Drive -eq 'C:'
+        ) `
+        -Name 'Archive/FreeSpaceSingleFixedDriveSurvivesStrictMode' `
+        -Failure 'Get-BRAVOArchiveFreeSpaceResult має коректно обробляти РІВНО один Fixed-диск під Set-StrictMode -Version 2.0 (production-рівень) — якщо if/else-присвоєння $localDrives колись знову втратить масивність для одноелементного результату, .Count вище кине PropertyNotFoundException і заблокує архівацію на будь-якому сервері з одним диском'
+
     $freeSpaceNotificationProbe = & $archiveRuntimeModule {
         param($Result)
 
