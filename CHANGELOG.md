@@ -1,5 +1,59 @@
 # Changelog
 
+## 5.0.1 — 2026-08-18
+
+Stable hotfix release promoted from the verified `5.0.1-rc.1` candidate
+(RELEASE_POLICY.md §12; accepted HEAD `69bf6ff`, CI run 32115265892
+SUCCESS — self-test, PSScriptAnalyzer, parser/BOM/JSON, gitleaks all
+green). No functional runtime changes relative to the accepted
+candidate: this promotion removes the prerelease suffix, sets the
+stable release channel, updates operator documentation headers, and
+regenerates the runtime integrity manifest.
+
+Validation evidence for the underlying fix: `BRAVO_SELF_TEST.ps1`
+PASSED (763 checks, 0 FAIL) both locally and in CI; the new regression
+coverage was confirmed to actually catch the original defect by
+temporarily reintroducing it (raw `$SlackMode` instead of the effective
+`$script:SlackMode` in one of the two webhook preflight gates) and
+observing the expected, specific self-test failure, then reverting.
+`BRAVO_DRY_RUN.ps1 -TestAccess` confirmed real write/read/delete access
+to all production archive/log paths (RuntimeRoot, BackupRoot,
+SystemLogRoot, MODEL/BLOG/BRAVOEXCH + `.work`, ProgramData
+lock/state); the SFTP and scheduler-state findings in that run reflect
+running outside the production `SYSTEM` task-account context and are
+not evidence of a regression in this fix. `BRAVO_RESTORE_TEST.ps1`
+could not complete in the validation environment (no `COMPLETE`
+generation manifest available on that host — its ad hoc local backups
+were not produced by a full `BRAVO_ARCHIV.ps1` cycle); this fix does
+not touch restore logic, but restore integrity for this cycle remains
+otherwise unverified beyond self-test's static/behavioral coverage and
+should be confirmed on a real server per RELEASE_POLICY.md §9 if not
+already covered by a prior cycle's acceptance.
+
+This hotfix addresses a notification-delivery regression introduced by
+the 5.0.0 GENERAL/ALERTS severity-based webhook routing.
+
+- Fixed `-EnableAllSlack`/`-DisableAllSlack` in `BRAVO_MAINTENANCE.ps1`:
+  the effective notification mode override was applied to `$script:SlackMode`
+  after the GENERAL/ALERTS webhook-route preflight had already resolved
+  (and validated) only the routes reachable under the pre-override mode.
+  With `NotificationMode` set to `none` or `errors_only` in `BRAVO.config`,
+  `-EnableAllSlack` silently became a no-op: every notification attempt
+  looked up a route the preflight never resolved, got a `$null` webhook URL,
+  and failed silently in the surrounding `try/catch`. The effective mode is
+  now computed once, immediately after the raw configured value, and used
+  consistently by both the preflight resolution/validation and all runtime
+  senders.
+- Removed a dead, duplicate notification-webhook resolution block left
+  behind in `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1` by the 5.0.0
+  migration to the centralized `BRAVO.Notifications` delivery pipeline — no
+  sender read its result; it only performed a redundant Credential Manager
+  lookup on every Archive startup.
+- Added `.claude` to the runtime-manifest/guard exclusion pattern
+  (`ci\Update-BRAVORuntimeManifest.ps1`, `BRAVO_RUNTIME_GUARD.ps1`),
+  matching the existing `.git`/`.vscode`/`local-backups` exclusions — AI
+  assistant session tooling, not part of the shipped runtime.
+
 ## 5.0.0 — 2026-08-11
 
 Stable production release promoted from the verified 5.0.0-rc.1 candidate.

@@ -17,3 +17,19 @@
 # в поточному стані файлу; цей запис ігнорує лише історичну знахідку в
 # уже опублікованому комміті 90e0eaf (без rebase/force-push).
 90e0eafab8c543be6612fd28716759f4115a304a:BRAVO_SELF_TEST.ps1:discord-client-secret:1841
+
+# Коміт 0305310 (2026-08-08, лог-ротація exchangAPI): рядок "exchangAPI"
+# (назва компонента й основа імен лог-файлів exchangAPI.log/exchangAPI_N.log)
+# випадково має ентропію, що збігається з дефолтним правилом gitleaks
+# generic-api-key. Це літерал у документації (CHANGELOG.md), коментарі
+# (BRAVO.Maintenance.Runtime.ps1) та фікстурах/асертах self-test
+# (BRAVO_SELF_TEST.ps1) для ротації логів exchangAPI — не секрет і не
+# використовується як credential. Виявлено CI-run 32114486976
+# (workflow_dispatch на hotfix/5.0.1, 2026-08-18) при валідації 5.0.1-rc.1.
+030531040404bd4023c48fd39158f3865729cfbe:CHANGELOG.md:generic-api-key:213
+030531040404bd4023c48fd39158f3865729cfbe:modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1:generic-api-key:1607
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5204
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5223
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5250
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5461
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5487

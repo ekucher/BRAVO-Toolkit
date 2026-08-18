@@ -195,7 +195,6 @@ $script:credentialInitializationError = $null
 $script:archiveCredentialInitializationError = $null
 $script:smbCredentialInitializationError = $null
 $script:institutionSettingsInitializationError = $null
-$script:notificationWebhookUrl = $null
 $script:notificationCredentialInitializationError = $null
 $script:notificationProvider = ([string]$bravoSettings.NotificationProvider).ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($script:notificationProvider)) {
@@ -443,32 +442,6 @@ if ($credentialHelperLoaded -and $smbCredentialRequired) {
         $storedSmbPassword = $null
     } catch {
         $script:smbCredentialInitializationError = Protect-BRAVOLogSecret -Text $_.Exception.Message
-    }
-}
-
-if ($credentialHelperLoaded -and $notificationCredentialRequired) {
-    try {
-        if ($script:notificationProvider -notin @("slack", "discord")) {
-            throw "невідомий канал повідомлень: $($script:notificationProvider)"
-        }
-        $notificationCredentialTarget = if ($script:notificationProvider -eq "discord") {
-            [string]$credentialSettings.Targets.DiscordWebhook
-        } else {
-            [string]$credentialSettings.Targets.SlackWebhook
-        }
-        if ([string]::IsNullOrWhiteSpace($notificationCredentialTarget)) {
-            $notificationCredentialTarget = if ($script:notificationProvider -eq "discord") {
-                "BRAVO_DISCORD_URL"
-            } else {
-                "BRAVO_SLACK_URL"
-            }
-        }
-        $script:notificationWebhookUrl = Get-BRAVOCredentialSecret -Target $notificationCredentialTarget
-        if ([string]::IsNullOrWhiteSpace($script:notificationWebhookUrl)) {
-            throw "запис Credential Manager '$notificationCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-        }
-    } catch {
-        $script:notificationCredentialInitializationError = Protect-BRAVOLogSecret -Text $_.Exception.Message
     }
 }
 

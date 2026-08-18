@@ -290,6 +290,28 @@ if ([string]::IsNullOrWhiteSpace($configuredNotificationMode) -and $MaintenanceC
 }
 $SlackMode = $configuredNotificationMode.ToLowerInvariant()
 
+# -EnableAllSlack/-DisableAllSlack обчислюється ТУТ, одразу після
+# сирого конфігураційного значення, а не лише пізніше перед основною
+# роботою: нижчий preflight (резолв route->webhook URL і валідація, що
+# кожен REACHABLE маршрут дійсно налаштований) мусить бачити ЕФЕКТИВНИЙ
+# режим. Раніше preflight резолвив/валідував лише той набір маршрутів,
+# що досяжний за СИРИМ $SlackMode, а рантайм-споживачі (Send-SlackAlert,
+# Send-InactiveServiceWarning, Send-FinalReport) вже читали
+# $script:SlackMode ПІСЛЯ override — при NotificationMode=none/
+# errors_only + -EnableAllSlack це лишало $script:NotificationWebhookUrls
+# недорезолвленим для нового ефективного маршруту: кожен наступний send
+# мовчки провалювався на відсутньому URL (Mandatory-параметр отримував
+# $null), а сам прапорець ставав no-op. Єдине джерело істини для
+# ЕФЕКТИВНОГО режиму — тут; банер-повідомлення нижче (де раніше й
+# відбувалось саме це присвоєння) лише друкує вже обчислене значення.
+$script:SlackMode = if ($DisableAllSlack) {
+    "none"
+} elseif ($EnableAllSlack) {
+    "all"
+} else {
+    $SlackMode
+}
+
 $NotificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.NotificationRequestTimeoutSeconds) {
     [math]::Max(1, [int]$bravoSettings.NotificationRequestTimeoutSeconds)
 } else {
@@ -298,20 +320,20 @@ $NotificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.NotificationRe
 $NotificationProviderDisplayName = if ($NotificationProvider -eq "discord") { "Discord" } else { "Slack" }
 # Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
 # централізований API BRAVO.Notifications; Maintenance сам канал не
-# обирає. Гейт "$SlackMode -ne 'none'" (а не пізніший $script:SlackMode
-# з урахуванням -DisableAllSlack/-EnableAllSlack) навмисно лишається
-# незмінним — той самий preflight-момент, що й раніше для єдиного
-# webhook.
+# обирає. Гейт — ЕФЕКТИВНИЙ $script:SlackMode (уже враховує
+# -DisableAllSlack/-EnableAllSlack, обчислений вище): резолвити routes
+# за сирим $SlackMode тут було б помилкою — рантайм-споживачі нижче
+# читають саме $script:SlackMode.
 $script:NotificationWebhookUrls = @{}
 $NotificationCredentialError = $null
-if ($SlackMode -ne "none") {
+if ($script:SlackMode -ne "none") {
     try {
         if ($null -eq $credentialSettings -or
             $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
             throw "вбудований Credential Manager недоступний"
         }
         $reachableNotificationRoutes = @("alerts")
-        if ($SlackMode -eq "all") {
+        if ($script:SlackMode -eq "all") {
             $reachableNotificationRoutes += "general"
         }
         foreach ($reachableRoute in $reachableNotificationRoutes) {
@@ -451,12 +473,13 @@ if ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     exit 31
 }
 
-if ($SlackMode -ne "none") {
-    # Перевіряються лише ті routes, які реально досяжні за поточного
-    # (pre-override) $SlackMode — той самий момент і той самий preflight,
-    # що й раніше для єдиного webhook.
+if ($script:SlackMode -ne "none") {
+    # Перевіряються ті routes, що реально досяжні за ЕФЕКТИВНОГО
+    # $script:SlackMode (уже враховує -DisableAllSlack/-EnableAllSlack) —
+    # інакше ця перевірка мовчки пропускала б відсутній webhook саме
+    # тоді, коли оператор явно попросив увімкнути повідомлення.
     $requiredNotificationRoutes = @("alerts")
-    if ($SlackMode -eq "all") {
+    if ($script:SlackMode -eq "all") {
         $requiredNotificationRoutes += "general"
     }
     $notificationConfigurationValid = $true
@@ -864,15 +887,15 @@ function Exit-BRAVOMaintenanceOperationLock {
     $script:maintenanceOperationLockPath = $null
 }
 
-# Визначаємо режим повідомлень.
+# Банер режиму повідомлень. Саме присвоєння $script:SlackMode уже
+# зроблено вище (одразу після обчислення сирого $SlackMode) — preflight-
+# резолв webhook-URL і його валідація мають бачити ефективний режим до
+# цього моменту, тому логіка -DisableAllSlack/-EnableAllSlack там не
+# дублюється, лише перевіряється тут для друку того самого банера.
 if ($DisableAllSlack) {
-    $script:SlackMode = "none"
     Write-Host "Повідомлення: ВИМКНЕНО (none)" -ForegroundColor Yellow
 } elseif ($EnableAllSlack) {
-    $script:SlackMode = "all" 
     Write-Host "Повідомлення через ${NotificationProviderDisplayName}: УСІ ПОВІДОМЛЕННЯ (all)" -ForegroundColor Green
-} else {
-    $script:SlackMode = $SlackMode
 }
 
 # Визначаємо режим автоматичного вимкнення
