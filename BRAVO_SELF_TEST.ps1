@@ -2730,6 +2730,23 @@ try {
         -Name 'Notifications/OutboundMessagesAssignmentsKeepOuterArrayWrapper' `
         -Failure "кожне присвоєння `$outboundMessages в Archive/Health/Maintenance Runtime має бути `$outboundMessages = @(if ...) — зовнішній @() навколо всього if/else; форма `= if(...){@(...)}` розгортає одно-чанкове повідомлення в скаляр, і .Count після неї кидає PropertyNotFoundException під Set-StrictMode 2.0 (очікувано safe=5, unsafe=0; фактично safe=$safeOutboundAssignmentCount, unsafe=$unsafeOutboundAssignmentCount)"
 
+    # Третій сайт того самого класу (повний .Count-sweep зони StrictMode,
+    # 2026-08-19): Resolve-DownloadedRemoteHashPath у Health будував
+    # $createdFiles через `= if(...){@(...)}else{@()}` — у fallback-гілці
+    # (operation mask старих WinSCP / невдале завантаження sidecar) один
+    # знайдений файл розгортався у FileInfo-скаляр, а нуль — у $null, і
+    # $createdFiles.Count кидав PropertyNotFoundException замість
+    # graceful-діагностики $downloadError (обидва кейси відтворені
+    # детерміновано під Set-StrictMode -Version 2.0).
+    $healthRuntimeTextForCreatedFiles = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'))
+    Test-BRAVOCondition `
+        -Condition (
+            ([regex]::Matches($healthRuntimeTextForCreatedFiles, '\$createdFiles\s*=\s*if\s*\(')).Count -eq 0 -and
+            ([regex]::Matches($healthRuntimeTextForCreatedFiles, '\$createdFiles\s*=\s*@\(if\s*\(')).Count -eq 1
+        ) `
+        -Name 'Health/RemoteHashFallbackCreatedFilesKeepsOuterArrayWrapper' `
+        -Failure 'присвоєння $createdFiles у Resolve-DownloadedRemoteHashPath (BRAVO.Health.Runtime.ps1) має бути $createdFiles = @(if ...) — без зовнішнього @() одноелементний/порожній результат fallback-пошуку sidecar розгортається у скаляр/$null і .Count кидає PropertyNotFoundException під Set-StrictMode 2.0'
+
     $freeSpaceNotificationProbe = & $archiveRuntimeModule {
         param($Result)
 

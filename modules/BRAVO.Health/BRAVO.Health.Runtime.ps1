@@ -2265,23 +2265,26 @@ function Resolve-DownloadedRemoteHashPath {
     # Старі версії WinSCP можуть застосувати operation mask і повернути інше
     # ім'я призначення. Каталог унікальний для одного sidecar, тому безпечно
     # знайти фактично створений файл у його межах.
-    $createdFiles = if (Test-Path `
+    # @() ЗОВНІ if/else: у Windows PowerShell 5.1 if/else-вираз розгортає
+    # одноелементний результат у скаляр (1 знайдений файл -> FileInfo), а
+    # порожній -> $null — в обох випадках $createdFiles.Count нижче кидав
+    # PropertyNotFoundException під Set-StrictMode -Version 2.0 замість
+    # graceful-діагностики $downloadError (той самий клас, що
+    # production-інцидент 2026-08-19 у Get-BRAVOArchiveFreeSpaceResult;
+    # обидва fallback-кейси відтворені детерміновано).
+    $createdFiles = @(if (Test-Path `
         -LiteralPath $ArchiveCheck.RemoteHashDownloadDirectory `
         -PathType Container) {
-        @(
-            Get-ChildItem `
-                -LiteralPath $ArchiveCheck.RemoteHashDownloadDirectory `
-                -Recurse `
-                -Force `
-                -ErrorAction SilentlyContinue |
-                Where-Object {
-                    -not $_.PSIsContainer -and
-                    $_.Name -ceq "$($ArchiveCheck.LocalArchive.Name)$hashFileExtension"
-                }
-        )
-    } else {
-        @()
-    }
+        Get-ChildItem `
+            -LiteralPath $ArchiveCheck.RemoteHashDownloadDirectory `
+            -Recurse `
+            -Force `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                -not $_.PSIsContainer -and
+                $_.Name -ceq "$($ArchiveCheck.LocalArchive.Name)$hashFileExtension"
+            }
+    })
     if ($createdFiles.Count -eq 1 -and
         (Test-BRAVOPathWithinDirectory `
             -Path $createdFiles[0].FullName `
