@@ -1,5 +1,44 @@
 # Changelog
 
+## 5.0.2-rc.1 — 2026-08-19
+
+Hotfix candidate (RELEASE_POLICY.md §12) for a production incident
+observed on 2026-08-19: on any server with exactly ONE local Fixed
+drive, the Archive free-space preflight failed every run with
+"The property 'Count' cannot be found on this object" and blocked the
+entire nightly archive cycle with exit 40 -- a false-positive block
+with no real space shortage (the reporting server had 177 GB free
+against a 20 GB threshold). Affected releases: 5.0.0, 5.0.0-rc.1 and
+5.0.1 -- every deployment of the 5.0.x line on a single-drive server
+produced no backups at all.
+
+- Fixed `Get-BRAVOArchiveFreeSpaceResult` in
+  `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`: the drive list was
+  built as `$localDrives = if (...) { @(...) } else { @(...) }`; in
+  Windows PowerShell 5.1 an if/else block used as an expression unwraps
+  a single-element result back to a scalar on exit -- despite each
+  branch's own `@()` -- and the subsequent `$localDrives.Count` throws
+  `PropertyNotFoundException` under `Set-StrictMode -Version 2.0`
+  (applied by `BRAVO_CONFIG_LOADER.ps1` on every production run).
+  The fix wraps the whole if/else expression in a single outer `@()`,
+  the only shape that reliably preserves array-ness for 0/1/N elements.
+  Reproduced deterministically before the fix and re-verified after.
+- Added unconditional diagnostic logging at the start of the
+  free-space section: every detected drive (all `DriveType` values,
+  not only Fixed) is now logged with type/readiness/format/free/total
+  before the check itself runs, so any future failure leaves the log
+  showing exactly what the system saw instead of only an exception
+  message.
+- Added regression self-test
+  `Archive/FreeSpaceSingleFixedDriveSurvivesStrictMode`, which invokes
+  the real function with exactly one injected Fixed drive under an
+  explicit `Set-StrictMode -Version 2.0` -- the pre-existing
+  single-drive test could not catch this because the self-test harness
+  does not otherwise run at the production StrictMode level.
+
+Cherry-picked from the verified `developer` fix (`274b514`, CI run
+green). No other functional changes relative to 5.0.1.
+
 ## 5.0.1 — 2026-08-18
 
 Stable hotfix release promoted from the verified `5.0.1-rc.1` candidate
