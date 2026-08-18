@@ -314,9 +314,25 @@ $NotificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.NotificationRe
     30
 }
 $NotificationProviderDisplayName = if ($NotificationProvider -eq "discord") { "Discord" } else { "Slack" }
+
+# Визначаємо режим повідомлень. ЄДИНЕ джерело істини для ЕФЕКТИВНОГО режиму —
+# тут, ДО preflight-резолву/валідації webhook нижче: інакше ці перевірки
+# мовчки працювали б проти сирого $SlackMode (без урахування
+# -EnableAllSlack/-DisableAllSlack), а $script:NotificationWebhookUrl лишався
+# б недорезолвленим для фактично ефективного маршруту.
+if ($DisableAllSlack) {
+    $script:SlackMode = "none"
+    Write-Host "Повідомлення: ВИМКНЕНО (none)" -ForegroundColor Yellow
+} elseif ($EnableAllSlack) {
+    $script:SlackMode = "all"
+    Write-Host "Повідомлення через ${NotificationProviderDisplayName}: УСІ ПОВІДОМЛЕННЯ (all)" -ForegroundColor Green
+} else {
+    $script:SlackMode = $SlackMode
+}
+
 $NotificationWebhookUrl = $null
 $NotificationCredentialError = $null
-if ($SlackMode -ne "none") {
+if ($script:SlackMode -ne "none") {
     try {
         if ($null -eq $credentialSettings -or
             $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
@@ -507,7 +523,7 @@ if ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     exit 31
 }
 
-if ($SlackMode -ne "none" -and
+if ($script:SlackMode -ne "none" -and
     ([string]::IsNullOrWhiteSpace($NotificationWebhookUrl) -or
     -not $NotificationWebhookUrl.StartsWith("https://"))) {
     $credentialDetails = if ($NotificationCredentialError) { ": $NotificationCredentialError" } else { "" }
@@ -898,17 +914,6 @@ function Exit-BRAVOMaintenanceOperationLock {
     # Stale metadata file is expected; only the exclusive handle indicates
     # that Archive or Maintenance is currently active.
     $script:maintenanceOperationLockPath = $null
-}
-
-# Визначаємо режим повідомлень.
-if ($DisableAllSlack) {
-    $script:SlackMode = "none"
-    Write-Host "Повідомлення: ВИМКНЕНО (none)" -ForegroundColor Yellow
-} elseif ($EnableAllSlack) {
-    $script:SlackMode = "all" 
-    Write-Host "Повідомлення через ${NotificationProviderDisplayName}: УСІ ПОВІДОМЛЕННЯ (all)" -ForegroundColor Green
-} else {
-    $script:SlackMode = $SlackMode
 }
 
 # Визначаємо режим автоматичного вимкнення
