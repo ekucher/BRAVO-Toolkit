@@ -20,7 +20,7 @@ useDefault = true
 # який випадково потрапить у ці ж файли, майже напевно не матиме форми
 # рівно 64 hex-символів; будь-який секрет у будь-якому іншому файлі
 # сканується як і раніше.
-[allowlist]
+[[allowlists]]
 description = "SHA-256 у маніфестах цілісності не є секретами"
 condition = "AND"
 paths = [
@@ -30,3 +30,14 @@ paths = [
 regexes = [
     '''\b[A-Fa-f0-9]{64}\b'''
 ]
+
+# .gitleaksignore виключений зі скану ЦІЛКОМ. Причина (виявлено на
+# PR #60): рядок fingerprint-а має форму
+# <40-hex-sha>:<file>:generic-api-key:<line> — 40-символьний hex поруч зі
+# словом "api-key" сам збігається з entropy-евристикою generic-api-key,
+# тобто КОЖЕН доданий запис-виняток породжує нову знахідку у файлі
+# винятків (рекурсія). .gitleaksignore за визначенням містить лише
+# fingerprint-и вже підтверджених false positive, не секрети.
+[[allowlists]]
+description = ".gitleaksignore містить лише fingerprint-и, не секрети"
+paths = ['''(^|/)\.gitleaksignore$''']
