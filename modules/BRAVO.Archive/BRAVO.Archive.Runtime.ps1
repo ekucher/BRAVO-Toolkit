@@ -4887,15 +4887,25 @@ function Get-BRAVOArchiveFreeSpaceResult {
         }
     }
 
-    $localDrives = if ($PSBoundParameters.ContainsKey('Drives')) {
-        @($Drives | Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed } | Sort-Object -Property Name)
+    # КРИТИЧНО: @() мусить обгортати ВЕСЬ if/else-вираз ЗОВНІ, а не кожну
+    # гілку окремо зсередини. У Windows PowerShell 5.1 якщо if/else
+    # використовується як вираз для присвоєння і обрана гілка повертає
+    # РІВНО один об'єкт, той об'єкт "розгортається" назад у скаляр при
+    # виході з if/else — навіть якщо сама гілка обгорнута власним @().
+    # Без Set-StrictMode це проходить непомітно (PowerShell додає
+    # синтетичний .Count=1 для скалярів), але під Set-StrictMode -Version
+    # 2.0 (BRAVO_CONFIG_LOADER.ps1) $localDrives.Count нижче кидає
+    # "The property 'Count' cannot be found on this object" — реально
+    # відтворено на сервері з рівно одним Fixed-диском (C:), production
+    # incident 2026-08-19. Зовнішній @() навколо if/else гарантує
+    # масив незалежно від кількості елементів у будь-якій гілці.
+    $localDrives = @(if ($PSBoundParameters.ContainsKey('Drives')) {
+        $Drives | Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed } | Sort-Object -Property Name
     } else {
-        @(
-            [System.IO.DriveInfo]::GetDrives() |
-                Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed } |
-                Sort-Object -Property Name
-        )
-    }
+        [System.IO.DriveInfo]::GetDrives() |
+            Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed } |
+            Sort-Object -Property Name
+    })
     if ($localDrives.Count -eq 0) {
         return [pscustomobject]@{
             Success = $false
@@ -5438,6 +5448,28 @@ function Main {
     Show-ScriptProgress -Status 'Перевірка вільного місця' -PercentComplete 8
     Write-Log '==='
     Write-Log '=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==='
+    # Діагностичний знімок УСІХ виявлених дисків (будь-якого DriveType, не
+    # лише Fixed) пишеться безумовно тут, до самого виклику
+    # Get-BRAVOArchiveFreeSpaceResult. Якщо цей виклик впаде з винятком
+    # (наприклад, нетиповий диск/старий PowerShell на конкретному сервері),
+    # лог і так матиме повний перелік того, що фізично бачила система — без
+    # цього оператор при "не вдалося перевірити локальні диски" не має
+    # жодної підказки, які диски взагалі є в системі.
+    try {
+        $archiveAllDetectedDrives = @([System.IO.DriveInfo]::GetDrives())
+        Write-Log "Виявлено дисків у системі (усі типи): $($archiveAllDetectedDrives.Count)" -Level 'INFO'
+        foreach ($detectedDrive in $archiveAllDetectedDrives) {
+            $ddName = try { [string]$detectedDrive.Name } catch { '?' }
+            $ddType = try { [string]$detectedDrive.DriveType } catch { '?' }
+            $ddReady = try { [bool]$detectedDrive.IsReady } catch { $false }
+            $ddFormat = if ($ddReady) { try { [string]$detectedDrive.DriveFormat } catch { 'н/д' } } else { 'н/д' }
+            $ddFree = if ($ddReady) { try { "$([math]::Round([double]$detectedDrive.AvailableFreeSpace / 1GB, 2)) GB" } catch { 'н/д' } } else { 'н/д' }
+            $ddTotal = if ($ddReady) { try { "$([math]::Round([double]$detectedDrive.TotalSize / 1GB, 2)) GB" } catch { 'н/д' } } else { 'н/д' }
+            Write-Log "  Диск ${ddName}: тип=$ddType, готовий=$ddReady, формат=$ddFormat, вільно=$ddFree, всього=$ddTotal" -Level 'INFO'
+        }
+    } catch {
+        Write-Log "Не вдалося отримати діагностичний перелік дисків: $($_.Exception.Message)" -Level 'WARNING'
+    }
     $freeSpaceExclusionsText = if ($archiveFreeSpaceExcludedDrives.Count -gt 0) {
         $archiveFreeSpaceExcludedDrives -join ', '
     } else {
