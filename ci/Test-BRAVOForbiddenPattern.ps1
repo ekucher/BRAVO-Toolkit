@@ -48,6 +48,14 @@ $bypassAllowlist = @(
     'BRAVO_TASKS_DIAGNOSE.ps1',
     'BRAVO_CREDENTIALS_SETUP.ps1',
     'BRAVO_SELF_TEST.ps1',
+    # Домен-фрагменти self-test (dot-sourced з BRAVO_SELF_TEST.ps1, Фаза 2
+    # модуляризації): несуть ТІ САМІ перевірки, що раніше жили в allowlisted
+    # моноліті — Governance проганяє release-policy гейт дочірнім
+    # powershell.exe, ManualLaunchers ПЕРЕВІРЯЄ, що Bypass у BRAVO_SETUP.ps1
+    # обмежений рівно New-BRAVOManualLauncherContent, і містить очікуваний
+    # рядок launcher-а. Нових ВИКОНУВАНИХ Bypass-місць не додано.
+    'BRAVO_SELF_TEST.Governance.ps1',
+    'BRAVO_SELF_TEST.ManualLaunchers.ps1',
     'BRAVO.Archive.Runtime.ps1',
     'BRAVO.Maintenance.Runtime.ps1',
     # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той
