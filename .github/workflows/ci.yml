@@ -258,3 +258,7 @@ jobs:
         uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Дефолтна версія action (8.24.3) не знає глобальних [[allowlists]]
+          # (введені в gitleaks v8.25.0) і мовчки ігнорує їх у .gitleaks.toml —
+          # разом із manifest-allowlist. Пін явної новішої версії.
+          GITLEAKS_VERSION: "8.30.1"
