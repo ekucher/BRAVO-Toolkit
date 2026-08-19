@@ -1345,6 +1345,36 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         $threwD = $false
         try { [void](Get-BRAVORestoreGenerationManifest -BackupRoot $caseDRoot -RequestedGenerationId '20260814_100000') } catch { $threwD = $true }
 
+        # Case E: автоматичний вибір — НАЙНОВІШИЙ manifest нечитабельний
+        # (пошкоджений JSON), старіший валідний -> старіший обирається,
+        # але аномалія НЕ мовчазна: повертається у SkippedManifests
+        # (P2-дефект «мовчазний пропуск нечитабельного manifest»).
+        $caseERoot = Join-Path $localIdentityTestRoot 'caseE'
+        $caseEManifests = Join-Path $caseERoot 'MANIFESTS'
+        [void][IO.Directory]::CreateDirectory($caseEManifests)
+        [IO.File]::WriteAllText((Join-Path $caseEManifests 'BRAVO_BACKUP_20260816_100000.json'), '{ це не валідний JSON !!')
+        New-BRAVOSelfTestLocalManifestFixture -ManifestsRoot $caseEManifests -FileNameGenerationId '20260814_090000' -JsonGenerationId '20260814_090000' -Status 'COMPLETE'
+        $selectedE = Get-BRAVORestoreGenerationManifest -BackupRoot $caseERoot
+
+        # Case F: той самий пошкоджений manifest, але з явним
+        # -RequestedGenerationId -> як і раніше, THROW (поведінка explicit
+        # запиту не змінилась).
+        $threwF = $false
+        try { [void](Get-BRAVORestoreGenerationManifest -BackupRoot $caseERoot -RequestedGenerationId '20260816_100000') } catch { $threwF = $true }
+
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$selectedE.Manifest.generationId -eq '20260814_090000' -and
+                @($selectedE.SkippedManifests).Count -eq 1 -and
+                ([string]@($selectedE.SkippedManifests)[0].Reason).Contains('не прочитано') -and
+                @($selectedC.SkippedManifests).Count -eq 1 -and
+                ([string]@($selectedC.SkippedManifests)[0].Reason).Contains('identity mismatch') -and
+                @($selectedA.SkippedManifests).Count -eq 0 -and
+                $threwF
+            ) `
+            -Name "DataRestore/AutoSelectReportsSkippedManifestAnomalies" `
+            -Failure "fail-closed пропуск manifest-ів під час АВТОМАТИЧНОГО вибору generation не має бути мовчазним: (E) нечитабельний найновіший manifest -> старіший обраний, аномалія 'не прочитано' у SkippedManifests; (C) identity mismatch звітується; (A) чистий вибір -> SkippedManifests порожній; (F) explicit -RequestedGenerationId на пошкодженому manifest далі кидає помилку"
+
         Test-BRAVOCondition `
             -Condition (
                 [string]$selectedA.Manifest.generationId -eq '20260814_100000' -and

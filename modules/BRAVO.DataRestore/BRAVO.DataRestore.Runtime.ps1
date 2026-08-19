@@ -842,6 +842,10 @@ function Get-BRAVODataRestoreGenerationCandidates {
         try {
             $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
         } catch {
+            # Нечитабельний manifest не зникає мовчки з переліку: без цього
+            # WARNING оператор у -ListGenerations взагалі не дізнався б, що
+            # generation існує, але її manifest пошкоджено.
+            Write-DataRestoreLog -Message "УВАГА: generation manifest пропущено (не прочитано): $($manifestFile.FullName) — $($_.Exception.Message)" -Level 'WARNING' -Console
             continue
         }
         $createdAt = $manifestFile.LastWriteTime
@@ -2638,6 +2642,11 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
             try {
                 $manifest = [IO.File]::ReadAllText($localManifestPath) | ConvertFrom-Json -ErrorAction Stop
             } catch {
+                # Той самий принцип, що в canonical селекторі: fail-closed
+                # пропуск нечитабельного manifest-а правильний, але мовчазним
+                # бути не може — інакше авто-вибір тихо падає на старішу
+                # generation без сліду в лозі.
+                Write-DataRestoreLog -Message "УВАГА: завантажений SFTP-manifest пропущено (не прочитано): $localManifestPath — $($_.Exception.Message)" -Level 'WARNING' -Console
                 continue
             }
             if ([string]$manifest.status -ne 'COMPLETE') { continue }
@@ -2654,6 +2663,7 @@ function Invoke-BRAVODataRestoreSftpManifestFetch {
                 if ($isExplicitRequest) {
                     throw "manifest '$manifestName' не пройшов перевірку ідентичності: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
                 }
+                Write-DataRestoreLog -Message "УВАГА: завантажений SFTP-manifest пропущено (identity mismatch): $localManifestPath — ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'" -Level 'WARNING' -Console
                 continue
             }
             $candidates += [pscustomobject]@{
@@ -3152,6 +3162,13 @@ try {
                     -RequestedGenerationId $GenerationId
             } catch {
                 Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason $_.Exception.Message
+            }
+            # Аномалії fail-closed-пропуску під час автоматичного вибору
+            # (нечитабельний manifest / identity mismatch) мають бути видимі
+            # оператору: тихий пропуск означав би непомічене відновлення
+            # старішої generation.
+            foreach ($skippedManifest in @($selectedGeneration.SkippedManifests)) {
+                Write-DataRestoreLog -Message "УВАГА: manifest пропущено під час вибору generation: $($skippedManifest.ManifestPath) — $($skippedManifest.Reason)" -Level 'WARNING' -Console
             }
             $selectedManifest = $selectedGeneration.Manifest
         } else {
