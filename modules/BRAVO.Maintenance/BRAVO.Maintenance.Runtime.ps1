@@ -308,6 +308,28 @@ if ([string]::IsNullOrWhiteSpace($configuredNotificationMode) -and $MaintenanceC
 }
 $SlackMode = $configuredNotificationMode.ToLowerInvariant()
 
+# -EnableAllSlack/-DisableAllSlack обчислюється ТУТ, одразу після
+# сирого конфігураційного значення, а не лише пізніше перед основною
+# роботою: нижчий preflight (резолв route->webhook URL і валідація, що
+# кожен REACHABLE маршрут дійсно налаштований) мусить бачити ЕФЕКТИВНИЙ
+# режим. Раніше preflight резолвив/валідував лише той набір маршрутів,
+# що досяжний за СИРИМ $SlackMode, а рантайм-споживачі (Send-SlackAlert,
+# Send-InactiveServiceWarning, Send-FinalReport) вже читали
+# $script:SlackMode ПІСЛЯ override — при NotificationMode=none/
+# errors_only + -EnableAllSlack це лишало $script:NotificationWebhookUrls
+# недорезолвленим для нового ефективного маршруту: кожен наступний send
+# мовчки провалювався на відсутньому URL (Mandatory-параметр отримував
+# $null), а сам прапорець ставав no-op. Єдине джерело істини для
+# ЕФЕКТИВНОГО режиму — тут; банер-повідомлення нижче (де раніше й
+# відбувалось саме це присвоєння) лише друкує вже обчислене значення.
+$script:SlackMode = if ($DisableAllSlack) {
+    "none"
+} elseif ($EnableAllSlack) {
+    "all"
+} else {
+    $SlackMode
+}
+
 $NotificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.NotificationRequestTimeoutSeconds) {
     [math]::Max(1, [int]$bravoSettings.NotificationRequestTimeoutSeconds)
 } else {
@@ -315,22 +337,24 @@ $NotificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.NotificationRe
 }
 $NotificationProviderDisplayName = if ($NotificationProvider -eq "discord") { "Discord" } else { "Slack" }
 
-# Визначаємо режим повідомлень. ЄДИНЕ джерело істини для ЕФЕКТИВНОГО режиму —
-# тут, ДО preflight-резолву/валідації webhook нижче: інакше ці перевірки
-# мовчки працювали б проти сирого $SlackMode (без урахування
-# -EnableAllSlack/-DisableAllSlack), а $script:NotificationWebhookUrl лишався
-# б недорезолвленим для фактично ефективного маршруту.
+# Банер режиму повідомлень. Саме присвоєння $script:SlackMode уже
+# зроблено вище (одразу після обчислення сирого $SlackMode) — preflight-
+# резолв webhook-URL і його валідація мають бачити ефективний режим до
+# цього моменту, тому логіка -DisableAllSlack/-EnableAllSlack там не
+# дублюється, лише перевіряється тут для друку того самого банера.
 if ($DisableAllSlack) {
-    $script:SlackMode = "none"
     Write-Host "Повідомлення: ВИМКНЕНО (none)" -ForegroundColor Yellow
 } elseif ($EnableAllSlack) {
-    $script:SlackMode = "all"
     Write-Host "Повідомлення через ${NotificationProviderDisplayName}: УСІ ПОВІДОМЛЕННЯ (all)" -ForegroundColor Green
-} else {
-    $script:SlackMode = $SlackMode
 }
 
-$NotificationWebhookUrl = $null
+# Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
+# централізований API BRAVO.Notifications; Maintenance сам канал не
+# обирає. Гейт — ЕФЕКТИВНИЙ $script:SlackMode (уже враховує
+# -DisableAllSlack/-EnableAllSlack, обчислений вище): резолвити routes
+# за сирим $SlackMode тут було б помилкою — рантайм-споживачі нижче
+# читають саме $script:SlackMode.
+$script:NotificationWebhookUrls = @{}
 $NotificationCredentialError = $null
 if ($script:SlackMode -ne "none") {
     try {
@@ -338,21 +362,21 @@ if ($script:SlackMode -ne "none") {
             $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
             throw "вбудований Credential Manager недоступний"
         }
-        $notificationCredentialTarget = if ($NotificationProvider -eq "discord") {
-            [string]$credentialSettings.Targets.DiscordWebhook
-        } else {
-            [string]$credentialSettings.Targets.SlackWebhook
+        $reachableNotificationRoutes = @("alerts")
+        if ($script:SlackMode -eq "all") {
+            $reachableNotificationRoutes += "general"
         }
-        if ([string]::IsNullOrWhiteSpace($notificationCredentialTarget)) {
-            $notificationCredentialTarget = if ($NotificationProvider -eq "discord") {
-                "BRAVO_DISCORD_URL"
-            } else {
-                "BRAVO_SLACK_URL"
+        foreach ($reachableRoute in $reachableNotificationRoutes) {
+            try {
+                $script:NotificationWebhookUrls[$reachableRoute] = Resolve-BRAVONotificationEndpoint `
+                    -Provider $NotificationProvider `
+                    -Route $reachableRoute `
+                    -CredentialTargets $credentialSettings.Targets
+            } catch {
+                if (-not $NotificationCredentialError) {
+                    $NotificationCredentialError = Protect-BRAVOLogSecret -Text $_.Exception.Message
+                }
             }
-        }
-        $NotificationWebhookUrl = Get-BRAVOCredentialSecret -Target $notificationCredentialTarget
-        if ([string]::IsNullOrWhiteSpace($NotificationWebhookUrl)) {
-            throw "запис Credential Manager '$notificationCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
         }
     } catch {
         $NotificationCredentialError = Protect-BRAVOLogSecret -Text $_.Exception.Message
@@ -523,12 +547,27 @@ if ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     exit 31
 }
 
-if ($script:SlackMode -ne "none" -and
-    ([string]::IsNullOrWhiteSpace($NotificationWebhookUrl) -or
-    -not $NotificationWebhookUrl.StartsWith("https://"))) {
-    $credentialDetails = if ($NotificationCredentialError) { ": $NotificationCredentialError" } else { "" }
-    Write-Host "ПОМИЛКА: Для каналу $NotificationProviderDisplayName не знайдено коректний HTTPS webhook у Credential Manager$credentialDetails" -ForegroundColor Red
-    exit 31
+if ($script:SlackMode -ne "none") {
+    # Перевіряються ті routes, що реально досяжні за ЕФЕКТИВНОГО
+    # $script:SlackMode (уже враховує -DisableAllSlack/-EnableAllSlack) —
+    # інакше ця перевірка мовчки пропускала б відсутній webhook саме
+    # тоді, коли оператор явно попросив увімкнути повідомлення.
+    $requiredNotificationRoutes = @("alerts")
+    if ($script:SlackMode -eq "all") {
+        $requiredNotificationRoutes += "general"
+    }
+    $notificationConfigurationValid = $true
+    foreach ($requiredRoute in $requiredNotificationRoutes) {
+        $requiredRouteUrl = [string]$script:NotificationWebhookUrls[$requiredRoute]
+        if ([string]::IsNullOrWhiteSpace($requiredRouteUrl) -or -not $requiredRouteUrl.StartsWith("https://")) {
+            $notificationConfigurationValid = $false
+        }
+    }
+    if (-not $notificationConfigurationValid) {
+        $credentialDetails = if ($NotificationCredentialError) { ": $NotificationCredentialError" } else { "" }
+        Write-Host "ПОМИЛКА: Для каналу $NotificationProviderDisplayName не знайдено коректний HTTPS webhook у Credential Manager$credentialDetails" -ForegroundColor Red
+        exit 31
+    }
 }
 
 # Автоматичне визначення служби Apache для BRAVO Web.
@@ -821,6 +860,12 @@ $script:ScriptStartTime = [DateTime]::Now
 $script:SlackMessageBuffer = New-Object 'System.Collections.Generic.List[string]'
 $script:CriticalErrors = $false
 $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]'
+# Окрема черга для notification-only WARNING/ERROR (Send-SlackAlert
+# -Severity без -IsCritical): CriticalErrorsList лишається виключно для
+# фактичних execution-critical подій (-IsCritical/$isSpaceError), щоб
+# Send-FinalReport не ескалював notification-severity WARNING до
+# "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ"/CRITICAL (review finding #2).
+$script:NotificationAlertQueue = New-Object 'System.Collections.Generic.List[object]'
 $script:criticalErrorOccurred = $false
 # Лічильник WARNING для контракту кодів завершення: успіх без жодного
 # попередження -> 0, успіх із попередженнями -> 10 (Resolve-BRAVOExitCode).
@@ -1479,7 +1524,18 @@ function New-MaintenanceNotificationMessage {
         [string]$DurationLabel = "Тривалість виконання",
         [string[]]$StatusLines = @(),
         [string[]]$Details = @(),
-        [string]$LogPath
+        [string]$LogPath,
+
+        # Явна канонічна NotificationSeverity. Якщо caller уже знає точну
+        # severity (напр. Send-FinalReport для NotificationAlertQueue —
+        # WARNING/ERROR/CRITICAL, review finding: notification-only
+        # ERROR/CRITICAL не повинні "downgrade"-итись до WARNING лише
+        # через спільний TitleEmoji ":warning:"), її треба передавати сюди
+        # напряму — вона стає source of truth і inference з TitleEmoji/Title
+        # нижче пропускається. Якщо не передано — поведінка ідентична
+        # попередній (backward compatibility для наявних викликів).
+        [ValidateSet("SUCCESS", "WARNING", "ERROR", "CRITICAL")]
+        [string]$Severity
     )
 
     $hostInformation = Get-HostInformation
@@ -1492,7 +1548,9 @@ function New-MaintenanceNotificationMessage {
     # усередині. Для трьох інших наявних викликів New-MaintenanceNotificationMessage
     # результат ідентичний обом порядкам (жоден не поєднує ":warning:" з
     # Title, що містить "УСПІШ").
-    $severity = if ($TitleEmoji -eq ":warning:") {
+    $severity = if ($Severity) {
+        $Severity
+    } elseif ($TitleEmoji -eq ":warning:") {
         "WARNING"
     } elseif ($TitleEmoji -eq ":white_check_mark:" -or $Title -match "УСПІШ") {
         "SUCCESS"
@@ -1606,88 +1664,26 @@ function Get-MaintenanceMinimumFreeSpaceLines {
 
 
 function Invoke-NotificationWebhook {
-    param([string]$Message)
+    param(
+        [string]$Message,
+        [Parameter(Mandatory = $true)][string]$WebhookUrl
+    )
 
-    $notificationSeparator = (("━" * 36) -join "")
-    $messageForWebhook = if ($Message.TrimStart().StartsWith($notificationSeparator)) {
-        $Message
-    } else {
-        "$notificationSeparator`n$Message"
-    }
-    # @() ЗОВНІ if/else: одноелементний результат гілки інакше
-    # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult в
-    # BRAVO.Archive.Runtime.ps1, production-інцидент 2026-08-19).
-    $outboundMessages = @(if ($NotificationProvider -eq "discord") {
-        $discordMessage = ConvertTo-DiscordNotificationText -Message $messageForWebhook
-        Split-DiscordNotificationText -Message $discordMessage
-    } else {
-        $messageForWebhook
-    })
-
-    foreach ($outboundMessage in $outboundMessages) {
-        # Інший код або завантажений модуль міг змінити глобальний протокол,
-        # тому відновлюємо TLS 1.2 безпосередньо перед WebHook-запитом.
-        [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject(
-            [Net.SecurityProtocolType],
-            3072
-        )
-        [Net.ServicePointManager]::Expect100Continue = $false
-
-        $payload = if ($NotificationProvider -eq "discord") {
-            @{
-                content = $outboundMessage
-                allowed_mentions = @{parse = @()}
-            }
-        } else {
-            @{text = $outboundMessage}
+    try {
+        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $Message
+        Send-BRAVONotificationChunks `
+            -Provider $NotificationProvider `
+            -WebhookUrl $WebhookUrl `
+            -MessageChunks $outboundMessages `
+            -TimeoutSeconds $NotificationRequestTimeoutSeconds
+    } catch {
+        $webhookError = $_.Exception.Message
+        if ($webhookError -match "SSL/TLS|secure channel|защищенн|захищен") {
+            throw "Не вдалося встановити TLS 1.2 з $NotificationProviderDisplayName. " +
+                "На Windows $([Environment]::OSVersion.Version) перевірте оновлення Schannel, " +
+                ".NET Framework і підтримку сучасних TLS-шифрів. Початкова помилка: $webhookError"
         }
-        $body = [System.Text.Encoding]::UTF8.GetBytes(
-            ($payload | ConvertTo-BRAVOJson -Compress -Depth 5)
-        )
-        $request = [System.Net.WebRequest]::Create($NotificationWebhookUrl)
-        $request.Method = "POST"
-        $request.ContentType = "application/json; charset=utf-8"
-        $request.ContentLength = $body.Length
-        $request.Timeout = $NotificationRequestTimeoutSeconds * 1000
-        $request.ReadWriteTimeout = $NotificationRequestTimeoutSeconds * 1000
-        $request.ProtocolVersion = [Net.HttpVersion]::Version11
-        $request.KeepAlive = $false
-        $request.ServicePoint.Expect100Continue = $false
-
-        $requestStream = $null
-        $response = $null
-        $reader = $null
-        try {
-            $requestStream = $request.GetRequestStream()
-            $requestStream.Write($body, 0, $body.Length)
-            $requestStream.Dispose()
-            $requestStream = $null
-
-            $response = $request.GetResponse()
-            $reader = New-Object System.IO.StreamReader(
-                $response.GetResponseStream(),
-                [System.Text.Encoding]::UTF8
-            )
-            $responseText = $reader.ReadToEnd().Trim()
-
-            if ($NotificationProvider -eq "slack" -and
-                -not [string]::IsNullOrWhiteSpace($responseText) -and
-                $responseText -ne "ok") {
-                throw "Slack повернув неочікувану відповідь: $responseText"
-            }
-        } catch {
-            $webhookError = $_.Exception.Message
-            if ($webhookError -match "SSL/TLS|secure channel|защищенн|захищен") {
-                throw "Не вдалося встановити TLS 1.2 з $NotificationProviderDisplayName. " +
-                    "На Windows $([Environment]::OSVersion.Version) перевірте оновлення Schannel, " +
-                    ".NET Framework і підтримку сучасних TLS-шифрів. Початкова помилка: $webhookError"
-            }
-            throw
-        } finally {
-            if ($requestStream) { $requestStream.Dispose() }
-            if ($reader) { $reader.Dispose() }
-            if ($response) { $response.Dispose() }
-        }
+        throw
     }
 }
 
@@ -1695,56 +1691,123 @@ function Invoke-NotificationWebhook {
 function Send-SlackAlert {
     param(
         [string]$Message,
-        [switch]$IsCritical
+        [switch]$IsCritical,
+        # Необов'язковий параметр: NotificationSeverity (маршрутизація —
+        # який канал, GENERAL чи ALERTS, і чи гарантована доставка в
+        # errors_only) — ОКРЕМЕ поняття від OperationSeverity
+        # ($script:criticalErrorOccurred, що керує exit code Maintenance).
+        # Якщо -Severity не передано, поведінка ідентична попередній: severity
+        # виводиться з -IsCritical/$isSpaceError, як і раніше. -Severity САМА
+        # ПО СОБІ ніколи не встановлює $script:criticalErrorOccurred — це
+        # й дозволяє гарантувати доставку в ALERTS під errors_only (напр.
+        # Send-SlackAlert -Message $x -Severity WARNING, без -IsCritical),
+        # не перетворюючи операцію на critical.
+        [ValidateSet("SUCCESS", "WARNING", "ERROR", "CRITICAL")]
+        [string]$Severity
     )
-    
+
     # Перевірка режиму "none" - повне вимкнення всіх повідомлень
     if ($script:SlackMode -eq "none") {
         return
     }
-    
+
     # Автоматично визначаємо критичність для помилок місця
     $isSpaceError = $Message -match (
         "Недостатньо вільного місця|не вистачає місця|" +
         "Помилка перевірки місця|Локальні диски типу Fixed|" +
         "Шлях .* не існує або недоступний"
     )
-    
+
+    $effectiveSeverity = if ($Severity) {
+        $Severity
+    } elseif ($IsCritical -or $isSpaceError) {
+        "CRITICAL"
+    } else {
+        "SUCCESS"
+    }
+
     if ($IsCritical -or $isSpaceError) {
+        # OperationSeverity ($script:criticalErrorOccurred) — керується
+        # виключно -IsCritical/$isSpaceError, так само як і раніше;
+        # -Severity на це НЕ впливає.
         $script:CriticalErrors = $true
         $script:criticalErrorOccurred = $true
-        
-        # Для критичних помилок перевіряємо режим "errors_only" або "all"
-        if ($script:SlackMode -eq "errors_only" -or $script:SlackMode -eq "all") {
-            if ($isSpaceError) {
-                # Для помилок місця - негайна відправка
-                try {
-                    $outboundMessage = New-MaintenanceNotificationMessage `
-                        -Title "КРИТИЧНА ПОМИЛКА ОБСЛУГОВУВАННЯ" `
-                        -TitleEmoji ":rotating_light:" `
-                        -Duration ((Get-Date) - $script:ScriptStartTime) `
-                        -Details @($Message) `
-                        -LogPath $LOG_FILE
-                    Invoke-NotificationWebhook -Message $outboundMessage
-                    Write-Log "Критичне повідомлення (помилки місця) відправлено в $NotificationProviderDisplayName" -Level "INFO"
-                }
-                catch {
-                    Write-Log "ПОМИЛКА негайної відправки: $($_.Exception.Message)" -Level "ERROR"
-                }
-            }
-            else {
-                # Для інших критичних помилок - додаємо до списку для групування
-                $script:CriticalErrorsList.Add($Message)
-            }
-        }
     }
-    else {
-        # Відправляємо не-критичні повідомлення тільки в режимі "all"
+
+    if ($effectiveSeverity -eq "SUCCESS") {
+        # Незмінна стара гілка: відправляємо не-критичні повідомлення
+        # тільки в режимі "all".
         if ($script:SlackMode -ne "all") {
             return
         }
-        
         $script:SlackMessageBuffer.Add($Message)
+        return
+    }
+
+    # WARNING/ERROR/CRITICAL: маршрутизація (GENERAL/ALERTS) — виключно
+    # через централізований Resolve-BRAVONotificationRoute. Для викликів
+    # без -Severity (effectiveSeverity=CRITICAL, виведений з -IsCritical/
+    # $isSpaceError) це функціонально еквівалентно старій перевірці
+    # "SlackMode -eq errors_only -or -eq all" (яка тут завжди була true,
+    # оскільки mode=none вже вийшов на початку функції). Для нового шляху
+    # -Severity WARNING/ERROR (без -IsCritical) це дозволяє гарантовану
+    # доставку в ALERTS під errors_only без побічного впливу на
+    # OperationSeverity вище.
+    $notificationRoute = Resolve-BRAVONotificationRoute `
+        -Severity $effectiveSeverity `
+        -NotificationMode $script:SlackMode `
+        -RoutingTable $bravoSettings.NotificationRouting
+    if ($notificationRoute -eq "none") {
+        return
+    }
+
+    if ($isSpaceError) {
+        # Для помилок місця - негайна відправка (незмінно для legacy
+        # -IsCritical/дефолтного шляху — effectiveSeverity=CRITICAL, той
+        # самий Title/TitleEmoji, що й завжди). Якщо викликач явно передав
+        # -Severity (WARNING/ERROR, без -IsCritical) для повідомлення, яке
+        # ЗБІГАЄТЬСЯ з space-error регексом — Title/TitleEmoji/-Severity
+        # узгоджені з effectiveSeverity, а не жорстко CRITICAL.
+        $spaceErrorTitleEmoji = switch ($effectiveSeverity) {
+            "WARNING" { ":warning:" }
+            "ERROR" { ":x:" }
+            default { ":rotating_light:" }
+        }
+        $spaceErrorTitle = if ($effectiveSeverity -eq "CRITICAL") {
+            "КРИТИЧНА ПОМИЛКА ОБСЛУГОВУВАННЯ"
+        } else {
+            "ПОМИЛКА ОБСЛУГОВУВАННЯ"
+        }
+        try {
+            $outboundMessage = New-MaintenanceNotificationMessage `
+                -Title $spaceErrorTitle `
+                -TitleEmoji $spaceErrorTitleEmoji `
+                -Severity $effectiveSeverity `
+                -Duration ((Get-Date) - $script:ScriptStartTime) `
+                -Details @($Message) `
+                -LogPath $LOG_FILE
+            Invoke-NotificationWebhook -Message $outboundMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
+            Write-Log "Критичне повідомлення (помилки місця) відправлено в $NotificationProviderDisplayName" -Level "INFO"
+        }
+        catch {
+            Write-Log "ПОМИЛКА негайної відправки: $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    elseif ($IsCritical) {
+        # Фактична execution-critical подія — та сама черга, що й раніше,
+        # без жодної зміни (CriticalErrorsList лишається виключно для
+        # -IsCritical, review finding #2).
+        $script:CriticalErrorsList.Add($Message)
+    }
+    else {
+        # Notification-only WARNING/ERROR (-Severity, без -IsCritical) —
+        # окрема черга: NotificationSeverity лишається WARNING/ERROR аж до
+        # Send-FinalReport, не "успадковує" CRITICAL-презентацію
+        # CriticalErrorsList.
+        $script:NotificationAlertQueue.Add([pscustomobject]@{
+            Severity = $effectiveSeverity
+            Message = $Message
+        })
     }
 }
 
@@ -1769,13 +1832,18 @@ function Send-InactiveServiceWarning {
         $notificationMessage = New-MaintenanceNotificationMessage `
             -Title "СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE" `
             -TitleEmoji ":warning:" `
+            -Severity "WARNING" `
             -Duration ((Get-Date) - $script:ScriptStartTime) `
             -Details @(
                 "Служби: $serviceList",
                 "Скрипт збереже початковий стан і не запускатиме ці служби автоматично."
             ) `
             -LogPath $LOG_FILE
-        Invoke-NotificationWebhook -Message $notificationMessage
+        $notificationRoute = Resolve-BRAVONotificationRoute `
+            -Severity "WARNING" `
+            -NotificationMode $script:SlackMode `
+            -RoutingTable $bravoSettings.NotificationRouting
+        Invoke-NotificationWebhook -Message $notificationMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
         Write-Log -Message "Сповіщення про зупинені служби відправлено в $NotificationProviderDisplayName" -Level "SUCCESS"
     } catch {
         Write-Log -Message "Не вдалося відправити сповіщення про зупинені служби: $($_.Exception.Message)" -Level "ERROR"
@@ -4101,17 +4169,63 @@ function Send-FinalReport {
     $elapsedTime = (Get-Date) - $script:ScriptStartTime
     $notificationMessage = ""
     $shouldSend = $false
-    
+    $notificationSeverity = "SUCCESS"
+
     if ($script:CriticalErrorsList.Count -gt 0) {
         # Є критичні помилки - відправляємо в режимах "errors_only" та "all"
         $notificationMessage = New-MaintenanceNotificationMessage `
             -Title "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ" `
             -TitleEmoji ":rotating_light:" `
+            -Severity "CRITICAL" `
             -Duration $elapsedTime `
             -Details @($script:CriticalErrorsList.ToArray()) `
             -LogPath $LOG_FILE
+        $notificationSeverity = "CRITICAL"
         $shouldSend = $true
-    } 
+    }
+    elseif ($script:NotificationAlertQueue.Count -gt 0) {
+        # Notification-only WARNING/ERROR/CRITICAL (Send-SlackAlert
+        # -Severity, без -IsCritical) — окрема гілка від справжніх
+        # execution-critical подій (CriticalErrorsList) вище: жодна з них
+        # не встановлює criticalErrorOccurred і не потрапляє в
+        # CriticalErrorsList/execution exit code (review finding #2), але
+        # CONTENT-severity в самому повідомленні має відповідати
+        # НАЙВИЩІЙ severity у черзі (CRITICAL > ERROR > WARNING) — не
+        # downgrade-итись до WARNING лише тому, що всі вони маршрутизуються
+        # в один ALERTS-канал (review, повторна знахідка після 95c05d7).
+        # Відправляється в режимах "errors_only" та "all" (WARNING/ERROR/
+        # CRITICAL завжди -> ALERTS).
+        $queuedSeverities = @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Severity })
+        $notificationSeverity = if ($queuedSeverities -contains "CRITICAL") {
+            "CRITICAL"
+        } elseif ($queuedSeverities -contains "ERROR") {
+            "ERROR"
+        } else {
+            "WARNING"
+        }
+        # Title/TitleEmoji узгоджені з тією самою обчисленою
+        # notificationSeverity (не окремий, розбіжний inference) —
+        # New-MaintenanceNotificationMessage отримує -Severity явно, тому
+        # TitleEmoji тут суто презентаційний і не впливає на content severity.
+        $alertQueueTitleEmoji = switch ($notificationSeverity) {
+            "CRITICAL" { ":rotating_light:" }
+            "ERROR" { ":x:" }
+            default { ":warning:" }
+        }
+        $alertQueueTitle = if ($notificationSeverity -eq "CRITICAL") {
+            "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ (CRITICAL)"
+        } else {
+            "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ"
+        }
+        $notificationMessage = New-MaintenanceNotificationMessage `
+            -Title $alertQueueTitle `
+            -TitleEmoji $alertQueueTitleEmoji `
+            -Severity $notificationSeverity `
+            -Duration $elapsedTime `
+            -Details @($script:NotificationAlertQueue | ForEach-Object { [string]$_.Message }) `
+            -LogPath $LOG_FILE
+        $shouldSend = $true
+    }
     else {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
@@ -4202,14 +4316,22 @@ function Send-FinalReport {
             # 'УСПІШНО'/'УСПІШНО З ПОПЕРЕДЖЕННЯМИ'.
             $maintenanceNotificationExitCodeSnapshot = Get-BRAVOMaintenanceResolvedExitCode
             $maintenanceNotificationStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $maintenanceNotificationExitCodeSnapshot
-            $maintenanceNotificationTitleEmoji = if ($maintenanceNotificationStatus.Text -eq 'УСПІШНО') {
+            # NotificationSeverity (маршрутизація) виводиться з ТОГО САМОГО
+            # канонічного final status, що визначає TitleEmoji/текст
+            # повідомлення — єдине джерело істини, щоб фактичний вміст
+            # ("УСПІШНО З ПОПЕРЕДЖЕННЯМИ" + :warning:) і канал доставки
+            # (GENERAL/ALERTS) ніколи не розходились (review finding #1).
+            $maintenanceIsPureSuccess = $maintenanceNotificationStatus.Text -eq 'УСПІШНО'
+            $maintenanceNotificationTitleEmoji = if ($maintenanceIsPureSuccess) {
                 ':white_check_mark:'
             } else {
                 ':warning:'
             }
+            $notificationSeverity = if ($maintenanceIsPureSuccess) { "SUCCESS" } else { "WARNING" }
             $notificationMessage = New-MaintenanceNotificationMessage `
                 -Title "BRAVO MAINTENANCE — $($maintenanceNotificationStatus.Text)" `
                 -TitleEmoji $maintenanceNotificationTitleEmoji `
+                -Severity $notificationSeverity `
                 -Duration $elapsedTime `
                 -StatusLines @() `
                 -Details @($completedCheckLines.ToArray()) `
@@ -4230,9 +4352,13 @@ function Send-FinalReport {
     Write-Log -Message "==="
     Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="
     Write-Log -Message "Відправка повідомлення в $NotificationProviderDisplayName" -Level "INFO"
-    
+
+    $notificationRoute = Resolve-BRAVONotificationRoute `
+        -Severity $notificationSeverity `
+        -NotificationMode $script:SlackMode `
+        -RoutingTable $bravoSettings.NotificationRouting
     try {
-        Invoke-NotificationWebhook -Message $notificationMessage
+        Invoke-NotificationWebhook -Message $notificationMessage -WebhookUrl $script:NotificationWebhookUrls[$notificationRoute]
         Write-Log -Message "Фінальне повідомлення відправлено в $NotificationProviderDisplayName" -Level "SUCCESS"
     }
     catch {

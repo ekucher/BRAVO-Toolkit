@@ -502,30 +502,29 @@ if ([string]::IsNullOrWhiteSpace($NotificationMode)) {
     $NotificationMode = [string]$backupMonitoring.SlackMode
 }
 $NotificationMode = $NotificationMode.ToLowerInvariant()
-$NotificationWebhookUrl = $null
-$notificationCredentialTarget = if ($NotificationProvider -eq "discord") {
-    [string]$backupMonitoring.NotificationCredentialTargets.DiscordWebhook
-} else {
-    [string]$backupMonitoring.NotificationCredentialTargets.SlackWebhook
-}
-if ([string]::IsNullOrWhiteSpace($notificationCredentialTarget)) {
-    $notificationCredentialTarget = if ($NotificationProvider -eq "discord") {
-        "BRAVO_DISCORD_URL"
-    } else {
-        "BRAVO_SLACK_URL"
-    }
-}
+# Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
+# централізований API BRAVO.Notifications; Health сам канал не обирає.
+# Preflight-резолв лише тих routes, які реально досяжні за поточного
+# NotificationMode: ALERTS потрібен, доки mode != none (WARNING/ERROR/
+# CRITICAL завжди туди маршрутизуються); GENERAL — лише коли mode == all
+# (інакше SUCCESS все одно придушується і GENERAL webhook не знадобиться).
+$script:NotificationWebhookUrls = @{}
 if ($NotificationMode -ne "none" -and $credentialHelperLoaded) {
-    try {
-        if ([string]::IsNullOrWhiteSpace($notificationCredentialTarget)) {
-            throw "не налаштовано назву Credential Manager для $NotificationProvider"
+    $reachableNotificationRoutes = @("alerts")
+    if ($NotificationMode -eq "all") {
+        $reachableNotificationRoutes += "general"
+    }
+    foreach ($reachableRoute in $reachableNotificationRoutes) {
+        try {
+            $script:NotificationWebhookUrls[$reachableRoute] = Resolve-BRAVONotificationEndpoint `
+                -Provider $NotificationProvider `
+                -Route $reachableRoute `
+                -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+        } catch {
+            if (-not $notificationCredentialError) {
+                $notificationCredentialError = $_.Exception.Message
+            }
         }
-        $NotificationWebhookUrl = Get-BRAVOCredentialSecret -Target $notificationCredentialTarget
-        if ([string]::IsNullOrWhiteSpace($NotificationWebhookUrl)) {
-            throw "запис Credential Manager '$notificationCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-        }
-    } catch {
-        $notificationCredentialError = $_.Exception.Message
     }
 } elseif ($NotificationMode -ne "none") {
     $notificationCredentialError = $credentialHelperError
@@ -4304,120 +4303,6 @@ function Clear-AlertState {
     }
 }
 
-function Send-SlackAlert {
-    param([string]$Message)
-
-    if ($NotificationProvider -notin @("slack", "discord")) {
-        throw "Невідомий канал повідомлень: $NotificationProvider"
-    }
-    if ([string]::IsNullOrWhiteSpace($NotificationWebhookUrl) -or
-        -not $NotificationWebhookUrl.StartsWith("https://")) {
-        throw "Webhook для $NotificationProviderDisplayName не налаштовано або він не використовує HTTPS"
-    }
-
-    try {
-        Enable-BRAVOTls12
-    } catch {
-        Write-HealthLog "Не вдалося примусово увімкнути TLS 1.2: $($_.Exception.Message)" -Level "DEBUG"
-    }
-
-    $notificationSeparator = (("━" * 36) -join "")
-    $messageForWebhook = if ($Message.TrimStart().StartsWith($notificationSeparator)) {
-        $Message
-    } else {
-        "$notificationSeparator`n$Message"
-    }
-    # @() ЗОВНІ if/else: одноелементний результат гілки інакше
-    # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult в
-    # BRAVO.Archive.Runtime.ps1, production-інцидент 2026-08-19).
-    $outboundMessages = @(if ($NotificationProvider -eq "discord") {
-        $discordMessage = ConvertTo-DiscordNotificationText -Message $messageForWebhook
-        Split-DiscordNotificationText -Message $discordMessage
-    } else {
-        $messageForWebhook
-    })
-
-    foreach ($outboundMessage in $outboundMessages) {
-        $payload = if ($NotificationProvider -eq "discord") {
-            @{
-                content = $outboundMessage
-                allowed_mentions = @{parse = @()}
-            }
-        } else {
-            @{text = $outboundMessage}
-        }
-        $body = [System.Text.Encoding]::UTF8.GetBytes(
-            ($payload | ConvertTo-BRAVOJson -Compress -Depth 5)
-        )
-        $request = [System.Net.WebRequest]::Create($NotificationWebhookUrl)
-        $request.Method = "POST"
-        $request.ContentType = "application/json; charset=utf-8"
-        $request.ContentLength = $body.Length
-        $request.Timeout = $NotificationRequestTimeoutSeconds * 1000
-        $request.ReadWriteTimeout = $NotificationRequestTimeoutSeconds * 1000
-
-        $requestStream = $null
-        $response = $null
-        $reader = $null
-        try {
-            $requestStream = $request.GetRequestStream()
-            $requestStream.Write($body, 0, $body.Length)
-            $requestStream.Dispose()
-            $requestStream = $null
-
-            $response = $request.GetResponse()
-            $reader = New-Object System.IO.StreamReader(
-                $response.GetResponseStream(),
-                [System.Text.Encoding]::UTF8
-            )
-            $responseText = $reader.ReadToEnd().Trim()
-            $reader.Dispose()
-            $reader = $null
-            $response.Dispose()
-            $response = $null
-
-            if ($NotificationProvider -eq "slack" -and
-                -not [string]::IsNullOrWhiteSpace($responseText) -and
-                $responseText -ne "ok") {
-                throw "Slack повернув неочікувану відповідь: $responseText"
-            }
-        } catch [System.Net.WebException] {
-            $webException = $_.Exception
-            $statusText = "невідомий HTTP-статус"
-            $responseText = ""
-            $errorResponse = $webException.Response
-
-            if ($null -ne $errorResponse) {
-                try {
-                    if ($errorResponse.StatusCode) {
-                        $statusText = "$([int]$errorResponse.StatusCode) $($errorResponse.StatusDescription)"
-                    }
-                    $errorReader = New-Object System.IO.StreamReader(
-                        $errorResponse.GetResponseStream(),
-                        [System.Text.Encoding]::UTF8
-                    )
-                    try {
-                        $responseText = $errorReader.ReadToEnd().Trim()
-                    } finally {
-                        $errorReader.Dispose()
-                    }
-                } catch {
-                    $responseText = ""
-                }
-            }
-
-            if ([string]::IsNullOrWhiteSpace($responseText)) {
-                throw "$NotificationProviderDisplayName HTTP ${statusText}: $($webException.Message)"
-            }
-            throw "$NotificationProviderDisplayName HTTP ${statusText}: $responseText"
-        } finally {
-            if ($requestStream) { $requestStream.Dispose() }
-            if ($reader) { $reader.Dispose() }
-            if ($response) { $response.Dispose() }
-        }
-    }
-}
-
 function Test-BRAVOArchiveProcessLockActive {
     # Archive and Maintenance coordinate through the canonical machine-wide
     # lock. Health does not acquire it, but must inspect that same handle so a
@@ -4458,11 +4343,26 @@ if (-not $backupMonitoring.Enabled) {
     })
 }
 
+$notificationConfigurationValid = $true
 if ($NotificationProvider -notin @("slack", "discord") -or
-    $NotificationMode -notin @("none", "errors_only", "all") -or
-    ($NotificationMode -ne "none" -and
-    ([string]::IsNullOrWhiteSpace($NotificationWebhookUrl) -or
-    -not $NotificationWebhookUrl.StartsWith("https://")))) {
+    $NotificationMode -notin @("none", "errors_only", "all")) {
+    $notificationConfigurationValid = $false
+} elseif ($NotificationMode -ne "none") {
+    # Перевіряються лише ті routes, які реально досяжні за поточного
+    # NotificationMode (див. preflight-резолв вище) — так само, як і
+    # раніше, коли перевірявся один спільний webhook.
+    $requiredNotificationRoutes = @("alerts")
+    if ($NotificationMode -eq "all") {
+        $requiredNotificationRoutes += "general"
+    }
+    foreach ($requiredRoute in $requiredNotificationRoutes) {
+        $requiredRouteUrl = [string]$script:NotificationWebhookUrls[$requiredRoute]
+        if ([string]::IsNullOrWhiteSpace($requiredRouteUrl) -or -not $requiredRouteUrl.StartsWith("https://")) {
+            $notificationConfigurationValid = $false
+        }
+    }
+}
+if (-not $notificationConfigurationValid) {
     $credentialDetails = if ($notificationCredentialError) { ": $notificationCredentialError" } else { "" }
     Write-HealthLog "Некоректно налаштовано канал повідомлень або його webhook у Credential Manager$credentialDetails" -Level "ERROR"
     return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
@@ -4717,7 +4617,16 @@ if (-not $environmentPreflight.IsWritable) {
         }
         $environmentMessage = New-BRAVOOperatorNotificationMessage @environmentNotificationParameters
         try {
-            Send-SlackAlert -Message $environmentMessage
+            $environmentRoute = Resolve-BRAVONotificationRoute `
+                -Severity "CRITICAL" `
+                -NotificationMode $NotificationMode `
+                -RoutingTable $backupMonitoring.NotificationRouting
+            $environmentChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $environmentMessage
+            Send-BRAVONotificationChunks `
+                -Provider $NotificationProvider `
+                -WebhookUrl $script:NotificationWebhookUrls[$environmentRoute] `
+                -MessageChunks $environmentChunks `
+                -TimeoutSeconds $NotificationRequestTimeoutSeconds
             $environmentNotificationStatus = "Sent"
             Write-HealthLog "Сповіщення про недоступність середовища відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
         } catch {
@@ -4861,7 +4770,16 @@ if ($healthIssues.Count -eq 0) {
         $healthDuration = (Get-Date) - $healthCheckStarted
         $successMessage = New-SlackSuccessMessage -Duration $healthDuration
         try {
-            Send-SlackAlert -Message $successMessage
+            $successRoute = Resolve-BRAVONotificationRoute `
+                -Severity "SUCCESS" `
+                -NotificationMode $NotificationMode `
+                -RoutingTable $backupMonitoring.NotificationRouting
+            $successChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $successMessage
+            Send-BRAVONotificationChunks `
+                -Provider $NotificationProvider `
+                -WebhookUrl $script:NotificationWebhookUrls[$successRoute] `
+                -MessageChunks $successChunks `
+                -TimeoutSeconds $NotificationRequestTimeoutSeconds
             Write-HealthLog "Успішний звіт відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
             return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
                 Status = "Healthy"
@@ -4990,7 +4908,16 @@ if (Test-AlertSuppressed -Fingerprint $alertFingerprint) {
 }
 
 try {
-    Send-SlackAlert -Message $slackMessage
+    $issuesRoute = Resolve-BRAVONotificationRoute `
+        -Severity "CRITICAL" `
+        -NotificationMode $NotificationMode `
+        -RoutingTable $backupMonitoring.NotificationRouting
+    $issuesChunks = ConvertTo-BRAVONotificationPayloadText -Provider $NotificationProvider -Message $slackMessage
+    Send-BRAVONotificationChunks `
+        -Provider $NotificationProvider `
+        -WebhookUrl $script:NotificationWebhookUrls[$issuesRoute] `
+        -MessageChunks $issuesChunks `
+        -TimeoutSeconds $NotificationRequestTimeoutSeconds
     Save-AlertState -Fingerprint $alertFingerprint
     Write-HealthLog "Критичне повідомлення успішно відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
     return Complete-BRAVOHealthResult -Result ([pscustomobject]@{

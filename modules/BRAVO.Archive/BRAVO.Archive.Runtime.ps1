@@ -195,7 +195,6 @@ $script:credentialInitializationError = $null
 $script:archiveCredentialInitializationError = $null
 $script:smbCredentialInitializationError = $null
 $script:institutionSettingsInitializationError = $null
-$script:notificationWebhookUrl = $null
 $script:notificationCredentialInitializationError = $null
 $script:notificationProvider = ([string]$bravoSettings.NotificationProvider).ToLowerInvariant()
 if ([string]::IsNullOrWhiteSpace($script:notificationProvider)) {
@@ -446,32 +445,6 @@ if ($credentialHelperLoaded -and $smbCredentialRequired) {
     }
 }
 
-if ($credentialHelperLoaded -and $notificationCredentialRequired) {
-    try {
-        if ($script:notificationProvider -notin @("slack", "discord")) {
-            throw "невідомий канал повідомлень: $($script:notificationProvider)"
-        }
-        $notificationCredentialTarget = if ($script:notificationProvider -eq "discord") {
-            [string]$credentialSettings.Targets.DiscordWebhook
-        } else {
-            [string]$credentialSettings.Targets.SlackWebhook
-        }
-        if ([string]::IsNullOrWhiteSpace($notificationCredentialTarget)) {
-            $notificationCredentialTarget = if ($script:notificationProvider -eq "discord") {
-                "BRAVO_DISCORD_URL"
-            } else {
-                "BRAVO_SLACK_URL"
-            }
-        }
-        $script:notificationWebhookUrl = Get-BRAVOCredentialSecret -Target $notificationCredentialTarget
-        if ([string]::IsNullOrWhiteSpace($script:notificationWebhookUrl)) {
-            throw "запис Credential Manager '$notificationCredentialTarget' не знайдено або він порожній для $([Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-        }
-    } catch {
-        $script:notificationCredentialInitializationError = Protect-BRAVOLogSecret -Text $_.Exception.Message
-    }
-}
-
 # =============================================
 # ІНІЦІАЛІЗАЦІЯ ЗМІННИХ З КОНФІГУРАЦІЇ
 # =============================================
@@ -616,7 +589,22 @@ function Send-ToolIntegrityAlert {
         Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: сповіщення вимкнено параметрами запуску або конфігурацією" -Level "WARNING"
         return
     }
-    if ([string]::IsNullOrWhiteSpace([string]$script:notificationWebhookUrl)) {
+    # Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
+    # централізований API BRAVO.Notifications; Archive сам канал не обирає.
+    $notificationRoute = Resolve-BRAVONotificationRoute `
+        -Severity "CRITICAL" `
+        -NotificationMode $script:notificationMode `
+        -RoutingTable $backupMonitoring.NotificationRouting
+    if ($notificationRoute -eq "none") {
+        Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: сповіщення вимкнено параметрами запуску або конфігурацією" -Level "WARNING"
+        return
+    }
+    try {
+        $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
+            -Provider $script:notificationProvider `
+            -Route $notificationRoute `
+            -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+    } catch {
         Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: webhook не налаштовано" -Level "WARNING"
         return
     }
@@ -644,23 +632,12 @@ function Send-ToolIntegrityAlert {
             -LogPath ([string]$script:logFile) `
             -LogLabel "Журнал"
 
-        # Discord потребує власного форматування й обмежений довжиною
-        # повідомлення; Slack приймає текст як є.
-        # @() ЗОВНІ if/else: одноелементний результат гілки інакше
-        # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult,
-        # production-інцидент 2026-08-19).
-        $outboundMessages = @(if ($script:notificationProvider -eq "discord") {
-            Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $alertText)
-        } else {
-            $alertText
-        })
-        foreach ($outboundMessage in $outboundMessages) {
-            Send-BRAVOWebhookNotification `
-                -Provider $script:notificationProvider `
-                -WebhookUrl $script:notificationWebhookUrl `
-                -Message $outboundMessage `
-                -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-        }
+        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+        Send-BRAVONotificationChunks `
+            -Provider $script:notificationProvider `
+            -WebhookUrl $notificationWebhookUrl `
+            -MessageChunks $outboundMessages `
+            -TimeoutSeconds $script:notificationRequestTimeoutSeconds
         Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів відправлено у $($script:notificationProviderDisplayName)" -Level "SUCCESS"
     } catch {
         # Неможливість сповістити не змінює рішення блокувати запуск.
@@ -681,7 +658,23 @@ function Send-BRAVOArchiveFreeSpaceAlert {
         ) -Level 'WARNING'
         return
     }
-    if ([string]::IsNullOrWhiteSpace([string]$script:notificationWebhookUrl)) {
+    $notificationRoute = Resolve-BRAVONotificationRoute `
+        -Severity 'CRITICAL' `
+        -NotificationMode $script:notificationMode `
+        -RoutingTable $backupMonitoring.NotificationRouting
+    if ($notificationRoute -eq 'none') {
+        Write-BRAVOLog -Component 'STARTUP' -Message (
+            'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
+            'сповіщення вимкнено параметрами запуску або конфігурацією'
+        ) -Level 'WARNING'
+        return
+    }
+    try {
+        $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
+            -Provider $script:notificationProvider `
+            -Route $notificationRoute `
+            -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+    } catch {
         Write-BRAVOLog -Component 'STARTUP' -Message (
             'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
             "webhook для $($script:notificationProviderDisplayName) не налаштовано"
@@ -726,21 +719,12 @@ function Send-BRAVOArchiveFreeSpaceAlert {
             -LogPath ([string]$script:logFile) `
             -LogLabel 'Журнал'
 
-        # @() ЗОВНІ if/else: одноелементний результат гілки інакше
-        # розгортається в скаляр (див. Get-BRAVOArchiveFreeSpaceResult,
-        # production-інцидент 2026-08-19).
-        $outboundMessages = @(if ($script:notificationProvider -eq 'discord') {
-            Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $alertText)
-        } else {
-            $alertText
-        })
-        foreach ($outboundMessage in $outboundMessages) {
-            Send-BRAVOWebhookNotification `
-                -Provider $script:notificationProvider `
-                -WebhookUrl $script:notificationWebhookUrl `
-                -Message $outboundMessage `
-                -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-        }
+        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+        Send-BRAVONotificationChunks `
+            -Provider $script:notificationProvider `
+            -WebhookUrl $notificationWebhookUrl `
+            -MessageChunks $outboundMessages `
+            -TimeoutSeconds $script:notificationRequestTimeoutSeconds
         Write-BRAVOLog -Component 'STARTUP' -Message (
             "Критичне повідомлення (помилки місця) відправлено в " +
             $script:notificationProviderDisplayName
@@ -4233,7 +4217,20 @@ function Send-BAZAIncompatibleNameAlert {
         Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про несумісні імена $ComponentName вимкнено параметрами запуску або конфігурацією" -Level "INFO"
         return
     }
-    if ([string]::IsNullOrWhiteSpace([string]$script:notificationWebhookUrl)) {
+    $notificationRoute = Resolve-BRAVONotificationRoute `
+        -Severity "WARNING" `
+        -NotificationMode $script:notificationMode `
+        -RoutingTable $backupMonitoring.NotificationRouting
+    if ($notificationRoute -eq "none") {
+        Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про несумісні імена $ComponentName вимкнено параметрами запуску або конфігурацією" -Level "INFO"
+        return
+    }
+    try {
+        $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
+            -Provider $script:notificationProvider `
+            -Route $notificationRoute `
+            -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+    } catch {
         Write-BRAVOLog -Component 'SFTP' -Message (
             "Сповіщення про несумісні імена $ComponentName не відправлено: " +
             "webhook для $($script:notificationProviderDisplayName) не налаштовано"
@@ -4313,27 +4310,12 @@ function Send-BAZAIncompatibleNameAlert {
         -LogLabel "Повний перелік"
 
     try {
-        # @() ЗОВНІ if/else, НЕ в гілках: у Windows PowerShell 5.1
-        # одноелементний результат if/else-виразу розгортається назад у
-        # скаляр попри @() усередині гілки, і $outboundMessages.Count нижче
-        # кидав PropertyNotFoundException під Set-StrictMode -Version 2.0
-        # (BRAVO_CONFIG_LOADER.ps1) для КОЖНОГО одно-чанкового сповіщення
-        # (Slack — завжди; короткий Discord — теж): повідомлення реально
-        # надсилалось у foreach, але catch нижче хибно логував "Не вдалося
-        # відправити". Той самий клас дефекту, що й production-інцидент
-        # 2026-08-19 у Get-BRAVOArchiveFreeSpaceResult.
-        $outboundMessages = @(if ($script:notificationProvider -eq "discord") {
-            Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $message)
-        } else {
-            $message
-        })
-        foreach ($outboundMessage in $outboundMessages) {
-            Send-BRAVOWebhookNotification `
-                -Provider $script:notificationProvider `
-                -WebhookUrl $script:notificationWebhookUrl `
-                -Message $outboundMessage `
-                -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-        }
+        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
+        Send-BRAVONotificationChunks `
+            -Provider $script:notificationProvider `
+            -WebhookUrl $notificationWebhookUrl `
+            -MessageChunks $outboundMessages `
+            -TimeoutSeconds $script:notificationRequestTimeoutSeconds
         $chunkText = if ($outboundMessages.Count -gt 1) {
             " частинами: $($outboundMessages.Count)"
         } else {
@@ -4341,7 +4323,7 @@ function Send-BAZAIncompatibleNameAlert {
         }
         Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про $($Issues.Count) несумісних імен $ComponentName відправлено у $($script:notificationProviderDisplayName)$chunkText" -Level "SUCCESS"
     } catch {
-        Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $($_.Exception.Message)" -Level "ERROR"
+        Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
     }
 }
 

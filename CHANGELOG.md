@@ -796,6 +796,119 @@ Invariants below).
   regression-tested deterministically with a fake clock
   (`Timeout=13/Interval=5` must sleep exactly `5,5,3`).
 
+## 5.0.2 — 2026-08-19
+
+Stable hotfix release promoted from the verified `5.0.2-rc.1` candidate
+(RELEASE_POLICY.md §12; accepted HEAD `26de54e`, CI run 32228324024
+SUCCESS — self-test, PSScriptAnalyzer, parser/BOM/JSON, gitleaks all
+green). No functional runtime changes relative to the accepted
+candidate: this promotion removes the prerelease suffix, sets the
+stable release channel, updates operator documentation headers, and
+regenerates the runtime integrity manifest.
+
+Real-server acceptance (§12.1) on the originally affected production
+server (single Fixed drive, 2026-08-19): `BRAVO_DRY_RUN.ps1` including
+`-TestAccess` finished 58 PASS / 0 WARN / 0 FAIL, and a full
+`BRAVO_ARCHIV.ps1` run completed successfully — the new drive
+diagnostics logged the exact previously-crashing profile (one Fixed
+drive C:, 177.45 GB free), the free-space preflight passed without any
+exception, generation `20260819_121141` reached COMPLETE (3 of 3
+archives with verified SHA512 sidecars), 7 of 7 files uploaded to SFTP,
+BAZA_APP fully synchronized, health-check reported all backups current.
+The same server had produced no backups at all on 5.0.x before this
+fix.
+
+Hotfix candidate (RELEASE_POLICY.md §12) for a production incident
+observed on 2026-08-19: on any server with exactly ONE local Fixed
+drive, the Archive free-space preflight failed every run with
+"The property 'Count' cannot be found on this object" and blocked the
+entire nightly archive cycle with exit 40 -- a false-positive block
+with no real space shortage (the reporting server had 177 GB free
+against a 20 GB threshold). Affected releases: 5.0.0, 5.0.0-rc.1 and
+5.0.1 -- every deployment of the 5.0.x line on a single-drive server
+produced no backups at all.
+
+- Fixed `Get-BRAVOArchiveFreeSpaceResult` in
+  `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`: the drive list was
+  built as `$localDrives = if (...) { @(...) } else { @(...) }`; in
+  Windows PowerShell 5.1 an if/else block used as an expression unwraps
+  a single-element result back to a scalar on exit -- despite each
+  branch's own `@()` -- and the subsequent `$localDrives.Count` throws
+  `PropertyNotFoundException` under `Set-StrictMode -Version 2.0`
+  (applied by `BRAVO_CONFIG_LOADER.ps1` on every production run).
+  The fix wraps the whole if/else expression in a single outer `@()`,
+  the only shape that reliably preserves array-ness for 0/1/N elements.
+  Reproduced deterministically before the fix and re-verified after.
+- Added unconditional diagnostic logging at the start of the
+  free-space section: every detected drive (all `DriveType` values,
+  not only Fixed) is now logged with type/readiness/format/free/total
+  before the check itself runs, so any future failure leaves the log
+  showing exactly what the system saw instead of only an exception
+  message.
+- Added regression self-test
+  `Archive/FreeSpaceSingleFixedDriveSurvivesStrictMode`, which invokes
+  the real function with exactly one injected Fixed drive under an
+  explicit `Set-StrictMode -Version 2.0` -- the pre-existing
+  single-drive test could not catch this because the self-test harness
+  does not otherwise run at the production StrictMode level.
+
+Cherry-picked from the verified `developer` fix (`274b514`, CI run
+green). No other functional changes relative to 5.0.1.
+
+## 5.0.1 — 2026-08-18
+
+Stable hotfix release promoted from the verified `5.0.1-rc.1` candidate
+(RELEASE_POLICY.md §12; accepted HEAD `69bf6ff`, CI run 32115265892
+SUCCESS — self-test, PSScriptAnalyzer, parser/BOM/JSON, gitleaks all
+green). No functional runtime changes relative to the accepted
+candidate: this promotion removes the prerelease suffix, sets the
+stable release channel, updates operator documentation headers, and
+regenerates the runtime integrity manifest.
+
+Validation evidence for the underlying fix: `BRAVO_SELF_TEST.ps1`
+PASSED (763 checks, 0 FAIL) both locally and in CI; the new regression
+coverage was confirmed to actually catch the original defect by
+temporarily reintroducing it (raw `$SlackMode` instead of the effective
+`$script:SlackMode` in one of the two webhook preflight gates) and
+observing the expected, specific self-test failure, then reverting.
+`BRAVO_DRY_RUN.ps1 -TestAccess` confirmed real write/read/delete access
+to all production archive/log paths (RuntimeRoot, BackupRoot,
+SystemLogRoot, MODEL/BLOG/BRAVOEXCH + `.work`, ProgramData
+lock/state); the SFTP and scheduler-state findings in that run reflect
+running outside the production `SYSTEM` task-account context and are
+not evidence of a regression in this fix. `BRAVO_RESTORE_TEST.ps1`
+could not complete in the validation environment (no `COMPLETE`
+generation manifest available on that host — its ad hoc local backups
+were not produced by a full `BRAVO_ARCHIV.ps1` cycle); this fix does
+not touch restore logic, but restore integrity for this cycle remains
+otherwise unverified beyond self-test's static/behavioral coverage and
+should be confirmed on a real server per RELEASE_POLICY.md §9 if not
+already covered by a prior cycle's acceptance.
+
+This hotfix addresses a notification-delivery regression introduced by
+the 5.0.0 GENERAL/ALERTS severity-based webhook routing.
+
+- Fixed `-EnableAllSlack`/`-DisableAllSlack` in `BRAVO_MAINTENANCE.ps1`:
+  the effective notification mode override was applied to `$script:SlackMode`
+  after the GENERAL/ALERTS webhook-route preflight had already resolved
+  (and validated) only the routes reachable under the pre-override mode.
+  With `NotificationMode` set to `none` or `errors_only` in `BRAVO.config`,
+  `-EnableAllSlack` silently became a no-op: every notification attempt
+  looked up a route the preflight never resolved, got a `$null` webhook URL,
+  and failed silently in the surrounding `try/catch`. The effective mode is
+  now computed once, immediately after the raw configured value, and used
+  consistently by both the preflight resolution/validation and all runtime
+  senders.
+- Removed a dead, duplicate notification-webhook resolution block left
+  behind in `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1` by the 5.0.0
+  migration to the centralized `BRAVO.Notifications` delivery pipeline — no
+  sender read its result; it only performed a redundant Credential Manager
+  lookup on every Archive startup.
+- Added `.claude` to the runtime-manifest/guard exclusion pattern
+  (`ci\Update-BRAVORuntimeManifest.ps1`, `BRAVO_RUNTIME_GUARD.ps1`),
+  matching the existing `.git`/`.vscode`/`local-backups` exclusions — AI
+  assistant session tooling, not part of the shipped runtime.
+
 ## 5.0.0 — 2026-08-11
 
 Stable production release promoted from the verified 5.0.0-rc.1 candidate.

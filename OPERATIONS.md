@@ -1615,6 +1615,31 @@ server metadata. The log path at the bottom is the source for full technical
 evidence: long filenames, destination paths, thresholds and tool output remain
 there.
 
+### GENERAL vs ALERTS channels
+
+`BRAVO.Notifications` routes messages by severity into two channels, so an
+operator can put routine status in a low-noise channel and problems in a
+channel that pages someone:
+
+| Severity | Channel |
+|---|---|
+| SUCCESS | GENERAL |
+| WARNING / ERROR / CRITICAL | ALERTS |
+
+Routing also depends on `NotificationMode`: `none` sends nothing; `errors_only`
+sends only to ALERTS (SUCCESS is suppressed); `all` sends SUCCESS to GENERAL
+and everything else to ALERTS.
+
+Each provider has two Credential Manager targets —
+`BRAVO_DISCORD_GENERAL_URL`/`BRAVO_DISCORD_ALERTS_URL` and
+`BRAVO_SLACK_GENERAL_URL`/`BRAVO_SLACK_ALERTS_URL` — set up via
+`BRAVO_CREDENTIALS_SETUP.ps1 -Component Discord.General|Discord.Alerts|
+Slack.General|Slack.Alerts`. Servers that only have the legacy
+`BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL` webhook keep working unchanged: both
+GENERAL and ALERTS fall back to that single legacy webhook when the
+channel-specific target is not configured, so upgrading BRAVO does not
+require reconfiguring an operator's existing Discord/Slack integration.
+
 Backup health wording:
 
 - SUCCESS: `Остання резервна копія`.
