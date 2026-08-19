@@ -1,0 +1,50 @@
+# gitleaks fingerprint allowlist — по одному fingerprint на рядок.
+#
+# Кожен запис нижче — підтверджений false positive, не секрет.
+# Формат: <commit-sha>:<file>:<rule-id>:<line>, точно як друкує сам
+# gitleaks у полі "Fingerprint:" при знахідці.
+#
+# 90e0eafab8c543be6612fd28716759f4115a304a:BRAVO_SELF_TEST.ps1:discord-client-secret:1841
+# BRAVO_SELF_TEST.ps1 (feature/notification-severity-routing) — ізольований
+# self-test для fallback-логіки Resolve-BRAVONotificationEndpoint. Значення
+# 'BRAVO_DISCORD_ALERTS_URL_MISSING' — НАЗВА Credential Manager target-а
+# (симулює "route-специфічний запис не налаштований"), не секрет; реального
+# Credential Manager цей тест не торкається (Get-BRAVOCredentialSecret
+# повністю замокана в ізольованому module scope). Рядок випадково має
+# рівно 32 символи, що поруч із ключем "DiscordWebhookAlerts" і "="
+# збігається з дефолтним правилом gitleaks discord-client-secret
+# (entropy-евристика). Наступний коміт (545bc44) перейменував це значення
+# в поточному стані файлу; цей запис ігнорує лише історичну знахідку в
+# уже опублікованому комміті 90e0eaf (без rebase/force-push).
+90e0eafab8c543be6612fd28716759f4115a304a:BRAVO_SELF_TEST.ps1:discord-client-secret:1841
+
+# Коміт 0305310 (2026-08-08, лог-ротація exchangAPI): рядок "exchangAPI"
+# (назва компонента й основа імен лог-файлів exchangAPI.log/exchangAPI_N.log)
+# випадково має ентропію, що збігається з дефолтним правилом gitleaks
+# generic-api-key. Це літерал у документації (CHANGELOG.md), коментарі
+# (BRAVO.Maintenance.Runtime.ps1) та фікстурах/асертах self-test
+# (BRAVO_SELF_TEST.ps1) для ротації логів exchangAPI — не секрет і не
+# використовується як credential. Виявлено CI-run 32114486976
+# (workflow_dispatch на hotfix/5.0.1, 2026-08-18) при валідації 5.0.1-rc.1.
+030531040404bd4023c48fd39158f3865729cfbe:CHANGELOG.md:generic-api-key:213
+030531040404bd4023c48fd39158f3865729cfbe:modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1:generic-api-key:1607
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5204
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5223
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5250
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5461
+030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5487
+
+# selftest/BRAVO_SELF_TEST.LogRotation.ps1 (Фаза 2b модуляризації,
+# коміт 013af2f) — фікстури тестів ротації логів exchangAPI: рядки виду
+# @("exchangAPI_1.log", "exchangAPI_2.log", ...) — імена ТЕСТОВИХ
+# лог-файлів у тимчасовому каталозі, не ключі. Слово "exchangAPI" поруч
+# із лапками збігається з entropy-евристикою generic-api-key (той самий
+# false-positive клас, що вже allowlisted для BRAVO_SELF_TEST.ps1 у
+# гілці 5.0.1, коміт 45979f4). Код НЕ новий — перенесений 1:1 з
+# BRAVO_SELF_TEST.ps1, де він у ПОВНОМУ скані не тригерив gitleaks;
+# нові fingerprint-и виникли лише через новий шлях файлу в PR-скані.
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:511
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:530
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:557
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:768
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:794
