@@ -1,5 +1,31 @@
 # Changelog
 
+## 5.1.0-rc.3 — 2026-08-20 (candidate, NOT accepted)
+
+Third release candidate of the 5.1.0 line. Opened because a
+release-identity review during the (aborted) rc.2 stable promotion
+found that the candidate lacked the notification severity-routing
+feature (GENERAL/ALERTS channels) present in stable 5.0.x: PR #39 had
+historically entered master directly, bypassing developer. rc.3 ports
+that feature into the 5.1.0 line via a reviewed master->developer
+merge, together with the overdue metadata sync of the 5.0.1/5.0.2
+hotfix sections. This is a functional runtime change, so the full
+DEV-LIMS acceptance PASS recorded for rc.2 (candidate 10e9973,
+docs/BRAVO_DATA_RESTORE_RC2_DEVLIMS_ACCEPTANCE_20260819_PASS.md) no
+longer covers the runtime: **rc.3 requires a new acceptance run**
+before any stable promotion.
+
+- Ported notification severity routing (PR #39 + its 5.0.1 override
+  fix, already present in developer form): severity -> GENERAL/ALERTS
+  channel routing centralized in BRAVO.Notifications
+  (Resolve-BRAVONotificationRoute / Resolve-BRAVONotificationEndpoint /
+  Send-BRAVONotification), per-channel Credential Manager targets
+  (BRAVO_DISCORD_GENERAL_URL / BRAVO_DISCORD_ALERTS_URL and the Slack
+  pair) with automatic fallback to the legacy single webhook,
+  NotificationRouting config key, Archive/Health/Maintenance senders
+  rewired through the canonical API, credentials-setup components and
+  operator documentation.
+
 ## 5.1.0-rc.2 — 2026-08-14 (candidate, NOT accepted)
 
 Second release candidate of the 5.1.0 line. Unlike a typical RC, rc.2
