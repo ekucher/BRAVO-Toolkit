@@ -1,6 +1,26 @@
 # Changelog
 
-## 5.0.2-rc.1 — 2026-08-19
+## 5.0.2 — 2026-08-19
+
+Stable hotfix release promoted from the verified `5.0.2-rc.1` candidate
+(RELEASE_POLICY.md §12; accepted HEAD `26de54e`, CI run 32228324024
+SUCCESS — self-test, PSScriptAnalyzer, parser/BOM/JSON, gitleaks all
+green). No functional runtime changes relative to the accepted
+candidate: this promotion removes the prerelease suffix, sets the
+stable release channel, updates operator documentation headers, and
+regenerates the runtime integrity manifest.
+
+Real-server acceptance (§12.1) on the originally affected production
+server (single Fixed drive, 2026-08-19): `BRAVO_DRY_RUN.ps1` including
+`-TestAccess` finished 58 PASS / 0 WARN / 0 FAIL, and a full
+`BRAVO_ARCHIV.ps1` run completed successfully — the new drive
+diagnostics logged the exact previously-crashing profile (one Fixed
+drive C:, 177.45 GB free), the free-space preflight passed without any
+exception, generation `20260819_121141` reached COMPLETE (3 of 3
+archives with verified SHA512 sidecars), 7 of 7 files uploaded to SFTP,
+BAZA_APP fully synchronized, health-check reported all backups current.
+The same server had produced no backups at all on 5.0.x before this
+fix.
 
 Hotfix candidate (RELEASE_POLICY.md §12) for a production incident
 observed on 2026-08-19: on any server with exactly ONE local Fixed
