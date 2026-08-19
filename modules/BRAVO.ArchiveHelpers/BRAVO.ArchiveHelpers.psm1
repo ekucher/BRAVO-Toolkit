@@ -483,6 +483,14 @@ function Get-BRAVORestoreGenerationManifest {
         -GenerationId $RequestedGenerationId)
 
     $candidates = @()
+    # Аномалії, пропущені fail-closed'ом ПІД ЧАС АВТОМАТИЧНОГО вибору
+    # (нечитабельний manifest, identity mismatch). Сам пропуск — правильна
+    # поведінка, але він НЕ має бути мовчазним: тихе падіння на старішу
+    # generation оператор інакше не побачить. Штатні не-COMPLETE manifest-и
+    # аномалією не вважаються. Модуль навмисно нічого не логує сам —
+    # список повертається викликачам (DATA_RESTORE / RESTORE_TEST) як
+    # властивість SkippedManifests результату, і кожен логує своїм логером.
+    $skippedAnomalies = @()
     foreach ($manifestFile in $manifestFiles) {
         try {
             $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
@@ -505,6 +513,10 @@ function Get-BRAVORestoreGenerationManifest {
                 # Автоматичний вибір (без explicit -RequestedGenerationId):
                 # fail-closed — пропускаємо підозрілий manifest, а не
                 # ризикуємо вибрати generation, вказану лише в JSON.
+                $skippedAnomalies += [pscustomobject]@{
+                    ManifestPath = $manifestFile.FullName
+                    Reason       = "identity mismatch: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
+                }
                 continue
             }
             $createdAt = $manifestFile.LastWriteTime
@@ -524,15 +536,23 @@ function Get-BRAVORestoreGenerationManifest {
             if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
                 throw "Generation manifest не прочитано: $($_.Exception.Message)"
             }
+            $skippedAnomalies += [pscustomobject]@{
+                ManifestPath = $manifestFile.FullName
+                Reason       = "manifest не прочитано: $($_.Exception.Message)"
+            }
         }
     }
     $selected = $candidates | Sort-Object CreatedAt -Descending | Select-Object -First 1
     if ($null -eq $selected) {
         if ([string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+            if (@($skippedAnomalies).Count -gt 0) {
+                throw "не знайдено жодного COMPLETE generation manifest (пропущено з аномаліями: $(@($skippedAnomalies).Count) — $((@($skippedAnomalies) | ForEach-Object { $_.Reason }) -join '; '))"
+            }
             throw 'не знайдено жодного COMPLETE generation manifest'
         }
         throw "COMPLETE generation '$RequestedGenerationId' не знайдено"
     }
+    Add-Member -InputObject $selected -MemberType NoteProperty -Name 'SkippedManifests' -Value @($skippedAnomalies) -Force
     return $selected
 }
 

@@ -218,6 +218,13 @@ try {
         $selectedGeneration = Get-BRAVORestoreGenerationManifest `
             -BackupRoot $backupRootPath `
             -RequestedGenerationId $GenerationId
+        # Аномалії fail-closed-пропуску під час автоматичного вибору
+        # (нечитабельний manifest / identity mismatch) — видимий WARN:
+        # тихий пропуск означав би непомічену перевірку старішої generation.
+        foreach ($skippedManifest in @($selectedGeneration.SkippedManifests)) {
+            Add-RestoreDrillResult WARN 'Generation' $null $null 0 0 (
+                "manifest пропущено під час вибору generation: $($skippedManifest.ManifestPath) — $($skippedManifest.Reason)")
+        }
         $script:selectedRestoreGenerationId = [string]$selectedGeneration.Manifest.generationId
         if ([string]::IsNullOrWhiteSpace($script:selectedRestoreGenerationId)) {
             throw "selected COMPLETE generation manifest не містить GenerationId: $($selectedGeneration.ManifestPath)"
