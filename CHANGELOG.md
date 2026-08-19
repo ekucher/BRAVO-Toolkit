@@ -1,18 +1,56 @@
 # Changelog
 
-## 5.1.0-rc.2 — 2026-08-14 (candidate, NOT accepted)
+## 5.1.0 — 2026-08-19
 
-Second release candidate of the 5.1.0 line. Unlike a typical RC, rc.2
-carries a functional addition: completion of BRAVO_DATA_RESTORE, which
-the project decided to ship inside stable 5.1.0. Because of this
-functional change, the 5.1.0-rc.1 acceptance evidence no longer covers
-the runtime: **rc.2 requires a new full acceptance run** (including the
-real DEV-LIMS restore acceptance) before any stable promotion. This
-candidate has NOT been accepted yet. The earlier local, unpublished
-5.1.0 stable promotion produced from rc.1 (commit `ac07f55`) is
-superseded and must not be pushed, merged, tagged, or released; the
-"5.1.0" section below describes that unpublished promotion and stable
-5.1.0 will be re-promoted from an accepted rc.2.
+Stable release promoted from the accepted `5.1.0-rc.2` candidate
+(RELEASE_POLICY.md §10.1; accepted stamp commit `10e9973`, sourceCommit
+`1f03a6f`, CI run 32292576143 SUCCESS — self-test, DataRestore matrix,
+PSScriptAnalyzer, parser/BOM/JSON, gitleaks all green). No functional
+runtime changes relative to the accepted candidate: this promotion
+removes the prerelease suffix, sets the stable release channel, updates
+operator documentation headers, and regenerates the runtime integrity
+manifest. The earlier local, unpublished 5.1.0 promotion produced from
+rc.1 (`ac07f55`) remains superseded and was never published.
+
+Real-server acceptance (full DEV-LIMS run, 2026-08-19, evidence:
+`docs/BRAVO_DATA_RESTORE_RC2_DEVLIMS_ACCEPTANCE_20260819_PASS.md` on
+branch `evidence/10e9973-rc2-devlims-acceptance-pass`): dry-run
+60 PASS / 0 WARN / 0 FAIL incl. SYSTEM end-to-end and SFTP read-only;
+scheduled SYSTEM Archive COMPLETE 3/3 with SFTP 7/7; B4/B15/B16 restore
+cycles PASS; B19 single-component rollback PASS (exit 43, clean
+filesystem); **B20 cross-component rollback — the scenario behind the
+previous NO-GO — PASS** (deterministic failpoint, cascading rollback of
+every mutated component); B17 first real SFTP-source restore PASS
+(PR #42 ProbeDirectory fix confirmed end-to-end); B21 clean exit-50
+abort on mid-download network failure with zero mutation and staging
+intentionally kept; B22 operation-lock contention PASS (5:00 of honest
+waiting, zero concurrency).
+
+Post-rc.2 changes included in the accepted candidate (all validated by
+the acceptance run above):
+
+- fix(archive): free-space preflight StrictMode crash on
+  single-Fixed-drive servers (`274b514`; shipped to the 5.0.x fleet as
+  hotfix 5.0.2) plus unconditional drive diagnostics logging.
+- fix(notifications): outbound message chunks lose array-ness in
+  if/else assignment under StrictMode — all five `$outboundMessages`
+  sites normalized (`04c6521`).
+- fix(health): remote-hash sidecar fallback crashes under StrictMode
+  instead of graceful diagnostics (`1cee524`).
+- fix(restore): fail-closed manifest skips during automatic generation
+  selection are no longer silent — canonical selector reports
+  `SkippedManifests`, callers log WARNING (PR #58).
+- feat(ci): automated release artifact build and validation —
+  `ci/New-BRAVOReleaseArtifact.ps1` + `release-artifact` workflow on
+  `v*` tags (PR #57); gitleaks config activated with pinned
+  `GITLEAKS_VERSION` (PR #60).
+- refactor(self-test): phases 2/2b — ManualLaunchers, Governance and
+  the whole LogRotation fixture block extracted into `selftest/`
+  (PR #59/#60); monolith 13961 -> 12217 lines, identical
+  1104 PASS / 0 FAIL characterization.
+
+The 5.1.0 line changes relative to stable 5.0.2 (accumulated through
+dev.1/rc.1/rc.2):
 
 - New `BRAVO_DATA_RESTORE.ps1` entrypoint (thin orchestration over the
   new `modules/BRAVO.DataRestore` domain module): real data restore of
