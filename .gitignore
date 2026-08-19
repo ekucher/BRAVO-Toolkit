@@ -25,3 +25,7 @@ Tools/TOOLS_INTEGRITY.json
 
 # Локальні налаштування IDE — особисті, не частина комплекту
 .vscode/
+
+# Результати збирання release-артефакту (ci\New-BRAVOReleaseArtifact.ps1) —
+# генеруються з git archive, ніколи не комітяться.
+artifacts/

@@ -1,0 +1,95 @@
+name: Release artifact
+
+# P1.2 (ROADMAP.md): stable release artifact. Раніше "release package" —
+# це був ручний git archive з робочої копії (востаннє для v5.0.2 його
+# збирали вручну). Цей workflow збирає той самий детермінований комплект
+# автоматично з конкретного release-тега:
+#
+#     BRAVO-Toolkit-X.Y.Z.zip
+#     BRAVO-Toolkit-X.Y.Z.zip.sha256
+#     release-manifest.json
+#
+# і прикріплює його до GitHub Release ЛИШЕ після того, як розпакований
+# комплект пройшов обидва integrity-манифести, BRAVO_RUNTIME_GUARD і
+# повний BRAVO_SELF_TEST. Якщо Release для тега ще не існує, створюється
+# DRAFT — публікація Release лишається рішенням людини (RELEASE_POLICY.md:
+# acceptance-вердикт не є авторизацією публікації).
+#
+# Той самий раннер/шелл-профіль, що й у ci.yml: windows-latest +
+# `shell: powershell` (Windows PowerShell 5.1), `run:`-блоки ASCII-only
+# (причина задокументована в ci.yml біля кроку "Forbidden patterns").
+
+on:
+  push:
+    tags: ['v*']
+  # Ручний прогін на будь-якому ref: збирає і валідує артефакт, але НЕ
+  # прикріплює його до Release (крок upload умовний на ref_type == tag).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-artifact:
+    name: Build + validate + attach
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Збирання артефакту (git archive + інтегріті-перевірки)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:GITHUB_REF_TYPE -eq 'tag') {
+              .\ci\New-BRAVOReleaseArtifact.ps1 -Ref $env:GITHUB_REF_NAME -ExpectedTag $env:GITHUB_REF_NAME
+          } else {
+              .\ci\New-BRAVOReleaseArtifact.ps1 -Ref $env:GITHUB_SHA
+          }
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Повний self-test з розпакованого артефакту
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Push-Location artifacts\release\staging
+          try {
+              .\BRAVO_SELF_TEST.ps1
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::error::BRAVO_SELF_TEST.ps1 (artifact staging) exited with code $LASTEXITCODE"
+                  exit 1
+              }
+          } finally {
+              Pop-Location
+          }
+
+      - name: Артефакти workflow (zip + sha256 + manifest)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-artifact
+          path: |
+            artifacts/release/*.zip
+            artifacts/release/*.zip.sha256
+            artifacts/release/release-manifest.json
+          if-no-files-found: error
+
+      - name: Прикріплення до GitHub Release (лише для тега)
+        if: github.ref_type == 'tag'
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $files = @(
+              (Get-ChildItem artifacts\release -Filter '*.zip').FullName,
+              (Get-ChildItem artifacts\release -Filter '*.zip.sha256').FullName,
+              (Join-Path (Resolve-Path artifacts\release) 'release-manifest.json')
+          )
+          gh release view $tag --json isDraft
+          if ($LASTEXITCODE -eq 0) {
+              gh release upload $tag @files
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+          } else {
+              gh release create $tag --draft --title "BRAVO Toolkit $($tag.TrimStart('v'))" --notes "Automated draft: validated release artifact attached by the release-artifact workflow. Review and publish manually." @files
+              if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
