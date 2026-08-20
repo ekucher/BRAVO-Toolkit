@@ -60,6 +60,18 @@ Runtime.ps1 decomposition.
   BRAVO.System exports (Write/Read/Clear/Suppress quiescence state,
   Test-BRAVOProcessAlive). See OPERATIONS.md «Аварійне відновлення
   служб (ownership-маркер)».
+- Fixed a double-restore defect (real incident on a production BRAVO
+  server, 2026-08-20): the Recovery guard branch for missed daily work
+  with services already running (exit 20) unconditionally overwrote
+  BRAVO_RESTORE_STATE.json with Pending, degrading the Succeeded state
+  of an already-performed restore — the next 15-minute Recovery tick
+  then executed the full model restore a second time in the same day.
+  The trigger was a race with the nightly BRAVO_ARCHIV run (its Backup
+  execution mark not yet written while it was still running produced a
+  false missed-Backup verdict). Pending is now written only when the
+  restore slot is genuinely still due; a completed restore state is
+  never degraded. Regression test
+  Maintenance/RecoveryGuardNeverDegradesSucceededRestoreState.
 - ROADMAP: P3.2a documented — BRAVO_UPDATE.ps1, operator-triggered
   server update (staged download + SHA-256 + config diff gate +
   in-place mirror + guard/scheduler/setup gates + update journal +
