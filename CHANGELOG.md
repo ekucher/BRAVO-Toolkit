@@ -5,12 +5,26 @@
 Opens the next development cycle on developer after the 5.1.0 stable
 release (per RELEASE_POLICY.md section 11: post-promotion sync with
 master, then immediate prerelease bump so both branches never carry the
-same packageVersion). No functional changes yet. Planned focus (from
-the recorded 5.1.0-cycle debt): deduplication of service-lifecycle /
-operation-lock / WinSCP-session / ASCII-temp-root policy copies,
-BRAVO.DataRestore Runtime.ps1 decomposition, and separating push- vs
-PR-event check names so the stable-promotion window no longer conflicts
-with master branch protection.
+same packageVersion). Planned focus (from the recorded 5.1.0-cycle
+debt): deduplication of service-lifecycle / operation-lock /
+WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
+Runtime.ps1 decomposition.
+
+- CI: push- and pull_request-event check names split (jobs get a
+  " (push)" suffix outside pull_request context). During the 5.1.0
+  stable promotion the same head SHA carried a green PR run and the
+  documented intentionally-red push run under identical check names,
+  so master branch protection counted both and blocked the merge
+  ("2 of 5 required status checks are failing"), forcing a temporary
+  enforce_admins bypass. Required checks are now supplied exclusively
+  by the pull_request (merge-preview) run; push runs keep full
+  coverage, including the branch-context release-policy gate, under
+  suffixed names. No step logic changed.
+- ROADMAP: P3.2a documented — BRAVO_UPDATE.ps1, operator-triggered
+  server update (staged download + SHA-256 + config diff gate +
+  in-place mirror + guard/scheduler/setup gates + update journal +
+  auto-rollback), planned for this cycle; silent auto-update remains
+  architecturally forbidden until full P3.2/P4.
 
 ## 5.1.0 — 2026-08-20
 

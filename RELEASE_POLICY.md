@@ -989,6 +989,9 @@ stable 5.1.0.
 Цикл `5.2.0-dev.1` відкрито одразу після промоції (розділ 11).
 Записаний борг циклу: дедуплікація service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root політик, декомпозиція
-BRAVO.DataRestore Runtime.ps1, розведення імен push- та PR-checks у CI
-(під час промоційного вікна однойменний червоний push-run блокував
-required checks гілки master — merge PR #61 виконано admin-обходом).
+BRAVO.DataRestore Runtime.ps1, реалізація P3.2a (BRAVO_UPDATE.ps1).
+Розведення імен push- та PR-checks у CI — ВИКОНАНО в dev.1 (під час
+промоційного вікна 5.1.0 однойменний червоний push-run блокував
+required checks гілки master, merge PR #61 виконано admin-обходом;
+тепер required-контексти постачає лише pull_request-прогін, push-прогони
+мають суфікс " (push)").
