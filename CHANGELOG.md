@@ -20,6 +20,23 @@ Runtime.ps1 decomposition.
   by the pull_request (merge-preview) run; push runs keep full
   coverage, including the branch-context release-policy gate, under
   suffixed names. No step logic changed.
+- Service quiescence ownership marker + Health watchdog: Maintenance
+  and DataRestore now write an atomic ownership marker
+  (`%ProgramData%\BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json`, same
+  pattern as the VSS ownership state) BEFORE stopping managed services
+  (marker write failure aborts the stop — fail-closed) and clear it
+  only after all services restarted successfully. The scheduled
+  BRAVO_HEALTH run gains a narrow, documented exception to its
+  read-only policy: if the marker's owner process is dead
+  (pid+processStartTime liveness check, PID reuse excluded) and
+  restartSuppressed=false, Health starts exactly the services listed
+  in the marker and alerts; a suppressed marker (DataRestore
+  incomplete rollback, exit 43) or a manual stop without a marker is
+  never auto-started. New self-test domain
+  `selftest/BRAVO_SELF_TEST.ServiceQuiescence.ps1`; new
+  BRAVO.System exports (Write/Read/Clear/Suppress quiescence state,
+  Test-BRAVOProcessAlive). See OPERATIONS.md «Аварійне відновлення
+  служб (ownership-маркер)».
 - ROADMAP: P3.2a documented — BRAVO_UPDATE.ps1, operator-triggered
   server update (staged download + SHA-256 + config diff gate +
   in-place mirror + guard/scheduler/setup gates + update journal +
