@@ -92,6 +92,170 @@ function Format-BRAVOSchedulerNextRun {
     return 'невідомо'
 }
 
+# ---------------------------------------------------------------------------
+# Ownership-маркер зупинки служб (BRAVO_SERVICE_QUIESCENCE.json).
+#
+# Проблема: якщо Maintenance/DataRestore зупинив служби і процес загинув
+# ЖОРСТКО (kill, втрата живлення — finally не виконався), in-memory знімки
+# станів втрачаються і служби лишаються зупиненими назавжди. Водночас
+# техпідтримка легітимно зупиняє служби вручну для регламентних робіт —
+# автоматичний старт у такий момент неприпустимий.
+#
+# Рішення: власник (Maintenance/DataRestore) ПЕРЕД зупинкою пише
+# персистентний маркер зі своїм pid+processStartTime і ТОЧНИМИ resolved
+# іменами служб; при штатному відновленні служб у finally — прибирає.
+# Watchdog (Health, кожні 4 год) стартує служби ЛИШЕ якщо маркер існує,
+# власник МЕРТВИЙ і restartSuppressed=false. Без маркера (ручна зупинка
+# техпідтримкою) BRAVO не чіпає служби ніколи.
+#
+# Атомарність запису — той самий патерн, що BRAVO_VSS_OWNERSHIP.json
+# (GUID-tmp + [IO.File]::Replace/Move).
+# ---------------------------------------------------------------------------
+
+function Get-BRAVOServiceQuiescenceStatePath {
+    $programDataRoot = [Environment]::GetFolderPath('CommonApplicationData')
+    if ([string]::IsNullOrWhiteSpace($programDataRoot)) {
+        throw 'CommonApplicationData недоступний для service-quiescence state'
+    }
+    return Join-Path $programDataRoot 'BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json'
+}
+
+function Write-BRAVOServiceQuiescenceState {
+    # Пишеться ПЕРЕД першою зупинкою служби. Збій запису має абортувати
+    # зупинку у викликача (fail-closed): без маркера аварія знову стала б
+    # «мовчазною». Services — масив @{ Name = ...; RestartIntent = $true/$false }
+    # з ФАКТИЧНИМИ resolved іменами (BravoWeb резолвиться в кожному рантаймі
+    # по-своєму — watchdog не повинен резолвити сам).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')][string]$Owner,
+        [Parameter(Mandatory = $true)][object[]]$Services,
+        [string]$LogFile,
+        [switch]$RestartSuppressed
+    )
+
+    $statePath = Get-BRAVOServiceQuiescenceStatePath
+    $stateDirectory = Split-Path -Path $statePath -Parent
+    if (-not [IO.Directory]::Exists($stateDirectory)) {
+        [void][IO.Directory]::CreateDirectory($stateDirectory)
+    }
+    $state = [ordered]@{
+        schemaVersion = 1
+        owner = $Owner
+        hostname = [Environment]::MachineName
+        pid = $PID
+        # Module-qualified: захист від затінення Get-Process функцією-стабом
+        # у сесії викликача (реальний випадок у self-test).
+        processStartTime = $(try { (Microsoft.PowerShell.Management\Get-Process -Id $PID -ErrorAction Stop).StartTime.ToString('o') } catch { $null })
+        createdAt = (Get-Date).ToString('o')
+        logFile = [string]$LogFile
+        restartSuppressed = [bool]$RestartSuppressed
+        services = @($Services | ForEach-Object {
+            [ordered]@{ Name = [string]$_.Name; RestartIntent = [bool]$_.RestartIntent }
+        })
+    }
+    $temporaryStatePath = Join-Path $stateDirectory ('.BRAVO_SERVICE_QUIESCENCE_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    $backupStatePath = Join-Path $stateDirectory ('.BRAVO_SERVICE_QUIESCENCE_{0}.bak' -f [guid]::NewGuid().ToString('N'))
+    $stateReplaced = $false
+    try {
+        $json = $state | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($temporaryStatePath, $json, (New-Object Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($statePath)) {
+            # .NET Framework відхиляє null-backup у Replace — тому явний шлях.
+            [IO.File]::Replace($temporaryStatePath, $statePath, $backupStatePath)
+            $stateReplaced = $true
+        } else {
+            [IO.File]::Move($temporaryStatePath, $statePath)
+        }
+    } finally {
+        if ([IO.File]::Exists($temporaryStatePath)) {
+            [IO.File]::Delete($temporaryStatePath)
+        }
+        if ($stateReplaced -and [IO.File]::Exists($backupStatePath)) {
+            Remove-Item -LiteralPath $backupStatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $state
+}
+
+function Read-BRAVOServiceQuiescenceState {
+    # $null = маркера немає АБО він невалідний/чужий (інший hostname,
+    # незнайома schemaVersion, зіпсований JSON) — у всіх цих випадках
+    # watchdog НЕ діє (лише алертить про невалідний файл сам викликач,
+    # якщо вважає за потрібне). Валідний чужий маркер не «лікуємо» — це
+    # свідома fail-safe поведінка, як у VSS-ownership.
+    [CmdletBinding()]
+    param()
+
+    $statePath = Get-BRAVOServiceQuiescenceStatePath
+    if (-not [IO.File]::Exists($statePath)) { return $null }
+    try {
+        $raw = [IO.File]::ReadAllText($statePath, (New-Object Text.UTF8Encoding($false)))
+        $state = $raw | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        return $null
+    }
+    if ($null -eq $state.PSObject.Properties['schemaVersion'] -or [int]$state.schemaVersion -ne 1) { return $null }
+    if ([string]$state.owner -notin @('BRAVO_MAINTENANCE', 'BRAVO_DATA_RESTORE')) { return $null }
+    if ([string]$state.hostname -ne [Environment]::MachineName) { return $null }
+    return $state
+}
+
+function Clear-BRAVOServiceQuiescenceState {
+    # Ідемпотентне видалення (штатне завершення відновлення служб).
+    [CmdletBinding()]
+    param()
+
+    $statePath = Get-BRAVOServiceQuiescenceStatePath
+    if ([IO.File]::Exists($statePath)) {
+        Remove-Item -LiteralPath $statePath -Force -ErrorAction Stop
+    }
+}
+
+function Set-BRAVOServiceQuiescenceRestartSuppressed {
+    # Для fail-closed гілки DataRestore (rollback неповний): служби НАВМИСНО
+    # лишаються зупиненими, маркер зберігається як евіденс, але watchdog не
+    # має права стартувати — лише алертити про потребу ручного втручання.
+    [CmdletBinding()]
+    param()
+
+    $state = Read-BRAVOServiceQuiescenceState
+    if ($null -eq $state) { return $null }
+    $services = @($state.services | ForEach-Object {
+        @{ Name = [string]$_.Name; RestartIntent = [bool]$_.RestartIntent }
+    })
+    return Write-BRAVOServiceQuiescenceState `
+        -Owner ([string]$state.owner) `
+        -Services $services `
+        -LogFile ([string]$state.logFile) `
+        -RestartSuppressed
+}
+
+function Test-BRAVOProcessAlive {
+    # Предикат «процес із цим PID і саме цим startTime ще живий».
+    # Мертвий PID або перевикористаний (інший startTime) -> $false.
+    # Помилка ДОСТУПУ до живого процесу -> консервативно $true (fail-safe:
+    # краще не стартувати служби під живим власником, ніж навпаки).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$ProcessId,
+        [string]$ProcessStartTime
+    )
+
+    $process = Microsoft.PowerShell.Management\Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $false }
+    if ([string]::IsNullOrWhiteSpace($ProcessStartTime)) {
+        # Маркер без startTime (не мав би траплятися) — вважаємо живим,
+        # поки PID існує (консервативно).
+        return $true
+    }
+    try {
+        return ($process.StartTime.ToString('o') -eq $ProcessStartTime)
+    } catch {
+        return $true
+    }
+}
+
 function Get-BRAVOTaskRootReadinessResults {
     # Одна canonical точка інтерпретації readiness LIMSRoot/SystemLogRoot/
     # BackupRoot для планованих завдань. Раніше ця логіка жила лише в
