@@ -3559,17 +3559,22 @@ try {
             # консервативна семантика, що й прапорець вище). Пишуться лише
             # служби з наміром відновлення (ShouldRestartAfterRestore) —
             # тільки їх Health-watchdog має право підняти після жорсткого
-            # kill цього процесу. Збій запису = аборт (fail-closed).
-            try {
-                [void](Write-BRAVOServiceQuiescenceState `
-                    -Owner 'BRAVO_DATA_RESTORE' `
-                    -Services @($servicesWithRestartIntent | ForEach-Object {
-                        @{ Name = [string]$_.Name; RestartIntent = $true }
-                    }) `
-                    -LogFile ([string]$script:dataRestoreLogFile))
-                $script:dataRestoreQuiescenceMarkerWritten = $true
-            } catch {
-                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося записати ownership-маркер зупинки служб (без нього аварійне переривання лишило б служби зупиненими без автоматичного відновлення): $($_.Exception.Message)"
+            # kill цього процесу. Збій запису = аборт (fail-closed). Якщо
+            # намір відновлення порожній (жодна керована служба не працювала
+            # на момент знімка — типово для тестових/ізольованих прогонів),
+            # маркер не потрібен: watchdog не мав би що піднімати.
+            if ($servicesWithRestartIntent.Count -gt 0) {
+                try {
+                    [void](Write-BRAVOServiceQuiescenceState `
+                        -Owner 'BRAVO_DATA_RESTORE' `
+                        -Services @($servicesWithRestartIntent | ForEach-Object {
+                            @{ Name = [string]$_.Name; RestartIntent = $true }
+                        }) `
+                        -LogFile ([string]$script:dataRestoreLogFile))
+                    $script:dataRestoreQuiescenceMarkerWritten = $true
+                } catch {
+                    Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося записати ownership-маркер зупинки служб (без нього аварійне переривання лишило б служби зупиненими без автоматичного відновлення): $($_.Exception.Message)"
+                }
             }
             $quiescenceFailures = Invoke-BRAVODataRestoreQuiescence `
                 -Snapshot $script:dataRestoreServiceSnapshot `
