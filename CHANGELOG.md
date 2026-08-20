@@ -105,7 +105,7 @@ Runtime.ps1 decomposition.
     enter the application before the model is replaced; fail-open —
     if the task does not run, delayed auto-start brings services up.
   - The former boot-trigger repetition (15 min for 8 h) is removed: on
-    RDL (2026-08-20) its tail kept waking the task every 15 minutes
+    a production BRAVO server (2026-08-20) its tail kept waking the task every 15 minutes
     long after the restore had succeeded.
 
 ## 5.1.0 — 2026-08-20

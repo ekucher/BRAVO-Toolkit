@@ -326,7 +326,7 @@ function New-BRAVOTaskDefinition {
     # одразу після старту сервера, поки служби (Automatic Delayed Start) ще
     # не запущені; повтор невдалої спроби — наступний старт сервера.
     # Раніший дизайн (daily-trigger о WindowStart + boot-Repetition
-    # 15 хв/8 год) прибрано: на РДЛ 2026-08-20 repetition-хвіст будив
+    # 15 хв/8 год) прибрано: на production-сервері BRAVO 2026-08-20 repetition-хвіст будив
     # завдання кожні 15 хв ще довго після успішної реставрації.
     if ($TaskType -eq "Recovery") {
         $trigger = $definition.Triggers.Create(8) # TASK_TRIGGER_BOOT

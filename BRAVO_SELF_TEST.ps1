@@ -1754,7 +1754,7 @@ try {
         -Severity WARNING `
         -Operation "BAZA_APP — 50 ФАЙЛІВ НЕ СИНХРОНІЗОВАНО" `
         -ActionText "скоротити назви зазначених файлів." `
-        -InstitutionName "МИКОЛАЇВСЬКА РДЛ" `
+        -InstitutionName "ТЕСТОВА УСТАНОВА BRAVO" `
         -InstitutionCode "00702245" `
         -HostInformation $notifyHostPublic `
         -ResultLines $bazaLines `
@@ -1773,7 +1773,7 @@ try {
     $maintSuccess = New-BRAVOOperatorNotificationMessage `
         -Severity SUCCESS `
         -Operation "BRAVO MAINTENANCE — УСПІШНО" `
-        -InstitutionName "ЧЕРНІВЕЦЬКА РДЛ" `
+        -InstitutionName "ТЕСТОВА УСТАНОВА BRAVO" `
         -InstitutionCode "21430093" `
         -HostInformation $notifyHostPublic `
         -ResultLines @(
@@ -1800,7 +1800,7 @@ try {
         -Operation "BRAVO MAINTENANCE — ПОТРІБНА ДІЯ" `
         -ActionText "звільнити щонайменше 5.4 ГБ." `
         -ReasonLines @(":x: Недостатньо вільного місця на диску D:") `
-        -InstitutionName "ЧЕРНІВЕЦЬКА РДЛ" `
+        -InstitutionName "ТЕСТОВА УСТАНОВА BRAVO" `
         -InstitutionCode "21430093" `
         -HostInformation $notifyHostPublic `
         -ResultLines @(
@@ -11101,7 +11101,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # і має РІВНО один boot-trigger БЕЗ Repetition: daily-тригер о
     # WindowStart прибрано (пропущений слот на 24/7 підхоплює планове
     # Maintenance), а 15-хвилинна repetition будила завдання вхолосту ще
-    # годинами після успішної реставрації (інцидент РДЛ 2026-08-20).
+    # годинами після успішної реставрації (інцидент на production-сервері BRAVO 2026-08-20).
     $recoveryTriggerModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $taskInstallerText `
         -FunctionNames @('New-BRAVOTaskDefinition', 'ConvertTo-ScheduleTime', 'ConvertTo-BRAVOMultipleInstancesPolicy')
