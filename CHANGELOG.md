@@ -1,5 +1,27 @@
 # Changelog
 
+## 5.1.0-rc.4 — 2026-08-20 (candidate, NOT accepted)
+
+Fourth release candidate of the 5.1.0 line. Opened because the rc.3
+DEV-LIMS acceptance run found that BRAVO_DATA_RESTORE notifications
+still went through the legacy single webhook without severity routing:
+a FAILED restore report (exit 43) landed in the GENERAL channel instead
+of ALERTS. Not a regression (DataRestore does not exist in 5.0.x and
+the PR #39 port covered Archive/Health/Maintenance only), but the
+project decided to fix it now rather than document it as a known
+limitation. This is a functional runtime change, so the partial rc.3
+acceptance evidence is discarded: **rc.4 requires a new full DEV-LIMS
+acceptance run** before any stable promotion.
+
+- DataRestore notifications routed through the canonical
+  BRAVO.Notifications chain (PR #62): Resolve-BRAVONotificationRoute
+  (send/no-send decisions stay at call-sites; routing selects the
+  channel only — exactly two channels: SUCCESS -> GENERAL,
+  WARNING/CRITICAL -> ALERTS), Resolve-BRAVONotificationEndpoint
+  (per-channel Credential Manager targets with the same legacy-webhook
+  fallback as other senders), Discord chunking and the configured
+  NotificationRequestTimeoutSeconds. Four regression self-tests added;
+  Notifications/DiscordMentionsRemainDisabled extended to DataRestore.
 ## 5.1.0-rc.3 — 2026-08-20 (candidate, NOT accepted)
 
 Third release candidate of the 5.1.0 line. Opened because a
