@@ -971,19 +971,24 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    5.0.0   (stable)
-developer: 5.1.0-rc.2 (prerelease, у розробці — acceptance ще не пройдено)
+master:    5.1.0   (stable, тег v5.1.0, merge PR #61 = aee27e4)
+developer: 5.2.0-dev.1 (development)
 ```
 
-`5.1.0-rc.1` пройшов real-SFTP acceptance на DEV-LIMS (2026-08-13),
-але ДО публікації stable вирішено включити у 5.1.0 нову
-функціональність — BRAVO_DATA_RESTORE (реальне відновлення даних із
-верифікованої COMPLETE generation). Функціональна зміна робить
-acceptance rc.1 недійсним як release evidence (розділ 3), тому
-відкрито наступний candidate `5.1.0-rc.2`, який потребує повного
-повторного acceptance (включно з реальним restore-acceptance на
-DEV-LIMS) перед promotion у stable.
+Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
+(stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО DEV-LIMS
+acceptance того ж дня (evidence
+`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md`, гілка
+`evidence/219c55b-rc4-devlims-acceptance-pass`). Шлях циклу:
+rc.1 (інвалідовано фічею DATA_RESTORE) → rc.2 (acceptance PASS, але
+промоцію скасовано: виявлено відсутність порту severity-routing
+PR #39) → rc.3 (порт routing; на acceptance виявлено, що DataRestore
+шле повз routing) → rc.4 (фікс PR #62; повний acceptance PASS) →
+stable 5.1.0.
 
-Локальний, ніде не опублікований коміт stable-промоушену з rc.1
-(`ac07f55`) НЕ є фінальним stable: його не можна push/merge/tag/
-release. Stable `5.1.0` буде промотовано заново з прийнятого rc.2.
+Цикл `5.2.0-dev.1` відкрито одразу після промоції (розділ 11).
+Записаний борг циклу: дедуплікація service-lifecycle / operation-lock /
+WinSCP-session / ASCII-temp-root політик, декомпозиція
+BRAVO.DataRestore Runtime.ps1, розведення імен push- та PR-checks у CI
+(під час промоційного вікна однойменний червоний push-run блокував
+required checks гілки master — merge PR #61 виконано admin-обходом).

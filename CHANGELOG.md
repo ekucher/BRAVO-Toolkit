@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.2.0-dev.1 — 2026-08-20
+
+Opens the next development cycle on developer after the 5.1.0 stable
+release (per RELEASE_POLICY.md section 11: post-promotion sync with
+master, then immediate prerelease bump so both branches never carry the
+same packageVersion). No functional changes yet. Planned focus (from
+the recorded 5.1.0-cycle debt): deduplication of service-lifecycle /
+operation-lock / WinSCP-session / ASCII-temp-root policy copies,
+BRAVO.DataRestore Runtime.ps1 decomposition, and separating push- vs
+PR-event check names so the stable-promotion window no longer conflicts
+with master branch protection.
+
 ## 5.1.0 — 2026-08-20
 
 Stable release of the 5.1.0 line, promoted (metadata-only) from the
