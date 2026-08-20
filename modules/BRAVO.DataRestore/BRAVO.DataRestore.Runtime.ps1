@@ -2839,14 +2839,35 @@ function Send-BRAVODataRestoreNotification {
         if ($notificationProvider -ne 'discord' -and $notificationProvider -ne 'slack') {
             $notificationProvider = 'discord'
         }
-        $webhookTarget = if ($notificationProvider -eq 'discord') {
-            [string]$credentialSettings.Targets.DiscordWebhook
-        } else {
-            [string]$credentialSettings.Targets.SlackWebhook
+        $notificationRouting = $null
+        $notificationCredentialTargets = $credentialSettings.Targets
+        $notificationTimeoutSeconds = 30
+        if ($null -ne $backupMonitoring) {
+            if ($backupMonitoring.NotificationRouting -is [hashtable]) {
+                $notificationRouting = $backupMonitoring.NotificationRouting
+            }
+            if ($backupMonitoring.NotificationCredentialTargets -is [hashtable]) {
+                $notificationCredentialTargets = $backupMonitoring.NotificationCredentialTargets
+            }
+            if ([int]$backupMonitoring.NotificationRequestTimeoutSeconds -gt 0) {
+                $notificationTimeoutSeconds = [int]$backupMonitoring.NotificationRequestTimeoutSeconds
+            }
         }
-        $webhookUrl = Get-BRAVOCredentialSecret -Target $webhookTarget
-        if ([string]::IsNullOrWhiteSpace($webhookUrl)) {
-            Write-DataRestoreLog -Message "Webhook URL не знайдено (target '$webhookTarget') — сповіщення пропущено" -Level 'WARNING'
+        # Рішення «слати чи ні» вже ухвалене на call-site (включно з
+        # DataRestore-специфічним SUCCESS для InPlace навіть під
+        # errors_only), тому routing викликається в режимі 'all' і вирішує
+        # лише канал доставки (GENERAL/ALERTS).
+        $notificationRoute = Resolve-BRAVONotificationRoute `
+            -Severity $Severity `
+            -NotificationMode 'all' `
+            -RoutingTable $notificationRouting
+        try {
+            $webhookUrl = Resolve-BRAVONotificationEndpoint `
+                -Provider $notificationProvider `
+                -Route $notificationRoute `
+                -CredentialTargets $notificationCredentialTargets
+        } catch {
+            Write-DataRestoreLog -Message "Webhook для '$notificationProvider/$notificationRoute' не налаштовано — сповіщення пропущено" -Level 'WARNING'
             return
         }
         $message = New-BRAVOOperatorNotificationMessage `
@@ -2862,10 +2883,14 @@ function Send-BRAVODataRestoreNotification {
             -Version ([string]$script:ScriptVersion) `
             -BuildId ([string]$script:ScriptBuildId) `
             -LogPath ([string]$script:dataRestoreLogFile)
-        Send-BRAVOWebhookNotification `
+        $messageChunks = ConvertTo-BRAVONotificationPayloadText `
+            -Provider $notificationProvider `
+            -Message $message
+        Send-BRAVONotificationChunks `
             -Provider $notificationProvider `
             -WebhookUrl $webhookUrl `
-            -Message $message
+            -MessageChunks $messageChunks `
+            -TimeoutSeconds $notificationTimeoutSeconds
     } catch {
         $script:dataRestoreWarningCount++
         Write-DataRestoreLog -Message "Не вдалося надіслати сповіщення: $($_.Exception.Message)" -Level 'WARNING'

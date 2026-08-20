@@ -3338,3 +3338,171 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/OperationsRunbookRestartGuidanceMatchesStartPendingPolicy" `
         -Failure "OPERATIONS.md не повинен стверджувати, що BRAVO зупиняє/відновлює лише Running-служби (квієсценція діє на всі Managed, а restart-intent = Running АБО StartPending); операторська інструкція має спиратись на залогований запис 'Знімок служби ...: restart-after-recovery=...' точно перерваного прогону, а не на поточний стан служб після аварії"
+
+    # --- 8. rc.4: severity-routing сповіщень DataRestore (GENERAL/ALERTS).
+    # Send-BRAVODataRestoreNotification має обирати канал через канонічний
+    # ланцюжок BRAVO.Notifications: Resolve-BRAVONotificationRoute (реальна
+    # функція, витягнута за AST з модуля) -> Resolve-BRAVONotificationEndpoint
+    # (заглушений: єдина ланка з доступом до Credential Manager) ->
+    # ConvertTo-BRAVONotificationPayloadText -> Send-BRAVONotificationChunks
+    # з таймаутом із конфігурації. Каналів рівно ДВА: SUCCESS -> general,
+    # WARNING/CRITICAL -> alerts; legacy-target — лише backward-compat
+    # fallback усередині канонічного endpoint-резолвера, НЕ третій канал.
+    # Регресія: старий legacy-шлях (прямий Get-BRAVOCredentialSecret +
+    # Send-BRAVOWebhookNotification без routing) провалює ці тести.
+    $notificationsModuleTextForDataRestore = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psm1"),
+        [Text.Encoding]::UTF8
+    )
+    $routingTokensForDataRestore = $null
+    $routingErrorsForDataRestore = $null
+    $routingAstForDataRestore = [Management.Automation.Language.Parser]::ParseInput(
+        $notificationsModuleTextForDataRestore,
+        [ref]$routingTokensForDataRestore,
+        [ref]$routingErrorsForDataRestore
+    )
+    $routeFunctionAstForDataRestore = @(
+        $routingAstForDataRestore.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -eq 'Resolve-BRAVONotificationRoute'
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition ($null -ne $routeFunctionAstForDataRestore) `
+        -Name "DataRestore/NotificationRoutingCanonicalFunctionAvailable" `
+        -Failure "Resolve-BRAVONotificationRoute не знайдено в modules\BRAVO.Notifications\BRAVO.Notifications.psm1 — канонічний severity-routing зник або перейменований"
+
+    # Стаб журналу визначається НЕ в SourceText (Runtime.ps1 починається з
+    # top-level param(), тому будь-який текст перед ним ламає парсинг), а
+    # всередині &-блоку модуля нижче — function-statement у module scope
+    # перекриває витягнуту реалізацію, як у Archive/Maintenance-пробах.
+    $dataRestoreNotificationModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $dataRestoreRuntimeTextForTests `
+        -FunctionNames @('Send-BRAVODataRestoreNotification')
+
+    $dataRestoreNotificationProbe = if ($null -eq $routeFunctionAstForDataRestore) {
+        [pscustomobject]@{ ResolvedEndpointRoutes = @(); SentBatches = @(); WarningCount = -1; Logs = @() }
+    } else {
+        & $dataRestoreNotificationModule {
+            param([string]$RoutingDefinition)
+
+            # Реальний Resolve-BRAVONotificationRoute у scope модуля разом з
+            # module-scope дефолтною таблицею, на яку він посилається.
+            . ([scriptblock]::Create($RoutingDefinition))
+            $script:BRAVODefaultNotificationRouting = @{
+                SUCCESS = 'general'; WARNING = 'alerts'; ERROR = 'alerts'; CRITICAL = 'alerts'
+            }
+
+            $script:bravoSettings = @{
+                NotificationProvider = 'discord'
+                InstitutionName = 'TEST'
+                InstitutionCode = '00000000'
+            }
+            $script:credentialSettings = @{ Targets = @{ DiscordWebhook = 'BRAVO_DISCORD_URL' } }
+            $script:backupMonitoring = @{
+                NotificationRouting = @{ SUCCESS = 'general'; WARNING = 'alerts'; ERROR = 'alerts'; CRITICAL = 'alerts' }
+                NotificationCredentialTargets = @{
+                    DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
+                    DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
+                    DiscordWebhook = 'BRAVO_DISCORD_URL'
+                }
+                NotificationRequestTimeoutSeconds = 7
+            }
+            $script:ScriptVersion = '5.1.0-test'
+            $script:ScriptBuildId = 'self-test'
+            $script:dataRestoreLogFile = 'C:\BRAVO_TEST\BRAVO_DATA_RESTORE.log'
+            $script:dataRestoreWarningCount = 0
+            $script:BRAVOSelfTestNotificationLogs = New-Object System.Collections.Generic.List[string]
+            $script:resolvedEndpointRoutes = New-Object System.Collections.Generic.List[string]
+            $script:sentChunkBatches = New-Object System.Collections.Generic.List[object]
+
+            function Write-DataRestoreLog {
+                param([AllowEmptyString()][string]$Message, [string]$Level = 'INFO', [switch]$Console)
+                [void]$script:BRAVOSelfTestNotificationLogs.Add("$Level|$Message")
+            }
+            function Get-HostInformation {
+                [pscustomobject]@{ MachineName = 'TEST-HOST'; LocalIP = '127.0.0.1'; PublicIP = 'вимкнено' }
+            }
+            function Resolve-BRAVONotificationEndpoint {
+                param([string]$Provider, [string]$Route, [hashtable]$CredentialTargets)
+                [void]$script:resolvedEndpointRoutes.Add("$Provider/$Route")
+                return "https://example.invalid/$Route"
+            }
+            function New-BRAVOOperatorNotificationMessage {
+                param(
+                    [string]$Severity, [string]$Operation, [string]$ActionText, [string[]]$ReasonLines,
+                    [string]$InstitutionName, [string]$InstitutionCode, $HostInformation,
+                    [string[]]$ResultLines, [datetime]$Timestamp, [string]$ProductName,
+                    [string]$Version, [string]$BuildId, [string]$LogPath, [string]$LogLabel
+                )
+                return (@($Severity, $Operation) + $ResultLines) -join [Environment]::NewLine
+            }
+            function ConvertTo-BRAVONotificationPayloadText {
+                param([string]$Provider, [string]$Message)
+                return @($Message)
+            }
+            function Send-BRAVONotificationChunks {
+                param([string]$Provider, [string]$WebhookUrl, [string[]]$MessageChunks, [int]$TimeoutSeconds)
+                [void]$script:sentChunkBatches.Add([pscustomobject]@{
+                    WebhookUrl = $WebhookUrl
+                    ChunkCount = @($MessageChunks).Count
+                    TimeoutSeconds = $TimeoutSeconds
+                })
+            }
+            # Legacy-шлях: якщо код усе ще звертається напряму до Credential
+            # Manager або шле без чанкінгу/таймауту — впасти явно (outer
+            # catch функції перетворить це на WarningCount > 0 і нуль
+            # відправлень, що провалює assertions нижче).
+            function Get-BRAVOCredentialSecret {
+                param([string]$Target)
+                throw "legacy-шлях: прямий Get-BRAVOCredentialSecret (target '$Target') замість Resolve-BRAVONotificationEndpoint"
+            }
+            function Send-BRAVOWebhookNotification {
+                param([string]$Provider, [string]$WebhookUrl, [string]$Message, [int]$TimeoutSeconds)
+                throw 'legacy-шлях: прямий Send-BRAVOWebhookNotification замість Send-BRAVONotificationChunks'
+            }
+
+            Send-BRAVODataRestoreNotification -Severity 'CRITICAL' -ResultLines @('Відновлення завершилось помилкою (код 43).') -ActionText 'перевірити журнал'
+            Send-BRAVODataRestoreNotification -Severity 'SUCCESS' -ResultLines @('Відновлення завершено успішно.')
+
+            [pscustomobject]@{
+                ResolvedEndpointRoutes = $script:resolvedEndpointRoutes.ToArray()
+                SentBatches = $script:sentChunkBatches.ToArray()
+                WarningCount = $script:dataRestoreWarningCount
+                Logs = $script:BRAVOSelfTestNotificationLogs.ToArray()
+            }
+        } $routeFunctionAstForDataRestore.Extent.Text
+    }
+
+    Test-BRAVOCondition `
+        -Condition (
+            @($dataRestoreNotificationProbe.ResolvedEndpointRoutes).Count -eq 2 -and
+            $dataRestoreNotificationProbe.ResolvedEndpointRoutes[0] -eq 'discord/alerts' -and
+            @($dataRestoreNotificationProbe.SentBatches).Count -eq 2 -and
+            $dataRestoreNotificationProbe.SentBatches[0].WebhookUrl -eq 'https://example.invalid/alerts' -and
+            $dataRestoreNotificationProbe.WarningCount -eq 0
+        ) `
+        -Name "DataRestore/NotificationCriticalRoutesToAlerts" `
+        -Failure "CRITICAL-сповіщення DataRestore має резолвитись через Resolve-BRAVONotificationEndpoint у route 'alerts' і доставлятись через Send-BRAVONotificationChunks без WARNING (fail B19-класу: FAILED-звіт падав у GENERAL через legacy webhook)"
+
+    Test-BRAVOCondition `
+        -Condition (
+            @($dataRestoreNotificationProbe.ResolvedEndpointRoutes).Count -eq 2 -and
+            $dataRestoreNotificationProbe.ResolvedEndpointRoutes[1] -eq 'discord/general' -and
+            $dataRestoreNotificationProbe.SentBatches[1].WebhookUrl -eq 'https://example.invalid/general'
+        ) `
+        -Name "DataRestore/NotificationSuccessRoutesToGeneral" `
+        -Failure "SUCCESS-сповіщення DataRestore має резолвитись у route 'general' — каналів рівно два (general/alerts), третього 'legacy'-каналу не існує"
+
+    Test-BRAVOCondition `
+        -Condition (
+            @($dataRestoreNotificationProbe.SentBatches).Count -eq 2 -and
+            $dataRestoreNotificationProbe.SentBatches[0].TimeoutSeconds -eq 7 -and
+            $dataRestoreNotificationProbe.SentBatches[1].TimeoutSeconds -eq 7
+        ) `
+        -Name "DataRestore/NotificationUsesConfiguredRequestTimeout" `
+        -Failure "Send-BRAVODataRestoreNotification має передавати NotificationRequestTimeoutSeconds з конфігурації (backupMonitoring) у Send-BRAVONotificationChunks, а не мовчазний дефолт"
