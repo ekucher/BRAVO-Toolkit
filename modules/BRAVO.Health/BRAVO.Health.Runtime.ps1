@@ -361,7 +361,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -4453,6 +4453,11 @@ if ($script:BRAVOToolIntegrity.HasIntegrityIssue) {
 # Health — діагностичний, read-only runtime: він НЕ блокує себе, а
 # звітує. Саме він має першим помітити підміну й підняти тривогу навіть
 # тоді, коли архівація ще не запускалась. Блокують Archive і Maintenance.
+# ЄДИНИЙ дозволений виняток з read-only політики —
+# Invoke-BRAVOServiceQuiescenceWatchdog: старт служб, перелічених у
+# ВЛАСНОМУ осиротілому ownership-маркері BRAVO (аварійне переривання
+# Maintenance/DataRestore). Ручні зупинки техпідтримки (без маркера)
+# Health ніколи не чіпає.
 $script:BRAVOToolManifestMode = 'Enforce'
 $script:BRAVOToolManifestPath = Join-Path $toolsPath "TOOLS_MANIFEST.json"
 if ($toolIntegritySettings -is [System.Collections.IDictionary]) {
@@ -4648,8 +4653,105 @@ if (-not $environmentPreflight.IsWritable) {
     })
 }
 
+function Invoke-BRAVOServiceQuiescenceWatchdog {
+    # ЄДИНИЙ дозволений Health виняток з read-only політики (див. політику
+    # нижче в цьому файлі та BRAVO.config): якщо Maintenance/DataRestore
+    # зупинив служби, записав ownership-маркер BRAVO_SERVICE_QUIESCENCE.json
+    # (BRAVO.System) і загинув ЖОРСТКО (kill/живлення — finally не
+    # виконався), цей watchdog запускає РІВНО перелічені в маркері служби.
+    # Усі інші випадки читання-тільки:
+    #   - маркера немає (служби зупинила техпідтримка вручну) — НІКОЛИ не
+    #     стартувати, лише штатний issue "не запущена" нижче;
+    #   - власник маркера ЖИВИЙ (pid+processStartTime збігаються) —
+    #     обслуговування саме триває, не втручатися;
+    #   - restartSuppressed=true (DataRestore лишив служби зупиненими
+    #     навмисно, rollback неповний) — не стартувати, CRITICAL-issue про
+    #     ручне втручання;
+    #   - маркер чужого hostname / невалідний — Read повертає $null, дій
+    #     немає.
+    # Повертає масив issue-об'єктів у форматі Get-ManagedServiceHealthIssues
+    # (аварійне відновлення — теж подія, про яку оператор МУСИТЬ дізнатися).
+    $watchdogIssues = @()
+    $quiescenceState = $null
+    try { $quiescenceState = Read-BRAVOServiceQuiescenceState } catch { $quiescenceState = $null }
+    if ($null -eq $quiescenceState) { return @() }
+
+    $ownerAlive = Test-BRAVOProcessAlive `
+        -ProcessId ([int]$quiescenceState.pid) `
+        -ProcessStartTime ([string]$quiescenceState.processStartTime)
+    if ($ownerAlive) {
+        Write-HealthLog "Ownership-маркер зупинки служб належить живому процесу $($quiescenceState.owner) (PID $($quiescenceState.pid)) — обслуговування триває, watchdog не втручається" -Level "INFO"
+        return @()
+    }
+
+    $ownerText = "$($quiescenceState.owner) (PID $($quiescenceState.pid), лог: $($quiescenceState.logFile))"
+    if ([bool]$quiescenceState.restartSuppressed) {
+        Write-HealthLog "Осиротілий ownership-маркер із restartSuppressed: $ownerText навмисно залишив служби зупиненими (незавершений rollback) — автоматичний старт заборонено, потрібне ручне відновлення (OPERATIONS.md, код 43)" -Level "ERROR"
+        $watchdogIssues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Служби після аварії $($quiescenceState.owner)"
+            Reason = "навмисно залишені зупиненими (незавершений rollback DataRestore) — потрібне РУЧНЕ відновлення, автоматичний старт заборонено; див. $($quiescenceState.logFile)"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$quiescenceState.owner
+            SizeBytes = $null
+            Details = @()
+        }
+        return @($watchdogIssues)
+    }
+
+    Write-HealthLog "Осиротілий ownership-маркер зупинки служб: власник $ownerText мертвий — відновлюю служби зі списку маркера" -Level "WARNING"
+    $startFailures = @()
+    $startedServices = @()
+    foreach ($markedService in @($quiescenceState.services | Where-Object { [bool]$_.RestartIntent })) {
+        $markedName = [string]$markedService.Name
+        try {
+            $serviceObject = Get-Service -Name $markedName -ErrorAction Stop
+            if ($serviceObject.Status -ne 'Running') {
+                Start-Service -Name $markedName -ErrorAction Stop
+            }
+            $startedServices += $markedName
+            Write-HealthLog "Службу $markedName відновлено після аварійного переривання $($quiescenceState.owner)" -Level "SUCCESS"
+        } catch {
+            $startFailures += "${markedName}: $($_.Exception.Message)"
+            Write-HealthLog "Не вдалося відновити службу $markedName після аварійного переривання: $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    if ($startFailures.Count -eq 0) {
+        try {
+            Clear-BRAVOServiceQuiescenceState
+        } catch {
+            Write-HealthLog "Служби відновлено, але ownership-маркер не видалився: $($_.Exception.Message)" -Level "WARNING"
+        }
+        $watchdogIssues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Аварійне відновлення служб"
+            Reason = "служби $($startedServices -join ', ') відновлено автоматично після аварійного переривання $ownerText — перевірте причину переривання"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$quiescenceState.owner
+            SizeBytes = $null
+            Details = @()
+        }
+    } else {
+        # Маркер лишається — наступний Health-прогін повторить спробу.
+        $watchdogIssues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Аварійне відновлення служб"
+            Reason = "після аварійного переривання $ownerText не вдалося відновити: $($startFailures -join '; ') — маркер збережено, наступний Health повторить"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$quiescenceState.owner
+            SizeBytes = $null
+            Details = @()
+        }
+    }
+    return @($watchdogIssues)
+}
+
 Write-BRAVOProgressPhase -Phase 'Керовані служби' -PercentComplete 15
-$serviceHealthIssues = @(Get-ManagedServiceHealthIssues)
+$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)
+$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)
 Write-BRAVOHealthStep `
     -Name 'Керовані служби' `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $serviceHealthIssues.Count) `
