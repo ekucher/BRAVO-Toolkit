@@ -50,7 +50,7 @@ $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime. BRAVO.ArchiveRuntime — заради
 # Test-BRAVOWinSCPAvailable/Get-SanitizedWinSCPDiagnostic (режим -Source SFTP).
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.ArchiveRuntime')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.ArchiveRuntime', 'BRAVO.System')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -265,6 +265,10 @@ $script:dataRestoreOperationLock = $null
 $script:dataRestoreOperationLockPath = $null
 $script:dataRestoreServiceSnapshot = $null
 $script:dataRestoreServicesStopped = $false
+# true після успішного запису ownership-маркера зупинки служб цим прогоном
+# (BRAVO_SERVICE_QUIESCENCE.json): чистити/позначати suppressed можна лише
+# ВЛАСНИЙ маркер — чужий осиротілий опрацьовує Health-watchdog.
+$script:dataRestoreQuiescenceMarkerWritten = $false
 # true, якщо відкат (поточного компонента АБО раніше завершених) не
 # гарантовано довершився — тоді live filesystem у невизначеному стані, і
 # служби НЕ можна запускати поверх нього (див. фінальний finally нижче).
@@ -3551,6 +3555,22 @@ try {
             # у циклі нижче).
             $stageStartedAt = Get-Date
             $script:dataRestoreServicesStopped = $true
+            # Ownership-маркер зупинки служб — ПЕРЕД quiescence (та сама
+            # консервативна семантика, що й прапорець вище). Пишуться лише
+            # служби з наміром відновлення (ShouldRestartAfterRestore) —
+            # тільки їх Health-watchdog має право підняти після жорсткого
+            # kill цього процесу. Збій запису = аборт (fail-closed).
+            try {
+                [void](Write-BRAVOServiceQuiescenceState `
+                    -Owner 'BRAVO_DATA_RESTORE' `
+                    -Services @($servicesWithRestartIntent | ForEach-Object {
+                        @{ Name = [string]$_.Name; RestartIntent = $true }
+                    }) `
+                    -LogFile ([string]$script:dataRestoreLogFile))
+                $script:dataRestoreQuiescenceMarkerWritten = $true
+            } catch {
+                Stop-BRAVODataRestoreRun -Category RestoreFailed -Reason "не вдалося записати ownership-маркер зупинки служб (без нього аварійне переривання лишило б служби зупиненими без автоматичного відновлення): $($_.Exception.Message)"
+            }
             $quiescenceFailures = Invoke-BRAVODataRestoreQuiescence `
                 -Snapshot $script:dataRestoreServiceSnapshot `
                 -StopTimeoutSeconds $serviceStopTimeoutSeconds `
@@ -3916,6 +3936,17 @@ try {
             }
             Write-DataRestoreLog -Message 'Служби НАВМИСНО залишено зупиненими: відкат не гарантовано довершився, live filesystem у невизначеному стані. Потрібне ручне відновлення перед запуском служб.' -Level 'ERROR' -Console
             Write-BRAVOOperationResult -Name 'Відновлення стану служб' -Status 'SKIPPED' -Details 'служби навмисно залишено зупиненими через незавершений rollback — ручне відновлення обов''язкове'
+            # Ownership-маркер НЕ видаляється, але позначається suppressed:
+            # Health-watchdog побачить його, НЕ стартуватиме служби (це
+            # зруйнувало б fail-closed гарантію вище) і алертитиме про
+            # потребу ручного втручання, доки оператор не розбереться.
+            if ($script:dataRestoreQuiescenceMarkerWritten) {
+                try {
+                    [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
+                } catch {
+                    Write-DataRestoreLog -Message "Не вдалося позначити ownership-маркер suppressed: $($_.Exception.Message)" -Level 'WARNING'
+                }
+            }
         } elseif ($script:dataRestoreServicesStopped -and $null -ne $script:dataRestoreServiceSnapshot) {
             $restoreServicesStartedAt = Get-Date
             $startFailures = Restore-BRAVODataRestoreServices `
@@ -3932,6 +3963,16 @@ try {
                 Write-BRAVOOperationResult -Name 'Відновлення стану служб' -Status 'FAIL' -Duration ((Get-Date) - $restoreServicesStartedAt) -Details ($startFailures -join '; ')
             } else {
                 Write-BRAVOOperationResult -Name 'Відновлення стану служб' -Status 'OK' -Duration ((Get-Date) - $restoreServicesStartedAt)
+                # Повне відновлення служб — ВЛАСНИЙ ownership-маркер більше
+                # не потрібен. Частковий збій вище лишає маркер для
+                # Health-watchdog (повторить старт за списком).
+                if ($script:dataRestoreQuiescenceMarkerWritten) {
+                    try {
+                        Clear-BRAVOServiceQuiescenceState
+                    } catch {
+                        Write-DataRestoreLog -Message "Не вдалося прибрати ownership-маркер зупинки служб: $($_.Exception.Message) — Health-watchdog побачить осиротілий маркер, мовчазної шкоди немає" -Level 'WARNING'
+                    }
+                }
             }
         }
     }
