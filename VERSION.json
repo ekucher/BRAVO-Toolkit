@@ -1,11 +1,11 @@
 {
-  "product": "BRAVO Archive",
-  "packageVersion": "5.0.2",
+  "product": "BRAVO-Toolkit",
+  "packageVersion": "5.1.0",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
   "updaterVersion": "1.0.0",
-  "releaseDate": "2026-08-19",
+  "releaseDate": "2026-08-20",
   "releaseChannel": "stable",
-  "buildId": "b4f2270",
-  "sourceCommit": "b4f2270b2234810a462cfe5538903b01c16f0896"
+  "buildId": "3cbba5e",
+  "sourceCommit": "3cbba5e0fb213d4de136cfb7490033cc5fcc57b0"
 }

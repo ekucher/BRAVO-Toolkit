@@ -1,4 +1,4 @@
-# BRAVO 5.0.2 — комплексне налаштування і безпечний тестовий прогін
+# BRAVO 5.1.0 — комплексне налаштування і безпечний тестовий прогін
 
 Кожен запуск setup і його допоміжних дочірніх скриптів створює окремий
 transcript у `LOGS\HELPERS`. Ім'я містить назву скрипта, timestamp і PID, а
@@ -25,6 +25,30 @@ transcript у `LOGS\HELPERS`. Ім'я містить назву скрипта, 
 Архівація, копіювання, синхронізація, видалення, перезапуск служб,
 shutdown та інші production-операції у цьому сценарії не виконуються.
 Тестове повідомлення — єдина зовнішня операція запису.
+
+## Отримання комплекту (release artifact)
+
+Комплект для розгортання — це release-артефакт з GitHub Release
+відповідного тега, а не ручна копія довільного checkout:
+
+- `BRAVO-Toolkit-X.Y.Z.zip` — детермінований вміст release-тега
+  (генерується workflow `release-artifact` через `git archive`);
+- `BRAVO-Toolkit-X.Y.Z.zip.sha256` — контрольна сума архіву;
+- `release-manifest.json` — product, версія, `sourceCommit`/`buildId`
+  і SHA-256 кожного файлу комплекту.
+
+Перед розгортанням обов'язково звірте контрольну суму:
+
+```powershell
+(Get-FileHash .\BRAVO-Toolkit-X.Y.Z.zip -Algorithm SHA256).Hash.ToLower()
+# порівняйте з вмістом BRAVO-Toolkit-X.Y.Z.zip.sha256
+```
+
+Артефакт прикріплюється до Release лише після того, як розпакований
+комплект пройшов інтегріті-манифести, `BRAVO_RUNTIME_GUARD.ps1` і повний
+`BRAVO_SELF_TEST.ps1` у CI. Той самий артефакт можна зібрати локально:
+`.\ci\New-BRAVOReleaseArtifact.ps1 -Ref vX.Y.Z` (результат в
+`artifacts\release`).
 
 ## Розташування runtime і безпека
 

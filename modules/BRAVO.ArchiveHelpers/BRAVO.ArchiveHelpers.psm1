@@ -454,3 +454,300 @@ function Get-BRAVOBackupGenerationManifestPhysicalFiles {
         [string]::Equals($_.Name, $expectedFileName, [StringComparison]::OrdinalIgnoreCase)
     })
 }
+
+function Get-BRAVORestoreGenerationManifest {
+    # Selector generation для restore-інструментів (BRAVO_RESTORE_TEST і
+    # BRAVO_DATA_RESTORE): найновіший COMPLETE generation manifest або точний
+    # -RequestedGenerationId. Живе тут, а не в кожному скрипті окремо, щоб
+    # обидва restore-потоки гарантовано вибирали generation за одними й тими
+    # самими правилами (MANIFESTS-first читання, лише status=COMPLETE,
+    # сортування за createdAt/startedAt/LastWriteTime).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$BackupRoot,
+        [string]$RequestedGenerationId
+    )
+
+    if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) {
+        throw "BackupRoot не знайдено: $BackupRoot"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId) -and
+        $RequestedGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$') {
+        throw "GenerationId має формат yyyyMMdd_HHmmss або collision-safe variant"
+    }
+
+    # dev.14: MANIFESTS-first reader з fallback на legacy корінь BackupRoot —
+    # той самий централізований reader, що Archive-retention і Health.
+    $manifestFiles = @(Get-BRAVOBackupGenerationManifestFiles `
+        -BackupRoot $BackupRoot `
+        -GenerationId $RequestedGenerationId)
+
+    $candidates = @()
+    # Аномалії, пропущені fail-closed'ом ПІД ЧАС АВТОМАТИЧНОГО вибору
+    # (нечитабельний manifest, identity mismatch). Сам пропуск — правильна
+    # поведінка, але він НЕ має бути мовчазним: тихе падіння на старішу
+    # generation оператор інакше не побачить. Штатні не-COMPLETE manifest-и
+    # аномалією не вважаються. Модуль навмисно нічого не логує сам —
+    # список повертається викликачам (DATA_RESTORE / RESTORE_TEST) як
+    # властивість SkippedManifests результату, і кожен логує своїм логером.
+    $skippedAnomalies = @()
+    foreach ($manifestFile in $manifestFiles) {
+        try {
+            $manifest = [IO.File]::ReadAllText($manifestFile.FullName) | ConvertFrom-Json -ErrorAction Stop
+            if ([string]$manifest.status -ne 'COMPLETE') { continue }
+            # Identity invariant: ім'я файлу (BRAVO_BACKUP_<generationId>.json)
+            # і generationId усередині JSON мають бути ТОЧНО тим самим
+            # значенням. Без цієї перевірки пошкоджений/перейменований
+            # manifest міг би пройти лише format-валідацію RequestedGenerationId
+            # (яка звіряється із самим ІМ'ЯМ файлу — Get-BRAVOBackupGenerationManifestFiles
+            # будує ім'я з нього), а фактично відновити зовсім іншу
+            # generation, вказану всередині файлу.
+            $filenameGenerationId = [IO.Path]::GetFileNameWithoutExtension($manifestFile.Name) -replace '^BRAVO_BACKUP_', ''
+            $jsonGenerationId = [string]$manifest.generationId
+            if ([string]::IsNullOrWhiteSpace($jsonGenerationId) -or
+                $jsonGenerationId -notmatch '^\d{8}_\d{6}(?:_\d+)?$' -or
+                -not [string]::Equals($filenameGenerationId, $jsonGenerationId, [StringComparison]::Ordinal)) {
+                if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+                    throw "manifest '$($manifestFile.Name)' не пройшов перевірку ідентичності: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
+                }
+                # Автоматичний вибір (без explicit -RequestedGenerationId):
+                # fail-closed — пропускаємо підозрілий manifest, а не
+                # ризикуємо вибрати generation, вказану лише в JSON.
+                $skippedAnomalies += [pscustomobject]@{
+                    ManifestPath = $manifestFile.FullName
+                    Reason       = "identity mismatch: ім'я файлу вказує generation '$filenameGenerationId', а вміст JSON — '$jsonGenerationId'"
+                }
+                continue
+            }
+            $createdAt = $manifestFile.LastWriteTime
+            foreach ($dateProperty in @('createdAt', 'startedAt')) {
+                $property = $manifest.PSObject.Properties[$dateProperty]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    $createdAt = [datetime]$property.Value
+                    break
+                }
+            }
+            $candidates += [pscustomobject]@{
+                Manifest = $manifest
+                ManifestPath = $manifestFile.FullName
+                CreatedAt = $createdAt
+            }
+        } catch {
+            if (-not [string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+                throw "Generation manifest не прочитано: $($_.Exception.Message)"
+            }
+            $skippedAnomalies += [pscustomobject]@{
+                ManifestPath = $manifestFile.FullName
+                Reason       = "manifest не прочитано: $($_.Exception.Message)"
+            }
+        }
+    }
+    $selected = $candidates | Sort-Object CreatedAt -Descending | Select-Object -First 1
+    if ($null -eq $selected) {
+        if ([string]::IsNullOrWhiteSpace($RequestedGenerationId)) {
+            if (@($skippedAnomalies).Count -gt 0) {
+                throw "не знайдено жодного COMPLETE generation manifest (пропущено з аномаліями: $(@($skippedAnomalies).Count) — $((@($skippedAnomalies) | ForEach-Object { $_.Reason }) -join '; '))"
+            }
+            throw 'не знайдено жодного COMPLETE generation manifest'
+        }
+        throw "COMPLETE generation '$RequestedGenerationId' не знайдено"
+    }
+    Add-Member -InputObject $selected -MemberType NoteProperty -Name 'SkippedManifests' -Value @($skippedAnomalies) -Force
+    return $selected
+}
+
+function Get-BRAVOVerifiedGenerationArchive {
+    # Строгий per-component gate для restore-інструментів: прапорці manifest
+    # (Enabled/CreateSuccess/IntegritySuccess/HashSuccess), фізична наявність
+    # архіву й sidecar, коректний формат sidecar із case-sensitive збігом
+    # імені файлу та ФАКТИЧНИЙ перерахунок SHA512. Будь-яка розбіжність —
+    # throw: компонент не можна ані вважати відновлюваним (RESTORE_TEST),
+    # ані відновлювати (DATA_RESTORE).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string]$Component,
+        # Canonical naming policy of the backup PRODUCER (той самий
+        # NameTemplate, яким генерувалось ім'я архіву — BRAVO.config
+        # archiveDefinitions[Type].NameTemplate -f archivePrefix,
+        # generationId). Використовується лише для СТРУКТУРИ суфіксу
+        # (роздільник + generationId + розширення), НЕ для конкретного
+        # значення ArchivePrefix — див. коментар нижче.
+        [Parameter(Mandatory = $true)][string]$NameTemplate,
+        # Canonical (не мутований поточними налаштуваннями) каталог, де
+        # ЛЕГІТИМНО зберігаються артефакти САМЕ цього Component — для
+        # Local це archiveDefinitions[Type].Destination, для SFTP-staging
+        # це per-component підкаталог staging generation root
+        # (Invoke-BRAVODataRestoreSftpArchiveFetch кладе кожен компонент
+        # у власний підкаталог). Основа identity-binding: ArchivePrefix —
+        # оператор-конфігурований рядок, що ЗМІНЮЄТЬСЯ з часом (ротація);
+        # README.md документує, що архіви, створені під СТАРИМ префіксом,
+        # лишаються legitimate й мають лишатись відновлюваними. Каталог,
+        # натомість, детермінований типом компонента і не залежить від
+        # поточного значення ArchivePrefix.
+        [Parameter(Mandatory = $true)][string]$ComponentDirectory
+    )
+
+    $componentsProperty = $Manifest.PSObject.Properties['components']
+    if ($null -eq $componentsProperty -or $null -eq $componentsProperty.Value) {
+        throw 'generation manifest не містить components'
+    }
+    $componentProperty = @($componentsProperty.Value.PSObject.Properties | Where-Object {
+        [string]::Equals($_.Name, $Component, [StringComparison]::OrdinalIgnoreCase)
+    } | Select-Object -First 1)
+    if ($componentProperty.Count -eq 0) {
+        throw "generation не містить component $Component"
+    }
+    $componentState = $componentProperty[0].Value
+    if (-not [bool]$componentState.Enabled -or
+        -not [bool]$componentState.CreateSuccess -or
+        -not [bool]$componentState.IntegritySuccess -or
+        -not [bool]$componentState.HashSuccess) {
+        throw "component $Component не має COMPLETE archive/integrity/SHA512 state"
+    }
+
+    $archivePath = [string]$componentState.ArchivePath
+    $hashPath = [string]$componentState.HashPath
+    if (-not (Test-Path -LiteralPath $archivePath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $hashPath -PathType Leaf)) {
+        throw "component $Component посилається на відсутній archive/hash artifact"
+    }
+    $archive = Get-Item -LiteralPath $archivePath
+
+    # Component identity binding: артефакт МУСИТЬ фізично лежати в
+    # canonical каталозі саме цього Component — інакше пошкоджений/
+    # підмінений manifest міг би підставити реальний, криптографічно
+    # валідний архів ІНШОГО компонента (він лежить у СВОЄМУ каталозі, не
+    # в цьому), і кожна перевірка нижче (SHA512, sidecar) пройшла б, бо
+    # файл сам по собі не пошкоджений. На відміну від попередньої
+    # реалізації (порівняння повного імені файлу з поточним ArchivePrefix),
+    # ця перевірка НЕ залежить від того, яким був ArchivePrefix у момент
+    # створення архіву — ротація префіксу не інвалідує старі backup.
+    $archiveDirectoryFull = try { [System.IO.Path]::GetFullPath($archive.DirectoryName).TrimEnd('\', '/') } catch { $archive.DirectoryName }
+    $expectedDirectoryFull = try { [System.IO.Path]::GetFullPath($ComponentDirectory).TrimEnd('\', '/') } catch { $ComponentDirectory }
+    if (-not [string]::Equals($archiveDirectoryFull, $expectedDirectoryFull, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "component ${Component}: артефакт '$($archive.FullName)' лежить поза canonical каталогом цього компонента ('$ComponentDirectory') — можлива підміна компонента у manifest"
+    }
+
+    # Generation identity binding: ім'я артефакта має закінчуватись саме
+    # тим суфіксом (роздільник(и) + generationId + розширення), який
+    # NameTemplate виробляє для CIЄЇ generationId — це прив'язує до
+    # generation, знову ж НЕЗАЛЕЖНО від значення ArchivePrefix (підставляємо
+    # порожній рядок у позицію {0}, суфікс — те, що лишається праворуч).
+    $manifestGenerationId = [string]$Manifest.generationId
+    $expectedNameSuffix = $NameTemplate -f '', $manifestGenerationId
+    if ([string]::IsNullOrEmpty($expectedNameSuffix) -or
+        $archive.Name.Length -le $expectedNameSuffix.Length -or
+        -not $archive.Name.EndsWith($expectedNameSuffix, [StringComparison]::Ordinal)) {
+        throw "component ${Component}: ім'я артефакта '$($archive.Name)' не відповідає generation '$manifestGenerationId' за canonical NameTemplate — можлива підміна generation у manifest"
+    }
+    $hashText = ([IO.File]::ReadAllText($hashPath)).Trim([char]0xFEFF).Trim()
+    if ($hashText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$' -or
+        $Matches.FileName -cne $archive.Name) {
+        throw "component $Component має некоректний SHA512 sidecar"
+    }
+    $actualHash = (Get-BRAVOFileHash -Path $archive.FullName -Algorithm SHA512).Hash.ToUpperInvariant()
+    if ($actualHash -cne $Matches.Hash.ToUpperInvariant()) {
+        throw "component $Component не пройшов фактичну SHA512 verification"
+    }
+    return $archive
+}
+
+function Get-BRAVOVerifiedArtifactLeafName {
+    # Витягує ІМ'Я файлу з недовіреного manifest-шляху і підтверджує, що
+    # воно безпечне для Join-Path з канонічним каталогом компонента: САМЕ
+    # leaf-ім'я бере участь у реконструкції шляху, ніколи решта каталогів
+    # зі старого/чужого manifest-шляху. Canonical для обох споживачів
+    # generation-manifest (BRAVO_DATA_RESTORE, BRAVO_RESTORE_TEST) — раніше
+    # існувала лише приватна копія в BRAVO.DataRestore.Runtime.ps1
+    # (round-7 P2), promoted сюди, щоб drill і реальне відновлення
+    # використовували ОДНУ політику rebasing.
+    #
+    # [System.IO.Path]::GetFileName — ЧИСТА рядкова операція (лише те, що
+    # після останнього роздільника), а НЕ Split-Path -Leaf: Split-Path є
+    # provider-aware й резолвить відносні сегменти (напр. буквальний "..")
+    # проти ПОТОЧНОГО робочого каталогу процесу, тому для значення ".."
+    # повернув би ім'я батьківського каталогу поточного $PWD (недетерміновано
+    # й ніяк не пов'язано зі змістом самого manifest-рядка) замість
+    # відхилення traversal-сегмента як такого. GetFileName трактує "..\..\"
+    # суто текстово й повертає порожній/traversal-фрагмент без звернення до
+    # файлової системи — саме це й потрібно для недовіреного вхідного рядка.
+    # Порожнє значення, "."/"..", чи ім'я з недопустимими символами
+    # файлової системи — відхиляється (повертає $null).
+    [CmdletBinding()]
+    param([string]$Value)
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $leaf = $null
+    try {
+        $leaf = [System.IO.Path]::GetFileName($Value)
+    } catch {
+        return $null
+    }
+    if ([string]::IsNullOrWhiteSpace($leaf)) { return $null }
+    if ($leaf -eq '.' -or $leaf -eq '..') { return $null }
+    if ($leaf.IndexOfAny([System.IO.Path]::GetInvalidFileNameChars()) -ge 0) { return $null }
+    return $leaf
+}
+
+function ConvertTo-BRAVORebasedLocalGenerationManifest {
+    # Canonical local-repository rebasing policy, спільна для
+    # BRAVO_DATA_RESTORE (реальне відновлення) і BRAVO_RESTORE_TEST
+    # (read-only pre-restore drill) — обидва мають бачити ОДНУ семантику
+    # генерації: якщо repository резервних копій скопійовано/змонтовано
+    # під іншим диском/коренем (документований disaster-recovery
+    # сценарій), manifest.ArchivePath/HashPath (записані ПРОДЮСЕРОМ, інший
+    # сервер) фізично не існують за старою адресою, хоча байти архіву,
+    # sidecar і сам manifest валідні під ПОТОЧНИМ BackupRoot. Раніше
+    # BRAVO_DATA_RESTORE переписував шляхи приватною копією
+    # (ConvertTo-BRAVODataRestoreRebasedLocalManifest в
+    # BRAVO.DataRestore.Runtime.ps1, round-7), а BRAVO_RESTORE_TEST
+    # довіряв необробленому manifest-у напряму — той самий relocated
+    # repository міг пройти BRAVO_DATA_RESTORE, але провалити
+    # BRAVO_RESTORE_TEST (P2 follow-up review 4945879933).
+    #
+    # Manifest-шлях лишається НЕДОВІРЕНИМ: з нього беруться ЛИШЕ leaf-імена
+    # (Get-BRAVOVerifiedArtifactLeafName), решта шляху відкидається. Нове
+    # ArchivePath/HashPath — canonical каталог компонента
+    # (archiveDefinitions[Type].Destination, довірене значення з
+    # BRAVO.config) + validated leaf-ім'я. Get-BRAVOVerifiedGenerationArchive
+    # (незмінно) далі вимагає, щоб фактичний каталог артефакту БУКВАЛЬНО
+    # збігався з ComponentDirectory — тому rebased шлях структурно НЕ може
+    # вийти за межі canonical каталогу компонента: перевірка тут не
+    # послаблює жодного з існуючих integrity/containment gate, лише додає
+    # ще один незалежний рівень (leaf-only, без traversal-сегментів).
+    # Rotated ArchivePrefix (round-4) теж незмінно підтримується — тут
+    # ЛИШЕ переписуються шляхи, історичний basename з manifest-а НЕ
+    # реконструюється з поточного префіксу.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$Manifest,
+        [Parameter(Mandatory = $true)][string[]]$ComponentTypes,
+        [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions
+    )
+
+    $clone = $Manifest | ConvertTo-Json -Depth 12 | ConvertFrom-Json
+    foreach ($componentType in $ComponentTypes) {
+        $componentProperty = @($clone.components.PSObject.Properties | Where-Object {
+            [string]::Equals($_.Name, $componentType, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1)
+        if ($componentProperty.Count -eq 0) { continue }
+
+        $componentDestination = [string]@($ArchiveDefinitions | Where-Object {
+            [string]::Equals([string]$_.Type, $componentType, [StringComparison]::OrdinalIgnoreCase)
+        } | Select-Object -First 1).Destination
+        if ([string]::IsNullOrWhiteSpace($componentDestination)) { continue }
+
+        $archiveLeaf = Get-BRAVOVerifiedArtifactLeafName -Value ([string]$componentProperty[0].Value.ArchivePath)
+        $hashLeaf = Get-BRAVOVerifiedArtifactLeafName -Value ([string]$componentProperty[0].Value.HashPath)
+        if ($null -eq $archiveLeaf -or $null -eq $hashLeaf) {
+            # Небезпечне/непарсиме ім'я — НЕ переписуємо; нижчий строгий
+            # gate однаково відхилить компонент (Test-Path на оригінальному
+            # значенні не пройде, або containment-перевірка провалиться) —
+            # fail-safe, не мовчазний пропуск.
+            continue
+        }
+        $componentProperty[0].Value.ArchivePath = Join-Path $componentDestination $archiveLeaf
+        $componentProperty[0].Value.HashPath = Join-Path $componentDestination $hashLeaf
+    }
+    return $clone
+}

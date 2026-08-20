@@ -3,7 +3,7 @@
 ## 1. Призначення документа
 
 Цей документ визначає політику розробки, тестування та випуску релізів у
-репозиторії `ARCHIV_LIMS_MONOLITH`.
+репозиторії `BRAVO-Toolkit`.
 
 Основні цілі:
 
@@ -262,7 +262,7 @@ Development-реліз:
 
 ```json
 {
-  "product": "BRAVO Archive",
+  "product": "BRAVO-Toolkit",
   "packageVersion": "4.5.0-dev.1",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
@@ -278,7 +278,7 @@ Release Candidate:
 
 ```json
 {
-  "product": "BRAVO Archive",
+  "product": "BRAVO-Toolkit",
   "packageVersion": "4.5.0-rc.1",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
@@ -294,7 +294,7 @@ Release Candidate:
 
 ```json
 {
-  "product": "BRAVO Archive",
+  "product": "BRAVO-Toolkit",
   "packageVersion": "4.5.0",
   "configSchemaVersion": 1,
   "stateSchemaVersion": 1,
@@ -449,7 +449,7 @@ developer: 4.6.0-dev.1
 Тег:
 
 ```bash
-git tag -a v4.5.0-dev.1 -m "BRAVO Archive 4.5.0-dev.1"
+git tag -a v4.5.0-dev.1 -m "BRAVO-Toolkit 4.5.0-dev.1"
 git push origin v4.5.0-dev.1
 ```
 
@@ -486,7 +486,7 @@ RC створюється після завершення функціональ
 Тег:
 
 ```bash
-git tag -a v4.5.0-rc.1 -m "BRAVO Archive 4.5.0-rc.1"
+git tag -a v4.5.0-rc.1 -m "BRAVO-Toolkit 4.5.0-rc.1"
 git push origin v4.5.0-rc.1
 ```
 
@@ -623,7 +623,7 @@ Merge виконується лише через Pull Request.
 ```bash
 git switch master
 git pull --ff-only origin master
-git tag -a v4.5.0 -m "BRAVO Archive 4.5.0"
+git tag -a v4.5.0 -m "BRAVO-Toolkit 4.5.0"
 git push origin v4.5.0
 ```
 
@@ -849,7 +849,7 @@ v4.5.0
 Теги повинні бути анотованими:
 
 ```bash
-git tag -a v4.5.0 -m "BRAVO Archive 4.5.0"
+git tag -a v4.5.0 -m "BRAVO-Toolkit 4.5.0"
 ```
 
 Перезапис опублікованих тегів заборонений.
@@ -971,10 +971,19 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    4.4.2   (stable)
-developer: 4.5.0-dev.1 (development)
+master:    5.0.0   (stable)
+developer: 5.1.0-rc.2 (prerelease, у розробці — acceptance ще не пройдено)
 ```
 
-`4.5.0` — minor-цикл: у `developer` заплановано автоматичний discovery
-джерел архівації (нова функціональність зі збереженням сумісності), тому
-відкрито `4.5.0-dev.1`, а не `4.4.3-dev.1`.
+`5.1.0-rc.1` пройшов real-SFTP acceptance на DEV-LIMS (2026-08-13),
+але ДО публікації stable вирішено включити у 5.1.0 нову
+функціональність — BRAVO_DATA_RESTORE (реальне відновлення даних із
+верифікованої COMPLETE generation). Функціональна зміна робить
+acceptance rc.1 недійсним як release evidence (розділ 3), тому
+відкрито наступний candidate `5.1.0-rc.2`, який потребує повного
+повторного acceptance (включно з реальним restore-acceptance на
+DEV-LIMS) перед promotion у stable.
+
+Локальний, ніде не опублікований коміт stable-промоушену з rc.1
+(`ac07f55`) НЕ є фінальним stable: його не можна push/merge/tag/
+release. Stable `5.1.0` буде промотовано заново з прийнятого rc.2.

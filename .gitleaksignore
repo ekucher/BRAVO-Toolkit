@@ -33,3 +33,18 @@
 030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5250
 030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5461
 030531040404bd4023c48fd39158f3865729cfbe:BRAVO_SELF_TEST.ps1:generic-api-key:5487
+
+# selftest/BRAVO_SELF_TEST.LogRotation.ps1 (Фаза 2b модуляризації,
+# коміт 013af2f) — фікстури тестів ротації логів exchangAPI: рядки виду
+# @("exchangAPI_1.log", "exchangAPI_2.log", ...) — імена ТЕСТОВИХ
+# лог-файлів у тимчасовому каталозі, не ключі. Слово "exchangAPI" поруч
+# із лапками збігається з entropy-евристикою generic-api-key (той самий
+# false-positive клас, що вже allowlisted для BRAVO_SELF_TEST.ps1 у
+# гілці 5.0.1, коміт 45979f4). Код НЕ новий — перенесений 1:1 з
+# BRAVO_SELF_TEST.ps1, де він у ПОВНОМУ скані не тригерив gitleaks;
+# нові fingerprint-и виникли лише через новий шлях файлу в PR-скані.
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:511
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:530
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:557
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:768
+013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:794

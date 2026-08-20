@@ -1,4 +1,4 @@
-# BRAVO 5.0.2 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.1.0 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -32,6 +32,8 @@
 | Запустити обслуговування вручну | `.\BRAVO_MAINTENANCE.ps1` |
 | Запустити health-check вручну | `.\BRAVO_HEALTH.ps1` |
 | Перевірити, що backup реально відновлюється | `.\BRAVO_RESTORE_TEST.ps1` |
+| Побачити, з чого можна відновитися | `.\BRAVO_DATA_RESTORE.ps1 -ListGenerations` |
+| Відновити дані з резервної копії | `.\BRAVO_DATA_RESTORE.ps1 -Mode OutOfPlace -TargetPath "D:\RESTORE"` |
 | Виконати тести коду | `.\BRAVO_SELF_TEST.ps1` |
 
 Усі команди в цій інструкції потрібно виконувати з каталогу `ARCHIV`. Для
@@ -231,7 +233,7 @@ $global:pathSettings = @{
 
 | Секція | Що перевірити |
 |---|---|
-| `bravoSettings` | `NotificationProvider` (`slack` або `discord`), `NotificationMode` і `NotificationRouting` (severity → GENERAL/ALERTS, розділ 4) |
+| `bravoSettings` | `NotificationProvider` (`slack` або `discord`), `NotificationMode` і `NotificationRouting` (severity → GENERAL/ALERTS) |
 | `pathSettings` | `LIMSRoot`/`SystemLogRoot`/`BackupRoot` — усі три `""`=AUTO (розділ 2); `ArchiveRoot` більше немає |
 | `maintenanceSettings` | імена служб, каталог Br-a-vo.web, таймаути, `Retention.ArchiveDays` / `Retention.CompressedLogDays` (розділ 12) |
 | `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати |
@@ -415,13 +417,10 @@ backup — лише пише `WARNING` у журнал (`Write-Log`) і підн
 Таблицю severity → канал можна перевизначити через
 `bravoSettings.NotificationRouting` у `BRAVO.config` (безпечний дефолт вище
 застосовується автоматично, якщо ключ відсутній — стара конфігурація без
-`NotificationRouting` лишається валідною).
-
-**Backward compatibility**: якщо `BRAVO_*_GENERAL_URL`/`BRAVO_*_ALERTS_URL` не
-налаштовані в Credential Manager, обидва канали автоматично використовують
-legacy `BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL`. Оновлення не вимагає негайного
-переналаштування вже працюючих серверів — вони продовжують отримувати всі
-сповіщення через один legacy webhook, як і раніше.
+`NotificationRouting` лишається валідною). Сервери, де налаштовано лише
+legacy `BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL`, працюють без змін: обидва
+канали автоматично використовують один legacy webhook, доки канальні
+записи не налаштовано.
 
 `ArchivePrefix` може містити латинські літери, цифри, `.`, `_` і `-`. Після
 зміни префікса старі архіви не видаляються, але новий health-check і retention
@@ -580,6 +579,70 @@ Dry-run їх не запускає.
 Планувальника — на відміну від `BRAVO_HEALTH.ps1`, це не входить до
 типового набору завдань, встановлюваних `BRAVO_TASKS_INSTALL.ps1`
 (потрібно додати вручну, якщо плануєте регулярний drill).
+
+### 6.2. Відновлення даних (`BRAVO_DATA_RESTORE.ps1`)
+
+Drill (розділ 6.1) доводить відновлюваність, але нічого не відновлює.
+Фактичне відновлення виконує `BRAVO_DATA_RESTORE.ps1`. Він працює лише з
+`COMPLETE` generation і **до** будь-якої зміни на диску перевіряє
+manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і вільне місце.
+
+Спершу подивіться, з чого взагалі можна відновитися (read-only, без
+елевації):
+
+```powershell
+.\BRAVO_DATA_RESTORE.ps1 -ListGenerations -ConfigPath ".\BRAVO.config"
+```
+
+**OutOfPlace** (типово) — розпакування у порожні підкаталоги вказаної
+директорії; production і служби не змінюються:
+
+```powershell
+.\BRAVO_DATA_RESTORE.ps1 -GenerationId "20260808_154300" `
+    -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK" -ConfigPath ".\BRAVO.config"
+```
+
+**InPlace** — відновлення у production-шляхи (їх визначає discovery за
+`bravo.ini`, тому `-TargetPath` тут заборонений). Протокол безпеки:
+знімок стану служб → зупинка → підтвердження (треба **набрати**
+`GenerationId`) → поточні дані переміщуються вбік у
+`<каталог>.prerestore_<timestamp>` → розпакування у щойно створений
+порожній каталог → post-verify за кількістю файлів і обсягом →
+повернення служб у попередній стан → `BRAVO_HEALTH`:
+
+```powershell
+.\BRAVO_DATA_RESTORE.ps1 -GenerationId "20260808_154300" `
+    -Mode InPlace -ConfigPath ".\BRAVO.config"
+```
+
+Джерелом може бути не лише локальний `BackupRoot`, а й SFTP
+(`-Source SFTP`): архіви завантажуються у staging і проходять ту саму
+повну верифікацію. Окремий компонент — `-Component MODEL|BLOG|BRAVOEXCH`.
+
+Інваріанти, на які можна покладатися:
+
+- жоден файл ніколи не розпаковується поверх наявних даних — ціль завжди
+  щойно створений порожній каталог;
+- `.prerestore_*` **не видаляються автоматично** — видаляйте вручну після
+  підтвердженої працездатності LIMS;
+- при збої будь-якого компонента система **намагається відкотити весь
+  прогін**: уже відновлені компоненти повертаються до попереднього стану у
+  зворотному порядку, щоб MODEL/BLOG/BRAVOEXCH не лишились із різних
+  generation. Відкат не є безумовно успішним — якщо каталог утримує інший
+  процес, повернути його автоматично не вдасться;
+- невдалий відкат одного компонента **не припиняє** відкат інших. Кожен
+  такий компонент отримує статус `ПОМИЛКА ВІДКАТУ` з конкретною причиною,
+  надсилається CRITICAL-сповіщення, його `.prerestore_*` зберігається, а
+  прогін завершується `RestoreFailed (43)`. Стан таких каталогів не
+  гарантований — потрібне ручне повернення за
+  [OPERATIONS.md](OPERATIONS.md), розділ коду `43`;
+- невдале відновлення дає код `43`; конкретніші причини — `41` (архів не
+  пройшов перевірку) і `42` (SHA512). Дії за кожним кодом і сценарій
+  перерваного відновлення — в [OPERATIONS.md](OPERATIONS.md).
+
+Операція вимагає прав адміністратора (окрім `-ListGenerations`) і
+захоплює той самий machine-wide operation lock, що архівація й
+обслуговування, тому не може виконуватись паралельно з ними.
 
 ## 7. Окремі етапи налаштування
 
@@ -1034,6 +1097,7 @@ health > лише попередження. Код `90` має найвищий 
 | `BRAVO_HEALTH.ps1` | контроль резервних копій і служб |
 | `BRAVO_TASKS_DIAGNOSE.ps1` | діагностика Планувальника і запуск від `SYSTEM` |
 | `BRAVO_RESTORE_TEST.ps1` | restore drill — розпакування останнього verified backup в ізольований каталог (розділ 6.1) |
+| `BRAVO_DATA_RESTORE.ps1` | реальне відновлення даних із verified generation: out-of-place або in-place з move-aside і rollback (розділ 6.2) |
 
 ### Службові файли
 

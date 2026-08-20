@@ -74,6 +74,13 @@ function Format-BRAVODiagnoseTaskNextRun {
     }
     if ($TaskType -eq "Recovery") {
         $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
+        $nextRunArguments.DailyWindowStart = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
+            -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
+            [string]$maintenanceSettings.Restore.WindowStart
+        } else {
+            "21:00"
+        }
+        $nextRunArguments.HasBootTrigger = [bool]$maintenanceSettings.Restore.RunMissedOnStartup
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments

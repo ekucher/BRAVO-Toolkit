@@ -24,7 +24,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -1031,12 +1031,63 @@ function Wait-ForManualExit {
     Wait-BRAVOManualExit -NoPause:$NoPause
 }
 
+function Group-BRAVOProbeTarget {
+    # Один і той самий шлях пробується РІВНО один раз (як і раніше через
+    # Select-Object -Unique), але його провал застосовується до ВСІХ власників
+    # цього шляху: два компоненти можуть мати спільний каталог призначення, і
+    # тоді відмова справедливо стосується обох.
+    param([object[]]$Targets)
+
+    # Hashtable для пошуку + List для порядку, а НЕ [ordered]@{}: доступ до
+    # .Values порожнього OrderedDictionary кидає ArgumentException
+    # ("Argument types do not match") під час загортання в @() — а порожній
+    # набір цілей тут цілком штатний (усі компоненти вимкнені).
+    $probeGroupIndex = @{}
+    $probeGroupList = New-Object System.Collections.Generic.List[object]
+    foreach ($probeTarget in @($Targets)) {
+        $probeTargetPath = [string]$probeTarget.Path
+        if ([string]::IsNullOrWhiteSpace($probeTargetPath)) {
+            continue
+        }
+        $probeGroupKey = $probeTargetPath.ToUpperInvariant()
+        if ($probeGroupIndex.ContainsKey($probeGroupKey)) {
+            [void]$probeGroupIndex[$probeGroupKey].Owners.Add($probeTarget)
+            continue
+        }
+        $probeGroup = [pscustomobject]@{
+            Path = $probeTargetPath
+            Owners = (New-Object System.Collections.Generic.List[object])
+        }
+        [void]$probeGroup.Owners.Add($probeTarget)
+        $probeGroupIndex[$probeGroupKey] = $probeGroup
+        [void]$probeGroupList.Add($probeGroup)
+    }
+    # .ToArray(), а НЕ @($probeGroupList): у Windows PowerShell 5.1 загортання
+    # ПОРОЖНЬОГО System.Collections.Generic.List у @() кидає
+    # ArgumentException "Argument types do not match". Порожній набір цілей
+    # тут штатний (усі компоненти вимкнені), тому це був би краш на рівному місці.
+    return $probeGroupList.ToArray()
+}
+
 function Test-PathWithLog {
     param(
         [string]$Path,
         [string]$Description,
         [bool]$CreateIfMissing = $false
     )
+
+    # Порожній шлях означає нерозв'язане джерело або призначення: напр.
+    # BRAVOEXCH, коли каталог із bravo.ini [model] BEXCH не існує, і
+    # BRAVO.config обнуляє sourcePaths.BravoExch. Раніше таке значення
+    # доходило до Test-Path "" — а той має [ValidateNotNullOrEmpty] на -Path,
+    # тому кидав термінальну помилку "Cannot bind argument to parameter
+    # 'Path' because it is an empty string" і валив УВЕСЬ прогін кодом 90
+    # (InternalError) ще до архівації справних компонентів. Тут це керована
+    # відмова одного шляху: викликач сам вирішує, що з нею робити.
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        Write-BRAVOLog -Component 'PATHS' -Message "$Description не визначено: шлях порожній або не вдалося визначити автоматично" -Level "ERROR"
+        return $false
+    }
 
     if (Test-Path $Path) {
         Write-BRAVOLog -Component 'PATHS' -Message "$Description знайдено: $Path" -Level "DEBUG"
@@ -1166,6 +1217,8 @@ function Remove-BRAVOExpiredBackupGenerations {
 
     if (-not (Test-Path -LiteralPath $BackupRoot -PathType Container)) { return $false }
     $deletedGenerationCount = 0
+    $deletedVerifiedExpiredCount = 0
+    $deletedFailedIncompleteCount = 0
     try {
         $validRetentionDays = if ($RetentionDays -gt 0) { $RetentionDays } else { 183 }
         $invalidRetentionDays = if ($failedArchiveRetentionDays -gt 0) { [int]$failedArchiveRetentionDays } else { 30 }
@@ -1273,9 +1326,24 @@ function Remove-BRAVOExpiredBackupGenerations {
                 Remove-Item -LiteralPath $physicalManifest.FullName -Force -ErrorAction Stop
             }
             Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено backup generation $($record.GenerationId) ($($record.Status))" -Level 'SUCCESS'
+            if ($record.VerifiedComplete) { $deletedVerifiedExpiredCount++ } else { $deletedFailedIncompleteCount++ }
             $deletedGenerationCount++
         }
         if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
+        # Один підсумковий рядок на прогін: скільки generation оцінено,
+        # скільки захищено мінімальним порогом verified-копій (і які саме —
+        # для forensic-діагностики), скільки реально видалено з розбивкою за
+        # причиною. Доповнює вже наявні per-deletion рядки вище, не замінює.
+        # Внутрішні дужки навколо конкатенації обов'язкові: -f зв'язується
+        # сильніше за +, тому без них форматувався ЛИШЕ другий рядок — в
+        # операторському лозі DEV-LIMS перша половина вийшла з літеральними
+        # "{0}/{1}/{2}" (діагностика без чисел, помічено на acceptance).
+        Write-BRAVOLog -Component 'CLEANUP' -Message (
+            ("Аудит retention: generation оцінено={0}; захищено (verified)={1} [{2}]; " +
+             "видалено (verified, прострочено)={3}; видалено (failed/incomplete, прострочено)={4}") -f
+            $records.Count, $protectedGenerationIds.Count, ($protectedGenerationIds -join ', '),
+            $deletedVerifiedExpiredCount, $deletedFailedIncompleteCount
+        ) -Level 'INFO'
         return $true
     } catch {
         if ($null -ne $RemovedGenerationCount) { $RemovedGenerationCount.Value = $deletedGenerationCount }
@@ -1582,7 +1650,7 @@ function Sync-Folders {
                 Show-RunningProgress `
                     -Id 3 `
                     -Activity "Robocopy — синхронiзацiя BAZA" `
-                    -Status "Виконується, минуло $elapsed сек." `
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsed) `
                     -PercentComplete -1
                 if (-not $process.HasExited) {
                     Start-Sleep -Milliseconds 500
@@ -2515,6 +2583,99 @@ function Remove-BRAVOTemporaryArchiveArtifacts {
     }
 }
 
+function Remove-BRAVOOrphanedTemporaryArchiveArtifacts {
+    # Осиротілі .work\*.partial* — залишки перерваного (крах/force-kill/
+    # втрата живлення) минулого прогону: Remove-BRAVOTemporaryArchiveArtifacts
+    # вище прибирає такі артефакти лише in-process (finally/catch того
+    # самого прогону), тому вбитий процес лишає їх назавжди без цієї функції.
+    # НІКОЛИ не виходить за межі .work\ конкретного Destination: MANIFESTS\ і
+    # опубліковані .mdz/.sha512 поза дією цієї функції (їх коректність і
+    # ретеншн гарантує окремо Remove-BRAVOExpiredBackupGenerations).
+    param(
+        [Parameter(Mandatory = $true)][object[]]$ArchiveDefinitions,
+        [int]$RetentionHours,
+        [ref]$RemovedFileCount
+    )
+
+    $deletedCount = 0
+    $failed = $false
+    try {
+        $effectiveRetentionHours = if ($RetentionHours -gt 0) { $RetentionHours } else { 48 }
+        $cutoff = (Get-Date).AddHours(-$effectiveRetentionHours)
+        foreach ($archive in @($ArchiveDefinitions)) {
+            $destination = [string]$archive.Destination
+            if ([string]::IsNullOrWhiteSpace($destination)) { continue }
+            $workDirectory = Join-Path $destination ".work"
+            # Свідомо БЕЗ окремого Test-Path gate: .NET Directory.Exists (на
+            # якому базується файловий провайдер) за дизайном ковтає
+            # UnauthorizedAccessException і повертає $false — pure ACL
+            # access-denied на ІСНУЮЧОМУ каталозі принципово нерозрізнюване
+            # від "не існує" через Test-Path, з -ErrorAction Stop чи без.
+            # Замість цього єдине джерело істини — сам Get-ChildItem: він
+            # РЕАЛЬНО кидає (підтверджено емпірично в цій сесії), і catch
+            # явно класифікує причину:
+            # - ItemNotFoundException/DirectoryNotFoundException — .work
+            #   справді відсутній, доброякісний SKIP, не помилка sweep'у;
+            # - будь-що інше (UnauthorizedAccessException, IOException,
+            #   мережева/провайдерська помилка) — fail-visible: $failed=true.
+            try {
+                $partialFiles = @(
+                    Get-ChildItem -LiteralPath $workDirectory -File -Force `
+                        -Filter "*.partial*" -ErrorAction Stop
+                )
+            } catch [System.Management.Automation.ItemNotFoundException], [System.IO.DirectoryNotFoundException] {
+                continue
+            } catch {
+                $failed = $true
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося прочитати $workDirectory для orphan-sweep: $($_.Exception.Message)" -Level 'ERROR'
+                continue
+            }
+
+            foreach ($file in $partialFiles) {
+                if ($file.LastWriteTime -ge $cutoff) { continue }
+                if (-not (Test-BRAVOBackupArtifactPathSafe -Path $file.FullName -BackupRoot $workDirectory)) {
+                    throw "orphan sweep candidate outside .work: $($file.FullName)"
+                }
+                try {
+                    Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop
+                    $deletedCount++
+                    Write-BRAVOLog -Component 'CLEANUP' -Message "Видалено осиротілий тимчасовий артефакт: $($file.FullName)" -Level 'SUCCESS'
+                } catch {
+                    $failed = $true
+                    Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося видалити осиротілий артефакт $($file.FullName): $($_.Exception.Message)" -Level 'ERROR'
+                }
+            }
+            # Так само класифіковано, а не Test-Path: помилка enumeration тут
+            # НЕ повинна трактуватися як "каталог порожній" — інакше рішення
+            # видалити .work спиралося б на недостовірний .Count. Зникнення
+            # каталогу МІЖ enumeration вище і цією перевіркою (конкурентний
+            # процес) — доброякісний SKIP (нічого видаляти), не помилка.
+            try {
+                $remainingItems = @(Get-ChildItem -LiteralPath $workDirectory -Force -ErrorAction Stop)
+            } catch [System.Management.Automation.ItemNotFoundException], [System.IO.DirectoryNotFoundException] {
+                continue
+            } catch {
+                $failed = $true
+                Write-BRAVOLog -Component 'CLEANUP' -Message "Не вдалося перевірити, чи $workDirectory порожній: $($_.Exception.Message)" -Level 'ERROR'
+                continue
+            }
+            if ($remainingItems.Count -eq 0) {
+                try {
+                    Remove-Item -LiteralPath $workDirectory -Force -ErrorAction Stop
+                } catch {
+                    # Порожній .work нікому не заважає — це не привід для помилки.
+                }
+            }
+        }
+        if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = $deletedCount }
+        return (-not $failed)
+    } catch {
+        if ($null -ne $RemovedFileCount) { $RemovedFileCount.Value = $deletedCount }
+        Write-BRAVOLog -Component 'CLEANUP' -Message "Orphan temp artifact sweep failed: $($_.Exception.Message)" -Level 'ERROR'
+        return $false
+    }
+}
+
 function New-BRAVOArchiveCreationResult {
     # Створення й перевірка цілісності — ДВІ різні події, а не одна.
     # Раніше New-Archive повертав один bool на обидві, тому "архів створено,
@@ -2651,7 +2812,7 @@ function New-Archive {
                 Show-RunningProgress `
                     -Id $sevenZipProgressId `
                     -Activity $progressActivity `
-                    -Status "Виконується $elapsedSeconds сек.; $currentSizeText" `
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsedSeconds -Detail $currentSizeText) `
                     -PercentComplete -1
             }
 
@@ -3390,16 +3551,29 @@ function Copy-ArchivesToSMB {
         $drive = New-BRAVOSMBDrive
         Write-BRAVOLog -Component 'SMB' -Message "Підключення до NAS/SMB успішне: $($smbSettings.RootPath)" -Level "SUCCESS"
 
-        $copyIndex = 0
+        $copyComponentOrder = @(
+            $copyQueue | Where-Object { $_.Component -ne 'MANIFEST' } |
+                ForEach-Object { $_.Component } | Select-Object -Unique
+        )
+        $copyComponentTotal = $copyComponentOrder.Count
+        $currentCopyComponent = $null
         foreach ($copyItem in $copyQueue) {
-            $copyIndex++
             $copyFileName = Split-Path $copyItem.SourcePath -Leaf
-            Show-ItemProgress `
-                -Id 14 `
-                -Activity "BRAVO_ARCHIV — копіювання на NAS/SMB" `
-                -Item $copyFileName `
-                -Current $copyIndex `
-                -Total $copyTotal
+            # Операторський підетап — КОМПОНЕНТ (mdz+sha512 = один visible
+            # підетап; MANIFEST — коротка фаза без позиції), як і для
+            # архівації та SFTP upload.
+            if ($copyItem.Component -ne $currentCopyComponent) {
+                $currentCopyComponent = $copyItem.Component
+                if ($currentCopyComponent -eq 'MANIFEST') {
+                    Show-ScriptProgress -Status "Копіювання manifest на NAS/SMB" -PercentComplete 95
+                } else {
+                    $copyComponentIndex = ([array]::IndexOf($copyComponentOrder, $currentCopyComponent) + 1)
+                    $copyComponentProgress = 92 + [Math]::Floor((($copyComponentIndex - 1) * 3) / [Math]::Max(1, $copyComponentTotal))
+                    Show-ScriptProgress `
+                        -Status (Format-BRAVOSubstepPhase -Name "Копіювання $currentCopyComponent на NAS/SMB" -Current $copyComponentIndex -Total $copyComponentTotal) `
+                        -PercentComplete $copyComponentProgress
+                }
+            }
 
             if (-not (Test-Path -LiteralPath $copyItem.DestinationDirectory -PathType Container)) {
                 New-Item -ItemType Directory -Path $copyItem.DestinationDirectory -Force -ErrorAction Stop | Out-Null
@@ -3430,128 +3604,12 @@ function Copy-ArchivesToSMB {
     }
 }
 
-function Remove-BRAVOWinSCPSensitiveTemporaryScript {
-    param([string]$Path)
-
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return
-    }
-
-    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([char[]]"\/")
-    $fullPath = [IO.Path]::GetFullPath($Path)
-    $expectedPrefix = $temporaryRoot + [IO.Path]::DirectorySeparatorChar
-    $fileName = [IO.Path]::GetFileName($fullPath)
-    if (-not $fullPath.StartsWith($expectedPrefix, [StringComparison]::OrdinalIgnoreCase) -or
-        $fileName -notmatch '^BRAVO_WinSCP_[0-9a-f]{32}\.txt$') {
-        throw "відхилено небезпечний шлях тимчасового WinSCP-файла: $Path"
-    }
-
-    if (Test-Path -LiteralPath $fullPath -PathType Leaf) {
-        # Спершу прибираємо вміст із доступного файлового запису, потім файл.
-        [IO.File]::WriteAllText($fullPath, "", [Text.Encoding]::ASCII)
-        Remove-Item -LiteralPath $fullPath -Force -ErrorAction Stop
-    }
-}
-
-function Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts {
-    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    $staleBefore = (Get-Date).AddDays(-1)
-    foreach ($file in @(
-            Get-ChildItem `
-                -LiteralPath $temporaryRoot `
-                -Filter "BRAVO_WinSCP_*.txt" `
-                -ErrorAction SilentlyContinue |
-                Where-Object { -not $_.PSIsContainer -and $_.LastWriteTime -lt $staleBefore }
-        )) {
-        try {
-            Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $file.FullName
-        } catch {
-            # Файл іншого облікового запису може мати закритий ACL.
-        }
-    }
-}
-
-function New-BRAVOWinSCPTemporaryScriptPath {
-    # WinSCP script містить URL з обліковими даними, тому файл створюється
-    # ОДРАЗУ з фінальним DACL — доступ лише поточному користувачу, SYSTEM і
-    # Administrators.
-    #
-    # ЧОМУ НЕ "створити, потім Set-Acl" (аудит Low #9): між створенням файлу
-    # й накладанням ACL файл існує з успадкованими від %TEMP% правами. Для
-    # запланованого завдання %TEMP% — це C:\Windows\Temp, куди має доступ
-    # значно ширше коло. Порожній файл у цьому вікні секрету ще не містить,
-    # але Windows перевіряє права в момент ВІДКРИТТЯ дескриптора, а не при
-    # кожному читанні: відкритий у цьому вікні дескриптор переживе зміну ACL
-    # і прочитає облікові дані, які запише сюди викликач. Передача
-    # FileSecurity у конструктор FileStream прибирає вікно повністю — файл
-    # ніколи не існує з успадкованими правами.
-    Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts
-    $temporaryRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath())
-    $temporaryPath = Join-Path `
-        -Path $temporaryRoot `
-        -ChildPath ("BRAVO_WinSCP_{0}.txt" -f [guid]::NewGuid().ToString("N"))
-
-    # DACL будується ДО створення файлу.
-    $security = New-Object System.Security.AccessControl.FileSecurity
-    $security.SetAccessRuleProtection($true, $false)
-    $uniqueSids = @{}
-    foreach ($sid in @(
-            [Security.Principal.WindowsIdentity]::GetCurrent().User,
-            (New-Object Security.Principal.SecurityIdentifier("S-1-5-18")),
-            (New-Object Security.Principal.SecurityIdentifier("S-1-5-32-544"))
-        )) {
-        if ($null -eq $sid -or $uniqueSids.ContainsKey($sid.Value)) {
-            continue
-        }
-        $uniqueSids[$sid.Value] = $true
-        $rule = New-Object `
-            -TypeName System.Security.AccessControl.FileSystemAccessRule `
-            -ArgumentList @(
-                $sid,
-                [Security.AccessControl.FileSystemRights]::FullControl,
-                [Security.AccessControl.AccessControlType]::Allow
-            )
-        [void]$security.AddAccessRule($rule)
-    }
-
-    $stream = $null
-    try {
-        $stream = New-Object `
-            -TypeName System.IO.FileStream `
-            -ArgumentList @(
-                $temporaryPath,
-                [IO.FileMode]::CreateNew,
-                [Security.AccessControl.FileSystemRights]::Write,
-                [IO.FileShare]::None,
-                4096,
-                [IO.FileOptions]::None,
-                $security
-            )
-        $stream.Dispose()
-        $stream = $null
-
-        return $temporaryPath
-    } catch {
-        if ($null -ne $stream) {
-            $stream.Dispose()
-        }
-        if (Test-Path -LiteralPath $temporaryPath -PathType Leaf) {
-            try {
-                Remove-BRAVOWinSCPSensitiveTemporaryScript -Path $temporaryPath
-            } catch {
-                # WARNING, а не мовчазний пропуск: цей файл містить облікові
-                # дані SFTP. Якщо його не вдалося затерти й видалити, секрет
-                # лишився в %TEMP% — оператор має про це дізнатися саме
-                # зараз, а не під час розслідування витоку.
-                Write-BRAVOLog `
-                    -Component 'SFTP' `
-                    -Message "Не вдалося прибрати тимчасовий WinSCP-скрипт з обліковими даними ($temporaryPath): $($_.Exception.Message). Видаліть файл вручну." `
-                    -Level "WARNING"
-            }
-        }
-        throw
-    }
-}
+# Remove-BRAVOWinSCPSensitiveTemporaryScript / New-BRAVOWinSCPTemporaryScriptPath /
+# Clear-BRAVOStaleWinSCPSensitiveTemporaryScripts перенесено в
+# modules/BRAVO.ArchiveRuntime/BRAVO.ArchiveRuntime.psm1 (canonical owner,
+# спільний для Archive і DataRestore — обидва створюють WinSCP-скрипти з
+# SFTP URL, що містить облікові дані). Модуль BRAVO.ArchiveRuntime вже
+# імпортується вище — виклики нижче лишаються без змін.
 
 function Test-SFTPConnection {
     param(
@@ -4399,6 +4457,15 @@ exit
     $showWinSCPProgress = $progressSettings.Enabled -and $progressSettings.ShowWinSCPOutput
     $transferFileName = Split-Path $LocalFilePath -Leaf
     $transferActivity = "WinSCP — передача $transferFileName"
+    # Розмір локального файлу вже відомий (жодного remote-запиту заради UI):
+    # корисна деталь running-рядка для великих mdz-архівів.
+    $transferSizeText = $null
+    try {
+        $transferSizeText = Format-BRAVOFileSize -Bytes ((Get-Item -LiteralPath $LocalFilePath).Length)
+    } catch {
+        # Розмір -- лише UI-деталь; його відсутність не має впливати на передачу.
+        $transferSizeText = $null
+    }
     try {
         $winscpCommand | Out-File -FilePath $tempScript -Encoding $winSCPScriptEncoding -Force
         Write-BRAVOLog -Component 'SFTP' -Message "Створено тимчасовий скрипт WinSCP: $tempScript" -Level "DEBUG"
@@ -4434,7 +4501,7 @@ exit
                 Show-RunningProgress `
                     -Id 11 `
                     -Activity $transferActivity `
-                    -Status "Виконується, минуло $elapsedSeconds сек."
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsedSeconds -Detail $transferSizeText)
             }
             if ($elapsedSeconds -ge $operationTimeoutSeconds) {
                 $transferTimedOut = $true
@@ -4635,7 +4702,7 @@ exit
                 Show-RunningProgress `
                     -Id 12 `
                     -Activity $syncActivity `
-                    -Status "Виконується, минуло $elapsedSeconds сек."
+                    -Status (Format-BRAVORunningDetail -ElapsedSeconds $elapsedSeconds)
             }
             if ($elapsedSeconds -ge $operationTimeoutSeconds) {
                 $syncTimedOut = $true
@@ -4757,6 +4824,147 @@ exit
                 -Level "WARNING"
         }
     }
+}
+
+function New-BRAVOBazaArchiveFullAuditProvider {
+    # Acceptance DEV-LIMS blocker #4 (2026-08-13): на Windows PowerShell 5.1
+    # .GetNewClosure() прив'язує scriptblock до НОВОГО dynamic module —
+    # захоплені ЗМІННІ копіюються, але command-lookup приватних функцій
+    # цього runtime (Get-BAZASFTPComparison — script-scope, не exported)
+    # у dynamic module НЕ резолвиться. Перший реальний виклик провайдера
+    # (bootstrap Full Audit через межу модуля BRAVO.BazaSync) падав
+    # CommandNotFoundException — підтверджено відтворенням механізму на
+    # PS 5.1 і поведінковим self-test-ом (FullAuditProviderCrossesModuleBoundary).
+    #
+    # Тому ВСІ command-references захоплюються ЯВНО як FunctionInfo ДО
+    # створення closure і викликаються через call operator (&): виклик
+    # FunctionInfo виконується в session state, де функцію визначено, —
+    # незалежно від scope, з якого викликають closure. Це стосується ОБОХ
+    # викликів (і ConvertTo-BRAVOBazaFullAuditResult теж: nested-import
+    # модуля так само може бути невидимим із dynamic module). Аналогічно
+    # всі значення (URL/host key/шляхи) — явні параметри, а не dynamic
+    # lookup script-scope змінних.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [Parameter(Mandatory = $true)][string]$RemotePath,
+        [Parameter(Mandatory = $true)][string]$RepositorySFTPUrl,
+        [Parameter(Mandatory = $true)][string]$HostKey
+    )
+
+    $capturedComparisonCommand = Get-Command `
+        -Name 'Get-BAZASFTPComparison' `
+        -CommandType Function `
+        -ErrorAction Stop
+    $capturedConvertAuditCommand = Get-Command `
+        -Name 'ConvertTo-BRAVOBazaFullAuditResult' `
+        -CommandType Function `
+        -ErrorAction Stop
+    $capturedLocalDirectory = $LocalDirectory
+    $capturedRemotePath = $RemotePath
+    $capturedSftpUrl = $RepositorySFTPUrl
+    $capturedHostKey = $HostKey
+
+    return {
+        param($Snapshot)
+        $comparison = & $capturedComparisonCommand `
+            -LocalPath $capturedLocalDirectory `
+            -RemotePath $capturedRemotePath `
+            -RepositorySFTPUrl $capturedSftpUrl `
+            -HostKey $capturedHostKey
+        return & $capturedConvertAuditCommand `
+            -ComparisonSuccess $comparison.Success `
+            -ComparisonError $comparison.Error `
+            -PendingFiles $comparison.PendingFiles `
+            -LocalDirectory $capturedLocalDirectory `
+            -LocalSnapshot $Snapshot
+    }.GetNewClosure()
+}
+
+function Invoke-BRAVOBazaIncrementalSync {
+    # Спільна orchestration-точка Archive/Health (ТЗ п.9: ONE synchronization,
+    # ONE SyncResult) — FullAuditProvider будується НАВКОЛО вже наявної
+    # Get-BAZASFTPComparison (не дублює її), і використовується лише для
+    # bootstrap першого запуску або періодичного Full Audit.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [Parameter(Mandatory = $true)][string]$RemoteDirectory,
+        [switch]$ForceFullAudit
+    )
+
+    $normalizedRemoteDirectory = $RemoteDirectory.Replace("\", "/").Trim("/")
+    $remotePath = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { "/" } else { "/$normalizedRemoteDirectory" }
+
+    $fullAuditProvider = New-BRAVOBazaArchiveFullAuditProvider `
+        -LocalDirectory $LocalDirectory `
+        -RemotePath $remotePath `
+        -RepositorySFTPUrl $sftpUrl `
+        -HostKey $sftpHostKey
+
+    # Одна canonical точка інтерпретації для Archive/Health/DryRun
+    # (Get-BRAVOBazaSettingsEffective, BRAVO.ArchiveRuntime) — StateRoot з
+    # можливим override, MutationPolicy, FullAuditEnabled/EveryDays.
+    $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+    $mutationPolicy = $bazaSettingsEffective.MutationPolicy
+    $stateRootPath = $bazaSettingsEffective.StateRoot
+    # FullAuditEnabled=$false вимикає ПЕРІОДИЧНИЙ audit (FullAuditEveryDays=0
+    # для модуля) — bootstrap першого запуску лишається обов'язковим і від
+    # цього прапорця не залежить (без нього перший запуск не має звідки
+    # взяти seed-стан, ТЗ п.15).
+    $fullAuditEveryDays = $bazaSettingsEffective.FullAuditEveryDays
+
+    # $(...), не (...): усередині звичайних дужок if парситься як КОМАНДА
+    # з іменем "if" (валідно для парсера!) і падає лише в рантаймі
+    # CommandNotFoundException — саме так упав перший реальний прогін
+    # BRAVO_ARCHIV на DEV-LIMS (SFTP acceptance, сценарій 1). Guard на цей
+    # клас: Diagnostics/NoKeywordParsedAsCommand у BRAVO_SELF_TEST.
+    $operationTimeoutSeconds = [int]$(
+        if ([int]$backupMonitoring.SFTP.SynchronizationTimeoutSeconds -gt 0) {
+            $backupMonitoring.SFTP.SynchronizationTimeoutSeconds
+        } else {
+            [math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)
+        }
+    )
+
+    # Acceptance DEV-LIMS (2026-08-13): .NET-асемблі потрібен winscp.exe,
+    # а $winSCPPath комплекту — це Tools\WinSCP.com (CLI-стаб для
+    # legacy-шляхів): із ним Session.Open зависав на інтерактивному
+    # промпті "winscp>" (CPU~0, лог мовчить). Резолвимо ТУ САМУ пару
+    # dll+exe, що її вже роками використовує Get-BAZASFTPComparison.
+    $winSCPComponents = Get-BRAVOWinSCPDotNetComponents `
+        -WinSCPAssemblyPath ([string]$winSCPAssemblyPath) `
+        -WinSCPPath ([string]$winSCPPath)
+    if ($null -eq $winSCPComponents) {
+        $componentsFailure = New-BRAVOBazaSyncResult `
+            -Component $Component `
+            -CycleId (New-BRAVOBazaCycleId) `
+            -StartedUtc (Get-Date).ToUniversalTime() `
+            -CutoffUtc (Get-Date).ToUniversalTime()
+        $componentsFailure.Status = 'ERROR'
+        $componentsFailure.Error = 'не знайдено сумісну пару WinSCPnet.dll та WinSCP.exe для incremental BAZA sync'
+        $componentsFailure.CompletedUtc = (Get-Date).ToUniversalTime()
+        return $componentsFailure
+    }
+
+    return Invoke-BRAVOBazaComponentSyncSession `
+        -Component $Component `
+        -LocalDirectory $LocalDirectory `
+        -RemoteRootPath $remotePath `
+        -RepositorySFTPUrl $sftpUrl `
+        -HostKey $sftpHostKey `
+        -WinSCPAssemblyPath $winSCPComponents.AssemblyPath `
+        -WinSCPExecutablePath $winSCPComponents.ExecutablePath `
+        -StateRoot $stateRootPath `
+        -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
+        -OperationTimeoutSeconds $operationTimeoutSeconds `
+        -MutationPolicy $mutationPolicy `
+        -BootstrapIfNeeded `
+        -FullAuditProvider $fullAuditProvider `
+        -FullAuditEveryDays $fullAuditEveryDays `
+        -ForceFullAudit:$ForceFullAudit `
+        -WriteCheckpoint
 }
 
 function Invoke-ManualBAZASFTPSynchronization {
@@ -5330,7 +5538,7 @@ function Main {
         $(if ($bazaAppLocalSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWLocalSyncEnabled) { 1 } else { 0 }) +
         $enabledArchives.Count +
-        $(if ($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup) { 1 } else { 0 }) +
+        $(if ($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup) { 1 } else { 0 }) +
         $(if ($sftpArchiveUploadEnabled) { 1 } else { 0 }) +
         $(if ($bazaAppSFTPSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWSFTPSyncEnabled) { 1 } else { 0 }) +
@@ -5370,7 +5578,7 @@ function Main {
     # вище і той самий вираз нижче, що й тут) — не unnumbered.
     $archivePlanEntries['Очищення старих журналів'] = $true
     $archivePlanEntries['Очищення старих backup generation'] = [bool](
-        $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup
+        $enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup
     )
     $archivePlanEntries['Post-backup Health'] = [bool]$healthCheckEnabled
     Write-BRAVOPlan -Title 'План операцій:' -Entries $archivePlanEntries
@@ -5480,8 +5688,20 @@ function Main {
         "виключення: $freeSpaceExclusionsText"
     ) -Level 'INFO'
     try {
+        # -RootPath тут лише sanity-перевірка "SOME каталог доступний"
+        # (сама функція перевіряє ВСІ Fixed-диски, а не лише диск $RootPath)
+        # — Test-Path з порожнім рядком кидає виняток, а $rootPath може
+        # бути порожнім, коли LIMSRoot не визначено (служба BRAVO
+        # відсутня; safety-review "service state != backup policy").
+        # $runtimeRoot гарантовано існує (звідти виконується сам скрипт)
+        # незалежно від LIMSRoot і не змінює перелік перевірених дисків.
+        $archiveFreeSpaceRootPath = if ([string]::IsNullOrWhiteSpace([string]$rootPath)) {
+            $runtimeRoot
+        } else {
+            $rootPath
+        }
         $archiveFreeSpaceResult = Get-BRAVOArchiveFreeSpaceResult `
-            -RootPath $rootPath `
+            -RootPath $archiveFreeSpaceRootPath `
             -MinimumFreeSpaceGB $archiveMinimumFreeSpaceGB `
             -ExcludedDrives $archiveFreeSpaceExcludedDrives
     } catch {
@@ -5788,52 +6008,159 @@ function Main {
     # BRAVO_ARCHIV пише лише власні логи ($logPath = RuntimeRoot\LOGS),
     # backup-дані (BackupRoot) і машинний стан (ProgramData\State). Системні
     # журнали (SystemLogRoot) — зона BRAVO_MAINTENANCE, тому тут не пробуються.
-    $writeProbePaths = @(
+    # Кожна probe-ціль належить конкретному ВЛАСНИКУ.
+    #
+    # 'Shared' — спільна інфраструктура (власні логи, BackupRoot, каталог
+    # lock, machine state). Без неї не може виконатись і чесно записатись
+    # ЖОДНА операція, тому її провал справедливо скасовує все.
+    #
+    # 'Archive'/'BAZA_APP'/'BAZA_WWW' — ресурс КОНКРЕТНОГО компонента. Його
+    # провал вимикає ЛИШЕ цей компонент, а решта виконуються далі.
+    #
+    # Раніше тут був один глобальний $systemAccessValid, і будь-який провал
+    # скасовував усе: відсутня тека опціональної синхронізації BAZA_WWW
+    # давала "опубліковано 0 з 3; VSS Snapshot Set: не створено", хоча
+    # джерела MODEL/BLOG/BRAVOEXCH і BAZA_APP були повністю справні, а
+    # BAZA_APP ще й отримувала оманливе "локальний source path недоступний".
+    # Це суперечило принципу самого циклу архівації: помилка одного
+    # компонента не має псувати решту.
+    $sharedAccessValid = $true
+    $probeFailedComponents = New-Object System.Collections.Generic.List[string]
+
+    $writeProbeTargets = New-Object System.Collections.Generic.List[object]
+    foreach ($sharedWritePath in @(
         [string]$logPath,
         [string]$backupRootPath,
         (Split-Path -Path ([string]$operationLockSettings.Path) -Parent),
         [string]$stateRoot
-    )
-    foreach ($archive in $enabledArchives) {
-        $writeProbePaths += [string]$archive.Destination
-        $writeProbePaths += [System.IO.Path]::Combine([string]$archive.Destination, '.work')
+    )) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = $sharedWritePath; Owner = 'Shared'; Component = $null
+        })
     }
-    if ($bazaAppLocalSyncEnabled) { $writeProbePaths += [string]$bazaAppPaths.Destination }
-    if ($bazaWWWLocalSyncEnabled) { $writeProbePaths += [string]$bazaWWWPaths.Destination }
-    foreach ($probePath in @($writeProbePaths |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            Select-Object -Unique)) {
-        $writeProbe = Test-BRAVOFileSystemWriteProbe -Path ([string]$probePath)
+    foreach ($archive in $enabledArchives) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [string]$archive.Destination; Owner = 'Archive'; Component = [string]$archive.Type
+        })
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [System.IO.Path]::Combine([string]$archive.Destination, '.work'); Owner = 'Archive'; Component = [string]$archive.Type
+        })
+    }
+    if ($bazaAppLocalSyncEnabled) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaAppPaths.Destination; Owner = 'BAZA_APP'; Component = $null
+        })
+    }
+    if ($bazaWWWLocalSyncEnabled) {
+        [void]$writeProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaWWWPaths.Destination; Owner = 'BAZA_WWW'; Component = $null
+        })
+    }
+    foreach ($probeGroup in (Group-BRAVOProbeTarget -Targets $writeProbeTargets.ToArray())) {
+        $writeProbe = Test-BRAVOFileSystemWriteProbe -Path ([string]$probeGroup.Path)
         if ($writeProbe.Success) {
-            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe OK: $probePath" -Level 'DEBUG'
-        } else {
-            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe FAILED: $probePath ($($writeProbe.Error))" -Level 'ERROR'
-            $systemAccessValid = $false
-            $pathCheckFailureCount++
+            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe OK: $($probeGroup.Path)" -Level 'DEBUG'
+            continue
+        }
+        Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM write probe FAILED: $($probeGroup.Path) ($($writeProbe.Error))" -Level 'ERROR'
+        $systemAccessValid = $false
+        $pathCheckFailureCount++
+        foreach ($probeOwner in $probeGroup.Owners) {
+            switch ([string]$probeOwner.Owner) {
+                'Archive' {
+                    if (-not $probeFailedComponents.Contains([string]$probeOwner.Component)) {
+                        [void]$probeFailedComponents.Add([string]$probeOwner.Component)
+                    }
+                }
+                'BAZA_APP' { $bazaAppDestinationAvailable = $false }
+                'BAZA_WWW' { $bazaWWWDestinationAvailable = $false }
+                default { $sharedAccessValid = $false }
+            }
         }
     }
-    $sourceProbePaths = @($enabledArchives | ForEach-Object { [string]$_.Source })
-    if ($bazaAppLocalSyncEnabled -or $bazaAppSFTPSyncEnabled) { $sourceProbePaths += [string]$bazaAppPaths.Source }
-    if ($bazaWWWLocalSyncEnabled -or $bazaWWWSFTPSyncEnabled) { $sourceProbePaths += [string]$bazaWWWPaths.Source }
-    foreach ($probePath in @($sourceProbePaths |
-            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) } |
-            Select-Object -Unique)) {
-        $readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probePath)
+
+    $sourceProbeTargets = New-Object System.Collections.Generic.List[object]
+    foreach ($archive in $enabledArchives) {
+        [void]$sourceProbeTargets.Add([pscustomobject]@{
+            Path = [string]$archive.Source; Owner = 'Archive'; Component = [string]$archive.Type
+        })
+    }
+    if ($bazaAppLocalSyncEnabled -or $bazaAppSFTPSyncEnabled) {
+        [void]$sourceProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaAppPaths.Source; Owner = 'BAZA_APP'; Component = $null
+        })
+    }
+    if ($bazaWWWLocalSyncEnabled -or $bazaWWWSFTPSyncEnabled) {
+        [void]$sourceProbeTargets.Add([pscustomobject]@{
+            Path = [string]$bazaWWWPaths.Source; Owner = 'BAZA_WWW'; Component = $null
+        })
+    }
+    foreach ($probeGroup in (Group-BRAVOProbeTarget -Targets $sourceProbeTargets.ToArray())) {
+        $readProbe = Test-BRAVOSourceReadProbe -Path ([string]$probeGroup.Path)
         if ($readProbe.Success) {
             Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe OK: $($readProbe.Path)" -Level 'DEBUG'
-        } else {
-            Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe FAILED: $probePath ($($readProbe.Error))" -Level 'ERROR'
-            $systemAccessValid = $false
-            $pathCheckFailureCount++
+            continue
+        }
+        Write-BRAVOLog -Component 'PATHS' -Message "SYSTEM source read probe FAILED: $($probeGroup.Path) ($($readProbe.Error))" -Level 'ERROR'
+        $systemAccessValid = $false
+        $pathCheckFailureCount++
+        foreach ($probeOwner in $probeGroup.Owners) {
+            switch ([string]$probeOwner.Owner) {
+                'Archive' {
+                    if (-not $probeFailedComponents.Contains([string]$probeOwner.Component)) {
+                        [void]$probeFailedComponents.Add([string]$probeOwner.Component)
+                    }
+                }
+                'BAZA_APP' { $bazaAppSourceAvailable = $false }
+                'BAZA_WWW' { $bazaWWWSourceAvailable = $false }
+                default { $sharedAccessValid = $false }
+            }
         }
     }
-    if (-not $systemAccessValid) {
-        Write-BRAVOLog -Component 'PATHS' -Message 'Production operations cancelled because SYSTEM access preflight failed' -Level 'ERROR'
+
+    if (-not $sharedAccessValid) {
+        # Спільна інфраструктура недоступна — виконувати нема куди й нема чим.
+        Write-BRAVOLog -Component 'PATHS' -Message 'Production operations cancelled because SYSTEM access preflight failed for shared infrastructure (logs/BackupRoot/lock/state)' -Level 'ERROR'
+        # Кожен увімкнений компонент отримує явний результат-відмову: інакше
+        # $results лишався порожнім, і РЕЗУЛЬТАТ показував "Створено архівів:
+        # 0 з 0" замість "0 з 3", а причиною відмови помилково ставав перший-
+        # ліпший наступний збій (напр. SFTP) замість справжнього.
+        foreach ($archive in $enabledArchives) {
+            if ($results.ContainsKey([string]$archive.Type)) { continue }
+            $results[[string]$archive.Type] = @{
+                ArchiveSuccess = $false
+                HashSuccess = $false
+                CreateSuccess = $false
+                IntegritySuccess = $false
+                ErrorStage = 'CONFIGURATION'
+                Error = 'SYSTEM access preflight failed for shared infrastructure'
+                ToolFailure = $null
+            }
+        }
         $readyArchives = @()
         $bazaAppSourceAvailable = $false
         $bazaAppDestinationAvailable = $false
         $bazaWWWSourceAvailable = $false
         $bazaWWWDestinationAvailable = $false
+    } elseif ($probeFailedComponents.Count -gt 0) {
+        # Вимикаємо ЛИШЕ ті компоненти, чий власний probe не пройшов: решта
+        # архівуються, а generation стає INCOMPLETE замість FAILED.
+        foreach ($probeFailedComponent in @($probeFailedComponents)) {
+            Write-BRAVOLog -Component 'PATHS' -Message "Компонент ${probeFailedComponent} пропущено: SYSTEM access probe для його шляхів не пройдено" -Level 'ERROR'
+            $results[$probeFailedComponent] = @{
+                ArchiveSuccess = $false
+                HashSuccess = $false
+                CreateSuccess = $false
+                IntegritySuccess = $false
+                ErrorStage = 'CONFIGURATION'
+                Error = 'SYSTEM access preflight failed for this component'
+                ToolFailure = $null
+            }
+        }
+        $failedComponentNames = @($probeFailedComponents)
+        $readyArchives = @($readyArchives | Where-Object { $failedComponentNames -notcontains [string]$_.Type })
+    }
+    if (-not $systemAccessValid) {
         $operationFailed = $true
     }
 
@@ -6016,13 +6343,12 @@ function Main {
         foreach ($archive in $readyArchives) {
             $archiveIndex++
             $archiveProgress = 30 + [Math]::Floor((($archiveIndex - 1) / [Math]::Max(1, $readyArchives.Count)) * 40)
-            Show-ScriptProgress -Status "Архiвацiя $($archive.Type) ($archiveIndex з $($readyArchives.Count))" -PercentComplete $archiveProgress
-            Show-ItemProgress `
-                -Id 10 `
-                -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" `
-                -Item $archive.Type `
-                -Current $archiveIndex `
-                -Total $readyArchives.Count
+            # Канонічний формат підетапу (Format-BRAVOSubstepPhase) — той
+            # самий для архівації/SFTP/NAS: оператор завжди бачить, ЯКИЙ
+            # компонент виконується і його позицію (N з Total).
+            Show-ScriptProgress `
+                -Status (Format-BRAVOSubstepPhase -Name "Архiвацiя $($archive.Type)" -Current $archiveIndex -Total $readyArchives.Count) `
+                -PercentComplete $archiveProgress
             $archiveName = $archive.NameTemplate -f $archivePrefix, $generationId
             Write-Log "==="
             Write-Log "=== АРХIВАЦIЯ $($archive.Type) ==="
@@ -6077,7 +6403,9 @@ function Main {
                 # уже ПІСЛЯ повного завершення виклику. Show-ScriptProgress
                 # нижче — прогрес-бар, не журнал, лишається на своєму місці.
                 $hashProgress = [Math]::Min(69, $archiveProgress + 8)
-                Show-ScriptProgress -Status "SHA512 для $($archive.Type)" -PercentComplete $hashProgress
+                Show-ScriptProgress `
+                    -Status (Format-BRAVOSubstepPhase -Name "SHA512 для $($archive.Type)" -Current $archiveIndex -Total $readyArchives.Count) `
+                    -PercentComplete $hashProgress
                 $results[$archive.Type] = @{
                     ArchivePath = $componentResult.ArchivePath
                     HashPath = $componentResult.HashPath
@@ -6286,7 +6614,7 @@ function Main {
     # рядків на кожен внутрішній фільтр. Retention days/filters/delete
     # semantics нижче не змінені.
     $backupRetentionCleanupStartedAt = Get-Date
-    $backupRetentionCleanupPlanned = [bool]($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup)
+    $backupRetentionCleanupPlanned = [bool]($enableArchiveDeletion -or $enableFailedArchiveDeletion -or $enableLunchArchiveCleanup -or $enableOrphanTempCleanup)
     $generationCleanupAttempted = $false
     $generationCleanupSucceeded = $true
     $generationCleanupDeletedCount = 0
@@ -6368,8 +6696,33 @@ function Main {
         }
     }
 
-    $backupRetentionCleanupAttempted = $generationCleanupAttempted -or $lunchCleanupAttempted
-    $backupRetentionCleanupFailed = (-not $generationCleanupSucceeded) -or $lunchCleanupConfigError -or (-not $lunchCleanupSucceeded)
+    # Осиротілі .work\*.partial* — залишок МИНУЛОГО перерваного прогону, не
+    # результат СЬОГОДНІШНЬОГО backupGenerationStatus, тому цей блок свідомо
+    # НЕ вкладений у "-and $script:backupGenerationStatus -eq 'COMPLETE'"
+    # вище: сьогоднішня невдача не повинна блокувати прибирання чужого
+    # минулого сміття. Ексклюзивний Enter-BRAVOArchiveProcessLock (тримається
+    # увесь прогін) виключає паралельний другий Archive/Maintenance —
+    # orphanTempRetentionHours лише додатковий запобіжник проти видалення
+    # артефакту повільного, але ще легітимно активного прогону.
+    $orphanCleanupAttempted = $false
+    $orphanCleanupSucceeded = $true
+    $orphanCleanupDeletedCount = 0
+    if ($enableOrphanTempCleanup) {
+        $orphanCleanupAttempted = $true
+        $effectiveOrphanTempRetentionHours = if ($null -ne $orphanTempRetentionHours -and [int]$orphanTempRetentionHours -gt 0) {
+            [int]$orphanTempRetentionHours
+        } else { 48 }
+        if (-not (Remove-BRAVOOrphanedTemporaryArchiveArtifacts `
+                -ArchiveDefinitions $archiveDefinitions `
+                -RetentionHours $effectiveOrphanTempRetentionHours `
+                -RemovedFileCount ([ref]$orphanCleanupDeletedCount))) {
+            $operationFailed = $true
+            $orphanCleanupSucceeded = $false
+        }
+    }
+
+    $backupRetentionCleanupAttempted = $generationCleanupAttempted -or $lunchCleanupAttempted -or $orphanCleanupAttempted
+    $backupRetentionCleanupFailed = (-not $generationCleanupSucceeded) -or $lunchCleanupConfigError -or (-not $lunchCleanupSucceeded) -or (-not $orphanCleanupSucceeded)
     # dev.16 (review round 3): OK лише коли щось РЕАЛЬНО видалено —
     # attempted+succeeded-без-видалень тепер SKIPPED "даних для очищення
     # немає", не OK. Факт-сигнали: $archiveCleanupSectionShown встановлює
@@ -6377,7 +6730,7 @@ function Main {
     # видаленням generation (не при самій лише перевірці); $lunchCleanupDeletedCount —
     # реальний $deletedCount, який Remove-OldLunchArchives вже рахує для
     # LOG. Обидва значення — факт, не вигадані числа.
-    $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0)
+    $backupRetentionCleanupDidDelete = [bool]$archiveCleanupSectionShown -or ($lunchCleanupDeletedCount -gt 0) -or ($orphanCleanupDeletedCount -gt 0)
     # dev.18: numbered [N/TOTAL] крок — раніше unnumbered
     # Write-BRAVOOperationResult. $backupRetentionCleanupPlanned (той
     # самий вираз, що Total вище і План) тепер вирішує, чи крок
@@ -6406,6 +6759,9 @@ function Main {
                     }
                     if ($lunchCleanupDeletedCount -gt 0) {
                         $retentionCleanupDetailParts += "обідніх файлів: $lunchCleanupDeletedCount"
+                    }
+                    if ($orphanCleanupDeletedCount -gt 0) {
+                        $retentionCleanupDetailParts += "осиротілих артефактів: $orphanCleanupDeletedCount"
                     }
                     $retentionCleanupDetailParts -join '; '
                 }
@@ -6466,10 +6822,12 @@ function Main {
                         $uploadQueue += [pscustomobject]@{
                             LocalPath = [string]$results[$archiveType].ArchivePath
                             RemoteDirectory = [string]$sftpDirectories[$archiveType]
+                            Component = [string]$archiveType
                         }
                         $uploadQueue += [pscustomobject]@{
                             LocalPath = [string]$results[$archiveType].HashPath
                             RemoteDirectory = [string]$sftpDirectories[$archiveType]
+                            Component = [string]$archiveType
                         }
                     }
                 }
@@ -6478,26 +6836,41 @@ function Main {
                     $uploadQueue += [pscustomobject]@{
                         LocalPath = $generationManifestPath
                         RemoteDirectory = [string]$sftpDirectories.Manifest
+                        Component = 'manifest'
                     }
                 }
 
                 $uploadTotal = $uploadQueue.Count
                 $transferResults.ArchiveUpload.Total = $uploadTotal
+                # Операторський рівень прогресу — КОМПОНЕНТНИЙ (MODEL/BLOG/
+                # BRAVOEXCH), а не файловий: mdz+sha512 одного компонента —
+                # один visible підетап; manifest — окрема коротка фаза без
+                # позиції. Тому "(1 з 3)", а не "(1 з 7)". Файлові операції
+                # й далі детально логуються у файл, як раніше.
+                $uploadComponentOrder = @(
+                    $uploadQueue | Where-Object { $_.Component -ne 'manifest' } |
+                        ForEach-Object { $_.Component } | Select-Object -Unique
+                )
+                $uploadComponentTotal = $uploadComponentOrder.Count
                 if ($uploadTotal -gt 0) {
                     Show-ScriptProgress -Status "Завантаження архiвiв на SFTP" -PercentComplete 82
                     Write-Log "==="
                     Write-Log "=== ЗАВАНТАЖЕННЯ АРХIВIВ НА SFTP ==="
                 }
-                $uploadIndex = 0
+                $currentUploadComponent = $null
                 foreach ($uploadItem in $uploadQueue) {
-                    $uploadIndex++
-                    $uploadFileName = Split-Path $uploadItem.LocalPath -Leaf
-                    Show-ItemProgress `
-                        -Id 13 `
-                        -Activity "BRAVO_ARCHIV — завантаження на SFTP" `
-                        -Item $uploadFileName `
-                        -Current $uploadIndex `
-                        -Total $uploadTotal
+                    if ($uploadItem.Component -ne $currentUploadComponent) {
+                        $currentUploadComponent = $uploadItem.Component
+                        if ($currentUploadComponent -eq 'manifest') {
+                            Show-ScriptProgress -Status "Завантаження manifest на SFTP" -PercentComplete 89
+                        } else {
+                            $uploadComponentIndex = ([array]::IndexOf($uploadComponentOrder, $currentUploadComponent) + 1)
+                            $uploadComponentProgress = 82 + [Math]::Floor((($uploadComponentIndex - 1) * 7) / [Math]::Max(1, $uploadComponentTotal))
+                            Show-ScriptProgress `
+                                -Status (Format-BRAVOSubstepPhase -Name "Завантаження $currentUploadComponent на SFTP" -Current $uploadComponentIndex -Total $uploadComponentTotal) `
+                                -PercentComplete $uploadComponentProgress
+                        }
+                    }
                     $fileUploaded = Send-FileViaWinSCP `
                         -WinSCPPath $winSCPPath `
                         -RepositorySFTPUrl $sftpUrl `
@@ -6508,7 +6881,6 @@ function Main {
                         $uploadSuccess++
                     }
                 }
-                Show-ItemProgress -Id 13 -Activity "BRAVO_ARCHIV — завантаження на SFTP" -Completed
 
                 if ($uploadTotal -gt 0) {
                     $transferResults.ArchiveUpload.Completed = $uploadSuccess
@@ -6538,18 +6910,40 @@ function Main {
                 Show-ScriptProgress -Status "Синхронiзацiя BAZA APP на SFTP" -PercentComplete 90
                 Write-Log "==="
                 Write-Log "=== СИНХРОНIЗАЦIЯ BAZA APP НА SFTP ==="
-                $bazaAppSFTPSync = Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
-                $transferResults.BAZA_APP.Success = [bool]$bazaAppSFTPSync
-                if ($null -ne $script:lastBAZASyncOutcome) {
-                    $transferResults.BAZA_APP.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
-                    $transferResults.BAZA_APP.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
-                    $transferResults.BAZA_APP.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
-                    $transferResults.BAZA_APP.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
-                }
-                if (-not $bazaAppSFTPSync) {
-                    $transferResults.BAZA_APP.Error = 'post-sync verification failed'
-                    Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP" -Level "WARNING"
-                    $operationFailed = $true
+                if (Test-BRAVOBazaIncrementalModeEnabled) {
+                    # Incremental append-only режим (safety-review): targeted
+                    # upload лише нових/pending/failed файлів замість повного
+                    # synchronize/CompareDirectories на весь каталог. Відома
+                    # прогалина відносно legacy Sync-FolderToSFTP: перевірка
+                    # сумісності імен для SFTP (Get-BAZARemoteNameCompatibilityIssues)
+                    # цим шляхом поки НЕ виконується — IncompatibleNames
+                    # завжди 0 у цьому режимі.
+                    $script:bazaAppSyncResult = Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_APP' -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
+                    $bazaAppSFTPSync = ($script:bazaAppSyncResult.Status -eq 'COMPLETE')
+                    $transferResults.BAZA_APP.Success = $bazaAppSFTPSync
+                    $transferResults.BAZA_APP.Completed = [int]($script:bazaAppSyncResult.Uploaded + $script:bazaAppSyncResult.AlreadyVerified)
+                    $transferResults.BAZA_APP.Remaining = [int]$script:bazaAppSyncResult.Failed
+                    if (-not $bazaAppSFTPSync) {
+                        $transferResults.BAZA_APP.Error = [string]$script:bazaAppSyncResult.Error
+                        Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP (incremental): $($script:bazaAppSyncResult.Status)" -Level "WARNING"
+                        $operationFailed = $true
+                    } else {
+                        Write-Log "BAZA APP: cycle $($script:bazaAppSyncResult.CycleId) — передано $($script:bazaAppSyncResult.Uploaded), вже підтверджено $($script:bazaAppSyncResult.AlreadyVerified), помилок 0" -Level "SUCCESS"
+                    }
+                } else {
+                    $bazaAppSFTPSync = Sync-FolderToSFTP -WinSCPPath $winSCPPath -RepositorySFTPUrl $sftpUrl -HostKey $sftpHostKey -LocalDirectory $bazaAppPaths.Source -RemoteDirectory $sftpDirectories.BAZA
+                    $transferResults.BAZA_APP.Success = [bool]$bazaAppSFTPSync
+                    if ($null -ne $script:lastBAZASyncOutcome) {
+                        $transferResults.BAZA_APP.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+                        $transferResults.BAZA_APP.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+                        $transferResults.BAZA_APP.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+                        $transferResults.BAZA_APP.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+                    }
+                    if (-not $bazaAppSFTPSync) {
+                        $transferResults.BAZA_APP.Error = 'post-sync verification failed'
+                        Write-Log "Каталог BAZA APP не вдалося синхронiзувати з SFTP" -Level "WARNING"
+                        $operationFailed = $true
+                    }
                 }
             } elseif ($bazaAppSFTPSyncEnabled) {
                 $transferResults.BAZA_APP.Success = $false
@@ -6565,24 +6959,41 @@ function Main {
                 Show-ScriptProgress -Status "Синхронiзацiя BAZA WWW на SFTP" -PercentComplete 91
                 Write-Log "==="
                 Write-Log "=== СИНХРОНIЗАЦIЯ BAZA WWW НА SFTP ==="
-                $bazaWWWSFTPSync = Sync-FolderToSFTP `
-                    -WinSCPPath $winSCPPath `
-                    -RepositorySFTPUrl $sftpUrl `
-                    -HostKey $sftpHostKey `
-                    -LocalDirectory $bazaWWWPaths.Source `
-                    -RemoteDirectory $sftpDirectories.BAZAWWW `
-                    -ComponentName "BAZA WWW"
-                $transferResults.BAZA_WWW.Success = [bool]$bazaWWWSFTPSync
-                if ($null -ne $script:lastBAZASyncOutcome) {
-                    $transferResults.BAZA_WWW.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
-                    $transferResults.BAZA_WWW.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
-                    $transferResults.BAZA_WWW.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
-                    $transferResults.BAZA_WWW.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
-                }
-                if (-not $bazaWWWSFTPSync) {
-                    $transferResults.BAZA_WWW.Error = 'post-sync verification failed'
-                    Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP" -Level "WARNING"
-                    $operationFailed = $true
+                if (Test-BRAVOBazaIncrementalModeEnabled) {
+                    # Той самий incremental append-only режим, що BAZA APP
+                    # вище — див. коментар там.
+                    $script:bazaWWWSyncResult = Invoke-BRAVOBazaIncrementalSync -Component 'BAZA_WWW' -LocalDirectory $bazaWWWPaths.Source -RemoteDirectory $sftpDirectories.BAZAWWW
+                    $bazaWWWSFTPSync = ($script:bazaWWWSyncResult.Status -eq 'COMPLETE')
+                    $transferResults.BAZA_WWW.Success = $bazaWWWSFTPSync
+                    $transferResults.BAZA_WWW.Completed = [int]($script:bazaWWWSyncResult.Uploaded + $script:bazaWWWSyncResult.AlreadyVerified)
+                    $transferResults.BAZA_WWW.Remaining = [int]$script:bazaWWWSyncResult.Failed
+                    if (-not $bazaWWWSFTPSync) {
+                        $transferResults.BAZA_WWW.Error = [string]$script:bazaWWWSyncResult.Error
+                        Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP (incremental): $($script:bazaWWWSyncResult.Status)" -Level "WARNING"
+                        $operationFailed = $true
+                    } else {
+                        Write-Log "BAZA WWW: cycle $($script:bazaWWWSyncResult.CycleId) — передано $($script:bazaWWWSyncResult.Uploaded), вже підтверджено $($script:bazaWWWSyncResult.AlreadyVerified), помилок 0" -Level "SUCCESS"
+                    }
+                } else {
+                    $bazaWWWSFTPSync = Sync-FolderToSFTP `
+                        -WinSCPPath $winSCPPath `
+                        -RepositorySFTPUrl $sftpUrl `
+                        -HostKey $sftpHostKey `
+                        -LocalDirectory $bazaWWWPaths.Source `
+                        -RemoteDirectory $sftpDirectories.BAZAWWW `
+                        -ComponentName "BAZA WWW"
+                    $transferResults.BAZA_WWW.Success = [bool]$bazaWWWSFTPSync
+                    if ($null -ne $script:lastBAZASyncOutcome) {
+                        $transferResults.BAZA_WWW.Degraded = [bool]$script:lastBAZASyncOutcome.IsDegraded
+                        $transferResults.BAZA_WWW.Completed = [int]$script:lastBAZASyncOutcome.CompletedCount
+                        $transferResults.BAZA_WWW.Remaining = [int]$script:lastBAZASyncOutcome.RetryableRemainingCount
+                        $transferResults.BAZA_WWW.IncompatibleNames = [int]$script:lastBAZASyncOutcome.IncompatibleRemainingCount
+                    }
+                    if (-not $bazaWWWSFTPSync) {
+                        $transferResults.BAZA_WWW.Error = 'post-sync verification failed'
+                        Write-Log "Каталог BAZA WWW не вдалося синхронiзувати з SFTP" -Level "WARNING"
+                        $operationFailed = $true
+                    }
                 }
             } elseif ($bazaWWWSFTPSyncEnabled) {
                 $transferResults.BAZA_WWW.Success = $false
@@ -6725,6 +7136,21 @@ function Main {
                 Import-Module -Name $healthModulePath -ErrorAction Stop
                 $healthParameters.RuntimeRoot = $bravoScriptDirectory
                 $healthParameters.EntryScriptPath = Join-Path $bravoScriptDirectory 'BRAVO_HEALTH.ps1'
+                # ONE synchronization, ONE SyncResult (safety-review ТЗ п.9):
+                # якщо ЦЕЙ прогін щойно виконав incremental BAZA sync, Health
+                # отримує вже готовий результат і НЕ повторює його сам —
+                # передається лише те, що реально було спробувано (Attempted),
+                # інакше Health сам вирішує, чи потрібна власна синхронізація.
+                $bazaSyncResultsForHealth = @{}
+                if ($transferResults.BAZA_APP.Attempted -and $null -ne $script:bazaAppSyncResult) {
+                    $bazaSyncResultsForHealth['BAZA_APP'] = $script:bazaAppSyncResult
+                }
+                if ($transferResults.BAZA_WWW.Attempted -and $null -ne $script:bazaWWWSyncResult) {
+                    $bazaSyncResultsForHealth['BAZA_WWW'] = $script:bazaWWWSyncResult
+                }
+                if ($bazaSyncResultsForHealth.Count -gt 0) {
+                    $healthParameters.BazaSyncResults = $bazaSyncResultsForHealth
+                }
                 $healthCheckResult = Invoke-BRAVOHealthCheck @healthParameters
                 switch ($healthCheckResult.Status) {
                     "Healthy" {
@@ -6910,7 +7336,23 @@ function Main {
             $summaryToolExitCode = $toolFailure.ToolExitCodeText
         }
     } elseif ([bool]$sftpStepFailed) {
-        $summaryReason = "Не вдалося передати архіви на SFTP"
+        # Називаємо САМЕ ті передавання, що впали. Раніше тут завжди стояло
+        # "Не вдалося передати архіви на SFTP" — навіть коли архіви
+        # завантажились успішно, а впала лише синхронізація BAZA_APP/BAZA_WWW.
+        # Через це РЕЗУЛЬТАТ суперечив сам собі: причина говорила про архіви,
+        # а поруч той самий блок показував "SFTP: резервні копії: OK".
+        $failedTransferNames = @(
+            @('ArchiveUpload', 'BAZA_APP', 'BAZA_WWW') |
+                Where-Object {
+                    [bool]$transferResults[$_].Enabled -and -not [bool]$transferResults[$_].Success
+                } |
+                ForEach-Object { [string]$transferResults[$_].Name }
+        )
+        $summaryReason = if ($failedTransferNames.Count -gt 0) {
+            "Не вдалося виконати передавання SFTP: $($failedTransferNames -join ', ')"
+        } else {
+            "Не вдалося передати архіви на SFTP"
+        }
     }
 
     Write-BRAVOResultHeader `

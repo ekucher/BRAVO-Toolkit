@@ -1,6 +1,6 @@
 ﻿@{
     RootModule = 'BRAVO.HelperLogging.psm1'
-    ModuleVersion = '5.0.2'
+    ModuleVersion = '5.1.0'
     GUID = 'e731a176-928c-45bd-91f3-dd3baafbcacf'
     PowerShellVersion = '3.0'
     FunctionsToExport = @('Start-BRAVOHelperLog', 'Complete-BRAVOHelperLog')

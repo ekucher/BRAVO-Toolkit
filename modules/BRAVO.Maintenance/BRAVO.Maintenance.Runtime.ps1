@@ -227,6 +227,24 @@ $ServicePollIntervalSeconds = if ([int]$MaintenanceConfig.Services.PollIntervalS
 }
 $RestoreDay = [int]$MaintenanceConfig.Restore.Day
 $RestoreTime = [string]$MaintenanceConfig.Restore.Time
+# Безпечне вікно АВТОМАТИЧНОЇ реставрації. Операція зупиняє служби BRAVO і
+# монопольно тримає модель, тому випадковий запуск у робочий час
+# неприпустимий. Вікно може перетинати північ (типово 21:00 -> 03:00).
+# Конфігурації без цих ключів отримують типове вікно, а не цілодобовий
+# дозвіл: відсутність явного обмеження не має означати "будь-коли".
+# -ForceRestore вікном НЕ обмежується — це свідома дія оператора.
+$RestoreWindowStart = if ($MaintenanceConfig.Restore -is [System.Collections.IDictionary] -and
+    -not [string]::IsNullOrWhiteSpace([string]$MaintenanceConfig.Restore.WindowStart)) {
+    [string]$MaintenanceConfig.Restore.WindowStart
+} else {
+    "21:00"
+}
+$RestoreWindowEnd = if ($MaintenanceConfig.Restore -is [System.Collections.IDictionary] -and
+    -not [string]::IsNullOrWhiteSpace([string]$MaintenanceConfig.Restore.WindowEnd)) {
+    [string]$MaintenanceConfig.Restore.WindowEnd
+} else {
+    "03:00"
+}
 $RESTORE_ARCHIVES_KEEP_COUNT = [int]$MaintenanceConfig.Restore.ArchivesKeepCount
 $ARCHIVE_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.ArchiveDays
 $LOG_RETENTION_DAYS = [int]$MaintenanceConfig.Retention.LogDays
@@ -318,6 +336,18 @@ $NotificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.NotificationRe
     30
 }
 $NotificationProviderDisplayName = if ($NotificationProvider -eq "discord") { "Discord" } else { "Slack" }
+
+# Банер режиму повідомлень. Саме присвоєння $script:SlackMode уже
+# зроблено вище (одразу після обчислення сирого $SlackMode) — preflight-
+# резолв webhook-URL і його валідація мають бачити ефективний режим до
+# цього моменту, тому логіка -DisableAllSlack/-EnableAllSlack там не
+# дублюється, лише перевіряється тут для друку того самого банера.
+if ($DisableAllSlack) {
+    Write-Host "Повідомлення: ВИМКНЕНО (none)" -ForegroundColor Yellow
+} elseif ($EnableAllSlack) {
+    Write-Host "Повідомлення через ${NotificationProviderDisplayName}: УСІ ПОВІДОМЛЕННЯ (all)" -ForegroundColor Green
+}
+
 # Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
 # централізований API BRAVO.Notifications; Maintenance сам канал не
 # обирає. Гейт — ЕФЕКТИВНИЙ $script:SlackMode (уже враховує
@@ -427,7 +457,49 @@ if (-not $PSBoundParameters.ContainsKey('ArchiveAfterMaintenance')) {
     $ArchiveAfterMaintenance = [string]$MaintenanceConfig.Automation.ArchiveAfterMaintenance
 }
 
+# Вікно може перетинати північ, тому це не звичайне порівняння діапазону:
+# для 21:00->03:00 дозволені і 23:30, і 01:15, але не 12:00. Рівні межі
+# трактуються як цілодобове вікно (обмеження фактично вимкнене).
+function Test-BRAVORestoreTimeWindow {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$Now,
+        [Parameter(Mandatory = $true)][TimeSpan]$WindowStart,
+        [Parameter(Mandatory = $true)][TimeSpan]$WindowEnd
+    )
+
+    if ($WindowStart -eq $WindowEnd) { return $true }
+    $nowSpan = $Now.TimeOfDay
+    if ($WindowStart -lt $WindowEnd) {
+        return ($nowSpan -ge $WindowStart -and $nowSpan -lt $WindowEnd)
+    }
+    return ($nowSpan -ge $WindowStart -or $nowSpan -lt $WindowEnd)
+}
+
+# TOCTOU-бар'єр: $shouldRestore/$restoreWindowOpen обчислюються один раз, до
+# Enter-BRAVOMaintenanceOperationLock (очікування до OperationLockWaitMinutes,
+# типово 360 хв), зупинки служб і архівації моделі перед реставрацією. За цей
+# час вікно могло закритися — стара перевірка НЕ є остаточним дозволом на
+# деструктивний bravocmd.exe. Тому це окрема, injectable-за-часом функція:
+# викликається ЗАНОВО безпосередньо перед входом у restore sequence і ще раз
+# безпосередньо перед самим bravocmd.exe (два незалежних бар'єри, той самий
+# критерій). -ForceRestore жодним із них не обмежується — свідома дія
+# оператора. $NowProvider — єдина точка ін'єкції часу для self-test (не
+# підміняє глобальний Get-Date).
+function Test-BRAVORestoreExecutionStillAllowed {
+    param(
+        [Parameter(Mandatory = $true)][TimeSpan]$WindowStart,
+        [Parameter(Mandatory = $true)][TimeSpan]$WindowEnd,
+        [bool]$ForceRestore,
+        [scriptblock]$NowProvider = { Get-Date }
+    )
+    if ($ForceRestore) { return $true }
+    $now = & $NowProvider
+    return Test-BRAVORestoreTimeWindow -Now $now -WindowStart $WindowStart -WindowEnd $WindowEnd
+}
+
 $parsedRestoreTime = [TimeSpan]::Zero
+$parsedRestoreWindowStart = [TimeSpan]::Zero
+$parsedRestoreWindowEnd = [TimeSpan]::Zero
 if ([string]::IsNullOrWhiteSpace($script:ObjectName) -or
     [string]::IsNullOrWhiteSpace($ArchivePrefix) -or
     [string]::IsNullOrWhiteSpace($BravoServiceName) -or
@@ -435,6 +507,8 @@ if ([string]::IsNullOrWhiteSpace($script:ObjectName) -or
     ($BravoWebComponentEnabled -and $BravoWebServiceCandidates.Count -eq 0) -or
     $RestoreDay -notin 1..7 -or
     -not [TimeSpan]::TryParse($RestoreTime, [ref]$parsedRestoreTime) -or
+    -not [TimeSpan]::TryParse($RestoreWindowStart, [ref]$parsedRestoreWindowStart) -or
+    -not [TimeSpan]::TryParse($RestoreWindowEnd, [ref]$parsedRestoreWindowEnd) -or
     $ARCHIVE_RETENTION_DAYS -lt 0 -or
     $LOG_RETENTION_DAYS -lt 0 -or
     $RESTORE_ARCHIVES_KEEP_COUNT -lt 0 -or
@@ -885,17 +959,6 @@ function Exit-BRAVOMaintenanceOperationLock {
     # Stale metadata file is expected; only the exclusive handle indicates
     # that Archive or Maintenance is currently active.
     $script:maintenanceOperationLockPath = $null
-}
-
-# Банер режиму повідомлень. Саме присвоєння $script:SlackMode уже
-# зроблено вище (одразу після обчислення сирого $SlackMode) — preflight-
-# резолв webhook-URL і його валідація мають бачити ефективний режим до
-# цього моменту, тому логіка -DisableAllSlack/-EnableAllSlack там не
-# дублюється, лише перевіряється тут для друку того самого банера.
-if ($DisableAllSlack) {
-    Write-Host "Повідомлення: ВИМКНЕНО (none)" -ForegroundColor Yellow
-} elseif ($EnableAllSlack) {
-    Write-Host "Повідомлення через ${NotificationProviderDisplayName}: УСІ ПОВІДОМЛЕННЯ (all)" -ForegroundColor Green
 }
 
 # Визначаємо режим автоматичного вимкнення
@@ -1787,15 +1850,67 @@ function Send-InactiveServiceWarning {
     }
 }
 
+# Bounded-очікування появи файла контролю діапазонів ID після запуску
+# служби BRAVO. Служба створює range_id_log.json асинхронно вже після
+# старту, тому одразу після Start-Service (особливо перший старт після
+# реставрації) файл може ще не існувати — одноразова перевірка давала
+# false WARNING. Цикл жорстко обмежений дедлайном (без нескінченних
+# циклів); проміжні стани — лише INFO (жодного WARNING звідси: фінальний
+# WARNING за таймаутом формує Test-RangeIdUsage нижче, рівно один раз).
+# Якщо файл уже існує — повертається одразу, без жодної затримки.
+function Wait-BRAVORangeIdLogFile {
+    param(
+        [string]$Path,
+        [int]$TimeoutSeconds,
+        [int]$IntervalSeconds = 5
+    )
+
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        return $true
+    }
+    if ($TimeoutSeconds -le 0) {
+        return $false
+    }
+
+    Write-Log -Message "Файл контролю діапазонів ID ще не створено службою BRAVO; очікування до $TimeoutSeconds сек. (інтервал $IntervalSeconds сек.): $Path" -Level "INFO"
+    $waitStartedAt = Get-Date
+    $deadline = $waitStartedAt.AddSeconds($TimeoutSeconds)
+    $interval = [Math]::Max(1, $IntervalSeconds)
+    while ((Get-Date) -lt $deadline) {
+        # TimeoutSeconds — справжня верхня межа: кожен sleep обмежується
+        # залишком бюджету, інакше останній повний інтервал міг би
+        # перевищити дедлайн на величину до IntervalSeconds.
+        $remainingSeconds = ($deadline - (Get-Date)).TotalSeconds
+        if ($remainingSeconds -le 0) { break }
+        $sleepSeconds = [Math]::Min($interval, [Math]::Max(1, [int][Math]::Ceiling($remainingSeconds)))
+        Start-Sleep -Seconds $sleepSeconds
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            $waitedSeconds = [int][Math]::Ceiling(((Get-Date) - $waitStartedAt).TotalSeconds)
+            Write-Log -Message "Файл контролю діапазонів ID з'явився через $waitedSeconds сек. після запуску BRAVO: $Path" -Level "INFO"
+            return $true
+        }
+    }
+    return $false
+}
+
 # Перевірка заповнення діапазонів ID за даними служби BRAVO
 function Test-RangeIdUsage {
     param(
         [string]$Path,
-        [double]$ThresholdPercent
+        [double]$ThresholdPercent,
+        # > 0 — call-site уже виконав bounded-очікування файла після запуску
+        # служби BRAVO (Wait-BRAVORangeIdLogFile) і не дочекався; WARNING
+        # тоді пояснює таймаут очікування, а не просто "не знайдено".
+        [int]$WaitedForFileSeconds = 0
     )
 
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        $errorMessage = "Файл контролю діапазонів ID не знайдено: $Path"
+        $missingLabel = if ($WaitedForFileSeconds -gt 0) {
+            "Файл контролю діапазонів ID не з'явився протягом $WaitedForFileSeconds сек. після запуску BRAVO"
+        } else {
+            "Файл контролю діапазонів ID не знайдено"
+        }
+        $errorMessage = "${missingLabel}: $Path"
         # dev.15: -NoConsole — виклик кроку нижче й так друкує Reason як
         # Details під рядком [N/8] (WARN), тому голий Write-Log у консоль
         # був би тим самим повідомленням удруге. LOG-файл і сповіщення
@@ -1808,7 +1923,7 @@ function Test-RangeIdUsage {
         # довгий рядок; LOG/Slack і далі отримують односрядковий $errorMessage.
         return [pscustomobject]@{
             HasIssue = $true
-            Reason = "Файл контролю діапазонів ID не знайдено:`n$Path"
+            Reason = "${missingLabel}:`n$Path"
         }
     }
 
@@ -1998,6 +2113,154 @@ function Get-BRAVONextLogSequence {
     return ($maxSequence + 1)
 }
 
+function Get-BRAVOFileLockingProcess {
+    # Хто саме тримає файл. Windows повідомляє лише "The process cannot access
+    # the file because it is being used by another process", не називаючи
+    # винуватця — і оператор лишається без єдиного факту, потрібного для
+    # рішення. Реальний випадок: невдала реставрація (bravocmd.exe) залишала
+    # процес, який тримав TraceSRV.out, і ротація trace падала вже після того,
+    # як служби були зупинені.
+    #
+    # Restart Manager (rstrtmgr.dll) — штатний API Windows саме для цього
+    # питання; він лише ЧИТАЄ список і нічого не зупиняє. Функція суто
+    # діагностична: будь-яка її помилка не має впливати на результат ротації,
+    # тому вона ніколи не кидає виняток і повертає порожній масив, коли
+    # визначити тримача не вдалося.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    $lockingProcesses = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return $lockingProcesses.ToArray()
+    }
+
+    try {
+        if (-not ('BRAVOFileLockInspector' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+
+public static class BRAVOFileLockInspector
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct RM_UNIQUE_PROCESS
+    {
+        public int dwProcessId;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+    }
+
+    private const int CCH_RM_MAX_APP_NAME = 255;
+    private const int CCH_RM_MAX_SVC_NAME = 63;
+    private const int ERROR_MORE_DATA = 234;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct RM_PROCESS_INFO
+    {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+        public string strServiceShortName;
+        public int ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmEndSession(uint pSessionHandle);
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    private static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
+        uint nApplications, [In] RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+
+    [DllImport("rstrtmgr.dll")]
+    private static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded,
+        ref uint pnProcInfo, [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+
+    public static List<string> GetHolders(string path)
+    {
+        List<string> holders = new List<string>();
+        uint sessionHandle;
+        if (RmStartSession(out sessionHandle, 0, Guid.NewGuid().ToString()) != 0)
+        {
+            return holders;
+        }
+        try
+        {
+            string[] resources = new string[] { path };
+            if (RmRegisterResources(sessionHandle, (uint)resources.Length, resources, 0, null, 0, null) != 0)
+            {
+                return holders;
+            }
+            uint needed = 0;
+            uint count = 0;
+            uint reasons = 0;
+            int result = RmGetList(sessionHandle, out needed, ref count, null, ref reasons);
+            if (result != ERROR_MORE_DATA || needed == 0)
+            {
+                return holders;
+            }
+            RM_PROCESS_INFO[] infos = new RM_PROCESS_INFO[needed];
+            count = needed;
+            if (RmGetList(sessionHandle, out needed, ref count, infos, ref reasons) != 0)
+            {
+                return holders;
+            }
+            for (int i = 0; i < count; i++)
+            {
+                string name = infos[i].strAppName;
+                try
+                {
+                    name = System.Diagnostics.Process.GetProcessById(infos[i].Process.dwProcessId).ProcessName;
+                }
+                catch
+                {
+                    // Процес міг завершитися між запитом і уточненням імені —
+                    // тоді лишається ім'я, яке повернув Restart Manager.
+                }
+                string service = infos[i].strServiceShortName;
+                if (!string.IsNullOrEmpty(service))
+                {
+                    holders.Add(name + " (PID " + infos[i].Process.dwProcessId + ", служба " + service + ")");
+                }
+                else
+                {
+                    holders.Add(name + " (PID " + infos[i].Process.dwProcessId + ")");
+                }
+            }
+        }
+        finally
+        {
+            RmEndSession(sessionHandle);
+        }
+        return holders;
+    }
+}
+'@
+        }
+        foreach ($holder in [BRAVOFileLockInspector]::GetHolders($Path)) {
+            if (-not [string]::IsNullOrWhiteSpace($holder)) {
+                [void]$lockingProcesses.Add([string]$holder)
+            }
+        }
+    } catch {
+        # Restart Manager недоступний, компіляція не вдалася або доступ
+        # обмежено. Це лише діагностика — мовчки віддаємо порожній результат,
+        # а викликач напише, що тримача визначити не вдалося.
+    }
+
+    # .ToArray(), а не @($lockingProcesses): загортання порожнього
+    # System.Collections.Generic.List[string]... тут безпечне, але масив
+    # робить контракт функції однозначним для викликача під Set-StrictMode.
+    return $lockingProcesses.ToArray()
+}
+
 function Move-BRAVOLogWithSequence {
     # Переміщення одного журналу в <DestinationDirectory>\<BaseName>_<N><Ext>.
     #
@@ -2160,11 +2423,25 @@ function Move-BRAVOLogWithSequence {
         }
     }
 
+    # Тримача файлу з'ясовуємо РІВНО один раз — на фінальній відмові, а не в
+    # кожній спробі: запит до Restart Manager коштує часу, а для рішення
+    # оператора достатньо одного разу. Перевірка не залежить від тексту
+    # системного повідомлення (він локалізований і покладатися на англійський
+    # рядок не можна) — тому виконується завжди, поки джерело ще на місці.
+    $lockingSuffix = ''
+    if (Test-Path -LiteralPath $SourcePath -PathType Leaf) {
+        $lockingProcesses = @(Get-BRAVOFileLockingProcess -Path $SourcePath)
+        $lockingSuffix = if ($lockingProcesses.Count -gt 0) {
+            "; файл утримує: $($lockingProcesses -join ', ')"
+        } else {
+            '; тримача файлу визначити не вдалося'
+        }
+    }
     Write-BRAVOLogRotationMessage `
         -Logger $Logger `
-        -Message "ПОМИЛКА: не вдалося перемістити ${displayPrefix}${sourceName} до $DestinationDirectory після $attemptsUsed спроб: $lastError" `
+        -Message "ПОМИЛКА: не вдалося перемістити ${displayPrefix}${sourceName} до $DestinationDirectory після $attemptsUsed спроб: ${lastError}${lockingSuffix}" `
         -Level "ERROR"
-    return (& $buildResult 'ERROR' $null $null $originalLength $null $null $lastError)
+    return (& $buildResult 'ERROR' $null $null $originalLength $null $null "${lastError}${lockingSuffix}")
 }
 
 function New-BRAVOLogRotationSummary {
@@ -3289,9 +3566,14 @@ function Invoke-CommandWithLog {
     }
 
     if (-not [string]::IsNullOrWhiteSpace($formattedOutput)) {
-        Write-Log "Деталі виконання:$formattedOutput" -Level "DEBUG"
+        # На успіху це шум, на помилці — єдине джерело причини. Вивід
+        # bravocmd/7-Zip писався в DEBUG, а промислові розгортання працюють
+        # на INFO: коли реставрація впала з кодом 11153, у журналі лишився
+        # сам код без жодного пояснення від інструмента.
+        $outputLevel = if ($exitCode -eq 0) { "DEBUG" } else { "ERROR" }
+        Write-Log "Деталі виконання:$formattedOutput" -Level $outputLevel
     }
-    
+
     return $exitCode
 }
 
@@ -4292,8 +4574,46 @@ function Test-BRAVOTaskWasMissed {
 $missedMaintenanceTask = Test-BRAVOTaskWasMissed -TaskName 'Maintenance' -ScheduledTime ([string]$schedulerSettings.Maintenance.DailyAt)
 $missedBackupTask = Test-BRAVOTaskWasMissed -TaskName 'Backup' -ScheduledTime ([string]$schedulerSettings.Backup.DailyAt)
 $missedDailyWork = $missedMaintenanceTask -or $missedBackupTask
-$shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($RunMissedRestoreOnly -and $missedRestore) -or ($isRestoreDay -and $isAfterRestoreTime -and -not (Test-Path $MARKER_FILE)))
-$restoreReason = if ($ForceRestore) { "Примусово" } elseif ($RunMissedRestoreOnly) { "Пропущений плановий слот $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm'))" } else { "$RestoreDayName, після $RestoreTime" }
+$restoreWindowOpen = Test-BRAVORestoreTimeWindow `
+    -Now $currentDate `
+    -WindowStart $parsedRestoreWindowStart `
+    -WindowEnd $parsedRestoreWindowEnd
+# Легка перевірка узгодженості конфігурації: якщо Maintenance.DailyAt НЕ
+# потрапляє у вікно Restore.WindowStart/WindowEnd, ЦЕЙ конкретний нічний
+# прогін Maintenance не підхопить $missedRestoreDue — але це вже не
+# втрата автоматики: Recovery-завдання має власний, безумовний daily
+# trigger рівно на Restore.WindowStart (BRAVO_TASKS_INSTALL.ps1,
+# New-BRAVOTaskDefinition), незалежний від Maintenance.DailyAt і від
+# Restore.RunMissedOnStartup (той керує лише додатковим boot-trigger).
+# Попередження нижче ($maintenanceDailyAtInsideRestoreWindow) лишається
+# інформаційним — не про втрату шляху, а про те, що саме ЦЕЙ прогін
+# участі не бере.
+$maintenanceDailyAtSpan = [TimeSpan]::Zero
+$maintenanceDailyAtInsideRestoreWindow = [TimeSpan]::TryParse([string]$schedulerSettings.Maintenance.DailyAt, [ref]$maintenanceDailyAtSpan) -and
+    (Test-BRAVORestoreTimeWindow -Now $currentDate.Date.Add($maintenanceDailyAtSpan) -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd)
+# Вікном обмежені саме АВТОМАТИЧНІ шляхи. Boot-recovery пропущеного слоту —
+# найімовірніше джерело випадкового денного запуску: сервер вмикають уранці,
+# і без цієї умови реставрація почалася б на робочій моделі о 09:00.
+$scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Path $MARKER_FILE)
+# НЕ прив'язуємо до -RunMissedRestoreOnly: той прапорець позначає лише те,
+# що цей конкретний прогін BRAVO_MAINTENANCE.ps1 стартував через Recovery
+# (daily АБО boot trigger — обидва передають той самий прапорець, обидва
+# викликають той самий Action). Надійний "наступного дня у дозволеному
+# вікні" шлях сьогодні НЕ один: (1) Recovery-завдання має власний,
+# безумовний daily trigger на Restore.WindowStart (не залежить від
+# Maintenance.DailyAt чи reboot), і (2) опційно ще й boot-trigger, коли
+# Restore.RunMissedOnStartup=true (швидша реакція одразу після
+# перезавантаження). Щоденний таск Maintenance (23:55, за замовчуванням у
+# самому вікні) — ТРЕТІЙ, додатковий шлях, коли DailyAt збігається з
+# вікном, але вже не єдиний і не обов'язковий. $missedRestore сам по собі
+# персистентний (BRAVO_RESTORE_STATE.json / маркер конкретного
+# $scheduledOccurrence), тому перевірка на будь-якому з цих прогонів не
+# створює дублювання.
+$missedRestoreDue = $missedRestore
+$automaticRestoreDue = $scheduledRestoreDue -or $missedRestoreDue
+$restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore
+$shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and $restoreWindowOpen))
+$restoreReason = if ($ForceRestore) { "Примусово" } elseif ($missedRestoreDue) { "Пропущений плановий слот $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm'))" } else { "$RestoreDayName, після $RestoreTime" }
 $CheckSize = -not $DisableSizeCheck
 if ($RunMissedRestoreOnly -and $missedDailyWork) {
     # Recovery завжди завершується актуальним backup після maintenance.
@@ -4512,12 +4832,25 @@ if (-not $script:BRAVOToolManifest.IsValid) {
 }
 Write-Log -Message "Перевірка вільного місця: усі локальні диски; виключення: $freeSpaceExclusionsText" -NoTimestamp
 if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
-    Write-Log -Message "Контроль діапазонів ID: понад $($RangeIdThresholdPercent)% у $RangeIdLogPath" -NoTimestamp
+    # Формулювання називає поріг контролю, а не поточний стан: старий текст
+    # "понад N% у <файл>" читався так, ніби використання ВЖЕ перевищило поріг.
+    Write-Log -Message "Контроль діапазонів ID: УВІМКНЕНО; поріг >$($RangeIdThresholdPercent)%; файл: $RangeIdLogPath" -NoTimestamp
 }
 Write-Log -Message "Дата: $($currentDate.ToString('yyyy-MM-dd'))" -NoTimestamp
 Write-Log -Message "Час: $($currentDate.ToString('HH:mm:ss'))" -NoTimestamp
-if ($RunMissedRestoreOnly -and -not $missedDailyWork) {
-    Write-Log -Message "Recovery: пропущених Backup/Maintenance не знайдено; завершення без дій" -Level 'INFO'
+# $missedDailyWork (пропущений денний Backup/Maintenance) — не єдина причина
+# продовжувати: якщо пропущено САМЕ реставрацію ($missedRestoreDue) і вікно
+# зараз відкрите, Recovery має дійти до звичайного кроку реставрації нижче,
+# а не вийти без дій. Якщо вікно ще зачинене — реставрація однаково
+# нездійсненна цього тику, тому компактний no-op-вихід лишається, лише з
+# окремим повідомленням про причину очікування.
+$missedRestoreActionableNow = $missedRestoreDue -and $restoreWindowOpen
+if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreActionableNow) {
+    if ($missedRestoreDue) {
+        Write-Log -Message "Recovery: пропущена реставрація очікує на вікно $RestoreWindowStart-$RestoreWindowEnd; повторна спроба за $([int]$schedulerSettings.Recovery.RetryEveryMinutes) хв" -Level 'INFO'
+    } else {
+        Write-Log -Message "Recovery: пропущених Backup/Maintenance не знайдено; завершення без дій" -Level 'INFO'
+    }
     # dev.16: раніше тут був голий "exit 0" без жодного підсумку —
     # оператор бачив заголовок і План операцій (вище), а потім одразу
     # "Натисніть будь-яку клавішу..." від зовнішнього finally, без
@@ -4564,7 +4897,33 @@ if ($BravoMaintenanceEnabled) {
 
     Write-Log -Message "Реставрація моделі: $(if ($shouldRestore) {"АКТИВОВАНА ($restoreReason)"} else {"ВИМКНЕНА"})" -NoTimestamp
     Write-Log -Message "Перевірка розмірів файлів: $(if ($CheckSize) {'УВІМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
-    Write-Log -Message "Умови: заданий день=$isRestoreDay, після $RestoreTime=$isAfterRestoreTime" -NoTimestamp
+    Write-Log -Message "Умови: заданий день=$isRestoreDay, після $RestoreTime=$isAfterRestoreTime; вікно $RestoreWindowStart-$RestoreWindowEnd=$restoreWindowOpen" -NoTimestamp
+    # Пропуск через вікно — не тиха відмова: без цього рядка оператор бачив
+    # би лише "ВИМКНЕНА" й не мав би причини.
+    if ($restoreSkippedByWindow) {
+        Write-Log -Message (
+            "Реставрацію пропущено: поточний час $($currentDate.ToString('HH:mm')) поза дозволеним вікном " +
+            "$RestoreWindowStart-$RestoreWindowEnd. Для позапланового запуску використайте -ForceRestore."
+        ) -Level "WARNING"
+    }
+    if ($ForceRestore -and -not $restoreWindowOpen) {
+        Write-Log -Message (
+            "Примусова реставрація поза дозволеним вікном $RestoreWindowStart-$RestoreWindowEnd " +
+            "(поточний час $($currentDate.ToString('HH:mm'))): служби BRAVO будуть зупинені."
+        ) -Level "WARNING"
+    }
+    if (-not $maintenanceDailyAtInsideRestoreWindow) {
+        # INFO, не WARNING: Recovery-таск має власний daily trigger саме на
+        # Restore.WindowStart (BRAVO_TASKS_INSTALL.ps1, New-BRAVOTaskDefinition),
+        # тому підхоплення пропущеної реставрації НЕ втрачається через
+        # розсинхронізацію Maintenance.DailyAt і вікна — лише не бере участі
+        # цей конкретний нічний прогін.
+        Write-Log -Message (
+            "Maintenance.DailyAt ($($schedulerSettings.Maintenance.DailyAt)) поза вікном Restore " +
+            "$RestoreWindowStart-${RestoreWindowEnd}: підхоплення пропущеної реставрації цим нічним " +
+            "прогоном недоступне; використовується daily Recovery-тригер о $RestoreWindowStart і boot-recovery."
+        ) -Level "INFO"
+    }
 }
 # ===== ВИЯВЛЕННЯ ДЖЕРЕЛ ЖУРНАЛІВ =====
 # Виконується ДО зупинки служб і до будь-якого переміщення: коли служби вже
@@ -4873,6 +5232,11 @@ $exchangAPILogsProcessedCount = 0
 $webApacheLogsProcessedCount = 0
 $webWwwLogsProcessedCount = 0
 $restoreCompletedAt = $null
+# Чи запускала службу BRAVO САМЕ ця сесія maintenance (блок відновлення
+# стану служб нижче). Одразу після такого старту range_id_log.json може ще
+# не існувати (служба створює його асинхронно) — крок контролю діапазонів
+# ID використовує прапорець, щоб дочекатися файла замість false WARNING.
+$script:bravoServiceStartedThisRun = $false
 
 try {
 $serviceWasRunning = @{
@@ -5062,6 +5426,11 @@ Write-BRAVOProgressPhase -Phase 'Реставрація моделі' -PercentCo
 $restoreCriticalBefore = $script:criticalErrorOccurred
 $restoreWarningsBefore = $script:BRAVOWarningCount
 $restoreStepReported = $false
+# Ініціалізується безумовно (не лише всередині бар'єрів нижче) — інакше під
+# Set-StrictMode посилання на неї у fallback Details ('Реставрація моделі')
+# кидає виняток, коли до бар'єрів узагалі не доходимо ($shouldRestore=false
+# від самого початку, або службу BRAVO не вдалося зупинити).
+$restorePostponedByWindowClosing = $false
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
 # коли BRAVO зупинити не вдалося.
@@ -5069,6 +5438,23 @@ $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
 $bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
 if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
+    # P0 TOCTOU barrier 1 (перед входом у restore sequence): $shouldRestore
+    # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
+    # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
+    # — вікно могло вже закритися. Переоцінюємо ЗАРАЗ, а не довіряємо
+    # старому знімку. -ForceRestore барʼєром не обмежується.
+    if ($shouldRestore -and -not $ForceRestore -and
+        -not (Test-BRAVORestoreExecutionStillAllowed `
+            -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
+            -ForceRestore $ForceRestore)) {
+        $restorePostponedByWindowClosing = $true
+        $shouldRestore = $false
+        Write-Log -Message (
+            "Реставрацію відкладено: вікно $RestoreWindowStart-$RestoreWindowEnd закрилося під час " +
+            "очікування lock/підготовки (заплановано було: $restoreReason). Плановий слот лишається " +
+            "непозначеним як виконаний — наступний daily Recovery-тригер повторить спробу в межах вікна."
+        ) -Level "WARNING"
+    }
     if ($shouldRestore) {
         try {
             Write-Log -Message "==="
@@ -5137,12 +5523,36 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 $script:restoreIntegrityFailed = $true
             } else {
                 Write-Log -Message "Архів моделі перед реставрацією створено та перевірено -> $beforeArchivePath" -Level "SUCCESS"
-                
-                # Виконання реставрації через bravocmd.exe (як в еталоні)
-                $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
-                $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
-                
-                if ($exitCode -eq 0) {
+
+                # P0 TOCTOU barrier 2 (point-of-no-return): останній момент
+                # перед ДЕСТРУКТИВНИМ bravocmd.exe. Barrier 1 (перед входом у
+                # цю послідовність) не покриває час самої архівації моделі
+                # перед реставрацією (7-Zip на великій моделі може тривати
+                # довго) — вікно могло закритися саме тут. -ForceRestore
+                # барʼєром не обмежується.
+                if (-not (Test-BRAVORestoreExecutionStillAllowed `
+                        -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
+                        -ForceRestore $ForceRestore)) {
+                    $restorePostponedByWindowClosing = $true
+                    $exitCode = $null
+                    Write-Log -Message (
+                        "Реставрацію скасовано безпосередньо перед bravocmd.exe: вікно " +
+                        "$RestoreWindowStart-$RestoreWindowEnd закрилося під час архівації моделі перед " +
+                        "реставрацією. bravocmd.exe НЕ викликано; архів перед реставрацією збережено: " +
+                        "$beforeArchivePath. Плановий слот лишається непозначеним як виконаний — " +
+                        "наступний daily Recovery-тригер повторить спробу в межах вікна."
+                    ) -Level "WARNING"
+                } else {
+                    # Виконання реставрації через bravocmd.exe (як в еталоні)
+                    $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
+                    $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                }
+
+                if ($restorePostponedByWindowClosing) {
+                    # Постановка на паузу — НЕ помилка: bravocmd не викликаний,
+                    # маркер/state не пишуться, гілки exitCode -eq/-ne 0 нижче
+                    # свідомо не виконуються (exitCode -eq $null для обох).
+                } elseif ($exitCode -eq 0) {
                     $restoreCompletedAt = Get-Date
                     Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"
                     
@@ -5379,8 +5789,10 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 # рендеритись ДО «Обробка trace і логів» [6/8] — той самий порядок, що в
 # затвердженому operator contract, незалежно від того, чи справді
 # виконувалась реставрація цього прогону. Сюди потрапляємо, якщо основна
-# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з двох причин,
+# гілка (рядок ~4680, $shouldRestore) її не надрукувала — з трьох причин,
 # які варто розрізняти в Details:
+# - вікно закрилося під час очікування lock/підготовки (Barrier 1) — було
+#   заплановано, безпечно відкладено, наступний daily Recovery повторить;
 # - $shouldRestore було true, але службу BRAVO не вдалося зупинити —
 #   заплановане й невиконане, а не «не настав час»;
 # - $shouldRestore було false від самого початку — реставрація цього
@@ -5396,7 +5808,11 @@ if (-not $restoreStepReported) {
     Write-BRAVOMaintenanceStep `
         -Name 'Реставрація моделі' `
         -Status 'SKIPPED' `
-        -Details $(if ($shouldRestore) { 'службу BRAVO не було зупинено' } else { 'не заплановано на цей запуск' })
+        -Details $(
+            if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
+            elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
+            else { 'не заплановано на цей запуск' }
+        )
 }
 
 # Підсумковий рядок етапу — поза блоком BRAVO Web. Раніше він стояв
@@ -5448,6 +5864,7 @@ try {
             -PollIntervalSeconds $ServicePollIntervalSeconds
         if ($serviceResult.Success) {
             Write-Log -Message "Служба $BravoServiceName успішно запущена" -Level "SUCCESS"
+            $script:bravoServiceStartedThisRun = $true
         } else {
             $errorMsg = "$BravoServiceName не запустився автоматично: $($serviceResult.Error)"
             Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
@@ -5568,9 +5985,25 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
     # саме цей виклик його підняв (якщо він уже був true до виклику —
     # від чогось іншого, — не займаємо його). CriticalErrorsList/сповіщення
     # errors_only Send-SlackAlert формує так само, як і раніше.
+    # Якщо службу BRAVO запускав саме цей прогін, файл діапазонів ID може
+    # ще не існувати — BRAVO створює його асинхронно після старту. Bounded-
+    # очікування (до 30 сек., крок 5 сек.) застосовується ЛИШЕ коли файл
+    # відсутній І службу запускали ми: звичайний прогін з наявним файлом не
+    # отримує жодної затримки, а прогін без рестарту служби зберігає
+    # негайний WARNING, як раніше. Якщо файл так і не з'явився —
+    # Test-RangeIdUsage нижче формує рівно один WARNING з текстом таймауту.
+    $rangeIdWaitTimeoutSeconds = if ($script:bravoServiceStartedThisRun) { 30 } else { 0 }
+    $rangeIdFileAppeared = Wait-BRAVORangeIdLogFile `
+        -Path $RangeIdLogPath `
+        -TimeoutSeconds $rangeIdWaitTimeoutSeconds
+    $rangeIdWaitedForFileSeconds = if (-not $rangeIdFileAppeared -and $rangeIdWaitTimeoutSeconds -gt 0) {
+        $rangeIdWaitTimeoutSeconds
+    } else {
+        0
+    }
     $rangeIdWarningsBefore = $script:BRAVOWarningCount
     $rangeIdCriticalBefore = $script:criticalErrorOccurred
-    $rangeIdCheckResult = Test-RangeIdUsage -Path $RangeIdLogPath -ThresholdPercent $RangeIdThresholdPercent
+    $rangeIdCheckResult = Test-RangeIdUsage -Path $RangeIdLogPath -ThresholdPercent $RangeIdThresholdPercent -WaitedForFileSeconds $rangeIdWaitedForFileSeconds
     $rangeIdHasWarning = $script:BRAVOWarningCount -gt $rangeIdWarningsBefore
     if (-not $rangeIdCriticalBefore -and $script:criticalErrorOccurred) {
         $script:criticalErrorOccurred = $false

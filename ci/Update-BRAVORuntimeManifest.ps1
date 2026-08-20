@@ -36,6 +36,10 @@ $includedExtensions = @('.ps1', '.psm1', '.psd1')
 # Відносні шляхи, не самі лише імена: TOOLS_MANIFEST.json лежить у
 # Tools\ (поруч із самими утилітами), а не в корені комплекту.
 $includedExtraFiles = @('VERSION.json', 'Tools\TOOLS_MANIFEST.json')
+# .claude — локальні файли асистентського середовища розробника (hooks,
+# правила): git-ignored, ніколи не входять у production-комплект. Без
+# виключення локально згенерований манфест розійшовся б із CI-checkout
+# (де .claude/hooks не існує) і зламав би "Integrity manifests are current".
 $excludedDirectoryPattern = '^(LOGS|\.git|\.vscode|\.claude|local-backups)[\\/]'
 
 $rootPrefixLength = $Root.TrimEnd('\', '/').Length + 1

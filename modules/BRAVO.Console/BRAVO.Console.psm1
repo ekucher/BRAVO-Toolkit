@@ -307,6 +307,67 @@ function Format-BRAVODuration {
     return '{0:mm}:{0:ss}' -f $Duration
 }
 
+# ---------------------------------------------------------------------
+# Канонічні progress-хелпери для multi-substep етапів (console UX).
+# Одна реалізація для archive/SFTP/NAS/BAZA — а не майже-однакові
+# рядки-формати, розкидані по call-site-ах Runtime-скриптів.
+# Format-BRAVODuration (mm:ss) лишається форматом ТАБЛИЦІ результатів;
+# для живого running-рядка канон — людське "7 сек." / "1 хв. 24 сек.".
+# ---------------------------------------------------------------------
+
+function Format-BRAVOElapsedText {
+    # "7 сек." | "1 хв. 24 сек." | "2 год. 05 хв. 09 сек."
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][int]$TotalSeconds)
+
+    if ($TotalSeconds -lt 0) { $TotalSeconds = 0 }
+    if ($TotalSeconds -lt 60) {
+        return "$TotalSeconds сек."
+    }
+    $elapsedMinutes = [math]::Floor($TotalSeconds / 60)
+    $remainderSeconds = $TotalSeconds % 60
+    if ($elapsedMinutes -lt 60) {
+        return "$elapsedMinutes хв. $remainderSeconds сек."
+    }
+    $elapsedHours = [math]::Floor($elapsedMinutes / 60)
+    $remainderMinutes = $elapsedMinutes % 60
+    return ('{0} год. {1:00} хв. {2:00} сек.' -f $elapsedHours, $remainderMinutes, $remainderSeconds)
+}
+
+function Format-BRAVOSubstepPhase {
+    # "Архiвацiя MODEL (1 з 3)" — операторський підетап у межах одного
+    # numbered етапу. Для Total<=1 суфікс позиції не має сенсу й опускається.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [Parameter(Mandatory = $true)][int]$Current,
+        [Parameter(Mandatory = $true)][int]$Total
+    )
+
+    if ($Total -le 1) {
+        return $Name
+    }
+    return ('{0} ({1} з {2})' -f $Name, $Current, $Total)
+}
+
+function Format-BRAVORunningDetail {
+    # Канонічний running-рядок: "Виконується 7 сек." /
+    # "Виконується 1 хв. 24 сек.; поточний розмiр: 44,0 МБ".
+    # Єдине формулювання (НЕ "Виконується, минуло ...") для всіх моніторингових
+    # циклів; опційна деталь дописується через "; ".
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$ElapsedSeconds,
+        [AllowNull()][AllowEmptyString()][string]$Detail
+    )
+
+    $runningText = 'Виконується {0}' -f (Format-BRAVOElapsedText -TotalSeconds $ElapsedSeconds)
+    if (-not [string]::IsNullOrWhiteSpace($Detail)) {
+        $runningText = '{0}; {1}' -f $runningText, $Detail
+    }
+    return $runningText
+}
+
 # Ширина, до якої лівим краєм доповнюється текст статусу перед тривалістю —
 # "OK"/"WARNING"/"ERROR"/"PASS"/"SKIPPED" усі вирівнюються по одній колонці
 # (docs/MANUAL_RUN_CONSOLE_UX.md: "OK       09:41", "ERROR    00:07").
@@ -922,6 +983,9 @@ Export-ModuleMember -Function @(
     'Complete-BRAVOProgress',
     'Format-BRAVOFileSize',
     'Format-BRAVODuration',
+    'Format-BRAVOElapsedText',
+    'Format-BRAVOSubstepPhase',
+    'Format-BRAVORunningDetail',
     'Write-BRAVOHeader',
     'Write-BRAVOFinalSummaryHeader',
     'Write-BRAVOFinalSummaryFooter',

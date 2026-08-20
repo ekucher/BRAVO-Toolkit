@@ -24,13 +24,26 @@ $dryRunConsoleModulePath = Join-Path $PSScriptRoot "modules\BRAVO.Console\BRAVO.
 Import-Module -Name $dryRunConsoleModulePath -ErrorAction Stop
 $notificationHelpersPath = Join-Path $PSScriptRoot "modules\BRAVO.Notifications\BRAVO.Notifications.psd1"
 Import-Module -Name $notificationHelpersPath -ErrorAction Stop
+# Get-BRAVOTaskRootReadinessResults: canonical LIMSRoot/SystemLogRoot/
+# BackupRoot readiness, спільна з BRAVO_TASKS_INSTALL.ps1 (не дублюється).
+$dryRunSystemModulePath = Join-Path $PSScriptRoot "modules\BRAVO.System\BRAVO.System.psd1"
+Import-Module -Name $dryRunSystemModulePath -ErrorAction Stop
 
 # Безпечна симуляція BRAVO/VETOFFICE:
-# - не створює архіви та каталоги;
-# - не копіює, не синхронізує і не видаляє файли;
+# - не створює архіви, не копіює, не синхронізує і не видаляє файли;
 # - не змінює служби або Планувальник завдань;
 # - надсилає тестове Slack/Discord повідомлення лише з -SendTestNotification.
 # -TestAccess виконує лише read-only мережеві перевірки.
+#
+# Каталоги — окремий, точний контракт (не "ніколи"): local write-probe
+# (Test-BRAVOFileSystemWriteAccess) для required/production destination
+# коренів реально СТВОРЮЄ відсутній каталог, щоб відрізнити "ще не існує"
+# від "немає прав" — це і є перевірка готовності запису, а не побічний
+# ефект, якого можна уникнути. Якщо каталог створив саме цей probe і після
+# перевірки він лишився порожнім, probe прибирає його за собою; непорожній
+# каталог (з чужим вмістом) не чіпається. Remote SFTP-перевірки (нижче) —
+# дійсно суворо read-only: жодного каталогу на віддаленому боці не
+# створюється й не видаляється.
 
 $ErrorActionPreference = "Stop"
 $script:dryRunResults = New-Object System.Collections.ArrayList
@@ -135,6 +148,8 @@ function Test-BRAVOFileSystemWriteAccess {
 
     $probePath = Join-Path $Path ("BRAVO_WRITE_PROBE_{0}.tmp" -f [guid]::NewGuid().ToString("N"))
     $probeBytes = [byte[]](0x42, 0x52, 0x41, 0x56, 0x4F)
+    $probeSuccess = $false
+    $probeFailureDetail = $null
     try {
         [IO.File]::WriteAllBytes($probePath, $probeBytes)
         $readBack = [IO.File]::ReadAllBytes($probePath)
@@ -146,17 +161,52 @@ function Test-BRAVOFileSystemWriteAccess {
                 throw "вміст probe-файла не збігається"
             }
         }
-        return [pscustomobject]@{
-            Success = $true
-            Detail = "запис/читання/видалення підтверджено: $Path$(if ($createdDirectory) { ' (каталог створено)' })"
-        }
+        $probeSuccess = $true
     } catch {
-        return [pscustomobject]@{ Success = $false; Detail = "запис у $Path неможливий: $($_.Exception.Message)" }
+        $probeFailureDetail = "запис у $Path неможливий: $($_.Exception.Message)"
     } finally {
         if (Test-Path -LiteralPath $probePath -PathType Leaf) {
             Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
         }
     }
+
+    # Тимчасовий probe не повинен лишати production-каталог, якого до нього
+    # не існувало: якщо каталог створив САМЕ ЦЕЙ виклик і після видалення
+    # probe-файла він лишився порожнім, прибираємо і каталог — інакше "dry"
+    # run (заголовок скрипта прямо обіцяє "не створює каталоги") насправді
+    # лишає за собою побічний ефект на диску. Непорожній каталог (щось інше
+    # паралельно туди щось поклало) НЕ видаляється — це вже не "прибирання
+    # за собою", а втрата чужих даних.
+    $directoryCleanedUp = $false
+    if ($createdDirectory -and (Test-Path -LiteralPath $Path -PathType Container)) {
+        $remainingItems = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+        if ($remainingItems.Count -eq 0) {
+            try {
+                Remove-Item -LiteralPath $Path -Force -ErrorAction Stop
+                $directoryCleanedUp = $true
+            } catch {
+                # Не критично для readiness-результату: сам probe уже
+                # підтвердив (або спростував) запис/читання; неможливість
+                # прибрати порожній каталог після себе — залишковий побічний
+                # ефект, не провал перевірки прав.
+            }
+        }
+    }
+
+    if ($probeSuccess) {
+        $createdNote = if (-not $createdDirectory) {
+            ''
+        } elseif ($directoryCleanedUp) {
+            ' (каталог тимчасово створювався для перевірки й прибраний після неї)'
+        } else {
+            ' (каталог створено; лишився на диску)'
+        }
+        return [pscustomobject]@{
+            Success = $true
+            Detail = "запис/читання/видалення підтверджено: $Path$createdNote"
+        }
+    }
+    return [pscustomobject]@{ Success = $false; Detail = $probeFailureDetail }
 }
 
 function Test-SettingEnabled {
@@ -174,9 +224,14 @@ function Test-SettingEnabled {
 }
 
 function Get-BRAVODryRunConfiguredServiceState {
-    # Discovery returns eligible services, but a Disabled installed service is
-    # deliberately absent from that result. Probe only known names so Dry Run
-    # can preserve the distinction without importing Maintenance runtime.
+    # Discovery (Resolve-BRAVOInstallationDiscovery) now includes Disabled
+    # services too (safety-review: service run-state does not affect path
+    # identity) but only exposes the discovered name/executable, not a
+    # structured Disabled flag Dry Run can branch on. This probe is
+    # deliberately independent of Discovery: it queries known service names
+    # directly to get Exists/Disabled/Name for the "should Dry Run plan
+    # log-rotation readiness for this optional component" decision, without
+    # importing the Maintenance runtime.
     param(
         [string]$DiscoveredServiceName,
         [string[]]$ServiceCandidates
@@ -231,11 +286,19 @@ function Get-BRAVODryRunOptionalComponentPlan {
 
     $bravoWebEligible = $BravoWebEnabled -and $BravoWebServiceExists -and -not $BravoWebServiceDisabled
     $exchangeApiEligible = $ExchangeApiServiceExists -and -not $ExchangeApiServiceDisabled
+    # SystemLogRoot може легітимно бути порожнім (safety-review: служба
+    # BRAVO відсутня; LIMSRoot/SystemLogRoot більше не throw-ляться в
+    # BRAVO.config). [IO.Path]::Combine("", "exchangAPI") мовчки повертає
+    # ВІДНОСНИЙ шлях "exchangAPI" замість кидання винятку чи порожнього
+    # рядка — подальший write-probe створив би каталог у поточній
+    # директорії процесу. Похідні SystemLog-цілі тому додаються лише коли
+    # сам SystemLogRoot фактично визначено.
+    $systemLogRootAvailable = -not [string]::IsNullOrWhiteSpace($SystemLogRoot)
     $writeAccessTargets = [ordered]@{}
-    if ($exchangeApiEligible) {
+    if ($exchangeApiEligible -and $systemLogRootAvailable) {
         $writeAccessTargets['SystemLog\exchangAPI'] = [IO.Path]::Combine($SystemLogRoot, 'exchangAPI')
     }
-    if ($bravoWebEligible) {
+    if ($bravoWebEligible -and $systemLogRootAvailable) {
         $writeAccessTargets['SystemLog\BravoWeb\Apache'] = [IO.Path]::Combine($SystemLogRoot, 'BravoWeb\Apache')
         $writeAccessTargets['SystemLog\BravoWeb\Application'] = [IO.Path]::Combine($SystemLogRoot, 'BravoWeb\Application')
     }
@@ -983,9 +1046,31 @@ try {
 
     Add-DryRunResult PASS "Корені" "RuntimeRoot" $dryRunRuntimeRoot
     Add-DryRunResult PASS "Корені" "RuntimeLogRoot (script logs)" $dryRunRuntimeLogRoot
-    Add-DryRunResult PASS "Корені" ("LIMSRoot [{0}]" -f $global:limsRootResult.Source) $dryRunLimsRoot
-    Add-DryRunResult PASS "Корені" ("SystemLogRoot [{0}]" -f $global:systemLogRootResult.Source) $dryRunSystemLogRoot
-    Add-DryRunResult PASS "Корені" ("BackupRoot [{0}]" -f $global:backupRootResult.Source) $dryRunBackupRoot
+
+    # LIMSRoot/SystemLogRoot/BackupRoot readiness — чиста функція
+    # Get-BRAVOTaskRootReadinessResults (BRAVO.System, спільна з
+    # BRAVO_TASKS_INSTALL.ps1) обчислює PASS/WARN/FAIL, тут лише рендеримо
+    # через Add-DryRunResult.
+    $maintenanceTaskEnabled = ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Maintenance -and
+        (Test-SettingEnabled $schedulerSettings.Maintenance.Enabled))
+    $recoveryTaskEnabled = ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Recovery -and
+        (Test-SettingEnabled $schedulerSettings.Recovery.Enabled))
+    $rootReadinessResults = Get-BRAVOTaskRootReadinessResults `
+        -BackupRootSource ([string]$global:backupRootResult.Source) `
+        -BackupRootValue $dryRunBackupRoot `
+        -BackupRootReason ([string]$global:backupRootResult.Reason) `
+        -LimsRootSource ([string]$global:limsRootResult.Source) `
+        -LimsRootValue $dryRunLimsRoot `
+        -LimsRootReason ([string]$global:limsRootResult.Reason) `
+        -SystemLogRootSource ([string]$global:systemLogRootResult.Source) `
+        -SystemLogRootValue $dryRunSystemLogRoot `
+        -SystemLogRootReason ([string]$global:systemLogRootResult.Reason) `
+        -MaintenanceTaskEnabled $maintenanceTaskEnabled `
+        -RecoveryTaskEnabled $recoveryTaskEnabled
+    foreach ($rootReadinessResult in $rootReadinessResults) {
+        Add-DryRunResult $rootReadinessResult.Status $rootReadinessResult.Category $rootReadinessResult.Label $rootReadinessResult.Detail
+    }
+
     foreach ($rootPair in @(
         @{ Name = 'LIMSRoot'; Path = $dryRunLimsRoot },
         @{ Name = 'SystemLogRoot'; Path = $dryRunSystemLogRoot },
@@ -1024,10 +1109,20 @@ try {
         'RuntimeRoot\LOGS (script logs)' = $dryRunRuntimeLogRoot
         'BackupRoot'                     = $dryRunBackupRoot
         'SystemLogRoot'                  = $dryRunSystemLogRoot
-        'SystemLog\Trace'               = ([System.IO.Path]::Combine($dryRunSystemLogRoot, 'Trace'))
         'Тимчасовий каталог'   = ([IO.Path]::GetTempPath())
         'Operation lock'       = (Split-Path -Path ([string]$operationLockSettings.Path) -Parent)
         'Machine state'        = $dryRunStateRoot
+    }
+    # 'SystemLog\Trace' додається ЛИШЕ коли $dryRunSystemLogRoot дійсно
+    # визначено: [System.IO.Path]::Combine($dryRunSystemLogRoot, 'Trace')
+    # з порожнім $dryRunSystemLogRoot мовчки повертає ВІДНОСНИЙ шлях
+    # "Trace" (не порожній рядок і не виняток), і подальший
+    # Test-BRAVOFileSystemWriteAccess реально створив би ".\Trace" у
+    # поточній директорії процесу — production-каталог, якого адміністратор
+    # не просив. 'SystemLogRoot' вище лишається в списку завжди: цикл нижче
+    # вже коректно рапортує порожнє значення як WARN "шлях не визначено".
+    if (-not [string]::IsNullOrWhiteSpace($dryRunSystemLogRoot)) {
+        $writeAccessTargets['SystemLog\Trace'] = [System.IO.Path]::Combine($dryRunSystemLogRoot, 'Trace')
     }
     foreach ($optionalTarget in $optionalComponentPlan.WriteAccessTargets.GetEnumerator()) {
         $writeAccessTargets[[string]$optionalTarget.Key] = [string]$optionalTarget.Value
@@ -1234,6 +1329,106 @@ try {
         }
     }
 
+    # BAZA incremental append-only engine (safety-review): читає лише
+    # persisted state (Read-BRAVOBazaState) — жодного SFTP-з'єднання,
+    # жодного sync не виконується. Одна canonical точка інтерпретації
+    # (Get-BRAVOBazaSettingsEffective) — та сама, що Archive і Health.
+    $bazaSftpComponents = @($bazaSyncEffective.Components | Where-Object { $_.AnyEnabled -and $_.SftpEnabled })
+    if ($bazaSftpComponents.Count -gt 0) {
+        $bazaArchiveRuntimeModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1'
+        $bazaSyncModulePath = Join-Path $dryRunRuntimeRoot 'modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1'
+        if ((Test-Path -LiteralPath $bazaArchiveRuntimeModulePath -PathType Leaf) -and
+            (Test-Path -LiteralPath $bazaSyncModulePath -PathType Leaf)) {
+            Import-Module -Name $bazaArchiveRuntimeModulePath -ErrorAction Stop
+            Import-Module -Name $bazaSyncModulePath -ErrorAction Stop
+
+            # Get-BRAVOBazaSettingsEffective тепер може throw-нути на
+            # несумісній комбінації (SynchronizeBeforeHealth/FastHealthEnabled
+            # =$false разом із Mode="IncrementalAppendOnly" — P2 deep review:
+            # ці налаштування більше не тихо ігноруються). Локальний
+            # try/catch, а не єдиний catch усього dry-run: одна помилка
+            # конфігурації BAZA не повинна обривати РЕШТУ незалежних
+            # перевірок dry-run.
+            $bazaSettingsEffective = $null
+            try {
+                $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
+            } catch {
+                Add-DryRunResult FAIL "BAZA sync" "Конфігурація" $_.Exception.Message
+            }
+            if ($null -eq $bazaSettingsEffective) {
+                # Помилку вже додано вище — решта секції BAZA не має сенсу
+                # без effective settings.
+            } elseif ($bazaSettingsEffective.Mode -eq 'IncrementalAppendOnly') {
+                Add-DryRunResult PASS "BAZA sync" "Режим" (
+                    "IncrementalAppendOnly; SynchronizeBeforeHealth=$($bazaSettingsEffective.SynchronizeBeforeHealth); " +
+                    "FastHealthEnabled=$($bazaSettingsEffective.FastHealthEnabled); MutationPolicy=$($bazaSettingsEffective.MutationPolicy)"
+                )
+                if ($bazaSettingsEffective.FullAuditEnabled) {
+                    Add-DryRunResult PASS "BAZA sync" "Full Audit" (
+                        "увімкнено; кожні $($bazaSettingsEffective.FullAuditEveryDays) дн."
+                    )
+                } else {
+                    Add-DryRunResult WARN "BAZA sync" "Full Audit" (
+                        "вимкнено (FullAuditEnabled=false) — дрейф стану проти реального SFTP не виявлятиметься автоматично"
+                    )
+                }
+
+                foreach ($bazaComponent in $bazaSftpComponents) {
+                    $bazaStatePath = Get-BRAVOBazaStatePath -StateRoot $bazaSettingsEffective.StateRoot -Component $bazaComponent.Name
+                    $bazaStateRead = Read-BRAVOBazaState -Path $bazaStatePath
+                    if ($bazaStateRead.Corrupt) {
+                        Add-DryRunResult FAIL "BAZA sync" ("{0} стан" -f $bazaComponent.DisplayName) (
+                            "$bazaStatePath пошкоджено/несумісний: $($bazaStateRead.Reason) -- потрібна повна реконсиляція (Full Audit)"
+                        )
+                        continue
+                    }
+                    if (-not $bazaStateRead.Exists) {
+                        Add-DryRunResult WARN "BAZA sync" ("{0} стан" -f $bazaComponent.DisplayName) (
+                            "$bazaStatePath ще не створено -- перший запуск BRAVO_ARCHIV виконає bootstrap Full Audit"
+                        )
+                        continue
+                    }
+
+                    $lastSyncText = if ([string]::IsNullOrWhiteSpace([string]$bazaStateRead.State.LastSuccessfulSyncUtc)) {
+                        "ще не було успішного циклу"
+                    } else {
+                        [string]$bazaStateRead.State.LastSuccessfulSyncUtc
+                    }
+                    $lastAuditText = if ([string]::IsNullOrWhiteSpace([string]$bazaStateRead.State.LastFullAuditUtc)) {
+                        "ще не виконувався"
+                    } else {
+                        [string]$bazaStateRead.State.LastFullAuditUtc
+                    }
+                    $nextAuditText = if (-not $bazaSettingsEffective.FullAuditEnabled) {
+                        "вимкнено"
+                    } elseif ([string]::IsNullOrWhiteSpace([string]$bazaStateRead.State.LastFullAuditUtc)) {
+                        "при наступному циклі (ще не було жодного Full Audit)"
+                    } else {
+                        try {
+                            $lastAuditUtc = [DateTime]::Parse(
+                                [string]$bazaStateRead.State.LastFullAuditUtc,
+                                [System.Globalization.CultureInfo]::InvariantCulture,
+                                [System.Globalization.DateTimeStyles]::RoundtripKind)
+                            $lastAuditUtc.AddDays($bazaSettingsEffective.FullAuditEveryDays).ToString('o')
+                        } catch {
+                            "не вдалося обчислити (LastFullAuditUtc у нерозпізнаваному форматі)"
+                        }
+                    }
+                    Add-DryRunResult PASS "BAZA sync" ("{0} стан" -f $bazaComponent.DisplayName) (
+                        "$bazaStatePath; файлів у стані: $($bazaStateRead.State.Files.Count); " +
+                        "останній успішний цикл: $lastSyncText; останній Full Audit: $lastAuditText; наступний Full Audit: $nextAuditText"
+                    )
+                }
+            } else {
+                Add-DryRunResult PASS "BAZA sync" "Режим" (
+                    "$($bazaSettingsEffective.Mode) (legacy) -- incremental append-only engine вимкнено"
+                )
+            }
+        } else {
+            Add-DryRunResult WARN "BAZA sync" "Модулі" "BRAVO.ArchiveRuntime/BRAVO.BazaSync не знайдено -- діагностика режиму BAZA пропущена"
+        }
+    }
+
     if ($null -ne $maintenanceSettings) {
         $serviceNames = @([string]$maintenanceSettings.Services.BravoName)
         $serviceNames += @($optionalComponentPlan.ServiceNames)
@@ -1436,16 +1631,28 @@ try {
     if ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Backup) {
         $taskFolder = $null
         $taskServiceError = $null
+        $taskFolderMissing = $false
+        $taskPath = ([string]$schedulerSettings.TaskPath).TrimEnd("\")
+        if ([string]::IsNullOrWhiteSpace($taskPath)) {
+            $taskPath = "\"
+        }
         try {
             $taskService = New-Object -ComObject "Schedule.Service"
             $taskService.Connect()
-            $taskPath = ([string]$schedulerSettings.TaskPath).TrimEnd("\")
-            if ([string]::IsNullOrWhiteSpace($taskPath)) {
-                $taskPath = "\"
-            }
             $taskFolder = $taskService.GetFolder($taskPath)
         } catch {
-            $taskServiceError = $_.Exception.Message
+            # 0x80070002 (ERROR_FILE_NOT_FOUND, як Int32 = -2147024894) від
+            # GetFolder означає лише, що каталогу завдань ще НЕМАЄ — тобто
+            # жодне завдання не встановлювалося. Це штатний стан першої
+            # інсталяції, а не збій служби Планувальника. Раніше оператор
+            # бачив сирий "стан не вдалося прочитати: The system cannot find
+            # the file specified. (Exception from HRESULT: 0x80070002)" —
+            # діагностика, яка не підказує ані причини, ані наступного кроку.
+            if ($_.Exception.HResult -eq -2147024894) {
+                $taskFolderMissing = $true
+            } else {
+                $taskServiceError = $_.Exception.Message
+            }
         }
 
         foreach ($taskName in @("Backup", "Maintenance", "Health")) {
@@ -1487,6 +1694,8 @@ try {
                     $missingStatus = if ($RequireScheduledTasks) { "FAIL" } else { "WARN" }
                     $missingDetail = if ($taskServiceError) {
                         "стан не вдалося прочитати: $taskServiceError"
+                    } elseif ($taskFolderMissing) {
+                        "увімкнене в config завдання ще не зареєстровано: каталог завдань '$taskPath' не створено — запустіть BRAVO_TASKS_INSTALL.ps1"
                     } else {
                         "увімкнене в config завдання ще не зареєстровано"
                     }
