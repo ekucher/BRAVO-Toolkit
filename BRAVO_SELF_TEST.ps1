@@ -1811,6 +1811,7 @@ try {
     Test-BRAVOCondition -Condition ($discordChunks.Count -gt 1 -and @($discordChunks | Where-Object { $_.Length -gt 1900 }).Count -eq 0) -Name "Notifications/DiscordChunkingStillWorks" -Failure "long Discord notifications мають chunking"
     $archiveNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
     $maintenanceNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $dataRestoreNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"), [Text.Encoding]::UTF8)
     $dryRunNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "BRAVO_DRY_RUN.ps1"), [Text.Encoding]::UTF8)
     $compatibilityNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"), [Text.Encoding]::UTF8)
     $mentionsDisabledPattern = 'allowed_mentions\s*=\s*@\{\s*parse\s*=\s*@\(\)\s*\}'
@@ -1819,7 +1820,7 @@ try {
     # (Send-BRAVONotification*) до єдиної canonical реалізації payload
     # (BRAVO.Compatibility::Send-BRAVOWebhookNotification, де й перевіряється
     # сам літерал allowed_mentions). DryRun лишається незалежним, як і раніше.
-    Test-BRAVOCondition -Condition ($archiveNotificationTextForMentions.Contains("Send-BRAVONotification") -and ($compatibilityNotificationTextForMentions -match $mentionsDisabledPattern) -and $maintenanceNotificationTextForMentions.Contains("Send-BRAVONotification") -and ($dryRunNotificationTextForMentions -match $mentionsDisabledPattern)) -Name "Notifications/DiscordMentionsRemainDisabled" -Failure "Discord payload має забороняти mentions"
+    Test-BRAVOCondition -Condition ($archiveNotificationTextForMentions.Contains("Send-BRAVONotification") -and ($compatibilityNotificationTextForMentions -match $mentionsDisabledPattern) -and $maintenanceNotificationTextForMentions.Contains("Send-BRAVONotification") -and $dataRestoreNotificationTextForMentions.Contains("Send-BRAVONotificationChunks") -and ($dryRunNotificationTextForMentions -match $mentionsDisabledPattern)) -Name "Notifications/DiscordMentionsRemainDisabled" -Failure "Discord payload має забороняти mentions"
 
     # dev.12: BRAVO_DRY_RUN.ps1 надсилав у Discord сирі ":emoji:" tokens,
     # бо Send-TestWebhookNotification не проганяв повідомлення через
