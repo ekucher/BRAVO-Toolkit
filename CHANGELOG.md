@@ -72,6 +72,15 @@ Runtime.ps1 decomposition.
   restore slot is genuinely still due; a completed restore state is
   never degraded. Regression test
   Maintenance/RecoveryGuardNeverDegradesSucceededRestoreState.
+- Legacy OS tier (Server 2012 R2/2016) is informational in operational
+  runs: BRAVO_ARCHIV and BRAVO_MAINTENANCE now log the LegacyBestEffort
+  support-tier message as INFO instead of WARNING. Previously every
+  successful run on such a server exited with code 10
+  (SuccessWithWarnings) and its report was routed to the ALERTS channel,
+  although the OS tier has no effect on the operation itself.
+  BRAVO_HEALTH keeps the WARNING as the canonical owner of environmental
+  metrics (same principle already applied to Windows update age), and
+  the Unsupported tier still blocks runs as before.
 - ROADMAP: P3.2a documented — BRAVO_UPDATE.ps1, operator-triggered
   server update (staged download + SHA-256 + config diff gate +
   in-place mirror + guard/scheduler/setup gates + update journal +
