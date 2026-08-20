@@ -1,6 +1,39 @@
 # Changelog
 
-## 5.1.0-rc.4 — 2026-08-20 (candidate, NOT accepted)
+## 5.1.0 — 2026-08-20
+
+Stable release of the 5.1.0 line, promoted (metadata-only) from the
+accepted 5.1.0-rc.4 candidate: deploy/stamp commit `219c55b`
+(sourceCommit `d90c3c2`), artifact BRAVO-Toolkit-5.1.0-rc.4.zip sha256
+`a825415c4275b8585c3b8896d655766545edfab2514902889229b80f096ca6b9`,
+push CI run 32346213433 SUCCESS (self-test, DataRestore E2E matrix,
+PSScriptAnalyzer, parser/BOM/JSON, gitleaks).
+
+Real-server acceptance: full DEV-LIMS run 2026-08-20 (11:18–13:42),
+evidence document
+`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md` (branch
+`evidence/219c55b-rc4-devlims-acceptance-pass`, commit `8efb95e`). All
+runbook scenarios PASS: Setup/Archive/Health, B4+B17 (real SFTP-source
+restore), B15, B16 (incl. a bonus fail-closed free-space abort), B19
+and B20 (deterministic failpoint rollbacks, incl. cross-component),
+B21 (clean exit-50 SFTP abort with zero live mutation), B22
+(operation-lock contention). Notification severity routing confirmed
+live in both directions: SUCCESS -> GENERAL, WARNING/CRITICAL ->
+ALERTS.
+
+Headline changes since stable 5.0.2:
+
+- BRAVO_DATA_RESTORE: production data-restore entrypoint +
+  modules/BRAVO.DataRestore (Local/SFTP source, InPlace/OutOfPlace,
+  move-aside `.prerestore_*` copies, deterministic cross-component
+  rollback, exit code 43 RestoreFailed, operation-lock integration,
+  post-restore Health, self-tests and a CI E2E matrix) — see the rc.2
+  candidate section below.
+- Notification severity routing (GENERAL/ALERTS) ported into the 5.1.0
+  line (rc.3 section) and extended to DataRestore notifications (rc.4
+  section, PR #62).
+
+## 5.1.0-rc.4 — 2026-08-20 (candidate, ACCEPTED 2026-08-20 — released as 5.1.0)
 
 Fourth release candidate of the 5.1.0 line. Opened because the rc.3
 DEV-LIMS acceptance run found that BRAVO_DATA_RESTORE notifications
