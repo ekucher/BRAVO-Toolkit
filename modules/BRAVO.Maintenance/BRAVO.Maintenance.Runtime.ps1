@@ -29,7 +29,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # ConvertTo-BRAVOIniPathValue, а покладатися на порядок чужих імпортів для
 # власних залежностей — рівно та помилка, яку вже задокументовано в шапці
 # самого BRAVO.Discovery.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -5290,6 +5290,32 @@ $stopServicesRequired = $serviceWasRunning.Bravo -or
 $stopServicesCriticalBefore = $script:criticalErrorOccurred
 $stopServicesWarningsBefore = $script:BRAVOWarningCount
 
+# Ownership-маркер зупинки служб — ПЕРЕД першою зупинкою. Якщо процес
+# загине жорстко (kill/живлення) до finally, Health-watchdog за
+# осиротілим маркером підніме РІВНО ці служби; ручні зупинки
+# техпідтримки (без маркера) BRAVO не чіпає ніколи. Збій запису маркера
+# абортує зупинку (fail-closed): без маркера аварія знову була б
+# «мовчазною» — служби б лишились лежати без сліду власника.
+$script:quiescenceMarkerWrittenThisRun = $false
+if ($stopServicesRequired) {
+    $quiescenceServices = @()
+    if ($serviceWasRunning.Bravo) { $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = $true } }
+    if ($serviceWasRunning.ExchangeApi) { $quiescenceServices += @{ Name = $ExchangAPIServiceName; RestartIntent = $true } }
+    if ($serviceWasRunning.BravoWeb) { $quiescenceServices += @{ Name = $BravoWebServiceName; RestartIntent = $true } }
+    try {
+        [void](Write-BRAVOServiceQuiescenceState `
+            -Owner 'BRAVO_MAINTENANCE' `
+            -Services $quiescenceServices `
+            -LogFile ([string]$LOG_FILE))
+        $script:quiescenceMarkerWrittenThisRun = $true
+    } catch {
+        $quiescenceMarkerError = "Не вдалося записати ownership-маркер зупинки служб — зупинку служб і обслуговування перервано (без маркера аварійне переривання лишило б служби зупиненими без автоматичного відновлення): $($_.Exception.Message)"
+        Write-Log -Message $quiescenceMarkerError -Level 'ERROR'
+        Send-SlackAlert -Message $quiescenceMarkerError -IsCritical
+        throw $quiescenceMarkerError
+    }
+}
+
 # 1. Зупинка BRAVO Web
 if ($BravoWebMaintenanceEnabled) {
     try {
@@ -5852,6 +5878,9 @@ $restoreServicesCriticalBefore = $script:criticalErrorOccurred
 $restoreServicesWarningsBefore = $script:BRAVOWarningCount
 Write-Log -Message "==="
 Write-Log -Message "=== ВІДНОВЛЕННЯ ПОЧАТКОВОГО СТАНУ СЛУЖБ ==="
+# Ownership-маркер можна прибрати лише коли ВСІ старти нижче успішні;
+# інакше він лишається, і Health-watchdog доспробує підняти служби.
+$serviceRestartFailed = $false
 
 # 1. Запуск служби BRAVO
 try {
@@ -5870,6 +5899,7 @@ try {
             Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
             Send-SlackAlert -Message $errorMsg -IsCritical
             $script:criticalErrorOccurred = $true
+            $serviceRestartFailed = $true
         }
     }
 } catch {
@@ -5877,6 +5907,7 @@ try {
     Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
     Send-SlackAlert -Message $errorMsg -IsCritical
     $script:criticalErrorOccurred = $true
+    $serviceRestartFailed = $true
 }
 
 # Діагностика, не перевірка: BRAVO створює trace лише під час першої
@@ -5914,6 +5945,7 @@ if ($serviceWasRunning.ExchangeApi) {
         Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
         Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
+        $serviceRestartFailed = $true
     }
 }
 
@@ -5941,7 +5973,22 @@ if ($serviceWasRunning.BravoWeb) {
         Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
         Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
+        $serviceRestartFailed = $true
     }
+}
+
+# Ownership-маркер: прибираємо лише ВЛАСНИЙ (записаний цим прогоном) і
+# лише після ПОВНОГО відновлення служб. Чужий/осиротілий маркер від
+# попереднього аварійного прогону цей код не чіпає — його опрацьовує
+# Health-watchdog. Частковий збій старту → маркер лишається.
+if ($script:quiescenceMarkerWrittenThisRun -and -not $serviceRestartFailed) {
+    try {
+        Clear-BRAVOServiceQuiescenceState
+    } catch {
+        Write-Log -Message "Не вдалося прибрати ownership-маркер зупинки служб: $($_.Exception.Message) — Health-watchdog побачить осиротілий маркер і мовчазної шкоди не буде" -Level "WARNING"
+    }
+} elseif ($script:quiescenceMarkerWrittenThisRun) {
+    Write-Log -Message "Ownership-маркер зупинки служб збережено: не всі служби запустились — Health-watchdog повторить спробу автоматично" -Level "WARNING"
 }
 
 Write-BRAVOMaintenanceStep `
