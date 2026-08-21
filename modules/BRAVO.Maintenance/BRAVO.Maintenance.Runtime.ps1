@@ -4578,42 +4578,46 @@ $restoreWindowOpen = Test-BRAVORestoreTimeWindow `
     -Now $currentDate `
     -WindowStart $parsedRestoreWindowStart `
     -WindowEnd $parsedRestoreWindowEnd
-# Легка перевірка узгодженості конфігурації: якщо Maintenance.DailyAt НЕ
-# потрапляє у вікно Restore.WindowStart/WindowEnd, ЦЕЙ конкретний нічний
-# прогін Maintenance не підхопить $missedRestoreDue — але це вже не
-# втрата автоматики: Recovery-завдання має власний, безумовний daily
-# trigger рівно на Restore.WindowStart (BRAVO_TASKS_INSTALL.ps1,
-# New-BRAVOTaskDefinition), незалежний від Maintenance.DailyAt і від
-# Restore.RunMissedOnStartup (той керує лише додатковим boot-trigger).
-# Попередження нижче ($maintenanceDailyAtInsideRestoreWindow) лишається
-# інформаційним — не про втрату шляху, а про те, що саме ЦЕЙ прогін
-# участі не бере.
+# Перевірка узгодженості конфігурації: якщо Maintenance.DailyAt НЕ
+# потрапляє у вікно Restore.WindowStart/WindowEnd, нічний прогін
+# Maintenance не підхопить $missedRestoreDue — а на 24/7-профілі
+# (Restore.BootRestoreMode="None", 5.2.0) це ЄДИНИЙ автоматичний шлях
+# пропущеної реставрації (daily-тригер Recovery о WindowStart прибрано).
+# Попередження нижче ($maintenanceDailyAtInsideRestoreWindow) тому
+# важливіше, ніж раніше: розсинхрон DailyAt і вікна на 24/7-сервері
+# означає, що пропущений слот не виконається автоматично взагалі.
 $maintenanceDailyAtSpan = [TimeSpan]::Zero
 $maintenanceDailyAtInsideRestoreWindow = [TimeSpan]::TryParse([string]$schedulerSettings.Maintenance.DailyAt, [ref]$maintenanceDailyAtSpan) -and
     (Test-BRAVORestoreTimeWindow -Now $currentDate.Date.Add($maintenanceDailyAtSpan) -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd)
-# Вікном обмежені саме АВТОМАТИЧНІ шляхи. Boot-recovery пропущеного слоту —
-# найімовірніше джерело випадкового денного запуску: сервер вмикають уранці,
-# і без цієї умови реставрація почалася б на робочій моделі о 09:00.
+# Вікном обмежені АВТОМАТИЧНІ шляхи 24/7-профілю. Єдиний свідомий виняток —
+# boot-recovery профілю робочого часу (Restore.BootRestoreMode=
+# "HoldServices", див. $bootRestoreIgnoresWindow нижче): там реставрація
+# зранку одразу після вмикання сервера — задумана поведінка, і клієнтів у
+# програмі ще немає, бо служби (Automatic Delayed Start) утримуються
+# зупиненими до її завершення.
 $scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Path $MARKER_FILE)
 # НЕ прив'язуємо до -RunMissedRestoreOnly: той прапорець позначає лише те,
-# що цей конкретний прогін BRAVO_MAINTENANCE.ps1 стартував через Recovery
-# (daily АБО boot trigger — обидва передають той самий прапорець, обидва
-# викликають той самий Action). Надійний "наступного дня у дозволеному
-# вікні" шлях сьогодні НЕ один: (1) Recovery-завдання має власний,
-# безумовний daily trigger на Restore.WindowStart (не залежить від
-# Maintenance.DailyAt чи reboot), і (2) опційно ще й boot-trigger, коли
-# Restore.RunMissedOnStartup=true (швидша реакція одразу після
-# перезавантаження). Щоденний таск Maintenance (23:55, за замовчуванням у
-# самому вікні) — ТРЕТІЙ, додатковий шлях, коли DailyAt збігається з
-# вікном, але вже не єдиний і не обов'язковий. $missedRestore сам по собі
-# персистентний (BRAVO_RESTORE_STATE.json / маркер конкретного
-# $scheduledOccurrence), тому перевірка на будь-якому з цих прогонів не
-# створює дублювання.
+# що цей конкретний прогін BRAVO_MAINTENANCE.ps1 стартував через
+# Recovery-завдання (5.2.0: єдиний його тригер — boot, профіль робочого
+# часу Restore.BootRestoreMode="HoldServices"). Автоматичних шляхів
+# пропущеної реставрації два, за профілем: 24/7 — щонічний Maintenance
+# (DailyAt у вікні реставрації); робочий час — boot-recovery одразу після
+# старту сервера. $missedRestore сам по собі персистентний
+# (BRAVO_RESTORE_STATE.json / маркер конкретного $scheduledOccurrence),
+# тому перевірка на будь-якому з цих прогонів не створює дублювання.
 $missedRestoreDue = $missedRestore
 $automaticRestoreDue = $scheduledRestoreDue -or $missedRestoreDue
-$restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore
-$shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and $restoreWindowOpen))
-$restoreReason = if ($ForceRestore) { "Примусово" } elseif ($missedRestoreDue) { "Пропущений плановий слот $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm'))" } else { "$RestoreDayName, після $RestoreTime" }
+# Профіль сервера РОБОЧОГО ЧАСУ (Restore.BootRestoreMode="HoldServices"):
+# Recovery-прогін, запущений boot-тригером, ігнорує вікно реставрації —
+# служби (Automatic Delayed Start) ще не запущені, клієнтів у програмі
+# немає, і іншої нагоди виконати пропущений слот такий сервер не матиме
+# (його вимикають до нічного вікна). На 24/7-профілі ("None")
+# -RunMissedRestoreOnly поводиться як раніше — вікно обов'язкове.
+$bootRestoreIgnoresWindow = $RunMissedRestoreOnly -and
+    ([string]$maintenanceSettings.Restore.BootRestoreMode -eq 'HoldServices')
+$restoreSkippedByWindow = $automaticRestoreDue -and -not $restoreWindowOpen -and -not $ForceRestore -and -not $bootRestoreIgnoresWindow
+$shouldRestore = $BravoMaintenanceEnabled -and ($ForceRestore -or ($automaticRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)))
+$restoreReason = if ($ForceRestore) { "Примусово" } elseif ($missedRestoreDue) { "Пропущений плановий слот $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm'))$(if ($bootRestoreIgnoresWindow -and -not $restoreWindowOpen) { ' (boot-recovery поза вікном, профіль робочого часу)' })" } else { "$RestoreDayName, після $RestoreTime" }
 $CheckSize = -not $DisableSizeCheck
 if ($RunMissedRestoreOnly -and $missedDailyWork) {
     # Recovery завжди завершується актуальним backup після maintenance.
@@ -4848,15 +4852,17 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
 Write-Log -Message "Дата: $($currentDate.ToString('yyyy-MM-dd'))" -NoTimestamp
 Write-Log -Message "Час: $($currentDate.ToString('HH:mm:ss'))" -NoTimestamp
 # $missedDailyWork (пропущений денний Backup/Maintenance) — не єдина причина
-# продовжувати: якщо пропущено САМЕ реставрацію ($missedRestoreDue) і вікно
-# зараз відкрите, Recovery має дійти до звичайного кроку реставрації нижче,
-# а не вийти без дій. Якщо вікно ще зачинене — реставрація однаково
-# нездійсненна цього тику, тому компактний no-op-вихід лишається, лише з
-# окремим повідомленням про причину очікування.
-$missedRestoreActionableNow = $missedRestoreDue -and $restoreWindowOpen
+# продовжувати: якщо пропущено САМЕ реставрацію ($missedRestoreDue) і вона
+# зараз здійсненна (вікно відкрите АБО boot-recovery профілю робочого часу,
+# який вікно ігнорує), Recovery має дійти до звичайного кроку реставрації
+# нижче, а не вийти без дій. Інакше — компактний no-op-вихід. Гілка
+# «поза вікном» тепер можлива лише при РУЧНОМУ -RunMissedRestoreOnly на
+# 24/7-профілі: Scheduler-Repetition 15-хвилинних повторів прибрано у
+# 5.2.0, тому жодного «повторна спроба за N хв» тут більше немає.
+$missedRestoreActionableNow = $missedRestoreDue -and ($restoreWindowOpen -or $bootRestoreIgnoresWindow)
 if ($RunMissedRestoreOnly -and -not $missedDailyWork -and -not $missedRestoreActionableNow) {
     if ($missedRestoreDue) {
-        Write-Log -Message "Recovery: пропущена реставрація очікує на вікно $RestoreWindowStart-$RestoreWindowEnd; повторна спроба за $([int]$schedulerSettings.Recovery.RetryEveryMinutes) хв" -Level 'INFO'
+        Write-Log -Message "Recovery: пропущена реставрація поза вікном $RestoreWindowStart-$RestoreWindowEnd; вона виконається у вікні (плановим Maintenance) або запустіть -ForceRestore свідомо" -Level 'INFO'
     } else {
         Write-Log -Message "Recovery: пропущених Backup/Maintenance не знайдено; завершення без дій" -Level 'INFO'
     }
@@ -5248,15 +5254,40 @@ $restoreCompletedAt = $null
 $script:bravoServiceStartedThisRun = $false
 
 try {
+# StartPending рахується як «працювала»: служба, що саме стартує на
+# момент знімка, все одно буде зупинена секцією нижче (вона зупиняє за
+# ФАКТИЧНИМ станом), і без restart-intent лишилася б лежати після
+# обслуговування; та сама семантика, що ShouldRestartAfterRestore у
+# DataRestore.
 $serviceWasRunning = @{
     Bravo = $BravoMaintenanceEnabled -and
-        (Get-Service -Name $BravoServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+        (Get-Service -Name $BravoServiceName -ErrorAction SilentlyContinue).Status -in @('Running', 'StartPending')
     ExchangeApi = $exchangAPIServiceEnabled -and
-        (Get-Service -Name $ExchangAPIServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+        (Get-Service -Name $ExchangAPIServiceName -ErrorAction SilentlyContinue).Status -in @('Running', 'StartPending')
     BravoWeb = $BravoWebMaintenanceEnabled -and
-        (Get-Service -Name $BravoWebServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+        (Get-Service -Name $BravoWebServiceName -ErrorAction SilentlyContinue).Status -in @('Running', 'StartPending')
 }
-if ($RunMissedRestoreOnly -and $missedDailyWork) {
+# Профіль робочого часу (boot-recovery, $bootRestoreIgnoresWindow):
+# «hold» — це ДЕТЕРМІНОВАНИЙ кінцевий стан (служби зупинені на час
+# реставрації, запущені після неї), а НЕ знімок гонитви з Automatic
+# (Delayed Start): службу, що ще НЕ встигла піднятися на момент знімка,
+# SCM запустив би ПОСЕРЕД деструктивної фази реставрації, а після
+# жорсткого переривання вона не мала б restart-intent у
+# ownership-маркері. Тому кожна УВІМКНЕНА керована служба примусово
+# трактується як «працювала»: зупинка нижче ідемпотентна (перевіряє
+# фактичний стан), маркер покриває всі керовані служби, finally поверне
+# все у Running.
+if ($bootRestoreIgnoresWindow) {
+    $serviceWasRunning.Bravo = $BravoMaintenanceEnabled
+    $serviceWasRunning.ExchangeApi = $exchangAPIServiceEnabled
+    $serviceWasRunning.BravoWeb = $BravoWebMaintenanceEnabled
+}
+# У boot-recovery профілю робочого часу ($bootRestoreIgnoresWindow) цей
+# guard НЕ діє: прогін стартує одразу після boot, і якщо служби
+# (Automatic Delayed Start) встигли піднятися раніше за задачу — зупинити
+# їх негайно і є задачею утримання (клієнти ще не встигли зайти). На
+# 24/7-профілі поведінка колишня: Recovery не зупиняє працюючі служби.
+if ($RunMissedRestoreOnly -and $missedDailyWork -and -not $bootRestoreIgnoresWindow) {
     $runningServices = @()
     if ($serviceWasRunning.Bravo) { $runningServices += $BravoServiceName }
     if ($serviceWasRunning.ExchangeApi) { $runningServices += $ExchangAPIServiceName }
@@ -5321,6 +5352,9 @@ $stopServicesWarningsBefore = $script:BRAVOWarningCount
 # абортує зупинку (fail-closed): без маркера аварія знову була б
 # «мовчазною» — служби б лишились лежати без сліду власника.
 $script:quiescenceMarkerWrittenThisRun = $false
+# true = маркер зараз suppressed на час деструктивної фази реставрації
+# (bravocmd) — див. Restore-BRAVOMaintenanceQuiescenceAutostart нижче.
+$script:quiescenceMarkerSuppressedForRestore = $false
 if ($stopServicesRequired) {
     $quiescenceServices = @()
     if ($serviceWasRunning.Bravo) { $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = $true } }
@@ -5337,6 +5371,27 @@ if ($stopServicesRequired) {
         Write-Log -Message $quiescenceMarkerError -Level 'ERROR'
         Send-SlackAlert -Message $quiescenceMarkerError -IsCritical
         throw $quiescenceMarkerError
+    }
+}
+
+function Restore-BRAVOMaintenanceQuiescenceAutostart {
+    # Зворотний бік suppressed-фази реставрації: модель знову
+    # консистентна (успішний bravocmd без критичних змін АБО успішний
+    # відкат з архіву перед реставрацією) — маркер перезаписується без
+    # suppression, щоб при жорсткому перериванні РЕШТИ прогону watchdog
+    # знову мав право підняти служби автоматично. Збій тут не фатальний:
+    # suppressed-маркер безпечний (watchdog лише алертить), а graceful
+    # finally і так стартує служби та прибере власний маркер.
+    if (-not $script:quiescenceMarkerSuppressedForRestore) { return }
+    try {
+        [void](Write-BRAVOServiceQuiescenceState `
+            -Owner 'BRAVO_MAINTENANCE' `
+            -Services $quiescenceServices `
+            -LogFile ([string]$LOG_FILE))
+        $script:quiescenceMarkerSuppressedForRestore = $false
+        Write-Log -Message "Ownership-маркер повернуто в режим автостарту: модель консистентна після фази реставрації" -Level "INFO"
+    } catch {
+        Write-Log -Message "Не вдалося зняти suppressed з ownership-маркера після фази реставрації: $($_.Exception.Message) — при жорсткому перериванні решти прогону watchdog лише алертитиме (без автостарту), мовчазної шкоди немає" -Level "WARNING"
     }
 }
 
@@ -5481,6 +5536,10 @@ $restoreStepReported = $false
 # кидає виняток, коли до бар'єрів узагалі не доходимо ($shouldRestore=false
 # від самого початку, або службу BRAVO не вдалося зупинити).
 $restorePostponedByWindowClosing = $false
+# true = реставрацію скасовано ДО bravocmd через збій переведення
+# ownership-маркера в suppressed (fail-closed, критична помилка вже
+# зарапортована в місці скасування).
+$restoreAbortedBeforeDestructivePhase = $false
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
 # коли BRAVO зупинити не вдалося.
@@ -5492,8 +5551,10 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
     # обчислений задовго до цього місця (до Enter-BRAVOMaintenanceOperationLock,
     # тобто до OperationLockWaitMinutes очікування, і до зупинки служб вище)
     # — вікно могло вже закритися. Переоцінюємо ЗАРАЗ, а не довіряємо
-    # старому знімку. -ForceRestore барʼєром не обмежується.
-    if ($shouldRestore -and -not $ForceRestore -and
+    # старому знімку. Барʼєром не обмежуються -ForceRestore і boot-recovery
+    # профілю робочого часу ($bootRestoreIgnoresWindow) — для них вікно не
+    # є умовою легітимності операції.
+    if ($shouldRestore -and -not $ForceRestore -and -not $bootRestoreIgnoresWindow -and
         -not (Test-BRAVORestoreExecutionStillAllowed `
             -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
             -ForceRestore $ForceRestore)) {
@@ -5502,7 +5563,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
         Write-Log -Message (
             "Реставрацію відкладено: вікно $RestoreWindowStart-$RestoreWindowEnd закрилося під час " +
             "очікування lock/підготовки (заплановано було: $restoreReason). Плановий слот лишається " +
-            "непозначеним як виконаний — наступний daily Recovery-тригер повторить спробу в межах вікна."
+            "непозначеним як виконаний — наступний плановий Maintenance повторить спробу в межах вікна."
         ) -Level "WARNING"
     }
     if ($shouldRestore) {
@@ -5578,9 +5639,11 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 # перед ДЕСТРУКТИВНИМ bravocmd.exe. Barrier 1 (перед входом у
                 # цю послідовність) не покриває час самої архівації моделі
                 # перед реставрацією (7-Zip на великій моделі може тривати
-                # довго) — вікно могло закритися саме тут. -ForceRestore
-                # барʼєром не обмежується.
-                if (-not (Test-BRAVORestoreExecutionStillAllowed `
+                # довго) — вікно могло закритися саме тут. Барʼєром не
+                # обмежуються -ForceRestore і boot-recovery профілю робочого
+                # часу ($bootRestoreIgnoresWindow).
+                if (-not $bootRestoreIgnoresWindow -and
+                    -not (Test-BRAVORestoreExecutionStillAllowed `
                         -WindowStart $parsedRestoreWindowStart -WindowEnd $parsedRestoreWindowEnd `
                         -ForceRestore $ForceRestore)) {
                     $restorePostponedByWindowClosing = $true
@@ -5590,18 +5653,46 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         "$RestoreWindowStart-$RestoreWindowEnd закрилося під час архівації моделі перед " +
                         "реставрацією. bravocmd.exe НЕ викликано; архів перед реставрацією збережено: " +
                         "$beforeArchivePath. Плановий слот лишається непозначеним як виконаний — " +
-                        "наступний daily Recovery-тригер повторить спробу в межах вікна."
+                        "наступний плановий Maintenance повторить спробу в межах вікна."
                     ) -Level "WARNING"
                 } else {
-                    # Виконання реставрації через bravocmd.exe (як в еталоні)
-                    $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
-                    $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                    # Suppressed-фаза (quiescence): на час деструктивного
+                    # bravocmd маркер перемикається в suppressed — якщо процес
+                    # загине ЖОРСТКО посеред реставрації, Health-watchdog НЕ
+                    # підніме служби поверх напіввідновленої моделі, а лише
+                    # дасть CRITICAL-алерт про ручне відновлення (та сама
+                    # семантика, що маркер DataRestore). Збій suppression =
+                    # реставрація НЕ починається (fail-closed: модель ще не
+                    # торкнута, збереження поточного стану безпечне).
+                    $quiescenceSuppressionReady = $true
+                    if ($script:quiescenceMarkerWrittenThisRun) {
+                        try {
+                            [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
+                            $script:quiescenceMarkerSuppressedForRestore = $true
+                        } catch {
+                            $quiescenceSuppressionReady = $false
+                            $restoreAbortedBeforeDestructivePhase = $true
+                            $exitCode = $null
+                            $errorMsg = "Реставрацію скасовано перед bravocmd.exe: не вдалося перевести ownership-маркер у suppressed (жорстке переривання посеред реставрації призвело б до автостарту служб поверх напіввідновленої моделі): $($_.Exception.Message). Модель не торкнута; архів перед реставрацією збережено: $beforeArchivePath"
+                            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                            Send-SlackAlert -Message $errorMsg -IsCritical
+                            $script:criticalErrorOccurred = $true
+                            $script:restoreArchiveFailed = $true
+                        }
+                    }
+                    if ($quiescenceSuppressionReady) {
+                        # Виконання реставрації через bravocmd.exe (як в еталоні)
+                        $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
+                        $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                    }
                 }
 
-                if ($restorePostponedByWindowClosing) {
-                    # Постановка на паузу — НЕ помилка: bravocmd не викликаний,
-                    # маркер/state не пишуться, гілки exitCode -eq/-ne 0 нижче
-                    # свідомо не виконуються (exitCode -eq $null для обох).
+                if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase) {
+                    # bravocmd не викликаний (пауза через вікно — не помилка;
+                    # скасування через suppression уже зарапортоване вище як
+                    # критичне), маркер/state не пишуться, гілки exitCode
+                    # -eq/-ne 0 нижче свідомо не виконуються (exitCode -eq
+                    # $null для обох).
                 } elseif ($exitCode -eq 0) {
                     $restoreCompletedAt = Get-Date
                     Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"
@@ -5625,6 +5716,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             $exitCode = Restore-FromArchive -ArchivePath "$ARC_DIR\$ARCH_NAME1" -Destination $MODEL_PATH -ARC_PATH $ARC_PATH
                             if ($exitCode -eq 0) {
                                 Write-Log -Message "Модель успішно відновлена з архіву перед реставрації" -Level "SUCCESS"
+                                # Відкат довершено — модель знову консистентна.
+                                Restore-BRAVOMaintenanceQuiescenceAutostart
                             } else {
                                 $errorMsg = "Відкат MODEL після критичних змін не виконано (код: $exitCode). Архівацію після реставрації та маркер успіху заблоковано."
                                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
@@ -5637,6 +5730,10 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     
                     # Виконуємо архівацію після реставрації ЛИШЕ якщо не було критичних змін
                     if (-not $restoreRequired) {
+                        # Реставрація успішна, критичних змін немає — модель
+                        # консистентна; повертаємо watchdog право автостарту
+                        # ЩЕ ДО тривалої архівації після реставрації.
+                        Restore-BRAVOMaintenanceQuiescenceAutostart
                         $afterArchivePath = Join-Path $ARC_DIR $ARCH_NAME2
                         $afterHashPath = "$afterArchivePath.sha512"
                         if (Test-Path -LiteralPath $afterHashPath -PathType Leaf) {

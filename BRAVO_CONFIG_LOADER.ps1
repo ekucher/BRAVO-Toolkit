@@ -312,6 +312,28 @@ function Assert-BravoLoadedConfiguration {
         Write-Warning 'bravoSettings.NotificationRouting має бути хеш-таблицею — застосовується дефолтна маршрутизація (SUCCESS=general, WARNING/ERROR/CRITICAL=alerts).'
     }
 
+    # Restore.BootRestoreMode (5.2.0) замінив Restore.RunMissedOnStartup:
+    # семантика boot-recovery змінилась (реставрація ПОЗА вікном з
+    # утриманням служб), тому стара назва навмисно не мапиться мовчки —
+    # оператор має свідомо обрати профіль сервера.
+    if ($global:maintenanceSettings -is [hashtable] -and
+        $global:maintenanceSettings.Restore -is [hashtable]) {
+        $restoreSettingsForValidation = $global:maintenanceSettings.Restore
+        if ($restoreSettingsForValidation.Contains('RunMissedOnStartup')) {
+            Write-Warning 'maintenanceSettings.Restore.RunMissedOnStartup застарів і ігнорується — задайте Restore.BootRestoreMode = "None" (24/7-сервер) або "HoldServices" (сервер робочого часу: реставрація при старті з утриманням служб).'
+        }
+        $bootRestoreModeValue = if ($restoreSettingsForValidation.Contains('BootRestoreMode')) {
+            [string]$restoreSettingsForValidation.BootRestoreMode
+        } else {
+            ''
+        }
+        if (-not [string]::IsNullOrWhiteSpace($bootRestoreModeValue) -and
+            $bootRestoreModeValue -notin @('None', 'HoldServices')) {
+            Write-Warning "maintenanceSettings.Restore.BootRestoreMode = '$bootRestoreModeValue' не розпізнано — застосовується безпечний профіль 'None' (24/7: без boot-recovery; пропущену реставрацію підхоплює планове Maintenance)."
+            $restoreSettingsForValidation.BootRestoreMode = 'None'
+        }
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }

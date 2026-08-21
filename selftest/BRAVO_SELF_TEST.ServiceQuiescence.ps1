@@ -629,6 +629,57 @@ function Get-Service {
         -Condition ($maintenanceRuntimeTextForQuiescence.Contains('if ($script:quiescenceMarkerWrittenThisRun -and -not $serviceRestartFailed)')) `
         -Name "ServiceQuiescence/MaintenanceClearsOnlyOwnMarkerAfterSuccessfulRestarts" `
         -Failure "Maintenance має чистити ЛИШЕ власний маркер і лише коли всі старти служб успішні"
+    # РЕГРЕСІЯ (#64 review, п.1): деструктивна фаза реставрації моделі
+    # (bravocmd) має проходити під suppressed-маркером — жорсткий kill
+    # посеред bravocmd НЕ повинен дати watchdog-у автостартувати служби
+    # поверх напіввідновленої моделі; після повернення консистентності
+    # (успіх без критичних змін або довершений відкат) suppression
+    # знімається хелпером Restore-BRAVOMaintenanceQuiescenceAutostart.
+    $maintenanceSuppressIndex = $maintenanceRuntimeTextForQuiescence.IndexOf('Set-BRAVOServiceQuiescenceRestartSuppressed')
+    $maintenanceBravocmdIndex = $maintenanceRuntimeTextForQuiescence.IndexOf('Виконання реставрації моделі LIMS')
+    $maintenanceUnsuppressHelperIndex = $maintenanceRuntimeTextForQuiescence.IndexOf('function Restore-BRAVOMaintenanceQuiescenceAutostart')
+    $maintenanceUnsuppressLastCallIndex = $maintenanceRuntimeTextForQuiescence.LastIndexOf('Restore-BRAVOMaintenanceQuiescenceAutostart')
+    $maintenanceUnsuppressHelperBlock = if ($maintenanceUnsuppressHelperIndex -ge 0) {
+        $maintenanceRuntimeTextForQuiescence.Substring($maintenanceUnsuppressHelperIndex, 1400)
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceSuppressIndex -ge 0 -and
+            $maintenanceBravocmdIndex -ge 0 -and
+            $maintenanceSuppressIndex -lt $maintenanceBravocmdIndex -and
+            $maintenanceUnsuppressHelperIndex -ge 0 -and
+            $maintenanceUnsuppressLastCallIndex -gt $maintenanceBravocmdIndex -and
+            $maintenanceUnsuppressHelperBlock.Contains('Write-BRAVOServiceQuiescenceState') -and
+            -not $maintenanceUnsuppressHelperBlock.Contains('-RestartSuppressed')
+        ) `
+        -Name "ServiceQuiescence/MaintenanceSuppressesMarkerAroundDestructiveModelRestore" `
+        -Failure "Maintenance має переводити маркер у suppressed ДО bravocmd і знімати suppression (helper без -RestartSuppressed) лише ПІСЛЯ повернення консистентності моделі"
+    # РЕГРЕСІЯ (#64 review, п.2): у boot-профілі робочого часу «hold» —
+    # детермінований кінцевий стан: усі УВІМКНЕНІ керовані служби входять
+    # у зупинку/маркер/restart-intent незалежно від того, чи встигли вони
+    # піднятися на момент знімка (інакше SCM стартував би delayed-службу
+    # посеред деструктивної фази, а маркер її не покривав би).
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceRuntimeTextForQuiescence.Contains('if ($bootRestoreIgnoresWindow) {') -and
+            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning.Bravo = $BravoMaintenanceEnabled') -and
+            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning.ExchangeApi = $exchangAPIServiceEnabled') -and
+            $maintenanceRuntimeTextForQuiescence.Contains('$serviceWasRunning.BravoWeb = $BravoWebMaintenanceEnabled')
+        ) `
+        -Name "ServiceQuiescence/MaintenanceBootHoldForcesManagedServicesIntoQuiescenceScope" `
+        -Failure "boot-профіль (bootRestoreIgnoresWindow) має примусово включати всі увімкнені керовані служби у зупинку/маркер/restart-intent"
+    # РЕГРЕСІЯ (#64 review, п.3): знімок стану служб рахує StartPending як
+    # «працювала» — інакше служба, що саме стартує, була б зупинена без
+    # restart-intent і лишилася лежати після обслуговування.
+    Test-BRAVOCondition `
+        -Condition (
+            @([regex]::Matches(
+                $maintenanceRuntimeTextForQuiescence,
+                [regex]::Escape("-in @('Running', 'StartPending')")
+            )).Count -eq 3
+        ) `
+        -Name "ServiceQuiescence/MaintenanceServiceSnapshotIncludesStartPending" `
+        -Failure "усі три перевірки знімка служб Maintenance мають рахувати StartPending нарівні з Running"
     # РЕГРЕСІЯ (review F1): маркер Maintenance МУСИТЬ лишатися придатним до
     # автостарту (робота Maintenance між stop/start не змінює live
     # filesystem) — жодного -RestartSuppressed у його виклику запису.

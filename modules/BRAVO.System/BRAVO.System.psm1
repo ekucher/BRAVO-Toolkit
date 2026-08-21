@@ -51,33 +51,19 @@ function Format-BRAVOSchedulerNextRun {
     param(
         [string]$TaskType,
         $NextRunTime,
-        [int]$StartupDelayMinutes = 0,
-        # Recovery може мати ДВА trigger на одному завданні: boot (сентинел
-        # NextRunTime, тому й лишається окремим текстом нижче) і daily о
-        # Restore.WindowStart. Без DailyWindowStart текст описував би лише
-        # половину реального розкладу.
-        [string]$DailyWindowStart,
-        # Boot-trigger сам New-BRAVOTaskDefinition створює лише коли
-        # Restore.RunMissedOnStartup=true (BRAVO.config). За замовчуванням
-        # $true — зберігає попередню поведінку викликів без цього параметра
-        # (усі наявні виклики й тести передбачали boot-trigger присутнім).
-        [bool]$HasBootTrigger = $true
+        [int]$StartupDelayMinutes = 0
     )
 
-    if ($TaskType -eq 'Recovery' -and $HasBootTrigger) {
-        $bootText = if ($StartupDelayMinutes -gt 0) {
-            "після наступного старту Windows; затримка $StartupDelayMinutes хв."
-        } else {
-            "після наступного старту Windows"
+    # Recovery (5.2.0) має рівно ОДИН boot-trigger (профіль робочого часу,
+    # Restore.BootRestoreMode="HoldServices"); daily-trigger о WindowStart
+    # прибрано — на 24/7-профілі пропущений слот підхоплює щонічне
+    # Maintenance, а саме Recovery-завдання вимкнене.
+    if ($TaskType -eq 'Recovery') {
+        if ($StartupDelayMinutes -gt 0) {
+            return "після наступного старту Windows; затримка $StartupDelayMinutes хв."
         }
-        if (-not [string]::IsNullOrWhiteSpace($DailyWindowStart)) {
-            return "$bootText та щодня о $DailyWindowStart"
-        }
-        return $bootText
+        return "після наступного старту Windows"
     }
-    # Recovery БЕЗ boot-trigger (RunMissedOnStartup=false) має лише daily
-    # trigger — NextRunTime для нього РЕАЛЬНА дата (не сентинел 1899), тому
-    # форматується так само, як звичайне щоденне завдання нижче.
 
     try {
         # .Year -gt 1900 відкидає sentinel 30.12.1899 (він БІЛЬШИЙ за
@@ -443,6 +429,96 @@ function Test-BRAVOProcessAlive {
     } catch {
         return $true
     }
+}
+
+function Get-BRAVOServiceDelayedAutoStart {
+    # Get-Service.StartType показує лише 'Automatic' і не розрізняє
+    # звичайний auto та Automatic (Delayed Start) — прапорець delayed
+    # живе окремим значенням реєстру DelayedAutostart. $null = службу не
+    # знайдено або значення відсутнє (для не-Automatic служб воно
+    # нерелевантне).
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$ServiceName)
+
+    $registryPath = "HKLM:\SYSTEM\CurrentControlSet\Services\$ServiceName"
+    if (-not (Test-Path -LiteralPath $registryPath)) {
+        return $null
+    }
+    $properties = Get-ItemProperty -LiteralPath $registryPath -ErrorAction SilentlyContinue
+    if ($null -eq $properties -or
+        $null -eq ($properties.PSObject.Properties['DelayedAutostart'])) {
+        return $false
+    }
+    return ([int]$properties.DelayedAutostart -eq 1)
+}
+
+function Set-BRAVOBootRestoreServiceStartType {
+    # Канонічне (єдине в комплекті) місце, де BRAVO змінює start type
+    # служб Windows. Використовується ЛИШЕ інсталятором Планувальника для
+    # профілю Restore.BootRestoreMode:
+    #
+    #   HoldServices: керовані служби -> Automatic (Delayed Start), щоб
+    #     Recovery-boot-завдання (delay 0) стартувало РАНІШЕ за них і
+    #     встигло виконати пропущену реставрацію до входу клієнтів.
+    #     Manual/Disabled НЕ чіпаються (site-рішення; вони й так не
+    #     стартують самі — «hold» виконується природно).
+    #
+    #   None: повернути звичайний Automatic ЛИШЕ службам, які зараз
+    #     Automatic (Delayed Start) — тобто відкотити виключно власну
+    #     попередню зміну; Manual/Disabled знову не чіпаються.
+    #
+    # -ValidateOnly: тільки читання/звіт, жодних змін (режим VALIDATE
+    # інсталятора). Збій зміни не throw-ить — повертається в записі
+    # результату, рішення про фатальність ухвалює викликач.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string[]]$ServiceNames,
+        [Parameter(Mandatory = $true)][bool]$HoldServices,
+        [switch]$ValidateOnly
+    )
+
+    $results = New-Object System.Collections.Generic.List[object]
+    foreach ($serviceName in $ServiceNames) {
+        if ([string]::IsNullOrWhiteSpace($serviceName)) { continue }
+        $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+        if ($null -eq $service) {
+            [void]$results.Add([pscustomobject]@{
+                Name = $serviceName; Found = $false; StartType = $null
+                DelayedAutoStart = $null; Action = 'NotFound'
+                Success = $true; Details = 'службу не знайдено — пропущено'
+            })
+            continue
+        }
+        $startType = [string]$service.StartType
+        $delayed = Get-BRAVOServiceDelayedAutoStart -ServiceName $serviceName
+        $action = 'None'
+        $targetArgument = $null
+        if ($startType -eq 'Automatic') {
+            if ($HoldServices -and -not $delayed) {
+                $action = 'SetDelayedAuto'; $targetArgument = 'delayed-auto'
+            } elseif (-not $HoldServices -and $delayed) {
+                $action = 'SetAuto'; $targetArgument = 'auto'
+            }
+        } elseif ($HoldServices) {
+            $action = 'SkippedNotAutomatic'
+        }
+        $success = $true
+        $details = $null
+        if ($null -ne $targetArgument -and -not $ValidateOnly) {
+            # sc.exe вимагає пробіл ПІСЛЯ 'start=' — це синтаксис утиліти.
+            & "$env:SystemRoot\System32\sc.exe" config $serviceName start= $targetArgument | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+                $success = $false
+                $details = "sc config start= $targetArgument завершився з кодом $LASTEXITCODE"
+            }
+        }
+        [void]$results.Add([pscustomobject]@{
+            Name = $serviceName; Found = $true; StartType = $startType
+            DelayedAutoStart = $delayed; Action = $action
+            Success = $success; Details = $details
+        })
+    }
+    return ,$results.ToArray()
 }
 
 function Get-BRAVOTaskRootReadinessResults {

@@ -272,16 +272,12 @@ function New-BRAVOTaskDefinition {
 
     $definition.Settings.Enabled = $true
     # Recovery окремо від інших task types: StartWhenAvailable=true, а не
-    # глобальний schedulerSettings.StartWhenAvailable (типово false). Якщо
-    # daily trigger на Restore.WindowStart пропущено через sleep/offline, а
-    # система стає доступною ще ВСЕРЕДИНІ вікна, Task Scheduler повинен
-    # наздогнати пропущений запуск негайно, а не чекати наступного дня.
-    # Безпечно ЛИШЕ разом із P0 TOCTOU-переперевіркою в
-    # BRAVO_MAINTENANCE.ps1 (Test-BRAVORestoreExecutionStillAllowed,
-    # обидва бар'єри): запізніле надолуження ПОЗА вікном коректно no-op,
-    # без деструктивного bravocmd.exe. На boot-trigger (той самий task,
-    # той самий Settings) StartWhenAvailable семантично не впливає — це
-    # властивість "пропущений запланований момент", а не подієвий тригер.
+    # глобальний schedulerSettings.StartWhenAvailable (типово false).
+    # Історично це страхувало пропущений daily-тик; з 5.2.0 Recovery має
+    # лише boot-trigger, на який StartWhenAvailable семантично не впливає
+    # (це властивість «пропущений запланований момент», а не подієвий
+    # тригер) — значення збережено як нешкідливе і сумісне з майбутніми
+    # розкладовими тригерами, якщо вони колись повернуться.
     $definition.Settings.StartWhenAvailable = if ($TaskType -eq "Recovery") {
         $true
     } else {
@@ -322,19 +318,17 @@ function New-BRAVOTaskDefinition {
     } else {
         ConvertTo-ScheduleTime -Value $TaskSettings.DailyAt -SettingName "$TaskType.DailyAt"
     }
-    # Recovery-завдання тепер завжди зареєстроване (Scheduler.Recovery.Enabled
-    # більше не залежить від Restore.RunMissedOnStartup — див. BRAVO.config):
-    # daily trigger на Restore.WindowStart — безумовний, постійний safety net.
-    # Boot-trigger (швидша реакція одразу після перезавантаження) — лише коли
-    # оператор явно хоче цю поведінку через Restore.RunMissedOnStartup=true.
-    # Обидва trigger викликають ТОЙ САМИЙ Action (-RunMissedRestoreOnly) —
-    # нового коду реставрації немає.
-    $recoveryRunMissedOnStartup = if ($TaskType -eq "Recovery") {
-        [bool]$maintenanceSettings.Restore.RunMissedOnStartup
-    } else {
-        $false
-    }
-    if ($TaskType -eq "Recovery" -and $recoveryRunMissedOnStartup) {
+    # Recovery-завдання (5.2.0) існує ЛИШЕ на серверах робочого часу
+    # (Restore.BootRestoreMode="HoldServices" -> Scheduler.Recovery.Enabled;
+    # на 24/7-профілі "None" завдання вимикається інсталятором, а пропущений
+    # слот підхоплює щонічне Maintenance у вікні реставрації). Тому тут воно
+    # має рівно ОДИН boot-trigger БЕЗ Repetition: реставрація виконується
+    # одразу після старту сервера, поки служби (Automatic Delayed Start) ще
+    # не запущені; повтор невдалої спроби — наступний старт сервера.
+    # Раніший дизайн (daily-trigger о WindowStart + boot-Repetition
+    # 15 хв/8 год) прибрано: на production-сервері BRAVO 2026-08-20 repetition-хвіст будив
+    # завдання кожні 15 хв ще довго після успішної реставрації.
+    if ($TaskType -eq "Recovery") {
         $trigger = $definition.Triggers.Create(8) # TASK_TRIGGER_BOOT
         $delayMinutes = [math]::Max(0, [int]$TaskSettings.StartupDelayMinutes)
         if ($delayMinutes -gt 0) {
@@ -343,7 +337,7 @@ function New-BRAVOTaskDefinition {
             )
         }
         $trigger.Enabled = $true
-    } elseif ($TaskType -ne "Recovery") {
+    } else {
         $trigger = $definition.Triggers.Create(2) # TASK_TRIGGER_DAILY
         $trigger.StartBoundary = $triggerTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
         $trigger.Enabled = $true
@@ -364,40 +358,6 @@ function New-BRAVOTaskDefinition {
         $trigger.Repetition.Duration = "P1D"
         $trigger.Repetition.StopAtDurationEnd = $false
     }
-    if ($TaskType -eq "Recovery" -and $recoveryRunMissedOnStartup) {
-        $trigger.Repetition.Interval = [System.Xml.XmlConvert]::ToString(
-            [timespan]::FromMinutes([int]$TaskSettings.RetryEveryMinutes)
-        )
-        $trigger.Repetition.Duration = [System.Xml.XmlConvert]::ToString(
-            [timespan]::FromHours([double]$TaskSettings.RetryDurationHours)
-        )
-        $trigger.Repetition.StopAtDurationEnd = $false
-    }
-    if ($TaskType -eq "Recovery") {
-        # Daily trigger на ТОМУ САМОМУ Recovery-завданні (той самий Action,
-        # -RunMissedRestoreOnly) — не окремий Windows task, і БЕЗУМОВНИЙ:
-        # єдиний надійний щоденний шлях підхоплення пропущеної реставрації
-        # незалежно від Maintenance.DailyAt, reboot і RunMissedOnStartup.
-        # $restoreWindowOpen у BRAVO_MAINTENANCE.ps1 і так відкидає спроби
-        # поза вікном — цей trigger лише забезпечує, що спроба СТАНЕТЬСЯ.
-        # Час НЕ хардкодиться: береться з Restore.WindowStart (той самий
-        # default "21:00" за відсутності ключа, що й
-        # BRAVO.Maintenance.Runtime.ps1 застосовує до вікна).
-        $restoreWindowStartSetting = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
-            -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
-            [string]$maintenanceSettings.Restore.WindowStart
-        } else {
-            "21:00"
-        }
-        $dailyRecoveryTime = ConvertTo-ScheduleTime `
-            -Value $restoreWindowStartSetting `
-            -SettingName "Restore.WindowStart"
-        $dailyRecoveryTrigger = $definition.Triggers.Create(2) # TASK_TRIGGER_DAILY
-        $dailyRecoveryTrigger.StartBoundary = $dailyRecoveryTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
-        $dailyRecoveryTrigger.Enabled = $true
-        $dailyRecoveryTrigger.DaysInterval = 1
-    }
-
     $scriptPath = (Resolve-Path -Path $TaskSettings.ScriptPath).Path
     $actionArguments = "-NoLogo -NoProfile -NonInteractive"
     $actionArguments += " -WindowStyle $($schedulerSettings.WindowStyle)"
@@ -454,13 +414,6 @@ function Format-BRAVOInstalledTaskSummaryNextRun {
     }
     if ($TaskType -eq "Recovery") {
         $nextRunArguments.StartupDelayMinutes = [int]$TaskSettings.StartupDelayMinutes
-        $nextRunArguments.DailyWindowStart = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
-            -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
-            [string]$maintenanceSettings.Restore.WindowStart
-        } else {
-            "21:00"
-        }
-        $nextRunArguments.HasBootTrigger = [bool]$maintenanceSettings.Restore.RunMissedOnStartup
     }
 
     return Format-BRAVOSchedulerNextRun @nextRunArguments
@@ -609,11 +562,6 @@ function Test-SchedulerConfiguration {
         [int]$schedulerSettings.Recovery.StartupDelayMinutes -lt 0) {
         throw "Recovery.StartupDelayMinutes не може бути від'ємним"
     }
-    if ($schedulerSettings.Recovery.Enabled -and
-        ([int]$schedulerSettings.Recovery.RetryEveryMinutes -lt 1 -or
-         [int]$schedulerSettings.Recovery.RetryDurationHours -lt 1)) {
-        throw "Recovery retry має мати інтервал і тривалість не менше 1"
-    }
 
     # P1 (safety-review): BRAVO_MAINTENANCE/BRAVO_RESTORE_RECOVERY реально
     # керують службою й ротацією системних журналів — якщо вони увімкнені, а
@@ -701,7 +649,7 @@ try {
         -Institution ([string]$bravoSettings.InstitutionName) `
         -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
         -Mode $(if ($ValidateOnly) { 'VALIDATE' } else { 'INSTALL' })
-    $script:BRAVOTasksInstallStepTotal = 4
+    $script:BRAVOTasksInstallStepTotal = 5
     $script:BRAVOTasksInstallStepCurrent = 0
     function Write-BRAVOTasksInstallStep {
         param(
@@ -810,6 +758,39 @@ try {
         Write-BRAVOTasksInstallStep -Name 'Task Scheduler Operational log' -Status OK
     }
 
+    # Start type керованих служб — частина профілю Restore.BootRestoreMode
+    # (BRAVO.config): HoldServices -> Automatic (Delayed Start), щоб
+    # Recovery-boot-завдання встигло виконати пропущену реставрацію до
+    # старту служб; None -> повернення звичайного Automatic лише зі стану
+    # delayed-auto. Канонічна реалізація — BRAVO.System
+    # (Set-BRAVOBootRestoreServiceStartType); Manual/Disabled не чіпаються.
+    $bootRestoreHoldServices = ([string]$maintenanceSettings.Restore.BootRestoreMode -eq 'HoldServices')
+    $bootRestoreServiceNames = @(
+        [string]$maintenanceSettings.Services.BravoName
+        [string]$maintenanceSettings.Services.ExchangeApiName
+    ) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $startTypeResults = Set-BRAVOBootRestoreServiceStartType `
+        -ServiceNames $bootRestoreServiceNames `
+        -HoldServices $bootRestoreHoldServices `
+        -ValidateOnly:$ValidateOnly
+    $startTypeFailures = @($startTypeResults | Where-Object { -not $_.Success })
+    $startTypeChanges = @($startTypeResults | Where-Object { $_.Action -in @('SetDelayedAuto', 'SetAuto') })
+    $startTypeDetailsText = ($startTypeResults | ForEach-Object {
+        $delayedText = if ($_.DelayedAutoStart) { 'delayed-auto' } else { [string]$_.StartType }
+        "{0}: {1} ({2})" -f $_.Name, $delayedText, $_.Action
+    }) -join '; '
+    if ($ValidateOnly) {
+        Write-BRAVOTasksInstallStep -Name 'Start type служб (BootRestoreMode)' -Status SKIPPED -Details "лише перевірка: $startTypeDetailsText"
+    } elseif ($startTypeFailures.Count -gt 0) {
+        # Невдала зміна start type ламає гарантію «клієнти не зайдуть до
+        # реставрації» у HoldServices-профілі — це помилка інсталяції.
+        throw "Не вдалося змінити start type служб: $(($startTypeFailures | ForEach-Object { "$($_.Name): $($_.Details)" }) -join '; ')"
+    } elseif ($startTypeChanges.Count -gt 0) {
+        Write-BRAVOTasksInstallStep -Name 'Start type служб (BootRestoreMode)' -Status OK -Details $startTypeDetailsText
+    } else {
+        Write-BRAVOTasksInstallStep -Name 'Start type служб (BootRestoreMode)' -Status OK -Details "змін не потрібно: $startTypeDetailsText"
+    }
+
     $taskFolder = Get-BRAVOScheduledTaskFolder -TaskService $taskService -TaskPath $taskPath
     if (-not $ValidateOnly -and @($taskPlans | Where-Object { $_.Settings.Enabled }).Count -gt 0) {
         $taskFolder = Ensure-ScheduledTaskFolder -TaskService $taskService -TaskPath $taskPath
@@ -875,17 +856,7 @@ try {
             $scheduleText = if ($taskPlan.Type -eq "Backup" -or $taskPlan.Type -eq "Maintenance") {
                 "щодня о $($taskSettings.DailyAt)"
             } elseif ($taskPlan.Type -eq "Recovery") {
-                $previewRestoreWindowStart = if ($maintenanceSettings.Restore -is [System.Collections.IDictionary] -and
-                    -not [string]::IsNullOrWhiteSpace([string]$maintenanceSettings.Restore.WindowStart)) {
-                    [string]$maintenanceSettings.Restore.WindowStart
-                } else {
-                    "21:00"
-                }
-                if ([bool]$maintenanceSettings.Restore.RunMissedOnStartup) {
-                    "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.) та щодня о $previewRestoreWindowStart"
-                } else {
-                    "щодня о $previewRestoreWindowStart (Restore.RunMissedOnStartup=false: без boot-trigger)"
-                }
+                "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.; профіль робочого часу)"
             } elseif ($taskPlan.Type -eq "BAZASync") {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
             } else {

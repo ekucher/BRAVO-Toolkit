@@ -86,6 +86,38 @@ Runtime.ps1 decomposition.
   in-place mirror + guard/scheduler/setup gates + update journal +
   auto-rollback), planned for this cycle; silent auto-update remains
   architecturally forbidden until full P3.2/P4.
+- Missed-restore redesign (server profiles). New config key
+  maintenanceSettings.Restore.BootRestoreMode replaces
+  RunMissedOnStartup (loader warns about the stale key):
+  - "None" (default, 24/7 server): the BRAVO_RESTORE_RECOVERY task is
+    no longer registered (an existing one is disabled by the
+    installer); a missed restore slot is picked up by the next nightly
+    BRAVO_MAINTENANCE (23:55) inside the restore window — previously a
+    separate Recovery daily trigger ran it at 21:00 instead.
+  - "HoldServices" (work-hours server that is powered off at night and
+    never sees the restore window): the installer switches
+    BRAVO/exchangAPI to Automatic (Delayed Start) (new canonical
+    BRAVO.System function Set-BRAVOBootRestoreServiceStartType — the
+    only place in the kit that changes service start types) and
+    registers Recovery with a single boot trigger (delay 0, no
+    repetition). At server startup the missed restore runs OUTSIDE the
+    window while the services are held stopped, so clients cannot
+    enter the application before the model is replaced; fail-open —
+    if the task does not run, delayed auto-start brings services up.
+  - The former boot-trigger repetition (15 min for 8 h) is removed: on
+    a production BRAVO server (2026-08-20) its tail kept waking the task every 15 minutes
+    long after the restore had succeeded.
+  - Quiescence integration (post-rebase review): the destructive model
+    restore phase (bravocmd) now runs under a suppressed ownership
+    marker — a hard kill mid-restore makes the Health watchdog raise a
+    CRITICAL manual-recovery alert instead of auto-starting services
+    over a half-restored model (suppression failure aborts the restore
+    before bravocmd, fail-closed; the marker returns to auto-start mode
+    once the model is consistent again). The boot HoldServices profile
+    forces every enabled managed service into the stop/marker/restart
+    scope regardless of the boot race with delayed auto-start, and the
+    service snapshot now counts StartPending as running in all
+    profiles.
 
 ## 5.1.0 — 2026-08-20
 
