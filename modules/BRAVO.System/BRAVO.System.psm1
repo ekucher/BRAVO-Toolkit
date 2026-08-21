@@ -134,6 +134,105 @@ function Get-BRAVOServiceQuiescenceStatePath {
     return Join-Path $programDataRoot 'BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json'
 }
 
+function Protect-BRAVOMachineStateRoot {
+    # Захист каталогу машинного стану %ProgramData%\BRAVO\State (review F4).
+    #
+    # Загроза: quiescence-маркер став ВХОДОМ для привілейованої дії
+    # (SYSTEM-Health виконує Start-Service за його вмістом), а стандартні
+    # успадковані ACL ProgramData дозволяють звичайним користувачам
+    # створювати файли у підкаталогах — локальний непривілейований
+    # користувач міг би підкинути маркер. Той самий каталог тримає
+    # VSS-ownership і BAZA-стан, тож зміцнення діє на весь State-корінь.
+    #
+    # Apply-режим (типовий, потребує адмін-прав): створює каталог за
+    # потреби, вимикає успадкування і лишає FullControl лише для SYSTEM
+    # та BUILTIN\Administrators (SID-и, не локалізовані імена — той самий
+    # підхід, що Set-PrivateDirectoryAcl у BRAVO_CREDENTIALS_SETUP).
+    # -CheckOnly: лише читає поточні ACL і звітує невідповідності, нічого
+    # не змінюючи (для ValidateOnly/неелевованих прогонів SETUP).
+    #
+    # Compliant оцінює стан ДО застосування: успадкування вимкнено і немає
+    # Allow-ACE для широких принципалів (Users/Authenticated Users/
+    # Everyone/INTERACTIVE/CREATOR OWNER) — перевіряється саме вектор
+    # «непривілейований запис», а не повна еквівалентність еталону.
+    [CmdletBinding()]
+    param(
+        [switch]$CheckOnly,
+        # Для self-test: захист довільного каталогу без дотику до
+        # реального %ProgramData%. У production не передається.
+        [string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        $Path = Split-Path -Path (Get-BRAVOServiceQuiescenceStatePath) -Parent
+    }
+
+    $broadPrincipalSids = @(
+        (New-Object Security.Principal.SecurityIdentifier('S-1-1-0')),   # Everyone
+        (New-Object Security.Principal.SecurityIdentifier('S-1-5-11')),  # Authenticated Users
+        (New-Object Security.Principal.SecurityIdentifier('S-1-5-32-545')), # BUILTIN\Users
+        (New-Object Security.Principal.SecurityIdentifier('S-1-5-4')),   # INTERACTIVE
+        (New-Object Security.Principal.SecurityIdentifier('S-1-3-0'))    # CREATOR OWNER
+    )
+
+    $issues = @()
+    $directoryExists = [IO.Directory]::Exists($Path)
+    if (-not $directoryExists) {
+        $issues += "каталог ще не існує: $Path (буде створений з успадкованими ACL ProgramData)"
+    } else {
+        $currentAcl = Get-Acl -LiteralPath $Path
+        if (-not $currentAcl.AreAccessRulesProtected) {
+            $issues += 'успадкування ACL не вимкнено — діють стандартні права ProgramData'
+        }
+        foreach ($accessRule in @($currentAcl.Access)) {
+            if ($accessRule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+            $ruleSid = $null
+            try {
+                $ruleSid = $accessRule.IdentityReference.Translate([Security.Principal.SecurityIdentifier])
+            } catch {
+                # Неперекладний принципал (осиротілий SID) — не широкий.
+                continue
+            }
+            foreach ($broadSid in $broadPrincipalSids) {
+                if ($ruleSid -eq $broadSid) {
+                    $issues += "Allow-ACE для широкого принципала: $($accessRule.IdentityReference) ($($accessRule.FileSystemRights))"
+                    break
+                }
+            }
+        }
+    }
+    $compliantBeforeApply = ($issues.Count -eq 0)
+
+    $applied = $false
+    if (-not $CheckOnly -and -not $compliantBeforeApply) {
+        if (-not $directoryExists) {
+            [void][IO.Directory]::CreateDirectory($Path)
+        }
+        $systemSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-18')
+        $administratorsSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
+        $protectedAcl = New-Object Security.AccessControl.DirectorySecurity
+        $protectedAcl.SetAccessRuleProtection($true, $false)
+        foreach ($allowedSid in @($systemSid, $administratorsSid)) {
+            $protectedAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                $allowedSid,
+                [Security.AccessControl.FileSystemRights]::FullControl,
+                [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+                [Security.AccessControl.PropagationFlags]::None,
+                [Security.AccessControl.AccessControlType]::Allow
+            )))
+        }
+        Set-Acl -LiteralPath $Path -AclObject $protectedAcl
+        $applied = $true
+    }
+
+    return [pscustomobject]@{
+        Path = $Path
+        Compliant = $compliantBeforeApply
+        Applied = $applied
+        Issues = @($issues)
+    }
+}
+
 function Get-BRAVOCurrentProcessStartTimeText {
     # Module-qualified: захист від затінення Get-Process функцією-стабом
     # у сесії викликача (реальний випадок у self-test).

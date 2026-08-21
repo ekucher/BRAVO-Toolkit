@@ -10,6 +10,21 @@ debt): deduplication of service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
 Runtime.ps1 decomposition.
 
+- Quiescence watchdog hardening (review F4/F5): the watchdog starts
+  only services from the canonical managed set resolved from
+  maintenanceSettings.Services (including resolved BravoWeb
+  candidates) — a marker entry outside that set is refused with an
+  ERROR alert and the marker is kept (fail-safe: unavailable
+  configuration yields an empty set and a full refusal), so a
+  planted/edited marker can no longer make SYSTEM-Health start an
+  arbitrary service. BRAVO_SETUP now hardens the machine state root
+  ACL (`Protect-BRAVOMachineStateRoot`, new BRAVO.System export):
+  `%ProgramData%\BRAVO\State` gets inheritance disabled with
+  FullControl only for SYSTEM and Administrators; ValidateOnly and
+  non-elevated runs report compliance without changing anything.
+  Watchdog reporting no longer counts an already-running service as
+  "recovered" — the operator sees the actual incident scope.
+
 - CI: push- and pull_request-event check names split (jobs get a
   " (push)" suffix outside pull_request context). During the 5.1.0
   stable promotion the same head SHA carried a green PR run and the

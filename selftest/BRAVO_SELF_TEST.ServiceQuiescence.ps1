@@ -31,6 +31,7 @@ function Set-BRAVOSelfTestQuiescenceStatePath {
         -FunctionNames @(
             'Get-BRAVOServiceQuiescenceStatePath',
             'Set-BRAVOSelfTestQuiescenceStatePath',
+            'Protect-BRAVOMachineStateRoot',
             'Get-BRAVOCurrentProcessStartTimeText',
             'Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess',
             'Write-BRAVOServiceQuiescenceState',
@@ -255,9 +256,13 @@ function Test-BRAVOProcessAlive {
     param([int]$ProcessId, [string]$ProcessStartTime)
     return [bool]$script:BRAVOSelfTestQuiescenceOwnerAlive
 }
+function Get-BRAVOQuiescenceWatchdogAllowedServiceNames {
+    return @($script:BRAVOSelfTestQuiescenceAllowedServices)
+}
 function Get-Service {
     param([string]$Name, $ErrorAction)
-    return [pscustomobject]@{ Name = $Name; Status = 'Stopped' }
+    $serviceStatus = if (@($script:BRAVOSelfTestQuiescenceRunningServices) -contains $Name) { 'Running' } else { 'Stopped' }
+    return [pscustomobject]@{ Name = $Name; Status = $serviceStatus }
 }
 function Start-Service {
     param([string]$Name, $ErrorAction)
@@ -273,10 +278,19 @@ function Clear-BRAVOServiceQuiescenceState {
     return $true
 }
 function Invoke-BRAVOSelfTestQuiescenceScenario {
-    param($State, [bool]$OwnerAlive, [string[]]$StartFailures, [object[]]$ReadQueue = @())
+    param(
+        $State,
+        [bool]$OwnerAlive,
+        [string[]]$StartFailures,
+        [object[]]$ReadQueue = @(),
+        [string[]]$AllowedServices = @('BRAVO', 'exchangAPI', 'BravoWeb'),
+        [string[]]$RunningServices = @()
+    )
     $script:BRAVOSelfTestQuiescenceReadResult = $State
     $script:BRAVOSelfTestQuiescenceReadQueue = @($ReadQueue)
     $script:BRAVOSelfTestQuiescenceReadIndex = 0
+    $script:BRAVOSelfTestQuiescenceAllowedServices = @($AllowedServices)
+    $script:BRAVOSelfTestQuiescenceRunningServices = @($RunningServices)
     $script:BRAVOSelfTestQuiescenceOwnerAlive = $OwnerAlive
     $script:BRAVOSelfTestQuiescenceStartFailures = @($StartFailures)
     $script:BRAVOSelfTestQuiescenceStartedServices = @()
@@ -297,6 +311,9 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             'Write-HealthLog',
             'Read-BRAVOServiceQuiescenceState',
             'Test-BRAVOProcessAlive',
+            # Стаб (перший у SourceText) затіняє реальний однойменний хелпер
+            # з Health-тексту: FindAll бере перше визначення.
+            'Get-BRAVOQuiescenceWatchdogAllowedServiceNames',
             'Get-Service',
             'Start-Service',
             'Clear-BRAVOServiceQuiescenceState',
@@ -431,6 +448,166 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
         -Name "ServiceQuiescence/WatchdogAbortsWhenMarkerReplacedOrVanishedBeforeStart" `
         -Failure "TOCTOU: маркер перезаписано новим власником або зник перед Start-Service — watchdog не стартує, не чистить, не створює issues"
 
+    # (є) РЕГРЕСІЯ (review F4): маркер вимагає службу поза канонічним
+    # керованим набором конфігурації (підкинутий/відредагований файл) —
+    # watchdog МУСИТЬ відмовити саме їй, лишити маркер і зробити відмову
+    # видимою оператору; легітимні служби з маркера стартують.
+    $tamperedQuiescenceMarker = $orphanedQuiescenceMarker.PSObject.Copy()
+    $tamperedQuiescenceMarker.services = @(
+        [pscustomobject]@{ Name = 'BRAVO'; RestartIntent = $true },
+        [pscustomobject]@{ Name = 'EvilSvc'; RestartIntent = $true }
+    )
+    $tamperedMarkerScenario = & $quiescenceWatchdogModule {
+        param($State)
+        Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @()
+    } $tamperedQuiescenceMarker
+    Test-BRAVOCondition `
+        -Condition (
+            @($tamperedMarkerScenario.StartedServices).Count -eq 1 -and
+            @($tamperedMarkerScenario.StartedServices) -contains 'BRAVO' -and
+            $tamperedMarkerScenario.MarkerCleared -eq $false -and
+            @($tamperedMarkerScenario.Issues).Count -eq 1 -and
+            [string]$tamperedMarkerScenario.Issues[0].Reason -match 'EvilSvc' -and
+            [string]$tamperedMarkerScenario.Issues[0].Reason -match 'не входить до керованого набору'
+        ) `
+        -Name "ServiceQuiescence/WatchdogRefusesServiceOutsideManagedSet" `
+        -Failure "служба поза керованим набором конфігурації: відмова у старті, маркер лишається, issue називає відхилену службу"
+
+    # (ж) РЕГРЕСІЯ (review F4, fail-safe): порожній керований набір
+    # (конфігурація недоступна) — жодного старту взагалі.
+    $emptyAllowedScenario = & $quiescenceWatchdogModule {
+        param($State)
+        Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @() -AllowedServices @()
+    } $orphanedQuiescenceMarker
+    Test-BRAVOCondition `
+        -Condition (
+            @($emptyAllowedScenario.StartedServices).Count -eq 0 -and
+            $emptyAllowedScenario.MarkerCleared -eq $false -and
+            @($emptyAllowedScenario.Issues).Count -eq 1
+        ) `
+        -Name "ServiceQuiescence/WatchdogRefusesAllWhenManagedSetUnavailable" `
+        -Failure "без керованого набору конфігурації watchdog не має права стартувати жодну службу (fail-safe)"
+
+    # (з) РЕГРЕСІЯ (review F5): службу, що вже працює, НЕ рапортуємо як
+    # «відновлену» — оператор має бачити фактичний масштаб аварії; маркер
+    # при цьому прибирається (мета — служби працюють — досягнута).
+    $alreadyRunningScenario = & $quiescenceWatchdogModule {
+        param($State)
+        Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @() -RunningServices @('BRAVO')
+    } $orphanedQuiescenceMarker
+    Test-BRAVOCondition `
+        -Condition (
+            @($alreadyRunningScenario.StartedServices).Count -eq 1 -and
+            @($alreadyRunningScenario.StartedServices) -contains 'exchangAPI' -and
+            -not (@($alreadyRunningScenario.StartedServices) -contains 'BRAVO') -and
+            $alreadyRunningScenario.MarkerCleared -eq $true -and
+            @($alreadyRunningScenario.Issues).Count -eq 1 -and
+            [string]$alreadyRunningScenario.Issues[0].Reason -match 'відновлено автоматично' -and
+            [string]$alreadyRunningScenario.Issues[0].Reason -match 'вже працювали'
+        ) `
+        -Name "ServiceQuiescence/WatchdogDoesNotReportAlreadyRunningAsRecovered" `
+        -Failure "вже запущена служба не потрапляє у «відновлено автоматично»; issue розділяє відновлені та ті, що вже працювали"
+
+    # ============================================================
+    # Реальний хелпер білого списку (review F4): резолюція канонічного
+    # керованого набору з maintenanceSettings.Services — імена BRAVO/
+    # exchangAPI напряму, BravoWeb через кандидатів (Name і DisplayName);
+    # відсутня конфігурація -> порожній список (fail-safe).
+    # ============================================================
+    $allowedNamesStubs = @'
+function Test-BRAVOSettingEnabled { param($Value) return [bool]$Value }
+function Get-Service {
+    param([string]$Name, [string]$DisplayName, $ErrorAction)
+    if ($PSBoundParameters.ContainsKey('Name') -and $Name -eq 'Apache2.4') {
+        return [pscustomobject]@{ Name = 'Apache2.4' }
+    }
+    if ($PSBoundParameters.ContainsKey('DisplayName') -and $DisplayName -eq 'BRAVO Web Display') {
+        return [pscustomobject]@{ Name = 'ApacheByDisplay' }
+    }
+    return $null
+}
+'@
+    $allowedNamesModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($allowedNamesStubs + "`n" + $healthRuntimeTextForQuiescence) `
+        -FunctionNames @(
+            'Test-BRAVOSettingEnabled',
+            'Get-Service',
+            'Get-BRAVOQuiescenceWatchdogAllowedServiceNames'
+        )
+    $resolvedAllowedNames = & $allowedNamesModule {
+        $script:maintenanceSettings = @{
+            Services = @{
+                BravoName = 'BRAVO'
+                ExchangeApiName = 'exchangAPI'
+                BravoWebEnabled = $true
+                BravoWebCandidates = @('NoSuchSvc', 'BRAVO Web Display', 'Apache2.4')
+            }
+        }
+        Get-BRAVOQuiescenceWatchdogAllowedServiceNames
+    }
+    $absentConfigAllowedNames = & $allowedNamesModule {
+        # Явний null у module-scope: перекриває можливий global
+        # $maintenanceSettings із сесії self-test.
+        $script:maintenanceSettings = $null
+        Get-BRAVOQuiescenceWatchdogAllowedServiceNames
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($resolvedAllowedNames).Count -eq 4 -and
+            @($resolvedAllowedNames) -contains 'BRAVO' -and
+            @($resolvedAllowedNames) -contains 'exchangAPI' -and
+            @($resolvedAllowedNames) -contains 'ApacheByDisplay' -and
+            @($resolvedAllowedNames) -contains 'Apache2.4' -and
+            -not (@($resolvedAllowedNames) -contains 'NoSuchSvc') -and
+            @($absentConfigAllowedNames).Count -eq 0
+        ) `
+        -Name "ServiceQuiescence/AllowedServiceNamesResolveFromCanonicalConfigOnly" `
+        -Failure "білий список: BravoName/ExchangeApiName + резолвлені web-кандидати (Name і DisplayName), нерозв'язні кандидати відкинуті; без конфігурації — порожній"
+
+    # ============================================================
+    # Protect-BRAVOMachineStateRoot (review F4): зміцнення ACL
+    # State-кореня — на ІЗОЛЬОВАНОМУ TEMP-каталозі, реальний
+    # %ProgramData% не торкається (-Path).
+    # ============================================================
+    $stateAclTestRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        "bravo_selftest_stateacl_{0}" -f ([guid]::NewGuid().ToString("N"))
+    )
+    [void][IO.Directory]::CreateDirectory($stateAclTestRoot)
+    try {
+        $stateAclCheckBefore = & $quiescenceStateModule {
+            param($Path)
+            Protect-BRAVOMachineStateRoot -CheckOnly -Path $Path
+        } $stateAclTestRoot
+        $stateAclApplyResult = & $quiescenceStateModule {
+            param($Path)
+            Protect-BRAVOMachineStateRoot -Path $Path
+        } $stateAclTestRoot
+        $stateAclSecondApplyResult = & $quiescenceStateModule {
+            param($Path)
+            Protect-BRAVOMachineStateRoot -Path $Path
+        } $stateAclTestRoot
+        $stateAclAfterApply = Get-Acl -LiteralPath $stateAclTestRoot
+        $stateAclIdentitySids = @($stateAclAfterApply.Access | ForEach-Object {
+            $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
+        } | Sort-Object -Unique)
+        Test-BRAVOCondition `
+            -Condition (
+                $stateAclCheckBefore.Compliant -eq $false -and
+                $stateAclCheckBefore.Applied -eq $false -and
+                $stateAclApplyResult.Applied -eq $true -and
+                $stateAclSecondApplyResult.Compliant -eq $true -and
+                $stateAclSecondApplyResult.Applied -eq $false -and
+                $stateAclAfterApply.AreAccessRulesProtected -eq $true -and
+                @($stateAclIdentitySids).Count -eq 2 -and
+                @($stateAclIdentitySids) -contains 'S-1-5-18' -and
+                @($stateAclIdentitySids) -contains 'S-1-5-32-544'
+            ) `
+            -Name "ServiceQuiescence/ProtectStateRootDisablesInheritanceAndLimitsToSystemAndAdmins" `
+            -Failure "Protect-BRAVOMachineStateRoot: CheckOnly не змінює, apply вимикає успадкування і лишає лише SYSTEM+Administrators, повторний apply ідемпотентний"
+    } finally {
+        Remove-Item -LiteralPath $stateAclTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # ============================================================
     # Статичні перевірки інтеграції маркера в рантайми.
     # ============================================================
@@ -499,3 +676,24 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
         ) `
         -Name "ServiceQuiescence/HealthRunsWatchdogBeforeManagedServiceChecks" `
         -Failure "Health має запускати watchdog ДО оцінки керованих служб і вливати його issues у результат"
+
+    # Review F4: SETUP має зміцнювати ACL State-кореня (apply з адмін-правами,
+    # CheckOnly для ValidateOnly/неелевованого прогону), а watchdog —
+    # фільтрувати служби маркера через канонічний білий список.
+    $setupTextForQuiescence = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_SETUP.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $setupTextForQuiescence.Contains('Protect-BRAVOMachineStateRoot') -and
+            $setupTextForQuiescence.Contains('Protect-BRAVOMachineStateRoot -CheckOnly')
+        ) `
+        -Name "ServiceQuiescence/SetupHardensStateRootAcl" `
+        -Failure "BRAVO_SETUP.ps1 має викликати Protect-BRAVOMachineStateRoot (apply + CheckOnly-гілка)"
+    $watchdogFunctionBlock = $healthRuntimeTextForQuiescence.Substring(
+        $healthRuntimeTextForQuiescence.IndexOf('function Invoke-BRAVOServiceQuiescenceWatchdog'))
+    Test-BRAVOCondition `
+        -Condition ($watchdogFunctionBlock.Contains('Get-BRAVOQuiescenceWatchdogAllowedServiceNames')) `
+        -Name "ServiceQuiescence/WatchdogConsultsManagedServiceWhitelist" `
+        -Failure "watchdog має фільтрувати служби маркера через Get-BRAVOQuiescenceWatchdogAllowedServiceNames перед Start-Service"
