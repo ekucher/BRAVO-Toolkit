@@ -1899,6 +1899,162 @@ function Get-BRAVOBazaFastHealthResult {
 # ТЗ п.25) — викликач сам будує scriptblock навколо своєї вже наявної
 # реалізації порівняння.
 
+function Get-BRAVOBazaMutationReport {
+    # Read-only звіт про append-only мутації для оператора
+    # (BRAVO_BAZA_RECONCILE -ListOnly): знімок + стан -> перелік Verified-
+    # файлів, чий локальний size/mtime змінився після успішної передачі.
+    # Жодного SFTP I/O і жодних побічних ефектів — безпечно викликати
+    # будь-коли (state читається без lock, як усі read-only споживачі).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [Parameter(Mandatory = $true)][string]$StateRoot
+    )
+
+    $statePath = Get-BRAVOBazaStatePath -StateRoot $StateRoot -Component $Component
+    $stateRead = Read-BRAVOBazaState -Path $statePath
+    if (-not $stateRead.Exists) {
+        return [pscustomobject]@{ Success = $false; Error = "стан $Component ще не ініціалізовано ($statePath) — мутації неможливі без Verified-записів"; Mutations = @() }
+    }
+    if ($stateRead.Corrupt) {
+        return [pscustomobject]@{ Success = $false; Error = "стан $Component непридатний: $($stateRead.Reason) — спершу реконсиляція через BRAVO_ARCHIV"; Mutations = @() }
+    }
+    $snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+    if (-not $snapshot.Success) {
+        return [pscustomobject]@{ Success = $false; Error = $snapshot.Error; Mutations = @() }
+    }
+    $plan = Get-BRAVOBazaSyncPlan -Snapshot $snapshot -State $stateRead.State -MutationPolicy 'Fail'
+    $mutationReport = @($plan.MutationViolations | ForEach-Object {
+        $stateEntry = $stateRead.State.Files[$_.RelativePath]
+        [pscustomobject]@{
+            RelativePath = $_.RelativePath
+            PreviousSize = $_.PreviousSize
+            PreviousLastWriteTimeUtc = $_.PreviousLastWriteTimeUtc
+            UploadedUtc = [string]$stateEntry.UploadedUtc
+            CurrentSize = $_.CurrentSize
+            CurrentLastWriteTimeUtc = $_.CurrentLastWriteTimeUtc
+        }
+    })
+    return [pscustomobject]@{ Success = $true; Error = $null; Mutations = $mutationReport }
+}
+
+function Invoke-BRAVOBazaMutationReconciliation {
+    # Свідоме операторське розв'язання мутацій (BRAVO_BAZA_RECONCILE
+    # -Accept): для КОЖНОГО прийнятого шляху, який СПРАВДІ є в поточних
+    # MutationViolations:
+    #   1) стара remote-версія (якщо існує) перейменовується в
+    #      <ім'я>.replaced_<yyyyMMdd_HHmmss> — НІКОЛИ не видаляється
+    #      (історію додатково тримають снапшоти сховища);
+    #   2) запис прибирається зі state (наступний плановий цикл побачить
+    #      файл як нового кандидата і заллє нову версію на вільний шлях).
+    # Fail-closed: state-ключ видаляється ЛИШЕ після успішного кроку 1;
+    # перша помилка зупиняє обробку решти шляхів; state зберігається одним
+    # атомарним Save-BRAVOBazaState наприкінці (лише якщо є що зберігати).
+    # Жодного PutFiles/RemoveFiles тут немає за конструкцією — інструмент
+    # не заливає і не видаляє, тільки звільняє шлях і довіру.
+    # Виконується під компонентним sync-lock — не перетинається з
+    # Archive/Health-синхронізацією.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][string]$LocalDirectory,
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$RemoteRootPath,
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string[]]$AcceptRelativePaths
+    )
+
+    $result = [pscustomobject]@{
+        Success = $false
+        Component = $Component
+        Accepted = @()
+        RenamedRemote = @()
+        RemoteAbsent = @()
+        StateRemoved = @()
+        Failures = @()
+        Error = $null
+    }
+
+    $syncLock = Enter-BRAVOBazaSyncLock -StateRoot $StateRoot -Component $Component
+    if (-not $syncLock.Success) {
+        $result.Error = if ($syncLock.Classification -eq 'Busy') {
+            "інший процес зараз синхронізує ${Component}: $($syncLock.Error) — повторіть після завершення циклу"
+        } else {
+            "не вдалося отримати sync-lock ${Component}: $($syncLock.Error)"
+        }
+        return $result
+    }
+    try {
+        $statePath = Get-BRAVOBazaStatePath -StateRoot $StateRoot -Component $Component
+        $stateRead = Read-BRAVOBazaState -Path $statePath
+        if (-not $stateRead.Exists -or $stateRead.Corrupt) {
+            $result.Error = if ($stateRead.Corrupt) { "стан непридатний: $($stateRead.Reason)" } else { "стан не ініціалізовано: $statePath" }
+            return $result
+        }
+        $state = $stateRead.State
+        $snapshot = Get-BRAVOBazaLocalSnapshot -LocalDirectory $LocalDirectory
+        if (-not $snapshot.Success) {
+            $result.Error = $snapshot.Error
+            return $result
+        }
+        $plan = Get-BRAVOBazaSyncPlan -Snapshot $snapshot -State $state -MutationPolicy 'Fail'
+        $mutationPaths = @{}
+        foreach ($mutation in @($plan.MutationViolations)) { $mutationPaths[$mutation.RelativePath] = $true }
+
+        $renameSuffix = '.replaced_' + (Get-Date).ToString('yyyyMMdd_HHmmss')
+        $stateChanged = $false
+        foreach ($acceptPath in $AcceptRelativePaths) {
+            # Захист від помилкового -Accept довільного шляху: працюємо
+            # ЛИШЕ з фактичними мутаціями поточного плану.
+            if (-not $mutationPaths.ContainsKey($acceptPath)) {
+                $result.Failures += [pscustomobject]@{ RelativePath = $acceptPath; Stage = 'Validate'; Error = 'шлях не є поточною мутацією (можливо, вже розв''язаний або хибне ім''я)' }
+                break
+            }
+            $remoteFullPath = ($RemoteRootPath.TrimEnd('/') + '/' + $acceptPath.Replace('\', '/'))
+            try {
+                if ($Session.FileExists($remoteFullPath)) {
+                    $Session.MoveFile($remoteFullPath, $remoteFullPath + $renameSuffix)
+                    $result.RenamedRemote += [pscustomobject]@{ RelativePath = $acceptPath; RemotePath = $remoteFullPath; RenamedTo = $remoteFullPath + $renameSuffix }
+                } else {
+                    # Remote відсутній (нетиповий стан: state вірив, файлу
+                    # немає) — rename не потрібен, шлях і так вільний.
+                    $result.RemoteAbsent += $acceptPath
+                }
+            } catch {
+                $result.Failures += [pscustomobject]@{ RelativePath = $acceptPath; Stage = 'RemoteRename'; Error = $_.Exception.Message }
+                break
+            }
+            $state.Files.Remove($acceptPath)
+            $stateChanged = $true
+            $result.StateRemoved += $acceptPath
+            $result.Accepted += $acceptPath
+        }
+
+        if ($stateChanged) {
+            try {
+                Save-BRAVOBazaState -Path $statePath -State $state
+            } catch {
+                # Remote уже перейменовано, а state зберегти не вдалося:
+                # наступний цикл побачить ті самі мутації, але remote-шлях
+                # вільний -> після повторного reconcile (validate пройде,
+                # rename пропуститься як RemoteAbsent) стан зійдеться.
+                $result.Error = "remote-кроки виконано, але state не збережено: $($_.Exception.Message) — повторіть reconcile для тих самих шляхів"
+                return $result
+            }
+        }
+        $result.Success = ($result.Failures.Count -eq 0 -and $null -eq $result.Error)
+        return $result
+    } finally {
+        if ($null -ne $syncLock.Stream) {
+            try { $syncLock.Stream.Dispose() } catch {
+                # Lock-файл звільниться із завершенням процесу; результат
+                # reconcile уже обчислено — збій Dispose не критичний.
+            }
+        }
+    }
+}
+
 function Invoke-BRAVOBazaComponentSyncSession {
     [CmdletBinding()]
     param(
@@ -2051,5 +2207,7 @@ Export-ModuleMember -Function @(
     'Update-BRAVOBazaSyncResultNewAfterCutoff',
     'Test-BRAVOBazaSyncResultFresh',
     'Get-BRAVOBazaFastHealthResult',
-    'Invoke-BRAVOBazaComponentSyncSession'
+    'Invoke-BRAVOBazaComponentSyncSession',
+    'Get-BRAVOBazaMutationReport',
+    'Invoke-BRAVOBazaMutationReconciliation'
 )

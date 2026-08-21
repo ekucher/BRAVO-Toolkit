@@ -10,6 +10,24 @@ debt): deduplication of service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
 Runtime.ps1 decomposition.
 
+- New operator tool BRAVO_BAZA_RECONCILE.ps1 (guarded entrypoint) +
+  BRAVO.BazaSync exports Get-BRAVOBazaMutationReport /
+  Invoke-BRAVOBazaMutationReconciliation: one-command resolution of
+  append-only mutation violations (real incident 2026-08-21: five
+  ЗВТ PDFs legitimately regenerated in the BRAVO application).
+  -ListOnly shows old (state/cloud) vs new (local) versions with the
+  upload date and a TraceSRV.out verification hint; -Accept/-AcceptAll
+  renames the old remote version to *.replaced_<date> (rename-only,
+  never delete) and removes the state entry under the component sync
+  lock, so the next scheduled cycle uploads the new version; a rename
+  failure keeps the state entry (fail-closed). MutationPolicy="Fail"
+  is unchanged — an automatic overwrite policy is deliberately NOT
+  provided (ransomware would silently propagate to the cloud).
+  OPERATIONS gains a mutation-resolution runbook including the manual
+  fallback lessons (hashtable Files keyed by RelativePath; state I/O
+  strictly via [IO.File]:: UTF-8 — raw Get-Content/Set-Content mangle
+  Cyrillic keys; deleting keys alone just converts the block into
+  REMOTE_CONFLICT).
 - The suppressed-marker watchdog issue text is compacted to one cause
   + one action + the owner log ("перерване відновлення — потрібне
   РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: <шлях>");
