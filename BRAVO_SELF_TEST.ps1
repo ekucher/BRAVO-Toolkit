@@ -1416,7 +1416,9 @@ try {
             $maintenanceRuntimeTextForExitCodes.Contains('$script:restoreIntegrityFailed') -and
             $maintenanceRuntimeTextForExitCodes.Contains('-LocalArchiveFailed:$script:restoreArchiveFailed') -and
             $maintenanceRuntimeTextForExitCodes.Contains('-IntegrityTestFailed:$script:restoreIntegrityFailed') -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 10) -and
+            # 11-та точка (5.2.0): скасування реставрації перед bravocmd через
+            # збій переведення quiescence-маркера в suppressed (fail-closed).
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 9)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
@@ -5391,7 +5393,9 @@ try {
         # а НЕ через порожню гілку if ($restorePostponedByWindowClosing) —
         # тобто postponement за конструкцією не може лишити після себе
         # позначку "виконано".
-        $postponedBranchIndex = $maintenanceRestoreWindowText.IndexOf('if ($restorePostponedByWindowClosing) {')
+        # 5.2.0: гілка паузи охоплює і скасування перед bravocmd через збій
+        # suppression quiescence-маркера ($restoreAbortedBeforeDestructivePhase).
+        $postponedBranchIndex = $maintenanceRestoreWindowText.IndexOf('if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase) {')
         $successStateWriteIndex = $maintenanceRestoreWindowText.IndexOf(
             "Write-BRAVORestoreState -ScheduledOccurrence `$scheduledOccurrence -Status 'Succeeded'"
         )

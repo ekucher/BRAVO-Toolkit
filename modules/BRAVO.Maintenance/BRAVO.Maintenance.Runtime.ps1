@@ -5254,13 +5254,33 @@ $restoreCompletedAt = $null
 $script:bravoServiceStartedThisRun = $false
 
 try {
+# StartPending рахується як «працювала»: служба, що саме стартує на
+# момент знімка, все одно буде зупинена секцією нижче (вона зупиняє за
+# ФАКТИЧНИМ станом), і без restart-intent лишилася б лежати після
+# обслуговування; та сама семантика, що ShouldRestartAfterRestore у
+# DataRestore.
 $serviceWasRunning = @{
     Bravo = $BravoMaintenanceEnabled -and
-        (Get-Service -Name $BravoServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+        (Get-Service -Name $BravoServiceName -ErrorAction SilentlyContinue).Status -in @('Running', 'StartPending')
     ExchangeApi = $exchangAPIServiceEnabled -and
-        (Get-Service -Name $ExchangAPIServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+        (Get-Service -Name $ExchangAPIServiceName -ErrorAction SilentlyContinue).Status -in @('Running', 'StartPending')
     BravoWeb = $BravoWebMaintenanceEnabled -and
-        (Get-Service -Name $BravoWebServiceName -ErrorAction SilentlyContinue).Status -eq 'Running'
+        (Get-Service -Name $BravoWebServiceName -ErrorAction SilentlyContinue).Status -in @('Running', 'StartPending')
+}
+# Профіль робочого часу (boot-recovery, $bootRestoreIgnoresWindow):
+# «hold» — це ДЕТЕРМІНОВАНИЙ кінцевий стан (служби зупинені на час
+# реставрації, запущені після неї), а НЕ знімок гонитви з Automatic
+# (Delayed Start): службу, що ще НЕ встигла піднятися на момент знімка,
+# SCM запустив би ПОСЕРЕД деструктивної фази реставрації, а після
+# жорсткого переривання вона не мала б restart-intent у
+# ownership-маркері. Тому кожна УВІМКНЕНА керована служба примусово
+# трактується як «працювала»: зупинка нижче ідемпотентна (перевіряє
+# фактичний стан), маркер покриває всі керовані служби, finally поверне
+# все у Running.
+if ($bootRestoreIgnoresWindow) {
+    $serviceWasRunning.Bravo = $BravoMaintenanceEnabled
+    $serviceWasRunning.ExchangeApi = $exchangAPIServiceEnabled
+    $serviceWasRunning.BravoWeb = $BravoWebMaintenanceEnabled
 }
 # У boot-recovery профілю робочого часу ($bootRestoreIgnoresWindow) цей
 # guard НЕ діє: прогін стартує одразу після boot, і якщо служби
@@ -5332,6 +5352,9 @@ $stopServicesWarningsBefore = $script:BRAVOWarningCount
 # абортує зупинку (fail-closed): без маркера аварія знову була б
 # «мовчазною» — служби б лишились лежати без сліду власника.
 $script:quiescenceMarkerWrittenThisRun = $false
+# true = маркер зараз suppressed на час деструктивної фази реставрації
+# (bravocmd) — див. Restore-BRAVOMaintenanceQuiescenceAutostart нижче.
+$script:quiescenceMarkerSuppressedForRestore = $false
 if ($stopServicesRequired) {
     $quiescenceServices = @()
     if ($serviceWasRunning.Bravo) { $quiescenceServices += @{ Name = $BravoServiceName; RestartIntent = $true } }
@@ -5348,6 +5371,27 @@ if ($stopServicesRequired) {
         Write-Log -Message $quiescenceMarkerError -Level 'ERROR'
         Send-SlackAlert -Message $quiescenceMarkerError -IsCritical
         throw $quiescenceMarkerError
+    }
+}
+
+function Restore-BRAVOMaintenanceQuiescenceAutostart {
+    # Зворотний бік suppressed-фази реставрації: модель знову
+    # консистентна (успішний bravocmd без критичних змін АБО успішний
+    # відкат з архіву перед реставрацією) — маркер перезаписується без
+    # suppression, щоб при жорсткому перериванні РЕШТИ прогону watchdog
+    # знову мав право підняти служби автоматично. Збій тут не фатальний:
+    # suppressed-маркер безпечний (watchdog лише алертить), а graceful
+    # finally і так стартує служби та прибере власний маркер.
+    if (-not $script:quiescenceMarkerSuppressedForRestore) { return }
+    try {
+        [void](Write-BRAVOServiceQuiescenceState `
+            -Owner 'BRAVO_MAINTENANCE' `
+            -Services $quiescenceServices `
+            -LogFile ([string]$LOG_FILE))
+        $script:quiescenceMarkerSuppressedForRestore = $false
+        Write-Log -Message "Ownership-маркер повернуто в режим автостарту: модель консистентна після фази реставрації" -Level "INFO"
+    } catch {
+        Write-Log -Message "Не вдалося зняти suppressed з ownership-маркера після фази реставрації: $($_.Exception.Message) — при жорсткому перериванні решти прогону watchdog лише алертитиме (без автостарту), мовчазної шкоди немає" -Level "WARNING"
     }
 }
 
@@ -5492,6 +5536,10 @@ $restoreStepReported = $false
 # кидає виняток, коли до бар'єрів узагалі не доходимо ($shouldRestore=false
 # від самого початку, або службу BRAVO не вдалося зупинити).
 $restorePostponedByWindowClosing = $false
+# true = реставрацію скасовано ДО bravocmd через збій переведення
+# ownership-маркера в suppressed (fail-closed, критична помилка вже
+# зарапортована в місці скасування).
+$restoreAbortedBeforeDestructivePhase = $false
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
 # коли BRAVO зупинити не вдалося.
@@ -5608,15 +5656,43 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         "наступний плановий Maintenance повторить спробу в межах вікна."
                     ) -Level "WARNING"
                 } else {
-                    # Виконання реставрації через bravocmd.exe (як в еталоні)
-                    $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
-                    $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                    # Suppressed-фаза (quiescence): на час деструктивного
+                    # bravocmd маркер перемикається в suppressed — якщо процес
+                    # загине ЖОРСТКО посеред реставрації, Health-watchdog НЕ
+                    # підніме служби поверх напіввідновленої моделі, а лише
+                    # дасть CRITICAL-алерт про ручне відновлення (та сама
+                    # семантика, що маркер DataRestore). Збій suppression =
+                    # реставрація НЕ починається (fail-closed: модель ще не
+                    # торкнута, збереження поточного стану безпечне).
+                    $quiescenceSuppressionReady = $true
+                    if ($script:quiescenceMarkerWrittenThisRun) {
+                        try {
+                            [void](Set-BRAVOServiceQuiescenceRestartSuppressed)
+                            $script:quiescenceMarkerSuppressedForRestore = $true
+                        } catch {
+                            $quiescenceSuppressionReady = $false
+                            $restoreAbortedBeforeDestructivePhase = $true
+                            $exitCode = $null
+                            $errorMsg = "Реставрацію скасовано перед bravocmd.exe: не вдалося перевести ownership-маркер у suppressed (жорстке переривання посеред реставрації призвело б до автостарту служб поверх напіввідновленої моделі): $($_.Exception.Message). Модель не торкнута; архів перед реставрацією збережено: $beforeArchivePath"
+                            Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
+                            Send-SlackAlert -Message $errorMsg -IsCritical
+                            $script:criticalErrorOccurred = $true
+                            $script:restoreArchiveFailed = $true
+                        }
+                    }
+                    if ($quiescenceSuppressionReady) {
+                        # Виконання реставрації через bravocmd.exe (як в еталоні)
+                        $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
+                        $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                    }
                 }
 
-                if ($restorePostponedByWindowClosing) {
-                    # Постановка на паузу — НЕ помилка: bravocmd не викликаний,
-                    # маркер/state не пишуться, гілки exitCode -eq/-ne 0 нижче
-                    # свідомо не виконуються (exitCode -eq $null для обох).
+                if ($restorePostponedByWindowClosing -or $restoreAbortedBeforeDestructivePhase) {
+                    # bravocmd не викликаний (пауза через вікно — не помилка;
+                    # скасування через suppression уже зарапортоване вище як
+                    # критичне), маркер/state не пишуться, гілки exitCode
+                    # -eq/-ne 0 нижче свідомо не виконуються (exitCode -eq
+                    # $null для обох).
                 } elseif ($exitCode -eq 0) {
                     $restoreCompletedAt = Get-Date
                     Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"
@@ -5640,6 +5716,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             $exitCode = Restore-FromArchive -ArchivePath "$ARC_DIR\$ARCH_NAME1" -Destination $MODEL_PATH -ARC_PATH $ARC_PATH
                             if ($exitCode -eq 0) {
                                 Write-Log -Message "Модель успішно відновлена з архіву перед реставрації" -Level "SUCCESS"
+                                # Відкат довершено — модель знову консистентна.
+                                Restore-BRAVOMaintenanceQuiescenceAutostart
                             } else {
                                 $errorMsg = "Відкат MODEL після критичних змін не виконано (код: $exitCode). Архівацію після реставрації та маркер успіху заблоковано."
                                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
@@ -5652,6 +5730,10 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     
                     # Виконуємо архівацію після реставрації ЛИШЕ якщо не було критичних змін
                     if (-not $restoreRequired) {
+                        # Реставрація успішна, критичних змін немає — модель
+                        # консистентна; повертаємо watchdog право автостарту
+                        # ЩЕ ДО тривалої архівації після реставрації.
+                        Restore-BRAVOMaintenanceQuiescenceAutostart
                         $afterArchivePath = Join-Path $ARC_DIR $ARCH_NAME2
                         $afterHashPath = "$afterArchivePath.sha512"
                         if (Test-Path -LiteralPath $afterHashPath -PathType Leaf) {

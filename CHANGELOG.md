@@ -107,6 +107,17 @@ Runtime.ps1 decomposition.
   - The former boot-trigger repetition (15 min for 8 h) is removed: on
     a production BRAVO server (2026-08-20) its tail kept waking the task every 15 minutes
     long after the restore had succeeded.
+  - Quiescence integration (post-rebase review): the destructive model
+    restore phase (bravocmd) now runs under a suppressed ownership
+    marker — a hard kill mid-restore makes the Health watchdog raise a
+    CRITICAL manual-recovery alert instead of auto-starting services
+    over a half-restored model (suppression failure aborts the restore
+    before bravocmd, fail-closed; the marker returns to auto-start mode
+    once the model is consistent again). The boot HoldServices profile
+    forces every enabled managed service into the stop/marker/restart
+    scope regardless of the boot race with delayed auto-start, and the
+    service snapshot now counts StartPending as running in all
+    profiles.
 
 ## 5.1.0 — 2026-08-20
 
