@@ -5512,6 +5512,26 @@ try {
             -Name 'Maintenance/RecoveryEarlyExitHonorsActionableMissedRestore' `
             -Failure 'Recovery не має мовчки виходити без дій, коли пропущену реставрацію вже можна виконати (вікно відкрите) — early-exit має перевіряти й $missedRestoreDue, не лише $missedDailyWork'
 
+        # Регресія (інцидент 2026-08-20): guard "Recovery не зупиняє служби"
+        # (гілка $missedDailyWork + running services, exit 20) БЕЗУМОВНО
+        # перезаписував BRAVO_RESTORE_STATE 'Pending' — деградуючи вже
+        # записаний 'Succeeded' виконаної реставрації, через що наступний
+        # 15-хвилинний тик виконував повну реставрацію слоту ВДРУГЕ за
+        # день. 'Pending' дозволено писати ЛИШЕ під умовою
+        # $missedRestoreDue (реставрація реально ще не виконана).
+        $recoveryGuardBlock = [regex]::Match(
+            $maintenanceRestoreWindowText,
+            '(?s)\$RunMissedRestoreOnly -and \$missedDailyWork.{0,2500}?exit 20'
+        ).Value
+        Test-BRAVOCondition `
+            -Condition (
+                -not [string]::IsNullOrEmpty($recoveryGuardBlock) -and
+                $recoveryGuardBlock -match '(?s)if \(\$missedRestoreDue\) \{\s*\r?\n\s*Write-BRAVORestoreState[^\r\n]*-Status .Pending.' -and
+                ([regex]::Matches($recoveryGuardBlock, 'Write-BRAVORestoreState')).Count -eq 1
+            ) `
+            -Name 'Maintenance/RecoveryGuardNeverDegradesSucceededRestoreState' `
+            -Failure "guard 'Recovery не зупиняє служби' має писати restore-state 'Pending' ЛИШЕ якщо `$missedRestoreDue — безумовний запис деградує 'Succeeded' виконаної реставрації і замовляє її повторне виконання наступному прогону"
+
         # Регресія: коли Maintenance.DailyAt не потрапляє у вікно Restore,
         # оператор має бути поінформований, що САМЕ цей нічний прогін не
         # підхоплює пропущену реставрацію. Це вже НЕ WARNING (даний ризик

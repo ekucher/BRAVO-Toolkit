@@ -5253,9 +5253,24 @@ if ($RunMissedRestoreOnly -and $missedDailyWork) {
     if ($serviceWasRunning.ExchangeApi) { $runningServices += $ExchangAPIServiceName }
     if ($serviceWasRunning.BravoWeb) { $runningServices += $BravoWebServiceName }
     if ($runningServices.Count -gt 0) {
-        $message = "Пропущена реставрація не виконана: уже працюють служби $($runningServices -join ', '). Recovery не зупиняє служби."
+        # 'Pending' пишеться ЛИШЕ коли реставрація слоту реально ще не
+        # виконана ($missedRestoreDue). Раніше state перезаписувався тут
+        # БЕЗУМОВНО — і деградував уже записаний 'Succeeded' до
+        # 'Pending', замовляючи ПОВТОРНУ реставрацію наступному прогону.
+        # Реальний інцидент (production-сервер, 2026-08-20): Recovery-тик
+        # 23:04 збігся з нічним BRAVO_ARCHIV (мітка Backup у
+        # BRAVO_TASK_EXECUTION_STATE ще не оновлена -> хибний
+        # $missedBackupTask -> ця гілка), guard затер Succeeded від 21:08
+        # -> тик 23:18 виконав повну реставрацію слоту ВДРУГЕ за день.
+        $message = if ($missedRestoreDue) {
+            "Пропущена реставрація не виконана: уже працюють служби $($runningServices -join ', '). Recovery не зупиняє служби."
+        } else {
+            "Пропущені Backup/Maintenance не виконані: уже працюють служби $($runningServices -join ', '). Recovery не зупиняє служби. Реставрація слоту вже виконана раніше — її стан не змінюється."
+        }
         Write-Log -Message $message -Level 'WARNING'
-        Write-BRAVORestoreState -ScheduledOccurrence $scheduledOccurrence -Status 'Pending' -Reason $message
+        if ($missedRestoreDue) {
+            Write-BRAVORestoreState -ScheduledOccurrence $scheduledOccurrence -Status 'Pending' -Reason $message
+        }
         Send-SlackAlert -Message $message -IsCritical
         exit 20
     }
