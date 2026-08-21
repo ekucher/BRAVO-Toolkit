@@ -345,6 +345,47 @@ function Assert-BravoLoadedConfiguration {
         }
     }
 
+    # Trace-модель 5.2.0 (добові Trace_YYYYMMDD.mdz): три нові ключі.
+    # Старі site-config без них лишаються валідними — ефективна
+    # конфігурація МУСИТЬ гарантувати наявність ключів (консумери читають
+    # їх напряму і під StrictMode падали б на відсутньому ключі — той
+    # самий клас, що інцидент BootRestoreMode вище).
+    if ($global:maintenanceSettings -is [hashtable]) {
+        if (-not $global:maintenanceSettings.Contains('Trace') -or
+            -not ($global:maintenanceSettings.Trace -is [hashtable])) {
+            $global:maintenanceSettings.Trace = @{}
+        }
+        $traceSettingsForValidation = $global:maintenanceSettings.Trace
+        if (-not $traceSettingsForValidation.Contains('BISSourcePath')) {
+            # Порожньо = TraceBIS не налаштовано (Maintenance пропускає з INFO).
+            $traceSettingsForValidation.BISSourcePath = ''
+        }
+        $bisSourcePathValue = [string]$traceSettingsForValidation.BISSourcePath
+        if (-not [string]::IsNullOrWhiteSpace($bisSourcePathValue) -and
+            -not [System.IO.Path]::IsPathRooted($bisSourcePathValue)) {
+            throw "maintenanceSettings.Trace.BISSourcePath = '$bisSourcePathValue' має бути абсолютним шляхом до TraceBIS.out (або порожнім рядком, якщо BIS не використовується)."
+        }
+
+        if ($global:maintenanceSettings.Retention -is [hashtable]) {
+            $retentionSettingsForValidation = $global:maintenanceSettings.Retention
+            if (-not $retentionSettingsForValidation.Contains('CompressedLogDeletionEnabled')) {
+                # Безпечний дефолт: стиснуті .mdz журналів НЕ видаляються
+                # автоматично, доки оператор явно не ввімкне політику.
+                $retentionSettingsForValidation.CompressedLogDeletionEnabled = $false
+            } elseif (-not ($retentionSettingsForValidation.CompressedLogDeletionEnabled -is [bool])) {
+                Write-Warning "maintenanceSettings.Retention.CompressedLogDeletionEnabled = '$($retentionSettingsForValidation.CompressedLogDeletionEnabled)' не є `$true/`$false — застосовується безпечне `$false (стиснуті .mdz не видаляються)."
+                $retentionSettingsForValidation.CompressedLogDeletionEnabled = $false
+            }
+        }
+    }
+
+    if ($global:sftpDirectories -is [hashtable]) {
+        if (-not $global:sftpDirectories.Contains('Trace') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.Trace)) {
+            $global:sftpDirectories.Trace = 'trace'
+        }
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }
