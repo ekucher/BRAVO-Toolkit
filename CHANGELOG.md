@@ -10,6 +10,13 @@ debt): deduplication of service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
 Runtime.ps1 decomposition.
 
+- Self-test: temporary directories are created under
+  [IO.Path]::GetTempPath() instead of raw $env:TEMP. On servers where
+  the session TEMP variable carries the 8.3 short profile form
+  (C:\Users\E980D~1.KUC\..., real case: DEV-LIMS / Server 2022),
+  Remove-Item -LiteralPath in Windows PowerShell 5.1 fails on the
+  short segment with PSArgumentException and aborted the whole
+  self-test run in the environment-preflight block.
 - Quiescence watchdog hardening (review F4/F5): the watchdog starts
   only services from the canonical managed set resolved from
   maintenanceSettings.Services (including resolved BravoWeb
