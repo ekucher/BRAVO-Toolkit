@@ -3003,6 +3003,9 @@ function Get-BRAVOTraceArchiveUpdatePlan {
     #                    повторити SFTP і потім прибрати джерело);
     #   ConflictFiles  — ім'я є, але контент інший (ПОМИЛКА: archived
     #                    entry недоторканий, локальний файл не видаляється).
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'ArchivePassword',
+        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же — той самий контракт, що канонічні 7z-обгортки BRAVO.Compatibility.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$BacklogGroup,
@@ -3227,6 +3230,9 @@ function Update-BRAVOTraceDailyArchive {
     #   -> атомарна публікація ([IO.File]::Replace / Move-Item).
     # Будь-який збій до публікації лишає попередній валідний архів
     # недоторканим; work-артефакти прибираються.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'ArchivePassword',
+        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же — той самий контракт, що канонічні 7z-обгортки BRAVO.Compatibility.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object]$BacklogGroup,
@@ -3507,6 +3513,9 @@ function Invoke-BRAVOTraceArchiveMaintenance {
     # ненаналаштований) — архіви оновлюються, джерела НЕ видаляються,
     # передача відкладається на наступний прогін. Локальний .mdz тут не
     # видаляється НІКОЛИ (лише retention-політика з явним прапорцем).
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'ArchivePassword',
+        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же — той самий контракт, що канонічні 7z-обгортки BRAVO.Compatibility.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$TraceDirectory,
