@@ -1653,6 +1653,27 @@ function ConvertTo-BRAVOWindowsCommandLineArgument {
     return $builder.ToString()
 }
 
+function Write-BRAVOProcessInputText {
+    # Детермінований запис у stdin дочірнього процесу: UTF-8 БЕЗ BOM через
+    # BaseStream. У .NET Framework Process.StandardInput завжди використовує
+    # Console.InputEncoding, і під UTF-8-консоллю (chcp 65001) StreamWriter
+    # додає BOM перед ПЕРШИМ записом — 7-Zip тоді отримує "BOM+пароль":
+    # створення архіву «успішне», але зашифроване спотвореним паролем, а
+    # додавання в існуючий архів падає з "Wrong password" (виявлено
+    # характеризацією Trace-MDZ під UTF-8-хостом). Кожен рядок завершується
+    # CRLF; потік закривається (EOF) — як і попередній WriteLine+Close.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $payloadBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Text + "`r`n")
+    $Process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)
+    $Process.StandardInput.BaseStream.Flush()
+    $Process.StandardInput.Close()
+}
+
 function Invoke-BRAVOSevenZipIntegrityTest {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
@@ -1700,8 +1721,7 @@ function Invoke-BRAVOSevenZipIntegrityTest {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $capture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($Password)
-        $process.StandardInput.Close()
+        Write-BRAVOProcessInputText -Process $process -Text $Password
 
         if ($TimeoutSeconds -gt 0) {
             $timeoutMilliseconds = [int][math]::Min(
@@ -1826,8 +1846,7 @@ function Invoke-BRAVOSevenZipExtraction {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $capture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($Password)
-        $process.StandardInput.Close()
+        Write-BRAVOProcessInputText -Process $process -Text $Password
 
         if ($TimeoutSeconds -gt 0) {
             $timeoutMilliseconds = [int][math]::Min(
@@ -1954,8 +1973,7 @@ function Get-BRAVOSevenZipArchiveEntries {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $capture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($Password)
-        $process.StandardInput.Close()
+        Write-BRAVOProcessInputText -Process $process -Text $Password
 
         if ($TimeoutSeconds -gt 0) {
             $timeoutMilliseconds = [int][math]::Min(
