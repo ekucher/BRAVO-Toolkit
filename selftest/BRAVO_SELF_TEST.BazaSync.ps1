@@ -2006,6 +2006,106 @@
             [bool]$hr7RecStateAfter.State.AuditReconciliationPending -eq $false -and
             [bool]$hr7RecStateAfter.State.Files['m7.txt'].Verified -eq $true
         ) -Name 'BazaSync/PendingMarkerRecoveryWorksWithProductionProviderBoundary' -Failure "маркер на диску -> наступний Archive-прогін з PRODUCTION-провайдером (реальна межа модуля) реконсилюється: аудит виконано, COMPLETE, маркер false; Status=$($hr7RecCycle.Status) Invoked=$($hr7RecProbe.Invoked) Pending=$($hr7RecStateAfter.State.AuditReconciliationPending)"
+
+        # =====================================================================
+        # BRAVO_BAZA_RECONCILE: операторське розв'язання append-only мутацій
+        # (інцидент LIMS 2026-08-21). Rename-only + state-removal; жодного
+        # delete і жодного upload за конструкцією.
+        # =====================================================================
+        $mrLocal = Join-Path $bazaSyncTestRoot 'reconcile_local'
+        $mrState = Join-Path $bazaSyncTestRoot 'reconcile_state'
+        New-Item -ItemType Directory -Path $mrLocal -Force | Out-Null
+        New-Item -ItemType Directory -Path $mrState -Force | Out-Null
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'doc1.pdf' -SizeBytes 100)
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'Eqv\звіт.pdf' -SizeBytes 120)
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'keep.txt' -SizeBytes 50)
+        $mrSession = New-BRAVOSelfTestFakeBazaSession
+        $mrCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mrLocal -RemoteRootPath '/baza_app' -Session $mrSession -StateRoot $mrState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        # Мутації: два Verified-файли перезаписано ІНШИМ розміром (як в
+        # інциденті: застосунок перегенерував PDF).
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'doc1.pdf' -SizeBytes 150)
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'Eqv\звіт.pdf' -SizeBytes 180)
+
+        $mrReport = Get-BRAVOBazaMutationReport -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState
+        $mrReportEntry = @($mrReport.Mutations | Where-Object { $_.RelativePath -eq 'doc1.pdf' }) | Select-Object -First 1
+        Test-BRAVOCondition -Condition (
+            $mrCycle1.Status -eq 'COMPLETE' -and
+            $mrReport.Success -eq $true -and
+            @($mrReport.Mutations).Count -eq 2 -and
+            $null -ne $mrReportEntry -and
+            [int64]$mrReportEntry.PreviousSize -eq 100 -and
+            [int64]$mrReportEntry.CurrentSize -eq 150 -and
+            -not [string]::IsNullOrWhiteSpace([string]$mrReportEntry.UploadedUtc)
+        ) -Name 'BazaSync/MutationReportListsPreviousAndCurrentVersions' -Failure "звіт мутацій має показувати стару (state) і нову (диск) версії з UploadedUtc; Count=$(@($mrReport.Mutations).Count)"
+
+        # Захист від -Accept довільного шляху: не-мутація відхиляється, state
+        # незмінний, remote неторкнутий.
+        $mrBadResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('keep.txt')
+        $mrStateAfterBad = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrBadResult.Success -eq $false -and
+            @($mrBadResult.Failures).Count -eq 1 -and
+            [string]$mrBadResult.Failures[0].Stage -eq 'Validate' -and
+            $null -ne $mrStateAfterBad.State.Files['keep.txt'] -and
+            $null -ne $mrStateAfterBad.State.Files['doc1.pdf']
+        ) -Name 'BazaSync/ReconcileRejectsPathThatIsNotACurrentMutation' -Failure 'шлях, що не є поточною мутацією, має відхилятися на етапі Validate без жодних змін state/remote'
+
+        # Fail-closed: збій remote-rename -> state-ключ НЕ видаляється.
+        $mrSession.State.MoveFileShouldFail = $true
+        $mrFailResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('doc1.pdf')
+        $mrSession.State.MoveFileShouldFail = $false
+        $mrStateAfterFail = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrFailResult.Success -eq $false -and
+            @($mrFailResult.Failures).Count -eq 1 -and
+            [string]$mrFailResult.Failures[0].Stage -eq 'RemoteRename' -and
+            @($mrFailResult.StateRemoved).Count -eq 0 -and
+            $null -ne $mrStateAfterFail.State.Files['doc1.pdf']
+        ) -Name 'BazaSync/ReconcileMoveFailureKeepsStateEntry' -Failure 'збій MoveFile має лишати state-запис неторкнутим (fail-closed: довіра знімається лише після успішного rename)'
+
+        # Успішний reconcile обох мутацій: старі remote-версії перейменовано
+        # у *.replaced_*, ключі прибрано, keep.txt неторкнутий, ЖОДНОГО
+        # RemoveFiles/PutFiles від самого інструмента.
+        $mrPutCallsBefore = $mrSession.State.PutFilesCallCount
+        $mrOkResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('doc1.pdf', 'Eqv\звіт.pdf')
+        $mrStateAfterOk = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        $mrRenameCalls = @($mrSession.State.MoveFileCalls | Where-Object { $_ -match '\.replaced_' })
+        Test-BRAVOCondition -Condition (
+            $mrOkResult.Success -eq $true -and
+            @($mrOkResult.RenamedRemote).Count -eq 2 -and
+            $mrRenameCalls.Count -ge 2 -and
+            ($mrRenameCalls -join '; ') -match '/baza_app/doc1\.pdf -> /baza_app/doc1\.pdf\.replaced_' -and
+            $null -eq $mrStateAfterOk.State.Files['doc1.pdf'] -and
+            $null -eq $mrStateAfterOk.State.Files['Eqv\звіт.pdf'] -and
+            $null -ne $mrStateAfterOk.State.Files['keep.txt'] -and
+            @($mrSession.State.RemoveFilesCalls).Count -eq 0 -and
+            $mrSession.State.PutFilesCallCount -eq $mrPutCallsBefore
+        ) -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' -Failure 'успішний reconcile: rename обох старих remote-версій у *.replaced_*, видалення лише прийнятих ключів, нуль delete/upload від інструмента'
+
+        # Кінець-у-кінець: наступний плановий цикл бачить нові версії як
+        # кандидатів, remote-шляхи вільні -> Uploaded, COMPLETE, Verified.
+        $mrCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mrLocal -RemoteRootPath '/baza_app' -Session $mrSession -StateRoot $mrState
+        $mrStateAfterCycle2 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrCycle2.Status -eq 'COMPLETE' -and
+            [bool]$mrStateAfterCycle2.State.Files['doc1.pdf'].Verified -eq $true -and
+            [int64]$mrStateAfterCycle2.State.Files['doc1.pdf'].Size -eq 150 -and
+            [int64]$mrSession.State.RemoteSizes['/baza_app/doc1.pdf'] -eq 150 -and
+            @($mrSession.State.RemoteSizes.Keys | Where-Object { $_ -match '^/baza_app/doc1\.pdf\.replaced_' }).Count -eq 1
+        ) -Name 'BazaSync/ReconcileThenNextCycleUploadsNewVersion' -Failure "після reconcile наступний цикл має залити нові версії на звільнені шляхи і стати COMPLETE; Status=$($mrCycle2.Status)"
+
+        # Remote відсутній (state вірив, файлу в хмарі немає): rename не
+        # потрібен, ключ видаляється, Success.
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'keep.txt' -SizeBytes 77)
+        $mrSession.State.RemoteSizes.Remove('/baza_app/keep.txt')
+        $mrAbsentResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('keep.txt')
+        $mrStateAfterAbsent = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrAbsentResult.Success -eq $true -and
+            @($mrAbsentResult.RemoteAbsent) -contains 'keep.txt' -and
+            @($mrAbsentResult.RenamedRemote).Count -eq 0 -and
+            $null -eq $mrStateAfterAbsent.State.Files['keep.txt']
+        ) -Name 'BazaSync/ReconcileRemoteAbsentSkipsRenameStillRemovesEntry' -Failure 'відсутній remote-файл: rename пропускається (RemoteAbsent), ключ видаляється, результат успішний'
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue
