@@ -435,17 +435,20 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             -Name "LogRotation/06-MissingDebugFileIsConfigurationError" `
             -Failure "без ключа FILE у секції [Debug] має бути помилка конфігурації, у якій названо і bravo.ini, і [Debug], і FILE"
 
-        # --- Test 7: Trace MAX+1, а не перший вільний номер ---
+        # --- Test 7: Trace 5.2.0 — timestamp-ім'я з LastWriteTime джерела,
+        # legacy sequence-файли в призначенні не заважають і не чіпаються ---
         $test7Source = Join-Path $rotationTestRoot "test07\src"
         $test7Destination = Join-Path $rotationTestRoot "test07\dst"
         foreach ($existingName in @("TraceSRV_1.out", "TraceSRV_2.out", "TraceSRV_5.out")) {
             [void](New-BRAVOLogRotationFixture -Directory $test7Destination -Name $existingName)
         }
         $test7TracePath = New-BRAVOLogRotationFixture -Directory $test7Source -Name "TraceSRV.out" -Content "trace"
+        $test7Stamp = Get-Date -Date '2026-08-19 18:30:05'
+        (Get-Item -LiteralPath $test7TracePath).LastWriteTime = $test7Stamp
         $test7Summary = Invoke-BRAVORotationHelper -Body {
             param($TracePath, $Destination, $Logger)
             Invoke-BRAVOTraceRotation `
-                -TracePath $TracePath `
+                -Sources @([pscustomobject]@{ Name = 'TraceSRV'; Path = $TracePath }) `
                 -DestinationDirectory $Destination `
                 -RetryCount 1 `
                 -RetryDelaySeconds 0 `
@@ -453,11 +456,37 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         } -Arguments @($test7TracePath, $test7Destination, $rotationLogger)
         Test-BRAVOCondition `
             -Condition (
-                (Test-Path -LiteralPath (Join-Path $test7Destination "TraceSRV_6.out")) -and
-                [int]$test7Summary.Moved -eq 1
+                (Test-Path -LiteralPath (Join-Path $test7Destination "TraceSRV_20260819_183005.out")) -and
+                [int]$test7Summary.Moved -eq 1 -and
+                (Test-Path -LiteralPath (Join-Path $test7Destination "TraceSRV_5.out")) -and
+                $null -eq @($test7Summary.Results)[0].Sequence
             ) `
-            -Name "LogRotation/07-TraceMaxPlusOne" `
-            -Failure "за наявних _1/_2/_5 наступним має бути _6 (MAX+1), а не _3 (перший вільний номер)"
+            -Name "LogRotation/07-TraceTimestampNameFromLastWriteTime" `
+            -Failure "Trace має отримати ім'я TraceSRV_<yyyyMMdd_HHmmss>.out з LastWriteTime джерела, legacy _N-файли неторкнуті, Sequence у результаті `$null"
+
+        # --- Test 7b: колізія timestamp -> наступна вільна секунда, без overwrite ---
+        $test7bSource = Join-Path $rotationTestRoot "test07b\src"
+        $test7bCollisionPath = Join-Path $test7Destination "TraceSRV_20260819_183005.out"
+        $test7bCollisionSizeBefore = (Get-Item -LiteralPath $test7bCollisionPath).Length
+        $test7bTracePath = New-BRAVOLogRotationFixture -Directory $test7bSource -Name "TraceSRV.out" -Content "trace-second-run-longer"
+        (Get-Item -LiteralPath $test7bTracePath).LastWriteTime = $test7Stamp
+        $test7bSummary = Invoke-BRAVORotationHelper -Body {
+            param($TracePath, $Destination, $Logger)
+            Invoke-BRAVOTraceRotation `
+                -Sources @([pscustomobject]@{ Name = 'TraceSRV'; Path = $TracePath }) `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test7bTracePath, $test7Destination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test7bSummary.Moved -eq 1 -and
+                (Test-Path -LiteralPath (Join-Path $test7Destination "TraceSRV_20260819_183006.out")) -and
+                (Get-Item -LiteralPath $test7bCollisionPath).Length -eq $test7bCollisionSizeBefore
+            ) `
+            -Name "LogRotation/07b-TraceTimestampCollisionTakesNextSecond" `
+            -Failure "колізія timestamp-імені має розв'язуватися наступною вільною секундою (183006), існуючий файл не перезаписується"
 
         # --- Test 8: порожній Trace лишається в джерелі ---
         $test8Source = Join-Path $rotationTestRoot "test08\src"
@@ -466,7 +495,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         $test8Summary = Invoke-BRAVORotationHelper -Body {
             param($TracePath, $Destination, $Logger)
             Invoke-BRAVOTraceRotation `
-                -TracePath $TracePath `
+                -Sources @([pscustomobject]@{ Name = 'TraceSRV'; Path = $TracePath }) `
                 -DestinationDirectory $Destination `
                 -RetryCount 1 `
                 -RetryDelaySeconds 0 `
@@ -490,7 +519,10 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         $test9Summary = Invoke-BRAVORotationHelper -Body {
             param($TracePath, $Destination, $Logger)
             Invoke-BRAVOTraceRotation `
-                -TracePath $TracePath `
+                -Sources @(
+                    [pscustomobject]@{ Name = 'TraceSRV'; Path = $TracePath }
+                    [pscustomobject]@{ Name = 'TraceBIS'; Path = '' }
+                ) `
                 -DestinationDirectory $Destination `
                 -RetryCount 1 `
                 -RetryDelaySeconds 0 `
@@ -501,10 +533,37 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
                 [int]$test9Summary.Errors -eq 0 -and
                 [int]$test9Summary.Moved -eq 0 -and
                 -not (Test-Path -LiteralPath $test9TracePath) -and
-                @($rotationLogMessages | Where-Object { $_ -like "*ще не створено*" }).Count -gt 0
+                @($rotationLogMessages | Where-Object { $_ -like "*ще не створено*" }).Count -gt 0 -and
+                @($rotationLogMessages | Where-Object { $_ -like "*TraceBIS*не налаштовано*" }).Count -gt 0
             ) `
             -Name "LogRotation/09-AbsentTraceIsDiagnosticOnly" `
-            -Failure "відсутній trace дає діагностичне повідомлення, не помилку і не створює фейкове джерело"
+            -Failure "відсутній trace дає діагностичне повідомлення (не помилку, без фейкового джерела), а неналаштований BIS — окремий INFO-пропуск"
+
+        # --- Test 9b: недоступний SRV не блокує ротацію BIS (і навпаки) ---
+        $test9bSource = Join-Path $rotationTestRoot "test09b\src"
+        $test9bDestination = Join-Path $rotationTestRoot "test09b\dst"
+        $test9bBisPath = New-BRAVOLogRotationFixture -Directory $test9bSource -Name "TraceBIS.out" -Content "bis data"
+        (Get-Item -LiteralPath $test9bBisPath).LastWriteTime = Get-Date -Date '2026-08-19 11:00:00'
+        $test9bSummary = Invoke-BRAVORotationHelper -Body {
+            param($BisPath, $Destination, $Logger)
+            Invoke-BRAVOTraceRotation `
+                -Sources @(
+                    [pscustomobject]@{ Name = 'TraceSRV'; Path = '' }
+                    [pscustomobject]@{ Name = 'TraceBIS'; Path = $BisPath }
+                ) `
+                -DestinationDirectory $Destination `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test9bBisPath, $test9bDestination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test9bSummary.Moved -eq 1 -and
+                [int]$test9bSummary.Errors -eq 0 -and
+                (Test-Path -LiteralPath (Join-Path $test9bDestination "TraceBIS_20260819_110000.out"))
+            ) `
+            -Name "LogRotation/09b-UnavailableSrvDoesNotBlockBis" `
+            -Failure "ненаналаштований/невалідний SRV не має блокувати ротацію BIS: TraceBIS_<ts>.out мусить з'явитися без помилок"
 
         # --- Test 10: обидва шаблони exchangAPI + дедуплікація за FullName ---
         $test10Source = Join-Path $rotationTestRoot "test10\src"

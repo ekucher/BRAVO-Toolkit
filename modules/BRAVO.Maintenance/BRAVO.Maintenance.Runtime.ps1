@@ -2278,6 +2278,17 @@ function Move-BRAVOLogWithSequence {
         # рядок читався як "API\request.log -> API\request_2.log", а не як
         # два однакові "request.log" з різних гілок.
         [string]$RelativeDirectory,
+        # Політика імен призначення. 'Sequence' (типово) — історична
+        # <Base>_<N><Ext> (exchangAPI/Apache/BravoWeb, семантика незмінна).
+        # 'Timestamp' — Trace-модель 5.2.0: <Base>_<yyyyMMdd_HHmmss><Ext>;
+        # колізія імені розв'язується наступною вільною секундою (без
+        # -Force, без суфіксів _1/_copy).
+        [ValidateSet('Sequence', 'Timestamp')][string]$NamingPolicy = 'Sequence',
+        # Лише для NamingPolicy='Timestamp': момент, з якого формується
+        # ім'я. Типово — LastWriteTime джерела («дата даних»: ротований
+        # уночі вчорашній trace потрапляє у вчорашній добовий архів, бо
+        # дата MDZ визначається з імені ротованого файла).
+        [Nullable[datetime]]$TimestampSource,
         [bool]$SkipIfEmpty = $true,
         [int]$RetryCount = 3,
         [int]$RetryDelaySeconds = 5,
@@ -2364,17 +2375,32 @@ function Move-BRAVOLogWithSequence {
         $destinationName = $null
         $destinationPath = $null
         $destinationSequence = $null
+        $timestampBase = if ($NamingPolicy -eq 'Timestamp') {
+            if ($null -ne $TimestampSource) { $TimestampSource } else { $sourceItem.LastWriteTime }
+        } else {
+            $null
+        }
         for ($nameAttempt = 1; $nameAttempt -le 100; $nameAttempt++) {
-            $nextSequence = Get-BRAVONextLogSequence `
-                -DestinationDirectory $DestinationDirectory `
-                -BaseName $baseName `
-                -Extension $extension
-            $candidateName = "${baseName}_${nextSequence}${extension}"
+            if ($NamingPolicy -eq 'Timestamp') {
+                # Колізія (два джерела з тим самим LastWriteTime, повторна
+                # ротація в ту саму секунду) — наступна вільна секунда в
+                # тому самому форматі; існуючий файл ніколи не перезаписується.
+                $candidateStamp = $timestampBase.AddSeconds($nameAttempt - 1)
+                $candidateName = '{0}_{1:yyyyMMdd_HHmmss}{2}' -f $baseName, $candidateStamp, $extension
+                $candidateSequence = $null
+            } else {
+                $nextSequence = Get-BRAVONextLogSequence `
+                    -DestinationDirectory $DestinationDirectory `
+                    -BaseName $baseName `
+                    -Extension $extension
+                $candidateName = "${baseName}_${nextSequence}${extension}"
+                $candidateSequence = [int]$nextSequence
+            }
             $candidatePath = Join-Path -Path $DestinationDirectory -ChildPath $candidateName
             if (-not (Test-Path -LiteralPath $candidatePath)) {
                 $destinationName = $candidateName
                 $destinationPath = $candidatePath
-                $destinationSequence = [int]$nextSequence
+                $destinationSequence = $candidateSequence
                 break
             }
         }
@@ -2672,35 +2698,86 @@ function Invoke-BRAVOLogRotation {
 }
 
 function Invoke-BRAVOTraceRotation {
-    # BRAVO Trace — рівно один файл, шлях і назва якого відомі з
-    # bravo.ini [Debug] FILE. Ані відсутній, ані порожній trace не є
-    # помилкою обслуговування: BRAVO міг просто не писати його від минулого
-    # запуску, і це не привід ані піднімати тривогу, ані — тим паче —
-    # залишити службу зупиненою.
+    # BRAVO Trace 5.2.0 — ДВА логічні джерела (SRV з bravo.ini [Debug] FILE
+    # через Discovery; BIS з явного maintenanceSettings.Trace.BISSourcePath).
+    # Імена призначення — Timestamp-політика (<Name>_<yyyyMMdd_HHmmss>.out,
+    # ПЛОСКО у Trace\, без каталогів-дат) — далі дата добового
+    # Trace_YYYYMMDD.mdz визначається саме з імені ротованого файла.
+    # Ані ненаналаштоване, ані відсутнє, ані порожнє джерело не є помилкою
+    # обслуговування, і жодне з них не блокує ротацію другого джерела:
+    # BRAVO міг просто не писати trace від минулого запуску.
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$TracePath,
+        # @([pscustomobject]@{ Name='TraceSRV'; Path='...' },
+        #   [pscustomobject]@{ Name='TraceBIS'; Path='' })
+        # Порожній Path = джерело не налаштовано (INFO, не помилка).
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Sources,
         [Parameter(Mandatory = $true)][string]$DestinationDirectory,
         [int]$RetryCount = 3,
         [int]$RetryDelaySeconds = 5,
         [AllowNull()][scriptblock]$Logger
     )
 
-    if (-not (Test-Path -LiteralPath $TracePath -PathType Leaf)) {
-        Write-BRAVOLogRotationMessage `
-            -Logger $Logger `
-            -Message "BRAVO Trace: файл $TracePath ще не створено — ротація не потрібна" `
-            -Level "INFO"
-        return (New-BRAVOLogRotationSummary -ComponentName 'Trace' -Note 'джерело відсутнє')
+    $foundCount = 0
+    $nonEmptyCount = 0
+    $movedCount = 0
+    $emptyCount = 0
+    $missingCount = 0
+    $errorCount = 0
+    $notes = @()
+    $results = @()
+    foreach ($source in @($Sources)) {
+        $sourceName = [string]$source.Name
+        $sourcePath = [string]$source.Path
+        if ([string]::IsNullOrWhiteSpace($sourcePath)) {
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "BRAVO Trace: джерело $sourceName не налаштовано — пропущено" `
+                -Level "INFO"
+            $notes += "$sourceName не налаштовано"
+            continue
+        }
+        $foundCount++
+        if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
+            Write-BRAVOLogRotationMessage `
+                -Logger $Logger `
+                -Message "BRAVO Trace: файл $sourcePath ($sourceName) ще не створено — ротація не потрібна" `
+                -Level "INFO"
+            $missingCount++
+            $notes += "$sourceName відсутній"
+            continue
+        }
+        $moveResult = Move-BRAVOLogWithSequence `
+            -SourcePath $sourcePath `
+            -DestinationDirectory $DestinationDirectory `
+            -LogicalBaseName $sourceName `
+            -NamingPolicy 'Timestamp' `
+            -RetryCount $RetryCount `
+            -RetryDelaySeconds $RetryDelaySeconds `
+            -Logger $Logger
+        $results += $moveResult
+        switch ([string]$moveResult.Status) {
+            'MOVED' { $nonEmptyCount++; $movedCount++ }
+            'SKIPPED_EMPTY' { $emptyCount++ }
+            'MISSING' { $missingCount++ }
+            default { $nonEmptyCount++; $errorCount++ }
+        }
     }
 
-    return (Invoke-BRAVOLogRotation `
+    $summary = New-BRAVOLogRotationSummary `
         -ComponentName 'Trace' `
-        -Items @(New-BRAVOLogRotationItem -Path $TracePath) `
-        -DestinationRoot $DestinationDirectory `
-        -RetryCount $RetryCount `
-        -RetryDelaySeconds $RetryDelaySeconds `
-        -Logger $Logger)
+        -Found $foundCount `
+        -NonEmpty $nonEmptyCount `
+        -Moved $movedCount `
+        -Empty $emptyCount `
+        -Missing $missingCount `
+        -Errors $errorCount `
+        -Note $(if (@($notes).Count -gt 0) { $notes -join '; ' } else { $null })
+    Write-BRAVOLogRotationSummary -Summary $summary -Logger $Logger
+    # Move-результати потрібні добовій MDZ-фазі та dry-run; summary-контракт
+    # (Slack-рядок «Trace — оброблено N файлів») при цьому незмінний.
+    Add-Member -InputObject $summary -MemberType NoteProperty -Name 'Results' -Value @($results) -Force
+    return $summary
 }
 
 function Invoke-BRAVOExchangeApiLogRotation {
@@ -4983,6 +5060,23 @@ if ($BravoMaintenanceEnabled) {
     }
 }
 
+# Trace-модель 5.2.0: друге джерело (BIS) — лише явний конфіг-override;
+# надійного автоматичного джерела для TraceBIS.out не існує (bravo.ini
+# описує тільки SRV). Rooted-валідність вже гарантована конфіг-лоадером.
+# Ротовані .out обох джерел ідуть ПЛОСКО у Trace\ (timestamp-імена),
+# каталоги-дати лишаються тільки за legacy-ланцюгом.
+$traceBisSourcePath = ''
+if ($BravoMaintenanceEnabled) {
+    $traceBisSourcePath = [string]$MaintenanceConfig.Trace.BISSourcePath
+    if ([string]::IsNullOrWhiteSpace($traceBisSourcePath)) {
+        $traceBisSourcePath = ''
+        Write-Log -Message "BRAVO TraceBIS: джерело не налаштовано (maintenanceSettings.Trace.BISSourcePath порожній) — пропускається" -Level "INFO"
+    } else {
+        Write-Log -Message "BRAVO TraceBIS джерело: $traceBisSourcePath" -Level "INFO"
+    }
+    Write-Log -Message "BRAVO Trace призначення ротації: $TRACE_DIR" -Level "INFO"
+}
+
 $exchangeApiRuntime = $null
 if ($exchangAPIServiceEnabled) {
     $exchangeApiRuntime = Resolve-BRAVOExchangeApiRuntimeDirectory `
@@ -5817,12 +5911,23 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
     # Обробка Trace належить лише до компонента основної служби BRAVO.
     Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
     try {
-        if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
+        if ($BravoMaintenanceEnabled) {
             Write-Log -Message "==="
             Write-Log -Message "=== ОБРОБКА TRACE-ФАЙЛІВ ===" -Level "INFO"
+            # SRV з невалідною конфігурацією вже прапорцьований критичною
+            # помилкою у блоці джерел — тут він просто пропускається
+            # (порожній Path), НЕ блокуючи ротацію BIS.
+            $traceSrvSourcePath = if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
+                [string]$traceConfiguration.TracePath
+            } else {
+                ''
+            }
             $traceRotationSummary = Invoke-BRAVOTraceRotation `
-                -TracePath $traceConfiguration.TracePath `
-                -DestinationDirectory $traceConfiguration.DestinationDirectory `
+                -Sources @(
+                    [pscustomobject]@{ Name = 'TraceSRV'; Path = $traceSrvSourcePath }
+                    [pscustomobject]@{ Name = 'TraceBIS'; Path = $traceBisSourcePath }
+                ) `
+                -DestinationDirectory $TRACE_DIR `
                 -RetryCount $MoveRetryCount `
                 -RetryDelaySeconds $MoveRetryDelaySeconds `
                 -Logger $bravoLogRotationLogger
