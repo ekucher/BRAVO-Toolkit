@@ -199,7 +199,10 @@ try {
         Exit-BRAVOBazaReconcile -ExitCode 0
     }
 
-    $acceptList = if ($AcceptAll) { @($mutations | ForEach-Object { $_.RelativePath }) } else { @($Accept) }
+    # @() навколо ВСЬОГО if: присвоєння з if-виразу йде через пайплайн і
+    # розгортає одноелементний масив у скаляр — .Count на ньому падає під
+    # успадкованим StrictMode 2.0 (той самий клас, що free-space баг 5.0.x).
+    $acceptList = @(if ($AcceptAll) { $mutations | ForEach-Object { $_.RelativePath } } else { $Accept })
     if ($AcceptAll -and -not $Force) {
         Write-Host ''
         Write-Host ("УВАГА: буде прийнято ВСІ {0} мутацій — старі версії на SFTP перейменуються у *.replaced_*, нові заллє наступний цикл." -f $acceptList.Count) -ForegroundColor Yellow

@@ -2106,6 +2106,17 @@
             @($mrAbsentResult.RenamedRemote).Count -eq 0 -and
             $null -eq $mrStateAfterAbsent.State.Files['keep.txt']
         ) -Name 'BazaSync/ReconcileRemoteAbsentSkipsRenameStillRemovesEntry' -Failure 'відсутній remote-файл: rename пропускається (RemoteAbsent), ключ видаляється, результат успішний'
+
+        # Регресія польового дефекту DEV-LIMS E2E (2026-08-21): присвоєння
+        # `$acceptList = if (...) {...} else { @($Accept) }` йде через
+        # пайплайн і РОЗГОРТАЄ одноелементний масив у скаляр — .Count на
+        # ньому падає під успадкованим StrictMode 2.0 (exit 90 після вже
+        # виконаних remote/state-кроків). Обгортка @() довкола всього if
+        # обов'язкова; гейт тримає саме цю форму в entrypoint.
+        $mrReconcileEntrypointText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_BAZA_RECONCILE.ps1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition -Condition (
+            $mrReconcileEntrypointText -match '\$acceptList\s*=\s*@\(if\s'
+        ) -Name 'BazaSync/ReconcileAcceptListAssignmentStaysArrayWrapped' -Failure 'BRAVO_BAZA_RECONCILE: $acceptList має присвоюватися як @(if ...) — if-вираз без обгортки розгортає одноелементний масив у скаляр і .Count падає під StrictMode 2.0'
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue
