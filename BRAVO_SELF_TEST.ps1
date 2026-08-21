@@ -3773,7 +3773,12 @@ try {
         -Condition (
             $archiveScriptText.Contains("RedirectStandardInput = `$true") -and
             $maintenanceScriptText.Contains("StandardInputText") -and
-            $compatibilityScriptText.Contains("StandardInput.WriteLine(`$Password)") -and
+            # 5.2.0: пароль пишеться канонічним Write-BRAVOProcessInputText
+            # (UTF-8 без BOM через BaseStream) — WriteLine під UTF-8-консоллю
+            # додавав BOM перед паролем (битий пароль архіву).
+            $compatibilityScriptText.Contains("Write-BRAVOProcessInputText -Process `$process -Text `$Password") -and
+            $compatibilityScriptText.Contains('$Process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)') -and
+            $compatibilityScriptText -notmatch [regex]::Escape('StandardInput.WriteLine($Password)') -and
             $archiveScriptText -notmatch '(?i)-p`"\{0\}`"' -and
             $maintenanceScriptText -notmatch '(?i)-p\$\(' -and
             $compatibilityScriptText -notmatch '(?i)-p`"\{0\}`"' -and
@@ -12767,6 +12772,9 @@ function Write-BRAVOLog {
         -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
 
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
+    # TraceArchive ПІСЛЯ BazaSync: SFTP-сценарії добового Trace-архіву
+    # використовують New-BRAVOSelfTestFakeBazaSession, визначену там.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red

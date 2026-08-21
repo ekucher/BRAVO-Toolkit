@@ -1653,6 +1653,27 @@ function ConvertTo-BRAVOWindowsCommandLineArgument {
     return $builder.ToString()
 }
 
+function Write-BRAVOProcessInputText {
+    # Детермінований запис у stdin дочірнього процесу: UTF-8 БЕЗ BOM через
+    # BaseStream. У .NET Framework Process.StandardInput завжди використовує
+    # Console.InputEncoding, і під UTF-8-консоллю (chcp 65001) StreamWriter
+    # додає BOM перед ПЕРШИМ записом — 7-Zip тоді отримує "BOM+пароль":
+    # створення архіву «успішне», але зашифроване спотвореним паролем, а
+    # додавання в існуючий архів падає з "Wrong password" (виявлено
+    # характеризацією Trace-MDZ під UTF-8-хостом). Кожен рядок завершується
+    # CRLF; потік закривається (EOF) — як і попередній WriteLine+Close.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $payloadBytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($Text + "`r`n")
+    $Process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)
+    $Process.StandardInput.BaseStream.Flush()
+    $Process.StandardInput.Close()
+}
+
 function Invoke-BRAVOSevenZipIntegrityTest {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
@@ -1700,8 +1721,7 @@ function Invoke-BRAVOSevenZipIntegrityTest {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $capture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($Password)
-        $process.StandardInput.Close()
+        Write-BRAVOProcessInputText -Process $process -Text $Password
 
         if ($TimeoutSeconds -gt 0) {
             $timeoutMilliseconds = [int][math]::Min(
@@ -1826,8 +1846,7 @@ function Invoke-BRAVOSevenZipExtraction {
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
         $capture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($Password)
-        $process.StandardInput.Close()
+        Write-BRAVOProcessInputText -Process $process -Text $Password
 
         if ($TimeoutSeconds -gt 0) {
             $timeoutMilliseconds = [int][math]::Min(
@@ -1888,6 +1907,306 @@ function Invoke-BRAVOSevenZipExtraction {
                 [void](Complete-BRAVOProcessOutputCapture -Capture $capture)
             } catch {
                 # Збір виводу не повинен приховувати основний результат тесту.
+            }
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+}
+
+function Get-BRAVOSevenZipArchiveEntries {
+    # Inventory вмісту 7z-архіву для накопичувальної Trace-MDZ моделі
+    # (Maintenance): список entries з Path/Size/CRC — саме те, що потрібно
+    # для перевірки immutability старих записів і відбору нових кандидатів
+    # перед `7za a`. Дзеркалить Invoke-BRAVOSevenZipIntegrityTest (той самий
+    # ProcessStartInfo/stdin-пароль патерн), команда "l -slt" замість "t".
+    # NB: у BRAVO.DataRestore існує приватний Get-BRAVOSevenZipArchiveInventory
+    # (лічильники FileCount/TotalUncompressedBytes для free-space preflight,
+    # без CRC і без списку) — свідомо НЕ об'єднано в цьому завданні, щоб не
+    # чіпати щільно характеризований restore-потік; борг міграції
+    # зафіксовано в CHANGELOG.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [int]$TimeoutSeconds = 43200
+    )
+
+    $process = $null
+    $capture = $null
+    $timedOut = $false
+    $exitCode = $null
+    $standardOutput = ""
+    $standardError = ""
+
+    try {
+        if (-not (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+            throw "7-Zip не знайдено: $SevenZipPath"
+        }
+        if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
+            throw "архів не знайдено: $ArchivePath"
+        }
+        if ([string]::IsNullOrWhiteSpace($Password)) {
+            throw "пароль архіву не задано"
+        }
+        if ($Password.IndexOfAny([char[]]"`r`n") -ge 0) {
+            throw "пароль архіву не може містити символи нового рядка"
+        }
+
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $SevenZipPath
+        # Без параметра -p 7-Zip запитує пароль зашифрованого архіву зі
+        # стандартного вводу (для -mhe=on заголовок теж шифрований — пароль
+        # потрібен уже для самого листингу).
+        $processInfo.Arguments = "l -slt -y `"$ArchivePath`""
+        $processInfo.RedirectStandardInput = $true
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        $capture = Start-BRAVOProcessOutputCapture -Process $process
+        Write-BRAVOProcessInputText -Process $process -Text $Password
+
+        if ($TimeoutSeconds -gt 0) {
+            $timeoutMilliseconds = [int][math]::Min(
+                [double][int]::MaxValue,
+                [double]$TimeoutSeconds * 1000
+            )
+            $completed = $process.WaitForExit($timeoutMilliseconds)
+        } else {
+            $process.WaitForExit()
+            $completed = $true
+        }
+
+        if (-not $completed) {
+            $timedOut = $true
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(5000)
+            } catch {
+                # Процес міг завершитися між перевіркою таймауту та Kill().
+            }
+        }
+
+        if ($null -ne $capture) {
+            $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $capture
+            $capture = $null
+            $standardOutput = [string]$capturedOutput.StandardOutput
+            $standardError = [string]$capturedOutput.StandardError
+        }
+        if ($process.HasExited) {
+            $exitCode = [int]$process.ExitCode
+        }
+
+        if ($timedOut -or $exitCode -ne 0) {
+            $description = Get-BRAVOSevenZipExitCodeDescription `
+                -ExitCode $exitCode `
+                -TimedOut:$timedOut
+            return New-Object PSObject -Property @{
+                Success = $false
+                ExitCode = $exitCode
+                TimedOut = $timedOut
+                Entries = @()
+                Error = "7-Zip listing не вдався: $description"
+            }
+        }
+
+        # Парсинг -slt: технічний блок до роздільника "----------",
+        # далі entries як групи "Key = Value", розділені порожніми рядками.
+        # Порядок ключів у групі 7-Zip не гарантує — entry фіксується при
+        # НАСТУПНОМУ "Path = " або наприкінці виводу.
+        $entries = New-Object System.Collections.Generic.List[object]
+        $inEntries = $false
+        $currentPath = $null
+        $currentSize = [int64]0
+        $currentCrc = ''
+        $currentIsDirectory = $false
+        foreach ($line in ($standardOutput -split "`r?`n")) {
+            if (-not $inEntries) {
+                if ($line -match '^-{5,}$') { $inEntries = $true }
+                continue
+            }
+            if ($line -match '^Path = (.+)$') {
+                if ($null -ne $currentPath) {
+                    [void]$entries.Add((New-Object PSObject -Property @{
+                        Path = $currentPath
+                        Size = $currentSize
+                        Crc = $currentCrc
+                        IsDirectory = $currentIsDirectory
+                    }))
+                }
+                $currentPath = $matches[1]
+                $currentSize = [int64]0
+                $currentCrc = ''
+                $currentIsDirectory = $false
+                continue
+            }
+            if ($null -eq $currentPath) { continue }
+            if ($line -match '^Size = (\d+)$') {
+                $currentSize = [int64]$matches[1]
+            } elseif ($line -match '^CRC = ([0-9A-Fa-f]+)$') {
+                $currentCrc = ([string]$matches[1]).ToUpperInvariant()
+            } elseif ($line -match '^Attributes = (\S*)') {
+                $currentIsDirectory = ([string]$matches[1]).StartsWith('D')
+            } elseif ($line -match '^Folder = \+') {
+                $currentIsDirectory = $true
+            }
+        }
+        if ($null -ne $currentPath) {
+            [void]$entries.Add((New-Object PSObject -Property @{
+                Path = $currentPath
+                Size = $currentSize
+                Crc = $currentCrc
+                IsDirectory = $currentIsDirectory
+            }))
+        }
+
+        return New-Object PSObject -Property @{
+            Success = $true
+            ExitCode = $exitCode
+            TimedOut = $false
+            Entries = @($entries.ToArray())
+            Error = $null
+        }
+    } catch {
+        return New-Object PSObject -Property @{
+            Success = $false
+            ExitCode = $exitCode
+            TimedOut = $timedOut
+            Entries = @()
+            Error = $_.Exception.Message
+        }
+    } finally {
+        if ($null -ne $capture) {
+            try {
+                [void](Complete-BRAVOProcessOutputCapture -Capture $capture)
+            } catch {
+                # Збір виводу не повинен приховувати основний результат.
+            }
+        }
+        if ($null -ne $process) {
+            $process.Dispose()
+        }
+    }
+}
+
+function Get-BRAVOSevenZipFileCrc {
+    # CRC32 локального файла тим самим 7-Zip, що формує CRC в архівних
+    # entries (`7za h -scrcCRC32`) — щоб порівняння «локальний .out проти
+    # archived entry» у Trace-MDZ плані відбувалося ідентичним алгоритмом
+    # без ручної CRC32-таблиці в PowerShell 5.1. Пароль не потрібен
+    # (аргумент — незашифрований локальний файл).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [int]$TimeoutSeconds = 3600
+    )
+
+    $process = $null
+    $capture = $null
+    $timedOut = $false
+    $exitCode = $null
+    $standardOutput = ""
+
+    try {
+        if (-not (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+            throw "7-Zip не знайдено: $SevenZipPath"
+        }
+        if (-not (Test-Path -LiteralPath $FilePath -PathType Leaf)) {
+            throw "файл не знайдено: $FilePath"
+        }
+
+        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
+        $processInfo.FileName = $SevenZipPath
+        $processInfo.Arguments = "h -scrcCRC32 `"$FilePath`""
+        $processInfo.RedirectStandardInput = $true
+        $processInfo.RedirectStandardOutput = $true
+        $processInfo.RedirectStandardError = $true
+        $processInfo.UseShellExecute = $false
+        $processInfo.CreateNoWindow = $true
+
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $processInfo
+        $capture = Start-BRAVOProcessOutputCapture -Process $process
+        $process.StandardInput.Close()
+
+        if ($TimeoutSeconds -gt 0) {
+            $timeoutMilliseconds = [int][math]::Min(
+                [double][int]::MaxValue,
+                [double]$TimeoutSeconds * 1000
+            )
+            $completed = $process.WaitForExit($timeoutMilliseconds)
+        } else {
+            $process.WaitForExit()
+            $completed = $true
+        }
+
+        if (-not $completed) {
+            $timedOut = $true
+            try {
+                $process.Kill()
+                [void]$process.WaitForExit(5000)
+            } catch {
+                # Процес міг завершитися між перевіркою таймауту та Kill().
+            }
+        }
+
+        if ($null -ne $capture) {
+            $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $capture
+            $capture = $null
+            $standardOutput = [string]$capturedOutput.StandardOutput
+        }
+        if ($process.HasExited) {
+            $exitCode = [int]$process.ExitCode
+        }
+
+        if ($timedOut -or $exitCode -ne 0) {
+            $description = Get-BRAVOSevenZipExitCodeDescription `
+                -ExitCode $exitCode `
+                -TimedOut:$timedOut
+            return New-Object PSObject -Property @{
+                Success = $false
+                Crc = ''
+                Error = "7-Zip CRC32 не вдався: $description"
+            }
+        }
+
+        # Формат виводу `7za h`: рядок "CRC32  for data:  XXXXXXXX".
+        if ($standardOutput -match 'CRC32\s+for data:\s*([0-9A-Fa-f]{1,8})') {
+            return New-Object PSObject -Property @{
+                Success = $true
+                # 7-Zip не доповнює провідні нулі — нормалізуємо до 8 знаків,
+                # як у CRC архівних entries.
+                Crc = ([string]$matches[1]).ToUpperInvariant().PadLeft(8, '0')
+                Error = $null
+            }
+        }
+        return New-Object PSObject -Property @{
+            Success = $false
+            Crc = ''
+            Error = "не вдалося розпізнати CRC32 у виводі 7-Zip для: $FilePath"
+        }
+    } catch {
+        return New-Object PSObject -Property @{
+            Success = $false
+            Crc = ''
+            Error = $_.Exception.Message
+        }
+    } finally {
+        if ($null -ne $capture) {
+            try {
+                [void](Complete-BRAVOProcessOutputCapture -Capture $capture)
+            } catch {
+                # Збір виводу не повинен приховувати основний результат.
             }
         }
         if ($null -ne $process) {

@@ -2,6 +2,55 @@
 
 ## 5.2.0-dev.1 — 2026-08-20
 
+- New Trace processing model (daily accumulating archive): TraceSRV.out
+  and the new optional TraceBIS.out (explicit
+  maintenanceSettings.Trace.BISSourcePath — no reliable auto-discovery
+  source exists for BIS) are handled EXCLUSIVELY by BRAVO_MAINTENANCE
+  (manual and scheduled runs share one pipeline; file size is never a
+  trigger). Rotation while services are stopped produces flat
+  Trace\<Name>_<yyyyMMdd_HHmmss>.out (collision takes the next free
+  second, never overwrites; the sequence engine for
+  exchangAPI/Apache/BravoWeb is byte-identical via the new
+  -NamingPolicy parameter). After service restoration an unnumbered
+  phase updates exactly ONE Trace_YYYYMMDD.mdz per calendar date (date
+  from the rotated file NAME, oldest-first backlog across dates):
+  inventory first (new Compatibility exports
+  Get-BRAVOSevenZipArchiveEntries / Get-BRAVOSevenZipFileCrc), only
+  NEW files are passed to 7za (existing entries are immutable and
+  verified by Path+Size+CRC before publish), transactional
+  .work-partial update with 7z t + SHA512 sidecar + atomic publish
+  (a failed update never touches the previous valid archive), then
+  SFTP into the new sftpDirectories.Trace ("trace") via verified
+  <name>.new before replacing the previous remote version; rotated
+  .out are deleted only after the full
+  archive+integrity+SFTP+remote-verify chain, and a failed SFTP just
+  defers to the next run without duplicate entries. The local daily
+  .mdz is NEVER deleted by the pipeline — only by the new explicit
+  Retention.CompressedLogDeletionEnabled (default $false: no
+  compressed log .mdz, including legacy Trace_YYYY-MM-DD.mdz, is
+  age-deleted until the operator opts in; CompressedLogDays applies
+  only with the flag). Trace archive headers are deliberately not
+  -mhe encrypted (same as backup .mdz): with encrypted headers 7za
+  requests the password twice on append and does not reliably read
+  the second prompt from redirected stdin. Dry-run gains read-only
+  PLAN lines (sources, would create/update, queued count, would
+  upload, would delete) reusing the canonical backlog function via
+  AST extraction. Legacy date-directories/archives remain untouched
+  and continue through the existing ArchiveDays chain. New selftest
+  domain TraceArchive (18 scenarios on the real Tools 7za + fake SFTP
+  session) plus rotation/retention/dry-run gates.
+- Fix (latent, found by Trace characterization): 7-Zip passwords fed
+  via Process.StandardInput.WriteLine were BOM-prefixed on UTF-8
+  console hosts (chcp 65001) — archives were created "successfully"
+  with a corrupted effective password. New canonical
+  Write-BRAVOProcessInputText (BOM-free UTF-8 via BaseStream) is used
+  by all Compatibility 7z wrappers and Maintenance
+  Invoke-CommandWithLog; the Secrets/SevenZipPasswordUsesStdin gate
+  now requires the helper. Debt note: BRAVO.DataRestore's private
+  Get-BRAVOSevenZipArchiveInventory (counters-only) should migrate to
+  the new canonical Get-BRAVOSevenZipArchiveEntries in the DataRestore
+  decomposition cycle.
+
 Opens the next development cycle on developer after the 5.1.0 stable
 release (per RELEASE_POLICY.md section 11: post-promotion sync with
 master, then immediate prerelease bump so both branches never carry the
