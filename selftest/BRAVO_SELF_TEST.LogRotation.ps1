@@ -1030,6 +1030,43 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             -Name "LogRotation/25-CompressedLogDaysRetention" `
             -Failure "CompressedLogDays видаляє лише .mdz власного компонента, старші за строк: 100-денний лишається, 200-денний видаляється, чужі й недатовані архіви не чіпаються"
 
+        # --- Test 25b: обидва формати дат (legacy YYYY-MM-DD і новий
+        # Trace_YYYYMMDD 5.2.0) підпадають під ту саму retention-політику ---
+        $test25bPath = Join-Path $rotationTestRoot "test25b\Trace"
+        $test25bExpiredCompact = (Get-Date).AddDays(-200).ToString("yyyyMMdd")
+        $test25bFreshCompact = (Get-Date).AddDays(-100).ToString("yyyyMMdd")
+        [void](New-BRAVOLogRotationFixture -Directory $test25bPath -Name "Trace_$test25bExpiredCompact.mdz" -Content "expired-compact")
+        [void](New-BRAVOLogRotationFixture -Directory $test25bPath -Name "Trace_$test25bFreshCompact.mdz" -Content "fresh-compact")
+        [void](New-BRAVOLogRotationFixture -Directory $test25bPath -Name "Trace_$test25ExpiredDate.mdz" -Content "expired-legacy")
+        $test25bResult = Invoke-BRAVORotationHelper -Body {
+            param($Path, $Logger)
+            Remove-BRAVOExpiredCompressedLogs `
+                -Path $Path `
+                -ArchiveNamePrefix "Trace" `
+                -RetentionDays 180 `
+                -Logger $Logger
+        } -Arguments @($test25bPath, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test25bResult.Deleted -eq 2 -and
+                -not (Test-Path -LiteralPath (Join-Path $test25bPath "Trace_$test25bExpiredCompact.mdz")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test25bPath "Trace_$test25ExpiredDate.mdz")) -and
+                (Test-Path -LiteralPath (Join-Path $test25bPath "Trace_$test25bFreshCompact.mdz"))
+            ) `
+            -Name "LogRotation/25b-BothMdzDateFormatsShareRetentionPolicy" `
+            -Failure "прострочені Trace_YYYYMMDD.mdz і Trace_YYYY-MM-DD.mdz видаляються однією політикою, свіжий компактний лишається"
+
+        # --- Test 25c: CompressedLogDeletionEnabled гейтує і скан, і виклик
+        # (типово `$false — жоден .mdz не видаляється за віком) ---
+        Test-BRAVOCondition `
+            -Condition (
+                $maintenanceScriptText.Contains('if ($COMPRESSED_LOG_DELETION_ENABLED) {') -and
+                $maintenanceScriptText.Contains('if ($COMPRESSED_LOG_DELETION_ENABLED -and $expiredCompressedLogCount -gt 0) {') -and
+                $maintenanceScriptText.Contains('$MaintenanceConfig.Retention.Contains("CompressedLogDeletionEnabled")')
+            ) `
+            -Name "LogRotation/25c-CompressedLogDeletionRequiresExplicitFlag" `
+            -Failure "видалення стиснутих .mdz за віком має бути двічі гейтоване CompressedLogDeletionEnabled (скан кандидатів + виклик), із захисним Contains-читанням конфіга"
+
         # --- Test 26: цільова структура, конфігурація і нерекурсивний cleanup ---
         $removeOldLogFilesBody = [regex]::Match(
             $maintenanceScriptText,

@@ -259,6 +259,17 @@ $COMPRESSED_LOG_RETENTION_DAYS = if ($MaintenanceConfig.Retention -is [System.Co
 } else {
     $LOG_RETENTION_DAYS
 }
+# 5.2.0: явний вимикач автоматичного видалення стиснутих .mdz за віком
+# (включно з добовими Trace_YYYYMMDD.mdz). Типово $false — жоден .mdz не
+# видаляється, доки оператор свідомо не ввімкне політику; CompressedLogDays
+# діє лише разом із прапорцем. Дефолт для старих site-config гарантує
+# конфіг-лоадер, тут — захисне читання тим самим Contains-патерном.
+$COMPRESSED_LOG_DELETION_ENABLED = if ($MaintenanceConfig.Retention -is [System.Collections.IDictionary] -and
+    $MaintenanceConfig.Retention.Contains("CompressedLogDeletionEnabled")) {
+    [bool]$MaintenanceConfig.Retention.CompressedLogDeletionEnabled
+} else {
+    $false
+}
 $FAILED_ARCHIVE_RETENTION_DAYS = if ($null -ne $MaintenanceConfig.Retention.FailedArchiveDays) {
     [math]::Max(1, [int]$MaintenanceConfig.Retention.FailedArchiveDays)
 } else {
@@ -3963,7 +3974,10 @@ function Remove-BRAVOExpiredCompressedLogs {
     }
 
     $cutoffDate = (Get-Date).AddDays(-$RetentionDays)
-    $archivePattern = '^' + [regex]::Escape($ArchiveNamePrefix) + '_(\d{4}-\d{2}-\d{2})\.mdz$'
+    # Два формати дат: legacy YYYY-MM-DD (архіви каталогів-дат) і новий
+    # компактний YYYYMMDD (добові Trace-архіви моделі 5.2.0) — обидва
+    # підпадають під ту саму (явно ввімкнену) політику видалення за віком.
+    $archivePattern = '^' + [regex]::Escape($ArchiveNamePrefix) + '_(\d{4}-\d{2}-\d{2}|\d{8})\.mdz$'
     foreach ($archiveFile in @(Get-BRAVOFiles -LiteralPath $Path -Filter "*.mdz")) {
         $archiveMatch = [regex]::Match($archiveFile.Name, $archivePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if (-not $archiveMatch.Success) {
@@ -3975,7 +3989,7 @@ function Remove-BRAVOExpiredCompressedLogs {
         [datetime]$archiveDate = [datetime]::MinValue
         if (-not [datetime]::TryParseExact(
                 $archiveMatch.Groups[1].Value,
-                'yyyy-MM-dd',
+                [string[]]@('yyyy-MM-dd', 'yyyyMMdd'),
                 [System.Globalization.CultureInfo]::InvariantCulture,
                 [System.Globalization.DateTimeStyles]::None,
                 [ref]$archiveDate)) {
@@ -7274,23 +7288,28 @@ if ($BravoWebLegacyDataEnabled) {
 }
 
 $expiredCompressedLogCount = 0
-$compressedLogCutoff = (Get-Date).AddDays(-$COMPRESSED_LOG_RETENTION_DAYS)
-foreach ($compressedTarget in $compressedLogRetentionTargets) {
-    if (-not (Test-Path -LiteralPath $compressedTarget.Path -PathType Container)) {
-        continue
-    }
-    $archivePattern = '^' + [regex]::Escape([string]$compressedTarget.Prefix) + '_(\d{4}-\d{2}-\d{2})\.mdz$'
-    foreach ($archiveFile in @(Get-BRAVOFiles -LiteralPath ([string]$compressedTarget.Path) -Filter "*.mdz")) {
-        $archiveMatch = [regex]::Match($archiveFile.Name, $archivePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-        if (-not $archiveMatch.Success) { continue }
-        [datetime]$archiveDate = [datetime]::MinValue
-        if ([datetime]::TryParseExact(
-                $archiveMatch.Groups[1].Value,
-                'yyyy-MM-dd',
-                [System.Globalization.CultureInfo]::InvariantCulture,
-                [System.Globalization.DateTimeStyles]::None,
-                [ref]$archiveDate) -and $archiveDate -lt $compressedLogCutoff) {
-            $expiredCompressedLogCount++
+# Скан кандидатів виконується ЛИШЕ при явно ввімкненій політиці видалення
+# стиснутих логів: із вимкненим прапорцем (типово) жоден .mdz не
+# видаляється за віком — незалежно від CompressedLogDays.
+if ($COMPRESSED_LOG_DELETION_ENABLED) {
+    $compressedLogCutoff = (Get-Date).AddDays(-$COMPRESSED_LOG_RETENTION_DAYS)
+    foreach ($compressedTarget in $compressedLogRetentionTargets) {
+        if (-not (Test-Path -LiteralPath $compressedTarget.Path -PathType Container)) {
+            continue
+        }
+        $archivePattern = '^' + [regex]::Escape([string]$compressedTarget.Prefix) + '_(\d{4}-\d{2}-\d{2}|\d{8})\.mdz$'
+        foreach ($archiveFile in @(Get-BRAVOFiles -LiteralPath ([string]$compressedTarget.Path) -Filter "*.mdz")) {
+            $archiveMatch = [regex]::Match($archiveFile.Name, $archivePattern, [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if (-not $archiveMatch.Success) { continue }
+            [datetime]$archiveDate = [datetime]::MinValue
+            if ([datetime]::TryParseExact(
+                    $archiveMatch.Groups[1].Value,
+                    [string[]]@('yyyy-MM-dd', 'yyyyMMdd'),
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::None,
+                    [ref]$archiveDate) -and $archiveDate -lt $compressedLogCutoff) {
+                $expiredCompressedLogCount++
+            }
         }
     }
 }
@@ -7347,8 +7366,10 @@ if ($BravoMaintenanceEnabled -and $traceOldLogs.Count -gt 0) {
 
 # Видалення стиснутих журналів, старших за CompressedLogDays. Виконується
 # ПІСЛЯ Process-OldData: спочатку сьогоднішні застарілі каталоги-дати стають
-# архівами, і лише потім перевіряється вік самих архівів.
-if ($expiredCompressedLogCount -gt 0) {
+# архівами, і лише потім перевіряється вік самих архівів. Гейт
+# CompressedLogDeletionEnabled — подвійний захист (скан вище вже нульовий
+# при вимкненій політиці).
+if ($COMPRESSED_LOG_DELETION_ENABLED -and $expiredCompressedLogCount -gt 0) {
     foreach ($compressedTarget in $compressedLogRetentionTargets) {
         [void](Remove-BRAVOExpiredCompressedLogs `
             -Path ([string]$compressedTarget.Path) `
