@@ -386,6 +386,9 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             $suppressedScenario.MarkerCleared -eq $false -and
             @($suppressedScenario.Issues).Count -eq 1 -and
             [string]$suppressedScenario.Issues[0].Reason -match 'РУЧНЕ' -and
+            [string]$suppressedScenario.Issues[0].Reason -match 'код(ом)? 43' -and
+            # Компактність: без внутрішнього жаргону в операторському тексті.
+            [string]$suppressedScenario.Issues[0].Reason -notmatch 'restartSuppressed' -and
             [string]$suppressedScenario.Issues[0].ActionText -match 'код 43'
         ) `
         -Name "ServiceQuiescence/WatchdogRespectsSuppressedMarker" `

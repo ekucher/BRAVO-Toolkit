@@ -10,6 +10,11 @@ debt): deduplication of service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
 Runtime.ps1 decomposition.
 
+- The suppressed-marker watchdog issue text is compacted to one cause
+  + one action + the owner log ("перерване відновлення — потрібне
+  РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: <шлях>");
+  the internal restartSuppressed jargon and the triple restatement
+  stay only in the detailed Health log line.
 - Compact operator alerts (operator request from the DEV-LIMS field
   test): the Health problem notification shows the full issue Reason
   exactly once (in its thematic section) — the header reason block now

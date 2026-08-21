@@ -4752,7 +4752,10 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
         $watchdogIssues += [pscustomobject]@{
             Kind = "Service"
             Component = "Служби після аварії $($quiescenceState.owner)"
-            Reason = "залишені зупиненими з restartSuppressed (аварійно перерваний DataRestore або незавершений rollback) — потрібне РУЧНЕ відновлення, автоматичний старт заборонено; див. $($quiescenceState.logFile)"
+            # Компактно (запит оператора): одна причина + одна дія + лог.
+            # Повний технічний контекст (restartSuppressed, варіанти
+            # переривання) лишається в ERROR-рядку Health-логу вище.
+            Reason = "перерване відновлення — потрібне РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: $($quiescenceState.logFile)"
             # Власний ActionText: Component тут — опис події, тому загальний
             # шаблон «запустити або перевірити службу <Component>» непридатний.
             ActionText = "виконати ручне відновлення служб (OPERATIONS.md, код 43)"
