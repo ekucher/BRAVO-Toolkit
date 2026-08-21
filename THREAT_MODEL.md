@@ -239,6 +239,24 @@ machine-wide lock, перевіряє schema/owner/hostname і ніколи не
 ресурси через широкий фільтр. Невідомий owner, небезпечний link path або
 помилка exact-ID delete зберігають state і блокують новий backup.
 
+Той самий патерн покриває служби: Maintenance/DataRestore перед зупинкою
+служб пишуть атомарний ownership-маркер
+`C:\ProgramData\BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json`
+(schemaVersion/owner/hostname/pid/processStartTime/services). Health-watchdog
+стартує служби ЛИШЕ якщо маркер валідний, власник мертвий
+(pid+processStartTime, PID-реюз виключено) і `restartSuppressed=false` —
+і рівно ті служби, що перелічені в маркері. Маркер — вхід для рішення про
+дію, тому Read відхиляє чужий hostname, незнайому schemaVersion, невідомого
+owner, зіпсований JSON і маркер без обов'язкових полів (fail-safe: краще не
+стартувати). DataRestore пише свій маркер одразу `restartSuppressed=true`:
+жорстке переривання посеред restore лишає live filesystem у невизначеному
+стані, тож watchdog для нього ніколи не автостартує — лише алертить.
+Clear/Suppress діють тільки на маркер, записаний власним процесом
+(pid+processStartTime), а watchdog перечитує маркер перед Start-Service і
+видаляє його лише за точним збігом (owner+pid+createdAt) — перетин
+власників не дає знищити чужий маркер. Ручні зупинки техпідтримки маркера
+не мають — їх watchdog не чіпає ніколи.
+
 **Залишковий ризик.** Низький. Lock — файловий, тому непрацездатний для
 кількох серверів, що пишуть в одне SFTP-призначення (сценарій поза
 поточною архітектурою).

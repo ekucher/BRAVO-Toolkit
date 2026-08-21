@@ -8129,6 +8129,8 @@ try {
 
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DataRestore.ps1')
 
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceQuiescence.ps1')
+
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
     # архів (7za test + SHA512 збігається) все одно може бути підозріло
     # малим через неправильне джерело чи зламані permissions.
