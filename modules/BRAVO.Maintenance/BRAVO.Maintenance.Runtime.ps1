@@ -29,7 +29,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # ConvertTo-BRAVOIniPathValue, а покладатися на порядок чужих імпортів для
 # власних залежностей — рівно та помилка, яку вже задокументовано в шапці
 # самого BRAVO.Discovery.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -436,6 +436,19 @@ if (-not [string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     # -p без значення: пароль буде передано 7-Zip через stdin.
     $arcCommonParams += "-p"
 }
+# Параметри 7-Zip для накопичувального добового Trace-архіву (модель
+# 5.2.0): базові Archiver.Parameters (включно з успадкованим bare -p) без
+#   'a'    — команда додається явно першою;
+#   '-r'   — рекурсія небезпечна для точкових додавань (7-Zip трактує
+#            імена як патерни і підтягнув би однойменні файли з підкаталогів);
+#   '-aoa' — overwrite-режим суперечить immutable-контракту entries;
+#   '-mhe' — шифрований заголовок вимагає ДРУГОГО вводу пароля при
+#            додаванні в існуючий архів, і 7-Zip читає його не з
+#            redirected stdin надійно (див. Update-BRAVOTraceDailyArchive).
+$traceArchiveAddParams = @('a') + @($arcCommonParams | Where-Object {
+    $_ -ne 'a' -and $_ -ne '-r' -and $_ -ne '-aoa' -and $_ -notmatch '^(?i)-mhe'
+})
+$traceSftpRemoteDirectory = [string]$sftpDirectories.Trace
 $MoveRetryCount = if ($MaintenanceConfig.FileOperations -and
     $null -ne $MaintenanceConfig.FileOperations.MoveRetryCount) {
     [math]::Max(1, [int]$MaintenanceConfig.FileOperations.MoveRetryCount)
@@ -3379,6 +3392,245 @@ function Update-BRAVOTraceDailyArchive {
     } finally {
         Remove-BRAVOTraceWorkArtifacts -WorkArchivePath $workArchivePath
     }
+}
+
+function Send-BRAVOTraceArchiveFile {
+    # Безпечна передача ОДНОГО файла з transactional publication: спочатку
+    # ПОВНА передача у <ім'я>.new (Resume=On, .filepart усередині WinSCP),
+    # верифікація розміру .new, і лише потім заміна фінального імені —
+    # попередня валідна remote-версія не втрачається до підтвердження
+    # нової. Duck-typed $Session (PutFiles/FileExists/GetFileInfo/
+    # MoveFile/RemoveFiles) — той самий контракт, що BazaSync-двигун і
+    # фейк-сесія self-test.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string]$LocalPath,
+        [Parameter(Mandatory = $true)][string]$RemoteFinalPath,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $localItem = Get-Item -LiteralPath $LocalPath -ErrorAction Stop
+    $remoteTempPath = "$RemoteFinalPath.new"
+    $transferOptions = New-Object WinSCP.TransferOptions
+    $transferOptions.TransferMode = [WinSCP.TransferMode]::Binary
+    $transferOptions.ResumeSupport.State = [WinSCP.TransferResumeSupportState]::On
+
+    $transferResult = $Session.PutFiles($LocalPath, $remoteTempPath, $false, $transferOptions)
+    if (-not $transferResult.IsSuccess) {
+        $failureMessages = @(
+            $transferResult.Transfers | Where-Object { $null -ne $_.Error } |
+                ForEach-Object { [string]$_.Error.Message }
+        )
+        $detail = if ($failureMessages.Count -gt 0) { $failureMessages -join '; ' } else { 'невідома помилка передачі' }
+        return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "передача $remoteTempPath не вдалася: $detail" }
+    }
+    $tempInfo = $Session.GetFileInfo($remoteTempPath)
+    if ($null -eq $tempInfo -or [int64]$tempInfo.Length -ne [int64]$localItem.Length) {
+        return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "remote розмір $remoteTempPath не збігається з локальним ($($localItem.Length) байт) — публікацію скасовано, попередня версія недоторкана" }
+    }
+    # Стара версія прибирається ЛИШЕ після верифікованого .new: SFTP-rename
+    # не перезаписує ціль, тому шлях звільняється явним RemoveFiles.
+    if ($Session.FileExists($RemoteFinalPath)) {
+        $removeResult = $Session.RemoveFiles($RemoteFinalPath)
+        if (-not $removeResult.IsSuccess) {
+            return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "не вдалося звільнити $RemoteFinalPath для публікації нової версії (верифікований .new залишено)" }
+        }
+    }
+    $Session.MoveFile($remoteTempPath, $RemoteFinalPath)
+    $finalInfo = $Session.GetFileInfo($RemoteFinalPath)
+    if ($null -eq $finalInfo -or [int64]$finalInfo.Length -ne [int64]$localItem.Length) {
+        return [pscustomobject]@{ Success = $false; RemoteSize = $null; Error = "фінальна верифікація $RemoteFinalPath не пройдена після публікації" }
+    }
+    Write-BRAVOLogRotationMessage -Logger $Logger `
+        -Message "SFTP: $RemoteFinalPath опубліковано ($($localItem.Length) байт)" -Level "SUCCESS"
+    return [pscustomobject]@{ Success = $true; RemoteSize = [int64]$finalInfo.Length; Error = $null }
+}
+
+function Send-BRAVOTraceArchive {
+    # Комплект добового архіву: спочатку .mdz, потім .sha512 (sidecar
+    # завжди відповідає вже опублікованому архіву; обрив між ними дає
+    # застарілий sidecar, який наступний прогін просто перезаллє).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$SidecarPath,
+        [Parameter(Mandatory = $true)][string]$RemoteDirectory,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    try {
+        $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Trim('/').Replace('\', '/')
+        $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
+        $remoteArchivePath = "$remoteRoot/$([System.IO.Path]::GetFileName($ArchivePath))"
+        $archiveResult = Send-BRAVOTraceArchiveFile `
+            -Session $Session `
+            -LocalPath $ArchivePath `
+            -RemoteFinalPath $remoteArchivePath `
+            -Logger $Logger
+        if (-not $archiveResult.Success) {
+            return [pscustomobject]@{ Success = $false; RemoteArchivePath = $remoteArchivePath; RemoteSize = $null; Error = $archiveResult.Error }
+        }
+        $sidecarResult = Send-BRAVOTraceArchiveFile `
+            -Session $Session `
+            -LocalPath $SidecarPath `
+            -RemoteFinalPath "$remoteRoot/$([System.IO.Path]::GetFileName($SidecarPath))" `
+            -Logger $Logger
+        if (-not $sidecarResult.Success) {
+            return [pscustomobject]@{ Success = $false; RemoteArchivePath = $remoteArchivePath; RemoteSize = $null; Error = "архів опубліковано, але sidecar не передано: $($sidecarResult.Error)" }
+        }
+        return [pscustomobject]@{ Success = $true; RemoteArchivePath = $remoteArchivePath; RemoteSize = [int64]$archiveResult.RemoteSize; Error = $null }
+    } catch {
+        return [pscustomobject]@{ Success = $false; RemoteArchivePath = $null; RemoteSize = $null; Error = $_.Exception.Message }
+    }
+}
+
+function Invoke-BRAVOTraceArchiveMaintenance {
+    # Оркестратор фази «добовий Trace-архів»: backlog (усі дати,
+    # oldest->newest) -> per-date план -> транзакційний update -> SFTP ->
+    # cleanup джерел. Джерельні .out (NewFiles І DuplicateFiles — сліди
+    # минулого «MDZ OK / SFTP FAIL») видаляються ЛИШЕ коли для дати
+    # одночасно: entry верифіковано в ОПУБЛІКОВАНОМУ архіві, 7z t OK,
+    # SFTP Success, remote-верифікація OK. Session=$null (SFTP недоступний/
+    # ненаналаштований) — архіви оновлюються, джерела НЕ видаляються,
+    # передача відкладається на наступний прогін. Локальний .mdz тут не
+    # видаляється НІКОЛИ (лише retention-політика з явним прапорцем).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TraceDirectory,
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string[]]$AddParameters,
+        [Parameter(Mandatory = $true)][string]$ArchivePassword,
+        [int]$CommandTimeoutSeconds = 14400,
+        [int]$IntegrityTimeoutSeconds = 43200,
+        [AllowNull()]$Session,
+        [string]$RemoteDirectory,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $result = [pscustomobject]@{
+        DatesProcessed = 0
+        ArchivesUpdated = 0
+        Uploaded = 0
+        SourcesDeleted = 0
+        Conflicts = 0
+        Errors = 0
+        UploadsDeferred = 0
+    }
+
+    [void](Clear-BRAVOTraceOrphanWorkArtifacts -TraceDirectory $TraceDirectory -Logger $Logger)
+
+    $backlog = @(Get-BRAVOTraceArchiveBacklog -TraceDirectory $TraceDirectory)
+    if (@($backlog).Count -eq 0) {
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Trace: ротованих файлів для добової архівації немає" -Level "INFO"
+        return $result
+    }
+
+    foreach ($group in $backlog) {
+        $result.DatesProcessed++
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Trace: дата $($group.DateKey) — файлів у черзі: $(@($group.Files).Count); архів: $($group.ArchiveName)" -Level "INFO"
+
+        $plan = Get-BRAVOTraceArchiveUpdatePlan `
+            -BacklogGroup $group `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePassword $ArchivePassword `
+            -TimeoutSeconds $IntegrityTimeoutSeconds `
+            -Logger $Logger
+        if ($plan.InventoryFailed) {
+            $result.Errors++
+            continue
+        }
+        if ($plan.HasConflicts) {
+            $result.Conflicts += @($plan.ConflictFiles).Count
+            $result.Errors++
+            foreach ($conflict in @($plan.ConflictFiles)) {
+                Write-BRAVOLogRotationMessage -Logger $Logger `
+                    -Message "ПОМИЛКА: Trace-конфлікт $($conflict.File.Name): $($conflict.Reason) — archived entry і локальний файл недоторкані" -Level "ERROR"
+            }
+            continue
+        }
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Trace: вже в архіві: $(@($plan.ExistingEntries).Count); нових: $(@($plan.NewFiles).Count); пропущено вже наявних: $(@($plan.DuplicateFiles).Count)" -Level "INFO"
+
+        $update = Update-BRAVOTraceDailyArchive `
+            -BacklogGroup $group `
+            -Plan $plan `
+            -SevenZipPath $SevenZipPath `
+            -AddParameters $AddParameters `
+            -ArchivePassword $ArchivePassword `
+            -CommandTimeoutSeconds $CommandTimeoutSeconds `
+            -IntegrityTimeoutSeconds $IntegrityTimeoutSeconds `
+            -Logger $Logger
+        if ([string]$update.Status -eq 'FAILED') {
+            $result.Errors++
+            continue
+        }
+        if ([string]$update.Status -in @('CREATED', 'UPDATED')) {
+            $result.ArchivesUpdated++
+        }
+
+        if ($null -eq $Session) {
+            $result.UploadsDeferred++
+            Write-BRAVOLogRotationMessage -Logger $Logger `
+                -Message "Trace: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні .out збережено для наступного прогону" -Level "WARNING"
+            continue
+        }
+
+        $send = Send-BRAVOTraceArchive `
+            -Session $Session `
+            -ArchivePath $group.ArchivePath `
+            -SidecarPath $group.SidecarPath `
+            -RemoteDirectory $RemoteDirectory `
+            -Logger $Logger
+        if (-not $send.Success) {
+            $result.Errors++
+            Write-BRAVOLogRotationMessage -Logger $Logger `
+                -Message "ПОМИЛКА: SFTP-передача $($group.ArchiveName) не вдалася: $($send.Error) — локальний архів і джерельні .out збережено, повтор наступним прогоном" -Level "ERROR"
+            continue
+        }
+        $result.Uploaded++
+
+        # Контрольний inventory ОПУБЛІКОВАНОГО архіву перед видаленням
+        # джерел: видаляти можна лише те, що гарантовано в архіві.
+        $publishedInventory = Get-BRAVOSevenZipArchiveEntries `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $group.ArchivePath `
+            -Password $ArchivePassword `
+            -TimeoutSeconds $IntegrityTimeoutSeconds
+        if (-not $publishedInventory.Success) {
+            $result.Errors++
+            Write-BRAVOLogRotationMessage -Logger $Logger `
+                -Message "ПОМИЛКА: контрольний inventory $($group.ArchiveName) перед очищенням джерел не вдався: $($publishedInventory.Error) — .out збережено" -Level "ERROR"
+            continue
+        }
+        $publishedNames = @{}
+        foreach ($entry in @($publishedInventory.Entries | Where-Object { -not $_.IsDirectory })) {
+            $publishedNames[[System.IO.Path]::GetFileName([string]$entry.Path)] = $true
+        }
+        foreach ($sourceFile in @(@($plan.NewFiles) + @($plan.DuplicateFiles))) {
+            if (-not $publishedNames.ContainsKey($sourceFile.Name)) {
+                $result.Errors++
+                Write-BRAVOLogRotationMessage -Logger $Logger `
+                    -Message "ПОМИЛКА: $($sourceFile.Name) відсутній в опублікованому архіві — джерело збережено" -Level "ERROR"
+                continue
+            }
+            Remove-Item -LiteralPath $sourceFile.FullName -Force -ErrorAction SilentlyContinue
+            if (Test-Path -LiteralPath $sourceFile.FullName) {
+                $result.Errors++
+                Write-BRAVOLogRotationMessage -Logger $Logger `
+                    -Message "ПОМИЛКА: не вдалося видалити передане джерело $($sourceFile.Name)" -Level "ERROR"
+            } else {
+                $result.SourcesDeleted++
+            }
+        }
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Trace: дата $($group.DateKey) завершена — видалено переданих .out: $($result.SourcesDeleted); локальний MDZ: ЗАЛИШЕНО" -Level "SUCCESS"
+    }
+
+    return $result
 }
 
 
@@ -6770,6 +7022,137 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
         -Name 'Контроль діапазонів ID' `
         -Status 'SKIPPED' `
         -Details 'вимкнено'
+}
+
+# ===== TRACE: ДОБОВИЙ АРХІВ І SFTP =====
+# Unnumbered операція ПІСЛЯ відновлення служб (Total=8 незмінний, як
+# cleanup/archive/shutdown нижче): архівація і мережева передача не мають
+# додавати ані секунди downtime — служби вже працюють, ротовані .out
+# обробляються у фоні цього ж запуску. SFTP-збій тут не блокує решту
+# Maintenance: файли лишаються, retry — наступним прогоном.
+Write-BRAVOProgressPhase -Phase 'Trace: добовий архів і SFTP' -PercentComplete 84
+$script:currentMaintenanceOperation = 'Trace: добовий архів і SFTP'
+$traceArchiveOperationStartedAt = Get-Date
+$traceArchiveCriticalBefore = $script:criticalErrorOccurred
+$traceArchiveWarningsBefore = $script:BRAVOWarningCount
+$traceArchiveOperationDetail = $null
+if (-not $BravoMaintenanceEnabled) {
+    Write-BRAVOOperationResult `
+        -Name 'Trace: добовий архів і SFTP' `
+        -Status 'SKIPPED' `
+        -Duration ((Get-Date) - $traceArchiveOperationStartedAt) `
+        -Details 'вимкнено'
+} elseif ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
+    Write-Log -Message "Trace: добова архівація пропущена — пароль архівів недоступний ($ArchiveCredentialError)" -Level "WARNING"
+    Write-BRAVOOperationResult `
+        -Name 'Trace: добовий архів і SFTP' `
+        -Status 'WARN' `
+        -Duration ((Get-Date) - $traceArchiveOperationStartedAt) `
+        -Details 'пароль архівів недоступний'
+} else {
+    $traceSftpSession = $null
+    try {
+        Write-Log -Message "==="
+        Write-Log -Message "=== TRACE: ДОБОВИЙ АРХІВ І SFTP ===" -Level "INFO"
+        # SFTP-сесія — той самий канонічний ланцюг, що standalone-інструменти
+        # (Credential Manager -> Resolve-BRAVOSftpHostName -> New-BRAVOSftpUrl
+        # -> WinSCP .NET). Недоступність креденшлів/WinSCP — НЕ критична:
+        # архіви оновлюються локально, передача відкладається.
+        try {
+            $traceSftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
+            $traceSftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
+            if ([string]::IsNullOrWhiteSpace($traceSftpLoginTarget)) { $traceSftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
+            if ([string]::IsNullOrWhiteSpace($traceSftpPasswordTarget)) { $traceSftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
+            $traceSftpLogin = Get-BRAVOCredentialSecret -Target $traceSftpLoginTarget
+            $traceSftpPassword = Get-BRAVOCredentialSecret -Target $traceSftpPasswordTarget
+            if ([string]::IsNullOrWhiteSpace($traceSftpLogin) -or [string]::IsNullOrWhiteSpace($traceSftpPassword)) {
+                throw "записи Credential Manager '$traceSftpLoginTarget'/'$traceSftpPasswordTarget' недоступні"
+            }
+            $traceSftpLogin = ([string]$traceSftpLogin).Trim()
+            $traceResolvedSftpHost = Resolve-BRAVOSftpHostName `
+                -UserName $traceSftpLogin `
+                -HostTemplate ([string]$sftpHostTemplate) `
+                -FallbackHostName $(if ($null -ne (Get-Variable -Name 'sftpHost' -Scope Global -ErrorAction SilentlyContinue)) { [string](Get-Variable -Name 'sftpHost' -Scope Global).Value } else { $null })
+            $traceRepositorySftpUrl = New-BRAVOSftpUrl `
+                -HostName $traceResolvedSftpHost `
+                -Port ([int]$sftpPort) `
+                -UserName $traceSftpLogin `
+                -Password ([string]$traceSftpPassword)
+            $traceSftpPassword = $null
+            $traceWinScpComponents = Get-BRAVOWinSCPDotNetComponents -WinSCPPath ([string]$winSCPPath)
+            if ($null -eq $traceWinScpComponents) {
+                throw 'WinSCP .NET-компоненти (WinSCPnet.dll + winscp.exe) не знайдено'
+            }
+            if ($null -eq ('WinSCP.Session' -as [type])) {
+                Add-Type -Path $traceWinScpComponents.AssemblyPath -ErrorAction Stop
+            }
+            $traceSessionOptions = New-Object WinSCP.SessionOptions
+            $traceSessionOptions.ParseUrl($traceRepositorySftpUrl)
+            $traceRepositorySftpUrl = $null
+            $traceSessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+            $traceSessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(15, [int]$sftpConnectionTimeoutSeconds))
+            $traceSftpSession = New-Object WinSCP.Session
+            $traceSftpSession.ExecutablePath = $traceWinScpComponents.ExecutablePath
+            $traceSftpSession.Open($traceSessionOptions)
+        } catch {
+            if ($null -ne $traceSftpSession) {
+                try { $traceSftpSession.Dispose() } catch {
+                    # Сесія так і не відкрилась; збій Dispose не значущий.
+                }
+            }
+            $traceSftpSession = $null
+            Write-Log -Message "Trace: SFTP-сесія недоступна ($($_.Exception.Message)) — добові архіви оновлюються локально, передачу відкладено" -Level "WARNING"
+        }
+
+        $traceMaintenanceResult = Invoke-BRAVOTraceArchiveMaintenance `
+            -TraceDirectory $TRACE_DIR `
+            -SevenZipPath $ARC_PATH `
+            -AddParameters $traceArchiveAddParams `
+            -ArchivePassword $script:ArchivePassword `
+            -CommandTimeoutSeconds $NativeCommandTimeoutSeconds `
+            -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
+            -Session $traceSftpSession `
+            -RemoteDirectory $traceSftpRemoteDirectory `
+            -Logger $bravoLogRotationLogger
+        if ([int]$traceMaintenanceResult.Errors -gt 0) {
+            $script:criticalErrorOccurred = $true
+        }
+        $traceArchiveOperationDetail = if ([int]$traceMaintenanceResult.DatesProcessed -eq 0) {
+            'файлів у черзі немає'
+        } else {
+            $traceDetailParts = @(
+                "дат: $($traceMaintenanceResult.DatesProcessed)",
+                "оновлено архівів: $($traceMaintenanceResult.ArchivesUpdated)",
+                "передано на SFTP: $($traceMaintenanceResult.Uploaded)",
+                "видалено переданих .out: $($traceMaintenanceResult.SourcesDeleted)"
+            )
+            if ([int]$traceMaintenanceResult.UploadsDeferred -gt 0) {
+                $traceDetailParts += "відкладено передач: $($traceMaintenanceResult.UploadsDeferred)"
+            }
+            if ([int]$traceMaintenanceResult.Conflicts -gt 0) {
+                $traceDetailParts += "конфліктів: $($traceMaintenanceResult.Conflicts)"
+            }
+            $traceDetailParts -join '; '
+        }
+    } catch {
+        $script:criticalErrorOccurred = $true
+        $traceArchiveOperationDetail = $_.Exception.Message
+        Write-Log -Message "ПОМИЛКА: Trace добовий архів/SFTP: $($_.Exception.Message)" -Level "ERROR"
+        Send-SlackAlert -Message "Trace добовий архів/SFTP: $($_.Exception.Message)"
+    } finally {
+        if ($null -ne $traceSftpSession) {
+            try { $traceSftpSession.Dispose() } catch {
+                # Результат фази вже зафіксовано; збій Dispose не критичний.
+            }
+        }
+    }
+    Write-BRAVOOperationResult `
+        -Name 'Trace: добовий архів і SFTP' `
+        -Status (Get-BRAVOMaintenanceStepStatus `
+            -CriticalBefore $traceArchiveCriticalBefore `
+            -WarningsBefore $traceArchiveWarningsBefore) `
+        -Duration ((Get-Date) - $traceArchiveOperationStartedAt) `
+        -Details $traceArchiveOperationDetail
 }
 
 # ===== ОЧИСТКА СТАРИХ ДАНИХ =====

@@ -61,7 +61,10 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             "Clear-BRAVOTraceOrphanWorkArtifacts",
             "Write-BRAVOTraceArchiveSidecar",
             "Test-BRAVOTraceArchiveSidecarCurrent",
-            "Update-BRAVOTraceDailyArchive"
+            "Update-BRAVOTraceDailyArchive",
+            "Send-BRAVOTraceArchiveFile",
+            "Send-BRAVOTraceArchive",
+            "Invoke-BRAVOTraceArchiveMaintenance"
         )
 
     $traceArchive7za = Join-Path $root "Tools\7za.exe"
@@ -242,6 +245,100 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             (Test-Path -LiteralPath $taOrphanFresh)
         ) -Name 'TraceArchive/OrphanWorkSweepRespectsRetention' -Failure "sweep має прибрати лише .partial старший за поріг (72h > 48h), свіжий лишити"
         Remove-Item -LiteralPath $taOrphanFresh -Force -ErrorAction SilentlyContinue
+
+        # ===== SFTP-фаза: фейкова duck-typed сесія (New-BRAVOSelfTestFakeBazaSession
+        # з BazaSync-домену — цей фрагмент dot-source-иться ПІСЛЯ нього) =====
+
+        # --- Успішна публікація: .new -> verify -> звільнення -> rename -> verify ---
+        $taSendLocalDir = Join-Path $traceArchiveTestRoot "send"
+        [void](New-Item -ItemType Directory -Path $taSendLocalDir -Force)
+        $taSendArchive = Join-Path $taSendLocalDir 'Trace_20260815.mdz'
+        $taSendSidecar = "$taSendArchive.sha512"
+        [IO.File]::WriteAllText($taSendArchive, ('m' * 300))
+        [IO.File]::WriteAllText($taSendSidecar, ('s' * 140))
+        $taSendSession = New-BRAVOSelfTestFakeBazaSession
+        $taSendSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] = [int64]111
+        $taSendResult = & $traceArchiveModule { param($s, $a, $sc, $d) Send-BRAVOTraceArchive -Session $s -ArchivePath $a -SidecarPath $sc -RemoteDirectory $d } $taSendSession $taSendArchive $taSendSidecar 'trace'
+        Test-BRAVOCondition -Condition (
+            $taSendResult.Success -eq $true -and
+            [int64]$taSendSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] -eq 300 -and
+            [int64]$taSendSession.State.RemoteSizes['/trace/Trace_20260815.mdz.sha512'] -eq 140 -and
+            (@($taSendSession.State.PutFilesCalledFor) -contains '/trace/Trace_20260815.mdz.new') -and
+            (@($taSendSession.State.MoveFileCalls) -contains '/trace/Trace_20260815.mdz.new -> /trace/Trace_20260815.mdz') -and
+            (@($taSendSession.State.RemoveFilesCalls) -contains '/trace/Trace_20260815.mdz') -and
+            [string]$taSendSession.State.LastResumeSupportState -eq 'On'
+        ) -Name 'TraceArchive/SftpPublishGoesThroughVerifiedTempName' -Failure "успішна публікація: передача у .new (Resume=On), verify, звільнення старої версії, rename, фінальний розмір 300/140; факт: $($taSendResult.Error)"
+
+        # --- Обірвана передача (PutFiles fail): стара remote-версія жива, нічого не зрушено ---
+        $taSendFailSession = New-BRAVOSelfTestFakeBazaSession -AllTransfersFail
+        $taSendFailSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] = [int64]111
+        $taSendFailResult = & $traceArchiveModule { param($s, $a, $sc, $d) Send-BRAVOTraceArchive -Session $s -ArchivePath $a -SidecarPath $sc -RemoteDirectory $d } $taSendFailSession $taSendArchive $taSendSidecar 'trace'
+        Test-BRAVOCondition -Condition (
+            $taSendFailResult.Success -eq $false -and
+            [int64]$taSendFailSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] -eq 111 -and
+            @($taSendFailSession.State.RemoveFilesCalls).Count -eq 0 -and
+            @($taSendFailSession.State.MoveFileCalls).Count -eq 0
+        ) -Name 'TraceArchive/SftpInterruptedTransferKeepsOldRemoteVersion' -Failure "збій передачі .new: стара remote-версія (111 байт) недоторкана, RemoveFiles/MoveFile не викликались"
+
+        # --- Remote-верифікація .new не пройдена: публікація скасована ---
+        $taSendBadSizeSession = New-BRAVOSelfTestFakeBazaSession
+        $taSendBadSizeSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] = [int64]111
+        $taSendBadSizeSession | Add-Member -Force -MemberType ScriptMethod -Name GetFileInfo -Value {
+            param($remotePath)
+            return [pscustomobject]@{ Length = [int64]1 }
+        }
+        $taSendBadSizeResult = & $traceArchiveModule { param($s, $a, $sc, $d) Send-BRAVOTraceArchive -Session $s -ArchivePath $a -SidecarPath $sc -RemoteDirectory $d } $taSendBadSizeSession $taSendArchive $taSendSidecar 'trace'
+        Test-BRAVOCondition -Condition (
+            $taSendBadSizeResult.Success -eq $false -and
+            [int64]$taSendBadSizeSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] -eq 111 -and
+            @($taSendBadSizeSession.State.RemoveFilesCalls).Count -eq 0
+        ) -Name 'TraceArchive/SftpSizeMismatchAbortsBeforeTouchingFinal' -Failure "розбіжність розміру .new має скасувати публікацію ДО будь-якого дотику фінального імені (стара версія 111 байт жива)"
+
+        # --- Оркестратор e2e на фейковій SFTP: повний success видаляє .out,
+        # локальний MDZ ЗАЛИШАЄТЬСЯ; SFTP fail зберігає все; retry без дублікатів ---
+        $taOrch = Join-Path $traceArchiveTestRoot "orch\Trace"
+        [void](New-Item -ItemType Directory -Path $taOrch -Force)
+        $taOrchFile1 = Join-Path $taOrch 'TraceSRV_20260816_090000.out'
+        [IO.File]::WriteAllText($taOrchFile1, 'orch srv morning')
+        $taOrchFailSession = New-BRAVOSelfTestFakeBazaSession -AllTransfersFail
+        $taOrchResult1 = & $traceArchiveModule { param($d, $z, $ap, $p, $s, $rd) Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Session $s -RemoteDirectory $rd } $taOrch $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taOrchFailSession 'trace'
+        Test-BRAVOCondition -Condition (
+            [int]$taOrchResult1.ArchivesUpdated -eq 1 -and
+            [int]$taOrchResult1.Uploaded -eq 0 -and
+            [int]$taOrchResult1.Errors -ge 1 -and
+            [int]$taOrchResult1.SourcesDeleted -eq 0 -and
+            (Test-Path -LiteralPath $taOrchFile1) -and
+            (Test-Path -LiteralPath (Join-Path $taOrch 'Trace_20260816.mdz'))
+        ) -Name 'TraceArchive/OrchestratorSftpFailureKeepsMdzAndSources' -Failure "SFTP-збій: локальний MDZ оновлено і ЗБЕРЕЖЕНО, .out збережено, нічого не видалено; факт: updated=$($taOrchResult1.ArchivesUpdated) deleted=$($taOrchResult1.SourcesDeleted)"
+
+        $taOrchOkSession = New-BRAVOSelfTestFakeBazaSession
+        $taOrchResult2 = & $traceArchiveModule { param($d, $z, $ap, $p, $s, $rd) Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Session $s -RemoteDirectory $rd } $taOrch $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taOrchOkSession 'trace'
+        $taOrchInventory = BRAVO.Compatibility\Get-BRAVOSevenZipArchiveEntries -SevenZipPath $traceArchive7za -ArchivePath (Join-Path $taOrch 'Trace_20260816.mdz') -Password $traceArchivePassword
+        Test-BRAVOCondition -Condition (
+            [int]$taOrchResult2.Uploaded -eq 1 -and
+            [int]$taOrchResult2.SourcesDeleted -eq 1 -and
+            [int]$taOrchResult2.Errors -eq 0 -and
+            [int]$taOrchResult2.ArchivesUpdated -eq 0 -and
+            -not (Test-Path -LiteralPath $taOrchFile1) -and
+            (Test-Path -LiteralPath (Join-Path $taOrch 'Trace_20260816.mdz')) -and
+            (Test-Path -LiteralPath (Join-Path $taOrch 'Trace_20260816.mdz.sha512')) -and
+            @($taOrchInventory.Entries).Count -eq 1 -and
+            [int64]$taOrchOkSession.State.RemoteSizes['/trace/Trace_20260816.mdz'] -eq (Get-Item -LiteralPath (Join-Path $taOrch 'Trace_20260816.mdz')).Length
+        ) -Name 'TraceArchive/OrchestratorRetryUploadsWithoutDuplicatesThenCleansSources' -Failure "retry після SFTP-збою: без повторного додавання (1 entry), upload+verify, .out видалено, локальний MDZ+sidecar ЗАЛИШЕНО; факт: uploaded=$($taOrchResult2.Uploaded) deleted=$($taOrchResult2.SourcesDeleted) errors=$($taOrchResult2.Errors)"
+
+        # --- Session=$null: передача відкладена, .out збережені ---
+        $taOrchDeferred = Join-Path $traceArchiveTestRoot "orch2\Trace"
+        [void](New-Item -ItemType Directory -Path $taOrchDeferred -Force)
+        $taOrchDeferredFile = Join-Path $taOrchDeferred 'TraceBIS_20260817_120000.out'
+        [IO.File]::WriteAllText($taOrchDeferredFile, 'deferred bis')
+        $taOrchResult3 = & $traceArchiveModule { param($d, $z, $ap, $p, $rd) Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Session $null -RemoteDirectory $rd } $taOrchDeferred $traceArchive7za $traceArchiveAddParams $traceArchivePassword 'trace'
+        Test-BRAVOCondition -Condition (
+            [int]$taOrchResult3.ArchivesUpdated -eq 1 -and
+            [int]$taOrchResult3.UploadsDeferred -eq 1 -and
+            [int]$taOrchResult3.SourcesDeleted -eq 0 -and
+            (Test-Path -LiteralPath $taOrchDeferredFile) -and
+            (Test-Path -LiteralPath (Join-Path $taOrchDeferred 'Trace_20260817.mdz'))
+        ) -Name 'TraceArchive/OrchestratorWithoutSessionDefersUploadKeepsSources' -Failure "без SFTP-сесії: архів оновлюється локально, передача відкладена, .out збережені"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$traceArchiveTestRoot) -and (Test-Path -LiteralPath $traceArchiveTestRoot)) {
             Remove-Item -LiteralPath $traceArchiveTestRoot -Recurse -Force -ErrorAction SilentlyContinue

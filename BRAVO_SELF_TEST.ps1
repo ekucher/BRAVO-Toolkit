@@ -11366,7 +11366,6 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "VERSION.json.buildId має бути префіксом 40-символьного sourceCommit; інакше артефакт pre-stamp/неузгоджений"
 
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.LogRotation.ps1')
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConsoleUX.ps1')
 
     #####################################################################
@@ -12773,6 +12772,9 @@ function Write-BRAVOLog {
         -Failure "переміщення заголовка HASH не повинно було змінити бізнес-логіку хешування: New-SHA512Hash має викликатися рівно 1 раз (усередині Invoke-BRAVOComponentBackup), Get-BRAVOFileHash — рівно 4 рази; знайдено $($archiveNewSha512HashCallAsts.Count)/$($archiveGetFileHashCallAsts.Count)"
 
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
+    # TraceArchive ПІСЛЯ BazaSync: SFTP-сценарії добового Trace-архіву
+    # використовують New-BRAVOSelfTestFakeBazaSession, визначену там.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
