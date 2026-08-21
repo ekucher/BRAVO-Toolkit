@@ -352,7 +352,8 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             $null -ne $deadOwnerScenario.ClearExpectedState -and
             [string]$deadOwnerScenario.ClearExpectedState.createdAt -eq [string]$orphanedQuiescenceMarker.createdAt -and
             @($deadOwnerScenario.Issues).Count -eq 1 -and
-            [string]$deadOwnerScenario.Issues[0].Reason -match 'відновлено автоматично'
+            [string]$deadOwnerScenario.Issues[0].Reason -match 'відновлено автоматично' -and
+            [string]$deadOwnerScenario.Issues[0].ActionText -match 'причину аварійного переривання'
         ) `
         -Name "ServiceQuiescence/WatchdogRestoresOnlyRestartIntentServicesAndClearsMarker" `
         -Failure "мертвий власник: старт рівно services[].RestartIntent=true, Clear РІВНО прочитаного маркера (-ExpectedState), issue про аварійне відновлення"
@@ -384,7 +385,8 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             @($suppressedScenario.StartedServices).Count -eq 0 -and
             $suppressedScenario.MarkerCleared -eq $false -and
             @($suppressedScenario.Issues).Count -eq 1 -and
-            [string]$suppressedScenario.Issues[0].Reason -match 'РУЧНЕ'
+            [string]$suppressedScenario.Issues[0].Reason -match 'РУЧНЕ' -and
+            [string]$suppressedScenario.Issues[0].ActionText -match 'код 43'
         ) `
         -Name "ServiceQuiescence/WatchdogRespectsSuppressedMarker" `
         -Failure "suppressed-маркер: жодного старту, маркер лишається, issue про потребу ручного відновлення"
@@ -416,7 +418,8 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             $partialFailureScenario.MarkerCleared -eq $false -and
             @($partialFailureScenario.Issues).Count -eq 1 -and
             [string]$partialFailureScenario.Issues[0].Reason -match 'не вдалося відновити' -and
-            [string]$partialFailureScenario.Issues[0].Reason -match 'exchangAPI'
+            [string]$partialFailureScenario.Issues[0].Reason -match 'exchangAPI' -and
+            [string]$partialFailureScenario.Issues[0].ActionText -match 'запустити служби вручну'
         ) `
         -Name "ServiceQuiescence/WatchdogKeepsMarkerOnPartialStartFailure" `
         -Failure "частковий збій старту: маркер зберігається для повтору, issue перелічує невдалі служби"

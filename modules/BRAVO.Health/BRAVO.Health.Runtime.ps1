@@ -3878,6 +3878,13 @@ function Get-BRAVOHealthIssueActionText {
     if ($firstIssue.Count -eq 0) {
         return "перевірити журнал BRAVO_HEALTH"
     }
+    # Issue може нести ВЛАСНИЙ ActionText (watchdog-issues: Component там —
+    # опис події, не ім'я служби, і шаблон «запустити або перевірити службу
+    # <Component>» давав зламану фразу «...службу Служби після аварії...»).
+    if ($null -ne $firstIssue[0].PSObject.Properties['ActionText'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$firstIssue[0].ActionText)) {
+        return [string]$firstIssue[0].ActionText
+    }
     switch ([string]$firstIssue[0].Kind) {
         "Service" { return "запустити або перевірити службу $($firstIssue[0].Component)" }
         { $_ -in @("LocalBackup", "LocalBackupGeneration") } { return "перевірити виконання BRAVO_ARCHIV" }
@@ -3935,10 +3942,19 @@ function New-SlackAlertMessage {
         "BRAVO BACKUP — ПОТРІБНА ДІЯ"
     }
     $latestBackup = Get-BRAVOHealthLatestBackupSummary
+    # Компактність (запит оператора, DEV-LIMS 2026-08-21): повний Reason
+    # з'являється в повідомленні РІВНО ОДИН РАЗ — у тематичній секції нижче.
+    # Шапка причин — лише перелік проблемних компонентів одним рядком
+    # (до 4 імен, далі «та ще N»); раніше сюди дублювався повний текст
+    # першої проблеми, і оператор читав його тричі.
     $reasonLines = New-Object System.Collections.Generic.List[string]
-    $firstIssue = @($Issues | Select-Object -First 1)
-    if ($firstIssue.Count -gt 0) {
-        $reasonLines.Add(":x: $(Get-HealthIssueComponentName -Issue $firstIssue[0]): $($firstIssue[0].Reason)")
+    if ($problemComponentNames.Count -gt 0) {
+        $reasonComponentsText = if ($problemComponentNames.Count -le 4) {
+            $problemComponentNames -join ' · '
+        } else {
+            (@($problemComponentNames | Select-Object -First 4) -join ' · ') + " та ще $($problemComponentNames.Count - 4)"
+        }
+        $reasonLines.Add(":x: $reasonComponentsText")
     }
     $resultLines = New-Object System.Collections.Generic.List[string]
     $resultLines.Add(":clock3: Остання успішна резервна копія: $($latestBackup.TimestampText)")
@@ -3949,8 +3965,9 @@ function New-SlackAlertMessage {
         $resultLines.Add(":warning: Допустимий вік: $($backupMonitoring.MaxBackupAgeHours) год.")
     }
     $resultLines.Add("")
+    # Перелік компонентів уже в шапці причин; тут — лише лічильники
+    # (окремий :package:-рядок з тим самим переліком був третім дублем).
     $resultLines.Add(":pushpin: Проблемних компонентів: $($problemComponentNames.Count) · перевірок: $($Issues.Count)")
-    $resultLines.Add(":package: $($problemComponentNames -join ', ')")
 
     if ($serviceIssues.Count -gt 0) {
         $resultLines.Add("")
@@ -4736,6 +4753,9 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
             Kind = "Service"
             Component = "Служби після аварії $($quiescenceState.owner)"
             Reason = "залишені зупиненими з restartSuppressed (аварійно перерваний DataRestore або незавершений rollback) — потрібне РУЧНЕ відновлення, автоматичний старт заборонено; див. $($quiescenceState.logFile)"
+            # Власний ActionText: Component тут — опис події, тому загальний
+            # шаблон «запустити або перевірити службу <Component>» непридатний.
+            ActionText = "виконати ручне відновлення служб (OPERATIONS.md, код 43)"
             FileName = ""
             LastWriteTime = $null
             Location = [string]$quiescenceState.owner
@@ -4815,6 +4835,7 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
             Kind = "Service"
             Component = "Аварійне відновлення служб"
             Reason = "$recoveryReportText після аварійного переривання $ownerText — перевірте причину переривання"
+            ActionText = "перевірити причину аварійного переривання $($quiescenceState.owner)"
             FileName = ""
             LastWriteTime = $null
             Location = [string]$quiescenceState.owner
@@ -4827,6 +4848,7 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
             Kind = "Service"
             Component = "Аварійне відновлення служб"
             Reason = "після аварійного переривання $ownerText не вдалося відновити: $($startFailures -join '; ') — маркер збережено, наступний Health повторить"
+            ActionText = "запустити служби вручну та перевірити ownership-маркер"
             FileName = ""
             LastWriteTime = $null
             Location = [string]$quiescenceState.owner

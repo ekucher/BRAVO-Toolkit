@@ -2637,6 +2637,52 @@ try {
         -Condition ($genericClassification -eq $false) `
         -Name "Health/GenericEnvironmentFailureClassification" `
         -Failure "IOException (диск повний тощо) НЕ повинен класифікуватися як privilege-відмова"
+
+    # --- Компактні операторські сповіщення (запит оператора, DEV-LIMS
+    # 2026-08-21): watchdog-issue несе ВЛАСНИЙ ActionText (Component там —
+    # опис події, і шаблон «запустити або перевірити службу <Component>»
+    # давав зламану фразу «...службу Служби після аварії BRAVO_...»);
+    # для звичайних Service-issue шаблон лишається незмінним. ---
+    $issueActionModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BRAVOHealthIssueActionText')
+    $watchdogStyleIssue = [pscustomobject]@{
+        Kind = 'Service'
+        Component = 'Служби після аварії BRAVO_DATA_RESTORE'
+        Reason = 'залишені зупиненими'
+        ActionText = 'виконати ручне відновлення служб (OPERATIONS.md, код 43)'
+    }
+    $plainServiceIssue = [pscustomobject]@{
+        Kind = 'Service'
+        Component = 'BRAVO'
+        Reason = 'не запущена'
+    }
+    $watchdogActionText = & $issueActionModule {
+        param($Issue)
+        Get-BRAVOHealthIssueActionText -Issues @($Issue)
+    } $watchdogStyleIssue
+    $plainActionText = & $issueActionModule {
+        param($Issue)
+        Get-BRAVOHealthIssueActionText -Issues @($Issue)
+    } $plainServiceIssue
+    Test-BRAVOCondition `
+        -Condition (
+            $watchdogActionText -eq 'виконати ручне відновлення служб (OPERATIONS.md, код 43)' -and
+            $plainActionText -eq 'запустити або перевірити службу BRAVO'
+        ) `
+        -Name "Health/IssueActionTextPrefersIssueProvidedAction" `
+        -Failure "issue з власним ActionText має використовувати його дослівно; звичайний Service-issue — шаблон «запустити або перевірити службу <Component>»"
+
+    # Компактність повідомлення: повний Reason рівно один раз (у секції);
+    # шапка причин — перелік компонентів; :package:-дубль переліку прибрано.
+    Test-BRAVOCondition `
+        -Condition (
+            -not $healthScriptText.Contains('$reasonLines.Add(":x: $(Get-HealthIssueComponentName -Issue $firstIssue[0]): $($firstIssue[0].Reason)")') -and
+            $healthScriptText.Contains('$reasonLines.Add(":x: $reasonComponentsText")') -and
+            -not $healthScriptText.Contains(':package: $($problemComponentNames')
+        ) `
+        -Name "Health/AlertMessageShowsFullReasonExactlyOnce" `
+        -Failure "шапка причин алерту має містити лише перелік компонентів (без повного Reason першої проблеми) і без дублюючого :package:-рядка — повний Reason показується один раз у тематичній секції"
     # [IO.Path]::GetTempPath(), НЕ $env:TEMP: на серверах TEMP у сесії може
     # містити 8.3-коротку форму профілю (C:\Users\E980D~1.KUC\...), а
     # Remove-Item -LiteralPath у PS 5.1 падає на короткому сегменті з

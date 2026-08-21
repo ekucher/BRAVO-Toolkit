@@ -10,6 +10,17 @@ debt): deduplication of service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
 Runtime.ps1 decomposition.
 
+- Compact operator alerts (operator request from the DEV-LIMS field
+  test): the Health problem notification shows the full issue Reason
+  exactly once (in its thematic section) — the header reason block now
+  carries only a compact component list (up to 4 names) instead of
+  duplicating the first issue's full text, and the redundant
+  :package: component-list line is removed. Watchdog issues carry
+  their own ActionText ("виконати ручне відновлення служб (OPERATIONS.md,
+  код 43)" / "перевірити причину аварійного переривання <owner>" /
+  "запустити служби вручну та перевірити ownership-маркер") instead of
+  the broken generic template "запустити або перевірити службу Служби
+  після аварії <owner>"; plain service issues keep the old template.
 - Config loader: an effective configuration now always carries
   maintenanceSettings.Restore.BootRestoreMode — a legacy site config
   (5.0/5.1) without the new key gets the safe 'None' (24/7) default.
