@@ -600,8 +600,19 @@ function Send-BRAVONotificationChunks {
         [int]$TimeoutSeconds = 30
     )
 
+    # Обмежений пейсинг між chunk-запитами (task item 12) — знижує шанс
+    # власне спровокувати 429 на великих багатоchunk-повідомленнях. 429/
+    # Retry-After усередині Send-BRAVOWebhookNotification має пріоритет:
+    # він сам чекає потрібний час перед поверненням у цей цикл.
+    $chunkPacingMilliseconds = 400
+    $chunkCount = @($MessageChunks).Count
+    $chunkIndex = 0
     foreach ($chunk in $MessageChunks) {
+        $chunkIndex++
         Send-BRAVOWebhookNotification -Provider $Provider -WebhookUrl $WebhookUrl -Message $chunk -TimeoutSeconds $TimeoutSeconds
+        if ($chunkIndex -lt $chunkCount) {
+            Start-Sleep -Milliseconds $chunkPacingMilliseconds
+        }
     }
 }
 

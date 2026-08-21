@@ -2269,7 +2269,50 @@ function Send-BRAVOWebhookNotification {
     # Invoke-WebRequest теж має власний індикатор; глушимо його локально,
     # щоб надсилання сповіщення не перекривало смугу прогресу BRAVO.
     $ProgressPreference = 'SilentlyContinue'
-    $response = Invoke-WebRequest @requestParameters
+
+    # HTTP 429 (Too Many Requests) обмежений retry з пріоритетом на
+    # Retry-After: максимум 4 спроби сумарно (1 первинна + 3 повтори).
+    # Будь-яка інша помилка (не 429) прокидається одразу — без ретраю, як і
+    # раніше. Успішна відповідь після retry вважається тим самим успішним
+    # відправленням цього chunk — виклик далі не знає про кількість спроб.
+    $maxWebhookAttempts = 4
+    $webhookAttempt = 0
+    $response = $null
+    while ($true) {
+        $webhookAttempt++
+        try {
+            $response = Invoke-WebRequest @requestParameters
+            break
+        } catch {
+            $webResponse = $_.Exception.Response
+            $statusCode = $null
+            if ($null -ne $webResponse) {
+                try { $statusCode = [int]$webResponse.StatusCode } catch { $statusCode = $null }
+            }
+            if ($statusCode -ne 429 -or $webhookAttempt -ge $maxWebhookAttempts) {
+                throw
+            }
+
+            $retryAfterSeconds = $null
+            if ($null -ne $webResponse -and $null -ne $webResponse.Headers) {
+                $retryAfterRaw = $webResponse.Headers["Retry-After"]
+                if (-not [string]::IsNullOrWhiteSpace($retryAfterRaw)) {
+                    $parsedRetryAfter = 0.0
+                    if ([double]::TryParse($retryAfterRaw, [ref]$parsedRetryAfter) -and $parsedRetryAfter -ge 0) {
+                        $retryAfterSeconds = $parsedRetryAfter
+                    }
+                }
+            }
+            if ($null -eq $retryAfterSeconds) {
+                # Без Retry-After: обмежений експоненційний фолбек 1с/2с/4с,
+                # межа 10с (task item 11).
+                $retryAfterSeconds = [math]::Min(10, [math]::Pow(2, $webhookAttempt - 1))
+            }
+            $delaySeconds = $retryAfterSeconds + 0.25
+            Write-Verbose "Webhook $Provider повернув 429 (спроба $webhookAttempt/$maxWebhookAttempts); повтор через $delaySeconds сек."
+            Start-Sleep -Milliseconds ([int][math]::Ceiling($delaySeconds * 1000))
+        }
+    }
 
     if ($normalizedProvider -eq "slack") {
         $responseText = ([string]$response.Content).Trim()

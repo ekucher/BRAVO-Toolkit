@@ -4124,20 +4124,51 @@ function Resolve-BRAVOExchangeApiRuntimeDirectory {
 }
 
 # Функція порівняння розмірів файлів
+#
+# Повертає структурований результат (не bool), щоб виклик і компактне
+# сповіщення могли звітувати кількість без повторного обчислення:
+#   HasCriticalChanges   — чи потрібен відкат
+#   CriticalFiles         — file-level деталі критичних змін (для логу/алерту)
+#   RemovedByRepairFiles  — файли, відсутні після repair, що НЕ є MAIN_MODEL_FILE
+#   RemovedByRepairCount  — @() .Count вище (PS 5.1 collection semantics)
+#   MainModelValid        — чи основна модель пройшла перевірку
+#
+# -MainModelRelativePath звужує "відсутній файл = CRITICAL" лише до основної
+# моделі. Сегментні файли (*.000, *.002, ...), яких bravocmd.exe штатно
+# перебудовує/прибирає під час repair, самі по собі більше НЕ є критичними —
+# лише RemovedByRepair-діагностикою. Якщо MainModelRelativePath не передано
+# (викликач не зміг визначити основну модель), поведінка fail-closed —
+# ЛЮБИЙ відсутній файл лишається критичним, як і раніше.
+function New-BRAVOCompareFileSizesResult {
+    param(
+        [bool]$HasCriticalChanges,
+        [array]$CriticalFiles = @(),
+        [array]$RemovedByRepairFiles = @(),
+        [bool]$MainModelValid = $true
+    )
+    return [PSCustomObject]@{
+        HasCriticalChanges = $HasCriticalChanges
+        CriticalFiles = @($CriticalFiles)
+        RemovedByRepairFiles = @($RemovedByRepairFiles)
+        RemovedByRepairCount = @($RemovedByRepairFiles).Count
+        MainModelValid = $MainModelValid
+    }
+}
+
 function Compare-FileSizes {
     param(
         [string]$BeforeFile,
         [string]$ModelPath,
-        [int]$MinSizeBytes = 2048
+        [int]$MinSizeBytes = 2048,
+        [AllowNull()][string]$MainModelRelativePath = $null
     )
-    
-    $criticalChanges = $false
+
     try {
         if (-not (Test-Path $BeforeFile)) {
             Write-Log "Файл з початковими розмірами не знайдено: $BeforeFile" -Level "ERROR"
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
-            return $true
+            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
         }
 
         $initialData = @(Import-Csv -Path $BeforeFile)
@@ -4145,14 +4176,29 @@ function Compare-FileSizes {
             Write-Log "Початковий список файлів MODEL порожній; цілісність після реставрації неможливо підтвердити" -Level "ERROR"
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
-            return $true
+            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
         }
 
         $criticalFiles = @()
+        $removedByRepairFiles = @()
+        $mainModelValid = $true
         $currentLookup = @{}
         foreach ($file in @(Get-BRAVOFiles -Path $ModelPath -Recurse)) {
             $relativePath = $file.FullName.Replace($ModelPath, "").TrimStart('\')
             $currentLookup[$relativePath] = [long]$file.Length
+        }
+
+        # Каталог MODEL повністю порожній після repair — критично незалежно
+        # від того, що показує посегментне порівняння нижче (defense-in-depth
+        # для випадку, коли before-CSV сам по собі валідний, але repair
+        # знищив усе).
+        if ($currentLookup.Count -eq 0) {
+            $errorMsg = "Каталог MODEL порожній після реставрації: $ModelPath"
+            Write-Log $errorMsg -Level "ERROR"
+            Send-SlackAlert -Message $errorMsg -IsCritical
+            $script:criticalErrorOccurred = $true
+            $script:restoreIntegrityFailed = $true
+            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
         }
 
         # Перевіряємо початковий набір, а не лише поточні файли. Інакше повністю
@@ -4166,6 +4212,10 @@ function Compare-FileSizes {
                 -1
             }
             $isMissing = $currentSizeBytes -lt 0
+            $isMainModelFile = (
+                -not [string]::IsNullOrWhiteSpace($MainModelRelativePath) -and
+                $relativePath -ieq $MainModelRelativePath
+            )
             $reductionPercent = if (-not $isMissing -and $initialSizeBytes -gt 0) {
                 (($initialSizeBytes - $currentSizeBytes) / [double]$initialSizeBytes) * 100
             } else {
@@ -4176,16 +4226,42 @@ function Compare-FileSizes {
                 $currentSizeBytes -lt $initialSizeBytes -and
                 ($currentSizeBytes -le $MinSizeBytes -or $reductionPercent -ge 50)
             )
+            # Fail-closed: без відомого MainModelRelativePath (викликач не
+            # зміг визначити основну модель) будь-який відсутній файл лишається
+            # критичним — стара поведінка. З відомим MainModelRelativePath
+            # критичним є лише відсутність САМЕ основної моделі; решта
+            # відсутніх файлів — RemovedByRepair-діагностика, не rollback-тригер.
+            $isCriticalMissing = $isMissing -and (
+                $isMainModelFile -or [string]::IsNullOrWhiteSpace($MainModelRelativePath)
+            )
 
-            if ($isMissing -or $isCriticalReduction) {
+            if ($isMissing -and -not $isCriticalMissing) {
+                $removedByRepairFiles += [PSCustomObject]@{
+                    File = $relativePath
+                    BeforeSizeBytes = $initialSizeBytes
+                }
+                continue
+            }
+
+            if ($isCriticalMissing -or $isCriticalReduction) {
+                if ($isMainModelFile) {
+                    $mainModelValid = $false
+                }
                 $criticalFiles += [PSCustomObject]@{
                     File = $relativePath
                     BeforeSizeBytes = $initialSizeBytes
                     AfterSizeBytes = $currentSizeBytes
                     Missing = $isMissing
                 }
-                $criticalChanges = $true
             }
+        }
+
+        if (@($removedByRepairFiles).Count -gt 0) {
+            $removedSummary = "Repair видалив/перебудував $(@($removedByRepairFiles).Count) файл(ів) MODEL (не основна модель, критичним НЕ вважається):`n"
+            foreach ($file in $removedByRepairFiles) {
+                $removedSummary += " - $($file.File) (було: $(Format-FileSize $file.BeforeSizeBytes))`n"
+            }
+            Write-Log $removedSummary -Level "INFO"
         }
 
         if ($criticalFiles.Count -gt 0) {
@@ -4198,23 +4274,30 @@ function Compare-FileSizes {
                 } else {
                     ($file.BeforeSizeBytes - $file.AfterSizeBytes) / $file.BeforeSizeBytes * 100
                 }
-                
+
                 $criticalMessage += " - $($file.File):`n"
                 $criticalMessage += "   Розмір до реставрації: $beforeFormatted ($($file.BeforeSizeBytes) байт)`n"
                 $criticalMessage += "   Розмір після реставрації: $afterFormatted ($($file.AfterSizeBytes) байт)`n"
                 $statusText = if ($file.Missing) { "ФАЙЛ ВИДАЛЕНО" } else { "РЕДУКЦІЯ" }
                 $criticalMessage += "   Статус: ❌ $statusText (зменшено на $($reductionPercent.ToString('0.00'))%)`n"
             }
-            
+
             Write-Log $criticalMessage -Level "ERROR"
             Send-SlackAlert -Message $criticalMessage -IsCritical
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
 
-            return $true
+            return New-BRAVOCompareFileSizesResult `
+                -HasCriticalChanges $true `
+                -CriticalFiles $criticalFiles `
+                -RemovedByRepairFiles $removedByRepairFiles `
+                -MainModelValid $mainModelValid
         } else {
-            Write-Log "Відсутніх файлів або критичних зменшень розміру не знайдено" -Level "INFO"
-            return $false
+            Write-Log "Критичних змін розміру не знайдено (RemovedByRepair: $(@($removedByRepairFiles).Count))" -Level "INFO"
+            return New-BRAVOCompareFileSizesResult `
+                -HasCriticalChanges $false `
+                -RemovedByRepairFiles $removedByRepairFiles `
+                -MainModelValid $mainModelValid
         }
     }
     catch {
@@ -4224,8 +4307,9 @@ function Compare-FileSizes {
         $script:criticalErrorOccurred = $true
         $script:restoreIntegrityFailed = $true
         # Неможливість довести цілісність MODEL є критичною подією. Повертаємо
-        # $true, щоб викликач виконав відкат і не створив маркер успіху.
-        return $true
+        # HasCriticalChanges = $true, щоб викликач виконав відкат і не
+        # створив маркер успіху.
+        return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
     }
 }
 
@@ -4297,6 +4381,7 @@ function Invoke-CommandWithLog {
     Write-Log "$Description..." -Level "INFO"
     $process = $null
     $outputCapture = $null
+    $commandStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
     try {
         $processInfo = New-Object System.Diagnostics.ProcessStartInfo
         $processInfo.FileName = $Command
@@ -4344,6 +4429,7 @@ function Invoke-CommandWithLog {
         ) -join [Environment]::NewLine
         $exitCode = if ($completed) { [int]$process.ExitCode } else { 258 }
     } catch {
+        $commandStopwatch.Stop()
         $errorMsg = "ПОМИЛКА під час ${Description}: $($_.Exception.Message)"
         Write-Log $errorMsg -Level "ERROR"
         Send-SlackAlert -Message $errorMsg -IsCritical
@@ -4370,8 +4456,9 @@ function Invoke-CommandWithLog {
         }
     }
 
+    $commandStopwatch.Stop()
     $formattedOutput = Format-CommandOutput -Output $output
-    
+
     if ($exitCode -eq 0) {
         Write-Log "$Description успішно завершено" -Level "SUCCESS"
     } else {
@@ -4382,13 +4469,27 @@ function Invoke-CommandWithLog {
         $script:restoreArchiveFailed = $true
     }
 
+    # Структурований заголовок діагностики (Executable/Arguments/ExitCode/
+    # Duration) — той самий канонічний хелпер обслуговує bravocmd.exe і всі
+    # 7-Zip виклики цього файлу, тому це одне місце, а не дублювання per
+    # caller. $StandardInputText (пароль архіву) сюди ніколи не потрапляє —
+    # він іде через stdin, не через Arguments.
+    $diagnosticsHeader = (
+        "`n  Executable : $Command`n" +
+        "  Arguments  : $($processInfo.Arguments)`n" +
+        "  ExitCode   : $exitCode`n" +
+        "  Duration   : $(Format-BRAVODuration -Duration $commandStopwatch.Elapsed)"
+    )
+
+    # На успіху це шум, на помилці — єдине джерело причини. Вивід
+    # bravocmd/7-Zip писався в DEBUG, а промислові розгортання працюють
+    # на INFO: коли реставрація впала з кодом 11153, у журналі лишився
+    # сам код без жодного пояснення від інструмента.
+    $outputLevel = if ($exitCode -eq 0) { "DEBUG" } else { "ERROR" }
     if (-not [string]::IsNullOrWhiteSpace($formattedOutput)) {
-        # На успіху це шум, на помилці — єдине джерело причини. Вивід
-        # bravocmd/7-Zip писався в DEBUG, а промислові розгортання працюють
-        # на INFO: коли реставрація впала з кодом 11153, у журналі лишився
-        # сам код без жодного пояснення від інструмента.
-        $outputLevel = if ($exitCode -eq 0) { "DEBUG" } else { "ERROR" }
-        Write-Log "Деталі виконання:$formattedOutput" -Level $outputLevel
+        Write-Log "Деталі виконання:$diagnosticsHeader`n`n  Output:$formattedOutput" -Level $outputLevel
+    } else {
+        Write-Log "Деталі виконання:$diagnosticsHeader" -Level $outputLevel
     }
 
     return $exitCode
@@ -5287,6 +5388,14 @@ $BRAVOCMD_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryRe
 } else {
     "$ROOT_LIMS\bravocmd.exe"
 }
+# MODEL-контракт (тільки похідні значення, без hardcode назви проєкту):
+#   MODEL_BASE_PATH == $MODEL_PROJECT_PATH (значення MODEL= з bravo.ini як є)
+#   MODEL_DIRECTORY == $MODEL_PATH         (батьківський каталог MODEL_BASE_PATH)
+# Обидва вже похідні від Discovery вище. MODEL_NAME/MAIN_MODEL_FILE потрібні
+# лише для post-repair валідації (Compare-FileSizes нижче) — bravocmd.exe
+# як і раніше отримує $MODEL_PROJECT_PATH без жодних змін.
+$MODEL_NAME = Split-Path -Path $MODEL_PROJECT_PATH -Leaf
+$MAIN_MODEL_FILE = "$MODEL_PROJECT_PATH.md"
 # Два різні корені (ТЗ RuntimeRoot/SystemLogRoot):
 #   $LOG_DIR         — власні журнали Maintenance (BRAVO_MAINTENANCE_*.log,
 #                      file_sizes_*.csv, restore_done_*.marker) — RuntimeRoot\LOGS.
@@ -6370,6 +6479,21 @@ $restoreStepReported = $false
 # кидає виняток, коли до бар'єрів узагалі не доходимо ($shouldRestore=false
 # від самого початку, або службу BRAVO не вдалося зупинити).
 $restorePostponedByWindowClosing = $false
+# Знімок ДО restore-сесії — той самий безумовний-ініт ідіом, що вище: без
+# цього снепшоту retention-гейт нижче (§9 задачі) не зможе відрізнити збій
+# САМЕ цієї restore-сесії від збою якоїсь незалежної Trace-операції, що теж
+# використовує ці два прапорці через Invoke-CommandWithLog.
+$restoreArchiveFailedBefore = $script:restoreArchiveFailed
+$restoreIntegrityFailedBefore = $script:restoreIntegrityFailed
+$restoreSessionUnsafeForRetention = $false
+# Компактні деталі кроку/сповіщення (task item 13) — безумовний-ініт, щоб
+# Details нижче лишався валідним, навіть якщо repair цього циклу взагалі не
+# запускався.
+$restoreBravocmdExitCode = $null
+$restoreRemovedByRepairCount = 0
+$restoreCriticalCount = 0
+$restoreRollbackStatus = 'NOT REQUIRED'
+$restoreMainModelValid = $true
 # true = реставрацію скасовано ДО bravocmd через збій переведення
 # ownership-маркера в suppressed (fail-closed, критична помилка вже
 # зарапортована в місці скасування).
@@ -6404,7 +6528,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
         try {
             Write-Log -Message "==="
             Write-Log -Message "=== РЕСТАВРАЦІЯ МОДЕЛІ ==="
-            
+            Write-Log -Message "MODEL: base=$MODEL_PROJECT_PATH, directory=$MODEL_PATH, name=$MODEL_NAME, mainModelFile=$MAIN_MODEL_FILE" -Level "DEBUG"
+
             if ($CheckSize) {
                 Write-Log -Message "Збереження розмірів файлів перед реставрацією..." -Level "INFO"
                 # Той самий обхід провайдерного шару PowerShell, що й у
@@ -6518,6 +6643,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         # Виконання реставрації через bravocmd.exe (як в еталоні)
                         $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
                         $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                        $restoreBravocmdExitCode = $exitCode
                     }
                 }
 
@@ -6529,20 +6655,35 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     # $null для обох).
                 } elseif ($exitCode -eq 0) {
                     $restoreCompletedAt = Get-Date
-                    Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"
-                    
+                    # dev: НЕ оголошуємо успіх одразу після exit 0 — bravocmd
+                    # штатно перебудовує/видаляє сегментні файли моделі, і
+                    # лише Compare-FileSizes нижче підтверджує, що це не
+                    # приховане пошкодження. "Модель успішно відреставрована"
+                    # тепер логується лише після проходження цієї перевірки
+                    # (або одразу тут, якщо CheckSize вимкнено конфігурацією —
+                    # тоді перевірку свідомо пропущено, як і раніше).
+                    Write-Log -Message "bravocmd.exe завершено, код 0. Перевірка результату repair..." -Level "INFO"
+
                     # Архівація після реставрації ВИКОНУЄТЬСЯ З УМОВАМИ
                     $restoreRequired = $false
                     $createMarker = $true
-                    
+                    $restoreRemovedByRepairCount = 0
+
                     if ($CheckSize) {
                         Write-Log -Message "Порівняння розмірів файлів..." -Level "INFO"
-                        $criticalChanges = Compare-FileSizes -BeforeFile $SIZES_FILE -ModelPath $MODEL_PATH -MinSizeBytes 2048
-                        
-                        if ($criticalChanges) {
+                        $criticalChanges = Compare-FileSizes `
+                            -BeforeFile $SIZES_FILE `
+                            -ModelPath $MODEL_PATH `
+                            -MinSizeBytes 2048 `
+                            -MainModelRelativePath "$MODEL_NAME.md"
+                        $restoreRemovedByRepairCount = $criticalChanges.RemovedByRepairCount
+                        $restoreCriticalCount = @($criticalChanges.CriticalFiles).Count
+                        $restoreMainModelValid = $criticalChanges.MainModelValid
+
+                        if ($criticalChanges.HasCriticalChanges) {
                             Write-Log -Message "УВАГА: Виявлено критичні зміни розмірів файлів!" -Level "WARNING"
                             Write-Log -Message "Відновлення моделі з архіву перед реставрацією..." -Level "INFO"
-                            
+
                             # З моменту виявлення пошкодження будь-який результат
                             # відкату блокує after-архів і маркер успішної реставрації.
                             $restoreRequired = $true
@@ -6551,6 +6692,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             if ($exitCode -eq 0) {
                                 Write-Log -Message "Модель успішно відновлена з архіву перед реставрації" -Level "SUCCESS"
                                 # Відкат довершено — модель знову консистентна.
+                                $restoreRollbackStatus = 'SUCCESS'
                                 Restore-BRAVOMaintenanceQuiescenceAutostart
                             } else {
                                 $errorMsg = "Відкат MODEL після критичних змін не виконано (код: $exitCode). Архівацію після реставрації та маркер успіху заблоковано."
@@ -6558,12 +6700,22 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                                 Send-SlackAlert -Message $errorMsg -IsCritical
                                 $script:criticalErrorOccurred = $true
                                 $script:restoreArchiveFailed = $true
+                                $restoreRollbackStatus = 'FAILED'
                             }
                         }
                     }
                     
                     # Виконуємо архівацію після реставрації ЛИШЕ якщо не було критичних змін
                     if (-not $restoreRequired) {
+                        # Валідація пройдена (або CheckSize вимкнено) — лише
+                        # тепер репарацію можна вважати успішною.
+                        $removedByRepairSuffix = if ($restoreRemovedByRepairCount -gt 0) {
+                            " (repair прибрав $restoreRemovedByRepairCount сегментних файл(ів), критичних змін немає)"
+                        } else {
+                            ""
+                        }
+                        Write-Log -Message "Модель успішно відреставрована$removedByRepairSuffix" -Level "SUCCESS"
+
                         # Реставрація успішна, критичних змін немає — модель
                         # консистентна; повертаємо watchdog право автостарту
                         # ЩЕ ДО тривалої архівації після реставрації.
@@ -6639,12 +6791,32 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
             $script:criticalErrorOccurred = $true
             $script:restoreArchiveFailed = $true
         }
+        # Retention-гейт (task item 9): знімок ДО/ПІСЛЯ (той самий ідіом, що
+        # $restoreCriticalBefore/$restoreWarningsBefore вище) — а не сирі
+        # поточні значення прапорців, бо ті самі два прапорці також
+        # виставляє незалежна Trace-архівація через Invoke-CommandWithLog
+        # (напр. рядок ~3315). Розширювати гейт на такі несуміжні збої не
+        # потрібно — лише на збій САМЕ цієї restore-сесії.
+        $restoreSessionUnsafeForRetention = $shouldRestore -and (
+            ($script:restoreArchiveFailed -and -not $restoreArchiveFailedBefore) -or
+            ($script:restoreIntegrityFailed -and -not $restoreIntegrityFailedBefore)
+        )
+        # Компактні деталі кроку (task item 13) — повний файловий список
+        # лишається лише в Write-Log/Send-SlackAlert вище (authoritative log).
+        $restoreStepDetails = $restoreReason
+        if ($null -ne $restoreBravocmdExitCode) {
+            $mainModelStatusText = if ($restoreMainModelValid) { 'OK' } else { 'FAIL' }
+            $restoreStepDetails += (
+                " | bravocmd exit=$restoreBravocmdExitCode | RemovedByRepair=$restoreRemovedByRepairCount " +
+                "| Critical=$restoreCriticalCount | Rollback=$restoreRollbackStatus | MainModel=$mainModelStatusText"
+            )
+        }
         Write-BRAVOMaintenanceStep `
             -Name 'Реставрація моделі' `
             -Status (Get-BRAVOMaintenanceStepStatus `
                 -CriticalBefore $restoreCriticalBefore `
                 -WarningsBefore $restoreWarningsBefore) `
-            -Details $restoreReason
+            -Details $restoreStepDetails
         $restoreStepReported = $true
     }
 
@@ -7388,13 +7560,18 @@ if ($COMPRESSED_LOG_DELETION_ENABLED -and $expiredCompressedLogCount -gt 0) {
     }
 }
 
-# Видалення старих архівів реставрації - тільки якщо є що видаляти
-if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt 0) {
+# Видалення старих архівів реставрації - тільки якщо є що видаляти І поточна
+# restore-сесія (якщо вона була цього циклу) завершилась чисто успішно —
+# інакше pruning під час аварійного run міг би зачепити щойно створені
+# діагностичні before/after-архіви цієї ж сесії (task item 9).
+if ($BravoMaintenanceEnabled -and $restoreArchiveDeleteCandidateGroups.Count -gt 0 -and -not $restoreSessionUnsafeForRetention) {
     Remove-OldRestoreArchives `
         -Path $ARC_DIR `
         -ArchivePrefix $ArchivePrefix `
         -KeepCount $RESTORE_ARCHIVES_KEEP_COUNT `
         -InvalidRetentionDays $FAILED_ARCHIVE_RETENTION_DAYS
+} elseif ($restoreSessionUnsafeForRetention) {
+    Write-Log -Message "Retention архівів реставрації пропущено: поточна restore-сесія завершилась помилкою або rollback." -Level "WARNING"
 }
 
 # dev.16: execution result очистки — unnumbered top-level операція (не

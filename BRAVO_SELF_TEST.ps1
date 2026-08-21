@@ -1418,8 +1418,13 @@ try {
             $maintenanceRuntimeTextForExitCodes.Contains('-IntegrityTestFailed:$script:restoreIntegrityFailed') -and
             # 11-та точка (5.2.0): скасування реставрації перед bravocmd через
             # збій переведення quiescence-маркера в suppressed (fail-closed).
+            # 10-та точка restoreIntegrityFailed (fix/repair-rollback-false-
+            # positive): каталог MODEL порожній після repair — Compare-FileSizes
+            # тепер розрізняє RemovedByRepair (не критично) від справжнього
+            # пошкодження, і ця нова defense-in-depth перевірка додає рівно
+            # одне нове critical-присвоєння, а не ще один "будь-який missing".
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 9)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40) і перевірку цілісності (41) відновлення, а не зводити все до 60"
@@ -5520,8 +5525,14 @@ try {
         # Те саме для post-restore архіву: між підтвердженням успішного
         # bravocmd.exe і фактичним викликом 7-Zip для after-restore архіву
         # також немає повторної Get-Service перевірки.
+        # dev (fix/repair-rollback-false-positive): SUCCESS-лог тепер
+        # логується лише ПІСЛЯ Compare-FileSizes-валідації (не одразу після
+        # exit 0 bravocmd), з опційним RemovedByRepair-суфіксом — якір
+        # оновлено на новий точний текст; вікно між ним і 7-Zip лишається
+        # ще коротшим (лог тепер стоїть безпосередньо перед archive-
+        # блоком), тож інваріант "без Get-Service" лише посилюється.
         $restoreSuccessLogIndex = $maintenanceRestoreWindowText.IndexOf(
-            'Write-Log -Message "Модель успішно відреставрована" -Level "SUCCESS"'
+            'Write-Log -Message "Модель успішно відреставрована$removedByRepairSuffix" -Level "SUCCESS"'
         )
         $postRestoreArchiveCallIndex = $maintenanceRestoreWindowText.IndexOf(
             '-Description "Архівація моделі після реставрації"'
@@ -5636,12 +5647,18 @@ try {
         # Вивід зовнішнього інструмента на шляху ПОМИЛКИ не має писатися в
         # DEBUG: промислові розгортання працюють на INFO, і причина падіння
         # (наприклад bravocmd з кодом 11153) губилася разом з ним.
+        # dev (fix/repair-rollback-false-positive): Write-Log тепер несе ще
+        # структурований заголовок діагностики (Executable/Arguments/
+        # ExitCode/Duration, task item 7) перед самим $formattedOutput —
+        # той самий $outputLevel і сам факт логування $formattedOutput на
+        # ERROR-шляху лишаються незмінними, регекс лише розширено під нове
+        # обрамлення повідомлення.
         Test-BRAVOCondition `
             -Condition (
                 $maintenanceRestoreWindowText -match
                 '\$outputLevel\s*=\s*if\s*\(\$exitCode\s*-eq\s*0\)\s*\{\s*"DEBUG"\s*\}\s*else\s*\{\s*"ERROR"\s*\}' -and
                 $maintenanceRestoreWindowText -match
-                'Write-Log\s+"Деталі виконання:\$formattedOutput"\s+-Level\s+\$outputLevel'
+                'Write-Log\s+"Деталі виконання:\$diagnosticsHeader`n`n  Output:\$formattedOutput"\s+-Level\s+\$outputLevel'
             ) `
             -Name 'Maintenance/FailedCommandOutputIsNotDebugOnly' `
             -Failure 'вивід зовнішньої команди на шляху помилки має логуватися рівнем ERROR, інакше діагностика зникає при LogLevel=INFO'
@@ -8603,10 +8620,16 @@ try {
     # --- 'Реставрація моделі' показує причину (Примусово/пропущений
     # слот/розклад) як Details, а 'Обробка trace і логів' — кількість
     # оброблених файлів.
+    # dev (fix/repair-rollback-false-positive): Details тепер будується як
+    # $restoreStepDetails = $restoreReason (+ опційний компактний
+    # bravocmd/RemovedByRepair/Critical/Rollback-суфікс, task item 13) —
+    # причина реставрації лишається першим і завжди присутнім компонентом
+    # Details, лише сама змінна, що йде у -Details, перейменована.
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptTextForManifestStorage.Contains("-Name 'Реставрація моделі' ``") -and
-            $maintenanceScriptTextForManifestStorage.Contains('-Details $restoreReason') -and
+            $maintenanceScriptTextForManifestStorage.Contains('-Details $restoreStepDetails') -and
+            $maintenanceScriptTextForManifestStorage.Contains('$restoreStepDetails = $restoreReason') -and
             $maintenanceScriptTextForManifestStorage.Contains('$restoreReason = if ($ForceRestore) { "Примусово" }')
         ) `
         -Name "Maintenance/ForceRestoreDetail" `
@@ -12775,6 +12798,9 @@ function Write-BRAVOLog {
     # TraceArchive ПІСЛЯ BazaSync: SFTP-сценарії добового Trace-архіву
     # використовують New-BRAVOSelfTestFakeBazaSession, визначену там.
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
+    # MaintenanceRepair: false-positive rollback після bravocmd repair +
+    # Discord HTTP 429 retry (fix/repair-rollback-false-positive-and-discord-429).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceRepair.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
