@@ -2637,7 +2637,13 @@ try {
         -Condition ($genericClassification -eq $false) `
         -Name "Health/GenericEnvironmentFailureClassification" `
         -Failure "IOException (диск повний тощо) НЕ повинен класифікуватися як privilege-відмова"
-    $preflightWritableDir = Join-Path $env:TEMP (
+    # [IO.Path]::GetTempPath(), НЕ $env:TEMP: на серверах TEMP у сесії може
+    # містити 8.3-коротку форму профілю (C:\Users\E980D~1.KUC\...), а
+    # Remove-Item -LiteralPath у PS 5.1 падає на короткому сегменті з
+    # PSArgumentException «object at the specified path does not exist»
+    # (реальний випадок: DEV-LIMS, Server 2022). GetTempPath повертає
+    # нормалізовану довгу форму.
+    $preflightWritableDir = Join-Path ([IO.Path]::GetTempPath()) (
         "bravo_selftest_preflight_{0}" -f ([guid]::NewGuid().ToString("N"))
     )
     [void](New-Item -ItemType Directory -Path $preflightWritableDir -Force)
@@ -2713,7 +2719,8 @@ try {
     # "MissingTempGenericIoIsEnvironmentUnavailable" лишається реальним
     # I/O (некоректні символи в шляху -> ArgumentException) — це не зміна
     # прав доступу, звичайна відмова створення файлу/каталогу.
-    $classificationTestDir = Join-Path $env:TEMP (
+    # GetTempPath, не $env:TEMP — та сама 8.3-гоча, що в preflight-блоці вище.
+    $classificationTestDir = Join-Path ([IO.Path]::GetTempPath()) (
         "bravo_selftest_classification_{0}" -f ([guid]::NewGuid().ToString("N"))
     )
     [void](New-Item -ItemType Directory -Path $classificationTestDir -Force)
@@ -6360,7 +6367,8 @@ try {
     # обривав увесь прогін фатальною помилкою й ховав решту результатів —
     # рівно це й показала регресія цього тесту.
     $capturedConsoleWrites = New-Object System.Collections.ArrayList
-    $consoleWriterProbeLog = Join-Path $env:TEMP ("BRAVO_CONSOLE_WRITER_{0}.log" -f ([guid]::NewGuid().ToString('N')))
+    # GetTempPath, не $env:TEMP — та сама 8.3-гоча, що в preflight-блоці вище.
+    $consoleWriterProbeLog = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CONSOLE_WRITER_{0}.log" -f ([guid]::NewGuid().ToString('N')))
     if ($null -eq (Get-Command -Name 'Set-BRAVOLogConsoleWriter' -ErrorAction SilentlyContinue)) {
         [void]$capturedConsoleWrites.Add('Set-BRAVOLogConsoleWriter недоступна')
     } else {

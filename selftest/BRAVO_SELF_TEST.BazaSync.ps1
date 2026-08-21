@@ -128,7 +128,10 @@
             return $fullPath
         }
 
-        $bazaSyncTestRoot = Join-Path $env:TEMP ("bazasynctest_" + [guid]::NewGuid().ToString('N'))
+        # GetTempPath, не $env:TEMP: TEMP сесії може бути 8.3-коротким
+        # (C:\Users\E980D~1.KUC\...), а Remove-Item -LiteralPath у PS 5.1
+        # падає на короткому сегменті (реальний випадок: DEV-LIMS).
+        $bazaSyncTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("bazasynctest_" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $bazaSyncTestRoot -Force | Out-Null
 
         # =======================================================================
