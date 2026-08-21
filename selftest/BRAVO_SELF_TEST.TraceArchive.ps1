@@ -339,6 +339,24 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             (Test-Path -LiteralPath $taOrchDeferredFile) -and
             (Test-Path -LiteralPath (Join-Path $taOrchDeferred 'Trace_20260817.mdz'))
         ) -Name 'TraceArchive/OrchestratorWithoutSessionDefersUploadKeepsSources' -Failure "без SFTP-сесії: архів оновлюється локально, передача відкладена, .out збережені"
+
+        # ===== Статичні гейти: dry-run PLAN-рядки + єдина реалізація =====
+        $taDryRunText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition -Condition (
+            $taDryRunText.Contains('"Trace джерела"') -and
+            $taDryRunText.Contains('would upload -> sftp:') -and
+            $taDryRunText.Contains('would delete source .out after confirmed transfer') -and
+            $taDryRunText.Contains("Get-BRAVOTraceArchiveBacklog") -and
+            $taDryRunText.Contains('CompressedLogDeletionEnabled')
+        ) -Name 'TraceArchive/DryRunPlansTracePipelineReadOnly' -Failure "BRAVO_DRY_RUN має PLAN-рядки Trace (джерела/would update/would upload/would delete) на КАНОНІЧНІЙ Get-BRAVOTraceArchiveBacklog і показує стан CompressedLogDeletionEnabled"
+
+        # Trace обробляється ВИКЛЮЧНО Maintenance: жодного окремого
+        # Scheduled Task для Trace (ТЗ §43).
+        $taTasksInstallText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_TASKS_INSTALL.ps1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition -Condition (
+            $taTasksInstallText -notmatch '(?i)BRAVO_TRACE' -and
+            $taTasksInstallText -notmatch '(?i)TRACE_ROTATE|TRACE_UPLOAD'
+        ) -Name 'TraceArchive/NoDedicatedTraceScheduledTask' -Failure "BRAVO_TASKS_INSTALL не повинен створювати окремих Trace-тасків — Trace обробляє лише BRAVO_MAINTENANCE"
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$traceArchiveTestRoot) -and (Test-Path -LiteralPath $traceArchiveTestRoot)) {
             Remove-Item -LiteralPath $traceArchiveTestRoot -Recurse -Force -ErrorAction SilentlyContinue

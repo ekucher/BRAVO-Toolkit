@@ -1450,8 +1450,59 @@ try {
             "архіви старші $($maintenanceSettings.Retention.ArchiveDays) дн.; " +
             "логи старші $($maintenanceSettings.Retention.LogDays) дн.; " +
             "failed-архіви старші $($maintenanceSettings.Retention.FailedArchiveDays) дн.; " +
+            "стиснуті .mdz: $(if ([bool]$maintenanceSettings.Retention.CompressedLogDeletionEnabled) { "видалення старших $($maintenanceSettings.Retention.CompressedLogDays) дн. УВІМКНЕНО" } else { 'автоматичне видалення ВИМКНЕНО (CompressedLogDeletionEnabled=$false)' }); " +
             "нічого не видалено"
         )
+        # Trace-модель 5.2.0: план добової MDZ-обробки — суто read-only
+        # (без 7-Zip, без SFTP, без переміщень). Backlog-скан повторно
+        # використовує КАНОНІЧНУ Get-BRAVOTraceArchiveBacklog з
+        # Maintenance.Runtime через AST-екстракцію (та сама техніка, що
+        # self-test) — жодної другої копії патерну імен.
+        $dryRunTraceBisSource = [string]$maintenanceSettings.Trace.BISSourcePath
+        Add-DryRunResult PLAN "Maintenance" "Trace джерела" (
+            "SRV: bravo.ini [Debug] FILE (Discovery); " +
+            "BIS: $(if ([string]::IsNullOrWhiteSpace($dryRunTraceBisSource)) { 'не налаштовано (maintenanceSettings.Trace.BISSourcePath)' } else { $dryRunTraceBisSource }); " +
+            "would rotate -> Trace\<Назва>_<yyyyMMdd_HHmmss>.out (лише при зупинених службах); нічого не переміщувалося"
+        )
+        if (-not [string]::IsNullOrWhiteSpace($dryRunSystemLogRoot)) {
+            try {
+                $dryRunTraceDirectory = [System.IO.Path]::Combine($dryRunSystemLogRoot, 'Trace')
+                $dryRunMaintenanceRuntimeText = [IO.File]::ReadAllText(
+                    (Join-Path $PSScriptRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'),
+                    [Text.Encoding]::UTF8
+                )
+                $dryRunBacklogAst = [Management.Automation.Language.Parser]::ParseInput($dryRunMaintenanceRuntimeText, [ref]$null, [ref]$null)
+                $dryRunBacklogFunction = @(
+                    $dryRunBacklogAst.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                        $candidate.Name -eq 'Get-BRAVOTraceArchiveBacklog'
+                    }, $true)
+                ) | Select-Object -First 1
+                . ([scriptblock]::Create($dryRunBacklogFunction.Extent.Text))
+                $dryRunTraceBacklog = @(Get-BRAVOTraceArchiveBacklog -TraceDirectory $dryRunTraceDirectory)
+                if (@($dryRunTraceBacklog).Count -eq 0) {
+                    Add-DryRunResult PLAN "Maintenance" "Trace добовий архів" (
+                        "ротованих .out у черзі немає — оновлення Trace_YYYYMMDD.mdz не планується"
+                    )
+                } else {
+                    foreach ($dryRunTraceGroup in $dryRunTraceBacklog) {
+                        $dryRunTraceArchiveExists = Test-Path -LiteralPath $dryRunTraceGroup.ArchivePath -PathType Leaf
+                        Add-DryRunResult PLAN "Maintenance" "Trace добовий архів $($dryRunTraceGroup.ArchiveName)" (
+                            "would $(if ($dryRunTraceArchiveExists) { 'update існуючий' } else { 'create новий' }) архів; " +
+                            "у черзі .out: $(@($dryRunTraceGroup.Files).Count); " +
+                            "would upload -> sftp:$($sftpDirectories.Trace)/$($dryRunTraceGroup.ArchiveName); " +
+                            "would delete source .out after confirmed transfer; " +
+                            "у dry-run нічого не архівувалося і не передавалося"
+                        )
+                    }
+                }
+            } catch {
+                Add-DryRunResult WARN "Maintenance" "Trace добовий архів" (
+                    "не вдалося побудувати план Trace-архівації: $($_.Exception.Message)"
+                )
+            }
+        }
         if (Test-SettingEnabled $maintenanceSettings.RangeIdMonitoring.Enabled) {
             $rangeIdPlan = Get-BRAVODryRunRangeIdPlan `
                 -RangeIdMonitoring $maintenanceSettings.RangeIdMonitoring
