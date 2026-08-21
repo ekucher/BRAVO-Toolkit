@@ -30,9 +30,17 @@ Runtime.ps1 decomposition.
   read-only policy: if the marker's owner process is dead
   (pid+processStartTime liveness check, PID reuse excluded) and
   restartSuppressed=false, Health starts exactly the services listed
-  in the marker and alerts; a suppressed marker (DataRestore
-  incomplete rollback, exit 43) or a manual stop without a marker is
-  never auto-started. New self-test domain
+  in the marker and alerts; a suppressed marker or a manual stop
+  without a marker is never auto-started. DataRestore always writes
+  its marker suppressed (a hard kill mid-restore leaves the live
+  filesystem in an undefined state, so the watchdog only raises a
+  CRITICAL manual-recovery alert and never auto-starts over it);
+  Clear/Suppress are owner-guarded (pid+processStartTime) and the
+  watchdog re-reads the marker before acting (TOCTOU guard), so
+  overlapping owners cannot delete each other's markers; Read
+  validates all required marker fields and returns null for
+  partially edited markers instead of failing the whole Health run
+  under StrictMode. New self-test domain
   `selftest/BRAVO_SELF_TEST.ServiceQuiescence.ps1`; new
   BRAVO.System exports (Write/Read/Clear/Suppress quiescence state,
   Test-BRAVOProcessAlive). See OPERATIONS.md «Аварійне відновлення

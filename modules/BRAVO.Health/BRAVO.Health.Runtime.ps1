@@ -4686,11 +4686,15 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
 
     $ownerText = "$($quiescenceState.owner) (PID $($quiescenceState.pid), лог: $($quiescenceState.logFile))"
     if ([bool]$quiescenceState.restartSuppressed) {
-        Write-HealthLog "Осиротілий ownership-маркер із restartSuppressed: $ownerText навмисно залишив служби зупиненими (незавершений rollback) — автоматичний старт заборонено, потрібне ручне відновлення (OPERATIONS.md, код 43)" -Level "ERROR"
+        # DataRestore пише маркер suppressed ОДРАЗУ (жорсткий kill посеред
+        # деструктивної фази лишає live filesystem у невизначеному стані —
+        # автостарт поверх нього неприпустимий), тому suppressed тут означає
+        # і аварійно перерваний DataRestore, і незавершений rollback.
+        Write-HealthLog "Осиротілий ownership-маркер із restartSuppressed: $ownerText залишив служби зупиненими (аварійно перерваний DataRestore або незавершений rollback — live filesystem може бути в невизначеному стані) — автоматичний старт заборонено, потрібне ручне відновлення (OPERATIONS.md, код 43)" -Level "ERROR"
         $watchdogIssues += [pscustomobject]@{
             Kind = "Service"
             Component = "Служби після аварії $($quiescenceState.owner)"
-            Reason = "навмисно залишені зупиненими (незавершений rollback DataRestore) — потрібне РУЧНЕ відновлення, автоматичний старт заборонено; див. $($quiescenceState.logFile)"
+            Reason = "залишені зупиненими з restartSuppressed (аварійно перерваний DataRestore або незавершений rollback) — потрібне РУЧНЕ відновлення, автоматичний старт заборонено; див. $($quiescenceState.logFile)"
             FileName = ""
             LastWriteTime = $null
             Location = [string]$quiescenceState.owner
@@ -4698,6 +4702,21 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
             Details = @()
         }
         return @($watchdogIssues)
+    }
+
+    # TOCTOU-guard: між першим Read і Start-Service нижче міг стартувати
+    # НОВИЙ власник (записати власний маркер і зупинити служби — Maintenance
+    # о 23:55 перетинається з 4-годинним циклом Health). Перечитуємо маркер:
+    # якщо він зник або це вже інший маркер (owner/pid/createdAt) — виходимо
+    # без жодних дій, аварію опрацює наступний прогін.
+    $verificationState = $null
+    try { $verificationState = Read-BRAVOServiceQuiescenceState } catch { $verificationState = $null }
+    if ($null -eq $verificationState -or
+        [string]$verificationState.owner -ne [string]$quiescenceState.owner -or
+        ($verificationState.pid -as [int]) -ne ($quiescenceState.pid -as [int]) -or
+        [string]$verificationState.createdAt -ne [string]$quiescenceState.createdAt) {
+        Write-HealthLog "Ownership-маркер зупинки служб змінився під час перевірки (новий власник активний або маркер зник) — watchdog виходить без дій" -Level "INFO"
+        return @()
     }
 
     Write-HealthLog "Осиротілий ownership-маркер зупинки служб: власник $ownerText мертвий — відновлюю служби зі списку маркера" -Level "WARNING"
@@ -4719,7 +4738,12 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
     }
     if ($startFailures.Count -eq 0) {
         try {
-            Clear-BRAVOServiceQuiescenceState
+            # -ExpectedState: видалити рівно той маркер, за яким діяли; якщо
+            # його вже перезаписав новий живий власник — не чіпати.
+            $quiescenceMarkerCleared = Clear-BRAVOServiceQuiescenceState -ExpectedState $quiescenceState
+            if (-not $quiescenceMarkerCleared) {
+                Write-HealthLog "Служби відновлено, але ownership-маркер уже належить іншому власнику — залишено без змін" -Level "WARNING"
+            }
         } catch {
             Write-HealthLog "Служби відновлено, але ownership-маркер не видалився: $($_.Exception.Message)" -Level "WARNING"
         }

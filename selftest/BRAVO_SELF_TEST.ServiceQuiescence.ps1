@@ -31,6 +31,8 @@ function Set-BRAVOSelfTestQuiescenceStatePath {
         -FunctionNames @(
             'Get-BRAVOServiceQuiescenceStatePath',
             'Set-BRAVOSelfTestQuiescenceStatePath',
+            'Get-BRAVOCurrentProcessStartTimeText',
+            'Test-BRAVOServiceQuiescenceStateOwnedByCurrentProcess',
             'Write-BRAVOServiceQuiescenceState',
             'Read-BRAVOServiceQuiescenceState',
             'Clear-BRAVOServiceQuiescenceState',
@@ -93,16 +95,17 @@ function Set-BRAVOSelfTestQuiescenceStatePath {
             -Name "ServiceQuiescence/SuppressKeepsOwnershipAndServices" `
             -Failure "Set-...RestartSuppressed має виставляти restartSuppressed=true, зберігаючи owner і services"
 
-        & $quiescenceStateModule { Clear-BRAVOServiceQuiescenceState }
+        $firstClearResult = & $quiescenceStateModule { Clear-BRAVOServiceQuiescenceState }
         $clearedQuiescenceState = & $quiescenceStateModule {
-            # Друге Clear поспіль перевіряє ідемпотентність.
-            Clear-BRAVOServiceQuiescenceState
+            # Друге Clear поспіль перевіряє ідемпотентність (маркера вже
+            # немає -> $true, «мета досягнута»).
+            [void](Clear-BRAVOServiceQuiescenceState)
             Read-BRAVOServiceQuiescenceState
         }
         Test-BRAVOCondition `
-            -Condition ($null -eq $clearedQuiescenceState) `
+            -Condition ($firstClearResult -eq $true -and $null -eq $clearedQuiescenceState) `
             -Name "ServiceQuiescence/ClearIsIdempotentAndReadReturnsNull" `
-            -Failure "Clear має бути ідемпотентним, а Read після нього — повертати null"
+            -Failure "Clear власного маркера має повертати true, бути ідемпотентним, а Read після нього — повертати null"
 
         # Read відхиляє чужий hostname і незнайому schemaVersion — watchdog
         # у цих випадках НЕ має права діяти.
@@ -118,6 +121,80 @@ function Set-BRAVOSelfTestQuiescenceStatePath {
             -Condition ($null -eq $foreignHostRead -and $null -eq $unknownSchemaRead -and $null -eq $brokenJsonRead) `
             -Name "ServiceQuiescence/ReadRejectsForeignHostUnknownSchemaAndBrokenJson" `
             -Failure "Read має повертати null для чужого hostname, schemaVersion!=1 і зіпсованого JSON"
+
+        # РЕГРЕСІЯ (review F3): валідний JSON з валідним header, але без
+        # обов'язкових полів (частково відредагований вручну маркер) МУСИТЬ
+        # давати null, а не PropertyNotFoundException під Set-StrictMode
+        # глибше у watchdog (це валило б увесь Health-прогін).
+        $ownHostnameText = [Environment]::MachineName
+        $missingPidJson = '{"schemaVersion":1,"owner":"BRAVO_MAINTENANCE","hostname":"' + $ownHostnameText + '","processStartTime":"","createdAt":"","logFile":"","restartSuppressed":false,"services":[]}'
+        [IO.File]::WriteAllText($quiescenceTestStatePath, $missingPidJson, (New-Object Text.UTF8Encoding($false)))
+        $missingPidRead = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        $missingServicesJson = '{"schemaVersion":1,"owner":"BRAVO_MAINTENANCE","hostname":"' + $ownHostnameText + '","pid":1,"processStartTime":"","createdAt":"","logFile":"","restartSuppressed":false}'
+        [IO.File]::WriteAllText($quiescenceTestStatePath, $missingServicesJson, (New-Object Text.UTF8Encoding($false)))
+        $missingServicesRead = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        $nonNumericPidJson = '{"schemaVersion":1,"owner":"BRAVO_MAINTENANCE","hostname":"' + $ownHostnameText + '","pid":"abc","processStartTime":"","createdAt":"","logFile":"","restartSuppressed":false,"services":[]}'
+        [IO.File]::WriteAllText($quiescenceTestStatePath, $nonNumericPidJson, (New-Object Text.UTF8Encoding($false)))
+        $nonNumericPidRead = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        $serviceWithoutIntentJson = '{"schemaVersion":1,"owner":"BRAVO_MAINTENANCE","hostname":"' + $ownHostnameText + '","pid":1,"processStartTime":"","createdAt":"","logFile":"","restartSuppressed":false,"services":[{"Name":"BRAVO"}]}'
+        [IO.File]::WriteAllText($quiescenceTestStatePath, $serviceWithoutIntentJson, (New-Object Text.UTF8Encoding($false)))
+        $serviceWithoutIntentRead = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $missingPidRead -and
+                $null -eq $missingServicesRead -and
+                $null -eq $nonNumericPidRead -and
+                $null -eq $serviceWithoutIntentRead
+            ) `
+            -Name "ServiceQuiescence/ReadRejectsMarkerWithMissingRequiredFields" `
+            -Failure "Read має повертати null для маркера без pid/services, з нечисловим pid і з services-записом без RestartIntent"
+
+        # РЕГРЕСІЯ (review F2): Clear/Suppress НЕ чіпають чужий маркер
+        # (записаний іншим процесом) — перетин власників (DataRestore під
+        # час планового Maintenance) не має дозволяти одному процесу
+        # видалити/переписати маркер іншого.
+        $foreignOwnerPid = $PID + 1
+        $foreignOwnedJson = '{"schemaVersion":1,"owner":"BRAVO_DATA_RESTORE","hostname":"' + $ownHostnameText + '","pid":' + $foreignOwnerPid + ',"processStartTime":"2001-01-01T00:00:00.0000000+02:00","createdAt":"2026-08-21T00:00:00.0000000+03:00","logFile":"C:\\LOGS\\datarestore.log","restartSuppressed":false,"services":[{"Name":"BRAVO","RestartIntent":true}]}'
+        [IO.File]::WriteAllText($quiescenceTestStatePath, $foreignOwnedJson, (New-Object Text.UTF8Encoding($false)))
+        $foreignClearResult = & $quiescenceStateModule { Clear-BRAVOServiceQuiescenceState }
+        $foreignSuppressResult = & $quiescenceStateModule { Set-BRAVOServiceQuiescenceRestartSuppressed }
+        $foreignMarkerAfterGuards = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        Test-BRAVOCondition `
+            -Condition (
+                $foreignClearResult -eq $false -and
+                $null -eq $foreignSuppressResult -and
+                $null -ne $foreignMarkerAfterGuards -and
+                [bool]$foreignMarkerAfterGuards.restartSuppressed -eq $false -and
+                ($foreignMarkerAfterGuards.pid -as [int]) -eq $foreignOwnerPid
+            ) `
+            -Name "ServiceQuiescence/ClearAndSuppressNeverTouchForeignMarker" `
+            -Failure "Clear має повертати false, а Suppress — null, лишаючи чужий маркер (інший pid/processStartTime) без змін"
+
+        # РЕГРЕСІЯ (review F2): Clear -ExpectedState (шлях watchdog) видаляє
+        # РІВНО очікуваний маркер; якщо на диску вже інший (новий власник
+        # встиг перезаписати) — не чіпає.
+        $staleExpectedState = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        $replacementOwnedJson = '{"schemaVersion":1,"owner":"BRAVO_MAINTENANCE","hostname":"' + $ownHostnameText + '","pid":' + $foreignOwnerPid + ',"processStartTime":"2002-02-02T00:00:00.0000000+02:00","createdAt":"2026-08-21T01:00:00.0000000+03:00","logFile":"C:\\LOGS\\maintenance.log","restartSuppressed":false,"services":[{"Name":"BRAVO","RestartIntent":true}]}'
+        [IO.File]::WriteAllText($quiescenceTestStatePath, $replacementOwnedJson, (New-Object Text.UTF8Encoding($false)))
+        $mismatchedExpectedClearResult = & $quiescenceStateModule {
+            param($Expected)
+            Clear-BRAVOServiceQuiescenceState -ExpectedState $Expected
+        } $staleExpectedState
+        $currentExpectedState = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        $matchedExpectedClearResult = & $quiescenceStateModule {
+            param($Expected)
+            Clear-BRAVOServiceQuiescenceState -ExpectedState $Expected
+        } $currentExpectedState
+        $markerAfterExpectedClear = & $quiescenceStateModule { Read-BRAVOServiceQuiescenceState }
+        Test-BRAVOCondition `
+            -Condition (
+                $mismatchedExpectedClearResult -eq $false -and
+                $null -ne $currentExpectedState -and
+                $matchedExpectedClearResult -eq $true -and
+                $null -eq $markerAfterExpectedClear
+            ) `
+            -Name "ServiceQuiescence/ClearWithExpectedStateDeletesOnlyThatExactMarker" `
+            -Failure "Clear -ExpectedState має видаляти лише рівно очікуваний маркер (owner+pid+createdAt) і повертати false для переписаного"
 
         # Liveness-предикат: живий власний процес -> true; той самий PID з
         # іншим startTime (симуляція PID-реюзу) -> false; неіснуючий PID -> false.
@@ -161,6 +238,17 @@ function Write-HealthLog {
     param([AllowEmptyString()][string]$Message, [string]$Level = 'INFO')
 }
 function Read-BRAVOServiceQuiescenceState {
+    # Черга дозволяє симулювати TOCTOU: перший Read бачить один маркер,
+    # повторний (verification перед Start-Service) — інший або жодного
+    # ($null у черзі — легітимний елемент «маркер зник»; саме тому індекс,
+    # а не зрізання масиву: @(... | Select-Object -Skip 1) губить $null).
+    # Вичерпана/порожня черга -> завжди той самий ReadResult (штатні
+    # сценарії).
+    if ($script:BRAVOSelfTestQuiescenceReadIndex -lt @($script:BRAVOSelfTestQuiescenceReadQueue).Count) {
+        $nextQueuedState = $script:BRAVOSelfTestQuiescenceReadQueue[$script:BRAVOSelfTestQuiescenceReadIndex]
+        $script:BRAVOSelfTestQuiescenceReadIndex = $script:BRAVOSelfTestQuiescenceReadIndex + 1
+        return $nextQueuedState
+    }
     return $script:BRAVOSelfTestQuiescenceReadResult
 }
 function Test-BRAVOProcessAlive {
@@ -179,20 +267,27 @@ function Start-Service {
     $script:BRAVOSelfTestQuiescenceStartedServices += @($Name)
 }
 function Clear-BRAVOServiceQuiescenceState {
+    param([object]$ExpectedState)
     $script:BRAVOSelfTestQuiescenceCleared = $true
+    $script:BRAVOSelfTestQuiescenceClearExpectedState = $ExpectedState
+    return $true
 }
 function Invoke-BRAVOSelfTestQuiescenceScenario {
-    param($State, [bool]$OwnerAlive, [string[]]$StartFailures)
+    param($State, [bool]$OwnerAlive, [string[]]$StartFailures, [object[]]$ReadQueue = @())
     $script:BRAVOSelfTestQuiescenceReadResult = $State
+    $script:BRAVOSelfTestQuiescenceReadQueue = @($ReadQueue)
+    $script:BRAVOSelfTestQuiescenceReadIndex = 0
     $script:BRAVOSelfTestQuiescenceOwnerAlive = $OwnerAlive
     $script:BRAVOSelfTestQuiescenceStartFailures = @($StartFailures)
     $script:BRAVOSelfTestQuiescenceStartedServices = @()
     $script:BRAVOSelfTestQuiescenceCleared = $false
+    $script:BRAVOSelfTestQuiescenceClearExpectedState = $null
     $issues = @(Invoke-BRAVOServiceQuiescenceWatchdog)
     return [pscustomobject]@{
         Issues = $issues
         StartedServices = @($script:BRAVOSelfTestQuiescenceStartedServices)
         MarkerCleared = [bool]$script:BRAVOSelfTestQuiescenceCleared
+        ClearExpectedState = $script:BRAVOSelfTestQuiescenceClearExpectedState
     }
 }
 '@
@@ -237,11 +332,13 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             @($deadOwnerScenario.StartedServices) -contains 'exchangAPI' -and
             -not (@($deadOwnerScenario.StartedServices) -contains 'BravoWeb') -and
             $deadOwnerScenario.MarkerCleared -eq $true -and
+            $null -ne $deadOwnerScenario.ClearExpectedState -and
+            [string]$deadOwnerScenario.ClearExpectedState.createdAt -eq [string]$orphanedQuiescenceMarker.createdAt -and
             @($deadOwnerScenario.Issues).Count -eq 1 -and
             [string]$deadOwnerScenario.Issues[0].Reason -match 'відновлено автоматично'
         ) `
         -Name "ServiceQuiescence/WatchdogRestoresOnlyRestartIntentServicesAndClearsMarker" `
-        -Failure "мертвий власник: старт рівно services[].RestartIntent=true, Clear маркера, issue про аварійне відновлення"
+        -Failure "мертвий власник: старт рівно services[].RestartIntent=true, Clear РІВНО прочитаного маркера (-ExpectedState), issue про аварійне відновлення"
 
     # (б) Власник живий (Maintenance/DataRestore саме працює) -> нуль дій.
     $aliveOwnerScenario = & $quiescenceWatchdogModule {
@@ -307,6 +404,33 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
         -Name "ServiceQuiescence/WatchdogKeepsMarkerOnPartialStartFailure" `
         -Failure "частковий збій старту: маркер зберігається для повтору, issue перелічує невдалі служби"
 
+    # (е) РЕГРЕСІЯ (review F2, TOCTOU): між першим Read і Start-Service
+    # маркер перезаписав НОВИЙ власник (Maintenance о 23:55 перетнувся з
+    # Health) або маркер зник — watchdog МУСИТЬ вийти без жодної дії
+    # (ані стартів, ані Clear, ані issues).
+    $replacedQuiescenceMarker = $orphanedQuiescenceMarker.PSObject.Copy()
+    $replacedQuiescenceMarker.pid = 54321
+    $replacedQuiescenceMarker.createdAt = '2026-08-21T03:00:00.0000000+03:00'
+    $markerReplacedScenario = & $quiescenceWatchdogModule {
+        param($State, $Replacement)
+        Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @() -ReadQueue @($State, $Replacement)
+    } $orphanedQuiescenceMarker $replacedQuiescenceMarker
+    $markerVanishedScenario = & $quiescenceWatchdogModule {
+        param($State)
+        Invoke-BRAVOSelfTestQuiescenceScenario -State $State -OwnerAlive $false -StartFailures @() -ReadQueue @($State, $null)
+    } $orphanedQuiescenceMarker
+    Test-BRAVOCondition `
+        -Condition (
+            @($markerReplacedScenario.StartedServices).Count -eq 0 -and
+            $markerReplacedScenario.MarkerCleared -eq $false -and
+            @($markerReplacedScenario.Issues).Count -eq 0 -and
+            @($markerVanishedScenario.StartedServices).Count -eq 0 -and
+            $markerVanishedScenario.MarkerCleared -eq $false -and
+            @($markerVanishedScenario.Issues).Count -eq 0
+        ) `
+        -Name "ServiceQuiescence/WatchdogAbortsWhenMarkerReplacedOrVanishedBeforeStart" `
+        -Failure "TOCTOU: маркер перезаписано новим власником або зник перед Start-Service — watchdog не стартує, не чистить, не створює issues"
+
     # ============================================================
     # Статичні перевірки інтеграції маркера в рантайми.
     # ============================================================
@@ -328,6 +452,15 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
         -Condition ($maintenanceRuntimeTextForQuiescence.Contains('if ($script:quiescenceMarkerWrittenThisRun -and -not $serviceRestartFailed)')) `
         -Name "ServiceQuiescence/MaintenanceClearsOnlyOwnMarkerAfterSuccessfulRestarts" `
         -Failure "Maintenance має чистити ЛИШЕ власний маркер і лише коли всі старти служб успішні"
+    # РЕГРЕСІЯ (review F1): маркер Maintenance МУСИТЬ лишатися придатним до
+    # автостарту (робота Maintenance між stop/start не змінює live
+    # filesystem) — жодного -RestartSuppressed у його виклику запису.
+    $maintenanceMarkerWriteBlock = $maintenanceRuntimeTextForQuiescence.Substring(
+        $maintenanceRuntimeTextForQuiescence.IndexOf("-Owner 'BRAVO_MAINTENANCE'"), 300)
+    Test-BRAVOCondition `
+        -Condition (-not $maintenanceMarkerWriteBlock.Contains('-RestartSuppressed')) `
+        -Name "ServiceQuiescence/MaintenanceMarkerAllowsWatchdogAutostart" `
+        -Failure "маркер Maintenance не має писатися з -RestartSuppressed: автостарт після жорсткого kill Maintenance безпечний і обов'язковий"
 
     $dataRestoreRuntimeTextForQuiescence = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"),
@@ -343,7 +476,18 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
             $dataRestoreRuntimeTextForQuiescence.Contains('if ($script:dataRestoreQuiescenceMarkerWritten)')
         ) `
         -Name "ServiceQuiescence/DataRestoreWritesMarkerAndSuppressesOnIncompleteRollback" `
-        -Failure "DataRestore має писати маркер при зупинці служб і виставляти restartSuppressed у гілці неповного rollback"
+        -Failure "DataRestore має писати маркер при зупинці служб і підтверджувати restartSuppressed у гілці неповного rollback"
+    # РЕГРЕСІЯ (review F1, БЛОКЕР): маркер DataRestore МУСИТЬ писатися
+    # -RestartSuppressed від самого створення. Інакше жорсткий kill посеред
+    # деструктивної фази (finally не виконується, suppression ніхто не
+    # виставить) призвів би до автостарту служб watchdog-ом поверх
+    # напіввідновленої live filesystem.
+    $dataRestoreMarkerWriteBlock = $dataRestoreRuntimeTextForQuiescence.Substring(
+        $dataRestoreRuntimeTextForQuiescence.IndexOf("-Owner 'BRAVO_DATA_RESTORE'"), 500)
+    Test-BRAVOCondition `
+        -Condition ($dataRestoreMarkerWriteBlock.Contains('-RestartSuppressed')) `
+        -Name "ServiceQuiescence/DataRestoreMarkerIsSuppressedFromCreation" `
+        -Failure "маркер DataRestore має писатися одразу з -RestartSuppressed: автостарт поверх невизначеної live filesystem заборонено навіть після жорсткого kill"
 
     $healthWatchdogInvokeIndex = $healthRuntimeTextForQuiescence.IndexOf('$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)')
     $healthManagedServicesIndex = $healthRuntimeTextForQuiescence.IndexOf('$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)')

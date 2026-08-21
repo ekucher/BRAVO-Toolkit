@@ -5983,7 +5983,13 @@ if ($serviceWasRunning.BravoWeb) {
 # Health-watchdog. Частковий збій старту → маркер лишається.
 if ($script:quiescenceMarkerWrittenThisRun -and -not $serviceRestartFailed) {
     try {
-        Clear-BRAVOServiceQuiescenceState
+        # Clear захищений: видаляє лише маркер, записаний ЦИМ процесом
+        # (pid+processStartTime). Якщо маркер перезаписав інший власник
+        # (перетин з DataRestore) — повертає $false і не чіпає чужий.
+        $quiescenceMarkerCleared = Clear-BRAVOServiceQuiescenceState
+        if (-not $quiescenceMarkerCleared) {
+            Write-Log -Message "Ownership-маркер зупинки служб не видалено: він уже належить іншому процесу (перетин власників) — залишено без змін" -Level "WARNING"
+        }
     } catch {
         Write-Log -Message "Не вдалося прибрати ownership-маркер зупинки служб: $($_.Exception.Message) — Health-watchdog побачить осиротілий маркер і мовчазної шкоди не буде" -Level "WARNING"
     }
