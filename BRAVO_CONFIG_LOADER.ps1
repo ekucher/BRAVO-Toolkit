@@ -332,6 +332,17 @@ function Assert-BravoLoadedConfiguration {
             Write-Warning "maintenanceSettings.Restore.BootRestoreMode = '$bootRestoreModeValue' не розпізнано — застосовується безпечний профіль 'None' (24/7: без boot-recovery; пропущену реставрацію підхоплює планове Maintenance)."
             $restoreSettingsForValidation.BootRestoreMode = 'None'
         }
+        if (-not $restoreSettingsForValidation.Contains('BootRestoreMode')) {
+            # Старий site-config (5.0/5.1) взагалі без нового ключа:
+            # ефективна конфігурація МУСИТЬ гарантувати його наявність —
+            # консумери (BRAVO_TASKS_INSTALL, Maintenance) читають
+            # $maintenanceSettings.Restore.BootRestoreMode напряму й під
+            # StrictMode падали на відсутньому ключі ("property cannot be
+            # found"), всупереч обіцянці «застарілий ключ ігнорується»
+            # (реальний випадок: DEV-LIMS, site-config rc.4-ери). Дефолт —
+            # безпечний 24/7-профіль 'None'.
+            $restoreSettingsForValidation.BootRestoreMode = 'None'
+        }
     }
 
     if (-not ($global:pathSettings -is [hashtable])) {
