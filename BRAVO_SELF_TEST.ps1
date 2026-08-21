@@ -10328,6 +10328,44 @@ function Get-BRAVOMaintenanceSummaryResult {
         return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($fixtureOutput | Out-String) }
     }
 
+    # РЕГРЕСІЯ (DEV-LIMS, 2026-08-21): site-config 5.0/5.1 БЕЗ
+    # Restore.BootRestoreMode (лише застарілий RunMissedOnStartup) валив
+    # BRAVO_TASKS_INSTALL під StrictMode ("property 'BootRestoreMode'
+    # cannot be found") усупереч обіцянці loader-а «застарілий ключ
+    # ігнорується». Loader тепер гарантує ключ в ефективній конфігурації
+    # (дефолт 'None'). Фікстура точно відтворює старий config: новий ключ
+    # прибрано, legacy-ключ повернуто, Recovery.Enabled — літерал (у
+    # старих config він не був виразом від BootRestoreMode).
+    $legacyRestoreFixture = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $true -RecoveryEnabled $false
+    $legacyRestoreConfigText = [IO.File]::ReadAllText($legacyRestoreFixture.ConfigPath, [Text.Encoding]::UTF8)
+    $legacyRestoreConfigText = [regex]::Replace(
+        $legacyRestoreConfigText,
+        '(?m)^(\s*)BootRestoreMode\s*=\s*"None"[^\r\n]*',
+        '${1}RunMissedOnStartup = $true',
+        1)
+    [IO.File]::WriteAllText($legacyRestoreFixture.ConfigPath, $legacyRestoreConfigText, (New-Object Text.UTF8Encoding($false)))
+    $legacyLoaderProbeOutput = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$($legacyRestoreFixture.Root)' -RuntimeRoot '$root'); " +
+            "[string]`$global:maintenanceSettings.Restore.BootRestoreMode"
+        ) 2>&1
+    $legacyLoaderProbeText = ($legacyLoaderProbeOutput | Out-String)
+    $legacyInstallerResult = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $legacyRestoreFixture.ConfigPath
+    Test-BRAVOCondition `
+        -Condition (
+            # Прибрано саме ПРИСВОЄННЯ (коментарі зі словом BootRestoreMode
+            # у config легітимно лишаються).
+            -not [regex]::IsMatch($legacyRestoreConfigText, '(?m)^\s*BootRestoreMode\s*=') -and
+            ([string](@($legacyLoaderProbeOutput)[-1])).Trim() -eq 'None' -and
+            $legacyLoaderProbeText -notmatch "cannot be found" -and
+            $legacyInstallerResult.Output -notmatch "BootRestoreMode' cannot be found"
+        ) `
+        -Name 'ConfigurationLoader/MissingBootRestoreModeDefaultsToNone' `
+        -Failure "loader має дефолтити відсутній Restore.BootRestoreMode у 'None' для старих site-config (лише RunMissedOnStartup) — консумери не повинні падати під StrictMode на відсутньому ключі"
+
     $schedFixtureMaintenance = New-BRAVOSelfTestSchedulerFixtureConfig `
         -BreakLimsRootViaFakeService $true -MaintenanceEnabled $true -RecoveryEnabled $false
     $schedResultMaintenance = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureMaintenance.ConfigPath

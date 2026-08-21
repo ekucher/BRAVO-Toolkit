@@ -10,6 +10,16 @@ debt): deduplication of service-lifecycle / operation-lock /
 WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
 Runtime.ps1 decomposition.
 
+- Config loader: an effective configuration now always carries
+  maintenanceSettings.Restore.BootRestoreMode — a legacy site config
+  (5.0/5.1) without the new key gets the safe 'None' (24/7) default.
+  Previously BRAVO_TASKS_INSTALL (and any other direct consumer)
+  crashed under StrictMode with "property 'BootRestoreMode' cannot be
+  found" despite the loader's own "the stale key is ignored" warning
+  (real case: DEV-LIMS site config from the rc.4 era). Regression test
+  ConfigurationLoader/MissingBootRestoreModeDefaultsToNone builds a
+  legacy-shaped fixture and validates both the loader default and the
+  installer run.
 - Self-test: temporary directories are created under
   [IO.Path]::GetTempPath() instead of raw $env:TEMP. On servers where
   the session TEMP variable carries the 8.3 short profile form
