@@ -894,8 +894,11 @@ logs `BRAVO_MAINTENANCE` переносить під `SystemLogRoot` (за за�
 ```text
 <SystemLogRoot>\
 ├── Trace\
-│   ├── YYYY-MM-DD\TraceSRV_1.out, TraceSRV_2.out, …
-│   └── Trace_YYYY-MM-DD.mdz            після Retention.ArchiveDays
+│   ├── TraceSRV_YYYYMMDD_HHMMSS.out    нова модель 5.2.0 (плоско, timestamp)
+│   ├── TraceBIS_YYYYMMDD_HHMMSS.out    друге джерело (конфіг-override)
+│   ├── Trace_YYYYMMDD.mdz (+ .sha512)  добовий накопичувальний архів
+│   ├── YYYY-MM-DD\TraceSRV_1.out, …    legacy-структура (не чіпається)
+│   └── Trace_YYYY-MM-DD.mdz            legacy-архіви каталогів-дат
 ├── exchangAPI\
 │   ├── YYYY-MM-DD\exchangAPI_1.log, exchangAPI_2.log, …
 │   └── exchangAPI_YYYY-MM-DD.mdz
@@ -915,8 +918,29 @@ Marker `restore_done_yyyyMMdd.marker` (у `<RuntimeRoot>\LOGS`) створюєт
 атомарно у UTF-8 і не створюється після примусового `-ForceRestore`. Тривкий
 стан реставрації — `%ProgramData%\BRAVO\State\BRAVO_RESTORE_STATE.json`.
 
-**Джерела.** Trace береться виключно з `bravo.ini`, секція `[Debug]`, ключ
-`FILE`; у `BRAVO.config` цей параметр не дублюється. Сам `bravo.ini` має рівно
+**Trace-модель 5.2.0 (добовий накопичувальний архів).** Trace-файли
+(`TraceSRV.out` + опційний `TraceBIS.out`) обробляються **виключно**
+`BRAVO_MAINTENANCE` (ручний запуск і Task Scheduler — одна pipeline; розмір
+файла ніколи не є тригером; без запуску Maintenance BRAVO-Toolkit trace не
+чіпає взагалі). У тому самому запуску: ротація при зупинених службах у
+`Trace\<Назва>_<yyyyMMdd_HHmmss>.out` (колізія імені → наступна вільна
+секунда, існуючий файл ніколи не перезаписується) → після відновлення служб —
+накопичувальне оновлення **одного** `Trace_YYYYMMDD.mdz` на календарну дату
+(дата — з імені ротованого файла; у 7-Zip передаються ЛИШЕ нові файли; entries,
+що вже в архіві, — immutable і верифікуються за Path+Size+CRC до/після) →
+`7z t` → SHA512 sidecar → SFTP у каталог `sftpDirectories.Trace` (передача у
+`<ім'я>.new` з верифікацією розміру до заміни попередньої remote-версії) →
+видалення ротованих `.out` лише після повного ланцюга archive+SFTP+verify.
+Локальний `.mdz` після SFTP **не видаляється** — лише явно ввімкненою
+політикою `Retention.CompressedLogDeletionEnabled` + `CompressedLogDays`.
+Збій SFTP не втрачає нічого: архів і `.out` лишаються, наступний Maintenance
+догрузить без дублікатів (backlog обробляє всі дати, oldest→newest).
+
+**Джерела.** Trace SRV береться виключно з `bravo.ini`, секція `[Debug]`, ключ
+`FILE`; у `BRAVO.config` цей параметр не дублюється. Шлях `TraceBIS.out`
+надійного автоматичного джерела не має, тому задається явно:
+`maintenanceSettings.Trace.BISSourcePath` (порожньо = BIS не використовується,
+INFO-пропуск без помилки). Сам `bravo.ini` має рівно
 один очікуваний шлях, визначений архітектурою ОС —
 `%SystemRoot%\SysWOW64\bravo.ini` на x64 і `%SystemRoot%\System32\bravo.ini`
 на x86; інших місць не перевіряється, а відсутність файлу є помилкою
