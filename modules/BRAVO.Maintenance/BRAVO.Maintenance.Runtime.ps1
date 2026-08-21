@@ -2917,6 +2917,470 @@ function Get-BRAVOTraceConfiguration {
     }
 }
 
+# ===== ДОБОВИЙ TRACE-АРХІВ (Trace_YYYYMMDD.mdz), МОДЕЛЬ 5.2.0 =====
+# Ротовані timestamp-файли (TraceSRV_/TraceBIS_<yyyyMMdd>_<HHmmss>.out)
+# пакуються в ОДИН накопичувальний архів на календарну дату в тому самому
+# запуску Maintenance. Інваріанти: entries, що вже в архіві, — immutable
+# (лише ADD нових; ніколи UPDATE/REPLACE/DELETE); попередня валідна
+# локальна версія переживає будь-який збій оновлення (транзакційний .work
+# + атомарна публікація); джерельні .out видаляються ЛИШЕ після повного
+# ланцюга archive+integrity+SFTP+remote-verify (оркестратор нижче).
+# Дата визначається З ІМЕНІ ротованого файла, не з CreationTime.
+
+function Get-BRAVOTraceArchiveBacklog {
+    # Скан УСІХ дат (backlog після минулих збоїв, не лише сьогодні),
+    # oldest -> newest. Плоский перелік Trace\ без рекурсії: legacy
+    # (TraceSRV_1.out, каталоги-дати, Trace_YYYY-MM-DD.mdz) патерном не
+    # матчиться і не чіпається.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$TraceDirectory)
+
+    $groups = @{}
+    if (-not (Test-Path -LiteralPath $TraceDirectory -PathType Container)) {
+        return @()
+    }
+    foreach ($file in @(Get-BRAVOFiles -Path $TraceDirectory)) {
+        if ($file.Name -notmatch '^(TraceSRV|TraceBIS)_(\d{8})_(\d{6})\.out$') { continue }
+        $dateKey = $matches[2]
+        $parsedDate = [datetime]::MinValue
+        if (-not [datetime]::TryParseExact($dateKey, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+            # Ім'я схоже на нове, але дата неможлива — не створювати
+            # сміттєвий Trace_99999999.mdz; файл лишається оператору.
+            continue
+        }
+        if (-not $groups.ContainsKey($dateKey)) {
+            $groups[$dateKey] = New-Object System.Collections.Generic.List[object]
+        }
+        [void]$groups[$dateKey].Add($file)
+    }
+
+    $result = @()
+    foreach ($dateKey in @($groups.Keys | Sort-Object)) {
+        $archiveName = "Trace_${dateKey}.mdz"
+        $archivePath = Join-Path $TraceDirectory $archiveName
+        $result += [pscustomobject]@{
+            DateKey = $dateKey
+            ArchiveName = $archiveName
+            ArchivePath = $archivePath
+            SidecarPath = "$archivePath.sha512"
+            Files = @($groups[$dateKey] | Sort-Object Name)
+        }
+    }
+    return @($result)
+}
+
+function Get-BRAVOTraceArchiveUpdatePlan {
+    # Класифікація кандидатів ДО формування аргументів 7-Zip — це
+    # критичний інваріант: `7za a` мовчки ОНОВЛЮЄ однойменний entry, тому
+    # в команду додавання потрапляють ВИКЛЮЧНО NewFiles.
+    #   NewFiles       — імені немає в архіві (додати);
+    #   DuplicateFiles — ім'я є і Size+CRC збігаються (нормальний слід
+    #                    минулого «MDZ OK / SFTP FAIL»: не додавати, лише
+    #                    повторити SFTP і потім прибрати джерело);
+    #   ConflictFiles  — ім'я є, але контент інший (ПОМИЛКА: archived
+    #                    entry недоторканий, локальний файл не видаляється).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$BacklogGroup,
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string]$ArchivePassword,
+        [int]$TimeoutSeconds = 3600,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $archiveExists = Test-Path -LiteralPath $BacklogGroup.ArchivePath -PathType Leaf
+    $existingEntries = @()
+    if ($archiveExists) {
+        $inventory = Get-BRAVOSevenZipArchiveEntries `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $BacklogGroup.ArchivePath `
+            -Password $ArchivePassword `
+            -TimeoutSeconds $TimeoutSeconds
+        if (-not $inventory.Success) {
+            Write-BRAVOLogRotationMessage -Logger $Logger `
+                -Message "ПОМИЛКА: inventory $($BacklogGroup.ArchiveName) не вдався: $($inventory.Error)" -Level "ERROR"
+            return [pscustomobject]@{
+                ArchiveExists = $true; ExistingEntries = @(); NewFiles = @()
+                DuplicateFiles = @(); ConflictFiles = @()
+                HasConflicts = $false; InventoryFailed = $true
+                Error = [string]$inventory.Error
+            }
+        }
+        $existingEntries = @($inventory.Entries | Where-Object { -not $_.IsDirectory })
+    }
+
+    $entriesByName = @{}
+    foreach ($entry in $existingEntries) {
+        # 7za a з абсолютними шляхами файлів зберігає плоскі імена; про
+        # всяк випадок нормалізуємо можливий підкаталог у Path.
+        $entriesByName[[System.IO.Path]::GetFileName([string]$entry.Path)] = $entry
+    }
+
+    $newFiles = @()
+    $duplicateFiles = @()
+    $conflictFiles = @()
+    foreach ($file in @($BacklogGroup.Files)) {
+        if (-not $entriesByName.ContainsKey($file.Name)) {
+            $newFiles += $file
+            continue
+        }
+        $entry = $entriesByName[$file.Name]
+        if ([int64]$entry.Size -ne [int64]$file.Length) {
+            $conflictFiles += [pscustomobject]@{
+                File = $file
+                Reason = "розмір локального файла ($($file.Length) байт) не збігається з archived entry ($($entry.Size) байт)"
+            }
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace([string]$entry.Crc)) {
+            # Legacy/порожній CRC в архіві — порівняння лише за розміром.
+            Write-BRAVOLogRotationMessage -Logger $Logger `
+                -Message "archived entry $($file.Name) без CRC — звірка лише за розміром" -Level "WARNING"
+            $duplicateFiles += $file
+            continue
+        }
+        $localCrc = Get-BRAVOSevenZipFileCrc -SevenZipPath $SevenZipPath -FilePath $file.FullName
+        if (-not $localCrc.Success) {
+            $conflictFiles += [pscustomobject]@{
+                File = $file
+                Reason = "не вдалося обчислити локальний CRC: $($localCrc.Error)"
+            }
+            continue
+        }
+        if ([string]$localCrc.Crc -ne [string]$entry.Crc) {
+            $conflictFiles += [pscustomobject]@{
+                File = $file
+                Reason = "CRC локального файла ($($localCrc.Crc)) не збігається з archived entry ($($entry.Crc))"
+            }
+            continue
+        }
+        $duplicateFiles += $file
+    }
+
+    return [pscustomobject]@{
+        ArchiveExists = $archiveExists
+        ExistingEntries = @($existingEntries)
+        NewFiles = @($newFiles)
+        DuplicateFiles = @($duplicateFiles)
+        ConflictFiles = @($conflictFiles)
+        HasConflicts = (@($conflictFiles).Count -gt 0)
+        InventoryFailed = $false
+        Error = $null
+    }
+}
+
+function New-BRAVOTraceWorkArchivePath {
+    # Транзакційний робочий артефакт у <Trace>\.work — той самий
+    # .work\<base>.<guid>.partial<ext> патерн, що в backup-конвеєрі
+    # (New-BRAVOTemporaryArchivePath, BRAVO.Archive.Runtime) — Archive
+    # Runtime не імпортується Maintenance-ом, тому патерн локально
+    # віддзеркалено (~15 рядків; борг консолідації за канонічним власником
+    # зафіксовано в CHANGELOG). Розташування всередині Trace\ гарантує той
+    # самий том для атомарного [IO.File]::Replace.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TraceDirectory,
+        [Parameter(Mandatory = $true)][string]$ArchiveName
+    )
+
+    $workDirectory = Join-Path $TraceDirectory '.work'
+    if (-not (Test-Path -LiteralPath $workDirectory -PathType Container)) {
+        [void](New-Item -Path $workDirectory -ItemType Directory -Force -ErrorAction Stop)
+    }
+    $baseName = [System.IO.Path]::GetFileNameWithoutExtension($ArchiveName)
+    $extension = [System.IO.Path]::GetExtension($ArchiveName)
+    $workName = '{0}.{1}.partial{2}' -f $baseName, ([guid]::NewGuid().ToString('N')), $extension
+    return [pscustomobject]@{
+        WorkDirectory = $workDirectory
+        WorkArchivePath = (Join-Path $workDirectory $workName)
+    }
+}
+
+function Remove-BRAVOTraceWorkArtifacts {
+    # Best-effort прибирання work-артефактів після збою або публікації;
+    # порожній .work прибирається, непорожній (чужі артефакти) — ні.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$WorkArchivePath)
+
+    foreach ($artifact in @($WorkArchivePath, "$WorkArchivePath.sha512")) {
+        if (Test-Path -LiteralPath $artifact -PathType Leaf) {
+            Remove-Item -LiteralPath $artifact -Force -ErrorAction SilentlyContinue
+        }
+    }
+    $workDirectory = Split-Path -Path $WorkArchivePath -Parent
+    if ((Test-Path -LiteralPath $workDirectory -PathType Container) -and
+        @(Get-BRAVOFiles -Path $workDirectory).Count -eq 0) {
+        Remove-Item -LiteralPath $workDirectory -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Clear-BRAVOTraceOrphanWorkArtifacts {
+    # Cross-run прибирання осиротілих .partial-артефактів (crash посеред
+    # минулого оновлення) — аналог orphan sweep backup-конвеєра. Свіжі
+    # артефакти не чіпаються (їх може тримати паралельний процес — хоча
+    # операційний lock цього й не допускає, поріг лишається захисним).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$TraceDirectory,
+        [int]$RetentionHours = 48,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $workDirectory = Join-Path $TraceDirectory '.work'
+    if (-not (Test-Path -LiteralPath $workDirectory -PathType Container)) { return 0 }
+    $cutoff = (Get-Date).AddHours(-[math]::Max(1, $RetentionHours))
+    $removed = 0
+    foreach ($file in @(Get-BRAVOFiles -Path $workDirectory)) {
+        if ($file.Name -notmatch '\.partial\.mdz(\.sha512)?$') { continue }
+        if ($file.LastWriteTime -ge $cutoff) { continue }
+        Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+        if (-not (Test-Path -LiteralPath $file.FullName)) {
+            $removed++
+            Write-BRAVOLogRotationMessage -Logger $Logger `
+                -Message "Прибрано осиротілий work-артефакт Trace: $($file.Name)" -Level "INFO"
+        }
+    }
+    return $removed
+}
+
+function Write-BRAVOTraceArchiveSidecar {
+    # Формат sidecar — точний стандарт backup-конвеєра
+    # (Write-BRAVOFinalHashFile): "{sha512-lowercase} *{ім'я архіву}",
+    # UTF-8 без BOM, без завершального переводу рядка.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$SidecarPath,
+        # Ім'я, під яким архів БУДЕ опублікований: під час транзакційного
+        # оновлення хеш рахується з .work-копії, але sidecar мусить
+        # посилатися на фінальне Trace_YYYYMMDD.mdz, не на .partial-ім'я.
+        [string]$ArchiveLeafName
+    )
+
+    $hashValue = ([string](Get-BRAVOFileHash -Path $ArchivePath -Algorithm SHA512).Hash).ToLowerInvariant()
+    $archiveLeafName = if ([string]::IsNullOrWhiteSpace($ArchiveLeafName)) {
+        [System.IO.Path]::GetFileName($ArchivePath)
+    } else {
+        $ArchiveLeafName
+    }
+    [System.IO.File]::WriteAllText(
+        $SidecarPath,
+        "$hashValue *$archiveLeafName",
+        (New-Object System.Text.UTF8Encoding($false))
+    )
+    return $hashValue
+}
+
+function Test-BRAVOTraceArchiveSidecarCurrent {
+    # true, якщо sidecar існує і відповідає фактичному архіву (ім'я+хеш).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$SidecarPath
+    )
+
+    if (-not (Test-Path -LiteralPath $SidecarPath -PathType Leaf)) { return $false }
+    try {
+        $sidecarText = [System.IO.File]::ReadAllText($SidecarPath, [System.Text.Encoding]::UTF8)
+    } catch {
+        return $false
+    }
+    if ($sidecarText -notmatch '^(?<Hash>[a-fA-F0-9]{128})\s+\*(?<FileName>.+)$') { return $false }
+    # $matches фіксується в локальні змінні ОДРАЗУ: наступні виклики
+    # (Get-BRAVOFileHash) можуть виконати власний -match і перезаписати його.
+    $sidecarHash = [string]$matches.Hash
+    $sidecarFileName = [string]$matches.FileName
+    if ($sidecarFileName -cne [System.IO.Path]::GetFileName($ArchivePath)) { return $false }
+    $actualHash = ([string](Get-BRAVOFileHash -Path $ArchivePath -Algorithm SHA512).Hash).ToLowerInvariant()
+    return $sidecarHash.ToLowerInvariant() -eq $actualHash
+}
+
+function Update-BRAVOTraceDailyArchive {
+    # Транзакційне накопичувальне оновлення ОДНОГО добового архіву:
+    #   copy існуючого -> .work partial (перший запуск дати — з нуля)
+    #   -> 7za a ЛИШЕ NewFiles -> 7z t -> re-inventory (старі entries
+    #   незмінні за Path+Size+CRC, нові присутні) -> SHA512 sidecar
+    #   -> атомарна публікація ([IO.File]::Replace / Move-Item).
+    # Будь-який збій до публікації лишає попередній валідний архів
+    # недоторканим; work-артефакти прибираються.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$BacklogGroup,
+        [Parameter(Mandatory = $true)][object]$Plan,
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string[]]$AddParameters,
+        [Parameter(Mandatory = $true)][string]$ArchivePassword,
+        [int]$CommandTimeoutSeconds = 14400,
+        [int]$IntegrityTimeoutSeconds = 43200,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $buildResult = {
+        param([string]$Status, [int]$AddedCount, [string]$ErrorText)
+        [pscustomobject]@{
+            Status = $Status
+            ArchivePath = [string]$BacklogGroup.ArchivePath
+            SidecarPath = [string]$BacklogGroup.SidecarPath
+            AddedCount = $AddedCount
+            Error = $ErrorText
+        }
+    }
+
+    if ($Plan.InventoryFailed) {
+        return (& $buildResult 'FAILED' 0 "inventory існуючого архіву не вдався: $($Plan.Error)")
+    }
+    if ($Plan.HasConflicts) {
+        $conflictText = (@($Plan.ConflictFiles | ForEach-Object { "$($_.File.Name): $($_.Reason)" }) -join '; ')
+        return (& $buildResult 'FAILED' 0 "конфлікт імен з archived entries (перезапис заборонено): $conflictText")
+    }
+
+    if (@($Plan.NewFiles).Count -eq 0) {
+        if ($Plan.ArchiveExists) {
+            # Restart-safe: якщо минулий прогін опублікував архів, але впав
+            # до/під час запису sidecar — доганяємо sidecar тут.
+            if (-not (Test-BRAVOTraceArchiveSidecarCurrent -ArchivePath $BacklogGroup.ArchivePath -SidecarPath $BacklogGroup.SidecarPath)) {
+                try {
+                    [void](Write-BRAVOTraceArchiveSidecar -ArchivePath $BacklogGroup.ArchivePath -SidecarPath $BacklogGroup.SidecarPath)
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "SHA512 sidecar $($BacklogGroup.ArchiveName) регенеровано (був відсутній або застарілий)" -Level "WARNING"
+                } catch {
+                    return (& $buildResult 'FAILED' 0 "не вдалося регенерувати sidecar: $($_.Exception.Message)")
+                }
+            }
+            return (& $buildResult 'UP_TO_DATE' 0 $null)
+        }
+        return (& $buildResult 'FAILED' 0 'немає ані нових файлів, ані існуючого архіву — порожня група (внутрішня помилка планування)')
+    }
+
+    $work = $null
+    try {
+        $work = New-BRAVOTraceWorkArchivePath `
+            -TraceDirectory (Split-Path -Path $BacklogGroup.ArchivePath -Parent) `
+            -ArchiveName $BacklogGroup.ArchiveName
+    } catch {
+        return (& $buildResult 'FAILED' 0 "не вдалося підготувати робочий каталог .work: $($_.Exception.Message)")
+    }
+    $workArchivePath = [string]$work.WorkArchivePath
+
+    try {
+        if ($Plan.ArchiveExists) {
+            $existingItem = Get-Item -LiteralPath $BacklogGroup.ArchivePath -ErrorAction Stop
+            Copy-Item -LiteralPath $BacklogGroup.ArchivePath -Destination $workArchivePath -ErrorAction Stop
+            $workCopyItem = Get-Item -LiteralPath $workArchivePath -ErrorAction Stop
+            if ([int64]$workCopyItem.Length -ne [int64]$existingItem.Length) {
+                throw "розмір робочої копії ($($workCopyItem.Length)) не збігається з оригіналом ($($existingItem.Length))"
+            }
+        }
+
+        # ЛИШЕ NewFiles: existing entry ніколи не потрапляє в команду
+        # додавання (див. коментар Get-BRAVOTraceArchiveUpdatePlan).
+        # AddParameters НЕ повинні містити -mhe: із шифрованим заголовком
+        # `7za a` в існуючий архів запитує пароль ДВІЧІ, і другий запит він
+        # читає не з redirected stdin надійно — на UTF-8-хості це давало
+        # "Everything is Ok" з фактично биті архівом (характеризація
+        # 2026-08-22). Без -mhe запит рівно один: заголовки добових
+        # Trace-архівів нешифровані (імена видимі) — як і в усіх backup
+        # .mdz продукту; вміст шифрований.
+        $addArguments = @($AddParameters) + @($workArchivePath) + @($Plan.NewFiles | ForEach-Object { [string]$_.FullName })
+        $addExitCode = Invoke-CommandWithLog `
+            -Command $SevenZipPath `
+            -Arguments $addArguments `
+            -Description "Trace: додавання $(@($Plan.NewFiles).Count) файл(ів) до $($BacklogGroup.ArchiveName)" `
+            -TimeoutSeconds $CommandTimeoutSeconds `
+            -StandardInputText $ArchivePassword
+        if ($addExitCode -ne 0) {
+            $exitDescription = Get-BRAVOSevenZipExitCodeDescription -ExitCode $addExitCode
+            throw "7-Zip завершився кодом $addExitCode — $exitDescription"
+        }
+
+        $integrityValid = Test-SevenZipArchiveIntegrity `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $workArchivePath `
+            -Password $ArchivePassword `
+            -TimeoutSeconds $IntegrityTimeoutSeconds `
+            -Logger $Logger
+        if (-not $integrityValid) {
+            throw "оновлений архів не пройшов перевірку цілісності 7-Zip (7z t)"
+        }
+
+        # Верифікація immutability: усі старі entries присутні з тими
+        # самими Path+Size+CRC; усі нові додано з правильним розміром.
+        $verifyInventory = Get-BRAVOSevenZipArchiveEntries `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $workArchivePath `
+            -Password $ArchivePassword `
+            -TimeoutSeconds $IntegrityTimeoutSeconds
+        if (-not $verifyInventory.Success) {
+            throw "контрольний inventory оновленого архіву не вдався: $($verifyInventory.Error)"
+        }
+        $verifiedByName = @{}
+        foreach ($entry in @($verifyInventory.Entries | Where-Object { -not $_.IsDirectory })) {
+            $verifiedByName[[System.IO.Path]::GetFileName([string]$entry.Path)] = $entry
+        }
+        foreach ($oldEntry in @($Plan.ExistingEntries)) {
+            $oldName = [System.IO.Path]::GetFileName([string]$oldEntry.Path)
+            if (-not $verifiedByName.ContainsKey($oldName)) {
+                throw "старий entry '$oldName' зник після оновлення — публікацію скасовано"
+            }
+            $newEntry = $verifiedByName[$oldName]
+            if ([int64]$newEntry.Size -ne [int64]$oldEntry.Size -or
+                ([string]$newEntry.Crc) -ne ([string]$oldEntry.Crc)) {
+                throw "старий entry '$oldName' змінився (Size/CRC) після оновлення — публікацію скасовано"
+            }
+        }
+        foreach ($newFile in @($Plan.NewFiles)) {
+            if (-not $verifiedByName.ContainsKey($newFile.Name)) {
+                throw "новий файл '$($newFile.Name)' відсутній в оновленому архіві"
+            }
+            if ([int64]$verifiedByName[$newFile.Name].Size -ne [int64]$newFile.Length) {
+                throw "новий entry '$($newFile.Name)' має неочікуваний розмір"
+            }
+        }
+
+        # Хеш обчислюється з work-копії ДО публікації; вміст після
+        # Replace/Move байт-у-байт той самий.
+        $publishedHash = Write-BRAVOTraceArchiveSidecar `
+            -ArchivePath $workArchivePath `
+            -SidecarPath "$workArchivePath.sha512" `
+            -ArchiveLeafName $BacklogGroup.ArchiveName
+
+        $statusOnPublish = if ($Plan.ArchiveExists) { 'UPDATED' } else { 'CREATED' }
+        if ($Plan.ArchiveExists) {
+            try {
+                # Атомарна заміна на тому самому томі (.work усередині Trace\).
+                [System.IO.File]::Replace($workArchivePath, $BacklogGroup.ArchivePath, $null)
+            } catch {
+                # Fallback (нетипові FS без підтримки Replace): rename-стратегія;
+                # попередня версія тримається як .bak до успішного Move.
+                $backupPath = "$($BacklogGroup.ArchivePath).bak_$([guid]::NewGuid().ToString('N'))"
+                Move-Item -LiteralPath $BacklogGroup.ArchivePath -Destination $backupPath -ErrorAction Stop
+                try {
+                    Move-Item -LiteralPath $workArchivePath -Destination $BacklogGroup.ArchivePath -ErrorAction Stop
+                } catch {
+                    Move-Item -LiteralPath $backupPath -Destination $BacklogGroup.ArchivePath -ErrorAction Stop
+                    throw
+                }
+                Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+            }
+        } else {
+            Move-Item -LiteralPath $workArchivePath -Destination $BacklogGroup.ArchivePath -ErrorAction Stop
+        }
+        # Sidecar публікується ПІСЛЯ архіву; збій тут доганяється
+        # sidecar-регенерацією гілки UP_TO_DATE наступного прогону.
+        Move-Item -LiteralPath "$workArchivePath.sha512" -Destination $BacklogGroup.SidecarPath -Force -ErrorAction Stop
+
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Добовий архів $($BacklogGroup.ArchiveName): $statusOnPublish, додано $(@($Plan.NewFiles).Count) файл(ів), SHA512 $publishedHash" -Level "SUCCESS"
+        return (& $buildResult $statusOnPublish (@($Plan.NewFiles).Count) $null)
+    } catch {
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "ПОМИЛКА: оновлення $($BacklogGroup.ArchiveName) не вдалося: $($_.Exception.Message) — попередня версія архіву недоторкана" -Level "ERROR"
+        return (& $buildResult 'FAILED' 0 $_.Exception.Message)
+    } finally {
+        Remove-BRAVOTraceWorkArtifacts -WorkArchivePath $workArchivePath
+    }
+}
+
 
 # ===== МІГРАЦІЯ СТАРОЇ СТРУКТУРИ ЖУРНАЛІВ =====
 # До переїзду під <ArchiveRoot>\LOGS програмні журнали лежали у трьох
@@ -3576,8 +4040,9 @@ function Invoke-CommandWithLog {
         $process.StartInfo = $processInfo
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
         if ($null -ne $StandardInputText) {
-            $process.StandardInput.WriteLine($StandardInputText)
-            $process.StandardInput.Close()
+            # UTF-8 без BOM через канонічний хелпер: під UTF-8-консоллю
+            # WriteLine додав би BOM перед паролем (див. Write-BRAVOProcessInputText).
+            Write-BRAVOProcessInputText -Process $process -Text $StandardInputText
         }
         $timeoutMilliseconds = [int][math]::Min(
             [double][int]::MaxValue,
