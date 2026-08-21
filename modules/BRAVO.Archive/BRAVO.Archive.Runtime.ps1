@@ -509,7 +509,16 @@ function Test-Compatibility {
     $script:BRAVOOSSupportTier = $osSupportTier
     Write-BRAVOLog -Component 'STARTUP' -Message "Підтримка ОС: $($osSupportTier.Tier) — Windows $($osSupportTier.OperatingSystem) ($($osSupportTier.OperatingSystemVersion), build $($osSupportTier.Build)); PowerShell $($osSupportTier.PowerShellVersion); .NET release $($osSupportTier.DotNetRelease)" -Level "INFO"
     if ($osSupportTier.Tier -eq "LegacyBestEffort") {
-        Write-BRAVOLog -Component 'STARTUP' -Message $osSupportTier.Message -Level "WARNING"
+        # Рівень INFO навмисно: legacy-tier — environmental-метрика, а не
+        # результат операції. WARNING тут інкрементував лічильник
+        # попереджень, і КОЖЕН успішний прогін на Server 2012 R2/2016
+        # завершувався кодом 10 (SuccessWithWarnings), а звіт ішов у канал
+        # ALERTS замість GENERAL — хоча на архівацію рівень ОС не впливає.
+        # Постійне нагадування про legacy-ОС — відповідальність
+        # BRAVO_HEALTH (там воно лишається WARNING), той самий принцип,
+        # що вже застосовано до віку Windows-оновлень (health-метрика,
+        # а не умова запуску — див. BRAVO_TASKS_INSTALL.ps1).
+        Write-BRAVOLog -Component 'STARTUP' -Message $osSupportTier.Message -Level "INFO"
     } elseif ($osSupportTier.Tier -eq "Unsupported") {
         if ($env:BRAVO_ALLOW_UNSUPPORTED_OS -eq "1") {
             Write-BRAVOLog -Component 'STARTUP' -Message "$($osSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level "WARNING"

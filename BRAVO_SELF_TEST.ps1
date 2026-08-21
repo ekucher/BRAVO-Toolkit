@@ -241,6 +241,27 @@ try {
         -Name "Runtime/UnsupportedOSBlocksProductionRun" `
         -Failure "Archive/Health/Maintenance мають блокувати запуск на Unsupported ОС, окрім явного override через BRAVO_ALLOW_UNSUPPORTED_OS=1 (аудит P0.4)"
 
+    # Legacy-tier (Server 2012 R2/2016) — environmental-метрика, а не
+    # результат операції: в Archive/Maintenance повідомлення логуються як
+    # INFO (WARNING інкрементував лічильник попереджень, і кожен успішний
+    # прогін на legacy-ОС завершувався кодом 10, а звіт ішов у ALERTS
+    # замість GENERAL). Канонічний власник постійного нагадування —
+    # BRAVO_HEALTH, там рівень лишається WARNING. Unsupported-гілки
+    # (override через BRAVO_ALLOW_UNSUPPORTED_OS) не чіпаються.
+    $archiveLegacyTierBlock = [regex]::Match($archiveRuntimeTextForOSTier, '(?s)Tier -eq "LegacyBestEffort"\) \{.{0,900}?\} elseif').Value
+    $maintenanceLegacyTierBlock = [regex]::Match($maintenanceRuntimeTextForOSTier, '(?s)Tier -eq "LegacyBestEffort"\) \{.{0,900}?\} elseif').Value
+    $healthLegacyTierBlock = [regex]::Match($healthRuntimeTextForOSTier, '(?s)Tier -eq "LegacyBestEffort"\) \{.{0,900}?\} elseif').Value
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveLegacyTierBlock -match '-Level "INFO"' -and
+            $archiveLegacyTierBlock -notmatch '-Level "WARNING"' -and
+            $maintenanceLegacyTierBlock -match '-Level "INFO"' -and
+            $maintenanceLegacyTierBlock -notmatch '-Level "WARNING"' -and
+            $healthLegacyTierBlock -match '-Level "WARNING"'
+        ) `
+        -Name "Runtime/LegacyOSTierIsInformationalInOperationalRuns" `
+        -Failure "LegacyBestEffort у Archive/Maintenance має логуватись як INFO (не піднімати exit 10 і не маршрутизувати успішний звіт в ALERTS); у Health лишається WARNING як канонічна environmental-метрика"
+
     $toolIntegrityTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_TOOL_INTEGRITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
