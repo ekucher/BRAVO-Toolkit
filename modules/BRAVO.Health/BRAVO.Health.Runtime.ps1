@@ -4653,6 +4653,47 @@ if (-not $environmentPreflight.IsWritable) {
     })
 }
 
+function Get-BRAVOQuiescenceWatchdogAllowedServiceNames {
+    # Білий список для watchdog (review F4): маркер — persistent-файл, тобто
+    # ВХІД для привілейованого Start-Service. Навіть валідний на вигляд
+    # маркер не має права змусити SYSTEM-Health запустити довільну службу:
+    # стартувати можна лише канонічні керовані служби з конфігурації
+    # (maintenanceSettings.Services — те саме джерело, що в
+    # Get-ManagedServiceHealthIssues; BravoWeb резолвиться за кандидатами
+    # так само). Конфігурація недоступна -> порожній список -> watchdog
+    # відмовляє всім (fail-safe: без керованого набору легітимного маркера
+    # існувати не може — його пишуть лише Maintenance/DataRestore, які цю ж
+    # конфігурацію читають).
+    $allowedServiceNames = @()
+    $servicesSettings = $null
+    $maintenanceSettingsVariable = Get-Variable -Name maintenanceSettings -ErrorAction SilentlyContinue
+    if ($null -ne $maintenanceSettingsVariable -and $null -ne $maintenanceSettingsVariable.Value) {
+        $servicesSettings = $maintenanceSettingsVariable.Value.Services
+    }
+    if ($null -eq $servicesSettings) { return @() }
+    foreach ($configuredServiceName in @(
+            [string]$servicesSettings.BravoName,
+            [string]$servicesSettings.ExchangeApiName
+        )) {
+        if (-not [string]::IsNullOrWhiteSpace($configuredServiceName)) {
+            $allowedServiceNames += $configuredServiceName
+        }
+    }
+    if (Test-BRAVOSettingEnabled -Value $servicesSettings.BravoWebEnabled) {
+        foreach ($webCandidate in @($servicesSettings.BravoWebCandidates)) {
+            if ([string]::IsNullOrWhiteSpace([string]$webCandidate)) { continue }
+            $webService = Get-Service -Name ([string]$webCandidate) -ErrorAction SilentlyContinue
+            if ($null -eq $webService) {
+                $webService = Get-Service -DisplayName ([string]$webCandidate) -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $webService) {
+                $allowedServiceNames += [string]$webService.Name
+            }
+        }
+    }
+    return @($allowedServiceNames)
+}
+
 function Invoke-BRAVOServiceQuiescenceWatchdog {
     # ЄДИНИЙ дозволений Health виняток з read-only політики (див. політику
     # нижче в цьому файлі та BRAVO.config): якщо Maintenance/DataRestore
@@ -4720,17 +4761,33 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
     }
 
     Write-HealthLog "Осиротілий ownership-маркер зупинки служб: власник $ownerText мертвий — відновлюю служби зі списку маркера" -Level "WARNING"
+    $allowedServiceNames = @(Get-BRAVOQuiescenceWatchdogAllowedServiceNames)
     $startFailures = @()
     $startedServices = @()
+    $alreadyRunningServices = @()
     foreach ($markedService in @($quiescenceState.services | Where-Object { [bool]$_.RestartIntent })) {
         $markedName = [string]$markedService.Name
+        if (@($allowedServiceNames | Where-Object { $_ -ieq $markedName }).Count -eq 0) {
+            # Review F4: маркер вимагає службу поза канонічним керованим
+            # набором конфігурації — ознака стороннього редагування файлу.
+            # Відмова потрапляє у startFailures: маркер лишається, issue
+            # робить подію видимою оператору при кожному прогоні.
+            $startFailures += "${markedName}: не входить до керованого набору служб конфігурації — автоматичний старт заборонено (можливе стороннє редагування маркера)"
+            Write-HealthLog "Відмовлено у старті служби ${markedName}: її немає в керованому наборі конфігурації (можливе стороннє редагування ownership-маркера)" -Level "ERROR"
+            continue
+        }
         try {
             $serviceObject = Get-Service -Name $markedName -ErrorAction Stop
             if ($serviceObject.Status -ne 'Running') {
                 Start-Service -Name $markedName -ErrorAction Stop
+                $startedServices += $markedName
+                Write-HealthLog "Службу $markedName відновлено після аварійного переривання $($quiescenceState.owner)" -Level "SUCCESS"
+            } else {
+                # Review F5: службу, що вже працює, НЕ рапортуємо як
+                # «відновлену» — інакше оператор бачить хибний масштаб аварії.
+                $alreadyRunningServices += $markedName
+                Write-HealthLog "Служба $markedName вже працює — старт після аварійного переривання не потрібен" -Level "INFO"
             }
-            $startedServices += $markedName
-            Write-HealthLog "Службу $markedName відновлено після аварійного переривання $($quiescenceState.owner)" -Level "SUCCESS"
         } catch {
             $startFailures += "${markedName}: $($_.Exception.Message)"
             Write-HealthLog "Не вдалося відновити службу $markedName після аварійного переривання: $($_.Exception.Message)" -Level "ERROR"
@@ -4747,10 +4804,17 @@ function Invoke-BRAVOServiceQuiescenceWatchdog {
         } catch {
             Write-HealthLog "Служби відновлено, але ownership-маркер не видалився: $($_.Exception.Message)" -Level "WARNING"
         }
+        $recoveryReportText = if ($startedServices.Count -gt 0 -and $alreadyRunningServices.Count -gt 0) {
+            "служби $($startedServices -join ', ') відновлено автоматично (служби $($alreadyRunningServices -join ', ') вже працювали)"
+        } elseif ($startedServices.Count -gt 0) {
+            "служби $($startedServices -join ', ') відновлено автоматично"
+        } else {
+            "усі служби з маркера ($($alreadyRunningServices -join ', ')) вже працювали, старт не знадобився"
+        }
         $watchdogIssues += [pscustomobject]@{
             Kind = "Service"
             Component = "Аварійне відновлення служб"
-            Reason = "служби $($startedServices -join ', ') відновлено автоматично після аварійного переривання $ownerText — перевірте причину переривання"
+            Reason = "$recoveryReportText після аварійного переривання $ownerText — перевірте причину переривання"
             FileName = ""
             LastWriteTime = $null
             Location = [string]$quiescenceState.owner

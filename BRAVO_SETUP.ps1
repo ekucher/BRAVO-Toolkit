@@ -360,6 +360,28 @@ try {
             -ValidateOnly:$ValidateOnly
     }
 
+    # Захист State-кореня (%ProgramData%\BRAVO\State): ownership-маркери в
+    # ньому — вхід для привілейованих дій SYSTEM-Health (Start-Service за
+    # quiescence-маркером), тому запис туди мають лише SYSTEM і
+    # Administrators. З адмін-правами невідповідні ACL зміцнюються; у
+    # ValidateOnly/неелевованому прогоні — лише перевірка зі звітом.
+    $stateRootProtection = if ((Test-IsAdministrator) -and -not $ValidateOnly) {
+        Protect-BRAVOMachineStateRoot
+    } else {
+        Protect-BRAVOMachineStateRoot -CheckOnly
+    }
+    if ($stateRootProtection.Applied) {
+        Write-BRAVOResultField -Label 'State ACL' -Value "зміцнено: $($stateRootProtection.Path)" -Color ([ConsoleColor]::Green)
+    } elseif ($stateRootProtection.Compliant) {
+        Write-BRAVOResultField -Label 'State ACL' -Value "OK: $($stateRootProtection.Path)"
+    } else {
+        Write-BRAVOResultField -Label 'State ACL' -Value "НЕВІДПОВІДНІСТЬ: $($stateRootProtection.Path)" -Color ([ConsoleColor]::Yellow)
+        foreach ($stateRootIssue in @($stateRootProtection.Issues)) {
+            Write-Host "  - $stateRootIssue" -ForegroundColor Yellow
+        }
+        Write-Host "  Зміцнення виконає повний запуск BRAVO_SETUP з правами адміністратора." -ForegroundColor Yellow
+    }
+
     # Discovery джерел (CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md): показуємо
     # завжди, це лише read-only читання вже обчисленого
     # $global:bravoDiscoveryResult з BRAVO.config — жодних нових операцій.
