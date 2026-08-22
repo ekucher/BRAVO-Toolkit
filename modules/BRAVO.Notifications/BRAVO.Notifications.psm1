@@ -388,6 +388,7 @@ function ConvertTo-DiscordNotificationText {
         ":minidisc:" = "💽"
         ":satellite:" = "🛰️"
         ":wrench:" = "🔧"
+        ":fast_forward:" = "⏭️"
         ":x:" = "❌"
     }
 

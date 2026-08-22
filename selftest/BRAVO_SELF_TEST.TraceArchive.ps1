@@ -269,6 +269,49 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             [string]$taSendSession.State.LastResumeSupportState -eq 'On'
         ) -Name 'TraceArchive/SftpPublishGoesThroughVerifiedTempName' -Failure "успішна публікація: передача у .new (Resume=On), verify, звільнення старої версії, rename, фінальний розмір 300/140; факт: $($taSendResult.Error)"
 
+        # --- РЕГРЕСІЯ (реальний DEV-LIMS): remote-каталог /trace/ не існував,
+        # session.PutFiles його НЕ створює, і кожен прогін падав із
+        # "Cannot create remote file '/trace/....new.filepart'. No such file
+        # or directory" -> exit 60 обслуговування, яке відпрацювало. Каталог
+        # має створюватись ДО передачі (канонічний рекурсивний creator
+        # BRAVO.BazaSync), один раз на комплект. ---
+        $taSendMissingDirArchive = Join-Path $taSendLocalDir 'Trace_20260817.mdz'
+        $taSendMissingDirSidecar = "$taSendMissingDirArchive.sha512"
+        [IO.File]::WriteAllText($taSendMissingDirArchive, ('m' * 210))
+        [IO.File]::WriteAllText($taSendMissingDirSidecar, ('s' * 140))
+        $taSendMissingDirSession = New-BRAVOSelfTestFakeBazaSession
+        $taSendMissingDirResult = & $traceArchiveModule { param($s, $a, $sc, $d) Send-BRAVOTraceArchive -Session $s -ArchivePath $a -SidecarPath $sc -RemoteDirectory $d } $taSendMissingDirSession $taSendMissingDirArchive $taSendMissingDirSidecar 'trace/daily'
+        Test-BRAVOCondition -Condition (
+            $taSendMissingDirResult.Success -eq $true -and
+            $taSendMissingDirSession.State.KnownRemoteDirs.Contains('/trace') -and
+            $taSendMissingDirSession.State.KnownRemoteDirs.Contains('/trace/daily') -and
+            [int64]$taSendMissingDirSession.State.RemoteSizes['/trace/daily/Trace_20260817.mdz'] -eq 210
+        ) -Name 'TraceArchive/SftpCreatesMissingRemoteDirectoryBeforeUpload' -Failure "відсутній remote-каталог має створюватись рекурсивно ДО PutFiles (/trace, потім /trace/daily); факт: $($taSendMissingDirResult.Error)"
+
+        # Каталог уже існує — жодного зайвого CreateDirectory.
+        $taSendExistingDirSession = New-BRAVOSelfTestFakeBazaSession
+        [void]$taSendExistingDirSession.State.KnownRemoteDirs.Add('/trace')
+        [void](& $traceArchiveModule { param($s, $a, $sc, $d) Send-BRAVOTraceArchive -Session $s -ArchivePath $a -SidecarPath $sc -RemoteDirectory $d } $taSendExistingDirSession $taSendArchive $taSendSidecar 'trace')
+        Test-BRAVOCondition -Condition (
+            @($taSendExistingDirSession.State.KnownRemoteDirs).Count -eq 1
+        ) -Name 'TraceArchive/SftpDoesNotRecreateExistingRemoteDirectory' -Failure "наявний remote-каталог не має створюватись повторно; факт каталогів: $(@($taSendExistingDirSession.State.KnownRemoteDirs) -join ', ')"
+
+        # Збій створення каталогу — fail-open саме для SFTP: помилка етапу,
+        # локальний архів і .out недоторкані, фінальне ім'я не зрушене.
+        $taSendDirFailSession = New-BRAVOSelfTestFakeBazaSession
+        $taSendDirFailSession | Add-Member -Force -MemberType ScriptMethod -Name CreateDirectory -Value {
+            param($path)
+            throw "simulated permission denied: $path"
+        }
+        $taSendDirFailResult = & $traceArchiveModule { param($s, $a, $sc, $d) Send-BRAVOTraceArchive -Session $s -ArchivePath $a -SidecarPath $sc -RemoteDirectory $d } $taSendDirFailSession $taSendArchive $taSendSidecar 'trace'
+        Test-BRAVOCondition -Condition (
+            $taSendDirFailResult.Success -eq $false -and
+            @($taSendDirFailSession.State.PutFilesCalledFor).Count -eq 0 -and
+            @($taSendDirFailSession.State.MoveFileCalls).Count -eq 0 -and
+            @($taSendDirFailSession.State.RemoveFilesCalls).Count -eq 0 -and
+            (Test-Path -LiteralPath $taSendArchive)
+        ) -Name 'TraceArchive/SftpRemoteDirectoryFailureAbortsBeforeTransfer' -Failure "збій CreateDirectory має завершити передачу помилкою ДО PutFiles, не чіпаючи ані remote-фінал, ані локальний архів"
+
         # --- Обірвана передача (PutFiles fail): стара remote-версія жива, нічого не зрушено ---
         $taSendFailSession = New-BRAVOSelfTestFakeBazaSession -AllTransfersFail
         $taSendFailSession.State.RemoteSizes['/trace/Trace_20260815.mdz'] = [int64]111

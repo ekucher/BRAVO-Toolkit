@@ -29,7 +29,15 @@ $bravoScriptDirectory = $RuntimeRoot
 # ConvertTo-BRAVOIniPathValue, а покладатися на порядок чужих імпортів для
 # власних залежностей — рівно та помилка, яку вже задокументовано в шапці
 # самого BRAVO.Discovery.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System')) {
+# BRAVO.BazaSync — рівно заради канонічного рекурсивного creator'а
+# remote-каталогів (New-BRAVOBazaRemoteDirectoryRecursive), який потрібен
+# добовій Trace-передачі. Функція duck-typed по $Session і не пов'язана з
+# BAZA-станом; сам імпорт побічних ефектів не має (тягне лише
+# BRAVO.Compatibility і BRAVO.ArchiveRuntime, вже імпортовані тут).
+# Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
+# проти другої власної реалізації; нейтральний власник SFTP-примітивів —
+# тема окремого рефактора.
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -1189,7 +1197,22 @@ function Get-BRAVOMaintenanceFinalStatus {
     }
 }
 
-function Write-BRAVOMaintenanceStep {
+# ЄДИНА канонічна точка обліку результату етапу — і лічильники підсумкового
+# блоку РЕЗУЛЬТАТ, і журнал для фінального сповіщення. Викликається з ОБОХ
+# рендерів: Write-BRAVOMaintenanceStep (пронумеровані [N/Total]) і
+# Write-BRAVOMaintenanceOperation (ненумеровані операції).
+#
+# Реальний DEV-LIMS прогін 19:26 показав, чому облік мусить бути спільним:
+# ненумеровані операції рендерилися прямо через Write-BRAVOOperationResult
+# (BRAVO.Console), тому FAIL-операція "Trace: добовий архів і SFTP" не
+# потрапляла ані в лічильники (підсумок брехав "Помилок: 0" при exit 60),
+# ані в журнал (сповіщення показувало "✅ Trace" замість ❌ і зовсім не
+# показувало рядок "Очистка").
+#
+# Нумератор $script:BRAVOMaintenanceStepCurrent тут НЕ чіпається свідомо:
+# його інкрементує лише Write-BRAVOMaintenanceStep, інакше зсунеться
+# нумерація [N/Total] пронумерованих кроків.
+function Add-BRAVOMaintenanceStepOutcome {
     param(
         [Parameter(Mandatory = $true)][string]$Name,
         [ValidateSet('OK', 'SKIPPED', 'WARN', 'FAIL')]
@@ -1197,7 +1220,6 @@ function Write-BRAVOMaintenanceStep {
         [string]$Details
     )
 
-    $script:BRAVOMaintenanceStepCurrent++
     switch ($Status) {
         'OK'      { $script:BRAVOMaintenanceStepOkCount++ }
         'WARN'    { $script:BRAVOMaintenanceStepWarnCount++ }
@@ -1211,6 +1233,37 @@ function Write-BRAVOMaintenanceStep {
         Status = $Status
         Details = [string]$Details
     })
+}
+
+# Ненумерована операція Maintenance (Trace-SFTP, Очистка, Міграція,
+# Архівація, Автовимкнення): той самий консольний рендер, що й раніше
+# (Write-BRAVOOperationResult з BRAVO.Console — спільна межа рендеру, яку
+# використовують і Archive, і DataRestore, тому maintenance-специфічний
+# облік у неї не вбудовується), плюс той самий облік, що в пронумерованих
+# кроків.
+function Write-BRAVOMaintenanceOperation {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [ValidateSet('OK', 'SKIPPED', 'WARN', 'FAIL')]
+        [string]$Status = 'OK',
+        [Nullable[timespan]]$Duration,
+        [string]$Details
+    )
+
+    Add-BRAVOMaintenanceStepOutcome -Name $Name -Status $Status -Details $Details
+    Write-BRAVOOperationResult -Name $Name -Status $Status -Duration $Duration -Details $Details
+}
+
+function Write-BRAVOMaintenanceStep {
+    param(
+        [Parameter(Mandatory = $true)][string]$Name,
+        [ValidateSet('OK', 'SKIPPED', 'WARN', 'FAIL')]
+        [string]$Status = 'OK',
+        [string]$Details
+    )
+
+    $script:BRAVOMaintenanceStepCurrent++
+    Add-BRAVOMaintenanceStepOutcome -Name $Name -Status $Status -Details $Details
     # Тривалість кроку — час від попереднього кроку (чи від Initialize, для
     # першого). Той самий підхід, що в Health: жоден із ~9 кроків не має
     # власного таймера, і додавати його кожному окремо — набагато більший
@@ -1542,16 +1595,111 @@ function Read-BRAVORestoreState {
     catch { Write-Log -Message "Не вдалося прочитати restore state: $($_.Exception.Message)" -Level 'WARNING'; return $null }
 }
 
-function Write-BRAVORestoreState {
-    param([datetime]$ScheduledOccurrence, [string]$Status, [string]$Reason)
+# Слот, покритий успішною ПРИМУСОВОЮ реставрацією (тижнева квота).
+# Читається StrictMode-безпечно: стан, збережений попередньою версією,
+# цього поля не має — відсутність означає "квота не спожита", тобто рівно
+# попередню поведінку.
+function Get-BRAVORestoreForcedCoveredSlot {
+    param($State)
+
+    if ($null -eq $State) { return $null }
+    if ($null -eq $State.PSObject.Properties['ForcedRestoreCoversSlot']) { return $null }
+    $raw = [string]$State.ForcedRestoreCoversSlot
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    [datetime]$parsed = [datetime]::MinValue
+    if ([datetime]::TryParse(
+            $raw,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$parsed)) {
+        return $parsed
+    }
+    return $null
+}
+
+# Дата ОСТАННЬОЇ успішної реставрації — будь-якої, і планової, і
+# примусової. Окреме поле потрібне тому, що оператору показується "остання:
+# <дата>", а історичне джерело цієї дати (файли restore_done_*.marker)
+# примусову реставрацію не бачить: маркер свідомо створюється лише
+# автоматичним шляхом. Через це реальне повідомлення показувало "ще не
+# виконувалася" через 20 хвилин після успішної примусової реставрації.
+function Get-BRAVORestoreLastSuccessfulAt {
+    param($State)
+
+    if ($null -eq $State) { return $null }
+    if ($null -eq $State.PSObject.Properties['LastSuccessfulRestoreAt']) { return $null }
+    $raw = [string]$State.LastSuccessfulRestoreAt
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+    [datetime]$parsed = [datetime]::MinValue
+    if ([datetime]::TryParse(
+            $raw,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind,
+            [ref]$parsed)) {
+        return $parsed
+    }
+    return $null
+}
+
+# Результат успішної ПРИМУСОВОЇ реставрації: тижнева квота + дата останньої.
+# ScheduledOccurrence/Status/Reason НЕ чіпаються — це принципово: примусова
+# реставрація не закриває плановий слот (маркер і Status='Succeeded'
+# лишаються за автоматичним шляхом), тому записати сюди поточний слот зі
+# старим Status='Succeeded' не можна — $scheduledSucceeded помилково визнав
+# би поточний слот виконаним.
+function Write-BRAVORestoreForcedOutcome {
+    param(
+        [Parameter(Mandatory = $true)][datetime]$CoveredSlot,
+        [Parameter(Mandatory = $true)][datetime]$CompletedAt
+    )
+
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
+    $existing = Read-BRAVORestoreState
+    $state = [pscustomobject]@{
+        ScheduledOccurrence = [string]$(if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['ScheduledOccurrence']) { $existing.ScheduledOccurrence } else { $null })
+        Status = [string]$(if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['Status']) { $existing.Status } else { $null })
+        Reason = [string]$(if ($null -ne $existing -and $null -ne $existing.PSObject.Properties['Reason']) { $existing.Reason } else { $null })
+        ForcedRestoreCoversSlot = $CoveredSlot.ToString('o')
+        LastSuccessfulRestoreAt = $CompletedAt.ToString('o')
+        UpdatedAt = ([datetime]::Now).ToString('o')
+    }
+    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+}
+
+function Write-BRAVORestoreState {
+    param(
+        [datetime]$ScheduledOccurrence,
+        [string]$Status,
+        [string]$Reason
+    )
+    $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
+    if (-not (Test-Path -LiteralPath $stateRoot -PathType Container)) {
+        [void](New-Item -ItemType Directory -Path $stateRoot -Force -ErrorAction Stop)
+    }
+    # Файл перезаписується цілком, а функція викликається і зі статусом
+    # 'Pending' (постановка слоту на паузу), і зі 'Succeeded'. Без цього
+    # переносу будь-який із них тихо стер би тижневу квоту, і планова
+    # реставрація виконалась би вдруге за тиждень.
+    $existingRestoreState = Read-BRAVORestoreState
+    $preservedForcedCoversSlot = Get-BRAVORestoreForcedCoveredSlot -State $existingRestoreState
+    # Дата останньої успішної реставрації оновлюється САМЕ тут для
+    # автоматичного шляху (Status='Succeeded'); при 'Pending' переноситься
+    # попереднє значення. Примусовий шлях пише її через
+    # Write-BRAVORestoreForcedOutcome.
+    $lastSuccessfulRestoreAt = if ($Status -eq 'Succeeded') {
+        [datetime]::Now
+    } else {
+        Get-BRAVORestoreLastSuccessfulAt -State $existingRestoreState
     }
     $state = [pscustomobject]@{
         ScheduledOccurrence = $ScheduledOccurrence.ToString('o')
         Status = $Status
         Reason = $Reason
+        ForcedRestoreCoversSlot = $(if ($null -ne $preservedForcedCoversSlot) { ([datetime]$preservedForcedCoversSlot).ToString('o') } else { $null })
+        LastSuccessfulRestoreAt = $(if ($null -ne $lastSuccessfulRestoreAt) { ([datetime]$lastSuccessfulRestoreAt).ToString('o') } else { $null })
         UpdatedAt = ([datetime]::Now).ToString('o')
     }
     [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
@@ -1759,11 +1907,17 @@ function New-BRAVOMaintenanceCompletedLines {
         [string]$ExchangeCountText
     )
 
-    $statusEmoji = @{ 'OK' = ':white_check_mark:'; 'WARN' = ':warning:'; 'FAIL' = ':x:' }
+    $statusEmoji = @{ 'OK' = ':white_check_mark:'; 'WARN' = ':warning:'; 'FAIL' = ':x:'; 'SKIPPED' = ':fast_forward:' }
     # Порядок = порядок виконання; Steps — імена етапів, що покривають пункт
     # (гірший статус серед них перемагає: FAIL > WARN > OK).
     $map = @(
-        @{ Label = 'Реставрація'; Steps = @('Реставрація моделі'); OkDetail = 'за планом' }
+        # ShowWhenSkipped: реставрація — головна операція Maintenance, і її
+        # ПРОПУСК оператор мусить бачити разом із причиною (тижнева квота,
+        # не плановий день, вікно закрилося). Реальне повідомлення прогону
+        # 22:23 не містило про реставрацію ЖОДНОГО рядка саме тому, що
+        # SKIPPED-етапи мовчки відкидались. Решта етапів залишаються
+        # прихованими при SKIPPED — інакше блок засмічується "вимкнено".
+        @{ Label = 'Реставрація'; Steps = @('Реставрація моделі'); OkDetail = 'за планом'; ShowWhenSkipped = $true }
         @{ Label = '.md-файли'; Steps = @('Перевірка розмірів .md'); OkDetail = 'перевірено' }
         @{ Label = 'Інтервали ID'; Steps = @('Контроль діапазонів ID'); OkDetail = 'у нормі' }
         @{ Label = 'Trace'; Steps = @('Обробка trace і логів', 'Trace: добовий архів і SFTP'); OkDetail = $null }
@@ -1777,15 +1931,25 @@ function New-BRAVOMaintenanceCompletedLines {
 
     foreach ($item in $map) {
         $worst = $null
+        # Етапи з ShowWhenSkipped показуються навіть коли пропущені —
+        # окремим "найгіршим" кандидатом нижчого рангу, щоб реальний
+        # OK/WARN/FAIL будь-якого з Steps завжди його перекривав.
+        $showWhenSkipped = ($null -ne $item['ShowWhenSkipped']) -and [bool]$item['ShowWhenSkipped']
+        $skippedFallback = $null
         foreach ($stepName in @($item.Steps)) {
             $outcome = Get-BRAVOMaintenanceStepOutcome -Name $stepName
-            if ($null -eq $outcome -or [string]$outcome.Status -eq 'SKIPPED') { continue }
+            if ($null -eq $outcome) { continue }
+            if ([string]$outcome.Status -eq 'SKIPPED') {
+                if ($showWhenSkipped -and $null -eq $skippedFallback) { $skippedFallback = $outcome }
+                continue
+            }
             $rank = switch ([string]$outcome.Status) { 'FAIL' { 3 } 'WARN' { 2 } default { 1 } }
             $worstRank = if ($null -eq $worst) { 0 } else {
                 switch ([string]$worst.Status) { 'FAIL' { 3 } 'WARN' { 2 } default { 1 } }
             }
             if ($rank -ge $worstRank) { $worst = $outcome }
         }
+        if ($null -eq $worst) { $worst = $skippedFallback }
         if ($null -eq $worst) { continue }
 
         $status = [string]$worst.Status
@@ -3650,6 +3814,17 @@ function Send-BRAVOTraceArchive {
         $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Trim('/').Replace('\', '/')
         $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
         $remoteArchivePath = "$remoteRoot/$([System.IO.Path]::GetFileName($ArchivePath))"
+        # session.PutFiles НЕ створює відсутні remote-каталоги: реальний
+        # DEV-LIMS прогін падав на кожному запуску з "Cannot create remote
+        # file '/trace/Trace_YYYYMMDD.mdz.new.filepart'. No such file or
+        # directory", бо /trace/ на сервері не існував — і це давало exit 60
+        # обслуговування, яке насправді відпрацювало. Канонічний рекурсивний
+        # creator уже є в BRAVO.BazaSync (duck-typed по $Session, толерантний
+        # до гонки) — використовуємо його, а не другу власну реалізацію.
+        # Викликається ОДИН раз на комплект, до обох передач.
+        if (-not [string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) {
+            New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $normalizedRemoteDirectory
+        }
         $archiveResult = Send-BRAVOTraceArchiveFile `
             -Session $Session `
             -LocalPath $ArchivePath `
@@ -5472,6 +5647,15 @@ function Send-FinalReport {
         if ($script:SlackMode -eq "all") {
             $completedCheckLines = [System.Collections.Generic.List[string]]::new()
             $lastRestoreTime = $restoreCompletedAt
+            # Персистована дата — джерело істини для ОБОХ шляхів: маркери
+            # restore_done_*.marker бачать лише автоматичну реставрацію
+            # (примусова їх свідомо не створює), тому реальне повідомлення
+            # показувало "ще не виконувалася" через 20 хвилин після успішної
+            # примусової. Маркери лишаються legacy-fallback для станів,
+            # записаних попередніми версіями.
+            if ($null -eq $lastRestoreTime) {
+                $lastRestoreTime = Get-BRAVORestoreLastSuccessfulAt -State (Read-BRAVORestoreState)
+            }
             if ($null -eq $lastRestoreTime) {
                 $lastRestoreMarker = @(Get-BRAVOFiles -Path $LOG_DIR -Filter "restore_done_*.marker" |
                     Sort-Object LastWriteTime -Descending |
@@ -5836,7 +6020,24 @@ $scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Pa
 # (BRAVO_RESTORE_STATE.json / маркер конкретного $scheduledOccurrence),
 # тому перевірка на будь-якому з цих прогонів не створює дублювання.
 $missedRestoreDue = $missedRestore
-$automaticRestoreDue = $scheduledRestoreDue -or $missedRestoreDue
+# Тижнева квота: АВТОМАТИЧНА реставрація виконується не частіше разу на
+# тиждень, і успішна ПРИМУСОВА зараховується в цей самий тиждень. Успішний
+# -ForceRestore записує слот, який він покриває (наступний плановий), тому
+# перевірка тут — просте порівняння з поточним слотом, без арифметики
+# "різниця < 7 діб": та дала б межову помилку, коли планова реставрація
+# о 03:20 блокувала б наступну о 03:00 рівно через тиждень.
+#
+# Гейт стоїть саме на $automaticRestoreDue, а не всередині
+# $scheduledSucceeded: $scheduledRestoreDue рахується від СЬОГОДНІШНЬОГО
+# маркера, а не від персистованого стану, тому обійшов би правило в сам
+# плановий день.
+#
+# -ForceRestore квотою НЕ обмежується (окремий диз'юнкт у $shouldRestore
+# нижче): свідома дія оператора може повторюватись будь-скільки разів.
+$forcedRestoreCoveredSlot = Get-BRAVORestoreForcedCoveredSlot -State $restoreState
+$weeklyRestoreQuotaConsumed = ($null -ne $forcedRestoreCoveredSlot) -and
+    ([datetime]$forcedRestoreCoveredSlot -eq $scheduledOccurrence)
+$automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $weeklyRestoreQuotaConsumed
 # Профіль сервера РОБОЧОГО ЧАСУ (Restore.BootRestoreMode="HoldServices"):
 # Recovery-прогін, запущений boot-тригером, ігнорує вікно реставрації —
 # служби (Automatic Delayed Start) ще не запущені, клієнтів у програмі
@@ -6143,6 +6344,17 @@ if ($BravoMaintenanceEnabled) {
     Write-Log -Message "Реставрація моделі: $(if ($shouldRestore) {"АКТИВОВАНА ($restoreReason)"} else {"ВИМКНЕНА"})" -NoTimestamp
     Write-Log -Message "Перевірка розмірів файлів: $(if ($CheckSize) {'УВІМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
     Write-Log -Message "Умови: заданий день=$isRestoreDay, після $RestoreTime=$isAfterRestoreTime; вікно $RestoreWindowStart-$RestoreWindowEnd=$restoreWindowOpen" -NoTimestamp
+    # Пропуск за тижневою квотою — не тиха відмова: без цього рядка оператор
+    # бачив би лише "ВИМКНЕНА" в плановий день і не мав би причини.
+    # INFO, не WARNING: це штатне планове рішення, а не аномалія (той самий
+    # принцип, що для -ForceRestore поза вікном нижче).
+    if ($weeklyRestoreQuotaConsumed) {
+        Write-Log -Message (
+            "Планову реставрацію слоту $($scheduledOccurrence.ToString('yyyy-MM-dd HH:mm')) пропущено: " +
+            "цього тижня вже виконано примусову реставрацію. Автоматична реставрація виконується " +
+            "не частіше разу на тиждень; -ForceRestore обмежень не має."
+        ) -Level "INFO"
+    }
     # Пропуск через вікно — не тиха відмова: без цього рядка оператор бачив
     # би лише "ВИМКНЕНА" й не мав би причини.
     if ($restoreSkippedByWindow) {
@@ -6152,10 +6364,21 @@ if ($BravoMaintenanceEnabled) {
         ) -Level "WARNING"
     }
     if ($ForceRestore -and -not $restoreWindowOpen) {
+        # INFO, не WARNING: це констатація СВІДОМОЇ дії оператора (він сам
+        # передав -ForceRestore), а не аномалія. Будь-який WARNING інкрементує
+        # $script:BRAVOWarningCount (Write-Log вище), а той піднімає severity
+        # сповіщення й дає exit 10 (SuccessWithWarnings) — реальний DEV-LIMS
+        # прогін 20:29 показав оператору жовте "ПОТРІБНА ДІЯ: перевірити
+        # журнал" при повністю зеленому списку етапів, без жодної підказки,
+        # що саме не так. Текст лишається в лозі повністю — змінюється лише
+        # рівень, тобто участь у severity/exit-коді.
+        #
+        # Сусідня гілка $restoreSkippedByWindow свідомо ЛИШАЄТЬСЯ WARNING:
+        # там реставрацію НЕ виконано попри план, і оператор мусить дізнатись.
         Write-Log -Message (
             "Примусова реставрація поза дозволеним вікном $RestoreWindowStart-$RestoreWindowEnd " +
             "(поточний час $($currentDate.ToString('HH:mm'))): служби BRAVO будуть зупинені."
-        ) -Level "WARNING"
+        ) -Level "INFO"
     }
     if (-not $maintenanceDailyAtInsideRestoreWindow) {
         # INFO, не WARNING: Recovery-таск має власний daily trigger саме на
@@ -6465,7 +6688,7 @@ if ($script:BRAVOMaintenanceMigrationStepEnabled) {
     # увімкнена, але досі мала лише LOG-видимість. WARN, а не FAIL: невдала
     # міграція не критична (semantics вище незмінні — це той самий
     # $migrationFailedTotal, що вже керував рівнем LOG-повідомлення).
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Міграція старих журналів' `
         -Status $(if ($migrationFailedTotal -gt 0) { 'WARN' } else { 'OK' }) `
         -Duration ((Get-Date) - $migrationOperationStartedAt) `
@@ -6480,7 +6703,7 @@ if ($script:BRAVOMaintenanceMigrationStepEnabled) {
     # dev.16: немає застарілих каталогів для міграції цього прогону —
     # той самий SKIPPED/'не заплановано на цей запуск' контраст, що вже
     # застосований до Restore/SizeCheck/Logs/RangeId.
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Міграція старих журналів' `
         -Status 'SKIPPED' `
         -Duration ((Get-Date) - $migrationOperationStartedAt) `
@@ -6804,7 +7027,9 @@ $restoreMainModelValid = $true
 $restoreAbortedBeforeDestructivePhase = $false
 # Базові лічильники етапу «Обробка trace і логів» — до розгалуження за
 # станом служби: підсумок етапу друкується в усіх гілках, зокрема й тоді,
-# коли BRAVO зупинити не вдалося.
+# коли BRAVO зупинити не вдалося. Тут лише ІНІЦІАЛІЗАЦІЯ (щоб під
+# Set-StrictMode змінні існували в кожній гілці рендеру); справжній зріз
+# знімається безпосередньо перед фазою обробки логів — див. нижче.
 $logsCriticalBefore = $script:criticalErrorOccurred
 $logsWarningsBefore = $script:BRAVOWarningCount
 $bravoStatus = if ($BravoMaintenanceEnabled) { (Get-Service -Name $BravoServiceName).Status } else { 'Unavailable' }
@@ -7083,6 +7308,20 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                                 -ErrorAction Stop
                             Write-BRAVORestoreState -ScheduledOccurrence $scheduledOccurrence -Status 'Succeeded' -Reason $restoreReason
                             Write-Log -Message "Створено маркерний файл: $MARKER_FILE" -Level "SUCCESS"
+                        } elseif ($afterArchiveReady -and $ForceRestore) {
+                            # Примусова реставрація свідомо НЕ закриває плановий
+                            # слот (маркер і Status='Succeeded' лишаються за
+                            # автоматичним шляхом), але СПОЖИВАЄ тижневу квоту:
+                            # модель уже реставрували, тож наступний плановий
+                            # слот пропускається. Записуємо саме той слот, який
+                            # покрито, — наступний після поточного.
+                            $forcedCoversSlot = $scheduledOccurrence.AddDays(7)
+                            Write-BRAVORestoreForcedOutcome -CoveredSlot $forcedCoversSlot -CompletedAt ([datetime]::Now)
+                            Write-Log -Message (
+                                "Примусова реставрація виконана успішно: плановий слот " +
+                                "$($forcedCoversSlot.ToString('yyyy-MM-dd HH:mm')) буде пропущено " +
+                                "(автоматична реставрація — не частіше разу на тиждень)."
+                            ) -Level "INFO"
                         }
                     } else {
                         # Реставрація НЕ успішна: bravocmd перервано/впав, або
@@ -7164,6 +7403,16 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
     }
 
     # Обробка Trace належить лише до компонента основної служби BRAVO.
+    #
+    # Зріз лічильників пересвіжується САМЕ ТУТ, після завершення
+    # реставрації: початкова ініціалізація вище знімається ДО неї, тому
+    # критична помилка реставрації опинялася "новою" для цього етапу і
+    # фарбувала його в FAIL. Реальний DEV-LIMS негативний прогін 19:48
+    # (bravocmd вбито -> exit 43) показав [6/8] FAIL з деталями
+    # "оброблено файлів: 2" — тобто етап відпрацював, а червоним був через
+    # чужу помилку. Статус етапу мусить відображати ЙОГО ВЛАСНИЙ результат.
+    $logsCriticalBefore = $script:criticalErrorOccurred
+    $logsWarningsBefore = $script:BRAVOWarningCount
     Write-BRAVOProgressPhase -Phase 'Обробка trace і логів' -PercentComplete 60
     try {
         if ($BravoMaintenanceEnabled) {
@@ -7318,6 +7567,7 @@ if (-not $restoreStepReported) {
         -Details $(
             if ($restorePostponedByWindowClosing) { 'вікно закрилося під час очікування lock/підготовки' }
             elseif ($shouldRestore) { 'службу BRAVO не було зупинено' }
+            elseif ($weeklyRestoreQuotaConsumed) { 'цього тижня вже виконано примусову' }
             else { 'не заплановано на цей запуск' }
         )
 }
@@ -7590,14 +7840,14 @@ $traceArchiveCriticalBefore = $script:criticalErrorOccurred
 $traceArchiveWarningsBefore = $script:BRAVOWarningCount
 $traceArchiveOperationDetail = $null
 if (-not $BravoMaintenanceEnabled) {
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Trace: добовий архів і SFTP' `
         -Status 'SKIPPED' `
         -Duration ((Get-Date) - $traceArchiveOperationStartedAt) `
         -Details 'вимкнено'
 } elseif ([string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
     Write-Log -Message "Trace: добова архівація пропущена — пароль архівів недоступний ($ArchiveCredentialError)" -Level "WARNING"
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Trace: добовий архів і SFTP' `
         -Status 'WARN' `
         -Duration ((Get-Date) - $traceArchiveOperationStartedAt) `
@@ -7699,7 +7949,7 @@ if (-not $BravoMaintenanceEnabled) {
             }
         }
     }
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Trace: добовий архів і SFTP' `
         -Status (Get-BRAVOMaintenanceStepStatus `
             -CriticalBefore $traceArchiveCriticalBefore `
@@ -7717,7 +7967,7 @@ $script:currentMaintenanceOperation = 'Очистка старих даних/л
 $cleanupOperationStartedAt = Get-Date
 $cleanupCriticalBefore = $script:criticalErrorOccurred
 $cleanupWarningsBefore = $script:BRAVOWarningCount
-# "Reported" — чи встиг цей блок надрукувати свій Write-BRAVOOperationResult
+# "Reported" — чи встиг цей блок надрукувати свій Write-BRAVOMaintenanceOperation
 # до того, як (якщо) стався виняток: outer catch перевіряє прапорець, щоб
 # не показати FAIL result двічі й не пропустити його, якщо виняток стався
 # ДО власного рендеру блоку.
@@ -7965,7 +8215,7 @@ $cleanupOperationDetails = if ($cleanupOperationStatus -eq 'SKIPPED') {
     }
     if ($cleanupDetailParts.Count -gt 0) { $cleanupDetailParts -join '; ' } else { $null }
 }
-Write-BRAVOOperationResult `
+Write-BRAVOMaintenanceOperation `
     -Name 'Очистка старих даних/логів' `
     -Status $cleanupOperationStatus `
     -Duration ((Get-Date) - $cleanupOperationStartedAt) `
@@ -8023,7 +8273,7 @@ if ($script:EnableArchiveAfterMaintenance) {
     # не рахується в Кроків/Успішно/Попереджень/Пропущено/Помилок).
     # Дочірній процес/lock/exit-code semantics вище не змінені — лише
     # обгорнуті трекінгом статусу/тривалості для консолі.
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Архівація після maintenance' `
         -Status (Get-BRAVOMaintenanceStepStatus `
             -CriticalBefore $archiveCriticalBefore `
@@ -8034,7 +8284,7 @@ if ($script:EnableArchiveAfterMaintenance) {
 } else {
     # Лише у журнал: вимкнений компонент не займає рядка в консолі.
     Write-Log -Message "Запуск BRAVO_ARCHIV: вимкнено" -Level "DEBUG"
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Архівація після maintenance' `
         -Status 'SKIPPED' `
         -Duration ((Get-Date) - $archiveOperationStartedAt) `
@@ -8053,7 +8303,7 @@ if ($script:EnableAutoShutdown) {
     # інтерактивним скасуванням, а не тільки той факт, що виклик колись
     # відбувся. Сама логіка планування/діалогу/скасування не змінена.
     $autoShutdownOutcome = Invoke-AutoShutdown -Timeout $ShutdownTimeout
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Автоматичне вимкнення сервера' `
         -Status $(switch ($autoShutdownOutcome) {
             'Scheduled' { 'OK' }
@@ -8070,7 +8320,7 @@ if ($script:EnableAutoShutdown) {
 } else {
     # Мінімальне інформаційне повідомлення без заголовків
     Write-Log -Message "Автоматичне вимкнення: вимкнено" -Level "DEBUG"
-    Write-BRAVOOperationResult `
+    Write-BRAVOMaintenanceOperation `
         -Name 'Автоматичне вимкнення сервера' `
         -Status 'SKIPPED' `
         -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
@@ -8149,7 +8399,7 @@ if (-not $script:criticalErrorOccurred) {
         switch ($script:currentMaintenanceOperation) {
             'Очистка старих даних/логів' {
                 if (-not $script:cleanupOperationReported) {
-                    Write-BRAVOOperationResult `
+                    Write-BRAVOMaintenanceOperation `
                         -Name 'Очистка старих даних/логів' `
                         -Status 'FAIL' `
                         -Duration ((Get-Date) - $cleanupOperationStartedAt) `
@@ -8158,7 +8408,7 @@ if (-not $script:criticalErrorOccurred) {
             }
             'Архівація після maintenance' {
                 if (-not $script:archiveOperationReported) {
-                    Write-BRAVOOperationResult `
+                    Write-BRAVOMaintenanceOperation `
                         -Name 'Архівація після maintenance' `
                         -Status 'FAIL' `
                         -Duration ((Get-Date) - $archiveOperationStartedAt) `
@@ -8167,7 +8417,7 @@ if (-not $script:criticalErrorOccurred) {
             }
             'Автоматичне вимкнення сервера' {
                 if (-not $script:autoShutdownOperationReported) {
-                    Write-BRAVOOperationResult `
+                    Write-BRAVOMaintenanceOperation `
                         -Name 'Автоматичне вимкнення сервера' `
                         -Status 'FAIL' `
                         -Duration ((Get-Date) - $autoShutdownOperationStartedAt) `
@@ -8252,8 +8502,15 @@ Write-BRAVOResultBlankLine
 # dev.14 (round 2): той самий підхід, що Health (Перевірок/Успішно/
 # Попереджень/Помилок, ConsoleUX/15-HealthSummaryCounters) — тут ще й
 # Пропущено, бо, на відміну від Health, Maintenance регулярно показує
-# SKIPPED-кроки. Лічильники накопичуються у Write-BRAVOMaintenanceStep.
-Write-BRAVOResultField -Label 'Кроків' -Value ([string]$script:BRAVOMaintenanceStepCurrent)
+# SKIPPED-кроки. Лічильники накопичуються в Add-BRAVOMaintenanceStepOutcome
+# — спільній точці обліку пронумерованих кроків І ненумерованих операцій.
+#
+# "Кроків" береться з довжини журналу етапів, а НЕ з нумератора
+# $script:BRAVOMaintenanceStepCurrent: той рахує лише пронумеровані [N/8],
+# тому після включення ненумерованих операцій в облік підсумок ставав
+# арифметично неспроможним (реальний прогін 20:29 показав "Кроків: 8" при
+# "Успішно: 9" + "Пропущено: 4").
+Write-BRAVOResultField -Label 'Кроків' -Value ([string]$script:BRAVOMaintenanceStepLog.Count)
 Write-BRAVOResultField -Label 'Успішно' -Value ([string]$script:BRAVOMaintenanceStepOkCount)
 Write-BRAVOResultField -Label 'Попереджень' -Value ([string]$script:BRAVOMaintenanceStepWarnCount)
 Write-BRAVOResultField -Label 'Пропущено' -Value ([string]$script:BRAVOMaintenanceStepSkippedCount)
