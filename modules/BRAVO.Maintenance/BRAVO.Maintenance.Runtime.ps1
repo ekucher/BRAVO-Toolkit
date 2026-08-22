@@ -6844,7 +6844,9 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
         # виставляє незалежна Trace-архівація через Invoke-CommandWithLog
         # (напр. рядок ~3315). Розширювати гейт на такі несуміжні збої не
         # потрібно — лише на збій САМЕ цієї restore-сесії.
-        $restoreSessionUnsafeForRetention = $shouldRestore -and (
+        # Умова обчислюється всередині if ($shouldRestore) — додатковий
+        # $shouldRestore тут завжди був true.
+        $restoreSessionUnsafeForRetention = (
             ($script:restoreArchiveFailed -and -not $restoreArchiveFailedBefore) -or
             ($script:restoreIntegrityFailed -and -not $restoreIntegrityFailedBefore)
         )

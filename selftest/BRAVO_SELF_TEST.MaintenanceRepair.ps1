@@ -341,53 +341,86 @@ function Invoke-WebRequest {
     }
     return [PSCustomObject]@{ StatusCode = 200; Content = '' }
 }
+function Start-Sleep {
+    param([long]$Milliseconds = 0, [long]$Seconds = 0)
+    $script:BRAVOFakeSleepTotalMs += $Milliseconds + ($Seconds * 1000)
+}
 '@
 $webhookModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($webhookStubText + "`n" + $compatibilityScriptText) `
-    -FunctionNames @('New-BRAVOFake429Exception', 'Invoke-WebRequest', 'Enable-BRAVOTls12', 'Send-BRAVOWebhookNotification')
+    -FunctionNames @('New-BRAVOFake429Exception', 'Invoke-WebRequest', 'Start-Sleep', 'Enable-BRAVOTls12', 'Send-BRAVOWebhookNotification')
 
-# --- 429 один раз, потім успіх -> рівно 2 спроби, успіх.
-$webhookRetrySuccessThrew = $false
-$webhookRetrySuccessError = $null
-$webhookRetrySuccessCallCount = & $webhookModule {
-    param($FailCount, $RetryAfter)
-    Set-StrictMode -Version Latest
-    $script:BRAVOFakeWebRequestCallCount = 0
-    $script:BRAVOFakeWebRequest429Count = $FailCount
-    $script:BRAVOFakeWebRequestRetryAfter = $RetryAfter
-    try {
-        Send-BRAVOWebhookNotification -Provider "discord" -WebhookUrl "https://discord.example.invalid/webhook" -Message "test"
-    } catch {
-        $script:BRAVOFakeWebhookRetryThrew = $true
-        $script:BRAVOFakeWebhookRetryError = $_.Exception.Message
-    }
-    $script:BRAVOFakeWebRequestCallCount
-} 1 '0'
+function Invoke-BRAVOWebhook429Scenario {
+    param(
+        [int]$FailCount,
+        [string]$RetryAfter
+    )
+    return & $webhookModule {
+        param($FailCount, $RetryAfter)
+        Set-StrictMode -Version Latest
+        $script:BRAVOFakeWebRequestCallCount = 0
+        $script:BRAVOFakeWebRequest429Count = $FailCount
+        $script:BRAVOFakeWebRequestRetryAfter = $RetryAfter
+        $script:BRAVOFakeSleepTotalMs = [long]0
+        $threw = $false
+        $errorMessage = $null
+        try {
+            Send-BRAVOWebhookNotification -Provider "discord" -WebhookUrl "https://discord.example.invalid/webhook" -Message "test"
+        } catch {
+            $threw = $true
+            $errorMessage = $_.Exception.Message
+        }
+        [PSCustomObject]@{
+            Threw = $threw
+            ErrorMessage = $errorMessage
+            CallCount = $script:BRAVOFakeWebRequestCallCount
+            SleepTotalMs = $script:BRAVOFakeSleepTotalMs
+        }
+    } $FailCount $RetryAfter
+}
+
+# --- 429 один раз, потім успіх -> рівно 2 спроби, БЕЗ помилки.
+$webhookRetrySuccess = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '0'
 Test-BRAVOCondition `
-    -Condition ($webhookRetrySuccessCallCount -eq 2) `
+    -Condition (-not $webhookRetrySuccess.Threw -and $webhookRetrySuccess.CallCount -eq 2) `
     -Name "Notifications/Discord429RetryThenSuccess" `
-    -Failure "429 з Retry-After на першій спробі має призвести до рівно 2 викликів Invoke-WebRequest (1 невдала + 1 успішна); отримано: $webhookRetrySuccessCallCount"
+    -Failure "429 з Retry-After на першій спробі має призвести до рівно 2 викликів Invoke-WebRequest без помилки; отримано Threw=$($webhookRetrySuccess.Threw) '$($webhookRetrySuccess.ErrorMessage)', CallCount=$($webhookRetrySuccess.CallCount)"
 
 # --- 429 постійно -> обмежена невдача (макс. 4 спроби, без нескінченного
-# retry), помилка прокидається виклику.
-$webhookRetryExhaustedResult = & $webhookModule {
-    param($FailCount, $RetryAfter)
-    Set-StrictMode -Version Latest
-    $script:BRAVOFakeWebRequestCallCount = 0
-    $script:BRAVOFakeWebRequest429Count = $FailCount
-    $script:BRAVOFakeWebRequestRetryAfter = $RetryAfter
-    $threw = $false
-    try {
-        Send-BRAVOWebhookNotification -Provider "discord" -WebhookUrl "https://discord.example.invalid/webhook" -Message "test"
-    } catch {
-        $threw = $true
-    }
-    [PSCustomObject]@{ Threw = $threw; CallCount = $script:BRAVOFakeWebRequestCallCount }
-} 99 '0'
+# retry), помилка прокидається виклику і ЯВНО називає rate limit та
+# кількість спроб (діагностика для оператора, а не генерична помилка).
+$webhookRetryExhaustedResult = Invoke-BRAVOWebhook429Scenario -FailCount 99 -RetryAfter '0'
 Test-BRAVOCondition `
     -Condition ($webhookRetryExhaustedResult.Threw -and $webhookRetryExhaustedResult.CallCount -eq 4) `
     -Name "Notifications/Discord429RetryBoundedNoInfiniteLoop" `
     -Failure "постійний 429 має призвести до РІВНО 4 спроб сумарно (без нескінченного retry) і помилка має прокидатись виклику; отримано Threw=$($webhookRetryExhaustedResult.Threw), CallCount=$($webhookRetryExhaustedResult.CallCount)"
+Test-BRAVOCondition `
+    -Condition ($webhookRetryExhaustedResult.ErrorMessage -match '429' -and $webhookRetryExhaustedResult.ErrorMessage -match '4\s*спроб') `
+    -Name "Notifications/Discord429ExhaustionErrorNamesRateLimitAndAttempts" `
+    -Failure "помилка після вичерпання ретраїв має містити '429' і кількість спроб; отримано: '$($webhookRetryExhaustedResult.ErrorMessage)'"
+
+# --- Великий серверний Retry-After (Cloudflare-фронт Discord повертає і
+# 1800с) має обмежуватись капом 30с: сумарний сон = 30.25с, а не 30 хвилин
+# синхронного сну під час зупинених служб BRAVO. Кап заодно виключає
+# OverflowException у [int]-конвертації мілісекунд.
+$webhookLargeRetryAfter = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '1800'
+Test-BRAVOCondition `
+    -Condition (-not $webhookLargeRetryAfter.Threw -and $webhookLargeRetryAfter.SleepTotalMs -eq 30250) `
+    -Name "Notifications/DiscordLargeRetryAfterCappedAt30s" `
+    -Failure "Retry-After=1800 має капатись до 30с (сон 30250мс з буфером 0.25с); отримано Threw=$($webhookLargeRetryAfter.Threw), SleepTotalMs=$($webhookLargeRetryAfter.SleepTotalMs)"
+
+# --- Дробовий Retry-After "1.5" парситься через InvariantCulture (крапка
+# як десятковий роздільник) незалежно від локалі хоста: сон 1.75с, а не
+# фолбек 1с+0.25 через невдалий culture-залежний парсинг.
+$webhookFractionalRetryAfter = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '1.5'
+Test-BRAVOCondition `
+    -Condition (-not $webhookFractionalRetryAfter.Threw -and $webhookFractionalRetryAfter.SleepTotalMs -eq 1750) `
+    -Name "Notifications/DiscordFractionalRetryAfterInvariantCulture" `
+    -Failure "Retry-After='1.5' має давати сон 1750мс (InvariantCulture-парсинг), а не фолбек 1250мс; отримано SleepTotalMs=$($webhookFractionalRetryAfter.SleepTotalMs)"
+Test-BRAVOCondition `
+    -Condition $compatibilityScriptText.Contains('[Globalization.CultureInfo]::InvariantCulture') `
+    -Name "Notifications/DiscordRetryAfterParseUsesInvariantCulture" `
+    -Failure "парсинг Retry-After має використовувати InvariantCulture-перевантаження TryParse (culture-залежне на uk-UA не парсить '1.5')"
 
 # --- Non-429 помилка НЕ ретраїться (rethrow одразу, без затримки).
 $webhookNon429Result = & $webhookModule {

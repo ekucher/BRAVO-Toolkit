@@ -2289,17 +2289,35 @@ function Send-BRAVOWebhookNotification {
             if ($null -ne $webResponse) {
                 try { $statusCode = [int]$webResponse.StatusCode } catch { $statusCode = $null }
             }
-            if ($statusCode -ne 429 -or $webhookAttempt -ge $maxWebhookAttempts) {
+            if ($statusCode -ne 429) {
                 throw
+            }
+            if ($webhookAttempt -ge $maxWebhookAttempts) {
+                # Оператор має бачити, що це саме rate limit і скільки спроб
+                # зроблено, а не генеричну помилку webhook.
+                throw "Webhook $Provider`: HTTP 429 після $maxWebhookAttempts спроб (rate limit не знято): $($_.Exception.Message)"
             }
 
             $retryAfterSeconds = $null
             if ($null -ne $webResponse -and $null -ne $webResponse.Headers) {
                 $retryAfterRaw = $webResponse.Headers["Retry-After"]
                 if (-not [string]::IsNullOrWhiteSpace($retryAfterRaw)) {
+                    # InvariantCulture: на uk-UA (десяткова кома) дробове
+                    # "1.5" інакше не парситься і мовчки деградує до фолбеку.
                     $parsedRetryAfter = 0.0
-                    if ([double]::TryParse($retryAfterRaw, [ref]$parsedRetryAfter) -and $parsedRetryAfter -ge 0) {
-                        $retryAfterSeconds = $parsedRetryAfter
+                    if ([double]::TryParse($retryAfterRaw,
+                            [Globalization.NumberStyles]::Float,
+                            [Globalization.CultureInfo]::InvariantCulture,
+                            [ref]$parsedRetryAfter) -and $parsedRetryAfter -ge 0) {
+                        # Кап 30с і на серверний Retry-After: Cloudflare-фронт
+                        # Discord повертає й великі значення (1800с) — синхронний
+                        # сон на годину під час зупинених служб BRAVO заради
+                        # вторинної нотифікації неприпустимий. Кап заодно усуває
+                        # OverflowException у [int]-конвертації мілісекунд нижче.
+                        # 30.0 (double), не 30 (int): інакше PowerShell обирає
+                        # перевантаження Min(int,int) і округлює дробові
+                        # значення (1.5 -> 2).
+                        $retryAfterSeconds = [math]::Min(30.0, $parsedRetryAfter)
                     }
                 }
             }
