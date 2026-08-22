@@ -1416,18 +1416,19 @@ try {
             $maintenanceRuntimeTextForExitCodes.Contains('$script:restoreIntegrityFailed') -and
             $maintenanceRuntimeTextForExitCodes.Contains('-LocalArchiveFailed:$script:restoreArchiveFailed') -and
             $maintenanceRuntimeTextForExitCodes.Contains('-IntegrityTestFailed:$script:restoreIntegrityFailed') -and
-            # 11-та точка (5.2.0): скасування реставрації перед bravocmd через
-            # збій переведення quiescence-маркера в suppressed (fail-closed).
-            # 10-та точка restoreIntegrityFailed (fix/repair-rollback-false-
-            # positive): каталог MODEL порожній після repair — Compare-FileSizes
-            # тепер розрізняє RemovedByRepair (не критично) від справжнього
-            # пошкодження, і ця нова defense-in-depth перевірка додає рівно
-            # одне нове critical-присвоєння, а не ще один "будь-який missing".
+            # Провал реставрації, що потребував відкату, мапиться на
+            # RestoreFailed (43) — окремо від збою СТВОРЕННЯ архіву (40).
+            $maintenanceRuntimeTextForExitCodes.Contains('-RestoreFailed:$script:restoreFailed') -and
+            # 11 точок restoreArchiveFailed; 11 точок restoreIntegrityFailed.
+            # +1 integrity проти fix/repair-rollback-false-positive:
+            # Invoke-BRAVOModelRestoreRecovery після успішного відкату повторно
+            # валідує модель і, якщо вона ВСЕ ОДНО не консистентна, позначає
+            # restoreIntegrityFailed (rollback=FAILED, служби гейтуються).
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 11)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
-        -Failure "Maintenance має розрізняти локальну архівацію (40) і перевірку цілісності (41) відновлення, а не зводити все до 60"
+        -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
     Test-BRAVOCondition `
         -Condition (
             $archiveRuntimeTextForExitCodes -match

@@ -62,7 +62,7 @@ $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
         'Format-CommandOutput', 'Format-FileSize',
         'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes',
         'Invoke-CommandWithLog', 'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
-        'Restore-FromArchive'
+        'Restore-FromArchive', 'Invoke-BRAVOModelRestoreRecovery'
     )
 # Module-scope стан, який реальні функції читають без параметрів. Пароль
 # непорожній і йде через stdin (голий -p в аргументах) — точно та сама
@@ -247,5 +247,131 @@ try {
         Remove-Item -LiteralPath $restoreSyntheticRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# ============================================================
+# Invoke-BRAVOModelRestoreRecovery: єдина точка «перевірити → відкотити»
+# для обох шляхів (repair exit 0 та перерваний exit≠0). Кожен сценарій —
+# власна синтетична модель + справжній before-архів (7za, пароль stdin).
+# ============================================================
+function Invoke-BRAVORestoreRecoveryScenario {
+    param(
+        [int]$BravocmdExitCode,
+        [scriptblock]$Damage,             # приймає $ModelDir; мутує модель ПІСЛЯ архіву
+        [switch]$CorruptBeforeArchive,    # зіпсувати before-архів (rollback має провалитись)
+        [switch]$AddOrphan                # додати orphan-сегмент, відсутній в архіві
+    )
+    $root = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RESTORE_RECOVERY_{0}" -f [guid]::NewGuid().ToString("N"))
+    $model = Join-Path $root 'MODEL'
+    [void][IO.Directory]::CreateDirectory($model)
+    try {
+        $files = [ordered]@{
+            'TestProject.md' = 4MB; 'TestProject0.md' = 1MB; 'DEPART.md' = 512KB
+            'ACT.000' = 256KB; 'ACT.002' = 128KB; 'TestProject.h1' = 64KB
+        }
+        $rnd = New-Object System.Random 424242
+        foreach ($n in $files.Keys) {
+            $b = New-Object byte[] ([int]$files[$n]); $rnd.NextBytes($b)
+            [IO.File]::WriteAllBytes((Join-Path $model $n), $b)
+        }
+        $origHashes = @{}
+        foreach ($n in $files.Keys) { $origHashes[$n] = (Get-FileHash -LiteralPath (Join-Path $model $n) -Algorithm SHA256).Hash }
+
+        $beforeCsv = Join-Path $root 'before_sizes.csv'
+        $files.Keys | ForEach-Object { [PSCustomObject]@{ RelativePath = $_; SizeBytes = [long]$files[$_] } } |
+            Export-Csv -Path $beforeCsv -NoTypeInformation -Encoding UTF8
+
+        $beforeArchive = Join-Path $root 'model_before.7z'
+        $archiveExit = & $restoreSyntheticModule {
+            param($SevenZip, $ArchivePath, $ModelDir)
+            Set-StrictMode -Version Latest
+            Invoke-CommandWithLog -Command $SevenZip -Arguments @('a', '-t7z', '-mx=1', '-y', '-p', $ArchivePath, "$ModelDir\*") `
+                -Description 'recovery-scenario before-архів' -TimeoutSeconds 300 -StandardInputText $script:ArchivePassword
+        } $restoreSyntheticSevenZip $beforeArchive $model
+        if ($archiveExit -ne 0) { throw "recovery-scenario: не вдалося створити before-архів (exit $archiveExit)" }
+
+        if ($CorruptBeforeArchive) {
+            $fs = [IO.File]::Open($beforeArchive, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite)
+            try { [void]$fs.Seek([long]($fs.Length / 2), [IO.SeekOrigin]::Begin); $g = New-Object byte[] 512; $rnd.NextBytes($g); $fs.Write($g, 0, $g.Length) } finally { $fs.Dispose() }
+        }
+        if ($AddOrphan) {
+            $ob = New-Object byte[] 100000; $rnd.NextBytes($ob)
+            [IO.File]::WriteAllBytes((Join-Path $model 'ORPHAN.099'), $ob)
+        }
+        if ($Damage) { & $Damage $model }
+
+        $recovery = & $restoreSyntheticModule {
+            param($ExitCode, $BeforeFile, $ModelPath, $BeforeArchivePath, $SevenZip)
+            Set-StrictMode -Version Latest
+            Invoke-BRAVOModelRestoreRecovery -BravocmdExitCode $ExitCode -BeforeFile $BeforeFile -ModelPath $ModelPath `
+                -MainModelRelativePath 'TestProject.md' -BeforeArchivePath $BeforeArchivePath -ARC_PATH $SevenZip -MinSizeBytes 2048
+        } $BravocmdExitCode $beforeCsv $model $beforeArchive $restoreSyntheticSevenZip
+
+        # Стан моделі ПІСЛЯ recovery (для перевірок байт-точності/orphan).
+        $byteExact = $true
+        foreach ($n in $files.Keys) {
+            $fp = Join-Path $model $n
+            if (-not (Test-Path -LiteralPath $fp) -or (Get-FileHash -LiteralPath $fp -Algorithm SHA256).Hash -ne $origHashes[$n]) { $byteExact = $false; break }
+        }
+        $orphanPresent = Test-Path -LiteralPath (Join-Path $model 'ORPHAN.099')
+        return [PSCustomObject]@{ Recovery = $recovery; ByteExact = $byteExact; OrphanPresent = $orphanPresent }
+    } finally {
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+# --- exit≠0 + модель ЦІЛА -> без відкату, цілісність встановлено.
+$recIntact = Invoke-BRAVORestoreRecoveryScenario -BravocmdExitCode 1
+Test-BRAVOCondition `
+    -Condition ($recIntact.Recovery.IntegrityEstablished -and $recIntact.Recovery.RollbackStatus -eq 'NONE' -and -not $recIntact.Recovery.HasCriticalChanges) `
+    -Name "RestoreSynthetic/RecoveryInterruptedButModelIntact" `
+    -Failure "перерваний bravocmd (exit≠0) при цілій моделі: без відкату, IntegrityEstablished=true; отримано Integrity=$($recIntact.Recovery.IntegrityEstablished), Rollback=$($recIntact.Recovery.RollbackStatus)"
+
+# --- exit≠0 + пошкоджена (main .md -> 2KB) + валідний before-архів ->
+# відкат SUCCESS, цілісність встановлено, файли байт-точно відновлені.
+$recDamaged = Invoke-BRAVORestoreRecoveryScenario -BravocmdExitCode 1 -Damage {
+    param($m) [IO.File]::WriteAllBytes((Join-Path $m 'TestProject.md'), (New-Object byte[] 2048))
+}
+Test-BRAVOCondition `
+    -Condition ($recDamaged.Recovery.IntegrityEstablished -and $recDamaged.Recovery.RollbackStatus -eq 'SUCCESS' -and $recDamaged.ByteExact) `
+    -Name "RestoreSynthetic/RecoveryDamagedRollbackSucceeds" `
+    -Failure "пошкоджена модель + валідний before-архів: відкат SUCCESS, байт-точно; отримано Integrity=$($recDamaged.Recovery.IntegrityEstablished), Rollback=$($recDamaged.Recovery.RollbackStatus), ByteExact=$($recDamaged.ByteExact)"
+
+# --- exit≠0 + пошкоджена + ПОШКОДЖЕНИЙ before-архів -> відкат FAILED,
+# цілісність НЕ встановлено (гейт служб спрацює), модель НЕ очищено.
+$recNoArchive = Invoke-BRAVORestoreRecoveryScenario -BravocmdExitCode 1 -CorruptBeforeArchive -Damage {
+    param($m) [IO.File]::WriteAllBytes((Join-Path $m 'TestProject.md'), (New-Object byte[] 2048))
+}
+Test-BRAVOCondition `
+    -Condition (-not $recNoArchive.Recovery.IntegrityEstablished -and $recNoArchive.Recovery.RollbackStatus -eq 'FAILED') `
+    -Name "RestoreSynthetic/RecoveryDamagedRollbackFailsFailClosed" `
+    -Failure "пошкоджена модель + невалідний before-архів: IntegrityEstablished=false, Rollback=FAILED (fail-closed); отримано Integrity=$($recNoArchive.Recovery.IntegrityEstablished), Rollback=$($recNoArchive.Recovery.RollbackStatus)"
+
+# --- exit 0 + критичні зміни -> відкат (регресія наявного шляху через
+# нову спільну функцію).
+$recExit0Critical = Invoke-BRAVORestoreRecoveryScenario -BravocmdExitCode 0 -Damage {
+    param($m) [IO.File]::WriteAllBytes((Join-Path $m 'TestProject.md'), (New-Object byte[] 2048))
+}
+Test-BRAVOCondition `
+    -Condition ($recExit0Critical.Recovery.RollbackStatus -eq 'SUCCESS' -and $recExit0Critical.Recovery.IntegrityEstablished -and $recExit0Critical.ByteExact) `
+    -Name "RestoreSynthetic/RecoveryExit0CriticalRollback" `
+    -Failure "exit 0 з критичними змінами: відкат SUCCESS, байт-точно; отримано Rollback=$($recExit0Critical.Recovery.RollbackStatus), ByteExact=$($recExit0Critical.ByteExact)"
+
+# --- clean→extract прибирає orphan-сегмент, якого немає в архіві.
+$recOrphan = Invoke-BRAVORestoreRecoveryScenario -BravocmdExitCode 1 -AddOrphan -Damage {
+    param($m) [IO.File]::WriteAllBytes((Join-Path $m 'TestProject.md'), (New-Object byte[] 2048))
+}
+Test-BRAVOCondition `
+    -Condition ($recOrphan.Recovery.RollbackStatus -eq 'SUCCESS' -and $recOrphan.ByteExact -and -not $recOrphan.OrphanPresent) `
+    -Name "RestoreSynthetic/RecoveryCleanRemovesOrphan" `
+    -Failure "clean→extract має прибрати orphan-файл (ORPHAN.099), відсутній в архіві; отримано Rollback=$($recOrphan.Recovery.RollbackStatus), ByteExact=$($recOrphan.ByteExact), OrphanPresent=$($recOrphan.OrphanPresent)"
+
+# --- Анкери коду: before-CSV+Compare розчеплені від CheckSize; гейт служб.
+Test-BRAVOCondition `
+    -Condition (
+        $restoreSyntheticRuntimeText.Contains('$recovery = Invoke-BRAVOModelRestoreRecovery') -and
+        $restoreSyntheticRuntimeText.Contains('$script:modelIntegrityEstablished -and $serviceWasRunning.Bravo')
+    ) `
+    -Name "RestoreSynthetic/ServiceRestartGatedByIntegrity" `
+    -Failure 'рестарт BRAVO має бути гейтований на $script:modelIntegrityEstablished, а recovery — через Invoke-BRAVOModelRestoreRecovery'
 
 }
