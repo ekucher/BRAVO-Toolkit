@@ -12801,6 +12801,11 @@ function Write-BRAVOLog {
     # MaintenanceRepair: false-positive rollback після bravocmd repair +
     # Discord HTTP 429 retry (fix/repair-rollback-false-positive-and-discord-429).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceRepair.ps1')
+    # RestoreSynthetic: наскрізний синтетичний тест відкату — справжній
+    # tools\7za.exe (архів + цілісність + екстракція) на синтетичній моделі,
+    # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
+    # архіві. Приймальну перевірку на DEV-LIMS не замінює.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
