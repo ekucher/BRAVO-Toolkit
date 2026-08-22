@@ -4179,6 +4179,29 @@ function Compare-FileSizes {
             return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
         }
 
+        # Fail-closed guard: hint передано, але його немає у before-CSV —
+        # деривацію головної моделі не можна вважати достовірною (нетипове
+        # MODEL= у bravo.ini, Hidden/System-атрибути на .md, розбіжність
+        # шляхів). Мовчазне продовження перетворило б УСІ зниклі файли на
+        # RemovedByRepair і пропустило б знищену модель без rollback.
+        # Повертаємось до строгого legacy-режиму: будь-який відсутній файл
+        # знову критичний.
+        if (-not [string]::IsNullOrWhiteSpace($MainModelRelativePath)) {
+            $hintFoundInInitial = $false
+            foreach ($item in $initialData) {
+                if ([string]$item.RelativePath -ieq $MainModelRelativePath) {
+                    $hintFoundInInitial = $true
+                    break
+                }
+            }
+            if (-not $hintFoundInInitial) {
+                Write-Log ("Головну модель '$MainModelRelativePath' не знайдено у початковій інвентаризації MODEL " +
+                    "($(@($initialData).Count) файл(ів) у $BeforeFile); активовано строгий режим перевірки: " +
+                    "будь-який відсутній файл вважається критичним") -Level "WARNING"
+                $MainModelRelativePath = $null
+            }
+        }
+
         $criticalFiles = @()
         $removedByRepairFiles = @()
         $mainModelValid = $true
@@ -4229,10 +4252,18 @@ function Compare-FileSizes {
             # Fail-closed: без відомого MainModelRelativePath (викликач не
             # зміг визначити основну модель) будь-який відсутній файл лишається
             # критичним — стара поведінка. З відомим MainModelRelativePath
-            # критичним є лише відсутність САМЕ основної моделі; решта
-            # відсутніх файлів — RemovedByRepair-діагностика, не rollback-тригер.
+            # не критичним є зникнення ЛИШЕ сегментних файлів (*.000, *.002,
+            # ... — розширення з трьох цифр): за трасуванням реального
+            # bravocmd repair (mdrepair/db_remove/db_commit) перебудовуються
+            # виключно сегментні файли, а .md/.h1/.h2 ніколи не видаляються.
+            # Зникнення будь-якого .md (зокрема lims0.md/lims1.md — продовження
+            # основної моделі — чи табличних DEPART.md тощо) або файлів
+            # ієрархії — критична втрата даних, rollback-тригер.
+            $isSegmentFile = $relativePath -match '\.\d{3}$'
             $isCriticalMissing = $isMissing -and (
-                $isMainModelFile -or [string]::IsNullOrWhiteSpace($MainModelRelativePath)
+                $isMainModelFile -or
+                [string]::IsNullOrWhiteSpace($MainModelRelativePath) -or
+                -not $isSegmentFile
             )
 
             if ($isMissing -and -not $isCriticalMissing) {
@@ -5391,9 +5422,10 @@ $BRAVOCMD_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryRe
 # MODEL-контракт (тільки похідні значення, без hardcode назви проєкту):
 #   MODEL_BASE_PATH == $MODEL_PROJECT_PATH (значення MODEL= з bravo.ini як є)
 #   MODEL_DIRECTORY == $MODEL_PATH         (батьківський каталог MODEL_BASE_PATH)
-# Обидва вже похідні від Discovery вище. MODEL_NAME/MAIN_MODEL_FILE потрібні
-# лише для post-repair валідації (Compare-FileSizes нижче) — bravocmd.exe
-# як і раніше отримує $MODEL_PROJECT_PATH без жодних змін.
+# Обидва вже похідні від Discovery вище. MAIN_MODEL_FILE потрібен для
+# post-repair валідації (hint для Compare-FileSizes нижче), MODEL_NAME —
+# лише для діагностичного логу; bravocmd.exe як і раніше отримує
+# $MODEL_PROJECT_PATH без жодних змін.
 $MODEL_NAME = Split-Path -Path $MODEL_PROJECT_PATH -Leaf
 $MAIN_MODEL_FILE = "$MODEL_PROJECT_PATH.md"
 # Два різні корені (ТЗ RuntimeRoot/SystemLogRoot):
@@ -6671,11 +6703,26 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
 
                     if ($CheckSize) {
                         Write-Log -Message "Порівняння розмірів файлів..." -Level "INFO"
+                        # Hint головної моделі — від канонічного $MAIN_MODEL_FILE
+                        # тим самим правилом Replace+TrimStart, що й writer
+                        # before-CSV вище (покриває MODEL= у підкаталозі, на
+                        # відміну від здогаду "$MODEL_NAME.md"). Якщо .md не
+                        # лежить під $MODEL_PATH (Replace нічого не змінив) —
+                        # hint не передаємо: Compare-FileSizes працює у строгому
+                        # режимі (будь-який відсутній файл критичний).
+                        $mainModelRelativeHint = $MAIN_MODEL_FILE.Replace($MODEL_PATH, "").TrimStart('\')
+                        if ([string]::IsNullOrWhiteSpace($mainModelRelativeHint) -or
+                            $mainModelRelativeHint -ieq $MAIN_MODEL_FILE) {
+                            Write-Log -Message ("Головна модель '$MAIN_MODEL_FILE' не знаходиться в каталозі MODEL " +
+                                "'$MODEL_PATH'; перевірка розмірів виконується у строгому режимі " +
+                                "(будь-який відсутній файл критичний)") -Level "WARNING"
+                            $mainModelRelativeHint = $null
+                        }
                         $criticalChanges = Compare-FileSizes `
                             -BeforeFile $SIZES_FILE `
                             -ModelPath $MODEL_PATH `
                             -MinSizeBytes 2048 `
-                            -MainModelRelativePath "$MODEL_NAME.md"
+                            -MainModelRelativePath $mainModelRelativeHint
                         $restoreRemovedByRepairCount = $criticalChanges.RemovedByRepairCount
                         $restoreCriticalCount = @($criticalChanges.CriticalFiles).Count
                         $restoreMainModelValid = $criticalChanges.MainModelValid
