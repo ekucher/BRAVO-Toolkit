@@ -6953,6 +6953,20 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                         if ($recovery.IntegrityEstablished) {
                             # Модель консистентна (ціла після переривання або
                             # успішно відкочена) — служби можна піднімати.
+                            # Категоризація коду виходу: це саме RestoreFailed
+                            # (43), а не LocalArchiveFailed(40)/IntegrityTest(41).
+                            # Ті два прапорці тут хибно виставлені як побічний
+                            # ефект: Invoke-CommandWithLog ставить
+                            # restoreArchiveFailed на будь-який ненульовий код
+                            # (вбитий bravocmd), а Compare-FileSizes —
+                            # restoreIntegrityFailed на первинних критичних
+                            # змінах ДО відкату. Фінальний стан — відновлено й
+                            # консистентно, тож скидаємо їх і лишаємо лише
+                            # restoreFailed(43). before-архів створено успішно
+                            # (інакше до цієї гілки не дійшли б), тож справжнього
+                            # LocalArchiveFailed тут бути не може.
+                            $script:restoreArchiveFailed = $false
+                            $script:restoreIntegrityFailed = $false
                             $stateSuffix = if ($restoreRollbackStatus -eq 'SUCCESS') {
                                 'модель відновлено з before-архіву'
                             } else {
