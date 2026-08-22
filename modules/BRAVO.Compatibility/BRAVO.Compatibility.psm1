@@ -2241,7 +2241,11 @@ function Send-BRAVOWebhookNotification {
     }
 
     Enable-BRAVOTls12
-    $notificationSeparator = (("━" * 36) -join "")
+    # ДОВЖИНА МУСИТЬ ЗБІГАТИСЯ з $separator у
+    # New-BRAVOOperatorNotificationMessage (BRAVO.Notifications): нижче
+    # перевіряється префікс повідомлення, і розбіжність дала б подвійний
+    # роздільник. 12 замість 36 — читабельність на мобільних.
+    $notificationSeparator = (("━" * 12) -join "")
     $messageForWebhook = if ($Message.TrimStart().StartsWith($notificationSeparator)) {
         $Message
     } else {

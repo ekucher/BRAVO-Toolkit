@@ -286,7 +286,12 @@ function New-BRAVOOperatorNotificationMessage {
         [string]$LogLabel = "Журнал"
     )
 
-    $separator = "━" * 36
+    # 12, не 36: довга лінія переносилась на вузьких мобільних екранах і
+    # з'їдала екран. ДОВЖИНА МУСИТЬ ЗБІГАТИСЯ з $notificationSeparator у
+    # Send-BRAVOWebhookNotification (BRAVO.Compatibility) — та функція
+    # перевіряє префікс повідомлення й додає власний роздільник, якщо він
+    # не збігся (розсинхрон дав би подвійну лінію).
+    $separator = "━" * 12
     $severityIcon = switch ($Severity) {
         "SUCCESS" { ":white_check_mark:" }
         "WARNING" { ":warning:" }
@@ -377,6 +382,7 @@ function ConvertTo-DiscordNotificationText {
         ":satellite_antenna:" = "📡"
         ":floppy_disk:" = "💾"
         ":memo:" = "📝"
+        ":mag:" = "🔎"
         ":white_check_mark:" = "✅"
         ":package:" = "📦"
         ":minidisc:" = "💽"

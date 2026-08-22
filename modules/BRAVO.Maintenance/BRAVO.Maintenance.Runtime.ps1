@@ -1063,6 +1063,11 @@ $script:BRAVOMaintenanceStepOkCount = 0
 $script:BRAVOMaintenanceStepWarnCount = 0
 $script:BRAVOMaintenanceStepSkippedCount = 0
 $script:BRAVOMaintenanceStepFailCount = 0
+# Журнал кроків (Name/Status/Details) — фактичний результат кожного етапу.
+# Потрібен фінальному сповіщенню: раніше блок "Виконано" будувався суто з
+# КОНФІГУРАЦІЙНИХ прапорців (компонент увімкнено -> ✅), тому збійний етап
+# (напр. Trace) показувався зеленим, а оператор не бачив, що саме не так.
+$script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
 
 function Initialize-BRAVOMaintenanceSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
@@ -1074,6 +1079,22 @@ function Initialize-BRAVOMaintenanceSteps {
     $script:BRAVOMaintenanceStepWarnCount = 0
     $script:BRAVOMaintenanceStepSkippedCount = 0
     $script:BRAVOMaintenanceStepFailCount = 0
+    $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+}
+
+# Останній зафіксований статус етапу за іменем. Етап може звітувати кілька
+# разів (напр. 'Обробка trace і логів' у різних гілках) — операторові
+# важливий підсумковий стан, тому береться ОСТАННІЙ запис.
+function Get-BRAVOMaintenanceStepOutcome {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    for ($index = $script:BRAVOMaintenanceStepLog.Count - 1; $index -ge 0; $index--) {
+        $entry = $script:BRAVOMaintenanceStepLog[$index]
+        if ([string]$entry.Name -eq $Name) {
+            return $entry
+        }
+    }
+    return $null
 }
 
 # Статус етапу рахується від ЗРІЗУ лічильників перед блоком, а не від
@@ -1183,6 +1204,13 @@ function Write-BRAVOMaintenanceStep {
         'SKIPPED' { $script:BRAVOMaintenanceStepSkippedCount++ }
         'FAIL'    { $script:BRAVOMaintenanceStepFailCount++ }
     }
+    # Той самий запис, що йде в консоль, зберігається для фінального
+    # сповіщення (див. коментар біля BRAVOMaintenanceStepLog вище).
+    [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{
+        Name = $Name
+        Status = $Status
+        Details = [string]$Details
+    })
     # Тривалість кроку — час від попереднього кроку (чи від Initialize, для
     # першого). Той самий підхід, що в Health: жоден із ~9 кроків не має
     # власного таймера, і додавати його кожному окремо — набагато більший
@@ -1692,6 +1720,136 @@ function Get-MaintenanceMinimumFreeSpaceLines {
         $minimumLine,
         "Порогове значення: $MIN_FREE_SPACE ГБ"
     )
+}
+
+# Компактний однорядковий варіант того самого запасу — для згрупованого
+# рядка "Вільне місце" у сповіщенні (три окремі рядки погано читалися на
+# мобільних). Джерело даних те саме, що Get-MaintenanceMinimumFreeSpaceLines.
+function Get-MaintenanceFreeSpaceInlineText {
+    $minimumLine = $null
+    $minimumFreeGb = $null
+    foreach ($driveLine in @($script:freeSpaceSummary)) {
+        if ([string]$driveLine -match '^([A-Z]:)\s+([0-9]+([.,][0-9]+)?)\s+GB') {
+            $freeGb = [double](([string]$Matches[2]).Replace(',', '.'))
+            if ($null -eq $minimumFreeGb -or $freeGb -lt $minimumFreeGb) {
+                $minimumFreeGb = $freeGb
+                $minimumLine = "$($Matches[1]) $freeGb ГБ"
+            }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($minimumLine)) {
+        return "запас: немає даних"
+    }
+    return ":floppy_disk: $minimumLine · поріг: $MIN_FREE_SPACE ГБ"
+}
+
+# Блок "Виконано"/"Проблеми" фінального сповіщення. Джерело істини —
+# ФАКТИЧНІ статуси етапів ($script:BRAVOMaintenanceStepLog), а не
+# конфігураційні прапорці: саме через прапорці збійний етап (Trace) раніше
+# показувався ✅ і оператор не бачив причини попередження.
+#
+# SKIPPED-етапи не друкуються (компонент вимкнено/не планувався — це не
+# результат). Для не-OK етапу деталь беремо з самого етапу (там причина),
+# а не декоративний текст успіху.
+function New-BRAVOMaintenanceCompletedLines {
+    param(
+        [string]$LastRestoreText,
+        [string]$FreeSpaceInlineText,
+        [string]$TraceCountText,
+        [string]$ExchangeCountText
+    )
+
+    $statusEmoji = @{ 'OK' = ':white_check_mark:'; 'WARN' = ':warning:'; 'FAIL' = ':x:' }
+    # Порядок = порядок виконання; Steps — імена етапів, що покривають пункт
+    # (гірший статус серед них перемагає: FAIL > WARN > OK).
+    $map = @(
+        @{ Label = 'Реставрація'; Steps = @('Реставрація моделі'); OkDetail = 'за планом' }
+        @{ Label = '.md-файли'; Steps = @('Перевірка розмірів .md'); OkDetail = 'перевірено' }
+        @{ Label = 'Інтервали ID'; Steps = @('Контроль діапазонів ID'); OkDetail = 'у нормі' }
+        @{ Label = 'Trace'; Steps = @('Обробка trace і логів', 'Trace: добовий архів і SFTP'); OkDetail = $null }
+        @{ Label = 'Очистка'; Steps = @('Очистка старих даних/логів'); OkDetail = 'виконано' }
+        @{ Label = 'Вільне місце'; Steps = @('Перевірка вільного місця'); OkDetail = 'достатньо' }
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $problems = New-Object System.Collections.Generic.List[string]
+    $lines.Add("Виконано:")
+
+    foreach ($item in $map) {
+        $worst = $null
+        foreach ($stepName in @($item.Steps)) {
+            $outcome = Get-BRAVOMaintenanceStepOutcome -Name $stepName
+            if ($null -eq $outcome -or [string]$outcome.Status -eq 'SKIPPED') { continue }
+            $rank = switch ([string]$outcome.Status) { 'FAIL' { 3 } 'WARN' { 2 } default { 1 } }
+            $worstRank = if ($null -eq $worst) { 0 } else {
+                switch ([string]$worst.Status) { 'FAIL' { 3 } 'WARN' { 2 } default { 1 } }
+            }
+            if ($rank -ge $worstRank) { $worst = $outcome }
+        }
+        if ($null -eq $worst) { continue }
+
+        $status = [string]$worst.Status
+        $detail = if ($status -eq 'OK') {
+            switch ([string]$item.Label) {
+                'Trace' { if ([string]::IsNullOrWhiteSpace($TraceCountText)) { 'оброблено' } else { "оброблено $TraceCountText" } }
+                default { [string]$item.OkDetail }
+            }
+        } elseif (-not [string]::IsNullOrWhiteSpace([string]$worst.Details)) {
+            [string]$worst.Details
+        } else {
+            'перевірте журнал'
+        }
+
+        # Групування пов'язаних даних в один рядок (окремі рядки погано
+        # читалися на мобільних).
+        if ([string]$item.Label -eq 'Реставрація' -and -not [string]::IsNullOrWhiteSpace($LastRestoreText)) {
+            $detail = "$detail · :arrows_counterclockwise: остання: $LastRestoreText"
+        }
+        if ([string]$item.Label -eq 'Вільне місце' -and -not [string]::IsNullOrWhiteSpace($FreeSpaceInlineText)) {
+            $detail = "$detail · $FreeSpaceInlineText"
+        }
+
+        $emoji = [string]$statusEmoji[$status]
+        $lines.Add("$emoji $($item.Label) — $detail")
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ExchangeCountText)) {
+        $lines.Add(":white_check_mark: exchangAPI — оброблено $ExchangeCountText")
+    }
+
+    # Проблемні етапи, яких НЕМАЄ у списку вище (зупинка/відновлення служб,
+    # архівація після maintenance тощо) — щоб жодна причина попередження не
+    # лишилась невидимою. Етапи зі списку не дублюються: вони вже показані
+    # з ❌/⚠️ і причиною.
+    # Hashtable, а не -contains над колекціями: під Set-StrictMode PS 5.1
+    # порівняння List/масивів різних типів дає "Argument types do not match".
+    $mappedStepNames = @{}
+    foreach ($item in $map) {
+        foreach ($stepName in @($item.Steps)) { $mappedStepNames[[string]$stepName] = $true }
+    }
+    $reportedProblemNames = @{}
+    for ($logIndex = 0; $logIndex -lt $script:BRAVOMaintenanceStepLog.Count; $logIndex++) {
+        $entry = $script:BRAVOMaintenanceStepLog[$logIndex]
+        $entryStatus = [string]$entry.Status
+        if ($entryStatus -ne 'FAIL' -and $entryStatus -ne 'WARN') { continue }
+        $entryName = [string]$entry.Name
+        if ($mappedStepNames.ContainsKey($entryName)) { continue }
+        if ($reportedProblemNames.ContainsKey($entryName)) { continue }
+        $reportedProblemNames[$entryName] = $true
+        $entryDetail = if (-not [string]::IsNullOrWhiteSpace([string]$entry.Details)) {
+            [string]$entry.Details
+        } else {
+            'перевірте журнал'
+        }
+        $problems.Add("$([string]$statusEmoji[$entryStatus]) $entryName — $entryDetail")
+    }
+    if ($problems.Count -gt 0) {
+        # Порожні рядки рендерер сповіщення відкидає, тому заголовок блоку
+        # виділяється власним маркером, а не відступом.
+        $lines.Add(":mag: Також потребує уваги:")
+        foreach ($problem in $problems) { $lines.Add($problem) }
+    }
+    return $lines.ToArray()
 }
 
 
@@ -5329,46 +5487,26 @@ function Send-FinalReport {
             } else {
                 "ще не виконувалася"
             }
-            $completedCheckLines.Add("Виконано:")
-            if ($BravoMaintenanceEnabled) {
-                $completedCheckLines.Add(":white_check_mark: Реставрація — за планом")
-            }
-
-            $mdCheckStatus = if ($BravoMaintenanceEnabled -and $CheckSize) {
-                "перевірено"
-            } elseif (-not $BravoMaintenanceEnabled) {
-                $null
+            # Блок будується з ФАКТИЧНИХ статусів етапів (див.
+            # New-BRAVOMaintenanceCompletedLines): збійний етап отримує ❌/⚠️
+            # і причину, а не ✅ від самої лише наявності компонента.
+            $traceCountText = if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
+                Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
             } else {
                 $null
             }
-            if ($mdCheckStatus) {
-                $completedCheckLines.Add(":white_check_mark: .md-файли — $mdCheckStatus")
-            }
-
-            $rangeCheckStatus = if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
-                "у нормі"
+            $exchangeCountText = if ($exchangAPILogsProcessedCount -gt 0) {
+                Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
             } else {
                 $null
             }
-            if ($rangeCheckStatus) {
-                $completedCheckLines.Add(":white_check_mark: Інтервали ID — $rangeCheckStatus")
+            foreach ($completedLine in @(New-BRAVOMaintenanceCompletedLines `
+                    -LastRestoreText $lastRestoreText `
+                    -FreeSpaceInlineText (Get-MaintenanceFreeSpaceInlineText) `
+                    -TraceCountText $traceCountText `
+                    -ExchangeCountText $exchangeCountText)) {
+                $completedCheckLines.Add([string]$completedLine)
             }
-
-            if ($BravoMaintenanceEnabled -and $traceOutputProcessed) {
-                $traceCountText = Format-BRAVOUkrainianCount -Count $traceOutputProcessedCount -One "файл" -Few "файли" -Many "файлів"
-                $completedCheckLines.Add(":white_check_mark: Trace — оброблено $traceCountText")
-            }
-            if ($exchangAPILogsProcessedCount -gt 0) {
-                $exchangeCountText = Format-BRAVOUkrainianCount -Count $exchangAPILogsProcessedCount -One "файл" -Few "файли" -Many "файлів"
-                $completedCheckLines.Add(":white_check_mark: exchangAPI — оброблено $exchangeCountText")
-            }
-            $completedCheckLines.Add(":white_check_mark: Вільне місце — достатньо")
-            $completedCheckLines.Add("")
-            foreach ($freeSpaceLine in @(Get-MaintenanceMinimumFreeSpaceLines)) {
-                $completedCheckLines.Add($freeSpaceLine)
-            }
-            $completedCheckLines.Add("")
-            $completedCheckLines.Add(":arrows_counterclockwise: Остання реставрація: $lastRestoreText")
 
             # dev.19 (виправлено): той самий канонічний
             # Get-BRAVOMaintenanceFinalStatus, що ЛОГ/консоль — раніше

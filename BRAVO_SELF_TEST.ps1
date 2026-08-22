@@ -2364,6 +2364,11 @@ try {
         function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
         function Get-BRAVOFiles { param($Path, $Filter) return @() }
         function Get-MaintenanceMinimumFreeSpaceLines { return @() }
+        function Get-MaintenanceFreeSpaceInlineText { return ":floppy_disk: C: 100 ГБ · поріг: 20 ГБ" }
+        function New-BRAVOMaintenanceCompletedLines {
+            param($LastRestoreText, $FreeSpaceInlineText, $TraceCountText, $ExchangeCountText)
+            return @("Виконано:", ":white_check_mark: Реставрація — за планом")
+        }
         function Format-BRAVOUkrainianCount { param([int]$Count, [string]$One, [string]$Few, [string]$Many) return "$Count" }
         function Resolve-BRAVONotificationRoute {
             param([string]$Severity, [string]$NotificationMode, $RoutingTable)
@@ -12453,6 +12458,108 @@ function Write-BRAVOLog {
         ) `
         -Name 'Maintenance/PureSuccessNotificationUnaffectedBySeverityReorder' `
         -Failure "Title 'УСПІШНО' + TitleEmoji ':white_check_mark:' мають і надалі рендерити ✅/'Дій не потрібно' — severity-reorder (':warning:' перевіряється першим) не повинен зачіпати звичайний success-шлях"
+
+    # --- Блок "Виконано" будується з ФАКТИЧНИХ статусів етапів, а не з
+    # конфігураційних прапорців: збійний етап (напр. Trace) раніше показувався
+    # ✅, і оператор не бачив причини попередження. Реальна AST-екстракція
+    # New-BRAVOMaintenanceCompletedLines + Get-BRAVOMaintenanceStepOutcome.
+    $maintenanceCompletedLinesModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @('Get-BRAVOMaintenanceStepOutcome', 'New-BRAVOMaintenanceCompletedLines')
+    $maintenanceCompletedAllOk = & $maintenanceCompletedLinesModule {
+        $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+        foreach ($entry in @(
+            @{ Name = 'Реставрація моделі'; Status = 'OK'; Details = '' },
+            @{ Name = 'Перевірка розмірів .md'; Status = 'OK'; Details = '' },
+            @{ Name = 'Обробка trace і логів'; Status = 'OK'; Details = '' },
+            @{ Name = 'Trace: добовий архів і SFTP'; Status = 'OK'; Details = '' },
+            @{ Name = 'Перевірка вільного місця'; Status = 'OK'; Details = '' }
+        )) {
+            [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]$entry)
+        }
+        New-BRAVOMaintenanceCompletedLines `
+            -LastRestoreText '22.08.2026 16:34' `
+            -FreeSpaceInlineText ':floppy_disk: C: 76.72 ГБ · поріг: 20 ГБ' `
+            -TraceCountText '1 файл'
+    }
+    $maintenanceCompletedAllOkText = ($maintenanceCompletedAllOk -join "`n")
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCompletedAllOkText.Contains(':white_check_mark: Реставрація — за планом · :arrows_counterclockwise: остання: 22.08.2026 16:34') -and
+            $maintenanceCompletedAllOkText.Contains(':white_check_mark: Вільне місце — достатньо · :floppy_disk: C: 76.72 ГБ · поріг: 20 ГБ') -and
+            $maintenanceCompletedAllOkText.Contains(':white_check_mark: Trace — оброблено 1 файл') -and
+            -not $maintenanceCompletedAllOkText.Contains('Також потребує уваги')
+        ) `
+        -Name 'Maintenance/CompletedLinesGroupRelatedFactsWhenAllOk' `
+        -Failure "усі етапи OK: рядки мають бути згруповані (Реставрація + остання, Вільне місце + запас/поріг) і без блоку 'Проблеми'; отримано:`n$maintenanceCompletedAllOkText"
+
+    $maintenanceCompletedTraceFailed = & $maintenanceCompletedLinesModule {
+        $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+        foreach ($entry in @(
+            @{ Name = 'Реставрація моделі'; Status = 'OK'; Details = '' },
+            @{ Name = 'Обробка trace і логів'; Status = 'OK'; Details = '' },
+            @{ Name = 'Trace: добовий архів і SFTP'; Status = 'FAIL'; Details = 'архів не пройшов 7z t' },
+            @{ Name = 'Перевірка вільного місця'; Status = 'OK'; Details = '' }
+        )) {
+            [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]$entry)
+        }
+        New-BRAVOMaintenanceCompletedLines -TraceCountText '1 файл'
+    }
+    $maintenanceCompletedTraceFailedText = ($maintenanceCompletedTraceFailed -join "`n")
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCompletedTraceFailedText.Contains(':x: Trace — архів не пройшов 7z t') -and
+            -not $maintenanceCompletedTraceFailedText.Contains(':white_check_mark: Trace') -and
+            # Етап зі списку НЕ дублюється в блоці "Також потребує уваги" —
+            # він уже показаний з ❌ і причиною (компактність на мобільних).
+            -not $maintenanceCompletedTraceFailedText.Contains('Також потребує уваги')
+        ) `
+        -Name 'Maintenance/CompletedLinesShowFailedStepInsteadOfGreenCheck' `
+        -Failure "збійний етап Trace має бути ❌ з причиною у самому списку і не дублюватись окремим блоком; отримано:`n$maintenanceCompletedTraceFailedText"
+
+    # Проблемний етап ПОЗА списком "Виконано" (зупинка служб тощо) не має
+    # загубитись — для нього є окремий блок.
+    $maintenanceCompletedUnmappedProblem = & $maintenanceCompletedLinesModule {
+        $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+        [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{ Name = 'Перевірка вільного місця'; Status = 'OK'; Details = '' })
+        [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{ Name = 'Відновлення стану служб'; Status = 'FAIL'; Details = 'BRAVO не запустився' })
+        New-BRAVOMaintenanceCompletedLines
+    }
+    $maintenanceCompletedUnmappedText = ($maintenanceCompletedUnmappedProblem -join "`n")
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceCompletedUnmappedText.Contains(':mag: Також потребує уваги:') -and
+            $maintenanceCompletedUnmappedText.Contains(':x: Відновлення стану служб — BRAVO не запустився')
+        ) `
+        -Name 'Maintenance/CompletedLinesReportUnmappedFailedSteps' `
+        -Failure "збійний етап поза списком 'Виконано' має потрапити в блок 'Також потребує уваги'; отримано:`n$maintenanceCompletedUnmappedText"
+
+    $maintenanceCompletedSkipped = & $maintenanceCompletedLinesModule {
+        $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+        [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{ Name = 'Реставрація моделі'; Status = 'SKIPPED'; Details = 'не заплановано' })
+        [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{ Name = 'Перевірка вільного місця'; Status = 'WARN'; Details = 'мало місця' })
+        New-BRAVOMaintenanceCompletedLines
+    }
+    $maintenanceCompletedSkippedText = ($maintenanceCompletedSkipped -join "`n")
+    Test-BRAVOCondition `
+        -Condition (
+            -not $maintenanceCompletedSkippedText.Contains('Реставрація') -and
+            $maintenanceCompletedSkippedText.Contains(':warning: Вільне місце — мало місця')
+        ) `
+        -Name 'Maintenance/CompletedLinesSkipSkippedAndFlagWarn' `
+        -Failure "SKIPPED-етап не друкується, WARN-етап показується ⚠️ з причиною і потрапляє в 'Проблеми'; отримано:`n$maintenanceCompletedSkippedText"
+
+    # --- Роздільник сповіщення: 12 символів і ОДНАКОВИЙ у двох модулях
+    # (BRAVO.Compatibility перевіряє префікс і додав би другий роздільник).
+    $notificationsSeparatorText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Notifications\BRAVO.Notifications.psm1'), [Text.Encoding]::UTF8)
+    $compatibilitySeparatorText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $notificationsSeparatorText.Contains('$separator = "━" * 12') -and
+            $compatibilitySeparatorText.Contains('$notificationSeparator = (("━" * 12) -join "")')
+        ) `
+        -Name 'Notifications/SeparatorIsCompactAndConsistent' `
+        -Failure "роздільник сповіщення має бути ━×12 і ОДНАКОВИЙ у BRAVO.Notifications та BRAVO.Compatibility (розсинхрон дає подвійну лінію)"
 
     # --- Range ID: dev.19 не мав чіпати WARN-only семантику Test-RangeIdUsage
     # — жодного auto-create файлу, fallback-пошуку іншого шляху чи
