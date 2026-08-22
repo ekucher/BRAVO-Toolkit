@@ -237,6 +237,31 @@ Test-BRAVOCondition `
     -Name "Maintenance/CompareFileSizesSubdirectoryHintMatches" `
     -Failure "hint з підкаталогом ('sub\TestProject.md') має збігатися з RelativePath before-CSV: зниклий сегмент = RemovedByRepair, не CRITICAL; отримано HasCriticalChanges=$($resultSubdirHint.HasCriticalChanges), RemovedByRepairCount=$($resultSubdirHint.RemovedByRepairCount)"
 
+# --- Реальна сигнатура провальної реставрації (звіт оператора): .md був
+# ~2GB, після repair став 2KB -> CRITICAL, MainModelValid=false. Ловиться
+# обома правилами незалежно: current <= MinSizeBytes(2048) і редукція >=50%.
+# 2GB перевіряє також [long]-семантику розмірів (понад [int32]::MaxValue).
+$resultMainCollapsed2Gb = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 2147483648; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'TestProject.md' = 2048; 'ACT.000' = 100000 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition ($resultMainCollapsed2Gb.HasCriticalChanges -and -not $resultMainCollapsed2Gb.MainModelValid) `
+    -Name "Maintenance/CompareFileSizesMainModel2GbCollapsedTo2KbCritical" `
+    -Failure "основна модель 2GB, що схлопнулась до 2KB після repair, має бути CRITICAL з MainModelValid=false — фактична сигнатура провальної реставрації; отримано HasCriticalChanges=$($resultMainCollapsed2Gb.HasCriticalChanges), MainModelValid=$($resultMainCollapsed2Gb.MainModelValid)"
+
+# --- Та сама сигнатура для НЕ-main файлу > 1GB (звіт оператора: таке
+# трапляється і з іншими великими файлами, не лише основною моделлю):
+# 1.5GB -> 2KB -> CRITICAL незалежно від імені файлу.
+$resultNonMainCollapsed1Gb = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'PROCRSRCH.md' = 1610612736 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000; 'PROCRSRCH.md' = 2048 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition ($resultNonMainCollapsed1Gb.HasCriticalChanges -and @($resultNonMainCollapsed1Gb.CriticalFiles).Count -eq 1) `
+    -Name "Maintenance/CompareFileSizesNonMainOver1GbCollapsedTo2KbCritical" `
+    -Failure "не-main файл >1GB, що схлопнувся до 2KB після repair, має бути CRITICAL незалежно від імені; отримано HasCriticalChanges=$($resultNonMainCollapsed1Gb.HasCriticalChanges), CriticalFiles=$(@($resultNonMainCollapsed1Gb.CriticalFiles).Count)"
+
 # --- Зниклий НЕ-main .md при коректному hint -> CRITICAL. За трасуванням
 # реального bravocmd repair перебудовуються лише сегментні файли (.NNN);
 # .md ніколи не видаляються. lims0.md/lims1.md — продовження основної
