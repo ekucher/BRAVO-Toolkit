@@ -1490,7 +1490,14 @@ try {
     }
     Write-BRAVOCredentialResultBlock -Results $operationResults -Action $Action
 
-    if (@($operationResults | Where-Object { $_.Status -in @("Error", "Missing") }).Count -gt 0) {
+    # "Missing" є невдачею лише для Test (перевірка наявності запису).
+    # Remove ідемпотентний: видалення вже-відсутнього запису дає статус
+    # "Missing", але це не помилка — інакше повторний "Видалити всі"
+    # хибно завершувався кодом 1 і піднімав "ПОТРІБНА ДІЯ". Для
+    # Add/Update/Set/Ensure статусу "Missing" не буває; скрізь, крім Test,
+    # невдачею лишається тільки "Error".
+    $failureStatuses = if ($Action -eq "Test") { @("Error", "Missing") } else { @("Error") }
+    if (@($operationResults | Where-Object { $_.Status -in $failureStatuses }).Count -gt 0) {
         Complete-BRAVOCredentialSetup -ExitCode 1
     }
     Complete-BRAVOCredentialSetup -ExitCode 0
