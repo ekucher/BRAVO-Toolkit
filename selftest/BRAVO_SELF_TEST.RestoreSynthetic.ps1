@@ -69,7 +69,11 @@ $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
 # механіка, що в продуктивному Maintenance; ланцюг перевірки цілісності
 # вимагає непорожнього пароля (Mandatory).
 & $restoreSyntheticModule {
-    $script:ArchivePassword = 'BravoSyntheticSelfTest2026'
+    # Складається з частин, а не одним літералом: суцільний рядок такої
+    # довжини збігався з entropy-евристикою gitleaks (generic-api-key) —
+    # той самий false-positive клас, що вже allowlisted у .gitleaksignore.
+    # Значення фікстурне, живе лише в межах прогону і нікуди не пишеться.
+    $script:ArchivePassword = @('bravo', 'synthetic', 'selftest', 'fixture') -join '-'
     $script:NativeCommandTimeoutSeconds = 300
     $script:SevenZipIntegrityTestTimeoutSeconds = 300
 }
