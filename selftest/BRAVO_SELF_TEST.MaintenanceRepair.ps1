@@ -296,6 +296,29 @@ Test-BRAVOCondition `
     -Name "Maintenance/CompareFileSizesMixedMissingSegmentAndMd" `
     -Failure "змішаний кейс: DEPART.md = CRITICAL, ASSORT.000 = RemovedByRepair(1); отримано HasCriticalChanges=$($resultMixedMissing.HasCriticalChanges), RemovedByRepairCount=$($resultMixedMissing.RemovedByRepairCount)"
 
+# --- Зниклий .$$$ (тимчасовий робочий файл bravocmd, залишок перерваного
+# repair) -> RemovedByRepair, НЕ критично: як і .NNN-сегменти, це транзитний
+# артефакт, а не дані. Інакше orphan .$$$ давав би false-positive rollback.
+$resultTempMissing = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'KZPpat.$$$' = 155273552 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition (-not $resultTempMissing.HasCriticalChanges -and $resultTempMissing.RemovedByRepairCount -eq 1) `
+    -Name "Maintenance/CompareFileSizesTempDollarFileNotCritical" `
+    -Failure "зниклий .`$`$`$ (temp bravocmd) має бути RemovedByRepair, не CRITICAL; отримано HasCriticalChanges=$($resultTempMissing.HasCriticalChanges), RemovedByRepairCount=$($resultTempMissing.RemovedByRepairCount)"
+
+# --- Змішаний: зник .$$$ (temp, не критично) + зник .md (дані, критично)
+# -> CRITICAL, а .$$$ лишається у RemovedByRepair.
+$resultTempAndMd = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'DEPART.md' = 200000; 'KZPpat.$$$' = 148000000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md'
+Test-BRAVOCondition `
+    -Condition ($resultTempAndMd.HasCriticalChanges -and $resultTempAndMd.RemovedByRepairCount -eq 1) `
+    -Name "Maintenance/CompareFileSizesTempDollarPlusMdMixed" `
+    -Failure "змішаний: DEPART.md = CRITICAL, KZPpat.`$`$`$ = RemovedByRepair(1); отримано HasCriticalChanges=$($resultTempAndMd.HasCriticalChanges), RemovedByRepairCount=$($resultTempAndMd.RemovedByRepairCount)"
+
 # --- Викликач деривує hint від MAIN_MODEL_FILE тим самим правилом, що й
 # writer before-CSV (Replace+TrimStart), а не здогадом "$MODEL_NAME.md".
 Test-BRAVOCondition `

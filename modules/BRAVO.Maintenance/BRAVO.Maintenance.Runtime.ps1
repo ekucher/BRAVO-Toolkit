@@ -4263,18 +4263,20 @@ function Compare-FileSizes {
             # Fail-closed: без відомого MainModelRelativePath (викликач не
             # зміг визначити основну модель) будь-який відсутній файл лишається
             # критичним — стара поведінка. З відомим MainModelRelativePath
-            # не критичним є зникнення ЛИШЕ сегментних файлів (*.000, *.002,
-            # ... — розширення з трьох цифр): за трасуванням реального
-            # bravocmd repair (mdrepair/db_remove/db_commit) перебудовуються
-            # виключно сегментні файли, а .md/.h1/.h2 ніколи не видаляються.
-            # Зникнення будь-якого .md (зокрема lims0.md/lims1.md — продовження
-            # основної моделі — чи табличних DEPART.md тощо) або файлів
-            # ієрархії — критична втрата даних, rollback-тригер.
-            $isSegmentFile = $relativePath -match '\.\d{3}$'
+            # не критичним є зникнення ЛИШЕ транзитних артефактів bravocmd:
+            #   *.NNN (тризначне розширення) — сегментні файли, які repair
+            #     (mdrepair/db_remove/db_commit) штатно перебудовує;
+            #   *.$$$ — тимчасові робочі файли bravocmd (пише перебудоване,
+            #     потім перейменовує/видаляє). Їх наявність = залишок
+            #     перерваного repair, а не дані; зникнення НЕ критичне.
+            # .md (зокрема lims0.md/lims1.md — продовження основної моделі — чи
+            # табличні DEPART.md), файли ієрархії (.h1/.h2) та будь-що інше при
+            # зникненні — критична втрата даних, rollback-тригер.
+            $isTransientRepairArtifact = $relativePath -match '(\.\d{3}$)|(\.\$\$\$$)'
             $isCriticalMissing = $isMissing -and (
                 $isMainModelFile -or
                 [string]::IsNullOrWhiteSpace($MainModelRelativePath) -or
-                -not $isSegmentFile
+                -not $isTransientRepairArtifact
             )
 
             if ($isMissing -and -not $isCriticalMissing) {
