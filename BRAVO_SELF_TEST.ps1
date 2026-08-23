@@ -8390,6 +8390,140 @@ try {
                 -Condition (-not [bool]$wrongPasswordResult.Success) `
                 -Name "RestoreDrill/ExtractionFailsWithWrongPassword" `
                 -Failure "Invoke-BRAVOSevenZipExtraction має повертати Success=false для архіву з неправильним паролем"
+
+            # 5.2.0 B2: legacy BOM-у-паролі fallback. До 5.2.0 пароль
+            # писався через Process.StandardInput.WriteLine, який під
+            # UTF-8-консоллю мовчки додавав BOM ПЕРЕД паролем — архів
+            # ефективно шифрувався паролем "U+FEFF<Password>". Фікстура
+            # відтворює це ДЕТЕРМІНОВАНО (не залежно від console encoding
+            # хоста самотесту): сирий запис BOM-байтів + пароль напряму в
+            # BaseStream, той самий формат, що колись писав старий
+            # WriteLine-шлях під chcp 65001.
+            $b2TestRoot = Join-Path `
+                -Path ([IO.Path]::GetTempPath()) `
+                -ChildPath ("BRAVO_B2_BOM_FALLBACK_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+            try {
+                $b2SourceDir = Join-Path $b2TestRoot "source"
+                [void][IO.Directory]::CreateDirectory($b2SourceDir)
+                [IO.File]::WriteAllText((Join-Path $b2SourceDir "payload.txt"), "B2 BOM fallback self-test payload")
+
+                function New-BRAVOB2LegacyBomArchive {
+                    # Створює архів так, як його ефективно створював старий
+                    # (pre-5.2.0) WriteLine-шлях під UTF-8-консоллю: сирий
+                    # запис U+FEFF + пароль + CRLF у BaseStream stdin.
+                    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                        'PSAvoidUsingPlainTextForPassword', 'Password',
+                        Justification = 'Тестова фікстура self-test; пароль передається 7-Zip через redirected stdin (не в аргументи процесу), як і production-код.')]
+                    param(
+                        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+                        [Parameter(Mandatory = $true)][string]$ArchivePath,
+                        [Parameter(Mandatory = $true)][string]$SourcePath,
+                        [Parameter(Mandatory = $true)][string]$Password
+                    )
+                    $psi = New-Object System.Diagnostics.ProcessStartInfo
+                    $psi.FileName = $SevenZipPath
+                    $psi.Arguments = "a -y -p `"$ArchivePath`" `"$SourcePath`""
+                    $psi.RedirectStandardInput = $true
+                    $psi.RedirectStandardOutput = $true
+                    $psi.RedirectStandardError = $true
+                    $psi.UseShellExecute = $false
+                    $proc = New-Object System.Diagnostics.Process
+                    $proc.StartInfo = $psi
+                    [void]$proc.Start()
+                    $effectivePassword = ([char]0xFEFF) + $Password
+                    $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($effectivePassword + "`r`n")
+                    $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
+                    $proc.StandardInput.BaseStream.Flush()
+                    $proc.StandardInput.Close()
+                    [void]$proc.StandardOutput.ReadToEnd()
+                    [void]$proc.StandardError.ReadToEnd()
+                    $proc.WaitForExit()
+                    return $proc.ExitCode
+                }
+
+                $b2LegacyArchivePath = Join-Path $b2TestRoot "legacy.7z"
+                $b2CreateExit = New-BRAVOB2LegacyBomArchive `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $b2LegacyArchivePath `
+                    -SourcePath $b2SourceDir -Password "B2LegacyPass"
+                Test-BRAVOCondition -Condition ($b2CreateExit -eq 0) `
+                    -Name "B2/LegacyFixtureArchiveCreated" `
+                    -Failure "setup: фікстура legacy BOM-архіву має створитись успішно (7za exit=$b2CreateExit)"
+
+                # Test/-t: перша спроба (BOM-free) на legacy-архіві провалюється
+                # як password-failure, друга (з BOM) — успішна.
+                $b2TestLegacy = Invoke-BRAVOSevenZipIntegrityTest `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $b2LegacyArchivePath -Password "B2LegacyPass"
+                Test-BRAVOCondition -Condition (
+                    [bool]$b2TestLegacy.Success -and [bool]$b2TestLegacy.LegacyBomPasswordFallbackUsed -and
+                    -not [string]::IsNullOrWhiteSpace([string]$b2TestLegacy.Warning)
+                ) -Name "B2/IntegrityTestFallsBackToLegacyBomPassword" `
+                    -Failure "Invoke-BRAVOSevenZipIntegrityTest має розпізнати legacy BOM-архів і успішно пройти через fallback з попередженням; Success=$($b2TestLegacy.Success),Fallback=$($b2TestLegacy.LegacyBomPasswordFallbackUsed)"
+
+                # Extract/-x: той самий fallback, з реальним відновленням вмісту.
+                $b2ExtractDir = Join-Path $b2TestRoot "extracted"
+                [void][IO.Directory]::CreateDirectory($b2ExtractDir)
+                $b2ExtractLegacy = Invoke-BRAVOSevenZipExtraction `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $b2LegacyArchivePath `
+                    -Password "B2LegacyPass" -ExtractDirectory $b2ExtractDir
+                # 7za archive-е СЮ ДИРЕКТОРІЮ source\ рекурсивно (без
+                # wildcard), тому payload.txt лежить у extract\source\...,
+                # не прямо в extract\ — шукаємо за іменем, не фіксованим шляхом.
+                $b2ExtractedPayload = Get-ChildItem -LiteralPath $b2ExtractDir -Recurse -Filter "payload.txt" -File -ErrorAction SilentlyContinue | Select-Object -First 1
+                Test-BRAVOCondition -Condition (
+                    [bool]$b2ExtractLegacy.Success -and [bool]$b2ExtractLegacy.LegacyBomPasswordFallbackUsed -and
+                    ($null -ne $b2ExtractedPayload) -and
+                    ([IO.File]::ReadAllText($b2ExtractedPayload.FullName) -eq "B2 BOM fallback self-test payload")
+                ) -Name "B2/ExtractionFallsBackToLegacyBomPasswordWithCorrectContent" `
+                    -Failure "Invoke-BRAVOSevenZipExtraction має відновити правильний вміст через legacy BOM fallback; Success=$($b2ExtractLegacy.Success),Fallback=$($b2ExtractLegacy.LegacyBomPasswordFallbackUsed)"
+
+                # Невірний (НЕ legacy) пароль на тому самому legacy-архіві —
+                # обидві спроби (нормальна і з BOM) невдалі, без фальшивого
+                # fallback-успіху.
+                $b2WrongOnLegacy = Invoke-BRAVOSevenZipIntegrityTest `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $b2LegacyArchivePath -Password "CompletelyDifferentPassword"
+                Test-BRAVOCondition -Condition (-not [bool]$b2WrongOnLegacy.Success -and -not [bool]$b2WrongOnLegacy.LegacyBomPasswordFallbackUsed) `
+                    -Name "B2/WrongPasswordOnLegacyArchiveFailsBothAttempts" `
+                    -Failure "Дійсно невірний пароль (не legacy-варіант правильного) має провалити ОБИДВІ спроби; Success=$($b2WrongOnLegacy.Success)"
+
+                # Звичайний (пост-5.2.0, БЕЗ BOM) архів із правильним паролем —
+                # успіх з ПЕРШОЇ спроби, fallback НЕ спрацьовує.
+                $b2NormalArchivePath = Join-Path $b2TestRoot "normal.7z"
+                $b2NormalCreatePsi = New-Object System.Diagnostics.ProcessStartInfo
+                $b2NormalCreatePsi.FileName = $sevenZipToolPath
+                $b2NormalCreatePsi.Arguments = "a -y -p `"$b2NormalArchivePath`" `"$b2SourceDir`""
+                $b2NormalCreatePsi.RedirectStandardInput = $true
+                $b2NormalCreatePsi.RedirectStandardOutput = $true
+                $b2NormalCreatePsi.RedirectStandardError = $true
+                $b2NormalCreatePsi.UseShellExecute = $false
+                $b2NormalCreateProcess = New-Object System.Diagnostics.Process
+                $b2NormalCreateProcess.StartInfo = $b2NormalCreatePsi
+                [void]$b2NormalCreateProcess.Start()
+                Write-BRAVOProcessInputText -Process $b2NormalCreateProcess -Text "B2NormalPass"
+                [void]$b2NormalCreateProcess.StandardOutput.ReadToEnd()
+                [void]$b2NormalCreateProcess.StandardError.ReadToEnd()
+                $b2NormalCreateProcess.WaitForExit()
+                $b2TestNormal = Invoke-BRAVOSevenZipIntegrityTest `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $b2NormalArchivePath -Password "B2NormalPass"
+                Test-BRAVOCondition -Condition (
+                    [bool]$b2TestNormal.Success -and -not [bool]$b2TestNormal.LegacyBomPasswordFallbackUsed
+                ) -Name "B2/NormalArchiveSucceedsOnFirstAttemptNoFallback" `
+                    -Failure "Архів, створений поточною (BOM-free) версією, має пройти з ПЕРШОЇ спроби без fallback; Success=$($b2TestNormal.Success),Fallback=$($b2TestNormal.LegacyBomPasswordFallbackUsed)"
+
+                # Пошкоджений архів — fallback НЕ пропонується (класифікатор
+                # відсікає corruption-патерн ще до password-перевірки).
+                $b2CorruptArchivePath = Join-Path $b2TestRoot "corrupt.7z"
+                $b2LegacyBytes = [IO.File]::ReadAllBytes($b2LegacyArchivePath)
+                [IO.File]::WriteAllBytes($b2CorruptArchivePath, $b2LegacyBytes[0..([Math]::Max(0, $b2LegacyBytes.Length - 15))])
+                $b2TestCorrupt = Invoke-BRAVOSevenZipIntegrityTest `
+                    -SevenZipPath $sevenZipToolPath -ArchivePath $b2CorruptArchivePath -Password "B2LegacyPass"
+                Test-BRAVOCondition -Condition (-not [bool]$b2TestCorrupt.Success -and -not [bool]$b2TestCorrupt.LegacyBomPasswordFallbackUsed) `
+                    -Name "B2/CorruptedArchiveDoesNotTriggerFallback" `
+                    -Failure "Пошкоджений (усічений) архів не повинен класифікуватись як password-failure і не повинен отримувати другу спробу; Success=$($b2TestCorrupt.Success),Fallback=$($b2TestCorrupt.LegacyBomPasswordFallbackUsed)"
+            } finally {
+                if (Test-Path -LiteralPath $b2TestRoot) {
+                    Remove-Item -LiteralPath $b2TestRoot -Recurse -Force -ErrorAction SilentlyContinue
+                }
+            }
         } finally {
             if (Test-Path -LiteralPath $restoreDrillTestRoot) {
                 Remove-Item -LiteralPath $restoreDrillTestRoot -Recurse -Force -ErrorAction SilentlyContinue

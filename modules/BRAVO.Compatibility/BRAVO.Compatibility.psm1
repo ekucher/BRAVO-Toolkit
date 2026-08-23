@@ -1674,7 +1674,61 @@ function Write-BRAVOProcessInputText {
     $Process.StandardInput.Close()
 }
 
-function Invoke-BRAVOSevenZipIntegrityTest {
+function Test-BRAVOSevenZipPasswordFailure {
+    # 5.2.0 B2: єдиний доступний сигнал "невірний пароль" — 7-Zip повертає
+    # ТОЙ САМИЙ exit code 2 і для невірного пароля, і для пошкодженого
+    # архіву, і для відсутнього файлу; дедиційного класифікатора немає.
+    # Патерни емпірично перевірені на bundled Tools\7za.exe (26.02, ц.
+    # версія комплекту):
+    #   невірний пароль    -> stderr "Data Error in encrypted file.
+    #                          Wrong password? : <файл>" (per-file, header
+    #                          не шифрований — команда test/extract єдина,
+    #                          де пароль реально перевіряється);
+    #   пошкоджений архів   -> "Cannot open the file as [7z] archive" /
+    #                          "Unexpected end of archive" (без "password");
+    #   відсутній файл      -> "The system cannot find the file specified."
+    #                          (без "password").
+    # Fail-safe за конструкцією: невідомий текст -> $false (без fallback).
+    # Патерни-виключення перевіряються ПЕРШИМИ — якщо є хоч натяк на
+    # пошкодження/відсутність, fallback не пропонується, навіть якщо десь
+    # у виводі трапиться слово "password".
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$StandardError,
+        [AllowNull()][AllowEmptyString()][string]$StandardOutput
+    )
+
+    $combined = "$StandardError`n$StandardOutput"
+    if ([string]::IsNullOrWhiteSpace($combined)) { return $false }
+
+    $nonPasswordPatterns = @(
+        'Cannot open the file as \[?7z\]? archive'
+        'Unexpected end of archive'
+        'Headers [Ee]rror'
+        'cannot find the file specified'
+        'Access is denied'
+        'Is not archive'
+    )
+    foreach ($pattern in $nonPasswordPatterns) {
+        if ($combined -match $pattern) { return $false }
+    }
+
+    $passwordPatterns = @(
+        'Wrong password'
+        'Can ?not open (as )?encrypted archive'
+    )
+    foreach ($pattern in $passwordPatterns) {
+        if ($combined -match $pattern) { return $true }
+    }
+    return $false
+}
+
+function Invoke-BRAVOSevenZipIntegrityTestCore {
+    # Лок-вільне (без ретраю) ядро ОДНІЄЇ спроби "7z t" з паролем через
+    # stdin. Публічний Invoke-BRAVOSevenZipIntegrityTest нижче обгортає
+    # це ядро логікою BOM-legacy fallback (5.2.0 B2) — сам процес
+    # запуску 7-Zip тут НЕ змінився відносно 5.1.0.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
         Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же.')]
@@ -1790,10 +1844,73 @@ function Invoke-BRAVOSevenZipIntegrityTest {
     }
 }
 
-function Invoke-BRAVOSevenZipExtraction {
+function Invoke-BRAVOSevenZipIntegrityTest {
+    # 5.2.0 B2: legacy-сумісність. До 5.2.0 пароль писався в stdin через
+    # Process.StandardInput.WriteLine, який під UTF-8-консоллю (chcp 65001)
+    # мовчки додавав BOM ПЕРЕД паролем (Write-BRAVOProcessInputText вище).
+    # Архіви, створені тоді, ефективно зашифровані паролем
+    # "U+FEFF<Password>" — новий BOM-free запис (та сама
+    # Write-BRAVOProcessInputText) їх більше не відкриє нормальним
+    # паролем. Одна додаткова спроба з BOM-префіксом ЛИШЕ коли перша
+    # невдача класифікована як password-failure (Test-BRAVOSevenZipPasswordFailure)
+    # — жодна інша причина відмови (пошкоджений архів, відсутній файл,
+    # access denied) не отримує другої спроби.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [int]$TimeoutSeconds = 43200
+    )
+
+    # LegacyBomPasswordFallbackUsed/Warning: додаються на КОЖЕН шлях
+    # повернення (не лише fallback-успіх) — StrictMode-безпечна схема
+    # (той самий сентинел-патерн, що AutoArchivedMutations у
+    # BRAVO.BazaSync: поле в базовій схемі для ВСІХ результатів, а не
+    # умовно з'являється лише в одній гілці).
+    $firstAttempt = Invoke-BRAVOSevenZipIntegrityTestCore `
+        -SevenZipPath $SevenZipPath -ArchivePath $ArchivePath `
+        -Password $Password -TimeoutSeconds $TimeoutSeconds
+    $firstAttempt | Add-Member -MemberType NoteProperty -Name LegacyBomPasswordFallbackUsed -Value $false -Force
+    $firstAttempt | Add-Member -MemberType NoteProperty -Name Warning -Value $null -Force
+    if ($firstAttempt.Success) {
+        return $firstAttempt
+    }
+    if (-not (Test-BRAVOSevenZipPasswordFailure -StandardError $firstAttempt.StandardError -StandardOutput $firstAttempt.StandardOutput)) {
+        # Не password-failure (пошкодження/відсутність/доступ) — fail-closed,
+        # без другої спроби, оригінальна причина не приховується.
+        return $firstAttempt
+    }
+    $legacyPassword = ([char]0xFEFF) + $Password
+    $secondAttempt = Invoke-BRAVOSevenZipIntegrityTestCore `
+        -SevenZipPath $SevenZipPath -ArchivePath $ArchivePath `
+        -Password $legacyPassword -TimeoutSeconds $TimeoutSeconds
+    if ($secondAttempt.Success) {
+        $secondAttempt | Add-Member -MemberType NoteProperty -Name LegacyBomPasswordFallbackUsed -Value $true -Force
+        $secondAttempt | Add-Member -MemberType NoteProperty -Name Warning -Value (
+            "Архів відкрито лише через legacy BOM-у-паролі fallback (5.2.0 B2) — " +
+            "цей архів створено версією BRAVO до 5.2.0 під UTF-8-консоллю. " +
+            "Рекомендовано після успішної перевірки/відновлення створити новий backup поточною версією."
+        ) -Force
+        return $secondAttempt
+    }
+    # Обидві спроби невдалі — повертаємо ПЕРШУ (нормальний пароль) як
+    # основну причину відмови, не приховуючи її fallback-спробою.
+    return $firstAttempt
+}
+
+function Invoke-BRAVOSevenZipExtractionCore {
+    # Лок-вільне (без ретраю) ядро ОДНІЄЇ спроби "7z x" з паролем через
+    # stdin. Публічний Invoke-BRAVOSevenZipExtraction нижче обгортає це
+    # ядро логікою BOM-legacy fallback (5.2.0 B2, той самий підхід, що
+    # Invoke-BRAVOSevenZipIntegrityTest) — сам процес запуску 7-Zip тут
+    # НЕ змінився відносно 5.1.0.
     # AUD-004 (аудит P0.4): розпакування архіву в ізольований каталог для
-    # restore drill. Дзеркалить Invoke-BRAVOSevenZipIntegrityTest один в
-    # один (той самий ProcessStartInfo/stdin-пароль патерн), лише команда
+    # restore drill. Дзеркалить Invoke-BRAVOSevenZipIntegrityTestCore один
+    # в один (той самий ProcessStartInfo/stdin-пароль патерн), лише команда
     # "x" (extract, повна структура шляхів) замість "t" (test) і
     # -o<ExtractDirectory> замість цільового архіву як єдиного аргументу.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
@@ -1915,12 +2032,65 @@ function Invoke-BRAVOSevenZipExtraction {
     }
 }
 
+function Invoke-BRAVOSevenZipExtraction {
+    # 5.2.0 B2: legacy-сумісність, той самий підхід, що
+    # Invoke-BRAVOSevenZipIntegrityTest (див. коментар там) — одна
+    # додаткова спроба з BOM-префіксом ЛИШЕ коли перша невдача
+    # класифікована як password-failure.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingPlainTextForPassword', 'Password',
+        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же.')]
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$SevenZipPath,
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [Parameter(Mandatory = $true)][string]$Password,
+        [Parameter(Mandatory = $true)][string]$ExtractDirectory,
+        [int]$TimeoutSeconds = 43200
+    )
+
+    $firstAttempt = Invoke-BRAVOSevenZipExtractionCore `
+        -SevenZipPath $SevenZipPath -ArchivePath $ArchivePath -Password $Password `
+        -ExtractDirectory $ExtractDirectory -TimeoutSeconds $TimeoutSeconds
+    $firstAttempt | Add-Member -MemberType NoteProperty -Name LegacyBomPasswordFallbackUsed -Value $false -Force
+    $firstAttempt | Add-Member -MemberType NoteProperty -Name Warning -Value $null -Force
+    if ($firstAttempt.Success) {
+        return $firstAttempt
+    }
+    if (-not (Test-BRAVOSevenZipPasswordFailure -StandardError $firstAttempt.StandardError -StandardOutput $firstAttempt.StandardOutput)) {
+        return $firstAttempt
+    }
+    $legacyPassword = ([char]0xFEFF) + $Password
+    # -y (yes to all) на другій спробі перезаписує будь-який частковий/
+    # спотворений вивід першої невдалої спроби в тому самому каталозі.
+    $secondAttempt = Invoke-BRAVOSevenZipExtractionCore `
+        -SevenZipPath $SevenZipPath -ArchivePath $ArchivePath -Password $legacyPassword `
+        -ExtractDirectory $ExtractDirectory -TimeoutSeconds $TimeoutSeconds
+    if ($secondAttempt.Success) {
+        $secondAttempt | Add-Member -MemberType NoteProperty -Name LegacyBomPasswordFallbackUsed -Value $true -Force
+        $secondAttempt | Add-Member -MemberType NoteProperty -Name Warning -Value (
+            "Архів відкрито лише через legacy BOM-у-паролі fallback (5.2.0 B2) — " +
+            "цей архів створено версією BRAVO до 5.2.0 під UTF-8-консоллю. " +
+            "Рекомендовано після успішного відновлення створити новий backup поточною версією."
+        ) -Force
+        return $secondAttempt
+    }
+    return $firstAttempt
+}
+
 function Get-BRAVOSevenZipArchiveEntries {
     # Inventory вмісту 7z-архіву для накопичувальної Trace-MDZ моделі
     # (Maintenance): список entries з Path/Size/CRC — саме те, що потрібно
     # для перевірки immutability старих записів і відбору нових кандидатів
     # перед `7za a`. Дзеркалить Invoke-BRAVOSevenZipIntegrityTest (той самий
     # ProcessStartInfo/stdin-пароль патерн), команда "l -slt" замість "t".
+    # 5.2.0 B2: BOM-legacy fallback СВІДОМО НЕ додано сюди — емпірично
+    # перевірено (bundled Tools\7za.exe), що "l -slt" на архіві з
+    # НЕшифрованими заголовками (проєкт ніколи не використовує -mhe,
+    # див. OPERATIONS.md) повертає повний список Path/Size/CRC з exit
+    # code 0 навіть із ЗАВІДОМО невірним паролем — сам лістинг пароль не
+    # перевіряє. Fallback тут був би мертвим кодом: гілка password-failure
+    # ніколи не спрацює, бо перша спроба з "невірним" паролем і так Success.
     # NB: у BRAVO.DataRestore існує приватний Get-BRAVOSevenZipArchiveInventory
     # (лічильники FileCount/TotalUncompressedBytes для free-space preflight,
     # без CRC і без списку) — свідомо НЕ об'єднано в цьому завданні, щоб не

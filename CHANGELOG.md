@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- FIX (сумісність, B2): додано legacy BOM-у-паролі fallback для
+  читання архівів, створених версіями BRAVO до 5.2.0. До 5.2.0 пароль
+  7-Zip писався в stdin через `Process.StandardInput.WriteLine`, який
+  під UTF-8-консоллю (`chcp 65001`) мовчки додавав BOM (U+FEFF) ПЕРЕД
+  паролем — такі архіви ефективно зашифровані паролем `U+FEFF<пароль>`.
+  Новий BOM-free запис (`Write-BRAVOProcessInputText`, впроваджено в
+  циклі dev.1) більше не відкриває їх нормальним паролем — без цього
+  фіксу читання/відновлення legacy-backup під UTF-8-хостом провалилось
+  би з "невірний пароль" на справді валідному архіві.
+  `Invoke-BRAVOSevenZipIntegrityTest`/`Invoke-BRAVOSevenZipExtraction`
+  (`modules/BRAVO.Compatibility`) тепер: (1) звичайна спроба з
+  нормальним паролем; (2) якщо невдача класифікована як password-failure
+  (новий `Test-BRAVOSevenZipPasswordFailure` — розпізнає stderr-патерни
+  7-Zip, емпірично перевірені на bundled `Tools\7za.exe`: "Wrong
+  password"/"Data Error in encrypted file" -> кандидат, "Cannot open
+  the file as archive"/"Unexpected end of archive"/"cannot find the
+  file specified"/"Access is denied" -> НЕ кандидат, жодного fallback)
+  — рівно ОДНА повторна спроба з `U+FEFF + пароль`; (3) успіх другої
+  спроби позначається `LegacyBomPasswordFallbackUsed=$true` і `Warning`
+  з рекомендацією створити новий backup поточною версією; (4) невдача
+  обох спроб повертає ПЕРШУ (нормальну) причину відмови — без
+  прихованої другої спроби. `Get-BRAVOSevenZipArchiveEntries` (listing)
+  свідомо НЕ отримав fallback: заголовки Trace-архівів завжди
+  нешифровані (без `-mhe`), тому listing не декриптує вміст і не
+  залежить від правильності пароля — гілка ніколи б не спрацювала.
+  Реалізація rename-безпечна щодо існуючих викликачів: обидві публічні
+  функції зберегли сигнатуру, старий однопрохідний код виділено в
+  приватні `*Core`-версії (без функціональних змін), обгорнуті новою
+  retry-логікою.
+
 - НОВА ОПЦІЯ (BAZA, опційна, вимкнена за замовчуванням): `backupMonitoring.
   SFTP.BAZA.AutoArchiveMutationThreshold` (`BRAVO.config`, default `0`) для
   розгортань із великою кількістю незалежних майданчиків клієнтів, де
