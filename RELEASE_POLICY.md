@@ -1033,21 +1033,43 @@ required checks гілки master, merge PR #61 виконано admin-обхо�
   compatibility-фікс) із частковою міграцією дублюючої реалізації
   (M3-подібний refactoring-ризик).
 
-### Функціональна зміна дефолту під час DEV-LIMS acceptance `5.2.0-rc.1`
+### DEV-LIMS acceptance `5.2.0-rc.1` знайшла P0 — відкрито `5.2.0-rc.2`
 
+Реальний DEV-LIMS acceptance-прогін `rc.1` (ДНДІЛДВСЕ, 2026-08-23)
+виявив три проблеми, зафіксовані нижче. Найважливіша — P0
+data-integrity false-positive у `BRAVO_MAINTENANCE`, тому `rc.1`
+уважається **superseded**: усі три зміни функціональні, отже
+acceptance-докази `rc.1` більше не покривають runtime (принцип "Runtime
+functional diff gate", `.claude/rules/06-release-lifecycle.md`). `rc.2`
+потребує нового повного
+acceptance-прогону перед будь-якою stable promotion. Деталі —
+`CHANGELOG.md` (`## 5.2.0-rc.2`).
+
+- **`Compare-FileSizes` (P0, data-integrity): false-positive rollback
+  моделі MODEL.** Підтверджено ДВІЧІ поспіль на реальному DEV-LIMS
+  byte-точним збігом розмірів файлів на диску: сканування каталогу
+  MODEL відбувалось за ~1 сек. після завершення `bravocmd repair`/
+  екстракції з `before`-архіву — до того, як гігабайтні щойно записані
+  `.md`-файли ставали видимими для directory-enumeration. Наслідок:
+  служба BRAVO зупинялась fail-closed через артефакт перевірки, а не
+  реальну втрату даних; без фіксу повторювалось би щоночі на плановому
+  `Restore.Time`. Фікс: до 3 повторних сканувань з паузою 5с
+  (`-MaxSettleAttempts`/`-SettleDelaySeconds`), лише коли перший прохід
+  знайшов критичні розбіжності — fail-closed не послаблено (справжня
+  відсутність файлу після всіх спроб лишається CRITICAL).
 - **`RepeatAlertAfterHours` (health-alert дедуп): дефолт `6` → `0`.**
-  Виявлено під час реального DEV-LIMS acceptance (ДНДІЛДВСЕ,
-  2026-08-23): при увімкненому `AutoArchiveMutationThreshold` оператор
-  спостерігав лише перше сповіщення про `MUTATION_VIOLATION`, повторний
-  ідентичний alert протягом наступних до 6 год. мовчав
-  (`Test-AlertSuppressed`, `modules/BRAVO.Health/BRAVO.Health.Runtime.ps1`).
-  Свідоме рішення: дедуп для alert-рівня (WARNING/ERROR/CRITICAL)
-  вимикається за замовчуванням — кожен цикл, поки проблема триває,
-  надсилає сповіщення заново, навіть якщо воно ідентичне попередньому.
-  SUCCESS-звіт дедупу ніколи не підлягав (окрема гілка коду без
-  fingerprint-перевірки) і цією зміною не зачіпається. Це функціональна
-  зміна поведінки за замовчуванням (не docs-only), свідомо застосована
-  до `5.2.0-rc.1` до завершення acceptance і публікації тега/artifact —
-  вимагає перестемпування (`buildId`/`sourceCommit`/`RUNTIME_MANIFEST`)
-  перед тегуванням. Деталі — `CHANGELOG.md` (`## 5.2.0-rc.1`, Upgrade
-  notes).
+  Виявлено під час того самого acceptance-прогону: при увімкненому
+  `AutoArchiveMutationThreshold` оператор спостерігав лише перше
+  сповіщення про `MUTATION_VIOLATION`, повторний ідентичний alert
+  протягом наступних до 6 год. мовчав (`Test-AlertSuppressed`,
+  `modules/BRAVO.Health/BRAVO.Health.Runtime.ps1`). Свідоме рішення:
+  дедуп для alert-рівня (WARNING/ERROR/CRITICAL) вимикається за
+  замовчуванням — кожен цикл, поки проблема триває, надсилає
+  сповіщення заново, навіть якщо воно ідентичне попередньому.
+  SUCCESS-звіт дедупу ніколи не підлягав і цією зміною не зачіпається.
+- **Логування очікування операційного lock.** Виявлена прогалина
+  спостережності під час розслідування того самого інциденту:
+  `Enter-BRAVOMaintenanceOperationLock`/`Enter-BRAVOArchiveProcessLock`
+  чекали звільнення спільного `BRAVO_OPERATION.lock` мовчки. Тепер
+  логує, хто саме тримає lock, і скільки лишилось чекати — чисто
+  діагностична зміна, без впливу на exit-коди чи fail-closed поведінку.
