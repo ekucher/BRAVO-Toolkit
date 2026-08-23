@@ -4543,7 +4543,12 @@ function Compare-FileSizes {
         [string]$BeforeFile,
         [string]$ModelPath,
         [int]$MinSizeBytes = 2048,
-        [AllowNull()][string]$MainModelRelativePath = $null
+        [AllowNull()][string]$MainModelRelativePath = $null,
+        # Settle-and-retry (нижче): production-дефолти. Параметризовано, щоб
+        # self-test міг перевірити саму механіку з короткою затримкою і
+        # окремо — інші сценарії без штучного уповільнення (MaxSettleAttempts=1).
+        [int]$MaxSettleAttempts = 3,
+        [int]$SettleDelaySeconds = 5
     )
 
     try {
@@ -4585,91 +4590,118 @@ function Compare-FileSizes {
             }
         }
 
+        # Settle-and-retry (аудит DEV-LIMS 2026-08-23): одразу після великих
+        # I/O-операцій (bravocmd repair, 7z-екстракція гігабайтних .md)
+        # перше сканування каталогу може застати файл, що ще не встиг
+        # з'явитися видимим для directory-enumeration (підтверджено
+        # відтворено двічі поспіль — файли з правильним розміром з'являлись
+        # за секунди після хибного "ФАЙЛ ВІДСУТНІЙ", без жодної реставрації
+        # чи відкату між першою і повторною перевіркою). Повторюємо
+        # сканування+порівняння до $maxSettleAttempts разів із паузою — лише
+        # коли перший прохід знайшов критичні розбіжності; чисте сканування
+        # (немає критичних файлів) завершується одразу, без затримки.
+        # Це НЕ послаблює fail-closed: якщо після всіх спроб файл усе ще
+        # відсутній — критичний статус і відкат лишаються без змін.
         $criticalFiles = @()
         $removedByRepairFiles = @()
         $mainModelValid = $true
-        $currentLookup = @{}
-        foreach ($file in @(Get-BRAVOFiles -Path $ModelPath -Recurse)) {
-            $relativePath = $file.FullName.Replace($ModelPath, "").TrimStart('\')
-            $currentLookup[$relativePath] = [long]$file.Length
-        }
-
-        # Каталог MODEL повністю порожній після repair — критично незалежно
-        # від того, що показує посегментне порівняння нижче (defense-in-depth
-        # для випадку, коли before-CSV сам по собі валідний, але repair
-        # знищив усе).
-        if ($currentLookup.Count -eq 0) {
-            $errorMsg = "Каталог MODEL порожній після реставрації: $ModelPath"
-            Write-Log $errorMsg -Level "ERROR"
-            Send-SlackAlert -Message $errorMsg -IsCritical
-            $script:criticalErrorOccurred = $true
-            $script:restoreIntegrityFailed = $true
-            return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
-        }
-
-        # Перевіряємо початковий набір, а не лише поточні файли. Інакше повністю
-        # видалений bravocmd.exe файл не потрапляв до результату порівняння.
-        foreach ($item in $initialData) {
-            $relativePath = [string]$item.RelativePath
-            $initialSizeBytes = [long]$item.SizeBytes
-            $currentSizeBytes = if ($currentLookup.ContainsKey($relativePath)) {
-                [long]$currentLookup[$relativePath]
-            } else {
-                -1
+        for ($settleAttempt = 1; $settleAttempt -le $MaxSettleAttempts; $settleAttempt++) {
+            $criticalFiles = @()
+            $removedByRepairFiles = @()
+            $mainModelValid = $true
+            $currentLookup = @{}
+            foreach ($file in @(Get-BRAVOFiles -Path $ModelPath -Recurse)) {
+                $relativePath = $file.FullName.Replace($ModelPath, "").TrimStart('\')
+                $currentLookup[$relativePath] = [long]$file.Length
             }
-            $isMissing = $currentSizeBytes -lt 0
-            $isMainModelFile = (
-                -not [string]::IsNullOrWhiteSpace($MainModelRelativePath) -and
-                $relativePath -ieq $MainModelRelativePath
-            )
-            $reductionPercent = if (-not $isMissing -and $initialSizeBytes -gt 0) {
-                (($initialSizeBytes - $currentSizeBytes) / [double]$initialSizeBytes) * 100
-            } else {
-                100
-            }
-            $isCriticalReduction = (
-                $initialSizeBytes -gt $MinSizeBytes -and
-                $currentSizeBytes -lt $initialSizeBytes -and
-                ($currentSizeBytes -le $MinSizeBytes -or $reductionPercent -ge 50)
-            )
-            # Fail-closed: без відомого MainModelRelativePath (викликач не
-            # зміг визначити основну модель) будь-який відсутній файл лишається
-            # критичним — стара поведінка. З відомим MainModelRelativePath
-            # не критичним є зникнення ЛИШЕ транзитних артефактів bravocmd:
-            #   *.NNN (тризначне розширення) — сегментні файли, які repair
-            #     (mdrepair/db_remove/db_commit) штатно перебудовує;
-            #   *.$$$ — тимчасові робочі файли bravocmd (пише перебудоване,
-            #     потім перейменовує/видаляє). Їх наявність = залишок
-            #     перерваного repair, а не дані; зникнення НЕ критичне.
-            # .md (зокрема lims0.md/lims1.md — продовження основної моделі — чи
-            # табличні DEPART.md), файли ієрархії (.h1/.h2) та будь-що інше при
-            # зникненні — критична втрата даних, rollback-тригер.
-            $isTransientRepairArtifact = $relativePath -match '(\.\d{3}$)|(\.\$\$\$$)'
-            $isCriticalMissing = $isMissing -and (
-                $isMainModelFile -or
-                [string]::IsNullOrWhiteSpace($MainModelRelativePath) -or
-                -not $isTransientRepairArtifact
-            )
 
-            if ($isMissing -and -not $isCriticalMissing) {
-                $removedByRepairFiles += [PSCustomObject]@{
-                    File = $relativePath
-                    BeforeSizeBytes = $initialSizeBytes
+            # Каталог MODEL повністю порожній після repair — критично незалежно
+            # від того, що показує посегментне порівняння нижче (defense-in-depth
+            # для випадку, коли before-CSV сам по собі валідний, але repair
+            # знищив усе). Не пов'язано з settle-race (порожній каталог не
+            # самозцілюється), retry тут зайвий — fail-closed негайно.
+            if ($currentLookup.Count -eq 0) {
+                $errorMsg = "Каталог MODEL порожній після реставрації: $ModelPath"
+                Write-Log $errorMsg -Level "ERROR"
+                Send-SlackAlert -Message $errorMsg -IsCritical
+                $script:criticalErrorOccurred = $true
+                $script:restoreIntegrityFailed = $true
+                return New-BRAVOCompareFileSizesResult -HasCriticalChanges $true -MainModelValid $false
+            }
+
+            # Перевіряємо початковий набір, а не лише поточні файли. Інакше повністю
+            # видалений bravocmd.exe файл не потрапляв до результату порівняння.
+            foreach ($item in $initialData) {
+                $relativePath = [string]$item.RelativePath
+                $initialSizeBytes = [long]$item.SizeBytes
+                $currentSizeBytes = if ($currentLookup.ContainsKey($relativePath)) {
+                    [long]$currentLookup[$relativePath]
+                } else {
+                    -1
                 }
-                continue
+                $isMissing = $currentSizeBytes -lt 0
+                $isMainModelFile = (
+                    -not [string]::IsNullOrWhiteSpace($MainModelRelativePath) -and
+                    $relativePath -ieq $MainModelRelativePath
+                )
+                $reductionPercent = if (-not $isMissing -and $initialSizeBytes -gt 0) {
+                    (($initialSizeBytes - $currentSizeBytes) / [double]$initialSizeBytes) * 100
+                } else {
+                    100
+                }
+                $isCriticalReduction = (
+                    $initialSizeBytes -gt $MinSizeBytes -and
+                    $currentSizeBytes -lt $initialSizeBytes -and
+                    ($currentSizeBytes -le $MinSizeBytes -or $reductionPercent -ge 50)
+                )
+                # Fail-closed: без відомого MainModelRelativePath (викликач не
+                # зміг визначити основну модель) будь-який відсутній файл лишається
+                # критичним — стара поведінка. З відомим MainModelRelativePath
+                # не критичним є зникнення ЛИШЕ транзитних артефактів bravocmd:
+                #   *.NNN (тризначне розширення) — сегментні файли, які repair
+                #     (mdrepair/db_remove/db_commit) штатно перебудовує;
+                #   *.$$$ — тимчасові робочі файли bravocmd (пише перебудоване,
+                #     потім перейменовує/видаляє). Їх наявність = залишок
+                #     перерваного repair, а не дані; зникнення НЕ критичне.
+                # .md (зокрема lims0.md/lims1.md — продовження основної моделі — чи
+                # табличні DEPART.md), файли ієрархії (.h1/.h2) та будь-що інше при
+                # зникненні — критична втрата даних, rollback-тригер.
+                $isTransientRepairArtifact = $relativePath -match '(\.\d{3}$)|(\.\$\$\$$)'
+                $isCriticalMissing = $isMissing -and (
+                    $isMainModelFile -or
+                    [string]::IsNullOrWhiteSpace($MainModelRelativePath) -or
+                    -not $isTransientRepairArtifact
+                )
+
+                if ($isMissing -and -not $isCriticalMissing) {
+                    $removedByRepairFiles += [PSCustomObject]@{
+                        File = $relativePath
+                        BeforeSizeBytes = $initialSizeBytes
+                    }
+                    continue
+                }
+
+                if ($isCriticalMissing -or $isCriticalReduction) {
+                    if ($isMainModelFile) {
+                        $mainModelValid = $false
+                    }
+                    $criticalFiles += [PSCustomObject]@{
+                        File = $relativePath
+                        BeforeSizeBytes = $initialSizeBytes
+                        AfterSizeBytes = $currentSizeBytes
+                        Missing = $isMissing
+                    }
+                }
             }
 
-            if ($isCriticalMissing -or $isCriticalReduction) {
-                if ($isMainModelFile) {
-                    $mainModelValid = $false
-                }
-                $criticalFiles += [PSCustomObject]@{
-                    File = $relativePath
-                    BeforeSizeBytes = $initialSizeBytes
-                    AfterSizeBytes = $currentSizeBytes
-                    Missing = $isMissing
-                }
+            if (@($criticalFiles).Count -eq 0 -or $settleAttempt -ge $MaxSettleAttempts) {
+                break
             }
+            Write-Log ("Знайдено $(@($criticalFiles).Count) файл(ів) з критичною зміною розміру одразу " +
+                "після реставрації (спроба $settleAttempt з $MaxSettleAttempts) — можлива затримка появи " +
+                "щойно записаних великих файлів у directory-enumeration; повторна перевірка через " +
+                "$SettleDelaySeconds с...") -Level "WARNING"
+            Start-Sleep -Seconds $SettleDelaySeconds
         }
 
         if (@($removedByRepairFiles).Count -gt 0) {

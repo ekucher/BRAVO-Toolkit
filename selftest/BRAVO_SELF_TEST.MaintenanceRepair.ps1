@@ -74,7 +74,21 @@ function Invoke-BRAVOCompareFileSizesScenario {
     param(
         [Parameter(Mandatory = $true)][hashtable]$BeforeFiles,
         [Parameter(Mandatory = $true)][hashtable]$AfterFiles,
-        [string]$MainModelRelativePath
+        [string]$MainModelRelativePath,
+        # Класифікаційні сценарії нижче перевіряють файли, які СПРАВДІ не
+        # з'являться (не settle-race) — MaxSettleAttempts=1 тримає їх
+        # миттєвими. Окремий SettleRetry-сценарій нижче явно перевизначає
+        # обидва параметри для реальної (короткої) затримки.
+        [int]$MaxSettleAttempts = 1,
+        [int]$SettleDelaySeconds = 0,
+        # Викликається ПІСЛЯ створення AfterFiles на диску, ДО Compare-FileSizes —
+        # settle-retry сценарій використовує це, щоб дописати файл, якого
+        # спочатку не було, поки перша спроба порівняння вже "бачила" диск.
+        [scriptblock]$AfterFilesWritten,
+        # За замовчуванням — стандартний ізольований модуль (реальний
+        # Get-BRAVOFiles). Settle-retry сценарій підміняє на модуль із
+        # мок-Get-BRAVOFiles, що приховує один файл лише на першому виклику.
+        $CompareModule = $compareFileSizesModule
     )
     $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ("BRAVO_COMPAREFILESIZES_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -92,11 +106,17 @@ function Invoke-BRAVOCompareFileSizesScenario {
         })
         $beforeRows | Export-Csv -Path $beforeCsvPath -NoTypeInformation -Encoding UTF8
 
-        return & $compareFileSizesModule {
-            param($BeforeFile, $ModelPath, $MainModelRelativePath)
+        if ($AfterFilesWritten) {
+            & $AfterFilesWritten $scenarioRoot
+        }
+
+        return & $CompareModule {
+            param($BeforeFile, $ModelPath, $MainModelRelativePath, $MaxSettleAttempts, $SettleDelaySeconds)
             Set-StrictMode -Version Latest
-            Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath $MainModelRelativePath
-        } $beforeCsvPath $scenarioRoot $MainModelRelativePath
+            Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 `
+                -MainModelRelativePath $MainModelRelativePath `
+                -MaxSettleAttempts $MaxSettleAttempts -SettleDelaySeconds $SettleDelaySeconds
+        } $beforeCsvPath $scenarioRoot $MainModelRelativePath $MaxSettleAttempts $SettleDelaySeconds
     } finally {
         if (Test-Path -LiteralPath $scenarioRoot) {
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -331,6 +351,74 @@ Test-BRAVOCondition `
     ) `
     -Name "Maintenance/MainModelHintDerivedFromMainModelFile" `
     -Failure "hint для Compare-FileSizes має деривуватися від MAIN_MODEL_FILE правилом Replace+TrimStart (як writer before-CSV), а не передаватися здогадом `"`$MODEL_NAME.md`""
+
+# ============================================================
+# Settle-and-retry (аудит DEV-LIMS 2026-08-23): підтверджений двічі
+# false-positive — велика .md з'являлась на диску за секунди після
+# хибного "ФАЙЛ ВІДСУТНІЙ" першого сканування, без жодного реального
+# відкату. Compare-FileSizes тепер повторює сканування+порівняння до
+# MaxSettleAttempts разів із паузою SettleDelaySeconds, коли перший
+# прохід знайшов критичні розбіжності.
+# ============================================================
+
+# --- Файл "не видно" при першому скануванні, але видно з другого -> settle-
+# retry має "самозцілитись": HasCriticalChanges=false, MainModelValid=true.
+# Детерміністично, БЕЗ потоків/таймерів/фонових процесів: окремий ізольований
+# модуль з мок-Get-BRAVOFiles, який рахує власні виклики і на першому виклику
+# відфільтровує рівно один (наперед заданий) файл із результату реального
+# BRAVO.Compatibility\Get-BRAVOFiles — той самий синхронний потік виконання,
+# що й production-код, лише детермінований момент "появи" файлу замість
+# залежності від реального I/O-таймінгу.
+$settleRetryStubText = @'
+function Write-Log { param($Message, [string]$Level = 'INFO') }
+function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+function Get-BRAVOFiles {
+    param($Path, [switch]$Recurse)
+    $global:BRAVOSelfTestSettleRetryCallCount++
+    $realFiles = @(BRAVO.Compatibility\Get-BRAVOFiles -Path $Path -Recurse:$Recurse)
+    if ($global:BRAVOSelfTestSettleRetryCallCount -eq 1 -and
+        -not [string]::IsNullOrWhiteSpace([string]$global:BRAVOSelfTestSettleRetryHiddenFile)) {
+        return @($realFiles | Where-Object { $_.FullName -ne $global:BRAVOSelfTestSettleRetryHiddenFile })
+    }
+    return $realFiles
+}
+'@
+$settleRetryModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($settleRetryStubText + "`n" + $maintenanceRepairScriptText) `
+    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
+
+$global:BRAVOSelfTestSettleRetryCallCount = 0
+$global:BRAVOSelfTestSettleRetryHiddenFile = $null
+$resultSettleRecovers = Invoke-BRAVOCompareFileSizesScenario `
+    -CompareModule $settleRetryModule `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -MaxSettleAttempts 3 -SettleDelaySeconds 1 `
+    -AfterFilesWritten {
+        param($ScenarioRoot)
+        $global:BRAVOSelfTestSettleRetryHiddenFile = Join-Path $ScenarioRoot 'TestProject.md'
+    }
+$global:BRAVOSelfTestSettleRetryCallCount = 0
+$global:BRAVOSelfTestSettleRetryHiddenFile = $null
+Test-BRAVOCondition `
+    -Condition (-not $resultSettleRecovers.HasCriticalChanges -and $resultSettleRecovers.MainModelValid) `
+    -Name "Maintenance/CompareFileSizesSettleRetryRecoversTransientlyMissingFile" `
+    -Failure "файл, невидимий лише на першому скануванні, має привести до HasCriticalChanges=false (settle-retry має підхопити його на повторному скануванні); отримано HasCriticalChanges=$($resultSettleRecovers.HasCriticalChanges), MainModelValid=$($resultSettleRecovers.MainModelValid)"
+
+# --- Файл СПРАВДІ ніколи не з'являється (реальна втрата даних) -> fail-closed
+# зберігається навіть із увімкненим retry: після вичерпання спроб лишається
+# CRITICAL. MaxSettleAttempts=2/SettleDelaySeconds=1 тримає сценарій швидким
+# (~1с), а не production-значення 3x5с.
+$resultSettleStillMissing = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'ACT.000' = 100000 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -MaxSettleAttempts 2 -SettleDelaySeconds 1
+Test-BRAVOCondition `
+    -Condition ($resultSettleStillMissing.HasCriticalChanges -and -not $resultSettleStillMissing.MainModelValid) `
+    -Name "Maintenance/CompareFileSizesSettleRetryStillCriticalWhenGenuinelyMissing" `
+    -Failure "справжня втрата основної моделі (файл ніколи не з'являється) має лишатись CRITICAL навіть із увімкненим settle-retry — fail-closed не повинен послаблюватися"
 
 # ============================================================
 # Discord HTTP 429: обмежений retry з пріоритетом на Retry-After.
