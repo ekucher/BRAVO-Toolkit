@@ -310,6 +310,44 @@ production-запуск не блокується. Якщо файл був пі
 guard-перед-Import у кожному entrypoint) та
 `ExitCodes/RuntimeIntegrityViolationPriority`.
 
+## 4.2. Health watchdog: контрольований виняток read-only
+
+`BRAVO_HEALTH.ps1` за задумом read-only: перевіряє, не змінює. Є один
+навмисний, вузько-скоуповий виняток — service quiescence recovery.
+
+Перед зупинкою служб Maintenance/DataRestore пишуть атомарний
+ownership-маркер
+`C:\ProgramData\BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json`
+(`schemaVersion`/`owner`/`hostname`/`pid`/`processStartTime`/`services`).
+Якщо процес, що зупинив служби, аварійно завершується до їх
+відновлення, служби лишаються `Stopped` без жодного власника — саме
+цей сценарій закриває watchdog.
+
+Health-watchdog (виконується під `SYSTEM`, як і решта заплановних
+завдань) запускає службу **лише** за одночасного виконання всіх умов:
+
+- маркер існує і проходить схема-валідацію (не пошкоджений, очікувана
+  `schemaVersion`);
+- власник маркера (`pid` + `processStartTime`, PID-реюз виключено
+  звіркою обох полів) мертвий — власник, що ще живий, ніколи не
+  перебивається;
+- `restartSuppressed=false` у маркері;
+- стартується **рівно** та служба, що перелічена в маркері — жодного
+  розширення на "усі Stopped-служби" чи довільний allowlist поза
+  маркером.
+
+`DataRestore` пише свій маркер одразу з `restartSuppressed=true`:
+жорстке переривання посеред реставрації лишає live filesystem у
+невизначеному стані, тому watchdog для цього шляху ніколи не
+автостартує служби — лише алертить оператора.
+
+Це єдиний шлях, яким `BRAVO_HEALTH.ps1` виконує мутуючу дію
+(`Start-Service`) — і лише за валідного ownership-доказу, ніколи для
+служби, зупиненої вручну адміністратором (немає валідного BRAVO-маркера
+= немає автостарту). Fail-closed: пошкоджений/відсутній/недійсний
+маркер = watchdog не стартує нічого. Детальніше — `THREAT_MODEL.md`
+§9.
+
 ## 5. Модель ACL
 
 `BRAVO_TASKS_INSTALL.ps1` (за `schedulerSettings.RequireProtectedRuntime`,
