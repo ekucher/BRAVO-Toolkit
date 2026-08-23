@@ -51,6 +51,30 @@
   Впливає лише на self-test; жодної зміни production-коду чи політики
   ASCII-перевірки launcher-ів.
 
+- **UX/DIAGNOSTICS: діагностичне збагачення помилки завантаження
+  `BRAVO.config`.** На реальному DEV-майданчику (2026-08-24, Windows NT
+  6.2.9200 / PowerShell 3.0 — `Get-BRAVOOSSupportTier` класифікує
+  PowerShell <4.0 як `Unsupported` незалежно від ОС) виконання
+  `BRAVO.config` під час `Import-BravoConfiguration` завершувалось голою
+  `.NET NullReferenceException` ("Ссылка на объект не указывает на
+  экземпляр объекта") без жодного натяку на причину — блокувало
+  `BRAVO_SETUP.ps1`, `BRAVO_SELF_TEST.ps1` і `BRAVO_DRY_RUN.ps1`
+  однаково (усі entrypoint-и зрештою проходять через ту саму спільну
+  точку завантаження конфігурації). `Get-BRAVOOSSupportTier`
+  (`BRAVO.Compatibility`) — уже канонічне джерело цієї класифікації
+  (використовують `Maintenance`/`Health`/`Archive`), але викликається
+  лише ПІСЛЯ успішного завантаження конфігурації — тобто жодного шансу
+  спрацювати раніше за цей крах не було. `Import-BravoConfiguration`
+  тепер, лише в catch-блоці навколо виконання `BRAVO.config`, викликає
+  той самий канонічний `Get-BRAVOOSSupportTier` і за наявності
+  непідтримуваного середовища додає його `.Message` до кинутої помилки —
+  оригінальна причина ніколи не губиться, і збагачення саме не може
+  замаскувати первинну помилку новою (мовчазний fallback, якщо модуль
+  `BRAVO.Compatibility` теж недоступний). На `Supported`-середовищах
+  повідомлення не змінюється. Backport сумісності з PowerShell 3.0 НЕ
+  виконано (нижче задокументованого baseline 5.1) — рекомендація й далі
+  «оновіть Windows Management Framework».
+
 ---
 
 ## 5.2.0-rc.3 — 2026-08-24 (candidate, pending acceptance)
