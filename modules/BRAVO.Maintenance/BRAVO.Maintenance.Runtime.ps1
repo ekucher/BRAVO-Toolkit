@@ -4623,7 +4623,25 @@ function Compare-FileSizes {
             $removedByRepairFiles = @()
             $mainModelValid = $true
             $currentLookup = @{}
-            foreach ($file in @(Get-BRAVOFiles -Path $ModelPath -Recurse)) {
+            # [IO.DirectoryInfo]::EnumerateFiles замість Get-BRAVOFiles/Get-ChildItem
+            # -Recurse (реальний DEV-LIMS інцидент 2026-08-24, ДНДІЛДВСЕ): на великому
+            # й глибоко вкладеному дереві MODEL рекурсивний PowerShell-провайдер
+            # ненадійно/неповно перераховував файли (ті самі симптоми, через які
+            # Check-MdFileSizes і before-snapshot нижче вже обходять провайдер
+            # напряму через .NET) — з -ErrorAction SilentlyContinue це мовчки
+            # повертало неповний список, і майже вся модель (усе, крім щойно
+            # переписаних repair .NNN-сегментів) щоразу класифікувалась як
+            # "ФАЙЛ ВІДСУТНІЙ", детерміновано, навіть одразу після підтвердженого
+            # цілісним rollback-відновлення. Settle-retry вище не рятує, бо
+            # повторний виклик того самого ненадійного шляху дає той самий
+            # неповний результат — причина не в затримці появи файлів, а в самій
+            # enumeration. Приводимо до того самого надійного механізму, що вже
+            # використовує before-snapshot (:7130) і Check-MdFileSizes (:5606).
+            $modelDirectoryInfo = New-Object System.IO.DirectoryInfo($ModelPath)
+            foreach ($file in $modelDirectoryInfo.EnumerateFiles('*', [System.IO.SearchOption]::AllDirectories)) {
+                if (($file.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) -ne 0) {
+                    continue
+                }
                 $relativePath = $file.FullName.Replace($ModelPath, "").TrimStart('\')
                 $currentLookup[$relativePath] = [long]$file.Length
             }

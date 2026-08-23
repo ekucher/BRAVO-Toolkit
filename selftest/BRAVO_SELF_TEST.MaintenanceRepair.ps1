@@ -61,15 +61,18 @@ foreach ($scenario in $modelContractScenarios) {
 # ============================================================
 # Compare-FileSizes: RemovedByRepair vs CRITICAL класифікація.
 # ============================================================
+# Get-BRAVOFiles НЕ стабиться: Compare-FileSizes після виправлення 2026-08-24
+# читає MODEL напряму через [IO.DirectoryInfo]::EnumerateFiles (той самий
+# надійний механізм, що вже використовують Check-MdFileSizes і before-CSV
+# snapshot) — Get-BRAVOFiles більше не на шляху виклику.
 $compareFileSizesStubText = @'
 function Write-Log { param($Message, [string]$Level = 'INFO') }
 function Send-SlackAlert { param($Message, [switch]$IsCritical) }
-function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
 function Write-BRAVOProgressDetail { param([AllowEmptyString()][string]$Detail) }
 '@
 $compareFileSizesModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($compareFileSizesStubText + "`n" + $maintenanceRepairScriptText) `
-    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Write-BRAVOProgressDetail', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
+    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Write-BRAVOProgressDetail', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
 
 function Invoke-BRAVOCompareFileSizesScenario {
     param(
@@ -362,51 +365,46 @@ Test-BRAVOCondition `
 # прохід знайшов критичні розбіжності.
 # ============================================================
 
-# --- Файл "не видно" при першому скануванні, але видно з другого -> settle-
-# retry має "самозцілитись": HasCriticalChanges=false, MainModelValid=true.
-# Детерміністично, БЕЗ потоків/таймерів/фонових процесів: окремий ізольований
-# модуль з мок-Get-BRAVOFiles, який рахує власні виклики і на першому виклику
-# відфільтровує рівно один (наперед заданий) файл із результату реального
-# BRAVO.Compatibility\Get-BRAVOFiles — той самий синхронний потік виконання,
-# що й production-код, лише детермінований момент "появи" файлу замість
-# залежності від реального I/O-таймінгу.
-$settleRetryStubText = @'
-function Write-Log { param($Message, [string]$Level = 'INFO') }
-function Send-SlackAlert { param($Message, [switch]$IsCritical) }
-function Get-BRAVOFiles {
-    param($Path, [switch]$Recurse)
-    $global:BRAVOSelfTestSettleRetryCallCount++
-    $realFiles = @(BRAVO.Compatibility\Get-BRAVOFiles -Path $Path -Recurse:$Recurse)
-    if ($global:BRAVOSelfTestSettleRetryCallCount -eq 1 -and
-        -not [string]::IsNullOrWhiteSpace([string]$global:BRAVOSelfTestSettleRetryHiddenFile)) {
-        return @($realFiles | Where-Object { $_.FullName -ne $global:BRAVOSelfTestSettleRetryHiddenFile })
+# --- Файл фізично відсутній на диску при першому скануванні, але зʼявляється
+# до другого -> settle-retry має "самозцілитись": HasCriticalChanges=false,
+# MainModelValid=true. Compare-FileSizes після виправлення 2026-08-24 читає
+# каталог напряму через [IO.DirectoryInfo]::EnumerateFiles (не через
+# shadowable Get-BRAVOFiles), тому мокати саму enumeration більше не можна —
+# файл має ГЕНУЇННО зʼявитися на диску між спробами. Пряма альтернатива
+# (System.Threading.Timer у тому самому процесі) раніше спричиняла
+# PSSessionStateBroken на межі ізольованого AST-модуля; Start-Job — окремий
+# ПРОЦЕС (не runspace/потік поточного процесу), не поділяє стан із
+# ізольованим модулем взагалі, тому той самий клас хангу тут неможливий.
+# MaxSettleAttempts/SettleDelaySeconds навмисно з запасом (6x1с) над
+# орієнтовним стартом дочірнього powershell.exe-процесу (звичайно
+# сотні мс) + 400мс запланованої затримки запису.
+$settleRetryWriteDelayMs = 400
+$settleRetryJob = $null
+try {
+    $resultSettleRecovers = Invoke-BRAVOCompareFileSizesScenario `
+        -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+        -AfterFiles  @{ 'ACT.000' = 100000 } `
+        -MainModelRelativePath 'TestProject.md' `
+        -MaxSettleAttempts 6 -SettleDelaySeconds 1 `
+        -AfterFilesWritten {
+            param($ScenarioRoot)
+            $targetPath = Join-Path $ScenarioRoot 'TestProject.md'
+            $script:settleRetryJob = Start-Job -ScriptBlock {
+                param($Path, $SizeBytes, $DelayMs)
+                Start-Sleep -Milliseconds $DelayMs
+                [IO.File]::WriteAllBytes($Path, (New-Object byte[] $SizeBytes))
+            } -ArgumentList $targetPath, 500000, $settleRetryWriteDelayMs
+        }
+    Test-BRAVOCondition `
+        -Condition (-not $resultSettleRecovers.HasCriticalChanges -and $resultSettleRecovers.MainModelValid) `
+        -Name "Maintenance/CompareFileSizesSettleRetryRecoversTransientlyMissingFile" `
+        -Failure "файл, відсутній на диску лише під час першого сканування, має привести до HasCriticalChanges=false (settle-retry має підхопити його на повторному скануванні); отримано HasCriticalChanges=$($resultSettleRecovers.HasCriticalChanges), MainModelValid=$($resultSettleRecovers.MainModelValid)"
+} finally {
+    if ($settleRetryJob) {
+        $null = $settleRetryJob | Wait-Job -Timeout 10
+        $settleRetryJob | Remove-Job -Force -ErrorAction SilentlyContinue
     }
-    return $realFiles
 }
-function Write-BRAVOProgressDetail { param([AllowEmptyString()][string]$Detail) }
-'@
-$settleRetryModule = New-BRAVOSelfTestRuntimeModule `
-    -SourceText ($settleRetryStubText + "`n" + $maintenanceRepairScriptText) `
-    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Write-BRAVOProgressDetail', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
-
-$global:BRAVOSelfTestSettleRetryCallCount = 0
-$global:BRAVOSelfTestSettleRetryHiddenFile = $null
-$resultSettleRecovers = Invoke-BRAVOCompareFileSizesScenario `
-    -CompareModule $settleRetryModule `
-    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
-    -AfterFiles  @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
-    -MainModelRelativePath 'TestProject.md' `
-    -MaxSettleAttempts 3 -SettleDelaySeconds 1 `
-    -AfterFilesWritten {
-        param($ScenarioRoot)
-        $global:BRAVOSelfTestSettleRetryHiddenFile = Join-Path $ScenarioRoot 'TestProject.md'
-    }
-$global:BRAVOSelfTestSettleRetryCallCount = 0
-$global:BRAVOSelfTestSettleRetryHiddenFile = $null
-Test-BRAVOCondition `
-    -Condition (-not $resultSettleRecovers.HasCriticalChanges -and $resultSettleRecovers.MainModelValid) `
-    -Name "Maintenance/CompareFileSizesSettleRetryRecoversTransientlyMissingFile" `
-    -Failure "файл, невидимий лише на першому скануванні, має привести до HasCriticalChanges=false (settle-retry має підхопити його на повторному скануванні); отримано HasCriticalChanges=$($resultSettleRecovers.HasCriticalChanges), MainModelValid=$($resultSettleRecovers.MainModelValid)"
 
 # --- Файл СПРАВДІ ніколи не з'являється (реальна втрата даних) -> fail-closed
 # зберігається навіть із увімкненим retry: після вичерпання спроб лишається
