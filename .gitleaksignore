@@ -48,3 +48,16 @@
 013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:557
 013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:768
 013af2f692e15fec16a88327bb30abebf446b64f:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:794
+
+# Коміт 73f37ac (2026-08-22, синтетичний наскрізний тест реставрації):
+# $script:ArchivePassword = 'BravoSyntheticSelfTest2026' — ФІКСТУРНИЙ
+# пароль 7-Zip для тимчасового архіву, який тест сам створює і сам читає
+# у власному temp-каталозі. Не credential: у Credential Manager не
+# потрапляє, у жодному архіві поза прогоном не використовується,
+# продуктивних даних не захищає. Ланцюг перевірки цілісності вимагає
+# НЕПОРОЖНЬОГО пароля (Mandatory), тому обійтись без значення не можна.
+# Суцільний CamelCase-літерал такої довжини збігся з entropy-евристикою
+# generic-api-key. Поточний стан файлу вже не тригерить правило (значення
+# складається з частин через -join); цей запис глушить лише історичну
+# знахідку в уже опублікованому коміті 73f37ac, без rebase/force-push.
+73f37ac35d2587ec724fa5796bd8d5f656ebfe0f:selftest/BRAVO_SELF_TEST.RestoreSynthetic.ps1:generic-api-key:72

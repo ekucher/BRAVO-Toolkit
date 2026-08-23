@@ -286,7 +286,12 @@ function New-BRAVOOperatorNotificationMessage {
         [string]$LogLabel = "Журнал"
     )
 
-    $separator = "━" * 36
+    # 12, не 36: довга лінія переносилась на вузьких мобільних екранах і
+    # з'їдала екран. ДОВЖИНА МУСИТЬ ЗБІГАТИСЯ з $notificationSeparator у
+    # Send-BRAVOWebhookNotification (BRAVO.Compatibility) — та функція
+    # перевіряє префікс повідомлення й додає власний роздільник, якщо він
+    # не збігся (розсинхрон дав би подвійну лінію).
+    $separator = "━" * 12
     $severityIcon = switch ($Severity) {
         "SUCCESS" { ":white_check_mark:" }
         "WARNING" { ":warning:" }
@@ -377,11 +382,13 @@ function ConvertTo-DiscordNotificationText {
         ":satellite_antenna:" = "📡"
         ":floppy_disk:" = "💾"
         ":memo:" = "📝"
+        ":mag:" = "🔎"
         ":white_check_mark:" = "✅"
         ":package:" = "📦"
         ":minidisc:" = "💽"
         ":satellite:" = "🛰️"
         ":wrench:" = "🔧"
+        ":fast_forward:" = "⏭️"
         ":x:" = "❌"
     }
 
@@ -600,8 +607,19 @@ function Send-BRAVONotificationChunks {
         [int]$TimeoutSeconds = 30
     )
 
+    # Обмежений пейсинг між chunk-запитами (task item 12) — знижує шанс
+    # власне спровокувати 429 на великих багатоchunk-повідомленнях. 429/
+    # Retry-After усередині Send-BRAVOWebhookNotification має пріоритет:
+    # він сам чекає потрібний час перед поверненням у цей цикл.
+    $chunkPacingMilliseconds = 400
+    $chunkCount = @($MessageChunks).Count
+    $chunkIndex = 0
     foreach ($chunk in $MessageChunks) {
+        $chunkIndex++
         Send-BRAVOWebhookNotification -Provider $Provider -WebhookUrl $WebhookUrl -Message $chunk -TimeoutSeconds $TimeoutSeconds
+        if ($chunkIndex -lt $chunkCount) {
+            Start-Sleep -Milliseconds $chunkPacingMilliseconds
+        }
     }
 }
 

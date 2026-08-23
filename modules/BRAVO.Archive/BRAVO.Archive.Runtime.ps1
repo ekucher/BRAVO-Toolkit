@@ -4917,6 +4917,7 @@ function Invoke-BRAVOBazaIncrementalSync {
     # можливим override, MutationPolicy, FullAuditEnabled/EveryDays.
     $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
     $mutationPolicy = $bazaSettingsEffective.MutationPolicy
+    $autoArchiveMutationThreshold = $bazaSettingsEffective.AutoArchiveMutationThreshold
     $stateRootPath = $bazaSettingsEffective.StateRoot
     # FullAuditEnabled=$false вимикає ПЕРІОДИЧНИЙ audit (FullAuditEveryDays=0
     # для модуля) — bootstrap першого запуску лишається обов'язковим і від
@@ -4969,6 +4970,7 @@ function Invoke-BRAVOBazaIncrementalSync {
         -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
         -OperationTimeoutSeconds $operationTimeoutSeconds `
         -MutationPolicy $mutationPolicy `
+        -AutoArchiveMutationThreshold $autoArchiveMutationThreshold `
         -BootstrapIfNeeded `
         -FullAuditProvider $fullAuditProvider `
         -FullAuditEveryDays $fullAuditEveryDays `

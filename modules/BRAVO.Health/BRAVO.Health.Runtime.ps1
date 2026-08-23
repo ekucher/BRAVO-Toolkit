@@ -3217,6 +3217,7 @@ function Get-SFTPHealthIssues {
                         -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
                         -OperationTimeoutSeconds ([math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)) `
                         -MutationPolicy $bazaSettingsEffective.MutationPolicy `
+                        -AutoArchiveMutationThreshold $bazaSettingsEffective.AutoArchiveMutationThreshold `
                         -WriteCheckpoint
                 }
             }
