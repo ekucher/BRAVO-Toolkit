@@ -102,6 +102,12 @@ Authenticode, підписані git tags і криптографічно під
 
 ### P1.1 — Автоматичний scheduled Restore Drill
 
+**Не входить у 5.2.0.** Цикл 5.2.0 відхилився від раніше рекомендованої
+послідовності (P1.1 мав іти одним із перших) через production-інциденти,
+що потребували негайного виправлення: подвійна реставрація, BootRestore/
+Recovery task lifecycle, watchdog/quiescence reliability, Trace/Reconcile
+reliability. P1.1 лишається пріоритетом наступного циклу.
+
 `BRAVO_RESTORE_TEST.ps1` має стати штатним елементом експлуатації, а не ручною процедурою.
 
 Цільова поведінка:
@@ -241,7 +247,17 @@ FEAT-002 реалізується після stable release artifact і, баж�
 
 Silent auto-update production серверів до завершення цих етапів заборонений архітектурно.
 
-### P3.2a — BRAVO_UPDATE.ps1: operator-triggered оновлення (план циклу 5.2.0)
+### P3.2a — BRAVO_UPDATE.ps1: operator-triggered оновлення (перенесено на 5.3.0)
+
+**Не реалізовується у 5.2.0.** Раніше запланований на цикл 5.2.0, але
+перенесений на `5.3.0`: це окремий функціональний цикл із новою
+поверхнею атаки (download release-артефакта з GitHub, перевірка
+цілісності отриманого артефакта, staging, `robocopy /MIR` у runtime,
+partial-update semantics, rollback, recovery після перерваного update,
+trust/integrity guarantees) — кожен пункт вимагає власного acceptance,
+який не повинен блокувати вже готовий 5.2.0 scope (виправлення
+production-інцидентів циклу dev.1). У коді 5.2.0 щодо P3.2a — нуль змін;
+`BRAVO_UPDATE.ps1` і `modules/BRAVO.Update/` реалізуються окремим циклом.
 
 Проміжний етап P3.2 (закриває його кроки staging + validation +
 rollback у спрощеній формі), запланований на цикл 5.2.0. Автоматизує
