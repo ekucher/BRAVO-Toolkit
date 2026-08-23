@@ -13402,6 +13402,10 @@ function Write-BRAVOLog {
     # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
     # архіві. Приймальну перевірку на DEV-LIMS не замінює.
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
+    # ConfigLoader: діагностичне збагачення помилки виконання BRAVO.config
+    # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
+    # замість голої NullReferenceException).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red

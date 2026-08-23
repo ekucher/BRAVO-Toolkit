@@ -107,6 +107,18 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 **Що означає.** `BRAVO.config` не пройшов валідацію, або ОС/PowerShell
 у рівні `Unsupported`.
 
+> **Гола `.NET`-помилка замість зрозумілого повідомлення (виправлено
+> 2026-08-24).** Якщо `BRAVO_SETUP.ps1`/`BRAVO_SELF_TEST.ps1`/
+> `BRAVO_DRY_RUN.ps1` завершуються з "Не вдалося завантажити
+> BRAVO.config ...: Ссылка на объект не указывает на экземпляр
+> объекта" (raw NullReferenceException) — реальний DEV-майданчик
+> підтвердив, що причина типово PowerShell <4.0 (`Get-BRAVOOSSupportTier`
+> класифікує це як `Unsupported` незалежно від версії ОС). Повідомлення
+> тепер додає прямий висновок `Get-BRAVOOSSupportTier` до причини —
+> перевірте `$PSVersionTable.PSVersion` і оновіть Windows Management
+> Framework до PowerShell 5.1. BRAVO не бекпортить сумісність із
+> PowerShell 3.x — це свідомо нижче baseline.
+
 **Чого не робити.** Не встановлювати `BRAVO_ALLOW_UNSUPPORTED_OS=1`
 як спосіб «прибрати помилку» — це свідоме зняття гарантій, а не
 виправлення.
