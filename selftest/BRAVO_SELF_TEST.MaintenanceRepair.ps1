@@ -65,10 +65,11 @@ $compareFileSizesStubText = @'
 function Write-Log { param($Message, [string]$Level = 'INFO') }
 function Send-SlackAlert { param($Message, [switch]$IsCritical) }
 function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
+function Write-BRAVOProgressDetail { param([AllowEmptyString()][string]$Detail) }
 '@
 $compareFileSizesModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($compareFileSizesStubText + "`n" + $maintenanceRepairScriptText) `
-    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
+    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Write-BRAVOProgressDetail', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
 
 function Invoke-BRAVOCompareFileSizesScenario {
     param(
@@ -382,10 +383,11 @@ function Get-BRAVOFiles {
     }
     return $realFiles
 }
+function Write-BRAVOProgressDetail { param([AllowEmptyString()][string]$Detail) }
 '@
 $settleRetryModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($settleRetryStubText + "`n" + $maintenanceRepairScriptText) `
-    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
+    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Write-BRAVOProgressDetail', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
 
 $global:BRAVOSelfTestSettleRetryCallCount = 0
 $global:BRAVOSelfTestSettleRetryHiddenFile = $null

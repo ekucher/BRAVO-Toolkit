@@ -4714,6 +4714,14 @@ function Compare-FileSizes {
                 "після реставрації (спроба $settleAttempt з $MaxSettleAttempts) — можлива затримка появи " +
                 "щойно записаних великих файлів у directory-enumeration; повторна перевірка через " +
                 "$SettleDelaySeconds с...") -Level "WARNING"
+            # Живий деталь на тій самій смузі "Реставрація моделі" (аудит
+            # DEV-LIMS 2026-08-24): без цього оператор, що дивиться на
+            # прогрес-бар інтерактивно, бачить лише статичний напис
+            # "Реставрація моделі" протягом усього вікна очікування (до
+            # 12x15с=180с) — виглядає як зависання, хоча перевірка активно
+            # повторюється. Write-BRAVOProgressDetail лише дописує деталь до
+            # поточної фази (BRAVO.Console), не змінює саму фазу/відсоток.
+            Write-BRAVOProgressDetail -Detail "очікую появи файлів (спроба $settleAttempt з $MaxSettleAttempts)..."
             Start-Sleep -Seconds $SettleDelaySeconds
         }
 
@@ -7149,6 +7157,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
             # Check-MdFileSizes «.md > ліміт»). Без цього знімка перерваний/
             # провальний repair неможливо відрізнити від пошкодження.
             Write-Log -Message "Збереження розмірів файлів перед реставрацією..." -Level "INFO"
+            Write-BRAVOProgressDetail -Detail "збереження розмірів файлів перед реставрацією..."
             # Той самий обхід провайдерного шару PowerShell, що й у
             # Check-MdFileSizes. EnumerateFiles не пропускає приховані й
             # системні файли, тому фільтруємо їх самі — Get-BRAVOFiles
@@ -7180,6 +7189,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 Write-Log "Видалено попередній hash-файл перед повторним створенням архіву: $beforeHashPath" -Level "WARNING"
             }
             $arcArgs = $arcCommonParams + @($beforeArchivePath, "$MODEL_PATH\*")
+            Write-BRAVOProgressDetail -Detail "архівація моделі перед реставрацією (може тривати кілька хвилин)..."
             $exitCode = Invoke-CommandWithLog `
                 -Command $ARC_PATH `
                 -Arguments $arcArgs `
@@ -7258,6 +7268,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     if ($quiescenceSuppressionReady) {
                         # Виконання реставрації через bravocmd.exe (як в еталоні)
                         $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
+                        Write-BRAVOProgressDetail -Detail "виконання bravocmd.exe repair (може тривати кілька хвилин)..."
                         $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
                         $restoreBravocmdExitCode = $exitCode
                     }
@@ -7282,6 +7293,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     } else {
                         Write-Log -Message "bravocmd.exe завершено з кодом $exitCode — реставрацію не підтверджено. Перевірка стану моделі..." -Level "WARNING"
                     }
+                    Write-BRAVOProgressDetail -Detail "перевірка результату repair..."
 
                     # Hint головної моделі — від канонічного $MAIN_MODEL_FILE тим
                     # самим правилом Replace+TrimStart, що й writer before-CSV

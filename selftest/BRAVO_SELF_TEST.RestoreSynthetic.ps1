@@ -50,12 +50,13 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
 function Write-BRAVOProcessInputText { BRAVO.Compatibility\Write-BRAVOProcessInputText @args }
 function Get-BRAVOSevenZipExitCodeDescription { BRAVO.Compatibility\Get-BRAVOSevenZipExitCodeDescription @args }
 function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity @args }
+function Write-BRAVOProgressDetail { param([AllowEmptyString()][string]$Detail) }
 '@
 $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($restoreSyntheticStubText + "`n" + $restoreSyntheticRuntimeText) `
     -FunctionNames @(
         'Write-Log', 'Send-SlackAlert', 'Write-BRAVOLog', 'Format-BRAVODuration',
-        'Get-BRAVOFiles', 'ConvertTo-BRAVOWindowsCommandLineArgument',
+        'Get-BRAVOFiles', 'Write-BRAVOProgressDetail', 'ConvertTo-BRAVOWindowsCommandLineArgument',
         'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
         'Write-BRAVOProcessInputText', 'Get-BRAVOSevenZipExitCodeDescription',
         'Test-SevenZipArchiveIntegrity',
