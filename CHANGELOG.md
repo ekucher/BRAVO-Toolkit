@@ -1,6 +1,25 @@
 # Changelog
 
-## Unreleased
+## 5.2.0-rc.1 — 2026-08-23 (candidate, pending acceptance)
+
+RC stabilization на основі `5.2.0-dev.1` (нижче). Без нових функцій —
+лише вузько-скоуповий compatibility-фікс (B2) і документальне
+приведення scope у відповідність (PR #78, PR #79):
+
+- B2: legacy BOM-у-паролі fallback для 7-Zip архівів (нижче).
+- P3.2a (`BRAVO_UPDATE.ps1`) перенесено на `5.3.0` — 0 змін коду в цьому
+  циклі.
+- M3 (великий рефакторинг: service-lifecycle/operation-lock/WinSCP-session
+  dedup, декомпозиція `BRAVO.DataRestore.Runtime.ps1`) відкладено на
+  наступний цикл — не входить у RC stabilization.
+- M1 (`WinSCP.uk` у `TOOLS_MANIFEST.json`) відкладено на `5.3.0` —
+  походження файла неможливо незалежно верифікувати з репозиторію.
+- B3: `SECURITY.md`/`README.md`/`BRAVO.config`/`OPERATIONS.md` синхронізовано
+  з фактичною поведінкою (Recovery task Disabled не Deleted, watchdog/
+  quiescence виняток, `BRAVO_BAZA_RECONCILE.ps1` в README, SFTP `trace/`
+  upgrade-примітка).
+
+Детальні рішення — `RELEASE_POLICY.md` §20.
 
 ### Upgrade notes (5.1.0 → 5.2.0)
 
