@@ -4544,11 +4544,24 @@ function Compare-FileSizes {
         [string]$ModelPath,
         [int]$MinSizeBytes = 2048,
         [AllowNull()][string]$MainModelRelativePath = $null,
-        # Settle-and-retry (нижче): production-дефолти. Параметризовано, щоб
-        # self-test міг перевірити саму механіку з короткою затримкою і
-        # окремо — інші сценарії без штучного уповільнення (MaxSettleAttempts=1).
-        [int]$MaxSettleAttempts = 3,
-        [int]$SettleDelaySeconds = 5
+        # Settle-and-retry (нижче): production-дефолти. 12x15с=180с —
+        # підтверджено реальним DEV-LIMS інцидентом 2026-08-24, де перший
+        # дефолт 3x5с=15с виявився замалим: причина не проста NTFS-затримка
+        # видимості, а реальний lock від активного антивірусного
+        # real-time-сканування щойно записаних гігабайтних .md-файлів
+        # (RealTimeProtectionEnabled=True, ExclusionPath порожній на момент
+        # інциденту) — Get-BRAVOFiles/Get-ChildItem -ErrorAction
+        # SilentlyContinue тихо пропускає залоченого кандидата, а не просто
+        # чекає на появу. 180с — з запасом під сканування ~7 ГБ, і
+        # незначний коштом на тлі ExecutionTimeLimitHours=18 у
+        # schedulerSettings.Maintenance. Канонічний операційний фікс —
+        # виняток антивірусу для LIMS Model/ARCHIV (OPERATIONS.md) — це
+        # лише другий рубіж захисту, не заміна винятку.
+        # Параметризовано, щоб self-test міг перевірити саму механіку з
+        # короткою затримкою і окремо — інші сценарії без штучного
+        # уповільнення (MaxSettleAttempts=1).
+        [int]$MaxSettleAttempts = 12,
+        [int]$SettleDelaySeconds = 15
     )
 
     try {
