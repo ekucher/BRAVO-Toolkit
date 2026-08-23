@@ -995,3 +995,40 @@ BRAVO.DataRestore Runtime.ps1, реалізація P3.2a (BRAVO_UPDATE.ps1).
 required checks гілки master, merge PR #61 виконано admin-обходом;
 тепер required-контексти постачає лише pull_request-прогін, push-прогони
 мають суфікс " (push)").
+
+### Підготовка `5.2.0-rc.1` — рішення про scope (docs-only, без функціональних змін коду)
+
+- **P3.2a (`BRAVO_UPDATE.ps1`) перенесено на `5.3.0`** (див.
+  `ROADMAP.md` §P3.2a). Не входить у RC stabilization: нова поверхня
+  атаки (download/staging/robocopy MIR/rollback/recovery), потребує
+  власного acceptance, який не повинен блокувати вже готовий scope
+  5.2.0. У коді 5.2.0 щодо P3.2a — нуль змін.
+- **M3 (великий рефакторинг) не виконується у RC stabilization
+  5.2.0.** Це стосується боргу циклу вище (dedup service-lifecycle/
+  operation-lock/WinSCP-session, декомпозиція
+  `BRAVO.DataRestore.Runtime.ps1`, перенесення Trace pipeline між
+  модулями) і будь-якого іншого великого structural refactoring без
+  конкретного production-дефекту — переноситься на наступний цикл
+  (переважно `5.3.0`).
+- **M1 (`WinSCP.uk` у `TOOLS_MANIFEST.json`) відкладено на `5.3.0`.**
+  Bundled `WinSCP.exe` підтверджено версії `6.5.6.16502`
+  (`FileVersionInfo`), що відповідає заявленому `WinSCP.uk`. Однак сам
+  `WinSCP.uk` — не PE-файл із version resource, тому його версію/
+  походження неможливо незалежно верифікувати з самого репозиторію.
+  Генератор `ci/Update-BRAVOToolsManifest.ps1` і далі покриває лише
+  `.exe/.dll/.com`; розширення allow-list на `.uk` і додавання
+  `WinSCP.uk` у `TOOLS_MANIFEST.json` — окрема задача 5.3.0 після
+  підтвердження походження файла.
+- **Known issue (не блокер 5.2.0):** приватна
+  `Get-BRAVOSevenZipArchiveInventory`
+  (`modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1`) досі
+  пише пароль у stdin через старий `Process.StandardInput.WriteLine`
+  (BOM-даючий під UTF-8-консоллю), не мігрована на канонічний
+  BOM-free `Write-BRAVOProcessInputText`. Функція й далі коректно
+  читає СТАРІ (pre-5.2.0) архіви, але за певних умов консолі може НЕ
+  прочитати НОВІ архіви (створені вже без BOM) під час free-space
+  preflight реставрації. Мітигація зафіксована як борг циклу
+  декомпозиції DataRestore (CHANGELOG, розділ dev.1) — не виправляється
+  окремо в 5.2.0, щоб не змішувати вузько-скоуповий B2-фікс (легітимний
+  compatibility-фікс) із частковою міграцією дублюючої реалізації
+  (M3-подібний refactoring-ризик).
