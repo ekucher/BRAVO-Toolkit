@@ -9,6 +9,7 @@ RC stabilization на основі `5.2.0-dev.1` (нижче). Без нових
 - B2: legacy BOM-у-паролі fallback для 7-Zip архівів (нижче).
 - Health-alert дедуп: типовий `RepeatAlertAfterHours` змінено `6` → `0`
   (нижче).
+- Логування очікування операційного lock (нижче).
 - P3.2a (`BRAVO_UPDATE.ps1`) перенесено на `5.3.0` — 0 змін коду в цьому
   циклі.
 - M3 (великий рефакторинг: service-lifecycle/operation-lock/WinSCP-session
@@ -70,6 +71,19 @@ RC stabilization на основі `5.2.0-dev.1` (нижче). Без нових
   (наприклад, щоб не заспамити канал під час тривалого відомого
   інциденту) — поверніть `RepeatAlertAfterHours` на потрібне значення
   вручну в `BRAVO.config`.
+- **Логування очікування операційного lock.** Виявлено під час DEV-LIMS
+  acceptance: `Enter-BRAVOMaintenanceOperationLock`/
+  `Enter-BRAVOArchiveProcessLock` (спільний `BRAVO_OPERATION.lock` між
+  `BRAVO_ARCHIV` і `BRAVO_MAINTENANCE`) чекали звільнення lock мовчки —
+  до `OperationLockWaitMinutes` без жодного логу про те, хто саме тримає
+  lock. Тепер під час очікування (кожні 30 сек.) пишеться `[INFO]`
+  повідомлення з вмістом lock-файла (operation/pid/hostname/startedAt/
+  generationId поточного власника) і рештою часу очікування. Для цього
+  власний handle власника lock відкривається з `FileShare.Read` замість
+  `FileShare.None` — дозволяє паралельний read-only peek, не послаблюючи
+  саму ексклюзивність (конкуруючий acquire так само провалюється проти
+  вже відкритого handle). Чисто діагностична зміна: жодного впливу на
+  exit-коди, таймаути чи fail-closed поведінку.
 
 - FIX (сумісність, B2): додано legacy BOM-у-паролі fallback для
   читання архівів, створених версіями BRAVO до 5.2.0. До 5.2.0 пароль

@@ -940,15 +940,54 @@ function Enter-BRAVOMaintenanceOperationLock {
         $lastLockError = $null
         do {
             try {
+                # FileShare.Read (не .None): дозволяє чужому read-only peek
+                # побачити, хто тримає lock, поки він ще активний — не
+                # послаблює саму ексклюзивність, бо конкуруючий acquire
+                # (нижче, теж ReadWrite/Read) усе одно провалиться проти
+                # вже відкритого handle. Раніше .None робив holder-а
+                # непрозорим навіть для власної діагностики очікування.
                 $stream = [System.IO.File]::Open(
                     $lockPath,
                     [System.IO.FileMode]::OpenOrCreate,
                     [System.IO.FileAccess]::ReadWrite,
-                    [System.IO.FileShare]::None
+                    [System.IO.FileShare]::Read
                 )
             } catch {
                 $lastLockError = $_.Exception.Message
                 if ((Get-Date) -lt $deadline) {
+                    # Оператор бачив лише мовчазний Start-Sleep до 30 хв. і
+                    # жодного натяку, хто саме тримає lock, хоча holder уже
+                    # пише в цей файл JSON із operation/pid/hostname/
+                    # generationId (аудит DEV-LIMS 2026-08-23). Читання —
+                    # best-effort: holder тримає файл із FileShare.Read
+                    # (нижче), тому в звичайному разі peek вдається, але
+                    # вузьке вікно між OpenOrCreate і Write лишається, і
+                    # тоді просто немає що показати — це не привід
+                    # перетворити діагностичний peek на ще одну причину
+                    # провалити захоплення lock.
+                    $holderDescription = "невідомо (lock ще не опубліковано або читання наразі неможливе)"
+                    try {
+                        $peekStream = [System.IO.File]::Open(
+                            $lockPath,
+                            [System.IO.FileMode]::Open,
+                            [System.IO.FileAccess]::Read,
+                            [System.IO.FileShare]::ReadWrite
+                        )
+                        try {
+                            $peekReader = New-Object System.IO.StreamReader($peekStream, [System.Text.Encoding]::UTF8)
+                            $peekText = $peekReader.ReadToEnd()
+                        } finally {
+                            $peekStream.Dispose()
+                        }
+                        if (-not [string]::IsNullOrWhiteSpace($peekText)) {
+                            $holderInfo = $peekText | ConvertFrom-Json
+                            $holderDescription = "operation=$($holderInfo.operation); pid=$($holderInfo.pid); hostname=$($holderInfo.hostname); startedAt=$($holderInfo.startedAt); generationId=$($holderInfo.generationId)"
+                        }
+                    } catch {
+                        # Peek не вдався (гонка з holder-ом, тимчасова
+                        # недоступність) — лишаємо дефолтний опис вище.
+                    }
+                    Write-Log "Очікую звільнення операційного lock ($lockPath); тримає: $holderDescription; залишилось $([math]::Max(0, [int]($deadline - (Get-Date)).TotalMinutes)) хв." -Level "INFO"
                     Start-Sleep -Seconds 30
                 }
             }
