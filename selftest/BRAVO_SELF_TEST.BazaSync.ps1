@@ -302,6 +302,90 @@
         Test-BRAVOCondition -Condition ($fastHealthMutation.Healthy -eq $false -and $fastHealthMutation.Level -eq 'CRITICAL' -and $fastHealthMutation.Message -match 'verified\.txt') `
             -Name 'BazaSync/MutationViolationIsHealthCritical' -Failure 'MUTATION_VIOLATION має бути CRITICAL/unhealthy з іменем файлу в повідомленні'
 
+        # AutoArchiveMutationThreshold: default (0, вимкнено) — $mutResult2
+        # вище вже підтверджує regression без явного передавання параметра
+        # (Invoke-BRAVOBazaSynchronization викликано без -AutoArchiveMutationThreshold).
+
+        # AutoArchiveMutationThreshold: N <= поріг -> авто-архівування
+        $aaOkRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveOk"
+        $aaOkLocal = Join-Path $aaOkRoot "local"
+        $aaOkState = Join-Path $aaOkRoot "state"
+        New-Item -ItemType Directory -Path $aaOkLocal -Force | Out-Null
+        $aaOkFile = New-BRAVOSelfTestBazaFile -Directory $aaOkLocal -RelativePath "eqv_11-116.pdf" -SizeBytes 500
+        $aaOkSession1 = New-BRAVOSelfTestFakeBazaSession
+        $aaOkResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOkLocal -RemoteRootPath '/baza_app' -Session $aaOkSession1 -StateRoot $aaOkState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($aaOkResult1.Status -eq 'COMPLETE' -and $aaOkResult1.Uploaded -eq 1) `
+            -Name 'BazaSync/AutoArchiveSetupInitialUploadSucceeds' -Failure 'setup: перший upload має пройти успішно перед тестом авто-архівування'
+
+        [IO.File]::WriteAllBytes($aaOkFile, (New-Object byte[] 999))
+        # Той самий session-об'єкт: "віддалений сервер" фейкового duck-типу
+        # тримає RemoteSizes/KnownRemoteDirs у своєму State — новий
+        # New-BRAVOSelfTestFakeBazaSession означав би порожній remote
+        # (FileExists завжди false), що приховало б реальний rename-шлях.
+        $aaOkSession2 = $aaOkSession1
+        $aaOkResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOkLocal -RemoteRootPath '/baza_app' -Session $aaOkSession2 -StateRoot $aaOkState -AutoArchiveMutationThreshold 5
+        $aaOkStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $aaOkState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $aaOkResult2.Status -eq 'MUTATION_AUTO_ARCHIVED' -and
+            $aaOkResult2.AutoArchivedMutations.Accepted.Count -eq 1 -and
+            $aaOkResult2.AutoArchivedMutations.Accepted[0] -eq 'eqv_11-116.pdf' -and
+            $aaOkSession2.State.MoveFileCalls.Count -eq 1 -and
+            ($aaOkSession2.State.MoveFileCalls[0] -match '\.replaced_') -and
+            -not $aaOkStateRead.State.Files.ContainsKey('eqv_11-116.pdf') -and
+            $aaOkSession2.State.PutFilesCallCount -eq 1
+        ) -Name 'BazaSync/AutoArchiveBelowThresholdRenamesAndClearsState' -Failure "мутація <= порогу має автоматично rename-archive: Status=$($aaOkResult2.Status),Accepted=$($aaOkResult2.AutoArchivedMutations.Accepted.Count),MoveFile=$($aaOkSession2.State.MoveFileCalls.Count),PutFiles=$($aaOkSession2.State.PutFilesCallCount)"
+
+        $fastHealthAutoArchive = Get-BRAVOBazaFastHealthResult -SyncResult $aaOkResult2
+        Test-BRAVOCondition -Condition (
+            $fastHealthAutoArchive.Healthy -eq $true -and $fastHealthAutoArchive.Level -eq 'INFO' -and
+            $fastHealthAutoArchive.Message -match 'eqv_11-116\.pdf' -and $fastHealthAutoArchive.Message -notmatch 'ПОТРІБНА ДІЯ'
+        ) -Name 'BazaSync/MutationAutoArchivedIsHealthInfoNotCritical' -Failure "MUTATION_AUTO_ARCHIVED має бути INFO/healthy (не блокує): Level=$($fastHealthAutoArchive.Level),Healthy=$($fastHealthAutoArchive.Healthy)"
+
+        # AutoArchiveMutationThreshold: N > поріг -> як і без опції (жорсткий блок)
+        $aaOverRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveOverThreshold"
+        $aaOverLocal = Join-Path $aaOverRoot "local"
+        $aaOverState = Join-Path $aaOverRoot "state"
+        New-Item -ItemType Directory -Path $aaOverLocal -Force | Out-Null
+        $aaOverFile1 = New-BRAVOSelfTestBazaFile -Directory $aaOverLocal -RelativePath "one.pdf" -SizeBytes 100
+        $aaOverFile2 = New-BRAVOSelfTestBazaFile -Directory $aaOverLocal -RelativePath "two.pdf" -SizeBytes 100
+        $aaOverSession1 = New-BRAVOSelfTestFakeBazaSession
+        $aaOverResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOverLocal -RemoteRootPath '/baza_app' -Session $aaOverSession1 -StateRoot $aaOverState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($aaOverResult1.Status -eq 'COMPLETE' -and $aaOverResult1.Uploaded -eq 2) `
+            -Name 'BazaSync/AutoArchiveOverThresholdSetupInitialUploadSucceeds' -Failure 'setup: обидва початкові upload мають пройти успішно'
+
+        [IO.File]::WriteAllBytes($aaOverFile1, (New-Object byte[] 150))
+        [IO.File]::WriteAllBytes($aaOverFile2, (New-Object byte[] 150))
+        $aaOverSession2 = New-BRAVOSelfTestFakeBazaSession
+        $aaOverResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOverLocal -RemoteRootPath '/baza_app' -Session $aaOverSession2 -StateRoot $aaOverState -AutoArchiveMutationThreshold 1
+        Test-BRAVOCondition -Condition (
+            $aaOverResult2.Status -eq 'MUTATION_VIOLATION' -and $aaOverResult2.MutationViolations.Count -eq 2 -and
+            $aaOverSession2.State.MoveFileCalls.Count -eq 0
+        ) -Name 'BazaSync/AutoArchiveOverThresholdBlocksAsWithoutOption' -Failure "кількість мутацій > порогу має блокувати рівно як без опції: Status=$($aaOverResult2.Status),Violations=$($aaOverResult2.MutationViolations.Count),MoveFile=$($aaOverSession2.State.MoveFileCalls.Count)"
+
+        # AutoArchiveMutationThreshold: невдалий rename -> fail-closed, state не просувається
+        $aaFailRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveRenameFails"
+        $aaFailLocal = Join-Path $aaFailRoot "local"
+        $aaFailState = Join-Path $aaFailRoot "state"
+        New-Item -ItemType Directory -Path $aaFailLocal -Force | Out-Null
+        $aaFailFile = New-BRAVOSelfTestBazaFile -Directory $aaFailLocal -RelativePath "will_not_archive.pdf" -SizeBytes 500
+        $aaFailSession1 = New-BRAVOSelfTestFakeBazaSession
+        $aaFailResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaFailLocal -RemoteRootPath '/baza_app' -Session $aaFailSession1 -StateRoot $aaFailState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($aaFailResult1.Status -eq 'COMPLETE' -and $aaFailResult1.Uploaded -eq 1) `
+            -Name 'BazaSync/AutoArchiveRenameFailsSetupInitialUploadSucceeds' -Failure 'setup: перший upload має пройти успішно перед тестом невдалого rename'
+
+        [IO.File]::WriteAllBytes($aaFailFile, (New-Object byte[] 999))
+        # Той самий session-об'єкт (див. коментар вище) — MoveFileShouldFail
+        # вмикається ПІСЛЯ bootstrap-upload, щоб сам upload не постраждав.
+        $aaFailSession2 = $aaFailSession1
+        $aaFailSession2.State.MoveFileShouldFail = $true
+        $aaFailResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaFailLocal -RemoteRootPath '/baza_app' -Session $aaFailSession2 -StateRoot $aaFailState -AutoArchiveMutationThreshold 5
+        $aaFailStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $aaFailState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $aaFailResult2.Status -eq 'MUTATION_VIOLATION' -and
+            $aaFailResult2.AutoArchivedMutations.Failures.Count -eq 1 -and
+            $aaFailStateRead.State.Files.ContainsKey('will_not_archive.pdf')
+        ) -Name 'BazaSync/AutoArchiveRenameFailureIsFailClosed' -Failure "невдалий rename під час авто-архівування має лишити state незмінним і Status=MUTATION_VIOLATION: Status=$($aaFailResult2.Status),Failures=$($aaFailResult2.AutoArchivedMutations.Failures.Count),StateHasKey=$($aaFailStateRead.State.Files.ContainsKey('will_not_archive.pdf'))"
+
         # New file with OLD LastWriteTime must still be discovered (timestamp is a hint, not source of truth)
         $oldTsRoot = Join-Path $bazaSyncTestRoot "A_OldTimestamp"
         $oldTsLocal = Join-Path $oldTsRoot "local"

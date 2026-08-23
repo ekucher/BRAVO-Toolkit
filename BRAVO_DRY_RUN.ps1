@@ -1361,7 +1361,9 @@ try {
             } elseif ($bazaSettingsEffective.Mode -eq 'IncrementalAppendOnly') {
                 Add-DryRunResult PASS "BAZA sync" "Режим" (
                     "IncrementalAppendOnly; SynchronizeBeforeHealth=$($bazaSettingsEffective.SynchronizeBeforeHealth); " +
-                    "FastHealthEnabled=$($bazaSettingsEffective.FastHealthEnabled); MutationPolicy=$($bazaSettingsEffective.MutationPolicy)"
+                    "FastHealthEnabled=$($bazaSettingsEffective.FastHealthEnabled); MutationPolicy=$($bazaSettingsEffective.MutationPolicy); " +
+                    "AutoArchiveMutationThreshold=$($bazaSettingsEffective.AutoArchiveMutationThreshold) " +
+                    "$(if ($bazaSettingsEffective.AutoArchiveMutationThreshold -le 0) { '(вимкнено)' } else { '(увімкнено)' })"
                 )
                 if ($bazaSettingsEffective.FullAuditEnabled) {
                     Add-DryRunResult PASS "BAZA sync" "Full Audit" (

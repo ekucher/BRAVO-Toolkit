@@ -72,6 +72,19 @@ function Get-BRAVOBazaSettingsEffective {
     } else {
         $true
     }
+    # AutoArchiveMutationThreshold: 0 = вимкнено (default, безпечна поведінка
+    # для всіх існуючих/нових інсталяцій без зміни конфігу — MUTATION_VIOLATION
+    # і далі жорстко блокує). Оператор, що свідомо вмикає значення > 0, дозволяє
+    # автоматичне rename-preserve-архівування (та сама операція, що ручний
+    # BRAVO_BAZA_RECONCILE.ps1 -AcceptAll) для циклів, де кількість мутацій НЕ
+    # перевищує поріг; понад поріг поведінка незмінна (жорсткий блок).
+    $autoArchiveMutationThresholdEffective = if ($null -ne $bazaSettings -and
+        $bazaSettings.Contains('AutoArchiveMutationThreshold') -and
+        [int]$bazaSettings.AutoArchiveMutationThreshold -gt 0) {
+        [int]$bazaSettings.AutoArchiveMutationThreshold
+    } else {
+        0
+    }
 
     # P2 (deep review): раніше production Health БЕЗУМОВНО синхронізувала
     # BAZA перед перевіркою і завжди йшла Fast Health-шляхом — SynchronizeBeforeHealth/
@@ -114,6 +127,7 @@ function Get-BRAVOBazaSettingsEffective {
         FullAuditEveryDays = $fullAuditEveryDaysEffective
         SynchronizeBeforeHealth = $synchronizeBeforeHealthEffective
         FastHealthEnabled = $fastHealthEnabledEffective
+        AutoArchiveMutationThreshold = $autoArchiveMutationThresholdEffective
     }
 }
 
