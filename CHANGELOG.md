@@ -4,12 +4,14 @@
 
 ---
 
-## 5.2.0-rc.6 — 2026-08-25 (candidate, pending acceptance)
+## 5.2.0-rc.7 — 2026-08-25 (candidate, pending acceptance)
 
 Кандидат = `5.2.0-rc.5` (нижче, acceptance пройдено на `SERV_HRDL_1`/
 `WIN-44OBNQ3R3OB`) + `feat(archive)` розрахункова перевірка вільного
-місця (PR #84). Acceptance саме для цього доданого вмісту ще не
-виконано.
+місця (PR #84), включно з floor-override фіксом нижче. Тег `v5.2.0-rc.6`
+(без floor-override фіксу) не пройшов acceptance саме через відсутність
+цього фіксу — новий tag/build не створювався окремо для нього, кандидат
+одразу піднято до rc.7.
 
 - **FEATURE (data-integrity, archive preflight): розрахункова перевірка
   вільного місця понад фіксований поріг.** `Maintenance.Limits.
