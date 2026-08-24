@@ -3169,6 +3169,10 @@ try {
             "Get-BRAVOUniqueVSSVolumes",
             "Get-BRAVOVSSVolumeIdentityCandidates",
             "Test-BRAVOVSSShadowMatchesVolume",
+            "Get-BRAVOVSSExistingShadowIdMap",
+            "Get-BRAVOVSSDiskshadowSetIdFromOutput",
+            "Get-BRAVOVSSDiskshadowSetIdFromWmi",
+            "Remove-BRAVOVSSDiskshadowOrphanedShadow",
             "New-BRAVOVSSSnapshotSet",
             "Resolve-BRAVOSnapshotSourcePath",
             "Remove-BRAVOVSSVolumeShadow",
@@ -4312,6 +4316,94 @@ try {
         ) `
         -Name "BackupConsistency/VSSSnapshotSetGeneration" `
         -Failure "MODEL/BLOG/BRAVOEXCH мають використовувати один VSS Snapshot Set з дедуплікацією томів і cleanup один раз після generation"
+
+    $vssDiskshadowProbe = & $archiveRuntimeModule {
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Message, [string]$Level)
+        }
+
+        # Локалізований вивід diskshadow.exe: людський текст перекладено,
+        # ASCII-alias VSS_SHADOW_SET і GUID-и — ні.
+        $localizedOutput = @(
+            "-> CREATE",
+            "Псевдоним BRAVOVolume1 для теневой копии с кодом {AAAAAAAA-1111-2222-3333-444444444444} задан.",
+            "Псевдоним VSS_SHADOW_SET для набора теневых копий с кодом {BBBBBBBB-1111-2222-3333-444444444444} задан.",
+            "-> END BACKUP"
+        ) -join "`r`n"
+        $localizedSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output $localizedOutput
+        $englishSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output (
+            "`t`t- Shadow copy set: {BBBBBBBB-1111-2222-3333-444444444444}`t%VSS_SHADOW_SET%"
+        )
+        $missingSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output "-> CREATE`r`n-> END BACKUP"
+
+        $script:deletedShadowIds = New-Object System.Collections.ArrayList
+        $newShadowIds = @(
+            "{11111111-1111-1111-1111-111111111111}",
+            "{22222222-2222-2222-2222-222222222222}"
+        )
+        function New-SelfTestShadow {
+            param([string]$Id, [string]$SetId, [string]$VolumeName)
+            $shadow = [pscustomobject]@{ ID = $Id; SetID = $SetId; VolumeName = $VolumeName }
+            Add-Member -InputObject $shadow -MemberType ScriptMethod -Name Delete -Value {
+                [void]$script:deletedShadowIds.Add($this.ID)
+            }
+            return $shadow
+        }
+        function Get-WmiObject {
+            param([string]$Namespace, [string]$Class, [string]$Filter, [string]$ErrorAction)
+            if ($Class -ne "Win32_ShadowCopy") {
+                return
+            }
+            @(
+                (New-SelfTestShadow -Id "{99999999-9999-9999-9999-999999999999}" -SetId "{OLD-SET}" -VolumeName "C:\"),
+                (New-SelfTestShadow -Id $newShadowIds[0] -SetId "{BBBBBBBB-1111-2222-3333-444444444444}" -VolumeName "C:\"),
+                (New-SelfTestShadow -Id $newShadowIds[1] -SetId "{BBBBBBBB-1111-2222-3333-444444444444}" -VolumeName "D:\"),
+                (New-SelfTestShadow -Id "{33333333-3333-3333-3333-333333333333}" -SetId "{FOREIGN-SET}" -VolumeName "E:\")
+            )
+        }
+
+        $knownShadowIds = @{ "{99999999-9999-9999-9999-999999999999}" = $true }
+        $wmiSetId = Get-BRAVOVSSDiskshadowSetIdFromWmi `
+            -KnownShadowIds $knownShadowIds `
+            -VolumeRoots @("C:\", "D:\")
+        Remove-BRAVOVSSDiskshadowOrphanedShadow `
+            -SnapshotSetId $null `
+            -KnownShadowIds $knownShadowIds `
+            -VolumeRoots @("C:\", "D:\")
+
+        [pscustomobject]@{
+            LocalizedSetId = $localizedSetId
+            EnglishSetId = $englishSetId
+            MissingSetId = $missingSetId
+            WmiSetId = $wmiSetId
+            DeletedShadowIds = @($script:deletedShadowIds)
+        }
+    }
+    $diskshadowScriptText = [regex]::Match(
+        $archiveRuntimeModuleText,
+        '(?s)function New-BRAVOVSSDiskshadowSnapshotSet \{.*?\r?\n\}\r?\n'
+    ).Value
+    Test-BRAVOCondition `
+        -Condition (
+            $vssDiskshadowProbe.LocalizedSetId -eq "{BBBBBBBB-1111-2222-3333-444444444444}" -and
+            $vssDiskshadowProbe.EnglishSetId -eq "{BBBBBBBB-1111-2222-3333-444444444444}" -and
+            $null -eq $vssDiskshadowProbe.MissingSetId -and
+            $vssDiskshadowProbe.WmiSetId -eq "{BBBBBBBB-1111-2222-3333-444444444444}" -and
+            $vssDiskshadowProbe.DeletedShadowIds.Count -eq 2 -and
+            $vssDiskshadowProbe.DeletedShadowIds -contains "{11111111-1111-1111-1111-111111111111}" -and
+            $vssDiskshadowProbe.DeletedShadowIds -contains "{22222222-2222-2222-2222-222222222222}"
+        ) `
+        -Name "BackupConsistency/VSSDiskshadowSetIdIsLocaleIndependent" `
+        -Failure "Shadow copy set ID має визначатися з ASCII-alias VSS_SHADOW_SET або з нових shadow copies у WMI, а persistent-знімки невдалого запуску — прибиратися навіть без розібраного SetID"
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($diskshadowScriptText) -and
+            $diskshadowScriptText.Contains('$lines.Add("EXIT")') -and
+            -not $diskshadowScriptText.Contains('[void]$process.Start()') -and
+            -not $diskshadowScriptText.Contains('Shadow copy set ID:')
+        ) `
+        -Name "BackupConsistency/VSSDiskshadowRunsExactlyOnce" `
+        -Failure "сценарій diskshadow.exe має завершуватися EXIT, запускатися лише через Start-BRAVOProcessOutputCapture і не покладатися на англомовний текст виводу"
 
     $vssOwnershipTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `

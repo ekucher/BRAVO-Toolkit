@@ -1,5 +1,79 @@
 # Changelog
 
+## Не випущено (developer)
+
+- FIX (архівація, критично): багатотомний VSS Snapshot Set більше не
+  падає на успішно створеному наборі. На серверах, де джерела generation
+  лежать на різних томах (типово `MODEL`/`BLOG` на `D:`, `BRAVOEXCH` на
+  `C:`), `New-BRAVOVSSDiskshadowSnapshotSet`
+  (`modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`) завершувався
+  помилкою `VSS SNAPSHOT SET FAILED: diskshadow.exe повернув код 4`, після
+  чого архівація MODEL/BLOG/BRAVOEXCH скасовувалась (`опубліковано 0 з 3`),
+  generation manifest не створювався, а наступний health-check доповідав
+  `не знайдено жодного COMPLETE generation manifest` і три `SFTP ...:
+  component відсутній у verified COMPLETE local generation`. Тобто щоденні
+  резервні копії на таких серверах не створювались узагалі. Три причини,
+  усі виправлені:
+  1. **Подвійний запуск `diskshadow.exe`.** Після
+     `Start-BRAVOProcessOutputCapture` (який САМ запускає процес) стояв ще
+     й `[void]$process.Start()`. Instance-метод `Process.Start()` спершу
+     робить `Close()` поточного процесу і запускає новий, тому набір
+     створював перший `diskshadow.exe`, а `WaitForExit`/`ExitCode` бралися
+     вже від другого — звідси код `4` при повністю успішному виводі в тому
+     ж повідомленні про помилку. Зайвий `Start()` прибрано; це єдиний
+     виклик у комплекті, який його мав.
+  2. **Сценарій без `EXIT`.** `diskshadow.exe` доходив до кінця файлу
+     сценарію як до несподіваного завершення інтерактивної сесії і
+     повертав ненульовий код навіть при успішному `CREATE`. Додано
+     фінальний `EXIT`.
+  3. **Розбір виводу залежав від мови ОС.** Ідентифікатор набору шукався
+     регулярним виразом по англійському тексту `Shadow copy set ID:`,
+     якого немає ні в локалізованому виводі (`Windows Server 2022` з
+     російським/українським мовним пакетом), ні, власне, в англійському
+     (`diskshadow.exe` друкує `Shadow copy set:` і `%VSS_SHADOW_SET%`).
+     Тепер `Get-BRAVOVSSDiskshadowSetIdFromOutput` бере GUID із рядка з
+     ASCII-alias-ом `VSS_SHADOW_SET` (alias-и не перекладаються), а
+     `Get-BRAVOVSSDiskshadowSetIdFromWmi` слугує резервом: єдиний `SetID`
+     серед shadow copies на потрібних томах, яких не було до запуску.
+
+- FIX (архівація, ресурси): невдалий багатотомний VSS-набір більше не
+  лишає на сервері persistent shadow copies. Контекст
+  `SET CONTEXT PERSISTENT NOWRITERS` означає, що знімки не звільняються
+  самі, а старий cleanup спрацьовував лише коли `SetID` вдалося розібрати
+  з виводу — тобто саме в тому сценарії, який падав, не спрацьовував
+  ніколи. Кожен невдалий запуск (щодня, за розкладом) лишав по знімку на
+  кожен том, які назавжди тримали місце в тіньовому сховищі. Новий
+  `Remove-BRAVOVSSDiskshadowOrphanedShadow` прибирає знімки, яких не було
+  до запуску і які лежать на наших томах, незалежно від того, чи вдалося
+  визначити `SetID`; чужі знімки (створені іншим ПЗ або наявні до старту)
+  свідомо не чіпаються.
+  **Дія оператора:** знімки, залишені попередніми версіями, треба
+  прибрати вручну одноразово — `vssadmin list shadows` і
+  `vssadmin delete shadows /shadow={ID}` для тих, що належать BRAVO.
+
+- FIX (діагностика): вивід `diskshadow.exe` читається в OEM-кодуванні
+  консолі (`StandardOutputEncoding`/`StandardErrorEncoding`). Раніше
+  повідомлення про помилку потрапляло в лог нечитабельними символами саме
+  тоді, коли діагностика найпотрібніша. На коректність розбору це не
+  впливає — він спирається лише на ASCII-alias і GUID-и.
+
+- FIX (dry-run, діагностика): порожній Discord/Slack webhook у перевірці
+  доступності (`BRAVO_DRY_RUN.ps1`, гілка `-TestAccess`) більше не
+  показується оператору сирим текстом .NET-винятку
+  (`Недопустимый URI: URI пуст.`), а дає ту саму канонічну причину
+  `webhook відсутній у Credential Manager`, що й решта перевірок webhook.
+  Поведінка перевірки не змінюється — це лишається `[FAIL]`.
+
+- Self-тести: додано `BackupConsistency/VSSDiskshadowSetIdIsLocaleIndependent`
+  (локалізований та англійський вивід, WMI-резерв, cleanup без розібраного
+  `SetID`) і `BackupConsistency/VSSDiskshadowRunsExactlyOnce` (сценарій
+  завершується `EXIT`, процес запускається лише через
+  `Start-BRAVOProcessOutputCapture`, немає прив'язки до англомовного
+  тексту виводу). Багатотомна гілка `diskshadow` до цього не мала жодного
+  покриття — тому дефект і не ловився.
+
+---
+
 ## 5.2.0-rc.1 — 2026-08-23 (candidate, pending acceptance)
 
 RC stabilization на основі `5.2.0-dev.1` (нижче). Без нових функцій —

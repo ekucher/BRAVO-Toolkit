@@ -1766,6 +1766,13 @@ try {
         foreach ($webhook in @($requiredCredentials | Where-Object { $_.Kind -eq "Webhook" })) {
             $webhookValue = [string]$credentialValues.Webhook
             try {
+                # Порожній webhook — окрема, зрозуміла оператору причина.
+                # Без цієї перевірки New-Object Uri віддавав сирий текст
+                # .NET-винятку ("Недопустимый URI: URI пуст."), який нічого не
+                # каже про те, що запис відсутній у Credential Manager.
+                if ([string]::IsNullOrWhiteSpace($webhookValue)) {
+                    throw "webhook відсутній у Credential Manager"
+                }
                 $uri = New-Object Uri($webhookValue)
                 if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne "https") {
                     throw "webhook повинен бути абсолютним HTTPS URL"
