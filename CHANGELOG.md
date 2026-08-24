@@ -33,6 +33,11 @@ acceptance-прогону** перед будь-якою stable promotion.
   DEV-майданчик мав службу з `DisplayName="BRAVO Server"`, а не
   `"BRAVO Service"`, і AUTO-визначення `LIMSRoot`/`BackupRoot`
   fail-closed відмовляло на цілком легітимній інсталяції.
+- **FIX (P0/P1, backup availability):** `New-BRAVOVSSDiskshadowSnapshotSet`
+  (`BRAVO_ARCHIV`, багатотомний VSS через `diskshadow.exe`) ховав
+  справжню причину провалу VSS за `VariableIsUndefined` на
+  `$snapshotSetId` (нижче) — реальний DEV-майданчик отримав **0 з 3**
+  опублікованих архівів без діагностованої причини.
 - Health-alert дедуп: типовий `RepeatAlertAfterHours` змінено `6` → `0`
   (нижче) — за прямим запитом оператора під час того самого
   acceptance-прогону.
@@ -187,6 +192,32 @@ acceptance-прогону** перед будь-якою stable promotion.
   список. Новий self-test:
   `Discovery/BravoServerDisplayNameAcceptedAsCanonical` і
   `Paths/01b-AutoLimsRootFromServiceBravoServerDisplayName`.
+- **FIX (P0/P1, backup availability): `$snapshotSetId` VariableIsUndefined
+  ховав справжню причину провалу багатотомного VSS Snapshot Set.**
+  Реальний DEV-майданчик (2026-08-24, Windows Server 2016 Datacenter,
+  два томи C:\+D:\ -> шлях через `diskshadow.exe`): `BRAVO_ARCHIV`
+  завершив generation зі статусом `FAILED` і `опубліковано 0 з 3` —
+  жодного архіву MODEL/BLOG/BRAVOEXCH за цей прогін, а лог показував
+  лише "VSS SNAPSHOT SET FAILED: Переменная "$snapshotSetId" не может
+  быть получена, так как она не установлена" — без жодного натяку, чому
+  саме `diskshadow.exe` не спрацював. Причина: `$snapshotSetId`
+  присвоюється лише ПІСЛЯ успішного парсингу виводу `diskshadow.exe`
+  (regex на "Shadow copy set ID"); якщо `diskshadow.exe` падає РАНІШЕ
+  (timeout, ненульовий exit code, відсутній очікуваний рядок у виводі —
+  усі три кидають `throw` до рядка присвоєння), змінна в цьому scope
+  взагалі не створювалась. `catch`-блок функції читає
+  `$snapshotSetId` для best-effort cleanup орфанних shadow copies —
+  під `Set-StrictMode` (успадкований від конфігураційного
+  завантажувача, як і всюди в проєкті) це читання ще не створеної
+  змінної саме кидало `VariableIsUndefined`, підмінюючи РЕАЛЬНУ причину
+  провалу `diskshadow.exe` цим вторинним, незрозумілим виключенням.
+  Виправлено: `$snapshotSetId = $null` ініціалізується одразу поруч із
+  уже наявним `$volumeShadows = $null`, перед `try` — той самий,
+  вже встановлений у функції патерн захисту від цього класу помилки.
+  Механізм перевірено ізольовано (до/після фіксу, ідентична структура
+  try/catch під `Set-StrictMode`); наскрізний regression-тест для
+  реального `diskshadow.exe`-шляху не додано (вимагає реальної
+  багатотомної VSS-системи, не синтезується детерміновано в self-test).
 - **UX: живий прогрес під час "Реставрація моделі".** Той самий
   реальний DEV-LIMS-прогін показав: увесь блок реставрації моделі
   (збереження розмірів, архівація перед реставрацією — кілька хвилин на

@@ -579,6 +579,7 @@ BRAVO-owned Shadow IDs і видаляє state після успіху. Не р�
 | `недостатньо місця` | вичерпано shadow storage — розширте `vssadmin resize shadowstorage` |
 | writer у стані `Failed` | перезапустіть відповідну службу, потім `swprv` |
 | persisted orphan cleanup failed | перевірте exact IDs у `BRAVO_VSS_OWNERSHIP.json`, VSS/WMI і права SYSTEM; state не видаляється до успішного cleanup |
+| `Переменная "$snapshotSetId" не может быть получена` (виправлено 2026-08-24) | **симптом, не причина** — багатотомний `diskshadow.exe`-шлях падав РАНІШЕ, ніж встигав повідомити реальну причину (timeout/exit code/відсутній очікуваний рядок у виводі); `catch`-блок сам кидав вторинну `VariableIsUndefined` замість неї. На поточному білді ця помилка вже не виникає — покажеться справжня причина `diskshadow.exe`. На старішому білді: перевірте `diskshadow.exe` вручну (`vssadmin list writers`, права SYSTEM на створення shadow copy для обох томів) |
 
 **Ескалація.** Якщо VSS не відновлюється — S2, але з жорстким
 дедлайном: доки VSS зламаний, щоденних backup **немає взагалі**.

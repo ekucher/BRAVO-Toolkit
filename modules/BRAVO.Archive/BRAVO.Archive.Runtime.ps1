@@ -2059,6 +2059,17 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     $lines.Add("END BACKUP")
 
     $volumeShadows = $null
+    # $snapshotSetId ініціалізується тут, ДО try: catch нижче читає її для
+    # best-effort cleanup орфанних shadow copies. Під Set-StrictMode
+    # (увімкнений для цього модуля) читання ще не створеної змінної кидає
+    # VariableIsUndefined — реальний DEV-майданчик (2026-08-24) показав це
+    # наочно: diskshadow.exe впав ДО рядка, що присвоює $snapshotSetId
+    # (регулярний вираз/exit code/timeout — будь-яка з throw вище цього
+    # присвоєння), і catch-блок замість реальної причини падіння
+    # diskshadow.exe видав "Переменная "$snapshotSetId" не может быть
+    # получена" — ховаючи фактичну помилку й лишаючи generation без жодного
+    # опублікованого архіву без діагностованої причини.
+    $snapshotSetId = $null
     try {
         [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), (New-Object Text.UTF8Encoding($false)))
 
