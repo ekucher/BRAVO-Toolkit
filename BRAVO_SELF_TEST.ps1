@@ -493,6 +493,39 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "DryRun/ModeLabelReflectsWriteProbes" `
         -Failure "з -TestAccess прогін робить локальні проби запису і створює каталоги на SFTP, тому заголовок не має безумовно повідомляти оператору READ-ONLY"
 
+    # --- RELEASE_POLICY.md розділ 16: dev/RC-релізи мають бути позначені як
+    # pre-release, і лише stable може бути Latest. Без --prerelease workflow
+    # створював чернетку RC як звичайний реліз, і після публікації неприйнятий
+    # кандидат ставав тим, що оператор бачить першим (спостережено на чернетці
+    # v5.2.0-rc.1).
+    $releaseArtifactWorkflowPath = Join-Path $root ".github\workflows\release-artifact.yml"
+    $releaseArtifactWorkflowText = if (Test-Path -LiteralPath $releaseArtifactWorkflowPath -PathType Leaf) {
+        [IO.File]::ReadAllText($releaseArtifactWorkflowPath, [Text.Encoding]::UTF8)
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($releaseArtifactWorkflowText) -and
+            $releaseArtifactWorkflowText.Contains('$isPrerelease = $tag -match') -and
+            $releaseArtifactWorkflowText.Contains('if ($isPrerelease) { $createArgs += ''--prerelease'' }') -and
+            $releaseArtifactWorkflowText.Contains('gh release edit $tag --prerelease') -and
+            -not [regex]::IsMatch(
+                $releaseArtifactWorkflowText,
+                'gh release create \$tag --draft --title'
+            ) -and
+            # Ремонт наявного релізу не має залежати від upload: реліз,
+            # створений попереднім прогоном, уже несе ті самі асети, і plain
+            # upload на ньому падає. Тому edit має стояти ПЕРЕД upload, а сам
+            # upload — мати --clobber, інакше жоден повторний прогін не
+            # доходить до виставлення прапорця.
+            $releaseArtifactWorkflowText.Contains('gh release upload $tag --clobber') -and
+            ($releaseArtifactWorkflowText.IndexOf('gh release edit $tag --prerelease') -lt
+             $releaseArtifactWorkflowText.IndexOf('gh release upload $tag --clobber'))
+        ) `
+        -Name "Release/ArtifactWorkflowMarksPrerelease" `
+        -Failure "release-artifact workflow має створювати dev/RC-реліз із --prerelease і виставляти прапорець наявному релізу, інакше неприйнятий кандидат стане Latest release (RELEASE_POLICY.md розділ 16)"
+
     $toolIntegrityTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_TOOL_INTEGRITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
