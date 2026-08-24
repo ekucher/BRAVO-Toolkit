@@ -119,6 +119,19 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 > Framework до PowerShell 5.1. BRAVO не бекпортить сумісність із
 > PowerShell 3.x — це свідомо нижче baseline.
 
+> **"Не вдалося визначити BackupRoot: ... вимагає визначеного
+> EffectiveLIMSRoot" при УЖЕ встановленій і запущеній службі BRAVO.**
+> Перевірте `DisplayName` реальної служби: `Get-Service BRAVO | Select
+> DisplayName` (або `Get-CimInstance Win32_Service -Filter
+> "Name='BRAVO'" | Select DisplayName`). Discovery ідентифікує службу
+> BRAVO за Name ТА DisplayName одночасно (навмисний захист від хибного
+> співставлення з чужим сервісом) — з 2026-08-24 приймає обидва відомі
+> реальні варіанти написання, `"BRAVO Service"` і `"BRAVO Server"`
+> (`maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config`, за
+> замовчуванням масив з обома). Якщо на вашому сервері DisplayName
+> інший за обидва — допишіть його третім елементом списку (не
+> замінюйте наявні два).
+
 **Чого не робити.** Не встановлювати `BRAVO_ALLOW_UNSUPPORTED_OS=1`
 як спосіб «прибрати помилку» — це свідоме зняття гарантій, а не
 виправлення.

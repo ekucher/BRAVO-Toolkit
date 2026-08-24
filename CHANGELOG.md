@@ -27,6 +27,12 @@ acceptance-прогону** перед будь-якою stable promotion.
   звичайного `[FAIL]`) після коректно спійманої помилки завантаження
   `BRAVO.config` (нижче) — ховаючи первинну причину за незрозумілим
   повідомленням.
+- **FIX (data-integrity discovery):** ідентифікація служби BRAVO
+  (`Resolve-BRAVOEffectiveLimsRoot`/`Resolve-BRAVOInstallationDiscovery`)
+  тепер приймає кілька канонічних значень `DisplayName` (нижче) — реальний
+  DEV-майданчик мав службу з `DisplayName="BRAVO Server"`, а не
+  `"BRAVO Service"`, і AUTO-визначення `LIMSRoot`/`BackupRoot`
+  fail-closed відмовляло на цілком легітимній інсталяції.
 - Health-alert дедуп: типовий `RepeatAlertAfterHours` змінено `6` → `0`
   (нижче) — за прямим запитом оператора під час того самого
   acceptance-прогону.
@@ -157,6 +163,30 @@ acceptance-прогону** перед будь-якою stable promotion.
   `ConfigLoader/DryRunDoesNotCrashOnUnsetScriptVersion` — реальний
   дочірній процес `BRAVO_DRY_RUN.ps1` із синтетично провальним
   `BRAVO.config`.
+- **FIX (data-integrity discovery): службу BRAVO з DisplayName="BRAVO
+  Server" не визнавали канонічною.** Реальний DEV-майданчик
+  (2026-08-24): служба Windows `BRAVO` встановлена й запущена
+  (`Get-Service BRAVO` -> `Running`), але `Import-BravoConfiguration`
+  усе одно падав на "Не вдалося визначити BackupRoot: ... вимагає
+  визначеного EffectiveLIMSRoot". Причина — `DisplayName` реальної
+  служби виявився `"BRAVO Server"`, тоді як Discovery (навмисний
+  строгий захист від хибного співставлення із чужим сервісом: Name ТА
+  DisplayName одночасно) очікував рівно `"BRAVO Service"`. Обидва
+  написання — реальні варіанти інсталяторів BRAVO/LIMS, не помилка
+  цього конкретного сервера. `Resolve-BRAVOEffectiveLimsRoot` і
+  `Resolve-BRAVOInstallationDiscovery` тепер приймають `-BravoDisplayName`
+  як масив (дефолт `@("BRAVO Service", "BRAVO Server")`) — точний збіг
+  з БУДЬ-ЯКИМ значенням зі списку, а не одне жорстко задане значення.
+  Це НЕ послаблення identity-перевірки: збіг і далі точний
+  (case-insensitive `-eq`, не substring/regex/wildcard), просто список
+  канонічних варіантів написання розширено з одного до двох.
+  `maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config` —
+  тепер `@("BRAVO Service", "BRAVO Server")`; якщо на вашому сервері
+  DisplayName служби інший за обидва — додайте третім елементом
+  (перевірте `Get-Service BRAVO | Select DisplayName`), не замінюйте
+  список. Новий self-test:
+  `Discovery/BravoServerDisplayNameAcceptedAsCanonical` і
+  `Paths/01b-AutoLimsRootFromServiceBravoServerDisplayName`.
 - **UX: живий прогрес під час "Реставрація моделі".** Той самий
   реальний DEV-LIMS-прогін показав: увесь блок реставрації моделі
   (збереження розмірів, архівація перед реставрацією — кілька хвилин на
