@@ -484,6 +484,14 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "DryRun/CreatesMissingSftpDestination" `
         -Failure "dry-run має створювати відсутній SFTP-каталог призначення через CreateDirectory, а не блокувати інсталяцію повідомленням 'Dry Run не створює каталоги'"
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunScriptTextForSftp.Contains('$dryRunModeLabel = if ($TestAccess)') -and
+            $dryRunScriptTextForSftp.Contains('-Mode $dryRunModeLabel') -and
+            -not $dryRunScriptTextForSftp.Contains("-Mode 'READ-ONLY'")
+        ) `
+        -Name "DryRun/ModeLabelReflectsWriteProbes" `
+        -Failure "з -TestAccess прогін робить локальні проби запису і створює каталоги на SFTP, тому заголовок не має безумовно повідомляти оператору READ-ONLY"
 
     $toolIntegrityTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
