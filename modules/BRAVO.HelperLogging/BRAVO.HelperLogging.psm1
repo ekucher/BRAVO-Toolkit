@@ -179,17 +179,22 @@ function Test-BRAVOHelperLogSuspensionEffective {
                 # Маркер друкується тим самим каналом, що й реальні підказки
                 # вводу — інакше перевірка стосувалася б не того шляху.
                 Write-Host $canary
+                # Файл читається ДО Resume, поки transcript зупинено: у Windows
+                # PowerShell 5.1 активний transcript тримає файл так, що
+                # ReadAllText падає — і перевірка помилково вважала б робочу
+                # паузу непрацездатною.
+                $logText = ''
+                try {
+                    $logText = [IO.File]::ReadAllText($canaryPath)
+                } catch {
+                    # Не змогли прочитати — довести відсутність витоку
+                    # неможливо, тому вважаємо паузу непрацездатною.
+                    $logText = $canary
+                }
+                $effective = -not $logText.Contains($canary)
             } finally {
                 [void](Resume-BRAVOHelperLog)
             }
-            $logText = ''
-            try {
-                $logText = [IO.File]::ReadAllText($canaryPath)
-            } catch {
-                # Файл не прочитався — довести відсутність витоку неможливо.
-                $logText = $canary
-            }
-            $effective = -not $logText.Contains($canary)
         }
     } catch {
         $effective = $false
