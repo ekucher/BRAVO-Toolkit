@@ -85,11 +85,31 @@ jobs:
               (Get-ChildItem artifacts\release -Filter '*.zip.sha256').FullName,
               (Join-Path (Resolve-Path artifacts\release) 'release-manifest.json')
           )
+          # RELEASE_POLICY.md section 16: development and RC releases must be
+          # marked as pre-release; only a stable release may be Latest. Without
+          # --prerelease every RC draft was created as an ordinary release, so
+          # publishing it made an unaccepted candidate the Latest release that
+          # operators see first (observed on the v5.2.0-rc.1 draft).
+          # GitHub excludes pre-releases from Latest on its own, so the single
+          # flag is enough - no --latest=false, which older gh versions reject.
+          $isPrerelease = $tag -match '-(dev|rc)\.'
           gh release view $tag --json isDraft
           if ($LASTEXITCODE -eq 0) {
               gh release upload $tag @files
               if ($LASTEXITCODE -ne 0) { exit 1 }
+              if ($isPrerelease) {
+                  # The release may predate this fix (or have been created by
+                  # hand), so the flag is enforced instead of assumed.
+                  gh release edit $tag --prerelease
+                  if ($LASTEXITCODE -ne 0) { exit 1 }
+              }
           } else {
-              gh release create $tag --draft --title "BRAVO Toolkit $($tag.TrimStart('v'))" --notes "Automated draft: validated release artifact attached by the release-artifact workflow. Review and publish manually." @files
+              $createArgs = @(
+                  '--draft',
+                  '--title', "BRAVO Toolkit $($tag.TrimStart('v'))",
+                  '--notes', 'Automated draft: validated release artifact attached by the release-artifact workflow. Review and publish manually.'
+              )
+              if ($isPrerelease) { $createArgs += '--prerelease' }
+              gh release create $tag @createArgs @files
               if ($LASTEXITCODE -ne 0) { exit 1 }
           }
