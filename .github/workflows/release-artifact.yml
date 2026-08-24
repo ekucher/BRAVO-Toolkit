@@ -95,14 +95,23 @@ jobs:
           $isPrerelease = $tag -match '-(dev|rc)\.'
           gh release view $tag --json isDraft
           if ($LASTEXITCODE -eq 0) {
-              gh release upload $tag @files
-              if ($LASTEXITCODE -ne 0) { exit 1 }
               if ($isPrerelease) {
                   # The release may predate this fix (or have been created by
                   # hand), so the flag is enforced instead of assumed.
+                  #
+                  # This runs BEFORE the upload on purpose: a release created by
+                  # an earlier run already carries these three assets, so the
+                  # upload is the step most likely to fail here. Setting the
+                  # policy flag first keeps the repair path working regardless.
                   gh release edit $tag --prerelease
                   if ($LASTEXITCODE -ne 0) { exit 1 }
               }
+              # --clobber: on any re-run the assets already exist under the same
+              # names and plain upload aborts. Replacing them is safe because
+              # this step is reached only after the artifact passed both
+              # integrity manifests, BRAVO_RUNTIME_GUARD and the full self-test.
+              gh release upload $tag --clobber @files
+              if ($LASTEXITCODE -ne 0) { exit 1 }
           } else {
               $createArgs = @(
                   '--draft',

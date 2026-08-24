@@ -513,7 +513,15 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             -not [regex]::IsMatch(
                 $releaseArtifactWorkflowText,
                 'gh release create \$tag --draft --title'
-            )
+            ) -and
+            # Ремонт наявного релізу не має залежати від upload: реліз,
+            # створений попереднім прогоном, уже несе ті самі асети, і plain
+            # upload на ньому падає. Тому edit має стояти ПЕРЕД upload, а сам
+            # upload — мати --clobber, інакше жоден повторний прогін не
+            # доходить до виставлення прапорця.
+            $releaseArtifactWorkflowText.Contains('gh release upload $tag --clobber') -and
+            ($releaseArtifactWorkflowText.IndexOf('gh release edit $tag --prerelease') -lt
+             $releaseArtifactWorkflowText.IndexOf('gh release upload $tag --clobber'))
         ) `
         -Name "Release/ArtifactWorkflowMarksPrerelease" `
         -Failure "release-artifact workflow має створювати dev/RC-реліз із --prerelease і виставляти прапорець наявному релізу, інакше неприйнятий кандидат стане Latest release (RELEASE_POLICY.md розділ 16)"
