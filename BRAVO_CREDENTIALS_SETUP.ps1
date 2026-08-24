@@ -567,13 +567,62 @@ function Read-SecretEntries {
         Justification = 'Секрет щойно введений оператором у консолі й одразу записується в Credential Manager; SecureString — формат зберігання, а не джерело.')]
     param([string[]]$Names)
 
+    # Оператор має бачити, що набирає: помилку в значенні (зайвий пробіл, не
+    # та розкладка) за зірочками не видно, і вона спливає пізніше як відмова
+    # автентифікації SFTP — далеко від місця, де її припустилися.
+    #
+    # Відкритий ввід дозволений ЛИШЕ тоді, коли доведено, що значення не
+    # осяде в журналі: helper-лог — це дослівний Start-Transcript, тому
+    # (1) власний transcript цього процесу має піддаватися паузі (перевіряє
+    # canary у Test-BRAVOHelperLogSuspensionEffective — не припущення про
+    # версію PowerShell, а фактична перевірка на цьому хості), і
+    # (2) батьківський BRAVO_SETUP має підтвердити, що зупинив СВІЙ transcript,
+    # інакше він захопить наш стрім у свій лог.
+    # Не виконано хоч одну умову -> fail-closed: ввід лишається прихованим.
+    $parentLogSuspended = ($env:BRAVO_PARENT_LOG_SUSPENDED -eq '1')
+    $plainInputAllowed = $parentLogSuspended -and (Test-BRAVOHelperLogSuspensionEffective)
+    if (-not $plainInputAllowed) {
+        Write-Host (
+            "Ввід лишається прихованим: не підтверджено, що значення не потрапить у журнал."
+        ) -ForegroundColor DarkGray
+    }
+
     $entries = New-Object System.Collections.ArrayList
+    $logSuspended = $false
+    if ($plainInputAllowed) {
+        $logSuspended = Suspend-BRAVOHelperLog
+        if (-not $logSuspended) {
+            # Canary щойно казав, що пауза працює, а вона не спрацювала —
+            # довіряємо фактові, а не попередній перевірці.
+            $plainInputAllowed = $false
+        }
+    }
+    try {
     foreach ($descriptor in @(Get-CredentialDescriptors -Names $Names)) {
         if ([string]::IsNullOrWhiteSpace([string]$descriptor.Target)) {
             throw "Для $($descriptor.Component) не налаштовано назву запису Credential Manager"
         }
 
-        $secret = if ([string]$descriptor.InputMode -eq "Text") {
+        $secret = if ($plainInputAllowed) {
+            $plainValue = Read-Host ([string]$descriptor.Prompt)
+            # Валідація застосовується лише там, де для значення взагалі є
+            # предметне правило (назва/код установи, префікс). Для паролів і
+            # webhook-ів такого правила немає — там єдина осмислена перевірка
+            # (непорожність) виконується нижче, спільно для всіх гілок.
+            $normalizedValue = if ([string]::IsNullOrWhiteSpace([string]$descriptor.Validation)) {
+                [string]$plainValue
+            } else {
+                Test-BRAVOInstitutionSettingValue `
+                    -Name ([string]$descriptor.Validation) `
+                    -Value ([string]$plainValue)
+            }
+            try {
+                ConvertTo-SecureString -String $normalizedValue -AsPlainText -Force
+            } finally {
+                $plainValue = $null
+                $normalizedValue = $null
+            }
+        } elseif ([string]$descriptor.InputMode -eq "Text") {
             $plainValue = Read-Host ([string]$descriptor.Prompt)
             $normalizedValue = Test-BRAVOInstitutionSettingValue `
                 -Name ([string]$descriptor.Validation) `
@@ -597,6 +646,13 @@ function Read-SecretEntries {
             UserName = [string]$descriptor.Component
             SecureSecret = $secret
         })
+    }
+    } finally {
+        # finally обов'язковий: без нього виняток під час вводу лишив би
+        # журнал вимкненим до кінця процесу, і решта кроків не записалась би.
+        if ($logSuspended) {
+            [void](Resume-BRAVOHelperLog)
+        }
     }
     return $entries.ToArray()
 }

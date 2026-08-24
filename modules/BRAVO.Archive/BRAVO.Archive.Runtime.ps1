@@ -503,7 +503,7 @@ function Test-Compatibility {
         Write-BRAVOLog -Component 'STARTUP' -Message "Стандартний режим" -Level "INFO"
     }
     if ($powerShellUpdate.IsUpdateRecommended) {
-        Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING"
+        Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING" -Environmental
     }
     $osSupportTier = Get-BRAVOOSSupportTier
     $script:BRAVOOSSupportTier = $osSupportTier
@@ -2032,6 +2032,153 @@ function Test-BRAVOVSSShadowMatchesVolume {
     return $false
 }
 
+function Get-BRAVOVSSExistingShadowIdMap {
+    # Знімок ID усіх наявних shadow copies ДО запуску diskshadow.exe. Потрібен
+    # двічі: щоб знайти щойно створений набір, коли вивід diskshadow.exe не
+    # вдалося розібрати, і щоб прибрати за собою persistent-знімки, якщо набір
+    # створився, але подальші кроки впали.
+    $map = @{}
+    try {
+        foreach ($shadow in @(
+                Get-WmiObject -Namespace "root\cimv2" -Class "Win32_ShadowCopy" -ErrorAction Stop
+            )) {
+            $shadowId = [string]$shadow.ID
+            if (-not [string]::IsNullOrWhiteSpace($shadowId)) {
+                $map[$shadowId.ToUpperInvariant()] = $true
+            }
+        }
+    } catch {
+        # Best-effort baseline: без нього лишаються парсинг виводу diskshadow.exe
+        # та відмова з явною помилкою, тому запит WMI не має зривати архівацію.
+    }
+    return $map
+}
+
+function Get-BRAVOVSSDiskshadowSetIdFromOutput {
+    # diskshadow.exe друкує людські повідомлення мовою системи, тому шукати в них
+    # англійський текст не можна: на локалізованому Windows Server такий пошук не
+    # знаходить нічого і архівація падає на успішно створеному наборі. Стабільні
+    # тут лише імена alias-ів (ASCII, не перекладаються) і самі GUID-и, тому
+    # ідентифікатор набору беремо з рядка з alias-ом VSS_SHADOW_SET.
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Output)
+
+    if ([string]::IsNullOrEmpty($Output)) {
+        return $null
+    }
+    $guidPattern = '\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}'
+    foreach ($line in ($Output -split "`r?`n")) {
+        if ($line -notmatch 'VSS_SHADOW_SET') {
+            continue
+        }
+        $guidMatch = [regex]::Match($line, $guidPattern)
+        if ($guidMatch.Success) {
+            return $guidMatch.Value.ToUpperInvariant()
+        }
+    }
+    return $null
+}
+
+function Get-BRAVOVSSDiskshadowSetIdFromWmi {
+    # Резервний шлях, коли вивід diskshadow.exe не містить alias-рядка: набором
+    # вважається єдиний SetID серед shadow copies, яких не було до запуску.
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$KnownShadowIds,
+        [Parameter(Mandatory = $true)][string[]]$VolumeRoots
+    )
+
+    try {
+        $currentShadows = @(
+            Get-WmiObject -Namespace "root\cimv2" -Class "Win32_ShadowCopy" -ErrorAction Stop
+        )
+    } catch {
+        return $null
+    }
+
+    $setIds = New-Object System.Collections.Generic.List[string]
+    foreach ($shadow in $currentShadows) {
+        $shadowId = [string]$shadow.ID
+        if ([string]::IsNullOrWhiteSpace($shadowId) -or
+            $KnownShadowIds.ContainsKey($shadowId.ToUpperInvariant())) {
+            continue
+        }
+        $matchesRequestedVolume = $false
+        foreach ($volumeRoot in @($VolumeRoots)) {
+            if (Test-BRAVOVSSShadowMatchesVolume -Shadow $shadow -VolumeRoot $volumeRoot) {
+                $matchesRequestedVolume = $true
+                break
+            }
+        }
+        if (-not $matchesRequestedVolume) {
+            continue
+        }
+        $setId = [string]$shadow.SetID
+        if (-not [string]::IsNullOrWhiteSpace($setId) -and
+            -not $setIds.Contains($setId.ToUpperInvariant())) {
+            [void]$setIds.Add($setId.ToUpperInvariant())
+        }
+    }
+    if ($setIds.Count -eq 1) {
+        return $setIds[0]
+    }
+    return $null
+}
+
+function Remove-BRAVOVSSDiskshadowOrphanedShadow {
+    # SET CONTEXT PERSISTENT NOWRITERS означає, що знімки не звільняються самі:
+    # кожен невдалий запуск без цього прибирання лишав на сервері shadow copies,
+    # які назавжди тримали місце в тіньовому сховищі томів.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$SnapshotSetId,
+        [Parameter(Mandatory = $true)][hashtable]$KnownShadowIds,
+        [Parameter(Mandatory = $true)][string[]]$VolumeRoots
+    )
+
+    try {
+        $currentShadows = @(
+            Get-WmiObject -Namespace "root\cimv2" -Class "Win32_ShadowCopy" -ErrorAction Stop
+        )
+    } catch {
+        return
+    }
+
+    $normalizedSetId = if ([string]::IsNullOrWhiteSpace($SnapshotSetId)) {
+        $null
+    } else {
+        $SnapshotSetId.ToUpperInvariant()
+    }
+
+    foreach ($shadow in $currentShadows) {
+        $shadowId = [string]$shadow.ID
+        if ([string]::IsNullOrWhiteSpace($shadowId)) {
+            continue
+        }
+        # Чужі знімки (у т.ч. створені паралельно іншим ПЗ) не чіпаємо: видаляємо
+        # лише ті, яких не було до нашого запуску і які лежать на наших томах,
+        # або ті, що явно належать нашому набору.
+        if ($KnownShadowIds.ContainsKey($shadowId.ToUpperInvariant())) {
+            continue
+        }
+        $isOurs = $false
+        if ($null -ne $normalizedSetId -and
+            ([string]$shadow.SetID).ToUpperInvariant() -eq $normalizedSetId) {
+            $isOurs = $true
+        } else {
+            foreach ($volumeRoot in @($VolumeRoots)) {
+                if (Test-BRAVOVSSShadowMatchesVolume -Shadow $shadow -VolumeRoot $volumeRoot) {
+                    $isOurs = $true
+                    break
+                }
+            }
+        }
+        if (-not $isOurs) {
+            continue
+        }
+        try { [void]$shadow.Delete() } catch {
+            # Best-effort cleanup: первинна помилка створення набору важливіша.
+        }
+    }
+}
+
 function New-BRAVOVSSDiskshadowSnapshotSet {
     param([Parameter(Mandatory = $true)][string[]]$VolumeRoots)
 
@@ -2057,8 +2204,14 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     }
     $lines.Add("CREATE")
     $lines.Add("END BACKUP")
+    # Без EXIT diskshadow.exe доходить до кінця файлу сценарію як до
+    # несподіваного завершення інтерактивної сесії і повертає ненульовий код
+    # навіть тоді, коли Snapshot Set створено успішно.
+    $lines.Add("EXIT")
 
     $volumeShadows = $null
+    $snapshotSetId = $null
+    $knownShadowIds = Get-BRAVOVSSExistingShadowIdMap
     try {
         [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), (New-Object Text.UTF8Encoding($false)))
 
@@ -2069,11 +2222,28 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
         $processInfo.RedirectStandardError = $true
         $processInfo.UseShellExecute = $false
         $processInfo.CreateNoWindow = $true
+        try {
+            # diskshadow.exe пише в OEM-кодуванні консолі. Без явного
+            # StandardOutputEncoding діагностика в лозі перетворюється на
+            # нечитабельні символи саме тоді, коли вона найпотрібніша.
+            $oemEncoding = [System.Text.Encoding]::GetEncoding(
+                [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+            )
+            $processInfo.StandardOutputEncoding = $oemEncoding
+            $processInfo.StandardErrorEncoding = $oemEncoding
+        } catch {
+            # Кодування — питання читабельності діагностики, а не коректності
+            # набору: розбір спирається лише на ASCII-alias і GUID-и.
+        }
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
+        # Start-BRAVOProcessOutputCapture сам запускає процес. Додатковий
+        # $process.Start() робив Close() поточного процесу і запускав другий
+        # diskshadow.exe: набір створював перший процес, а код завершення й
+        # WaitForExit бралися вже від другого, тому кожен багатотомний backup
+        # падав на успішно створеному наборі.
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
-        [void]$process.Start()
         if (-not $process.WaitForExit(300000)) {
             try { $process.Kill() } catch {
                 # Основна помилка timeout важливіша: процес міг завершитись між WaitForExit і Kill.
@@ -2081,18 +2251,24 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
             throw "diskshadow.exe не завершився протягом 300 секунд"
         }
         $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $outputCapture
+        # Ідентифікатор набору визначаємо ДО перевірки коду завершення: якщо
+        # diskshadow.exe встиг створити persistent-знімки і аж потім впав,
+        # cleanup у catch має знати, що саме прибирати.
+        $snapshotSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output (
+            $capturedOutput.StandardOutput + "`n" + $capturedOutput.StandardError
+        )
         if ($process.ExitCode -ne 0) {
             throw "diskshadow.exe повернув код $($process.ExitCode): $($capturedOutput.StandardError) $($capturedOutput.StandardOutput)"
         }
 
-        $snapshotSetMatch = [regex]::Match(
-            ($capturedOutput.StandardOutput + "`n" + $capturedOutput.StandardError),
-            '(?im)Shadow copy set ID:\s*(?<SetId>\{[0-9a-fA-F-]+\})'
-        )
-        if (-not $snapshotSetMatch.Success) {
+        if ([string]::IsNullOrWhiteSpace($snapshotSetId)) {
+            $snapshotSetId = Get-BRAVOVSSDiskshadowSetIdFromWmi `
+                -KnownShadowIds $knownShadowIds `
+                -VolumeRoots $VolumeRoots
+        }
+        if ([string]::IsNullOrWhiteSpace($snapshotSetId)) {
             throw "diskshadow.exe не повідомив Shadow copy set ID"
         }
-        $snapshotSetId = $snapshotSetMatch.Groups["SetId"].Value.ToUpperInvariant()
         $escapedSetId = $snapshotSetId.Replace("'", "''")
         $wmiShadows = @(
             Get-WmiObject `
@@ -2143,23 +2319,16 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
                 # Best-effort cleanup після частково створених link-ів; первинна помилка лишається нижче.
             }
         }
-        if (-not [string]::IsNullOrWhiteSpace($snapshotSetId)) {
-            try {
-                $escapedSetId = $snapshotSetId.Replace("'", "''")
-                foreach ($orphanedShadow in @(
-                        Get-WmiObject `
-                            -Namespace "root\cimv2" `
-                            -Class "Win32_ShadowCopy" `
-                            -Filter ("SetID='{0}'" -f $escapedSetId) `
-                            -ErrorAction SilentlyContinue
-                    )) {
-                    try { [void]$orphanedShadow.Delete() } catch {
-                        # Best-effort cleanup після невдалого створення; первинна помилка лишається нижче.
-                    }
-                }
-            } catch {
-                # Не перекриваємо первинну помилку diskshadow/WMI вторинною помилкою cleanup.
-            }
+        try {
+            # Прибирання не можна ставити в залежність від розібраного SetID:
+            # саме коли розбір не вдався, persistent-знімки й лишалися на
+            # сервері після кожного невдалого запуску.
+            Remove-BRAVOVSSDiskshadowOrphanedShadow `
+                -SnapshotSetId $snapshotSetId `
+                -KnownShadowIds $knownShadowIds `
+                -VolumeRoots $VolumeRoots
+        } catch {
+            # Не перекриваємо первинну помилку diskshadow/WMI вторинною помилкою cleanup.
         }
         throw
     } finally {

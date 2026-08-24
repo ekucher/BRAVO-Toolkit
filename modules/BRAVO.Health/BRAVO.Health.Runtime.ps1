@@ -751,14 +751,22 @@ $script:BRAVOHealthConsoleReady = $true
 function Write-HealthLog {
     param(
         [string]$Message,
-        [string]$Level = "INFO"
+        [string]$Level = "INFO",
+
+        # Environmental-нагадування (застарілі оновлення ОС/PowerShell) —
+        # це стан середовища, а не результат операції. Такий запис лишається
+        # видимим як WARNING, але НЕ інкрементує лічильник попереджень:
+        # інакше кожен успішний прогін на невідновленому сервері назавжди
+        # завершувався б кодом 10 (SuccessWithWarnings) зі статусом ЧАСТКОВО,
+        # поки адміністратор не встановить оновлення Windows.
+        [switch]$Environmental
     )
 
     # SFTP URL із паролем, webhook чи інший секрет можуть потрапити сюди
     # через повідомлення винятку WinSCP/Invoke-WebRequest — маскуємо перед
     # тим, як щось піде в консоль чи файл.
     $Message = Protect-BRAVOLogSecret -Text $Message
-    if ($Level -eq "WARNING") {
+    if ($Level -eq "WARNING" -and -not $Environmental) {
         $script:BRAVOWarningCount++
     }
 
@@ -4438,10 +4446,10 @@ Write-HealthLog "Конфігурація: $ConfigPath"
 Write-HealthLog "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); JSON=$($BRAVOCompatibility.JsonProvider); завдання=$($BRAVOCompatibility.TaskSchedulerProvider)"
 Write-HealthLog "Каталог резервних копій: $backupRootPath"
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
-    Write-HealthLog $BRAVOPowerShellUpdate.Message -Level "WARNING"
+    Write-HealthLog $BRAVOPowerShellUpdate.Message -Level "WARNING" -Environmental
 }
 if ($BRAVOWindowsPatchLevel.IsUpdateRecommended) {
-    Write-HealthLog $BRAVOWindowsPatchLevel.Message -Level "WARNING"
+    Write-HealthLog $BRAVOWindowsPatchLevel.Message -Level "WARNING" -Environmental
 }
 $script:BRAVOOSSupportTier = Get-BRAVOOSSupportTier
 Write-HealthLog "Підтримка ОС: $($script:BRAVOOSSupportTier.Tier) — Windows $($script:BRAVOOSSupportTier.OperatingSystem) ($($script:BRAVOOSSupportTier.OperatingSystemVersion), build $($script:BRAVOOSSupportTier.Build)); PowerShell $($script:BRAVOOSSupportTier.PowerShellVersion); .NET release $($script:BRAVOOSSupportTier.DotNetRelease)"

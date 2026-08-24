@@ -135,6 +135,147 @@ try {
         -Name "Credentials/SystemWorkerQuietConsole" `
         -Failure "SYSTEM worker Credential Manager не повинен виконувати Write-Host без консолі"
 
+    # --- Відкритий ввід облікових даних дозволений ЛИШЕ доти, доки доведено,
+    # що значення не осідає в helper-лозі (дослівний Start-Transcript).
+    # Механізм: пауза transcript + canary-перевірка її справності на цьому
+    # хості. Тести нижче фіксують і сам механізм, і його fail-closed контракт.
+    # Проба виконується в ДОЧІРНЬОМУ процесі PowerShell навмисно: Windows
+    # PowerShell 5.1 підтримує лише один transcript на сесію, а сам
+    # BRAVO_SELF_TEST уже працює під Start-BRAVOHelperLog. Вкладений
+    # Start-Transcript на 5.1 або падає, або перехоплює чужий журнал —
+    # у чистій дочірній сесії перевіряється саме той сценарій, що в проді.
+    $logSuspensionTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_LOG_SUSPENSION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($logSuspensionTestRoot)
+        $suspensionProbeScript = @'
+param([string]$ModuleRoot, [string]$TestRoot)
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $ModuleRoot 'BRAVO.HelperLogging.psd1') -Force
+$module = Get-Module BRAVO.HelperLogging
+
+function Invoke-SuspensionScenario {
+    param([string]$LogPath, [switch]$BreakSuspension)
+    & $module {
+        param($Path, $Break)
+        Start-Transcript -Path $Path -Force | Out-Null
+        $script:BRAVOHelperLogActive = $true
+        $script:BRAVOHelperLogPath = $Path
+        $script:BRAVOHelperLogSuspended = $false
+        $script:BRAVOHelperLogSuspensionEffective = $null
+        if ($Break) {
+            # Пауза, яка мовчки не спрацьовує: саме це має впіймати canary.
+            # script: обов'язковий — без нього підміна живе лише до кінця
+            # цього scriptblock і зникає ще до перевірки.
+            function script:Stop-Transcript { }
+        }
+    } $LogPath $BreakSuspension.IsPresent
+
+    $verdict = Test-BRAVOHelperLogSuspensionEffective
+    $suspended = $false
+    if (-not $BreakSuspension) {
+        Write-Host 'BRAVO-BEFORE-WINDOW'
+        $suspended = Suspend-BRAVOHelperLog
+        try { Write-Host 'BRAVO-INSIDE-WINDOW' } finally { [void](Resume-BRAVOHelperLog) }
+        Write-Host 'BRAVO-AFTER-WINDOW'
+    }
+    try { Stop-Transcript | Out-Null } catch { }
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($LogPath) } catch { }
+    return [pscustomobject]@{ Verdict = $verdict; Suspended = $suspended; Text = $text }
+}
+
+$effective = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'effective.log')
+$broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') -BreakSuspension
+
+[pscustomobject]@{
+    CanaryVerdict = [bool]$effective.Verdict
+    Suspended = [bool]$effective.Suspended
+    BeforeLogged = $effective.Text.Contains('BRAVO-BEFORE-WINDOW')
+    InsideLogged = $effective.Text.Contains('BRAVO-INSIDE-WINDOW')
+    AfterLogged = $effective.Text.Contains('BRAVO-AFTER-WINDOW')
+    CanaryTextLeaked = $effective.Text.Contains('BRAVO-LOG-SUSPENSION-CANARY')
+    BrokenVerdict = [bool]$broken.Verdict
+} | ConvertTo-Json -Compress
+'@
+        $suspensionProbePath = Join-Path $logSuspensionTestRoot 'probe.ps1'
+        [IO.File]::WriteAllText($suspensionProbePath, $suspensionProbeScript, (New-Object Text.UTF8Encoding($false)))
+        $hostExecutable = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $suspensionProbeOutput = & $hostExecutable -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File $suspensionProbePath `
+            (Join-Path $root 'modules\BRAVO.HelperLogging') $logSuspensionTestRoot
+        $suspensionProbeJson = @($suspensionProbeOutput) |
+            Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
+            Select-Object -Last 1
+        $suspensionProbe = if ([string]::IsNullOrWhiteSpace([string]$suspensionProbeJson)) {
+            $null
+        } else {
+            [string]$suspensionProbeJson | ConvertFrom-Json
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $suspensionProbe -and
+                $suspensionProbe.CanaryVerdict -and
+                $suspensionProbe.Suspended -and
+                $suspensionProbe.BeforeLogged -and
+                -not $suspensionProbe.InsideLogged -and
+                $suspensionProbe.AfterLogged -and
+                -not $suspensionProbe.CanaryTextLeaked
+            ) `
+            -Name "HelperLogging/SuspensionHidesConsoleOutput" `
+            -Failure ("пауза transcript має ховати вивід лише всередині вікна: рядки до і після мають лишатися в лозі, а canary-маркер не повинен туди потрапляти; фактично: " + $(
+                if ($null -eq $suspensionProbe) {
+                    'проба не повернула JSON'
+                } else {
+                    'canary={0}; suspended={1}; before={2}; inside={3}; after={4}; canaryLeaked={5}' -f `
+                        $suspensionProbe.CanaryVerdict, $suspensionProbe.Suspended, $suspensionProbe.BeforeLogged, `
+                        $suspensionProbe.InsideLogged, $suspensionProbe.AfterLogged, $suspensionProbe.CanaryTextLeaked
+                }))
+        Test-BRAVOCondition `
+            -Condition ($null -ne $suspensionProbe -and -not $suspensionProbe.BrokenVerdict) `
+            -Name "HelperLogging/CanaryDetectsIneffectiveSuspension" `
+            -Failure "якщо пауза transcript на хості не працює, canary-перевірка має повернути false — інакше відкритий ввід писався б прямо в журнал"
+    } finally {
+        Remove-Item -LiteralPath $logSuspensionTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $setupScriptTextForLogSuspension = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_SETUP.ps1"), [Text.Encoding]::UTF8)
+    $readSecretEntriesBlock = [regex]::Match(
+        $credentialSetupText,
+        '(?s)function Read-SecretEntries \{.*?\r?\n\}\r?\n'
+    ).Value
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($readSecretEntriesBlock) -and
+            $readSecretEntriesBlock.Contains('Test-BRAVOHelperLogSuspensionEffective') -and
+            $readSecretEntriesBlock.Contains("BRAVO_PARENT_LOG_SUSPENDED -eq '1'") -and
+            $readSecretEntriesBlock.Contains('$secret = if ($plainInputAllowed)') -and
+            $readSecretEntriesBlock.Contains('-AsSecureString')
+        ) `
+        -Name "Credentials/PlainInputRequiresSuspendedLog" `
+        -Failure "відкритий ввід має бути доступний лише за підтвердженої паузи ВЛАСНОГО журналу (canary) І батьківського (BRAVO_PARENT_LOG_SUSPENDED); прихована гілка -AsSecureString має лишатись як fail-closed запасний шлях"
+    Test-BRAVOCondition `
+        -Condition (
+            ([regex]::Matches($readSecretEntriesBlock, [regex]::Escape('Suspend-BRAVOHelperLog')).Count -ge 1) -and
+            ([regex]::IsMatch($readSecretEntriesBlock, '(?s)\} finally \{.*?Resume-BRAVOHelperLog')) -and
+            ([regex]::Matches($setupScriptTextForLogSuspension, [regex]::Escape('Suspend-BRAVOHelperLog')).Count -ge 1) -and
+            ([regex]::IsMatch($setupScriptTextForLogSuspension, '(?s)\} finally \{.*?Resume-BRAVOHelperLog'))
+        ) `
+        -Name "Credentials/ResumeAlwaysInFinally" `
+        -Failure "кожна пауза журналу має відновлюватись у finally: інакше виняток під час вводу лишив би журнал вимкненим до кінця процесу"
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptTextForLogSuspension.Contains('$env:BRAVO_PARENT_LOG_SUSPENDED = ''1''') -and
+            [regex]::IsMatch(
+                $setupScriptTextForLogSuspension,
+                '(?s)Suspend-BRAVOHelperLog.{0,600}?-ScriptPath \$setup\.CredentialScript'
+            )
+        ) `
+        -Name "Setup/CredentialStepSuspendsParentLog" `
+        -Failure "BRAVO_SETUP має зупиняти власний transcript навколо кроку Credential Manager і повідомляти про це дитині — інакше введені значення осядуть у батьківському лозі"
+
     Remove-Module -Name 'BRAVO.Compatibility' -Force -ErrorAction SilentlyContinue
     $outputEncodingBeforeCompatibilityImport = $global:OutputEncoding
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
@@ -261,6 +402,88 @@ try {
         ) `
         -Name "Runtime/LegacyOSTierIsInformationalInOperationalRuns" `
         -Failure "LegacyBestEffort у Archive/Maintenance має логуватись як INFO (не піднімати exit 10 і не маршрутизувати успішний звіт в ALERTS); у Health лишається WARNING як канонічна environmental-метрика"
+
+    # --- Environmental-нагадування (застарілі оновлення Windows/PowerShell)
+    # лишаються видимими як WARNING, але не інкрементують лічильник
+    # попереджень. Інакше кожен успішний прогін на невідновленому сервері
+    # назавжди завершувався б кодом 10 (SuccessWithWarnings) зі статусом
+    # ЧАСТКОВО — саме це й спостерігалось на SERV_HRDL_1 (останнє оновлення
+    # Windows 1109 дн. тому).
+    $loggingModuleSourceText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psm1"), [Text.Encoding]::UTF8)
+    $environmentalLogModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $loggingModuleSourceText `
+        -FunctionNames @('Write-BRAVOLog', 'Get-BRAVOLogSeverityValue')
+    $environmentalLogProbe = & $environmentalLogModule {
+        function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+        # Таблиця рівнів — module-scope змінна BRAVO.Logging, тому в
+        # екстрагований module scope її треба внести явно (AST переносить
+        # лише функції).
+        $script:BRAVOLogSeverity = @{
+            TRACE = 0; DEBUG = 1; INFO = 2; SUCCESS = 3
+            WARNING = 4; ERROR = 5; FATAL = 6
+        }
+        $script:BRAVOLogActive = $false
+        $script:BRAVOLogWarningCount = 0
+        $script:BRAVOLogErrorCount = 0
+
+        Write-BRAVOLog -Component 'STARTUP' -Message '環' -Level 'WARNING' -Environmental -NoConsole
+        $afterEnvironmental = $script:BRAVOLogWarningCount
+        Write-BRAVOLog -Component 'STARTUP' -Message 'звичайне попередження' -Level 'WARNING' -NoConsole
+        $afterOperational = $script:BRAVOLogWarningCount
+        # -Environmental не має приховувати справжні помилки.
+        Write-BRAVOLog -Component 'STARTUP' -Message 'помилка' -Level 'ERROR' -Environmental -NoConsole
+        $errorsAfter = $script:BRAVOLogErrorCount
+
+        [pscustomobject]@{
+            AfterEnvironmental = $afterEnvironmental
+            AfterOperational = $afterOperational
+            ErrorsAfter = $errorsAfter
+        }
+    }
+    $healthRuntimeTextForEnvironmental = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $archiveRuntimeTextForEnvironmental = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $maintenanceRuntimeTextForEnvironmental = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $environmentalLogProbe.AfterEnvironmental -eq 0 -and
+            $environmentalLogProbe.AfterOperational -eq 1 -and
+            $environmentalLogProbe.ErrorsAfter -eq 1
+        ) `
+        -Name "Runtime/EnvironmentalWarningDoesNotCountAsOperationWarning" `
+        -Failure "-Environmental має лишати рівень WARNING, але не інкрементувати лічильник попереджень; звичайний WARNING і будь-який ERROR мають рахуватись як раніше"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForEnvironmental -match '\$BRAVOWindowsPatchLevel\.Message -Level "WARNING" -Environmental' -and
+            $healthRuntimeTextForEnvironmental -match '\$BRAVOPowerShellUpdate\.Message -Level "WARNING" -Environmental' -and
+            $archiveRuntimeTextForEnvironmental -match '\$powerShellUpdate\.Message -Level "WARNING" -Environmental' -and
+            $maintenanceRuntimeTextForEnvironmental -match '\$BRAVOPowerShellUpdate\.Message -Level "WARNING" -Environmental'
+        ) `
+        -Name "Runtime/StaleUpdateRemindersAreEnvironmental" `
+        -Failure "нагадування про застарілі оновлення Windows/PowerShell мають логуватись з -Environmental, інакше невідновлений сервер назавжди дає exit 10 і статус ЧАСТКОВО на успішному прогоні"
+
+    # --- Dry-run створює відсутній SFTP-каталог призначення замість того,
+    # щоб падати fail-closed на тому, що BRAVO_ARCHIV робить сам
+    # (Initialize-BRAVOSFTPRemoteDirectories).
+    $dryRunScriptTextForSftp = [IO.File]::ReadAllText(
+        (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
+    $sftpDestinationBlock = [regex]::Match(
+        $dryRunScriptTextForSftp,
+        '(?s)function Test-SftpDestinationAccess \{.*?\r?\n\}\r?\n'
+    ).Value
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($sftpDestinationBlock) -and
+            $sftpDestinationBlock.Contains('$session.CreateDirectory($remotePath)') -and
+            $sftpDestinationBlock.Contains('[switch]$CreateMissingDirectories') -and
+            $dryRunScriptTextForSftp.Contains('-CreateMissingDirectories') -and
+            -not $dryRunScriptTextForSftp.Contains('Dry Run не створює каталоги.')
+        ) `
+        -Name "DryRun/CreatesMissingSftpDestination" `
+        -Failure "dry-run має створювати відсутній SFTP-каталог призначення через CreateDirectory, а не блокувати інсталяцію повідомленням 'Dry Run не створює каталоги'"
 
     $toolIntegrityTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
@@ -2039,6 +2262,86 @@ try {
         -Condition ($endpointFallbackCapture.AllMissingThrew) `
         -Name "Notifications/EndpointThrowsWhenNothingConfigured" `
         -Failure "коли жоден target (новий і legacy) не налаштований, має кидатись виняток, а не мовчки повертатись порожній webhook"
+    # --- Dry-run має перевіряти РІВНО ті записи Credential Manager, які
+    # читає runtime. Регресія з логів SERV_HRDL_1 (2026-08-24): сервер
+    # налаштовано на route-специфічні webhook-и, BRAVO_DISCORD_URL відсутній —
+    # сповіщення працювали, а dry-run звітував [FAIL] і зупиняв BRAVO_SETUP
+    # fail-closed.
+    $dryRunScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
+    $dryRunWebhookTestModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($dryRunScriptText + [Environment]::NewLine + $notificationsModuleSourceText) `
+        -FunctionNames @(
+            'Get-NotificationCredentialTargetTable',
+            'Test-DryRunWebhookCredential',
+            'Resolve-BRAVONotificationEndpoint'
+        )
+    $dryRunWebhookCapture = & $dryRunWebhookTestModule {
+        $script:stubStore = @{}
+        function Get-BRAVOCredentialSecret {
+            param([string]$Target)
+            # Ізольований stub: жодного доступу до Windows Credential Manager.
+            if ($script:stubStore.Contains($Target)) { return $script:stubStore[$Target] }
+            return $null
+        }
+        $script:capturedResults = New-Object System.Collections.ArrayList
+        function Add-DryRunResult {
+            param($Status, $Section, $Name, $Detail)
+            [void]$script:capturedResults.Add(('{0}|{1}' -f $Status, $Detail))
+        }
+        $credentialSettings = @{ Targets = @{
+            DiscordWebhook = 'BRAVO_DISCORD_URL'
+            DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
+            DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
+        } }
+        $descriptor = [pscustomobject]@{
+            Name = 'Discord webhook'
+            Target = 'BRAVO_DISCORD_URL'
+            Kind = 'Webhook'
+            NotificationProvider = 'discord'
+        }
+
+        # 1. Конфігурація SERV_HRDL_1: лише route-специфічні записи.
+        $script:stubStore = @{
+            'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS'
+            'BRAVO_DISCORD_GENERAL_URL' = 'STUB-GENERAL'
+        }
+        $script:capturedResults.Clear()
+        $routeSpecificValues = @{}
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $routeSpecificValues
+        $routeSpecificStatus = [string]$script:capturedResults[0]
+
+        # 2. Стара інсталяція: лише legacy BRAVO_DISCORD_URL.
+        $script:stubStore = @{ 'BRAVO_DISCORD_URL' = 'STUB-LEGACY' }
+        $script:capturedResults.Clear()
+        $legacyValues = @{}
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $legacyValues
+        $legacyStatus = [string]$script:capturedResults[0]
+
+        # 3. Жодного webhook: dry-run має чесно впасти.
+        $script:stubStore = @{}
+        $script:capturedResults.Clear()
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues @{}
+        $missingStatus = [string]$script:capturedResults[0]
+
+        [pscustomobject]@{
+            RouteSpecificStatus = $routeSpecificStatus
+            RouteSpecificSecret = [string]$routeSpecificValues['Webhook']
+            LegacyStatus = $legacyStatus
+            LegacySecret = [string]$legacyValues['Webhook']
+            MissingStatus = $missingStatus
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunWebhookCapture.RouteSpecificStatus -like 'PASS|*' -and
+            $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-ALERTS' -and
+            $dryRunWebhookCapture.LegacyStatus -like 'PASS|*' -and
+            $dryRunWebhookCapture.LegacySecret -eq 'STUB-LEGACY' -and
+            $dryRunWebhookCapture.MissingStatus -like 'FAIL|*'
+        ) `
+        -Name 'DryRun/WebhookCheckMatchesRuntimeResolution' `
+        -Failure 'dry-run має перевіряти webhook тим самим Resolve-BRAVONotificationEndpoint, що й runtime: route-специфічні записи без legacy BRAVO_DISCORD_URL мають давати PASS, legacy-only інсталяція теж PASS, і лише повна відсутність webhook — FAIL'
     # Відновлюємо реальні модулі для решти self-test (наступні секції
     # покладаються на їх наявність, як і до цього ізольованого блоку).
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
@@ -3169,6 +3472,10 @@ try {
             "Get-BRAVOUniqueVSSVolumes",
             "Get-BRAVOVSSVolumeIdentityCandidates",
             "Test-BRAVOVSSShadowMatchesVolume",
+            "Get-BRAVOVSSExistingShadowIdMap",
+            "Get-BRAVOVSSDiskshadowSetIdFromOutput",
+            "Get-BRAVOVSSDiskshadowSetIdFromWmi",
+            "Remove-BRAVOVSSDiskshadowOrphanedShadow",
             "New-BRAVOVSSSnapshotSet",
             "Resolve-BRAVOSnapshotSourcePath",
             "Remove-BRAVOVSSVolumeShadow",
@@ -4312,6 +4619,96 @@ try {
         ) `
         -Name "BackupConsistency/VSSSnapshotSetGeneration" `
         -Failure "MODEL/BLOG/BRAVOEXCH мають використовувати один VSS Snapshot Set з дедуплікацією томів і cleanup один раз після generation"
+
+    $vssDiskshadowProbe = & $archiveRuntimeModule {
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Message, [string]$Level)
+        }
+
+        # Локалізований вивід diskshadow.exe: людський текст перекладено,
+        # ASCII-alias VSS_SHADOW_SET і GUID-и — ні.
+        $localizedOutput = @(
+            "-> CREATE",
+            "Псевдоним BRAVOVolume1 для теневой копии с кодом {AAAAAAAA-1111-2222-3333-444444444444} задан.",
+            "Псевдоним VSS_SHADOW_SET для набора теневых копий с кодом {BBBBBBBB-1111-2222-3333-444444444444} задан.",
+            "-> END BACKUP"
+        ) -join "`r`n"
+        $localizedSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output $localizedOutput
+        $englishSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output (
+            "`t`t- Shadow copy set: {BBBBBBBB-1111-2222-3333-444444444444}`t%VSS_SHADOW_SET%"
+        )
+        $missingSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output "-> CREATE`r`n-> END BACKUP"
+
+        $script:deletedShadowIds = New-Object System.Collections.ArrayList
+        $newShadowIds = @(
+            "{11111111-1111-1111-1111-111111111111}",
+            "{22222222-2222-2222-2222-222222222222}"
+        )
+        function New-SelfTestShadow {
+            param([string]$Id, [string]$SetId, [string]$VolumeName)
+            $shadow = [pscustomobject]@{ ID = $Id; SetID = $SetId; VolumeName = $VolumeName }
+            Add-Member -InputObject $shadow -MemberType ScriptMethod -Name Delete -Value {
+                [void]$script:deletedShadowIds.Add($this.ID)
+            }
+            return $shadow
+        }
+        function Get-WmiObject {
+            param([string]$Namespace, [string]$Class, [string]$Filter, [string]$ErrorAction)
+            if ($Class -ne "Win32_ShadowCopy") {
+                return
+            }
+            @(
+                (New-SelfTestShadow -Id "{99999999-9999-9999-9999-999999999999}" -SetId "{OLD-SET}" -VolumeName "C:\"),
+                (New-SelfTestShadow -Id $newShadowIds[0] -SetId "{BBBBBBBB-1111-2222-3333-444444444444}" -VolumeName "C:\"),
+                (New-SelfTestShadow -Id $newShadowIds[1] -SetId "{BBBBBBBB-1111-2222-3333-444444444444}" -VolumeName "D:\"),
+                (New-SelfTestShadow -Id "{33333333-3333-3333-3333-333333333333}" -SetId "{FOREIGN-SET}" -VolumeName "E:\")
+            )
+        }
+
+        $knownShadowIds = @{ "{99999999-9999-9999-9999-999999999999}" = $true }
+        $wmiSetId = Get-BRAVOVSSDiskshadowSetIdFromWmi `
+            -KnownShadowIds $knownShadowIds `
+            -VolumeRoots @("C:\", "D:\")
+        Remove-BRAVOVSSDiskshadowOrphanedShadow `
+            -SnapshotSetId $null `
+            -KnownShadowIds $knownShadowIds `
+            -VolumeRoots @("C:\", "D:\")
+
+        [pscustomobject]@{
+            LocalizedSetId = $localizedSetId
+            EnglishSetId = $englishSetId
+            MissingSetId = $missingSetId
+            WmiSetId = $wmiSetId
+            DeletedShadowIds = @($script:deletedShadowIds)
+        }
+    }
+    # Джерело — BRAVO.Archive.Runtime.ps1 ($archiveScriptText).
+    # $archiveRuntimeModuleText — це BRAVO.ArchiveRuntime.psm1, інший файл.
+    $diskshadowScriptText = [regex]::Match(
+        $archiveScriptText,
+        '(?s)function New-BRAVOVSSDiskshadowSnapshotSet \{.*?\r?\n\}\r?\n'
+    ).Value
+    Test-BRAVOCondition `
+        -Condition (
+            $vssDiskshadowProbe.LocalizedSetId -eq "{BBBBBBBB-1111-2222-3333-444444444444}" -and
+            $vssDiskshadowProbe.EnglishSetId -eq "{BBBBBBBB-1111-2222-3333-444444444444}" -and
+            $null -eq $vssDiskshadowProbe.MissingSetId -and
+            $vssDiskshadowProbe.WmiSetId -eq "{BBBBBBBB-1111-2222-3333-444444444444}" -and
+            $vssDiskshadowProbe.DeletedShadowIds.Count -eq 2 -and
+            $vssDiskshadowProbe.DeletedShadowIds -contains "{11111111-1111-1111-1111-111111111111}" -and
+            $vssDiskshadowProbe.DeletedShadowIds -contains "{22222222-2222-2222-2222-222222222222}"
+        ) `
+        -Name "BackupConsistency/VSSDiskshadowSetIdIsLocaleIndependent" `
+        -Failure "Shadow copy set ID має визначатися з ASCII-alias VSS_SHADOW_SET або з нових shadow copies у WMI, а persistent-знімки невдалого запуску — прибиратися навіть без розібраного SetID"
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($diskshadowScriptText) -and
+            $diskshadowScriptText.Contains('$lines.Add("EXIT")') -and
+            -not $diskshadowScriptText.Contains('[void]$process.Start()') -and
+            -not $diskshadowScriptText.Contains('Shadow copy set ID:')
+        ) `
+        -Name "BackupConsistency/VSSDiskshadowRunsExactlyOnce" `
+        -Failure "сценарій diskshadow.exe має завершуватися EXIT, запускатися лише через Start-BRAVOProcessOutputCapture і не покладатися на англомовний текст виводу"
 
     $vssOwnershipTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `

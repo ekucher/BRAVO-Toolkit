@@ -443,17 +443,87 @@ function Get-RequiredCredentialDescriptors {
                 Name = "Slack webhook"
                 Target = Get-ConfiguredTarget "SlackWebhook" "BRAVO_SLACK_URL"
                 Kind = "Webhook"
+                NotificationProvider = "slack"
             })
         } else {
             [void]$descriptors.Add([pscustomobject]@{
                 Name = "Discord webhook"
                 Target = Get-ConfiguredTarget "DiscordWebhook" "BRAVO_DISCORD_URL"
                 Kind = "Webhook"
+                NotificationProvider = "discord"
             })
         }
     }
 
     return $descriptors.ToArray()
+}
+
+function Get-NotificationCredentialTargetTable {
+    # Рівно той самий об'єкт, який runtime передає в
+    # Resolve-BRAVONotificationEndpoint (BRAVO.config:
+    # NotificationCredentialTargets = $credentialSettings.Targets).
+    if ($null -ne $credentialSettings -and $credentialSettings.Targets -is [hashtable]) {
+        return $credentialSettings.Targets
+    }
+    $table = @{}
+    if ($null -ne $credentialSettings -and $null -ne $credentialSettings.Targets) {
+        foreach ($property in $credentialSettings.Targets.PSObject.Properties) {
+            $table[$property.Name] = [string]$property.Value
+        }
+    }
+    return $table
+}
+
+function Test-DryRunWebhookCredential {
+    # Dry-run має перевіряти РІВНО ті записи Credential Manager, які runtime
+    # реально читає. Раніше тут стояв лише legacy provider-wide target
+    # (BRAVO_DISCORD_URL / BRAVO_SLACK_URL), тоді як
+    # Resolve-BRAVONotificationEndpoint пробує спершу route-специфічний
+    # (BRAVO_DISCORD_ALERTS_URL / BRAVO_DISCORD_GENERAL_URL) і лише потім
+    # legacy. Сервер, налаштований на route-специфічні webhook-и, отримував
+    # [FAIL] на цілком робочій конфігурації — і BRAVO_SETUP зупинявся
+    # fail-closed, хоча сповіщення фактично надсилались. Канонічний власник
+    # порядку пошуку один — BRAVO.Notifications; тут він саме викликається,
+    # а не дублюється.
+    param(
+        [Parameter(Mandatory = $true)][object]$Descriptor,
+        [Parameter(Mandatory = $true)][hashtable]$CredentialValues
+    )
+
+    $credentialTargets = Get-NotificationCredentialTargetTable
+    $resolvedRoutes = New-Object System.Collections.Generic.List[string]
+    $failedRoutes = New-Object System.Collections.Generic.List[string]
+    foreach ($route in @('alerts', 'general')) {
+        $secret = $null
+        try {
+            $secret = Resolve-BRAVONotificationEndpoint `
+                -Provider ([string]$Descriptor.NotificationProvider) `
+                -Route $route `
+                -CredentialTargets $credentialTargets
+        } catch {
+            [void]$failedRoutes.Add(('{0}: {1}' -f $route, $_.Exception.Message))
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($secret)) {
+            [void]$failedRoutes.Add(('{0}: порожнє значення' -f $route))
+            continue
+        }
+        [void]$resolvedRoutes.Add($route)
+        if ([string]::IsNullOrWhiteSpace([string]$CredentialValues[$Descriptor.Kind])) {
+            $CredentialValues[$Descriptor.Kind] = $secret
+        }
+    }
+
+    if ($failedRoutes.Count -gt 0) {
+        Add-DryRunResult FAIL 'Credential Manager' $Descriptor.Name (
+            'для {0} не вдалося отримати webhook — {1}' -f `
+                ([Security.Principal.WindowsIdentity]::GetCurrent().Name), ($failedRoutes -join '; ')
+        )
+        return
+    }
+    Add-DryRunResult PASS 'Credential Manager' $Descriptor.Name (
+        'webhook доступний для поточного облікового запису (маршрути: {0})' -f ($resolvedRoutes -join ', ')
+    )
 }
 
 function Get-SourceDirectory {
@@ -707,7 +777,7 @@ function Get-WinSCPComponents {
     return $null
 }
 
-function Test-SftpReadOnlyAccess {
+function Test-SftpDestinationAccess {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
         Justification = 'Секрет із Credential Manager; WinSCP.SessionOptions.Password приймає саме рядок.')]
@@ -715,9 +785,17 @@ function Test-SftpReadOnlyAccess {
         [string]$Login,
         [string]$Password,
         # Віддалені каталоги призначення для увімкнених SFTP-компонентів
-        # (наприклад "baza_app", "baza_www"). Перевіряються read-only через
-        # FileExists; каталоги НЕ створюються.
-        [string[]]$RequiredDirectories = @()
+        # (наприклад "baza_app", "baza_www").
+        [string[]]$RequiredDirectories = @(),
+
+        # Відсутні каталоги призначення створюються тут же. BRAVO_ARCHIV усе
+        # одно створює їх при першому запуску
+        # (Initialize-BRAVOSFTPRemoteDirectories, BRAVO.Archive.Runtime.ps1),
+        # тому падати fail-closed на тому, що продукт робить сам, означало б
+        # не давати операторові завершити інсталяцію: BRAVO_SETUP зупиняється
+        # на ненульовому коді dry-run, а перший архівний запуск, який створив
+        # би каталог, при цьому ніколи не настає.
+        [switch]$CreateMissingDirectories
     )
 
     $hostName = Resolve-SftpHost -Login $Login
@@ -745,20 +823,40 @@ function Test-SftpReadOnlyAccess {
 
         $present = New-Object System.Collections.Generic.List[string]
         $missing = New-Object System.Collections.Generic.List[string]
+        $created = New-Object System.Collections.Generic.List[string]
+        $creationFailed = New-Object System.Collections.Generic.List[string]
         foreach ($directory in @($RequiredDirectories)) {
             if ([string]::IsNullOrWhiteSpace($directory)) { continue }
             $remotePath = '/' + ($directory.Trim().Trim('/'))
-            # FileExists — read-only stat; Dry Run НІКОЛИ не створює каталоги.
             if ($session.FileExists($remotePath)) {
                 $present.Add($remotePath)
-            } else {
+                continue
+            }
+            if (-not $CreateMissingDirectories) {
                 $missing.Add($remotePath)
+                continue
+            }
+            try {
+                $session.CreateDirectory($remotePath)
+            } catch {
+                $creationFailed.Add(('{0}: {1}' -f $remotePath, $_.Exception.Message))
+                continue
+            }
+            # Підтверджуємо фактом, а не відсутністю винятку: каталог має
+            # існувати після створення, інакше наступний реальний upload
+            # впаде вже в production.
+            if ($session.FileExists($remotePath)) {
+                $created.Add($remotePath)
+            } else {
+                $creationFailed.Add(('{0}: каталог не з''явився після створення' -f $remotePath))
             }
         }
         return [pscustomobject]@{
             Detail = "$hostName`:$port — автентифікація і читання каталогу успішні"
             Present = $present.ToArray()
             Missing = $missing.ToArray()
+            Created = $created.ToArray()
+            CreationFailed = $creationFailed.ToArray()
         }
     } finally {
         $session.Dispose()
@@ -1591,6 +1689,12 @@ try {
             }
             $requiredCredentials = @(Get-RequiredCredentialDescriptors)
             foreach ($descriptor in $requiredCredentials) {
+                if ($descriptor.Kind -eq "Webhook") {
+                    Test-DryRunWebhookCredential `
+                        -Descriptor $descriptor `
+                        -CredentialValues $credentialValues
+                    continue
+                }
                 try {
                     $secret = Get-BRAVOCredentialSecret -Target $descriptor.Target
                     if ([string]::IsNullOrWhiteSpace($secret)) {
@@ -1626,29 +1730,41 @@ try {
         }
         if ($TestAccess -and $credentialValues.SFTPLogin -and $credentialValues.SFTPPassword) {
             try {
-                # Кожен УВІМКНЕНИЙ SFTP-компонент вимагає, щоб його віддалений
-                # каталог призначення вже існував (production sync його не
-                # створює). Перелік — з канонічного $bazaSyncEffective.
+                # Кожен УВІМКНЕНИЙ SFTP-компонент має власний віддалений
+                # каталог призначення. Перелік — з канонічного $bazaSyncEffective.
+                # Відсутні каталоги створюються одразу: BRAVO_ARCHIV робить те
+                # саме при першому запуску (Initialize-BRAVOSFTPRemoteDirectories),
+                # тому блокувати інсталяцію на їх відсутності немає підстав.
                 $requiredSftpDirectories = @($bazaSyncEffective.RequiredSftpDestinations)
-                $sftpResult = Test-SftpReadOnlyAccess `
+                $sftpResult = Test-SftpDestinationAccess `
                     -Login ([string]$credentialValues.SFTPLogin) `
                     -Password ([string]$credentialValues.SFTPPassword) `
-                    -RequiredDirectories $requiredSftpDirectories
-                Add-DryRunResult PASS "SFTP" "Read-only доступ" $sftpResult.Detail
+                    -RequiredDirectories $requiredSftpDirectories `
+                    -CreateMissingDirectories
+                Add-DryRunResult PASS "SFTP" "Доступ" $sftpResult.Detail
                 foreach ($presentDir in @($sftpResult.Present)) {
                     Add-DryRunResult PASS "SFTP" "Каталог призначення" "$presentDir існує"
                 }
+                foreach ($createdDir in @($sftpResult.Created)) {
+                    Add-DryRunResult PASS "SFTP" "Каталог призначення" (
+                        "$createdDir був відсутній — створено"
+                    )
+                }
                 foreach ($missingDir in @($sftpResult.Missing)) {
                     Add-DryRunResult FAIL "SFTP" "Каталог призначення" (
-                        "SFTP destination '$missingDir' не існує або недоступний. " +
-                        "Dry Run не створює каталоги."
+                        "SFTP destination '$missingDir' не існує або недоступний."
+                    )
+                }
+                foreach ($creationFailure in @($sftpResult.CreationFailed)) {
+                    Add-DryRunResult FAIL "SFTP" "Каталог призначення" (
+                        "не вдалося створити SFTP destination — $creationFailure"
                     )
                 }
             } catch {
-                Add-DryRunResult FAIL "SFTP" "Read-only доступ" $_.Exception.Message
+                Add-DryRunResult FAIL "SFTP" "Доступ" $_.Exception.Message
             }
         } elseif (-not $TestAccess) {
-            Add-DryRunResult WARN "SFTP" "Read-only доступ" "не перевірявся; використайте -TestAccess"
+            Add-DryRunResult WARN "SFTP" "Доступ" "не перевірявся; використайте -TestAccess"
         }
     }
 
@@ -1766,6 +1882,13 @@ try {
         foreach ($webhook in @($requiredCredentials | Where-Object { $_.Kind -eq "Webhook" })) {
             $webhookValue = [string]$credentialValues.Webhook
             try {
+                # Порожній webhook — окрема, зрозуміла оператору причина.
+                # Без цієї перевірки New-Object Uri віддавав сирий текст
+                # .NET-винятку ("Недопустимый URI: URI пуст."), який нічого не
+                # каже про те, що запис відсутній у Credential Manager.
+                if ([string]::IsNullOrWhiteSpace($webhookValue)) {
+                    throw "webhook відсутній у Credential Manager"
+                }
                 $uri = New-Object Uri($webhookValue)
                 if (-not $uri.IsAbsoluteUri -or $uri.Scheme -ne "https") {
                     throw "webhook повинен бути абсолютним HTTPS URL"
