@@ -4379,8 +4379,10 @@ try {
             DeletedShadowIds = @($script:deletedShadowIds)
         }
     }
+    # Джерело — BRAVO.Archive.Runtime.ps1 ($archiveScriptText).
+    # $archiveRuntimeModuleText — це BRAVO.ArchiveRuntime.psm1, інший файл.
     $diskshadowScriptText = [regex]::Match(
-        $archiveRuntimeModuleText,
+        $archiveScriptText,
         '(?s)function New-BRAVOVSSDiskshadowSnapshotSet \{.*?\r?\n\}\r?\n'
     ).Value
     Test-BRAVOCondition `
