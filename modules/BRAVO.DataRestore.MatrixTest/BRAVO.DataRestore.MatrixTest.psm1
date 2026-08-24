@@ -139,7 +139,7 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
         @{ Pattern = '(?m)^(\s*NotificationMode\s*=\s*)"all"'; Replacement = '${1}"none"' }
         @{ Pattern = '(?m)^(\s*MinimumFreeSpaceGB\s*=\s*)20\b'; Replacement = "`${1}$MinimumFreeSpaceGB" }
         @{ Pattern = '(?m)^(\s*BravoName\s*=\s*)"BRAVO"'; Replacement = "`${1}`"$($script:FixtureBravoServiceName)`"" }
-        @{ Pattern = '(?m)^(\s*BravoDisplayName\s*=\s*)"BRAVO Service"'; Replacement = "`${1}`"$($script:FixtureBravoDisplayName)`"" }
+        @{ Pattern = '(?m)^(\s*BravoDisplayName\s*=\s*)@\("BRAVO Service",\s*"BRAVO Server"\)'; Replacement = "`${1}`"$($script:FixtureBravoDisplayName)`"" }
         @{ Pattern = '(?m)^(\s*BravoWebEnabled\s*=\s*)\$true'; Replacement = '${1}$false' }
         @{ Pattern = '(?m)^(\s*ExchangeApiName\s*=\s*)"exchangAPI"'; Replacement = "`${1}`"$($script:FixtureExchangeApiServiceName)`"" }
     )

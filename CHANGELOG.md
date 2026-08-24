@@ -75,6 +75,31 @@
   виконано (нижче задокументованого baseline 5.1) — рекомендація й далі
   «оновіть Windows Management Framework».
 
+- **FIX (data-integrity discovery): службу BRAVO з DisplayName="BRAVO
+  Server" не визнавали канонічною.** Реальний DEV-майданчик
+  (2026-08-24): служба Windows `BRAVO` встановлена й запущена
+  (`Get-Service BRAVO` -> `Running`), але `Import-BravoConfiguration`
+  усе одно падав на "Не вдалося визначити BackupRoot: ... вимагає
+  визначеного EffectiveLIMSRoot". Причина — `DisplayName` реальної
+  служби виявився `"BRAVO Server"`, тоді як Discovery (навмисний
+  строгий захист від хибного співставлення із чужим сервісом: Name ТА
+  DisplayName одночасно) очікував рівно `"BRAVO Service"`. Обидва
+  написання — реальні варіанти інсталяторів BRAVO/LIMS, не помилка
+  цього конкретного сервера. `Resolve-BRAVOEffectiveLimsRoot` і
+  `Resolve-BRAVOInstallationDiscovery` тепер приймають `-BravoDisplayName`
+  як масив (дефолт `@("BRAVO Service", "BRAVO Server")`) — точний збіг
+  з БУДЬ-ЯКИМ значенням зі списку, а не одне жорстко задане значення.
+  Це НЕ послаблення identity-перевірки: збіг і далі точний
+  (case-insensitive `-eq`, не substring/regex/wildcard), просто список
+  канонічних варіантів написання розширено з одного до двох.
+  `maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config` —
+  тепер `@("BRAVO Service", "BRAVO Server")`; якщо на вашому сервері
+  DisplayName служби інший за обидва — додайте третім елементом
+  (перевірте `Get-Service BRAVO | Select DisplayName`), не замінюйте
+  список. Новий self-test:
+  `Discovery/BravoServerDisplayNameAcceptedAsCanonical` і
+  `Paths/01b-AutoLimsRootFromServiceBravoServerDisplayName`.
+
 ---
 
 ## 5.2.0-rc.3 — 2026-08-24 (candidate, pending acceptance)
