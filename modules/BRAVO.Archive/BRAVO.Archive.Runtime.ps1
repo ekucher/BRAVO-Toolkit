@@ -5496,6 +5496,80 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     }
 }
 
+function Merge-BRAVOArchiveSpaceCheckResults {
+    # Об'єднує фіксований поріг (Get-BRAVOArchiveFreeSpaceResult) і
+    # розрахункову оцінку (Get-BRAVOArchiveEstimatedSpaceRequirement) в
+    # один підсумковий результат кроку "Перевірка вільного місця".
+    #
+    # Реальний acceptance (2026-08-25): фіксований поріг — загальний
+    # OS-захист "не забити диск впритул", не прив'язаний до конкретного
+    # backup. Оператор підтвердив, що коли розрахункова оцінка доводить
+    # достатність місця САМЕ для цього набору архівів, фіксований поріг
+    # не повинен блокувати прогін — лише попереджати.
+    #
+    # Виправдання приймається СТРОГО по-диску (не глобально) і ЛИШЕ коли
+    # для ТОГО САМОГО диска оцінка реально обчислена й показала
+    # достатність. Диск без жодного увімкненого компонента з валідною
+    # історією (bootstrap, чи взагалі не бере участі в backup) лишається
+    # під фіксованим порогом без жодних послаблень — довести безпеку
+    # нема на чому, а не тому, що ризик підтверджено прийнятним.
+    #
+    # Незалежно від floor-виправдання: якщо сама розрахункова оцінка
+    # виявила недостатність (для будь-якого оціненого диска) — це
+    # завжди блокує, floor-виправдання тут ролі не відіграє.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$FloorResult,
+        [Parameter(Mandatory = $true)][object]$EstimatedResult,
+        [Parameter(Mandatory = $true)][double]$MinimumFreeSpaceGB
+    )
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $unresolvedProblems = New-Object System.Collections.Generic.List[string]
+    $success = [bool]$FloorResult.Success
+
+    if (-not $FloorResult.Success) {
+        foreach ($driveStatus in @($FloorResult.DriveStatus)) {
+            if ([double]$driveStatus.FreeSpaceGB -ge $MinimumFreeSpaceGB) {
+                continue
+            }
+            $matchingEstimate = @($EstimatedResult.VolumeStatus | Where-Object {
+                [string]::Equals([string]$_.Drive, [string]$driveStatus.Drive, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1)
+            $estimateCoversDrive = (
+                $matchingEstimate.Count -gt 0 -and
+                $null -ne $matchingEstimate[0].AvailableGB -and
+                $matchingEstimate[0].AvailableGB -ge $matchingEstimate[0].RequiredGB
+            )
+            if ($estimateCoversDrive) {
+                [void]$warnings.Add(
+                    "Диск $($driveStatus.Drive): вільно $($driveStatus.FreeSpaceGB) GB — нижче " +
+                    "фіксованого порогу $MinimumFreeSpaceGB GB, але розрахункова потреба " +
+                    "$($matchingEstimate[0].RequiredGB) GB покрита ($($matchingEstimate[0].Components)) — " +
+                    "продовжуємо (WARNING, не блокує)."
+                )
+            } else {
+                [void]$unresolvedProblems.Add(
+                    "диск $($driveStatus.Drive): залишилось $($driveStatus.FreeSpaceGB) GB, потрібно мінімум $MinimumFreeSpaceGB GB"
+                )
+            }
+        }
+        $success = ($unresolvedProblems.Count -eq 0)
+    }
+
+    $finalProblems = @($unresolvedProblems.ToArray())
+    if (-not [bool]$EstimatedResult.Success) {
+        $success = $false
+        $finalProblems = @($finalProblems) + @($EstimatedResult.Problems)
+    }
+
+    return [pscustomobject]@{
+        Success = $success
+        Problems = $finalProblems
+        Warnings = $warnings.ToArray()
+    }
+}
+
 function Write-BRAVOArchivePreflightFailureSummary {
     param(
         [Parameter(Mandatory = $true)][datetime]$StartedAt,
@@ -6076,10 +6150,24 @@ function Main {
             "$($volumeStatusEntry.RequiredGB) GB, доступно $($volumeStatusEntry.AvailableGB) GB"
         ) -Level 'INFO'
     }
-    if (-not $archiveEstimatedSpaceResult.Success) {
-        $archiveFreeSpaceResult.Success = $false
-        $archiveFreeSpaceResult.Problems = @($archiveFreeSpaceResult.Problems) + @($archiveEstimatedSpaceResult.Problems)
+
+    # Оператор (реальний acceptance, 2026-08-25): фіксований поріг
+    # (загальний OS-захист "не забити диск впритул", не прив'язаний до
+    # конкретного backup) не повинен блокувати архівацію, коли для САМЕ
+    # ЦЬОГО набору архівів розрахунково доведено достатньо місця.
+    # Merge-BRAVOArchiveSpaceCheckResults реалізує це строго по-диску —
+    # диск без жодного оціненого компонента (bootstrap, чи взагалі не
+    # бере участі в backup) лишається під фіксованим порогом без
+    # послаблень.
+    $mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults `
+        -FloorResult $archiveFreeSpaceResult `
+        -EstimatedResult $archiveEstimatedSpaceResult `
+        -MinimumFreeSpaceGB $archiveMinimumFreeSpaceGB
+    foreach ($mergedWarning in @($mergedArchiveSpaceResult.Warnings)) {
+        Write-Log $mergedWarning -Level 'WARNING'
     }
+    $archiveFreeSpaceResult.Success = $mergedArchiveSpaceResult.Success
+    $archiveFreeSpaceResult.Problems = $mergedArchiveSpaceResult.Problems
 
     $archiveFreeSpaceReason = if ($archiveFreeSpaceResult.Success) {
         $null
