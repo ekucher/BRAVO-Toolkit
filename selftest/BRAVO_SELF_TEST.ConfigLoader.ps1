@@ -68,3 +68,40 @@ try {
 } finally {
     Remove-Item -LiteralPath $configLoaderScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# --- BRAVO_DRY_RUN.ps1: коли Import-BravoConfiguration провалюється (той
+# самий синтетичний BRAVO.config, що й вище), Write-DryRunOutput усе одно
+# має намалювати заголовок і звичайний [FAIL] запис "Dry-run/Фатальна
+# помилка" — а не впасти вдруге з окремою, ще заплутанішою помилкою.
+# Реальний DEV-майданчик (2026-08-24): "if ($global:ScriptVersion)" під
+# Set-StrictMode 2.0 (успадкованим від dot-sourced BRAVO_CONFIG_LOADER.ps1)
+# кидав VariableIsUndefined, коли конфігурація не завантажилась ДО того, як
+# змінна взагалі створювалась — ховаючи первинну причину.
+$dryRunPath = Join-Path $root 'BRAVO_DRY_RUN.ps1'
+$dryRunScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_DRY_RUN_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($dryRunScenarioRoot)
+try {
+    $dryRunSyntheticConfigPath = Join-Path $dryRunScenarioRoot 'BRAVO.config'
+    [IO.File]::WriteAllText(
+        $dryRunSyntheticConfigPath,
+        "param(`$ConfigRoot, `$RuntimeRoot)`nthrow 'BRAVO_SELF_TEST_SYNTHETIC_CONFIG_FAILURE'",
+        (New-Object System.Text.UTF8Encoding $false)
+    )
+    $dryRunChildOutput = [string](
+        & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $dryRunPath -ConfigPath $dryRunSyntheticConfigPath 2>&1 | Out-String
+    )
+    $dryRunExitCode = $LASTEXITCODE
+
+    Test-BRAVOCondition `
+        -Condition ($dryRunExitCode -eq 1) `
+        -Name "ConfigLoader/DryRunFailsClosedOnConfigLoadFailure" `
+        -Failure "BRAVO_DRY_RUN.ps1 з непридатним BRAVO.config має завершитись кодом 1 (звичайний FAIL-контракт dry-run), а не впасти неопрацьованим виключенням; отримано exit code $dryRunExitCode, вивід: $dryRunChildOutput"
+    Test-BRAVOCondition `
+        -Condition (-not $dryRunChildOutput.Contains('VariableIsUndefined')) `
+        -Name "ConfigLoader/DryRunDoesNotCrashOnUnsetScriptVersion" `
+        -Failure "Write-DryRunOutput не повинен падати з VariableIsUndefined, коли `$global:ScriptVersion ще не створено через провал завантаження конфігурації; отримано: $dryRunChildOutput"
+} finally {
+    Remove-Item -LiteralPath $dryRunScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

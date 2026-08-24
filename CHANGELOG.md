@@ -23,6 +23,10 @@ acceptance-прогону** перед будь-якою stable promotion.
 - TESTING: self-test `ManualLaunchers/*` більше не падає на кириличних
   Windows-установках (нижче) — фікстура використовувала `%TEMP%`
   напряму, а не ASCII-безпечний корінь.
+- **FIX:** `BRAVO_DRY_RUN.ps1` падав із `VariableIsUndefined` (замість
+  звичайного `[FAIL]`) після коректно спійманої помилки завантаження
+  `BRAVO.config` (нижче) — ховаючи первинну причину за незрозумілим
+  повідомленням.
 - Health-alert дедуп: типовий `RepeatAlertAfterHours` змінено `6` → `0`
   (нижче) — за прямим запитом оператора під час того самого
   acceptance-прогону.
@@ -132,6 +136,27 @@ acceptance-прогону** перед будь-якою stable promotion.
   реальне відхилення, лише тепер від контрольованого ASCII-базису.
   Впливає лише на self-test; жодної зміни production-коду чи політики
   ASCII-перевірки launcher-ів.
+- **FIX: `BRAVO_DRY_RUN.ps1` падав удруге, ховаючи первинну причину.**
+  Реальний DEV-майданчик (2026-08-24): після коректно спійманої "Не
+  вдалося завантажити BRAVO.config" (єдиний try/catch dry-run, вище)
+  `Write-DryRunOutput` мала намалювати звичайний `[FAIL] Dry-run/
+  Фатальна помилка` — але замість цього процес падав із `Переменная
+  "$global:ScriptVersion" не может быть получена, так как она не
+  установлена` (`VariableIsUndefined`), ховаючи вже сформований,
+  зрозумілий діагноз за новою незрозумілою помилкою.
+  `BRAVO_CONFIG_LOADER.ps1` (dot-sourced) вмикає `Set-StrictMode
+  -Version 2.0` у ТОМУ Ж scope (dot-source зливає scope викликача) —
+  якщо `Import-BravoConfiguration` провалюється ДО рядка, що створює
+  `$global:ScriptVersion`, змінна не існує взагалі (не `$null`), і
+  `if ($global:ScriptVersion)` під strict mode кидає
+  `VariableIsUndefined` навіть у такому "безпечному" контексті. Сусідній
+  рядок для `$bravoSettings` уже коректно захищений через `Get-Variable
+  -ErrorAction SilentlyContinue` — `$global:ScriptVersion` використовував
+  інший, вразливий патерн. Виправлено тим самим захищеним патерном.
+  Новий self-test `ConfigLoader/DryRunFailsClosedOnConfigLoadFailure` +
+  `ConfigLoader/DryRunDoesNotCrashOnUnsetScriptVersion` — реальний
+  дочірній процес `BRAVO_DRY_RUN.ps1` із синтетично провальним
+  `BRAVO.config`.
 - **UX: живий прогрес під час "Реставрація моделі".** Той самий
   реальний DEV-LIMS-прогін показав: увесь блок реставрації моделі
   (збереження розмірів, архівація перед реставрацією — кілька хвилин на
