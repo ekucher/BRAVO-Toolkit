@@ -33,7 +33,11 @@ Import-Module -Name $dryRunSystemModulePath -ErrorAction Stop
 # - не створює архіви, не копіює, не синхронізує і не видаляє файли;
 # - не змінює служби або Планувальник завдань;
 # - надсилає тестове Slack/Discord повідомлення лише з -SendTestNotification.
-# -TestAccess виконує лише read-only мережеві перевірки.
+# -TestAccess НЕ є read-only: окрім автентифікації й читання, він створює
+# відсутні каталоги призначення на SFTP (Test-SftpDestinationAccess
+# -CreateMissingDirectories) — BRAVO_ARCHIV усе одно створює їх при першому
+# запуску, тому падати fail-closed на їх відсутності не було підстав.
+# Заголовок прогону показує це оператору як 'READ-ONLY + ПРОБИ ЗАПИСУ'.
 #
 # Каталоги — окремий, точний контракт (не "ніколи"): local write-probe
 # (Test-BRAVOFileSystemWriteAccess) для required/production destination
@@ -930,11 +934,17 @@ function Write-DryRunOutput {
         $dryRunInstitutionCode = [string]$bravoSettingsVariable.Value.InstitutionCode
     }
     $dryRunVersionText = if ($global:ScriptVersion) { [string]$global:ScriptVersion } else { 'невідома' }
+    # Ярлик режиму має описувати те, що дійсно відбудеться. З -TestAccess
+    # прогін НЕ є read-only: він робить create/write/read/delete проби в
+    # локальних каталогах і створює відсутні каталоги призначення на SFTP
+    # (Test-SftpDestinationAccess -CreateMissingDirectories). Оператор,
+    # який погоджує запуск за словом READ-ONLY, має бачити різницю.
+    $dryRunModeLabel = if ($TestAccess) { 'READ-ONLY + ПРОБИ ЗАПИСУ' } else { 'READ-ONLY' }
     Write-BRAVOHeader `
         -Title ("BRAVO Dry Run {0}" -f $dryRunVersionText) `
         -Institution $dryRunInstitutionName `
         -InstitutionCode $dryRunInstitutionCode `
-        -Mode 'READ-ONLY'
+        -Mode $dryRunModeLabel
 
     # Dry Run зберігає власну семантику PASS/WARN/FAIL/PLAN
     # (docs/OPERATOR_CONSOLE_UX.md §6) — не переводиться силоміць у

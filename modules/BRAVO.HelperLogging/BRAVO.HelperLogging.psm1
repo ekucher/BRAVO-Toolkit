@@ -179,19 +179,41 @@ function Test-BRAVOHelperLogSuspensionEffective {
                 # Маркер друкується тим самим каналом, що й реальні підказки
                 # вводу — інакше перевірка стосувалася б не того шляху.
                 Write-Host $canary
-                # Файл читається ДО Resume, поки transcript зупинено: у Windows
-                # PowerShell 5.1 активний transcript тримає файл так, що
-                # ReadAllText падає — і перевірка помилково вважала б робочу
-                # паузу непрацездатною.
-                $logText = ''
+                # Файл перевіряється ДО Resume, поки transcript має бути
+                # зупинений. Перевірка навмисно ПОЗИТИВНА: файл відкривається
+                # ексклюзивно (FileShare::None). Успішне відкриття доводить, що
+                # writer'а транскрипції вже немає — тільки тоді відсутність
+                # маркера щось означає.
+                #
+                # Просто прочитати вміст недостатньо: якщо Stop-Transcript
+                # мовчки не спрацював, маркер може ще лежати в буфері writer'а
+                # і у файл не потрапити. Тоді перевірка побачила б "маркера
+                # немає" і визнала б непрацездатну паузу робочою — тобто
+                # схибила б у небезпечний бік.
+                $effective = $false
                 try {
-                    $logText = [IO.File]::ReadAllText($canaryPath)
+                    $canaryStream = [IO.File]::Open(
+                        $canaryPath,
+                        [IO.FileMode]::Open,
+                        [IO.FileAccess]::Read,
+                        [IO.FileShare]::None
+                    )
+                    try {
+                        $canaryReader = New-Object IO.StreamReader($canaryStream)
+                        try {
+                            $effective = -not $canaryReader.ReadToEnd().Contains($canary)
+                        } finally {
+                            $canaryReader.Dispose()
+                        }
+                    } finally {
+                        $canaryStream.Dispose()
+                    }
                 } catch {
-                    # Не змогли прочитати — довести відсутність витоку
-                    # неможливо, тому вважаємо паузу непрацездатною.
-                    $logText = $canary
+                    # Файл ще комусь належить або не читається — довести
+                    # відсутність витоку неможливо, тому пауза вважається
+                    # непрацездатною (fail-closed).
+                    $effective = $false
                 }
-                $effective = -not $logText.Contains($canary)
             } finally {
                 [void](Resume-BRAVOHelperLog)
             }
