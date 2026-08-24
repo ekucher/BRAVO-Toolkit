@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0-rc.6 — 2026-08-25 (candidate, pending acceptance)
+
+Кандидат = `5.2.0-rc.5` (нижче, acceptance пройдено на `SERV_HRDL_1`/
+`WIN-44OBNQ3R3OB`) + `feat(archive)` розрахункова перевірка вільного
+місця (PR #84). Acceptance саме для цього доданого вмісту ще не
+виконано.
+
 - **FEATURE (data-integrity, archive preflight): розрахункова перевірка
   вільного місця понад фіксований поріг.** `Maintenance.Limits.
   MinimumFreeSpaceGB` (типово 20) — загальний захист від переповнення
