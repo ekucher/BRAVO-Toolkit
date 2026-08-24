@@ -3828,7 +3828,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
     $archiveEstimateRuntimeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
-        -FunctionNames @("Get-BRAVOArchiveEstimatedSpaceRequirement")
+        -FunctionNames @("Get-BRAVOArchiveEstimatedSpaceRequirement", "Merge-BRAVOArchiveSpaceCheckResults")
 
     function New-BRAVOEstimatedSpaceFixtureArchive {
         param([string]$Directory, [string]$Name, [int]$Bytes)
@@ -3944,18 +3944,113 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         Remove-Item -LiteralPath $estimatedSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # Merge-BRAVOArchiveSpaceCheckResults: реальний acceptance (2026-08-25,
+    # сервер із 19.38 GB вільних проти фіксованого порогу 20 GB, але
+    # розрахункова потреба лише 0.2 GB) — фіксований поріг не повинен
+    # блокувати, коли розрахунок доводить достатність САМЕ для того диска.
+    $mergeFloorSuccess = [pscustomobject]@{ Success = $true; DriveStatus = @() }
+    $mergeFloorFailsOneDrive = [pscustomobject]@{
+        Success = $false
+        DriveStatus = @([pscustomobject]@{ Drive = 'C:'; FreeSpaceGB = 19.38; TotalSpaceGB = 223.08 })
+    }
+    $mergeFloorFailsTwoDrives = [pscustomobject]@{
+        Success = $false
+        DriveStatus = @(
+            [pscustomobject]@{ Drive = 'C:'; FreeSpaceGB = 19.38; TotalSpaceGB = 223.08 },
+            [pscustomobject]@{ Drive = 'D:'; FreeSpaceGB = 5.0; TotalSpaceGB = 500.0 }
+        )
+    }
+    $mergeEstimateCoversC = [pscustomobject]@{
+        Success = $true
+        VolumeStatus = @([pscustomobject]@{ Drive = 'C:'; Components = 'MODEL, BLOG, BRAVOEXCH'; RequiredGB = 0.2; AvailableGB = 19.38 })
+        Problems = @()
+    }
+    $mergeEstimateEmpty = [pscustomobject]@{ Success = $true; VolumeStatus = @(); Problems = @() }
+    $mergeEstimateInsufficientC = [pscustomobject]@{
+        Success = $false
+        VolumeStatus = @([pscustomobject]@{ Drive = 'C:'; Components = 'MODEL'; RequiredGB = 25.0; AvailableGB = 19.38 })
+        Problems = @('диск C: розрахункова потреба 25 GB, доступно лише 19.38 GB')
+    }
+
+    $mergeOverridden = & $archiveEstimateRuntimeModule {
+        param($Floor, $Estimated)
+        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
+    } $mergeFloorFailsOneDrive $mergeEstimateCoversC
+    Test-BRAVOCondition `
+        -Condition (
+            $mergeOverridden.Success -and
+            @($mergeOverridden.Problems).Count -eq 0 -and
+            @($mergeOverridden.Warnings).Count -eq 1 -and
+            $mergeOverridden.Warnings[0] -match 'C:' -and
+            $mergeOverridden.Warnings[0] -match '0\.2 GB'
+        ) `
+        -Name 'Archive/MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive' `
+        -Failure 'фіксований поріг на конкретному диску має знижуватись до WARNING (не блокувати), коли розрахункова оцінка для ТОГО САМОГО диска реально порахована і показує достатність'
+
+    $mergeNoEstimate = & $archiveEstimateRuntimeModule {
+        param($Floor, $Estimated)
+        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
+    } $mergeFloorFailsOneDrive $mergeEstimateEmpty
+    Test-BRAVOCondition `
+        -Condition (
+            -not $mergeNoEstimate.Success -and
+            @($mergeNoEstimate.Problems).Count -eq 1 -and
+            @($mergeNoEstimate.Warnings).Count -eq 0
+        ) `
+        -Name 'Archive/MergeSpaceResultsKeepsFloorBlockingWithoutEstimate' `
+        -Failure 'диск без жодного оціненого компонента (bootstrap чи не бере участі в backup) має лишатись під фіксованим порогом без послаблень — довести безпеку нема на чому'
+
+    $mergeEstimateAlsoFails = & $archiveEstimateRuntimeModule {
+        param($Floor, $Estimated)
+        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
+    } $mergeFloorFailsOneDrive $mergeEstimateInsufficientC
+    Test-BRAVOCondition `
+        -Condition (-not $mergeEstimateAlsoFails.Success) `
+        -Name 'Archive/MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient' `
+        -Failure 'якщо розрахункова оцінка для того самого диска сама показує недостатність, floor-виправдання застосовуватись не повинно'
+
+    $mergeEstimateFailsFloorPasses = & $archiveEstimateRuntimeModule {
+        param($Floor, $Estimated)
+        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
+    } $mergeFloorSuccess $mergeEstimateInsufficientC
+    Test-BRAVOCondition `
+        -Condition (
+            -not $mergeEstimateFailsFloorPasses.Success -and
+            @($mergeEstimateFailsFloorPasses.Problems) -contains $mergeEstimateInsufficientC.Problems[0]
+        ) `
+        -Name 'Archive/MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses' `
+        -Failure 'недостатність за розрахунковою оцінкою має блокувати прогін незалежно від того, що фіксований поріг сам по собі пройшов — floor-виправдання діє лише в один бік'
+
+    $mergeMixedDrives = & $archiveEstimateRuntimeModule {
+        param($Floor, $Estimated)
+        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
+    } $mergeFloorFailsTwoDrives $mergeEstimateCoversC
+    Test-BRAVOCondition `
+        -Condition (
+            -not $mergeMixedDrives.Success -and
+            @($mergeMixedDrives.Problems).Count -eq 1 -and
+            $mergeMixedDrives.Problems[0] -match 'D:' -and
+            @($mergeMixedDrives.Warnings).Count -eq 1 -and
+            $mergeMixedDrives.Warnings[0] -match 'C:'
+        ) `
+        -Name 'Archive/MergeSpaceResultsAppliesOverridePerDriveIndependently' `
+        -Failure 'виправдання фіксованого порогу має застосовуватись СТРОГО по-диску — інший диск без оцінки (D: тут) має лишатись блокуючим, навіть коли C: виправдано'
+
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('Get-BRAVOArchiveEstimatedSpaceRequirement') -and
             $archiveScriptText.Contains('EstimatedSpaceMarginPercent') -and
-            $archiveScriptText.Contains('$archiveFreeSpaceResult.Success = $false') -and
+            $archiveScriptText.Contains('function Merge-BRAVOArchiveSpaceCheckResults') -and
+            $archiveScriptText.Contains('$mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults') -and
             $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -gt
                 $archiveScriptText.IndexOf('$archiveFreeSpaceResult = Get-BRAVOArchiveFreeSpaceResult') -and
-            $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -lt
+            $archiveScriptText.IndexOf('$mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults') -gt
+                $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -and
+            $archiveScriptText.IndexOf('$mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults') -lt
                 $archiveScriptText.IndexOf('$archiveFreeSpaceReason = if (')
         ) `
         -Name 'Archive/EstimatedSpacePreflightWiredIntoFreeSpaceCheck' `
-        -Failure 'розрахункова перевірка місця має виконуватись у тому самому preflight-кроці "Перевірка вільного місця", ПІСЛЯ фіксованого порогу і ДО обчислення підсумкового Reason/раннього return — інакше вона або не впливає на результат, або перевіряється в неправильний момент'
+        -Failure 'розрахункова перевірка й об''єднання результатів мають виконуватись у тому самому preflight-кроці "Перевірка вільного місця", ПІСЛЯ фіксованого порогу і ДО обчислення підсумкового Reason/раннього return — інакше вони або не впливають на результат, або перевіряються в неправильний момент'
 
     $literalSourceText = "Методика*виконання_вимірювань.pdf"
     $discordLiteralText = & $archiveRuntimeModule {

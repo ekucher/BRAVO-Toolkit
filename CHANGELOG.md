@@ -14,30 +14,46 @@
   Новий `Get-BRAVOArchiveEstimatedSpaceRequirement`
   (`modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`), викликається в
   тому самому кроці "Перевірка вільного місця" одразу після фіксованого
-  порогу (не замінює його, а доповнює — фіксований поріг лишається
-  незалежним і обов'язковим): для кожного увімкненого компонента бере
-  розмір ОСТАННЬОГО hash-підтвердженого валідного архіву
-  (`Get-BRAVOValidArchiveSizeHistory`, `BRAVO.ArchiveHelpers` — той
-  самий канонічний reader, що вже використовує `SizeSanity` для
-  виявлення підозріло малих архівів) і додає запас на зростання
-  (`Maintenance.Limits.EstimatedSpaceMarginPercent`, типово 25%).
-  Компоненти на тому самому фізичному диску сумуються в один розрахунок
-  (інакше можна двічі "витратити" те саме вільне місце). Компонент без
-  валідної історії (перший запуск, bootstrap) свідомо пропускається з
-  оцінки — не блокує прогін; захистом для цього випадку лишається
-  фіксований поріг.
+  порогу: для кожного увімкненого компонента бере розмір ОСТАННЬОГО
+  hash-підтвердженого валідного архіву (`Get-BRAVOValidArchiveSizeHistory`,
+  `BRAVO.ArchiveHelpers` — той самий канонічний reader, що вже
+  використовує `SizeSanity` для виявлення підозріло малих архівів) і
+  додає запас на зростання (`Maintenance.Limits.
+  EstimatedSpaceMarginPercent`, типово 25%). Компоненти на тому самому
+  фізичному диску сумуються в один розрахунок (інакше можна двічі
+  "витратити" те саме вільне місце). Компонент без валідної історії
+  (перший запуск, bootstrap) свідомо пропускається з оцінки — не блокує
+  прогін.
 
   `EstimatedSpaceMarginPercent` — опційний ключ (compat: старі
   `BRAVO.config` без нього отримують дефолт `25` у коді завантаження,
   не лише в шаблоні файлу).
 
+  **UPD (2026-08-25, реальний acceptance):** оператор зафіксував
+  протилежний до початкового сценарій — сервер із `19.38 GB` вільних
+  проти фіксованого порогу `20 GB` блокував архівацію, хоча розрахункова
+  потреба для MODEL/BLOG/BRAVOEXCH становила лише `0.2 GB`. Новий
+  `Merge-BRAVOArchiveSpaceCheckResults` тепер знижує провал фіксованого
+  порогу до `WARNING` (не блокує), коли розрахункова оцінка для ТОГО
+  САМОГО диска реально порахована і показує достатність. Виправдання —
+  строго по-диску: інший диск без жодного оціненого компонента
+  (bootstrap чи взагалі не бере участі в backup) лишається під
+  фіксованим порогом без послаблень, а недостатність за самою
+  розрахунковою оцінкою й далі блокує незалежно від floor-статусу.
+
   Новий self-test: `Archive/EstimatedSpaceUsesLastValidArchiveHistoryPlusMargin`,
   `Archive/EstimatedSpaceFailsWhenBelowRequirement`,
   `Archive/EstimatedSpaceSkipsComponentWithoutHistory`,
   `Archive/EstimatedSpaceGroupsComponentsOnSameDrive`,
+  `Archive/MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive`,
+  `Archive/MergeSpaceResultsKeepsFloorBlockingWithoutEstimate`,
+  `Archive/MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient`,
+  `Archive/MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses`,
+  `Archive/MergeSpaceResultsAppliesOverridePerDriveIndependently`,
   `Archive/EstimatedSpacePreflightWiredIntoFreeSpaceCheck`. Регресію
-  підтверджено вручну (тимчасово прибрано запас/групування з коду —
-  відповідні тести почервоніли, решта лишились зеленими; відновлено).
+  підтверджено вручну двічі (спершу запас/групування, потім сама
+  override-умова тимчасово прибиралися з коду — щоразу відповідні тести
+  почервоніли, решта лишились зеленими; відновлено).
 
 - FIX (реліз-автоматизація): `release-artifact` workflow створював чернетку
   релізу для dev/RC **без прапорця `--prerelease`**
