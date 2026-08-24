@@ -503,7 +503,7 @@ function Test-Compatibility {
         Write-BRAVOLog -Component 'STARTUP' -Message "Стандартний режим" -Level "INFO"
     }
     if ($powerShellUpdate.IsUpdateRecommended) {
-        Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING"
+        Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING" -Environmental
     }
     $osSupportTier = Get-BRAVOOSSupportTier
     $script:BRAVOOSSupportTier = $osSupportTier

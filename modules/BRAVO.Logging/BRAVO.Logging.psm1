@@ -128,14 +128,24 @@ function Write-BRAVOLog {
         [switch]$Console,
 
         # Ніколи не показувати запис у консолі.
-        [switch]$NoConsole
+        [switch]$NoConsole,
+
+        # Environmental-нагадування (застарілі оновлення ОС/PowerShell) —
+        # це стан середовища, а не результат операції. Такий запис лишається
+        # видимим як WARNING, але НЕ інкрементує лічильник попереджень:
+        # інакше кожен успішний прогін на невідновленому сервері назавжди
+        # завершувався б кодом 10 (SuccessWithWarnings) зі статусом ЧАСТКОВО,
+        # поки адміністратор не встановить оновлення Windows.
+        [switch]$Environmental
     )
 
     $severity = Get-BRAVOLogSeverityValue -Level $Level
     if ($severity -ge (Get-BRAVOLogSeverityValue -Level 'WARNING')) {
         if ($severity -ge (Get-BRAVOLogSeverityValue -Level 'ERROR')) {
+            # $Environmental свідомо НЕ впливає на помилки: прапорець знімає
+            # лише вагу попередження, а не приховує справжню відмову.
             $script:BRAVOLogErrorCount++
-        } else {
+        } elseif (-not $Environmental) {
             $script:BRAVOLogWarningCount++
         }
     }

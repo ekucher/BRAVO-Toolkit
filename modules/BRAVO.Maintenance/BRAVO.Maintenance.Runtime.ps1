@@ -1314,14 +1314,22 @@ function Write-Log {
         # лишаються незмінними, друк у консоль пропускається. За
         # замовчуванням вимкнено — жоден існуючий виклик Write-Log не змінює
         # поведінку.
-        [switch]$NoConsole
+        [switch]$NoConsole,
+
+        # Environmental-нагадування (застарілі оновлення ОС/PowerShell) —
+        # це стан середовища, а не результат операції. Такий запис лишається
+        # видимим як WARNING, але НЕ інкрементує лічильник попереджень:
+        # інакше кожен успішний прогін на невідновленому сервері назавжди
+        # завершувався б кодом 10 (SuccessWithWarnings) зі статусом ЧАСТКОВО,
+        # поки адміністратор не встановить оновлення Windows.
+        [switch]$Environmental
     )
 
     # Пароль архіву, webhook чи URL з обліковими даними можуть потрапити
     # сюди через повідомлення винятку — маскуємо перед виводом у консоль
     # чи запис у файл, до будь-якого з можливих виходів функції нижче.
     $Message = Protect-BRAVOLogSecret -Text $Message
-    if ($Level -eq "WARNING") {
+    if ($Level -eq "WARNING" -and -not $Environmental) {
         $script:BRAVOWarningCount++
     }
 
@@ -6212,7 +6220,7 @@ Write-Log -Message "Коренева директорія: $ROOT_LIMS" -NoTimest
 Write-Log -Message "Конфігурація: $ConfigPath" -NoTimestamp
 Write-Log -Message "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); Hash=$($BRAVOCompatibility.FileHashProvider); Files=$($BRAVOCompatibility.ChildItemProvider)" -NoTimestamp
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
-    Write-Log -Message $BRAVOPowerShellUpdate.Message -Level "WARNING"
+    Write-Log -Message $BRAVOPowerShellUpdate.Message -Level "WARNING" -Environmental
 }
 $script:BRAVOOSSupportTier = Get-BRAVOOSSupportTier
 Write-Log -Message "Підтримка ОС: $($script:BRAVOOSSupportTier.Tier) — Windows $($script:BRAVOOSSupportTier.OperatingSystem) ($($script:BRAVOOSSupportTier.OperatingSystemVersion), build $($script:BRAVOOSSupportTier.Build)); PowerShell $($script:BRAVOOSSupportTier.PowerShellVersion); .NET release $($script:BRAVOOSSupportTier.DotNetRelease)" -NoTimestamp

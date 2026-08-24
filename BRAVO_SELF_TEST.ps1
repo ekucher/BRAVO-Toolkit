@@ -262,6 +262,88 @@ try {
         -Name "Runtime/LegacyOSTierIsInformationalInOperationalRuns" `
         -Failure "LegacyBestEffort у Archive/Maintenance має логуватись як INFO (не піднімати exit 10 і не маршрутизувати успішний звіт в ALERTS); у Health лишається WARNING як канонічна environmental-метрика"
 
+    # --- Environmental-нагадування (застарілі оновлення Windows/PowerShell)
+    # лишаються видимими як WARNING, але не інкрементують лічильник
+    # попереджень. Інакше кожен успішний прогін на невідновленому сервері
+    # назавжди завершувався б кодом 10 (SuccessWithWarnings) зі статусом
+    # ЧАСТКОВО — саме це й спостерігалось на SERV_HRDL_1 (останнє оновлення
+    # Windows 1109 дн. тому).
+    $loggingModuleSourceText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psm1"), [Text.Encoding]::UTF8)
+    $environmentalLogModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $loggingModuleSourceText `
+        -FunctionNames @('Write-BRAVOLog', 'Get-BRAVOLogSeverityValue')
+    $environmentalLogProbe = & $environmentalLogModule {
+        function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+        # Таблиця рівнів — module-scope змінна BRAVO.Logging, тому в
+        # екстрагований module scope її треба внести явно (AST переносить
+        # лише функції).
+        $script:BRAVOLogSeverity = @{
+            TRACE = 0; DEBUG = 1; INFO = 2; SUCCESS = 3
+            WARNING = 4; ERROR = 5; FATAL = 6
+        }
+        $script:BRAVOLogActive = $false
+        $script:BRAVOLogWarningCount = 0
+        $script:BRAVOLogErrorCount = 0
+
+        Write-BRAVOLog -Component 'STARTUP' -Message '環' -Level 'WARNING' -Environmental -NoConsole
+        $afterEnvironmental = $script:BRAVOLogWarningCount
+        Write-BRAVOLog -Component 'STARTUP' -Message 'звичайне попередження' -Level 'WARNING' -NoConsole
+        $afterOperational = $script:BRAVOLogWarningCount
+        # -Environmental не має приховувати справжні помилки.
+        Write-BRAVOLog -Component 'STARTUP' -Message 'помилка' -Level 'ERROR' -Environmental -NoConsole
+        $errorsAfter = $script:BRAVOLogErrorCount
+
+        [pscustomobject]@{
+            AfterEnvironmental = $afterEnvironmental
+            AfterOperational = $afterOperational
+            ErrorsAfter = $errorsAfter
+        }
+    }
+    $healthRuntimeTextForEnvironmental = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $archiveRuntimeTextForEnvironmental = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $maintenanceRuntimeTextForEnvironmental = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $environmentalLogProbe.AfterEnvironmental -eq 0 -and
+            $environmentalLogProbe.AfterOperational -eq 1 -and
+            $environmentalLogProbe.ErrorsAfter -eq 1
+        ) `
+        -Name "Runtime/EnvironmentalWarningDoesNotCountAsOperationWarning" `
+        -Failure "-Environmental має лишати рівень WARNING, але не інкрементувати лічильник попереджень; звичайний WARNING і будь-який ERROR мають рахуватись як раніше"
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForEnvironmental -match '\$BRAVOWindowsPatchLevel\.Message -Level "WARNING" -Environmental' -and
+            $healthRuntimeTextForEnvironmental -match '\$BRAVOPowerShellUpdate\.Message -Level "WARNING" -Environmental' -and
+            $archiveRuntimeTextForEnvironmental -match '\$powerShellUpdate\.Message -Level "WARNING" -Environmental' -and
+            $maintenanceRuntimeTextForEnvironmental -match '\$BRAVOPowerShellUpdate\.Message -Level "WARNING" -Environmental'
+        ) `
+        -Name "Runtime/StaleUpdateRemindersAreEnvironmental" `
+        -Failure "нагадування про застарілі оновлення Windows/PowerShell мають логуватись з -Environmental, інакше невідновлений сервер назавжди дає exit 10 і статус ЧАСТКОВО на успішному прогоні"
+
+    # --- Dry-run створює відсутній SFTP-каталог призначення замість того,
+    # щоб падати fail-closed на тому, що BRAVO_ARCHIV робить сам
+    # (Initialize-BRAVOSFTPRemoteDirectories).
+    $dryRunScriptTextForSftp = [IO.File]::ReadAllText(
+        (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
+    $sftpDestinationBlock = [regex]::Match(
+        $dryRunScriptTextForSftp,
+        '(?s)function Test-SftpDestinationAccess \{.*?\r?\n\}\r?\n'
+    ).Value
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($sftpDestinationBlock) -and
+            $sftpDestinationBlock.Contains('$session.CreateDirectory($remotePath)') -and
+            $sftpDestinationBlock.Contains('[switch]$CreateMissingDirectories') -and
+            $dryRunScriptTextForSftp.Contains('-CreateMissingDirectories') -and
+            -not $dryRunScriptTextForSftp.Contains('Dry Run не створює каталоги.')
+        ) `
+        -Name "DryRun/CreatesMissingSftpDestination" `
+        -Failure "dry-run має створювати відсутній SFTP-каталог призначення через CreateDirectory, а не блокувати інсталяцію повідомленням 'Dry Run не створює каталоги'"
+
     $toolIntegrityTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_TOOL_INTEGRITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
