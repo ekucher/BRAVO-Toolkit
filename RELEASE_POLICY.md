@@ -972,7 +972,7 @@ developer: 4.5.1-dev.1
 
 ```text
 master:    5.1.0   (stable, тег v5.1.0, merge PR #61 = aee27e4)
-developer: 5.2.0-dev.1 (development)
+developer: 5.2.0-rc.3 (prerelease, acceptance ще не пройдено)
 ```
 
 Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
