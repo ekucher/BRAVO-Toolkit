@@ -139,68 +139,83 @@ try {
     # що значення не осідає в helper-лозі (дослівний Start-Transcript).
     # Механізм: пауза transcript + canary-перевірка її справності на цьому
     # хості. Тести нижче фіксують і сам механізм, і його fail-closed контракт.
-    $helperLoggingModuleText = [IO.File]::ReadAllText(
-        (Join-Path $root "modules\BRAVO.HelperLogging\BRAVO.HelperLogging.psm1"),
-        [Text.Encoding]::UTF8
-    )
+    # Проба виконується в ДОЧІРНЬОМУ процесі PowerShell навмисно: Windows
+    # PowerShell 5.1 підтримує лише один transcript на сесію, а сам
+    # BRAVO_SELF_TEST уже працює під Start-BRAVOHelperLog. Вкладений
+    # Start-Transcript на 5.1 або падає, або перехоплює чужий журнал —
+    # у чистій дочірній сесії перевіряється саме той сценарій, що в проді.
     $logSuspensionTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_LOG_SUSPENSION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
     try {
         [void][IO.Directory]::CreateDirectory($logSuspensionTestRoot)
-        $suspensionProbe = & (New-BRAVOSelfTestRuntimeModule `
-                -SourceText $helperLoggingModuleText `
-                -FunctionNames @(
-                    'Suspend-BRAVOHelperLog',
-                    'Resume-BRAVOHelperLog',
-                    'Test-BRAVOHelperLogSuspensionEffective'
-                )) {
-            param([string]$TestRoot)
+        $suspensionProbeScript = @'
+param([string]$ModuleRoot, [string]$TestRoot)
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $ModuleRoot 'BRAVO.HelperLogging.psd1') -Force
+$module = Get-Module BRAVO.HelperLogging
 
-            $effectiveLog = Join-Path $TestRoot 'effective.log'
-            Start-Transcript -Path $effectiveLog -Force | Out-Null
-            $script:BRAVOHelperLogActive = $true
-            $script:BRAVOHelperLogPath = $effectiveLog
-            $script:BRAVOHelperLogSuspended = $false
-            $script:BRAVOHelperLogSuspensionEffective = $null
+function Invoke-SuspensionScenario {
+    param([string]$LogPath, [switch]$BreakSuspension)
+    & $module {
+        param($Path, $Break)
+        Start-Transcript -Path $Path -Force | Out-Null
+        $script:BRAVOHelperLogActive = $true
+        $script:BRAVOHelperLogPath = $Path
+        $script:BRAVOHelperLogSuspended = $false
+        $script:BRAVOHelperLogSuspensionEffective = $null
+        if ($Break) {
+            # Пауза, яка мовчки не спрацьовує: саме це має впіймати canary.
+            # script: обов'язковий — без нього підміна живе лише до кінця
+            # цього scriptblock і зникає ще до перевірки.
+            function script:Stop-Transcript { }
+        }
+    } $LogPath $BreakSuspension.IsPresent
 
-            Write-Host 'BRAVO-BEFORE-WINDOW'
-            $canaryVerdict = Test-BRAVOHelperLogSuspensionEffective
-            $suspended = Suspend-BRAVOHelperLog
-            try {
-                Write-Host 'BRAVO-INSIDE-WINDOW'
-            } finally {
-                [void](Resume-BRAVOHelperLog)
-            }
-            Write-Host 'BRAVO-AFTER-WINDOW'
-            Stop-Transcript | Out-Null
-            $effectiveText = [IO.File]::ReadAllText($effectiveLog)
+    $verdict = Test-BRAVOHelperLogSuspensionEffective
+    $suspended = $false
+    if (-not $BreakSuspension) {
+        Write-Host 'BRAVO-BEFORE-WINDOW'
+        $suspended = Suspend-BRAVOHelperLog
+        try { Write-Host 'BRAVO-INSIDE-WINDOW' } finally { [void](Resume-BRAVOHelperLog) }
+        Write-Host 'BRAVO-AFTER-WINDOW'
+    }
+    try { Stop-Transcript | Out-Null } catch { }
+    $text = ''
+    try { $text = [IO.File]::ReadAllText($LogPath) } catch { }
+    return [pscustomobject]@{ Verdict = $verdict; Suspended = $suspended; Text = $text }
+}
 
-            # Друга частина: пауза, яка НЕ працює. Stop-Transcript підмінено
-            # заглушкою-nop, тому маркер лишається у файлі — canary мусить це
-            # побачити і повернути $false.
-            $brokenLog = Join-Path $TestRoot 'broken.log'
-            Start-Transcript -Path $brokenLog -Force | Out-Null
-            $script:BRAVOHelperLogActive = $true
-            $script:BRAVOHelperLogPath = $brokenLog
-            $script:BRAVOHelperLogSuspended = $false
-            $script:BRAVOHelperLogSuspensionEffective = $null
-            function Stop-Transcript { }
-            function Start-Transcript { param([string]$Path, [switch]$Force, [switch]$Append) }
-            $brokenVerdict = Test-BRAVOHelperLogSuspensionEffective
+$effective = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'effective.log')
+$broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') -BreakSuspension
 
-            [pscustomobject]@{
-                CanaryVerdict = $canaryVerdict
-                Suspended = $suspended
-                BeforeLogged = $effectiveText.Contains('BRAVO-BEFORE-WINDOW')
-                InsideLogged = $effectiveText.Contains('BRAVO-INSIDE-WINDOW')
-                AfterLogged = $effectiveText.Contains('BRAVO-AFTER-WINDOW')
-                CanaryTextLeaked = $effectiveText.Contains('BRAVO-LOG-SUSPENSION-CANARY')
-                BrokenVerdict = $brokenVerdict
-            }
-        } $logSuspensionTestRoot
+[pscustomobject]@{
+    CanaryVerdict = [bool]$effective.Verdict
+    Suspended = [bool]$effective.Suspended
+    BeforeLogged = $effective.Text.Contains('BRAVO-BEFORE-WINDOW')
+    InsideLogged = $effective.Text.Contains('BRAVO-INSIDE-WINDOW')
+    AfterLogged = $effective.Text.Contains('BRAVO-AFTER-WINDOW')
+    CanaryTextLeaked = $effective.Text.Contains('BRAVO-LOG-SUSPENSION-CANARY')
+    BrokenVerdict = [bool]$broken.Verdict
+} | ConvertTo-Json -Compress
+'@
+        $suspensionProbePath = Join-Path $logSuspensionTestRoot 'probe.ps1'
+        [IO.File]::WriteAllText($suspensionProbePath, $suspensionProbeScript, (New-Object Text.UTF8Encoding($false)))
+        $hostExecutable = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $suspensionProbeOutput = & $hostExecutable -NoLogo -NoProfile -NonInteractive `
+            -ExecutionPolicy Bypass -File $suspensionProbePath `
+            (Join-Path $root 'modules\BRAVO.HelperLogging') $logSuspensionTestRoot
+        $suspensionProbeJson = @($suspensionProbeOutput) |
+            Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
+            Select-Object -Last 1
+        $suspensionProbe = if ([string]::IsNullOrWhiteSpace([string]$suspensionProbeJson)) {
+            $null
+        } else {
+            [string]$suspensionProbeJson | ConvertFrom-Json
+        }
         Test-BRAVOCondition `
             -Condition (
+                $null -ne $suspensionProbe -and
                 $suspensionProbe.CanaryVerdict -and
                 $suspensionProbe.Suspended -and
                 $suspensionProbe.BeforeLogged -and
@@ -209,9 +224,16 @@ try {
                 -not $suspensionProbe.CanaryTextLeaked
             ) `
             -Name "HelperLogging/SuspensionHidesConsoleOutput" `
-            -Failure "пауза transcript має ховати вивід лише всередині вікна: рядки до і після мають лишатися в лозі, а сам canary-маркер не повинен туди потрапляти"
+            -Failure ("пауза transcript має ховати вивід лише всередині вікна: рядки до і після мають лишатися в лозі, а canary-маркер не повинен туди потрапляти; фактично: " + $(
+                if ($null -eq $suspensionProbe) {
+                    'проба не повернула JSON'
+                } else {
+                    'canary={0}; suspended={1}; before={2}; inside={3}; after={4}; canaryLeaked={5}' -f `
+                        $suspensionProbe.CanaryVerdict, $suspensionProbe.Suspended, $suspensionProbe.BeforeLogged, `
+                        $suspensionProbe.InsideLogged, $suspensionProbe.AfterLogged, $suspensionProbe.CanaryTextLeaked
+                }))
         Test-BRAVOCondition `
-            -Condition (-not $suspensionProbe.BrokenVerdict) `
+            -Condition ($null -ne $suspensionProbe -and -not $suspensionProbe.BrokenVerdict) `
             -Name "HelperLogging/CanaryDetectsIneffectiveSuspension" `
             -Failure "якщо пауза transcript на хості не працює, canary-перевірка має повернути false — інакше відкритий ввід писався б прямо в журнал"
     } finally {
