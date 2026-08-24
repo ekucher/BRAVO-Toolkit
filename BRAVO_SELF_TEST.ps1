@@ -2039,6 +2039,86 @@ try {
         -Condition ($endpointFallbackCapture.AllMissingThrew) `
         -Name "Notifications/EndpointThrowsWhenNothingConfigured" `
         -Failure "коли жоден target (новий і legacy) не налаштований, має кидатись виняток, а не мовчки повертатись порожній webhook"
+    # --- Dry-run має перевіряти РІВНО ті записи Credential Manager, які
+    # читає runtime. Регресія з логів SERV_HRDL_1 (2026-08-24): сервер
+    # налаштовано на route-специфічні webhook-и, BRAVO_DISCORD_URL відсутній —
+    # сповіщення працювали, а dry-run звітував [FAIL] і зупиняв BRAVO_SETUP
+    # fail-closed.
+    $dryRunScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
+    $dryRunWebhookTestModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($dryRunScriptText + [Environment]::NewLine + $notificationsModuleSourceText) `
+        -FunctionNames @(
+            'Get-NotificationCredentialTargetTable',
+            'Test-DryRunWebhookCredential',
+            'Resolve-BRAVONotificationEndpoint'
+        )
+    $dryRunWebhookCapture = & $dryRunWebhookTestModule {
+        $script:stubStore = @{}
+        function Get-BRAVOCredentialSecret {
+            param([string]$Target)
+            # Ізольований stub: жодного доступу до Windows Credential Manager.
+            if ($script:stubStore.Contains($Target)) { return $script:stubStore[$Target] }
+            return $null
+        }
+        $script:capturedResults = New-Object System.Collections.ArrayList
+        function Add-DryRunResult {
+            param($Status, $Section, $Name, $Detail)
+            [void]$script:capturedResults.Add(('{0}|{1}' -f $Status, $Detail))
+        }
+        $credentialSettings = @{ Targets = @{
+            DiscordWebhook = 'BRAVO_DISCORD_URL'
+            DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
+            DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
+        } }
+        $descriptor = [pscustomobject]@{
+            Name = 'Discord webhook'
+            Target = 'BRAVO_DISCORD_URL'
+            Kind = 'Webhook'
+            NotificationProvider = 'discord'
+        }
+
+        # 1. Конфігурація SERV_HRDL_1: лише route-специфічні записи.
+        $script:stubStore = @{
+            'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS'
+            'BRAVO_DISCORD_GENERAL_URL' = 'STUB-GENERAL'
+        }
+        $script:capturedResults.Clear()
+        $routeSpecificValues = @{}
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $routeSpecificValues
+        $routeSpecificStatus = [string]$script:capturedResults[0]
+
+        # 2. Стара інсталяція: лише legacy BRAVO_DISCORD_URL.
+        $script:stubStore = @{ 'BRAVO_DISCORD_URL' = 'STUB-LEGACY' }
+        $script:capturedResults.Clear()
+        $legacyValues = @{}
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $legacyValues
+        $legacyStatus = [string]$script:capturedResults[0]
+
+        # 3. Жодного webhook: dry-run має чесно впасти.
+        $script:stubStore = @{}
+        $script:capturedResults.Clear()
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues @{}
+        $missingStatus = [string]$script:capturedResults[0]
+
+        [pscustomobject]@{
+            RouteSpecificStatus = $routeSpecificStatus
+            RouteSpecificSecret = [string]$routeSpecificValues['Webhook']
+            LegacyStatus = $legacyStatus
+            LegacySecret = [string]$legacyValues['Webhook']
+            MissingStatus = $missingStatus
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunWebhookCapture.RouteSpecificStatus -like 'PASS|*' -and
+            $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-ALERTS' -and
+            $dryRunWebhookCapture.LegacyStatus -like 'PASS|*' -and
+            $dryRunWebhookCapture.LegacySecret -eq 'STUB-LEGACY' -and
+            $dryRunWebhookCapture.MissingStatus -like 'FAIL|*'
+        ) `
+        -Name 'DryRun/WebhookCheckMatchesRuntimeResolution' `
+        -Failure 'dry-run має перевіряти webhook тим самим Resolve-BRAVONotificationEndpoint, що й runtime: route-специфічні записи без legacy BRAVO_DISCORD_URL мають давати PASS, legacy-only інсталяція теж PASS, і лише повна відсутність webhook — FAIL'
     # Відновлюємо реальні модулі для решти self-test (наступні секції
     # покладаються на їх наявність, як і до цього ізольованого блоку).
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop

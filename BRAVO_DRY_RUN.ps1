@@ -443,17 +443,87 @@ function Get-RequiredCredentialDescriptors {
                 Name = "Slack webhook"
                 Target = Get-ConfiguredTarget "SlackWebhook" "BRAVO_SLACK_URL"
                 Kind = "Webhook"
+                NotificationProvider = "slack"
             })
         } else {
             [void]$descriptors.Add([pscustomobject]@{
                 Name = "Discord webhook"
                 Target = Get-ConfiguredTarget "DiscordWebhook" "BRAVO_DISCORD_URL"
                 Kind = "Webhook"
+                NotificationProvider = "discord"
             })
         }
     }
 
     return $descriptors.ToArray()
+}
+
+function Get-NotificationCredentialTargetTable {
+    # Рівно той самий об'єкт, який runtime передає в
+    # Resolve-BRAVONotificationEndpoint (BRAVO.config:
+    # NotificationCredentialTargets = $credentialSettings.Targets).
+    if ($null -ne $credentialSettings -and $credentialSettings.Targets -is [hashtable]) {
+        return $credentialSettings.Targets
+    }
+    $table = @{}
+    if ($null -ne $credentialSettings -and $null -ne $credentialSettings.Targets) {
+        foreach ($property in $credentialSettings.Targets.PSObject.Properties) {
+            $table[$property.Name] = [string]$property.Value
+        }
+    }
+    return $table
+}
+
+function Test-DryRunWebhookCredential {
+    # Dry-run має перевіряти РІВНО ті записи Credential Manager, які runtime
+    # реально читає. Раніше тут стояв лише legacy provider-wide target
+    # (BRAVO_DISCORD_URL / BRAVO_SLACK_URL), тоді як
+    # Resolve-BRAVONotificationEndpoint пробує спершу route-специфічний
+    # (BRAVO_DISCORD_ALERTS_URL / BRAVO_DISCORD_GENERAL_URL) і лише потім
+    # legacy. Сервер, налаштований на route-специфічні webhook-и, отримував
+    # [FAIL] на цілком робочій конфігурації — і BRAVO_SETUP зупинявся
+    # fail-closed, хоча сповіщення фактично надсилались. Канонічний власник
+    # порядку пошуку один — BRAVO.Notifications; тут він саме викликається,
+    # а не дублюється.
+    param(
+        [Parameter(Mandatory = $true)][object]$Descriptor,
+        [Parameter(Mandatory = $true)][hashtable]$CredentialValues
+    )
+
+    $credentialTargets = Get-NotificationCredentialTargetTable
+    $resolvedRoutes = New-Object System.Collections.Generic.List[string]
+    $failedRoutes = New-Object System.Collections.Generic.List[string]
+    foreach ($route in @('alerts', 'general')) {
+        $secret = $null
+        try {
+            $secret = Resolve-BRAVONotificationEndpoint `
+                -Provider ([string]$Descriptor.NotificationProvider) `
+                -Route $route `
+                -CredentialTargets $credentialTargets
+        } catch {
+            [void]$failedRoutes.Add(('{0}: {1}' -f $route, $_.Exception.Message))
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($secret)) {
+            [void]$failedRoutes.Add(('{0}: порожнє значення' -f $route))
+            continue
+        }
+        [void]$resolvedRoutes.Add($route)
+        if ([string]::IsNullOrWhiteSpace([string]$CredentialValues[$Descriptor.Kind])) {
+            $CredentialValues[$Descriptor.Kind] = $secret
+        }
+    }
+
+    if ($failedRoutes.Count -gt 0) {
+        Add-DryRunResult FAIL 'Credential Manager' $Descriptor.Name (
+            'для {0} не вдалося отримати webhook — {1}' -f `
+                ([Security.Principal.WindowsIdentity]::GetCurrent().Name), ($failedRoutes -join '; ')
+        )
+        return
+    }
+    Add-DryRunResult PASS 'Credential Manager' $Descriptor.Name (
+        'webhook доступний для поточного облікового запису (маршрути: {0})' -f ($resolvedRoutes -join ', ')
+    )
 }
 
 function Get-SourceDirectory {
@@ -1591,6 +1661,12 @@ try {
             }
             $requiredCredentials = @(Get-RequiredCredentialDescriptors)
             foreach ($descriptor in $requiredCredentials) {
+                if ($descriptor.Kind -eq "Webhook") {
+                    Test-DryRunWebhookCredential `
+                        -Descriptor $descriptor `
+                        -CredentialValues $credentialValues
+                    continue
+                }
                 try {
                     $secret = Get-BRAVOCredentialSecret -Target $descriptor.Target
                     if ([string]::IsNullOrWhiteSpace($secret)) {

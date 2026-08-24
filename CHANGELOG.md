@@ -57,6 +57,23 @@
   тоді, коли діагностика найпотрібніша. На коректність розбору це не
   впливає — він спирається лише на ASCII-alias і GUID-и.
 
+- FIX (dry-run, критично для інсталяції): перевірка webhook у
+  `BRAVO_DRY_RUN.ps1` більше не вимагає legacy-запису `BRAVO_DISCORD_URL` /
+  `BRAVO_SLACK_URL`. Runtime резолвить webhook через
+  `Resolve-BRAVONotificationEndpoint` (route-специфічний
+  `BRAVO_DISCORD_ALERTS_URL`/`BRAVO_DISCORD_GENERAL_URL` → legacy
+  provider-wide → жорсткий літерал), а dry-run перевіряв ЛИШЕ legacy-запис.
+  На сервері, налаштованому на route-специфічні webhook-и (саме так їх пише
+  `BRAVO_CREDENTIALS_SETUP.ps1`), сповіщення фактично працювали, але dry-run
+  звітував `запис 'BRAVO_DISCORD_URL' відсутній або порожній`, а
+  `BRAVO_SETUP.ps1` зупинявся fail-closed з `СТАТУС: ПОМИЛКА` —
+  інсталяція не завершувалась на цілком робочій конфігурації. Тепер dry-run
+  викликає той самий канонічний `Resolve-BRAVONotificationEndpoint` для обох
+  маршрутів (`alerts`, `general`) замість власної паралельної політики.
+  Backward compatibility збережено: інсталяція лише з legacy
+  `BRAVO_DISCORD_URL` і далі проходить, а повна відсутність webhook і далі
+  дає `[FAIL]`.
+
 - FIX (dry-run, діагностика): порожній Discord/Slack webhook у перевірці
   доступності (`BRAVO_DRY_RUN.ps1`, гілка `-TestAccess`) більше не
   показується оператору сирим текстом .NET-винятку
