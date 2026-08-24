@@ -2,6 +2,43 @@
 
 ## Не випущено (developer)
 
+- **FEATURE (data-integrity, archive preflight): розрахункова перевірка
+  вільного місця понад фіксований поріг.** `Maintenance.Limits.
+  MinimumFreeSpaceGB` (типово 20) — загальний захист від переповнення
+  диска ОС на КОЖНОМУ локальному Fixed-диску, не оцінка того, скільки
+  місця реально потребує НАЙБЛИЖЧИЙ backup. Джерела MODEL/BLOG/BRAVOEXCH
+  ростуть з часом: сервер може мати вільного місця більше за фіксований
+  поріг, але менше, ніж потрібно для нового архіву — 7-Zip/VSS падає
+  посеред роботи, хоча стара preflight-перевірка проходила `OK`.
+
+  Новий `Get-BRAVOArchiveEstimatedSpaceRequirement`
+  (`modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`), викликається в
+  тому самому кроці "Перевірка вільного місця" одразу після фіксованого
+  порогу (не замінює його, а доповнює — фіксований поріг лишається
+  незалежним і обов'язковим): для кожного увімкненого компонента бере
+  розмір ОСТАННЬОГО hash-підтвердженого валідного архіву
+  (`Get-BRAVOValidArchiveSizeHistory`, `BRAVO.ArchiveHelpers` — той
+  самий канонічний reader, що вже використовує `SizeSanity` для
+  виявлення підозріло малих архівів) і додає запас на зростання
+  (`Maintenance.Limits.EstimatedSpaceMarginPercent`, типово 25%).
+  Компоненти на тому самому фізичному диску сумуються в один розрахунок
+  (інакше можна двічі "витратити" те саме вільне місце). Компонент без
+  валідної історії (перший запуск, bootstrap) свідомо пропускається з
+  оцінки — не блокує прогін; захистом для цього випадку лишається
+  фіксований поріг.
+
+  `EstimatedSpaceMarginPercent` — опційний ключ (compat: старі
+  `BRAVO.config` без нього отримують дефолт `25` у коді завантаження,
+  не лише в шаблоні файлу).
+
+  Новий self-test: `Archive/EstimatedSpaceUsesLastValidArchiveHistoryPlusMargin`,
+  `Archive/EstimatedSpaceFailsWhenBelowRequirement`,
+  `Archive/EstimatedSpaceSkipsComponentWithoutHistory`,
+  `Archive/EstimatedSpaceGroupsComponentsOnSameDrive`,
+  `Archive/EstimatedSpacePreflightWiredIntoFreeSpaceCheck`. Регресію
+  підтверджено вручну (тимчасово прибрано запас/групування з коду —
+  відповідні тести почервоніли, решта лишились зеленими; відновлено).
+
 ---
 
 ## 5.2.0-rc.5 — 2026-08-25 (candidate, acceptance passed)
