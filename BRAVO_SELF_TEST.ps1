@@ -3814,6 +3814,149 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name 'Archive/FreeSpacePreflightRunsBeforeBackupMutation' `
         -Failure 'звичайний Archive має перевіряти місце після ізольованого SyncBAZA-flow, але до VSS/архівації, завершуватись кодом 40 і показувати стандартний summary'
 
+    # Фіксований поріг MinimumFreeSpaceGB вище — загальний захист від
+    # переповнення диска ОС, не оцінка того, скільки місця реально
+    # потребує ЦЕЙ backup. Get-BRAVOArchiveEstimatedSpaceRequirement
+    # (доданий поверх, не замінює фіксований поріг) оцінює за розміром
+    # останнього hash-підтвердженого валідного архіву того самого
+    # компонента (Get-BRAVOValidArchiveSizeHistory, BRAVO.ArchiveHelpers —
+    # той самий reader, що вже використовує SizeSanity) + запас на
+    # зростання. Get-BRAVOValidArchiveSizeHistory резолвиться як реальна
+    # export-функція імпортованого модуля (не AST-екстракт), тому модуль
+    # має бути імпортований до виклику.
+    Remove-Module -Name 'BRAVO.ArchiveHelpers' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    $archiveEstimateRuntimeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $archiveScriptText `
+        -FunctionNames @("Get-BRAVOArchiveEstimatedSpaceRequirement")
+
+    function New-BRAVOEstimatedSpaceFixtureArchive {
+        param([string]$Directory, [string]$Name, [int]$Bytes)
+
+        [void][IO.Directory]::CreateDirectory($Directory)
+        $archivePath = Join-Path $Directory $Name
+        [IO.File]::WriteAllBytes($archivePath, (New-Object byte[] $Bytes))
+        $hash = (Get-BRAVOFileHash -Path $archivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+        [IO.File]::WriteAllText("$archivePath.sha512", "$hash *$Name")
+        return $archivePath
+    }
+
+    $estimatedSpaceTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_ESTIMATED_SPACE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $estimatedSpaceModelDir = Join-Path $estimatedSpaceTestRoot 'MODEL'
+        $estimatedSpaceBlogDir = Join-Path $estimatedSpaceTestRoot 'BLOG'
+        $estimatedSpaceBravoexchDir = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH'
+        [void](New-BRAVOEstimatedSpaceFixtureArchive -Directory $estimatedSpaceModelDir -Name 'INST_20260101_000000.mdz' -Bytes 100000)
+        [void](New-BRAVOEstimatedSpaceFixtureArchive -Directory $estimatedSpaceBlogDir -Name 'INST_blog_20260101_000000.mdz' -Bytes 50000)
+        $estimatedSpaceDriveLetter = ([IO.Path]::GetPathRoot($estimatedSpaceTestRoot)).TrimEnd('\').ToUpperInvariant()
+
+        # A: один компонент з історією, достатньо місця — 100000 * 1.25 = 125000.
+        $estimateSufficient = & $archiveEstimateRuntimeModule {
+            param($EnabledArchives, $Drives)
+            Get-BRAVOArchiveEstimatedSpaceRequirement `
+                -EnabledArchives $EnabledArchives `
+                -ArchiveFileFilter '*.mdz' `
+                -HashFileExtension '.sha512' `
+                -MarginPercent 25 `
+                -Drives $Drives
+        } @(@{ Type = 'MODEL'; Destination = $estimatedSpaceModelDir }) @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 200000; IsReady = $true })
+        Test-BRAVOCondition `
+            -Condition (
+                $estimateSufficient.Success -and
+                $estimateSufficient.ComponentEstimates[0].HasHistory -and
+                $estimateSufficient.ComponentEstimates[0].LastValidBytes -eq 100000 -and
+                $estimateSufficient.ComponentEstimates[0].EstimatedBytes -eq 125000 -and
+                @($estimateSufficient.VolumeStatus).Count -eq 1
+            ) `
+            -Name 'Archive/EstimatedSpaceUsesLastValidArchiveHistoryPlusMargin' `
+            -Failure 'Get-BRAVOArchiveEstimatedSpaceRequirement має брати розмір останнього hash-підтвердженого валідного архіву компонента і додавати MarginPercent запасу'
+
+        # B: та сама історія, вільного місця замало — має fail-closed зупинити.
+        $estimateInsufficient = & $archiveEstimateRuntimeModule {
+            param($EnabledArchives, $Drives)
+            Get-BRAVOArchiveEstimatedSpaceRequirement `
+                -EnabledArchives $EnabledArchives `
+                -ArchiveFileFilter '*.mdz' `
+                -HashFileExtension '.sha512' `
+                -MarginPercent 25 `
+                -Drives $Drives
+        } @(@{ Type = 'MODEL'; Destination = $estimatedSpaceModelDir }) @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 50000; IsReady = $true })
+        Test-BRAVOCondition `
+            -Condition (
+                -not $estimateInsufficient.Success -and
+                $estimateInsufficient.Problems.Count -eq 1 -and
+                $estimateInsufficient.Problems[0] -match 'розрахункова потреба' -and
+                $estimateInsufficient.Problems[0] -match [regex]::Escape($estimatedSpaceDriveLetter)
+            ) `
+            -Name 'Archive/EstimatedSpaceFailsWhenBelowRequirement' `
+            -Failure 'Get-BRAVOArchiveEstimatedSpaceRequirement має повертати Success=false і причину, коли реального вільного місця менше за розрахункову потребу'
+
+        # C: компонент без жодного валідного архіву (bootstrap) — пропускається
+        # з оцінки, НЕ блокує (фіксований поріг вище лишається єдиним захистом).
+        $estimatedSpaceEmptyDir = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_EMPTY'
+        [void][IO.Directory]::CreateDirectory($estimatedSpaceEmptyDir)
+        $estimateNoHistory = & $archiveEstimateRuntimeModule {
+            param($EnabledArchives)
+            Get-BRAVOArchiveEstimatedSpaceRequirement `
+                -EnabledArchives $EnabledArchives `
+                -ArchiveFileFilter '*.mdz' `
+                -HashFileExtension '.sha512' `
+                -MarginPercent 25
+        } @(@{ Type = 'BRAVOEXCH'; Destination = $estimatedSpaceEmptyDir })
+        Test-BRAVOCondition `
+            -Condition (
+                $estimateNoHistory.Success -and
+                -not $estimateNoHistory.ComponentEstimates[0].HasHistory -and
+                $null -eq $estimateNoHistory.ComponentEstimates[0].EstimatedBytes -and
+                @($estimateNoHistory.VolumeStatus).Count -eq 0
+            ) `
+            -Name 'Archive/EstimatedSpaceSkipsComponentWithoutHistory' `
+            -Failure 'компонент без валідної історії архівів (перший запуск) має пропускатись з розрахункової оцінки, а не блокувати прогін'
+
+        # D: два компоненти на одному диску — потреби сумуються на цей диск,
+        # а не перевіряються незалежно (інакше можна двічі "витратити" те саме
+        # вільне місце в розрахунку).
+        $estimateGrouped = & $archiveEstimateRuntimeModule {
+            param($EnabledArchives, $Drives)
+            Get-BRAVOArchiveEstimatedSpaceRequirement `
+                -EnabledArchives $EnabledArchives `
+                -ArchiveFileFilter '*.mdz' `
+                -HashFileExtension '.sha512' `
+                -MarginPercent 25 `
+                -Drives $Drives
+        } @(
+            @{ Type = 'MODEL'; Destination = $estimatedSpaceModelDir },
+            @{ Type = 'BLOG'; Destination = $estimatedSpaceBlogDir }
+        # 150000: >= кожної окремої потреби (MODEL 125000, BLOG 62500), але
+        # < сумарної (187500) — якщо компоненти помилково перевірялися б
+        # незалежно, обидва пройшли б; коректна поведінка має провалитись.
+        ) @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 150000; IsReady = $true })
+        Test-BRAVOCondition `
+            -Condition (
+                @($estimateGrouped.VolumeStatus).Count -eq 1 -and
+                -not $estimateGrouped.Success
+            ) `
+            -Name 'Archive/EstimatedSpaceGroupsComponentsOnSameDrive' `
+            -Failure 'компоненти на тому самому фізичному диску мають сумуватись в один розрахунок (125000+62500=187500 > доступних 150000), а не перевірятись незалежно один від одного'
+    } finally {
+        Remove-Item -LiteralPath $estimatedSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Get-BRAVOArchiveEstimatedSpaceRequirement') -and
+            $archiveScriptText.Contains('EstimatedSpaceMarginPercent') -and
+            $archiveScriptText.Contains('$archiveFreeSpaceResult.Success = $false') -and
+            $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -gt
+                $archiveScriptText.IndexOf('$archiveFreeSpaceResult = Get-BRAVOArchiveFreeSpaceResult') -and
+            $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -lt
+                $archiveScriptText.IndexOf('$archiveFreeSpaceReason = if (')
+        ) `
+        -Name 'Archive/EstimatedSpacePreflightWiredIntoFreeSpaceCheck' `
+        -Failure 'розрахункова перевірка місця має виконуватись у тому самому preflight-кроці "Перевірка вільного місця", ПІСЛЯ фіксованого порогу і ДО обчислення підсумкового Reason/раннього return — інакше вона або не впливає на результат, або перевіряється в неправильний момент'
+
     $literalSourceText = "Методика*виконання_вимірювань.pdf"
     $discordLiteralText = & $archiveRuntimeModule {
         param($Value)

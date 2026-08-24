@@ -141,6 +141,24 @@ try {
             $archiveFreeSpaceExcludedDrives += $normalizedDrive
         }
     }
+
+    # Опційний параметр (compat: старі BRAVO.config його не містять) —
+    # запас понад розмір останнього валідного архіву для розрахункової
+    # перевірки місця (Get-BRAVOArchiveEstimatedSpaceRequirement нижче).
+    # Відсутність ключа НЕ послаблює жодного наявного захисту: фіксований
+    # поріг MinimumFreeSpaceGB вище лишається обов'язковим і незалежним.
+    $archiveEstimatedSpaceMarginPercent = if (
+        $maintenanceSettings.Limits -is [System.Collections.IDictionary] -and
+        $maintenanceSettings.Limits.Contains('EstimatedSpaceMarginPercent') -and
+        $null -ne $maintenanceSettings.Limits.EstimatedSpaceMarginPercent
+    ) {
+        [double]$maintenanceSettings.Limits.EstimatedSpaceMarginPercent
+    } else {
+        25.0
+    }
+    if ($archiveEstimatedSpaceMarginPercent -lt 0) {
+        throw 'Maintenance.Limits.EstimatedSpaceMarginPercent не може бути відʼємним'
+    }
 } catch {
     Write-Host "ПОМИЛКА: Некоректна конфігурація перевірки вільного місця: $($_.Exception.Message)" -ForegroundColor Red
     Exit 30
@@ -5344,6 +5362,140 @@ function Get-BRAVOArchiveFreeSpaceResult {
     }
 }
 
+function Get-BRAVOArchiveEstimatedSpaceRequirement {
+    # Фіксований поріг MinimumFreeSpaceGB (Get-BRAVOArchiveFreeSpaceResult
+    # вище) — загальний захист від переповнення диска ОС, не оцінка того,
+    # скільки місця реально потребує ЦЕЙ backup. Джерела MODEL/BLOG/
+    # BRAVOEXCH ростуть з часом; сервер може мати вільного місця більше за
+    # поріг, але менше, ніж потрібно для нового архіву — 7-Zip/VSS падає
+    # посеред роботи, хоча preflight-перевірка вище пройшла.
+    #
+    # Оцінка спирається на розмір ОСТАННЬОГО hash-підтвердженого валідного
+    # архіву того самого компонента (Get-BRAVOValidArchiveSizeHistory —
+    # той самий канонічний reader, що вже використовує SizeSanity для
+    # виявлення підозріло малих архівів) плюс запас на зростання джерела.
+    # Компонент без валідної історії (перший запуск компонента чи всі
+    # попередні архіви invalid/FAILED) свідомо пропускається з оцінки —
+    # bootstrap не повинен fail-closed заблокуватись через відсутність
+    # даних; захист для цього випадку лишається фіксований поріг вище.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object[]]$EnabledArchives,
+        [Parameter(Mandatory = $true)][string]$ArchiveFileFilter,
+        [Parameter(Mandatory = $true)][string]$HashFileExtension,
+        [Parameter(Mandatory = $true)][double]$MarginPercent,
+        # Той самий injectable-override принцип, що -Drives у
+        # Get-BRAVOArchiveFreeSpaceResult вище: детермінований self-test
+        # без залежності від реального вільного місця на CI/dev-машині.
+        # Елемент: @{ Drive = 'C:'; AvailableFreeSpace = <bytes>; IsReady = $true }.
+        [object[]]$Drives
+    )
+
+    $componentEstimates = New-Object System.Collections.Generic.List[object]
+    foreach ($archive in $EnabledArchives) {
+        $destination = [string]$archive.Destination
+        $history = @(Get-BRAVOValidArchiveSizeHistory `
+            -Directory $destination `
+            -ArchiveFilter $ArchiveFileFilter `
+            -HashFileExtension $HashFileExtension `
+            -MaxCount 1)
+        if ($history.Count -eq 0) {
+            [void]$componentEstimates.Add([pscustomobject]@{
+                Type = [string]$archive.Type
+                Destination = $destination
+                HasHistory = $false
+                LastValidBytes = $null
+                EstimatedBytes = $null
+            })
+            continue
+        }
+        $lastBytes = [int64]$history[0].Bytes
+        $estimatedBytes = [int64][math]::Ceiling($lastBytes * (1.0 + ($MarginPercent / 100.0)))
+        [void]$componentEstimates.Add([pscustomobject]@{
+            Type = [string]$archive.Type
+            Destination = $destination
+            HasHistory = $true
+            LastValidBytes = $lastBytes
+            EstimatedBytes = $estimatedBytes
+        })
+    }
+
+    # Групування за фізичним диском призначення: компоненти можуть лежати
+    # на різних томах (нетиповий, але дозволений layout) — кожен том
+    # перевіряється проти суми ЛИШЕ своїх компонентів, не всіх разом.
+    $volumeGroups = [ordered]@{}
+    foreach ($estimate in $componentEstimates) {
+        if (-not $estimate.HasHistory) { continue }
+        $driveLetter = $null
+        try {
+            $driveLetter = ([IO.Path]::GetPathRoot($estimate.Destination)).TrimEnd('\').ToUpperInvariant()
+        } catch {
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($driveLetter)) { continue }
+        if (-not $volumeGroups.Contains($driveLetter)) {
+            $volumeGroups[$driveLetter] = [pscustomobject]@{
+                Drive = $driveLetter
+                RequiredBytes = [int64]0
+                Components = New-Object System.Collections.Generic.List[string]
+            }
+        }
+        $volumeGroups[$driveLetter].RequiredBytes += $estimate.EstimatedBytes
+        [void]$volumeGroups[$driveLetter].Components.Add([string]$estimate.Type)
+    }
+
+    $injectedDrives = @(if ($PSBoundParameters.ContainsKey('Drives')) { $Drives } else { @() })
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $volumeStatus = New-Object System.Collections.Generic.List[object]
+    foreach ($driveLetter in $volumeGroups.Keys) {
+        $group = $volumeGroups[$driveLetter]
+        $availableBytes = $null
+        try {
+            if ($PSBoundParameters.ContainsKey('Drives')) {
+                $injectedDrive = @($injectedDrives | Where-Object {
+                    ([string]$_.Drive).TrimEnd('\').ToUpperInvariant() -eq $driveLetter
+                } | Select-Object -First 1)
+                if ($injectedDrive.Count -gt 0 -and [bool]$injectedDrive[0].IsReady) {
+                    $availableBytes = [int64]$injectedDrive[0].AvailableFreeSpace
+                }
+            } else {
+                $driveInfo = New-Object System.IO.DriveInfo($driveLetter)
+                if ($driveInfo.IsReady) {
+                    $availableBytes = [int64]$driveInfo.AvailableFreeSpace
+                }
+            }
+        } catch {
+            $availableBytes = $null
+        }
+        $requiredGB = [math]::Round($group.RequiredBytes / 1GB, 2)
+        $availableGB = if ($null -ne $availableBytes) { [math]::Round($availableBytes / 1GB, 2) } else { $null }
+        $componentsText = $group.Components -join ', '
+        [void]$volumeStatus.Add([pscustomobject]@{
+            Drive = $driveLetter
+            Components = $componentsText
+            RequiredGB = $requiredGB
+            AvailableGB = $availableGB
+        })
+        if ($null -eq $availableBytes) {
+            [void]$problems.Add("диск ${driveLetter}: не вдалося визначити вільне місце для оцінки ($componentsText)")
+            continue
+        }
+        if ($availableBytes -lt $group.RequiredBytes) {
+            [void]$problems.Add(
+                "диск ${driveLetter}: розрахункова потреба ${requiredGB} GB ($componentsText; історія + ${MarginPercent}% запасу), доступно лише ${availableGB} GB"
+            )
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = ($problems.Count -eq 0)
+        ComponentEstimates = $componentEstimates.ToArray()
+        VolumeStatus = $volumeStatus.ToArray()
+        Problems = $problems.ToArray()
+    }
+}
+
 function Write-BRAVOArchivePreflightFailureSummary {
     param(
         [Parameter(Mandatory = $true)][datetime]$StartedAt,
@@ -5902,6 +6054,31 @@ function Main {
     }
     if ($archiveFreeSpaceResult.AllExcluded) {
         Write-Log 'Усі локальні диски виключено з перевірки вільного місця' -Level 'WARNING'
+    }
+
+    # Розрахункова перевірка поверх фіксованого порогу вище: скільки місця
+    # реально потребує ЦЕЙ backup (за розміром останнього валідного архіву
+    # кожного компонента + запас), а не лише "диск ОС не забитий впритул".
+    # Компонент без історії пропускається (bootstrap), не блокує прогін.
+    try {
+        $archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement `
+            -EnabledArchives $enabledArchives `
+            -ArchiveFileFilter $archiveFileFilter `
+            -HashFileExtension $hashFileExtension `
+            -MarginPercent $archiveEstimatedSpaceMarginPercent
+    } catch {
+        Write-Log "Не вдалося виконати розрахункову перевірку місця: $($_.Exception.Message)" -Level 'WARNING'
+        $archiveEstimatedSpaceResult = [pscustomobject]@{ Success = $true; ComponentEstimates = @(); VolumeStatus = @(); Problems = @() }
+    }
+    foreach ($volumeStatusEntry in @($archiveEstimatedSpaceResult.VolumeStatus)) {
+        Write-Log (
+            "Диск $($volumeStatusEntry.Drive) ($($volumeStatusEntry.Components)): розрахункова потреба " +
+            "$($volumeStatusEntry.RequiredGB) GB, доступно $($volumeStatusEntry.AvailableGB) GB"
+        ) -Level 'INFO'
+    }
+    if (-not $archiveEstimatedSpaceResult.Success) {
+        $archiveFreeSpaceResult.Success = $false
+        $archiveFreeSpaceResult.Problems = @($archiveFreeSpaceResult.Problems) + @($archiveEstimatedSpaceResult.Problems)
     }
 
     $archiveFreeSpaceReason = if ($archiveFreeSpaceResult.Success) {
