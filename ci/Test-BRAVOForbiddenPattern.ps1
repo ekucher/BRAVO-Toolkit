@@ -56,6 +56,12 @@ $bypassAllowlist = @(
     # рядок launcher-а. Нових ВИКОНУВАНИХ Bypass-місць не додано.
     'BRAVO_SELF_TEST.Governance.ps1',
     'BRAVO_SELF_TEST.ManualLaunchers.ps1',
+    # ConfigLoader: Import-BravoConfiguration встановлює $global:ScriptVersion/
+    # $global:BravoConfigurationMetadata та інший глобальний стан, небезпечний
+    # для змішування з рештою self-test-прогону в тому самому процесі — той
+    # самий ізольований дочірній powershell.exe патерн, що ManualLaunchers/
+    # Governance вище. Нових ВИКОНУВАНИХ Bypass-місць не додано.
+    'BRAVO_SELF_TEST.ConfigLoader.ps1',
     'BRAVO.Archive.Runtime.ps1',
     'BRAVO.Maintenance.Runtime.ps1',
     # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той
