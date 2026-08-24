@@ -135,6 +135,125 @@ try {
         -Name "Credentials/SystemWorkerQuietConsole" `
         -Failure "SYSTEM worker Credential Manager не повинен виконувати Write-Host без консолі"
 
+    # --- Відкритий ввід облікових даних дозволений ЛИШЕ доти, доки доведено,
+    # що значення не осідає в helper-лозі (дослівний Start-Transcript).
+    # Механізм: пауза transcript + canary-перевірка її справності на цьому
+    # хості. Тести нижче фіксують і сам механізм, і його fail-closed контракт.
+    $helperLoggingModuleText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.HelperLogging\BRAVO.HelperLogging.psm1"),
+        [Text.Encoding]::UTF8
+    )
+    $logSuspensionTestRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_LOG_SUSPENSION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($logSuspensionTestRoot)
+        $suspensionProbe = & (New-BRAVOSelfTestRuntimeModule `
+                -SourceText $helperLoggingModuleText `
+                -FunctionNames @(
+                    'Suspend-BRAVOHelperLog',
+                    'Resume-BRAVOHelperLog',
+                    'Test-BRAVOHelperLogSuspensionEffective'
+                )) {
+            param([string]$TestRoot)
+
+            $effectiveLog = Join-Path $TestRoot 'effective.log'
+            Start-Transcript -Path $effectiveLog -Force | Out-Null
+            $script:BRAVOHelperLogActive = $true
+            $script:BRAVOHelperLogPath = $effectiveLog
+            $script:BRAVOHelperLogSuspended = $false
+            $script:BRAVOHelperLogSuspensionEffective = $null
+
+            Write-Host 'BRAVO-BEFORE-WINDOW'
+            $canaryVerdict = Test-BRAVOHelperLogSuspensionEffective
+            $suspended = Suspend-BRAVOHelperLog
+            try {
+                Write-Host 'BRAVO-INSIDE-WINDOW'
+            } finally {
+                [void](Resume-BRAVOHelperLog)
+            }
+            Write-Host 'BRAVO-AFTER-WINDOW'
+            Stop-Transcript | Out-Null
+            $effectiveText = [IO.File]::ReadAllText($effectiveLog)
+
+            # Друга частина: пауза, яка НЕ працює. Stop-Transcript підмінено
+            # заглушкою-nop, тому маркер лишається у файлі — canary мусить це
+            # побачити і повернути $false.
+            $brokenLog = Join-Path $TestRoot 'broken.log'
+            Start-Transcript -Path $brokenLog -Force | Out-Null
+            $script:BRAVOHelperLogActive = $true
+            $script:BRAVOHelperLogPath = $brokenLog
+            $script:BRAVOHelperLogSuspended = $false
+            $script:BRAVOHelperLogSuspensionEffective = $null
+            function Stop-Transcript { }
+            function Start-Transcript { param([string]$Path, [switch]$Force, [switch]$Append) }
+            $brokenVerdict = Test-BRAVOHelperLogSuspensionEffective
+
+            [pscustomobject]@{
+                CanaryVerdict = $canaryVerdict
+                Suspended = $suspended
+                BeforeLogged = $effectiveText.Contains('BRAVO-BEFORE-WINDOW')
+                InsideLogged = $effectiveText.Contains('BRAVO-INSIDE-WINDOW')
+                AfterLogged = $effectiveText.Contains('BRAVO-AFTER-WINDOW')
+                CanaryTextLeaked = $effectiveText.Contains('BRAVO-LOG-SUSPENSION-CANARY')
+                BrokenVerdict = $brokenVerdict
+            }
+        } $logSuspensionTestRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $suspensionProbe.CanaryVerdict -and
+                $suspensionProbe.Suspended -and
+                $suspensionProbe.BeforeLogged -and
+                -not $suspensionProbe.InsideLogged -and
+                $suspensionProbe.AfterLogged -and
+                -not $suspensionProbe.CanaryTextLeaked
+            ) `
+            -Name "HelperLogging/SuspensionHidesConsoleOutput" `
+            -Failure "пауза transcript має ховати вивід лише всередині вікна: рядки до і після мають лишатися в лозі, а сам canary-маркер не повинен туди потрапляти"
+        Test-BRAVOCondition `
+            -Condition (-not $suspensionProbe.BrokenVerdict) `
+            -Name "HelperLogging/CanaryDetectsIneffectiveSuspension" `
+            -Failure "якщо пауза transcript на хості не працює, canary-перевірка має повернути false — інакше відкритий ввід писався б прямо в журнал"
+    } finally {
+        Remove-Item -LiteralPath $logSuspensionTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $setupScriptTextForLogSuspension = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_SETUP.ps1"), [Text.Encoding]::UTF8)
+    $readSecretEntriesBlock = [regex]::Match(
+        $credentialSetupText,
+        '(?s)function Read-SecretEntries \{.*?\r?\n\}\r?\n'
+    ).Value
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($readSecretEntriesBlock) -and
+            $readSecretEntriesBlock.Contains('Test-BRAVOHelperLogSuspensionEffective') -and
+            $readSecretEntriesBlock.Contains("BRAVO_PARENT_LOG_SUSPENDED -eq '1'") -and
+            $readSecretEntriesBlock.Contains('$secret = if ($plainInputAllowed)') -and
+            $readSecretEntriesBlock.Contains('-AsSecureString')
+        ) `
+        -Name "Credentials/PlainInputRequiresSuspendedLog" `
+        -Failure "відкритий ввід має бути доступний лише за підтвердженої паузи ВЛАСНОГО журналу (canary) І батьківського (BRAVO_PARENT_LOG_SUSPENDED); прихована гілка -AsSecureString має лишатись як fail-closed запасний шлях"
+    Test-BRAVOCondition `
+        -Condition (
+            ([regex]::Matches($readSecretEntriesBlock, [regex]::Escape('Suspend-BRAVOHelperLog')).Count -ge 1) -and
+            ([regex]::IsMatch($readSecretEntriesBlock, '(?s)\} finally \{.*?Resume-BRAVOHelperLog')) -and
+            ([regex]::Matches($setupScriptTextForLogSuspension, [regex]::Escape('Suspend-BRAVOHelperLog')).Count -ge 1) -and
+            ([regex]::IsMatch($setupScriptTextForLogSuspension, '(?s)\} finally \{.*?Resume-BRAVOHelperLog'))
+        ) `
+        -Name "Credentials/ResumeAlwaysInFinally" `
+        -Failure "кожна пауза журналу має відновлюватись у finally: інакше виняток під час вводу лишив би журнал вимкненим до кінця процесу"
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptTextForLogSuspension.Contains('$env:BRAVO_PARENT_LOG_SUSPENDED = ''1''') -and
+            [regex]::IsMatch(
+                $setupScriptTextForLogSuspension,
+                '(?s)Suspend-BRAVOHelperLog.{0,600}?-ScriptPath \$setup\.CredentialScript'
+            )
+        ) `
+        -Name "Setup/CredentialStepSuspendsParentLog" `
+        -Failure "BRAVO_SETUP має зупиняти власний transcript навколо кроку Credential Manager і повідомляти про це дитині — інакше введені значення осядуть у батьківському лозі"
+
     Remove-Module -Name 'BRAVO.Compatibility' -Force -ErrorAction SilentlyContinue
     $outputEncodingBeforeCompatibilityImport = $global:OutputEncoding
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
