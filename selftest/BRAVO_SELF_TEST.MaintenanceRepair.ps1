@@ -18,6 +18,7 @@ $maintenanceRepairScriptText = [IO.File]::ReadAllText(
 )
 
 Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+Import-Module -Name (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psd1") -Force -ErrorAction Stop
 
 # ============================================================
 # MODEL-контракт: похідні MODEL_NAME/MAIN_MODEL_FILE, без hardcode.
@@ -62,13 +63,27 @@ foreach ($scenario in $modelContractScenarios) {
 # Compare-FileSizes: RemovedByRepair vs CRITICAL класифікація.
 # ============================================================
 $compareFileSizesStubText = @'
-function Write-Log { param($Message, [string]$Level = 'INFO') }
-function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+function Write-Log {
+    param($Message, [string]$Level = 'INFO')
+    if ($null -eq (Get-Variable -Name BRAVOCapturedLogMessages -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:BRAVOCapturedLogMessages = New-Object System.Collections.ArrayList
+    }
+    [void]$script:BRAVOCapturedLogMessages.Add([string]$Message)
+}
+function Send-SlackAlert {
+    param($Message, [switch]$IsCritical)
+    if ($null -eq (Get-Variable -Name BRAVOCapturedAlerts -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:BRAVOCapturedAlerts = New-Object System.Collections.ArrayList
+    }
+    [void]$script:BRAVOCapturedAlerts.Add([string]$Message)
+}
 function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
+function Format-BRAVOUkrainianCount { BRAVO.Notifications\Format-BRAVOUkrainianCount @args }
+function Format-BRAVONotificationListSummary { BRAVO.Notifications\Format-BRAVONotificationListSummary @args }
 '@
 $compareFileSizesModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($compareFileSizesStubText + "`n" + $maintenanceRepairScriptText) `
-    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'Get-BRAVOModelRelativePath', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
+    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'Get-BRAVOModelRelativePath', 'Format-BRAVOUkrainianCount', 'Format-BRAVONotificationListSummary', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
 
 function Invoke-BRAVOCompareFileSizesScenario {
     param(
@@ -383,6 +398,127 @@ foreach ($scenario in $relativePathScenarios) {
         -Name "Maintenance/ModelRelativePath[$($scenario.Label)]" `
         -Failure "Get-BRAVOModelRelativePath('$($scenario.FullName)', '$($scenario.Root)') має повернути '$($scenario.Expected)'; отримано '$derived'"
 }
+
+# ============================================================
+# Compact notification: операторський alert = count + ≤5 прикладів;
+# повна діагностика (4 рядки/файл) лишається ТІЛЬКИ в журналі.
+# Реальний інцидент: сотні critical-файлів → 4×N рядків у транспорт →
+# серія Discord-повідомлень. Contract: one event -> one notification.
+# ============================================================
+function Get-BRAVOCompareCaptured {
+    param([Parameter(Mandatory = $true)][ValidateSet('Alerts', 'Logs')][string]$Kind)
+    return @(& $compareFileSizesModule {
+        param($Which)
+        if ($Which -eq 'Alerts') {
+            if ($null -eq (Get-Variable -Name BRAVOCapturedAlerts -Scope Script -ErrorAction SilentlyContinue)) { @() } else { @($script:BRAVOCapturedAlerts) }
+        } else {
+            if ($null -eq (Get-Variable -Name BRAVOCapturedLogMessages -Scope Script -ErrorAction SilentlyContinue)) { @() } else { @($script:BRAVOCapturedLogMessages) }
+        }
+    } $Kind)
+}
+function Clear-BRAVOCompareCaptured {
+    & $compareFileSizesModule {
+        $script:BRAVOCapturedAlerts = New-Object System.Collections.ArrayList
+        $script:BRAVOCapturedLogMessages = New-Object System.Collections.ArrayList
+    }
+}
+
+# --- 341 critical: рівно ОДИН alert, компактний; повний список у лозі ---
+$compactBefore = @{ 'TestProject.md' = 500000 }
+for ($compactIndex = 1; $compactIndex -le 341; $compactIndex++) {
+    $compactBefore[('F{0:000}.md' -f $compactIndex)] = 10000
+}
+Clear-BRAVOCompareCaptured
+$compact341 = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles $compactBefore `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md'
+$compact341Alerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
+$compact341Logs = @(Get-BRAVOCompareCaptured -Kind Logs)
+$compact341DetailedLog = @($compact341Logs | Where-Object { $_ -like '*Розмір до реставрації*' } | Select-Object -First 1)
+Test-BRAVOCondition `
+    -Condition (
+        $compact341.HasCriticalChanges -and
+        @($compact341Alerts).Count -eq 1 -and
+        $compact341Alerts[0].Contains('341 файл') -and
+        $compact341Alerts[0].Contains('…і ще 336 файлів.') -and
+        $compact341Alerts[0].Length -lt 1800 -and
+        -not $compact341Alerts[0].Contains('Розмір до реставрації') -and
+        (@($compact341Alerts[0] -split "`n" | Where-Object { $_ -like '• *' }).Count -eq 5) -and
+        @($compact341DetailedLog).Count -eq 1 -and
+        $compact341DetailedLog[0].Contains('F001.md') -and
+        $compact341DetailedLog[0].Contains('F341.md') -and
+        $compact341DetailedLog[0].Contains('Розмір до реставрації')
+    ) `
+    -Name "Maintenance/CompactAlert341FilesOneNotificationFullLog" `
+    -Failure "341 critical: рівно 1 alert (<1800 симв., '341 файл', '…і ще 336 файлів.', 5 прикладів, БЕЗ 'Розмір до реставрації'); повний список (F001..F341 + деталі) лишається в лозі; факт: alerts=$(@($compact341Alerts).Count), len=$(if (@($compact341Alerts).Count) { $compact341Alerts[0].Length } else { 0 })"
+
+# --- 3 critical (<=5): усі показані, БЕЗ '…і ще' ---
+Clear-BRAVOCompareCaptured
+[void](Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'A.md' = 9000; 'B.md' = 9000; 'C.md' = 9000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md')
+$compact3Alerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
+Test-BRAVOCondition `
+    -Condition (
+        @($compact3Alerts).Count -eq 1 -and
+        $compact3Alerts[0].Contains('3 файли') -and
+        (@($compact3Alerts[0] -split "`n" | Where-Object { $_ -like '• *' }).Count -eq 3) -and
+        -not $compact3Alerts[0].Contains('і ще')
+    ) `
+    -Name "Maintenance/CompactAlertThreeFilesShowsAllNoRemainder" `
+    -Failure "3 critical: усі 3 приклади, без '…і ще'; факт: $(if (@($compact3Alerts).Count) { $compact3Alerts[0] } else { 'alert відсутній' })"
+
+# --- 6 critical: 5 прикладів + '…і ще 1 файл.' ---
+Clear-BRAVOCompareCaptured
+[void](Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'A.md' = 9000; 'B.md' = 9000; 'C.md' = 9000; 'D.md' = 9000; 'E.md' = 9000; 'G.md' = 9000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md')
+$compact6Alerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
+Test-BRAVOCondition `
+    -Condition (
+        @($compact6Alerts).Count -eq 1 -and
+        (@($compact6Alerts[0] -split "`n" | Where-Object { $_ -like '• *' }).Count -eq 5) -and
+        $compact6Alerts[0].Contains('…і ще 1 файл.')
+    ) `
+    -Name "Maintenance/CompactAlertSixFilesShowsFivePlusRemainder" `
+    -Failure "6 critical: 5 прикладів + '…і ще 1 файл.'; факт: $(if (@($compact6Alerts).Count) { $compact6Alerts[0] } else { 'alert відсутній' })"
+
+# --- missing vs редукція: різні короткі формати (structured, без parsing) ---
+Clear-BRAVOCompareCaptured
+[void](Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'GONE.md' = 2048000; 'DATABASE.md' = 1000000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000; 'DATABASE.md' = 200000 } `
+    -MainModelRelativePath 'TestProject.md')
+$compactKindAlerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
+Test-BRAVOCondition `
+    -Condition (
+        @($compactKindAlerts).Count -eq 1 -and
+        $compactKindAlerts[0] -match 'GONE\.md — файл відсутній \(було ' -and
+        $compactKindAlerts[0] -match 'DATABASE\.md — .+ → .+ \(-80[,.]0%\)'
+    ) `
+    -Name "Maintenance/CompactAlertDistinguishesMissingVsReduction" `
+    -Failure "missing -> 'файл відсутній (було ...)'; редукція 1000000->200000 -> '<before> → <after> (-80,0%)'; факт: $(if (@($compactKindAlerts).Count) { $compactKindAlerts[0] } else { 'alert відсутній' })"
+
+# --- Unicode/вкладені шляхи/пробіли не ламають compact-формат ---
+Clear-BRAVOCompareCaptured
+[void](Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; '#\tbl\antib41.csv' = 9000; 'Eqv\ЗВТ_13-80.pdf' = 9000; 'Folder With Spaces\Test.md' = 9000; 'Довідники\Аналіз №1.md' = 9000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md')
+$compactUnicodeAlerts = @(Get-BRAVOCompareCaptured -Kind Alerts)
+Test-BRAVOCondition `
+    -Condition (
+        @($compactUnicodeAlerts).Count -eq 1 -and
+        $compactUnicodeAlerts[0].Contains('#\tbl\antib41.csv — файл відсутній') -and
+        $compactUnicodeAlerts[0].Contains('Eqv\ЗВТ_13-80.pdf — файл відсутній') -and
+        $compactUnicodeAlerts[0].Contains('Folder With Spaces\Test.md — файл відсутній') -and
+        $compactUnicodeAlerts[0].Contains('Довідники\Аналіз №1.md — файл відсутній')
+    ) `
+    -Name "Maintenance/CompactAlertHandlesUnicodeAndNestedPaths" `
+    -Failure "compact-формат має коректно нести #\, кирилицю, пробіли і вкладені шляхи; факт: $(if (@($compactUnicodeAlerts).Count) { $compactUnicodeAlerts[0] } else { 'alert відсутній' })"
 
 # --- Викликач деривує hint від MAIN_MODEL_FILE тим самим канонічним правилом
 # Get-BRAVOModelRelativePath, що й writer before-CSV та lookup у

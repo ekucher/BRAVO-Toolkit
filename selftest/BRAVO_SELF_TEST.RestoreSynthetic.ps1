@@ -22,6 +22,7 @@
 
 Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
 Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+Import-Module -Name (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psd1") -Force -ErrorAction Stop
 
 $restoreSyntheticSevenZip = Join-Path $root 'tools\7za.exe'
 if (-not (Test-Path -LiteralPath $restoreSyntheticSevenZip -PathType Leaf)) {
@@ -50,6 +51,8 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
 function Write-BRAVOProcessInputText { BRAVO.Compatibility\Write-BRAVOProcessInputText @args }
 function Get-BRAVOSevenZipExitCodeDescription { BRAVO.Compatibility\Get-BRAVOSevenZipExitCodeDescription @args }
 function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity @args }
+function Format-BRAVOUkrainianCount { BRAVO.Notifications\Format-BRAVOUkrainianCount @args }
+function Format-BRAVONotificationListSummary { BRAVO.Notifications\Format-BRAVONotificationListSummary @args }
 function Write-BRAVOProgressDetail {
     param([AllowEmptyString()][string]$Detail)
     if ($null -eq (Get-Variable -Name BRAVORunningDetailCalls -Scope Script -ErrorAction SilentlyContinue)) {
@@ -73,6 +76,7 @@ $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
         'Test-SevenZipArchiveIntegrity',
         'Format-CommandOutput', 'Format-FileSize',
         'Get-BRAVOModelRelativePath',
+        'Format-BRAVOUkrainianCount', 'Format-BRAVONotificationListSummary',
         'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes',
         'Invoke-CommandWithLog', 'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
         'Restore-FromArchive', 'Invoke-BRAVOModelRestoreRecovery'

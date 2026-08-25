@@ -2387,8 +2387,24 @@ function Test-RangeIdUsage {
         $message += "`nЧас оновлення даних: $($rangeData.time)"
     }
 
+    # Повний перелік діапазонів — у журналі; операторський alert —
+    # count + канонічна вибірка прикладів (compact notification).
+    $rangeAlertCompactLines = @(
+        "Перевищено поріг використання діапазонів ID (${thresholdText}%): $(Format-BRAVOUkrainianCount -Count $exceededRanges.Count -One 'діапазон' -Few 'діапазони' -Many 'діапазонів')."
+        ''
+    ) + @(Format-BRAVONotificationListSummary `
+        -ExampleLines @($alertLines | ForEach-Object { ([string]$_).TrimStart('-', ' ') }) `
+        -TotalCount $exceededRanges.Count `
+        -RemainderNounOne 'діапазон' -RemainderNounFew 'діапазони' -RemainderNounMany 'діапазонів') + @(
+        ''
+        "Файл: $sourceFileName"
+    )
+    if ($rangeData.time) {
+        $rangeAlertCompactLines += "Час оновлення даних: $($rangeData.time)"
+    }
+
     Write-Log $message -Level "WARNING" -NoConsole
-    Send-SlackAlert -Message $message -IsCritical
+    Send-SlackAlert -Message ($rangeAlertCompactLines -join "`n") -IsCritical
     $exceededSummary = "перевищено поріг {0}%: {1}" -f $thresholdText, ($exceededRanges.Count)
     return [pscustomobject]@{ HasIssue = $true; Reason = $exceededSummary }
 }
@@ -4909,7 +4925,19 @@ function Compare-FileSizes {
         }
 
         if ($criticalFiles.Count -gt 0) {
+            # Розділені представлення (compact notification):
+            #   DetailedDiagnostic (4 рядки/файл, УСІ файли) -> Write-Log —
+            #     авторитетна повна діагностика лишається в
+            #     BRAVO_MAINTENANCE_*.log без жодних скорочень;
+            #   OperatorSummary (count + до N прикладів + «…і ще N») ->
+            #     Send-SlackAlert — операторський alert не повинен нести
+            #     сотні рядків і перетворювати транспорт на переглядач
+            #     журналу (реальний інцидент: 364 файли ≈ 1456 рядків →
+            #     серія Discord-повідомлень). Шлях до журналу додає
+            #     канонічний шаблон повідомлення (-LogPath у фінальному
+            #     звіті), тут не дублюється.
             $criticalMessage = "Знайдено $($criticalFiles.Count) файлів з критичною зміною розміру після реставрації:`n"
+            $criticalExampleLines = New-Object System.Collections.Generic.List[string]
             foreach ($file in $criticalFiles) {
                 $beforeFormatted = Format-FileSize $file.BeforeSizeBytes
                 $afterFormatted = if ($file.Missing) { "ФАЙЛ ВІДСУТНІЙ" } else { Format-FileSize $file.AfterSizeBytes }
@@ -4924,10 +4952,29 @@ function Compare-FileSizes {
                 $criticalMessage += "   Розмір після реставрації: $afterFormatted ($($file.AfterSizeBytes) байт)`n"
                 $statusText = if ($file.Missing) { "ФАЙЛ ВИДАЛЕНО" } else { "РЕДУКЦІЯ" }
                 $criticalMessage += "   Статус: ❌ $statusText (зменшено на $($reductionPercent.ToString('0.00'))%)`n"
+
+                # Один файл = один короткий рядок для operator summary;
+                # missing і редукція розрізняються (structured поля, без
+                # повторного parsing тексту).
+                [void]$criticalExampleLines.Add($(if ($file.Missing) {
+                    "$($file.File) — файл відсутній (було $beforeFormatted)"
+                } else {
+                    "$($file.File) — $beforeFormatted → $afterFormatted (-$($reductionPercent.ToString('0.0'))%)"
+                }))
             }
 
+            $criticalAlertLines = @(
+                "Знайдено $(Format-BRAVOUkrainianCount -Count $criticalFiles.Count -One 'файл' -Few 'файли' -Many 'файлів') з критичною зміною розміру після реставрації."
+                ''
+            ) + @(Format-BRAVONotificationListSummary `
+                -ExampleLines $criticalExampleLines.ToArray() `
+                -TotalCount $criticalFiles.Count) + @(
+                ''
+                'Повний перелік — у журналі BRAVO_MAINTENANCE.'
+            )
+
             Write-Log $criticalMessage -Level "ERROR"
-            Send-SlackAlert -Message $criticalMessage -IsCritical
+            Send-SlackAlert -Message ($criticalAlertLines -join "`n") -IsCritical
             $script:criticalErrorOccurred = $true
             $script:restoreIntegrityFailed = $true
 
@@ -5846,8 +5893,20 @@ function Check-MdFileSizes {
         $fileList = $fileListBuilder.ToString()
 
         $message = "Знайдено $($largeFiles.Count) файлів .md, розмір яких перевищує $($MAX_MD_FILE_SIZE / 1MB) МБ:`n$fileList"
+        # Повний перелік — у журналі; alert — count + вибірка (compact).
+        $largeMdAlertLines = @(
+            "Знайдено $(Format-BRAVOUkrainianCount -Count $largeFiles.Count -One 'файл' -Few 'файли' -Many 'файлів') .md, розмір яких перевищує $($MAX_MD_FILE_SIZE / 1MB) МБ."
+            ''
+        ) + @(Format-BRAVONotificationListSummary `
+            -ExampleLines @($largeFiles | ForEach-Object {
+                "$(Get-BRAVOModelRelativePath -FullName $_.FullName -RootPath $MODEL_PATH) : $(Format-FileSize $_.Length)"
+            }) `
+            -TotalCount $largeFiles.Count) + @(
+            ''
+            'Повний перелік — у журналі BRAVO_MAINTENANCE.'
+        )
         Write-Log $message -Level "WARNING"
-        Send-SlackAlert -Message $message -IsCritical
+        Send-SlackAlert -Message ($largeMdAlertLines -join "`n") -IsCritical
     } elseif ($oversizedFiles.Count -gt 0) {
         Write-Log "Усі великі файли .md виключені з контролю розміру налаштуваннями конфігурації." -Level "DEBUG"
     } else {

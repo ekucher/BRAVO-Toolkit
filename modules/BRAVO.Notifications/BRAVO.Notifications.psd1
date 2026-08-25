@@ -17,6 +17,8 @@
         'Split-DiscordNotificationText',
         'Resolve-BRAVONotificationRoute',
         'Resolve-BRAVONotificationEndpoint',
+        'Format-BRAVONotificationListSummary',
+        'Limit-BRAVONotificationPayload',
         'ConvertTo-BRAVONotificationPayloadText',
         'Send-BRAVONotificationChunks',
         'Send-BRAVONotification'

@@ -2101,7 +2101,81 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Version "5.0.0-dev.11" `
         -BuildId "testbuild"
     $discordChunks = @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $longDiscord))
-    Test-BRAVOCondition -Condition ($discordChunks.Count -gt 1 -and @($discordChunks | Where-Object { $_.Length -gt 1900 }).Count -eq 0) -Name "Notifications/DiscordChunkingStillWorks" -Failure "long Discord notifications мають chunking"
+    Test-BRAVOCondition -Condition ($discordChunks.Count -gt 1 -and @($discordChunks | Where-Object { $_.Length -gt 1900 }).Count -eq 0) -Name "Notifications/DiscordChunkingStillWorks" -Failure "long Discord notifications мають chunking (defense-in-depth під payload guard-ом)"
+
+    # ============================================================
+    # Compact list summary + глобальний payload guard (compact alerts).
+    # ============================================================
+    # Helper: 0 / 1 / 5 / 6 / 341; «…і ще 0» структурно неможливе.
+    $summaryZero = @(Format-BRAVONotificationListSummary -ExampleLines @() -TotalCount 0)
+    $summaryOne = @(Format-BRAVONotificationListSummary -ExampleLines @('a.md — файл відсутній') -TotalCount 1)
+    $summaryFive = @(Format-BRAVONotificationListSummary -ExampleLines @('a', 'b', 'c', 'd', 'e') -TotalCount 5)
+    $summarySix = @(Format-BRAVONotificationListSummary -ExampleLines @('a', 'b', 'c', 'd', 'e', 'f') -TotalCount 6)
+    $summary341Lines = @(1..341 | ForEach-Object { "F$_.md — файл відсутній" })
+    $summary341 = @(Format-BRAVONotificationListSummary -ExampleLines $summary341Lines -TotalCount 341)
+    Test-BRAVOCondition `
+        -Condition (
+            @($summaryZero).Count -eq 0 -and
+            @($summaryOne).Count -eq 2 -and $summaryOne[1] -eq '• a.md — файл відсутній' -and -not (($summaryOne -join "`n").Contains('і ще')) -and
+            @($summaryFive).Count -eq 6 -and -not (($summaryFive -join "`n").Contains('і ще')) -and
+            @($summarySix).Count -eq 7 -and $summarySix[-1] -eq '…і ще 1 файл.' -and -not (($summarySix -join "`n").Contains('• f')) -and
+            @($summary341).Count -eq 7 -and $summary341[-1] -eq '…і ще 336 файлів.'
+        ) `
+        -Name "Notifications/ListSummaryCountsAndRemainder" `
+        -Failure "Format-BRAVONotificationListSummary: 0 -> порожньо; 1/5 -> без 'і ще'; 6 -> 5 прикладів + '…і ще 1 файл.'; 341 -> '…і ще 336 файлів.'"
+    $summaryUnicode = @(Format-BRAVONotificationListSummary -ExampleLines @(
+        '#\tbl\antib41.csv — файл відсутній',
+        'Eqv\ЗВТ_13-80.pdf — файл відсутній',
+        'Folder With Spaces\Test.md — файл відсутній',
+        'Довідники\Аналіз №1.md — файл відсутній'
+    ) -TotalCount 4)
+    Test-BRAVOCondition `
+        -Condition (
+            @($summaryUnicode).Count -eq 5 -and
+            $summaryUnicode[1] -eq '• #\tbl\antib41.csv — файл відсутній' -and
+            $summaryUnicode[4] -eq '• Довідники\Аналіз №1.md — файл відсутній'
+        ) `
+        -Name "Notifications/ListSummaryHandlesUnicodeAndPaths" `
+        -Failure "helper має без спотворень нести #\, кирилицю, пробіли, вкладені шляхи"
+
+    # Guard: аномально великий payload -> ОДНЕ повідомлення на обох
+    # транспортах, обрізане по межі рядка, з явним suffix і збереженим
+    # рядком журналу; малий payload проходить без змін і без suffix.
+    $guardOversizeLines = @('🚨 BRAVO MAINTENANCE — ПОТРІБНА ДІЯ')
+    $guardOversizeLines += @(1..500 | ForEach-Object { "рядок діагностики номер $_ з достатньо довгим текстом" })
+    $guardOversizeLines += ':memo: Журнал: C:\Program Files\BRAVO-Toolkit\LOGS\BRAVO_MAINTENANCE_test.log'
+    $guardOversizeMessage = $guardOversizeLines -join "`n"
+    $guardSlackChunks = @(ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardOversizeMessage 3>$null)
+    $guardDiscordChunks = @(ConvertTo-BRAVONotificationPayloadText -Provider discord -Message $guardOversizeMessage 3>$null)
+    $guardSmallMessage = "коротке повідомлення`n:memo: Журнал: X"
+    $guardSmallChunks = @(ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardSmallMessage 3>$null)
+    Test-BRAVOCondition `
+        -Condition (
+            @($guardSlackChunks).Count -eq 1 -and
+            $guardSlackChunks[0].Length -le 1800 -and
+            $guardSlackChunks[0].Contains('⚠️ Повідомлення скорочено') -and
+            $guardSlackChunks[0].Contains('BRAVO_MAINTENANCE_test.log') -and
+            $guardSlackChunks[0].StartsWith('🚨 BRAVO MAINTENANCE — ПОТРІБНА ДІЯ') -and
+            -not $guardSlackChunks[0].Contains('рядок діагностики номер 500')
+        ) `
+        -Name "Notifications/PayloadGuardTruncatesSlackToSingleMessage" `
+        -Failure "oversized Slack payload: 1 повідомлення <=1800, suffix скорочення, збережений початок і рядок журналу; факт: chunks=$(@($guardSlackChunks).Count), len=$($guardSlackChunks[0].Length)"
+    Test-BRAVOCondition `
+        -Condition (
+            @($guardDiscordChunks).Count -eq 1 -and
+            $guardDiscordChunks[0].Length -le 1900 -and
+            $guardDiscordChunks[0].Contains('⚠️ Повідомлення скорочено') -and
+            $guardDiscordChunks[0].Contains('BRAVO_MAINTENANCE_test.log')
+        ) `
+        -Name "Notifications/PayloadGuardYieldsSingleDiscordChunk" `
+        -Failure "oversized Discord payload після guard-а: РІВНО 1 chunk (one event -> one notification), із suffix і журналом; факт: chunks=$(@($guardDiscordChunks).Count)"
+    Test-BRAVOCondition `
+        -Condition (
+            @($guardSmallChunks).Count -eq 1 -and
+            $guardSmallChunks[0] -eq $guardSmallMessage
+        ) `
+        -Name "Notifications/PayloadGuardLeavesSmallMessagesUntouched" `
+        -Failure "малий payload має проходити без змін і без truncation-suffix"
     $archiveNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
     $maintenanceNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
     $dataRestoreNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"), [Text.Encoding]::UTF8)
