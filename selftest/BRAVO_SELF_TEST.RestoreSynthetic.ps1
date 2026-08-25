@@ -404,7 +404,12 @@ $runningDetailResult = & $restoreSyntheticModule {
         Calls = @($script:BRAVORunningDetailCalls)
     }
 } $env:ComSpec
-$runningTicks = @($runningDetailResult.Calls | Where-Object { $_ -like 'Виконується*' })
+# Формат тіка (acceptance rc.12): "<Опис операції> — Виконується N сек." —
+# опис обов'язковий, бо багатохвилинний крок складається з кількох
+# native-фаз, і без опису всі вони виглядали однаково.
+$runningTicks = @($runningDetailResult.Calls | Where-Object {
+    $_ -like 'self-test: живий підстатус native-операції — Виконується*'
+})
 Test-BRAVOCondition `
     -Condition (
         $runningDetailResult.ExitCode -eq 0 -and
@@ -412,7 +417,7 @@ Test-BRAVOCondition `
         @($runningDetailResult.Calls)[-1] -eq ''
     ) `
     -Name "RestoreSynthetic/InvokeCommandWithLogEmitsRunningDetail" `
-    -Failure "Invoke-CommandWithLog під час ~2с процесу має видати >=1 running-підстатус ('Виконується ...') і завершити скиданням detail=''; отримано ExitCode=$($runningDetailResult.ExitCode), ticks=$($runningTicks.Count), lastDetail='$(@($runningDetailResult.Calls)[-1])'"
+    -Failure "Invoke-CommandWithLog під час ~2с процесу має видати >=1 running-підстатус формату '<Опис> — Виконується ...' і завершити скиданням detail=''; отримано ExitCode=$($runningDetailResult.ExitCode), ticks=$($runningTicks.Count), lastDetail='$(@($runningDetailResult.Calls)[-1])'"
 
 # --- Анкери коду: before-CSV+Compare розчеплені від CheckSize; гейт служб.
 Test-BRAVOCondition `

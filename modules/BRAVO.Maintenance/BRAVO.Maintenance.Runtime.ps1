@@ -5246,16 +5246,21 @@ function Invoke-CommandWithLog {
         # native-операції (bravocmd-реставрація, 7-Zip архівації до/після)
         # раніше блокувались у суцільному WaitForExit(timeout) — оператор
         # бачив застиглу смугу без жодного підстатусу. Polling кожні 500 мс
-        # оновлює прогрес канонічним running-рядком BRAVO.Console
-        # ("<Фаза> — Виконується N сек."), як в Archive; сумарний таймаут
-        # і kill-семантика після нього не змінені.
+        # оновлює прогрес канонічним running-рядком BRAVO.Console з НАЗВОЮ
+        # поточної операції ("<Фаза> — <Опис операції> — Виконується N
+        # сек."): багатохвилинний крок на кшталт "Реставрація моделі"
+        # складається з кількох native-фаз (архівація до, bravocmd,
+        # архівація після), і без $Description усі вони виглядали однаково
+        # (звіт оператора з acceptance rc.12). Сумарний таймаут і
+        # kill-семантика після нього не змінені.
         $waitDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds($timeoutMilliseconds)
         $completed = $false
         while (-not $completed) {
             $completed = $process.WaitForExit(500)
             if ($completed) { break }
             Write-BRAVOProgressDetail -Detail (
-                Format-BRAVORunningDetail -ElapsedSeconds ([int][math]::Floor($commandStopwatch.Elapsed.TotalSeconds))
+                "$Description — " +
+                (Format-BRAVORunningDetail -ElapsedSeconds ([int][math]::Floor($commandStopwatch.Elapsed.TotalSeconds)))
             )
             if ([DateTime]::UtcNow -ge $waitDeadlineUtc) { break }
         }
@@ -7557,7 +7562,10 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     if ($quiescenceSuppressionReady) {
                         # Виконання реставрації через bravocmd.exe (як в еталоні)
                         $restoreArgs = @("r", "null", $MODEL_PROJECT_PATH)
-                        $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі LIMS"
+                        # Без суфікса продукту в описі: проєкт моделі може бути
+                        # будь-яким (назва деривується з bravo.ini MODEL=), тож
+                        # операторський підстатус показує фактичне ім'я моделі.
+                        $exitCode = Invoke-CommandWithLog -Command $BRAVOCMD_PATH -Arguments $restoreArgs -Description "Виконання реставрації моделі ($MODEL_NAME)"
                         $restoreBravocmdExitCode = $exitCode
                     }
                 }
