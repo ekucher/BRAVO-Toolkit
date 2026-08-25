@@ -1278,6 +1278,13 @@ Host information is compact: `🖥️ SERVER · 10.10.150.102`. Public IP is sho
 only when lookup is enabled and a valid address is returned. Institution lines
 use `🏢`.
 
+Large diagnostic collections are summarized: the notification carries the
+total count, up to 5 representative examples and an `…і ще N` line; complete
+diagnostics remain in the local BRAVO-Toolkit log. A transport-agnostic safe
+payload limit truncates anomalously large messages (with an explicit suffix
+and the preserved log path) instead of splitting one event into a series of
+messages.
+
 Backup health terminology:
 
 - SUCCESS: `Остання резервна копія`.

@@ -2,6 +2,49 @@
 
 ## Не випущено (developer)
 
+- **UX (operator notifications): компактні Maintenance-алерти + глобальний
+  payload guard.** Реальний клас інциденту: сотні critical-файлів після
+  перевірки реставрації давали alert на 4×N рядків (341 файл ≈ 55 тис.
+  символів), який Discord дробив на серію повідомлень, а Slack (без
+  chunking взагалі) міг відхилити цілком — транспорт фактично працював
+  переглядачем журналу.
+  - Розділені представлення у трьох Maintenance-сайтах
+    (`Compare-FileSizes` critical-файли; пороги діапазонів ID; великі
+    `.md`): повна діагностика (4 рядки/файл, УСІ елементи) — як і раніше
+    лише у `BRAVO_MAINTENANCE_*.log`; операторський alert — загальна
+    кількість + до 5 прикладів (один файл = один короткий рядок; missing
+    і редукція розрізняються зі structured-полів: «файл відсутній (було
+    X)» / «X → Y (-Z%)») + «…і ще N» + вказівка на журнал. Семантика
+    виявлення/severity/rollback не змінена.
+  - Новий канонічний `Format-BRAVONotificationListSummary`
+    (`BRAVO.Notifications`): «Приклади: • … …і ще N файл(ів).»;
+    константа максимуму прикладів (5) — в одному місці; «…і ще 0»
+    структурно неможливе.
+  - Новий `Limit-BRAVONotificationPayload` + вбудова в
+    `ConvertTo-BRAVONotificationPayloadText`: транспорт-агностичний safe
+    limit 1800 символів (свідомо менший за фізичні ліміти
+    Discord-chunk 1900/Slack) — «одна подія → одне повідомлення» на обох
+    транспортах; обрізання по межі рядка, явний suffix «⚠️ Повідомлення
+    скорочено…», рядок журналу (`:memo:`/`📝`) зберігається після
+    suffix; факт truncation логуються Write-Warning з
+    Original/FinalLength (без секретів). Discord-split лишається
+    defense-in-depth під guard-лімітом; business-logic Maintenance
+    транспортних лімітів не знає.
+
+  Регресії (pre-fix RED продемонстровано: старий alert 341 файла =
+  55 308 символів): `Maintenance/CompactAlert341FilesOneNotificationFullLog`
+  (рівно 1 alert <1800, «…і ще 336 файлів.», повний список у лозі),
+  `CompactAlertThreeFilesShowsAllNoRemainder`,
+  `CompactAlertSixFilesShowsFivePlusRemainder`,
+  `CompactAlertDistinguishesMissingVsReduction`,
+  `CompactAlertHandlesUnicodeAndNestedPaths` (`#\`, кирилиця, пробіли);
+  `Notifications/ListSummaryCountsAndRemainder`,
+  `ListSummaryHandlesUnicodeAndPaths`,
+  `PayloadGuardTruncatesSlackToSingleMessage`,
+  `PayloadGuardYieldsSingleDiscordChunk`,
+  `PayloadGuardLeavesSmallMessagesUntouched`;
+  `DiscordChunkingStillWorks` збережено як defense-in-depth-юніт.
+
 ---
 
 ## 5.2.0-rc.10 — 2026-08-25 (candidate, pending acceptance)

@@ -1935,6 +1935,15 @@ Slack/Discord messages are first-response summaries:
   risk. Do not improvise around integrity failures; follow the relevant
   runbook section and inspect the referenced log.
 
+Large diagnostic collections (hundreds of affected files/ranges) are
+summarized in operator notifications: the message carries the total count,
+up to 5 representative examples and an `…і ще N` remainder line. Complete
+per-item diagnostics remain available only in the local BRAVO-Toolkit log.
+The notification layer additionally enforces a transport-agnostic safe
+payload limit: an anomalously large message is truncated at a line boundary
+with an explicit `⚠️ Повідомлення скорочено` suffix (the log-path line is
+preserved) instead of being split into a series of messages.
+
 The top of a warning/critical message contains the reason and action before
 server metadata. The log path at the bottom is the source for full technical
 evidence: long filenames, destination paths, thresholds and tool output remain
