@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0-rc.10 — 2026-08-25 (candidate, pending acceptance)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.9`
+(нижче; acceptance rc.9 не проводився — одразу замінено цим кандидатом)
++ ci-hardening промоції (PR #92) + актуалізація release-документації
+(PR #91). Acceptance rc.10 покриває всю нову поверхню rc.9/rc.10:
+повний maintenance-цикл (скан усіх `*.out`, exchangAPI-mdz,
+автостворення `logs/*`, WinSCP MoveFile-міграція `trace/`) +
+A2-encoding протокол (RELEASE_CHECKLIST §1.1).
+
 - **CI (release governance, підготовка до 5.2.0 stable): семантичний
   гейт версії промоції + виключення artifacts\ з генератора маніфесту.**
   - `ci/Test-BRAVOMasterMergePolicy.ps1`: нова
