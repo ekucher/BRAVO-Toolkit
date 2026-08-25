@@ -294,6 +294,50 @@
         -Name "ReleasePolicy/RejectsStaleChangelogAndHeaderOnPromotion" `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати promotion, якщо CHANGELOG.md і заголовки README.md/BRAVO_SETUP.md лишились зі старої prerelease-версії — X.Y.Z як підрядок X.Y.Z-dev.N не повинен рахуватись збігом; код виходу: $($releasePolicyProbeResults['StaleFromDev'])"
 
+    # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
+    # stable-версії, а не лише нерівність рядків (стара реалізація
+    # пропускала downgrade і prerelease). Реальна функція екстрагується з
+    # канонічного ci-скрипта — жодної другої копії правила.
+    $masterMergePolicyText = [IO.File]::ReadAllText(
+        (Join-Path $root "ci\Test-BRAVOMasterMergePolicy.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $stableVersionModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $masterMergePolicyText `
+        -FunctionNames @('Test-BRAVOStableVersionPromotion')
+    $stableVersionScenarios = @(
+        @{ Head = '5.2.0';      Master = '5.1.0';   ExpectFailures = 0; Label = 'GenuineIncrease' }
+        @{ Head = '5.10.0';     Master = '5.9.0';   ExpectFailures = 0; Label = 'SemanticNotLexical' }
+        @{ Head = '5.2.0';      Master = '';        ExpectFailures = 0; Label = 'NoMasterVersionYet' }
+        @{ Head = '5.2.0-rc.9'; Master = '5.1.0';   ExpectFailures = 1; Label = 'PrereleaseRejected' }
+        @{ Head = '5.1.0';      Master = '5.1.0';   ExpectFailures = 1; Label = 'SameVersionRejected' }
+        @{ Head = '5.0.9';      Master = '5.1.0';   ExpectFailures = 1; Label = 'DowngradeRejected' }
+        @{ Head = '5.2.0';      Master = 'garbage'; ExpectFailures = 1; Label = 'UnparsableMasterFailsClosed' }
+    )
+    foreach ($scenario in $stableVersionScenarios) {
+        $scenarioFailures = @(& $stableVersionModule {
+            param($HeadVersion, $MasterVersion)
+            Test-BRAVOStableVersionPromotion -HeadPackageVersion $HeadVersion -MasterPackageVersion $MasterVersion
+        } $scenario.Head $scenario.Master)
+        Test-BRAVOCondition `
+            -Condition (@($scenarioFailures).Count -eq [int]$scenario.ExpectFailures) `
+            -Name "ReleasePolicy/StableVersionPromotion[$($scenario.Label)]" `
+            -Failure "Test-BRAVOStableVersionPromotion('$($scenario.Head)' vs '$($scenario.Master)') має дати $($scenario.ExpectFailures) порушень; отримано $(@($scenarioFailures).Count): $($scenarioFailures -join ' | ')"
+    }
+
+    # Пастка циклу 5.2.0-rc: збірник артефакту навмисно лишає
+    # artifacts\release\staging (повну копію комплекту), і без виключення
+    # каталогу генератор маніфесту вносив staging-дублікати -> exit 33 на
+    # сервері. Виключення має лишатись у патерні назавжди.
+    $runtimeManifestGeneratorText = [IO.File]::ReadAllText(
+        (Join-Path $root "ci\Update-BRAVORuntimeManifest.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition ($runtimeManifestGeneratorText -match '\$excludedDirectoryPattern\s*=\s*''[^'']*\|artifacts\)') `
+        -Name "ReleasePolicy/RuntimeManifestGeneratorExcludesArtifacts" `
+        -Failure "ci\Update-BRAVORuntimeManifest.ps1 має виключати каталог artifacts\ з enumeration (staging збірки артефакту — повна копія комплекту, її потрапляння в маніфест ламає розгортання кодом 33)"
+
     # P2.7 аудиту: дрібні зауваження документації. Дерево каталогів мало
     # дублікат "BRAVO_*.ps1" двома окремими рядками; додано матрицю
     # діагностики за кодом завершення (розділ 12).

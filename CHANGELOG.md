@@ -2,6 +2,29 @@
 
 ## Не випущено (developer)
 
+- **CI (release governance, підготовка до 5.2.0 stable): семантичний
+  гейт версії промоції + виключення artifacts\ з генератора маніфесту.**
+  - `ci/Test-BRAVOMasterMergePolicy.ps1`: нова
+    `Test-BRAVOStableVersionPromotion` — PR у `master` приймається лише
+    зі STABLE-версією `X.Y.Z` (prerelease-суфікс = порушення) і лише
+    коли вона семантично БІЛЬША за поточну master-версію
+    (`[version]`-порівняння; стара перевірка «нерівність рядків»
+    пропускала downgrade і prerelease — ROADMAP P0.2). Нечитабельний
+    master-VERSION.json — fail-closed.
+  - `ci/Update-BRAVORuntimeManifest.ps1`: каталог `artifacts\` додано у
+    виключення enumeration. Збірник артефакту навмисно лишає
+    `artifacts\release\staging` (повну копію комплекту для self-test), і
+    `-Apply` після локальної збірки вносив у маніфест ~85 дублікатів
+    staging-файлів, яких немає на сервері → RUNTIME_GUARD exit 33
+    (двічі спіймано в циклі 5.2.0-rc — раніше рятувало лише ручне
+    видалення staging перед перерахунком).
+
+  Регресії: `ReleasePolicy/StableVersionPromotion[7 сценаріїв]`
+  (справжня функція з ci-скрипта через AST-екстракцію: genuine increase,
+  семантичне-не-лексичне 5.10>5.9, prerelease/same/downgrade/
+  unparsable-master — відхилені) і
+  `ReleasePolicy/RuntimeManifestGeneratorExcludesArtifacts`.
+
 ---
 
 ## 5.2.0-rc.9 — 2026-08-25 (candidate, pending acceptance)

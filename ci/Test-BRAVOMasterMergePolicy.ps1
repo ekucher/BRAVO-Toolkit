@@ -55,6 +55,45 @@ function Add-BRAVOMasterMergePolicyFailure {
     Write-Host "::error::$Message"
 }
 
+# Семантична перевірка версії для промоції в master (RELEASE_POLICY §2.2,
+# §3.3, §5.3): head мусить нести STABLE-версію X.Y.Z (без prerelease-
+# суфікса) і бути семантично БІЛЬШОЮ за поточну master-версію. Проста
+# нерівність рядків (попередня реалізація, ROADMAP P0.2) пропускала і
+# downgrade, і prerelease — саме той клас помилок, від якого гейт має
+# захищати промоційне вікно. Повертає перелік порушень (порожній = ОК).
+function Test-BRAVOStableVersionPromotion {
+    param(
+        [Parameter(Mandatory = $true)][string]$HeadPackageVersion,
+        [AllowNull()][AllowEmptyString()][string]$MasterPackageVersion
+    )
+
+    $versionFailures = New-Object System.Collections.ArrayList
+    if ($HeadPackageVersion -notmatch '^\d+\.\d+\.\d+$') {
+        [void]$versionFailures.Add(
+            "RELEASE_POLICY.md §2.2/§5.3: у master дозволені лише stable-версії X.Y.Z — packageVersion '$HeadPackageVersion' містить prerelease-суфікс або має невалідний формат."
+        )
+        return @($versionFailures.ToArray())
+    }
+    $headBaseVersion = [version]$HeadPackageVersion
+
+    if (-not [string]::IsNullOrWhiteSpace($MasterPackageVersion)) {
+        # master теоретично може містити лише stable, але порівнюємо базову
+        # частину захисно (історичні/аварійні стани не мають ламати парсер).
+        $masterBaseText = ([string]$MasterPackageVersion -split '-', 2)[0]
+        $masterBaseVersion = $null
+        if (-not [version]::TryParse($masterBaseText, [ref]$masterBaseVersion)) {
+            [void]$versionFailures.Add(
+                "не вдалося розпарсити packageVersion поточного master ('$MasterPackageVersion') для семантичного порівняння — перевірте VERSION.json у master вручну."
+            )
+        } elseif ($headBaseVersion -le $masterBaseVersion) {
+            [void]$versionFailures.Add(
+                "RELEASE_POLICY.md §2.2/§4: packageVersion head ('$HeadPackageVersion') семантично НЕ БІЛЬШИЙ за поточний master ('$MasterPackageVersion') — downgrade або повтор версії в master заборонені."
+            )
+        }
+    }
+    return @($versionFailures.ToArray())
+}
+
 $allowedHeadPattern = '^(developer|hotfix/.+)$'
 if ([string]::IsNullOrWhiteSpace($HeadRef) -or $HeadRef -notmatch $allowedHeadPattern) {
     Add-BRAVOMasterMergePolicyFailure "RELEASE_POLICY.md §2.2/§12: у master приймається код лише з 'developer' (stable promotion) або 'hotfix/*' (§12) — джерельна гілка '$HeadRef' не відповідає жодному з дозволених шляхів. Нову функціональність спершу розробіть і протестуйте в developer."
@@ -80,8 +119,10 @@ if ($headPackageVersion) {
         } catch {
             Add-BRAVOMasterMergePolicyFailure "не вдалося розпарсити VERSION.json з origin/master: $($_.Exception.Message)"
         }
-        if ($masterPackageVersion -and $headPackageVersion -eq $masterPackageVersion) {
-            Add-BRAVOMasterMergePolicyFailure "RELEASE_POLICY.md §2.2/§12.1: packageVersion ('$headPackageVersion') не відрізняється від поточного master — злиття функціонального коду в master без підняття версії заборонено."
+        foreach ($versionFailure in @(Test-BRAVOStableVersionPromotion `
+                -HeadPackageVersion $headPackageVersion `
+                -MasterPackageVersion $masterPackageVersion)) {
+            Add-BRAVOMasterMergePolicyFailure $versionFailure
         }
     }
 }
