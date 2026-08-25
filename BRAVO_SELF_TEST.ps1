@@ -6237,6 +6237,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 -FunctionNames @(
                     'Read-BRAVORestoreState',
                     'Get-BRAVORestoreForcedCoveredSlot',
+                    'Test-BRAVORestoreWeeklyQuotaConsumed',
                     'Write-BRAVORestoreForcedOutcome',
                     'Get-BRAVORestoreLastSuccessfulAt',
                     'Write-BRAVORestoreState'
@@ -6372,6 +6373,29 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             if (Test-Path -LiteralPath $restoreQuotaStateRoot) {
                 Remove-Item -LiteralPath $restoreQuotaStateRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
+        }
+
+        # --- Семантика квоти (регресія інциденту 2026-08-26: -ForceRestore
+        # увечері + звичайний прогін того ж вечора = ПОДВІЙНА реставрація):
+        # покритий слот закриває СОБОЮ і всі попередні (<=), включно з
+        # «пропущеним» МИНУЛИМ слотом, який примусова свідомо не закриває
+        # маркером; наступний слот (+7 днів) строго більший — квота
+        # знімається вчасно.
+        $quotaConsumedScenarios = @(
+            @{ Covered = [datetime]'2026-08-30 03:00:00'; Scheduled = [datetime]'2026-08-23 03:00:00'; Expected = $true;  Label = 'MissedPastSlotCovered(incident)' }
+            @{ Covered = [datetime]'2026-08-30 03:00:00'; Scheduled = [datetime]'2026-08-30 03:00:00'; Expected = $true;  Label = 'CoveredSlotItself' }
+            @{ Covered = [datetime]'2026-08-30 03:00:00'; Scheduled = [datetime]'2026-09-06 03:00:00'; Expected = $false; Label = 'NextWeekSlotNotCovered' }
+            @{ Covered = $null;                            Scheduled = [datetime]'2026-08-23 03:00:00'; Expected = $false; Label = 'LegacyStateWithoutQuota' }
+        )
+        foreach ($quotaScenario in $quotaConsumedScenarios) {
+            $quotaConsumedActual = & $restoreQuotaModule {
+                param($covered, $scheduled)
+                Test-BRAVORestoreWeeklyQuotaConsumed -ForcedCoveredSlot $covered -ScheduledOccurrence $scheduled
+            } $quotaScenario.Covered $quotaScenario.Scheduled
+            Test-BRAVOCondition `
+                -Condition ([bool]$quotaConsumedActual -eq [bool]$quotaScenario.Expected) `
+                -Name "Maintenance/WeeklyQuotaConsumed[$($quotaScenario.Label)]" `
+                -Failure "Test-BRAVORestoreWeeklyQuotaConsumed(covered=$($quotaScenario.Covered), scheduled=$($quotaScenario.Scheduled)) має дати $($quotaScenario.Expected); отримано $quotaConsumedActual — строга рівність замість <= відтворює подвійну реставрацію forced+normal в один вечір"
         }
 
         # --- Гейт стоїть на $automaticRestoreDue (а не всередині
