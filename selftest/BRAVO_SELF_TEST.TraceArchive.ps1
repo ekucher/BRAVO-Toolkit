@@ -64,6 +64,7 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             "Update-BRAVOTraceDailyArchive",
             "Send-BRAVOTraceArchiveFile",
             "Send-BRAVOTraceArchive",
+            "Invoke-BRAVOTraceRemoteLogMigration",
             "Invoke-BRAVOTraceArchiveMaintenance"
         )
 
@@ -382,6 +383,90 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             (Test-Path -LiteralPath $taOrchDeferredFile) -and
             (Test-Path -LiteralPath (Join-Path $taOrchDeferred 'Trace_20260817.mdz'))
         ) -Name 'TraceArchive/OrchestratorWithoutSessionDefersUploadKeepsSources' -Failure "без SFTP-сесії: архів оновлюється локально, передача відкладена, .out збережені"
+
+        # ===== Узагальнений backlog: довільні basename (усі *.out) =====
+        $taGenericBacklogDir = Join-Path $traceArchiveTestRoot "backlog-generic\Trace"
+        [void](New-Item -ItemType Directory -Path $taGenericBacklogDir -Force)
+        [IO.File]::WriteAllText((Join-Path $taGenericBacklogDir '!traceBIS_20260819_151200.out'), 'bang bis')
+        [IO.File]::WriteAllText((Join-Path $taGenericBacklogDir 'TraceSRV2_20260819_152000.out'), 'srv2')
+        [IO.File]::WriteAllText((Join-Path $taGenericBacklogDir 'TraceSRV_1.out'), 'legacy seq — не матчиться')
+        $taGenericBacklog = & $traceArchiveModule { param($d) Get-BRAVOTraceArchiveBacklog -TraceDirectory $d } $taGenericBacklogDir
+        Test-BRAVOCondition -Condition (
+            @($taGenericBacklog).Count -eq 1 -and
+            [string]$taGenericBacklog[0].DateKey -eq '20260819' -and
+            [string]$taGenericBacklog[0].ArchiveName -eq 'Trace_20260819.mdz' -and
+            @($taGenericBacklog[0].Files).Count -eq 2
+        ) -Name 'TraceArchive/BacklogAcceptsArbitraryRotatedBasenames' -Failure "узагальнений патерн має захопити !traceBIS_/TraceSRV2_-ротовані файли (2 шт., одна дата) і далі ігнорувати legacy TraceSRV_1.out; отримано груп: $(@($taGenericBacklog).Count)"
+
+        # ===== Backlog ByLastWriteTime (exchangAPI: оригінальні імена) =====
+        $taExchangeBacklogDir = Join-Path $traceArchiveTestRoot "backlog-exchange\exchangAPI"
+        [void](New-Item -ItemType Directory -Path $taExchangeBacklogDir -Force)
+        [IO.File]::WriteAllText((Join-Path $taExchangeBacklogDir 'exchangAPI_2026-08-19_030001.log'), 'day one')
+        (Get-Item -LiteralPath (Join-Path $taExchangeBacklogDir 'exchangAPI_2026-08-19_030001.log')).LastWriteTime = [datetime]'2026-08-19 03:00:01'
+        [IO.File]::WriteAllText((Join-Path $taExchangeBacklogDir 'exchangAPI_2026-08-20_030002.log'), 'day two')
+        (Get-Item -LiteralPath (Join-Path $taExchangeBacklogDir 'exchangAPI_2026-08-20_030002.log')).LastWriteTime = [datetime]'2026-08-20 03:00:02'
+        [IO.File]::WriteAllText((Join-Path $taExchangeBacklogDir 'exchangAPI_20260818.mdz'), 'decoy archive')
+        $taExchangeBacklog = & $traceArchiveModule { param($d) Get-BRAVOTraceArchiveBacklog -TraceDirectory $d -ArchiveNamePrefix 'exchangAPI' -GroupBy 'ByLastWriteTime' -FileFilter '*.log' } $taExchangeBacklogDir
+        Test-BRAVOCondition -Condition (
+            @($taExchangeBacklog).Count -eq 2 -and
+            [string]$taExchangeBacklog[0].ArchiveName -eq 'exchangAPI_20260819.mdz' -and
+            [string]$taExchangeBacklog[1].ArchiveName -eq 'exchangAPI_20260820.mdz' -and
+            @($taExchangeBacklog[0].Files).Count -eq 1 -and
+            [string]$taExchangeBacklog[0].Files[0].Name -eq 'exchangAPI_2026-08-19_030001.log'
+        ) -Name 'TraceArchive/BacklogGroupsExchangeLogsByLastWriteDate' -Failure "ByLastWriteTime + '*.log' має дати 2 групи (за датою файла, oldest->newest) з архівами exchangAPI_YYYYMMDD.mdz і не захопити .mdz-decoy; отримано груп: $(@($taExchangeBacklog).Count)"
+
+        # ===== e2e exchangAPI: движок пакує оригінальні імена, вантажить у
+        # logs/exchangapi і видаляє джерела після верифікації =====
+        $taExchangeSession = New-BRAVOSelfTestFakeBazaSession
+        $taExchangeResult = & $traceArchiveModule { param($d, $z, $ap, $p, $s, $rd) Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 -Session $s -RemoteDirectory $rd -ComponentLabel 'exchangAPI' -ArchiveNamePrefix 'exchangAPI' -BacklogGroupBy 'ByLastWriteTime' -BacklogFileFilter '*.log' } $taExchangeBacklogDir $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taExchangeSession 'logs/exchangapi'
+        Test-BRAVOCondition -Condition (
+            [int]$taExchangeResult.DatesProcessed -eq 2 -and
+            [int]$taExchangeResult.ArchivesUpdated -eq 2 -and
+            [int]$taExchangeResult.Uploaded -eq 2 -and
+            [int]$taExchangeResult.Errors -eq 0 -and
+            (Test-Path -LiteralPath (Join-Path $taExchangeBacklogDir 'exchangAPI_20260819.mdz')) -and
+            (Test-Path -LiteralPath (Join-Path $taExchangeBacklogDir 'exchangAPI_20260820.mdz.sha512')) -and
+            -not (Test-Path -LiteralPath (Join-Path $taExchangeBacklogDir 'exchangAPI_2026-08-19_030001.log')) -and
+            $taExchangeSession.State.RemoteSizes.ContainsKey('/logs/exchangapi/exchangAPI_20260819.mdz') -and
+            $taExchangeSession.State.RemoteSizes.ContainsKey('/logs/exchangapi/exchangAPI_20260820.mdz')
+        ) -Name 'TraceArchive/ExchangeApiDailyArchivePipelineEndToEnd' -Failure "exchangAPI-конвеєр: 2 добові архіви створені, передані в /logs/exchangapi, джерельні .log видалені після верифікації; факт: dates=$($taExchangeResult.DatesProcessed) updated=$($taExchangeResult.ArchivesUpdated) uploaded=$($taExchangeResult.Uploaded) errors=$($taExchangeResult.Errors)"
+
+        # ===== Міграція /trace -> /logs/trace: успіх + конфлікт + порожній =====
+        $taMigrationSession = New-BRAVOSelfTestFakeBazaSession
+        [void]$taMigrationSession.State.KnownRemoteDirs.Add('/trace')
+        $taMigrationSession.State.RemoteSizes['/trace/Trace_20260810.mdz'] = [int64]111
+        $taMigrationSession.State.RemoteSizes['/trace/Trace_20260810.mdz.sha512'] = [int64]148
+        $taMigrationSession.State.RemoteSizes['/trace/unrelated.txt'] = [int64]5
+        $taMigrationResult = & $traceArchiveModule { param($s) Invoke-BRAVOTraceRemoteLogMigration -Session $s -LegacyDirectory 'trace' -TargetDirectory 'logs/trace' } $taMigrationSession
+        Test-BRAVOCondition -Condition (
+            [int]$taMigrationResult.Attempted -eq 2 -and
+            [int]$taMigrationResult.Moved -eq 2 -and
+            [int]$taMigrationResult.Errors -eq 0 -and
+            $taMigrationSession.State.RemoteSizes.ContainsKey('/logs/trace/Trace_20260810.mdz') -and
+            $taMigrationSession.State.RemoteSizes.ContainsKey('/logs/trace/Trace_20260810.mdz.sha512') -and
+            -not $taMigrationSession.State.RemoteSizes.ContainsKey('/trace/Trace_20260810.mdz') -and
+            $taMigrationSession.State.RemoteSizes.ContainsKey('/trace/unrelated.txt')
+        ) -Name 'TraceArchive/RemoteMigrationMovesArchivesWithVerify' -Failure "міграція має перенести .mdz+.sha512 (2 файли) у /logs/trace з верифікацією, не чіпаючи сторонній unrelated.txt; факт: attempted=$($taMigrationResult.Attempted) moved=$($taMigrationResult.Moved) errors=$($taMigrationResult.Errors)"
+
+        $taMigrationConflictSession = New-BRAVOSelfTestFakeBazaSession
+        [void]$taMigrationConflictSession.State.KnownRemoteDirs.Add('/trace')
+        $taMigrationConflictSession.State.RemoteSizes['/trace/Trace_20260811.mdz'] = [int64]222
+        $taMigrationConflictSession.State.RemoteSizes['/logs/trace/Trace_20260811.mdz'] = [int64]333
+        $taMigrationConflictResult = & $traceArchiveModule { param($s) Invoke-BRAVOTraceRemoteLogMigration -Session $s -LegacyDirectory 'trace' -TargetDirectory 'logs/trace' } $taMigrationConflictSession
+        Test-BRAVOCondition -Condition (
+            [int]$taMigrationConflictResult.Conflicts -eq 1 -and
+            [int]$taMigrationConflictResult.Errors -eq 1 -and
+            [int]$taMigrationConflictResult.Moved -eq 0 -and
+            [int64]$taMigrationConflictSession.State.RemoteSizes['/logs/trace/Trace_20260811.mdz'] -eq 333 -and
+            $taMigrationConflictSession.State.RemoteSizes.ContainsKey('/trace/Trace_20260811.mdz')
+        ) -Name 'TraceArchive/RemoteMigrationConflictFailsClosed' -Failure "конфлікт імені в цілі: ERROR без перезапису, legacy-файл на місці; факт: conflicts=$($taMigrationConflictResult.Conflicts) errors=$($taMigrationConflictResult.Errors) moved=$($taMigrationConflictResult.Moved)"
+
+        $taMigrationEmptySession = New-BRAVOSelfTestFakeBazaSession
+        $taMigrationEmptyResult = & $traceArchiveModule { param($s) Invoke-BRAVOTraceRemoteLogMigration -Session $s -LegacyDirectory 'trace' -TargetDirectory 'logs/trace' } $taMigrationEmptySession
+        Test-BRAVOCondition -Condition (
+            [int]$taMigrationEmptyResult.Attempted -eq 0 -and
+            [int]$taMigrationEmptyResult.Errors -eq 0
+        ) -Name 'TraceArchive/RemoteMigrationNoLegacyDirectoryIsNoop' -Failure "відсутній legacy-каталог /trace = no-op без помилок; факт: attempted=$($taMigrationEmptyResult.Attempted) errors=$($taMigrationEmptyResult.Errors)"
 
         # ===== Статичні гейти: dry-run PLAN-рядки + єдина реалізація =====
         $taDryRunText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)

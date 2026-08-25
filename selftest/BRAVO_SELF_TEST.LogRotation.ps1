@@ -54,6 +54,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             "New-BRAVOLogRotationItem",
             "Invoke-BRAVOLogRotation",
             "Invoke-BRAVOTraceRotation",
+            "Get-BRAVOInstallationTraceOutSources",
             "Invoke-BRAVOExchangeApiLogRotation",
             "Invoke-BRAVOApacheLogRotation",
             "Invoke-BRAVOWebApplicationLogRotation",
@@ -565,6 +566,113 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             -Name "LogRotation/09b-UnavailableSrvDoesNotBlockBis" `
             -Failure "ненаналаштований/невалідний SRV не має блокувати ротацію BIS: TraceBIS_<ts>.out мусить з'явитися без помилок"
 
+        # --- Test 9c: скан усіх *.out кореня інсталяції (нова модель) ---
+        # Реальний лістинг сервера: TraceSRV.out, traceBIS.out, !TraceSRV.out,
+        # TraceSRV2.out, traceBIS1.out — усе має стати джерелами; не-.out не
+        # захоплюється; SRV-шлях з bravo.ini, що збігається з файлом кореня
+        # ІНШИМ регістром, дедуплікується (OrdinalIgnoreCase — той самий
+        # клас, що інцидент Compare-FileSizes).
+        $test9cRoot = Join-Path $rotationTestRoot "test9c\install"
+        foreach ($outName in @('TraceSRV.out', 'traceBIS.out', '!TraceSRV.out', 'TraceSRV2.out', 'traceBIS1.out')) {
+            [void](New-BRAVOLogRotationFixture -Directory $test9cRoot -Name $outName -Content "data")
+        }
+        [void](New-BRAVOLogRotationFixture -Directory $test9cRoot -Name 'decoy.log' -Content "not-out")
+        $test9cEnumeration = Invoke-BRAVORotationHelper -Body {
+            param($Root)
+            Get-BRAVOInstallationTraceOutSources `
+                -InstallationRoot $Root `
+                -LimsRoot 'C:\Unused' `
+                -SrvTracePath (Join-Path $Root.ToLowerInvariant() 'TRACESRV.OUT') `
+                -ExplicitBisPath ''
+        } -Arguments @($test9cRoot)
+        $test9cNames = @($test9cEnumeration.Sources | ForEach-Object { $_.Name })
+        Test-BRAVOCondition `
+            -Condition (
+                @($test9cEnumeration.Sources).Count -eq 5 -and
+                ($test9cNames -contains '!TraceSRV') -and
+                ($test9cNames -contains 'TraceSRV2') -and
+                ($test9cNames -contains 'traceBIS1') -and
+                -not ($test9cNames -contains 'decoy')
+            ) `
+            -Name "LogRotation/09c-AllOutFilesEnumeratedFromInstallationRoot" `
+            -Failure "скан кореня має дати 5 *.out-джерел (включно з !TraceSRV/TraceSRV2/traceBIS1), без не-.out і без дубліката SRV з іншим регістром; отримано: $($test9cNames -join ', ')"
+
+        # --- Test 9d: фолбек LIMSRoot + додаткове BIS-джерело поза коренем;
+        # 'off' не дає додаткового джерела; колізія basename -> суфікс _2 ---
+        $test9dLims = Join-Path $rotationTestRoot "test9d\lims"
+        [void](New-BRAVOLogRotationFixture -Directory $test9dLims -Name 'TraceSRV.out' -Content "srv")
+        $test9dExternal = Join-Path $rotationTestRoot "test9d\external"
+        $test9dExternalBis = New-BRAVOLogRotationFixture -Directory $test9dExternal -Name 'TraceSRV.out' -Content "external-with-same-basename"
+        $test9dEnumeration = Invoke-BRAVORotationHelper -Body {
+            param($Lims, $ExternalBis)
+            Get-BRAVOInstallationTraceOutSources `
+                -InstallationRoot '' `
+                -LimsRoot $Lims `
+                -SrvTracePath '' `
+                -ExplicitBisPath $ExternalBis
+        } -Arguments @($test9dLims, $test9dExternalBis)
+        $test9dOffEnumeration = Invoke-BRAVORotationHelper -Body {
+            param($Lims)
+            Get-BRAVOInstallationTraceOutSources `
+                -InstallationRoot '' `
+                -LimsRoot $Lims `
+                -SrvTracePath '' `
+                -ExplicitBisPath 'off'
+        } -Arguments @($test9dLims)
+        $test9dNames = @($test9dEnumeration.Sources | ForEach-Object { $_.Name })
+        Test-BRAVOCondition `
+            -Condition (
+                @($test9dEnumeration.Sources).Count -eq 2 -and
+                ($test9dNames -contains 'TraceSRV') -and
+                ($test9dNames -contains 'TraceSRV_2') -and
+                [string]$test9dEnumeration.ScanRoot -eq $test9dLims -and
+                @($test9dOffEnumeration.Sources).Count -eq 1
+            ) `
+            -Name "LogRotation/09d-FallbackLimsRootAndBasenameCollisionSuffix" `
+            -Failure "фолбек LIMSRoot має сканувати LIMS-корінь; зовнішнє BIS-джерело з тим самим basename отримує ім'я TraceSRV_2; 'off' не додає джерела; отримано: $($test9dNames -join ', '); off-джерел: $(@($test9dOffEnumeration.Sources).Count)"
+
+        # --- Test 9e: NamingPolicy 'Original' — ім'я зберігається як є;
+        # колізія в цілі -> ERROR, джерело лишається на місці ---
+        $test9eSource = Join-Path $rotationTestRoot "test9e\src"
+        $test9eDestination = Join-Path $rotationTestRoot "test9e\dst"
+        [void](New-BRAVOLogRotationFixture -Directory $test9eSource -Name 'exchangAPI_2026-08-25_222302.log' -Content "payload-one")
+        $rotationLogMessages.Clear()
+        $test9eSummary = Invoke-BRAVORotationHelper -Body {
+            param($SourcePath, $Destination, $Logger)
+            Invoke-BRAVOLogRotation `
+                -ComponentName 'exchangAPI' `
+                -Items @((New-BRAVOLogRotationItem -Path $SourcePath)) `
+                -DestinationRoot $Destination `
+                -NamingPolicy 'Original' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @((Join-Path $test9eSource 'exchangAPI_2026-08-25_222302.log'), $test9eDestination, $rotationLogger)
+        $test9eCollisionSource = New-BRAVOLogRotationFixture -Directory $test9eSource -Name 'exchangAPI_2026-08-25_222302.log' -Content "payload-two-different"
+        $test9eCollisionSummary = Invoke-BRAVORotationHelper -Body {
+            param($SourcePath, $Destination, $Logger)
+            Invoke-BRAVOLogRotation `
+                -ComponentName 'exchangAPI' `
+                -Items @((New-BRAVOLogRotationItem -Path $SourcePath)) `
+                -DestinationRoot $Destination `
+                -NamingPolicy 'Original' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test9eCollisionSource, $test9eDestination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test9eSummary.Moved -eq 1 -and
+                (Test-Path -LiteralPath (Join-Path $test9eDestination 'exchangAPI_2026-08-25_222302.log')) -and
+                -not (Test-Path -LiteralPath (Join-Path $test9eDestination 'exchangAPI_2026-08-25_222302_1.log')) -and
+                [int]$test9eCollisionSummary.Errors -eq 1 -and
+                [int]$test9eCollisionSummary.Moved -eq 0 -and
+                (Test-Path -LiteralPath $test9eCollisionSource) -and
+                (Get-Content -LiteralPath (Join-Path $test9eDestination 'exchangAPI_2026-08-25_222302.log') -Raw) -eq 'payload-one'
+            ) `
+            -Name "LogRotation/09e-OriginalNamingPolicyKeepsNameAndFailsClosedOnCollision" `
+            -Failure "Original-політика має зберегти ім'я без суфіксів; колізія = ERROR, джерело на місці, ціль не перезаписана; отримано Moved=$($test9eSummary.Moved), collision Errors=$($test9eCollisionSummary.Errors), Moved=$($test9eCollisionSummary.Moved)"
+
         # --- Test 10: обидва шаблони exchangAPI + дедуплікація за FullName ---
         $test10Source = Join-Path $rotationTestRoot "test10\src"
         foreach ($sourceName in @("exchangAPI.log", "exchangAPI_1.log", "exchangAPI_2.log")) {
@@ -600,12 +708,13 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         } -Arguments @($test11Source, $test11Destination, $rotationLogger))
         Test-BRAVOCondition `
             -Condition (
-                (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_10.log")) -and
-                -not (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_25.log")) -and
-                -not (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_25_1.log"))
+                (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_25.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_10.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_25_1.log")) -and
+                (Test-Path -LiteralPath (Join-Path $test11Destination "exchangAPI_9.log"))
             ) `
-            -Name "LogRotation/11-ExchangeApiSourceSequenceIgnored" `
-            -Failure "exchangAPI_25.log має стати exchangAPI_10.log (MAX+1 у призначенні), а не зберегти власний номер чи стати exchangAPI_25_1.log"
+            -Name "LogRotation/11-ExchangeApiOriginalNamePreserved" `
+            -Failure "нова модель: exchangAPI_25.log має зберегти ОРИГІНАЛЬНЕ ім'я (без перенумерації MAX+1 і без суфіксів), наявні файли призначення недоторкані"
 
         # --- Test 12: кілька файлів exchangAPI у стабільному порядку ---
         $test12Source = Join-Path $rotationTestRoot "test12\src"
@@ -627,13 +736,15 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         } -Arguments @($test12Source, $test12Destination, $rotationLogger)
         Test-BRAVOCondition `
             -Condition (
-                [int]$test12Summary.Moved -eq 3 -and
-                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_6.log")) -eq "first" -and
-                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_7.log")) -eq "second" -and
-                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_8.log")) -eq "third"
+                [int]$test12Summary.Moved -eq 2 -and
+                [int]$test12Summary.Errors -eq 1 -and
+                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI.log")) -eq "first" -and
+                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_error.log")) -eq "third" -and
+                [IO.File]::ReadAllText((Join-Path $test12Source "exchangAPI_1.log")) -eq "second" -and
+                [IO.File]::ReadAllText((Join-Path $test12Destination "exchangAPI_1.log")) -ne "second"
             ) `
-            -Name "LogRotation/12-ExchangeApiStableSourceOrder" `
-            -Failure "три файли exchangAPI мають отримати _6/_7/_8 у стабільному порядку (LastWriteTime ASC, потім Name ASC)"
+            -Name "LogRotation/12-ExchangeApiOriginalNamesWithCollisionFailClosed" `
+            -Failure "нова модель: exchangAPI.log/exchangAPI_error.log переміщуються з оригінальними іменами; exchangAPI_1.log конфліктує з наявним у призначенні -> ERROR, джерело на місці, ціль не перезаписана; отримано Moved=$($test12Summary.Moved), Errors=$($test12Summary.Errors)"
 
         # --- Test 13: Apache бере лише журнали й не заходить у підкаталоги ---
         $test13Source = Join-Path $rotationTestRoot "test13\src"
@@ -850,7 +961,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         Test-BRAVOCondition `
             -Condition (
                 @($rotationLogMessages | Where-Object {
-                    $_ -eq "[SUCCESS] Переміщено exchangAPI_2.log -> exchangAPI_6.log"
+                    $_ -eq "[SUCCESS] Переміщено exchangAPI_2.log -> exchangAPI_2.log"
                 }).Count -eq 1 -and
                 @($rotationLogMessages | Where-Object {
                     $_ -eq "[SUCCESS] Переміщено API\request.log -> API\request_1.log"

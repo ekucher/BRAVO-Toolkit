@@ -1582,11 +1582,32 @@ try {
         # використовує КАНОНІЧНУ Get-BRAVOTraceArchiveBacklog з
         # Maintenance.Runtime через AST-екстракцію (та сама техніка, що
         # self-test) — жодної другої копії патерну імен.
-        $dryRunTraceBisSource = [string]$maintenanceSettings.Trace.BISSourcePath
+        $dryRunTraceBisSource = ([string]$maintenanceSettings.Trace.BISSourcePath).Trim()
+        $dryRunTraceScanRoot = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BRAVO_ROOT)) {
+            "$([string]$bravoDiscoveryResult.BRAVO_ROOT) (корінь інсталяції bravo.exe, Discovery)"
+        } else {
+            "<LIMSRoot> (фолбек: каталог інсталяції bravo.exe невизначений)"
+        }
+        $dryRunTraceBisPlanText = if ([string]::IsNullOrWhiteSpace($dryRunTraceBisSource) -or
+            [string]::Equals($dryRunTraceBisSource, 'off', [System.StringComparison]::OrdinalIgnoreCase)) {
+            "додаткового немає (корінь покривається скануванням)"
+        } else {
+            "додаткове джерело $dryRunTraceBisSource"
+        }
         Add-DryRunResult PLAN "Maintenance" "Trace джерела" (
-            "SRV: bravo.ini [Debug] FILE (Discovery); " +
-            "BIS: $(if ([string]::IsNullOrWhiteSpace($dryRunTraceBisSource)) { 'не налаштовано (maintenanceSettings.Trace.BISSourcePath)' } else { $dryRunTraceBisSource }); " +
-            "would rotate -> Trace\<Назва>_<yyyyMMdd_HHmmss>.out (лише при зупинених службах); нічого не переміщувалося"
+            "УСІ *.out зі скану $dryRunTraceScanRoot + SRV з bravo.ini [Debug] FILE (якщо поза коренем); " +
+            "BIS: $dryRunTraceBisPlanText; " +
+            "would rotate -> Trace\<basename>_<yyyyMMdd_HHmmss>.out (лише при зупинених службах); нічого не переміщувалося"
+        )
+        Add-DryRunResult PLAN "Maintenance" "exchangAPI логи" (
+            "оригінальні імена БЕЗ перейменувань -> LOGS\exchangAPI (плоско); " +
+            "would archive добовий exchangAPI_YYYYMMDD.mdz (група за LastWriteTime) " +
+            "-> SFTP $([string]$sftpDirectories.ExchangeApiLogs); джерела видаляються лише після повної верифікації"
+        )
+        Add-DryRunResult PLAN "Maintenance" "SFTP структура логів" (
+            "Trace-архіви -> $([string]$sftpDirectories.TraceLogs); " +
+            "would migrate наявні архіви з $([string]$sftpDirectories.Trace) -> $([string]$sftpDirectories.TraceLogs) " +
+            "(remote-move з верифікацією, одноразово/idempotent); нічого не переносилося"
         )
         if (-not [string]::IsNullOrWhiteSpace($dryRunSystemLogRoot)) {
             try {

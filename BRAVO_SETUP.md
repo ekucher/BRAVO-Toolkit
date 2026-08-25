@@ -109,15 +109,24 @@ retention нового запуску шукають уже новий преф�
 для поточного користувача та `SYSTEM`, значення не запитуються і не
 перезаписуються. Якщо компонент відсутній, запитується лише він.
 
-### Trace-модель 5.2.0: що налаштувати
+### Trace-модель: що налаштувати
 
-- `maintenanceSettings.Trace.BISSourcePath` у `BRAVO.config` — абсолютний шлях
-  до `TraceBIS.out`, якщо на сервері використовується друге trace-джерело
-  (порожньо = BIS вимкнено; SRV резолвиться автоматично з
-  `bravo.ini [Debug] FILE`, у config не дублюється).
-- `sftpDirectories.Trace` (типово `"trace"`) — каталог добових
-  `Trace_YYYYMMDD.mdz` + `.sha512` на SFTP. **Каталог треба попередньо
-  створити на SFTP-сервері**, як і решту каталогів із цього блоку.
+- Джерела trace налаштовувати НЕ потрібно: ротується кожен `*.out` з кореня
+  інсталяції bravo.exe (Discovery), включно з варіантами на кшталт
+  `TraceSRV2.out`/`traceBIS1.out`/`!TraceSRV.out`.
+  `maintenanceSettings.Trace.BISSourcePath` потрібен лише якщо `TraceBIS.out`
+  лежить ПОЗА коренем інсталяції (абсолютний шлях; порожньо/`'off'` — нічого
+  додаткового).
+- `sftpDirectories.TraceLogs` (типово `"logs/trace"`) і
+  `sftpDirectories.ExchangeApiLogs` (типово `"logs/exchangapi"`) — каталоги
+  добових `Trace_YYYYMMDD.mdz` / `exchangAPI_YYYYMMDD.mdz` + `.sha512` на
+  SFTP. Відсутні remote-каталоги створюються автоматично (рекурсивно); у
+  облікового запису SFTP мають бути права запису й квота. Наявні архіви зі
+  старого `sftpDirectories.Trace` (`trace/`) Maintenance одноразово мігрує
+  remote-move'ом у `logs/trace` — нічого не видаляється.
+- Логи exchangAPI зберігають оригінальні імена (без `exchangAPI_N.log`),
+  пакуються в добовий `exchangAPI_YYYYMMDD.mdz` і видаляються локально лише
+  після повної SFTP-верифікації.
 - `maintenanceSettings.Retention.CompressedLogDeletionEnabled` — типово
   `$false`: стиснуті `.mdz` журналів (включно з добовими Trace-архівами)
   ніколи не видаляються автоматично; вмикайте свідомо разом із
@@ -137,7 +146,14 @@ retention нового запуску шукають уже новий преф�
   README розділ 3.3);
 - `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` — за
   відсутності діє `0` (авто-архівування мутацій вимкнено; поведінка
-  reconcile не змінюється, `OPERATIONS.md`).
+  reconcile не змінюється, `OPERATIONS.md`);
+- `sftpDirectories.TraceLogs` / `sftpDirectories.ExchangeApiLogs` — за
+  відсутності діють `"logs/trace"` / `"logs/exchangapi"` (нова структура
+  журнальних архівів на SFTP; старий `Trace = "trace"` лишається джерелом
+  одноразової автоміграції);
+- `maintenanceSettings.Trace.BISSourcePath` — тепер опційний і на типових
+  інсталяціях непотрібний (усі `*.out` кореня інсталяції скануються
+  автоматично); значення `'off'` теж валідне.
 
 ## Спочатку лише перевірка
 
