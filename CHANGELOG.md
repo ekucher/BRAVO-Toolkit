@@ -2,6 +2,97 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0-rc.5 — 2026-08-25 (candidate, acceptance passed)
+
+Кандидат = `5.2.0-rc.4` (нижче) + три cherry-picked фікси з локальної гілки
+`developer`, перевірені на відсутність дублювання з уже прийнятими
+origin-змінами. Acceptance пройдено на двох реальних серверах:
+`SERV_HRDL_1` (ХЕРСОНСЬКА РДЛ, rc.4) і `WIN-44OBNQ3R3OB` (МИКОЛАЇВСЬКА
+РДЛ, rc.5) — повний `BRAVO_SELF_TEST.ps1` PASSED, `BRAVO_DRY_RUN.ps1
+-TestAccess` без жодного FAIL, `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly`
+успішний.
+
+- **UX/DIAGNOSTICS: діагностичне збагачення помилки завантаження
+  `BRAVO.config`.** На реальному DEV-майданчику (2026-08-24, Windows NT
+  6.2.9200 / PowerShell 3.0 — `Get-BRAVOOSSupportTier` класифікує
+  PowerShell <4.0 як `Unsupported` незалежно від ОС) виконання
+  `BRAVO.config` під час `Import-BravoConfiguration` завершувалось голою
+  `.NET NullReferenceException` ("Ссылка на объект не указывает на
+  экземпляр объекта") без жодного натяку на причину — блокувало
+  `BRAVO_SETUP.ps1`, `BRAVO_SELF_TEST.ps1` і `BRAVO_DRY_RUN.ps1`
+  однаково (усі entrypoint-и зрештою проходять через ту саму спільну
+  точку завантаження конфігурації). `Get-BRAVOOSSupportTier`
+  (`BRAVO.Compatibility`) — уже канонічне джерело цієї класифікації
+  (використовують `Maintenance`/`Health`/`Archive`), але викликається
+  лише ПІСЛЯ успішного завантаження конфігурації — тобто жодного шансу
+  спрацювати раніше за цей крах не було. `Import-BravoConfiguration`
+  тепер, лише в catch-блоці навколо виконання `BRAVO.config`, викликає
+  той самий канонічний `Get-BRAVOOSSupportTier` і за наявності
+  непідтримуваного середовища додає його `.Message` до кинутої помилки —
+  оригінальна причина ніколи не губиться, і збагачення саме не може
+  замаскувати первинну помилку новою (мовчазний fallback, якщо модуль
+  `BRAVO.Compatibility` теж недоступний). На `Supported`-середовищах
+  повідомлення не змінюється. Backport сумісності з PowerShell 3.0 НЕ
+  виконано (нижче задокументованого baseline 5.1) — рекомендація й далі
+  «оновіть Windows Management Framework».
+
+- **FIX (data-integrity discovery): службу BRAVO з DisplayName="BRAVO
+  Server" не визнавали канонічною.** Реальний DEV-майданчик
+  (2026-08-24): служба Windows `BRAVO` встановлена й запущена
+  (`Get-Service BRAVO` -> `Running`), але `Import-BravoConfiguration`
+  усе одно падав на "Не вдалося визначити BackupRoot: ... вимагає
+  визначеного EffectiveLIMSRoot". Причина — `DisplayName` реальної
+  служби виявився `"BRAVO Server"`, тоді як Discovery (навмисний
+  строгий захист від хибного співставлення із чужим сервісом: Name ТА
+  DisplayName одночасно) очікував рівно `"BRAVO Service"`. Обидва
+  написання — реальні варіанти інсталяторів BRAVO/LIMS, не помилка
+  цього конкретного сервера. `Resolve-BRAVOEffectiveLimsRoot` і
+  `Resolve-BRAVOInstallationDiscovery` тепер приймають `-BravoDisplayName`
+  як масив (дефолт `@("BRAVO Service", "BRAVO Server")`) — точний збіг
+  з БУДЬ-ЯКИМ значенням зі списку, а не одне жорстко задане значення.
+  Це НЕ послаблення identity-перевірки: збіг і далі точний
+  (case-insensitive `-eq`, не substring/regex/wildcard), просто список
+  канонічних варіантів написання розширено з одного до двох.
+  `maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config` —
+  тепер `@("BRAVO Service", "BRAVO Server")`; якщо на вашому сервері
+  DisplayName служби інший за обидва — додайте третім елементом
+  (перевірте `Get-Service BRAVO | Select DisplayName`), не замінюйте
+  список. Новий self-test:
+  `Discovery/BravoServerDisplayNameAcceptedAsCanonical` і
+  `Paths/01b-AutoLimsRootFromServiceBravoServerDisplayName`.
+
+- **FIX: `BRAVO_DRY_RUN.ps1` падав удруге, ховаючи первинну причину.**
+  Реальний DEV-майданчик (2026-08-24): після коректно спійманої "Не
+  вдалося завантажити BRAVO.config" (єдиний try/catch dry-run, вище)
+  `Write-DryRunOutput` мала намалювати звичайний `[FAIL] Dry-run/
+  Фатальна помилка` — але замість цього процес падав із `Переменная
+  "$global:ScriptVersion" не может быть получена, так как она не
+  установлена` (`VariableIsUndefined`), ховаючи вже сформований,
+  зрозумілий діагноз за новою незрозумілою помилкою.
+  `BRAVO_CONFIG_LOADER.ps1` (dot-sourced) вмикає `Set-StrictMode
+  -Version 2.0` у ТОМУ Ж scope (dot-source зливає scope викликача) —
+  якщо `Import-BravoConfiguration` провалюється ДО рядка, що створює
+  `$global:ScriptVersion`, змінна не існує взагалі (не `$null`), і
+  `if ($global:ScriptVersion)` під strict mode кидає
+  `VariableIsUndefined` навіть у такому "безпечному" контексті. Сусідній
+  рядок для `$bravoSettings` уже коректно захищений через `Get-Variable
+  -ErrorAction SilentlyContinue` — `$global:ScriptVersion` використовував
+  інший, вразливий патерн. Виправлено тим самим захищеним патерном.
+  Новий self-test `ConfigLoader/DryRunFailsClosedOnConfigLoadFailure` +
+  `ConfigLoader/DryRunDoesNotCrashOnUnsetScriptVersion` — реальний
+  дочірній процес `BRAVO_DRY_RUN.ps1` із синтетично провальним
+  `BRAVO.config`.
+
+- FIX (ci): `ci\Test-BRAVOForbiddenPattern.ps1` не мав у allowlist
+  `BRAVO_SELF_TEST.ConfigLoader.ps1` для навмисного ізольованого
+  дочірнього `powershell.exe -ExecutionPolicy Bypass` (той самий патерн,
+  що вже allowlisted для `Governance.ps1`/`ManualLaunchers.ps1`) —
+  виявлено CI на PR #83, не при первинному локальному коміті фіксу.
+
+## 5.2.0-rc.4 — 2026-08-24 (candidate, acceptance passed)
+
 - FIX (реліз-автоматизація): `release-artifact` workflow створював чернетку
   релізу для dev/RC **без прапорця `--prerelease`**
   (`.github/workflows/release-artifact.yml`, крок «Прикріплення до GitHub
@@ -30,6 +121,26 @@
   Self-тест `Release/ArtifactWorkflowMarksPrerelease` — перший у репозиторії
   тест на вміст workflow; він фіксує і прапорець, і порядок кроків.
   Перевірено регресійно: на коді до фіксу падає.
+
+- **TESTING: `ManualLaunchers/*` self-test падав на кириличних Windows-
+  установках.** Реальний DEV-майданчик (2026-08-24, обліковий запис
+  "Администратор") показав `[FAIL] Manual launcher не підтримує не-ASCII
+  шлях: ...\AppData\Local\Temp\...` — фікстура будувала свій тимчасовий
+  корінь через `[IO.Path]::GetTempPath()` (`%TEMP%`), який на
+  локалізованих Windows-установках наслідує кириличне імʼя профілю
+  користувача. `New-BRAVOManualLauncherContent` (`BRAVO_SETUP.ps1`)
+  навмисно й коректно відхиляє не-ASCII шляхи (відомі проблеми
+  кодування `cmd.exe` для `.cmd`-launcher-ів) — сама production-логіка
+  тут без дефекту, проблема лише в тому, що self-test-фікстура
+  успадковувала не-ASCII базовий шлях НЕ навмисно, ламаючи навіть
+  сценарії, які не мають нічого спільного з ASCII-перевіркою. Виправлено:
+  фікстура тепер визначає, чи `%TEMP%` не-ASCII, і в такому разі
+  використовує `%SystemRoot%\Temp` (не залежить від локалізованого
+  імені користувача) — той самий явний, навмисний non-ASCII-сценарій
+  (`ManualLaunchers/NonAsciiEmbeddedPathFailsClosed`) і далі перевіряє
+  реальне відхилення, лише тепер від контрольованого ASCII-базису.
+  Впливає лише на self-test; жодної зміни production-коду чи політики
+  ASCII-перевірки launcher-ів.
 
 ---
 

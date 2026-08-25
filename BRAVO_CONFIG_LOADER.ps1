@@ -458,7 +458,36 @@ function Import-BravoConfiguration {
         & $legacyConfigScript -ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot
     }
     catch {
-        throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message)"
+        # Реальний DEV-майданчик (2026-08-24, Windows NT 6.2.9200 / PowerShell
+        # 3.0 — Get-BRAVOOSSupportTier класифікує PowerShell <4.0 як
+        # "Unsupported" незалежно від ОС): помилка виконання BRAVO.config тут
+        # спливала як гола .NET NullReferenceException ("Ссылка на объект не
+        # указывает на экземпляр объекта") без жодного натяку на причину.
+        # Get-BRAVOOSSupportTier (BRAVO.Compatibility) — уже канонічне,
+        # протестоване джерело цієї класифікації (використовують Maintenance/
+        # Health/Archive), але викликається лише ПІСЛЯ успішного завантаження
+        # конфігурації — на ~6000 рядків пізніше в Maintenance — тому жодного
+        # шансу спрацювати раніше за цей крах немає. Збагачуємо повідомлення
+        # тим самим канонічним висновком тут, а не дублюємо порогове значення
+        # версії окремим magic-number: якщо саме збагачення з якоїсь причини
+        # не вдається (напр. модуль Compatibility теж не вантажиться на цій
+        # системі), мовчазний fallback — оригінальна помилка не повинна
+        # загубитися за новою, ще заплутанішою.
+        $unsupportedEnvironmentHint = ""
+        try {
+            $compatibilityModulePath = Join-Path $resolvedRuntimeRoot 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1'
+            if (Test-Path -LiteralPath $compatibilityModulePath -PathType Leaf) {
+                Import-Module -Name $compatibilityModulePath -ErrorAction Stop
+                $osSupportTier = Get-BRAVOOSSupportTier
+                if ($osSupportTier.Tier -ne 'Supported') {
+                    $unsupportedEnvironmentHint = " $($osSupportTier.Message)"
+                }
+            }
+        } catch {
+            # Див. коментар вище — діагностичне збагачення не повинне саме
+            # кидати нову помилку поверх оригінальної.
+        }
+        throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message).$unsupportedEnvironmentHint"
     }
 
     Assert-BravoLoadedConfiguration
