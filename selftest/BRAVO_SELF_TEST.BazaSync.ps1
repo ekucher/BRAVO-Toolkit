@@ -102,6 +102,35 @@
                     $this.State.RemoteSizes.Remove($sourcePath)
                 }
             }
+            $session | Add-Member -MemberType ScriptMethod -Name ListDirectory -Value {
+                param($path)
+                # Спрощена модель WinSCP Session.ListDirectory: безпосередні
+                # діти каталогу з RemoteSizes/KnownRemoteDirs. Використовується
+                # міграцією журнальних архівів (TraceArchive-фрагмент).
+                $normalized = ([string]$path).TrimEnd('/')
+                $files = New-Object System.Collections.Generic.List[object]
+                foreach ($remotePath in @($this.State.RemoteSizes.Keys)) {
+                    if ($remotePath -notlike "$normalized/*") { continue }
+                    $childRelative = $remotePath.Substring($normalized.Length + 1)
+                    if ($childRelative.Contains('/')) { continue }
+                    [void]$files.Add([pscustomobject]@{
+                        Name = $childRelative
+                        IsDirectory = $false
+                        Length = [int64]$this.State.RemoteSizes[$remotePath]
+                    })
+                }
+                foreach ($knownDir in @($this.State.KnownRemoteDirs)) {
+                    if ($knownDir -notlike "$normalized/*") { continue }
+                    $childRelative = $knownDir.Substring($normalized.Length + 1)
+                    if ($childRelative.Contains('/')) { continue }
+                    [void]$files.Add([pscustomobject]@{
+                        Name = $childRelative
+                        IsDirectory = $true
+                        Length = [int64]0
+                    })
+                }
+                return [pscustomobject]@{ Files = @($files.ToArray()) }
+            }
             $session | Add-Member -MemberType ScriptMethod -Name RemoveFiles -Value {
                 param($path)
                 [void]$this.State.RemoveFilesCalls.Add($path)

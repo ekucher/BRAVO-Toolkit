@@ -467,7 +467,11 @@ if (-not [string]::IsNullOrWhiteSpace($script:ArchivePassword)) {
 $traceArchiveAddParams = @('a') + @($arcCommonParams | Where-Object {
     $_ -ne 'a' -and $_ -ne '-r' -and $_ -ne '-aoa' -and $_ -notmatch '^(?i)-mhe'
 })
-$traceSftpRemoteDirectory = [string]$sftpDirectories.Trace
+# Модель logs/: нові добові архіви йдуть у logs/trace та logs/exchangapi;
+# legacy-каталог trace лишається лише джерелом одноразової автоміграції.
+$traceSftpRemoteDirectory = [string]$sftpDirectories.TraceLogs
+$traceLegacySftpRemoteDirectory = [string]$sftpDirectories.Trace
+$exchangeApiSftpRemoteDirectory = [string]$sftpDirectories.ExchangeApiLogs
 $MoveRetryCount = if ($MaintenanceConfig.FileOperations -and
     $null -ne $MaintenanceConfig.FileOperations.MoveRetryCount) {
     [math]::Max(1, [int]$MaintenanceConfig.FileOperations.MoveRetryCount)
@@ -2648,7 +2652,7 @@ function Move-BRAVOLogWithSequence {
         # 'Timestamp' — Trace-модель 5.2.0: <Base>_<yyyyMMdd_HHmmss><Ext>;
         # колізія імені розв'язується наступною вільною секундою (без
         # -Force, без суфіксів _1/_copy).
-        [ValidateSet('Sequence', 'Timestamp')][string]$NamingPolicy = 'Sequence',
+        [ValidateSet('Sequence', 'Timestamp', 'Original')][string]$NamingPolicy = 'Sequence',
         # Лише для NamingPolicy='Timestamp': момент, з якого формується
         # ім'я. Типово — LastWriteTime джерела («дата даних»: ротований
         # уночі вчорашній trace потрапляє у вчорашній добовий архів, бо
@@ -2745,7 +2749,23 @@ function Move-BRAVOLogWithSequence {
         } else {
             $null
         }
-        for ($nameAttempt = 1; $nameAttempt -le 100; $nameAttempt++) {
+        if ($NamingPolicy -eq 'Original') {
+            # Контракт оператора (exchangAPI): ім'я джерела зберігається ЯК Є,
+            # без нумерації і timestamp-суфіксів. Колізія з наявним файлом
+            # призначення — ПОМИЛКА (джерело лишається на місці, нічого не
+            # перезаписується і не перейменовується) — fail-closed, бо
+            # однакове ім'я з різним вмістом означало б втрату журналу.
+            $candidateOriginalPath = Join-Path -Path $DestinationDirectory -ChildPath $sourceName
+            if (Test-Path -LiteralPath $candidateOriginalPath) {
+                $collisionError = "у каталозі призначення вже існує файл з ім'ям $sourceName — оригінальне ім'я зберегти неможливо, джерело залишено на місці"
+                Write-BRAVOLogRotationMessage -Logger $Logger -Message "ПОМИЛКА: $collisionError" -Level "ERROR"
+                return (& $buildResult 'ERROR' $sourceName $candidateOriginalPath $originalLength $null $null $collisionError)
+            }
+            $destinationName = $sourceName
+            $destinationPath = $candidateOriginalPath
+            $destinationSequence = $null
+        }
+        for ($nameAttempt = 1; ($nameAttempt -le 100) -and ($null -eq $destinationPath); $nameAttempt++) {
             if ($NamingPolicy -eq 'Timestamp') {
                 # Колізія (два джерела з тим самим LastWriteTime, повторна
                 # ротація в ту саму секунду) — наступна вільна секунда в
@@ -3005,6 +3025,7 @@ function Invoke-BRAVOLogRotation {
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$Items,
         [Parameter(Mandatory = $true)][string]$DestinationRoot,
         [string]$LogicalBaseName,
+        [ValidateSet('Sequence', 'Timestamp', 'Original')][string]$NamingPolicy = 'Sequence',
         [int]$RetryCount = 3,
         [int]$RetryDelaySeconds = 5,
         [AllowNull()][scriptblock]$Logger
@@ -3038,6 +3059,7 @@ function Invoke-BRAVOLogRotation {
             -SourcePath ([string]$item.Path) `
             -DestinationDirectory $destinationDirectory `
             -LogicalBaseName $LogicalBaseName `
+            -NamingPolicy $NamingPolicy `
             -RelativeDirectory $relativeDirectory `
             -RetryCount $RetryCount `
             -RetryDelaySeconds $RetryDelaySeconds `
@@ -3063,11 +3085,12 @@ function Invoke-BRAVOLogRotation {
 }
 
 function Invoke-BRAVOTraceRotation {
-    # BRAVO Trace 5.2.0 — ДВА логічні джерела (SRV з bravo.ini [Debug] FILE
-    # через Discovery; BIS з явного maintenanceSettings.Trace.BISSourcePath).
-    # Імена призначення — Timestamp-політика (<Name>_<yyyyMMdd_HHmmss>.out,
-    # ПЛОСКО у Trace\, без каталогів-дат) — далі дата добового
-    # Trace_YYYYMMDD.mdz визначається саме з імені ротованого файла.
+    # BRAVO Trace — довільний перелік *.out-джерел
+    # (Get-BRAVOInstallationTraceOutSources: скан кореня інсталяції +
+    # SRV/BIS поза коренем). Імена призначення — Timestamp-політика
+    # (<Name>_<yyyyMMdd_HHmmss>.out, ПЛОСКО у Trace\, без каталогів-дат) —
+    # далі дата добового Trace_YYYYMMDD.mdz визначається саме з імені
+    # ротованого файла.
     # Ані ненаналаштоване, ані відсутнє, ані порожнє джерело не є помилкою
     # обслуговування, і жодне з них не блокує ротацію другого джерела:
     # BRAVO міг просто не писати trace від минулого запуску.
@@ -3170,11 +3193,15 @@ function Invoke-BRAVOExchangeApiLogRotation {
         -Logger $Logger `
         -Message "exchangAPI: унікальних файлів знайдено: $($sourceFiles.Count)" `
         -Level "INFO"
+    # Контракт оператора: імена exchangAPI-логів зберігаються ЯК Є
+    # (NamingPolicy 'Original', без exchangAPI_N.log), плоско в каталозі
+    # призначення — далі добовий exchangAPI_YYYYMMDD.mdz групує їх за
+    # LastWriteTime і після SFTP-верифікації джерела видаляються.
     return (Invoke-BRAVOLogRotation `
         -ComponentName 'exchangAPI' `
         -Items @($sourceFiles | ForEach-Object { New-BRAVOLogRotationItem -Path $_.FullName }) `
         -DestinationRoot $DestinationDirectory `
-        -LogicalBaseName $LogicalBaseName `
+        -NamingPolicy 'Original' `
         -RetryCount $RetryCount `
         -RetryDelaySeconds $RetryDelaySeconds `
         -Logger $Logger)
@@ -3282,6 +3309,79 @@ function Get-BRAVOTraceConfiguration {
     }
 }
 
+# Перелік trace-джерел (*.out) для ротації. За фактичною розкладкою
+# інсталяцій bravo.exe пише .out-файли (TraceSRV.out, traceBIS.out і їхні
+# варіанти на кшталт TraceSRV2.out, traceBIS1.out, !TraceSRV.out) у корінь
+# інсталяції — тому скануються ВСІ *.out цього каталогу (нерекурсивно),
+# а не два фіксовані імені. Додатково включаються, якщо лежать ПОЗА
+# коренем: SRV-шлях з bravo.ini [Debug] FILE і явний
+# maintenanceSettings.Trace.BISSourcePath (порожньо/'off' — нічого
+# додаткового: корінь і так покривається скануванням). Ім'я джерела =
+# basename без розширення (ротація дасть <basename>_<ts>.out).
+function Get-BRAVOInstallationTraceOutSources {
+    [CmdletBinding()]
+    param(
+        [AllowNull()][AllowEmptyString()][string]$InstallationRoot,
+        [AllowNull()][AllowEmptyString()][string]$LimsRoot,
+        [AllowNull()][AllowEmptyString()][string]$SrvTracePath,
+        [AllowNull()][AllowEmptyString()][string]$ExplicitBisPath
+    )
+
+    $scanRoot = ''
+    $scanRootReason = ''
+    if (-not [string]::IsNullOrWhiteSpace($InstallationRoot)) {
+        $scanRoot = $InstallationRoot
+        $scanRootReason = 'корінь інсталяції bravo.exe (Discovery)'
+    } elseif (-not [string]::IsNullOrWhiteSpace($LimsRoot)) {
+        $scanRoot = $LimsRoot
+        $scanRootReason = 'фолбек LIMSRoot: каталог інсталяції bravo.exe невизначений'
+    } else {
+        $scanRootReason = 'скан неможливий: невизначені і каталог інсталяції bravo.exe, і LIMSRoot'
+    }
+
+    $sources = New-Object System.Collections.Generic.List[object]
+    $seenPaths = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+    $seenNames = New-Object System.Collections.Generic.HashSet[string] ([System.StringComparer]::OrdinalIgnoreCase)
+
+    $addSource = {
+        param([string]$FullPath)
+        if ([string]::IsNullOrWhiteSpace($FullPath)) { return }
+        if (-not $seenPaths.Add($FullPath)) { return }
+        $baseName = [System.IO.Path]::GetFileNameWithoutExtension($FullPath)
+        if ([string]::IsNullOrWhiteSpace($baseName)) { return }
+        # Колізія логічних імен (однаковий basename з різних каталогів) —
+        # унікалізуємо суфіксом, щоб ротовані <Name>_<ts>.out не змішувались.
+        $candidateName = $baseName
+        $suffix = 2
+        while (-not $seenNames.Add($candidateName)) {
+            $candidateName = "${baseName}_$suffix"
+            $suffix++
+        }
+        [void]$sources.Add([pscustomobject]@{ Name = $candidateName; Path = $FullPath })
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($scanRoot) -and
+        (Test-Path -LiteralPath $scanRoot -PathType Container)) {
+        foreach ($outFile in @(Get-BRAVOFiles -LiteralPath $scanRoot -Filter '*.out' |
+                Sort-Object -Property Name)) {
+            & $addSource ([string]$outFile.FullName)
+        }
+    }
+
+    foreach ($extraPath in @($SrvTracePath, $ExplicitBisPath)) {
+        if ([string]::IsNullOrWhiteSpace($extraPath)) { continue }
+        $trimmedExtra = $extraPath.Trim()
+        if ([string]::Equals($trimmedExtra, 'off', [System.StringComparison]::OrdinalIgnoreCase)) { continue }
+        & $addSource $trimmedExtra
+    }
+
+    return [pscustomobject]@{
+        ScanRoot = $scanRoot
+        ScanRootReason = $scanRootReason
+        Sources = @($sources.ToArray())
+    }
+}
+
 # ===== ДОБОВИЙ TRACE-АРХІВ (Trace_YYYYMMDD.mdz), МОДЕЛЬ 5.2.0 =====
 # Ротовані timestamp-файли (TraceSRV_/TraceBIS_<yyyyMMdd>_<HHmmss>.out)
 # пакуються в ОДИН накопичувальний архів на календарну дату в тому самому
@@ -3294,24 +3394,44 @@ function Get-BRAVOTraceConfiguration {
 
 function Get-BRAVOTraceArchiveBacklog {
     # Скан УСІХ дат (backlog після минулих збоїв, не лише сьогодні),
-    # oldest -> newest. Плоский перелік Trace\ без рекурсії: legacy
-    # (TraceSRV_1.out, каталоги-дати, Trace_YYYY-MM-DD.mdz) патерном не
-    # матчиться і не чіпається.
+    # oldest -> newest. Плоский перелік каталогу без рекурсії.
+    # Два режими групування:
+    #   ByName (Trace) — дата з timestamp-імені ротованого файла
+    #     (<basename>_<yyyyMMdd>_<HHmmss>.out, basename довільний: скан
+    #     усіх *.out кореня інсталяції дає й TraceSRV2, !traceBIS тощо);
+    #     legacy (TraceSRV_1.out, каталоги-дати, Trace_YYYY-MM-DD.mdz)
+    #     патерном не матчиться і не чіпається.
+    #   ByLastWriteTime (exchangAPI) — файли зберігають ОРИГІНАЛЬНІ імена
+    #     (контракт оператора: без перейменувань), тому дата групи
+    #     береться з LastWriteTime файла.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$TraceDirectory)
+    param(
+        [Parameter(Mandatory = $true)][string]$TraceDirectory,
+        [string]$FileNamePattern = '^(.+)_(\d{8})_(\d{6})\.out$',
+        [string]$ArchiveNamePrefix = 'Trace',
+        [ValidateSet('ByName', 'ByLastWriteTime')][string]$GroupBy = 'ByName',
+        [string]$FileFilter = '*.out'
+    )
 
     $groups = @{}
     if (-not (Test-Path -LiteralPath $TraceDirectory -PathType Container)) {
         return @()
     }
-    foreach ($file in @(Get-BRAVOFiles -Path $TraceDirectory)) {
-        if ($file.Name -notmatch '^(TraceSRV|TraceBIS)_(\d{8})_(\d{6})\.out$') { continue }
-        $dateKey = $matches[2]
-        $parsedDate = [datetime]::MinValue
-        if (-not [datetime]::TryParseExact($dateKey, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
-            # Ім'я схоже на нове, але дата неможлива — не створювати
-            # сміттєвий Trace_99999999.mdz; файл лишається оператору.
-            continue
+    foreach ($file in @(Get-BRAVOFiles -Path $TraceDirectory -Filter $FileFilter)) {
+        $dateKey = $null
+        if ($GroupBy -eq 'ByName') {
+            if ($file.Name -notmatch $FileNamePattern) { continue }
+            $dateKey = $matches[2]
+            $parsedDate = [datetime]::MinValue
+            if (-not [datetime]::TryParseExact($dateKey, 'yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::None, [ref]$parsedDate)) {
+                # Ім'я схоже на нове, але дата неможлива — не створювати
+                # сміттєвий <Prefix>_99999999.mdz; файл лишається оператору.
+                continue
+            }
+        } else {
+            # ByLastWriteTime: артефакти самого конвеєра (<Prefix>_*.mdz,
+            # sidecar, .work) відфільтровує $FileFilter викликача.
+            $dateKey = $file.LastWriteTime.ToString('yyyyMMdd', [Globalization.CultureInfo]::InvariantCulture)
         }
         if (-not $groups.ContainsKey($dateKey)) {
             $groups[$dateKey] = New-Object System.Collections.Generic.List[object]
@@ -3321,7 +3441,7 @@ function Get-BRAVOTraceArchiveBacklog {
 
     $result = @()
     foreach ($dateKey in @($groups.Keys | Sort-Object)) {
-        $archiveName = "Trace_${dateKey}.mdz"
+        $archiveName = "${ArchiveNamePrefix}_${dateKey}.mdz"
         $archivePath = Join-Path $TraceDirectory $archiveName
         $result += [pscustomobject]@{
             DateKey = $dateKey
@@ -3656,7 +3776,7 @@ function Update-BRAVOTraceDailyArchive {
         $addExitCode = Invoke-CommandWithLog `
             -Command $SevenZipPath `
             -Arguments $addArguments `
-            -Description "Trace: додавання $(@($Plan.NewFiles).Count) файл(ів) до $($BacklogGroup.ArchiveName)" `
+            -Description "Додавання $(@($Plan.NewFiles).Count) файл(ів) до $($BacklogGroup.ArchiveName)" `
             -TimeoutSeconds $CommandTimeoutSeconds `
             -StandardInputText $ArchivePassword
         if ($addExitCode -ne 0) {
@@ -3855,6 +3975,93 @@ function Send-BRAVOTraceArchive {
     }
 }
 
+# Одноразова (idempotent) автоміграція журнальних архівів на SFTP зі
+# старого плаского каталогу (типово trace/) у нову структуру logs/
+# (типово logs/trace/). Лише remote-move з верифікацією, БЕЗ видалень:
+# файл або доведено з'явився в цілі і зник із джерела, або лишається в
+# legacy до наступного прогону. Конфлікт імені в цілі — ERROR, нічого не
+# перезаписується. Помилки видимі, але не блокують подальші передачі.
+function Invoke-BRAVOTraceRemoteLogMigration {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string]$LegacyDirectory,
+        [Parameter(Mandatory = $true)][string]$TargetDirectory,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    $result = [pscustomobject]@{
+        Attempted = 0
+        Moved = 0
+        Conflicts = 0
+        Errors = 0
+    }
+
+    $legacyNormalized = ([string]$LegacyDirectory).Trim().Trim('/').Replace('\', '/')
+    $targetNormalized = ([string]$TargetDirectory).Trim().Trim('/').Replace('\', '/')
+    if ([string]::IsNullOrWhiteSpace($legacyNormalized) -or
+        [string]::IsNullOrWhiteSpace($targetNormalized) -or
+        [string]::Equals($legacyNormalized, $targetNormalized, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $result
+    }
+    $legacyRoot = "/$legacyNormalized"
+    $targetRoot = "/$targetNormalized"
+
+    try {
+        if (-not $Session.FileExists($legacyRoot)) {
+            return $result
+        }
+        $legacyListing = $Session.ListDirectory($legacyRoot)
+        $legacyArchiveFiles = @($legacyListing.Files | Where-Object {
+            -not $_.IsDirectory -and $_.Name -match '\.mdz(\.sha512)?$'
+        })
+        if (@($legacyArchiveFiles).Count -eq 0) {
+            return $result
+        }
+
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Міграція SFTP: $legacyRoot -> $targetRoot — файлів до перенесення: $(@($legacyArchiveFiles).Count)" -Level "INFO"
+        New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $targetNormalized
+
+        foreach ($legacyFile in $legacyArchiveFiles) {
+            $result.Attempted++
+            $sourcePath = "$legacyRoot/$($legacyFile.Name)"
+            $targetPath = "$targetRoot/$($legacyFile.Name)"
+            try {
+                if ($Session.FileExists($targetPath)) {
+                    $result.Conflicts++
+                    $result.Errors++
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "ПОМИЛКА: міграція SFTP — у $targetRoot вже існує $($legacyFile.Name); файл залишено в $legacyRoot (нічого не перезаписано)" -Level "ERROR"
+                    continue
+                }
+                $Session.MoveFile($sourcePath, $targetPath)
+                if ($Session.FileExists($targetPath) -and -not $Session.FileExists($sourcePath)) {
+                    $result.Moved++
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "Міграція SFTP: $($legacyFile.Name) -> $targetRoot" -Level "SUCCESS"
+                } else {
+                    $result.Errors++
+                    Write-BRAVOLogRotationMessage -Logger $Logger `
+                        -Message "ПОМИЛКА: міграція SFTP — стан $($legacyFile.Name) після MoveFile не підтверджено (ціль: $($Session.FileExists($targetPath)); джерело зникло: $(-not $Session.FileExists($sourcePath)))" -Level "ERROR"
+                }
+            } catch {
+                $result.Errors++
+                Write-BRAVOLogRotationMessage -Logger $Logger `
+                    -Message "ПОМИЛКА: міграція SFTP $($legacyFile.Name): $($_.Exception.Message) — файл залишено в $legacyRoot" -Level "ERROR"
+            }
+        }
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "Міграція SFTP завершена: перенесено $($result.Moved) з $($result.Attempted); помилок: $($result.Errors)" `
+            -Level $(if ([int]$result.Errors -gt 0) { 'WARNING' } else { 'SUCCESS' })
+    } catch {
+        $result.Errors++
+        Write-BRAVOLogRotationMessage -Logger $Logger `
+            -Message "ПОМИЛКА: міграція SFTP $legacyRoot -> $targetRoot не виконана: $($_.Exception.Message)" -Level "ERROR"
+    }
+    return $result
+}
+
 function Invoke-BRAVOTraceArchiveMaintenance {
     # Оркестратор фази «добовий Trace-архів»: backlog (усі дати,
     # oldest->newest) -> per-date план -> транзакційний update -> SFTP ->
@@ -3878,6 +4085,12 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         [int]$IntegrityTimeoutSeconds = 43200,
         [AllowNull()]$Session,
         [string]$RemoteDirectory,
+        # Той самий движок обслуговує і Trace (*.out, дата з timestamp-імені),
+        # і exchangAPI (*.log з оригінальними іменами, дата з LastWriteTime).
+        [string]$ComponentLabel = 'Trace',
+        [string]$ArchiveNamePrefix = 'Trace',
+        [ValidateSet('ByName', 'ByLastWriteTime')][string]$BacklogGroupBy = 'ByName',
+        [string]$BacklogFileFilter = '*.out',
         [AllowNull()][scriptblock]$Logger
     )
 
@@ -3893,17 +4106,21 @@ function Invoke-BRAVOTraceArchiveMaintenance {
 
     [void](Clear-BRAVOTraceOrphanWorkArtifacts -TraceDirectory $TraceDirectory -Logger $Logger)
 
-    $backlog = @(Get-BRAVOTraceArchiveBacklog -TraceDirectory $TraceDirectory)
+    $backlog = @(Get-BRAVOTraceArchiveBacklog `
+        -TraceDirectory $TraceDirectory `
+        -ArchiveNamePrefix $ArchiveNamePrefix `
+        -GroupBy $BacklogGroupBy `
+        -FileFilter $BacklogFileFilter)
     if (@($backlog).Count -eq 0) {
         Write-BRAVOLogRotationMessage -Logger $Logger `
-            -Message "Trace: ротованих файлів для добової архівації немає" -Level "INFO"
+            -Message "${ComponentLabel}: ротованих файлів для добової архівації немає" -Level "INFO"
         return $result
     }
 
     foreach ($group in $backlog) {
         $result.DatesProcessed++
         Write-BRAVOLogRotationMessage -Logger $Logger `
-            -Message "Trace: дата $($group.DateKey) — файлів у черзі: $(@($group.Files).Count); архів: $($group.ArchiveName)" -Level "INFO"
+            -Message "${ComponentLabel}: дата $($group.DateKey) — файлів у черзі: $(@($group.Files).Count); архів: $($group.ArchiveName)" -Level "INFO"
 
         $plan = Get-BRAVOTraceArchiveUpdatePlan `
             -BacklogGroup $group `
@@ -3920,12 +4137,12 @@ function Invoke-BRAVOTraceArchiveMaintenance {
             $result.Errors++
             foreach ($conflict in @($plan.ConflictFiles)) {
                 Write-BRAVOLogRotationMessage -Logger $Logger `
-                    -Message "ПОМИЛКА: Trace-конфлікт $($conflict.File.Name): $($conflict.Reason) — archived entry і локальний файл недоторкані" -Level "ERROR"
+                    -Message "ПОМИЛКА: $ComponentLabel-конфлікт $($conflict.File.Name): $($conflict.Reason) — archived entry і локальний файл недоторкані" -Level "ERROR"
             }
             continue
         }
         Write-BRAVOLogRotationMessage -Logger $Logger `
-            -Message "Trace: вже в архіві: $(@($plan.ExistingEntries).Count); нових: $(@($plan.NewFiles).Count); пропущено вже наявних: $(@($plan.DuplicateFiles).Count)" -Level "INFO"
+            -Message "${ComponentLabel}: вже в архіві: $(@($plan.ExistingEntries).Count); нових: $(@($plan.NewFiles).Count); пропущено вже наявних: $(@($plan.DuplicateFiles).Count)" -Level "INFO"
 
         $update = Update-BRAVOTraceDailyArchive `
             -BacklogGroup $group `
@@ -3947,7 +4164,7 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         if ($null -eq $Session) {
             $result.UploadsDeferred++
             Write-BRAVOLogRotationMessage -Logger $Logger `
-                -Message "Trace: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні .out збережено для наступного прогону" -Level "WARNING"
+                -Message "${ComponentLabel}: SFTP-сесія недоступна — передачу $($group.ArchiveName) відкладено; джерельні файли збережено для наступного прогону" -Level "WARNING"
             continue
         }
 
@@ -3960,7 +4177,7 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         if (-not $send.Success) {
             $result.Errors++
             Write-BRAVOLogRotationMessage -Logger $Logger `
-                -Message "ПОМИЛКА: SFTP-передача $($group.ArchiveName) не вдалася: $($send.Error) — локальний архів і джерельні .out збережено, повтор наступним прогоном" -Level "ERROR"
+                -Message "ПОМИЛКА: SFTP-передача $($group.ArchiveName) не вдалася: $($send.Error) — локальний архів і джерельні файли збережено, повтор наступним прогоном" -Level "ERROR"
             continue
         }
         $result.Uploaded++
@@ -3975,7 +4192,7 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         if (-not $publishedInventory.Success) {
             $result.Errors++
             Write-BRAVOLogRotationMessage -Logger $Logger `
-                -Message "ПОМИЛКА: контрольний inventory $($group.ArchiveName) перед очищенням джерел не вдався: $($publishedInventory.Error) — .out збережено" -Level "ERROR"
+                -Message "ПОМИЛКА: контрольний inventory $($group.ArchiveName) перед очищенням джерел не вдався: $($publishedInventory.Error) — джерельні файли збережено" -Level "ERROR"
             continue
         }
         $publishedNames = @{}
@@ -3999,7 +4216,7 @@ function Invoke-BRAVOTraceArchiveMaintenance {
             }
         }
         Write-BRAVOLogRotationMessage -Logger $Logger `
-            -Message "Trace: дата $($group.DateKey) завершена — видалено переданих .out: $($result.SourcesDeleted); локальний MDZ: ЗАЛИШЕНО" -Level "SUCCESS"
+            -Message "${ComponentLabel}: дата $($group.DateKey) завершена — видалено переданих джерел: $($result.SourcesDeleted); локальний MDZ: ЗАЛИШЕНО" -Level "SUCCESS"
     }
 
     return $result
@@ -5935,8 +6152,8 @@ $MODEL_PROJECT_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscov
     "$ROOT_LIMS\MODEL\lims"
 }
 # bravocmd.exe стоїть поруч із bravo.exe (BRAVO_ROOT), не обов'язково в
-# LIMSRoot. Discovery сам деградує BRAVO_ROOT до LIMSRoot, коли служби
-# BRAVO не знайдено — той самий фолбек, що й був тут раніше.
+# LIMSRoot. Discovery НЕ деградує BRAVO_ROOT (без служби повертає $null з
+# reason) — фолбек до LIMSRoot локальний, тут (той самий, що й раніше).
 $BRAVOCMD_PATH = if (-not [string]::IsNullOrWhiteSpace([string]$bravoDiscoveryResult.BRAVO_ROOT)) {
     Join-Path ([string]$bravoDiscoveryResult.BRAVO_ROOT) "bravocmd.exe"
 } else {
@@ -6132,7 +6349,6 @@ $SIZES_FILE = "$LOG_DIR\file_sizes_before_$NOW.csv"
 # у різних каталогах, без жодного зв'язку між номерами.
 $LOG_DATE_FOLDER = "$YYYY-$MM-$DD"
 $TRACE_ARCHIV_DIR = Join-Path $TRACE_DIR $LOG_DATE_FOLDER
-$EXCHANGE_DAILY_LOG_DIR = Join-Path $EXCHANGE_LOG_DIR $LOG_DATE_FOLDER
 $APACHE_DAILY_LOG_DIR = Join-Path $APACHE_LOG_DIR $LOG_DATE_FOLDER
 $BRAVOWEB_APP_DAILY_LOG_DIR = Join-Path $BRAVOWEB_APP_LOG_DIR $LOG_DATE_FOLDER
 $freeSpaceExclusionsText = if ($FREE_SPACE_EXCLUDED_DRIVES.Count -gt 0) {
@@ -6503,19 +6719,31 @@ if ($BravoMaintenanceEnabled) {
     }
 }
 
-# Trace-модель 5.2.0: друге джерело (BIS) — лише явний конфіг-override;
-# надійного автоматичного джерела для TraceBIS.out не існує (bravo.ini
-# описує тільки SRV). Rooted-валідність вже гарантована конфіг-лоадером.
-# Ротовані .out обох джерел ідуть ПЛОСКО у Trace\ (timestamp-імена),
-# каталоги-дати лишаються тільки за legacy-ланцюгом.
-$traceBisSourcePath = ''
+# Trace-модель: усі *.out з кореня інсталяції bravo.exe за прохід
+# (Get-BRAVOInstallationTraceOutSources вище) + SRV з bravo.ini і явний
+# BISSourcePath, якщо вони поза коренем. Порожній/'off' BISSourcePath —
+# нічого додаткового (корінь покривається скануванням; rooted-валідність
+# явного шляху гарантована конфіг-лоадером). Ротовані .out усіх джерел
+# ідуть ПЛОСКО у Trace\ (timestamp-імена), каталоги-дати лишаються
+# тільки за legacy-ланцюгом.
+$traceOutSources = @()
 if ($BravoMaintenanceEnabled) {
-    $traceBisSourcePath = [string]$MaintenanceConfig.Trace.BISSourcePath
-    if ([string]::IsNullOrWhiteSpace($traceBisSourcePath)) {
-        $traceBisSourcePath = ''
-        Write-Log -Message "BRAVO TraceBIS: джерело не налаштовано (maintenanceSettings.Trace.BISSourcePath порожній) — пропускається" -Level "INFO"
+    $traceSrvPathForEnumeration = if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
+        [string]$traceConfiguration.TracePath
+    } else { '' }
+    $traceOutEnumeration = Get-BRAVOInstallationTraceOutSources `
+        -InstallationRoot ([string]$bravoDiscoveryResult.BRAVO_ROOT) `
+        -LimsRoot $ROOT_LIMS `
+        -SrvTracePath $traceSrvPathForEnumeration `
+        -ExplicitBisPath ([string]$MaintenanceConfig.Trace.BISSourcePath)
+    $traceOutSources = @($traceOutEnumeration.Sources)
+    if ([string]::IsNullOrWhiteSpace([string]$traceOutEnumeration.ScanRoot)) {
+        Write-Log -Message "BRAVO Trace *.out: $($traceOutEnumeration.ScanRootReason)" -Level "WARNING"
     } else {
-        Write-Log -Message "BRAVO TraceBIS джерело: $traceBisSourcePath" -Level "INFO"
+        Write-Log -Message "BRAVO Trace *.out: скан $($traceOutEnumeration.ScanRoot) ($($traceOutEnumeration.ScanRootReason)) — джерел: $(@($traceOutSources).Count)" -Level "INFO"
+        foreach ($traceOutSource in $traceOutSources) {
+            Write-Log -Message "BRAVO Trace джерело: $($traceOutSource.Path)" -Level "INFO"
+        }
     }
     Write-Log -Message "BRAVO Trace призначення ротації: $TRACE_DIR" -Level "INFO"
 }
@@ -6527,7 +6755,7 @@ if ($exchangAPIServiceEnabled) {
         -FallbackDirectory $ROOT_LIMS
     Write-Log -Message "exchangAPI робочий каталог: $($exchangeApiRuntime.Directory) ($($exchangeApiRuntime.Reason))" -Level "INFO"
     Write-Log -Message "exchangAPI шаблони джерела: $($EXCHANGAPI_LOG_FILTERS -join '; ')" -Level "INFO"
-    Write-Log -Message "exchangAPI призначення: $EXCHANGE_DAILY_LOG_DIR" -Level "INFO"
+    Write-Log -Message "exchangAPI призначення: $EXCHANGE_LOG_DIR (оригінальні імена; добовий exchangAPI_YYYYMMDD.mdz -> SFTP $exchangeApiSftpRemoteDirectory)" -Level "INFO"
 }
 
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
@@ -6571,7 +6799,10 @@ if ($BravoMaintenanceEnabled) {
     }
 }
 if ($exchangAPIServiceEnabled) {
-    $dirsToCreate += $EXCHANGE_LOG_DIR, $EXCHANGE_DAILY_LOG_DIR
+    # Нова модель — плоский EXCHANGE_LOG_DIR (оригінальні імена + добовий
+    # exchangAPI_YYYYMMDD.mdz); каталоги-дати більше не створюються
+    # (legacy-каталоги обробляє лише retention/compress-ланцюг).
+    $dirsToCreate += $EXCHANGE_LOG_DIR
 }
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
     $dirsToCreate += $BRAVOWEB_LOG_DIR, $APACHE_LOG_DIR, $APACHE_DAILY_LOG_DIR,
@@ -7488,16 +7719,12 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
             # SRV з невалідною конфігурацією вже прапорцьований критичною
             # помилкою у блоці джерел — тут він просто пропускається
             # (порожній Path), НЕ блокуючи ротацію BIS.
-            $traceSrvSourcePath = if ($null -ne $traceConfiguration -and $traceConfiguration.IsValid) {
-                [string]$traceConfiguration.TracePath
-            } else {
-                ''
-            }
+            # Джерела вже перелічені один раз у блоці "ДЖЕРЕЛА ЖУРНАЛІВ"
+            # (скан усіх *.out кореня інсталяції + SRV/BIS поза коренем).
+            # Порожній перелік — легальний стан (скан неможливий/файлів
+            # немає): ротація сама віддасть підсумок "файлів немає".
             $traceRotationSummary = Invoke-BRAVOTraceRotation `
-                -Sources @(
-                    [pscustomobject]@{ Name = 'TraceSRV'; Path = $traceSrvSourcePath }
-                    [pscustomobject]@{ Name = 'TraceBIS'; Path = $traceBisSourcePath }
-                ) `
+                -Sources @($traceOutSources) `
                 -DestinationDirectory $TRACE_DIR `
                 -RetryCount $MoveRetryCount `
                 -RetryDelaySeconds $MoveRetryDelaySeconds `
@@ -7537,9 +7764,12 @@ if ($exchangAPIServiceEnabled) {
         try {
             Write-Log "==="
             Write-Log -Message "=== ОБРОБКА ЛОГІВ EXCHANGAPI ===" -Level "INFO"
+            # Плоске призначення (без каталогу-дати): нова модель зберігає
+            # оригінальні імена і пакує їх у добовий exchangAPI_YYYYMMDD.mdz
+            # тим самим движком, що Trace; legacy каталоги-дати не чіпаються.
             $exchangeRotationSummary = Invoke-BRAVOExchangeApiLogRotation `
                 -SourceDirectory ([string]$exchangeApiRuntime.Directory) `
-                -DestinationDirectory $EXCHANGE_DAILY_LOG_DIR `
+                -DestinationDirectory $EXCHANGE_LOG_DIR `
                 -Patterns $EXCHANGAPI_LOG_FILTERS `
                 -RetryCount $MoveRetryCount `
                 -RetryDelaySeconds $MoveRetryDelaySeconds `
@@ -7974,6 +8204,20 @@ if (-not $BravoMaintenanceEnabled) {
             Write-Log -Message "Trace: SFTP-сесія недоступна ($($_.Exception.Message)) — добові архіви оновлюються локально, передачу відкладено" -Level "WARNING"
         }
 
+        # Одноразова (idempotent) автоміграція legacy /trace -> /logs/trace:
+        # виконується до передач, лише за живої сесії; помилки видимі, але
+        # не блокують оновлення/передачу нових архівів.
+        if ($null -ne $traceSftpSession) {
+            $traceMigrationResult = Invoke-BRAVOTraceRemoteLogMigration `
+                -Session $traceSftpSession `
+                -LegacyDirectory $traceLegacySftpRemoteDirectory `
+                -TargetDirectory $traceSftpRemoteDirectory `
+                -Logger $bravoLogRotationLogger
+            if ([int]$traceMigrationResult.Errors -gt 0) {
+                $script:criticalErrorOccurred = $true
+            }
+        }
+
         $traceMaintenanceResult = Invoke-BRAVOTraceArchiveMaintenance `
             -TraceDirectory $TRACE_DIR `
             -SevenZipPath $ARC_PATH `
@@ -7987,20 +8231,52 @@ if (-not $BravoMaintenanceEnabled) {
         if ([int]$traceMaintenanceResult.Errors -gt 0) {
             $script:criticalErrorOccurred = $true
         }
-        $traceArchiveOperationDetail = if ([int]$traceMaintenanceResult.DatesProcessed -eq 0) {
+
+        # exchangAPI: той самий движок добових архівів (оригінальні імена,
+        # групування за LastWriteTime) — logs/exchangapi на SFTP.
+        $exchangeArchiveMaintenanceResult = $null
+        if ($exchangAPIServiceEnabled) {
+            Write-Log -Message "==="
+            Write-Log -Message "=== EXCHANGAPI: ДОБОВИЙ АРХІВ І SFTP ===" -Level "INFO"
+            $exchangeArchiveMaintenanceResult = Invoke-BRAVOTraceArchiveMaintenance `
+                -TraceDirectory $EXCHANGE_LOG_DIR `
+                -SevenZipPath $ARC_PATH `
+                -AddParameters $traceArchiveAddParams `
+                -ArchivePassword $script:ArchivePassword `
+                -CommandTimeoutSeconds $NativeCommandTimeoutSeconds `
+                -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
+                -Session $traceSftpSession `
+                -RemoteDirectory $exchangeApiSftpRemoteDirectory `
+                -ComponentLabel 'exchangAPI' `
+                -ArchiveNamePrefix 'exchangAPI' `
+                -BacklogGroupBy 'ByLastWriteTime' `
+                -BacklogFileFilter '*.log' `
+                -Logger $bravoLogRotationLogger
+            if ([int]$exchangeArchiveMaintenanceResult.Errors -gt 0) {
+                $script:criticalErrorOccurred = $true
+            }
+        }
+
+        $traceArchiveOperationDetail = if (
+            [int]$traceMaintenanceResult.DatesProcessed -eq 0 -and
+            ($null -eq $exchangeArchiveMaintenanceResult -or [int]$exchangeArchiveMaintenanceResult.DatesProcessed -eq 0)
+        ) {
             'файлів у черзі немає'
         } else {
             $traceDetailParts = @(
                 "дат: $($traceMaintenanceResult.DatesProcessed)",
                 "оновлено архівів: $($traceMaintenanceResult.ArchivesUpdated)",
                 "передано на SFTP: $($traceMaintenanceResult.Uploaded)",
-                "видалено переданих .out: $($traceMaintenanceResult.SourcesDeleted)"
+                "видалено переданих джерел: $($traceMaintenanceResult.SourcesDeleted)"
             )
             if ([int]$traceMaintenanceResult.UploadsDeferred -gt 0) {
                 $traceDetailParts += "відкладено передач: $($traceMaintenanceResult.UploadsDeferred)"
             }
             if ([int]$traceMaintenanceResult.Conflicts -gt 0) {
                 $traceDetailParts += "конфліктів: $($traceMaintenanceResult.Conflicts)"
+            }
+            if ($null -ne $exchangeArchiveMaintenanceResult -and [int]$exchangeArchiveMaintenanceResult.DatesProcessed -gt 0) {
+                $traceDetailParts += "exchangAPI: дат $($exchangeArchiveMaintenanceResult.DatesProcessed), передано $($exchangeArchiveMaintenanceResult.Uploaded)"
             }
             $traceDetailParts -join '; '
         }

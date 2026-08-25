@@ -61,3 +61,16 @@
 # складається з частин через -join); цей запис глушить лише історичну
 # знахідку в уже опублікованому коміті 73f37ac, без rebase/force-push.
 73f37ac35d2587ec724fa5796bd8d5f656ebfe0f:selftest/BRAVO_SELF_TEST.RestoreSynthetic.ps1:generic-api-key:72
+
+# logs-pipeline (PR #89), коміт 7b05cc0: нові конфіг-ключі
+# sftpDirectories.ExchangeApiLogs = "logs/exchangapi" (BRAVO.config,
+# compat-дефолт у BRAVO_CONFIG_LOADER.ps1) і тестовий лог-рядок
+# "Переміщено exchangAPI_2.log -> exchangAPI_2.log" (LogRotation
+# self-test). Ідентифікатор містить "Api" поруч із "=" і рядковим
+# значенням — дефолтне правило generic-api-key матчить сам ПАТЕРН
+# імені ключа; значення — публічні відносні SFTP-шляхи/імена файлів
+# журналів, жодного секрету. Фіксується per-fingerprint, без
+# послаблення правила.
+7b05cc0d73214089b8144db508e065429a58b7b9:BRAVO_CONFIG_LOADER.ps1:generic-api-key:398
+7b05cc0d73214089b8144db508e065429a58b7b9:BRAVO.config:generic-api-key:856
+7b05cc0d73214089b8144db508e065429a58b7b9:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:964

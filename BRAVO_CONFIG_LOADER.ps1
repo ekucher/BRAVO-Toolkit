@@ -357,13 +357,15 @@ function Assert-BravoLoadedConfiguration {
         }
         $traceSettingsForValidation = $global:maintenanceSettings.Trace
         if (-not $traceSettingsForValidation.Contains('BISSourcePath')) {
-            # Порожньо = TraceBIS не налаштовано (Maintenance пропускає з INFO).
+            # Порожньо = AUTO: Maintenance резолвить TraceBIS.out від кореня
+            # інсталяції bravo.exe (Resolve-BRAVOTraceBisSourcePath).
             $traceSettingsForValidation.BISSourcePath = ''
         }
         $bisSourcePathValue = [string]$traceSettingsForValidation.BISSourcePath
         if (-not [string]::IsNullOrWhiteSpace($bisSourcePathValue) -and
+            -not [string]::Equals($bisSourcePathValue.Trim(), 'off', [System.StringComparison]::OrdinalIgnoreCase) -and
             -not [System.IO.Path]::IsPathRooted($bisSourcePathValue)) {
-            throw "maintenanceSettings.Trace.BISSourcePath = '$bisSourcePathValue' має бути абсолютним шляхом до TraceBIS.out (або порожнім рядком, якщо BIS не використовується)."
+            throw "maintenanceSettings.Trace.BISSourcePath = '$bisSourcePathValue' має бути абсолютним шляхом до TraceBIS.out, порожнім рядком (AUTO: корінь інсталяції bravo.exe) або 'off' (вимкнути обробку BIS)."
         }
 
         if ($global:maintenanceSettings.Retention -is [hashtable]) {
@@ -383,6 +385,17 @@ function Assert-BravoLoadedConfiguration {
         if (-not $global:sftpDirectories.Contains('Trace') -or
             [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.Trace)) {
             $global:sftpDirectories.Trace = 'trace'
+        }
+        # Модель logs/: нові каталоги журнальних архівів. Legacy-конфіги без
+        # цих ключів отримують канонічні дефолти (compat), Trace лишається
+        # джерелом одноразової автоміграції.
+        if (-not $global:sftpDirectories.Contains('TraceLogs') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.TraceLogs)) {
+            $global:sftpDirectories.TraceLogs = 'logs/trace'
+        }
+        if (-not $global:sftpDirectories.Contains('ExchangeApiLogs') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.ExchangeApiLogs)) {
+            $global:sftpDirectories.ExchangeApiLogs = 'logs/exchangapi'
         }
     }
 

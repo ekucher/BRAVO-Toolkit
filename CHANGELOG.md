@@ -2,6 +2,50 @@
 
 ## Не випущено (developer)
 
+- **FEATURE (operations, logs pipeline v2): усі `*.out` за прохід,
+  exchangAPI-архіви на SFTP, нова структура `logs/`.** Запит власника за
+  лістингом реального сервера: у корені інсталяції накопичуються
+  `!TraceSRV.out` (214MB), `traceBIS1.out`, `TraceSRV2.out` тощо, які
+  модель «два налаштовані файли» ніколи не підбирала; exchangAPI-логи
+  перейменовувались у `exchangAPI_N.log` і не потрапляли на SFTP.
+
+  **Свідомі зміни поведінки (рішення власника):**
+  - Ротація trace тепер захоплює **кожен `*.out` з кореня інсталяції
+    bravo.exe** (нова `Get-BRAVOInstallationTraceOutSources`: Discovery
+    `BRAVO_ROOT`, фолбек LIMSRoot; SRV з `bravo.ini` і явний
+    `Trace.BISSourcePath` — додаткові джерела, якщо поза коренем; дедуп
+    шляхів OrdinalIgnoreCase; порожній/`'off'` BISSourcePath = нічого
+    додаткового). Backlog добового архіву узагальнено до довільних
+    basename (`^(.+)_(\d{8})_(\d{6})\.out$`); legacy-імена як і раніше
+    не чіпаються.
+  - **exchangAPI: оригінальні імена без перейменувань** (нова
+    `NamingPolicy 'Original'` у спільному рушії ротації; колізія імені в
+    призначенні = ПОМИЛКА fail-closed, джерело лишається). Плоске
+    призначення `LOGS\exchangAPI` без каталогів-дат; добовий
+    `exchangAPI_YYYYMMDD.mdz` тим САМИМ движком, що Trace
+    (`Invoke-BRAVOTraceArchiveMaintenance` параметризовано:
+    ComponentLabel/ArchiveNamePrefix/GroupBy=ByLastWriteTime/FileFilter),
+    з тим самим ланцюгом 7z t → SHA512 → SFTP → видалення джерел лише
+    після повної верифікації.
+  - **SFTP-структура:** нові каталоги `sftpDirectories.TraceLogs`
+    (`logs/trace`) і `sftpDirectories.ExchangeApiLogs`
+    (`logs/exchangapi`); compat — legacy-конфіги без ключів отримують
+    дефолти в лоадері. Наявні архіви зі старого `trace/` **одноразово
+    (idempotent) мігруються** remote-move'ом з верифікацією
+    (`Invoke-BRAVOTraceRemoteLogMigration`): без видалень, конфлікт
+    імені = ERROR без перезапису, помилки видимі й не блокують нові
+    передачі.
+
+  Регресії: `LogRotation/09c-09e` (скан кореня, фолбек/дедуп/колізія
+  basename, Original-політика), оновлені `11/12/20` під новий
+  exchangAPI-контракт (колізія fail-closed),
+  `TraceArchive/BacklogAcceptsArbitraryRotatedBasenames`,
+  `BacklogGroupsExchangeLogsByLastWriteDate`,
+  `ExchangeApiDailyArchivePipelineEndToEnd` (справжній 7za + fake SFTP),
+  `RemoteMigration*` (успіх/конфлікт/no-op). Повний `BRAVO_SELF_TEST.ps1`
+  PASSED. Потрібен real-server acceptance (нові SFTP-каталоги, WinSCP
+  MoveFile-міграція, повний maintenance-цикл).
+
 - **UX (operator console, maintenance): живий підстатус тривалих
   native-операцій.** Звіт оператора: під час реставрації моделі
   прогрес-смуга `BRAVO_MAINTENANCE` стояла без жодного підстатусу —
