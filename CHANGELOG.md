@@ -2,6 +2,42 @@
 
 ## Не випущено (developer)
 
+- **FIX (data-integrity, restore/maintenance): хибний тотальний провал
+  перевірки цілісності моделі після repair через регістр шляху MODEL.**
+  Реальний інцидент (ДНДІЛДВСЕ, 2026-08-25, exit 43): `bravocmd r`
+  завершується успішно, але `Compare-FileSizes` оголошував УСІ файли
+  before-CSV відсутніми (364 CRITICAL + 182 RemovedByRepair) і після
+  успішного відкату повторна перевірка знову провалювалась —
+  `rollback=FAILED`, служби не піднімались, хоча дані на диску цілі.
+  Причина: `bravo.ini MODEL=` на сервері містить шлях з іншим регістром
+  (мала літера диска, `d:\LIMS\Model`), before-CSV пишеться через .NET
+  `EnumerateFiles` (зберігає регістр переданого кореня), а поточний вміст
+  читається через `Get-BRAVOFiles`/`Get-ChildItem` (провайдер нормалізує
+  `D:\...`); ordinal `String.Replace` не зрізав корінь — ключі порівняння
+  ставали абсолютними шляхами і не збігались із відносними записами CSV.
+
+  Виправлення: нова канонічна `Get-BRAVOModelRelativePath`
+  (`modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1`) —
+  регістронезалежний (OrdinalIgnoreCase, культуро-незалежний) зріз кореня;
+  мігровано всі 5 місць патерну `FullName.Replace($MODEL_PATH...)` (lookup
+  у `Compare-FileSizes` — сам баг; writer before-CSV, деривація hint
+  головної моделі, два місця `Check-MdFileSizes` — hardening того самого
+  патерну). Fail-closed поведінка не послаблена: шлях поза коренем
+  повертається як є і, як і раніше, не зіставляється. Додатковий
+  діагностичний tripwire: якщо жоден запис before-CSV не зіставився, а
+  каталог MODEL не порожній — явний ERROR про ймовірний розсинхрон
+  деривації шляхів (корінь/регістр), а не «втрату даних»; блокування і
+  rollback лишаються незмінними.
+
+  Регресія: `Maintenance/CompareFileSizesRootCaseInsensitive`,
+  `Maintenance/CompareFileSizesRootCaseInsensitiveSegmentRemoved`
+  (той самий каталог, змінений лише регістр рядка ModelPath) — червоні до
+  фіксу, зелені після; `Maintenance/ModelRelativePath[...]` — юніт-контракт
+  helper'а (регістр, підкаталог, точний збіг, поза коренем, межа
+  компонента `Model` vs `ModelBackup`). Повний `BRAVO_SELF_TEST.ps1`
+  PASSED. Потрібен real-server acceptance реставрації саме на сервері
+  інциденту (Task Scheduler + bravocmd) — CI його не замінює.
+
 - **FEATURE (data-integrity, archive preflight): розрахункова перевірка
   вільного місця понад фіксований поріг.** `Maintenance.Limits.
   MinimumFreeSpaceGB` (типово 20) — загальний захист від переповнення

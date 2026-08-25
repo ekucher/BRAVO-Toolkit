@@ -4485,6 +4485,33 @@ function Resolve-BRAVOExchangeApiRuntimeDirectory {
 #   RemovedByRepairCount  — @() .Count вище (PS 5.1 collection semantics)
 #   MainModelValid        — чи основна модель пройшла перевірку
 #
+# Єдине правило деривації відносного шляху файлу MODEL від кореня.
+# Регістронезалежне (OrdinalIgnoreCase): $MODEL_PATH походить із bravo.ini
+# і може мати інший регістр (напр. "d:\LIMS\Model"), ніж FullName від
+# Get-ChildItem, який FileSystem-провайдер нормалізує ("D:\LIMS\Model\...").
+# Ordinal String.Replace на такому розсинхроні мовчки НЕ зрізав корінь,
+# ключі порівняння ставали абсолютними шляхами і ВСІ файли before-CSV
+# оголошувались відсутніми — хибний CRITICAL + rollback (реальний інцидент
+# ДНДІЛДВСЕ 2026-08-25, exit 43). Windows-шляхи регістронезалежні, тому
+# OrdinalIgnoreCase тут коректний і не залежить від локалі ОС.
+function Get-BRAVOModelRelativePath {
+    param(
+        [Parameter(Mandatory = $true)][string]$FullName,
+        [Parameter(Mandatory = $true)][string]$RootPath
+    )
+    $normalizedRoot = $RootPath.TrimEnd('\')
+    if ($FullName.StartsWith($normalizedRoot + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $FullName.Substring($normalizedRoot.Length + 1)
+    }
+    if ([string]::Equals($FullName, $normalizedRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return ''
+    }
+    # Шлях поза коренем (нетипово): повертаємо як є — абсолютний шлях
+    # діагностично видимий у звітах і, як і раніше, не зіставиться з
+    # відносними записами before-CSV (fail-closed).
+    return $FullName
+}
+
 # -MainModelRelativePath звужує "відсутній файл = CRITICAL" лише до основної
 # моделі. Сегментні файли (*.000, *.002, ...), яких bravocmd.exe штатно
 # перебудовує/прибирає під час repair, самі по собі більше НЕ є критичними —
@@ -4557,9 +4584,10 @@ function Compare-FileSizes {
         $criticalFiles = @()
         $removedByRepairFiles = @()
         $mainModelValid = $true
+        $missingFileCount = 0
         $currentLookup = @{}
         foreach ($file in @(Get-BRAVOFiles -Path $ModelPath -Recurse)) {
-            $relativePath = $file.FullName.Replace($ModelPath, "").TrimStart('\')
+            $relativePath = Get-BRAVOModelRelativePath -FullName $file.FullName -RootPath $ModelPath
             $currentLookup[$relativePath] = [long]$file.Length
         }
 
@@ -4587,6 +4615,7 @@ function Compare-FileSizes {
                 -1
             }
             $isMissing = $currentSizeBytes -lt 0
+            if ($isMissing) { $missingFileCount++ }
             $isMainModelFile = (
                 -not [string]::IsNullOrWhiteSpace($MainModelRelativePath) -and
                 $relativePath -ieq $MainModelRelativePath
@@ -4639,6 +4668,19 @@ function Compare-FileSizes {
                     Missing = $isMissing
                 }
             }
+        }
+
+        # Діагностичний tripwire: каталог MODEL не порожній, але ЖОДЕН запис
+        # before-CSV не зіставився з поточним вмістом. Реальна тотальна втрата
+        # так не виглядає (тоді каталог порожній — окремий guard вище);
+        # найімовірніша причина — розсинхрон деривації шляхів (корінь/регістр)
+        # між writer-ом CSV і цим порівнянням. Поведінка НЕ послаблюється
+        # (critical -> rollback лишається), лише правильна підказка оператору.
+        if ($missingFileCount -eq @($initialData).Count -and $currentLookup.Count -gt 0) {
+            Write-Log ("ЖОДЕН із $missingFileCount файлів before-CSV не знайдений у поточному вмісті MODEL, " +
+                "хоча каталог містить $($currentLookup.Count) файл(ів). Це схоже не на втрату даних, а на " +
+                "розсинхрон деривації відносних шляхів (корінь/регістр MODEL між before-CSV і порівнянням). " +
+                "Перевірте значення MODEL= у bravo.ini і фактичний шлях каталогу.") -Level "ERROR"
         }
 
         if (@($removedByRepairFiles).Count -gt 0) {
@@ -5534,7 +5576,7 @@ function Check-MdFileSizes {
     $excludedFiles = @()
 
     foreach ($file in $oversizedFiles) {
-        $relativePath = $file.FullName.Replace($MODEL_PATH, "").TrimStart('\')
+        $relativePath = Get-BRAVOModelRelativePath -FullName $file.FullName -RootPath $MODEL_PATH
         $isExcluded = $false
 
         foreach ($pattern in $ExcludePatterns) {
@@ -5564,7 +5606,7 @@ function Check-MdFileSizes {
         $fileListBuilder = New-Object System.Text.StringBuilder
         foreach ($file in $largeFiles) {
             $sizeFormatted = Format-FileSize $file.Length
-            $relativePath = $file.FullName.Replace($MODEL_PATH, "").TrimStart('\')
+            $relativePath = Get-BRAVOModelRelativePath -FullName $file.FullName -RootPath $MODEL_PATH
             [void]$fileListBuilder.AppendLine("- $relativePath : $sizeFormatted")
         }
         $fileList = $fileListBuilder.ToString()
@@ -7084,7 +7126,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 } |
                 ForEach-Object {
                     [PSCustomObject]@{
-                        RelativePath = $_.FullName.Replace($MODEL_PATH, "").TrimStart('\')
+                        RelativePath = Get-BRAVOModelRelativePath -FullName $_.FullName -RootPath $MODEL_PATH
                         SizeBytes = $_.Length
                     }
                 }
@@ -7208,11 +7250,11 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                     }
 
                     # Hint головної моделі — від канонічного $MAIN_MODEL_FILE тим
-                    # самим правилом Replace+TrimStart, що й writer before-CSV
-                    # (покриває MODEL= у підкаталозі). Якщо .md не під $MODEL_PATH
-                    # — hint не передаємо: строгий режим (будь-який відсутній
-                    # файл критичний).
-                    $mainModelRelativeHint = $MAIN_MODEL_FILE.Replace($MODEL_PATH, "").TrimStart('\')
+                    # самим правилом Get-BRAVOModelRelativePath, що й writer
+                    # before-CSV (покриває MODEL= у підкаталозі). Якщо .md не під
+                    # $MODEL_PATH — hint не передаємо: строгий режим (будь-який
+                    # відсутній файл критичний).
+                    $mainModelRelativeHint = Get-BRAVOModelRelativePath -FullName $MAIN_MODEL_FILE -RootPath $MODEL_PATH
                     if ([string]::IsNullOrWhiteSpace($mainModelRelativeHint) -or
                         $mainModelRelativeHint -ieq $MAIN_MODEL_FILE) {
                         Write-Log -Message ("Головна модель '$MAIN_MODEL_FILE' не знаходиться в каталозі MODEL " +

@@ -60,6 +60,7 @@ $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
         'Write-BRAVOProcessInputText', 'Get-BRAVOSevenZipExitCodeDescription',
         'Test-SevenZipArchiveIntegrity',
         'Format-CommandOutput', 'Format-FileSize',
+        'Get-BRAVOModelRelativePath',
         'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes',
         'Invoke-CommandWithLog', 'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
         'Restore-FromArchive', 'Invoke-BRAVOModelRestoreRecovery'
