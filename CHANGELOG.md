@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0-rc.11 — 2026-08-26 (candidate, pending acceptance)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.10`
+(нижче; acceptance не проводився — одразу замінено цим кандидатом) +
+компактні Maintenance-алерти з глобальним payload guard-ом (PR #94,
+нижче). Acceptance rc.11 покриває всю накопичену нову поверхню
+rc.9-rc.11: повний maintenance-цикл (скан усіх `*.out`, exchangAPI-mdz,
+автостворення `logs/*`, WinSCP MoveFile-міграція `trace/`), компактні
+алерти + A2-encoding протокол (RELEASE_CHECKLIST §1.1).
+
 - **UX (operator notifications): компактні Maintenance-алерти + глобальний
   payload guard.** Реальний клас інциденту: сотні critical-файлів після
   перевірки реставрації давали alert на 4×N рядків (341 файл ≈ 55 тис.
