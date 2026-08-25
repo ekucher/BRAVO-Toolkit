@@ -4956,7 +4956,24 @@ function Invoke-CommandWithLog {
             [double][int]::MaxValue,
             [double][math]::Max(1, $TimeoutSeconds) * 1000
         )
-        $completed = $process.WaitForExit($timeoutMilliseconds)
+        # Живий підстатус (контракт docs/MANUAL_RUN_CONSOLE_UX.md): тривалі
+        # native-операції (bravocmd-реставрація, 7-Zip архівації до/після)
+        # раніше блокувались у суцільному WaitForExit(timeout) — оператор
+        # бачив застиглу смугу без жодного підстатусу. Polling кожні 500 мс
+        # оновлює прогрес канонічним running-рядком BRAVO.Console
+        # ("<Фаза> — Виконується N сек."), як в Archive; сумарний таймаут
+        # і kill-семантика після нього не змінені.
+        $waitDeadlineUtc = [DateTime]::UtcNow.AddMilliseconds($timeoutMilliseconds)
+        $completed = $false
+        while (-not $completed) {
+            $completed = $process.WaitForExit(500)
+            if ($completed) { break }
+            Write-BRAVOProgressDetail -Detail (
+                Format-BRAVORunningDetail -ElapsedSeconds ([int][math]::Floor($commandStopwatch.Elapsed.TotalSeconds))
+            )
+            if ([DateTime]::UtcNow -ge $waitDeadlineUtc) { break }
+        }
+        Write-BRAVOProgressDetail -Detail ''
         if (-not $completed) {
             try {
                 $process.Kill()
