@@ -2,6 +2,16 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0-rc.9 — 2026-08-25 (candidate, pending acceptance)
+
+Кандидат = прийнятий `5.2.0-rc.8` (нижче; acceptance реставрації пройдено
+на сервері інциденту) + logs pipeline v2 (PR #89) + живий підстатус
+консолі Maintenance (PR #88). Обидві зміни потребують real-server
+acceptance: нові SFTP-каталоги `logs/*`, WinSCP MoveFile-міграція,
+повний maintenance-цикл із реальними `*.out`-варіантами.
+
 - **FEATURE (operations, logs pipeline v2): усі `*.out` за прохід,
   exchangAPI-архіви на SFTP, нова структура `logs/`.** Запит власника за
   лістингом реального сервера: у корені інсталяції накопичуються
