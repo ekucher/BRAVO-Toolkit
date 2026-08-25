@@ -971,9 +971,9 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    5.1.0      (stable, тег v5.1.0, merge PR #61 = aee27e4)
-developer: 5.2.0-rc.9 (prerelease, тег v5.2.0-rc.9 = stamp-коміт
-           0437fd0; acceptance rc.9 ще не пройдено)
+master:    5.1.0       (stable, тег v5.1.0, merge PR #61 = aee27e4)
+developer: 5.2.0-rc.10 (prerelease; acceptance ще не пройдено —
+           фінальний кандидат циклу перед stable 5.2.0)
 ```
 
 Хронологія RC-циклу 5.2.0 (2026-08-24/25):
@@ -994,9 +994,14 @@ developer: 5.2.0-rc.9 (prerelease, тег v5.2.0-rc.9 = stamp-коміт
   PR #89: logs pipeline v2 — усі `*.out` з кореня інсталяції,
   exchangAPI-архіви з оригінальними іменами на SFTP, структура
   `logs/trace`/`logs/exchangapi` з одноразовою автоміграцією `trace/`)
-  — **acceptance ще не пройдено**; нова поверхня вимагає повного
-  maintenance-циклу на реальному сервері (WinSCP MoveFile-міграція,
-  автостворення `logs/*`, скан реальних `*.out`-варіантів).
+  — acceptance НЕ проводився: кандидата одразу замінено rc.10.
+- `v5.2.0-rc.10` (rc.9 + PR #91: актуалізація release-документації +
+  PR #92: семантичний гейт версії промоції в master і виключення
+  `artifacts\` з генератора runtime-маніфесту) — **фінальний кандидат
+  циклу; acceptance ще не пройдено**; нова поверхня rc.9/rc.10 вимагає
+  повного maintenance-циклу на реальному сервері (WinSCP
+  MoveFile-міграція, автостворення `logs/*`, скан реальних
+  `*.out`-варіантів, A2-encoding протокол з RELEASE_CHECKLIST §1.1).
 
 Перенесено на 5.3.0 (додатково до P3.2a/M1/M3 нижче): три відкладені
 Compare-FileSizes-фікси з локальної незапушеної гілки розробника
