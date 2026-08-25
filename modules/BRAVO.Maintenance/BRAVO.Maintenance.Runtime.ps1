@@ -1629,6 +1629,28 @@ function Get-BRAVORestoreForcedCoveredSlot {
     return $null
 }
 
+# Чи спожита тижнева квота автоматичної реставрації успішною ПРИМУСОВОЮ.
+# Успішний -ForceRestore записує ПОКРИТИЙ слот = наступний плановий
+# (+7 днів) і НЕ закриває поточний плановий слот маркером/Status —
+# тому «пропущений» МИНУЛИЙ слот лишається formally missed. Строга
+# рівність (ForcedCoveredSlot -eq ScheduledOccurrence) через це давала
+# подвійну реставрацію: примусова о 22:00, і того ж вечора звичайний
+# прогін у вікні бачив missed-слот минулого тижня (< покритого) і
+# запускав реставрацію ВДРУГЕ (реальний інцидент 2026-08-26). Правильна
+# семантика «не частіше разу на тиждень»: покритий слот закриває СОБОЮ
+# і всі попередні (<=). Наступний плановий слот (+7 днів після
+# покритого) строго більший — квота знімається рівно вчасно, без
+# межової помилки арифметики «різниця < 7 діб».
+function Test-BRAVORestoreWeeklyQuotaConsumed {
+    param(
+        [AllowNull()]$ForcedCoveredSlot,
+        [Parameter(Mandatory = $true)][datetime]$ScheduledOccurrence
+    )
+
+    if ($null -eq $ForcedCoveredSlot) { return $false }
+    return ($ScheduledOccurrence -le [datetime]$ForcedCoveredSlot)
+}
+
 # Дата ОСТАННЬОЇ успішної реставрації — будь-якої, і планової, і
 # примусової. Окреме поле потрібне тому, що оператору показується "остання:
 # <дата>", а історичне джерело цієї дати (файли restore_done_*.marker)
@@ -6365,10 +6387,13 @@ $scheduledRestoreDue = $isRestoreDay -and $isAfterRestoreTime -and -not (Test-Pa
 $missedRestoreDue = $missedRestore
 # Тижнева квота: АВТОМАТИЧНА реставрація виконується не частіше разу на
 # тиждень, і успішна ПРИМУСОВА зараховується в цей самий тиждень. Успішний
-# -ForceRestore записує слот, який він покриває (наступний плановий), тому
-# перевірка тут — просте порівняння з поточним слотом, без арифметики
-# "різниця < 7 діб": та дала б межову помилку, коли планова реставрація
-# о 03:20 блокувала б наступну о 03:00 рівно через тиждень.
+# -ForceRestore записує слот, який він покриває (наступний плановий);
+# квота вважається спожитою для поточного слоту, якщо він <= покритого
+# (Test-BRAVORestoreWeeklyQuotaConsumed): це закриває і «пропущений»
+# МИНУЛИЙ слот (строга рівність тут давала подвійну реставрацію в один
+# вечір — інцидент 2026-08-26), і сам покритий; наступний слот (+7 днів)
+# строго більший — квота знімається вчасно, без арифметики
+# "різниця < 7 діб" з її межовою помилкою.
 #
 # Гейт стоїть саме на $automaticRestoreDue, а не всередині
 # $scheduledSucceeded: $scheduledRestoreDue рахується від СЬОГОДНІШНЬОГО
@@ -6378,8 +6403,9 @@ $missedRestoreDue = $missedRestore
 # -ForceRestore квотою НЕ обмежується (окремий диз'юнкт у $shouldRestore
 # нижче): свідома дія оператора може повторюватись будь-скільки разів.
 $forcedRestoreCoveredSlot = Get-BRAVORestoreForcedCoveredSlot -State $restoreState
-$weeklyRestoreQuotaConsumed = ($null -ne $forcedRestoreCoveredSlot) -and
-    ([datetime]$forcedRestoreCoveredSlot -eq $scheduledOccurrence)
+$weeklyRestoreQuotaConsumed = Test-BRAVORestoreWeeklyQuotaConsumed `
+    -ForcedCoveredSlot $forcedRestoreCoveredSlot `
+    -ScheduledOccurrence $scheduledOccurrence
 $automaticRestoreDue = ($scheduledRestoreDue -or $missedRestoreDue) -and -not $weeklyRestoreQuotaConsumed
 # Профіль сервера РОБОЧОГО ЧАСУ (Restore.BootRestoreMode="HoldServices"):
 # Recovery-прогін, запущений boot-тригером, ігнорує вікно реставрації —
