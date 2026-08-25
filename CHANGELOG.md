@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **UX (operator console, maintenance): живий підстатус тривалих
+  native-операцій.** Звіт оператора: під час реставрації моделі
+  прогрес-смуга `BRAVO_MAINTENANCE` стояла без жодного підстатусу —
+  `Invoke-CommandWithLog` блокувався в суцільному `WaitForExit(timeout)`
+  на весь час роботи bravocmd/7-Zip. Тепер очікування — polling кожні
+  500 мс з оновленням прогресу канонічним running-рядком `BRAVO.Console`
+  (`<Фаза> — Виконується N сек.`, `Format-BRAVORunningDetail` — той
+  самий, що в Archive), після завершення detail скидається. Охоплює всі
+  native-виклики Maintenance через `Invoke-CommandWithLog`: реставрацію
+  bravocmd і 7-Zip архівації до/після. Сумарний таймаут і kill-семантика
+  не змінені. Регресія:
+  `RestoreSynthetic/InvokeCommandWithLogEmitsRunningDetail` (червоний до
+  зміни: `ticks=0`; зелений після).
+
 ---
 
 ## 5.2.0-rc.8 — 2026-08-25 (candidate, pending acceptance)

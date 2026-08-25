@@ -50,6 +50,17 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
 function Write-BRAVOProcessInputText { BRAVO.Compatibility\Write-BRAVOProcessInputText @args }
 function Get-BRAVOSevenZipExitCodeDescription { BRAVO.Compatibility\Get-BRAVOSevenZipExitCodeDescription @args }
 function Test-SevenZipArchiveIntegrity { BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity @args }
+function Write-BRAVOProgressDetail {
+    param([AllowEmptyString()][string]$Detail)
+    if ($null -eq (Get-Variable -Name BRAVORunningDetailCalls -Scope Script -ErrorAction SilentlyContinue)) {
+        $script:BRAVORunningDetailCalls = New-Object System.Collections.ArrayList
+    }
+    [void]$script:BRAVORunningDetailCalls.Add([string]$Detail)
+}
+function Format-BRAVORunningDetail {
+    param([Parameter(Mandatory = $true)][int]$ElapsedSeconds, [AllowNull()][AllowEmptyString()][string]$Detail)
+    return "Виконується $ElapsedSeconds сек."
+}
 '@
 $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($restoreSyntheticStubText + "`n" + $restoreSyntheticRuntimeText) `
@@ -58,6 +69,7 @@ $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
         'Get-BRAVOFiles', 'ConvertTo-BRAVOWindowsCommandLineArgument',
         'Start-BRAVOProcessOutputCapture', 'Complete-BRAVOProcessOutputCapture',
         'Write-BRAVOProcessInputText', 'Get-BRAVOSevenZipExitCodeDescription',
+        'Write-BRAVOProgressDetail', 'Format-BRAVORunningDetail',
         'Test-SevenZipArchiveIntegrity',
         'Format-CommandOutput', 'Format-FileSize',
         'Get-BRAVOModelRelativePath',
@@ -369,6 +381,34 @@ Test-BRAVOCondition `
     -Condition ($recOrphan.Recovery.RollbackStatus -eq 'SUCCESS' -and $recOrphan.ByteExact -and -not $recOrphan.OrphanPresent) `
     -Name "RestoreSynthetic/RecoveryCleanRemovesOrphan" `
     -Failure "clean→extract має прибрати orphan-файл (ORPHAN.099), відсутній в архіві; отримано Rollback=$($recOrphan.Recovery.RollbackStatus), ByteExact=$($recOrphan.ByteExact), OrphanPresent=$($recOrphan.OrphanPresent)"
+
+# --- Живий підстатус тривалих native-операцій (звіт оператора: під час
+# реставрації прогрес-смуга стояла без жодного підстатусу). Invoke-CommandWithLog
+# має оновлювати progress-detail канонічним running-рядком під час очікування
+# процесу і скидати detail у '' після завершення.
+$runningDetailResult = & $restoreSyntheticModule {
+    param($ComSpec)
+    Set-StrictMode -Version Latest
+    $script:BRAVORunningDetailCalls = New-Object System.Collections.ArrayList
+    $exitCode = Invoke-CommandWithLog `
+        -Command $ComSpec `
+        -Arguments @('/c', 'ping', '-n', '3', '127.0.0.1') `
+        -Description 'self-test: живий підстатус native-операції' `
+        -TimeoutSeconds 60
+    [PSCustomObject]@{
+        ExitCode = $exitCode
+        Calls = @($script:BRAVORunningDetailCalls)
+    }
+} $env:ComSpec
+$runningTicks = @($runningDetailResult.Calls | Where-Object { $_ -like 'Виконується*' })
+Test-BRAVOCondition `
+    -Condition (
+        $runningDetailResult.ExitCode -eq 0 -and
+        $runningTicks.Count -ge 1 -and
+        @($runningDetailResult.Calls)[-1] -eq ''
+    ) `
+    -Name "RestoreSynthetic/InvokeCommandWithLogEmitsRunningDetail" `
+    -Failure "Invoke-CommandWithLog під час ~2с процесу має видати >=1 running-підстатус ('Виконується ...') і завершити скиданням detail=''; отримано ExitCode=$($runningDetailResult.ExitCode), ticks=$($runningTicks.Count), lastDetail='$(@($runningDetailResult.Calls)[-1])'"
 
 # --- Анкери коду: before-CSV+Compare розчеплені від CheckSize; гейт служб.
 Test-BRAVOCondition `
