@@ -2,6 +2,19 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0-rc.12 — 2026-08-26 (candidate, pending acceptance)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.11`
+(нижче; на acceptance 2026-08-26 виявлено дефект подвійної реставрації
+після `-ForceRestore` — виправлено FIX-ом нижче, PR #96). Acceptance
+rc.12 покриває всю накопичену нову поверхню rc.9-rc.12: повний
+maintenance-цикл (скан усіх `*.out`, exchangAPI-mdz, автостворення
+`logs/*`, WinSCP MoveFile-міграція `trace/`), компактні алерти,
+відсутність повторної реставрації після forced+normal в один вечір +
+A2-encoding протокол (RELEASE_CHECKLIST §1.1).
+
 - **FIX (maintenance, restore scheduling): подвійна реставрація після
   `-ForceRestore` в один вечір.** Реальний інцидент (2026-08-26,
   acceptance rc.11): успішна примусова реставрація, а наступний
