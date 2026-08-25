@@ -971,21 +971,44 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    5.1.0   (stable, тег v5.1.0, merge PR #61 = aee27e4)
-developer: 5.2.0-rc.5 у VERSION.json (prerelease); фактичний код
-           HEAD = зміст прийнятого v5.2.0-rc.7 (див. нижче)
+master:    5.1.0      (stable, тег v5.1.0, merge PR #61 = aee27e4)
+developer: 5.2.0-rc.9 (prerelease, тег v5.2.0-rc.9 = stamp-коміт
+           0437fd0; acceptance rc.9 ще не пройдено)
 ```
 
-Стан RC-циклу 5.2.0 (2026-08-24/25): `v5.2.0-rc.4` і `v5.2.0-rc.5`
-(лінія PR #83) пройшли повний real-server acceptance (`SERV_HRDL_1`,
-`WIN-44OBNQ3R3OB`). Поверх rc.5 додано розрахункову перевірку вільного
-місця (PR #84): `v5.2.0-rc.6` провалив acceptance через відсутність
-floor-override фіксу, `v5.2.0-rc.7` (rc.5 + PR #84 включно з фіксом)
-пройшов повний end-to-end acceptance 2026-08-25 (`WIN-42Q5558LQC9`:
-backup MODEL/BLOG/BRAVOEXCH, SFTP 7/7, Health OK). Після злиття PR
-#83/#84 функціональний runtime-diff між `developer` HEAD і тегом
-`v5.2.0-rc.7` порожній — відрізняються лише версійні метадані
-(`VERSION.json` на `developer` формально не піднімався вище rc.5).
+Хронологія RC-циклу 5.2.0 (2026-08-24/25):
+
+- `v5.2.0-rc.4`/`v5.2.0-rc.5` (лінія PR #83) — повний real-server
+  acceptance PASS (`SERV_HRDL_1`, `WIN-44OBNQ3R3OB`).
+- `v5.2.0-rc.6` — acceptance FAIL (фіксований поріг місця блокував
+  backup); `v5.2.0-rc.7` (rc.5 + PR #84: розрахункова перевірка
+  вільного місця з floor-override) — повний end-to-end acceptance PASS
+  2026-08-25 (`WIN-42Q5558LQC9`: backup MODEL/BLOG/BRAVOEXCH,
+  SFTP 7/7, Health OK).
+- `v5.2.0-rc.8` (rc.7 + PR #86: регістронезалежна деривація відносних
+  шляхів MODEL у Compare-FileSizes; закриває інцидент exit 43) —
+  **acceptance реставрації PASS** 2026-08-25 22:03-22:24 на сервері
+  інциденту (`LIMS`/ДНДІЛДВСЕ, `-ForceRestore`: bravocmd exit 0,
+  Critical=0, Rollback=NONE, служби відновлено, Trace-pipeline OK).
+- `v5.2.0-rc.9` (rc.8 + PR #88: живий підстатус консолі Maintenance +
+  PR #89: logs pipeline v2 — усі `*.out` з кореня інсталяції,
+  exchangAPI-архіви з оригінальними іменами на SFTP, структура
+  `logs/trace`/`logs/exchangapi` з одноразовою автоміграцією `trace/`)
+  — **acceptance ще не пройдено**; нова поверхня вимагає повного
+  maintenance-циклу на реальному сервері (WinSCP MoveFile-міграція,
+  автостворення `logs/*`, скан реальних `*.out`-варіантів).
+
+Перенесено на 5.3.0 (додатково до P3.2a/M1/M3 нижче): три відкладені
+Compare-FileSizes-фікси з локальної незапушеної гілки розробника
+(settle-retry, AV-вікно 12×15с, надійна enumeration; збережено в
+`backup/local-developer-rc2-line`) — механічний cherry-pick неможливий
+(функцію двічі переписано в 5.2.0: main-model/сегменти,
+регістронезалежні шляхи), а acceptance rc.8 на сервері інциденту
+пройшов без settle-логіки; залишковий ризик — клас «антивірус тримає
+файли MODEL одразу після bravocmd» на серверах з іншим AV. Там само
+збережено `127e7e4` (діагностика очікування operation-lock) — кандидат
+5.3.0. Решта локальних комітів тієї гілки верифіковано редундантні
+(зміст уже в developer іншими комітами).
 
 Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
 (stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО DEV-LIMS

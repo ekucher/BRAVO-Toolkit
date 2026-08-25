@@ -72,7 +72,15 @@ acceptance: нові SFTP-каталоги `logs/*`, WinSCP MoveFile-мігра�
 
 ---
 
-## 5.2.0-rc.8 — 2026-08-25 (candidate, pending acceptance)
+## 5.2.0-rc.8 — 2026-08-25 (candidate, acceptance passed)
+
+**UPD (2026-08-25 22:03-22:24): real-server acceptance реставрації
+ПРОЙДЕНО на сервері інциденту** (`LIMS`/ДНДІЛДВСЕ, `BRAVO_MAINTENANCE
+-ForceRestore`): `[5/8] Реставрація моделі OK 19:22 — bravocmd exit=0 |
+RemovedByRepair=0 | Critical=0 | Rollback=NONE | MainModel=OK`; фінал
+УСПІШНО/exit 0, служби відновлено автоматично, Trace-pipeline (добовий
+архів + SFTP) теж пройшов. Днем раніше той самий сервер на rc.7-коді
+давав 364 хибні «критичні зміни» і rollback=FAILED (exit 43).
 
 Кандидат = зміст прийнятого `v5.2.0-rc.7` (`5.2.0-rc.5` + розрахункова
 перевірка вільного місця з floor-override; повний end-to-end acceptance
