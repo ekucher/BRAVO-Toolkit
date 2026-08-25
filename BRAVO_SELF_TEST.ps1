@@ -8731,6 +8731,24 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             -Name "Discovery/BravoServiceRequiresNameAndDisplayNameMatch" `
             -Failure "служба з Name='BRAVO', але іншим Display name не повинна визнаватись службою BRAVO або спричиняти silent fallback на LIMSRoot"
 
+        # Реальний DEV-майданчик (2026-08-24): деякі інсталятори BRAVO/LIMS
+        # реєструють службу з DisplayName="BRAVO Server", а не
+        # "BRAVO Service" — обидва мають визнаватись канонічними без
+        # override (дефолт функції — масив), інакше AUTO-визначення
+        # BravoRoot/LIMSRoot ламається на цілком легітимній інсталяції.
+        $bravoServerDisplayNameServices = @(
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Server"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) }
+        )
+        $bravoServerDisplayNameDiscovery = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -Services $bravoServerDisplayNameServices `
+            -SystemRoot $noSuchSystemRoot
+        Test-BRAVOCondition `
+            -Condition (-not [string]::IsNullOrWhiteSpace([string]$bravoServerDisplayNameDiscovery.BRAVO_ROOT)) `
+            -Name "Discovery/BravoServerDisplayNameAcceptedAsCanonical" `
+            -Failure "служба BRAVO з DisplayName='BRAVO Server' (реальний DEV-варіант написання, не лише 'BRAVO Service') має визнаватись канонічною за замовчуванням; BRAVO_ROOT: '$($bravoServerDisplayNameDiscovery.BRAVO_ROOT)'"
+
         # bravo.ini — джерело істини системний каталог Windows, НЕ каталог
         # bravo.exe. -SystemRoot/-Is64BitOperatingSystem — ін'єкція для
         # детермінованості: реальний %SystemRoot% цієї машини не повинен
@@ -8960,13 +8978,13 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     # один каталог, а бекапи їхали б в інший).
     Test-BRAVOCondition `
         -Condition (
-            $bravoConfigTextForDiscovery.Contains('BravoDisplayName = "BRAVO Service"') -and
-            [regex]::IsMatch($bravoConfigTextForDiscovery, '-BravoDisplayName\s+\(\[string\]\$maintenanceSettings\.Services\.BravoDisplayName\)') -and
+            $bravoConfigTextForDiscovery.Contains('BravoDisplayName = @("BRAVO Service", "BRAVO Server")') -and
+            (@([regex]::Matches($bravoConfigTextForDiscovery, '-BravoDisplayName\s+@\(\$maintenanceSettings\.Services\.BravoDisplayName\)')).Count -eq 2) -and
             $bravoConfigTextForDiscovery.Contains('Resolve-BRAVOEffectiveBackupRoot') -and
             -not [regex]::IsMatch($bravoConfigTextForDiscovery, '\$global:pathSettings\.BackupRoot\s*=\s*\[string\]\$bravoDiscoveryResult\.BACKUP_ROOT')
         ) `
         -Name "Discovery/ConfigUsesStrictBravoIdentityAndResolvesBackupRoot" `
-        -Failure "BRAVO.config має передавати -BravoDisplayName='BRAVO Service' у Resolve-BRAVOInstallationDiscovery, обчислювати BackupRoot через Resolve-BRAVOEffectiveBackupRoot і НЕ перевизначати pathSettings.BackupRoot мовчки з Discovery.BACKUP_ROOT"
+        -Failure "BRAVO.config має передавати -BravoDisplayName=@(`"BRAVO Service`", `"BRAVO Server`") у Resolve-BRAVOEffectiveLimsRoot і Resolve-BRAVOInstallationDiscovery (обидва call-сайти, як масив — не [string]-cast), обчислювати BackupRoot через Resolve-BRAVOEffectiveBackupRoot і НЕ перевизначати pathSettings.BackupRoot мовчки з Discovery.BACKUP_ROOT"
 
     # CODE IS NOT DATA. Виробничі корені даних НЕ виводяться з розташування
     # комплекту: для комплекту в C:\BRAVO старі формули дали б LIMSRoot="C:\"
@@ -14078,6 +14096,10 @@ function Write-BRAVOLog {
     # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
     # архіві. Приймальну перевірку на DEV-LIMS не замінює.
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
+    # ConfigLoader: діагностичне збагачення помилки виконання BRAVO.config
+    # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
+    # замість голої NullReferenceException).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red

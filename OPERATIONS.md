@@ -107,6 +107,31 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 **Що означає.** `BRAVO.config` не пройшов валідацію, або ОС/PowerShell
 у рівні `Unsupported`.
 
+> **Гола `.NET`-помилка замість зрозумілого повідомлення (виправлено
+> 2026-08-24).** Якщо `BRAVO_SETUP.ps1`/`BRAVO_SELF_TEST.ps1`/
+> `BRAVO_DRY_RUN.ps1` завершуються з "Не вдалося завантажити
+> BRAVO.config ...: Ссылка на объект не указывает на экземпляр
+> объекта" (raw NullReferenceException) — реальний DEV-майданчик
+> підтвердив, що причина типово PowerShell <4.0 (`Get-BRAVOOSSupportTier`
+> класифікує це як `Unsupported` незалежно від версії ОС). Повідомлення
+> тепер додає прямий висновок `Get-BRAVOOSSupportTier` до причини —
+> перевірте `$PSVersionTable.PSVersion` і оновіть Windows Management
+> Framework до PowerShell 5.1. BRAVO не бекпортить сумісність із
+> PowerShell 3.x — це свідомо нижче baseline.
+
+> **"Не вдалося визначити BackupRoot: ... вимагає визначеного
+> EffectiveLIMSRoot" при УЖЕ встановленій і запущеній службі BRAVO.**
+> Перевірте `DisplayName` реальної служби: `Get-Service BRAVO | Select
+> DisplayName` (або `Get-CimInstance Win32_Service -Filter
+> "Name='BRAVO'" | Select DisplayName`). Discovery ідентифікує службу
+> BRAVO за Name ТА DisplayName одночасно (навмисний захист від хибного
+> співставлення з чужим сервісом) — з 2026-08-24 приймає обидва відомі
+> реальні варіанти написання, `"BRAVO Service"` і `"BRAVO Server"`
+> (`maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config`, за
+> замовчуванням масив з обома). Якщо на вашому сервері DisplayName
+> інший за обидва — допишіть його третім елементом списку (не
+> замінюйте наявні два).
+
 **Чого не робити.** Не встановлювати `BRAVO_ALLOW_UNSUPPORTED_OS=1`
 як спосіб «прибрати помилку» — це свідоме зняття гарантій, а не
 виправлення.

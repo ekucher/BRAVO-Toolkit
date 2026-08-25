@@ -933,7 +933,21 @@ function Write-DryRunOutput {
         $dryRunInstitutionName = [string]$bravoSettingsVariable.Value.InstitutionName
         $dryRunInstitutionCode = [string]$bravoSettingsVariable.Value.InstitutionCode
     }
-    $dryRunVersionText = if ($global:ScriptVersion) { [string]$global:ScriptVersion } else { 'невідома' }
+    # Get-Variable -ErrorAction SilentlyContinue, а не "if ($global:ScriptVersion)":
+    # BRAVO_CONFIG_LOADER.ps1 (dot-sourced вище) вмикає Set-StrictMode -Version
+    # 2.0 у ЦЬОМУ scope теж (dot-source зливає scope викликача) — читання ще не
+    # створеної (не просто $null/порожньої) $global:ScriptVersion під strict
+    # mode кидає VariableIsUndefined навіть у "безпечному" if(...)-контексті.
+    # Реальний DEV-майданчик (2026-08-24): саме тут dry-run після коректно
+    # спійманої "Не вдалося завантажити BRAVO.config" падав ВДРУГЕ, уже без
+    # жодного перехоплення, ховаючи первинну причину за незрозумілим
+    # "Переменная не может быть получена".
+    $scriptVersionVariable = Get-Variable -Name ScriptVersion -Scope Global -ErrorAction SilentlyContinue
+    $dryRunVersionText = if ($null -ne $scriptVersionVariable -and $scriptVersionVariable.Value) {
+        [string]$scriptVersionVariable.Value
+    } else {
+        'невідома'
+    }
     # Ярлик режиму має описувати те, що дійсно відбудеться. З -TestAccess
     # прогін НЕ є read-only: він робить create/write/read/delete проби в
     # локальних каталогах і створює відсутні каталоги призначення на SFTP

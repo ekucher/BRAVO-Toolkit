@@ -46,7 +46,22 @@ $archiveScriptText = [IO.File]::ReadAllText(
             ) `
             -Name 'ManualLaunchers/BypassIsScopedToLauncherGenerator' `
             -Failure 'BRAVO_SETUP.ps1 може містити рівно один ExecutionPolicy Bypass і лише всередині New-BRAVOManualLauncherContent; ширший allowlist був би security-регресією'
-        $manualLauncherRoot = Join-Path ([IO.Path]::GetTempPath()) (
+        # [IO.Path]::GetTempPath() наслідує %TEMP%, який на локалізованих
+        # Windows-установках (реальний DEV-майданчик, 2026-08-24: обліковий
+        # запис "Администратор") містить не-ASCII символи в шляху профілю
+        # користувача — саме ASCII-чистоту тут перевіряє New-
+        # BRAVOManualLauncherContent (навмисно, fail-closed: .cmd-launcher-и
+        # з не-ASCII шляхом мають відомі проблеми кодування cmd.exe). Без
+        # цього кожен сценарій нижче, включно з тими, що НЕ мають нічого
+        # спільного з ASCII-перевіркою, падав би на будь-якій кириличній
+        # установці — не через дефект BRAVO, а через випадковий артефакт
+        # локалізованого %TEMP%. C:\Windows\Temp не залежить від
+        # локалізованого імені користувача і завжди ASCII.
+        $manualLauncherTempBase = [IO.Path]::GetTempPath()
+        if ($manualLauncherTempBase -cmatch '[^\x00-\x7F]') {
+            $manualLauncherTempBase = Join-Path $env:SystemRoot 'Temp'
+        }
+        $manualLauncherRoot = Join-Path $manualLauncherTempBase (
             'BRAVO_MANUAL_LAUNCHERS_{0}' -f [guid]::NewGuid().ToString('N')
         )
         try {
