@@ -68,17 +68,33 @@ function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
 '@
 $compareFileSizesModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText ($compareFileSizesStubText + "`n" + $maintenanceRepairScriptText) `
-    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
+    -FunctionNames @('Write-Log', 'Send-SlackAlert', 'Get-BRAVOFiles', 'Format-FileSize', 'Get-BRAVOModelRelativePath', 'New-BRAVOCompareFileSizesResult', 'Compare-FileSizes')
 
 function Invoke-BRAVOCompareFileSizesScenario {
     param(
         [Parameter(Mandatory = $true)][hashtable]$BeforeFiles,
         [Parameter(Mandatory = $true)][hashtable]$AfterFiles,
-        [string]$MainModelRelativePath
+        [string]$MainModelRelativePath,
+        # Реальний інцидент (ДНДІЛДВСЕ, 2026-08-25): bravo.ini MODEL= містить
+        # шлях з іншим регістром (мала літера диска), ніж нормалізований
+        # FullName від Get-ChildItem. Перемикач передає Compare-FileSizes
+        # той самий каталог, але з повністю зміненим регістром рядка шляху —
+        # Windows-резолюція шляху ідентична, відрізняється лише рядок.
+        [switch]$InvertModelPathCase
     )
     $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ("BRAVO_COMPAREFILESIZES_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
     [void][IO.Directory]::CreateDirectory($scenarioRoot)
+    $effectiveModelPath = if ($InvertModelPathCase) {
+        # ToLowerInvariant дає той самий каталог, але інший РЯДОК шляху:
+        # літера диска й компоненти на кшталт Users/AppData/Temp стають
+        # малими, тоді як Get-ChildItem у Compare-FileSizes поверне FullName
+        # з нормалізованим регістром (велика літера диска + фактичний
+        # регістр каталогів) — точна сигнатура інциденту.
+        $scenarioRoot.ToLowerInvariant()
+    } else {
+        $scenarioRoot
+    }
     try {
         foreach ($relativePath in $AfterFiles.Keys) {
             $fullPath = Join-Path $scenarioRoot $relativePath
@@ -96,7 +112,7 @@ function Invoke-BRAVOCompareFileSizesScenario {
             param($BeforeFile, $ModelPath, $MainModelRelativePath)
             Set-StrictMode -Version Latest
             Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath $MainModelRelativePath
-        } $beforeCsvPath $scenarioRoot $MainModelRelativePath
+        } $beforeCsvPath $effectiveModelPath $MainModelRelativePath
     } finally {
         if (Test-Path -LiteralPath $scenarioRoot) {
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -319,18 +335,71 @@ Test-BRAVOCondition `
     -Name "Maintenance/CompareFileSizesTempDollarPlusMdMixed" `
     -Failure "змішаний: DEPART.md = CRITICAL, KZPpat.`$`$`$ = RemovedByRepair(1); отримано HasCriticalChanges=$($resultTempAndMd.HasCriticalChanges), RemovedByRepairCount=$($resultTempAndMd.RemovedByRepairCount)"
 
-# --- Викликач деривує hint від MAIN_MODEL_FILE тим самим правилом, що й
-# writer before-CSV (Replace+TrimStart), а не здогадом "$MODEL_NAME.md".
+# --- Регресія реального інциденту (ДНДІЛДВСЕ, 2026-08-25, exit 43):
+# bravo.ini MODEL= з малою літерою диска ("d:\LIMS\Model"), Get-ChildItem
+# нормалізує FullName до "D:\...", ordinal Replace НЕ зрізав корінь, ключі
+# lookup ставали абсолютними шляхами і ВСІ 546 файлів before-CSV оголошувались
+# відсутніми (364 CRITICAL + 182 RemovedByRepair) навіть одразу після
+# успішного rollback. Той самий каталог, змінено лише регістр рядка шляху ->
+# нічого не зникло -> НЕ критично.
+$resultRootCaseMismatch = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -InvertModelPathCase
+Test-BRAVOCondition `
+    -Condition (-not $resultRootCaseMismatch.HasCriticalChanges -and $resultRootCaseMismatch.RemovedByRepairCount -eq 0) `
+    -Name "Maintenance/CompareFileSizesRootCaseInsensitive" `
+    -Failure "ModelPath з іншим регістром (той самий каталог) не повинен перетворювати всі файли на 'відсутні': HasCriticalChanges має бути false; отримано HasCriticalChanges=$($resultRootCaseMismatch.HasCriticalChanges), RemovedByRepairCount=$($resultRootCaseMismatch.RemovedByRepairCount), CriticalFiles=$(@($resultRootCaseMismatch.CriticalFiles).Count)"
+
+# --- Той самий регістровий розсинхрон + штатно зниклий сегмент: класифікація
+# RemovedByRepair/critical має працювати ідентично незалежно від регістру кореня.
+$resultRootCaseMismatchSegment = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'TestProject.md' = 500000 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -InvertModelPathCase
+Test-BRAVOCondition `
+    -Condition (-not $resultRootCaseMismatchSegment.HasCriticalChanges -and $resultRootCaseMismatchSegment.RemovedByRepairCount -eq 1) `
+    -Name "Maintenance/CompareFileSizesRootCaseInsensitiveSegmentRemoved" `
+    -Failure "при регістровому розсинхроні кореня зниклий сегмент .000 має класифікуватись RemovedByRepair(1), не CRITICAL; отримано HasCriticalChanges=$($resultRootCaseMismatchSegment.HasCriticalChanges), RemovedByRepairCount=$($resultRootCaseMismatchSegment.RemovedByRepairCount)"
+
+# --- Юніт-контракт Get-BRAVOModelRelativePath: регістронезалежний зріз
+# кореня, точний збіг -> '', шлях поза коренем -> без змін (fail-closed).
+$relativePathScenarios = @(
+    @{ FullName = 'D:\LIMS\Model\ACT.md';       Root = 'd:\lims\model';    Expected = 'ACT.md';        Label = 'CaseInsensitiveRoot' }
+    @{ FullName = 'D:\LIMS\Model\sub\x.000';    Root = 'D:\LIMS\Model';    Expected = 'sub\x.000';     Label = 'Subdirectory' }
+    @{ FullName = 'D:\LIMS\Model';              Root = 'd:\LIMS\MODEL\';   Expected = '';              Label = 'ExactRootMatch' }
+    @{ FullName = 'E:\Other\file.md';           Root = 'D:\LIMS\Model';    Expected = 'E:\Other\file.md'; Label = 'OutsideRootUnchanged' }
+    @{ FullName = 'D:\LIMS\ModelBackup\a.md';   Root = 'D:\LIMS\Model';    Expected = 'D:\LIMS\ModelBackup\a.md'; Label = 'PrefixNotComponentBoundary' }
+)
+foreach ($scenario in $relativePathScenarios) {
+    $derived = & $compareFileSizesModule {
+        param($FullName, $RootPath)
+        Get-BRAVOModelRelativePath -FullName $FullName -RootPath $RootPath
+    } $scenario.FullName $scenario.Root
+    Test-BRAVOCondition `
+        -Condition ($derived -ceq $scenario.Expected) `
+        -Name "Maintenance/ModelRelativePath[$($scenario.Label)]" `
+        -Failure "Get-BRAVOModelRelativePath('$($scenario.FullName)', '$($scenario.Root)') має повернути '$($scenario.Expected)'; отримано '$derived'"
+}
+
+# --- Викликач деривує hint від MAIN_MODEL_FILE тим самим канонічним правилом
+# Get-BRAVOModelRelativePath, що й writer before-CSV та lookup у
+# Compare-FileSizes, а не здогадом "$MODEL_NAME.md" і не ordinal Replace
+# (регістрочутливий Replace — корінь інциденту ДНДІЛДВСЕ 2026-08-25).
 Test-BRAVOCondition `
     -Condition (
         $maintenanceRepairScriptText.Contains(
-            '$mainModelRelativeHint = $MAIN_MODEL_FILE.Replace($MODEL_PATH, "").TrimStart(''\'')'
+            '$mainModelRelativeHint = Get-BRAVOModelRelativePath -FullName $MAIN_MODEL_FILE -RootPath $MODEL_PATH'
         ) -and
         $maintenanceRepairScriptText.Contains('-MainModelRelativePath $mainModelRelativeHint') -and
-        -not $maintenanceRepairScriptText.Contains('-MainModelRelativePath "$MODEL_NAME.md"')
+        -not $maintenanceRepairScriptText.Contains('-MainModelRelativePath "$MODEL_NAME.md"') -and
+        -not $maintenanceRepairScriptText.Contains('.Replace($MODEL_PATH, "").TrimStart') -and
+        -not $maintenanceRepairScriptText.Contains('.Replace($ModelPath, "").TrimStart')
     ) `
     -Name "Maintenance/MainModelHintDerivedFromMainModelFile" `
-    -Failure "hint для Compare-FileSizes має деривуватися від MAIN_MODEL_FILE правилом Replace+TrimStart (як writer before-CSV), а не передаватися здогадом `"`$MODEL_NAME.md`""
+    -Failure "hint/writer/lookup мають деривувати відносний шлях канонічним Get-BRAVOModelRelativePath (регістронезалежно), без залишків ordinal Replace+TrimStart і без здогаду `"`$MODEL_NAME.md`""
 
 # ============================================================
 # Discord HTTP 429: обмежений retry з пріоритетом на Retry-After.
