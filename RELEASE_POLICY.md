@@ -972,8 +972,20 @@ developer: 4.5.1-dev.1
 
 ```text
 master:    5.1.0   (stable, тег v5.1.0, merge PR #61 = aee27e4)
-developer: 5.2.0-rc.3 (prerelease, acceptance ще не пройдено)
+developer: 5.2.0-rc.5 у VERSION.json (prerelease); фактичний код
+           HEAD = зміст прийнятого v5.2.0-rc.7 (див. нижче)
 ```
+
+Стан RC-циклу 5.2.0 (2026-08-24/25): `v5.2.0-rc.4` і `v5.2.0-rc.5`
+(лінія PR #83) пройшли повний real-server acceptance (`SERV_HRDL_1`,
+`WIN-44OBNQ3R3OB`). Поверх rc.5 додано розрахункову перевірку вільного
+місця (PR #84): `v5.2.0-rc.6` провалив acceptance через відсутність
+floor-override фіксу, `v5.2.0-rc.7` (rc.5 + PR #84 включно з фіксом)
+пройшов повний end-to-end acceptance 2026-08-25 (`WIN-42Q5558LQC9`:
+backup MODEL/BLOG/BRAVOEXCH, SFTP 7/7, Health OK). Після злиття PR
+#83/#84 функціональний runtime-diff між `developer` HEAD і тегом
+`v5.2.0-rc.7` порожній — відрізняються лише версійні метадані
+(`VERSION.json` на `developer` формально не піднімався вище rc.5).
 
 Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
 (stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО DEV-LIMS
