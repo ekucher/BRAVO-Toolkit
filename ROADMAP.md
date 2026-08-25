@@ -45,28 +45,47 @@ Authenticode, підписані git tags і криптографічно під
 
 ### P0.1 — Завершити hotfix 5.0.1
 
+**Статус (2026-08-25): цикл закрито.** PR #45 (`hotfix/5.0.1`) злито,
+stable `5.0.1` випущено 2026-08-18 (тег `v5.0.1`, CHANGELOG §5.0.1) і
+синхронізовано назад у `developer`. Формального real-server acceptance
+саме PR #45 у репозиторії не зафіксовано (промоція спиралась на
+CI + повний self-test із regression-доказом); notification
+routing/override поведінку повторно підтверджено real-server
+acceptance циклу 5.1.0 (rc.2/rc.4 PASS).
+
 Поточний production-дефект notification override має бути закритий до нових feature-релізів.
 
 Критерії завершення:
 
-- [ ] PR #45 проходить real-server acceptance.
-- [ ] Перевірено `NotificationMode=none/errors_only/all` з `-EnableAllSlack`/`-DisableAllSlack`.
-- [ ] Перевірено GENERAL/ALERTS routing і credential fallback.
-- [ ] Перевірено Maintenance final report і критичні alerts.
-- [ ] `5.0.1-rc.1` промотовано у stable `5.0.1` без функціональних змін після acceptance.
-- [ ] Hotfix синхронізовано назад у `developer`.
+- [ ] PR #45 проходить real-server acceptance. *(не зафіксовано окремо;
+      покрито опосередковано acceptance 5.1.0-rc.2/rc.4)*
+- [ ] Перевірено `NotificationMode=none/errors_only/all` з `-EnableAllSlack`/`-DisableAllSlack`. *(окремий протокол відсутній)*
+- [ ] Перевірено GENERAL/ALERTS routing і credential fallback. *(routing підтверджено acceptance 5.1.0-rc.4)*
+- [ ] Перевірено Maintenance final report і критичні alerts. *(окремий протокол відсутній)*
+- [x] `5.0.1-rc.1` промотовано у stable `5.0.1` без функціональних змін після acceptance.
+- [x] Hotfix синхронізовано назад у `developer`.
 
 ### P0.2 — Закрити release governance
 
 Мета — унеможливити повторення прямого feature merge у `master` в обхід RC/acceptance.
 
+**Статус (2026-08-25): здебільшого закрито.** PR #46 злито
+(`ci/Test-BRAVOMasterMergePolicy.ps1` працює в CI: PR у `master`
+приймається лише з `developer`/`hotfix/*` і лише з піднятою
+`packageVersion`). Залишок: гейт порівнює версії на нерівність рядків
+(не семантичне збільшення) і не перевіряє repository identity; branch
+protection із required checks недоступна на поточному GitHub-плані
+(задокументовано в `RELEASE_POLICY.md` §«Технічний стан»), через що
+admin-обхід required checks лишається можливим (прецедент — merge
+PR #61 під час промоційного вікна 5.1.0).
+
 Критерії завершення:
 
-- [ ] PR #46 доведено до merge після виправлення всіх review findings.
-- [ ] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity.
-- [ ] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків.
-- [ ] `master` не приймає feature/fix PR напряму.
-- [ ] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan.
+- [x] PR #46 доведено до merge після виправлення всіх review findings.
+- [ ] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity. *(джерело — так; repository identity — ні)*
+- [ ] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків. *(наразі — лише нерівність)*
+- [x] `master` не приймає feature/fix PR напряму. *(через CI-гейт; без branch protection admin-обхід можливий)*
+- [ ] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(branch protection не ввімкнено — потребує GitHub Pro)*
 
 ### P0.3 — Захист remote backup history
 
@@ -148,13 +167,22 @@ BRAVO-Toolkit-X.Y.Z.zip.sha256
 release-manifest.json
 ```
 
+**Статус (2026-08-25): закрито.** Реалізовано
+`.github/workflows/release-artifact.yml` +
+`ci/New-BRAVOReleaseArtifact.ps1`: збірка з конкретного git ref із
+провенанс-гейтом (`sourceCommit` має бути повним hash), `*.zip.sha256`,
+`release-manifest.json` (product/version/sourceCommit/files+hashes),
+повний self-test із розпакованого артефакту перед публікацією; процедура
+отримання/перевірки описана в `BRAVO_SETUP.md`, розділ «Отримання
+комплекту (release artifact)».
+
 Критерії завершення:
 
-- [ ] Artifact збирається автоматично з конкретного release commit/tag.
-- [ ] SHA-256 перевіряється до deployment.
-- [ ] Manifest містить product, version, sourceCommit і список файлів/хешів.
-- [ ] Artifact проходить CI/self-test перед публікацією.
-- [ ] Документація оновлення посилається на artifact, а не на ручне копіювання випадкового checkout.
+- [x] Artifact збирається автоматично з конкретного release commit/tag.
+- [x] SHA-256 перевіряється до deployment.
+- [x] Manifest містить product, version, sourceCommit і список файлів/хешів.
+- [x] Artifact проходить CI/self-test перед публікацією.
+- [x] Документація оновлення посилається на artifact, а не на ручне копіювання випадкового checkout.
 
 Підпис artifact/manifest є optional future hardening, не blocker для цього етапу.
 
