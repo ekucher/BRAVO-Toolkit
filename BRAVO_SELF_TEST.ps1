@@ -7847,6 +7847,23 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Health/ServerSideHashFallbackIsInfoNotWarning" `
         -Failure "фолбек на .sha512-файл — це успішна перевірка іншим методом, а не WARNING; має логуватись як INFO"
 
+    # 5.2.1 (реальний алерт SERV_HRDL_1 23:03): активний WinSCP.com іншої
+    # BRAVO-операції робив SFTP health-check CRITICAL «ПОТРІБНА ДІЯ».
+    # Transient-конкуренція = ВІДКЛАДЕННЯ: pre-check зайнятості ДО
+    # конфігураційних/мережевих кроків -> WARNING + return без issues,
+    # кроки SFTP — SKIPPED, SftpVerified не оголошується підтвердженим.
+    Test-BRAVOCondition `
+        -Condition (
+            [regex]::IsMatch(
+                $healthRuntimeText,
+                '(?s)\$sftpWinScpAvailability = Test-BRAVOWinSCPAvailable -WinSCPPath \$winSCPPath.*?BRAVOHealthSftpCheckDeferredByBusyWinSCP = \$true.*?-Level "WARNING"\s*\r?\n\s*return @\(\)'
+            ) -and
+            $healthRuntimeText.Contains("'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount `$sftpArchivesStepIssues.Count }") -and
+            $healthRuntimeText.Contains('$destinationSummary.SftpVerified = $false')
+        ) `
+        -Name "Health/BusyWinScpDefersSftpCheckAsWarning" `
+        -Failure "зайнятий WinSCP.com має ВІДКЛАДАТИ SFTP health-check (WARNING + SKIPPED-кроки + SftpVerified=false), а не давати CRITICAL «ПОТРІБНА ДІЯ» — transient-конкуренція з іншою BRAVO-передачею не є збоєм SFTP"
+
     # CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md: автоматичний Discovery джерел
     # (BRAVO_ROOT/WEB_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP/BAZA_WWW) за
     # встановленою службою BRAVO і активним bravo.ini, з повним ручним

@@ -700,6 +700,9 @@ Initialize-BRAVOProgress -Activity 'BRAVO HEALTH' -Enabled ([bool]$progressSetti
 $script:BRAVOHealthSftpStepEnabled = $sftpCredentialRequired
 $script:BRAVOHealthSmbStepEnabled = $smbCredentialRequired
 $script:BRAVOHealthNotificationStepEnabled = ($NotificationMode -ne 'none') -and (-not $NoSlack)
+# SFTP-перевірку відкладено через зайнятий WinSCP (див. Get-SFTPHealthIssues):
+# кроки SFTP рендеряться SKIPPED, SftpVerified не оголошується підтвердженим.
+$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $false
 # Середовище, керовані служби й локальні копії виконуються завжди.
 # dev.16 (review round 3): BAZA (локальна копія) і SFTP розділені на
 # незалежні dynamic steps — Total тепер точно дорівнює кількості РЕАЛЬНО
@@ -2968,6 +2971,26 @@ function Get-SFTPHealthIssues {
         return @()
     }
 
+    # 5.2.1 (реальний алерт SERV_HRDL_1 23:03): активний WinSCP.com іншої
+    # BRAVO-операції (паралельна передача/затяжна синхронізація) робив
+    # SFTP-перевірку CRITICAL «ПОТРІБНА ДІЯ», хоча це transient-конкуренція,
+    # а не збій SFTP. Тепер зайнятий WinSCP = ВІДКЛАДЕННЯ: WARNING у лозі
+    # (exit 10/ЧАСТКОВО, жовте сповіщення), кроки SFTP — SKIPPED, наступний
+    # health-прогін (кожні 4 год) перевірить знову. Довго висячий процес
+    # видно з PID у попередженні — його завершує оператор. Fail-closed не
+    # втрачено: реальна відсутність свіжих копій на SFTP почервоніє, щойно
+    # WinSCP звільниться і перевірка виконається.
+    $sftpWinScpAvailability = Test-BRAVOWinSCPAvailable -WinSCPPath $winSCPPath
+    if (-not $sftpWinScpAvailability.Available) {
+        $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $true
+        Write-HealthLog (
+            (Get-BRAVOWinSCPBusyMessage -Availability $sftpWinScpAvailability -Operation "SFTP health-check") +
+            " — перевірку відкладено до наступного health-прогону (ймовірно, триває інша передача BRAVO); " +
+            "якщо процес WinSCP.com висить довго — завершіть його вручну"
+        ) -Level "WARNING"
+        return @()
+    }
+
     $configurationResult = Test-SFTPHealthConfiguration `
         -CheckArchives $checkArchives `
         -CheckBAZA $checkBAZA `
@@ -4942,23 +4965,26 @@ $sftpSharedIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP'
 $sftpArchivesStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -in $sftpArchiveComponentNames }) + @($sftpSharedIssues)
 $sftpBazaAppStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA APP' }) + @($sftpSharedIssues)
 $sftpBazaWWWStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA WWW' }) + @($sftpSharedIssues)
+# Відкладення через зайнятий WinSCP (5.2.1): кроки SFTP — SKIPPED з
+# причиною, а не OK (нічого не перевірено) і не ERROR (це не збій SFTP).
+$sftpDeferredDetails = 'відкладено: WinSCP зайнятий іншою операцією'
 if ($sftpArchivesHealthEnabled) {
     Write-BRAVOHealthStep `
         -Name 'SFTP: резервні копії' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpArchivesStepIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpArchivesStepIssues.Count)
+        -Status $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { 'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount $sftpArchivesStepIssues.Count }) `
+        -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpArchivesStepIssues.Count })
 }
 if ($sftpBazaAppHealthEnabled) {
     Write-BRAVOHealthStep `
         -Name 'SFTP: BAZA_APP' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaAppStepIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaAppStepIssues.Count)
+        -Status $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { 'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount $sftpBazaAppStepIssues.Count }) `
+        -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpBazaAppStepIssues.Count })
 }
 if ($sftpBazaWWWHealthEnabled) {
     Write-BRAVOHealthStep `
         -Name 'SFTP: BAZA_WWW' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaWWWStepIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count)
+        -Status $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { 'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount $sftpBazaWWWStepIssues.Count }) `
+        -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count })
 }
 if (-not $sftpArchivesHealthEnabled -and -not $sftpBazaAppHealthEnabled -and -not $sftpBazaWWWHealthEnabled) {
     Write-HealthLog "SFTP health-check пропущено: усі SFTP-перевірки вимкнено в конфігурації"
@@ -4980,6 +5006,11 @@ $destinationSummary = Get-BRAVOHealthDestinationSummary `
     -BazaLocalIssues $bazaLocalHealthIssues `
     -SftpIssues $sftpHealthIssues `
     -SmbIssues $smbHealthIssues
+if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) {
+    # Відкладена SFTP-перевірка не має оголошуватись підтвердженою: нуль
+    # issues означає «не перевіряли», а не «перевірено успішно».
+    $destinationSummary.SftpVerified = $false
+}
 
 if ($healthIssues.Count -eq 0) {
     Write-HealthLog "Усі керовані служби працюють, а локальні, SFTP та NAS/SMB-компоненти мають актуальні резервні копії" -Level "SUCCESS"
