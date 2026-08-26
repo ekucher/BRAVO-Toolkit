@@ -105,3 +105,95 @@ try {
 } finally {
     Remove-Item -LiteralPath $dryRunScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# ============================================================
+# BRAVO.local.config (5.2.1): локальні site-overrides, що переживають
+# оновлення комплекту. Кожен сценарій — ізольований дочірній
+# powershell.exe (Import-BravoConfiguration змінює глобальний стан).
+# ============================================================
+$localCfgScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_LOCALCFG_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+try {
+    [void][IO.Directory]::CreateDirectory($localCfgScenarioRoot)
+    $localCfgBackupDir = Join-Path $localCfgScenarioRoot 'SITE_BACKUP'
+    [void][IO.Directory]::CreateDirectory($localCfgBackupDir)
+    Copy-Item (Join-Path $root 'BRAVO.config') (Join-Path $localCfgScenarioRoot 'BRAVO.config')
+    $localCfgOverridePath = Join-Path $localCfgScenarioRoot 'BRAVO.local.config'
+    $localCfgBackupLiteral = $localCfgBackupDir.Replace("'", "''")
+
+    # --- Фаза 1 + фаза 2 + деривації: BackupRoot протягується в archiveDirs,
+    # BootRestoreMode -> Recovery.Enabled, пізній поріг BAZA, скаляр.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$localCfgBackupLiteral'`r`n" +
+        "    'maintenanceSettings.Restore.BootRestoreMode' = 'HoldServices'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = 77`r`n" +
+        "    'sftpHostTemplate' = '{0}.selftest-example.test'`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'{0}|{1}|{2}|{3}|{4}' -f [string]`$global:archiveDirs.Model, " +
+            "[string]`$global:maintenanceSettings.Restore.BootRestoreMode, " +
+            "[string]`$global:schedulerSettings.Recovery.Enabled, " +
+            "[string]`$global:backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold, " +
+            "(@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count)"
+        ) 2>&1
+    $localCfgProbeLast = ([string](@($localCfgProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgProbeLast -eq "$localCfgBackupDir\MODEL|HoldServices|True|77|4") `
+        -Name "ConfigLoader/LocalOverridesApplyAcrossBothPhasesWithDerivations" `
+        -Failure "BRAVO.local.config має перевизначати первинні поля ДО деривацій (BackupRoot -> archiveDirs.Model; BootRestoreMode -> Recovery.Enabled=True) і пізні leaf-поля (поріг BAZA=77), з обліком у metadata (4 ключі); отримано: '$localCfgProbeLast'"
+
+    # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
+    [IO.File]::WriteAllText($localCfgOverridePath,
+        "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",
+        (New-Object System.Text.UTF8Encoding $false))
+    $localCfgTypoProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW' }"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition ($localCfgTypoProbe.Contains('THREW') -and -not $localCfgTypoProbe.Contains('NO-THROW')) `
+        -Name "ConfigLoader/LocalOverrideUnknownKeyFailsClosed" `
+        -Failure "невідомий dot-шлях у BRAVO.local.config мусить давати помилку конфігурації (конфіг, що бреше, гірший за помилку); отримано: $localCfgTypoProbe"
+
+    # --- Виконуваний код у файлі -> відхилення (data-only контракт).
+    [IO.File]::WriteAllText($localCfgOverridePath,
+        "@{ 'pathSettings.BackupRoot' = (Get-Date).ToString() }",
+        (New-Object System.Text.UTF8Encoding $false))
+    $localCfgCodeProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW' }"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition ($localCfgCodeProbe.Contains('THREW') -and -not $localCfgCodeProbe.Contains('NO-THROW')) `
+        -Name "ConfigLoader/LocalOverrideRejectsExecutableCode" `
+        -Failure "BRAVO.local.config — data-only: файл із виконуваним кодом мусить відхилятись (CheckRestrictedLanguage); отримано: $localCfgCodeProbe"
+
+    # --- Без файла -> штатне завантаження, metadata порожній.
+    Remove-Item -LiteralPath $localCfgOverridePath -Force
+    $localCfgAbsentProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+                "'OK ' + (@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count)"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition ($localCfgAbsentProbe.Contains('OK 0')) `
+        -Name "ConfigLoader/LocalOverrideFileAbsentIsNoop" `
+        -Failure "відсутній BRAVO.local.config = штатне завантаження без overrides; отримано: $localCfgAbsentProbe"
+} finally {
+    Remove-Item -LiteralPath $localCfgScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

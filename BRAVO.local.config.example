@@ -1,0 +1,48 @@
+# BRAVO.local.config — приклад локальних site-відмінностей.
+#
+# ЯК КОРИСТУВАТИСЬ: скопіюйте цей файл як BRAVO.local.config у той самий
+# каталог, де лежить effective BRAVO.config, розкоментуйте/додайте потрібні
+# ключі. Файл ПЕРЕЖИВАЄ оновлення комплекту (оновлення замінює BRAVO.config,
+# але не чіпає BRAVO.local.config) — редагувати BRAVO.config вручну більше
+# не потрібно.
+#
+# ФОРМАТ: data-only hashtable «dot-шлях -> значення». Виконуваний код
+# заборонений (файл відхиляється). Ключ — шлях від імені глобального блоку
+# BRAVO.config через крапки до кінцевого поля. Невідомий/помилковий шлях =
+# помилка конфігурації при запуску (опечатки не мовчать).
+#
+# Первинні поля (pathSettings/maintenanceSettings/componentSettings/...)
+# застосовуються ДО деривацій — перевизначений BackupRoot коректно
+# протягується в archiveDirs/scheduler. Пізні блоки (backupMonitoring,
+# sftpDirectories, schedulerSettings) — фінальні значення.
+@{
+    # --- Найтиповіші site-відмінності ---
+
+    # Корінь резервних копій (порожньо в комплекті = AUTO від LIMSRoot\ARCHIV):
+    # 'pathSettings.BackupRoot' = 'E:\ARCHIV'
+
+    # Профіль сервера робочого часу (boot-recovery з утриманням служб):
+    # 'maintenanceSettings.Restore.BootRestoreMode' = 'HoldServices'
+
+    # Поріг авто-архівування append-only мутацій BAZA (0 = жорсткий блок):
+    # 'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = 50
+
+    # Мінімум вільного місця (ГБ):
+    # 'maintenanceSettings.Limits.MinimumFreeSpaceGB' = 30
+
+    # Друге trace-джерело (TraceBIS.out; порожньо = AUTO, 'off' = вимкнено):
+    # 'maintenanceSettings.Trace.BISSourcePath' = 'D:\LIMS\TraceBIS.out'
+
+    # Режим сповіщень (none | errors_only | all):
+    # 'bravoSettings.NotificationMode' = 'errors_only'
+
+    # SFTP-хост (шаблон; {0} = логін зі сховища credentials):
+    # 'sftpHostTemplate' = '{0}.example-storage.com'
+
+    # NAS/SMB-корінь:
+    # 'smbSettings.RootPath' = '\\192.168.1.10\backup\BRAVO'
+
+    # Вікно планової реставрації:
+    # 'maintenanceSettings.Restore.WindowStart' = '20:00'
+    # 'maintenanceSettings.Restore.WindowEnd' = '04:00'
+}

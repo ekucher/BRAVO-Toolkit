@@ -1,4 +1,4 @@
-# BRAVO 5.2.1-rc.6 — комплексне налаштування і безпечний тестовий прогін
+# BRAVO 5.2.1-rc.7 — комплексне налаштування і безпечний тестовий прогін
 
 Кожен запуск setup і його допоміжних дочірніх скриптів створює окремий
 transcript у `LOGS\HELPERS`. Ім'я містить назву скрипта, timestamp і PID, а
@@ -71,6 +71,34 @@ shutdown та інші production-операції у цьому сценарі�
 Під час інсталяції Планувальника `BRAVO_TASKS_INSTALL.ps1` відмовляється
 створювати SYSTEM-завдання з профілю користувача, захищає runtime ACL та
 вмикає журнал `Microsoft-Windows-TaskScheduler/Operational`.
+
+## Локальні site-відмінності: `BRAVO.local.config` (5.2.1)
+
+Нетипові інсталяції більше не потребують ручного редагування
+`BRAVO.config` після кожного оновлення. Створіть поряд з effective
+`BRAVO.config` файл **`BRAVO.local.config`** (шаблон —
+`BRAVO.local.config.example` у комплекті): data-only hashtable
+«dot-шлях → значення», наприклад:
+
+```powershell
+@{
+    'pathSettings.BackupRoot' = 'E:\ARCHIV'
+    'maintenanceSettings.Restore.BootRestoreMode' = 'HoldServices'
+    'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = 50
+}
+```
+
+Правила:
+
+- файл **переживає оновлення** (оновлення замінює `BRAVO.config`, локальний
+  файл не чіпається);
+- первинні поля (`pathSettings`/`maintenanceSettings`/`componentSettings`/
+  sftp-скаляри/`smbSettings`) застосовуються **до деривацій** — перевизначений
+  `BackupRoot` коректно протягується в каталоги архівів і Планувальник;
+- виконуваний код у файлі заборонений (файл відхиляється);
+- невідомий/помилковий dot-шлях = помилка конфігурації при запуску
+  (опечатки не мовчать);
+- застосовані ключі видно в metadata завантаження (діагностика).
 
 ## Локальні параметри установи
 
