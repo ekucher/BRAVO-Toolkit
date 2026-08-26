@@ -360,6 +360,28 @@ try {
             -ValidateOnly:$ValidateOnly
     }
 
+    # Захист State-кореня (%ProgramData%\BRAVO\State): ownership-маркери в
+    # ньому — вхід для привілейованих дій SYSTEM-Health (Start-Service за
+    # quiescence-маркером), тому запис туди мають лише SYSTEM і
+    # Administrators. З адмін-правами невідповідні ACL зміцнюються; у
+    # ValidateOnly/неелевованому прогоні — лише перевірка зі звітом.
+    $stateRootProtection = if ((Test-IsAdministrator) -and -not $ValidateOnly) {
+        Protect-BRAVOMachineStateRoot
+    } else {
+        Protect-BRAVOMachineStateRoot -CheckOnly
+    }
+    if ($stateRootProtection.Applied) {
+        Write-BRAVOResultField -Label 'State ACL' -Value "зміцнено: $($stateRootProtection.Path)" -Color ([ConsoleColor]::Green)
+    } elseif ($stateRootProtection.Compliant) {
+        Write-BRAVOResultField -Label 'State ACL' -Value "OK: $($stateRootProtection.Path)"
+    } else {
+        Write-BRAVOResultField -Label 'State ACL' -Value "НЕВІДПОВІДНІСТЬ: $($stateRootProtection.Path)" -Color ([ConsoleColor]::Yellow)
+        foreach ($stateRootIssue in @($stateRootProtection.Issues)) {
+            Write-Host "  - $stateRootIssue" -ForegroundColor Yellow
+        }
+        Write-Host "  Зміцнення виконає повний запуск BRAVO_SETUP з правами адміністратора." -ForegroundColor Yellow
+    }
+
     # Discovery джерел (CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md): показуємо
     # завжди, це лише read-only читання вже обчисленого
     # $global:bravoDiscoveryResult з BRAVO.config — жодних нових операцій.
@@ -462,11 +484,33 @@ try {
                 "-StoreFor", $StoreFor,
                 "-Component"
             ) + @($CredentialComponent)
-            Invoke-ChildPowerShell `
-                -ScriptPath $setup.CredentialScript `
-                -Arguments $credentialArguments `
-                -StepName "Додавання або оновлення Credential Manager" `
-                -Current 2 -Total 5
+            # Крок вводу облікових даних — єдине місце, де на екрані
+            # з'являються значення, які оператор набирає. Наш transcript
+            # захоплює стрім дитини (у helper-лозі BRAVO_SETUP видно вивід
+            # BRAVO_DRY_RUN), тому паузи лише в дочірньому процесі замало:
+            # без цієї паузи значення осіли б у батьківському лозі.
+            #
+            # Дитина показує ввід відкрито ЛИШЕ побачивши цю змінну
+            # середовища разом із власною canary-перевіркою — тобто рішення
+            # fail-closed з обох боків.
+            $parentLogSuspended = Suspend-BRAVOHelperLog
+            if ($parentLogSuspended) {
+                $env:BRAVO_PARENT_LOG_SUSPENDED = '1'
+            }
+            try {
+                Invoke-ChildPowerShell `
+                    -ScriptPath $setup.CredentialScript `
+                    -Arguments $credentialArguments `
+                    -StepName "Додавання або оновлення Credential Manager" `
+                    -Current 2 -Total 5
+            } finally {
+                # finally обов'язковий: інакше помилка дочірнього процесу
+                # лишила б журнал BRAVO_SETUP вимкненим до кінця роботи.
+                $env:BRAVO_PARENT_LOG_SUSPENDED = $null
+                if ($parentLogSuspended) {
+                    [void](Resume-BRAVOHelperLog)
+                }
+            }
         } else {
             Write-Host ''
             Write-Host '[2/5] Credential Manager' -ForegroundColor Cyan

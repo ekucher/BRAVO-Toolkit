@@ -361,7 +361,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -751,14 +751,22 @@ $script:BRAVOHealthConsoleReady = $true
 function Write-HealthLog {
     param(
         [string]$Message,
-        [string]$Level = "INFO"
+        [string]$Level = "INFO",
+
+        # Environmental-нагадування (застарілі оновлення ОС/PowerShell) —
+        # це стан середовища, а не результат операції. Такий запис лишається
+        # видимим як WARNING, але НЕ інкрементує лічильник попереджень:
+        # інакше кожен успішний прогін на невідновленому сервері назавжди
+        # завершувався б кодом 10 (SuccessWithWarnings) зі статусом ЧАСТКОВО,
+        # поки адміністратор не встановить оновлення Windows.
+        [switch]$Environmental
     )
 
     # SFTP URL із паролем, webhook чи інший секрет можуть потрапити сюди
     # через повідомлення винятку WinSCP/Invoke-WebRequest — маскуємо перед
     # тим, як щось піде в консоль чи файл.
     $Message = Protect-BRAVOLogSecret -Text $Message
-    if ($Level -eq "WARNING") {
+    if ($Level -eq "WARNING" -and -not $Environmental) {
         $script:BRAVOWarningCount++
     }
 
@@ -3217,6 +3225,7 @@ function Get-SFTPHealthIssues {
                         -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
                         -OperationTimeoutSeconds ([math]::Max(1, [int]$backupMonitoring.SFTP.OperationTimeoutSeconds)) `
                         -MutationPolicy $bazaSettingsEffective.MutationPolicy `
+                        -AutoArchiveMutationThreshold $bazaSettingsEffective.AutoArchiveMutationThreshold `
                         -WriteCheckpoint
                 }
             }
@@ -3878,6 +3887,13 @@ function Get-BRAVOHealthIssueActionText {
     if ($firstIssue.Count -eq 0) {
         return "перевірити журнал BRAVO_HEALTH"
     }
+    # Issue може нести ВЛАСНИЙ ActionText (watchdog-issues: Component там —
+    # опис події, не ім'я служби, і шаблон «запустити або перевірити службу
+    # <Component>» давав зламану фразу «...службу Служби після аварії...»).
+    if ($null -ne $firstIssue[0].PSObject.Properties['ActionText'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$firstIssue[0].ActionText)) {
+        return [string]$firstIssue[0].ActionText
+    }
     switch ([string]$firstIssue[0].Kind) {
         "Service" { return "запустити або перевірити службу $($firstIssue[0].Component)" }
         { $_ -in @("LocalBackup", "LocalBackupGeneration") } { return "перевірити виконання BRAVO_ARCHIV" }
@@ -3935,10 +3951,19 @@ function New-SlackAlertMessage {
         "BRAVO BACKUP — ПОТРІБНА ДІЯ"
     }
     $latestBackup = Get-BRAVOHealthLatestBackupSummary
+    # Компактність (запит оператора, DEV-LIMS 2026-08-21): повний Reason
+    # з'являється в повідомленні РІВНО ОДИН РАЗ — у тематичній секції нижче.
+    # Шапка причин — лише перелік проблемних компонентів одним рядком
+    # (до 4 імен, далі «та ще N»); раніше сюди дублювався повний текст
+    # першої проблеми, і оператор читав його тричі.
     $reasonLines = New-Object System.Collections.Generic.List[string]
-    $firstIssue = @($Issues | Select-Object -First 1)
-    if ($firstIssue.Count -gt 0) {
-        $reasonLines.Add(":x: $(Get-HealthIssueComponentName -Issue $firstIssue[0]): $($firstIssue[0].Reason)")
+    if ($problemComponentNames.Count -gt 0) {
+        $reasonComponentsText = if ($problemComponentNames.Count -le 4) {
+            $problemComponentNames -join ' · '
+        } else {
+            (@($problemComponentNames | Select-Object -First 4) -join ' · ') + " та ще $($problemComponentNames.Count - 4)"
+        }
+        $reasonLines.Add(":x: $reasonComponentsText")
     }
     $resultLines = New-Object System.Collections.Generic.List[string]
     $resultLines.Add(":clock3: Остання успішна резервна копія: $($latestBackup.TimestampText)")
@@ -3949,8 +3974,9 @@ function New-SlackAlertMessage {
         $resultLines.Add(":warning: Допустимий вік: $($backupMonitoring.MaxBackupAgeHours) год.")
     }
     $resultLines.Add("")
+    # Перелік компонентів уже в шапці причин; тут — лише лічильники
+    # (окремий :package:-рядок з тим самим переліком був третім дублем).
     $resultLines.Add(":pushpin: Проблемних компонентів: $($problemComponentNames.Count) · перевірок: $($Issues.Count)")
-    $resultLines.Add(":package: $($problemComponentNames -join ', ')")
 
     if ($serviceIssues.Count -gt 0) {
         $resultLines.Add("")
@@ -4420,10 +4446,10 @@ Write-HealthLog "Конфігурація: $ConfigPath"
 Write-HealthLog "Сумісність: Windows $($BRAVOCompatibility.WindowsVersion); PowerShell $($BRAVOCompatibility.PowerShellVersion); WMI=$($BRAVOCompatibility.WmiProvider); JSON=$($BRAVOCompatibility.JsonProvider); завдання=$($BRAVOCompatibility.TaskSchedulerProvider)"
 Write-HealthLog "Каталог резервних копій: $backupRootPath"
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
-    Write-HealthLog $BRAVOPowerShellUpdate.Message -Level "WARNING"
+    Write-HealthLog $BRAVOPowerShellUpdate.Message -Level "WARNING" -Environmental
 }
 if ($BRAVOWindowsPatchLevel.IsUpdateRecommended) {
-    Write-HealthLog $BRAVOWindowsPatchLevel.Message -Level "WARNING"
+    Write-HealthLog $BRAVOWindowsPatchLevel.Message -Level "WARNING" -Environmental
 }
 $script:BRAVOOSSupportTier = Get-BRAVOOSSupportTier
 Write-HealthLog "Підтримка ОС: $($script:BRAVOOSSupportTier.Tier) — Windows $($script:BRAVOOSSupportTier.OperatingSystem) ($($script:BRAVOOSSupportTier.OperatingSystemVersion), build $($script:BRAVOOSSupportTier.Build)); PowerShell $($script:BRAVOOSSupportTier.PowerShellVersion); .NET release $($script:BRAVOOSSupportTier.DotNetRelease)"
@@ -4453,6 +4479,11 @@ if ($script:BRAVOToolIntegrity.HasIntegrityIssue) {
 # Health — діагностичний, read-only runtime: він НЕ блокує себе, а
 # звітує. Саме він має першим помітити підміну й підняти тривогу навіть
 # тоді, коли архівація ще не запускалась. Блокують Archive і Maintenance.
+# ЄДИНИЙ дозволений виняток з read-only політики —
+# Invoke-BRAVOServiceQuiescenceWatchdog: старт служб, перелічених у
+# ВЛАСНОМУ осиротілому ownership-маркері BRAVO (аварійне переривання
+# Maintenance/DataRestore). Ручні зупинки техпідтримки (без маркера)
+# Health ніколи не чіпає.
 $script:BRAVOToolManifestMode = 'Enforce'
 $script:BRAVOToolManifestPath = Join-Path $toolsPath "TOOLS_MANIFEST.json"
 if ($toolIntegritySettings -is [System.Collections.IDictionary]) {
@@ -4648,8 +4679,201 @@ if (-not $environmentPreflight.IsWritable) {
     })
 }
 
+function Get-BRAVOQuiescenceWatchdogAllowedServiceNames {
+    # Білий список для watchdog (review F4): маркер — persistent-файл, тобто
+    # ВХІД для привілейованого Start-Service. Навіть валідний на вигляд
+    # маркер не має права змусити SYSTEM-Health запустити довільну службу:
+    # стартувати можна лише канонічні керовані служби з конфігурації
+    # (maintenanceSettings.Services — те саме джерело, що в
+    # Get-ManagedServiceHealthIssues; BravoWeb резолвиться за кандидатами
+    # так само). Конфігурація недоступна -> порожній список -> watchdog
+    # відмовляє всім (fail-safe: без керованого набору легітимного маркера
+    # існувати не може — його пишуть лише Maintenance/DataRestore, які цю ж
+    # конфігурацію читають).
+    $allowedServiceNames = @()
+    $servicesSettings = $null
+    $maintenanceSettingsVariable = Get-Variable -Name maintenanceSettings -ErrorAction SilentlyContinue
+    if ($null -ne $maintenanceSettingsVariable -and $null -ne $maintenanceSettingsVariable.Value) {
+        $servicesSettings = $maintenanceSettingsVariable.Value.Services
+    }
+    if ($null -eq $servicesSettings) { return @() }
+    foreach ($configuredServiceName in @(
+            [string]$servicesSettings.BravoName,
+            [string]$servicesSettings.ExchangeApiName
+        )) {
+        if (-not [string]::IsNullOrWhiteSpace($configuredServiceName)) {
+            $allowedServiceNames += $configuredServiceName
+        }
+    }
+    if (Test-BRAVOSettingEnabled -Value $servicesSettings.BravoWebEnabled) {
+        foreach ($webCandidate in @($servicesSettings.BravoWebCandidates)) {
+            if ([string]::IsNullOrWhiteSpace([string]$webCandidate)) { continue }
+            $webService = Get-Service -Name ([string]$webCandidate) -ErrorAction SilentlyContinue
+            if ($null -eq $webService) {
+                $webService = Get-Service -DisplayName ([string]$webCandidate) -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $webService) {
+                $allowedServiceNames += [string]$webService.Name
+            }
+        }
+    }
+    return @($allowedServiceNames)
+}
+
+function Invoke-BRAVOServiceQuiescenceWatchdog {
+    # ЄДИНИЙ дозволений Health виняток з read-only політики (див. політику
+    # нижче в цьому файлі та BRAVO.config): якщо Maintenance/DataRestore
+    # зупинив служби, записав ownership-маркер BRAVO_SERVICE_QUIESCENCE.json
+    # (BRAVO.System) і загинув ЖОРСТКО (kill/живлення — finally не
+    # виконався), цей watchdog запускає РІВНО перелічені в маркері служби.
+    # Усі інші випадки читання-тільки:
+    #   - маркера немає (служби зупинила техпідтримка вручну) — НІКОЛИ не
+    #     стартувати, лише штатний issue "не запущена" нижче;
+    #   - власник маркера ЖИВИЙ (pid+processStartTime збігаються) —
+    #     обслуговування саме триває, не втручатися;
+    #   - restartSuppressed=true (DataRestore лишив служби зупиненими
+    #     навмисно, rollback неповний) — не стартувати, CRITICAL-issue про
+    #     ручне втручання;
+    #   - маркер чужого hostname / невалідний — Read повертає $null, дій
+    #     немає.
+    # Повертає масив issue-об'єктів у форматі Get-ManagedServiceHealthIssues
+    # (аварійне відновлення — теж подія, про яку оператор МУСИТЬ дізнатися).
+    $watchdogIssues = @()
+    $quiescenceState = $null
+    try { $quiescenceState = Read-BRAVOServiceQuiescenceState } catch { $quiescenceState = $null }
+    if ($null -eq $quiescenceState) { return @() }
+
+    $ownerAlive = Test-BRAVOProcessAlive `
+        -ProcessId ([int]$quiescenceState.pid) `
+        -ProcessStartTime ([string]$quiescenceState.processStartTime)
+    if ($ownerAlive) {
+        Write-HealthLog "Ownership-маркер зупинки служб належить живому процесу $($quiescenceState.owner) (PID $($quiescenceState.pid)) — обслуговування триває, watchdog не втручається" -Level "INFO"
+        return @()
+    }
+
+    $ownerText = "$($quiescenceState.owner) (PID $($quiescenceState.pid), лог: $($quiescenceState.logFile))"
+    if ([bool]$quiescenceState.restartSuppressed) {
+        # DataRestore пише маркер suppressed ОДРАЗУ (жорсткий kill посеред
+        # деструктивної фази лишає live filesystem у невизначеному стані —
+        # автостарт поверх нього неприпустимий), тому suppressed тут означає
+        # і аварійно перерваний DataRestore, і незавершений rollback.
+        Write-HealthLog "Осиротілий ownership-маркер із restartSuppressed: $ownerText залишив служби зупиненими (аварійно перерваний DataRestore або незавершений rollback — live filesystem може бути в невизначеному стані) — автоматичний старт заборонено, потрібне ручне відновлення (OPERATIONS.md, код 43)" -Level "ERROR"
+        $watchdogIssues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Служби після аварії $($quiescenceState.owner)"
+            # Компактно (запит оператора): одна причина + одна дія + лог.
+            # Повний технічний контекст (restartSuppressed, варіанти
+            # переривання) лишається в ERROR-рядку Health-логу вище.
+            Reason = "перерване відновлення — потрібне РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: $($quiescenceState.logFile)"
+            # Власний ActionText: Component тут — опис події, тому загальний
+            # шаблон «запустити або перевірити службу <Component>» непридатний.
+            ActionText = "виконати ручне відновлення служб (OPERATIONS.md, код 43)"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$quiescenceState.owner
+            SizeBytes = $null
+            Details = @()
+        }
+        return @($watchdogIssues)
+    }
+
+    # TOCTOU-guard: між першим Read і Start-Service нижче міг стартувати
+    # НОВИЙ власник (записати власний маркер і зупинити служби — Maintenance
+    # о 23:55 перетинається з 4-годинним циклом Health). Перечитуємо маркер:
+    # якщо він зник або це вже інший маркер (owner/pid/createdAt) — виходимо
+    # без жодних дій, аварію опрацює наступний прогін.
+    $verificationState = $null
+    try { $verificationState = Read-BRAVOServiceQuiescenceState } catch { $verificationState = $null }
+    if ($null -eq $verificationState -or
+        [string]$verificationState.owner -ne [string]$quiescenceState.owner -or
+        ($verificationState.pid -as [int]) -ne ($quiescenceState.pid -as [int]) -or
+        [string]$verificationState.createdAt -ne [string]$quiescenceState.createdAt) {
+        Write-HealthLog "Ownership-маркер зупинки служб змінився під час перевірки (новий власник активний або маркер зник) — watchdog виходить без дій" -Level "INFO"
+        return @()
+    }
+
+    Write-HealthLog "Осиротілий ownership-маркер зупинки служб: власник $ownerText мертвий — відновлюю служби зі списку маркера" -Level "WARNING"
+    $allowedServiceNames = @(Get-BRAVOQuiescenceWatchdogAllowedServiceNames)
+    $startFailures = @()
+    $startedServices = @()
+    $alreadyRunningServices = @()
+    foreach ($markedService in @($quiescenceState.services | Where-Object { [bool]$_.RestartIntent })) {
+        $markedName = [string]$markedService.Name
+        if (@($allowedServiceNames | Where-Object { $_ -ieq $markedName }).Count -eq 0) {
+            # Review F4: маркер вимагає службу поза канонічним керованим
+            # набором конфігурації — ознака стороннього редагування файлу.
+            # Відмова потрапляє у startFailures: маркер лишається, issue
+            # робить подію видимою оператору при кожному прогоні.
+            $startFailures += "${markedName}: не входить до керованого набору служб конфігурації — автоматичний старт заборонено (можливе стороннє редагування маркера)"
+            Write-HealthLog "Відмовлено у старті служби ${markedName}: її немає в керованому наборі конфігурації (можливе стороннє редагування ownership-маркера)" -Level "ERROR"
+            continue
+        }
+        try {
+            $serviceObject = Get-Service -Name $markedName -ErrorAction Stop
+            if ($serviceObject.Status -ne 'Running') {
+                Start-Service -Name $markedName -ErrorAction Stop
+                $startedServices += $markedName
+                Write-HealthLog "Службу $markedName відновлено після аварійного переривання $($quiescenceState.owner)" -Level "SUCCESS"
+            } else {
+                # Review F5: службу, що вже працює, НЕ рапортуємо як
+                # «відновлену» — інакше оператор бачить хибний масштаб аварії.
+                $alreadyRunningServices += $markedName
+                Write-HealthLog "Служба $markedName вже працює — старт після аварійного переривання не потрібен" -Level "INFO"
+            }
+        } catch {
+            $startFailures += "${markedName}: $($_.Exception.Message)"
+            Write-HealthLog "Не вдалося відновити службу $markedName після аварійного переривання: $($_.Exception.Message)" -Level "ERROR"
+        }
+    }
+    if ($startFailures.Count -eq 0) {
+        try {
+            # -ExpectedState: видалити рівно той маркер, за яким діяли; якщо
+            # його вже перезаписав новий живий власник — не чіпати.
+            $quiescenceMarkerCleared = Clear-BRAVOServiceQuiescenceState -ExpectedState $quiescenceState
+            if (-not $quiescenceMarkerCleared) {
+                Write-HealthLog "Служби відновлено, але ownership-маркер уже належить іншому власнику — залишено без змін" -Level "WARNING"
+            }
+        } catch {
+            Write-HealthLog "Служби відновлено, але ownership-маркер не видалився: $($_.Exception.Message)" -Level "WARNING"
+        }
+        $recoveryReportText = if ($startedServices.Count -gt 0 -and $alreadyRunningServices.Count -gt 0) {
+            "служби $($startedServices -join ', ') відновлено автоматично (служби $($alreadyRunningServices -join ', ') вже працювали)"
+        } elseif ($startedServices.Count -gt 0) {
+            "служби $($startedServices -join ', ') відновлено автоматично"
+        } else {
+            "усі служби з маркера ($($alreadyRunningServices -join ', ')) вже працювали, старт не знадобився"
+        }
+        $watchdogIssues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Аварійне відновлення служб"
+            Reason = "$recoveryReportText після аварійного переривання $ownerText — перевірте причину переривання"
+            ActionText = "перевірити причину аварійного переривання $($quiescenceState.owner)"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$quiescenceState.owner
+            SizeBytes = $null
+            Details = @()
+        }
+    } else {
+        # Маркер лишається — наступний Health-прогін повторить спробу.
+        $watchdogIssues += [pscustomobject]@{
+            Kind = "Service"
+            Component = "Аварійне відновлення служб"
+            Reason = "після аварійного переривання $ownerText не вдалося відновити: $($startFailures -join '; ') — маркер збережено, наступний Health повторить"
+            ActionText = "запустити служби вручну та перевірити ownership-маркер"
+            FileName = ""
+            LastWriteTime = $null
+            Location = [string]$quiescenceState.owner
+            SizeBytes = $null
+            Details = @()
+        }
+    }
+    return @($watchdogIssues)
+}
+
 Write-BRAVOProgressPhase -Phase 'Керовані служби' -PercentComplete 15
-$serviceHealthIssues = @(Get-ManagedServiceHealthIssues)
+$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)
+$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)
 Write-BRAVOHealthStep `
     -Name 'Керовані служби' `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $serviceHealthIssues.Count) `

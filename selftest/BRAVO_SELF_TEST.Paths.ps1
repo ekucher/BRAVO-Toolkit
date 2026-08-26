@@ -35,6 +35,17 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         -Name "Paths/01-AutoLimsRootFromService" `
         -Failure "LIMSRoot='' має визначатись як каталог bravo.exe встановленої служби (Disabled — теж валідна identity)"
 
+    # --- Paths/01b: AUTO LIMSRoot зі служби з DisplayName="BRAVO Server" ---
+    # (реальний DEV-майданчик, 2026-08-24: деякі інсталятори BRAVO/LIMS
+    # використовують саме це написання замість "BRAVO Service" — обидва
+    # мають визнаватись канонічними за замовчуванням, без override).
+    $svcBravoServer = @([pscustomobject]@{ Name='BRAVO'; DisplayName='BRAVO Server'; State='Running'; StartMode='Auto'; PathName='"C:\LIMS\bravo.exe"' })
+    $autoLimsBravoServer = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath '' -Services $svcBravoServer
+    Test-BRAVOCondition `
+        -Condition ([string]$autoLimsBravoServer.Source -eq 'ServiceDiscovery' -and [string]$autoLimsBravoServer.EffectivePath -eq 'C:\LIMS') `
+        -Name "Paths/01b-AutoLimsRootFromServiceBravoServerDisplayName" `
+        -Failure "служба BRAVO з DisplayName='BRAVO Server' (реальний DEV-варіант написання) має визнаватись канонічною за замовчуванням так само, як 'BRAVO Service'"
+
     # --- Paths/02: explicit LIMSRoot має пріоритет над службою ---
     $explicitLims = Resolve-BRAVOEffectiveLimsRoot -ConfiguredPath 'E:\CUSTOM_BRAVO' -Services $svcAmbiguous
     Test-BRAVOCondition `

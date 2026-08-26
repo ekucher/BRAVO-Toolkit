@@ -40,7 +40,13 @@ $includedExtraFiles = @('VERSION.json', 'Tools\TOOLS_MANIFEST.json')
 # правила): git-ignored, ніколи не входять у production-комплект. Без
 # виключення локально згенерований манфест розійшовся б із CI-checkout
 # (де .claude/hooks не існує) і зламав би "Integrity manifests are current".
-$excludedDirectoryPattern = '^(LOGS|\.git|\.vscode|\.claude|local-backups)[\\/]'
+# artifacts — вихід ci\New-BRAVOReleaseArtifact.ps1 (git-ignored):
+# збірник НАВМИСНО лишає artifacts\release\staging (повну розпаковану
+# копію комплекту для self-test), і без виключення `-Apply` після
+# локальної збірки артефакту вносив у маніфест ~85 дублікатів
+# staging\*.ps1, яких немає на розгорнутому сервері -> RUNTIME_GUARD
+# блокував запуск з кодом 33 (двічі спіймано в циклі 5.2.0-rc).
+$excludedDirectoryPattern = '^(LOGS|\.git|\.vscode|\.claude|local-backups|artifacts)[\\/]'
 
 $rootPrefixLength = $Root.TrimEnd('\', '/').Length + 1
 $currentHashes = [ordered]@{}

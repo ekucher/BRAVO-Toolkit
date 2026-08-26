@@ -33,3 +33,21 @@ secret:
       match: "ea165f8d65b6e75b540449e92b4886f43607fa02"
     - name: "gitleaks/gitleaks-action@v2 pinned commit SHA (аудит P3)"
       match: "ff98106e4c7b2bc287b24eaf42907196329070c7"
+    # Health self-test: фіктивний SFTP-URI для перевірки, що програмний
+    # Health API очищає секретний module state після ранньої помилки.
+    # Цілісного літерала в репозиторії НЕМАЄ і ніколи не було (git log -S
+    # не знаходить жодного коміту): BRAVO_SELF_TEST.ps1 навмисно збирає
+    # URL із частин через -f саме проти сканерів. GitGuardian реконструює
+    # значення сам. Домен example.invalid зарезервований RFC 2606 і не
+    # резолвиться; облікові дані фіктивні й нікуди не передаються.
+    - name: "Health self-test fixture SFTP URI (example.invalid, RFC 2606)"
+      match: "sftp://self-test-user:self-test-secret@example.invalid/"
+    # Синтетичний тест реставрації: фікстурний пароль 7-Zip для тимчасового
+    # архіву, який тест сам створює і сам читає у власному temp-каталозі.
+    # Не credential: у Credential Manager не потрапляє, продуктивних даних
+    # не захищає; непорожній пароль вимагає сам ланцюг перевірки цілісності.
+    # Поточний стан файлу літерала вже не містить (значення складається
+    # через -join, коміт aade0ee); запис покриває історичну знахідку в
+    # уже опублікованому коміті 73f37ac.
+    - name: "RestoreSynthetic self-test fixture 7-Zip password (історичний, 73f37ac)"
+      match: "BravoSyntheticSelfTest2026"

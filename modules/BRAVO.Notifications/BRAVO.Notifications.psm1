@@ -286,7 +286,12 @@ function New-BRAVOOperatorNotificationMessage {
         [string]$LogLabel = "Журнал"
     )
 
-    $separator = "━" * 36
+    # 12, не 36: довга лінія переносилась на вузьких мобільних екранах і
+    # з'їдала екран. ДОВЖИНА МУСИТЬ ЗБІГАТИСЯ з $notificationSeparator у
+    # Send-BRAVOWebhookNotification (BRAVO.Compatibility) — та функція
+    # перевіряє префікс повідомлення й додає власний роздільник, якщо він
+    # не збігся (розсинхрон дав би подвійну лінію).
+    $separator = "━" * 12
     $severityIcon = switch ($Severity) {
         "SUCCESS" { ":white_check_mark:" }
         "WARNING" { ":warning:" }
@@ -377,11 +382,13 @@ function ConvertTo-DiscordNotificationText {
         ":satellite_antenna:" = "📡"
         ":floppy_disk:" = "💾"
         ":memo:" = "📝"
+        ":mag:" = "🔎"
         ":white_check_mark:" = "✅"
         ":package:" = "📦"
         ":minidisc:" = "💽"
         ":satellite:" = "🛰️"
         ":wrench:" = "🔧"
+        ":fast_forward:" = "⏭️"
         ":x:" = "❌"
     }
 
@@ -566,6 +573,109 @@ function Resolve-BRAVONotificationEndpoint {
     throw "Webhook для $Provider/$Route не налаштовано в Credential Manager (перевірені targets: $($candidateTargetNames -join ', '))"
 }
 
+# Канонічний максимум прикладів для великих переліків у операторських
+# notification (ЄДИНЕ місце константи — не розносити 5 по коду; повна
+# діагностика завжди лишається в локальному журналі).
+$script:BRAVONotificationMaximumListExamples = 5
+
+# Транспорт-агностичний safe payload limit операторського notification.
+# СВІДОМО менший за фізичні ліміти конкретних API (Discord message 2000,
+# chunk-ліміт Split-DiscordNotificationText 1900; Slack text ~4000) — щоб
+# лишався запас на заголовки/markdown/escaping/wrapper-и і щоб «одна
+# подія → одне повідомлення» виконувалось на ОБОХ транспортах: після
+# guard Discord-split структурно не може дати більше одного chunk-а.
+$script:BRAVONotificationSafePayloadLimit = 1800
+
+# Канонічний рендер великого переліку в операторському notification:
+#   Приклади:
+#   • <рядок 1>
+#   ...
+#   …і ще N файл(ів).
+# «…і ще 0» структурно неможливе (хвіст додається лише коли TotalCount
+# перевищує кількість показаних прикладів). Повертає масив рядків —
+# викликач вирішує, як їх вплести у своє повідомлення.
+function Format-BRAVONotificationListSummary {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][string[]]$ExampleLines,
+        [Parameter(Mandatory = $true)][int]$TotalCount,
+        [int]$MaximumExamples = $script:BRAVONotificationMaximumListExamples,
+        [string]$RemainderNounOne = 'файл',
+        [string]$RemainderNounFew = 'файли',
+        [string]$RemainderNounMany = 'файлів'
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $shown = @($ExampleLines | Select-Object -First ([math]::Max(1, $MaximumExamples)))
+    if (@($shown).Count -eq 0) {
+        return @()
+    }
+    [void]$lines.Add('Приклади:')
+    foreach ($exampleLine in $shown) {
+        [void]$lines.Add(('• {0}' -f [string]$exampleLine))
+    }
+    $remainder = $TotalCount - @($shown).Count
+    if ($remainder -gt 0) {
+        [void]$lines.Add(('…і ще {0}.' -f (Format-BRAVOUkrainianCount -Count $remainder -One $RemainderNounOne -Few $RemainderNounFew -Many $RemainderNounMany)))
+    }
+    return @($lines.ToArray())
+}
+
+# Defensive guard транспортного шару: один аномально великий payload не
+# повинен породжувати серію операторських повідомлень і не повинен
+# використовувати транспорт як переглядач журналу. Обрізає ПО МЕЖІ РЯДКА,
+# додає явний suffix; рядок журналу (":memo:"/"📝") з повного тексту
+# зберігається ПІСЛЯ suffix, щоб оператор не втратив шлях до повної
+# діагностики. Секрети/webhook у warning не потрапляють.
+function Limit-BRAVONotificationPayload {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Message,
+        [int]$MaximumLength = $script:BRAVONotificationSafePayloadLimit,
+        [string]$TransportLabel = 'unknown'
+    )
+
+    if ($Message.Length -le $MaximumLength) {
+        return $Message
+    }
+
+    $truncationSuffix = '⚠️ Повідомлення скорочено — повні деталі в журналі BRAVO-Toolkit.'
+    $allLines = $Message -split "`r?`n"
+    $logPathLine = @($allLines | Where-Object {
+        $trimmedLine = ([string]$_).TrimStart()
+        $trimmedLine.StartsWith(':memo:') -or $trimmedLine.StartsWith('📝')
+    } | Select-Object -First 1)
+    $tailLines = New-Object System.Collections.Generic.List[string]
+    [void]$tailLines.Add($truncationSuffix)
+    if (@($logPathLine).Count -gt 0) {
+        [void]$tailLines.Add([string]$logPathLine[0])
+    }
+    $tailText = ($tailLines.ToArray() -join "`n")
+
+    $budget = $MaximumLength - $tailText.Length - 1
+    $keptLines = New-Object System.Collections.Generic.List[string]
+    $usedLength = 0
+    foreach ($line in $allLines) {
+        $lineText = [string]$line
+        $lineCost = $lineText.Length + $(if ($keptLines.Count -gt 0) { 1 } else { 0 })
+        if (($usedLength + $lineCost) -gt $budget) { break }
+        [void]$keptLines.Add($lineText)
+        $usedLength += $lineCost
+    }
+    if ($keptLines.Count -eq 0 -and $budget -gt 0) {
+        # Дегенеративний випадок: перший рядок сам довший за бюджет —
+        # обрізаємо його посимвольно, щоб suffix гарантовано вмістився.
+        [void]$keptLines.Add(([string]$allLines[0]).Substring(0, [math]::Max(0, $budget)))
+    }
+
+    $limitedMessage = (($keptLines.ToArray() -join "`n").TrimEnd()) + "`n" + $tailText
+    Write-Warning (
+        "Notification payload exceeded safe limit and was truncated. " +
+        "Transport=$TransportLabel OriginalLength=$($Message.Length) FinalLength=$($limitedMessage.Length) Limit=$MaximumLength"
+    )
+    return $limitedMessage
+}
+
 function ConvertTo-BRAVONotificationPayloadText {
     [CmdletBinding()]
     param(
@@ -577,11 +687,17 @@ function ConvertTo-BRAVONotificationPayloadText {
         [string]$Message
     )
 
+    # Guard ДО провайдер-специфічної обробки: після нього повідомлення
+    # гарантовано ≤ safe limit (< 1900), тож Discord-split структурно дає
+    # рівно один chunk, а Slack отримує один payload у межах своїх лімітів.
+    # Split-DiscordNotificationText лишається як defense-in-depth.
+    $limitedMessage = Limit-BRAVONotificationPayload -Message $Message -TransportLabel $Provider
+
     if ($Provider.ToLowerInvariant() -eq "discord") {
-        $discordText = ConvertTo-DiscordNotificationText -Message $Message
+        $discordText = ConvertTo-DiscordNotificationText -Message $limitedMessage
         return @(Split-DiscordNotificationText -Message $discordText)
     }
-    return @($Message)
+    return @($limitedMessage)
 }
 
 function Send-BRAVONotificationChunks {
@@ -600,8 +716,19 @@ function Send-BRAVONotificationChunks {
         [int]$TimeoutSeconds = 30
     )
 
+    # Обмежений пейсинг між chunk-запитами (task item 12) — знижує шанс
+    # власне спровокувати 429 на великих багатоchunk-повідомленнях. 429/
+    # Retry-After усередині Send-BRAVOWebhookNotification має пріоритет:
+    # він сам чекає потрібний час перед поверненням у цей цикл.
+    $chunkPacingMilliseconds = 400
+    $chunkCount = @($MessageChunks).Count
+    $chunkIndex = 0
     foreach ($chunk in $MessageChunks) {
+        $chunkIndex++
         Send-BRAVOWebhookNotification -Provider $Provider -WebhookUrl $WebhookUrl -Message $chunk -TimeoutSeconds $TimeoutSeconds
+        if ($chunkIndex -lt $chunkCount) {
+            Start-Sleep -Milliseconds $chunkPacingMilliseconds
+        }
     }
 }
 

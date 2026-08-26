@@ -141,6 +141,24 @@ try {
             $archiveFreeSpaceExcludedDrives += $normalizedDrive
         }
     }
+
+    # Опційний параметр (compat: старі BRAVO.config його не містять) —
+    # запас понад розмір останнього валідного архіву для розрахункової
+    # перевірки місця (Get-BRAVOArchiveEstimatedSpaceRequirement нижче).
+    # Відсутність ключа НЕ послаблює жодного наявного захисту: фіксований
+    # поріг MinimumFreeSpaceGB вище лишається обов'язковим і незалежним.
+    $archiveEstimatedSpaceMarginPercent = if (
+        $maintenanceSettings.Limits -is [System.Collections.IDictionary] -and
+        $maintenanceSettings.Limits.Contains('EstimatedSpaceMarginPercent') -and
+        $null -ne $maintenanceSettings.Limits.EstimatedSpaceMarginPercent
+    ) {
+        [double]$maintenanceSettings.Limits.EstimatedSpaceMarginPercent
+    } else {
+        25.0
+    }
+    if ($archiveEstimatedSpaceMarginPercent -lt 0) {
+        throw 'Maintenance.Limits.EstimatedSpaceMarginPercent не може бути відʼємним'
+    }
 } catch {
     Write-Host "ПОМИЛКА: Некоректна конфігурація перевірки вільного місця: $($_.Exception.Message)" -ForegroundColor Red
     Exit 30
@@ -503,13 +521,22 @@ function Test-Compatibility {
         Write-BRAVOLog -Component 'STARTUP' -Message "Стандартний режим" -Level "INFO"
     }
     if ($powerShellUpdate.IsUpdateRecommended) {
-        Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING"
+        Write-BRAVOLog -Component 'STARTUP' -Message $powerShellUpdate.Message -Level "WARNING" -Environmental
     }
     $osSupportTier = Get-BRAVOOSSupportTier
     $script:BRAVOOSSupportTier = $osSupportTier
     Write-BRAVOLog -Component 'STARTUP' -Message "Підтримка ОС: $($osSupportTier.Tier) — Windows $($osSupportTier.OperatingSystem) ($($osSupportTier.OperatingSystemVersion), build $($osSupportTier.Build)); PowerShell $($osSupportTier.PowerShellVersion); .NET release $($osSupportTier.DotNetRelease)" -Level "INFO"
     if ($osSupportTier.Tier -eq "LegacyBestEffort") {
-        Write-BRAVOLog -Component 'STARTUP' -Message $osSupportTier.Message -Level "WARNING"
+        # Рівень INFO навмисно: legacy-tier — environmental-метрика, а не
+        # результат операції. WARNING тут інкрементував лічильник
+        # попереджень, і КОЖЕН успішний прогін на Server 2012 R2/2016
+        # завершувався кодом 10 (SuccessWithWarnings), а звіт ішов у канал
+        # ALERTS замість GENERAL — хоча на архівацію рівень ОС не впливає.
+        # Постійне нагадування про legacy-ОС — відповідальність
+        # BRAVO_HEALTH (там воно лишається WARNING), той самий принцип,
+        # що вже застосовано до віку Windows-оновлень (health-метрика,
+        # а не умова запуску — див. BRAVO_TASKS_INSTALL.ps1).
+        Write-BRAVOLog -Component 'STARTUP' -Message $osSupportTier.Message -Level "INFO"
     } elseif ($osSupportTier.Tier -eq "Unsupported") {
         if ($env:BRAVO_ALLOW_UNSUPPORTED_OS -eq "1") {
             Write-BRAVOLog -Component 'STARTUP' -Message "$($osSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level "WARNING"
@@ -2023,6 +2050,153 @@ function Test-BRAVOVSSShadowMatchesVolume {
     return $false
 }
 
+function Get-BRAVOVSSExistingShadowIdMap {
+    # Знімок ID усіх наявних shadow copies ДО запуску diskshadow.exe. Потрібен
+    # двічі: щоб знайти щойно створений набір, коли вивід diskshadow.exe не
+    # вдалося розібрати, і щоб прибрати за собою persistent-знімки, якщо набір
+    # створився, але подальші кроки впали.
+    $map = @{}
+    try {
+        foreach ($shadow in @(
+                Get-WmiObject -Namespace "root\cimv2" -Class "Win32_ShadowCopy" -ErrorAction Stop
+            )) {
+            $shadowId = [string]$shadow.ID
+            if (-not [string]::IsNullOrWhiteSpace($shadowId)) {
+                $map[$shadowId.ToUpperInvariant()] = $true
+            }
+        }
+    } catch {
+        # Best-effort baseline: без нього лишаються парсинг виводу diskshadow.exe
+        # та відмова з явною помилкою, тому запит WMI не має зривати архівацію.
+    }
+    return $map
+}
+
+function Get-BRAVOVSSDiskshadowSetIdFromOutput {
+    # diskshadow.exe друкує людські повідомлення мовою системи, тому шукати в них
+    # англійський текст не можна: на локалізованому Windows Server такий пошук не
+    # знаходить нічого і архівація падає на успішно створеному наборі. Стабільні
+    # тут лише імена alias-ів (ASCII, не перекладаються) і самі GUID-и, тому
+    # ідентифікатор набору беремо з рядка з alias-ом VSS_SHADOW_SET.
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Output)
+
+    if ([string]::IsNullOrEmpty($Output)) {
+        return $null
+    }
+    $guidPattern = '\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}'
+    foreach ($line in ($Output -split "`r?`n")) {
+        if ($line -notmatch 'VSS_SHADOW_SET') {
+            continue
+        }
+        $guidMatch = [regex]::Match($line, $guidPattern)
+        if ($guidMatch.Success) {
+            return $guidMatch.Value.ToUpperInvariant()
+        }
+    }
+    return $null
+}
+
+function Get-BRAVOVSSDiskshadowSetIdFromWmi {
+    # Резервний шлях, коли вивід diskshadow.exe не містить alias-рядка: набором
+    # вважається єдиний SetID серед shadow copies, яких не було до запуску.
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$KnownShadowIds,
+        [Parameter(Mandatory = $true)][string[]]$VolumeRoots
+    )
+
+    try {
+        $currentShadows = @(
+            Get-WmiObject -Namespace "root\cimv2" -Class "Win32_ShadowCopy" -ErrorAction Stop
+        )
+    } catch {
+        return $null
+    }
+
+    $setIds = New-Object System.Collections.Generic.List[string]
+    foreach ($shadow in $currentShadows) {
+        $shadowId = [string]$shadow.ID
+        if ([string]::IsNullOrWhiteSpace($shadowId) -or
+            $KnownShadowIds.ContainsKey($shadowId.ToUpperInvariant())) {
+            continue
+        }
+        $matchesRequestedVolume = $false
+        foreach ($volumeRoot in @($VolumeRoots)) {
+            if (Test-BRAVOVSSShadowMatchesVolume -Shadow $shadow -VolumeRoot $volumeRoot) {
+                $matchesRequestedVolume = $true
+                break
+            }
+        }
+        if (-not $matchesRequestedVolume) {
+            continue
+        }
+        $setId = [string]$shadow.SetID
+        if (-not [string]::IsNullOrWhiteSpace($setId) -and
+            -not $setIds.Contains($setId.ToUpperInvariant())) {
+            [void]$setIds.Add($setId.ToUpperInvariant())
+        }
+    }
+    if ($setIds.Count -eq 1) {
+        return $setIds[0]
+    }
+    return $null
+}
+
+function Remove-BRAVOVSSDiskshadowOrphanedShadow {
+    # SET CONTEXT PERSISTENT NOWRITERS означає, що знімки не звільняються самі:
+    # кожен невдалий запуск без цього прибирання лишав на сервері shadow copies,
+    # які назавжди тримали місце в тіньовому сховищі томів.
+    param(
+        [AllowNull()][AllowEmptyString()][string]$SnapshotSetId,
+        [Parameter(Mandatory = $true)][hashtable]$KnownShadowIds,
+        [Parameter(Mandatory = $true)][string[]]$VolumeRoots
+    )
+
+    try {
+        $currentShadows = @(
+            Get-WmiObject -Namespace "root\cimv2" -Class "Win32_ShadowCopy" -ErrorAction Stop
+        )
+    } catch {
+        return
+    }
+
+    $normalizedSetId = if ([string]::IsNullOrWhiteSpace($SnapshotSetId)) {
+        $null
+    } else {
+        $SnapshotSetId.ToUpperInvariant()
+    }
+
+    foreach ($shadow in $currentShadows) {
+        $shadowId = [string]$shadow.ID
+        if ([string]::IsNullOrWhiteSpace($shadowId)) {
+            continue
+        }
+        # Чужі знімки (у т.ч. створені паралельно іншим ПЗ) не чіпаємо: видаляємо
+        # лише ті, яких не було до нашого запуску і які лежать на наших томах,
+        # або ті, що явно належать нашому набору.
+        if ($KnownShadowIds.ContainsKey($shadowId.ToUpperInvariant())) {
+            continue
+        }
+        $isOurs = $false
+        if ($null -ne $normalizedSetId -and
+            ([string]$shadow.SetID).ToUpperInvariant() -eq $normalizedSetId) {
+            $isOurs = $true
+        } else {
+            foreach ($volumeRoot in @($VolumeRoots)) {
+                if (Test-BRAVOVSSShadowMatchesVolume -Shadow $shadow -VolumeRoot $volumeRoot) {
+                    $isOurs = $true
+                    break
+                }
+            }
+        }
+        if (-not $isOurs) {
+            continue
+        }
+        try { [void]$shadow.Delete() } catch {
+            # Best-effort cleanup: первинна помилка створення набору важливіша.
+        }
+    }
+}
+
 function New-BRAVOVSSDiskshadowSnapshotSet {
     param([Parameter(Mandatory = $true)][string[]]$VolumeRoots)
 
@@ -2048,8 +2222,14 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     }
     $lines.Add("CREATE")
     $lines.Add("END BACKUP")
+    # Без EXIT diskshadow.exe доходить до кінця файлу сценарію як до
+    # несподіваного завершення інтерактивної сесії і повертає ненульовий код
+    # навіть тоді, коли Snapshot Set створено успішно.
+    $lines.Add("EXIT")
 
     $volumeShadows = $null
+    $snapshotSetId = $null
+    $knownShadowIds = Get-BRAVOVSSExistingShadowIdMap
     try {
         [IO.File]::WriteAllLines($scriptPath, $lines.ToArray(), (New-Object Text.UTF8Encoding($false)))
 
@@ -2060,11 +2240,28 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
         $processInfo.RedirectStandardError = $true
         $processInfo.UseShellExecute = $false
         $processInfo.CreateNoWindow = $true
+        try {
+            # diskshadow.exe пише в OEM-кодуванні консолі. Без явного
+            # StandardOutputEncoding діагностика в лозі перетворюється на
+            # нечитабельні символи саме тоді, коли вона найпотрібніша.
+            $oemEncoding = [System.Text.Encoding]::GetEncoding(
+                [System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage
+            )
+            $processInfo.StandardOutputEncoding = $oemEncoding
+            $processInfo.StandardErrorEncoding = $oemEncoding
+        } catch {
+            # Кодування — питання читабельності діагностики, а не коректності
+            # набору: розбір спирається лише на ASCII-alias і GUID-и.
+        }
 
         $process = New-Object System.Diagnostics.Process
         $process.StartInfo = $processInfo
+        # Start-BRAVOProcessOutputCapture сам запускає процес. Додатковий
+        # $process.Start() робив Close() поточного процесу і запускав другий
+        # diskshadow.exe: набір створював перший процес, а код завершення й
+        # WaitForExit бралися вже від другого, тому кожен багатотомний backup
+        # падав на успішно створеному наборі.
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
-        [void]$process.Start()
         if (-not $process.WaitForExit(300000)) {
             try { $process.Kill() } catch {
                 # Основна помилка timeout важливіша: процес міг завершитись між WaitForExit і Kill.
@@ -2072,18 +2269,24 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
             throw "diskshadow.exe не завершився протягом 300 секунд"
         }
         $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $outputCapture
+        # Ідентифікатор набору визначаємо ДО перевірки коду завершення: якщо
+        # diskshadow.exe встиг створити persistent-знімки і аж потім впав,
+        # cleanup у catch має знати, що саме прибирати.
+        $snapshotSetId = Get-BRAVOVSSDiskshadowSetIdFromOutput -Output (
+            $capturedOutput.StandardOutput + "`n" + $capturedOutput.StandardError
+        )
         if ($process.ExitCode -ne 0) {
             throw "diskshadow.exe повернув код $($process.ExitCode): $($capturedOutput.StandardError) $($capturedOutput.StandardOutput)"
         }
 
-        $snapshotSetMatch = [regex]::Match(
-            ($capturedOutput.StandardOutput + "`n" + $capturedOutput.StandardError),
-            '(?im)Shadow copy set ID:\s*(?<SetId>\{[0-9a-fA-F-]+\})'
-        )
-        if (-not $snapshotSetMatch.Success) {
+        if ([string]::IsNullOrWhiteSpace($snapshotSetId)) {
+            $snapshotSetId = Get-BRAVOVSSDiskshadowSetIdFromWmi `
+                -KnownShadowIds $knownShadowIds `
+                -VolumeRoots $VolumeRoots
+        }
+        if ([string]::IsNullOrWhiteSpace($snapshotSetId)) {
             throw "diskshadow.exe не повідомив Shadow copy set ID"
         }
-        $snapshotSetId = $snapshotSetMatch.Groups["SetId"].Value.ToUpperInvariant()
         $escapedSetId = $snapshotSetId.Replace("'", "''")
         $wmiShadows = @(
             Get-WmiObject `
@@ -2134,23 +2337,16 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
                 # Best-effort cleanup після частково створених link-ів; первинна помилка лишається нижче.
             }
         }
-        if (-not [string]::IsNullOrWhiteSpace($snapshotSetId)) {
-            try {
-                $escapedSetId = $snapshotSetId.Replace("'", "''")
-                foreach ($orphanedShadow in @(
-                        Get-WmiObject `
-                            -Namespace "root\cimv2" `
-                            -Class "Win32_ShadowCopy" `
-                            -Filter ("SetID='{0}'" -f $escapedSetId) `
-                            -ErrorAction SilentlyContinue
-                    )) {
-                    try { [void]$orphanedShadow.Delete() } catch {
-                        # Best-effort cleanup після невдалого створення; первинна помилка лишається нижче.
-                    }
-                }
-            } catch {
-                # Не перекриваємо первинну помилку diskshadow/WMI вторинною помилкою cleanup.
-            }
+        try {
+            # Прибирання не можна ставити в залежність від розібраного SetID:
+            # саме коли розбір не вдався, persistent-знімки й лишалися на
+            # сервері після кожного невдалого запуску.
+            Remove-BRAVOVSSDiskshadowOrphanedShadow `
+                -SnapshotSetId $snapshotSetId `
+                -KnownShadowIds $knownShadowIds `
+                -VolumeRoots $VolumeRoots
+        } catch {
+            # Не перекриваємо первинну помилку diskshadow/WMI вторинною помилкою cleanup.
         }
         throw
     } finally {
@@ -4908,6 +5104,7 @@ function Invoke-BRAVOBazaIncrementalSync {
     # можливим override, MutationPolicy, FullAuditEnabled/EveryDays.
     $bazaSettingsEffective = Get-BRAVOBazaSettingsEffective
     $mutationPolicy = $bazaSettingsEffective.MutationPolicy
+    $autoArchiveMutationThreshold = $bazaSettingsEffective.AutoArchiveMutationThreshold
     $stateRootPath = $bazaSettingsEffective.StateRoot
     # FullAuditEnabled=$false вимикає ПЕРІОДИЧНИЙ audit (FullAuditEveryDays=0
     # для модуля) — bootstrap першого запуску лишається обов'язковим і від
@@ -4960,6 +5157,7 @@ function Invoke-BRAVOBazaIncrementalSync {
         -ConnectionTimeoutSeconds $sftpConnectionTimeoutSeconds `
         -OperationTimeoutSeconds $operationTimeoutSeconds `
         -MutationPolicy $mutationPolicy `
+        -AutoArchiveMutationThreshold $autoArchiveMutationThreshold `
         -BootstrapIfNeeded `
         -FullAuditProvider $fullAuditProvider `
         -FullAuditEveryDays $fullAuditEveryDays `
@@ -5161,6 +5359,214 @@ function Get-BRAVOArchiveFreeSpaceResult {
         AllExcluded = ($checkedDriveCount -eq 0)
         DriveStatus = $driveStatus.ToArray()
         Problems = $problems.ToArray()
+    }
+}
+
+function Get-BRAVOArchiveEstimatedSpaceRequirement {
+    # Фіксований поріг MinimumFreeSpaceGB (Get-BRAVOArchiveFreeSpaceResult
+    # вище) — загальний захист від переповнення диска ОС, не оцінка того,
+    # скільки місця реально потребує ЦЕЙ backup. Джерела MODEL/BLOG/
+    # BRAVOEXCH ростуть з часом; сервер може мати вільного місця більше за
+    # поріг, але менше, ніж потрібно для нового архіву — 7-Zip/VSS падає
+    # посеред роботи, хоча preflight-перевірка вище пройшла.
+    #
+    # Оцінка спирається на розмір ОСТАННЬОГО hash-підтвердженого валідного
+    # архіву того самого компонента (Get-BRAVOValidArchiveSizeHistory —
+    # той самий канонічний reader, що вже використовує SizeSanity для
+    # виявлення підозріло малих архівів) плюс запас на зростання джерела.
+    # Компонент без валідної історії (перший запуск компонента чи всі
+    # попередні архіви invalid/FAILED) свідомо пропускається з оцінки —
+    # bootstrap не повинен fail-closed заблокуватись через відсутність
+    # даних; захист для цього випадку лишається фіксований поріг вище.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object[]]$EnabledArchives,
+        [Parameter(Mandatory = $true)][string]$ArchiveFileFilter,
+        [Parameter(Mandatory = $true)][string]$HashFileExtension,
+        [Parameter(Mandatory = $true)][double]$MarginPercent,
+        # Той самий injectable-override принцип, що -Drives у
+        # Get-BRAVOArchiveFreeSpaceResult вище: детермінований self-test
+        # без залежності від реального вільного місця на CI/dev-машині.
+        # Елемент: @{ Drive = 'C:'; AvailableFreeSpace = <bytes>; IsReady = $true }.
+        [object[]]$Drives
+    )
+
+    $componentEstimates = New-Object System.Collections.Generic.List[object]
+    foreach ($archive in $EnabledArchives) {
+        $destination = [string]$archive.Destination
+        $history = @(Get-BRAVOValidArchiveSizeHistory `
+            -Directory $destination `
+            -ArchiveFilter $ArchiveFileFilter `
+            -HashFileExtension $HashFileExtension `
+            -MaxCount 1)
+        if ($history.Count -eq 0) {
+            [void]$componentEstimates.Add([pscustomobject]@{
+                Type = [string]$archive.Type
+                Destination = $destination
+                HasHistory = $false
+                LastValidBytes = $null
+                EstimatedBytes = $null
+            })
+            continue
+        }
+        $lastBytes = [int64]$history[0].Bytes
+        $estimatedBytes = [int64][math]::Ceiling($lastBytes * (1.0 + ($MarginPercent / 100.0)))
+        [void]$componentEstimates.Add([pscustomobject]@{
+            Type = [string]$archive.Type
+            Destination = $destination
+            HasHistory = $true
+            LastValidBytes = $lastBytes
+            EstimatedBytes = $estimatedBytes
+        })
+    }
+
+    # Групування за фізичним диском призначення: компоненти можуть лежати
+    # на різних томах (нетиповий, але дозволений layout) — кожен том
+    # перевіряється проти суми ЛИШЕ своїх компонентів, не всіх разом.
+    $volumeGroups = [ordered]@{}
+    foreach ($estimate in $componentEstimates) {
+        if (-not $estimate.HasHistory) { continue }
+        $driveLetter = $null
+        try {
+            $driveLetter = ([IO.Path]::GetPathRoot($estimate.Destination)).TrimEnd('\').ToUpperInvariant()
+        } catch {
+            continue
+        }
+        if ([string]::IsNullOrWhiteSpace($driveLetter)) { continue }
+        if (-not $volumeGroups.Contains($driveLetter)) {
+            $volumeGroups[$driveLetter] = [pscustomobject]@{
+                Drive = $driveLetter
+                RequiredBytes = [int64]0
+                Components = New-Object System.Collections.Generic.List[string]
+            }
+        }
+        $volumeGroups[$driveLetter].RequiredBytes += $estimate.EstimatedBytes
+        [void]$volumeGroups[$driveLetter].Components.Add([string]$estimate.Type)
+    }
+
+    $injectedDrives = @(if ($PSBoundParameters.ContainsKey('Drives')) { $Drives } else { @() })
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $volumeStatus = New-Object System.Collections.Generic.List[object]
+    foreach ($driveLetter in $volumeGroups.Keys) {
+        $group = $volumeGroups[$driveLetter]
+        $availableBytes = $null
+        try {
+            if ($PSBoundParameters.ContainsKey('Drives')) {
+                $injectedDrive = @($injectedDrives | Where-Object {
+                    ([string]$_.Drive).TrimEnd('\').ToUpperInvariant() -eq $driveLetter
+                } | Select-Object -First 1)
+                if ($injectedDrive.Count -gt 0 -and [bool]$injectedDrive[0].IsReady) {
+                    $availableBytes = [int64]$injectedDrive[0].AvailableFreeSpace
+                }
+            } else {
+                $driveInfo = New-Object System.IO.DriveInfo($driveLetter)
+                if ($driveInfo.IsReady) {
+                    $availableBytes = [int64]$driveInfo.AvailableFreeSpace
+                }
+            }
+        } catch {
+            $availableBytes = $null
+        }
+        $requiredGB = [math]::Round($group.RequiredBytes / 1GB, 2)
+        $availableGB = if ($null -ne $availableBytes) { [math]::Round($availableBytes / 1GB, 2) } else { $null }
+        $componentsText = $group.Components -join ', '
+        [void]$volumeStatus.Add([pscustomobject]@{
+            Drive = $driveLetter
+            Components = $componentsText
+            RequiredGB = $requiredGB
+            AvailableGB = $availableGB
+        })
+        if ($null -eq $availableBytes) {
+            [void]$problems.Add("диск ${driveLetter}: не вдалося визначити вільне місце для оцінки ($componentsText)")
+            continue
+        }
+        if ($availableBytes -lt $group.RequiredBytes) {
+            [void]$problems.Add(
+                "диск ${driveLetter}: розрахункова потреба ${requiredGB} GB ($componentsText; історія + ${MarginPercent}% запасу), доступно лише ${availableGB} GB"
+            )
+        }
+    }
+
+    return [pscustomobject]@{
+        Success = ($problems.Count -eq 0)
+        ComponentEstimates = $componentEstimates.ToArray()
+        VolumeStatus = $volumeStatus.ToArray()
+        Problems = $problems.ToArray()
+    }
+}
+
+function Merge-BRAVOArchiveSpaceCheckResults {
+    # Об'єднує фіксований поріг (Get-BRAVOArchiveFreeSpaceResult) і
+    # розрахункову оцінку (Get-BRAVOArchiveEstimatedSpaceRequirement) в
+    # один підсумковий результат кроку "Перевірка вільного місця".
+    #
+    # Реальний acceptance (2026-08-25): фіксований поріг — загальний
+    # OS-захист "не забити диск впритул", не прив'язаний до конкретного
+    # backup. Оператор підтвердив, що коли розрахункова оцінка доводить
+    # достатність місця САМЕ для цього набору архівів, фіксований поріг
+    # не повинен блокувати прогін — лише попереджати.
+    #
+    # Виправдання приймається СТРОГО по-диску (не глобально) і ЛИШЕ коли
+    # для ТОГО САМОГО диска оцінка реально обчислена й показала
+    # достатність. Диск без жодного увімкненого компонента з валідною
+    # історією (bootstrap, чи взагалі не бере участі в backup) лишається
+    # під фіксованим порогом без жодних послаблень — довести безпеку
+    # нема на чому, а не тому, що ризик підтверджено прийнятним.
+    #
+    # Незалежно від floor-виправдання: якщо сама розрахункова оцінка
+    # виявила недостатність (для будь-якого оціненого диска) — це
+    # завжди блокує, floor-виправдання тут ролі не відіграє.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$FloorResult,
+        [Parameter(Mandatory = $true)][object]$EstimatedResult,
+        [Parameter(Mandatory = $true)][double]$MinimumFreeSpaceGB
+    )
+
+    $warnings = New-Object System.Collections.Generic.List[string]
+    $unresolvedProblems = New-Object System.Collections.Generic.List[string]
+    $success = [bool]$FloorResult.Success
+
+    if (-not $FloorResult.Success) {
+        foreach ($driveStatus in @($FloorResult.DriveStatus)) {
+            if ([double]$driveStatus.FreeSpaceGB -ge $MinimumFreeSpaceGB) {
+                continue
+            }
+            $matchingEstimate = @($EstimatedResult.VolumeStatus | Where-Object {
+                [string]::Equals([string]$_.Drive, [string]$driveStatus.Drive, [StringComparison]::OrdinalIgnoreCase)
+            } | Select-Object -First 1)
+            $estimateCoversDrive = (
+                $matchingEstimate.Count -gt 0 -and
+                $null -ne $matchingEstimate[0].AvailableGB -and
+                $matchingEstimate[0].AvailableGB -ge $matchingEstimate[0].RequiredGB
+            )
+            if ($estimateCoversDrive) {
+                [void]$warnings.Add(
+                    "Диск $($driveStatus.Drive): вільно $($driveStatus.FreeSpaceGB) GB — нижче " +
+                    "фіксованого порогу $MinimumFreeSpaceGB GB, але розрахункова потреба " +
+                    "$($matchingEstimate[0].RequiredGB) GB покрита ($($matchingEstimate[0].Components)) — " +
+                    "продовжуємо (WARNING, не блокує)."
+                )
+            } else {
+                [void]$unresolvedProblems.Add(
+                    "диск $($driveStatus.Drive): залишилось $($driveStatus.FreeSpaceGB) GB, потрібно мінімум $MinimumFreeSpaceGB GB"
+                )
+            }
+        }
+        $success = ($unresolvedProblems.Count -eq 0)
+    }
+
+    $finalProblems = @($unresolvedProblems.ToArray())
+    if (-not [bool]$EstimatedResult.Success) {
+        $success = $false
+        $finalProblems = @($finalProblems) + @($EstimatedResult.Problems)
+    }
+
+    return [pscustomobject]@{
+        Success = $success
+        Problems = $finalProblems
+        Warnings = $warnings.ToArray()
     }
 }
 
@@ -5723,6 +6129,45 @@ function Main {
     if ($archiveFreeSpaceResult.AllExcluded) {
         Write-Log 'Усі локальні диски виключено з перевірки вільного місця' -Level 'WARNING'
     }
+
+    # Розрахункова перевірка поверх фіксованого порогу вище: скільки місця
+    # реально потребує ЦЕЙ backup (за розміром останнього валідного архіву
+    # кожного компонента + запас), а не лише "диск ОС не забитий впритул".
+    # Компонент без історії пропускається (bootstrap), не блокує прогін.
+    try {
+        $archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement `
+            -EnabledArchives $enabledArchives `
+            -ArchiveFileFilter $archiveFileFilter `
+            -HashFileExtension $hashFileExtension `
+            -MarginPercent $archiveEstimatedSpaceMarginPercent
+    } catch {
+        Write-Log "Не вдалося виконати розрахункову перевірку місця: $($_.Exception.Message)" -Level 'WARNING'
+        $archiveEstimatedSpaceResult = [pscustomobject]@{ Success = $true; ComponentEstimates = @(); VolumeStatus = @(); Problems = @() }
+    }
+    foreach ($volumeStatusEntry in @($archiveEstimatedSpaceResult.VolumeStatus)) {
+        Write-Log (
+            "Диск $($volumeStatusEntry.Drive) ($($volumeStatusEntry.Components)): розрахункова потреба " +
+            "$($volumeStatusEntry.RequiredGB) GB, доступно $($volumeStatusEntry.AvailableGB) GB"
+        ) -Level 'INFO'
+    }
+
+    # Оператор (реальний acceptance, 2026-08-25): фіксований поріг
+    # (загальний OS-захист "не забити диск впритул", не прив'язаний до
+    # конкретного backup) не повинен блокувати архівацію, коли для САМЕ
+    # ЦЬОГО набору архівів розрахунково доведено достатньо місця.
+    # Merge-BRAVOArchiveSpaceCheckResults реалізує це строго по-диску —
+    # диск без жодного оціненого компонента (bootstrap, чи взагалі не
+    # бере участі в backup) лишається під фіксованим порогом без
+    # послаблень.
+    $mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults `
+        -FloorResult $archiveFreeSpaceResult `
+        -EstimatedResult $archiveEstimatedSpaceResult `
+        -MinimumFreeSpaceGB $archiveMinimumFreeSpaceGB
+    foreach ($mergedWarning in @($mergedArchiveSpaceResult.Warnings)) {
+        Write-Log $mergedWarning -Level 'WARNING'
+    }
+    $archiveFreeSpaceResult.Success = $mergedArchiveSpaceResult.Success
+    $archiveFreeSpaceResult.Problems = $mergedArchiveSpaceResult.Problems
 
     $archiveFreeSpaceReason = if ($archiveFreeSpaceResult.Success) {
         $null

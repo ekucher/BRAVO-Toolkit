@@ -67,6 +67,41 @@ $interactiveMenuRequested = (
 )
 $storeForWasSpecified = $PSBoundParameters.ContainsKey("StoreFor")
 
+# Пауза перед закриттям вікна — лише для окремого інтерактивного запуску
+# (подвійний клік / ручний запуск меню), щоб оператор устиг прочитати
+# РЕЗУЛЬТАТ. НЕ спрацьовує у worker-режимі (-ProtectedPayloadPath), при
+# неінтерактивному CLI (-Action/-Component) — там $interactiveMenuRequested
+# = $false — і в неінтерактивному хості (redirected stdin), щоб не підвісити
+# батьківський процес чи Планувальник. Той самий самодостатній ідіом паузи,
+# що Wait-BRAVOEarlyManualExit у BRAVO_MAINTENANCE/BRAVO_ARCHIV. Делегує до
+# канонічного Complete-BRAVOHelperLog (яка й викликає exit) — цей файл
+# єдиний, хто загортає її в паузу, тому спільний helper-модуль не чіпаємо.
+function Complete-BRAVOCredentialSetup {
+    param([Parameter(Mandatory = $true)][int]$ExitCode)
+    if ($interactiveMenuRequested) {
+        $canPause = $false
+        try {
+            $canPause = [Environment]::UserInteractive -and -not [Console]::IsInputRedirected
+        } catch {
+            $canPause = $false
+        }
+        if ($canPause) {
+            Write-Host ""
+            Write-Host "Натиснiть будь-яку клавiшу для закриття вiкна..." -ForegroundColor Cyan
+            try {
+                [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+            } catch {
+                try {
+                    [void](Read-Host)
+                } catch {
+                    # Немає способу почекати на ввід (нетиповий хост) — не привід падати.
+                }
+            }
+        }
+    }
+    Complete-BRAVOHelperLog -ExitCode $ExitCode
+}
+
 $bravoScriptDirectory = if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
     Split-Path -Path $PSCommandPath -Parent
 } elseif (-not [string]::IsNullOrWhiteSpace($MyInvocation.MyCommand.Path)) {
@@ -79,7 +114,7 @@ $compatibilityModulePath = Join-Path $bravoScriptDirectory "modules\BRAVO.Compat
 $systemModulePath = Join-Path $bravoScriptDirectory "modules\BRAVO.System\BRAVO.System.psd1"
 if (-not (Test-Path -LiteralPath $compatibilityModulePath -PathType Leaf)) {
     Write-Error "Не знайдено модуль сумісності: $compatibilityModulePath"
-    Complete-BRAVOHelperLog -ExitCode 1
+    Complete-BRAVOCredentialSetup -ExitCode 1
 }
 try {
     Import-Module -Name $compatibilityModulePath -ErrorAction Stop
@@ -89,7 +124,7 @@ try {
     $script:BRAVOPowerShellUpdate = Get-BRAVOPowerShellUpdateRecommendation
 } catch {
     Write-Error "Помилка сумісності: $($_.Exception.Message)"
-    Complete-BRAVOHelperLog -ExitCode 1
+    Complete-BRAVOCredentialSetup -ExitCode 1
 }
 if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
     Write-Warning $BRAVOPowerShellUpdate.Message
@@ -532,13 +567,62 @@ function Read-SecretEntries {
         Justification = 'Секрет щойно введений оператором у консолі й одразу записується в Credential Manager; SecureString — формат зберігання, а не джерело.')]
     param([string[]]$Names)
 
+    # Оператор має бачити, що набирає: помилку в значенні (зайвий пробіл, не
+    # та розкладка) за зірочками не видно, і вона спливає пізніше як відмова
+    # автентифікації SFTP — далеко від місця, де її припустилися.
+    #
+    # Відкритий ввід дозволений ЛИШЕ тоді, коли доведено, що значення не
+    # осяде в журналі: helper-лог — це дослівний Start-Transcript, тому
+    # (1) власний transcript цього процесу має піддаватися паузі (перевіряє
+    # canary у Test-BRAVOHelperLogSuspensionEffective — не припущення про
+    # версію PowerShell, а фактична перевірка на цьому хості), і
+    # (2) батьківський BRAVO_SETUP має підтвердити, що зупинив СВІЙ transcript,
+    # інакше він захопить наш стрім у свій лог.
+    # Не виконано хоч одну умову -> fail-closed: ввід лишається прихованим.
+    $parentLogSuspended = ($env:BRAVO_PARENT_LOG_SUSPENDED -eq '1')
+    $plainInputAllowed = $parentLogSuspended -and (Test-BRAVOHelperLogSuspensionEffective)
+    if (-not $plainInputAllowed) {
+        Write-Host (
+            "Ввід лишається прихованим: не підтверджено, що значення не потрапить у журнал."
+        ) -ForegroundColor DarkGray
+    }
+
     $entries = New-Object System.Collections.ArrayList
+    $logSuspended = $false
+    if ($plainInputAllowed) {
+        $logSuspended = Suspend-BRAVOHelperLog
+        if (-not $logSuspended) {
+            # Canary щойно казав, що пауза працює, а вона не спрацювала —
+            # довіряємо фактові, а не попередній перевірці.
+            $plainInputAllowed = $false
+        }
+    }
+    try {
     foreach ($descriptor in @(Get-CredentialDescriptors -Names $Names)) {
         if ([string]::IsNullOrWhiteSpace([string]$descriptor.Target)) {
             throw "Для $($descriptor.Component) не налаштовано назву запису Credential Manager"
         }
 
-        $secret = if ([string]$descriptor.InputMode -eq "Text") {
+        $secret = if ($plainInputAllowed) {
+            $plainValue = Read-Host ([string]$descriptor.Prompt)
+            # Валідація застосовується лише там, де для значення взагалі є
+            # предметне правило (назва/код установи, префікс). Для паролів і
+            # webhook-ів такого правила немає — там єдина осмислена перевірка
+            # (непорожність) виконується нижче, спільно для всіх гілок.
+            $normalizedValue = if ([string]::IsNullOrWhiteSpace([string]$descriptor.Validation)) {
+                [string]$plainValue
+            } else {
+                Test-BRAVOInstitutionSettingValue `
+                    -Name ([string]$descriptor.Validation) `
+                    -Value ([string]$plainValue)
+            }
+            try {
+                ConvertTo-SecureString -String $normalizedValue -AsPlainText -Force
+            } finally {
+                $plainValue = $null
+                $normalizedValue = $null
+            }
+        } elseif ([string]$descriptor.InputMode -eq "Text") {
             $plainValue = Read-Host ([string]$descriptor.Prompt)
             $normalizedValue = Test-BRAVOInstitutionSettingValue `
                 -Name ([string]$descriptor.Validation) `
@@ -562,6 +646,13 @@ function Read-SecretEntries {
             UserName = [string]$descriptor.Component
             SecureSecret = $secret
         })
+    }
+    } finally {
+        # finally обов'язковий: без нього виняток під час вводу лишив би
+        # журнал вимкненим до кінця процесу, і решта кроків не записалась би.
+        if ($logSuspended) {
+            [void](Resume-BRAVOHelperLog)
+        }
     }
     return $entries.ToArray()
 }
@@ -1240,7 +1331,7 @@ try {
             throw "Для worker-режиму не вказано ResultPath"
         }
         Invoke-ProtectedPayloadWorker -PayloadPath $ProtectedPayloadPath -WorkerResultPath $ResultPath
-        Complete-BRAVOHelperLog -ExitCode 0
+        Complete-BRAVOCredentialSetup -ExitCode 0
     }
 
     if ($interactiveMenuRequested) {
@@ -1249,7 +1340,7 @@ try {
             -AskForStore (-not $storeForWasSpecified)
         if ($null -eq $menuSelection) {
             Write-Host "Роботу завершено без змін." -ForegroundColor Yellow
-            Complete-BRAVOHelperLog -ExitCode 0
+            Complete-BRAVOCredentialSetup -ExitCode 0
         }
         $Action = [string]$menuSelection.Action
         $Component = @([string]$menuSelection.Component)
@@ -1269,7 +1360,7 @@ try {
     $requestedComponents = @(Resolve-RequestedComponents)
     if ($requestedComponents.Count -eq 0) {
         Write-Host "Немає секретів, необхідних для увімкнених компонентів." -ForegroundColor Yellow
-        Complete-BRAVOHelperLog -ExitCode 0
+        Complete-BRAVOCredentialSetup -ExitCode 0
     }
 
     $scheduledAccount = [string]$schedulerSettings.RunAsUser
@@ -1315,7 +1406,7 @@ try {
             -PassThru `
             -WindowStyle Normal
         Write-Host "Налаштування Credential Manager завершено з кодом $($process.ExitCode)."
-        Complete-BRAVOHelperLog -ExitCode $process.ExitCode
+        Complete-BRAVOCredentialSetup -ExitCode $process.ExitCode
     }
 
     $currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent().Name
@@ -1361,7 +1452,7 @@ try {
 
         Write-OperationResults -Results $availabilityResults
         if (@($availabilityResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-            Complete-BRAVOHelperLog -ExitCode 1
+            Complete-BRAVOCredentialSetup -ExitCode 1
         }
         $missingComponents = @(
             $availabilityResults |
@@ -1370,7 +1461,7 @@ try {
         )
         if ($missingComponents.Count -eq 0) {
             Write-Host "Усі запитані записи вже наявні. Значення не змінювалися." -ForegroundColor Green
-            Complete-BRAVOHelperLog -ExitCode 0
+            Complete-BRAVOCredentialSetup -ExitCode 0
         }
 
         Write-Host (
@@ -1455,10 +1546,17 @@ try {
     }
     Write-BRAVOCredentialResultBlock -Results $operationResults -Action $Action
 
-    if (@($operationResults | Where-Object { $_.Status -in @("Error", "Missing") }).Count -gt 0) {
-        Complete-BRAVOHelperLog -ExitCode 1
+    # "Missing" є невдачею лише для Test (перевірка наявності запису).
+    # Remove ідемпотентний: видалення вже-відсутнього запису дає статус
+    # "Missing", але це не помилка — інакше повторний "Видалити всі"
+    # хибно завершувався кодом 1 і піднімав "ПОТРІБНА ДІЯ". Для
+    # Add/Update/Set/Ensure статусу "Missing" не буває; скрізь, крім Test,
+    # невдачею лишається тільки "Error".
+    $failureStatuses = if ($Action -eq "Test") { @("Error", "Missing") } else { @("Error") }
+    if (@($operationResults | Where-Object { $_.Status -in $failureStatuses }).Count -gt 0) {
+        Complete-BRAVOCredentialSetup -ExitCode 1
     }
-    Complete-BRAVOHelperLog -ExitCode 0
+    Complete-BRAVOCredentialSetup -ExitCode 0
 } catch {
     if (-not [string]::IsNullOrWhiteSpace($ProtectedPayloadPath) -and
         -not [string]::IsNullOrWhiteSpace($ResultPath)) {
@@ -1478,5 +1576,5 @@ try {
     if (-not $protectedWorkerMode) {
         Write-Host "ПОМИЛКА: $($_.Exception.Message)" -ForegroundColor Red
     }
-    Complete-BRAVOHelperLog -ExitCode 1
+    Complete-BRAVOCredentialSetup -ExitCode 1
 }

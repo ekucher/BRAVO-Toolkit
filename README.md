@@ -1,4 +1,4 @@
-# BRAVO 5.1.0 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.2.0 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -78,7 +78,7 @@ Archive, Health і Maintenance визначають рівень при кожн
 |---|---|
 | `7za.exe` | Створення та повна перевірка архівів |
 | `WinSCP.com` | Production-передача і синхронізація SFTP |
-| `WinSCPnet.dll` | Автентифікований read-only тест SFTP |
+| `WinSCPnet.dll` | Автентифікований тест доступу SFTP |
 | `WinSCP.exe` | Працює в парі з `WinSCPnet.dll` під час тесту доступу |
 
 Еталон цілісності інструментів — `Tools\TOOLS_MANIFEST.json`, у тому
@@ -236,6 +236,7 @@ $global:pathSettings = @{
 | `bravoSettings` | `NotificationProvider` (`slack` або `discord`), `NotificationMode` і `NotificationRouting` (severity → GENERAL/ALERTS) |
 | `pathSettings` | `LIMSRoot`/`SystemLogRoot`/`BackupRoot` — усі три `""`=AUTO (розділ 2); `ArchiveRoot` більше немає |
 | `maintenanceSettings` | імена служб, каталог Br-a-vo.web, таймаути, `Retention.ArchiveDays` / `Retention.CompressedLogDays` (розділ 12) |
+| `maintenanceSettings.Limits` | `MinimumFreeSpaceGB`, `ExcludedDrives`, `MaximumMdFileSizeGB`, опційний `EstimatedSpaceMarginPercent` (розділ 3.3) |
 | `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати |
 | `backupConsistency` | обов'язковий режим `VSS` і контекст `ClientAccessible` для узгоджених архівів |
 | SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey`, віддалені каталоги |
@@ -369,6 +370,39 @@ backup — лише пише `WARNING` у журнал (`Write-Log`) і підн
 потрапляє в лічильник попереджень і, відповідно, у Slack/Discord-
 сповіщення після backup.
 
+### 3.3. Розрахункова перевірка вільного місця
+
+Фіксований поріг `maintenanceSettings.Limits.MinimumFreeSpaceGB`
+(типово 20 GB на кожному локальному Fixed-диску) — загальний захист від
+переповнення диска, а не оцінка того, скільки місця реально потребує
+найближчий backup. Джерела MODEL/BLOG/BRAVOEXCH ростуть з часом, тому
+перед архівацією `BRAVO_ARCHIV` додатково рахує **розрахункову потребу**:
+розмір останнього hash-підтвердженого валідного архіву кожного
+увімкненого компонента (той самий канонічний reader історії, що й
+`SizeSanity` у розділі 3.2) плюс запас на зростання:
+
+| Поле (`maintenanceSettings.Limits`) | Призначення |
+|---|---|
+| `EstimatedSpaceMarginPercent` | запас у % понад розмір останнього валідного архіву (типово 25); опційний — старі `BRAVO.config` без нього отримують дефолт у коді завантаження |
+
+Правила:
+
+- компоненти на одному фізичному диску сумуються в один розрахунок;
+- компонент без валідної історії (перший запуск, bootstrap) з оцінки
+  пропускається — не блокує прогін;
+- **недостатність за оцінкою завжди блокує** backup, навіть якщо
+  фіксований поріг проходить;
+- у зворотний бік: якщо диск нижче фіксованого порогу, але розрахункова
+  потреба для ТОГО САМОГО диска доведено покрита, провал порогу
+  знижується до `WARNING` у лозі (backup не блокується). Диск без
+  жодного оціненого компонента лишається під фіксованим порогом без
+  послаблень.
+
+Перевірка діє лише в archive preflight (`BRAVO_ARCHIV`); Maintenance
+перевіряє тільки фіксований поріг. Операторська інтерпретація
+результатів — в `OPERATIONS.md`, розділ `40`, підрозділ «Archive
+preflight: перевірка вільного місця».
+
 ## 4. Параметри установи та секрети
 
 Наступні значення зберігаються у Windows Credential Manager, тому їх не потрібно
@@ -474,7 +508,7 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 2. запитує лише відсутні credentials та параметри установи;
 3. перевіряє їх читання поточним користувачем і `SYSTEM`;
 4. перевіряє і встановлює завдання Планувальника;
-5. запускає dry-run та read-only тести SFTP/SMB від `SYSTEM`;
+5. запускає dry-run та тести доступу SFTP/SMB від `SYSTEM`;
 6. надсилає одне тестове повідомлення у налаштований Slack або Discord.
 
 У цьому сценарії не створюються архіви, не синхронізуються дані, не видаляються
@@ -511,7 +545,9 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 .\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config"
 ```
 
-Додатково перевірити реальну автентифікацію та read-only доступ:
+Додатково перевірити реальну автентифікацію та доступ (містить проби
+запису: локальні create/write/read/delete і створення відсутніх каталогів
+призначення на SFTP):
 
 ```powershell
 .\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
@@ -644,6 +680,18 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 захоплює той самий machine-wide operation lock, що архівація й
 обслуговування, тому не може виконуватись паралельно з ними.
 
+**Автоматична реставрація пропущеного слота** (`Restore.BootRestoreMode`,
+`BRAVO.config`) визначає, як сервер поводиться, якщо планова реставрація
+пропущена (сервер був вимкнений/перезавантажувався у вікні відновлення):
+`"None"` (типово, 24/7-сервер) — пропущений слот підхоплює щонічне
+Maintenance, окреме Recovery-завдання не реєструється (наявне вимикається
+інсталятором); `"HoldServices"` (сервер робочого часу) — реєструється
+одноразовий boot-trigger Recovery-завдання, що виконує пропущену
+реставрацію одразу після старту, поки служби ще не запущені. Повний опис
+обох режимів і взаємодії зі стартовим типом служб — `BRAVO.config`
+(коментар над `Restore.BootRestoreMode`) і `OPERATIONS.md`, розділ
+"Профілі реставрації: 24/7 vs сервер робочого часу".
+
 ## 7. Окремі етапи налаштування
 
 Комплексний setup можна обмежити одним етапом:
@@ -724,8 +772,11 @@ Snapshot Set і мають один `GenerationId`: one backup generation = one
 point-in-time. Якщо set створити не вдалося, виконується zero live archive
 operations і запуск повертає
 помилку. Погодинний health-check повторно контролює встановлені
-служби, крім служб із типом запуску `Disabled`; однакові health-alert
-пригнічуються на інтервал `RepeatAlertAfterHours`.
+служби, крім служб із типом запуску `Disabled`; повторні однакові
+health-alert можуть тимчасово пригнічуватися на інтервал
+`RepeatAlertAfterHours` (типово `0` - дедуп вимкнено, alert надходить
+щоцикл, поки проблема триває; success-звіт дедупу не підлягає незалежно
+від цього значення).
 
 Встановити або оновити лише завдання:
 
@@ -894,8 +945,11 @@ logs `BRAVO_MAINTENANCE` переносить під `SystemLogRoot` (за за�
 ```text
 <SystemLogRoot>\
 ├── Trace\
-│   ├── YYYY-MM-DD\TraceSRV_1.out, TraceSRV_2.out, …
-│   └── Trace_YYYY-MM-DD.mdz            після Retention.ArchiveDays
+│   ├── TraceSRV_YYYYMMDD_HHMMSS.out    нова модель 5.2.0 (плоско, timestamp)
+│   ├── TraceBIS_YYYYMMDD_HHMMSS.out    друге джерело (конфіг-override)
+│   ├── Trace_YYYYMMDD.mdz (+ .sha512)  добовий накопичувальний архів
+│   ├── YYYY-MM-DD\TraceSRV_1.out, …    legacy-структура (не чіпається)
+│   └── Trace_YYYY-MM-DD.mdz            legacy-архіви каталогів-дат
 ├── exchangAPI\
 │   ├── YYYY-MM-DD\exchangAPI_1.log, exchangAPI_2.log, …
 │   └── exchangAPI_YYYY-MM-DD.mdz
@@ -915,8 +969,42 @@ Marker `restore_done_yyyyMMdd.marker` (у `<RuntimeRoot>\LOGS`) створюєт
 атомарно у UTF-8 і не створюється після примусового `-ForceRestore`. Тривкий
 стан реставрації — `%ProgramData%\BRAVO\State\BRAVO_RESTORE_STATE.json`.
 
-**Джерела.** Trace береться виключно з `bravo.ini`, секція `[Debug]`, ключ
-`FILE`; у `BRAVO.config` цей параметр не дублюється. Сам `bravo.ini` має рівно
+**Trace-модель (добовий накопичувальний архів).** Trace-файли обробляються
+**виключно** `BRAVO_MAINTENANCE` (ручний запуск і Task Scheduler — одна
+pipeline; розмір файла ніколи не є тригером; без запуску Maintenance
+BRAVO-Toolkit trace не чіпає взагалі). У тому самому запуску: ротація при
+зупинених службах у `Trace\<basename>_<yyyyMMdd_HHmmss>.out` (колізія імені →
+наступна вільна секунда, існуючий файл ніколи не перезаписується) → після
+відновлення служб — накопичувальне оновлення **одного** `Trace_YYYYMMDD.mdz`
+на календарну дату (дата — з імені ротованого файла; у 7-Zip передаються ЛИШЕ
+нові файли; entries, що вже в архіві, — immutable і верифікуються за
+Path+Size+CRC до/після) → `7z t` → SHA512 sidecar → SFTP у каталог
+`sftpDirectories.TraceLogs` (типово `logs/trace`; передача у `<ім'я>.new` з
+верифікацією розміру до заміни попередньої remote-версії) → видалення
+ротованих `.out` лише після повного ланцюга archive+SFTP+verify. Локальний
+`.mdz` після SFTP **не видаляється** — лише явно ввімкненою політикою
+`Retention.CompressedLogDeletionEnabled` + `CompressedLogDays`. Збій SFTP не
+втрачає нічого: архів і `.out` лишаються, наступний Maintenance догрузить без
+дублікатів (backlog обробляє всі дати, oldest→newest). Наявні архіви зі
+старого SFTP-каталогу `sftpDirectories.Trace` (типово `trace`) Maintenance
+одноразово (idempotent) мігрує remote-move'ом у `logs/trace` з верифікацією,
+нічого не видаляючи.
+
+**Логи exchangAPI** обробляються тим самим движком: при зупиненій службі
+файли переносяться в `LOGS\exchangAPI` (плоско) **з оригінальними іменами,
+без перейменувань**; після відновлення служб — добовий
+`exchangAPI_YYYYMMDD.mdz` (група за датою LastWriteTime файла) → `7z t` →
+SHA512 → SFTP у `sftpDirectories.ExchangeApiLogs` (типово `logs/exchangapi`)
+→ видалення джерельних `.log` лише після повної верифікації.
+
+**Джерела.** Ротується **кожен `*.out` з кореня інсталяції bravo.exe**
+(Discovery; фолбек — LIMSRoot, коли служба BRAVO не знайдена): реальні
+інсталяції накопичують варіанти на кшталт `TraceSRV2.out`, `traceBIS1.out`,
+`!TraceSRV.out` — усі вони підбираються за один прохід. Додатково: SRV-шлях
+із `bravo.ini` (секція `[Debug]`, ключ `FILE`; у `BRAVO.config` не
+дублюється) і явний `maintenanceSettings.Trace.BISSourcePath`, якщо ці файли
+лежать поза коренем (порожньо або `'off'` = нічого додаткового — корінь і так
+покривається скануванням). Сам `bravo.ini` має рівно
 один очікуваний шлях, визначений архітектурою ОС —
 `%SystemRoot%\SysWOW64\bravo.ini` на x64 і `%SystemRoot%\System32\bravo.ini`
 на x86; інших місць не перевіряється, а відсутність файлу є помилкою
@@ -1071,12 +1159,12 @@ health > лише попередження. Код `90` має найвищий 
 | `35` | `VERSION.json.packageVersion` нижчий за записаний у `C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json` | Рядок `ВІДКАТ ВЕРСІЇ` на старті. Старіший комплект проходить усі перевірки цілісності — разом із вразливостями, які відтоді закрили. Звірте `sourceCommit` розгорнутого й записаного. Якщо повернення на попередній реліз свідоме, встановіть `BRAVO_ALLOW_DOWNGRADE=1` |
 | `36` | (лише `BRAVO_HEALTH.ps1`) ручний запуск без прав адміністратора: explicit `-NonInteractive` сесія без elevation, скасований UAC, або `UnauthorizedAccessException` при записі в `LOGS`/`TEMP` | Рядок `ПОМИЛКА СЕРЕДОВИЩА`/`КРИТИЧНА ПОМИЛКА: BRAVO HEALTH запущено без прав адміністратора` на старті. Запустіть від імені адміністратора вручну (з'явиться запит UAC автоматично) або переконайтесь, що заплановане завдання виконується від `SYSTEM`. SFTP/SMB/локальні перевірки при цьому коді НЕ виконувались — не плутати з `50`/`70` |
 | `37` | (лише `BRAVO_HEALTH.ps1`) `LOGS`/`TEMP` недоступні з причини, що НЕ є `UnauthorizedAccessException` (диск повний, `PathTooLong`, пошкоджена файлова система) | Рядок `ПОМИЛКА СЕРЕДОВИЩА` / `Не вдалося використовувати runtime TEMP/LOGS: ...` на старті — конкретна причина в тексті. НЕ означає бракує прав адміністратора: перевірте вільне місце на диску й доступність самого шляху. SFTP/SMB/локальні перевірки НЕ виконувались |
-| `40` | Провал створення архіву 7-Zip, або (Maintenance) провал відновлення з архіву | `[ERROR]` у секції `АРХІВАЦІЯ <компонент>`/`ВІДНОВЛЕННЯ`; останні рядки stdout/stderr 7-Zip записуються одразу після загального повідомлення |
+| `40` | Провал створення архіву 7-Zip, провал archive preflight (зокрема перевірки вільного місця, розділ 3.3), або (Maintenance) провал відновлення з архіву | `[ERROR]` у секції `АРХІВАЦІЯ <компонент>`/`ВІДНОВЛЕННЯ`; останні рядки stdout/stderr 7-Zip записуються одразу після загального повідомлення. При провалі preflight — `Причина: Недостатньо вільного місця...`, архіви не створювались |
 | `41` | `7z test` не підтвердив цілісність | `Перевiрка цiлiсностi 7-Zip не пройдена` у секції `АРХІВАЦІЯ`; final artifact не публікується |
 | `42` | SHA512 generation/verification failed після успішного `7z t` | Компонент `HASH`; тимчасові артефакти поточної generation прибираються, попередній valid backup лишається незмінним |
 | `50` | SFTP: з'єднання, автентифікація або передача файлу | Секція `ЗАВАНТАЖЕННЯ АРХІВІВ НА SFTP` / `СИНХРОНІЗАЦІЯ BAZA НА SFTP`; перевірте `sftpHostKey` fingerprint і мережевий доступ до TCP 22 |
 | `51` | SMB/NAS: недоступний UNC-шлях або облікові дані | Секція `КОПІЮВАННЯ АРХІВІВ НА NAS/SMB`; перевірте доступність UNC-шляху від `SYSTEM` через `BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess` |
-| `60` | Maintenance: служби, диск, файлове господарство — усе, що не потрапляє під `40`/`41` | Секція, де `Результат: ПОМИЛКА` вперше з'являється в `BRAVO_MAINTENANCE_*.log`; часто — недостатньо вільного місця (`Limits.MinimumFreeSpaceGB`) або служба не в стані `Running` |
+| `60` | Maintenance: служби, диск, файлове господарство — усе, що не потрапляє під `40`/`41` | Секція, де `Результат: ПОМИЛКА` вперше з'являється в `BRAVO_MAINTENANCE_*.log`; часто — недостатньо вільного місця (`Limits.MinimumFreeSpaceGB`; у Maintenance діє лише фіксований поріг, без розрахункового послаблення з розділу 3.3) або служба не в стані `Running` |
 | `70` | Health-check: локальні/SFTP/SMB копії застаріли, або керована служба не працює | `BRAVO_ARCHIV_HEALTH_*.log`, рядки `[ERROR] Проблема ...`; дивіться `LocalVerified`/`SftpVerified`/`SmbVerified`, якщо результат читається програмно |
 | `90` | Непередбачений виняток, якого runtime не встиг категоризувати | `Write-Error`/останній `[ERROR]` перед аварійним завершенням; часто вказує на прогалину в конфігурації, яку варто завести як окремий issue, а не лише перезапустити завдання |
 
@@ -1098,6 +1186,7 @@ health > лише попередження. Код `90` має найвищий 
 | `BRAVO_TASKS_DIAGNOSE.ps1` | діагностика Планувальника і запуск від `SYSTEM` |
 | `BRAVO_RESTORE_TEST.ps1` | restore drill — розпакування останнього verified backup в ізольований каталог (розділ 6.1) |
 | `BRAVO_DATA_RESTORE.ps1` | реальне відновлення даних із verified generation: out-of-place або in-place з move-aside і rollback (розділ 6.2) |
+| `BRAVO_BAZA_RECONCILE.ps1` | розв'язання append-only mutation violation у BAZA_APP/BAZA_WWW — свідоме прийняття оператором (`OPERATIONS.md`, "Розв'язання мутацій"); опційний per-cycle поріг авто-архівування `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` (типово `0` = вимкнено) описаний там само |
 
 ### Службові файли
 
@@ -1188,6 +1277,13 @@ technical evidence stays in the referenced log file.
 Host information is compact: `🖥️ SERVER · 10.10.150.102`. Public IP is shown
 only when lookup is enabled and a valid address is returned. Institution lines
 use `🏢`.
+
+Large diagnostic collections are summarized: the notification carries the
+total count, up to 5 representative examples and an `…і ще N` line; complete
+diagnostics remain in the local BRAVO-Toolkit log. A transport-agnostic safe
+payload limit truncates anomalously large messages (with an explicit suffix
+and the preserved log path) instead of splitting one event into a series of
+messages.
 
 Backup health terminology:
 

@@ -45,28 +45,51 @@ Authenticode, підписані git tags і криптографічно під
 
 ### P0.1 — Завершити hotfix 5.0.1
 
+**Статус (2026-08-25): цикл закрито.** PR #45 (`hotfix/5.0.1`) злито,
+stable `5.0.1` випущено 2026-08-18 (тег `v5.0.1`, CHANGELOG §5.0.1) і
+синхронізовано назад у `developer`. Формального real-server acceptance
+саме PR #45 у репозиторії не зафіксовано (промоція спиралась на
+CI + повний self-test із regression-доказом); notification
+routing/override поведінку повторно підтверджено real-server
+acceptance циклу 5.1.0 (rc.2/rc.4 PASS).
+
 Поточний production-дефект notification override має бути закритий до нових feature-релізів.
 
 Критерії завершення:
 
-- [ ] PR #45 проходить real-server acceptance.
-- [ ] Перевірено `NotificationMode=none/errors_only/all` з `-EnableAllSlack`/`-DisableAllSlack`.
-- [ ] Перевірено GENERAL/ALERTS routing і credential fallback.
-- [ ] Перевірено Maintenance final report і критичні alerts.
-- [ ] `5.0.1-rc.1` промотовано у stable `5.0.1` без функціональних змін після acceptance.
-- [ ] Hotfix синхронізовано назад у `developer`.
+- [ ] PR #45 проходить real-server acceptance. *(не зафіксовано окремо;
+      покрито опосередковано acceptance 5.1.0-rc.2/rc.4)*
+- [ ] Перевірено `NotificationMode=none/errors_only/all` з `-EnableAllSlack`/`-DisableAllSlack`. *(окремий протокол відсутній)*
+- [ ] Перевірено GENERAL/ALERTS routing і credential fallback. *(routing підтверджено acceptance 5.1.0-rc.4)*
+- [ ] Перевірено Maintenance final report і критичні alerts. *(окремий протокол відсутній)*
+- [x] `5.0.1-rc.1` промотовано у stable `5.0.1` без функціональних змін після acceptance.
+- [x] Hotfix синхронізовано назад у `developer`.
 
 ### P0.2 — Закрити release governance
 
 Мета — унеможливити повторення прямого feature merge у `master` в обхід RC/acceptance.
 
+**Статус (2026-08-26): закрито.** PR #46 злито
+(`ci/Test-BRAVOMasterMergePolicy.ps1` працює в CI). PR #92 додав
+семантичне порівняння stable-версій (`Test-BRAVOStableVersionPromotion`
+з регресіями, включно з кейсом `5.10.0 > 5.9.0`). Гілка
+`hardening/release-governance` додала перевірку repository identity
+(`Test-BRAVOMasterMergeSource`: PR у `master` приймається лише з
+`developer`/`hotfix/*` ЦЬОГО репозиторію; fork з однойменною гілкою —
+FAIL; невідомий head-репозиторій — fail-closed). Репозиторій став
+публічним, тож branch protection доступний без GitHub Pro: увімкнено
+для `master` і `developer` (PR-only, required checks, заборона force
+push/видалення, `enforce_admins` — admin-обхід на кшталт прецеденту
+PR #61 у вікні промоції 5.1.0 технічно заблоковано). Фактична
+конфігурація — `RELEASE_POLICY.md`, розділ 13.
+
 Критерії завершення:
 
-- [ ] PR #46 доведено до merge після виправлення всіх review findings.
-- [ ] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity.
-- [ ] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків.
-- [ ] `master` не приймає feature/fix PR напряму.
-- [ ] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan.
+- [x] PR #46 доведено до merge після виправлення всіх review findings.
+- [x] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity.
+- [x] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків. *(PR #92)*
+- [x] `master` не приймає feature/fix PR напряму. *(CI-гейт + branch protection з `enforce_admins`)*
+- [x] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(branch protection увімкнено на `master` і `developer`, 2026-08-26)*
 
 ### P0.3 — Захист remote backup history
 
@@ -101,6 +124,12 @@ Authenticode, підписані git tags і криптографічно під
 ## P1 — доказова відновлюваність і deployment quality
 
 ### P1.1 — Автоматичний scheduled Restore Drill
+
+**Не входить у 5.2.0.** Цикл 5.2.0 відхилився від раніше рекомендованої
+послідовності (P1.1 мав іти одним із перших) через production-інциденти,
+що потребували негайного виправлення: подвійна реставрація, BootRestore/
+Recovery task lifecycle, watchdog/quiescence reliability, Trace/Reconcile
+reliability. P1.1 лишається пріоритетом наступного циклу.
 
 `BRAVO_RESTORE_TEST.ps1` має стати штатним елементом експлуатації, а не ручною процедурою.
 
@@ -142,13 +171,22 @@ BRAVO-Toolkit-X.Y.Z.zip.sha256
 release-manifest.json
 ```
 
+**Статус (2026-08-25): закрито.** Реалізовано
+`.github/workflows/release-artifact.yml` +
+`ci/New-BRAVOReleaseArtifact.ps1`: збірка з конкретного git ref із
+провенанс-гейтом (`sourceCommit` має бути повним hash), `*.zip.sha256`,
+`release-manifest.json` (product/version/sourceCommit/files+hashes),
+повний self-test із розпакованого артефакту перед публікацією; процедура
+отримання/перевірки описана в `BRAVO_SETUP.md`, розділ «Отримання
+комплекту (release artifact)».
+
 Критерії завершення:
 
-- [ ] Artifact збирається автоматично з конкретного release commit/tag.
-- [ ] SHA-256 перевіряється до deployment.
-- [ ] Manifest містить product, version, sourceCommit і список файлів/хешів.
-- [ ] Artifact проходить CI/self-test перед публікацією.
-- [ ] Документація оновлення посилається на artifact, а не на ручне копіювання випадкового checkout.
+- [x] Artifact збирається автоматично з конкретного release commit/tag.
+- [x] SHA-256 перевіряється до deployment.
+- [x] Manifest містить product, version, sourceCommit і список файлів/хешів.
+- [x] Artifact проходить CI/self-test перед публікацією.
+- [x] Документація оновлення посилається на artifact, а не на ручне копіювання випадкового checkout.
 
 Підпис artifact/manifest є optional future hardening, не blocker для цього етапу.
 
@@ -240,6 +278,60 @@ FEAT-002 реалізується після stable release artifact і, баж�
 8. лише після цього — можливість auto-download/auto-update.
 
 Silent auto-update production серверів до завершення цих етапів заборонений архітектурно.
+
+### P3.2a — BRAVO_UPDATE.ps1: operator-triggered оновлення (перенесено на 5.3.0)
+
+**Не реалізовується у 5.2.0.** Раніше запланований на цикл 5.2.0, але
+перенесений на `5.3.0`: це окремий функціональний цикл із новою
+поверхнею атаки (download release-артефакта з GitHub, перевірка
+цілісності отриманого артефакта, staging, `robocopy /MIR` у runtime,
+partial-update semantics, rollback, recovery після перерваного update,
+trust/integrity guarantees) — кожен пункт вимагає власного acceptance,
+який не повинен блокувати вже готовий 5.2.0 scope (виправлення
+production-інцидентів циклу dev.1). У коді 5.2.0 щодо P3.2a — нуль змін;
+`BRAVO_UPDATE.ps1` і `modules/BRAVO.Update/` реалізуються окремим циклом.
+
+Проміжний етап P3.2 (закриває його кроки staging + validation +
+rollback у спрощеній формі), запланований на цикл 5.2.0. Автоматизує
+рівно те, що виконувалось вручну при оновленні парку до v5.1.0
+(production-сервер BRAVO, 2026-08-20), разом із виявленими там граблями.
+
+Форма: thin entrypoint `BRAVO_UPDATE.ps1` + домен-модуль
+`modules/BRAVO.Update/`. Запуск — ЛИШЕ явною командою оператора на
+сервері (elevated); жодного scheduled-тригера і жодного silent-режиму.
+
+Обов'язкові кроки одного прогону:
+
+1. TLS 1.2 примусово (legacy-сервери 2016 не мають його дефолтом);
+2. завантаження артефакта GitHub Release за явним тегом (`-Tag vX.Y.Z`,
+   без "latest" за замовчуванням) + звірка SHA-256 з `.zip.sha256`;
+3. staged-розпакування в тимчасовий каталог, НЕ в runtime;
+4. диф `BRAVO.config` поточного комплекту зі staged: змінені ЗНАЧЕННЯ
+   (не коментарі/нові дефолти) -> STOP з переліком, оновлення
+   продовжується тільки після явного підтвердження перенесення;
+5. preflight: жодне завдання `\BRAVO\` не Running;
+6. backup поточного комплекту копіюванням у `<runtime>.old_<ver>`
+   (Rename-Item каталогу runtime НЕМОЖЛИВИЙ — ACL-захист
+   BRAVO_TASKS_INSTALL забороняє його навіть адміністратору; спроба
+   rename+move кладе новий комплект УСЕРЕДИНУ старого і блокує нічні
+   завдання guard-ом з кодом 33);
+7. дзеркалення staged у runtime НА МІСЦІ (robocopy /MIR з виключенням
+   LOGS) — шлях, ACL і визначення завдань Планувальника не змінюються;
+8. гейти після заміни: VERSION.json = очікуваний тег; Runtime Guard
+   exit 0; `BRAVO_SETUP -Action Scheduler` (нові завдання версії);
+   `BRAVO_SETUP -Action Test` без FAIL;
+9. update journal: запис (стара/нова версія, тег, sha256, оператор,
+   результати гейтів) у machine state;
+10. автоматичний відкат із backup-копії при провалі будь-якого гейта
+    8 (дзеркалення назад тим самим механізмом), зі збереженням логів
+    невдалої спроби.
+
+Свідомо НЕ входить у P3.2a (лишається за повним P3.2/P4):
+versioned-каталоги з deployment pointer, atomic activation,
+auto-download за розкладом, будь-який silent-режим, підпис артефактів.
+Довіра до артефакта в P3.2a = TLS до GitHub + SHA-256 з того самого
+каналу — прийнятно для операції, яку ініціює і спостерігає оператор,
+недостатньо для автономної.
 
 ## P4 — optional hardening
 

@@ -312,6 +312,93 @@ function Assert-BravoLoadedConfiguration {
         Write-Warning 'bravoSettings.NotificationRouting має бути хеш-таблицею — застосовується дефолтна маршрутизація (SUCCESS=general, WARNING/ERROR/CRITICAL=alerts).'
     }
 
+    # Restore.BootRestoreMode (5.2.0) замінив Restore.RunMissedOnStartup:
+    # семантика boot-recovery змінилась (реставрація ПОЗА вікном з
+    # утриманням служб), тому стара назва навмисно не мапиться мовчки —
+    # оператор має свідомо обрати профіль сервера.
+    if ($global:maintenanceSettings -is [hashtable] -and
+        $global:maintenanceSettings.Restore -is [hashtable]) {
+        $restoreSettingsForValidation = $global:maintenanceSettings.Restore
+        if ($restoreSettingsForValidation.Contains('RunMissedOnStartup')) {
+            Write-Warning 'maintenanceSettings.Restore.RunMissedOnStartup застарів і ігнорується — задайте Restore.BootRestoreMode = "None" (24/7-сервер) або "HoldServices" (сервер робочого часу: реставрація при старті з утриманням служб).'
+        }
+        $bootRestoreModeValue = if ($restoreSettingsForValidation.Contains('BootRestoreMode')) {
+            [string]$restoreSettingsForValidation.BootRestoreMode
+        } else {
+            ''
+        }
+        if (-not [string]::IsNullOrWhiteSpace($bootRestoreModeValue) -and
+            $bootRestoreModeValue -notin @('None', 'HoldServices')) {
+            Write-Warning "maintenanceSettings.Restore.BootRestoreMode = '$bootRestoreModeValue' не розпізнано — застосовується безпечний профіль 'None' (24/7: без boot-recovery; пропущену реставрацію підхоплює планове Maintenance)."
+            $restoreSettingsForValidation.BootRestoreMode = 'None'
+        }
+        if (-not $restoreSettingsForValidation.Contains('BootRestoreMode')) {
+            # Старий site-config (5.0/5.1) взагалі без нового ключа:
+            # ефективна конфігурація МУСИТЬ гарантувати його наявність —
+            # консумери (BRAVO_TASKS_INSTALL, Maintenance) читають
+            # $maintenanceSettings.Restore.BootRestoreMode напряму й під
+            # StrictMode падали на відсутньому ключі ("property cannot be
+            # found"), всупереч обіцянці «застарілий ключ ігнорується»
+            # (реальний випадок: DEV-LIMS, site-config rc.4-ери). Дефолт —
+            # безпечний 24/7-профіль 'None'.
+            $restoreSettingsForValidation.BootRestoreMode = 'None'
+        }
+    }
+
+    # Trace-модель 5.2.0 (добові Trace_YYYYMMDD.mdz): три нові ключі.
+    # Старі site-config без них лишаються валідними — ефективна
+    # конфігурація МУСИТЬ гарантувати наявність ключів (консумери читають
+    # їх напряму і під StrictMode падали б на відсутньому ключі — той
+    # самий клас, що інцидент BootRestoreMode вище).
+    if ($global:maintenanceSettings -is [hashtable]) {
+        if (-not $global:maintenanceSettings.Contains('Trace') -or
+            -not ($global:maintenanceSettings.Trace -is [hashtable])) {
+            $global:maintenanceSettings.Trace = @{}
+        }
+        $traceSettingsForValidation = $global:maintenanceSettings.Trace
+        if (-not $traceSettingsForValidation.Contains('BISSourcePath')) {
+            # Порожньо = AUTO: Maintenance резолвить TraceBIS.out від кореня
+            # інсталяції bravo.exe (Resolve-BRAVOTraceBisSourcePath).
+            $traceSettingsForValidation.BISSourcePath = ''
+        }
+        $bisSourcePathValue = [string]$traceSettingsForValidation.BISSourcePath
+        if (-not [string]::IsNullOrWhiteSpace($bisSourcePathValue) -and
+            -not [string]::Equals($bisSourcePathValue.Trim(), 'off', [System.StringComparison]::OrdinalIgnoreCase) -and
+            -not [System.IO.Path]::IsPathRooted($bisSourcePathValue)) {
+            throw "maintenanceSettings.Trace.BISSourcePath = '$bisSourcePathValue' має бути абсолютним шляхом до TraceBIS.out, порожнім рядком (AUTO: корінь інсталяції bravo.exe) або 'off' (вимкнути обробку BIS)."
+        }
+
+        if ($global:maintenanceSettings.Retention -is [hashtable]) {
+            $retentionSettingsForValidation = $global:maintenanceSettings.Retention
+            if (-not $retentionSettingsForValidation.Contains('CompressedLogDeletionEnabled')) {
+                # Безпечний дефолт: стиснуті .mdz журналів НЕ видаляються
+                # автоматично, доки оператор явно не ввімкне політику.
+                $retentionSettingsForValidation.CompressedLogDeletionEnabled = $false
+            } elseif (-not ($retentionSettingsForValidation.CompressedLogDeletionEnabled -is [bool])) {
+                Write-Warning "maintenanceSettings.Retention.CompressedLogDeletionEnabled = '$($retentionSettingsForValidation.CompressedLogDeletionEnabled)' не є `$true/`$false — застосовується безпечне `$false (стиснуті .mdz не видаляються)."
+                $retentionSettingsForValidation.CompressedLogDeletionEnabled = $false
+            }
+        }
+    }
+
+    if ($global:sftpDirectories -is [hashtable]) {
+        if (-not $global:sftpDirectories.Contains('Trace') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.Trace)) {
+            $global:sftpDirectories.Trace = 'trace'
+        }
+        # Модель logs/: нові каталоги журнальних архівів. Legacy-конфіги без
+        # цих ключів отримують канонічні дефолти (compat), Trace лишається
+        # джерелом одноразової автоміграції.
+        if (-not $global:sftpDirectories.Contains('TraceLogs') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.TraceLogs)) {
+            $global:sftpDirectories.TraceLogs = 'logs/trace'
+        }
+        if (-not $global:sftpDirectories.Contains('ExchangeApiLogs') -or
+            [string]::IsNullOrWhiteSpace([string]$global:sftpDirectories.ExchangeApiLogs)) {
+            $global:sftpDirectories.ExchangeApiLogs = 'logs/exchangapi'
+        }
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }
@@ -384,7 +471,36 @@ function Import-BravoConfiguration {
         & $legacyConfigScript -ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot
     }
     catch {
-        throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message)"
+        # Реальний DEV-майданчик (2026-08-24, Windows NT 6.2.9200 / PowerShell
+        # 3.0 — Get-BRAVOOSSupportTier класифікує PowerShell <4.0 як
+        # "Unsupported" незалежно від ОС): помилка виконання BRAVO.config тут
+        # спливала як гола .NET NullReferenceException ("Ссылка на объект не
+        # указывает на экземпляр объекта") без жодного натяку на причину.
+        # Get-BRAVOOSSupportTier (BRAVO.Compatibility) — уже канонічне,
+        # протестоване джерело цієї класифікації (використовують Maintenance/
+        # Health/Archive), але викликається лише ПІСЛЯ успішного завантаження
+        # конфігурації — на ~6000 рядків пізніше в Maintenance — тому жодного
+        # шансу спрацювати раніше за цей крах немає. Збагачуємо повідомлення
+        # тим самим канонічним висновком тут, а не дублюємо порогове значення
+        # версії окремим magic-number: якщо саме збагачення з якоїсь причини
+        # не вдається (напр. модуль Compatibility теж не вантажиться на цій
+        # системі), мовчазний fallback — оригінальна помилка не повинна
+        # загубитися за новою, ще заплутанішою.
+        $unsupportedEnvironmentHint = ""
+        try {
+            $compatibilityModulePath = Join-Path $resolvedRuntimeRoot 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1'
+            if (Test-Path -LiteralPath $compatibilityModulePath -PathType Leaf) {
+                Import-Module -Name $compatibilityModulePath -ErrorAction Stop
+                $osSupportTier = Get-BRAVOOSSupportTier
+                if ($osSupportTier.Tier -ne 'Supported') {
+                    $unsupportedEnvironmentHint = " $($osSupportTier.Message)"
+                }
+            }
+        } catch {
+            # Див. коментар вище — діагностичне збагачення не повинне саме
+            # кидати нову помилку поверх оригінальної.
+        }
+        throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message).$unsupportedEnvironmentHint"
     }
 
     Assert-BravoLoadedConfiguration

@@ -4,6 +4,9 @@
 $script:BRAVOHelperLogActive = $false
 $script:BRAVOHelperLogPath = $null
 $script:BRAVOHelperLogQuietConsole = $false
+$script:BRAVOHelperLogSuspended = $false
+# $null — canary-перевірку ще не виконували; $true/$false — кешований результат.
+$script:BRAVOHelperLogSuspensionEffective = $null
 
 function Start-BRAVOHelperLog {
     param(
@@ -93,6 +96,136 @@ function Start-BRAVOHelperLog {
     }
 }
 
+function Suspend-BRAVOHelperLog {
+    # Тимчасово зупиняє transcript, щоб те, що зараз з'явиться на екрані, НЕ
+    # потрапило у файл журналу. Використовується для інтерактивного вводу
+    # облікових даних: оператор має бачити, що набирає, але значення не має
+    # осідати в лозі, який потім пересилають у підтримку.
+    #
+    # Повертає $true ЛИШЕ при фактичному успіху. Викликач зобов'язаний
+    # трактувати $false як заборону показувати щось чутливе: журнал усе ще
+    # пише. Функція ніколи не кидає — інакше помилка журналювання зривала б
+    # саму операцію.
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOHelperLogActive) {
+        # Журналу немає взагалі — писати нікуди, отже вивід уже «прихований».
+        return $true
+    }
+    if ($script:BRAVOHelperLogSuspended) {
+        return $true
+    }
+    try {
+        Stop-Transcript | Out-Null
+        $script:BRAVOHelperLogSuspended = $true
+        return $true
+    } catch {
+        $script:BRAVOHelperLogSuspended = $false
+        return $false
+    }
+}
+
+function Resume-BRAVOHelperLog {
+    # Парна до Suspend-BRAVOHelperLog; викликається ЛИШЕ з finally, інакше
+    # виняток під час вводу лишив би журнал вимкненим до кінця процесу.
+    [CmdletBinding()]
+    param()
+
+    if (-not $script:BRAVOHelperLogSuspended) {
+        return $true
+    }
+    $resumePath = [string]$script:BRAVOHelperLogPath
+    if ([string]::IsNullOrWhiteSpace($resumePath)) {
+        $script:BRAVOHelperLogSuspended = $false
+        return $false
+    }
+    try {
+        Start-Transcript -Path $resumePath -Append | Out-Null
+        $script:BRAVOHelperLogSuspended = $false
+        return $true
+    } catch {
+        $script:BRAVOHelperLogSuspended = $false
+        return $false
+    }
+}
+
+function Test-BRAVOHelperLogSuspensionEffective {
+    # Транскрипція перехоплює вивід по-різному в Windows PowerShell 5.1 і
+    # PowerShell 7, а поведінка хоста може залежати ще й від групової політики.
+    # Тому справність паузи НЕ приймається на віру: друкуємо унікальний маркер
+    # у вікні паузи й перевіряємо, що у файлі його немає.
+    #
+    # Знайдений маркер означає, що на цьому хості пауза не працює. Єдина
+    # коректна реакція викликача — fail-closed: не показувати значення взагалі.
+    [CmdletBinding()]
+    param()
+
+    if ($null -ne $script:BRAVOHelperLogSuspensionEffective) {
+        return [bool]$script:BRAVOHelperLogSuspensionEffective
+    }
+    if (-not $script:BRAVOHelperLogActive) {
+        # Немає активного transcript — немає й файлу, куди могло б протекти.
+        $script:BRAVOHelperLogSuspensionEffective = $true
+        return $true
+    }
+
+    $canaryPath = [string]$script:BRAVOHelperLogPath
+    $canary = 'BRAVO-LOG-SUSPENSION-CANARY-{0}' -f [guid]::NewGuid().ToString('N')
+    $effective = $false
+    try {
+        if (Suspend-BRAVOHelperLog) {
+            try {
+                # Маркер друкується тим самим каналом, що й реальні підказки
+                # вводу — інакше перевірка стосувалася б не того шляху.
+                Write-Host $canary
+                # Файл перевіряється ДО Resume, поки transcript має бути
+                # зупинений. Перевірка навмисно ПОЗИТИВНА: файл відкривається
+                # ексклюзивно (FileShare::None). Успішне відкриття доводить, що
+                # writer'а транскрипції вже немає — тільки тоді відсутність
+                # маркера щось означає.
+                #
+                # Просто прочитати вміст недостатньо: якщо Stop-Transcript
+                # мовчки не спрацював, маркер може ще лежати в буфері writer'а
+                # і у файл не потрапити. Тоді перевірка побачила б "маркера
+                # немає" і визнала б непрацездатну паузу робочою — тобто
+                # схибила б у небезпечний бік.
+                $effective = $false
+                try {
+                    $canaryStream = [IO.File]::Open(
+                        $canaryPath,
+                        [IO.FileMode]::Open,
+                        [IO.FileAccess]::Read,
+                        [IO.FileShare]::None
+                    )
+                    try {
+                        $canaryReader = New-Object IO.StreamReader($canaryStream)
+                        try {
+                            $effective = -not $canaryReader.ReadToEnd().Contains($canary)
+                        } finally {
+                            $canaryReader.Dispose()
+                        }
+                    } finally {
+                        $canaryStream.Dispose()
+                    }
+                } catch {
+                    # Файл ще комусь належить або не читається — довести
+                    # відсутність витоку неможливо, тому пауза вважається
+                    # непрацездатною (fail-closed).
+                    $effective = $false
+                }
+            } finally {
+                [void](Resume-BRAVOHelperLog)
+            }
+        }
+    } catch {
+        $effective = $false
+    }
+
+    $script:BRAVOHelperLogSuspensionEffective = $effective
+    return $effective
+}
+
 function Complete-BRAVOHelperLog {
     param(
         [Parameter(Mandatory = $true)]
@@ -126,6 +259,7 @@ function Complete-BRAVOHelperLog {
         }
         $script:BRAVOHelperLogActive = $false
         $script:BRAVOHelperLogQuietConsole = $false
+        $script:BRAVOHelperLogSuspended = $false
     }
 
     exit $ExitCode

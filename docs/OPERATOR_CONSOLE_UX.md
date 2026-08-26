@@ -85,7 +85,7 @@ Health використовує checklist-oriented UX. Основний рядо
 
 ```text
 ============================================================
- BRAVO Health 4.5.0
+ BRAVO Health <packageVersion>
  TEST-COMPANY [1234567890]
  WIN-44OBNQ3R3OB
  Режим: MANUAL
@@ -124,13 +124,19 @@ Health використовує checklist-oriented UX. Основний рядо
 
 Блок `Проблеми:` показується тільки коли є warning/error і є коротким операторським index проблем поточного run.
 
+Health-`WARNING` «Вільне місце» — це просто мало місця на диску за
+health-порогом. Він не тотожний archive-preflight `WARNING` у
+`BRAVO_ARCHIV` («нижче фіксованого порогу, але розрахункова потреба
+покрита» — див. `MANUAL_RUN_CONSOLE_UX.md`, еталон «перевірка вільного
+місця»): у другому випадку негайні дії не потрібні, backup продовжено.
+
 ## 4. BRAVO Restore Test
 
 Restore Test використовує component-oriented UX. Для кожного `.mdz` показуються фактичні результати verification/extraction.
 
 ```text
 ============================================================
- BRAVO Restore Test 4.5.0
+ BRAVO Restore Test <packageVersion>
  TEST-COMPANY [1234567890]
  WIN-44OBNQ3R3OB
  Режим: READ-ONLY / ISOLATED RESTORE
@@ -176,7 +182,7 @@ Maintenance має plan-first UX, бо сценарій може змінюва�
 
 ```text
 ============================================================
- BRAVO Maintenance 4.5.0
+ BRAVO Maintenance <packageVersion>
  TEST-COMPANY [1234567890]
  WIN-44OBNQ3R3OB
  Режим: MANUAL
@@ -225,7 +231,7 @@ Dry Run зберігає власну семантику `PASS`, `WARN`, `FAIL`,
 
 ```text
 ============================================================
- BRAVO Dry Run 4.5.0
+ BRAVO Dry Run <packageVersion>
  TEST-COMPANY [1234567890]
  WIN-44OBNQ3R3OB
  Режим: READ-ONLY
@@ -277,7 +283,7 @@ Setup має wizard/stage-oriented UX. Детальний discovery-блок д�
 
 ```text
 ============================================================
- BRAVO Setup 4.5.0
+ BRAVO Setup <packageVersion>
  TEST-COMPANY [1234567890]
  WIN-44OBNQ3R3OB
  Режим: FULL
@@ -316,7 +322,7 @@ Credentials UX ніколи не показує secret value. Показують
 
 ```text
 ============================================================
- BRAVO Credentials Setup 4.5.0
+ BRAVO Credentials Setup <packageVersion>
  WIN-44OBNQ3R3OB
  Режим: TEST
 ============================================================
@@ -357,7 +363,7 @@ Tasks Install показує окремо infrastructure stages і резуль�
 
 ```text
 ============================================================
- BRAVO Tasks Setup 4.5.0
+ BRAVO Tasks Setup <packageVersion>
  WIN-44OBNQ3R3OB
  Режим: INSTALL
 ============================================================

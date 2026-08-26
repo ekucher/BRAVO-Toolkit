@@ -1,5 +1,1118 @@
 # Changelog
 
+## Не випущено (developer)
+
+---
+
+## 5.2.0 — 2026-08-26
+
+Stable release of the 5.2.0 line, promoted (metadata-only) from the
+accepted 5.2.0-rc.13 candidate: rc stamp `0247ac3` (sourceCommit
+`12e6370`), artifact BRAVO-Toolkit-5.2.0-rc.13.zip sha256
+`6eac9695ed6053e7156ff843d8b4aed8522b4627d65c95bace1bc3de5a42af22`.
+
+Real-server acceptance rc.13: PASS 2026-08-26 (`LIMS`/ДНДІЛДВСЕ —
+повний maintenance-цикл з реставрацією, logs pipeline v2, компактні
+алерти, негативний сценарій forced+normal без повторної реставрації)
+плюс A2-encoding протокол (RELEASE_CHECKLIST §1.1) PASS в обох
+консольних контекстах (інтерактивно CP65001, SYSTEM CP866). Зведений
+evidence: `docs/BRAVO_520_RC13_ACCEPTANCE_EVIDENCE_20260826.md`
+(PR #100). Ланцюг кандидатів циклу: rc.8 (ACCEPTED, restore) →
+rc.9–rc.12 (замінені без окремого acceptance) → rc.13 (фінальний).
+
+Дерево stable додатково до rc.13 містить лише non-runtime зміни:
+acceptance-evidence документ (PR #100) і governance-hardening
+(PR #101, нижче) — runtime functional diff проти прийнятого rc.13
+порожній.
+
+- **GOVERNANCE (release process, P0): repository identity у гейті
+  промоції master + branch protection.** `ci\Test-BRAVOMasterMergePolicy.ps1`
+  тепер перевіряє не лише ім'я head-гілки (`developer`/`hotfix/*`), а й
+  repository identity джерела PR (екстрагована `Test-BRAVOMasterMergeSource`:
+  head-репозиторій мусить збігатися з base; fork з однойменною гілкою —
+  FAIL; невизначений head-репозиторій — fail-closed FAIL). Identity
+  береться з `GITHUB_EVENT_PATH` (`pull_request.head.repo.full_name`) /
+  `GITHUB_REPOSITORY`; нові параметри `-HeadRepository`/`-BaseRepository`
+  для локального запуску. Регресії в
+  `selftest\BRAVO_SELF_TEST.Governance.ps1`: 8 сценаріїв джерела
+  (same/fork/feature/unknown) + 2 додаткові версійні
+  (`5.2.1>5.2.0`, `5.3.0>5.2.9`). Фактичний GitHub-стан приведено до
+  політики: branch protection увімкнено для `developer` (PR-only, ті
+  самі required checks, що на `master`, заборона force push/видалення,
+  `enforce_admins`); документацію (`RELEASE_POLICY.md` §13,
+  `RELEASE_CHECKLIST.md`, `ROADMAP.md` P0.2) синхронізовано з фактичним
+  станом — застарілі твердження «branch protection потребує GitHub Pro»
+  прибрано (репозиторій публічний). Runtime-код не змінювався.
+
+---
+
+## 5.2.0-rc.13 — 2026-08-26 (candidate, ACCEPTED 2026-08-26 — released as 5.2.0)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.12`
+(нижче; на acceptance зафіксовано UX-зауваження до прогресу
+реставрації — закрито UX-фіксом нижче, PR #98). Acceptance rc.13
+покриває всю накопичену нову поверхню rc.9-rc.13.
+
+- **UX (operator console, maintenance): підетапи у прогресі тривалих
+  native-операцій + назва моделі без прив'язки до продукту.** Звіт
+  оператора з acceptance rc.12: 19-хвилинний крок «Реставрація моделі»
+  показував один суцільний підстатус «Виконується N сек.» без розбивки
+  на фази (архівація до ~7 хв → bravocmd ~5 хв → архівація після
+  ~7 хв). Polling-цикл `Invoke-CommandWithLog` тепер включає
+  `-Description` операції у running-рядок: «Реставрація моделі —
+  Архівація моделі перед реставрацією — Виконується 7 сек.» — це
+  автоматично охоплює всі native-виклики Maintenance. Опис
+  bravocmd-фази змінено з «Виконання реставрації моделі LIMS» на
+  «Виконання реставрації моделі (<ім'я проєкту>)»: проєкт моделі може
+  бути будь-яким (ім'я деривується з `bravo.ini MODEL=`), суфікс
+  продукту прибрано. Регресія
+  `RestoreSynthetic/InvokeCommandWithLogEmitsRunningDetail` оновлена
+  під формат «<Опис> — Виконується …».
+
+---
+
+## 5.2.0-rc.12 — 2026-08-26 (candidate, pending acceptance)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.11`
+(нижче; на acceptance 2026-08-26 виявлено дефект подвійної реставрації
+після `-ForceRestore` — виправлено FIX-ом нижче, PR #96). Acceptance
+rc.12 покриває всю накопичену нову поверхню rc.9-rc.12: повний
+maintenance-цикл (скан усіх `*.out`, exchangAPI-mdz, автостворення
+`logs/*`, WinSCP MoveFile-міграція `trace/`), компактні алерти,
+відсутність повторної реставрації після forced+normal в один вечір +
+A2-encoding протокол (RELEASE_CHECKLIST §1.1).
+
+- **FIX (maintenance, restore scheduling): подвійна реставрація після
+  `-ForceRestore` в один вечір.** Реальний інцидент (2026-08-26,
+  acceptance rc.11): успішна примусова реставрація, а наступний
+  ЗВИЧАЙНИЙ прогін того ж вечора запустив реставрацію вдруге. Причина:
+  успішний `-ForceRestore` свідомо не закриває плановий слот
+  маркером/Status (це за автоматичним шляхом) і записує квоту як
+  ПОКРИТИЙ НАСТУПНИЙ слот (+7 днів), а перевірка квоти порівнювала
+  покритий слот із поточним СТРОГОЮ РІВНІСТЮ — «пропущений» МИНУЛИЙ
+  слот (менший за покритий) лишався незадоволеним і тригерив
+  missed-гілку повторної реставрації у відкритому вікні.
+
+  Фікс: нова `Test-BRAVORestoreWeeklyQuotaConsumed` — квота спожита,
+  коли поточний слот **<=** покритого (закриває і пропущений минулий,
+  і сам покритий); наступний слот (+7 днів) строго більший — квота
+  знімається рівно вчасно, без межової помилки арифметики
+  «різниця < 7 діб». Семантика «-ForceRestore не обмежений квотою» і
+  «forced не закриває плановий слот» не змінені; даних інцидент не
+  зачепив (друга реставрація пройшла повний безпечний ланцюг —
+  лише зайвий downtime).
+
+  Регресія: `Maintenance/WeeklyQuotaConsumed[MissedPastSlotCovered
+  (incident)/CoveredSlotItself/NextWeekSlotNotCovered/
+  LegacyStateWithoutQuota]` — реальна функція через AST-екстракцію в
+  наявному quota-harness.
+
+---
+
+## 5.2.0-rc.11 — 2026-08-26 (candidate, pending acceptance)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.10`
+(нижче; acceptance не проводився — одразу замінено цим кандидатом) +
+компактні Maintenance-алерти з глобальним payload guard-ом (PR #94,
+нижче). Acceptance rc.11 покриває всю накопичену нову поверхню
+rc.9-rc.11: повний maintenance-цикл (скан усіх `*.out`, exchangAPI-mdz,
+автостворення `logs/*`, WinSCP MoveFile-міграція `trace/`), компактні
+алерти + A2-encoding протокол (RELEASE_CHECKLIST §1.1).
+
+- **UX (operator notifications): компактні Maintenance-алерти + глобальний
+  payload guard.** Реальний клас інциденту: сотні critical-файлів після
+  перевірки реставрації давали alert на 4×N рядків (341 файл ≈ 55 тис.
+  символів), який Discord дробив на серію повідомлень, а Slack (без
+  chunking взагалі) міг відхилити цілком — транспорт фактично працював
+  переглядачем журналу.
+  - Розділені представлення у трьох Maintenance-сайтах
+    (`Compare-FileSizes` critical-файли; пороги діапазонів ID; великі
+    `.md`): повна діагностика (4 рядки/файл, УСІ елементи) — як і раніше
+    лише у `BRAVO_MAINTENANCE_*.log`; операторський alert — загальна
+    кількість + до 5 прикладів (один файл = один короткий рядок; missing
+    і редукція розрізняються зі structured-полів: «файл відсутній (було
+    X)» / «X → Y (-Z%)») + «…і ще N» + вказівка на журнал. Семантика
+    виявлення/severity/rollback не змінена.
+  - Новий канонічний `Format-BRAVONotificationListSummary`
+    (`BRAVO.Notifications`): «Приклади: • … …і ще N файл(ів).»;
+    константа максимуму прикладів (5) — в одному місці; «…і ще 0»
+    структурно неможливе.
+  - Новий `Limit-BRAVONotificationPayload` + вбудова в
+    `ConvertTo-BRAVONotificationPayloadText`: транспорт-агностичний safe
+    limit 1800 символів (свідомо менший за фізичні ліміти
+    Discord-chunk 1900/Slack) — «одна подія → одне повідомлення» на обох
+    транспортах; обрізання по межі рядка, явний suffix «⚠️ Повідомлення
+    скорочено…», рядок журналу (`:memo:`/`📝`) зберігається після
+    suffix; факт truncation логуються Write-Warning з
+    Original/FinalLength (без секретів). Discord-split лишається
+    defense-in-depth під guard-лімітом; business-logic Maintenance
+    транспортних лімітів не знає.
+
+  Регресії (pre-fix RED продемонстровано: старий alert 341 файла =
+  55 308 символів): `Maintenance/CompactAlert341FilesOneNotificationFullLog`
+  (рівно 1 alert <1800, «…і ще 336 файлів.», повний список у лозі),
+  `CompactAlertThreeFilesShowsAllNoRemainder`,
+  `CompactAlertSixFilesShowsFivePlusRemainder`,
+  `CompactAlertDistinguishesMissingVsReduction`,
+  `CompactAlertHandlesUnicodeAndNestedPaths` (`#\`, кирилиця, пробіли);
+  `Notifications/ListSummaryCountsAndRemainder`,
+  `ListSummaryHandlesUnicodeAndPaths`,
+  `PayloadGuardTruncatesSlackToSingleMessage`,
+  `PayloadGuardYieldsSingleDiscordChunk`,
+  `PayloadGuardLeavesSmallMessagesUntouched`;
+  `DiscordChunkingStillWorks` збережено як defense-in-depth-юніт.
+
+---
+
+## 5.2.0-rc.10 — 2026-08-25 (candidate, pending acceptance)
+
+Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.9`
+(нижче; acceptance rc.9 не проводився — одразу замінено цим кандидатом)
++ ci-hardening промоції (PR #92) + актуалізація release-документації
+(PR #91). Acceptance rc.10 покриває всю нову поверхню rc.9/rc.10:
+повний maintenance-цикл (скан усіх `*.out`, exchangAPI-mdz,
+автостворення `logs/*`, WinSCP MoveFile-міграція `trace/`) +
+A2-encoding протокол (RELEASE_CHECKLIST §1.1).
+
+- **CI (release governance, підготовка до 5.2.0 stable): семантичний
+  гейт версії промоції + виключення artifacts\ з генератора маніфесту.**
+  - `ci/Test-BRAVOMasterMergePolicy.ps1`: нова
+    `Test-BRAVOStableVersionPromotion` — PR у `master` приймається лише
+    зі STABLE-версією `X.Y.Z` (prerelease-суфікс = порушення) і лише
+    коли вона семантично БІЛЬША за поточну master-версію
+    (`[version]`-порівняння; стара перевірка «нерівність рядків»
+    пропускала downgrade і prerelease — ROADMAP P0.2). Нечитабельний
+    master-VERSION.json — fail-closed.
+  - `ci/Update-BRAVORuntimeManifest.ps1`: каталог `artifacts\` додано у
+    виключення enumeration. Збірник артефакту навмисно лишає
+    `artifacts\release\staging` (повну копію комплекту для self-test), і
+    `-Apply` після локальної збірки вносив у маніфест ~85 дублікатів
+    staging-файлів, яких немає на сервері → RUNTIME_GUARD exit 33
+    (двічі спіймано в циклі 5.2.0-rc — раніше рятувало лише ручне
+    видалення staging перед перерахунком).
+
+  Регресії: `ReleasePolicy/StableVersionPromotion[7 сценаріїв]`
+  (справжня функція з ci-скрипта через AST-екстракцію: genuine increase,
+  семантичне-не-лексичне 5.10>5.9, prerelease/same/downgrade/
+  unparsable-master — відхилені) і
+  `ReleasePolicy/RuntimeManifestGeneratorExcludesArtifacts`.
+
+---
+
+## 5.2.0-rc.9 — 2026-08-25 (candidate, pending acceptance)
+
+Кандидат = прийнятий `5.2.0-rc.8` (нижче; acceptance реставрації пройдено
+на сервері інциденту) + logs pipeline v2 (PR #89) + живий підстатус
+консолі Maintenance (PR #88). Обидві зміни потребують real-server
+acceptance: нові SFTP-каталоги `logs/*`, WinSCP MoveFile-міграція,
+повний maintenance-цикл із реальними `*.out`-варіантами.
+
+- **FEATURE (operations, logs pipeline v2): усі `*.out` за прохід,
+  exchangAPI-архіви на SFTP, нова структура `logs/`.** Запит власника за
+  лістингом реального сервера: у корені інсталяції накопичуються
+  `!TraceSRV.out` (214MB), `traceBIS1.out`, `TraceSRV2.out` тощо, які
+  модель «два налаштовані файли» ніколи не підбирала; exchangAPI-логи
+  перейменовувались у `exchangAPI_N.log` і не потрапляли на SFTP.
+
+  **Свідомі зміни поведінки (рішення власника):**
+  - Ротація trace тепер захоплює **кожен `*.out` з кореня інсталяції
+    bravo.exe** (нова `Get-BRAVOInstallationTraceOutSources`: Discovery
+    `BRAVO_ROOT`, фолбек LIMSRoot; SRV з `bravo.ini` і явний
+    `Trace.BISSourcePath` — додаткові джерела, якщо поза коренем; дедуп
+    шляхів OrdinalIgnoreCase; порожній/`'off'` BISSourcePath = нічого
+    додаткового). Backlog добового архіву узагальнено до довільних
+    basename (`^(.+)_(\d{8})_(\d{6})\.out$`); legacy-імена як і раніше
+    не чіпаються.
+  - **exchangAPI: оригінальні імена без перейменувань** (нова
+    `NamingPolicy 'Original'` у спільному рушії ротації; колізія імені в
+    призначенні = ПОМИЛКА fail-closed, джерело лишається). Плоске
+    призначення `LOGS\exchangAPI` без каталогів-дат; добовий
+    `exchangAPI_YYYYMMDD.mdz` тим САМИМ движком, що Trace
+    (`Invoke-BRAVOTraceArchiveMaintenance` параметризовано:
+    ComponentLabel/ArchiveNamePrefix/GroupBy=ByLastWriteTime/FileFilter),
+    з тим самим ланцюгом 7z t → SHA512 → SFTP → видалення джерел лише
+    після повної верифікації.
+  - **SFTP-структура:** нові каталоги `sftpDirectories.TraceLogs`
+    (`logs/trace`) і `sftpDirectories.ExchangeApiLogs`
+    (`logs/exchangapi`); compat — legacy-конфіги без ключів отримують
+    дефолти в лоадері. Наявні архіви зі старого `trace/` **одноразово
+    (idempotent) мігруються** remote-move'ом з верифікацією
+    (`Invoke-BRAVOTraceRemoteLogMigration`): без видалень, конфлікт
+    імені = ERROR без перезапису, помилки видимі й не блокують нові
+    передачі.
+
+  Регресії: `LogRotation/09c-09e` (скан кореня, фолбек/дедуп/колізія
+  basename, Original-політика), оновлені `11/12/20` під новий
+  exchangAPI-контракт (колізія fail-closed),
+  `TraceArchive/BacklogAcceptsArbitraryRotatedBasenames`,
+  `BacklogGroupsExchangeLogsByLastWriteDate`,
+  `ExchangeApiDailyArchivePipelineEndToEnd` (справжній 7za + fake SFTP),
+  `RemoteMigration*` (успіх/конфлікт/no-op). Повний `BRAVO_SELF_TEST.ps1`
+  PASSED. Потрібен real-server acceptance (нові SFTP-каталоги, WinSCP
+  MoveFile-міграція, повний maintenance-цикл).
+
+- **UX (operator console, maintenance): живий підстатус тривалих
+  native-операцій.** Звіт оператора: під час реставрації моделі
+  прогрес-смуга `BRAVO_MAINTENANCE` стояла без жодного підстатусу —
+  `Invoke-CommandWithLog` блокувався в суцільному `WaitForExit(timeout)`
+  на весь час роботи bravocmd/7-Zip. Тепер очікування — polling кожні
+  500 мс з оновленням прогресу канонічним running-рядком `BRAVO.Console`
+  (`<Фаза> — Виконується N сек.`, `Format-BRAVORunningDetail` — той
+  самий, що в Archive), після завершення detail скидається. Охоплює всі
+  native-виклики Maintenance через `Invoke-CommandWithLog`: реставрацію
+  bravocmd і 7-Zip архівації до/після. Сумарний таймаут і kill-семантика
+  не змінені. Регресія:
+  `RestoreSynthetic/InvokeCommandWithLogEmitsRunningDetail` (червоний до
+  зміни: `ticks=0`; зелений після).
+
+---
+
+## 5.2.0-rc.8 — 2026-08-25 (candidate, acceptance passed)
+
+**UPD (2026-08-25 22:03-22:24): real-server acceptance реставрації
+ПРОЙДЕНО на сервері інциденту** (`LIMS`/ДНДІЛДВСЕ, `BRAVO_MAINTENANCE
+-ForceRestore`): `[5/8] Реставрація моделі OK 19:22 — bravocmd exit=0 |
+RemovedByRepair=0 | Critical=0 | Rollback=NONE | MainModel=OK`; фінал
+УСПІШНО/exit 0, служби відновлено автоматично, Trace-pipeline (добовий
+архів + SFTP) теж пройшов. Днем раніше той самий сервер на rc.7-коді
+давав 364 хибні «критичні зміни» і rollback=FAILED (exit 43).
+
+Кандидат = зміст прийнятого `v5.2.0-rc.7` (`5.2.0-rc.5` + розрахункова
+перевірка вільного місця з floor-override; повний end-to-end acceptance
+2026-08-25 на `WIN-42Q5558LQC9`) + `fix(maintenance)` нижче (PR #86).
+Перший формальний build із гілки `developer` після злиття PR #83/#84:
+rc.6/rc.7 збирались з інтеграційної гілки `rc6-merge`, функціональний
+runtime-diff `developer` проти `v5.2.0-rc.7` до PR #86 був порожній.
+FEATURE-запис про розрахункову перевірку місця (нижче) вже пройшов
+acceptance у складі rc.7; новий у цьому кандидаті — лише FIX.
+
+- **FIX (data-integrity, restore/maintenance): хибний тотальний провал
+  перевірки цілісності моделі після repair через регістр шляху MODEL.**
+  Реальний інцидент (ДНДІЛДВСЕ, 2026-08-25, exit 43): `bravocmd r`
+  завершується успішно, але `Compare-FileSizes` оголошував УСІ файли
+  before-CSV відсутніми (364 CRITICAL + 182 RemovedByRepair) і після
+  успішного відкату повторна перевірка знову провалювалась —
+  `rollback=FAILED`, служби не піднімались, хоча дані на диску цілі.
+  Причина: `bravo.ini MODEL=` на сервері містить шлях з іншим регістром
+  (мала літера диска, `d:\LIMS\Model`), before-CSV пишеться через .NET
+  `EnumerateFiles` (зберігає регістр переданого кореня), а поточний вміст
+  читається через `Get-BRAVOFiles`/`Get-ChildItem` (провайдер нормалізує
+  `D:\...`); ordinal `String.Replace` не зрізав корінь — ключі порівняння
+  ставали абсолютними шляхами і не збігались із відносними записами CSV.
+
+  Виправлення: нова канонічна `Get-BRAVOModelRelativePath`
+  (`modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1`) —
+  регістронезалежний (OrdinalIgnoreCase, культуро-незалежний) зріз кореня;
+  мігровано всі 5 місць патерну `FullName.Replace($MODEL_PATH...)` (lookup
+  у `Compare-FileSizes` — сам баг; writer before-CSV, деривація hint
+  головної моделі, два місця `Check-MdFileSizes` — hardening того самого
+  патерну). Fail-closed поведінка не послаблена: шлях поза коренем
+  повертається як є і, як і раніше, не зіставляється. Додатковий
+  діагностичний tripwire: якщо жоден запис before-CSV не зіставився, а
+  каталог MODEL не порожній — явний ERROR про ймовірний розсинхрон
+  деривації шляхів (корінь/регістр), а не «втрату даних»; блокування і
+  rollback лишаються незмінними.
+
+  Регресія: `Maintenance/CompareFileSizesRootCaseInsensitive`,
+  `Maintenance/CompareFileSizesRootCaseInsensitiveSegmentRemoved`
+  (той самий каталог, змінений лише регістр рядка ModelPath) — червоні до
+  фіксу, зелені після; `Maintenance/ModelRelativePath[...]` — юніт-контракт
+  helper'а (регістр, підкаталог, точний збіг, поза коренем, межа
+  компонента `Model` vs `ModelBackup`). Повний `BRAVO_SELF_TEST.ps1`
+  PASSED. Потрібен real-server acceptance реставрації саме на сервері
+  інциденту (Task Scheduler + bravocmd) — CI його не замінює.
+
+- **FEATURE (data-integrity, archive preflight): розрахункова перевірка
+  вільного місця понад фіксований поріг.** `Maintenance.Limits.
+  MinimumFreeSpaceGB` (типово 20) — загальний захист від переповнення
+  диска ОС на КОЖНОМУ локальному Fixed-диску, не оцінка того, скільки
+  місця реально потребує НАЙБЛИЖЧИЙ backup. Джерела MODEL/BLOG/BRAVOEXCH
+  ростуть з часом: сервер може мати вільного місця більше за фіксований
+  поріг, але менше, ніж потрібно для нового архіву — 7-Zip/VSS падає
+  посеред роботи, хоча стара preflight-перевірка проходила `OK`.
+
+  Новий `Get-BRAVOArchiveEstimatedSpaceRequirement`
+  (`modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`), викликається в
+  тому самому кроці "Перевірка вільного місця" одразу після фіксованого
+  порогу: для кожного увімкненого компонента бере розмір ОСТАННЬОГО
+  hash-підтвердженого валідного архіву (`Get-BRAVOValidArchiveSizeHistory`,
+  `BRAVO.ArchiveHelpers` — той самий канонічний reader, що вже
+  використовує `SizeSanity` для виявлення підозріло малих архівів) і
+  додає запас на зростання (`Maintenance.Limits.
+  EstimatedSpaceMarginPercent`, типово 25%). Компоненти на тому самому
+  фізичному диску сумуються в один розрахунок (інакше можна двічі
+  "витратити" те саме вільне місце). Компонент без валідної історії
+  (перший запуск, bootstrap) свідомо пропускається з оцінки — не блокує
+  прогін.
+
+  `EstimatedSpaceMarginPercent` — опційний ключ (compat: старі
+  `BRAVO.config` без нього отримують дефолт `25` у коді завантаження,
+  не лише в шаблоні файлу).
+
+  **UPD (2026-08-25, реальний acceptance):** оператор зафіксував
+  протилежний до початкового сценарій — сервер із `19.38 GB` вільних
+  проти фіксованого порогу `20 GB` блокував архівацію, хоча розрахункова
+  потреба для MODEL/BLOG/BRAVOEXCH становила лише `0.2 GB`. Новий
+  `Merge-BRAVOArchiveSpaceCheckResults` тепер знижує провал фіксованого
+  порогу до `WARNING` (не блокує), коли розрахункова оцінка для ТОГО
+  САМОГО диска реально порахована і показує достатність. Виправдання —
+  строго по-диску: інший диск без жодного оціненого компонента
+  (bootstrap чи взагалі не бере участі в backup) лишається під
+  фіксованим порогом без послаблень, а недостатність за самою
+  розрахунковою оцінкою й далі блокує незалежно від floor-статусу.
+
+  Новий self-test: `Archive/EstimatedSpaceUsesLastValidArchiveHistoryPlusMargin`,
+  `Archive/EstimatedSpaceFailsWhenBelowRequirement`,
+  `Archive/EstimatedSpaceSkipsComponentWithoutHistory`,
+  `Archive/EstimatedSpaceGroupsComponentsOnSameDrive`,
+  `Archive/MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive`,
+  `Archive/MergeSpaceResultsKeepsFloorBlockingWithoutEstimate`,
+  `Archive/MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient`,
+  `Archive/MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses`,
+  `Archive/MergeSpaceResultsAppliesOverridePerDriveIndependently`,
+  `Archive/EstimatedSpacePreflightWiredIntoFreeSpaceCheck`. Регресію
+  підтверджено вручну двічі (спершу запас/групування, потім сама
+  override-умова тимчасово прибиралися з коду — щоразу відповідні тести
+  почервоніли, решта лишились зеленими; відновлено).
+
+---
+
+## 5.2.0-rc.5 — 2026-08-25 (candidate, acceptance passed)
+
+Кандидат = `5.2.0-rc.4` (нижче) + три cherry-picked фікси з локальної гілки
+`developer`, перевірені на відсутність дублювання з уже прийнятими
+origin-змінами. Acceptance пройдено на двох реальних серверах:
+`SERV_HRDL_1` (ХЕРСОНСЬКА РДЛ, rc.4) і `WIN-44OBNQ3R3OB` (МИКОЛАЇВСЬКА
+РДЛ, rc.5) — повний `BRAVO_SELF_TEST.ps1` PASSED, `BRAVO_DRY_RUN.ps1
+-TestAccess` без жодного FAIL, `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly`
+успішний.
+
+- **UX/DIAGNOSTICS: діагностичне збагачення помилки завантаження
+  `BRAVO.config`.** На реальному DEV-майданчику (2026-08-24, Windows NT
+  6.2.9200 / PowerShell 3.0 — `Get-BRAVOOSSupportTier` класифікує
+  PowerShell <4.0 як `Unsupported` незалежно від ОС) виконання
+  `BRAVO.config` під час `Import-BravoConfiguration` завершувалось голою
+  `.NET NullReferenceException` ("Ссылка на объект не указывает на
+  экземпляр объекта") без жодного натяку на причину — блокувало
+  `BRAVO_SETUP.ps1`, `BRAVO_SELF_TEST.ps1` і `BRAVO_DRY_RUN.ps1`
+  однаково (усі entrypoint-и зрештою проходять через ту саму спільну
+  точку завантаження конфігурації). `Get-BRAVOOSSupportTier`
+  (`BRAVO.Compatibility`) — уже канонічне джерело цієї класифікації
+  (використовують `Maintenance`/`Health`/`Archive`), але викликається
+  лише ПІСЛЯ успішного завантаження конфігурації — тобто жодного шансу
+  спрацювати раніше за цей крах не було. `Import-BravoConfiguration`
+  тепер, лише в catch-блоці навколо виконання `BRAVO.config`, викликає
+  той самий канонічний `Get-BRAVOOSSupportTier` і за наявності
+  непідтримуваного середовища додає його `.Message` до кинутої помилки —
+  оригінальна причина ніколи не губиться, і збагачення саме не може
+  замаскувати первинну помилку новою (мовчазний fallback, якщо модуль
+  `BRAVO.Compatibility` теж недоступний). На `Supported`-середовищах
+  повідомлення не змінюється. Backport сумісності з PowerShell 3.0 НЕ
+  виконано (нижче задокументованого baseline 5.1) — рекомендація й далі
+  «оновіть Windows Management Framework».
+
+- **FIX (data-integrity discovery): службу BRAVO з DisplayName="BRAVO
+  Server" не визнавали канонічною.** Реальний DEV-майданчик
+  (2026-08-24): служба Windows `BRAVO` встановлена й запущена
+  (`Get-Service BRAVO` -> `Running`), але `Import-BravoConfiguration`
+  усе одно падав на "Не вдалося визначити BackupRoot: ... вимагає
+  визначеного EffectiveLIMSRoot". Причина — `DisplayName` реальної
+  служби виявився `"BRAVO Server"`, тоді як Discovery (навмисний
+  строгий захист від хибного співставлення із чужим сервісом: Name ТА
+  DisplayName одночасно) очікував рівно `"BRAVO Service"`. Обидва
+  написання — реальні варіанти інсталяторів BRAVO/LIMS, не помилка
+  цього конкретного сервера. `Resolve-BRAVOEffectiveLimsRoot` і
+  `Resolve-BRAVOInstallationDiscovery` тепер приймають `-BravoDisplayName`
+  як масив (дефолт `@("BRAVO Service", "BRAVO Server")`) — точний збіг
+  з БУДЬ-ЯКИМ значенням зі списку, а не одне жорстко задане значення.
+  Це НЕ послаблення identity-перевірки: збіг і далі точний
+  (case-insensitive `-eq`, не substring/regex/wildcard), просто список
+  канонічних варіантів написання розширено з одного до двох.
+  `maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config` —
+  тепер `@("BRAVO Service", "BRAVO Server")`; якщо на вашому сервері
+  DisplayName служби інший за обидва — додайте третім елементом
+  (перевірте `Get-Service BRAVO | Select DisplayName`), не замінюйте
+  список. Новий self-test:
+  `Discovery/BravoServerDisplayNameAcceptedAsCanonical` і
+  `Paths/01b-AutoLimsRootFromServiceBravoServerDisplayName`.
+
+- **FIX: `BRAVO_DRY_RUN.ps1` падав удруге, ховаючи первинну причину.**
+  Реальний DEV-майданчик (2026-08-24): після коректно спійманої "Не
+  вдалося завантажити BRAVO.config" (єдиний try/catch dry-run, вище)
+  `Write-DryRunOutput` мала намалювати звичайний `[FAIL] Dry-run/
+  Фатальна помилка` — але замість цього процес падав із `Переменная
+  "$global:ScriptVersion" не может быть получена, так как она не
+  установлена` (`VariableIsUndefined`), ховаючи вже сформований,
+  зрозумілий діагноз за новою незрозумілою помилкою.
+  `BRAVO_CONFIG_LOADER.ps1` (dot-sourced) вмикає `Set-StrictMode
+  -Version 2.0` у ТОМУ Ж scope (dot-source зливає scope викликача) —
+  якщо `Import-BravoConfiguration` провалюється ДО рядка, що створює
+  `$global:ScriptVersion`, змінна не існує взагалі (не `$null`), і
+  `if ($global:ScriptVersion)` під strict mode кидає
+  `VariableIsUndefined` навіть у такому "безпечному" контексті. Сусідній
+  рядок для `$bravoSettings` уже коректно захищений через `Get-Variable
+  -ErrorAction SilentlyContinue` — `$global:ScriptVersion` використовував
+  інший, вразливий патерн. Виправлено тим самим захищеним патерном.
+  Новий self-test `ConfigLoader/DryRunFailsClosedOnConfigLoadFailure` +
+  `ConfigLoader/DryRunDoesNotCrashOnUnsetScriptVersion` — реальний
+  дочірній процес `BRAVO_DRY_RUN.ps1` із синтетично провальним
+  `BRAVO.config`.
+
+- FIX (ci): `ci\Test-BRAVOForbiddenPattern.ps1` не мав у allowlist
+  `BRAVO_SELF_TEST.ConfigLoader.ps1` для навмисного ізольованого
+  дочірнього `powershell.exe -ExecutionPolicy Bypass` (той самий патерн,
+  що вже allowlisted для `Governance.ps1`/`ManualLaunchers.ps1`) —
+  виявлено CI на PR #83, не при первинному локальному коміті фіксу.
+
+## 5.2.0-rc.4 — 2026-08-24 (candidate, acceptance passed)
+
+- FIX (реліз-автоматизація): `release-artifact` workflow створював чернетку
+  релізу для dev/RC **без прапорця `--prerelease`**
+  (`.github/workflows/release-artifact.yml`, крок «Прикріплення до GitHub
+  Release»). Через це кандидат публікувався як звичайний реліз і ставав
+  «Latest release» — тобто оператор, який заходить по останню версію, бачив
+  би неприйнятий RC замість stable. Це прямо суперечить `RELEASE_POLICY.md`
+  розділ 16 (dev/RC → `Pre-release: true`, `Latest release: false`).
+  Виявлено на чернетці `v5.2.0-rc.1`, яка досі висить із `prerelease: false`.
+
+  Тег тепер класифікується за суфіксом (`-dev.` / `-rc.`), і для таких
+  релізів додається `--prerelease`. Прапорець виставляється і наявному
+  релізу через `gh release edit`, бо чернетка могла бути створена ще до
+  цього фіксу або вручну. `--latest=false` свідомо НЕ використовується:
+  GitHub і так виключає pre-release із Latest, а цей прапорець підтримують
+  не всі версії `gh` — зайва несумісність зламала б workflow сильніше, ніж
+  початковий дефект.
+
+  Ремонт наявного релізу виконується ПЕРЕД вивантаженням асетів, а саме
+  вивантаження отримало `--clobber`. Інакше шлях ремонту не працював би саме
+  там, де потрібен: реліз, створений попереднім прогоном, уже несе ті самі
+  три асети, тому `gh release upload` падає і крок завершується ще до
+  `gh release edit`. Заміна асетів безпечна — до цього кроку доходить лише
+  артефакт, що пройшов обидва integrity-маніфести, `BRAVO_RUNTIME_GUARD` і
+  повний self-test.
+
+  Self-тест `Release/ArtifactWorkflowMarksPrerelease` — перший у репозиторії
+  тест на вміст workflow; він фіксує і прапорець, і порядок кроків.
+  Перевірено регресійно: на коді до фіксу падає.
+
+- **TESTING: `ManualLaunchers/*` self-test падав на кириличних Windows-
+  установках.** Реальний DEV-майданчик (2026-08-24, обліковий запис
+  "Администратор") показав `[FAIL] Manual launcher не підтримує не-ASCII
+  шлях: ...\AppData\Local\Temp\...` — фікстура будувала свій тимчасовий
+  корінь через `[IO.Path]::GetTempPath()` (`%TEMP%`), який на
+  локалізованих Windows-установках наслідує кириличне імʼя профілю
+  користувача. `New-BRAVOManualLauncherContent` (`BRAVO_SETUP.ps1`)
+  навмисно й коректно відхиляє не-ASCII шляхи (відомі проблеми
+  кодування `cmd.exe` для `.cmd`-launcher-ів) — сама production-логіка
+  тут без дефекту, проблема лише в тому, що self-test-фікстура
+  успадковувала не-ASCII базовий шлях НЕ навмисно, ламаючи навіть
+  сценарії, які не мають нічого спільного з ASCII-перевіркою. Виправлено:
+  фікстура тепер визначає, чи `%TEMP%` не-ASCII, і в такому разі
+  використовує `%SystemRoot%\Temp` (не залежить від локалізованого
+  імені користувача) — той самий явний, навмисний non-ASCII-сценарій
+  (`ManualLaunchers/NonAsciiEmbeddedPathFailsClosed`) і далі перевіряє
+  реальне відхилення, лише тепер від контрольованого ASCII-базису.
+  Впливає лише на self-test; жодної зміни production-коду чи політики
+  ASCII-перевірки launcher-ів.
+
+---
+
+## 5.2.0-rc.3 — 2026-08-24 (candidate, pending acceptance)
+
+Кандидат зі стабілізаційними виправленнями за логами реального сервера
+(`SERV_HRDL_1`, 2026-08-24) і двома змінами поведінки на запит власника.
+Нових функцій немає — усе нижче або виправляє дефект, або змінює рівень/
+видимість уже наявної поведінки (розділ 3.2 `RELEASE_POLICY.md`).
+
+Нумерація: `5.2.0-rc.2` (build `84627f1`, 2026-08-23) існував лише як
+локальна збірка на DEV-сервері і НЕ публікувався в `origin` — тега й
+GitHub Release для нього немає. Щоб номер версії на сервері не збігався з
+іншим за змістом кодом, наступний кандидат — `rc.3`.
+
+Ключове для оператора: до цього кандидата на серверах, де джерела
+generation лежать на різних томах, щоденні резервні копії **не
+створювались узагалі** — див. перший запис нижче.
+
+- ЗМІНА ПОВЕДІНКИ (UX інсталяції): під час `BRAVO_SETUP`/
+  `BRAVO_CREDENTIALS_SETUP` оператор тепер бачить те, що набирає — усі поля,
+  включно з паролями (7-Zip, SFTP, SMB) і Slack/Discord webhook-URL. Раніше
+  все, крім назви/коду установи й префікса архівів, вводилось під зірочками
+  (`Read-Host -AsSecureString`), тому помилку в значенні (зайвий пробіл, не та
+  розкладка) не було видно, і вона спливала пізніше як відмова автентифікації
+  SFTP або `[FAIL]` у dry-run — далеко від місця, де її припустилися.
+
+  **Значення при цьому не потрапляють у власні логи BRAVO.** Helper-логи —
+  дослівний `Start-Transcript`, тому ввід виконується у вікні з паузою
+  transcript, і пауза знімається у `finally`. Нові функції
+  `Suspend-BRAVOHelperLog` / `Resume-BRAVOHelperLog` /
+  `Test-BRAVOHelperLogSuspensionEffective` (`modules/BRAVO.HelperLogging`).
+
+  Механізм **fail-closed** і не покладається на припущення про версію
+  PowerShell: перед першим запитом canary-перевірка друкує унікальний маркер
+  у вікні паузи й перечитує файл логу. Якщо маркер знайдено (пауза на цьому
+  хості не працює) або якщо батьківський `BRAVO_SETUP` не підтвердив, що
+  зупинив свій transcript (`BRAVO_PARENT_LOG_SUSPENDED=1`) — ввід лишається
+  прихованим рівно як раніше, і оператор бачить пояснення в консолі.
+  Батьківська пауза обов'язкова окремо: лог `BRAVO_SETUP` захоплює стрім
+  дочірнього процесу.
+
+  Валідація значення тепер застосовується лише там, де для нього є предметне
+  правило (назва/код установи, префікс) — для паролів і webhook-ів такого
+  правила немає, тож лишається спільна перевірка на непорожність. Збережені
+  значення НЕ перевалідовуються, тому оновлення не ламає наявні інсталяції.
+
+  Чого це не закриває (детально — `SECURITY.md`, розділ 3): групову політику
+  «PowerShell Transcription» (окремий системний лог поза контролем BRAVO),
+  scrollback консолі та запис екрана, і втрату фрагмента логу, якщо процес
+  аварійно завершиться під час паузи.
+
+- FIX (архівація, критично): багатотомний VSS Snapshot Set більше не
+  падає на успішно створеному наборі. На серверах, де джерела generation
+  лежать на різних томах (типово `MODEL`/`BLOG` на `D:`, `BRAVOEXCH` на
+  `C:`), `New-BRAVOVSSDiskshadowSnapshotSet`
+  (`modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1`) завершувався
+  помилкою `VSS SNAPSHOT SET FAILED: diskshadow.exe повернув код 4`, після
+  чого архівація MODEL/BLOG/BRAVOEXCH скасовувалась (`опубліковано 0 з 3`),
+  generation manifest не створювався, а наступний health-check доповідав
+  `не знайдено жодного COMPLETE generation manifest` і три `SFTP ...:
+  component відсутній у verified COMPLETE local generation`. Тобто щоденні
+  резервні копії на таких серверах не створювались узагалі. Три причини,
+  усі виправлені:
+  1. **Подвійний запуск `diskshadow.exe`.** Після
+     `Start-BRAVOProcessOutputCapture` (який САМ запускає процес) стояв ще
+     й `[void]$process.Start()`. Instance-метод `Process.Start()` спершу
+     робить `Close()` поточного процесу і запускає новий, тому набір
+     створював перший `diskshadow.exe`, а `WaitForExit`/`ExitCode` бралися
+     вже від другого — звідси код `4` при повністю успішному виводі в тому
+     ж повідомленні про помилку. Зайвий `Start()` прибрано; це єдиний
+     виклик у комплекті, який його мав.
+  2. **Сценарій без `EXIT`.** `diskshadow.exe` доходив до кінця файлу
+     сценарію як до несподіваного завершення інтерактивної сесії і
+     повертав ненульовий код навіть при успішному `CREATE`. Додано
+     фінальний `EXIT`.
+  3. **Розбір виводу залежав від мови ОС.** Ідентифікатор набору шукався
+     регулярним виразом по англійському тексту `Shadow copy set ID:`,
+     якого немає ні в локалізованому виводі (`Windows Server 2022` з
+     російським/українським мовним пакетом), ні, власне, в англійському
+     (`diskshadow.exe` друкує `Shadow copy set:` і `%VSS_SHADOW_SET%`).
+     Тепер `Get-BRAVOVSSDiskshadowSetIdFromOutput` бере GUID із рядка з
+     ASCII-alias-ом `VSS_SHADOW_SET` (alias-и не перекладаються), а
+     `Get-BRAVOVSSDiskshadowSetIdFromWmi` слугує резервом: єдиний `SetID`
+     серед shadow copies на потрібних томах, яких не було до запуску.
+
+- FIX (архівація, ресурси): невдалий багатотомний VSS-набір більше не
+  лишає на сервері persistent shadow copies. Контекст
+  `SET CONTEXT PERSISTENT NOWRITERS` означає, що знімки не звільняються
+  самі, а старий cleanup спрацьовував лише коли `SetID` вдалося розібрати
+  з виводу — тобто саме в тому сценарії, який падав, не спрацьовував
+  ніколи. Кожен невдалий запуск (щодня, за розкладом) лишав по знімку на
+  кожен том, які назавжди тримали місце в тіньовому сховищі. Новий
+  `Remove-BRAVOVSSDiskshadowOrphanedShadow` прибирає знімки, яких не було
+  до запуску і які лежать на наших томах, незалежно від того, чи вдалося
+  визначити `SetID`; чужі знімки (створені іншим ПЗ або наявні до старту)
+  свідомо не чіпаються.
+  **Дія оператора:** знімки, залишені попередніми версіями, треба
+  прибрати вручну одноразово — `vssadmin list shadows` і
+  `vssadmin delete shadows /shadow={ID}` для тих, що належать BRAVO.
+
+- FIX (діагностика): вивід `diskshadow.exe` читається в OEM-кодуванні
+  консолі (`StandardOutputEncoding`/`StandardErrorEncoding`). Раніше
+  повідомлення про помилку потрапляло в лог нечитабельними символами саме
+  тоді, коли діагностика найпотрібніша. На коректність розбору це не
+  впливає — він спирається лише на ASCII-alias і GUID-и.
+
+- ЗМІНА ПОВЕДІНКИ (exit code): нагадування про застарілі оновлення Windows
+  і PowerShell більше не знижують результат успішного прогону. Ці записи
+  лишаються видимими як `[WARNING]`, але позначені новим прапорцем
+  `-Environmental` (`Write-BRAVOLog`, `Write-HealthLog`, `Write-Log`) і не
+  інкрементують лічильник попереджень. Раніше сервер із невстановленими
+  оновленнями (у реальному інциденті — 1109 днів) НАЗАВЖДИ отримував
+  `exit 10` (`SuccessWithWarnings`) і статус `ЧАСТКОВО` на кожному
+  успішному Health/Archive/Maintenance — стан середовища підмінював собою
+  результат операції. Це та сама причина, з якої legacy-tier ОС уже
+  логується як INFO в Archive/Maintenance; тут обрано `-Environmental`,
+  щоб зберегти видимість нагадування як попередження. `-Environmental`
+  свідомо НЕ впливає на помилки: прапорець знімає лише вагу попередження,
+  а не приховує відмову. Рівень WARNING для legacy-tier у `BRAVO_HEALTH`
+  не змінено — це окреме, раніше прийняте рішення
+  (`Runtime/LegacyOSTierIsInformationalInOperationalRuns`).
+  Якщо ваш моніторинг очікував код `10` як сигнал про непропатчену ОС —
+  оновіть цю логіку: рівень оновлень більше НЕ впливає на код завершення.
+
+- ЗМІНА ПОВЕДІНКИ (dry-run більше не суто read-only): відсутній SFTP-каталог
+  призначення тепер створюється, а не блокує інсталяцію.
+  `Test-SftpReadOnlyAccess` перейменовано на `Test-SftpDestinationAccess` і
+  отримало прапорець `-CreateMissingDirectories`; `BRAVO_DRY_RUN.ps1`
+  викликає його з цим прапорцем при `-TestAccess`. Підстава: `BRAVO_ARCHIV`
+  усе одно створює ці каталоги при першому запуску
+  (`Initialize-BRAVOSFTPRemoteDirectories`), тому старе повідомлення
+  «Dry Run не створює каталоги» описувало неіснуюче обмеження продукту й
+  давало глухий кут: `BRAVO_SETUP` зупинявся fail-closed на ненульовому коді
+  dry-run, а перший архівний запуск, який створив би каталог, через це ніколи
+  не настав (реальний випадок: `/baza_app`). Створення підтверджується
+  повторним `FileExists`, а не відсутністю винятку; невдале створення й далі
+  дає `[FAIL]`. Рядок результату `SFTP / Read-only доступ` перейменовано на
+  `SFTP / Доступ` — попередня назва вже не описувала поведінку.
+
+- FIX (dry-run, критично для інсталяції): перевірка webhook у
+  `BRAVO_DRY_RUN.ps1` більше не вимагає legacy-запису `BRAVO_DISCORD_URL` /
+  `BRAVO_SLACK_URL`. Runtime резолвить webhook через
+  `Resolve-BRAVONotificationEndpoint` (route-специфічний
+  `BRAVO_DISCORD_ALERTS_URL`/`BRAVO_DISCORD_GENERAL_URL` → legacy
+  provider-wide → жорсткий літерал), а dry-run перевіряв ЛИШЕ legacy-запис.
+  На сервері, налаштованому на route-специфічні webhook-и (саме так їх пише
+  `BRAVO_CREDENTIALS_SETUP.ps1`), сповіщення фактично працювали, але dry-run
+  звітував `запис 'BRAVO_DISCORD_URL' відсутній або порожній`, а
+  `BRAVO_SETUP.ps1` зупинявся fail-closed з `СТАТУС: ПОМИЛКА` —
+  інсталяція не завершувалась на цілком робочій конфігурації. Тепер dry-run
+  викликає той самий канонічний `Resolve-BRAVONotificationEndpoint` для обох
+  маршрутів (`alerts`, `general`) замість власної паралельної політики.
+  Backward compatibility збережено: інсталяція лише з legacy
+  `BRAVO_DISCORD_URL` і далі проходить, а повна відсутність webhook і далі
+  дає `[FAIL]`.
+
+- FIX (dry-run, діагностика): порожній Discord/Slack webhook у перевірці
+  доступності (`BRAVO_DRY_RUN.ps1`, гілка `-TestAccess`) більше не
+  показується оператору сирим текстом .NET-винятку
+  (`Недопустимый URI: URI пуст.`), а дає ту саму канонічну причину
+  `webhook відсутній у Credential Manager`, що й решта перевірок webhook.
+  Поведінка перевірки не змінюється — це лишається `[FAIL]`.
+
+- Self-тести: додано `BackupConsistency/VSSDiskshadowSetIdIsLocaleIndependent`
+  (локалізований та англійський вивід, WMI-резерв, cleanup без розібраного
+  `SetID`) і `BackupConsistency/VSSDiskshadowRunsExactlyOnce` (сценарій
+  завершується `EXIT`, процес запускається лише через
+  `Start-BRAVOProcessOutputCapture`, немає прив'язки до англомовного
+  тексту виводу). Багатотомна гілка `diskshadow` до цього не мала жодного
+  покриття — тому дефект і не ловився.
+
+---
+
+## 5.2.0-rc.1 — 2026-08-23 (candidate, pending acceptance)
+
+RC stabilization на основі `5.2.0-dev.1` (нижче). Без нових функцій —
+лише вузько-скоуповий compatibility-фікс (B2) і документальне
+приведення scope у відповідність (PR #78, PR #79):
+
+- B2: legacy BOM-у-паролі fallback для 7-Zip архівів (нижче).
+- Health-alert дедуп: типовий `RepeatAlertAfterHours` змінено `6` → `0`
+  (нижче).
+- P3.2a (`BRAVO_UPDATE.ps1`) перенесено на `5.3.0` — 0 змін коду в цьому
+  циклі.
+- M3 (великий рефакторинг: service-lifecycle/operation-lock/WinSCP-session
+  dedup, декомпозиція `BRAVO.DataRestore.Runtime.ps1`) відкладено на
+  наступний цикл — не входить у RC stabilization.
+- M1 (`WinSCP.uk` у `TOOLS_MANIFEST.json`) відкладено на `5.3.0` —
+  походження файла неможливо незалежно верифікувати з репозиторію.
+- B3: `SECURITY.md`/`README.md`/`BRAVO.config`/`OPERATIONS.md` синхронізовано
+  з фактичною поведінкою (Recovery task Disabled не Deleted, watchdog/
+  quiescence виняток, `BRAVO_BAZA_RECONCILE.ps1` в README, SFTP `trace/`
+  upgrade-примітка).
+
+Детальні рішення — `RELEASE_POLICY.md` §20.
+
+### Upgrade notes (5.1.0 → 5.2.0)
+
+Обов'язково прочитати перед оновленням production-серверів:
+
+- **Recovery scheduled task.** На 24/7-серверах (`Restore.BootRestoreMode
+  = "None"`, типово) інсталятор більше не видаляє раніше зареєстроване
+  Recovery-завдання — він його **вимикає** (`Enabled = $false`). Завдання
+  лишається видимим у Планувальнику зі статусом Disabled, а не зникає.
+  Якщо ваш моніторинг/аудит очікував повної відсутності завдання —
+  оновіть очікування на "Disabled", не "відсутнє".
+- **`.mdz` retention.** `Retention.CompressedLogDeletionEnabled` (default
+  `$false`) означає, що стиснуті `.mdz`-журнали, включно з legacy
+  `Trace_YYYY-MM-DD.mdz`, **більше не видаляються автоматично за віком**,
+  доки оператор явно не увімкне прапорець і `CompressedLogDays`. Це
+  свідомий вибір безпеки (архіви не зникають самі), але має прямий
+  наслідок — ризик росту використання локального диска на серверах із
+  давньою історією `.mdz`; перевірте вільне місце і за потреби увімкніть
+  retention явно.
+- **SFTP `trace/`.** Trace-архіви (`Trace_YYYYMMDD.mdz`) тепер
+  завантажуються в окремий SFTP-каталог `trace/`
+  (`$global:sftpDirectories.Trace`), якого не існувало раніше. Перед
+  оновленням переконайтесь, що каталог існує (або буде створений) на
+  SFTP/Storage Box, і що обліковий запис BRAVO має права запису й
+  достатню квоту під нього — так само, як для `baza_app`/`model`.
+- **Legacy OS (Windows Server 2012/2012 R2/2016, best-effort tier).**
+  `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE` більше не завершуються кодом `10`
+  (`SuccessWithWarnings`) і не маршрутизують успішний звіт у канал
+  ALERTS лише через legacy-tier ОС — повідомлення тепер INFO, exit code
+  `0`, звіт іде в GENERAL. Це змінює operator/monitoring контракт: якщо
+  ваш моніторинг фільтрував/очікував код `10` як сигнал про legacy-ОС,
+  оновіть цю логіку — рівень ОС більше НЕ впливає на код завершення
+  успішної операції. `BRAVO_HEALTH.ps1` і далі показує WARNING про
+  legacy-tier як окрему, постійну environmental-метрику (не змінилось).
+- **Health-alert дедуп (`RepeatAlertAfterHours`).** Типовий дефолт
+  змінено `6` → `0`: дедуп повторного ідентичного CRITICAL/WARNING
+  health-alert **вимкнено за замовчуванням** — сповіщення про проблему
+  тепер надходить щоцикл, поки проблема триває, навіть якщо вона
+  ідентична попередній. Раніше однакове повідомлення пригнічувалось на
+  6 годин (`Test-AlertSuppressed`/`Save-AlertState`,
+  `modules/BRAVO.Health/BRAVO.Health.Runtime.ps1`), через що повторний
+  той самий alert міг мовчати до 6 год., і оператор бачив лише перше
+  сповіщення інциденту. SUCCESS-звіт ("ВСЕ СПРАВНО") дедупу ніколи не
+  підлягав і цією зміною не зачіпається — він і раніше надсилався щоцикл.
+  Якщо ваш моніторинг покладався на природне придушення дублікатів
+  (наприклад, щоб не заспамити канал під час тривалого відомого
+  інциденту) — поверніть `RepeatAlertAfterHours` на потрібне значення
+  вручну в `BRAVO.config`.
+
+- FIX (сумісність, B2): додано legacy BOM-у-паролі fallback для
+  читання архівів, створених версіями BRAVO до 5.2.0. До 5.2.0 пароль
+  7-Zip писався в stdin через `Process.StandardInput.WriteLine`, який
+  під UTF-8-консоллю (`chcp 65001`) мовчки додавав BOM (U+FEFF) ПЕРЕД
+  паролем — такі архіви ефективно зашифровані паролем `U+FEFF<пароль>`.
+  Новий BOM-free запис (`Write-BRAVOProcessInputText`, впроваджено в
+  циклі dev.1) більше не відкриває їх нормальним паролем — без цього
+  фіксу читання/відновлення legacy-backup під UTF-8-хостом провалилось
+  би з "невірний пароль" на справді валідному архіві.
+  `Invoke-BRAVOSevenZipIntegrityTest`/`Invoke-BRAVOSevenZipExtraction`
+  (`modules/BRAVO.Compatibility`) тепер: (1) звичайна спроба з
+  нормальним паролем; (2) якщо невдача класифікована як password-failure
+  (новий `Test-BRAVOSevenZipPasswordFailure` — розпізнає stderr-патерни
+  7-Zip, емпірично перевірені на bundled `Tools\7za.exe`: "Wrong
+  password"/"Data Error in encrypted file" -> кандидат, "Cannot open
+  the file as archive"/"Unexpected end of archive"/"cannot find the
+  file specified"/"Access is denied" -> НЕ кандидат, жодного fallback)
+  — рівно ОДНА повторна спроба з `U+FEFF + пароль`; (3) успіх другої
+  спроби позначається `LegacyBomPasswordFallbackUsed=$true` і `Warning`
+  з рекомендацією створити новий backup поточною версією; (4) невдача
+  обох спроб повертає ПЕРШУ (нормальну) причину відмови — без
+  прихованої другої спроби. `Get-BRAVOSevenZipArchiveEntries` (listing)
+  свідомо НЕ отримав fallback: заголовки Trace-архівів завжди
+  нешифровані (без `-mhe`), тому listing не декриптує вміст і не
+  залежить від правильності пароля — гілка ніколи б не спрацювала.
+  Реалізація rename-безпечна щодо існуючих викликачів: обидві публічні
+  функції зберегли сигнатуру, старий однопрохідний код виділено в
+  приватні `*Core`-версії (без функціональних змін), обгорнуті новою
+  retry-логікою.
+
+- НОВА ОПЦІЯ (BAZA, опційна, вимкнена за замовчуванням): `backupMonitoring.
+  SFTP.BAZA.AutoArchiveMutationThreshold` (`BRAVO.config`, default `0`) для
+  розгортань із великою кількістю незалежних майданчиків клієнтів, де
+  ручний обхід кожного сервера при кожній легітимній append-only мутації
+  (типово — застосунок перегенерував кілька документів, як в інциденті
+  21.08.2026) не масштабується. При `N > 0`: якщо мутацій за один цикл на
+  компонент не більше `N`, синхронізація автоматично виконує ту саму
+  rename-preserve операцію, що ручний `BRAVO_BAZA_RECONCILE.ps1 -AcceptAll`
+  (стара remote-версія → `*.replaced_<дата>`, нічого не видаляється, стан
+  очищається, нову версію заливає наступний плановий цикл) — без
+  підтвердження оператора для кожного циклу. Новий `SyncResult.Status =
+  'MUTATION_AUTO_ARCHIVED'`; Health показує це як INFO (не CRITICAL/
+  ПОТРІБНА ДІЯ). Понад поріг `N` за цикл — поведінка НЕ змінюється:
+  жорсткий блок, `MUTATION_VIOLATION`, CRITICAL, ручний
+  `BRAVO_BAZA_RECONCILE.ps1`. Реалізація повторно використовує канонічну
+  rename/state-логіку `Invoke-BRAVOBazaMutationReconciliation` через нове
+  спільне лок-вільне ядро `Invoke-BRAVOBazaMutationAcceptanceCore`
+  (`modules/BRAVO.BazaSync/BRAVO.BazaSync.psm1`) — без другої паралельної
+  архівної політики. За замовчуванням (`0`, вимкнено) поведінка всіх
+  існуючих і нових інсталяцій ідентична попередній: `MutationPolicy="Fail"`
+  без auto-overwrite лишається default. Свідомо прийнятий залишковий
+  ризик (без сукупного добового/тижневого ліміту, лише per-cycle поріг)
+  задокументовано в `OPERATIONS.md`/`THREAT_MODEL.md`.
+
+- ЗМІНА ПОВЕДІНКИ (планувальник реставрації): АВТОМАТИЧНА реставрація
+  виконується не частіше ніж раз на тиждень, і успішна ПРИМУСОВА
+  (`-ForceRestore`) зараховується в той самий тижневий інтервал —
+  наступний плановий слот пропускається. Раніше захист був лише
+  «раз на добу» (маркер `restore_done_<дата>.marker` за сьогоднішньою
+  датою), тому `-ForceRestore` у вівторок не заважав плановій реставрації
+  в неділю — модель реставрувалась двічі за 5 днів.
+  Реалізація: успішна примусова реставрація записує в
+  `BRAVO_RESTORE_STATE.json` нове поле `ForcedRestoreCoversSlot` —
+  НАСТУПНИЙ плановий слот, який вона покриває; гейт стоїть на
+  `$automaticRestoreDue`. Модель детермінована (порівняння слотів, а не
+  арифметика «різниця < 7 діб»), тому планова реставрація о 03:20 не
+  блокує наступну о 03:00 рівно через тиждень.
+  `-ForceRestore` обмежень не має і може виконуватись будь-скільки разів;
+  провалена/перервана примусова реставрація квоту НЕ споживає.
+  Примусова реставрація, як і раніше, НЕ закриває сам плановий слот
+  (маркер і `Status='Succeeded'` лишаються за автоматичним шляхом).
+  Стан, збережений попередньою версією, поля не має — поведінка як раніше;
+  записи `Status='Pending'`/`'Succeeded'` квоту зберігають.
+  Пропуск логується як INFO із зазначенням слоту й причини.
+
+- ЗМІНА ПОВЕДІНКИ (операторський підсумок): рядки «Кроків/Успішно/
+  Попереджень/Пропущено/Помилок» у фінальному блоці РЕЗУЛЬТАТ тепер
+  враховують і ненумеровані операції (Trace-SFTP, Очистка, Міграція,
+  Архівація, Автовимкнення), а не лише пронумеровані `[N/8]`. Раніше
+  вони рендерилися прямо через `Write-BRAVOOperationResult`, який не
+  веде ані лічильники, ані журнал етапів, тому реальний прогін показував
+  «Помилок: 0» при exit 60 через збійну SFTP-передачу Trace, а
+  Discord-повідомлення показувало `✅ Trace` замість `❌` і зовсім не
+  містило рядка «Очистка» та блоку «Проблеми». Нумерація `[N/8]` і
+  `Total=8` не змінилися.
+- ЗМІНА ПОВЕДІНКИ (exit-код): примусова реставрація поза дозволеним вікном
+  (`-ForceRestore`) логується як INFO, а не WARNING. Це констатація свідомої
+  дії оператора, а не аномалія, але будь-який WARNING піднімав severity
+  сповіщення й давав exit 10 (SuccessWithWarnings) — оператор отримував
+  жовте «ПОТРІБНА ДІЯ: перевірити журнал» при повністю успішному прогоні
+  без жодної підказки, що саме не так. Текст у журналі не змінився.
+  Протилежна ситуація — «Реставрацію пропущено … поза дозволеним вікном»
+  (заплановане не виконано) — свідомо лишається WARNING.
+- Виправлено хибну атрибуцію збою: зріз лічильників етапу «Обробка trace
+  і логів» знімався ДО реставрації, тому критична помилка реставрації
+  фарбувала наступний етап у FAIL, хоча той відпрацював. Зріз тепер
+  береться безпосередньо перед фазою обробки логів — статус етапу
+  відображає його власний результат.
+- Добова Trace-передача створює відсутній віддалений SFTP-каталог
+  рекурсивно перед завантаженням (канонічний `New-BRAVOBazaRemoteDirectoryRecursive`
+  з BRAVO.BazaSync). Раніше `session.PutFiles` не створював каталог, і
+  за відсутнього `/trace/` на сервері кожен прогін падав із
+  «Cannot create remote file '...new.filepart'. No such file or
+  directory», даючи exit 60 обслуговуванню, яке насправді відпрацювало.
+  Збій створення каталогу лишається fail-open саме для SFTP: помилка
+  етапу, локальний архів і джерельні `.out` збережені, повтор наступним
+  прогоном.
+
+- Post-repair валідація: тимчасові робочі файли bravocmd `*.$$$` (як і
+  сегментні `*.NNN`) більше не вважаються критичними при зникненні —
+  це транзитні артефакти repair, а не дані. Раніше orphan `*.$$$`
+  (залишок перерваного repair) спричиняв би false-positive rollback на
+  кожному наступному прогоні.
+- Fail-closed відкат при провалі/перериванні реставрації + гейт рестарту
+  служб. Раніше відкат із before-архіву виконувався лише коли bravocmd
+  завершувався кодом 0 і Compare-FileSizes знаходив критичні зміни;
+  перерваний/провальний repair (exit≠0) лишав модель без перевірки й без
+  відкату, а служби BRAVO піднімалися поверх неперевіреної моделі.
+  Тепер обидва шляхи проходять єдину функцію Invoke-BRAVOModelRestoreRecovery:
+  рішення про відкат приймається за фактичним станом моделі (не за кодом
+  виходу); відкат виконується у режимі «очистити→розпакувати» (прибирає
+  orphan-сегменти перерваного repair) лише після підтвердження цілісності
+  before-архіву; після відкату модель повторно валідується. Рестарт служб
+  (BRAVO/exchangAPI/BRAVO Web) гейтований на встановленій цілісності моделі —
+  якщо її не доведено (відкат провалився / before-архів невалідний), служби
+  НЕ піднімаються, quiescence-маркер лишається suppressed, надсилається
+  CRITICAL «потрібне ручне відновлення». Провал реставрації з відкатом тепер
+  має власний exit-код RestoreFailed (43), окремо від збою створення архіву
+  (40) і перевірки цілісності (41).
+- ЗМІНА ПОВЕДІНКИ: механізм перевірки розмірів реставрації (знімок before-CSV
+  і Compare-FileSizes після repair) став невідʼємною частиною реставрації і
+  виконується ЗАВЖДИ, незалежно від -DisableSizeCheck. Прапорець
+  -DisableSizeCheck / CheckSize тепер керує ЛИШЕ окремим кроком
+  Check-MdFileSizes («.md > ліміт»), а не самоперевіркою реставрації.
+
+## 5.2.0-dev.1 — 2026-08-20
+
+- New Trace processing model (daily accumulating archive): TraceSRV.out
+  and the new optional TraceBIS.out (explicit
+  maintenanceSettings.Trace.BISSourcePath — no reliable auto-discovery
+  source exists for BIS) are handled EXCLUSIVELY by BRAVO_MAINTENANCE
+  (manual and scheduled runs share one pipeline; file size is never a
+  trigger). Rotation while services are stopped produces flat
+  Trace\<Name>_<yyyyMMdd_HHmmss>.out (collision takes the next free
+  second, never overwrites; the sequence engine for
+  exchangAPI/Apache/BravoWeb is byte-identical via the new
+  -NamingPolicy parameter). After service restoration an unnumbered
+  phase updates exactly ONE Trace_YYYYMMDD.mdz per calendar date (date
+  from the rotated file NAME, oldest-first backlog across dates):
+  inventory first (new Compatibility exports
+  Get-BRAVOSevenZipArchiveEntries / Get-BRAVOSevenZipFileCrc), only
+  NEW files are passed to 7za (existing entries are immutable and
+  verified by Path+Size+CRC before publish), transactional
+  .work-partial update with 7z t + SHA512 sidecar + atomic publish
+  (a failed update never touches the previous valid archive), then
+  SFTP into the new sftpDirectories.Trace ("trace") via verified
+  <name>.new before replacing the previous remote version; rotated
+  .out are deleted only after the full
+  archive+integrity+SFTP+remote-verify chain, and a failed SFTP just
+  defers to the next run without duplicate entries. The local daily
+  .mdz is NEVER deleted by the pipeline — only by the new explicit
+  Retention.CompressedLogDeletionEnabled (default $false: no
+  compressed log .mdz, including legacy Trace_YYYY-MM-DD.mdz, is
+  age-deleted until the operator opts in; CompressedLogDays applies
+  only with the flag). Trace archive headers are deliberately not
+  -mhe encrypted (same as backup .mdz): with encrypted headers 7za
+  requests the password twice on append and does not reliably read
+  the second prompt from redirected stdin. Dry-run gains read-only
+  PLAN lines (sources, would create/update, queued count, would
+  upload, would delete) reusing the canonical backlog function via
+  AST extraction. Legacy date-directories/archives remain untouched
+  and continue through the existing ArchiveDays chain. New selftest
+  domain TraceArchive (18 scenarios on the real Tools 7za + fake SFTP
+  session) plus rotation/retention/dry-run gates.
+- Fix (latent, found by Trace characterization): 7-Zip passwords fed
+  via Process.StandardInput.WriteLine were BOM-prefixed on UTF-8
+  console hosts (chcp 65001) — archives were created "successfully"
+  with a corrupted effective password. New canonical
+  Write-BRAVOProcessInputText (BOM-free UTF-8 via BaseStream) is used
+  by all Compatibility 7z wrappers and Maintenance
+  Invoke-CommandWithLog; the Secrets/SevenZipPasswordUsesStdin gate
+  now requires the helper. Debt note: BRAVO.DataRestore's private
+  Get-BRAVOSevenZipArchiveInventory (counters-only) should migrate to
+  the new canonical Get-BRAVOSevenZipArchiveEntries in the DataRestore
+  decomposition cycle.
+
+Opens the next development cycle on developer after the 5.1.0 stable
+release (per RELEASE_POLICY.md section 11: post-promotion sync with
+master, then immediate prerelease bump so both branches never carry the
+same packageVersion). Planned focus (from the recorded 5.1.0-cycle
+debt): deduplication of service-lifecycle / operation-lock /
+WinSCP-session / ASCII-temp-root policy copies and BRAVO.DataRestore
+Runtime.ps1 decomposition.
+
+- New operator tool BRAVO_BAZA_RECONCILE.ps1 (guarded entrypoint) +
+  BRAVO.BazaSync exports Get-BRAVOBazaMutationReport /
+  Invoke-BRAVOBazaMutationReconciliation: one-command resolution of
+  append-only mutation violations (real incident 2026-08-21: five
+  ЗВТ PDFs legitimately regenerated in the BRAVO application).
+  -ListOnly shows old (state/cloud) vs new (local) versions with the
+  upload date and a TraceSRV.out verification hint; -Accept/-AcceptAll
+  renames the old remote version to *.replaced_<date> (rename-only,
+  never delete) and removes the state entry under the component sync
+  lock, so the next scheduled cycle uploads the new version; a rename
+  failure keeps the state entry (fail-closed). MutationPolicy="Fail"
+  is unchanged — an automatic overwrite policy is deliberately NOT
+  provided (ransomware would silently propagate to the cloud).
+  OPERATIONS gains a mutation-resolution runbook including the manual
+  fallback lessons (hashtable Files keyed by RelativePath; state I/O
+  strictly via [IO.File]:: UTF-8 — raw Get-Content/Set-Content mangle
+  Cyrillic keys; deleting keys alone just converts the block into
+  REMOTE_CONFLICT).
+- The suppressed-marker watchdog issue text is compacted to one cause
+  + one action + the owner log ("перерване відновлення — потрібне
+  РУЧНЕ втручання за кодом 43 (автостарт заборонено); лог: <шлях>");
+  the internal restartSuppressed jargon and the triple restatement
+  stay only in the detailed Health log line.
+- Compact operator alerts (operator request from the DEV-LIMS field
+  test): the Health problem notification shows the full issue Reason
+  exactly once (in its thematic section) — the header reason block now
+  carries only a compact component list (up to 4 names) instead of
+  duplicating the first issue's full text, and the redundant
+  :package: component-list line is removed. Watchdog issues carry
+  their own ActionText ("виконати ручне відновлення служб (OPERATIONS.md,
+  код 43)" / "перевірити причину аварійного переривання <owner>" /
+  "запустити служби вручну та перевірити ownership-маркер") instead of
+  the broken generic template "запустити або перевірити службу Служби
+  після аварії <owner>"; plain service issues keep the old template.
+- Config loader: an effective configuration now always carries
+  maintenanceSettings.Restore.BootRestoreMode — a legacy site config
+  (5.0/5.1) without the new key gets the safe 'None' (24/7) default.
+  Previously BRAVO_TASKS_INSTALL (and any other direct consumer)
+  crashed under StrictMode with "property 'BootRestoreMode' cannot be
+  found" despite the loader's own "the stale key is ignored" warning
+  (real case: DEV-LIMS site config from the rc.4 era). Regression test
+  ConfigurationLoader/MissingBootRestoreModeDefaultsToNone builds a
+  legacy-shaped fixture and validates both the loader default and the
+  installer run.
+- Self-test: temporary directories are created under
+  [IO.Path]::GetTempPath() instead of raw $env:TEMP. On servers where
+  the session TEMP variable carries the 8.3 short profile form
+  (C:\Users\E980D~1.KUC\..., real case: DEV-LIMS / Server 2022),
+  Remove-Item -LiteralPath in Windows PowerShell 5.1 fails on the
+  short segment with PSArgumentException and aborted the whole
+  self-test run in the environment-preflight block.
+- Quiescence watchdog hardening (review F4/F5): the watchdog starts
+  only services from the canonical managed set resolved from
+  maintenanceSettings.Services (including resolved BravoWeb
+  candidates) — a marker entry outside that set is refused with an
+  ERROR alert and the marker is kept (fail-safe: unavailable
+  configuration yields an empty set and a full refusal), so a
+  planted/edited marker can no longer make SYSTEM-Health start an
+  arbitrary service. BRAVO_SETUP now hardens the machine state root
+  ACL (`Protect-BRAVOMachineStateRoot`, new BRAVO.System export):
+  `%ProgramData%\BRAVO\State` gets inheritance disabled with
+  FullControl only for SYSTEM and Administrators; ValidateOnly and
+  non-elevated runs report compliance without changing anything.
+  Watchdog reporting no longer counts an already-running service as
+  "recovered" — the operator sees the actual incident scope.
+
+- CI: push- and pull_request-event check names split (jobs get a
+  " (push)" suffix outside pull_request context). During the 5.1.0
+  stable promotion the same head SHA carried a green PR run and the
+  documented intentionally-red push run under identical check names,
+  so master branch protection counted both and blocked the merge
+  ("2 of 5 required status checks are failing"), forcing a temporary
+  enforce_admins bypass. Required checks are now supplied exclusively
+  by the pull_request (merge-preview) run; push runs keep full
+  coverage, including the branch-context release-policy gate, under
+  suffixed names. No step logic changed.
+- Service quiescence ownership marker + Health watchdog: Maintenance
+  and DataRestore now write an atomic ownership marker
+  (`%ProgramData%\BRAVO\State\BRAVO_SERVICE_QUIESCENCE.json`, same
+  pattern as the VSS ownership state) BEFORE stopping managed services
+  (marker write failure aborts the stop — fail-closed) and clear it
+  only after all services restarted successfully. The scheduled
+  BRAVO_HEALTH run gains a narrow, documented exception to its
+  read-only policy: if the marker's owner process is dead
+  (pid+processStartTime liveness check, PID reuse excluded) and
+  restartSuppressed=false, Health starts exactly the services listed
+  in the marker and alerts; a suppressed marker or a manual stop
+  without a marker is never auto-started. DataRestore always writes
+  its marker suppressed (a hard kill mid-restore leaves the live
+  filesystem in an undefined state, so the watchdog only raises a
+  CRITICAL manual-recovery alert and never auto-starts over it);
+  Clear/Suppress are owner-guarded (pid+processStartTime) and the
+  watchdog re-reads the marker before acting (TOCTOU guard), so
+  overlapping owners cannot delete each other's markers; Read
+  validates all required marker fields and returns null for
+  partially edited markers instead of failing the whole Health run
+  under StrictMode. New self-test domain
+  `selftest/BRAVO_SELF_TEST.ServiceQuiescence.ps1`; new
+  BRAVO.System exports (Write/Read/Clear/Suppress quiescence state,
+  Test-BRAVOProcessAlive). See OPERATIONS.md «Аварійне відновлення
+  служб (ownership-маркер)».
+- Fixed a double-restore defect (real incident on a production BRAVO
+  server, 2026-08-20): the Recovery guard branch for missed daily work
+  with services already running (exit 20) unconditionally overwrote
+  BRAVO_RESTORE_STATE.json with Pending, degrading the Succeeded state
+  of an already-performed restore — the next 15-minute Recovery tick
+  then executed the full model restore a second time in the same day.
+  The trigger was a race with the nightly BRAVO_ARCHIV run (its Backup
+  execution mark not yet written while it was still running produced a
+  false missed-Backup verdict). Pending is now written only when the
+  restore slot is genuinely still due; a completed restore state is
+  never degraded. Regression test
+  Maintenance/RecoveryGuardNeverDegradesSucceededRestoreState.
+- Legacy OS tier (Server 2012 R2/2016) is informational in operational
+  runs: BRAVO_ARCHIV and BRAVO_MAINTENANCE now log the LegacyBestEffort
+  support-tier message as INFO instead of WARNING. Previously every
+  successful run on such a server exited with code 10
+  (SuccessWithWarnings) and its report was routed to the ALERTS channel,
+  although the OS tier has no effect on the operation itself.
+  BRAVO_HEALTH keeps the WARNING as the canonical owner of environmental
+  metrics (same principle already applied to Windows update age), and
+  the Unsupported tier still blocks runs as before.
+- ROADMAP: P3.2a documented — BRAVO_UPDATE.ps1, operator-triggered
+  server update (staged download + SHA-256 + config diff gate +
+  in-place mirror + guard/scheduler/setup gates + update journal +
+  auto-rollback), planned for this cycle; silent auto-update remains
+  architecturally forbidden until full P3.2/P4.
+- Missed-restore redesign (server profiles). New config key
+  maintenanceSettings.Restore.BootRestoreMode replaces
+  RunMissedOnStartup (loader warns about the stale key):
+  - "None" (default, 24/7 server): the BRAVO_RESTORE_RECOVERY task is
+    no longer registered (an existing one is disabled by the
+    installer); a missed restore slot is picked up by the next nightly
+    BRAVO_MAINTENANCE (23:55) inside the restore window — previously a
+    separate Recovery daily trigger ran it at 21:00 instead.
+  - "HoldServices" (work-hours server that is powered off at night and
+    never sees the restore window): the installer switches
+    BRAVO/exchangAPI to Automatic (Delayed Start) (new canonical
+    BRAVO.System function Set-BRAVOBootRestoreServiceStartType — the
+    only place in the kit that changes service start types) and
+    registers Recovery with a single boot trigger (delay 0, no
+    repetition). At server startup the missed restore runs OUTSIDE the
+    window while the services are held stopped, so clients cannot
+    enter the application before the model is replaced; fail-open —
+    if the task does not run, delayed auto-start brings services up.
+  - The former boot-trigger repetition (15 min for 8 h) is removed: on
+    a production BRAVO server (2026-08-20) its tail kept waking the task every 15 minutes
+    long after the restore had succeeded.
+  - Quiescence integration (post-rebase review): the destructive model
+    restore phase (bravocmd) now runs under a suppressed ownership
+    marker — a hard kill mid-restore makes the Health watchdog raise a
+    CRITICAL manual-recovery alert instead of auto-starting services
+    over a half-restored model (suppression failure aborts the restore
+    before bravocmd, fail-closed; the marker returns to auto-start mode
+    once the model is consistent again). The boot HoldServices profile
+    forces every enabled managed service into the stop/marker/restart
+    scope regardless of the boot race with delayed auto-start, and the
+    service snapshot now counts StartPending as running in all
+    profiles.
+
 ## 5.1.0 — 2026-08-20
 
 Stable release of the 5.1.0 line, promoted (metadata-only) from the

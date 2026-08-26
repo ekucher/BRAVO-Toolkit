@@ -15,9 +15,21 @@ on:
     branches: [master, developer]
   workflow_dispatch:
 
+# Check names are split by event on purpose (5.1.0 promotion incident,
+# 2026-08-20): master branch protection matches required checks by NAME,
+# and during a stable promotion the same head SHA carries BOTH a green
+# pull_request run and an intentionally red push run (stable version on
+# developer fails the release-policy gate in branch context - documented
+# transient). GitHub counted both and blocked the merge ("2 of 5
+# required status checks are failing"), forcing an enforce_admins
+# bypass. Therefore: pull_request runs keep the canonical names that
+# branch protection requires; push/workflow_dispatch runs get a
+# " (push)" suffix so they stay visible but never compete with the
+# merge gate. If developer ever gets its own required checks, configure
+# them with the canonical (pull_request) names.
 jobs:
   static-checks:
-    name: Parser / BOM / JSON
+    name: ${{ github.event_name == 'pull_request' && 'Parser / BOM / JSON' || 'Parser / BOM / JSON (push)' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,7 +151,7 @@ jobs:
           if ($failed) { exit 1 }
 
   psscriptanalyzer:
-    name: PSScriptAnalyzer
+    name: ${{ github.event_name == 'pull_request' && 'PSScriptAnalyzer' || 'PSScriptAnalyzer (push)' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -172,7 +184,7 @@ jobs:
         run: .\ci\Invoke-BRAVOSecurityAnalysis.ps1 -Informational
 
   self-test:
-    name: BRAVO_SELF_TEST.ps1
+    name: ${{ github.event_name == 'pull_request' && 'BRAVO_SELF_TEST.ps1' || 'BRAVO_SELF_TEST.ps1 (push)' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -196,7 +208,7 @@ jobs:
           if-no-files-found: ignore
 
   datarestore-matrix-test:
-    name: BRAVO_DATA_RESTORE_MATRIX_TEST.ps1
+    name: ${{ github.event_name == 'pull_request' && 'BRAVO_DATA_RESTORE_MATRIX_TEST.ps1' || 'BRAVO_DATA_RESTORE_MATRIX_TEST.ps1 (push)' }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -239,7 +251,7 @@ jobs:
           if-no-files-found: ignore
 
   secret-scan:
-    name: Secret scanning (gitleaks)
+    name: ${{ github.event_name == 'pull_request' && 'Secret scanning (gitleaks)' || 'Secret scanning (gitleaks) (push)' }}
     runs-on: ubuntu-latest
     # gitleaks-action на pull_request-подіях звертається до GitHub API за
     # списком комітів PR (GET /pulls/{n}/commits) — без явного дозволу

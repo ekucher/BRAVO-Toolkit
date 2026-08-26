@@ -102,6 +102,35 @@
                     $this.State.RemoteSizes.Remove($sourcePath)
                 }
             }
+            $session | Add-Member -MemberType ScriptMethod -Name ListDirectory -Value {
+                param($path)
+                # Спрощена модель WinSCP Session.ListDirectory: безпосередні
+                # діти каталогу з RemoteSizes/KnownRemoteDirs. Використовується
+                # міграцією журнальних архівів (TraceArchive-фрагмент).
+                $normalized = ([string]$path).TrimEnd('/')
+                $files = New-Object System.Collections.Generic.List[object]
+                foreach ($remotePath in @($this.State.RemoteSizes.Keys)) {
+                    if ($remotePath -notlike "$normalized/*") { continue }
+                    $childRelative = $remotePath.Substring($normalized.Length + 1)
+                    if ($childRelative.Contains('/')) { continue }
+                    [void]$files.Add([pscustomobject]@{
+                        Name = $childRelative
+                        IsDirectory = $false
+                        Length = [int64]$this.State.RemoteSizes[$remotePath]
+                    })
+                }
+                foreach ($knownDir in @($this.State.KnownRemoteDirs)) {
+                    if ($knownDir -notlike "$normalized/*") { continue }
+                    $childRelative = $knownDir.Substring($normalized.Length + 1)
+                    if ($childRelative.Contains('/')) { continue }
+                    [void]$files.Add([pscustomobject]@{
+                        Name = $childRelative
+                        IsDirectory = $true
+                        Length = [int64]0
+                    })
+                }
+                return [pscustomobject]@{ Files = @($files.ToArray()) }
+            }
             $session | Add-Member -MemberType ScriptMethod -Name RemoveFiles -Value {
                 param($path)
                 [void]$this.State.RemoveFilesCalls.Add($path)
@@ -128,7 +157,10 @@
             return $fullPath
         }
 
-        $bazaSyncTestRoot = Join-Path $env:TEMP ("bazasynctest_" + [guid]::NewGuid().ToString('N'))
+        # GetTempPath, не $env:TEMP: TEMP сесії може бути 8.3-коротким
+        # (C:\Users\E980D~1.KUC\...), а Remove-Item -LiteralPath у PS 5.1
+        # падає на короткому сегменті (реальний випадок: DEV-LIMS).
+        $bazaSyncTestRoot = Join-Path ([IO.Path]::GetTempPath()) ("bazasynctest_" + [guid]::NewGuid().ToString('N'))
         New-Item -ItemType Directory -Path $bazaSyncTestRoot -Force | Out-Null
 
         # =======================================================================
@@ -298,6 +330,90 @@
         $fastHealthMutation = Get-BRAVOBazaFastHealthResult -SyncResult $mutResult2
         Test-BRAVOCondition -Condition ($fastHealthMutation.Healthy -eq $false -and $fastHealthMutation.Level -eq 'CRITICAL' -and $fastHealthMutation.Message -match 'verified\.txt') `
             -Name 'BazaSync/MutationViolationIsHealthCritical' -Failure 'MUTATION_VIOLATION має бути CRITICAL/unhealthy з іменем файлу в повідомленні'
+
+        # AutoArchiveMutationThreshold: default (0, вимкнено) — $mutResult2
+        # вище вже підтверджує regression без явного передавання параметра
+        # (Invoke-BRAVOBazaSynchronization викликано без -AutoArchiveMutationThreshold).
+
+        # AutoArchiveMutationThreshold: N <= поріг -> авто-архівування
+        $aaOkRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveOk"
+        $aaOkLocal = Join-Path $aaOkRoot "local"
+        $aaOkState = Join-Path $aaOkRoot "state"
+        New-Item -ItemType Directory -Path $aaOkLocal -Force | Out-Null
+        $aaOkFile = New-BRAVOSelfTestBazaFile -Directory $aaOkLocal -RelativePath "eqv_11-116.pdf" -SizeBytes 500
+        $aaOkSession1 = New-BRAVOSelfTestFakeBazaSession
+        $aaOkResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOkLocal -RemoteRootPath '/baza_app' -Session $aaOkSession1 -StateRoot $aaOkState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($aaOkResult1.Status -eq 'COMPLETE' -and $aaOkResult1.Uploaded -eq 1) `
+            -Name 'BazaSync/AutoArchiveSetupInitialUploadSucceeds' -Failure 'setup: перший upload має пройти успішно перед тестом авто-архівування'
+
+        [IO.File]::WriteAllBytes($aaOkFile, (New-Object byte[] 999))
+        # Той самий session-об'єкт: "віддалений сервер" фейкового duck-типу
+        # тримає RemoteSizes/KnownRemoteDirs у своєму State — новий
+        # New-BRAVOSelfTestFakeBazaSession означав би порожній remote
+        # (FileExists завжди false), що приховало б реальний rename-шлях.
+        $aaOkSession2 = $aaOkSession1
+        $aaOkResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOkLocal -RemoteRootPath '/baza_app' -Session $aaOkSession2 -StateRoot $aaOkState -AutoArchiveMutationThreshold 5
+        $aaOkStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $aaOkState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $aaOkResult2.Status -eq 'MUTATION_AUTO_ARCHIVED' -and
+            $aaOkResult2.AutoArchivedMutations.Accepted.Count -eq 1 -and
+            $aaOkResult2.AutoArchivedMutations.Accepted[0] -eq 'eqv_11-116.pdf' -and
+            $aaOkSession2.State.MoveFileCalls.Count -eq 1 -and
+            ($aaOkSession2.State.MoveFileCalls[0] -match '\.replaced_') -and
+            -not $aaOkStateRead.State.Files.ContainsKey('eqv_11-116.pdf') -and
+            $aaOkSession2.State.PutFilesCallCount -eq 1
+        ) -Name 'BazaSync/AutoArchiveBelowThresholdRenamesAndClearsState' -Failure "мутація <= порогу має автоматично rename-archive: Status=$($aaOkResult2.Status),Accepted=$($aaOkResult2.AutoArchivedMutations.Accepted.Count),MoveFile=$($aaOkSession2.State.MoveFileCalls.Count),PutFiles=$($aaOkSession2.State.PutFilesCallCount)"
+
+        $fastHealthAutoArchive = Get-BRAVOBazaFastHealthResult -SyncResult $aaOkResult2
+        Test-BRAVOCondition -Condition (
+            $fastHealthAutoArchive.Healthy -eq $true -and $fastHealthAutoArchive.Level -eq 'INFO' -and
+            $fastHealthAutoArchive.Message -match 'eqv_11-116\.pdf' -and $fastHealthAutoArchive.Message -notmatch 'ПОТРІБНА ДІЯ'
+        ) -Name 'BazaSync/MutationAutoArchivedIsHealthInfoNotCritical' -Failure "MUTATION_AUTO_ARCHIVED має бути INFO/healthy (не блокує): Level=$($fastHealthAutoArchive.Level),Healthy=$($fastHealthAutoArchive.Healthy)"
+
+        # AutoArchiveMutationThreshold: N > поріг -> як і без опції (жорсткий блок)
+        $aaOverRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveOverThreshold"
+        $aaOverLocal = Join-Path $aaOverRoot "local"
+        $aaOverState = Join-Path $aaOverRoot "state"
+        New-Item -ItemType Directory -Path $aaOverLocal -Force | Out-Null
+        $aaOverFile1 = New-BRAVOSelfTestBazaFile -Directory $aaOverLocal -RelativePath "one.pdf" -SizeBytes 100
+        $aaOverFile2 = New-BRAVOSelfTestBazaFile -Directory $aaOverLocal -RelativePath "two.pdf" -SizeBytes 100
+        $aaOverSession1 = New-BRAVOSelfTestFakeBazaSession
+        $aaOverResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOverLocal -RemoteRootPath '/baza_app' -Session $aaOverSession1 -StateRoot $aaOverState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($aaOverResult1.Status -eq 'COMPLETE' -and $aaOverResult1.Uploaded -eq 2) `
+            -Name 'BazaSync/AutoArchiveOverThresholdSetupInitialUploadSucceeds' -Failure 'setup: обидва початкові upload мають пройти успішно'
+
+        [IO.File]::WriteAllBytes($aaOverFile1, (New-Object byte[] 150))
+        [IO.File]::WriteAllBytes($aaOverFile2, (New-Object byte[] 150))
+        $aaOverSession2 = New-BRAVOSelfTestFakeBazaSession
+        $aaOverResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOverLocal -RemoteRootPath '/baza_app' -Session $aaOverSession2 -StateRoot $aaOverState -AutoArchiveMutationThreshold 1
+        Test-BRAVOCondition -Condition (
+            $aaOverResult2.Status -eq 'MUTATION_VIOLATION' -and $aaOverResult2.MutationViolations.Count -eq 2 -and
+            $aaOverSession2.State.MoveFileCalls.Count -eq 0
+        ) -Name 'BazaSync/AutoArchiveOverThresholdBlocksAsWithoutOption' -Failure "кількість мутацій > порогу має блокувати рівно як без опції: Status=$($aaOverResult2.Status),Violations=$($aaOverResult2.MutationViolations.Count),MoveFile=$($aaOverSession2.State.MoveFileCalls.Count)"
+
+        # AutoArchiveMutationThreshold: невдалий rename -> fail-closed, state не просувається
+        $aaFailRoot = Join-Path $bazaSyncTestRoot "A_AutoArchiveRenameFails"
+        $aaFailLocal = Join-Path $aaFailRoot "local"
+        $aaFailState = Join-Path $aaFailRoot "state"
+        New-Item -ItemType Directory -Path $aaFailLocal -Force | Out-Null
+        $aaFailFile = New-BRAVOSelfTestBazaFile -Directory $aaFailLocal -RelativePath "will_not_archive.pdf" -SizeBytes 500
+        $aaFailSession1 = New-BRAVOSelfTestFakeBazaSession
+        $aaFailResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaFailLocal -RemoteRootPath '/baza_app' -Session $aaFailSession1 -StateRoot $aaFailState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($aaFailResult1.Status -eq 'COMPLETE' -and $aaFailResult1.Uploaded -eq 1) `
+            -Name 'BazaSync/AutoArchiveRenameFailsSetupInitialUploadSucceeds' -Failure 'setup: перший upload має пройти успішно перед тестом невдалого rename'
+
+        [IO.File]::WriteAllBytes($aaFailFile, (New-Object byte[] 999))
+        # Той самий session-об'єкт (див. коментар вище) — MoveFileShouldFail
+        # вмикається ПІСЛЯ bootstrap-upload, щоб сам upload не постраждав.
+        $aaFailSession2 = $aaFailSession1
+        $aaFailSession2.State.MoveFileShouldFail = $true
+        $aaFailResult2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaFailLocal -RemoteRootPath '/baza_app' -Session $aaFailSession2 -StateRoot $aaFailState -AutoArchiveMutationThreshold 5
+        $aaFailStateRead = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $aaFailState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $aaFailResult2.Status -eq 'MUTATION_VIOLATION' -and
+            $aaFailResult2.AutoArchivedMutations.Failures.Count -eq 1 -and
+            $aaFailStateRead.State.Files.ContainsKey('will_not_archive.pdf')
+        ) -Name 'BazaSync/AutoArchiveRenameFailureIsFailClosed' -Failure "невдалий rename під час авто-архівування має лишити state незмінним і Status=MUTATION_VIOLATION: Status=$($aaFailResult2.Status),Failures=$($aaFailResult2.AutoArchivedMutations.Failures.Count),StateHasKey=$($aaFailStateRead.State.Files.ContainsKey('will_not_archive.pdf'))"
 
         # New file with OLD LastWriteTime must still be discovered (timestamp is a hint, not source of truth)
         $oldTsRoot = Join-Path $bazaSyncTestRoot "A_OldTimestamp"
@@ -2003,6 +2119,117 @@
             [bool]$hr7RecStateAfter.State.AuditReconciliationPending -eq $false -and
             [bool]$hr7RecStateAfter.State.Files['m7.txt'].Verified -eq $true
         ) -Name 'BazaSync/PendingMarkerRecoveryWorksWithProductionProviderBoundary' -Failure "маркер на диску -> наступний Archive-прогін з PRODUCTION-провайдером (реальна межа модуля) реконсилюється: аудит виконано, COMPLETE, маркер false; Status=$($hr7RecCycle.Status) Invoked=$($hr7RecProbe.Invoked) Pending=$($hr7RecStateAfter.State.AuditReconciliationPending)"
+
+        # =====================================================================
+        # BRAVO_BAZA_RECONCILE: операторське розв'язання append-only мутацій
+        # (інцидент LIMS 2026-08-21). Rename-only + state-removal; жодного
+        # delete і жодного upload за конструкцією.
+        # =====================================================================
+        $mrLocal = Join-Path $bazaSyncTestRoot 'reconcile_local'
+        $mrState = Join-Path $bazaSyncTestRoot 'reconcile_state'
+        New-Item -ItemType Directory -Path $mrLocal -Force | Out-Null
+        New-Item -ItemType Directory -Path $mrState -Force | Out-Null
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'doc1.pdf' -SizeBytes 100)
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'Eqv\звіт.pdf' -SizeBytes 120)
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'keep.txt' -SizeBytes 50)
+        $mrSession = New-BRAVOSelfTestFakeBazaSession
+        $mrCycle1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mrLocal -RemoteRootPath '/baza_app' -Session $mrSession -StateRoot $mrState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        # Мутації: два Verified-файли перезаписано ІНШИМ розміром (як в
+        # інциденті: застосунок перегенерував PDF).
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'doc1.pdf' -SizeBytes 150)
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'Eqv\звіт.pdf' -SizeBytes 180)
+
+        $mrReport = Get-BRAVOBazaMutationReport -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState
+        $mrReportEntry = @($mrReport.Mutations | Where-Object { $_.RelativePath -eq 'doc1.pdf' }) | Select-Object -First 1
+        Test-BRAVOCondition -Condition (
+            $mrCycle1.Status -eq 'COMPLETE' -and
+            $mrReport.Success -eq $true -and
+            @($mrReport.Mutations).Count -eq 2 -and
+            $null -ne $mrReportEntry -and
+            [int64]$mrReportEntry.PreviousSize -eq 100 -and
+            [int64]$mrReportEntry.CurrentSize -eq 150 -and
+            -not [string]::IsNullOrWhiteSpace([string]$mrReportEntry.UploadedUtc)
+        ) -Name 'BazaSync/MutationReportListsPreviousAndCurrentVersions' -Failure "звіт мутацій має показувати стару (state) і нову (диск) версії з UploadedUtc; Count=$(@($mrReport.Mutations).Count)"
+
+        # Захист від -Accept довільного шляху: не-мутація відхиляється, state
+        # незмінний, remote неторкнутий.
+        $mrBadResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('keep.txt')
+        $mrStateAfterBad = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrBadResult.Success -eq $false -and
+            @($mrBadResult.Failures).Count -eq 1 -and
+            [string]$mrBadResult.Failures[0].Stage -eq 'Validate' -and
+            $null -ne $mrStateAfterBad.State.Files['keep.txt'] -and
+            $null -ne $mrStateAfterBad.State.Files['doc1.pdf']
+        ) -Name 'BazaSync/ReconcileRejectsPathThatIsNotACurrentMutation' -Failure 'шлях, що не є поточною мутацією, має відхилятися на етапі Validate без жодних змін state/remote'
+
+        # Fail-closed: збій remote-rename -> state-ключ НЕ видаляється.
+        $mrSession.State.MoveFileShouldFail = $true
+        $mrFailResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('doc1.pdf')
+        $mrSession.State.MoveFileShouldFail = $false
+        $mrStateAfterFail = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrFailResult.Success -eq $false -and
+            @($mrFailResult.Failures).Count -eq 1 -and
+            [string]$mrFailResult.Failures[0].Stage -eq 'RemoteRename' -and
+            @($mrFailResult.StateRemoved).Count -eq 0 -and
+            $null -ne $mrStateAfterFail.State.Files['doc1.pdf']
+        ) -Name 'BazaSync/ReconcileMoveFailureKeepsStateEntry' -Failure 'збій MoveFile має лишати state-запис неторкнутим (fail-closed: довіра знімається лише після успішного rename)'
+
+        # Успішний reconcile обох мутацій: старі remote-версії перейменовано
+        # у *.replaced_*, ключі прибрано, keep.txt неторкнутий, ЖОДНОГО
+        # RemoveFiles/PutFiles від самого інструмента.
+        $mrPutCallsBefore = $mrSession.State.PutFilesCallCount
+        $mrOkResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('doc1.pdf', 'Eqv\звіт.pdf')
+        $mrStateAfterOk = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        $mrRenameCalls = @($mrSession.State.MoveFileCalls | Where-Object { $_ -match '\.replaced_' })
+        Test-BRAVOCondition -Condition (
+            $mrOkResult.Success -eq $true -and
+            @($mrOkResult.RenamedRemote).Count -eq 2 -and
+            $mrRenameCalls.Count -ge 2 -and
+            ($mrRenameCalls -join '; ') -match '/baza_app/doc1\.pdf -> /baza_app/doc1\.pdf\.replaced_' -and
+            $null -eq $mrStateAfterOk.State.Files['doc1.pdf'] -and
+            $null -eq $mrStateAfterOk.State.Files['Eqv\звіт.pdf'] -and
+            $null -ne $mrStateAfterOk.State.Files['keep.txt'] -and
+            @($mrSession.State.RemoveFilesCalls).Count -eq 0 -and
+            $mrSession.State.PutFilesCallCount -eq $mrPutCallsBefore
+        ) -Name 'BazaSync/ReconcileRenamesRemoteAndRemovesStateEntry' -Failure 'успішний reconcile: rename обох старих remote-версій у *.replaced_*, видалення лише прийнятих ключів, нуль delete/upload від інструмента'
+
+        # Кінець-у-кінець: наступний плановий цикл бачить нові версії як
+        # кандидатів, remote-шляхи вільні -> Uploaded, COMPLETE, Verified.
+        $mrCycle2 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mrLocal -RemoteRootPath '/baza_app' -Session $mrSession -StateRoot $mrState
+        $mrStateAfterCycle2 = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrCycle2.Status -eq 'COMPLETE' -and
+            [bool]$mrStateAfterCycle2.State.Files['doc1.pdf'].Verified -eq $true -and
+            [int64]$mrStateAfterCycle2.State.Files['doc1.pdf'].Size -eq 150 -and
+            [int64]$mrSession.State.RemoteSizes['/baza_app/doc1.pdf'] -eq 150 -and
+            @($mrSession.State.RemoteSizes.Keys | Where-Object { $_ -match '^/baza_app/doc1\.pdf\.replaced_' }).Count -eq 1
+        ) -Name 'BazaSync/ReconcileThenNextCycleUploadsNewVersion' -Failure "після reconcile наступний цикл має залити нові версії на звільнені шляхи і стати COMPLETE; Status=$($mrCycle2.Status)"
+
+        # Remote відсутній (state вірив, файлу в хмарі немає): rename не
+        # потрібен, ключ видаляється, Success.
+        [void](New-BRAVOSelfTestBazaFile -Directory $mrLocal -RelativePath 'keep.txt' -SizeBytes 77)
+        $mrSession.State.RemoteSizes.Remove('/baza_app/keep.txt')
+        $mrAbsentResult = Invoke-BRAVOBazaMutationReconciliation -Component 'BAZA_APP' -LocalDirectory $mrLocal -StateRoot $mrState -RemoteRootPath '/baza_app' -Session $mrSession -AcceptRelativePaths @('keep.txt')
+        $mrStateAfterAbsent = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mrState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $mrAbsentResult.Success -eq $true -and
+            @($mrAbsentResult.RemoteAbsent) -contains 'keep.txt' -and
+            @($mrAbsentResult.RenamedRemote).Count -eq 0 -and
+            $null -eq $mrStateAfterAbsent.State.Files['keep.txt']
+        ) -Name 'BazaSync/ReconcileRemoteAbsentSkipsRenameStillRemovesEntry' -Failure 'відсутній remote-файл: rename пропускається (RemoteAbsent), ключ видаляється, результат успішний'
+
+        # Регресія польового дефекту DEV-LIMS E2E (2026-08-21): присвоєння
+        # `$acceptList = if (...) {...} else { @($Accept) }` йде через
+        # пайплайн і РОЗГОРТАЄ одноелементний масив у скаляр — .Count на
+        # ньому падає під успадкованим StrictMode 2.0 (exit 90 після вже
+        # виконаних remote/state-кроків). Обгортка @() довкола всього if
+        # обов'язкова; гейт тримає саме цю форму в entrypoint.
+        $mrReconcileEntrypointText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_BAZA_RECONCILE.ps1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition -Condition (
+            $mrReconcileEntrypointText -match '\$acceptList\s*=\s*@\(if\s'
+        ) -Name 'BazaSync/ReconcileAcceptListAssignmentStaysArrayWrapped' -Failure 'BRAVO_BAZA_RECONCILE: $acceptList має присвоюватися як @(if ...) — if-вираз без обгортки розгортає одноелементний масив у скаляр і .Count падає під StrictMode 2.0'
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue

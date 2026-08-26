@@ -747,10 +747,27 @@ production-реліз може повторно повернути вже вип
 - дозволити merge робочих гілок;
 - не дозволяти stable-версії.
 
-Технічний стан на сьогодні: branch protection **не ввімкнено** —
-required status checks на приватному репозиторії потребують GitHub Pro.
-Тому CI показує статус, але не блокує merge; дотримання цього розділу
-поки що ручне (`RELEASE_CHECKLIST.md`, розділ 2).
+Технічний стан (перевірено 2026-08-26, репозиторій публічний —
+branch protection доступний без платного плану): protection
+**увімкнено** для обох гілок.
+
+- `master`: зміни лише через Pull Request; required checks
+  «Parser / BOM / JSON», «PSScriptAnalyzer», «BRAVO_SELF_TEST.ps1»,
+  «Secret scanning (gitleaks)», «GitGuardian Security Checks»
+  (strict — гілка мусить бути актуальною); force push і видалення
+  гілки заборонені; `enforce_admins` увімкнено (обхід адміністратором
+  заблоковано — прецедент merge PR #61 у вікні промоції 5.1.0 більше
+  технічно неможливий).
+- `developer`: зміни лише через Pull Request; ті самі required
+  checks (без strict-вимоги актуальності гілки); force push і
+  видалення заборонені; `enforce_admins` увімкнено.
+
+Дозволене джерело промоції в `master` (`developer`/`hotfix/*` з
+ЦЬОГО репозиторію, а не fork з однойменною гілкою) і семантичне
+підняття stable-версії додатково контролює CI-гейт
+`ci\Test-BRAVOMasterMergePolicy.ps1` (крок у required check
+«Parser / BOM / JSON»), тож порушення політики блокує merge
+технічно, а не лише процедурно.
 
 ---
 
@@ -971,19 +988,152 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    5.0.0   (stable)
-developer: 5.1.0-rc.2 (prerelease, у розробці — acceptance ще не пройдено)
+master:    5.2.0 (stable, тег v5.2.0; metadata-only промоція
+           2026-08-26 з прийнятого 5.2.0-rc.13)
+developer: наступний цикл відкривається одразу після промоції
+           (5.3.0-dev.1, розділ 4)
 ```
 
-`5.1.0-rc.1` пройшов real-SFTP acceptance на DEV-LIMS (2026-08-13),
-але ДО публікації stable вирішено включити у 5.1.0 нову
-функціональність — BRAVO_DATA_RESTORE (реальне відновлення даних із
-верифікованої COMPLETE generation). Функціональна зміна робить
-acceptance rc.1 недійсним як release evidence (розділ 3), тому
-відкрито наступний candidate `5.1.0-rc.2`, який потребує повного
-повторного acceptance (включно з реальним restore-acceptance на
-DEV-LIMS) перед promotion у stable.
+Дерево stable 5.2.0 = прийнятий `v5.2.0-rc.13` (stamp `0247ac3`,
+sourceCommit `12e6370`) + non-runtime доповнення: acceptance-evidence
+документ (PR #100) і governance-hardening PR #101 (repository identity
+у гейті промоції master, регресії, branch protection `developer`,
+синхронізація release-документації) — runtime functional diff проти
+прийнятого rc.13 порожній.
 
-Локальний, ніде не опублікований коміт stable-промоушену з rc.1
-(`ac07f55`) НЕ є фінальним stable: його не можна push/merge/tag/
-release. Stable `5.1.0` буде промотовано заново з прийнятого rc.2.
+Хронологія RC-циклу 5.2.0 (2026-08-24/25):
+
+- `v5.2.0-rc.4`/`v5.2.0-rc.5` (лінія PR #83) — повний real-server
+  acceptance PASS (`SERV_HRDL_1`, `WIN-44OBNQ3R3OB`).
+- `v5.2.0-rc.6` — acceptance FAIL (фіксований поріг місця блокував
+  backup); `v5.2.0-rc.7` (rc.5 + PR #84: розрахункова перевірка
+  вільного місця з floor-override) — повний end-to-end acceptance PASS
+  2026-08-25 (`WIN-42Q5558LQC9`: backup MODEL/BLOG/BRAVOEXCH,
+  SFTP 7/7, Health OK).
+- `v5.2.0-rc.8` (rc.7 + PR #86: регістронезалежна деривація відносних
+  шляхів MODEL у Compare-FileSizes; закриває інцидент exit 43) —
+  **acceptance реставрації PASS** 2026-08-25 22:03-22:24 на сервері
+  інциденту (`LIMS`/ДНДІЛДВСЕ, `-ForceRestore`: bravocmd exit 0,
+  Critical=0, Rollback=NONE, служби відновлено, Trace-pipeline OK).
+- `v5.2.0-rc.9` (rc.8 + PR #88: живий підстатус консолі Maintenance +
+  PR #89: logs pipeline v2 — усі `*.out` з кореня інсталяції,
+  exchangAPI-архіви з оригінальними іменами на SFTP, структура
+  `logs/trace`/`logs/exchangapi` з одноразовою автоміграцією `trace/`)
+  — acceptance НЕ проводився: кандидата одразу замінено rc.10.
+- `v5.2.0-rc.10` (rc.9 + PR #91: актуалізація release-документації +
+  PR #92: семантичний гейт версії промоції в master і виключення
+  `artifacts\` з генератора runtime-маніфесту) — acceptance НЕ
+  проводився: кандидата одразу замінено rc.11.
+- `v5.2.0-rc.11` (rc.10 + PR #94: компактні Maintenance-алерти —
+  count + ≤5 прикладів замість повних діагностичних списків, повна
+  діагностика лише в журналі — і глобальний payload guard notification-
+  шару: safe limit 1800, одна подія → одне повідомлення на обох
+  транспортах) — на acceptance 2026-08-26 виявлено дефект подвійної
+  реставрації (нижче): кандидата замінено rc.12.
+- `v5.2.0-rc.12` (rc.11 + PR #96: фікс подвійної реставрації після
+  `-ForceRestore` — тижнева квота тепер покриває і «пропущений»
+  минулий слот, `Test-BRAVORestoreWeeklyQuotaConsumed` з <= замість
+  строгої рівності) — на acceptance зафіксовано UX-зауваження до
+  прогресу реставрації: кандидата замінено rc.13.
+- `v5.2.0-rc.13` (rc.12 + PR #98: підетапи у прогресі тривалих
+  native-операцій — «<Фаза> — <Опис операції> — Виконується N сек.»;
+  опис bravocmd-фази без прив'язки до продукту, з фактичним ім'ям
+  проєкту моделі) — **фінальний кандидат циклу; acceptance PASS
+  2026-08-26**: повний maintenance-цикл нової поверхні rc.9-rc.13 на
+  двох реальних серверах (ДНДІЛДВСЕ Server 2022 / Львівська РДЛ,
+  включно з хостом Server 2016 LegacyBestEffort) — перша бойова WinSCP
+  MoveFile-міграція `trace/`→`logs/trace` 4/4, автостворення `logs/*`,
+  скан реальних `*.out`-варіантів, компактні алерти, forced+normal
+  реставрація в один вечір БЕЗ повтору; A2-encoding протокол
+  (RELEASE_CHECKLIST §1.1) PASS в обох консольних контекстах
+  (інтерактивно CP65001, SYSTEM CP866). Зведений evidence:
+  `docs/BRAVO_520_RC13_ACCEPTANCE_EVIDENCE_20260826.md`.
+
+Перенесено на 5.3.0 (додатково до P3.2a/M1/M3 нижче): три відкладені
+Compare-FileSizes-фікси з локальної незапушеної гілки розробника
+(settle-retry, AV-вікно 12×15с, надійна enumeration; збережено в
+`backup/local-developer-rc2-line`) — механічний cherry-pick неможливий
+(функцію двічі переписано в 5.2.0: main-model/сегменти,
+регістронезалежні шляхи), а acceptance rc.8 на сервері інциденту
+пройшов без settle-логіки; залишковий ризик — клас «антивірус тримає
+файли MODEL одразу після bravocmd» на серверах з іншим AV. Там само
+збережено `127e7e4` (діагностика очікування operation-lock) — кандидат
+5.3.0. Решта локальних комітів тієї гілки верифіковано редундантні
+(зміст уже в developer іншими комітами).
+
+Stable `5.1.0` промотовано 2026-08-20 з прийнятого `5.1.0-rc.4`
+(stamp `219c55b`, sourceCommit `d90c3c2`) після ПОВНОГО DEV-LIMS
+acceptance того ж дня (evidence
+`docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md`, гілка
+`evidence/219c55b-rc4-devlims-acceptance-pass`). Шлях циклу:
+rc.1 (інвалідовано фічею DATA_RESTORE) → rc.2 (acceptance PASS, але
+промоцію скасовано: виявлено відсутність порту severity-routing
+PR #39) → rc.3 (порт routing; на acceptance виявлено, що DataRestore
+шле повз routing) → rc.4 (фікс PR #62; повний acceptance PASS) →
+stable 5.1.0.
+
+Цикл `5.2.0-dev.1` відкрито одразу після промоції (розділ 11).
+Записаний борг циклу: дедуплікація service-lifecycle / operation-lock /
+WinSCP-session / ASCII-temp-root політик, декомпозиція
+BRAVO.DataRestore Runtime.ps1, реалізація P3.2a (BRAVO_UPDATE.ps1).
+Розведення імен push- та PR-checks у CI — ВИКОНАНО в dev.1 (під час
+промоційного вікна 5.1.0 однойменний червоний push-run блокував
+required checks гілки master, merge PR #61 виконано admin-обходом;
+тепер required-контексти постачає лише pull_request-прогін, push-прогони
+мають суфікс " (push)").
+
+### Підготовка `5.2.0-rc.1` — рішення про scope (docs-only, без функціональних змін коду)
+
+- **P3.2a (`BRAVO_UPDATE.ps1`) перенесено на `5.3.0`** (див.
+  `ROADMAP.md` §P3.2a). Не входить у RC stabilization: нова поверхня
+  атаки (download/staging/robocopy MIR/rollback/recovery), потребує
+  власного acceptance, який не повинен блокувати вже готовий scope
+  5.2.0. У коді 5.2.0 щодо P3.2a — нуль змін.
+- **M3 (великий рефакторинг) не виконується у RC stabilization
+  5.2.0.** Це стосується боргу циклу вище (dedup service-lifecycle/
+  operation-lock/WinSCP-session, декомпозиція
+  `BRAVO.DataRestore.Runtime.ps1`, перенесення Trace pipeline між
+  модулями) і будь-якого іншого великого structural refactoring без
+  конкретного production-дефекту — переноситься на наступний цикл
+  (переважно `5.3.0`).
+- **M1 (`WinSCP.uk` у `TOOLS_MANIFEST.json`) відкладено на `5.3.0`.**
+  Bundled `WinSCP.exe` підтверджено версії `6.5.6.16502`
+  (`FileVersionInfo`), що відповідає заявленому `WinSCP.uk`. Однак сам
+  `WinSCP.uk` — не PE-файл із version resource, тому його версію/
+  походження неможливо незалежно верифікувати з самого репозиторію.
+  Генератор `ci/Update-BRAVOToolsManifest.ps1` і далі покриває лише
+  `.exe/.dll/.com`; розширення allow-list на `.uk` і додавання
+  `WinSCP.uk` у `TOOLS_MANIFEST.json` — окрема задача 5.3.0 після
+  підтвердження походження файла.
+- **Known issue (не блокер 5.2.0):** приватна
+  `Get-BRAVOSevenZipArchiveInventory`
+  (`modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1`) досі
+  пише пароль у stdin через старий `Process.StandardInput.WriteLine`
+  (BOM-даючий під UTF-8-консоллю), не мігрована на канонічний
+  BOM-free `Write-BRAVOProcessInputText`. Функція й далі коректно
+  читає СТАРІ (pre-5.2.0) архіви, але за певних умов консолі може НЕ
+  прочитати НОВІ архіви (створені вже без BOM) під час free-space
+  preflight реставрації. Мітигація зафіксована як борг циклу
+  декомпозиції DataRestore (CHANGELOG, розділ dev.1) — не виправляється
+  окремо в 5.2.0, щоб не змішувати вузько-скоуповий B2-фікс (легітимний
+  compatibility-фікс) із частковою міграцією дублюючої реалізації
+  (M3-подібний refactoring-ризик).
+
+### Функціональна зміна дефолту під час DEV-LIMS acceptance `5.2.0-rc.1`
+
+- **`RepeatAlertAfterHours` (health-alert дедуп): дефолт `6` → `0`.**
+  Виявлено під час реального DEV-LIMS acceptance (ДНДІЛДВСЕ,
+  2026-08-23): при увімкненому `AutoArchiveMutationThreshold` оператор
+  спостерігав лише перше сповіщення про `MUTATION_VIOLATION`, повторний
+  ідентичний alert протягом наступних до 6 год. мовчав
+  (`Test-AlertSuppressed`, `modules/BRAVO.Health/BRAVO.Health.Runtime.ps1`).
+  Свідоме рішення: дедуп для alert-рівня (WARNING/ERROR/CRITICAL)
+  вимикається за замовчуванням — кожен цикл, поки проблема триває,
+  надсилає сповіщення заново, навіть якщо воно ідентичне попередньому.
+  SUCCESS-звіт дедупу ніколи не підлягав (окрема гілка коду без
+  fingerprint-перевірки) і цією зміною не зачіпається. Це функціональна
+  зміна поведінки за замовчуванням (не docs-only), свідомо застосована
+  до `5.2.0-rc.1` до завершення acceptance і публікації тега/artifact —
+  вимагає перестемпування (`buildId`/`sourceCommit`/`RUNTIME_MANIFEST`)
+  перед тегуванням. Деталі — `CHANGELOG.md` (`## 5.2.0-rc.1`, Upgrade
+  notes).

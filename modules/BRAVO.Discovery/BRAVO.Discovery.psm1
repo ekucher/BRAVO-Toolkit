@@ -424,7 +424,13 @@ function Resolve-BRAVOInstallationDiscovery {
         # Джерело істини для ідентифікації служби BRAVO — Service name
         # ТА Display name одночасно, а не будь-яке з них окремо: сторонній
         # сервіс із випадково схожим ім'ям не повинен пройти як BRAVO.
-        [string]$BravoDisplayName = "BRAVO Service",
+        # Масив, а не один рядок: реальні інсталятори BRAVO/LIMS
+        # використовували різні DisplayName ("BRAVO Service" і
+        # "BRAVO Server" — підтверджено реальним DEV-майданчиком,
+        # 2026-08-24). Точний збіг з БУДЬ-ЯКИМ значенням зі списку — не
+        # ослаблення: це той самий строгий exact-match, лише допускає
+        # кілька відомих канонічних варіантів написання.
+        [string[]]$BravoDisplayName = @("BRAVO Service", "BRAVO Server"),
         [string[]]$WebServiceCandidates = @(),
         [string]$ExchangeApiServiceName,
         [object[]]$Services,
@@ -470,7 +476,7 @@ function Resolve-BRAVOInstallationDiscovery {
         -ServiceCandidates $bravoServiceSearchCandidates `
         -Services $Services
     $bravoServices = @($bravoServicesFound | Where-Object {
-        $_.Name -ieq $BravoServiceName -and $_.DisplayName -ieq $BravoDisplayName
+        $_.Name -ieq $BravoServiceName -and @($BravoDisplayName) -icontains $_.DisplayName
     })
     $bravoServiceMatch = $bravoServices | Select-Object -First 1
     # AUD-007 (аудит P1.1): кілька служб BRAVO з РІЗНИМИ виконуваними
@@ -1065,7 +1071,14 @@ function Resolve-BRAVOEffectiveLimsRoot {
     param(
         [string]$ConfiguredPath,
         [string]$BravoServiceName = "BRAVO",
-        [string]$BravoDisplayName = "BRAVO Service",
+        # Масив, а не один рядок: реальні інсталятори BRAVO/LIMS
+        # використовували різні DisplayName ("BRAVO Service" і
+        # "BRAVO Server" — підтверджено реальним DEV-майданчиком,
+        # 2026-08-24). Точний збіг з БУДЬ-ЯКИМ значенням зі списку — не
+        # ослаблення identity-перевірки, лише допускає кілька відомих
+        # канонічних варіантів написання (той самий підхід, що й у
+        # Resolve-BRAVOInstallationDiscovery).
+        [string[]]$BravoDisplayName = @("BRAVO Service", "BRAVO Server"),
         [object[]]$Services
     )
 
@@ -1103,7 +1116,7 @@ function Resolve-BRAVOEffectiveLimsRoot {
 
     $canonical = @(
         $Services | Where-Object {
-            $_.Name -ieq $BravoServiceName -and $_.DisplayName -ieq $BravoDisplayName
+            $_.Name -ieq $BravoServiceName -and @($BravoDisplayName) -icontains $_.DisplayName
         } | ForEach-Object {
             [pscustomobject]@{
                 Name = [string]$_.Name
@@ -1116,7 +1129,7 @@ function Resolve-BRAVOEffectiveLimsRoot {
     )
 
     if ($canonical.Count -eq 0) {
-        return (& $buildResult $null 'Error' $null "службу BRAVO (Name='$BravoServiceName', DisplayName='$BravoDisplayName') не знайдено або вона без виконуваного файла; задайте pathSettings.LIMSRoot явно")
+        return (& $buildResult $null 'Error' $null "службу BRAVO (Name='$BravoServiceName', DisplayName один із: '$(@($BravoDisplayName) -join "', '")') не знайдено або вона без виконуваного файла; задайте pathSettings.LIMSRoot явно")
     }
 
     $distinctExecutables = @($canonical | Select-Object -ExpandProperty ExecutablePath -Unique)
