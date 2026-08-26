@@ -493,6 +493,20 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "DryRun/ModeLabelReflectsWriteProbes" `
         -Failure "з -TestAccess прогін робить локальні проби запису і створює каталоги на SFTP, тому заголовок не має безумовно повідомляти оператору READ-ONLY"
 
+    # P2-знахідка acceptance 5.2.0: тестове повідомлення -SendTestNotification
+    # завжди йшло в ALERTS, бо Test-DryRunWebhookCredential ітерував маршрути
+    # у порядку ('alerts','general') і ПЕРШИЙ resolved осідав у слот, з
+    # якого шлеться тест. SUCCESS-семантика канонічно належить GENERAL —
+    # 'general' мусить стояти першим (fallback на legacy/alerts зберігається).
+    # BRAVO_SETUP і BRAVO_TASKS_DIAGNOSE успадковують (шлють через dry-run).
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunScriptTextForSftp.Contains("foreach (`$route in @('general', 'alerts'))") -and
+            -not $dryRunScriptTextForSftp.Contains("foreach (`$route in @('alerts', 'general'))")
+        ) `
+        -Name "DryRun/TestNotificationPrefersGeneralRoute" `
+        -Failure "Test-DryRunWebhookCredential має резолвити маршрут 'general' першим — тестове SUCCESS-повідомлення належить GENERAL, а не ALERTS"
+
     # --- RELEASE_POLICY.md розділ 16: dev/RC-релізи мають бути позначені як
     # pre-release, і лише stable може бути Latest. Без --prerelease workflow
     # створював чернетку RC як звичайний реліз, і після публікації неприйнятий

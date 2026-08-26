@@ -497,7 +497,15 @@ function Test-DryRunWebhookCredential {
     $credentialTargets = Get-NotificationCredentialTargetTable
     $resolvedRoutes = New-Object System.Collections.Generic.List[string]
     $failedRoutes = New-Object System.Collections.Generic.List[string]
-    foreach ($route in @('alerts', 'general')) {
+    # Порядок 'general' першим — НЕ лише косметика: перший resolved route
+    # осідає у слот $CredentialValues[Kind], звідки -SendTestNotification
+    # бере URL для тестового повідомлення. Тестове повідомлення має
+    # SUCCESS-семантику, а SUCCESS канонічно належить GENERAL
+    # (P2-знахідка acceptance 5.2.0: тест завжди падав у ALERTS, бо
+    # 'alerts' стояв першим). Fallback лишається: без general-target
+    # Resolve-BRAVONotificationEndpoint сам відкочується на legacy
+    # provider-wide webhook, а якщо і його немає — 'alerts' нижче.
+    foreach ($route in @('general', 'alerts')) {
         $secret = $null
         try {
             $secret = Resolve-BRAVONotificationEndpoint `
