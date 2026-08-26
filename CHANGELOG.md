@@ -4,7 +4,28 @@
 
 ---
 
-## 5.2.1-rc.2 — 2026-08-26 (hotfix candidate, pending acceptance)
+## 5.2.1-rc.3 — 2026-08-26 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.2 + одноразова міграція legacy-розкладки архівів MODEL
+(запит власника: старі сервери ARCHIV_LIMS-ери тримають архіви у
+`<BackupRoot>\ARCHIV\LIMS` локально і в `archiv` на SFTP):
+
+- **FEATURE (maintenance): міграція legacy-архівів MODEL.** Щонічний
+  Maintenance best-effort переносить вміст `<BackupRoot>\ARCHIV\LIMS` →
+  `<BackupRoot>\MODEL` (пофайлово, без перезаписів/видалень; колізія
+  імені — WARNING, старий файл лишається; спорожнілі `LIMS` і батько
+  `ARCHIV` прибираються) і `archiv` → `model` на SFTP (канонічний
+  механізм trace-міграції, `.mdz`/`.sha512`; колізія — WARNING без
+  критичного статусу). Idempotent: після повного переносу — no-op.
+
+Acceptance rc.3 (додатково до сценаріїв rc.2): на legacy-сервері після
+нічного Maintenance — архіви з `ARCHIV\LIMS` у `MODEL`, з `archiv` у
+`model`; порожні legacy-каталоги зникли; retention/Health бачать повну
+історію.
+
+---
+
+## 5.2.1-rc.2 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.3)
 
 Hotfix-кандидат лінії 5.2.x = rc.1 + другий операторський фікс,
 відтворений власником на тому самому сервері (Тернопіль):
