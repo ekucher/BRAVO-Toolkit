@@ -4025,7 +4025,14 @@ function Invoke-BRAVOTraceRemoteLogMigration {
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][string]$LegacyDirectory,
         [Parameter(Mandatory = $true)][string]$TargetDirectory,
-        [AllowNull()][scriptblock]$Logger
+        [AllowNull()][scriptblock]$Logger,
+        # 5.2.1: рівень колізії імені в цільовому каталозі. 'ERROR' (дефолт,
+        # семантика trace-міграції незмінна) рахує колізію в Errors;
+        # 'WARNING' (міграція legacy archiv -> model, рішення власника)
+        # лишає файл на місці з попередженням, без Errors — колізія там
+        # означає, що АКТУАЛЬНІША копія вже в цілі, і це не привід для
+        # критичного статусу прогону.
+        [ValidateSet('ERROR', 'WARNING')][string]$ConflictLevel = 'ERROR'
     )
 
     $result = [pscustomobject]@{
@@ -4068,9 +4075,14 @@ function Invoke-BRAVOTraceRemoteLogMigration {
             try {
                 if ($Session.FileExists($targetPath)) {
                     $result.Conflicts++
-                    $result.Errors++
-                    Write-BRAVOLogRotationMessage -Logger $Logger `
-                        -Message "ПОМИЛКА: міграція SFTP — у $targetRoot вже існує $($legacyFile.Name); файл залишено в $legacyRoot (нічого не перезаписано)" -Level "ERROR"
+                    if ($ConflictLevel -eq 'ERROR') {
+                        $result.Errors++
+                        Write-BRAVOLogRotationMessage -Logger $Logger `
+                            -Message "ПОМИЛКА: міграція SFTP — у $targetRoot вже існує $($legacyFile.Name); файл залишено в $legacyRoot (нічого не перезаписано)" -Level "ERROR"
+                    } else {
+                        Write-BRAVOLogRotationMessage -Logger $Logger `
+                            -Message "Міграція SFTP: у $targetRoot вже існує $($legacyFile.Name); файл залишено в $legacyRoot (нічого не перезаписано)" -Level "WARNING"
+                    }
                     continue
                 }
                 $Session.MoveFile($sourcePath, $targetPath)
@@ -4096,6 +4108,87 @@ function Invoke-BRAVOTraceRemoteLogMigration {
         $result.Errors++
         Write-BRAVOLogRotationMessage -Logger $Logger `
             -Message "ПОМИЛКА: міграція SFTP $legacyRoot -> $targetRoot не виконана: $($_.Exception.Message)" -Level "ERROR"
+    }
+    return $result
+}
+
+function Invoke-BRAVOLegacyModelArchiveLocalMigration {
+    # Одноразова (idempotent) міграція legacy-розкладки локальних архівів
+    # MODEL: старий комплект (ARCHIV_LIMS-ера) писав архіви у
+    # <BackupRoot>\ARCHIV\LIMS, поточний — у <BackupRoot>\MODEL. Переносимо
+    # вміст пофайлово (той самий принцип, що SFTP-міграція trace/ вище):
+    # НІЧОГО не перезаписуємо і не видаляємо — колізія імені лишає старий
+    # файл на місці з WARNING (рішення власника 2026-08-26); невдалий
+    # перенос (файл залочено) — WARNING, наступний нічний прогін повторить.
+    # Порожній legacy-каталог (і його порожній батько ARCHIV) прибираються.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LegacyDirectory,
+        [Parameter(Mandatory = $true)][string]$TargetDirectory
+    )
+
+    $result = [pscustomobject]@{
+        Attempted = 0
+        Moved = 0
+        Conflicts = 0
+        Errors = 0
+    }
+
+    try {
+        if (-not (Test-Path -LiteralPath $LegacyDirectory -PathType Container)) {
+            return $result
+        }
+        $legacyFiles = @((New-Object System.IO.DirectoryInfo($LegacyDirectory)).EnumerateFiles())
+        if (@($legacyFiles).Count -gt 0) {
+            Write-Log -Message ("Міграція legacy-архівів MODEL: $LegacyDirectory -> $TargetDirectory — " +
+                "файлів до перенесення: $(@($legacyFiles).Count)") -Level "INFO"
+            if (-not (Test-Path -LiteralPath $TargetDirectory -PathType Container)) {
+                [void](New-Item -ItemType Directory -Path $TargetDirectory -Force -ErrorAction Stop)
+            }
+            foreach ($legacyFile in $legacyFiles) {
+                $result.Attempted++
+                $targetPath = Join-Path $TargetDirectory $legacyFile.Name
+                try {
+                    if (Test-Path -LiteralPath $targetPath) {
+                        $result.Conflicts++
+                        Write-Log -Message ("Міграція legacy-архівів MODEL: у $TargetDirectory вже існує " +
+                            "$($legacyFile.Name); файл залишено в $LegacyDirectory (нічого не перезаписано)") -Level "WARNING"
+                        continue
+                    }
+                    [System.IO.File]::Move($legacyFile.FullName, $targetPath)
+                    $result.Moved++
+                } catch {
+                    $result.Errors++
+                    Write-Log -Message ("Міграція legacy-архівів MODEL: не вдалося перенести " +
+                        "$($legacyFile.Name): $($_.Exception.Message) — файл залишено, наступний прогін повторить") -Level "WARNING"
+                }
+            }
+            Write-Log -Message ("Міграція legacy-архівів MODEL завершена: перенесено $($result.Moved) з " +
+                "$($result.Attempted); колізій: $($result.Conflicts); помилок: $($result.Errors)") `
+                -Level $(if ([int]$result.Errors -gt 0 -or [int]$result.Conflicts -gt 0) { 'WARNING' } else { 'INFO' })
+        }
+
+        # Прибирання порожніх legacy-каталогів: спершу LIMS, потім батько
+        # ARCHIV — лише коли вони СПРАВДІ порожні (жодних файлів і
+        # підкаталогів; будь-який залишок робить прибирання неможливим і
+        # видимим у лозі вище — нічого не видаляємо рекурсивно).
+        $legacyDirectoryInfo = New-Object System.IO.DirectoryInfo($LegacyDirectory)
+        if ($legacyDirectoryInfo.Exists -and
+            @($legacyDirectoryInfo.EnumerateFileSystemInfos()).Count -eq 0) {
+            $legacyDirectoryInfo.Delete()
+            Write-Log -Message "Порожній legacy-каталог видалено: $LegacyDirectory" -Level "INFO"
+            $legacyParent = $legacyDirectoryInfo.Parent
+            if ($null -ne $legacyParent -and $legacyParent.Exists -and
+                [string]::Equals($legacyParent.Name, 'ARCHIV', [System.StringComparison]::OrdinalIgnoreCase) -and
+                @($legacyParent.EnumerateFileSystemInfos()).Count -eq 0) {
+                $legacyParent.Delete()
+                Write-Log -Message "Порожній legacy-каталог видалено: $($legacyParent.FullName)" -Level "INFO"
+            }
+        }
+    } catch {
+        $result.Errors++
+        Write-Log -Message ("Міграція legacy-архівів MODEL не виконана: $($_.Exception.Message) — " +
+            "наявні архіви не зачеплено, наступний прогін повторить") -Level "WARNING"
     }
     return $result
 }
@@ -8237,6 +8330,17 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
 # обробляються у фоні цього ж запуску. SFTP-збій тут не блокує решту
 # Maintenance: файли лишаються, retry — наступним прогоном.
 Write-BRAVOProgressPhase -Phase 'Trace: добовий архів і SFTP' -PercentComplete 84
+# Одноразова (idempotent) міграція legacy-розкладки локальних архівів
+# MODEL: <BackupRoot>\ARCHIV\LIMS -> <BackupRoot>\MODEL (старий комплект
+# ARCHIV_LIMS-ери). Best-effort: помилки — WARNING, наступний нічний
+# прогін повторить; функція no-op, коли legacy-каталогу немає (тобто на
+# всіх уже мігрованих/нових серверах). Віддалена частина (archiv ->
+# model) — нижче, у SFTP-сесії Trace-блоку.
+$legacyModelLocalDirectory = [System.IO.Path]::Combine([string]$backupRootPath, 'ARCHIV', 'LIMS')
+[void](Invoke-BRAVOLegacyModelArchiveLocalMigration `
+    -LegacyDirectory $legacyModelLocalDirectory `
+    -TargetDirectory ([string]$archiveDirs.Model))
+
 $script:currentMaintenanceOperation = 'Trace: добовий архів і SFTP'
 $traceArchiveOperationStartedAt = Get-Date
 $traceArchiveCriticalBefore = $script:criticalErrorOccurred
@@ -8322,6 +8426,22 @@ if (-not $BravoMaintenanceEnabled) {
             if ([int]$traceMigrationResult.Errors -gt 0) {
                 $script:criticalErrorOccurred = $true
             }
+
+            # Одноразова (idempotent) міграція legacy-архівів MODEL на SFTP:
+            # archiv -> model (той самий канонічний механізм, що trace/ вище;
+            # фільтр .mdz/.sha512 покриває архіви MODEL). ConflictLevel
+            # WARNING (рішення власника): колізія означає, що актуальніша
+            # копія вже в model — файл лишається в archiv без критичного
+            # статусу. Помилки переносу логуються самою функцією рядками
+            # «ПОМИЛКА: міграція SFTP...»; статус прогону свідомо НЕ
+            # ескалюється (на відміну від trace-міграції вище): legacy-
+            # перенос — best-effort і повториться наступної ночі.
+            [void](Invoke-BRAVOTraceRemoteLogMigration `
+                -Session $traceSftpSession `
+                -LegacyDirectory 'archiv' `
+                -TargetDirectory ([string]$sftpDirectories.MODEL) `
+                -Logger $bravoLogRotationLogger `
+                -ConflictLevel 'WARNING')
         }
 
         $traceMaintenanceResult = Invoke-BRAVOTraceArchiveMaintenance `

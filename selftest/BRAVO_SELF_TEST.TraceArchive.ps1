@@ -65,6 +65,7 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             "Send-BRAVOTraceArchiveFile",
             "Send-BRAVOTraceArchive",
             "Invoke-BRAVOTraceRemoteLogMigration",
+            "Invoke-BRAVOLegacyModelArchiveLocalMigration",
             "Invoke-BRAVOTraceArchiveMaintenance"
         )
 
@@ -467,6 +468,74 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             [int]$taMigrationEmptyResult.Attempted -eq 0 -and
             [int]$taMigrationEmptyResult.Errors -eq 0
         ) -Name 'TraceArchive/RemoteMigrationNoLegacyDirectoryIsNoop' -Failure "відсутній legacy-каталог /trace = no-op без помилок; факт: attempted=$($taMigrationEmptyResult.Attempted) errors=$($taMigrationEmptyResult.Errors)"
+
+        # ===== Міграція legacy MODEL: archiv -> model, ConflictLevel WARNING =====
+        # (5.2.1) Колізія імені при -ConflictLevel WARNING лишає файл на
+        # місці БЕЗ Errors — актуальніша копія вже в цілі, статус прогону
+        # не ескалюється (рішення власника; trace-семантика ERROR незмінна —
+        # сценарій RemoteMigrationConflictFailsClosed вище).
+        $taModelMigrationConflictSession = New-BRAVOSelfTestFakeBazaSession
+        [void]$taModelMigrationConflictSession.State.KnownRemoteDirs.Add('/archiv')
+        $taModelMigrationConflictSession.State.RemoteSizes['/archiv/MODEL_20260810_010000.mdz'] = [int64]444
+        $taModelMigrationConflictSession.State.RemoteSizes['/archiv/MODEL_20260811_010000.mdz'] = [int64]555
+        $taModelMigrationConflictSession.State.RemoteSizes['/model/MODEL_20260811_010000.mdz'] = [int64]666
+        $taModelMigrationConflictResult = & $traceArchiveModule { param($s) Invoke-BRAVOTraceRemoteLogMigration -Session $s -LegacyDirectory 'archiv' -TargetDirectory 'model' -ConflictLevel 'WARNING' } $taModelMigrationConflictSession
+        Test-BRAVOCondition -Condition (
+            [int]$taModelMigrationConflictResult.Moved -eq 1 -and
+            [int]$taModelMigrationConflictResult.Conflicts -eq 1 -and
+            [int]$taModelMigrationConflictResult.Errors -eq 0 -and
+            $taModelMigrationConflictSession.State.RemoteSizes.ContainsKey('/model/MODEL_20260810_010000.mdz') -and
+            [int64]$taModelMigrationConflictSession.State.RemoteSizes['/model/MODEL_20260811_010000.mdz'] -eq 666 -and
+            $taModelMigrationConflictSession.State.RemoteSizes.ContainsKey('/archiv/MODEL_20260811_010000.mdz')
+        ) -Name 'TraceArchive/ModelRemoteMigrationConflictIsWarningNotError' -Failure "archiv->model з ConflictLevel WARNING: неконфліктний файл перенесено, колізія лишає обидві копії без Errors; факт: moved=$($taModelMigrationConflictResult.Moved) conflicts=$($taModelMigrationConflictResult.Conflicts) errors=$($taModelMigrationConflictResult.Errors)"
+
+        # ===== Локальна міграція <BackupRoot>\ARCHIV\LIMS -> <BackupRoot>\MODEL =====
+        $taLocalMigrationRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MODELMIG_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+        try {
+            $taLocalLegacy = Join-Path $taLocalMigrationRoot 'ARCHIV\LIMS'
+            $taLocalTarget = Join-Path $taLocalMigrationRoot 'MODEL'
+            [void][IO.Directory]::CreateDirectory($taLocalLegacy)
+            [void][IO.Directory]::CreateDirectory($taLocalTarget)
+            [IO.File]::WriteAllText((Join-Path $taLocalLegacy 'MODEL_20260810_010000.mdz'), 'legacy-a')
+            [IO.File]::WriteAllText((Join-Path $taLocalLegacy 'MODEL_20260811_010000.mdz'), 'legacy-b')
+            [IO.File]::WriteAllText((Join-Path $taLocalTarget 'MODEL_20260811_010000.mdz'), 'newer-copy')
+            $taLocalMigrationResult = & $traceArchiveModule { param($l, $t) Invoke-BRAVOLegacyModelArchiveLocalMigration -LegacyDirectory $l -TargetDirectory $t } $taLocalLegacy $taLocalTarget
+            Test-BRAVOCondition -Condition (
+                [int]$taLocalMigrationResult.Moved -eq 1 -and
+                [int]$taLocalMigrationResult.Conflicts -eq 1 -and
+                [int]$taLocalMigrationResult.Errors -eq 0 -and
+                (Test-Path (Join-Path $taLocalTarget 'MODEL_20260810_010000.mdz')) -and
+                ([IO.File]::ReadAllText((Join-Path $taLocalTarget 'MODEL_20260811_010000.mdz')) -eq 'newer-copy') -and
+                (Test-Path (Join-Path $taLocalLegacy 'MODEL_20260811_010000.mdz')) -and
+                (Test-Path $taLocalLegacy)
+            ) -Name 'TraceArchive/ModelLocalMigrationMovesAndPreservesConflicts' -Failure "локальна міграція: неконфліктний файл перенесено, колізія лишає ОБИДВІ копії без перезапису, непорожній legacy-каталог зберігається; факт: moved=$($taLocalMigrationResult.Moved) conflicts=$($taLocalMigrationResult.Conflicts) errors=$($taLocalMigrationResult.Errors)"
+
+            # Другий прогін: конфліктний файл прибрано вручну -> каталоги
+            # порожніють і видаляються (LIMS, потім батько ARCHIV).
+            Remove-Item -LiteralPath (Join-Path $taLocalLegacy 'MODEL_20260811_010000.mdz') -Force
+            $taLocalCleanupResult = & $traceArchiveModule { param($l, $t) Invoke-BRAVOLegacyModelArchiveLocalMigration -LegacyDirectory $l -TargetDirectory $t } $taLocalLegacy $taLocalTarget
+            Test-BRAVOCondition -Condition (
+                [int]$taLocalCleanupResult.Errors -eq 0 -and
+                -not (Test-Path $taLocalLegacy) -and
+                -not (Test-Path (Join-Path $taLocalMigrationRoot 'ARCHIV'))
+            ) -Name 'TraceArchive/ModelLocalMigrationRemovesEmptiedLegacyDirs' -Failure "порожні legacy-каталоги LIMS і батько ARCHIV мають видалятись після повного переносу; факт: legacyExists=$(Test-Path $taLocalLegacy) archivExists=$(Test-Path (Join-Path $taLocalMigrationRoot 'ARCHIV'))"
+
+            $taLocalNoopResult = & $traceArchiveModule { param($l, $t) Invoke-BRAVOLegacyModelArchiveLocalMigration -LegacyDirectory $l -TargetDirectory $t } $taLocalLegacy $taLocalTarget
+            Test-BRAVOCondition -Condition (
+                [int]$taLocalNoopResult.Attempted -eq 0 -and [int]$taLocalNoopResult.Errors -eq 0
+            ) -Name 'TraceArchive/ModelLocalMigrationNoLegacyDirectoryIsNoop' -Failure "відсутній legacy-каталог = no-op без помилок; факт: attempted=$($taLocalNoopResult.Attempted) errors=$($taLocalNoopResult.Errors)"
+        } finally {
+            Remove-Item -LiteralPath $taLocalMigrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        # ===== Статичні контракти call-site'ів міграції MODEL у Maintenance =====
+        Test-BRAVOCondition -Condition (
+            $traceArchiveScriptText.Contains("[System.IO.Path]::Combine([string]`$backupRootPath, 'ARCHIV', 'LIMS')") -and
+            $traceArchiveScriptText.Contains('Invoke-BRAVOLegacyModelArchiveLocalMigration') -and
+            $traceArchiveScriptText.Contains("-LegacyDirectory 'archiv' ``") -and
+            $traceArchiveScriptText.Contains('-TargetDirectory ([string]$sftpDirectories.MODEL) `') -and
+            $traceArchiveScriptText.Contains("-ConflictLevel 'WARNING'")
+        ) -Name 'TraceArchive/ModelLegacyMigrationWiredIntoMaintenance' -Failure "Maintenance має викликати локальну міграцію <BackupRoot>\ARCHIV\LIMS -> archiveDirs.Model і SFTP-міграцію archiv -> sftpDirectories.MODEL з ConflictLevel WARNING"
 
         # ===== Статичні гейти: dry-run PLAN-рядки + єдина реалізація =====
         $taDryRunText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_DRY_RUN.ps1'), [Text.Encoding]::UTF8)
