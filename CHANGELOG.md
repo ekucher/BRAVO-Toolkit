@@ -2,6 +2,27 @@
 
 ## Не випущено (developer)
 
+- **FEATURE (P2.1, status contract): machine-readable статус останніх
+  прогонів.** Новий тонкий модуль `BRAVO.Status` (schemaVersion 1) —
+  канонічний власник контракту: Archive, Health, Maintenance і
+  RestoreVerify після обчислення exit code атомарно пишуть
+  `%ProgramData%\BRAVO\State\STATUS\BRAVO_STATUS_<Operation>.json`
+  (спільне ядро: host/packageVersion/operation/status/exitCode/
+  exitCodeName/startedAt/finishedAt/durationSeconds + операційні
+  `details`; Health додатково несе lastCompleteGeneration/
+  lastRestoreVerifiedAt/localVerified/sftpVerified/smbVerified/
+  runtimeIntegrity/toolIntegrity — ескіз ROADMAP P2.1). Інваріанти:
+  fail-soft (помилка запису лише WARNING-лог, ніколи не змінює exit
+  code/результат операції — покрито самотестами CallSiteIsFailSoft для
+  всіх 4 call-site'ів), status = проєкція exitCode (0=OK, 10=WARNINGS,
+  інше=ERROR; деривація в одному місці), жодних secret-bearing значень
+  (самотест), fail-closed читання невідомої schemaVersion. Archive
+  пише статус і при фатальному краху (ERROR/90 best-effort); Maintenance
+  — і на ранньому виході disk-preflight; вбудований у Archive
+  Health-виклик статус НЕ пише (не перезаписує самостійний прогін).
+  Транспорт/моніторинг (Zabbix/outbox, P2.2) свідомо не входить —
+  контракт локальний. Регресії: `selftest\BRAVO_SELF_TEST.Status.ps1`.
+
 - **FEATURE (P1.1, restore verification): планова перевірка
   відновлюваності `BRAVO_RESTORE_VERIFY`.** Новий тип задачі Планувальника
   `RestoreVerify` (weekly-тригер, типово Сб 04:00;

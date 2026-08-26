@@ -220,6 +220,69 @@ function Complete-BRAVOHealthResult {
     }
     $script:healthRuntimeExitCode = $healthExitCode
 
+    # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
+    # пишеться ПІСЛЯ обчислення exit code і fail-soft — помилка запису
+    # лише логується і НІКОЛИ не змінює результат Health (інваріант
+    # «telemetry не змінює exit code»). Вбудований виклик з Archive
+    # (-SuppressHeader) статус НЕ пише: інакше він перезаписував би
+    # результат останнього самостійного Health-прогону. Поля деталей
+    # best-effort: на ранніх виходах (config не завантажено) відсутні
+    # значення лишаються порожніми/null, а недоступний $stateRoot
+    # коректно перехоплюється зовнішнім catch.
+    # ([bool]-форма guard-а навмисно відрізняється ТЕКСТУАЛЬНО від guard-а
+    # консольного підсумку нижче: контракт Health/EmbeddedCallSuppressesOwnSummary
+    # аналізує перші входження точних рядків того блоку і не повинен
+    # зачепити цей телеметричний блок — тому тут жодних згадок імен
+    # функцій консольного підсумку.)
+    if (-not [bool]$SuppressHeader) {
+        try {
+            $statusLastCompleteGeneration = ''
+            try {
+                $statusLastCompleteGeneration = [string](Get-BRAVORestoreGenerationManifest `
+                    -BackupRoot $backupRootPath).Manifest.generationId
+            } catch {
+                $statusLastCompleteGeneration = ''
+            }
+            $statusLastRestoreVerifiedAt = ''
+            try {
+                $statusRestoreVerifyState = Get-BRAVORestoreVerifyState `
+                    -Path (Get-BRAVORestoreVerifyStatePath -StateRoot $stateRoot)
+                if ($statusRestoreVerifyState.Exists -and -not $statusRestoreVerifyState.Corrupt) {
+                    $statusLastRestoreVerifiedAt = [string]$statusRestoreVerifyState.State.LastVerifiedAt
+                }
+            } catch {
+                $statusLastRestoreVerifiedAt = ''
+            }
+            $statusDetails = @{
+                issueCount = if ($null -ne $Result.PSObject.Properties['IssueCount']) { [int]$Result.IssueCount } else { $null }
+                localVerified = if ($null -ne $Result.PSObject.Properties['LocalVerified']) { [bool]$Result.LocalVerified } else { $null }
+                sftpVerified = if ($null -ne $Result.PSObject.Properties['SftpVerified']) { [bool]$Result.SftpVerified } else { $null }
+                smbVerified = if ($null -ne $Result.PSObject.Properties['SmbVerified']) { [bool]$Result.SmbVerified } else { $null }
+                runtimeIntegrity = if ($env:BRAVO_RUNTIME_INTEGRITY_MODE -eq 'Warn') { 'UNVERIFIED' } else { 'OK' }
+                toolIntegrity = if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) { 'VIOLATION' } else { 'OK' }
+                lastCompleteGeneration = $statusLastCompleteGeneration
+                lastRestoreVerifiedAt = $statusLastRestoreVerifiedAt
+            }
+            Write-BRAVOOperationStatus `
+                -StateRoot $stateRoot `
+                -Operation Health `
+                -ExitCode $healthExitCode `
+                -ExitCodeName (Get-BRAVOExitCodeName -Code $healthExitCode) `
+                -StartedAt $healthCheckStarted `
+                -Details $statusDetails
+        } catch {
+            # Ранні виходи (config не завантажено) стаються ДО оголошення
+            # Write-HealthLog — catch мусить бути самодостатнім, інакше
+            # телеметрична помилка зламала б сам шлях виходу.
+            $statusWriteFailureMessage = "Не вдалося записати machine-readable status-файл Health: $($_.Exception.Message)"
+            if (Get-Command -Name Write-HealthLog -CommandType Function -ErrorAction SilentlyContinue) {
+                Write-HealthLog $statusWriteFailureMessage -Level WARNING -Environmental
+            } else {
+                Write-Warning $statusWriteFailureMessage
+            }
+        }
+    }
+
     # Через цю функцію проходить КОЖЕН шлях виходу Health, тому підсумок тут
     # неможливо забути додати в новій гілці — на відміну від друку підсумку
     # в кінці основного потоку.
@@ -361,7 +424,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify', 'BRAVO.Status')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"

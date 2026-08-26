@@ -461,7 +461,8 @@ function Test-SchedulerConfiguration {
         'BRAVO.Maintenance',
         'BRAVO.HelperLogging',
         'BRAVO.System',
-        'BRAVO.RestoreVerify'
+        'BRAVO.RestoreVerify',
+        'BRAVO.Status'
     )
     foreach ($moduleName in $requiredModuleNames) {
         $manifestPath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"

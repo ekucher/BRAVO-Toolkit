@@ -24,7 +24,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -7749,6 +7749,36 @@ function Main {
         $script:processExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
 
+    # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
+    # ПІСЛЯ обчислення exit code, fail-soft — помилка запису лише
+    # логується і ніколи не змінює результат Archive (інваріант
+    # «telemetry не змінює exit code»).
+    try {
+        $statusComponentsTotal = @($archiveDefinitions | Where-Object { [bool]$_.Enabled }).Count
+        $statusComponentsSucceeded = @($results.Values | Where-Object { [bool]$_.ArchiveSuccess }).Count
+        $statusTotalCreatedBytes = [long]0
+        foreach ($statusComponentResult in $results.Values) {
+            if ($null -ne $statusComponentResult.Bytes) {
+                $statusTotalCreatedBytes += [long]$statusComponentResult.Bytes
+            }
+        }
+        Write-BRAVOOperationStatus `
+            -StateRoot $stateRoot `
+            -Operation Archive `
+            -ExitCode $script:processExitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $script:processExitCode) `
+            -StartedAt $scriptStartTime `
+            -Details @{
+                generationId = [string]$script:backupGenerationId
+                generationStatus = [string]$script:backupGenerationStatus
+                componentsSucceeded = $statusComponentsSucceeded
+                componentsTotal = $statusComponentsTotal
+                totalCreatedBytes = $statusTotalCreatedBytes
+            }
+    } catch {
+        Write-Log "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Archive: $($_.Exception.Message)"
+    }
+
     # Причина/Інструмент/Код інструменту показуються лише коли головний
     # результат дійсно спричинений конкретним локальним компонентом
     # (docs/MANUAL_RUN_CONSOLE_UX.md) — перший відмовлений компонент за
@@ -7889,6 +7919,21 @@ try {
     $fatalErrorRecord = $_
     $fatalMessage = [string]$fatalErrorRecord.Exception.Message
     $script:processExitCode = 90
+    # Best-effort machine-readable статус і при фатальному краху (P2.1):
+    # без нього моніторинг бачив би застарілий "OK" від попереднього
+    # прогону. Мовчазний catch — крах може статися до завантаження
+    # конфігурації ($stateRoot) чи модуля статусу.
+    try {
+        Write-BRAVOOperationStatus `
+            -StateRoot $stateRoot `
+            -Operation Archive `
+            -ExitCode 90 `
+            -ExitCodeName 'InternalError' `
+            -StartedAt $(if (Test-Path variable:scriptStartTime) { $scriptStartTime } else { Get-Date }) `
+            -Details @{ fatal = $true }
+    } catch {
+        # Первинний exception важливіший — не маскуємо його телеметрією.
+    }
     try {
         Write-BRAVOArchiveFatalDiagnostics `
             -ErrorRecord $fatalErrorRecord `

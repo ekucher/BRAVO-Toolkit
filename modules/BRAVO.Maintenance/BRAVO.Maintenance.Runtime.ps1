@@ -37,7 +37,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
 # проти другої власної реалізації; нейтральний власник SFTP-примітивів —
 # тема окремого рефактора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -6867,6 +6867,26 @@ if (-not $spaceCheckResult) {
     Write-Log -Message "Критична помилка перевірки місця. Завершення скрипта." -Level "ERROR"
     $diskPreflightExitCode = Get-BRAVOMaintenanceResolvedExitCode
     $script:maintenanceRuntimeExitCode = $diskPreflightExitCode
+    # Ранній вихід оминає фінальний блок — machine-readable статус (P2.1)
+    # пишеться й тут, fail-soft (див. коментар у фінальному блоці).
+    try {
+        Write-BRAVOOperationStatus `
+            -StateRoot $stateRoot `
+            -Operation Maintenance `
+            -ExitCode $diskPreflightExitCode `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $diskPreflightExitCode) `
+            -StartedAt $script:ScriptStartTime `
+            -Details @{
+                stepsTotal = [int]$script:BRAVOMaintenanceStepLog.Count
+                stepsOk = [int]$script:BRAVOMaintenanceStepOkCount
+                stepsWarning = [int]$script:BRAVOMaintenanceStepWarnCount
+                stepsSkipped = [int]$script:BRAVOMaintenanceStepSkippedCount
+                stepsError = [int]$script:BRAVOMaintenanceStepFailCount
+                criticalErrorOccurred = [bool]$script:criticalErrorOccurred
+            }
+    } catch {
+        Write-Log -Message "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Maintenance: $($_.Exception.Message)"
+    }
     Write-BRAVOMaintenanceEarlyFailureSummary `
         -EndedAt (Get-Date) `
         -ExitCode $diskPreflightExitCode
@@ -8886,6 +8906,30 @@ $script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
 
 $maintenanceEndedAt = Get-Date
 $totalTime = $maintenanceEndedAt - $script:ScriptStartTime
+
+# Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
+# ПІСЛЯ резолву exit code, fail-soft — помилка запису лише логується і
+# ніколи не змінює результат Maintenance (інваріант «telemetry не змінює
+# exit code»).
+try {
+    Write-BRAVOOperationStatus `
+        -StateRoot $stateRoot `
+        -Operation Maintenance `
+        -ExitCode $script:maintenanceRuntimeExitCode `
+        -ExitCodeName (Get-BRAVOExitCodeName -Code $script:maintenanceRuntimeExitCode) `
+        -StartedAt $script:ScriptStartTime `
+        -FinishedAt $maintenanceEndedAt `
+        -Details @{
+            stepsTotal = [int]$script:BRAVOMaintenanceStepLog.Count
+            stepsOk = [int]$script:BRAVOMaintenanceStepOkCount
+            stepsWarning = [int]$script:BRAVOMaintenanceStepWarnCount
+            stepsSkipped = [int]$script:BRAVOMaintenanceStepSkippedCount
+            stepsError = [int]$script:BRAVOMaintenanceStepFailCount
+            criticalErrorOccurred = [bool]$script:criticalErrorOccurred
+        }
+} catch {
+    Write-Log -Message "ПОПЕРЕДЖЕННЯ: не вдалося записати machine-readable status-файл Maintenance: $($_.Exception.Message)"
+}
 
 # ФІНАЛЬНИЙ БЛОК ЗАВЕРШЕННЯ
 Write-Log -Message "==="

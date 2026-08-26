@@ -1913,6 +1913,31 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
 
 ---
 
+## Machine-readable статус останніх прогонів (`STATUS\`, 5.3.0)
+
+Кожна з чотирьох основних операцій після обчислення коду завершення
+пише machine-readable статус свого прогону (модуль `BRAVO.Status`,
+schemaVersion 1) у
+`%ProgramData%\BRAVO\State\STATUS\BRAVO_STATUS_<Operation>.json`
+(`Archive`, `Health`, `Maintenance`, `RestoreVerify`). Це
+compatibility-контракт для зовнішніх machine-споживачів — не редагуйте
+файли вручну.
+
+- Спільні поля: `schemaVersion`, `host`, `packageVersion`, `operation`,
+  `status` (`OK`/`WARNINGS`/`ERROR` — проєкція exitCode: 0/10/інше),
+  `exitCode`, `exitCodeName`, `startedAt`/`finishedAt`/`durationSeconds`,
+  `details` (операційні агрегати: generation, лічильники кроків,
+  verified-прапорці призначень, вік верифікації).
+- Канонічним класифікатором збою лишаються **коди завершення**
+  (`BRAVO.ExitCodes`); статус-файл — зручна проєкція, не заміна.
+- Запис fail-soft: помилка запису лише логується як WARNING і ніколи не
+  змінює код завершення чи результат операції.
+- Секретів у файлах немає за контрактом (перевіряється самотестом).
+- Транспорт/моніторинг (Zabbix, telemetry outbox) поверх цих файлів —
+  окремий майбутній етап (ROADMAP P2.2); зараз контракт суто локальний.
+
+---
+
 ## Планова перевірка відновлюваності (`BRAVO_RESTORE_VERIFY`, 5.3.0)
 
 Щотижневий restore drill тепер автоматизований: задача Планувальника
