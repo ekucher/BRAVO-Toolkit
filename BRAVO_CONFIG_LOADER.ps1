@@ -275,7 +275,12 @@ function Assert-BravoDataRootsAreIndependent {
 
 function Assert-BravoLoadedConfiguration {
     [CmdletBinding()]
-    param()
+    param(
+        # Каталог комплекту — для синтезу дефолтних ScriptPath при
+        # нормалізації legacy-конфігів (RestoreVerify нижче). Порожнє
+        # значення легальне: тоді ScriptPath не синтезується.
+        [string]$RuntimeRoot
+    )
 
     $requiredGlobalVariables = @(
         'bravoSettings',
@@ -399,6 +404,63 @@ function Assert-BravoLoadedConfiguration {
         }
     }
 
+    # RestoreVerify (P1.1, 5.3.0): щотижневий restore drill. Старі
+    # site-config без цих вузлів лишаються валідними — ефективна
+    # конфігурація МУСИТЬ гарантувати наявність ключів (консумери
+    # BRAVO_TASKS_INSTALL/DIAGNOSE, BRAVO_RESTORE_TEST і Health читають їх
+    # напряму й під StrictMode падали б на відсутньому ключі — той самий
+    # клас, що інцидент BootRestoreMode вище).
+    $restoreVerifyScheduleDefaults = @{
+        Enabled = $true
+        TaskName = 'BRAVO_RESTORE_VERIFY'
+        Description = 'Щотижнева перевірка відновлюваності резервних копій (restore drill)'
+        WeeklyOn = 'Saturday'
+        At = '04:00'
+        ExecutionTimeLimitHours = 4
+    }
+    $schedulerSettingsVariable = Get-Variable -Name 'schedulerSettings' -Scope Global -ErrorAction SilentlyContinue
+    if ($null -ne $schedulerSettingsVariable -and $global:schedulerSettings -is [hashtable]) {
+        if (-not $global:schedulerSettings.Contains('RestoreVerify') -or
+            -not ($global:schedulerSettings.RestoreVerify -is [hashtable])) {
+            $global:schedulerSettings.RestoreVerify = @{}
+        }
+        $restoreVerifyScheduleForValidation = $global:schedulerSettings.RestoreVerify
+        foreach ($defaultKey in $restoreVerifyScheduleDefaults.Keys) {
+            if (-not $restoreVerifyScheduleForValidation.Contains($defaultKey)) {
+                $restoreVerifyScheduleForValidation[$defaultKey] = $restoreVerifyScheduleDefaults[$defaultKey]
+            }
+        }
+        if ((-not $restoreVerifyScheduleForValidation.Contains('ScriptPath') -or
+            [string]::IsNullOrWhiteSpace([string]$restoreVerifyScheduleForValidation.ScriptPath)) -and
+            -not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+            $restoreVerifyScheduleForValidation.ScriptPath = Join-Path $RuntimeRoot 'BRAVO_RESTORE_TEST.ps1'
+        }
+        $weeklyOnValue = [string]$restoreVerifyScheduleForValidation.WeeklyOn
+        $validWeekDays = @('Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday')
+        if ($weeklyOnValue -notin $validWeekDays) {
+            # Fail-closed до безпечного дефолту з видимим попередженням:
+            # невалідний день тижня не повинен мовчки вимкнути верифікацію.
+            Write-Warning "schedulerSettings.RestoreVerify.WeeklyOn = '$weeklyOnValue' не розпізнано (очікується англійська назва дня тижня, напр. 'Saturday') — застосовується дефолт 'Saturday'."
+            $restoreVerifyScheduleForValidation.WeeklyOn = 'Saturday'
+        }
+    }
+    $restoreVerifyVariable = Get-Variable -Name 'restoreVerifySettings' -Scope Global -ErrorAction SilentlyContinue
+    if ($null -eq $restoreVerifyVariable -or -not ($global:restoreVerifySettings -is [hashtable])) {
+        $global:restoreVerifySettings = @{}
+    }
+    if (-not $global:restoreVerifySettings.Contains('MinimumFileCount')) {
+        $global:restoreVerifySettings.MinimumFileCount = 1
+    }
+    if (-not $global:restoreVerifySettings.Contains('MaxVerificationAgeHours')) {
+        $global:restoreVerifySettings.MaxVerificationAgeHours = 216
+    }
+    $maxVerificationAgeValue = 0
+    if (-not [int]::TryParse([string]$global:restoreVerifySettings.MaxVerificationAgeHours, [ref]$maxVerificationAgeValue) -or
+        $maxVerificationAgeValue -le 0) {
+        Write-Warning "restoreVerifySettings.MaxVerificationAgeHours = '$($global:restoreVerifySettings.MaxVerificationAgeHours)' не є додатним цілим — застосовується дефолт 216 (9 діб)."
+        $global:restoreVerifySettings.MaxVerificationAgeHours = 216
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }
@@ -503,7 +565,7 @@ function Import-BravoConfiguration {
         throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message).$unsupportedEnvironmentHint"
     }
 
-    Assert-BravoLoadedConfiguration
+    Assert-BravoLoadedConfiguration -RuntimeRoot $resolvedRuntimeRoot
 
     $legacyScriptVersionVariable = Get-Variable `
         -Name 'ScriptVersion' `

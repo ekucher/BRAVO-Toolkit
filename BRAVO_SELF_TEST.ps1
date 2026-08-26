@@ -11924,10 +11924,11 @@ function Get-BRAVOMaintenanceSummaryResult {
     # визначення могло б оголошуватись invalid у Diagnose.
     Test-BRAVOCondition `
         -Condition (
-            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync")') -and
+            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")') -and
             $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
-            $tasksDiagnoseTextForRuntime.Contains('BAZASync    = @(''-NoPause'', ''-SyncBAZA'')') -and
-            $tasksDiagnoseTextForRuntime.Contains('Recovery    = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
+            $tasksDiagnoseTextForRuntime.Contains('BAZASync      = @(''-NoPause'', ''-SyncBAZA'')') -and
+            $tasksDiagnoseTextForRuntime.Contains('Recovery      = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
+            $tasksDiagnoseTextForRuntime.Contains('RestoreVerify = @(''-NoPause'', ''-NotifyOnSuccess'')') -and
             $tasksDiagnoseTextForRuntime.Contains('Test-BRAVOAccountIdentityEquivalent') -and
             $tasksDiagnoseTextForRuntime.Contains('Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings $schedulerSettings') -and
             $tasksDiagnoseTextForRuntime.Contains('LogonType=$($principal.LogonType), очікується $ExpectedLogonType') -and
@@ -14194,6 +14195,10 @@ function Write-BRAVOLog {
     # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
     # архіві. Приймальну перевірку на DEV-LIMS не замінює.
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
+    # RestoreVerify (P1.1): state-API верифікації відновлюваності, health-
+    # оцінка віку, канонічний DaysOfWeek-mask, контракти scheduled drill і
+    # loader-нормалізація legacy-конфігів без RestoreVerify-вузлів.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreVerify.ps1')
     # ConfigLoader: діагностичне збагачення помилки виконання BRAVO.config
     # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
     # замість голої NullReferenceException).

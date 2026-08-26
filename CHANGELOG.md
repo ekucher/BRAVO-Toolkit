@@ -2,6 +2,32 @@
 
 ## Не випущено (developer)
 
+- **FEATURE (P1.1, restore verification): планова перевірка
+  відновлюваності `BRAVO_RESTORE_VERIFY`.** Новий тип задачі Планувальника
+  `RestoreVerify` (weekly-тригер, типово Сб 04:00;
+  `schedulerSettings.RestoreVerify` з loader-дефолтами для legacy-конфігів)
+  запускає наявний `BRAVO_RESTORE_TEST.ps1 -NoPause -NotifyOnSuccess` —
+  без другої копії drill-логіки. Новий тонкий модуль `BRAVO.RestoreVerify`
+  володіє станом `%ProgramData%\BRAVO\State\BRAVO_RESTORE_VERIFY_STATE.json`
+  (атомарний запис; `LastVerifiedAt` оновлюється лише повністю чистим
+  прогоном — 0 FAIL і 0 WARN) і health-оцінкою віку. Новий Health-крок
+  «Відновлюваність (restore drill)»: ERROR при FAIL останнього drill,
+  пошкодженому стані або віці понад
+  `restoreVerifySettings.MaxVerificationAgeHours` (типово 216 год);
+  відсутній стан після оновлення — лише нагадування. `BRAVO_RESTORE_TEST`
+  додатково отримав runtime guard (33/34/35, паритет з рештою
+  entrypoint-ів — стосується й ручних запусків), bounded cleanup
+  покинутих drill-каталогів (>7 діб, ≤10 за прогін), канонічний
+  notification-маршрут (FAIL→CRITICAL/WARN→WARNING в ALERTS,
+  SUCCESS→GENERAL за `-NotifyOnSuccess`) і `MinimumFileCount` з
+  конфігурації. Канонічний `ConvertTo-BRAVODaysOfWeekMask` (BRAVO.System)
+  спільний для Installer/Diagnose; `BRAVO_TASKS_DIAGNOSE` перевіряє
+  weekly-тригер і аргументи, `BRAVO_TASKS_UNINSTALL` видаляє задачу.
+  Регресії: `selftest\BRAVO_SELF_TEST.RestoreVerify.ps1` (state roundtrip,
+  політика LastVerifiedAt, health-таблиця, mask, контракти, legacy-loader
+  probe). Real-server acceptance розкладу — окремим прогоном. Exit-контракт
+  drill незмінний (0/10/41/90).
+
 ---
 
 ## 5.3.0-dev.1 — 2026-08-26

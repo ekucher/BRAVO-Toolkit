@@ -361,7 +361,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -700,6 +700,9 @@ Initialize-BRAVOProgress -Activity 'BRAVO HEALTH' -Enabled ([bool]$progressSetti
 $script:BRAVOHealthSftpStepEnabled = $sftpCredentialRequired
 $script:BRAVOHealthSmbStepEnabled = $smbCredentialRequired
 $script:BRAVOHealthNotificationStepEnabled = ($NotificationMode -ne 'none') -and (-not $NoSlack)
+# P1.1: крок «Відновлюваність» видимий лише коли задача BRAVO_RESTORE_VERIFY
+# увімкнена конфігурацією (loader гарантує наявність вузла і для legacy).
+$script:BRAVOHealthRestoreVerifyStepEnabled = [bool]$schedulerSettings.RestoreVerify.Enabled
 # Середовище, керовані служби й локальні копії виконуються завжди.
 # dev.16 (review round 3): BAZA (локальна копія) і SFTP розділені на
 # незалежні dynamic steps — Total тепер точно дорівнює кількості РЕАЛЬНО
@@ -713,7 +716,8 @@ Initialize-BRAVOHealthSteps -Total (
     $(if ($sftpBazaAppHealthEnabled) { 1 } else { 0 }) +
     $(if ($sftpBazaWWWHealthEnabled) { 1 } else { 0 }) +
     $(if ($script:BRAVOHealthSmbStepEnabled) { 1 } else { 0 }) +
-    $(if ($script:BRAVOHealthNotificationStepEnabled) { 1 } else { 0 })
+    $(if ($script:BRAVOHealthNotificationStepEnabled) { 1 } else { 0 }) +
+    $(if ($script:BRAVOHealthRestoreVerifyStepEnabled) { 1 } else { 0 })
 )
 Write-BRAVOHeader `
     -Title ("BRAVO HEALTH {0}" -f $global:ScriptVersion) `
@@ -737,6 +741,7 @@ if (-not $SuppressHeader) {
     $healthPlanEntries['Середовище й цілісність інструментів'] = $true
     $healthPlanEntries['Керовані служби'] = $true
     $healthPlanEntries['Локальні резервні копії'] = $true
+    $healthPlanEntries['Відновлюваність (restore drill)'] = [bool]$script:BRAVOHealthRestoreVerifyStepEnabled
     $healthPlanEntries['BAZA_APP (локальна копія)'] = [bool]$bazaAppLocalHealthEnabled
     $healthPlanEntries['BAZA_WWW (локальна копія)'] = [bool]$bazaWWWLocalHealthEnabled
     $healthPlanEntries['SFTP: резервні копії'] = [bool]$sftpArchivesHealthEnabled
@@ -4886,6 +4891,54 @@ Write-BRAVOHealthStep `
     -Status (Get-BRAVOHealthStepStatus -IssueCount $localHealthIssues.Count) `
     -Details (Get-BRAVOHealthCompactIssueDetails -Issues $localHealthIssues -EntityProperty 'Component' -Label 'компоненти')
 
+# P1.1: вік останньої УСПІШНОЇ перевірки відновлюваності (restore drill,
+# BRAVO_RESTORE_TEST.ps1 / задача BRAVO_RESTORE_VERIFY). Оцінка — канонічна
+# Get-BRAVORestoreVerifyHealthIssue (BRAVO.RestoreVerify): FAIL останнього
+# drill, прострочений/недоведений LastVerifiedAt або пошкоджений state =
+# issue (ERROR); ЩЕ ВІДСУТНІЙ state (сервер щойно оновлено, перший
+# суботній прогін попереду) = лише environmental-нагадування в журнал —
+# інакше кожен сервер тиждень стояв би в ЧАСТКОВО без реальної проблеми.
+function Get-RestoreVerifyHealthIssues {
+    $restoreVerifyIssues = @()
+    $restoreVerifyStatePath = Get-BRAVORestoreVerifyStatePath -StateRoot $stateRoot
+    $restoreVerifyStateResult = Get-BRAVORestoreVerifyState -Path $restoreVerifyStatePath
+    $restoreVerifyEvaluation = Get-BRAVORestoreVerifyHealthIssue `
+        -StateResult $restoreVerifyStateResult `
+        -MaxVerificationAgeHours ([int]$restoreVerifySettings.MaxVerificationAgeHours)
+    if (-not [string]::IsNullOrWhiteSpace([string]$restoreVerifyEvaluation.Warning)) {
+        Write-HealthLog ("Відновлюваність: {0}" -f [string]$restoreVerifyEvaluation.Warning) -Level WARNING -Environmental
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$restoreVerifyEvaluation.Detail)) {
+        Write-HealthLog ("Відновлюваність: {0}" -f [string]$restoreVerifyEvaluation.Detail)
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$restoreVerifyEvaluation.Issue)) {
+        $restoreVerifyIssues += [pscustomobject]@{
+            Kind = "RestoreVerify"
+            Component = "Restore drill"
+            Reason = [string]$restoreVerifyEvaluation.Issue
+            ActionText = "запустити BRAVO_RESTORE_TEST.ps1 вручну та перевірити задачу BRAVO_RESTORE_VERIFY (BRAVO_TASKS_DIAGNOSE.ps1)"
+            FileName = ""
+            LastWriteTime = $null
+            Location = $restoreVerifyStatePath
+            SizeBytes = $null
+            Details = @()
+        }
+    }
+    return @($restoreVerifyIssues)
+}
+
+$restoreVerifyHealthIssues = @()
+if ($script:BRAVOHealthRestoreVerifyStepEnabled) {
+    Write-BRAVOProgressPhase -Phase 'Відновлюваність (restore drill)' -PercentComplete 35
+    $restoreVerifyHealthIssues = @(Get-RestoreVerifyHealthIssues)
+    Write-BRAVOHealthStep `
+        -Name 'Відновлюваність (restore drill)' `
+        -Status (Get-BRAVOHealthStepStatus -IssueCount $restoreVerifyHealthIssues.Count) `
+        -Details (Get-BRAVOHealthStepDetails -IssueCount $restoreVerifyHealthIssues.Count)
+} else {
+    Write-HealthLog "Перевірку відновлюваності пропущено: schedulerSettings.RestoreVerify.Enabled = `$false"
+}
+
 # dev.16 (review round 3): BAZA_APP і BAZA_WWW локальна копія — незалежні
 # dynamic steps (було: один комбінований "BAZA (локальна копія)" рядок,
 # що ховав, ЯКИЙ саме компонент має проблему). Той самий "вимкнений
@@ -4974,7 +5027,7 @@ if ($script:BRAVOHealthSmbStepEnabled) {
 }
 
 Write-BRAVOProgressPhase -Phase 'Сповіщення' -PercentComplete 95
-$healthIssues = @($serviceHealthIssues) + @($localHealthIssues) + @($bazaLocalHealthIssues) + @($sftpHealthIssues) + @($smbHealthIssues)
+$healthIssues = @($serviceHealthIssues) + @($localHealthIssues) + @($restoreVerifyHealthIssues) + @($bazaLocalHealthIssues) + @($sftpHealthIssues) + @($smbHealthIssues)
 $destinationSummary = Get-BRAVOHealthDestinationSummary `
     -LocalIssues $localHealthIssues `
     -BazaLocalIssues $bazaLocalHealthIssues `

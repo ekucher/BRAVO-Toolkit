@@ -62,7 +62,7 @@ function Get-BRAVOTaskResultDescription {
 
 function Format-BRAVODiagnoseTaskNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -229,6 +229,23 @@ function Test-BRAVOScheduledTaskDefinition {
         }
     }
 
+    # RestoreVerify — єдиний weekly-тип: перевіряємо, що фактичний тригер
+    # справді щотижневий і день збігається з конфігурацією. Маска — той
+    # самий канонічний ConvertTo-BRAVODaysOfWeekMask (BRAVO.System), яким
+    # Installer створює тригер: Diagnose не може розійтися з ним у правилах.
+    if ($TaskType -eq 'RestoreVerify') {
+        $weeklyTriggers = @(@($definition.Triggers) | Where-Object { [int]$_.Type -eq 3 })
+        if ($weeklyTriggers.Count -eq 0) {
+            $problems.Add("немає жодного weekly-тригера (TASK_TRIGGER_WEEKLY)")
+        } else {
+            $expectedDaysMask = ConvertTo-BRAVODaysOfWeekMask -DayOfWeek ([string]$TaskSettings.WeeklyOn)
+            $actualDaysMask = [int]$weeklyTriggers[0].DaysOfWeek
+            if ($actualDaysMask -ne $expectedDaysMask) {
+                $problems.Add("DaysOfWeek=$actualDaysMask, очікується $expectedDaysMask ($($TaskSettings.WeeklyOn))")
+            }
+        }
+    }
+
     return $problems.ToArray()
 }
 
@@ -356,13 +373,14 @@ try {
     # production-завданням поза діагностикою, тобто єдиним, чия неправильна
     # реєстрація виявлялася б лише з відсутності даних у хмарі.
     $taskArgumentExpectations = @{
-        Backup      = @('-NoPause')
-        Maintenance = @('-NoPause')
-        Health      = @('-NoPause', '-NotifyOnSuccess')
-        Recovery    = @('-NoPause', '-RunMissedRestoreOnly')
-        BAZASync    = @('-NoPause', '-SyncBAZA')
+        Backup        = @('-NoPause')
+        Maintenance   = @('-NoPause')
+        Health        = @('-NoPause', '-NotifyOnSuccess')
+        Recovery      = @('-NoPause', '-RunMissedRestoreOnly')
+        BAZASync      = @('-NoPause', '-SyncBAZA')
+        RestoreVerify = @('-NoPause', '-NotifyOnSuccess')
     }
-    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync")) {
+    foreach ($taskType in @("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")) {
         $settings = $schedulerSettings[$taskType]
         if ($null -eq $settings -or -not [bool]$settings.Enabled) {
             Write-Host "[SKIP] ${taskType}: вимкнено в конфігурації" -ForegroundColor Gray

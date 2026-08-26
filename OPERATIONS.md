@@ -1913,11 +1913,42 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
 
 ---
 
+## Планова перевірка відновлюваності (`BRAVO_RESTORE_VERIFY`, 5.3.0)
+
+Щотижневий restore drill тепер автоматизований: задача Планувальника
+`BRAVO_RESTORE_VERIFY` (типово Сб 04:00, `schedulerSettings.RestoreVerify`
+у `BRAVO.config`: `Enabled`/`WeeklyOn`/`At`) запускає
+`BRAVO_RESTORE_TEST.ps1 -NoPause -NotifyOnSuccess`: останній COMPLETE
+generation розпаковується в ізольований каталог
+`%ProgramData%\BRAVO\RestoreDrill\<guid>` і прибирається; production-шляхи
+не змінюються, служби не зупиняються.
+
+- Стан — `%ProgramData%\BRAVO\State\BRAVO_RESTORE_VERIFY_STATE.json`
+  (compatibility-контракт, не редагувати вручну): `LastVerifiedAt`
+  оновлюється лише повністю чистим прогоном (0 FAIL і 0 WARN); слабший
+  результат зберігає вік останньої доведеної верифікації.
+- Health-крок «Відновлюваність (restore drill)»: ERROR, якщо останній
+  drill FAIL, стан пошкоджено або `LastVerifiedAt` старший за
+  `restoreVerifySettings.MaxVerificationAgeHours` (типово 216 год = 9 діб);
+  відсутній стан (сервер щойно оновлено) — лише нагадування в журналі.
+- Нотифікації: FAIL → CRITICAL в ALERTS, WARN → WARNING в ALERTS,
+  успіх scheduled-прогону → SUCCESS у GENERAL (глушиться
+  `NotificationMode=errors_only`).
+- **Міграція після оновлення комплекту:** задача з'являється лише після
+  повторного запуску `BRAVO_TASKS_INSTALL.ps1` (діагностика —
+  `BRAVO_TASKS_DIAGNOSE.ps1`). До першого прогону Health показує
+  нагадування.
+- Ручний `BRAVO_RESTORE_TEST.ps1` лишається доступним і теж оновлює стан;
+  з 5.3.0 він проходить runtime guard (коди 33/34/35), як решта
+  entrypoint-ів.
+
+---
+
 ## Регулярна профілактика
 
 | Періодичність | Дія |
 |---|---|
-| щотижня | `BRAVO_RESTORE_TEST.ps1` — архів, з якого ніхто не відновлював, це оптимістично названий файл |
+| щотижня | автоматично: задача `BRAVO_RESTORE_VERIFY` (restore drill; вручну — `BRAVO_RESTORE_TEST.ps1`) — архів, з якого ніхто не відновлював, це оптимістично названий файл |
 | щомісяця | звірка `VERSION.json.sourceCommit` на сервері з розгорнутим релізом |
 | щокварталу | повне навчальне відновлення на окрему машину |
 | при кожному оновленні Tools | [процедура вище](#оновлення-7zaexe-або-winscp) |
