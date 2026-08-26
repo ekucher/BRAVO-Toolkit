@@ -4,7 +4,51 @@
 
 ---
 
-## 5.2.1-rc.7 — 2026-08-27 (hotfix candidate, pending acceptance)
+## 5.2.1-rc.8 — 2026-08-27 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.7 + фікс хибного ERROR у сповіщенні про несумісні імена
+(знайдено аналізом acceptance-логів ХРДЛ 27.08: rc.5/rc.6 -SyncBAZA):
+
+- **FIX (notifications): одно-chunk результат
+  `ConvertTo-BRAVONotificationPayloadText` втрачав масивність.**
+  `return @(...)` PowerShell 5.1 розгортає в скаляр-[string] на виході
+  з функції; наступний `.Count` в Archive Runtime під
+  `Set-StrictMode 2.0` кидав `PropertyNotFoundException` — у лог падав
+  ERROR «Не вдалося відправити сповіщення про несумісні імена
+  BAZA_APP», хоча webhook на той момент уже був доставлений
+  (`Send-BRAVONotificationChunks` виконується до `.Count`). Канонічний
+  фікс у конверторі (unary comma: `return ,@(...)`) — масив
+  гарантовано для будь-якої кількості chunk-ів, усі викликачі
+  (Archive/Health/Maintenance/DataRestore/`Send-BRAVONotification`
+  `ChunkCount`) отримують коректний `.Count`. Дефект існував з 5.2.0
+  (не регресія hotfix-лінії). Регресія
+  `Notifications/PayloadTextSingleChunkKeepsArrayness`: пре-фікс
+  репродукція на rc.7 відтворила точний серверний виняток; після
+  фіксу — масив із Count=1.
+
+- **FIX (self-test, CI): local-config сценарій `FileAbsentIsNoop`
+  залежав від середовища прогону.** CI «Release artifact» на тегу
+  v5.2.1-rc.7 упав: без `BRAVO.local.config` копія комплектного
+  `BRAVO.config` виконувалась із дефолтом `BackupRoot=""` (AUTO →
+  `<EffectiveLIMSRoot>\ARCHIV`), а на GitHub runner немає інсталяції
+  LIMS → «Не вдалося визначити BackupRoot»; stderr дочірнього процесу
+  під `$ErrorActionPreference='Stop'` валив увесь self-test як
+  `[FAIL] Fatal` (на dev/серверах LIMS є, тому локально зелено).
+  Сценарії тепер герметичні: у копію конфігурації запікається явний
+  `BackupRoot` (окремий від override-каталогу — фаза-1 сценарій
+  відтепер доводить пріоритет override над явним значенням), а
+  дочірні probe-процеси загорнуто в try/catch (майбутній збій — чистий
+  FAIL сценарію з причиною, не Fatal-крах прогону). Дефект лише у
+  валідаційному інструментарії; runtime-поведінка rc.7 коректна.
+
+Acceptance rc.8 (додатково до rc.7): на інсталяції з несумісними
+іменами BAZA (напр., ХРДЛ) прогнати `-SyncBAZA` → у лозі SUCCESS
+«Сповіщення про N несумісних імен … відправлено», без ERROR
+«Не вдалося відправити…: Не удается найти свойство "Count"».
+
+---
+
+## 5.2.1-rc.7 — 2026-08-27 (hotfix candidate, NOT accepted — superseded by rc.8)
 
 Кандидат = rc.6 + локальні site-overrides конфігурації (запит власника:
 «втомився кожного разу виправляти конфіг на нетипових інсталяціях»):
