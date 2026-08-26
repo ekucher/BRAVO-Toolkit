@@ -5080,6 +5080,20 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "BackupConsistency/VSSDiskshadowRunsExactlyOnce" `
         -Failure "сценарій diskshadow.exe має завершуватися EXIT, запускатися лише через Start-BRAVOProcessOutputCapture і не покладатися на англомовний текст виводу"
 
+    # 5.2.1 (реальний звіт SERVER-01/Тернопіль): без SET METADATA
+    # diskshadow.exe у backup-контексті писав metadata-.cab з автоіменем
+    # (NN-DD.MM.YYYY-HH_--_HOSTNAME.cab) у робочий каталог планової
+    # задачі — файли накопичувались у C:\Program Files\BRAVO-Toolkit.
+    Test-BRAVOCondition `
+        -Condition (
+            $diskshadowScriptText.Contains('SET METADATA') -and
+            $diskshadowScriptText.Contains('BRAVO_diskshadow_meta_') -and
+            $diskshadowScriptText.Contains('Remove-Item -LiteralPath $metadataPath -Force') -and
+            $diskshadowScriptText.Contains('_--_')
+        ) `
+        -Name "BackupConsistency/VSSDiskshadowMetadataGoesToTempAndIsCleaned" `
+        -Failure "сценарій diskshadow.exe мусить задавати SET METADATA у TEMP (інакше metadata-.cab з автоіменем накопичуються в каталозі комплекту), прибирати файл у finally і best-effort зачищати legacy-.cab цього хоста в каталозі комплекту"
+
     $vssOwnershipTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_VSS_OWNERSHIP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
