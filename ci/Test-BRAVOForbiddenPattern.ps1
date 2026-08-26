@@ -62,6 +62,11 @@ $bypassAllowlist = @(
     # самий ізольований дочірній powershell.exe патерн, що ManualLaunchers/
     # Governance вище. Нових ВИКОНУВАНИХ Bypass-місць не додано.
     'BRAVO_SELF_TEST.ConfigLoader.ps1',
+    # RestoreVerify (P1.1): legacy-loader probe — той самий ізольований
+    # дочірній powershell.exe патерн, що ConfigLoader/Governance вище
+    # (Import-BravoConfiguration змінює глобальний стан). Нових
+    # ВИКОНУВАНИХ Bypass-місць не додано.
+    'BRAVO_SELF_TEST.RestoreVerify.ps1',
     'BRAVO.Archive.Runtime.ps1',
     'BRAVO.Maintenance.Runtime.ps1',
     # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той

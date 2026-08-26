@@ -260,7 +260,7 @@ function New-BRAVOTaskDefinition {
     param(
         $TaskService,
         [hashtable]$TaskSettings,
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
         [string]$TaskType,
         [string]$ResolvedConfigPath
     )
@@ -315,6 +315,8 @@ function New-BRAVOTaskDefinition {
             -SettingName "$TaskType.StartAt"
     } elseif ($TaskType -eq "Recovery") {
         $null
+    } elseif ($TaskType -eq "RestoreVerify") {
+        ConvertTo-ScheduleTime -Value $TaskSettings.At -SettingName "$TaskType.At"
     } else {
         ConvertTo-ScheduleTime -Value $TaskSettings.DailyAt -SettingName "$TaskType.DailyAt"
     }
@@ -337,6 +339,15 @@ function New-BRAVOTaskDefinition {
             )
         }
         $trigger.Enabled = $true
+    } elseif ($TaskType -eq "RestoreVerify") {
+        # Щотижневий restore drill (P1.1): один weekly-тригер. DaysOfWeek —
+        # канонічний bitmask ConvertTo-BRAVODaysOfWeekMask (BRAVO.System),
+        # той самий розрахунок використовує Diagnose.
+        $trigger = $definition.Triggers.Create(3) # TASK_TRIGGER_WEEKLY
+        $trigger.StartBoundary = $triggerTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
+        $trigger.Enabled = $true
+        $trigger.WeeksInterval = 1
+        $trigger.DaysOfWeek = ConvertTo-BRAVODaysOfWeekMask -DayOfWeek ([string]$TaskSettings.WeeklyOn)
     } else {
         $trigger = $definition.Triggers.Create(2) # TASK_TRIGGER_DAILY
         $trigger.StartBoundary = $triggerTime.ToString("yyyy-MM-dd'T'HH:mm:ss")
@@ -383,6 +394,11 @@ function New-BRAVOTaskDefinition {
     if ($TaskType -eq "BAZASync") {
         $actionArguments += " -SyncBAZA"
     }
+    if ($TaskType -eq "RestoreVerify") {
+        # Щотижневе SUCCESS-підтвердження в GENERAL (рішення власника,
+        # 2026-08-26): «тиша» не відрізняється від «задача мертва».
+        $actionArguments += " -NotifyOnSuccess"
+    }
     $action = $definition.Actions.Create(0) # TASK_ACTION_EXEC
     $action.Path = [string]$schedulerSettings.PowerShellExecutable
     $action.Arguments = $actionArguments
@@ -402,7 +418,7 @@ function New-BRAVOTaskDefinition {
 
 function Format-BRAVOInstalledTaskSummaryNextRun {
     param(
-        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync")]
+        [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
         [string]$TaskType,
         $TaskSettings,
         $NextRunTime
@@ -444,7 +460,8 @@ function Test-SchedulerConfiguration {
         'BRAVO.Health',
         'BRAVO.Maintenance',
         'BRAVO.HelperLogging',
-        'BRAVO.System'
+        'BRAVO.System',
+        'BRAVO.RestoreVerify'
     )
     foreach ($moduleName in $requiredModuleNames) {
         $manifestPath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"
@@ -511,15 +528,17 @@ function Test-SchedulerConfiguration {
     Test-TaskName -TaskName $schedulerSettings.Health.TaskName -SettingName "Health.TaskName"
     Test-TaskName -TaskName $schedulerSettings.Recovery.TaskName -SettingName "Recovery.TaskName"
     Test-TaskName -TaskName $schedulerSettings.BAZASync.TaskName -SettingName "BAZASync.TaskName"
+    Test-TaskName -TaskName $schedulerSettings.RestoreVerify.TaskName -SettingName "RestoreVerify.TaskName"
     $taskNames = @(
         [string]$schedulerSettings.Backup.TaskName,
         [string]$schedulerSettings.Maintenance.TaskName,
         [string]$schedulerSettings.Health.TaskName,
         [string]$schedulerSettings.Recovery.TaskName,
-        [string]$schedulerSettings.BAZASync.TaskName
+        [string]$schedulerSettings.BAZASync.TaskName,
+        [string]$schedulerSettings.RestoreVerify.TaskName
     )
     if (@($taskNames | Select-Object -Unique).Count -ne $taskNames.Count) {
-        throw "Імена Backup, Maintenance, Health, Recovery і BAZASync завдань повинні відрізнятися"
+        throw "Імена Backup, Maintenance, Health, Recovery, BAZASync і RestoreVerify завдань повинні відрізнятися"
     }
 
     foreach ($taskSettings in @(
@@ -527,7 +546,8 @@ function Test-SchedulerConfiguration {
         $schedulerSettings.Maintenance,
         $schedulerSettings.Health,
         $schedulerSettings.Recovery,
-        $schedulerSettings.BAZASync
+        $schedulerSettings.BAZASync,
+        $schedulerSettings.RestoreVerify
     )) {
         if ($taskSettings.Enabled -and -not (Test-Path -Path $taskSettings.ScriptPath -PathType Leaf)) {
             throw "Скрипт завдання не знайдено: $($taskSettings.ScriptPath)"
@@ -561,6 +581,14 @@ function Test-SchedulerConfiguration {
     if ($schedulerSettings.Recovery.Enabled -and
         [int]$schedulerSettings.Recovery.StartupDelayMinutes -lt 0) {
         throw "Recovery.StartupDelayMinutes не може бути від'ємним"
+    }
+    if ($schedulerSettings.RestoreVerify.Enabled) {
+        [void](ConvertTo-ScheduleTime `
+            -Value $schedulerSettings.RestoreVerify.At `
+            -SettingName "RestoreVerify.At")
+        # Канонічний конвертер (BRAVO.System) кидає на невідомій назві дня —
+        # невалідний розклад ловиться тут, а не під час створення тригера.
+        [void](ConvertTo-BRAVODaysOfWeekMask -DayOfWeek ([string]$schedulerSettings.RestoreVerify.WeeklyOn))
     }
 
     # P1 (safety-review): BRAVO_MAINTENANCE/BRAVO_RESTORE_RECOVERY реально
@@ -708,7 +736,8 @@ try {
         [pscustomobject]@{ Type = "Maintenance"; Settings = $schedulerSettings.Maintenance },
         [pscustomobject]@{ Type = "Health"; Settings = $schedulerSettings.Health },
         [pscustomobject]@{ Type = "Recovery"; Settings = $schedulerSettings.Recovery },
-        [pscustomobject]@{ Type = "BAZASync"; Settings = $schedulerSettings.BAZASync }
+        [pscustomobject]@{ Type = "BAZASync"; Settings = $schedulerSettings.BAZASync },
+        [pscustomobject]@{ Type = "RestoreVerify"; Settings = $schedulerSettings.RestoreVerify }
     )
 
     $requireProtectedRuntime = (
@@ -859,6 +888,8 @@ try {
                 "після старту сервера (затримка $($taskSettings.StartupDelayMinutes) хв.; профіль робочого часу)"
             } elseif ($taskPlan.Type -eq "BAZASync") {
                 "кожні $($taskSettings.RepeatEveryHours) год., починаючи з $($taskSettings.StartAt)"
+            } elseif ($taskPlan.Type -eq "RestoreVerify") {
+                "щотижня ($($taskSettings.WeeklyOn)) о $($taskSettings.At)"
             } else {
                 if (([int]$taskSettings.RepeatEveryMinutes % 60) -eq 0) {
                     "кожні $([int]$taskSettings.RepeatEveryMinutes / 60) год., починаючи з $($taskSettings.StartAt)"

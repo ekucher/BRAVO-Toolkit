@@ -125,13 +125,19 @@ PR #61 у вікні промоції 5.1.0 технічно заблокова�
 
 ### P1.1 — Автоматичний scheduled Restore Drill
 
-**Не входить у 5.2.0.** Цикл 5.2.0 відхилився від раніше рекомендованої
-послідовності (P1.1 мав іти одним із перших) через production-інциденти,
-що потребували негайного виправлення: подвійна реставрація, BootRestore/
-Recovery task lifecycle, watchdog/quiescence reliability, Trace/Reconcile
-reliability. P1.1 лишається пріоритетом наступного циклу.
+**Статус (2026-08-26, цикл 5.3.0): реалізовано** (гілка
+`feature/restore-verify`): задача `BRAVO_RESTORE_VERIFY` (weekly-тригер,
+типово Сб 04:00, `schedulerSettings.RestoreVerify`) запускає наявний
+`BRAVO_RESTORE_TEST.ps1 -NoPause -NotifyOnSuccess`; стан у
+`%ProgramData%\BRAVO\State\BRAVO_RESTORE_VERIFY_STATE.json`
+(модуль `BRAVO.RestoreVerify`, атомарний запис, `LastVerifiedAt`
+оновлюється лише повністю чистим прогоном); Health-крок
+«Відновлюваність (restore drill)» оцінює вік проти
+`restoreVerifySettings.MaxVerificationAgeHours` (типово 216 год).
+Drill отримав runtime guard і bounded cleanup покинутих drill-каталогів.
+Real-server acceptance розкладу/нотифікацій — окремим прогоном.
 
-`BRAVO_RESTORE_TEST.ps1` має стати штатним елементом експлуатації, а не ручною процедурою.
+`BRAVO_RESTORE_TEST.ps1` став штатним елементом експлуатації, а не ручною процедурою.
 
 Цільова поведінка:
 
@@ -151,13 +157,13 @@ machine-readable result + notification
 
 Критерії завершення:
 
-- [ ] Додано окремий scheduler task, наприклад `BRAVO_RESTORE_VERIFY`.
-- [ ] Розклад задається конфігурацією; типовий інтервал — щотижня.
-- [ ] Restore drill не торкається production paths і не зупиняє служби.
-- [ ] Є stable exit code/result contract.
-- [ ] Health може показати вік останньої успішної restore verification.
-- [ ] Failure піднімає WARNING/CRITICAL залежно від причини.
-- [ ] Є bounded cleanup тимчасових restore artifacts.
+- [x] Додано окремий scheduler task `BRAVO_RESTORE_VERIFY`.
+- [x] Розклад задається конфігурацією (`RestoreVerify.WeeklyOn/At`); типовий інтервал — щотижня (Сб 04:00).
+- [x] Restore drill не торкається production paths і не зупиняє служби. *(незмінна властивість BRAVO_RESTORE_TEST)*
+- [x] Є stable exit code/result contract. *(0/10/41/90 + JSON `-ResultPath`/`-AsJson` — без змін; + state-файл)*
+- [x] Health може показати вік останньої успішної restore verification. *(крок «Відновлюваність (restore drill)»)*
+- [x] Failure піднімає WARNING/CRITICAL залежно від причини. *(WARN→WARNING, FAIL→CRITICAL в ALERTS; SUCCESS→GENERAL для scheduled)*
+- [x] Є bounded cleanup тимчасових restore artifacts. *(сироти >7 діб, ≤10 за прогін)*
 
 ### P1.2 — Stable release artifact
 

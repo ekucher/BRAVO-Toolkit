@@ -134,6 +134,13 @@ health-порогом. Він не тотожний archive-preflight `WARNING` 
 
 Restore Test використовує component-oriented UX. Для кожного `.mdz` показуються фактичні результати verification/extraction.
 
+Scheduled-запуск (задача `BRAVO_RESTORE_VERIFY`, прапорець `-NoPause`)
+відрізняється лише рядком режиму в заголовку:
+`Режим: SCHEDULED / READ-ONLY / ISOLATED RESTORE`. Решта контракту
+(кроки, підсумок, JSON `-AsJson`/`-ResultPath`, exit codes) ідентична
+ручному запуску; додатково кожен прогін оновлює
+`%ProgramData%\BRAVO\State\BRAVO_RESTORE_VERIFY_STATE.json`.
+
 ```text
 ============================================================
  BRAVO Restore Test <packageVersion>

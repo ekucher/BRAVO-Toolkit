@@ -12,8 +12,118 @@ param(
     [string]$ResultPath,
     [switch]$AsJson,
     [switch]$SkipNotification,
-    [switch]$NoElevation
+    [switch]$NoElevation,
+    # Scheduled-режим (задача BRAVO_RESTORE_VERIFY, P1.1): без паузи
+    # «натисніть клавішу» і з позначкою SCHEDULED у заголовку консолі.
+    [switch]$NoPause,
+    # Дозволяє SUCCESS-сповіщення в GENERAL після повністю успішного drill
+    # (за NotificationMode; errors_only глушить). Без прапорця поведінка
+    # як раніше: сповіщення лише при FAIL/WARN.
+    [switch]$NotifyOnSuccess
 )
+
+# Пауза перед закриттям вікна — самодостатня (без BRAVO.Console), бо
+# цілісність комплекту ще не підтверджена guard-ом нижче. Дублюється
+# ідентично в BRAVO_ARCHIV.ps1, BRAVO_DATA_RESTORE.ps1, BRAVO_HEALTH.ps1
+# і BRAVO_MAINTENANCE.ps1, як і сам guard-блок.
+function Wait-BRAVOEarlyManualExit {
+    param([switch]$NoPause)
+    if ($NoPause) { return }
+    try {
+        if (-not [Environment]::UserInteractive) { return }
+        if ([Console]::IsInputRedirected) { return }
+    } catch {
+        return
+    }
+    Write-Host ""
+    Write-Host "Натиснiть будь-яку клавiшу для закриття вiкна..." -ForegroundColor Cyan
+    try {
+        [void]$Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown")
+    } catch {
+        try {
+            [void](Read-Host)
+        } catch {
+            # Немає жодного способу почекати на ввід (нетиповий хост) — це не привід завершити скрипт помилкою.
+        }
+    }
+}
+
+# Effective ConfigPath визначається ОДИН раз, до guard-а, і далі
+# використовується всюди (той самий контракт, що в BRAVO_DATA_RESTORE.ps1).
+$effectiveConfigPath = if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    Join-Path $PSScriptRoot 'BRAVO.config'
+} else {
+    [Environment]::ExpandEnvironmentVariables($ConfigPath)
+}
+try {
+    $effectiveConfigPath = [System.IO.Path]::GetFullPath($effectiveConfigPath)
+} catch {
+    # Некоректний шлях НЕ обробляється тут виходом: перевірка цілісності
+    # комплекту (код 33) мусить лишатись найпершим бар'єром. Далі це
+    # значення відхилить сам drill (файл конфігурації не знайдено).
+    $effectiveConfigPath = [string]$effectiveConfigPath
+}
+$ConfigPath = $effectiveConfigPath
+
+# Runtime guard (5.3.0, P1.1): drill став планованою SYSTEM-задачею
+# (BRAVO_RESTORE_VERIFY), тому цілісність комплекту перевіряється ДО
+# Import-Module — той самий fail-closed блок, що в BRAVO_DATA_RESTORE.ps1.
+# Це навмисно поширюється й на ручні запуски (паритет з рештою
+# entrypoint-ів; аварійний обхід — BRAVO_RUNTIME_INTEGRITY_MODE=Warn,
+# SECURITY.md).
+$runtimeGuardPath = Join-Path $PSScriptRoot 'BRAVO_RUNTIME_GUARD.ps1'
+if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
+    try {
+        . $runtimeGuardPath
+    } catch {
+        Write-Host "КРИТИЧНА ПОМИЛКА: не вдалося завантажити BRAVO_RUNTIME_GUARD.ps1: $($_.Exception.Message)" -ForegroundColor Red
+        Wait-BRAVOEarlyManualExit -NoPause:$NoPause
+        exit 33
+    }
+    foreach ($guardFunction in @(
+        'Test-BRAVORuntimeManifestIntegrity',
+        'Test-BRAVORuntimeSecuritySettings',
+        'Test-BRAVOVersionDowngrade'
+    )) {
+        if (-not (Get-Command -Name $guardFunction -CommandType Function -ErrorAction SilentlyContinue)) {
+            Write-Host "КРИТИЧНА ПОМИЛКА: BRAVO_RUNTIME_GUARD.ps1 не оголосив $guardFunction — цілісність комплекту не підтверджена" -ForegroundColor Red
+            Wait-BRAVOEarlyManualExit -NoPause:$NoPause
+            exit 33
+        }
+    }
+    $runtimeIntegrityMode = if ($env:BRAVO_RUNTIME_INTEGRITY_MODE -eq 'Warn') { 'Warn' } else { 'Enforce' }
+    $runtimeIntegrity = Test-BRAVORuntimeManifestIntegrity `
+        -RuntimeRoot $PSScriptRoot `
+        -ManifestPath (Join-Path $PSScriptRoot 'RUNTIME_MANIFEST.json') `
+        -Mode $runtimeIntegrityMode
+    if (-not $runtimeIntegrity.IsValid) {
+        Write-Host $runtimeIntegrity.Message -ForegroundColor Red
+        if ($runtimeIntegrity.ShouldBlock) { Wait-BRAVOEarlyManualExit -NoPause:$NoPause; exit 33 }
+    }
+
+    $securitySettings = Test-BRAVORuntimeSecuritySettings `
+        -ConfigPath $effectiveConfigPath `
+        -Mode $runtimeIntegrityMode
+    if (-not $securitySettings.IsValid) {
+        $securityColor = if ($securitySettings.ShouldBlock) { 'Red' } else { 'Yellow' }
+        Write-Host $securitySettings.Message -ForegroundColor $securityColor
+        if ($securitySettings.ShouldBlock) { Wait-BRAVOEarlyManualExit -NoPause:$NoPause; exit 34 }
+    }
+
+    $versionState = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $PSScriptRoot `
+        -StatePath (Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'BRAVO\State\BRAVO_VERSION_STATE.json') `
+        -Mode $runtimeIntegrityMode
+    if (-not $versionState.IsValid) {
+        $versionColor = if ($versionState.ShouldBlock) { 'Red' } else { 'Yellow' }
+        Write-Host $versionState.Message -ForegroundColor $versionColor
+        if ($versionState.ShouldBlock) { Wait-BRAVOEarlyManualExit -NoPause:$NoPause; exit 35 }
+    }
+} else {
+    Write-Host "КРИТИЧНА ПОМИЛКА: відсутній BRAVO_RUNTIME_GUARD.ps1 — цілісність комплекту не підтверджена" -ForegroundColor Red
+    Wait-BRAVOEarlyManualExit -NoPause:$NoPause
+    exit 33
+}
 
 $helperLoggingPath = Join-Path $PSScriptRoot "modules\BRAVO.HelperLogging\BRAVO.HelperLogging.psd1"
 Import-Module -Name $helperLoggingPath -ErrorAction Stop
@@ -174,7 +284,7 @@ try {
     $configRoot = Split-Path $resolvedConfigPath -Parent
     $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 
-    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications')) {
+    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications', 'BRAVO.RestoreVerify')) {
         $modulePath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"
         if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
             throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -193,6 +303,13 @@ try {
     }
     . $configurationLoaderPath
     Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $runtimeRoot
+
+    # Поріг із конфігурації ($restoreVerifySettings, нормалізований
+    # loader-ом і для legacy-конфігів) — але явний параметр командного
+    # рядка завжди має пріоритет.
+    if (-not $PSBoundParameters.ContainsKey('MinimumFileCount')) {
+        $MinimumFileCount = [int]$global:restoreVerifySettings.MinimumFileCount
+    }
 
     if ([string]::IsNullOrWhiteSpace([string]$arcPath) -or
         -not (Test-Path -LiteralPath $arcPath -PathType Leaf)) {
@@ -267,7 +384,7 @@ try {
             -Title ("BRAVO Restore Test {0}" -f $global:ScriptVersion) `
             -Institution ([string]$bravoSettings.InstitutionName) `
             -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
-            -Mode 'READ-ONLY / ISOLATED RESTORE'
+            -Mode $(if ($NoPause) { 'SCHEDULED / READ-ONLY / ISOLATED RESTORE' } else { 'READ-ONLY / ISOLATED RESTORE' })
     }
 
     if ($componentsToCheck.Count -eq 0 -and $script:restoreDrillResults.Count -eq 0) {
@@ -282,6 +399,25 @@ try {
     $drillRoot = Join-Path ([Environment]::GetFolderPath("CommonApplicationData")) "BRAVO\RestoreDrill"
     if (-not (Test-Path -LiteralPath $drillRoot -PathType Container)) {
         [void](New-Item -ItemType Directory -Path $drillRoot -Force)
+    }
+
+    # Bounded cleanup сиріт (ROADMAP P1.1): kill/BSOD посеред extraction
+    # оминає finally нижче й лишає guid-каталог із розпакованими даними.
+    # Прибираємо каталоги, старші за 7 діб (жоден легітимний drill стільки
+    # не живе — ExecutionTimeLimitHours=4), не більше 10 за прогін
+    # (обмежений час прибирання), fail-soft: невдале видалення — WARN,
+    # а не провал самої перевірки відновлюваності.
+    $orphanCandidates = @(Get-ChildItem -LiteralPath $drillRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt (Get-Date).AddDays(-7) } |
+        Sort-Object LastWriteTime |
+        Select-Object -First 10)
+    foreach ($orphanDirectory in $orphanCandidates) {
+        try {
+            Remove-Item -LiteralPath $orphanDirectory.FullName -Recurse -Force -ErrorAction Stop
+        } catch {
+            Add-RestoreDrillResult WARN 'Cleanup' $null $null 0 0 (
+                "не вдалося прибрати покинутий drill-каталог '$($orphanDirectory.FullName)': $($_.Exception.Message)")
+        }
     }
 
     $restoreDrillStepCurrent = 0
@@ -403,44 +539,88 @@ try {
         }
     }
 
+    # Стан верифікації (P1.1) пишеться ЗАВЖДИ — і scheduled, і ручний
+    # прогін є валідною верифікацією. LastVerifiedAt оновлюється лише
+    # повністю чистим прогоном (0 FAIL і 0 WARN) — політика в
+    # Save-BRAVORestoreVerifyState (BRAVO.RestoreVerify). Помилка запису
+    # стану — WARN (drill фактично відбувся), не FAIL.
+    $drillFailCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "FAIL" }).Count
+    $drillWarnCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "WARN" }).Count
+    $drillOverallStatus = if ($drillFailCount -gt 0) { 'FAIL' } elseif ($drillWarnCount -gt 0) { 'WARN' } else { 'PASS' }
+    $drillExitCodeForState = Resolve-BRAVOExitCode `
+        -IntegrityTestFailed:($drillFailCount -gt 0) `
+        -HasWarnings:($drillWarnCount -gt 0 -and $drillFailCount -eq 0)
+    try {
+        Save-BRAVORestoreVerifyState `
+            -Path (Get-BRAVORestoreVerifyStatePath -StateRoot $global:stateRoot) `
+            -RunAt (Get-Date) `
+            -Status $drillOverallStatus `
+            -ExitCode $drillExitCodeForState `
+            -GenerationId ([string]$script:selectedRestoreGenerationId) `
+            -VerificationSucceeded ($drillFailCount -eq 0 -and $drillWarnCount -eq 0)
+    } catch {
+        Add-RestoreDrillResult WARN "Стан верифікації" $null $null 0 0 (
+            "не вдалося записати BRAVO_RESTORE_VERIFY_STATE.json: $($_.Exception.Message)")
+    }
+
     if (-not $SkipNotification) {
         $notificationMode = ([string]$bravoSettings.NotificationMode).Trim().ToLowerInvariant()
+        if ($notificationMode -notin @('none', 'errors_only', 'all')) {
+            # Невідоме значення: помилки все одно сповіщаються, success —
+            # ні (найближча до старої поведінка «усе, крім none»).
+            $notificationMode = 'errors_only'
+        }
         $failCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "FAIL" }).Count
         $warnCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq "WARN" }).Count
-        if ($notificationMode -ne "none" -and ($failCount -gt 0 -or $warnCount -gt 0)) {
+        $wantSuccessNotification = ($NotifyOnSuccess -and $failCount -eq 0 -and $warnCount -eq 0)
+        if ($notificationMode -ne "none" -and ($failCount -gt 0 -or $warnCount -gt 0 -or $wantSuccessNotification)) {
             try {
                 $notificationProvider = ([string]$bravoSettings.NotificationProvider).Trim().ToLowerInvariant()
                 if ($notificationProvider -ne "discord" -and $notificationProvider -ne "slack") {
                     $notificationProvider = "discord"
                 }
-                $webhookTarget = if ($notificationProvider -eq "discord") {
-                    [string]$credentialSettings.Targets.DiscordWebhook
+                $summaryLines = @($script:restoreDrillResults | ForEach-Object {
+                    "[$($_.Status)] $($_.Component): $($_.Detail)"
+                })
+                $severity = if ($failCount -gt 0) { "CRITICAL" } elseif ($warnCount -gt 0) { "WARNING" } else { "SUCCESS" }
+                $operationText = if ($severity -eq "SUCCESS") {
+                    "BRAVO RESTORE DRILL — ВІДНОВЛЮВАНІСТЬ ПІДТВЕРДЖЕНО"
                 } else {
-                    [string]$credentialSettings.Targets.SlackWebhook
+                    "BRAVO RESTORE DRILL — ПОТРІБНА ДІЯ"
                 }
-                $webhookUrl = Get-BRAVOCredentialSecret -Target $webhookTarget
-                if (-not [string]::IsNullOrWhiteSpace($webhookUrl)) {
-                    $summaryLines = @($script:restoreDrillResults | ForEach-Object {
-                        "[$($_.Status)] $($_.Component): $($_.Detail)"
-                    })
-                    $severity = if ($failCount -gt 0) { "CRITICAL" } else { "WARNING" }
-                    $message = New-BRAVOOperatorNotificationMessage `
-                        -Severity $severity `
-                        -Operation "BRAVO RESTORE DRILL — ПОТРІБНА ДІЯ" `
-                        -ActionText "перевірити restore drill і журнал відновлення." `
-                        -InstitutionName ([string]$bravoSettings.InstitutionName) `
-                        -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
-                        -HostInformation (Get-HostInformation) `
-                        -ResultLines (@("FAIL: $failCount, WARN: $warnCount") + $summaryLines) `
-                        -Timestamp (Get-Date) `
-                        -ProductName "BRAVO Restore Drill" `
-                        -Version ([string]$global:ScriptVersion) `
-                        -BuildId ([string]$global:ScriptBuildId)
-                    Send-BRAVOWebhookNotification `
-                        -Provider $notificationProvider `
-                        -WebhookUrl $webhookUrl `
-                        -Message $message
+                $resultHeadline = if ($severity -eq "SUCCESS") {
+                    "PASS: $(@($script:restoreDrillResults | Where-Object { $_.Status -eq 'PASS' }).Count), GenerationId: $($script:selectedRestoreGenerationId)"
+                } else {
+                    "FAIL: $failCount, WARN: $warnCount"
                 }
+                $message = New-BRAVOOperatorNotificationMessage `
+                    -Severity $severity `
+                    -Operation $operationText `
+                    -ActionText $(if ($severity -eq "SUCCESS") { $null } else { "перевірити restore drill і журнал відновлення." }) `
+                    -InstitutionName ([string]$bravoSettings.InstitutionName) `
+                    -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+                    -HostInformation (Get-HostInformation) `
+                    -ResultLines (@($resultHeadline) + $summaryLines) `
+                    -Timestamp (Get-Date) `
+                    -ProductName "BRAVO Restore Drill" `
+                    -Version ([string]$global:ScriptVersion) `
+                    -BuildId ([string]$global:ScriptBuildId)
+                # Канонічний маршрут (BRAVO.Notifications): SUCCESS -> GENERAL,
+                # WARNING/CRITICAL -> ALERTS; route-специфічні credential
+                # targets із legacy-fallback на provider-wide webhook.
+                $notificationRoutingTable = if ($bravoSettings.Contains('NotificationRouting') -and
+                    $bravoSettings.NotificationRouting -is [hashtable]) {
+                    $bravoSettings.NotificationRouting
+                } else {
+                    $null
+                }
+                [void](Send-BRAVONotification `
+                    -Severity $severity `
+                    -Message $message `
+                    -Provider $notificationProvider `
+                    -NotificationMode $notificationMode `
+                    -RoutingTable $notificationRoutingTable `
+                    -CredentialTargets $credentialSettings.Targets)
             } catch {
                 Add-RestoreDrillResult WARN "Сповіщення" $null $null 0 0 $_.Exception.Message
             }

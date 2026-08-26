@@ -625,6 +625,30 @@ function Get-BRAVOTaskRootReadinessResults {
     return $results.ToArray()
 }
 
+function ConvertTo-BRAVODaysOfWeekMask {
+    # Канонічний bitmask DaysOfWeek для Task Scheduler weekly-тригера
+    # (TASK_TRIGGER_WEEKLY): Sunday=1, Monday=2, ... Saturday=64. Один
+    # розрахунок для Installer (створює тригер) і Diagnose (перевіряє
+    # фактичне визначення) — той самий інваріант, що
+    # Get-BRAVOExpectedSchedulerPrincipal нижче. Невідома назва дня —
+    # throw (fail-closed: невалідний розклад не має мовчки створити
+    # завдання без жодного дня запуску).
+    param([Parameter(Mandatory = $true)][string]$DayOfWeek)
+
+    switch ($DayOfWeek.Trim()) {
+        'Sunday'    { return 1 }
+        'Monday'    { return 2 }
+        'Tuesday'   { return 4 }
+        'Wednesday' { return 8 }
+        'Thursday'  { return 16 }
+        'Friday'    { return 32 }
+        'Saturday'  { return 64 }
+        default {
+            throw "невідомий день тижня '$DayOfWeek' — очікується англійська назва (Sunday..Saturday)"
+        }
+    }
+}
+
 function Get-BRAVOExpectedSchedulerPrincipal {
     # Канонічний principal запланованого завдання з effective schedulerSettings.
     # Installer застосовує САМЕ ці значення під час створення завдання, а
