@@ -4,7 +4,28 @@
 
 ---
 
-## 5.2.1-rc.3 — 2026-08-26 (hotfix candidate, pending acceptance)
+## 5.2.1-rc.4 — 2026-08-26 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.3 + фікс накопичення diskshadow metadata-.cab (реальний
+звіт SERVER-01/Тернопіль: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
+`C:\Program Files\BRAVO-Toolkit` після кожної багатотомної архівації):
+
+- **FIX (archive/VSS): metadata-.cab diskshadow — у TEMP і прибирається.**
+  Сценарій diskshadow.exe не задавав `SET METADATA`, тому VSS writer
+  metadata `.cab` з автоіменем писався в робочий каталог планової
+  задачі (= каталог комплекту) і ніколи не прибирався. BRAVO ці
+  метадані не використовує (контекст `NOWRITERS`): тепер `SET METADATA`
+  вказує в TEMP, файл видаляється у finally разом зі сценарієм, а
+  наявні legacy-.cab цього хоста в каталозі комплекту best-effort
+  зачищаються перед створенням набору. Контракт
+  `BackupConsistency/VSSDiskshadowMetadataGoesToTempAndIsCleaned`.
+
+Acceptance rc.4 (додатково до rc.3): після багатотомної архівації в
+каталозі комплекту немає нових `*_--_*.cab`, старі зникли.
+
+---
+
+## 5.2.1-rc.3 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.4)
 
 Кандидат = rc.2 + одноразова міграція legacy-розкладки архівів MODEL
 (запит власника: старі сервери ARCHIV_LIMS-ери тримають архіви у
