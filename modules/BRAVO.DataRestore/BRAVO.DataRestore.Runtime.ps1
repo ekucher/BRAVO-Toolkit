@@ -1261,9 +1261,19 @@ function Get-BRAVODataRestorePlan {
 function Get-BRAVOSevenZipArchiveInventory {
     # Інвентаризація архіву БЕЗ розпакування: кількість файлів/каталогів і
     # сумарний нестиснутий розмір (free-space preflight + post-verify еталон).
+    #
+    # 5.3.0 (закритий борг CHANGELOG 5.2.0-dev.1): тонкий адаптер над
+    # КАНОНІЧНОЮ Get-BRAVOSevenZipArchiveEntries (BRAVO.Compatibility) —
+    # остання власна копія 7z-listing з legacy BOM-даючим
+    # StandardInput.WriteLine(пароль) прибрана; пароль тепер іде через
+    # BOM-free Write-BRAVOProcessInputText усередині канонічної функції,
+    # тож нові (BOM-free) архіви читаються й під UTF-8-консоллю. Контракт
+    # повернення {Success; FileCount; DirectoryCount;
+    # TotalUncompressedBytes; Description} НЕЗМІННИЙ — його точно звіряє
+    # post-verify Test-BRAVODataRestoreExtractionResult.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
-        Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу) — той самий патерн, що Invoke-BRAVOSevenZipIntegrityTest.')]
+        Justification = 'Пароль передається 7-Zip через redirected stdin канонічною Get-BRAVOSevenZipArchiveEntries (не в аргументи процесу) — той самий патерн, що Invoke-BRAVOSevenZipIntegrityTest.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$SevenZipPath,
@@ -1272,87 +1282,32 @@ function Get-BRAVOSevenZipArchiveInventory {
         [int]$TimeoutSeconds = 43200
     )
 
-    $process = $null
-    $capture = $null
-    $timedOut = $false
-    $exitCode = $null
     try {
-        if (-not (Test-Path -LiteralPath $ArchivePath -PathType Leaf)) {
-            throw "архів не знайдено: $ArchivePath"
-        }
-        $processInfo = New-Object System.Diagnostics.ProcessStartInfo
-        $processInfo.FileName = $SevenZipPath
-        $processInfo.Arguments = "l -slt `"$ArchivePath`""
-        $processInfo.RedirectStandardInput = $true
-        $processInfo.RedirectStandardOutput = $true
-        $processInfo.RedirectStandardError = $true
-        $processInfo.UseShellExecute = $false
-        $processInfo.CreateNoWindow = $true
-
-        $process = New-Object System.Diagnostics.Process
-        $process.StartInfo = $processInfo
-        $capture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($Password)
-        $process.StandardInput.Close()
-
-        if ($TimeoutSeconds -gt 0) {
-            $completed = $process.WaitForExit([int][math]::Min([double][int]::MaxValue, [double]$TimeoutSeconds * 1000))
-        } else {
-            $process.WaitForExit()
-            $completed = $true
-        }
-        if (-not $completed) {
-            $timedOut = $true
-            try { $process.Kill(); [void]$process.WaitForExit(5000) } catch {
-                # Kill процесу, що вже завершився сам, кидає InvalidOperation —
-                # результат той самий (процес мертвий), логувати нічого.
-            }
-        }
-        $capturedOutput = Complete-BRAVOProcessOutputCapture -Capture $capture
-        $capture = $null
-        if ($process.HasExited) { $exitCode = [int]$process.ExitCode }
-        if ($timedOut -or $exitCode -ne 0) {
+        $listing = Get-BRAVOSevenZipArchiveEntries `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $ArchivePath `
+            -Password $Password `
+            -TimeoutSeconds $TimeoutSeconds
+        if (-not $listing.Success) {
             return [pscustomobject]@{
                 Success = $false
                 FileCount = 0
                 DirectoryCount = 0
                 TotalUncompressedBytes = [long]0
-                Description = (Get-BRAVOSevenZipExitCodeDescription -ExitCode $exitCode -TimedOut:$timedOut)
+                Description = [string]$listing.Error
             }
         }
 
         $fileCount = 0
         $directoryCount = 0
         $totalBytes = [long]0
-        $inEntries = $false
-        $currentIsDirectory = $false
-        $currentSize = [long]0
-        $currentOpen = $false
-        foreach ($outputLine in ([string]$capturedOutput.StandardOutput -split "\r?\n")) {
-            if (-not $inEntries) {
-                if ($outputLine -match '^-{5,}\s*$') { $inEntries = $true }
-                continue
+        foreach ($entry in @($listing.Entries)) {
+            if ([bool]$entry.IsDirectory) {
+                $directoryCount++
+            } else {
+                $fileCount++
+                $totalBytes += [long]$entry.Size
             }
-            if ($outputLine -match '^Path = ') {
-                if ($currentOpen) {
-                    if ($currentIsDirectory) { $directoryCount++ } else { $fileCount++; $totalBytes += $currentSize }
-                }
-                $currentOpen = $true
-                $currentIsDirectory = $false
-                $currentSize = [long]0
-                continue
-            }
-            if (-not $currentOpen) { continue }
-            if ($outputLine -match '^Size = (\d+)\s*$') {
-                $currentSize = [long]$Matches[1]
-            } elseif ($outputLine -match '^Attributes = (\S+)') {
-                if (([string]$Matches[1]).StartsWith('D')) { $currentIsDirectory = $true }
-            } elseif ($outputLine -match '^Folder = \+') {
-                $currentIsDirectory = $true
-            }
-        }
-        if ($currentOpen) {
-            if ($currentIsDirectory) { $directoryCount++ } else { $fileCount++; $totalBytes += $currentSize }
         }
         return [pscustomobject]@{
             Success = $true
@@ -1369,14 +1324,6 @@ function Get-BRAVOSevenZipArchiveInventory {
             TotalUncompressedBytes = [long]0
             Description = $_.Exception.Message
         }
-    } finally {
-        if ($null -ne $capture) {
-            try { [void](Complete-BRAVOProcessOutputCapture -Capture $capture) } catch {
-                # Cleanup-гілка після помилки: збій закриття capture не має
-                # маскувати первинний exception, який зараз летить нагору.
-            }
-        }
-        if ($null -ne $process) { $process.Dispose() }
     }
 }
 

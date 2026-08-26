@@ -493,6 +493,20 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "DryRun/ModeLabelReflectsWriteProbes" `
         -Failure "з -TestAccess прогін робить локальні проби запису і створює каталоги на SFTP, тому заголовок не має безумовно повідомляти оператору READ-ONLY"
 
+    # P2-знахідка acceptance 5.2.0: тестове повідомлення -SendTestNotification
+    # завжди йшло в ALERTS, бо Test-DryRunWebhookCredential ітерував маршрути
+    # у порядку ('alerts','general') і ПЕРШИЙ resolved осідав у слот, з
+    # якого шлеться тест. SUCCESS-семантика канонічно належить GENERAL —
+    # 'general' мусить стояти першим (fallback на legacy/alerts зберігається).
+    # BRAVO_SETUP і BRAVO_TASKS_DIAGNOSE успадковують (шлють через dry-run).
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunScriptTextForSftp.Contains("foreach (`$route in @('general', 'alerts'))") -and
+            -not $dryRunScriptTextForSftp.Contains("foreach (`$route in @('alerts', 'general'))")
+        ) `
+        -Name "DryRun/TestNotificationPrefersGeneralRoute" `
+        -Failure "Test-DryRunWebhookCredential має резолвити маршрут 'general' першим — тестове SUCCESS-повідомлення належить GENERAL, а не ALERTS"
+
     # --- RELEASE_POLICY.md розділ 16: dev/RC-релізи мають бути позначені як
     # pre-release, і лише stable може бути Latest. Без --prerelease workflow
     # створював чернетку RC як звичайний реліз, і після публікації неприйнятий
@@ -2450,7 +2464,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     Test-BRAVOCondition `
         -Condition (
             $dryRunWebhookCapture.RouteSpecificStatus -like 'PASS|*' -and
-            $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-ALERTS' -and
+            # 5.3.0: слот надсилання тестового повідомлення тримає GENERAL
+            # (перший resolved route; SUCCESS-семантика тесту) — раніше
+            # тут осідав ALERTS, і тест завжди падав у канал алертів.
+            $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-GENERAL' -and
             $dryRunWebhookCapture.LegacyStatus -like 'PASS|*' -and
             $dryRunWebhookCapture.LegacySecret -eq 'STUB-LEGACY' -and
             $dryRunWebhookCapture.MissingStatus -like 'FAIL|*'
@@ -4440,6 +4457,14 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         [Text.Encoding]::UTF8
     )
     $sevenZipPasswordInArgumentsPattern = '(?im)^.*(?:^|\s)-p(?:\$|"|\{).*archivePassword.*$'
+    # 5.3.0: гейт розширено на BRAVO.DataRestore.Runtime.ps1 — його приватна
+    # Get-BRAVOSevenZipArchiveInventory була останньою точкою на legacy
+    # BOM-даючому StandardInput.WriteLine(пароль) і мігрована на канонічну
+    # Get-BRAVOSevenZipArchiveEntries (борг CHANGELOG 5.2.0-dev.1).
+    $dataRestoreScriptTextForSecrets = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains("RedirectStandardInput = `$true") -and
@@ -4450,15 +4475,18 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $compatibilityScriptText.Contains("Write-BRAVOProcessInputText -Process `$process -Text `$Password") -and
             $compatibilityScriptText.Contains('$Process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)') -and
             $compatibilityScriptText -notmatch [regex]::Escape('StandardInput.WriteLine($Password)') -and
+            $dataRestoreScriptTextForSecrets -notmatch [regex]::Escape('StandardInput.WriteLine($Password)') -and
+            $dataRestoreScriptTextForSecrets.Contains('Get-BRAVOSevenZipArchiveEntries') -and
             $archiveScriptText -notmatch '(?i)-p`"\{0\}`"' -and
             $maintenanceScriptText -notmatch '(?i)-p\$\(' -and
             $compatibilityScriptText -notmatch '(?i)-p`"\{0\}`"' -and
             $archiveScriptText -notmatch $sevenZipPasswordInArgumentsPattern -and
             $maintenanceScriptText -notmatch $sevenZipPasswordInArgumentsPattern -and
-            $compatibilityScriptText -notmatch $sevenZipPasswordInArgumentsPattern
+            $compatibilityScriptText -notmatch $sevenZipPasswordInArgumentsPattern -and
+            $dataRestoreScriptTextForSecrets -notmatch $sevenZipPasswordInArgumentsPattern
         ) `
         -Name "Secrets/SevenZipPasswordUsesStdin" `
-        -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу"
+        -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу (включно з BRAVO.DataRestore inventory, мігрованим на канонічну Get-BRAVOSevenZipArchiveEntries)"
 
     # Реальний випадок: власний прогрес-бокс Test-NetConnection
     # ("Attempting TCP connect", "Waiting for response") усе одно

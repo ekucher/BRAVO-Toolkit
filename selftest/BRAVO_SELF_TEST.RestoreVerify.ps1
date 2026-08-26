@@ -142,10 +142,11 @@
             $taskInstallerTextForVerify.Contains('$definition.Triggers.Create(3) # TASK_TRIGGER_WEEKLY') -and
             $taskInstallerTextForVerify.Contains('ConvertTo-BRAVODaysOfWeekMask -DayOfWeek ([string]$TaskSettings.WeeklyOn)') -and
             $taskInstallerTextForVerify.Contains('Type = "RestoreVerify"; Settings = $schedulerSettings.RestoreVerify') -and
-            $taskUninstallerTextForVerify.Contains('$schedulerSettings.RestoreVerify.TaskName')
+            $taskUninstallerTextForVerify.Contains('$schedulerSettings.RestoreVerify.TaskName') -and
+            $taskUninstallerTextForVerify.Contains('$schedulerSettings.BAZASync.TaskName')
         ) `
         -Name 'Scheduler/RestoreVerifyTaskTypeRegistered' `
-        -Failure 'RestoreVerify має бути повноцінним типом завдання: ValidateSet + weekly-тригер через канонічний DaysOfWeek-mask у TASKS_INSTALL, елемент taskPlans і видалення у TASKS_UNINSTALL'
+        -Failure 'RestoreVerify має бути повноцінним типом завдання: ValidateSet + weekly-тригер через канонічний DaysOfWeek-mask у TASKS_INSTALL, елемент taskPlans і видалення у TASKS_UNINSTALL (разом із BAZASync — історичний пропуск переліку деінсталяції)'
 
     # --- Loader: legacy-конфіг без RestoreVerify-вузлів отримує дефолти ---
     # Та сама фікстурна механіка, що ConfigurationLoader/MissingBootRestoreModeDefaultsToNone:

@@ -2,6 +2,34 @@
 
 ## Не випущено (developer)
 
+- **FIX-пакет (deferred debts циклу 5.2.0):** п'ять відкладених
+  runtime/операційних боргів одним PR (окремі коміти):
+  1. *Lock-wait діагностика* (порт `127e7e4` з
+     `backup/local-developer-rc2-line`): обидва власники спільного
+     `BRAVO_OPERATION.lock` (Archive/Maintenance) кожні 30 с очікування
+     логують, ХТО тримає lock (operation/pid/hostname/startedAt/
+     generationId) і залишок часу; handle власника з `FileShare.Read`
+     (peek можливий, ексклюзивність не слабшає).
+  2. *Compare-FileSizes* (порт `67f3ad3`+`e2c61e1`+`f7f6628` у
+     переписане в 5.2.0 тіло): пряма
+     `[IO.DirectoryInfo]::EnumerateFiles`-enumeration з Hidden/System-
+     фільтром замість ненадійного `Get-ChildItem -Recurse`
+     (детермінований інцидент ДНДІЛДВСЕ ~364 «зниклих» файлів) +
+     settle-retry 12×15с ЛИШЕ при знайдених критичних розбіжностях
+     (AV-race видимості; канонічний фікс — AV-виняток, runbook у
+     OPERATIONS.md код 43); tripwire розсинхрону шляхів виконується
+     один раз після retry-циклу; fail-closed не послаблено (регресії
+     SettleRetry* — реальний файл через Start-Job).
+  3. *BOM-міграція `Get-BRAVOSevenZipArchiveInventory`* (DataRestore):
+     тонкий адаптер над канонічною `Get-BRAVOSevenZipArchiveEntries` —
+     остання точка legacy `StandardInput.WriteLine(пароль)` прибрана;
+     контракт повернення незмінний; гейт
+     `Secrets/SevenZipPasswordUsesStdin` розширено на DataRestore.
+  4. *Dry-run тестове повідомлення* — у GENERAL (SUCCESS-семантика)
+     замість ALERTS; SETUP/TASKS_DIAGNOSE успадковують.
+  5. *TASKS_UNINSTALL* — видаляє й задачу BAZASync (історичний пропуск
+     переліку деінсталяції).
+
 - **FEATURE (P2.1, status contract): machine-readable статус останніх
   прогонів.** Новий тонкий модуль `BRAVO.Status` (schemaVersion 1) —
   канонічний власник контракту: Archive, Health, Maintenance і
@@ -61,18 +89,21 @@
 
 Записаний борг/план циклу 5.3.0 (пріоритети власника: P1 → P2 → далі):
 
-- **P1 — Scheduled Restore Verification** (наступний етап за планом
-  власника; окреме завдання).
-- **P2 — Machine-readable Status Contract v1** (після P1).
+- **P1 — Scheduled Restore Verification** *(виконано в dev.1,
+  `BRAVO_RESTORE_VERIFY`)*.
+- **P2 — Machine-readable Status Contract v1** *(виконано в dev.1,
+  `BRAVO.Status`)*.
 - Відкладені runtime-фікси: settle/AV/enumeration Compare-FileSizes
   (збережені в `backup/local-developer-rc2-line`), `127e7e4`
-  lock-wait diagnostics.
-- P2-знахідка acceptance: dry-run тест-повідомлення завжди в ALERTS
-  (рішення 5.3.0 vs окремий фікс не прийняте).
+  lock-wait diagnostics. *(Виконано в dev.1 — пакет deferred-фіксів
+  нижче.)*
+- P2-знахідка acceptance: dry-run тест-повідомлення завжди в ALERTS.
+  *(Виконано в dev.1 — тест іде в GENERAL.)*
 - P3.2a (`BRAVO_UPDATE.ps1`), M1 (`WinSCP.uk` у TOOLS_MANIFEST після
-  підтвердження походження), M3, BOM known-issue
-  `Get-BRAVOSevenZipArchiveInventory`.
-- Гігієна: видалення ~15 злитих remote-гілок циклу 5.2.0.
+  підтвердження походження), M3 — відкриті. BOM known-issue
+  `Get-BRAVOSevenZipArchiveInventory` *(виконано в dev.1 — міграція на
+  канонічну `Get-BRAVOSevenZipArchiveEntries`)*.
+- Гігієна: видалення ~15+ злитих remote-гілок циклу 5.2.0 — відкрито.
 
 ---
 
