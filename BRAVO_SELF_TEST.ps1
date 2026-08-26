@@ -2464,7 +2464,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     Test-BRAVOCondition `
         -Condition (
             $dryRunWebhookCapture.RouteSpecificStatus -like 'PASS|*' -and
-            $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-ALERTS' -and
+            # 5.2.1: слот надсилання тестового повідомлення тримає GENERAL
+            # (перший resolved route; SUCCESS-семантика тесту) — раніше тут
+            # осідав ALERTS, і тест завжди падав у канал алертів.
+            $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-GENERAL' -and
             $dryRunWebhookCapture.LegacyStatus -like 'PASS|*' -and
             $dryRunWebhookCapture.LegacySecret -eq 'STUB-LEGACY' -and
             $dryRunWebhookCapture.MissingStatus -like 'FAIL|*'

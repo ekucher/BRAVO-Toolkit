@@ -4,10 +4,32 @@
 
 ---
 
-## 5.2.1-rc.1 — 2026-08-26 (hotfix candidate, pending acceptance)
+## 5.2.1-rc.2 — 2026-08-26 (hotfix candidate, pending acceptance)
+
+Hotfix-кандидат лінії 5.2.x = rc.1 + другий операторський фікс,
+відтворений власником на тому самому сервері (Тернопіль):
+
+- **FIX (dry-run, операторський UX):** тестове повідомлення
+  `-SendTestNotification` надходило в ALERTS замість GENERAL —
+  порядок резолвінгу маршрутів у `Test-DryRunWebhookCredential` клав
+  ALERTS-webhook у слот надсилання. Тепер `('general','alerts')`:
+  SUCCESS-семантика тесту → GENERAL; fallback на legacy provider-wide
+  webhook/alerts збережено; `BRAVO_SETUP` і `BRAVO_TASKS_DIAGNOSE`
+  успадковують (шлють через dry-run). Той самий фікс уже в лінії 5.3.0
+  (developer); сюди перенесений cherry-pick-ом.
+
+Acceptance rc.2: обидва сценарії — (1) денний ручний прогін
+`BRAVO_MAINTENANCE.ps1` поза вікном → УСПІШНО/exit 0, SUCCESS у
+GENERAL, рядок пропуску `[INFO]`; (2) `BRAVO_DRY_RUN.ps1 -TestAccess
+-SendTestNotification` → тестове повідомлення в GENERAL.
+
+---
+
+## 5.2.1-rc.1 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.2)
 
 Hotfix-кандидат лінії 5.2.x (гілка `hotfix/5.2.1` від stable 5.2.0).
-Одна вузька зміна:
+На перевірці rc.1 власник відтворив другу хибну маршрутизацію (dry-run
+тест в ALERTS) — кандидата одразу замінено rc.2 вище. Одна вузька зміна:
 
 - **FIX (maintenance, операторський UX):** «Реставрацію пропущено: ...
   поза дозволеним вікном» — рівень WARNING → INFO (реальний денний
