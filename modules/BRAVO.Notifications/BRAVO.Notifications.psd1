@@ -1,6 +1,6 @@
 ﻿@{
     RootModule = 'BRAVO.Notifications.psm1'
-    ModuleVersion = '5.2.0'
+    ModuleVersion = '5.2.1'
     GUID = 'b7229730-af64-4cb1-822e-9cf44c4d6546'
     PowerShellVersion = '3.0'
     FunctionsToExport = @(
