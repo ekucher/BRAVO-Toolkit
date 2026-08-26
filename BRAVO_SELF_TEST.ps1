@@ -10988,9 +10988,13 @@ function Get-BRAVOMaintenanceSummaryResult {
     # поза вікном логувався як WARNING, тому інкрементував BRAVOWarningCount
     # -> severity сповіщення WARNING -> оператор бачив жовте "ПОТРІБНА ДІЯ:
     # перевірити журнал" при повністю зеленому списку етапів. Це констатація
-    # свідомої дії оператора, а не аномалія -> INFO. Сусідня гілка
-    # "Реставрацію пропущено ... поза дозволеним вікном" МУСИТЬ лишатись
-    # WARNING: там заплановане не виконано.
+    # свідомої дії оператора, а не аномалія -> INFO.
+    # 5.2.1 (рішення власника, реальний денний прогін ТЕРНОПІЛЬСЬКА РДЛ
+    # 2026-08-26): гілка "Реставрацію пропущено ... поза дозволеним вікном"
+    # — ТОЙ САМИЙ клас хибного «ПОТРІБНА ДІЯ» (слот не втрачається:
+    # підхоплюється нічним Maintenance у вікні / boot-Recovery) — теж INFO;
+    # справжній розсинхрон конфігурації покриває окреме попередження
+    # $maintenanceDailyAtInsideRestoreWindow.
     $forceRestoreOutsideWindowIndex = $maintenanceScriptTextForManifestStorage.IndexOf(
         '"Примусова реставрація поза дозволеним вікном')
     $forceRestoreOutsideWindowWindow = if ($forceRestoreOutsideWindowIndex -ge 0) {
@@ -11007,10 +11011,11 @@ function Get-BRAVOMaintenanceSummaryResult {
             $forceRestoreOutsideWindowWindow.Contains('-Level "INFO"') -and
             -not $forceRestoreOutsideWindowWindow.Contains('-Level "WARNING"') -and
             $restoreSkippedByWindowIndex -ge 0 -and
-            $restoreSkippedByWindowWindow.Contains('-Level "WARNING"')
+            $restoreSkippedByWindowWindow.Contains('-Level "INFO"') -and
+            -not $restoreSkippedByWindowWindow.Contains('-Level "WARNING"')
         ) `
-        -Name "Maintenance/ForcedRestoreOutsideWindowIsInfoNotWarning" `
-        -Failure "'Примусова реставрація поза дозволеним вікном' (-ForceRestore = свідома дія оператора) має логуватись як INFO, щоб не піднімати BRAVOWarningCount/severity/exit 10; при цьому 'Реставрацію пропущено ... поза дозволеним вікном' мусить лишатись WARNING"
+        -Name "Maintenance/RestoreWindowSkipsAreInfoNotWarning" `
+        -Failure "обидві гілки поза вікном ('Примусова реставрація...' і 'Реставрацію пропущено...') мають логуватись як INFO — слот не втрачається (нічний Maintenance/boot-Recovery), а WARNING давав хибне «ПОТРІБНА ДІЯ» з exit 10 при зеленому прогоні (Тернопіль 2026-08-26)"
 
     # --- РЕГРЕСІЯ (реальний DEV-LIMS прогін 20:29): підсумок показав
     # "Кроків: 8" при "Успішно: 9" + "Пропущено: 4" — арифметично
