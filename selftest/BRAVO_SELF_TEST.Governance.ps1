@@ -304,9 +304,11 @@
     )
     $stableVersionModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $masterMergePolicyText `
-        -FunctionNames @('Test-BRAVOStableVersionPromotion')
+        -FunctionNames @('Test-BRAVOStableVersionPromotion', 'Test-BRAVOMasterMergeSource')
     $stableVersionScenarios = @(
         @{ Head = '5.2.0';      Master = '5.1.0';   ExpectFailures = 0; Label = 'GenuineIncrease' }
+        @{ Head = '5.2.1';      Master = '5.2.0';   ExpectFailures = 0; Label = 'PatchIncrease' }
+        @{ Head = '5.3.0';      Master = '5.2.9';   ExpectFailures = 0; Label = 'MinorRolloverIncrease' }
         @{ Head = '5.10.0';     Master = '5.9.0';   ExpectFailures = 0; Label = 'SemanticNotLexical' }
         @{ Head = '5.2.0';      Master = '';        ExpectFailures = 0; Label = 'NoMasterVersionYet' }
         @{ Head = '5.2.0-rc.9'; Master = '5.1.0';   ExpectFailures = 1; Label = 'PrereleaseRejected' }
@@ -323,6 +325,32 @@
             -Condition (@($scenarioFailures).Count -eq [int]$scenario.ExpectFailures) `
             -Name "ReleasePolicy/StableVersionPromotion[$($scenario.Label)]" `
             -Failure "Test-BRAVOStableVersionPromotion('$($scenario.Head)' vs '$($scenario.Master)') має дати $($scenario.ExpectFailures) порушень; отримано $(@($scenarioFailures).Count): $($scenarioFailures -join ' | ')"
+    }
+
+    # ROADMAP P0.2 (repository identity): ім'я head-гілки не ідентифікує
+    # репозиторій — fork з гілкою 'developer'/'hotfix/*' не повинен
+    # проходити гейт промоції в master. Невизначений head-репозиторій —
+    # теж FAIL (fail-closed), а не мовчазний skip. Та сама екстракція з
+    # канонічного ci-скрипта — жодної другої копії правила.
+    $mergeSourceScenarios = @(
+        @{ HeadRef = 'developer';   HeadRepo = 'ekucher/BRAVO-Toolkit'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 0; Label = 'SameRepoDeveloper' }
+        @{ HeadRef = 'hotfix/x';    HeadRepo = 'ekucher/BRAVO-Toolkit'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 0; Label = 'SameRepoHotfix' }
+        @{ HeadRef = 'developer';   HeadRepo = 'EKUCHER/BRAVO-TOOLKIT'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 0; Label = 'SameRepoCaseInsensitive' }
+        @{ HeadRef = 'feature/x';   HeadRepo = 'ekucher/BRAVO-Toolkit'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 1; Label = 'SameRepoFeatureRejected' }
+        @{ HeadRef = 'developer';   HeadRepo = 'attacker/BRAVO-Toolkit'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 1; Label = 'ForkDeveloperRejected' }
+        @{ HeadRef = 'hotfix/x';    HeadRepo = 'attacker/BRAVO-Toolkit'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 1; Label = 'ForkHotfixRejected' }
+        @{ HeadRef = 'developer';   HeadRepo = '';                       BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 1; Label = 'UnknownHeadRepoFailsClosed' }
+        @{ HeadRef = 'feature/x';   HeadRepo = 'attacker/BRAVO-Toolkit'; BaseRepo = 'ekucher/BRAVO-Toolkit'; ExpectFailures = 2; Label = 'ForkFeatureBothViolations' }
+    )
+    foreach ($scenario in $mergeSourceScenarios) {
+        $scenarioFailures = @(& $stableVersionModule {
+            param($ScenarioHeadRef, $ScenarioHeadRepo, $ScenarioBaseRepo)
+            Test-BRAVOMasterMergeSource -HeadRef $ScenarioHeadRef -HeadRepository $ScenarioHeadRepo -BaseRepository $ScenarioBaseRepo
+        } $scenario.HeadRef $scenario.HeadRepo $scenario.BaseRepo)
+        Test-BRAVOCondition `
+            -Condition (@($scenarioFailures).Count -eq [int]$scenario.ExpectFailures) `
+            -Name "ReleasePolicy/MasterMergeSource[$($scenario.Label)]" `
+            -Failure "Test-BRAVOMasterMergeSource('$($scenario.HeadRef)' з '$($scenario.HeadRepo)' у '$($scenario.BaseRepo)') має дати $($scenario.ExpectFailures) порушень; отримано $(@($scenarioFailures).Count): $($scenarioFailures -join ' | ')"
     }
 
     # Пастка циклу 5.2.0-rc: збірник артефакту навмисно лишає

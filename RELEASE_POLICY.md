@@ -747,10 +747,27 @@ production-реліз може повторно повернути вже вип
 - дозволити merge робочих гілок;
 - не дозволяти stable-версії.
 
-Технічний стан на сьогодні: branch protection **не ввімкнено** —
-required status checks на приватному репозиторії потребують GitHub Pro.
-Тому CI показує статус, але не блокує merge; дотримання цього розділу
-поки що ручне (`RELEASE_CHECKLIST.md`, розділ 2).
+Технічний стан (перевірено 2026-08-26, репозиторій публічний —
+branch protection доступний без платного плану): protection
+**увімкнено** для обох гілок.
+
+- `master`: зміни лише через Pull Request; required checks
+  «Parser / BOM / JSON», «PSScriptAnalyzer», «BRAVO_SELF_TEST.ps1»,
+  «Secret scanning (gitleaks)», «GitGuardian Security Checks»
+  (strict — гілка мусить бути актуальною); force push і видалення
+  гілки заборонені; `enforce_admins` увімкнено (обхід адміністратором
+  заблоковано — прецедент merge PR #61 у вікні промоції 5.1.0 більше
+  технічно неможливий).
+- `developer`: зміни лише через Pull Request; ті самі required
+  checks (без strict-вимоги актуальності гілки); force push і
+  видалення заборонені; `enforce_admins` увімкнено.
+
+Дозволене джерело промоції в `master` (`developer`/`hotfix/*` з
+ЦЬОГО репозиторію, а не fork з однойменною гілкою) і семантичне
+підняття stable-версії додатково контролює CI-гейт
+`ci\Test-BRAVOMasterMergePolicy.ps1` (крок у required check
+«Parser / BOM / JSON»), тож порушення політики блокує merge
+технічно, а не лише процедурно.
 
 ---
 

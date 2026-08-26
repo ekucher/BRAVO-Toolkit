@@ -48,8 +48,10 @@
       гілки — не інструмент, який це вимагає автоматично; дотримуйтесь
       вручну.)
 - [ ] GitHub Actions CI (`.github/workflows/ci.yml`) зелений на коміті
-      релізу — перевірте вкладку Actions перед тегуванням; CI не блокує
-      merge технічно (немає branch protection), тому перевірка ручна.
+      релізу — перевірте вкладку Actions перед тегуванням. Branch
+      protection на `master` і `developer` увімкнено (перевірено
+      2026-08-26): merge технічно заблоковано, доки required checks не
+      зелені; цей пункт лишається як свідома фінальна звірка.
 - [ ] `RUNTIME_MANIFEST.json` перегенеровано **після останньої зміни
       коду**: `ci\Update-BRAVORuntimeManifest.ps1 -Apply`. Без цього
       свіжо розгорнутий комплект заблокує сам себе на першому ж запуску
@@ -117,11 +119,11 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
 - CI (аудит AUD-001) — тепер існує: `.github/workflows/ci.yml`
   (`windows-latest`, парсинг, BOM, JSON, `PSScriptAnalyzer`, повний
   `BRAVO_SELF_TEST.ps1`, `gitleaks`), запускається на кожен push/PR.
-  **Не** ввімкнено branch protection — CI показує статус, але технічно
-  ще не блокує merge/push у `master`. Не забутий крок: спроба через
-  `gh api` заблокована самим GitHub — required status checks на
-  приватних репозиторіях вимагає GitHub Pro. Доступно знову, якщо
-  репозиторій стане публічним або власник апгрейдить план.
+  Branch protection **увімкнено** (2026-08-26; репозиторій публічний,
+  обмеження GitHub Pro для приватних більше не діє): `master` і
+  `developer` приймають зміни лише через PR із зеленими required
+  checks, force push/видалення заборонені, `enforce_admins` увімкнено.
+  Фактичний стан описано в `RELEASE_POLICY.md`, розділ 13.
 - Tools hashes (`TOOLS_INTEGRITY.json`) — TOFU, не еталонний release
   manifest; оновлюються самі при першому запуску на кожному сервері, а
   не публікуються разом з релізом (аудит P0.2).
