@@ -991,8 +991,10 @@ developer: 4.5.1-dev.1
 master:    5.2.0       (stable, тег v5.2.0 = stamp b76a5ac,
            merge PR #102 = 477f166; metadata-only промоція
            2026-08-26 з прийнятого 5.2.0-rc.13)
-developer: 5.3.0-dev.1 (development; цикл відкрито одразу після
-           промоції, розділ 4/11)
+developer: 5.3.0-rc.1 (prerelease; перший кандидат циклу 5.3.0 =
+           dev.1 + P1.1 BRAVO_RESTORE_VERIFY + P2.1 status contract +
+           FIX-пакет deferred-боргів; real-server acceptance —
+           очікується, scope у CHANGELOG-розділі rc.1)
 ```
 
 Дерево stable 5.2.0 = прийнятий `v5.2.0-rc.13` (stamp `0247ac3`,

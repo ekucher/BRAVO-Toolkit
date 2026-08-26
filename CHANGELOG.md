@@ -2,6 +2,38 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.3.0-rc.1 — 2026-08-26 (candidate, pending acceptance)
+
+Перший кандидат циклу 5.3.0. Кандидат = `5.3.0-dev.1` (розділ нижче:
+P1.1 `BRAVO_RESTORE_VERIFY`, P2.1 machine-readable status contract,
+FIX-пакет deferred-боргів 5.2.0). Runtime-зміни в цьому bump відсутні —
+лише версійні метадані.
+
+Scope real-server acceptance rc.1 (уся нова поверхня циклу):
+
+- повторний запуск `BRAVO_TASKS_INSTALL.ps1` → задача
+  `BRAVO_RESTORE_VERIFY` (weekly, Сб 04:00) зареєстрована;
+  `BRAVO_TASKS_DIAGNOSE.ps1` зелений (включно з weekly-тригером);
+- прогін drill (ручний `schtasks /Run \BRAVO\BRAVO_RESTORE_VERIFY` або
+  суботній слот): консоль SCHEDULED-режиму, стан
+  `BRAVO_RESTORE_VERIFY_STATE.json`, SUCCESS-повідомлення в GENERAL;
+- Health: крок «Відновлюваність (restore drill)» (до першого прогону —
+  нагадування, після — вік верифікації);
+- файли `%ProgramData%\BRAVO\State\STATUS\BRAVO_STATUS_<Operation>.json`
+  від SYSTEM-задач (Archive/Health/Maintenance/RestoreVerify) після
+  нічного циклу;
+- lock-wait: за конкуренції Archive/Maintenance у лозі видно, хто
+  тримає lock;
+- Compare-FileSizes: недільна реставрація без false-positive (нова
+  enumeration + settle-retry), tripwire мовчить;
+- dry-run `-SendTestNotification`: тестове повідомлення в GENERAL;
+- `BRAVO_TASKS_UNINSTALL.ps1` (на тестовому сервері): видаляє й
+  BAZASync-задачу.
+
+Зміст кандидата (накопичено в developer після dev.1):
+
 - **FIX-пакет (deferred debts циклу 5.2.0):** п'ять відкладених
   runtime/операційних боргів одним PR (окремі коміти):
   1. *Lock-wait діагностика* (порт `127e7e4` з
