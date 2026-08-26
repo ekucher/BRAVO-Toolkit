@@ -693,11 +693,17 @@ function ConvertTo-BRAVONotificationPayloadText {
     # Split-DiscordNotificationText лишається як defense-in-depth.
     $limitedMessage = Limit-BRAVONotificationPayload -Message $Message -TransportLabel $Provider
 
+    # Unary comma зберігає масивність крізь pipeline-повернення: `return @(...)`
+    # з одним chunk-ом PowerShell 5.1 розгортає у скаляр-[string], і `.Count`
+    # у викликача під Set-StrictMode 2.0 кидає PropertyNotFoundException
+    # (спостережено 2026-08-27 на ХРДЛ: хибний ERROR «Не вдалося відправити
+    # сповіщення про несумісні імена BAZA_APP» після фактично доставленого
+    # webhook-повідомлення).
     if ($Provider.ToLowerInvariant() -eq "discord") {
         $discordText = ConvertTo-DiscordNotificationText -Message $limitedMessage
-        return @(Split-DiscordNotificationText -Message $discordText)
+        return ,@(Split-DiscordNotificationText -Message $discordText)
     }
-    return @($limitedMessage)
+    return ,@($limitedMessage)
 }
 
 function Send-BRAVONotificationChunks {

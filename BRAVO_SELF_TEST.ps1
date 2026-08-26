@@ -2159,10 +2159,13 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     $guardOversizeLines += @(1..500 | ForEach-Object { "рядок діагностики номер $_ з достатньо довгим текстом" })
     $guardOversizeLines += ':memo: Журнал: C:\Program Files\BRAVO-Toolkit\LOGS\BRAVO_MAINTENANCE_test.log'
     $guardOversizeMessage = $guardOversizeLines -join "`n"
-    $guardSlackChunks = @(ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardOversizeMessage 3>$null)
-    $guardDiscordChunks = @(ConvertTo-BRAVONotificationPayloadText -Provider discord -Message $guardOversizeMessage 3>$null)
+    # Без зовнішнього @(...): конвертор з 5.2.1-rc.8 сам гарантує масив
+    # (unary comma), а @() навколо виклику загорнув би його вдруге —
+    # [0] став би вкладеним масивом замість рядка.
+    $guardSlackChunks = ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardOversizeMessage 3>$null
+    $guardDiscordChunks = ConvertTo-BRAVONotificationPayloadText -Provider discord -Message $guardOversizeMessage 3>$null
     $guardSmallMessage = "коротке повідомлення`n:memo: Журнал: X"
-    $guardSmallChunks = @(ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardSmallMessage 3>$null)
+    $guardSmallChunks = ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardSmallMessage 3>$null
     Test-BRAVOCondition `
         -Condition (
             @($guardSlackChunks).Count -eq 1 -and
@@ -2190,6 +2193,23 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "Notifications/PayloadGuardLeavesSmallMessagesUntouched" `
         -Failure "малий payload має проходити без змін і без truncation-suffix"
+    # Регресія 5.2.1-rc.8 (ХРДЛ 2026-08-27): одно-chunk результат конвертора
+    # присвоювався без зовнішнього @(...) і PowerShell 5.1 розгортав його в
+    # скаляр-[string]; наступний .Count під Set-StrictMode 2.0 кидав
+    # PropertyNotFoundException і логував хибний ERROR про недоставлене
+    # сповіщення. Конвертор зобов'язаний повертати масив для БУДЬ-ЯКОЇ
+    # кількості chunk-ів (unary comma), щоб .Count у викликачів був безпечним.
+    $guardSmallSlackProbe = ConvertTo-BRAVONotificationPayloadText -Provider slack -Message $guardSmallMessage 3>$null
+    $guardSmallDiscordProbe = ConvertTo-BRAVONotificationPayloadText -Provider discord -Message $guardSmallMessage 3>$null
+    Test-BRAVOCondition `
+        -Condition (
+            ($guardSmallSlackProbe -is [System.Array]) -and
+            $guardSmallSlackProbe.Count -eq 1 -and
+            ($guardSmallDiscordProbe -is [System.Array]) -and
+            $guardSmallDiscordProbe.Count -eq 1
+        ) `
+        -Name "Notifications/PayloadTextSingleChunkKeepsArrayness" `
+        -Failure "ConvertTo-BRAVONotificationPayloadText має повертати масив навіть для одного chunk-а (unary comma), інакше .Count на результаті кидає PropertyNotFoundException під Set-StrictMode 2.0; факт: slack=$($guardSmallSlackProbe.GetType().Name), discord=$($guardSmallDiscordProbe.GetType().Name)"
     $archiveNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
     $maintenanceNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
     $dataRestoreNotificationTextForMentions = [IO.File]::ReadAllText((Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"), [Text.Encoding]::UTF8)

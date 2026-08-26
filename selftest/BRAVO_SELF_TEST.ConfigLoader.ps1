@@ -117,7 +117,29 @@ try {
     [void][IO.Directory]::CreateDirectory($localCfgScenarioRoot)
     $localCfgBackupDir = Join-Path $localCfgScenarioRoot 'SITE_BACKUP'
     [void][IO.Directory]::CreateDirectory($localCfgBackupDir)
-    Copy-Item (Join-Path $root 'BRAVO.config') (Join-Path $localCfgScenarioRoot 'BRAVO.config')
+    # Герметичність (CI-провал v5.2.1-rc.7): комплектний дефолт
+    # BackupRoot="" означає AUTO -> <EffectiveLIMSRoot>\ARCHIV, і на
+    # машині БЕЗ інсталяції LIMS (GitHub runner) BRAVO.config кидає
+    # «Не вдалося визначити BackupRoot» — сценарій без overrides
+    # (FileAbsentIsNoop) залежав від середовища прогону. Запікаємо в
+    # копію конфігурації явний BackupRoot (ОКРЕМИЙ від SITE_BACKUP
+    # каталог: фаза-1 сценарій саме доводить, що override з
+    # BRAVO.local.config перемагає явне значення з BRAVO.config).
+    $localCfgDefaultBackupDir = Join-Path $localCfgScenarioRoot 'SITE_DEFAULT'
+    [void][IO.Directory]::CreateDirectory($localCfgDefaultBackupDir)
+    $localCfgKitConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $localCfgBackupRootLiteralLine = '    BackupRoot    = ""'
+    if (-not $localCfgKitConfigText.Contains($localCfgBackupRootLiteralLine)) {
+        throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$localCfgBackupRootLiteralLine' — оновіть підготовку local-config сценаріїв під нову форму конфігурації"
+    }
+    [IO.File]::WriteAllText(
+        (Join-Path $localCfgScenarioRoot 'BRAVO.config'),
+        $localCfgKitConfigText.Replace(
+            $localCfgBackupRootLiteralLine,
+            "    BackupRoot    = '$($localCfgDefaultBackupDir.Replace("'", "''"))'"
+        ),
+        (New-Object System.Text.UTF8Encoding $false)
+    )
     $localCfgOverridePath = Join-Path $localCfgScenarioRoot 'BRAVO.local.config'
     $localCfgBackupLiteral = $localCfgBackupDir.Replace("'", "''")
 
@@ -134,13 +156,15 @@ try {
     $localCfgProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
         -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
             "Set-StrictMode -Version 2.0; " +
+            "try { " +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
             "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
             "'{0}|{1}|{2}|{3}|{4}' -f [string]`$global:archiveDirs.Model, " +
             "[string]`$global:maintenanceSettings.Restore.BootRestoreMode, " +
             "[string]`$global:schedulerSettings.Recovery.Enabled, " +
             "[string]`$global:backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold, " +
-            "(@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count)"
+            "(@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count) " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
         ) 2>&1
     $localCfgProbeLast = ([string](@($localCfgProbe)[-1])).Trim()
     Test-BRAVOCondition `
@@ -185,9 +209,11 @@ try {
     $localCfgAbsentProbe = [string](
         & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
             -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                "try { " +
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
-                "'OK ' + (@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count)"
+                "'OK ' + (@(`$global:BravoConfigurationMetadata.LocalConfigOverrides).Count) " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
             ) 2>&1 | Out-String
     )
     Test-BRAVOCondition `
