@@ -175,10 +175,13 @@ try {
     Remove-Item -LiteralPath (Join-Path $restoreSyntheticModel 'DEPART.md') -Force
 
     # --- Крок 4: Compare-FileSizes мусить виявити пошкодження.
+    # -MaxSettleAttempts 1: пошкодження тут детерміноване (файл реально
+    # схлопнутий на диску), і production-дефолт settle-retry (12×15с) лише
+    # затримав би тест на 180с без зміни результату.
     $restoreSyntheticDamage = & $restoreSyntheticModule {
         param($BeforeFile, $ModelPath)
         Set-StrictMode -Version Latest
-        Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath 'TestProject.md'
+        Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath 'TestProject.md' -MaxSettleAttempts 1 -SettleDelaySeconds 0
     } $restoreSyntheticBeforeCsv $restoreSyntheticModel
     Test-BRAVOCondition `
         -Condition ($restoreSyntheticDamage.HasCriticalChanges -and -not $restoreSyntheticDamage.MainModelValid) `
@@ -255,7 +258,7 @@ try {
     $restoreSyntheticAfterRollback = & $restoreSyntheticModule {
         param($BeforeFile, $ModelPath)
         Set-StrictMode -Version Latest
-        Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath 'TestProject.md'
+        Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath 'TestProject.md' -MaxSettleAttempts 1 -SettleDelaySeconds 0
     } $restoreSyntheticBeforeCsv $restoreSyntheticModel
     Test-BRAVOCondition `
         -Condition (-not $restoreSyntheticAfterRollback.HasCriticalChanges -and

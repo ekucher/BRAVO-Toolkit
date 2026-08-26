@@ -4834,7 +4834,26 @@ function Compare-FileSizes {
         [string]$BeforeFile,
         [string]$ModelPath,
         [int]$MinSizeBytes = 2048,
-        [AllowNull()][string]$MainModelRelativePath = $null
+        [AllowNull()][string]$MainModelRelativePath = $null,
+        # Settle-retry (порт 67f3ad3+e2c61e1 з backup/local-developer-rc2-line):
+        # двічі підтверджено на реальному DEV-LIMS (2026-08-23/24, byte-точний
+        # збіг розмірів на диску одразу після хибного rollback) — активний
+        # антивірус із real-time захистом тримав щойно записані гігабайтні
+        # .md залоченими одразу після bravocmd repair/екстракції, і
+        # enumeration тихо пропускала залоченого кандидата. КАНОНІЧНИЙ фікс —
+        # AV-виняток для каталогів LIMS Model/ARCHIV на сервері
+        # (Add-MpPreference -ExclusionPath, див. OPERATIONS.md, код 43);
+        # цей retry — лише другий рубіж (defense-in-depth) для серверів з
+        # іншим/неналаштованим AV. 12×15с = 180с бюджет (розраховано під
+        # сканування ~7 ГБ моделі) — мізерний на тлі
+        # ExecutionTimeLimitHours=18 задачі Maintenance. Чистий прохід
+        # завершується миттєво: retry вмикається ЛИШЕ коли перший прохід
+        # знайшов критичні розбіжності. Fail-closed не послаблено: справжня
+        # відсутність файлу після всіх спроб лишається критичною.
+        # Параметризовано явно заради self-test (короткі значення в
+        # детерміністичних сценаріях).
+        [int]$MaxSettleAttempts = 12,
+        [int]$SettleDelaySeconds = 15
     )
 
     try {
@@ -4881,7 +4900,29 @@ function Compare-FileSizes {
         $mainModelValid = $true
         $missingFileCount = 0
         $currentLookup = @{}
-        foreach ($file in @(Get-BRAVOFiles -Path $ModelPath -Recurse)) {
+        for ($settleAttempt = 1; $settleAttempt -le $MaxSettleAttempts; $settleAttempt++) {
+        # Кожна ітерація починається з чистого стану — включно з
+        # $missingFileCount, який живить tripwire ПІСЛЯ циклу: накопичення
+        # між спробами дало б хибний ERROR про розсинхрон шляхів.
+        $criticalFiles = @()
+        $removedByRepairFiles = @()
+        $mainModelValid = $true
+        $missingFileCount = 0
+        $currentLookup = @{}
+        # Пряма .NET enumeration замість Get-BRAVOFiles/Get-ChildItem -Recurse
+        # (порт f7f6628): PowerShell-провайдер на великих/глибоких деревах з
+        # -ErrorAction SilentlyContinue мовчки повертав НЕПОВНИЙ список —
+        # реальний детермінований інцидент ДНДІЛДВСЕ 2026-08-24 (~364 «зниклі»
+        # файли 4/4 рази, незалежно від settle-вікна, дані фізично цілі).
+        # Той самий канонічний механізм, що вже використовують дві інші
+        # enumeration-точки цього flow (Check-MdFileSizes і before-CSV
+        # snapshot); Hidden/System-фільтр відтворює поведінку Get-ChildItem
+        # без -Force, щоб набір файлів не змінився.
+        $modelDirectoryInfo = New-Object System.IO.DirectoryInfo($ModelPath)
+        foreach ($file in $modelDirectoryInfo.EnumerateFiles('*', [System.IO.SearchOption]::AllDirectories)) {
+            if (($file.Attributes -band ([IO.FileAttributes]::Hidden -bor [IO.FileAttributes]::System)) -ne 0) {
+                continue
+            }
             $relativePath = Get-BRAVOModelRelativePath -FullName $file.FullName -RootPath $ModelPath
             $currentLookup[$relativePath] = [long]$file.Length
         }
@@ -4889,7 +4930,8 @@ function Compare-FileSizes {
         # Каталог MODEL повністю порожній після repair — критично незалежно
         # від того, що показує посегментне порівняння нижче (defense-in-depth
         # для випадку, коли before-CSV сам по собі валідний, але repair
-        # знищив усе).
+        # знищив усе). Порожній каталог не самозцілюється — retry тут
+        # зайвий, fail-closed негайно.
         if ($currentLookup.Count -eq 0) {
             $errorMsg = "Каталог MODEL порожній після реставрації: $ModelPath"
             Write-Log $errorMsg -Level "ERROR"
@@ -4963,6 +5005,17 @@ function Compare-FileSizes {
                     Missing = $isMissing
                 }
             }
+        }
+
+        # Чистий прохід — миттєвий вихід без жодної затримки; retry лише
+        # коли знайдено критичні розбіжності (можливий AV-рейс видимості
+        # щойно записаних файлів, див. коментар у param-блоці).
+        if (@($criticalFiles).Count -eq 0 -or $settleAttempt -ge $MaxSettleAttempts) {
+            break
+        }
+        Write-Log ("Знайдено $(@($criticalFiles).Count) критичних розбіжностей MODEL (спроба $settleAttempt з $MaxSettleAttempts); " +
+            "можлива затримка видимості щойно записаних файлів (антивірус/кеш) — повторна перевірка через $SettleDelaySeconds с...") -Level "WARNING"
+        Start-Sleep -Seconds $SettleDelaySeconds
         }
 
         # Діагностичний tripwire: каталог MODEL не порожній, але ЖОДЕН запис

@@ -95,7 +95,17 @@ function Invoke-BRAVOCompareFileSizesScenario {
         # FullName від Get-ChildItem. Перемикач передає Compare-FileSizes
         # той самий каталог, але з повністю зміненим регістром рядка шляху —
         # Windows-резолюція шляху ідентична, відрізняється лише рядок.
-        [switch]$InvertModelPathCase
+        [switch]$InvertModelPathCase,
+        # Settle-retry: юніт-сценарії детерміністичні, retry їм не потрібен —
+        # 1 спроба без затримки, інакше кожен critical-сценарій чекав би
+        # production-бюджет 12×15с. Окремі settle-регресії нижче передають
+        # власні значення.
+        [int]$MaxSettleAttempts = 1,
+        [int]$SettleDelaySeconds = 0,
+        # Відкладене створення файлу під час прогону (симуляція AV-затримки
+        # видимості): ScriptBlock запускається Start-Job-ом ДО виклику
+        # Compare-FileSizes і створює файл у $ScenarioRoot із паузою.
+        [scriptblock]$DelayedFileJob
     )
     $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ("BRAVO_COMPAREFILESIZES_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -103,9 +113,11 @@ function Invoke-BRAVOCompareFileSizesScenario {
     $effectiveModelPath = if ($InvertModelPathCase) {
         # ToLowerInvariant дає той самий каталог, але інший РЯДОК шляху:
         # літера диска й компоненти на кшталт Users/AppData/Temp стають
-        # малими, тоді як Get-ChildItem у Compare-FileSizes поверне FullName
-        # з нормалізованим регістром (велика літера диска + фактичний
-        # регістр каталогів) — точна сигнатура інциденту.
+        # малими, тоді як enumeration у Compare-FileSizes (тепер прямий
+        # [IO.DirectoryInfo]::EnumerateFiles) повертає FullName з фактичним
+        # регістром дочірніх компонентів — регістровий розсинхрон кореня
+        # лишається точною сигнатурою інциденту, яку канонічно знімає
+        # Get-BRAVOModelRelativePath (OrdinalIgnoreCase).
         $scenarioRoot.ToLowerInvariant()
     } else {
         $scenarioRoot
@@ -123,11 +135,36 @@ function Invoke-BRAVOCompareFileSizesScenario {
         })
         $beforeRows | Export-Csv -Path $beforeCsvPath -NoTypeInformation -Encoding UTF8
 
-        return & $compareFileSizesModule {
-            param($BeforeFile, $ModelPath, $MainModelRelativePath)
-            Set-StrictMode -Version Latest
-            Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 -MainModelRelativePath $MainModelRelativePath
-        } $beforeCsvPath $effectiveModelPath $MainModelRelativePath
+        $delayedJob = $null
+        if ($null -ne $DelayedFileJob) {
+            $delayedJob = Start-Job -ScriptBlock $DelayedFileJob -ArgumentList $scenarioRoot
+            # Холодний старт Start-Job (окремий powershell.exe) на
+            # завантаженій машині може тривати довше за все retry-вікно —
+            # реальний прогін показав старт job-а ПІСЛЯ завершення всіх
+            # спроб. Тому job СПОЧАТКУ пише ready-маркер, а сценарій чекає
+            # його ДО виклику Compare-FileSizes: гонка «cold start проти
+            # retry-вікна» виключена, лишається лише детермінована
+            # затримка появи файлу.
+            $jobReadyMarker = Join-Path $scenarioRoot '__job_ready.marker'
+            $jobReadyDeadline = (Get-Date).AddSeconds(60)
+            while (-not (Test-Path -LiteralPath $jobReadyMarker) -and (Get-Date) -lt $jobReadyDeadline) {
+                Start-Sleep -Milliseconds 200
+            }
+        }
+        try {
+            return & $compareFileSizesModule {
+                param($BeforeFile, $ModelPath, $MainModelRelativePath, $MaxSettleAttempts, $SettleDelaySeconds)
+                Set-StrictMode -Version Latest
+                Compare-FileSizes -BeforeFile $BeforeFile -ModelPath $ModelPath -MinSizeBytes 2048 `
+                    -MainModelRelativePath $MainModelRelativePath `
+                    -MaxSettleAttempts $MaxSettleAttempts -SettleDelaySeconds $SettleDelaySeconds
+            } $beforeCsvPath $effectiveModelPath $MainModelRelativePath $MaxSettleAttempts $SettleDelaySeconds
+        } finally {
+            if ($null -ne $delayedJob) {
+                Wait-Job -Job $delayedJob -Timeout 30 | Out-Null
+                Remove-Job -Job $delayedJob -Force -ErrorAction SilentlyContinue
+            }
+        }
     } finally {
         if (Test-Path -LiteralPath $scenarioRoot) {
             Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -537,8 +574,53 @@ Test-BRAVOCondition `
     -Name "Maintenance/MainModelHintDerivedFromMainModelFile" `
     -Failure "hint/writer/lookup мають деривувати відносний шлях канонічним Get-BRAVOModelRelativePath (регістронезалежно), без залишків ordinal Replace+TrimStart і без здогаду `"`$MODEL_NAME.md`""
 
+# --- Settle-retry (порт 67f3ad3/f7f6628 з backup/local-developer-rc2-line):
+# транзитно «невидимий» файл (симуляція AV-затримки видимості щойно
+# записаних .md) з'являється на диску ПІД ЧАС retry-вікна — Compare-FileSizes
+# має відновитись без critical. Файл створюється окремим процесом
+# (Start-Job), бо enumeration тепер прямий .NET-виклик і не мокабельний.
+$settleRecoveredResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'ACT.000' = 100000 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -MaxSettleAttempts 20 -SettleDelaySeconds 2 `
+    -DelayedFileJob {
+        param($ScenarioRoot)
+        # Ready-маркер ПЕРШИМ (harness чекає його до старту compare) —
+        # див. коментар у Invoke-BRAVOCompareFileSizesScenario. Файл
+        # з'являється через 2 с після маркера — гарантовано всередині
+        # retry-вікна 20×2с.
+        [IO.File]::WriteAllText((Join-Path $ScenarioRoot '__job_ready.marker'), 'ready')
+        Start-Sleep -Seconds 2
+        [IO.File]::WriteAllBytes((Join-Path $ScenarioRoot 'TestProject.md'), (New-Object byte[] 500000))
+    }
+Test-BRAVOCondition `
+    -Condition (-not $settleRecoveredResult.HasCriticalChanges -and $settleRecoveredResult.MainModelValid) `
+    -Name "Maintenance/CompareFileSizesSettleRetryRecoversTransientlyMissingFile" `
+    -Failure "файл, що став видимим у settle-вікні, не повинен лишати CRITICAL; отримано HasCriticalChanges=$($settleRecoveredResult.HasCriticalChanges), MainModelValid=$($settleRecoveredResult.MainModelValid)"
+
+# --- Settle-retry НЕ послаблює fail-closed: справді відсутня основна модель
+# лишається критичною після всіх спроб.
+$settleStillCriticalResult = Invoke-BRAVOCompareFileSizesScenario `
+    -BeforeFiles @{ 'TestProject.md' = 500000; 'ACT.000' = 100000 } `
+    -AfterFiles  @{ 'ACT.000' = 100000 } `
+    -MainModelRelativePath 'TestProject.md' `
+    -MaxSettleAttempts 2 -SettleDelaySeconds 0
+Test-BRAVOCondition `
+    -Condition ($settleStillCriticalResult.HasCriticalChanges -and -not $settleStillCriticalResult.MainModelValid) `
+    -Name "Maintenance/CompareFileSizesSettleRetryStillCriticalWhenGenuinelyMissing" `
+    -Failure "справді відсутній файл після всіх settle-спроб мусить лишатися CRITICAL (fail-closed не послаблено); отримано HasCriticalChanges=$($settleStillCriticalResult.HasCriticalChanges)"
+
 # ============================================================
 # Discord HTTP 429: обмежений retry з пріоритетом на Retry-After.
+#
+# УВАГА (пастка, реально спіймана 2026-08-26): New-Module у
+# New-BRAVOSelfTestRuntimeModule авто-імпортує dynamic module у СЕСІЮ,
+# тому фейкові Invoke-WebRequest і Start-Sleep звідси стають видимими
+# ГЛОБАЛЬНО після цієї секції — зокрема Start-Sleep перетворюється на
+# no-op лічильник. Будь-які нові сценарії, що покладаються на РЕАЛЬНИЙ
+# Start-Sleep/мережу (напр. settle-retry Compare-FileSizes вище),
+# додавайте ПЕРЕД цією секцією.
 # ============================================================
 $compatibilityScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1"),
