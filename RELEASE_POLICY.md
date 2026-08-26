@@ -988,10 +988,11 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    5.2.0 (stable, тег v5.2.0; metadata-only промоція
+master:    5.2.0       (stable, тег v5.2.0 = stamp b76a5ac,
+           merge PR #102 = 477f166; metadata-only промоція
            2026-08-26 з прийнятого 5.2.0-rc.13)
-developer: наступний цикл відкривається одразу після промоції
-           (5.3.0-dev.1, розділ 4)
+developer: 5.3.0-dev.1 (development; цикл відкрито одразу після
+           промоції, розділ 4/11)
 ```
 
 Дерево stable 5.2.0 = прийнятий `v5.2.0-rc.13` (stamp `0247ac3`,

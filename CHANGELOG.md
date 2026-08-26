@@ -4,6 +4,31 @@
 
 ---
 
+## 5.3.0-dev.1 — 2026-08-26
+
+Відкриття наступного циклу розробки після stable-релізу 5.2.0
+(RELEASE_POLICY §11: негайний prerelease-bump, щоб `developer` і
+`master` не несли однакову версію). Лише метадані версії: VERSION.json
+5.3.0-dev.1/development, ModuleVersion усіх 17 `modules\*\*.psd1` →
+5.3.0, заголовки README/BRAVO_SETUP, RELEASE_POLICY §20.
+
+Записаний борг/план циклу 5.3.0 (пріоритети власника: P1 → P2 → далі):
+
+- **P1 — Scheduled Restore Verification** (наступний етап за планом
+  власника; окреме завдання).
+- **P2 — Machine-readable Status Contract v1** (після P1).
+- Відкладені runtime-фікси: settle/AV/enumeration Compare-FileSizes
+  (збережені в `backup/local-developer-rc2-line`), `127e7e4`
+  lock-wait diagnostics.
+- P2-знахідка acceptance: dry-run тест-повідомлення завжди в ALERTS
+  (рішення 5.3.0 vs окремий фікс не прийняте).
+- P3.2a (`BRAVO_UPDATE.ps1`), M1 (`WinSCP.uk` у TOOLS_MANIFEST після
+  підтвердження походження), M3, BOM known-issue
+  `Get-BRAVOSevenZipArchiveInventory`.
+- Гігієна: видалення ~15 злитих remote-гілок циклу 5.2.0.
+
+---
+
 ## 5.2.0 — 2026-08-26
 
 Stable release of the 5.2.0 line, promoted (metadata-only) from the
