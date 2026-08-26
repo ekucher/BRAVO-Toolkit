@@ -4,7 +4,36 @@
 
 ---
 
-## 5.2.1-rc.6 — 2026-08-27 (hotfix candidate, pending acceptance)
+## 5.2.1-rc.7 — 2026-08-27 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.6 + локальні site-overrides конфігурації (запит власника:
+«втомився кожного разу виправляти конфіг на нетипових інсталяціях»):
+
+- **FEATURE (config): `BRAVO.local.config` — site-відмінності, що
+  переживають оновлення комплекту.** Опційний data-only файл поряд з
+  effective `BRAVO.config` (шаблон `BRAVO.local.config.example` у
+  комплекті): hashtable «dot-шлях → значення». Loader читає його до
+  виконання конфігурації; `BRAVO.config` застосовує overrides у двох
+  канонічних фазах — після первинних блоків (перевизначений
+  `pathSettings.BackupRoot` коректно протягується в archiveDirs/
+  discovery/scheduler; `Restore.BootRestoreMode` → `Recovery.Enabled`)
+  і наприкінці (пізні leaf-блоки: `backupMonitoring`, `sftpDirectories`,
+  `schedulerSettings`). Безпека/надійність: виконуваний код у файлі
+  відхиляється (`CheckRestrictedLanguage`, лише літеральні дані);
+  невідомий dot-шлях = помилка конфігурації (опечатки не мовчать);
+  застосовані ключі — у `BravoConfigurationMetadata.LocalConfigOverrides`.
+  4 регресії в ConfigLoader-фрагменті (обидві фази з деривацією,
+  typo fail-closed, code-rejection, no-op без файла). Документація:
+  BRAVO_SETUP.md.
+
+Acceptance rc.7 (додатково до rc.6): на нетиповій інсталяції створити
+`BRAVO.local.config` (напр., `pathSettings.BackupRoot`), оновити
+комплект → налаштування діють без редагування `BRAVO.config`; ключ з
+опечаткою → зрозуміла помилка конфігурації.
+
+---
+
+## 5.2.1-rc.6 — 2026-08-27 (hotfix candidate, NOT accepted — superseded by rc.7)
 
 Кандидат = rc.5 + свідома зміна дефолту порогу авто-архівування BAZA
 (реальний алерт ДНДІЛДВСЕ 23:00: 18 легітимних мутацій PDF-звітів →
