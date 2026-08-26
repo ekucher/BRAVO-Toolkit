@@ -284,7 +284,8 @@ try {
     $configRoot = Split-Path $resolvedConfigPath -Parent
     $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 
-    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications', 'BRAVO.RestoreVerify')) {
+    $script:restoreDrillRunStartedAt = Get-Date
+    foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ExitCodes', 'BRAVO.Console', 'BRAVO.Notifications', 'BRAVO.RestoreVerify', 'BRAVO.Status')) {
         $modulePath = Join-Path $runtimeRoot "modules\$moduleName\$moduleName.psd1"
         if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
             throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -561,6 +562,36 @@ try {
     } catch {
         Add-RestoreDrillResult WARN "Стан верифікації" $null $null 0 0 (
             "не вдалося записати BRAVO_RESTORE_VERIFY_STATE.json: $($_.Exception.Message)")
+    }
+
+    # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status).
+    # На відміну від Save-BRAVORestoreVerifyState вище, помилка запису
+    # status-файла НЕ стає WARN-результатом drill: статус-контракт —
+    # телеметрична проєкція і за інваріантом ROADMAP не має впливати на
+    # результат чи exit code операції (fail-soft, лише Write-Warning).
+    try {
+        $restoreVerifyStateAfterRun = Get-BRAVORestoreVerifyState `
+            -Path (Get-BRAVORestoreVerifyStatePath -StateRoot $global:stateRoot)
+        $lastVerifiedAtForStatus = if ($restoreVerifyStateAfterRun.Exists -and -not $restoreVerifyStateAfterRun.Corrupt) {
+            [string]$restoreVerifyStateAfterRun.State.LastVerifiedAt
+        } else {
+            ''
+        }
+        Write-BRAVOOperationStatus `
+            -StateRoot $global:stateRoot `
+            -Operation RestoreVerify `
+            -ExitCode $drillExitCodeForState `
+            -ExitCodeName (Get-BRAVOExitCodeName -Code $drillExitCodeForState) `
+            -StartedAt $script:restoreDrillRunStartedAt `
+            -Details @{
+                generationId = [string]$script:selectedRestoreGenerationId
+                passCount = @($script:restoreDrillResults | Where-Object { $_.Status -eq 'PASS' }).Count
+                warnCount = $drillWarnCount
+                failCount = $drillFailCount
+                lastVerifiedAt = $lastVerifiedAtForStatus
+            }
+    } catch {
+        Write-Warning "Не вдалося записати machine-readable status-файл RestoreVerify: $($_.Exception.Message)"
     }
 
     if (-not $SkipNotification) {

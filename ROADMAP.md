@@ -212,6 +212,18 @@ release-manifest.json
 
 ### P2.1 — Machine-readable health/status contract
 
+**Статус (2026-08-26, цикл 5.3.0): реалізовано** (гілка
+`feature/status-contract`): модуль `modules/BRAVO.Status/` — канонічний
+власник контракту; кожна з чотирьох операцій після обчислення exit code
+атомарно пише `%ProgramData%\BRAVO\State\STATUS\BRAVO_STATUS_<Operation>.json`
+(fail-soft: помилка запису ніколи не змінює результат операції).
+Спільне ядро схеми + `details` per-operation; поля
+`lastCompleteGeneration`/`lastRestoreVerifiedAt`/`*Verified`/
+`runtimeIntegrity`/`toolIntegrity` з ескізу нижче живуть у `details`
+Health-файла. Транспорт/моніторинг поверх файлів — P2.2 (свідомо не
+входить у v1 за рішенням власника: «моніторинг поки не робимо,
+укріплюємо основу»).
+
 Уніфікувати JSON-result для Archive, Health, Maintenance і Restore Verification.
 
 Мінімальні поля:
@@ -236,10 +248,10 @@ release-manifest.json
 
 Критерії завершення:
 
-- [ ] Один versioned schema для machine consumers.
-- [ ] Жодних secret-bearing values.
-- [ ] Exit codes лишаються canonical source of failure class.
-- [ ] JSON можна використовувати Zabbix/telemetry без парсингу console text.
+- [x] Один versioned schema для machine consumers. *(BRAVO.Status, schemaVersion 1)*
+- [x] Жодних secret-bearing values. *(контракт + самотест Status/NoSecretBearingFields)*
+- [x] Exit codes лишаються canonical source of failure class. *(status — проєкція exitCode; fail-soft самотести CallSiteIsFailSoft)*
+- [x] JSON можна використовувати Zabbix/telemetry без парсингу console text. *(4 файли в `STATUS\`; сама інтеграція — P2.2)*
 
 ### P2.2 — Remote Fleet Telemetry
 

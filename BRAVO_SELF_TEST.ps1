@@ -14199,6 +14199,10 @@ function Write-BRAVOLog {
     # оцінка віку, канонічний DaysOfWeek-mask, контракти scheduled drill і
     # loader-нормалізація legacy-конфігів без RestoreVerify-вузлів.
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreVerify.ps1')
+    # Status (P2.1): machine-readable status contract v1 — атомарний
+    # roundtrip, деривація status з exitCode, fail-closed схема,
+    # відсутність секретів і fail-soft контракти чотирьох call-site'ів.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Status.ps1')
     # ConfigLoader: діагностичне збагачення помилки виконання BRAVO.config
     # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
     # замість голої NullReferenceException).
