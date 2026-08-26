@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **GOVERNANCE (release process, P0): repository identity у гейті
+  промоції master + branch protection.** `ci\Test-BRAVOMasterMergePolicy.ps1`
+  тепер перевіряє не лише ім'я head-гілки (`developer`/`hotfix/*`), а й
+  repository identity джерела PR (екстрагована `Test-BRAVOMasterMergeSource`:
+  head-репозиторій мусить збігатися з base; fork з однойменною гілкою —
+  FAIL; невизначений head-репозиторій — fail-closed FAIL). Identity
+  береться з `GITHUB_EVENT_PATH` (`pull_request.head.repo.full_name`) /
+  `GITHUB_REPOSITORY`; нові параметри `-HeadRepository`/`-BaseRepository`
+  для локального запуску. Регресії в
+  `selftest\BRAVO_SELF_TEST.Governance.ps1`: 8 сценаріїв джерела
+  (same/fork/feature/unknown) + 2 додаткові версійні
+  (`5.2.1>5.2.0`, `5.3.0>5.2.9`). Фактичний GitHub-стан приведено до
+  політики: branch protection увімкнено для `developer` (PR-only, ті
+  самі required checks, що на `master`, заборона force push/видалення,
+  `enforce_admins`); документацію (`RELEASE_POLICY.md` §13,
+  `RELEASE_CHECKLIST.md`, `ROADMAP.md` P0.2) синхронізовано з фактичним
+  станом — застарілі твердження «branch protection потребує GitHub Pro»
+  прибрано (репозиторій публічний). Runtime-код не змінювався.
+
 ---
 
 ## 5.2.0-rc.13 — 2026-08-26 (candidate, pending acceptance)

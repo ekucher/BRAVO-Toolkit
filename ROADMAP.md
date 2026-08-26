@@ -69,23 +69,27 @@ acceptance циклу 5.1.0 (rc.2/rc.4 PASS).
 
 Мета — унеможливити повторення прямого feature merge у `master` в обхід RC/acceptance.
 
-**Статус (2026-08-25): здебільшого закрито.** PR #46 злито
-(`ci/Test-BRAVOMasterMergePolicy.ps1` працює в CI: PR у `master`
-приймається лише з `developer`/`hotfix/*` і лише з піднятою
-`packageVersion`). Залишок: гейт порівнює версії на нерівність рядків
-(не семантичне збільшення) і не перевіряє repository identity; branch
-protection із required checks недоступна на поточному GitHub-плані
-(задокументовано в `RELEASE_POLICY.md` §«Технічний стан»), через що
-admin-обхід required checks лишається можливим (прецедент — merge
-PR #61 під час промоційного вікна 5.1.0).
+**Статус (2026-08-26): закрито.** PR #46 злито
+(`ci/Test-BRAVOMasterMergePolicy.ps1` працює в CI). PR #92 додав
+семантичне порівняння stable-версій (`Test-BRAVOStableVersionPromotion`
+з регресіями, включно з кейсом `5.10.0 > 5.9.0`). Гілка
+`hardening/release-governance` додала перевірку repository identity
+(`Test-BRAVOMasterMergeSource`: PR у `master` приймається лише з
+`developer`/`hotfix/*` ЦЬОГО репозиторію; fork з однойменною гілкою —
+FAIL; невідомий head-репозиторій — fail-closed). Репозиторій став
+публічним, тож branch protection доступний без GitHub Pro: увімкнено
+для `master` і `developer` (PR-only, required checks, заборона force
+push/видалення, `enforce_admins` — admin-обхід на кшталт прецеденту
+PR #61 у вікні промоції 5.1.0 технічно заблоковано). Фактична
+конфігурація — `RELEASE_POLICY.md`, розділ 13.
 
 Критерії завершення:
 
 - [x] PR #46 доведено до merge після виправлення всіх review findings.
-- [ ] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity. *(джерело — так; repository identity — ні)*
-- [ ] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків. *(наразі — лише нерівність)*
-- [x] `master` не приймає feature/fix PR напряму. *(через CI-гейт; без branch protection admin-обхід можливий)*
-- [ ] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(branch protection не ввімкнено — потребує GitHub Pro)*
+- [x] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity.
+- [x] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків. *(PR #92)*
+- [x] `master` не приймає feature/fix PR напряму. *(CI-гейт + branch protection з `enforce_admins`)*
+- [x] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(branch protection увімкнено на `master` і `developer`, 2026-08-26)*
 
 ### P0.3 — Захист remote backup history
 
