@@ -1118,7 +1118,9 @@ required checks гілки master, merge PR #61 виконано admin-обхо�
   декомпозиції DataRestore (CHANGELOG, розділ dev.1) — не виправляється
   окремо в 5.2.0, щоб не змішувати вузько-скоуповий B2-фікс (легітимний
   compatibility-фікс) із частковою міграцією дублюючої реалізації
-  (M3-подібний refactoring-ризик).
+  (M3-подібний refactoring-ризик). *(Закрито в циклі 5.3.0: inventory
+  став тонким адаптером над канонічною `Get-BRAVOSevenZipArchiveEntries`;
+  гейт `Secrets/SevenZipPasswordUsesStdin` розширено на DataRestore.)*
 
 ### Функціональна зміна дефолту під час DEV-LIMS acceptance `5.2.0-rc.1`
 

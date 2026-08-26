@@ -2091,11 +2091,11 @@ function Get-BRAVOSevenZipArchiveEntries {
     # code 0 навіть із ЗАВІДОМО невірним паролем — сам лістинг пароль не
     # перевіряє. Fallback тут був би мертвим кодом: гілка password-failure
     # ніколи не спрацює, бо перша спроба з "невірним" паролем і так Success.
-    # NB: у BRAVO.DataRestore існує приватний Get-BRAVOSevenZipArchiveInventory
-    # (лічильники FileCount/TotalUncompressedBytes для free-space preflight,
-    # без CRC і без списку) — свідомо НЕ об'єднано в цьому завданні, щоб не
-    # чіпати щільно характеризований restore-потік; борг міграції
-    # зафіксовано в CHANGELOG.
+    # NB: приватний Get-BRAVOSevenZipArchiveInventory у BRAVO.DataRestore
+    # (лічильники FileCount/TotalUncompressedBytes для free-space preflight)
+    # з 5.3.0 — тонкий адаптер над ЦІЄЮ функцією (борг міграції з
+    # CHANGELOG 5.2.0-dev.1 закрито): друга копія 7z-listing з legacy
+    # BOM-даючим WriteLine(пароль) прибрана.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
         Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же.')]

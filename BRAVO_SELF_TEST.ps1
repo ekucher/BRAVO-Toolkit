@@ -4440,6 +4440,14 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         [Text.Encoding]::UTF8
     )
     $sevenZipPasswordInArgumentsPattern = '(?im)^.*(?:^|\s)-p(?:\$|"|\{).*archivePassword.*$'
+    # 5.3.0: гейт розширено на BRAVO.DataRestore.Runtime.ps1 — його приватна
+    # Get-BRAVOSevenZipArchiveInventory була останньою точкою на legacy
+    # BOM-даючому StandardInput.WriteLine(пароль) і мігрована на канонічну
+    # Get-BRAVOSevenZipArchiveEntries (борг CHANGELOG 5.2.0-dev.1).
+    $dataRestoreScriptTextForSecrets = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains("RedirectStandardInput = `$true") -and
@@ -4450,15 +4458,18 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $compatibilityScriptText.Contains("Write-BRAVOProcessInputText -Process `$process -Text `$Password") -and
             $compatibilityScriptText.Contains('$Process.StandardInput.BaseStream.Write($payloadBytes, 0, $payloadBytes.Length)') -and
             $compatibilityScriptText -notmatch [regex]::Escape('StandardInput.WriteLine($Password)') -and
+            $dataRestoreScriptTextForSecrets -notmatch [regex]::Escape('StandardInput.WriteLine($Password)') -and
+            $dataRestoreScriptTextForSecrets.Contains('Get-BRAVOSevenZipArchiveEntries') -and
             $archiveScriptText -notmatch '(?i)-p`"\{0\}`"' -and
             $maintenanceScriptText -notmatch '(?i)-p\$\(' -and
             $compatibilityScriptText -notmatch '(?i)-p`"\{0\}`"' -and
             $archiveScriptText -notmatch $sevenZipPasswordInArgumentsPattern -and
             $maintenanceScriptText -notmatch $sevenZipPasswordInArgumentsPattern -and
-            $compatibilityScriptText -notmatch $sevenZipPasswordInArgumentsPattern
+            $compatibilityScriptText -notmatch $sevenZipPasswordInArgumentsPattern -and
+            $dataRestoreScriptTextForSecrets -notmatch $sevenZipPasswordInArgumentsPattern
         ) `
         -Name "Secrets/SevenZipPasswordUsesStdin" `
-        -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу"
+        -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу (включно з BRAVO.DataRestore inventory, мігрованим на канонічну Get-BRAVOSevenZipArchiveEntries)"
 
     # Реальний випадок: власний прогрес-бокс Test-NetConnection
     # ("Attempting TCP connect", "Waiting for response") усе одно
