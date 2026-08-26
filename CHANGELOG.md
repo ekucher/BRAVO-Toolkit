@@ -2,6 +2,29 @@
 
 ## Не випущено (developer)
 
+---
+
+## 5.2.0 — 2026-08-26
+
+Stable release of the 5.2.0 line, promoted (metadata-only) from the
+accepted 5.2.0-rc.13 candidate: rc stamp `0247ac3` (sourceCommit
+`12e6370`), artifact BRAVO-Toolkit-5.2.0-rc.13.zip sha256
+`6eac9695ed6053e7156ff843d8b4aed8522b4627d65c95bace1bc3de5a42af22`.
+
+Real-server acceptance rc.13: PASS 2026-08-26 (`LIMS`/ДНДІЛДВСЕ —
+повний maintenance-цикл з реставрацією, logs pipeline v2, компактні
+алерти, негативний сценарій forced+normal без повторної реставрації)
+плюс A2-encoding протокол (RELEASE_CHECKLIST §1.1) PASS в обох
+консольних контекстах (інтерактивно CP65001, SYSTEM CP866). Зведений
+evidence: `docs/BRAVO_520_RC13_ACCEPTANCE_EVIDENCE_20260826.md`
+(PR #100). Ланцюг кандидатів циклу: rc.8 (ACCEPTED, restore) →
+rc.9–rc.12 (замінені без окремого acceptance) → rc.13 (фінальний).
+
+Дерево stable додатково до rc.13 містить лише non-runtime зміни:
+acceptance-evidence документ (PR #100) і governance-hardening
+(PR #101, нижче) — runtime functional diff проти прийнятого rc.13
+порожній.
+
 - **GOVERNANCE (release process, P0): repository identity у гейті
   промоції master + branch protection.** `ci\Test-BRAVOMasterMergePolicy.ps1`
   тепер перевіряє не лише ім'я head-гілки (`developer`/`hotfix/*`), а й
@@ -23,7 +46,7 @@
 
 ---
 
-## 5.2.0-rc.13 — 2026-08-26 (candidate, pending acceptance)
+## 5.2.0-rc.13 — 2026-08-26 (candidate, ACCEPTED 2026-08-26 — released as 5.2.0)
 
 Фінальний кандидат циклу 5.2.0 перед stable. Кандидат = `5.2.0-rc.12`
 (нижче; на acceptance зафіксовано UX-зауваження до прогресу

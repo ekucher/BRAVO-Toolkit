@@ -988,10 +988,18 @@ developer: 4.5.1-dev.1
 ## 20. Поточний стан
 
 ```text
-master:    5.1.0       (stable, тег v5.1.0, merge PR #61 = aee27e4)
-developer: 5.2.0-rc.13 (prerelease; acceptance PASS 2026-08-26 —
-           фінальний кандидат циклу, готовий до промоції stable 5.2.0)
+master:    5.2.0 (stable, тег v5.2.0; metadata-only промоція
+           2026-08-26 з прийнятого 5.2.0-rc.13)
+developer: наступний цикл відкривається одразу після промоції
+           (5.3.0-dev.1, розділ 4)
 ```
+
+Дерево stable 5.2.0 = прийнятий `v5.2.0-rc.13` (stamp `0247ac3`,
+sourceCommit `12e6370`) + non-runtime доповнення: acceptance-evidence
+документ (PR #100) і governance-hardening PR #101 (repository identity
+у гейті промоції master, регресії, branch protection `developer`,
+синхронізація release-документації) — runtime functional diff проти
+прийнятого rc.13 порожній.
 
 Хронологія RC-циклу 5.2.0 (2026-08-24/25):
 
