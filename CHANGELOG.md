@@ -4,7 +4,27 @@
 
 ---
 
-## 5.2.1-rc.4 — 2026-08-26 (hotfix candidate, pending acceptance)
+## 5.2.1-rc.5 — 2026-08-26 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.4 + фікс хибного CRITICAL при зайнятому WinSCP (реальний
+алерт SERV_HRDL_1/ХЕРСОНСЬКА РДЛ 23:03: «Запуск WinSCP для SFTP
+health-check заблоковано: виявлено активний WinSCP.com»):
+
+- **FIX (health, операторський UX): зайнятий WinSCP = відкладення, а не
+  CRITICAL.** `Get-SFTPHealthIssues` тепер pre-check-ом перевіряє
+  доступність WinSCP до мережевих кроків: якщо інша BRAVO-передача ще
+  тримає WinSCP.com — SFTP-перевірка відкладається (WARNING у лозі з
+  PID і підказкою, кроки SFTP — SKIPPED, `SftpVerified` не
+  підтверджується), наступний health-прогін перевірить знову. Гонковий
+  випадок після pre-check лишається ERROR (друга лінія захисту).
+
+Acceptance rc.5 (додатково до rc.4): health-прогін під час активної
+передачі → ЧАСТКОВО/exit 10, жовте сповіщення «відкладено», кроки SFTP
+SKIPPED; без конкуренції — звичайна повна перевірка.
+
+---
+
+## 5.2.1-rc.4 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.5)
 
 Кандидат = rc.3 + фікс накопичення diskshadow metadata-.cab (реальний
 звіт SERVER-01/Тернопіль: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
