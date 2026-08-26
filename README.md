@@ -1,4 +1,4 @@
-# BRAVO 5.2.1-rc.5 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.2.1-rc.6 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -1186,7 +1186,7 @@ health > лише попередження. Код `90` має найвищий 
 | `BRAVO_TASKS_DIAGNOSE.ps1` | діагностика Планувальника і запуск від `SYSTEM` |
 | `BRAVO_RESTORE_TEST.ps1` | restore drill — розпакування останнього verified backup в ізольований каталог (розділ 6.1) |
 | `BRAVO_DATA_RESTORE.ps1` | реальне відновлення даних із verified generation: out-of-place або in-place з move-aside і rollback (розділ 6.2) |
-| `BRAVO_BAZA_RECONCILE.ps1` | розв'язання append-only mutation violation у BAZA_APP/BAZA_WWW — свідоме прийняття оператором (`OPERATIONS.md`, "Розв'язання мутацій"); опційний per-cycle поріг авто-архівування `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` (типово `0` = вимкнено) описаний там само |
+| `BRAVO_BAZA_RECONCILE.ps1` | розв'язання append-only mutation violation у BAZA_APP/BAZA_WWW — свідоме прийняття оператором (`OPERATIONS.md`, "Розв'язання мутацій"); опційний per-cycle поріг авто-архівування `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` (типово `25`; `0` = вимкнено) описаний там само |
 
 ### Службові файли
 
