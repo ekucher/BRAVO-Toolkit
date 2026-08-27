@@ -1,4 +1,4 @@
-# BRAVO.local.config — приклад локальних site-відмінностей.
+# BRAVO.local.config — приклад локальних site-відмінностей (повний каталог).
 #
 # ЯК КОРИСТУВАТИСЬ: скопіюйте цей файл як BRAVO.local.config у той самий
 # каталог, де лежить effective BRAVO.config, розкоментуйте/додайте потрібні
@@ -9,40 +9,265 @@
 # ФОРМАТ: data-only hashtable «dot-шлях -> значення». Виконуваний код
 # заборонений (файл відхиляється). Ключ — шлях від імені глобального блоку
 # BRAVO.config через крапки до кінцевого поля. Невідомий/помилковий шлях =
-# помилка конфігурації при запуску (опечатки не мовчать).
+# помилка конфігурації при запуску (опечатки не мовчать). Дозволені значення
+# і семантика кожного поля — у коментарях відповідного блоку BRAVO.config.
 #
-# Первинні поля (pathSettings/maintenanceSettings/componentSettings/...)
-# застосовуються ДО деривацій — перевизначений BackupRoot коректно
-# протягується в archiveDirs/scheduler. Пізні блоки (backupMonitoring,
-# sftpDirectories, schedulerSettings) — фінальні значення.
+# ДВІ ФАЗИ ЗАСТОСУВАННЯ:
+#   Фаза 1 — первинні налаштування (bravoSettings, pathSettings,
+#     maintenanceSettings, componentSettings, sftp-скаляри, smbSettings,
+#     retention-скаляри тощо): застосовуються ДО деривацій, тому
+#     перевизначений BackupRoot коректно протягується в archiveDirs,
+#     discovery і scheduler, а BootRestoreMode — у Recovery.Enabled.
+#   Фаза 2 — пізні блоки (sftpDirectories, backupMonitoring,
+#     schedulerSettings): фінальні значення; похідні вирази, обчислені з
+#     інших полів, НЕ переобчислюються — первинні поля перевизначайте
+#     через фазу 1.
+#
+# НЕ ПЕРЕВИЗНАЧАЙТЕ через цей файл: похідні блоки (sourcePaths, archiveDirs,
+# bazaAppPaths, bazaWWWPaths, archiveDefinitions), discoverySettings
+# (споживається discovery ДО фази 2 — override не подіє), toolIntegritySettings
+# та runtime-шляхи (ScriptPath/HelperPath) — вони обчислюються з розташування
+# комплекту.
 @{
-    # --- Найтиповіші site-відмінності ---
+    # =========================================================
+    # УСТАНОВА ТА СПОВІЩЕННЯ (bravoSettings) — фаза 1
+    # =========================================================
+    # УВАГА: InstitutionName/InstitutionCode/ArchivePrefix тут — лише
+    # fallback першого запуску; після BRAVO_SETUP.ps1 фактичні значення
+    # живуть у Windows Credential Manager і мають пріоритет.
+    # 'bravoSettings.InstitutionName' = 'МОЯ УСТАНОВА'
+    # 'bravoSettings.InstitutionCode' = '01234567'
+    # 'bravoSettings.ArchivePrefix' = 'lab_v2412'
 
-    # Корінь резервних копій (порожньо в комплекті = AUTO від LIMSRoot\ARCHIV):
-    # 'pathSettings.BackupRoot' = 'E:\ARCHIV'
+    # Постачальник і режим сповіщень:
+    # 'bravoSettings.NotificationProvider' = 'discord'   # slack | discord
+    # 'bravoSettings.NotificationMode' = 'errors_only'   # none | errors_only | all
+    # 'bravoSettings.NotificationRequestTimeoutSeconds' = 30
 
-    # Профіль сервера робочого часу (boot-recovery з утриманням служб):
+    # Маршрутизація severity -> канал (general | alerts):
+    # 'bravoSettings.NotificationRouting.SUCCESS' = 'general'
+    # 'bravoSettings.NotificationRouting.WARNING' = 'alerts'
+    # 'bravoSettings.NotificationRouting.ERROR' = 'alerts'
+    # 'bravoSettings.NotificationRouting.CRITICAL' = 'alerts'
+
+    # Нестандартні імена записів Credential Manager (рідко потрібно):
+    # 'credentialSettings.Targets.SFTPLogin' = 'BRAVO_SFTP_LOGIN'
+    # 'credentialSettings.Targets.SFTPPassword' = 'BRAVO_SFTP_PASSWORD'
+    # 'credentialSettings.Targets.DiscordWebhookGeneral' = 'BRAVO_DISCORD_GENERAL_URL'
+    # 'credentialSettings.Targets.DiscordWebhookAlerts' = 'BRAVO_DISCORD_ALERTS_URL'
+
+    # Публічна IP у сповіщеннях (вимкнено свідомо; вмикайте усвідомлено):
+    # 'hostInformationSettings.PublicIPLookupEnabled' = $true
+    # 'hostInformationSettings.PublicIPLookupTimeoutSeconds' = 5
+
+    # =========================================================
+    # ВИРОБНИЧІ КОРЕНІ ДАНИХ (pathSettings) — фаза 1
+    # =========================================================
+    # LIMSRoot: "" = AUTO через встановлену службу BRAVO; непорожнє = точний шлях.
+    # 'pathSettings.LIMSRoot' = 'D:\LIMS'
+    # SystemLogRoot: "" = <EffectiveLIMSRoot>\ARCHIV\LOGS.
+    # 'pathSettings.SystemLogRoot' = 'E:\BACKUPS\LOGS'
+    # BackupRoot: "" = AUTO -> <EffectiveLIMSRoot>\ARCHIV. Найтиповіший override.
+    # 'pathSettings.BackupRoot' = 'E:\BACKUPS'
+
+    # =========================================================
+    # ОБСЛУГОВУВАННЯ (maintenanceSettings) — фаза 1
+    # =========================================================
+    # --- Служби ---
+    # Додатковий DisplayName служби BRAVO (див. коментар у BRAVO.config —
+    # ДОДАВАЙТЕ до списку, не замінюйте його двома дефолтними):
+    # 'maintenanceSettings.Services.BravoDisplayName' = @('BRAVO Service', 'BRAVO Server', 'BRAVO LIMS')
+    # 'maintenanceSettings.Services.BravoWebEnabled' = $true
+    # 'maintenanceSettings.Services.ExchangeApiName' = 'exchangAPI'
+    # 'maintenanceSettings.Services.StartTimeoutSeconds' = 180
+    # 'maintenanceSettings.Services.StopTimeoutSeconds' = 120
+
+    # --- Планова реставрація моделі ---
+    # 'maintenanceSettings.Restore.Day' = 7            # 1=Пн ... 7=Нд
+    # 'maintenanceSettings.Restore.Time' = '03:00'
+    # Безпечне вікно старту автоматичної реставрації (може перетинати північ):
+    # 'maintenanceSettings.Restore.WindowStart' = '21:00'
+    # 'maintenanceSettings.Restore.WindowEnd' = '03:00'
+    # 'maintenanceSettings.Restore.ArchivesKeepCount' = 1
+    # Профіль сервера: 'None' (24/7) | 'HoldServices' (сервер робочого часу —
+    # boot-recovery з утриманням служб; протягується в Recovery.Enabled):
     # 'maintenanceSettings.Restore.BootRestoreMode' = 'HoldServices'
+    # 'maintenanceSettings.Restore.StartupDelayMinutes' = 0
 
-    # Поріг авто-архівування append-only мутацій BAZA (0 = жорсткий блок):
-    # 'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = 50
+    # --- Retention журналів ---
+    # 'maintenanceSettings.Retention.ArchiveDays' = 14
+    # 'maintenanceSettings.Retention.LogDays' = 180
+    # 'maintenanceSettings.Retention.CompressedLogDeletionEnabled' = $true
+    # 'maintenanceSettings.Retention.CompressedLogDays' = 180
+    # 'maintenanceSettings.Retention.FailedArchiveDays' = 30
 
-    # Мінімум вільного місця (ГБ):
-    # 'maintenanceSettings.Limits.MinimumFreeSpaceGB' = 30
-
-    # Друге trace-джерело (TraceBIS.out; порожньо = AUTO, 'off' = вимкнено):
+    # --- Trace ---
+    # Друге trace-джерело (TraceBIS.out): "" = AUTO; 'off' = вимкнено; шлях = явно.
     # 'maintenanceSettings.Trace.BISSourcePath' = 'D:\LIMS\TraceBIS.out'
 
-    # Режим сповіщень (none | errors_only | all):
-    # 'bravoSettings.NotificationMode' = 'errors_only'
+    # --- Ліміти диска й моделі ---
+    # 'maintenanceSettings.Limits.MinimumFreeSpaceGB' = 30
+    # Виключення дисків з перевірки місця (формати: "D:", "E", "F:\"):
+    # 'maintenanceSettings.Limits.ExcludedDrives' = @('F:\')
+    # 'maintenanceSettings.Limits.MaximumMdFileSizeGB' = 1.5
+    # 'maintenanceSettings.Limits.MdFileSizeExclusions' = @('KZPpatArc.md')
+    # 'maintenanceSettings.Limits.EstimatedSpaceMarginPercent' = 25
 
-    # SFTP-хост (шаблон; {0} = логін зі сховища credentials):
-    # 'sftpHostTemplate' = '{0}.example-storage.com'
+    # --- Автоматизація після обслуговування ---
+    # 'maintenanceSettings.Automation.AutoShutdown' = 'off'
+    # 'maintenanceSettings.Automation.ArchiveAfterMaintenance' = 'off'
 
-    # NAS/SMB-корінь:
+    # --- Моніторинг діапазонів ID ---
+    # 'maintenanceSettings.RangeIdMonitoring.Enabled' = $true
+    # 'maintenanceSettings.RangeIdMonitoring.ThresholdPercent' = 80
+
+    # --- 7-Zip Maintenance ---
+    # 'maintenanceSettings.Archiver.CommandTimeoutSeconds' = 14400
+    # 'maintenanceSettings.Logging.Level' = 'INFO'
+
+    # =========================================================
+    # КОМПОНЕНТИ (componentSettings) — фаза 1
+    # =========================================================
+    # 'componentSettings.Archive.MODEL' = $true
+    # 'componentSettings.Archive.BLOG' = $true
+    # 'componentSettings.Archive.BRAVOEXCH' = $true
+    # 'componentSettings.Synchronization.BAZA_APP_LOCAL' = $false
+    # 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true
+    # BAZA_WWW_SFTP вмикайте свідомо (див. коментар у BRAVO.config):
+    # 'componentSettings.Synchronization.BAZA_WWW_SFTP' = $true
+    # 'componentSettings.Synchronization.BAZA_WWW_LOCAL' = $false
+    # 'componentSettings.SFTP.ArchiveUpload' = $true
+    # 'componentSettings.SMB.ArchiveCopy' = $true
+
+    # =========================================================
+    # КОНСОЛЬ, ПРОГРЕС, ЛОГИ — фаза 1
+    # =========================================================
+    # 'consoleSettings.ConsoleLevel' = 'WARNING'  # TRACE..FATAL
+    # 'consoleSettings.FileLevel' = 'INFO'
+    # 'consoleSettings.PauseOnExit' = $false
+    # 'progressSettings.Enabled' = $true
+    # 'progressSettings.SevenZipTimeoutSeconds' = 14400
+    # 'LogLevel' = 'DEBUG'
+
+    # =========================================================
+    # ЗБЕРІГАННЯ АРХІВІВ (скаляри) — фаза 1
+    # =========================================================
+    # 'logRetentionDays' = 31
+    # Коректні архіви зберігаються не менше цього віку (діє при
+    # enableArchiveDeletion = $true):
+    # 'archiveRetentionDays' = 183
+    # 'enableArchiveDeletion' = $true
+    # 'minimumRetainedVerifiedBackups' = 2
+    # 'failedArchiveRetentionDays' = 30
+    # 'enableFailedArchiveDeletion' = $true
+    # 'enableOrphanTempCleanup' = $true
+    # 'orphanTempRetentionHours' = 48
+    # Разове очищення legacy-каталогу архівів (сумісність):
+    # 'enableLunchArchiveCleanup' = $true
+    # 'lunchArchiveCleanupPath' = 'E:\Archiv'
+    # 'lunchArchiveRetentionMonths' = 2
+
+    # =========================================================
+    # VSS / КОНСИСТЕНТНІСТЬ — фаза 1
+    # =========================================================
+    # 'backupConsistency.Mode' = 'VSS'               # VSS | Direct
+    # 'backupConsistency.SnapshotContext' = 'ClientAccessible'
+
+    # =========================================================
+    # SFTP (скаляри) — фаза 1
+    # =========================================================
+    # Шаблон хоста ({0} = логін зі сховища credentials):
+    # 'sftpHostTemplate' = '{0}.your-storagebox.de'
+    # 'sftpPort' = 22
+    # SSH host-key pinning (обов'язковий; значення — з панелі провайдера):
+    # 'sftpHostKey' = '"ssh-rsa 2048 xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx:xx"'
+    # 'sftpConnectionTimeoutSeconds' = 30
+
+    # =========================================================
+    # NAS/SMB (smbSettings) — фаза 1
+    # =========================================================
     # 'smbSettings.RootPath' = '\\192.168.1.10\backup\BRAVO'
+    # 'smbSettings.Directories.MODEL' = 'model'
+    # 'smbSettings.Directories.BLOG' = 'blog'
+    # 'smbSettings.Directories.BRAVOEXCH' = 'bravoexch'
+    # 'smbSettings.CopyBufferSizeMB' = 4
 
-    # Вікно планової реставрації:
-    # 'maintenanceSettings.Restore.WindowStart' = '20:00'
-    # 'maintenanceSettings.Restore.WindowEnd' = '04:00'
+    # =========================================================
+    # КАТАЛОГИ НА SFTP (sftpDirectories) — фаза 2
+    # =========================================================
+    # Каталоги завантаження архівів і журналів. Ключі BAZA/BAZAWWW НЕ
+    # перевизначайте: ефективна конфігурація BAZA-синхронізації
+    # обчислюється до фази 2.
+    # 'sftpDirectories.MODEL' = 'model'
+    # 'sftpDirectories.Blog' = 'blog'
+    # 'sftpDirectories.BravoExch' = 'bravoexch'
+    # 'sftpDirectories.Manifest' = 'manifests'
+    # 'sftpDirectories.TraceLogs' = 'logs/trace'
+    # 'sftpDirectories.ExchangeApiLogs' = 'logs/exchangapi'
+
+    # =========================================================
+    # HEALTH-МОНІТОРИНГ (backupMonitoring) — фаза 2
+    # =========================================================
+    # 'backupMonitoring.Enabled' = $true
+    # 'backupMonitoring.RunAfterBackup' = $true
+    # 'backupMonitoring.CheckManagedServices' = $true
+    # 'backupMonitoring.MaxBackupAgeHours' = 24
+    # 'backupMonitoring.VerifyFileHash' = $true
+    # 'backupMonitoring.NotifyOnSuccessAfterBackup' = $true
+    # Дедуп критичних сповіщень (0 = надсилати щоцикл):
+    # 'backupMonitoring.RepeatAlertAfterHours' = 6
+
+    # --- SFTP-перевірки ---
+    # 'backupMonitoring.SFTP.Enabled' = $true
+    # 'backupMonitoring.SFTP.CheckArchiveUploads' = $true
+    # 'backupMonitoring.SFTP.CheckBAZASynchronization' = $true
+    # 'backupMonitoring.SFTP.VerifyRemoteArchiveHash' = $true
+    # 'backupMonitoring.SFTP.RequireServerSideArchiveHash' = $false
+    # 'backupMonitoring.SFTP.RemoteBackupMaxAgeHours' = 24
+    # 'backupMonitoring.SFTP.OperationTimeoutSeconds' = 1800
+    # 'backupMonitoring.SFTP.SynchronizationTimeoutSeconds' = 14400
+    # 'backupMonitoring.SFTP.BAZAPendingAlertAfterHours' = 26
+
+    # --- BAZA append-only двигун ---
+    # 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly'  # | 'Legacy'
+    # 'backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth' = $true
+    # 'backupMonitoring.SFTP.BAZA.FastHealthEnabled' = $true
+    # 'backupMonitoring.SFTP.BAZA.FullAuditEnabled' = $true
+    # 'backupMonitoring.SFTP.BAZA.FullAuditEveryDays' = 7
+    # Поріг авто-архівування append-only мутацій за цикл
+    # (0 = жорсткий блок будь-якої мутації; типово комплект = 25):
+    # 'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = 50
+
+    # --- SMB-перевірки ---
+    # 'backupMonitoring.SMB.Enabled' = $true
+    # 'backupMonitoring.SMB.RemoteBackupMaxAgeHours' = 24
+
+    # --- Sanity-перевірка розміру нового архіву ---
+    # 'backupMonitoring.SizeSanity.Enabled' = $true
+    # 'backupMonitoring.SizeSanity.HistoryCount' = 5
+    # 'backupMonitoring.SizeSanity.MaxSizeDropPercent' = 50
+
+    # =========================================================
+    # ПЛАНУВАЛЬНИК (schedulerSettings) — фаза 2
+    # =========================================================
+    # УВАГА: Recovery.Enabled — похідне від Restore.BootRestoreMode (фаза 1);
+    # перевизначайте профіль, а не це поле. BAZASync.Enabled — похідне від
+    # componentSettings.Synchronization (фаза 1).
+    # 'schedulerSettings.StartWhenAvailable' = $false
+    # 'schedulerSettings.WakeToRun' = $true
+    # 'schedulerSettings.OperationLockWaitMinutes' = 360
+
+    # --- Розклади завдань (локальний час сервера, HH:mm) ---
+    # 'schedulerSettings.Backup.Enabled' = $true
+    # 'schedulerSettings.Backup.DailyAt' = '22:00'
+    # 'schedulerSettings.Backup.ExecutionTimeLimitHours' = 30
+    # 'schedulerSettings.Maintenance.Enabled' = $true
+    # 'schedulerSettings.Maintenance.DailyAt' = '23:55'
+    # 'schedulerSettings.Health.Enabled' = $true
+    # 'schedulerSettings.Health.StartAt' = '00:30'
+    # 'schedulerSettings.Health.RepeatEveryMinutes' = 240
+    # 'schedulerSettings.Health.SkipIfBackupTaskRunning' = $true
+    # 'schedulerSettings.Health.BusyWaitMinutes' = 20   # 0 = негайне відкладення при зайнятій архівації
+    # 'schedulerSettings.BAZASync.StartAt' = '00:00'
+    # 'schedulerSettings.BAZASync.RepeatEveryHours' = 4
 }
