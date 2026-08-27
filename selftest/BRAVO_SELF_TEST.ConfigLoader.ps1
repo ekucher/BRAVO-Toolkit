@@ -223,3 +223,75 @@ try {
 } finally {
     Remove-Item -LiteralPath $localCfgScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# ============================================================
+# schedulerSettings.Health.BusyWaitMinutes (5.2.1): loader-нормалізація
+# ліміту очікування зайнятої архівації перед відкладенням health-прогону.
+# Кожен сценарій — ізольований дочірній powershell.exe (Import-BravoConfiguration
+# змінює глобальний стан); конфіг герметизовано явним BackupRoot (та сама
+# CI-пастка, що й у local-config сценаріях вище).
+# ============================================================
+$busyWaitScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_BUSYWAIT_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+try {
+    [void][IO.Directory]::CreateDirectory($busyWaitScenarioRoot)
+    $busyWaitBackupDir = Join-Path $busyWaitScenarioRoot 'SITE_DEFAULT'
+    [void][IO.Directory]::CreateDirectory($busyWaitBackupDir)
+    $busyWaitKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $busyWaitBackupRootLine = '    BackupRoot    = ""'
+    $busyWaitKeyLine = '        BusyWaitMinutes = 20'
+    foreach ($busyWaitRequiredLine in @($busyWaitBackupRootLine, $busyWaitKeyLine)) {
+        if (-not $busyWaitKitText.Contains($busyWaitRequiredLine)) {
+            throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$busyWaitRequiredLine' — оновіть підготовку BusyWaitMinutes-сценаріїв під нову форму конфігурації"
+        }
+    }
+    $busyWaitHermeticText = $busyWaitKitText.Replace(
+        $busyWaitBackupRootLine,
+        "    BackupRoot    = '$($busyWaitBackupDir.Replace("'", "''"))'"
+    )
+    $busyWaitProbeCommand = (
+        "try { " +
+        "Set-StrictMode -Version 2.0; " +
+        ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+        "[void](Import-BravoConfiguration -ConfigRoot '$busyWaitScenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+        "'VALUE=' + [string]`$global:schedulerSettings.Health.BusyWaitMinutes " +
+        "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+    )
+    $busyWaitCases = @(
+        @{
+            Name = 'ConfigLoader/HealthBusyWaitLegacyConfigGetsCanonicalDefault'
+            ConfigText = $busyWaitHermeticText.Replace("$busyWaitKeyLine`r`n", '')
+            Expected = 'VALUE=20'
+            Failure = 'legacy-конфіг без schedulerSettings.Health.BusyWaitMinutes мусить отримувати канонічний loader-дефолт 20 (компат-нормалізація, без Warning)'
+        },
+        @{
+            Name = 'ConfigLoader/HealthBusyWaitExplicitZeroIsPreserved'
+            ConfigText = $busyWaitHermeticText.Replace($busyWaitKeyLine, '        BusyWaitMinutes = 0')
+            Expected = 'VALUE=0'
+            Failure = 'явний BusyWaitMinutes = 0 (стара поведінка: негайне відкладення) мусить зберігатись, а не затиратись дефолтом'
+        },
+        @{
+            Name = 'ConfigLoader/HealthBusyWaitInvalidValueFallsBackToDefault'
+            ConfigText = $busyWaitHermeticText.Replace($busyWaitKeyLine, "        BusyWaitMinutes = 'abc'")
+            Expected = 'VALUE=20'
+            Failure = "нечислове/поза-діапазонне BusyWaitMinutes мусить нормалізуватись до канонічних 20 хв (з Warning), а не протікати в runtime як рядок"
+        }
+    )
+    foreach ($busyWaitCase in $busyWaitCases) {
+        [IO.File]::WriteAllText(
+            (Join-Path $busyWaitScenarioRoot 'BRAVO.config'),
+            [string]$busyWaitCase.ConfigText,
+            (New-Object System.Text.UTF8Encoding $false)
+        )
+        $busyWaitProbe = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $busyWaitProbeCommand 2>&1 | Out-String
+        )
+        Test-BRAVOCondition `
+            -Condition ($busyWaitProbe.Contains([string]$busyWaitCase.Expected)) `
+            -Name ([string]$busyWaitCase.Name) `
+            -Failure "$($busyWaitCase.Failure); отримано: $busyWaitProbe"
+    }
+} finally {
+    Remove-Item -LiteralPath $busyWaitScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

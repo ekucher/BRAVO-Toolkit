@@ -252,7 +252,7 @@ $global:pathSettings = @{
 - синхронізацію `BAZA_WWW` на SFTP (`BAZA_WWW_SFTP`);
 - щоденний backup о `23:00`;
 - щоденне maintenance о `23:55`;
-- health-check кожні 240 хвилин, починаючи з `00:15`.
+- health-check кожні 240 хвилин, починаючи з `00:30` (слот зсунуто повз ~16-хвилинне вікно BAZASync о `:00`; при зайнятій архівації прогін чекає її завершення до `Health.BusyWaitMinutes` хв, дефолт 20).
 
 Початково вимкнено:
 
@@ -739,7 +739,7 @@ Maintenance, окреме Recovery-завдання не реєструєтьс�
 |---|---|---|
 | `BRAVO_ARCHIV` | щодня `23:00` | архівація та передача копій |
 | `BRAVO_MAINTENANCE` | щодня `23:55` | обслуговування BRAVO |
-| `BRAVO_ARCHIV_HEALTH` | кожні 240 хв. від `00:15` | контроль служб і локальних/SFTP/SMB копій |
+| `BRAVO_ARCHIV_HEALTH` | кожні 240 хв. від `00:30` | контроль служб і локальних/SFTP/SMB копій |
 
 Архівація, maintenance і health-check використовують спільний
 `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock`. Якщо інша операція вже працює, наступна не накладається

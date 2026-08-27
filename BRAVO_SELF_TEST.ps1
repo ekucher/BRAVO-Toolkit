@@ -6700,6 +6700,31 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             ) `
             -Name 'Health/DeferralDecisionIsOutsideTryCatch' `
             -Failure 'рішення про відкладення й повернення Deferred мають бути поза try/catch: інакше помилка у формуванні результату скасовує вже ухвалене відкладення'
+
+        # 5.2.1: BAZASync (:00, ~16-17 хв) систематично накривав слот Health
+        # :15 — усі денні прогони відкладались без повтору (ДНДІЛДВСЕ,
+        # 25-27.08.2026). Перед відкладенням Health мусить обмежено чекати
+        # звільнення архівації (BusyWaitMinutes з loader-дефолтом), і лише
+        # після дедлайна повертати Deferred.
+        Test-BRAVOCondition `
+            -Condition (
+                $deferralSegmentMatch.Success -and
+                $deferralSegmentMatch.Groups[1].Value.Contains('BusyWaitMinutes') -and
+                $deferralSegmentMatch.Groups[1].Value.Contains('$busyWaitDeadline') -and
+                # Start-Sleep стоїть ПІСЛЯ deferral-return (кінець ітерації
+                # циклу), тому шукається одразу за захопленим сегментом, а не
+                # всередині нього.
+                [regex]::IsMatch(
+                    $healthEarlyExitText,
+                    '(?s)if \(\$SkipIfBackupTaskRunning\) \{.*?Status = "Deferred".*?Start-Sleep -Seconds 30\s*\r?\n\s*\}'
+                ) -and
+                [regex]::IsMatch(
+                    $deferralSegmentMatch.Groups[1].Value,
+                    '(?s)if \(\(Get-Date\) -ge \$busyWaitDeadline\) \{\s*\r?\n\s*Write-HealthLog "Health-check відкладено'
+                )
+            ) `
+            -Name 'Health/BusyBackupBoundedWaitBeforeDeferral' `
+            -Failure 'зайнята архівація мусить давати обмежене очікування (schedulerSettings.Health.BusyWaitMinutes: цикл із повторною перевіркою сигналів і Start-Sleep), а Deferred повертатись лише після вичерпання дедлайна — інакше 4-годинна BAZASync о :00 систематично з''їдає слот health-прогону'
     } finally {
         if (Test-Path -LiteralPath $archiveGenerationTestRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveGenerationTestRoot -Recurse -Force -ErrorAction SilentlyContinue

@@ -501,6 +501,32 @@ function Assert-BravoLoadedConfiguration {
         }
     }
 
+    if ($global:schedulerSettings -is [hashtable] -and
+        $global:schedulerSettings.Contains('Health') -and
+        $global:schedulerSettings.Health -is [hashtable]) {
+        # 5.2.1: обмежене очікування звільнення архівації перед відкладенням
+        # health-прогону. Legacy-конфіги без ключа отримують канонічний
+        # дефолт комплекту (20 хв); явний 0 = негайне відкладення (стара
+        # поведінка). Значення поза 0..90 хв — некоректне: ExecutionTimeLimit
+        # задачі Health = 2 год, очікування мусить лишати запас на перевірку.
+        $healthBusyWaitIsValid = $false
+        if ($global:schedulerSettings.Health.Contains('BusyWaitMinutes')) {
+            $healthBusyWaitParsed = 0
+            if ([int]::TryParse([string]$global:schedulerSettings.Health.BusyWaitMinutes, [ref]$healthBusyWaitParsed) -and
+                $healthBusyWaitParsed -ge 0 -and $healthBusyWaitParsed -le 90) {
+                $global:schedulerSettings.Health.BusyWaitMinutes = $healthBusyWaitParsed
+                $healthBusyWaitIsValid = $true
+            } else {
+                Write-Warning "schedulerSettings.Health.BusyWaitMinutes = '$($global:schedulerSettings.Health.BusyWaitMinutes)' не є цілим числом у межах 0..90 — застосовується канонічний дефолт 20 хв."
+            }
+        }
+        if (-not $healthBusyWaitIsValid) {
+            # Legacy-конфіг без ключа (мовчазний compat-дефолт) або
+            # некоректне значення (Warning уже виписано вище).
+            $global:schedulerSettings.Health.BusyWaitMinutes = 20
+        }
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }

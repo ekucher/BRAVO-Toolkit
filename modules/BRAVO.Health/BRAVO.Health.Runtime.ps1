@@ -4423,31 +4423,54 @@ if (-not $notificationConfigurationValid) {
 }
 
 if ($SkipIfBackupTaskRunning) {
-    # Два НЕЗАЛЕЖНІ сигнали. Запит стану завдання може впасти (COM/ACL), і
-    # тоді єдиним свідченням лишається lock — тому він перевіряється поза
-    # тим самим try, а не після невдалого запиту в спільному блоці.
-    $backupTaskRunning = $false
-    try {
-        $backupTaskState = Get-BRAVOScheduledTaskState `
-            -TaskPath ([string]$schedulerSettings.TaskPath) `
-            -TaskName ([string]$schedulerSettings.Backup.TaskName)
-        Write-HealthLog "Перевірка стану завдання архівації: $($backupTaskState.Provider)" -Level "DEBUG"
-        $backupTaskRunning = [bool]$backupTaskState.IsRunning
-    } catch {
-        Write-HealthLog "Не вдалося прочитати стан завдання архівації; рішення за блокуванням процесу: $($_.Exception.Message)" -Level "WARNING"
-    }
+    # 5.2.1: BAZASync (BRAVO_ARCHIV -SyncBAZA, кожні 4 год о :00) на
+    # реальних серверах тримає lock архівації ~16-17 хв і систематично
+    # накривав слот Health :15 — КОЖЕН денний health-прогін відкладався без
+    # повтору (доведено логами ДНДІЛДВСЕ 25-27.08.2026). Замість негайного
+    # відкладення Health обмежено чекає звільнення архівації
+    # (schedulerSettings.Health.BusyWaitMinutes, loader-дефолт 20 хв;
+    # 0 = стара поведінка) і лише після вичерпання ліміту відкладається
+    # до наступного слота, як раніше.
+    $busyWaitMinutes = [int]$schedulerSettings.Health.BusyWaitMinutes
+    $busyWaitStarted = Get-Date
+    $busyWaitDeadline = $busyWaitStarted.AddMinutes($busyWaitMinutes)
+    $busyWaitAnnounced = $false
+    while ($true) {
+        # Два НЕЗАЛЕЖНІ сигнали. Запит стану завдання може впасти (COM/ACL),
+        # і тоді єдиним свідченням лишається lock — тому він перевіряється
+        # поза тим самим try, а не після невдалого запиту в спільному блоці.
+        $backupTaskRunning = $false
+        try {
+            $backupTaskState = Get-BRAVOScheduledTaskState `
+                -TaskPath ([string]$schedulerSettings.TaskPath) `
+                -TaskName ([string]$schedulerSettings.Backup.TaskName)
+            if (-not $busyWaitAnnounced) {
+                Write-HealthLog "Перевірка стану завдання архівації: $($backupTaskState.Provider)" -Level "DEBUG"
+            }
+            $backupTaskRunning = [bool]$backupTaskState.IsRunning
+        } catch {
+            Write-HealthLog "Не вдалося прочитати стан завдання архівації; рішення за блокуванням процесу: $($_.Exception.Message)" -Level "WARNING"
+        }
 
-    $archiveProcessLockActive = $false
-    try {
-        $archiveProcessLockActive = Test-BRAVOArchiveProcessLockActive
-    } catch {
-        Write-HealthLog "Не вдалося перевірити блокування архівації: $($_.Exception.Message)" -Level "WARNING"
-    }
+        $archiveProcessLockActive = $false
+        try {
+            $archiveProcessLockActive = Test-BRAVOArchiveProcessLockActive
+        } catch {
+            Write-HealthLog "Не вдалося перевірити блокування архівації: $($_.Exception.Message)" -Level "WARNING"
+        }
 
-    # Рішення й повернення — ПОЗА try: вже ухвалене й залоговане відкладення
-    # не має скасовуватись помилкою у формуванні результату. Саме так
-    # Health продовжував роботу під час архівації, ковтаючи виняток.
-    if ($backupTaskRunning -or $archiveProcessLockActive) {
+        # Рішення й повернення — ПОЗА try: вже ухвалене й залоговане
+        # відкладення не має скасовуватись помилкою у формуванні результату.
+        # Саме так Health продовжував роботу під час архівації, ковтаючи
+        # виняток.
+        if (-not ($backupTaskRunning -or $archiveProcessLockActive)) {
+            if ($busyWaitAnnounced) {
+                $busyWaitedSeconds = [int]((Get-Date) - $busyWaitStarted).TotalSeconds
+                Write-HealthLog "Архівація завершилась — health-check продовжується після очікування $busyWaitedSeconds с." -Level "INFO"
+            }
+            break
+        }
+
         $runningIndicator = if ($backupTaskRunning -and $archiveProcessLockActive) {
             "стан завдання та блокування процесу"
         } elseif ($backupTaskRunning) {
@@ -4455,13 +4478,20 @@ if ($SkipIfBackupTaskRunning) {
         } else {
             "блокування процесу"
         }
-        Write-HealthLog "Health-check відкладено: архівація зараз виконується ($runningIndicator)" -Level "INFO"
-        return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
-            Status = "Deferred"
-            IssueCount = 0
-            Notification = "NotRequired"
-            LogPath = $healthLogFile
-        })
+        if ((Get-Date) -ge $busyWaitDeadline) {
+            Write-HealthLog "Health-check відкладено: архівація зараз виконується ($runningIndicator)" -Level "INFO"
+            return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
+                Status = "Deferred"
+                IssueCount = 0
+                Notification = "NotRequired"
+                LogPath = $healthLogFile
+            })
+        }
+        if (-not $busyWaitAnnounced) {
+            Write-HealthLog "Архівація зараз виконується ($runningIndicator) — health-check зачекає її завершення до $busyWaitMinutes хв." -Level "INFO"
+            $busyWaitAnnounced = $true
+        }
+        Start-Sleep -Seconds 30
     }
 }
 
