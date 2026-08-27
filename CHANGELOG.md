@@ -4,6 +4,38 @@
 
 ---
 
+## 5.2.1-rc.9 — 2026-08-27 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.8 + фікс систематичного пропуску денних health-прогонів
+(доведено логами ДНДІЛДВСЕ 25-27.08.2026) + повний каталог
+`BRAVO.local.config.example`:
+
+- **FIX (health/scheduler): денний слот health-прогону систематично
+  з'їдався BAZASync.** Синхронізація (`BRAVO_ARCHIV -SyncBAZA`, кожні
+  4 год о `:00`) тримає lock архівації ~16-17 хв і накривала слот
+  Health `00:15`: кожен денний прогін відкладався без повтору, зелені
+  звіти йшли лише з нічного post-backup Health. Двошарово:
+  (1) kit-дефолт `schedulerSettings.Health.StartAt` `00:15` -> `00:30`
+  (набуває чинності після повторного `BRAVO_TASKS_INSTALL.ps1`);
+  (2) новий ключ `schedulerSettings.Health.BusyWaitMinutes` (kit 20;
+  loader-нормалізація: legacy без ключа -> 20, некоректне значення ->
+  Warning + 20, явний `0` = стара поведінка) — при зайнятій архівації
+  Health обмежено чекає звільнення (повторна перевірка сигналів кожні
+  30 с) і відкладається лише після вичерпання ліміту. Регресії:
+  `Health/BusyBackupBoundedWaitBeforeDeferral`,
+  `ConfigLoader/HealthBusyWait*` (3 сценарії).
+- **Повний каталог `BRAVO.local.config.example`**: 132 підтримувані
+  override-ключі по блоках/фазах, перевірені loader-ом; свідомо без
+  `discoverySettings` і `sftpDirectories.BAZA/BAZAWWW` (споживаються до
+  фази 2).
+
+Acceptance rc.9 додатково включає: re-run `BRAVO_TASKS_INSTALL`
+(тригер Health 00:30), зелений звіт із денного слота, сценарій
+очікування (ручний Health під час активної синхронізації -> INFO
+«зачекає» -> звіт після звільнення lock).
+
+---
+
 ## 5.2.1-rc.8 — 2026-08-27 (hotfix candidate, pending acceptance)
 
 Кандидат = rc.7 + фікс хибного ERROR у сповіщенні про несумісні імена
