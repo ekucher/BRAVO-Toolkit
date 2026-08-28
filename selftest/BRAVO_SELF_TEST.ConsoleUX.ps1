@@ -318,3 +318,192 @@ $taskInstallerText = [IO.File]::ReadAllText(
         -Condition ($exitOrderFailures.Count -eq 0) `
         -Name "ConsoleUX/21-ExitCodeComputedBeforeRender" `
         -Failure "Код завершення має обчислюватись ДО Write-BRAVOResultHeader, інакше підсумок бреше; порушено в: $($exitOrderFailures -join ', ')"
+
+    # 22-23. Регресія для New-BRAVOSelfTestRuntimeModule: коли SourceText
+    # містить ДВА визначення однієї функції (production-текст + навмисний
+    # test-only silent-stub, доданий ПІСЛЯ — точний патерн DataRestore/
+    # ManifestStorage negative-path battery), екстракція має брати ОСТАННЄ
+    # визначення. Корінь оманливих КРИТИЧНО:/ПОМИЛКА:/УВАГА: у консолі
+    # self-test-у: -First 1 мовчки повертав production-версію (перше
+    # визначення), і призначений silent-stub ставав мертвим кодом —
+    # реальний Write-DataRestoreLog/Write-BRAVOLog виконувався і друкував
+    # справжній production-рендер під час свідомо симульованого negative-
+    # path сценарію, хоча жодної реальної аварії сервера не було.
+    $duplicateDefinitionSource = @'
+function Test-BRAVOSelfTestDuplicateDefinition {
+    Write-Host "REAL-NOISE-MARKER-НЕ-МАЄ-ПОТРАПИТИ-У-КОНСОЛЬ"
+    Write-Warning "REAL-WARNING-MARKER-НЕ-МАЄ-ПОТРАПИТИ-У-КОНСОЛЬ"
+}
+'@
+    $duplicateDefinitionStub = @'
+function Test-BRAVOSelfTestDuplicateDefinition {
+    # навмисно тихий test-only override
+}
+'@
+    # Без прапорця -PreferLastDefinitionOnDuplicate поведінка НЕ змінилась
+    # (перше визначення перемагає) — саме на цьому й досі спираються
+    # ServiceQuiescence та ще 50+ інших виклик-площин (заглушка ПЕРШОЮ,
+    # реальний модульний текст ДРУГИМ). Регресія цього дефолту зламала б
+    # їх мовчки під час первинної спроби виправлення (виявлено повним
+    # прогоном self-test — ServiceQuiescence/ClearAndSuppressNeverTouch-
+    # ForeignMarker і сусідній тест впали, коли дефолт тимчасово змінили
+    # на -Last без опт-ін прапорця).
+    $duplicateDefinitionModuleDefault = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($duplicateDefinitionSource + [Environment]::NewLine + $duplicateDefinitionStub) `
+        -FunctionNames @('Test-BRAVOSelfTestDuplicateDefinition')
+    $duplicateDefinitionDefaultOutput = & $duplicateDefinitionModuleDefault { Test-BRAVOSelfTestDuplicateDefinition } 6>&1 3>&1 | Out-String
+
+    $duplicateDefinitionModuleLast = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($duplicateDefinitionSource + [Environment]::NewLine + $duplicateDefinitionStub) `
+        -FunctionNames @('Test-BRAVOSelfTestDuplicateDefinition') `
+        -PreferLastDefinitionOnDuplicate
+    $duplicateDefinitionLastOutput = & $duplicateDefinitionModuleLast { Test-BRAVOSelfTestDuplicateDefinition } 6>&1 3>&1 | Out-String
+
+    Test-BRAVOCondition `
+        -Condition (
+            $duplicateDefinitionDefaultOutput.Contains('REAL-NOISE-MARKER') -and
+            $duplicateDefinitionDefaultOutput.Contains('REAL-WARNING-MARKER')
+        ) `
+        -Name "ConsoleUX/22-RuntimeModuleExtractionDefaultStillPrefersFirstDefinition" `
+        -Failure "без -PreferLastDefinitionOnDuplicate New-BRAVOSelfTestRuntimeModule має й далі брати ПЕРШЕ визначення (історична поведінка, на якій тримається ServiceQuiescence та інші виклик-площини із заглушкою-першою)"
+    Test-BRAVOCondition `
+        -Condition (
+            -not $duplicateDefinitionLastOutput.Contains('REAL-NOISE-MARKER') -and
+            -not $duplicateDefinitionLastOutput.Contains('REAL-WARNING-MARKER')
+        ) `
+        -Name "ConsoleUX/23-RuntimeModulePreferLastDefinitionSwitchSuppressesEarlierWriteHostAndWarning" `
+        -Failure "з -PreferLastDefinitionOnDuplicate New-BRAVOSelfTestRuntimeModule має брати ОСТАННЄ визначення (test-only silent-stub після production-тексту — конвенція DataRestore/ManifestStorage), інакше очікувані negative-path сценарії друкують справжній Write-Host/Write-Warning у консоль self-test-у"
+
+    # 24. Структурний якір: ManifestStorage retention/orphan-sweep
+    # battery (реальні Remove-BRAVOExpiredBackupGenerations/Remove-
+    # BRAVOOrphanedTemporaryArchiveArtifacts, WARNING/ERROR-гілки
+    # Archive.Runtime.ps1) має власний silent-stub для Write-BRAVOLog —
+    # без нього реальний production Write-BRAVOLog (BRAVO.Logging уже
+    # імпортовано self-test-прогоном раніше) друкує ПОМИЛКА:/КРИТИЧНО:/
+    # УВАГА: у консоль під час навмисно очікуваного negative-path сценарію.
+    $manifestStorageScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root "selftest\BRAVO_SELF_TEST.ManifestStorage.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $manifestStorageScriptText.Contains("function Write-BRAVOLog {") -and
+            $manifestStorageScriptText -match "retentionCleanupModule[\s\S]*?'Write-BRAVOLog'[\s\S]*?-PreferLastDefinitionOnDuplicate" -and
+            $manifestStorageScriptText -match "orphanSweepModule[\s\S]*?'Write-BRAVOLog'\)[\s\S]*?-PreferLastDefinitionOnDuplicate"
+        ) `
+        -Name "ConsoleUX/24-ManifestStorageRetentionOrphanSweepSilenceWriteBRAVOLog" `
+        -Failure "retentionCleanupModule і orphanSweepModule мають включати silent-stub Write-BRAVOLog у FunctionNames ТА -PreferLastDefinitionOnDuplicate, інакше production-визначення Write-BRAVOLog (перше в SourceText) переможе, і реальні WARNING/ERROR негативні сценарії друкують production-лог у консоль self-test-у"
+
+    # 25-30. SELF-TEST Operator UX: завершальний operator summary +
+    # manual-exit pause самого BRAVO_SELF_TEST.ps1. Структурні перевірки на
+    # власному тексті кореневого скрипта (той самий підхід, що й ConsoleUX/
+    # 21 вище: exitOrderFailures) — реальний живий прогін цих сценаріїв
+    # неможливий зсередини self-test-у, який сам виконується прямо зараз.
+    $selfTestScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_SELF_TEST.ps1"),
+        [Text.Encoding]::UTF8
+    )
+
+    # 25. Operator summary рендериться ЧЕРЕЗ ті самі канонічні BRAVO.Console
+    # примітиви, що Archive/Health/Maintenance (Write-BRAVOFinalSummaryHeader/
+    # Footer, Write-BRAVOResultField) — не окрема паралельна box-drawing
+    # реалізація. Machine-readable маркери "SELF-TEST PASSED"/"SELF-TEST
+    # FAILED:" лишаються дослівними (CI/RELEASE_CHECKLIST.md залежать від
+    # точного тексту) — операторський підсумок додається НАД ними, не
+    # замінює їх.
+    Test-BRAVOCondition `
+        -Condition (
+            $selfTestScriptText.Contains("Write-BRAVOFinalSummaryHeader -Title 'BRAVO SELF-TEST'") -and
+            $selfTestScriptText.Contains('Write-BRAVOFinalSummaryFooter -LogFile $script:selfTestHelperLogPath') -and
+            $selfTestScriptText.Contains('Write-Host "SELF-TEST PASSED" -ForegroundColor Green') -and
+            $selfTestScriptText -match 'Write-Host\s+"SELF-TEST FAILED:\s+\$\(\$script:failures\.Count\)"'
+        ) `
+        -Name "ConsoleUX/25-SelfTestOperatorSummaryUsesCanonicalConsolePrimitives" `
+        -Failure "BRAVO_SELF_TEST.ps1 має рендерити фінальний operator summary через канонічні Write-BRAVOFinalSummaryHeader/Footer (BRAVO.Console) і зберігати дослівні machine-readable маркери SELF-TEST PASSED/FAILED"
+
+    # 26. PASS-лічильник у підсумку — динамічний ($script:passCount), не
+    # hardcoded число. Test-BRAVOCondition інкрементує його при кожному
+    # успіху (єдина точка обліку, той самий $script:failures, що вже
+    # рахує FAIL).
+    Test-BRAVOCondition `
+        -Condition (
+            $selfTestScriptText.Contains("`$script:passCount++") -and
+            $selfTestScriptText.Contains("-Value ([string]`$script:passCount)") -and
+            -not [regex]::IsMatch($selfTestScriptText, "-Label 'Перевірки' -Value '1420'")
+        ) `
+        -Name "ConsoleUX/26-SelfTestSummaryUsesDynamicPassCount" `
+        -Failure "Перевірки: у operator summary мають братися з динамічного `$script:passCount (інкрементується в Test-BRAVOCondition), а не з hardcoded числа"
+
+    # 27. Один resolved exit code — обчислюється РІВНО один раз
+    # ($script:selfTestExitCode) і використовується і для поля 'Код
+    # завершення', і для Complete-BRAVOHelperLog -ExitCode; жодного
+    # повторного обчислення після паузи (P16).
+    $selfTestExitCodeAssignments = @([regex]::Matches(
+        $selfTestScriptText, '\$script:selfTestExitCode\s*='
+    ))
+    Test-BRAVOCondition `
+        -Condition (
+            $selfTestExitCodeAssignments.Count -eq 1 -and
+            $selfTestScriptText.Contains("-Label 'Код завершення' -Value ([string]`$script:selfTestExitCode)") -and
+            $selfTestScriptText.Contains('Complete-BRAVOHelperLog -ExitCode $script:selfTestExitCode')
+        ) `
+        -Name "ConsoleUX/27-SelfTestResolvedExitCodeSingleSource" `
+        -Failure "`$script:selfTestExitCode має обчислюватись рівно один раз і використовуватись і operator summary, і фактичним Complete-BRAVOHelperLog — знайдено присвоєнь: $($selfTestExitCodeAssignments.Count)"
+
+    # 28. Один виклик Wait-BRAVOManualExit у самому BRAVO_SELF_TEST.ps1 —
+    # жодної другої паузи (P18), і сам виклик прокидає параметр -NoPause
+    # скрипта (forwarding, не hardcoded true/false). AST CommandAst, а не
+    # текстовий пошук: BRAVO_SELF_TEST.ps1 містить десятки СТРОКОВИХ
+    # ЛІТЕРАЛІВ з тим самим текстом "Wait-BRAVOManualExit -NoPause:$NoPause"
+    # усередині ІНШИХ структурних перевірок (Archive/Health/Maintenance
+    # ManualModeAndPauseUseSameNoPauseContract тощо) — .Contains()/regex
+    # порахував би їх теж і дав хибно завищений count.
+    $selfTestAst = [Management.Automation.Language.Parser]::ParseInput($selfTestScriptText, [ref]$null, [ref]$null)
+    $selfTestManualExitCalls = @(
+        $selfTestAst.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.CommandAst] -and
+                $candidate.GetCommandName() -eq 'Wait-BRAVOManualExit'
+            },
+            $true
+        ) | Where-Object { $_.Extent.Text -eq 'Wait-BRAVOManualExit -NoPause:$NoPause' }
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $selfTestManualExitCalls.Count -eq 1 -and
+            $selfTestScriptText -match '(?m)^\s*\[switch\]\$NoPause\s*$'
+        ) `
+        -Name "ConsoleUX/28-SelfTestSinglePauseForwardsNoPauseParameter" `
+        -Failure "BRAVO_SELF_TEST.ps1 має приймати [switch]`$NoPause у param() і РЕАЛЬНО (не в текстовому літералі іншої перевірки) викликати Wait-BRAVOManualExit -NoPause:`$NoPause рівно один раз; знайдено викликів: $($selfTestManualExitCalls.Count)"
+
+    # 29. Operator summary (включно з маркером SELF-TEST PASSED/FAILED і
+    # Complete-BRAVOHelperLog) друкується ДО паузи (P17) — Complete-
+    # BRAVOHelperLog викликається всередині try, Wait-BRAVOManualExit — у
+    # відповідному finally; exit усередині Complete-BRAVOHelperLog
+    # проходить крізь finally ПЕРЕД реальним завершенням процесу (той
+    # самий емпірично підтверджений принцип, що Maintenance.Runtime.ps1
+    # використовує навколо свого exit) — тому пауза не може змінити вже
+    # викликаний exit-код.
+    $selfTestCompleteHelperLogIndex = $selfTestScriptText.IndexOf('Complete-BRAVOHelperLog -ExitCode $script:selfTestExitCode')
+    $selfTestManualExitIndex = $selfTestScriptText.LastIndexOf('Wait-BRAVOManualExit -NoPause:$NoPause')
+    Test-BRAVOCondition `
+        -Condition (
+            $selfTestCompleteHelperLogIndex -ge 0 -and
+            $selfTestManualExitIndex -gt $selfTestCompleteHelperLogIndex -and
+            [regex]::IsMatch(
+                $selfTestScriptText,
+                '(?s)try\s*\{\s*Complete-BRAVOHelperLog -ExitCode \$script:selfTestExitCode\s*\}\s*finally\s*\{\s*Wait-BRAVOManualExit -NoPause:\$NoPause\s*\}'
+            )
+        ) `
+        -Name "ConsoleUX/29-SelfTestSummaryBeforePauseOrdering" `
+        -Failure "Complete-BRAVOHelperLog (яка друкує SELF-TEST PASSED/FAILED-контекст і власний Код завершення/Лог) має бути всередині try, а Wait-BRAVOManualExit -NoPause:`$NoPause — у парному finally, у цьому порядку"
+
+    # 30. -NoPause лишається авторитетним і повертається миттєво навіть
+    # після operator summary — той самий генеричний Wait-BRAVOManualExit
+    # (BRAVO.Console), жодної окремої paralel-реалізації для self-test.
+    $selfTestNoPauseElapsed = Measure-Command { Wait-BRAVOManualExit -NoPause }
+    Test-BRAVOCondition `
+        -Condition ($selfTestNoPauseElapsed.TotalSeconds -lt 2) `
+        -Name "ConsoleUX/30-SelfTestNoPauseStillReturnsImmediately" `
+        -Failure "Wait-BRAVOManualExit -NoPause (та сама функція, яку BRAVO_SELF_TEST.ps1 викликає наприкінці) має повертатися миттєво; зайняло $($selfTestNoPauseElapsed.TotalSeconds) с"

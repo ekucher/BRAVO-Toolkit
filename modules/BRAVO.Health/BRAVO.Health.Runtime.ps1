@@ -700,6 +700,9 @@ Initialize-BRAVOProgress -Activity 'BRAVO HEALTH' -Enabled ([bool]$progressSetti
 $script:BRAVOHealthSftpStepEnabled = $sftpCredentialRequired
 $script:BRAVOHealthSmbStepEnabled = $smbCredentialRequired
 $script:BRAVOHealthNotificationStepEnabled = ($NotificationMode -ne 'none') -and (-not $NoSlack)
+# SFTP-перевірку відкладено через зайнятий WinSCP (див. Get-SFTPHealthIssues):
+# кроки SFTP рендеряться SKIPPED, SftpVerified не оголошується підтвердженим.
+$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $false
 # Середовище, керовані служби й локальні копії виконуються завжди.
 # dev.16 (review round 3): BAZA (локальна копія) і SFTP розділені на
 # незалежні dynamic steps — Total тепер точно дорівнює кількості РЕАЛЬНО
@@ -2968,6 +2971,26 @@ function Get-SFTPHealthIssues {
         return @()
     }
 
+    # 5.2.1 (реальний алерт SERV_HRDL_1 23:03): активний WinSCP.com іншої
+    # BRAVO-операції (паралельна передача/затяжна синхронізація) робив
+    # SFTP-перевірку CRITICAL «ПОТРІБНА ДІЯ», хоча це transient-конкуренція,
+    # а не збій SFTP. Тепер зайнятий WinSCP = ВІДКЛАДЕННЯ: WARNING у лозі
+    # (exit 10/ЧАСТКОВО, жовте сповіщення), кроки SFTP — SKIPPED, наступний
+    # health-прогін (кожні 4 год) перевірить знову. Довго висячий процес
+    # видно з PID у попередженні — його завершує оператор. Fail-closed не
+    # втрачено: реальна відсутність свіжих копій на SFTP почервоніє, щойно
+    # WinSCP звільниться і перевірка виконається.
+    $sftpWinScpAvailability = Test-BRAVOWinSCPAvailable -WinSCPPath $winSCPPath
+    if (-not $sftpWinScpAvailability.Available) {
+        $script:BRAVOHealthSftpCheckDeferredByBusyWinSCP = $true
+        Write-HealthLog (
+            (Get-BRAVOWinSCPBusyMessage -Availability $sftpWinScpAvailability -Operation "SFTP health-check") +
+            " — перевірку відкладено до наступного health-прогону (ймовірно, триває інша передача BRAVO); " +
+            "якщо процес WinSCP.com висить довго — завершіть його вручну"
+        ) -Level "WARNING"
+        return @()
+    }
+
     $configurationResult = Test-SFTPHealthConfiguration `
         -CheckArchives $checkArchives `
         -CheckBAZA $checkBAZA `
@@ -4329,6 +4352,210 @@ function Clear-AlertState {
     }
 }
 
+function Get-BRAVOHealthSuccessNotificationState {
+    # Стан попереднього фактично відправленого success-звіту:
+    # @{ Age = [timespan]; Fingerprint = [string]|$null } або $null.
+    # Відсутній/нечитабельний/битий стан = fail-open ($null): дедуп —
+    # зручність, доставка звіту — первинний контракт. Legacy-файл 5.2.1
+    # без поля Fingerprint читається (Age валідний), Fingerprint = $null —
+    # семантична рівність недоказова, тому такий стан не придушує звіт.
+    $statePath = [string]$backupMonitoring.SuccessNotificationStatePath
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $state = Read-BRAVOTextFile -Path $statePath | ConvertFrom-BRAVOJson
+        $lastSent = [datetime]::Parse(
+            $state.LastSuccessSentUtc,
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::RoundtripKind
+        )
+        $stateFingerprint = $null
+        $fingerprintProperty = $state.PSObject.Properties['Fingerprint']
+        if ($null -ne $fingerprintProperty -and
+            -not [string]::IsNullOrWhiteSpace([string]$fingerprintProperty.Value)) {
+            $stateFingerprint = [string]$fingerprintProperty.Value
+        }
+        return [pscustomobject]@{
+            Age = [datetime]::UtcNow - $lastSent.ToUniversalTime()
+            Fingerprint = $stateFingerprint
+        }
+    } catch {
+        Write-HealthLog "Не вдалося прочитати стан попереднього success-звіту (дедуп пропущено, звіт буде відправлено): $($_.Exception.Message)" -Level "WARNING"
+        return $null
+    }
+}
+
+function Get-BRAVOHealthSuccessFingerprint {
+    # Семантичний відбиток здорового стану для дедуплікації SUCCESS-звітів.
+    # Містить лише verdict-поля, зміна яких означає реальну зміну
+    # operational state: прапори підтвердження destination-ів, ознаку
+    # відкладеної SFTP-перевірки, набір увімкнених перевірок та ідентичність
+    # останніх резервних копій (GenerationId; fallback — UTC-час копії).
+    # Волатильні поля (час запуску, тривалість, вік копії, PID) свідомо
+    # НЕ входять: старіння тієї самої копії в межах healthy-порогу — не
+    # зміна стану. Канонічний рядок детермінований (сортування, InvariantCulture,
+    # без hashtable-порядку) і хешується SHA-256 — у state/лог потрапляє
+    # лише хеш, жодних секретів чи шляхів.
+    param(
+        [Parameter(Mandatory = $true)]$DestinationSummary,
+        [bool]$SftpDeferred,
+        [string[]]$EnabledCheckNames = @(),
+        [array]$ArchiveIdentities = @()
+    )
+
+    $canonicalLines = New-Object System.Collections.Generic.List[string]
+    $canonicalLines.Add('schema=1')
+    $canonicalLines.Add("localVerified=$([bool]$DestinationSummary.LocalVerified)")
+    $canonicalLines.Add("sftpVerified=$([bool]$DestinationSummary.SftpVerified)")
+    $canonicalLines.Add("smbVerified=$([bool]$DestinationSummary.SmbVerified)")
+    $canonicalLines.Add("sftpDeferred=$SftpDeferred")
+    $canonicalLines.Add('checks=' + ((@($EnabledCheckNames) | Sort-Object) -join ','))
+    foreach ($archiveIdentity in @($ArchiveIdentities | Sort-Object -Property Type)) {
+        $identityText = if (-not [string]::IsNullOrWhiteSpace([string]$archiveIdentity.GenerationId)) {
+            [string]$archiveIdentity.GenerationId
+        } elseif ($null -ne $archiveIdentity.LastWriteTime) {
+            ([datetime]$archiveIdentity.LastWriteTime).ToUniversalTime().ToString(
+                'o', [System.Globalization.CultureInfo]::InvariantCulture)
+        } else {
+            'unknown'
+        }
+        $canonicalLines.Add("archive=$([string]$archiveIdentity.Type):$identityText")
+    }
+
+    $canonicalText = ($canonicalLines -join "`n")
+    $sha256 = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        $hashBytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($canonicalText))
+    } finally {
+        $sha256.Dispose()
+    }
+    return (($hashBytes | ForEach-Object { $_.ToString('x2') }) -join '')
+}
+
+function Get-BRAVOHealthSuccessNotificationDecision {
+    # Чисте (без I/O) рішення про доставку/придушення SUCCESS-звіту.
+    # Викликається лише коли сповіщення взагалі увімкнені. Пріоритети:
+    # примус оператора > первинний post-backup звіт > вимкнений дедуп >
+    # непідтверджене відновлення (RecoveryPending) > відсутній/недоказовий
+    # попередній стан > зміна semantic-стану > вичерпане часове вікно;
+    # придушується лише семантично той самий standalone-звіт у межах вікна.
+    param(
+        [bool]$ForceNotification,
+        [bool]$EmbeddedPostBackup,
+        [int]$DedupMinutes,
+        [bool]$RecoveryPending,
+        $PreviousState,
+        [string]$CurrentFingerprint
+    )
+
+    $decision = { param([bool]$Send, [string]$Reason)
+        [pscustomobject]@{ Send = $Send; Reason = $Reason }
+    }
+    if ($ForceNotification) { return (& $decision $true 'ForceNotification') }
+    if ($EmbeddedPostBackup) { return (& $decision $true 'PostBackup') }
+    if ($DedupMinutes -le 0) { return (& $decision $true 'DedupDisabled') }
+    if ($RecoveryPending) { return (& $decision $true 'Recovery') }
+    if ($null -eq $PreviousState) { return (& $decision $true 'NoPreviousState') }
+    if ([string]::IsNullOrWhiteSpace([string]$PreviousState.Fingerprint) -or
+        [string]$PreviousState.Fingerprint -ne $CurrentFingerprint) {
+        return (& $decision $true 'StateChanged')
+    }
+    if (([timespan]$PreviousState.Age).TotalMinutes -ge $DedupMinutes) {
+        return (& $decision $true 'WindowExpired')
+    }
+    return (& $decision $false 'SameStateWithinWindow')
+}
+
+function Save-BRAVOHealthSuccessNotificationState {
+    param([string]$Fingerprint)
+
+    $statePath = [string]$backupMonitoring.SuccessNotificationStatePath
+    $stateDirectory = Split-Path $statePath -Parent
+    if (-not (Test-Path -Path $stateDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+    }
+
+    $state = @{
+        LastSuccessSentUtc = [datetime]::UtcNow.ToString("o")
+        Fingerprint = [string]$Fingerprint
+    } | ConvertTo-BRAVOJson
+
+    $temporaryStatePath = "$statePath.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryStatePath,
+            $state,
+            [System.Text.Encoding]::UTF8
+        )
+        Move-Item -LiteralPath $temporaryStatePath -Destination $statePath -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporaryStatePath) {
+            Remove-Item -LiteralPath $temporaryStatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Get-BRAVOHealthOperationalState {
+    # Операційний lifecycle-стан Health, окремий від notification-дедупів:
+    # RecoveryPending = «система була unhealthy після останнього
+    # ПІДТВЕРДЖЕНОГО оператору відновлення» (факт, а не стан доставки
+    # сповіщень). Семантика читання:
+    #   файл відсутній  -> RecoveryPending = $false (норма першої інсталяції
+    #                      або підтвердженого відновлення — дедуп працює);
+    #   файл читається  -> фактичне значення;
+    #   файл битий      -> RecoveryPending = $true (fail-open: невідомість
+    #                      не має права придушити recovery-звіт; storm
+    #                      неможливий — перша ж успішна доставка SUCCESS
+    #                      перезапише стан значенням $false).
+    $statePath = [string]$backupMonitoring.OperationalStatePath
+    if (-not (Test-Path -LiteralPath $statePath -PathType Leaf)) {
+        return [pscustomobject]@{ RecoveryPending = $false }
+    }
+    try {
+        $state = Read-BRAVOTextFile -Path $statePath | ConvertFrom-BRAVOJson
+        return [pscustomobject]@{
+            RecoveryPending = [bool]$state.RecoveryPending
+        }
+    } catch {
+        Write-HealthLog "Не вдалося прочитати операційний стан Health (fail-open: recovery-звіт буде надіслано): $($_.Exception.Message)" -Level "WARNING"
+        return [pscustomobject]@{ RecoveryPending = $true }
+    }
+}
+
+function Save-BRAVOHealthOperationalState {
+    param([Parameter(Mandatory = $true)][bool]$RecoveryPending)
+
+    $statePath = [string]$backupMonitoring.OperationalStatePath
+    $stateDirectory = Split-Path $statePath -Parent
+    if (-not (Test-Path -Path $stateDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $stateDirectory -Force | Out-Null
+    }
+
+    $stateObject = @{
+        RecoveryPending = $RecoveryPending
+        UpdatedAtUtc = [datetime]::UtcNow.ToString("o")
+    }
+    if ($RecoveryPending) {
+        $stateObject.LastUnhealthyAtUtc = [datetime]::UtcNow.ToString("o")
+    }
+    $state = $stateObject | ConvertTo-BRAVOJson
+
+    $temporaryStatePath = "$statePath.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        [System.IO.File]::WriteAllText(
+            $temporaryStatePath,
+            $state,
+            [System.Text.Encoding]::UTF8
+        )
+        Move-Item -LiteralPath $temporaryStatePath -Destination $statePath -Force
+    } finally {
+        if (Test-Path -LiteralPath $temporaryStatePath) {
+            Remove-Item -LiteralPath $temporaryStatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
 function Test-BRAVOArchiveProcessLockActive {
     # Archive and Maintenance coordinate through the canonical machine-wide
     # lock. Health does not acquire it, but must inspect that same handle so a
@@ -4400,31 +4627,54 @@ if (-not $notificationConfigurationValid) {
 }
 
 if ($SkipIfBackupTaskRunning) {
-    # Два НЕЗАЛЕЖНІ сигнали. Запит стану завдання може впасти (COM/ACL), і
-    # тоді єдиним свідченням лишається lock — тому він перевіряється поза
-    # тим самим try, а не після невдалого запиту в спільному блоці.
-    $backupTaskRunning = $false
-    try {
-        $backupTaskState = Get-BRAVOScheduledTaskState `
-            -TaskPath ([string]$schedulerSettings.TaskPath) `
-            -TaskName ([string]$schedulerSettings.Backup.TaskName)
-        Write-HealthLog "Перевірка стану завдання архівації: $($backupTaskState.Provider)" -Level "DEBUG"
-        $backupTaskRunning = [bool]$backupTaskState.IsRunning
-    } catch {
-        Write-HealthLog "Не вдалося прочитати стан завдання архівації; рішення за блокуванням процесу: $($_.Exception.Message)" -Level "WARNING"
-    }
+    # 5.2.1: BAZASync (BRAVO_ARCHIV -SyncBAZA, кожні 4 год о :00) на
+    # реальних серверах тримає lock архівації ~16-17 хв і систематично
+    # накривав слот Health :15 — КОЖЕН денний health-прогін відкладався без
+    # повтору (доведено логами ДНДІЛДВСЕ 25-27.08.2026). Замість негайного
+    # відкладення Health обмежено чекає звільнення архівації
+    # (schedulerSettings.Health.BusyWaitMinutes, loader-дефолт 60 хв;
+    # 0 = стара поведінка) і лише після вичерпання ліміту відкладається
+    # до наступного слота, як раніше.
+    $busyWaitMinutes = [int]$schedulerSettings.Health.BusyWaitMinutes
+    $busyWaitStarted = Get-Date
+    $busyWaitDeadline = $busyWaitStarted.AddMinutes($busyWaitMinutes)
+    $busyWaitAnnounced = $false
+    while ($true) {
+        # Два НЕЗАЛЕЖНІ сигнали. Запит стану завдання може впасти (COM/ACL),
+        # і тоді єдиним свідченням лишається lock — тому він перевіряється
+        # поза тим самим try, а не після невдалого запиту в спільному блоці.
+        $backupTaskRunning = $false
+        try {
+            $backupTaskState = Get-BRAVOScheduledTaskState `
+                -TaskPath ([string]$schedulerSettings.TaskPath) `
+                -TaskName ([string]$schedulerSettings.Backup.TaskName)
+            if (-not $busyWaitAnnounced) {
+                Write-HealthLog "Перевірка стану завдання архівації: $($backupTaskState.Provider)" -Level "DEBUG"
+            }
+            $backupTaskRunning = [bool]$backupTaskState.IsRunning
+        } catch {
+            Write-HealthLog "Не вдалося прочитати стан завдання архівації; рішення за блокуванням процесу: $($_.Exception.Message)" -Level "WARNING"
+        }
 
-    $archiveProcessLockActive = $false
-    try {
-        $archiveProcessLockActive = Test-BRAVOArchiveProcessLockActive
-    } catch {
-        Write-HealthLog "Не вдалося перевірити блокування архівації: $($_.Exception.Message)" -Level "WARNING"
-    }
+        $archiveProcessLockActive = $false
+        try {
+            $archiveProcessLockActive = Test-BRAVOArchiveProcessLockActive
+        } catch {
+            Write-HealthLog "Не вдалося перевірити блокування архівації: $($_.Exception.Message)" -Level "WARNING"
+        }
 
-    # Рішення й повернення — ПОЗА try: вже ухвалене й залоговане відкладення
-    # не має скасовуватись помилкою у формуванні результату. Саме так
-    # Health продовжував роботу під час архівації, ковтаючи виняток.
-    if ($backupTaskRunning -or $archiveProcessLockActive) {
+        # Рішення й повернення — ПОЗА try: вже ухвалене й залоговане
+        # відкладення не має скасовуватись помилкою у формуванні результату.
+        # Саме так Health продовжував роботу під час архівації, ковтаючи
+        # виняток.
+        if (-not ($backupTaskRunning -or $archiveProcessLockActive)) {
+            if ($busyWaitAnnounced) {
+                $busyWaitedSeconds = [int]((Get-Date) - $busyWaitStarted).TotalSeconds
+                Write-HealthLog "Архівація завершилась — health-check продовжується після очікування $busyWaitedSeconds с." -Level "INFO"
+            }
+            break
+        }
+
         $runningIndicator = if ($backupTaskRunning -and $archiveProcessLockActive) {
             "стан завдання та блокування процесу"
         } elseif ($backupTaskRunning) {
@@ -4432,13 +4682,20 @@ if ($SkipIfBackupTaskRunning) {
         } else {
             "блокування процесу"
         }
-        Write-HealthLog "Health-check відкладено: архівація зараз виконується ($runningIndicator)" -Level "INFO"
-        return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
-            Status = "Deferred"
-            IssueCount = 0
-            Notification = "NotRequired"
-            LogPath = $healthLogFile
-        })
+        if ((Get-Date) -ge $busyWaitDeadline) {
+            Write-HealthLog "Health-check відкладено: архівація зараз виконується ($runningIndicator)" -Level "INFO"
+            return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
+                Status = "Deferred"
+                IssueCount = 0
+                Notification = "NotRequired"
+                LogPath = $healthLogFile
+            })
+        }
+        if (-not $busyWaitAnnounced) {
+            Write-HealthLog "Архівація зараз виконується ($runningIndicator) — health-check зачекає її завершення до $busyWaitMinutes хв." -Level "INFO"
+            $busyWaitAnnounced = $true
+        }
+        Start-Sleep -Seconds 30
     }
 }
 
@@ -4942,23 +5199,26 @@ $sftpSharedIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP'
 $sftpArchivesStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -in $sftpArchiveComponentNames }) + @($sftpSharedIssues)
 $sftpBazaAppStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA APP' }) + @($sftpSharedIssues)
 $sftpBazaWWWStepIssues = @($sftpHealthIssues | Where-Object { $_.Component -eq 'SFTP BAZA WWW' }) + @($sftpSharedIssues)
+# Відкладення через зайнятий WinSCP (5.2.1): кроки SFTP — SKIPPED з
+# причиною, а не OK (нічого не перевірено) і не ERROR (це не збій SFTP).
+$sftpDeferredDetails = 'відкладено: WinSCP зайнятий іншою операцією'
 if ($sftpArchivesHealthEnabled) {
     Write-BRAVOHealthStep `
         -Name 'SFTP: резервні копії' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpArchivesStepIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpArchivesStepIssues.Count)
+        -Status $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { 'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount $sftpArchivesStepIssues.Count }) `
+        -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpArchivesStepIssues.Count })
 }
 if ($sftpBazaAppHealthEnabled) {
     Write-BRAVOHealthStep `
         -Name 'SFTP: BAZA_APP' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaAppStepIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaAppStepIssues.Count)
+        -Status $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { 'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount $sftpBazaAppStepIssues.Count }) `
+        -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpBazaAppStepIssues.Count })
 }
 if ($sftpBazaWWWHealthEnabled) {
     Write-BRAVOHealthStep `
         -Name 'SFTP: BAZA_WWW' `
-        -Status (Get-BRAVOHealthStepStatus -IssueCount $sftpBazaWWWStepIssues.Count) `
-        -Details (Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count)
+        -Status $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { 'SKIPPED' } else { Get-BRAVOHealthStepStatus -IssueCount $sftpBazaWWWStepIssues.Count }) `
+        -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count })
 }
 if (-not $sftpArchivesHealthEnabled -and -not $sftpBazaAppHealthEnabled -and -not $sftpBazaWWWHealthEnabled) {
     Write-HealthLog "SFTP health-check пропущено: усі SFTP-перевірки вимкнено в конфігурації"
@@ -4980,9 +5240,20 @@ $destinationSummary = Get-BRAVOHealthDestinationSummary `
     -BazaLocalIssues $bazaLocalHealthIssues `
     -SftpIssues $sftpHealthIssues `
     -SmbIssues $smbHealthIssues
+if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) {
+    # Відкладена SFTP-перевірка не має оголошуватись підтвердженою: нуль
+    # issues означає «не перевіряли», а не «перевірено успішно».
+    $destinationSummary.SftpVerified = $false
+}
 
 if ($healthIssues.Count -eq 0) {
     Write-HealthLog "Усі керовані служби працюють, а локальні, SFTP та NAS/SMB-компоненти мають актуальні резервні копії" -Level "SUCCESS"
+    # Recovery-факт живе в окремому операційному стані (RecoveryPending),
+    # а не в alert-state: alert-state описує дедуп доставки алертів і
+    # очищається нижче незалежно, тоді як RecoveryPending переживає провал
+    # доставки recovery-звіту і повторює його на наступних healthy-прогонах,
+    # доки відновлення не буде фактично підтверджене оператору.
+    $operationalRecoveryPending = [bool](Get-BRAVOHealthOperationalState).RecoveryPending
     Clear-AlertState
 
     $sendSuccessNotification = (
@@ -4990,6 +5261,76 @@ if ($healthIssues.Count -eq 0) {
         -not $NoSlack -and
         $NotificationMode -eq "all"
     )
+    # 5.2.1: semantic + recovery-aware дедуплікація зелених звітів.
+    # Embedded post-backup виклик з Archive (SuppressHeader) не дедупиться —
+    # це первинне підтвердження свіжої копії; standalone-прогін мовчить лише
+    # коли semantic-стан не змінився, аварії з часу попереднього звіту не
+    # було і вікно SuccessDedupMinutes не вичерпане. -ForceNotification —
+    # обхід. Fingerprint обчислюється завжди (потрібен і для запису стану
+    # після фактичної доставки).
+    $successNotificationDisposition = 'NotRequired'
+    $successDedupMinutes = [int]$backupMonitoring.SuccessDedupMinutes
+    $successEnabledCheckNames = @(
+        if ($bazaAppLocalHealthEnabled) { 'baza_app_local' }
+        if ($bazaWWWLocalHealthEnabled) { 'baza_www_local' }
+        if ($sftpArchivesHealthEnabled) { 'sftp_archives' }
+        if ($sftpBazaAppHealthEnabled) { 'sftp_baza_app' }
+        if ($sftpBazaWWWHealthEnabled) { 'sftp_baza_www' }
+        if ($script:BRAVOHealthSmbStepEnabled) { 'smb' }
+    )
+    $successArchiveIdentities = @(
+        $archiveDefinitions | Where-Object { [bool]$_.Enabled } | ForEach-Object {
+            $successArchiveInfo = $script:healthLatestArchives[[string]$_.Type]
+            if ($null -ne $successArchiveInfo -and $null -ne $successArchiveInfo.LastWriteTime) {
+                [pscustomobject]@{
+                    Type = [string]$_.Type
+                    GenerationId = [string]$successArchiveInfo.GenerationId
+                    LastWriteTime = [datetime]$successArchiveInfo.LastWriteTime
+                }
+            }
+        }
+    )
+    $successFingerprint = Get-BRAVOHealthSuccessFingerprint `
+        -DestinationSummary $destinationSummary `
+        -SftpDeferred ([bool]$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) `
+        -EnabledCheckNames $successEnabledCheckNames `
+        -ArchiveIdentities $successArchiveIdentities
+    if ($sendSuccessNotification) {
+        $previousSuccessState = $null
+        if (-not $ForceNotification -and -not $SuppressHeader -and
+            $successDedupMinutes -gt 0 -and -not $operationalRecoveryPending) {
+            $previousSuccessState = Get-BRAVOHealthSuccessNotificationState
+        }
+        $successDecision = Get-BRAVOHealthSuccessNotificationDecision `
+            -ForceNotification:$ForceNotification `
+            -EmbeddedPostBackup:$SuppressHeader `
+            -DedupMinutes $successDedupMinutes `
+            -RecoveryPending:$operationalRecoveryPending `
+            -PreviousState $previousSuccessState `
+            -CurrentFingerprint $successFingerprint
+        switch ([string]$successDecision.Reason) {
+            'Recovery' {
+                Write-HealthLog "Recovery pending: оператор ще не отримав підтвердження відновлення після аварійного стану — SUCCESS не підлягає дедуплікації" -Level "INFO"
+            }
+            'StateChanged' {
+                $previousFingerprintShort = if ($null -ne $previousSuccessState -and
+                    -not [string]::IsNullOrWhiteSpace([string]$previousSuccessState.Fingerprint)) {
+                    ([string]$previousSuccessState.Fingerprint).Substring(0, 8)
+                } else {
+                    'невідомий'
+                }
+                Write-HealthLog "Semantic-стан змінився з часу попереднього success-звіту (fingerprint $previousFingerprintShort -> $($successFingerprint.Substring(0, 8))) — звіт буде відправлено" -Level "INFO"
+            }
+            'SameStateWithinWindow' {
+                $previousSuccessAgeMinutes = [int][math]::Round(([timespan]$previousSuccessState.Age).TotalMinutes)
+                Write-HealthLog "SUCCESS-звіт придушено дедуплікацією: semantic-стан не змінився (fingerprint $($successFingerprint.Substring(0, 8))), попередню доставку виконано $previousSuccessAgeMinutes хв тому (вікно SuccessDedupMinutes = $successDedupMinutes хв; -ForceNotification надсилає примусово)" -Level "INFO"
+            }
+        }
+        if (-not $successDecision.Send) {
+            $sendSuccessNotification = $false
+            $successNotificationDisposition = 'Suppressed'
+        }
+    }
     if ($sendSuccessNotification) {
         $healthDuration = (Get-Date) - $healthCheckStarted
         $successMessage = New-SlackSuccessMessage -Duration $healthDuration
@@ -5005,6 +5346,26 @@ if ($healthIssues.Count -eq 0) {
                 -MessageChunks $successChunks `
                 -TimeoutSeconds $NotificationRequestTimeoutSeconds
             Write-HealthLog "Успішний звіт відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
+            try {
+                Save-BRAVOHealthSuccessNotificationState -Fingerprint $successFingerprint
+            } catch {
+                # Провал запису state не змінює первинний результат —
+                # звіт УЖЕ відправлено; наступний прогін просто не
+                # дедуплікується.
+                Write-HealthLog "Не вдалося зберегти стан success-звіту (наступний звіт може не дедуплікуватись): $($_.Exception.Message)" -Level "WARNING"
+            }
+            if ($operationalRecoveryPending) {
+                # Recovery підтверджене лише ФАКТИЧНО доставленим SUCCESS —
+                # тому очищення стоїть тут, після Send, а не в decision-гілці.
+                # Провал запису fail-safe у бік повтору: наступний healthy
+                # прогін надішле recovery-звіт ще раз.
+                try {
+                    Save-BRAVOHealthOperationalState -RecoveryPending $false
+                    Write-HealthLog "Recovery SUCCESS доставлено; RecoveryPending очищено" -Level "INFO"
+                } catch {
+                    Write-HealthLog "Recovery SUCCESS доставлено, але операційний стан не вдалося оновити — наступний healthy прогін повторить recovery-звіт: $($_.Exception.Message)" -Level "WARNING"
+                }
+            }
             return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
                 Status = "Healthy"
                 IssueCount = 0
@@ -5016,6 +5377,11 @@ if ($healthIssues.Count -eq 0) {
             })
         } catch {
             Write-HealthLog "Не вдалося відправити успішний звіт у ${NotificationProviderDisplayName}: $($_.Exception.Message)" -Level "ERROR"
+            if ($operationalRecoveryPending) {
+                # Операційний стан навмисно НЕ чіпаємо: RecoveryPending
+                # лишається true, наступний healthy прогін повторить спробу.
+                Write-HealthLog "Recovery SUCCESS не доставлено; RecoveryPending збережено для повторної спроби на наступному healthy-прогоні" -Level "WARNING"
+            }
             return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
                 Status = "NotificationError"
                 IssueCount = 0
@@ -5032,12 +5398,24 @@ if ($healthIssues.Count -eq 0) {
     return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
         Status = "Healthy"
         IssueCount = 0
-        Notification = "NotRequired"
+        Notification = $successNotificationDisposition
         LogPath = $healthLogFile
         LocalVerified = $destinationSummary.LocalVerified
         SftpVerified = $destinationSummary.SftpVerified
         SmbVerified = $destinationSummary.SmbVerified
     })
+}
+
+# Операційний факт фіксується ДО будь-якої notification-логіки і незалежно
+# від того, чи вдасться доставити alert (operational truth і notification
+# delivery — різні речі): система unhealthy, отже оператор ще не отримав
+# підтвердження відновлення — наступний healthy прогін зобов'язаний надіслати
+# recovery-SUCCESS, і так до першої успішної доставки.
+try {
+    Save-BRAVOHealthOperationalState -RecoveryPending $true
+    Write-HealthLog "RecoveryPending встановлено: Health перейшов у problem state; відновлення буде підтверджено окремим SUCCESS-звітом" -Level "INFO"
+} catch {
+    Write-HealthLog "Не вдалося зберегти операційний стан RecoveryPending — гарантія повторного recovery-звіту після відновлення втрачена до наступного unhealthy-прогону: $($_.Exception.Message)" -Level "WARNING"
 }
 
 foreach ($healthIssue in $healthIssues) {

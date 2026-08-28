@@ -72,7 +72,11 @@ $bypassAllowlist = @(
     # робить рядковий exit, тому in-process виклик неможливий), той самий
     # елевований self-relaunch патерн, що BRAVO_SELF_TEST.ps1 і
     # BRAVO.DataRestore.Runtime.ps1 вище.
-    'BRAVO.DataRestore.MatrixTest.psm1'
+    'BRAVO.DataRestore.MatrixTest.psm1',
+    # BRAVO.config описує завдання Планувальника (ArgumentsTemplate для
+    # schtasks) — та сама категорія "описує завдання", що TASKS_INSTALL.
+    # Config увійшов у скан заради правила legacy-webhook нижче.
+    'BRAVO.config'
 )
 
 $forbiddenRules = @(
@@ -95,11 +99,39 @@ $forbiddenRules = @(
         Name = 'ExecutionPolicy Bypass поза installer/task definitions'
         Pattern = '(?i)ExecutionPolicy\s+Bypass'
         Allowlist = $bypassAllowlist
+    },
+    @{
+        # 5.2.1: legacy provider-wide webhook-и виведені з активного
+        # контракту — Discord/Slack працюють лише через канальні
+        # GENERAL/ALERTS targets. Правило блокує ПОВЕРНЕННЯ legacy-літералів
+        # в активний runtime/config/setup код (коментарі пропускаються
+        # загальним фільтром вище; історичні CHANGELOG/evidence-docs не
+        # входять у analyzable-набір).
+        # Allowlist: BRAVO_DRY_RUN.ps1 — міграційна діагностика legacy-only
+        # інсталяції (читає запис лише щоб пояснити FAIL, runtime resolver
+        # його не використовує); BRAVO_SELF_TEST.ps1 — негативні регресії
+        # (доводять, що навіть наявний legacy-запис ігнорується).
+        Name = 'Legacy provider-wide webhook target (BRAVO_DISCORD_URL/BRAVO_SLACK_URL)'
+        Pattern = 'BRAVO_(DISCORD|SLACK)_URL'
+        Allowlist = @(
+            'BRAVO_DRY_RUN.ps1',
+            'BRAVO_SELF_TEST.ps1'
+        )
     }
 )
 
 . (Join-Path $PSScriptRoot 'BRAVOAnalyzableFiles.ps1')
 $files = @(Get-BRAVOAnalyzableFile -Root $Root)
+
+# Активні конфігураційні файли — не .ps1/.psm1/.psd1, тому поза
+# Get-BRAVOAnalyzableFile, але legacy webhook-літерали (та інші заборонені
+# патерни) не мають права з'являтись і в них.
+foreach ($configFileName in @('BRAVO.config', 'BRAVO.local.config.example')) {
+    $configFilePath = Join-Path $Root $configFileName
+    if (Test-Path -LiteralPath $configFilePath -PathType Leaf) {
+        $files += @(Get-Item -LiteralPath $configFilePath)
+    }
+}
 
 $violationCount = 0
 foreach ($file in $files) {

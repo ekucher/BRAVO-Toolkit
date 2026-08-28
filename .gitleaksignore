@@ -74,3 +74,13 @@
 7b05cc0d73214089b8144db508e065429a58b7b9:BRAVO_CONFIG_LOADER.ps1:generic-api-key:398
 7b05cc0d73214089b8144db508e065429a58b7b9:BRAVO.config:generic-api-key:856
 7b05cc0d73214089b8144db508e065429a58b7b9:selftest/BRAVO_SELF_TEST.LogRotation.ps1:generic-api-key:964
+
+# Коміт 378fb60 (2026-08-27, повний каталог override-ключів у
+# BRAVO.local.config.example): закоментований приклад
+# # 'sftpDirectories.ExchangeApiLogs' = 'logs/exchangapi' — той самий
+# false-positive клас, що вже allowlisted вище для BRAVO_CONFIG_LOADER.ps1/
+# BRAVO.config/selftest (7b05cc0): ключ містить "Api" поруч із "=" і
+# рядковим значенням, що збігається з entropy-евристикою generic-api-key.
+# Значення — публічний відносний SFTP-шлях (приклад override у
+# документаційному .example-файлі), жодного секрету.
+378fb603451b5cc407e016d835576a0607ee57b9:BRAVO.local.config.example:generic-api-key:206
