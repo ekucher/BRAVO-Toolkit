@@ -193,7 +193,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
-          .\BRAVO_SELF_TEST.ps1
+          .\BRAVO_SELF_TEST.ps1 -NoPause
           if ($LASTEXITCODE -ne 0) {
               Write-Host "::error::BRAVO_SELF_TEST.ps1 exited with code $LASTEXITCODE"
               exit 1
