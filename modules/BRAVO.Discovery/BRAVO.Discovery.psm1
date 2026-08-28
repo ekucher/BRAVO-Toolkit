@@ -332,6 +332,44 @@ function Get-BRAVOApacheDocumentRoot {
     return $null
 }
 
+function Test-BRAVOBazaWwwInstallation {
+    # Структурна перевірка кандидата BAZA_WWW: сам факт наявності Apache
+    # (навіть з дійсним DocumentRoot) ще НЕ означає, що BAZA_WWW присутній —
+    # DocumentRoot може належати зовсім іншому сайту на тій самій Apache-
+    # службі. Кандидат тут — це вже <DocumentRoot>\BAZA (конвенція,
+    # застосована викликачем нижче), тому перевірка навмисно НЕ є
+    # full-fledged BAZA application fingerprint (у репозиторії немає жодного
+    # задокументованого/перевіреного internal-layout BAZA_WWW, який можна
+    # було б безпечно закласти сюди без вигадування — вигадувати customer-
+    # specific структуру заборонено ТЗ). Замість цього — мінімальний,
+    # generic, недеструктивний сигнал: кандидат існує, є РЕАЛЬНИМ каталогом
+    # (не reparse point/symlink — той самий клас перевірки, що вже
+    # застосовується для BRAVO.DataRestore live-source, аби уникнути
+    # path-traversal через підмінений каталог) і НЕ порожній. Порожній чи
+    # відсутній каталог з тим самим ім'ям — законний привід лишитись
+    # Absent, а не Present з помилковими даними.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ Valid = $false; Reason = "шлях не задано" }
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or -not $item.PSIsContainer) {
+        return [pscustomobject]@{ Valid = $false; Reason = "каталог не існує: $Path" }
+    }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return [pscustomobject]@{ Valid = $false; Reason = "каталог є reparse point/symlink — небезпечно приймати без ручної перевірки: $Path" }
+    }
+    $hasEntries = $null -ne (Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if (-not $hasEntries) {
+        return [pscustomobject]@{ Valid = $false; Reason = "каталог порожній (не схожий на реальну інсталяцію BAZA_WWW): $Path" }
+    }
+    return [pscustomobject]@{ Valid = $true; Reason = $null }
+}
+
 function Get-BRAVOSystemDirectoryPath {
     # BRAVO — 32-бітний процес. На x64 Windows звернення служби до
     # System32 прозоро перенаправляється WOW64 у SysWOW64; на x86 правильним
@@ -807,16 +845,66 @@ function Resolve-BRAVOInstallationDiscovery {
         $documentRootReason = "WEB_ROOT заданий явним override, тому httpd.conf службою не шукається; для BAZA_WWW потрібен окремий discoverySettings.Sources.BAZA_WWW"
     }
 
+    # BAZA_WWW Presence-контракт (Present/Absent/Ambiguous/Error) — окремо
+    # від WEB_ROOT: сама Apache-служба може бути неоднозначною/присутньою
+    # без того, щоб BAZA_WWW існував чи навпаки. Пріоритет 1 (explicit
+    # override) завжди перекриває Priority 2 (Apache service/config); при
+    # invalid override — visible Error, БЕЗ silent fallback на auto-
+    # discovery (той самий fail-closed принцип, що для BravoRoot вище).
     $bazaWwwOverride = if ($sourceOverrides.Contains('BAZA_WWW')) {
         [string]$sourceOverrides['BAZA_WWW']
     } else { $null }
-    $bazaWwwResolved = if (-not [string]::IsNullOrWhiteSpace($bazaWwwOverride)) {
+    $bazaWwwPresence = $null
+    $bazaWwwSource = 'None'
+    if (-not [string]::IsNullOrWhiteSpace($bazaWwwOverride)) {
         $overrides['BAZA_WWW'] = $true
-        [pscustomobject]@{ Value = $bazaWwwOverride; Reason = 'явний override discoverySettings.Sources.BAZA_WWW' }
+        $bazaWwwSource = 'ExplicitOverride'
+        if (-not (Test-BRAVOAbsolutePath -Path $bazaWwwOverride)) {
+            $bazaWwwPresence = 'Error'
+            $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "явний override discoverySettings.Sources.BAZA_WWW не є absolute шляхом: $bazaWwwOverride" }
+        } elseif (-not (Test-Path -LiteralPath $bazaWwwOverride -PathType Container)) {
+            $bazaWwwPresence = 'Error'
+            $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "явний override discoverySettings.Sources.BAZA_WWW вказує на каталог, якого не існує: $bazaWwwOverride" }
+        } else {
+            $bazaWwwPresence = 'Present'
+            $bazaWwwResolved = [pscustomobject]@{ Value = $bazaWwwOverride; Reason = 'явний override discoverySettings.Sources.BAZA_WWW' }
+        }
+    } elseif ($webRootAmbiguous) {
+        # Кілька Apache-подібних служб із РІЗНИМИ виконуваними файлами —
+        # неможливо визначити, чий саме DocumentRoot authoritative.
+        # НЕ обираємо першу службу мовчки (на відміну від $webRoot/
+        # $apacheDocumentRoot вище, які лишаються для діагностики
+        # Reasons.WebRoot/Test-BRAVODiscoveryResult) — для самого значення
+        # BAZA_WWW, яке реально споживає Archive/Health runtime, неоднозначність
+        # має явно зупиняти auto-discovery.
+        $bazaWwwPresence = 'Ambiguous'
+        $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "кілька Apache-подібних служб з різними виконуваними файлами — неможливо визначити authoritative BAZA_WWW ($($distinctWebExecutables -join '; '))" }
     } elseif (-not [string]::IsNullOrWhiteSpace($apacheDocumentRoot)) {
-        [pscustomobject]@{ Value = (Join-Path $apacheDocumentRoot 'BAZA'); Reason = $documentRootReason }
+        $bazaWwwCandidate = Join-Path $apacheDocumentRoot 'BAZA'
+        $bazaWwwStructural = Test-BRAVOBazaWwwInstallation -Path $bazaWwwCandidate
+        $bazaWwwSource = 'ApacheConfig'
+        if ($bazaWwwStructural.Valid) {
+            $bazaWwwPresence = 'Present'
+            $bazaWwwResolved = [pscustomobject]@{ Value = $bazaWwwCandidate; Reason = $documentRootReason }
+        } else {
+            # Apache присутній і DocumentRoot реально резолвиться, але
+            # <DocumentRoot>\BAZA не проходить структурну перевірку — це
+            # означає "цей Apache не хостить BAZA_WWW", а НЕ помилку
+            # discovery-механізму. Тому Absent, не Error (розділ 6 ТЗ:
+            # сама наявність Apache не означає BAZA_WWW).
+            $bazaWwwPresence = 'Absent'
+            $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "Apache знайдено, DocumentRoot=$apacheDocumentRoot, але $($bazaWwwStructural.Reason) — BAZA_WWW на цьому Apache відсутній" }
+        }
+    } elseif (-not [string]::IsNullOrWhiteSpace($apacheServerRoot)) {
+        # Apache-служба знайдена (однозначно), ServerRoot визначено, але
+        # сам httpd.conf/DocumentRoot прочитати не вдалося — це поломка
+        # discovery-механізму (config відсутній/malformed), а не законна
+        # відсутність компонента.
+        $bazaWwwPresence = 'Error'
+        $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: $documentRootReason" }
     } else {
-        [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: $documentRootReason" }
+        $bazaWwwPresence = 'Absent'
+        $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: $documentRootReason" }
     }
     # --- ExchangeAPI: лише ідентифікація служби, шлях завжди з bravo.ini ---
     $exchangeApiServices = if (-not [string]::IsNullOrWhiteSpace($ExchangeApiServiceName)) {
@@ -848,6 +936,13 @@ function Resolve-BRAVOInstallationDiscovery {
         BRAVOEXCH_SOURCE = $bravoexchResolved.Value
         BAZA_APP = $bazaAppResolved.Value
         BAZA_WWW = $bazaWwwResolved.Value
+        # Структурований Presence-контракт (Present/Absent/Ambiguous/Error)
+        # — окремо від BAZA_WWW (сирий шлях, для сумісності з наявними
+        # споживачами, $null у всіх трьох "непозитивних" станах). Source
+        # показує, ЯКИЙ pathway дав значення (ExplicitOverride/ApacheConfig/
+        # None), а не лише "чи присутній".
+        BAZA_WWW_Presence = $bazaWwwPresence
+        BAZA_WWW_Source = $bazaWwwSource
         BACKUP_ROOT = $backupRootResolved.Value
         Services = $allServices
         Overrides = $overrides
@@ -1316,6 +1411,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-BRAVOIniPathValue',
     'Test-BRAVOAbsolutePath',
     'Get-BRAVOApacheDocumentRoot',
+    'Test-BRAVOBazaWwwInstallation',
     'Get-BRAVOSystemDirectoryPath',
     'Get-BRAVOSystemBravoIniPath',
     'Get-BRAVOSystemRangeIdLogPath',

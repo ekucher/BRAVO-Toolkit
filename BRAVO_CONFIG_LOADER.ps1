@@ -506,7 +506,7 @@ function Assert-BravoLoadedConfiguration {
         $global:schedulerSettings.Health -is [hashtable]) {
         # 5.2.1: обмежене очікування звільнення архівації перед відкладенням
         # health-прогону. Legacy-конфіги без ключа отримують канонічний
-        # дефолт комплекту (20 хв); явний 0 = негайне відкладення (стара
+        # дефолт комплекту (60 хв); явний 0 = негайне відкладення (стара
         # поведінка). Значення поза 0..90 хв — некоректне: ExecutionTimeLimit
         # задачі Health = 2 год, очікування мусить лишати запас на перевірку.
         $healthBusyWaitIsValid = $false
@@ -517,13 +517,55 @@ function Assert-BravoLoadedConfiguration {
                 $global:schedulerSettings.Health.BusyWaitMinutes = $healthBusyWaitParsed
                 $healthBusyWaitIsValid = $true
             } else {
-                Write-Warning "schedulerSettings.Health.BusyWaitMinutes = '$($global:schedulerSettings.Health.BusyWaitMinutes)' не є цілим числом у межах 0..90 — застосовується канонічний дефолт 20 хв."
+                Write-Warning "schedulerSettings.Health.BusyWaitMinutes = '$($global:schedulerSettings.Health.BusyWaitMinutes)' не є цілим числом у межах 0..90 — застосовується канонічний дефолт 60 хв."
             }
         }
         if (-not $healthBusyWaitIsValid) {
             # Legacy-конфіг без ключа (мовчазний compat-дефолт) або
             # некоректне значення (Warning уже виписано вище).
-            $global:schedulerSettings.Health.BusyWaitMinutes = 20
+            $global:schedulerSettings.Health.BusyWaitMinutes = 60
+        }
+    }
+
+    if ($global:backupMonitoring -is [hashtable]) {
+        # 5.2.1: вікно дедуплікації зелених success-звітів Health. Legacy-конфіги
+        # без ключа отримують канонічний дефолт комплекту (1380 хв = 23 год:
+        # максимум один зелений звіт на добу — post-backup після щоденної
+        # архівації); явний 0 = дедуп вимкнено (стара поведінка). Верхня межа
+        # 2880 хв (дві доби) — стеля для нестандартних розкладів бекапу.
+        $successDedupIsValid = $false
+        if ($global:backupMonitoring.Contains('SuccessDedupMinutes')) {
+            $successDedupParsed = 0
+            if ([int]::TryParse([string]$global:backupMonitoring.SuccessDedupMinutes, [ref]$successDedupParsed) -and
+                $successDedupParsed -ge 0 -and $successDedupParsed -le 2880) {
+                $global:backupMonitoring.SuccessDedupMinutes = $successDedupParsed
+                $successDedupIsValid = $true
+            } else {
+                Write-Warning "backupMonitoring.SuccessDedupMinutes = '$($global:backupMonitoring.SuccessDedupMinutes)' не є цілим числом у межах 0..2880 — застосовується канонічний дефолт 1380 хв (23 год)."
+            }
+        }
+        if (-not $successDedupIsValid) {
+            $global:backupMonitoring.SuccessDedupMinutes = 1380
+        }
+        # Шлях state-файла дедупу: legacy-конфіг без ключа отримує файл поряд
+        # з AlertStatePath (той самий State-каталог).
+        if ((-not $global:backupMonitoring.Contains('SuccessNotificationStatePath') -or
+                [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.SuccessNotificationStatePath)) -and
+            $global:backupMonitoring.Contains('AlertStatePath') -and
+            -not [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.AlertStatePath)) {
+            $global:backupMonitoring.SuccessNotificationStatePath = Join-Path `
+                (Split-Path -Path ([string]$global:backupMonitoring.AlertStatePath) -Parent) `
+                'BRAVO_HEALTH_SUCCESS_NOTIFICATION_STATE.json'
+        }
+        # Шлях операційного lifecycle-стану Health (RecoveryPending): та сама
+        # legacy-деривація від каталогу AlertStatePath.
+        if ((-not $global:backupMonitoring.Contains('OperationalStatePath') -or
+                [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.OperationalStatePath)) -and
+            $global:backupMonitoring.Contains('AlertStatePath') -and
+            -not [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.AlertStatePath)) {
+            $global:backupMonitoring.OperationalStatePath = Join-Path `
+                (Split-Path -Path ([string]$global:backupMonitoring.AlertStatePath) -Parent) `
+                'BRAVO_HEALTH_OPERATIONAL_STATE.json'
         }
     }
 

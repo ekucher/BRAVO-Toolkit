@@ -893,7 +893,6 @@ $exchangAPILegacyDataEnabled = [bool]$exchangeApiComponentPlan.IncludeLegacyData
 
 # ===== ГЛОБАЛЬНІ ЗМІННІ (НЕ ЗМІНЮВАТИ) =====
 $script:ScriptStartTime = [DateTime]::Now
-$script:SlackMessageBuffer = New-Object 'System.Collections.Generic.List[string]'
 $script:CriticalErrors = $false
 $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]'
 # Окрема черга для notification-only WARNING/ERROR (Send-SlackAlert
@@ -2126,12 +2125,12 @@ function Send-SlackAlert {
     }
 
     if ($effectiveSeverity -eq "SUCCESS") {
-        # Незмінна стара гілка: відправляємо не-критичні повідомлення
-        # тільки в режимі "all".
-        if ($script:SlackMode -ne "all") {
-            return
-        }
-        $script:SlackMessageBuffer.Add($Message)
+        # 5.2.1: SUCCESS-гілка НЕ надсилає окремих повідомлень — покрокові
+        # інформаційні статуси представлені підсумковим Send-FinalReport
+        # (один звіт на прогін). Раніше тут стояв $script:SlackMessageBuffer,
+        # який лише накопичував повідомлення і НІКОЛИ не читався (мовчазна
+        # втрата) — буфер видалено; аудит показав, що 6 із 7 викликів цієї
+        # гілки насправді були ERROR-сценаріями і переведені на -IsCritical.
         return
     }
 
@@ -5547,7 +5546,7 @@ function Compress-OldData {
     if ($errorCount -gt 0) {
         $errorMsg = "Виникло $errorCount помилок під час архівації"
         Write-Log "$errorMsg" -Level "ERROR"
-        Send-SlackAlert -Message $errorMsg
+        Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
         $script:restoreArchiveFailed = $true
     }
@@ -5883,11 +5882,11 @@ function Check-FreeSpace {
             return $false
         }
 
+        # Зведення по дисках потрапляє у фінальний звіт через
+        # $script:freeSpaceSummary — окреме інформаційне повідомлення тут
+        # ішло в мертвий буфер і ніколи не доставлялось (5.2.1: буфер
+        # видалено разом із викликом).
         $script:freeSpaceSummary = @($driveStatus)
-        if ($script:SlackMode -eq "all") {
-            $infoMsg = "Достатньо вільного місця на локальних дисках: $($driveStatus -join '; ') (мінімум ${MIN_FREE_SPACE} GB на кожному)"
-            Send-SlackAlert -Message $infoMsg
-        }
 
         return $true
     }
@@ -7938,14 +7937,14 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
     catch {
         $errorMsg = "Помилка при обробці Trace-файлів: $($_.Exception.Message)"
         Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-        Send-SlackAlert -Message $errorMsg
+        Send-SlackAlert -Message $errorMsg -IsCritical
         $script:criticalErrorOccurred = $true
     }
 }
 elseif ($BravoMaintenanceEnabled) {
     $errorMsg = "Сервіс $($BravoServiceName) все ще працює. Операції з файлами пропущено."
     Write-Log -Message $errorMsg -Level "ERROR"
-    Send-SlackAlert -Message $errorMsg
+    Send-SlackAlert -Message $errorMsg -IsCritical
     $script:criticalErrorOccurred = $true
 }
 
@@ -7981,7 +7980,7 @@ if ($exchangAPIServiceEnabled) {
         } catch {
             $errorMsg = "Помилка при обробці логів exchangAPI: $($_.Exception.Message)"
             Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-            Send-SlackAlert -Message $errorMsg
+            Send-SlackAlert -Message $errorMsg -IsCritical
             $script:criticalErrorOccurred = $true
         }
     } else {
@@ -8029,7 +8028,7 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
         } catch {
             $errorMsg = "Помилка при обробці логів BRAVO Web: $($_.Exception.Message)"
             Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-            Send-SlackAlert -Message $errorMsg
+            Send-SlackAlert -Message $errorMsg -IsCritical
             $script:criticalErrorOccurred = $true
         }
     } else {
@@ -8510,7 +8509,7 @@ if (-not $BravoMaintenanceEnabled) {
         $script:criticalErrorOccurred = $true
         $traceArchiveOperationDetail = $_.Exception.Message
         Write-Log -Message "ПОМИЛКА: Trace добовий архів/SFTP: $($_.Exception.Message)" -Level "ERROR"
-        Send-SlackAlert -Message "Trace добовий архів/SFTP: $($_.Exception.Message)"
+        Send-SlackAlert -Message "Trace добовий архів/SFTP: $($_.Exception.Message)" -IsCritical
     } finally {
         if ($null -ne $traceSftpSession) {
             try { $traceSftpSession.Dispose() } catch {

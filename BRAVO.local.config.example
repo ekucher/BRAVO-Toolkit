@@ -55,6 +55,8 @@
     # 'credentialSettings.Targets.SFTPPassword' = 'BRAVO_SFTP_PASSWORD'
     # 'credentialSettings.Targets.DiscordWebhookGeneral' = 'BRAVO_DISCORD_GENERAL_URL'
     # 'credentialSettings.Targets.DiscordWebhookAlerts' = 'BRAVO_DISCORD_ALERTS_URL'
+    # 'credentialSettings.Targets.SlackWebhookGeneral' = 'BRAVO_SLACK_GENERAL_URL'
+    # 'credentialSettings.Targets.SlackWebhookAlerts' = 'BRAVO_SLACK_ALERTS_URL'
 
     # Публічна IP у сповіщеннях (вимкнено свідомо; вмикайте усвідомлено):
     # 'hostInformationSettings.PublicIPLookupEnabled' = $true
@@ -216,6 +218,9 @@
     # 'backupMonitoring.NotifyOnSuccessAfterBackup' = $true
     # Дедуп критичних сповіщень (0 = надсилати щоцикл):
     # 'backupMonitoring.RepeatAlertAfterHours' = 6
+    # Дедуп зелених success-звітів: 1380 хв (23 год) = максимум один зелений
+    # звіт на добу (0 = вимкнено; post-backup звіт не дедупиться):
+    # 'backupMonitoring.SuccessDedupMinutes' = 1380
 
     # --- SFTP-перевірки ---
     # 'backupMonitoring.SFTP.Enabled' = $true
@@ -267,7 +272,7 @@
     # 'schedulerSettings.Health.StartAt' = '00:30'
     # 'schedulerSettings.Health.RepeatEveryMinutes' = 240
     # 'schedulerSettings.Health.SkipIfBackupTaskRunning' = $true
-    # 'schedulerSettings.Health.BusyWaitMinutes' = 20   # 0 = негайне відкладення при зайнятій архівації
+    # 'schedulerSettings.Health.BusyWaitMinutes' = 60   # 0 = негайне відкладення при зайнятій архівації
     # 'schedulerSettings.BAZASync.StartAt' = '00:00'
     # 'schedulerSettings.BAZASync.RepeatEveryHours' = 4
 }

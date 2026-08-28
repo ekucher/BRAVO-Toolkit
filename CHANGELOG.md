@@ -4,6 +4,87 @@
 
 ---
 
+## 5.2.1 — 2026-08-29
+
+Stable release of the 5.2.1 hotfix line, promoted from accepted
+`5.2.1-rc.9` (tag `v5.2.1-rc.9`, stamp `f99134d`) plus the additional
+fixes/features below, validated end-to-end via production acceptance
+on preview build `BRAVO-Toolkit-5.2.1-rc.10-preview-6737485.zip`
+(snapshot `6737485`, sha256
+`8c70324596fa55a805877e767529d77d9ff4db9472f2626ae2e749bc27692155`):
+Runtime Guard 82/82, SELF-TEST 1447/0, real Archive (MODEL/BLOG/
+BRAVOEXCH + SFTP), BAZA_APP/BAZA_WWW sync, CurrentUser/SYSTEM
+notification delivery, retry-safe Recovery, BusyWait 60-min overlap,
+CurrentUser/SYSTEM state writes.
+
+- **FIX P0 (self-test/health, process isolation): orphaned SELF-TEST
+  service-helper function could shadow production `Get-Service`/
+  `Start-Service`/`Stop-Service`/`Get-CimInstance`/`Get-WmiObject` for
+  the rest of the process.** `BRAVO_SELF_TEST.ps1` builds throwaway
+  dynamic modules/functions to simulate service states for its
+  fixtures; a cleanup gap could leave one of these shadowing the real
+  cmdlet in the caller's scope after SELF-TEST returned. In a
+  long-lived process (e.g. a scheduled task host that runs SELF-TEST
+  and then Health in the same session) this silently turned real
+  Health service checks into mocked results. New ownership registry
+  (`$script:BRAVOSelfTestOwnedRuntimeModules`) tracks every dynamic
+  module/function SELF-TEST creates; `Clear-BRAVOSelfTestOwnedRuntimeModules`
+  removes them all before SELF-TEST returns, run unconditionally after
+  the top-level try/catch, before the exit code is computed. Five new
+  fail-loud regression tests confirm `Get-Service`/`Start-Service`/
+  `Stop-Service` resolve back to `Microsoft.PowerShell.Management` and
+  that no SELF-TEST-owned module/function remains exported after a
+  full run. Re-validated same-process against the built ZIP artifact
+  (PID unchanged before/after SELF-TEST).
+- **FEATURE (health, notification): semantic SUCCESS-report deduplication
+  with retry-safe Recovery lifecycle.** A healthy Health run now sends
+  at most one duplicate-content SUCCESS notification per
+  `backupMonitoring.SuccessDedupMinutes` window (kit default `1380` =
+  23h, one green report per day; embedded post-backup reports and
+  `-ForceNotification` always bypass dedup; `0` disables it). Recovery
+  from an unhealthy state is never deduplicated: a new
+  `RecoveryPending` operational-state flag is set the moment Health
+  goes unhealthy and is cleared only after a Recovery SUCCESS
+  notification is actually delivered — a failed delivery preserves
+  `RecoveryPending` so the next healthy run retries the recovery
+  report instead of silently deduplicating it.
+- **FIX (health/scheduler): `schedulerSettings.Health.BusyWaitMinutes`
+  kit default `20` -> `60`.** Production acceptance showed the
+  scheduled BAZASync lock window can exceed 20 minutes; Health now
+  waits up to 60 minutes for the archive lock to clear before
+  deferring (loader range unchanged at `0..90`, explicit `0` still
+  disables waiting).
+- **FEATURE (discovery): BAZA_WWW Apache-based discovery with an
+  explicit Present/Absent/Ambiguous/Error presence contract.**
+  `Test-BRAVOBazaWwwInstallation` validates the resolved
+  `<DocumentRoot>\BAZA` candidate (real directory, not a reparse
+  point/symlink, non-empty) before accepting it; explicit
+  `discoverySettings.Sources.BAZA_WWW` override still takes priority
+  and fails closed (visible `Error`, no silent fallback) on an
+  invalid override, matching existing `BravoRoot` discovery policy.
+- **BREAKING NOTIFICATION MIGRATION: legacy provider-wide webhook-и
+  `BRAVO_DISCORD_URL` та `BRAVO_SLACK_URL` більше не підтримуються.**
+  Кожен канал резолвиться виключно через route-специфічні credentials
+  (`BRAVO_DISCORD_GENERAL_URL`/`BRAVO_DISCORD_ALERTS_URL`,
+  `BRAVO_SLACK_GENERAL_URL`/`BRAVO_SLACK_ALERTS_URL`) без provider-wide
+  fallback і без fallback між каналами. Обов'язкова topology:
+  `errors_only` -> ALERTS; `all` -> GENERAL + ALERTS; `none` -> нічого.
+  Перед оновленням (або після міграційної помилки Dry Run/Setup)
+  налаштуйте канальні записи для CurrentUser і SYSTEM:
+  `.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Discord -StoreFor Both`
+  (аналогічно `-Component Slack`). Старі записи ігноруються і не
+  видаляються автоматично. Також: `BRAVO_RESTORE_TEST` переведено на
+  канонічний notification-конвеєр; новий opt-in інтеграційний тест
+  реальної доставки `BRAVO_NOTIFICATION_TEST.ps1`; у Maintenance
+  видалено мертвий `SlackMessageBuffer` (6 error-повідомлень, що мовчки
+  губились, тепер доставляються через ALERTS).
+
+Real-server production acceptance evidence: local Git/provenance PASS,
+production regression sweep PASS (see acceptance handoff for full gate
+list). No outstanding blocking findings.
+
+---
+
 ## 5.2.1-rc.9 — 2026-08-27 (hotfix candidate, pending acceptance)
 
 Кандидат = rc.8 + фікс систематичного пропуску денних health-прогонів

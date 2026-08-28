@@ -413,17 +413,23 @@ try {
                 if ($notificationProvider -ne "discord" -and $notificationProvider -ne "slack") {
                     $notificationProvider = "discord"
                 }
-                $webhookTarget = if ($notificationProvider -eq "discord") {
-                    [string]$credentialSettings.Targets.DiscordWebhook
-                } else {
-                    [string]$credentialSettings.Targets.SlackWebhook
-                }
-                $webhookUrl = Get-BRAVOCredentialSecret -Target $webhookTarget
-                if (-not [string]::IsNullOrWhiteSpace($webhookUrl)) {
+                # 5.2.1: drill іде через канонічний конвеєр BRAVO.Notifications
+                # (маршрут за severity + route-специфічний credential +
+                # payload-guard/chunking) — жодного власного вибору webhook
+                # чи прямого legacy provider-wide lookup.
+                $severity = if ($failCount -gt 0) { "CRITICAL" } else { "WARNING" }
+                $notificationRoute = Resolve-BRAVONotificationRoute `
+                    -Severity $severity `
+                    -NotificationMode $notificationMode `
+                    -RoutingTable $backupMonitoring.NotificationRouting
+                if ($notificationRoute -ne "none") {
+                    $webhookUrl = Resolve-BRAVONotificationEndpoint `
+                        -Provider $notificationProvider `
+                        -Route $notificationRoute `
+                        -CredentialTargets $credentialSettings.Targets
                     $summaryLines = @($script:restoreDrillResults | ForEach-Object {
                         "[$($_.Status)] $($_.Component): $($_.Detail)"
                     })
-                    $severity = if ($failCount -gt 0) { "CRITICAL" } else { "WARNING" }
                     $message = New-BRAVOOperatorNotificationMessage `
                         -Severity $severity `
                         -Operation "BRAVO RESTORE DRILL — ПОТРІБНА ДІЯ" `
@@ -436,10 +442,14 @@ try {
                         -ProductName "BRAVO Restore Drill" `
                         -Version ([string]$global:ScriptVersion) `
                         -BuildId ([string]$global:ScriptBuildId)
-                    Send-BRAVOWebhookNotification `
+                    $messageChunks = ConvertTo-BRAVONotificationPayloadText `
+                        -Provider $notificationProvider `
+                        -Message $message
+                    Send-BRAVONotificationChunks `
                         -Provider $notificationProvider `
                         -WebhookUrl $webhookUrl `
-                        -Message $message
+                        -MessageChunks $messageChunks `
+                        -TimeoutSeconds ([int]$bravoSettings.NotificationRequestTimeoutSeconds)
                 }
             } catch {
                 Add-RestoreDrillResult WARN "Сповіщення" $null $null 0 0 $_.Exception.Message

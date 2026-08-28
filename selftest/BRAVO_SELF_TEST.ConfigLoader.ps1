@@ -239,7 +239,7 @@ try {
     [void][IO.Directory]::CreateDirectory($busyWaitBackupDir)
     $busyWaitKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
     $busyWaitBackupRootLine = '    BackupRoot    = ""'
-    $busyWaitKeyLine = '        BusyWaitMinutes = 20'
+    $busyWaitKeyLine = '        BusyWaitMinutes = 60'
     foreach ($busyWaitRequiredLine in @($busyWaitBackupRootLine, $busyWaitKeyLine)) {
         if (-not $busyWaitKitText.Contains($busyWaitRequiredLine)) {
             throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$busyWaitRequiredLine' — оновіть підготовку BusyWaitMinutes-сценаріїв під нову форму конфігурації"
@@ -261,8 +261,8 @@ try {
         @{
             Name = 'ConfigLoader/HealthBusyWaitLegacyConfigGetsCanonicalDefault'
             ConfigText = $busyWaitHermeticText.Replace("$busyWaitKeyLine`r`n", '')
-            Expected = 'VALUE=20'
-            Failure = 'legacy-конфіг без schedulerSettings.Health.BusyWaitMinutes мусить отримувати канонічний loader-дефолт 20 (компат-нормалізація, без Warning)'
+            Expected = 'VALUE=60'
+            Failure = 'legacy-конфіг без schedulerSettings.Health.BusyWaitMinutes мусить отримувати канонічний loader-дефолт 60 (компат-нормалізація, без Warning)'
         },
         @{
             Name = 'ConfigLoader/HealthBusyWaitExplicitZeroIsPreserved'
@@ -273,8 +273,8 @@ try {
         @{
             Name = 'ConfigLoader/HealthBusyWaitInvalidValueFallsBackToDefault'
             ConfigText = $busyWaitHermeticText.Replace($busyWaitKeyLine, "        BusyWaitMinutes = 'abc'")
-            Expected = 'VALUE=20'
-            Failure = "нечислове/поза-діапазонне BusyWaitMinutes мусить нормалізуватись до канонічних 20 хв (з Warning), а не протікати в runtime як рядок"
+            Expected = 'VALUE=60'
+            Failure = "нечислове/поза-діапазонне BusyWaitMinutes мусить нормалізуватись до канонічних 60 хв (з Warning), а не протікати в runtime як рядок"
         }
     )
     foreach ($busyWaitCase in $busyWaitCases) {
@@ -294,4 +294,88 @@ try {
     }
 } finally {
     Remove-Item -LiteralPath $busyWaitScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================
+# backupMonitoring.SuccessDedupMinutes (5.2.1): loader-нормалізація вікна
+# дедуплікації зелених success-звітів + деривація SuccessNotificationStatePath
+# для legacy-конфігів. Той самий герметичний патерн, що й BusyWaitMinutes вище.
+# ============================================================
+$successDedupScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_SUCCESSDEDUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+try {
+    [void][IO.Directory]::CreateDirectory($successDedupScenarioRoot)
+    $successDedupBackupDir = Join-Path $successDedupScenarioRoot 'SITE_DEFAULT'
+    [void][IO.Directory]::CreateDirectory($successDedupBackupDir)
+    $successDedupKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $successDedupBackupRootLine = '    BackupRoot    = ""'
+    $successDedupKeyLine = '    SuccessDedupMinutes = 1380'
+    $successDedupStatePathLine = '    SuccessNotificationStatePath = Join-Path $stateRoot "BRAVO_HEALTH_SUCCESS_NOTIFICATION_STATE.json"'
+    $operationalStatePathLine = '    OperationalStatePath = Join-Path $stateRoot "BRAVO_HEALTH_OPERATIONAL_STATE.json"'
+    foreach ($successDedupRequiredLine in @($successDedupBackupRootLine, $successDedupKeyLine, $successDedupStatePathLine, $operationalStatePathLine)) {
+        if (-not $successDedupKitText.Contains($successDedupRequiredLine)) {
+            throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$successDedupRequiredLine' — оновіть підготовку SuccessDedup-сценаріїв під нову форму конфігурації"
+        }
+    }
+    $successDedupHermeticText = $successDedupKitText.Replace(
+        $successDedupBackupRootLine,
+        "    BackupRoot    = '$($successDedupBackupDir.Replace("'", "''"))'"
+    )
+    $successDedupProbeCommand = (
+        "try { " +
+        "Set-StrictMode -Version 2.0; " +
+        ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+        "[void](Import-BravoConfiguration -ConfigRoot '$successDedupScenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+        "'VALUE=' + [string]`$global:backupMonitoring.SuccessDedupMinutes + ';PATH=' + [string]`$global:backupMonitoring.SuccessNotificationStatePath + ';OPPATH=' + [string]`$global:backupMonitoring.OperationalStatePath " +
+        "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+    )
+    $successDedupCases = @(
+        @{
+            Name = 'ConfigLoader/HealthSuccessDedupLegacyConfigGetsCanonicalDefault'
+            ConfigText = $successDedupHermeticText.Replace("$successDedupKeyLine`r`n", '').Replace("$successDedupStatePathLine`r`n", '')
+            Expected = 'VALUE=1380;PATH='
+            Failure = 'legacy-конфіг без backupMonitoring.SuccessDedupMinutes мусить отримувати канонічний loader-дефолт 1380 (компат-нормалізація, без Warning)'
+        },
+        @{
+            Name = 'ConfigLoader/HealthSuccessDedupLegacyStatePathDerivedFromAlertState'
+            ConfigText = $successDedupHermeticText.Replace("$successDedupKeyLine`r`n", '').Replace("$successDedupStatePathLine`r`n", '')
+            Expected = 'BRAVO_HEALTH_SUCCESS_NOTIFICATION_STATE.json'
+            Failure = 'legacy-конфіг без SuccessNotificationStatePath мусить отримувати шлях, деривований від каталогу AlertStatePath'
+        },
+        @{
+            Name = 'ConfigLoader/HealthOperationalStatePathDerivedForLegacyConfig'
+            ConfigText = $successDedupHermeticText.Replace("$operationalStatePathLine`r`n", '')
+            Expected = 'BRAVO_HEALTH_OPERATIONAL_STATE.json'
+            Failure = 'legacy-конфіг без OperationalStatePath мусить отримувати шлях операційного recovery-стану, деривований від каталогу AlertStatePath'
+        },
+        @{
+            Name = 'ConfigLoader/HealthSuccessDedupExplicitZeroIsPreserved'
+            ConfigText = $successDedupHermeticText.Replace($successDedupKeyLine, '    SuccessDedupMinutes = 0')
+            Expected = 'VALUE=0;'
+            Failure = 'явний SuccessDedupMinutes = 0 (дедуп вимкнено, стара поведінка) мусить зберігатись, а не затиратись дефолтом'
+        },
+        @{
+            Name = 'ConfigLoader/HealthSuccessDedupInvalidValueFallsBackToDefault'
+            ConfigText = $successDedupHermeticText.Replace($successDedupKeyLine, "    SuccessDedupMinutes = 'abc'")
+            Expected = 'VALUE=1380;'
+            Failure = "нечислове/поза-діапазонне SuccessDedupMinutes мусить нормалізуватись до канонічних 1380 хв (з Warning), а не протікати в runtime як рядок"
+        }
+    )
+    foreach ($successDedupCase in $successDedupCases) {
+        [IO.File]::WriteAllText(
+            (Join-Path $successDedupScenarioRoot 'BRAVO.config'),
+            [string]$successDedupCase.ConfigText,
+            (New-Object System.Text.UTF8Encoding $false)
+        )
+        $successDedupProbe = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $successDedupProbeCommand 2>&1 | Out-String
+        )
+        Test-BRAVOCondition `
+            -Condition ($successDedupProbe.Contains([string]$successDedupCase.Expected)) `
+            -Name ([string]$successDedupCase.Name) `
+            -Failure "$($successDedupCase.Failure); отримано: $successDedupProbe"
+    }
+} finally {
+    Remove-Item -LiteralPath $successDedupScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }

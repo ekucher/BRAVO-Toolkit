@@ -528,31 +528,29 @@ function Resolve-BRAVONotificationEndpoint {
     $normalizedProvider = $Provider.ToLowerInvariant()
     $routeKey = if ($Route -eq "general") { "General" } else { "Alerts" }
 
-    # Route-специфічний target -> legacy provider-wide target -> жорсткий
-    # літерал. Це і є backward-compatibility fallback: сервер, де
-    # налаштовано лише BRAVO_DISCORD_URL/BRAVO_SLACK_URL, продовжує
-    # отримувати сповіщення в обидва канали через один legacy webhook.
+    # 5.2.1: legacy provider-wide webhook-и повністю виведені з контракту
+    # для ОБОХ провайдерів. GENERAL і ALERTS — незалежні логічні канали,
+    # кожен резолвиться ВИКЛЮЧНО через власний route-специфічний target
+    # (config-ключ, інакше жорсткий канонічний літерал
+    # BRAVO_<PROVIDER>_<GENERAL|ALERTS>_URL). Жодного fallback на спільний
+    # provider-wide запис і жодного fallback між каналами: стара інсталяція
+    # з одним спільним webhook мусить отримати явну помилку конфігурації
+    # (міграційна діагностика — у BRAVO_DRY_RUN/BRAVO_SETUP), а не
+    # мовчазну legacy-доставку.
     $candidateTargetNames = New-Object System.Collections.Generic.List[string]
-
-    if ($normalizedProvider -eq "discord") {
-        $routeSpecificKey = "DiscordWebhook$routeKey"
-        $legacyKey = "DiscordWebhook"
-        $legacyLiteral = "BRAVO_DISCORD_URL"
-    } else {
-        $routeSpecificKey = "SlackWebhook$routeKey"
-        $legacyKey = "SlackWebhook"
-        $legacyLiteral = "BRAVO_SLACK_URL"
-    }
-
+    $providerPrefix = if ($normalizedProvider -eq "discord") { "Discord" } else { "Slack" }
+    $routeSpecificKey = "${providerPrefix}Webhook$routeKey"
     if ($CredentialTargets.Contains($routeSpecificKey) -and
         -not [string]::IsNullOrWhiteSpace([string]$CredentialTargets[$routeSpecificKey])) {
+        # Явно сконфігурований target — єдиний кандидат: якщо саме цей
+        # запис відсутній у Credential Manager, це помилка конфігурації,
+        # а не привід шукати секрет під іншою назвою.
         $candidateTargetNames.Add([string]$CredentialTargets[$routeSpecificKey])
+    } else {
+        # Legacy-конфіг без канального ключа: канонічний літерал.
+        $candidateTargetNames.Add("BRAVO_$($providerPrefix.ToUpperInvariant())_$($routeKey.ToUpperInvariant())_URL")
     }
-    if ($CredentialTargets.Contains($legacyKey) -and
-        -not [string]::IsNullOrWhiteSpace([string]$CredentialTargets[$legacyKey])) {
-        $candidateTargetNames.Add([string]$CredentialTargets[$legacyKey])
-    }
-    $candidateTargetNames.Add($legacyLiteral)
+    $missingTargetHint = "; legacy provider-wide webhook більше не підтримується — налаштуйте канальні записи: BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component $providerPrefix -StoreFor Both"
 
     $lastError = $null
     foreach ($targetName in ($candidateTargetNames | Select-Object -Unique)) {
@@ -568,9 +566,9 @@ function Resolve-BRAVONotificationEndpoint {
     }
 
     if ($lastError) {
-        throw "Не вдалося отримати webhook для $Provider/$Route з Credential Manager: $($lastError.Exception.Message)"
+        throw "Не вдалося отримати webhook для $Provider/$Route з Credential Manager: $($lastError.Exception.Message)$missingTargetHint"
     }
-    throw "Webhook для $Provider/$Route не налаштовано в Credential Manager (перевірені targets: $($candidateTargetNames -join ', '))"
+    throw "Webhook для $Provider/$Route не налаштовано в Credential Manager (перевірені targets: $($candidateTargetNames -join ', '))$missingTargetHint"
 }
 
 # Канонічний максимум прикладів для великих переліків у операторських

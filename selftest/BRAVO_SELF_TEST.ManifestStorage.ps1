@@ -20,6 +20,29 @@ $healthScriptText = [IO.File]::ReadAllText(
 )
 $archiveRuntimeTextForSizeSanity = $archiveScriptText
 
+# Silent-stub для Write-BRAVOLog (той самий підхід, що й Write-DataRestoreLog
+# у BRAVO_SELF_TEST.DataRestore.ps1): retention/orphan-sweep нижче навмисно
+# провокують реальні WARNING/ERROR-гілки Archive.Runtime.ps1 (mismatch
+# generationId, access-denied enumerate) через справжні
+# Remove-BRAVOExpiredBackupGenerations/Remove-BRAVOOrphanedTemporaryArchive-
+# Artifacts — не текстову перевірку. Без цього stub-у виклик резолвиться
+# у РЕАЛЬНИЙ Write-BRAVOLog (BRAVO.Logging імпортовано раніше self-test-
+# прогоном) і друкує production ПОМИЛКА:/КРИТИЧНО:/УВАГА: у консоль
+# self-test-у під час свідомо очікуваного negative-path сценарію. Append
+# ПІСЛЯ runtime-тексту: New-BRAVOSelfTestRuntimeModule бере останнє
+# визначення імені.
+$manifestStorageLogStub = @'
+function Write-BRAVOLog {
+    param(
+        [AllowEmptyString()][string]$Message,
+        [string]$Level = 'INFO',
+        [string]$Component = 'GENERAL',
+        [switch]$Console,
+        [switch]$NoConsole,
+        [switch]$Environmental
+    )
+}
+'@
 
     # dev.14: generation manifest-и (BRAVO_BACKUP_<GenerationId>.json) —
     # виділене сховище MANIFESTS\, окреме від LOGS/TEMP. Усі тести нижче
@@ -309,15 +332,17 @@ $archiveRuntimeTextForSizeSanity = $archiveScriptText
     # симуляцію алгоритму, бо саме порядок фізичного видалення тут і є
     # предметом перевірки.
     $retentionCleanupModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $archiveRuntimeTextForSizeSanity `
+        -SourceText ($archiveRuntimeTextForSizeSanity + [Environment]::NewLine + $manifestStorageLogStub) `
         -FunctionNames @(
             'Remove-BRAVOExpiredBackupGenerations',
             'Get-BRAVOGenerationManifestComponents',
             'Test-BRAVOGenerationManifestVerified',
             'Show-ArchiveCleanupSection',
             'Show-ScriptProgress',
-            'Test-BRAVOBackupArtifactPathSafe'
-        )
+            'Test-BRAVOBackupArtifactPathSafe',
+            'Write-BRAVOLog'
+        ) `
+        -PreferLastDefinitionOnDuplicate
     $retentionCleanupTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_RETENTION_CLEANUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -513,8 +538,9 @@ $archiveRuntimeTextForSizeSanity = $archiveScriptText
     # лише in-process). Reused module: реальні функції, реальне тимчасове
     # дерево каталогів — не текстова перевірка.
     $orphanSweepModule = New-BRAVOSelfTestRuntimeModule `
-        -SourceText $archiveScriptText `
-        -FunctionNames @('Remove-BRAVOOrphanedTemporaryArchiveArtifacts', 'Test-BRAVOBackupArtifactPathSafe')
+        -SourceText ($archiveScriptText + [Environment]::NewLine + $manifestStorageLogStub) `
+        -FunctionNames @('Remove-BRAVOOrphanedTemporaryArchiveArtifacts', 'Test-BRAVOBackupArtifactPathSafe', 'Write-BRAVOLog') `
+        -PreferLastDefinitionOnDuplicate
     $orphanSweepTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_ORPHAN_SWEEP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))

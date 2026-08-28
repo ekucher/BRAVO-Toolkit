@@ -175,7 +175,8 @@ function Stop-Process {
             'Get-BRAVODataRestoreGenerationIdSortKey',
             'Sort-BRAVODataRestoreManifestNamesByGenerationDescending',
             'New-BRAVODataRestoreWinSCPNamespaceManager'
-        )
+        ) `
+        -PreferLastDefinitionOnDuplicate
 
     # --- 1. Path guards: некоректний шлях трактується як заборонений ---
     $pathWithinTrue = & $dataRestoreModule {
@@ -3402,13 +3403,15 @@ function Invoke-BRAVODataRestoreWinSCPScript {
                 InstitutionName = 'TEST'
                 InstitutionCode = '00000000'
             }
-            $script:credentialSettings = @{ Targets = @{ DiscordWebhook = 'BRAVO_DISCORD_URL' } }
+            $script:credentialSettings = @{ Targets = @{
+                DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
+                DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
+            } }
             $script:backupMonitoring = @{
                 NotificationRouting = @{ SUCCESS = 'general'; WARNING = 'alerts'; ERROR = 'alerts'; CRITICAL = 'alerts' }
                 NotificationCredentialTargets = @{
                     DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
                     DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
-                    DiscordWebhook = 'BRAVO_DISCORD_URL'
                 }
                 NotificationRequestTimeoutSeconds = 7
             }

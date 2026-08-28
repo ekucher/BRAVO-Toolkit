@@ -1,11 +1,22 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$ConfigPath
+    [string]$ConfigPath,
+
+    # SELF-TEST Console UX (operator pause): та сама -NoPause семантика, що
+    # Archive/Health/Maintenance — вимикає паузу перед закриттям вікна.
+    # Без прапорця Wait-BRAVOManualExit сама вирішує (SYSTEM/non-interactive
+    # завжди повертається без очікування; тут лише явний opt-out для
+    # інтерактивного ручного запуску).
+    [switch]$NoPause
 )
 
 $helperLoggingPath = Join-Path $PSScriptRoot "modules\BRAVO.HelperLogging\BRAVO.HelperLogging.psd1"
 Import-Module -Name $helperLoggingPath -ErrorAction Stop
-$null = Start-BRAVOHelperLog -ScriptPath $PSCommandPath -ConfigPath $ConfigPath
+# Start-BRAVOHelperLog повертає canonical шлях журналу — той самий, що й
+# показує Complete-BRAVOHelperLog при завершенні. Захоплюємо, щоб
+# operator-summary міг показати цей шлях ДО фінальної паузи, не будуючи
+# альтернативний/другий шлях журналу.
+$script:selfTestHelperLogPath = Start-BRAVOHelperLog -ScriptPath $PSCommandPath -ConfigPath $ConfigPath
 
 $ErrorActionPreference = "Stop"
 $root = if ($PSCommandPath) {
@@ -16,8 +27,35 @@ $root = if ($PSCommandPath) {
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $root "BRAVO.config"
 }
+
+# Canonical console/manual-exit helper (Write-BRAVOFinalSummaryHeader/Footer,
+# Write-BRAVOResultField, Wait-BRAVOManualExit) — та сама модель, що
+# Archive/Health/Maintenance. Імпортується тут (а не лише всередині окремих
+# тестових блоків нижче, які самі роблять Remove-Module/Import-Module -Force
+# для власних цілей) — гарантує доступність для фінального operator summary
+# незалежно від порядку/наявності доменних self-test фрагментів.
+Import-Module -Name (Join-Path $root "modules\BRAVO.Console\BRAVO.Console.psd1") -Force -ErrorAction Stop
+
 $script:failures = New-Object System.Collections.ArrayList
+$script:passCount = 0
 $script:selfTestConfigRoot = $null
+
+# Ownership-реєстр динамічних runtime-модулів, створених
+# New-BRAVOSelfTestRuntimeModule (P0 hotfix: session-contamination —
+# Get-Service/Start-Service/Stop-Service/... шаблон, що затінює production
+# cmdlet-и в caller-сесії). New-Module -ScriptBlock (без -AsCustomObject)
+# емпірично підтверджено: одразу матеріалізує КОЖНУ визначену в ньому
+# функцію у Function:-drive ПОТОЧНОЇ (caller) сесії — це НЕ те саме, що
+# формальний Import-Module (Get-Module модуль не бачить), і тому звичайний
+# Remove-Module цей витік НЕ прибирає (емпірично перевірено окремим
+# репро). Єдиний надійний спосіб зняти витік — явне видалення самої
+# function-точки (Remove-Item function:<Name>, той самий клас фіксу, що й
+# раніше для Get-CimInstance/Get-WmiObject у
+# New-BRAVOProductionConfigFixtureResult). Реєстр тут дозволяє зробити це
+# ОДНИМ централізованим ownership-aware проходом наприкінці self-test
+# (Clear-BRAVOSelfTestOwnedRuntimeModules нижче), не чіпаючи 60+ викликових
+# площин.
+$script:BRAVOSelfTestOwnedRuntimeModules = New-Object System.Collections.Generic.List[object]
 
 function Test-BRAVOCondition {
     param(
@@ -26,6 +64,7 @@ function Test-BRAVOCondition {
         [string]$Failure
     )
     if ($Condition) {
+        $script:passCount++
         Write-Host "[PASS] $Name" -ForegroundColor Green
     } else {
         Write-Host "[FAIL] ${Name}: $Failure" -ForegroundColor Red
@@ -36,7 +75,20 @@ function Test-BRAVOCondition {
 function New-BRAVOSelfTestRuntimeModule {
     param(
         [Parameter(Mandatory = $true)][string]$SourceText,
-        [Parameter(Mandatory = $true)][string[]]$FunctionNames
+        [Parameter(Mandatory = $true)][string[]]$FunctionNames,
+
+        # За замовчуванням (без прапорця) береться ПЕРШЕ визначення імені —
+        # історична поведінка, на яку вже спираються існуючі виклик-площини,
+        # де ЗАГЛУШКА йде ПЕРШОЮ, а справжній production-текст ДРУГИМ
+        # (напр. ServiceQuiescence: $quiescenceStateStubs + системний
+        # модуль). Деякі інші виклик-площини (DataRestore/ManifestStorage)
+        # роблять навпаки — production-текст, а ПІСЛЯ нього test-only
+        # silent-stub, що навмисно переозначає лог-функцію (щоб negative-
+        # path тести не друкували справжній production-рендер ERROR/
+        # CRITICAL/WARNING у консоль self-test-у). Для таких викликів
+        # потрібне ОСТАННЄ визначення — явний опт-ін через цей прапорець,
+        # щоб не зламати мовчки протилежну конвенцію інших 50+ викликів.
+        [switch]$PreferLastDefinitionOnDuplicate
     )
 
     $tokens = $null
@@ -54,7 +106,7 @@ function New-BRAVOSelfTestRuntimeModule {
 
     $definitions = @()
     foreach ($functionName in $FunctionNames) {
-        $functionAst = @(
+        $matchingDefinitions = @(
             $ast.FindAll(
                 {
                     param($candidate)
@@ -63,19 +115,69 @@ function New-BRAVOSelfTestRuntimeModule {
                 },
                 $true
             )
-        ) | Select-Object -First 1
+        )
+        $functionAst = if ($PreferLastDefinitionOnDuplicate) {
+            $matchingDefinitions | Select-Object -Last 1
+        } else {
+            $matchingDefinitions | Select-Object -First 1
+        }
         if ($null -eq $functionAst) {
             throw "функцію '$functionName' не знайдено для runtime-тесту"
         }
         $definitions += $functionAst.Extent.Text
     }
 
-    return New-Module -ScriptBlock {
+    $runtimeModule = New-Module -ScriptBlock {
         param([string[]]$Definitions)
         foreach ($definition in $Definitions) {
             . ([scriptblock]::Create($definition))
         }
     } -ArgumentList (, $definitions)
+
+    # Ownership-реєстрація для фінального cleanup-проходу — див. коментар
+    # біля $script:BRAVOSelfTestOwnedRuntimeModules вище. $FunctionNames
+    # (не $definitions) навмисно: саме ці імена могли матеріалізуватися у
+    # Function:-drive caller-сесії.
+    [void]$script:BRAVOSelfTestOwnedRuntimeModules.Add(
+        [pscustomobject]@{
+            Module        = $runtimeModule
+            FunctionNames = @($FunctionNames)
+        }
+    )
+
+    return $runtimeModule
+}
+
+function Clear-BRAVOSelfTestOwnedRuntimeModules {
+    # Централізований, ownership-aware cleanup усіх динамічних модулів,
+    # створених New-BRAVOSelfTestRuntimeModule протягом усього прогону
+    # self-test. Викликається РІВНО ОДИН РАЗ, наприкінці — після того, як
+    # усі доменні фрагменти відпрацювали (& $module {...} лишається
+    # робочим до самого кінця незалежно від цього витоку, бо це окремий
+    # механізм виклику через сам PSModuleInfo).
+    #
+    # Ownership-перевірка: функцію видаляємо з Function:-drive ЛИШЕ якщо
+    # її поточний ModuleName станом на момент cleanup дійсно збігається з
+    # ModuleName модуля, що її зареєстрував. Це навмисно захищає від
+    # видалення "чужої" функції, якщо кілька модулів послідовно
+    # перевизначали те саме ім'я (типово для Get-Service/Start-Service/
+    # Stop-Service — див. DataRestore/ServiceQuiescence): у Function:-drive
+    # у будь-який момент може резолвитися лише ОСТАННЄ визначення, тому
+    # ownership-mismatch для більш ранніх реєстрацій — очікуваний, не
+    # помилка.
+    foreach ($ownedEntry in $script:BRAVOSelfTestOwnedRuntimeModules) {
+        $ownerModuleName = $ownedEntry.Module.Name
+        foreach ($functionName in @($ownedEntry.FunctionNames)) {
+            $currentCommand = Get-Command -Name $functionName -ErrorAction SilentlyContinue
+            if ($null -ne $currentCommand -and
+                $currentCommand.CommandType -eq [Management.Automation.CommandTypes]::Function -and
+                $currentCommand.ModuleName -eq $ownerModuleName) {
+                Remove-Item -Path "function:$functionName" -Force -ErrorAction Stop
+            }
+        }
+        Remove-Module -ModuleInfo $ownedEntry.Module -Force -ErrorAction SilentlyContinue
+    }
+    $script:BRAVOSelfTestOwnedRuntimeModules.Clear()
 }
 
 try {
@@ -497,12 +599,13 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     # завжди йшло в ALERTS, бо Test-DryRunWebhookCredential ітерував маршрути
     # у порядку ('alerts','general') і ПЕРШИЙ resolved осідав у слот, з
     # якого шлеться тест. SUCCESS-семантика канонічно належить GENERAL —
-    # 'general' мусить стояти першим (fallback на legacy/alerts зберігається).
+    # 'general' мусить стояти першим у режимі "all" (5.2.1: набір
+    # маршрутів mode-залежний; в errors_only перевіряється лише 'alerts').
     # BRAVO_SETUP і BRAVO_TASKS_DIAGNOSE успадковують (шлють через dry-run).
     Test-BRAVOCondition `
         -Condition (
-            $dryRunScriptTextForSftp.Contains("foreach (`$route in @('general', 'alerts'))") -and
-            -not $dryRunScriptTextForSftp.Contains("foreach (`$route in @('alerts', 'general'))")
+            $dryRunScriptTextForSftp.Contains("@('general', 'alerts')") -and
+            -not $dryRunScriptTextForSftp.Contains("@('alerts', 'general')")
         ) `
         -Name "DryRun/TestNotificationPrefersGeneralRoute" `
         -Failure "Test-DryRunWebhookCredential має резолвити маршрут 'general' першим — тестове SUCCESS-повідомлення належить GENERAL, а не ALERTS"
@@ -2354,63 +2457,108 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     Remove-Module -Name 'BRAVO.Credentials' -Force -ErrorAction SilentlyContinue
     Remove-Module -Name 'BRAVO.Compatibility' -Force -ErrorAction SilentlyContinue
     $endpointFallbackCapture = & $notificationEndpointTestModule {
+        $script:queriedTargets = New-Object System.Collections.Generic.List[string]
         function Get-BRAVOCredentialSecret {
             param([string]$Target)
             # Ізольований stub: жодного реального доступу до Windows
             # Credential Manager — лише синтетичні значення нижче.
+            # Кожне звернення фіксується для контракту "legacy Discord
+            # credential ніколи не читається".
+            [void]$script:queriedTargets.Add($Target)
             $stubs = @{
+                'BRAVO_DISCORD_GENERAL_URL' = 'STUB-GENERAL'
                 'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS'
                 'BRAVO_DISCORD_URL' = 'STUB-LEGACY'
+                'BRAVO_SLACK_URL' = 'STUB-SLACK-LEGACY'
                 'BRAVO_SLACK_GENERAL_URL' = 'STUB-SLACK-GENERAL'
+                'BRAVO_SLACK_ALERTS_URL' = 'STUB-SLACK-ALERTS'
             }
             if ($stubs.Contains($Target)) { return $stubs[$Target] }
             return $null
         }
-        $targetsBothPresent = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
-        # Назва target-а навмисно НЕ у ключах $stubs вище (Get-BRAVOCredentialSecret
-        # поверне $null) — симулює "route-специфічний Credential Manager
-        # запис не налаштований", щоб перевірити fallback на legacy.
-        # (Значення НЕ 32 символи навмисно: gitleaks' "discord-client-secret"
-        # rule false-positive спрацьовує на 32-символьні рядки поруч із
-        # "Discord"+"=" — це назва Credential Manager target-а, не секрет.)
-        $targetsLegacyOnly = @{ DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL_NOT_CONFIGURED'; DiscordWebhook = 'BRAVO_DISCORD_URL' }
-        $targetsNoneConfigured = @{}
-        $newTargetWins = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsBothPresent
-        $legacyFallback = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsLegacyOnly
-        $literalFallback = $null
-        $literalFallbackThrew = $false
+        $targetsFull = @{
+            DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
+            DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
+        }
+        # 5.2.1: legacy provider-wide Discord webhook виведений з контракту.
+        # Stub 'BRAVO_DISCORD_URL' -> 'STUB-LEGACY' лишається НАВМИСНО:
+        # негативні сценарії доводять, що навіть НАЯВНИЙ legacy-запис
+        # ніколи не резолвиться і не читається для Discord.
+        # (Назви *_NOT_CONFIGURED навмисно поза ключами $stubs — симулюють
+        # відсутній Credential Manager запис.)
+        $generalSecret = Resolve-BRAVONotificationEndpoint -Provider discord -Route general -CredentialTargets $targetsFull
+        $alertsSecret = Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets $targetsFull
+        $generalMissingThrew = $false
         try {
-            $literalFallback = Resolve-BRAVONotificationEndpoint -Provider discord -Route general -CredentialTargets $targetsNoneConfigured
-        } catch { $literalFallbackThrew = $true }
+            [void](Resolve-BRAVONotificationEndpoint -Provider discord -Route general -CredentialTargets @{
+                DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL_NOT_CONFIGURED'
+                DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
+            })
+        } catch { $generalMissingThrew = $true }
+        $alertsMissingThrew = $false
+        try {
+            [void](Resolve-BRAVONotificationEndpoint -Provider discord -Route alerts -CredentialTargets @{
+                DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
+                DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL_NOT_CONFIGURED'
+            })
+        } catch { $alertsMissingThrew = $true }
+        # Config без канальних ключів: резолвиться жорсткий канонічний
+        # літерал route-специфічного target-а (НЕ legacy).
+        $literalGeneral = Resolve-BRAVONotificationEndpoint -Provider discord -Route general -CredentialTargets @{}
         $slackGeneral = Resolve-BRAVONotificationEndpoint -Provider slack -Route general -CredentialTargets @{ SlackWebhookGeneral = 'BRAVO_SLACK_GENERAL_URL' }
-        $allMissingThrew = $false
+        $slackAlerts = Resolve-BRAVONotificationEndpoint -Provider slack -Route alerts -CredentialTargets @{ SlackWebhookAlerts = 'BRAVO_SLACK_ALERTS_URL' }
+        # Slack дзеркально до Discord: route-специфічний запис відсутній ->
+        # THROW навіть при наявному legacy BRAVO_SLACK_URL.
+        $slackAlertsMissingThrew = $false
         try {
-            Resolve-BRAVONotificationEndpoint -Provider slack -Route alerts -CredentialTargets @{}
-        } catch { $allMissingThrew = $true }
+            [void](Resolve-BRAVONotificationEndpoint -Provider slack -Route alerts -CredentialTargets @{
+                SlackWebhookAlerts = 'BRAVO_SLACK_ALERTS_URL_NOT_CONFIGURED'
+                SlackWebhook = 'BRAVO_SLACK_URL'
+            })
+        } catch { $slackAlertsMissingThrew = $true }
         [pscustomobject]@{
-            NewTargetWins = $newTargetWins
-            LegacyFallback = $legacyFallback
-            LiteralFallbackThrew = $literalFallbackThrew
+            GeneralSecret = $generalSecret
+            AlertsSecret = $alertsSecret
+            GeneralMissingThrew = $generalMissingThrew
+            AlertsMissingThrew = $alertsMissingThrew
+            LiteralGeneral = $literalGeneral
             SlackGeneral = $slackGeneral
-            AllMissingThrew = $allMissingThrew
+            SlackAlerts = $slackAlerts
+            SlackAlertsMissingThrew = $slackAlertsMissingThrew
+            DiscordLegacyQueried = ($script:queriedTargets -contains 'BRAVO_DISCORD_URL')
+            SlackLegacyQueried = ($script:queriedTargets -contains 'BRAVO_SLACK_URL')
         }
     }
     Test-BRAVOCondition `
-        -Condition ($endpointFallbackCapture.NewTargetWins -eq 'STUB-ALERTS') `
-        -Name "Notifications/EndpointPrefersRouteSpecificTarget" `
-        -Failure "коли налаштовано і route-специфічний, і legacy target, має використовуватись route-специфічний"
+        -Condition (
+            $endpointFallbackCapture.GeneralSecret -eq 'STUB-GENERAL' -and
+            $endpointFallbackCapture.AlertsSecret -eq 'STUB-ALERTS' -and
+            $endpointFallbackCapture.LiteralGeneral -eq 'STUB-GENERAL'
+        ) `
+        -Name "Notifications/EndpointResolvesDiscordRouteSpecificTargets" `
+        -Failure "Discord GENERAL/ALERTS мають резолвитись через власні route-специфічні targets (config-ключ або канонічний літерал BRAVO_DISCORD_GENERAL_URL/BRAVO_DISCORD_ALERTS_URL)"
     Test-BRAVOCondition `
-        -Condition ($endpointFallbackCapture.LegacyFallback -eq 'STUB-LEGACY') `
-        -Name "Notifications/EndpointFallsBackToLegacyWebhook" `
-        -Failure "коли route-специфічний credential відсутній, має використовуватись legacy BRAVO_DISCORD_URL/BRAVO_SLACK_URL (backward compatibility)"
+        -Condition (
+            $endpointFallbackCapture.GeneralMissingThrew -and
+            $endpointFallbackCapture.AlertsMissingThrew -and
+            -not $endpointFallbackCapture.DiscordLegacyQueried
+        ) `
+        -Name "Notifications/DiscordNeverFallsBackToProviderWideWebhook" `
+        -Failure "для Discord відсутній route-специфічний credential мусить давати THROW навіть при наявному legacy BRAVO_DISCORD_URL, і legacy-запис не повинен ЧИТАТИСЬ взагалі — жодного provider-wide fallback і жодного fallback між каналами GENERAL/ALERTS"
     Test-BRAVOCondition `
-        -Condition ($endpointFallbackCapture.SlackGeneral -eq 'STUB-SLACK-GENERAL') `
-        -Name "Notifications/EndpointResolvesSlackGeneralTarget" `
-        -Failure "Slack GENERAL route має резолвитись через SlackWebhookGeneral target"
+        -Condition (
+            $endpointFallbackCapture.SlackGeneral -eq 'STUB-SLACK-GENERAL' -and
+            $endpointFallbackCapture.SlackAlerts -eq 'STUB-SLACK-ALERTS'
+        ) `
+        -Name "Notifications/EndpointResolvesSlackRouteSpecificTargets" `
+        -Failure "Slack GENERAL/ALERTS мають резолвитись через власні route-специфічні targets (SlackWebhookGeneral/SlackWebhookAlerts)"
     Test-BRAVOCondition `
-        -Condition ($endpointFallbackCapture.AllMissingThrew) `
-        -Name "Notifications/EndpointThrowsWhenNothingConfigured" `
-        -Failure "коли жоден target (новий і legacy) не налаштований, має кидатись виняток, а не мовчки повертатись порожній webhook"
+        -Condition (
+            $endpointFallbackCapture.SlackAlertsMissingThrew -and
+            -not $endpointFallbackCapture.SlackLegacyQueried
+        ) `
+        -Name "Notifications/SlackNeverFallsBackToProviderWideWebhook" `
+        -Failure "для Slack відсутній route-специфічний credential мусить давати THROW навіть при наявному legacy BRAVO_SLACK_URL, і legacy-запис не повинен ЧИТАТИСЬ взагалі — жодного provider-wide fallback і жодного fallback між каналами GENERAL/ALERTS"
     # --- Dry-run має перевіряти РІВНО ті записи Credential Manager, які
     # читає runtime. Регресія з логів SERV_HRDL_1 (2026-08-24): сервер
     # налаштовано на route-специфічні webhook-и, BRAVO_DISCORD_URL відсутній —
@@ -2439,61 +2587,164 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             [void]$script:capturedResults.Add(('{0}|{1}' -f $Status, $Detail))
         }
         $credentialSettings = @{ Targets = @{
-            DiscordWebhook = 'BRAVO_DISCORD_URL'
             DiscordWebhookGeneral = 'BRAVO_DISCORD_GENERAL_URL'
             DiscordWebhookAlerts = 'BRAVO_DISCORD_ALERTS_URL'
         } }
         $descriptor = [pscustomobject]@{
             Name = 'Discord webhook'
-            Target = 'BRAVO_DISCORD_URL'
+            Target = 'BRAVO_DISCORD_GENERAL_URL / BRAVO_DISCORD_ALERTS_URL'
             Kind = 'Webhook'
             NotificationProvider = 'discord'
         }
 
-        # 1. Конфігурація SERV_HRDL_1: лише route-специфічні записи.
+        # 1. mode=all, обидва канальні записи: PASS.
         $script:stubStore = @{
             'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS'
             'BRAVO_DISCORD_GENERAL_URL' = 'STUB-GENERAL'
         }
         $script:capturedResults.Clear()
         $routeSpecificValues = @{}
-        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $routeSpecificValues
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $routeSpecificValues -NotificationMode all
         $routeSpecificStatus = [string]$script:capturedResults[0]
 
-        # 2. Стара інсталяція: лише legacy BRAVO_DISCORD_URL.
+        # 2. mode=all, лише ALERTS + наявний legacy: GENERAL мусить дати
+        # FAIL із назвою відсутнього target-а — legacy не рятує topology.
+        $script:stubStore = @{
+            'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS'
+            'BRAVO_DISCORD_URL' = 'STUB-LEGACY'
+        }
+        $script:capturedResults.Clear()
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues @{} -NotificationMode all
+        $alertsOnlyAllStatus = [string]$script:capturedResults[0]
+
+        # 3. mode=errors_only, лише ALERTS: GENERAL не required -> PASS.
+        $script:stubStore = @{ 'BRAVO_DISCORD_ALERTS_URL' = 'STUB-ALERTS' }
+        $script:capturedResults.Clear()
+        $errorsOnlyValues = @{}
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $errorsOnlyValues -NotificationMode errors_only
+        $errorsOnlyStatus = [string]$script:capturedResults[0]
+
+        # 4. Стара legacy-only інсталяція: FAIL з міграційною діагностикою.
         $script:stubStore = @{ 'BRAVO_DISCORD_URL' = 'STUB-LEGACY' }
         $script:capturedResults.Clear()
-        $legacyValues = @{}
-        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues $legacyValues
-        $legacyStatus = [string]$script:capturedResults[0]
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues @{} -NotificationMode all
+        $legacyOnlyStatus = [string]$script:capturedResults[0]
 
-        # 3. Жодного webhook: dry-run має чесно впасти.
+        # 5. Жодного webhook: FAIL.
         $script:stubStore = @{}
         $script:capturedResults.Clear()
-        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues @{}
+        Test-DryRunWebhookCredential -Descriptor $descriptor -CredentialValues @{} -NotificationMode all
         $missingStatus = [string]$script:capturedResults[0]
+
+        # 6-7. Slack дзеркально: legacy-only -> FAIL з міграційною
+        # діагностикою; errors_only + лише ALERTS -> PASS.
+        $slackDescriptor = [pscustomobject]@{
+            Name = 'Slack webhook'
+            Target = 'BRAVO_SLACK_GENERAL_URL / BRAVO_SLACK_ALERTS_URL'
+            Kind = 'Webhook'
+            NotificationProvider = 'slack'
+        }
+        $script:stubStore = @{ 'BRAVO_SLACK_URL' = 'STUB-SLACK-LEGACY' }
+        $script:capturedResults.Clear()
+        Test-DryRunWebhookCredential -Descriptor $slackDescriptor -CredentialValues @{} -NotificationMode all
+        $slackLegacyOnlyStatus = [string]$script:capturedResults[0]
+        $script:stubStore = @{ 'BRAVO_SLACK_ALERTS_URL' = 'STUB-SLACK-ALERTS' }
+        $script:capturedResults.Clear()
+        Test-DryRunWebhookCredential -Descriptor $slackDescriptor -CredentialValues @{} -NotificationMode errors_only
+        $slackErrorsOnlyStatus = [string]$script:capturedResults[0]
 
         [pscustomobject]@{
             RouteSpecificStatus = $routeSpecificStatus
             RouteSpecificSecret = [string]$routeSpecificValues['Webhook']
-            LegacyStatus = $legacyStatus
-            LegacySecret = [string]$legacyValues['Webhook']
+            AlertsOnlyAllStatus = $alertsOnlyAllStatus
+            ErrorsOnlyStatus = $errorsOnlyStatus
+            ErrorsOnlySecret = [string]$errorsOnlyValues['Webhook']
+            LegacyOnlyStatus = $legacyOnlyStatus
             MissingStatus = $missingStatus
+            SlackLegacyOnlyStatus = $slackLegacyOnlyStatus
+            SlackErrorsOnlyStatus = $slackErrorsOnlyStatus
         }
     }
     Test-BRAVOCondition `
         -Condition (
             $dryRunWebhookCapture.RouteSpecificStatus -like 'PASS|*' -and
-            # 5.2.1: слот надсилання тестового повідомлення тримає GENERAL
-            # (перший resolved route; SUCCESS-семантика тесту) — раніше тут
-            # осідав ALERTS, і тест завжди падав у канал алертів.
+            # Слот надсилання тестового повідомлення тримає GENERAL
+            # (перший resolved route; SUCCESS-семантика тесту).
             $dryRunWebhookCapture.RouteSpecificSecret -eq 'STUB-GENERAL' -and
-            $dryRunWebhookCapture.LegacyStatus -like 'PASS|*' -and
-            $dryRunWebhookCapture.LegacySecret -eq 'STUB-LEGACY' -and
             $dryRunWebhookCapture.MissingStatus -like 'FAIL|*'
         ) `
         -Name 'DryRun/WebhookCheckMatchesRuntimeResolution' `
-        -Failure 'dry-run має перевіряти webhook тим самим Resolve-BRAVONotificationEndpoint, що й runtime: route-специфічні записи без legacy BRAVO_DISCORD_URL мають давати PASS, legacy-only інсталяція теж PASS, і лише повна відсутність webhook — FAIL'
+        -Failure 'dry-run має перевіряти webhook тим самим Resolve-BRAVONotificationEndpoint, що й runtime: канальні записи -> PASS (тестове повідомлення бере GENERAL), повна відсутність webhook -> FAIL'
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunWebhookCapture.AlertsOnlyAllStatus -like 'FAIL|*' -and
+            $dryRunWebhookCapture.AlertsOnlyAllStatus.Contains('BRAVO_DISCORD_GENERAL_URL') -and
+            $dryRunWebhookCapture.ErrorsOnlyStatus -like 'PASS|*' -and
+            $dryRunWebhookCapture.ErrorsOnlySecret -eq 'STUB-ALERTS'
+        ) `
+        -Name 'DryRun/WebhookTopologyDependsOnNotificationMode' `
+        -Failure 'mode=all вимагає ОБИДВА канальні Discord-записи (відсутній GENERAL -> FAIL з назвою target-а, навіть при наявному legacy), а mode=errors_only вимагає лише ALERTS (GENERAL не required, тестове повідомлення бере ALERTS)'
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunWebhookCapture.LegacyOnlyStatus -like 'FAIL|*' -and
+            $dryRunWebhookCapture.LegacyOnlyStatus.Contains('більше не підтримується')
+        ) `
+        -Name 'DryRun/LegacyOnlyDiscordInstallationFailsWithMigrationDiagnostic' `
+        -Failure 'legacy-only Discord-інсталяція (лише BRAVO_DISCORD_URL) мусить давати FAIL з явною міграційною діагностикою (налаштувати канальні GENERAL/ALERTS записи), а не мовчазний PASS через provider-wide fallback'
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunWebhookCapture.SlackLegacyOnlyStatus -like 'FAIL|*' -and
+            $dryRunWebhookCapture.SlackLegacyOnlyStatus.Contains('BRAVO_SLACK_URL') -and
+            $dryRunWebhookCapture.SlackLegacyOnlyStatus.Contains('більше не підтримується') -and
+            $dryRunWebhookCapture.SlackErrorsOnlyStatus -like 'PASS|*'
+        ) `
+        -Name 'DryRun/SlackTopologyMirrorsDiscordContract' `
+        -Failure 'Slack мусить мати той самий контракт, що Discord: legacy-only інсталяція (лише BRAVO_SLACK_URL) -> FAIL з міграційною діагностикою; errors_only з лише ALERTS -> PASS'
+    # --- 5.2.1: source-контракти міграції з legacy provider-wide webhook-ів.
+    # (1) Restore Drill мусить іти канонічним конвеєром BRAVO.Notifications і
+    # не знати про legacy targets чи прямий HTTP-виклик.
+    $restoreTestScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root 'BRAVO_RESTORE_TEST.ps1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            -not $restoreTestScriptText.Contains('BRAVO_DISCORD_URL') -and
+            -not $restoreTestScriptText.Contains('BRAVO_SLACK_URL') -and
+            -not $restoreTestScriptText.Contains('Targets.DiscordWebhook') -and
+            -not $restoreTestScriptText.Contains('Targets.SlackWebhook') -and
+            -not $restoreTestScriptText.Contains('Send-BRAVOWebhookNotification') -and
+            $restoreTestScriptText.Contains('Resolve-BRAVONotificationRoute') -and
+            $restoreTestScriptText.Contains('Resolve-BRAVONotificationEndpoint') -and
+            $restoreTestScriptText.Contains('ConvertTo-BRAVONotificationPayloadText') -and
+            $restoreTestScriptText.Contains('Send-BRAVONotificationChunks')
+        ) `
+        -Name 'RestoreDrill/UsesCanonicalNotificationPipeline' `
+        -Failure 'BRAVO_RESTORE_TEST.ps1 мусить надсилати WARN/FAIL через канонічний конвеєр BRAVO.Notifications (route за severity -> route-специфічний credential -> payload-guard -> chunks), без legacy targets і без прямого transport-виклику'
+    # (2) Credential Setup: групи Slack/Discord розгортаються рівно в
+    # канальні General+Alerts дескриптори; legacy літерали відсутні в
+    # активному коді Setup.
+    $credentialsSetupScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root 'BRAVO_CREDENTIALS_SETUP.ps1'), [Text.Encoding]::UTF8)
+    $discordGroupMatch = [regex]::Match(
+        $credentialsSetupScriptText,
+        '"Discord" \{[\s\S]*?\n            \}'
+    )
+    $slackGroupMatch = [regex]::Match(
+        $credentialsSetupScriptText,
+        '"Slack" \{[\s\S]*?\n            \}'
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            -not $credentialsSetupScriptText.Contains('BRAVO_DISCORD_URL') -and
+            -not $credentialsSetupScriptText.Contains('BRAVO_SLACK_URL') -and
+            $discordGroupMatch.Success -and
+            $discordGroupMatch.Value.Contains('Discord.General') -and
+            $discordGroupMatch.Value.Contains('Discord.Alerts') -and
+            $slackGroupMatch.Success -and
+            $slackGroupMatch.Value.Contains('Slack.General') -and
+            $slackGroupMatch.Value.Contains('Slack.Alerts')
+        ) `
+        -Name 'CredentialsSetup/ProviderGroupsExpandToRouteSpecificTargets' `
+        -Failure 'логічні групи -Component Discord/-Component Slack мусять розгортатись рівно в канальні General+Alerts дескриптори, а legacy літерали BRAVO_DISCORD_URL/BRAVO_SLACK_URL мають бути повністю відсутні в активному коді Credential Setup'
     # Відновлюємо реальні модулі для решти self-test (наступні секції
     # покладаються на їх наявність, як і до цього ізольованого блоку).
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
@@ -2524,7 +2775,6 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $script:criticalErrorOccurred = $false
             $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
             $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
-            $script:SlackMessageBuffer = New-Object System.Collections.Generic.List[string]
             $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
             $script:ScriptStartTime = Get-Date
             $bravoSettings = @{ NotificationRouting = @{} }
@@ -4682,6 +4932,51 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "Discovery/ArchiveReadsExactlyFourBazaSyncFlags" `
         -Failure "BRAVO.Archive.Runtime.ps1 має читати всі 4 прапорці BAZA окремими змінними"
+
+    # BAZA_WWW optional-component contract (production incident, 2026-08,
+    # LIMS acceptance: Apache/BAZA_WWW відсутній на сервері при
+    # BAZA_WWW_SFTP=enabled -> ERROR/exit 50 SftpFailed). Перевірено, що це
+    # ІСНУЮЧА, коректна fail-closed поведінка (Scenario 2), а не дефект — і
+    # закріплено регресією клас-контракту для всіх трьох сценаріїв:
+    #   Scenario 1: BAZA_WWW_SFTP=disabled -> INFO "вимкнено в конфiгурацiї",
+    #               без ERROR, без $operationFailed (optional component).
+    #   Scenario 2: BAZA_WWW_SFTP=enabled + source недоступний (Apache
+    #               відсутній) -> ERROR + $operationFailed=$true -> fail
+    #               closed (SftpFailed), джерело НЕ маскується мовчки.
+    #   Scenario 3: enabled + source доступний -> існуючий upload-шлях
+    #               (incremental/Sync-FolderToSFTP) без гілки disabled/
+    #               source-unavailable.
+    # Тест структурний (AST/текст) — той самий підхід, що й усі сусідні
+    # Discovery/Console/* перевірки цього файлу для Archive.Runtime.ps1;
+    # runtime-контракт SFTP/WinSCP self-test навмисно не виконує наживо
+    # (див. .claude/rules — CI-докази не замінюють real-server acceptance
+    # для WinSCP/SFTP-поведінки).
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('if ($bazaWWWSFTPSyncEnabled -and $bazaWWWSourceAvailable) {') -and
+            $archiveScriptText.Contains('} elseif ($bazaWWWSFTPSyncEnabled) {') -and
+            $archiveScriptText.Contains('Write-Log "Синхронiзацiю BAZA WWW на SFTP вимкнено в конфiгурацiї" -Level "INFO"')
+        ) `
+        -Name "Archive/BazaWWWSyncDisabledIsOptionalSkipNotError" `
+        -Failure "Scenario 1 (BAZA_WWW_SFTP=disabled): гілка вимкненого BAZA_WWW SFTP має бути окремим INFO-шляхом без ERROR/operationFailed — компонент опціональний"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('Синхронiзацiю BAZA WWW на SFTP пропущено через помилку автоматичного визначення шляху') -and
+            [regex]::IsMatch(
+                $archiveScriptText,
+                '(?s)\}\s*elseif\s*\(\$bazaWWWSFTPSyncEnabled\)\s*\{\s*\$transferResults\.BAZA_WWW\.Success\s*=\s*\$false\s*\$transferResults\.BAZA_WWW\.Error\s*=\s*.локальний source path недоступний.\s*Write-Log "Синхронiзацiю BAZA WWW на SFTP пропущено через помилку автоматичного визначення шляху" -Level "ERROR"\s*\$operationFailed\s*=\s*\$true'
+            )
+        ) `
+        -Name "Archive/BazaWWWEnabledSourceAbsentFailsClosed" `
+        -Failure 'Scenario 2 (BAZA_WWW_SFTP=enabled, джерело/Apache недоступні): має лишатись ERROR + $operationFailed=$true (fail closed, SftpFailed) — джерело не повинно мовчки вимикатись/маскуватись'
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('$script:bazaWWWSyncResult = Invoke-BRAVOBazaIncrementalSync -Component ''BAZA_WWW''') -or
+            $archiveScriptText.Contains('$bazaWWWSFTPSync = Sync-FolderToSFTP')
+        ) `
+        -Name "Archive/BazaWWWEnabledSourceAvailableUsesExistingUploadPath" `
+        -Failure "Scenario 3 (enabled + джерело доступне): має лишатись існуючий upload-шлях (incremental sync / Sync-FolderToSFTP) без змін"
+
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('=== СИНХРОНIЗАЦIЯ BAZA WWW ===') -and
@@ -4894,6 +5189,416 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "Health/DestinationSummaryWiredIntoAllResults" `
         -Failure "LocalVerified/SftpVerified/SmbVerified мають потрапляти в результат з усіх 7 місць return Complete-BRAVOHealthResult, інакше зовнішній моніторинг періодично втрачатиме цю деталізацію"
+    # 5.2.1: semantic + recovery-aware дедуплікація зелених success-звітів.
+    # Source-контракти фіксують:
+    # (1) дедуп-рішення живе ЛИШЕ в success-гілці (читання стану і виклик
+    #     Get-BRAVOHealthSuccessNotificationDecision між
+    #     if ($healthIssues.Count -eq 0) та alert-циклом) — alert-шлях
+    #     (WARNING/ERROR/CRITICAL) від SUCCESS-дедупу не залежить;
+    # (2) recovery-сигнал знімається ДО Clear-AlertState (після очищення
+    #     інформація про попередню аварію втрачена);
+    # (3) гейти обходу: -ForceNotification і SuppressHeader (embedded
+    #     post-backup звіт з Archive не дедупиться);
+    # (4) придушений прогін віддає Notification 'Suppressed' (консоль вже
+    #     мапить його в SKIPPED) без нового return-сайту;
+    # (5) стан (LastSuccessSentUtc + Fingerprint) пишеться ПІСЛЯ фактичної
+    #     відправки (Send-BRAVONotificationChunks) у try/catch з WARNING —
+    #     провал доставки чи запису не оголошує звіт доставленим;
+    # (6) fail-open: catch читача стану повертає $null (звіт шлеться).
+    $successDedupHealthyIndex = $healthScriptText.IndexOf('if ($healthIssues.Count -eq 0) {')
+    $successDedupAlertLoopIndex = $healthScriptText.IndexOf('foreach ($healthIssue in $healthIssues)')
+    $successDedupStateCallIndex = $healthScriptText.IndexOf("`$previousSuccessState = Get-BRAVOHealthSuccessNotificationState")
+    $successDedupDecisionCallIndex = $healthScriptText.IndexOf('$successDecision = Get-BRAVOHealthSuccessNotificationDecision')
+    $successDedupRecoverySignalIndex = $healthScriptText.IndexOf('$operationalRecoveryPending = [bool](Get-BRAVOHealthOperationalState).RecoveryPending')
+    $successDedupClearIndex = $healthScriptText.IndexOf('Clear-AlertState', [math]::Max($successDedupHealthyIndex, 0))
+    $successDedupSendIndex = $healthScriptText.IndexOf('Send-BRAVONotificationChunks', [math]::Max($successDedupHealthyIndex, 0))
+    $successDedupSaveIndex = $healthScriptText.IndexOf('Save-BRAVOHealthSuccessNotificationState -Fingerprint $successFingerprint', [math]::Max($successDedupHealthyIndex, 0))
+    $successDedupReaderMatch = [regex]::Match(
+        $healthScriptText,
+        'function Get-BRAVOHealthSuccessNotificationState \{[\s\S]*?\n\}'
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $successDedupHealthyIndex -ge 0 -and
+            $successDedupAlertLoopIndex -gt $successDedupHealthyIndex -and
+            $successDedupStateCallIndex -gt $successDedupHealthyIndex -and
+            $successDedupStateCallIndex -lt $successDedupAlertLoopIndex -and
+            $successDedupDecisionCallIndex -gt $successDedupHealthyIndex -and
+            $successDedupDecisionCallIndex -lt $successDedupAlertLoopIndex -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape("`$previousSuccessState = Get-BRAVOHealthSuccessNotificationState")).Count -eq 1) -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('$successDecision = Get-BRAVOHealthSuccessNotificationDecision')).Count -eq 1) -and
+            $healthScriptText.Contains('-not $ForceNotification -and -not $SuppressHeader -and') -and
+            $healthScriptText.Contains('$successDedupMinutes -gt 0 -and -not $operationalRecoveryPending') -and
+            $healthScriptText.Contains("`$successNotificationDisposition = 'Suppressed'") -and
+            $healthScriptText.Contains('Notification = $successNotificationDisposition')
+        ) `
+        -Name "Health/SuccessDedupOnlyInSuccessBranchWithBypassGates" `
+        -Failure "semantic-дедуп success-звітів мусить жити лише в success-гілці (не в alert-шляху), обходитись -ForceNotification та embedded-викликом (SuppressHeader) і віддавати Notification 'Suppressed' через наявний return-сайт"
+    Test-BRAVOCondition `
+        -Condition (
+            $successDedupRecoverySignalIndex -gt $successDedupHealthyIndex -and
+            $successDedupRecoverySignalIndex -lt $successDedupAlertLoopIndex -and
+            $successDedupClearIndex -gt $successDedupHealthyIndex
+        ) `
+        -Name "Health/SuccessDedupRecoveryReadsOperationalStateInSuccessBranch" `
+        -Failure "recovery-факт мусить читатись з операційного стану (Get-BRAVOHealthOperationalState) у success-гілці — alert-state лишається механізмом дедупу алертів і не є пам'яттю recovery"
+    # Retry-safe recovery lifecycle (операційний стан, окремий від
+    # notification-станів):
+    # (a) RecoveryPending = $true пишеться в unhealthy-гілці ДО побудови
+    #     alert-повідомлення і ДО будь-якої спроби доставки — operational
+    #     truth не залежить від notification delivery;
+    # (b) RecoveryPending = $false пишеться РІВНО в одному місці — після
+    #     фактичної доставки SUCCESS (Send-BRAVONotificationChunks), у
+    #     гілці if ($operationalRecoveryPending);
+    # (c) у catch провалу доставки SUCCESS стан НЕ очищається (повтор на
+    #     наступному healthy-прогоні) — лише WARNING.
+    $recoveryPendingSetIndex = $healthScriptText.IndexOf('Save-BRAVOHealthOperationalState -RecoveryPending $true')
+    $recoveryPendingClearIndex = $healthScriptText.IndexOf('Save-BRAVOHealthOperationalState -RecoveryPending $false')
+    $recoveryAlertMessageIndex = $healthScriptText.IndexOf('New-SlackAlertMessage -Issues $healthIssues')
+    $recoveryAlertSuppressIndex = $healthScriptText.IndexOf('Test-AlertSuppressed -Fingerprint $alertFingerprint')
+    $recoverySendFailureLogIndex = $healthScriptText.IndexOf('Не вдалося відправити успішний звіт')
+    Test-BRAVOCondition `
+        -Condition (
+            $recoveryPendingSetIndex -gt 0 -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('Save-BRAVOHealthOperationalState -RecoveryPending $true')).Count -eq 1) -and
+            $recoveryPendingSetIndex -lt $recoveryAlertMessageIndex -and
+            $recoveryPendingSetIndex -lt $recoveryAlertSuppressIndex -and
+            $recoveryPendingSetIndex -gt $successDedupHealthyIndex
+        ) `
+        -Name "Health/RecoveryPendingSetOnUnhealthyBeforeAlertDelivery" `
+        -Failure "RecoveryPending=true мусить фіксуватись при unhealthy-результаті ДО побудови/доставки alert-у (і незалежно від її результату) — операційний факт не залежить від транспорту"
+    Test-BRAVOCondition `
+        -Condition (
+            $recoveryPendingClearIndex -gt $successDedupSendIndex -and
+            ([regex]::Matches($healthScriptText, [regex]::Escape('Save-BRAVOHealthOperationalState -RecoveryPending $false')).Count -eq 1) -and
+            $recoveryPendingClearIndex -lt $recoverySendFailureLogIndex -and
+            ([regex]::IsMatch($healthScriptText, 'if \(\$operationalRecoveryPending\) \{[\s\S]{0,600}?Save-BRAVOHealthOperationalState -RecoveryPending \$false')) -and
+            $healthScriptText.Contains('RecoveryPending збережено для повторної спроби')
+        ) `
+        -Name "Health/RecoveryPendingClearedOnlyAfterDeliveredSuccess" `
+        -Failure "RecoveryPending мусить очищатись РІВНО в одному місці — після фактично доставленого SUCCESS; провал доставки залишає стан true (WARNING) і наступний healthy прогін повторює recovery-звіт"
+    Test-BRAVOCondition `
+        -Condition (
+            $successDedupSendIndex -ge 0 -and
+            $successDedupSaveIndex -gt $successDedupSendIndex -and
+            ([regex]::IsMatch($healthScriptText, 'try \{\s*\r?\n\s*Save-BRAVOHealthSuccessNotificationState -Fingerprint \$successFingerprint\s*\r?\n\s*\} catch \{')) -and
+            $successDedupReaderMatch.Success -and
+            ([regex]::IsMatch($successDedupReaderMatch.Value, 'catch \{[\s\S]*?return \$null'))
+        ) `
+        -Name "Health/SuccessDedupStateWriteAfterSendAndFailOpenReader" `
+        -Failure "стан success-звіту (час + fingerprint) мусить записуватись після фактичної відправки в try/catch (провал запису = WARNING, не зміна результату; провал доставки = state НЕ оновлено), а читач стану — повертати `$null з catch (fail-open: доставка первинна, дедуп — зручність)"
+
+    # Runtime-тести semantic/recovery-дедупу: чиста decision-функція і
+    # fingerprint виконуються ізольовано (без I/O, без мережі) — покриття
+    # A-L з операторського контракту дедуплікації.
+    $successDedupRuntimeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Get-BRAVOHealthSuccessFingerprint',
+            'Get-BRAVOHealthSuccessNotificationDecision'
+        )
+    $successDedupDecisionCases = @(
+        @{  # Test A: embedded post-backup звіт первинний — завжди SEND
+            Name = 'Health/SuccessDedupDecisionPostBackupAlwaysSends'
+            Arguments = @{ EmbeddedPostBackup = $true; DedupMinutes = 1380; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'PostBackup'
+            Failure = 'embedded post-backup SUCCESS (первинне підтвердження свіжої копії) не можна придушувати попереднім scheduled-звітом'
+        },
+        @{  # Test B: standalone, той самий semantic-стан у вікні — SUPPRESS
+            Name = 'Health/SuccessDedupDecisionSameStateWithinWindowSuppresses'
+            Arguments = @{ DedupMinutes = 1380; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $false; ExpectedReason = 'SameStateWithinWindow'
+            Failure = 'standalone SUCCESS з незмінним semantic-станом у межах вікна мусить придушуватись — це і є цільовий кейс дедуплікації'
+        },
+        @{  # Test C: fingerprint змінився — SEND навіть у вікні
+            Name = 'Health/SuccessDedupDecisionChangedFingerprintSends'
+            Arguments = @{ DedupMinutes = 1380; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-B' }
+            ExpectedSend = $true; ExpectedReason = 'StateChanged'
+            Failure = 'зміна semantic-стану (інший fingerprint) мусить надсилати SUCCESS незалежно від часу останньої доставки'
+        },
+        @{  # Test D/E: непідтверджене відновлення (RecoveryPending) — SEND
+            Name = 'Health/SuccessDedupDecisionRecoveryAfterAlertSends'
+            Arguments = @{ DedupMinutes = 1380; RecoveryPending = $true; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'Recovery'
+            Failure = 'HEALTHY після WARNING/ERROR/CRITICAL — це відновлення (зміна operational state), його SUCCESS не можна придушувати навіть у межах вікна, доки recovery не підтверджено доставкою'
+        },
+        @{  # Test G: вікно вичерпане — SEND попри той самий fingerprint
+            Name = 'Health/SuccessDedupDecisionExpiredWindowSends'
+            Arguments = @{ DedupMinutes = 1380; PreviousStateAgeMinutes = 1500; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'WindowExpired'
+            Failure = 'вік >= SuccessDedupMinutes мусить надсилати звіт: час — останній guard, добове підтвердження живості каналу зберігається'
+        },
+        @{  # Test H: -ForceNotification обходить усе
+            Name = 'Health/SuccessDedupDecisionForceNotificationBypasses'
+            Arguments = @{ ForceNotification = $true; DedupMinutes = 1380; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'ForceNotification'
+            Failure = '-ForceNotification мусить повністю обходити SUCCESS-дедуп (same fingerprint + у вікні)'
+        },
+        @{  # Test I: SuccessDedupMinutes = 0 — дедуп вимкнено
+            Name = 'Health/SuccessDedupDecisionDisabledWindowSends'
+            Arguments = @{ DedupMinutes = 0; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = 'FP-A'; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'DedupDisabled'
+            Failure = 'SuccessDedupMinutes = 0 мусить повністю вимикати дедуп (стара поведінка)'
+        },
+        @{  # Test J (проєкція): відсутній/битий стан (fail-open $null) — SEND
+            Name = 'Health/SuccessDedupDecisionMissingStateSends'
+            Arguments = @{ DedupMinutes = 1380; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'NoPreviousState'
+            Failure = 'відсутній/битий success-state (fail-open читач повертає $null) мусить вести до SEND — дедуп є optimization, а не safety mechanism'
+        },
+        @{  # Legacy 5.2.1-стан без Fingerprint: рівність недоказова — SEND
+            Name = 'Health/SuccessDedupDecisionLegacyStateWithoutFingerprintSends'
+            Arguments = @{ DedupMinutes = 1380; PreviousStateAgeMinutes = 30; PreviousStateFingerprint = ''; CurrentFingerprint = 'FP-A' }
+            ExpectedSend = $true; ExpectedReason = 'StateChanged'
+            Failure = 'legacy-стан без поля Fingerprint не доводить семантичну рівність — такий SUCCESS мусить надсилатись, а не придушуватись за самим лише часом'
+        }
+    )
+    foreach ($successDedupDecisionCase in $successDedupDecisionCases) {
+        $successDedupDecisionResult = & $successDedupRuntimeModule {
+            param($CaseArguments)
+            $previousState = $null
+            if ($CaseArguments.Contains('PreviousStateAgeMinutes')) {
+                $previousState = [pscustomobject]@{
+                    Age = [timespan]::FromMinutes([double]$CaseArguments.PreviousStateAgeMinutes)
+                    Fingerprint = [string]$CaseArguments.PreviousStateFingerprint
+                }
+            }
+            $forceNotification = $CaseArguments.Contains('ForceNotification') -and [bool]$CaseArguments.ForceNotification
+            $embeddedPostBackup = $CaseArguments.Contains('EmbeddedPostBackup') -and [bool]$CaseArguments.EmbeddedPostBackup
+            $recoveryPending = $CaseArguments.Contains('RecoveryPending') -and [bool]$CaseArguments.RecoveryPending
+            Get-BRAVOHealthSuccessNotificationDecision `
+                -ForceNotification:$forceNotification `
+                -EmbeddedPostBackup:$embeddedPostBackup `
+                -DedupMinutes ([int]$CaseArguments.DedupMinutes) `
+                -RecoveryPending:$recoveryPending `
+                -PreviousState $previousState `
+                -CurrentFingerprint ([string]$CaseArguments.CurrentFingerprint)
+        } $successDedupDecisionCase.Arguments
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $successDedupDecisionResult -and
+                [bool]$successDedupDecisionResult.Send -eq [bool]$successDedupDecisionCase.ExpectedSend -and
+                [string]$successDedupDecisionResult.Reason -eq [string]$successDedupDecisionCase.ExpectedReason
+            ) `
+            -Name ([string]$successDedupDecisionCase.Name) `
+            -Failure "$($successDedupDecisionCase.Failure); отримано Send=$($successDedupDecisionResult.Send) Reason=$($successDedupDecisionResult.Reason)"
+    }
+
+    # Test L + детермінізм fingerprint: волатильні атрибути (час запуску,
+    # тривалість, вік копії) взагалі не є входами функції; однакові
+    # semantic-поля дають однаковий хеш незалежно від порядку елементів,
+    # а зміна GenerationId чи deferred-ознаки SFTP — інший хеш.
+    $successFingerprintProbe = & $successDedupRuntimeModule {
+        $summary = [pscustomobject]@{ LocalVerified = $true; SftpVerified = $true; SmbVerified = $true }
+        $archivesOrdered = @(
+            [pscustomobject]@{ Type = 'FULL'; GenerationId = 'GEN-1'; LastWriteTime = [datetime]::UtcNow },
+            [pscustomobject]@{ Type = 'BAZA'; GenerationId = 'GEN-2'; LastWriteTime = [datetime]::UtcNow.AddHours(-3) }
+        )
+        $archivesReversed = @($archivesOrdered[1], $archivesOrdered[0])
+        $baseline = Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -SftpDeferred $false -EnabledCheckNames @('sftp_archives', 'smb') -ArchiveIdentities $archivesOrdered
+        [pscustomobject]@{
+            Baseline = $baseline
+            SameSemanticsReordered = Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -SftpDeferred $false -EnabledCheckNames @('smb', 'sftp_archives') -ArchiveIdentities $archivesReversed
+            NewGeneration = Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -SftpDeferred $false -EnabledCheckNames @('sftp_archives', 'smb') -ArchiveIdentities @(
+                [pscustomobject]@{ Type = 'FULL'; GenerationId = 'GEN-9'; LastWriteTime = [datetime]::UtcNow },
+                $archivesOrdered[1]
+            )
+            SftpDeferred = Get-BRAVOHealthSuccessFingerprint -DestinationSummary ([pscustomobject]@{ LocalVerified = $true; SftpVerified = $false; SmbVerified = $true }) -SftpDeferred $true -EnabledCheckNames @('sftp_archives', 'smb') -ArchiveIdentities $archivesOrdered
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$successFingerprintProbe.Baseline -match '^[0-9a-f]{64}$' -and
+            [string]$successFingerprintProbe.Baseline -eq [string]$successFingerprintProbe.SameSemanticsReordered -and
+            [string]$successFingerprintProbe.Baseline -ne [string]$successFingerprintProbe.NewGeneration -and
+            [string]$successFingerprintProbe.Baseline -ne [string]$successFingerprintProbe.SftpDeferred
+        ) `
+        -Name "Health/SuccessDedupFingerprintDeterministicAndSemantic" `
+        -Failure "fingerprint мусить бути детермінованим SHA-256 hex (незалежним від порядку перевірок/архівів; волатильні поля не є входами), змінюватись при новій генерації копії та при відкладеній SFTP-перевірці; отримано Baseline=$($successFingerprintProbe.Baseline) Reordered=$($successFingerprintProbe.SameSemanticsReordered)"
+    # LastWriteTime волатильного впливу не має, коли GenerationId присутній:
+    # той самий GenerationId у різний час читання = той самий fingerprint.
+    $successFingerprintVolatileProbe = & $successDedupRuntimeModule {
+        $summary = [pscustomobject]@{ LocalVerified = $true; SftpVerified = $true; SmbVerified = $true }
+        $first = Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -SftpDeferred $false -EnabledCheckNames @('smb') -ArchiveIdentities @(
+            [pscustomobject]@{ Type = 'FULL'; GenerationId = 'GEN-1'; LastWriteTime = [datetime]::UtcNow }
+        )
+        $second = Get-BRAVOHealthSuccessFingerprint -DestinationSummary $summary -SftpDeferred $false -EnabledCheckNames @('smb') -ArchiveIdentities @(
+            [pscustomobject]@{ Type = 'FULL'; GenerationId = 'GEN-1'; LastWriteTime = [datetime]::UtcNow.AddHours(5) }
+        )
+        $first -eq $second
+    }
+    Test-BRAVOCondition `
+        -Condition ($successFingerprintVolatileProbe -eq $true) `
+        -Name "Health/SuccessDedupFingerprintIgnoresVolatileTimestamps" `
+        -Failure "та сама генерація копії (GenerationId) у різні моменти читання мусить давати той самий fingerprint — старіння копії в межах healthy-порогу не є зміною semantic-стану"
+    # Test F: alert-шлях (WARNING/ERROR/CRITICAL) не бере участі в
+    # SUCCESS-дедупі — жодне звернення до success-стану/fingerprint/decision
+    # не зустрічається після alert-циклу; alert-механізм (Test-AlertSuppressed/
+    # Save-AlertState/RepeatAlertAfterHours) лишається окремим.
+    Test-BRAVOCondition `
+        -Condition (
+            $successDedupAlertLoopIndex -gt 0 -and
+            $healthScriptText.LastIndexOf('Get-BRAVOHealthSuccessNotificationState') -lt $successDedupAlertLoopIndex -and
+            $healthScriptText.LastIndexOf('Get-BRAVOHealthSuccessNotificationDecision') -lt $successDedupAlertLoopIndex -and
+            $healthScriptText.LastIndexOf('$successFingerprint') -lt $successDedupAlertLoopIndex -and
+            $healthScriptText.IndexOf('Test-AlertSuppressed -Fingerprint $alertFingerprint') -gt $successDedupAlertLoopIndex -and
+            $healthScriptText.IndexOf('Save-AlertState -Fingerprint $alertFingerprint') -gt $successDedupAlertLoopIndex
+        ) `
+        -Name "Health/SuccessDedupDoesNotTouchAlertPath" `
+        -Failure "SUCCESS-дедуп не має жодним чином впливати на alert-шлях: доставка WARNING/ERROR/CRITICAL керується лише наявним alert-механізмом (Test-AlertSuppressed/Save-AlertState)"
+    # Test J (функціональний): битий JSON у success-state — читач мусить
+    # повернути $null (fail-open, WARNING у лог) і не кинути виняток.
+    $successDedupReaderModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @('Get-BRAVOHealthSuccessNotificationState')
+    $successDedupCorruptStatePath = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_SUCCESS_DEDUP_CORRUPT_{0}.json" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [IO.File]::WriteAllText($successDedupCorruptStatePath, '{ "LastSuccessSentUtc": "not-a-', [System.Text.Encoding]::UTF8)
+        $successDedupReaderProbe = & $successDedupReaderModule {
+            param($StatePath)
+            function script:Write-HealthLog { param([string]$Message, [string]$Level) }
+            $script:backupMonitoring = @{ SuccessNotificationStatePath = $StatePath }
+            [pscustomobject]@{
+                Corrupt = Get-BRAVOHealthSuccessNotificationState
+                Missing = & {
+                    $script:backupMonitoring = @{ SuccessNotificationStatePath = "$StatePath.does-not-exist" }
+                    Get-BRAVOHealthSuccessNotificationState
+                }
+            }
+        } $successDedupCorruptStatePath
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $successDedupReaderProbe.Corrupt -and
+                $null -eq $successDedupReaderProbe.Missing
+            ) `
+            -Name "Health/SuccessDedupCorruptOrMissingStateFailsOpen" `
+            -Failure "битий/відсутній success-state мусить давати `$null без винятку (fail-open: звіт надсилається), а не зривати healthy-прогін"
+    } finally {
+        Remove-Item -LiteralPath $successDedupCorruptStatePath -Force -ErrorAction SilentlyContinue
+    }
+    # Операційний recovery-стан (retry-safe recovery): reader/writer
+    # функціонально — round-trip true/false, відсутній файл = false
+    # (норма підтвердженого відновлення/першої інсталяції), битий файл =
+    # true (fail-open: невідомість не придушує recovery; storm неможливий,
+    # бо перша доставка SUCCESS перезаписує стан значенням false).
+    $operationalStateModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $healthScriptText `
+        -FunctionNames @(
+            'Get-BRAVOHealthOperationalState',
+            'Save-BRAVOHealthOperationalState'
+        )
+    $operationalStateDir = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_OPERATIONAL_STATE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($operationalStateDir)
+        $operationalStateProbe = & $operationalStateModule {
+            param($StateDir)
+            function script:Write-HealthLog { param([string]$Message, [string]$Level) }
+            $script:backupMonitoring = @{
+                OperationalStatePath = (Join-Path $StateDir 'BRAVO_HEALTH_OPERATIONAL_STATE.json')
+            }
+            $missing = (Get-BRAVOHealthOperationalState).RecoveryPending
+            Save-BRAVOHealthOperationalState -RecoveryPending $true
+            $afterSetTrue = (Get-BRAVOHealthOperationalState).RecoveryPending
+            Save-BRAVOHealthOperationalState -RecoveryPending $false
+            $afterSetFalse = (Get-BRAVOHealthOperationalState).RecoveryPending
+            [IO.File]::WriteAllText(
+                [string]$script:backupMonitoring.OperationalStatePath,
+                '{ "RecoveryPending": tr',
+                [System.Text.Encoding]::UTF8
+            )
+            $corrupt = (Get-BRAVOHealthOperationalState).RecoveryPending
+            $leftoverTmp = @([IO.Directory]::GetFiles($StateDir, '*.tmp')).Count
+            [pscustomobject]@{
+                Missing = $missing
+                AfterSetTrue = $afterSetTrue
+                AfterSetFalse = $afterSetFalse
+                Corrupt = $corrupt
+                LeftoverTmp = $leftoverTmp
+            }
+        } $operationalStateDir
+        Test-BRAVOCondition `
+            -Condition (
+                $operationalStateProbe.Missing -eq $false -and
+                $operationalStateProbe.AfterSetTrue -eq $true -and
+                $operationalStateProbe.AfterSetFalse -eq $false -and
+                [int]$operationalStateProbe.LeftoverTmp -eq 0
+            ) `
+            -Name "Health/OperationalStateRecoveryPendingRoundTrip" `
+            -Failure "operational state: відсутній файл = RecoveryPending `$false, запис true/false мусить читатись назад без залишених tmp-файлів; отримано Missing=$($operationalStateProbe.Missing) True=$($operationalStateProbe.AfterSetTrue) False=$($operationalStateProbe.AfterSetFalse) Tmp=$($operationalStateProbe.LeftoverTmp)"
+        Test-BRAVOCondition `
+            -Condition ($operationalStateProbe.Corrupt -eq $true) `
+            -Name "Health/OperationalStateCorruptFailsOpenToRecovery" `
+            -Failure "битий операційний стан мусить трактуватись як RecoveryPending=`$true (невідомість не має права придушити recovery-звіт); отримано Corrupt=$($operationalStateProbe.Corrupt)"
+    } finally {
+        if (Test-Path -LiteralPath $operationalStateDir) {
+            [IO.Directory]::Delete($operationalStateDir, $true)
+        }
+    }
+    # BRAVO_NOTIFICATION_TEST.ps1: channel-resolution без мережі. Регресія
+    # реального InvokeMethodOnNull (rc.10 acceptance): пропущений [string[]]
+    # -Channels = $null, а @($null).Count = 1 у PS5.1 — default-канали не
+    # підставлялись і null-канал падав на .ToUpperInvariant().
+    $notificationTestScriptText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_NOTIFICATION_TEST.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $notificationTestChannelModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $notificationTestScriptText `
+        -FunctionNames @('Get-BRAVONotificationTestEffectiveChannel')
+    $notificationTestChannelCases = @(
+        @{
+            Name = 'NotificationTest/OmittedChannelsAll'
+            Channels = $null; Mode = 'all'
+            ExpectedChannels = @('General', 'Alerts'); ExpectedExplicitRequired = $false
+            Failure = "пропущений -Channels при NotificationMode=all мусить давати General+Alerts (PS5.1: @(`$null).Count = 1 — фільтр null обов'язковий)"
+        },
+        @{
+            Name = 'NotificationTest/OmittedChannelsErrorsOnly'
+            Channels = $null; Mode = 'errors_only'
+            ExpectedChannels = @('Alerts'); ExpectedExplicitRequired = $false
+            Failure = 'пропущений -Channels при NotificationMode=errors_only мусить давати лише Alerts'
+        },
+        @{
+            Name = 'NotificationTest/OmittedChannelsNoneRequiresExplicit'
+            Channels = $null; Mode = 'none'
+            ExpectedChannels = @(); ExpectedExplicitRequired = $true
+            Failure = 'NotificationMode=none без явного -Channels не має права виконувати реальну доставку — потрібен явний намір оператора'
+        },
+        @{
+            Name = 'NotificationTest/ExplicitGeneral'
+            Channels = @('General'); Mode = 'all'
+            ExpectedChannels = @('General'); ExpectedExplicitRequired = $false
+            Failure = 'явний -Channels General мусить давати рівно General (без розширення до топології mode)'
+        },
+        @{
+            Name = 'NotificationTest/ExplicitAlerts'
+            Channels = @('Alerts'); Mode = 'none'
+            ExpectedChannels = @('Alerts'); ExpectedExplicitRequired = $false
+            Failure = 'явний -Channels Alerts мусить працювати навіть при mode=none — явний намір оператора'
+        },
+        @{
+            Name = 'NotificationTest/ExplicitBoth'
+            Channels = @('General', 'Alerts'); Mode = 'errors_only'
+            ExpectedChannels = @('General', 'Alerts'); ExpectedExplicitRequired = $false
+            Failure = 'явний -Channels General,Alerts мусить зберігатись без змін незалежно від mode'
+        }
+    )
+    foreach ($notificationTestChannelCase in $notificationTestChannelCases) {
+        $notificationTestChannelResult = & $notificationTestChannelModule {
+            param($CaseChannels, $CaseMode)
+            Get-BRAVONotificationTestEffectiveChannel -Channels $CaseChannels -NotificationMode $CaseMode
+        } $notificationTestChannelCase.Channels $notificationTestChannelCase.Mode
+        $notificationTestActualChannels = @($notificationTestChannelResult.Channels | Where-Object { $null -ne $_ })
+        Test-BRAVOCondition `
+            -Condition (
+                ($notificationTestActualChannels -join ',') -eq (@($notificationTestChannelCase.ExpectedChannels) -join ',') -and
+                [bool]$notificationTestChannelResult.RequiresExplicitChannels -eq [bool]$notificationTestChannelCase.ExpectedExplicitRequired
+            ) `
+            -Name ([string]$notificationTestChannelCase.Name) `
+            -Failure "$($notificationTestChannelCase.Failure); отримано Channels='$($notificationTestActualChannels -join ',')' RequiresExplicit=$($notificationTestChannelResult.RequiresExplicitChannels)"
+    }
     Test-BRAVOCondition `
         -Condition (
             [bool]$backupMonitoring.CheckManagedServices -and
@@ -8120,6 +8825,13 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             'ServerRoot "c:/br-a-vo.web/apache"',
             ("DocumentRoot ""{0}""" -f $fakeDocumentRoot.Replace('\', '/'))
         ))
+        # Test-BRAVOBazaWwwInstallation (структурна перевірка кандидата)
+        # вимагає реальний, непорожній, не-reparse каталог <DocumentRoot>\BAZA
+        # — без нього Presence був би Absent, а BAZA_WWW лишався б $null,
+        # хоча цей фікстур навмисно моделює "справжній" BAZA_WWW.
+        $fakeBazaWwwDir = Join-Path $fakeDocumentRoot "BAZA"
+        [void][IO.Directory]::CreateDirectory($fakeBazaWwwDir)
+        [IO.File]::WriteAllText((Join-Path $fakeBazaWwwDir 'placeholder.txt'), 'baza-www-fixture', (New-Object Text.UTF8Encoding($false)))
         $discoveryWithHttpdConf = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
@@ -8226,6 +8938,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) }
         )
         $bazaWwwOverridePath = Join-Path $discoveryTestRoot "ExplicitBazaWWW"
+        # Explicit override тепер валідується (absolute + directory
+        # existence) перед прийняттям як Presence=Present — без реального
+        # каталогу override давав би Presence=Error, не Present.
+        [void][IO.Directory]::CreateDirectory($bazaWwwOverridePath)
         $discoveryApacheAbsentWithOverride = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
@@ -8259,6 +8975,239 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             ) `
             -Name "Discovery/BazaWWWAbsentApacheIsControlledFailureNotServiceDenial" `
             -Failure "коли служби Apache/BravoWeb немає і override не задано, причина має бути 'службу не знайдено' (джерело невідоме), а НЕ формулюванням на кшталт 'backup заборонено через stopped/disabled службу' — це різна семантика"
+
+        # =====================================================================
+        # BAZA_WWW Presence-контракт (Present/Absent/Ambiguous/Error) —
+        # regression matrix scenarios 01-07, 11-15, 17-18 (частково; SFTP-
+        # enabled dispatch у BRAVO.Archive.Runtime.ps1 уже покрито окремим
+        # Archive/BazaWWW* блоком нижче за файлом).
+        # =====================================================================
+
+        # 01-03: Apache Running/Stopped/Disabled + валідний DocumentRoot з
+        # реальним <DocumentRoot>\BAZA -> Present, той самий шлях у всіх
+        # трьох (fixture вище — $fakeDocumentRoot/BAZA уже створено з файлом).
+        Test-BRAVOCondition `
+            -Condition ($discoveryWithHttpdConf.BAZA_WWW_Presence -eq 'Present' -and $discoveryWithHttpdConf.BAZA_WWW_Source -eq 'ApacheConfig') `
+            -Name "Discovery/BazaWWWPresenceContractPresentFromApacheConfig" `
+            -Failure "коли Apache-служба однозначна і <DocumentRoot>\BAZA реально існує/непорожній, BAZA_WWW_Presence має бути 'Present', Source='ApacheConfig'"
+
+        # 04/11: Apache відсутній (немає служби) і немає override -> Absent
+        # (не generic error), stale-директорія на диску тут відсутня.
+        Test-BRAVOCondition `
+            -Condition ($discoveryApacheAbsentNoOverride.BAZA_WWW_Presence -eq 'Absent') `
+            -Name "Discovery/BazaWWWPresenceContractAbsentWhenApacheMissing" `
+            -Failure "коли Apache-службу не знайдено і override не задано, BAZA_WWW_Presence має бути 'Absent', а не 'Error'/'Ambiguous'"
+
+        # 05: explicit валідний override + Apache відсутній -> Present,
+        # Source=ExplicitOverride (fixture вище тепер створює каталог override).
+        Test-BRAVOCondition `
+            -Condition ($discoveryApacheAbsentWithOverride.BAZA_WWW_Presence -eq 'Present' -and $discoveryApacheAbsentWithOverride.BAZA_WWW_Source -eq 'ExplicitOverride') `
+            -Name "Discovery/BazaWWWPresenceContractExplicitOverrideIsPresent" `
+            -Failure "явний, валідний (absolute + existing) discoverySettings.Sources.BAZA_WWW має давати Presence='Present', Source='ExplicitOverride' навіть без Apache-служби"
+
+        # 07: explicit override заданий, але каталог на диску не існує ->
+        # Error, БЕЗ silent fallback на auto-discovery (навіть коли Apache
+        # ТАКОЖ присутній і валідний — override має пріоритет; тут Apache
+        # взагалі відсутній, що додатково підтверджує відсутність fallback).
+        $invalidBazaWwwOverridePath = Join-Path $discoveryTestRoot "NoSuchExplicitBazaWWW"
+        $discoveryInvalidOverride = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -WebServiceCandidates @("Apache2.4") `
+            -Services $servicesWithoutApache `
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true `
+            -DiscoverySettings @{ Sources = @{ BAZA_WWW = $invalidBazaWwwOverridePath } }
+        Test-BRAVOCondition `
+            -Condition (
+                $discoveryInvalidOverride.BAZA_WWW_Presence -eq 'Error' -and
+                [string]::IsNullOrWhiteSpace([string]$discoveryInvalidOverride.BAZA_WWW) -and
+                $discoveryInvalidOverride.BAZA_WWW_Source -eq 'ExplicitOverride' -and
+                $discoveryInvalidOverride.Reasons.BAZA_WWW -match '(?i)не існує'
+            ) `
+            -Name "Discovery/BazaWWWPresenceContractInvalidOverrideFailsClosedNoFallback" `
+            -Failure "невалідний (неіснуючий каталог) explicit override BAZA_WWW має давати Presence='Error' і Value=`$null — БЕЗ автоматичного fallback на Apache-виявлення"
+
+        # 12: кілька Apache-подібних служб із РІЗНИМИ виконуваними файлами ->
+        # Ambiguous, БЕЗ мовчазного вибору першої (реґрес до фіксу: раніше
+        # BAZA_WWW тихо брав шлях першого кандидата, лише додаючи текстове
+        # [УВАГА] у Reasons.WebRoot).
+        $ambiguousApacheServices = @(
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) },
+            [pscustomobject]@{ Name = "Apache2.4"; DisplayName = "Apache2.4"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeHttpdPath) },
+            [pscustomobject]@{ Name = "Apache2.4-Second"; DisplayName = "Apache2.4 (другий)"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f (Join-Path $discoveryTestRoot "second-apache\bin\httpd.exe")) }
+        )
+        $discoveryAmbiguousApache = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -WebServiceCandidates @("Apache2.4", "Apache2.4-Second") `
+            -Services $ambiguousApacheServices `
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                $discoveryAmbiguousApache.BAZA_WWW_Presence -eq 'Ambiguous' -and
+                [string]::IsNullOrWhiteSpace([string]$discoveryAmbiguousApache.BAZA_WWW) -and
+                $discoveryAmbiguousApache.Ambiguous.WebRoot -eq $true
+            ) `
+            -Name "Discovery/BazaWWWPresenceContractAmbiguousDoesNotPickFirst" `
+            -Failure "кілька Apache-подібних служб з різними виконуваними файлами мають давати Presence='Ambiguous' і BAZA_WWW=`$null — НЕ мовчки перший знайдений кандидат"
+
+        # 18: Apache однозначний, DocumentRoot реально резолвиться, але
+        # <DocumentRoot>\BAZA або не існує, або порожній -> НЕ Present
+        # (структурна перевірка Test-BRAVOBazaWwwInstallation). Окремий
+        # httpd.conf/DocumentRoot без файлів у BAZA-підкаталозі.
+        $notBazaApacheConfDir = Join-Path $discoveryTestRoot "not-baza-apache\conf"
+        [void][IO.Directory]::CreateDirectory($notBazaApacheConfDir)
+        $notBazaHttpdConfPath = Join-Path $notBazaApacheConfDir "httpd.conf"
+        $notBazaDocumentRoot = Join-Path $discoveryTestRoot "not-baza-web-root"
+        [void][IO.Directory]::CreateDirectory($notBazaDocumentRoot)
+        [IO.File]::WriteAllLines($notBazaHttpdConfPath, @(
+            'ServerRoot "c:/not-baza/apache"',
+            ("DocumentRoot ""{0}""" -f $notBazaDocumentRoot.Replace('\', '/'))
+        ))
+        $notBazaServices = @(
+            [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) },
+            [pscustomobject]@{ Name = "NotBazaApache"; DisplayName = "NotBazaApache"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f (Join-Path $discoveryTestRoot "not-baza-apache\bin\httpd.exe")) }
+        )
+        $discoveryNotBaza = Resolve-BRAVOInstallationDiscovery `
+            -LimsRoot $discoveryTestRoot `
+            -BravoServiceName "BRAVO" `
+            -WebServiceCandidates @("NotBazaApache") `
+            -Services $notBazaServices `
+            -SystemRoot $fixtureSystemRoot `
+            -Is64BitOperatingSystem $true
+        Test-BRAVOCondition `
+            -Condition (
+                $discoveryNotBaza.BAZA_WWW_Presence -eq 'Absent' -and
+                [string]::IsNullOrWhiteSpace([string]$discoveryNotBaza.BAZA_WWW) -and
+                -not [string]::IsNullOrWhiteSpace([string]$discoveryNotBaza.HttpdConfPath)
+            ) `
+            -Name "Discovery/BazaWWWPresenceContractApachePresentButNotBazaStaysAbsent" `
+            -Failure "Apache-служба однозначна і DocumentRoot реально резолвиться, але <DocumentRoot>\BAZA не проходить структурну перевірку (не існує/порожній) — Presence має лишатись 'Absent', а НЕ 'Present' з хибним шляхом"
+
+        # Test-BRAVOBazaWwwInstallation напряму: 0/1/N елементів усередині
+        # кандидата, reparse point.
+        $structuralMissingDir = Join-Path $discoveryTestRoot "structural-missing"
+        $structuralEmptyDir = Join-Path $discoveryTestRoot "structural-empty"
+        [void][IO.Directory]::CreateDirectory($structuralEmptyDir)
+        $structuralPopulatedDir = Join-Path $discoveryTestRoot "structural-populated"
+        [void][IO.Directory]::CreateDirectory($structuralPopulatedDir)
+        [IO.File]::WriteAllText((Join-Path $structuralPopulatedDir 'a.txt'), 'x', (New-Object Text.UTF8Encoding($false)))
+        Test-BRAVOCondition `
+            -Condition (
+                -not (Test-BRAVOBazaWwwInstallation -Path $structuralMissingDir).Valid -and
+                -not (Test-BRAVOBazaWwwInstallation -Path $structuralEmptyDir).Valid -and
+                (Test-BRAVOBazaWwwInstallation -Path $structuralPopulatedDir).Valid
+            ) `
+            -Name "Discovery/TestBRAVOBazaWwwInstallationZeroOneManyEntries" `
+            -Failure "Test-BRAVOBazaWwwInstallation має відхиляти відсутній і порожній каталог, приймати непорожній реальний каталог"
+
+        # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
+        # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
+        # структурно валідний (реальний, непорожній <DocumentRoot>\BAZA) —
+        # обидва кандидати (Path A через override, Path B через Apache)
+        # structurally valid одночасно; Path B не повинен використовуватись
+        # ні напряму, ні як fallback. Ізольований temp root + власний
+        # try/finally (не покладається на спільний $discoveryTestRoot
+        # cleanup наприкінці блоку).
+        $scenario06Root = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_BAZAWWW_S06_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($scenario06Root)
+
+            # Path A — explicit override, structurally valid.
+            $scenario06PathA = Join-Path $scenario06Root "PathA-Explicit"
+            [void][IO.Directory]::CreateDirectory($scenario06PathA)
+            [IO.File]::WriteAllText((Join-Path $scenario06PathA 'explicit-a.txt'), 'path-a', (New-Object Text.UTF8Encoding($false)))
+
+            # Path B — окремий, ТАКОЖ structurally valid Apache DocumentRoot\BAZA.
+            $scenario06ApacheConfDir = Join-Path $scenario06Root "apache\conf"
+            [void][IO.Directory]::CreateDirectory($scenario06ApacheConfDir)
+            $scenario06HttpdConfPath = Join-Path $scenario06ApacheConfDir "httpd.conf"
+            $scenario06DocumentRoot = Join-Path $scenario06Root "PathB-Apache-DocRoot"
+            [void][IO.Directory]::CreateDirectory($scenario06DocumentRoot)
+            [IO.File]::WriteAllLines($scenario06HttpdConfPath, @(
+                'ServerRoot "c:/scenario06/apache"',
+                ("DocumentRoot ""{0}""" -f $scenario06DocumentRoot.Replace('\', '/'))
+            ))
+            $scenario06PathB = Join-Path $scenario06DocumentRoot "BAZA"
+            [void][IO.Directory]::CreateDirectory($scenario06PathB)
+            [IO.File]::WriteAllText((Join-Path $scenario06PathB 'apache-b.txt'), 'path-b', (New-Object Text.UTF8Encoding($false)))
+
+            $scenario06Services = @(
+                [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) },
+                [pscustomobject]@{ Name = "Scenario06Apache"; DisplayName = "Scenario06Apache"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f (Join-Path $scenario06Root "apache\bin\httpd.exe")) }
+            )
+            $scenario06Discovery = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $scenario06Root `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Scenario06Apache") `
+                -Services $scenario06Services `
+                -SystemRoot $fixtureSystemRoot `
+                -Is64BitOperatingSystem $true `
+                -DiscoverySettings @{ Sources = @{ BAZA_WWW = $scenario06PathA } }
+            Test-BRAVOCondition `
+                -Condition (
+                    $scenario06Discovery.BAZA_WWW_Presence -eq 'Present' -and
+                    $scenario06Discovery.BAZA_WWW_Source -eq 'ExplicitOverride' -and
+                    $scenario06Discovery.BAZA_WWW -eq $scenario06PathA -and
+                    $scenario06Discovery.BAZA_WWW -ne $scenario06PathB -and
+                    -not [string]::IsNullOrWhiteSpace([string]$scenario06Discovery.HttpdConfPath)
+                ) `
+                -Name "Discovery/BazaWWWPresenceContractExplicitOverrideWinsOverApache" `
+                -Failure "коли явний override (Path A) і однозначна, structurally valid Apache-служба (Path B) присутні ОДНОЧАСНО, Presence має бути 'Present', Source='ExplicitOverride', BAZA_WWW=Path A — Path B (Apache DocumentRoot\BAZA) не повинен використовуватись ні напряму, ні як fallback, і результат не повинен ставати Ambiguous"
+        } finally {
+            if (Test-Path -LiteralPath $scenario06Root) {
+                Remove-Item -LiteralPath $scenario06Root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # 11: stale/legacy каталог, що ВИГЛЯДАЄ як старий BAZA_WWW layout
+        # (populated, canonical-looking ім'я), не повинен активувати
+        # компонент, коли Apache-служба відсутня і explicit override не
+        # заданий — discovery не сканує диск заради BAZA_WWW: коли Apache
+        # відсутній, єдине джерело — override, якого тут немає. Ізольований
+        # temp root + власний try/finally.
+        $scenario11Root = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_BAZAWWW_S11_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($scenario11Root)
+
+            # "Правдоподібний" legacy BAZA_WWW layout — саме такий шлях і
+            # такі файли реальний BAZA_WWW міг би мати, якби Apache-служба
+            # реально стояла тут колись і згодом була видалена/перенесена.
+            $scenario11StaleDocumentRoot = Join-Path $scenario11Root "old-apache\htdocs"
+            $scenario11StaleBazaDir = Join-Path $scenario11StaleDocumentRoot "BAZA"
+            [void][IO.Directory]::CreateDirectory($scenario11StaleBazaDir)
+            [IO.File]::WriteAllText((Join-Path $scenario11StaleBazaDir 'legacy-data.txt'), 'stale-baza-www-leftover', (New-Object Text.UTF8Encoding($false)))
+            [void][IO.Directory]::CreateDirectory((Join-Path $scenario11StaleBazaDir 'subfolder'))
+
+            $scenario11Services = @(
+                [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $fakeBravoExePath) }
+            )
+            $scenario11Discovery = Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $scenario11Root `
+                -BravoServiceName "BRAVO" `
+                -WebServiceCandidates @("Apache2.4") `
+                -Services $scenario11Services `
+                -SystemRoot $fixtureSystemRoot `
+                -Is64BitOperatingSystem $true
+            Test-BRAVOCondition `
+                -Condition (
+                    $scenario11Discovery.BAZA_WWW_Presence -eq 'Absent' -and
+                    [string]::IsNullOrWhiteSpace([string]$scenario11Discovery.BAZA_WWW) -and
+                    $scenario11Discovery.BAZA_WWW_Source -eq 'None'
+                ) `
+                -Name "Discovery/BazaWWWPresenceContractStaleDirectoryDoesNotActivateComponent" `
+                -Failure "populated, canonical-looking legacy BAZA_WWW каталог на диску (без Apache-служби і без explicit override) НЕ повинен активувати компонент — Presence має лишатись 'Absent', BAZA_WWW=`$null, Source='None'; discovery не сканує диск заради BAZA_WWW"
+        } finally {
+            if (Test-Path -LiteralPath $scenario11Root) {
+                Remove-Item -LiteralPath $scenario11Root -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
 
         # Аналогічно для BRAVO: коли служба взагалі не встановлена,
         # MODEL/BLOG/BRAVOEXCH мають лишатись доступними через незалежне
@@ -8329,17 +9278,31 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 [hashtable]$ComponentSyncFlagOverrides = @{}
             )
 
-            $script:prodLoaderFixtureServices = @($Services)
-            function global:Get-CimInstance {
-                param([string]$ClassName, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
-                if ($ClassName -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
-                Microsoft.Management.Infrastructure.CimCmdlets\Get-CimInstance @PSBoundParameters
-            }
-            function global:Get-WmiObject {
-                param([string]$Class, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
-                if ($Class -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
-                Microsoft.PowerShell.Management\Get-WmiObject @PSBoundParameters
-            }
+            # Ізольований module scope для fixture-стану: усередині функцій,
+            # визначених через New-Module -ScriptBlock, $script: лексично
+            # прив'язується до SCOPE САМОГО МОДУЛЯ (перевірено емпірично) —
+            # НЕ до $script: скрипта, що ВИКЛИКАЄ функцію під час виконання,
+            # на відміну від "голих" function global:-визначень поза
+            # модулем, де $script: усередині динамічно резолвиться відносно
+            # ПОТОЧНОГО виклик-стека. Це прибирає цілий клас crossscript
+            # contamination: навіть якщо cleanup нижче колись знову дасть
+            # збій, fixture-дані лишаються прив'язані до СВОГО модуля, а не
+            # плутають $script:-простір production-скрипта, що працює далі
+            # в тому самому powershell.exe process.
+            $prodLoaderFixtureModule = New-Module -ScriptBlock {
+                param([object[]]$Services)
+                $script:prodLoaderFixtureServices = @($Services)
+                function global:Get-CimInstance {
+                    param([string]$ClassName, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
+                    if ($ClassName -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
+                    Microsoft.Management.Infrastructure.CimCmdlets\Get-CimInstance @PSBoundParameters
+                }
+                function global:Get-WmiObject {
+                    param([string]$Class, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
+                    if ($Class -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
+                    Microsoft.PowerShell.Management\Get-WmiObject @PSBoundParameters
+                }
+            } -ArgumentList (, @($Services))
 
             try {
                 $configText = [IO.File]::ReadAllText($SourceConfigPath, [Text.Encoding]::UTF8)
@@ -8414,8 +9377,44 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 }
                 return $result
             } finally {
-                Remove-Item -Path function:global:Get-CimInstance -ErrorAction SilentlyContinue
-                Remove-Item -Path function:global:Get-WmiObject -ErrorAction SilentlyContinue
+                # КОРІНЬ production-інциденту (2026-08, LIMS acceptance):
+                # `Remove-Item -Path function:global:Get-CimInstance` (з
+                # явним префіксом "global:" У РЯДКУ шляху function:-
+                # провайдера) НІЧОГО не видаляє — провайдер мовчки резолвить
+                # 0 елементів і НЕ кидає помилку (перевірено емпірично на
+                # Windows PowerShell 5.1.26100: Get-Item з тим самим шляхом
+                # читає елемент нормально, але Remove-Item з ним — ні), тож
+                # -ErrorAction SilentlyContinue раніше маскував це як
+                # "успіх" — override переживав завершення self-test і в
+                # ТОМУ САМОМУ powershell.exe отруював наступний production
+                # entrypoint (BRAVO_ARCHIV.ps1 -> embedded Health ->
+                # Get-BRAVOWmiInstance -> цей leftover Get-CimInstance),
+                # даючи саме "$script:prodLoaderFixtureServices cannot be
+                # retrieved because it has not been set" — бо $script:
+                # усередині "голої" function global:-функції динамічно
+                # резолвиться відносно СКРИПТА, що її ВИКЛИКАВ, а не того,
+                # що її визначив (теж перевірено емпірично).
+                #
+                # Правильний шлях провайдера — БЕЗ "global:" у самому
+                # рядку: тоді провайдер коректно знаходить і видаляє
+                # визначення в глобальній таблиці функцій незалежно від
+                # того, з якого вкладеного scope викликається Remove-Item
+                # (перевірено емпірично). -ErrorAction Stop + явна перевірка
+                # нижче — щоб БУДЬ-ЯКЕ повторне регресування цього класу
+                # дефекту провалювало сам self-test голосно (fail-closed),
+                # а не мовчки залишало production-runtime отруєним у тому
+                # самому процесі.
+                Remove-Item -Path function:Get-CimInstance -Force -ErrorAction Stop
+                Remove-Item -Path function:Get-WmiObject -Force -ErrorAction Stop
+                if (Test-Path -LiteralPath function:global:Get-CimInstance) {
+                    throw "New-BRAVOProductionConfigFixtureResult: не вдалося видалити fixture-override function:global:Get-CimInstance — production runtime у цьому процесі залишиться отруєним"
+                }
+                if (Test-Path -LiteralPath function:global:Get-WmiObject) {
+                    throw "New-BRAVOProductionConfigFixtureResult: не вдалося видалити fixture-override function:global:Get-WmiObject — production runtime у цьому процесі залишиться отруєним"
+                }
+                if ($null -ne $prodLoaderFixtureModule) {
+                    Remove-Module -ModuleInfo $prodLoaderFixtureModule -Force -ErrorAction SilentlyContinue
+                }
             }
         }
 
@@ -8440,6 +9439,11 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $prodLoaderExplicitBlogSource = Join-Path $prodLoaderRoot 'ExplicitBlog'
             $prodLoaderExplicitBravoexchSource = Join-Path $prodLoaderRoot 'ExplicitBravoexch'
             $prodLoaderBazaWWWOverride = Join-Path $prodLoaderRoot 'ExplicitBazaWWW'
+            # Explicit override BAZA_WWW валідується на existence (на
+            # відміну від MODEL/BLOG/BRAVOEXCH override, чия existence
+            # перевіряється пізніше, при archive) — без каталогу на диску
+            # Presence був би Error, не Present.
+            [void][IO.Directory]::CreateDirectory($prodLoaderBazaWWWOverride)
             $prodLoaderNoSuchIniPath = Join-Path $prodLoaderRoot 'NoSuchDir\bravo.ini'
 
             # --- Acceptance 1: BRAVO absent + canonical bravo.ini + usable
@@ -8900,6 +9904,102 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 Remove-Item -LiteralPath $absentBackupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+
+        # =====================================================================
+        # SAME-PROCESS CONTAMINATION REGRESSION (production incident, 2026-08,
+        # LIMS acceptance): New-BRAVOProductionConfigFixtureResult вище
+        # виконано 8 разів у ЦЬОМУ САМОМУ powershell.exe process, кожен раз
+        # тимчасово підміняючи global:Get-CimInstance/global:Get-WmiObject.
+        # Нижче доводиться, що ПІСЛЯ всіх 8 викликів той самий process
+        # функціонально еквівалентний process, де self-test взагалі не
+        # запускався, з погляду production entrypoints (Health/service
+        # discovery) — саме контракт, порушений в інциденті.
+        # =====================================================================
+
+        # Test A/B: Get-CimInstance/Get-WmiObject мають бути РЕАЛЬНИМИ
+        # cmdlet'ами (CommandType=Cmdlet), а не self-test function-override,
+        # що лишився в глобальній таблиці функцій.
+        $postFixtureCimCommand = Get-Command -Name 'Get-CimInstance' -ErrorAction SilentlyContinue
+        $postFixtureWmiCommand = Get-Command -Name 'Get-WmiObject' -ErrorAction SilentlyContinue
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $postFixtureCimCommand -and $postFixtureCimCommand.CommandType -eq 'Cmdlet' -and
+                $null -ne $postFixtureWmiCommand -and $postFixtureWmiCommand.CommandType -eq 'Cmdlet'
+            ) `
+            -Name "Isolation/GetCimGetWmiRestoredToRealCmdletsAfterProdLoaderFixtures" `
+            -Failure "Get-CimInstance/Get-WmiObject мають лишатись справжніми cmdlet'ами (не self-test function-override) для будь-якого production entrypoint, що виконається далі в тому самому powershell.exe"
+
+        # Test A/B (production incident reproduction): production
+        # Get-BRAVOWmiInstance -ClassName Win32_Service — той самий виклик,
+        # що Health.Runtime.ps1 робить у Get-ManagedServiceHealthIssues — має
+        # відпрацювати БЕЗ помилки "$script:prodLoaderFixtureServices cannot
+        # be retrieved" і повернути об'єкти з production-контрактом
+        # (Name/StartMode), а НЕ synthetic fixture-shape.
+        $postCleanupDiscoveryThrew = $false
+        $postCleanupDiscoveryMessage = $null
+        $postCleanupWin32Services = @()
+        try {
+            $postCleanupWin32Services = @(Get-BRAVOWmiInstance -ClassName 'Win32_Service')
+        } catch {
+            $postCleanupDiscoveryThrew = $true
+            $postCleanupDiscoveryMessage = $_.Exception.Message
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $postCleanupDiscoveryThrew -and
+                ($postCleanupWin32Services.Count -eq 0 -or (
+                    $null -ne $postCleanupWin32Services[0].PSObject.Properties['Name'] -and
+                    $null -ne $postCleanupWin32Services[0].PSObject.Properties['StartMode']
+                ))
+            ) `
+            -Name "Isolation/ProductionServiceDiscoveryContractAfterProdLoaderFixtures" `
+            -Failure "Get-BRAVOWmiInstance -ClassName Win32_Service (той самий шлях, що production Health/Get-ManagedServiceHealthIssues) має повертати production-контракт (Name/StartMode) без винятків після self-test fixtures; отримано Threw=$postCleanupDiscoveryThrew Message='$postCleanupDiscoveryMessage'"
+
+        # Test C: специфічна назва зі самого інциденту не повинна лишатись
+        # видимою в Script/Global scope self-test-у після fixture-блоку.
+        # ПРИМІТКА щодо scope-моделі: self-test запускається як top-level
+        # -File скрипт (те саме, що production entrypoints), тому для НЬОГО
+        # САМОГО $script: і $global: — ОДИН і той самий scope object (немає
+        # "caller" вище top-level скрипта). Це підтверджує саме той механізм,
+        # що спричинив інцидент: коли New-BRAVOProductionConfigFixtureResult
+        # (нестед-функція) писала `$script:prodLoaderFixtureServices`, вона
+        # писала прямісінько в цей top-level/global-еквівалентний scope.
+        # Тому перевіряти ТУТ можна лише ТОЧНУ назву — self-test сам
+        # легітимно тримає в цьому самому scope десятки власних робочих
+        # fixture-змінних під схожі "service/fixture/synthetic" імена
+        # (напр. $syntheticServices — вхід для Resolve-BRAVOInstallation
+        # Discovery по всьому файлу), і клас-патерн за підрядком неминуче
+        # false-positive на власний словник self-test-у. Ширше покриття
+        # КЛАСУ дефекту (не одна назва) забезпечують Test A/B/D вище/нижче —
+        # різними, незалежними механізмами (CommandType real-cmdlet,
+        # функціональний виклик production service discovery, Get-Module
+        # export-стан), а не додатковим вгадуванням імен.
+        $leftoverScriptFixtureVars = @(
+            Get-Variable -Scope Script -Name 'prodLoaderFixtureServices' -ErrorAction SilentlyContinue
+        )
+        $leftoverGlobalFixtureVars = @(
+            Get-Variable -Scope Global -Name 'prodLoaderFixtureServices' -ErrorAction SilentlyContinue
+        )
+        Test-BRAVOCondition `
+            -Condition ($leftoverScriptFixtureVars.Count -eq 0 -and $leftoverGlobalFixtureVars.Count -eq 0) `
+            -Name "Isolation/NoFixtureServiceVariablesLeakIntoScriptOrGlobalScope" `
+            -Failure "після New-BRAVOProductionConfigFixtureResult fixture-стан (service-mock class) не повинен лишатись видимим у Script/Global scope: знайдено $(($leftoverScriptFixtureVars | ForEach-Object { $_.Name }) -join ', ') / $(($leftoverGlobalFixtureVars | ForEach-Object { $_.Name }) -join ', ')"
+
+        # Test D: жоден orphaned dynamic-module, що досі експортує
+        # Get-CimInstance/Get-WmiObject (fixture-модуль з ізоляції вище),
+        # не повинен лишатись у Get-Module — інакше навіть коректно
+        # видалена global:-функція могла б бути повторно "прив'язана" при
+        # майбутньому рефакторингу, що знову імпортує цей модуль за іменем.
+        $orphanedFixtureModules = @(
+            Get-Module | Where-Object {
+                $_.ExportedFunctions.ContainsKey('Get-CimInstance') -or
+                $_.ExportedFunctions.ContainsKey('Get-WmiObject')
+            }
+        )
+        Test-BRAVOCondition `
+            -Condition ($orphanedFixtureModules.Count -eq 0) `
+            -Name "Isolation/NoOrphanedFixtureModuleExportsCimOrWmiOverride" `
+            -Failure "динамічний fixture-модуль New-BRAVOProductionConfigFixtureResult має бути видалений (Remove-Module) після кожного виклику; знайдено модулі, що досі експортують Get-CimInstance/Get-WmiObject: $(($orphanedFixtureModules | ForEach-Object { $_.Name }) -join ', ')"
 
         # Джерело істини — Service name ТА Display name одночасно.
         # Сторонній сервіс із Name="BRAVO", але іншим Display name (типова
@@ -14301,14 +15401,147 @@ function Write-BRAVOLog {
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
 }
 
+# ============================================================
+# P0 hotfix: session-contamination gate. Знімок УСІХ імен функцій, які
+# будь-коли реєструвалися через New-BRAVOSelfTestRuntimeModule за весь
+# прогін (ДО Clear — сам Clear спорожнює реєстр), потрібен нижче для
+# перевірки "жодна з них не лишилася прив'язаною до self-test-модуля".
+# ============================================================
+$selfTestEverRegisteredFunctionNames = @(
+    $script:BRAVOSelfTestOwnedRuntimeModules |
+        ForEach-Object { $_.FunctionNames } |
+        Select-Object -Unique
+)
+$selfTestOwnedModuleNamesBeforeCleanup = @(
+    $script:BRAVOSelfTestOwnedRuntimeModules | ForEach-Object { $_.Module.Name }
+)
+
+Clear-BRAVOSelfTestOwnedRuntimeModules
+
+# Fail-loud production-command contract: якщо будь-який self-test fixture
+# (New-BRAVOSelfTestRuntimeModule) лишив caller-сесію отруєною, SELF-TEST
+# НЕ повинен доповісти PASSED — саме той сценарій, що спричинив реальний
+# production-інцидент (Get-Service function shadow -> Health StartType
+# crash у тому самому powershell.exe PID).
+foreach ($criticalCommandName in @('Get-Service', 'Start-Service', 'Stop-Service')) {
+    $criticalCommand = Get-Command -Name $criticalCommandName -ErrorAction SilentlyContinue
+    $isRealCmdlet = $null -ne $criticalCommand -and
+        $criticalCommand.CommandType -eq [Management.Automation.CommandTypes]::Cmdlet -and
+        $criticalCommand.ModuleName -eq 'Microsoft.PowerShell.Management'
+    $testNameSuffix = ($criticalCommandName -replace '-', '')
+    Test-BRAVOCondition `
+        -Condition $isRealCmdlet `
+        -Name "Isolation/${testNameSuffix}RestoredToRealCmdletAfterFullSelfTestFixtures" `
+        -Failure ("$criticalCommandName станом на кінець self-test має резолвитися у " +
+            "справжній Cmdlet Microsoft.PowerShell.Management, а не у self-test fixture-" +
+            "function; фактично: CommandType=$($criticalCommand.CommandType), " +
+            "ModuleName=$($criticalCommand.ModuleName)")
+}
+
+$leakedFixtureCommands = @(
+    $selfTestEverRegisteredFunctionNames | ForEach-Object {
+        $command = Get-Command -Name $_ -ErrorAction SilentlyContinue
+        if ($null -ne $command -and
+            $command.CommandType -eq [Management.Automation.CommandTypes]::Function -and
+            $selfTestOwnedModuleNamesBeforeCleanup -contains $command.ModuleName) {
+            $command
+        }
+    }
+)
+Test-BRAVOCondition `
+    -Condition ($leakedFixtureCommands.Count -eq 0) `
+    -Name "Isolation/NoSelfTestOwnedDynamicModuleExportsProductionCommands" `
+    -Failure ("динамічні fixture-модулі New-BRAVOSelfTestRuntimeModule мають бути повністю " +
+        "прибрані Clear-BRAVOSelfTestOwnedRuntimeModules наприкінці self-test; досі " +
+        "резолвиться як self-test-owned function: $(
+            ($leakedFixtureCommands | ForEach-Object { "$($_.Name) [$($_.ModuleName)]" }) -join ', '
+        )")
+
+
+# Get-Module (навіть -All) НІКОЛИ не бачить ці динамічні New-Module-
+# інстанси — емпірично підтверджено окремим репро: New-Module -ScriptBlock
+# (без -AsCustomObject) матеріалізує функції у Function:-drive, не
+# реєструючи модуль у видимому module-списку сесії. Тому перевірка
+# "не лишилось fixture-helper функцій" (окремо від трьох критичних
+# service-cmdlet-ів вище) має бути function-based, як і
+# NoSelfTestOwnedDynamicModuleExportsProductionCommands, а не через
+# Get-Module.
+$leakedHelperCommands = @(
+    $selfTestEverRegisteredFunctionNames |
+        Where-Object { $_ -notin @('Get-Service', 'Start-Service', 'Stop-Service') } |
+        ForEach-Object {
+            $command = Get-Command -Name $_ -ErrorAction SilentlyContinue
+            if ($null -ne $command -and
+                $command.CommandType -eq [Management.Automation.CommandTypes]::Function -and
+                $selfTestOwnedModuleNamesBeforeCleanup -contains $command.ModuleName) {
+                $command
+            }
+        }
+)
+Test-BRAVOCondition `
+    -Condition ($leakedHelperCommands.Count -eq 0) `
+    -Name "Isolation/NoSelfTestServiceHelperFunctionsLeakIntoCallerScope" `
+    -Failure ("self-test fixture/helper-функції (Initialize-BRAVOSelfTestServiceState, " +
+        "Get-BRAVOQuiescenceWatchdogAllowedServiceNames тощо) мають бути прибрані з " +
+        "Function:-drive caller-сесії наприкінці self-test; досі резолвиться: $(
+            ($leakedHelperCommands | ForEach-Object { "$($_.Name) [$($_.ModuleName)]" }) -join ', '
+        )")
+
 if (-not [string]::IsNullOrWhiteSpace([string]$script:selfTestConfigRoot) -and
     [IO.Directory]::Exists($script:selfTestConfigRoot)) {
     [IO.Directory]::Delete($script:selfTestConfigRoot, $true)
 }
 
-if ($script:failures.Count -gt 0) {
-    Write-Host "SELF-TEST FAILED: $($script:failures.Count)" -ForegroundColor Red
-    Complete-BRAVOHelperLog -ExitCode 1
+# SELF-TEST Console UX: один resolved exit code — і для operator summary,
+# і для реального завершення процесу (Complete-BRAVOHelperLog нижче).
+# Ніколи не обчислюється повторно після паузи (той самий інваріант, що
+# Archive/Health/Maintenance: "обчислити ДО друку РЕЗУЛЬТАТ").
+$script:selfTestExitCode = if ($script:failures.Count -gt 0) { 1 } else { 0 }
+$script:selfTestStatusText = if ($script:selfTestExitCode -eq 0) { 'УСПІШНО' } else { 'ВИЯВЛЕНО ПОМИЛКИ' }
+$script:selfTestStatusColor = if ($script:selfTestExitCode -eq 0) { [ConsoleColor]::Green } else { [ConsoleColor]::Red }
+
+# Явний Initialize-BRAVOConsole (Enabled за замовчуванням $true) — доменні
+# self-test фрагменти вище неодноразово роблять Remove-Module/Import-Module
+# -Force для BRAVO.Console під власні сценарії; operator summary не повинен
+# залежати від того, у якому стані модуль лишився після останнього з них.
+Initialize-BRAVOConsole
+Write-BRAVOFinalSummaryHeader -Title 'BRAVO SELF-TEST' -Status $script:selfTestStatusText -StatusColor $script:selfTestStatusColor
+Write-BRAVOResultField -Label 'Статус' -Value $script:selfTestStatusText -Color $script:selfTestStatusColor
+Write-BRAVOResultField -Label 'Перевірки' -Value ([string]$script:passCount)
+Write-BRAVOResultField -Label 'Помилки' -Value ([string]$script:failures.Count)
+Write-BRAVOResultBlankLine
+if ($script:selfTestExitCode -eq 0) {
+    Write-Host 'Усі перевірки BRAVO-Toolkit успішно пройдено.'
+    Write-Host 'Проблем не виявлено. Додаткові дії не потрібні.'
+} else {
+    Write-Host 'BRAVO-Toolkit не пройшов усі перевірки.'
+    Write-Host 'Перегляньте рядки [FAIL] вище та журнал self-test.'
 }
-Write-Host "SELF-TEST PASSED" -ForegroundColor Green
-Complete-BRAVOHelperLog -ExitCode 0
+Write-BRAVOResultBlankLine
+
+# Канонічні machine-readable маркери (CI/тести/скрипти) — не видалені,
+# лише перенесені в операторський підсумок; текст незмінний.
+if ($script:selfTestExitCode -gt 0) {
+    Write-Host "SELF-TEST FAILED: $($script:failures.Count)" -ForegroundColor Red
+} else {
+    Write-Host "SELF-TEST PASSED" -ForegroundColor Green
+}
+Write-BRAVOResultField -Label 'Код завершення' -Value ([string]$script:selfTestExitCode)
+Write-BRAVOFinalSummaryFooter -LogFile $script:selfTestHelperLogPath
+
+# exit усередині Complete-BRAVOHelperLog (яка сама теж пише "Код
+# завершення"/"Лог" перед exit — той самий контракт, що й для всіх інших
+# допоміжних скриптів, що підключають BRAVO.HelperLogging) проходить крізь
+# finally ПЕРЕД тим, як процес справді завершується — той самий емпірично
+# підтверджений принцип, що Maintenance.Runtime.ps1 використовує навколо
+# свого exit. Тому пауза (у finally) не може змінити вже викликаний
+# exit-код (P16), і оператор бачить весь підсумок ДО очікування клавіші
+# (P17), а Wait-BRAVOManualExit викликається рівно один раз на цьому
+# шляху завершення (P18). SYSTEM/non-interactive/-NoPause не чекають —
+# рішення повністю всередині самої Wait-BRAVOManualExit (той самий
+# контракт, що й Archive/Health/Maintenance, жодної паралельної реалізації).
+try {
+    Complete-BRAVOHelperLog -ExitCode $script:selfTestExitCode
+} finally {
+    Wait-BRAVOManualExit -NoPause:$NoPause
+}
