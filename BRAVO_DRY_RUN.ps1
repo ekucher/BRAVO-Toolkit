@@ -409,9 +409,16 @@ function Get-RequiredCredentialDescriptors {
         })
     }
 
-    $sftpEnabled = (Test-SettingEnabled $componentSettings.SFTP.ArchiveUpload) -or
+    # componentSettings.SFTP.Enabled (5.2.2) вже "запечений" в ArchiveUpload
+    # і ScheduledSftpSyncRequired (canonical effective layer); явний AND
+    # потрібен лише для backupMonitoring.SFTP.Enabled (Health-моніторинг),
+    # яке master-вимикач теж нейтралізує — Health більше не торкається
+    # SFTP при глобально вимкненому destination.
+    $sftpEnabled = [bool]$storageEffective.SFTP.Enabled -and (
+        (Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) -or
         $bazaSyncEffective.ScheduledSftpSyncRequired -or
         (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
+    )
     if ($sftpEnabled) {
         [void]$descriptors.Add([pscustomobject]@{
             Name = "SFTP логін"
@@ -425,7 +432,7 @@ function Get-RequiredCredentialDescriptors {
         })
     }
 
-    $smbEnabled = Test-SettingEnabled $componentSettings.SMB.ArchiveCopy
+    $smbEnabled = Test-SettingEnabled $storageEffective.SMB.ArchiveCopy
     if ($smbEnabled) {
         [void]$descriptors.Add([pscustomobject]@{
             Name = "SMB логін"
@@ -1343,9 +1350,14 @@ try {
         Add-DryRunResult FAIL 'Цілісність' 'Compatibility module' "не знайдено: $compatibilityModulePath"
     }
 
-    $sftpConfigured = (Test-SettingEnabled $componentSettings.SFTP.ArchiveUpload) -or
+    # componentSettings.SFTP.Enabled (5.2.2): той самий вираз, що і для
+    # $sftpEnabled вище — WinSCP CLI/TCP-проба (нижче, $sftpRequired)
+    # не мають вимагатись для глобально вимкненого destination.
+    $sftpConfigured = [bool]$storageEffective.SFTP.Enabled -and (
+        (Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) -or
         $bazaSyncEffective.ScheduledSftpSyncRequired -or
         (Test-SettingEnabled $backupMonitoring.SFTP.Enabled)
+    )
     if ($sftpConfigured) {
         $configuredWinSCPPath = if (-not [string]::IsNullOrWhiteSpace([string]$winSCPPath)) {
             [string]$winSCPPath
@@ -1855,9 +1867,14 @@ try {
         } elseif (-not $TestAccess) {
             Add-DryRunResult WARN "SFTP" "Доступ" "не перевірявся; використайте -TestAccess"
         }
+    } elseif (-not [bool]$storageEffective.SFTP.Enabled) {
+        # componentSettings.SFTP.Enabled=false (5.2.2): явний PASS/SKIPPED
+        # рядок (не WARNING) — оператор має бачити ПРИЧИНУ відсутності
+        # SFTP-перевірок, а не мовчазну відсутність секції.
+        Add-DryRunResult PASS "SFTP" "ВИМКНЕНО ГЛОБАЛЬНО" ([string]$storageEffective.SFTP.DisabledReason)
     }
 
-    if (Test-SettingEnabled $componentSettings.SMB.ArchiveCopy) {
+    if (Test-SettingEnabled $storageEffective.SMB.ArchiveCopy) {
         $smbRoot = if (-not [string]::IsNullOrWhiteSpace([string]$smbSettings.RootPath)) {
             [string]$smbSettings.RootPath
         } else {
@@ -1884,6 +1901,8 @@ try {
         } elseif (-not $TestAccess) {
             Add-DryRunResult WARN "SMB" "Read-only доступ" "не перевірявся; використайте -TestAccess"
         }
+    } elseif (-not [bool]$storageEffective.SMB.Enabled) {
+        Add-DryRunResult PASS "SMB" "ВИМКНЕНО ГЛОБАЛЬНО" ([string]$storageEffective.SMB.DisabledReason)
     }
 
     if ($null -ne $schedulerSettings -and $null -ne $schedulerSettings.Backup) {

@@ -185,14 +185,23 @@ function Resolve-RequestedComponents {
                     [void]$resolved.Add("Archive")
                 }
 
-                $sftpRequired = [bool]$componentSettings.SFTP.ArchiveUpload -or
-                    [bool]$componentSettings.Synchronization.BAZA_APP_SFTP -or
+                # componentSettings.SFTP.Enabled (5.2.2): master AND child
+                # через canonical effective-шар. Фікс латентного 5.2.1-бага:
+                # формула пропускала BAZA_WWW_SFTP (сервер лише з
+                # WWW-синхронізацією не вважав SFTP-креденшели
+                # обов'язковими) — $bazaSyncEffective.ScheduledSftpSyncRequired
+                # покриває APP+WWW разом, той самий канонічний вираз, що
+                # Archive/Health.
+                $sftpRequired = [bool]$storageEffective.SFTP.Enabled -and (
+                    [bool]$storageEffective.SFTP.ArchiveUpload -or
+                    [bool]$bazaSyncEffective.ScheduledSftpSyncRequired -or
                     [bool]$backupMonitoring.SFTP.Enabled
+                )
                 if ($sftpRequired -and -not $resolved.Contains("SFTP")) {
                     [void]$resolved.Add("SFTP")
                 }
 
-                $smbRequired = [bool]$componentSettings.SMB.ArchiveCopy
+                $smbRequired = [bool]$storageEffective.SMB.ArchiveCopy
                 if ($smbRequired -and -not $resolved.Contains("SMB")) {
                     [void]$resolved.Add("SMB")
                 }

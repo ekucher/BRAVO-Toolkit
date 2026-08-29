@@ -586,6 +586,32 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "DryRun/CreatesMissingSftpDestination" `
         -Failure "dry-run має створювати відсутній SFTP-каталог призначення через CreateDirectory, а не блокувати інсталяцію повідомленням 'Dry Run не створює каталоги'"
+
+    # --- Dry Run: componentSettings.SFTP.Enabled/SMB.Enabled (5.2.2) —
+    # zero-network інваріант. $sftpEnabled/$sftpConfigured (дескриптори
+    # креденшелів, WinSCP CLI presence, TCP-проба host:22) і $smbEnabled
+    # (SMB-дескриптори, Test-SmbReadOnlyAccess) мають читати canonical
+    # effective-шар, а не сирий componentSettings — інакше глобально
+    # вимкнений destination все одно вимагав би креденшелів чи виконував
+    # мережеву TCP-пробу.
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunScriptTextForSftp.Contains('$sftpEnabled = [bool]$storageEffective.SFTP.Enabled -and (') -and
+            $dryRunScriptTextForSftp.Contains('$sftpConfigured = [bool]$storageEffective.SFTP.Enabled -and (') -and
+            $dryRunScriptTextForSftp.Contains('$smbEnabled = Test-SettingEnabled $storageEffective.SMB.ArchiveCopy') -and
+            $dryRunScriptTextForSftp.Contains('(Test-SettingEnabled $storageEffective.SFTP.ArchiveUpload) -or') -and
+            -not $dryRunScriptTextForSftp.Contains('Test-SettingEnabled $componentSettings.SMB.ArchiveCopy')
+        ) `
+        -Name "DryRun/StorageMasterSwitchGatesCredentialsAndNetworkProbes" `
+        -Failure "sftpEnabled/sftpConfigured/smbEnabled мають AND-итись з storageEffective.SFTP/SMB.Enabled — інакше глобально вимкнений destination усе одно вимагав би SFTP/SMB-креденшелів або виконував TCP-пробу host:22"
+    Test-BRAVOCondition `
+        -Condition (
+            $dryRunScriptTextForSftp.Contains('Add-DryRunResult PASS "SFTP" "ВИМКНЕНО ГЛОБАЛЬНО" ([string]$storageEffective.SFTP.DisabledReason)') -and
+            $dryRunScriptTextForSftp.Contains('Add-DryRunResult PASS "SMB" "ВИМКНЕНО ГЛОБАЛЬНО" ([string]$storageEffective.SMB.DisabledReason)')
+        ) `
+        -Name "DryRun/RendersExplicitPassWhenGloballyDisabled" `
+        -Failure "master-off має рендерити явний PASS 'ВИМКНЕНО ГЛОБАЛЬНО' з причиною (не WARNING, не мовчазна відсутність секції)"
+
     Test-BRAVOCondition `
         -Condition (
             $dryRunScriptTextForSftp.Contains('$dryRunModeLabel = if ($TestAccess)') -and
@@ -2742,6 +2768,23 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name 'CredentialsSetup/ProviderGroupsExpandToRouteSpecificTargets' `
         -Failure 'логічні групи -Component Discord/-Component Slack мусять розгортатись рівно в канальні General+Alerts дескриптори, а legacy літерали BRAVO_DISCORD_URL/BRAVO_SLACK_URL мають бути повністю відсутні в активному коді Credential Setup'
+
+    # --- CredentialsSetup: componentSettings.SFTP.Enabled (5.2.2) + фікс
+    # латентного 5.2.1-бага (BAZA_WWW_SFTP був відсутній у формулі
+    # $sftpRequired — сервер лише з WWW-синхронізацією не вважав SFTP
+    # креденшели обов'язковими). $bazaSyncEffective.ScheduledSftpSyncRequired
+    # покриває APP+WWW разом; master-вимикач гейтить усе "Required"-обчислення,
+    # explicit-меню лишається доступним завжди.
+    Test-BRAVOCondition `
+        -Condition (
+            $credentialsSetupScriptText.Contains('$sftpRequired = [bool]$storageEffective.SFTP.Enabled -and (') -and
+            $credentialsSetupScriptText.Contains('[bool]$bazaSyncEffective.ScheduledSftpSyncRequired -or') -and
+            $credentialsSetupScriptText.Contains('$smbRequired = [bool]$storageEffective.SMB.ArchiveCopy') -and
+            -not $credentialsSetupScriptText.Contains('[bool]$componentSettings.Synchronization.BAZA_APP_SFTP -or')
+        ) `
+        -Name 'CredentialsSetup/SftpRequiredCoversBothBazaDirectionsAndGlobalSwitch' `
+        -Failure 'sftpRequired має враховувати componentSettings.SFTP.Enabled і обидва напрямки BAZA (APP+WWW через canonical ScheduledSftpSyncRequired) — стара формула пропускала BAZA_WWW_SFTP'
+
     # Відновлюємо реальні модулі для решти self-test (наступні секції
     # покладаються на їх наявність, як і до цього ізольованого блоку).
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
@@ -4934,12 +4977,19 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('$bazaAppLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_LOCAL') -and
-            $archiveScriptText.Contains('$bazaAppSFTPSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_SFTP') -and
-            $archiveScriptText.Contains('$bazaWWWSFTPSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_SFTP') -and
+            # 5.2.2: SFTP-напрямки BAZA читаються через $bazaSyncEffective.Components
+            # (Get-BRAVOEffectiveSynchronizationConfiguration), а не напряму з
+            # componentSettings.Synchronization — canonical AND з глобальним
+            # componentSettings.SFTP.Enabled уже "запечений" в SftpEnabled,
+            # тому Archive не дублює цей вираз самостійно (LOCAL-напрямки
+            # від глобального SFTP-вимикача не залежать і лишаються прямим
+            # читанням componentSettings).
+            $archiveScriptText.Contains('$bazaAppSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq ''BAZA_APP'' } | Select-Object -First 1 -ExpandProperty SftpEnabled)') -and
+            $archiveScriptText.Contains('$bazaWWWSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq ''BAZA_WWW'' } | Select-Object -First 1 -ExpandProperty SftpEnabled)') -and
             $archiveScriptText.Contains('$bazaWWWLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL')
         ) `
         -Name "Discovery/ArchiveReadsExactlyFourBazaSyncFlags" `
-        -Failure "BRAVO.Archive.Runtime.ps1 має читати всі 4 прапорці BAZA окремими змінними"
+        -Failure "BRAVO.Archive.Runtime.ps1 має читати всі 4 прапорці BAZA окремими змінними (SFTP-напрямки — через canonical bazaSyncEffective.Components, LOCAL — напряму з componentSettings)"
 
     # BAZA_WWW optional-component contract (production incident, 2026-08,
     # LIMS acceptance: Apache/BAZA_WWW відсутній на сервері при
@@ -5087,6 +5137,31 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "Maintenance/AtomicUtf8RestoreMarker" `
         -Failure "маркер успішної реставрації має атомарно записуватися у UTF-8"
+
+    # --- Maintenance: Trace/SFTP-блок (5.2.2). До появи глобального
+    # вимикача цей блок відкривав WinSCP-сесію щоночі БЕЗ жодного
+    # SFTP-гейта (найбільша прогалина інвентаризації для 5.2.2). Тепер
+    # componentSettings.SFTP.Enabled=false пропускає credential-читання і
+    # спробу з'єднання ПОВНІСТЮ (нуль Credential Manager, нуль WinSCP);
+    # локальна архівація trace/exchangAPI (Invoke-BRAVOTraceArchiveMaintenance
+    # з -Session $null) продовжується так само, як і при недоступності SFTP
+    # з будь-якої іншої причини — розрізняється лише рівень логу
+    # (INFO замість WARNING).
+    $maintenanceTraceSftpGateIndex = $maintenanceScriptText.IndexOf('if (-not [bool]$storageEffective.SFTP.Enabled) {')
+    $maintenanceTraceSftpElseIndex = $maintenanceScriptText.IndexOf('} else {', $maintenanceTraceSftpGateIndex)
+    $maintenanceTraceCredentialReadIndex = $maintenanceScriptText.IndexOf('$traceSftpLogin = Get-BRAVOCredentialSecret -Target $traceSftpLoginTarget')
+    $maintenanceTraceSessionOpenIndex = $maintenanceScriptText.IndexOf('$traceSftpSession.Open($traceSessionOptions)')
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceTraceSftpGateIndex -ge 0 -and
+            $maintenanceTraceSftpElseIndex -gt $maintenanceTraceSftpGateIndex -and
+            $maintenanceTraceCredentialReadIndex -gt $maintenanceTraceSftpElseIndex -and
+            $maintenanceTraceSessionOpenIndex -gt $maintenanceTraceSftpElseIndex -and
+            $maintenanceScriptText.Contains('Write-Log -Message ([string]$storageEffective.SFTP.DisabledReason) -Level "INFO"')
+        ) `
+        -Name 'Maintenance/TraceSftpBlockGloballyDisabledSkipsCredentialsAndSession' `
+        -Failure 'componentSettings.SFTP.Enabled=false має пропускати credential-читання ($traceSftpLogin = Get-BRAVOCredentialSecret) і відкриття WinSCP-сесії ПОВНІСТЮ — обидва мусять залишатись у "else"-гілці (SFTP увімкнено), не досяжній при глобально вимкненому SFTP'
+
     Test-BRAVOCondition `
         -Condition (
             $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
@@ -12929,6 +13004,111 @@ function Get-BRAVOMaintenanceSummaryResult {
         }
     }
 
+    # ===== Scheduler/BAZASync: глобальний вимикач SFTP (5.2.2) =====
+    # componentSettings.SFTP.Enabled=false має зробити BAZASync-завдання
+    # непотрібним через ту саму ScheduledSftpSyncRequired-похідну, яку вже
+    # споживає BRAVO_TASKS_INSTALL.ps1 — installer не отримує окремого
+    # коду для master-вимикача. Асерти навмисно НЕ звіряють локалізований
+    # (кириличний) текст статусу з захопленого виводу дочірнього процесу
+    # (той самий ризик кодової сторінки, через який сусідні Scheduler/*
+    # тести вище звіряють лише англомовні маркери на кшталт "LIMSRoot"):
+    # ASCII-назва завдання "BRAVO BAZA Synchronization" з'являється двічі
+    # (рядок плану + заголовок підсумку), коли завдання заплановане, і
+    # рівно один раз (лише "вимкнено в конфігурації"), коли ні — рахунок
+    # входжень незалежний від кодової сторінки консолі.
+    $schedFixtureSftpBaseline = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false
+    $schedResultSftpBaseline = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpBaseline.ConfigPath
+    $schedBaselineBazaSyncOccurrences = ([regex]::Matches($schedResultSftpBaseline.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
+    Test-BRAVOCondition `
+        -Condition (
+            $schedResultSftpBaseline.ExitCode -eq 0 -and
+            $schedBaselineBazaSyncOccurrences -eq 2
+        ) `
+        -Name 'Scheduler/BazaSyncTaskPlannedWhenSftpEnabled' `
+        -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' (2 входження: план + підсумок); отримано входжень: $schedBaselineBazaSyncOccurrences, ExitCode=$($schedResultSftpBaseline.ExitCode)"
+
+    $schedFixtureSftpDisabled = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false
+    $schedSftpDisabledConfigText = [IO.File]::ReadAllText($schedFixtureSftpDisabled.ConfigPath, [Text.Encoding]::UTF8)
+    $schedSftpDisabledConfigText = [regex]::Replace(
+        $schedSftpDisabledConfigText, '(?s)(SFTP = @\{\r?\n\s*Enabled = )\$true', '${1}$false', 1)
+    [IO.File]::WriteAllText($schedFixtureSftpDisabled.ConfigPath, $schedSftpDisabledConfigText, (New-Object Text.UTF8Encoding($false)))
+    $schedResultSftpDisabled = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpDisabled.ConfigPath
+    $schedDisabledBazaSyncOccurrences = ([regex]::Matches($schedResultSftpDisabled.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
+    Test-BRAVOCondition `
+        -Condition (
+            $schedResultSftpDisabled.ExitCode -eq 0 -and
+            $schedDisabledBazaSyncOccurrences -eq 1
+        ) `
+        -Name 'Scheduler/BazaSyncTaskSkippedWhenSftpGloballyDisabled' `
+        -Failure "componentSettings.SFTP.Enabled=false має нейтралізувати завдання 'BRAVO BAZA Synchronization' (installer вважає це валідним DISABLED/SKIP станом, ExitCode=0, лише 1 входження назви замість плану+підсумку); отримано входжень: $schedDisabledBazaSyncOccurrences, ExitCode=$($schedResultSftpDisabled.ExitCode)"
+
+    foreach ($schedFixtureSftpRootToClean in @($schedFixtureSftpBaseline.Root, $schedFixtureSftpDisabled.Root)) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$schedFixtureSftpRootToClean) -and
+            (Test-Path -LiteralPath $schedFixtureSftpRootToClean -PathType Container)) {
+            Remove-Item -LiteralPath $schedFixtureSftpRootToClean -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # ===== Local-only mode (5.2.2): componentSettings.SFTP.Enabled=false +
+    # SMB.Enabled=false — валідна production-конфігурація. Наскрізний
+    # прогін реального BRAVO_DRY_RUN.ps1 (read-only) з герметичним
+    # конфігом підтверджує: обидва destination рендерять явний PASS
+    # "ВИМКНЕНО ГЛОБАЛЬНО" з причиною, і жоден SFTP/SMB credential-
+    # дескриптор не додається (нуль вимог до Credential Manager).
+    # -BreakLimsRootViaFakeService: той самий детермінований технічний
+    # прийом, що й у Scheduler-фікстурах вище — LIMSRoot/SystemLogRoot тут
+    # не досліджуються (окрема, вже покрита self-test-területом), лише
+    # SFTP/SMB-поведінка при local-only.
+    $localOnlyFixture = New-BRAVOSelfTestSchedulerFixtureConfig `
+        -BreakLimsRootViaFakeService $true -MaintenanceEnabled $false -RecoveryEnabled $false
+    $localOnlyConfigText = [IO.File]::ReadAllText($localOnlyFixture.ConfigPath, [Text.Encoding]::UTF8)
+    $localOnlyConfigText = [regex]::Replace(
+        $localOnlyConfigText, '(?s)(SFTP = @\{\r?\n\s*Enabled = )\$true', '${1}$false', 1)
+    $localOnlyConfigText = [regex]::Replace(
+        $localOnlyConfigText, '(?s)(SMB = @\{\r?\n\s*Enabled = )\$true', '${1}$false', 1)
+    [IO.File]::WriteAllText($localOnlyFixture.ConfigPath, $localOnlyConfigText, (New-Object Text.UTF8Encoding($false)))
+    # Захоплення виводу дочірнього процесу з кирилицею потребує явного
+    # UTF-8 OutputEncoding — інакше системна кодова сторінка ламає
+    # багатобайтові послідовності й (через зсув байтових меж) псує навіть
+    # сусідній ASCII-текст у тому самому рядку. Змінюємо/відновлюємо лише
+    # локально для цього виклику, без побічного впливу на решту self-test.
+    $localOnlyPreviousOutputEncoding = [Console]::OutputEncoding
+    try {
+        [Console]::OutputEncoding = [Text.Encoding]::UTF8
+        $localOnlyDryRunOutput = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                -File (Join-Path $root 'BRAVO_DRY_RUN.ps1') -ConfigPath $localOnlyFixture.ConfigPath 2>&1 | Out-String
+        )
+    } finally {
+        [Console]::OutputEncoding = $localOnlyPreviousOutputEncoding
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $localOnlyDryRunOutput.Contains('SFTP') -and
+            $localOnlyDryRunOutput.Contains('ВИМКНЕНО ГЛОБАЛЬНО') -and
+            $localOnlyDryRunOutput.Contains('componentSettings.SFTP.Enabled = $false') -and
+            $localOnlyDryRunOutput.Contains('componentSettings.SMB.Enabled = $false')
+        ) `
+        -Name 'LocalOnly/DryRunRendersExplicitDisabledForBothDestinations' `
+        -Failure 'BRAVO_DRY_RUN.ps1 з обома componentSettings.SFTP.Enabled/SMB.Enabled=false має явно показувати ВИМКНЕНО ГЛОБАЛЬНО з причиною для кожного destination'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $localOnlyDryRunOutput.Contains('SFTP логін') -and
+            -not $localOnlyDryRunOutput.Contains('SFTP пароль') -and
+            -not $localOnlyDryRunOutput.Contains('SMB логін') -and
+            -not $localOnlyDryRunOutput.Contains('SMB пароль')
+        ) `
+        -Name 'LocalOnly/DryRunRequiresZeroSftpSmbCredentials' `
+        -Failure 'local-only режим (обидва master-вимикачі false) не повинен додавати жодного SFTP/SMB credential-дескриптора в перевірку Credential Manager'
+    if (-not [string]::IsNullOrWhiteSpace([string]$localOnlyFixture.Root) -and
+        (Test-Path -LiteralPath $localOnlyFixture.Root -PathType Container)) {
+        Remove-Item -LiteralPath $localOnlyFixture.Root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+
     # ===== RUNTIME / DATA ROOTS, EFFECTIVE CONFIGPATH, SYSTEM PREFLIGHT =====
     # (ТЗ «production-grade runtime, Task Scheduler, log rotation…», §93-§116)
     # Жоден сценарій не керує реальними службами й не змінює production-дані:
@@ -13372,6 +13552,34 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (-not $syncDisabledComp.AnyEnabled) `
         -Name "Sync/05-DisabledMissingSourceDoesNotBlock" `
         -Failure "вимкнений BAZA_WWW не має вважатися увімкненим лише через відсутнє джерело"
+
+    # --- Sync/06: глобальний вимикач SFTP (5.2.2) гасить обидва напрямки ---
+    $syncGlobalOff = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $true; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $true; BAZA_WWW_LOCAL = $true } `
+        -BazaAppSource 'D:\LIMS-NEW\BAZA' -BazaWWWSource 'C:\Br-a-vo.web\www\BAZA' -BazaWWWDetection ([pscustomobject]@{ Success = $true; Reason = $null }) -SftpDirectories $syncSftpDirs `
+        -GlobalSftpEnabled $false
+    $syncGlobalOffWww = @($syncGlobalOff.Components | Where-Object { $_.Name -eq 'BAZA_WWW' })[0]
+    Test-BRAVOCondition `
+        -Condition (
+            -not $syncGlobalOff.ScheduledSftpSyncRequired -and
+            @($syncGlobalOff.RequiredSftpDestinations).Count -eq 0 -and
+            -not $syncGlobalOffWww.SftpEnabled -and
+            $syncGlobalOffWww.AnyEnabled
+        ) `
+        -Name "Sync/06-GlobalSftpDisabledDropsBothSftpDirections" `
+        -Failure "GlobalSftpEnabled=false має гасити APP+WWW SFTP (BAZASync не потрібне, destinations порожні), зберігаючи LOCAL-напрямок (AnyEnabled через LocalEnabled)"
+
+    # --- Sync/07: default GlobalSftpEnabled зберігає поведінку 5.2.1 ---
+    $syncGlobalDefault = Get-BRAVOEffectiveSynchronizationConfiguration `
+        -Synchronization @{ BAZA_APP_SFTP = $true; BAZA_APP_LOCAL = $false; BAZA_WWW_SFTP = $false; BAZA_WWW_LOCAL = $false } `
+        -BazaAppSource 'D:\LIMS-NEW\BAZA' -BazaWWWSource '' -BazaWWWDetection $null -SftpDirectories $syncSftpDirs
+    Test-BRAVOCondition `
+        -Condition (
+            $syncGlobalDefault.ScheduledSftpSyncRequired -and
+            (@($syncGlobalDefault.RequiredSftpDestinations) -contains 'baza_app')
+        ) `
+        -Name "Sync/07-GlobalSftpDefaultPreservesLegacyCallers" `
+        -Failure "виклик без -GlobalSftpEnabled (усі наявні 5.2.1-споживачі) має зберігати стару поведінку (default `$true)"
 
     # --- Scheduler/ExpectedPrincipalFromConfig: не хардкод, а з effective settings ---
     $principalService = Get-BRAVOExpectedSchedulerPrincipal -SchedulerSettings @{ RunAsUser = 'SYSTEM'; LogonType = 'ServiceAccount' }
@@ -14154,6 +14362,34 @@ function Write-BRAVOLog {
         -Name 'Archive/SyncBazaModeDoesNotGainNormalArchiveOperations' `
         -Failure 'if ($SyncBAZA) {...; return} має стояти в джерелі РАНІШЕ, ніж Write-BRAVOPlan/новий Initialize-BRAVOArchiveSteps основного backup-flow — інакше -SyncBAZA показав би План повного backup-flow'
 
+    # --- Archive: componentSettings.SFTP.Enabled=false (5.2.2) має давати
+    # -SyncBAZA чистий SKIPPED/exit 0 БЕЗ жодного звернення до
+    # Invoke-ManualBAZASFTPSynchronization (нуль credential-читань, нуль
+    # Test-SFTPConfig/Test-SFTPConnection/WinSCP). Раніше конфігурація без
+    # жодної увімкненої SFTP-цілі помилково давала exit 50 (SftpFailed) —
+    # навмисно вимкнений destination не є помилкою конфігурації.
+    $archiveSyncBazaGateIndex = $archiveScriptText.IndexOf('if (-not [bool]$storageEffective.SFTP.Enabled) {', $archiveMainSyncBazaIndex)
+    $archiveSyncBazaManualCallIndex = $archiveScriptText.IndexOf('$manualSyncResult = Invoke-ManualBAZASFTPSynchronization', $archiveMainSyncBazaIndex)
+    $archiveSyncBazaGateWindow = if ($archiveSyncBazaGateIndex -ge 0 -and $archiveSyncBazaManualCallIndex -gt $archiveSyncBazaGateIndex) {
+        $archiveScriptText.Substring($archiveSyncBazaGateIndex, $archiveSyncBazaManualCallIndex - $archiveSyncBazaGateIndex)
+    } else {
+        ''
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveMainSyncBazaIndex -ge 0 -and
+            $archiveSyncBazaGateIndex -gt $archiveMainSyncBazaIndex -and
+            $archiveSyncBazaManualCallIndex -gt $archiveSyncBazaGateIndex -and
+            $archiveSyncBazaGateWindow.Contains('$script:processExitCode = 0') -and
+            $archiveSyncBazaGateWindow.Contains("-Status 'SKIPPED'") -and
+            $archiveSyncBazaGateWindow.Contains('return') -and
+            -not $archiveSyncBazaGateWindow.Contains('Test-SFTPConfig') -and
+            -not $archiveSyncBazaGateWindow.Contains('Test-SFTPConnection') -and
+            -not $archiveSyncBazaGateWindow.Contains('Get-BRAVOCredentialSecret')
+        ) `
+        -Name 'Archive/SyncBazaGloballyDisabledSftpSkipsBeforeManualSync' `
+        -Failure 'componentSettings.SFTP.Enabled=false має зупиняти -SyncBAZA (exit 0, SKIPPED) ДО виклику Invoke-ManualBAZASFTPSynchronization — жодного Test-SFTPConfig/Test-SFTPConnection/credential-читання для глобально вимкненого SFTP'
+
     # --- Archive: embedded Health лишається ОДНИМ Archive-кроком незалежно
     # від внутрішнього статусу Invoke-BRAVOHealthCheck.
     Test-BRAVOCondition `
@@ -14267,6 +14503,54 @@ function Write-BRAVOLog {
         ) `
         -Name 'Health/StepTotalMatchesVisibleEnabledChecks' `
         -Failure "Initialize-BRAVOHealthSteps -Total має дорівнювати 3 (базові кроки) + по одному доданку на кожен реально розділений enable-прапорець кроку; відсутні доданки: $($healthTotalMissingTerms -join ', ')"
+
+    # --- Health: componentSettings.SFTP.Enabled/SMB.Enabled (5.2.2).
+    # Get-SFTPHealthIssues/Get-SMBHealthIssues мусять перевіряти глобальний
+    # вимикач ПЕРШИМ (до backupMonitoring.*.Enabled) — інакше реальний
+    # BAZA-sync (SynchronizeBeforeHealth) усередині Get-SFTPHealthIssues
+    # виконався б навіть при глобально вимкненому SFTP.
+    $healthSftpFuncIndex = $healthScriptText.IndexOf('function Get-SFTPHealthIssues')
+    $healthSftpMasterGateIndex = $healthScriptText.IndexOf('if (-not [bool]$storageEffective.SFTP.Enabled) {', $healthSftpFuncIndex)
+    $healthSftpBackupMonGateIndex = $healthScriptText.IndexOf('if (-not $backupMonitoring.SFTP.Enabled) {', $healthSftpFuncIndex)
+    $healthSmbFuncIndex = $healthScriptText.IndexOf('function Get-SMBHealthIssues')
+    $healthSmbMasterGateIndex = $healthScriptText.IndexOf('if (-not [bool]$storageEffective.SMB.Enabled) {', $healthSmbFuncIndex)
+    $healthSmbBackupMonGateIndex = $healthScriptText.IndexOf('if (-not [bool]$backupMonitoring.SMB.Enabled) {', $healthSmbFuncIndex)
+    Test-BRAVOCondition `
+        -Condition (
+            $healthSftpMasterGateIndex -gt $healthSftpFuncIndex -and
+            $healthSftpMasterGateIndex -lt $healthSftpBackupMonGateIndex -and
+            $healthSmbMasterGateIndex -gt $healthSmbFuncIndex -and
+            $healthSmbMasterGateIndex -lt $healthSmbBackupMonGateIndex
+        ) `
+        -Name 'Health/StorageMasterSwitchGatesPrecedeBackupMonitoringGates' `
+        -Failure 'componentSettings.SFTP.Enabled/SMB.Enabled мусять перевірятися ПЕРШИМИ всередині Get-SFTPHealthIssues/Get-SMBHealthIssues — інакше реальний BAZA-sync (SynchronizeBeforeHealth) чи New-PSDrive виконався б навіть при глобально вимкненому destination'
+
+    # --- Health: BAZA_APP/BAZA_WWW SFTP-напрямки читаються через
+    # canonical $bazaSyncEffective.Components (той самий вираз, що Archive)
+    # — componentSettings.SFTP.Enabled уже "запечений" в SftpEnabled.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('$bazaAppSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq ''BAZA_APP'' } | Select-Object -First 1 -ExpandProperty SftpEnabled)') -and
+            $healthScriptText.Contains('$bazaWWWSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq ''BAZA_WWW'' } | Select-Object -First 1 -ExpandProperty SftpEnabled)') -and
+            $healthScriptText.Contains('[bool]$storageEffective.SFTP.ArchiveUpload') -and
+            $healthScriptText.Contains('[bool]$storageEffective.SMB.ArchiveCopy')
+        ) `
+        -Name 'Health/SftpSmbEnableFlagsUseCanonicalEffectiveLayer' `
+        -Failure 'sftpArchivesHealthEnabled/smbCredentialRequired і BAZA SFTP-напрямки мають читати ефективні (master AND child) значення з canonical bazaSyncEffective/storageEffective, а не сирий componentSettings'
+
+    # --- Health: SftpVerified/SmbVerified не мають підтверджувати
+    # непроведену перевірку — той самий принцип, що deferred-by-busy-WinSCP
+    # (5.2.1): нуль issues при глобально вимкненому destination означає
+    # «не перевіряли», а не «перевірено успішно».
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains('if (-not [bool]$storageEffective.SFTP.Enabled) {') -and
+            $healthScriptText.Contains('$destinationSummary.SftpVerified = $false') -and
+            $healthScriptText.Contains('if (-not [bool]$storageEffective.SMB.Enabled) {') -and
+            $healthScriptText.Contains('$destinationSummary.SmbVerified = $false')
+        ) `
+        -Name 'Health/DestinationSummaryNeverClaimsVerifiedWhenGloballyDisabled' `
+        -Failure 'SftpVerified/SmbVerified мають примусово ставати $false, коли відповідний componentSettings.*.Enabled=false — інакше нуль issues (нічого не перевірено) читався б як "перевірено успішно"'
 
     # --- Health: "Керовані служби"/"Локальні резервні копії" лишаються
     # ОДНИМ кроком кожен (не розділені), але отримують компактні

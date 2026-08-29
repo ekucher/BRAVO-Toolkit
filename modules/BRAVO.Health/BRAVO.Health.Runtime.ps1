@@ -514,10 +514,13 @@ function Test-BRAVOSettingEnabled {
 
 $bazaAppLocalHealthEnabled = Test-BRAVOSettingEnabled `
     -Value $componentSettings.Synchronization.BAZA_APP_LOCAL
-$bazaAppSFTPHealthEnabled = Test-BRAVOSettingEnabled `
-    -Value $componentSettings.Synchronization.BAZA_APP_SFTP
-$bazaWWWSFTPHealthEnabled = Test-BRAVOSettingEnabled `
-    -Value $componentSettings.Synchronization.BAZA_WWW_SFTP
+# SFTP-напрямки BAZA (5.2.2): через canonical $bazaSyncEffective.Components
+# (Get-BRAVOEffectiveSynchronizationConfiguration), той самий вираз, що і
+# в Archive/Дry Run — componentSettings.SFTP.Enabled уже "запечений" в
+# SftpEnabled, Health не дублює AND самостійно. LOCAL-напрямки від
+# глобального SFTP-вимикача не залежать і лишаються прямим читанням.
+$bazaAppSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
+$bazaWWWSFTPHealthEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
 $bazaWWWLocalHealthEnabled = Test-BRAVOSettingEnabled `
     -Value $componentSettings.Synchronization.BAZA_WWW_LOCAL
 
@@ -602,9 +605,14 @@ $script:sftpUrl = $null
 # $sftpCredentialRequired (нижче) лишається ЇХНІМ OR — той самий
 # consumer (BRAVOHealthSftpStepEnabled, підсумок Complete-BRAVOHealthResult)
 # і той самий сигнал про потребу в credential, що й раніше.
+# componentSettings.SFTP.Enabled (5.2.2): $storageEffective.SFTP.ArchiveUpload
+# уже "запечений" master AND child; bazaApp/WwwSFTPHealthEnabled вище так
+# само вже effective через $bazaSyncEffective.Components — тому явний AND
+# з $storageEffective.SFTP.Enabled тут не потрібен для цих трьох, окрім
+# ArchiveUpload-терму нижче (той досі читав raw componentSettings).
 $sftpArchivesHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
     [bool]$backupMonitoring.SFTP.CheckArchiveUploads -and
-    [bool]$componentSettings.SFTP.ArchiveUpload
+    [bool]$storageEffective.SFTP.ArchiveUpload
 $sftpBazaAppHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
     [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
     $bazaAppSFTPHealthEnabled
@@ -612,7 +620,7 @@ $sftpBazaWWWHealthEnabled = [bool]$backupMonitoring.SFTP.Enabled -and
     [bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
     $bazaWWWSFTPHealthEnabled
 $sftpCredentialRequired = [bool]$backupMonitoring.SFTP.Enabled -and
-    (([bool]$backupMonitoring.SFTP.CheckArchiveUploads -and [bool]$componentSettings.SFTP.ArchiveUpload) -or
+    (([bool]$backupMonitoring.SFTP.CheckArchiveUploads -and [bool]$storageEffective.SFTP.ArchiveUpload) -or
     ([bool]$backupMonitoring.SFTP.CheckBAZASynchronization -and
     ($bazaAppSFTPHealthEnabled -or $bazaWWWSFTPHealthEnabled)))
 if ($sftpCredentialRequired -and $credentialHelperLoaded) {
@@ -656,7 +664,7 @@ if ($sftpCredentialRequired -and $credentialHelperLoaded) {
 
 $smbCredentialRequired = [bool]$backupMonitoring.SMB.Enabled -and
     [bool]$backupMonitoring.SMB.CheckArchiveCopies -and
-    [bool]$componentSettings.SMB.ArchiveCopy
+    [bool]$storageEffective.SMB.ArchiveCopy
 if ($smbCredentialRequired -and $credentialHelperLoaded) {
     try {
         $smbLoginTarget = [string]$credentialSettings.Targets.SMBLogin
@@ -3022,6 +3030,15 @@ function Invoke-WinSCPBAZAComparison {
 
 function Get-SFTPHealthIssues {
     $issues = @()
+    # componentSettings.SFTP.Enabled=false (5.2.2): глобальний вимикач
+    # перевіряється ПЕРШИМ, до backupMonitoring.SFTP.Enabled — не лише
+    # блокує читання/сповіщення про SFTP-стан, а й запобігає реальному
+    # BAZA-sync нижче в цій функції (SynchronizeBeforeHealth відкриває
+    # WinSCP-сесію через Invoke-BRAVOBazaComponentSyncSession).
+    if (-not [bool]$storageEffective.SFTP.Enabled) {
+        Write-HealthLog "SFTP health-check пропущено: $([string]$storageEffective.SFTP.DisabledReason)" -Level "INFO"
+        return @()
+    }
     if (-not $backupMonitoring.SFTP.Enabled) {
         Write-HealthLog "Незалежну SFTP-перевірку вимкнено в конфігурації" -Level "INFO"
         return @()
@@ -3447,6 +3464,13 @@ function New-BRAVOSMBHealthDrive {
 
 function Get-SMBHealthIssues {
     $issues = @()
+    # componentSettings.SMB.Enabled=false (5.2.2): глобальний вимикач
+    # перевіряється ПЕРШИМ, до backupMonitoring.SMB.Enabled — жодного
+    # New-PSDrive/UNC-звернення для глобально вимкненого destination.
+    if (-not [bool]$storageEffective.SMB.Enabled) {
+        Write-HealthLog "NAS/SMB health-check пропущено: $([string]$storageEffective.SMB.DisabledReason)" -Level "INFO"
+        return @()
+    }
     if (-not [bool]$backupMonitoring.SMB.Enabled) {
         Write-HealthLog "Незалежну NAS/SMB-перевірку вимкнено в конфігурації" -Level "INFO"
         return @()
@@ -4219,7 +4243,7 @@ function New-SlackSuccessMessage {
 
     if ($backupMonitoring.SFTP.Enabled -and
         $backupMonitoring.SFTP.CheckArchiveUploads -and
-        $componentSettings.SFTP.ArchiveUpload) {
+        [bool]$storageEffective.SFTP.ArchiveUpload) {
         $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":cloud:" -Name "SFTP"))
     }
     if ($backupMonitoring.SFTP.Enabled -and
@@ -4240,7 +4264,7 @@ function New-SlackSuccessMessage {
     }
     if ($backupMonitoring.SMB.Enabled -and
         $backupMonitoring.SMB.CheckArchiveCopies -and
-        $componentSettings.SMB.ArchiveCopy) {
+        [bool]$storageEffective.SMB.ArchiveCopy) {
         $resultLines.Add((Format-BRAVOOperatorStatusLine -Status SUCCESS -Icon ":minidisc:" -Name "SMB"))
     }
 
@@ -5337,11 +5361,23 @@ if ($sftpBazaWWWHealthEnabled) {
         -Details $(if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) { $sftpDeferredDetails } else { Get-BRAVOHealthStepDetails -IssueCount $sftpBazaWWWStepIssues.Count })
 }
 if (-not $sftpArchivesHealthEnabled -and -not $sftpBazaAppHealthEnabled -and -not $sftpBazaWWWHealthEnabled) {
-    Write-HealthLog "SFTP health-check пропущено: усі SFTP-перевірки вимкнено в конфігурації"
+    # componentSettings.SFTP.Enabled=false (5.2.2): та сама "усі кроки
+    # вимкнено -> кроки мовчки відсутні" 5.2.1-конвенція (Total нижче не
+    # рахує їх, denominator звужується), але причина в лозі відрізняється
+    # від "оператор вимкнув усі дочірні прапорці" — явно цитуємо
+    # DisabledReason, коли причина саме глобальний вимикач.
+    if (-not [bool]$storageEffective.SFTP.Enabled) {
+        Write-HealthLog "SFTP health-check пропущено: $([string]$storageEffective.SFTP.DisabledReason)"
+    } else {
+        Write-HealthLog "SFTP health-check пропущено: усі SFTP-перевірки вимкнено в конфігурації"
+    }
 }
 
 Write-BRAVOProgressPhase -Phase 'NAS/SMB' -PercentComplete 80
 $smbHealthIssues = @(Get-SMBHealthIssues)
+if (-not $script:BRAVOHealthSmbStepEnabled -and -not [bool]$storageEffective.SMB.Enabled) {
+    Write-HealthLog "NAS/SMB health-check пропущено: $([string]$storageEffective.SMB.DisabledReason)"
+}
 if ($script:BRAVOHealthSmbStepEnabled) {
     Write-BRAVOHealthStep `
         -Name 'NAS/SMB' `
@@ -5360,6 +5396,17 @@ if ($script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) {
     # Відкладена SFTP-перевірка не має оголошуватись підтвердженою: нуль
     # issues означає «не перевіряли», а не «перевірено успішно».
     $destinationSummary.SftpVerified = $false
+}
+if (-not [bool]$storageEffective.SFTP.Enabled) {
+    # componentSettings.SFTP.Enabled=false (5.2.2): Get-SFTPHealthIssues
+    # повертає @() ще до будь-якої перевірки — той самий принцип, що й
+    # deferred вище: нуль issues тут означає «глобально вимкнено», а не
+    # «перевірено успішно». JSON/notification-споживачі SftpVerified не
+    # мають читати відсутність перевірки як підтвердження.
+    $destinationSummary.SftpVerified = $false
+}
+if (-not [bool]$storageEffective.SMB.Enabled) {
+    $destinationSummary.SmbVerified = $false
 }
 
 if ($healthIssues.Count -eq 0) {

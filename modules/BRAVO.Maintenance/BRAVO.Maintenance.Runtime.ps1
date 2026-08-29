@@ -2993,6 +2993,25 @@ function Get-BRAVOExchangeApiLogFiles {
     return @($uniqueFiles | Sort-Object -Property LastWriteTime, Name)
 }
 
+function Test-BRAVOIsTimestampedExchangeApiLogName {
+    # exchangAPI (5.2.2): відрізняє вже унікальне джерельне ім'я
+    # "<Base>_yyyy-MM-dd_HHmmss.log" (сучасний формат — timestamp сам собою є
+    # частиною ідентичності/audit trail файла, той самий формат, що поточна
+    # НЕ-legacy ротація exchangAPI зберігає через NamingPolicy='Original')
+    # від старих sequence-стильних legacy-імен (exchangAPI.log/exchangAPI_1.log/
+    # exchangAPI_2.log), які й далі проходять стару послідовну нумерацію під
+    # час одноразової legacy-міграції нижче (Invoke-BRAVOLegacyLogMigration).
+    # Виявлено на продакшені: sequence-гілка перейменовувала такі файли в
+    # exchangAPI_N.log, знищуючи timestamp безповоротно.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    return [regex]::IsMatch(
+        $Name,
+        '^exchangAPI_\d{4}-\d{2}-\d{2}_\d{6}\.log$',
+        [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+}
+
 function Get-BRAVOApacheLogFiles {
     # Тільки журнали. У apache\logs поруч лежать httpd.pid, *.lock і
     # тимчасові файли: переміщення httpd.pid зупиненого Apache — це
@@ -4571,7 +4590,11 @@ function Invoke-BRAVOLegacyLogMigration {
     #     (так їх складав колишній exchangAPI-код). Вони отримують каталог-дату
     #     за власним LastWriteTime і проходять через sequence engine, тобто
     #     одразу стають частиною нормального життєвого циклу, а не осідають
-    #     назавжди поза межами будь-якої політики.
+    #     назавжди поза межами будь-якої політики. Виняток (5.2.2):
+    #     exchangAPI-файли, чиє ім'я вже унікальне (timestamped формат
+    #     застосунку, exchangAPI_yyyy-MM-dd_HHmmss.log) — вони зберігають
+    #     оригінальне ім'я плоско в корені призначення (Test-BRAVOIsTimestampedExchangeApiLogName),
+    #     той самий контракт, що поточна НЕ-legacy ротація exchangAPI.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$LegacyPath,
@@ -4635,6 +4658,33 @@ function Invoke-BRAVOLegacyLogMigration {
         $isLooseLogAtRoot = $isAtLegacyRoot -and
             ([string]$legacyFile.Extension) -ine '.mdz'
         if ($isLooseLogAtRoot) {
+            # exchangAPI (5.2.2, продакшен-знахідка): джерело вже може мати
+            # унікальне timestamped ім'я застосунку (exchangAPI_yyyy-MM-dd_
+            # HHmmss.log) — sequence-гілка нижче знищила б timestamp,
+            # перейменувавши файл у exchangAPI_N.log. Такі імена зберігаються
+            # ЯК Є (NamingPolicy='Original', плоско в корінь призначення —
+            # той самий контракт, що вже застосовує поточна НЕ-legacy
+            # ротація, Invoke-BRAVOExchangeApiLogRotation). Старі sequence-
+            # стильні legacy-імена (exchangAPI.log/exchangAPI_1.log) й далі
+            # йдуть через попередню гілку нижче без змін.
+            if (([string]$LogicalBaseName) -ieq 'exchangAPI' -and
+                (Test-BRAVOIsTimestampedExchangeApiLogName -Name $legacyFile.Name)) {
+                $originalMoveResult = Move-BRAVOLogWithSequence `
+                    -SourcePath $legacyFile.FullName `
+                    -DestinationDirectory $DestinationPath `
+                    -NamingPolicy 'Original' `
+                    -SkipIfEmpty $false `
+                    -RetryCount $RetryCount `
+                    -RetryDelaySeconds $RetryDelaySeconds `
+                    -Logger $Logger
+                if ([string]$originalMoveResult.Status -eq 'MOVED') {
+                    $migratedCount++
+                } else {
+                    $failedCount++
+                }
+                continue
+            }
+
             $dateFolder = $legacyFile.LastWriteTime.ToString('yyyy-MM-dd')
             $moveResult = Move-BRAVOLogWithSequence `
                 -SourcePath $legacyFile.FullName `
@@ -8480,50 +8530,65 @@ if (-not $BravoMaintenanceEnabled) {
         # (Credential Manager -> Resolve-BRAVOSftpHostName -> New-BRAVOSftpUrl
         # -> WinSCP .NET). Недоступність креденшлів/WinSCP — НЕ критична:
         # архіви оновлюються локально, передача відкладається.
-        try {
-            $traceSftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
-            $traceSftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
-            if ([string]::IsNullOrWhiteSpace($traceSftpLoginTarget)) { $traceSftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
-            if ([string]::IsNullOrWhiteSpace($traceSftpPasswordTarget)) { $traceSftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
-            $traceSftpLogin = Get-BRAVOCredentialSecret -Target $traceSftpLoginTarget
-            $traceSftpPassword = Get-BRAVOCredentialSecret -Target $traceSftpPasswordTarget
-            if ([string]::IsNullOrWhiteSpace($traceSftpLogin) -or [string]::IsNullOrWhiteSpace($traceSftpPassword)) {
-                throw "записи Credential Manager '$traceSftpLoginTarget'/'$traceSftpPasswordTarget' недоступні"
-            }
-            $traceSftpLogin = ([string]$traceSftpLogin).Trim()
-            $traceResolvedSftpHost = Resolve-BRAVOSftpHostName `
-                -UserName $traceSftpLogin `
-                -HostTemplate ([string]$sftpHostTemplate) `
-                -FallbackHostName $(if ($null -ne (Get-Variable -Name 'sftpHost' -Scope Global -ErrorAction SilentlyContinue)) { [string](Get-Variable -Name 'sftpHost' -Scope Global).Value } else { $null })
-            $traceRepositorySftpUrl = New-BRAVOSftpUrl `
-                -HostName $traceResolvedSftpHost `
-                -Port ([int]$sftpPort) `
-                -UserName $traceSftpLogin `
-                -Password ([string]$traceSftpPassword)
-            $traceSftpPassword = $null
-            $traceWinScpComponents = Get-BRAVOWinSCPDotNetComponents -WinSCPPath ([string]$winSCPPath)
-            if ($null -eq $traceWinScpComponents) {
-                throw 'WinSCP .NET-компоненти (WinSCPnet.dll + winscp.exe) не знайдено'
-            }
-            if ($null -eq ('WinSCP.Session' -as [type])) {
-                Add-Type -Path $traceWinScpComponents.AssemblyPath -ErrorAction Stop
-            }
-            $traceSessionOptions = New-Object WinSCP.SessionOptions
-            $traceSessionOptions.ParseUrl($traceRepositorySftpUrl)
-            $traceRepositorySftpUrl = $null
-            $traceSessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
-            $traceSessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(15, [int]$sftpConnectionTimeoutSeconds))
-            $traceSftpSession = New-Object WinSCP.Session
-            $traceSftpSession.ExecutablePath = $traceWinScpComponents.ExecutablePath
-            $traceSftpSession.Open($traceSessionOptions)
-        } catch {
-            if ($null -ne $traceSftpSession) {
-                try { $traceSftpSession.Dispose() } catch {
-                    # Сесія так і не відкрилась; збій Dispose не значущий.
+        #
+        # componentSettings.SFTP.Enabled=false (5.2.2): цей блок раніше
+        # не мав ЖОДНОГО SFTP-гейта й відкривав сесію щоночі незалежно від
+        # конфігурації дестинацій. Тепер при глобально вимкненому SFTP
+        # credential-читання і спроба WinSCP-з'єднання пропускаються
+        # ПОВНІСТЮ (нуль Credential Manager, нуль WinSCP) — $traceSftpSession
+        # лишається $null, і решта блоку (Invoke-BRAVOTraceArchiveMaintenance,
+        # remote-міграції) деградує до локального режиму так само, як і при
+        # недоступності SFTP з будь-якої іншої причини нижче; різниця лише
+        # у рівні логу (INFO замість WARNING — це не збій, а свідома
+        # конфігурація).
+        if (-not [bool]$storageEffective.SFTP.Enabled) {
+            Write-Log -Message ([string]$storageEffective.SFTP.DisabledReason) -Level "INFO"
+        } else {
+            try {
+                $traceSftpLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
+                $traceSftpPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
+                if ([string]::IsNullOrWhiteSpace($traceSftpLoginTarget)) { $traceSftpLoginTarget = 'BRAVO_SFTP_LOGIN' }
+                if ([string]::IsNullOrWhiteSpace($traceSftpPasswordTarget)) { $traceSftpPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
+                $traceSftpLogin = Get-BRAVOCredentialSecret -Target $traceSftpLoginTarget
+                $traceSftpPassword = Get-BRAVOCredentialSecret -Target $traceSftpPasswordTarget
+                if ([string]::IsNullOrWhiteSpace($traceSftpLogin) -or [string]::IsNullOrWhiteSpace($traceSftpPassword)) {
+                    throw "записи Credential Manager '$traceSftpLoginTarget'/'$traceSftpPasswordTarget' недоступні"
                 }
+                $traceSftpLogin = ([string]$traceSftpLogin).Trim()
+                $traceResolvedSftpHost = Resolve-BRAVOSftpHostName `
+                    -UserName $traceSftpLogin `
+                    -HostTemplate ([string]$sftpHostTemplate) `
+                    -FallbackHostName $(if ($null -ne (Get-Variable -Name 'sftpHost' -Scope Global -ErrorAction SilentlyContinue)) { [string](Get-Variable -Name 'sftpHost' -Scope Global).Value } else { $null })
+                $traceRepositorySftpUrl = New-BRAVOSftpUrl `
+                    -HostName $traceResolvedSftpHost `
+                    -Port ([int]$sftpPort) `
+                    -UserName $traceSftpLogin `
+                    -Password ([string]$traceSftpPassword)
+                $traceSftpPassword = $null
+                $traceWinScpComponents = Get-BRAVOWinSCPDotNetComponents -WinSCPPath ([string]$winSCPPath)
+                if ($null -eq $traceWinScpComponents) {
+                    throw 'WinSCP .NET-компоненти (WinSCPnet.dll + winscp.exe) не знайдено'
+                }
+                if ($null -eq ('WinSCP.Session' -as [type])) {
+                    Add-Type -Path $traceWinScpComponents.AssemblyPath -ErrorAction Stop
+                }
+                $traceSessionOptions = New-Object WinSCP.SessionOptions
+                $traceSessionOptions.ParseUrl($traceRepositorySftpUrl)
+                $traceRepositorySftpUrl = $null
+                $traceSessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+                $traceSessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(15, [int]$sftpConnectionTimeoutSeconds))
+                $traceSftpSession = New-Object WinSCP.Session
+                $traceSftpSession.ExecutablePath = $traceWinScpComponents.ExecutablePath
+                $traceSftpSession.Open($traceSessionOptions)
+            } catch {
+                if ($null -ne $traceSftpSession) {
+                    try { $traceSftpSession.Dispose() } catch {
+                        # Сесія так і не відкрилась; збій Dispose не значущий.
+                    }
+                }
+                $traceSftpSession = $null
+                Write-Log -Message "Trace: SFTP-сесія недоступна ($($_.Exception.Message)) — добові архіви оновлюються локально, передачу відкладено" -Level "WARNING"
             }
-            $traceSftpSession = $null
-            Write-Log -Message "Trace: SFTP-сесія недоступна ($($_.Exception.Message)) — добові архіви оновлюються локально, передачу відкладено" -Level "WARNING"
         }
 
         # Одноразова (idempotent) автоміграція legacy /trace -> /logs/trace:

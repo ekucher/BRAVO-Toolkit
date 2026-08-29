@@ -639,6 +639,63 @@ function Assert-BravoLoadedConfiguration {
         throw 'componentSettings повинен бути хеш-таблицею.'
     }
 
+    # Глобальні вимикачі зовнішніх сховищ (з 5.2.2): деплойнуті
+    # BRAVO.config можуть передувати цій версії і не мати ключа Enabled —
+    # консумери читають effective-значення напряму й під StrictMode падали
+    # б на відсутньому ключі. Відсутній ключ = $true (поведінка 5.2.1).
+    # Явне не-bool значення — канонічна помилка конфігурації, а не тихе
+    # приведення: помилкове $true продовжило б мережеві операції, які
+    # оператор намагався вимкнути, помилкове $false — тихо зупинило б
+    # offsite-копії; безпечного напрямку коерції тут немає.
+    foreach ($storageDestinationName in @('SFTP', 'SMB')) {
+        if (-not $global:componentSettings.Contains($storageDestinationName)) { continue }
+        $storageDestinationNode = $global:componentSettings[$storageDestinationName]
+        if (-not ($storageDestinationNode -is [hashtable])) { continue }
+        if (-not $storageDestinationNode.Contains('Enabled')) {
+            $storageDestinationNode.Enabled = $true
+        } elseif (-not ($storageDestinationNode.Enabled -is [bool])) {
+            throw ("componentSettings.{0}.Enabled = '{1}' некоректне: головний вимикач сховища приймає лише `$true або `$false." -f `
+                $storageDestinationName, [string]$storageDestinationNode.Enabled)
+        }
+    }
+
+    # Канонічний продюсер $global:storageEffective — Config Loader (тут),
+    # ПІСЛЯ нормалізації: новий BRAVO.config обчислює його й сам (він
+    # потрібен деривації bazaSyncEffective всередині конфігу), але
+    # деплойнутий конфіг 5.2.1 цього коду не має. Перерахунок idempotent —
+    # однакові нормалізовані вхідні дані дають однаковий результат.
+    if (Get-Command -Name 'Get-BRAVOEffectiveStorageConfiguration' -ErrorAction SilentlyContinue) {
+        $global:storageEffective = Get-BRAVOEffectiveStorageConfiguration `
+            -ComponentSettings $global:componentSettings
+    }
+
+    # Узгодження деривацій для деплойнутого BRAVO.config без підтримки
+    # master-вимикача: старий конфіг обчислює bazaSyncEffective і
+    # schedulerSettings.BAZASync.Enabled БЕЗ урахування SFTP.Enabled
+    # (наприклад, коли оператор вимкнув SFTP через BRAVO.local.config).
+    # Новий BRAVO.config робить це сам — тоді значення вже узгоджені й
+    # цей блок нічого не змінює.
+    if ($null -ne (Get-Variable -Name 'storageEffective' -Scope Global -ErrorAction SilentlyContinue) -and
+        -not [bool]$global:storageEffective.SFTP.Enabled) {
+        $bazaSyncEffectiveVariable = Get-Variable -Name 'bazaSyncEffective' -Scope Global -ErrorAction SilentlyContinue
+        if ($null -ne $bazaSyncEffectiveVariable -and $null -ne $bazaSyncEffectiveVariable.Value) {
+            $legacyBazaSyncEffective = $bazaSyncEffectiveVariable.Value
+            foreach ($bazaSyncComponent in @($legacyBazaSyncEffective.Components)) {
+                $bazaSyncComponent.SftpEnabled = $false
+                $bazaSyncComponent.AnyEnabled = [bool]$bazaSyncComponent.LocalEnabled
+            }
+            $legacyBazaSyncEffective.ScheduledSftpSyncRequired = $false
+            $legacyBazaSyncEffective.RequiredSftpDestinations = @()
+        }
+        $schedulerSettingsVariable = Get-Variable -Name 'schedulerSettings' -Scope Global -ErrorAction SilentlyContinue
+        if ($null -ne $schedulerSettingsVariable -and
+            $schedulerSettingsVariable.Value -is [hashtable] -and
+            $schedulerSettingsVariable.Value.Contains('BAZASync') -and
+            $schedulerSettingsVariable.Value.BAZASync -is [hashtable]) {
+            $schedulerSettingsVariable.Value.BAZASync.Enabled = $false
+        }
+    }
+
     Assert-BravoDataRootsAreIndependent -PathSettings $global:pathSettings
 }
 
