@@ -53,7 +53,7 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Push-Location artifacts\release\staging
           try {
-              .\BRAVO_SELF_TEST.ps1
+              .\BRAVO_SELF_TEST.ps1 -NoPause
               if ($LASTEXITCODE -ne 0) {
                   Write-Host "::error::BRAVO_SELF_TEST.ps1 (artifact staging) exited with code $LASTEXITCODE"
                   exit 1
