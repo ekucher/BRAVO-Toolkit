@@ -32,6 +32,9 @@ Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.p
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Model.psm1') -Force
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Validation.psm1') -Force
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Persistence.psm1') -Force
+Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Credentials.psm1') -Force
+Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Presets.psm1') -Force
+Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Preview.psm1') -Force
 
 $configuratorFixtureRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_CONFIGURATOR_SELFTEST_RUNTIME_{0}" -f [guid]::NewGuid().ToString('N'))
@@ -402,6 +405,172 @@ $settingScenarioM = @($modelScenarioM | Where-Object { $_.Path -eq 'componentSet
 Test-BRAVOCondition ($settingScenarioM.Count -eq 1 -and [bool]$settingScenarioM[0].EffectiveValue -eq $false -and [string]::IsNullOrWhiteSpace([string]$settingScenarioM[0].DisabledReason)) `
     'Configurator 5.2.2 Scenario M: BAZA_APP_SFTP raw=false + SFTP.Enabled=false -> DisabledReason НЕ приписується master-у (власний вибір оператора)' `
     "Effective=$($settingScenarioM[0].EffectiveValue) DisabledReason=$($settingScenarioM[0].DisabledReason)"
+
+# ===== P1.7 Credentials: requirement-формула (детерміновано, без
+# звернення до Credential Manager — CI-гермет) =====
+
+# N: SFTP master OFF -> Required=false, незалежно від child-прапорців.
+$credentialEffectiveSftpOff = [pscustomobject]@{
+    storageEffective  = [pscustomobject]@{
+        SFTP = [pscustomobject]@{ Enabled = $false; ArchiveUpload = $false; DisabledReason = 'SFTP глобально вимкнено (componentSettings.SFTP.Enabled = $false)' }
+        SMB  = [pscustomobject]@{ Enabled = $true; ArchiveCopy = $false; DisabledReason = $null }
+    }
+    bazaSyncEffective = [pscustomobject]@{ ScheduledSftpSyncRequired = $false }
+    backupMonitoring  = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true }; SMB = [pscustomobject]@{ Enabled = $true } }
+}
+$credentialRequirementSftpOff = Get-BRAVOConfiguratorCredentialRequirement -EffectiveConfig $credentialEffectiveSftpOff
+Test-BRAVOCondition (-not $credentialRequirementSftpOff.SFTP.Required) `
+    'Configurator Credentials: SFTP master OFF -> SFTP credentials НЕ обов''язкові' `
+    "Required=$($credentialRequirementSftpOff.SFTP.Required)"
+
+# O: SFTP master ON + ArchiveUpload=true -> Required=true.
+$credentialEffectiveSftpOn = [pscustomobject]@{
+    storageEffective  = [pscustomobject]@{
+        SFTP = [pscustomobject]@{ Enabled = $true; ArchiveUpload = $true; DisabledReason = $null }
+        SMB  = [pscustomobject]@{ Enabled = $true; ArchiveCopy = $false; DisabledReason = $null }
+    }
+    bazaSyncEffective = [pscustomobject]@{ ScheduledSftpSyncRequired = $false }
+    backupMonitoring  = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $false }; SMB = [pscustomobject]@{ Enabled = $false } }
+}
+$credentialRequirementSftpOn = Get-BRAVOConfiguratorCredentialRequirement -EffectiveConfig $credentialEffectiveSftpOn
+Test-BRAVOCondition ($credentialRequirementSftpOn.SFTP.Required) `
+    'Configurator Credentials: SFTP operational (master ON + ArchiveUpload) -> credentials обов''язкові' `
+    "Required=$($credentialRequirementSftpOn.SFTP.Required)"
+
+# P: SMB master OFF (storageEffective.SMB.ArchiveCopy вже false за
+# конструкцією резолвера) -> Required=false.
+$credentialRequirementSmbOff = Get-BRAVOConfiguratorCredentialRequirement -EffectiveConfig $credentialEffectiveSftpOn
+Test-BRAVOCondition (-not $credentialRequirementSmbOff.SMB.Required) `
+    'Configurator Credentials: SMB.ArchiveCopy effective=false -> SMB credentials НЕ обов''язкові' `
+    "Required=$($credentialRequirementSmbOff.SMB.Required)"
+
+# Q: SMB operational (ArchiveCopy effective=true) -> Required=true.
+$credentialEffectiveSmbOn = [pscustomobject]@{
+    storageEffective  = [pscustomobject]@{
+        SFTP = [pscustomobject]@{ Enabled = $false; ArchiveUpload = $false; DisabledReason = $null }
+        SMB  = [pscustomobject]@{ Enabled = $true; ArchiveCopy = $true; DisabledReason = $null }
+    }
+    bazaSyncEffective = [pscustomobject]@{ ScheduledSftpSyncRequired = $false }
+    backupMonitoring  = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $false }; SMB = [pscustomobject]@{ Enabled = $false } }
+}
+$credentialRequirementSmbOn = Get-BRAVOConfiguratorCredentialRequirement -EffectiveConfig $credentialEffectiveSmbOn
+Test-BRAVOCondition ($credentialRequirementSmbOn.SMB.Required) `
+    'Configurator Credentials: SMB operational (ArchiveCopy effective=true) -> credentials обов''язкові' `
+    "Required=$($credentialRequirementSmbOn.SMB.Required)"
+
+# R: Health-only SFTP monitoring (backupMonitoring.SFTP.Enabled=true) з
+# master ON, без ArchiveUpload/BAZA sync -> все одно Required=true (Health
+# monitoring сам по собі законна причина потребувати креденшели, доки
+# master увімкнений) — canonical формула, не Configurator-вигадка.
+$credentialEffectiveHealthOnly = [pscustomobject]@{
+    storageEffective  = [pscustomobject]@{
+        SFTP = [pscustomobject]@{ Enabled = $true; ArchiveUpload = $false; DisabledReason = $null }
+        SMB  = [pscustomobject]@{ Enabled = $true; ArchiveCopy = $false; DisabledReason = $null }
+    }
+    bazaSyncEffective = [pscustomobject]@{ ScheduledSftpSyncRequired = $false }
+    backupMonitoring  = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $true }; SMB = [pscustomobject]@{ Enabled = $false } }
+}
+$credentialRequirementHealthOnly = Get-BRAVOConfiguratorCredentialRequirement -EffectiveConfig $credentialEffectiveHealthOnly
+Test-BRAVOCondition ($credentialRequirementHealthOnly.SFTP.Required) `
+    'Configurator Credentials: SFTP Health-моніторинг увімкнено (master ON) -> credentials обов''язкові (навіть без ArchiveUpload/BAZA sync)' `
+    "Required=$($credentialRequirementHealthOnly.SFTP.Required)"
+
+# S: смоук-тест реального (non-mutating) прогону -Action Test через
+# Invoke-BRAVOConfiguratorCredentialCheck — НЕ прив'язується до
+# конкретного Found/Missing (CI-runner може не мати credential), лише
+# перевіряє, що виклик повертає валідний статус без винятку.
+$configuratorCredentialCheckResult = Invoke-BRAVOConfiguratorCredentialCheck -RuntimeRoot $root -Component 'SFTP' -TimeoutSeconds 30
+Test-BRAVOCondition ($configuratorCredentialCheckResult.Status -in @('Found', 'Missing', 'Error')) `
+    'Configurator Credentials: Invoke-BRAVOConfiguratorCredentialCheck повертає валідний статус без винятку (CI-гермет, не прив''язано до Found/Missing)' `
+    "Status=$($configuratorCredentialCheckResult.Status) ExitCode=$($configuratorCredentialCheckResult.ExitCode) Reason=$($configuratorCredentialCheckResult.Reason)"
+
+# ===== P1.6 Presets: чисті model-трансформації (не пишуть файл) =====
+
+$configuratorPresetBaseModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
+# Навмисний unrelated override ДО preset — має пережити будь-який preset.
+$configuratorPresetBaseModel = Set-BRAVOConfiguratorOverride -Model $configuratorPresetBaseModel -Path 'consoleSettings.ConsoleLevel' -Value 'ERROR'
+
+# T: LocalOnly -> SFTP.Enabled=false, SMB.Enabled=false.
+$configuratorPresetLocalOnly = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetBaseModel -PresetName 'LocalOnly'
+$configuratorPresetLocalOnlySftp = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'componentSettings.SFTP.Enabled' })
+$configuratorPresetLocalOnlySmb = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'componentSettings.SMB.Enabled' })
+Test-BRAVOCondition ($configuratorPresetLocalOnlySftp.Count -eq 1 -and [bool]$configuratorPresetLocalOnlySftp[0].OverrideValue -eq $false -and [bool]$configuratorPresetLocalOnlySmb[0].OverrideValue -eq $false) `
+    'Configurator Presets: LocalOnly -> SFTP.Enabled=false, SMB.Enabled=false' `
+    "SFTP=$($configuratorPresetLocalOnlySftp[0].OverrideValue) SMB=$($configuratorPresetLocalOnlySmb[0].OverrideValue)"
+
+# U: unrelated override (consoleSettings.ConsoleLevel) переживає preset.
+$configuratorPresetLocalOnlyConsole = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'consoleSettings.ConsoleLevel' })
+Test-BRAVOCondition ($configuratorPresetLocalOnlyConsole.Count -eq 1 -and [string]$configuratorPresetLocalOnlyConsole[0].OverrideValue -eq 'ERROR') `
+    'Configurator Presets: preset не стирає unrelated override (consoleSettings.ConsoleLevel)' `
+    "ConsoleLevel=$($configuratorPresetLocalOnlyConsole[0].OverrideValue)"
+
+# V: LocalPlusSFTPAndSMB -> обидва master=true.
+$configuratorPresetBoth = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetBaseModel -PresetName 'LocalPlusSFTPAndSMB'
+$configuratorPresetBothSftp = @($configuratorPresetBoth | Where-Object { $_.Path -eq 'componentSettings.SFTP.Enabled' })
+$configuratorPresetBothSmb = @($configuratorPresetBoth | Where-Object { $_.Path -eq 'componentSettings.SMB.Enabled' })
+Test-BRAVOCondition ([bool]$configuratorPresetBothSftp[0].OverrideValue -eq $true -and [bool]$configuratorPresetBothSmb[0].OverrideValue -eq $true) `
+    'Configurator Presets: LocalPlusSFTPAndSMB -> SFTP.Enabled=true, SMB.Enabled=true' `
+    "SFTP=$($configuratorPresetBothSftp[0].OverrideValue) SMB=$($configuratorPresetBothSmb[0].OverrideValue)"
+
+# W: idempotent — повторне застосування того самого preset дає той самий результат.
+$configuratorPresetLocalOnlyTwice = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetLocalOnly -PresetName 'LocalOnly'
+$configuratorPresetLocalOnlyTwiceSftp = @($configuratorPresetLocalOnlyTwice | Where-Object { $_.Path -eq 'componentSettings.SFTP.Enabled' })
+Test-BRAVOCondition ([bool]$configuratorPresetLocalOnlyTwiceSftp[0].OverrideValue -eq $false) `
+    'Configurator Presets: повторне застосування LocalOnly — ідемпотентне' `
+    "SFTP=$($configuratorPresetLocalOnlyTwiceSftp[0].OverrideValue)"
+
+# X: master OFF (preset) не втрачає раніше виставлений child raw override
+# — той самий master/child контракт, що ручне редагування.
+$configuratorPresetChildBase = Set-BRAVOConfiguratorOverride -Model $configuratorPresetBaseModel -Path 'componentSettings.SFTP.ArchiveUpload' -Value $true
+$configuratorPresetChildAfterLocalOnly = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetChildBase -PresetName 'LocalOnly'
+$configuratorPresetChildSetting = @($configuratorPresetChildAfterLocalOnly | Where-Object { $_.Path -eq 'componentSettings.SFTP.ArchiveUpload' })
+Test-BRAVOCondition ($configuratorPresetChildSetting.Count -eq 1 -and [bool]$configuratorPresetChildSetting[0].OverrideValue -eq $true) `
+    'Configurator Presets: LocalOnly НЕ стирає child raw override (ArchiveUpload лишається true, лише Effective зміниться)' `
+    "ArchiveUpload Raw=$($configuratorPresetChildSetting[0].OverrideValue)"
+
+# Y: Current/Manual — no-op, жодне override-значення не змінюється
+# (порівняння за вмістом, не за object reference — PowerShell типізоване
+# [array]-параметр-зв'язування не гарантує той самий фізичний масив).
+$configuratorPresetCurrent = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetBaseModel -PresetName 'Current'
+$configuratorPresetCurrentConsole = @($configuratorPresetCurrent | Where-Object { $_.Path -eq 'consoleSettings.ConsoleLevel' })
+$configuratorPresetCurrentSftp = @($configuratorPresetCurrent | Where-Object { $_.Path -eq 'componentSettings.SFTP.Enabled' })
+Test-BRAVOCondition (
+    $configuratorPresetCurrent.Count -eq $configuratorPresetBaseModel.Count -and
+    [string]$configuratorPresetCurrentConsole[0].OverrideValue -eq 'ERROR' -and
+    -not $configuratorPresetCurrentSftp[0].OverridePresent
+) `
+    'Configurator Presets: Current — no-op (жодне override-значення не змінюється)' `
+    "Count=$($configuratorPresetCurrent.Count)/$($configuratorPresetBaseModel.Count) Console=$($configuratorPresetCurrentConsole[0].OverrideValue) SftpOverridePresent=$($configuratorPresetCurrentSftp[0].OverridePresent)"
+
+# ===== P1.8 Preview: семантичний diff =====
+
+$configuratorPreviewBefore = Update-BRAVOConfiguratorEffective -Model $configuratorPresetBaseModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+$configuratorPresetForPreview = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetBaseModel -PresetName 'LocalOnly'
+$configuratorPreviewAfter = Update-BRAVOConfiguratorEffective -Model $configuratorPresetForPreview -RuntimeRoot $configuratorFixtureRuntimeRoot
+$configuratorPreviewResult = Get-BRAVOConfiguratorPreview -ModelBefore $configuratorPreviewBefore -ModelAfter $configuratorPreviewAfter
+
+# Z: Raw diff містить рівно 2 зміни (SFTP.Enabled, SMB.Enabled).
+$configuratorPreviewRawPaths = @($configuratorPreviewResult.RawChanges | ForEach-Object { $_.Path } | Sort-Object)
+Test-BRAVOCondition (@(Compare-Object $configuratorPreviewRawPaths @('componentSettings.SFTP.Enabled', 'componentSettings.SMB.Enabled')).Count -eq 0) `
+    'Configurator Preview: Raw diff = рівно 2 master-switch зміни' `
+    "RawChanges=$($configuratorPreviewRawPaths -join ',')"
+
+# AA: Effective diff НЕ порожній (SFTP/SMB вимкнення реально змінює
+# ефективну поведінку принаймні одного залежного поля).
+Test-BRAVOCondition ($configuratorPreviewResult.EffectiveChanges.Count -gt 0) `
+    'Configurator Preview: Effective diff непорожній для LocalOnly preset' `
+    "EffectiveChanges=$($configuratorPreviewResult.EffectiveChanges.Count)"
+
+# AB: HasBlockingErrors коректно відображає чисту (без ERROR) модель.
+Test-BRAVOCondition (-not $configuratorPreviewResult.HasBlockingErrors) `
+    'Configurator Preview: HasBlockingErrors=false для валідної LocalOnly-моделі' `
+    "HasBlockingErrors=$($configuratorPreviewResult.HasBlockingErrors)"
+
+# AC: Preview без реальних змін (той самий Before/After) -> HasChanges=false.
+$configuratorPreviewNoChangeResult = Get-BRAVOConfiguratorPreview -ModelBefore $configuratorPreviewBefore -ModelAfter $configuratorPreviewBefore
+Test-BRAVOCondition (-not $configuratorPreviewNoChangeResult.HasChanges) `
+    'Configurator Preview: Before==After -> HasChanges=false' `
+    "HasChanges=$($configuratorPreviewNoChangeResult.HasChanges)"
 
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
