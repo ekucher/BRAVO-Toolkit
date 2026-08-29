@@ -361,6 +361,188 @@ try {
     Remove-Item -LiteralPath $configuratorPersistScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# ===== P2-A.7: hermetic Backup forced-failure (§Stage='Backup') =====
+# Крок 11 (Copy-Item production -> .bak) провалюється, якщо WRITE у
+# директорію заборонено ACL deny-rule для поточного користувача — на
+# відміну від file-lock (AtomicReplace-тест нижче), READ джерела (і крок
+# 10 race-check, і сам Copy-Item source-read) лишається доступним, тому
+# збій ізольовано САМЕ на кроці 11, а не раніше. Реальна знахідка: до
+# P2-A.7 backup Copy-Item НЕ мав власного try/catch взагалі — необроблений
+# виняток пробив би Invoke-BRAVOConfiguratorApply наскрізь, порушуючи
+# задокументований контракт "завжди повертає структурований результат".
+$configuratorBackupFailureRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_CONFIGURATOR_BACKUPFAIL_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($configuratorBackupFailureRoot)
+$backupFailureDenyRule = $null
+$backupFailureAclApplied = $false
+try {
+    $backupFailureConfigPath = Join-Path $configuratorBackupFailureRoot 'BRAVO.local.config'
+    [IO.File]::WriteAllText(
+        $backupFailureConfigPath,
+        (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'consoleSettings.ConsoleLevel' = 'ERROR' }),
+        (New-Object System.Text.UTF8Encoding($false)))
+    $backupFailureBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorBackupFailureRoot
+    $backupFailureContentBefore = Get-Content -LiteralPath $backupFailureConfigPath -Raw -Encoding UTF8
+    $backupFailureModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $backupFailureBaseline.Overrides
+    $backupFailureModel = Set-BRAVOConfiguratorOverride -Model $backupFailureModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARN'
+    $backupFailureModel = Update-BRAVOConfiguratorEffective -Model $backupFailureModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+
+    $backupFailureAcl = Get-Acl -Path $configuratorBackupFailureRoot
+    $backupFailureIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $backupFailureDenyRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+        $backupFailureIdentity, 'CreateFiles,Write', 'ContainerInherit,ObjectInherit', 'None', 'Deny')
+    $backupFailureAcl.AddAccessRule($backupFailureDenyRule)
+    Set-Acl -Path $configuratorBackupFailureRoot -AclObject $backupFailureAcl
+    $backupFailureAclApplied = $true
+
+    $persistApplyBackupFailure = Invoke-BRAVOConfiguratorApply `
+        -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorBackupFailureRoot `
+        -Model $backupFailureModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $backupFailureBaseline
+
+    # ACL знімається ПЕРЕД читанням результату/cleanup, інакше Get-Content/
+    # Remove-Item нижче так само впадуть на deny-write directory.
+    if ($backupFailureAclApplied) {
+        $backupFailureAclRestore = Get-Acl -Path $configuratorBackupFailureRoot
+        $backupFailureAclRestore.RemoveAccessRule($backupFailureDenyRule) | Out-Null
+        Set-Acl -Path $configuratorBackupFailureRoot -AclObject $backupFailureAclRestore
+        $backupFailureAclApplied = $false
+    }
+
+    $backupFailureContentAfter = Get-Content -LiteralPath $backupFailureConfigPath -Raw -Encoding UTF8
+    $backupFailureTempLeftovers = @(Get-ChildItem -LiteralPath $configuratorBackupFailureRoot -Filter 'BRAVO.local.config.tmp-*' -ErrorAction SilentlyContinue)
+    $backupFailureBakFiles = @(Get-ChildItem -LiteralPath $configuratorBackupFailureRoot -Filter 'BRAVO.local.config.bak-*' -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition (
+        (-not $persistApplyBackupFailure.Applied) -and
+        $persistApplyBackupFailure.Stage -eq 'Backup' -and
+        $backupFailureContentAfter -eq $backupFailureContentBefore -and
+        $backupFailureTempLeftovers.Count -eq 0 -and
+        $backupFailureBakFiles.Count -eq 0 -and
+        $persistApplyBackupFailure.Reasons.Count -gt 0
+    ) `
+        'Configurator Persistence: forced Backup failure (ACL deny-write directory) -> Applied=false Stage=Backup, оригінал незмінний, AtomicReplace/PostApplyVerification НЕ виконувались' `
+        ("Applied=$($persistApplyBackupFailure.Applied) Stage=$($persistApplyBackupFailure.Stage) " +
+         "ContentUnchanged=$($backupFailureContentAfter -eq $backupFailureContentBefore) TempLeftovers=$($backupFailureTempLeftovers.Count) " +
+         "BakFiles=$($backupFailureBakFiles.Count) Reasons=$($persistApplyBackupFailure.Reasons -join '; ')")
+} finally {
+    if ($backupFailureAclApplied -and $null -ne $backupFailureDenyRule) {
+        try {
+            $backupFailureAclCleanup = Get-Acl -Path $configuratorBackupFailureRoot
+            $backupFailureAclCleanup.RemoveAccessRule($backupFailureDenyRule) | Out-Null
+            Set-Acl -Path $configuratorBackupFailureRoot -AclObject $backupFailureAclCleanup
+        } catch { }
+    }
+    Remove-Item -LiteralPath $configuratorBackupFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ===== P2-A.1: hermetic AtomicReplace forced-failure (§Stage='AtomicReplace') =====
+# Crок 12 (Move-Item temp -> production) провалюється, якщо production-файл
+# відкритий БЕЗ FileShare.Delete — реальний, детермінований, без потреби у
+# test-only seam чи змінах Persistence-коду (перевірено окремим прототипом:
+# Move-Item -Force дійсно кидає "Cannot create a file when that file already
+# exists" на такому handle).
+$configuratorAtomicReplaceRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_CONFIGURATOR_ATOMICREPLACE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($configuratorAtomicReplaceRoot)
+try {
+    $atomicReplaceConfigPath = Join-Path $configuratorAtomicReplaceRoot 'BRAVO.local.config'
+    [IO.File]::WriteAllText(
+        $atomicReplaceConfigPath,
+        (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'consoleSettings.ConsoleLevel' = 'ERROR' }),
+        (New-Object System.Text.UTF8Encoding($false)))
+    $atomicReplaceBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorAtomicReplaceRoot
+    $atomicReplaceContentBefore = Get-Content -LiteralPath $atomicReplaceConfigPath -Raw -Encoding UTF8
+    $atomicReplaceModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $atomicReplaceBaseline.Overrides
+    $atomicReplaceModel = Set-BRAVOConfiguratorOverride -Model $atomicReplaceModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARN'
+    $atomicReplaceModel = Update-BRAVOConfiguratorEffective -Model $atomicReplaceModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+
+    $atomicReplaceLockStream = [System.IO.File]::Open(
+        $atomicReplaceConfigPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+    try {
+        $persistApplyAtomicReplaceFailure = Invoke-BRAVOConfiguratorApply `
+            -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorAtomicReplaceRoot `
+            -Model $atomicReplaceModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $atomicReplaceBaseline
+    } finally {
+        $atomicReplaceLockStream.Close()
+    }
+    $atomicReplaceContentAfter = Get-Content -LiteralPath $atomicReplaceConfigPath -Raw -Encoding UTF8
+    $atomicReplaceTempLeftovers = @(Get-ChildItem -LiteralPath $configuratorAtomicReplaceRoot -Filter 'BRAVO.local.config.tmp-*' -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition (
+        (-not $persistApplyAtomicReplaceFailure.Applied) -and
+        $persistApplyAtomicReplaceFailure.Stage -eq 'AtomicReplace' -and
+        $atomicReplaceContentAfter -eq $atomicReplaceContentBefore -and
+        $atomicReplaceTempLeftovers.Count -eq 0
+    ) `
+        'Configurator Persistence: forced AtomicReplace failure (locked production file) -> Applied=false, оригінал незмінний, temp прибрано' `
+        ("Applied=$($persistApplyAtomicReplaceFailure.Applied) Stage=$($persistApplyAtomicReplaceFailure.Stage) " +
+         "ContentUnchanged=$($atomicReplaceContentAfter -eq $atomicReplaceContentBefore) TempLeftovers=$($atomicReplaceTempLeftovers.Count) " +
+         "Reasons=$($persistApplyAtomicReplaceFailure.Reasons -join '; ')")
+} finally {
+    Remove-Item -LiteralPath $configuratorAtomicReplaceRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ===== P2-A.2: PostApplyVerification forced-mismatch (§Stage='PostApplyVerification') =====
+# Test-BRAVOConfiguratorPostApplyVerification винесено з Invoke-BRAVOConfiguratorApply
+# (крок 13-14) саме для цього — hermetic виклик напряму з деліберативно
+# зіпсованим "щойно записаним" файлом (canonical Read-BRAVOLocalConfigurationOverrides
+# відхиляє $env:-звернення через CheckRestrictedLanguage), без залежності
+# від таймінгу/race файлової системи.
+$configuratorPostVerifyRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_CONFIGURATOR_POSTAPPLYVERIFY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($configuratorPostVerifyRoot)
+try {
+    $postVerifyConfigPath = Join-Path $configuratorPostVerifyRoot 'BRAVO.local.config'
+    $postVerifyBackupPath = "$postVerifyConfigPath.bak-selftest"
+    $postVerifyOriginalContent = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'consoleSettings.ConsoleLevel' = 'ERROR' }
+    [IO.File]::WriteAllText($postVerifyBackupPath, $postVerifyOriginalContent, (New-Object System.Text.UTF8Encoding($false)))
+    # "Щойно записаний" файл — синтаксично неприпустимий (CheckRestrictedLanguage
+    # відхилить $env: звернення) -> reload на кроці 13 гарантовано впаде.
+    [IO.File]::WriteAllText($postVerifyConfigPath, "@{ 'x' = `$env:PATH }", (New-Object System.Text.UTF8Encoding($false)))
+
+    $postVerifyResultWithBackup = Test-BRAVOConfiguratorPostApplyVerification `
+        -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPostVerifyRoot `
+        -ProductionConfigPath $postVerifyConfigPath -BackupPath $postVerifyBackupPath
+    $postVerifyContentAfterRollback = Get-Content -LiteralPath $postVerifyConfigPath -Raw -Encoding UTF8
+    Test-BRAVOCondition (
+        ($null -ne $postVerifyResultWithBackup) -and
+        (-not $postVerifyResultWithBackup.Applied) -and
+        $postVerifyResultWithBackup.Stage -eq 'PostApplyVerification' -and
+        $postVerifyContentAfterRollback -eq $postVerifyOriginalContent
+    ) `
+        'Configurator Persistence: forced PostApplyVerification mismatch (backup наявний) -> Applied=false, rollback з backup, фінальний стан = оригінал' `
+        ("Applied=$($postVerifyResultWithBackup.Applied) Stage=$($postVerifyResultWithBackup.Stage) " +
+         "RolledBackToOriginal=$($postVerifyContentAfterRollback -eq $postVerifyOriginalContent) " +
+         "Reasons=$($postVerifyResultWithBackup.Reasons -join '; ')")
+
+    # Без backup (симулює перший-у-житті запис, що самé виявився зіпсованим) ->
+    # rollback видаляє файл, а не лишає невалідований production-стан.
+    [IO.File]::WriteAllText($postVerifyConfigPath, "@{ 'x' = `$env:PATH }", (New-Object System.Text.UTF8Encoding($false)))
+    $postVerifyResultNoBackup = Test-BRAVOConfiguratorPostApplyVerification `
+        -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPostVerifyRoot `
+        -ProductionConfigPath $postVerifyConfigPath
+    $postVerifyFileRemainsAfterNoBackupRollback = Test-Path -LiteralPath $postVerifyConfigPath -PathType Leaf
+    Test-BRAVOCondition (
+        ($null -ne $postVerifyResultNoBackup) -and
+        (-not $postVerifyResultNoBackup.Applied) -and
+        $postVerifyResultNoBackup.Stage -eq 'PostApplyVerification' -and
+        (-not $postVerifyFileRemainsAfterNoBackupRollback)
+    ) `
+        'Configurator Persistence: forced PostApplyVerification mismatch (без backup) -> Applied=false, rollback видаляє файл' `
+        ("Applied=$($postVerifyResultNoBackup.Applied) Stage=$($postVerifyResultNoBackup.Stage) " +
+         "FileRemains=$postVerifyFileRemainsAfterNoBackupRollback Reasons=$($postVerifyResultNoBackup.Reasons -join '; ')")
+
+    # Успішна верифікація (валідний "щойно записаний" файл) -> $null,
+    # Apply продовжує до Complete (те саме, що вже покривають тести 14/19 вище).
+    [IO.File]::WriteAllText($postVerifyConfigPath, $postVerifyOriginalContent, (New-Object System.Text.UTF8Encoding($false)))
+    $postVerifyResultSuccess = Test-BRAVOConfiguratorPostApplyVerification `
+        -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPostVerifyRoot `
+        -ProductionConfigPath $postVerifyConfigPath -BackupPath $postVerifyBackupPath
+    Test-BRAVOCondition ($null -eq $postVerifyResultSuccess) `
+        'Configurator Persistence: PostApplyVerification успішна -> $null (Apply продовжує до Complete)' `
+        "Result=$postVerifyResultSuccess"
+} finally {
+    Remove-Item -LiteralPath $configuratorPostVerifyRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # ===== 21 (P2-регресія за незалежним review): EffectiveSource для масивів =====
 # Test-BRAVOConfiguratorValueEquality замінив '-eq' (element-wise для
 # масивів зліва — завжди хибний 'Derived' навіть для дійсно рівних
@@ -571,6 +753,110 @@ $configuratorPreviewNoChangeResult = Get-BRAVOConfiguratorPreview -ModelBefore $
 Test-BRAVOCondition (-not $configuratorPreviewNoChangeResult.HasChanges) `
     'Configurator Preview: Before==After -> HasChanges=false' `
     "HasChanges=$($configuratorPreviewNoChangeResult.HasChanges)"
+
+# ===== P2-A.3: справжній diff-based Dirty (Test-BRAVOConfiguratorModelDirty) —
+# заміна подієвого Model[].Dirty прапорця, який лишався $true назавжди
+# після edit -> revert до оригіналу (P3 "phantom Dirty", P1-стабілізація). =====
+
+$dirtyArrayPath = 'maintenanceSettings.Services.BravoDisplayName'
+$dirtyStringPath = 'consoleSettings.ConsoleLevel'
+
+# AD: чиста модель без overrides проти порожнього baseline -> Dirty=false
+$dirtyModelClean = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelClean -BaselineOverrides @{})) `
+    'Configurator Dirty: чиста модель проти порожнього baseline -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelClean -BaselineOverrides @{})"
+
+# AE: edit -> Dirty=true
+$dirtyModelEdited = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyStringPath -Value 'ERROR'
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelEdited -BaselineOverrides @{}) `
+    'Configurator Dirty: edit -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelEdited -BaselineOverrides @{})"
+
+# AF: edit -> revert (Clear, повертає до "без override", яким і був baseline) -> Dirty=false
+$dirtyModelReverted = Clear-BRAVOConfiguratorOverride -Model $dirtyModelEdited -Path $dirtyStringPath
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelReverted -BaselineOverrides @{})) `
+    'Configurator Dirty: edit -> revert (Clear) до оригіналу -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelReverted -BaselineOverrides @{})"
+
+# AG: edit значенням, рівним поточному Default, все одно Dirty=true, якщо
+# baseline не мав override (OverridePresent сам по собі — частина diff,
+# не лише значення) — "false override" != "absent override".
+$dirtyDefaultConsoleLevel = ($dirtyModelClean | Where-Object { $_.Path -eq $dirtyStringPath })[0].DefaultValue
+$dirtyModelSameAsDefault = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyStringPath -Value $dirtyDefaultConsoleLevel
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelSameAsDefault -BaselineOverrides @{}) `
+    'Configurator Dirty: явний override == Default value, але baseline не мав override -> true (OverridePresent частина diff)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelSameAsDefault -BaselineOverrides @{}) OverrideValue=$dirtyDefaultConsoleLevel Default=$dirtyDefaultConsoleLevel"
+
+# AH: baseline МАВ override -> модель побудована з нього -> false; Clear -> true
+# ("clear override" != "absent baseline" — реальна зміна, якщо baseline був present)
+$dirtyBaselineWithOverride = @{ $dirtyStringPath = 'WARN' }
+$dirtyModelFromBaseline = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $dirtyBaselineWithOverride
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelFromBaseline -BaselineOverrides $dirtyBaselineWithOverride)) `
+    'Configurator Dirty: модель побудована з baseline -> false (щойно Load/Reload)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelFromBaseline -BaselineOverrides $dirtyBaselineWithOverride)"
+$dirtyModelClearedFromBaseline = Clear-BRAVOConfiguratorOverride -Model $dirtyModelFromBaseline -Path $dirtyStringPath
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelClearedFromBaseline -BaselineOverrides $dirtyBaselineWithOverride) `
+    'Configurator Dirty: baseline мав override, Clear прибирає його -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelClearedFromBaseline -BaselineOverrides $dirtyBaselineWithOverride)"
+
+# AI: false override != absent override (Boolean-специфічний випадок)
+$dirtyBooleanPath = 'componentSettings.SFTP.ArchiveUpload'
+$dirtyModelFalseOverride = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyBooleanPath -Value $false
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelFalseOverride -BaselineOverrides @{}) `
+    'Configurator Dirty: явний override=false проти відсутнього baseline -> true (false != absent)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelFalseOverride -BaselineOverrides @{})"
+
+# AJ: масив — той самий порядок елементів, що baseline -> Dirty=false; інший порядок -> true
+$dirtyArrayDefault = @(($dirtyModelClean | Where-Object { $_.Path -eq $dirtyArrayPath })[0].DefaultValue)
+$dirtyBaselineWithArray = @{ $dirtyArrayPath = $dirtyArrayDefault }
+$dirtyModelArraySameOrder = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $dirtyBaselineWithArray
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelArraySameOrder -BaselineOverrides $dirtyBaselineWithArray)) `
+    'Configurator Dirty: масив, той самий порядок що baseline -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelArraySameOrder -BaselineOverrides $dirtyBaselineWithArray)"
+$dirtyArrayReversedList = $dirtyArrayDefault.Clone()
+[array]::Reverse($dirtyArrayReversedList)
+$dirtyModelArrayReordered = Set-BRAVOConfiguratorOverride -Model $dirtyModelArraySameOrder -Path $dirtyArrayPath -Value $dirtyArrayReversedList
+Test-BRAVOCondition (
+    ($dirtyArrayReversedList.Count -lt 2) -or (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelArrayReordered -BaselineOverrides $dirtyBaselineWithArray)
+) `
+    'Configurator Dirty: масив з іншим порядком елементів проти baseline -> true' `
+    "ArrayCount=$($dirtyArrayReversedList.Count) Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelArrayReordered -BaselineOverrides $dirtyBaselineWithArray)"
+
+# AK: Reset-BRAVOConfiguratorSetting — еквівалентний Clear (Boolean повертається
+# до Default, а не матеріалізується як False).
+$dirtyModelForResetSetting = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyBooleanPath -Value $false
+$dirtyModelAfterResetSetting = Reset-BRAVOConfiguratorSetting -Model $dirtyModelForResetSetting -Path $dirtyBooleanPath
+$dirtyResetSettingRow = @($dirtyModelAfterResetSetting | Where-Object { $_.Path -eq $dirtyBooleanPath })
+Test-BRAVOCondition ($dirtyResetSettingRow.Count -eq 1 -and -not [bool]$dirtyResetSettingRow[0].OverridePresent) `
+    'Configurator Reset setting: Reset-BRAVOConfiguratorSetting прибирає override (Default, не False)' `
+    "OverridePresent=$($dirtyResetSettingRow[0].OverridePresent)"
+
+# AL: Reset-BRAVOConfiguratorSection — скидає лише settings ЦІЄЇ Group/Section,
+# інші секції та невідомі ключі не постраждали.
+$dirtyResetSectionTarget = @($dirtyModelClean | Where-Object { -not [bool]$_.Metadata.ReadOnly })[0]
+$dirtyResetSectionGroup = [string]$dirtyResetSectionTarget.Metadata.Group
+$dirtyResetSectionSection = [string]$dirtyResetSectionTarget.Metadata.Section
+$dirtyResetSectionOtherCandidate = @($dirtyModelClean | Where-Object {
+    ([string]$_.Metadata.Group -ne $dirtyResetSectionGroup -or [string]$_.Metadata.Section -ne $dirtyResetSectionSection) -and -not [bool]$_.Metadata.ReadOnly
+})
+$dirtyResetSectionOtherPath = if ($dirtyResetSectionOtherCandidate.Count -gt 0) { [string]$dirtyResetSectionOtherCandidate[0].Path } else { $null }
+$dirtyModelBeforeSectionReset = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyResetSectionTarget.Path -Value $dirtyResetSectionTarget.DefaultValue
+if (-not [string]::IsNullOrWhiteSpace($dirtyResetSectionOtherPath)) {
+    $otherPathDescriptor = @($dirtyModelClean | Where-Object { $_.Path -eq $dirtyResetSectionOtherPath })[0]
+    $dirtyModelBeforeSectionReset = Set-BRAVOConfiguratorOverride -Model $dirtyModelBeforeSectionReset -Path $dirtyResetSectionOtherPath -Value $otherPathDescriptor.DefaultValue
+}
+$dirtyModelAfterSectionReset = Reset-BRAVOConfiguratorSection -Model $dirtyModelBeforeSectionReset -Group $dirtyResetSectionGroup -Section $dirtyResetSectionSection
+$dirtyTargetRowAfterReset = @($dirtyModelAfterSectionReset | Where-Object { $_.Path -eq $dirtyResetSectionTarget.Path })[0]
+$dirtyOtherRowAfterReset = if (-not [string]::IsNullOrWhiteSpace($dirtyResetSectionOtherPath)) {
+    @($dirtyModelAfterSectionReset | Where-Object { $_.Path -eq $dirtyResetSectionOtherPath })[0]
+} else { $null }
+Test-BRAVOCondition (
+    (-not [bool]$dirtyTargetRowAfterReset.OverridePresent) -and
+    ($null -eq $dirtyOtherRowAfterReset -or [bool]$dirtyOtherRowAfterReset.OverridePresent)
+) `
+    'Configurator Reset section: скидає лише обрану Group/Section, інші секції не постраждали' `
+    "TargetOverridePresent=$($dirtyTargetRowAfterReset.OverridePresent) OtherPath=$dirtyResetSectionOtherPath OtherOverridePresent=$($dirtyOtherRowAfterReset.OverridePresent)"
 
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
