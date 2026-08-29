@@ -185,3 +185,62 @@ $configuratorUIDisplayArrayText = ConvertTo-BRAVOConfiguratorUIDisplayText -Type
 Test-BRAVOCondition ($configuratorUIDisplayArrayText -eq 'D:, E:, F:') `
     'ConfiguratorUI ConvertTo-...DisplayText: StringArray форматується через кому' `
     "DisplayText=$configuratorUIDisplayArrayText"
+
+# ===== 10: Static-analysis регресія (P1-stabilization): жоден
+# .GetNewClosure()-scriptblock у BRAVO.Configurator.UI.psm1 не викликає
+# приватну (не-exported) функцію ЦЬОГО модуля по імені напряму.
+#
+# Root cause реального дефекту (реальний запуск BRAVO_CONFIGURATOR.ps1
+# падав на "term 'Update-BRAVOConfiguratorUICenterPanel' is not
+# recognized" одразу при відкритті форми): у Windows PowerShell 5.1
+# .GetNewClosure() створює клон scriptblock-а, що НЕ зберігає прив'язку
+# до command-table приватних (не-exported) функцій свого модуля — прямий
+# виклик такої функції по імені зсередини GetNewClosure()-блоку падає з
+# CommandNotFoundException, навіть коли функція реально визначена в тому
+# самому модулі. Жоден headless self-test цього не ловив, бо жоден з них
+# не будує реальну WinForms-форму (Show-BRAVOConfiguratorMainForm
+# навмисно поза межами цього фрагмента — див. коментар на початку файлу).
+# Цей тест — суто статичний AST-аналіз (не будує жодного System.Windows.
+# Forms-об'єкта), що ловить САМЕ цей патерн дефекту напряму в коді.
+$configuratorUIModulePath = Join-Path $configuratorUIModuleRoot 'BRAVO.Configurator.UI.psm1'
+$configuratorUIParseErrors = $null
+$configuratorUITokens = $null
+$configuratorUIAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    $configuratorUIModulePath, [ref]$configuratorUITokens, [ref]$configuratorUIParseErrors)
+
+$configuratorUIAllFunctionNames = @(
+    $configuratorUIAst.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        ForEach-Object { $_.Name }
+)
+$configuratorUIExportedFunctionNames = @((Get-Module BRAVO.Configurator.UI).ExportedFunctions.Keys)
+$configuratorUIPrivateFunctionNames = @($configuratorUIAllFunctionNames | Where-Object { $configuratorUIExportedFunctionNames -notcontains $_ })
+
+$configuratorUIClosureScriptBlocks = @(
+    $configuratorUIAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        [string]$node.Member.Value -eq 'GetNewClosure' -and
+        $node.Expression -is [System.Management.Automation.Language.ScriptBlockExpressionAst]
+    }, $true) | ForEach-Object { $_.Expression.ScriptBlock }
+)
+
+$configuratorUIBrokenClosureCalls = New-Object System.Collections.Generic.List[string]
+foreach ($closureBlock in $configuratorUIClosureScriptBlocks) {
+    $commandsInClosure = @($closureBlock.FindAll({ param($node) $node -is [System.Management.Automation.Language.CommandAst] }, $true))
+    foreach ($commandAst in $commandsInClosure) {
+        $calledName = [string]$commandAst.GetCommandName()
+        if ($configuratorUIPrivateFunctionNames -contains $calledName) {
+            $configuratorUIBrokenClosureCalls.Add("$calledName (рядок $($commandAst.Extent.StartLineNumber))")
+        }
+    }
+}
+
+Test-BRAVOCondition (
+    $configuratorUIParseErrors.Count -eq 0 -and
+    $configuratorUIPrivateFunctionNames.Count -gt 0 -and
+    $configuratorUIClosureScriptBlocks.Count -gt 0 -and
+    $configuratorUIBrokenClosureCalls.Count -eq 0
+) `
+    'ConfiguratorUI static: жоден .GetNewClosure()-блок не викликає приватну функцію модуля напряму по імені (regression для P1-launch-crash)' `
+    ("ParseErrors=$($configuratorUIParseErrors.Count) PrivateFns=$($configuratorUIPrivateFunctionNames.Count) " +
+     "ClosureBlocks=$($configuratorUIClosureScriptBlocks.Count) Broken=$($configuratorUIBrokenClosureCalls -join '; ')")
