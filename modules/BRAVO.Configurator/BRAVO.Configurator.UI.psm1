@@ -304,6 +304,18 @@ function New-BRAVOConfiguratorUISettingRow {
     $descriptorType = [string]$Setting.Metadata.Type
     $currentPath = [string]$Setting.Path
 
+    # P1-фікс (stabilization): .GetNewClosure() у Windows PowerShell 5.1 не
+    # зберігає прив'язку до module-private command table — прямий виклик
+    # приватної функції модуля (не exported) з тіла GetNewClosure()-блоку
+    # падає з "term ... is not recognized" у реальному WinForms-запуску
+    # (self-test цього не ловив, бо ніколи не будує реальну форму). Тут
+    # $currentPath/$overrideCheckBox/$valueControl дійсно потребують
+    # GetNewClosure (New-BRAVOConfiguratorUISettingRow повертається одразу
+    # після побудови рядка, до першого кліку) — тому замість видалення
+    # GetNewClosure передаємо приватну функцію як captured-змінну
+    # (той самий підхід, що вже працює для $OnChanged/$OnSelected-параметрів).
+    $showMessageRef = ${function:Show-BRAVOConfiguratorUIMessage}
+
     $rowPanel = New-Object System.Windows.Forms.Panel
     $rowPanel.Width = 700
     $rowPanel.Height = 28
@@ -377,7 +389,7 @@ function New-BRAVOConfiguratorUISettingRow {
                 $convertedValue = & $getConvertedValue
                 & $OnChanged $currentPath $true $convertedValue
             } catch {
-                Show-BRAVOConfiguratorUIMessage -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
             }
         } else {
             & $OnChanged $currentPath $false $null
@@ -392,7 +404,7 @@ function New-BRAVOConfiguratorUISettingRow {
                     $convertedValue = & $getConvertedValue
                     & $OnChanged $currentPath $true $convertedValue
                 } catch {
-                    Show-BRAVOConfiguratorUIMessage -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                    & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
                 }
             }
             & $OnSelected $currentPath
@@ -404,7 +416,7 @@ function New-BRAVOConfiguratorUISettingRow {
                     $convertedValue = & $getConvertedValue
                     & $OnChanged $currentPath $true $convertedValue
                 } catch {
-                    Show-BRAVOConfiguratorUIMessage -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                    & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
                 }
             }
         }.GetNewClosure())
@@ -882,6 +894,15 @@ function Show-BRAVOConfiguratorMainForm {
     $rootNode.Expand()
 
     # ===== Callbacks, спільні для рядків налаштувань =====
+    # P1-фікс (stabilization): без .GetNewClosure() — ці scriptblock-и
+    # визначаються один раз (не в циклі) в тілі Show-BRAVOConfiguratorMainForm,
+    # а форма блокує виконання через ShowDialog() на весь час своєї роботи,
+    # тому лексичний scope цієй функції лишається живим і доступним для
+    # прямого виклику приватних функцій модуля (Update-BRAVOConfiguratorUI*)
+    # аж до закриття форми. .GetNewClosure() тут не додає жодної потрібної
+    # семантики (немає циклу/повторного виклику з різними значеннями), але
+    # ламає резолюцію приватних module-функцій у Windows PowerShell 5.1 —
+    # див. коментар біля $showMessageRef вище.
     $onChanged = {
         param($path, $overridePresent, $value)
         if ($overridePresent) {
@@ -891,16 +912,16 @@ function Show-BRAVOConfiguratorMainForm {
         }
         $state.EffectiveStale = $true
         Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
-    }.GetNewClosure()
+    }
 
     $onSelected = {
         param($path)
         Update-BRAVOConfiguratorUIDetailsPanel -DetailsTextBox $detailsTextBox -State $state -Path $path
-    }.GetNewClosure()
+    }
 
     $refreshCenterPanel = {
         Update-BRAVOConfiguratorUICenterPanel -CenterPanel $centerScrollPanel -State $state -OnChanged $onChanged -OnSelected $onSelected
-    }.GetNewClosure()
+    }
 
     & $refreshCenterPanel
     Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
@@ -916,17 +937,17 @@ function Show-BRAVOConfiguratorMainForm {
             $state.SelectedSection = $tag.Section
         }
         & $refreshCenterPanel
-    }.GetNewClosure())
+    })
 
     $searchTextBox.Add_TextChanged({
         $state.SearchText = $searchTextBox.Text
         & $refreshCenterPanel
-    }.GetNewClosure())
+    })
 
     $filterComboBox.Add_SelectedIndexChanged({
         $state.Filter = [string]$filterComboBox.SelectedItem
         & $refreshCenterPanel
-    }.GetNewClosure())
+    })
 
     $presetApplyButton.Add_Click({
         if ($presetComboBox.SelectedIndex -lt 0) { return }
@@ -935,7 +956,7 @@ function Show-BRAVOConfiguratorMainForm {
         $state.EffectiveStale = $true
         & $refreshCenterPanel
         Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
-    }.GetNewClosure())
+    })
 
     $recalculateButton.Add_Click({
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -948,7 +969,7 @@ function Show-BRAVOConfiguratorMainForm {
         }
         & $refreshCenterPanel
         Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
-    }.GetNewClosure())
+    })
 
     $credCheckButton.Add_Click({
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -961,7 +982,7 @@ function Show-BRAVOConfiguratorMainForm {
         } finally {
             $form.Cursor = [System.Windows.Forms.Cursors]::Default
         }
-    }.GetNewClosure())
+    })
 
     $credSetupSftpButton.Add_Click({
         try {
@@ -969,7 +990,7 @@ function Show-BRAVOConfiguratorMainForm {
         } catch {
             Show-BRAVOConfiguratorUIMessage -Text "Налаштування SFTP-креденшелів не вдалося: $($_.Exception.Message)" -Icon Error
         }
-    }.GetNewClosure())
+    })
 
     $credSetupSmbButton.Add_Click({
         try {
@@ -977,7 +998,7 @@ function Show-BRAVOConfiguratorMainForm {
         } catch {
             Show-BRAVOConfiguratorUIMessage -Text "Налаштування SMB-креденшелів не вдалося: $($_.Exception.Message)" -Icon Error
         }
-    }.GetNewClosure())
+    })
 
     $applyButton.Add_Click({
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -1047,11 +1068,11 @@ function Show-BRAVOConfiguratorMainForm {
         } else {
             Show-BRAVOConfiguratorUIMessage -Text "Apply відхилено (Stage=$($applyResult.Stage)):`n$($applyResult.Reasons -join [Environment]::NewLine)" -Icon Error
         }
-    }.GetNewClosure())
+    })
 
     $cancelButton.Add_Click({
         if (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state) { $form.Close() }
-    }.GetNewClosure())
+    })
 
     # P2-фікс за результатами незалежного review (Agent D): раніше
     # єдиний спосіб реально "reload configuration" (як велить
@@ -1084,14 +1105,14 @@ function Show-BRAVOConfiguratorMainForm {
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
         & $refreshCenterPanel
         Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
-    }.GetNewClosure())
+    })
 
     $form.Add_FormClosing({
         param($formSender, $formArgs)
         if (-not (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state)) {
             $formArgs.Cancel = $true
         }
-    }.GetNewClosure())
+    })
 
     [void]$form.ShowDialog()
 }
