@@ -283,7 +283,7 @@ config-семантичної валідації; вона й далі відс�
 Приймається без змін навігаційна структура з §6 задачі (10 груп: Загальні /
 Шляхи та дані / Компоненти / Maintenance / Storage / Health / Scheduler /
 Console-Logging / Credentials / Effective configuration) — узгоджується з
-120-key inventory після Agent 1 verification.
+138-key inventory (§1, після P0 reconciliation).
 
 ## 8. Test plan (Agent 7)
 
@@ -301,4 +301,115 @@ persistence, presets, credentials-адаптер, повний test suite, docs)
 перед масовим кодуванням потрібне рішення власника про темп/розбивку
 подальшої роботи на окремі review-порції (Agent 1+2+3 backend спочатку,
 або паралельний запуск усіх — впливає на розмір і кількість наступних
-PR-ів згідно §20 задачі).
+PR-ів згідно §20 задачі). **Вирішено: backend спочатку (P0, завершено й
+merged), UI/Presets/Credentials/Preview — окрема ітерація (P1, цей
+розділ).**
+
+## 10. P1 — UI/Presets/Credentials/Preview architecture
+
+### 10.1. Model/UI межа
+
+UI НІКОЛИ не читає `$global:*Settings` чи будь-яку canonical runtime-
+структуру напряму — виключно через `BRAVO.Configurator.Model` API
+(`Setting[]`: Path/Metadata/DefaultValue/OverridePresent/OverrideValue/
+EffectiveValue/EffectiveSource/DisabledReason/ValidationState/
+DependencyState/Dirty). Кожна зміна в UI — виклик
+`Set-BRAVOConfiguratorOverride`/`Clear-BRAVOConfiguratorOverride`, що
+повертає НОВИЙ масив-модель (immutable snapshot); UI зберігає лише
+поточний знімок у власному стані форми. Жоден UI control не пише файл
+напряму — єдиний шлях до диска: `Invoke-BRAVOConfiguratorApply`.
+
+`BRAVO.Configurator.UI` (`modules/BRAVO.Configurator/BRAVO.Configurator.UI.psm1`)
+розділяє WinForms-специфічний код (побудова Form/TreeView/Controls) від
+чистих, headless-тестованих функцій без жодного `System.Windows.Forms`-
+типу в сигнатурі: `Get-BRAVOConfiguratorUIReachablePaths` (coverage-доказ:
+кожен Path зі схеми потрапляє в UI механічно, не через хардкод-форму),
+`Get-BRAVOConfiguratorUIFilteredSettings` (All/Changed/Active/Problems/
+Advanced), `Get-BRAVOConfiguratorUISearchMatches` (пошук за Path/Label/
+Description/Group), `Get-BRAVOConfiguratorUICategoryTree` (Group/Section
+зі схеми — не хардкоджена структура). Це дозволяє self-test-у перевірити
+UI-логіку в CI без інтерактивного desktop/ShowDialog().
+
+### 10.2. Presets (`BRAVO.Configurator.Presets`)
+
+Чисті model-трансформації — `Invoke-BRAVOConfiguratorPreset -Model -PresetName`
+повертає НОВИЙ Model[], торкаючись ЛИШЕ `componentSettings.SFTP.Enabled`/
+`componentSettings.SMB.Enabled` (master-switches; ніколи дочірніх
+прапорців — вони лишаються тим, чим були, канонічний master AND child
+контракт сам вирішує ефективну поведінку). `Current`/`Manual` — no-op.
+Жоден preset не пише файл; результат іде через звичайний
+Update-BRAVOConfiguratorEffective -> Preview -> Apply той самий шлях, що
+й ручне редагування.
+
+### 10.3. Credentials (`BRAVO.Configurator.Credentials`)
+
+Секрети НІКОЛИ не входять у Configurator model (сьогодні жоден
+schema-дескриптор не має `Secret=$true`). Requirement-формула
+(`Get-BRAVOConfiguratorCredentialRequirement`) обчислюється з canonical
+`storageEffective`/`bazaSyncEffective`/`backupMonitoring` структур —
+ідентична вирazу в `BRAVO_CREDENTIALS_SETUP.ps1::Resolve-RequestedComponents`.
+Ця формула НЕ винесена в спільну canonical функцію: `BRAVO_CREDENTIALS_SETUP.ps1`
+є executing entrypoint-скриптом (param() -> function defs -> top-level
+try{} з реальними записами/інтерактивними запитами), НЕ importable
+module — dot-source для "лише функцій" фактично запустив би повний
+credential setup flow. Це задокументована, вузька, обґрунтована виключна
+дублювання (не "вигадана" семантика — той самий вираз, з тих самих
+canonical джерел), а не нова незалежна політика.
+
+Found/Missing статус (`Invoke-BRAVOConfiguratorCredentialCheck`) — РЕАЛЬНИЙ
+non-destructive прогін `BRAVO_CREDENTIALS_SETUP.ps1 -Action Test -Component X`
+дочірнім процесом (canonical exit-code контракт: 0=знайдено, 1=Missing/
+Error) — без жодного незалежного читання Windows Credential Manager чи
+дублювання target-name resolution. "Налаштувати"
+(`Invoke-BRAVOConfiguratorCredentialSetup`) запускає той самий скрипт
+`-Action Ensure` інтерактивно в тій самій консолі — Configurator ніколи
+не бачить, не збирає й не передає секрет.
+
+### 10.4. Preview (`BRAVO.Configurator.Preview`)
+
+`Get-BRAVOConfiguratorPreview -ModelBefore -ModelAfter [-RequirementStateBefore] [-RequirementStateAfter]`
+— чистий diff двох уже обчислених Model[] (і опційно двох Credential-
+знімків): RawChanges (OverridePresent/OverrideValue), EffectiveChanges
+(EffectiveValue + DisabledReason), CredentialChanges (Required
+before/after), Warnings/BlockingErrors (з `Invoke-BRAVOConfiguratorValidation`
+над ModelAfter). Жодної I/O, жодної canonical-логіки — лише порівняння.
+Explicit фільтр `Metadata.Secret=$true` (сьогодні завжди порожній набір,
+але явний, не покладений на випадковість поточного стану схеми).
+
+### 10.5. Canonical candidate validation gate (P1.2)
+
+**Вже закритий за конструкцією, без додаткової роботи** — той самий
+висновок, що §6 "P0.3" вище: `Test-BRAVOConfiguratorCandidateOverrides`
+(Persistence, кроки 4-7) прогонить candidate через справжній
+`Import-BravoConfiguration` (canonical loader) ПЕРЕД будь-яким записом —
+`Apply` кнопка НЕ потребує додаткового disable/gate понад те, що
+Validation вже блокує (`HasBlockingErrors`). Жодного окремого
+`BRAVO_CONFIG_TEST.ps1`/`BRAVO_DRY_RUN.ps1` виклику не додано — той самий
+обґрунтований вибір, що P0.3, лишається чинним.
+
+### 10.6. E2E Apply flow і конфлікт паралельної зміни
+
+```
+Launch -> Get-BRAVOConfiguratorProductionOverrideState (baseline)
+       -> Get-BRAVOConfiguratorSchemaCatalog
+       -> Get-BRAVOConfiguratorModel (Default + поточні overrides)
+       -> Update-BRAVOConfiguratorEffective
+       -> [оператор редагує / застосовує preset]
+       -> Invoke-BRAVOConfiguratorValidation (Apply вимкнено, якщо HasBlockingErrors)
+       -> Get-BRAVOConfiguratorPreview (RawChanges/EffectiveChanges/CredentialChanges/Warnings/BlockingErrors)
+       -> [оператор підтверджує]
+       -> Invoke-BRAVOConfiguratorApply
+            (re-check baseline hash -> RaceDetection STOP, якщо змінився;
+             backup -> atomic replace -> reload -> verify)
+       -> reload production state + перерахувати Effective для UI
+```
+
+Race: якщо `Invoke-BRAVOConfiguratorApply` повертає `Stage='RaceDetection'`,
+UI показує: "BRAVO.local.config was changed by another process. Your
+changes were NOT written. Reload configuration before applying your
+changes." — без auto-merge; оператор явно перезавантажує (заново
+Get-BRAVOConfiguratorProductionOverrideState + перебудова моделі).
+`Invoke-BRAVOConfiguratorApply` НІКОЛИ не кидає виняток (P1.1-фікс:
+Serialization-стадія теж повертає структурований `Applied=$false`) — UI
+завжди отримує предбачуваний `{Applied, Stage, Reasons}`, не try/catch
+навколо непередбачуваного винятку.

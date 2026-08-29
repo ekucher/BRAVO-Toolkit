@@ -104,6 +104,19 @@ function ConvertTo-BRAVOConfiguratorPowerShellLiteral {
     if ($Value -is [bool]) { return $(if ($Value) { '$true' } else { '$false' }) }
     if ($Value -is [int] -or $Value -is [long]) { return [string]$Value }
     if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [float]) { return [string]$Value }
+    # Fail-closed, не мовчазний recurse (P2-фікс за результатами незалежного
+    # review): hashtable/IDictionary теж [System.Collections.IEnumerable], і
+    # раніше потрапляв у гілку нижче — але піпа хеш-таблиці через
+    # ForEach-Object повертає ЇЇ Ж САМУ як єдиний елемент (не пари
+    # ключ/значення), тому рекурсивний виклик отримував той самий $Value і
+    # йшов у нескінченну рекурсію до "call depth overflow". Документований
+    # контракт BRAVO.local.config — плаский 'dot.path' = скаляр|масив;
+    # вкладена hashtable ніколи не мала тут з'являтись, але
+    # Merge-BRAVOConfiguratorCandidateOverrides зберігає preserved
+    # unknown-ключі без перевірки типу, тому явна відмова тут потрібна.
+    if ($Value -is [System.Collections.IDictionary]) {
+        throw "BRAVO.Configurator.Effective: неможливо серіалізувати hashtable-значення в data-only BRAVO.local.config літерал (очікується скаляр або масив скалярів)."
+    }
     if ($Value -is [array] -or $Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
         $items = @($Value | ForEach-Object { ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $_ })
         return '@(' + [string]::Join(', ', $items) + ')'
@@ -212,6 +225,13 @@ function Invoke-BRAVOConfiguratorEffectiveComputation {
         return $resultObject
     }
     finally {
+        # P2 (незалежний review, Agent D): -ErrorAction SilentlyContinue тут
+        # свідомо, не недбало — AV lock/ще-не-звільнений handle на щойно
+        # завершеному дочірньому процесі не повинні перетворювати успішний
+        # Effective-результат на помилку. Рідкісний залишений
+        # BRAVO_CONFIGURATOR_EFFECTIVE_*-каталог у %TEMP% — гігієнічний
+        # артефакт (унікальний GUID, ніколи не використовується повторно,
+        # ніякого секрету в ньому), не функціональний дефект.
         Remove-Item -LiteralPath $isolatedRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
