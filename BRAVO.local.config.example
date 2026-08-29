@@ -141,6 +141,28 @@
     # 'componentSettings.SFTP.ArchiveUpload' = $true
     # 'componentSettings.SMB.ArchiveCopy' = $true
 
+    # --- Глобальні вимикачі зовнішніх сховищ (5.2.2) ---
+    # Enabled = $false вимикає ВСІ автоматичні мережеві операції
+    # відповідного destination (архіви, BAZA-синхронізацію, Health-
+    # моніторинг, Dry Run проби) і знімає вимогу креденшелів — без зміни
+    # дочірніх прапорців вище (ArchiveUpload/ArchiveCopy/BAZA_*_SFTP
+    # лишаються збереженими; повернення Enabled = $true відновлює
+    # попередню поведінку без повторного налаштування). Відсутній ключ
+    # (конфіг 5.2.1 і старіші) трактується як $true. Ручні операторські
+    # дії (BRAVO_DATA_RESTORE -Source SFTP, BRAVO_BAZA_RECONCILE, явне
+    # додавання креденшелів) залишаються доступними незалежно від цього
+    # вимикача.
+    #
+    # Сервер без SFTP:
+    # 'componentSettings.SFTP.Enabled' = $false
+    #
+    # Сервер без SMB/Samba/NAS:
+    # 'componentSettings.SMB.Enabled' = $false
+    #
+    # Local-only сервер (обидва вимкнені — валідна production-конфігурація):
+    # 'componentSettings.SFTP.Enabled' = $false
+    # 'componentSettings.SMB.Enabled' = $false
+
     # =========================================================
     # КОНСОЛЬ, ПРОГРЕС, ЛОГИ — фаза 1
     # =========================================================

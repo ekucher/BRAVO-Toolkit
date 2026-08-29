@@ -1337,6 +1337,49 @@ function ConvertTo-BRAVOSyncFlag {
     try { return [System.Convert]::ToBoolean($Value) } catch { return $false }
 }
 
+function Get-BRAVOEffectiveStorageConfiguration {
+    # ЄДИНЕ канонічне джерело правди про глобальні вимикачі зовнішніх
+    # сховищ (з 5.2.2). Згортає componentSettings.SFTP.Enabled /
+    # SMB.Enabled з дочірніми прапорцями в effective-значення ОДИН раз:
+    # Archive, Health, Maintenance, Dry Run і Credentials Setup споживають
+    # результат і не повторюють вираз "master AND child" самостійно.
+    # Raw-значення в componentSettings ніколи не мутуються — повернення
+    # Enabled = $true відновлює попередню effective-поведінку без
+    # повторного налаштування дочірніх прапорців.
+    [CmdletBinding()]
+    param(
+        [hashtable]$ComponentSettings
+    )
+
+    if ($null -eq $ComponentSettings) { $ComponentSettings = @{} }
+
+    $sftpNode = if ($ComponentSettings.Contains('SFTP') -and $ComponentSettings['SFTP'] -is [hashtable]) { $ComponentSettings['SFTP'] } else { @{} }
+    $smbNode = if ($ComponentSettings.Contains('SMB') -and $ComponentSettings['SMB'] -is [hashtable]) { $ComponentSettings['SMB'] } else { @{} }
+
+    # Відсутній ключ Enabled (legacy-конфіг 5.2.1 і старіші) = $true.
+    # Config Loader нормалізує/валідує значення до жорсткого [bool] ще до
+    # цього виклику; ConvertTo-BRAVOSyncFlag тут — та сама толерантність,
+    # що й для прапорців синхронізації, на випадок прямих викликів у тестах.
+    $sftpEnabled = if ($sftpNode.Contains('Enabled')) { ConvertTo-BRAVOSyncFlag $sftpNode['Enabled'] } else { $true }
+    $smbEnabled = if ($smbNode.Contains('Enabled')) { ConvertTo-BRAVOSyncFlag $smbNode['Enabled'] } else { $true }
+
+    $sftpArchiveUpload = ConvertTo-BRAVOSyncFlag $sftpNode['ArchiveUpload']
+    $smbArchiveCopy = ConvertTo-BRAVOSyncFlag $smbNode['ArchiveCopy']
+
+    return [pscustomobject]@{
+        SFTP = [pscustomobject]@{
+            Enabled = $sftpEnabled
+            ArchiveUpload = ($sftpEnabled -and $sftpArchiveUpload)
+            DisabledReason = if (-not $sftpEnabled) { 'SFTP глобально вимкнено (componentSettings.SFTP.Enabled = $false)' } else { $null }
+        }
+        SMB = [pscustomobject]@{
+            Enabled = $smbEnabled
+            ArchiveCopy = ($smbEnabled -and $smbArchiveCopy)
+            DisabledReason = if (-not $smbEnabled) { 'SMB глобально вимкнено (componentSettings.SMB.Enabled = $false)' } else { $null }
+        }
+    }
+}
+
 function Get-BRAVOEffectiveSynchronizationConfiguration {
     # ЄДИНЕ канонічне джерело правди про синхронізацію BAZA. Централізує:
     #   - чи потрібне заплановане BAZASync-завдання (SFTP-операція за
@@ -1354,15 +1397,19 @@ function Get-BRAVOEffectiveSynchronizationConfiguration {
         [string]$BazaAppSource,
         [string]$BazaWWWSource,
         $BazaWWWDetection,
-        [hashtable]$SftpDirectories
+        [hashtable]$SftpDirectories,
+        # Глобальний вимикач componentSettings.SFTP.Enabled (з 5.2.2).
+        # $false вимикає ОБИДВА SFTP-напрямки BAZA незалежно від дочірніх
+        # прапорців; default $true зберігає поведінку наявних викликів 5.2.1.
+        [bool]$GlobalSftpEnabled = $true
     )
 
     if ($null -eq $Synchronization) { $Synchronization = @{} }
 
     $appLocal = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_APP_LOCAL']
-    $appSftp = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_APP_SFTP']
+    $appSftp = ($GlobalSftpEnabled -and (ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_APP_SFTP']))
     $wwwLocal = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_WWW_LOCAL']
-    $wwwSftp = ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_WWW_SFTP']
+    $wwwSftp = ($GlobalSftpEnabled -and (ConvertTo-BRAVOSyncFlag $Synchronization['BAZA_WWW_SFTP']))
 
     $wwwReason = $null
     if ($null -ne $BazaWWWDetection -and
@@ -1419,6 +1466,7 @@ Export-ModuleMember -Function @(
     'Resolve-BRAVOEffectiveLimsRoot',
     'Resolve-BRAVOEffectiveSystemLogRoot',
     'Resolve-BRAVOEffectiveBackupRoot',
+    'Get-BRAVOEffectiveStorageConfiguration',
     'Get-BRAVOEffectiveSynchronizationConfiguration',
     'Test-BRAVODiscoveryResult',
     'Save-BRAVODiscoveryBaseline',

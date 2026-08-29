@@ -1,4 +1,4 @@
-# BRAVO 5.2.1 — архівація, обслуговування та контроль резервних копій
+# BRAVO 5.2.2-dev.1 — архівація, обслуговування та контроль резервних копій
 
 Цей комплект автоматизує:
 
@@ -237,7 +237,7 @@ $global:pathSettings = @{
 | `pathSettings` | `LIMSRoot`/`SystemLogRoot`/`BackupRoot` — усі три `""`=AUTO (розділ 2); `ArchiveRoot` більше немає |
 | `maintenanceSettings` | імена служб, каталог Br-a-vo.web, таймаути, `Retention.ArchiveDays` / `Retention.CompressedLogDays` (розділ 12) |
 | `maintenanceSettings.Limits` | `MinimumFreeSpaceGB`, `ExcludedDrives`, `MaximumMdFileSizeGB`, опційний `EstimatedSpaceMarginPercent` (розділ 3.3) |
-| `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати |
+| `componentSettings` | які архіви, BAZA, SFTP і SMB потрібно виконувати; `SFTP.Enabled`/`SMB.Enabled` — глобальні вимикачі destination (розділ 3.1) |
 | `backupConsistency` | обов'язковий режим `VSS` і контекст `ClientAccessible` для узгоджених архівів |
 | SFTP | `sftpHostTemplate`, порт, fingerprint `sftpHostKey`, віддалені каталоги |
 | `smbSettings` | реальний UNC-шлях і підкаталоги, якщо `ArchiveCopy = $true` |
@@ -259,6 +259,44 @@ $global:pathSettings = @{
 - локальну копію `BAZA_APP` (`BAZA_APP_LOCAL`);
 - локальну копію `BAZA_WWW` (`BAZA_WWW_LOCAL`);
 - копіювання архівів на SMB/NAS.
+
+### 3.1. Глобальні вимикачі зовнішніх сховищ (5.2.2)
+
+```text
+componentSettings.SFTP.Enabled
+├── ArchiveUpload
+├── (Synchronization.)BAZA_APP_SFTP
+└── (Synchronization.)BAZA_WWW_SFTP
+
+componentSettings.SMB.Enabled
+└── ArchiveCopy
+```
+
+`SFTP.Enabled = $false` / `SMB.Enabled = $false` — головні вимикачі
+відповідного destination: вимикають ВСІ автоматичні мережеві операції
+(архіви, BAZA-синхронізацію, Health-моніторинг, Dry Run проби) і знімають
+вимогу креденшелів, **не змінюючи** дочірні прапорці (`ArchiveUpload`,
+`ArchiveCopy`, `BAZA_*_SFTP`) — повернення `Enabled = $true` відновлює
+попередню поведінку без повторного налаштування. Відсутній ключ (конфіг
+5.2.1 і старіші) трактується як `$true`, тобто оновлення не змінює
+поточну поведінку.
+
+Ручні операторські дії лишаються доступними незалежно від вимикача:
+`BRAVO_DATA_RESTORE.ps1 -Source SFTP`, `BRAVO_BAZA_RECONCILE.ps1`, явне
+додавання SFTP/SMB-креденшелів через `BRAVO_CREDENTIALS_SETUP.ps1`.
+
+**Local-only режим** (`SFTP.Enabled = $false` і `SMB.Enabled = $false`
+одночасно) — валідна production-конфігурація: локальна архівація,
+локальна BAZA, service/local-backup Health, notifications продовжують
+працювати; scheduled завдання `BRAVO BAZA Synchronization` не
+реєструється; SFTP/SMB-креденшели не вимагаються.
+
+Приклади override у `BRAVO.local.config` — розділ "Глобальні вимикачі
+зовнішніх сховищ" у `BRAVO.local.config.example`.
+
+> Обмеження: `SMB.Enabled` не керує UNC-шляхами в `pathSettings`
+> (наприклад, `BackupRoot`, якщо він вказаний як `\\server\share`) —
+> це окремий, не пов'язаний з `componentSettings.SMB` механізм.
 
 Визначення BAZA обмежене рівно чотирма незалежними прапорцями в
 `componentSettings.Synchronization` — інших значень немає:

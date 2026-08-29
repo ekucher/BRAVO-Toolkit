@@ -998,6 +998,57 @@ SFTP-хост не резолвиться — інтернет і DNS працю
 
 ---
 
+## Глобальні вимикачі зовнішніх сховищ і local-only режим (5.2.2)
+
+**Що це.** `componentSettings.SFTP.Enabled` і `componentSettings.SMB.Enabled` —
+головні вимикачі відповідного destination. `$false` вимикає ВСІ
+автоматичні мережеві операції (архіви, BAZA-синхронізацію,
+Health-моніторинг, `BRAVO_DRY_RUN.ps1` проби) і знімає вимогу
+креденшелів — дочірні прапорці (`ArchiveUpload`, `ArchiveCopy`,
+`BAZA_*_SFTP`) при цьому НЕ змінюються: `Enabled = $true` відновлює
+попередню поведінку без повторного налаштування дочірніх флагів.
+Відсутній ключ (конфіг 5.2.1 і старіші) трактується як `$true` —
+оновлення саме по собі не змінює поведінку.
+
+**Коли використовувати.**
+
+| Сценарій | Override |
+|---|---|
+| Сервер без SFTP | `componentSettings.SFTP.Enabled = $false` |
+| Сервер без SMB/Samba/NAS | `componentSettings.SMB.Enabled = $false` |
+| Local-only сервер | обидва `= $false` — **валідна production-конфігурація** |
+
+Задавайте через `BRAVO.local.config` (приклад — `BRAVO.local.config.example`).
+
+**Що продовжує працювати в local-only режимі:** локальна архівація
+`MODEL`/`BLOG`/`BRAVOEXCH`, локальна BAZA, службовий Health, локальний
+backup Health, notifications. Scheduled завдання
+`BRAVO BAZA Synchronization` не реєструється (installer вважає це
+валідним DISABLED-станом, diagnose — `[SKIP]`).
+
+**Що лишається доступним попри вимикач** (операторська дія, не
+автоматика): `BRAVO_DATA_RESTORE.ps1 -Source SFTP` (disaster recovery),
+`BRAVO_BAZA_RECONCILE.ps1`, явне додавання SFTP/SMB-креденшелів через
+`BRAVO_CREDENTIALS_SETUP.ps1`.
+
+**Manual `-SyncBAZA` при `SFTP.Enabled = $false`:**
+`BRAVO_ARCHIV.ps1 -SyncBAZA` завершується чистим `SKIPPED`, `ExitCode = 0`,
+без жодного звернення до Credential Manager чи WinSCP.
+
+**Обмеження — читайте уважно.** `componentSettings.SMB.Enabled = $false`
+**не** блокує UNC-шляхи в `pathSettings` (наприклад, якщо `BackupRoot`
+явно вказаний як `\\server\share\...`) — це окремий, не пов'язаний з
+`componentSettings.SMB` механізм валідації шляхів. Якщо потрібен
+справжній local-only без будь-якого мережевого шляху, переконайтесь, що
+`pathSettings.BackupRoot`/`LIMSRoot`/`SystemLogRoot` теж локальні.
+
+**Ескалація.** Не застосовно — це конфігураційне рішення оператора, не
+збій. `Health`/`Dry Run` рендерять явний PASS/SKIPPED з причиною
+(`componentSettings.SFTP.Enabled = $false` / `SMB.Enabled = $false`),
+не WARNING і не ERROR.
+
+---
+
 ## Профілі реставрації: 24/7 vs сервер робочого часу
 
 Планова реставрація моделі (`Restore.Day`/`Restore.Time`, типово нд

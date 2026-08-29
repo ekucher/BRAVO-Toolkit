@@ -1,6 +1,35 @@
 # Changelog
 
-## Не випущено (developer)
+## 5.2.2-dev.1 (hotfix/5.2.2, у розробці)
+
+### Додано
+- Глобальні master-switches зовнішніх сховищ: `componentSettings.SFTP.Enabled`
+  та `componentSettings.SMB.Enabled` (відсутній ключ у legacy-конфігах = `$true`).
+  `Enabled = $false` вимикає всі автоматичні мережеві операції відповідного
+  destination (архіви, BAZA, Health, Maintenance, Dry Run проби) без зміни
+  дочірніх налаштувань; повторне ввімкнення відновлює попередню effective-поведінку.
+  Local-only режим (обидва `$false`) — підтримувана production-конфігурація.
+
+### Виправлено
+- `BRAVO_CREDENTIALS_SETUP.ps1`: формула обов'язковості SFTP-креденшелів не
+  враховувала `componentSettings.Synchronization.BAZA_WWW_SFTP` — сервер лише з
+  WWW-синхронізацією не вважав SFTP-креденшели обов'язковими.
+- `BRAVO_ARCHIV.ps1 -SyncBAZA` при глобально вимкненому SFTP завершується
+  чистим SKIPPED з кодом 0 (раніше конфігурація без жодної SFTP-цілі давала
+  помилковий exit 50).
+- `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1`:
+  `Invoke-BRAVOLegacyLogMigration` більше не знищує timestamp у вже
+  унікальному джерельному імені exchangAPI-журналу
+  (`exchangAPI_yyyy-MM-dd_HHmmss.log`) під час одноразової legacy-міграції —
+  раніше такий файл перейменовувався в `exchangAPI_N.log` через sequence-
+  гілку, призначену лише для старих sequence-стильних legacy-імен
+  (`exchangAPI.log`/`exchangAPI_1.log`). Виявлено на продакшені. Новий
+  `Test-BRAVOIsTimestampedExchangeApiLogName` розпізнає timestamped-формат і
+  скеровує такі файли через `NamingPolicy='Original'` (той самий контракт,
+  що вже застосовує поточна не-legacy ротація exchangAPI): ім'я зберігається
+  точно, колізія імені в призначенні — fail-closed (без перезапису, без
+  перейменування джерела). Старі sequence-стильні legacy-імена й далі
+  проходять через незмінену послідовну нумерацію.
 
 ---
 

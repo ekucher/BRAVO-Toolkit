@@ -108,9 +108,11 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
         BAZA_WWW_LOCAL = `$false
     }
     SFTP = @{
+        Enabled = `$false
         ArchiveUpload = `$false
     }
     SMB = @{
+        Enabled = `$false
         ArchiveCopy = `$false
     }
 }

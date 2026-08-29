@@ -379,3 +379,122 @@ try {
 } finally {
     Remove-Item -LiteralPath $successDedupScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+# ============================================================
+# componentSettings.SFTP.Enabled / SMB.Enabled (5.2.2): глобальні
+# master-вимикачі зовнішніх сховищ. Loader-нормалізація (відсутній ключ =
+# $true), strict-bool валідація (не-bool = канонічна помилка), raw vs
+# effective розділення і узгодження bazaSyncEffective/BAZASync.
+# Кожен сценарій — ізольований дочірній powershell.exe.
+# ============================================================
+$storageSwitchScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_STORAGESW_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+try {
+    [void][IO.Directory]::CreateDirectory($storageSwitchScenarioRoot)
+    $storageSwitchBackupDir = Join-Path $storageSwitchScenarioRoot 'SITE_DEFAULT'
+    [void][IO.Directory]::CreateDirectory($storageSwitchBackupDir)
+    $storageSwitchKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $storageSwitchBackupRootLine = '    BackupRoot    = ""'
+    $storageSwitchSftpBlock = "    SFTP = @{`r`n        Enabled = `$true`r`n        ArchiveUpload = `$true`r`n    }"
+    $storageSwitchSmbBlock = "    SMB = @{`r`n        Enabled = `$true"
+    foreach ($storageSwitchRequiredLine in @($storageSwitchBackupRootLine, $storageSwitchSftpBlock, $storageSwitchSmbBlock)) {
+        if (-not $storageSwitchKitText.Contains($storageSwitchRequiredLine)) {
+            throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено фрагмент '$storageSwitchRequiredLine' — оновіть підготовку storage-switch сценаріїв під нову форму конфігурації"
+        }
+    }
+    $storageSwitchHermeticText = $storageSwitchKitText.Replace(
+        $storageSwitchBackupRootLine,
+        "    BackupRoot    = '$($storageSwitchBackupDir.Replace("'", "''"))'"
+    )
+    # Probe: effective-значення, raw-збереження і узгодження деривацій в
+    # одному рядку — щоб кожен кейс перевірявся атомарно.
+    $storageSwitchProbeCommand = (
+        "try { " +
+        "Set-StrictMode -Version 2.0; " +
+        ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+        "[void](Import-BravoConfiguration -ConfigRoot '$storageSwitchScenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+        "'SFTPEN=' + [string]`$global:storageEffective.SFTP.Enabled + " +
+        "';SFTPUP=' + [string]`$global:storageEffective.SFTP.ArchiveUpload + " +
+        "';SMBEN=' + [string]`$global:storageEffective.SMB.Enabled + " +
+        "';SMBCP=' + [string]`$global:storageEffective.SMB.ArchiveCopy + " +
+        "';RAWUP=' + [string]`$global:componentSettings.SFTP.ArchiveUpload + " +
+        "';SCHED=' + [string]`$global:schedulerSettings.BAZASync.Enabled + " +
+        "';REQ=' + [string]`$global:bazaSyncEffective.ScheduledSftpSyncRequired " +
+        "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+    )
+    $storageSwitchCases = @(
+        @{
+            Name = 'ConfigLoader/StorageSwitchLegacyConfigDefaultsToEnabled'
+            ConfigText = $storageSwitchHermeticText.Replace("        Enabled = `$true`r`n", '')
+            LocalOverride = $null
+            Expected = 'SFTPEN=True;SFTPUP=True;SMBEN=True'
+            Failure = 'legacy-конфіг без componentSettings.SFTP.Enabled/SMB.Enabled мусить трактуватись як увімкнений (поведінка 5.2.1 зберігається)'
+        },
+        @{
+            Name = 'ConfigLoader/StorageSwitchSftpDisabledKeepsRawChildAndDropsEffective'
+            ConfigText = $storageSwitchHermeticText.Replace(
+                $storageSwitchSftpBlock,
+                "    SFTP = @{`r`n        Enabled = `$false`r`n        ArchiveUpload = `$true`r`n    }"
+            )
+            LocalOverride = $null
+            Expected = 'SFTPEN=False;SFTPUP=False;SMBEN=True;SMBCP=False;RAWUP=True;SCHED=False;REQ=False'
+            Failure = 'SFTP.Enabled=$false мусить занулити effective ArchiveUpload/BAZASync (SCHED/REQ=False), зберігши raw ArchiveUpload=$true; SMB незалежний'
+        },
+        @{
+            Name = 'ConfigLoader/StorageSwitchInvalidValueIsCanonicalConfigError'
+            ConfigText = $storageSwitchHermeticText.Replace(
+                $storageSwitchSftpBlock,
+                "    SFTP = @{`r`n        Enabled = 'yes'`r`n        ArchiveUpload = `$true`r`n    }"
+            )
+            LocalOverride = $null
+            Expected = 'CHILD-ERROR:'
+            ExpectedAlso = 'componentSettings.SFTP.Enabled'
+            Failure = "не-bool значення Enabled мусить давати канонічну помилку конфігурації (fail-closed), а не тихе приведення"
+        },
+        @{
+            Name = 'ConfigLoader/StorageSwitchLocalOverrideDisablesBothPhase1'
+            ConfigText = $storageSwitchHermeticText
+            LocalOverride = (
+                "@{`r`n" +
+                "    'componentSettings.SFTP.Enabled' = `$false`r`n" +
+                "    'componentSettings.SMB.Enabled' = `$false`r`n" +
+                "}`r`n"
+            )
+            Expected = 'SFTPEN=False;SFTPUP=False;SMBEN=False;SMBCP=False;RAWUP=True;SCHED=False;REQ=False'
+            Failure = 'BRAVO.local.config override обох master-вимикачів (фаза 1, до деривацій) мусить давати local-only режим без зміни raw-прапорців'
+        },
+        @{
+            Name = 'ConfigLoader/StorageSwitchReEnableRestoresEffectiveState'
+            ConfigText = $storageSwitchHermeticText
+            LocalOverride = $null
+            Expected = 'SFTPEN=True;SFTPUP=True;SMBEN=True;SMBCP=False;RAWUP=True;SCHED=True;REQ=True'
+            Failure = 'повернення Enabled=$true (комплектний дефолт) мусить відновлювати effective-поведінку 5.2.1 без ручної зміни дочірніх прапорців'
+        }
+    )
+    $storageSwitchLocalConfigPath = Join-Path $storageSwitchScenarioRoot 'BRAVO.local.config'
+    foreach ($storageSwitchCase in $storageSwitchCases) {
+        [IO.File]::WriteAllText(
+            (Join-Path $storageSwitchScenarioRoot 'BRAVO.config'),
+            [string]$storageSwitchCase.ConfigText,
+            (New-Object System.Text.UTF8Encoding $false)
+        )
+        if ($null -ne $storageSwitchCase.LocalOverride) {
+            [IO.File]::WriteAllText($storageSwitchLocalConfigPath, [string]$storageSwitchCase.LocalOverride, (New-Object System.Text.UTF8Encoding $false))
+        } elseif (Test-Path -LiteralPath $storageSwitchLocalConfigPath) {
+            Remove-Item -LiteralPath $storageSwitchLocalConfigPath -Force
+        }
+        $storageSwitchProbe = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $storageSwitchProbeCommand 2>&1 | Out-String
+        )
+        $storageSwitchMatched = $storageSwitchProbe.Contains([string]$storageSwitchCase.Expected)
+        if ($storageSwitchMatched -and $storageSwitchCase.Contains('ExpectedAlso')) {
+            $storageSwitchMatched = $storageSwitchProbe.Contains([string]$storageSwitchCase.ExpectedAlso)
+        }
+        Test-BRAVOCondition `
+            -Condition $storageSwitchMatched `
+            -Name ([string]$storageSwitchCase.Name) `
+            -Failure "$($storageSwitchCase.Failure); отримано: $storageSwitchProbe"
+    }
+} finally {
+    Remove-Item -LiteralPath $storageSwitchScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+}

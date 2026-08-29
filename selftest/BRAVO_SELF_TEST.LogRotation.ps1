@@ -48,6 +48,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             "Move-BRAVOLogWithSequence",
             "New-BRAVOLogRotationSummary",
             "Get-BRAVOExchangeApiLogFiles",
+            "Test-BRAVOIsTimestampedExchangeApiLogName",
             "Get-BRAVOApacheLogFiles",
             "Get-BRAVOWebApplicationLogFiles",
             "Write-BRAVOLogRotationSummary",
@@ -1113,6 +1114,241 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/24-PartialMigrationRetainsSource" `
             -Failure "при частковій невдачі міграції невдалий файл і legacy-каталог мають лишитись для наступного запуску, а успішні — залишитись мігрованими"
+
+        # --- Test 24a: продакшен-знахідка — timestamped exchangAPI legacy-ім'я
+        # зберігається БЕЗ перейменування у sequence-стиль ---
+        $test24aArchiveRoot = Join-Path $rotationTestRoot "test24a\ARCHIV"
+        $test24aLegacyPath = Join-Path $test24aArchiveRoot "exchangAPI"
+        $test24aDestination = Join-Path $test24aArchiveRoot "LOGS\exchangAPI"
+        [void](New-BRAVOLogRotationFixture -Directory $test24aLegacyPath -Name "exchangAPI_2026-05-18_235930.log" -Content "timestamped-payload")
+        $test24aResult = Invoke-BRAVORotationHelper -Body {
+            param($LegacyPath, $DestinationPath, $Logger)
+            Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $LegacyPath `
+                -DestinationPath $DestinationPath `
+                -LogicalBaseName 'exchangAPI' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test24aLegacyPath, $test24aDestination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test24aResult.Migrated -eq 1 -and
+                [int]$test24aResult.Failed -eq 0 -and
+                (Test-Path -LiteralPath (Join-Path $test24aDestination "exchangAPI_2026-05-18_235930.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test24aDestination "exchangAPI_1.log")) -and
+                -not (Test-Path -LiteralPath $test24aLegacyPath)
+            ) `
+            -Name "LogRotation/LegacyExchangeApiTimestampNamePreserved" `
+            -Failure "timestamped legacy exchangAPI-файл має мігрувати з ТИМ САМИМ іменем (exchangAPI_2026-05-18_235930.log), а не перетворитись на exchangAPI_1.log"
+
+        # --- Test 24b: кілька timestamped-файлів — кожен зберігає власне ім'я ---
+        $test24bArchiveRoot = Join-Path $rotationTestRoot "test24b\ARCHIV"
+        $test24bLegacyPath = Join-Path $test24bArchiveRoot "exchangAPI"
+        $test24bDestination = Join-Path $test24bArchiveRoot "LOGS\exchangAPI"
+        $test24bNames = @(
+            "exchangAPI_2025-08-18_211452.log",
+            "exchangAPI_2026-05-18_235930.log",
+            "exchangAPI_2026-05-19_010000.log"
+        )
+        foreach ($test24bName in $test24bNames) {
+            [void](New-BRAVOLogRotationFixture -Directory $test24bLegacyPath -Name $test24bName -Content $test24bName)
+        }
+        $test24bResult = Invoke-BRAVORotationHelper -Body {
+            param($LegacyPath, $DestinationPath, $Logger)
+            Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $LegacyPath `
+                -DestinationPath $DestinationPath `
+                -LogicalBaseName 'exchangAPI' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test24bLegacyPath, $test24bDestination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test24bResult.Migrated -eq 3 -and
+                [int]$test24bResult.Failed -eq 0 -and
+                (@($test24bNames | ForEach-Object {
+                    Test-Path -LiteralPath (Join-Path $test24bDestination $_)
+                }) -notcontains $false) -and
+                (@(Get-ChildItem -LiteralPath $test24bDestination -File).Count -eq 3)
+            ) `
+            -Name "LogRotation/LegacyExchangeApiMultipleTimestampNamesPreserved" `
+            -Failure "усі три timestamped legacy-файли мають мігрувати кожен під власним оригінальним іменем, без взаємних колізій чи перенумерації"
+
+        # --- Test 24c: timestamped-гілка не використовує sequence engine
+        # (немає каталогу-дати, немає _N-нумерації) ---
+        $test24cArchiveRoot = Join-Path $rotationTestRoot "test24c\ARCHIV"
+        $test24cLegacyPath = Join-Path $test24cArchiveRoot "exchangAPI"
+        $test24cDestination = Join-Path $test24cArchiveRoot "LOGS\exchangAPI"
+        [void](New-BRAVOLogRotationFixture `
+            -Directory $test24cLegacyPath `
+            -Name "exchangAPI_2026-05-18_235930.log" `
+            -Content "x" `
+            -LastWriteTime ([datetime]"2026-05-18T23:59:30"))
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($LegacyPath, $DestinationPath, $Logger)
+            Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $LegacyPath `
+                -DestinationPath $DestinationPath `
+                -LogicalBaseName 'exchangAPI' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test24cLegacyPath, $test24cDestination, $rotationLogger))
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath (Join-Path $test24cDestination "exchangAPI_2026-05-18_235930.log")) -and
+                -not (Test-Path -LiteralPath (Join-Path $test24cDestination "2026-05-18")) -and
+                (@(Get-ChildItem -LiteralPath $test24cDestination -Directory -ErrorAction SilentlyContinue).Count -eq 0)
+            ) `
+            -Name "LogRotation/LegacyExchangeApiTimestampMigrationDoesNotUseSequence" `
+            -Failure "timestamped exchangAPI-файл має лягти ПЛОСКО в корінь призначення (той самий контракт, що й поточна НЕ-legacy ротація) — без каталогу-дати за LastWriteTime і без sequence engine"
+
+        # --- Test 24d: вміст/розмір не змінюються при міграції ---
+        $test24dArchiveRoot = Join-Path $rotationTestRoot "test24d\ARCHIV"
+        $test24dLegacyPath = Join-Path $test24dArchiveRoot "exchangAPI"
+        $test24dDestination = Join-Path $test24dArchiveRoot "LOGS\exchangAPI"
+        $test24dSourcePath = New-BRAVOLogRotationFixture -Directory $test24dLegacyPath -Name "exchangAPI_2026-05-18_235930.log" -Content "byte-identical-payload-12345"
+        $test24dSourceHash = (Get-FileHash -LiteralPath $test24dSourcePath -Algorithm SHA256).Hash
+        [void](Invoke-BRAVORotationHelper -Body {
+            param($LegacyPath, $DestinationPath, $Logger)
+            Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $LegacyPath `
+                -DestinationPath $DestinationPath `
+                -LogicalBaseName 'exchangAPI' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test24dLegacyPath, $test24dDestination, $rotationLogger))
+        $test24dDestinationPath = Join-Path $test24dDestination "exchangAPI_2026-05-18_235930.log"
+        $test24dDestinationHash = if (Test-Path -LiteralPath $test24dDestinationPath) {
+            (Get-FileHash -LiteralPath $test24dDestinationPath -Algorithm SHA256).Hash
+        } else { $null }
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $test24dDestinationHash -and
+                $test24dDestinationHash -eq $test24dSourceHash
+            ) `
+            -Name "LogRotation/LegacyExchangeApiTimestampContentPreserved" `
+            -Failure "SHA256 timestamped exchangAPI-файла до і після міграції має збігатися — очікувано $test24dSourceHash, отримано $test24dDestinationHash"
+
+        # --- Test 24e: колізія імені у призначенні -> fail-closed, без
+        # перезапису й без перейменування джерела ---
+        $test24eArchiveRoot = Join-Path $rotationTestRoot "test24e\ARCHIV"
+        $test24eLegacyPath = Join-Path $test24eArchiveRoot "exchangAPI"
+        $test24eDestination = Join-Path $test24eArchiveRoot "LOGS\exchangAPI"
+        $test24eSourcePath = New-BRAVOLogRotationFixture -Directory $test24eLegacyPath -Name "exchangAPI_2026-05-18_235930.log" -Content "source-content"
+        [void](New-BRAVOLogRotationFixture -Directory $test24eDestination -Name "exchangAPI_2026-05-18_235930.log" -Content "already-there")
+        $test24eResult = Invoke-BRAVORotationHelper -Body {
+            param($LegacyPath, $DestinationPath, $Logger)
+            Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $LegacyPath `
+                -DestinationPath $DestinationPath `
+                -LogicalBaseName 'exchangAPI' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test24eLegacyPath, $test24eDestination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test24eResult.Failed -eq 1 -and
+                [int]$test24eResult.Migrated -eq 0 -and
+                (Test-Path -LiteralPath $test24eSourcePath) -and
+                (Get-Content -LiteralPath $test24eSourcePath -Raw) -eq 'source-content' -and
+                (Get-Content -LiteralPath (Join-Path $test24eDestination "exchangAPI_2026-05-18_235930.log") -Raw) -eq 'already-there' -and
+                -not (Test-Path -LiteralPath (Join-Path $test24eDestination "exchangAPI_2026-05-18_235930_1.log"))
+            ) `
+            -Name "LogRotation/LegacyExchangeApiTimestampCollisionFailsClosed" `
+            -Failure "колізія імені при міграції timestamped exchangAPI-файла має завершитись ПОМИЛКОЮ: джерело на місці, ціль не перезаписана, жодного _1-суфікса не згенеровано"
+
+        # --- Test 24f: повторний запуск міграції ідемпотентний ---
+        $test24fArchiveRoot = Join-Path $rotationTestRoot "test24f\ARCHIV"
+        $test24fLegacyPath = Join-Path $test24fArchiveRoot "exchangAPI"
+        $test24fDestination = Join-Path $test24fArchiveRoot "LOGS\exchangAPI"
+        [void](New-BRAVOLogRotationFixture -Directory $test24fLegacyPath -Name "exchangAPI_2026-05-18_235930.log" -Content "idempotent-payload")
+        foreach ($migrationPass in @(1, 2)) {
+            [void](Invoke-BRAVORotationHelper -Body {
+                param($LegacyPath, $DestinationPath, $Logger)
+                Invoke-BRAVOLegacyLogMigration `
+                    -LegacyPath $LegacyPath `
+                    -DestinationPath $DestinationPath `
+                    -LogicalBaseName 'exchangAPI' `
+                    -RetryCount 1 `
+                    -RetryDelaySeconds 0 `
+                    -Logger $Logger
+            } -Arguments @($test24fLegacyPath, $test24fDestination, $rotationLogger))
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-Path -LiteralPath (Join-Path $test24fDestination "exchangAPI_2026-05-18_235930.log")) -and
+                (@(Get-ChildItem -LiteralPath $test24fDestination -File).Count -eq 1) -and
+                -not (Test-Path -LiteralPath $test24fLegacyPath)
+            ) `
+            -Name "LogRotation/LegacyExchangeApiTimestampMigrationIdempotent" `
+            -Failure "повторний запуск міграції над тим самим legacy-деревом не повинен створювати дублікатів чи _migrated_N-варіантів — перший прогін уже переніс і прибрав джерело"
+
+        # --- Test 24g: старі sequence-стильні legacy-імена й далі мігрують
+        # через попередню (незмінену) поведінку — сумісність збережена ---
+        $test24gArchiveRoot = Join-Path $rotationTestRoot "test24g\ARCHIV"
+        $test24gLegacyPath = Join-Path $test24gArchiveRoot "exchangAPI"
+        $test24gDestination = Join-Path $test24gArchiveRoot "LOGS\exchangAPI"
+        [void](New-BRAVOLogRotationFixture `
+            -Directory $test24gLegacyPath `
+            -Name "exchangAPI_3.log" `
+            -Content "old-sequence-style" `
+            -LastWriteTime ([datetime]"2026-07-05T09:00:00"))
+        $test24gResult = Invoke-BRAVORotationHelper -Body {
+            param($LegacyPath, $DestinationPath, $Logger)
+            Invoke-BRAVOLegacyLogMigration `
+                -LegacyPath $LegacyPath `
+                -DestinationPath $DestinationPath `
+                -LogicalBaseName 'exchangAPI' `
+                -RetryCount 1 `
+                -RetryDelaySeconds 0 `
+                -Logger $Logger
+        } -Arguments @($test24gLegacyPath, $test24gDestination, $rotationLogger)
+        Test-BRAVOCondition `
+            -Condition (
+                [int]$test24gResult.Migrated -eq 1 -and
+                (Test-Path -LiteralPath (Join-Path $test24gDestination "2026-07-05\exchangAPI_1.log"))
+            ) `
+            -Name "LogRotation/LegacyExchangeApiOldSequenceCompatibility" `
+            -Failure "стара поведінка для СПРАВЖНІХ legacy sequence-імен (exchangAPI_3.log) має лишитись незмінною: каталог-дата за LastWriteTime + sequence engine (exchangAPI_1.log), той самий контракт, що LogRotation/23"
+
+        # --- Test 24h: детектор timestamped-імені узгоджений з тим, які
+        # файли поточна (НЕ-legacy) ротація exchangAPI взагалі вважає своїми ---
+        $test24hPositive = @(
+            "exchangAPI_2026-05-18_235930.log",
+            "exchangAPI_2025-08-18_211452.log",
+            "exchangAPI_2026-01-01_000000.log"
+        )
+        $test24hNegative = @(
+            "exchangAPI.log",
+            "exchangAPI_1.log",
+            "exchangAPI_25.log",
+            "exchangAPI_2026-05-18_235930.mdz",
+            "exchangAPI_2026-5-18_235930.log",
+            "Trace_2026-05-18_235930.log",
+            "exchangAPI_20260518_235930.log"
+        )
+        $test24hPositiveResults = @($test24hPositive | ForEach-Object {
+            Invoke-BRAVORotationHelper -Body {
+                param($Name) Test-BRAVOIsTimestampedExchangeApiLogName -Name $Name
+            } -Arguments @($_)
+        })
+        $test24hNegativeResults = @($test24hNegative | ForEach-Object {
+            Invoke-BRAVORotationHelper -Body {
+                param($Name) Test-BRAVOIsTimestampedExchangeApiLogName -Name $Name
+            } -Arguments @($_)
+        })
+        Test-BRAVOCondition `
+            -Condition (
+                ($test24hPositiveResults -notcontains $false) -and
+                ($test24hNegativeResults -notcontains $true)
+            ) `
+            -Name "LogRotation/ExchangeApiNormalAndLegacyNamingContractMatch" `
+            -Failure "Test-BRAVOIsTimestampedExchangeApiLogName має розпізнавати рівно формат <Base>_yyyy-MM-dd_HHmmss.log (той, що пише сучасний застосунок і зберігає поточна НЕ-legacy ротація) і відхиляти старі sequence-імена, .mdz, чужі компоненти та формати, що не збігаються буквально"
 
         # --- Test 25: CompressedLogDays — окрема політика для .mdz ---
         $test25Path = Join-Path $rotationTestRoot "test25\Trace"
