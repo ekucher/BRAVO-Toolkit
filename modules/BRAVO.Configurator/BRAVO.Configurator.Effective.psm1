@@ -72,8 +72,14 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
     }
 
     $isolatedRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_CONFIGURATOR_EFFECTIVE_' + [Guid]::NewGuid().ToString('N'))
-    New-Item -ItemType Directory -Path $isolatedRoot -Force | Out-Null
-    Copy-Item -LiteralPath $sourceConfigPath -Destination (Join-Path $isolatedRoot 'BRAVO.config') -Force
+    New-Item -ItemType Directory -Path $isolatedRoot -Force -ErrorAction Stop | Out-Null
+    # P2-A (той самий root-cause клас, що BRAVO.Configurator.Persistence
+    # AtomicReplace/PostApplyVerification hermetic-тести реально виявили):
+    # без -ErrorAction Stop файлова IOException тут успадковує
+    # $ErrorActionPreference викликача й може НЕ termінувати виконання під
+    # дефолтним 'Continue' — isolated root лишився б без BRAVO.config
+    # мовчки замість явного throw.
+    Copy-Item -LiteralPath $sourceConfigPath -Destination (Join-Path $isolatedRoot 'BRAVO.config') -Force -ErrorAction Stop
 
     if ($CandidateOverrides.Count -gt 0) {
         $localConfigLines = New-Object System.Collections.Generic.List[string]
