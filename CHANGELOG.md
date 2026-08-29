@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.2.2-rc.1 — 2026-08-29
+
+Release-metadata-only promotion of `5.2.2-dev.1` (нижче) до Release
+Candidate: `packageVersion`/`releaseChannel` bump per `RELEASE_POLICY.md`
+розділ 8, без функціональних runtime-змін відносно implementation-коміту
+`a5eec35` (`feat(storage): add global SFTP and SMB controls for 5.2.2`).
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1476 PASS / 0 FAIL), Parser,
+PSScriptAnalyzer, ForbiddenPattern, Runtime Manifest, Tools Manifest,
+ReleasePolicy — усі PASS. Real-server acceptance ще не проводився —
+обов'язковий перед промоцією в stable (SFTP ON/OFF × SMB ON/OFF та
+exchangAPI legacy-міграція на ізольованій fixture).
+
 ## 5.2.2-dev.1 (hotfix/5.2.2, у розробці)
 
 ### Додано
