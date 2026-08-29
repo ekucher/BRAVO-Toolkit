@@ -225,6 +225,13 @@ function Invoke-BRAVOConfiguratorEffectiveComputation {
         return $resultObject
     }
     finally {
+        # P2 (незалежний review, Agent D): -ErrorAction SilentlyContinue тут
+        # свідомо, не недбало — AV lock/ще-не-звільнений handle на щойно
+        # завершеному дочірньому процесі не повинні перетворювати успішний
+        # Effective-результат на помилку. Рідкісний залишений
+        # BRAVO_CONFIGURATOR_EFFECTIVE_*-каталог у %TEMP% — гігієнічний
+        # артефакт (унікальний GUID, ніколи не використовується повторно,
+        # ніякого секрету в ньому), не функціональний дефект.
         Remove-Item -LiteralPath $isolatedRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

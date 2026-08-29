@@ -805,6 +805,16 @@ function Show-BRAVOConfiguratorMainForm {
     $validationLabel.Width = 500
     $bottomPanel.Controls.Add($validationLabel)
 
+    # P2-фікс за результатами незалежного review (Agent D): повідомлення
+    # RaceDetection буквально каже "Reload configuration before applying
+    # your changes", але до цього фіксу форма не мала жодного способу це
+    # зробити — лише закрити й перезапустити BRAVO_CONFIGURATOR.ps1.
+    $reloadButton = New-Object System.Windows.Forms.Button
+    $reloadButton.Text = 'Перезавантажити'
+    $reloadButton.Location = New-Object System.Drawing.Point(570, 15)
+    $reloadButton.Width = 120
+    $bottomPanel.Controls.Add($reloadButton)
+
     $recalculateButton = New-Object System.Windows.Forms.Button
     $recalculateButton.Text = 'Перерахувати'
     $recalculateButton.Location = New-Object System.Drawing.Point(700, 15)
@@ -1041,6 +1051,39 @@ function Show-BRAVOConfiguratorMainForm {
 
     $cancelButton.Add_Click({
         if (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state) { $form.Close() }
+    }.GetNewClosure())
+
+    # P2-фікс за результатами незалежного review (Agent D): раніше
+    # єдиний спосіб реально "reload configuration" (як велить
+    # RaceDetection-повідомлення нижче) — закрити форму й перезапустити
+    # BRAVO_CONFIGURATOR.ps1. Той самий discard-confirm gate, що Cancel/
+    # FormClosing — reload відкидає незастосовані правки, тому потребує
+    # такого ж явного підтвердження.
+    $reloadButton.Add_Click({
+        if (-not (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state)) { return }
+        $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        try {
+            $state.ProductionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $state.RuntimeRoot -ProductionConfigDirectory $state.ProductionConfigDirectory
+            $reloadedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $state.SchemaCatalog -DefaultConfig $defaultConfig -LocalOverrides $state.ProductionBaseline.Overrides
+            $reloadedModel = Update-BRAVOConfiguratorEffective -Model $reloadedModel -RuntimeRoot $state.RuntimeRoot
+            $state.Model = $reloadedModel
+            $state.OriginalModel = $reloadedModel
+            $state.ValidationResult = Invoke-BRAVOConfiguratorValidation -Model $reloadedModel
+            $state.EffectiveStale = $false
+            try {
+                $reloadedSnapshot = Get-BRAVOConfiguratorUIEffectiveConfigSnapshot -State $state
+                $state.RequirementBefore = Get-BRAVOConfiguratorCredentialRequirement -EffectiveConfig $reloadedSnapshot
+            } catch {
+                $state.RequirementBefore = $null
+            }
+        } catch {
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
+            Show-BRAVOConfiguratorUIMessage -Text "Не вдалося перезавантажити конфігурацію з диска: $($_.Exception.Message)" -Icon Error
+            return
+        }
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        & $refreshCenterPanel
+        Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
     }.GetNewClosure())
 
     $form.Add_FormClosing({

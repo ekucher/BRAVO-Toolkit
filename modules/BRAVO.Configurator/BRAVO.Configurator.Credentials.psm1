@@ -113,6 +113,10 @@ function Invoke-BRAVOConfiguratorCredentialCheck {
     } catch {
         return [pscustomobject]@{ Component = $Component; Status = 'Error'; ExitCode = $null; Reason = $_.Exception.Message }
     } finally {
+        # P2 (незалежний review, Agent D): те саме обґрунтування, що
+        # Effective.psm1 — свідомий SilentlyContinue, не недбалість; жоден
+        # секрет у цей каталог не потрапляє (лише stdout/stderr canonical
+        # -Action Test, який сам ніколи не друкує відкритий пароль).
         Remove-Item -LiteralPath $logDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
