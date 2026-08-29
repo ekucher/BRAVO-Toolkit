@@ -9,6 +9,22 @@
 # Ізоляція: жодна перевірка не читає й не пише реальний
 # $root\BRAVO.local.config — лише тимчасові каталоги в %TEMP%, видалені у
 # finally.
+#
+# Герметичність RuntimeRoot (CI-регресія, той самий клас, що
+# selftest\BRAVO_SELF_TEST.ConfigLoader.ps1 вже документує для
+# BackupRoot=""): Configurator.Effective копіює $RuntimeRoot\BRAVO.config
+# У isolated ConfigRoot ВЕРБАТИМ, без жодного патчингу. Канонічний
+# комплектний default LIMSRoot=""/BackupRoot="" (AUTO) на реальному
+# production-сервері резолвиться через встановлену службу BRAVO; на
+# GitHub runner (і будь-якій dev-машині без LIMS) AUTO-виявлення падає з
+# "Не вдалося визначити BackupRoot" — жоден Configurator-виклик з
+# порожнім/без-override candidate (у т.ч. ВСЕРЕДИНІ production
+# Test-BRAVOConfiguratorCandidateOverrides, яка завжди рахує ВЛАСНИЙ
+# DefaultConfig з -CandidateOverrides @{}) не може обійти цю залежність
+# лише через overrides, передані САМИМ self-test-ом. Тому весь фрагмент
+# передає RuntimeRoot = ІЗОЛЬОВАНА копія реального комплекту з ЄДИНОЮ
+# зміною — явний LIMSRoot/BackupRoot замість AUTO (той самий text-replace
+# прийом, що ConfigLoader.ps1), а не реальний $root.
 
 $configuratorModuleRoot = Join-Path $root 'modules\BRAVO.Configurator'
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Schema.psm1') -Force
@@ -16,6 +32,31 @@ Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.p
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Model.psm1') -Force
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Validation.psm1') -Force
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Persistence.psm1') -Force
+
+$configuratorFixtureRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_CONFIGURATOR_SELFTEST_RUNTIME_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($configuratorFixtureRuntimeRoot)
+$configuratorFixtureLimsRoot = Join-Path $configuratorFixtureRuntimeRoot 'FIXTURE_LIMS'
+$configuratorFixtureBackupRoot = Join-Path $configuratorFixtureRuntimeRoot 'FIXTURE_BACKUP'
+[void][IO.Directory]::CreateDirectory($configuratorFixtureLimsRoot)
+[void][IO.Directory]::CreateDirectory($configuratorFixtureBackupRoot)
+Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination (Join-Path $configuratorFixtureRuntimeRoot 'BRAVO_CONFIG_LOADER.ps1') -Force
+Copy-Item -LiteralPath (Join-Path $root 'VERSION.json') -Destination (Join-Path $configuratorFixtureRuntimeRoot 'VERSION.json') -Force
+# Junction, не copy: modules\ — великий, реальні збірки викликів
+# (Discovery/Compatibility) мають лишатися canonical-кодом репозиторію,
+# не копією, що могла б непомітно розійтись.
+$null = cmd.exe /c mklink /J "$configuratorFixtureRuntimeRoot\modules" "$root\modules" 2>&1
+$configuratorKitConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+$configuratorLimsRootLiteralLine = '    LIMSRoot      = ""'
+$configuratorBackupRootLiteralLine = '    BackupRoot    = ""'
+if (-not $configuratorKitConfigText.Contains($configuratorLimsRootLiteralLine) -or
+    -not $configuratorKitConfigText.Contains($configuratorBackupRootLiteralLine)) {
+    throw "BRAVO_SELF_TEST.Configurator: у BRAVO.config не знайдено очікувані рядки LIMSRoot/BackupRoot — оновіть fixture під нову форму конфігурації"
+}
+$configuratorPatchedConfigText = $configuratorKitConfigText.
+    Replace($configuratorLimsRootLiteralLine, "    LIMSRoot      = '$($configuratorFixtureLimsRoot.Replace("'", "''"))'").
+    Replace($configuratorBackupRootLiteralLine, "    BackupRoot    = '$($configuratorFixtureBackupRoot.Replace("'", "''"))'")
+[IO.File]::WriteAllText((Join-Path $configuratorFixtureRuntimeRoot 'BRAVO.config'), $configuratorPatchedConfigText, (New-Object System.Text.UTF8Encoding($false)))
 
 # ===== Schema completeness (§3.4 задачі Configurator-а) =====
 $configuratorSchemaResult = Test-BRAVOConfiguratorSchemaCompleteness -ExamplePath (Join-Path $root 'BRAVO.local.config.example')
@@ -30,11 +71,11 @@ Test-BRAVOCondition ($configuratorSchemaResult.ConfigurableTotal -gt 100) `
 
 # ===== Model: Default/Override/Effective/Dirty (§22.4-6 задачі) =====
 $configuratorSchemaCatalog = Get-BRAVOConfiguratorSchemaCatalog
-$configuratorDefaultConfig = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $root -CandidateOverrides @{}
+$configuratorDefaultConfig = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $configuratorFixtureRuntimeRoot -CandidateOverrides @{}
 
 # 4: no override -> Effective=Default
 $modelNoOverride = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
-$modelNoOverride = Update-BRAVOConfiguratorEffective -Model $modelNoOverride -RuntimeRoot $root
+$modelNoOverride = Update-BRAVOConfiguratorEffective -Model $modelNoOverride -RuntimeRoot $configuratorFixtureRuntimeRoot
 $backupRootSettingNoOverride = @($modelNoOverride | Where-Object { $_.Path -eq 'pathSettings.BackupRoot' })
 Test-BRAVOCondition ($backupRootSettingNoOverride.Count -eq 1 -and $backupRootSettingNoOverride[0].EffectiveValue -eq $backupRootSettingNoOverride[0].DefaultValue) `
     'Configurator Model: без override Effective=Default' `
@@ -42,7 +83,7 @@ Test-BRAVOCondition ($backupRootSettingNoOverride.Count -eq 1 -and $backupRootSe
 
 # 5: explicit override -> Effective=Override
 $modelWithOverride = Set-BRAVOConfiguratorOverride -Model $modelNoOverride -Path 'pathSettings.BackupRoot' -Value 'E:\SELFTEST_BACKUP_ROOT'
-$modelWithOverride = Update-BRAVOConfiguratorEffective -Model $modelWithOverride -RuntimeRoot $root
+$modelWithOverride = Update-BRAVOConfiguratorEffective -Model $modelWithOverride -RuntimeRoot $configuratorFixtureRuntimeRoot
 $backupRootSettingOverride = @($modelWithOverride | Where-Object { $_.Path -eq 'pathSettings.BackupRoot' })
 Test-BRAVOCondition ($backupRootSettingOverride.Count -eq 1 -and $backupRootSettingOverride[0].EffectiveValue -eq 'E:\SELFTEST_BACKUP_ROOT' -and $backupRootSettingOverride[0].EffectiveSource -eq 'Override') `
     'Configurator Model: explicit override -> Effective=Override' `
@@ -64,7 +105,7 @@ $modelScenarioA = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $true
     'componentSettings.SFTP.ArchiveUpload' = $true
 }
-$modelScenarioA = Update-BRAVOConfiguratorEffective -Model $modelScenarioA -RuntimeRoot $root
+$modelScenarioA = Update-BRAVOConfiguratorEffective -Model $modelScenarioA -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioA = @($modelScenarioA | Where-Object { $_.Path -eq 'componentSettings.SFTP.ArchiveUpload' })
 Test-BRAVOCondition ($settingScenarioA.Count -eq 1 -and [bool]$settingScenarioA[0].EffectiveValue -eq $true) `
     'Configurator 5.2.2 Scenario A: SFTP.Enabled=true + ArchiveUpload raw=true -> Effective=true' `
@@ -77,7 +118,7 @@ $modelScenarioB = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $false
     'componentSettings.SFTP.ArchiveUpload' = $true
 }
-$modelScenarioB = Update-BRAVOConfiguratorEffective -Model $modelScenarioB -RuntimeRoot $root
+$modelScenarioB = Update-BRAVOConfiguratorEffective -Model $modelScenarioB -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioB = @($modelScenarioB | Where-Object { $_.Path -eq 'componentSettings.SFTP.ArchiveUpload' })
 Test-BRAVOCondition (
     $settingScenarioB.Count -eq 1 -and
@@ -94,7 +135,7 @@ $modelScenarioC = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $false
     'componentSettings.Synchronization.BAZA_APP_SFTP' = $true
 }
-$modelScenarioC = Update-BRAVOConfiguratorEffective -Model $modelScenarioC -RuntimeRoot $root
+$modelScenarioC = Update-BRAVOConfiguratorEffective -Model $modelScenarioC -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioC = @($modelScenarioC | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_SFTP' })
 Test-BRAVOCondition ($settingScenarioC.Count -eq 1 -and [bool]$settingScenarioC[0].OverrideValue -eq $true -and [bool]$settingScenarioC[0].EffectiveValue -eq $false) `
     'Configurator 5.2.2 Scenario C: SFTP.Enabled=false -> BAZA_APP_SFTP Effective=false (Raw=true збережено)' `
@@ -105,7 +146,7 @@ $modelScenarioD = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $false
     'componentSettings.Synchronization.BAZA_WWW_SFTP' = $true
 }
-$modelScenarioD = Update-BRAVOConfiguratorEffective -Model $modelScenarioD -RuntimeRoot $root
+$modelScenarioD = Update-BRAVOConfiguratorEffective -Model $modelScenarioD -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioD = @($modelScenarioD | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_SFTP' })
 Test-BRAVOCondition ($settingScenarioD.Count -eq 1 -and [bool]$settingScenarioD[0].OverrideValue -eq $true -and [bool]$settingScenarioD[0].EffectiveValue -eq $false) `
     'Configurator 5.2.2 Scenario D: SFTP.Enabled=false -> BAZA_WWW_SFTP Effective=false (Raw=true збережено)' `
@@ -119,7 +160,7 @@ $modelScenarioE = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $true
     'componentSettings.SFTP.ArchiveUpload' = $true
 }
-$modelScenarioE = Update-BRAVOConfiguratorEffective -Model $modelScenarioE -RuntimeRoot $root
+$modelScenarioE = Update-BRAVOConfiguratorEffective -Model $modelScenarioE -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioE = @($modelScenarioE | Where-Object { $_.Path -eq 'componentSettings.SFTP.ArchiveUpload' })
 Test-BRAVOCondition ($settingScenarioE.Count -eq 1 -and [bool]$settingScenarioE[0].OverrideValue -eq $true -and [bool]$settingScenarioE[0].EffectiveValue -eq $true -and [string]::IsNullOrWhiteSpace([string]$settingScenarioE[0].DisabledReason)) `
     'Configurator 5.2.2 Scenario E: master повторно увімкнено -> Effective відновлено з Raw, без DisabledReason' `
@@ -130,7 +171,7 @@ $modelScenarioF = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SMB.Enabled' = $false
     'componentSettings.SMB.ArchiveCopy' = $true
 }
-$modelScenarioF = Update-BRAVOConfiguratorEffective -Model $modelScenarioF -RuntimeRoot $root
+$modelScenarioF = Update-BRAVOConfiguratorEffective -Model $modelScenarioF -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioF = @($modelScenarioF | Where-Object { $_.Path -eq 'componentSettings.SMB.ArchiveCopy' })
 Test-BRAVOCondition (
     $settingScenarioF.Count -eq 1 -and [bool]$settingScenarioF[0].OverrideValue -eq $true -and [bool]$settingScenarioF[0].EffectiveValue -eq $false -and
@@ -144,7 +185,7 @@ $modelScenarioG = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $false
     'componentSettings.SMB.ArchiveCopy' = $true
 }
-$modelScenarioG = Update-BRAVOConfiguratorEffective -Model $modelScenarioG -RuntimeRoot $root
+$modelScenarioG = Update-BRAVOConfiguratorEffective -Model $modelScenarioG -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioG = @($modelScenarioG | Where-Object { $_.Path -eq 'componentSettings.SMB.ArchiveCopy' })
 Test-BRAVOCondition ($settingScenarioG.Count -eq 1 -and [bool]$settingScenarioG[0].EffectiveValue -eq $true) `
     'Configurator 5.2.2 Scenario G: SFTP.Enabled=false НЕ вимикає SMB.ArchiveCopy' `
@@ -155,7 +196,7 @@ $modelScenarioH = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SMB.Enabled' = $false
     'componentSettings.SFTP.ArchiveUpload' = $true
 }
-$modelScenarioH = Update-BRAVOConfiguratorEffective -Model $modelScenarioH -RuntimeRoot $root
+$modelScenarioH = Update-BRAVOConfiguratorEffective -Model $modelScenarioH -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioH = @($modelScenarioH | Where-Object { $_.Path -eq 'componentSettings.SFTP.ArchiveUpload' })
 Test-BRAVOCondition ($settingScenarioH.Count -eq 1 -and [bool]$settingScenarioH[0].EffectiveValue -eq $true) `
     'Configurator 5.2.2 Scenario H: SMB.Enabled=false НЕ вимикає SFTP.ArchiveUpload' `
@@ -169,7 +210,7 @@ $modelScenarioI = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SFTP.Enabled' = $true
     'componentSettings.SFTP.ArchiveUpload' = $true
 }
-$modelScenarioI = Update-BRAVOConfiguratorEffective -Model $modelScenarioI -RuntimeRoot $root
+$modelScenarioI = Update-BRAVOConfiguratorEffective -Model $modelScenarioI -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioI = @($modelScenarioI | Where-Object { $_.Path -eq 'componentSettings.SFTP.ArchiveUpload' })
 Test-BRAVOCondition ($settingScenarioI.Count -eq 1 -and [bool]$settingScenarioI[0].EffectiveValue -eq $true -and [string]::IsNullOrWhiteSpace([string]$settingScenarioI[0].DisabledReason)) `
     'Configurator 5.2.2 Scenario I: backupMonitoring.SFTP.Enabled=false НЕ вимикає operational ArchiveUpload (Health isolation)' `
@@ -182,7 +223,7 @@ $modelScenarioJ = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaC
     'componentSettings.SMB.Enabled' = $true
     'componentSettings.SMB.ArchiveCopy' = $true
 }
-$modelScenarioJ = Update-BRAVOConfiguratorEffective -Model $modelScenarioJ -RuntimeRoot $root
+$modelScenarioJ = Update-BRAVOConfiguratorEffective -Model $modelScenarioJ -RuntimeRoot $configuratorFixtureRuntimeRoot
 $settingScenarioJ = @($modelScenarioJ | Where-Object { $_.Path -eq 'componentSettings.SMB.ArchiveCopy' })
 Test-BRAVOCondition ($settingScenarioJ.Count -eq 1 -and [bool]$settingScenarioJ[0].EffectiveValue -eq $true -and [string]::IsNullOrWhiteSpace([string]$settingScenarioJ[0].DisabledReason)) `
     'Configurator 5.2.2 Scenario J: backupMonitoring.SMB.Enabled=false НЕ вимикає operational ArchiveCopy (Health isolation)' `
@@ -206,7 +247,7 @@ $modelSmbInvalid = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchema
     'componentSettings.SMB.ArchiveCopy' = $true
     'smbSettings.RootPath' = ''
 }
-$modelSmbInvalid = Update-BRAVOConfiguratorEffective -Model $modelSmbInvalid -RuntimeRoot $root
+$modelSmbInvalid = Update-BRAVOConfiguratorEffective -Model $modelSmbInvalid -RuntimeRoot $configuratorFixtureRuntimeRoot
 $validationSmbInvalid = Invoke-BRAVOConfiguratorValidation -Model $modelSmbInvalid
 Test-BRAVOCondition ($validationSmbInvalid.HasErrors -and $validationSmbInvalid.ErrorCount -eq 1) `
     'Configurator Validation: SMB.ArchiveCopy=true + порожній RootPath -> blocking ERROR' `
@@ -223,11 +264,11 @@ $configuratorPersistScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
 [void][IO.Directory]::CreateDirectory($configuratorPersistScenarioRoot)
 try {
     # 14: candidate valid -> atomic apply (на порожній production-директорії)
-    $persistBaselineEmpty = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineEmpty = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $persistModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $persistBaselineEmpty.Overrides
     $persistModel = Set-BRAVOConfiguratorOverride -Model $persistModel -Path 'consoleSettings.ConsoleLevel' -Value 'ERROR'
-    $persistModel = Update-BRAVOConfiguratorEffective -Model $persistModel -RuntimeRoot $root
-    $persistApplyValid = Invoke-BRAVOConfiguratorApply -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineEmpty
+    $persistModel = Update-BRAVOConfiguratorEffective -Model $persistModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+    $persistApplyValid = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineEmpty
     Test-BRAVOCondition ($persistApplyValid.Applied -and $persistApplyValid.Stage -eq 'Complete') `
         'Configurator Persistence: валідний candidate -> atomic apply' `
         "Applied=$($persistApplyValid.Applied) Stage=$($persistApplyValid.Stage) Reasons=$($persistApplyValid.Reasons -join '; ')"
@@ -235,12 +276,12 @@ try {
     $persistContentAfterValid = Get-Content -LiteralPath (Join-Path $configuratorPersistScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
 
     # 15: candidate invalid -> production untouched
-    $persistBaselineForInvalid = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineForInvalid = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $persistInvalidModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $persistBaselineForInvalid.Overrides
     $persistInvalidModel = Set-BRAVOConfiguratorOverride -Model $persistInvalidModel -Path 'componentSettings.SMB.ArchiveCopy' -Value $true
     $persistInvalidModel = Set-BRAVOConfiguratorOverride -Model $persistInvalidModel -Path 'smbSettings.RootPath' -Value ''
-    $persistInvalidModel = Update-BRAVOConfiguratorEffective -Model $persistInvalidModel -RuntimeRoot $root
-    $persistApplyInvalid = Invoke-BRAVOConfiguratorApply -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistInvalidModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineForInvalid
+    $persistInvalidModel = Update-BRAVOConfiguratorEffective -Model $persistInvalidModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+    $persistApplyInvalid = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistInvalidModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineForInvalid
     $persistContentAfterInvalidAttempt = Get-Content -LiteralPath (Join-Path $configuratorPersistScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
     Test-BRAVOCondition ((-not $persistApplyInvalid.Applied) -and $persistApplyInvalid.Stage -eq 'Validation' -and $persistContentAfterInvalidAttempt -eq $persistContentAfterValid) `
         'Configurator Persistence: невалідний candidate -> production файл незмінний' `
@@ -248,7 +289,7 @@ try {
 
     # 16: baseline змінився паралельно -> STOP (race detection), без merge
     $staleBaselineForRace = $persistBaselineEmpty   # свідомо застарілий знімок (до кроку 14)
-    $persistApplyRace = Invoke-BRAVOConfiguratorApply -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $staleBaselineForRace
+    $persistApplyRace = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $staleBaselineForRace
     Test-BRAVOCondition ((-not $persistApplyRace.Applied) -and $persistApplyRace.Stage -eq 'RaceDetection') `
         'Configurator Persistence: застарілий baseline -> STOP без merge/overwrite' `
         "Applied=$($persistApplyRace.Applied) Stage=$($persistApplyRace.Stage)"
@@ -259,7 +300,7 @@ try {
         "BackupPath=$($persistApplyValid.BackupPath) ProductionWasPresent=$($persistBaselineEmpty.Present)"
 
     # 18: unknown/newer ключ (не в схемі) переживає roundtrip
-    $persistBaselineForUnknown = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineForUnknown = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $mergedWithUnknown = @{}
     foreach ($existingKey in $persistBaselineForUnknown.Overrides.Keys) { $mergedWithUnknown[$existingKey] = $persistBaselineForUnknown.Overrides[$existingKey] }
     $mergedWithUnknown['maintenanceSettings.FutureFieldNotYetInSchema'] = 'preserve-me'
@@ -268,21 +309,21 @@ try {
         (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mergedWithUnknown),
         (New-Object System.Text.UTF8Encoding($false))
     )
-    $persistBaselineWithUnknown = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineWithUnknown = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $persistModelWithUnknown = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $persistBaselineWithUnknown.Overrides
     $persistModelWithUnknown = Set-BRAVOConfiguratorOverride -Model $persistModelWithUnknown -Path 'progressSettings.Enabled' -Value $false
-    $persistModelWithUnknown = Update-BRAVOConfiguratorEffective -Model $persistModelWithUnknown -RuntimeRoot $root
-    $persistApplyWithUnknown = Invoke-BRAVOConfiguratorApply -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModelWithUnknown -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineWithUnknown
+    $persistModelWithUnknown = Update-BRAVOConfiguratorEffective -Model $persistModelWithUnknown -RuntimeRoot $configuratorFixtureRuntimeRoot
+    $persistApplyWithUnknown = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModelWithUnknown -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineWithUnknown
     $persistContentWithUnknown = Get-Content -LiteralPath (Join-Path $configuratorPersistScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
     Test-BRAVOCondition ($persistApplyWithUnknown.Applied -and $persistContentWithUnknown -match 'FutureFieldNotYetInSchema') `
         'Configurator Persistence: невідомий/newer ключ переживає roundtrip' `
         "Applied=$($persistApplyWithUnknown.Applied) UnknownKeyPresent=$($persistContentWithUnknown -match 'FutureFieldNotYetInSchema')"
 
     # 19: повторний Apply без реальних змін — ідемпотентний (той самий контент/хеш)
-    $persistBaselineIdem = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineIdem = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $persistModelIdem = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $persistBaselineIdem.Overrides
-    $persistModelIdem = Update-BRAVOConfiguratorEffective -Model $persistModelIdem -RuntimeRoot $root
-    $persistApplyIdem = Invoke-BRAVOConfiguratorApply -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModelIdem -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineIdem
+    $persistModelIdem = Update-BRAVOConfiguratorEffective -Model $persistModelIdem -RuntimeRoot $configuratorFixtureRuntimeRoot
+    $persistApplyIdem = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModelIdem -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineIdem
     Test-BRAVOCondition ($persistApplyIdem.Applied -and $persistApplyIdem.NewHash -eq $persistBaselineIdem.BaselineHash) `
         'Configurator Persistence: повторний Apply без змін — ідемпотентний' `
         "Applied=$($persistApplyIdem.Applied) NewHash=$($persistApplyIdem.NewHash) BaselineHash=$($persistBaselineIdem.BaselineHash)"
@@ -294,7 +335,7 @@ try {
     # мовчки відкидала цей ключ) — тепер Update-BRAVOConfiguratorEffective
     # викликається з -CandidateOverridesOverride $mergedOverrides (повний
     # набір), тому canonical loader реально бачить і відхиляє зламаний ключ.
-    $persistBaselineForBrokenKey = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineForBrokenKey = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $mergedWithBrokenKey = @{}
     foreach ($existingKey in $persistBaselineForBrokenKey.Overrides.Keys) { $mergedWithBrokenKey[$existingKey] = $persistBaselineForBrokenKey.Overrides[$existingKey] }
     $mergedWithBrokenKey['thisRootDoesNotExist.BrokenLegacyField'] = 'x'
@@ -303,12 +344,12 @@ try {
         (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mergedWithBrokenKey),
         (New-Object System.Text.UTF8Encoding($false))
     )
-    $persistBaselineWithBrokenKey = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot
+    $persistBaselineWithBrokenKey = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot
     $persistContentBeforeBrokenAttempt = Get-Content -LiteralPath (Join-Path $configuratorPersistScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
     $persistModelForBrokenKey = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $persistBaselineWithBrokenKey.Overrides
     $persistModelForBrokenKey = Set-BRAVOConfiguratorOverride -Model $persistModelForBrokenKey -Path 'progressSettings.Enabled' -Value $true
-    $persistModelForBrokenKey = Update-BRAVOConfiguratorEffective -Model $persistModelForBrokenKey -RuntimeRoot $root
-    $persistApplyBrokenKey = Invoke-BRAVOConfiguratorApply -RuntimeRoot $root -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModelForBrokenKey -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineWithBrokenKey
+    $persistModelForBrokenKey = Update-BRAVOConfiguratorEffective -Model $persistModelForBrokenKey -RuntimeRoot $configuratorFixtureRuntimeRoot
+    $persistApplyBrokenKey = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorPersistScenarioRoot -Model $persistModelForBrokenKey -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $persistBaselineWithBrokenKey
     $persistContentAfterBrokenAttempt = Get-Content -LiteralPath (Join-Path $configuratorPersistScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
     Test-BRAVOCondition ((-not $persistApplyBrokenKey.Applied) -and $persistApplyBrokenKey.Stage -eq 'Validation' -and $persistContentAfterBrokenAttempt -eq $persistContentBeforeBrokenAttempt) `
         'Configurator Persistence: зламаний preserved-ключ (неіснуючий root) -> Apply відхилено на Validation, не записано' `
@@ -327,8 +368,13 @@ try {
 # саме 2+-елементний масив реально демонструє баг/фікс.
 $configuratorArrayPathForEquality = 'maintenanceSettings.Services.BravoDisplayName'
 $modelArrayNoOverride = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
-$modelArrayNoOverride = Update-BRAVOConfiguratorEffective -Model $modelArrayNoOverride -RuntimeRoot $root
+$modelArrayNoOverride = Update-BRAVOConfiguratorEffective -Model $modelArrayNoOverride -RuntimeRoot $configuratorFixtureRuntimeRoot
 $arraySettingNoOverride = @($modelArrayNoOverride | Where-Object { $_.Path -eq $configuratorArrayPathForEquality })
 Test-BRAVOCondition ($arraySettingNoOverride.Count -eq 1 -and $arraySettingNoOverride[0].EffectiveSource -eq 'Default') `
     'Configurator Model: EffectiveSource для StringArray без override -> Default (не хибний Derived)' `
     "Path=$configuratorArrayPathForEquality EffectiveSource=$($arraySettingNoOverride[0].EffectiveSource) Effective=$($arraySettingNoOverride[0].EffectiveValue -join ',') Default=$($arraySettingNoOverride[0].DefaultValue -join ',')"
+
+# ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
+# початку файлу). Remove-Item на директорію-junction видаляє лише сам
+# reparse point, не рекурсує в реальний modules\ репозиторію. =====
+Remove-Item -LiteralPath $configuratorFixtureRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
