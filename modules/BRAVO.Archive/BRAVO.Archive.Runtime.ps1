@@ -2210,9 +2210,40 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     }
 
     $scriptPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_{0}.txt" -f [guid]::NewGuid().ToString("N"))
+    # SET METADATA обов'язковий (5.2.1): без нього diskshadow.exe у
+    # backup-контексті пише VSS writer metadata .cab з автоіменем
+    # (NN-DD.MM.YYYY-HH_--_HOSTNAME.cab) у ПОТОЧНИЙ РОБОЧИЙ КАТАЛОГ
+    # процесу — для планової задачі це каталог комплекту, і файли
+    # накопичувались у C:\Program Files\BRAVO-Toolkit з кожної
+    # багатотомної архівації (реальний звіт SERVER-01/Тернопіль
+    # 2026-08-26). BRAVO ці метадані не використовує (контекст
+    # NOWRITERS), тому файл спрямовується в TEMP і прибирається у finally
+    # разом зі сценарієм.
+    $metadataPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_diskshadow_meta_{0}.cab" -f [guid]::NewGuid().ToString("N"))
+
+    # Одноразове best-effort прибирання ВЖЕ накопичених metadata-.cab від
+    # попередніх версій (до SET METADATA вище): у каталозі комплекту вони
+    # мають строго розпізнаваний шаблон автоімені diskshadow з іменем
+    # ЦЬОГО хоста — нічого іншого під нього не підпадає. Помилка видалення
+    # (файл залочено) не блокує backup.
+    try {
+        $legacyMetadataPattern = "^\d+-\d{2}\.\d{2}\.\d{4}-\d+_--_$([regex]::Escape($env:COMPUTERNAME))\.cab$"
+        $legacyMetadataFiles = @(Get-ChildItem -LiteralPath $bravoScriptDirectory -File -Filter '*.cab' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $legacyMetadataPattern })
+        foreach ($legacyMetadataFile in $legacyMetadataFiles) {
+            Remove-Item -LiteralPath $legacyMetadataFile.FullName -Force -ErrorAction SilentlyContinue
+        }
+        if (@($legacyMetadataFiles).Count -gt 0) {
+            Write-BRAVOLog -Component 'VSS' -Message "Прибрано $(@($legacyMetadataFiles).Count) legacy metadata-.cab diskshadow з каталогу комплекту (тимчасові артефакти попередніх версій)" -Level "INFO"
+        }
+    } catch {
+        # Прибирання суто гігієнічне: збій не має стосунку до створення набору.
+    }
+
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("SET CONTEXT PERSISTENT NOWRITERS")
     $lines.Add("SET VERBOSE ON")
+    $lines.Add(("SET METADATA `"{0}`"" -f $metadataPath))
     $lines.Add("BEGIN BACKUP")
     $index = 0
     foreach ($volumeRoot in @($VolumeRoots)) {
@@ -2352,6 +2383,9 @@ function New-BRAVOVSSDiskshadowSnapshotSet {
     } finally {
         if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
             Remove-Item -LiteralPath $scriptPath -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $metadataPath -PathType Leaf) {
+            Remove-Item -LiteralPath $metadataPath -Force -ErrorAction SilentlyContinue
         }
     }
 }
