@@ -338,6 +338,98 @@ function Update-BRAVOConfiguratorEffective {
     return $updated
 }
 
+function Test-BRAVOConfiguratorModelDirty {
+    <#
+    .SYNOPSIS
+        P2-A.3: справжній diff-based Dirty — порівнює поточний
+        OverridePresent/OverrideValue КОЖНОГО schema-запису з
+        $BaselineOverrides (той самий hashtable, що
+        Get-BRAVOConfiguratorProductionOverrideState.Overrides повертає
+        при Load/Reload/успішному Apply), а НЕ подієвий Model[].Dirty
+        прапорець.
+    .DESCRIPTION
+        Model[].Dirty (виставляється Set/Clear-BRAVOConfiguratorOverride)
+        лише фіксує "цей рядок торкались у цій сесії" і лишається $true
+        назавжди навіть після edit -> revert до оригінального значення —
+        P3-знахідка P1-стабілізації ("phantom Dirty"). Ця функція натомість
+        обчислює справжній diff:
+          - OverridePresent відрізняється від baseline OverridePresent, АБО
+          - обидва present, але OverrideValue відрізняється (глибоке
+            порівняння через Test-BRAVOConfiguratorValueEquality — та сама
+            функція, що EffectiveSource уже використовує для масивів).
+        "false override" (OverridePresent=true, OverrideValue=$false)
+        НІКОЛИ не еквівалентний "відсутньому override" — порівняння йде
+        по OverridePresent, не лише по значенню.
+        Обчислені/непersisted поля моделі (EffectiveValue, EffectiveSource,
+        ValidationState, DependencyState, DisabledReason) свідомо НЕ
+        враховуються — вони не є частиною BRAVO.local.config.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array]$Model,
+        [Parameter(Mandatory = $true)][hashtable]$BaselineOverrides
+    )
+
+    foreach ($setting in $Model) {
+        $baselinePresent = $BaselineOverrides.Contains($setting.Path)
+        if ([bool]$setting.OverridePresent -ne $baselinePresent) { return $true }
+        if ($baselinePresent -and -not (Test-BRAVOConfiguratorValueEquality -Left $setting.OverrideValue -Right $BaselineOverrides[$setting.Path])) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Reset-BRAVOConfiguratorSetting {
+    <#
+    .SYNOPSIS
+        P2-A.6: скидає ОДИН schema-запис до Default — еквівалентно
+        Clear-BRAVOConfiguratorOverride (видаляє local override, НЕ
+        матеріалізує Default явно в BRAVO.local.config — той самий §1.3
+        контракт, що "Використовувати default"). Іменований окремо для
+        явного Reset-контракту (§ P2-A.6 задачі), логіка канонічно та сама.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array]$Model,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    return Clear-BRAVOConfiguratorOverride -Model $Model -Path $Path
+}
+
+function Reset-BRAVOConfiguratorSection {
+    <#
+    .SYNOPSIS
+        P2-A.6: скидає ВСІ schema-записи вказаної Group/Section до
+        Default. Інші section/group і будь-який preserved unknown/newer
+        ключ (Model про нього нічого не знає) лишаються незмінними —
+        unknown-ключі persist через Merge-BRAVOConfiguratorCandidateOverrides
+        (Persistence), не через Model.
+    .PARAMETER Group
+        Metadata.Group значення (той самий групувальний ключ, що UI
+        категорійне дерево вже використовує).
+    .PARAMETER Section
+        Metadata.Section значення в межах Group.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array]$Model,
+        [Parameter(Mandatory = $true)][string]$Group,
+        [Parameter(Mandatory = $true)][string]$Section
+    )
+
+    $updated = $Model
+    $pathsInSection = @($Model | Where-Object {
+        [string]$_.Metadata.Group -eq $Group -and [string]$_.Metadata.Section -eq $Section -and [bool]$_.OverridePresent
+    } | ForEach-Object { [string]$_.Path })
+
+    foreach ($path in $pathsInSection) {
+        $updated = Clear-BRAVOConfiguratorOverride -Model $updated -Path $path
+    }
+    return $updated
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorValueAtPath',
     'Get-BRAVOConfiguratorModel',
@@ -345,5 +437,8 @@ Export-ModuleMember -Function @(
     'Clear-BRAVOConfiguratorOverride',
     'ConvertTo-BRAVOConfiguratorOverrideHashtable',
     'Test-BRAVOConfiguratorValueEquality',
-    'Update-BRAVOConfiguratorEffective'
+    'Update-BRAVOConfiguratorEffective',
+    'Test-BRAVOConfiguratorModelDirty',
+    'Reset-BRAVOConfiguratorSetting',
+    'Reset-BRAVOConfiguratorSection'
 )
