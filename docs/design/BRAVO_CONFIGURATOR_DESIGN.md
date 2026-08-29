@@ -1,4 +1,4 @@
-﻿# BRAVO Configurator — Architecture Freeze (Agent 0)
+# BRAVO Configurator — Architecture Freeze (Agent 0)
 
 Статус: **DRAFT — architecture freeze для перегляду перед стартом Agent 1-6.**
 Гілка: `feat/bravo-configurator` (первинно базована на `origin/developer` @
