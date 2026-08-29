@@ -273,6 +273,108 @@ function Assert-BravoDataRootsAreIndependent {
     Test-BravoDataRootValue -Name 'BackupRoot' -Value ([string]$PathSettings['BackupRoot']) -AllowEmpty
 }
 
+function Read-BRAVOLocalConfigurationOverrides {
+    # BRAVO.local.config (5.2.1) — локальні site-відмінності, що ПЕРЕЖИВАЮТЬ
+    # оновлення комплекту: оператор більше не редагує BRAVO.config вручну на
+    # нетипових інсталяціях. Файл лежить ПОРЯД з effective config і містить
+    # data-only hashtable «dot-шлях -> значення», наприклад:
+    #
+    #     @{
+    #         'pathSettings.BackupRoot' = 'E:\ARCHIV'
+    #         'maintenanceSettings.Restore.BootRestoreMode' = 'HoldServices'
+    #         'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = 50
+    #         'sftpHostTemplate' = '{0}.example.com'
+    #     }
+    #
+    # Формат навмисно data-only (CheckRestrictedLanguage без жодної
+    # дозволеної команди): локальний файл не є кодом і не може виконувати
+    # дії — лише значення. Відсутній файл = штатний no-op.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigDirectory
+    )
+
+    $localOverridePath = Join-Path $ConfigDirectory 'BRAVO.local.config'
+    if (-not (Test-Path -LiteralPath $localOverridePath -PathType Leaf)) {
+        return [pscustomobject]@{ Path = $localOverridePath; Present = $false; Overrides = @{} }
+    }
+
+    $localOverrideText = Get-Content -LiteralPath $localOverridePath -Raw -Encoding UTF8 -ErrorAction Stop
+    $localOverrideScript = [scriptblock]::Create($localOverrideText)
+    try {
+        # Порожні списки дозволених команд/змінних + заборона змінних
+        # оточення: як Import-PowerShellDataFile, лише літеральні дані.
+        $localOverrideScript.CheckRestrictedLanguage([string[]]@(), [string[]]@(), $false)
+    } catch {
+        throw "BRAVO.local.config ('$localOverridePath') мусить бути data-only hashtable без виконуваного коду: $($_.Exception.Message)"
+    }
+    $localOverrideData = & $localOverrideScript
+    if ($localOverrideData -isnot [hashtable]) {
+        throw "BRAVO.local.config ('$localOverridePath') мусить повертати hashtable «dot-шлях -> значення» (отримано: $(if ($null -eq $localOverrideData) { 'null' } else { $localOverrideData.GetType().Name }))."
+    }
+    foreach ($overrideKey in @($localOverrideData.Keys)) {
+        if ([string]::IsNullOrWhiteSpace([string]$overrideKey)) {
+            throw "BRAVO.local.config ('$localOverridePath'): порожній ключ неприпустимий."
+        }
+    }
+    return [pscustomobject]@{ Path = $localOverridePath; Present = $true; Overrides = $localOverrideData }
+}
+
+function Invoke-BRAVOLocalConfigurationOverridePhase {
+    # Застосовує ще не застосовані overrides, чий кореневий $global:-об'єкт
+    # УЖЕ визначено. Викликається з BRAVO.config у двох канонічних точках:
+    # після первинних блоків налаштувань (щоб деривації — archiveDirs,
+    # discovery, scheduler — підхопили перевизначені первинні значення) і в
+    # самому кінці (для пізно визначених leaf-блоків: пороги, розклади).
+    # Проміжні вузли шляху НЕ створюються (захист від опечаток): ключ, що
+    # так і не застосувався, стане помилкою конфігурації в лоадері.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    foreach ($overrideKey in @($State.Overrides.Keys)) {
+        if ($State.Applied.Contains([string]$overrideKey)) { continue }
+        $segments = @(([string]$overrideKey) -split '\.')
+        $rootVariable = Get-Variable -Name $segments[0] -Scope Global -ErrorAction SilentlyContinue
+        if ($null -eq $rootVariable -or $null -eq $rootVariable.Value) { continue }
+
+        if ($segments.Count -eq 1) {
+            Set-Variable -Name $segments[0] -Scope Global -Value $State.Overrides[$overrideKey]
+            [void]$State.Applied.Add([string]$overrideKey)
+            continue
+        }
+
+        $currentNode = $rootVariable.Value
+        $intermediateBroken = $false
+        for ($segmentIndex = 1; $segmentIndex -lt ($segments.Count - 1); $segmentIndex++) {
+            $segment = $segments[$segmentIndex]
+            if ($currentNode -is [hashtable] -and $currentNode.Contains($segment)) {
+                $currentNode = $currentNode[$segment]
+            } elseif ($null -ne $currentNode -and $null -ne $currentNode.PSObject.Properties[$segment]) {
+                $currentNode = $currentNode.$segment
+            } else {
+                $intermediateBroken = $true
+                break
+            }
+        }
+        if ($intermediateBroken -or $null -eq $currentNode) { continue }
+
+        $leafSegment = $segments[$segments.Count - 1]
+        if ($currentNode -is [hashtable]) {
+            # Новий ключ у hashtable дозволено: опційні властивості з
+            # Contains-нормалізацією у споживачах — легітимна ціль override.
+            $currentNode[$leafSegment] = $State.Overrides[$overrideKey]
+            [void]$State.Applied.Add([string]$overrideKey)
+        } elseif ($null -ne $currentNode.PSObject.Properties[$leafSegment]) {
+            $currentNode.$leafSegment = $State.Overrides[$overrideKey]
+            [void]$State.Applied.Add([string]$overrideKey)
+        }
+        # Інакше (об'єкт без такої властивості) — лишається незастосованим:
+        # лоадер підніме помилку зі списком таких ключів.
+    }
+}
+
 function Assert-BravoLoadedConfiguration {
     [CmdletBinding()]
     param(
@@ -461,6 +563,74 @@ function Assert-BravoLoadedConfiguration {
         $global:restoreVerifySettings.MaxVerificationAgeHours = 216
     }
 
+    if ($global:schedulerSettings -is [hashtable] -and
+        $global:schedulerSettings.Contains('Health') -and
+        $global:schedulerSettings.Health -is [hashtable]) {
+        # 5.2.1: обмежене очікування звільнення архівації перед відкладенням
+        # health-прогону. Legacy-конфіги без ключа отримують канонічний
+        # дефолт комплекту (60 хв); явний 0 = негайне відкладення (стара
+        # поведінка). Значення поза 0..90 хв — некоректне: ExecutionTimeLimit
+        # задачі Health = 2 год, очікування мусить лишати запас на перевірку.
+        $healthBusyWaitIsValid = $false
+        if ($global:schedulerSettings.Health.Contains('BusyWaitMinutes')) {
+            $healthBusyWaitParsed = 0
+            if ([int]::TryParse([string]$global:schedulerSettings.Health.BusyWaitMinutes, [ref]$healthBusyWaitParsed) -and
+                $healthBusyWaitParsed -ge 0 -and $healthBusyWaitParsed -le 90) {
+                $global:schedulerSettings.Health.BusyWaitMinutes = $healthBusyWaitParsed
+                $healthBusyWaitIsValid = $true
+            } else {
+                Write-Warning "schedulerSettings.Health.BusyWaitMinutes = '$($global:schedulerSettings.Health.BusyWaitMinutes)' не є цілим числом у межах 0..90 — застосовується канонічний дефолт 60 хв."
+            }
+        }
+        if (-not $healthBusyWaitIsValid) {
+            # Legacy-конфіг без ключа (мовчазний compat-дефолт) або
+            # некоректне значення (Warning уже виписано вище).
+            $global:schedulerSettings.Health.BusyWaitMinutes = 60
+        }
+    }
+
+    if ($global:backupMonitoring -is [hashtable]) {
+        # 5.2.1: вікно дедуплікації зелених success-звітів Health. Legacy-конфіги
+        # без ключа отримують канонічний дефолт комплекту (1380 хв = 23 год:
+        # максимум один зелений звіт на добу — post-backup після щоденної
+        # архівації); явний 0 = дедуп вимкнено (стара поведінка). Верхня межа
+        # 2880 хв (дві доби) — стеля для нестандартних розкладів бекапу.
+        $successDedupIsValid = $false
+        if ($global:backupMonitoring.Contains('SuccessDedupMinutes')) {
+            $successDedupParsed = 0
+            if ([int]::TryParse([string]$global:backupMonitoring.SuccessDedupMinutes, [ref]$successDedupParsed) -and
+                $successDedupParsed -ge 0 -and $successDedupParsed -le 2880) {
+                $global:backupMonitoring.SuccessDedupMinutes = $successDedupParsed
+                $successDedupIsValid = $true
+            } else {
+                Write-Warning "backupMonitoring.SuccessDedupMinutes = '$($global:backupMonitoring.SuccessDedupMinutes)' не є цілим числом у межах 0..2880 — застосовується канонічний дефолт 1380 хв (23 год)."
+            }
+        }
+        if (-not $successDedupIsValid) {
+            $global:backupMonitoring.SuccessDedupMinutes = 1380
+        }
+        # Шлях state-файла дедупу: legacy-конфіг без ключа отримує файл поряд
+        # з AlertStatePath (той самий State-каталог).
+        if ((-not $global:backupMonitoring.Contains('SuccessNotificationStatePath') -or
+                [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.SuccessNotificationStatePath)) -and
+            $global:backupMonitoring.Contains('AlertStatePath') -and
+            -not [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.AlertStatePath)) {
+            $global:backupMonitoring.SuccessNotificationStatePath = Join-Path `
+                (Split-Path -Path ([string]$global:backupMonitoring.AlertStatePath) -Parent) `
+                'BRAVO_HEALTH_SUCCESS_NOTIFICATION_STATE.json'
+        }
+        # Шлях операційного lifecycle-стану Health (RecoveryPending): та сама
+        # legacy-деривація від каталогу AlertStatePath.
+        if ((-not $global:backupMonitoring.Contains('OperationalStatePath') -or
+                [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.OperationalStatePath)) -and
+            $global:backupMonitoring.Contains('AlertStatePath') -and
+            -not [string]::IsNullOrWhiteSpace([string]$global:backupMonitoring.AlertStatePath)) {
+            $global:backupMonitoring.OperationalStatePath = Join-Path `
+                (Split-Path -Path ([string]$global:backupMonitoring.AlertStatePath) -Parent) `
+                'BRAVO_HEALTH_OPERATIONAL_STATE.json'
+        }
+    }
+
     if (-not ($global:pathSettings -is [hashtable])) {
         throw 'pathSettings повинен бути хеш-таблицею.'
     }
@@ -519,6 +689,21 @@ function Import-BravoConfiguration {
         Import-Module -Name $discoveryModulePath -ErrorAction Stop
     }
 
+    # Локальні site-overrides (BRAVO.local.config поряд з effective config):
+    # читаються ДО виконання BRAVO.config; сам config застосовує їх у двох
+    # канонічних фазах через Invoke-BRAVOLocalConfigurationOverridePhase.
+    $localOverrideRead = Read-BRAVOLocalConfigurationOverrides `
+        -ConfigDirectory (Split-Path -Path $resolvedConfigPath -Parent)
+    $localOverrideState = $null
+    if ($localOverrideRead.Present) {
+        $localOverrideState = [pscustomobject]@{
+            Path = [string]$localOverrideRead.Path
+            Overrides = $localOverrideRead.Overrides
+            Applied = New-Object 'System.Collections.Generic.HashSet[string]'
+        }
+    }
+    $global:BravoLocalConfigOverrideState = $localOverrideState
+
     try {
         # Files with a non-.ps1 extension are not reliably dot-sourced by
         # Windows PowerShell. Read the legacy file explicitly and compile it
@@ -564,6 +749,26 @@ function Import-BravoConfiguration {
         }
         throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message).$unsupportedEnvironmentHint"
     }
+
+    # Fail-closed для overrides: ключ, що не застосувався в жодній фазі, —
+    # найімовірніше опечатка в шляху або вузол, якого більше немає. Мовчазне
+    # ігнорування означало б «конфіг, що бреше» — сервер працює не так, як
+    # оператор налаштував.
+    if ($null -ne $localOverrideState) {
+        $unappliedOverrideKeys = @(
+            $localOverrideState.Overrides.Keys |
+                Where-Object { -not $localOverrideState.Applied.Contains([string]$_) } |
+                Sort-Object
+        )
+        if (@($unappliedOverrideKeys).Count -gt 0) {
+            throw (
+                "BRAVO.local.config ('$($localOverrideState.Path)'): не вдалося застосувати ключ(і): " +
+                ($unappliedOverrideKeys -join ', ') +
+                ". Перевірте dot-шлях (кореневий об'єкт і проміжні вузли мають існувати в BRAVO.config)."
+            )
+        }
+    }
+    $global:BravoLocalConfigOverrideState = $null
 
     Assert-BravoLoadedConfiguration -RuntimeRoot $resolvedRuntimeRoot
 
@@ -617,6 +822,11 @@ function Import-BravoConfiguration {
         ConfigPath = $resolvedConfigPath
         ConfigRoot = $resolvedConfigRoot
         RuntimeRoot = $resolvedRuntimeRoot
+        # Ключі з BRAVO.local.config, реально застосовані цим завантаженням
+        # (порожньо = файла немає) — операторська прозорість для dry-run/діагностики.
+        LocalConfigOverrides = @(
+            if ($null -ne $localOverrideState) { @($localOverrideState.Applied) | Sort-Object } else { @() }
+        )
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
         LegacyScriptVersion = $legacyScriptVersion
         LegacyScriptVersionPresent = ($null -ne $legacyScriptVersionVariable)

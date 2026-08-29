@@ -1238,8 +1238,11 @@ SFTP у `<ім'я>.replaced_<дата>` (нічого не видаляє; іс�
 LIMS у своїй мережі, без вхідного доступу для централізованого керування)
 ручний обхід кожного сервера при кожній append-only мутації не
 масштабується. `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold`
-(`BRAVO.config`) дає **опційний**, **вимкнений за замовчуванням** (`0`)
-поріг: якщо мутацій за **один цикл на компонент** не більше `N`,
+(`BRAVO.config`) задає поріг: **типове значення комплекту — `25`**
+(свідоме рішення власника розгортання, 2026-08-27, після реального
+інциденту ДНДІЛДВСЕ з 18 легітимними мутаціями; `0` = вимкнено, жорсткий
+блок на будь-яку мутацію). Якщо мутацій за **один цикл на компонент** не
+більше `N`,
 синхронізація автоматично виконує ту саму rename-preserve операцію, що й
 `BRAVO_BAZA_RECONCILE.ps1 -AcceptAll` (стара remote-версія →
 `<ім'я>.replaced_<дата>`, нічого не видаляється, стан очищається, нову
@@ -2056,12 +2059,37 @@ and everything else to ALERTS.
 Each provider has two Credential Manager targets —
 `BRAVO_DISCORD_GENERAL_URL`/`BRAVO_DISCORD_ALERTS_URL` and
 `BRAVO_SLACK_GENERAL_URL`/`BRAVO_SLACK_ALERTS_URL` — set up via
-`BRAVO_CREDENTIALS_SETUP.ps1 -Component Discord.General|Discord.Alerts|
-Slack.General|Slack.Alerts`. Servers that only have the legacy
-`BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL` webhook keep working unchanged: both
-GENERAL and ALERTS fall back to that single legacy webhook when the
-channel-specific target is not configured, so upgrading BRAVO does not
-require reconfiguring an operator's existing Discord/Slack integration.
+`BRAVO_CREDENTIALS_SETUP.ps1 -Component Discord` / `-Component Slack`
+(each provider group configures both route-specific credentials at once).
+
+Required topology depends on `NotificationMode`:
+
+| Mode | Required credentials |
+|---|---|
+| `none` | none |
+| `errors_only` | ALERTS only |
+| `all` | GENERAL + ALERTS |
+
+**MIGRATION (5.2.1): legacy provider-wide webhooks are no longer supported.**
+`BRAVO_DISCORD_URL` and `BRAVO_SLACK_URL` are ignored by the runtime: each
+channel resolves exclusively through its own route-specific credential, with
+no provider-wide fallback and no GENERAL↔ALERTS fallback. An installation
+that only has the legacy record fails Dry Run / Setup with an explicit
+diagnostic ("Знайдено лише legacy … — він більше не підтримується").
+Migration command (run for both stores):
+
+```powershell
+.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Discord -StoreFor Both
+.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Slack -StoreFor Both
+```
+
+The old Credential Manager records are NOT deleted automatically and are not
+copied into the new channel records (one shared webhook does not identify
+which Discord/Slack channel it pointed to) — configure the new topology
+deliberately, then remove the legacy records manually after acceptance.
+Verify real delivery to both channels with `.\BRAVO_NOTIFICATION_TEST.ps1`
+(canonical pipeline; explicitly marked test messages; requires credentials
+for the account it runs under — repeat under SYSTEM for scheduled tasks).
 
 Backup health wording:
 

@@ -139,6 +139,326 @@ Scope real-server acceptance rc.1 (уся нова поверхня циклу):
 
 ---
 
+## 5.2.1 — 2026-08-29
+
+Stable release of the 5.2.1 hotfix line, promoted from accepted
+`5.2.1-rc.9` (tag `v5.2.1-rc.9`, stamp `f99134d`) plus the additional
+fixes/features below, validated end-to-end via production acceptance
+on preview build `BRAVO-Toolkit-5.2.1-rc.10-preview-6737485.zip`
+(snapshot `6737485`, sha256
+`8c70324596fa55a805877e767529d77d9ff4db9472f2626ae2e749bc27692155`):
+Runtime Guard 82/82, SELF-TEST 1447/0, real Archive (MODEL/BLOG/
+BRAVOEXCH + SFTP), BAZA_APP/BAZA_WWW sync, CurrentUser/SYSTEM
+notification delivery, retry-safe Recovery, BusyWait 60-min overlap,
+CurrentUser/SYSTEM state writes.
+
+- **FIX P0 (self-test/health, process isolation): orphaned SELF-TEST
+  service-helper function could shadow production `Get-Service`/
+  `Start-Service`/`Stop-Service`/`Get-CimInstance`/`Get-WmiObject` for
+  the rest of the process.** `BRAVO_SELF_TEST.ps1` builds throwaway
+  dynamic modules/functions to simulate service states for its
+  fixtures; a cleanup gap could leave one of these shadowing the real
+  cmdlet in the caller's scope after SELF-TEST returned. In a
+  long-lived process (e.g. a scheduled task host that runs SELF-TEST
+  and then Health in the same session) this silently turned real
+  Health service checks into mocked results. New ownership registry
+  (`$script:BRAVOSelfTestOwnedRuntimeModules`) tracks every dynamic
+  module/function SELF-TEST creates; `Clear-BRAVOSelfTestOwnedRuntimeModules`
+  removes them all before SELF-TEST returns, run unconditionally after
+  the top-level try/catch, before the exit code is computed. Five new
+  fail-loud regression tests confirm `Get-Service`/`Start-Service`/
+  `Stop-Service` resolve back to `Microsoft.PowerShell.Management` and
+  that no SELF-TEST-owned module/function remains exported after a
+  full run. Re-validated same-process against the built ZIP artifact
+  (PID unchanged before/after SELF-TEST).
+- **FEATURE (health, notification): semantic SUCCESS-report deduplication
+  with retry-safe Recovery lifecycle.** A healthy Health run now sends
+  at most one duplicate-content SUCCESS notification per
+  `backupMonitoring.SuccessDedupMinutes` window (kit default `1380` =
+  23h, one green report per day; embedded post-backup reports and
+  `-ForceNotification` always bypass dedup; `0` disables it). Recovery
+  from an unhealthy state is never deduplicated: a new
+  `RecoveryPending` operational-state flag is set the moment Health
+  goes unhealthy and is cleared only after a Recovery SUCCESS
+  notification is actually delivered — a failed delivery preserves
+  `RecoveryPending` so the next healthy run retries the recovery
+  report instead of silently deduplicating it.
+- **FIX (health/scheduler): `schedulerSettings.Health.BusyWaitMinutes`
+  kit default `20` -> `60`.** Production acceptance showed the
+  scheduled BAZASync lock window can exceed 20 minutes; Health now
+  waits up to 60 minutes for the archive lock to clear before
+  deferring (loader range unchanged at `0..90`, explicit `0` still
+  disables waiting).
+- **FEATURE (discovery): BAZA_WWW Apache-based discovery with an
+  explicit Present/Absent/Ambiguous/Error presence contract.**
+  `Test-BRAVOBazaWwwInstallation` validates the resolved
+  `<DocumentRoot>\BAZA` candidate (real directory, not a reparse
+  point/symlink, non-empty) before accepting it; explicit
+  `discoverySettings.Sources.BAZA_WWW` override still takes priority
+  and fails closed (visible `Error`, no silent fallback) on an
+  invalid override, matching existing `BravoRoot` discovery policy.
+- **BREAKING NOTIFICATION MIGRATION: legacy provider-wide webhook-и
+  `BRAVO_DISCORD_URL` та `BRAVO_SLACK_URL` більше не підтримуються.**
+  Кожен канал резолвиться виключно через route-специфічні credentials
+  (`BRAVO_DISCORD_GENERAL_URL`/`BRAVO_DISCORD_ALERTS_URL`,
+  `BRAVO_SLACK_GENERAL_URL`/`BRAVO_SLACK_ALERTS_URL`) без provider-wide
+  fallback і без fallback між каналами. Обов'язкова topology:
+  `errors_only` -> ALERTS; `all` -> GENERAL + ALERTS; `none` -> нічого.
+  Перед оновленням (або після міграційної помилки Dry Run/Setup)
+  налаштуйте канальні записи для CurrentUser і SYSTEM:
+  `.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Discord -StoreFor Both`
+  (аналогічно `-Component Slack`). Старі записи ігноруються і не
+  видаляються автоматично. Також: `BRAVO_RESTORE_TEST` переведено на
+  канонічний notification-конвеєр; новий opt-in інтеграційний тест
+  реальної доставки `BRAVO_NOTIFICATION_TEST.ps1`; у Maintenance
+  видалено мертвий `SlackMessageBuffer` (6 error-повідомлень, що мовчки
+  губились, тепер доставляються через ALERTS).
+
+Real-server production acceptance evidence: local Git/provenance PASS,
+production regression sweep PASS (see acceptance handoff for full gate
+list). No outstanding blocking findings.
+
+---
+
+## 5.2.1-rc.9 — 2026-08-27 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.8 + фікс систематичного пропуску денних health-прогонів
+(доведено логами ДНДІЛДВСЕ 25-27.08.2026) + повний каталог
+`BRAVO.local.config.example`:
+
+- **FIX (health/scheduler): денний слот health-прогону систематично
+  з'їдався BAZASync.** Синхронізація (`BRAVO_ARCHIV -SyncBAZA`, кожні
+  4 год о `:00`) тримає lock архівації ~16-17 хв і накривала слот
+  Health `00:15`: кожен денний прогін відкладався без повтору, зелені
+  звіти йшли лише з нічного post-backup Health. Двошарово:
+  (1) kit-дефолт `schedulerSettings.Health.StartAt` `00:15` -> `00:30`
+  (набуває чинності після повторного `BRAVO_TASKS_INSTALL.ps1`);
+  (2) новий ключ `schedulerSettings.Health.BusyWaitMinutes` (kit 20;
+  loader-нормалізація: legacy без ключа -> 20, некоректне значення ->
+  Warning + 20, явний `0` = стара поведінка) — при зайнятій архівації
+  Health обмежено чекає звільнення (повторна перевірка сигналів кожні
+  30 с) і відкладається лише після вичерпання ліміту. Регресії:
+  `Health/BusyBackupBoundedWaitBeforeDeferral`,
+  `ConfigLoader/HealthBusyWait*` (3 сценарії).
+- **Повний каталог `BRAVO.local.config.example`**: 132 підтримувані
+  override-ключі по блоках/фазах, перевірені loader-ом; свідомо без
+  `discoverySettings` і `sftpDirectories.BAZA/BAZAWWW` (споживаються до
+  фази 2).
+
+Acceptance rc.9 додатково включає: re-run `BRAVO_TASKS_INSTALL`
+(тригер Health 00:30), зелений звіт із денного слота, сценарій
+очікування (ручний Health під час активної синхронізації -> INFO
+«зачекає» -> звіт після звільнення lock).
+
+---
+
+## 5.2.1-rc.8 — 2026-08-27 (hotfix candidate, pending acceptance)
+
+Кандидат = rc.7 + фікс хибного ERROR у сповіщенні про несумісні імена
+(знайдено аналізом acceptance-логів ХРДЛ 27.08: rc.5/rc.6 -SyncBAZA):
+
+- **FIX (notifications): одно-chunk результат
+  `ConvertTo-BRAVONotificationPayloadText` втрачав масивність.**
+  `return @(...)` PowerShell 5.1 розгортає в скаляр-[string] на виході
+  з функції; наступний `.Count` в Archive Runtime під
+  `Set-StrictMode 2.0` кидав `PropertyNotFoundException` — у лог падав
+  ERROR «Не вдалося відправити сповіщення про несумісні імена
+  BAZA_APP», хоча webhook на той момент уже був доставлений
+  (`Send-BRAVONotificationChunks` виконується до `.Count`). Канонічний
+  фікс у конверторі (unary comma: `return ,@(...)`) — масив
+  гарантовано для будь-якої кількості chunk-ів, усі викликачі
+  (Archive/Health/Maintenance/DataRestore/`Send-BRAVONotification`
+  `ChunkCount`) отримують коректний `.Count`. Дефект існував з 5.2.0
+  (не регресія hotfix-лінії). Регресія
+  `Notifications/PayloadTextSingleChunkKeepsArrayness`: пре-фікс
+  репродукція на rc.7 відтворила точний серверний виняток; після
+  фіксу — масив із Count=1.
+
+- **FIX (self-test, CI): local-config сценарій `FileAbsentIsNoop`
+  залежав від середовища прогону.** CI «Release artifact» на тегу
+  v5.2.1-rc.7 упав: без `BRAVO.local.config` копія комплектного
+  `BRAVO.config` виконувалась із дефолтом `BackupRoot=""` (AUTO →
+  `<EffectiveLIMSRoot>\ARCHIV`), а на GitHub runner немає інсталяції
+  LIMS → «Не вдалося визначити BackupRoot»; stderr дочірнього процесу
+  під `$ErrorActionPreference='Stop'` валив увесь self-test як
+  `[FAIL] Fatal` (на dev/серверах LIMS є, тому локально зелено).
+  Сценарії тепер герметичні: у копію конфігурації запікається явний
+  `BackupRoot` (окремий від override-каталогу — фаза-1 сценарій
+  відтепер доводить пріоритет override над явним значенням), а
+  дочірні probe-процеси загорнуто в try/catch (майбутній збій — чистий
+  FAIL сценарію з причиною, не Fatal-крах прогону). Дефект лише у
+  валідаційному інструментарії; runtime-поведінка rc.7 коректна.
+
+Acceptance rc.8 (додатково до rc.7): на інсталяції з несумісними
+іменами BAZA (напр., ХРДЛ) прогнати `-SyncBAZA` → у лозі SUCCESS
+«Сповіщення про N несумісних імен … відправлено», без ERROR
+«Не вдалося відправити…: Не удается найти свойство "Count"».
+
+---
+
+## 5.2.1-rc.7 — 2026-08-27 (hotfix candidate, NOT accepted — superseded by rc.8)
+
+Кандидат = rc.6 + локальні site-overrides конфігурації (запит власника:
+«втомився кожного разу виправляти конфіг на нетипових інсталяціях»):
+
+- **FEATURE (config): `BRAVO.local.config` — site-відмінності, що
+  переживають оновлення комплекту.** Опційний data-only файл поряд з
+  effective `BRAVO.config` (шаблон `BRAVO.local.config.example` у
+  комплекті): hashtable «dot-шлях → значення». Loader читає його до
+  виконання конфігурації; `BRAVO.config` застосовує overrides у двох
+  канонічних фазах — після первинних блоків (перевизначений
+  `pathSettings.BackupRoot` коректно протягується в archiveDirs/
+  discovery/scheduler; `Restore.BootRestoreMode` → `Recovery.Enabled`)
+  і наприкінці (пізні leaf-блоки: `backupMonitoring`, `sftpDirectories`,
+  `schedulerSettings`). Безпека/надійність: виконуваний код у файлі
+  відхиляється (`CheckRestrictedLanguage`, лише літеральні дані);
+  невідомий dot-шлях = помилка конфігурації (опечатки не мовчать);
+  застосовані ключі — у `BravoConfigurationMetadata.LocalConfigOverrides`.
+  4 регресії в ConfigLoader-фрагменті (обидві фази з деривацією,
+  typo fail-closed, code-rejection, no-op без файла). Документація:
+  BRAVO_SETUP.md.
+
+Acceptance rc.7 (додатково до rc.6): на нетиповій інсталяції створити
+`BRAVO.local.config` (напр., `pathSettings.BackupRoot`), оновити
+комплект → налаштування діють без редагування `BRAVO.config`; ключ з
+опечаткою → зрозуміла помилка конфігурації.
+
+---
+
+## 5.2.1-rc.6 — 2026-08-27 (hotfix candidate, NOT accepted — superseded by rc.7)
+
+Кандидат = rc.5 + свідома зміна дефолту порогу авто-архівування BAZA
+(реальний алерт ДНДІЛДВСЕ 23:00: 18 легітимних мутацій PDF-звітів →
+CRITICAL «ПОТРІБНА ДІЯ», хоча механізм auto-archive існує з 5.2.0, але
+був вимкнений дефолтом 0):
+
+- **CONFIG (BAZA, рішення власника 2026-08-27):**
+  `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` у комплекті
+  тепер `25` (було `0` = вимкнено). Мутації ≤ 25 за цикл на компонент
+  авто-архівуються rename-preserve (`*.replaced_*`, нічого не
+  втрачається) з інформаційним Health-повідомленням; > 25 — незмінний
+  жорсткий блок/CRITICAL. Runtime-код не змінювався (механізм наявний з
+  5.2.0). Site-config'и БЕЗ ключа і далі отримують fail-closed `0`
+  (fallback loader-а незмінний) — нове значення діє лише там, де
+  розгорнуто конфіг комплекту або ключ задано явно. Документацію
+  (OPERATIONS/THREAT_MODEL/README/конфіг-коментар) синхронізовано;
+  залишковий ризик per-cycle порогу зафіксовано там само.
+
+Acceptance rc.6 (додатково до rc.5): на ДНДІЛДВСЕ після оновлення
+конфіга — наступний цикл авто-архівує ≤25 мутацій (INFO, без
+«ПОТРІБНА ДІЯ»), старі remote-версії з суфіксом `.replaced_*`.
+
+---
+
+## 5.2.1-rc.5 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.6)
+
+Кандидат = rc.4 + фікс хибного CRITICAL при зайнятому WinSCP (реальний
+алерт SERV_HRDL_1/ХЕРСОНСЬКА РДЛ 23:03: «Запуск WinSCP для SFTP
+health-check заблоковано: виявлено активний WinSCP.com»):
+
+- **FIX (health, операторський UX): зайнятий WinSCP = відкладення, а не
+  CRITICAL.** `Get-SFTPHealthIssues` тепер pre-check-ом перевіряє
+  доступність WinSCP до мережевих кроків: якщо інша BRAVO-передача ще
+  тримає WinSCP.com — SFTP-перевірка відкладається (WARNING у лозі з
+  PID і підказкою, кроки SFTP — SKIPPED, `SftpVerified` не
+  підтверджується), наступний health-прогін перевірить знову. Гонковий
+  випадок після pre-check лишається ERROR (друга лінія захисту).
+
+Acceptance rc.5 (додатково до rc.4): health-прогін під час активної
+передачі → ЧАСТКОВО/exit 10, жовте сповіщення «відкладено», кроки SFTP
+SKIPPED; без конкуренції — звичайна повна перевірка.
+
+---
+
+## 5.2.1-rc.4 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.5)
+
+Кандидат = rc.3 + фікс накопичення diskshadow metadata-.cab (реальний
+звіт SERVER-01/Тернопіль: файли `NN-DD.MM.YYYY-HH_--_SERVER-01.cab` у
+`C:\Program Files\BRAVO-Toolkit` після кожної багатотомної архівації):
+
+- **FIX (archive/VSS): metadata-.cab diskshadow — у TEMP і прибирається.**
+  Сценарій diskshadow.exe не задавав `SET METADATA`, тому VSS writer
+  metadata `.cab` з автоіменем писався в робочий каталог планової
+  задачі (= каталог комплекту) і ніколи не прибирався. BRAVO ці
+  метадані не використовує (контекст `NOWRITERS`): тепер `SET METADATA`
+  вказує в TEMP, файл видаляється у finally разом зі сценарієм, а
+  наявні legacy-.cab цього хоста в каталозі комплекту best-effort
+  зачищаються перед створенням набору. Контракт
+  `BackupConsistency/VSSDiskshadowMetadataGoesToTempAndIsCleaned`.
+
+Acceptance rc.4 (додатково до rc.3): після багатотомної архівації в
+каталозі комплекту немає нових `*_--_*.cab`, старі зникли.
+
+---
+
+## 5.2.1-rc.3 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.4)
+
+Кандидат = rc.2 + одноразова міграція legacy-розкладки архівів MODEL
+(запит власника: старі сервери ARCHIV_LIMS-ери тримають архіви у
+`<BackupRoot>\ARCHIV\LIMS` локально і в `archiv` на SFTP):
+
+- **FEATURE (maintenance): міграція legacy-архівів MODEL.** Щонічний
+  Maintenance best-effort переносить вміст `<BackupRoot>\ARCHIV\LIMS` →
+  `<BackupRoot>\MODEL` (пофайлово, без перезаписів/видалень; колізія
+  імені — WARNING, старий файл лишається; спорожнілі `LIMS` і батько
+  `ARCHIV` прибираються) і `archiv` → `model` на SFTP (канонічний
+  механізм trace-міграції, `.mdz`/`.sha512`; колізія — WARNING без
+  критичного статусу). Idempotent: після повного переносу — no-op.
+
+Acceptance rc.3 (додатково до сценаріїв rc.2): на legacy-сервері після
+нічного Maintenance — архіви з `ARCHIV\LIMS` у `MODEL`, з `archiv` у
+`model`; порожні legacy-каталоги зникли; retention/Health бачать повну
+історію.
+
+---
+
+## 5.2.1-rc.2 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.3)
+
+Hotfix-кандидат лінії 5.2.x = rc.1 + другий операторський фікс,
+відтворений власником на тому самому сервері (Тернопіль):
+
+- **FIX (dry-run, операторський UX):** тестове повідомлення
+  `-SendTestNotification` надходило в ALERTS замість GENERAL —
+  порядок резолвінгу маршрутів у `Test-DryRunWebhookCredential` клав
+  ALERTS-webhook у слот надсилання. Тепер `('general','alerts')`:
+  SUCCESS-семантика тесту → GENERAL; fallback на legacy provider-wide
+  webhook/alerts збережено; `BRAVO_SETUP` і `BRAVO_TASKS_DIAGNOSE`
+  успадковують (шлють через dry-run). Той самий фікс уже в лінії 5.3.0
+  (developer); сюди перенесений cherry-pick-ом.
+
+Acceptance rc.2: обидва сценарії — (1) денний ручний прогін
+`BRAVO_MAINTENANCE.ps1` поза вікном → УСПІШНО/exit 0, SUCCESS у
+GENERAL, рядок пропуску `[INFO]`; (2) `BRAVO_DRY_RUN.ps1 -TestAccess
+-SendTestNotification` → тестове повідомлення в GENERAL.
+
+---
+
+## 5.2.1-rc.1 — 2026-08-26 (hotfix candidate, NOT accepted — superseded by rc.2)
+
+Hotfix-кандидат лінії 5.2.x (гілка `hotfix/5.2.1` від stable 5.2.0).
+На перевірці rc.1 власник відтворив другу хибну маршрутизацію (dry-run
+тест в ALERTS) — кандидата одразу замінено rc.2 вище. Одна вузька зміна:
+
+- **FIX (maintenance, операторський UX):** «Реставрацію пропущено: ...
+  поза дозволеним вікном» — рівень WARNING → INFO (реальний денний
+  ручний прогін ТЕРНОПІЛЬСЬКА РДЛ 2026-08-26: хибний алерт
+  «ПОТРІБНА ДІЯ» з exit 10 при повністю зеленому прогоні; рішення
+  власника — це штатна поведінка, слот не втрачається: підхоплюється
+  нічним Maintenance у вікні або boot-Recovery). Текст у лозі доповнено
+  поясненням про автоматичне підхоплення. Розсинхрон конфігурації, за
+  якого слот справді не виконався б, і далі дає окреме попередження
+  (`maintenanceDailyAtInsideRestoreWindow`). Той самий клас, що вже
+  виправлена в 5.2.0 гілка `-ForceRestore` поза вікном.
+
+Acceptance: ручний денний прогін `BRAVO_MAINTENANCE.ps1` поза вікном →
+консоль/алерт УСПІШНО (SUCCESS у GENERAL), exit 0, рядок про пропуск —
+`[INFO]` у журналі.
+
+Після прийняття той самий фікс синхронізується в `developer`
+(лінія 5.3.0) — обов'язкова синхронізація hotfix, RELEASE_POLICY §12.2.
+
+---
+
 ## 5.2.0 — 2026-08-26
 
 Stable release of the 5.2.0 line, promoted (metadata-only) from the

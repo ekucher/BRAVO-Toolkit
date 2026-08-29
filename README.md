@@ -252,7 +252,7 @@ $global:pathSettings = @{
 - синхронізацію `BAZA_WWW` на SFTP (`BAZA_WWW_SFTP`);
 - щоденний backup о `23:00`;
 - щоденне maintenance о `23:55`;
-- health-check кожні 240 хвилин, починаючи з `00:15`.
+- health-check кожні 240 хвилин, починаючи з `00:30` (слот зсунуто повз ~16-хвилинне вікно BAZASync о `:00`; при зайнятій архівації прогін чекає її завершення до `Health.BusyWaitMinutes` хв, дефолт 60).
 
 Початково вимкнено:
 
@@ -418,8 +418,6 @@ preflight: перевірка вільного місця».
 | `BRAVO_SFTP_PASSWORD` | пароль SFTP |
 | `BRAVO_SMB_LOGIN` | логін SMB/NAS |
 | `BRAVO_SMB_PASSWORD` | пароль SMB/NAS |
-| `BRAVO_SLACK_URL` | Slack webhook (legacy, спільний для GENERAL і ALERTS) |
-| `BRAVO_DISCORD_URL` | Discord webhook (legacy, спільний для GENERAL і ALERTS) |
 | `BRAVO_SLACK_GENERAL_URL` | Slack webhook — лише штатні (SUCCESS) сповіщення |
 | `BRAVO_SLACK_ALERTS_URL` | Slack webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
 | `BRAVO_DISCORD_GENERAL_URL` | Discord webhook — лише штатні (SUCCESS) сповіщення |
@@ -451,10 +449,20 @@ preflight: перевірка вільного місця».
 Таблицю severity → канал можна перевизначити через
 `bravoSettings.NotificationRouting` у `BRAVO.config` (безпечний дефолт вище
 застосовується автоматично, якщо ключ відсутній — стара конфігурація без
-`NotificationRouting` лишається валідною). Сервери, де налаштовано лише
-legacy `BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL`, працюють без змін: обидва
-канали автоматично використовують один legacy webhook, доки канальні
-записи не налаштовано.
+`NotificationRouting` лишається валідною).
+
+Legacy provider-wide webhook-и (`BRAVO_DISCORD_URL`/`BRAVO_SLACK_URL`)
+**більше не підтримуються**: кожен канал резолвиться виключно через власний
+route-специфічний запис, без fallback на спільний webhook і без fallback між
+каналами. Обов'язкова topology залежить від `NotificationMode`:
+`errors_only` вимагає лише ALERTS-запис, `all` — обидва (GENERAL + ALERTS),
+`none` — жодного. Стара інсталяція лише з legacy-записом отримає явну
+міграційну діагностику в `BRAVO_DRY_RUN`/`BRAVO_SETUP`; налаштування:
+`.\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Discord -StoreFor Both`
+(аналогічно `-Component Slack`). Старі записи Credential Manager не
+видаляються автоматично — після міграції вони просто ігноруються. Реальну
+доставку в обидва канали перевіряє `.\BRAVO_NOTIFICATION_TEST.ps1`
+(канонічний конвеєр, явно марковані тестові повідомлення).
 
 `ArchivePrefix` може містити латинські літери, цифри, `.`, `_` і `-`. Після
 зміни префікса старі архіви не видаляються, але новий health-check і retention
@@ -743,7 +751,7 @@ Maintenance, окреме Recovery-завдання не реєструєтьс�
 |---|---|---|
 | `BRAVO_ARCHIV` | щодня `23:00` | архівація та передача копій |
 | `BRAVO_MAINTENANCE` | щодня `23:55` | обслуговування BRAVO |
-| `BRAVO_ARCHIV_HEALTH` | кожні 240 хв. від `00:15` | контроль служб і локальних/SFTP/SMB копій |
+| `BRAVO_ARCHIV_HEALTH` | кожні 240 хв. від `00:30` | контроль служб і локальних/SFTP/SMB копій |
 
 Архівація, maintenance і health-check використовують спільний
 `C:\ProgramData\BRAVO\Locks\BRAVO_OPERATION.lock`. Якщо інша операція вже працює, наступна не накладається
@@ -779,8 +787,21 @@ operations і запуск повертає
 служби, крім служб із типом запуску `Disabled`; повторні однакові
 health-alert можуть тимчасово пригнічуватися на інтервал
 `RepeatAlertAfterHours` (типово `0` - дедуп вимкнено, alert надходить
-щоцикл, поки проблема триває; success-звіт дедупу не підлягає незалежно
-від цього значення).
+щоцикл, поки проблема триває). Зелені success-звіти мають власне вікно
+дедуплікації `SuccessDedupMinutes` (типово `1380` хв = 23 год —
+максимум один зелений звіт на добу): плановий чи ручний health-прогін
+не повторює звіт лише коли semantic-стан не змінився (той самий
+fingerprint перевірок і генерацій копій) і аварій з часу попереднього
+звіту не було; зміна стану, нова генерація копії або відновлення після
+WARNING/ERROR/CRITICAL (recovery) надсилаються завжди, незалежно від
+вікна. Факт непідтвердженого відновлення зберігається в окремому
+операційному стані (`RecoveryPending`): він фіксується при виявленні
+проблеми незалежно від долі alert-доставки і знімається лише після
+фактично доставленого SUCCESS — якщо recovery-звіт не вдалося
+доставити, наступні health-прогони повторюють його, доки оператор не
+отримає підтвердження. Сам post-backup звіт після щоденної архівації не дедуплікується
+і надходить завжди, `0` вимикає дедуп, `-ForceNotification` надсилає
+примусово. Аварійні сповіщення від SUCCESS-дедупу не залежать.
 
 Встановити або оновити лише завдання:
 
@@ -1190,7 +1211,7 @@ health > лише попередження. Код `90` має найвищий 
 | `BRAVO_TASKS_DIAGNOSE.ps1` | діагностика Планувальника і запуск від `SYSTEM` |
 | `BRAVO_RESTORE_TEST.ps1` | restore drill — розпакування останнього verified backup в ізольований каталог (розділ 6.1) |
 | `BRAVO_DATA_RESTORE.ps1` | реальне відновлення даних із verified generation: out-of-place або in-place з move-aside і rollback (розділ 6.2) |
-| `BRAVO_BAZA_RECONCILE.ps1` | розв'язання append-only mutation violation у BAZA_APP/BAZA_WWW — свідоме прийняття оператором (`OPERATIONS.md`, "Розв'язання мутацій"); опційний per-cycle поріг авто-архівування `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` (типово `0` = вимкнено) описаний там само |
+| `BRAVO_BAZA_RECONCILE.ps1` | розв'язання append-only mutation violation у BAZA_APP/BAZA_WWW — свідоме прийняття оператором (`OPERATIONS.md`, "Розв'язання мутацій"); опційний per-cycle поріг авто-архівування `backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold` (типово `25`; `0` = вимкнено) описаний там само |
 
 ### Службові файли
 

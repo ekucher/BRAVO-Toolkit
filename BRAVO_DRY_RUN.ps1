@@ -445,14 +445,22 @@ function Get-RequiredCredentialDescriptors {
         if ($provider -eq "slack") {
             [void]$descriptors.Add([pscustomobject]@{
                 Name = "Slack webhook"
-                Target = Get-ConfiguredTarget "SlackWebhook" "BRAVO_SLACK_URL"
+                # 5.2.1: legacy provider-wide target виведений з контракту;
+                # фактичну перевірку канальних записів робить
+                # Test-DryRunWebhookCredential через канонічний resolver,
+                # Target тут — лише інформаційний підпис.
+                Target = "$(Get-ConfiguredTarget 'SlackWebhookGeneral' 'BRAVO_SLACK_GENERAL_URL') / $(Get-ConfiguredTarget 'SlackWebhookAlerts' 'BRAVO_SLACK_ALERTS_URL')"
                 Kind = "Webhook"
                 NotificationProvider = "slack"
             })
         } else {
             [void]$descriptors.Add([pscustomobject]@{
                 Name = "Discord webhook"
-                Target = Get-ConfiguredTarget "DiscordWebhook" "BRAVO_DISCORD_URL"
+                # 5.2.1: legacy provider-wide target виведений з контракту;
+                # фактичну перевірку канальних записів робить
+                # Test-DryRunWebhookCredential через канонічний resolver,
+                # Target тут — лише інформаційний підпис.
+                Target = "$(Get-ConfiguredTarget 'DiscordWebhookGeneral' 'BRAVO_DISCORD_GENERAL_URL') / $(Get-ConfiguredTarget 'DiscordWebhookAlerts' 'BRAVO_DISCORD_ALERTS_URL')"
                 Kind = "Webhook"
                 NotificationProvider = "discord"
             })
@@ -479,19 +487,20 @@ function Get-NotificationCredentialTargetTable {
 }
 
 function Test-DryRunWebhookCredential {
-    # Dry-run має перевіряти РІВНО ті записи Credential Manager, які runtime
-    # реально читає. Раніше тут стояв лише legacy provider-wide target
-    # (BRAVO_DISCORD_URL / BRAVO_SLACK_URL), тоді як
-    # Resolve-BRAVONotificationEndpoint пробує спершу route-специфічний
-    # (BRAVO_DISCORD_ALERTS_URL / BRAVO_DISCORD_GENERAL_URL) і лише потім
-    # legacy. Сервер, налаштований на route-специфічні webhook-и, отримував
-    # [FAIL] на цілком робочій конфігурації — і BRAVO_SETUP зупинявся
-    # fail-closed, хоча сповіщення фактично надсилались. Канонічний власник
-    # порядку пошуку один — BRAVO.Notifications; тут він саме викликається,
-    # а не дублюється.
+    # Dry-run має перевіряти РІВНО ту topology Credential Manager, яку
+    # runtime реально використовує. Канонічний власник порядку пошуку
+    # один — BRAVO.Notifications; тут він саме викликається, а не
+    # дублюється. Набір обов'язкових маршрутів залежить від
+    # NotificationMode: errors_only не маршрутизує SUCCESS, тому GENERAL
+    # для нього не required; all вимагає ОБИДВА канали. Legacy
+    # provider-wide Discord webhook більше не рятує неповну topology:
+    # route-specific missing = FAIL (fail-closed, міграційна діагностика
+    # нижче).
     param(
         [Parameter(Mandatory = $true)][object]$Descriptor,
-        [Parameter(Mandatory = $true)][hashtable]$CredentialValues
+        [Parameter(Mandatory = $true)][hashtable]$CredentialValues,
+        [ValidateSet('errors_only', 'all')]
+        [string]$NotificationMode = 'all'
     )
 
     $credentialTargets = Get-NotificationCredentialTargetTable
@@ -502,10 +511,14 @@ function Test-DryRunWebhookCredential {
     # бере URL для тестового повідомлення. Тестове повідомлення має
     # SUCCESS-семантику, а SUCCESS канонічно належить GENERAL
     # (P2-знахідка acceptance 5.2.0: тест завжди падав у ALERTS, бо
-    # 'alerts' стояв першим). Fallback лишається: без general-target
-    # Resolve-BRAVONotificationEndpoint сам відкочується на legacy
-    # provider-wide webhook, а якщо і його немає — 'alerts' нижче.
-    foreach ($route in @('general', 'alerts')) {
+    # 'alerts' стояв першим). В errors_only GENERAL не перевіряється —
+    # тестове повідомлення піде в ALERTS (єдиний активний канал режиму).
+    $requiredRoutes = if ($NotificationMode -eq 'errors_only') {
+        @('alerts')
+    } else {
+        @('general', 'alerts')
+    }
+    foreach ($route in $requiredRoutes) {
         $secret = $null
         try {
             $secret = Resolve-BRAVONotificationEndpoint `
@@ -527,10 +540,28 @@ function Test-DryRunWebhookCredential {
     }
 
     if ($failedRoutes.Count -gt 0) {
-        Add-DryRunResult FAIL 'Credential Manager' $Descriptor.Name (
-            'для {0} не вдалося отримати webhook — {1}' -f `
-                ([Security.Principal.WindowsIdentity]::GetCurrent().Name), ($failedRoutes -join '; ')
-        )
+        $failureDetail = 'для {0} не вдалося отримати webhook — {1}' -f `
+            ([Security.Principal.WindowsIdentity]::GetCurrent().Name), ($failedRoutes -join '; ')
+        # Міграційна діагностика для старої інсталяції: legacy-запис
+        # читається тут ЛИШЕ щоб чесно пояснити оператору, чому
+        # конфігурація, що "працювала раніше", тепер FAIL. Runtime
+        # resolver цей запис не використовує.
+        $legacyDiagnostic = if ([string]$Descriptor.NotificationProvider -eq 'discord') {
+            @{ Literal = 'BRAVO_DISCORD_URL'; Component = 'Discord' }
+        } else {
+            @{ Literal = 'BRAVO_SLACK_URL'; Component = 'Slack' }
+        }
+        $legacyProviderSecret = $null
+        try {
+            $legacyProviderSecret = Get-BRAVOCredentialSecret -Target ([string]$legacyDiagnostic.Literal)
+        } catch {
+            $legacyProviderSecret = $null
+        }
+        if (-not [string]::IsNullOrWhiteSpace($legacyProviderSecret)) {
+            $failureDetail += " Знайдено лише legacy $($legacyDiagnostic.Literal) — він більше не підтримується. " +
+                "Налаштуйте канальні записи: BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component $($legacyDiagnostic.Component) -StoreFor Both."
+        }
+        Add-DryRunResult FAIL 'Credential Manager' $Descriptor.Name $failureDetail
         return
     }
     Add-DryRunResult PASS 'Credential Manager' $Descriptor.Name (
@@ -1743,9 +1774,14 @@ try {
             $requiredCredentials = @(Get-RequiredCredentialDescriptors)
             foreach ($descriptor in $requiredCredentials) {
                 if ($descriptor.Kind -eq "Webhook") {
+                    $webhookNotificationMode = ([string]$bravoSettings.NotificationMode).Trim().ToLowerInvariant()
+                    if ($webhookNotificationMode -ne 'errors_only') {
+                        $webhookNotificationMode = 'all'
+                    }
                     Test-DryRunWebhookCredential `
                         -Descriptor $descriptor `
-                        -CredentialValues $credentialValues
+                        -CredentialValues $credentialValues `
+                        -NotificationMode $webhookNotificationMode
                     continue
                 }
                 try {
