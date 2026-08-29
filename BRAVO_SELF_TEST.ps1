@@ -15697,6 +15697,9 @@ function Write-BRAVOLog {
     # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
     # замість голої NullReferenceException).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
+    # Configurator backend: Schema/Model/Effective/Validation/Persistence
+    # (docs/design/BRAVO_CONFIGURATOR_DESIGN.md) — GUI ще не реалізовано.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
