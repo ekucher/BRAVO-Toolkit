@@ -104,6 +104,19 @@ function ConvertTo-BRAVOConfiguratorPowerShellLiteral {
     if ($Value -is [bool]) { return $(if ($Value) { '$true' } else { '$false' }) }
     if ($Value -is [int] -or $Value -is [long]) { return [string]$Value }
     if ($Value -is [double] -or $Value -is [decimal] -or $Value -is [float]) { return [string]$Value }
+    # Fail-closed, не мовчазний recurse (P2-фікс за результатами незалежного
+    # review): hashtable/IDictionary теж [System.Collections.IEnumerable], і
+    # раніше потрапляв у гілку нижче — але піпа хеш-таблиці через
+    # ForEach-Object повертає ЇЇ Ж САМУ як єдиний елемент (не пари
+    # ключ/значення), тому рекурсивний виклик отримував той самий $Value і
+    # йшов у нескінченну рекурсію до "call depth overflow". Документований
+    # контракт BRAVO.local.config — плаский 'dot.path' = скаляр|масив;
+    # вкладена hashtable ніколи не мала тут з'являтись, але
+    # Merge-BRAVOConfiguratorCandidateOverrides зберігає preserved
+    # unknown-ключі без перевірки типу, тому явна відмова тут потрібна.
+    if ($Value -is [System.Collections.IDictionary]) {
+        throw "BRAVO.Configurator.Effective: неможливо серіалізувати hashtable-значення в data-only BRAVO.local.config літерал (очікується скаляр або масив скалярів)."
+    }
     if ($Value -is [array] -or $Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
         $items = @($Value | ForEach-Object { ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $_ })
         return '@(' + [string]::Join(', ', $items) + ')'

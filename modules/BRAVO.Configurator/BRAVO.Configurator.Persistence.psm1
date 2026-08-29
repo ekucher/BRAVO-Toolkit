@@ -263,7 +263,25 @@ function Invoke-BRAVOConfiguratorApply {
     }
 
     $productionConfigPath = Join-Path $ProductionConfigDirectory 'BRAVO.local.config'
-    $candidateText = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mergedOverrides
+    # P2-фікс за результатами незалежного review: ConvertTo-BRAVOConfiguratorLocalConfigText
+    # (через ConvertTo-BRAVOConfiguratorPowerShellLiteral) кидає виняток на
+    # непідтримуваних значеннях (напр. вкладена hashtable у preserved
+    # unknown-ключі) — раніше це пробивало Invoke-BRAVOConfiguratorApply
+    # наскрізь необробленим винятком, порушуючи задокументований контракт
+    # "завжди повертає [pscustomobject]@{ Applied = ... }". Крок 6-7 вище
+    # вже прогнав цей самий candidate через canonical loader, тому реальний
+    # unsupported-value case тут малоймовірний, але fail-closed без
+    # структурованої відповіді — гірше, ніж явний Stage='Serialization'.
+    # Продакшн-файл тут ще не чіпався (backup/replace нижче).
+    try {
+        $candidateText = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mergedOverrides
+    } catch {
+        return [pscustomobject]@{
+            Applied = $false
+            Stage   = 'Serialization'
+            Reasons = @("Не вдалося серіалізувати candidate у BRAVO.local.config: $($_.Exception.Message). Production файл НЕ змінено.")
+        }
+    }
 
     # Крок 11: backup існуючого файлу (якщо був).
     $backupPath = $null

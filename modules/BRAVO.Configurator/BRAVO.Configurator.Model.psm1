@@ -62,18 +62,27 @@ function Resolve-BRAVOConfiguratorGatedEffective {
             $component = @($EffectiveConfig.bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' })
             if ($component.Count -ne 1) { return $null }
             $sftpMasterReason = [string]$EffectiveConfig.storageEffective.SFTP.DisabledReason
+            # P2-фікс за результатами незалежного review: приписувати
+            # DisabledReason master-у можна лише якщо ВЛАСНИЙ raw-прапорець
+            # дитини true (тобто дитина була б Effective=true, якби не
+            # master) — інакше, коли raw дитини вже false, Effective=false
+            # спричинений власним вибором оператора, а не master-ом, і
+            # DisabledReason, що вказує на SFTP.Enabled, був би хибним
+            # поясненням.
+            $rawSftpFlag = [bool]$EffectiveConfig.componentSettings.Synchronization.BAZA_APP_SFTP
             return [pscustomobject]@{
                 EffectiveValue = [bool]$component[0].SftpEnabled
-                DisabledReason = if ((-not [bool]$component[0].SftpEnabled) -and -not [string]::IsNullOrWhiteSpace($sftpMasterReason)) { $sftpMasterReason } else { $null }
+                DisabledReason = if ($rawSftpFlag -and (-not [bool]$component[0].SftpEnabled) -and -not [string]::IsNullOrWhiteSpace($sftpMasterReason)) { $sftpMasterReason } else { $null }
             }
         }
         'componentSettings.Synchronization.BAZA_WWW_SFTP' {
             $component = @($EffectiveConfig.bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' })
             if ($component.Count -ne 1) { return $null }
             $sftpMasterReason = [string]$EffectiveConfig.storageEffective.SFTP.DisabledReason
+            $rawSftpFlag = [bool]$EffectiveConfig.componentSettings.Synchronization.BAZA_WWW_SFTP
             return [pscustomobject]@{
                 EffectiveValue = [bool]$component[0].SftpEnabled
-                DisabledReason = if ((-not [bool]$component[0].SftpEnabled) -and -not [string]::IsNullOrWhiteSpace($sftpMasterReason)) { $sftpMasterReason } else { $null }
+                DisabledReason = if ($rawSftpFlag -and (-not [bool]$component[0].SftpEnabled) -and -not [string]::IsNullOrWhiteSpace($sftpMasterReason)) { $sftpMasterReason } else { $null }
             }
         }
         default { return $null }

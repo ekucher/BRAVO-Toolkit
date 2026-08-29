@@ -374,6 +374,35 @@ Test-BRAVOCondition ($arraySettingNoOverride.Count -eq 1 -and $arraySettingNoOve
     'Configurator Model: EffectiveSource для StringArray без override -> Default (не хибний Derived)' `
     "Path=$configuratorArrayPathForEquality EffectiveSource=$($arraySettingNoOverride[0].EffectiveSource) Effective=$($arraySettingNoOverride[0].EffectiveValue -join ',') Default=$($arraySettingNoOverride[0].DefaultValue -join ',')"
 
+# ===== P1.1 незалежний review (2 P2-регресії) =====
+
+# L: hashtable-значення у candidate -> ConvertTo-BRAVOConfiguratorPowerShellLiteral
+# явно відхиляє (fail-closed), а не рекурсує до call-depth overflow.
+$configuratorHashtableLiteralThrew = $false
+$configuratorHashtableLiteralMessage = $null
+try {
+    [void](ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value @{ Nested = 'value' })
+} catch {
+    $configuratorHashtableLiteralThrew = $true
+    $configuratorHashtableLiteralMessage = $_.Exception.Message
+}
+Test-BRAVOCondition ($configuratorHashtableLiteralThrew -and $configuratorHashtableLiteralMessage -notmatch 'call depth overflow') `
+    'Configurator Effective: hashtable-значення відхиляється явним винятком, не рекурсією до call depth overflow' `
+    "Threw=$configuratorHashtableLiteralThrew Message=$configuratorHashtableLiteralMessage"
+
+# M: BAZA_APP_SFTP raw=false + SFTP.Enabled=false -> DisabledReason НЕ
+# приписується master-у (Effective=false спричинений власним raw-вибором
+# оператора, а не глобальним вимикачем).
+$modelScenarioM = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{
+    'componentSettings.SFTP.Enabled' = $false
+    'componentSettings.Synchronization.BAZA_APP_SFTP' = $false
+}
+$modelScenarioM = Update-BRAVOConfiguratorEffective -Model $modelScenarioM -RuntimeRoot $configuratorFixtureRuntimeRoot
+$settingScenarioM = @($modelScenarioM | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_SFTP' })
+Test-BRAVOCondition ($settingScenarioM.Count -eq 1 -and [bool]$settingScenarioM[0].EffectiveValue -eq $false -and [string]::IsNullOrWhiteSpace([string]$settingScenarioM[0].DisabledReason)) `
+    'Configurator 5.2.2 Scenario M: BAZA_APP_SFTP raw=false + SFTP.Enabled=false -> DisabledReason НЕ приписується master-у (власний вибір оператора)' `
+    "Effective=$($settingScenarioM[0].EffectiveValue) DisabledReason=$($settingScenarioM[0].DisabledReason)"
+
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====
