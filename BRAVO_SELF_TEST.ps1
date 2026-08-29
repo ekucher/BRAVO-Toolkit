@@ -15697,9 +15697,14 @@ function Write-BRAVOLog {
     # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
     # замість голої NullReferenceException).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
-    # Configurator backend: Schema/Model/Effective/Validation/Persistence
-    # (docs/design/BRAVO_CONFIGURATOR_DESIGN.md) — GUI ще не реалізовано.
+    # Configurator backend: Schema/Model/Effective/Validation/Persistence/
+    # Credentials/Presets/Preview (docs/design/BRAVO_CONFIGURATOR_DESIGN.md).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
+    # Configurator UI: лише headless-тестовані pure-функції (coverage,
+    # filters, search, category tree, boolean tri-state) — жодного
+    # System.Windows.Forms-об'єкта в цьому фрагменті, ShowDialog() тут не
+    # викликається.
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
