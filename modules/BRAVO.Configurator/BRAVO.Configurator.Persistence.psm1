@@ -180,6 +180,72 @@ function ConvertTo-BRAVOConfiguratorLocalConfigText {
     return [string]::Join([Environment]::NewLine, $lines)
 }
 
+function Test-BRAVOConfiguratorPostApplyVerification {
+    <#
+    .SYNOPSIS
+        Крок 13-14 Invoke-BRAVOConfiguratorApply, винесені в окрему
+        одиницю (P2-A.2, hermetic failure-injection тестування) — реальна
+        поведінка НЕ змінена, лише витягнута з інлайн try/catch, щоб
+        forced-mismatch сценарій можна було відтворити без залежності
+        від таймінгу/race файлової системи (крок 12, atomic replace, уже
+        відбувся до виклику цієї функції).
+    .DESCRIPTION
+        Перечитує щойно записаний production BRAVO.local.config через
+        canonical loader. При провалі — АВТОМАТИЧНИЙ ROLLBACK (P1-фікс за
+        результатами незалежного review, §07 BRAVO Runtime Safety
+        Invariants: fail-closed, не попередження): відновлює з
+        $BackupPath, або видаляє файл, якщо до Apply його не існувало.
+    .OUTPUTS
+        $null, якщо верифікація пройшла (Apply може продовжувати до
+        Complete). Інакше — [pscustomobject]@{ Applied=$false;
+        Stage='PostApplyVerification'; Reasons; BackupPath } — той самий
+        contract, що Invoke-BRAVOConfiguratorApply повертає напряму.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$ProductionConfigDirectory,
+        [Parameter(Mandatory = $true)][string]$ProductionConfigPath,
+        [string]$BackupPath
+    )
+
+    try {
+        $loaderPath = Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1'
+        . $loaderPath
+        $reloadResult = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $ProductionConfigDirectory
+        if (-not $reloadResult.Present) {
+            throw 'Щойно записаний BRAVO.local.config не читається повторно.'
+        }
+        return $null
+    } catch {
+        $verificationError = $_.Exception.Message
+        $rollbackReasons = New-Object System.Collections.Generic.List[string]
+        $rollbackReasons.Add("Щойно записаний BRAVO.local.config не пройшов повторне читання: $verificationError")
+        try {
+            if (-not [string]::IsNullOrEmpty($BackupPath) -and (Test-Path -LiteralPath $BackupPath -PathType Leaf)) {
+                # P2-A.2 (той самий root-cause клас, що AtomicReplace вище):
+                # без -ErrorAction Stop файлова IOException тут НЕ termінує
+                # try/catch під дефолтним $ErrorActionPreference='Continue' —
+                # rollback міг мовчки НЕ відбутись, а повідомлення все одно
+                # заявляло б "Rollback виконано".
+                Copy-Item -LiteralPath $BackupPath -Destination $ProductionConfigPath -Force -ErrorAction Stop
+                $rollbackReasons.Add("Rollback виконано: production BRAVO.local.config відновлено з backup ($BackupPath).")
+            } else {
+                Remove-Item -LiteralPath $ProductionConfigPath -Force -ErrorAction Stop
+                $rollbackReasons.Add('Rollback виконано: production BRAVO.local.config видалено (до Apply файл не існував).')
+            }
+        } catch {
+            $rollbackReasons.Add("КРИТИЧНО: автоматичний rollback НЕ вдався ($($_.Exception.Message)). Production файл лишається у невалідованому стані ($ProductionConfigPath). Відновіть вручну з backup: $BackupPath")
+        }
+        return [pscustomobject]@{
+            Applied      = $false
+            Stage        = 'PostApplyVerification'
+            Reasons      = $rollbackReasons.ToArray()
+            BackupPath   = $BackupPath
+        }
+    }
+}
+
 function Invoke-BRAVOConfiguratorApply {
     <#
     .SYNOPSIS
@@ -253,7 +319,27 @@ function Invoke-BRAVOConfiguratorApply {
     # production BRAVO_CONFIG_TEST/LOADER не знадобилося.
 
     # Крок 10: race detection — перечитати baseline ПРЯМО перед записом.
-    $currentState = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ProductionConfigDirectory
+    # P2-A (той самий root-cause клас, що AtomicReplace/Backup нижче,
+    # реальна знахідка через hermetic failure-injection): цей виклик НЕ
+    # мав жодного try/catch — якщо production-файл тимчасово недоступний
+    # для читання (напр. заблокований антивірусом/backup-софтом саме в
+    # цю мить), Get-Content усередині кидає виняток, який пробивав
+    # Invoke-BRAVOConfiguratorApply НАСКРІЗЬ необробленим, порушуючи
+    # задокументований контракт "завжди повертає структурований
+    # результат" (P1.1-фікс, §10.6 design doc). Явний structured
+    # Stage='RaceCheckFailed' — окремий від справжнього 'RaceDetection'
+    # (файл ДІЙСНО змінився), щоб UI не показував хибне "was changed by
+    # another process" повідомлення для принципово іншої причини
+    # (тимчасова недоступність читання, не паралельна зміна).
+    try {
+        $currentState = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ProductionConfigDirectory
+    } catch {
+        return [pscustomobject]@{
+            Applied = $false
+            Stage   = 'RaceCheckFailed'
+            Reasons = @("Не вдалося перечитати BRAVO.local.config перед записом (pre-write перевірка): $($_.Exception.Message). Production файл НЕ змінено.")
+        }
+    }
     if ($currentState.BaselineHash -ne $ProductionBaseline.BaselineHash) {
         return [pscustomobject]@{
             Applied = $false
@@ -284,10 +370,27 @@ function Invoke-BRAVOConfiguratorApply {
     }
 
     # Крок 11: backup існуючого файлу (якщо був).
+    # P2-A.1 (реальна знахідка hermetic failure-injection тесту, не
+    # гіпотетична): Copy-Item/Move-Item БЕЗ -ErrorAction Stop успадковують
+    # $ErrorActionPreference ВИКЛИКАЧА — типова файлова IOException (напр.
+    # "Cannot create a file when that file already exists" від заблокованого
+    # файлу) НЕ termінує виконання під дефолтним 'Continue', тому catch
+    # нижче НІКОЛИ не спрацьовував, а Apply мовчки повертав Applied=$true/
+    # Stage='Complete', хоча запис фізично НЕ відбувся (fail-closed
+    # порушення, §07 BRAVO Runtime Safety Invariants). Явний -ErrorAction
+    # Stop на КОЖНОМУ кроці 11-12 — root-cause фікс, не косметика.
     $backupPath = $null
     if ($ProductionBaseline.Present) {
         $backupPath = "$productionConfigPath.bak-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
-        Copy-Item -LiteralPath $productionConfigPath -Destination $backupPath -Force
+        try {
+            Copy-Item -LiteralPath $productionConfigPath -Destination $backupPath -Force -ErrorAction Stop
+        } catch {
+            return [pscustomobject]@{
+                Applied = $false
+                Stage   = 'Backup'
+                Reasons = @("Не вдалося створити backup перед записом: $($_.Exception.Message). Production файл НЕ змінено.")
+            }
+        }
     }
 
     # Крок 12: atomic replace — write у temp У ТІЙ САМІЙ директорії (той
@@ -314,7 +417,7 @@ function Invoke-BRAVOConfiguratorApply {
             }
         }
 
-        Move-Item -LiteralPath $tempWritePath -Destination $productionConfigPath -Force
+        Move-Item -LiteralPath $tempWritePath -Destination $productionConfigPath -Force -ErrorAction Stop
     } catch {
         Remove-Item -LiteralPath $tempWritePath -Force -ErrorAction SilentlyContinue
         return [pscustomobject]@{
@@ -334,34 +437,11 @@ function Invoke-BRAVOConfiguratorApply {
     # Тепер: спроба відновити production з backup (або видалити, якщо
     # файлу до Apply не існувало), і в будь-якому разі Applied=$false —
     # операція вважається неуспішною, оператор повинен повторити Apply.
-    try {
-        $loaderPath = Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1'
-        . $loaderPath
-        $reloadResult = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $ProductionConfigDirectory
-        if (-not $reloadResult.Present) {
-            throw 'Щойно записаний BRAVO.local.config не читається повторно.'
-        }
-    } catch {
-        $verificationError = $_.Exception.Message
-        $rollbackReasons = New-Object System.Collections.Generic.List[string]
-        $rollbackReasons.Add("Щойно записаний BRAVO.local.config не пройшов повторне читання: $verificationError")
-        try {
-            if ($null -ne $backupPath -and (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
-                Copy-Item -LiteralPath $backupPath -Destination $productionConfigPath -Force
-                $rollbackReasons.Add("Rollback виконано: production BRAVO.local.config відновлено з backup ($backupPath).")
-            } else {
-                Remove-Item -LiteralPath $productionConfigPath -Force -ErrorAction Stop
-                $rollbackReasons.Add('Rollback виконано: production BRAVO.local.config видалено (до Apply файл не існував).')
-            }
-        } catch {
-            $rollbackReasons.Add("КРИТИЧНО: автоматичний rollback НЕ вдався ($($_.Exception.Message)). Production файл лишається у невалідованому стані ($productionConfigPath). Відновіть вручну з backup: $backupPath")
-        }
-        return [pscustomobject]@{
-            Applied      = $false
-            Stage        = 'PostApplyVerification'
-            Reasons      = $rollbackReasons.ToArray()
-            BackupPath   = $backupPath
-        }
+    $postApplyFailure = Test-BRAVOConfiguratorPostApplyVerification `
+        -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ProductionConfigDirectory `
+        -ProductionConfigPath $productionConfigPath -BackupPath $backupPath
+    if ($null -ne $postApplyFailure) {
+        return $postApplyFailure
     }
 
     # Крок 15: результат.
@@ -380,5 +460,6 @@ Export-ModuleMember -Function @(
     'Merge-BRAVOConfiguratorCandidateOverrides',
     'Test-BRAVOConfiguratorCandidateOverrides',
     'ConvertTo-BRAVOConfiguratorLocalConfigText',
+    'Test-BRAVOConfiguratorPostApplyVerification',
     'Invoke-BRAVOConfiguratorApply'
 )

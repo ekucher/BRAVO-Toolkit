@@ -413,3 +413,181 @@ Get-BRAVOConfiguratorProductionOverrideState + перебудова моделі
 Serialization-стадія теж повертає структурований `Applied=$false`) — UI
 завжди отримує предбачуваний `{Applied, Stage, Reasons}`, не try/catch
 навколо непередбачуваного винятку.
+
+## 11. P2-A — Reliability & UX correctness
+
+Пост-P1-стабілізаційний цикл (закриття P0/P1 стабілізації, PR #113/#114,
+`developer`@`8bd022a`). Мета — correctness/reliability gaps, знайдені під
+час P1-стабілізації, ДО будь-якого косметичного P2-B redesign (High DPI,
+1024x768, keyboard navigation тощо — окрема майбутня ітерація).
+
+### 11.1. AtomicReplace / PostApplyVerification — hermetic failure-injection
+
+Обидва `Stage`-и вже мали production-контракт (P1-фікс: fail-closed,
+автоматичний rollback для PostApplyVerification) — бракувало лише
+targeted regression-тесту, що реально форсує кожен збій.
+
+- **AtomicReplace**: жодного test-only seam не знадобилось — `Move-Item
+  -Force` (крок 12) реально провалюється, якщо production-файл відкритий
+  handle-ом БЕЗ `FileShare.Delete` (Windows rename-семантика); self-test
+  відкриває такий handle перед `Invoke-BRAVOConfiguratorApply` і закриває
+  його в `finally`. Детерміновано, без залежності від таймінгу.
+
+  **Реальна знахідка (не гіпотетична)**: цей тест ПАДАВ під повним
+  `BRAVO_SELF_TEST.ps1` (хоча проходив в ізольованому фокусованому
+  прогоні) — `Move-Item`/`Copy-Item` у кроках 11-12 не мали явного
+  `-ErrorAction Stop`, тому успадковували `$ErrorActionPreference`
+  ВИКЛИКАЧА; коли ambient-значення виявлялось `'Continue'` (витік з
+  іншого доменного фрагмента self-test-а в тому самому процесі —
+  попередня, окрема, вже наявна крихкість, не в межах цього P2-A циклу),
+  файлова `IOException` НЕ termінувала `try`, `catch` ніколи не
+  спрацьовував, і `Invoke-BRAVOConfiguratorApply` МОВЧКИ повертав
+  `Applied=$true, Stage='Complete'`, хоча запис фізично НЕ відбувся —
+  §07 BRAVO Runtime Safety Invariants fail-closed порушення. Root-cause
+  фікс: явний `-ErrorAction Stop` на кожному load-bearing файловому
+  cmdlet-виклику в кроках 11-12 (backup `Copy-Item`, `Move-Item`) — крок
+  11 (backup) тепер має власний structured `Stage='Backup'` провал,
+  раніше взагалі не мав власного try/catch. Той самий клас дефекту
+  знайдено й виправлено в PostApplyVerification rollback-шляху
+  (`Copy-Item` відновлення з backup, §11.1 нижче) і в
+  `BRAVO.Configurator.Effective::New-BRAVOConfiguratorIsolatedConfigRoot`
+  (менш критично — гірша діагностика, не хибний success). Підтверджено
+  повторним прогоном фокусованого self-test-у під явним
+  `$ErrorActionPreference='Continue'` (відтворює умову збою) — PASS
+  після фіксу.
+- **PostApplyVerification**: кроки 13-14 (reload + rollback-on-failure)
+  винесено з `Invoke-BRAVOConfiguratorApply` в окрему публічну функцію
+  `Test-BRAVOConfiguratorPostApplyVerification` (той самий контракт, той
+  самий текст повідомлень — чиста екстракція, не зміна поведінки). Це
+  дозволяє self-test-у викликати верифікацію напряму на деліберативно
+  зіпсованому "щойно записаному" файлі (canonical `CheckRestrictedLanguage`
+  відхиляє `$env:`-звернення), без залежності від race-вікна файлової
+  системи. Повертає `$null` при успіху, або
+  `[pscustomobject]@{ Applied=$false; Stage='PostApplyVerification'; Reasons; BackupPath }`
+  при провалі — `Invoke-BRAVOConfiguratorApply` лишається тонким
+  викликачем цієї функції.
+
+### 11.2. Dirty — справжній diff, не подієвий прапорець
+
+**Знайдений P3 (P1-стабілізація): "phantom Dirty"** — `Model[].Dirty`
+виставлявся `$true` в `Set-/Clear-BRAVOConfiguratorOverride` і ніколи не
+скидався назад, тому статус "Є незбережені зміни" лишався правдивим
+назавжди навіть після edit → revert до оригінального значення.
+
+**Фікс**: нова canonical чиста функція
+`Test-BRAVOConfiguratorModelDirty -Model -BaselineOverrides`
+(`BRAVO.Configurator.Model.psm1`) — порівнює поточний
+`OverridePresent`/`OverrideValue` КОЖНОГО schema-запису з
+`$BaselineOverrides` (той самий hashtable, що
+`Get-BRAVOConfiguratorProductionOverrideState.Overrides` повертає при
+Load/Reload/успішному Apply — вже існуючий знімок, що Persistence
+використовував для race detection). `OverridePresent` сам по собі — частина
+diff (не лише значення): "false override" ніколи не еквівалентний
+"відсутньому override". Масиви порівнюються поелементно через уже наявний
+`Test-BRAVOConfiguratorValueEquality` (та сама функція, що `EffectiveSource`
+використовує). `Model[].Dirty`-поле саме по собі лишилось у формі моделі
+(вже expected shape для існуючих споживачів), але статус-бар UI
+(`Get-BRAVOConfiguratorUIDirtyState`, private, `BRAVO.Configurator.UI.psm1`)
+тепер делегує до `Test-BRAVOConfiguratorModelDirty` проти
+`$State.ProductionBaseline.Overrides`, а не до застарілого прапорця.
+
+### 11.3. Exit-семантика — рішення: KEEP exit 0 + structured result
+
+Configurator — інтерактивний desktop-інструмент, не scheduled SYSTEM-
+завдання (див. коментар на початку `BRAVO_CONFIGURATOR.ps1`) і НЕ
+учасник canonical `BRAVO.ExitCodes`-контракту сьогодні; жоден
+automation-caller не розрізняє exit-код Configurator-а. Введення нових OS
+exit-кодів без жодного реального споживача суперечило б
+"Do not invent... exit-code semantics" і мінімальному обсягу зміни.
+
+Замість цього `Show-BRAVOConfiguratorMainForm` повертає структурований
+рядок-результат — `'Applied'` / `'Cancelled'` / `'NoChanges'` — викликачу,
+через `Get-BRAVOConfiguratorSessionOutcome` (Model.psm1, чиста функція,
+покрита headless-тестами).
+
+**Correction (після початкового P2-A.4):** перша версія оцінювала
+Cancelled/NoChanges проти *первинного* baseline сесії
+(`InitialBaselineOverrides`, знімок на момент Launch) і давала Applied
+абсолютний пріоритет над будь-яким подальшим diff. Це давало два хибні
+результати: (1) `Launch A -> зовнішня зміна на диску -> Reload -> Close
+без edits` повертав `Cancelled`, хоча `ProductionBaseline` уже оновлено
+Reload-ом і незбережених змін немає; (2) `Apply успішний (baseline ->
+B) -> подальший edit -> Close без повторного Apply` повертав `Applied`,
+приховуючи реальні незбережені зміни, які оператор фактично відкинув.
+
+Виправлений контракт оцінює diff проти **поточного**
+`$state.ProductionBaseline.Overrides` (той самий canonical знімок, що
+race detection у Persistence і status-bar/close-confirmation Dirty вже
+використовують — оновлюється Load/Reload і кожним успішним Apply), з
+пріоритетом:
+
+```text
+currentDirty = Test-BRAVOConfiguratorModelDirty(Model, ProductionBaseline.Overrides)
+
+if currentDirty:      Cancelled   # незбережений diff на момент закриття
+elif AnyApplySucceeded: Applied   # принаймні один Apply відбувся, diff відсутній
+else:                  NoChanges
+```
+
+`InitialBaselineOverrides` видалено зі `$state` — окремого знімка
+первинного baseline сесії більше не потрібно.
+
+`BRAVO_CONFIGURATOR.ps1` виводить відповідний текст оператору й лишає
+`exit 0` для всіх трьох — це навмисно, не недогляд.
+
+### 11.4. Reset setting / Reset section
+
+Reset одного setting уже існував як побічний ефект зняття
+override-checkbox у рядку (`Clear-BRAVOConfiguratorOverride` — §1.3:
+"Використовувати default" видаляє override, не матеріалізує `False`).
+Формалізовано під явним ім'ям — `Reset-BRAVOConfiguratorSetting` (тонка
+обгортка над `Clear-BRAVOConfiguratorOverride`, той самий контракт).
+
+Reset секції (bulk-операція, якої раніше не було) —
+`Reset-BRAVOConfiguratorSection -Model -Group -Section`: скидає ЛИШЕ
+overrides settings цієї конкретної `Metadata.Group`/`Metadata.Section`
+пари; інші секції та будь-який preserved unknown/newer ключ (Model про
+нього нічого не знає — persist йде через
+`Merge-BRAVOConfiguratorCandidateOverrides`, не через Model) лишаються
+незмінними. UI: кнопка "Скинути секцію" в нижній панелі, активна лише
+коли в дереві категорій обрано КОНКРЕТНУ секцію (не групу цілком), з
+підтвердженням через `MessageBox`, якщо в секції дійсно є активні
+override.
+
+### 11.5. Temp-cleanup diagnostics — DEFERRED (без зміни production-коду)
+
+`Remove-Item ... -ErrorAction SilentlyContinue` для GUID-ізольованих temp-
+директорій (Persistence/Effective) лишається без diagnostic-логування.
+Canonical logging-інфраструктура існує в репозиторії (`BRAVO.Logging`),
+але Configurator НЕ ініціалізує її сьогодні (немає `Initialize-BRAVOLog`
+у `BRAVO_CONFIGURATOR.ps1` — інтерактивний desktop-інструмент, не
+scheduled-завдання з власним LOGS-каталогом). Додавання повного
+`Initialize-/Complete-BRAVOLog` життєвого циклу навколо всієї інтерактивної
+сесії заради діагностики best-effort cleanup — непропорційний ризик
+(нова залежність, новий log-файл, нове failure-mode) для non-blocking
+знахідки. Лишається ACCEPTED/DEFERRED (той самий disposition, що
+P1-стабілізація вже зафіксувала) до появи canonical UI-рівня
+diagnostic-механізму, придатного для Configurator без цього overhead.
+
+### 11.6. Launch-smoke harness
+
+`ci/acceptance/Test-BRAVOConfiguratorLaunch.ps1` — детермінований,
+НЕ-CI-gate local acceptance-скрипт (поруч з `ci/Test-BRAVO*.ps1` gate-
+скриптами, але в окремій `acceptance/` підпапці — щоб не виглядати як
+блокуючий gate; canonical `Tools/` (WinSCP/7-Zip бінарники,
+`TOOLS_MANIFEST.json`) навмисно НЕ використано — інша, security-чутлива
+відповідальність, не місце для тестового скрипта). Покриває те, що
+`selftest\BRAVO_SELF_TEST.Configurator*.ps1` навмисно НІКОЛИ не покриває —
+обидва фрагменти headless, ніколи не конструюють `System.Windows.Forms.Form`,
+саме цей розрив пропустив P1 `GetNewClosure()`-дефект повз 1572 self-test
+PASS. Запускає `BRAVO_CONFIGURATOR.ps1` реальним дочірнім процесом проти
+ІЗОЛЬОВАНОЇ `-ConfigPath` (порожня тимчасова директорія — реальний
+production `BRAVO.local.config`/Credential Manager не читається/пишеться;
+`$RuntimeRoot`, модулі й `RUNTIME_MANIFEST.json` лишаються справжнім
+комплектом — саме їх цілісність перевіряється), чекає N секунд,
+підтверджує, що процес живий (дійшов до блокуючого `ShowDialog()` без
+винятку), інакше зчитує stdout/stderr і повертає FAIL, потім гарантовано
+`Kill()`-ить процес. Навмисно НЕ призначений як блокуючий GitHub-hosted
+Windows CI gate (non-interactive/non-windowing сесія може поводитись
+непередбачувано для реального WinForms `Form`) — лише документований
+local acceptance-крок для реальної десктопної Windows-сесії.

@@ -126,9 +126,21 @@ $configuratorProductionConfigDirectory = if ([string]::IsNullOrWhiteSpace($Confi
 }
 
 try {
-    Show-BRAVOConfiguratorMainForm `
+    # P2-A.4: exit-семантика — свідомо exit 0 для всіх трьох нормальних
+    # завершень (Applied/Cancelled/NoChanges); жоден automation-caller
+    # сьогодні не розрізняє їх за OS exit-кодом (Configurator —
+    # інтерактивний desktop-інструмент, не scheduled-завдання під
+    # BRAVO.ExitCodes). Результат лише виводиться операторові для
+    # інформації.
+    $configuratorOutcome = Show-BRAVOConfiguratorMainForm `
         -RuntimeRoot $configuratorRuntimeRoot `
         -ProductionConfigDirectory $configuratorProductionConfigDirectory
+    $outcomeText = switch ($configuratorOutcome) {
+        'Applied'   { 'Зміни застосовано.' }
+        'Cancelled' { 'Закрито без застосування незбережених змін.' }
+        default     { 'Закрито без змін.' }
+    }
+    Write-Host $outcomeText -ForegroundColor Cyan
     $exitCode = 0
 } catch {
     Write-Host "ПОМИЛКА Configurator: $($_.Exception.Message)" -ForegroundColor Red

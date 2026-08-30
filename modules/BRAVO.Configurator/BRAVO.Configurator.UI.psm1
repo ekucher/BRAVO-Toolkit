@@ -270,10 +270,15 @@ function Initialize-BRAVOConfiguratorUIAssemblies {
 }
 
 function Get-BRAVOConfiguratorUIDirtyState {
-    # Модель "потребує уваги оператора перед закриттям" — будь-який
-    # Dirty=$true запис (виставлений Set/Clear-BRAVOConfiguratorOverride).
-    param([Parameter(Mandatory = $true)][array]$Model)
-    return (@($Model | Where-Object { [bool]$_.Dirty }).Count -gt 0)
+    # P2-A.3: справжній diff-based Dirty проти $State.ProductionBaseline.Overrides
+    # (canonical Test-BRAVOConfiguratorModelDirty, Model.psm1) — НЕ подієвий
+    # Model[].Dirty прапорець, який лишався $true назавжди після
+    # edit -> revert до оригіналу (P3-знахідка P1-стабілізації, "phantom
+    # Dirty"). $State.ProductionBaseline оновлюється при Load/Reload/
+    # успішному Apply — той самий знімок, що вже існував для race
+    # detection у Persistence.
+    param([Parameter(Mandatory = $true)][hashtable]$State)
+    return Test-BRAVOConfiguratorModelDirty -Model $State.Model -BaselineOverrides $State.ProductionBaseline.Overrides
 }
 
 function Show-BRAVOConfiguratorUIMessage {
@@ -508,7 +513,7 @@ function Update-BRAVOConfiguratorUIStatusLabels {
         [Parameter(Mandatory = $true)][hashtable]$State
     )
 
-    $isDirty = Get-BRAVOConfiguratorUIDirtyState -Model $State.Model
+    $isDirty = Get-BRAVOConfiguratorUIDirtyState -State $State
     $dirtyText = if ($isDirty) { 'Є незбережені зміни' } else { 'Змін немає' }
     if ($State.EffectiveStale) { $dirtyText += ' (потрібен перерахунок Effective)' }
     $DirtyLabel.Text = $dirtyText
@@ -650,7 +655,7 @@ function Confirm-BRAVOConfiguratorUIDiscardChanges {
     # або явно підтвердив відкидання незбережених змін).
     param([Parameter(Mandatory = $true)][hashtable]$State)
 
-    if (-not (Get-BRAVOConfiguratorUIDirtyState -Model $State.Model)) { return $true }
+    if (-not (Get-BRAVOConfiguratorUIDirtyState -State $State)) { return $true }
     $result = [System.Windows.Forms.MessageBox]::Show(
         'Є незбережені зміни. Закрити без застосування?',
         'BRAVO Configurator',
@@ -702,6 +707,17 @@ function Show-BRAVOConfiguratorMainForm {
         SearchText                 = ''
         Filter                     = 'All'
         EffectiveStale             = $false
+        # P2-A.4: exit-semantics — Applied/Cancelled/NoChanges НЕ мапляться
+        # на різні OS exit-коди (жоден automation-caller сьогодні їх не
+        # розрізняє; Configurator — інтерактивний desktop-інструмент, не
+        # scheduled-завдання під BRAVO.ExitCodes). Натомість — structured
+        # internal result, який Show-BRAVOConfiguratorMainForm повертає
+        # викликачу; BRAVO_CONFIGURATOR.ps1 лишає exit 0 для всіх трьох.
+        # Фінальний outcome оцінюється проти ПОТОЧНОГО $state.ProductionBaseline
+        # (Get-BRAVOConfiguratorSessionOutcome, Model.psm1) — не проти
+        # первинного baseline сесії; окремого InitialBaselineOverrides не
+        # зберігаємо (P2-A.4 correction).
+        AnyApplySucceeded          = $false
     }
     try {
         $initialSnapshot = Get-BRAVOConfiguratorUIEffectiveConfigSnapshot -State $state
@@ -845,6 +861,18 @@ function Show-BRAVOConfiguratorMainForm {
     $cancelButton.Width = 120
     $bottomPanel.Controls.Add($cancelButton)
 
+    # P2-A.6: скидання всіх overrides ПОТОЧНОЇ обраної секції до Default —
+    # bulk-операція, для якої раніше не було UI-шляху (одиночний setting
+    # уже скидається зняттям override-checkbox у рядку — Clear-BRAVOConfiguratorOverride,
+    # той самий контракт §1.3 "Використовувати default"). Активна лише
+    # коли в дереві обрано КОНКРЕТНУ секцію (не групу цілком і не "Усі категорії").
+    $resetSectionButton = New-Object System.Windows.Forms.Button
+    $resetSectionButton.Text = 'Скинути секцію'
+    $resetSectionButton.Location = New-Object System.Drawing.Point(570, 43)
+    $resetSectionButton.Width = 160
+    $resetSectionButton.Enabled = $false
+    $bottomPanel.Controls.Add($resetSectionButton)
+
     $form.Controls.Add($bottomPanel)
 
     # --- Середня частина: TreeView | центр (settings) | деталі ---
@@ -936,7 +964,33 @@ function Show-BRAVOConfiguratorMainForm {
             $state.SelectedGroup = $tag.Group
             $state.SelectedSection = $tag.Section
         }
+        $resetSectionButton.Enabled = (-not [string]::IsNullOrEmpty($state.SelectedSection)) -and ($null -ne $state.SelectedGroup)
         & $refreshCenterPanel
+    })
+
+    $resetSectionButton.Add_Click({
+        if ([string]::IsNullOrEmpty($state.SelectedSection) -or $null -eq $state.SelectedGroup) { return }
+        $affectedCount = @($state.Model | Where-Object {
+            [string]$_.Metadata.Group -eq $state.SelectedGroup -and [string]$_.Metadata.Section -eq $state.SelectedSection -and [bool]$_.OverridePresent
+        }).Count
+        if ($affectedCount -eq 0) {
+            [void][System.Windows.Forms.MessageBox]::Show(
+                "У секції '$($state.SelectedSection)' немає активних override — нічого скидати.",
+                'BRAVO Configurator',
+                [System.Windows.Forms.MessageBoxButtons]::OK,
+                [System.Windows.Forms.MessageBoxIcon]::Information)
+            return
+        }
+        $confirmResult = [System.Windows.Forms.MessageBox]::Show(
+            "Скинути $affectedCount налаштувань секції '$($state.SelectedSection)' до значень за замовчуванням? Інші секції не постраждають.",
+            'BRAVO Configurator',
+            [System.Windows.Forms.MessageBoxButtons]::YesNo,
+            [System.Windows.Forms.MessageBoxIcon]::Warning)
+        if ($confirmResult -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+        $state.Model = Reset-BRAVOConfiguratorSection -Model $state.Model -Group $state.SelectedGroup -Section $state.SelectedSection
+        $state.EffectiveStale = $true
+        & $refreshCenterPanel
+        Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
     })
 
     $searchTextBox.Add_TextChanged({
@@ -1044,6 +1098,7 @@ function Show-BRAVOConfiguratorMainForm {
         }
 
         if ($applyResult.Applied) {
+            $state.AnyApplySucceeded = $true
             Show-BRAVOConfiguratorUIMessage -Text "Застосовано успішно. Змінені шляхи: $($applyResult.AppliedPaths -join ', ')"
             # Reload з диску — стан після Apply стає новим baseline/OriginalModel.
             $state.ProductionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $state.RuntimeRoot -ProductionConfigDirectory $state.ProductionConfigDirectory
@@ -1115,6 +1170,20 @@ function Show-BRAVOConfiguratorMainForm {
     })
 
     [void]$form.ShowDialog()
+
+    # P2-A.4 (correction): outcome оцінюється проти ПОТОЧНОГО
+    # $state.ProductionBaseline (Get-BRAVOConfiguratorSessionOutcome,
+    # Model.psm1) — не проти первинного baseline сесії. Незбережений diff
+    # на момент закриття (Cancelled) переважає над фактом, що Apply
+    # колись у сесії відбувся успішно (Applied) — інакше подальші
+    # незбережені зміни після успішного Apply, які оператор відкинув,
+    # хибно репортувались би як Applied. Reload оновлює ProductionBaseline,
+    # тож "Launch -> зовнішня зміна -> Reload -> Close без edits" коректно
+    # дає NoChanges, а не хибний Cancelled проти застарілого первинного
+    # baseline.
+    return Get-BRAVOConfiguratorSessionOutcome -Model $state.Model `
+        -ProductionBaseline $state.ProductionBaseline.Overrides `
+        -AnyApplySucceeded $state.AnyApplySucceeded
 }
 
 Export-ModuleMember -Function @(
