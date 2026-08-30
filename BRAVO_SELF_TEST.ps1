@@ -7862,6 +7862,23 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Scheduler/AclInheritanceOnlyForContainers" `
         -Failure "прапорці успадкування ACL можна ставити лише каталогам, інакше файл дає 'No flags can be set'"
 
+    # Регресія (SRV_WORK, 2026-08-30): Get-Acl + RemoveAccessRuleAll на
+    # ІСНУЮЧОМУ DACL реального runtime-каталогу падав двома способами —
+    # "not in canonical form" (SetAccessRuleProtection на неканонічному
+    # успадкованому DACL) і "identity references could not be translated"
+    # (RemoveAccessRuleAll на правилі з orphaned SID). Ціль коду й так —
+    # повна заміна на 3 нові правила, тож hardening має будувати ACL з
+    # чистого порожнього security-descriptor, а не читати/мутувати старий.
+    Test-BRAVOCondition `
+        -Condition (
+            -not $taskInstallScriptText.Contains('Get-Acl -LiteralPath $runtimeItem') -and
+            -not $taskInstallScriptText.Contains('.RemoveAccessRuleAll(') -and
+            $taskInstallScriptText.Contains('New-Object Security.AccessControl.DirectorySecurity') -and
+            $taskInstallScriptText.Contains('New-Object Security.AccessControl.FileSecurity')
+        ) `
+        -Name "Scheduler/ProtectedRuntimeAclDoesNotMutateExistingDacl" `
+        -Failure "ACL hardening має будуватися з чистого security-descriptor (New-Object DirectorySecurity/FileSecurity), а не Get-Acl+RemoveAccessRuleAll на існуючому DACL — інакше падає на неканонічному DACL/orphaned SID реального сервера"
+
     # Функціональна регресія: попередня перевірка вище була суто текстовою й
     # проходила навіть тоді, коли hardening ACL падав на бойовому сервері.
     # Тут правило справді будується для каталогу та для файлу.
@@ -12916,7 +12933,21 @@ function Get-BRAVOMaintenanceSummaryResult {
         } finally {
             $ErrorActionPreference = $previousSchedFixtureErrorActionPreference
         }
-        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = ($fixtureOutput | Out-String) }
+        # Регресія (2026-08-30): non-interactive дочірній powershell.exe
+        # форматує ErrorRecord/Write-Error під конкретну ширину консолі й
+        # може вставити жорсткий CRLF-перенос ПОСЕРЕД слова (напр.
+        # "BRAVO_RESTO<CRLF>RE_RECOVERY") — маркер стає нерозпізнаваним для
+        # -match/-notmatch нижче попри те, що фактичне повідомлення
+        # BRAVO_TASKS_INSTALL.ps1 повне й коректне. Сам wrap не додає й не
+        # споживає пробіл (жорсткий розрив по ширині консолі), тож переноси
+        # ПРИБИРАЄМО (не замінюємо пробілом) — інакше "BRAVO_RESTO" +
+        # "RE_RECOVERY" лишаться розділеними пробілом і match однаково не
+        # спрацює. Усі споживачі нижче шукають токени (BRAVO_MAINTENANCE,
+        # BRAVO_RESTORE_RECOVERY, "BRAVO BAZA Synchronization" тощо) —
+        # жоден не залежить від збереження рядкової структури, а внутрішні
+        # пробіли самих токенів переносами не зачіпаються.
+        $normalizedOutput = ($fixtureOutput | Out-String) -replace '\r?\n', ''
+        return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $normalizedOutput }
     }
 
     # РЕГРЕСІЯ (DEV-LIMS, 2026-08-21): site-config 5.0/5.1 БЕЗ

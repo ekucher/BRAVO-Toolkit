@@ -100,12 +100,22 @@ function Set-BRAVOProtectedRuntimeAcl {
         } else {
             [Security.AccessControl.InheritanceFlags]::None
         }
-        $acl = Get-Acl -LiteralPath $runtimeItem -ErrorAction Stop
+        # Навмисно НЕ читаємо існуючий ACL через Get-Acl: мета — повна заміна
+        # на рівно 3 правила нижче, і читання/мутація старого DACL ламається
+        # на реальних runtime-каталогах двома способами: "This access
+        # control list is not in canonical form" (SetAccessRuleProtection на
+        # успадкованому неканонічному DACL) і "Some or all identity
+        # references could not be translated" (RemoveAccessRuleAll на
+        # правилі з orphaned SID — видалений обліковий запис). Чистий
+        # порожній security-descriptor не має старих правил, тож обидва
+        # шляхи відмови неможливі, а кінцевий результат ідентичний.
+        $acl = if ([System.IO.Directory]::Exists($runtimeItem)) {
+            New-Object Security.AccessControl.DirectorySecurity
+        } else {
+            New-Object Security.AccessControl.FileSecurity
+        }
         $acl.SetAccessRuleProtection($true, $false)
         $acl.SetOwner($administrators)
-        foreach ($rule in @($acl.Access)) {
-            [void]$acl.RemoveAccessRuleAll($rule)
-        }
         $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
             $administrators,
             [Security.AccessControl.FileSystemRights]::FullControl,
