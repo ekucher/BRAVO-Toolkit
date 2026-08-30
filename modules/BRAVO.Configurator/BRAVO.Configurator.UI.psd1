@@ -17,7 +17,16 @@
         'Get-BRAVOConfiguratorUICategoryTree',
         'Get-BRAVOConfiguratorUIBooleanTriState',
         'ConvertTo-BRAVOConfiguratorUIDisplayText',
-        'ConvertTo-BRAVOConfiguratorUITypedValue'
+        'ConvertTo-BRAVOConfiguratorUITypedValue',
+        # P2-B: чисті UX-helpers (layout breakpoint/filter labels/context
+        # help/startup-size/splitter clamp) — headless-тестовані, без
+        # System.Windows.Forms у сигнатурі/тілі.
+        'Get-BRAVOConfiguratorUILayoutMode',
+        'Get-BRAVOConfiguratorUIFilterOptions',
+        'Get-BRAVOConfiguratorUISettingHelpText',
+        'Get-BRAVOConfiguratorUIGeneralHelpText',
+        'Get-BRAVOConfiguratorUIStartupSize',
+        'Get-BRAVOConfiguratorUIClampedSplitterDistance'
     )
     VariablesToExport = @()
     CmdletsToExport = @()
