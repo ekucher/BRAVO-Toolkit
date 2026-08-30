@@ -369,3 +369,39 @@ $configuratorUIReintroducedDebt = @($configuratorUIFixedLayoutDebtPatterns | Whe
 Test-BRAVOCondition ($configuratorUIReintroducedDebt.Count -eq 0) `
     'ConfiguratorUI P2-B static regression: попередній fixed-layout борг (rowPanel.Width=700, form.Width=1150, form.Height=780 як пряме присвоєння) не реінтродукований' `
     "Reintroduced=$($configuratorUIReintroducedDebt -join '; ')"
+
+# ===== 18: P2-B manual acceptance FAIL #5 регресія — Filter 'Problems'
+# з $ValidationFindings=$null (не @()) НЕ падає з "The property 'Severity'
+# cannot be found on this object". Реальний production-шлях:
+# Update-BRAVOConfiguratorUICenterPanel обчислює
+#   $validationFindings = if ($cond) { $State.ValidationResult.Findings } else { @() }
+# — коли Findings є ПОРОЖНІМ масивом (типовий стан одразу після запуску,
+# до будь-яких warnings/errors), PowerShell "згортає" тіло if-виразу з
+# нуля елементів у $null (НЕ @()), що обходить `-ValidationFindings = @()`
+# default нижче. `$null | Where-Object {...}` (на відміну від `@() |
+# Where-Object {...}`) пропускає РІВНО один $null-елемент пайплайном,
+# тому `[string]$_.Severity` падав під Set-StrictMode -Version 2.0.
+# Викликається напряму з $ValidationFindings=$null — тестує контракт
+# Get-BRAVOConfiguratorUIFilteredSettings, не UI-конструювання (фрагмент
+# лишається headless, жодного System.Windows.Forms-об'єкта).
+foreach ($configuratorUINullFindingsFilter in @('All', 'Changed', 'Active', 'Problems', 'Advanced')) {
+    $configuratorUINullFindingsThrew = $false
+    $configuratorUINullFindingsCount = -1
+    try {
+        $configuratorUINullFindingsResult = @(Get-BRAVOConfiguratorUIFilteredSettings -Model $configuratorUIFixtureModel -Filter $configuratorUINullFindingsFilter -ValidationFindings $null)
+        $configuratorUINullFindingsCount = $configuratorUINullFindingsResult.Count
+    } catch {
+        $configuratorUINullFindingsThrew = $true
+    }
+    Test-BRAVOCondition (-not $configuratorUINullFindingsThrew) `
+        "ConfiguratorUI P2-B regression (FAIL #5): Filter '$configuratorUINullFindingsFilter' з -ValidationFindings `$null не кидає виняток" `
+        "Filter=$configuratorUINullFindingsFilter Threw=$configuratorUINullFindingsThrew Count=$configuratorUINullFindingsCount"
+}
+$configuratorUINullFindingsProblemsResult = @(Get-BRAVOConfiguratorUIFilteredSettings -Model $configuratorUIFixtureModel -Filter 'Problems' -ValidationFindings $null)
+$configuratorUINullFindingsProblemsPaths = @($configuratorUINullFindingsProblemsResult | ForEach-Object { $_.Path })
+Test-BRAVOCondition (
+    ($configuratorUINullFindingsProblemsPaths -contains 'fixture.Storage.WithProblem') -and
+    ($configuratorUINullFindingsProblemsPaths -notcontains 'fixture.Storage.NoProblem')
+) `
+    "ConfiguratorUI P2-B regression (FAIL #5): Filter 'Problems' з `$null ValidationFindings усе одно коректно фільтрує за DisabledReason" `
+    "Paths=$($configuratorUINullFindingsProblemsPaths -join ',')"

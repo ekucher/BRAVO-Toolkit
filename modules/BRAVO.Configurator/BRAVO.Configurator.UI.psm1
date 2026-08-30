@@ -90,6 +90,15 @@ function Get-BRAVOConfiguratorUIFilteredSettings {
         [array]$ValidationFindings = @()
     )
 
+    # P2-B bugfix (manual acceptance FAIL #5): явний $null, переданий
+    # викликачем (напр. через збірку if-виразу над масивом довжини 0 —
+    # PowerShell "згортає" таку @() у $null поза межами цієї функції),
+    # обходить `= @()` default параметра вище. Без цього guard'а
+    # `$null | Where-Object {...}` у гілці 'Problems' нижче пропускає
+    # РІВНО один $null-елемент пайплайном (на відміну від @() — нуль
+    # елементів), і `$_.Severity` падає під Set-StrictMode -Version 2.0.
+    if ($null -eq $ValidationFindings) { $ValidationFindings = @() }
+
     switch ($Filter) {
         'All' {
             return @($Model)
@@ -724,7 +733,12 @@ function Update-BRAVOConfiguratorUICenterPanel {
     $CenterPanel.SuspendLayout()
     $CenterPanel.Controls.Clear()
 
-    $validationFindings = if ($null -ne $State.ValidationResult) { $State.ValidationResult.Findings } else { @() }
+    # P2-B bugfix (manual acceptance FAIL #5): зовнішній @() — без нього
+    # порожній $State.ValidationResult.Findings (типовий стан одразу після
+    # запуску, до будь-яких warnings/errors) "згортається" у $null, що
+    # обходить `= @()` default нижче за течією (див. коментар у
+    # Get-BRAVOConfiguratorUIFilteredSettings).
+    $validationFindings = @(if ($null -ne $State.ValidationResult) { $State.ValidationResult.Findings } else { @() })
     $filtered = Get-BRAVOConfiguratorUIFilteredSettings -Model $State.Model -Filter $State.Filter -ValidationFindings $validationFindings
     $searched = Get-BRAVOConfiguratorUISearchMatches -Model $filtered -SearchText $State.SearchText
     $categoryFiltered = @($searched | Where-Object {
