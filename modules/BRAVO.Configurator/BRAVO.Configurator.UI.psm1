@@ -269,6 +269,26 @@ function ConvertTo-BRAVOConfiguratorUITypedValue {
             if ([string]::IsNullOrWhiteSpace($RawText)) { return @() }
             return @($RawText -split ',' | ForEach-Object { [double]::Parse($_.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) })
         }
+        { $_ -in @('Path', 'UNCPath') } {
+            # P2-B bugfix (manual acceptance: FAIL #11 follow-up): раніше
+            # 'Path'/'UNCPath' падали в default { return $RawText } — БЕЗ
+            # жодної валідації, на відміну від Integer/Number вище (які
+            # fail-closed на невалідному числі). Некоректний шлях (нелегальні
+            # символи тощо) тому міг потрапити в $State.Model як override і
+            # лише пізніше зривав реальний (child-process) Update-
+            # BRAVOConfiguratorEffective з незрозумілою для оператора
+            # помилкою "Не вдалося перерахувати Effective: ...". Порожній
+            # рядок лишається легальним (валідність відсутності шляху —
+            # семантика Validation-модуля, не цієї функції: див.
+            # Test-BRAVOConfiguratorSMBArchiveConsistency). [System.IO.Path]::
+            # GetFullPath лише перевіряє СИНТАКСИЧНУ форму (нелегальні
+            # символи тощо), не існування шляху — не-створений/віддалений
+            # шлях лишається дійсним вводом.
+            if ([string]::IsNullOrWhiteSpace($RawText)) { return '' }
+            $trimmedPath = $RawText.Trim()
+            [void][System.IO.Path]::GetFullPath($trimmedPath)
+            return $trimmedPath
+        }
         default {
             return $RawText
         }
@@ -613,6 +633,19 @@ function New-BRAVOConfiguratorUISettingRow {
     $valueControl.AccessibleName = "Значення: $labelText"
     $rowPanel.Controls.Add($valueControl, 1, 0)
 
+    # P2-B bugfix (manual acceptance FAIL #11 follow-up): некоректний ввід
+    # (тепер fail-closed на рівні ConvertTo-BRAVOConfiguratorUITypedValue
+    # вище) НЕ комітиться в $State.Model — але без цього $editorRevertState
+    # текстове поле й далі візуально показувало б некоректний текст після
+    # попередження, змушуючи оператора вручну стирати його. Хешмапа (не
+    # звичайна локальна змінна) — бо CheckedChanged/Leave/SelectedIndexChanged
+    # нижче реєструються ЯК ОКРЕМІ .GetNewClosure()-блоки: кожен отримує
+    # ВЛАСНУ копію звичайної змінної на момент створення, тоді як хешмапа —
+    # reference-тип, тому мутація з одного обробника видима іншому.
+    $editorRevertState = @{ LastValidText = $valueControl.Text }
+    $updateRevertBaseline = { $editorRevertState.LastValidText = $valueControl.Text }.GetNewClosure()
+    $restoreLastValidValue = { $valueControl.Text = $editorRevertState.LastValidText }.GetNewClosure()
+
     $statusLabel = New-Object System.Windows.Forms.Label
     $statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
     $statusLabel.AutoEllipsis = $true
@@ -648,8 +681,10 @@ function New-BRAVOConfiguratorUISettingRow {
             try {
                 $convertedValue = & $getConvertedValue
                 & $OnChanged $currentPath $true $convertedValue
+                & $updateRevertBaseline
             } catch {
                 & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                & $restoreLastValidValue
             }
         } else {
             & $OnChanged $currentPath $false $null
@@ -663,8 +698,10 @@ function New-BRAVOConfiguratorUISettingRow {
                 try {
                     $convertedValue = & $getConvertedValue
                     & $OnChanged $currentPath $true $convertedValue
+                    & $updateRevertBaseline
                 } catch {
                     & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                    & $restoreLastValidValue
                 }
             }
             & $OnSelected $currentPath
@@ -675,8 +712,10 @@ function New-BRAVOConfiguratorUISettingRow {
                 try {
                     $convertedValue = & $getConvertedValue
                     & $OnChanged $currentPath $true $convertedValue
+                    & $updateRevertBaseline
                 } catch {
                     & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                    & $restoreLastValidValue
                 }
             }
         }.GetNewClosure())

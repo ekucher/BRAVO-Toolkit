@@ -405,3 +405,33 @@ Test-BRAVOCondition (
 ) `
     "ConfiguratorUI P2-B regression (FAIL #5): Filter 'Problems' з `$null ValidationFindings усе одно коректно фільтрує за DisabledReason" `
     "Paths=$($configuratorUINullFindingsProblemsPaths -join ',')"
+
+# ===== 19: P2-B manual acceptance FAIL #11 follow-up регресія —
+# ConvertTo-BRAVOConfiguratorUITypedValue для 'Path'/'UNCPath' тепер
+# fail-closed на синтаксично некоректному шляху (раніше падало в
+# default { return $RawText } без жодної перевірки — некоректний текст
+# міг потрапити у $State.Model як override і зривав реальний
+# Update-BRAVOConfiguratorEffective лише пізніше, під час Recalculate/
+# Apply, з незрозумілою помилкою). Порожній рядок лишається легальним
+# (валідність відсутності шляху — семантика Validation-модуля).
+foreach ($configuratorUIPathType in @('Path', 'UNCPath')) {
+    $configuratorUIValidPathResult = ConvertTo-BRAVOConfiguratorUITypedValue -Type $configuratorUIPathType -RawText '  \\host\share\BRAVO  '
+    Test-BRAVOCondition ($configuratorUIValidPathResult -eq '\\host\share\BRAVO') `
+        "ConfiguratorUI P2-B regression (FAIL #11 follow-up): Type '$configuratorUIPathType' пропускає валідний UNC-шлях (з trim)" `
+        "Result='$configuratorUIValidPathResult'"
+
+    $configuratorUIEmptyPathResult = ConvertTo-BRAVOConfiguratorUITypedValue -Type $configuratorUIPathType -RawText ''
+    Test-BRAVOCondition ($configuratorUIEmptyPathResult -eq '') `
+        "ConfiguratorUI P2-B regression (FAIL #11 follow-up): Type '$configuratorUIPathType' пропускає порожній рядок (валідна відсутність шляху)" `
+        "Result='$configuratorUIEmptyPathResult'"
+
+    $configuratorUIInvalidPathThrew = $false
+    try {
+        [void](ConvertTo-BRAVOConfiguratorUITypedValue -Type $configuratorUIPathType -RawText 'C:\Bad|Path')
+    } catch {
+        $configuratorUIInvalidPathThrew = $true
+    }
+    Test-BRAVOCondition $configuratorUIInvalidPathThrew `
+        "ConfiguratorUI P2-B regression (FAIL #11 follow-up): Type '$configuratorUIPathType' fail-closed на синтаксично некоректному шляху (не комітиться як default { return `$RawText })" `
+        "Threw=$configuratorUIInvalidPathThrew"
+}
