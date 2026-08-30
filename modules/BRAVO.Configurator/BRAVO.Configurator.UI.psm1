@@ -25,6 +25,12 @@
 # Preview" з умови задачі), (в) одноразово при старті форми, (г) після
 # успішного Apply/Reload. Жодного автоматичного виклику на TextChanged/
 # SelectedIndexChanged немає.
+#
+# P2-B (UX/DPI/keyboard/context-help hardening, docs/design/
+# BRAVO_CONFIGURATOR_DESIGN.md §12) НЕ змінює жодну з семантик вище —
+# лише responsive-layout/DPI/keyboard/accessibility шар навколо того
+# самого backend-контракту. Schema/Effective/Persistence/Presets/
+# Credentials/Dirty/session-outcome/fail-closed поведінка не зачіпаються.
 
 Set-StrictMode -Version 2.0
 
@@ -71,6 +77,11 @@ function Get-BRAVOConfiguratorUIFilteredSettings {
                           операторської уваги, навіть якщо це лише INFO
                           у Validation-модулі).
           - 'Advanced' — Metadata.Advanced=$true.
+
+        P2-B: внутрішні ID фільтрів (і backend-семантика вище) НЕ
+        змінюються — Get-BRAVOConfiguratorUIFilterOptions лише додає
+        українську підпис-проєкцію для ComboBox, filtering тут лишається
+        єдиним джерелом істини.
     #>
     [CmdletBinding()]
     param(
@@ -255,6 +266,187 @@ function ConvertTo-BRAVOConfiguratorUITypedValue {
     }
 }
 
+# ---------------------------------------------------------------------
+# P2-B pure helpers (§26 задачі: deterministic headless layout tests) —
+# усі рішення про breakpoint/розмір/затискання splitter обчислюються
+# ТУТ, а не всередині WinForms-функцій нижче, саме щоб їх можна було
+# протестувати без побудови реальної форми.
+# ---------------------------------------------------------------------
+
+$script:BRAVOConfiguratorUICompactWidthThreshold = 1000
+
+function Get-BRAVOConfiguratorUILayoutMode {
+    <#
+    .SYNOPSIS
+        Визначає режим компонування середньої частини форми (§13 задачі
+        P2-B): 'Wide' — Categories | Settings | Details одним рядом;
+        'Compact' — права SplitContainer-пара (Settings/Details) стає
+        горизонтальною (Details знизу), а не вертикальною (Details
+        праворуч). Один канонічний breakpoint-поріг — не дублюється по
+        файлу.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$ClientWidth
+    )
+    if ($ClientWidth -lt $script:BRAVOConfiguratorUICompactWidthThreshold) {
+        return 'Compact'
+    }
+    return 'Wide'
+}
+
+function Get-BRAVOConfiguratorUIFilterOptions {
+    <#
+    .SYNOPSIS
+        Канонічна відповідність внутрішнього (backend, ValidateSet
+        Get-BRAVOConfiguratorUIFilteredSettings) ідентифікатора фільтра
+        і українського відображуваного підпису (§21 задачі P2-B). Порядок
+        масиву = порядок пунктів у ComboBox (DisplayMember='Label',
+        ValueMember='Id'). Backend-семантика фільтрації НЕ змінюється —
+        це лише проєкція для відображення, filtering й далі виконує
+        Get-BRAVOConfiguratorUIFilteredSettings за Id.
+    #>
+    [CmdletBinding()]
+    param()
+    return @(
+        [pscustomobject]@{ Id = 'All';      Label = 'Усі' }
+        [pscustomobject]@{ Id = 'Changed';  Label = 'Змінені' }
+        [pscustomobject]@{ Id = 'Active';   Label = 'Активні' }
+        [pscustomobject]@{ Id = 'Problems'; Label = 'Проблеми' }
+        [pscustomobject]@{ Id = 'Advanced'; Label = 'Розширені' }
+    )
+}
+
+function Get-BRAVOConfiguratorUISettingHelpText {
+    <#
+    .SYNOPSIS
+        Форматує Details-панель/F1 context-help текст для одного
+        Model-запису (§14 задачі P2-B): спершу операторський зміст
+        (Назва/Опис/Поточний стан/Default/Local override/Effective/
+        Effective source/Disabled reason), потім технічні дані
+        (Path/Group/Section/Type/Advanced). Використовує ЛИШЕ schema/
+        model metadata, яка вже проходить через Validation/Effective —
+        жодних secrets/паролів/credential-значень тут ніколи немає (той
+        самий Model[], що й решта UI-шару; Credential Manager-значення
+        взагалі не потрапляють у Model).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Setting
+    )
+
+    $lines = New-Object System.Collections.Generic.List[string]
+    $label = [string]$Setting.Metadata.Label
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = [string]$Setting.Path }
+
+    $currentStateText = if ([bool]$Setting.OverridePresent) { 'Локальний override активний' } else { 'Використовується значення за замовчуванням' }
+
+    $lines.Add("Назва: $label")
+    $lines.Add("Опис: $([string]$Setting.Metadata.Description)")
+    $lines.Add("Поточний стан: $currentStateText")
+    $lines.Add('')
+    $lines.Add("Default: $($Setting.DefaultValue)")
+    $lines.Add("Local override: $(if ($Setting.OverridePresent) { $Setting.OverrideValue } else { '<немає>' })")
+    $lines.Add("Effective: $($Setting.EffectiveValue)")
+    $lines.Add("Effective source: $($Setting.EffectiveSource)")
+    if (-not [string]::IsNullOrWhiteSpace([string]$Setting.DisabledReason)) {
+        $lines.Add("Disabled reason: $($Setting.DisabledReason)")
+    }
+    $lines.Add('')
+    $lines.Add("Path: $($Setting.Path)")
+    $lines.Add("Group / Section: $($Setting.Metadata.Group) / $($Setting.Metadata.Section)")
+    $lines.Add("Type: $($Setting.Metadata.Type)")
+    $lines.Add("Advanced: $($Setting.Metadata.Advanced)")
+
+    return [string]::Join([Environment]::NewLine, $lines.ToArray())
+}
+
+function Get-BRAVOConfiguratorUIGeneralHelpText {
+    <#
+    .SYNOPSIS
+        Загальний F1-текст, коли жодне налаштування не обрано (§15
+        задачі P2-B). Статичний рядок — не документаційний браузер і не
+        зовнішня веб-сторінка.
+    #>
+    [CmdletBinding()]
+    param()
+    return (@(
+        'BRAVO Configurator — контекстна довідка'
+        ''
+        'Оберіть налаштування ліворуч, щоб побачити його опис, поточний стан і Effective-значення.'
+        ''
+        'Клавіатурні скорочення:'
+        '  Ctrl+F — фокус на полі пошуку'
+        '  F1     — контекстна довідка для обраного налаштування'
+        '  F5     — Перезавантажити (з підтвердженням, якщо є незбережені зміни)'
+        '  Esc    — Скасувати (з підтвердженням, якщо є незбережені зміни)'
+        '  Tab / Shift+Tab — навігація між елементами керування'
+    ) -join [Environment]::NewLine)
+}
+
+function Get-BRAVOConfiguratorUIStartupSize {
+    <#
+    .SYNOPSIS
+        Обчислює безпечний початковий розмір вікна (§5/§24 задачі P2-B):
+        ніколи не більший за Screen.WorkingArea, але й не менший за
+        практичний мінімум (за замовчуванням — придатний для 1024x768
+        @ 100%). Чиста функція — не читає жодного реального
+        System.Windows.Forms.Screen; приймає вже виміряні числа
+        (headless-тестована), тому придатна і для головної форми, і для
+        Preview-діалогу з різними Preferred/Min значеннями.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$WorkingAreaWidth,
+        [Parameter(Mandatory = $true)][int]$WorkingAreaHeight,
+        [int]$PreferredWidth = 1150,
+        [int]$PreferredHeight = 780,
+        [int]$MinWidth = 1000,
+        [int]$MinHeight = 650
+    )
+
+    # Ніколи не більше усього робочого простору екрана.
+    $width = [Math]::Min($PreferredWidth, $WorkingAreaWidth)
+    $height = [Math]::Min($PreferredHeight, $WorkingAreaHeight)
+
+    # Не менше практичного мінімуму, ЯКЩО робоча область це дозволяє —
+    # інакше пріоритет за WorkingArea (не відкривати вікно, що фізично
+    # не влазить на екран, лише щоб дотриматись Min*).
+    if ($WorkingAreaWidth -ge $MinWidth) { $width = [Math]::Max($width, $MinWidth) }
+    if ($WorkingAreaHeight -ge $MinHeight) { $height = [Math]::Max($height, $MinHeight) }
+
+    return [pscustomobject]@{ Width = $width; Height = $height }
+}
+
+function Get-BRAVOConfiguratorUIClampedSplitterDistance {
+    <#
+    .SYNOPSIS
+        Затискає бажану SplitterDistance у легальний діапазон
+        [Panel1MinSize, AvailableSize-Panel2MinSize] (§12/§13 задачі
+        P2-B) — SplitContainer.SplitterDistance кидає
+        ArgumentOutOfRangeException на значенні поза цим діапазоном,
+        зокрема одразу після DPI-масштабування, зміни орієнтації чи
+        запуску з малим стартовим розміром вікна. Якщо AvailableSize
+        замалий для обох мінімумів одночасно — повертає Panel1MinSize
+        (найменше безпечне значення), НЕ кидає виняток.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][int]$AvailableSize,
+        [Parameter(Mandatory = $true)][int]$Panel1MinSize,
+        [Parameter(Mandatory = $true)][int]$Panel2MinSize,
+        [Parameter(Mandatory = $true)][int]$DesiredDistance
+    )
+
+    $maxDistance = $AvailableSize - $Panel2MinSize
+    if ($maxDistance -lt $Panel1MinSize) {
+        return $Panel1MinSize
+    }
+    if ($DesiredDistance -lt $Panel1MinSize) { return $Panel1MinSize }
+    if ($DesiredDistance -gt $maxDistance) { return $maxDistance }
+    return $DesiredDistance
+}
+
 # =====================================================================
 # 2. Приватні WinForms-функції (не exported) — конструюють реальні
 #    System.Windows.Forms-контролі поверх чистих функцій вище.
@@ -290,6 +482,36 @@ function Show-BRAVOConfiguratorUIMessage {
     [void][System.Windows.Forms.MessageBox]::Show($Text, $Caption, [System.Windows.Forms.MessageBoxButtons]::OK, $Icon)
 }
 
+function Set-BRAVOConfiguratorUISplitterDistanceSafe {
+    <#
+    .SYNOPSIS
+        Затискає й безпечно призначає SplitterDistance (§12/§13 задачі
+        P2-B) — обгортка над чистою Get-BRAVOConfiguratorUIClampedSplitterDistance
+        з захисним try/catch на межовий WinForms-race (заокруглення
+        border/DPI вже ПІСЛЯ обчислення затиснутого значення) — НЕ
+        приховує бізнес-помилку, лише конкретний відомий WinForms-квірк
+        навколо SplitContainer.SplitterDistance.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]$SplitContainer,
+        [Parameter(Mandatory = $true)][int]$DesiredDistance
+    )
+    $available = if ($SplitContainer.Orientation -eq [System.Windows.Forms.Orientation]::Horizontal) {
+        $SplitContainer.ClientSize.Height
+    } else {
+        $SplitContainer.ClientSize.Width
+    }
+    $clamped = Get-BRAVOConfiguratorUIClampedSplitterDistance -AvailableSize $available `
+        -Panel1MinSize $SplitContainer.Panel1MinSize -Panel2MinSize $SplitContainer.Panel2MinSize `
+        -DesiredDistance $DesiredDistance
+    try {
+        $SplitContainer.SplitterDistance = $clamped
+    } catch [System.ArgumentException] {
+        # Захисний fallback — див. .SYNOPSIS. Навмисно порожньо: значення
+        # лишається попереднім легальним SplitterDistance.
+    }
+}
+
 function New-BRAVOConfiguratorUISettingRow {
     <#
     .SYNOPSIS
@@ -298,12 +520,20 @@ function New-BRAVOConfiguratorUISettingRow {
         Жодна подія тут НЕ пише на диск і НЕ викликає
         Update-BRAVOConfiguratorEffective — лише Set/Clear-BRAVOConfiguratorOverride
         через $OnChanged callback (мутує $State.Model на місці).
+    .DESCRIPTION
+        P2-B: TableLayoutPanel (3 responsive-колонки: override+label |
+        editor | status) замінює попередній fixed-Width=700/Point(x,y)
+        рядок — ширина рядка тепер визначається батьківським контейнером,
+        не магічним числом. $ToolTip — один спільний
+        System.Windows.Forms.ToolTip, власник форми (§16 задачі P2-B),
+        не окремий об'єкт на кожен рядок.
     #>
     param(
         [Parameter(Mandatory = $true)]$Setting,
         [Parameter(Mandatory = $true)][hashtable]$State,
         [Parameter(Mandatory = $true)][scriptblock]$OnChanged,
-        [Parameter(Mandatory = $true)][scriptblock]$OnSelected
+        [Parameter(Mandatory = $true)][scriptblock]$OnSelected,
+        [Parameter(Mandatory = $true)]$ToolTip
     )
 
     $descriptorType = [string]$Setting.Metadata.Type
@@ -321,20 +551,30 @@ function New-BRAVOConfiguratorUISettingRow {
     # (той самий підхід, що вже працює для $OnChanged/$OnSelected-параметрів).
     $showMessageRef = ${function:Show-BRAVOConfiguratorUIMessage}
 
-    $rowPanel = New-Object System.Windows.Forms.Panel
-    $rowPanel.Width = 700
-    $rowPanel.Height = 28
-    $rowPanel.Margin = New-Object System.Windows.Forms.Padding(2)
+    $rowPanel = New-Object System.Windows.Forms.TableLayoutPanel
+    $rowPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $rowPanel.Margin = New-Object System.Windows.Forms.Padding(2, 1, 2, 1)
+    $rowPanel.ColumnCount = 3
+    $rowPanel.RowCount = 1
+    [void]$rowPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 38)))
+    [void]$rowPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 37)))
+    [void]$rowPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 25)))
+    [void]$rowPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
-    $overrideCheckBox = New-Object System.Windows.Forms.CheckBox
     $labelText = [string]$Setting.Metadata.Label
     if ([string]::IsNullOrWhiteSpace($labelText)) { $labelText = $currentPath }
+
+    $overrideCheckBox = New-Object System.Windows.Forms.CheckBox
     $overrideCheckBox.Text = $labelText
-    $overrideCheckBox.Location = New-Object System.Drawing.Point(0, 5)
-    $overrideCheckBox.Width = 270
+    $overrideCheckBox.AutoEllipsis = $true
+    $overrideCheckBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $overrideCheckBox.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
     $overrideCheckBox.Checked = [bool]$Setting.OverridePresent
     $overrideCheckBox.Enabled = -not [bool]$Setting.Metadata.ReadOnly
-    $rowPanel.Controls.Add($overrideCheckBox)
+    $overrideCheckBox.AccessibleName = "Override: $labelText"
+    $overrideCheckBox.AccessibleDescription = 'Позначено = явний локальний override; знято = використовується значення за замовчуванням.'
+    $ToolTip.SetToolTip($overrideCheckBox, 'Позначено = явний локальний override (записується у BRAVO.local.config). Знято = використовується Default.')
+    $rowPanel.Controls.Add($overrideCheckBox, 0, 0)
 
     $valueControl = $null
     if ($descriptorType -eq 'Boolean') {
@@ -358,22 +598,28 @@ function New-BRAVOConfiguratorUISettingRow {
         $currentTypedValue = if ($Setting.OverridePresent) { $Setting.OverrideValue } else { $Setting.DefaultValue }
         $valueControl.Text = ConvertTo-BRAVOConfiguratorUIDisplayText -Type $descriptorType -Value $currentTypedValue
     }
-    $valueControl.Location = New-Object System.Drawing.Point(275, 2)
-    $valueControl.Width = 260
+    $valueControl.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $valueControl.Margin = New-Object System.Windows.Forms.Padding(4, 2, 4, 2)
     $valueControl.Enabled = ([bool]$Setting.OverridePresent) -and (-not [bool]$Setting.Metadata.ReadOnly)
-    $rowPanel.Controls.Add($valueControl)
+    $valueControl.AccessibleName = "Значення: $labelText"
+    $rowPanel.Controls.Add($valueControl, 1, 0)
 
     $statusLabel = New-Object System.Windows.Forms.Label
-    $statusLabel.Location = New-Object System.Drawing.Point(545, 5)
-    $statusLabel.Width = 150
+    $statusLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $statusLabel.AutoEllipsis = $true
+    $statusLabel.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
     $statusText = [string]$Setting.EffectiveSource
-    if (-not [string]::IsNullOrWhiteSpace([string]$Setting.DisabledReason)) {
+    $hasDisabledReason = -not [string]::IsNullOrWhiteSpace([string]$Setting.DisabledReason)
+    if ($hasDisabledReason) {
         $statusText = "$statusText *"
-        $toolTip = New-Object System.Windows.Forms.ToolTip
-        $toolTip.SetToolTip($statusLabel, [string]$Setting.DisabledReason)
+        $ToolTip.SetToolTip($statusLabel, [string]$Setting.DisabledReason)
+    } else {
+        $ToolTip.SetToolTip($statusLabel, "Effective source: $statusText")
     }
     $statusLabel.Text = $statusText
-    $rowPanel.Controls.Add($statusLabel)
+    $statusLabel.AccessibleName = "Статус: $labelText"
+    $statusLabel.AccessibleDescription = if ($hasDisabledReason) { [string]$Setting.DisabledReason } else { "Effective source: $statusText" }
+    $rowPanel.Controls.Add($statusLabel, 2, 0)
 
     # Захоплення поточного значення редактора в типізований override —
     # спільна логіка для checkbox-toggle і value-change нижче.
@@ -449,32 +695,30 @@ function Update-BRAVOConfiguratorUIDetailsPanel {
         $DetailsTextBox.Text = ''
         return
     }
-    $item = $setting[0]
-    $lines = New-Object System.Collections.Generic.List[string]
-    $lines.Add("Path: $($item.Path)")
-    $lines.Add("Label: $($item.Metadata.Label)")
-    $lines.Add("Group / Section: $($item.Metadata.Group) / $($item.Metadata.Section)")
-    $lines.Add("Type: $($item.Metadata.Type)")
-    $lines.Add("Advanced: $($item.Metadata.Advanced)")
-    $lines.Add('')
-    $lines.Add("Description: $($item.Metadata.Description)")
-    $lines.Add('')
-    $lines.Add("Default: $($item.DefaultValue)")
-    $lines.Add("Raw (override): $(if ($item.OverridePresent) { $item.OverrideValue } else { '<немає>' })")
-    $lines.Add("Effective: $($item.EffectiveValue)")
-    $lines.Add("EffectiveSource: $($item.EffectiveSource)")
-    if (-not [string]::IsNullOrWhiteSpace([string]$item.DisabledReason)) {
-        $lines.Add("DisabledReason: $($item.DisabledReason)")
-    }
-    $DetailsTextBox.Text = [string]::Join([Environment]::NewLine, $lines.ToArray())
+    # P2-B.8: форматування винесено в чисту Get-BRAVOConfiguratorUISettingHelpText
+    # (§14 задачі) — той самий текст обслуговує і Details-панель, і F1.
+    $DetailsTextBox.Text = Get-BRAVOConfiguratorUISettingHelpText -Setting $setting[0]
 }
 
 function Update-BRAVOConfiguratorUICenterPanel {
+    <#
+    .DESCRIPTION
+        P2-B: рядки монтуються в одну responsive TableLayoutPanel-хост
+        (Dock=Top, AutoSize) замість ручного Point(4,$yPosition)-стекінгу
+        — ширина рядків тепер розтягується на всю доступну область
+        $CenterPanel (AutoScroll Panel), висота хоста росте автоматично з
+        кількістю рядків. §20: якщо обраний Path усе ще присутній серед
+        відфільтрованих settings — фокус повертається на його рядок;
+        якщо фільтр/пошук/категорія видалили обраний рядок — фокус НЕ
+        відновлюється (немає контролю, на який можна було б його
+        поставити), а $State.SelectedSettingPath очищається.
+    #>
     param(
         [Parameter(Mandatory = $true)]$CenterPanel,
         [Parameter(Mandatory = $true)][hashtable]$State,
         [Parameter(Mandatory = $true)][scriptblock]$OnChanged,
-        [Parameter(Mandatory = $true)][scriptblock]$OnSelected
+        [Parameter(Mandatory = $true)][scriptblock]$OnSelected,
+        [Parameter(Mandatory = $true)]$ToolTip
     )
 
     $CenterPanel.SuspendLayout()
@@ -495,12 +739,34 @@ function Update-BRAVOConfiguratorUICenterPanel {
         @{ Expression = { [string]$_.Metadata.Section } }, `
         @{ Expression = { [int]$_.Metadata.Order } })
 
-    $yPosition = 4
+    $rowsHost = New-Object System.Windows.Forms.TableLayoutPanel
+    $rowsHost.Dock = [System.Windows.Forms.DockStyle]::Top
+    $rowsHost.AutoSize = $true
+    $rowsHost.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $rowsHost.GrowStyle = [System.Windows.Forms.TableLayoutPanelGrowStyle]::AddRows
+    $rowsHost.ColumnCount = 1
+    [void]$rowsHost.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $rowIndexToFocus = -1
+    $rowIndex = 0
     foreach ($setting in $orderedSettings) {
-        $row = New-BRAVOConfiguratorUISettingRow -Setting $setting -State $State -OnChanged $OnChanged -OnSelected $OnSelected
-        $row.Location = New-Object System.Drawing.Point(4, $yPosition)
-        $CenterPanel.Controls.Add($row)
-        $yPosition += ($row.Height + 4)
+        [void]$rowsHost.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 30)))
+        $row = New-BRAVOConfiguratorUISettingRow -Setting $setting -State $State -OnChanged $OnChanged -OnSelected $OnSelected -ToolTip $ToolTip
+        $rowsHost.Controls.Add($row, 0, $rowIndex)
+        if ((-not [string]::IsNullOrEmpty($State.SelectedSettingPath)) -and ([string]$setting.Path -eq $State.SelectedSettingPath)) {
+            $rowIndexToFocus = $rowIndex
+        }
+        $rowIndex++
+    }
+    $CenterPanel.Controls.Add($rowsHost)
+
+    if ($rowIndexToFocus -ge 0) {
+        $focusRow = $rowsHost.GetControlFromPosition(0, $rowIndexToFocus)
+        if ($null -ne $focusRow -and $focusRow.Controls.Count -gt 0) {
+            [void]$focusRow.Controls[0].Focus()
+        }
+    } elseif (-not [string]::IsNullOrEmpty($State.SelectedSettingPath)) {
+        $State.SelectedSettingPath = $null
     }
 
     $CenterPanel.ResumeLayout()
@@ -518,6 +784,9 @@ function Update-BRAVOConfiguratorUIStatusLabels {
     if ($State.EffectiveStale) { $dirtyText += ' (потрібен перерахунок Effective)' }
     $DirtyLabel.Text = $dirtyText
 
+    # P2-B.22: текстовий зміст — джерело істини; колір лише додатковий
+    # (не єдиний) сигнал, тому текст не спрощується до самого лише
+    # кольору чи символу.
     if ($null -ne $State.ValidationResult) {
         $ValidationLabel.Text = "Помилки: $($State.ValidationResult.ErrorCount)  Попередження: $($State.ValidationResult.WarningCount)  Інфо: $($State.ValidationResult.InfoCount)"
         $ValidationLabel.ForeColor = if ($State.ValidationResult.HasErrors) { [System.Drawing.Color]::Red } else { [System.Drawing.Color]::Black }
@@ -578,21 +847,45 @@ function Show-BRAVOConfiguratorUIPreviewDialog {
         CredentialChanges/Warnings/BlockingErrors) перед реальним Apply.
         Повертає $true лише якщо оператор підтвердив І HasBlockingErrors=false
         (кнопка підтвердження вимкнена, коли є blocking errors).
+    .DESCRIPTION
+        P2-B.11: resizable, MinimumSize, стартовий розмір затиснутий до
+        WorkingArea власника (той самий Get-BRAVOConfiguratorUIStartupSize,
+        що головна форма — інші Preferred/Min для компактнішого діалогу).
+        WordWrap=false + ScrollBars=Both для технічного diff-тексту (довгі
+        шляхи/значення лишаються інспектованими через горизонтальний
+        скрол, а не переносяться й не обрізаються). Жодної зміни семантики
+        Preview: blocking error і далі вимикає Apply, Enter/Escape і далі
+        мапляться на AcceptButton/CancelButton.
     #>
-    param([Parameter(Mandatory = $true)]$Preview)
+    param(
+        [Parameter(Mandatory = $true)]$Preview,
+        $Owner
+    )
 
     $dialog = New-Object System.Windows.Forms.Form
     $dialog.Text = 'BRAVO Configurator — попередній перегляд змін'
-    $dialog.Width = 720
-    $dialog.Height = 560
     $dialog.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterParent
+    $dialog.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $dialog.MinimumSize = New-Object System.Drawing.Size(480, 320)
+
+    $ownerWorkingArea = if ($null -ne $Owner) {
+        [System.Windows.Forms.Screen]::FromControl($Owner).WorkingArea
+    } else {
+        [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    }
+    $previewSize = Get-BRAVOConfiguratorUIStartupSize -WorkingAreaWidth $ownerWorkingArea.Width -WorkingAreaHeight $ownerWorkingArea.Height `
+        -PreferredWidth 900 -PreferredHeight 640 -MinWidth 480 -MinHeight 320
+    $dialog.Width = $previewSize.Width
+    $dialog.Height = $previewSize.Height
 
     $textBox = New-Object System.Windows.Forms.TextBox
     $textBox.Multiline = $true
     $textBox.ReadOnly = $true
-    $textBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $textBox.WordWrap = $false
+    $textBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Both
     $textBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $textBox.Font = New-Object System.Drawing.Font('Consolas', 9)
+    $textBox.AccessibleName = 'Попередній перегляд змін'
 
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add("=== Raw-зміни ($($Preview.RawChanges.Count)) ===")
@@ -622,22 +915,26 @@ function Show-BRAVOConfiguratorUIPreviewDialog {
     }
     $textBox.Text = [string]::Join([Environment]::NewLine, $lines.ToArray())
 
-    $buttonPanel = New-Object System.Windows.Forms.Panel
+    $buttonPanel = New-Object System.Windows.Forms.FlowLayoutPanel
     $buttonPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-    $buttonPanel.Height = 44
+    $buttonPanel.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $buttonPanel.WrapContents = $true
+    $buttonPanel.AutoSize = $true
+    $buttonPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $buttonPanel.Padding = New-Object System.Windows.Forms.Padding(8)
 
     $confirmButton = New-Object System.Windows.Forms.Button
     $confirmButton.Text = 'Застосувати'
-    $confirmButton.Location = New-Object System.Drawing.Point(10, 8)
-    $confirmButton.Width = 140
+    $confirmButton.AutoSize = $true
+    $confirmButton.Margin = New-Object System.Windows.Forms.Padding(6)
     $confirmButton.Enabled = -not [bool]$Preview.HasBlockingErrors
     $confirmButton.DialogResult = [System.Windows.Forms.DialogResult]::OK
     $buttonPanel.Controls.Add($confirmButton)
 
     $cancelButton = New-Object System.Windows.Forms.Button
     $cancelButton.Text = 'Скасувати'
-    $cancelButton.Location = New-Object System.Drawing.Point(160, 8)
-    $cancelButton.Width = 140
+    $cancelButton.AutoSize = $true
+    $cancelButton.Margin = New-Object System.Windows.Forms.Padding(6)
     $cancelButton.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $buttonPanel.Controls.Add($cancelButton)
 
@@ -646,7 +943,7 @@ function Show-BRAVOConfiguratorUIPreviewDialog {
     $dialog.AcceptButton = $confirmButton
     $dialog.CancelButton = $cancelButton
 
-    $result = $dialog.ShowDialog()
+    $result = if ($null -ne $Owner) { $dialog.ShowDialog($Owner) } else { $dialog.ShowDialog() }
     return ($result -eq [System.Windows.Forms.DialogResult]::OK) -and (-not [bool]$Preview.HasBlockingErrors)
 }
 
@@ -704,6 +1001,15 @@ function Show-BRAVOConfiguratorMainForm {
         RequirementBefore          = $null
         SelectedGroup              = $null
         SelectedSection            = $null
+        # P2-B.20: canonical Path обраного налаштування — переживає
+        # rebuild центральної панелі (search/filter/category refresh),
+        # ЛИШЕ якщо той самий Path усе ще присутній у відфільтрованому
+        # наборі (Update-BRAVOConfiguratorUICenterPanel).
+        SelectedSettingPath        = $null
+        # P2-B.13: 'Wide'/'Compact' — обчислюється Get-BRAVOConfiguratorUILayoutMode
+        # з фактичної ширини mainSplit; ініціалізується нижче, до першого
+        # виклику $applyLayoutMode.
+        LayoutMode                 = $null
         SearchText                 = ''
         Filter                     = 'All'
         EffectiveStale             = $false
@@ -728,169 +1034,278 @@ function Show-BRAVOConfiguratorMainForm {
         $state.RequirementBefore = $null
     }
 
-    # ===== Форма і панелі =====
+    # ===== Форма =====
+    # P2-B.2/3: startup-розмір НЕ хардкодиться сліпо до 1150x780 —
+    # затискається до Screen.WorkingArea (Get-BRAVOConfiguratorUIStartupSize),
+    # ніколи не відкриває вікно більше за реальний робочий простір екрана.
+    # AutoScaleMode=Dpi — framework-рівень DPI-масштабування, сумісний з
+    # Windows PowerShell 5.1/.NET Framework (без Application.SetHighDpiMode
+    # чи іншого API, недоступного в цьому рантаймі — див. docs/design).
     $form = New-Object System.Windows.Forms.Form
     $form.Text = 'BRAVO Configurator'
-    $form.Width = 1150
-    $form.Height = 780
+    $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $form.KeyPreview = $true
+    $form.MinimumSize = New-Object System.Drawing.Size(1000, 650)
+    $formWorkingArea = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+    $startupSize = Get-BRAVOConfiguratorUIStartupSize -WorkingAreaWidth $formWorkingArea.Width -WorkingAreaHeight $formWorkingArea.Height
+    $form.Width = $startupSize.Width
+    $form.Height = $startupSize.Height
     $form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+    $form.AccessibleName = 'BRAVO Configurator'
 
-    # --- Верхня панель: пошук, фільтр, пресети, креденшели ---
-    $topPanel = New-Object System.Windows.Forms.Panel
+    # P2-B.9: один спільний ToolTip, власник форми, замість окремого
+    # об'єкта на кожен рядок налаштування.
+    $sharedToolTip = New-Object System.Windows.Forms.ToolTip
+    $sharedToolTip.AutoPopDelay = 8000
+    $sharedToolTip.InitialDelay = 400
+    $sharedToolTip.ReshowDelay = 200
+
+    # --- Верхня панель: рядок 1 (пошук/фільтр/пресет), рядок 2 (креденшели) ---
+    $topPanel = New-Object System.Windows.Forms.TableLayoutPanel
     $topPanel.Dock = [System.Windows.Forms.DockStyle]::Top
-    $topPanel.Height = 90
+    $topPanel.AutoSize = $true
+    $topPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $topPanel.ColumnCount = 1
+    $topPanel.RowCount = 2
+    [void]$topPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$topPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$topPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+    $searchFilterRow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $searchFilterRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $searchFilterRow.AutoSize = $true
+    $searchFilterRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $searchFilterRow.WrapContents = $true
+    $searchFilterRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $searchFilterRow.Padding = New-Object System.Windows.Forms.Padding(6, 6, 6, 2)
 
     $searchLabel = New-Object System.Windows.Forms.Label
     $searchLabel.Text = 'Пошук:'
-    $searchLabel.Location = New-Object System.Drawing.Point(8, 10)
-    $searchLabel.Width = 50
-    $topPanel.Controls.Add($searchLabel)
+    $searchLabel.AutoSize = $true
+    $searchLabel.Margin = New-Object System.Windows.Forms.Padding(3, 8, 3, 3)
+    $searchFilterRow.Controls.Add($searchLabel)
 
     $searchTextBox = New-Object System.Windows.Forms.TextBox
-    $searchTextBox.Location = New-Object System.Drawing.Point(60, 8)
     $searchTextBox.Width = 220
-    $topPanel.Controls.Add($searchTextBox)
+    $searchTextBox.Margin = New-Object System.Windows.Forms.Padding(3, 5, 12, 3)
+    $searchTextBox.AccessibleName = 'Пошук'
+    $searchTextBox.AccessibleDescription = 'Пошук за назвою, шляхом, описом чи групою налаштування.'
+    $sharedToolTip.SetToolTip($searchTextBox, 'Пошук за Path/Label/Description/Group (Ctrl+F — фокус сюди)')
+    $searchFilterRow.Controls.Add($searchTextBox)
 
     $filterLabel = New-Object System.Windows.Forms.Label
     $filterLabel.Text = 'Фільтр:'
-    $filterLabel.Location = New-Object System.Drawing.Point(290, 10)
-    $filterLabel.Width = 45
-    $topPanel.Controls.Add($filterLabel)
+    $filterLabel.AutoSize = $true
+    $filterLabel.Margin = New-Object System.Windows.Forms.Padding(3, 8, 3, 3)
+    $searchFilterRow.Controls.Add($filterLabel)
 
+    # P2-B.21: ComboBox-пункти — pscustomobject{Id;Label} з
+    # Get-BRAVOConfiguratorUIFilterOptions (DisplayMember='Label',
+    # ValueMember='Id') — оператор бачить український підпис, backend
+    # filter (Get-BRAVOConfiguratorUIFilteredSettings) і далі отримує
+    # канонічний Id, не залежить від відображуваного тексту.
     $filterComboBox = New-Object System.Windows.Forms.ComboBox
     $filterComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-    $filterComboBox.Location = New-Object System.Drawing.Point(340, 8)
-    $filterComboBox.Width = 120
-    foreach ($filterName in @('All', 'Changed', 'Active', 'Problems', 'Advanced')) { [void]$filterComboBox.Items.Add($filterName) }
-    $filterComboBox.SelectedItem = 'All'
-    $topPanel.Controls.Add($filterComboBox)
+    $filterComboBox.Width = 140
+    $filterComboBox.Margin = New-Object System.Windows.Forms.Padding(3, 5, 12, 3)
+    $filterComboBox.DisplayMember = 'Label'
+    $filterComboBox.ValueMember = 'Id'
+    $filterOptions = Get-BRAVOConfiguratorUIFilterOptions
+    foreach ($filterOption in $filterOptions) { [void]$filterComboBox.Items.Add($filterOption) }
+    $filterComboBox.SelectedIndex = 0
+    $filterComboBox.AccessibleName = 'Фільтр'
+    $sharedToolTip.SetToolTip($filterComboBox, 'Усі / Змінені / Активні / Проблеми / Розширені.')
+    $searchFilterRow.Controls.Add($filterComboBox)
 
     $presetLabel = New-Object System.Windows.Forms.Label
     $presetLabel.Text = 'Пресет:'
-    $presetLabel.Location = New-Object System.Drawing.Point(470, 10)
-    $presetLabel.Width = 50
-    $topPanel.Controls.Add($presetLabel)
+    $presetLabel.AutoSize = $true
+    $presetLabel.Margin = New-Object System.Windows.Forms.Padding(3, 8, 3, 3)
+    $searchFilterRow.Controls.Add($presetLabel)
 
     $presetComboBox = New-Object System.Windows.Forms.ComboBox
     $presetComboBox.DropDownStyle = [System.Windows.Forms.ComboBoxStyle]::DropDownList
-    $presetComboBox.Location = New-Object System.Drawing.Point(525, 8)
     $presetComboBox.Width = 170
+    $presetComboBox.Margin = New-Object System.Windows.Forms.Padding(3, 5, 12, 3)
     $presetCatalog = Get-BRAVOConfiguratorPresetCatalog
     foreach ($preset in $presetCatalog) { [void]$presetComboBox.Items.Add([string]$preset.Label) }
     if ($presetComboBox.Items.Count -gt 0) { $presetComboBox.SelectedIndex = 0 }
-    $topPanel.Controls.Add($presetComboBox)
+    $presetComboBox.AccessibleName = 'Пресет'
+    $sharedToolTip.SetToolTip($presetComboBox, 'Готовий набір значень для типового сценарію розгортання.')
+    $searchFilterRow.Controls.Add($presetComboBox)
 
     $presetApplyButton = New-Object System.Windows.Forms.Button
     $presetApplyButton.Text = 'Застосувати пресет'
-    $presetApplyButton.Location = New-Object System.Drawing.Point(700, 7)
-    $presetApplyButton.Width = 150
-    $topPanel.Controls.Add($presetApplyButton)
+    $presetApplyButton.AutoSize = $true
+    $presetApplyButton.Margin = New-Object System.Windows.Forms.Padding(3, 3, 3, 3)
+    $presetApplyButton.AccessibleName = 'Застосувати пресет'
+    $sharedToolTip.SetToolTip($presetApplyButton, 'Застосувати обраний пресет до поточної (ще не збереженої) моделі.')
+    $searchFilterRow.Controls.Add($presetApplyButton)
+
+    $topPanel.Controls.Add($searchFilterRow, 0, 0)
+
+    $credentialRow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $credentialRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $credentialRow.AutoSize = $true
+    $credentialRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $credentialRow.WrapContents = $true
+    $credentialRow.FlowDirection = [System.Windows.Forms.FlowDirection]::LeftToRight
+    $credentialRow.Padding = New-Object System.Windows.Forms.Padding(6, 2, 6, 6)
 
     $sftpCredLabel = New-Object System.Windows.Forms.Label
     $sftpCredLabel.Text = 'SFTP: —'
-    $sftpCredLabel.Location = New-Object System.Drawing.Point(8, 40)
-    $sftpCredLabel.Width = 300
-    $topPanel.Controls.Add($sftpCredLabel)
+    $sftpCredLabel.AutoSize = $true
+    $sftpCredLabel.Margin = New-Object System.Windows.Forms.Padding(3, 8, 12, 3)
+    $credentialRow.Controls.Add($sftpCredLabel)
 
     $smbCredLabel = New-Object System.Windows.Forms.Label
     $smbCredLabel.Text = 'SMB: —'
-    $smbCredLabel.Location = New-Object System.Drawing.Point(8, 60)
-    $smbCredLabel.Width = 300
-    $topPanel.Controls.Add($smbCredLabel)
+    $smbCredLabel.AutoSize = $true
+    $smbCredLabel.Margin = New-Object System.Windows.Forms.Padding(3, 8, 12, 3)
+    $credentialRow.Controls.Add($smbCredLabel)
 
     $credCheckButton = New-Object System.Windows.Forms.Button
     $credCheckButton.Text = 'Перевірити креденшели'
-    $credCheckButton.Location = New-Object System.Drawing.Point(320, 40)
-    $credCheckButton.Width = 170
-    $topPanel.Controls.Add($credCheckButton)
+    $credCheckButton.AutoSize = $true
+    $credCheckButton.Margin = New-Object System.Windows.Forms.Padding(3, 3, 3, 3)
+    $credCheckButton.AccessibleName = 'Перевірити креденшели'
+    $sharedToolTip.SetToolTip($credCheckButton, 'Перевірити стан SFTP/SMB креденшелів для поточної Effective-конфігурації (секрети не показуються).')
+    $credentialRow.Controls.Add($credCheckButton)
 
     $credSetupSftpButton = New-Object System.Windows.Forms.Button
     $credSetupSftpButton.Text = 'Налаштувати SFTP'
-    $credSetupSftpButton.Location = New-Object System.Drawing.Point(500, 40)
-    $credSetupSftpButton.Width = 150
-    $topPanel.Controls.Add($credSetupSftpButton)
+    $credSetupSftpButton.AutoSize = $true
+    $credSetupSftpButton.Margin = New-Object System.Windows.Forms.Padding(3, 3, 3, 3)
+    $credSetupSftpButton.AccessibleName = 'Налаштувати SFTP креденшели'
+    $credentialRow.Controls.Add($credSetupSftpButton)
 
     $credSetupSmbButton = New-Object System.Windows.Forms.Button
     $credSetupSmbButton.Text = 'Налаштувати SMB'
-    $credSetupSmbButton.Location = New-Object System.Drawing.Point(660, 40)
-    $credSetupSmbButton.Width = 150
-    $topPanel.Controls.Add($credSetupSmbButton)
+    $credSetupSmbButton.AutoSize = $true
+    $credSetupSmbButton.Margin = New-Object System.Windows.Forms.Padding(3, 3, 3, 3)
+    $credSetupSmbButton.AccessibleName = 'Налаштувати SMB креденшели'
+    $credentialRow.Controls.Add($credSetupSmbButton)
 
+    $topPanel.Controls.Add($credentialRow, 0, 1)
     $form.Controls.Add($topPanel)
 
-    # --- Нижня панель: dirty/validation, Перерахувати/Apply/Cancel ---
-    $bottomPanel = New-Object System.Windows.Forms.Panel
+    # --- Нижня панель: status (ліворуч) | дії (праворуч, wrap) ---
+    $bottomPanel = New-Object System.Windows.Forms.TableLayoutPanel
     $bottomPanel.Dock = [System.Windows.Forms.DockStyle]::Bottom
-    $bottomPanel.Height = 70
+    $bottomPanel.AutoSize = $true
+    $bottomPanel.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $bottomPanel.ColumnCount = 2
+    $bottomPanel.RowCount = 1
+    [void]$bottomPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 45)))
+    [void]$bottomPanel.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 55)))
+    [void]$bottomPanel.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+    $statusPanel = New-Object System.Windows.Forms.TableLayoutPanel
+    $statusPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $statusPanel.AutoSize = $true
+    $statusPanel.ColumnCount = 1
+    $statusPanel.RowCount = 2
+    $statusPanel.Padding = New-Object System.Windows.Forms.Padding(8, 8, 4, 8)
 
     $dirtyLabel = New-Object System.Windows.Forms.Label
-    $dirtyLabel.Location = New-Object System.Drawing.Point(8, 8)
-    $dirtyLabel.Width = 400
-    $bottomPanel.Controls.Add($dirtyLabel)
+    $dirtyLabel.AutoSize = $true
+    $dirtyLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $statusPanel.Controls.Add($dirtyLabel, 0, 0)
 
     $validationLabel = New-Object System.Windows.Forms.Label
-    $validationLabel.Location = New-Object System.Drawing.Point(8, 28)
-    $validationLabel.Width = 500
-    $bottomPanel.Controls.Add($validationLabel)
+    $validationLabel.AutoSize = $true
+    $validationLabel.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $statusPanel.Controls.Add($validationLabel, 0, 1)
 
-    # P2-фікс за результатами незалежного review (Agent D): повідомлення
-    # RaceDetection буквально каже "Reload configuration before applying
-    # your changes", але до цього фіксу форма не мала жодного способу це
-    # зробити — лише закрити й перезапустити BRAVO_CONFIGURATOR.ps1.
-    $reloadButton = New-Object System.Windows.Forms.Button
-    $reloadButton.Text = 'Перезавантажити'
-    $reloadButton.Location = New-Object System.Drawing.Point(570, 15)
-    $reloadButton.Width = 120
-    $bottomPanel.Controls.Add($reloadButton)
-
-    $recalculateButton = New-Object System.Windows.Forms.Button
-    $recalculateButton.Text = 'Перерахувати'
-    $recalculateButton.Location = New-Object System.Drawing.Point(700, 15)
-    $recalculateButton.Width = 120
-    $bottomPanel.Controls.Add($recalculateButton)
-
-    $applyButton = New-Object System.Windows.Forms.Button
-    $applyButton.Text = 'Застосувати...'
-    $applyButton.Location = New-Object System.Drawing.Point(830, 15)
-    $applyButton.Width = 120
-    $bottomPanel.Controls.Add($applyButton)
-
-    $cancelButton = New-Object System.Windows.Forms.Button
-    $cancelButton.Text = 'Скасувати'
-    $cancelButton.Location = New-Object System.Drawing.Point(960, 15)
-    $cancelButton.Width = 120
-    $bottomPanel.Controls.Add($cancelButton)
+    $bottomPanel.Controls.Add($statusPanel, 0, 0)
 
     # P2-A.6: скидання всіх overrides ПОТОЧНОЇ обраної секції до Default —
     # bulk-операція, для якої раніше не було UI-шляху (одиночний setting
     # уже скидається зняттям override-checkbox у рядку — Clear-BRAVOConfiguratorOverride,
     # той самий контракт §1.3 "Використовувати default"). Активна лише
     # коли в дереві обрано КОНКРЕТНУ секцію (не групу цілком і не "Усі категорії").
+    #
+    # FlowDirection=RightToLeft: перший доданий контроль опиняється
+    # крайнім правим — додаємо у зворотному до візуального порядку, щоб
+    # зберегти читання зліва направо: Перезавантажити, Перерахувати,
+    # Скинути секцію, Застосувати, Скасувати (крайня права — як і в
+    # попередньому fixed-layout).
+    $actionsRow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $actionsRow.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $actionsRow.AutoSize = $true
+    $actionsRow.AutoSizeMode = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $actionsRow.WrapContents = $true
+    $actionsRow.FlowDirection = [System.Windows.Forms.FlowDirection]::RightToLeft
+    $actionsRow.Padding = New-Object System.Windows.Forms.Padding(4, 8, 8, 8)
+
+    $cancelButton = New-Object System.Windows.Forms.Button
+    $cancelButton.Text = 'Скасувати'
+    $cancelButton.AutoSize = $true
+    $cancelButton.Margin = New-Object System.Windows.Forms.Padding(4)
+    $cancelButton.AccessibleName = 'Скасувати'
+    $actionsRow.Controls.Add($cancelButton)
+
+    $applyButton = New-Object System.Windows.Forms.Button
+    $applyButton.Text = 'Застосувати...'
+    $applyButton.AutoSize = $true
+    $applyButton.Margin = New-Object System.Windows.Forms.Padding(4)
+    $applyButton.AccessibleName = 'Застосувати'
+    $sharedToolTip.SetToolTip($applyButton, 'Перерахувати Effective, показати попередній перегляд і застосувати зміни (з підтвердженням).')
+    $actionsRow.Controls.Add($applyButton)
+
     $resetSectionButton = New-Object System.Windows.Forms.Button
     $resetSectionButton.Text = 'Скинути секцію'
-    $resetSectionButton.Location = New-Object System.Drawing.Point(570, 43)
-    $resetSectionButton.Width = 160
+    $resetSectionButton.AutoSize = $true
+    $resetSectionButton.Margin = New-Object System.Windows.Forms.Padding(4)
     $resetSectionButton.Enabled = $false
-    $bottomPanel.Controls.Add($resetSectionButton)
+    $resetSectionButton.AccessibleName = 'Скинути секцію до значень за замовчуванням'
+    $actionsRow.Controls.Add($resetSectionButton)
 
+    $recalculateButton = New-Object System.Windows.Forms.Button
+    $recalculateButton.Text = 'Перерахувати'
+    $recalculateButton.AutoSize = $true
+    $recalculateButton.Margin = New-Object System.Windows.Forms.Padding(4)
+    $recalculateButton.AccessibleName = 'Перерахувати Effective'
+    $actionsRow.Controls.Add($recalculateButton)
+
+    $reloadButton = New-Object System.Windows.Forms.Button
+    $reloadButton.Text = 'Перезавантажити'
+    $reloadButton.AutoSize = $true
+    $reloadButton.Margin = New-Object System.Windows.Forms.Padding(4)
+    $reloadButton.AccessibleName = 'Перезавантажити конфігурацію з диска'
+    $sharedToolTip.SetToolTip($reloadButton, 'Перечитати BRAVO.local.config з диска (F5). Незбережені зміни буде відкинуто після підтвердження.')
+    $actionsRow.Controls.Add($reloadButton)
+
+    $bottomPanel.Controls.Add($actionsRow, 1, 0)
     $form.Controls.Add($bottomPanel)
 
-    # --- Середня частина: TreeView | центр (settings) | деталі ---
+    # --- Середня частина: TreeView | Settings | Details (responsive: §13) ---
+    # Panel1MinSize/Panel2MinSize НАВМИСНО не встановлюються одразу після
+    # New-Object: SplitContainer у цей момент ще не Dock-размещений і має
+    # дефолтний малий Size (не той, що дасть форма) — призначення
+    # MinSize/SplitterDistance проти цього тимчасового розміру кидає
+    # "SplitterDistance must be between Panel1MinSize and Width -
+    # Panel2MinSize" (реальний launch-smoke crash, зловлений
+    # ci\acceptance\Test-BRAVOConfiguratorLaunch.ps1). MinSize
+    # виставляється нижче, ПІСЛЯ $form.Controls.Add($mainSplit) — коли
+    # ClientSize вже відповідає реальному стартовому розміру форми.
     $mainSplit = New-Object System.Windows.Forms.SplitContainer
     $mainSplit.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $mainSplit.SplitterDistance = 220
+    $mainSplit.AccessibleName = 'Категорії та налаштування'
 
     $categoryTree = New-Object System.Windows.Forms.TreeView
     $categoryTree.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $categoryTree.AccessibleName = 'Дерево категорій'
+    $categoryTree.AccessibleDescription = 'Групи та секції схеми налаштувань.'
     $mainSplit.Panel1.Controls.Add($categoryTree)
 
     $rightSplit = New-Object System.Windows.Forms.SplitContainer
     $rightSplit.Dock = [System.Windows.Forms.DockStyle]::Fill
-    $rightSplit.SplitterDistance = 620
 
     $centerScrollPanel = New-Object System.Windows.Forms.Panel
     $centerScrollPanel.Dock = [System.Windows.Forms.DockStyle]::Fill
     $centerScrollPanel.AutoScroll = $true
+    $centerScrollPanel.AccessibleName = 'Область налаштувань'
     $rightSplit.Panel1.Controls.Add($centerScrollPanel)
 
     $detailsTextBox = New-Object System.Windows.Forms.TextBox
@@ -898,12 +1313,60 @@ function Show-BRAVOConfiguratorMainForm {
     $detailsTextBox.ReadOnly = $true
     $detailsTextBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
     $detailsTextBox.Dock = [System.Windows.Forms.DockStyle]::Fill
+    $detailsTextBox.AccessibleName = 'Деталі налаштування'
     $rightSplit.Panel2.Controls.Add($detailsTextBox)
 
     $mainSplit.Panel2.Controls.Add($rightSplit)
     $form.Controls.Add($mainSplit)
     $mainSplit.BringToFront()
     $topPanel.SendToBack()
+
+    # ===== §13: початкове розташування splitter-ів і режим (Wide/Compact) =====
+    # У цей момент $form уже має фінальний startup-розмір (вище), а
+    # $mainSplit/$rightSplit — Dock=Fill дочірні елементи, щойно додані в
+    # ієрархію контролів, тому ClientSize вже коректний (WinForms виконує
+    # docking-layout синхронно при додаванні Dock-контролю до батька) —
+    # саме тому Panel1MinSize/Panel2MinSize встановлюються ТУТ, а не одразу
+    # після New-Object (див. коментар вище).
+    $mainSplit.Panel1MinSize = 150
+    $mainSplit.Panel2MinSize = 400
+    $rightSplit.Panel1MinSize = 350
+    $rightSplit.Panel2MinSize = 200
+    Set-BRAVOConfiguratorUISplitterDistanceSafe -SplitContainer $mainSplit -DesiredDistance 220
+    $state.LayoutMode = Get-BRAVOConfiguratorUILayoutMode -ClientWidth $mainSplit.ClientSize.Width
+    $rightSplit.Orientation = if ($state.LayoutMode -eq 'Compact') {
+        [System.Windows.Forms.Orientation]::Horizontal
+    } else {
+        [System.Windows.Forms.Orientation]::Vertical
+    }
+    $rightSplitAvailable = if ($rightSplit.Orientation -eq [System.Windows.Forms.Orientation]::Horizontal) { $rightSplit.ClientSize.Height } else { $rightSplit.ClientSize.Width }
+    Set-BRAVOConfiguratorUISplitterDistanceSafe -SplitContainer $rightSplit -DesiredDistance ([Math]::Floor($rightSplitAvailable * 0.65))
+
+    # Resize-driven reclamp (§12/§13): перемикає орієнтацію rightSplit
+    # лише на факт зміни Wide<->Compact (не на кожен піксель), інакше
+    # затискає ПОТОЧНУ SplitterDistance у новий легальний діапазон —
+    # зберігає операторський вибір позиції splitter-а при звичайному
+    # resize, замість скидання до фіксованого значення щоразу.
+    $applyLayoutMode = {
+        $newMode = Get-BRAVOConfiguratorUILayoutMode -ClientWidth $mainSplit.ClientSize.Width
+        $orientationChanged = ($newMode -ne $state.LayoutMode)
+        $state.LayoutMode = $newMode
+        if ($orientationChanged) {
+            $rightSplit.Orientation = if ($newMode -eq 'Compact') {
+                [System.Windows.Forms.Orientation]::Horizontal
+            } else {
+                [System.Windows.Forms.Orientation]::Vertical
+            }
+        }
+
+        Set-BRAVOConfiguratorUISplitterDistanceSafe -SplitContainer $mainSplit -DesiredDistance $mainSplit.SplitterDistance
+
+        $rightAvailableNow = if ($rightSplit.Orientation -eq [System.Windows.Forms.Orientation]::Horizontal) { $rightSplit.ClientSize.Height } else { $rightSplit.ClientSize.Width }
+        $rightDesired = if ($orientationChanged) { [Math]::Floor($rightAvailableNow * 0.65) } else { $rightSplit.SplitterDistance }
+        Set-BRAVOConfiguratorUISplitterDistanceSafe -SplitContainer $rightSplit -DesiredDistance $rightDesired
+    }
+    $mainSplit.Add_SizeChanged({ & $applyLayoutMode })
+    $rightSplit.Add_SizeChanged({ & $applyLayoutMode })
 
     # ===== Заповнення TreeView з чистої Get-BRAVOConfiguratorUICategoryTree =====
     $categoryTreeData = Get-BRAVOConfiguratorUICategoryTree -SchemaCatalog $schemaCatalog
@@ -944,11 +1407,15 @@ function Show-BRAVOConfiguratorMainForm {
 
     $onSelected = {
         param($path)
+        # P2-B.20: canonical Path обраного налаштування — переживає
+        # наступний rebuild центральної панелі, якщо він усе ще
+        # присутній у відфільтрованому наборі.
+        $state.SelectedSettingPath = $path
         Update-BRAVOConfiguratorUIDetailsPanel -DetailsTextBox $detailsTextBox -State $state -Path $path
     }
 
     $refreshCenterPanel = {
-        Update-BRAVOConfiguratorUICenterPanel -CenterPanel $centerScrollPanel -State $state -OnChanged $onChanged -OnSelected $onSelected
+        Update-BRAVOConfiguratorUICenterPanel -CenterPanel $centerScrollPanel -State $state -OnChanged $onChanged -OnSelected $onSelected -ToolTip $sharedToolTip
     }
 
     & $refreshCenterPanel
@@ -999,7 +1466,7 @@ function Show-BRAVOConfiguratorMainForm {
     })
 
     $filterComboBox.Add_SelectedIndexChanged({
-        $state.Filter = [string]$filterComboBox.SelectedItem
+        $state.Filter = [string]$filterComboBox.SelectedItem.Id
         & $refreshCenterPanel
     })
 
@@ -1083,7 +1550,7 @@ function Show-BRAVOConfiguratorMainForm {
             return
         }
 
-        $confirmed = Show-BRAVOConfiguratorUIPreviewDialog -Preview $preview
+        $confirmed = Show-BRAVOConfiguratorUIPreviewDialog -Preview $preview -Owner $form
         if (-not $confirmed) { return }
 
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
@@ -1162,6 +1629,37 @@ function Show-BRAVOConfiguratorMainForm {
         Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
     })
 
+    # P2-B.10/§18/§19: клавіатурні скорочення. Ctrl+F -> фокус пошуку;
+    # F1 -> контекстна довідка (фокус Details, якщо є обране налаштування,
+    # інакше загальне повідомлення); F5/Escape ПОВНІСТЮ переадресовуються
+    # на PerformClick() існуючих кнопок — жоден шлях не обходить
+    # dirty-discard confirmation чи Preview/Apply-контракт, бо виконується
+    # ТОЙ САМИЙ Add_Click-обробник, не паралельна копія логіки. Головна
+    # форма НІКОЛИ не отримує AcceptButton=Apply (Enter у полі редагування
+    # не повинен неочікувано писати конфігурацію) — це свідомо не
+    # встановлюється тут.
+    $form.Add_KeyDown({
+        param($keySender, $keyArgs)
+        if ($keyArgs.Control -and $keyArgs.KeyCode -eq [System.Windows.Forms.Keys]::F) {
+            [void]$searchTextBox.Focus()
+            $searchTextBox.SelectAll()
+            $keyArgs.Handled = $true
+        } elseif ($keyArgs.KeyCode -eq [System.Windows.Forms.Keys]::F1) {
+            if (-not [string]::IsNullOrEmpty($state.SelectedSettingPath)) {
+                [void]$detailsTextBox.Focus()
+            } else {
+                Show-BRAVOConfiguratorUIMessage -Text (Get-BRAVOConfiguratorUIGeneralHelpText)
+            }
+            $keyArgs.Handled = $true
+        } elseif ($keyArgs.KeyCode -eq [System.Windows.Forms.Keys]::F5) {
+            $reloadButton.PerformClick()
+            $keyArgs.Handled = $true
+        } elseif ($keyArgs.KeyCode -eq [System.Windows.Forms.Keys]::Escape) {
+            $cancelButton.PerformClick()
+            $keyArgs.Handled = $true
+        }
+    })
+
     $form.Add_FormClosing({
         param($formSender, $formArgs)
         if (-not (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state)) {
@@ -1194,5 +1692,11 @@ Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorUICategoryTree',
     'Get-BRAVOConfiguratorUIBooleanTriState',
     'ConvertTo-BRAVOConfiguratorUIDisplayText',
-    'ConvertTo-BRAVOConfiguratorUITypedValue'
+    'ConvertTo-BRAVOConfiguratorUITypedValue',
+    'Get-BRAVOConfiguratorUILayoutMode',
+    'Get-BRAVOConfiguratorUIFilterOptions',
+    'Get-BRAVOConfiguratorUISettingHelpText',
+    'Get-BRAVOConfiguratorUIGeneralHelpText',
+    'Get-BRAVOConfiguratorUIStartupSize',
+    'Get-BRAVOConfiguratorUIClampedSplitterDistance'
 )
