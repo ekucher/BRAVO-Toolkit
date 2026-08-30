@@ -501,13 +501,39 @@ exit-кодів без жодного реального споживача су
 "Do not invent... exit-code semantics" і мінімальному обсягу зміни.
 
 Замість цього `Show-BRAVOConfiguratorMainForm` повертає структурований
-рядок-результат — `'Applied'` / `'Cancelled'` / `'NoChanges'` — викликачу:
-`Applied`, якщо хоч раз відбувся успішний Apply в сесії (пріоритет над
-подальшим редагуванням і скасуванням); інакше `Cancelled`, якщо
-diff-based Dirty (§11.2) проти самого першого baseline сесії показує
-незастосовані зміни; інакше `NoChanges`. `BRAVO_CONFIGURATOR.ps1` виводить
-відповідний текст оператору й лишає `exit 0` для всіх трьох — це
-навмисно, не недогляд.
+рядок-результат — `'Applied'` / `'Cancelled'` / `'NoChanges'` — викликачу,
+через `Get-BRAVOConfiguratorSessionOutcome` (Model.psm1, чиста функція,
+покрита headless-тестами).
+
+**Correction (після початкового P2-A.4):** перша версія оцінювала
+Cancelled/NoChanges проти *первинного* baseline сесії
+(`InitialBaselineOverrides`, знімок на момент Launch) і давала Applied
+абсолютний пріоритет над будь-яким подальшим diff. Це давало два хибні
+результати: (1) `Launch A -> зовнішня зміна на диску -> Reload -> Close
+без edits` повертав `Cancelled`, хоча `ProductionBaseline` уже оновлено
+Reload-ом і незбережених змін немає; (2) `Apply успішний (baseline ->
+B) -> подальший edit -> Close без повторного Apply` повертав `Applied`,
+приховуючи реальні незбережені зміни, які оператор фактично відкинув.
+
+Виправлений контракт оцінює diff проти **поточного**
+`$state.ProductionBaseline.Overrides` (той самий canonical знімок, що
+race detection у Persistence і status-bar/close-confirmation Dirty вже
+використовують — оновлюється Load/Reload і кожним успішним Apply), з
+пріоритетом:
+
+```text
+currentDirty = Test-BRAVOConfiguratorModelDirty(Model, ProductionBaseline.Overrides)
+
+if currentDirty:      Cancelled   # незбережений diff на момент закриття
+elif AnyApplySucceeded: Applied   # принаймні один Apply відбувся, diff відсутній
+else:                  NoChanges
+```
+
+`InitialBaselineOverrides` видалено зі `$state` — окремого знімка
+первинного baseline сесії більше не потрібно.
+
+`BRAVO_CONFIGURATOR.ps1` виводить відповідний текст оператору й лишає
+`exit 0` для всіх трьох — це навмисно, не недогляд.
 
 ### 11.4. Reset setting / Reset section
 

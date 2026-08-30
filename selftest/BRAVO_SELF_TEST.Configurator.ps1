@@ -858,6 +858,59 @@ Test-BRAVOCondition (
     'Configurator Reset section: скидає лише обрану Group/Section, інші секції не постраждали' `
     "TargetOverridePresent=$($dirtyTargetRowAfterReset.OverridePresent) OtherPath=$dirtyResetSectionOtherPath OtherOverridePresent=$($dirtyOtherRowAfterReset.OverridePresent)"
 
+# AM: Get-BRAVOConfiguratorSessionOutcome — P2-A.4 correction. Session
+# outcome оцінюється проти ПОТОЧНОГО ProductionBaseline (не первинного
+# baseline сесії): Cancelled переважає над Applied, коли на момент
+# закриття лишився незбережений diff проти поточного baseline.
+
+# Test 1 — порожня сесія (baseline A, model A, жодного Apply) -> NoChanges
+$outcomeBaselineA = @{ $dirtyStringPath = 'WARN' }
+$outcomeModelA = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $outcomeBaselineA
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelA -ProductionBaseline $outcomeBaselineA -AnyApplySucceeded $false) -eq 'NoChanges') `
+    'Configurator SessionOutcome: порожня сесія -> NoChanges' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelA -ProductionBaseline $outcomeBaselineA -AnyApplySucceeded $false)"
+
+# Test 2 — edit, потім revert точно до baseline A, без Apply -> NoChanges
+$outcomeModelEdited = Set-BRAVOConfiguratorOverride -Model $outcomeModelA -Path $dirtyBooleanPath -Value $true
+$outcomeModelReverted = Reset-BRAVOConfiguratorSetting -Model $outcomeModelEdited -Path $dirtyBooleanPath
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelReverted -ProductionBaseline $outcomeBaselineA -AnyApplySucceeded $false) -eq 'NoChanges') `
+    'Configurator SessionOutcome: edit -> revert -> NoChanges' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelReverted -ProductionBaseline $outcomeBaselineA -AnyApplySucceeded $false)"
+
+# Test 3 — незбережений edit, без Apply -> Cancelled
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelEdited -ProductionBaseline $outcomeBaselineA -AnyApplySucceeded $false) -eq 'Cancelled') `
+    'Configurator SessionOutcome: незбережений edit -> Cancelled' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelEdited -ProductionBaseline $outcomeBaselineA -AnyApplySucceeded $false)"
+
+# Test 4 — успішний Apply: ProductionBaseline оновлено до B, Model = B -> Applied
+$outcomeBaselineB = @{ $dirtyStringPath = 'WARN'; $dirtyBooleanPath = $true }
+$outcomeModelB = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $outcomeBaselineB
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelB -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $true) -eq 'Applied') `
+    'Configurator SessionOutcome: успішний Apply, без подальших змін -> Applied' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelB -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $true)"
+
+# Test 5 — Apply(B) відбувся, потім НОВИЙ незбережений edit (C != B) -> Cancelled
+#   (regression для дефекту: AnyApplySucceeded раніше мав абсолютний
+#   пріоритет і хибно приховував ці подальші незбережені зміни)
+$outcomeModelC = Set-BRAVOConfiguratorOverride -Model $outcomeModelB -Path $dirtyArrayPath -Value @('changed-after-apply')
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelC -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $true) -eq 'Cancelled') `
+    'Configurator SessionOutcome: Apply + подальший незбережений edit -> Cancelled (не Applied)' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelC -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $true)"
+
+# Test 6 — Apply(B) відбувся, потім edit, потім revert точно до B -> Applied
+$outcomeModelCReverted = Reset-BRAVOConfiguratorSetting -Model $outcomeModelC -Path $dirtyArrayPath
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelCReverted -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $true) -eq 'Applied') `
+    'Configurator SessionOutcome: Apply + edit -> revert до B -> Applied' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelCReverted -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $true)"
+
+# Test 7 — Launch(A) -> зовнішня модифікація на диску -> B -> Reload
+#   (ProductionBaseline і Model обидва оновлені до B) -> Close без edits
+#   -> NoChanges. Це головний regression для дефекту InitialBaselineOverrides
+#   (B != первинний baseline A хибно давав Cancelled).
+Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelB -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $false) -eq 'NoChanges') `
+    'Configurator SessionOutcome: Reload після зовнішньої зміни, без edits -> NoChanges' `
+    "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelB -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $false)"
+
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====

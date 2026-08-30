@@ -713,8 +713,11 @@ function Show-BRAVOConfiguratorMainForm {
         # scheduled-завдання під BRAVO.ExitCodes). Натомість — structured
         # internal result, який Show-BRAVOConfiguratorMainForm повертає
         # викликачу; BRAVO_CONFIGURATOR.ps1 лишає exit 0 для всіх трьох.
+        # Фінальний outcome оцінюється проти ПОТОЧНОГО $state.ProductionBaseline
+        # (Get-BRAVOConfiguratorSessionOutcome, Model.psm1) — не проти
+        # первинного baseline сесії; окремого InitialBaselineOverrides не
+        # зберігаємо (P2-A.4 correction).
         AnyApplySucceeded          = $false
-        InitialBaselineOverrides   = $productionBaseline.Overrides
     }
     try {
         $initialSnapshot = Get-BRAVOConfiguratorUIEffectiveConfigSnapshot -State $state
@@ -1168,20 +1171,19 @@ function Show-BRAVOConfiguratorMainForm {
 
     [void]$form.ShowDialog()
 
-    # P2-A.4: Applied завжди має пріоритет — навіть якщо оператор після
-    # успішного Apply ще щось редагував і зрештою закрив форму без
-    # повторного застосування, зміни ВЖЕ persisted у production. Інакше —
-    # діагностуємо через справжній diff (Test-BRAVOConfiguratorModelDirty,
-    # P2-A.3) проти самого першого baseline цієї сесії: Cancelled, якщо
-    # лишились незастосовані відхилення, NoChanges — якщо форму закрито
-    # без жодної реальної зміни (порожня сесія або edit->revert).
-    if ($state.AnyApplySucceeded) {
-        return 'Applied'
-    } elseif (Test-BRAVOConfiguratorModelDirty -Model $state.Model -BaselineOverrides $state.InitialBaselineOverrides) {
-        return 'Cancelled'
-    } else {
-        return 'NoChanges'
-    }
+    # P2-A.4 (correction): outcome оцінюється проти ПОТОЧНОГО
+    # $state.ProductionBaseline (Get-BRAVOConfiguratorSessionOutcome,
+    # Model.psm1) — не проти первинного baseline сесії. Незбережений diff
+    # на момент закриття (Cancelled) переважає над фактом, що Apply
+    # колись у сесії відбувся успішно (Applied) — інакше подальші
+    # незбережені зміни після успішного Apply, які оператор відкинув,
+    # хибно репортувались би як Applied. Reload оновлює ProductionBaseline,
+    # тож "Launch -> зовнішня зміна -> Reload -> Close без edits" коректно
+    # дає NoChanges, а не хибний Cancelled проти застарілого первинного
+    # baseline.
+    return Get-BRAVOConfiguratorSessionOutcome -Model $state.Model `
+        -ProductionBaseline $state.ProductionBaseline.Overrides `
+        -AnyApplySucceeded $state.AnyApplySucceeded
 }
 
 Export-ModuleMember -Function @(

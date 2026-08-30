@@ -430,6 +430,52 @@ function Reset-BRAVOConfiguratorSection {
     return $updated
 }
 
+function Get-BRAVOConfiguratorSessionOutcome {
+    <#
+    .SYNOPSIS
+        P2-A.4 (correction): визначає фінальний session outcome
+        ('Applied'/'Cancelled'/'NoChanges') виключно проти ПОТОЧНОГО
+        ProductionBaseline (не проти першого baseline сесії при Launch).
+    .DESCRIPTION
+        ProductionBaseline — canonical знімок production-стану, який уже
+        оновлюється при Load/Reload і після успішного Apply (той самий
+        знімок, що вже використовується для race detection у Persistence
+        і для status-bar/close-confirmation Dirty). Використання
+        первинного baseline сесії (замість поточного) давало хибний
+        Cancelled після Reload без незбережених змін (сценарій A) і
+        приховувало реальні незбережені зміни, зроблені ПІСЛЯ успішного
+        Apply (сценарій B), бо AnyApplySucceeded мав абсолютний
+        пріоритет над фактичним поточним diff.
+
+        Precedence: незбережений diff на момент закриття переважає над
+        фактом, що Apply колись у сесії відбувся успішно — Applied не
+        повинен приховувати подальші незбережені зміни, які оператор
+        закрив без застосування.
+    .PARAMETER Model
+        Поточна модель на момент закриття форми.
+    .PARAMETER ProductionBaseline
+        Поточний (не первинний) ProductionBaseline.Overrides знімок —
+        оновлюється Reload/успішним Apply.
+    .PARAMETER AnyApplySucceeded
+        Чи відбувся хоча б один успішний Apply протягом сесії.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][array]$Model,
+        [Parameter(Mandatory = $true)][hashtable]$ProductionBaseline,
+        [Parameter(Mandatory = $true)][bool]$AnyApplySucceeded
+    )
+
+    $currentDirty = Test-BRAVOConfiguratorModelDirty -Model $Model -BaselineOverrides $ProductionBaseline
+    if ($currentDirty) {
+        return 'Cancelled'
+    } elseif ($AnyApplySucceeded) {
+        return 'Applied'
+    } else {
+        return 'NoChanges'
+    }
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorValueAtPath',
     'Get-BRAVOConfiguratorModel',
@@ -440,5 +486,6 @@ Export-ModuleMember -Function @(
     'Update-BRAVOConfiguratorEffective',
     'Test-BRAVOConfiguratorModelDirty',
     'Reset-BRAVOConfiguratorSetting',
-    'Reset-BRAVOConfiguratorSection'
+    'Reset-BRAVOConfiguratorSection',
+    'Get-BRAVOConfiguratorSessionOutcome'
 )
