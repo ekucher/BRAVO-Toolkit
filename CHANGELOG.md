@@ -1,5 +1,17 @@
 # Changelog
 
+## 5.2.2 — 2026-08-31
+
+Stable promotion від прийнятого `5.2.2-rc.2` (нижче) — real-server acceptance
+на SRV_WORK (тому самому сервері, де раніше падав ACL-баг): `BRAVO_SETUP.ps1`
+[1/5] Захист runtime ACL — OK; idempotent повторний `BRAVO_TASKS_INSTALL.ps1`;
+перший повний `BRAVO_ARCHIV.ps1` (MODEL/BLOG/BRAVOEXCH, VSS, SHA512, SFTP) —
+COMPLETE generation; `BRAVO_HEALTH.ps1` після нього — 0 errors. Release-
+metadata-only зміни відносно прийнятого rc.2: `VERSION.json` (packageVersion
+`5.2.2-rc.2` → `5.2.2`, releaseChannel `prerelease` → `stable`),
+README.md/BRAVO_SETUP.md заголовки, цей розділ CHANGELOG, RUNTIME_MANIFEST.json
+регенеровано. Жодних функціональних runtime-змін відносно прийнятого rc.2.
+
 ## 5.2.2-rc.2 — 2026-08-30
 
 Hotfix-кандидат: rc.1 + вузький ACL-фікс, знайдений і підтверджений на
