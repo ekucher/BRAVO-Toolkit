@@ -1,6 +1,31 @@
 # Changelog
 
-## 5.2.2-rc.1 — 2026-08-29
+## 5.2.2-rc.2 — 2026-08-30
+
+Hotfix-кандидат: rc.1 + вузький ACL-фікс, знайдений і підтверджений на
+реальному сервері SRV_WORK (не через self-test, через фактичний запуск
+`BRAVO_SETUP` на встановленій копії).
+
+- **FIX (scheduler, runtime ACL):** `BRAVO_TASKS_INSTALL.ps1` падав двома
+  різними .NET-винятками при захисті runtime ACL — "This access control
+  list is not in canonical form" і "Some or all identity references could
+  not be translated" (orphaned SID). Причина: `Set-BRAVOProtectedRuntimeAcl`
+  читав існуючий ACL через `Get-Acl` і намагався прибрати з нього старі
+  правила замість повної заміни. Тепер ACL будується з чистого
+  `New-Object DirectorySecurity/FileSecurity` — той самий кінцевий
+  результат (Administrators/SYSTEM FullControl, Users ReadAndExecute), без
+  залежності від стану попереднього ACL. Регресійний self-test:
+  `Scheduler/ProtectedRuntimeAclDoesNotMutateExistingDacl`.
+- **FIX (self-test, супутня знахідка):** `Scheduler/RecoveryEnabledMissingRootsFailsValidation`
+  хибно падав через жорсткий CRLF-перенос ПОСЕРЕД слова у форматованому
+  виводі дочірнього non-interactive `powershell.exe` (ширина консолі) —
+  нормалізовано в `Invoke-BRAVOSelfTestTaskInstallValidateOnly`. Не
+  впливає на production-поведінку `BRAVO_TASKS_INSTALL.ps1`.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1477 PASS / 0 FAIL).
+Real-server acceptance для rc.2 — окремий крок, ще не проводився.
+
+## 5.2.2-rc.1 — 2026-08-29 (superseded by rc.2)
 
 Release-metadata-only promotion of `5.2.2-dev.1` (нижче) до Release
 Candidate: `packageVersion`/`releaseChannel` bump per `RELEASE_POLICY.md`
