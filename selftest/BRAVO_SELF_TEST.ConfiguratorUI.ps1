@@ -435,3 +435,49 @@ foreach ($configuratorUIPathType in @('Path', 'UNCPath')) {
         "ConfiguratorUI P2-B regression (FAIL #11 follow-up): Type '$configuratorUIPathType' fail-closed на синтаксично некоректному шляху (не комітиться як default { return `$RawText })" `
         "Threw=$configuratorUIInvalidPathThrew"
 }
+
+# ===== 20: P2-B manual acceptance FAIL #11 (друга ітерація) — 'UNCPath'
+# вимагає ПОВНУ структурну UNC-форму (\\server\share[\subdir...]), не
+# лише префікс \\ (єдиний 'UNCPath'-дескриптор, smbSettings.RootPath, у
+# власному Schema.Description документує: "UNC-шлях, напр.
+# \\host\share\BRAVO"). Проста StartsWith('\\') перевірка (перша
+# ітерація цього фіксу) пропускала б '\\', '\\host', '\\host\' — жоден
+# з них не є завершеним UNC-шляхом (немає непорожньої share-частини).
+# Детерміністична матриця нижче — точно та, що визначена в задачі;
+# перевіряє ЛИШЕ структурну валідність (кількість/непорожність
+# server-, share- та subdir-сегментів), НЕ існування host/share чи
+# доступність мережі.
+$configuratorUIUncMatrix = [ordered]@{
+    '123'                  = $false
+    'C:\BRAVO'             = $false
+    '\host\share'          = $false
+    '\\'                   = $false
+    '\\host'               = $false
+    '\\host\'              = $false
+    '\\host\share'         = $true
+    '\\host\share\BRAVO'   = $true
+    '\\192.168.1.10\BRAVO' = $true
+}
+foreach ($configuratorUIUncCase in $configuratorUIUncMatrix.Keys) {
+    $configuratorUIUncExpectedValid = $configuratorUIUncMatrix[$configuratorUIUncCase]
+    $configuratorUIUncThrew = $false
+    $configuratorUIUncResult = $null
+    try {
+        $configuratorUIUncResult = ConvertTo-BRAVOConfiguratorUITypedValue -Type 'UNCPath' -RawText $configuratorUIUncCase
+    } catch {
+        $configuratorUIUncThrew = $true
+    }
+    $configuratorUIUncActuallyValid = -not $configuratorUIUncThrew
+    Test-BRAVOCondition ($configuratorUIUncActuallyValid -eq $configuratorUIUncExpectedValid) `
+        "ConfiguratorUI P2-B regression (FAIL #11, 2-га ітерація): Type 'UNCPath' матриця — '$configuratorUIUncCase' очікується $(if ($configuratorUIUncExpectedValid) { 'VALID' } else { 'INVALID' })" `
+        "Case='$configuratorUIUncCase' ExpectedValid=$configuratorUIUncExpectedValid ActuallyValid=$configuratorUIUncActuallyValid Result='$configuratorUIUncResult'"
+}
+
+# 'Path' (на відміну від 'UNCPath') і далі НЕ вимагає UNC-структуру —
+# абсолютні локальні шляхи й legit sentinel-значення (напр.
+# maintenanceSettings.Trace.BISSourcePath: 'off' = вимкнено) лишаються
+# легальними.
+$configuratorUIPathSentinelResult = ConvertTo-BRAVOConfiguratorUITypedValue -Type 'Path' -RawText '123'
+Test-BRAVOCondition ($configuratorUIPathSentinelResult -eq '123') `
+    "ConfiguratorUI P2-B regression (FAIL #11, 2-га ітерація): Type 'Path' НЕ вимагає UNC-структуру (легальні абсолютні локальні шляхи/sentinel-значення на кшталт 'off')" `
+    "Result='$configuratorUIPathSentinelResult'"

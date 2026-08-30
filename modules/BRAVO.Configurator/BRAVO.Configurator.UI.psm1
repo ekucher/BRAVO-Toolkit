@@ -269,24 +269,54 @@ function ConvertTo-BRAVOConfiguratorUITypedValue {
             if ([string]::IsNullOrWhiteSpace($RawText)) { return @() }
             return @($RawText -split ',' | ForEach-Object { [double]::Parse($_.Trim(), [System.Globalization.CultureInfo]::InvariantCulture) })
         }
-        { $_ -in @('Path', 'UNCPath') } {
+        'Path' {
             # P2-B bugfix (manual acceptance: FAIL #11 follow-up): раніше
-            # 'Path'/'UNCPath' падали в default { return $RawText } — БЕЗ
-            # жодної валідації, на відміну від Integer/Number вище (які
-            # fail-closed на невалідному числі). Некоректний шлях (нелегальні
-            # символи тощо) тому міг потрапити в $State.Model як override і
-            # лише пізніше зривав реальний (child-process) Update-
+            # 'Path' падало в default { return $RawText } — БЕЗ жодної
+            # валідації, на відміну від Integer/Number вище (які fail-closed
+            # на невалідному числі). Некоректний шлях (нелегальні символи
+            # тощо) тому міг потрапити в $State.Model як override і лише
+            # пізніше зривав реальний (child-process) Update-
             # BRAVOConfiguratorEffective з незрозумілою для оператора
             # помилкою "Не вдалося перерахувати Effective: ...". Порожній
             # рядок лишається легальним (валідність відсутності шляху —
-            # семантика Validation-модуля, не цієї функції: див.
-            # Test-BRAVOConfiguratorSMBArchiveConsistency). [System.IO.Path]::
-            # GetFullPath лише перевіряє СИНТАКСИЧНУ форму (нелегальні
-            # символи тощо), не існування шляху — не-створений/віддалений
-            # шлях лишається дійсним вводом.
+            # семантика Validation-модуля, не цієї функції). Схемні 'Path'-
+            # дескриптори — абсолютні локальні шляхи, деякі з legit
+            # sentinel-значеннями (напр. maintenanceSettings.Trace.
+            # BISSourcePath: 'off' = вимкнено) — тому лише СИНТАКСИЧНА
+            # перевірка через [System.IO.Path]::GetFullPath (нелегальні
+            # символи тощо), без вимоги конкретного префіксу/існування
+            # шляху.
             if ([string]::IsNullOrWhiteSpace($RawText)) { return '' }
             $trimmedPath = $RawText.Trim()
             [void][System.IO.Path]::GetFullPath($trimmedPath)
+            return $trimmedPath
+        }
+        'UNCPath' {
+            # P2-B bugfix (manual acceptance: FAIL #11, друга ітерація):
+            # чиста синтаксична GetFullPath-перевірка (як для 'Path' вище)
+            # пропускає будь-який відносний рядок без заборонених символів
+            # (напр. '123') як "валідний" — бо синтаксично він дійсно
+            # валідний, просто не є UNC-шляхом. Проста StartsWith('\\')
+            # перевірка теж недостатня — пропускає '\\', '\\host',
+            # '\\host\' (без непорожньої share-частини). Єдиний наразі
+            # 'UNCPath'-дескриптор (smbSettings.RootPath) у власному
+            # Schema-описі документує очікуваний формат:
+            # "UNC-шлях, напр. \\host\share\BRAVO" — тобто повна
+            # структурна форма \\server\share[\subdir...], НЕ лише
+            # префікс. Регекс нижче вимагає: рівно 2 провідні backslash,
+            # непорожній server (без backslash), непорожній share (без
+            # backslash), і 0+ додаткових непорожніх \subdir-сегментів.
+            # НЕ перевіряє існування host/share чи доступність мережі —
+            # лише структурну валідність (§ вимога задачі). Порожній
+            # рядок і далі лишається легальним (Validation-модуль
+            # вирішує, чи порожній RootPath є проблемою в конкретному
+            # effective-контексті).
+            if ([string]::IsNullOrWhiteSpace($RawText)) { return '' }
+            $trimmedPath = $RawText.Trim()
+            [void][System.IO.Path]::GetFullPath($trimmedPath)
+            if ($trimmedPath -notmatch '^\\\\[^\\]+\\[^\\]+(\\[^\\]+)*$') {
+                throw "Очікується UNC-шлях у форматі \\server\share або \\server\share\subdir (отримано: '$trimmedPath')."
+            }
             return $trimmedPath
         }
         default {
