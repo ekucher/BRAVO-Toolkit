@@ -1,5 +1,22 @@
 # Changelog
 
+## 5.2.3-rc.1 — 2026-08-31
+
+Release-metadata-only promotion `5.2.3-dev.1` → `5.2.3-rc.1` (`hotfix/5.2.3`),
+per `RELEASE_POLICY.md` §8. Без функціональних runtime-змін відносно `5.2.3-dev.1`
+(нижче) — лише `packageVersion`, заголовки README.md/BRAVO_SETUP.md, цей запис.
+
+Заодно виправлено `releaseChannel` у `5.2.3-dev.1`: мало бути `development`
+(RELEASE_POLICY.md §5.3, dev-релізи), помилково стояло `prerelease` —
+знайдено `ci\Test-BRAVOReleasePolicy.ps1`, який не запускався до цього
+моменту. Для самого `5.2.3-rc.1` значення `prerelease` коректне й без змін.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1532 PASS / 0 FAIL), Parser,
+PSScriptAnalyzer (блокуючий ruleset), Runtime Manifest, Tools Manifest,
+`ci\Test-BRAVOReleasePolicy.ps1` — усі PASS. Real-server acceptance
+(RELEASE_POLICY.md §9) ще не проводився — обов'язковий перед promotion у
+`master`.
+
 ## 5.2.3-dev.1 (fix/5.2.3-operation-aware-disk-space, у розробці)
 
 Operation-aware disk-space policy для `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`: усуває
