@@ -3509,3 +3509,23 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/NotificationUsesConfiguredRequestTimeout" `
         -Failure "Send-BRAVODataRestoreNotification має передавати NotificationRequestTimeoutSeconds з конфігурації (backupMonitoring) у Send-BRAVONotificationChunks, а не мовчазний дефолт"
+
+    # --- DataRestore: componentSettings.SFTP.Enabled (5.2.2) — фіксація
+    # семантики disaster recovery. Глобальний вимикач керує АВТОМАТИЧНИМИ/
+    # запланованими операціями та Health-моніторингом; -Source SFTP —
+    # явна, ручна дія оператора (default -Source Local) і НЕ має
+    # блокуватися master-вимикачем. Ця регресія фіксує інваріант, щоб
+    # майбутній рефактор випадково не додав таку залежність.
+    Test-BRAVOCondition `
+        -Condition (-not $dataRestoreRuntimeTextForTests.Contains('storageEffective')) `
+        -Name "DataRestore/SftpRestoreDoesNotDependOnGlobalStorageSwitch" `
+        -Failure "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1 не повинен посилатися на storageEffective — явний -Source SFTP лишається доступним незалежно від componentSettings.SFTP.Enabled (disaster recovery не має ставати заручником master-вимикача автоматичних операцій)"
+
+    $bazaReconcileScriptTextForStorageSwitch = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_BAZA_RECONCILE.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (-not $bazaReconcileScriptTextForStorageSwitch.Contains('storageEffective')) `
+        -Name "DataRestore/BazaReconcileDoesNotDependOnGlobalStorageSwitch" `
+        -Failure "BRAVO_BAZA_RECONCILE.ps1 (операторський, ручний виклик) не повинен посилатися на storageEffective — узгодження мутацій має лишатися доступним незалежно від componentSettings.SFTP.Enabled"

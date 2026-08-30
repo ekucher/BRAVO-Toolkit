@@ -1,6 +1,84 @@
 # Changelog
 
-## Не випущено (developer)
+## 5.2.2 — 2026-08-31
+
+Stable promotion від прийнятого `5.2.2-rc.2` (нижче) — real-server acceptance
+на SRV_WORK (тому самому сервері, де раніше падав ACL-баг): `BRAVO_SETUP.ps1`
+[1/5] Захист runtime ACL — OK; idempotent повторний `BRAVO_TASKS_INSTALL.ps1`;
+перший повний `BRAVO_ARCHIV.ps1` (MODEL/BLOG/BRAVOEXCH, VSS, SHA512, SFTP) —
+COMPLETE generation; `BRAVO_HEALTH.ps1` після нього — 0 errors. Release-
+metadata-only зміни відносно прийнятого rc.2: `VERSION.json` (packageVersion
+`5.2.2-rc.2` → `5.2.2`, releaseChannel `prerelease` → `stable`),
+README.md/BRAVO_SETUP.md заголовки, цей розділ CHANGELOG, RUNTIME_MANIFEST.json
+регенеровано. Жодних функціональних runtime-змін відносно прийнятого rc.2.
+
+## 5.2.2-rc.2 — 2026-08-30
+
+Hotfix-кандидат: rc.1 + вузький ACL-фікс, знайдений і підтверджений на
+реальному сервері SRV_WORK (не через self-test, через фактичний запуск
+`BRAVO_SETUP` на встановленій копії).
+
+- **FIX (scheduler, runtime ACL):** `BRAVO_TASKS_INSTALL.ps1` падав двома
+  різними .NET-винятками при захисті runtime ACL — "This access control
+  list is not in canonical form" і "Some or all identity references could
+  not be translated" (orphaned SID). Причина: `Set-BRAVOProtectedRuntimeAcl`
+  читав існуючий ACL через `Get-Acl` і намагався прибрати з нього старі
+  правила замість повної заміни. Тепер ACL будується з чистого
+  `New-Object DirectorySecurity/FileSecurity` — той самий кінцевий
+  результат (Administrators/SYSTEM FullControl, Users ReadAndExecute), без
+  залежності від стану попереднього ACL. Регресійний self-test:
+  `Scheduler/ProtectedRuntimeAclDoesNotMutateExistingDacl`.
+- **FIX (self-test, супутня знахідка):** `Scheduler/RecoveryEnabledMissingRootsFailsValidation`
+  хибно падав через жорсткий CRLF-перенос ПОСЕРЕД слова у форматованому
+  виводі дочірнього non-interactive `powershell.exe` (ширина консолі) —
+  нормалізовано в `Invoke-BRAVOSelfTestTaskInstallValidateOnly`. Не
+  впливає на production-поведінку `BRAVO_TASKS_INSTALL.ps1`.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1477 PASS / 0 FAIL).
+Real-server acceptance для rc.2 — окремий крок, ще не проводився.
+
+## 5.2.2-rc.1 — 2026-08-29 (superseded by rc.2)
+
+Release-metadata-only promotion of `5.2.2-dev.1` (нижче) до Release
+Candidate: `packageVersion`/`releaseChannel` bump per `RELEASE_POLICY.md`
+розділ 8, без функціональних runtime-змін відносно implementation-коміту
+`a5eec35` (`feat(storage): add global SFTP and SMB controls for 5.2.2`).
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1476 PASS / 0 FAIL), Parser,
+PSScriptAnalyzer, ForbiddenPattern, Runtime Manifest, Tools Manifest,
+ReleasePolicy — усі PASS. Real-server acceptance ще не проводився —
+обов'язковий перед промоцією в stable (SFTP ON/OFF × SMB ON/OFF та
+exchangAPI legacy-міграція на ізольованій fixture).
+
+## 5.2.2-dev.1 (hotfix/5.2.2, у розробці)
+
+### Додано
+- Глобальні master-switches зовнішніх сховищ: `componentSettings.SFTP.Enabled`
+  та `componentSettings.SMB.Enabled` (відсутній ключ у legacy-конфігах = `$true`).
+  `Enabled = $false` вимикає всі автоматичні мережеві операції відповідного
+  destination (архіви, BAZA, Health, Maintenance, Dry Run проби) без зміни
+  дочірніх налаштувань; повторне ввімкнення відновлює попередню effective-поведінку.
+  Local-only режим (обидва `$false`) — підтримувана production-конфігурація.
+
+### Виправлено
+- `BRAVO_CREDENTIALS_SETUP.ps1`: формула обов'язковості SFTP-креденшелів не
+  враховувала `componentSettings.Synchronization.BAZA_WWW_SFTP` — сервер лише з
+  WWW-синхронізацією не вважав SFTP-креденшели обов'язковими.
+- `BRAVO_ARCHIV.ps1 -SyncBAZA` при глобально вимкненому SFTP завершується
+  чистим SKIPPED з кодом 0 (раніше конфігурація без жодної SFTP-цілі давала
+  помилковий exit 50).
+- `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1`:
+  `Invoke-BRAVOLegacyLogMigration` більше не знищує timestamp у вже
+  унікальному джерельному імені exchangAPI-журналу
+  (`exchangAPI_yyyy-MM-dd_HHmmss.log`) під час одноразової legacy-міграції —
+  раніше такий файл перейменовувався в `exchangAPI_N.log` через sequence-
+  гілку, призначену лише для старих sequence-стильних legacy-імен
+  (`exchangAPI.log`/`exchangAPI_1.log`). Виявлено на продакшені. Новий
+  `Test-BRAVOIsTimestampedExchangeApiLogName` розпізнає timestamped-формат і
+  скеровує такі файли через `NamingPolicy='Original'` (той самий контракт,
+  що вже застосовує поточна не-legacy ротація exchangAPI): ім'я зберігається
+  точно, колізія імені в призначенні — fail-closed (без перезапису, без
+  перейменування джерела). Старі sequence-стильні legacy-імена й далі
+  проходять через незмінену послідовну нумерацію.
 
 ---
 

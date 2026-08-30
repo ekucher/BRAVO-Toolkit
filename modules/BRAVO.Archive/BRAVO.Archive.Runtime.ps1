@@ -231,12 +231,19 @@ $script:notificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.Notific
 } else {
     30
 }
-$sftpCredentialRequired = $SyncBAZA -or
-    [bool]$componentSettings.SFTP.ArchiveUpload -or
-    [bool]$componentSettings.Synchronization.BAZA_APP_SFTP -or
-    [bool]$componentSettings.Synchronization.BAZA_WWW_SFTP
+# SFTP.Enabled=false (5.2.2) вимикає вимогу креденшелів навіть для
+# явного -SyncBAZA — глобально вимкнений destination не має жодних
+# автоматичних/ручних network-операцій, доки оператор не поверне
+# Enabled=true. ArchiveUpload і ScheduledSftpSyncRequired беруться вже
+# effective (Enabled AND child), обгортка потрібна лише для терму
+# $SyncBAZA, який не проходить через componentSettings.
+$sftpCredentialRequired = [bool]$storageEffective.SFTP.Enabled -and (
+    $SyncBAZA -or
+    [bool]$storageEffective.SFTP.ArchiveUpload -or
+    [bool]$bazaSyncEffective.ScheduledSftpSyncRequired
+)
 $smbCredentialRequired = -not $SyncBAZA -and
-    [bool]$componentSettings.SMB.ArchiveCopy
+    [bool]$storageEffective.SMB.ArchiveCopy
 $archiveCredentialRequired = -not $SyncBAZA -and (
     [bool]$componentSettings.Archive.MODEL -or
     [bool]$componentSettings.Archive.BLOG -or
@@ -5857,11 +5864,15 @@ function Main {
     $readyArchives = @()
     $results = @{}
     $bazaAppLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_LOCAL
-    $bazaAppSFTPSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_APP_SFTP
-    $bazaWWWSFTPSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_SFTP
+    # BAZA_*_SFTP тут беруться вже effective (Get-BRAVOEffectiveSynchronizationConfiguration
+    # ANDить componentSettings.SFTP.Enabled у SftpEnabled кожного компонента,
+    # 5.2.2) — один канонічний вираз замінює локальний AND і в цьому файлі,
+    # і в Health/Maintenance/Dry Run.
+    $bazaAppSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_APP' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
+    $bazaWWWSFTPSyncEnabled = [bool]($bazaSyncEffective.Components | Where-Object { $_.Name -eq 'BAZA_WWW' } | Select-Object -First 1 -ExpandProperty SftpEnabled)
     $bazaWWWLocalSyncEnabled = [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL
-    $sftpArchiveUploadEnabled = [bool]$componentSettings.SFTP.ArchiveUpload
-    $smbArchiveCopyEnabled = [bool]$componentSettings.SMB.ArchiveCopy
+    $sftpArchiveUploadEnabled = [bool]$storageEffective.SFTP.ArchiveUpload
+    $smbArchiveCopyEnabled = [bool]$storageEffective.SMB.ArchiveCopy
     $sftpTransferEnabled = (
         $sftpArchiveUploadEnabled -or
         $bazaAppSFTPSyncEnabled -or
@@ -5894,6 +5905,35 @@ function Main {
     [void](Test-Compatibility)
 
     if ($SyncBAZA) {
+        # componentSettings.SFTP.Enabled=false (5.2.2): -SyncBAZA — це
+        # суто SFTP-операція, тому глобальний вимикач має чистий SKIPPED
+        # exit 0 БЕЗ жодного звернення до Invoke-ManualBAZASFTPSynchronization
+        # (нуль credential-читань, нуль Test-SFTPConfig/Test-SFTPConnection,
+        # нуль WinSCP). Фіксує 5.2.1-поведінку, де конфігурація без жодної
+        # увімкненої SFTP-цілі помилково давала exit 50 (SftpFailed) —
+        # навмисно вимкнений destination не є помилкою конфігурації.
+        if (-not [bool]$storageEffective.SFTP.Enabled) {
+            Write-Log "==="
+            Write-Log "=== РУЧНА СИНХРОНIЗАЦIЯ BAZA_APP / BAZA_WWW НА SFTP: SKIPPED ==="
+            Write-Log ([string]$storageEffective.SFTP.DisabledReason) -Level "INFO" -NoTimestamp
+            $script:processExitCode = 0
+            Show-ScriptProgress -Status "Завершено" -PercentComplete 100
+            Complete-BRAVOProgress
+            Initialize-BRAVOArchiveSteps -Total 1
+            Write-BRAVOArchiveStep `
+                -Name 'SFTP: BAZA_APP/BAZA_WWW' `
+                -Status 'SKIPPED' `
+                -Details ([string]$storageEffective.SFTP.DisabledReason)
+            $skippedSyncMetrics = New-Object System.Collections.Specialized.OrderedDictionary
+            $skippedSyncMetrics.Add('Операція', 'Ручна синхронізація BAZA_APP / BAZA_WWW')
+            $skippedSyncMetrics.Add('Причина', [string]$storageEffective.SFTP.DisabledReason)
+            Write-BRAVOSummary `
+                -Result 'УСПІШНО' `
+                -Duration ([timespan]::Zero) `
+                -Metrics $skippedSyncMetrics `
+                -LogFile $script:logFile
+            return
+        }
         $manualSyncStarted = Get-Date
         $manualSyncResult = Invoke-ManualBAZASFTPSynchronization
         $manualSyncSuccess = [bool]$manualSyncResult.Success
@@ -6088,6 +6128,16 @@ function Main {
         }
     }
     Write-Log "Копіювання архівів на NAS/SMB: $(if ($smbArchiveCopyEnabled) {'УВIМКНЕНО'} else {'ВИМКНЕНО'})" -NoTimestamp
+    # Причина "ВИМКНЕНО" вище — дочірній прапорець чи глобальний
+    # componentSettings.SFTP.Enabled/SMB.Enabled (5.2.2)? Явно розрізняємо
+    # в логах лише для другого випадку — дочірні ВИМКНЕНО без пояснення
+    # це наявна 5.2.1-поведінка, яку тут не змінюємо.
+    if (-not [string]::IsNullOrWhiteSpace([string]$storageEffective.SFTP.DisabledReason)) {
+        Write-Log $storageEffective.SFTP.DisabledReason -Level "INFO" -NoTimestamp
+    }
+    if (-not [string]::IsNullOrWhiteSpace([string]$storageEffective.SMB.DisabledReason)) {
+        Write-Log $storageEffective.SMB.DisabledReason -Level "INFO" -NoTimestamp
+    }
 
     # Disk preflight виконується до очищення, локальної синхронізації, VSS і
     # створення archive generation. Політика та виключення спільні з
