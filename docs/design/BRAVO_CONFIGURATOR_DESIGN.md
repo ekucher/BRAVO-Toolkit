@@ -591,3 +591,133 @@ production `BRAVO.local.config`/Credential Manager не читається/пи�
 Windows CI gate (non-interactive/non-windowing сесія може поводитись
 непередбачувано для реального WinForms `Form`) — лише документований
 local acceptance-крок для реальної десктопної Windows-сесії.
+
+## 12. P2-B — Responsive WinForms UX, DPI, keyboard/context help
+
+Гілка `feat/bravo-configurator-p2b-ux` від `origin/developer @ db8d955`
+(merge PR #115). Мета — UX/visual hardening `BRAVO.Configurator.UI`
+БЕЗ жодної зміни Schema/Effective/Persistence/Presets/Credentials/Dirty/
+session-outcome/fail-closed контракту (§§1-11 вище лишаються чинними без
+змін). Увесь код лишається в `BRAVO.Configurator.UI.psm1`/`.psd1` і
+`selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1` — інші `BRAVO.Configurator.*`
+модулі не торкались.
+
+### 12.1. Responsive layout
+
+Fixed-layout борг (`$form.Width=1150`/`Height=780`, `$rowPanel.Width=700`,
+абсолютні `Point(x,y)` у top/bottom toolbar-ах, `SplitterDistance=220/620`
+без урахування реального розміру) прибрано. Замінено на:
+
+- **Головна форма**: `TableLayoutPanel`/`FlowLayoutPanel` з
+  `Dock`/`AutoSize`/`WrapContents` для top-toolbar (2 рядки: пошук/
+  фільтр/пресет; креденшели) і bottom-панелі (статус | дії, `FlowLayoutPanel`
+  з `WrapContents=$true`).
+- **Рядок налаштування**: `TableLayoutPanel` 3 responsive-колонки
+  (38%/37%/25%: override+label | editor | status) замість фіксованих
+  `Width=700`/`Point(275,2)`/`Point(545,5)`. `AutoEllipsis` на
+  checkbox/status — довгі українські підписи не виштовхують сусідні
+  контролі за межі рядка; underlying Model-дані не обрізаються, лише
+  візуальний текст.
+- **Splitter-и**: `Panel1MinSize`/`Panel2MinSize` + чиста
+  `Get-BRAVOConfiguratorUIClampedSplitterDistance` (headless-тестована) —
+  `SplitterDistance` ніколи не призначається поза легальним діапазоном.
+  Реальний launch-крash (`SplitterDistance must be between Panel1MinSize
+  and Width - Panel2MinSize`), спричинений призначенням `Panel1MinSize`/
+  `Panel2MinSize` одразу після `New-Object SplitContainer` (до
+  Dock-розміщення, коли контрол ще має дефолтний малий розмір) — знайдено
+  й виправлено через реальний прогін `ci\acceptance\Test-BRAVOConfiguratorLaunch.ps1`
+  (headless self-test цього патерну принципово не ловить — той самий
+  клас розриву, що P1 `GetNewClosure()`-дефект, §11.6). MinSize тепер
+  встановлюється ПІСЛЯ `$form.Controls.Add($mainSplit)`, коли `ClientSize`
+  вже відповідає реальному стартовому розміру форми.
+- **Компактний режим**: `Get-BRAVOConfiguratorUILayoutMode` (чиста,
+  headless-тестована; поріг 1000px) визначає Wide/Compact; у Compact
+  `rightSplit.Orientation` перемикається з `Vertical` (Details праворуч)
+  на `Horizontal` (Details під Settings) — Option A з §13 задачі,
+  той самий `SplitContainer`, лише зміна орієнтації, без перебудови
+  контролів.
+
+### 12.2. Startup-розмір і DPI
+
+`Get-BRAVOConfiguratorUIStartupSize` (чиста функція) затискає стартовий
+розмір і головної форми, і Preview-діалогу до `Screen.WorkingArea` —
+ніколи не відкриває вікно більше за реальний робочий простір екрана;
+respectує практичний мінімум (1000×650 для головної форми) лише якщо
+робоча область це дозволяє. `AutoScaleMode=Dpi` — framework-рівень DPI-
+масштабування (.NET Framework/WinForms), сумісний з Windows PowerShell
+5.1. `Application.SetHighDpiMode`/PerMonitorV2-специфічний P/Invoke
+НЕ використано (недоступно чи недоцільно для цього рантайму — рішення
+свідоме, не недогляд).
+
+**DPI acceptance-матриця (100%/125%/150%) — NOT EXECUTED** у цій сесії
+(немає доступу до реального багатодисплейного/масштабованого Windows-
+хоста в середовищі розробки). Структурні/headless-тести (`LayoutMode`,
+`StartupSize`, `ClampedSplitterDistance`) виконано; реальна візуальна
+DPI-перевірка потребує окремого acceptance-кроку на реальній Windows-
+сесії з іншим масштабуванням.
+
+### 12.3. Keyboard, context help, tooltips, accessibility
+
+- `Ctrl+F` — фокус пошуку; `F1` — фокус Details, якщо обрано
+  налаштування, інакше `Get-BRAVOConfiguratorUIGeneralHelpText`; `F5`/`Esc`
+  викликають `PerformClick()` на існуючих `reloadButton`/`cancelButton` —
+  ТОЙ САМИЙ обробник, що й кнопка (dirty-discard confirmation не
+  обходиться жодним шляхом). Головна форма й далі НЕ має
+  `AcceptButton=Apply`.
+- Details-текст уніфіковано через чисту `Get-BRAVOConfiguratorUISettingHelpText`
+  (операторський зміст — Назва/Опис/Поточний стан/Default/Local
+  override/Effective/Effective source/Disabled reason — перед технічними
+  Path/Group/Section/Type/Advanced); той самий текст обслуговує і
+  Details-панель, і F1.
+- Один спільний `System.Windows.Forms.ToolTip` (не по одному на рядок)
+  для search/filter/preset/credential/action-кнопок і override-checkbox/
+  status-мітки в кожному рядку.
+- `AccessibleName`/`AccessibleDescription` на ключових контролах
+  (search/filter/category tree/settings area/details/action-кнопки/
+  credential-кнопки/override-checkbox/editor/status).
+- Фільтр `All/Changed/Active/Problems/Advanced` — backend Id незмінний;
+  `Get-BRAVOConfiguratorUIFilterOptions` додає українську
+  `DisplayMember`-проєкцію (Усі/Змінені/Активні/Проблеми/Розширені),
+  `ComboBox.ValueMember='Id'` — filtering і далі керується Id, не
+  відображуваним текстом.
+- Статус (`Помилки: N Попередження: N Інфо: N`) і статус-мітка рядка
+  (`EffectiveSource [*]` + tooltip з `DisabledReason`) лишаються
+  текстовими; колір — додатковий, не єдиний носій сенсу.
+
+### 12.4. Preview-діалог
+
+`Show-BRAVOConfiguratorUIPreviewDialog` тепер resizable
+(`MinimumSize`, стартовий розмір через ту саму `Get-BRAVOConfiguratorUIStartupSize`,
+затиснутий до `WorkingArea` власника — `Screen.FromControl($Owner)`,
+переданого явно з головної форми), `WordWrap=$false`+`ScrollBars=Both`
+для технічного diff-тексту (довгі шляхи лишаються інспектованими через
+горизонтальний скрол). `AcceptButton`/`CancelButton` і blocking-error
+gate на кнопці підтвердження — без змін семантики.
+
+### 12.5. Тести й регресія
+
+`selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1` доповнено headless-тестами
+для `Get-BRAVOConfiguratorUILayoutMode`/`-UIFilterOptions`/
+`-UISettingHelpText`/`-UIGeneralHelpText`/`-UIStartupSize`/
+`-UIClampedSplitterDistance` (breakpoint-межа, клампінг у нормальному й
+межовому випадку, WorkingArea-пріоритет над Min) + точкова статична
+регресія проти повторного внесення конкретних fixed-layout літералів
+(`$rowPanel.Width=700`, `$form.Width=1150`, `$form.Height=780`) —
+не блокує довільне використання `.Width` деінде.
+
+### 12.6. Візуальна/DPI/click-through перевірка — межі цієї сесії
+
+Реально виконано в цій сесії: headless self-test (усі
+`ConfiguratorUI`-перевірки, включно з новими P2-B), `PSScriptAnalyzer`
+(0 знахідок), і реальний `ci\acceptance\Test-BRAVOConfiguratorLaunch.ps1`
+(процес доходить до блокуючого `ShowDialog()` без винятку, 0 orphans) —
+саме цей крок і виявив реальний `SplitterDistance`-дефект вище.
+
+**NOT EXECUTED** у цій сесії: інтерактивний click-through (Tab-навігація,
+Boolean tri-state через реальний UI, invalid-input-повідомлення,
+Preview-resize, F1/Ctrl+F наживо), візуальна перевірка кирилиці/
+clipping/scrollbars, і DPI 100/125/150% матриця — вимагають реальної
+інтерактивної Windows-desktop-сесії з відповідним обладнанням/
+масштабуванням, недоступної в середовищі, де виконувалась ця робота.
+Ці кроки лишаються обов'язковим наступним acceptance-кроком перед
+рішенням про merge (§39-40 задачі P2-B: STOP після звіту, без merge).
