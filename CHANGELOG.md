@@ -1,5 +1,85 @@
 # Changelog
 
+## 5.2.3-dev.1 (fix/5.2.3-operation-aware-disk-space, у розробці)
+
+Operation-aware disk-space policy для `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`: усуває
+false-positive блокування, коли мало вільного місця на локальному Fixed-диску,
+який поточна операція фактично не використовує (типовий приклад: C: з
+runtime/логами при архівації на D:/E:).
+
+Base: `v5.2.2` (`15ce820`), гілка `fix/5.2.3-operation-aware-disk-space` ←
+`hotfix/5.2.3`.
+
+### Додано
+- **`modules/BRAVO.DiskSpace`** — новий канонічний shared classifier: розділяє
+  `Participates`/`RequiresAccess`/`RequiresFreeSpace` для кожного volume/шляху,
+  групує write-required entities за `CapacityKey` (не за окремим шляхом),
+  підтримує `RequirementGranularity` (`Entity`/`CapacityGroup`/`Unknown`) і
+  безпечний floor-fallback (`KnownRequiredLowerBoundGB`/`ResidualAvailableGB`)
+  для невідомої частини вимоги. `Blocks` монотонний у межах одного evaluation.
+  Використовується і Archive, і Maintenance — одна політика замість двох
+  незалежних реалізацій.
+- `BRAVO_ARCHIV`: `Resolve-BRAVOArchiveSpaceDecision` будує health-only sweep
+  усіх локальних Fixed-дисків + per-компонент SOURCE (не потребує вільного
+  місця)/ARCHIVE_DESTINATION (потребує, оцінка з
+  `Get-BRAVOArchiveEstimatedSpaceRequirement`, без змін) і передає це в
+  спільний класифікатор.
+- `BRAVO_MAINTENANCE`: `Invoke-BRAVOMaintenanceDiskSpaceCheck` замінює
+  глобальний прохід по всіх Fixed-дисках на health-only sweep +
+  єдину write-required ціль `ROOT_LIMS` (усі write-операції Maintenance —
+  ARC_DIR/TRACE_DIR/логи — похідні від цього дерева; жодна Maintenance-операція
+  сьогодні не має exact-оцінки вимоги, тому `RequirementGranularity=Unknown` і
+  чинний floor застосовується коректно лише до цього тому).
+
+### Змінено (навмисне посилення політики, не регресія)
+- **Below-floor relaxation для Archive прибрано.** У 5.2.1/5.2.2
+  `Merge-BRAVOArchiveSpaceCheckResults` (реальний production acceptance
+  2026-08-25) знижував фіксований поріг до WARNING, коли розрахункова оцінка
+  доводила достатність місця САМЕ для того диска. У 5.2.3 ця relaxation
+  вимкнена (`PeakSafeEstimate=false`): below-floor тепер БЛОКУЄ
+  (`BelowFloorEstimateNotPeakSafe`), навіть якщо оцінка достатня. Причина:
+  `Get-BRAVOArchiveEstimatedSpaceRequirement` не враховує вже наявні retained
+  generations (cleanup виконується ПІСЛЯ створення нової generation, тобто
+  пікове використання диска — це стара+нова generation одночасно) і тимчасовий
+  `.work`-файл під час створення архіву — оцінка не доведена peak-safe.
+  **Операційний вплив:** сервери, де фіксований поріг проходив саме завдяки
+  цій relaxation (приклад із production: ~19.4 GB вільно проти порогу 20 GB,
+  розрахункова потреба ~0.2 GB), після оновлення до 5.2.3 почнуть блокуватись
+  на цьому кроці. Перед оновленням перевірте `Maintenance.Limits.MinimumFreeSpaceGB`
+  для таких серверів — або підвищіть реальне вільне місце, або свідомо
+  знизьте поріг конфігураційно.
+- **`ExcludedDrives` більше не приховує operational-небезпеку required
+  volume.** До 5.2.3 диск у `Maintenance.Limits.ExcludedDrives` повністю
+  виключався з перевірки. Тепер виключення придушує лише health-only
+  попередження; якщо той самий диск реально потрібен поточній операції
+  (write-required destination чи ROOT_LIMS) і місця недостатньо — блокування
+  залишається (`Flags += ExclusionIgnoredForRequiredVolume`, `Reason` — реальна
+  причина). Якщо диск додано в `ExcludedDrives` саме для обходу цього типу
+  блокування — перевірте конфігурацію перед оновленням: з 5.2.3 такий обхід
+  більше не спрацює для required volume.
+
+### Відомі обмеження (зафіксовано свідомо, не приховано)
+- Maintenance моделює одну write-required ціль (`ROOT_LIMS`), а не окремі
+  ролі для кожної операції (`RestoreTarget`/`TemporaryProcessingVolume`
+  тощо) — жодна поточна Maintenance-операція не постачає exact-оцінку
+  вимоги, тому детальніша модель не дала б практичної переваги в цьому
+  релізі.
+- `RuntimeWriteUnavailable` (проба реальної write-спроможності) не додано —
+  відкладено до наступного циклу.
+- Archive: `-SyncBAZA`-потік (`Invoke-ManualBAZASFTPSynchronization`) і
+  SMB/SFTP-передача архівів не проходять через новий класифікатор у цьому
+  релізі (не торкались ними) — поведінка незмінна відносно 5.2.2.
+
+### Тести
+Новий: `selftest/BRAVO_SELF_TEST.DiskSpace.ps1` (S1-S20, класифікатор
+ізольовано), `selftest/BRAVO_SELF_TEST.ArchiveDiskSpace.ps1` (A1,A2,A4-A11,
+A14-A17,A19,A20,A24,A25 — реальний виклик-сайт Archive),
+`selftest/BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1` (M1,M2,M3,M4,M5,M7,M8,
+M10,M11 — реальний виклик-сайт Maintenance). 6 застарілих тестів
+`Merge-BRAVOArchiveSpaceCheckResults` замінені (не мовчки видалені) —
+диспозиція задокументована в `BRAVO_SELF_TEST.ps1` біля місця видалення.
+Повний `BRAVO_SELF_TEST.ps1`: 1532 PASS / 0 FAIL.
+
 ## 5.2.2 — 2026-08-31
 
 Stable promotion від прийнятого `5.2.2-rc.2` (нижче) — real-server acceptance
