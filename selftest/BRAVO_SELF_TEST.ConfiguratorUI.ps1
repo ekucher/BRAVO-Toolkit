@@ -244,3 +244,128 @@ Test-BRAVOCondition (
     'ConfiguratorUI static: жоден .GetNewClosure()-блок не викликає приватну функцію модуля напряму по імені (regression для P1-launch-crash)' `
     ("ParseErrors=$($configuratorUIParseErrors.Count) PrivateFns=$($configuratorUIPrivateFunctionNames.Count) " +
      "ClosureBlocks=$($configuratorUIClosureScriptBlocks.Count) Broken=$($configuratorUIBrokenClosureCalls -join '; ')")
+
+# =====================================================================
+# P2-B (docs/design/BRAVO_CONFIGURATOR_DESIGN.md §12): деtermіновані
+# headless-тести для чистих UX-helpers (breakpoint/filter labels/context
+# help/startup-size/splitter clamp) + статична регресія проти
+# повторного внесення fixed-layout боргу (§27 задачі). Жоден з цих
+# тестів не будує System.Windows.Forms.Form — та сама ізоляція, що й
+# решта фрагмента.
+# =====================================================================
+
+# ===== 11: Get-BRAVOConfiguratorUILayoutMode — детермінований breakpoint =====
+$configuratorUILayoutCompact = Get-BRAVOConfiguratorUILayoutMode -ClientWidth 800
+$configuratorUILayoutWide = Get-BRAVOConfiguratorUILayoutMode -ClientWidth 1200
+$configuratorUILayoutBoundaryBelow = Get-BRAVOConfiguratorUILayoutMode -ClientWidth 999
+$configuratorUILayoutBoundaryAt = Get-BRAVOConfiguratorUILayoutMode -ClientWidth 1000
+Test-BRAVOCondition (
+    $configuratorUILayoutCompact -eq 'Compact' -and $configuratorUILayoutWide -eq 'Wide' -and
+    $configuratorUILayoutBoundaryBelow -eq 'Compact' -and $configuratorUILayoutBoundaryAt -eq 'Wide'
+) `
+    'ConfiguratorUI P2-B LayoutMode: детермінований Wide/Compact breakpoint (800->Compact, 1200->Wide, межа 999/1000)' `
+    "800=$configuratorUILayoutCompact 1200=$configuratorUILayoutWide 999=$configuratorUILayoutBoundaryBelow 1000=$configuratorUILayoutBoundaryAt"
+
+# ===== 12: Get-BRAVOConfiguratorUIFilterOptions — канонічна українська відповідність (§21) =====
+$configuratorUIFilterOptions = @(Get-BRAVOConfiguratorUIFilterOptions)
+$configuratorUIExpectedFilterMap = [ordered]@{
+    All      = 'Усі'
+    Changed  = 'Змінені'
+    Active   = 'Активні'
+    Problems = 'Проблеми'
+    Advanced = 'Розширені'
+}
+$configuratorUIFilterMapMismatch = @($configuratorUIExpectedFilterMap.Keys | Where-Object {
+    $expectedId = $_
+    $actual = @($configuratorUIFilterOptions | Where-Object { $_.Id -eq $expectedId })
+    ($actual.Count -ne 1) -or ($actual[0].Label -ne $configuratorUIExpectedFilterMap[$expectedId])
+})
+Test-BRAVOCondition (
+    $configuratorUIFilterOptions.Count -eq $configuratorUIExpectedFilterMap.Count -and
+    $configuratorUIFilterMapMismatch.Count -eq 0
+) `
+    'ConfiguratorUI P2-B FilterOptions: усі 5 backend Id мають канонічний український Label, без розбіжностей' `
+    "Count=$($configuratorUIFilterOptions.Count) Mismatch=$($configuratorUIFilterMapMismatch -join ',')"
+
+# ===== 13: Get-BRAVOConfiguratorUISettingHelpText — операторський зміст перед технічним (§14) =====
+$configuratorUIHelpFixture = New-ConfiguratorUIFixtureSetting -Path 'fixture.Storage.Overridden' -Group 'Storage' -Section 'C' `
+    -Label 'BackupRoot Override' -Type 'Path' -DefaultValue 'C:\Default' -OverridePresent $true -OverrideValue 'D:\Override' `
+    -EffectiveValue 'D:\Override' -EffectiveSource 'Override'
+$configuratorUIHelpText = Get-BRAVOConfiguratorUISettingHelpText -Setting $configuratorUIHelpFixture
+$configuratorUINameIndex = $configuratorUIHelpText.IndexOf('Назва:')
+$configuratorUIStateIndex = $configuratorUIHelpText.IndexOf('Поточний стан:')
+$configuratorUIEffectiveIndex = $configuratorUIHelpText.IndexOf('Effective:')
+$configuratorUIPathIndex = $configuratorUIHelpText.IndexOf('Path:')
+Test-BRAVOCondition (
+    $configuratorUINameIndex -ge 0 -and $configuratorUIStateIndex -gt $configuratorUINameIndex -and
+    $configuratorUIEffectiveIndex -gt $configuratorUIStateIndex -and $configuratorUIPathIndex -gt $configuratorUIEffectiveIndex -and
+    $configuratorUIHelpText -match 'Локальний override активний' -and
+    $configuratorUIHelpText -notmatch 'password' -and $configuratorUIHelpText -notmatch 'secret'
+) `
+    'ConfiguratorUI P2-B SettingHelpText: операторський зміст (Назва/Поточний стан/Effective) передує технічним даним (Path), override-стан коректний, без secret-слів' `
+    "NameIdx=$configuratorUINameIndex StateIdx=$configuratorUIStateIndex EffectiveIdx=$configuratorUIEffectiveIndex PathIdx=$configuratorUIPathIndex"
+
+$configuratorUIHelpFixtureDefault = New-ConfiguratorUIFixtureSetting -Path 'fixture.Storage.Default' -Type 'String' -DefaultValue 'x' -EffectiveValue 'x'
+$configuratorUIHelpTextDefault = Get-BRAVOConfiguratorUISettingHelpText -Setting $configuratorUIHelpFixtureDefault
+Test-BRAVOCondition ($configuratorUIHelpTextDefault -match 'Використовується значення за замовчуванням') `
+    'ConfiguratorUI P2-B SettingHelpText: без override "Поточний стан" явно каже "за замовчуванням" (Default != False з тексту так само, як з семантики)' `
+    "Text=$configuratorUIHelpTextDefault"
+
+# ===== 14: Get-BRAVOConfiguratorUIGeneralHelpText — статичний, без веб/зовнішніх посилань (§15) =====
+$configuratorUIGeneralHelp = Get-BRAVOConfiguratorUIGeneralHelpText
+Test-BRAVOCondition (
+    (-not [string]::IsNullOrWhiteSpace($configuratorUIGeneralHelp)) -and
+    $configuratorUIGeneralHelp -match 'Ctrl\+F' -and $configuratorUIGeneralHelp -match 'F1' -and
+    $configuratorUIGeneralHelp -notmatch 'http://' -and $configuratorUIGeneralHelp -notmatch 'https://'
+) `
+    'ConfiguratorUI P2-B GeneralHelpText: непорожній, документує Ctrl+F/F1, без зовнішніх URL (немає web-браузера довідки)' `
+    "Length=$($configuratorUIGeneralHelp.Length)"
+
+# ===== 15: Get-BRAVOConfiguratorUIStartupSize — ніколи не більше WorkingArea, Min лише коли є місце (§5/§24) =====
+$configuratorUIStartupSmallScreen = Get-BRAVOConfiguratorUIStartupSize -WorkingAreaWidth 1024 -WorkingAreaHeight 768
+$configuratorUIStartupHugeScreen = Get-BRAVOConfiguratorUIStartupSize -WorkingAreaWidth 3840 -WorkingAreaHeight 2160
+$configuratorUIStartupTinyScreen = Get-BRAVOConfiguratorUIStartupSize -WorkingAreaWidth 800 -WorkingAreaHeight 600
+Test-BRAVOCondition (
+    $configuratorUIStartupSmallScreen.Width -eq 1024 -and $configuratorUIStartupSmallScreen.Height -eq 768 -and
+    $configuratorUIStartupHugeScreen.Width -eq 1150 -and $configuratorUIStartupHugeScreen.Height -eq 780 -and
+    $configuratorUIStartupTinyScreen.Width -le 800 -and $configuratorUIStartupTinyScreen.Height -le 600
+) `
+    'ConfiguratorUI P2-B StartupSize: 1024x768 лишається повністю usable, великий екран не розтягує понад Preferred, замалий екран НІКОЛИ не перевищується (Min поступається WorkingArea)' `
+    ("Small=$($configuratorUIStartupSmallScreen.Width)x$($configuratorUIStartupSmallScreen.Height) " +
+     "Huge=$($configuratorUIStartupHugeScreen.Width)x$($configuratorUIStartupHugeScreen.Height) " +
+     "Tiny=$($configuratorUIStartupTinyScreen.Width)x$($configuratorUIStartupTinyScreen.Height)")
+
+# ===== 16: Get-BRAVOConfiguratorUIClampedSplitterDistance — легальний діапазон, без винятків (§12/§13) =====
+$configuratorUISplitterNormal = Get-BRAVOConfiguratorUIClampedSplitterDistance -AvailableSize 1000 -Panel1MinSize 150 -Panel2MinSize 400 -DesiredDistance 220
+$configuratorUISplitterTooSmallContainer = Get-BRAVOConfiguratorUIClampedSplitterDistance -AvailableSize 300 -Panel1MinSize 150 -Panel2MinSize 400 -DesiredDistance 220
+$configuratorUISplitterDesiredTooBig = Get-BRAVOConfiguratorUIClampedSplitterDistance -AvailableSize 1000 -Panel1MinSize 150 -Panel2MinSize 400 -DesiredDistance 950
+$configuratorUISplitterDesiredTooSmall = Get-BRAVOConfiguratorUIClampedSplitterDistance -AvailableSize 1000 -Panel1MinSize 150 -Panel2MinSize 400 -DesiredDistance 10
+Test-BRAVOCondition (
+    $configuratorUISplitterNormal -eq 220 -and
+    $configuratorUISplitterTooSmallContainer -eq 150 -and
+    $configuratorUISplitterDesiredTooBig -eq 600 -and
+    $configuratorUISplitterDesiredTooSmall -eq 150
+) `
+    'ConfiguratorUI P2-B ClampedSplitterDistance: у межах діапазону лишається без змін, поза межами затискається, замалий контейнер повертає Panel1MinSize (не кидає ArgumentOutOfRangeException)' `
+    "Normal=$configuratorUISplitterNormal TooSmallContainer=$configuratorUISplitterTooSmallContainer TooBig=$configuratorUISplitterDesiredTooBig TooSmall=$configuratorUISplitterDesiredTooSmall"
+
+# ===== 17: Статична регресія (§27 задачі P2-B) — попередній fixed-layout
+# борг (rowPanel.Width=700, form.Width=1150, form.Height=780 як
+# ЄДИНО МОЖЛИВІ значення) не повертається. Навмисно ТОЧКОВО (не блокує
+# кожне присвоєння .Width/.Height у файлі — лише конкретні знову-внесені
+# магічні константи з попереднього fixed-layout контракту), як вимагає
+# задача ("Do not build a brittle blanket ban against every .Width
+# assignment"). 1150x780 і далі використовуються як Preferred* значення
+# всередині Get-BRAVOConfiguratorUIStartupSize (де вони — верхня стеля,
+# не хардкод присвоєння формі) — регресія перевіряє саме РЯДКОВИЙ
+# патерн прямого присвоєння контролу, який P2-B прибрав.
+$configuratorUIRawSource = Get-Content -LiteralPath $configuratorUIModulePath -Raw
+$configuratorUIFixedLayoutDebtPatterns = @(
+    '\$rowPanel\.Width\s*=\s*700\b'
+    '\$form\.Width\s*=\s*1150\b'
+    '\$form\.Height\s*=\s*780\b'
+)
+$configuratorUIReintroducedDebt = @($configuratorUIFixedLayoutDebtPatterns | Where-Object { $configuratorUIRawSource -match $_ })
+Test-BRAVOCondition ($configuratorUIReintroducedDebt.Count -eq 0) `
+    'ConfiguratorUI P2-B static regression: попередній fixed-layout борг (rowPanel.Width=700, form.Width=1150, form.Height=780 як пряме присвоєння) не реінтродукований' `
+    "Reintroduced=$($configuratorUIReintroducedDebt -join '; ')"
