@@ -724,6 +724,83 @@ Test-BRAVOCondition (
     'Configurator Presets: Current — no-op (жодне override-значення не змінюється)' `
     "Count=$($configuratorPresetCurrent.Count)/$($configuratorPresetBaseModel.Count) Console=$($configuratorPresetCurrentConsole[0].OverrideValue) SftpOverridePresent=$($configuratorPresetCurrentSftp[0].OverridePresent)"
 
+# ===== feat/bravo-configurator-preset-baza-local: BAZA_*_LOCAL/BAZA_*_SFTP
+# preset-контракт (§ user-approved manual acceptance follow-up, item 13) =====
+
+# AC2: LocalOnly -> BAZA_APP_LOCAL=true, BAZA_WWW_LOCAL=true ("усі
+# локальні опції увімкнено", коли SFTP/SMB глобально вимкнені).
+$configuratorPresetLocalOnlyBazaAppLocal = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_LOCAL' })
+$configuratorPresetLocalOnlyBazaWwwLocal = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_LOCAL' })
+Test-BRAVOCondition (
+    $configuratorPresetLocalOnlyBazaAppLocal.Count -eq 1 -and [bool]$configuratorPresetLocalOnlyBazaAppLocal[0].OverrideValue -eq $true -and
+    $configuratorPresetLocalOnlyBazaWwwLocal.Count -eq 1 -and [bool]$configuratorPresetLocalOnlyBazaWwwLocal[0].OverrideValue -eq $true
+) `
+    'Configurator Presets: LocalOnly -> BAZA_APP_LOCAL=true, BAZA_WWW_LOCAL=true' `
+    "BAZA_APP_LOCAL=$($configuratorPresetLocalOnlyBazaAppLocal[0].OverrideValue) BAZA_WWW_LOCAL=$($configuratorPresetLocalOnlyBazaWwwLocal[0].OverrideValue)"
+
+# AC3: LocalOnly НЕ виставляє override для BAZA_*_SFTP (master і так
+# вимкнений — child raw цих двох шляхів лишається незмінним/відсутнім).
+$configuratorPresetLocalOnlyBazaAppSftp = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_SFTP' })
+$configuratorPresetLocalOnlyBazaWwwSftp = @($configuratorPresetLocalOnly | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_SFTP' })
+Test-BRAVOCondition (
+    -not $configuratorPresetLocalOnlyBazaAppSftp[0].OverridePresent -and
+    -not $configuratorPresetLocalOnlyBazaWwwSftp[0].OverridePresent
+) `
+    'Configurator Presets: LocalOnly НЕ виставляє override для BAZA_APP_SFTP/BAZA_WWW_SFTP' `
+    "AppSftpOverridePresent=$($configuratorPresetLocalOnlyBazaAppSftp[0].OverridePresent) WwwSftpOverridePresent=$($configuratorPresetLocalOnlyBazaWwwSftp[0].OverridePresent)"
+
+# AC4: LocalPlusSMB регресія (критичний негативний тест) — застосування
+# LocalPlusSMB до моделі з ПОПЕРЕДНЬО виставленими BAZA-override НЕ
+# змінює їх. Немає BAZA-over-SMB transport у кодовій базі — вимкнення
+# BAZA_*_LOCAL тут осиротило б BAZA без жодного каналу синхронізації.
+$configuratorPresetSmbBazaBase = Set-BRAVOConfiguratorOverride -Model $configuratorPresetBaseModel -Path 'componentSettings.Synchronization.BAZA_APP_LOCAL' -Value $true
+$configuratorPresetSmbBazaBase = Set-BRAVOConfiguratorOverride -Model $configuratorPresetSmbBazaBase -Path 'componentSettings.Synchronization.BAZA_WWW_SFTP' -Value $true
+$configuratorPresetLocalPlusSmb = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetSmbBazaBase -PresetName 'LocalPlusSMB'
+$configuratorPresetLocalPlusSmbBazaAppLocal = @($configuratorPresetLocalPlusSmb | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_LOCAL' })
+$configuratorPresetLocalPlusSmbBazaWwwSftp = @($configuratorPresetLocalPlusSmb | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_SFTP' })
+Test-BRAVOCondition (
+    [bool]$configuratorPresetLocalPlusSmbBazaAppLocal[0].OverrideValue -eq $true -and
+    [bool]$configuratorPresetLocalPlusSmbBazaWwwSftp[0].OverrideValue -eq $true
+) `
+    'Configurator Presets: LocalPlusSMB НЕ змінює раніше виставлені BAZA-overrides (немає BAZA-over-SMB каналу)' `
+    "BAZA_APP_LOCAL=$($configuratorPresetLocalPlusSmbBazaAppLocal[0].OverrideValue) BAZA_WWW_SFTP=$($configuratorPresetLocalPlusSmbBazaWwwSftp[0].OverrideValue)"
+
+# AC5: LocalPlusSFTP / LocalPlusSFTPAndSMB -> BAZA_APP_LOCAL=false,
+# BAZA_APP_SFTP=true, BAZA_WWW_LOCAL=false, BAZA_WWW_SFTP=true.
+# BAZA_WWW_SFTP форсується true РАЗОМ з BAZA_WWW_LOCAL=false навмисно
+# (schema default BAZA_WWW_SFTP=$false, "вмикайте свідомо" — без цього
+# форсування WWW-компонент лишився б без жодного каналу синхронізації).
+foreach ($bazaPresetName in @('LocalPlusSFTP', 'LocalPlusSFTPAndSMB')) {
+    $configuratorPresetBazaResult = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetBaseModel -PresetName $bazaPresetName
+    $bazaAppLocal = @($configuratorPresetBazaResult | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_LOCAL' })
+    $bazaAppSftp  = @($configuratorPresetBazaResult | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_SFTP' })
+    $bazaWwwLocal = @($configuratorPresetBazaResult | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_LOCAL' })
+    $bazaWwwSftp  = @($configuratorPresetBazaResult | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_SFTP' })
+    Test-BRAVOCondition (
+        [bool]$bazaAppLocal[0].OverrideValue -eq $false -and [bool]$bazaAppSftp[0].OverrideValue -eq $true -and
+        [bool]$bazaWwwLocal[0].OverrideValue -eq $false -and [bool]$bazaWwwSftp[0].OverrideValue -eq $true
+    ) `
+        "Configurator Presets: $bazaPresetName -> BAZA_APP_LOCAL=false, BAZA_APP_SFTP=true, BAZA_WWW_LOCAL=false, BAZA_WWW_SFTP=true" `
+        "AppLocal=$($bazaAppLocal[0].OverrideValue) AppSftp=$($bazaAppSftp[0].OverrideValue) WwwLocal=$($bazaWwwLocal[0].OverrideValue) WwwSftp=$($bazaWwwSftp[0].OverrideValue)"
+}
+
+# AC6: ідемпотентність — той самий патерн, що тест W, тепер для BAZA-шляхів.
+$configuratorPresetLocalOnlyTwiceBaza = Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetLocalOnly -PresetName 'LocalOnly'
+$configuratorPresetLocalOnlyTwiceBazaAppLocal = @($configuratorPresetLocalOnlyTwiceBaza | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_APP_LOCAL' })
+$configuratorPresetLocalOnlyTwiceBazaWwwLocal = @($configuratorPresetLocalOnlyTwiceBaza | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_LOCAL' })
+Test-BRAVOCondition (
+    [bool]$configuratorPresetLocalOnlyTwiceBazaAppLocal[0].OverrideValue -eq $true -and
+    [bool]$configuratorPresetLocalOnlyTwiceBazaWwwLocal[0].OverrideValue -eq $true
+) `
+    'Configurator Presets: повторне застосування LocalOnly — ідемпотентне і для BAZA_*_LOCAL' `
+    "BAZA_APP_LOCAL=$($configuratorPresetLocalOnlyTwiceBazaAppLocal[0].OverrideValue) BAZA_WWW_LOCAL=$($configuratorPresetLocalOnlyTwiceBazaWwwLocal[0].OverrideValue)"
+
+$configuratorPresetSftpBothTwiceBaza = Invoke-BRAVOConfiguratorPreset -Model (Invoke-BRAVOConfiguratorPreset -Model $configuratorPresetBaseModel -PresetName 'LocalPlusSFTPAndSMB') -PresetName 'LocalPlusSFTPAndSMB'
+$configuratorPresetSftpBothTwiceBazaWwwSftp = @($configuratorPresetSftpBothTwiceBaza | Where-Object { $_.Path -eq 'componentSettings.Synchronization.BAZA_WWW_SFTP' })
+Test-BRAVOCondition ([bool]$configuratorPresetSftpBothTwiceBazaWwwSftp[0].OverrideValue -eq $true) `
+    'Configurator Presets: повторне застосування LocalPlusSFTPAndSMB — ідемпотентне для BAZA_WWW_SFTP' `
+    "BAZA_WWW_SFTP=$($configuratorPresetSftpBothTwiceBazaWwwSftp[0].OverrideValue)"
+
 # ===== P1.8 Preview: семантичний diff =====
 
 $configuratorPreviewBefore = Update-BRAVOConfiguratorEffective -Model $configuratorPresetBaseModel -RuntimeRoot $configuratorFixtureRuntimeRoot
@@ -731,10 +808,16 @@ $configuratorPresetForPreview = Invoke-BRAVOConfiguratorPreset -Model $configura
 $configuratorPreviewAfter = Update-BRAVOConfiguratorEffective -Model $configuratorPresetForPreview -RuntimeRoot $configuratorFixtureRuntimeRoot
 $configuratorPreviewResult = Get-BRAVOConfiguratorPreview -ModelBefore $configuratorPreviewBefore -ModelAfter $configuratorPreviewAfter
 
-# Z: Raw diff містить рівно 2 зміни (SFTP.Enabled, SMB.Enabled).
+# Z: Raw diff містить рівно 4 зміни для LocalOnly (2 master-switch +
+# BAZA_APP_LOCAL/BAZA_WWW_LOCAL — feat/bravo-configurator-preset-baza-local).
 $configuratorPreviewRawPaths = @($configuratorPreviewResult.RawChanges | ForEach-Object { $_.Path } | Sort-Object)
-Test-BRAVOCondition (@(Compare-Object $configuratorPreviewRawPaths @('componentSettings.SFTP.Enabled', 'componentSettings.SMB.Enabled')).Count -eq 0) `
-    'Configurator Preview: Raw diff = рівно 2 master-switch зміни' `
+Test-BRAVOCondition (@(Compare-Object $configuratorPreviewRawPaths @(
+    'componentSettings.SFTP.Enabled',
+    'componentSettings.SMB.Enabled',
+    'componentSettings.Synchronization.BAZA_APP_LOCAL',
+    'componentSettings.Synchronization.BAZA_WWW_LOCAL'
+)).Count -eq 0) `
+    'Configurator Preview: Raw diff = рівно 4 зміни для LocalOnly (2 master-switch + 2 BAZA_*_LOCAL)' `
     "RawChanges=$($configuratorPreviewRawPaths -join ',')"
 
 # AA: Effective diff НЕ порожній (SFTP/SMB вимкнення реально змінює
