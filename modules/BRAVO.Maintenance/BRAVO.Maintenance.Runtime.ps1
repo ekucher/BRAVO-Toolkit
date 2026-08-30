@@ -37,7 +37,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
 # проти другої власної реалізації; нейтральний власник SFTP-примітивів —
 # тема окремого рефактора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.DiskSpace')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -5846,34 +5846,94 @@ function Remove-OldRestoreArchives {
 }
 
 # ===== ФУНКЦІЯ ПЕРЕВІРКИ ВІЛЬНОГО МІСЦЯ =====
-function Check-FreeSpace {
+function Get-BRAVOMaintenanceDiskSpaceEntities {
+    # Будує per-entity вхід для Invoke-BRAVODiskSpaceClassifier (заміна
+    # колишнього Check-FreeSpace, fix/5.2.3-operation-aware-disk-space):
+    #   - health-only sweep усіх локальних Fixed-дисків (§11 — health
+    #     monitoring не прибирається, RequiresFreeSpace=false);
+    #   - $ROOT_LIMS як єдиний write-required MaintenanceWorkingVolume.
+    #     Phase 0 characterization (BRAVO_5_2_2_DISK_SPACE_TASK_FINAL.md
+    #     §5.3) підтвердила: ARC_DIR/TRACE_DIR/LOG_DIR/EXCHANGE_LOG_DIR/
+    #     APACHE_DAILY_LOG_DIR/BRAVOWEB_APP_DAILY_LOG_DIR — усі похідні
+    #     від дерева ROOT_LIMS, і жодна поточна Maintenance-операція не
+    #     надає exact/verified розрахунок вимоги (на відміну від Archive,
+    #     де є Get-BRAVOArchiveEstimatedSpaceRequirement). Тому
+    #     RequirementGranularity='Unknown' — чесне відображення поточного
+    #     стану, не евристична вигадка; звужується до
+    #     KnownRequiredLowerBoundGB=0/ResidualAvailableGB=AvailableGB, тобто
+    #     legacy floor fallback (§45), АЛЕ коректно застосований лише до
+    #     тому ROOT_LIMS, а не до КОЖНОГО Fixed-диска, як робив
+    #     Check-FreeSpace у 5.2.1 — саме це усуває false-positive blocking
+    #     для непов'язаних дисків (§1), не послаблюючи захист самого
+    #     робочого тому.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$RootLimsPath,
+        [Parameter(Mandatory = $true)][double]$MinimumFreeSpaceGB,
+        [object[]]$Drives
+    )
+
+    $entitySpecs = New-Object System.Collections.Generic.List[object]
+
+    $usingInjectedDrives = $PSBoundParameters.ContainsKey('Drives')
+    $healthDrives = @(if ($usingInjectedDrives) {
+        $Drives | Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed }
+    } else {
+        [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed }
+    })
+    foreach ($driveInfo in $healthDrives) {
+        $driveName = if ($usingInjectedDrives) {
+            ([string]$driveInfo.Drive).TrimEnd('\').ToUpperInvariant()
+        } else {
+            ([string]$driveInfo.Name).TrimEnd('\').ToUpperInvariant()
+        }
+        [void]$entitySpecs.Add([pscustomobject]@{
+            DisplayPath = "$driveName\"
+            Roles = @('HealthOnly')
+            RequiresAccess = $false
+            RequiresFreeSpace = $false
+            MinimumFreeSpaceGB = $MinimumFreeSpaceGB
+        })
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($RootLimsPath)) {
+        [void]$entitySpecs.Add([pscustomobject]@{
+            DisplayPath = $RootLimsPath
+            Roles = @('MaintenanceWorkingVolume')
+            RequiresAccess = $true
+            RequiresFreeSpace = $true
+            RequirementGranularity = 'Unknown'
+        })
+    }
+
+    return $entitySpecs.ToArray()
+}
+
+function Invoke-BRAVOMaintenanceDiskSpaceCheck {
+    # Замінює Check-FreeSpace (5.2.1) — видалено в 5.2.3 разом з переходом
+    # на спільний BRAVO.DiskSpace-класифікатор
+    # (fix/5.2.3-operation-aware-disk-space). Той самий boolean-контракт
+    # виклик-сайту: $true = продовжувати (успіх або non-blocking WARNING),
+    # $false = критична відмова ($script:criticalErrorOccurred=$true,
+    # той самий generic exit 60 MaintenanceFailed — новий exit code НЕ
+    # вводиться, §56.1).
+    [CmdletBinding()]
     param(
         [string]$ROOT_LIMS,
-        [string[]]$ExcludedDrives = @()
+        [string[]]$ExcludedDrives = @(),
+        [object[]]$Drives
     )
-    
+
     Write-Log "Перевірка вільного місця на всіх локальних дисках..." -Level "DEBUG"
-    
+
     try {
-        if (-not (Test-Path $ROOT_LIMS)) {
-            $errorMsg = "Шлях $ROOT_LIMS не існує або недоступний"
-            Write-Log "ПОМИЛКА: $errorMsg" -Level "ERROR"
-            # В режимі "none" не відправляємо повідомлення
-            if ($script:SlackMode -ne "none") {
-                Send-SlackAlert -Message $errorMsg -IsCritical
-            }
-            $script:criticalErrorOccurred = $true
-            return $false
-        }
-
-        $localDrives = @(
-            [System.IO.DriveInfo]::GetDrives() |
-                Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed } |
-                Sort-Object -Property Name
-        )
-
-        if ($localDrives.Count -eq 0) {
-            $errorMsg = "Локальні диски типу Fixed не знайдено"
+        # M10: активна write-heavy Maintenance-операція (Maintenance
+        # завжди потенційно пише під ROOT_LIMS — ARC_DIR/LOG_DIR/трасування),
+        # але цільовий том визначити не вдалося (порожній/невизначений
+        # ROOT_LIMS) => fail-closed BLOCK, не мовчазний ALLOW і не вгаданий
+        # диск.
+        if ([string]::IsNullOrWhiteSpace($ROOT_LIMS)) {
+            $errorMsg = "MaintenanceTargetUndetermined: ROOT_LIMS не визначено, цільовий том для write-heavy операції встановити неможливо"
             Write-Log "ПОМИЛКА: $errorMsg" -Level "ERROR"
             if ($script:SlackMode -ne "none") {
                 Send-SlackAlert -Message $errorMsg -IsCritical
@@ -5882,61 +5942,48 @@ function Check-FreeSpace {
             return $false
         }
 
-        $checkedDriveCount = 0
-        $driveStatus = @()
-        $spaceProblems = @()
-        $minimumFreeSpaceBytes = $MIN_FREE_SPACE * 1GB
+        $entityParams = @{ RootLimsPath = $ROOT_LIMS; MinimumFreeSpaceGB = $MIN_FREE_SPACE }
+        if ($PSBoundParameters.ContainsKey('Drives')) { $entityParams.Drives = $Drives }
+        $entitySpecs = Get-BRAVOMaintenanceDiskSpaceEntities @entityParams
 
-        foreach ($driveInfo in $localDrives) {
-            $driveName = $driveInfo.Name.TrimEnd('\').ToUpperInvariant()
+        $classifierParams = @{
+            EntitySpecs = $entitySpecs
+            MinimumFreeSpaceGB = $MIN_FREE_SPACE
+            ExcludedDrives = $ExcludedDrives
+            RequirementPolicy = 'MaintenanceExactOnly'
+        }
+        if ($PSBoundParameters.ContainsKey('Drives')) { $classifierParams.Drives = $Drives }
+        $classified = Invoke-BRAVODiskSpaceClassifier @classifierParams
+        Write-BRAVODiskSpaceDecisionLog -Results $classified.Results -Logger { param($line) Write-Log $line -Level 'INFO' }
 
-            if ($ExcludedDrives -contains $driveName) {
-                Write-Log "Диск ${driveName} виключено з перевірки вільного місця" -Level "INFO"
-                continue
-            }
-
-            $checkedDriveCount++
-
-            if (-not $driveInfo.IsReady) {
-                $problemText = "диск $driveName не готовий або недоступний"
-                $spaceProblems += $problemText
-                Write-Log $problemText -Level "ERROR"
-                continue
-            }
-
-            $freeSpaceGB = [math]::Round($driveInfo.AvailableFreeSpace / 1GB, 2)
-            $totalSpaceGB = [math]::Round($driveInfo.TotalSize / 1GB, 2)
-            $driveStatus += "${driveName} ${freeSpaceGB} GB з ${totalSpaceGB} GB"
-
-            Write-Log "Диск ${driveName}: доступно ${freeSpaceGB} GB з ${totalSpaceGB} GB (потрібно мінімум: ${MIN_FREE_SPACE} GB)" -Level "INFO"
-
-            if ($driveInfo.AvailableFreeSpace -lt $minimumFreeSpaceBytes) {
-                $spaceProblems += "диск ${driveName}: залишилось ${freeSpaceGB} GB, потрібно мінімум ${MIN_FREE_SPACE} GB"
+        foreach ($result in $classified.Results) {
+            if ($result.Roles -contains 'HealthOnly' -and $result.CapacityState -eq 'Known') {
+                Write-Log (
+                    "Диск $($result.Drive): доступно $($result.AvailableGB) GB з $($result.TotalGB) GB " +
+                    "(потрібно мінімум: $MIN_FREE_SPACE GB)"
+                ) -Level 'INFO'
             }
         }
-
-        if ($checkedDriveCount -eq 0) {
-            Write-Log "Усі локальні диски виключено з перевірки вільного місця" -Level "WARNING"
-            return $true
+        foreach ($warningText in @($classified.Warnings)) {
+            Write-Log $warningText -Level 'WARNING'
         }
 
-        if ($spaceProblems.Count -gt 0) {
-            $errorMsg = "Недостатньо вільного місця або не вдалося перевірити локальні диски: $($spaceProblems -join '; ')"
+        if (-not $classified.Success) {
+            $errorMsg = "Недостатньо вільного місця або не вдалося перевірити необхідний том: $(@($classified.Problems) -join '; ')"
             Write-Log "ПОМИЛКА: $errorMsg" -Level "ERROR"
-
             if ($script:SlackMode -ne "none") {
                 Send-SlackAlert -Message $errorMsg -IsCritical
             }
-
             $script:criticalErrorOccurred = $true
             return $false
         }
 
         # Зведення по дисках потрапляє у фінальний звіт через
-        # $script:freeSpaceSummary — окреме інформаційне повідомлення тут
-        # ішло в мертвий буфер і ніколи не доставлялось (5.2.1: буфер
-        # видалено разом із викликом).
-        $script:freeSpaceSummary = @($driveStatus)
+        # $script:freeSpaceSummary — той самий текстовий формат, що 5.2.1,
+        # щоб не міняти виклик-сайти цієї змінної нижче за течією.
+        $script:freeSpaceSummary = @($classified.Results | Where-Object { $_.Roles -contains 'HealthOnly' -and $_.CapacityState -eq 'Known' } | ForEach-Object {
+            "$($_.Drive) $($_.AvailableGB) GB з $($_.TotalGB) GB"
+        })
 
         return $true
     }
@@ -7014,7 +7061,7 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 Write-Log -Message "==="
 Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="
 Write-BRAVOProgressPhase -Phase 'Перевірка вільного місця' -PercentComplete 5
-$spaceCheckResult = Check-FreeSpace -ROOT_LIMS $ROOT_LIMS -ExcludedDrives $FREE_SPACE_EXCLUDED_DRIVES
+$spaceCheckResult = Invoke-BRAVOMaintenanceDiskSpaceCheck -ROOT_LIMS $ROOT_LIMS -ExcludedDrives $FREE_SPACE_EXCLUDED_DRIVES
 
 # Перевірка критичних помилок після перевірки місця
 if (-not $spaceCheckResult) {

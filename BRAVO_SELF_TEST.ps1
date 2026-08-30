@@ -15633,6 +15633,9 @@ function Write-BRAVOLog {
     # (Resolve-BRAVOArchiveSpaceDecision) — на відміну від DiskSpace.ps1
     # вище, що тестує сам shared classifier ізольовано.
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ArchiveDiskSpace.ps1')
+    # MaintenanceDiskSpace: M1-M11, реальний виклик-сайт BRAVO_MAINTENANCE
+    # (Invoke-BRAVOMaintenanceDiskSpaceCheck).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1')
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
     Write-Host "[FAIL] Fatal: $($_.Exception.Message)" -ForegroundColor Red
