@@ -19,6 +19,29 @@
   зовнішнього запиту) — вимикає `PublicIPLookupEnabled = $false` явно в
   `BRAVO.local.config`.
 
+- Додано `BRAVO_CONFIGURATOR.ps1` — інтерактивний GUI-редактор
+  `BRAVO.local.config` (`modules/BRAVO.Configurator`: Schema/Model/Effective/
+  Validation/Persistence/Presets/Credentials/Preview/UI). Schema-driven форма
+  з усіма 138 override-ключами (1:1 з `BRAVO.local.config.example`),
+  обчислення ефективної конфігурації через ізольований child-процес,
+  атомарне застосування (timestamped+GUID backup, hash-verify, автоматичний
+  rollback при провалі верифікації), responsive/DPI-safe WinForms UI з
+  keyboard-навігацією. Пройшов цикл P0 (backend) → P1 (UI/Presets/
+  Credentials/Preview) → P2-A (reliability/UX correctness) → P2-B
+  (responsive/DPI/accessibility) з незалежними рев'ю на кожному етапі
+  (`docs/design/BRAVO_CONFIGURATOR_DESIGN.md`). Раніше був відсутній у
+  README.md/CHANGELOG.md, хоча код і self-test-покриття (1000+483 рядки)
+  вже існували — цей запис і оновлення README.md закривають цю прогалину.
+  `BRAVO.config` (canonical-дефолти) редагується, як і раніше, вручну.
+
+- Регресійний тест `Scheduler/AclRuleAppliesToFilesAndFolders` перероблено з
+  суто in-memory перевірки (`Get-Acl`+`AddAccessRule`, ніколи не викликала
+  `Set-Acl`) на реальний функціональний проб, що застосовує from-scratch
+  `DirectorySecurity`/`FileSecurity`-патерн `Set-BRAVOProtectedRuntimeAcl`
+  через `Set-Acl` на тимчасовий каталог+файл і звіряє результат через
+  `Get-Acl`. Попередня версія тесту проходила навіть тоді, коли hardening
+  ACL падав на бойовому сервері (code-review 2026-08-31).
+
 > Примітка: розділи 5.2.2-* нижче перенесено з `hotfix/5.2.2` (гілка, відгалужена від релізу v5.2.1) під час інтеграції у `developer`; вони стоять вище за датою запису, хоча `developer` вже пройшов через цикл 5.3.0 — функціонал 5.2.2 тепер частина поточної лінії розробки.
 
 ## 5.2.2 — 2026-08-31

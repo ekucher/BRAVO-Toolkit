@@ -28,6 +28,7 @@
 | Перевірити реєстрацію завдань без UAC | `.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly` |
 | Перевірити завдання та доступ від `SYSTEM` | `.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess` |
 | Оновити лише параметри установи | `.\BRAVO_SETUP.ps1 -Action Credentials -CredentialComponent Institution` |
+| Змінити налаштування `BRAVO.config` через GUI | `.\BRAVO_CONFIGURATOR.ps1` |
 | Запустити архівацію вручну | `.\BRAVO_ARCHIV.ps1 -NoPause` |
 | Запустити обслуговування вручну | `.\BRAVO_MAINTENANCE.ps1` |
 | Запустити health-check вручну | `.\BRAVO_HEALTH.ps1` |
@@ -228,6 +229,14 @@ $global:pathSettings = @{
 
 `BRAVO.config` є PowerShell-конфігурацією, тому зберігайте його кодування і
 синтаксис. Паролі, логіни та webhook URL у файл не записуються.
+
+> Замість ручного редагування можна скористатися `.\BRAVO_CONFIGURATOR.ps1` —
+> інтерактивним GUI поверх `BRAVO.local.config` (не `BRAVO.config`): schema-
+> driven форма з усіма 138 override-ключами, presets, керуванням Credential
+> Manager, попереднім переглядом ефективної конфігурації і атомарним
+> застосуванням (backup + перевірка хешу + автоматичний rollback при
+> помилці). `BRAVO.config` лишається canonical-дефолтами й редагується
+> вручну, як і раніше.
 
 Перед першим запуском перевірте такі секції:
 
@@ -1246,6 +1255,7 @@ health > лише попередження. Код `90` має найвищий 
 | `BRAVO_ARCHIV.ps1` | production-архівація |
 | `BRAVO_MAINTENANCE.ps1` | production-обслуговування |
 | `BRAVO_HEALTH.ps1` | контроль резервних копій і служб |
+| `BRAVO_CONFIGURATOR.ps1` | інтерактивний GUI-редактор `BRAVO.local.config` (schema-driven, presets, credentials, preview, atomic apply з rollback) — альтернатива ручному редагуванню файлу |
 | `BRAVO_TASKS_DIAGNOSE.ps1` | діагностика Планувальника і запуск від `SYSTEM` |
 | `BRAVO_RESTORE_TEST.ps1` | restore drill — розпакування останнього verified backup в ізольований каталог (розділ 6.1) |
 | `BRAVO_DATA_RESTORE.ps1` | реальне відновлення даних із verified generation: out-of-place або in-place з move-aside і rollback (розділ 6.2) |
