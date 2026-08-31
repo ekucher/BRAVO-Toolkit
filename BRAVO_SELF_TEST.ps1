@@ -7907,10 +7907,23 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Scheduler/ProtectedRuntimeAclDoesNotMutateExistingDacl" `
         -Failure "ACL hardening має будуватися з чистого security-descriptor (New-Object DirectorySecurity/FileSecurity), а не Get-Acl+RemoveAccessRuleAll на існуючому DACL — інакше падає на неканонічному DACL/orphaned SID реального сервера"
 
-    # Функціональна регресія: попередня перевірка вище була суто текстовою й
-    # проходила навіть тоді, коли hardening ACL падав на бойовому сервері.
-    # Тут правило справді будується для каталогу та для файлу.
-    # AddAccessRule працює над копією ACL у пам'яті й не потребує прав адміністратора.
+    # Функціональна регресія (code-review 2026-08-31): попередня версія цього
+    # тесту була суто in-memory (Get-Acl + AddAccessRule, ніколи не викликала
+    # Set-Acl) і фактично перевіряла старий, уже видалений патерн, а не новий
+    # from-scratch DirectorySecurity/FileSecurity шлях Set-BRAVOProtectedRuntimeAcl.
+    # Тут відтворюється РІВНО той самий патерн (чистий security-descriptor,
+    # SetAccessRuleProtection($true,$false), 3 AddAccessRule) і РЕАЛЬНО
+    # застосовується на диск через Set-Acl для каталогу й файлу, після чого
+    # результат перечитується Get-Acl і звіряється.
+    #
+    # SetOwner НАВМИСНО не відтворюється тут: зміна owner на іншу групу
+    # (Adminstrators) вимагає SeRestorePrivilege/SeTakeOwnershipPrivilege або
+    # elevated-токен, який self-test не гарантований мати (локальний dev-запуск
+    # цього скрипта неелевований). Це не та частина коду, що спричиняла
+    # реальний production-дефект ("not in canonical form" / orphaned SID) —
+    # той виникав саме від читання/мутації СТАРОГО DACL через Get-Acl +
+    # RemoveAccessRuleAll, а не від SetOwner. Тому пропуск SetOwner тут не
+    # послаблює регресійне покриття власне виправленого дефекту.
     $aclProbeRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_ACL_PROBE_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -7920,23 +7933,63 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         [IO.File]::WriteAllText($aclProbeFile, "# probe", (New-Object Text.UTF8Encoding($false)))
         $probeInheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
             [Security.AccessControl.InheritanceFlags]::ObjectInherit
-        $probeSid = New-Object Security.Principal.SecurityIdentifier("S-1-5-18")
+        $probeSystem = New-Object Security.Principal.SecurityIdentifier("S-1-5-18")
+        $probeUsers = New-Object Security.Principal.SecurityIdentifier("S-1-5-32-545")
         $aclProbeFailure = $null
         foreach ($probeItem in @($aclProbeRoot, $aclProbeFile)) {
-            $probeItemInheritance = if ([IO.Directory]::Exists($probeItem)) {
+            $probeIsDirectory = [IO.Directory]::Exists($probeItem)
+            $probeItemInheritance = if ($probeIsDirectory) {
                 $probeInheritance
             } else {
                 [Security.AccessControl.InheritanceFlags]::None
             }
             try {
-                $probeAcl = Get-Acl -LiteralPath $probeItem -ErrorAction Stop
+                $probeAcl = if ($probeIsDirectory) {
+                    New-Object Security.AccessControl.DirectorySecurity
+                } else {
+                    New-Object Security.AccessControl.FileSecurity
+                }
+                $probeAcl.SetAccessRuleProtection($true, $false)
                 $probeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
-                    $probeSid,
+                    $probeSystem,
                     [Security.AccessControl.FileSystemRights]::FullControl,
                     $probeItemInheritance,
                     [Security.AccessControl.PropagationFlags]::None,
                     [Security.AccessControl.AccessControlType]::Allow
                 )))
+                $probeAcl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule(
+                    $probeUsers,
+                    [Security.AccessControl.FileSystemRights]::ReadAndExecute,
+                    $probeItemInheritance,
+                    [Security.AccessControl.PropagationFlags]::None,
+                    [Security.AccessControl.AccessControlType]::Allow
+                )))
+                Set-Acl -LiteralPath $probeItem -AclObject $probeAcl -ErrorAction Stop
+
+                $probeAppliedAcl = Get-Acl -LiteralPath $probeItem -ErrorAction Stop
+                # Get-Acl транслює IdentityReference у NTAccount (напр. "NT
+                # AUTHORITY\SYSTEM"), тому порівнювати треба після Translate
+                # назад у SecurityIdentifier — інакше порівняння з raw SID
+                # ніколи не збігається.
+                $probeAppliedRules = @($probeAppliedAcl.Access | ForEach-Object {
+                    [pscustomobject]@{
+                        Sid = $_.IdentityReference.Translate([Security.Principal.SecurityIdentifier])
+                        Rights = $_.FileSystemRights
+                    }
+                })
+                $hasSystemRule = @($probeAppliedRules | Where-Object {
+                    $_.Sid -eq $probeSystem -and
+                    $_.Rights -band [Security.AccessControl.FileSystemRights]::FullControl
+                }).Count -gt 0
+                $hasUsersRule = @($probeAppliedRules | Where-Object {
+                    $_.Sid -eq $probeUsers -and
+                    $_.Rights -band [Security.AccessControl.FileSystemRights]::ReadAndExecute
+                }).Count -gt 0
+                if (-not $probeAppliedAcl.AreAccessRulesProtected) {
+                    $aclProbeFailure = "$probeItem — DACL не захищено (AreAccessRulesProtected=false) після Set-Acl"
+                } elseif (-not $hasSystemRule -or -not $hasUsersRule) {
+                    $aclProbeFailure = "$probeItem — після Set-Acl+Get-Acl не знайдено очікуваних правил (SYSTEM FullControl / Users ReadAndExecute)"
+                }
             } catch {
                 $aclProbeFailure = "$probeItem — $($_.Exception.Message)"
             }
@@ -7944,7 +7997,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         Test-BRAVOCondition `
             -Condition ($null -eq $aclProbeFailure) `
             -Name "Scheduler/AclRuleAppliesToFilesAndFolders" `
-            -Failure "правило ACL не будується: $aclProbeFailure"
+            -Failure "новий from-scratch ACL-патерн (DirectorySecurity/FileSecurity + Set-Acl) не застосувався коректно на диску: $aclProbeFailure"
     } finally {
         if (Test-Path -LiteralPath $aclProbeRoot -PathType Container) {
             [IO.Directory]::Delete($aclProbeRoot, $true)
