@@ -59,23 +59,24 @@ function Get-HostInformation {
         "недоступна"
     }
 
-    # Аудит P1.10: за замовчуванням вимкнено, якщо конфігурація взагалі не
-    # визначає hostInformationSettings/PublicIPLookupEnabled — той самий
-    # fail-safe default, що тепер і в BRAVO.config.
-    $lookupEnabled = $false
+    # Явне рішення власника (2026-08-30), що замінює попередній P1.10-дефолт:
+    # за замовчуванням увімкнено, якщо конфігурація взагалі не визначає
+    # hostInformationSettings/PublicIPLookupEnabled — той самий fail-safe
+    # default, що тепер і в BRAVO.config.
+    $lookupEnabled = $true
     $lookupUrls = @("https://api.ipify.org")
     $lookupTimeoutSeconds = 5
 
     # $hostInformationSettings навмисно читається без $global: — так само
     # резолвиться через ланцюжок scope. Але якщо змінна взагалі не існує
-    # (модуль імпортовано до того, як BRAVO.config її встановив), це і
-    # раніше, і зараз мовчки трактується як "вимкнено" (fail-safe за
-    # замовчуванням) — явно попереджаємо про це в лог, щоб оператор
-    # бачив, що налаштування з конфігу фактично проігноровані, а не
-    # думав, що lookup свідомо вимкнено адміністратором.
+    # (модуль імпортовано до того, як BRAVO.config її встановив), це
+    # мовчки трактується як fail-safe default ($lookupEnabled=$true вище) —
+    # явно попереджаємо про це в лог, щоб оператор бачив, що налаштування
+    # з конфігу фактично проігноровані, а не думав, що значення взято
+    # свідомо з BRAVO.config.
     $hostInformationSettingsVar = Get-Variable -Name hostInformationSettings -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $hostInformationSettingsVar -and (Get-Command -Name Write-Log -ErrorAction SilentlyContinue)) {
-        Write-Log -Message "hostInformationSettings не ініціалізовано (BRAVO.config не завантажено?) — public IP lookup вимкнено за замовчуванням" -Level WARNING
+        Write-Log -Message "hostInformationSettings не ініціалізовано (BRAVO.config не завантажено?) — public IP lookup використовує fail-safe default (увімкнено)" -Level WARNING
     }
 
     if ($hostInformationSettings -is [System.Collections.IDictionary]) {

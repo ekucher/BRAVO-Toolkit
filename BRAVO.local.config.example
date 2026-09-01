@@ -58,8 +58,9 @@
     # 'credentialSettings.Targets.SlackWebhookGeneral' = 'BRAVO_SLACK_GENERAL_URL'
     # 'credentialSettings.Targets.SlackWebhookAlerts' = 'BRAVO_SLACK_ALERTS_URL'
 
-    # Публічна IP у сповіщеннях (вимкнено свідомо; вмикайте усвідомлено):
-    # 'hostInformationSettings.PublicIPLookupEnabled' = $true
+    # Публічна IP у сповіщеннях (увімкнено за замовчуванням у BRAVO.config;
+    # розкоментуйте нижче, щоб свідомо вимкнути цю зовнішню залежність):
+    # 'hostInformationSettings.PublicIPLookupEnabled' = $false
     # 'hostInformationSettings.PublicIPLookupTimeoutSeconds' = 5
 
     # =========================================================

@@ -2038,21 +2038,49 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Version/AuthoritativeLoader" `
         -Failure "VERSION.json має бути єдиним джерелом версії, releaseDate і buildId для ScriptVersion/ScriptDate/ScriptBuildId"
 
-    # P1.10 аудиту: за замовчуванням жодних запитів до сторонніх сервісів
-    # (api.ipify.org/checkip.amazonaws.com) для визначення публічної IP —
-    # це зайва зовнішня залежність, яка розкриває факт і час запуску backup.
-    Remove-Module -Name 'BRAVO.Notifications' -Force -ErrorAction SilentlyContinue
-    Import-Module -Name (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psd1") -Force -ErrorAction Stop
-    $hostInformationWithConfig = Get-HostInformation
+    # Явне рішення власника (2026-08-30): за замовчуванням PublicIPLookupEnabled
+    # увімкнено в BRAVO.config, тож Get-HostInformation свідомо звертається до
+    # api.ipify.org/checkip.amazonaws.com у production. Цей факт конфігурації
+    # перевіряється тут статично, без мережевого виклику — сам
+    # $global:hostInformationSettings уже завантажений BRAVO.config раніше в
+    # цьому скрипті, окремого імпорту/виклику для цього не потрібно.
     Test-BRAVOCondition `
         -Condition (
             $global:hostInformationSettings -is [System.Collections.IDictionary] -and
             $global:hostInformationSettings.Contains("PublicIPLookupEnabled") -and
-            $global:hostInformationSettings.PublicIPLookupEnabled -eq $false -and
-            $hostInformationWithConfig.PublicIP -eq "вимкнено"
+            $global:hostInformationSettings.PublicIPLookupEnabled -eq $true
         ) `
-        -Name "Notifications/PublicIPLookupDisabledByDefault" `
-        -Failure "PublicIPLookupEnabled у BRAVO.config має бути \$false за замовчуванням; Get-HostInformation не повинен звертатись до зовнішніх IP-сервісів, доки це не увімкнено свідомо"
+        -Name "Notifications/PublicIPLookupEnabledByDefault" `
+        -Failure "PublicIPLookupEnabled у BRAVO.config має бути \$true за замовчуванням (рішення власника 2026-08-30)"
+
+    # Функціональна перевірка, що Get-HostInformation при lookupEnabled=true
+    # реально НАМАГАЄТЬСЯ отримати публічну IP (не хардкодить "вимкнено"),
+    # але без живого запиту до api.ipify.org на кожному прогоні self-test —
+    # це повертало б саме ту властивість "зовнішній сервіс бачить час
+    # виконання", яку P1.10-аудит прибирав, тепер ще й під час тестування.
+    # PublicIPLookupUrls тимчасово підмінюється на локальну недоступну
+    # адресу (миттєва відмова з'єднання, без залежності від реальної
+    # мережі/DNS), $global:hostInformationSettings відновлюється одразу
+    # після виклику.
+    $originalHostInformationSettings = $global:hostInformationSettings
+    try {
+        $global:hostInformationSettings = @{
+            PublicIPLookupEnabled = $true
+            PublicIPLookupUrls = @("http://127.0.0.1:1")
+            PublicIPLookupTimeoutSeconds = 1
+        }
+        Remove-Module -Name 'BRAVO.Notifications' -Force -ErrorAction SilentlyContinue
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psd1") -Force -ErrorAction Stop
+        $hostInformationWithConfig = Get-HostInformation
+    } finally {
+        $global:hostInformationSettings = $originalHostInformationSettings
+        Remove-Module -Name 'BRAVO.Notifications' -Force -ErrorAction SilentlyContinue
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psd1") -Force -ErrorAction Stop
+    }
+    Test-BRAVOCondition `
+        -Condition ($hostInformationWithConfig.PublicIP -ne "вимкнено") `
+        -Name "Notifications/PublicIPLookupEnabledAttemptsLookup" `
+        -Failure "Get-HostInformation при lookupEnabled=true має намагатись отримати публічну IP (не хардкодити 'вимкнено'), доки це не вимкнено свідомо через PublicIPLookupEnabled"
 
     $notifyHostOff = [pscustomobject]@{
         MachineName = "DEV-LIMS"
@@ -6904,7 +6932,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         Test-BRAVOCondition `
             -Condition ($bravoConfigText -match '(?s)Restore\s*=\s*@\{.*?Day\s*=\s*7\b') `
             -Name 'Maintenance/DefaultRestoreScheduleRemainsSunday' `
-            -Failure 'BRAVO.config Restore.Day має лишатися 7 (Sunday), як задокументовано для планової реставрації о 03:00'
+            -Failure 'BRAVO.config Restore.Day має лишатися 7 (Sunday), як задокументовано для планової реставрації о 21:00'
 
         # --- Безпечне вікно автоматичної реставрації ---
         # Реставрація зупиняє служби BRAVO і монопольно тримає модель.
