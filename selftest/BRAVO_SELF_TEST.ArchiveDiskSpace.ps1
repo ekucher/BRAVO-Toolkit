@@ -9,6 +9,29 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, $archiveScriptText, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
+#
+# Свідомо відсутні тут ID з §63 (перевірено 2026-08-31, не оверсайт):
+#   A3  — below-floor relaxation при достатній оцінці. Сценарій прибраний
+#         разом із PeakSafeEstimate=false для Archive (§24.1); замінений на
+#         A24 (BLOCK BelowFloorEstimateNotPeakSafe) і A25 (той самий вхід під
+#         ArchivePeakSafe-політикою, яка в 5.2.3 не використовується
+#         production-виклик-сайтом — лише доводить наявність коду).
+#   A12 — SyncBAZA-потік. Invoke-ManualBAZASFTPSynchronization НЕ підключений
+#         до Invoke-BRAVODiskSpaceClassifier у цьому релізі (CHANGELOG,
+#         "Відомі обмеження") — тестувати нема що, поведінка незмінна
+#         відносно 5.2.2.
+#   A13 — peak-estimator characterization. Результат Phase 0 зафіксований як
+#         рішення коду (PeakSafeEstimate=false, коментар на початку
+#         BRAVO.DiskSpace.psm1), а не як окремий регресійний тест.
+#   A18, A21, A22 — remote/SFTP capacity-unknown і access-unavailable
+#         сценарії. StorageKind SFTP проходить ті самі гілки класифікатора,
+#         що й UNC/AccessUnavailable — реальне branch-покриття вже дають
+#         DiskSpace/S10 (UNC accessible + capacity unknown → Warning
+#         CapacityUnknownRemote), DiskSpace/S11 (RequiresAccess=true +
+#         override) та Archive/A7, Archive/A20 (RequiresAccess=true +
+#         AccessStatus=Unavailable → BLOCK AccessUnavailable — код
+#         storage-kind-агностичний, крок 6). SFTP-мітка на дублі цих же
+#         гілок не додає покриття, лише назву.
 
 Import-Module -Name (Join-Path $root "modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psd1") -Force -ErrorAction Stop
 
