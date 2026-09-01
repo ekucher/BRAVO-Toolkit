@@ -86,9 +86,10 @@ Windows Credential Manager — окремо для поточного адмін
   `Login`/`sftpUrl`/`smbCredential` у `finally` навіть після ранньої
   помилки (self-test `Health/ProgrammaticApiClearsCredentialState`).
 - запит публічної IP-адреси для сповіщень (`api.ipify.org`,
-  `checkip.amazonaws.com`) вимкнено за замовчуванням
-  (`PublicIPLookupEnabled = $false`) — зайва зовнішня залежність, яка
-  розкриває стороннім сервісам факт і час запуску backup.
+  `checkip.amazonaws.com`) увімкнено за замовчуванням
+  (`PublicIPLookupEnabled = $true`, рішення власника 2026-08-30, замінює
+  попередній P1.10-дефолт) — розкриває стороннім сервісам факт і час
+  запуску backup; вимкніть свідомо, якщо це небажано.
 
 **Відкритий ввід у консолі (BRAVO_SETUP / BRAVO_CREDENTIALS_SETUP).**
 Під час інтерактивного вводу оператор бачить те, що набирає — усі поля,
