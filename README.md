@@ -49,7 +49,9 @@ runbook за кожним кодом завершення, із розділом
 
 - 64-бітна Windows для повного сценарію обслуговування;
 - локальні права адміністратора для встановлення завдань і керування службами;
-- доступний VSS на локальних томах із `MODEL`, `BLOG` і `BRAVOEXCH`;
+- доступний VSS на локальних томах із `MODEL`, `BLOG` і `BRAVOEXCH` (див.
+  застереження щодо `diskshadow.exe` нижче, якщо ці компоненти на різних
+  томах);
 - доступ до SFTP через TCP 22, якщо SFTP-компоненти ввімкнені;
 - доступ до Slack/Discord через HTTPS 443, якщо сповіщення ввімкнені;
 - доступ до потрібного UNC-шляху, якщо SMB/NAS ввімкнений.
@@ -61,6 +63,24 @@ runbook за кожним кодом завершення, із розділом
 | **Supported** | Windows Server 2019+, Windows 10/11, Windows PowerShell 5.1 |
 | **Legacy best-effort** | Windows Server 2012 R2, Windows Server 2016 (без гарантій) |
 | **Unsupported** | Windows 7, Windows Server 2008 R2, PowerShell 3.0 |
+
+> **Застереження (Windows 10/11, підтверджено 2026-09-01):** `diskshadow.exe`
+> — компонент, гарантовано доступний на Windows Server, але на клієнтських
+> Windows 10/11 його наявність **не гарантована** (підтверджено відсутнім у
+> `%SystemRoot%\System32` на кількох реальних Windows 10 Pro-машинах, включно
+> з build 19045/22H2). BRAVO вимагає `diskshadow.exe` лише коли джерела
+> архіву (`MODEL`/`BLOG`/`BRAVOEXCH`) розташовані на **кількох різних
+> томах** — тоді атомарний багатотомний VSS Snapshot Set неможливий без
+> нього, і `BRAVO_DRY_RUN.ps1`/`BRAVO_SETUP.ps1` fail-closed зупиняються на
+> `[FAIL] VSS` ще до кроку реєстрації планувальника (це навмисна поведінка
+> — тихе створення кількох незалежних однотомних знімків і видача їх за
+> єдиний узгоджений набір становило б реальний ризик цілісності backup).
+> Якщо цільова машина — Windows 10/11 client без `diskshadow.exe`:
+> перевірте `Test-Path "$env:SystemRoot\System32\diskshadow.exe"` заздалегідь,
+> і за потреби розмістіть `MODEL`, `BLOG` і `BRAVOEXCH` на **одному томі**
+> (тоді достатньо однотомного `Win32_ShadowCopy.Create`, `diskshadow.exe` не
+> потрібен). Архітектурне рішення про підтримку багатотомних джерел без
+> `diskshadow.exe` (наприклад, через VSS COM API) — окреме, ще не ухвалене.
 
 Archive, Health і Maintenance визначають рівень при кожному запуску
 (`Get-BRAVOOSSupportTier`, `modules\BRAVO.Compatibility`) і завжди пишуть у

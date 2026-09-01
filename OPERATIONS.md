@@ -579,6 +579,7 @@ BRAVO-owned Shadow IDs і видаляє state після успіху. Не р�
 | `недостатньо місця` | вичерпано shadow storage — розширте `vssadmin resize shadowstorage` |
 | writer у стані `Failed` | перезапустіть відповідну службу, потім `swprv` |
 | persisted orphan cleanup failed | перевірте exact IDs у `BRAVO_VSS_OWNERSHIP.json`, VSS/WMI і права SYSTEM; state не видаляється до успішного cleanup |
+| `VSS service/class/diskshadow capability incomplete`, джерела на різних томах | `diskshadow.exe` відсутній — типово на клієнтських Windows 10/11 (підтверджено 2026-09-01: відсутній на кількох build 19045/22H2 Pro-машин, на відміну від Windows Server, де він штатний). Перевірте `Test-Path "$env:SystemRoot\System32\diskshadow.exe"`. Якщо це очікувана клієнтська машина без нього — розмістіть `MODEL`/`BLOG`/`BRAVOEXCH` на одному томі (тоді достатньо однотомного `Win32_ShadowCopy.Create`); багатотомні джерела без `diskshadow.exe` наразі не підтримуються — не спроба обійти цю вимогу, а свідома fail-closed відмова. |
 
 **Ескалація.** Якщо VSS не відновлюється — S2, але з жорстким
 дедлайном: доки VSS зламаний, щоденних backup **немає взагалі**.
