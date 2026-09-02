@@ -1,6 +1,35 @@
 # Changelog
 
-## 5.2.3-rc.1 — 2026-08-31
+## 5.2.3-rc.2 — 2026-09-02
+
+Hotfix-кандидат: rc.1 + вузький фікс self-test-ізоляції, знайдений і
+підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
+`RELEASE_POLICY.md` §9, не через локальний self-test — там rc.1 проходив
+чисто).
+
+- **FIX (self-test, DiskSpace):** `Resolve-BRAVODiskSpaceStorageIdentity`
+  (§35.1 bootstrap — walk up до найближчого існуючого предка) виконувала
+  реальний `Test-Path` проти літерального `DisplayPath` з self-test
+  фікстур (`'D:\ARCHIV\MODEL'`, `'E:\ARCHIV\...'`) незалежно від
+  інжектованого `-Drives`-мока, який підміняв лише
+  `DriveType`/`AvailableFreeSpace`. Тому результат 11 self-test сценаріїв
+  (`DiskSpace/S16` ×2, `Archive/A4,A5,A9,A10,A14,A17,A19,A24,A25`) залежав
+  від того, чи фізично існують диски `D:`/`E:` на хості, що запускає
+  self-test — на `LIMS-TOP` (лише `C:`) усі 11 падали з
+  `Reason=VolumeResolutionFailed`, хоча той самий коміт `5270280` проходив
+  1532/0 на dev-машині з дисками `D:`/`E:`. Тепер bootstrap-перевірка
+  існування довіряє мок-масиву, коли `-Drives` інжектовано; виробнича
+  поведінка (реальні виклики з `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`, без
+  `-Drives`) не змінена.
+  **Це дефект непортативності self-test-фікстур, не самого
+  disk-space-класифікатора** — production-виклики передають реальні
+  шляхи з конфігурації, де реальний `Test-Path` є очікуваною поведінкою.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1532 PASS / 0 FAIL, ті самі
+11 сценаріїв, що впали на `LIMS-TOP`, тепер PASS). Real-server acceptance
+для rc.2 на `LIMS-TOP` — окремий крок, продовжується з місця зупинки rc.1.
+
+## 5.2.3-rc.1 — 2026-08-31 (superseded by rc.2)
 
 Release-metadata-only promotion `5.2.3-dev.1` → `5.2.3-rc.1` (`hotfix/5.2.3`),
 per `RELEASE_POLICY.md` §8. Без функціональних runtime-змін відносно `5.2.3-dev.1`
