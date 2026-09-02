@@ -143,6 +143,27 @@ exchangAPI legacy-міграція на ізольованій fixture).
 
 ---
 
+## 5.3.0-dev.2 — 2026-09-02
+
+Повернення `developer` у development-канал поверх тегованого
+`5.3.0-rc.1` (тег `v5.3.0-rc.1` лишається незмінним, pending
+acceptance — не rejected, не promoted). Причина: власник доручив
+почати P0 Configuration Foundation (нове canonical джерело built-in
+raw defaults, `BRAVO.config` як optional override, precedence
+`DEFAULT < BRAVO.config < BRAVO.local.config`, discovery/derivation
+після merge) — це feature/architecture-робота, яку `RELEASE_POLICY.md`
+§3.2 прямо забороняє вносити в заморожений RC («не повинен отримувати
+нові функції»). Замість маскування feature під fix відкрито новий
+prerelease-цикл. Лише метадані версії в цьому коміті: VERSION.json
+5.3.0-dev.2/development, заголовки README/BRAVO_SETUP, RELEASE_POLICY
+§20 (ModuleVersion `*.psd1` не змінюється — базова частина версії
+лишається `5.3.0`). Наступний кандидат цього циклу (rc.2) успадкує
+весь зафіксований scope dev.1 (P1.1 `BRAVO_RESTORE_VERIFY`, P2.1
+status contract, FIX-пакет deferred-боргів 5.2.0) плюс P0
+Configuration Foundation.
+
+---
+
 ## 5.3.0-rc.1 — 2026-08-26 (candidate, pending acceptance)
 
 Перший кандидат циклу 5.3.0. Кандидат = `5.3.0-dev.1` (розділ нижче:
