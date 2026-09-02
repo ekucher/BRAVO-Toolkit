@@ -30,7 +30,15 @@ $maintenanceScriptTextForDiskSpace = [IO.File]::ReadAllText(
 )
 $maintenanceDiskSpaceModule = New-BRAVOSelfTestRuntimeModule `
     -SourceText $maintenanceScriptTextForDiskSpace `
-    -FunctionNames @('Invoke-BRAVOMaintenanceDiskSpaceCheck', 'Get-BRAVOMaintenanceDiskSpaceEntities', 'Write-Log')
+    -FunctionNames @('Invoke-BRAVOMaintenanceDiskSpaceCheck', 'Get-BRAVOMaintenanceDiskSpaceEntities', 'Write-Log', 'Write-BRAVOMaintenanceLogFile')
+
+# Write-Log викликає Write-BRAVOMaintenanceLogFile, яка читає $LOG_DIR/
+# $LOG_FILE зі своєї module-scope (той самий підхід ізоляції, що й у
+# ManifestStorage-фрагменті нижче по BRAVO_SELF_TEST.ps1). Без екстракції
+# цієї функції і встановлення обох змінних $LOG_DIR лишається невстановленим
+# і Test-Path отримує $null — ізольований тимчасовий файл нижче усуває це,
+# жоден production-каталог не зачіпається.
+$maintenanceDiskSpaceLogTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MAINT_DISKSPACE_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
 
 function New-MaintenanceDiskSpaceDrive {
     param([string]$Drive, [double]$AvailableGB, [double]$TotalGB = 200, [bool]$IsReady = $true)
@@ -40,7 +48,9 @@ function New-MaintenanceDiskSpaceDrive {
 function Invoke-MaintenanceSpaceCheck {
     param([string]$RootLims, [double]$MinFreeSpace, [string[]]$ExcludedDrives = @(), [object[]]$Drives)
     & $maintenanceDiskSpaceModule {
-        param($RootLims, $MinFreeSpace, $ExcludedDrives, $Drives)
+        param($RootLims, $MinFreeSpace, $ExcludedDrives, $Drives, $LogFilePath)
+        $LOG_DIR = [IO.Path]::GetDirectoryName($LogFilePath)
+        $LOG_FILE = $LogFilePath
         $script:SlackMode = 'none'
         $script:criticalErrorOccurred = $false
         $script:BRAVOWarningCount = 0
@@ -52,7 +62,7 @@ function Invoke-MaintenanceSpaceCheck {
             WarningCount = $script:BRAVOWarningCount
             FreeSpaceSummary = $script:freeSpaceSummary
         }
-    } $RootLims $MinFreeSpace $ExcludedDrives $Drives
+    } $RootLims $MinFreeSpace $ExcludedDrives $Drives $maintenanceDiskSpaceLogTempFile
 }
 
 # ============================================================
@@ -161,6 +171,31 @@ Test-BRAVOCondition `
     ) `
     -Name 'Maintenance/SpaceCheckWiredIntoMain' `
     -Failure 'Invoke-BRAVOMaintenanceDiskSpaceCheck має викликатися на виклик-сайті замість Check-FreeSpace; стара функція має бути видалена, не залишена паралельно'
+
+# ============================================================
+# Regression: Write-Log у M1-M11 має реально писати в ізольований
+# $LOG_DIR/$LOG_FILE fixture, а не мовчки провалюватись у catch
+# Write-BRAVOMaintenanceLogFile через невстановлений $LOG_DIR=$null
+# (реальний production acceptance-інцидент на LIMS-TOP, 5.2.3-rc.1 —
+# self-test PASS ховав 36 рядків "Помилка запису у файл логу:
+# Cannot bind argument to parameter 'Path' because it is null.").
+# Перевіряємо конкретний logging-fixture (файл на диску), не текст усієї
+# консолі self-test — не крихкий тест, не забороняє інші негативні
+# сценарії з очікуваними ПОМИЛКА-рядками деінде.
+# ============================================================
+$maintenanceDiskSpaceLogContent = if (Test-Path -LiteralPath $maintenanceDiskSpaceLogTempFile) {
+    [IO.File]::ReadAllText($maintenanceDiskSpaceLogTempFile, [Text.Encoding]::UTF8)
+} else { $null }
+Test-BRAVOCondition `
+    -Condition (
+        $null -ne $maintenanceDiskSpaceLogContent -and
+        $maintenanceDiskSpaceLogContent.Length -gt 0 -and
+        -not $maintenanceDiskSpaceLogContent.Contains('Помилка запису у файл логу') -and
+        -not $maintenanceDiskSpaceLogContent.Contains("Cannot bind argument to parameter 'Path'")
+    ) `
+    -Name 'Maintenance/DiskSpaceFixtureLogWritesWithoutPathError' `
+    -Failure "M1-M11 мають писати в ізольований fixture-лог ($maintenanceDiskSpaceLogTempFile) без 'Помилка запису у файл логу'/null-Path — Write-BRAVOMaintenanceLogFile мусить бути екстрагована разом із Write-Log, а `$LOG_DIR/`$LOG_FILE встановлені перед викликом"
+Remove-Item -LiteralPath $maintenanceDiskSpaceLogTempFile -Force -ErrorAction SilentlyContinue
 
 # ============================================================
 # Відомі обмеження цієї стадії (задокументовано, не приховано):
