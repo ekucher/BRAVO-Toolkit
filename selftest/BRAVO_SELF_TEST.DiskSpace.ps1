@@ -349,6 +349,26 @@ Test-BRAVOCondition `
     -Failure "remote CapacityState=Unknown має зупинити АРИФМЕТИКУ повністю (жодного ProjectedFreeGB/AggregatedRequiredGB порівняння з `$null)"
 
 # ============================================================
+# S21 — регресія (2026-09-02, real-server LIMS-TOP): HealthOnly LocalVolume
+# БЕЗ інжектованого -Drives (реальний прод-виклик, не self-test-мок) мав
+# отримувати CapacityState=Unknown навіть для реально існуючого диска,
+# бо крок 7 передавав -Drives класифікатору capacity БЕЗУМОВНО (реальний
+# масив АБО "@()"), тому Get-BRAVODiskSpaceCapacityObservation бачив
+# параметр як завжди прив'язаний і йшов гілкою пошуку в порожньому
+# injected-масиві замість реального System.IO.DriveInfo. Усі S1-S20 вище
+# завжди інжектують -Drives — жоден з них не міг зловити цю регресію.
+# 'C:\' обрано як том, що гарантовано існує на будь-якому Windows-хості
+# (проєкт цільово Windows PowerShell 5.1 / Windows-сервери).
+# ============================================================
+$s21 = Test-BRAVODiskSpaceEntity `
+    -EntitySpec ([pscustomobject]@{ DisplayPath = 'C:\'; Roles = @('HealthOnly'); RequiresAccess = $false; RequiresFreeSpace = $false }) `
+    -ExcludedDrives @()
+Test-BRAVOCondition `
+    -Condition ($s21.Result.CapacityState -eq 'Known' -and $null -ne $s21.Result.AvailableGB) `
+    -Name 'DiskSpace/S21-HealthOnlyWithoutInjectedDrivesUsesRealCapacity' `
+    -Failure "HealthOnly LocalVolume БЕЗ інжектованого -Drives має резолвити CapacityState=Known через реальний System.IO.DriveInfo (отримано CapacityState='$($s21.Result.CapacityState)' AvailableGB='$($s21.Result.AvailableGB)')"
+
+# ============================================================
 # S3 — notification wording: non-blocking Warning ніколи не формує текст
 # "операцію не розпочато"/CRITICAL (§51/§84.10). Warnings будуються лише
 # з DisplayPath+Reason — структурно не можуть містити таких фраз, але

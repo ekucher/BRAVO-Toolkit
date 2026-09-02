@@ -571,8 +571,18 @@ function Test-BRAVODiskSpaceEntity {
             $healthCapacityState = $capacityOverride
             $healthAvailableGB = $availableOverride
         } elseif ($identity.StorageKind -eq 'LocalVolume' -and -not [string]::IsNullOrWhiteSpace($identity.Drive)) {
-            $observation = Get-BRAVODiskSpaceCapacityObservation -StorageKind 'LocalVolume' -CapacityKey $identity.CapacityKey `
-                -Drive $identity.Drive -Observations @() -Drives $(if ($PSBoundParameters.ContainsKey('Drives')) { $Drives } else { @() })
+            # §35.1/§50.1 регресія (2026-09-02, real-server LIMS-TOP):
+            # -Drives передавався БЕЗУМОВНО (реальний масив або "@()"), тому
+            # Get-BRAVODiskSpaceCapacityObservation бачив параметр Drives як
+            # завжди прив'язаний (навіть на проді без self-test-ін'єкції) і
+            # йшов гілкою пошуку в injected-масиві замість реального
+            # System.IO.DriveInfo — HealthOnly C:/D: хибно отримували
+            # CapacityState=Unknown, хоча реальна ємність визначалась легко.
+            # Той самий conditional-splat патерн, що вже коректно
+            # використовується нижче для Phase 2 (рядок ~668).
+            $healthCapacityParams = @{ StorageKind = 'LocalVolume'; CapacityKey = $identity.CapacityKey; Drive = $identity.Drive; Observations = @() }
+            if ($PSBoundParameters.ContainsKey('Drives')) { $healthCapacityParams.Drives = $Drives }
+            $observation = Get-BRAVODiskSpaceCapacityObservation @healthCapacityParams
             $healthCapacityState = $observation.CapacityState
             $healthAvailableGB = $observation.AvailableGB
         }
@@ -586,11 +596,13 @@ function Test-BRAVODiskSpaceEntity {
             # ця гілка на практиці не спрацьовує для requiresAccess=true
             # (той випадок уже BLOCK на кроці 6). Залишено для повноти таблиці §50.1.
             $healthStatus = 'Warning'
+            $healthReason = 'AccessUnavailableNoFreeSpaceRequirement'
         } elseif ($null -ne $minimumGB -and $healthCapacityState -eq 'Known' -and $null -ne $healthAvailableGB -and [double]$healthAvailableGB -lt [double]$minimumGB) {
             $healthStatus = 'Warning'
             $healthReason = 'BelowHealthFloorNoFreeSpaceRequirement'
         } elseif ($healthCapacityState -ne 'Known') {
             $healthStatus = 'Warning'
+            $healthReason = 'HealthCapacityUnknown'
         }
 
         $suppressed = $false
