@@ -1,5 +1,35 @@
 # Changelog
 
+## 5.2.3-rc.4 — 2026-09-02
+
+Hotfix-кандидат: rc.3 + операторська ясність self-test-логів (без зміни
+production-логіки чи набору перевірок).
+
+- **FIX (self-test, оператор-facing):** rc.3 пройшов чисто (1533 PASS / 0 FAIL)
+  на `LIMS-TOP`, але `.log`-транскрипт self-test містив сирий консольний вивід
+  дочірніх `BRAVO_TASKS_INSTALL.ps1 -ValidateOnly`/`BRAVO_DRY_RUN.ps1` на
+  навмисно "зламаних" fixture-конфігураціях без жодного маркування — рядки
+  на кшталт `[FAIL]`/`ПОМИЛКА`/`НЕ ГОТОВО` виглядали як production-інцидент,
+  хоча фінальний self-test summary коректно повідомляв `PASSED`.
+  Причина: Windows PowerShell 5.1 `Start-Transcript` фіксує сирий вивід
+  дочірнього `powershell.exe` у `.log` НАВІТЬ КОЛИ він коректно перехоплений
+  батьківським скриптом у змінну для власної `[PASS]`/`[FAIL]`-оцінки —
+  платформна особливість, не баг self-test-логіки.
+  Додано `Write-BRAVOSelfTestFixtureBanner` (`BRAVO_SELF_TEST.ps1`) — чисто
+  адитивні `>>>`/`<<<` маркери до/після виклику, нічого не приховує і не
+  пригнічує. Обгорнуто 3 місця: спільний helper
+  `Invoke-BRAVOSelfTestTaskInstallValidateOnly` (6 фікстур: legacy installer,
+  Maintenance/Recovery/Disabled/SftpBaseline/SftpDisabled scheduler),
+  `BRAVO_DRY_RUN.ps1` LocalOnly fixture, `BRAVO_DRY_RUN.ps1` synthetic
+  config failure fixture (`selftest/BRAVO_SELF_TEST.ConfigLoader.ps1`).
+  Позитивний `Scheduler/ValidateOnly`-виклик (валідний конфіг, не очікує
+  FAIL) банером не обгорнуто — плутанини там немає.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1533 PASS / 0 FAIL — той самий
+рахунок перевірок, що й rc.3; зміна суто `Write-Host`-банери, без нових
+`Test-BRAVOCondition`). Real-server acceptance для rc.4 на `LIMS-TOP` —
+окремий крок.
+
 ## 5.2.3-rc.3 — 2026-09-02
 
 Hotfix-кандидат: rc.2 + fixture-only фікс шуму self-test, знайдений і
