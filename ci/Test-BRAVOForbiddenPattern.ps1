@@ -81,7 +81,13 @@ $bypassAllowlist = @(
     # BRAVO.config описує завдання Планувальника (ArgumentsTemplate для
     # schtasks) — та сама категорія "описує завдання", що TASKS_INSTALL.
     # Config увійшов у скан заради правила legacy-webhook нижче.
-    'BRAVO.config'
+    'BRAVO.config',
+    # BRAVO.Configuration.psm1 (P0 Configuration Foundation, PR A):
+    # Get-BRAVODefaultConfiguration повертає ТОЙ САМИЙ elevationSettings.
+    # ArgumentsTemplate, що сьогодні буквально в BRAVO.config вище —
+    # canonical built-in default того самого self-elevation-опису, а не
+    # нове виконуване Bypass-місце.
+    'BRAVO.Configuration.psm1'
 )
 
 $forbiddenRules = @(
