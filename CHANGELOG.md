@@ -1,6 +1,40 @@
 # Changelog
 
-## 5.2.3-rc.2 — 2026-09-02
+## 5.2.3-rc.3 — 2026-09-02
+
+Hotfix-кандидат: rc.2 + fixture-only фікс шуму self-test, знайдений і
+підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
+`RELEASE_POLICY.md` §9 — rc.2 проходив 1532/0, але з 36 рядками
+діагностичного шуму навколо Archive/Maintenance disk-space-тестів).
+
+- **FIX (self-test, Maintenance):** `selftest/BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1`
+  ізолював `Invoke-BRAVOMaintenanceDiskSpaceCheck`/`Write-Log` через
+  `New-BRAVOSelfTestRuntimeModule`, але не екстрагував `Write-BRAVOMaintenanceLogFile`
+  (яку викликає `Write-Log`) і не встановлював `$LOG_DIR`/`$LOG_FILE` перед
+  M1-M11. Обидві змінні лишались невстановленими в module-scope цього
+  динамічного модуля — `Test-Path $LOG_DIR` резолвився як
+  `Test-Path -Path $null`, TerminatingError перехоплювався в catch і друкував
+  `"Помилка запису у файл логу: Cannot bind argument to parameter 'Path'
+  because it is null."` (36 разів). Сам self-test PASS не постраждав —
+  catch обробляв помилку коректно, це був виключно діагностичний шум, не
+  прихована регресія.
+  Тепер `Write-BRAVOMaintenanceLogFile` екстрагується разом із `Write-Log`,
+  і fixture встановлює обидві змінні на ізольований тимчасовий лог-файл
+  перед кожним викликом (той самий патерн, що вже використовується в
+  ManifestStorage-фрагменті `BRAVO_SELF_TEST.ps1`).
+  **Це дефект ізоляції test-harness, не production-логіки** —
+  `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` не змінено;
+  реальний `BRAVO_MAINTENANCE.ps1` завжди виконує top-level ініціалізацію
+  `$LOG_DIR`/`$LOG_FILE` до будь-якого `Write-Log`.
+  Regression coverage: `Maintenance/DiskSpaceFixtureLogWritesWithoutPathError`.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1533 PASS / 0 FAIL — +1 новий
+regression-тест). Пошук "Cannot bind argument to parameter 'Path'" і
+"Помилка запису у файл логу" у новому логу self-test — 0 входжень.
+Real-server acceptance для rc.3 на `LIMS-TOP` — окремий крок, продовжується
+з місця зупинки rc.2.
+
+## 5.2.3-rc.2 — 2026-09-02 (superseded by rc.3)
 
 Hotfix-кандидат: rc.1 + вузький фікс self-test-ізоляції, знайдений і
 підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
