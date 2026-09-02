@@ -1,5 +1,34 @@
 # Changelog
 
+## 5.2.3-rc.5 — 2026-09-02
+
+Hotfix-кандидат: rc.4 + реальний production-баг у спільному
+`BRAVO.DiskSpace`-класифікаторі, знайдений при аналізі свіжого
+`BRAVO_MAINTENANCE`-логу на `LIMS-TOP` (Вінницька ФВЛ) під час перевірки rc.4.
+
+- **FIX (DiskSpace, HealthOnly-диски):** `Test-BRAVODiskSpaceEntity`
+  (крок 7) на реальному сервері завжди резолвив `C:\`/`D:\`
+  (роль `HealthOnly`) як `CapacityState=Unknown`, хоча реальна ємність
+  визначається тривіально — Discord-звіт показував "запас: немає
+  даних", `.log` містив порожні `[WARNING] C:\: `/`[WARNING] D:\: `.
+  Причина 1: `-Drives` передавався `Get-BRAVODiskSpaceCapacityObservation`
+  безумовно (реальний масив або `@()`), тому функція завжди йшла
+  гілкою пошуку в injected-масиві замість реального
+  `System.IO.DriveInfo` — виправлено на умовний splat-патерн, вже
+  коректно застосований нижче для Phase 2. Причина 2: гілка
+  `CapacityState != Known` не встановлювала `Reason`, звідки порожній
+  текст попередження — додано `Reason='HealthCapacityUnknown'`.
+  Regression coverage: `DiskSpace/S21-HealthOnlyWithoutInjectedDrivesUsesRealCapacity`
+  (єдиний тест без `-Drives`-ін'єкції — S1-S20 усі мокають Drives і
+  тому не могли зловити цю регресію). Pre-fix характеризація
+  (ізольований `Import-Module` старої версії з попереднього коміту)
+  відтворила точний production-симптом (`CapacityState=Unknown`,
+  порожні `AvailableGB`/`Reason`) до фіксу.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1534 PASS / 0 FAIL —
+1533 rc.4 + 1 новий регресійний S21). Real-server acceptance для rc.5
+на `LIMS-TOP` — окремий крок.
+
 ## 5.2.3-rc.4 — 2026-09-02
 
 Hotfix-кандидат: rc.3 + операторська ясність self-test-логів (без зміни
