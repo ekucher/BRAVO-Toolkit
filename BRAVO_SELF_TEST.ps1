@@ -1425,7 +1425,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     # узгоджені: жоден не повинен лишитись зі старим $archivPath/
     # $bravoScriptDirectory-відносним шляхом.
     $toolManifestLocationSources = @{
-        'BRAVO.config' = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+        # P0 Configuration Foundation (PR B): toolIntegritySettings.ManifestPath
+        # тепер обчислюється в canonical derivation resolver, не в самому
+        # BRAVO.config (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
+        'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'), [Text.Encoding]::UTF8)
         'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
         'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
         'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1' = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
@@ -3892,13 +3895,20 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Health/SelfTestDoesNotModifyAcl" `
         -Failure "dev.13 test block (manual elevation + environment preflight) у BRAVO_SELF_TEST.ps1 не повинен містити Set-Acl/AddAccessRule/RemoveAccessRule/FileSystemAccessRule — класифікація тестується чистими функціями/синтетичними винятками, не ACL-мутацією"
 
-    $bravoExchSelectionStart = $bravoConfigText.IndexOf('$global:bravoExchSourceCandidates')
-    $bravoExchSelectionEnd = $bravoConfigText.IndexOf('$bravoExchArchiveSource', $bravoExchSelectionStart)
+    # P0 Configuration Foundation (PR B): bravoExchSourceCandidates-логіка
+    # тепер живе в canonical derivation resolver, не в самому BRAVO.config
+    # (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
+    $bravoConfigDerivationText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
+        [Text.Encoding]::UTF8
+    )
+    $bravoExchSelectionStart = $bravoConfigDerivationText.IndexOf('$global:bravoExchSourceCandidates')
+    $bravoExchSelectionEnd = $bravoConfigDerivationText.IndexOf('$bravoExchArchiveSource', $bravoExchSelectionStart)
     $bravoExchSelectionText = if (
         $bravoExchSelectionStart -ge 0 -and
         $bravoExchSelectionEnd -gt $bravoExchSelectionStart
     ) {
-        $bravoConfigText.Substring(
+        $bravoConfigDerivationText.Substring(
             $bravoExchSelectionStart,
             $bravoExchSelectionEnd - $bravoExchSelectionStart
         )
@@ -10411,9 +10421,19 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
-    $bravoConfigTextForDiscovery = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
-        [Text.Encoding]::UTF8
+    # P0 Configuration Foundation (PR B): discovery/derivation-виклики
+    # (Resolve-BRAVOInstallationDiscovery, $global:discoverySettings/
+    # sourcePaths, Resolve-BRAVOEffectiveBackupRoot, подвійний
+    # -BravoDisplayName) тепер живуть у canonical derivation resolver, не
+    # в самому BRAVO.config — перевірки нижче читають об'єднаний текст
+    # обох файлів (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
+    $bravoConfigTextForDiscovery = (
+        [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8) +
+        [Environment]::NewLine +
+        [IO.File]::ReadAllText(
+            (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
+            [Text.Encoding]::UTF8
+        )
     )
     $configLoaderTextForDiscovery = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO_CONFIG_LOADER.ps1"),
@@ -12990,11 +13010,18 @@ function Get-BRAVOMaintenanceSummaryResult {
         $fixtureMaintenanceFlag = if ($MaintenanceEnabled) { '$true' } else { '$false' }
         $fixtureConfigText = [regex]::Replace(
             $fixtureConfigText, '(?s)(Maintenance = @\{\r?\n\s*Enabled = )\$true', "`$1$fixtureMaintenanceFlag", 1)
-        # Recovery.Enabled у config — вираз від Restore.BootRestoreMode
-        # (5.2.0), не літерал, тому замінюємо ВЕСЬ правий бік рядка.
-        $fixtureRecoveryFlag = if ($RecoveryEnabled) { '$true' } else { '$false' }
+        # P0 Configuration Foundation (PR B): Recovery.Enabled більше не
+        # inline-вираз у самому BRAVO.config — це похідне поле, яке
+        # Resolve-BRAVOConfigurationDerivation обчислює з
+        # maintenanceSettings.Restore.BootRestoreMode ("HoldServices" =>
+        # true). Керуємо РЕАЛЬНИМ важелем деривації (BootRestoreMode), а
+        # не патчимо вже неіснуючий inline-вираз — це й точніше
+        # відтворює production-поведінку, і уникає regex-переспрацювання
+        # на першому наступному "Enabled = " нижче по файлу
+        # (schedulerSettings.RestoreVerify.Enabled).
+        $fixtureBootRestoreModeValue = if ($RecoveryEnabled) { 'HoldServices' } else { 'None' }
         $fixtureConfigText = [regex]::Replace(
-            $fixtureConfigText, '(?s)(Recovery = @\{\r?\n\s*Enabled = )[^\r\n]+', "`$1$fixtureRecoveryFlag", 1)
+            $fixtureConfigText, '(?m)^(\s*BootRestoreMode\s*=\s*)"None"\s*$', "`$1`"$fixtureBootRestoreModeValue`"", 1)
 
         [IO.File]::WriteAllText($fixtureConfigPath, $fixtureConfigText, (New-Object Text.UTF8Encoding($false)))
         return [pscustomobject]@{ ConfigPath = $fixtureConfigPath; Root = $fixtureRoot }
@@ -13342,8 +13369,12 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "перемикачі безпеки мають перевірятись у ТІЙ САМІЙ конфігурації, з якою запущено скрипт (-ConfigPath), а не в захардкоденому `$PSScriptRoot\BRAVO.config; порушено в: $($configPathFailures -join ', ')"
 
     # --- Runtime/04: Tools і LOGS живуть у різних коренях ---
+    # P0 Configuration Foundation (PR B): toolsPath/arcPath/winSCPPath і
+    # PowerShellExecutable (Runtime/06 нижче, $bravoConfigTextForScheduler
+    # = ця сама змінна) тепер обчислюються в canonical derivation resolver,
+    # не в самому BRAVO.config.
     $bravoConfigTextForTools = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
+        (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
         [Text.Encoding]::UTF8
     )
     Test-BRAVOCondition `
