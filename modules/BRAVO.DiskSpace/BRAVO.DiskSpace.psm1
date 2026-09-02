@@ -183,17 +183,6 @@ function Resolve-BRAVODiskSpaceStorageIdentity {
         }
     }
 
-    # LocalVolume: §35.1 bootstrap — walk up до найближчого існуючого предка.
-    $probePath = $DisplayPath
-    $foundExisting = $false
-    for ($depth = 0; $depth -lt 64; $depth++) {
-        if ([string]::IsNullOrWhiteSpace($probePath)) { break }
-        if (Test-Path -LiteralPath $probePath) { $foundExisting = $true; break }
-        $parent = Split-Path -Path $probePath -Parent
-        if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probePath) { break }
-        $probePath = $parent
-    }
-
     $driveLetter = $null
     try {
         $driveLetter = ([IO.Path]::GetPathRoot($DisplayPath)).TrimEnd('\').ToUpperInvariant()
@@ -210,6 +199,30 @@ function Resolve-BRAVODiskSpaceStorageIdentity {
             DriveType = $null
             VolumeKey = $null
             VolumeId = $null
+        }
+    }
+
+    # LocalVolume: §35.1 bootstrap — walk up до найближчого існуючого предка.
+    # Коли викликач інжектує -Drives (self-test ізоляція), реальний диск
+    # DisplayPath може не існувати на конкретному хості (інша машина/сервер
+    # без саме цієї букви диска) — мокований том сам по собі є заявленою
+    # ознакою "існує/готовий", тому реальний Test-Path не виконується, і
+    # результат класифікатора не залежить від фізичного набору дисків
+    # хоста, що запускає self-test.
+    $foundExisting = $false
+    if ($PSBoundParameters.ContainsKey('Drives')) {
+        $injectedForExistence = @($Drives | Where-Object {
+            ([string]$_.Drive).TrimEnd('\').ToUpperInvariant() -eq $driveLetter
+        } | Select-Object -First 1)
+        if ($injectedForExistence.Count -gt 0) { $foundExisting = $true }
+    } else {
+        $probePath = $DisplayPath
+        for ($depth = 0; $depth -lt 64; $depth++) {
+            if ([string]::IsNullOrWhiteSpace($probePath)) { break }
+            if (Test-Path -LiteralPath $probePath) { $foundExisting = $true; break }
+            $parent = Split-Path -Path $probePath -Parent
+            if ([string]::IsNullOrWhiteSpace($parent) -or $parent -eq $probePath) { break }
+            $probePath = $parent
         }
     }
 
