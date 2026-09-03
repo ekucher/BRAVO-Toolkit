@@ -17,8 +17,32 @@
 # Discovery, Resolve-BRAVOEffectiveBackupRoot, Resolve-
 # BRAVOEffectiveSystemLogRoot, Get-BRAVOEffectiveStorageConfiguration,
 # Get-BRAVOEffectiveSynchronizationConfiguration — усі з
-# modules/BRAVO.Discovery. Викликач (BRAVO_CONFIG_LOADER.ps1) вже
-# імпортує BRAVO.Discovery ПЕРЕД виконанням BRAVO.config/цієї функції.
+# modules/BRAVO.Discovery.
+#
+# CI remediation (fresh-process defect, BRAVO_DATA_RESTORE_MATRIX_TEST.ps1):
+# попередній коментар тут стверджував, що викликач (BRAVO_CONFIG_LOADER.ps1)
+# "вже імпортує BRAVO.Discovery ПЕРЕД виконанням BRAVO.config/цієї функції"
+# — це припущення НЕ тримається в реальному fresh-process execution path.
+# BRAVO_CONFIG_LOADER.ps1 імпортує BRAVO.Discovery з-під ланцюжка
+# dot-source, який виконується ВСЕРЕДИНІ SessionState модуля BRAVO.Archive
+# (RootModule BRAVO.Archive.psm1 дот-сорсить BRAVO.Archive.Runtime.ps1,
+# який дот-сорсить BRAVO_CONFIG_LOADER.ps1). PowerShell 5.1 Import-Module,
+# викликаний із СЕРЕДИНИ чужого модуля (без -Global), імпортує залежність
+# у ПРИВАТНИЙ SessionState цього викликача (BRAVO.Archive), а НЕ в global
+# scope. Цей модуль (BRAVO.Configuration.Derivation) імпортується
+# ОКРЕМИМ Import-Module-викликом (з BRAVO.config, теж усередині
+# BRAVO.Archive scope) — тобто отримує СВІЙ ВЛАСНИЙ ізольований
+# SessionState, який НЕ бачить приватний імпорт BRAVO.Discovery, зроблений
+# іншим модулем. Функція нижче резолвить виклики лише проти власного
+# SessionState модуля + справжнього global scope — жодного з них
+# Discovery не займає, звідси "Resolve-BRAVOEffectiveLimsRoot is not
+# recognized" у fresh child powershell.exe (BRAVO_SELF_TEST.ps1 це не
+# ловив: self-test виконує цю функцію в іншому, спрощеному scope-ланцюжку,
+# не через повний BRAVO_ARCHIV.ps1 -> BRAVO.Archive module -> BRAVO.config
+# ланцюг). Тому цей модуль явно й детерміновано імпортує СВОЮ ВЛАСНУ
+# залежність нижче — не покладаючись на випадковий caller scope.
+$discoveryModulePathForDerivation = Join-Path -Path $PSScriptRoot -ChildPath '..\BRAVO.Discovery\BRAVO.Discovery.psd1'
+Import-Module -Name $discoveryModulePathForDerivation -ErrorAction Stop
 #
 # Свідома зміна поведінки (докладно — design-документ, ТЗ Test 17): у
 # поточному BRAVO.config sftpDirectories/backupMonitoring/
