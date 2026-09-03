@@ -439,9 +439,38 @@ function Get-BRAVOCanonicalDiscoverySettings {
     # ігнорувалась). Винесено сюди як ОДНЕ джерело, яким користуються ОБИДВА
     # шляхи (BRAVO.config present і absent) — без цього no-config-шлях мав би
     # тримати другу незалежну копію цього самого літералу.
+    #
+    # CI remediation (BRAVO_DATA_RESTORE_MATRIX_TEST.ps1, E2E fixture):
+    # раніше self-test обходив цю фіксацію через function global:
+    # Get-BRAVOCanonicalDiscoverySettings (function-shadowing). Емпірично
+    # підтверджено, що цей прийом НЕ переноситься на MatrixTest — там
+    # викликач (Resolve-BRAVOConfigurationDerivation) виконується
+    # всередині приватного SessionState модуля BRAVO.Archive (повний
+    # ланцюг BRAVO_ARCHIV.ps1 -> BRAVO.Archive module -> BRAVO_CONFIG_
+    # LOADER.ps1), тому global-scope shadow, визначена в дочірньому
+    # процесі ДО імпорту BRAVO.Archive, програє module-приватному
+    # імпорту (мінімальний ізольований repro підтвердив: семантичного
+    # шляху до global-shadow тут просто немає). Замість розширення
+    # Import-Module до -Global (ширший blast radius на ВСІ entrypoints)
+    # — вузький, явно gate-ований env-var seam, того самого класу, що
+    # вже прийнятий у цьому репозиторії для BRAVO_DATARESTORE_TEST_HOOKS/
+    # BRAVO_DATARESTORE_TEST_FAILPOINT (modules/BRAVO.DataRestore.
+    # MatrixTest): без встановленої змінної — поведінка на 100% незмінна
+    # (canonical fixed-літерал нижче, як і раніше); лише коли ОПЕРАТОР
+    # явно поставив BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH на існуючий
+    # .psd1-файл, повертається його вміст. Не читає з мережі/непідконтрольного
+    # входу — лише локальний файл, шлях до якого задає сам викликач
+    # процесу. Не торкається жодного security-релевантного налаштування
+    # (SFTP/SMB/toolIntegrity/backupConsistency).
     [CmdletBinding()]
     [OutputType([hashtable])]
     param()
+
+    $overridePath = $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH
+    if (-not [string]::IsNullOrWhiteSpace($overridePath) -and
+        (Test-Path -LiteralPath $overridePath -PathType Leaf)) {
+        return Import-PowerShellDataFile -LiteralPath $overridePath
+    }
 
     return @{
         BravoIniPath = $null

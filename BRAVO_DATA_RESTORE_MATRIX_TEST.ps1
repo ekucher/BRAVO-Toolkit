@@ -121,7 +121,9 @@ try {
             -FailpointComponent $combo.FailpointComponent `
             -TimeoutSeconds $ComboTimeoutSeconds `
             -LogDirectory $ComboLogDirectory `
-            -ComboName $combo.Name
+            -ComboName $combo.Name `
+            -ProgramDataRoot $fixtureConfig.ProgramDataRoot `
+            -DiscoverySettingsOverridePath $fixtureConfig.DiscoverySettingsOverridePath
         $assertion = Assert-BRAVODataRestoreMatrixComboResult `
             -Combo $combo `
             -Result $comboResult `
