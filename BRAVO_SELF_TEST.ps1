@@ -15809,6 +15809,12 @@ function Write-BRAVOLog {
     # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
     # замість голої NullReferenceException).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
+    # Configuration Foundation (P0, PR A): canonical built-in raw defaults +
+    # Merge-BRAVOConfiguration/ConvertTo-BRAVONestedOverride/
+    # Resolve-BRAVORawConfiguration (modules/BRAVO.Configuration) — ще не
+    # підключено до BRAVO_CONFIG_LOADER.ps1/BRAVO.config
+    # (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configuration.ps1')
     # Configurator backend: Schema/Model/Effective/Validation/Persistence/
     # Credentials/Presets/Preview (docs/design/BRAVO_CONFIGURATOR_DESIGN.md).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
