@@ -2,6 +2,69 @@
 
 ## Не випущено (developer)
 
+- **P0 Configuration Foundation (PR B/C)** — `BRAVO.config` став опційним
+  primary override-шаром замість обов'язкового джерела конфігурації:
+  precedence тепер `DEFAULT < BRAVO.config (опційно) < BRAVO.local.config`,
+  повністю через один canonical pipeline
+  (`Complete-BRAVOConfigurationLoad`/`Import-BravoConfiguration`, немає
+  окремого config-present/config-absent коду). Дизайн-рішення й обґрунтування
+  розбиття на PR A/B/C — `docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md`.
+  - **Явний/AUTO намір оператора для `-ConfigPath`**: кожен entrypoint
+    (`BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`/`BRAVO_HEALTH`/`BRAVO_SETUP`/
+    `BRAVO_TASKS_INSTALL`/`BRAVO_TASKS_DIAGNOSE`/`BRAVO_TASKS_UNINSTALL`/
+    `BRAVO_CONFIG_TEST`) тепер фіксує, чи оператор реально передав
+    `-ConfigPath` (`$PSBoundParameters.ContainsKey(...)`), ДО auto-дефолту,
+    і передає цей намір явно в `Import-BravoConfiguration
+    -ConfigPathWasExplicit`. AUTO + відсутній `BRAVO.config` — легітимний
+    built-in-only/local-only шлях (не помилка). EXPLICIT + відсутній файл —
+    як і раніше, помилка конфігурації.
+  - **Task Scheduler (`BRAVO_TASKS_INSTALL/DIAGNOSE/UNINSTALL.ps1`)**:
+    генеровані завдання й UAC-relaunch більше не вбудовують `-ConfigPath` у
+    Arguments завдання при AUTO-режимі (кожен запуск завдання сам виконує ту
+    саму AUTO-резолюцію проти свого `RuntimeRoot`) — вбудовується лише при
+    EXPLICIT. Механічно доведено реальною інспекцією `ITaskDefinition.Actions
+    [0].Arguments` (COM API), не лише `-ValidateOnly` exit-кодом.
+  - **`BRAVO_SETUP.ps1`**: `Get-SetupConfiguration`/`Restart-SetupElevated`/
+    manual `.cmd`-launcher-и (`BRAVO_ARCHIV.cmd`, `BRAVO_MAINTENANCE.cmd`,
+    `BRAVO_MAINTENANCE_FORCE_RESTORE.cmd`) отримали той самий AUTO/EXPLICIT
+    контракт; AUTO-launcher більше не вимагає фізичного `BRAVO.config` для
+    генерації і не вбудовує `-ConfigPath` у згенерований `.cmd`-текст
+    (mechanical proof — hermetic-тест читає реальний вміст `.cmd`).
+  - **Configurator**: `BRAVO.Configurator.Effective.psm1` більше не падає,
+    якщо в `RuntimeRoot` немає `BRAVO.config` (раніше — жорсткий throw);
+    попутно виправлено застарілий опис `PublicIPLookupEnabled` у
+    Configurator-схемі (стверджував "вимкнено за замовчуванням (P1.10)",
+    хоча дефолт — `$true` уже з 2026-08-30, див. запис нижче).
+  - **Security**: новий `Test-BRAVOEffectiveSecurityInvariants`
+    (`BRAVO_CONFIG_LOADER.ps1`) перевіряє ПОСТ-merge ефективні
+    `backupConsistency.Mode`/`toolIntegritySettings.Mode` одразу після
+    завантаження конфігурації — закриває сліпу зону, де pre-trust guard
+    (`BRAVO_RUNTIME_GUARD.ps1`) бачив лише текст `BRAVO.config`, а
+    `BRAVO.local.config` міг послабити захист непоміченим. Поважає
+    `BRAVO_RUNTIME_INTEGRITY_MODE`/`BRAVO_ALLOW_WEAKENED_SECURITY` (той
+    самий контракт, що й existing guard).
+  - **`BRAVO.config`**: 3 літеральні значення синхронізовано з canonical
+    built-in дефолтами (задокументовано в `Get-BRAVODefaultConfiguration`
+    як свідомі відхилення до цього PR): `maintenanceSettings.Limits.
+    ExcludedDrives` `@('F:\')` → `@()`, `lunchArchiveCleanupPath`
+    `"E:\Archiv"` → `""`, `smbSettings.RootPath` — placeholder → `""`.
+    Мechanically перевірено (0 розбіжностей) постійним self-test.
+  - **`BRAVO.local.config`** тепер у `.gitignore` (site-специфічний шар, не
+    частина release-артефакту) — розділ "10. Оновлення в установі"
+    `README.md` переписано: заміна комплекту більше не вимагає ручного
+    перенесення значень у новий `BRAVO.config` при кожному оновленні.
+  - Формальний characterization-тест паритету (`ci\
+    Test-BRAVOConfigFoundationParity.ps1`, dev/CI-інструмент, не частина
+    hermetic self-test): для ідентичного `BRAVO.local.config` над повним
+    effective graph (76 `$global:*`-змінних) PR B (`feature/config-
+    foundation-derivation`) і PR C дають ідентичний результат — 0
+    нерегламентованих відмінностей.
+  - Відомий, НЕ виправлений у цьому PR блокер: `BRAVO_CONFIG_INTEGRATE.ps1`
+    (одноразовий міграційний інструмент під дуже старий inline-config
+    патерн) наразі завжди падає проти поточного thin-entrypoint +
+    `.Runtime.ps1` коду — застаріле вже до цього PR, потребує окремого
+    рішення (fix/retire).
+
 - Явне рішення власника (2026-08-30): `maintenanceSettings.Restore.Time` у
   `BRAVO.config` тепер `"21:00"` за замовчуванням (раніше `"03:00"`).
   `Restore.Day = 7` (неділя) лишається без змін. `"21:00"` збігається з

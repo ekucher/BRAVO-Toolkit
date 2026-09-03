@@ -132,6 +132,10 @@ if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
 # додавала WARNING (а отже, ненульовий код завершення 10) до операції, на
 # результат якої вік патчів не впливає жодним чином. Перевірки платформи
 # (ОС, build, PowerShell, .NET, архітектура, API) лишаються на місці.
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -145,20 +149,24 @@ function Test-IsSystemIdentity {
 }
 
 function Get-BRAVOCredentialSetupConfiguration {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [switch]$PathWasExplicit
+    )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
-        throw "Файл конфігурації не знайдено: $Path"
-    }
-
-    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    # P0 Configuration Foundation: BRAVO.config став опційним основним
+    # override-шаром — попередня жорстка "файл мусить існувати" перевірка
+    # (і Resolve-Path, який теж вимагав існування) дублювала те саме
+    # рішення, яке Import-BravoConfiguration тепер приймає коректно сама.
+    # GetFullPath (а не Resolve-Path) нормалізує шлях без вимоги існування.
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
     $root = Split-Path -Path $resolvedPath -Parent
     $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $root -ConfigPath $resolvedPath -RuntimeRoot $bravoScriptDirectory
+    Import-BravoConfiguration -ConfigRoot $root -ConfigPath $resolvedPath -RuntimeRoot $bravoScriptDirectory -ConfigPathWasExplicit:$PathWasExplicit
 
     if ($null -eq $credentialSettings -or
         [string]::IsNullOrWhiteSpace([string]$credentialSettings.HelperPath) -or
@@ -1330,7 +1338,7 @@ function Invoke-ProtectedPayloadWorker {
 }
 
 try {
-    $resolvedConfigPath = Get-BRAVOCredentialSetupConfiguration -Path $ConfigPath
+    $resolvedConfigPath = Get-BRAVOCredentialSetupConfiguration -Path $ConfigPath -PathWasExplicit:$configPathWasExplicit
     Import-Module -Name $credentialSettings.HelperPath -ErrorAction Stop
 
     if (-not [string]::IsNullOrWhiteSpace($ProtectedPayloadPath)) {

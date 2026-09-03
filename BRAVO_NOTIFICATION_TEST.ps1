@@ -99,13 +99,18 @@ function Get-BRAVONotificationTestEffectiveChannel {
 # теж мусить завершитись канонічним кодом, а не CommandNotFoundException.
 Import-Module -Name (Join-Path $PSScriptRoot "modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1") -ErrorAction Stop
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
+
 try {
     $configurationLoaderPath = Join-Path $PSScriptRoot "BRAVO_CONFIG_LOADER.ps1"
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
         throw "Не знайдено BRAVO_CONFIG_LOADER.ps1: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $PSScriptRoot -ConfigPath $ConfigPath -RuntimeRoot $PSScriptRoot
+    Import-BravoConfiguration -ConfigRoot $PSScriptRoot -ConfigPath $ConfigPath -RuntimeRoot $PSScriptRoot -ConfigPathWasExplicit:$configPathWasExplicit
 
     foreach ($moduleName in @("BRAVO.Compatibility", "BRAVO.Credentials", "BRAVO.Notifications")) {
         $modulePath = Join-Path $PSScriptRoot "modules\$moduleName\$moduleName.psd1"

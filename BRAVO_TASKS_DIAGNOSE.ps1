@@ -31,6 +31,10 @@ if (-not (Test-Path -LiteralPath $compatibilityHelpersPath -PathType Leaf)) {
     throw "Не знайдено PowerShell-модуль сумісності: $compatibilityHelpersPath"
 }
 Import-Module -Name $compatibilityHelpersPath -ErrorAction Stop
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $scriptRoot "BRAVO.config"
 }
@@ -132,6 +136,14 @@ function Test-BRAVOScheduledTaskDefinition {
         $RegisteredTask,
         [hashtable]$TaskSettings,
         [string]$ExpectedConfigPath,
+        # P0 Configuration Foundation (PR C, Секція 6): AUTO-встановлені
+        # завдання НЕ повинні мати -ConfigPath у аргументах взагалі (див.
+        # New-BRAVOTaskDefinition) — тому "правильний" стан для AUTO
+        # означає ВІДСУТНІСТЬ токена, а не його наявність із будь-яким
+        # значенням. $false тут — дефолт, що відповідає найпоширенішому
+        # (AUTO) сценарію; викликач передає $true лише коли оператор
+        # свідомо встановлював через -ConfigPath.
+        [bool]$ConfigPathWasExplicit,
         [string]$ExpectedExecutable,
         [string[]]$RequiredArgumentTokens,
         [Parameter(Mandatory = $true)][string]$ExpectedAccount,
@@ -220,9 +232,21 @@ function Test-BRAVOScheduledTaskDefinition {
                 $problems.Add("WorkingDirectory='$workingDirectory', очікується '$expectedWorkingDirectory'")
             }
         }
-        if (-not [string]::IsNullOrWhiteSpace($ExpectedConfigPath) -and
-            $arguments -notlike "*-ConfigPath `"$ExpectedConfigPath`"*") {
-            $problems.Add("-ConfigPath не вказує на $ExpectedConfigPath")
+        # P0 Configuration Foundation (PR C, Секція 6): AUTO/EXPLICIT
+        # семантика симетрична New-BRAVOTaskDefinition — EXPLICIT вимагає
+        # ТОЧНИЙ -ConfigPath, AUTO вимагає його ПОВНУ ВІДСУТНІСТЬ (не лише
+        # "не перевіряємо"): застаріле завдання, встановлене до цього
+        # фіксу (або відредаговане вручну), де AUTO-намір мав би НЕ мати
+        # -ConfigPath, але фактично має — це реальна розбіжність "як
+        # встановлювали" vs "як зараз", яку Diagnose існує саме для того,
+        # щоб виявляти.
+        if ($ConfigPathWasExplicit) {
+            if (-not [string]::IsNullOrWhiteSpace($ExpectedConfigPath) -and
+                $arguments -notlike "*-ConfigPath `"$ExpectedConfigPath`"*") {
+                $problems.Add("-ConfigPath не вказує на $ExpectedConfigPath (EXPLICIT-режим)")
+            }
+        } elseif ($arguments -like "*-ConfigPath *") {
+            $problems.Add("AUTO-режим (оператор не передавав -ConfigPath при інсталяції) не повинен мати -ConfigPath у аргументах завдання, але він присутній")
         }
         if (Test-BRAVOMappedNetworkDrive -Path $actionPath) {
             $problems.Add("Action.Path на підключеному мережевому диску: $actionPath — використайте UNC \\server\share\...")
@@ -260,10 +284,12 @@ function Get-BRAVOTaskFolder {
 }
 
 try {
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-        throw "config не знайдено: $ConfigPath"
-    }
-    $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    # P0 Configuration Foundation: BRAVO.config став опційним основним
+    # override-шаром — попередня жорстка "файл мусить існувати" перевірка
+    # (і Resolve-Path, який теж вимагав існування) дублювала те саме
+    # рішення, яке Import-BravoConfiguration тепер приймає коректно сама.
+    # GetFullPath (а не Resolve-Path) нормалізує шлях без вимоги існування.
+    $resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
     $configurationLoaderPath = Join-Path $scriptRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
@@ -273,7 +299,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $resolvedConfigPath `
-        -RuntimeRoot $scriptRoot
+        -RuntimeRoot $scriptRoot `
+        -ConfigPathWasExplicit:$configPathWasExplicit
 
     if (-not $InspectOnly -and
         (ConvertTo-BRAVOAccountSidValue -AccountName ([string]$schedulerSettings.RunAsUser)) -eq 'S-1-5-18') {
@@ -309,10 +336,14 @@ try {
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            (ConvertTo-BRAVOProcessArgument $PSCommandPath),
-            "-ConfigPath",
-            (ConvertTo-BRAVOProcessArgument $resolvedConfigPath)
+            (ConvertTo-BRAVOProcessArgument $PSCommandPath)
         )
+        # P0 Configuration Foundation (PR C, Секція 6): зберігаємо той
+        # самий AUTO/EXPLICIT намір при власному UAC relaunch Diagnose-а.
+        if ($configPathWasExplicit) {
+            $arguments += "-ConfigPath"
+            $arguments += (ConvertTo-BRAVOProcessArgument $resolvedConfigPath)
+        }
         if ($TestAccess) { $arguments += "-TestAccess" }
         if ($SendTestNotification) { $arguments += "-SendTestNotification" }
         $process = Start-Process `
@@ -441,6 +472,7 @@ try {
             -RegisteredTask $registeredTask `
             -TaskSettings $settings `
             -ExpectedConfigPath $resolvedConfigPath `
+            -ConfigPathWasExplicit $configPathWasExplicit `
             -ExpectedExecutable ([string]$schedulerSettings.PowerShellExecutable) `
             -RequiredArgumentTokens $requiredTokens `
             -ExpectedAccount $expectedPrincipal.UserId `
@@ -516,13 +548,19 @@ try {
             "-ExecutionPolicy",
             "Bypass",
             "-File",
-            (ConvertTo-BRAVOProcessArgument $dryRunPath),
-            "-ConfigPath",
-            (ConvertTo-BRAVOProcessArgument $resolvedConfigPath),
-            "-RequireScheduledTasks",
-            "-ResultPath",
-            (ConvertTo-BRAVOProcessArgument $resultPath)
+            (ConvertTo-BRAVOProcessArgument $dryRunPath)
         )
+        # P0 Configuration Foundation (PR C, Секція 6): тимчасове SYSTEM
+        # dry-run завдання має відтворювати ТОЙ САМИЙ AUTO/EXPLICIT намір,
+        # що й реальні встановлені завдання — інакше діагностика
+        # перевіряла б інший сценарій, ніж той, що реально встановлено.
+        if ($configPathWasExplicit) {
+            $argumentParts += "-ConfigPath"
+            $argumentParts += (ConvertTo-BRAVOProcessArgument $resolvedConfigPath)
+        }
+        $argumentParts += "-RequireScheduledTasks"
+        $argumentParts += "-ResultPath"
+        $argumentParts += (ConvertTo-BRAVOProcessArgument $resultPath)
         if ($TestAccess) { $argumentParts += "-TestAccess" }
         if ($SendTestNotification) { $argumentParts += "-SendTestNotification" }
         $action.Arguments = $argumentParts -join " "

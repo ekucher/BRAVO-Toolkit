@@ -82,6 +82,7 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 BackupRoot = $manualBackupRoot
                 Root = $manualRuntimeOne
                 ConfigPath = $manualConfigPath
+                ConfigPathWasExplicit = $true
             }
             & $manualLauncherModule {
                 param($Setup)
@@ -228,6 +229,7 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 BackupRoot = $validateOnlyRoot
                 Root = $manualRuntimeOne
                 ConfigPath = $manualConfigPath
+                ConfigPathWasExplicit = $true
             }
             & $manualLauncherModule {
                 param($Setup)
@@ -241,6 +243,7 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 BackupRoot = $manualBackupRoot
                 Root = $manualRuntimeTwo
                 ConfigPath = $manualConfigPath
+                ConfigPathWasExplicit = $true
             }
             & $manualLauncherModule {
                 param($Setup)
@@ -266,6 +269,7 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 BackupRoot = $manualBackupRoot
                 Root = $manualRuntimeTwo
                 ConfigPath = $manualConfigPathTwo
+                ConfigPathWasExplicit = $true
             }
             & $manualLauncherModule {
                 param($Setup)
@@ -291,6 +295,7 @@ $archiveScriptText = [IO.File]::ReadAllText(
                     BackupRoot = $actionRoot
                     Root = $manualRuntimeOne
                     ConfigPath = $manualConfigPath
+                    ConfigPathWasExplicit = $true
                 }
                 & $manualLauncherModule {
                     param($Setup, $Action)
@@ -310,6 +315,7 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 BackupRoot = $nonAsciiBackupRoot
                 Root = $nonAsciiRuntime
                 ConfigPath = $manualConfigPath
+                ConfigPathWasExplicit = $true
             }
             $nonAsciiLauncherFailed = $false
             try {
@@ -333,6 +339,63 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 ) `
                 -Name 'ManualLaunchers/BackupRootFilesDoNotEnterGeneration' `
                 -Failure 'root-level .cmd launchers не можуть бути manifest generation або backup artifacts'
+
+            # P0 Configuration Foundation (PR C, Секція 7, hermetic AUTO/EXPLICIT
+            # content proof — власник explicitно вимагав це в correction-checkpoint
+            # п.4): mechanical перевірка згенерованого .cmd тексту, а не лише
+            # exit code Invoke-BRAVOManualLauncherSetup. AUTO -> жодного -ConfigPath
+            # у жодному з трьох launcher-ів; EXPLICIT -> точний -ConfigPath "<path>"
+            # у кожному.
+            $autoLauncherRoot = Join-Path $manualLauncherRoot 'Auto Launcher Root'
+            $autoSetup = [pscustomobject]@{
+                BackupRoot = $autoLauncherRoot
+                Root = $manualRuntimeOne
+                ConfigPath = $manualConfigPath
+                ConfigPathWasExplicit = $false
+            }
+            & $manualLauncherModule {
+                param($Setup)
+                Invoke-BRAVOManualLauncherSetup -SetupConfiguration $Setup -Action Full
+            } $autoSetup
+            $autoArchiveContent = [IO.File]::ReadAllText((Join-Path $autoLauncherRoot 'BRAVO_ARCHIV.cmd'), [Text.Encoding]::ASCII)
+            $autoMaintenanceContent = [IO.File]::ReadAllText((Join-Path $autoLauncherRoot 'BRAVO_MAINTENANCE.cmd'), [Text.Encoding]::ASCII)
+            $autoForceRestoreContent = [IO.File]::ReadAllText((Join-Path $autoLauncherRoot 'BRAVO_MAINTENANCE_FORCE_RESTORE.cmd'), [Text.Encoding]::ASCII)
+            Test-BRAVOCondition `
+                -Condition (
+                    $autoArchiveContent -notmatch '-ConfigPath' -and
+                    $autoMaintenanceContent -notmatch '-ConfigPath' -and
+                    $autoForceRestoreContent -notmatch '-ConfigPath' -and
+                    $autoArchiveContent.Contains(('"{0}"' -f (Join-Path $manualRuntimeOne 'BRAVO_ARCHIV.ps1'))) -and
+                    $autoMaintenanceContent.Contains(('"{0}"' -f (Join-Path $manualRuntimeOne 'BRAVO_MAINTENANCE.ps1')))
+                ) `
+                -Name 'ManualLaunchers/AutoModeOmitsConfigPathFromGeneratedContent' `
+                -Failure 'AUTO ConfigPathWasExplicit=$false має генерувати .cmd launcher без -ConfigPath у тексті (але зі збереженим -File шляхом)'
+            $explicitLauncherRoot = Join-Path $manualLauncherRoot 'Explicit Launcher Root'
+            $explicitSetup = [pscustomobject]@{
+                BackupRoot = $explicitLauncherRoot
+                Root = $manualRuntimeOne
+                ConfigPath = $manualConfigPath
+                ConfigPathWasExplicit = $true
+            }
+            & $manualLauncherModule {
+                param($Setup)
+                Invoke-BRAVOManualLauncherSetup -SetupConfiguration $Setup -Action Full
+            } $explicitSetup
+            $explicitArchiveContent = [IO.File]::ReadAllText((Join-Path $explicitLauncherRoot 'BRAVO_ARCHIV.cmd'), [Text.Encoding]::ASCII)
+            $explicitMaintenanceContent = [IO.File]::ReadAllText((Join-Path $explicitLauncherRoot 'BRAVO_MAINTENANCE.cmd'), [Text.Encoding]::ASCII)
+            $explicitForceRestoreContent = [IO.File]::ReadAllText((Join-Path $explicitLauncherRoot 'BRAVO_MAINTENANCE_FORCE_RESTORE.cmd'), [Text.Encoding]::ASCII)
+            $expectedExplicitConfigPathToken = ' -ConfigPath "{0}"' -f $manualConfigPath
+            Test-BRAVOCondition `
+                -Condition (
+                    $explicitArchiveContent.Contains($expectedExplicitConfigPathToken) -and
+                    $explicitMaintenanceContent.Contains($expectedExplicitConfigPathToken) -and
+                    $explicitForceRestoreContent.Contains($expectedExplicitConfigPathToken) -and
+                    @([regex]::Matches($explicitArchiveContent, '-ConfigPath')).Count -eq 1 -and
+                    @([regex]::Matches($explicitMaintenanceContent, '-ConfigPath')).Count -eq 1 -and
+                    @([regex]::Matches($explicitForceRestoreContent, '-ConfigPath')).Count -eq 1
+                ) `
+                -Name 'ManualLaunchers/ExplicitModeEmbedsExactConfigPathInGeneratedContent' `
+                -Failure 'EXPLICIT ConfigPathWasExplicit=$true має генерувати .cmd launcher з рівно одним точним -ConfigPath "<path>" у тексті'
         } finally {
             Remove-Item -LiteralPath $manualLauncherRoot -Recurse -Force -ErrorAction SilentlyContinue
         }

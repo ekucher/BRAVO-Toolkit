@@ -342,8 +342,17 @@ function Test-BRAVORuntimeSecuritySettings {
         $configAst = [System.Management.Automation.Language.Parser]::ParseFile(
             $ConfigPath, [ref]$tokens, [ref]$parseErrors)
     } else {
-        # Відсутність конфігурації — не задача цього guard: її діагностує
-        # завантажувач із кодом 30 і зрозумілим повідомленням.
+        # P0 Configuration Foundation: BRAVO.config — опційний override-шар.
+        # Його відсутність за замовчуваним шляхом — легітимний
+        # synthetic-no-config сценарій (Import-BravoConfiguration/
+        # BRAVO_CONFIG_LOADER.ps1), не помилка: без BRAVO.config
+        # toolIntegritySettings.Mode/backupConsistency.Mode стартують із
+        # canonical дефолтів (Get-BRAVODefaultConfiguration; toolIntegritySettings
+        # взагалі не raw-configurable — лише deriv). Цей guard, як і раніше,
+        # текстово перевіряє САМЕ BRAVO.config і не бачить BRAVO.local.config
+        # (той самий, уже задокументований поза цим guard-ом розрив — не
+        # новий, і не специфічний для synthetic-шляху: він існував і коли
+        # BRAVO.config був обов'язковим).
         return $result
     }
 

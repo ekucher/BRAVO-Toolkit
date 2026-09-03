@@ -1,7 +1,18 @@
 # BRAVO Configuration Foundation — architecture gate (P0)
 
-> Статус: PR A (canonical defaults + merge engine) реалізовано в цьому PR.
-> PR B/C (нижче) — не реалізовані; описані як план.
+> Статус (оновлено): PR A (canonical defaults + merge engine) — змерджено.
+> PR B (`BRAVO_CONFIG_LOADER.ps1` snapshot-виконання, `-ConfigPath`
+> explicit/auto-intent, security invariant re-validation, Configurator
+> `DefaultValue` adapter) — реалізовано на гілці `feature/config-foundation-
+> derivation`. PR C (прибирання дублюючого derivation/two-phase-override
+> коду з `BRAVO.config`, AUTO/EXPLICIT-контракт для Task Scheduler/
+> `BRAVO_SETUP.ps1`/Configurator, security-blind-spot fix для
+> `BRAVO.local.config`, install/update preservation) — реалізовано на
+> `feature/config-foundation-pr-c` (стек: `developer` ← PR A/B ← ця гілка).
+> Розділи нижче лишаються як історичний запис прийнятого architecture-
+> рішення (7 питань gate, source matrix, обґрунтування розбиття на
+> PR A/B/C) — не переписані заднім числом під фактичну реалізацію; де
+> реалізація відрізнялась від плану, це задокументовано в CHANGELOG.md.
 
 ## 0. Контекст
 

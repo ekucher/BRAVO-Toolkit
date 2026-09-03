@@ -320,61 +320,6 @@ function Read-BRAVOLocalConfigurationOverrides {
     return [pscustomobject]@{ Path = $localOverridePath; Present = $true; Overrides = $localOverrideData }
 }
 
-function Invoke-BRAVOLocalConfigurationOverridePhase {
-    # Застосовує ще не застосовані overrides, чий кореневий $global:-об'єкт
-    # УЖЕ визначено. Викликається з BRAVO.config у двох канонічних точках:
-    # після первинних блоків налаштувань (щоб деривації — archiveDirs,
-    # discovery, scheduler — підхопили перевизначені первинні значення) і в
-    # самому кінці (для пізно визначених leaf-блоків: пороги, розклади).
-    # Проміжні вузли шляху НЕ створюються (захист від опечаток): ключ, що
-    # так і не застосувався, стане помилкою конфігурації в лоадері.
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory = $true)]$State
-    )
-
-    foreach ($overrideKey in @($State.Overrides.Keys)) {
-        if ($State.Applied.Contains([string]$overrideKey)) { continue }
-        $segments = @(([string]$overrideKey) -split '\.')
-        $rootVariable = Get-Variable -Name $segments[0] -Scope Global -ErrorAction SilentlyContinue
-        if ($null -eq $rootVariable -or $null -eq $rootVariable.Value) { continue }
-
-        if ($segments.Count -eq 1) {
-            Set-Variable -Name $segments[0] -Scope Global -Value $State.Overrides[$overrideKey]
-            [void]$State.Applied.Add([string]$overrideKey)
-            continue
-        }
-
-        $currentNode = $rootVariable.Value
-        $intermediateBroken = $false
-        for ($segmentIndex = 1; $segmentIndex -lt ($segments.Count - 1); $segmentIndex++) {
-            $segment = $segments[$segmentIndex]
-            if ($currentNode -is [hashtable] -and $currentNode.Contains($segment)) {
-                $currentNode = $currentNode[$segment]
-            } elseif ($null -ne $currentNode -and $null -ne $currentNode.PSObject.Properties[$segment]) {
-                $currentNode = $currentNode.$segment
-            } else {
-                $intermediateBroken = $true
-                break
-            }
-        }
-        if ($intermediateBroken -or $null -eq $currentNode) { continue }
-
-        $leafSegment = $segments[$segments.Count - 1]
-        if ($currentNode -is [hashtable]) {
-            # Новий ключ у hashtable дозволено: опційні властивості з
-            # Contains-нормалізацією у споживачах — легітимна ціль override.
-            $currentNode[$leafSegment] = $State.Overrides[$overrideKey]
-            [void]$State.Applied.Add([string]$overrideKey)
-        } elseif ($null -ne $currentNode.PSObject.Properties[$leafSegment]) {
-            $currentNode.$leafSegment = $State.Overrides[$overrideKey]
-            [void]$State.Applied.Add([string]$overrideKey)
-        }
-        # Інакше (об'єкт без такої властивості) — лишається незастосованим:
-        # лоадер підніме помилку зі списком таких ключів.
-    }
-}
-
 function Assert-BravoLoadedConfiguration {
     [CmdletBinding()]
     param(
@@ -699,6 +644,221 @@ function Assert-BravoLoadedConfiguration {
     Assert-BravoDataRootsAreIndependent -PathSettings $global:pathSettings
 }
 
+function Test-BRAVOEffectiveSecurityInvariants {
+    # P0 Configuration Foundation (PR C, Секція 5.4): ФІНАЛЬНА перевірка
+    # ЕФЕКТИВНИХ (post-merge: DEFAULT + PRIMARY + LOCAL, УСІ джерела
+    # одночасно) значень безпеки — після Complete-BRAVOConfigurationLoad,
+    # ДО повернення керування бізнес-операціям (викликається з
+    # Import-BravoConfiguration одразу після Assert-BravoLoadedConfiguration).
+    #
+    # BRAVO_RUNTIME_GUARD.ps1 (pre-trust, ДО Import-Module,
+    # Test-BRAVORuntimeSecuritySettings) статично AST-сканує ЛИШЕ текст
+    # BRAVO.config — навмисно не бачить BRAVO.local.config (інший формат,
+    # інший момент застосування; сам guard це документує). До цієї
+    # перевірки те саме послаблення (напр. 'backupConsistency.Mode' =
+    # 'Direct'), записане через BRAVO.local.config замість BRAVO.config,
+    # проходило б повз pre-trust guard непоміченим і ставало б ефективним
+    # — ідентичний за наслідками, лише інший вектор. Ця функція перевіряє
+    # РЕАЛЬНЕ post-merge значення (не текстовий літерал), тому ловить
+    # послаблення ОДНАКОВО незалежно від того, чи прийшло воно з
+    # BRAVO.config, BRAVO.local.config, чи з обох одночасно (Test 5.4 —
+    # config-present-режим теж перевірено, не лише no-config).
+    #
+    # toolIntegritySettings.Mode НЕ raw-configurable (канонічна константа
+    # з Resolve-BRAVOConfigurationDerivation, BRAVO.Configuration.Derivation
+    # .psm1 — жодне джерело не може її перевизначити raw-шляхом): перевірка
+    # тут — дешевий захисний canary на випадок майбутньої архітектурної
+    # регресії (якщо колись знову стане raw-configurable), не активний
+    # вектор атаки сьогодні.
+    #
+    # Той самий операторський контракт, що BRAVO_RUNTIME_GUARD.ps1: Mode
+    # (Enforce/Warn через BRAVO_RUNTIME_INTEGRITY_MODE) і
+    # BRAVO_ALLOW_WEAKENED_SECURITY=1 (свідоме тимчасове послаблення,
+    # лишає слід у виводі) — Секція 5.5: НЕ окремий, розбіжний набір
+    # перемикачів; ті самі значення ('VSS', 'Enforce'), що очікує
+    # pre-trust guard.
+    [CmdletBinding()]
+    param()
+
+    $integrityMode = if ($env:BRAVO_RUNTIME_INTEGRITY_MODE -eq 'Warn') { 'Warn' } else { 'Enforce' }
+    $allowWeakened = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+
+    $weakened = New-Object System.Collections.Generic.List[string]
+
+    if ($global:backupConsistency -is [hashtable] -and
+        $global:backupConsistency.Contains('Mode') -and
+        -not [string]::Equals([string]$global:backupConsistency.Mode, 'VSS', [System.StringComparison]::OrdinalIgnoreCase)) {
+        [void]$weakened.Add(
+            "backupConsistency.Mode = '$($global:backupConsistency.Mode)' замість 'VSS' " +
+            "(архів читається з live-каталогу, файли належать різним моментам часу)")
+    }
+
+    if ($global:toolIntegritySettings -is [hashtable] -and
+        $global:toolIntegritySettings.Contains('Mode') -and
+        -not [string]::Equals([string]$global:toolIntegritySettings.Mode, 'Enforce', [System.StringComparison]::OrdinalIgnoreCase)) {
+        [void]$weakened.Add(
+            "toolIntegritySettings.Mode = '$($global:toolIntegritySettings.Mode)' замість 'Enforce' " +
+            "(підмінений 7za.exe/WinSCP більше не блокує запуск)")
+    }
+
+    if ($weakened.Count -eq 0) { return }
+
+    if ($allowWeakened -eq '1') {
+        Write-Warning (
+            "УВАГА: ЕФЕКТИВНА конфігурація (BRAVO.config + BRAVO.local.config злиті) послаблює захист: " +
+            "$($weakened -join '; '). Продовжено через BRAVO_ALLOW_WEAKENED_SECURITY=1. " +
+            "Це тимчасовий режим міграції, не для постійної експлуатації."
+        )
+        return
+    }
+
+    $message = (
+        "ЕФЕКТИВНА КОНФІГУРАЦІЯ ПОСЛАБЛЮЄ ЗАХИСТ (post-merge, включно з BRAVO.local.config, якщо " +
+        "присутній): $($weakened -join '; '). Якщо послаблення свідоме й тимчасове, встановіть " +
+        "BRAVO_ALLOW_WEAKENED_SECURITY=1 — тоді воно лишає слід поза комплектом."
+    )
+
+    if ($integrityMode -eq 'Enforce') {
+        throw $message
+    }
+    Write-Warning "$message (RuntimeIntegrityMode = Warn — запуск продовжується, але це слід перевірити)"
+}
+
+function Complete-BRAVOConfigurationLoad {
+    # P0 Configuration Foundation (PR C, Секція 3): ОДИН canonical
+    # raw/effective pipeline для ОБОХ шляхів — BRAVO.config присутній чи
+    # ні. Різниця між шляхами — лише в тому, що потрапляє в
+    # -PrimaryOverrides ($null/порожньо для synthetic; raw-знімок
+    # виконаного legacy BRAVO.config для primary-шляху). Усе інше — злиття
+    # DEFAULT < PRIMARY < LOCAL (Resolve-BRAVORawConfiguration), проєкція в
+    # $global:, і ЄДИНИЙ виклик Resolve-BRAVOConfigurationDerivation —
+    # спільне для обох шляхів, а не дві незалежні копії.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [AllowNull()][hashtable]$PrimaryOverrides,
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+    )
+
+    # -Force НЕ використовується навмисно: повторний Import-Module тієї
+    # самої вже завантаженої модульної функції в цьому ж процесі
+    # переустановлює її з нуля (перевірено емпірично) — self-test-фікстури,
+    # що підміняють Get-BRAVOCanonicalDiscoverySettings function-shadowing
+    # прийомом (як для Get-CimInstance/Get-WmiObject), покладаються саме
+    # на ЦЕЙ ранній-вихід, інакше кожен виклик Complete-BRAVOConfigurationLoad
+    # мовчки стирав би підміну. Побічний ефект корисний і поза тестами:
+    # уникає зайвого перезавантаження модуля на кожному Import-BravoConfiguration.
+    $configurationModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name $configurationModulePath -ErrorAction Stop
+    }
+    $derivationModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psd1'
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Derivation')) {
+        Import-Module -Name $derivationModulePath -ErrorAction Stop
+    }
+
+    $defaultConfiguration = Get-BRAVODefaultConfiguration
+    $mergedConfiguration = Resolve-BRAVORawConfiguration `
+        -DefaultConfiguration $defaultConfiguration `
+        -PrimaryOverrides $PrimaryOverrides `
+        -LocalOverrides $LocalOverrides
+
+    # Проєкція кожного top-level ключа мерджу в $global: — той самий
+    # контракт, що BRAVO.config колись встановлював власними
+    # $global:-присвоєннями для кожного raw-блоку (bravoSettings,
+    # pathSettings, ...).
+    foreach ($topLevelKey in @($mergedConfiguration.Keys)) {
+        Set-Variable -Name $topLevelKey -Scope Global -Value $mergedConfiguration[$topLevelKey]
+    }
+
+    # Поля, які раніше обчислював сам BRAVO.config як тривіальні
+    # проєкції/константи, а не через raw-блок (runtimeRoot — параметр
+    # виклику; archivePrefix — зручний alias на bravoSettings.
+    # ArchivePrefix; discoverySettings — фіксована НЕ raw-configurable
+    # структура, canonical для обох шляхів).
+    $global:runtimeRoot = $RuntimeRoot
+    $global:archivePrefix = $global:bravoSettings.ArchivePrefix
+    $global:discoverySettings = Get-BRAVOCanonicalDiscoverySettings
+
+    Resolve-BRAVOConfigurationDerivation `
+        -runtimeRoot $global:runtimeRoot `
+        -bravoSettings $global:bravoSettings `
+        -credentialSettings $global:credentialSettings `
+        -pathSettings $global:pathSettings `
+        -maintenanceSettings $global:maintenanceSettings `
+        -componentSettings $global:componentSettings `
+        -discoverySettings $global:discoverySettings `
+        -sftpDirectories $global:sftpDirectories `
+        -backupMonitoring $global:backupMonitoring `
+        -schedulerSettings $global:schedulerSettings `
+        -restoreVerifySettings $global:restoreVerifySettings
+}
+
+function Import-BravoSyntheticConfiguration {
+    # P0 Configuration Foundation: будує повну ефективну raw-конфігурацію
+    # БЕЗ BRAVO.config — канонічні built-in defaults + BRAVO.local.config
+    # overrides (precedence DEFAULT < BRAVO.config < BRAVO.local.config,
+    # де середній шар просто відсутній). Complete-BRAVOConfigurationLoad —
+    # той самий canonical pipeline, яким користується й BRAVO.config-шлях
+    # (Import-BravoLegacyPrimaryConfiguration нижче).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+    )
+
+    Complete-BRAVOConfigurationLoad `
+        -RuntimeRoot $RuntimeRoot `
+        -PrimaryOverrides $null `
+        -LocalOverrides $LocalOverrides
+}
+
+function Import-BravoLegacyPrimaryConfiguration {
+    # P0 Configuration Foundation (PR C, Секція 3): BRAVO.config (legacy
+    # primary) виконується, але лише ЯК ДЖЕРЕЛО RAW-значень — файл більше
+    # НЕ викликає власний override-phase чи derivation (обидва видалені з
+    # самого BRAVO.config цим PR). Captured у $primaryRawOverrides ЛИШЕ
+    # ключі з canonical allowlist (Get-BRAVODefaultConfiguration.Keys) —
+    # жодного derived/невідомого $global:-значення (runtimeRoot,
+    # discoverySettings, operationLockSettings, archivePrefix, і будь-яке
+    # інше, обчислене derivation-резолвером) сюди НЕ потрапляє: ці поля
+    # canonical resolver перераховує ПІСЛЯ фінального merge, а не приймає
+    # від primary як необмежений вхід.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$ConfigRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+    )
+
+    $configurationModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name $configurationModulePath -ErrorAction Stop
+    }
+
+    # Files with a non-.ps1 extension are not reliably dot-sourced by
+    # Windows PowerShell. Read the legacy file explicitly and compile it
+    # as a script block, preserving its param(ConfigRoot) contract.
+    $legacyConfigText = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
+    $legacyConfigScript = [scriptblock]::Create($legacyConfigText)
+    & $legacyConfigScript -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot
+
+    $defaultConfiguration = Get-BRAVODefaultConfiguration
+    $primaryRawOverrides = @{}
+    foreach ($topLevelKey in @($defaultConfiguration.Keys)) {
+        $legacyVariable = Get-Variable -Name $topLevelKey -Scope Global -ErrorAction SilentlyContinue
+        if ($null -ne $legacyVariable -and $null -ne $legacyVariable.Value) {
+            $primaryRawOverrides[$topLevelKey] = $legacyVariable.Value
+        }
+    }
+
+    Complete-BRAVOConfigurationLoad `
+        -RuntimeRoot $RuntimeRoot `
+        -PrimaryOverrides $primaryRawOverrides `
+        -LocalOverrides $LocalOverrides
+}
+
 function Import-BravoConfiguration {
     [CmdletBinding()]
     param(
@@ -714,6 +874,26 @@ function Import-BravoConfiguration {
         # і тоді modules\ треба шукати не поруч із нею, а поруч зі скриптами.
         [string]$RuntimeRoot,
 
+        # P0 Configuration Foundation (PR C): явний namір оператора
+        # ("-ConfigPath був справді заданий на виклику скрипта") МУСИТЬ
+        # фіксуватись на межі справжнього entrypoint-а — там, де існує
+        # РЕАЛЬНИЙ $PSBoundParameters.ContainsKey('ConfigPath') виклику
+        # оператора, ДО того, як entrypoint підставить свій auto-derived
+        # дефолт. $PSBoundParameters ЦІЄЇ функції для цього не годиться:
+        # усі відомі виклики верхнього рівня (BRAVO.Archive/Health/
+        # Maintenance.Runtime.ps1 та ін.) заздалегідь резолвлять і ЗАВЖДИ
+        # передають сюди вже непорожній -ConfigPath, навіть коли сам
+        # оператор нічого не вказував — тож ContainsKey('ConfigPath') тут
+        # був би true для кожного виклику. Порівняння РЕЗУЛЬТАТУ шляху з
+        # auto-похідним (попередня версія цього коду) теж некоректне:
+        # оператор, що явно набрав саме той самий шлях, який дала б
+        # auto-похідна, має намір "цей файл МУСИТЬ існувати" — а не
+        # "мені байдуже". Тому виклик-caller (кожен entrypoint) сам
+        # обчислює intent зі СВОГО $PSBoundParameters і передає його сюди
+        # явним параметром — це джерело правди, а не здогад на основі
+        # значення шляху.
+        [switch]$ConfigPathWasExplicit,
+
         [switch]$PassThru
     )
 
@@ -724,15 +904,35 @@ function Import-BravoConfiguration {
         [System.IO.Path]::GetFullPath($RuntimeRoot)
     }
 
+    # Порожній/whitespace -ConfigPathWasExplicit-аргумент від caller-а, що
+    # сам нічого не отримав від оператора, не є свідомим наміром — навіть
+    # якщо помилково передано -ConfigPathWasExplicit разом із порожнім
+    # -ConfigPath (захист від помилки виклику, не єдиний механізм). Перевірка
+    # МАЄ бути ДО auto-дефолту нижче: після нього $ConfigPath уже ніколи не
+    # порожній, і перевірка після мутації завжди дала б $true.
+    $configPathWasExplicit = [bool]$ConfigPathWasExplicit -and
+        -not [string]::IsNullOrWhiteSpace($ConfigPath)
+
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
         $ConfigPath = Join-Path $resolvedConfigRoot 'BRAVO.config'
     }
 
     $resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
+    $legacyConfigFileExists = Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf
 
-    Test-BravoLegacyConfiguration `
-        -ConfigPath $resolvedConfigPath `
-        -ConfigRoot $resolvedConfigRoot
+    if ($configPathWasExplicit -or $legacyConfigFileExists) {
+        # Явний -ConfigPath завжди мусить існувати (свідомий намір
+        # виклику/оператора) — відсутній файл за явно вказаним шляхом
+        # лишається помилкою конфігурації, як і раніше. Auto-derived шлях,
+        # що не існує, — тепер НЕ помилка: BRAVO.config стає опційним
+        # основним override-шаром (Import-BravoSyntheticConfiguration
+        # нижче), а не єдиним джерелом дефолтів/деривації.
+        Test-BravoLegacyConfiguration `
+            -ConfigPath $resolvedConfigPath `
+            -ConfigRoot $resolvedConfigRoot
+    } elseif (-not (Test-Path -LiteralPath $resolvedConfigRoot -PathType Container)) {
+        throw "Не знайдено каталог конфігурації: $resolvedConfigRoot"
+    }
 
     $versionMetadata = Get-BravoVersionMetadata -ConfigRoot $resolvedRuntimeRoot
 
@@ -747,8 +947,9 @@ function Import-BravoConfiguration {
     }
 
     # Локальні site-overrides (BRAVO.local.config поряд з effective config):
-    # читаються ДО виконання BRAVO.config; сам config застосовує їх у двох
-    # канонічних фазах через Invoke-BRAVOLocalConfigurationOverridePhase.
+    # читаються ДО виконання BRAVO.config і зливаються ОДНИМ canonical
+    # pipeline (Complete-BRAVOConfigurationLoad, Секція 3) — більше НЕ
+    # двофазний Invoke-BRAVOLocalConfigurationOverridePhase.
     $localOverrideRead = Read-BRAVOLocalConfigurationOverrides `
         -ConfigDirectory (Split-Path -Path $resolvedConfigPath -Parent)
     $localOverrideState = $null
@@ -760,19 +961,22 @@ function Import-BravoConfiguration {
         }
     }
     $global:BravoLocalConfigOverrideState = $localOverrideState
+    $effectiveLocalOverrides = if ($null -ne $localOverrideState) { $localOverrideState.Overrides } else { @{} }
+
+    $configurationFormat = if ($legacyConfigFileExists) { 'legacy-config' } else { 'synthetic-no-config' }
 
     try {
-        # Files with a non-.ps1 extension are not reliably dot-sourced by
-        # Windows PowerShell. Read the legacy file explicitly and compile it
-        # as a script block, preserving its param(ConfigRoot) contract.
-        $legacyConfigText = Get-Content `
-            -LiteralPath $resolvedConfigPath `
-            -Raw `
-            -Encoding UTF8 `
-            -ErrorAction Stop
-
-        $legacyConfigScript = [scriptblock]::Create($legacyConfigText)
-        & $legacyConfigScript -ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot
+        if ($legacyConfigFileExists) {
+            Import-BravoLegacyPrimaryConfiguration `
+                -ConfigPath $resolvedConfigPath `
+                -ConfigRoot $resolvedConfigRoot `
+                -RuntimeRoot $resolvedRuntimeRoot `
+                -LocalOverrides $effectiveLocalOverrides
+        } else {
+            Import-BravoSyntheticConfiguration `
+                -RuntimeRoot $resolvedRuntimeRoot `
+                -LocalOverrides $effectiveLocalOverrides
+        }
     }
     catch {
         # Реальний DEV-майданчик (2026-08-24, Windows NT 6.2.9200 / PowerShell
@@ -804,7 +1008,25 @@ function Import-BravoConfiguration {
             # Див. коментар вище — діагностичне збагачення не повинне саме
             # кидати нову помилку поверх оригінальної.
         }
-        throw "Не вдалося завантажити BRAVO.config '$resolvedConfigPath': $($_.Exception.Message).$unsupportedEnvironmentHint"
+        $failedConfigurationDescription = if ($legacyConfigFileExists) {
+            "BRAVO.config '$resolvedConfigPath'"
+        } else {
+            "синтетичну конфігурацію без BRAVO.config (ConfigRoot '$resolvedConfigRoot')"
+        }
+        throw "Не вдалося завантажити $failedConfigurationDescription`: $($_.Exception.Message).$unsupportedEnvironmentHint"
+    }
+
+    if ($null -ne $localOverrideState) {
+        # P0 Configuration Foundation (PR C, Секція 3): ОБИДВА шляхи тепер
+        # проходять через ОДИН atomic Resolve-BRAVORawConfiguration (через
+        # ConvertTo-BRAVONestedOverride) — той уже fail-closed кинув би
+        # виняток вище на БУДЬ-який невідомий dot-шлях ОДНИМ проходом, до
+        # злиття. Якщо дійшли сюди без винятку, усі ключі гарантовано
+        # застосувались для ОБОХ шляхів — позначаємо це тут, щоб перевірка
+        # "unappliedOverrideKeys" нижче не спрацювала хибно.
+        foreach ($appliedOverrideKey in @($localOverrideState.Overrides.Keys)) {
+            [void]$localOverrideState.Applied.Add([string]$appliedOverrideKey)
+        }
     }
 
     # Fail-closed для overrides: ключ, що не застосувався в жодній фазі, —
@@ -828,6 +1050,11 @@ function Import-BravoConfiguration {
     $global:BravoLocalConfigOverrideState = $null
 
     Assert-BravoLoadedConfiguration -RuntimeRoot $resolvedRuntimeRoot
+
+    # Секція 5.4: фінальна перевірка ЕФЕКТИВНИХ (post-merge) значень
+    # безпеки — ПІСЛЯ повного злиття (default+primary+local), ДО
+    # повернення керування бізнес-операціям entrypoint-а.
+    Test-BRAVOEffectiveSecurityInvariants
 
     $legacyScriptVersionVariable = Get-Variable `
         -Name 'ScriptVersion' `
@@ -874,14 +1101,33 @@ function Import-BravoConfiguration {
     }
 
     $global:BravoVersionMetadata = $versionMetadata
+    # P0 Configuration Foundation (PR C, Секція 10): Mode однозначно
+    # показує композицію ефективної конфігурації для операторської
+    # діагностики (BRAVO_CONFIG_TEST.ps1, dry-run тощо) — Format лишається
+    # (сумісність із наявними консюмерами: BRAVO_DRY_RUN.ps1), Mode —
+    # доповнення, не заміна.
+    $configurationMode = if ($legacyConfigFileExists) {
+        if ($null -ne $localOverrideState) { 'LegacyPrimary+Local' } else { 'LegacyPrimary' }
+    } else {
+        if ($null -ne $localOverrideState) { 'BuiltIn+Local' } else { 'BuiltInOnly' }
+    }
     $global:BravoConfigurationMetadata = [pscustomobject]@{
-        Format = 'legacy-config'
+        Format = $configurationFormat
+        Mode = $configurationMode
         ConfigPath = $resolvedConfigPath
         ConfigRoot = $resolvedConfigRoot
         RuntimeRoot = $resolvedRuntimeRoot
+        PrimaryConfigPath = $resolvedConfigPath
+        PrimaryConfigPresent = $legacyConfigFileExists
+        PrimaryConfigWasExplicit = $configPathWasExplicit
+        LocalConfigPath = if ($null -ne $localOverrideState) { [string]$localOverrideState.Path } else { $null }
+        LocalConfigPresent = ($null -ne $localOverrideState)
         # Ключі з BRAVO.local.config, реально застосовані цим завантаженням
         # (порожньо = файла немає) — операторська прозорість для dry-run/діагностики.
         LocalConfigOverrides = @(
+            if ($null -ne $localOverrideState) { @($localOverrideState.Applied) | Sort-Object } else { @() }
+        )
+        AppliedLocalOverrideKeys = @(
             if ($null -ne $localOverrideState) { @($localOverrideState.Applied) | Sort-Object } else { @() }
         )
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion

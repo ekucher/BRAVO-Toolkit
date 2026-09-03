@@ -41,6 +41,10 @@ if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
 # додавала WARNING (а отже, ненульовий код завершення 10) до операції, на
 # результат якої вік патчів не впливає жодним чином. Перевірки платформи
 # (ОС, build, PowerShell, .NET, архітектура, API) лишаються на місці.
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -87,12 +91,15 @@ function Remove-TaskFolderIfEmpty {
 
 
 
-if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
-    Write-Error "Файл конфігурації не знайдено: $ConfigPath"
-    Complete-BRAVOHelperLog -ExitCode 1
-}
-
-$resolvedConfigPath = (Resolve-Path -Path $ConfigPath).Path
+# P0 Configuration Foundation: BRAVO.config став опційним основним
+# override-шаром — попередня жорстка "файл мусить існувати" перевірка
+# (і Resolve-Path, який теж вимагав існування) дублювала те саме
+# рішення, яке Import-BravoConfiguration тепер приймає коректно сама.
+# GetFullPath (а не Resolve-Path) нормалізує шлях без вимоги існування.
+# Прибирання завдань планувальника залежить лише від schedulerSettings.*
+# .TaskName (raw-configurable зі своїм canonical дефолтом), не від
+# наявності самого BRAVO.config.
+$resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 try {
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
     $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
@@ -100,7 +107,7 @@ try {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $bravoScriptDirectory
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $bravoScriptDirectory -ConfigPathWasExplicit:$configPathWasExplicit
     $taskService = New-Object -ComObject "Schedule.Service"
     $taskService.Connect()
     $taskPath = ConvertTo-BRAVOTaskPath -TaskPath $schedulerSettings.TaskPath
@@ -143,7 +150,12 @@ try {
 
 if (-not $ValidateOnly -and -not (Test-IsAdministrator)) {
     Write-Host "Потрібні права адміністратора. Відкривається запит UAC..." -ForegroundColor Yellow
-    $elevationArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ConfigPath `"$resolvedConfigPath`""
+    # P0 Configuration Foundation (PR C, Секція 6): зберігаємо AUTO/EXPLICIT
+    # намір при UAC relaunch — той самий контракт, що BRAVO_TASKS_INSTALL.ps1.
+    $elevationArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    if ($configPathWasExplicit) {
+        $elevationArguments += " -ConfigPath `"$resolvedConfigPath`""
+    }
     if ($StopRunningTasks) {
         $elevationArguments += " -StopRunningTasks"
     }

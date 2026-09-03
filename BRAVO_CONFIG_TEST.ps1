@@ -24,9 +24,15 @@ if (-not (Test-Path -LiteralPath $loaderPath -PathType Leaf)) {
 
 . $loaderPath
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
+
 $result = Import-BravoConfiguration `
     -ConfigRoot $scriptRoot `
     -ConfigPath $ConfigPath `
+    -ConfigPathWasExplicit:$configPathWasExplicit `
     -PassThru
 
 # Ефективні корені (з урахуванням AUTO) обчислює BRAVO.config і публікує
@@ -43,7 +49,11 @@ $validation = [pscustomobject]@{
     PackageVersionMatchesLegacyConfig = $result.Configuration.PackageVersionMatchesLegacyConfig
     ConfigSchemaVersion = $result.Configuration.ConfigSchemaVersion
     ConfigFormat = $result.Configuration.Format
+    ConfigMode = $result.Configuration.Mode
     ConfigPath = $result.Configuration.ConfigPath
+    PrimaryConfigPresent = $result.Configuration.PrimaryConfigPresent
+    PrimaryConfigWasExplicit = $result.Configuration.PrimaryConfigWasExplicit
+    LocalConfigPresent = $result.Configuration.LocalConfigPresent
     RuntimeRoot = [string]$global:runtimeRoot
     RuntimeLogRoot = [string]$global:runtimeLogRoot
     ConfiguredLIMSRoot = [string]$limsRootResult.ConfiguredPath
@@ -65,7 +75,15 @@ if ($AsJson) {
     exit 0
 }
 
-Write-Host ('[INFO] Configuration loaded: {0}' -f $validation.ConfigPath)
+# P0 Configuration Foundation (PR C, Секція 10): без primary (BuiltInOnly/
+# BuiltIn+Local) НЕ друкувати "Configuration loaded: <шлях>" — цей шлях
+# фізично не існує, і рядок читався б так, ніби файл реально завантажено.
+if ($validation.PrimaryConfigPresent) {
+    Write-Host ('[INFO] Configuration loaded: {0}' -f $validation.ConfigPath)
+} else {
+    Write-Host ('[INFO] Configuration mode: {0} (BRAVO.config відсутній — canonical дефолти{1})' -f `
+        $validation.ConfigMode, $(if ($validation.LocalConfigPresent) { ' + BRAVO.local.config' } else { '' }))
+}
 Write-Host ('[INFO] Package version: {0}' -f $validation.PackageVersion)
 Write-Host ('[INFO] Legacy config version: {0}' -f $validation.LegacyScriptVersion)
 Write-Host ('[INFO] Configuration schema: {0}' -f $validation.ConfigSchemaVersion)

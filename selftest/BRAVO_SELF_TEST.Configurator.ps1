@@ -994,6 +994,71 @@ Test-BRAVOCondition ((Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelB 
     'Configurator SessionOutcome: Reload після зовнішньої зміни, без edits -> NoChanges' `
     "Outcome=$(Get-BRAVOConfiguratorSessionOutcome -Model $outcomeModelB -ProductionBaseline $outcomeBaselineB -AnyApplySucceeded $false)"
 
+# ===== P0 Configuration Foundation (PR C, Секція 8): Configurator без
+# фізичного BRAVO.config (built-in-only + BRAVO.local.config-only шлях) —
+# та сама герметична модель fixture, що вище, але БЕЗ BRAVO.config
+# взагалі: LIMSRoot/BackupRoot надаються через CandidateOverrides (=
+# кандидатний BRAVO.local.config, який New-BRAVOConfiguratorIsolatedConfigRoot
+# і так уже пише), а не через патчений primary-шар. Доводить: (1)
+# Invoke-BRAVOConfiguratorEffectiveComputation більше НЕ вимагає фізичного
+# BRAVO.config (раніше — жорсткий throw); (2) DefaultValue для
+# hostInformationSettings.PublicIPLookupEnabled узгоджений із дійсним
+# canonical дефолтом ($true, рішення власника 2026-08-30) — не застарілим
+# P1.10-текстом схеми (drift, знайдений і виправлений у Секції 8). =====
+$configuratorNoConfigRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_CONFIGURATOR_SELFTEST_NOCONFIG_{0}" -f [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($configuratorNoConfigRuntimeRoot)
+try {
+    $configuratorNoConfigLimsRoot = Join-Path $configuratorNoConfigRuntimeRoot 'FIXTURE_LIMS'
+    $configuratorNoConfigBackupRoot = Join-Path $configuratorNoConfigRuntimeRoot 'FIXTURE_BACKUP'
+    [void][IO.Directory]::CreateDirectory($configuratorNoConfigLimsRoot)
+    [void][IO.Directory]::CreateDirectory($configuratorNoConfigBackupRoot)
+    Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination (Join-Path $configuratorNoConfigRuntimeRoot 'BRAVO_CONFIG_LOADER.ps1') -Force
+    Copy-Item -LiteralPath (Join-Path $root 'VERSION.json') -Destination (Join-Path $configuratorNoConfigRuntimeRoot 'VERSION.json') -Force
+    $null = cmd.exe /c mklink /J "$configuratorNoConfigRuntimeRoot\modules" "$root\modules" 2>&1
+    # Свідомо НЕ копіюємо BRAVO.config — це і є предмет перевірки.
+    Test-BRAVOCondition (-not (Test-Path -LiteralPath (Join-Path $configuratorNoConfigRuntimeRoot 'BRAVO.config') -PathType Leaf)) `
+        'Configurator no-config fixture: BRAVO.config справді відсутній (self-test setup guard)' `
+        'fixture RuntimeRoot несподівано містить BRAVO.config'
+
+    $configuratorNoConfigDefault = $null
+    $configuratorNoConfigComputationFailed = $false
+    $configuratorNoConfigComputationMessage = ''
+    try {
+        $configuratorNoConfigDefault = Invoke-BRAVOConfiguratorEffectiveComputation `
+            -RuntimeRoot $configuratorNoConfigRuntimeRoot `
+            -CandidateOverrides @{
+                'pathSettings.LIMSRoot' = $configuratorNoConfigLimsRoot
+                'pathSettings.BackupRoot' = $configuratorNoConfigBackupRoot
+            }
+    } catch {
+        $configuratorNoConfigComputationFailed = $true
+        $configuratorNoConfigComputationMessage = $_.Exception.Message
+    }
+    Test-BRAVOCondition (-not $configuratorNoConfigComputationFailed) `
+        'Configurator Effective: без фізичного BRAVO.config обчислення НЕ падає (built-in-only + local-only шлях)' `
+        "Помилка: $configuratorNoConfigComputationMessage"
+
+    if (-not $configuratorNoConfigComputationFailed) {
+        Test-BRAVOCondition (
+            [bool]$configuratorNoConfigDefault.hostInformationSettings.PublicIPLookupEnabled -eq $true
+        ) `
+            'Configurator no-config Default: PublicIPLookupEnabled узгоджений із canonical дефолтом ($true, рішення власника 2026-08-30, не застарілий P1.10=false)' `
+            "Отримано: $($configuratorNoConfigDefault.hostInformationSettings.PublicIPLookupEnabled)"
+
+        $configuratorNoConfigModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorNoConfigDefault -LocalOverrides @{}
+        $configuratorNoConfigPublicIpSetting = @($configuratorNoConfigModel | Where-Object { $_.Path -eq 'hostInformationSettings.PublicIPLookupEnabled' })
+        Test-BRAVOCondition (
+            $configuratorNoConfigPublicIpSetting.Count -eq 1 -and
+            [bool]$configuratorNoConfigPublicIpSetting[0].DefaultValue -eq $true
+        ) `
+            'Configurator no-config Model: DefaultValue-колонка (не лише сирий Effective-знімок) теж узгоджена з canonical дефолтом' `
+            "DefaultValue=$($configuratorNoConfigPublicIpSetting[0].DefaultValue)"
+    }
+} finally {
+    Remove-Item -LiteralPath $configuratorNoConfigRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====

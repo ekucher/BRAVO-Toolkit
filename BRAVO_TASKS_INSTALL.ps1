@@ -50,6 +50,12 @@ if ($BRAVOPowerShellUpdate.IsUpdateRecommended) {
 # додавала WARNING (а отже, ненульовий код завершення 10) до операції, на
 # результат якої вік патчів не впливає жодним чином. Перевірки платформи
 # (ОС, build, PowerShell, .NET, архітектура, API) лишаються на місці.
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту —
+# використовується і для Import-BravoConfiguration, і для рішення, чи
+# вбудовувати -ConfigPath у Task Scheduler XML/UAC relaunch (Секція 6).
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -272,7 +278,19 @@ function New-BRAVOTaskDefinition {
         [hashtable]$TaskSettings,
         [ValidateSet("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")]
         [string]$TaskType,
-        [string]$ResolvedConfigPath
+        [string]$ResolvedConfigPath,
+
+        # P0 Configuration Foundation (PR C, Секція 6): AUTO-інсталяція
+        # (оператор НЕ передав -ConfigPath) НЕ повинна вбудовувати
+        # -ConfigPath у заплановане завдання — інакше майбутнє
+        # додавання/видалення BRAVO.config на цьому сервері вимагало б
+        # переінсталяції задач, і auto-задача мовчки ставала б explicit.
+        # Кожен запуск задачі сам виконує ту саму AUTO-резолюцію, що й
+        # цей інсталятор (entrypoint без -ConfigPath -> Import-BravoConfiguration
+        # сама визначає no-config/legacy-primary шлях). EXPLICIT-інсталяція
+        # (оператор свідомо передав -ConfigPath, зокрема зовнішній
+        # ConfigRoot != RuntimeRoot) зберігає точний шлях у задачі.
+        [bool]$ConfigPathWasExplicit
     )
 
     # Task Scheduler 2.0 COM API доступний починаючи з Windows Vista/7 і
@@ -384,7 +402,9 @@ function New-BRAVOTaskDefinition {
     $actionArguments += " -WindowStyle $($schedulerSettings.WindowStyle)"
     $actionArguments += " -ExecutionPolicy Bypass"
     $actionArguments += " -File `"$scriptPath`""
-    $actionArguments += " -ConfigPath `"$ResolvedConfigPath`""
+    if ($ConfigPathWasExplicit) {
+        $actionArguments += " -ConfigPath `"$ResolvedConfigPath`""
+    }
     # -NoPause — безумовно, для КОЖНОГО типу завдання, а не вибірково за
     # типом. Заплановане завдання ніколи не повинно чекати на клавішу: це
     # зупинило б автоматизацію назавжди, без жодного індикатора для
@@ -648,17 +668,23 @@ function Test-SchedulerConfiguration {
         }
     }
 
-    if (-not (Test-Path -Path $ResolvedConfigPath -PathType Leaf)) {
-        throw "Файл конфігурації не знайдено"
-    }
 }
 
-if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
-    Write-Error "Файл конфігурації не знайдено: $ConfigPath"
-    Complete-BRAVOHelperLog -ExitCode 1
-}
-
-$resolvedConfigPath = (Resolve-Path -Path $ConfigPath).Path
+# P0 Configuration Foundation: BRAVO.config став опційним основним
+# override-шаром — попередні жорсткі "файл мусить існувати" перевірки тут
+# (і в Test-SchedulerConfiguration вище, і Resolve-Path, який теж вимагав
+# існування) дублювали те саме рішення, яке Import-BravoConfiguration
+# тепер приймає коректно сама. schedulerSettings/credentialSettings.
+# HelperPath/SetupScriptPath повністю заповнюються canonical дефолтами +
+# derivation незалежно від наявності BRAVO.config — Test-SchedulerConfiguration
+# і далі валідно перевіряє РЕАЛЬНІ шляхи runtime-ресурсів на диску, лише не
+# наявність самого BRAVO.config. $ResolvedConfigPath, вбудований у аргументи
+# запланованого завдання (New-BRAVOTaskDefinition), за відсутності
+# BRAVO.config дорівнюватиме auto-derived шляху (ConfigRoot\BRAVO.config) —
+# той самий шлях, який завантажувач під час майбутнього запуску завдання
+# коректно розпізнає як no-config (synthetic) сценарій, а не помилку.
+# GetFullPath (а не Resolve-Path) нормалізує шлях без вимоги існування.
+$resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
 try {
     $configRoot = Split-Path -Path $resolvedConfigPath -Parent
     $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
@@ -669,7 +695,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $resolvedConfigPath `
-        -RuntimeRoot $bravoScriptDirectory
+        -RuntimeRoot $bravoScriptDirectory `
+        -ConfigPathWasExplicit:$configPathWasExplicit
 
     # schedulerSettings.BAZASync (разом із його .Enabled) визначає BRAVO.config
     # через канонічний $bazaSyncEffective (BAZA_APP_SFTP OR BAZA_WWW_SFTP).
@@ -724,7 +751,15 @@ try {
 
 if (-not $ValidateOnly -and -not (Test-IsAdministrator)) {
     Write-Host "Потрібні права адміністратора. Відкривається запит UAC..." -ForegroundColor Yellow
-    $elevationArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`" -ConfigPath `"$resolvedConfigPath`""
+    # P0 Configuration Foundation (PR C, Секція 6): зберігаємо operator
+    # intent при UAC relaunch — AUTO (оператор НЕ передав -ConfigPath) не
+    # повинен ставати EXPLICIT лише тому, що elevated-процес отримує
+    # передані аргументи. Без цього no-config-інсталяція втратила б
+    # AUTO-намір одразу після першого UAC-запиту.
+    $elevationArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
+    if ($configPathWasExplicit) {
+        $elevationArguments += " -ConfigPath `"$resolvedConfigPath`""
+    }
     try {
         $elevatedProcess = Start-Process `
             -FilePath $schedulerSettings.PowerShellExecutable `
@@ -890,7 +925,8 @@ try {
             -TaskService $taskService `
             -TaskSettings $taskSettings `
             -TaskType $taskPlan.Type `
-            -ResolvedConfigPath $resolvedConfigPath
+            -ResolvedConfigPath $resolvedConfigPath `
+            -ConfigPathWasExplicit $configPathWasExplicit
 
         if ($ValidateOnly) {
             $scheduleText = if ($taskPlan.Type -eq "Backup" -or $taskPlan.Type -eq "Maintenance") {

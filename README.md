@@ -28,7 +28,7 @@
 | Перевірити реєстрацію завдань без UAC | `.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly` |
 | Перевірити завдання та доступ від `SYSTEM` | `.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess` |
 | Оновити лише параметри установи | `.\BRAVO_SETUP.ps1 -Action Credentials -CredentialComponent Institution` |
-| Змінити налаштування `BRAVO.config` через GUI | `.\BRAVO_CONFIGURATOR.ps1` |
+| Змінити локальні (site-специфічні) налаштування через GUI | `.\BRAVO_CONFIGURATOR.ps1` |
 | Запустити архівацію вручну | `.\BRAVO_ARCHIV.ps1 -NoPause` |
 | Запустити обслуговування вручну | `.\BRAVO_MAINTENANCE.ps1` |
 | Запустити health-check вручну | `.\BRAVO_HEALTH.ps1` |
@@ -941,19 +941,33 @@ UAC — можливий подальший крок, якщо той самий
 
 ## 10. Оновлення в установі
 
-1. Зробіть копію поточного `BRAVO.config`.
-2. Атомарно замініть весь комплект новою версією: виконувані `.ps1`,
-   `VERSION.json`, документацію та весь каталог `modules`. Не змішуйте модулі й
-   wrappers із різних версій.
-3. Після копіювання вилучіть застарілі root-бібліотеки
+Локальні site-відмінності (шляхи, компоненти, служби, SFTP/SMB, розклад)
+живуть у `BRAVO.local.config` — файлі, якого НЕМАЄ в release-архіві
+(`.gitignore`) і який оновлення взагалі не чіпає. Ручне перенесення значень
+із старого `BRAVO.config` у новий («крок 4» попередніх версій цього
+розділу) більше не потрібне: `BRAVO.local.config` — постійний override-шар,
+що переживає заміну комплекту байт-у-байт.
+
+1. Атомарно замініть весь комплект новою версією: виконувані `.ps1`,
+   `VERSION.json`, документацію, `BRAVO.config` (новий default-шар) та весь
+   каталог `modules`. Не змішуйте модулі й wrappers із різних версій.
+2. **НЕ торкайтесь** `BRAVO.local.config` — він лежить поруч (той самий
+   каталог, що `BRAVO.config`/effective ConfigPath) і не є частиною
+   release-архіву; заміна комплекту його не перезаписує.
+3. Якщо в установі ще немає `BRAVO.local.config` (сайт не мігрував на цю
+   схему), а старий `BRAVO.config` мав ручні site-правки — перенесіть ЛИШЕ
+   ці відмінності у НОВИЙ `BRAVO.local.config` (скопіюйте
+   `BRAVO.local.config.example`, розкоментуйте потрібні `'dot.path' =
+   значення`), а не в сам `BRAVO.config`. Це одноразова міграція за
+   установу, не за кожне оновлення.
+4. Після копіювання вилучіть застарілі root-бібліотеки
    `BRAVO_COMPATIBILITY.ps1`, `BRAVO_CREDENTIALS.ps1`,
    `BRAVO_HELPER_LOGGING.ps1`, `BRAVO_NOTIFICATION.ps1`,
    `BRAVO_ARCHIVE_HELPERS.ps1`, `BRAVO_ARCHIV_RUNTIME.ps1` і
    `BRAVO_SYSTEM_HELPERS.ps1`.
-4. Порівняйте та перенесіть локальні значення шляхів, компонентів, служб,
-   SFTP/SMB і розкладу у новий `BRAVO.config`.
-5. Не переносіть у config секрети, назву установи, код або префікс — вони вже
-   зберігаються у Credential Manager.
+5. Не переносіть у config (ні `BRAVO.config`, ні `BRAVO.local.config`)
+   секрети, назву установи, код або префікс — вони вже зберігаються у
+   Credential Manager.
 6. Запустіть:
 
 ```powershell

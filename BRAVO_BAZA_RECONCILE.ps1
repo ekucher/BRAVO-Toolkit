@@ -47,6 +47,11 @@ function Wait-BRAVOEarlyManualExit {
     }
 }
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО обчислення effective-шляху.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
+
 # Цілісність комплекту перевіряється ДО Import-Module (guard самодостатній).
 $effectiveConfigPath = if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     Join-Path $PSScriptRoot 'BRAVO.config'
@@ -142,7 +147,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot (Split-Path -Path $ConfigPath -Parent) `
         -ConfigPath $ConfigPath `
-        -RuntimeRoot $PSScriptRoot
+        -RuntimeRoot $PSScriptRoot `
+        -ConfigPathWasExplicit:$configPathWasExplicit
 
     Initialize-BRAVOConsole
     Initialize-BRAVOProgress -Enabled $false

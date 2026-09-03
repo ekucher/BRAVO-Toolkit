@@ -115,12 +115,19 @@ function New-BRAVOManualLauncherContent {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$EntryScriptPath,
-        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        # P0 Configuration Foundation (PR C, Секція 7): AUTO ($ConfigPath
+        # порожній/не передано) -> launcher НЕ вбудовує -ConfigPath, кожен
+        # запуск сам виконує ту саму AUTO-резолюцію проти RuntimeRoot
+        # (той самий контракт, що BRAVO_TASKS_INSTALL.ps1, Секція 6).
+        # EXPLICIT -> точний шлях у .cmd.
+        [string]$ConfigPath,
         [ValidateSet('-ForceRestore')][string[]]$Arguments = @(),
         [switch]$RequiresConfirmation
     )
 
-    foreach ($path in @($EntryScriptPath, $ConfigPath)) {
+    $pathsToValidate = @($EntryScriptPath)
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) { $pathsToValidate += $ConfigPath }
+    foreach ($path in $pathsToValidate) {
         if (-not [IO.Path]::IsPathRooted($path) -or $path.Contains('"')) {
             throw "Некоректний шлях для manual launcher: $path"
         }
@@ -145,9 +152,14 @@ function New-BRAVOManualLauncherContent {
             ''
         )
     }
+    $configPathArgumentText = if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+        ''
+    } else {
+        ' -ConfigPath "{0}"' -f $ConfigPath
+    }
     $lines += @(
         'set "BRAVO_PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"',
-        ('"%BRAVO_PS%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}" -ConfigPath "{1}"{2}' -f $EntryScriptPath, $ConfigPath, $commandArguments),
+        ('"%BRAVO_PS%" -NoLogo -NoProfile -ExecutionPolicy Bypass -File "{0}"{1}{2}' -f $EntryScriptPath, $configPathArgumentText, $commandArguments),
         'exit /b %ERRORLEVEL%',
         ''
     )
@@ -159,21 +171,27 @@ function Write-BRAVOManualLaunchers {
     param(
         [Parameter(Mandatory = $true)][string]$BackupRoot,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)][string]$ConfigPath
+        # P0 Configuration Foundation (PR C, Секція 7): AUTO -> $ConfigPath
+        # порожній ($ConfigPathWasExplicit=$false); EXPLICIT -> точний шлях.
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit
     )
 
-    foreach ($path in @($BackupRoot, $RuntimeRoot, $ConfigPath)) {
+    $pathsToValidate = @($BackupRoot, $RuntimeRoot)
+    if ($ConfigPathWasExplicit) { $pathsToValidate += $ConfigPath }
+    foreach ($path in $pathsToValidate) {
         if (-not [IO.Path]::IsPathRooted($path)) {
             throw "Очікувався абсолютний шлях для manual launcher: $path"
         }
     }
 
     $resolvedRuntimeRoot = [IO.Path]::GetFullPath($RuntimeRoot)
-    $resolvedConfigPath = [IO.Path]::GetFullPath($ConfigPath)
     $resolvedBackupRoot = [IO.Path]::GetFullPath($BackupRoot)
-    if (-not (Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf)) {
-        throw "Файл конфігурації для manual launcher не знайдено: $resolvedConfigPath"
-    }
+    # AUTO-режим не вимагає фізичного BRAVO.config для генерації launcher-ів
+    # (built-in-only/no-primary — легітимний сценарій); launcher у цьому
+    # режимі й не посилається на цей шлях. EXPLICIT — файл мав існувати ще
+    # на кроці Get-SetupConfiguration (інакше Setup уже впав раніше).
+    $launcherConfigPath = if ($ConfigPathWasExplicit) { [IO.Path]::GetFullPath($ConfigPath) } else { $null }
 
     $launchers = @(
         [pscustomobject]@{ Name = 'BRAVO_ARCHIV.cmd'; Script = 'BRAVO_ARCHIV.ps1'; Arguments = @(); RequiresConfirmation = $false },
@@ -190,7 +208,7 @@ function Write-BRAVOManualLaunchers {
             Path = Join-Path $resolvedBackupRoot $launcher.Name
             Content = New-BRAVOManualLauncherContent `
                 -EntryScriptPath $entryScriptPath `
-                -ConfigPath $resolvedConfigPath `
+                -ConfigPath $launcherConfigPath `
                 -Arguments $launcher.Arguments `
                 -RequiresConfirmation:$launcher.RequiresConfirmation
         }
@@ -221,16 +239,27 @@ function Invoke-BRAVOManualLauncherSetup {
     Write-BRAVOManualLaunchers `
         -BackupRoot $SetupConfiguration.BackupRoot `
         -RuntimeRoot $SetupConfiguration.Root `
-        -ConfigPath $SetupConfiguration.ConfigPath
+        -ConfigPath $SetupConfiguration.ConfigPath `
+        -ConfigPathWasExplicit $SetupConfiguration.ConfigPathWasExplicit
 }
 
 function Get-SetupConfiguration {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        # P0 Configuration Foundation (PR C, Секція 7): зберігає operator
+        # intent (той самий контракт, що решта entrypoint-ів) — AUTO
+        # (оператор НЕ передав -ConfigPath) допускає відсутній файл
+        # (built-in-only/legacy-primary+local synthetic-шлях);
+        # EXPLICIT-відсутність лишається помилкою конфігурації.
+        [bool]$ConfigPathWasExplicit
+    )
 
-    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+    if ($ConfigPathWasExplicit -and -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         throw "Файл конфігурації не знайдено: $Path"
     }
-    $resolvedPath = (Resolve-Path -LiteralPath $Path).Path
+    # GetFullPath (не Resolve-Path) — нормалізує шлях без вимоги існування
+    # (AUTO-шлях може легітимно вказувати на файл, якого ще немає).
+    $resolvedPath = [System.IO.Path]::GetFullPath($Path)
     $configRoot = Split-Path $resolvedPath -Parent
     $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
     $configurationLoaderPath = Join-Path $runtimeRoot 'BRAVO_CONFIG_LOADER.ps1'
@@ -238,7 +267,9 @@ function Get-SetupConfiguration {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedPath -RuntimeRoot $runtimeRoot
+    Import-BravoConfiguration `
+        -ConfigRoot $configRoot -ConfigPath $resolvedPath -RuntimeRoot $runtimeRoot `
+        -ConfigPathWasExplicit:$ConfigPathWasExplicit
 
     $credentialScript = if ($null -ne $credentialSettings -and
         -not [string]::IsNullOrWhiteSpace([string]$credentialSettings.SetupScriptPath)) {
@@ -249,6 +280,15 @@ function Get-SetupConfiguration {
 
     return [pscustomobject]@{
         ConfigPath = $resolvedPath
+        ConfigRoot = $configRoot
+        ConfigPathWasExplicit = $ConfigPathWasExplicit
+        # Порожній масив у AUTO-режимі: жодна дочірня інвокація (child
+        # PowerShell/UAC relaunch/manual launcher) НЕ повинна вбудовувати
+        # -ConfigPath — кожен дочірній процес сам виконує ту саму
+        # AUTO-резолюцію проти власного RuntimeRoot (той самий контракт,
+        # що BRAVO_TASKS_INSTALL.ps1, Секція 6).
+        ConfigPathArgument = if ($ConfigPathWasExplicit) { @('-ConfigPath', $resolvedPath) } else { @() }
+        PrimaryConfigPresent = [bool]$global:BravoConfigurationMetadata.PrimaryConfigPresent
         Root = $runtimeRoot
         BackupRoot = [string]$global:backupRootPath
         CredentialScript = $credentialScript
@@ -279,9 +319,15 @@ function Restart-SetupElevated {
         "-ExecutionPolicy",
         "Bypass",
         "-File",
-        (ConvertTo-BRAVOProcessArgument $PSCommandPath),
-        "-ConfigPath",
-        (ConvertTo-BRAVOProcessArgument $SetupConfiguration.ConfigPath),
+        (ConvertTo-BRAVOProcessArgument $PSCommandPath)
+    )
+    # P0 Configuration Foundation (PR C, Секція 7): зберігаємо AUTO/EXPLICIT
+    # намір при UAC relaunch — той самий контракт, що BRAVO_TASKS_INSTALL.ps1.
+    if ($SetupConfiguration.ConfigPathWasExplicit) {
+        $argumentParts += "-ConfigPath"
+        $argumentParts += (ConvertTo-BRAVOProcessArgument $SetupConfiguration.ConfigPath)
+    }
+    $argumentParts += @(
         "-Action",
         $Action,
         "-StoreFor",
@@ -324,10 +370,15 @@ try {
         [Environment]::CurrentDirectory
     }
     Import-Module -Name (Join-Path $scriptDirectory 'modules\BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop
+    # P0 Configuration Foundation (PR C, Секція 7): intent обчислюється ДО
+    # auto-дефолту (той самий контракт, що решта entrypoint-ів) — інакше
+    # ця перевірка після мутації $ConfigPath завжди дала б $true.
+    $configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+        -not [string]::IsNullOrWhiteSpace($ConfigPath)
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
         $ConfigPath = Join-Path $scriptDirectory "BRAVO.config"
     }
-    $setup = Get-SetupConfiguration -Path $ConfigPath
+    $setup = Get-SetupConfiguration -Path $ConfigPath -ConfigPathWasExplicit $configPathWasExplicit
 
     $credentialWorkRequested = $Action -in @("Full", "Credentials")
     $schedulerWorkRequested = $Action -in @("Full", "Scheduler")
@@ -472,14 +523,13 @@ try {
     # Preflight не читає секрети й ніколи не робить мережеві або production-операції.
     Invoke-ChildPowerShell `
         -ScriptPath $setup.DryRunScript `
-        -Arguments @("-ConfigPath", $setup.ConfigPath, "-SkipCredentials") `
+        -Arguments (@($setup.ConfigPathArgument) + @("-SkipCredentials")) `
         -StepName "Локальний preflight / симуляція" `
         -Current 1 -Total 5
 
     if ($credentialWorkRequested) {
         if (-not $ValidateOnly) {
-            $credentialArguments = @(
-                "-ConfigPath", $setup.ConfigPath,
+            $credentialArguments = @($setup.ConfigPathArgument) + @(
                 "-Action", "Ensure",
                 "-StoreFor", $StoreFor,
                 "-Component"
@@ -527,8 +577,7 @@ try {
             @("Required")
         }
         $testStore = if ($credentialWorkRequested) { $StoreFor } else { "Both" }
-        $credentialTestArguments = @(
-            "-ConfigPath", $setup.ConfigPath,
+        $credentialTestArguments = @($setup.ConfigPathArgument) + @(
             "-Action", "Test",
             "-StoreFor", $testStore,
             "-Component"
@@ -549,21 +598,21 @@ try {
         } else {
             Invoke-ChildPowerShell `
                 -ScriptPath $setup.TaskInstallScript `
-                -Arguments @("-ConfigPath", $setup.ConfigPath, "-ValidateOnly") `
+                -Arguments (@($setup.ConfigPathArgument) + @("-ValidateOnly")) `
                 -StepName "Валідація Планувальника завдань" `
                 -Current 4 -Total 5
 
             if ($schedulerWorkRequested -and -not $ValidateOnly) {
                 Invoke-ChildPowerShell `
                     -ScriptPath $setup.TaskInstallScript `
-                    -Arguments @("-ConfigPath", $setup.ConfigPath) `
+                    -Arguments @($setup.ConfigPathArgument) `
                     -StepName "Встановлення/оновлення Планувальника завдань" `
                     -Current 4 -Total 5
             }
         }
     }
 
-    $dryRunArguments = @("-ConfigPath", $setup.ConfigPath)
+    $dryRunArguments = @($setup.ConfigPathArgument)
     if (-not $SkipAccessTest) {
         $dryRunArguments += "-TestAccess"
     }

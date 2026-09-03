@@ -53,14 +53,25 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
     $systemLogRootDir = Join-Path $FixtureRoot 'SYSTEMLOGS'
     $backupRootDir = Join-Path $FixtureRoot 'ARCHIV'
     $sourcesRootDir = Join-Path $FixtureRoot 'SOURCES'
+    # P0 Configuration Foundation (PR C) зробив discoverySettings і
+    # operationLockSettings НЕ raw-configurable через BRAVO.config —
+    # ізолюємо їх ІНШИМИ, вже підтримуваними механізмами (не повертаючи
+    # ці блоки в BRAVO.config): $env:ProgramData дочірнього процесу
+    # (operationLockSettings/stateRoot деривуються від нього — див.
+    # Resolve-BRAVOConfigurationDerivation) і явний test-only
+    # BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH seam (Get-
+    # BRAVOCanonicalDiscoverySettings, той самий клас, що
+    # BRAVO_DATARESTORE_TEST_HOOKS/FAILPOINT нижче).
+    $programDataRootDir = Join-Path $FixtureRoot 'PROGRAMDATA'
     $sourceDirectories = @{
         MODEL = Join-Path $sourcesRootDir 'MODEL'
         BLOG = Join-Path $sourcesRootDir 'BLOG'
         BRAVOEXCH = Join-Path $sourcesRootDir 'BRAVOEXCH'
     }
-    $lockPath = Join-Path $FixtureRoot 'LOCK\BRAVO_OPERATION.lock'
+    $lockPath = Join-Path $programDataRootDir 'BRAVO\Locks\BRAVO_OPERATION.lock'
+    $discoverySettingsOverridePath = Join-Path $FixtureRoot 'discoverySettings.psd1'
 
-    foreach ($directory in @($configRootDir, $limsRootDir, $systemLogRootDir, $backupRootDir) + @($sourceDirectories.Values) + @(Split-Path $lockPath -Parent)) {
+    foreach ($directory in @($configRootDir, $limsRootDir, $systemLogRootDir, $backupRootDir, $programDataRootDir) + @($sourceDirectories.Values) + @(Split-Path $lockPath -Parent)) {
         if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
             [void](New-Item -ItemType Directory -Path $directory -Force -ErrorAction Stop)
         }
@@ -74,21 +85,6 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
     LIMSRoot      = "$limsRootDir"
     SystemLogRoot = "$systemLogRootDir"
     BackupRoot    = "$backupRootDir"
-}
-"@
-    $fixtureDiscoverySettingsBlock = @"
-`$global:discoverySettings = @{
-    BravoIniPath = `$null
-    BravoRoot = `$null
-    WebRoot = `$null
-    Sources = @{
-        MODEL = "$($sourceDirectories.MODEL)"
-        BLOG = "$($sourceDirectories.BLOG)"
-        BRAVOEXCH = "$($sourceDirectories.BRAVOEXCH)"
-        BAZA_APP = `$null
-        BAZA_WWW = `$null
-        BACKUP_ROOT = `$null
-    }
 }
 "@
     # Archive: усі три компоненти увімкнені (потрібні реальні генерації для
@@ -117,17 +113,10 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
     }
 }
 "@
-    $fixtureOperationLockSettingsBlock = @"
-`$global:operationLockSettings = @{
-    Path = "$lockPath"
-}
-"@
 
     $blockReplacements = @(
         @{ Pattern = '(?ms)^\$global:pathSettings = @\{.*?^\}'; Replacement = $fixturePathSettingsBlock }
-        @{ Pattern = '(?ms)^\$global:discoverySettings = @\{.*?^\}'; Replacement = $fixtureDiscoverySettingsBlock }
         @{ Pattern = '(?ms)^\$global:componentSettings = @\{.*?^\}'; Replacement = $fixtureComponentSettingsBlock }
-        @{ Pattern = '(?ms)^\$global:operationLockSettings = @\{.*?^\}'; Replacement = $fixtureOperationLockSettingsBlock }
     )
     foreach ($block in $blockReplacements) {
         $newConfigText = [regex]::Replace($configText, $block.Pattern, { param($m) $block.Replacement })
@@ -156,6 +145,29 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
     $fixtureConfigPath = Join-Path $configRootDir $ConfigFileName
     Set-Content -LiteralPath $fixtureConfigPath -Value $configText -Encoding UTF8 -NoNewline
 
+    # discoverySettings — НЕ raw-configurable через BRAVO.config (P0
+    # Configuration Foundation, Секція 3). Джерела фікстури передаються
+    # через test-only env-var seam (Get-BRAVOCanonicalDiscoverySettings,
+    # modules/BRAVO.Configuration/BRAVO.Configuration.Derivation.psm1) —
+    # окремий .psd1-файл (restricted language, Import-PowerShellDataFile,
+    # PS 5.1-сумісно), не JSON.
+    $discoverySettingsPsd1 = @"
+@{
+    BravoIniPath = `$null
+    BravoRoot = `$null
+    WebRoot = `$null
+    Sources = @{
+        MODEL = '$($sourceDirectories.MODEL)'
+        BLOG = '$($sourceDirectories.BLOG)'
+        BRAVOEXCH = '$($sourceDirectories.BRAVOEXCH)'
+        BAZA_APP = `$null
+        BAZA_WWW = `$null
+        BACKUP_ROOT = `$null
+    }
+}
+"@
+    Set-Content -LiteralPath $discoverySettingsOverridePath -Value $discoverySettingsPsd1 -Encoding UTF8
+
     return [pscustomobject]@{
         ConfigPath = $fixtureConfigPath
         ConfigRoot = $configRootDir
@@ -163,6 +175,8 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
         SourceDirectories = $sourceDirectories
         LockPath = $lockPath
         MinimumFreeSpaceGB = $MinimumFreeSpaceGB
+        ProgramDataRoot = $programDataRootDir
+        DiscoverySettingsOverridePath = $discoverySettingsOverridePath
     }
 }
 
@@ -209,6 +223,20 @@ function New-BRAVODataRestoreMatrixFixtureGeneration {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
+    # ProgramData ізольований для ЦЬОГО дочірнього процесу: operationLockSettings/
+    # stateRoot деривуються від $env:ProgramData (P0 Configuration
+    # Foundation, Resolve-BRAVOConfigurationDerivation) — без цього
+    # override фікстура торкалася б реального C:\ProgramData\BRAVO.
+    # P1 security hardening (Assert-BRAVODiscoverySettingsTestOverride,
+    # BRAVO.Configuration.Derivation.psm1): discovery override тепер
+    # two-factor fail-closed — сам BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH
+    # без sentinel-фактора BRAVO_DATARESTORE_TEST_HOOKS=ACCEPTANCE_ONLY
+    # кидає виняток замість мовчазного fallback, тому обидва фактори
+    # виставляються тут разом, тим самим ProcessStartInfo.EnvironmentVariables
+    # каналом.
+    $startInfo.EnvironmentVariables['ProgramData'] = [string]$FixtureConfig.ProgramDataRoot
+    $startInfo.EnvironmentVariables['BRAVO_DATARESTORE_TEST_HOOKS'] = 'ACCEPTANCE_ONLY'
+    $startInfo.EnvironmentVariables['BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH'] = [string]$FixtureConfig.DiscoverySettingsOverridePath
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
     $capture = Start-BRAVOProcessOutputCapture -Process $process
@@ -258,7 +286,13 @@ function Invoke-BRAVODataRestoreMatrixCombo {
         # файлу описує себе, тому оператору не треба співвідносити з
         # порядком запуску.
         [string]$LogDirectory,
-        [string]$ComboName
+        [string]$ComboName,
+
+        # Той самий ProgramData/discoverySettings isolation seam, що й
+        # New-BRAVODataRestoreMatrixFixtureGeneration — BRAVO_DATA_RESTORE.ps1
+        # проходить той самий Complete-BRAVOConfigurationLoad ланцюг.
+        [string]$ProgramDataRoot,
+        [string]$DiscoverySettingsOverridePath
     )
 
     $scriptPath = Join-Path $RepoRoot 'BRAVO_DATA_RESTORE.ps1'
@@ -288,9 +322,24 @@ function Invoke-BRAVODataRestoreMatrixCombo {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
-    if (-not [string]::IsNullOrWhiteSpace($FailpointComponent)) {
+    # P1 security hardening (Assert-BRAVODiscoverySettingsTestOverride,
+    # BRAVO.Configuration.Derivation.psm1): discovery override тепер
+    # two-factor fail-closed — BRAVO_DATARESTORE_TEST_HOOKS=ACCEPTANCE_ONLY
+    # обов'язковий, якщо задано BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH, так
+    # само як і для FailpointComponent нижче (той самий sentinel, обидва
+    # test-only канали одного і того ж isolated child-процесу).
+    if (-not [string]::IsNullOrWhiteSpace($FailpointComponent) -or
+        -not [string]::IsNullOrWhiteSpace($DiscoverySettingsOverridePath)) {
         $startInfo.EnvironmentVariables['BRAVO_DATARESTORE_TEST_HOOKS'] = 'ACCEPTANCE_ONLY'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FailpointComponent)) {
         $startInfo.EnvironmentVariables['BRAVO_DATARESTORE_TEST_FAILPOINT'] = "AfterMoveAside:$FailpointComponent"
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ProgramDataRoot)) {
+        $startInfo.EnvironmentVariables['ProgramData'] = $ProgramDataRoot
+    }
+    if (-not [string]::IsNullOrWhiteSpace($DiscoverySettingsOverridePath)) {
+        $startInfo.EnvironmentVariables['BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH'] = $DiscoverySettingsOverridePath
     }
 
     $process = New-Object System.Diagnostics.Process

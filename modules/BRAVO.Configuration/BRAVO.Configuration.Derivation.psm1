@@ -85,6 +85,35 @@ function Resolve-BRAVOConfigurationDerivation {
         [Parameter(Mandatory = $true)][hashtable]$restoreVerifySettings
     )
 
+    # credentialSettings.HelperPath/SetupScriptPath — похідні від
+    # runtimeRoot шляхи runtime-ресурсів комплекту (не raw-configurable
+    # значення). У BRAVO.config вони обчислювались inline одразу при
+    # оголошенні $global:credentialSettings, ДО появи цього canonical
+    # resolver-а — переносимо сюди, щоб no-config-шлях (BRAVO.config
+    # відсутній) отримував той самий результат без другої копії цієї
+    # логіки.
+    $global:credentialSettings = $credentialSettings
+    $global:credentialSettings.HelperPath = Join-Path $runtimeRoot "modules\BRAVO.Credentials\BRAVO.Credentials.psd1"
+    $global:credentialSettings.SetupScriptPath = Join-Path $runtimeRoot "BRAVO_CREDENTIALS_SETUP.ps1"
+
+    # maintenanceSettings.General.ObjectName/ArchivePrefix — той самий
+    # клас: похідні від bravoSettings значення, обчислені inline при
+    # оголошенні $global:maintenanceSettings у BRAVO.config, ДО появи
+    # цього resolver-а. Це лише ПОЧАТКОВЕ/placeholder-значення:
+    # Import-BRAVOInstitutionSettings (BRAVO.Credentials.psm1, викликана
+    # entrypoint-ом одразу після Import-BravoConfiguration) перезаписує
+    # обидва поля реальними даними з Credential Manager — але до ТОГО
+    # моменту консюмери читають напряму (BRAVO.Maintenance.Runtime.ps1)
+    # і під StrictMode впали б на відсутньому ключі без цього дефолту.
+    if ($maintenanceSettings.Contains('General') -and $maintenanceSettings.General -is [hashtable]) {
+        if ($bravoSettings.Contains('InstitutionName') -and $bravoSettings.Contains('InstitutionCode')) {
+            $maintenanceSettings.General.ObjectName = "$($bravoSettings.InstitutionName) [$($bravoSettings.InstitutionCode)]"
+        }
+        if ($bravoSettings.Contains('ArchivePrefix')) {
+            $maintenanceSettings.General.ArchivePrefix = [string]$bravoSettings.ArchivePrefix
+        }
+    }
+
     # =============================================
     # ШЛЯХИ ДО ДЖЕРЕЛ ДАНИХ
     # =============================================
@@ -214,6 +243,16 @@ function Resolve-BRAVOConfigurationDerivation {
         [Environment]::ExpandEnvironmentVariables($env:ProgramData)
     }
     $global:stateRoot = Join-Path $programDataRoot 'BRAVO\State'
+
+    # Operation lock — той самий %ProgramData%\BRAVO корінь, що й state.
+    # Раніше обчислювався окремо, inline у самому BRAVO.config (ДО появи
+    # цього canonical resolver-а) — переносимо сюди, бо це той самий клас
+    # похідного (від programDataRoot), не raw-configurable значення, що й
+    # stateRoot поруч, і no-config-шлях (BRAVO.config відсутній) потребує
+    # того самого обчислення без другої копії цієї логіки.
+    $global:operationLockSettings = @{
+        Path = Join-Path $programDataRoot 'BRAVO\Locks\BRAVO_OPERATION.lock'
+    }
 
     # Tools\ — runtime-залежності комплекту, лежать поруч зі скриптами
     # (RuntimeRoot).
@@ -390,4 +429,185 @@ function Resolve-BRAVOConfigurationDerivation {
 
     # Пороги перевірки відновлюваності — уже повністю raw-параметр.
     $global:restoreVerifySettings = $restoreVerifySettings
+}
+
+function Test-BRAVOLocalAbsoluteDriveLetterPath {
+    # Внутрішній helper (не exported): true лише для локального,
+    # absolute, drive-letter Windows-шляху ('C:\...' / 'C:/...').
+    # Свідомо відхиляє UNC ('\\server\share', '\\?\UNC\...'),
+    # forward-slash UNC ('//server/share'), відносні шляхи та
+    # будь-що з схемою URI (http:, file: тощо) — жоден із них не
+    # відповідає патерну "рівно одна літера + ':' + роздільник"
+    # на позиції 0..1 рядка.
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyString()]
+        [string]$CandidatePath
+    )
+    return [bool]($CandidatePath -match '^[A-Za-z]:[\\/]')
+}
+
+function Assert-BRAVODiscoverySettingsTestOverride {
+    # Внутрішній helper (не exported через .psd1 — production API цього
+    # не потребує): two-factor, fail-closed gate для discovery test-seam.
+    #
+    # TEST-ONLY. DataRestore Matrix E2E fixture. Process-local (env var
+    # на конкретному дочірньому powershell.exe, встановлена виключно
+    # через ProcessStartInfo.EnvironmentVariables — див.
+    # modules/BRAVO.DataRestore.MatrixTest). НЕ supported site
+    # configuration, НЕ заміна BRAVO.local.config, НЕ документований
+    # production override.
+    #
+    # Контракт (P1 security hardening, CI remediation #129):
+    #   1. $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH порожній/відсутній
+    #      -> $null (canonical discovery, без жодної додаткової перевірки;
+    #      сам по собі $env:BRAVO_DATARESTORE_TEST_HOOKS нічого не активує).
+    #   2. Інакше — ОБИДВА фактори обов'язкові, і будь-яке порушення дає
+    #      THROW (fail-closed), а не мовчазний fallback на canonical:
+    #        a. $env:BRAVO_DATARESTORE_TEST_HOOKS РІВНО 'ACCEPTANCE_ONLY'
+    #           (той самий sentinel і той самий ordinal/case-sensitive
+    #           контракт, що вже canonical у
+    #           modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1);
+    #        b. шлях — local absolute drive-letter .psd1 (не relative,
+    #           не UNC, не URI, правильне розширення), існуючий regular
+    #           file;
+    #        c. Import-PowerShellDataFile (PS 5.1-сумісно; НЕ
+    #           ConvertFrom-Json -AsHashtable) парситься без винятку;
+    #        d. результат проходить сувору schema-валідацію (top-level
+    #           keys, Sources keys, типи значень, локальність будь-яких
+    #           вкладених filesystem-шляхів).
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    $overridePath = $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH
+    if ([string]::IsNullOrWhiteSpace($overridePath)) {
+        return $null
+    }
+
+    $hooksGuard = [string]$env:BRAVO_DATARESTORE_TEST_HOOKS
+    if (-not [string]::Equals($hooksGuard, 'ACCEPTANCE_ONLY', [System.StringComparison]::Ordinal)) {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH заданий, але BRAVO_DATARESTORE_TEST_HOOKS != 'ACCEPTANCE_ONLY' (two-factor test-only seam; production discovery override без обох sentinel-факторів заборонено, fail-closed)."
+    }
+
+    if (-not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $overridePath)) {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH має бути локальним absolute drive-letter шляхом (^[A-Za-z]:[\\/]) — UNC/network/relative/URI відхилено, fail-closed. Отримано: '$overridePath'."
+    }
+    if ($overridePath -notmatch '\.psd1$') {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH має вказувати на .psd1-файл, fail-closed. Отримано: '$overridePath'."
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($overridePath)
+    if (-not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $fullPath) -or
+        $fullPath -notmatch '\.psd1$') {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH після канонізації шляху більше не є локальним drive-letter .psd1-шляхом, fail-closed. Отримано: '$overridePath'."
+    }
+    if (-not (Test-Path -LiteralPath $fullPath -PathType Leaf)) {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH вказує на неіснуючий/не-файл шлях, fail-closed. Отримано: '$fullPath'."
+    }
+
+    try {
+        $overrideData = Import-PowerShellDataFile -LiteralPath $fullPath -ErrorAction Stop
+    } catch {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH вказує на .psd1, який не вдалось розпарсити (Import-PowerShellDataFile), fail-closed. Помилка: $($_.Exception.Message)"
+    }
+    if ($null -eq $overrideData -or -not ($overrideData -is [hashtable])) {
+        throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1 має повертати верхньорівневий hashtable (@{ ... }), fail-closed."
+    }
+
+    $allowedTopLevelKeys = @('BravoIniPath', 'BravoRoot', 'WebRoot', 'Sources')
+    foreach ($key in $overrideData.Keys) {
+        if ($allowedTopLevelKeys -notcontains $key) {
+            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1 містить невідомий top-level ключ '$key', fail-closed. Дозволено лише: $($allowedTopLevelKeys -join ',')."
+        }
+    }
+
+    foreach ($scalarKey in @('BravoIniPath', 'BravoRoot', 'WebRoot')) {
+        if (-not $overrideData.Contains($scalarKey)) { continue }
+        $value = $overrideData[$scalarKey]
+        if ($null -ne $value -and -not ($value -is [string])) {
+            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: '$scalarKey' має бути `$null або string, fail-closed. Отримано тип: $($value.GetType().FullName)."
+        }
+        if ($value -is [string] -and -not [string]::IsNullOrEmpty($value) -and
+            -not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $value)) {
+            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: '$scalarKey' має бути локальним absolute drive-letter шляхом, fail-closed. Отримано: '$value'."
+        }
+    }
+
+    if ($overrideData.Contains('Sources')) {
+        $sourcesValue = $overrideData['Sources']
+        if ($null -ne $sourcesValue -and -not ($sourcesValue -is [hashtable])) {
+            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: 'Sources' має бути hashtable (або `$null), fail-closed."
+        }
+        if ($sourcesValue -is [hashtable]) {
+            $allowedSourceKeys = @('MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA_APP', 'BAZA_WWW', 'BACKUP_ROOT')
+            foreach ($sourceKey in $sourcesValue.Keys) {
+                if ($allowedSourceKeys -notcontains $sourceKey) {
+                    throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: невідомий Sources-ключ '$sourceKey', fail-closed. Дозволено лише: $($allowedSourceKeys -join ',')."
+                }
+                $sourceValue = $sourcesValue[$sourceKey]
+                if ($null -ne $sourceValue -and -not ($sourceValue -is [string])) {
+                    throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: Sources.$sourceKey має бути `$null або string, fail-closed. Отримано тип: $($sourceValue.GetType().FullName)."
+                }
+                if ($sourceValue -is [string] -and -not [string]::IsNullOrEmpty($sourceValue) -and
+                    -not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $sourceValue)) {
+                    throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: Sources.$sourceKey має бути локальним absolute drive-letter шляхом, fail-closed. Отримано: '$sourceValue'."
+                }
+            }
+        }
+    }
+
+    return $overrideData
+}
+
+function Get-BRAVOCanonicalDiscoverySettings {
+    # Канонічна, фіксована (НЕ raw-configurable) структура discoverySettings
+    # — той самий літерал, який BRAVO.config визначає інлайн (навмисно
+    # ПІСЛЯ фази local-overrides, щоб спроба перевизначити 'discoverySettings.*'
+    # через BRAVO.local.config провалювалась fail-closed, а не мовчки
+    # ігнорувалась). Винесено сюди як ОДНЕ джерело, яким користуються ОБИДВА
+    # шляхи (BRAVO.config present і absent) — без цього no-config-шлях мав би
+    # тримати другу незалежну копію цього самого літералу.
+    #
+    # CI remediation (BRAVO_DATA_RESTORE_MATRIX_TEST.ps1, E2E fixture):
+    # раніше self-test обходив цю фіксацію через function global:
+    # Get-BRAVOCanonicalDiscoverySettings (function-shadowing). Емпірично
+    # підтверджено, що цей прийом НЕ переноситься на MatrixTest — там
+    # викликач (Resolve-BRAVOConfigurationDerivation) виконується
+    # всередині приватного SessionState модуля BRAVO.Archive (повний
+    # ланцюг BRAVO_ARCHIV.ps1 -> BRAVO.Archive module -> BRAVO_CONFIG_
+    # LOADER.ps1), тому global-scope shadow, визначена в дочірньому
+    # процесі ДО імпорту BRAVO.Archive, програє module-приватному
+    # імпорту (мінімальний ізольований repro підтвердив: семантичного
+    # шляху до global-shadow тут просто немає). Замість розширення
+    # Import-Module до -Global (ширший blast radius на ВСІ entrypoints)
+    # — вузький, явно gate-ований, two-factor, fail-closed env-var seam
+    # (Assert-BRAVODiscoverySettingsTestOverride вище), того самого
+    # класу, що вже прийнятий у цьому репозиторії для
+    # BRAVO_DATARESTORE_TEST_HOOKS/BRAVO_DATARESTORE_TEST_FAILPOINT
+    # (modules/BRAVO.DataRestore.MatrixTest): без встановленої змінної —
+    # поведінка на 100% незмінна (canonical fixed-літерал нижче, як і
+    # раніше). TEST-ONLY, не supported production configuration.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    $override = Assert-BRAVODiscoverySettingsTestOverride
+    if ($null -ne $override) {
+        return $override
+    }
+
+    return @{
+        BravoIniPath = $null
+        BravoRoot = $null
+        WebRoot = $null
+        Sources = @{
+            MODEL = $null
+            BLOG = $null
+            BRAVOEXCH = $null
+            BAZA_APP = $null
+            BAZA_WWW = $null
+            BACKUP_ROOT = $null
+        }
+    }
 }

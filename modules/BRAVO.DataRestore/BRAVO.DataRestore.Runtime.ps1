@@ -201,6 +201,11 @@ function ConvertTo-BRAVODataRestoreElevationArgument {
 # (той самий принцип, що BRAVO_MAINTENANCE).
 try {
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту —
+# використовується і для UAC-relaunch нижче, і для Import-BravoConfiguration.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -236,7 +241,12 @@ if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.I
     if ($SkipHealthCheck) { $elevatedArguments += "-SkipHealthCheck" }
     if ($TimeoutSeconds -gt 0) { $elevatedArguments += @("-TimeoutSeconds", [string]$TimeoutSeconds) }
     if ($NoPause) { $elevatedArguments += "-NoPause" }
-    $elevatedArguments += @("-ConfigPath", (ConvertTo-BRAVODataRestoreElevationArgument -Value $ConfigPath))
+    # AUTO -> не вбудовувати -ConfigPath у relaunch: elevated-процес сам
+    # повторить ту саму auto-derivation. EXPLICIT -> зберегти точний шлях
+    # (свідомий намір оператора не повинен губитись при елевації).
+    if ($configPathWasExplicit) {
+        $elevatedArguments += @("-ConfigPath", (ConvertTo-BRAVODataRestoreElevationArgument -Value $ConfigPath))
+    }
     $elevatedProcess = Start-Process powershell.exe -ArgumentList $elevatedArguments -Verb RunAs -Wait -PassThru
     Exit $elevatedProcess.ExitCode
 }
@@ -283,12 +293,15 @@ $script:dataRestoreTemporaryRoot = $null
 $script:archivePassword = $null
 
 # ===== ЗАВАНТАЖЕННЯ НАЛАШТУВАНЬ =====
-if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    Write-Host "ПОМИЛКА: Не знайдено конфігураційний файл: $ConfigPath" -ForegroundColor Red
-    exit 30
-}
+# P0 Configuration Foundation: BRAVO.config став опційним основним
+# override-шаром — попередня жорстка "файл мусить існувати" перевірка
+# (і Resolve-Path, який теж вимагав існування) дублювала те саме рішення,
+# яке Import-BravoConfiguration тепер приймає коректно сама (auto-derived
+# відсутній BRAVO.config -> canonical built-in defaults + BRAVO.local.
+# config; явно вказаний відсутній -ConfigPath -> як і раніше, помилка,
+# перехоплена нижче тим самим catch/exit 30).
 try {
-    $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
     $configRoot = Split-Path -Path $ConfigPath -Parent
     $configurationLoaderPath = Join-Path $bravoScriptDirectory 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
@@ -298,7 +311,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $ConfigPath `
-        -RuntimeRoot $bravoScriptDirectory
+        -RuntimeRoot $bravoScriptDirectory `
+        -ConfigPathWasExplicit:$configPathWasExplicit
     $script:ScriptVersion = [string]$global:ScriptVersion
     $script:ScriptDate = [string]$global:ScriptDate
     $script:ScriptBuildId = [string]$global:ScriptBuildId

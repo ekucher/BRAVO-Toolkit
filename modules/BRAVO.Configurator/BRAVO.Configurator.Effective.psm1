@@ -57,8 +57,9 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
     <#
     .SYNOPSIS
         Створює ізольований тимчасовий каталог із копією canonical
-        BRAVO.config і (опційно) кандидатним BRAVO.local.config — ніколи не
-        торкається production ConfigRoot.
+        BRAVO.config, якщо він фізично присутній (опційний legacy-primary
+        шар — P0 Configuration Foundation, Секція 8), і (опційно) кандидатним
+        BRAVO.local.config — ніколи не торкається production ConfigRoot.
     #>
     [CmdletBinding()]
     param(
@@ -66,20 +67,29 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
         [Parameter(Mandatory = $true)][hashtable]$CandidateOverrides
     )
 
+    # P0 Configuration Foundation (PR C, Секція 8): BRAVO.config — опційний
+    # legacy-primary шар (Секції 2-5), не обов'язкова умова роботи
+    # Configurator-а. AUTO-семантика тут дзеркалить canonical loader:
+    # присутній -> копіюємо (та сама поведінка, що раніше); відсутній ->
+    # ізольований root свідомо БЕЗ BRAVO.config, і canonical
+    # Import-BravoConfiguration -PassThru (дочірній процес нижче) сам іде
+    # built-in-only/local-only synthetic шляхом (той самий контракт, що
+    # Get-SetupConfiguration AUTO і BRAVO_TASKS_INSTALL.ps1 AUTO) — не
+    # окрема, друга політика "config відсутній".
     $sourceConfigPath = Join-Path $RuntimeRoot 'BRAVO.config'
-    if (-not (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf)) {
-        throw "BRAVO.Configurator.Effective: canonical BRAVO.config не знайдено ('$sourceConfigPath')."
-    }
+    $sourceConfigPresent = Test-Path -LiteralPath $sourceConfigPath -PathType Leaf
 
     $isolatedRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('BRAVO_CONFIGURATOR_EFFECTIVE_' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $isolatedRoot -Force -ErrorAction Stop | Out-Null
-    # P2-A (той самий root-cause клас, що BRAVO.Configurator.Persistence
-    # AtomicReplace/PostApplyVerification hermetic-тести реально виявили):
-    # без -ErrorAction Stop файлова IOException тут успадковує
-    # $ErrorActionPreference викликача й може НЕ termінувати виконання під
-    # дефолтним 'Continue' — isolated root лишився б без BRAVO.config
-    # мовчки замість явного throw.
-    Copy-Item -LiteralPath $sourceConfigPath -Destination (Join-Path $isolatedRoot 'BRAVO.config') -Force -ErrorAction Stop
+    if ($sourceConfigPresent) {
+        # P2-A (той самий root-cause клас, що BRAVO.Configurator.Persistence
+        # AtomicReplace/PostApplyVerification hermetic-тести реально виявили):
+        # без -ErrorAction Stop файлова IOException тут успадковує
+        # $ErrorActionPreference викликача й може НЕ termінувати виконання під
+        # дефолтним 'Continue' — isolated root лишився б без BRAVO.config
+        # мовчки замість явного throw.
+        Copy-Item -LiteralPath $sourceConfigPath -Destination (Join-Path $isolatedRoot 'BRAVO.config') -Force -ErrorAction Stop
+    }
 
     if ($CandidateOverrides.Count -gt 0) {
         $localConfigLines = New-Object System.Collections.Generic.List[string]

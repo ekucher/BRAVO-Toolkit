@@ -46,7 +46,7 @@
         @{ Path = 'credentialSettings.Targets.SlackWebhookAlerts'; Group = 'Credentials'; Section = 'Targets'; Label = 'Ім''я запису: Slack webhook (alerts)'; Description = 'Назва запису Windows Credential Manager (не сам секрет).'; Type = 'String'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 60 }
 
         # ===== General / Host info =====
-        @{ Path = 'hostInformationSettings.PublicIPLookupEnabled'; Group = 'General'; Section = 'HostInfo'; Label = 'Показувати публічну IP у сповіщеннях'; Description = 'Вимкнено за замовчуванням (P1.10): запит до зовнішнього сервісу розкриває факт і час запуску backup.'; Type = 'Boolean'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 10 }
+        @{ Path = 'hostInformationSettings.PublicIPLookupEnabled'; Group = 'General'; Section = 'HostInfo'; Label = 'Показувати публічну IP у сповіщеннях'; Description = 'Увімкнено за замовчуванням (рішення власника 2026-08-30, замінює попередній P1.10-дефолт): запит до зовнішнього сервісу розкриває факт і час запуску backup. Вимкніть, якщо ця зовнішня залежність небажана.'; Type = 'Boolean'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 10 }
         @{ Path = 'hostInformationSettings.PublicIPLookupTimeoutSeconds'; Group = 'General'; Section = 'HostInfo'; Label = 'Таймаут запиту публічної IP (с)'; Description = 'Діє лише якщо PublicIPLookupEnabled=true.'; Type = 'Integer'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 20 }
 
         # ===== Paths (pathSettings) — фаза 1 =====
