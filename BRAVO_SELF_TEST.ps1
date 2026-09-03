@@ -7756,9 +7756,14 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "Scheduler/OperationLockMetadata" `
         -Failure "BRAVO_OPERATION.lock має містити pid/processStartTime/hostname/operation/packageVersion (JSON), а не лише голий PID/Started/Config"
+    # P0 Configuration Foundation (PR B): operationLockSettings.Path
+    # обчислюється в Resolve-BRAVOConfigurationDerivation (canonical
+    # resolver, спільний для BRAVO.config-present і -absent шляхів), а не
+    # inline у самому BRAVO.config — літерал шукаємо в обох файлах разом.
+    $bravoConfigTextForOperationLock = $bravoConfigText + [Environment]::NewLine + $bravoConfigDerivationText
     Test-BRAVOCondition `
         -Condition (
-            $bravoConfigText.Contains("'BRAVO\Locks\BRAVO_OPERATION.lock'") -and
+            $bravoConfigTextForOperationLock.Contains("'BRAVO\Locks\BRAVO_OPERATION.lock'") -and
             $archiveScriptText.Contains('$lockPath = [string]$operationLockSettings.Path') -and
             $maintenanceScriptText.Contains('$lockPath = [string]$operationLockSettings.Path') -and
             $healthScriptText.Contains('$lockPath = [string]$operationLockSettings.Path') -and
@@ -8624,15 +8629,24 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     $tasksInstallTextForPause = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO_TASKS_INSTALL.ps1"), [Text.Encoding]::UTF8
     )
+    # P0 Configuration Foundation (PR C, Секція 6): -ConfigPath тепер сам
+    # умовний (лише EXPLICIT-режим, if ($ConfigPathWasExplicit) { ... }) —
+    # анкер "одразу після -ConfigPath" більше не годиться буквально.
+    # Перевіряємо той самий інваріант напряму: між рядком -File і першою
+    # появою -NoPause НЕМАЄ жодного `if ($TaskType -eq` (тобто -NoPause не
+    # потрапляє під вибіркову per-type умову).
+    $noPauseAnchorMatch = [regex]::Match(
+        $tasksInstallTextForPause,
+        '\$actionArguments \+= " -File[^\r\n]*"\r?\n(?<between>.*?)\$actionArguments \+= " -NoPause"',
+        [System.Text.RegularExpressions.RegexOptions]::Singleline
+    )
     Test-BRAVOCondition `
         -Condition (
-            [regex]::IsMatch(
-                $tasksInstallTextForPause,
-                '\$actionArguments \+= " -ConfigPath[^\r\n]*"\r?\n\s*#[^\r\n]*\r?\n(?:\s*#[^\r\n]*\r?\n)*\s*\$actionArguments \+= " -NoPause"'
-            )
+            $noPauseAnchorMatch.Success -and
+            -not $noPauseAnchorMatch.Groups['between'].Value.Contains('if ($TaskType -eq')
         ) `
         -Name "Scheduler/EveryTaskTypeGetsNoPauseUnconditionally" `
-        -Failure "BRAVO_TASKS_INSTALL.ps1 має додавати -NoPause одразу після -ConfigPath, поза будь-яким if (`$TaskType -eq ...) — інакше якийсь тип завдання лишиться без нього непомітно"
+        -Failure "BRAVO_TASKS_INSTALL.ps1 має додавати -NoPause безумовно (між -File і -NoPause не повинно бути `if (`$TaskType -eq ...)`) — інакше якийсь тип завдання лишиться без нього непомітно"
 
     # Об'єкти проблем Health мають різний набір полів: Kind = "Service" не
     # несе ні DifferenceCount, ні ActionCounts. Пряме $_.DifferenceCount під
@@ -9480,8 +9494,32 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             # збій, fixture-дані лишаються прив'язані до СВОГО модуля, а не
             # плутають $script:-простір production-скрипта, що працює далі
             # в тому самому powershell.exe process.
+            if ($DiscoverySettingsOverrides.Count -gt 0) {
+                # Complete-BRAVOConfigurationLoad (BRAVO_CONFIG_LOADER.ps1)
+                # пропускає повторний Import-Module лише коли модуль УЖЕ
+                # завантажений (perf-guard) — тому Derivation-модуль МАЄ
+                # бути імпортований ДО визначення shadow-функції нижче.
+                # КРИТИЧНО: цей Import-Module має виконуватись ТУТ, У
+                # ЗВИЧАЙНОМУ (не-модульному) scope виклику, а НЕ всередині
+                # New-Module -ScriptBlock нижче — перевірено емпірично, що
+                # Import-Module, викликаний ЗСЕРЕДИНИ dynamic-module
+                # scriptblock-а, реєструє реальний модуль як NESTED MODULE
+                # цього dynamic-модуля: подальше "function global:X" з тим
+                # самим іменем усередині ТОГО САМОГО scriptblock-а після
+                # цього формально стає активним command (Get-Command
+                # показує dynamic-модуль джерелом), але РЕАЛЬНИЙ виклик
+                # усе одно диспетчеризується в оригінальну nested-модульну
+                # реалізацію (мовчки повертає canonical, НЕ shadow) —
+                # класичний PowerShell-дефект command-resolution для
+                # nested-module re-export. Import-Module ЗВІДСИ (звичайний
+                # caller scope) не створює цього вкладеного зв'язку —
+                # подальший global:-shadow усередині scriptblock-а коректно
+                # перекриває виклик.
+                Import-Module -Name (Join-Path $RuntimeRoot `
+                    'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psd1') -ErrorAction Stop
+            }
             $prodLoaderFixtureModule = New-Module -ScriptBlock {
-                param([object[]]$Services)
+                param([object[]]$Services, [hashtable]$DiscoveryOverrides)
                 $script:prodLoaderFixtureServices = @($Services)
                 function global:Get-CimInstance {
                     param([string]$ClassName, [string]$Namespace, [string]$Filter, [string]$ErrorAction)
@@ -9493,7 +9531,43 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                     if ($Class -eq 'Win32_Service') { return @($script:prodLoaderFixtureServices) }
                     Microsoft.PowerShell.Management\Get-WmiObject @PSBoundParameters
                 }
-            } -ArgumentList (, @($Services))
+                # P0 Configuration Foundation (PR C, Секція 3): discoverySettings
+                # більше НЕ інлайн-літерал у BRAVO.config-тексті (той anchor
+                # видалено — обчислення повністю перенесено в
+                # BRAVO_CONFIG_LOADER.ps1/Complete-BRAVOConfigurationLoad,
+                # спільне для legacy й synthetic шляхів). Той самий
+                # function-shadowing прийом, що для Get-CimInstance/
+                # Get-WmiObject вище (а не текстовий патч BRAVO.config) —
+                # підміняє canonical baseline-функцію лише для цього
+                # ізольованого дочірнього прогону self-test.
+                if ($DiscoveryOverrides.Count -gt 0) {
+                    # Реальний модуль уже імпортовано ЗОВНІ (перед
+                    # New-Module -ScriptBlock, див. коментар вище) — тут
+                    # лише перекриваємо ім'я function global: у звичайний
+                    # спосіб, без вкладеного Import-Module.
+                    $script:prodLoaderDiscoveryOverrides = $DiscoveryOverrides
+                    function global:Get-BRAVOCanonicalDiscoverySettings {
+                        $baseline = @{
+                            BravoIniPath = $null
+                            BravoRoot = $null
+                            WebRoot = $null
+                            Sources = @{
+                                MODEL = $null; BLOG = $null; BRAVOEXCH = $null
+                                BAZA_APP = $null; BAZA_WWW = $null; BACKUP_ROOT = $null
+                            }
+                        }
+                        foreach ($overrideKey in @($script:prodLoaderDiscoveryOverrides.Keys)) {
+                            $segments = @(([string]$overrideKey) -split '\.')
+                            $node = $baseline
+                            for ($i = 0; $i -lt ($segments.Count - 1); $i++) {
+                                $node = $node[$segments[$i]]
+                            }
+                            $node[$segments[$segments.Count - 1]] = $script:prodLoaderDiscoveryOverrides[$overrideKey]
+                        }
+                        return $baseline
+                    }
+                }
+            } -ArgumentList (, @($Services)), $DiscoverySettingsOverrides
 
             try {
                 $configText = [IO.File]::ReadAllText($SourceConfigPath, [Text.Encoding]::UTF8)
@@ -9509,19 +9583,9 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                     }
                     $configText = $replacedText
                 }
-                foreach ($key in $DiscoverySettingsOverrides.Keys) {
-                    $simpleName = ($key -split '\.')[-1]
-                    $escapedValue = ([string]$DiscoverySettingsOverrides[$key]).Replace("'", "''")
-                    $pattern = '(?m)^(\s*' + [regex]::Escape($simpleName) + '\s*=\s*)\$null\s*$'
-                    $evaluator = [Text.RegularExpressions.MatchEvaluator] {
-                        param($match) $match.Groups[1].Value + "'$escapedValue'"
-                    }
-                    $replacedText = [regex]::Replace($configText, $pattern, $evaluator, 1)
-                    if ($replacedText -eq $configText) {
-                        throw "discoverySettings.$key substitution matched nothing (fixture BRAVO.config may have drifted)"
-                    }
-                    $configText = $replacedText
-                }
+                # discoverySettings override — тепер через function-shadowing
+                # Get-BRAVOCanonicalDiscoverySettings у fixture-модулі вище
+                # (не текстовий патч: anchor більше не існує в BRAVO.config).
                 foreach ($key in $ComponentSyncFlagOverrides.Keys) {
                     $boolValue = if ([bool]$ComponentSyncFlagOverrides[$key]) { '$true' } else { '$false' }
                     $pattern = '(?m)^(\s*' + [regex]::Escape($key) + '\s*=\s*)\$(true|false)\s*$'
@@ -9602,6 +9666,25 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 }
                 if (Test-Path -LiteralPath function:global:Get-WmiObject) {
                     throw "New-BRAVOProductionConfigFixtureResult: не вдалося видалити fixture-override function:global:Get-WmiObject — production runtime у цьому процесі залишиться отруєним"
+                }
+                if ($DiscoverySettingsOverrides.Count -gt 0) {
+                    # На відміну від Get-CimInstance/Get-WmiObject (built-in
+                    # cmdlets, під підміною завжди лишається справжня
+                    # реалізація), Get-BRAVOCanonicalDiscoverySettings —
+                    # функція МОДУЛЯ BRAVO.Configuration.Derivation:
+                    # Remove-Item function:X видаляє САМЕ модульну
+                    # реалізацію з глобальної таблиці функцій, а не лише
+                    # fixture-shadow. Complete-BRAVOConfigurationLoad
+                    # пропускає повторний Import-Module УЖЕ завантаженого
+                    # модуля (perf/shadow-guard) — тож без примусового
+                    # -Force reimport тут production runtime цього самого
+                    # процесу назавжди залишиться БЕЗ цієї функції.
+                    Remove-Item -Path function:Get-BRAVOCanonicalDiscoverySettings -Force -ErrorAction Stop
+                    Import-Module -Name (Join-Path $RuntimeRoot `
+                        'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psd1') -Force -ErrorAction Stop
+                    if (-not (Test-Path -LiteralPath function:global:Get-BRAVOCanonicalDiscoverySettings)) {
+                        throw "New-BRAVOProductionConfigFixtureResult: не вдалося відновити справжню function:global:Get-BRAVOCanonicalDiscoverySettings після fixture-override — production runtime у цьому процесі залишиться отруєним"
+                    }
                 }
                 if ($null -ne $prodLoaderFixtureModule) {
                     Remove-Module -ModuleInfo $prodLoaderFixtureModule -Force -ErrorAction SilentlyContinue
@@ -13096,6 +13179,28 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name 'ConfigurationLoader/MissingBootRestoreModeDefaultsToNone' `
         -Failure "loader має дефолтити відсутній Restore.BootRestoreMode у 'None' для старих site-config (лише RunMissedOnStartup) — консумери не повинні падати під StrictMode на відсутньому ключі"
 
+    # --- Scheduler/InstallRejectsExplicitMissingConfigPath (P0 Configuration
+    # Foundation, PR C, Секція 6): оператор явно передав -ConfigPath на
+    # файл, якого немає -> інсталяція МАЄ провалитись (не мовчки впасти
+    # назад на AUTO/synthetic). Примітка: "AUTO + файл відсутній -> PASS"
+    # уже вичерпно покрито на рівні loader-а (ConfigLoader-self-test,
+    # NoConfigAutoDerivedPathSucceedsAsSynthetic та сусідні) — тут його
+    # НЕ повторюємо через реальний виклик BRAVO_TASKS_INSTALL.ps1, бо
+    # цей entrypoint (як і решта) не має окремого -ConfigRoot: будь-яке
+    # ПЕРЕДАНЕ -ConfigPath за контрактом є EXPLICIT-наміром, а
+    # непереданий -ConfigPath завжди резолвиться проти реального
+    # RuntimeRoot цього репозиторію (де BRAVO.config фізично існує) —
+    # тому "AUTO + справді відсутній файл" на цьому entrypoint-і без
+    # небезпечної підміни реального BRAVO.config механічно не відтворюється.
+    $explicitMissingConfigPath = Join-Path ([IO.Path]::GetTempPath()) (
+        "BRAVO_EXPLICIT_MISSING_{0}\BRAVO.config" -f [guid]::NewGuid().ToString('N')
+    )
+    $explicitMissingResult = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $explicitMissingConfigPath
+    Test-BRAVOCondition `
+        -Condition ($explicitMissingResult.ExitCode -ne 0) `
+        -Name "Scheduler/InstallRejectsExplicitMissingConfigPath" `
+        -Failure "EXPLICIT -ConfigPath на відсутній файл МАЄ провалити BRAVO_TASKS_INSTALL.ps1 -ValidateOnly; отримано exit=$($explicitMissingResult.ExitCode), output=$($explicitMissingResult.Output)"
+
     $schedFixtureMaintenance = New-BRAVOSelfTestSchedulerFixtureConfig `
         -BreakLimsRootViaFakeService $true -MaintenanceEnabled $true -RecoveryEnabled $false
     $schedResultMaintenance = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureMaintenance.ConfigPath
@@ -13340,11 +13445,21 @@ function Get-BRAVOMaintenanceSummaryResult {
             Assert-BravoDataRootsAreIndependent -PathSettings $Settings
         } @{ LIMSRoot = ''; SystemLogRoot = ''; BackupRoot = '' }
     } catch { $allAutoValid = $false }
+    # P0 Configuration Foundation (PR C, Секція 3): Import-BravoConfiguration
+    # більше не викликає Import-Module/synthetic-конфігурацію одним інлайн-
+    # рядком — делегує в Import-BravoLegacyPrimaryConfiguration/
+    # Import-BravoSyntheticConfiguration (Complete-BRAVOConfigurationLoad),
+    # де -ConfigRoot і -RuntimeRoot передаються окремими іменованими
+    # аргументами (кожен на своєму рядку), а не одним конкатенованим
+    # рядком виклику. Перевіряємо саме контракт (RuntimeRoot — явний
+    # resolved-параметр, не похідний від коренів даних), а не застарілий
+    # буквальний рядок.
     Test-BRAVOCondition `
         -Condition (
             $relocatableValid -and $allAutoValid -and
             $configLoaderTextForRuntime.Contains('[string]$RuntimeRoot') -and
-            $configLoaderTextForRuntime.Contains('-ConfigRoot $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot')
+            $configLoaderTextForRuntime.Contains('-ConfigRoot $resolvedConfigRoot') -and
+            $configLoaderTextForRuntime.Contains('-RuntimeRoot $resolvedRuntimeRoot')
         ) `
         -Name "Runtime/02-RelocatableRuntimeSupportsSeparateDisks" `
         -Failure "мають бути валідними обидві крайності: усі три корені explicit на різних дисках І усі три '' (all-AUTO); RuntimeRoot окремим параметром, не з коренів даних"
@@ -14059,6 +14174,53 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition $recoveryTriggersOk `
         -Name "TaskDefinition/RecoveryIsSingleBootTriggerWithoutRepetition" `
         -Failure "Recovery-завдання (5.2.0) має мати РІВНО один boot-trigger (Type=8, Enabled=true) БЕЗ Repetition і БЕЗ daily-тригера — 24/7-профіль підхоплює пропущений слот плановим Maintenance, а не окремим розкладом"
+
+    # --- TaskDefinition/ConfigPathAutoExplicitMatrix (P0 Configuration
+    # Foundation, PR C, Секція 6): МЕХАНІЧНА перевірка ЗГЕНЕРОВАНИХ
+    # Arguments реального ITaskDefinition (через New-BRAVOTaskDefinition,
+    # той самий код, що виконує реальний Installer) — не -ValidateOnly
+    # exit code, а фактичний рядок Action.Arguments для КОЖНОГО типу
+    # завдання. AUTO (ConfigPathWasExplicit=$false) не повинен містити
+    # -ConfigPath взагалі; EXPLICIT — точний шлях.
+    $configPathMatrixTaskServiceForTest = New-Object -ComObject "Schedule.Service"
+    $configPathMatrixTaskServiceForTest.Connect()
+    $configPathMatrixFailures = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($matrixTaskType in @('Backup', 'Maintenance', 'Health', 'Recovery', 'BAZASync', 'RestoreVerify')) {
+            $matrixTaskSettings = $global:schedulerSettings.$matrixTaskType
+            foreach ($matrixCase in @(
+                    @{ Explicit = $false; Label = 'AUTO' },
+                    @{ Explicit = $true; Label = 'EXPLICIT' }
+                )) {
+                $matrixArguments = & $recoveryTriggerModule {
+                    param($TaskService, $TaskSettings, $TaskType, $ConfigPath, $Explicit)
+                    $matrixResult = New-BRAVOTaskDefinition `
+                        -TaskService $TaskService -TaskSettings $TaskSettings `
+                        -TaskType $TaskType -ResolvedConfigPath $ConfigPath `
+                        -ConfigPathWasExplicit $Explicit
+                    @($matrixResult.Definition.Actions)[0].Arguments
+                } $configPathMatrixTaskServiceForTest $matrixTaskSettings $matrixTaskType $resolvedConfig $matrixCase.Explicit
+
+                $matrixHasConfigPath = [string]$matrixArguments -like '*-ConfigPath *'
+                $matrixExpectedExactToken = "-ConfigPath `"$resolvedConfig`""
+                $matrixOk = if ($matrixCase.Explicit) {
+                    $matrixHasConfigPath -and ([string]$matrixArguments).Contains($matrixExpectedExactToken)
+                } else {
+                    -not $matrixHasConfigPath
+                }
+                if (-not $matrixOk) {
+                    [void]$configPathMatrixFailures.Add(
+                        "$matrixTaskType/$($matrixCase.Label): Arguments='$matrixArguments'")
+                }
+            }
+        }
+    } finally {
+        [void][Runtime.InteropServices.Marshal]::ReleaseComObject($configPathMatrixTaskServiceForTest)
+    }
+    Test-BRAVOCondition `
+        -Condition ($configPathMatrixFailures.Count -eq 0) `
+        -Name "TaskDefinition/ConfigPathAutoExplicitMatrix" `
+        -Failure "AUTO-встановлене завдання не повинно містити -ConfigPath у Arguments, EXPLICIT — точний шлях; для ВСІХ типів завдань (Backup/Maintenance/Health/Recovery/BAZASync/RestoreVerify). Розбіжності: $($configPathMatrixFailures -join ' | ')"
 
     # --- BootRestore/StartTypeClassificationMatrix: класифікація дій
     # Set-BRAVOBootRestoreServiceStartType (BRAVO.System) для обох профілів;

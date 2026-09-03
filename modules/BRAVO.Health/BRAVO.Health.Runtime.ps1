@@ -449,6 +449,11 @@ try {
     # TLS 1.2 не підтримується системним .NET/Schannel.
 }
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту
+# нижче.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -457,14 +462,14 @@ $healthCheckStarted = Get-Date
 $healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
 $script:healthLatestArchives = @{}
 
-if (-not (Test-Path -Path $ConfigPath -PathType Leaf)) {
-    Write-Error "Файл конфігурації не знайдено: $ConfigPath"
-    return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
-        Status = "ConfigurationError"
-        IssueCount = 0
-        Notification = "NotSent"
-    })
-}
+# P0 Configuration Foundation: BRAVO.config став опційним основним
+# override-шаром — попередня жорстка "файл мусить існувати" перевірка
+# тут дублювала (і випереджала) те саме рішення, яке Import-Bravo
+# Configuration тепер приймає коректно сама (auto-derived відсутній
+# BRAVO.config -> canonical built-in defaults + BRAVO.local.config;
+# явно вказаний відсутній -ConfigPath -> як і раніше, помилка,
+# перехоплена нижче тим самим catch і тим самим ConfigurationError-
+# результатом). Один canonical guard замість двох незалежних копій.
 
 try {
     $loaderPath = Join-Path `
@@ -480,7 +485,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
         -ConfigPath $ConfigPath `
-        -RuntimeRoot $bravoScriptDirectory
+        -RuntimeRoot $bravoScriptDirectory `
+        -ConfigPathWasExplicit:$configPathWasExplicit
 
     $ConfigPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     if ($null -ne $credentialSettings) {

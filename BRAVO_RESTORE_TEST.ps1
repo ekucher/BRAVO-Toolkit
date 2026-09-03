@@ -48,6 +48,11 @@ function Wait-BRAVOEarlyManualExit {
     }
 }
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО обчислення effective-шляху.
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
+
 # Effective ConfigPath визначається ОДИН раз, до guard-а, і далі
 # використовується всюди (той самий контракт, що в BRAVO_DATA_RESTORE.ps1).
 $effectiveConfigPath = if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -277,10 +282,12 @@ try {
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
         $ConfigPath = Join-Path $scriptDirectory "BRAVO.config"
     }
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-        throw "файл конфігурації не знайдено: $ConfigPath"
-    }
-    $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    # P0 Configuration Foundation: BRAVO.config став опційним основним
+    # override-шаром — попередня жорстка "файл мусить існувати" перевірка
+    # (і Resolve-Path, який теж вимагав існування) дублювала те саме
+    # рішення, яке Import-BravoConfiguration тепер приймає коректно сама.
+    # GetFullPath (а не Resolve-Path) нормалізує шлях без вимоги існування.
+    $resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
     $configRoot = Split-Path $resolvedConfigPath -Parent
     $runtimeRoot = (Resolve-Path -LiteralPath $PSScriptRoot).Path
 
@@ -303,7 +310,7 @@ try {
         throw "Не знайдено BRAVO_CONFIG_LOADER.ps1: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $runtimeRoot
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $runtimeRoot -ConfigPathWasExplicit:$configPathWasExplicit
 
     # Поріг із конфігурації ($restoreVerifySettings, нормалізований
     # loader-ом і для legacy-конфігів) — але явний параметр командного

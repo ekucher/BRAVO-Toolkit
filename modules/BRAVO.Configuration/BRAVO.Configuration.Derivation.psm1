@@ -61,6 +61,35 @@ function Resolve-BRAVOConfigurationDerivation {
         [Parameter(Mandatory = $true)][hashtable]$restoreVerifySettings
     )
 
+    # credentialSettings.HelperPath/SetupScriptPath — похідні від
+    # runtimeRoot шляхи runtime-ресурсів комплекту (не raw-configurable
+    # значення). У BRAVO.config вони обчислювались inline одразу при
+    # оголошенні $global:credentialSettings, ДО появи цього canonical
+    # resolver-а — переносимо сюди, щоб no-config-шлях (BRAVO.config
+    # відсутній) отримував той самий результат без другої копії цієї
+    # логіки.
+    $global:credentialSettings = $credentialSettings
+    $global:credentialSettings.HelperPath = Join-Path $runtimeRoot "modules\BRAVO.Credentials\BRAVO.Credentials.psd1"
+    $global:credentialSettings.SetupScriptPath = Join-Path $runtimeRoot "BRAVO_CREDENTIALS_SETUP.ps1"
+
+    # maintenanceSettings.General.ObjectName/ArchivePrefix — той самий
+    # клас: похідні від bravoSettings значення, обчислені inline при
+    # оголошенні $global:maintenanceSettings у BRAVO.config, ДО появи
+    # цього resolver-а. Це лише ПОЧАТКОВЕ/placeholder-значення:
+    # Import-BRAVOInstitutionSettings (BRAVO.Credentials.psm1, викликана
+    # entrypoint-ом одразу після Import-BravoConfiguration) перезаписує
+    # обидва поля реальними даними з Credential Manager — але до ТОГО
+    # моменту консюмери читають напряму (BRAVO.Maintenance.Runtime.ps1)
+    # і під StrictMode впали б на відсутньому ключі без цього дефолту.
+    if ($maintenanceSettings.Contains('General') -and $maintenanceSettings.General -is [hashtable]) {
+        if ($bravoSettings.Contains('InstitutionName') -and $bravoSettings.Contains('InstitutionCode')) {
+            $maintenanceSettings.General.ObjectName = "$($bravoSettings.InstitutionName) [$($bravoSettings.InstitutionCode)]"
+        }
+        if ($bravoSettings.Contains('ArchivePrefix')) {
+            $maintenanceSettings.General.ArchivePrefix = [string]$bravoSettings.ArchivePrefix
+        }
+    }
+
     # =============================================
     # ШЛЯХИ ДО ДЖЕРЕЛ ДАНИХ
     # =============================================
@@ -190,6 +219,16 @@ function Resolve-BRAVOConfigurationDerivation {
         [Environment]::ExpandEnvironmentVariables($env:ProgramData)
     }
     $global:stateRoot = Join-Path $programDataRoot 'BRAVO\State'
+
+    # Operation lock — той самий %ProgramData%\BRAVO корінь, що й state.
+    # Раніше обчислювався окремо, inline у самому BRAVO.config (ДО появи
+    # цього canonical resolver-а) — переносимо сюди, бо це той самий клас
+    # похідного (від programDataRoot), не raw-configurable значення, що й
+    # stateRoot поруч, і no-config-шлях (BRAVO.config відсутній) потребує
+    # того самого обчислення без другої копії цієї логіки.
+    $global:operationLockSettings = @{
+        Path = Join-Path $programDataRoot 'BRAVO\Locks\BRAVO_OPERATION.lock'
+    }
 
     # Tools\ — runtime-залежності комплекту, лежать поруч зі скриптами
     # (RuntimeRoot).
@@ -366,4 +405,31 @@ function Resolve-BRAVOConfigurationDerivation {
 
     # Пороги перевірки відновлюваності — уже повністю raw-параметр.
     $global:restoreVerifySettings = $restoreVerifySettings
+}
+
+function Get-BRAVOCanonicalDiscoverySettings {
+    # Канонічна, фіксована (НЕ raw-configurable) структура discoverySettings
+    # — той самий літерал, який BRAVO.config визначає інлайн (навмисно
+    # ПІСЛЯ фази local-overrides, щоб спроба перевизначити 'discoverySettings.*'
+    # через BRAVO.local.config провалювалась fail-closed, а не мовчки
+    # ігнорувалась). Винесено сюди як ОДНЕ джерело, яким користуються ОБИДВА
+    # шляхи (BRAVO.config present і absent) — без цього no-config-шлях мав би
+    # тримати другу незалежну копію цього самого літералу.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    return @{
+        BravoIniPath = $null
+        BravoRoot = $null
+        WebRoot = $null
+        Sources = @{
+            MODEL = $null
+            BLOG = $null
+            BRAVOEXCH = $null
+            BAZA_APP = $null
+            BAZA_WWW = $null
+            BACKUP_ROOT = $null
+        }
+    }
 }

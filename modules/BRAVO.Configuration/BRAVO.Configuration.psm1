@@ -526,10 +526,29 @@ function ConvertTo-BRAVONestedOverride {
     # Fail-closed на невідомий шлях: кожен сегмент, окрім останнього,
     # повинен існувати як hashtable-вузол у $ReferenceConfiguration (типово
     # — Get-BRAVODefaultConfiguration), інакше опечатка мовчки створила б
-    # новий, ніколи не консультований вузол (той самий контракт, що вже
-    # захищає Invoke-BRAVOLocalConfigurationOverridePhase для вже
-    # створених $global:-об'єктів — тут той самий захист застосовується
-    # ДО існування будь-яких $global:-змінних, на чистому raw-графі).
+    # новий, ніколи не консультований вузол.
+    #
+    # P0 Configuration Foundation (PR C, Секція 4): ОДИН canonical контракт
+    # для ОБОХ шляхів (config-present і config-absent) — раніше
+    # config-present-шлях проходив через окремий, м'якший
+    # Invoke-BRAVOLocalConfigurationOverridePhase (дозволяв НОВИЙ leaf у
+    # ВЖЕ існуючому hashtable-вузлі), а config-absent-шлях уже тоді йшов
+    # через цю функцію з вимогою, щоб і LEAF також існував у
+    # $ReferenceConfiguration — те саме BRAVO.local.config давало різний
+    # accept/reject результат залежно від наявності BRAVO.config
+    # (задокументований дефект, знайдений на review). Той функцію тепер
+    # прибрано (єдиний pipeline, Complete-BRAVOConfigurationLoad) — щоб не
+    # втратити forward-compat-сумісність, яку вона забезпечувала
+    # (новіший BRAVO.local.config.example/Configurator може містити ключ,
+    # ще не описаний у схемі цієї версії toolkit — такий ключ МАЄ
+    # пережити roundtrip, а не відкидати весь local-override файл),
+    # багатосегментний шлях більше НЕ вимагає, щоб сам LEAF вже існував —
+    # лише щоб БАТЬКІВСЬКИЙ вузол (усі сегменти, крім останнього) був
+    # реальним hashtable-вузлом канонічної конфігурації. Односегментний
+    # (без крапки) шлях — це сам top-level ключ: тут requirement
+    # лишається строгим, бо "новий top-level raw-блок" — це вже зміна
+    # формату конфігурації, а не forward-compat-лист усередині відомого
+    # блоку.
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
@@ -560,9 +579,17 @@ function ConvertTo-BRAVONestedOverride {
         }
 
         $leafSegment = $segments[$segments.Count - 1]
-        if ($pathIsKnown -and -not (
+        if ($pathIsKnown -and $segments.Count -eq 1 -and -not (
                 $referenceNode -is [hashtable] -and $referenceNode.Contains($leafSegment)
             )) {
+            $pathIsKnown = $false
+        }
+        # Багатосегментний шлях: сам leaf не мусить уже існувати
+        # (forward-compat, див. коментар вище) — але батьківський вузол
+        # МАЄ бути реальним hashtable-вузлом (не масив/скаляр/$null), щоб
+        # $targetNode[$leafSegment]= нижче не створював структуру поза
+        # канонічною формою.
+        if ($pathIsKnown -and $segments.Count -gt 1 -and -not ($referenceNode -is [hashtable])) {
             $pathIsKnown = $false
         }
 

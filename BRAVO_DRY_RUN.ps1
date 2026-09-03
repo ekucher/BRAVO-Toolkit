@@ -1081,14 +1081,20 @@ try {
     } else {
         [Environment]::CurrentDirectory
     }
+    # P0 Configuration Foundation (PR C): свідомий намір оператора
+    # фіксується ТУТ, на межі справжнього виклику скрипта, ДО підстановки
+    # auto-дефолту нижче.
+    $configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+        -not [string]::IsNullOrWhiteSpace($ConfigPath)
     if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
         $ConfigPath = Join-Path $scriptDirectory "BRAVO.config"
     }
-    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-        throw "файл конфігурації не знайдено: $ConfigPath"
-    }
-
-    $resolvedConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    # P0 Configuration Foundation: BRAVO.config став опційним основним
+    # override-шаром — попередня жорстка "файл мусить існувати" перевірка
+    # (і Resolve-Path, який теж вимагав існування) дублювала те саме
+    # рішення, яке Import-BravoConfiguration тепер приймає коректно сама.
+    # GetFullPath (а не Resolve-Path) нормалізує шлях без вимоги існування.
+    $resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
     $runtimeRoot = (Resolve-Path -LiteralPath $scriptDirectory).Path
     $configRoot = Split-Path $resolvedConfigPath -Parent
     $configurationLoaderPath = Join-Path $runtimeRoot 'BRAVO_CONFIG_LOADER.ps1'
@@ -1099,8 +1105,20 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $resolvedConfigPath `
-        -RuntimeRoot $runtimeRoot
-    Add-DryRunResult PASS "Конфігурація" "Завантаження" $resolvedConfigPath
+        -RuntimeRoot $runtimeRoot `
+        -ConfigPathWasExplicit:$configPathWasExplicit
+    # P0 Configuration Foundation: у режимі без BRAVO.config (Format =
+    # synthetic-no-config) $resolvedConfigPath законно не існує — це не
+    # помилка. Нижче (readAccessTargets) враховуємо Format, щоб не
+    # позначати відсутній файл як FAIL. Import-BravoConfiguration без
+    # -PassThru нічого не повертає — фактичний Format лежить у
+    # $global:BravoConfigurationMetadata (той самий канонічний контракт,
+    # який виставляє сам loader після успішного завантаження).
+    $bravoConfigFileWasUsed = ($null -ne $global:BravoConfigurationMetadata) -and
+        ([string]$global:BravoConfigurationMetadata.Format -eq 'legacy-config')
+    Add-DryRunResult PASS "Конфігурація" "Завантаження" $(
+        if ($bravoConfigFileWasUsed) { $resolvedConfigPath } else { "$resolvedConfigPath (BRAVO.config відсутній — canonical дефолти + local override)" }
+    )
 
     $requiredScriptNames = @(
         "BRAVO_ARCHIV.ps1",
@@ -1263,6 +1281,10 @@ try {
     foreach ($readTarget in $readAccessTargets.GetEnumerator()) {
         if ([string]::IsNullOrWhiteSpace([string]$readTarget.Value)) {
             Add-DryRunResult WARN "Доступ (читання)" ([string]$readTarget.Key) "шлях не визначено в конфігурації"
+            continue
+        }
+        if ([string]$readTarget.Key -eq 'ConfigPath' -and -not $bravoConfigFileWasUsed) {
+            Add-DryRunResult PASS "Доступ (читання)" ([string]$readTarget.Key) "BRAVO.config відсутній навмисно (synthetic-no-config) — canonical дефолти + local override"
             continue
         }
         $readResult = Test-BRAVOFileSystemReadAccess -Path ([string]$readTarget.Value)

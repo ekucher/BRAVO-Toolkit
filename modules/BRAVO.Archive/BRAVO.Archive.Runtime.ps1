@@ -64,6 +64,12 @@ if ($HealthCheckOnly) {
         -NoPause:$NoPause
     exit $LASTEXITCODE
 }
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту
+# нижче — і передається в Import-BravoConfiguration явним параметром
+# (не вгадується там за збігом шляхів).
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -73,13 +79,13 @@ if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
 # =============================================
 # ЗАВАНТАЖЕННЯ КОНФІГУРАЦІЇ
 # =============================================
-
-# Перевірка наявності файлу конфігурації
-if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    Write-Host "ПОМИЛКА: Файл конфiгурацiї не знайдено: $ConfigPath" -ForegroundColor Red
-    Write-Host "Створiть або налаштуйте файл BRAVO.config поруч зі скриптом." -ForegroundColor Yellow
-    Exit 1
-}
+# P0 Configuration Foundation: BRAVO.config став опційним основним
+# override-шаром — попередня жорстка "файл мусить існувати" перевірка
+# тут дублювала (і випереджала) те саме рішення, яке Import-Bravo
+# Configuration тепер приймає коректно сама (auto-derived відсутній
+# BRAVO.config -> canonical built-in defaults + BRAVO.local.config;
+# явно вказаний відсутній -ConfigPath -> як і раніше, помилка). Один
+# canonical guard замість двох незалежних копій цього рішення.
 
 # Завантаження конфігурації
 try {
@@ -96,7 +102,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
         -ConfigPath $ConfigPath `
-        -RuntimeRoot $bravoScriptDirectory
+        -RuntimeRoot $bravoScriptDirectory `
+        -ConfigPathWasExplicit:$configPathWasExplicit
 
     $configPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     Write-Host "Конфiгурацiю завантажено успiшно: $configPath" -ForegroundColor $logColors.SUCCESS

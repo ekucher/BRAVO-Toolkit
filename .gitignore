@@ -29,3 +29,11 @@ Tools/TOOLS_INTEGRITY.json
 # Результати збирання release-артефакту (ci\New-BRAVOReleaseArtifact.ps1) —
 # генеруються з git archive, ніколи не комітяться.
 artifacts/
+
+# P0 Configuration Foundation (PR C): BRAVO.local.config — site-specific
+# override-шар оператора (LIMSRoot/BackupRoot/креденшел-таргети/розклади
+# тощо для КОНКРЕТНОГО сервера), той самий клас, що WinSCP.ini вище —
+# ніколи не частина комплекту й не повинен потрапити в git при ручному
+# запуску з робочої копії репозиторію. Трекається лише шаблон
+# BRAVO.local.config.example.
+BRAVO.local.config
