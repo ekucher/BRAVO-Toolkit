@@ -148,3 +148,211 @@
         ) `
         -Name "Configuration/LocalOnlyModeApplies" `
         -Failure "local override має застосовуватись навіть без primary-шару"
+
+    # --- P1 security hardening (CI remediation #129): Get-BRAVOCanonicalDiscoverySettings
+    # two-factor fail-closed test-only discovery override seam
+    # (Assert-BRAVODiscoverySettingsTestOverride, BRAVO.Configuration.Derivation.psm1).
+    # DataRestore Matrix fixture-only seam; НЕ supported production configuration.
+
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psd1') -Force
+
+    $discoveryOverrideTestRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("BRAVO_DiscoveryOverrideTest_" + [guid]::NewGuid().ToString('N'))
+    [void](New-Item -ItemType Directory -Path $discoveryOverrideTestRoot -Force -ErrorAction Stop)
+    $discoveryOverrideBeforeHooks = $env:BRAVO_DATARESTORE_TEST_HOOKS
+    $discoveryOverrideBeforePath = $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH
+
+    function Reset-BRAVODiscoveryOverrideTestEnv {
+        Remove-Item -Path 'Env:\BRAVO_DATARESTORE_TEST_HOOKS' -ErrorAction SilentlyContinue
+        Remove-Item -Path 'Env:\BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH' -ErrorAction SilentlyContinue
+    }
+
+    function New-BRAVODiscoveryOverrideFixturePsd1 {
+        param([string]$Name, [string]$Content)
+        $fixturePath = Join-Path $discoveryOverrideTestRoot $Name
+        Set-Content -LiteralPath $fixturePath -Value $Content -Encoding UTF8
+        return $fixturePath
+    }
+
+    $validFixtureModel = Join-Path $discoveryOverrideTestRoot 'MODEL'
+    $validFixtureBlog = Join-Path $discoveryOverrideTestRoot 'BLOG'
+    $validFixtureExch = Join-Path $discoveryOverrideTestRoot 'BRAVOEXCH'
+    $validFixtureContent = "@{`n    BravoIniPath = `$null`n    BravoRoot = `$null`n    WebRoot = `$null`n    Sources = @{`n        MODEL = '$validFixtureModel'`n        BLOG = '$validFixtureBlog'`n        BRAVOEXCH = '$validFixtureExch'`n        BAZA_APP = `$null`n        BAZA_WWW = `$null`n        BACKUP_ROOT = `$null`n    }`n}`n"
+    $validFixturePath = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'valid.psd1' -Content $validFixtureContent
+
+    try {
+        # --- DiscoveryOverride/NoVariablesReturnsCanonicalSettings ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $canonicalResult = Get-BRAVOCanonicalDiscoverySettings
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $canonicalResult.BravoIniPath -and
+                $null -eq $canonicalResult.Sources.MODEL
+            ) `
+            -Name "Configuration/DiscoveryOverride/NoVariablesReturnsCanonicalSettings" `
+            -Failure "без обох env var Get-BRAVOCanonicalDiscoverySettings має повертати canonical null-літерал"
+
+        # --- DiscoveryOverride/SentinelOnlyDoesNotActivateOverride ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $sentinelOnlyResult = Get-BRAVOCanonicalDiscoverySettings
+        Test-BRAVOCondition `
+            -Condition ($null -eq $sentinelOnlyResult.Sources.MODEL) `
+            -Name "Configuration/DiscoveryOverride/SentinelOnlyDoesNotActivateOverride" `
+            -Failure "сам по собі BRAVO_DATARESTORE_TEST_HOOKS без OVERRIDE_PATH не повинен нічого активувати"
+
+        # --- DiscoveryOverride/PathWithoutSentinelFailsClosed ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $validFixturePath
+        $pathWithoutSentinelThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $pathWithoutSentinelThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $pathWithoutSentinelThrew `
+            -Name "Configuration/DiscoveryOverride/PathWithoutSentinelFailsClosed" `
+            -Failure "OVERRIDE_PATH без sentinel BRAVO_DATARESTORE_TEST_HOOKS=ACCEPTANCE_ONLY має fail-closed THROW, а не мовчазний canonical fallback"
+
+        # --- DiscoveryOverride/WrongSentinelFailsClosed ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'wrong'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $validFixturePath
+        $wrongSentinelThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $wrongSentinelThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $wrongSentinelThrew `
+            -Name "Configuration/DiscoveryOverride/WrongSentinelFailsClosed" `
+            -Failure "неточний (case/значення) sentinel має fail-closed THROW"
+
+        # --- DiscoveryOverride/MissingFileFailsClosed ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = Join-Path $discoveryOverrideTestRoot 'missing.psd1'
+        $missingFileThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $missingFileThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $missingFileThrew `
+            -Name "Configuration/DiscoveryOverride/MissingFileFailsClosed" `
+            -Failure "неіснуючий OVERRIDE_PATH-файл має fail-closed THROW"
+
+        # --- DiscoveryOverride/RelativePathRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = 'relative\discovery.psd1'
+        $relativePathThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $relativePathThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $relativePathThrew `
+            -Name "Configuration/DiscoveryOverride/RelativePathRejected" `
+            -Failure "відносний OVERRIDE_PATH має fail-closed THROW"
+
+        # --- DiscoveryOverride/UncPathRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = '\\server\share\discovery.psd1'
+        $uncPathThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $uncPathThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $uncPathThrew `
+            -Name "Configuration/DiscoveryOverride/UncPathRejected" `
+            -Failure "UNC OVERRIDE_PATH має fail-closed THROW"
+
+        # --- DiscoveryOverride/WrongExtensionRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $wrongExtPath = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'wrongext.txt' -Content '@{ BravoIniPath = $null; BravoRoot = $null; WebRoot = $null; Sources = @{} }'
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $wrongExtPath
+        $wrongExtThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $wrongExtThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $wrongExtThrew `
+            -Name "Configuration/DiscoveryOverride/WrongExtensionRejected" `
+            -Failure "OVERRIDE_PATH не з розширенням .psd1 має fail-closed THROW"
+
+        # --- DiscoveryOverride/InvalidPsd1Rejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $invalidPsd1Path = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'invalid.psd1' -Content 'this is not valid restricted-language PSD1 { [ } ='
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $invalidPsd1Path
+        $invalidPsd1Threw = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $invalidPsd1Threw = $true }
+        Test-BRAVOCondition `
+            -Condition $invalidPsd1Threw `
+            -Name "Configuration/DiscoveryOverride/InvalidPsd1Rejected" `
+            -Failure "невалідний .psd1 (Import-PowerShellDataFile parse error) має fail-closed THROW"
+
+        # --- DiscoveryOverride/UnknownTopLevelKeyRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $unknownTopLevelPath = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'unknown-top.psd1' -Content '@{ BravoIniPath = $null; BravoRoot = $null; WebRoot = $null; Sources = @{}; UnknownKey = "x" }'
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $unknownTopLevelPath
+        $unknownTopLevelThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $unknownTopLevelThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $unknownTopLevelThrew `
+            -Name "Configuration/DiscoveryOverride/UnknownTopLevelKeyRejected" `
+            -Failure "невідомий top-level ключ у .psd1 має fail-closed THROW"
+
+        # --- DiscoveryOverride/UnknownSourceKeyRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $unknownSourcePath = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'unknown-source.psd1' -Content '@{ BravoIniPath = $null; BravoRoot = $null; WebRoot = $null; Sources = @{ UNKNOWN_SOURCE = $null } }'
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $unknownSourcePath
+        $unknownSourceThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $unknownSourceThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $unknownSourceThrew `
+            -Name "Configuration/DiscoveryOverride/UnknownSourceKeyRejected" `
+            -Failure "невідомий Sources-ключ у .psd1 має fail-closed THROW"
+
+        # --- DiscoveryOverride/InvalidTopLevelValueTypeRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $invalidTopLevelTypePath = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'invalid-top-type.psd1' -Content '@{ BravoIniPath = 42; BravoRoot = $null; WebRoot = $null; Sources = @{} }'
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $invalidTopLevelTypePath
+        $invalidTopLevelTypeThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $invalidTopLevelTypeThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $invalidTopLevelTypeThrew `
+            -Name "Configuration/DiscoveryOverride/InvalidTopLevelValueTypeRejected" `
+            -Failure "нестроковий/не-null top-level scalar (integer) має fail-closed THROW"
+
+        # --- DiscoveryOverride/InvalidSourceValueTypeRejected ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $invalidSourceTypePath = New-BRAVODiscoveryOverrideFixturePsd1 -Name 'invalid-source-type.psd1' -Content '@{ BravoIniPath = $null; BravoRoot = $null; WebRoot = $null; Sources = @{ MODEL = @(1,2,3) } }'
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $invalidSourceTypePath
+        $invalidSourceTypeThrew = $false
+        try { Get-BRAVOCanonicalDiscoverySettings | Out-Null } catch { $invalidSourceTypeThrew = $true }
+        Test-BRAVOCondition `
+            -Condition $invalidSourceTypeThrew `
+            -Name "Configuration/DiscoveryOverride/InvalidSourceValueTypeRejected" `
+            -Failure "масив як значення Sources.MODEL має fail-closed THROW"
+
+        # --- DiscoveryOverride/ValidFixtureAccepted ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = 'ACCEPTANCE_ONLY'
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $validFixturePath
+        $validFixtureResult = Get-BRAVOCanonicalDiscoverySettings
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$validFixtureResult.Sources.MODEL -eq $validFixtureModel -and
+                [string]$validFixtureResult.Sources.BLOG -eq $validFixtureBlog -and
+                [string]$validFixtureResult.Sources.BRAVOEXCH -eq $validFixtureExch
+            ) `
+            -Name "Configuration/DiscoveryOverride/ValidFixtureAccepted" `
+            -Failure "валідний two-factor fixture .psd1 має повернути точно задані MODEL/BLOG/BRAVOEXCH шляхи"
+
+        # --- DiscoveryOverride/DefaultBehaviorUnchangedAfterFailedTest ---
+        Reset-BRAVODiscoveryOverrideTestEnv
+        $afterFailedTestResult = Get-BRAVOCanonicalDiscoverySettings
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $afterFailedTestResult.BravoIniPath -and
+                $null -eq $afterFailedTestResult.Sources.MODEL
+            ) `
+            -Name "Configuration/DiscoveryOverride/DefaultBehaviorUnchangedAfterFailedTest" `
+            -Failure "після серії fail-closed тестів (і після env var очищено) canonical поведінка має лишатись повністю незмінною"
+    } finally {
+        Reset-BRAVODiscoveryOverrideTestEnv
+        if ($null -ne $discoveryOverrideBeforeHooks) { $env:BRAVO_DATARESTORE_TEST_HOOKS = $discoveryOverrideBeforeHooks }
+        if ($null -ne $discoveryOverrideBeforePath) { $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $discoveryOverrideBeforePath }
+        Remove-Item -LiteralPath $discoveryOverrideTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }

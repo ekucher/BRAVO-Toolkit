@@ -227,7 +227,15 @@ function New-BRAVODataRestoreMatrixFixtureGeneration {
     # stateRoot деривуються від $env:ProgramData (P0 Configuration
     # Foundation, Resolve-BRAVOConfigurationDerivation) — без цього
     # override фікстура торкалася б реального C:\ProgramData\BRAVO.
+    # P1 security hardening (Assert-BRAVODiscoverySettingsTestOverride,
+    # BRAVO.Configuration.Derivation.psm1): discovery override тепер
+    # two-factor fail-closed — сам BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH
+    # без sentinel-фактора BRAVO_DATARESTORE_TEST_HOOKS=ACCEPTANCE_ONLY
+    # кидає виняток замість мовчазного fallback, тому обидва фактори
+    # виставляються тут разом, тим самим ProcessStartInfo.EnvironmentVariables
+    # каналом.
     $startInfo.EnvironmentVariables['ProgramData'] = [string]$FixtureConfig.ProgramDataRoot
+    $startInfo.EnvironmentVariables['BRAVO_DATARESTORE_TEST_HOOKS'] = 'ACCEPTANCE_ONLY'
     $startInfo.EnvironmentVariables['BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH'] = [string]$FixtureConfig.DiscoverySettingsOverridePath
     $process = New-Object System.Diagnostics.Process
     $process.StartInfo = $startInfo
@@ -314,8 +322,17 @@ function Invoke-BRAVODataRestoreMatrixCombo {
     $startInfo.RedirectStandardOutput = $true
     $startInfo.RedirectStandardError = $true
     $startInfo.CreateNoWindow = $true
-    if (-not [string]::IsNullOrWhiteSpace($FailpointComponent)) {
+    # P1 security hardening (Assert-BRAVODiscoverySettingsTestOverride,
+    # BRAVO.Configuration.Derivation.psm1): discovery override тепер
+    # two-factor fail-closed — BRAVO_DATARESTORE_TEST_HOOKS=ACCEPTANCE_ONLY
+    # обов'язковий, якщо задано BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH, так
+    # само як і для FailpointComponent нижче (той самий sentinel, обидва
+    # test-only канали одного і того ж isolated child-процесу).
+    if (-not [string]::IsNullOrWhiteSpace($FailpointComponent) -or
+        -not [string]::IsNullOrWhiteSpace($DiscoverySettingsOverridePath)) {
         $startInfo.EnvironmentVariables['BRAVO_DATARESTORE_TEST_HOOKS'] = 'ACCEPTANCE_ONLY'
+    }
+    if (-not [string]::IsNullOrWhiteSpace($FailpointComponent)) {
         $startInfo.EnvironmentVariables['BRAVO_DATARESTORE_TEST_FAILPOINT'] = "AfterMoveAside:$FailpointComponent"
     }
     if (-not [string]::IsNullOrWhiteSpace($ProgramDataRoot)) {
