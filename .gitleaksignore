@@ -84,3 +84,14 @@
 # Значення — публічний відносний SFTP-шлях (приклад override у
 # документаційному .example-файлі), жодного секрету.
 378fb603451b5cc407e016d835576a0607ee57b9:BRAVO.local.config.example:generic-api-key:206
+
+# P0 Configuration Foundation PR B (2026-09-02, коміт 074707d): той самий
+# false-positive клас, що вже allowlisted вище для BRAVO_CONFIG_LOADER.ps1/
+# BRAVO.config/selftest (7b05cc0) — sftpDirectories.ExchangeApiLogs =
+# "logs/exchangapi" (публічний відносний SFTP-шлях, не секрет), тепер
+# також у modules/BRAVO.Configuration/BRAVO.Configuration.psm1
+# (Get-BRAVODefaultConfiguration — canonical-дефолт-резолвер, куди PR B
+# виніс цей блок). Ключ містить "Api" поруч із "=" і рядковим значенням —
+# дефолтне правило generic-api-key матчить сам патерн імені ключа.
+# Фіксується per-fingerprint, без послаблення правила.
+074707db48546e31d04ce1842e8b48fc5e145a46:modules/BRAVO.Configuration/BRAVO.Configuration.psm1:generic-api-key:362
