@@ -310,11 +310,33 @@ try {
     $successDedupKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
     $successDedupBackupRootLine = '    BackupRoot    = ""'
     $successDedupKeyLine = '    SuccessDedupMinutes = 1380'
+    # P0 Configuration Foundation (PR B): SuccessNotificationStatePath і
+    # OperationalStatePath більше не raw-літерали в BRAVO.config — це
+    # безумовно похідні поля, які тепер завжди обчислює
+    # Resolve-BRAVOConfigurationDerivation (modules/BRAVO.Configuration/
+    # BRAVO.Configuration.Derivation.psm1), а не сам BRAVO.config. Форма
+    # рядків тепер інша ($global:backupMonitoring.X = ..., без 4-
+    # пробільного raw-hashtable відступу) — і, оскільки поле обчислюється
+    # безумовно (не за raw-ключем), .Replace(...) на цих двох рядках у
+    # $successDedupHermeticText нижче — навмисний no-op (більше нема що
+    # прибирати з BRAVO.config): деривація й так виробляє шлях незалежно
+    # від вмісту raw-конфігу, тому "legacy" і "поточний" сценарії для цих
+    # двох конкретних полів тепер еквівалентні.
     $successDedupStatePathLine = '    SuccessNotificationStatePath = Join-Path $stateRoot "BRAVO_HEALTH_SUCCESS_NOTIFICATION_STATE.json"'
     $operationalStatePathLine = '    OperationalStatePath = Join-Path $stateRoot "BRAVO_HEALTH_OPERATIONAL_STATE.json"'
-    foreach ($successDedupRequiredLine in @($successDedupBackupRootLine, $successDedupKeyLine, $successDedupStatePathLine, $operationalStatePathLine)) {
+    $successDedupDerivationText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'))
+    foreach ($successDedupRequiredLine in @($successDedupBackupRootLine, $successDedupKeyLine)) {
         if (-not $successDedupKitText.Contains($successDedupRequiredLine)) {
             throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$successDedupRequiredLine' — оновіть підготовку SuccessDedup-сценаріїв під нову форму конфігурації"
+        }
+    }
+    foreach ($successDedupDerivedLine in @(
+        '$global:backupMonitoring.SuccessNotificationStatePath = Join-Path $stateRoot "BRAVO_HEALTH_SUCCESS_NOTIFICATION_STATE.json"',
+        '$global:backupMonitoring.OperationalStatePath = Join-Path $stateRoot "BRAVO_HEALTH_OPERATIONAL_STATE.json"'
+    )) {
+        if (-not $successDedupDerivationText.Contains($successDedupDerivedLine)) {
+            throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.Configuration.Derivation.psm1 не знайдено рядок '$successDedupDerivedLine' — оновіть підготовку SuccessDedup-сценаріїв під нову форму деривації"
         }
     }
     $successDedupHermeticText = $successDedupKitText.Replace(

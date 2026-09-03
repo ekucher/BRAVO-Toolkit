@@ -21,7 +21,19 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
     Remove-Module -Name 'BRAVO.Discovery' -Force -ErrorAction SilentlyContinue
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
     Import-Module -Name (Join-Path $root "modules\BRAVO.Discovery\BRAVO.Discovery.psd1") -Force -ErrorAction Stop
-    $bravoConfigTextForPaths = [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8)
+    # P0 Configuration Foundation (PR B): derivation-виклики
+    # (Resolve-BRAVOEffective*, runtimeLogRoot/stateRoot/archiveDirs
+    # тощо) тепер живуть у canonical derivation resolver, не в самому
+    # BRAVO.config — перевірки нижче читають об'єднаний текст обох
+    # файлів (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
+    $bravoConfigTextForPaths = (
+        [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8) +
+        [Environment]::NewLine +
+        [IO.File]::ReadAllText(
+            (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
+            [Text.Encoding]::UTF8
+        )
+    )
 
     $svcCanonical = @([pscustomobject]@{ Name='BRAVO'; DisplayName='BRAVO Service'; State='Stopped'; StartMode='Disabled'; PathName='"D:\LIMS-NEW\bravo.exe" -service' })
     $svcAmbiguous = @(
