@@ -16008,6 +16008,10 @@ function Write-BRAVOLog {
     # підключено до BRAVO_CONFIG_LOADER.ps1/BRAVO.config
     # (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configuration.ps1')
+    # Configuration Foundation: AUTO/EXPLICIT намір -ConfigPath на межі
+    # оператора + пропагація в runtime/child (регресія acceptance CF-17
+    # та AUTO-intent класу дефектів root-entrypoint splat-ів).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigIntent.ps1')
     # Configurator backend: Schema/Model/Effective/Validation/Persistence/
     # Credentials/Presets/Preview (docs/design/BRAVO_CONFIGURATOR_DESIGN.md).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')

@@ -28,6 +28,7 @@
 
 param (
     [string]$ConfigPath,
+    [bool]$ConfigPathWasExplicit = $false,
     [string]$GenerationId,
     [ValidateSet("MODEL", "BLOG", "BRAVOEXCH", "All")]
     [string]$Component = "All",
@@ -201,10 +202,14 @@ function ConvertTo-BRAVODataRestoreElevationArgument {
 # (той самий принцип, що BRAVO_MAINTENANCE).
 try {
 
-# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
-# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту —
-# використовується і для UAC-relaunch нижче, і для Import-BravoConfiguration.
-$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+# P0 Configuration Foundation: справжня межа виклику оператора — root
+# entrypoint, і лише ВІН знає, чи -ConfigPath був реально переданий: сюди
+# ConfigPath завжди приходить уже резолвленим і непорожнім, тому
+# $PSBoundParameters тут відновити намір не може (acceptance-клас дефектів
+# CF-17/AUTO-intent). Намір приймається явним -ConfigPathWasExplicit;
+# додаткова перевірка порожнього шляху страхує від помилкового виклику з
+# прапорцем без шляху (та сама семантика, що в Import-BravoConfiguration).
+$configPathWasExplicit = $ConfigPathWasExplicit -and
     -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"

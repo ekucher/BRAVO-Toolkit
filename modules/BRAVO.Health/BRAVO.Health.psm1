@@ -22,6 +22,14 @@ function Invoke-BRAVOHealthCheck {
     [CmdletBinding()]
     param(
         [string]$ConfigPath,
+        # Намір оператора з СПРАВЖНЬОЇ межі виклику (root entrypoint
+        # Archive) — прокидається в runtime без повторного вгадування.
+        # Якщо викликач НЕ передав прапорець, намір виводиться з ЙОГО
+        # власного виклику: це публічний module API, і програмний виклик
+        # із явним -ConfigPath зберігає explicit-семантику (fail-closed на
+        # відсутньому файлі) без знання про новий параметр — сумісність
+        # контракту. Archive передає прапорець явно (AUTO -> $false).
+        [bool]$ConfigPathWasExplicit = $false,
         [switch]$ForceNotification,
         [switch]$NotifyOnSuccess,
         [switch]$NoSlack,
@@ -35,11 +43,16 @@ function Invoke-BRAVOHealthCheck {
         [hashtable]$BazaSyncResults
     )
 
+    if (-not $PSBoundParameters.ContainsKey('ConfigPathWasExplicit')) {
+        $ConfigPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+            -not [string]::IsNullOrWhiteSpace($ConfigPath)
+    }
     if ([string]::IsNullOrWhiteSpace($EntryScriptPath)) {
         $EntryScriptPath = Join-Path $RuntimeRoot 'BRAVO_HEALTH.ps1'
     }
     $runtimeParameters = @{
         ConfigPath = $ConfigPath
+        ConfigPathWasExplicit = $ConfigPathWasExplicit
         ForceNotification = $ForceNotification
         NotifyOnSuccess = $NotifyOnSuccess
         NoSlack = $NoSlack
