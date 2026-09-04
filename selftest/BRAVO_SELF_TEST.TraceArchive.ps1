@@ -64,9 +64,12 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             "Update-BRAVOTraceDailyArchive",
             "Send-BRAVOTraceArchiveFile",
             "Send-BRAVOTraceArchive",
+            "Send-BRAVOOwnLogFile",
             "Invoke-BRAVOTraceRemoteLogMigration",
             "Invoke-BRAVOLegacyModelArchiveLocalMigration",
-            "Invoke-BRAVOTraceArchiveMaintenance"
+            "Invoke-BRAVOTraceArchiveMaintenance",
+            "Get-BRAVOEmptyLogDateDirectories",
+            "Remove-BRAVOEmptyLogDateDirectories"
         )
 
     $traceArchive7za = Join-Path $root "Tools\7za.exe"
@@ -339,6 +342,53 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             @($taSendBadSizeSession.State.RemoveFilesCalls).Count -eq 0
         ) -Name 'TraceArchive/SftpSizeMismatchAbortsBeforeTouchingFinal' -Failure "розбіжність розміру .new має скасувати публікацію ДО будь-якого дотику фінального імені (стара версія 111 байт жива)"
 
+        # ===== Log-lifecycle P1: Send-BRAVOOwnLogFile (best-effort
+        # вивантаження власного логу прогону / знімка range_id_log.json) =====
+
+        # Успішна передача: remote-каталог створюється, файл публікується
+        # через той самий verified-.new канал (Send-BRAVOTraceArchiveFile).
+        $taOwnLogPath = Join-Path $taSendLocalDir 'BRAVO_MAINTENANCE_20260904_010203_PID42.log'
+        [IO.File]::WriteAllText($taOwnLogPath, ('l' * 250))
+        $taOwnLogSession = New-BRAVOSelfTestFakeBazaSession
+        & $traceArchiveModule { param($s, $l, $d) Send-BRAVOOwnLogFile -Session $s -LocalLogPath $l -RemoteDirectory $d } $taOwnLogSession $taOwnLogPath 'logs/maintenance'
+        Test-BRAVOCondition -Condition (
+            [int64]$taOwnLogSession.State.RemoteSizes['/logs/maintenance/BRAVO_MAINTENANCE_20260904_010203_PID42.log'] -eq 250 -and
+            $taOwnLogSession.State.KnownRemoteDirs.Contains('/logs/maintenance')
+        ) -Name 'TraceArchive/OwnLogUploadPublishesFullLogToConfiguredDirectory' -Failure "власний лог має публікуватись у сконфігурований remote-каталог (з рекурсивним створенням) через verified-.new канал; факт: $(@($taOwnLogSession.State.RemoteSizes.Keys) -join ', ')"
+
+        # RemoteFileName override: константне локальне ім'я (range_id_log.json)
+        # публікується під унікальним remote-ім'ям з run-id.
+        $taOwnRangeIdPath = Join-Path $taSendLocalDir 'range_id_log.json'
+        [IO.File]::WriteAllText($taOwnRangeIdPath, '{"r":1}')
+        $taOwnRangeIdSession = New-BRAVOSelfTestFakeBazaSession
+        & $traceArchiveModule { param($s, $l, $d, $n) Send-BRAVOOwnLogFile -Session $s -LocalLogPath $l -RemoteDirectory $d -RemoteFileName $n } $taOwnRangeIdSession $taOwnRangeIdPath 'logs/maintenance' 'range_id_log_20260904_010203_PID42.json'
+        Test-BRAVOCondition -Condition (
+            $taOwnRangeIdSession.State.RemoteSizes.ContainsKey('/logs/maintenance/range_id_log_20260904_010203_PID42.json') -and
+            -not $taOwnRangeIdSession.State.RemoteSizes.ContainsKey('/logs/maintenance/range_id_log.json')
+        ) -Name 'TraceArchive/OwnLogUploadRemoteFileNameOverrideAvoidsOverwrite' -Failure "range_id-знімок має публікуватись під унікальним remote-ім'ям з run-id, а не під константним локальним ім'ям"
+
+        # Відсутній локальний файл — тихий no-op без жодного remote-виклику.
+        $taOwnMissingSession = New-BRAVOSelfTestFakeBazaSession
+        & $traceArchiveModule { param($s, $l, $d) Send-BRAVOOwnLogFile -Session $s -LocalLogPath $l -RemoteDirectory $d } $taOwnMissingSession (Join-Path $taSendLocalDir 'NO_SUCH_LOG.log') 'logs/maintenance'
+        Test-BRAVOCondition -Condition (
+            @($taOwnMissingSession.State.PutFilesCalledFor).Count -eq 0 -and
+            @($taOwnMissingSession.State.KnownRemoteDirs).Count -eq 0
+        ) -Name 'TraceArchive/OwnLogUploadMissingLocalFileIsSilentNoOp' -Failure "відсутній локальний файл (напр., range_id_log.json ще не створено службою) — no-op без remote-викликів"
+
+        # Збій передачі — WARNING усередині, БЕЗ винятку назовні
+        # (best-effort: провал телеметрії ніколи не ламає прогін).
+        $taOwnFailSession = New-BRAVOSelfTestFakeBazaSession -AllTransfersFail
+        $taOwnFailThrew = $false
+        try {
+            & $traceArchiveModule { param($s, $l, $d) Send-BRAVOOwnLogFile -Session $s -LocalLogPath $l -RemoteDirectory $d } $taOwnFailSession $taOwnLogPath 'logs/maintenance'
+        } catch {
+            $taOwnFailThrew = $true
+        }
+        Test-BRAVOCondition -Condition (
+            -not $taOwnFailThrew -and
+            @($taOwnFailSession.State.MoveFileCalls).Count -eq 0
+        ) -Name 'TraceArchive/OwnLogUploadFailureIsBestEffortNoThrow' -Failure "збій передачі власного логу не має кидати виняток назовні (лише WARNING) і не має чіпати remote-фінал"
+
         # --- Оркестратор e2e на фейковій SFTP: повний success видаляє .out,
         # локальний MDZ ЗАЛИШАЄТЬСЯ; SFTP fail зберігає все; retry без дублікатів ---
         $taOrch = Join-Path $traceArchiveTestRoot "orch\Trace"
@@ -384,6 +434,60 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             (Test-Path -LiteralPath $taOrchDeferredFile) -and
             (Test-Path -LiteralPath (Join-Path $taOrchDeferred 'Trace_20260817.mdz'))
         ) -Name 'TraceArchive/OrchestratorWithoutSessionDefersUploadKeepsSources' -Failure "без SFTP-сесії: архів оновлюється локально, передача відкладена, .out збережені"
+
+        # ===== P5 (2026-09): RawSourceRetentionDays grace-період =====
+        # RawSourceRetentionDays=0 (дефолт, не передається явно) —
+        # регресійний захист: точна попередня поведінка вже підтверджена
+        # вище (OrchestratorRetryUploadsWithoutDuplicatesThenCleansSources
+        # викликає БЕЗ -RawSourceRetentionDays і бачить SourcesDeleted=1).
+
+        # --- N>0, джерело МОЛОДШЕ N днів: лишається локально попри повний success.
+        $taGraceYoung = Join-Path $traceArchiveTestRoot "grace-young\Trace"
+        [void](New-Item -ItemType Directory -Path $taGraceYoung -Force)
+        $taGraceYoungFile = Join-Path $taGraceYoung 'TraceSRV_20260901_090000.out'
+        [IO.File]::WriteAllText($taGraceYoungFile, 'grace young')
+        (Get-Item -LiteralPath $taGraceYoungFile).LastWriteTime = (Get-Date).AddDays(-1)
+        $taGraceYoungSession = New-BRAVOSelfTestFakeBazaSession
+        $taGraceYoungResult = & $traceArchiveModule {
+            param($d, $z, $ap, $p, $s, $rd, $grace)
+            Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap `
+                -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 `
+                -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace
+        } $taGraceYoung $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taGraceYoungSession 'trace' 7
+        Test-BRAVOCondition -Condition (
+            [int]$taGraceYoungResult.Uploaded -eq 1 -and
+            [int]$taGraceYoungResult.Errors -eq 0 -and
+            [int]$taGraceYoungResult.SourcesDeleted -eq 0 -and
+            [int]$taGraceYoungResult.SourcesRetainedForGrace -eq 1 -and
+            (Test-Path -LiteralPath $taGraceYoungFile)
+        ) -Name 'TraceArchive/RawSourceGraceRetainsYoungVerifiedSource' -Failure "джерело молодше grace-періоду має лишатись локально попри повний success (архів+SFTP+верифікація); факт: deleted=$($taGraceYoungResult.SourcesDeleted) retained=$($taGraceYoungResult.SourcesRetainedForGrace)"
+
+        # --- N>0, джерело СТАРШЕ N днів: видаляється як завжди.
+        $taGraceOld = Join-Path $traceArchiveTestRoot "grace-old\Trace"
+        [void](New-Item -ItemType Directory -Path $taGraceOld -Force)
+        $taGraceOldFile = Join-Path $taGraceOld 'TraceSRV_20260801_090000.out'
+        [IO.File]::WriteAllText($taGraceOldFile, 'grace old')
+        (Get-Item -LiteralPath $taGraceOldFile).LastWriteTime = (Get-Date).AddDays(-30)
+        $taGraceOldSession = New-BRAVOSelfTestFakeBazaSession
+        $taGraceOldResult = & $traceArchiveModule {
+            param($d, $z, $ap, $p, $s, $rd, $grace)
+            Invoke-BRAVOTraceArchiveMaintenance -TraceDirectory $d -SevenZipPath $z -AddParameters $ap `
+                -ArchivePassword $p -CommandTimeoutSeconds 600 -IntegrityTimeoutSeconds 600 `
+                -Session $s -RemoteDirectory $rd -RawSourceRetentionDays $grace
+        } $taGraceOld $traceArchive7za $traceArchiveAddParams $traceArchivePassword $taGraceOldSession 'trace' 7
+        Test-BRAVOCondition -Condition (
+            [int]$taGraceOldResult.Uploaded -eq 1 -and
+            [int]$taGraceOldResult.Errors -eq 0 -and
+            [int]$taGraceOldResult.SourcesDeleted -eq 1 -and
+            [int]$taGraceOldResult.SourcesRetainedForGrace -eq 0 -and
+            -not (Test-Path -LiteralPath $taGraceOldFile)
+        ) -Name 'TraceArchive/RawSourceGraceDeletesOldVerifiedSource' -Failure "джерело старше grace-періоду має видалятись як завжди, попри встановлений RawSourceRetentionDays; факт: deleted=$($taGraceOldResult.SourcesDeleted) retained=$($taGraceOldResult.SourcesRetainedForGrace)"
+
+        # --- Legacy-конфіг без ключа: BRAVO_CONFIG_LOADER нормалізує в 0 (StrictMode-безпечно).
+        Test-BRAVOCondition -Condition (
+            $traceArchiveScriptText.Contains('$RAW_SOURCE_GRACE_DAYS = if ($MaintenanceConfig.Retention -is [System.Collections.IDictionary] -and') -and
+            $traceArchiveScriptText.Contains('$MaintenanceConfig.Retention.Contains("RawSourceGraceDays")')
+        ) -Name 'TraceArchive/RawSourceGraceDaysLegacyConfigDefaultsToZero' -Failure "RAW_SOURCE_GRACE_DAYS має захисно читатись через Contains-патерн (легасі-конфіг без ключа -> 0), а не прямим доступом під StrictMode"
 
         # ===== Узагальнений backlog: довільні basename (усі *.out) =====
         $taGenericBacklogDir = Join-Path $traceArchiveTestRoot "backlog-generic\Trace"
@@ -546,6 +650,56 @@ function Complete-BRAVOProcessOutputCapture { BRAVO.Compatibility\Complete-BRAVO
             $taDryRunText.Contains("Get-BRAVOTraceArchiveBacklog") -and
             $taDryRunText.Contains('CompressedLogDeletionEnabled')
         ) -Name 'TraceArchive/DryRunPlansTracePipelineReadOnly' -Failure "BRAVO_DRY_RUN має PLAN-рядки Trace (джерела/would update/would upload/would delete) на КАНОНІЧНІЙ Get-BRAVOTraceArchiveBacklog і показує стан CompressedLogDeletionEnabled"
+
+        # ===== Порожні legacy каталоги-дати видаляються негайно, незалежно
+        # від віку; непорожні лишаються недоторканими для звичайного
+        # age-gated Compress-OldData-шляху (регресія 2026-09, LIMS-TOP) =====
+        $taEmptyDirRoot = Join-Path $traceArchiveTestRoot 'EmptyDirCleanup'
+        [void](New-Item -ItemType Directory -Path $taEmptyDirRoot -Force)
+        try {
+            # 0 каталогів-дат: no-op, без помилок.
+            $taEmptyNone = & $traceArchiveModule { param($p) Get-BRAVOEmptyLogDateDirectories -Path $p } $taEmptyDirRoot
+            Test-BRAVOCondition -Condition (@($taEmptyNone).Count -eq 0) `
+                -Name 'TraceArchive/EmptyDateDirNoneIsNoop' `
+                -Failure "0 каталогів-дат має повертати порожній масив; отримано: $(@($taEmptyNone).Count)"
+
+            # 1 порожній каталог-дата — з навмисно СВІЖИМ CreationTime, щоб
+            # довести відсутність age-gate: видаляється незалежно від віку.
+            $taEmptyFreshDir = Join-Path $taEmptyDirRoot '2026-09-01'
+            [void](New-Item -ItemType Directory -Path $taEmptyFreshDir -Force)
+            & $traceArchiveModule { param($p) Remove-BRAVOEmptyLogDateDirectories -Path $p -Label 'SelfTest' } $taEmptyDirRoot
+            Test-BRAVOCondition -Condition (-not (Test-Path -LiteralPath $taEmptyFreshDir)) `
+                -Name 'TraceArchive/EmptyDateDirDeletedRegardlessOfAge' `
+                -Failure "порожній каталог-дата має видалятись негайно, незалежно від віку; факт: existst=$(Test-Path -LiteralPath $taEmptyFreshDir)"
+
+            # 1 непорожній каталог-дата (молодий) — не чіпається.
+            $taEmptyYoungNonEmptyDir = Join-Path $taEmptyDirRoot '2026-09-02'
+            [void](New-Item -ItemType Directory -Path $taEmptyYoungNonEmptyDir -Force)
+            [IO.File]::WriteAllText((Join-Path $taEmptyYoungNonEmptyDir 'traceBIS_000001.out'), 'stray', (New-Object Text.UTF8Encoding($false)))
+            & $traceArchiveModule { param($p) Remove-BRAVOEmptyLogDateDirectories -Path $p -Label 'SelfTest' } $taEmptyDirRoot
+            Test-BRAVOCondition -Condition (
+                (Test-Path -LiteralPath $taEmptyYoungNonEmptyDir) -and
+                (Test-Path -LiteralPath (Join-Path $taEmptyYoungNonEmptyDir 'traceBIS_000001.out'))
+            ) -Name 'TraceArchive/NonEmptyYoungDateDirUntouched' `
+                -Failure "непорожній молодий каталог-дата не повинен видалятись пустотним шляхом; факт: dirExists=$(Test-Path -LiteralPath $taEmptyYoungNonEmptyDir)"
+
+            # 1 непорожній каталог-дата (старий, за retention) — теж не
+            # чіпається пустотним шляхом; це завдання наявного
+            # Get-BRAVOExpiredLogDateDirectories/Compress-OldData, без змін.
+            $taEmptyOldNonEmptyDir = Join-Path $taEmptyDirRoot '2026-08-01'
+            [void](New-Item -ItemType Directory -Path $taEmptyOldNonEmptyDir -Force)
+            [IO.File]::WriteAllText((Join-Path $taEmptyOldNonEmptyDir 'traceBIS_000001.out'), 'stray-old', (New-Object Text.UTF8Encoding($false)))
+            (Get-Item -LiteralPath $taEmptyOldNonEmptyDir).CreationTime = (Get-Date).AddDays(-30)
+            & $traceArchiveModule { param($p) Remove-BRAVOEmptyLogDateDirectories -Path $p -Label 'SelfTest' } $taEmptyDirRoot
+            $taEmptyOldExpired = & $traceArchiveModule { param($p) Get-BRAVOExpiredLogDateDirectories -Path $p -RetentionDays 14 } $taEmptyDirRoot
+            Test-BRAVOCondition -Condition (
+                (Test-Path -LiteralPath $taEmptyOldNonEmptyDir) -and
+                @(@($taEmptyOldExpired) | Where-Object { $_.Name -eq '2026-08-01' }).Count -eq 1
+            ) -Name 'TraceArchive/NonEmptyOldDateDirRemainsForAgeGatedPath' `
+                -Failure "непорожній старий каталог-дата не повинен видалятись пустотним шляхом і має лишатись видимим для Get-BRAVOExpiredLogDateDirectories (Compress-OldData); факт: dirExists=$(Test-Path -LiteralPath $taEmptyOldNonEmptyDir)"
+        } finally {
+            Remove-Item -LiteralPath $taEmptyDirRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
 
         # Trace обробляється ВИКЛЮЧНО Maintenance: жодного окремого
         # Scheduled Task для Trace (ТЗ §43).

@@ -752,3 +752,86 @@ Test-BRAVOCondition `
     -Condition $webhookNon429Result `
     -Name "Notifications/DiscordNon429NotRetried" `
     -Failure "помилка, що НЕ є 429, має прокидатись одразу без retry-циклу"
+
+# ============================================================
+# Invoke-BRAVOLegacySweep: одноразове маркер-гейтоване очищення
+# legacy-артефактів ери ARCHIV_LIMS-предка (регресія 2026-09, LIMS-TOP).
+# ============================================================
+$legacySweepStubText = @'
+function Write-Log { param($Message, [string]$Level = 'INFO') }
+function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
+function Get-BRAVODirectories { BRAVO.Compatibility\Get-BRAVODirectories @args }
+'@
+$legacySweepModule = New-BRAVOSelfTestRuntimeModule `
+    -SourceText ($legacySweepStubText + "`n" + $maintenanceRepairScriptText) `
+    -FunctionNames @(
+        'Write-Log',
+        'Get-BRAVOFiles',
+        'Get-BRAVODirectories',
+        'Get-BRAVOLegacySweepStatePath',
+        'Write-BRAVOLegacySweepState',
+        'Read-BRAVOLegacySweepState',
+        'Invoke-BRAVOLegacySweep'
+    )
+
+$legacySweepRoot = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_LEGACY_SWEEP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+try {
+    $legacySweepLogDir = Join-Path $legacySweepRoot 'LOGS'
+    $legacySweepTraceDir = Join-Path $legacySweepRoot 'LOGS\Trace'
+    [void](New-Item -ItemType Directory -Path $legacySweepLogDir -Force)
+    [void](New-Item -ItemType Directory -Path $legacySweepTraceDir -Force)
+    $legacySweepStatePath = Join-Path $legacySweepRoot 'State\BRAVO_LEGACY_SWEEP_STATE.json'
+
+    # --- (a) Немає стану + legacy-артефакти присутні -> виметено, маркер записано.
+    [IO.File]::WriteAllText((Join-Path $legacySweepLogDir 'script_log_20260830_2355.txt'), 'legacy', (New-Object Text.UTF8Encoding($false)))
+    [IO.File]::WriteAllText((Join-Path $legacySweepLogDir 'ARCHIV_LIMS_20260902_1510.log'), 'legacy', (New-Object Text.UTF8Encoding($false)))
+    $legacySweepEmptyDir = Join-Path $legacySweepTraceDir '2026-08-23'
+    [void](New-Item -ItemType Directory -Path $legacySweepEmptyDir -Force)
+    $legacySweepNonEmptyDir = Join-Path $legacySweepTraceDir '2026-08-19'
+    [void](New-Item -ItemType Directory -Path $legacySweepNonEmptyDir -Force)
+    [IO.File]::WriteAllText((Join-Path $legacySweepNonEmptyDir 'traceBIS_000001.out'), 'stray', (New-Object Text.UTF8Encoding($false)))
+
+    & $legacySweepModule {
+        param($LogDir, $TraceDir, $StatePath)
+        Invoke-BRAVOLegacySweep -LogDir $LogDir -TraceDir $TraceDir -StateFilePath $StatePath -SweptBy '5.3.0-dev.2-selftest'
+    } $legacySweepLogDir $legacySweepTraceDir $legacySweepStatePath
+
+    Test-BRAVOCondition -Condition (
+        -not (Test-Path -LiteralPath (Join-Path $legacySweepLogDir 'script_log_20260830_2355.txt')) -and
+        -not (Test-Path -LiteralPath (Join-Path $legacySweepLogDir 'ARCHIV_LIMS_20260902_1510.log')) -and
+        -not (Test-Path -LiteralPath $legacySweepEmptyDir) -and
+        (Test-Path -LiteralPath $legacySweepNonEmptyDir) -and
+        (Test-Path -LiteralPath (Join-Path $legacySweepNonEmptyDir 'traceBIS_000001.out')) -and
+        (Test-Path -LiteralPath $legacySweepStatePath)
+    ) -Name 'Maintenance/LegacySweepFirstRunSweepsKnownArtifactsOnly' `
+        -Failure "перший прогін має видалити script_log_*.txt/ARCHIV_LIMS_*.log і ПОРОЖНІЙ каталог-дату, залишити НЕПОРОЖНІЙ каталог-дату і записати маркер стану"
+
+    # --- (b) Маркер присутній -> sweep пропущено, навіть якщо legacy-артефакти знову з'явились.
+    [IO.File]::WriteAllText((Join-Path $legacySweepLogDir 'script_log_20260901_0000.txt'), 'reappeared', (New-Object Text.UTF8Encoding($false)))
+    & $legacySweepModule {
+        param($LogDir, $TraceDir, $StatePath)
+        Invoke-BRAVOLegacySweep -LogDir $LogDir -TraceDir $TraceDir -StateFilePath $StatePath -SweptBy '5.3.0-dev.2-selftest'
+    } $legacySweepLogDir $legacySweepTraceDir $legacySweepStatePath
+    Test-BRAVOCondition -Condition (
+        Test-Path -LiteralPath (Join-Path $legacySweepLogDir 'script_log_20260901_0000.txt')
+    ) -Name 'Maintenance/LegacySweepSkippedWhenMarkerPresent' `
+        -Failure "з наявним маркером sweep має бути пропущений навіть якщо legacy-артефакт знову з'явився"
+
+    # --- (c) Пошкоджений/нечитабельний стан -> трактується як "вже виметено" (пропуск), без деструкції.
+    [IO.File]::WriteAllText($legacySweepStatePath, 'not-valid-json{{{', (New-Object Text.UTF8Encoding($false)))
+    $legacySweepCorruptRead = & $legacySweepModule { param($p) Read-BRAVOLegacySweepState -Path $p } $legacySweepStatePath
+    & $legacySweepModule {
+        param($LogDir, $TraceDir, $StatePath)
+        Invoke-BRAVOLegacySweep -LogDir $LogDir -TraceDir $TraceDir -StateFilePath $StatePath -SweptBy '5.3.0-dev.2-selftest'
+    } $legacySweepLogDir $legacySweepTraceDir $legacySweepStatePath
+    Test-BRAVOCondition -Condition (
+        $null -eq $legacySweepCorruptRead -and
+        (Test-Path -LiteralPath (Join-Path $legacySweepLogDir 'script_log_20260901_0000.txt'))
+    ) -Name 'Maintenance/LegacySweepCorruptStateTreatedAsAlreadySwept' `
+        -Failure "пошкоджений стан-файл має трактуватись як 'вже виметено' (fail-closed skip), Read має повернути `$null, жодної деструктивної дії"
+} finally {
+    if (Test-Path -LiteralPath $legacySweepRoot) {
+        Remove-Item -LiteralPath $legacySweepRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
