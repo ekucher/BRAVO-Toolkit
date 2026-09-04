@@ -830,6 +830,28 @@ try {
         (Test-Path -LiteralPath (Join-Path $legacySweepLogDir 'script_log_20260901_0000.txt'))
     ) -Name 'Maintenance/LegacySweepCorruptStateTreatedAsAlreadySwept' `
         -Failure "пошкоджений стан-файл має трактуватись як 'вже виметено' (fail-closed skip), Read має повернути `$null, жодної деструктивної дії"
+
+    # --- (d) Валідний JSON, але нечислова schemaVersion — регресія
+    # code-review 5c14a70: [int]-каст поза try кидав помилковий record і
+    # повертав зіпсований стан як валідний. Має бути $null (пошкоджений),
+    # тихо, без error-record.
+    [IO.File]::WriteAllText($legacySweepStatePath, '{"schemaVersion": "abc", "sweptAt": "2026-09-04T00:00:00Z"}', (New-Object Text.UTF8Encoding($false)))
+    $legacySweepBadSchemaOutput = @(
+        & $legacySweepModule { param($p) Read-BRAVOLegacySweepState -Path $p } $legacySweepStatePath 2>&1
+    )
+    $legacySweepBadSchemaErrors = @(
+        $legacySweepBadSchemaOutput | Where-Object { $_ -is [System.Management.Automation.ErrorRecord] }
+    )
+    $legacySweepBadSchemaValues = @(
+        $legacySweepBadSchemaOutput | Where-Object {
+            $_ -isnot [System.Management.Automation.ErrorRecord] -and $null -ne $_
+        }
+    )
+    Test-BRAVOCondition -Condition (
+        $legacySweepBadSchemaValues.Count -eq 0 -and
+        $legacySweepBadSchemaErrors.Count -eq 0
+    ) -Name 'Maintenance/LegacySweepNonNumericSchemaVersionIsCorruptState' `
+        -Failure "валідний JSON із нечисловою schemaVersion має трактуватись як пошкоджений стан (`$null) без error-record; факт: values=$($legacySweepBadSchemaValues.Count), errors=$($legacySweepBadSchemaErrors.Count)"
 } finally {
     if (Test-Path -LiteralPath $legacySweepRoot) {
         Remove-Item -LiteralPath $legacySweepRoot -Recurse -Force -ErrorAction SilentlyContinue

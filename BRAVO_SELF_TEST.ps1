@@ -5134,6 +5134,25 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Console/ArchiveOwnLogUploadAloneRequiresSftpCredentials" `
         -Failure "ArchiveLogUploadEnabled має входити термом у `$sftpCredentialRequired — інакше тумблер мертвий без увімкненого ArchiveUpload/scheduled sync"
 
+    # Log-lifecycle P1: контракт "провал вивантаження власного логу
+    # структурно не може змінити результат прогону" тримається на ПОРЯДКУ
+    # коду — upload-блок Maintenance мусить стояти ПІСЛЯ резолву
+    # $script:maintenanceRuntimeExitCode і фінального футера. Пін ловить
+    # випадкове перенесення блоку вище під час майбутніх рефакторингів.
+    $maintenanceOwnLogUploadIndex = $maintenanceScriptText.IndexOf('$componentSettings.SFTP.MaintenanceLogUploadEnabled')
+    $maintenanceExitResolveIndex = $maintenanceScriptText.IndexOf('Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceSummaryFooterIndex = $maintenanceScriptText.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceOwnLogUploadIndex -ge 0 -and
+            $maintenanceExitResolveIndex -ge 0 -and
+            $maintenanceSummaryFooterIndex -ge 0 -and
+            $maintenanceOwnLogUploadIndex -gt $maintenanceExitResolveIndex -and
+            $maintenanceOwnLogUploadIndex -gt $maintenanceSummaryFooterIndex
+        ) `
+        -Name "Console/MaintenanceOwnLogUploadRunsAfterExitCodeResolution" `
+        -Failure "вивантаження власного логу Maintenance мусить стояти після резолву exit code і фінального футера — інакше провал телеметрії може змінити результат прогону"
+
     # $difference.Local з WinSCP CompareDirectories — це RemoteFileInfo
     # навіть для локальної сторони порівняння, а не System.IO.FileInfo:
     # .FullName на ньому немає, лише .FileName (той самий API, що вже

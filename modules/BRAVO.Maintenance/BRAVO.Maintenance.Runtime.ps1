@@ -8721,11 +8721,15 @@ function Read-BRAVOLegacySweepState {
     try {
         $raw = [IO.File]::ReadAllText($Path, (New-Object Text.UTF8Encoding($false)))
         $state = $raw | ConvertFrom-Json -ErrorAction Stop
+        # Схема валідується всередині try: валідний JSON із нечисловим
+        # schemaVersion (напр. "abc") кидав би на [int]-касті ПОЗА try —
+        # помилковий record у консоль і повернення зіпсованого стану як
+        # валідного (code-review 5c14a70, знахідка 1).
+        if ($null -eq $state.PSObject.Properties['schemaVersion'] -or [int]$state.schemaVersion -ne 1) { return $null }
+        if ($null -eq $state.PSObject.Properties['sweptAt'] -or [string]::IsNullOrWhiteSpace([string]$state.sweptAt)) { return $null }
     } catch {
         return $null
     }
-    if ($null -eq $state.PSObject.Properties['schemaVersion'] -or [int]$state.schemaVersion -ne 1) { return $null }
-    if ($null -eq $state.PSObject.Properties['sweptAt'] -or [string]::IsNullOrWhiteSpace([string]$state.sweptAt)) { return $null }
     return $state
 }
 
