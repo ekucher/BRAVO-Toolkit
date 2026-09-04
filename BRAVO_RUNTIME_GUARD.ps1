@@ -461,6 +461,90 @@ function Test-BRAVORuntimeSecuritySettings {
 # не той архів) вона працює повністю.
 ##########
 
+# Розбір версії комплекту з підтримкою prerelease-суфікса (SemVer:
+# X.Y.Z[-prerelease][+build]). Сам по собі [version] кидає виняток на
+# "5.3.0-dev.2" — і саме так prerelease-версії мовчки обходили
+# downgrade-захист: і не фіксували highestVersion, і не блокували
+# справжній відкат (acceptance-знахідка 2026-09-03; походження — коміт
+# 3e27dae, до Configuration Foundation). Повертає $null, якщо текст не є
+# версією, — рішення про наслідки ухвалює викликач.
+function ConvertTo-BRAVOComparableVersion {
+    [CmdletBinding()]
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $trimmed = $Text.Trim()
+
+    # Build-метадані (+...) за SemVer не впливають на порядок версій.
+    $plusIndex = $trimmed.IndexOf('+')
+    if ($plusIndex -ge 0) { $trimmed = $trimmed.Substring(0, $plusIndex) }
+
+    $prerelease = $null
+    $baseText = $trimmed
+    $dashIndex = $trimmed.IndexOf('-')
+    if ($dashIndex -ge 0) {
+        $prerelease = $trimmed.Substring($dashIndex + 1)
+        $baseText = $trimmed.Substring(0, $dashIndex)
+        if ([string]::IsNullOrWhiteSpace($prerelease)) { return $null }
+    }
+
+    $base = $null
+    if (-not [version]::TryParse($baseText, [ref]$base)) { return $null }
+
+    return New-Object PSObject -Property @{
+        Base = $base
+        Prerelease = $prerelease
+        Text = $trimmed
+    }
+}
+
+# SemVer-порівняння двох результатів ConvertTo-BRAVOComparableVersion:
+# -1/0/1 (Left молодший / рівний / старший). База X.Y.Z — за [version];
+# за однакової бази stable СТАРШИЙ за будь-який prerelease
+# (5.3.0 > 5.3.0-rc.9); два prerelease — за dot-ідентифікаторами:
+# числові порівнюються як числа і молодші за текстові, текстові —
+# ординально, коротший список ідентифікаторів молодший
+# (dev.2 < rc.1 < rc.1.hotfix).
+function Compare-BRAVOComparableVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Left,
+        [Parameter(Mandatory = $true)]$Right
+    )
+
+    if ($Left.Base -lt $Right.Base) { return -1 }
+    if ($Left.Base -gt $Right.Base) { return 1 }
+
+    if ($null -eq $Left.Prerelease -and $null -eq $Right.Prerelease) { return 0 }
+    if ($null -eq $Left.Prerelease) { return 1 }
+    if ($null -eq $Right.Prerelease) { return -1 }
+
+    $leftIdentifiers = $Left.Prerelease.Split('.')
+    $rightIdentifiers = $Right.Prerelease.Split('.')
+    $commonCount = [Math]::Min($leftIdentifiers.Length, $rightIdentifiers.Length)
+    for ($index = 0; $index -lt $commonCount; $index++) {
+        $leftNumber = [long]0
+        $rightNumber = [long]0
+        $leftIsNumeric = [long]::TryParse($leftIdentifiers[$index], [ref]$leftNumber)
+        $rightIsNumeric = [long]::TryParse($rightIdentifiers[$index], [ref]$rightNumber)
+        if ($leftIsNumeric -and $rightIsNumeric) {
+            if ($leftNumber -lt $rightNumber) { return -1 }
+            if ($leftNumber -gt $rightNumber) { return 1 }
+        } elseif ($leftIsNumeric) {
+            return -1
+        } elseif ($rightIsNumeric) {
+            return 1
+        } else {
+            $ordinal = [string]::CompareOrdinal($leftIdentifiers[$index], $rightIdentifiers[$index])
+            if ($ordinal -lt 0) { return -1 }
+            if ($ordinal -gt 0) { return 1 }
+        }
+    }
+    if ($leftIdentifiers.Length -lt $rightIdentifiers.Length) { return -1 }
+    if ($leftIdentifiers.Length -gt $rightIdentifiers.Length) { return 1 }
+    return 0
+}
+
 function Test-BRAVOVersionDowngrade {
     [CmdletBinding()]
     param(
@@ -513,14 +597,45 @@ function Test-BRAVOVersionDowngrade {
     # означає лише, що порівнювати нема з чим.
     if ([string]::IsNullOrWhiteSpace($versionRaw)) { return $result }
 
+    $deployed = $null
+    $deployedText = $null
     try {
         $versionParsed = $versionRaw | ConvertFrom-Json
         $deployedText = [string]$versionParsed.packageVersion
-        $deployed = [version]$deployedText
+        $deployed = ConvertTo-BRAVOComparableVersion -Text $deployedText
     } catch {
+        $deployed = $null
+    }
+
+    # VERSION.json захищений маніфестом, тому непарсибельна packageVersion
+    # тут — не "битий файл на сервері", а аномалія самого комплекту
+    # (дефект release-інженерії або обхід). Мовчазний пропуск був би тим
+    # самим bypass-ом, який ця перевірка мусить ловити, — fail-closed за
+    # режимом, з тим самим аварійним вентилем BRAVO_ALLOW_DOWNGRADE=1.
+    if ($null -eq $deployed) {
+        $result.IsValid = $false
+        if ($AllowDowngrade -eq '1') {
+            $result.OverrideApplied = $true
+            $result.Message = (
+                "УВАГА: packageVersion у VERSION.json не розпізнано як версію ('{0}'). " +
+                "Продовжено через BRAVO_ALLOW_DOWNGRADE=1."
+            ) -f $deployedText
+            return $result
+        }
+        $result.ShouldBlock = ($Mode -eq 'Enforce')
+        $versionParseAction = if ($Mode -eq 'Enforce') {
+            "Запуск заблоковано."
+        } else {
+            "Запуск продовжується (RuntimeIntegrityMode = Warn), але це слід перевірити."
+        }
+        $result.Message = (
+            "ВЕРСІЯ НЕ РОЗПІЗНАНА: packageVersion у VERSION.json ('{0}') не є версією " +
+            "X.Y.Z[-prerelease] — захист від відкату не може порівняти комплект. {1} " +
+            "Якщо запуск свідомий, встановіть BRAVO_ALLOW_DOWNGRADE=1."
+        ) -f $deployedText, $versionParseAction
         return $result
     }
-    $result.DeployedVersion = $deployed.ToString()
+    $result.DeployedVersion = $deployed.Text
 
     $stateRaw = $null
     if ($PSBoundParameters.ContainsKey('StateContent')) {
@@ -537,9 +652,22 @@ function Test-BRAVOVersionDowngrade {
     if (-not [string]::IsNullOrWhiteSpace($stateRaw)) {
         try {
             $stateParsed = $stateRaw | ConvertFrom-Json
+            # highestVersionFull зберігає повну версію разом із
+            # prerelease-суфіксом; legacy-поле highestVersion лишається
+            # базовим X.Y.Z, щоб старіший guard (який парсить його через
+            # [version]) продовжував читати цей стан.
+            $recordedText = $null
             if ($null -ne $stateParsed -and
+                $null -ne $stateParsed.PSObject.Properties['highestVersionFull']) {
+                $recordedText = [string]$stateParsed.highestVersionFull
+            }
+            if ([string]::IsNullOrWhiteSpace($recordedText) -and
+                $null -ne $stateParsed -and
                 $null -ne $stateParsed.PSObject.Properties['highestVersion']) {
-                $recorded = [version]([string]$stateParsed.highestVersion)
+                $recordedText = [string]$stateParsed.highestVersion
+            }
+            if (-not [string]::IsNullOrWhiteSpace($recordedText)) {
+                $recorded = ConvertTo-BRAVOComparableVersion -Text $recordedText
             }
         } catch {
             # Пошкоджений файл стану НЕ блокує: на відміну від маніфеста,
@@ -549,11 +677,14 @@ function Test-BRAVOVersionDowngrade {
         }
     }
 
-    if ($null -ne $recorded) { $result.RecordedVersion = $recorded.ToString() }
+    if ($null -ne $recorded) { $result.RecordedVersion = $recorded.Text }
 
     # Перший запуск або новіша версія — запам'ятовуємо й пропускаємо.
-    if ($null -eq $recorded -or $deployed -ge $recorded) {
-        if (-not $NoWrite -and ($null -eq $recorded -or $deployed -gt $recorded)) {
+    $comparison = if ($null -eq $recorded) { 1 } else {
+        Compare-BRAVOComparableVersion -Left $deployed -Right $recorded
+    }
+    if ($comparison -ge 0) {
+        if (-not $NoWrite -and ($null -eq $recorded -or $comparison -gt 0)) {
             $sourceCommit = ''
             try {
                 if ($null -ne $versionParsed.PSObject.Properties['sourceCommit']) {
@@ -563,9 +694,10 @@ function Test-BRAVOVersionDowngrade {
                 $sourceCommit = ''
             }
             $stateJson = (
-                '{{{0}  "highestVersion": "{1}",{0}  "sourceCommit": "{2}",{0}  "recordedAt": "{3}"{0}}}{0}'
+                '{{{0}  "highestVersion": "{1}",{0}  "highestVersionFull": "{2}",{0}  "sourceCommit": "{3}",{0}  "recordedAt": "{4}"{0}}}{0}'
             ) -f [Environment]::NewLine,
-                 $deployed.ToString(),
+                 $deployed.Base.ToString(),
+                 $deployed.Text,
                  $sourceCommit,
                  ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
             try {

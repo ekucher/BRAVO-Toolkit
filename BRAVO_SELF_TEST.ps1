@@ -1207,6 +1207,94 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
+    # Prerelease-версії (X.Y.Z-dev.N / X.Y.Z-rc.N). Регресія acceptance
+    # 2026-09-03: [version] кидав виняток на prerelease-суфіксі, catch
+    # мовчки повертав "valid" — dev/rc-комплекти й не фіксували
+    # highestVersion, і не блокували справжній відкат (походження — коміт
+    # 3e27dae). Порівняння тепер SemVer-aware.
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVODowngradeScenario -Deployed '4.4.0-dev.2' -Recorded '4.3.0').IsValid -and
+            (Test-BRAVODowngradeScenario -Deployed '4.4.0-dev.2' -Recorded '4.3.0').DeployedVersion -eq '4.4.0-dev.2' -and
+            (Test-BRAVODowngradeScenario -Deployed '4.3.0' -Recorded '4.3.0-rc.1').IsValid
+        ) `
+        -Name "VersionState/PrereleaseNewerThanRecordedPasses" `
+        -Failure "prerelease з новішою базою та stable понад власний prerelease мають проходити, а версія — розпізнаватися повністю"
+
+    # Точний синтетичний кейс acceptance-знахідки: rc старішої лінії проти
+    # вже запускавшогося stable — раніше мовчки проходив.
+    $downgradePrerelease = Test-BRAVODowngradeScenario -Deployed '5.0.0-rc.1' -Recorded '5.1.0'
+    $downgradeToPrereleaseOfSameBase = Test-BRAVODowngradeScenario -Deployed '4.3.0-rc.1' -Recorded '4.3.0'
+    $downgradeWithinPrerelease = Test-BRAVODowngradeScenario -Deployed '4.3.0-rc.1' -Recorded '4.3.0-rc.2'
+    $downgradeDevBelowRc = Test-BRAVODowngradeScenario -Deployed '4.3.0-dev.9' -Recorded '4.3.0-rc.1'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $downgradePrerelease.IsValid -and $downgradePrerelease.ShouldBlock -and
+            -not $downgradeToPrereleaseOfSameBase.IsValid -and $downgradeToPrereleaseOfSameBase.ShouldBlock -and
+            -not $downgradeWithinPrerelease.IsValid -and $downgradeWithinPrerelease.ShouldBlock -and
+            -not $downgradeDevBelowRc.IsValid -and $downgradeDevBelowRc.ShouldBlock
+        ) `
+        -Name "VersionState/PrereleaseDowngradeBlocks" `
+        -Failure "відкат через prerelease (старіша база, prerelease тієї самої бази, rc.1<rc.2, dev<rc) має блокувати так само, як stable-відкат"
+
+    $downgradePrereleaseOverride = Test-BRAVODowngradeScenario -Deployed '5.0.0-rc.1' -Recorded '5.1.0' -Allow '1'
+    Test-BRAVOCondition `
+        -Condition (-not $downgradePrereleaseOverride.ShouldBlock -and $downgradePrereleaseOverride.OverrideApplied) `
+        -Name "VersionState/PrereleaseOverrideAllowsDowngrade" `
+        -Failure "BRAVO_ALLOW_DOWNGRADE=1 має працювати й для prerelease-відкату"
+
+    # Непарсибельна packageVersion — VERSION.json захищений маніфестом,
+    # тому це аномалія комплекту, а не битий файл: fail-closed за режимом,
+    # з тим самим аварійним вентилем.
+    $unparsableVersion = Test-BRAVODowngradeScenario -Deployed 'not-a-version' -Recorded '4.3.0'
+    $unparsableVersionWarn = Test-BRAVODowngradeScenario -Deployed 'not-a-version' -Recorded '4.3.0' -Mode 'Warn'
+    $unparsableVersionOverride = Test-BRAVODowngradeScenario -Deployed 'not-a-version' -Recorded '4.3.0' -Allow '1'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $unparsableVersion.IsValid -and $unparsableVersion.ShouldBlock -and
+            -not $unparsableVersionWarn.IsValid -and -not $unparsableVersionWarn.ShouldBlock -and
+            -not $unparsableVersionOverride.ShouldBlock -and $unparsableVersionOverride.OverrideApplied
+        ) `
+        -Name "VersionState/UnparsableVersionFailsClosed" `
+        -Failure "непарсибельна packageVersion має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1"
+
+    # Повний цикл запису для prerelease: стан фіксує і legacy-сумісну базу
+    # (highestVersion — читабельна старішим guard-ом через [version]), і
+    # повну версію (highestVersionFull), після чого старіший prerelease
+    # тієї самої бази блокується.
+    $prereleaseStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $prereleaseStatePath = Join-Path $prereleaseStateRoot 'LOGS\BRAVO_VERSION_STATE.json'
+        $prereleaseFirstRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $prereleaseStatePath `
+            -VersionContent '{"packageVersion": "4.3.0-dev.2", "sourceCommit": "abc"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $prereleaseStateText = if (Test-Path -LiteralPath $prereleaseStatePath -PathType Leaf) {
+            [System.IO.File]::ReadAllText($prereleaseStatePath, [System.Text.Encoding]::UTF8)
+        } else { '' }
+        $prereleaseStateParsed = $null
+        try { $prereleaseStateParsed = $prereleaseStateText | ConvertFrom-Json } catch { $prereleaseStateParsed = $null }
+        $prereleaseAfterWrite = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $prereleaseStatePath `
+            -VersionContent '{"packageVersion": "4.3.0-dev.1"}' `
+            -Mode Enforce -AllowDowngrade '' -NoWrite
+        Test-BRAVOCondition `
+            -Condition (
+                $prereleaseFirstRun.StateUpdated -and
+                $null -ne $prereleaseStateParsed -and
+                [string]$prereleaseStateParsed.highestVersion -eq '4.3.0' -and
+                [string]$prereleaseStateParsed.highestVersionFull -eq '4.3.0-dev.2' -and
+                $prereleaseAfterWrite.ShouldBlock -and
+                $prereleaseAfterWrite.RecordedVersion -eq '4.3.0-dev.2'
+            ) `
+            -Name "VersionState/PrereleaseRecordsFullAndLegacyBase" `
+            -Failure "prerelease-запуск має фіксувати highestVersionFull разом із legacy-сумісною базою highestVersion, після чого старіший prerelease блокується"
+    } finally {
+        if (Test-Path -LiteralPath $prereleaseStateRoot) {
+            Remove-Item -LiteralPath $prereleaseStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Аудит Low #8: порожній catch {} без жодного пояснення ковтає
     # діагностику саме там, де вона потрібна — під час інциденту. Вимога не
     # "заборонити порожні catch" (частина з них законна: прибирання у
