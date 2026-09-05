@@ -1408,6 +1408,48 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
+    # Legacy-стан із записаною версією, яку СУВОРІША валідація тепер
+    # відхиляє (напр. leading zero від старішого guard або наслідок
+    # саме того дефекту, що виправлявся). Документований контракт: state
+    # не є еталоном довіри — непридатний записаний рядок деградує до
+    # first-run семантики (без падіння, без блокування) і перезаписується
+    # валідною поточною версією. Тест закріплює цю деградацію свідомо.
+    $legacyInvalidStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $legacyInvalidStatePath = Join-Path $legacyInvalidStateRoot 'LOGS\BRAVO_VERSION_STATE.json'
+        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $legacyInvalidStatePath))
+        [System.IO.File]::WriteAllText(
+            $legacyInvalidStatePath,
+            '{"highestVersion": "5.3.0", "highestVersionFull": "5.3.0-rc.01"}',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $legacyInvalidRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $legacyInvalidStatePath `
+            -VersionContent '{"packageVersion": "5.2.0"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $legacyInvalidRewritten = $null
+        try {
+            $legacyInvalidRewritten = [System.IO.File]::ReadAllText(
+                $legacyInvalidStatePath, [System.Text.Encoding]::UTF8
+            ) | ConvertFrom-Json
+        } catch {
+            $legacyInvalidRewritten = $null
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyInvalidRun.IsValid -and -not $legacyInvalidRun.ShouldBlock -and
+                $legacyInvalidRun.StateUpdated -and
+                $null -ne $legacyInvalidRewritten -and
+                [string]$legacyInvalidRewritten.highestVersionFull -eq '5.2.0'
+            ) `
+            -Name "VersionState/LegacyInvalidRecordedVersionDegradesToFirstRun" `
+            -Failure "записана версія, яку суворіша валідація відхиляє, має деградувати до first-run (без падіння і блокування) і перезаписатися валідною поточною версією — документований контракт state-не-еталон-довіри"
+    } finally {
+        if (Test-Path -LiteralPath $legacyInvalidStateRoot) {
+            Remove-Item -LiteralPath $legacyInvalidStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Аудит Low #8: порожній catch {} без жодного пояснення ковтає
     # діагностику саме там, де вона потрібна — під час інциденту. Вимога не
     # "заборонити порожні catch" (частина з них законна: прибирання у
