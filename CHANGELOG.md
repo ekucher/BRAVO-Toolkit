@@ -2,6 +2,33 @@
 
 ## Не випущено (developer)
 
+- **Тест-ізоляція VersionState (SELFTEST-SAFETY-0 v1.4)** — сесійний
+  кортеж із трьох env-змінних `BRAVO_SELFTEST_SESSION_ID` (GUID) +
+  `BRAVO_SELFTEST_ROOT` (абсолютний локальний шлях з basename рівно
+  `BRAVO_SELFTEST_<GUID>`) + `BRAVO_SELFTEST_VERSION_STATE_PATH` (рівно
+  `<ROOT>\State\BRAVO_VERSION_STATE.json`) переспрямовує ЛИШЕ місце
+  зберігання стану (`Resolve-BRAVOSelfTestIsolationContext` +
+  `Test-BRAVOVersionDowngrade`); уся валідація версій/відкату виконується
+  без змін. Це внутрішній regression-test seam, не production-налаштування
+  і не security boundary. Рівно два валідні режими: без жодної змінної —
+  канонічна production-поведінка (machine-global
+  `%ProgramData%\BRAVO\State\`); повний валідний кортеж — ізольований
+  sandbox. Частковий або некоректний кортеж (не-GUID, невідповідний
+  basename, відносний шлях, traversal, sibling-префікс, UNC, reparse
+  point/junction на ROOT чи `State`) — fail closed (`IsValid=false`,
+  `ShouldBlock=true`) БЕЗ відкату до production-шляху; перевірка
+  виконується ДО будь-якого читання/запису стану. Причина: fixture-діти
+  `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1` (справжні
+  `BRAVO_ARCHIV`/`BRAVO_DATA_RESTORE`) після SemVer-фіксу #135 писали
+  production high-water mark — на сервері з установленим toolkit це
+  блокувало б старіший production runtime як "відкат" (знахідка
+  real-server acceptance 2026-09-05). Matrix-test і self-test створюють
+  одну сесію на прогін (`RUNNER_TEMP`/TEMP) і виставляють кортеж навколо
+  fixture-запусків (process-env, відновлення у `finally`);
+  `Invoke-AsSystem` (`BRAVO_CREDENTIALS_SETUP.ps1`) переносить кортеж
+  через межу USER → SYSTEM (Task Scheduler не успадковує process-env)
+  лише коли кортеж присутній — production-запуск незмінний.
+
 - **P0 Configuration Foundation (PR B/C)** — `BRAVO.config` став опційним
   primary override-шаром замість обов'язкового джерела конфігурації:
   precedence тепер `DEFAULT < BRAVO.config (опційно) < BRAVO.local.config`,
