@@ -9009,7 +9009,16 @@ if ($script:EnableArchiveAfterMaintenance) {
         if (Test-Path -LiteralPath $bravoArchivePath -PathType Leaf) {
             Write-Log -Message "Запуск скрипту BRAVO_ARCHIV.ps1..." -Level "INFO"
 
-            $archiveArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$bravoArchivePath`" -ConfigPath `"$ConfigPath`" -NoPause"
+            # AUTO-намір: -ConfigPath вбудовується лише за explicit (той
+            # самий гейт, що UAC-relaunch вище) — інакше дочірній Archive
+            # трактував би auto-derived відсутній шлях як explicit і
+            # завершувався configuration error замість власного AUTO.
+            $archiveConfigArgumentText = if ($configPathWasExplicit) {
+                " -ConfigPath `"$ConfigPath`""
+            } else {
+                ''
+            }
+            $archiveArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$bravoArchivePath`"$archiveConfigArgumentText -NoPause"
             $archivProcess = Start-Process -FilePath $schedulerSettings.PowerShellExecutable `
                 -ArgumentList $archiveArguments `
                 -Wait `

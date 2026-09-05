@@ -12580,8 +12580,11 @@ function Get-BRAVOMaintenanceSummaryResult {
 
     # --- Archive after maintenance: SKIPPED/OK/FAIL wiring.
     $archiveResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("`$script:currentMaintenanceOperation = 'Архівація після maintenance'")
+    # Вікно 3600 -> 4300: гейт AUTO-наміру для дочірнього BRAVO_ARCHIV
+    # (review PR #134, $archiveConfigArgumentText) легітимно додав ~600
+    # символів між маркером операції та SKIPPED/OK/FAIL-wiring.
     $archiveResultCallWindow = if ($archiveResultCallIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($archiveResultCallIndex, [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $archiveResultCallIndex))
+        $maintenanceScriptTextForManifestStorage.Substring($archiveResultCallIndex, [Math]::Min(4300, $maintenanceScriptTextForManifestStorage.Length - $archiveResultCallIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (

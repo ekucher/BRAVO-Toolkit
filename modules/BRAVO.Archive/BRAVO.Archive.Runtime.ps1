@@ -369,9 +369,17 @@ if ($credentialHelperLoaded -and -not $NoPause -and
                 # сам виконує повне завантаження BRAVO.config і перезаписав
                 # би глобальний стан (pathSettings, componentSettings тощо)
                 # цього процесу — ізоляція важливіша за швидкість запуску.
+                # AUTO-намір: -ConfigPath вбудовується лише за explicit
+                # (той самий гейт, що канал Archive->Health) — інакше
+                # helper трактував би auto-derived відсутній шлях як
+                # explicit і fail-closed ламав first-run налаштування.
+                $credentialsSetupConfigArguments = @()
+                if ($configPathWasExplicit -and -not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+                    $credentialsSetupConfigArguments = @('-ConfigPath', $ConfigPath)
+                }
                 & powershell.exe -NoProfile -ExecutionPolicy Bypass `
                     -File $credentialsSetupPath `
-                    -ConfigPath $ConfigPath `
+                    @credentialsSetupConfigArguments `
                     -Action Ensure `
                     -Component Required `
                     -StoreFor CurrentUser

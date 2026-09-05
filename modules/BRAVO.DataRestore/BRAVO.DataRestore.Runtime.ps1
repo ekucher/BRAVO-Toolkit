@@ -2781,7 +2781,16 @@ function Invoke-BRAVODataRestorePostHealth {
     }
     try {
         Write-DataRestoreLog -Message 'Запуск post-restore BRAVO_HEALTH...' -Level 'INFO'
-        $healthArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$healthScriptPath`" -ConfigPath `"$ConfigPath`" -NoPause"
+        # AUTO-намір: -ConfigPath вбудовується лише за explicit — інакше
+        # дочірній Health трактував би auto-derived відсутній шлях як
+        # explicit і кожен AUTO no-config restore давав би хибне
+        # Health-попередження замість реальної перевірки.
+        $healthConfigArgumentText = if ($configPathWasExplicit) {
+            " -ConfigPath `"$ConfigPath`""
+        } else {
+            ''
+        }
+        $healthArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$healthScriptPath`"$healthConfigArgumentText -NoPause"
         $healthProcess = Start-Process -FilePath $schedulerSettings.PowerShellExecutable `
             -ArgumentList $healthArguments `
             -Wait `

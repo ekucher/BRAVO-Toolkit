@@ -646,3 +646,197 @@ try {
         }
     }
 }
+
+# ===== Дочірні канали runtime: -ConfigPath лише за explicit-наміру =====
+# Review PR #134 (друга хвиля): три дочірні виклики вбудовували
+# -ConfigPath безумовно, і AUTO no-config прогін перетворювався на
+# explicit-помилку в дитини: (1) Archive -> BRAVO_CREDENTIALS_SETUP
+# (first-run credentials), (2) Maintenance -> post-maintenance
+# BRAVO_ARCHIV, (3) DataRestore -> post-restore BRAVO_HEALTH.
+$configIntentArchiveRuntimeText = [IO.File]::ReadAllText(
+    (Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'),
+    [Text.Encoding]::UTF8
+)
+Test-BRAVOCondition `
+    -Condition (
+        $configIntentArchiveRuntimeText.Contains('$credentialsSetupConfigArguments = @()') -and
+        $configIntentArchiveRuntimeText -match (
+            '(?s)if \(\$configPathWasExplicit -and -not \[string\]::IsNullOrWhiteSpace\(\$ConfigPath\)\) \{\s*' +
+            [regex]::Escape('$credentialsSetupConfigArguments = @(''-ConfigPath'', $ConfigPath)')
+        ) -and
+        -not ($configIntentArchiveRuntimeText -match (
+            '(?s)-File \$credentialsSetupPath `\s*-ConfigPath \$ConfigPath'
+        ))
+    ) `
+    -Name 'ConfigIntent/ArchiveCredentialsSetupChildGatesConfigByIntent' `
+    -Failure 'Archive мусить вбудовувати -ConfigPath у виклик BRAVO_CREDENTIALS_SETUP лише за explicit-наміру — інакше AUTO first-run без BRAVO.config fail-closed ламає створення облікових даних'
+
+$configIntentMaintenanceRuntimeText = [IO.File]::ReadAllText(
+    (Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'),
+    [Text.Encoding]::UTF8
+)
+Test-BRAVOCondition `
+    -Condition (
+        $configIntentMaintenanceRuntimeText -match (
+            '(?s)\$archiveConfigArgumentText = if \(\$configPathWasExplicit\) \{'
+        ) -and
+        $configIntentMaintenanceRuntimeText.Contains(
+            '-File `"$bravoArchivePath`"$archiveConfigArgumentText -NoPause'
+        )
+    ) `
+    -Name 'ConfigIntent/MaintenancePostArchiveChildGatesConfigByIntent' `
+    -Failure 'Maintenance мусить вбудовувати -ConfigPath у пост-maintenance запуск BRAVO_ARCHIV лише за explicit-наміру — інакше AUTO no-config прогін дає configuration error у дитини і хибний critical'
+
+$configIntentDataRestoreRuntimeText = [IO.File]::ReadAllText(
+    (Join-Path $root 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1'),
+    [Text.Encoding]::UTF8
+)
+Test-BRAVOCondition `
+    -Condition (
+        $configIntentDataRestoreRuntimeText -match (
+            '(?s)\$healthConfigArgumentText = if \(\$configPathWasExplicit\) \{'
+        ) -and
+        $configIntentDataRestoreRuntimeText.Contains(
+            '-File `"$healthScriptPath`"$healthConfigArgumentText -NoPause'
+        )
+    ) `
+    -Name 'ConfigIntent/DataRestorePostHealthChildGatesConfigByIntent' `
+    -Failure 'DataRestore мусить вбудовувати -ConfigPath у post-restore Health лише за explicit-наміру — інакше кожен AUTO no-config restore дає хибне Health-попередження'
+
+# ===== Exported entrypoint wrappers: explicit-inference на межі API =====
+# Review PR #134 (друга хвиля): зовнішній викликач Invoke-BRAVO*Entrypoint
+# передає Parameters із явним ConfigPath, але не знає нового ключа наміру
+# — без inference runtime-дефолт $false мовчки перетворював explicit
+# missing config на built-in/local AUTO (втрата fail-closed).
+$configIntentWrapperModules = @(
+    'modules\BRAVO.Archive\BRAVO.Archive.psm1',
+    'modules\BRAVO.Maintenance\BRAVO.Maintenance.psm1',
+    'modules\BRAVO.Health\BRAVO.Health.psm1',
+    'modules\BRAVO.DataRestore\BRAVO.DataRestore.psm1'
+)
+$configIntentWrapperViolations = @()
+foreach ($configIntentWrapperName in $configIntentWrapperModules) {
+    $configIntentWrapperText = [IO.File]::ReadAllText(
+        (Join-Path $root $configIntentWrapperName), [Text.Encoding]::UTF8
+    )
+    $configIntentWrapperHasInference = (
+        $configIntentWrapperText.Contains("-not `$Parameters.ContainsKey('ConfigPathWasExplicit')") -and
+        $configIntentWrapperText.Contains("`$Parameters['ConfigPathWasExplicit'] = `$true")
+    )
+    if (-not $configIntentWrapperHasInference) {
+        $configIntentWrapperViolations += $configIntentWrapperName
+    }
+}
+Test-BRAVOCondition `
+    -Condition ($configIntentWrapperViolations.Count -eq 0) `
+    -Name 'ConfigIntent/EntrypointWrappersInferExplicitIntent' `
+    -Failure (
+        'exported entrypoint wrapper мусить інферити explicit-намір з ' +
+        'непорожнього ConfigPath, коли викликач не передав ключ наміру; ' +
+        'порушено: ' + ($configIntentWrapperViolations -join ', ')
+    )
+
+# Behavior-level (представник — Archive): fixture-копія справжнього psm1
+# зі stub-Runtime, що фіксує отриманий splat; дочірній процес виключає
+# колізію з уже завантаженими модулями.
+$configIntentWrapperFixture = Join-Path $configIntentTempBase (
+    'BRAVO_WRAPPER_API_{0}' -f [guid]::NewGuid().ToString('N')
+)
+try {
+    [void][IO.Directory]::CreateDirectory($configIntentWrapperFixture)
+    Copy-Item -LiteralPath (Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.psm1') `
+        -Destination (Join-Path $configIntentWrapperFixture 'BRAVO.Archive.psm1')
+    $configIntentWrapperStubRuntime = @'
+param(
+    [string]$ConfigPath,
+    [bool]$ConfigPathWasExplicit = $false
+)
+$capturedWrapperSplat = [pscustomobject]@{
+    ConfigPathWasExplicitBound = [bool]$PSBoundParameters.ContainsKey('ConfigPathWasExplicit')
+    ConfigPathWasExplicit = $ConfigPathWasExplicit
+    ConfigPath = $ConfigPath
+}
+[IO.File]::WriteAllText(
+    $env:BRAVO_SELFTEST_WRAPPER_RESULT,
+    ($capturedWrapperSplat | ConvertTo-Json),
+    [Text.Encoding]::UTF8
+)
+exit 0
+'@
+    [IO.File]::WriteAllText(
+        (Join-Path $configIntentWrapperFixture 'BRAVO.Archive.Runtime.ps1'),
+        $configIntentWrapperStubRuntime, [Text.Encoding]::UTF8
+    )
+    $configIntentWrapperProbe = @'
+param(
+    [Parameter(Mandatory = $true)][string]$ModulePath,
+    [Parameter(Mandatory = $true)][string]$ResultPath
+)
+$ErrorActionPreference = 'Stop'
+Import-Module $ModulePath -Force
+$probeOutcomes = @{}
+$probeCases = @{
+    ExplicitNoKey = @{ ConfigPath = 'C:\__bravo_probe__\BRAVO.config' }
+    ExplicitFalseKey = @{ ConfigPath = 'C:\__bravo_probe__\BRAVO.config'; ConfigPathWasExplicit = $false }
+    NoConfigPath = @{}
+}
+foreach ($probeCaseName in @($probeCases.Keys | Sort-Object)) {
+    $probeCaptureFile = Join-Path ([IO.Path]::GetDirectoryName($ResultPath)) (
+        'capture_{0}.json' -f $probeCaseName
+    )
+    $env:BRAVO_SELFTEST_WRAPPER_RESULT = $probeCaptureFile
+    [void](Invoke-BRAVOArchiveEntrypoint -Parameters $probeCases[$probeCaseName])
+    if ([IO.File]::Exists($probeCaptureFile)) {
+        $probeOutcomes[$probeCaseName] = [IO.File]::ReadAllText(
+            $probeCaptureFile, [Text.Encoding]::UTF8
+        ) | ConvertFrom-Json
+    } else {
+        $probeOutcomes[$probeCaseName] = $null
+    }
+}
+[IO.File]::WriteAllText(
+    $ResultPath, ($probeOutcomes | ConvertTo-Json -Depth 5), [Text.Encoding]::UTF8
+)
+'@
+    $configIntentWrapperProbePath = Join-Path $configIntentWrapperFixture 'probe.ps1'
+    [IO.File]::WriteAllText(
+        $configIntentWrapperProbePath, $configIntentWrapperProbe, [Text.Encoding]::UTF8
+    )
+    $configIntentWrapperResultPath = Join-Path $configIntentWrapperFixture 'result.json'
+    $configIntentWrapperPwsh = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    & $configIntentWrapperPwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $configIntentWrapperProbePath `
+        -ModulePath (Join-Path $configIntentWrapperFixture 'BRAVO.Archive.psm1') `
+        -ResultPath $configIntentWrapperResultPath | Out-Null
+    $configIntentWrapperResult = $null
+    if ([IO.File]::Exists($configIntentWrapperResultPath)) {
+        $configIntentWrapperResult = [IO.File]::ReadAllText(
+            $configIntentWrapperResultPath, [Text.Encoding]::UTF8
+        ) | ConvertFrom-Json
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $configIntentWrapperResult -and
+            $null -ne $configIntentWrapperResult.ExplicitNoKey -and
+            $configIntentWrapperResult.ExplicitNoKey.ConfigPathWasExplicitBound -eq $true -and
+            $configIntentWrapperResult.ExplicitNoKey.ConfigPathWasExplicit -eq $true -and
+            $null -ne $configIntentWrapperResult.ExplicitFalseKey -and
+            $configIntentWrapperResult.ExplicitFalseKey.ConfigPathWasExplicit -eq $false -and
+            $null -ne $configIntentWrapperResult.NoConfigPath -and
+            $configIntentWrapperResult.NoConfigPath.ConfigPathWasExplicitBound -eq $false
+        ) `
+        -Name 'ConfigIntent/WrapperBoundaryInfersAndPreservesIntent' `
+        -Failure (
+            'межа wrapper-а: явний ConfigPath без ключа -> explicit=true; ' +
+            'явний $false зберігається; без ConfigPath ключ не додається; ' +
+            'фактично: ' + ($configIntentWrapperResult | ConvertTo-Json -Compress -Depth 5)
+        )
+} finally {
+    if ([IO.Directory]::Exists($configIntentWrapperFixture)) {
+        try {
+            Remove-Item -LiteralPath $configIntentWrapperFixture -Recurse -Force -ErrorAction Stop
+        } catch {
+            # best-effort: тимчасова fixture-тека не впливає на результат.
+        }
+    }
+}
