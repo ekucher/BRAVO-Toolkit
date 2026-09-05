@@ -517,6 +517,15 @@ function ConvertTo-BRAVOComparableVersion {
     if ($baseText -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
         return $null
     }
+    # СВІДОМИЙ контракт BRAVO, а не випадковий технічний ліміт: core
+    # X.Y.Z записується як ModuleVersion у кожному *.psd1, а
+    # ModuleVersion на Windows PowerShell 5.1 — [System.Version], тобто
+    # кожен компонент <= Int32.MaxValue. Тому core, непредставимий через
+    # [version] (напр. 2147483648.0.0), — це непідтримувана packageVersion
+    # (malformed fail-closed шлях); той самий контракт заздалегідь
+    # блокує її в CI (ci\Test-BRAVOReleasePolicy.ps1, RELEASE_POLICY.md).
+    # Numeric prerelease-ідентифікатори (-rc.N) цим НЕ обмежені —
+    # порівнюються як digit-рядки довільної довжини (див. нижче).
     $base = $null
     if (-not [version]::TryParse($baseText, [ref]$base)) { return $null }
 

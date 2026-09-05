@@ -1329,7 +1329,12 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         # Core суворо X.Y.Z: [version] сам прийняв би 2-/4-компонентні
         # форми і leading zero, а 4-компонентний high-water mark блокував
         # би коректний X.Y.Z як «відкат» (review PR #135, друга хвиля).
-        '5.3', '5.3.0.1', '05.3.0', '5.03.0', '5.3.00', '5..3.0'
+        '5.3', '5.3.0.1', '05.3.0', '5.03.0', '5.3.00', '5..3.0',
+        # СВІДОМИЙ контракт BRAVO (RELEASE_POLICY.md): core-компонент
+        # обмежений System.Version (<= 2147483647), бо той самий X.Y.Z
+        # є ModuleVersion у *.psd1 на Windows PowerShell 5.1. Overflow
+        # будь-якого з MAJOR/MINOR/PATCH — непідтримувана packageVersion.
+        '2147483648.0.0-rc.1', '5.2147483648.0-rc.1', '5.3.2147483648-rc.1'
     )
     $semverInvalidAccepted = @($semverInvalidTexts | Where-Object {
         $null -ne (ConvertTo-BRAVOComparableVersion -Text $_)
@@ -1337,7 +1342,9 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     $semverValidTexts = @(
         '5.3.0-rc.1', '5.3.0-dev.12', '5.3.0-alpha-beta', '5.3.0-rc.0',
         '5.3.0-rc.999999999999999999999999999999999',
-        '5.3.0+build.7', '5.3.0-rc.1+build-7.x', '0.9.0', '10.20.30'
+        '5.3.0+build.7', '5.3.0-rc.1+build-7.x', '0.9.0', '10.20.30',
+        # Межа контракту включно: максимальний представимий компонент.
+        '2147483647.0.0-rc.1'
     )
     $semverValidRejected = @($semverValidTexts | Where-Object {
         $null -eq (ConvertTo-BRAVOComparableVersion -Text $_)
@@ -1464,6 +1471,92 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     } finally {
         if (Test-Path -LiteralPath $legacyInvalidStateRoot) {
             Remove-Item -LiteralPath $legacyInvalidStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Release policy <-> runtime guard consistency (review PR #135):
+    # core, представимий System.Version, — свідомий release contract
+    # BRAVO (той самий X.Y.Z є ModuleVersion у *.psd1 на PS 5.1).
+    # Behavior-level: справжній ci\Test-BRAVOReleasePolicy.ps1 на
+    # synthetic fixture-repo в дочірньому процесі (скрипт робить exit).
+    $releasePolicyFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RELEASE_POLICY_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $releasePolicyModuleDir = Join-Path $releasePolicyFixtureRoot 'modules\BRAVO.Stub'
+        [void][IO.Directory]::CreateDirectory($releasePolicyModuleDir)
+        [IO.File]::WriteAllText((Join-Path $releasePolicyFixtureRoot 'BRAVO_SELF_TEST.ps1'), '# fixture marker', [Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText((Join-Path $releasePolicyModuleDir 'BRAVO.Stub.psd1'), "@{ ModuleVersion = '5.3.0' }", [Text.Encoding]::UTF8)
+        # Стаб лоадера: policy dot-source-ить його лише заради
+        # Resolve-BRAVOReleaseChannelFromGit (git-перехресна перевірка).
+        [IO.File]::WriteAllText(
+            (Join-Path $releasePolicyFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
+            "function Resolve-BRAVOReleaseChannelFromGit { param([string]`$ConfigRoot) return '' }",
+            [Text.Encoding]::UTF8
+        )
+        $releasePolicyScriptPath = Join-Path $root 'ci\Test-BRAVOReleasePolicy.ps1'
+        $releasePolicyPwsh = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        function Invoke-BRAVOReleasePolicyFixture {
+            param([Parameter(Mandatory = $true)][string]$PackageVersion)
+            [IO.File]::WriteAllText(
+                (Join-Path $releasePolicyFixtureRoot 'VERSION.json'),
+                ('{{"packageVersion": "{0}", "releaseChannel": "prerelease"}}' -f $PackageVersion),
+                [Text.Encoding]::UTF8
+            )
+            foreach ($documentName in @('CHANGELOG.md', 'README.md', 'BRAVO_SETUP.md')) {
+                [IO.File]::WriteAllText(
+                    (Join-Path $releasePolicyFixtureRoot $documentName),
+                    ("# BRAVO {0}`r`n" -f $PackageVersion),
+                    [Text.Encoding]::UTF8
+                )
+            }
+            # EAP=Continue лише навколо native-виклику: 2>&1 під
+            # глобальним Stop перетворив би будь-який stderr-рядок
+            # дитини на terminating NativeCommandError і зірвав би весь
+            # self-test замість чесного FAIL одного тесту.
+            $previousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $fixtureOutput = & $releasePolicyPwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                    -File $releasePolicyScriptPath `
+                    -Root $releasePolicyFixtureRoot -Branch 'developer' 2>&1 | Out-String
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $fixtureOutput }
+        }
+        # Huge prerelease-лічильник валідний на РІВНІ POLICY теж (core
+        # constrained, prerelease arbitrary-length — обидва рівні згодні).
+        $releasePolicyHugePrerelease = Invoke-BRAVOReleasePolicyFixture `
+            -PackageVersion '5.3.0-rc.999999999999999999999999999999999'
+        # Overflow MAJOR: рівно ОДНА root-cause помилка про System.Version,
+        # БЕЗ каскаду ModuleVersion-mismatch по *.psd1 (у fixture
+        # ModuleVersion=5.3.0 навмисно «не збігається» — порівняння не
+        # повинно навіть запускатись для непідтримуваної версії).
+        $releasePolicyOverflow = Invoke-BRAVOReleasePolicyFixture `
+            -PackageVersion '2147483648.0.0-rc.1'
+        # Asserts свідомо ASCII-стабільні: stdout дитини кодується
+        # кодовою сторінкою КОНСОЛІ (CP437 на GitHub-runner, CP866 у
+        # типовій операторській консолі) — кирилиця там спотворюється,
+        # і кириличний Contains давав би хибний FAIL/хибний PASS залежно
+        # від chcp. Рівно ОДИН '::error::' = одна root-cause помилка без
+        # каскаду ModuleVersion-mismatch.
+        Test-BRAVOCondition `
+            -Condition (
+                $releasePolicyHugePrerelease.ExitCode -eq 0 -and
+                $releasePolicyOverflow.ExitCode -ne 0 -and
+                $releasePolicyOverflow.Output.Contains('System.Version') -and
+                @([regex]::Matches($releasePolicyOverflow.Output, '::error::')).Count -eq 1
+            ) `
+            -Name "VersionState/ReleasePolicyCoreMatchesRuntimeContract" `
+            -Failure (
+                "release policy має відхиляти core понад System.Version однією root-cause помилкою (без каскаду ModuleVersion) і приймати " +
+                "довільно великий prerelease-лічильник; фактично: huge=exit {0}; overflow=exit {1}; overflow output: {2}" -f `
+                    $releasePolicyHugePrerelease.ExitCode,
+                    $releasePolicyOverflow.ExitCode,
+                    $releasePolicyOverflow.Output
+            )
+    } finally {
+        if (Test-Path -LiteralPath $releasePolicyFixtureRoot) {
+            Remove-Item -LiteralPath $releasePolicyFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
 
