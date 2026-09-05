@@ -1295,6 +1295,119 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
+    # SemVer-hardening (review PR #135). Знахідка A: числові
+    # prerelease-ідентифікатори понад Int64.MaxValue обидва «переставали»
+    # бути числовими для [long]::TryParse і падали в ординальне
+    # порівняння, яке інвертує порядок (…rc.9999999999999999999 виглядав
+    # СТАРШИМ за …rc.10000000000000000000) — відкат проходив непоміченим.
+    # Порівняння тепер за довжиною рядка цифр + ординально, без Int64.
+    $hugeNumericDowngrade = Test-BRAVODowngradeScenario `
+        -Deployed '5.3.0-rc.9999999999999999999' -Recorded '5.3.0-rc.10000000000000000000'
+    $hugeNumericUpgrade = Test-BRAVODowngradeScenario `
+        -Deployed '5.3.0-rc.10000000000000000000' -Recorded '5.3.0-rc.9999999999999999999'
+    # Ідентифікатори значно довші за 64-bit межу (33 цифри): захист не
+    # має бути випадково прив'язаним до жодної фіксованої розрядності.
+    $hugeNumericBeyondInt64Downgrade = Test-BRAVODowngradeScenario `
+        -Deployed '5.3.0-rc.999999999999999999999999999999998' `
+        -Recorded '5.3.0-rc.999999999999999999999999999999999'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $hugeNumericDowngrade.IsValid -and $hugeNumericDowngrade.ShouldBlock -and
+            $hugeNumericUpgrade.IsValid -and -not $hugeNumericUpgrade.ShouldBlock -and
+            [string]$hugeNumericUpgrade.DeployedVersion -eq '5.3.0-rc.10000000000000000000' -and
+            -not $hugeNumericBeyondInt64Downgrade.IsValid -and $hugeNumericBeyondInt64Downgrade.ShouldBlock
+        ) `
+        -Name "VersionState/HugeNumericPrereleaseComparesNumerically" `
+        -Failure "числові prerelease-ідентифікатори довільної довжини (понад Int64) мають порівнюватися як числа: rc.99…9(19) < rc.10…0(20), незалежно від розрядності"
+
+    # Знахідка B: сувора SemVer-валідація суфіксів ДО порівняння і ДО
+    # запису стану. Malformed суфікс (лапки, '_', порожній сегмент,
+    # leading zero) раніше приймався і пошкоджував state JSON.
+    $semverInvalidTexts = @(
+        '5.3.0-', '5.3.0-rc..1', ('5.3.0-rc' + '"' + 'oops'), '5.3.0-rc_1',
+        '5.3.0-rc.01', '5.3.0- rc.1', '5.3.0+', '5.3.0+bad_meta', '5.3.0+build..7'
+    )
+    $semverInvalidAccepted = @($semverInvalidTexts | Where-Object {
+        $null -ne (ConvertTo-BRAVOComparableVersion -Text $_)
+    })
+    $semverValidTexts = @(
+        '5.3.0-rc.1', '5.3.0-dev.12', '5.3.0-alpha-beta', '5.3.0-rc.0',
+        '5.3.0-rc.999999999999999999999999999999999',
+        '5.3.0+build.7', '5.3.0-rc.1+build-7.x'
+    )
+    $semverValidRejected = @($semverValidTexts | Where-Object {
+        $null -eq (ConvertTo-BRAVOComparableVersion -Text $_)
+    })
+    Test-BRAVOCondition `
+        -Condition ($semverInvalidAccepted.Count -eq 0 -and $semverValidRejected.Count -eq 0) `
+        -Name "VersionState/PrereleaseAndBuildSyntaxValidated" `
+        -Failure (
+            "SemVer-валідація суфіксів: помилково прийнято [" +
+            ($semverInvalidAccepted -join '; ') + "], помилково відхилено [" +
+            ($semverValidRejected -join '; ') + "]"
+        )
+
+    # Malformed prerelease у VERSION.json проходить той самий fail-closed
+    # шлях, що й непарсибельна версія: блок в Enforce, попередження у
+    # Warn (IsValid=false, ShouldBlock=false), аварійний вентиль
+    # BRAVO_ALLOW_DOWNGRADE=1 діє.
+    $malformedQuoteVersionContent = '{"packageVersion": "5.3.0-rc\"oops"}'
+    $malformedQuoteEnforce = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $malformedQuoteVersionContent `
+        -Mode Enforce -AllowDowngrade '' -NoWrite
+    $malformedQuoteWarn = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $malformedQuoteVersionContent `
+        -Mode Warn -AllowDowngrade '' -NoWrite
+    $malformedQuoteOverride = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $malformedQuoteVersionContent `
+        -Mode Enforce -AllowDowngrade '1' -NoWrite
+    Test-BRAVOCondition `
+        -Condition (
+            -not $malformedQuoteEnforce.IsValid -and $malformedQuoteEnforce.ShouldBlock -and
+            -not $malformedQuoteWarn.IsValid -and -not $malformedQuoteWarn.ShouldBlock -and
+            -not $malformedQuoteOverride.ShouldBlock -and $malformedQuoteOverride.OverrideApplied
+        ) `
+        -Name "VersionState/MalformedPrereleaseFailsClosed" `
+        -Failure 'malformed prerelease-суфікс (5.3.0-rc"oops) має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1 — не прийматися і не псувати state'
+
+    # State пишеться штатним ConvertTo-Json: жоден вміст полів (включно з
+    # ворожим sourceCommit) не робить його непарсибельним, а контрактні
+    # імена/значення полів зберігаються.
+    $jsonStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $jsonStatePath = Join-Path $jsonStateRoot 'LOGS\BRAVO_VERSION_STATE.json'
+        $jsonWriteRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $jsonStatePath `
+            -VersionContent '{"packageVersion": "5.3.0-rc.10000000000000000000", "sourceCommit": "abc\"def\\ghi"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $jsonStateParsed = $null
+        try {
+            $jsonStateParsed = [System.IO.File]::ReadAllText(
+                $jsonStatePath, [System.Text.Encoding]::UTF8
+            ) | ConvertFrom-Json
+        } catch {
+            $jsonStateParsed = $null
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $jsonWriteRun.StateUpdated -and
+                $null -ne $jsonStateParsed -and
+                [string]$jsonStateParsed.highestVersion -eq '5.3.0' -and
+                [string]$jsonStateParsed.highestVersionFull -eq '5.3.0-rc.10000000000000000000' -and
+                [string]$jsonStateParsed.sourceCommit -eq ('abc' + '"' + 'def\ghi') -and
+                -not [string]::IsNullOrWhiteSpace([string]$jsonStateParsed.recordedAt)
+            ) `
+            -Name "VersionState/StateJsonAlwaysParseable" `
+            -Failure "записаний state мусить читатися ConvertFrom-Json із контрактними полями highestVersion/highestVersionFull/sourceCommit/recordedAt навіть із ворожим вмістом sourceCommit"
+    } finally {
+        if (Test-Path -LiteralPath $jsonStateRoot) {
+            Remove-Item -LiteralPath $jsonStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Аудит Low #8: порожній catch {} без жодного пояснення ковтає
     # діагностику саме там, де вона потрібна — під час інциденту. Вимога не
     # "заборонити порожні catch" (частина з них законна: прибирання у

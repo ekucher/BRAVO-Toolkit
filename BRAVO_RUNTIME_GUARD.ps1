@@ -475,9 +475,19 @@ function ConvertTo-BRAVOComparableVersion {
     if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
     $trimmed = $Text.Trim()
 
-    # Build-метадані (+...) за SemVer не впливають на порядок версій.
+    # Build-метадані (+...) за SemVer не впливають на порядок версій,
+    # але їхній синтаксис валідується (dot-separated, непорожні
+    # ідентифікатори [0-9A-Za-z-]): build-суфікс не має бути каналом,
+    # яким malformed текст оминає перевірку нижче.
     $plusIndex = $trimmed.IndexOf('+')
-    if ($plusIndex -ge 0) { $trimmed = $trimmed.Substring(0, $plusIndex) }
+    if ($plusIndex -ge 0) {
+        $buildMetadata = $trimmed.Substring($plusIndex + 1)
+        $trimmed = $trimmed.Substring(0, $plusIndex)
+        if ([string]::IsNullOrEmpty($buildMetadata)) { return $null }
+        foreach ($buildIdentifier in $buildMetadata.Split('.')) {
+            if ($buildIdentifier -cnotmatch '^[0-9A-Za-z-]+$') { return $null }
+        }
+    }
 
     $prerelease = $null
     $baseText = $trimmed
@@ -486,6 +496,17 @@ function ConvertTo-BRAVOComparableVersion {
         $prerelease = $trimmed.Substring($dashIndex + 1)
         $baseText = $trimmed.Substring(0, $dashIndex)
         if ([string]::IsNullOrWhiteSpace($prerelease)) { return $null }
+        # SemVer 2.0 §9: кожен dot-ідентифікатор prerelease непорожній,
+        # лише [0-9A-Za-z-]; числовий — без leading zero (крім "0").
+        # Review-знахідка PR #135: суфікс на кшталт 'rc"oops' раніше
+        # приймався, лапка потрапляла в highestVersionFull і ламала
+        # state JSON — наступний запуск втрачав high-water mark, і
+        # захист від відкату слабшав. Валідація ДО порівняння і ДО
+        # запису стану.
+        foreach ($prereleaseIdentifier in $prerelease.Split('.')) {
+            if ($prereleaseIdentifier -cnotmatch '^[0-9A-Za-z-]+$') { return $null }
+            if ($prereleaseIdentifier -cmatch '^0[0-9]+$') { return $null }
+        }
     }
 
     $base = $null
@@ -523,13 +544,22 @@ function Compare-BRAVOComparableVersion {
     $rightIdentifiers = $Right.Prerelease.Split('.')
     $commonCount = [Math]::Min($leftIdentifiers.Length, $rightIdentifiers.Length)
     for ($index = 0; $index -lt $commonCount; $index++) {
-        $leftNumber = [long]0
-        $rightNumber = [long]0
-        $leftIsNumeric = [long]::TryParse($leftIdentifiers[$index], [ref]$leftNumber)
-        $rightIsNumeric = [long]::TryParse($rightIdentifiers[$index], [ref]$rightNumber)
+        # SemVer не обмежує числовий ідентифікатор розрядністю Int64
+        # (review-знахідка PR #135: два ідентифікатори понад
+        # Int64.MaxValue обидва «переставали» бути числовими і падали в
+        # ординальне порівняння, яке може інвертувати порядок). Числовий
+        # ідентифікатор — це рядок цифр без leading zero (гарантія
+        # ConvertTo-BRAVOComparableVersion), тому порівняння точне для
+        # будь-якої довжини: коротший рядок цифр менший, за однакової
+        # довжини — ординально.
+        $leftIsNumeric = $leftIdentifiers[$index] -cmatch '^[0-9]+$'
+        $rightIsNumeric = $rightIdentifiers[$index] -cmatch '^[0-9]+$'
         if ($leftIsNumeric -and $rightIsNumeric) {
-            if ($leftNumber -lt $rightNumber) { return -1 }
-            if ($leftNumber -gt $rightNumber) { return 1 }
+            if ($leftIdentifiers[$index].Length -lt $rightIdentifiers[$index].Length) { return -1 }
+            if ($leftIdentifiers[$index].Length -gt $rightIdentifiers[$index].Length) { return 1 }
+            $numericOrdinal = [string]::CompareOrdinal($leftIdentifiers[$index], $rightIdentifiers[$index])
+            if ($numericOrdinal -lt 0) { return -1 }
+            if ($numericOrdinal -gt 0) { return 1 }
         } elseif ($leftIsNumeric) {
             return -1
         } elseif ($rightIsNumeric) {
@@ -693,13 +723,19 @@ function Test-BRAVOVersionDowngrade {
             } catch {
                 $sourceCommit = ''
             }
-            $stateJson = (
-                '{{{0}  "highestVersion": "{1}",{0}  "highestVersionFull": "{2}",{0}  "sourceCommit": "{3}",{0}  "recordedAt": "{4}"{0}}}{0}'
-            ) -f [Environment]::NewLine,
-                 $deployed.Base.ToString(),
-                 $deployed.Text,
-                 $sourceCommit,
-                 ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
+            # Штатна JSON-серіалізація замість ручного формат-рядка:
+            # ConvertTo-Json екранує будь-який вміст полів, тому жоден
+            # символ у версії чи sourceCommit не може зробити state
+            # непарсибельним (review-знахідка PR #135). Імена полів —
+            # контракт: highestVersion лишається legacy-сумісною базою
+            # X.Y.Z для старішого guard, highestVersionFull — повна
+            # валідована версія.
+            $stateJson = ([pscustomobject]@{
+                highestVersion = $deployed.Base.ToString()
+                highestVersionFull = $deployed.Text
+                sourceCommit = $sourceCommit
+                recordedAt = ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
+            } | ConvertTo-Json) + [Environment]::NewLine
             try {
                 $stateDirectory = [System.IO.Path]::GetDirectoryName($StatePath)
                 if (-not [System.IO.Directory]::Exists($stateDirectory)) {
