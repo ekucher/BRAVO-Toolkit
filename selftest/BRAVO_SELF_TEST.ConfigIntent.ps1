@@ -408,3 +408,241 @@ Test-BRAVOCondition `
     ) `
     -Name 'ConfigIntent/ArchiveToHealthChannelsPropagateIntent' `
     -Failure 'обидва канали Archive->Health (in-process Invoke-BRAVOHealthCheck та -HealthCheckOnly child) мусять пропагувати намір, а не вигаданий explicit'
+
+# ===== Публічний positional-контракт Invoke-BRAVOHealthCheck =====
+# Регресія review-знахідки PR #134: ConfigPathWasExplicit було вставлено
+# ДРУГИМ параметром exported public function — за увімкненого positional
+# binding це зсувало позиції всіх наступних параметрів, і legacy
+# positional-виклик міг мовчки зв'язати друге значення з [bool]-прапорцем.
+# Контракт: усі параметри, що існували ДО PR #134, зберігають свій
+# declaration/positional order 1:1; нові параметри — лише ПІСЛЯ них.
+
+# --- H1: declaration order (AST) ---
+$configIntentHealthAst = [System.Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.psm1'), [ref]$null, [ref]$null
+)
+$configIntentHealthCheckAst = $configIntentHealthAst.Find({
+    param($node)
+    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+    $node.Name -eq 'Invoke-BRAVOHealthCheck'
+}, $true)
+$configIntentHealthParamNames = @(
+    $configIntentHealthCheckAst.Body.ParamBlock.Parameters |
+        ForEach-Object { $_.Name.VariablePath.UserPath }
+)
+# Порядок exported-контракту ДО PR #134 (origin/developer) — не змінювати.
+$configIntentHealthBaselineOrder = @(
+    'ConfigPath', 'ForceNotification', 'NotifyOnSuccess', 'NoSlack',
+    'SkipIfBackupTaskRunning', 'RuntimeRoot', 'EntryScriptPath', 'BazaSyncResults'
+)
+$configIntentHealthPrefixIntact = (
+    $configIntentHealthParamNames.Count -gt $configIntentHealthBaselineOrder.Count
+)
+if ($configIntentHealthPrefixIntact) {
+    for ($configIntentHealthIndex = 0;
+         $configIntentHealthIndex -lt $configIntentHealthBaselineOrder.Count;
+         $configIntentHealthIndex++) {
+        if ($configIntentHealthParamNames[$configIntentHealthIndex] -cne
+            $configIntentHealthBaselineOrder[$configIntentHealthIndex]) {
+            $configIntentHealthPrefixIntact = $false
+            break
+        }
+    }
+}
+Test-BRAVOCondition `
+    -Condition (
+        $configIntentHealthPrefixIntact -and
+        ([Collections.Generic.List[string]]$configIntentHealthParamNames).IndexOf('ConfigPathWasExplicit') -ge
+            $configIntentHealthBaselineOrder.Count
+    ) `
+    -Name 'ConfigIntent/HealthPublicApiParameterOrderPreserved' `
+    -Failure (
+        'exported Invoke-BRAVOHealthCheck мусить зберігати порядок параметрів ' +
+        'до-PR#134 контракту (' + ($configIntentHealthBaselineOrder -join ', ') +
+        '), а ConfigPathWasExplicit — лише ПІСЛЯ них; фактично: ' +
+        ($configIntentHealthParamNames -join ', ')
+    )
+
+# --- H2..H5: behavior-level binding у дочірньому процесі ---
+# Fixture-копія СПРАВЖНЬОГО BRAVO.Health.psm1 зі stub-Runtime, що фіксує,
+# ЩО реально дійшло до runtime-splat. Дочірній процес виключає колізію з
+# уже імпортованим у цій сесії модулем BRAVO.Health.
+$configIntentHealthApiFixture = Join-Path $configIntentTempBase (
+    'BRAVO_HEALTH_API_{0}' -f [guid]::NewGuid().ToString('N')
+)
+try {
+    [void][IO.Directory]::CreateDirectory($configIntentHealthApiFixture)
+    Copy-Item -LiteralPath (Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.psm1') `
+        -Destination (Join-Path $configIntentHealthApiFixture 'BRAVO.Health.psm1')
+    $configIntentHealthStubRuntime = @'
+param(
+    [string]$ConfigPath,
+    [bool]$ConfigPathWasExplicit = $false,
+    [switch]$ForceNotification,
+    [switch]$NotifyOnSuccess,
+    [switch]$NoSlack,
+    [switch]$SkipIfBackupTaskRunning,
+    [switch]$NoPause,
+    [string]$RuntimeRoot,
+    [string]$EntryScriptPath
+)
+$script:Login = $null
+$script:resolvedSftpHost = $null
+$script:sftpUrl = $null
+$script:smbCredential = $null
+$script:stubRuntimeConfigPath = $ConfigPath
+$script:stubRuntimeConfigPathWasExplicit = $ConfigPathWasExplicit
+$script:stubRuntimeRuntimeRoot = $RuntimeRoot
+$script:stubRuntimeEntryScriptPath = $EntryScriptPath
+function Invoke-BRAVOHealth {
+    [CmdletBinding()]
+    param(
+        [string]$ConfigPath,
+        [switch]$ForceNotification,
+        [switch]$NotifyOnSuccess,
+        [switch]$NoSlack,
+        [hashtable]$BazaSyncResults,
+        [switch]$SkipIfBackupTaskRunning,
+        [switch]$SuppressHeader
+    )
+    $bazaKeys = ''
+    if ($null -ne $BazaSyncResults) {
+        $bazaKeys = (@($BazaSyncResults.Keys) | Sort-Object) -join ','
+    }
+    return [pscustomobject]@{
+        Status = 'StubCaptured'
+        Notification = 'none'
+        RuntimeConfigPath = $script:stubRuntimeConfigPath
+        RuntimeConfigPathWasExplicit = $script:stubRuntimeConfigPathWasExplicit
+        RuntimeRoot = $script:stubRuntimeRuntimeRoot
+        RuntimeEntryScriptPath = $script:stubRuntimeEntryScriptPath
+        BazaSyncKeys = $bazaKeys
+    }
+}
+'@
+    [IO.File]::WriteAllText(
+        (Join-Path $configIntentHealthApiFixture 'BRAVO.Health.Runtime.ps1'),
+        $configIntentHealthStubRuntime, [Text.Encoding]::UTF8
+    )
+    $configIntentHealthApiProbe = @'
+param(
+    [Parameter(Mandatory = $true)][string]$ModulePath,
+    [Parameter(Mandatory = $true)][string]$ResultPath
+)
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+Import-Module $ModulePath -Force
+$probeConfigPath = 'C:\__bravo_probe__\BRAVO.config'
+$probeRuntimeRoot = 'C:\__bravo_probe__\runtime'
+$probeEntryScript = 'C:\__bravo_probe__\BRAVO_HEALTH.ps1'
+$probeBaza = @{ BAZA_APP = 'probe' }
+$probeResults = @{}
+# H2: legacy positional call за до-PR#134 схемою:
+# ConfigPath(0), RuntimeRoot(1), EntryScriptPath(2), BazaSyncResults(3).
+try {
+    $probePositional = Invoke-BRAVOHealthCheck `
+        $probeConfigPath $probeRuntimeRoot $probeEntryScript $probeBaza
+    $probeResults['Positional'] = @{
+        Ok = $true
+        ConfigPath = [string]$probePositional.RuntimeConfigPath
+        WasExplicit = [bool]$probePositional.RuntimeConfigPathWasExplicit
+        RuntimeRoot = [string]$probePositional.RuntimeRoot
+        EntryScriptPath = [string]$probePositional.RuntimeEntryScriptPath
+        BazaSyncKeys = [string]$probePositional.BazaSyncKeys
+    }
+} catch {
+    $probeResults['Positional'] = @{ Ok = $false; Error = $_.Exception.Message }
+}
+# H3: named explicit ConfigPath без прапорця -> inference = explicit.
+try {
+    $probeNamed = Invoke-BRAVOHealthCheck `
+        -ConfigPath $probeConfigPath -RuntimeRoot $probeRuntimeRoot
+    $probeResults['NamedExplicit'] = @{
+        Ok = $true; WasExplicit = [bool]$probeNamed.RuntimeConfigPathWasExplicit
+    }
+} catch {
+    $probeResults['NamedExplicit'] = @{ Ok = $false; Error = $_.Exception.Message }
+}
+# H4: явний $false має пріоритет над inference (AUTO-derived непорожній шлях).
+try {
+    $probeAutoFalse = Invoke-BRAVOHealthCheck `
+        -ConfigPath $probeConfigPath -ConfigPathWasExplicit $false `
+        -RuntimeRoot $probeRuntimeRoot
+    $probeResults['ExplicitFalse'] = @{
+        Ok = $true; WasExplicit = [bool]$probeAutoFalse.RuntimeConfigPathWasExplicit
+    }
+} catch {
+    $probeResults['ExplicitFalse'] = @{ Ok = $false; Error = $_.Exception.Message }
+}
+# H5: явний $true проходить без повторного inference (ConfigPath не bound,
+# inference дав би $false).
+try {
+    $probeTrue = Invoke-BRAVOHealthCheck `
+        -ConfigPathWasExplicit $true -RuntimeRoot $probeRuntimeRoot
+    $probeResults['ExplicitTrue'] = @{
+        Ok = $true; WasExplicit = [bool]$probeTrue.RuntimeConfigPathWasExplicit
+    }
+} catch {
+    $probeResults['ExplicitTrue'] = @{ Ok = $false; Error = $_.Exception.Message }
+}
+[IO.File]::WriteAllText(
+    $ResultPath, ($probeResults | ConvertTo-Json -Depth 5), [Text.Encoding]::UTF8
+)
+'@
+    $configIntentHealthApiProbePath = Join-Path $configIntentHealthApiFixture 'probe.ps1'
+    [IO.File]::WriteAllText(
+        $configIntentHealthApiProbePath, $configIntentHealthApiProbe, [Text.Encoding]::UTF8
+    )
+    $configIntentHealthApiResultPath = Join-Path $configIntentHealthApiFixture 'result.json'
+    $configIntentHealthApiPwsh = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    & $configIntentHealthApiPwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $configIntentHealthApiProbePath `
+        -ModulePath (Join-Path $configIntentHealthApiFixture 'BRAVO.Health.psm1') `
+        -ResultPath $configIntentHealthApiResultPath | Out-Null
+    $configIntentHealthApiResult = $null
+    if ([IO.File]::Exists($configIntentHealthApiResultPath)) {
+        $configIntentHealthApiResult = [IO.File]::ReadAllText(
+            $configIntentHealthApiResultPath, [Text.Encoding]::UTF8
+        ) | ConvertFrom-Json
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $configIntentHealthApiResult -and
+            $configIntentHealthApiResult.Positional.Ok -and
+            [string]$configIntentHealthApiResult.Positional.ConfigPath -eq 'C:\__bravo_probe__\BRAVO.config' -and
+            $configIntentHealthApiResult.Positional.WasExplicit -eq $true -and
+            [string]$configIntentHealthApiResult.Positional.RuntimeRoot -eq 'C:\__bravo_probe__\runtime' -and
+            [string]$configIntentHealthApiResult.Positional.EntryScriptPath -eq 'C:\__bravo_probe__\BRAVO_HEALTH.ps1' -and
+            [string]$configIntentHealthApiResult.Positional.BazaSyncKeys -eq 'BAZA_APP'
+        ) `
+        -Name 'ConfigIntent/HealthPublicApiLegacyPositionalBinding' `
+        -Failure (
+            'legacy positional-виклик Invoke-BRAVOHealthCheck мусить зв''язати ' +
+            'ConfigPath/RuntimeRoot/EntryScriptPath/BazaSyncResults як ДО PR #134; ' +
+            'фактично: ' + ($configIntentHealthApiResult | ConvertTo-Json -Compress -Depth 5)
+        )
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $configIntentHealthApiResult -and
+            $configIntentHealthApiResult.NamedExplicit.Ok -and
+            $configIntentHealthApiResult.NamedExplicit.WasExplicit -eq $true -and
+            $configIntentHealthApiResult.ExplicitFalse.Ok -and
+            $configIntentHealthApiResult.ExplicitFalse.WasExplicit -eq $false -and
+            $configIntentHealthApiResult.ExplicitTrue.Ok -and
+            $configIntentHealthApiResult.ExplicitTrue.WasExplicit -eq $true
+        ) `
+        -Name 'ConfigIntent/HealthPublicApiIntentInferenceAndOverrides' `
+        -Failure (
+            'семантика наміру Invoke-BRAVOHealthCheck: named explicit ConfigPath -> ' +
+            'explicit; явний $false/$true має пріоритет над inference; фактично: ' +
+            ($configIntentHealthApiResult | ConvertTo-Json -Compress -Depth 5)
+        )
+} finally {
+    if ([IO.Directory]::Exists($configIntentHealthApiFixture)) {
+        try {
+            Remove-Item -LiteralPath $configIntentHealthApiFixture -Recurse -Force -ErrorAction Stop
+        } catch {
+            # best-effort: тимчасова fixture-тека не впливає на результат.
+        }
+    }
+}
