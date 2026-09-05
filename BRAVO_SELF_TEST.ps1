@@ -1474,6 +1474,143 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
+    # Ізоляція сховища VersionState (SELFTEST-SAFETY-0):
+    # BRAVO_VERSION_STATE_PATH переспрямовує ЛИШЕ місце зберігання стану,
+    # не вимикаючи валідацію. Потрібен, бо fixture-діти тестів запускають
+    # справжні entrypoints із захардкоженим machine-global StatePath —
+    # без переспрямування тестовий прогін піднімав би production
+    # high-water mark (real-server acceptance 2026-09-05).
+    $isolationRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    $isolationPreviousOverride = [Environment]::GetEnvironmentVariable('BRAVO_VERSION_STATE_PATH')
+    try {
+        [void][IO.Directory]::CreateDirectory($isolationRoot)
+        $isolationOverridePath = Join-Path $isolationRoot 'State\BRAVO_VERSION_STATE.json'
+        $isolationPassedPath = Join-Path $isolationRoot 'passed\BRAVO_VERSION_STATE.json'
+
+        # 1) Env-override переспрямовує запис: файл виникає за override-шляхом,
+        # а НЕ за шляхом із параметра (так реальний entrypoint, що передає
+        # production-шлях, стає ізольованим без зміни свого коду). Друга
+        # версія доводить, що ізольований стан ЖИВИЙ — оновлюється, тобто
+        # переспрямовано сховище, а не пригнічено запис.
+        $env:BRAVO_VERSION_STATE_PATH = $isolationOverridePath
+        $isolationFirstRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $isolationPassedPath `
+            -VersionContent '{"packageVersion": "9.9.0-rc.1"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $isolationSecondRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $isolationPassedPath `
+            -VersionContent '{"packageVersion": "9.9.0-rc.2"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $isolationDowngradeRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $isolationPassedPath `
+            -VersionContent '{"packageVersion": "9.9.0-rc.1"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $isolationParsed = $null
+        try {
+            $isolationParsed = [System.IO.File]::ReadAllText(
+                $isolationOverridePath, [System.Text.Encoding]::UTF8
+            ) | ConvertFrom-Json
+        } catch {
+            $isolationParsed = $null
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $isolationFirstRun.StateUpdated -and
+                [string]$isolationFirstRun.StatePath -eq $isolationOverridePath -and
+                $isolationSecondRun.StateUpdated -and
+                (-not $isolationDowngradeRun.IsValid) -and $isolationDowngradeRun.ShouldBlock -and
+                (-not [System.IO.File]::Exists($isolationPassedPath)) -and
+                $null -ne $isolationParsed -and
+                [string]$isolationParsed.highestVersion -eq '9.9.0' -and
+                [string]$isolationParsed.highestVersionFull -eq '9.9.0-rc.2'
+            ) `
+            -Name "VersionState/EnvOverrideRedirectsStorageOnly" `
+            -Failure "BRAVO_VERSION_STATE_PATH має переспрямувати запис стану за override-шлях (створення + оновлення + робочий downgrade-блок), не створюючи файл за шляхом із параметра"
+
+        # 2) Без override поведінка канонічна: пишеться саме шлях із
+        # параметра (production-дефолт незмінний).
+        [Environment]::SetEnvironmentVariable('BRAVO_VERSION_STATE_PATH', $null)
+        $isolationDefaultRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $isolationPassedPath `
+            -VersionContent '{"packageVersion": "9.9.0-rc.1"}' `
+            -Mode Enforce -AllowDowngrade ''
+        Test-BRAVOCondition `
+            -Condition (
+                $isolationDefaultRun.StateUpdated -and
+                [System.IO.File]::Exists($isolationPassedPath) -and
+                [string]$isolationDefaultRun.StatePath -eq $isolationPassedPath
+            ) `
+            -Name "VersionState/NoOverrideUsesCallerStatePath" `
+            -Failure "без BRAVO_VERSION_STATE_PATH стан мусить писатися рівно за шляхом із параметра StatePath — production-семантика не має дрейфувати"
+
+        # 3) Кривий override не падає, не блокує і — навмисно — НЕ
+        # відкочується мовчки до шляху з параметра: краще незаписаний стан,
+        # ніж тестовий запис у production. Символ '<' невалідний у
+        # Windows-шляху на будь-якій машині (на відміну від "неіснуючого
+        # диска", який десь може існувати).
+        $env:BRAVO_VERSION_STATE_PATH = $isolationRoot + '\inv<alid\BRAVO_VERSION_STATE.json'
+        $isolationInvalidPassedPath = Join-Path $isolationRoot 'invalid\BRAVO_VERSION_STATE.json'
+        $isolationInvalidRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $isolationInvalidPassedPath `
+            -VersionContent '{"packageVersion": "9.9.0-rc.1"}' `
+            -Mode Enforce -AllowDowngrade ''
+        Test-BRAVOCondition `
+            -Condition (
+                $isolationInvalidRun.IsValid -and
+                (-not $isolationInvalidRun.ShouldBlock) -and
+                (-not $isolationInvalidRun.StateUpdated) -and
+                (-not [System.IO.File]::Exists($isolationInvalidPassedPath))
+            ) `
+            -Name "VersionState/InvalidOverrideFailsSafelyWithoutFallback" `
+            -Failure "кривий BRAVO_VERSION_STATE_PATH має дати StateUpdated=false без виключення/блокування і БЕЗ мовчазного запису за шлях із параметра"
+
+        # 4) Успадкування ланцюжком процесів: дочірній powershell.exe і
+        # внучатий процес (child -> grandchild) успадковують env і пишуть
+        # ізольовано, хоча параметром передано інший шлях — саме так
+        # ізоляція досягає реальних entrypoints у fixture-дітях.
+        $env:BRAVO_VERSION_STATE_PATH = $isolationOverridePath
+        $isolationChildScript = Join-Path $isolationRoot 'child-probe.ps1'
+        [IO.File]::WriteAllText($isolationChildScript, @'
+param([string]$GuardPath, [string]$RuntimeRoot, [string]$PassedPath, [string]$SpawnNested, [string]$RcCounter)
+$ErrorActionPreference = 'Stop'
+$t = $null; $e = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($GuardPath, [ref]$t, [ref]$e)
+foreach ($fn in 'ConvertTo-BRAVOComparableVersion','Compare-BRAVOComparableVersion','Test-BRAVOVersionDowngrade') {
+    . ([scriptblock]::Create(($ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq $fn }, $true)).Extent.Text))
+}
+if ($SpawnNested -eq '1') {
+    & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File $PSCommandPath -GuardPath $GuardPath -RuntimeRoot $RuntimeRoot -PassedPath $PassedPath -SpawnNested '0' -RcCounter $RcCounter
+    exit $LASTEXITCODE
+}
+$r = Test-BRAVOVersionDowngrade -RuntimeRoot $RuntimeRoot `
+    -StatePath $PassedPath `
+    -VersionContent ('{"packageVersion": "9.9.1-rc.' + $RcCounter + '"}') `
+    -Mode Enforce -AllowDowngrade ''
+if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { exit 7 }
+'@, (New-Object System.Text.UTF8Encoding($true)))
+        $isolationChildPassedPath = Join-Path $isolationRoot 'child-passed\BRAVO_VERSION_STATE.json'
+        $null = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $isolationChildScript -GuardPath (Join-Path $root 'BRAVO_RUNTIME_GUARD.ps1') `
+            -RuntimeRoot $root -PassedPath $isolationChildPassedPath -SpawnNested '0' -RcCounter '1' 2>&1
+        $isolationChildExit = $LASTEXITCODE
+        # Внучатий процес пише ВИЩИЙ rc-лічильник: StateUpdated=true вимагає
+        # реального підняття стану, рівна версія не перезаписується.
+        $null = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $isolationChildScript -GuardPath (Join-Path $root 'BRAVO_RUNTIME_GUARD.ps1') `
+            -RuntimeRoot $root -PassedPath $isolationChildPassedPath -SpawnNested '1' -RcCounter '2' 2>&1
+        $isolationNestedExit = $LASTEXITCODE
+        Test-BRAVOCondition `
+            -Condition ($isolationChildExit -eq 0 -and $isolationNestedExit -eq 0) `
+            -Name "VersionState/EnvOverrideSurvivesChildProcessChain" `
+            -Failure "BRAVO_VERSION_STATE_PATH мусить успадковуватися дочірнім (exit=$isolationChildExit) і внучатим (exit=$isolationNestedExit) powershell.exe: справжні guard-функції пишуть за override-шлях, а не за переданий параметром"
+    } finally {
+        [Environment]::SetEnvironmentVariable('BRAVO_VERSION_STATE_PATH', $isolationPreviousOverride)
+        if (Test-Path -LiteralPath $isolationRoot) {
+            Remove-Item -LiteralPath $isolationRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Release policy <-> runtime guard consistency (review PR #135):
     # core, представимий System.Version, — свідомий release contract
     # BRAVO (той самий X.Y.Z є ModuleVersion у *.psd1 на PS 5.1).
@@ -8582,6 +8719,13 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     # поведінка полягає саме в тому, щоб до них не дійти.
     $failClosedRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_GUARD_FAILCLOSED_{0}" -f [guid]::NewGuid().ToString('N'))
     $failClosedResults = @()
+    # Ізоляція VersionState (SELFTEST-SAFETY-0): діти нижче — справжні
+    # entrypoints. Сьогодні вони зупиняються кодом 33 ДО перевірки версії,
+    # але цей тест не має права залежати від порядку етапів guard-а: якщо
+    # порядок колись зміниться, без переспрямування дитина писала б у
+    # machine-global %ProgramData%\BRAVO\State\BRAVO_VERSION_STATE.json.
+    $failClosedVersionStatePrevious = [Environment]::GetEnvironmentVariable('BRAVO_VERSION_STATE_PATH')
+    $env:BRAVO_VERSION_STATE_PATH = Join-Path $failClosedRoot 'State\BRAVO_VERSION_STATE.json'
     try {
         [void][IO.Directory]::CreateDirectory($failClosedRoot)
         [IO.File]::WriteAllText(
@@ -8617,6 +8761,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             }
         }
     } finally {
+        [Environment]::SetEnvironmentVariable('BRAVO_VERSION_STATE_PATH', $failClosedVersionStatePrevious)
         Remove-Item -LiteralPath $failClosedRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
     $wrongExitCodes = @(
@@ -13675,6 +13820,11 @@ function Get-BRAVOMaintenanceSummaryResult {
     # сусідній ASCII-текст у тому самому рядку. Змінюємо/відновлюємо лише
     # локально для цього виклику, без побічного впливу на решту self-test.
     $localOnlyPreviousOutputEncoding = [Console]::OutputEncoding
+    # Ізоляція VersionState: дочірній BRAVO_DRY_RUN читає (з -NoWrite)
+    # machine-global BRAVO_VERSION_STATE.json — переспрямування робить
+    # рядок "Версія" детермінованим і незалежним від стану хоста.
+    $localOnlyVersionStatePrevious = [Environment]::GetEnvironmentVariable('BRAVO_VERSION_STATE_PATH')
+    $env:BRAVO_VERSION_STATE_PATH = Join-Path (Split-Path -Path $localOnlyFixture.ConfigPath -Parent) 'BRAVO_VERSION_STATE.json'
     try {
         [Console]::OutputEncoding = [Text.Encoding]::UTF8
         $localOnlyDryRunOutput = [string](
@@ -13684,6 +13834,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         )
     } finally {
         [Console]::OutputEncoding = $localOnlyPreviousOutputEncoding
+        [Environment]::SetEnvironmentVariable('BRAVO_VERSION_STATE_PATH', $localOnlyVersionStatePrevious)
     }
     Test-BRAVOCondition `
         -Condition (

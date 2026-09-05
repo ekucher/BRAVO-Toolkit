@@ -81,6 +81,11 @@ $dryRunPath = Join-Path $root 'BRAVO_DRY_RUN.ps1'
 $dryRunScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_DRY_RUN_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
 [void][IO.Directory]::CreateDirectory($dryRunScenarioRoot)
+# Ізоляція VersionState (SELFTEST-SAFETY-0): дочірній BRAVO_DRY_RUN читає
+# (з -NoWrite) machine-global BRAVO_VERSION_STATE.json — переспрямування
+# в сценарний каталог робить дитину незалежною від стану хоста.
+$dryRunVersionStatePrevious = [Environment]::GetEnvironmentVariable('BRAVO_VERSION_STATE_PATH')
+$env:BRAVO_VERSION_STATE_PATH = Join-Path $dryRunScenarioRoot 'BRAVO_VERSION_STATE.json'
 try {
     $dryRunSyntheticConfigPath = Join-Path $dryRunScenarioRoot 'BRAVO.config'
     [IO.File]::WriteAllText(
@@ -103,6 +108,7 @@ try {
         -Name "ConfigLoader/DryRunDoesNotCrashOnUnsetScriptVersion" `
         -Failure "Write-DryRunOutput не повинен падати з VariableIsUndefined, коли `$global:ScriptVersion ще не створено через провал завантаження конфігурації; отримано: $dryRunChildOutput"
 } finally {
+    [Environment]::SetEnvironmentVariable('BRAVO_VERSION_STATE_PATH', $dryRunVersionStatePrevious)
     Remove-Item -LiteralPath $dryRunScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 

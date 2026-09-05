@@ -2,6 +2,21 @@
 
 ## Не випущено (developer)
 
+- **Тест-ізоляція VersionState (SELFTEST-SAFETY-0)** — нова env-змінна
+  `BRAVO_VERSION_STATE_PATH` переспрямовує ЛИШЕ місце зберігання
+  `BRAVO_VERSION_STATE.json` (`Test-BRAVOVersionDowngrade`); уся валідація
+  версій/відкату виконується без змін, а без змінної поведінка канонічна
+  (machine-global `%ProgramData%\BRAVO\State\`). Причина: fixture-діти
+  `BRAVO_DATA_RESTORE_MATRIX_TEST.ps1` (справжні
+  `BRAVO_ARCHIV`/`BRAVO_DATA_RESTORE`) після SemVer-фіксу #135 писали
+  production high-water mark — на сервері з установленим toolkit це
+  блокувало б старіший production runtime як "відкат" (знахідка real-server
+  acceptance 2026-09-05). Matrix-test і відповідні fixture-запуски self-test
+  тепер виставляють ізольований шлях (process-env, відновлюється у
+  `finally`); регресії: redirect-only семантика, no-override канонічний
+  шлях, кривий override без мовчазного відкату в production, успадкування
+  child→grandchild ланцюжком процесів.
+
 - **P0 Configuration Foundation (PR B/C)** — `BRAVO.config` став опційним
   primary override-шаром замість обов'язкового джерела конфігурації:
   precedence тепер `DEFAULT < BRAVO.config (опційно) < BRAVO.local.config`,

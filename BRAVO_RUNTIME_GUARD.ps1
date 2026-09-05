@@ -625,6 +625,24 @@ function Test-BRAVOVersionDowngrade {
         $AllowDowngrade = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_DOWNGRADE')
     }
 
+    # Тест-ізоляція СХОВИЩА стану: BRAVO_VERSION_STATE_PATH переспрямовує
+    # лише місце зберігання BRAVO_VERSION_STATE.json — уся валідація версій
+    # виконується без змін. Потрібен, бо fixture-діти self-test і
+    # DataRestore-matrix запускають справжні entrypoints, які передають сюди
+    # захардкожений machine-global шлях %ProgramData%\BRAVO\State\..., і без
+    # переспрямування тестовий прогін піднімав би production high-water mark
+    # (реальна знахідка real-server acceptance 2026-09-05). Непорожнє
+    # значення застосовується як є, БЕЗ мовчазного відкату до
+    # production-шляху при кривому значенні: незаписаний стан у некоректному
+    # місці безпечніший за тестовий запис у production (збій запису нижче
+    # вже не зупиняє запуск). Клас загрози "env-обхід" не новий —
+    # BRAVO_ALLOW_DOWNGRADE=1 є рівноцінним існуючим аварійним вентилем.
+    $stateOverridePath = [System.Environment]::GetEnvironmentVariable('BRAVO_VERSION_STATE_PATH')
+    if (-not [string]::IsNullOrWhiteSpace($stateOverridePath)) {
+        $StatePath = $stateOverridePath.Trim()
+        $result.StatePath = $StatePath
+    }
+
     $versionRaw = $null
     if ($PSBoundParameters.ContainsKey('VersionContent')) {
         $versionRaw = $VersionContent

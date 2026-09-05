@@ -63,6 +63,18 @@ Write-Host "Fixture root: $fixtureRoot"
 $realLockPath = Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'BRAVO\Locks\BRAVO_OPERATION.lock'
 $realLockTimestampBefore = if (Test-Path -LiteralPath $realLockPath -PathType Leaf) { (Get-Item -LiteralPath $realLockPath).LastWriteTimeUtc } else { $null }
 
+# Ізоляція VersionState (SELFTEST-SAFETY-0): fixture-діти нижче — справжні
+# BRAVO_ARCHIV.ps1/BRAVO_DATA_RESTORE.ps1, чий runtime guard передає
+# захардкожений machine-global шлях %ProgramData%\BRAVO\State\
+# BRAVO_VERSION_STATE.json. Після SemVer-фіксу (#135) prerelease-версії
+# ПИШУТЬ стан, тож без переспрямування тестовий прогін піднімав би
+# production high-water mark і на сервері з установленим toolkit блокував
+# би старіший production runtime як "відкат". Env-змінна успадковується
+# всіма дочірніми процесами матриці; guard застосовує її лише як місце
+# зберігання — валідація версій виконується повністю.
+$versionStateOverridePrevious = [Environment]::GetEnvironmentVariable('BRAVO_VERSION_STATE_PATH')
+$env:BRAVO_VERSION_STATE_PATH = Join-Path $fixtureRoot 'State\BRAVO_VERSION_STATE.json'
+
 $aggregateExitCode = 1
 try {
     $fixtureConfig = New-BRAVODataRestoreMatrixFixtureConfig -RepoRoot $PSScriptRoot -FixtureRoot $fixtureRoot -MinimumFreeSpaceGB 1
@@ -178,6 +190,9 @@ try {
         $aggregateExitCode = 1
     }
 } finally {
+    # Відновлення process-env (не machine-wide): зовнішнє значення
+    # BRAVO_VERSION_STATE_PATH, якщо воно було, повертається як є.
+    [Environment]::SetEnvironmentVariable('BRAVO_VERSION_STATE_PATH', $versionStateOverridePrevious)
     if ($KeepFixture) {
         Write-Host "Fixture root збережено (-KeepFixture): $fixtureRoot"
     } else {
