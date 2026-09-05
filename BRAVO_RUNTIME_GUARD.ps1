@@ -461,6 +461,137 @@ function Test-BRAVORuntimeSecuritySettings {
 # не той архів) вона працює повністю.
 ##########
 
+# Розбір версії комплекту з підтримкою prerelease-суфікса (SemVer:
+# X.Y.Z[-prerelease][+build]). Сам по собі [version] кидає виняток на
+# "5.3.0-dev.2" — і саме так prerelease-версії мовчки обходили
+# downgrade-захист: і не фіксували highestVersion, і не блокували
+# справжній відкат (acceptance-знахідка 2026-09-03; походження — коміт
+# 3e27dae, до Configuration Foundation). Повертає $null, якщо текст не є
+# версією, — рішення про наслідки ухвалює викликач.
+function ConvertTo-BRAVOComparableVersion {
+    [CmdletBinding()]
+    param([string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $null }
+    $trimmed = $Text.Trim()
+
+    # Build-метадані (+...) за SemVer не впливають на порядок версій,
+    # але їхній синтаксис валідується (dot-separated, непорожні
+    # ідентифікатори [0-9A-Za-z-]): build-суфікс не має бути каналом,
+    # яким malformed текст оминає перевірку нижче.
+    $plusIndex = $trimmed.IndexOf('+')
+    if ($plusIndex -ge 0) {
+        $buildMetadata = $trimmed.Substring($plusIndex + 1)
+        $trimmed = $trimmed.Substring(0, $plusIndex)
+        if ([string]::IsNullOrEmpty($buildMetadata)) { return $null }
+        foreach ($buildIdentifier in $buildMetadata.Split('.')) {
+            if ($buildIdentifier -cnotmatch '^[0-9A-Za-z-]+$') { return $null }
+        }
+    }
+
+    $prerelease = $null
+    $baseText = $trimmed
+    $dashIndex = $trimmed.IndexOf('-')
+    if ($dashIndex -ge 0) {
+        $prerelease = $trimmed.Substring($dashIndex + 1)
+        $baseText = $trimmed.Substring(0, $dashIndex)
+        if ([string]::IsNullOrWhiteSpace($prerelease)) { return $null }
+        # SemVer 2.0 §9: кожен dot-ідентифікатор prerelease непорожній,
+        # лише [0-9A-Za-z-]; числовий — без leading zero (крім "0").
+        # Review-знахідка PR #135: суфікс на кшталт 'rc"oops' раніше
+        # приймався, лапка потрапляла в highestVersionFull і ламала
+        # state JSON — наступний запуск втрачав high-water mark, і
+        # захист від відкату слабшав. Валідація ДО порівняння і ДО
+        # запису стану.
+        foreach ($prereleaseIdentifier in $prerelease.Split('.')) {
+            if ($prereleaseIdentifier -cnotmatch '^[0-9A-Za-z-]+$') { return $null }
+            if ($prereleaseIdentifier -cmatch '^0[0-9]+$') { return $null }
+        }
+    }
+
+    # Канонічний контракт пакета — рівно X.Y.Z (три числові
+    # dot-ідентифікатори без leading zero). Сам [version] прийняв би і
+    # "5.3", і "5.3.0.1", і "05.3.0" — а чотирикомпонентний запис у
+    # state зробив би коректний "5.3.0" «відкатом» (Revision -1 проти 1)
+    # замість malformed fail-closed шляху (review PR #135, друга хвиля).
+    if ($baseText -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        return $null
+    }
+    # СВІДОМИЙ контракт BRAVO, а не випадковий технічний ліміт: core
+    # X.Y.Z записується як ModuleVersion у кожному *.psd1, а
+    # ModuleVersion на Windows PowerShell 5.1 — [System.Version], тобто
+    # кожен компонент <= Int32.MaxValue. Тому core, непредставимий через
+    # [version] (напр. 2147483648.0.0), — це непідтримувана packageVersion
+    # (malformed fail-closed шлях); той самий контракт заздалегідь
+    # блокує її в CI (ci\Test-BRAVOReleasePolicy.ps1, RELEASE_POLICY.md).
+    # Numeric prerelease-ідентифікатори (-rc.N) цим НЕ обмежені —
+    # порівнюються як digit-рядки довільної довжини (див. нижче).
+    $base = $null
+    if (-not [version]::TryParse($baseText, [ref]$base)) { return $null }
+
+    return New-Object PSObject -Property @{
+        Base = $base
+        Prerelease = $prerelease
+        Text = $trimmed
+    }
+}
+
+# SemVer-порівняння двох результатів ConvertTo-BRAVOComparableVersion:
+# -1/0/1 (Left молодший / рівний / старший). База X.Y.Z — за [version];
+# за однакової бази stable СТАРШИЙ за будь-який prerelease
+# (5.3.0 > 5.3.0-rc.9); два prerelease — за dot-ідентифікаторами:
+# числові порівнюються як числа і молодші за текстові, текстові —
+# ординально, коротший список ідентифікаторів молодший
+# (dev.2 < rc.1 < rc.1.hotfix).
+function Compare-BRAVOComparableVersion {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Left,
+        [Parameter(Mandatory = $true)]$Right
+    )
+
+    if ($Left.Base -lt $Right.Base) { return -1 }
+    if ($Left.Base -gt $Right.Base) { return 1 }
+
+    if ($null -eq $Left.Prerelease -and $null -eq $Right.Prerelease) { return 0 }
+    if ($null -eq $Left.Prerelease) { return 1 }
+    if ($null -eq $Right.Prerelease) { return -1 }
+
+    $leftIdentifiers = $Left.Prerelease.Split('.')
+    $rightIdentifiers = $Right.Prerelease.Split('.')
+    $commonCount = [Math]::Min($leftIdentifiers.Length, $rightIdentifiers.Length)
+    for ($index = 0; $index -lt $commonCount; $index++) {
+        # SemVer не обмежує числовий ідентифікатор розрядністю Int64
+        # (review-знахідка PR #135: два ідентифікатори понад
+        # Int64.MaxValue обидва «переставали» бути числовими і падали в
+        # ординальне порівняння, яке може інвертувати порядок). Числовий
+        # ідентифікатор — це рядок цифр без leading zero (гарантія
+        # ConvertTo-BRAVOComparableVersion), тому порівняння точне для
+        # будь-якої довжини: коротший рядок цифр менший, за однакової
+        # довжини — ординально.
+        $leftIsNumeric = $leftIdentifiers[$index] -cmatch '^[0-9]+$'
+        $rightIsNumeric = $rightIdentifiers[$index] -cmatch '^[0-9]+$'
+        if ($leftIsNumeric -and $rightIsNumeric) {
+            if ($leftIdentifiers[$index].Length -lt $rightIdentifiers[$index].Length) { return -1 }
+            if ($leftIdentifiers[$index].Length -gt $rightIdentifiers[$index].Length) { return 1 }
+            $numericOrdinal = [string]::CompareOrdinal($leftIdentifiers[$index], $rightIdentifiers[$index])
+            if ($numericOrdinal -lt 0) { return -1 }
+            if ($numericOrdinal -gt 0) { return 1 }
+        } elseif ($leftIsNumeric) {
+            return -1
+        } elseif ($rightIsNumeric) {
+            return 1
+        } else {
+            $ordinal = [string]::CompareOrdinal($leftIdentifiers[$index], $rightIdentifiers[$index])
+            if ($ordinal -lt 0) { return -1 }
+            if ($ordinal -gt 0) { return 1 }
+        }
+    }
+    if ($leftIdentifiers.Length -lt $rightIdentifiers.Length) { return -1 }
+    if ($leftIdentifiers.Length -gt $rightIdentifiers.Length) { return 1 }
+    return 0
+}
+
 function Test-BRAVOVersionDowngrade {
     [CmdletBinding()]
     param(
@@ -513,14 +644,45 @@ function Test-BRAVOVersionDowngrade {
     # означає лише, що порівнювати нема з чим.
     if ([string]::IsNullOrWhiteSpace($versionRaw)) { return $result }
 
+    $deployed = $null
+    $deployedText = $null
     try {
         $versionParsed = $versionRaw | ConvertFrom-Json
         $deployedText = [string]$versionParsed.packageVersion
-        $deployed = [version]$deployedText
+        $deployed = ConvertTo-BRAVOComparableVersion -Text $deployedText
     } catch {
+        $deployed = $null
+    }
+
+    # VERSION.json захищений маніфестом, тому непарсибельна packageVersion
+    # тут — не "битий файл на сервері", а аномалія самого комплекту
+    # (дефект release-інженерії або обхід). Мовчазний пропуск був би тим
+    # самим bypass-ом, який ця перевірка мусить ловити, — fail-closed за
+    # режимом, з тим самим аварійним вентилем BRAVO_ALLOW_DOWNGRADE=1.
+    if ($null -eq $deployed) {
+        $result.IsValid = $false
+        if ($AllowDowngrade -eq '1') {
+            $result.OverrideApplied = $true
+            $result.Message = (
+                "УВАГА: packageVersion у VERSION.json не розпізнано як версію ('{0}'). " +
+                "Продовжено через BRAVO_ALLOW_DOWNGRADE=1."
+            ) -f $deployedText
+            return $result
+        }
+        $result.ShouldBlock = ($Mode -eq 'Enforce')
+        $versionParseAction = if ($Mode -eq 'Enforce') {
+            "Запуск заблоковано."
+        } else {
+            "Запуск продовжується (RuntimeIntegrityMode = Warn), але це слід перевірити."
+        }
+        $result.Message = (
+            "ВЕРСІЯ НЕ РОЗПІЗНАНА: packageVersion у VERSION.json ('{0}') не є версією " +
+            "X.Y.Z[-prerelease] — захист від відкату не може порівняти комплект. {1} " +
+            "Якщо запуск свідомий, встановіть BRAVO_ALLOW_DOWNGRADE=1."
+        ) -f $deployedText, $versionParseAction
         return $result
     }
-    $result.DeployedVersion = $deployed.ToString()
+    $result.DeployedVersion = $deployed.Text
 
     $stateRaw = $null
     if ($PSBoundParameters.ContainsKey('StateContent')) {
@@ -537,9 +699,22 @@ function Test-BRAVOVersionDowngrade {
     if (-not [string]::IsNullOrWhiteSpace($stateRaw)) {
         try {
             $stateParsed = $stateRaw | ConvertFrom-Json
+            # highestVersionFull зберігає повну версію разом із
+            # prerelease-суфіксом; legacy-поле highestVersion лишається
+            # базовим X.Y.Z, щоб старіший guard (який парсить його через
+            # [version]) продовжував читати цей стан.
+            $recordedText = $null
             if ($null -ne $stateParsed -and
+                $null -ne $stateParsed.PSObject.Properties['highestVersionFull']) {
+                $recordedText = [string]$stateParsed.highestVersionFull
+            }
+            if ([string]::IsNullOrWhiteSpace($recordedText) -and
+                $null -ne $stateParsed -and
                 $null -ne $stateParsed.PSObject.Properties['highestVersion']) {
-                $recorded = [version]([string]$stateParsed.highestVersion)
+                $recordedText = [string]$stateParsed.highestVersion
+            }
+            if (-not [string]::IsNullOrWhiteSpace($recordedText)) {
+                $recorded = ConvertTo-BRAVOComparableVersion -Text $recordedText
             }
         } catch {
             # Пошкоджений файл стану НЕ блокує: на відміну від маніфеста,
@@ -549,11 +724,14 @@ function Test-BRAVOVersionDowngrade {
         }
     }
 
-    if ($null -ne $recorded) { $result.RecordedVersion = $recorded.ToString() }
+    if ($null -ne $recorded) { $result.RecordedVersion = $recorded.Text }
 
     # Перший запуск або новіша версія — запам'ятовуємо й пропускаємо.
-    if ($null -eq $recorded -or $deployed -ge $recorded) {
-        if (-not $NoWrite -and ($null -eq $recorded -or $deployed -gt $recorded)) {
+    $comparison = if ($null -eq $recorded) { 1 } else {
+        Compare-BRAVOComparableVersion -Left $deployed -Right $recorded
+    }
+    if ($comparison -ge 0) {
+        if (-not $NoWrite -and ($null -eq $recorded -or $comparison -gt 0)) {
             $sourceCommit = ''
             try {
                 if ($null -ne $versionParsed.PSObject.Properties['sourceCommit']) {
@@ -562,12 +740,19 @@ function Test-BRAVOVersionDowngrade {
             } catch {
                 $sourceCommit = ''
             }
-            $stateJson = (
-                '{{{0}  "highestVersion": "{1}",{0}  "sourceCommit": "{2}",{0}  "recordedAt": "{3}"{0}}}{0}'
-            ) -f [Environment]::NewLine,
-                 $deployed.ToString(),
-                 $sourceCommit,
-                 ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
+            # Штатна JSON-серіалізація замість ручного формат-рядка:
+            # ConvertTo-Json екранує будь-який вміст полів, тому жоден
+            # символ у версії чи sourceCommit не може зробити state
+            # непарсибельним (review-знахідка PR #135). Імена полів —
+            # контракт: highestVersion лишається legacy-сумісною базою
+            # X.Y.Z для старішого guard, highestVersionFull — повна
+            # валідована версія.
+            $stateJson = ([pscustomobject]@{
+                highestVersion = $deployed.Base.ToString()
+                highestVersionFull = $deployed.Text
+                sourceCommit = $sourceCommit
+                recordedAt = ([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))
+            } | ConvertTo-Json) + [Environment]::NewLine
             try {
                 $stateDirectory = [System.IO.Path]::GetDirectoryName($StatePath)
                 if (-not [System.IO.Directory]::Exists($stateDirectory)) {

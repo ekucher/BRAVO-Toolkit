@@ -1207,6 +1207,359 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         }
     }
 
+    # Prerelease-версії (X.Y.Z-dev.N / X.Y.Z-rc.N). Регресія acceptance
+    # 2026-09-03: [version] кидав виняток на prerelease-суфіксі, catch
+    # мовчки повертав "valid" — dev/rc-комплекти й не фіксували
+    # highestVersion, і не блокували справжній відкат (походження — коміт
+    # 3e27dae). Порівняння тепер SemVer-aware.
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVODowngradeScenario -Deployed '4.4.0-dev.2' -Recorded '4.3.0').IsValid -and
+            (Test-BRAVODowngradeScenario -Deployed '4.4.0-dev.2' -Recorded '4.3.0').DeployedVersion -eq '4.4.0-dev.2' -and
+            (Test-BRAVODowngradeScenario -Deployed '4.3.0' -Recorded '4.3.0-rc.1').IsValid
+        ) `
+        -Name "VersionState/PrereleaseNewerThanRecordedPasses" `
+        -Failure "prerelease з новішою базою та stable понад власний prerelease мають проходити, а версія — розпізнаватися повністю"
+
+    # Точний синтетичний кейс acceptance-знахідки: rc старішої лінії проти
+    # вже запускавшогося stable — раніше мовчки проходив.
+    $downgradePrerelease = Test-BRAVODowngradeScenario -Deployed '5.0.0-rc.1' -Recorded '5.1.0'
+    $downgradeToPrereleaseOfSameBase = Test-BRAVODowngradeScenario -Deployed '4.3.0-rc.1' -Recorded '4.3.0'
+    $downgradeWithinPrerelease = Test-BRAVODowngradeScenario -Deployed '4.3.0-rc.1' -Recorded '4.3.0-rc.2'
+    $downgradeDevBelowRc = Test-BRAVODowngradeScenario -Deployed '4.3.0-dev.9' -Recorded '4.3.0-rc.1'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $downgradePrerelease.IsValid -and $downgradePrerelease.ShouldBlock -and
+            -not $downgradeToPrereleaseOfSameBase.IsValid -and $downgradeToPrereleaseOfSameBase.ShouldBlock -and
+            -not $downgradeWithinPrerelease.IsValid -and $downgradeWithinPrerelease.ShouldBlock -and
+            -not $downgradeDevBelowRc.IsValid -and $downgradeDevBelowRc.ShouldBlock
+        ) `
+        -Name "VersionState/PrereleaseDowngradeBlocks" `
+        -Failure "відкат через prerelease (старіша база, prerelease тієї самої бази, rc.1<rc.2, dev<rc) має блокувати так само, як stable-відкат"
+
+    $downgradePrereleaseOverride = Test-BRAVODowngradeScenario -Deployed '5.0.0-rc.1' -Recorded '5.1.0' -Allow '1'
+    Test-BRAVOCondition `
+        -Condition (-not $downgradePrereleaseOverride.ShouldBlock -and $downgradePrereleaseOverride.OverrideApplied) `
+        -Name "VersionState/PrereleaseOverrideAllowsDowngrade" `
+        -Failure "BRAVO_ALLOW_DOWNGRADE=1 має працювати й для prerelease-відкату"
+
+    # Непарсибельна packageVersion — VERSION.json захищений маніфестом,
+    # тому це аномалія комплекту, а не битий файл: fail-closed за режимом,
+    # з тим самим аварійним вентилем.
+    $unparsableVersion = Test-BRAVODowngradeScenario -Deployed 'not-a-version' -Recorded '4.3.0'
+    $unparsableVersionWarn = Test-BRAVODowngradeScenario -Deployed 'not-a-version' -Recorded '4.3.0' -Mode 'Warn'
+    $unparsableVersionOverride = Test-BRAVODowngradeScenario -Deployed 'not-a-version' -Recorded '4.3.0' -Allow '1'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $unparsableVersion.IsValid -and $unparsableVersion.ShouldBlock -and
+            -not $unparsableVersionWarn.IsValid -and -not $unparsableVersionWarn.ShouldBlock -and
+            -not $unparsableVersionOverride.ShouldBlock -and $unparsableVersionOverride.OverrideApplied
+        ) `
+        -Name "VersionState/UnparsableVersionFailsClosed" `
+        -Failure "непарсибельна packageVersion має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1"
+
+    # Повний цикл запису для prerelease: стан фіксує і legacy-сумісну базу
+    # (highestVersion — читабельна старішим guard-ом через [version]), і
+    # повну версію (highestVersionFull), після чого старіший prerelease
+    # тієї самої бази блокується.
+    $prereleaseStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $prereleaseStatePath = Join-Path $prereleaseStateRoot 'LOGS\BRAVO_VERSION_STATE.json'
+        $prereleaseFirstRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $prereleaseStatePath `
+            -VersionContent '{"packageVersion": "4.3.0-dev.2", "sourceCommit": "abc"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $prereleaseStateText = if (Test-Path -LiteralPath $prereleaseStatePath -PathType Leaf) {
+            [System.IO.File]::ReadAllText($prereleaseStatePath, [System.Text.Encoding]::UTF8)
+        } else { '' }
+        $prereleaseStateParsed = $null
+        try { $prereleaseStateParsed = $prereleaseStateText | ConvertFrom-Json } catch { $prereleaseStateParsed = $null }
+        $prereleaseAfterWrite = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $prereleaseStatePath `
+            -VersionContent '{"packageVersion": "4.3.0-dev.1"}' `
+            -Mode Enforce -AllowDowngrade '' -NoWrite
+        Test-BRAVOCondition `
+            -Condition (
+                $prereleaseFirstRun.StateUpdated -and
+                $null -ne $prereleaseStateParsed -and
+                [string]$prereleaseStateParsed.highestVersion -eq '4.3.0' -and
+                [string]$prereleaseStateParsed.highestVersionFull -eq '4.3.0-dev.2' -and
+                $prereleaseAfterWrite.ShouldBlock -and
+                $prereleaseAfterWrite.RecordedVersion -eq '4.3.0-dev.2'
+            ) `
+            -Name "VersionState/PrereleaseRecordsFullAndLegacyBase" `
+            -Failure "prerelease-запуск має фіксувати highestVersionFull разом із legacy-сумісною базою highestVersion, після чого старіший prerelease блокується"
+    } finally {
+        if (Test-Path -LiteralPath $prereleaseStateRoot) {
+            Remove-Item -LiteralPath $prereleaseStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # SemVer-hardening (review PR #135). Знахідка A: числові
+    # prerelease-ідентифікатори понад Int64.MaxValue обидва «переставали»
+    # бути числовими для [long]::TryParse і падали в ординальне
+    # порівняння, яке інвертує порядок (…rc.9999999999999999999 виглядав
+    # СТАРШИМ за …rc.10000000000000000000) — відкат проходив непоміченим.
+    # Порівняння тепер за довжиною рядка цифр + ординально, без Int64.
+    $hugeNumericDowngrade = Test-BRAVODowngradeScenario `
+        -Deployed '5.3.0-rc.9999999999999999999' -Recorded '5.3.0-rc.10000000000000000000'
+    $hugeNumericUpgrade = Test-BRAVODowngradeScenario `
+        -Deployed '5.3.0-rc.10000000000000000000' -Recorded '5.3.0-rc.9999999999999999999'
+    # Ідентифікатори значно довші за 64-bit межу (33 цифри): захист не
+    # має бути випадково прив'язаним до жодної фіксованої розрядності.
+    $hugeNumericBeyondInt64Downgrade = Test-BRAVODowngradeScenario `
+        -Deployed '5.3.0-rc.999999999999999999999999999999998' `
+        -Recorded '5.3.0-rc.999999999999999999999999999999999'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $hugeNumericDowngrade.IsValid -and $hugeNumericDowngrade.ShouldBlock -and
+            $hugeNumericUpgrade.IsValid -and -not $hugeNumericUpgrade.ShouldBlock -and
+            [string]$hugeNumericUpgrade.DeployedVersion -eq '5.3.0-rc.10000000000000000000' -and
+            -not $hugeNumericBeyondInt64Downgrade.IsValid -and $hugeNumericBeyondInt64Downgrade.ShouldBlock
+        ) `
+        -Name "VersionState/HugeNumericPrereleaseComparesNumerically" `
+        -Failure "числові prerelease-ідентифікатори довільної довжини (понад Int64) мають порівнюватися як числа: rc.99…9(19) < rc.10…0(20), незалежно від розрядності"
+
+    # Знахідка B: сувора SemVer-валідація суфіксів ДО порівняння і ДО
+    # запису стану. Malformed суфікс (лапки, '_', порожній сегмент,
+    # leading zero) раніше приймався і пошкоджував state JSON.
+    $semverInvalidTexts = @(
+        '5.3.0-', '5.3.0-rc..1', ('5.3.0-rc' + '"' + 'oops'), '5.3.0-rc_1',
+        '5.3.0-rc.01', '5.3.0- rc.1', '5.3.0+', '5.3.0+bad_meta', '5.3.0+build..7',
+        # Core суворо X.Y.Z: [version] сам прийняв би 2-/4-компонентні
+        # форми і leading zero, а 4-компонентний high-water mark блокував
+        # би коректний X.Y.Z як «відкат» (review PR #135, друга хвиля).
+        '5.3', '5.3.0.1', '05.3.0', '5.03.0', '5.3.00', '5..3.0',
+        # СВІДОМИЙ контракт BRAVO (RELEASE_POLICY.md): core-компонент
+        # обмежений System.Version (<= 2147483647), бо той самий X.Y.Z
+        # є ModuleVersion у *.psd1 на Windows PowerShell 5.1. Overflow
+        # будь-якого з MAJOR/MINOR/PATCH — непідтримувана packageVersion.
+        '2147483648.0.0-rc.1', '5.2147483648.0-rc.1', '5.3.2147483648-rc.1'
+    )
+    $semverInvalidAccepted = @($semverInvalidTexts | Where-Object {
+        $null -ne (ConvertTo-BRAVOComparableVersion -Text $_)
+    })
+    $semverValidTexts = @(
+        '5.3.0-rc.1', '5.3.0-dev.12', '5.3.0-alpha-beta', '5.3.0-rc.0',
+        '5.3.0-rc.999999999999999999999999999999999',
+        '5.3.0+build.7', '5.3.0-rc.1+build-7.x', '0.9.0', '10.20.30',
+        # Межа контракту включно: максимальний представимий компонент.
+        '2147483647.0.0-rc.1'
+    )
+    $semverValidRejected = @($semverValidTexts | Where-Object {
+        $null -eq (ConvertTo-BRAVOComparableVersion -Text $_)
+    })
+    Test-BRAVOCondition `
+        -Condition ($semverInvalidAccepted.Count -eq 0 -and $semverValidRejected.Count -eq 0) `
+        -Name "VersionState/PrereleaseAndBuildSyntaxValidated" `
+        -Failure (
+            "SemVer-валідація суфіксів: помилково прийнято [" +
+            ($semverInvalidAccepted -join '; ') + "], помилково відхилено [" +
+            ($semverValidRejected -join '; ') + "]"
+        )
+
+    # Malformed prerelease у VERSION.json проходить той самий fail-closed
+    # шлях, що й непарсибельна версія: блок в Enforce, попередження у
+    # Warn (IsValid=false, ShouldBlock=false), аварійний вентиль
+    # BRAVO_ALLOW_DOWNGRADE=1 діє.
+    $malformedQuoteVersionContent = '{"packageVersion": "5.3.0-rc\"oops"}'
+    $malformedQuoteEnforce = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $malformedQuoteVersionContent `
+        -Mode Enforce -AllowDowngrade '' -NoWrite
+    $malformedQuoteWarn = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $malformedQuoteVersionContent `
+        -Mode Warn -AllowDowngrade '' -NoWrite
+    $malformedQuoteOverride = Test-BRAVOVersionDowngrade `
+        -RuntimeRoot $root -StatePath 'synthetic' `
+        -VersionContent $malformedQuoteVersionContent `
+        -Mode Enforce -AllowDowngrade '1' -NoWrite
+    Test-BRAVOCondition `
+        -Condition (
+            -not $malformedQuoteEnforce.IsValid -and $malformedQuoteEnforce.ShouldBlock -and
+            -not $malformedQuoteWarn.IsValid -and -not $malformedQuoteWarn.ShouldBlock -and
+            -not $malformedQuoteOverride.ShouldBlock -and $malformedQuoteOverride.OverrideApplied
+        ) `
+        -Name "VersionState/MalformedPrereleaseFailsClosed" `
+        -Failure 'malformed prerelease-суфікс (5.3.0-rc"oops) має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1 — не прийматися і не псувати state'
+
+    # Не-канонічний core (4 компоненти) — malformed fail-closed шлях, а
+    # НЕ запис у state: інакше '5.3.0.1' став би high-water mark і
+    # коректний '5.3.0' блокувався б як «відкат».
+    $fourComponentDeployed = Test-BRAVODowngradeScenario -Deployed '5.3.0.1' -Recorded '5.3.0'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $fourComponentDeployed.IsValid -and
+            $fourComponentDeployed.ShouldBlock -and
+            $null -eq $fourComponentDeployed.DeployedVersion
+        ) `
+        -Name "VersionState/FourComponentCoreTakesMalformedPath" `
+        -Failure "4-компонентна packageVersion (5.3.0.1) має йти malformed fail-closed шляхом, а не порівнюватися чи фіксуватися як версія"
+
+    # State пишеться штатним ConvertTo-Json: жоден вміст полів (включно з
+    # ворожим sourceCommit) не робить його непарсибельним, а контрактні
+    # імена/значення полів зберігаються.
+    $jsonStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $jsonStatePath = Join-Path $jsonStateRoot 'LOGS\BRAVO_VERSION_STATE.json'
+        $jsonWriteRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $jsonStatePath `
+            -VersionContent '{"packageVersion": "5.3.0-rc.10000000000000000000", "sourceCommit": "abc\"def\\ghi"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $jsonStateParsed = $null
+        try {
+            $jsonStateParsed = [System.IO.File]::ReadAllText(
+                $jsonStatePath, [System.Text.Encoding]::UTF8
+            ) | ConvertFrom-Json
+        } catch {
+            $jsonStateParsed = $null
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $jsonWriteRun.StateUpdated -and
+                $null -ne $jsonStateParsed -and
+                [string]$jsonStateParsed.highestVersion -eq '5.3.0' -and
+                [string]$jsonStateParsed.highestVersionFull -eq '5.3.0-rc.10000000000000000000' -and
+                [string]$jsonStateParsed.sourceCommit -eq ('abc' + '"' + 'def\ghi') -and
+                -not [string]::IsNullOrWhiteSpace([string]$jsonStateParsed.recordedAt)
+            ) `
+            -Name "VersionState/StateJsonAlwaysParseable" `
+            -Failure "записаний state мусить читатися ConvertFrom-Json із контрактними полями highestVersion/highestVersionFull/sourceCommit/recordedAt навіть із ворожим вмістом sourceCommit"
+    } finally {
+        if (Test-Path -LiteralPath $jsonStateRoot) {
+            Remove-Item -LiteralPath $jsonStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Legacy-стан із записаною версією, яку СУВОРІША валідація тепер
+    # відхиляє (напр. leading zero від старішого guard або наслідок
+    # саме того дефекту, що виправлявся). Документований контракт: state
+    # не є еталоном довіри — непридатний записаний рядок деградує до
+    # first-run семантики (без падіння, без блокування) і перезаписується
+    # валідною поточною версією. Тест закріплює цю деградацію свідомо.
+    $legacyInvalidStateRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VERSION_STATE_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $legacyInvalidStatePath = Join-Path $legacyInvalidStateRoot 'LOGS\BRAVO_VERSION_STATE.json'
+        [void][System.IO.Directory]::CreateDirectory((Split-Path -Parent $legacyInvalidStatePath))
+        [System.IO.File]::WriteAllText(
+            $legacyInvalidStatePath,
+            '{"highestVersion": "5.3.0", "highestVersionFull": "5.3.0-rc.01"}',
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $legacyInvalidRun = Test-BRAVOVersionDowngrade `
+            -RuntimeRoot $root -StatePath $legacyInvalidStatePath `
+            -VersionContent '{"packageVersion": "5.2.0"}' `
+            -Mode Enforce -AllowDowngrade ''
+        $legacyInvalidRewritten = $null
+        try {
+            $legacyInvalidRewritten = [System.IO.File]::ReadAllText(
+                $legacyInvalidStatePath, [System.Text.Encoding]::UTF8
+            ) | ConvertFrom-Json
+        } catch {
+            $legacyInvalidRewritten = $null
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyInvalidRun.IsValid -and -not $legacyInvalidRun.ShouldBlock -and
+                $legacyInvalidRun.StateUpdated -and
+                $null -ne $legacyInvalidRewritten -and
+                [string]$legacyInvalidRewritten.highestVersionFull -eq '5.2.0'
+            ) `
+            -Name "VersionState/LegacyInvalidRecordedVersionDegradesToFirstRun" `
+            -Failure "записана версія, яку суворіша валідація відхиляє, має деградувати до first-run (без падіння і блокування) і перезаписатися валідною поточною версією — документований контракт state-не-еталон-довіри"
+    } finally {
+        if (Test-Path -LiteralPath $legacyInvalidStateRoot) {
+            Remove-Item -LiteralPath $legacyInvalidStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Release policy <-> runtime guard consistency (review PR #135):
+    # core, представимий System.Version, — свідомий release contract
+    # BRAVO (той самий X.Y.Z є ModuleVersion у *.psd1 на PS 5.1).
+    # Behavior-level: справжній ci\Test-BRAVOReleasePolicy.ps1 на
+    # synthetic fixture-repo в дочірньому процесі (скрипт робить exit).
+    $releasePolicyFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RELEASE_POLICY_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        $releasePolicyModuleDir = Join-Path $releasePolicyFixtureRoot 'modules\BRAVO.Stub'
+        [void][IO.Directory]::CreateDirectory($releasePolicyModuleDir)
+        [IO.File]::WriteAllText((Join-Path $releasePolicyFixtureRoot 'BRAVO_SELF_TEST.ps1'), '# fixture marker', [Text.Encoding]::UTF8)
+        [IO.File]::WriteAllText((Join-Path $releasePolicyModuleDir 'BRAVO.Stub.psd1'), "@{ ModuleVersion = '5.3.0' }", [Text.Encoding]::UTF8)
+        # Стаб лоадера: policy dot-source-ить його лише заради
+        # Resolve-BRAVOReleaseChannelFromGit (git-перехресна перевірка).
+        [IO.File]::WriteAllText(
+            (Join-Path $releasePolicyFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
+            "function Resolve-BRAVOReleaseChannelFromGit { param([string]`$ConfigRoot) return '' }",
+            [Text.Encoding]::UTF8
+        )
+        $releasePolicyScriptPath = Join-Path $root 'ci\Test-BRAVOReleasePolicy.ps1'
+        $releasePolicyPwsh = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        function Invoke-BRAVOReleasePolicyFixture {
+            param([Parameter(Mandatory = $true)][string]$PackageVersion)
+            [IO.File]::WriteAllText(
+                (Join-Path $releasePolicyFixtureRoot 'VERSION.json'),
+                ('{{"packageVersion": "{0}", "releaseChannel": "prerelease"}}' -f $PackageVersion),
+                [Text.Encoding]::UTF8
+            )
+            foreach ($documentName in @('CHANGELOG.md', 'README.md', 'BRAVO_SETUP.md')) {
+                [IO.File]::WriteAllText(
+                    (Join-Path $releasePolicyFixtureRoot $documentName),
+                    ("# BRAVO {0}`r`n" -f $PackageVersion),
+                    [Text.Encoding]::UTF8
+                )
+            }
+            # EAP=Continue лише навколо native-виклику: 2>&1 під
+            # глобальним Stop перетворив би будь-який stderr-рядок
+            # дитини на terminating NativeCommandError і зірвав би весь
+            # self-test замість чесного FAIL одного тесту.
+            $previousErrorActionPreference = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $fixtureOutput = & $releasePolicyPwsh -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                    -File $releasePolicyScriptPath `
+                    -Root $releasePolicyFixtureRoot -Branch 'developer' 2>&1 | Out-String
+            } finally {
+                $ErrorActionPreference = $previousErrorActionPreference
+            }
+            return [pscustomobject]@{ ExitCode = $LASTEXITCODE; Output = $fixtureOutput }
+        }
+        # Huge prerelease-лічильник валідний на РІВНІ POLICY теж (core
+        # constrained, prerelease arbitrary-length — обидва рівні згодні).
+        $releasePolicyHugePrerelease = Invoke-BRAVOReleasePolicyFixture `
+            -PackageVersion '5.3.0-rc.999999999999999999999999999999999'
+        # Overflow MAJOR: рівно ОДНА root-cause помилка про System.Version,
+        # БЕЗ каскаду ModuleVersion-mismatch по *.psd1 (у fixture
+        # ModuleVersion=5.3.0 навмисно «не збігається» — порівняння не
+        # повинно навіть запускатись для непідтримуваної версії).
+        $releasePolicyOverflow = Invoke-BRAVOReleasePolicyFixture `
+            -PackageVersion '2147483648.0.0-rc.1'
+        # Asserts свідомо ASCII-стабільні: stdout дитини кодується
+        # кодовою сторінкою КОНСОЛІ (CP437 на GitHub-runner, CP866 у
+        # типовій операторській консолі) — кирилиця там спотворюється,
+        # і кириличний Contains давав би хибний FAIL/хибний PASS залежно
+        # від chcp. Рівно ОДИН '::error::' = одна root-cause помилка без
+        # каскаду ModuleVersion-mismatch.
+        Test-BRAVOCondition `
+            -Condition (
+                $releasePolicyHugePrerelease.ExitCode -eq 0 -and
+                $releasePolicyOverflow.ExitCode -ne 0 -and
+                $releasePolicyOverflow.Output.Contains('System.Version') -and
+                @([regex]::Matches($releasePolicyOverflow.Output, '::error::')).Count -eq 1
+            ) `
+            -Name "VersionState/ReleasePolicyCoreMatchesRuntimeContract" `
+            -Failure (
+                "release policy має відхиляти core понад System.Version однією root-cause помилкою (без каскаду ModuleVersion) і приймати " +
+                "довільно великий prerelease-лічильник; фактично: huge=exit {0}; overflow=exit {1}; overflow output: {2}" -f `
+                    $releasePolicyHugePrerelease.ExitCode,
+                    $releasePolicyOverflow.ExitCode,
+                    $releasePolicyOverflow.Output
+            )
+    } finally {
+        if (Test-Path -LiteralPath $releasePolicyFixtureRoot) {
+            Remove-Item -LiteralPath $releasePolicyFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Аудит Low #8: порожній catch {} без жодного пояснення ковтає
     # діагностику саме там, де вона потрібна — під час інциденту. Вимога не
     # "заборонити порожні catch" (частина з них законна: прибирання у
