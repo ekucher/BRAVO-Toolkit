@@ -12580,8 +12580,11 @@ function Get-BRAVOMaintenanceSummaryResult {
 
     # --- Archive after maintenance: SKIPPED/OK/FAIL wiring.
     $archiveResultCallIndex = $maintenanceScriptTextForManifestStorage.IndexOf("`$script:currentMaintenanceOperation = 'Архівація після maintenance'")
+    # Вікно 3600 -> 4300: гейт AUTO-наміру для дочірнього BRAVO_ARCHIV
+    # (review PR #134, $archiveConfigArgumentText) легітимно додав ~600
+    # символів між маркером операції та SKIPPED/OK/FAIL-wiring.
     $archiveResultCallWindow = if ($archiveResultCallIndex -ge 0) {
-        $maintenanceScriptTextForManifestStorage.Substring($archiveResultCallIndex, [Math]::Min(3600, $maintenanceScriptTextForManifestStorage.Length - $archiveResultCallIndex))
+        $maintenanceScriptTextForManifestStorage.Substring($archiveResultCallIndex, [Math]::Min(4300, $maintenanceScriptTextForManifestStorage.Length - $archiveResultCallIndex))
     } else { '' }
     Test-BRAVOCondition `
         -Condition (
@@ -16008,6 +16011,10 @@ function Write-BRAVOLog {
     # підключено до BRAVO_CONFIG_LOADER.ps1/BRAVO.config
     # (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configuration.ps1')
+    # Configuration Foundation: AUTO/EXPLICIT намір -ConfigPath на межі
+    # оператора + пропагація в runtime/child (регресія acceptance CF-17
+    # та AUTO-intent класу дефектів root-entrypoint splat-ів).
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigIntent.ps1')
     # Configurator backend: Schema/Model/Effective/Validation/Persistence/
     # Credentials/Presets/Preview (docs/design/BRAVO_CONFIGURATOR_DESIGN.md).
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
