@@ -68,6 +68,12 @@ Import-Module -Name $notificationHelpersPath -ErrorAction Stop
 # ніж вставляти виклик паузи перед кожним окремим exit.
 try {
 
+# P0 Configuration Foundation (PR C): свідомий намір оператора фіксується
+# ТУТ, на межі справжнього виклику скрипта, ДО підстановки auto-дефолту
+# нижче — і використовується як для UAC-relaunch (нижче), так і для
+# Import-BravoConfiguration (далі по файлу).
+$configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
+    -not [string]::IsNullOrWhiteSpace($ConfigPath)
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
     $ConfigPath = Join-Path $bravoScriptDirectory "BRAVO.config"
 }
@@ -90,7 +96,13 @@ If (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal
 	if ($PSBoundParameters.ContainsKey('ArchiveAfterMaintenance')) {
         $elevatedArguments += @("-ArchiveAfterMaintenance", $ArchiveAfterMaintenance)
     }
-    $elevatedArguments += @("-ConfigPath", "`"$ConfigPath`"")
+    # AUTO -> не вбудовувати -ConfigPath у relaunch: elevated-процес сам
+    # повторить ту саму auto-derivation (RuntimeRoot\BRAVO.config). Так
+    # relaunch не перетворює auto-намір на explicit, і майбутня
+    # появу/зникнення auto-primary не вимагає узгодження тут.
+    if ($configPathWasExplicit) {
+        $elevatedArguments += @("-ConfigPath", "`"$ConfigPath`"")
+    }
 	$elevatedProcess = Start-Process powershell.exe -ArgumentList $elevatedArguments -Verb RunAs -Wait -PassThru
 	Exit $elevatedProcess.ExitCode
 }
@@ -114,13 +126,21 @@ $script:maintenanceOperationLock = $null
 $script:maintenanceOperationLockPath = $null
 
 # ===== ЗАВАНТАЖЕННЯ НАЛАШТУВАНЬ =====
-if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
-    Write-Host "ПОМИЛКА: Не знайдено конфігураційний файл: $ConfigPath" -ForegroundColor Red
-    exit 30
-}
+# P0 Configuration Foundation: BRAVO.config став опційним основним
+# override-шаром — попередня жорстка "файл мусить існувати" перевірка
+# тут дублювала (і випереджала) те саме рішення, яке Import-Bravo
+# Configuration тепер приймає коректно сама (auto-derived відсутній
+# BRAVO.config -> canonical built-in defaults + BRAVO.local.config;
+# явно вказаний відсутній -ConfigPath -> як і раніше, помилка,
+# перехоплена нижче тим самим catch/exit 30). Один canonical guard
+# замість двох незалежних копій цього рішення.
 
 try {
-    $ConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    # Resolve-Path (а не лише GetFullPath) вимагав існування файла —
+    # несумісно з no-config-шляхом. GetFullPath нормалізує шлях без
+    # такої вимоги; існування файла (коли це справді потрібно) перевіряє
+    # сам Import-BravoConfiguration.
+    $ConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
     $configRoot = Split-Path -Path $ConfigPath -Parent
     # Завантажувач і modules\ беруться з КОМПЛЕКТУ, а не з каталогу
     # конфігурації: -ConfigPath може вказувати на C:\BRAVO\CONFIGS\SERVER1.config,
@@ -133,7 +153,8 @@ try {
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $ConfigPath `
-        -RuntimeRoot $bravoScriptDirectory
+        -RuntimeRoot $bravoScriptDirectory `
+        -ConfigPathWasExplicit:$configPathWasExplicit
     $script:ScriptVersion = [string]$global:ScriptVersion
     $script:ScriptDate = [string]$global:ScriptDate
     $script:ScriptBuildId = [string]$global:ScriptBuildId
@@ -282,6 +303,19 @@ $FAILED_ARCHIVE_RETENTION_DAYS = if ($null -ne $MaintenanceConfig.Retention.Fail
     [math]::Max(1, [int]$MaintenanceConfig.Retention.FailedArchiveDays)
 } else {
     30
+}
+# P5 (2026-09): скільки днів понад LastWriteTime лишати локально ПОВНІСТЮ
+# верифіковане джерело (.out/.log) після успішної архівації+SFTP, перш
+# ніж видалити. 0 = точна попередня поведінка (видалення одразу, щойно
+# безпечно). Той самий захисний Contains-патерн, що CompressedLogDays/
+# CompressedLogDeletionEnabled вище — старі site-config без ключа
+# зберігають поточну (негайну) поведінку без винятків.
+$RAW_SOURCE_GRACE_DAYS = if ($MaintenanceConfig.Retention -is [System.Collections.IDictionary] -and
+    $MaintenanceConfig.Retention.Contains("RawSourceGraceDays") -and
+    $null -ne $MaintenanceConfig.Retention.RawSourceGraceDays) {
+    [math]::Max(0, [int]$MaintenanceConfig.Retention.RawSourceGraceDays)
+} else {
+    0
 }
 $MIN_FREE_SPACE = [double]$MaintenanceConfig.Limits.MinimumFreeSpaceGB
 $FREE_SPACE_EXCLUDED_DRIVES = @()
@@ -4071,6 +4105,108 @@ function Send-BRAVOTraceArchive {
     }
 }
 
+function Connect-BRAVOOwnLogSftpSession {
+    # Коротко-живуча SFTP-сесія для вивантаження власного логу наприкінці
+    # прогону: Trace-сесія відкривається і закривається всередині фази
+    # "TRACE: ДОБОВИЙ АРХІВ І SFTP" — задовго до фінального звіту, тому
+    # ПОВНИЙ лог через неї передати неможливо. Той самий канонічний
+    # bootstrap-ланцюг, що Trace-фаза (Credential Manager ->
+    # Resolve-BRAVOSftpHostName -> New-BRAVOSftpUrl -> WinSCP .NET),
+    # включно з обов'язковим SshHostKeyFingerprint — жодних послаблень
+    # host-key-перевірки. Будь-який провал -> WARNING і $null: вивантаження
+    # власного логу — другорядний/телеметричний ефект, ніколи не критичний.
+    [CmdletBinding()]
+    param()
+
+    $ownLogSession = $null
+    try {
+        $ownLogLoginTarget = [string]$credentialSettings.Targets.SFTPLogin
+        $ownLogPasswordTarget = [string]$credentialSettings.Targets.SFTPPassword
+        if ([string]::IsNullOrWhiteSpace($ownLogLoginTarget)) { $ownLogLoginTarget = 'BRAVO_SFTP_LOGIN' }
+        if ([string]::IsNullOrWhiteSpace($ownLogPasswordTarget)) { $ownLogPasswordTarget = 'BRAVO_SFTP_PASSWORD' }
+        $ownLogLogin = Get-BRAVOCredentialSecret -Target $ownLogLoginTarget
+        $ownLogPassword = Get-BRAVOCredentialSecret -Target $ownLogPasswordTarget
+        if ([string]::IsNullOrWhiteSpace($ownLogLogin) -or [string]::IsNullOrWhiteSpace($ownLogPassword)) {
+            throw "записи Credential Manager '$ownLogLoginTarget'/'$ownLogPasswordTarget' недоступні"
+        }
+        $ownLogLogin = ([string]$ownLogLogin).Trim()
+        $ownLogResolvedHost = Resolve-BRAVOSftpHostName `
+            -UserName $ownLogLogin `
+            -HostTemplate ([string]$sftpHostTemplate) `
+            -FallbackHostName $(if ($null -ne (Get-Variable -Name 'sftpHost' -Scope Global -ErrorAction SilentlyContinue)) { [string](Get-Variable -Name 'sftpHost' -Scope Global).Value } else { $null })
+        $ownLogSftpUrl = New-BRAVOSftpUrl `
+            -HostName $ownLogResolvedHost `
+            -Port ([int]$sftpPort) `
+            -UserName $ownLogLogin `
+            -Password ([string]$ownLogPassword)
+        $ownLogPassword = $null
+        $ownLogWinScpComponents = Get-BRAVOWinSCPDotNetComponents -WinSCPPath ([string]$winSCPPath)
+        if ($null -eq $ownLogWinScpComponents) {
+            throw 'WinSCP .NET-компоненти (WinSCPnet.dll + winscp.exe) не знайдено'
+        }
+        if ($null -eq ('WinSCP.Session' -as [type])) {
+            Add-Type -Path $ownLogWinScpComponents.AssemblyPath -ErrorAction Stop
+        }
+        $ownLogSessionOptions = New-Object WinSCP.SessionOptions
+        $ownLogSessionOptions.ParseUrl($ownLogSftpUrl)
+        $ownLogSftpUrl = $null
+        $ownLogSessionOptions.SshHostKeyFingerprint = ([string]$sftpHostKey).Trim().Trim('"')
+        $ownLogSessionOptions.Timeout = [timespan]::FromSeconds([math]::Max(15, [int]$sftpConnectionTimeoutSeconds))
+        $ownLogSession = New-Object WinSCP.Session
+        $ownLogSession.ExecutablePath = $ownLogWinScpComponents.ExecutablePath
+        $ownLogSession.Open($ownLogSessionOptions)
+        return $ownLogSession
+    } catch {
+        if ($null -ne $ownLogSession) {
+            try { $ownLogSession.Dispose() } catch {
+                # Прибирання після провалу відкриття — початкова помилка
+                # (WARNING нижче) важливіша за помилку Dispose.
+            }
+        }
+        Write-Log "Власний лог: SFTP-сесію не відкрито: $($_.Exception.Message)" -Level "WARNING"
+        return $null
+    }
+}
+
+function Send-BRAVOOwnLogFile {
+    # Best-effort вивантаження ОДНОГО власного файлу (live-лог прогону,
+    # знімок range_id_log.json) на SFTP. Другорядний/телеметричний ефект:
+    # провал — лише WARNING, ніколи не встановлює
+    # $script:criticalErrorOccurred і не впливає на exit code.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$Session,
+        [Parameter(Mandatory = $true)][string]$LocalLogPath,
+        [Parameter(Mandatory = $true)][string]$RemoteDirectory,
+        # Remote-ім'я за замовчуванням — локальне ім'я файлу; для файлів із
+        # константним локальним ім'ям (range_id_log.json) передається
+        # унікальне ім'я з run-id, щоб прогони не перезаписували один одного.
+        [string]$RemoteFileName,
+        [AllowNull()][scriptblock]$Logger
+    )
+    try {
+        if (-not (Test-Path -LiteralPath $LocalLogPath -PathType Leaf)) { return }
+        if ([string]::IsNullOrWhiteSpace($RemoteFileName)) {
+            $RemoteFileName = [System.IO.Path]::GetFileName($LocalLogPath)
+        }
+        $normalizedRemoteDirectory = ([string]$RemoteDirectory).Trim().Trim('/').Replace('\', '/')
+        $remoteRoot = if ([string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) { '' } else { "/$normalizedRemoteDirectory" }
+        if (-not [string]::IsNullOrWhiteSpace($normalizedRemoteDirectory)) {
+            New-BRAVOBazaRemoteDirectoryRecursive -Session $Session -RemoteDirectoryPath $normalizedRemoteDirectory
+        }
+        $ownLogResult = Send-BRAVOTraceArchiveFile `
+            -Session $Session `
+            -LocalPath $LocalLogPath `
+            -RemoteFinalPath "$remoteRoot/$RemoteFileName" `
+            -Logger $Logger
+        if (-not $ownLogResult.Success) {
+            Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($ownLogResult.Error)" -Level "WARNING"
+        }
+    } catch {
+        Write-Log "Власний лог: передача $LocalLogPath не вдалася: $($_.Exception.Message)" -Level "WARNING"
+    }
+}
+
 # Одноразова (idempotent) автоміграція журнальних архівів на SFTP зі
 # старого плаского каталогу (типово trace/) у нову структуру logs/
 # (типово logs/trace/). Лише remote-move з верифікацією, БЕЗ видалень:
@@ -4280,6 +4416,18 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         [string]$ArchiveNamePrefix = 'Trace',
         [ValidateSet('ByName', 'ByLastWriteTime')][string]$BacklogGroupBy = 'ByName',
         [string]$BacklogFileFilter = '*.out',
+        # P5 (2026-09): grace-період локального зберігання ПОВНІСТЮ
+        # верифікованого джерела понад момент його LastWriteTime. 0
+        # (дефолт) = точна попередня поведінка — видалення одразу, щойно
+        # безпечно (усі 4 умови success виконано), без винятків.
+        # Відраховується від LastWriteTime файлу, а не від моменту
+        # успішної архівації/вивантаження: не вимагає нового persisted
+        # per-file стану. Наслідок (задокументоване обмеження, не
+        # недолік): якщо SFTP довго був недоступний і накопичилась пачка
+        # старих файлів, після відновлення вони видаляться одразу першим
+        # успішним циклом — не отримають "свіжий" N-денний grace від
+        # моменту вивантаження.
+        [int]$RawSourceRetentionDays = 0,
         [AllowNull()][scriptblock]$Logger
     )
 
@@ -4288,6 +4436,7 @@ function Invoke-BRAVOTraceArchiveMaintenance {
         ArchivesUpdated = 0
         Uploaded = 0
         SourcesDeleted = 0
+        SourcesRetainedForGrace = 0
         Conflicts = 0
         Errors = 0
         UploadsDeferred = 0
@@ -4393,6 +4542,19 @@ function Invoke-BRAVOTraceArchiveMaintenance {
                 $result.Errors++
                 Write-BRAVOLogRotationMessage -Logger $Logger `
                     -Message "ПОМИЛКА: $($sourceFile.Name) відсутній в опублікованому архіві — джерело збережено" -Level "ERROR"
+                continue
+            }
+            if ($RawSourceRetentionDays -gt 0 -and
+                ((Get-Date) - $sourceFile.LastWriteTime) -lt [timespan]::FromDays($RawSourceRetentionDays)) {
+                $result.SourcesRetainedForGrace++
+                # Оператору показується фактичний залишок grace-вікна від
+                # LastWriteTime, а не повний $RawSourceRetentionDays — файл
+                # міг пролежати частину вікна ще до цього прогону.
+                $graceRemainingDays = [math]::Ceiling(
+                    ([timespan]::FromDays($RawSourceRetentionDays) - ((Get-Date) - $sourceFile.LastWriteTime)).TotalDays
+                )
+                Write-BRAVOLogRotationMessage -Logger $Logger `
+                    -Message "${ComponentLabel}: $($sourceFile.Name) верифіковано, але лишено локально ще ~$graceRemainingDays дн. (grace-період $RawSourceRetentionDays дн. від останньої зміни)" -Level "INFO"
                 continue
             }
             Remove-Item -LiteralPath $sourceFile.FullName -Force -ErrorAction SilentlyContinue
@@ -8485,6 +8647,171 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
         -Details 'вимкнено'
 }
 
+# ---------------------------------------------------------------------------
+# Первинна (одноразова) очистка legacy-артефактів ери ARCHIV_LIMS-предка.
+# Маркер-гейтована: виконується РІВНО один раз (перший прогін, де маркер
+# ще відсутній), потім ПОСТІЙНО пропускається — на відміну від
+# Remove-BRAVOEmptyLogDateDirectories (P2, щопрогінна, без стану), яка
+# продовжує діяти завжди. Той самий атомарний GUID-tmp+[IO.File]::Replace
+# патерн, що BRAVO_SERVICE_QUIESCENCE.json/BRAVO_VSS_OWNERSHIP.json
+# (modules\BRAVO.System\BRAVO.System.psm1) — свідомо самодостатня (без
+# залежності від Configuration.Derivation $stateRoot), як і той зразок.
+# ---------------------------------------------------------------------------
+
+function Get-BRAVOLegacySweepStatePath {
+    $programDataRoot = [Environment]::GetFolderPath('CommonApplicationData')
+    if ([string]::IsNullOrWhiteSpace($programDataRoot)) {
+        throw 'CommonApplicationData недоступний для legacy-sweep state'
+    }
+    return Join-Path $programDataRoot 'BRAVO\State\BRAVO_LEGACY_SWEEP_STATE.json'
+}
+
+function Write-BRAVOLegacySweepState {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [string]$SweptBy
+    )
+
+    $stateDirectory = Split-Path -Path $Path -Parent
+    if (-not [IO.Directory]::Exists($stateDirectory)) {
+        [void][IO.Directory]::CreateDirectory($stateDirectory)
+    }
+    $state = [ordered]@{
+        schemaVersion = 1
+        sweptAt = (Get-Date).ToString('o')
+        sweptBy = [string]$SweptBy
+    }
+    $temporaryStatePath = Join-Path $stateDirectory ('.BRAVO_LEGACY_SWEEP_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    $backupStatePath = Join-Path $stateDirectory ('.BRAVO_LEGACY_SWEEP_{0}.bak' -f [guid]::NewGuid().ToString('N'))
+    $stateReplaced = $false
+    try {
+        $json = $state | ConvertTo-Json -Depth 5
+        [IO.File]::WriteAllText($temporaryStatePath, $json, (New-Object Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($Path)) {
+            # .NET Framework відхиляє null-backup у Replace — тому явний шлях.
+            [IO.File]::Replace($temporaryStatePath, $Path, $backupStatePath)
+            $stateReplaced = $true
+        } else {
+            [IO.File]::Move($temporaryStatePath, $Path)
+        }
+    } finally {
+        if ([IO.File]::Exists($temporaryStatePath)) {
+            [IO.File]::Delete($temporaryStatePath)
+        }
+        if ($stateReplaced -and [IO.File]::Exists($backupStatePath)) {
+            Remove-Item -LiteralPath $backupStatePath -Force -ErrorAction SilentlyContinue
+        }
+    }
+    return $state
+}
+
+function Read-BRAVOLegacySweepState {
+    # $null = маркера немає АБО він нечитабельний/пошкоджений/незнайомий
+    # schemaVersion. Fail-closed: у ВСІХ цих випадках виклик-сайт трактує
+    # це як "вже виметено" (пропустити sweep), НЕ як "повторити sweep" —
+    # sweep є одноразовою зручністю очищення диска, не data-integrity
+    # операцією; безпечніший режим відмови — не повторювати деструктивну
+    # дію при сумніві в стані, а не ризикувати повторним sweep-ом
+    # legacy-вмісту, який оператор міг навмисно відновити для інспекції.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    if (-not [IO.File]::Exists($Path)) { return $null }
+    try {
+        $raw = [IO.File]::ReadAllText($Path, (New-Object Text.UTF8Encoding($false)))
+        $state = $raw | ConvertFrom-Json -ErrorAction Stop
+        # Схема валідується всередині try: валідний JSON із нечисловим
+        # schemaVersion (напр. "abc") кидав би на [int]-касті ПОЗА try —
+        # помилковий record у консоль і повернення зіпсованого стану як
+        # валідного (code-review 5c14a70, знахідка 1).
+        if ($null -eq $state.PSObject.Properties['schemaVersion'] -or [int]$state.schemaVersion -ne 1) { return $null }
+        if ($null -eq $state.PSObject.Properties['sweptAt'] -or [string]::IsNullOrWhiteSpace([string]$state.sweptAt)) { return $null }
+    } catch {
+        return $null
+    }
+    return $state
+}
+
+function Invoke-BRAVOLegacySweep {
+    # Одноразове (маркер-гейтоване) best-effort очищення відомих legacy-
+    # артефактів ери ARCHIV_LIMS-предка. Виконується ДО фаз Trace/
+    # exchangAPI/BravoWeb (нижче), щоб їхнє перше після-оновлення
+    # переміщення не наштовхувалось на застарілі сторонні файли. Ніколи
+    # не чіпає нічого поза явно переліченими legacy-патернами; ніколи не
+    # чіпає поточно-модельний вміст. Провал — WARNING-рівень, некритичний
+    # (не встановлює $script:criticalErrorOccurred): це одноразова
+    # зручність очищення диска, не операція, від якої залежить
+    # коректність/цілісність даних.
+    #
+    # Непорожні legacy Trace-каталоги-дати СВІДОМО НЕ архівуються тут
+    # bypass-ом віку — лишаються для звичайного age-gated
+    # Compress-OldData-шляху (той самий принцип обережності, що й у
+    # Get-BRAVOEmptyLogDateDirectories/P2): одноразовий bypass поза
+    # протестованим Compress-OldData-контуром — саме той вузький виняток,
+    # якого застерігають fail-closed-правила проєкту.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$LogDir,
+        [Parameter(Mandatory = $true)][string]$TraceDir,
+        [Parameter(Mandatory = $true)][string]$StateFilePath,
+        [string]$SweptBy
+    )
+
+    # Розрізняємо "маркера ще не існувало" (безпечно замітати) від "файл
+    # існує, але нечитабельний/пошкоджений" (fail-closed: пропустити, а НЕ
+    # повторити sweep) — обидва Read-BRAVOLegacySweepState повертає як
+    # $null, тому існування файлу перевіряємо окремо.
+    $stateFileExisted = [IO.File]::Exists($StateFilePath)
+    $state = Read-BRAVOLegacySweepState -Path $StateFilePath
+    if ($null -ne $state) {
+        Write-Log "Первинна очистка legacy-артефактів вже виконана $($state.sweptAt) — пропущено." -Level "DEBUG"
+        return
+    }
+    if ($stateFileExisted) {
+        Write-Log "Стан-маркер первинної очистки пошкоджений/нечитабельний — sweep пропущено (fail-closed). Для повторного запуску видаліть вручну: $StateFilePath" -Level "WARNING"
+        return
+    }
+    Write-Log "=== ПЕРВИННА ОЧИСТКА LEGACY-АРТЕФАКТІВ (одноразово) ===" -Level "INFO"
+    $removed = 0
+    try {
+        $legacyFiles = @(Get-BRAVOFiles -Path $LogDir | Where-Object {
+            $_.Name -like 'script_log_*.txt' -or $_.Name -like 'ARCHIV_LIMS_*.log'
+        })
+        foreach ($f in $legacyFiles) {
+            try {
+                Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
+                $removed++
+            } catch {
+                Write-Log "Legacy-очистка: не вдалося видалити $($f.Name): $($_.Exception.Message)" -Level "WARNING"
+            }
+        }
+        $legacyDateDirs = @(Get-BRAVODirectories -Path $TraceDir | Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}$' })
+        foreach ($d in $legacyDateDirs) {
+            $isEmpty = @((New-Object System.IO.DirectoryInfo($d.FullName)).EnumerateFileSystemInfos()).Count -eq 0
+            if (-not $isEmpty) {
+                Write-Log "Legacy-очистка: непорожній каталог-дата $($d.FullName) залишено для звичайної age-gated архівації." -Level "INFO"
+                continue
+            }
+            try {
+                (New-Object System.IO.DirectoryInfo($d.FullName)).Delete()
+                $removed++
+            } catch {
+                Write-Log "Legacy-очистка: не вдалося видалити $($d.FullName): $($_.Exception.Message)" -Level "WARNING"
+            }
+        }
+        Write-BRAVOLegacySweepState -Path $StateFilePath -SweptBy $SweptBy | Out-Null
+        Write-Log "Первинна очистка завершена: видалено $removed об'єкт(ів)." -Level "SUCCESS"
+    } catch {
+        Write-Log "Первинна очистка legacy-артефактів не завершена: $($_.Exception.Message) — маркер НЕ записано, повтор наступним прогоном." -Level "WARNING"
+    }
+}
+
+if ($BravoMaintenanceEnabled) {
+    Invoke-BRAVOLegacySweep -LogDir $LOG_DIR -TraceDir $TRACE_DIR `
+        -StateFilePath (Get-BRAVOLegacySweepStatePath) -SweptBy $script:ScriptVersion
+}
+
 # ===== TRACE: ДОБОВИЙ АРХІВ І SFTP =====
 # Unnumbered операція ПІСЛЯ відновлення служб (Total=8 незмінний, як
 # cleanup/archive/shutdown нижче): архівація і мережева передача не мають
@@ -8630,6 +8957,7 @@ if (-not $BravoMaintenanceEnabled) {
             -IntegrityTimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
             -Session $traceSftpSession `
             -RemoteDirectory $traceSftpRemoteDirectory `
+            -RawSourceRetentionDays $RAW_SOURCE_GRACE_DAYS `
             -Logger $bravoLogRotationLogger
         if ([int]$traceMaintenanceResult.Errors -gt 0) {
             $script:criticalErrorOccurred = $true
@@ -8654,6 +8982,7 @@ if (-not $BravoMaintenanceEnabled) {
                 -ArchiveNamePrefix 'exchangAPI' `
                 -BacklogGroupBy 'ByLastWriteTime' `
                 -BacklogFileFilter '*.log' `
+                -RawSourceRetentionDays $RAW_SOURCE_GRACE_DAYS `
                 -Logger $bravoLogRotationLogger
             if ([int]$exchangeArchiveMaintenanceResult.Errors -gt 0) {
                 $script:criticalErrorOccurred = $true
@@ -8739,6 +9068,48 @@ function Get-BRAVOExpiredLogDateDirectories {
         })
 }
 
+# Порожні каталоги-дати — незалежно від віку: нема чого втрачати, тому
+# без ARCHIVE_RETENTION_DAYS-gate. Регресія (2026-09, real-server LIMS-TOP):
+# поточна ("5.2.0") модель Trace/exchangAPI/BravoWeb пише лише пласкі
+# timestamped-файли — жоден чинний код більше не пише у каталоги-дати
+# YYYY-MM-DD, тож щойно така тека спорожніла (увесь вміст архівовано),
+# вона гарантовано вже НЕ отримає нового вмісту. Проте
+# Get-BRAVOExpiredLogDateDirectories все одно чекала би повні
+# ARCHIVE_RETENTION_DAYS (14) днів, перш ніж її прибрати — попри
+# відсутність будь-яких даних, які можна втратити. Непорожні
+# каталоги-дати лишаються завданням наявного age-gated Compress-OldData-
+# шляху (Get-BRAVOExpiredLogDateDirectories вище) без змін.
+function Get-BRAVOEmptyLogDateDirectories {
+    param([string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return @()
+    }
+    return @(Get-BRAVODirectories -Path $Path |
+        Where-Object {
+            $_.Name -match '^\d{4}-\d{2}-\d{2}$' -and
+            @((New-Object System.IO.DirectoryInfo($_.FullName)).EnumerateFileSystemInfos()).Count -eq 0
+        })
+}
+
+function Remove-BRAVOEmptyLogDateDirectories {
+    # Best-effort негайне видалення порожніх каталогів-дат. Некритичний
+    # ефект — провал видалення одного каталогу не зупиняє обробку решти
+    # й не встановлює $script:criticalErrorOccurred (чиста зручність
+    # очищення диска, не data-integrity операція).
+    param([string]$Path, [string]$Label)
+
+    $emptyDirs = @(Get-BRAVOEmptyLogDateDirectories -Path $Path)
+    foreach ($emptyDir in $emptyDirs) {
+        try {
+            (New-Object System.IO.DirectoryInfo($emptyDir.FullName)).Delete()
+            Write-Log "Порожній legacy-каталог ${Label} видалено: $($emptyDir.FullName)" -Level "INFO"
+        } catch {
+            Write-Log "ПОМИЛКА видалення порожнього каталогу ${Label} $($emptyDir.FullName): $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+}
+
 # Перевірка даних основного компонента BRAVO
 $traceOldDirs = @()
 $traceOldLogs = @()
@@ -8750,6 +9121,7 @@ $traceOldLogs = @()
 # значення.
 $restoreArchiveDeleteCandidateGroups = @()
 if ($BravoMaintenanceEnabled) {
+    Remove-BRAVOEmptyLogDateDirectories -Path $TRACE_DIR -Label 'Trace'
     $traceOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $TRACE_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
     $traceOldLogs = @(Get-BRAVOFiles -Path $LOG_DIR |
         Where-Object {
@@ -8782,6 +9154,7 @@ if ($BravoMaintenanceEnabled) {
 # Перевірка каталогів-дат exchangAPI лише для активного компонента
 $exchangAPIOldDirs = @()
 if ($exchangAPIServiceEnabled) {
+    Remove-BRAVOEmptyLogDateDirectories -Path $EXCHANGE_LOG_DIR -Label 'exchangAPI'
     $exchangAPIOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $EXCHANGE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 }
 
@@ -8791,6 +9164,8 @@ if ($exchangAPIServiceEnabled) {
 $apacheOldDirs = @()
 $bravoWebAppOldDirs = @()
 if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
+    Remove-BRAVOEmptyLogDateDirectories -Path $APACHE_LOG_DIR -Label 'Apache'
+    Remove-BRAVOEmptyLogDateDirectories -Path $BRAVOWEB_APP_LOG_DIR -Label 'BravoWeb-App'
     $apacheOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $APACHE_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
     $bravoWebAppOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_APP_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 }
@@ -8799,6 +9174,7 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 # розділені). Без окремого рядка вони лишилися б поза будь-яким retention.
 $bravoWebLegacyOldDirs = @()
 if ($BravoWebLegacyDataEnabled) {
+    Remove-BRAVOEmptyLogDateDirectories -Path $BRAVOWEB_LOG_DIR -Label 'BravoWeb-Legacy'
     $bravoWebLegacyOldDirs = @(Get-BRAVOExpiredLogDateDirectories -Path $BRAVOWEB_LOG_DIR -RetentionDays $ARCHIVE_RETENTION_DAYS)
 }
 
@@ -9297,6 +9673,50 @@ Write-BRAVOResultField -Label 'Помилок' -Value ([string]$script:BRAVOMain
 # прогону. Старий '-'-роздільник і довший підпис лишаються контрактом
 # Archive/Health/інших — тут навмисно окрема функція, не той самий виклик.
 Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE
+
+# Вивантаження ВЛАСНОГО повного логу прогону (+ знімок range_id_log.json)
+# на SFTP — opt-in (componentSettings.SFTP.MaintenanceLogUploadEnabled,
+# дефолт $false). Розміщено ПІСЛЯ резолву $script:maintenanceRuntimeExitCode
+# і фінального підсумку: провал передачі структурно не може змінити
+# результат прогону (другорядний/телеметричний ефект). Trace-сесія на цей
+# момент давно закрита, тому відкривається окрема коротко-живуча сесія.
+if ([bool]$componentSettings.SFTP.MaintenanceLogUploadEnabled -and
+    [bool]$storageEffective.SFTP.Enabled) {
+    $ownLogUploadSession = $null
+    try {
+        $ownLogUploadSession = Connect-BRAVOOwnLogSftpSession
+        if ($null -ne $ownLogUploadSession) {
+            $ownLogRemoteDirectory = [string]$sftpDirectories.MaintenanceLog
+            Send-BRAVOOwnLogFile `
+                -Session $ownLogUploadSession `
+                -LocalLogPath $LOG_FILE `
+                -RemoteDirectory $ownLogRemoteDirectory `
+                -Logger $null
+            # range_id_log.json пише служба BRAVO (toolkit його лише читає) —
+            # строго read-only знімок; локальне ім'я константне, тому remote-
+            # ім'я суфіксується run-id, щоб прогони не перезаписували один
+            # одного. Відсутній файл — тихий no-op (Send-BRAVOOwnLogFile).
+            $ownRangeIdLogPath = Get-BRAVOSystemRangeIdLogPath
+            if (-not [string]::IsNullOrWhiteSpace([string]$ownRangeIdLogPath)) {
+                Send-BRAVOOwnLogFile `
+                    -Session $ownLogUploadSession `
+                    -LocalLogPath ([string]$ownRangeIdLogPath) `
+                    -RemoteDirectory $ownLogRemoteDirectory `
+                    -RemoteFileName ("range_id_log_{0}.json" -f $maintenanceLogRunId) `
+                    -Logger $null
+            }
+        }
+    } catch {
+        Write-Log "Власний лог: вивантаження на SFTP не вдалося: $($_.Exception.Message)" -Level "WARNING"
+    } finally {
+        if ($null -ne $ownLogUploadSession) {
+            try { $ownLogUploadSession.Dispose() } catch {
+                # Best-effort закриття сесії — помилка Dispose тут уже ні на
+                # що не впливає (лог передано або WARNING вже записано).
+            }
+        }
+    }
+}
 } finally {
     Exit-BRAVOMaintenanceOperationLock
 }

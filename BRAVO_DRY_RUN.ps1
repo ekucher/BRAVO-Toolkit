@@ -1648,6 +1648,7 @@ try {
             "логи старші $($maintenanceSettings.Retention.LogDays) дн.; " +
             "failed-архіви старші $($maintenanceSettings.Retention.FailedArchiveDays) дн.; " +
             "стиснуті .mdz: $(if ([bool]$maintenanceSettings.Retention.CompressedLogDeletionEnabled) { "видалення старших $($maintenanceSettings.Retention.CompressedLogDays) дн. УВІМКНЕНО" } else { 'автоматичне видалення ВИМКНЕНО (CompressedLogDeletionEnabled=$false)' }); " +
+            "сирі Trace/exchangAPI-джерела: $(if ([int]$maintenanceSettings.Retention.RawSourceGraceDays -gt 0) { "grace-період $($maintenanceSettings.Retention.RawSourceGraceDays) дн. понад LastWriteTime" } else { 'без grace-періоду (видалення одразу після успішної архівації, поточна поведінка)' }); " +
             "нічого не видалено"
         )
         # Trace-модель 5.2.0: план добової MDZ-обробки — суто read-only

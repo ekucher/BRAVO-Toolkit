@@ -247,7 +247,12 @@ $script:notificationRequestTimeoutSeconds = if ($null -ne $bravoSettings.Notific
 $sftpCredentialRequired = [bool]$storageEffective.SFTP.Enabled -and (
     $SyncBAZA -or
     [bool]$storageEffective.SFTP.ArchiveUpload -or
-    [bool]$bazaSyncEffective.ScheduledSftpSyncRequired
+    [bool]$bazaSyncEffective.ScheduledSftpSyncRequired -or
+    # Log-lifecycle P1: вивантаження власного логу — самостійна причина
+    # мати SFTP-сесію. Без цього терму ArchiveLogUploadEnabled=$true при
+    # ArchiveUpload=$false (і без scheduled sync) лишав $script:sftpUrl
+    # порожнім, і фінальний upload-блок мовчки пропускався назавжди.
+    [bool]$componentSettings.SFTP.ArchiveLogUploadEnabled
 )
 $smbCredentialRequired = -not $SyncBAZA -and
     [bool]$storageEffective.SMB.ArchiveCopy
@@ -8027,6 +8032,44 @@ function Main {
         }
     }
     Write-BRAVOResultFooter -LogFile $script:logFile
+
+    # Вивантаження ВЛАСНОГО повного логу прогону на SFTP — opt-in
+    # (componentSettings.SFTP.ArchiveLogUploadEnabled, дефолт $false).
+    # Свідомо ПІСЛЯ Write-BRAVOResultFooter, а не в $uploadQueue-циклі:
+    # Main() дописує лог після того циклу, і лише тут файл повний.
+    # Незалежний try/catch, результат НЕ додається у
+    # $transferResults.ArchiveUpload — провал передачі власного логу
+    # ніколи не переводить прогін у Failed і не змінює exit code
+    # (другорядний/телеметричний ефект).
+    if ([bool]$componentSettings.SFTP.ArchiveLogUploadEnabled -and
+        [bool]$storageEffective.SFTP.Enabled) {
+        try {
+            if ([string]::IsNullOrWhiteSpace($sftpUrl) -or
+                [string]::IsNullOrWhiteSpace($sftpHostKey) -or
+                [string]::IsNullOrWhiteSpace($winSCPPath) -or
+                -not (Test-Path -LiteralPath $script:logFile -PathType Leaf)) {
+                Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: SFTP-конфігурація неповна або лог відсутній — вивантаження пропущено" -Level "WARNING"
+            } else {
+                $ownLogRemoteDirectory = [string]$sftpDirectories.ArchivLog
+                Initialize-BRAVOSFTPRemoteDirectories `
+                    -WinSCPPath $winSCPPath `
+                    -RepositorySFTPUrl $sftpUrl `
+                    -HostKey $sftpHostKey `
+                    -RemoteDirectories @($ownLogRemoteDirectory)
+                $ownLogUploaded = Send-FileViaWinSCP `
+                    -WinSCPPath $winSCPPath `
+                    -RepositorySFTPUrl $sftpUrl `
+                    -HostKey $sftpHostKey `
+                    -LocalFilePath $script:logFile `
+                    -RemoteDirectory $ownLogRemoteDirectory
+                if (-not $ownLogUploaded) {
+                    Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: передачу не завершено (деталі вище) — результат прогону не змінюється" -Level "WARNING"
+                }
+            }
+        } catch {
+            Write-BRAVOLog -Component 'SFTP' -Message "Власний лог: вивантаження не вдалося: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
 }
 
 # Запуск головної функції

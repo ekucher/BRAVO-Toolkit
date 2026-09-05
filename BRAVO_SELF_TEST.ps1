@@ -5112,10 +5112,46 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             -not [string]::IsNullOrWhiteSpace($sftpMkdirFunctionText) -and
             $sftpMkdirFunctionText.Contains('option batch continue') -and
             $sftpMkdirFunctionText.Contains('mkdir') -and
-            $sftpMkdirCallCount -eq 2
+            # 3 точки виклику: автоматичний потік завантаження/синхронізації,
+            # ручна -SyncBAZA і best-effort вивантаження власного логу
+            # прогону наприкінці Main (log-lifecycle P1, sftpDirectories.
+            # ArchivLog).
+            $sftpMkdirCallCount -eq 3
         ) `
         -Name "Console/ArchiveEnsuresSFTPDirectoriesBeforeTransfer" `
-        -Failure "Initialize-BRAVOSFTPRemoteDirectories (mkdir з option batch continue) має існувати й викликатись і в автоматичному потоці завантаження/синхронізації, і в ручній -SyncBAZA — інакше відсутні каталоги на SFTP і далі валять кожну передачу"
+        -Failure "Initialize-BRAVOSFTPRemoteDirectories (mkdir з option batch continue) має існувати й викликатись в автоматичному потоці завантаження/синхронізації, у ручній -SyncBAZA і перед вивантаженням власного логу — інакше відсутні каталоги на SFTP і далі валять кожну передачу"
+
+    # Log-lifecycle P1 (code-review знахідка): вивантаження власного логу —
+    # самостійна причина мати SFTP-креденшели. Без цього терму
+    # ArchiveLogUploadEnabled=$true при ArchiveUpload=$false (і без
+    # scheduled sync) лишав $script:sftpUrl порожнім, і фінальний
+    # upload-блок мовчки пропускався назавжди (мертвий тумблер).
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText.Contains('[bool]$componentSettings.SFTP.ArchiveLogUploadEnabled') -and
+            ($archiveScriptText -match '(?s)\$sftpCredentialRequired = .{0,700}?ArchiveLogUploadEnabled')
+        ) `
+        -Name "Console/ArchiveOwnLogUploadAloneRequiresSftpCredentials" `
+        -Failure "ArchiveLogUploadEnabled має входити термом у `$sftpCredentialRequired — інакше тумблер мертвий без увімкненого ArchiveUpload/scheduled sync"
+
+    # Log-lifecycle P1: контракт "провал вивантаження власного логу
+    # структурно не може змінити результат прогону" тримається на ПОРЯДКУ
+    # коду — upload-блок Maintenance мусить стояти ПІСЛЯ резолву
+    # $script:maintenanceRuntimeExitCode і фінального футера. Пін ловить
+    # випадкове перенесення блоку вище під час майбутніх рефакторингів.
+    $maintenanceOwnLogUploadIndex = $maintenanceScriptText.IndexOf('$componentSettings.SFTP.MaintenanceLogUploadEnabled')
+    $maintenanceExitResolveIndex = $maintenanceScriptText.IndexOf('Get-BRAVOMaintenanceResolvedExitCode')
+    $maintenanceSummaryFooterIndex = $maintenanceScriptText.IndexOf('Write-BRAVOFinalSummaryFooter -LogFile $LOG_FILE')
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceOwnLogUploadIndex -ge 0 -and
+            $maintenanceExitResolveIndex -ge 0 -and
+            $maintenanceSummaryFooterIndex -ge 0 -and
+            $maintenanceOwnLogUploadIndex -gt $maintenanceExitResolveIndex -and
+            $maintenanceOwnLogUploadIndex -gt $maintenanceSummaryFooterIndex
+        ) `
+        -Name "Console/MaintenanceOwnLogUploadRunsAfterExitCodeResolution" `
+        -Failure "вивантаження власного логу Maintenance мусить стояти після резолву exit code і фінального футера — інакше провал телеметрії може змінити результат прогону"
 
     # $difference.Local з WinSCP CompareDirectories — це RemoteFileInfo
     # навіть для локальної сторони порівняння, а не System.IO.FileInfo:
