@@ -509,6 +509,14 @@ function ConvertTo-BRAVOComparableVersion {
         }
     }
 
+    # Канонічний контракт пакета — рівно X.Y.Z (три числові
+    # dot-ідентифікатори без leading zero). Сам [version] прийняв би і
+    # "5.3", і "5.3.0.1", і "05.3.0" — а чотирикомпонентний запис у
+    # state зробив би коректний "5.3.0" «відкатом» (Revision -1 проти 1)
+    # замість malformed fail-closed шляху (review PR #135, друга хвиля).
+    if ($baseText -cnotmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$') {
+        return $null
+    }
     $base = $null
     if (-not [version]::TryParse($baseText, [ref]$base)) { return $null }
 

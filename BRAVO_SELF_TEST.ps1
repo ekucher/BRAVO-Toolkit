@@ -1325,7 +1325,11 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     # leading zero) раніше приймався і пошкоджував state JSON.
     $semverInvalidTexts = @(
         '5.3.0-', '5.3.0-rc..1', ('5.3.0-rc' + '"' + 'oops'), '5.3.0-rc_1',
-        '5.3.0-rc.01', '5.3.0- rc.1', '5.3.0+', '5.3.0+bad_meta', '5.3.0+build..7'
+        '5.3.0-rc.01', '5.3.0- rc.1', '5.3.0+', '5.3.0+bad_meta', '5.3.0+build..7',
+        # Core суворо X.Y.Z: [version] сам прийняв би 2-/4-компонентні
+        # форми і leading zero, а 4-компонентний high-water mark блокував
+        # би коректний X.Y.Z як «відкат» (review PR #135, друга хвиля).
+        '5.3', '5.3.0.1', '05.3.0', '5.03.0', '5.3.00', '5..3.0'
     )
     $semverInvalidAccepted = @($semverInvalidTexts | Where-Object {
         $null -ne (ConvertTo-BRAVOComparableVersion -Text $_)
@@ -1333,7 +1337,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     $semverValidTexts = @(
         '5.3.0-rc.1', '5.3.0-dev.12', '5.3.0-alpha-beta', '5.3.0-rc.0',
         '5.3.0-rc.999999999999999999999999999999999',
-        '5.3.0+build.7', '5.3.0-rc.1+build-7.x'
+        '5.3.0+build.7', '5.3.0-rc.1+build-7.x', '0.9.0', '10.20.30'
     )
     $semverValidRejected = @($semverValidTexts | Where-Object {
         $null -eq (ConvertTo-BRAVOComparableVersion -Text $_)
@@ -1372,6 +1376,19 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         ) `
         -Name "VersionState/MalformedPrereleaseFailsClosed" `
         -Failure 'malformed prerelease-суфікс (5.3.0-rc"oops) має блокувати в Enforce, попереджати у Warn і поважати BRAVO_ALLOW_DOWNGRADE=1 — не прийматися і не псувати state'
+
+    # Не-канонічний core (4 компоненти) — malformed fail-closed шлях, а
+    # НЕ запис у state: інакше '5.3.0.1' став би high-water mark і
+    # коректний '5.3.0' блокувався б як «відкат».
+    $fourComponentDeployed = Test-BRAVODowngradeScenario -Deployed '5.3.0.1' -Recorded '5.3.0'
+    Test-BRAVOCondition `
+        -Condition (
+            -not $fourComponentDeployed.IsValid -and
+            $fourComponentDeployed.ShouldBlock -and
+            $null -eq $fourComponentDeployed.DeployedVersion
+        ) `
+        -Name "VersionState/FourComponentCoreTakesMalformedPath" `
+        -Failure "4-компонентна packageVersion (5.3.0.1) має йти malformed fail-closed шляхом, а не порівнюватися чи фіксуватися як версія"
 
     # State пишеться штатним ConvertTo-Json: жоден вміст полів (включно з
     # ворожим sourceCommit) не робить його непарсибельним, а контрактні
