@@ -78,8 +78,14 @@ Write-Host "packageVersion: $packageVersion"
 Write-Host "releaseChannel: $releaseChannel"
 Write-Host ""
 
-$stablePattern = '^\d+\.\d+\.\d+$'
-$prereleasePattern = '^\d+\.\d+\.\d+-(dev|rc)\.\d+$'
+# Узгоджено з ConvertTo-BRAVOComparableVersion (BRAVO_RUNTIME_GUARD.ps1):
+# без leading zero і в core, і в prerelease-лічильнику. Інакше PR CI
+# схвалював би версію на кшталт 5.3.0-rc.01, яку Enforce-guard кожного
+# entrypoint відкидає як malformed (review PR #135, третя хвиля) — і
+# непрацездатний пакет ловився б лише на пізнішому tag-build.
+$strictNumberPattern = '(0|[1-9][0-9]*)'
+$stablePattern = "^$strictNumberPattern\.$strictNumberPattern\.$strictNumberPattern$"
+$prereleasePattern = "^$strictNumberPattern\.$strictNumberPattern\.$strictNumberPattern-(dev|rc)\.$strictNumberPattern$"
 
 if ($isStableBranch) {
     if ($packageVersion -notmatch $stablePattern) {
