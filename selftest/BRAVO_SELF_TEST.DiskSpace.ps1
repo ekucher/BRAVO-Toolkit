@@ -395,3 +395,50 @@ Test-BRAVOCondition `
     ) `
     -Name 'DiskSpace/S62-NoDiskSpacePolicyModeIntroduced' `
     -Failure "§62: DiskSpacePolicyMode (Strict/OperationAware перемикач) не повинен вводитись у 5.2.3 — OperationAware стає єдиною canonical поведінкою"
+
+# ============================================================
+# S63 — production-шлях health-only БЕЗ інжектованих -Drives
+# ============================================================
+# Регресія реального дефекту, знайденого acceptance rc.3 на LIMS-TOP
+# (13.09.2026): у health-only гілці Test-BRAVODiskSpaceEntity capacity
+# читався викликом з безумовним -Drives @(). Оскільки
+# Get-BRAVODiskSpaceCapacityObservation трактує ЗВ'ЯЗАНИЙ -Drives як
+# інжектований список, порожній масив означав "такого тому немає" ->
+# CapacityState=Unknown для КОЖНОГО локального тому на реальному сервері.
+# Наслідки в бою: порожні WARNING-рядки ("C:\: "), втрачене зведення
+# вільного місця ("запас: немає даних"), exit 10 SuccessWithWarnings і
+# сповіщення в ALERTS замість GENERAL на цілком успішному прогоні.
+#
+# Жоден із S1-S62 цього не ловив: усі вони передають -Drives, тобто
+# production-гілка System.IO.DriveInfo не виконувалась ніколи.
+# Тому тест НАВМИСНО викликає Test-BRAVODiskSpaceEntity без -Drives.
+$s63Root = [IO.Path]::GetPathRoot([IO.Path]::GetTempPath())
+$s63 = Test-BRAVODiskSpaceEntity `
+    -EntitySpec ([pscustomobject]@{ DisplayPath = $s63Root; RequiresAccess = $false; RequiresFreeSpace = $false; MinimumFreeSpaceGB = 0 }) `
+    -ExcludedDrives @()
+Test-BRAVOCondition `
+    -Condition (
+        [string]$s63.Result.CapacityState -eq 'Known' -and
+        $null -ne $s63.Result.AvailableGB -and
+        $null -ne $s63.Result.TotalGB -and
+        [string]$s63.Result.Status -eq 'Success' -and
+        [string]::IsNullOrWhiteSpace([string]$s63.Result.Reason)
+    ) `
+    -Name 'DiskSpace/S63-HealthOnlyReadsRealVolumeWithoutInjectedDrives' `
+    -Failure ("health-only том без інжектованих -Drives має читатися реальним DriveInfo: " +
+        "очікувалось CapacityState=Known + AvailableGB/TotalGB заповнені + Status=Success без Reason, " +
+        "отримано CapacityState=$($s63.Result.CapacityState) AvailableGB=$($s63.Result.AvailableGB) " +
+        "TotalGB=$($s63.Result.TotalGB) Status=$($s63.Result.Status) Reason=$($s63.Result.Reason)")
+
+# S64 — warning-повідомлення ніколи не буває порожнім
+$s64 = Invoke-BRAVODiskSpaceClassifier `
+    -EntitySpecs @([pscustomobject]@{ DisplayPath = 'sftp://host/path'; StorageKind = 'SFTP'; CapacityKey = 'sftp://host'; RequiresAccess = $false; RequiresFreeSpace = $true; RequirementGranularity = 'Entity'; RequiredGB = 1; AccessStatusOverride = 'Available' }) `
+    -MinimumFreeSpaceGB 20 -RequirementPolicy 'ArchiveNotPeakSafe' -ExcludedDrives @()
+Test-BRAVOCondition `
+    -Condition (
+        @($s64.Warnings).Count -gt 0 -and
+        -not (@($s64.Warnings) | Where-Object { ([string]$_).TrimEnd() -match ':$' })
+    ) `
+    -Name 'DiskSpace/S64-WarningMessageNeverEndsWithEmptyReason' `
+    -Failure ("warning-повідомлення не має закінчуватись двокрапкою без причини (отримано: " +
+        ((@($s64.Warnings) | ForEach-Object { [string]$_ }) -join ' | ') + ')')

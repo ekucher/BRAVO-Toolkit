@@ -565,16 +565,33 @@ function Test-BRAVODiskSpaceEntity {
         $capacityOverride = if ($EntitySpec.PSObject.Properties.Match('CapacityStateOverride').Count -gt 0) { [string]$EntitySpec.CapacityStateOverride } else { $null }
         $availableOverride = if ($EntitySpec.PSObject.Properties.Match('AvailableGBOverride').Count -gt 0) { $EntitySpec.AvailableGBOverride } else { $null }
 
+        $totalOverride = if ($EntitySpec.PSObject.Properties.Match('TotalGBOverride').Count -gt 0) { $EntitySpec.TotalGBOverride } else { $null }
+
         $healthAvailableGB = $null
+        $healthTotalGB = $null
         $healthCapacityState = 'Unknown'
         if (-not [string]::IsNullOrWhiteSpace($capacityOverride)) {
             $healthCapacityState = $capacityOverride
             $healthAvailableGB = $availableOverride
+            $healthTotalGB = $totalOverride
         } elseif ($identity.StorageKind -eq 'LocalVolume' -and -not [string]::IsNullOrWhiteSpace($identity.Drive)) {
-            $observation = Get-BRAVODiskSpaceCapacityObservation -StorageKind 'LocalVolume' -CapacityKey $identity.CapacityKey `
-                -Drive $identity.Drive -Observations @() -Drives $(if ($PSBoundParameters.ContainsKey('Drives')) { $Drives } else { @() })
+            # -Drives передається ЛИШЕ якщо його зв'язав виклик-сайт. Раніше
+            # тут безумовно йшло -Drives @(), а Get-BRAVODiskSpaceCapacityObservation
+            # трактує будь-який зв'язаний -Drives як інжектований список дисків:
+            # порожній масив -> том не знайдено -> CapacityState=Unknown на
+            # КОЖНОМУ реальному сервері. Self-test цього не ловив, бо завжди
+            # інжектує -Drives (production-гілка DriveInfo не виконувалась).
+            $healthObservationParams = @{
+                StorageKind  = 'LocalVolume'
+                CapacityKey  = $identity.CapacityKey
+                Drive        = $identity.Drive
+                Observations = @()
+            }
+            if ($PSBoundParameters.ContainsKey('Drives')) { $healthObservationParams.Drives = $Drives }
+            $observation = Get-BRAVODiskSpaceCapacityObservation @healthObservationParams
             $healthCapacityState = $observation.CapacityState
             $healthAvailableGB = $observation.AvailableGB
+            $healthTotalGB = $observation.TotalGB
         }
 
         $minimumGB = if ($EntitySpec.PSObject.Properties.Match('MinimumFreeSpaceGB').Count -gt 0) { [System.Nullable[double]]$EntitySpec.MinimumFreeSpaceGB } else { $null }
@@ -590,7 +607,10 @@ function Test-BRAVODiskSpaceEntity {
             $healthStatus = 'Warning'
             $healthReason = 'BelowHealthFloorNoFreeSpaceRequirement'
         } elseif ($healthCapacityState -ne 'Known') {
+            # Reason обов'язковий: без нього warning-повідомлення виходило
+            # порожнім ("C:\: ") і в консолі, і в журналі.
             $healthStatus = 'Warning'
+            $healthReason = 'CapacityUndeterminedHealthOnly'
         }
 
         $suppressed = $false
@@ -603,7 +623,7 @@ function Test-BRAVODiskSpaceEntity {
             -CapacityKey $identity.CapacityKey -Drive $identity.Drive -DriveType $identity.DriveType `
             -Roles $roles -Components $components -Participates $participates `
             -RequiresAccess $requiresAccess -RequiresFreeSpace $requiresFreeSpace -AccessStatus $accessStatus `
-            -CapacityState $healthCapacityState -AvailableGB $healthAvailableGB -MinimumGB $minimumGB `
+            -CapacityState $healthCapacityState -AvailableGB $healthAvailableGB -TotalGB $healthTotalGB -MinimumGB $minimumGB `
             -Status $healthStatus -Blocks $false -Reason $healthReason -Flags $flags.ToArray()
         return @{ Result = $result; Pending = $false; EntitySpec = $EntitySpec }
     }
@@ -882,7 +902,14 @@ function Group-BRAVODiskSpaceMessagesByCapacityKey {
     foreach ($key in $groups.Keys) {
         $group = $groups[$key]
         $pathsText = ($group.Paths.ToArray() | Select-Object -Unique) -join ', '
-        [void]$messages.Add("${pathsText}: $($group.Reason)")
+        $reasonText = [string]$group.Reason
+        if ([string]::IsNullOrWhiteSpace($reasonText)) {
+            # Захист від повідомлення-заглушки "C:\: " — рядок без причини
+            # нічого не пояснює операторові.
+            [void]$messages.Add("${pathsText}: Unspecified")
+        } else {
+            [void]$messages.Add("${pathsText}: $reasonText")
+        }
     }
     return $messages.ToArray()
 }
