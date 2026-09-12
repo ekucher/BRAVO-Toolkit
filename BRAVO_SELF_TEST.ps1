@@ -12789,7 +12789,17 @@ function Get-BRAVOMaintenanceSummaryResult {
         param(
             [bool]$BreakLimsRootViaFakeService,
             [bool]$MaintenanceEnabled = $true,
-            [bool]$RecoveryEnabled = $true
+            [bool]$RecoveryEnabled = $true,
+            # Site-overrides для фікстури пишуться у BRAVO.local.config поряд
+            # з нею, а НЕ текстовою мутацією BRAVO.config: форма конфігурації
+            # на реальному сервері відрізняється від комплектної (у файлі два
+            # блоки "SFTP = @{", інші відступи, у конфігах 5.2.1 і старіших
+            # ключа Enabled немає взагалі), і regex-заміна там МОВЧКИ не
+            # спрацьовує — тест падав на LIMS-TOP при зеленому CI
+            # (acceptance rc.3, 13.09.2026). Оверлей читається ДО виконання
+            # BRAVO.config і застосовується у фазі 1, тобто ДО деривацій —
+            # саме те, що ці тести й перевіряють.
+            [hashtable]$LocalOverrides
         )
         $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SCHED_FIXTURE_' + [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($fixtureRoot)
@@ -12822,6 +12832,26 @@ function Get-BRAVOMaintenanceSummaryResult {
             $fixtureConfigText, '(?s)(Recovery = @\{\r?\n\s*Enabled = )[^\r\n]+', "`$1$fixtureRecoveryFlag", 1)
 
         [IO.File]::WriteAllText($fixtureConfigPath, $fixtureConfigText, (New-Object Text.UTF8Encoding($false)))
+
+        if ($null -ne $LocalOverrides -and $LocalOverrides.Count -gt 0) {
+            $fixtureLocalLines = New-Object System.Collections.Generic.List[string]
+            [void]$fixtureLocalLines.Add('@{')
+            foreach ($fixtureOverrideKey in @($LocalOverrides.Keys | Sort-Object)) {
+                $fixtureOverrideValue = $LocalOverrides[$fixtureOverrideKey]
+                if ($fixtureOverrideValue -isnot [bool]) {
+                    throw ("New-BRAVOSelfTestSchedulerFixtureConfig: -LocalOverrides підтримує лише булеві значення " +
+                        "(ключ '$fixtureOverrideKey' має тип $($fixtureOverrideValue.GetType().Name))")
+                }
+                $fixtureOverrideLiteral = if ($fixtureOverrideValue) { '$true' } else { '$false' }
+                [void]$fixtureLocalLines.Add(("    '{0}' = {1}" -f $fixtureOverrideKey, $fixtureOverrideLiteral))
+            }
+            [void]$fixtureLocalLines.Add('}')
+            [IO.File]::WriteAllText(
+                (Join-Path $fixtureRoot 'BRAVO.local.config'),
+                (($fixtureLocalLines.ToArray() -join "`r`n") + "`r`n"),
+                (New-Object Text.UTF8Encoding($false)))
+        }
+
         return [pscustomobject]@{ ConfigPath = $fixtureConfigPath; Root = $fixtureRoot }
     }
     function Invoke-BRAVOSelfTestTaskInstallValidateOnly {
@@ -12954,7 +12984,8 @@ function Get-BRAVOMaintenanceSummaryResult {
     # рівно один раз (лише "вимкнено в конфігурації"), коли ні — рахунок
     # входжень незалежний від кодової сторінки консолі.
     $schedFixtureSftpBaseline = New-BRAVOSelfTestSchedulerFixtureConfig `
-        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
+        -LocalOverrides @{ 'componentSettings.SFTP.Enabled' = $true; 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true }
     $schedResultSftpBaseline = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpBaseline.ConfigPath
     $schedBaselineBazaSyncOccurrences = ([regex]::Matches($schedResultSftpBaseline.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
     Test-BRAVOCondition `
@@ -12966,11 +12997,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' (2 входження: план + підсумок); отримано входжень: $schedBaselineBazaSyncOccurrences, ExitCode=$($schedResultSftpBaseline.ExitCode)"
 
     $schedFixtureSftpDisabled = New-BRAVOSelfTestSchedulerFixtureConfig `
-        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false
-    $schedSftpDisabledConfigText = [IO.File]::ReadAllText($schedFixtureSftpDisabled.ConfigPath, [Text.Encoding]::UTF8)
-    $schedSftpDisabledConfigText = [regex]::Replace(
-        $schedSftpDisabledConfigText, '(?s)(SFTP = @\{\r?\n\s*Enabled = )\$true', '${1}$false', 1)
-    [IO.File]::WriteAllText($schedFixtureSftpDisabled.ConfigPath, $schedSftpDisabledConfigText, (New-Object Text.UTF8Encoding($false)))
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
+        -LocalOverrides @{ 'componentSettings.SFTP.Enabled' = $false; 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true }
     $schedResultSftpDisabled = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpDisabled.ConfigPath
     $schedDisabledBazaSyncOccurrences = ([regex]::Matches($schedResultSftpDisabled.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
     Test-BRAVOCondition `
