@@ -12978,36 +12978,50 @@ function Get-BRAVOMaintenanceSummaryResult {
     # коду для master-вимикача. Асерти навмисно НЕ звіряють локалізований
     # (кириличний) текст статусу з захопленого виводу дочірнього процесу
     # (той самий ризик кодової сторінки, через який сусідні Scheduler/*
-    # тести вище звіряють лише англомовні маркери на кшталт "LIMSRoot"):
-    # ASCII-назва завдання "BRAVO BAZA Synchronization" з'являється двічі
-    # (рядок плану + заголовок підсумку), коли завдання заплановане, і
-    # рівно один раз (лише "вимкнено в конфігурації"), коли ні — рахунок
-    # входжень незалежний від кодової сторінки консолі.
+    # тести вище звіряють лише англомовні маркери на кшталт "LIMSRoot").
+    #
+    # РАХУНОК ВХОДЖЕНЬ НАЗВИ ЗАВДАННЯ ТУТ НЕ ПРАЦЮЄ (acceptance rc.3,
+    # LIMS-TOP, 13.09.2026). Кількість згадок "BRAVO BAZA Synchronization"
+    # залежить від того, чи завдання ВЖЕ зареєстроване в Планувальнику
+    # цієї машини: на чистому раннері CI вимкнене завдання згадується один
+    # раз, а на сервері з установленим комплектом — двічі (рядок плану
+    # "буде вимкнено" + запис у підсумку зі статусом "БУДЕ ВИМКНЕНО"),
+    # бо інсталятор мусить активно вимкнути наявне завдання. Обидві
+    # поведінки коректні; хибним був асерт.
+    #
+    # Тому маркер — розклад, а не кількість згадок: StartAt "00:00" в
+    # усьому BRAVO.config належить рівно BAZASync (решта завдань: 23:00,
+    # 23:55, 00:30). Заплановане завдання друкує свій час, вимкнене — ні,
+    # незалежно від стану Планувальника й кодової сторінки.
     $schedFixtureSftpBaseline = New-BRAVOSelfTestSchedulerFixtureConfig `
         -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
         -LocalOverrides @{ 'componentSettings.SFTP.Enabled' = $true; 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true }
     $schedResultSftpBaseline = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpBaseline.ConfigPath
     $schedBaselineBazaSyncOccurrences = ([regex]::Matches($schedResultSftpBaseline.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
+    $schedBaselineBazaSyncScheduleMarkers = ([regex]::Matches($schedResultSftpBaseline.Output, [regex]::Escape('00:00'))).Count
     Test-BRAVOCondition `
         -Condition (
             $schedResultSftpBaseline.ExitCode -eq 0 -and
-            $schedBaselineBazaSyncOccurrences -eq 2
+            $schedBaselineBazaSyncOccurrences -ge 1 -and
+            $schedBaselineBazaSyncScheduleMarkers -ge 1
         ) `
         -Name 'Scheduler/BazaSyncTaskPlannedWhenSftpEnabled' `
-        -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' (2 входження: план + підсумок); отримано входжень: $schedBaselineBazaSyncOccurrences, ExitCode=$($schedResultSftpBaseline.ExitCode)"
+        -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' з розкладом 00:00; отримано згадок назви: $schedBaselineBazaSyncOccurrences, маркерів розкладу '00:00': $schedBaselineBazaSyncScheduleMarkers, ExitCode=$($schedResultSftpBaseline.ExitCode)"
 
     $schedFixtureSftpDisabled = New-BRAVOSelfTestSchedulerFixtureConfig `
         -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
         -LocalOverrides @{ 'componentSettings.SFTP.Enabled' = $false; 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true }
     $schedResultSftpDisabled = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpDisabled.ConfigPath
     $schedDisabledBazaSyncOccurrences = ([regex]::Matches($schedResultSftpDisabled.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
+    $schedDisabledBazaSyncScheduleMarkers = ([regex]::Matches($schedResultSftpDisabled.Output, [regex]::Escape('00:00'))).Count
     Test-BRAVOCondition `
         -Condition (
             $schedResultSftpDisabled.ExitCode -eq 0 -and
-            $schedDisabledBazaSyncOccurrences -eq 1
+            $schedDisabledBazaSyncOccurrences -ge 1 -and
+            $schedDisabledBazaSyncScheduleMarkers -eq 0
         ) `
         -Name 'Scheduler/BazaSyncTaskSkippedWhenSftpGloballyDisabled' `
-        -Failure "componentSettings.SFTP.Enabled=false має нейтралізувати завдання 'BRAVO BAZA Synchronization' (installer вважає це валідним DISABLED/SKIP станом, ExitCode=0, лише 1 входження назви замість плану+підсумку); отримано входжень: $schedDisabledBazaSyncOccurrences, ExitCode=$($schedResultSftpDisabled.ExitCode)"
+        -Failure "componentSettings.SFTP.Enabled=false має нейтралізувати завдання 'BRAVO BAZA Synchronization' (installer вважає це валідним DISABLED/SKIP станом, ExitCode=0, завдання згадане, але БЕЗ розкладу 00:00); отримано згадок назви: $schedDisabledBazaSyncOccurrences, маркерів розкладу '00:00': $schedDisabledBazaSyncScheduleMarkers, ExitCode=$($schedResultSftpDisabled.ExitCode)"
 
     foreach ($schedFixtureSftpRootToClean in @($schedFixtureSftpBaseline.Root, $schedFixtureSftpDisabled.Root)) {
         if (-not [string]::IsNullOrWhiteSpace([string]$schedFixtureSftpRootToClean) -and
