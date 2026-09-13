@@ -1418,9 +1418,32 @@ function Test-BRAVODataRestoreFreeSpace {
         } catch {
             continue
         }
+        # -ErrorAction SilentlyContinue тут обов'язковий. На недоступному
+        # UNC-хості Test-Path не просто повертає $false: після успішного
+        # резолву імені йде спроба SMB, і провайдер піднімає
+        # "The network path was not found". Під $ErrorActionPreference =
+        # 'Stop' у викликача це ставало ТЕРМІНАЛЬНОЮ помилкою — замість
+        # класифікованої проблеми відновлення падало некатегоризовано.
+        # Спіймано self-test-ом на доменному сервері; CI-раннер помилки не
+        # бачив, бо там неіснуюче ім'я просто не резолвиться.
+        #
+        # Fail-closed збережено: недосяжний шлях = "немає наявного
+        # батьківського каталогу" -> запис у $problems -> Success = $false.
         while (-not [string]::IsNullOrWhiteSpace($probeDirectory) -and
-            -not (Test-Path -LiteralPath $probeDirectory -PathType Container)) {
-            $probeDirectory = Split-Path -Path $probeDirectory -Parent
+            -not (Test-Path -LiteralPath $probeDirectory -PathType Container -ErrorAction SilentlyContinue)) {
+            $parentDirectory = $null
+            try {
+                $parentDirectory = [string](Split-Path -Path $probeDirectory -Parent)
+            } catch {
+                $parentDirectory = ''
+            }
+            if ([string]::Equals($parentDirectory, $probeDirectory, [System.StringComparison]::OrdinalIgnoreCase)) {
+                # Корінь тому або UNC-share: підніматися більше нікуди, і без
+                # цієї перевірки цикл був би нескінченним.
+                $probeDirectory = ''
+                break
+            }
+            $probeDirectory = $parentDirectory
         }
         if ([string]::IsNullOrWhiteSpace($probeDirectory)) {
             $problems += "не знайдено жодного наявного батьківського каталогу для цілі: $($requirement.TargetDirectory)"
@@ -1436,7 +1459,7 @@ function Test-BRAVODataRestoreFreeSpace {
             # провалився частково (файл міг бути створений і залишений
             # порожнім) — інакше скасоване відновлення лишає слід у
             # (потенційно production) probe-каталозі.
-            if (Test-Path -LiteralPath $probeFile -PathType Leaf) {
+            if (Test-Path -LiteralPath $probeFile -PathType Leaf -ErrorAction SilentlyContinue) {
                 try {
                     Remove-Item -LiteralPath $probeFile -Force -ErrorAction Stop
                 } catch {

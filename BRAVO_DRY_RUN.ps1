@@ -602,7 +602,15 @@ function Get-BRAVODryRunVolumeRoot {
     $sourceDirectory = Get-SourceDirectory -Path $Path
     if ([string]::IsNullOrWhiteSpace($sourceDirectory)) { return $null }
     try {
-        return [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($sourceDirectory)).TrimEnd('\')
+        # ToUpperInvariant — та сама нормалізація кореня тому, що в
+        # BRAVO.DiskSpace (CapacityKey). Регістр приходить із джерела як є:
+        # bravo.ini на реальному сервері мав MODEL=d:\LIMS\Model поруч із
+        # BLOG=D:\LIMS\BLOG, і без нормалізації Select-Object -Unique
+        # рахував ОДИН том двічі ("volumes=d:, D:"). Наслідок був не
+        # косметичний: два томи вмикають вимогу diskshadow.exe, якого немає
+        # на клієнтській Windows, і dry-run давав [FAIL] VSS на машині, де
+        # runtime тим часом успішно знімав один Snapshot Set.
+        return [IO.Path]::GetPathRoot([IO.Path]::GetFullPath($sourceDirectory)).TrimEnd('\').ToUpperInvariant()
     } catch {
         return $null
     }

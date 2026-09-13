@@ -344,6 +344,43 @@ function Stop-Process {
             ) `
             -Name "DataRestore/FreeSpacePreflightBlocksAndProbes" `
             -Failure "Test-BRAVODataRestoreFreeSpace має пропускати реалістичну вимогу, блокувати завідомо неможливу (з урахуванням резерву MinimumFreeSpaceGB) і для UNC-цілі лишати нотатку замість перевірки обсягу"
+
+        # Регресія (реальний сервер, 2026-09-14): на доменному хості
+        # Test-Path по недосяжному UNC не повертає $false, а піднімає
+        # "The network path was not found" — після успішного резолву імені
+        # йде спроба SMB. Під $ErrorActionPreference = 'Stop' це вбивало
+        # весь self-test ("Fatal: The network path was not found") і, що
+        # важливіше, зробило б відновлення на тимчасово недоступний UNC
+        # некатегоризованою фатальною помилкою замість класифікованої
+        # проблеми. CI-раннер дефекту не бачив: там ім'я просто не
+        # резолвиться, і Test-Path тихо повертає $false.
+        $uncProbeThrew = $false
+        $uncProbeResult = $null
+        try {
+            $uncProbeResult = & $dataRestoreModule {
+                Test-BRAVODataRestoreFreeSpace `
+                    -Requirements @([pscustomobject]@{ TargetDirectory = '\\\\nas-host\\share\\restore'; RequiredBytes = [long]1024 }) `
+                    -MinimumFreeGigabytes 1
+            }
+        } catch {
+            $uncProbeThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $uncProbeThrew -and
+                $null -ne $uncProbeResult -and
+                -not $uncProbeResult.Success -and
+                @($uncProbeResult.Problems).Count -gt 0
+            ) `
+            -Name "DataRestore/UnreachableUncTargetIsClassifiedNotFatal" `
+            -Failure "недосяжна UNC-ціль має давати класифіковану проблему (Success=false + Problems), а не термінальну помилку"
+        Test-BRAVOCondition `
+            -Condition (
+                $dataRestoreRuntimeTextForTests -match 
+                    '(?m)^\s*-not \(Test-Path -LiteralPath \$probeDirectory -PathType Container -ErrorAction SilentlyContinue\)\)'
+            ) `
+            -Name "DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors" `
+            -Failure "пошук наявного батьківського каталогу у write-probe мусить придушувати помилки провайдера (-ErrorAction SilentlyContinue), інакше недосяжний UNC валить весь виклик"
     } finally {
         if (Test-Path -LiteralPath $freeSpaceTestRoot) {
             Remove-Item -LiteralPath $freeSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
