@@ -72,6 +72,29 @@ function Test-BRAVOCondition {
     }
 }
 
+# Оператор, що читає .log-транскрипт self-test (не лише фінальний
+# підсумок), інакше бачить сирий консольний вивід дочірнього
+# BRAVO_TASKS_INSTALL.ps1/BRAVO_DRY_RUN.ps1 на навмисно "зламаній"
+# fixture-конфігурації — Windows PowerShell 5.1 Start-Transcript фіксує
+# цей вивід у .log НАВІТЬ КОЛИ він коректно перехоплений батьківським
+# скриптом у змінну ($x = & powershell.exe ... 2>&1 | Out-String) для
+# власної (правильної) [PASS]/[FAIL] self-test-оцінки нижче. Без цих
+# банерів рядки на кшталт "[FAIL] Dry-run"/"ПОМИЛКА: ..."/"НЕ ГОТОВО" від
+# дитини виглядають як реальний production-інцидент. Банер нічого не
+# приховує і не пригнічує — сирий вивід дитини лишається повністю видимим
+# між банерами, self-test-оцінка так само видима одразу після.
+function Write-BRAVOSelfTestFixtureBanner {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [switch]$End
+    )
+    if ($End) {
+        Write-Host "<<< FIXTURE-ТЕСТ ЗАВЕРШЕНО ($Label) — self-test-оцінка нижче" -ForegroundColor Cyan
+    } else {
+        Write-Host ">>> НАВМИСНИЙ FIXTURE-ТЕСТ self-test ($Label): дочірній скрипт нижче МОЖЕ вивести [FAIL]/ПОМИЛКА/НЕ ГОТОВО — це очікувано і НЕ є production-інцидентом" -ForegroundColor Cyan
+    }
+}
+
 function New-BRAVOSelfTestRuntimeModule {
     param(
         [Parameter(Mandatory = $true)][string]$SourceText,
@@ -12862,12 +12885,14 @@ function Get-BRAVOMaintenanceSummaryResult {
         # який реально перевіряє production Task Scheduler.
         $previousSchedFixtureErrorActionPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
+        Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_TASKS_INSTALL.ps1 -ValidateOnly'
         try {
             $fixtureOutput = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
                 -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
                 -File $taskInstaller -ConfigPath $ConfigPath -ValidateOnly 2>&1
         } finally {
             $ErrorActionPreference = $previousSchedFixtureErrorActionPreference
+            Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_TASKS_INSTALL.ps1 -ValidateOnly' -End
         }
         # Регресія (2026-08-30): non-interactive дочірній powershell.exe
         # форматує ErrorRecord/Write-Error під конкретну ширину консолі й
@@ -13054,6 +13079,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # сусідній ASCII-текст у тому самому рядку. Змінюємо/відновлюємо лише
     # локально для цього виклику, без побічного впливу на решту self-test.
     $localOnlyPreviousOutputEncoding = [Console]::OutputEncoding
+    Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_DRY_RUN.ps1 (LocalOnly fixture)'
     try {
         [Console]::OutputEncoding = [Text.Encoding]::UTF8
         $localOnlyDryRunOutput = [string](
@@ -13063,6 +13089,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         )
     } finally {
         [Console]::OutputEncoding = $localOnlyPreviousOutputEncoding
+        Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_DRY_RUN.ps1 (LocalOnly fixture)' -End
     }
     Test-BRAVOCondition `
         -Condition (

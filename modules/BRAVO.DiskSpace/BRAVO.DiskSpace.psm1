@@ -602,7 +602,11 @@ function Test-BRAVODiskSpaceEntity {
             # Дійти сюди можна лише якщо requiresAccess=false вище — тобто
             # ця гілка на практиці не спрацьовує для requiresAccess=true
             # (той випадок уже BLOCK на кроці 6). Залишено для повноти таблиці §50.1.
+            # Reason виставляється й тут — щоб жодна гілка не могла дати
+            # warning без причини (перенесено з backup/local-5.2.3-rc.5,
+            # коміт 457d3b8).
             $healthStatus = 'Warning'
+            $healthReason = 'AccessUnavailableNoFreeSpaceRequirement'
         } elseif ($null -ne $minimumGB -and $healthCapacityState -eq 'Known' -and $null -ne $healthAvailableGB -and [double]$healthAvailableGB -lt [double]$minimumGB) {
             $healthStatus = 'Warning'
             $healthReason = 'BelowHealthFloorNoFreeSpaceRequirement'
