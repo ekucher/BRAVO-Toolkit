@@ -2,6 +2,19 @@
 
 ## Не випущено (developer)
 
+- **§12.2 sync: лінія 5.2.3 злита в developer.** Приносить
+  `modules/BRAVO.DiskSpace` (operation-aware класифікатор вільного місця),
+  його інтеграцію в `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE` і три self-test
+  suite (S1-S20, A1-A25, M1-M11). Розділи 5.2.3 нижче — історія тієї
+  лінії, перенесена без змін. Конфлікти злиття були двох типів:
+  `ModuleVersion` у 17 маніфестах (перемагає базова версія dev-лінії)
+  і три списки, куди обидві сторони дописали своє — у них збережено
+  обидва внески (`BRAVO.Status` + `BRAVO.DiskSpace` у переліках модулів
+  Archive/Maintenance; ізоляція VersionState + fixture-банери в
+  `BRAVO_SELF_TEST.ps1`). Три нові suite обгорнуто в
+  `Enter-BRAVOSelfTestSuite` за конвенцією developer, якої лінія 5.2.3
+  ще не знала.
+
 - **SELF_TEST: fail-fast structural preflight і diagnostic timing
   telemetry (PR #138)** — рання fail-closed structural перевірка
   (runtime manifest integrity, обов'язкові manifest-файли, синтаксис
@@ -185,6 +198,292 @@
   один том.
 
 > Примітка: розділи 5.2.2-* нижче перенесено з `hotfix/5.2.2` (гілка, відгалужена від релізу v5.2.1) під час інтеграції у `developer`; вони стоять вище за датою запису, хоча `developer` вже пройшов через цикл 5.3.0 — функціонал 5.2.2 тепер частина поточної лінії розробки.
+## 5.2.3 — 2026-09-13
+
+Stable promotion від прийнятого `5.2.3-rc.6` (нижче) — real-server acceptance
+на `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]), де раніше провалився rc.3. Усі
+обов'язкові перевірки `RELEASE_POLICY.md` §9.1 закриті; зведені докази —
+`docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md`.
+
+Ключове з acceptance:
+
+- дві повні архівації, друга — з бойового кореня `C:\Program Files\BRAVO-Toolkit`
+  (generation `20260913_044758`, COMPLETE, 3 з 3, один VSS Snapshot Set,
+  SHA512 і 7-Zip integrity OK, SFTP + BAZA_APP OK, post-backup health OK,
+  exit 0);
+- Maintenance — УСПІШНО, exit 0; health — усі копії актуальні;
+- restore drill з явним `-GenerationId 20260913_035104` — 3 з 3 компоненти
+  PASS з ОДНІЄЇ COMPLETE-генерації;
+- запуск завдань від `NT AUTHORITY\SYSTEM`: `BRAVO_ARCHIV_HEALTH` і
+  `BRAVO_MAINTENANCE` — `LastTaskResult = 0`; наскрізний SYSTEM-dry-run
+  `BRAVO_TASKS_DIAGNOSE` — усі перевірки PASS;
+- self-test на сервері — **1535 PASS / 0 FAIL**, exit 0, у т.ч. з бойового
+  кореня; `BRAVO_RUNTIME_GUARD.ps1` — цілісність 87 файлів підтверджена;
+- нова operation-aware disk-space policy перевірена в обидва боки:
+  позитивні сценарії (місця вистачає, том поза операцією, Maintenance
+  `ROOT_LIMS`) і блокувальні — `BelowFloorEstimateNotPeakSafe` та
+  `ExclusionIgnoredForRequiredVolume`, обидва exit 40, з підтвердженим
+  відкатом у бойову конфігурацію.
+
+Побічно під час acceptance усунено ваду конфігурації production: усі чотири
+завдання гілки `\BRAVO\` вказували на тимчасову теку `C:\Temp\BRAVO_523_rc3\kit`
+(код rc.3, без ACL) — нічна архівація виконалася б звідти. Переустановка
+`BRAVO_SETUP.ps1` перереєструвала завдання на бойовий корінь.
+
+Release-metadata-only зміни відносно прийнятого rc.6: `VERSION.json`
+(packageVersion `5.2.3-rc.6` → `5.2.3`, releaseChannel `prerelease` →
+`stable`), README.md/BRAVO_SETUP.md заголовки, цей розділ CHANGELOG,
+RUNTIME_MANIFEST.json регенеровано. Жодних функціональних runtime-змін
+відносно прийнятого rc.6.
+
+Операційний вплив оновлення описаний у розділі `5.2.3-rc.6` нижче —
+**прочитати перед розкаткою на парк**.
+
+## 5.2.3-rc.6 — 2026-09-13
+
+**Нумерація:** номери `rc.4` і `rc.5` зайняті двома різними деревами —
+паралельною локальною лінією розробника (коміти 2026-09-02, збережені як
+`origin/backup/local-5.2.3-rc.5`, тег `v5.2.3-rc.5` не публікувався) і
+проміжним metadata-комітом цієї лінії. Щоб жоден із них не плутався з
+фінальним кандидатом, цикл продовжено з `rc.6`.
+
+Локальна лінія незалежно виправила той самий disk-space дефект тим самим
+механізмом; за основу взято лінію з підтвердженням (CI + real-server), а з
+локальної перенесено те, чого в ній не було — fixture-банери самотесту
+(`43b6f04`) і `Reason` для dead-code access-гілки. Деталі — коміт `460df95`.
+Кандидат після **FAIL acceptance rc.3** на `LIMS-TOP` (ВІННИЦЬКА ФВЛ,
+13.09.2026). Три фікси; production-логіку зачіпає лише перший.
+
+- **FIX (disk-space, production):** health-only гілка
+  `Test-BRAVODiskSpaceEntity` читала ємність тому викликом із безумовним
+  `-Drives @()`, а `Get-BRAVODiskSpaceCapacityObservation` трактує будь-який
+  зв'язаний `-Drives` як інжектований список дисків — порожній масив означав
+  «тому немає», тож `CapacityState=Unknown` для КОЖНОГО локального тому на
+  реальному сервері. Наслідки в бою: порожні рядки `[WARNING] C:\: ` у
+  консолі й журналі Archive і Maintenance, втрачене зведення вільного місця
+  (`запас: немає даних` у сповіщенні, регресія проти 5.2.1/5.2.2) і
+  `exit 10 SuccessWithWarnings` при нульових лічильниках етапів, через що
+  фінальне сповіщення йшло в ALERTS як «ПОТРІБНА ДІЯ» на успішному прогоні.
+  Тепер `-Drives` передається далі лише коли його зв'язав виклик-сайт;
+  health-only результат несе `TotalGB`; невизначена ємність отримує явний
+  `Reason = CapacityUndeterminedHealthOnly`; композитор повідомлень більше не
+  будує заглушку `<шлях>: ` без причини.
+  Регресії: `DiskSpace/S63` (перший тест, що виконує production-гілку
+  `System.IO.DriveInfo` без інжектованих дисків) і `DiskSpace/S64`.
+- **FIX (self-test):** фікстура планувальника вимикає SFTP через
+  `BRAVO.local.config` (новий параметр `-LocalOverrides`), а не текстовою
+  заміною в `BRAVO.config`. Стара regex-мутація мовчки не спрацьовувала на
+  конфігураціях, де порядок або форма блоків відрізняється від комплектної
+  (у файлі два блоки `SFTP = @{`), і підміняла передумову тесту замість того,
+  щоб впасти. Оверлей застосовується у фазі 1 — до деривації
+  `bazaSyncEffective`, тобто рівно там, де це перевіряється.
+- **FIX (self-test):** асерт `Scheduler/BazaSyncTask*` спирається на розклад,
+  а не на кількість згадок назви завдання. Кількість згадок залежала від
+  того, чи завдання ВЖЕ зареєстроване в Планувальнику машини: на чистому
+  раннері CI вимкнене завдання згадується один раз, на сервері з
+  установленим комплектом — двічі (план «буде вимкнено» + запис у підсумку),
+  бо інсталятор мусить активно вимкнути наявне завдання. Обидві поведінки
+  коректні — хибним був асерт. Маркер тепер `StartAt "00:00"`, що в усьому
+  `BRAVO.config` належить рівно BAZASync і є ASCII (не залежить від кодової
+  сторінки консолі).
+
+### Acceptance rc.3 — FAIL (13.09.2026, `LIMS-TOP`)
+
+- Archive і Maintenance відпрацювали функціонально без помилок (3 з 3
+  архівів, VSS, SHA512, SFTP 7/7, BAZA APP, exchangAPI, health 0 errors),
+  дефекти — у діагностичному шарі та похідних від нього exit code і
+  маршрутизації сповіщення;
+- self-test на сервері: 1532 PASS / 1 FAIL
+  (`Scheduler/BazaSyncTaskSkippedWhenSftpGloballyDisabled`).
+
+Перевірено після фіксів: CI зелений на `1855891` (усі 5 задач, включно з
+повним self-test і DataRestore matrix), self-test на `LIMS-TOP` —
+**1535 PASS / 0 FAIL** (03:01, 13.09.2026), тобто на машині, де завдання
+BAZASync зареєстроване й де обидві знахідки відтворювались.
+
+Real-server acceptance rc.4 (`RELEASE_POLICY.md` §9) — окремий крок, ще не
+проводився. Обов'язковий перед промоцією у stable.
+
+### Операційний вплив оновлення (обов'язково прочитати перед розгортанням)
+
+Обидва пункти детально описані в розділі `5.2.3-dev.1` нижче; тут вони
+повторені, бо це той розділ, який читає оператор при оновленні парку:
+
+- **Below-floor relaxation для Archive прибрано.** Сервер, який раніше
+  проходив перевірку вільного місця лише завдяки цій поблажці (реальний
+  приклад: ~19.4 GB вільно проти порогу 20 GB при розрахунковій потребі
+  ~0.2 GB), після оновлення почне блокуватись на цьому кроці. Перед
+  оновленням перевірте `Maintenance.Limits.MinimumFreeSpaceGB` — або
+  підвищіть фактичне вільне місце, або свідомо знизьте поріг конфігураційно.
+- **`ExcludedDrives` більше не приховує нестачу місця на required volume.**
+  Виключення тепер придушує лише health-only попередження; якщо диск реально
+  потрібен поточній операції (write-required destination або `ROOT_LIMS`),
+  блокування залишається (`ExclusionIgnoredForRequiredVolume`).
+- **Том, менший за поріг, дає постійне health-попередження.** Приклад із
+  acceptance: `G:` має 15 GB загальних при порозі 20 GB, тож
+  `BelowHealthFloorNoFreeSpaceRequirement` виникатиме на кожному прогоні
+  (exit 10, сповіщення в ALERTS), скільки місця не звільняй. Такі томи
+  вносяться в `Maintenance.Limits.ExcludedDrives`.
+
+## 5.2.3-rc.3 — 2026-09-02
+
+Hotfix-кандидат: rc.2 + fixture-only фікс шуму self-test, знайдений і
+підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
+`RELEASE_POLICY.md` §9 — rc.2 проходив 1532/0, але з 36 рядками
+діагностичного шуму навколо Archive/Maintenance disk-space-тестів).
+
+- **FIX (self-test, Maintenance):** `selftest/BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1`
+  ізолював `Invoke-BRAVOMaintenanceDiskSpaceCheck`/`Write-Log` через
+  `New-BRAVOSelfTestRuntimeModule`, але не екстрагував `Write-BRAVOMaintenanceLogFile`
+  (яку викликає `Write-Log`) і не встановлював `$LOG_DIR`/`$LOG_FILE` перед
+  M1-M11. Обидві змінні лишались невстановленими в module-scope цього
+  динамічного модуля — `Test-Path $LOG_DIR` резолвився як
+  `Test-Path -Path $null`, TerminatingError перехоплювався в catch і друкував
+  `"Помилка запису у файл логу: Cannot bind argument to parameter 'Path'
+  because it is null."` (36 разів). Сам self-test PASS не постраждав —
+  catch обробляв помилку коректно, це був виключно діагностичний шум, не
+  прихована регресія.
+  Тепер `Write-BRAVOMaintenanceLogFile` екстрагується разом із `Write-Log`,
+  і fixture встановлює обидві змінні на ізольований тимчасовий лог-файл
+  перед кожним викликом (той самий патерн, що вже використовується в
+  ManifestStorage-фрагменті `BRAVO_SELF_TEST.ps1`).
+  **Це дефект ізоляції test-harness, не production-логіки** —
+  `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` не змінено;
+  реальний `BRAVO_MAINTENANCE.ps1` завжди виконує top-level ініціалізацію
+  `$LOG_DIR`/`$LOG_FILE` до будь-якого `Write-Log`.
+  Regression coverage: `Maintenance/DiskSpaceFixtureLogWritesWithoutPathError`.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1533 PASS / 0 FAIL — +1 новий
+regression-тест). Пошук "Cannot bind argument to parameter 'Path'" і
+"Помилка запису у файл логу" у новому логу self-test — 0 входжень.
+Real-server acceptance для rc.3 на `LIMS-TOP` — окремий крок, продовжується
+з місця зупинки rc.2.
+
+## 5.2.3-rc.2 — 2026-09-02 (superseded by rc.3)
+
+Hotfix-кандидат: rc.1 + вузький фікс self-test-ізоляції, знайдений і
+підтверджений на реальному сервері `LIMS-TOP` (real-server acceptance
+`RELEASE_POLICY.md` §9, не через локальний self-test — там rc.1 проходив
+чисто).
+
+- **FIX (self-test, DiskSpace):** `Resolve-BRAVODiskSpaceStorageIdentity`
+  (§35.1 bootstrap — walk up до найближчого існуючого предка) виконувала
+  реальний `Test-Path` проти літерального `DisplayPath` з self-test
+  фікстур (`'D:\ARCHIV\MODEL'`, `'E:\ARCHIV\...'`) незалежно від
+  інжектованого `-Drives`-мока, який підміняв лише
+  `DriveType`/`AvailableFreeSpace`. Тому результат 11 self-test сценаріїв
+  (`DiskSpace/S16` ×2, `Archive/A4,A5,A9,A10,A14,A17,A19,A24,A25`) залежав
+  від того, чи фізично існують диски `D:`/`E:` на хості, що запускає
+  self-test — на `LIMS-TOP` (лише `C:`) усі 11 падали з
+  `Reason=VolumeResolutionFailed`, хоча той самий коміт `5270280` проходив
+  1532/0 на dev-машині з дисками `D:`/`E:`. Тепер bootstrap-перевірка
+  існування довіряє мок-масиву, коли `-Drives` інжектовано; виробнича
+  поведінка (реальні виклики з `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`, без
+  `-Drives`) не змінена.
+  **Це дефект непортативності self-test-фікстур, не самого
+  disk-space-класифікатора** — production-виклики передають реальні
+  шляхи з конфігурації, де реальний `Test-Path` є очікуваною поведінкою.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1532 PASS / 0 FAIL, ті самі
+11 сценаріїв, що впали на `LIMS-TOP`, тепер PASS). Real-server acceptance
+для rc.2 на `LIMS-TOP` — окремий крок, продовжується з місця зупинки rc.1.
+
+## 5.2.3-rc.1 — 2026-08-31 (superseded by rc.2)
+
+Release-metadata-only promotion `5.2.3-dev.1` → `5.2.3-rc.1` (`hotfix/5.2.3`),
+per `RELEASE_POLICY.md` §8. Без функціональних runtime-змін відносно `5.2.3-dev.1`
+(нижче) — лише `packageVersion`, заголовки README.md/BRAVO_SETUP.md, цей запис.
+
+Заодно виправлено `releaseChannel` у `5.2.3-dev.1`: мало бути `development`
+(RELEASE_POLICY.md §5.3, dev-релізи), помилково стояло `prerelease` —
+знайдено `ci\Test-BRAVOReleasePolicy.ps1`, який не запускався до цього
+моменту. Для самого `5.2.3-rc.1` значення `prerelease` коректне й без змін.
+
+Локальні гейти: повний `BRAVO_SELF_TEST.ps1` (1532 PASS / 0 FAIL), Parser,
+PSScriptAnalyzer (блокуючий ruleset), Runtime Manifest, Tools Manifest,
+`ci\Test-BRAVOReleasePolicy.ps1` — усі PASS. Real-server acceptance
+(RELEASE_POLICY.md §9) ще не проводився — обов'язковий перед promotion у
+`master`.
+
+## 5.2.3-dev.1 (fix/5.2.3-operation-aware-disk-space, у розробці)
+
+Operation-aware disk-space policy для `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`: усуває
+false-positive блокування, коли мало вільного місця на локальному Fixed-диску,
+який поточна операція фактично не використовує (типовий приклад: C: з
+runtime/логами при архівації на D:/E:).
+
+Base: `v5.2.2` (`15ce820`), гілка `fix/5.2.3-operation-aware-disk-space` ←
+`hotfix/5.2.3`.
+
+### Додано
+- **`modules/BRAVO.DiskSpace`** — новий канонічний shared classifier: розділяє
+  `Participates`/`RequiresAccess`/`RequiresFreeSpace` для кожного volume/шляху,
+  групує write-required entities за `CapacityKey` (не за окремим шляхом),
+  підтримує `RequirementGranularity` (`Entity`/`CapacityGroup`/`Unknown`) і
+  безпечний floor-fallback (`KnownRequiredLowerBoundGB`/`ResidualAvailableGB`)
+  для невідомої частини вимоги. `Blocks` монотонний у межах одного evaluation.
+  Використовується і Archive, і Maintenance — одна політика замість двох
+  незалежних реалізацій.
+- `BRAVO_ARCHIV`: `Resolve-BRAVOArchiveSpaceDecision` будує health-only sweep
+  усіх локальних Fixed-дисків + per-компонент SOURCE (не потребує вільного
+  місця)/ARCHIVE_DESTINATION (потребує, оцінка з
+  `Get-BRAVOArchiveEstimatedSpaceRequirement`, без змін) і передає це в
+  спільний класифікатор.
+- `BRAVO_MAINTENANCE`: `Invoke-BRAVOMaintenanceDiskSpaceCheck` замінює
+  глобальний прохід по всіх Fixed-дисках на health-only sweep +
+  єдину write-required ціль `ROOT_LIMS` (усі write-операції Maintenance —
+  ARC_DIR/TRACE_DIR/логи — похідні від цього дерева; жодна Maintenance-операція
+  сьогодні не має exact-оцінки вимоги, тому `RequirementGranularity=Unknown` і
+  чинний floor застосовується коректно лише до цього тому).
+
+### Змінено (навмисне посилення політики, не регресія)
+- **Below-floor relaxation для Archive прибрано.** У 5.2.1/5.2.2
+  `Merge-BRAVOArchiveSpaceCheckResults` (реальний production acceptance
+  2026-08-25) знижував фіксований поріг до WARNING, коли розрахункова оцінка
+  доводила достатність місця САМЕ для того диска. У 5.2.3 ця relaxation
+  вимкнена (`PeakSafeEstimate=false`): below-floor тепер БЛОКУЄ
+  (`BelowFloorEstimateNotPeakSafe`), навіть якщо оцінка достатня. Причина:
+  `Get-BRAVOArchiveEstimatedSpaceRequirement` не враховує вже наявні retained
+  generations (cleanup виконується ПІСЛЯ створення нової generation, тобто
+  пікове використання диска — це стара+нова generation одночасно) і тимчасовий
+  `.work`-файл під час створення архіву — оцінка не доведена peak-safe.
+  **Операційний вплив:** сервери, де фіксований поріг проходив саме завдяки
+  цій relaxation (приклад із production: ~19.4 GB вільно проти порогу 20 GB,
+  розрахункова потреба ~0.2 GB), після оновлення до 5.2.3 почнуть блокуватись
+  на цьому кроці. Перед оновленням перевірте `Maintenance.Limits.MinimumFreeSpaceGB`
+  для таких серверів — або підвищіть реальне вільне місце, або свідомо
+  знизьте поріг конфігураційно.
+- **`ExcludedDrives` більше не приховує operational-небезпеку required
+  volume.** До 5.2.3 диск у `Maintenance.Limits.ExcludedDrives` повністю
+  виключався з перевірки. Тепер виключення придушує лише health-only
+  попередження; якщо той самий диск реально потрібен поточній операції
+  (write-required destination чи ROOT_LIMS) і місця недостатньо — блокування
+  залишається (`Flags += ExclusionIgnoredForRequiredVolume`, `Reason` — реальна
+  причина). Якщо диск додано в `ExcludedDrives` саме для обходу цього типу
+  блокування — перевірте конфігурацію перед оновленням: з 5.2.3 такий обхід
+  більше не спрацює для required volume.
+
+### Відомі обмеження (зафіксовано свідомо, не приховано)
+- Maintenance моделює одну write-required ціль (`ROOT_LIMS`), а не окремі
+  ролі для кожної операції (`RestoreTarget`/`TemporaryProcessingVolume`
+  тощо) — жодна поточна Maintenance-операція не постачає exact-оцінку
+  вимоги, тому детальніша модель не дала б практичної переваги в цьому
+  релізі.
+- `RuntimeWriteUnavailable` (проба реальної write-спроможності) не додано —
+  відкладено до наступного циклу.
+- Archive: `-SyncBAZA`-потік (`Invoke-ManualBAZASFTPSynchronization`) і
+  SMB/SFTP-передача архівів не проходять через новий класифікатор у цьому
+  релізі (не торкались ними) — поведінка незмінна відносно 5.2.2.
+
+### Тести
+Новий: `selftest/BRAVO_SELF_TEST.DiskSpace.ps1` (S1-S20, класифікатор
+ізольовано), `selftest/BRAVO_SELF_TEST.ArchiveDiskSpace.ps1` (A1,A2,A4-A11,
+A14-A17,A19,A20,A24,A25 — реальний виклик-сайт Archive),
+`selftest/BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1` (M1,M2,M3,M4,M5,M7,M8,
+M10,M11 — реальний виклик-сайт Maintenance). 6 застарілих тестів
+`Merge-BRAVOArchiveSpaceCheckResults` замінені (не мовчки видалені) —
+диспозиція задокументована в `BRAVO_SELF_TEST.ps1` біля місця видалення.
+Повний `BRAVO_SELF_TEST.ps1`: 1532 PASS / 0 FAIL.
 
 ## 5.2.2 — 2026-08-31
 

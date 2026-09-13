@@ -92,11 +92,13 @@ try {
         "param(`$ConfigRoot, `$RuntimeRoot)`nthrow 'BRAVO_SELF_TEST_SYNTHETIC_CONFIG_FAILURE'",
         (New-Object System.Text.UTF8Encoding $false)
     )
+    Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_DRY_RUN.ps1 (synthetic config failure)'
     $dryRunChildOutput = [string](
         & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
             -File $dryRunPath -ConfigPath $dryRunSyntheticConfigPath 2>&1 | Out-String
     )
     $dryRunExitCode = $LASTEXITCODE
+    Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_DRY_RUN.ps1 (synthetic config failure)' -End
 
     Test-BRAVOCondition `
         -Condition ($dryRunExitCode -eq 1) `
