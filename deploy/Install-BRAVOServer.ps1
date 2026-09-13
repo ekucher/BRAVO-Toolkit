@@ -6,7 +6,9 @@ param(
     [string]$StagingRoot = 'C:\Temp\BRAVO_INSTALL',
     [switch]$SeedLocalConfig,
     [switch]$SkipSelfTest,
-    [switch]$Force
+    [switch]$Force,
+    [switch]$NoElevation,
+    [switch]$NoPause
 )
 
 # Проміжний помічник ЧИСТОЇ інсталяції stable-релізу BRAVO-Toolkit на ОДИН
@@ -36,12 +38,65 @@ trap {
 }
 Set-StrictMode -Version 2.0
 
+# --- Кирилиця в консолі ------------------------------------------------------
+# Windows PowerShell 5.1 на серверах з російською локаллю тримає консоль у
+# OEM-866, тому UTF-8-вивід дочірніх процесів BRAVO (BRAVO_DRY_RUN,
+# BRAVO_TASKS_INSTALL, BRAVO_CREDENTIALS_SETUP) читається як
+# "‹®Ј ¤®Ї®¬?¦­®Ј®". Перемикаємо консоль на UTF-8 на час роботи скрипта;
+# дочірні процеси успадковують кодову сторінку. Початковий стан
+# повертається у finally наприкінці файлу.
+
+$script:PreviousConsoleEncoding = $null
+$script:PreviousOutputEncoding = $null
+try {
+    $script:PreviousConsoleEncoding = [Console]::OutputEncoding
+    $script:PreviousOutputEncoding = $OutputEncoding
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [Console]::OutputEncoding = $utf8NoBom
+    $global:OutputEncoding = $utf8NoBom
+} catch {
+    # Вивід перенаправлено або консолі немає — не критично, працюємо далі.
+    Write-Host ('Не вдалося перемкнути консоль на UTF-8: ' + $_.Exception.Message) -ForegroundColor Yellow
+}
+
+$script:SuppressPause = $false
+
+function Wait-BRAVODeployCompletion {
+    # Той самий контракт, що Wait-BRAVOSetupCompletion у BRAVO_SETUP.ps1:
+    # після UAC-перезапуску вікно закрилося б миттєво, і оператор не встиг би
+    # прочитати результат. Батьківський (неелевований) процес не паузиться —
+    # його консоль нікуди не зникає.
+    if ($NoPause -or $script:SuppressPause -or -not [Environment]::UserInteractive) {
+        return
+    }
+    try {
+        if ([Console]::IsInputRedirected) { return }
+        [void](Read-Host 'Натисніть Enter для завершення')
+    } catch {
+        # Фоновий або перенаправлений запуск не має падати через брак консолі.
+    }
+}
+
+function Restore-BRAVOConsoleEncoding {
+    try {
+        if ($null -ne $script:PreviousConsoleEncoding) {
+            [Console]::OutputEncoding = $script:PreviousConsoleEncoding
+        }
+        if ($null -ne $script:PreviousOutputEncoding) {
+            $global:OutputEncoding = $script:PreviousOutputEncoding
+        }
+    } catch {
+        # Відновлення кодування ніколи не має маскувати результат роботи.
+    }
+}
+
 function Write-Step { param([string]$T) Write-Host ''; Write-Host ('=== ' + $T) -ForegroundColor Cyan }
 function Write-Ok   { param([string]$T) Write-Host ('  [OK]    ' + $T) -ForegroundColor Green }
 function Write-Bad  { param([string]$T) Write-Host ('  [FAIL]  ' + $T) -ForegroundColor Red }
 function Write-Note { param([string]$T) Write-Host ('  [..]    ' + $T) }
 function Write-Warn2{ param([string]$T) Write-Host ('  [УВАГА] ' + $T) -ForegroundColor Yellow }
 
+try {
 $targetVersion = $Tag.TrimStart('v')
 
 # --- 0. Передумови ----------------------------------------------------------
@@ -51,8 +106,53 @@ Write-Step '0. Передумови'
 $isElevated = ([Security.Principal.WindowsPrincipal] `
     [Security.Principal.WindowsIdentity]::GetCurrent()
 ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+# Права адміністратора обов'язкові: скрипт пише у %ProgramFiles%, читає
+# Планувальник і запускає BRAVO_SETUP. Замість відмови пропонуємо UAC —
+# той самий контракт, що BRAVO_SETUP.ps1 (-NoElevation вимикає підняття й
+# передається у перезапущений процес, щоб не було циклу).
+#
+# ExecutionPolicy тут НЕ послаблюється: перезапуск іде як
+# "-NoLogo -NoProfile -File", без -ExecutionPolicy Bypass.
+
 if (-not $isElevated) {
-    throw 'Потрібні права адміністратора: запустіть PowerShell від імені адміністратора.'
+    if ($NoElevation -or -not [Environment]::UserInteractive) {
+        throw ('Потрібні права адміністратора. Запустіть PowerShell від імені ' +
+            'адміністратора або приберіть -NoElevation, щоб скрипт сам запросив UAC.')
+    }
+    if ([string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        throw 'Не вдалося визначити власний шлях для перезапуску з правами адміністратора.'
+    }
+
+    Write-Note 'права не підняті — запит UAC і перезапуск в елевованій консолі'
+
+    $argumentParts = New-Object System.Collections.Generic.List[string]
+    foreach ($fixed in @('-NoLogo', '-NoProfile', '-File', ('"' + $PSCommandPath + '"'))) {
+        [void]$argumentParts.Add($fixed)
+    }
+    if (-not [string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+        [void]$argumentParts.Add('-RuntimeRoot'); [void]$argumentParts.Add('"' + $RuntimeRoot + '"')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Tag)) {
+        [void]$argumentParts.Add('-Tag'); [void]$argumentParts.Add('"' + $Tag + '"')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ZipPath)) {
+        [void]$argumentParts.Add('-ZipPath'); [void]$argumentParts.Add('"' + $ZipPath + '"')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($StagingRoot)) {
+        [void]$argumentParts.Add('-StagingRoot'); [void]$argumentParts.Add('"' + $StagingRoot + '"')
+    }
+    if ($SeedLocalConfig) { [void]$argumentParts.Add('-SeedLocalConfig') }
+    if ($SkipSelfTest) { [void]$argumentParts.Add('-SkipSelfTest') }
+    if ($Force) { [void]$argumentParts.Add('-Force') }
+    if ($NoPause) { [void]$argumentParts.Add('-NoPause') }
+    [void]$argumentParts.Add('-NoElevation')
+
+    $powerShellPath = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $elevated = Start-Process -FilePath $powerShellPath `
+        -ArgumentList ($argumentParts -join ' ') `
+        -Verb RunAs -Wait -PassThru -WindowStyle Normal
+    $script:SuppressPause = $true
+    exit $elevated.ExitCode
 }
 Write-Ok 'запущено з піднятими правами'
 
@@ -342,3 +442,7 @@ Write-Host '    6. .\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess'
 Write-Host '    7. .\BRAVO_DRY_RUN.ps1                                 — прогін без production-дій'
 Write-Host ''
 exit 0
+} finally {
+    Wait-BRAVODeployCompletion
+    Restore-BRAVOConsoleEncoding
+}
