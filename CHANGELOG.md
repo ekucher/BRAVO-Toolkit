@@ -2,19 +2,6 @@
 
 ## Не випущено (developer)
 
-- **§12.2 sync: лінія 5.2.3 злита в developer.** Приносить
-  `modules/BRAVO.DiskSpace` (operation-aware класифікатор вільного місця),
-  його інтеграцію в `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE` і три self-test
-  suite (S1-S20, A1-A25, M1-M11). Розділи 5.2.3 нижче — історія тієї
-  лінії, перенесена без змін. Конфлікти злиття були двох типів:
-  `ModuleVersion` у 17 маніфестах (перемагає базова версія dev-лінії)
-  і три списки, куди обидві сторони дописали своє — у них збережено
-  обидва внески (`BRAVO.Status` + `BRAVO.DiskSpace` у переліках модулів
-  Archive/Maintenance; ізоляція VersionState + fixture-банери в
-  `BRAVO_SELF_TEST.ps1`). Три нові suite обгорнуто в
-  `Enter-BRAVOSelfTestSuite` за конвенцією developer, якої лінія 5.2.3
-  ще не знала.
-
 - **SELF_TEST: fail-fast structural preflight і diagnostic timing
   telemetry (PR #138)** — рання fail-closed structural перевірка
   (runtime manifest integrity, обов'язкові manifest-файли, синтаксис
@@ -198,6 +185,36 @@
   один том.
 
 > Примітка: розділи 5.2.2-* нижче перенесено з `hotfix/5.2.2` (гілка, відгалужена від релізу v5.2.1) під час інтеграції у `developer`; вони стоять вище за датою запису, хоча `developer` вже пройшов через цикл 5.3.0 — функціонал 5.2.2 тепер частина поточної лінії розробки.
+
+## 5.3.0-dev.3 — 2026-09-13
+
+Обов'язкова синхронізація за `RELEASE_POLICY.md` §12.2 після stable-релізу
+5.2.3: merge `master` (`8b77f43`) у `developer`. Приносить у dev-лінію
+`modules/BRAVO.DiskSpace` (operation-aware класифікатор вільного місця),
+його інтеграцію в `BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`, три self-test suite
+(S1-S20, A1-A25, M1-M11) і acceptance-evidence 5.2.3. Розділи 5.2.3 нижче —
+історія тієї лінії, перенесена без змін.
+
+Номер підвищено з `5.3.0-dev.2`, бо sync приносить у dev-лінію нову
+функціональність (§8); лишити `dev.2` означало б, що два різні дерева
+носять один номер. Канал `development` без змін, `ModuleVersion` усіх
+`modules\*\*.psd1` лишається базовою `5.3.0`.
+
+Конфлікти злиття були двох типів: `ModuleVersion` у 17 маніфестах
+(перемагає базова версія dev-лінії) і три списки, куди обидві сторони
+дописали своє — там збережено обидва внески (`BRAVO.Status` +
+`BRAVO.DiskSpace` у переліках імпорту Archive/Maintenance; ізоляція
+VersionState + fixture-банери в `BRAVO_SELF_TEST.ps1`). Три нові suite
+обгорнуто в `Enter-BRAVOSelfTestSuite` за конвенцією developer, якої лінія
+5.2.3 ще не знала — без обгортки їхні перевірки потрапили б у suite
+`ConfigLoader`. Окремо: `BRAVO.DiskSpace.psd1` приходить як НОВИЙ файл без
+конфлікту й ніс `ModuleVersion 5.2.3` — виправлено на `5.3.0`, інакше
+`RELEASE_POLICY` §3.4 впав би саме на ньому.
+
+`RUNTIME_MANIFEST.json` перегенеровано для злитого дерева: 126 записів.
+
+---
+
 ## 5.2.3 — 2026-09-13
 
 Stable promotion від прийнятого `5.2.3-rc.6` (нижче) — real-server acceptance
