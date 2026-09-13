@@ -307,6 +307,29 @@ function Complete-BRAVOSelfTestActiveSuiteSpan {
     }
 }
 
+# Оператор, що читає .log-транскрипт self-test (не лише фінальний
+# підсумок), інакше бачить сирий консольний вивід дочірнього
+# BRAVO_TASKS_INSTALL.ps1/BRAVO_DRY_RUN.ps1 на навмисно "зламаній"
+# fixture-конфігурації — Windows PowerShell 5.1 Start-Transcript фіксує
+# цей вивід у .log НАВІТЬ КОЛИ він коректно перехоплений батьківським
+# скриптом у змінну ($x = & powershell.exe ... 2>&1 | Out-String) для
+# власної (правильної) [PASS]/[FAIL] self-test-оцінки нижче. Без цих
+# банерів рядки на кшталт "[FAIL] Dry-run"/"ПОМИЛКА: ..."/"НЕ ГОТОВО" від
+# дитини виглядають як реальний production-інцидент. Банер нічого не
+# приховує і не пригнічує — сирий вивід дитини лишається повністю видимим
+# між банерами, self-test-оцінка так само видима одразу після.
+function Write-BRAVOSelfTestFixtureBanner {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [switch]$End
+    )
+    if ($End) {
+        Write-Host "<<< FIXTURE-ТЕСТ ЗАВЕРШЕНО ($Label) — self-test-оцінка нижче" -ForegroundColor Cyan
+    } else {
+        Write-Host ">>> НАВМИСНИЙ FIXTURE-ТЕСТ self-test ($Label): дочірній скрипт нижче МОЖЕ вивести [FAIL]/ПОМИЛКА/НЕ ГОТОВО — це очікувано і НЕ є production-інцидентом" -ForegroundColor Cyan
+    }
+}
+
 function New-BRAVOSelfTestRuntimeModule {
     param(
         [Parameter(Mandatory = $true)][string]$SourceText,
@@ -5290,7 +5313,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
     $archiveEstimateRuntimeModule = New-BRAVOSelfTestRuntimeModule `
         -SourceText $archiveScriptText `
-        -FunctionNames @("Get-BRAVOArchiveEstimatedSpaceRequirement", "Merge-BRAVOArchiveSpaceCheckResults")
+        -FunctionNames @("Get-BRAVOArchiveEstimatedSpaceRequirement")
 
     function New-BRAVOEstimatedSpaceFixtureArchive {
         param([string]$Directory, [string]$Name, [int]$Bytes)
@@ -5406,113 +5429,27 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         Remove-Item -LiteralPath $estimatedSpaceTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
-    # Merge-BRAVOArchiveSpaceCheckResults: реальний acceptance (2026-08-25,
-    # сервер із 19.38 GB вільних проти фіксованого порогу 20 GB, але
-    # розрахункова потреба лише 0.2 GB) — фіксований поріг не повинен
-    # блокувати, коли розрахунок доводить достатність САМЕ для того диска.
-    $mergeFloorSuccess = [pscustomobject]@{ Success = $true; DriveStatus = @() }
-    $mergeFloorFailsOneDrive = [pscustomobject]@{
-        Success = $false
-        DriveStatus = @([pscustomobject]@{ Drive = 'C:'; FreeSpaceGB = 19.38; TotalSpaceGB = 223.08 })
-    }
-    $mergeFloorFailsTwoDrives = [pscustomobject]@{
-        Success = $false
-        DriveStatus = @(
-            [pscustomobject]@{ Drive = 'C:'; FreeSpaceGB = 19.38; TotalSpaceGB = 223.08 },
-            [pscustomobject]@{ Drive = 'D:'; FreeSpaceGB = 5.0; TotalSpaceGB = 500.0 }
-        )
-    }
-    $mergeEstimateCoversC = [pscustomobject]@{
-        Success = $true
-        VolumeStatus = @([pscustomobject]@{ Drive = 'C:'; Components = 'MODEL, BLOG, BRAVOEXCH'; RequiredGB = 0.2; AvailableGB = 19.38 })
-        Problems = @()
-    }
-    $mergeEstimateEmpty = [pscustomobject]@{ Success = $true; VolumeStatus = @(); Problems = @() }
-    $mergeEstimateInsufficientC = [pscustomobject]@{
-        Success = $false
-        VolumeStatus = @([pscustomobject]@{ Drive = 'C:'; Components = 'MODEL'; RequiredGB = 25.0; AvailableGB = 19.38 })
-        Problems = @('диск C: розрахункова потреба 25 GB, доступно лише 19.38 GB')
-    }
-
-    $mergeOverridden = & $archiveEstimateRuntimeModule {
-        param($Floor, $Estimated)
-        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
-    } $mergeFloorFailsOneDrive $mergeEstimateCoversC
-    Test-BRAVOCondition `
-        -Condition (
-            $mergeOverridden.Success -and
-            @($mergeOverridden.Problems).Count -eq 0 -and
-            @($mergeOverridden.Warnings).Count -eq 1 -and
-            $mergeOverridden.Warnings[0] -match 'C:' -and
-            $mergeOverridden.Warnings[0] -match '0\.2 GB'
-        ) `
-        -Name 'Archive/MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive' `
-        -Failure 'фіксований поріг на конкретному диску має знижуватись до WARNING (не блокувати), коли розрахункова оцінка для ТОГО САМОГО диска реально порахована і показує достатність'
-
-    $mergeNoEstimate = & $archiveEstimateRuntimeModule {
-        param($Floor, $Estimated)
-        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
-    } $mergeFloorFailsOneDrive $mergeEstimateEmpty
-    Test-BRAVOCondition `
-        -Condition (
-            -not $mergeNoEstimate.Success -and
-            @($mergeNoEstimate.Problems).Count -eq 1 -and
-            @($mergeNoEstimate.Warnings).Count -eq 0
-        ) `
-        -Name 'Archive/MergeSpaceResultsKeepsFloorBlockingWithoutEstimate' `
-        -Failure 'диск без жодного оціненого компонента (bootstrap чи не бере участі в backup) має лишатись під фіксованим порогом без послаблень — довести безпеку нема на чому'
-
-    $mergeEstimateAlsoFails = & $archiveEstimateRuntimeModule {
-        param($Floor, $Estimated)
-        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
-    } $mergeFloorFailsOneDrive $mergeEstimateInsufficientC
-    Test-BRAVOCondition `
-        -Condition (-not $mergeEstimateAlsoFails.Success) `
-        -Name 'Archive/MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient' `
-        -Failure 'якщо розрахункова оцінка для того самого диска сама показує недостатність, floor-виправдання застосовуватись не повинно'
-
-    $mergeEstimateFailsFloorPasses = & $archiveEstimateRuntimeModule {
-        param($Floor, $Estimated)
-        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
-    } $mergeFloorSuccess $mergeEstimateInsufficientC
-    Test-BRAVOCondition `
-        -Condition (
-            -not $mergeEstimateFailsFloorPasses.Success -and
-            @($mergeEstimateFailsFloorPasses.Problems) -contains $mergeEstimateInsufficientC.Problems[0]
-        ) `
-        -Name 'Archive/MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses' `
-        -Failure 'недостатність за розрахунковою оцінкою має блокувати прогін незалежно від того, що фіксований поріг сам по собі пройшов — floor-виправдання діє лише в один бік'
-
-    $mergeMixedDrives = & $archiveEstimateRuntimeModule {
-        param($Floor, $Estimated)
-        Merge-BRAVOArchiveSpaceCheckResults -FloorResult $Floor -EstimatedResult $Estimated -MinimumFreeSpaceGB 20
-    } $mergeFloorFailsTwoDrives $mergeEstimateCoversC
-    Test-BRAVOCondition `
-        -Condition (
-            -not $mergeMixedDrives.Success -and
-            @($mergeMixedDrives.Problems).Count -eq 1 -and
-            $mergeMixedDrives.Problems[0] -match 'D:' -and
-            @($mergeMixedDrives.Warnings).Count -eq 1 -and
-            $mergeMixedDrives.Warnings[0] -match 'C:'
-        ) `
-        -Name 'Archive/MergeSpaceResultsAppliesOverridePerDriveIndependently' `
-        -Failure 'виправдання фіксованого порогу має застосовуватись СТРОГО по-диску — інший диск без оцінки (D: тут) має лишатись блокуючим, навіть коли C: виправдано'
-
-    Test-BRAVOCondition `
-        -Condition (
-            $archiveScriptText.Contains('Get-BRAVOArchiveEstimatedSpaceRequirement') -and
-            $archiveScriptText.Contains('EstimatedSpaceMarginPercent') -and
-            $archiveScriptText.Contains('function Merge-BRAVOArchiveSpaceCheckResults') -and
-            $archiveScriptText.Contains('$mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults') -and
-            $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -gt
-                $archiveScriptText.IndexOf('$archiveFreeSpaceResult = Get-BRAVOArchiveFreeSpaceResult') -and
-            $archiveScriptText.IndexOf('$mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults') -gt
-                $archiveScriptText.IndexOf('$archiveEstimatedSpaceResult = Get-BRAVOArchiveEstimatedSpaceRequirement') -and
-            $archiveScriptText.IndexOf('$mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults') -lt
-                $archiveScriptText.IndexOf('$archiveFreeSpaceReason = if (')
-        ) `
-        -Name 'Archive/EstimatedSpacePreflightWiredIntoFreeSpaceCheck' `
-        -Failure 'розрахункова перевірка й об''єднання результатів мають виконуватись у тому самому preflight-кроці "Перевірка вільного місця", ПІСЛЯ фіксованого порогу і ДО обчислення підсумкового Reason/раннього return — інакше вони або не впливають на результат, або перевіряються в неправильний момент'
+    # Merge-BRAVOArchiveSpaceCheckResults (5.2.1) видалено в 5.2.3 разом з
+    # переходом на спільний BRAVO.DiskSpace-класифікатор
+    # (fix/5.2.3-operation-aware-disk-space, reviewer decision #2:
+    # PeakSafeEstimate=false). 6 тестів, що раніше стояли тут, ЯВНО
+    # переведені (не мовчки видалені) в selftest\BRAVO_SELF_TEST.ArchiveDiskSpace.ps1,
+    # який перевіряє РЕАЛЬНИЙ виклик-сайт Archive (Resolve-BRAVOArchiveSpaceDecision)
+    # наскрізно:
+    #   MergeSpaceResultsOverridesFloorWhenEstimateCoversDrive
+    #       -> ІНВЕРТОВАНО в A24 (below-floor-але-достатньо тепер БЛОКУЄ
+    #          BelowFloorEstimateNotPeakSafe — навмисна зміна поведінки,
+    #          не регресія; той самий вхід під PeakSafeEstimate=true
+    #          лишається ALLOW+WARNING — доведено в A25)
+    #   MergeSpaceResultsKeepsFloorBlockingWithoutEstimate      -> A5
+    #   MergeSpaceResultsKeepsFloorBlockingWhenEstimateAlsoInsufficient -> A4/A10
+    #   MergeSpaceResultsEstimatedFailureBlocksEvenWhenFloorPasses -> A4
+    #   MergeSpaceResultsAppliesOverridePerDriveIndependently   -> A11 (Archive)
+    #                                                               + S14 (DiskSpace)
+    #   EstimatedSpacePreflightWiredIntoFreeSpaceCheck (структурний, call
+    #   order) -> Archive/SpaceDecisionWiredIntoFreeSpaceCheck нижче в
+    #   ArchiveDiskSpace.ps1, з тими самими AST-перевірками порядку викликів,
+    #   але для нового Resolve-BRAVOArchiveSpaceDecision.
 
     $literalSourceText = "Методика*виконання_вимірювань.pdf"
     $discordLiteralText = & $archiveRuntimeModule {
@@ -14158,7 +14095,17 @@ function Get-BRAVOMaintenanceSummaryResult {
         param(
             [bool]$BreakLimsRootViaFakeService,
             [bool]$MaintenanceEnabled = $true,
-            [bool]$RecoveryEnabled = $true
+            [bool]$RecoveryEnabled = $true,
+            # Site-overrides для фікстури пишуться у BRAVO.local.config поряд
+            # з нею, а НЕ текстовою мутацією BRAVO.config: форма конфігурації
+            # на реальному сервері відрізняється від комплектної (у файлі два
+            # блоки "SFTP = @{", інші відступи, у конфігах 5.2.1 і старіших
+            # ключа Enabled немає взагалі), і regex-заміна там МОВЧКИ не
+            # спрацьовує — тест падав на LIMS-TOP при зеленому CI
+            # (acceptance rc.3, 13.09.2026). Оверлей читається ДО виконання
+            # BRAVO.config і застосовується у фазі 1, тобто ДО деривацій —
+            # саме те, що ці тести й перевіряють.
+            [hashtable]$LocalOverrides
         )
         $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SCHED_FIXTURE_' + [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($fixtureRoot)
@@ -14198,6 +14145,26 @@ function Get-BRAVOMaintenanceSummaryResult {
             $fixtureConfigText, '(?m)^(\s*BootRestoreMode\s*=\s*)"None"\s*$', "`$1`"$fixtureBootRestoreModeValue`"", 1)
 
         [IO.File]::WriteAllText($fixtureConfigPath, $fixtureConfigText, (New-Object Text.UTF8Encoding($false)))
+
+        if ($null -ne $LocalOverrides -and $LocalOverrides.Count -gt 0) {
+            $fixtureLocalLines = New-Object System.Collections.Generic.List[string]
+            [void]$fixtureLocalLines.Add('@{')
+            foreach ($fixtureOverrideKey in @($LocalOverrides.Keys | Sort-Object)) {
+                $fixtureOverrideValue = $LocalOverrides[$fixtureOverrideKey]
+                if ($fixtureOverrideValue -isnot [bool]) {
+                    throw ("New-BRAVOSelfTestSchedulerFixtureConfig: -LocalOverrides підтримує лише булеві значення " +
+                        "(ключ '$fixtureOverrideKey' має тип $($fixtureOverrideValue.GetType().Name))")
+                }
+                $fixtureOverrideLiteral = if ($fixtureOverrideValue) { '$true' } else { '$false' }
+                [void]$fixtureLocalLines.Add(("    '{0}' = {1}" -f $fixtureOverrideKey, $fixtureOverrideLiteral))
+            }
+            [void]$fixtureLocalLines.Add('}')
+            [IO.File]::WriteAllText(
+                (Join-Path $fixtureRoot 'BRAVO.local.config'),
+                (($fixtureLocalLines.ToArray() -join "`r`n") + "`r`n"),
+                (New-Object Text.UTF8Encoding($false)))
+        }
+
         return [pscustomobject]@{ ConfigPath = $fixtureConfigPath; Root = $fixtureRoot }
     }
     function Invoke-BRAVOSelfTestTaskInstallValidateOnly {
@@ -14208,12 +14175,14 @@ function Get-BRAVOMaintenanceSummaryResult {
         # який реально перевіряє production Task Scheduler.
         $previousSchedFixtureErrorActionPreference = $ErrorActionPreference
         $ErrorActionPreference = 'Continue'
+        Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_TASKS_INSTALL.ps1 -ValidateOnly'
         try {
             $fixtureOutput = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
                 -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
                 -File $taskInstaller -ConfigPath $ConfigPath -ValidateOnly 2>&1
         } finally {
             $ErrorActionPreference = $previousSchedFixtureErrorActionPreference
+            Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_TASKS_INSTALL.ps1 -ValidateOnly' -End
         }
         # Регресія (2026-08-30): non-interactive дочірній powershell.exe
         # форматує ErrorRecord/Write-Error під конкретну ширину консолі й
@@ -14346,38 +14315,50 @@ function Get-BRAVOMaintenanceSummaryResult {
     # коду для master-вимикача. Асерти навмисно НЕ звіряють локалізований
     # (кириличний) текст статусу з захопленого виводу дочірнього процесу
     # (той самий ризик кодової сторінки, через який сусідні Scheduler/*
-    # тести вище звіряють лише англомовні маркери на кшталт "LIMSRoot"):
-    # ASCII-назва завдання "BRAVO BAZA Synchronization" з'являється двічі
-    # (рядок плану + заголовок підсумку), коли завдання заплановане, і
-    # рівно один раз (лише "вимкнено в конфігурації"), коли ні — рахунок
-    # входжень незалежний від кодової сторінки консолі.
+    # тести вище звіряють лише англомовні маркери на кшталт "LIMSRoot").
+    #
+    # РАХУНОК ВХОДЖЕНЬ НАЗВИ ЗАВДАННЯ ТУТ НЕ ПРАЦЮЄ (acceptance rc.3,
+    # LIMS-TOP, 13.09.2026). Кількість згадок "BRAVO BAZA Synchronization"
+    # залежить від того, чи завдання ВЖЕ зареєстроване в Планувальнику
+    # цієї машини: на чистому раннері CI вимкнене завдання згадується один
+    # раз, а на сервері з установленим комплектом — двічі (рядок плану
+    # "буде вимкнено" + запис у підсумку зі статусом "БУДЕ ВИМКНЕНО"),
+    # бо інсталятор мусить активно вимкнути наявне завдання. Обидві
+    # поведінки коректні; хибним був асерт.
+    #
+    # Тому маркер — розклад, а не кількість згадок: StartAt "00:00" в
+    # усьому BRAVO.config належить рівно BAZASync (решта завдань: 23:00,
+    # 23:55, 00:30). Заплановане завдання друкує свій час, вимкнене — ні,
+    # незалежно від стану Планувальника й кодової сторінки.
     $schedFixtureSftpBaseline = New-BRAVOSelfTestSchedulerFixtureConfig `
-        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
+        -LocalOverrides @{ 'componentSettings.SFTP.Enabled' = $true; 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true }
     $schedResultSftpBaseline = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpBaseline.ConfigPath
     $schedBaselineBazaSyncOccurrences = ([regex]::Matches($schedResultSftpBaseline.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
+    $schedBaselineBazaSyncScheduleMarkers = ([regex]::Matches($schedResultSftpBaseline.Output, [regex]::Escape('00:00'))).Count
     Test-BRAVOCondition `
         -Condition (
             $schedResultSftpBaseline.ExitCode -eq 0 -and
-            $schedBaselineBazaSyncOccurrences -eq 2
+            $schedBaselineBazaSyncOccurrences -ge 1 -and
+            $schedBaselineBazaSyncScheduleMarkers -ge 1
         ) `
         -Name 'Scheduler/BazaSyncTaskPlannedWhenSftpEnabled' `
-        -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' (2 входження: план + підсумок); отримано входжень: $schedBaselineBazaSyncOccurrences, ExitCode=$($schedResultSftpBaseline.ExitCode)"
+        -Failure "componentSettings.SFTP.Enabled=true (комплектний дефолт, BAZA_APP_SFTP=true) має планувати завдання 'BRAVO BAZA Synchronization' з розкладом 00:00; отримано згадок назви: $schedBaselineBazaSyncOccurrences, маркерів розкладу '00:00': $schedBaselineBazaSyncScheduleMarkers, ExitCode=$($schedResultSftpBaseline.ExitCode)"
 
     $schedFixtureSftpDisabled = New-BRAVOSelfTestSchedulerFixtureConfig `
-        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false
-    $schedSftpDisabledConfigText = [IO.File]::ReadAllText($schedFixtureSftpDisabled.ConfigPath, [Text.Encoding]::UTF8)
-    $schedSftpDisabledConfigText = [regex]::Replace(
-        $schedSftpDisabledConfigText, '(?s)(SFTP = @\{\r?\n\s*Enabled = )\$true', '${1}$false', 1)
-    [IO.File]::WriteAllText($schedFixtureSftpDisabled.ConfigPath, $schedSftpDisabledConfigText, (New-Object Text.UTF8Encoding($false)))
+        -BreakLimsRootViaFakeService $false -MaintenanceEnabled $false -RecoveryEnabled $false `
+        -LocalOverrides @{ 'componentSettings.SFTP.Enabled' = $false; 'componentSettings.Synchronization.BAZA_APP_SFTP' = $true }
     $schedResultSftpDisabled = Invoke-BRAVOSelfTestTaskInstallValidateOnly -ConfigPath $schedFixtureSftpDisabled.ConfigPath
     $schedDisabledBazaSyncOccurrences = ([regex]::Matches($schedResultSftpDisabled.Output, [regex]::Escape('BRAVO BAZA Synchronization'))).Count
+    $schedDisabledBazaSyncScheduleMarkers = ([regex]::Matches($schedResultSftpDisabled.Output, [regex]::Escape('00:00'))).Count
     Test-BRAVOCondition `
         -Condition (
             $schedResultSftpDisabled.ExitCode -eq 0 -and
-            $schedDisabledBazaSyncOccurrences -eq 1
+            $schedDisabledBazaSyncOccurrences -ge 1 -and
+            $schedDisabledBazaSyncScheduleMarkers -eq 0
         ) `
         -Name 'Scheduler/BazaSyncTaskSkippedWhenSftpGloballyDisabled' `
-        -Failure "componentSettings.SFTP.Enabled=false має нейтралізувати завдання 'BRAVO BAZA Synchronization' (installer вважає це валідним DISABLED/SKIP станом, ExitCode=0, лише 1 входження назви замість плану+підсумку); отримано входжень: $schedDisabledBazaSyncOccurrences, ExitCode=$($schedResultSftpDisabled.ExitCode)"
+        -Failure "componentSettings.SFTP.Enabled=false має нейтралізувати завдання 'BRAVO BAZA Synchronization' (installer вважає це валідним DISABLED/SKIP станом, ExitCode=0, завдання згадане, але БЕЗ розкладу 00:00); отримано згадок назви: $schedDisabledBazaSyncOccurrences, маркерів розкладу '00:00': $schedDisabledBazaSyncScheduleMarkers, ExitCode=$($schedResultSftpDisabled.ExitCode)"
 
     foreach ($schedFixtureSftpRootToClean in @($schedFixtureSftpBaseline.Root, $schedFixtureSftpDisabled.Root)) {
         if (-not [string]::IsNullOrWhiteSpace([string]$schedFixtureSftpRootToClean) -and
@@ -14414,6 +14395,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # -NoWrite) machine-global BRAVO_VERSION_STATE.json — сесійний scope
     # робить рядок "Версія" детермінованим і незалежним від стану хоста.
     $localOnlyIsolationPrevious = Enter-BRAVOSelfTestIsolationScope
+    Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_DRY_RUN.ps1 (LocalOnly fixture)'
     try {
         [Console]::OutputEncoding = [Text.Encoding]::UTF8
         $localOnlyDryRunOutput = [string](
@@ -14423,6 +14405,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         )
     } finally {
         [Console]::OutputEncoding = $localOnlyPreviousOutputEncoding
+        Write-BRAVOSelfTestFixtureBanner -Label 'BRAVO_DRY_RUN.ps1 (LocalOnly fixture)' -End
         Exit-BRAVOSelfTestIsolationScope -PreviousValues $localOnlyIsolationPrevious
     }
     Test-BRAVOCondition `
@@ -17154,6 +17137,20 @@ function Write-BRAVOLog {
     # викликається.
     Enter-BRAVOSelfTestSuite -Name 'ConfiguratorUI'
     . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1')
+    # DiskSpace: спільний operation-aware класифікатор вільного місця/доступу
+    # (fix/5.2.3-operation-aware-disk-space) — S1-S20, ізольовано від
+    # Archive/Maintenance інтеграції.
+    Enter-BRAVOSelfTestSuite -Name 'DiskSpace'
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DiskSpace.ps1')
+    # ArchiveDiskSpace: A1-A25, реальний виклик-сайт BRAVO_ARCHIV
+    # (Resolve-BRAVOArchiveSpaceDecision) — на відміну від DiskSpace.ps1
+    # вище, що тестує сам shared classifier ізольовано.
+    Enter-BRAVOSelfTestSuite -Name 'ArchiveDiskSpace'
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ArchiveDiskSpace.ps1')
+    # MaintenanceDiskSpace: M1-M11, реальний виклик-сайт BRAVO_MAINTENANCE
+    # (Invoke-BRAVOMaintenanceDiskSpaceCheck).
+    Enter-BRAVOSelfTestSuite -Name 'MaintenanceDiskSpace'
+    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1')
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
