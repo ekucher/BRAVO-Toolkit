@@ -5402,88 +5402,102 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             -Name 'Archive/EstimatedSpaceSkipsComponentWithoutHistoryOrMeasurableSource' `
             -Failure 'компонент без валідної історії і без заданого/вимірюваного Source не має з чого вивести вимогу — пропускається з оцінки, а не блокує прогін'
 
-        # C2 (5.2.4): той самий bootstrap, але джерело вимірюване. Вимога
-        # виводиться з нестиснутого розміру джерела — доведеної верхньої
-        # межі розміру архіву. Свідомо через РЕАЛЬНИЙ обхід файлової
-        # системи (без -SourceSizeOverrides): інакше production-гілка
-        # Get-ChildItem/Measure-Object лишилась би непокритою.
-        $estimatedSpaceBootstrapSource = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_SRC'
-        [void][IO.Directory]::CreateDirectory($estimatedSpaceBootstrapSource)
-        [IO.File]::WriteAllBytes((Join-Path $estimatedSpaceBootstrapSource 'payload.bin'), (New-Object byte[] 40000))
-        $estimatedSpaceBootstrapDest = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_BOOTSTRAP'
-        [void][IO.Directory]::CreateDirectory($estimatedSpaceBootstrapDest)
-        $estimateBootstrapSource = & $archiveEstimateRuntimeModule {
-            param($EnabledArchives, $Drives)
-            Get-BRAVOArchiveEstimatedSpaceRequirement `
-                -EnabledArchives $EnabledArchives `
-                -ArchiveFileFilter '*.mdz' `
-                -HashFileExtension '.sha512' `
-                -MarginPercent 25 `
-                -Drives $Drives
-        } @(@{ Type = 'BRAVOEXCH'; Source = $estimatedSpaceBootstrapSource; Destination = $estimatedSpaceBootstrapDest }) `
-          @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000; IsReady = $true })
-        Test-BRAVOCondition `
-            -Condition (
-                $estimateBootstrapSource.Success -and
-                -not $estimateBootstrapSource.ComponentEstimates[0].HasHistory -and
-                $estimateBootstrapSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
-                $estimateBootstrapSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
-                $estimateBootstrapSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
-                @($estimateBootstrapSource.VolumeStatus).Count -eq 1
-            ) `
-            -Name 'Archive/EstimatedSpaceBootstrapUsesSourceUpperBound' `
-            -Failure '5.2.4: компонент без історії, але з вимірюваним джерелом (40000 B), має отримати вимогу з доведеної верхньої межі 40000*1.02 = 40800 B і брати участь у розрахунку по тому — до 5.2.4 він мовчки випадав з оцінки взагалі'
+        # Три блоки 5.2.4 нижче виконуються у ДОЧІРНЬОМУ scope (`& { ... }`)
+        # — та сама причина, що й у Framework/Bootstrap*-блоках нижче:
+        # script-scope цього flat-файлу має ЖОРСТКИЙ ліміт PowerShell у 4096
+        # змінних, і кожна додана сюди top-level змінна не звільняється до
+        # кінця процесу. Після злиття лінії 5.2.4 у developer (де файл на ~2500
+        # рядків більший) сім локальних змінних цих блоків перевели ліміт через
+        # край: SessionStateOverflowException у teardown, ПІСЛЯ того як усі
+        # тести вже пройшли. Дочірній scope читає $estimatedSpaceTestRoot,
+        # $archiveEstimateRuntimeModule, $estimatedSpaceModelDir і
+        # $estimatedSpaceDriveLetter з батьківського, а Test-BRAVOCondition
+        # пише у $script:-лічильники — той самий механізм, що вже працює для
+        # решти дочірніх блоків файлу.
+        & {
+            # C2 (5.2.4): той самий bootstrap, але джерело вимірюване. Вимога
+            # виводиться з нестиснутого розміру джерела — доведеної верхньої
+            # межі розміру архіву. Свідомо через РЕАЛЬНИЙ обхід файлової
+            # системи (без -SourceSizeOverrides): інакше production-гілка
+            # Get-ChildItem/Measure-Object лишилась би непокритою.
+            $estimatedSpaceBootstrapSource = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_SRC'
+            [void][IO.Directory]::CreateDirectory($estimatedSpaceBootstrapSource)
+            [IO.File]::WriteAllBytes((Join-Path $estimatedSpaceBootstrapSource 'payload.bin'), (New-Object byte[] 40000))
+            $estimatedSpaceBootstrapDest = Join-Path $estimatedSpaceTestRoot 'BRAVOEXCH_BOOTSTRAP'
+            [void][IO.Directory]::CreateDirectory($estimatedSpaceBootstrapDest)
+            $estimateBootstrapSource = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'BRAVOEXCH'; Source = $estimatedSpaceBootstrapSource; Destination = $estimatedSpaceBootstrapDest }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 100000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateBootstrapSource.Success -and
+                    -not $estimateBootstrapSource.ComponentEstimates[0].HasHistory -and
+                    $estimateBootstrapSource.ComponentEstimates[0].SourceBytes -eq 40000 -and
+                    $estimateBootstrapSource.ComponentEstimates[0].EstimateBasis -eq 'SourceUpperBound' -and
+                    $estimateBootstrapSource.ComponentEstimates[0].EstimatedBytes -eq 40800 -and
+                    @($estimateBootstrapSource.VolumeStatus).Count -eq 1
+                ) `
+                -Name 'Archive/EstimatedSpaceBootstrapUsesSourceUpperBound' `
+                -Failure '5.2.4: компонент без історії, але з вимірюваним джерелом (40000 B), має отримати вимогу з доведеної верхньої межі 40000*1.02 = 40800 B і брати участь у розрахунку по тому — до 5.2.4 він мовчки випадав з оцінки взагалі'
 
-        # C3 (5.2.4): джерело менше за history-прогноз — межа працює як
-        # СТЕЛЯ, роблячи вимогу тіснішою. Архів не може бути більшим за
-        # своє джерело, тож тримати стару, більшу цифру нема підстав.
-        $estimatedSpaceShrunkSource = Join-Path $estimatedSpaceTestRoot 'MODEL_SRC_SMALL'
-        [void][IO.Directory]::CreateDirectory($estimatedSpaceShrunkSource)
-        [IO.File]::WriteAllBytes((Join-Path $estimatedSpaceShrunkSource 'payload.bin'), (New-Object byte[] 50000))
-        $estimateCapped = & $archiveEstimateRuntimeModule {
-            param($EnabledArchives, $Drives)
-            Get-BRAVOArchiveEstimatedSpaceRequirement `
-                -EnabledArchives $EnabledArchives `
-                -ArchiveFileFilter '*.mdz' `
-                -HashFileExtension '.sha512' `
-                -MarginPercent 25 `
-                -Drives $Drives
-        } @(@{ Type = 'MODEL'; Source = $estimatedSpaceShrunkSource; Destination = $estimatedSpaceModelDir }) `
-          @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 200000; IsReady = $true })
-        Test-BRAVOCondition `
-            -Condition (
-                $estimateCapped.Success -and
-                $estimateCapped.ComponentEstimates[0].HasHistory -and
-                $estimateCapped.ComponentEstimates[0].LastValidBytes -eq 100000 -and
-                $estimateCapped.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
-                $estimateCapped.ComponentEstimates[0].EstimatedBytes -eq 51000
-            ) `
-            -Failure '5.2.4: history-прогноз 125000 B має обмежуватись доведеною межею джерела 50000*1.02 = 51000 B; стеля робить вимогу тіснішою і ніколи не більшою' `
-            -Name 'Archive/EstimatedSpaceHistoryCappedBySmallerSource'
+            # C3 (5.2.4): джерело менше за history-прогноз — межа працює як
+            # СТЕЛЯ, роблячи вимогу тіснішою. Архів не може бути більшим за
+            # своє джерело, тож тримати стару, більшу цифру нема підстав.
+            $estimatedSpaceShrunkSource = Join-Path $estimatedSpaceTestRoot 'MODEL_SRC_SMALL'
+            [void][IO.Directory]::CreateDirectory($estimatedSpaceShrunkSource)
+            [IO.File]::WriteAllBytes((Join-Path $estimatedSpaceShrunkSource 'payload.bin'), (New-Object byte[] 50000))
+            $estimateCapped = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'MODEL'; Source = $estimatedSpaceShrunkSource; Destination = $estimatedSpaceModelDir }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 200000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateCapped.Success -and
+                    $estimateCapped.ComponentEstimates[0].HasHistory -and
+                    $estimateCapped.ComponentEstimates[0].LastValidBytes -eq 100000 -and
+                    $estimateCapped.ComponentEstimates[0].EstimateBasis -eq 'HistoryCappedBySource' -and
+                    $estimateCapped.ComponentEstimates[0].EstimatedBytes -eq 51000
+                ) `
+                -Failure '5.2.4: history-прогноз 125000 B має обмежуватись доведеною межею джерела 50000*1.02 = 51000 B; стеля робить вимогу тіснішою і ніколи не більшою' `
+                -Name 'Archive/EstimatedSpaceHistoryCappedBySmallerSource'
 
-        # C4 (5.2.4): межа НЕ застосовується, коли джерело порожнє —
-        # інакше нульове/недоступне джерело обнулило б вимогу компонента,
-        # який насправді має що архівувати.
-        $estimatedSpaceEmptySource = Join-Path $estimatedSpaceTestRoot 'MODEL_SRC_EMPTY'
-        [void][IO.Directory]::CreateDirectory($estimatedSpaceEmptySource)
-        $estimateEmptySource = & $archiveEstimateRuntimeModule {
-            param($EnabledArchives, $Drives)
-            Get-BRAVOArchiveEstimatedSpaceRequirement `
-                -EnabledArchives $EnabledArchives `
-                -ArchiveFileFilter '*.mdz' `
-                -HashFileExtension '.sha512' `
-                -MarginPercent 25 `
-                -Drives $Drives
-        } @(@{ Type = 'MODEL'; Source = $estimatedSpaceEmptySource; Destination = $estimatedSpaceModelDir }) `
-          @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 200000; IsReady = $true })
-        Test-BRAVOCondition `
-            -Condition (
-                $estimateEmptySource.ComponentEstimates[0].EstimateBasis -eq 'History' -and
-                $estimateEmptySource.ComponentEstimates[0].EstimatedBytes -eq 125000 -and
-                $null -eq $estimateEmptySource.ComponentEstimates[0].SourceUpperBoundBytes
-            ) `
-            -Name 'Archive/EstimatedSpaceEmptySourceDoesNotZeroRequirement' `
-            -Failure 'порожнє джерело не дає стелі: вимога має лишитись history-оцінкою 125000 B, інакше нульовий вимір обнулив би захист'
+            # C4 (5.2.4): межа НЕ застосовується, коли джерело порожнє —
+            # інакше нульове/недоступне джерело обнулило б вимогу компонента,
+            # який насправді має що архівувати.
+            $estimatedSpaceEmptySource = Join-Path $estimatedSpaceTestRoot 'MODEL_SRC_EMPTY'
+            [void][IO.Directory]::CreateDirectory($estimatedSpaceEmptySource)
+            $estimateEmptySource = & $archiveEstimateRuntimeModule {
+                param($EnabledArchives, $Drives)
+                Get-BRAVOArchiveEstimatedSpaceRequirement `
+                    -EnabledArchives $EnabledArchives `
+                    -ArchiveFileFilter '*.mdz' `
+                    -HashFileExtension '.sha512' `
+                    -MarginPercent 25 `
+                    -Drives $Drives
+            } @(@{ Type = 'MODEL'; Source = $estimatedSpaceEmptySource; Destination = $estimatedSpaceModelDir }) `
+              @(@{ Drive = $estimatedSpaceDriveLetter; AvailableFreeSpace = 200000; IsReady = $true })
+            Test-BRAVOCondition `
+                -Condition (
+                    $estimateEmptySource.ComponentEstimates[0].EstimateBasis -eq 'History' -and
+                    $estimateEmptySource.ComponentEstimates[0].EstimatedBytes -eq 125000 -and
+                    $null -eq $estimateEmptySource.ComponentEstimates[0].SourceUpperBoundBytes
+                ) `
+                -Name 'Archive/EstimatedSpaceEmptySourceDoesNotZeroRequirement' `
+                -Failure 'порожнє джерело не дає стелі: вимога має лишитись history-оцінкою 125000 B, інакше нульовий вимір обнулив би захист'
+        }
 
         # D: два компоненти на одному диску — потреби сумуються на цей диск,
         # а не перевіряються незалежно (інакше можна двічі "витратити" те саме
