@@ -1,23 +1,25 @@
-# 5.3.0 — health-сигнал вільного місця: том менший за поріг і лічильник попереджень
+# 5.3.0 — вільне місце: health-сигнал, звітність рішення і симетрія Archive/Maintenance
 
-Статус: **специфікація, до реалізації**. Два залишкові пункти боргу з
-`docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md` §8.
+Статус: **специфікація, до реалізації**. Пункти 1-2 — залишковий борг з
+`docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md` §8. Пункти 3-4 знайдено
+під час real-server acceptance 5.2.4-rc.1 на `LIMS-TOP` 13.09.2026.
 
 > **Що вже зроблено іншими релізами.** Первісна редакція цього документа
 > охоплювала повернення below-floor relaxation і peak-safe оцінку. Це
 > реалізовано в **5.2.4** (`hotfix/5.2.4`): `RequirementPolicy` для Archive
 > переведено на `ArchivePeakSafe`, а вимогу підперто доведеною верхньою
-> межею з нестиснутого розміру джерела. Тут лишились тільки два пункти,
-> яких 5.2.4 не торкається.
+> межею з нестиснутого розміру джерела. Жоден із пунктів нижче 5.2.4 не
+> торкається — три з них вона робить помітнішими, а один уперше проявила.
 >
 > **Передумова.** 5.2.4 має бути промотована у stable і синхронізована в
-> `developer` за `RELEASE_POLICY.md` §12.2 до початку цієї роботи. Обидва
-> пункти нижче лежать поруч зі зміненим у 5.2.4 кодом, і робити їх на
-> несинхронізованій базі означає гарантований конфлікт злиття.
+> `developer` за `RELEASE_POLICY.md` §12.2 до початку цієї роботи. Усі
+> чотири пункти нижче лежать поруч зі зміненим у 5.2.4 кодом, і робити їх
+> на несинхронізованій базі означає гарантований конфлікт злиття.
 
-Спільна теза обох пунктів: після 5.2.4 `MinimumFreeSpaceGB` — це **сигнал
-здоров'я тому**, а не гейт операції. Сигнал має бути (1) досяжним і
-(2) видимим у підсумку. Зараз він не є ані тим, ані тим.
+Спільна теза: після 5.2.4 `MinimumFreeSpaceGB` — це **сигнал здоров'я
+тому**, а не гейт операції. Сигнал має бути досяжним (§1), видимим у
+підсумку (§2), правдиво атрибутованим (§3) і однаково трактованим усіма
+операціями (§4). Зараз він не є жодним із чотирьох.
 
 ---
 
@@ -152,6 +154,183 @@ foreach ($warningText in @($classified.Warnings)) {
 
 ---
 
+## 3. Зведений рядок рішення приписує шляхам чужу причину
+
+### Проблема
+
+`Resolve-BRAVODiskSpaceGroupDecision` ухвалює рішення на групу
+`CapacityKey`, але операторський рядок формує
+`Group-BRAVODiskSpaceMessagesByCapacityKey`
+(`modules/BRAVO.DiskSpace/BRAVO.DiskSpace.psm1:883`), яка групує **лише за
+`CapacityKey`**, а `Reason` бере від першої entity й більше не переглядає:
+
+```powershell
+$key = if ([string]::IsNullOrWhiteSpace([string]$entity.CapacityKey)) {
+    "path:$($entity.DisplayPath)"
+} else {
+    "key:$($entity.CapacityKey)"
+}
+if (-not $groups.Contains($key)) {
+    $groups[$key] = [pscustomobject]@{ Reason = $entity.Reason; Paths = ... }
+}
+[void]$groups[$key].Paths.Add([string]$entity.DisplayPath)
+```
+
+Рядки 894-902. Шляхи додаються всі, причина лишається від першого.
+
+Entity з `RequiresFreeSpace=false` вирішуються окремо у фазі 1 (крок 7,
+рядок ~610) і не входять у групу вимоги — але в **повідомлення** входять,
+бо `CapacityKey` у них той самий. Коли на одному томі зійшлися health-only
+entity і destination із різними причинами, усі отримують причину першої.
+
+### Доказ
+
+`BRAVO_ARCHIV` 5.2.4-rc.1 на `LIMS-TOP`, 13.09.2026 17:01, поріг 1000 GB.
+Структурований лог рішення (`Write-BRAVODiskSpaceDecisionLog`):
+
+```
+DisplayPath=D:\                      Status=Warning Blocks=False Reason=BelowHealthFloorNoFreeSpaceRequirement
+DisplayPath=D:\LIMS\ARCHIV\MODEL     Status=Warning Blocks=False Reason=BelowHealthFloorButRequirementSatisfied
+DisplayPath=D:\LIMS\ARCHIV\BLOG      Status=Warning Blocks=False Reason=BelowHealthFloorButRequirementSatisfied
+DisplayPath=D:\LIMS\ARCHIV\BRAVOEXCH Status=Warning Blocks=False Reason=BelowHealthFloorButRequirementSatisfied
+```
+
+Зведений рядок у тому самому прогоні:
+
+```
+D:\, D:\LIMS\ARCHIV\MODEL, D:\LIMS\ARCHIV\BLOG, D:\LIMS\ARCHIV\BRAVOEXCH: BelowHealthFloorNoFreeSpaceRequirement
+```
+
+Трьом із чотирьох шляхів приписано протилежне за змістом: «вимоги немає»
+замість «вимога є і задоволена».
+
+Дефект успадкований з 5.2.3 (функція з'явилася в `236e559`, присутня в
+`origin/master` без змін; 5.2.4 її не торкалася). До 5.2.4 він був
+непомітний: при порозі вище за вільне місце всі destination блокувалися з
+`BelowFloorEstimateNotPeakSafe`, тобто причина в групі збігалася. 5.2.4
+вперше створює на одному томі **змішані причини**.
+
+Та сама функція обслуговує `Problems` (рядок 878), тож при блокуванні з
+різними причинами на одному томі оператор так само побачить одну.
+
+### Пропозиція
+
+Додати `Reason` у ключ групування. Намір §51.1 зберігається повністю —
+«спільна умова повідомляється раз на capacity resource», а спільна умова
+це саме однакова причина. Очікуваний вивід для прикладу вище:
+
+```
+D:\: BelowHealthFloorNoFreeSpaceRequirement
+D:\LIMS\ARCHIV\MODEL, D:\LIMS\ARCHIV\BLOG, D:\LIMS\ARCHIV\BRAVOEXCH: BelowHealthFloorButRequirementSatisfied
+```
+
+Дедуплікація не втрачається: шляхи з однаковою причиною на одному томі
+далі йдуть одним рядком.
+
+### Критерії приймання
+
+1. Том з кількома entity **однієї** причини — один рядок, як зараз
+   (без регресії дедуплікації).
+2. Том з entity **різних** причин — окремий рядок на кожну причину,
+   кожен шлях лише у своєму.
+3. Жоден шлях не з'являється в рядку з причиною, відмінною від його
+   `Reason` у структурованому лозі.
+4. Те саме для `Problems`, не лише для `Warnings`.
+5. Entity без `CapacityKey` далі групуються по `DisplayPath` окремими
+   повідомленнями.
+
+---
+
+## 4. Maintenance трактує поріг інакше за Archive — на тому самому ключі
+
+### Проблема
+
+`Get-BRAVOMaintenanceDiskSpaceEntities`
+(`modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1:6650-6658`)
+створює єдину write-required entity (`$ROOT_LIMS`) з жорстко заданим
+`RequirementGranularity = 'Unknown'` (рядок 6655), бо в Maintenance немає
+аналога `Get-BRAVOArchiveEstimatedSpaceRequirement`. Коментар у коді
+називає це чесно.
+
+Наслідок: `GroupRequirementState` ніколи не стає `Known`, гілка з
+`RequirementPolicy` (рядки 751-763) недосяжна, а `MaintenanceExactOnly`
+(рядок 6703) — **мертве значення**. Виконується завжди fallback:
+
+```powershell
+$lowerBound = 0.0            # оцінки немає
+$residual = $available
+if ($residual -lt $floor) {
+    $groupStatus = 'Error'; $groupBlocks = $true
+    $groupReason = 'BelowFallbackFloorNoEstimate'
+}
+```
+
+Рядки 774-786. Тобто для Maintenance поріг лишився **жорстким гейтом**,
+яким він був у 5.2.3.
+
+Обидві операції читають **той самий ключ**:
+`maintenanceSettings.Limits.MinimumFreeSpaceGB`
+(`BRAVO.Maintenance.Runtime.ps1:335`, `BRAVO.Archive.Runtime.ps1:135`).
+
+### Доказ
+
+`LIMS-TOP`, 13.09.2026, том `D:` — 931.51 GB ємності, ~715 GB вільних,
+фактична потреба архівації 0.0686 GB:
+
+| Поріг | `BRAVO_ARCHIV` | `BRAVO_MAINTENANCE` |
+|---|---|---|
+| 20 GB | Success, exit 0 | Success |
+| 730 GB | Warning `BelowHealthFloorButRequirementSatisfied`, архіви 3/3, exit 10 | не прогонялось |
+| 800 GB | не прогонялось | `BelowFallbackFloorNoEstimate`, exit 60, 2 сек (17:41) |
+| 1000 GB | Success, архіви 3/3, SFTP 7/7, exit 0 (17:01) | `BelowFallbackFloorNoEstimate`, exit 60, 2 сек (17:07) |
+
+Обслуговування завершується за дві секунди, не виконавши жодного кроку, і
+надсилає критичне сповіщення.
+
+### Чому це операційно небезпечно
+
+Після 5.2.4 оператор, який підняв поріг заради толерантності архівації,
+**тихо ламає обслуговування**. Архівація проходить і рапортує успіх;
+Maintenance падає — але зазвичай уночі, за розкладом, і зв'язок із правкою
+конфігурації не очевидний. Дві операції з одного комплекту дають
+протилежні відповіді на те саме питання про той самий том.
+
+### Варіанти рішення
+
+Рішення про підхід — за власником; нижче компроміси, не рекомендація до
+негайної реалізації.
+
+1. **Дати Maintenance власну оцінку потреби.** Найближче за духом до 5.2.4
+   і робить `MaintenanceExactOnly` живим. Найдорожче: потрібен
+   консервативний верхній кордон для ротації журналів і очищення.
+2. **Дозволити below-floor як WARNING і без оцінки** — для
+   `MaintenanceWorkingVolume`, з окремою `Reason`. Дешево, але послаблює
+   єдиний наявний захист робочого тому; вимагає окремого обґрунтування,
+   бо суперечить fail-closed за замовчуванням.
+3. **Розділити ключі** (`Limits.MinimumFreeSpaceGB` для health,
+   окремий для Maintenance-гейта). Знімає приховану зв'язність, але додає
+   конфігураційний ключ і міграційний борг.
+4. **Лишити як є, задокументувавши.** Прийнятно, лише якщо поріг у парку
+   тримається реалістичним; тоді потрібна явна перевірка при розкатці.
+
+Незалежно від вибору: розбіжність має бути **видимою**. Мінімум —
+діагностика, коли `MinimumFreeSpaceGB` перевищує ємність тому, до якого
+застосовується (на `LIMS-TOP` поріг 1000 GB стояв на томі 931.51 GB, і
+жоден рядок цього не назвав).
+
+### Критерії приймання
+
+1. Поведінка Archive і Maintenance на однаковому вході описана одним
+   правилом, або розбіжність явно задокументована і видима в журналі.
+2. Поріг, більший за ємність тому, діагностується окремим повідомленням
+   із назвою фактичної ємності.
+3. Захист робочого тому Maintenance не послаблено: стан, за якого місця
+   реально бракує, блокує як і раніше.
+4. `MaintenanceExactOnly` або стає досяжним, або видаляється з
+   `ValidateSet` як мертве значення — мовчазного мертвого коду не лишається.
+
+---
+
 ## Зміни в self-test
 
 | Серія | Що додати |
@@ -161,6 +340,9 @@ foreach ($warningText in @($classified.Warnings)) {
 | `Maintenance` | попередження preflight потрапляє в `Попереджень` |
 | `Maintenance` | нумерація `[N/Total]` не зсунулась після додавання outcome |
 | `ConsoleUX` | підсумок не суперечить коду завершення (`Попереджень: 0` при exit 10 неможливий) |
+| `DiskSpace` | змішані причини на одному `CapacityKey` → окремий рядок на причину; однакові причини → один рядок |
+| `DiskSpace` | те саме для `Problems`, не лише для `Warnings` |
+| `Maintenance` | поведінка `MaintenanceWorkingVolume` при below-floor — за обраним у §4 варіантом |
 
 Наявні `DiskSpace/S*` і `Maintenance/M*` мають лишитись зеленими **без
 правок**. Якщо котрась падає — це регресія, а не очікуване оновлення.
@@ -174,5 +356,8 @@ foreach ($warningText in @($classified.Warnings)) {
   запису на том, де місця бракує.
 - Будь-яка зміна `EstimatedRequirementNotMet` — жорстке блокування
   лишається.
-- Політика `ArchivePeakSafe` і оцінка вимоги — зроблено в 5.2.4, повторно
-  не переглядається.
+- Політика `ArchivePeakSafe` і оцінка вимоги для Archive — зроблено в
+  5.2.4, повторно не переглядається. §4 стосується Maintenance, не Archive.
+- Формат структурованого рядка `Write-BRAVODiskSpaceDecisionLog`: він уже
+  дає правдиву причину на кожну entity, і саме він лишається джерелом
+  істини для §3.
