@@ -152,7 +152,24 @@ if (-not $isElevated) {
     $elevated = Start-Process -FilePath $powerShellPath `
         -ArgumentList ($argumentParts -join ' ') `
         -Verb RunAs -Wait -PassThru -WindowStyle Normal
-    exit $elevated.ExitCode
+
+    # Елевований прогін іде в ОКРЕМОМУ вікні, тому батьківський процес мусить
+    # сказати, чим він скінчився. Без цього оператор бачив лише "запит UAC" і
+    # одразу "Натисніть Enter" — без жодної ознаки, спрацювало щось чи ні.
+    if ($null -eq $elevated) {
+        throw 'UAC-перезапуск не повернув об''єкт процесу — підняття прав не відбулося.'
+    }
+    $elevatedCode = [int]$elevated.ExitCode
+    Write-Host ''
+    if ($elevatedCode -eq 0) {
+        Write-Ok 'елевований прогін завершився успішно (код 0)'
+    } else {
+        Write-Bad ('елевований прогін завершився кодом ' + $elevatedCode)
+        Write-Host '  Вивід ішов в ОКРЕМЕ вікно. Якщо воно закрилося раніше, ніж ви встигли' -ForegroundColor Yellow
+        Write-Host '  прочитати, запустіть скрипт з консолі, відкритої через "Запуск від імені' -ForegroundColor Yellow
+        Write-Host '  адміністратора" — тоді весь вивід лишиться в одному вікні.' -ForegroundColor Yellow
+    }
+    exit $elevatedCode
 }
 Write-Ok 'запущено з піднятими правами'
 
