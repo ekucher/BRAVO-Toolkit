@@ -27,6 +27,14 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Операторський інструмент: помилка має читатися одним рядком, а не
+# стек-дампом PowerShell. Код завершення 1 = скрипт зупинився сам.
+trap {
+    Write-Host ''
+    Write-Host ('ЗУПИНЕНО: ' + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
+
 function Write-Step { param([string]$T) Write-Host ''; Write-Host ('=== ' + $T) -ForegroundColor Cyan }
 function Write-Ok   { param([string]$T) Write-Host ('  [OK]    ' + $T) -ForegroundColor Green }
 function Write-Bad  { param([string]$T) Write-Host ('  [FAIL]  ' + $T) -ForegroundColor Red }
@@ -188,6 +196,49 @@ if ([string]$stagedVersion.packageVersion -ne $targetVersion) {
 }
 Write-Ok ('розпаковано: ' + $stagedVersion.packageVersion + ' / ' + $stagedVersion.releaseChannel +
           ' (sourceCommit ' + $stagedVersion.sourceCommit + ')')
+
+# Копіювання поверх НЕ видаляє файлів. Скрипт .ps1/.psm1/.psd1, якого немає
+# в новому RUNTIME_MANIFEST.json, після оновлення лишиться в комплекті — і
+# BRAVO_RUNTIME_GUARD заблокує запуск кодом 33 ("сторонні скрипти в
+# комплекті"). Тому шукаємо такі файли ДО заміни, а не після провалу гейта.
+#
+# Це загальна перевірка замість припущення "між версією X і цільовою нічого
+# не видалено": вона однаково працює для будь-якої встановленої версії.
+# Файли не видаляються автоматично — видалення в production-каталозі
+# лишається рішенням оператора.
+
+$stagedManifest = Get-Content -LiteralPath (Join-Path $staged 'RUNTIME_MANIFEST.json') `
+    -Raw -Encoding UTF8 | ConvertFrom-Json
+$expectedRelative = New-Object 'System.Collections.Generic.HashSet[string]' `
+    ([StringComparer]::OrdinalIgnoreCase)
+foreach ($property in $stagedManifest.files.PSObject.Properties) {
+    [void]$expectedRelative.Add($property.Name)
+}
+
+# Той самий набір виключень, що в BRAVO_RUNTIME_GUARD.ps1.
+$guardExclusion = '^(LOGS|\.git|\.vscode|\.claude|local-backups)[\\/]'
+$runtimePrefixLength = $RuntimeRoot.TrimEnd('\', '/').Length + 1
+$orphans = New-Object System.Collections.Generic.List[string]
+foreach ($file in (Get-ChildItem -LiteralPath $RuntimeRoot -Recurse -File -ErrorAction SilentlyContinue)) {
+    if (@('.ps1', '.psm1', '.psd1') -notcontains $file.Extension.ToLowerInvariant()) { continue }
+    $relative = $file.FullName.Substring($runtimePrefixLength)
+    if ($relative -match $guardExclusion) { continue }
+    if (-not $expectedRelative.Contains($relative)) { [void]$orphans.Add($relative) }
+}
+
+if ($orphans.Count -gt 0) {
+    Write-Bad ('у комплекті ' + $orphans.Count + ' скрипт(ів), яких немає в новому маніфесті:')
+    foreach ($o in $orphans) { Write-Host ('      ' + $o) -ForegroundColor Red }
+    Write-Host ''
+    Write-Host '  Копіювання поверх їх не видалить, і після оновлення BRAVO_RUNTIME_GUARD' -ForegroundColor Yellow
+    Write-Host '  заблокує запуск кодом 33. Приберіть їх (зберігши власну копію) і' -ForegroundColor Yellow
+    Write-Host '  повторіть. Типові кандидати після давніх оновлень поверх — застарілі' -ForegroundColor Yellow
+    Write-Host '  кореневі бібліотеки BRAVO_COMPATIBILITY.ps1, BRAVO_CREDENTIALS.ps1,' -ForegroundColor Yellow
+    Write-Host '  BRAVO_HELPER_LOGGING.ps1, BRAVO_NOTIFICATION.ps1, BRAVO_ARCHIVE_HELPERS.ps1,' -ForegroundColor Yellow
+    Write-Host '  BRAVO_ARCHIV_RUNTIME.ps1, BRAVO_SYSTEM_HELPERS.ps1 (README §10, пункт 4).' -ForegroundColor Yellow
+    exit 1
+}
+Write-Ok 'сторонніх скриптів у комплекті немає'
 
 # --- 4. Backup копіюванням --------------------------------------------------
 

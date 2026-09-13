@@ -26,6 +26,14 @@ param(
 #     цілісності — це доказ, а не сміття.
 
 $ErrorActionPreference = 'Stop'
+
+# Операторський інструмент: помилка має читатися одним рядком, а не
+# стек-дампом PowerShell. Код завершення 1 = скрипт зупинився сам.
+trap {
+    Write-Host ''
+    Write-Host ('ЗУПИНЕНО: ' + $_.Exception.Message) -ForegroundColor Red
+    exit 1
+}
 Set-StrictMode -Version 2.0
 
 function Write-Step { param([string]$T) Write-Host ''; Write-Host ('=== ' + $T) -ForegroundColor Cyan }
