@@ -1,7 +1,8 @@
 # BRAVO-Toolkit 5.2.3-rc.6 — зведений acceptance evidence (2026-09-13)
 
-Статус: **PASS з відкритими позиціями** — сценарій 1, restore drill і ядро
-§9.1 закриті на реальному сервері; три пункти лишаються відкритими (розділ 8). Документ
+Статус: **PASS з однією відкритою позицією** — усі обов'язкові перевірки
+§9.1, включно із запуском від `NT AUTHORITY\SYSTEM`, закриті на реальному
+сервері; відкритими лишаються тільки негативні сценарії 4/5 (розділ 8). Документ
 фіксує докази й не є авторизацією промоції: вердикт acceptance і рішення про
 промоцію — окремі кроки (`RELEASE_POLICY.md` §9.3, §4).
 
@@ -14,7 +15,7 @@
 | sourceCommit / buildId (`VERSION.json`) | `b872ce68cd970594e18b4b9688b3e35a6799a9a5` / `b872ce6` |
 | releaseChannel | `prerelease` |
 | Артефакт | `BRAVO-Toolkit-5.2.3-rc.6.zip`, зібраний і провалідований workflow `Release artifact` (run 34728417679) |
-| Розгорнуто на | `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]), `C:\Temp\BRAVO_523_rc6\kit` |
+| Розгорнуто на | `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]): спершу `C:\Temp\BRAVO_523_rc6\kit` (розділи 3-4), далі — бойовий runtime-корінь `C:\Program Files\BRAVO-Toolkit` (розділ 4.4) |
 | Site-оверлей | `BRAVO.local.config`: `maintenanceSettings.Limits.ExcludedDrives = @('F:\','G:\')` |
 | Базова stable (поведінковий baseline) | `5.2.2` (тег `v5.2.2` = `15ce820`) |
 
@@ -69,8 +70,8 @@
 | Коди завершення | Archive «УСПIШНО», Maintenance `0 — Success` | консоль + журнали |
 | Сумісність | Windows PowerShell 5.1.19041.7725, LIMS-TOP | заголовки журналів |
 | Self-test на сервері | **1535 PASS / 0 FAIL**, exit 0 | `HELPERS/BRAVO_SELF_TEST_20260913_034434` |
-| Запуск від `NT AUTHORITY\SYSTEM` | **не виконувався** (усі прогони MANUAL) | розділ 8 |
-| `BRAVO_DRY_RUN.ps1 -TestAccess` під SYSTEM | **не виконувався** (був READ-ONLY під `LIMS-TOP\LimsTop`) | розділ 8 |
+| Запуск від `NT AUTHORITY\SYSTEM` | **PASS** — `BRAVO_ARCHIV_HEALTH` і `BRAVO_MAINTENANCE` запущені вручну з бойового кореня, `LastTaskResult = 0` в обох | розділ 4.4 |
+| Доступи під SYSTEM (`-TestAccess`-еквівалент) | **PASS** — наскрізний dry-run `BRAVO_TASKS_DIAGNOSE` від `NT AUTHORITY\SYSTEM`: write-проби, обидва креденшели, Discord HTTP 204 | розділ 4.4 |
 | Restore test з explicit `-GenerationId` | **PASS** — 3/3 компоненти з генерації `20260913_035104` | розділ 4.2 |
 
 ## 4. Нова поверхня 5.2.3 — operation-aware disk-space policy
@@ -146,6 +147,40 @@ runtime-кореня з ACL, які виставляє `BRAVO_TASKS_INSTALL`.
 **Це не дефект кандидата** (та сама дія з тими самими аргументами працює),
 але й **не доказ** SYSTEM-виконання. Пункт §9.1 «запуск завдань від SYSTEM»
 лишається відкритим — див. розділ 8.
+### 4.4. Розгортання в бойовий runtime-корінь і запуск від SYSTEM
+
+13.09.2026, `LIMS-TOP`. Кандидат розгорнуто в реальний runtime-корінь
+`C:\Program Files\BRAVO-Toolkit` — саме той шлях, з якого працюють бойові
+завдання Планувальника.
+
+**Знахідка на production (не дефект кандидата).** До розгортання всі чотири
+завдання гілки `\BRAVO\` (`BRAVO_ARCHIV`, `BRAVO_MAINTENANCE`,
+`BRAVO_ARCHIV_HEALTH`, `BRAVO BAZA Synchronization`) вказували на
+`C:\Temp\BRAVO_523_rc3\kit` — тобто нічна архівація о 23:00 виконалася б із
+тимчасової теки без ACL і з кодом rc.3, у якому міститься дефект disk-space.
+Так лишилось після acceptance-прогонів rc.3. Розгортання цю конфігурацію
+виправило.
+
+| Крок | Результат |
+|---|---|
+| Попередній вміст кореня | `5.2.3-rc.3` (prerelease, buildId `a008f78`) — збережено в `C:\BRAVO-Toolkit.old_5.2.3-rc.3` (311 файлів) |
+| Порівняння `BRAVO.config` (встановлений vs комплект) | ідентичні (`Compare-Object` без виводу) |
+| `robocopy … /MIR /XD LOGS /XF BRAVO.local.config BRAVO.config` | exit 1 (успіх), 125 файлів; legacy-бібліотеки в корені прибрано; `VERSION.json` → **5.2.3-rc.6 / b872ce6** |
+| `BRAVO_RUNTIME_GUARD.ps1` | «Цілісність комплекту підтверджена (перевірено файлів: 87)», exit **0** |
+| Повний self-test із бойового кореня | **1535 перевірок / 0 помилок**, exit **0** (включно з `DiskSpace/S63`, `S64`, серією `Maintenance/M*`) |
+| `BRAVO_SETUP.ps1 -ValidateOnly` | ГОТОВО ДО ЗАПУСКУ: dry-run 1 — PASS 48 / WARN 2 / FAIL 0; dry-run 2 з write-пробами — PASS 63 / WARN 0 / FAIL 0; SFTP-endpoint автентифіковано |
+| `BRAVO_SETUP.ps1` (повний) | ACL рекурсивно застосовано до `C:\Program Files\BRAVO-Toolkit`; 4 завдання **UPDATED**, 0 помилок |
+| `BRAVO_TASKS_DIAGNOSE` наскрізний dry-run від `NT AUTHORITY\SYSTEM` | усі перевірки PASS: write-проби під `C:\WINDOWS\SystemTemp\`, креденшели для `LimsTop` і `SYSTEM` — FOUND, тестове повідомлення Discord — HTTP 204 |
+| Аргументи завдань після переустановки | усі шляхи — `C:\Program Files\BRAVO-Toolkit\…`; **жодного входження `C:\Temp`** |
+| Ручний запуск `\BRAVO\BRAVO_ARCHIV_HEALTH` (принципал SYSTEM) | `LastTaskResult = 0` |
+| Ручний запуск `\BRAVO\BRAVO_MAINTENANCE` (принципал SYSTEM) | `LastTaskResult = 0` |
+
+Це закриває пункти §9.1 «запуск завдань від SYSTEM» і «доступи під SYSTEM»:
+на відміну від спроби з `C:\Temp` (розділ 4.3), тут перевірено і ACL бойового
+кореня, і креденшели SYSTEM, і реальні шляхи. Завдання `BRAVO_RESTORE_VERIFY`
+у цій гілці не існує (з'являється лише в 5.3.0), тому SYSTEM-виконання
+підтверджено наявними завданнями Health і Maintenance.
+
 ## 5. Передпольотна інвентаризація парку
 
 | Сервер | `MinimumFreeSpaceGB` | Фактично на required томі | `ExcludedDrives` | Рішення |
@@ -161,19 +196,22 @@ OS:                   Windows (LIMS-TOP)
 PowerShell:           5.1.19041.7725
 Previous version:     5.2.3-rc.3 (прогін 13.09 01:26-01:32), stable у парку — 5.2.2
 Tested version:       5.2.3-rc.6 (stamp 124140b, provenance b872ce6)
-Install/update result: OK — артефакт розгорнуто в C:\Temp\BRAVO_523_rc6\kit + site-оверлей
+Install/update result: OK — артефакт розгорнуто в C:\Temp\BRAVO_523_rc6\kit + site-оверлей,
+                      далі — у бойовий корінь C:\Program Files\BRAVO-Toolkit (GUARD 0, self-test 1535/0)
 ValidateOnly result:  OK (7 прогонів BRAVO_TASKS_INSTALL, ExitCode 0)
-Dry-run result:       OK, 0 помилок (READ-ONLY; -TestAccess під SYSTEM не виконувався)
+Dry-run result:       OK, 0 помилок (READ-ONLY) + наскрізний dry-run BRAVO_TASKS_DIAGNOSE від SYSTEM — усі PASS
 Archive result:       УСПIШНО — 3 з 3 архівів, VSS, SHA512
 SFTP result:          7 з 7 файлів + manifest; BAZA APP: 0 нових, 5423 підтверджено
 SMB result:           n/a — компонент вимкнено
 Health result:        усі копії актуальні, служби працюють
 Maintenance result:   УСПІШНО, exit 0, 0 попереджень, 0 помилок, 19 с
 Restore test result:  PASS - MODEL/BLOG/BRAVOEXCH з генерації 20260913_035104
-Self-test result:     1535 PASS / 0 FAIL, exit 0
+Self-test result:     1535 PASS / 0 FAIL, exit 0 (у т.ч. з C:\Program Files\BRAVO-Toolkit)
+SYSTEM task run:      PASS - BRAVO_ARCHIV_HEALTH LastTaskResult=0, BRAVO_MAINTENANCE LastTaskResult=0
 DiskSpace scenarios:  1 PASS, 2 PASS, 6 PASS; 3/4/5 не виконувались
-Detected issues:      немає
-Decision:             PASS з відкритими позиціями (розділ 8)
+Detected issues:      немає в кандидаті; на production знайдено й усунено конфігураційну
+                      ваду — завдання \BRAVO\ вказували на C:\Temp\BRAVO_523_rc3\kit (розділ 4.4)
+Decision:             PASS; відкритими лишаються тільки негативні сценарії 4/5 (розділ 8)
 ```
 
 ## 7. CI / детерміновані перевірки
@@ -199,17 +237,15 @@ self-test.
 
 ## 8. Відкриті позиції
 
-Не виконувалось у цьому циклі — рішення власника, чи вимагати до промоції:
+Закриті після випуску попередньої редакції цього документа:
 
-1. **Запуск від `NT AUTHORITY\SYSTEM`** через Task Scheduler. §9.1 називає це
-   обов'язковим. Спроба з тимчасової теки не вдалась з причин, не пов'язаних
-   із кандидатом (розділ 4.3). Змістовно закрити цей пункт можна лише
-   розгортанням rc.6 у справжній runtime-корінь і ручним запуском наявного
-   завдання `\BRAVO\BRAVO_RESTORE_VERIFY` — запуск із `C:\Temp` не перевіряє
-   ані ACL, ані креденшели SYSTEM, ані реальні шляхи.
-2. **`BRAVO_DRY_RUN.ps1 -TestAccess` під SYSTEM** — виконувався READ-ONLY під
-   інтерактивним обліковим записом.
-4. **Негативні сценарії 4 і 5** (below-floor блокування та
+- ~~запуск від `NT AUTHORITY\SYSTEM`~~ — **PASS**, розділ 4.4;
+- ~~доступи під SYSTEM (`-TestAccess`-еквівалент)~~ — **PASS**, розділ 4.4;
+- ~~restore test з explicit `-GenerationId`~~ — **PASS**, розділ 4.2.
+
+Лишається відкритим — рішення власника, чи вимагати до промоції:
+
+1. **Негативні сценарії 4 і 5** (below-floor блокування та
    `ExclusionIgnoredForRequiredVolume`) — не відтворювались на сервері.
    Покриті self-test-серіями A24/A25 і M7.
 
@@ -234,7 +270,15 @@ self-test.
 1535/0 на машині із зареєстрованим завданням BAZASync, `exit 0` і сповіщення
 в GENERAL замість ALERTS.
 
+Обов'язкові перевірки §9.1 закриті повністю: до restore drill з явним
+`-GenerationId` додано запуск завдань від `NT AUTHORITY\SYSTEM` з бойового
+кореня `C:\Program Files\BRAVO-Toolkit` (`LastTaskResult = 0` для Health і
+Maintenance) та наскрізний SYSTEM-dry-run доступів. Побічно усунено
+конфігураційну ваду production: завдання Планувальника більше не вказують на
+тимчасову теку з кодом rc.3.
+
 Блокуючих дефектів і security-регресій не виявлено. Рекомендація:
 **metadata-only промоція в stable `5.2.3`** — після рішення власника щодо
-чотирьох відкритих позицій розділу 8. Промоція вимагає окремої явної
+єдиної відкритої позиції розділу 8 (негативні сценарії 4/5, покриті
+self-test-серіями A24/A25 і M7). Промоція вимагає окремої явної
 авторизації.
