@@ -31,11 +31,11 @@ $ErrorActionPreference = 'Stop'
 
 # Операторський інструмент: помилка має читатися одним рядком, а не
 # стек-дампом PowerShell. Код завершення 1 = скрипт зупинився сам.
-trap {
-    Write-Host ''
-    Write-Host ('ЗУПИНЕНО: ' + $_.Exception.Message) -ForegroundColor Red
-    exit 1
-}
+#
+# Це catch, а не trap: тіло скрипта обгорнуте try/finally заради паузи й
+# відновлення кодування, а trap спрацював би ПІСЛЯ finally — оператор
+# побачив би запит "Натисніть Enter" раніше за причину зупинки.
+$script:Failed = $false
 
 # --- Кирилиця в консолі ------------------------------------------------------
 # Windows PowerShell 5.1 на серверах з російською локаллю тримає консоль у
@@ -58,14 +58,13 @@ try {
     Write-Host ('Не вдалося перемкнути консоль на UTF-8: ' + $_.Exception.Message) -ForegroundColor Yellow
 }
 
-$script:SuppressPause = $false
-
 function Wait-BRAVODeployCompletion {
-    # Той самий контракт, що Wait-BRAVOSetupCompletion у BRAVO_SETUP.ps1:
-    # після UAC-перезапуску вікно закрилося б миттєво, і оператор не встиг би
-    # прочитати результат. Батьківський (неелевований) процес не паузиться —
-    # його консоль нікуди не зникає.
-    if ($NoPause -or $script:SuppressPause -or -not [Environment]::UserInteractive) {
+    # Той самий контракт, що Wait-BRAVOSetupCompletion у BRAVO_SETUP.ps1.
+    # Пауза безумовна на КОЖНОМУ шляху завершення — успіх, зупинка, провал
+    # гейта, UAC-перезапуск: вікно, відкрите подвійним кліком або UAC-ом,
+    # інакше закривається миттєво разом із результатом. Вимикається лише
+    # явним -NoPause або відсутністю інтерактивної консолі.
+    if ($NoPause -or -not [Environment]::UserInteractive) {
         return
     }
     try {
@@ -153,7 +152,6 @@ if (-not $isElevated) {
     $elevated = Start-Process -FilePath $powerShellPath `
         -ArgumentList ($argumentParts -join ' ') `
         -Verb RunAs -Wait -PassThru -WindowStyle Normal
-    $script:SuppressPause = $true
     exit $elevated.ExitCode
 }
 Write-Ok 'запущено з піднятими правами'
@@ -475,7 +473,13 @@ Write-Host ''
 Write-Warn2 'Перевірте перший нічний прогін: і архівацію, і обслуговування.'
 Write-Warn2 ('Backup не видаляється автоматично — приберіть ' + $BackupRoot + ' після успішної доби.')
 exit 0
+} catch {
+    Write-Host ''
+    Write-Host ('ЗУПИНЕНО: ' + $_.Exception.Message) -ForegroundColor Red
+    $script:Failed = $true
 } finally {
     Wait-BRAVODeployCompletion
     Restore-BRAVOConsoleEncoding
 }
+
+if ($script:Failed) { exit 1 }
