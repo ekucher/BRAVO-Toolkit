@@ -1,8 +1,8 @@
 # BRAVO-Toolkit 5.2.3-rc.6 — зведений acceptance evidence (2026-09-13)
 
-Статус: **PASS з однією відкритою позицією** — усі обов'язкові перевірки
-§9.1, включно із запуском від `NT AUTHORITY\SYSTEM`, закриті на реальному
-сервері; відкритими лишаються тільки негативні сценарії 4/5 (розділ 8). Документ
+Статус: **PASS без відкритих позицій** — усі обов'язкові перевірки §9.1
+закриті на реальному сервері, включно із запуском від `NT AUTHORITY\SYSTEM`,
+restore drill і негативними сценаріями 4/5 disk-space policy. Документ
 фіксує докази й не є авторизацією промоції: вердикт acceptance і рішення про
 промоцію — окремі кроки (`RELEASE_POLICY.md` §9.3, §4).
 
@@ -99,8 +99,8 @@ D:\LIMS MaintenanceWorkingVolume CapacityState=Known AvailableGB=715.51 Status=S
 | 1 | Місця вистачає всюди | архівація йде, `Status=Success` | **PASS** — Archive 3/3, Maintenance exit 0 |
 | 2 | Мало місця на томі, що не бере участі в операції | не блокує | **PASS** — `G:` 0.54 GB не заблокував ані Archive, ані Maintenance |
 | 3 | Мало місця на required томі призначення | блокує, `EstimatedRequirementNotMet` | не виконувався (покрито self-test A-серією) |
-| 4 | Вільне нижче порогу, оцінка мала | блокує, `BelowFloorEstimateNotPeakSafe` | **не виконувався** |
-| 5 | Required том у `ExcludedDrives` | блокує, `ExclusionIgnoredForRequiredVolume` | **не виконувався** |
+| 4 | Вільне нижче порогу, оцінка мала | блокує, `BelowFloorEstimateNotPeakSafe` | **PASS** — exit 40, див. розділ 4.5 |
+| 5 | Required том у `ExcludedDrives` | блокує, `ExclusionIgnoredForRequiredVolume` | **PASS** — exit 40 + флаг, див. розділ 4.5 |
 | 6 | Maintenance: `ROOT_LIMS` як єдина write-required ціль | `RequirementGranularity=Unknown`, лише цей том | **PASS** — див. вивід вище |
 
 ### 4.1. Негативні перевірки
@@ -147,6 +147,18 @@ runtime-кореня з ACL, які виставляє `BRAVO_TASKS_INSTALL`.
 **Це не дефект кандидата** (та сама дія з тими самими аргументами працює),
 але й **не доказ** SYSTEM-виконання. Пункт §9.1 «запуск завдань від SYSTEM»
 лишається відкритим — див. розділ 8.
+### 4.3-bis. Друга повна архівація — з бойового кореня
+
+13.09.2026 04:47:58-04:52:32, запуск `BRAVO_ARCHIV.ps1` з
+`C:\Program Files\BRAVO-Toolkit` (перший повний прогін розділу 3 виконувався
+з тимчасової теки). Generation `20260913_044758`, статус **COMPLETE**:
+3 з 3 архівів (56.19 МБ), один VSS Snapshot Set
+`{5AEE6077-EFF2-43E3-9D77-069BBAF58122}`, SHA512 і 7-Zip integrity OK для
+кожного компонента, SFTP резервних копій OK, SFTP BAZA_APP OK, post-backup
+health OK, **exit 0**. Рішення класифікатора на групі `D:`:
+`AvailableGB=715.52`, `AggregatedRequiredGB=0.0686`, `Status=Success`,
+`Blocks=False` — базова лінія для негативних сценаріїв нижче.
+
 ### 4.4. Розгортання в бойовий runtime-корінь і запуск від SYSTEM
 
 13.09.2026, `LIMS-TOP`. Кандидат розгорнуто в реальний runtime-корінь
@@ -181,6 +193,64 @@ runtime-кореня з ACL, які виставляє `BRAVO_TASKS_INSTALL`.
 у цій гілці не існує (з'являється лише в 5.3.0), тому SYSTEM-виконання
 підтверджено наявними завданнями Health і Maintenance.
 
+### 4.5. Негативні сценарії 4 і 5 — блокувальні гілки класифікатора
+
+13.09.2026 04:57-04:59, `LIMS-TOP`, бойовий корінь. Дефіцит місця відтворено
+**підняттям порога**, а не заповненням тому: `MinimumFreeSpaceGB` тимчасово
+переведено з 20 на 730 GB через `BRAVO.local.config` (data-only оверлей,
+жодної зміни коду чи бойового `BRAVO.config`). Обидва сценарії належать
+шляху Archive — `Resolve-BRAVOArchiveSpaceDecision` жорстко задає
+`RequirementPolicy='ArchiveNotPeakSafe'`; Maintenance працює під
+`MaintenanceExactOnly`, де below-floor дає WARNING, а не блокування.
+
+Обидва прогони зупинились на передетапній перевірці місця: `Створено
+архівів: 0`, generation-каталог і manifest не створювались, стан
+`BRAVO_TASK_EXECUTION_STATE.json` не оновлювався (пишеться лише за
+`backupGenerationStatus = COMPLETE`).
+
+**Сценарій 4 — `BelowFloorEstimateNotPeakSafe`** (журнал
+`BRAVO_ARCHIV_20260913_045706_PID8236.log`):
+
+```text
+Поріг: 730 GB на кожному локальному Fixed-диску; виключення: F:, G:
+DiskSpace ... Roles=MODEL_ARCHIVE_DESTINATION ... AvailableGB=715.46
+    RequiredGB=0.0549 AggregatedRequiredGB=0.0686 ResidualAvailableGB=715.39
+    Status=Error Blocks=True Reason=BelowFloorEstimateNotPeakSafe Flags=-
+Код завершення: 40 — LocalArchiveFailed
+```
+
+Оцінка (0.07 GB) **достатня** і значно менша за доступне (715.46 GB) —
+блокування спричинене виключно `available < floor`. Це і є навмисне
+посилення 5.2.3: у 5.2.1 той самий вхід дістав би below-floor relaxation і
+прогін продовжився б. Health-рядки `C:\` і `D:\` дали
+`BelowHealthFloorNoFreeSpaceRequirement` (WARNING, без блокування), `F:`/`G:`
+лишились придушеними.
+
+**Сценарій 5 — `ExclusionIgnoredForRequiredVolume`** (журнал
+`BRAVO_ARCHIV_20260913_045914_PID8236.log`): той самий поріг, `D:\` додано
+у `ExcludedDrives`:
+
+```text
+Поріг: 730 GB на кожному локальному Fixed-диску; виключення: F:, G:, D:
+DiskSpace ... Roles=MODEL_ARCHIVE_DESTINATION ... AvailableGB=715.46
+    Status=Error Blocks=True Reason=BelowFloorEstimateNotPeakSafe
+    Flags=ExclusionIgnoredForRequiredVolume
+Код завершення: 40 — LocalArchiveFailed
+```
+
+Контраст, який і є суттю перевірки: health-попередження про `D:\` зникло з
+консолі (виключення глушить моніторинг), а операційна вимога **не**
+придушилась — блокування лишилось, і виключення явно позначене як
+проігнороване. Це ширша комбінація, ніж покриває self-test `DiskSpace/S5`,
+де той самий флаг перевіряється в парі з `EstimatedRequirementNotMet`.
+
+**Відкат виконано**: `BRAVO.local.config` повернуто до бойового вмісту
+(`ExcludedDrives = @('F:\','G:\')`, порога немає → діє штатні 20 GB),
+контрольний `BRAVO_SETUP.ps1 -ValidateOnly` — ГОТОВО ДО ЗАПУСКУ,
+**PASS 63 / WARN 0 / FAIL 0**, усі 4 завдання зареєстровані й Ready,
+SFTP-endpoint автентифіковано, 16 з 16 записів Credential Manager FOUND для
+`LimsTop` і `SYSTEM`.
+
 ## 5. Передпольотна інвентаризація парку
 
 | Сервер | `MinimumFreeSpaceGB` | Фактично на required томі | `ExcludedDrives` | Рішення |
@@ -200,7 +270,8 @@ Install/update result: OK — артефакт розгорнуто в C:\Temp\B
                       далі — у бойовий корінь C:\Program Files\BRAVO-Toolkit (GUARD 0, self-test 1535/0)
 ValidateOnly result:  OK (7 прогонів BRAVO_TASKS_INSTALL, ExitCode 0)
 Dry-run result:       OK, 0 помилок (READ-ONLY) + наскрізний dry-run BRAVO_TASKS_DIAGNOSE від SYSTEM — усі PASS
-Archive result:       УСПIШНО — 3 з 3 архівів, VSS, SHA512
+Archive result:       УСПIШНО — 3 з 3 архівів, VSS, SHA512; повторено з бойового кореня
+                      (generation 20260913_044758, COMPLETE, exit 0)
 SFTP result:          7 з 7 файлів + manifest; BAZA APP: 0 нових, 5423 підтверджено
 SMB result:           n/a — компонент вимкнено
 Health result:        усі копії актуальні, служби працюють
@@ -208,10 +279,11 @@ Maintenance result:   УСПІШНО, exit 0, 0 попереджень, 0 пом
 Restore test result:  PASS - MODEL/BLOG/BRAVOEXCH з генерації 20260913_035104
 Self-test result:     1535 PASS / 0 FAIL, exit 0 (у т.ч. з C:\Program Files\BRAVO-Toolkit)
 SYSTEM task run:      PASS - BRAVO_ARCHIV_HEALTH LastTaskResult=0, BRAVO_MAINTENANCE LastTaskResult=0
-DiskSpace scenarios:  1 PASS, 2 PASS, 6 PASS; 3/4/5 не виконувались
+DiskSpace scenarios:  1 PASS, 2 PASS, 4 PASS, 5 PASS, 6 PASS; 3 покрито self-test A-серією
+                      (4/5: exit 40 з BelowFloorEstimateNotPeakSafe і ExclusionIgnoredForRequiredVolume)
 Detected issues:      немає в кандидаті; на production знайдено й усунено конфігураційну
                       ваду — завдання \BRAVO\ вказували на C:\Temp\BRAVO_523_rc3\kit (розділ 4.4)
-Decision:             PASS; відкритими лишаються тільки негативні сценарії 4/5 (розділ 8)
+Decision:             PASS — відкритих позицій немає
 ```
 
 ## 7. CI / детерміновані перевірки
@@ -237,17 +309,18 @@ self-test.
 
 ## 8. Відкриті позиції
 
-Закриті після випуску попередньої редакції цього документа:
+Блокуючих відкритих позицій **немає**. Закрито в ході циклу:
 
 - ~~запуск від `NT AUTHORITY\SYSTEM`~~ — **PASS**, розділ 4.4;
 - ~~доступи під SYSTEM (`-TestAccess`-еквівалент)~~ — **PASS**, розділ 4.4;
-- ~~restore test з explicit `-GenerationId`~~ — **PASS**, розділ 4.2.
+- ~~restore test з explicit `-GenerationId`~~ — **PASS**, розділ 4.2;
+- ~~негативні сценарії 4 і 5~~ — **PASS**, розділ 4.5.
 
-Лишається відкритим — рішення власника, чи вимагати до промоції:
-
-1. **Негативні сценарії 4 і 5** (below-floor блокування та
-   `ExclusionIgnoredForRequiredVolume`) — не відтворювались на сервері.
-   Покриті self-test-серіями A24/A25 і M7.
+Свідомо не відтворювався на сервері лише сценарій 3
+(`EstimatedRequirementNotMet`): він вимагає, щоб оцінка перевищила доступне
+місце, тобто реального заповнення тому на ~715 GB. Детерміновано покритий
+self-test-серіями `Archive/A4`, `A10`, `DiskSpace/S5`, `S13`, `S15d`, а його
+сусідні гілки того самого `if`-ланцюга (сценарії 4 і 5) перевірені на сервері.
 
 Косметичний борг циклу (не блокує):
 
@@ -273,12 +346,16 @@ self-test.
 Обов'язкові перевірки §9.1 закриті повністю: до restore drill з явним
 `-GenerationId` додано запуск завдань від `NT AUTHORITY\SYSTEM` з бойового
 кореня `C:\Program Files\BRAVO-Toolkit` (`LastTaskResult = 0` для Health і
-Maintenance) та наскрізний SYSTEM-dry-run доступів. Побічно усунено
-конфігураційну ваду production: завдання Планувальника більше не вказують на
-тимчасову теку з кодом rc.3.
+Maintenance), наскрізний SYSTEM-dry-run доступів, повторну повну архівацію з
+цього ж кореня (generation `20260913_044758`, COMPLETE) і обидві блокувальні
+гілки нової disk-space policy. Побічно усунено конфігураційну ваду
+production: завдання Планувальника більше не вказують на тимчасову теку з
+кодом rc.3.
 
-Блокуючих дефектів і security-регресій не виявлено. Рекомендація:
-**metadata-only промоція в stable `5.2.3`** — після рішення власника щодо
-єдиної відкритої позиції розділу 8 (негативні сценарії 4/5, покриті
-self-test-серіями A24/A25 і M7). Промоція вимагає окремої явної
-авторизації.
+Нова поверхня перевірена в обидва боки: позитивні сценарії 1/2/6 і
+блокувальні 4/5 — на живому сервері, з підтвердженим відкатом у бойову
+конфігурацію після дрилу.
+
+Блокуючих дефектів і security-регресій не виявлено. Відкритих позицій немає.
+Рекомендація: **metadata-only промоція в stable `5.2.3`**. Промоція вимагає
+окремої явної авторизації.
