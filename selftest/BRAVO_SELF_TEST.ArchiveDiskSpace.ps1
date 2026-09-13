@@ -271,27 +271,68 @@ Test-BRAVOCondition `
     -Failure "недоступне (IsReady=false) джерело MODEL_SOURCE має BLOCK AccessUnavailable"
 
 # ============================================================
-# A24/A25 — PeakSafeEstimate=false рішення reviewer #2: below-floor
-# при достатній оцінці БЛОКУЄ (A24); той самий вхід під ArchivePeakSafe
-# policy (доводить реальний код-шлях §24.1) — WARNING+ALLOW (A25).
+# A24/A25 (5.2.4) — MinimumFreeSpaceGB більше НЕ гейт операції.
+# A24: below-floor при достатній вимозі ДОЗВОЛЯЄ з WARNING (у 5.2.3 цей
+# самий вхід блокувався BelowFloorEstimateNotPeakSafe).
+# A25: вимога, що НЕ влазить, блокує й далі — послаблення порога не
+# перетворилось на зняття захисту.
 # ============================================================
 $a24Drives = @(New-ArchiveDiskSpaceDrive -Drive 'E:' -AvailableGB 18)
 $a24Archives = @(@{ Type = 'MODEL'; Source = 'E:\Source\MODEL'; Destination = 'E:\ARCHIV\MODEL' })
 $a24Estimate = New-ArchiveDiskSpaceEstimate -ComponentSizes @{ MODEL = 7 }
 $a24 = Invoke-ArchiveSpaceDecision -EnabledArchives $a24Archives -EstimatedResult $a24Estimate -MinimumFreeSpaceGB 20 -Drives $a24Drives
+$a24Destination = @($a24.Results | Where-Object { $_.Roles -contains 'MODEL_ARCHIVE_DESTINATION' })[0]
 Test-BRAVOCondition `
-    -Condition (-not $a24.Success -and (@($a24.Results | Where-Object { $_.Blocks })[0]).Reason -eq 'BelowFloorEstimateNotPeakSafe') `
-    -Name 'Archive/A24-BelowFloorNotPeakSafeBlocks' `
-    -Failure "Resolve-BRAVOArchiveSpaceDecision використовує RequirementPolicy=ArchiveNotPeakSafe: below-floor (18<20) з достатньою оцінкою (7<=18) має БЛОКУВАТИ BelowFloorEstimateNotPeakSafe (рішення reviewer #2), а не послаблювати поріг як у 5.2.1"
+    -Condition (
+        $a24.Success -and
+        -not $a24Destination.Blocks -and
+        $a24Destination.Reason -eq 'BelowHealthFloorButRequirementSatisfied'
+    ) `
+    -Name 'Archive/A24-BelowFloorWithSufficientRequirementAllows' `
+    -Failure "5.2.4: production-виклик використовує RequirementPolicy=ArchivePeakSafe, тож below-floor (18<20) з достатньою вимогою (7<=18) має ДОЗВОЛЯТИ прогін з WARNING BelowHealthFloorButRequirementSatisfied. Поріг — захист здоров'я тому, не гейт операції"
 
-Import-Module -Name (Join-Path $root "modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psd1") -Force -ErrorAction Stop
-$a25 = Invoke-BRAVODiskSpaceClassifier `
-    -EntitySpecs @([pscustomobject]@{ DisplayPath = 'E:\ARCHIV\MODEL'; Roles = @('MODEL_ARCHIVE_DESTINATION'); RequiresAccess = $true; RequiresFreeSpace = $true; RequirementGranularity = 'Entity'; RequiredGB = 7 }) `
-    -MinimumFreeSpaceGB 20 -RequirementPolicy 'ArchivePeakSafe' -Drives $a24Drives
+$a25Drives = @(New-ArchiveDiskSpaceDrive -Drive 'E:' -AvailableGB 18)
+$a25Archives = @(@{ Type = 'MODEL'; Source = 'E:\Source\MODEL'; Destination = 'E:\ARCHIV\MODEL' })
+$a25Estimate = New-ArchiveDiskSpaceEstimate -ComponentSizes @{ MODEL = 25 }
+$a25 = Invoke-ArchiveSpaceDecision -EnabledArchives $a25Archives -EstimatedResult $a25Estimate -MinimumFreeSpaceGB 20 -Drives $a25Drives
 Test-BRAVOCondition `
-    -Condition ($a25.Success -and $a25.Results[0].Reason -eq 'BelowHealthFloorButRequirementSatisfied') `
-    -Name 'Archive/A25-SameInputPeakSafePolicyAllows' `
-    -Failure "той самий вхід (18<20, 7<=18) під ArchivePeakSafe policy (не використовується у production-виклику 5.2.3, лише доводить наявність коду §24.1) має ALLOW+WARNING BelowHealthFloorButRequirementSatisfied"
+    -Condition (-not $a25.Success -and (@($a25.Results | Where-Object { $_.Blocks })[0]).Reason -eq 'EstimatedRequirementNotMet') `
+    -Name 'Archive/A25-RequirementNotMetStillBlocksUnderPeakSafe' `
+    -Failure "перехід на ArchivePeakSafe не сміє зняти справжній захист: вимога 25 GB при 18 GB доступних має БЛОКУВАТИ EstimatedRequirementNotMet"
+
+# ============================================================
+# A26 (5.2.4) — компонент БЕЗ історії більше не приходить у класифікатор
+# із порожньою вимогою: оцінювач виводить її з нестиснутого розміру
+# джерела, тож RequiredGB заповнений, а нестача блокує.
+# ============================================================
+$a26Drives = @(New-ArchiveDiskSpaceDrive -Drive 'E:' -AvailableGB 5)
+$a26Archives = @(@{ Type = 'MODEL'; Source = 'E:\Source\MODEL'; Destination = 'E:\ARCHIV\MODEL' })
+# HasHistory=$false, але EstimatedBytes заповнений — саме те, що тепер
+# повертає Get-BRAVOArchiveEstimatedSpaceRequirement для bootstrap.
+$a26Estimate = [pscustomobject]@{
+    Success = $true
+    ComponentEstimates = @([pscustomobject]@{
+        Type = 'MODEL'
+        HasHistory = $false
+        SourceBytes = [int64](30 * 1GB)
+        SourceUpperBoundBytes = [int64](30.6 * 1GB)
+        EstimateBasis = 'SourceUpperBound'
+        EstimatedBytes = [int64](30.6 * 1GB)
+    })
+    VolumeStatus = @()
+    Problems = @()
+}
+$a26 = Invoke-ArchiveSpaceDecision -EnabledArchives $a26Archives -EstimatedResult $a26Estimate -MinimumFreeSpaceGB 20 -Drives $a26Drives
+$a26Destination = @($a26.Results | Where-Object { $_.Roles -contains 'MODEL_ARCHIVE_DESTINATION' })[0]
+Test-BRAVOCondition `
+    -Condition (
+        -not $a26.Success -and
+        [bool]$a26Destination.Blocks -and
+        $a26Destination.Reason -eq 'EstimatedRequirementNotMet' -and
+        $null -ne $a26Destination.RequiredGB
+    ) `
+    -Name 'Archive/A26-BootstrapComponentCarriesSourceDerivedRequirement' `
+    -Failure "5.2.4: компонент без історії несе вимогу з нестиснутого розміру джерела (30.6 GB) — при 5 GB доступних має BLOCK EstimatedRequirementNotMet із заповненим RequiredGB. Умова HasHistory на виклик-сайті давала тут RequiredGB=null, тобто bootstrap проходив без перевірки"
 
 # ============================================================
 # Structural: виклик-сайт Main викликає Resolve-BRAVOArchiveSpaceDecision
