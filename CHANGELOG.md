@@ -1,5 +1,46 @@
 # Changelog
 
+## 5.2.3 — 2026-09-13
+
+Stable promotion від прийнятого `5.2.3-rc.6` (нижче) — real-server acceptance
+на `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]), де раніше провалився rc.3. Усі
+обов'язкові перевірки `RELEASE_POLICY.md` §9.1 закриті; зведені докази —
+`docs/BRAVO_523_RC6_ACCEPTANCE_EVIDENCE_20260913.md`.
+
+Ключове з acceptance:
+
+- дві повні архівації, друга — з бойового кореня `C:\Program Files\BRAVO-Toolkit`
+  (generation `20260913_044758`, COMPLETE, 3 з 3, один VSS Snapshot Set,
+  SHA512 і 7-Zip integrity OK, SFTP + BAZA_APP OK, post-backup health OK,
+  exit 0);
+- Maintenance — УСПІШНО, exit 0; health — усі копії актуальні;
+- restore drill з явним `-GenerationId 20260913_035104` — 3 з 3 компоненти
+  PASS з ОДНІЄЇ COMPLETE-генерації;
+- запуск завдань від `NT AUTHORITY\SYSTEM`: `BRAVO_ARCHIV_HEALTH` і
+  `BRAVO_MAINTENANCE` — `LastTaskResult = 0`; наскрізний SYSTEM-dry-run
+  `BRAVO_TASKS_DIAGNOSE` — усі перевірки PASS;
+- self-test на сервері — **1535 PASS / 0 FAIL**, exit 0, у т.ч. з бойового
+  кореня; `BRAVO_RUNTIME_GUARD.ps1` — цілісність 87 файлів підтверджена;
+- нова operation-aware disk-space policy перевірена в обидва боки:
+  позитивні сценарії (місця вистачає, том поза операцією, Maintenance
+  `ROOT_LIMS`) і блокувальні — `BelowFloorEstimateNotPeakSafe` та
+  `ExclusionIgnoredForRequiredVolume`, обидва exit 40, з підтвердженим
+  відкатом у бойову конфігурацію.
+
+Побічно під час acceptance усунено ваду конфігурації production: усі чотири
+завдання гілки `\BRAVO\` вказували на тимчасову теку `C:\Temp\BRAVO_523_rc3\kit`
+(код rc.3, без ACL) — нічна архівація виконалася б звідти. Переустановка
+`BRAVO_SETUP.ps1` перереєструвала завдання на бойовий корінь.
+
+Release-metadata-only зміни відносно прийнятого rc.6: `VERSION.json`
+(packageVersion `5.2.3-rc.6` → `5.2.3`, releaseChannel `prerelease` →
+`stable`), README.md/BRAVO_SETUP.md заголовки, цей розділ CHANGELOG,
+RUNTIME_MANIFEST.json регенеровано. Жодних функціональних runtime-змін
+відносно прийнятого rc.6.
+
+Операційний вплив оновлення описаний у розділі `5.2.3-rc.6` нижче —
+**прочитати перед розкаткою на парк**.
+
 ## 5.2.3-rc.6 — 2026-09-13
 
 **Нумерація:** номери `rc.4` і `rc.5` зайняті двома різними деревами —
