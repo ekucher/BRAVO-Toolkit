@@ -78,12 +78,47 @@ if ($currentVersion.packageVersion -eq $targetVersion -and -not $Force) {
 Write-Step '1. Preflight: поріг вільного місця (пастка асиметрії Archive/Maintenance)'
 
 $configPath = Join-Path $RuntimeRoot 'BRAVO.config'
-. (Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1')
-Import-BravoConfiguration -ConfigRoot $RuntimeRoot -ConfigPath $configPath -RuntimeRoot $RuntimeRoot
 
-$floor = [double]$global:maintenanceSettings.Limits.MinimumFreeSpaceGB
-$excluded = @($global:maintenanceSettings.Limits.ExcludedDrives)
-$limsRoot = [string]$global:effectiveLimsRoot
+# Ефективна конфігурація читається в ДОЧІРНЬОМУ powershell.exe, а не тут.
+# Import-BravoConfiguration змінює глобальний стан процесу — зокрема
+# встановлює $global:ScriptVersion зі СТАРОЇ VERSION.json. Далі гейти
+# запускають BRAVO_SETUP у цьому ж процесі, його завантажувач бачить
+# успадкований global і друкує хибне попередження "VERSION.json (нова) і
+# BRAVO.config (стара) містять різні версії пакета" — при повністю
+# коректній конфігурації. Ізоляція дочірнім процесом — та сама конвенція,
+# що вже застосована в self-test репозиторію з тієї самої причини.
+
+$probe = @'
+param([string]$RuntimeRoot, [string]$ConfigPath)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1')
+Import-BravoConfiguration -ConfigRoot $RuntimeRoot -ConfigPath $ConfigPath -RuntimeRoot $RuntimeRoot
+[pscustomobject]@{
+    Floor    = [double]$global:maintenanceSettings.Limits.MinimumFreeSpaceGB
+    Excluded = @($global:maintenanceSettings.Limits.ExcludedDrives)
+    LimsRoot = [string]$global:effectiveLimsRoot
+    TaskPath = [string]$global:schedulerSettings.TaskPath
+} | ConvertTo-Json -Compress
+'@
+
+$probePath = Join-Path $env:TEMP ('BRAVO_UPDATE_PROBE_' + [guid]::NewGuid().ToString('N') + '.ps1')
+try {
+    [System.IO.File]::WriteAllText($probePath, $probe, (New-Object System.Text.UTF8Encoding($true)))
+    $probeOutput = & powershell.exe -NoProfile -NonInteractive -File $probePath `
+        -RuntimeRoot $RuntimeRoot -ConfigPath $configPath
+    if ($LASTEXITCODE -ne 0) {
+        throw ('Не вдалося прочитати ефективну конфігурацію (' + $LASTEXITCODE + '): ' +
+            ($probeOutput -join ' '))
+    }
+} finally {
+    Remove-Item -LiteralPath $probePath -Force -ErrorAction SilentlyContinue
+}
+
+$effective = ($probeOutput | Where-Object { $_ -match '^\s*\{' } | Select-Object -Last 1) | ConvertFrom-Json
+$floor = [double]$effective.Floor
+$excluded = @($effective.Excluded)
+$limsRoot = [string]$effective.LimsRoot
+$taskPathFromConfig = [string]$effective.TaskPath
 Write-Note ('ефективний поріг MinimumFreeSpaceGB: ' + $floor + ' GB')
 Write-Note ('виключення ExcludedDrives: ' + $(if ($excluded.Count) { $excluded -join ', ' } else { '(немає)' }))
 Write-Note ('EffectiveLIMSRoot (робочий том Maintenance): ' + $limsRoot)
@@ -128,7 +163,7 @@ if ($script:Blockers.Count -eq 0) { Write-Ok 'поріг сумісний і з 
 
 Write-Step '2. Preflight: стан завдань Планувальника'
 
-$taskPath = [string]$global:schedulerSettings.TaskPath
+$taskPath = $taskPathFromConfig
 if ([string]::IsNullOrWhiteSpace($taskPath)) { $taskPath = '\BRAVO\' }
 $running = @()
 try {
