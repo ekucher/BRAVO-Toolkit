@@ -5489,48 +5489,136 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     # архіву того самого компонента (Get-BRAVOValidArchiveSizeHistory —
     # той самий канонічний reader, що вже використовує SizeSanity для
     # виявлення підозріло малих архівів) плюс запас на зростання джерела.
-    # Компонент без валідної історії (перший запуск компонента чи всі
-    # попередні архіви invalid/FAILED) свідомо пропускається з оцінки —
-    # bootstrap не повинен fail-closed заблокуватись через відсутність
-    # даних; захист для цього випадку лишається фіксований поріг вище.
+    #
+    # 5.2.4: додано другу, НЕЗАЛЕЖНУ від історії величину — нестиснутий
+    # розмір джерела. Архів фізично не може бути більшим за своє джерело
+    # (найгірший випадок 7-Zip — store-режим), тому
+    #   sourceBytes * (1 + SourceOverheadPercent/100)
+    # є ДОВЕДЕНОЮ верхньою межею, а не прогнозом. Вона застосовується
+    # двояко:
+    #   - як стеля для history-оцінки: якщо джерело з часу останнього
+    #     архіву зменшилось, вимога зменшується разом з ним (тісніше,
+    #     ніколи не більше);
+    #   - як сама вимога для компонента БЕЗ валідної історії. До 5.2.4
+    #     такий компонент мовчки випадав з оцінки взагалі (перший запуск
+    #     або всі попередні архіви invalid/FAILED) — тобто саме тоді, коли
+    #     передбачити споживання найважче, вимога була нульовою. Захистом
+    #     тоді лишався фіксований поріг; у 5.2.4 поріг більше не гейтить
+    #     операцію (Resolve-BRAVOArchiveSpaceDecision нижче), тож цю діру
+    #     довелось закрити по-справжньому.
+    # Джерело, розмір якого виміряти не вдалось (шлях недоступний, порожній
+    # або не заданий), лишає компонент без вимоги — як і до 5.2.4.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][object[]]$EnabledArchives,
         [Parameter(Mandatory = $true)][string]$ArchiveFileFilter,
         [Parameter(Mandatory = $true)][string]$HashFileExtension,
         [Parameter(Mandatory = $true)][double]$MarginPercent,
+        # Запас на контейнерні накладні витрати 7-Zip понад нестиснутий
+        # розмір джерела. Стиснення практично завжди зменшує розмір, але
+        # на несжимаємих даних архів може вийти на частки відсотка більшим
+        # за вхід — 2% покривають це з запасом і не роблять межу марною.
+        [double]$SourceOverheadPercent = 2.0,
         # Той самий injectable-override принцип, що -Drives у
         # Get-BRAVOArchiveFreeSpaceResult вище: детермінований self-test
         # без залежності від реального вільного місця на CI/dev-машині.
         # Елемент: @{ Drive = 'C:'; AvailableFreeSpace = <bytes>; IsReady = $true }.
-        [object[]]$Drives
+        [object[]]$Drives,
+        # Детермінований self-test без обходу реальної файлової системи:
+        # Type -> нестиснуті байти джерела ($null = виміряти не вдалось).
+        [hashtable]$SourceSizeOverrides
     )
 
     $componentEstimates = New-Object System.Collections.Generic.List[object]
     foreach ($archive in $EnabledArchives) {
+        $componentType = [string]$archive.Type
         $destination = [string]$archive.Destination
+
+        # Нестиснутий розмір джерела — доведена верхня межа розміру архіву.
+        # Обхід каталогу навмисно тут, у preflight: те саме дерево 7-Zip
+        # прочитає далі в будь-якому разі, а помилка доступу тут має
+        # означати «межу невідомо», а не крах оцінки.
+        $sourceBytes = $null
+        if ($PSBoundParameters.ContainsKey('SourceSizeOverrides') -and
+            $SourceSizeOverrides.ContainsKey($componentType)) {
+            $overrideValue = $SourceSizeOverrides[$componentType]
+            if ($null -ne $overrideValue) { $sourceBytes = [int64]$overrideValue }
+        } else {
+            # $EnabledArchives приходять і як [hashtable] (self-test
+            # фікстури), і як [pscustomobject] (archiveDefinitions з
+            # конфігурації). Для hashtable ключі НЕ є .NET-властивостями,
+            # тож PSObject.Properties.Match тут дав би 0 і джерело мовчки
+            # не читалося б; для pscustomobject під Set-StrictMode пряме
+            # звернення до відсутньої властивості — помилка. Тому окрема
+            # гілка на кожен випадок.
+            $sourcePath = $null
+            if ($archive -is [System.Collections.IDictionary]) {
+                if ($archive.Contains('Source')) { $sourcePath = [string]$archive['Source'] }
+            } elseif ($archive.PSObject.Properties.Match('Source').Count -gt 0) {
+                $sourcePath = [string]$archive.Source
+            }
+            if (-not [string]::IsNullOrWhiteSpace($sourcePath)) {
+                try {
+                    if (Test-Path -LiteralPath $sourcePath) {
+                        $measuredSource = Get-ChildItem -LiteralPath $sourcePath -Recurse -File -Force -ErrorAction Stop |
+                            Measure-Object -Property Length -Sum
+                        if ($null -ne $measuredSource -and $null -ne $measuredSource.Sum) {
+                            $sourceBytes = [int64]$measuredSource.Sum
+                        }
+                    }
+                } catch {
+                    # Недоступне чи частково недоступне джерело не робить
+                    # оцінку недійсною — воно лише лишає межу невідомою.
+                    # Сама недоступність джерела ловиться окремо, як
+                    # RequiresAccess у класифікаторі.
+                    $sourceBytes = $null
+                }
+            }
+        }
+        # Порожнє чи нульове джерело НЕ дає стелі: інакше воно обнулило б
+        # вимогу компонента, який насправді має що архівувати.
+        $sourceUpperBoundBytes = if ($null -ne $sourceBytes -and $sourceBytes -gt 0) {
+            [int64][math]::Ceiling($sourceBytes * (1.0 + ($SourceOverheadPercent / 100.0)))
+        } else {
+            $null
+        }
+
         $history = @(Get-BRAVOValidArchiveSizeHistory `
             -Directory $destination `
             -ArchiveFilter $ArchiveFileFilter `
             -HashFileExtension $HashFileExtension `
             -MaxCount 1)
+
         if ($history.Count -eq 0) {
+            # Bootstrap: історії немає, тож єдина підстава — доведена межа.
             [void]$componentEstimates.Add([pscustomobject]@{
-                Type = [string]$archive.Type
+                Type = $componentType
                 Destination = $destination
                 HasHistory = $false
                 LastValidBytes = $null
-                EstimatedBytes = $null
+                SourceBytes = $sourceBytes
+                SourceUpperBoundBytes = $sourceUpperBoundBytes
+                EstimateBasis = $(if ($null -ne $sourceUpperBoundBytes) { 'SourceUpperBound' } else { 'Unknown' })
+                EstimatedBytes = $sourceUpperBoundBytes
             })
             continue
         }
+
         $lastBytes = [int64]$history[0].Bytes
         $estimatedBytes = [int64][math]::Ceiling($lastBytes * (1.0 + ($MarginPercent / 100.0)))
+        $estimateBasis = 'History'
+        if ($null -ne $sourceUpperBoundBytes -and $sourceUpperBoundBytes -lt $estimatedBytes) {
+            $estimatedBytes = $sourceUpperBoundBytes
+            $estimateBasis = 'HistoryCappedBySource'
+        }
         [void]$componentEstimates.Add([pscustomobject]@{
-            Type = [string]$archive.Type
+            Type = $componentType
             Destination = $destination
             HasHistory = $true
             LastValidBytes = $lastBytes
+            SourceBytes = $sourceBytes
+            SourceUpperBoundBytes = $sourceUpperBoundBytes
+            EstimateBasis = $estimateBasis
             EstimatedBytes = $estimatedBytes
         })
     }
@@ -5540,7 +5628,10 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     # перевіряється проти суми ЛИШЕ своїх компонентів, не всіх разом.
     $volumeGroups = [ordered]@{}
     foreach ($estimate in $componentEstimates) {
-        if (-not $estimate.HasHistory) { continue }
+        # 5.2.4: критерій участі — наявність вимоги, а не наявність
+        # історії. Компонент без історії тепер несе вимогу, виведену з
+        # розміру джерела, і мусить враховуватись у сумі по тому.
+        if ($null -eq $estimate.EstimatedBytes) { continue }
         $driveLetter = $null
         try {
             $driveLetter = ([IO.Path]::GetPathRoot($estimate.Destination)).TrimEnd('\').ToUpperInvariant()
@@ -5598,7 +5689,7 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
         }
         if ($availableBytes -lt $group.RequiredBytes) {
             [void]$problems.Add(
-                "диск ${driveLetter}: розрахункова потреба ${requiredGB} GB ($componentsText; історія + ${MarginPercent}% запасу), доступно лише ${availableGB} GB"
+                "диск ${driveLetter}: розрахункова потреба ${requiredGB} GB ($componentsText; історія + ${MarginPercent}% запасу, обмежена нестиснутим розміром джерела), доступно лише ${availableGB} GB"
             )
         }
     }
@@ -5629,16 +5720,30 @@ function Resolve-BRAVOArchiveSpaceDecision {
     #     історії свідомо залишає RequiredGB невідомим — bootstrap,
     #     GroupRequirementState=Unknown, safe floor fallback).
     #
-    # ВАЖЛИВО (навмисна зміна поведінки, рішення reviewer #2, 2026-08-30):
-    # RequirementPolicy='ArchiveNotPeakSafe' — PeakSafeEstimate=false для
-    # Archive у 5.2.3. Get-BRAVOArchiveEstimatedSpaceRequirement НЕ
-    # враховує retained generations і .work тимчасові файли (Phase 0
-    # characterization), тому below-floor relaxation, який 5.2.1 надавав
-    # через Merge-BRAVOArchiveSpaceCheckResults (реальний acceptance
-    # 2026-08-25), у 5.2.3 СВІДОМО вимкнено: below-floor тепер БЛОКУЄ
-    # (Reason=BelowFloorEstimateNotPeakSafe), навіть якщо оцінка достатня.
-    # Задокументовано в CHANGELOG/upgrade notes 5.2.3 як посилення
-    # політики, не регресія (детально: A24/A25 self-test, §24.1 специфікації).
+    # ВАЖЛИВО (5.2.4, замінює рішення reviewer #2 від 2026-08-30):
+    # RequirementPolicy='ArchivePeakSafe'. MinimumFreeSpaceGB — захист
+    # ЗДОРОВ'Я тому, а не гейт операції: якщо доведена вимога влазить у
+    # доступне місце, прогін ДОЗВОЛЯЄТЬСЯ з WARNING
+    # (BelowHealthFloorButRequirementSatisfied), навіть коли вільного
+    # менше за поріг. Блокує лише невиконана вимога
+    # (EstimatedRequirementNotMet).
+    #
+    # Чому 5.2.3 вирішила інакше і чому це виправлено. Там below-floor
+    # блокував, бо оцінку не вважали peak-safe; названою причиною були
+    # retained generations і .work. Обидві не витримують перевірки:
+    # .work лежить на тому самому томі й публікується ПЕРЕЙМЕНУВАННЯМ
+    # (New-BRAVOTemporaryArchivePath), тобто в піку тримає один розмір
+    # архіву, а не два; наявні генерації вже враховані у виміряному
+    # AvailableGB, бо вимірювання відбувається до створення нової.
+    # Реальною дірою було інше — компонент без історії взагалі випадав з
+    # оцінки. Її закрито в Get-BRAVOArchiveEstimatedSpaceRequirement вище
+    # доведеною верхньою межею з нестиснутого розміру джерела, і саме це
+    # дає право увімкнути ArchivePeakSafe.
+    #
+    # Наслідок 5.2.3, який це прибирає: сервер із 715 GB вільного і
+    # потребою 0.07 GB блокувався лише тому, що поріг стояв вище за
+    # вільне (real-server відтворення 13.09.2026, exit 40).
+    # Регресії: Archive/A24, A25, A26 і Archive/EstimatedSpace* у self-test.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$EnabledArchives,
@@ -5693,7 +5798,11 @@ function Resolve-BRAVOArchiveSpaceDecision {
 
         $componentEstimate = @($EstimatedResult.ComponentEstimates | Where-Object { [string]$_.Type -eq $componentType } | Select-Object -First 1)
         $requiredGB = $null
-        if ($componentEstimate.Count -gt 0 -and [bool]$componentEstimate[0].HasHistory) {
+        # 5.2.4: вимогу несе будь-який компонент, для якого її вдалося
+        # вивести — з історії або з нестиснутого розміру джерела. Умова
+        # HasHistory тут була причиною того, що bootstrap-компонент
+        # приходив у класифікатор із RequiredGB = $null.
+        if ($componentEstimate.Count -gt 0 -and $null -ne $componentEstimate[0].EstimatedBytes) {
             $requiredGB = [double]$componentEstimate[0].EstimatedBytes / 1GB
         }
         [void]$entitySpecs.Add([pscustomobject]@{
@@ -5711,7 +5820,7 @@ function Resolve-BRAVOArchiveSpaceDecision {
         EntitySpecs = $entitySpecs.ToArray()
         MinimumFreeSpaceGB = $MinimumFreeSpaceGB
         ExcludedDrives = $ExcludedDrives
-        RequirementPolicy = 'ArchiveNotPeakSafe'
+        RequirementPolicy = 'ArchivePeakSafe'
     }
     if ($PSBoundParameters.ContainsKey('Drives')) { $classifierParams.Drives = $Drives }
 
