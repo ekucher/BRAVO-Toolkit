@@ -7411,6 +7411,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -SourceText $dryRunScriptText `
         -FunctionNames @(
             'Test-SettingEnabled',
+            'Get-SourceDirectory',
+            'Get-BRAVODryRunVolumeRoot',
             'Get-BRAVODryRunOptionalComponentPlan',
             'Get-BRAVODryRunRangeIdPlan'
         )
@@ -7491,6 +7493,34 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Condition (-not $rangeIdCanonicalPlan.Path.Contains('LIMS') -and -not $rangeIdCanonicalPlan.Detail.Contains('fallback')) `
         -Name 'DryRun/RangeIdHasNoLimsRootFallback' `
         -Failure 'Range ID Dry Run не може мати fallback до LIMSRoot'
+
+    # Регресія (реальний сервер, 2026-09-14): bravo.ini мав MODEL=d:\LIMS\Model
+    # поруч із BLOG=D:\LIMS\BLOG, і корінь тому повертався у регістрі
+    # джерела. Select-Object -Unique у VSS-перевірці рахує рядки з
+    # урахуванням регістру, тому ОДИН том ставав двома ("volumes=d:, D:"),
+    # вмикалася вимога diskshadow.exe (відсутній на клієнтській Windows) і
+    # dry-run давав [FAIL] VSS на машині, де runtime у той самий вечір
+    # успішно зняв один Snapshot Set. Нормалізація має збігатися з
+    # CapacityKey у BRAVO.DiskSpace.
+    $mixedCaseVolumeRoots = @(
+        @('d:\LIMS\Model\*', 'D:\LIMS\BLOG\*', 'D:\LIMS\bravoexch\*') |
+            ForEach-Object {
+                $volumeSourcePath = $_
+                & $dryRunPlanModule {
+                    param($SourcePath)
+                    Get-BRAVODryRunVolumeRoot -Path $SourcePath
+                } $volumeSourcePath
+            }
+    )
+    $mixedCaseVolumeUnique = @($mixedCaseVolumeRoots | Select-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition (
+            $mixedCaseVolumeRoots.Count -eq 3 -and
+            @($mixedCaseVolumeRoots | Where-Object { $_ -cne 'D:' }).Count -eq 0 -and
+            $mixedCaseVolumeUnique.Count -eq 1
+        ) `
+        -Name 'DryRun/VolumeRootIsCaseNormalizedAcrossSources' `
+        -Failure ("корені томів джерел мають нормалізуватись до одного регістру (D:), інакше один том рахується двічі й вмикає хибну вимогу diskshadow; фактично: " + ($mixedCaseVolumeRoots -join ', '))
 
     $absentBravoWebDryRunPlan = & $dryRunPlanModule {
         Get-BRAVODryRunOptionalComponentPlan `

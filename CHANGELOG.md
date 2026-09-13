@@ -2,6 +2,28 @@
 
 ## Не випущено (developer)
 
+- **Діагностика: два хибні провали на реальних серверах** — обидва
+  знайдено під час розкатки 5.2.4, обидва в перевірках, а не в
+  production-шляху, який у той самий момент відпрацьовував успішно.
+  `Get-BRAVODryRunVolumeRoot` повертав корінь тому в регістрі джерела,
+  тому `bravo.ini` з `MODEL=d:\LIMS\Model` поруч із `BLOG=D:\LIMS\BLOG`
+  давав `volumes=d:, D:` — один том рахувався двічі, вмикалася вимога
+  `diskshadow.exe` (відсутнього на клієнтській Windows) і dry-run
+  повертав `[FAIL] VSS` на машині, де runtime тим часом успішно зняв
+  один Snapshot Set; корінь тому тепер нормалізується так само, як
+  `CapacityKey` у `BRAVO.DiskSpace`. `Test-BRAVODataRestoreFreeSpace`
+  падав термінально на недосяжній UNC-цілі: на доменному хості
+  `Test-Path` після резолву імені пробує SMB і піднімає
+  `The network path was not found`, що під `$ErrorActionPreference =
+  'Stop'` обривало виклик замість класифікованої проблеми (на
+  CI-раннері ім'я не резолвиться, тому дефект не відтворювався);
+  обхід каталогів угору тепер придушує помилки провайдера, має захист
+  від нескінченного циклу на корені share і лишається fail-closed —
+  недосяжний шлях дає `Success = $false` із записом у `Problems`.
+  Додано три регресії: `DryRun/VolumeRootIsCaseNormalizedAcrossSources`,
+  `DataRestore/UnreachableUncTargetIsClassifiedNotFatal`,
+  `DataRestore/WriteProbeWalkUpSuppressesPathProviderErrors`.
+
 - **SELF_TEST: fail-fast structural preflight і diagnostic timing
   telemetry (PR #138)** — рання fail-closed structural перевірка
   (runtime manifest integrity, обов'язкові manifest-файли, синтаксис
