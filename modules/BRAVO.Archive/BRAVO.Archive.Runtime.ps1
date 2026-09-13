@@ -24,7 +24,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.DiskSpace')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -5537,77 +5537,123 @@ function Get-BRAVOArchiveEstimatedSpaceRequirement {
     }
 }
 
-function Merge-BRAVOArchiveSpaceCheckResults {
-    # Об'єднує фіксований поріг (Get-BRAVOArchiveFreeSpaceResult) і
-    # розрахункову оцінку (Get-BRAVOArchiveEstimatedSpaceRequirement) в
-    # один підсумковий результат кроку "Перевірка вільного місця".
+function Resolve-BRAVOArchiveSpaceDecision {
+    # Замінює Merge-BRAVOArchiveSpaceCheckResults (5.2.1, видалено в 5.2.3
+    # разом з переходом на спільний shared classifier BRAVO.DiskSpace —
+    # fix/5.2.3-operation-aware-disk-space, BRAVO_5_2_2_DISK_SPACE_TASK_FINAL.md).
     #
-    # Реальний acceptance (2026-08-25): фіксований поріг — загальний
-    # OS-захист "не забити диск впритул", не прив'язаний до конкретного
-    # backup. Оператор підтвердив, що коли розрахункова оцінка доводить
-    # достатність місця САМЕ для цього набору архівів, фіксований поріг
-    # не повинен блокувати прогін — лише попереджати.
+    # Будує per-entity вхід для Invoke-BRAVODiskSpaceClassifier:
+    #   - health-only sweep усіх локальних Fixed-дисків (§11 — health
+    #     monitoring не прибирається; RequiresFreeSpace=false для дисків,
+    #     які самі по собі не є archive destination);
+    #   - per-компонент SOURCE (RequiresAccess=true, RequiresFreeSpace=false —
+    #     VSS-джерело саме по собі не потребує додаткового вільного місця,
+    #     Phase 0 §5.2/decision #5);
+    #   - per-компонент ARCHIVE_DESTINATION (RequiresFreeSpace=true,
+    #     RequirementGranularity=Entity, RequiredGB з уже обчисленого
+    #     Get-BRAVOArchiveEstimatedSpaceRequirement; компонент без валідної
+    #     історії свідомо залишає RequiredGB невідомим — bootstrap,
+    #     GroupRequirementState=Unknown, safe floor fallback).
     #
-    # Виправдання приймається СТРОГО по-диску (не глобально) і ЛИШЕ коли
-    # для ТОГО САМОГО диска оцінка реально обчислена й показала
-    # достатність. Диск без жодного увімкненого компонента з валідною
-    # історією (bootstrap, чи взагалі не бере участі в backup) лишається
-    # під фіксованим порогом без жодних послаблень — довести безпеку
-    # нема на чому, а не тому, що ризик підтверджено прийнятним.
-    #
-    # Незалежно від floor-виправдання: якщо сама розрахункова оцінка
-    # виявила недостатність (для будь-якого оціненого диска) — це
-    # завжди блокує, floor-виправдання тут ролі не відіграє.
+    # ВАЖЛИВО (навмисна зміна поведінки, рішення reviewer #2, 2026-08-30):
+    # RequirementPolicy='ArchiveNotPeakSafe' — PeakSafeEstimate=false для
+    # Archive у 5.2.3. Get-BRAVOArchiveEstimatedSpaceRequirement НЕ
+    # враховує retained generations і .work тимчасові файли (Phase 0
+    # characterization), тому below-floor relaxation, який 5.2.1 надавав
+    # через Merge-BRAVOArchiveSpaceCheckResults (реальний acceptance
+    # 2026-08-25), у 5.2.3 СВІДОМО вимкнено: below-floor тепер БЛОКУЄ
+    # (Reason=BelowFloorEstimateNotPeakSafe), навіть якщо оцінка достатня.
+    # Задокументовано в CHANGELOG/upgrade notes 5.2.3 як посилення
+    # політики, не регресія (детально: A24/A25 self-test, §24.1 специфікації).
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][object]$FloorResult,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][object[]]$EnabledArchives,
         [Parameter(Mandatory = $true)][object]$EstimatedResult,
-        [Parameter(Mandatory = $true)][double]$MinimumFreeSpaceGB
+        [Parameter(Mandatory = $true)][double]$MinimumFreeSpaceGB,
+        [string[]]$ExcludedDrives = @(),
+        # Той самий injectable-override принцип, що в
+        # Get-BRAVOArchiveFreeSpaceResult/Get-BRAVOArchiveEstimatedSpaceRequirement.
+        [object[]]$Drives
     )
 
-    $warnings = New-Object System.Collections.Generic.List[string]
-    $unresolvedProblems = New-Object System.Collections.Generic.List[string]
-    $success = [bool]$FloorResult.Success
+    $entitySpecs = New-Object System.Collections.Generic.List[object]
 
-    if (-not $FloorResult.Success) {
-        foreach ($driveStatus in @($FloorResult.DriveStatus)) {
-            if ([double]$driveStatus.FreeSpaceGB -ge $MinimumFreeSpaceGB) {
-                continue
-            }
-            $matchingEstimate = @($EstimatedResult.VolumeStatus | Where-Object {
-                [string]::Equals([string]$_.Drive, [string]$driveStatus.Drive, [StringComparison]::OrdinalIgnoreCase)
-            } | Select-Object -First 1)
-            $estimateCoversDrive = (
-                $matchingEstimate.Count -gt 0 -and
-                $null -ne $matchingEstimate[0].AvailableGB -and
-                $matchingEstimate[0].AvailableGB -ge $matchingEstimate[0].RequiredGB
-            )
-            if ($estimateCoversDrive) {
-                [void]$warnings.Add(
-                    "Диск $($driveStatus.Drive): вільно $($driveStatus.FreeSpaceGB) GB — нижче " +
-                    "фіксованого порогу $MinimumFreeSpaceGB GB, але розрахункова потреба " +
-                    "$($matchingEstimate[0].RequiredGB) GB покрита ($($matchingEstimate[0].Components)) — " +
-                    "продовжуємо (WARNING, не блокує)."
-                )
-            } else {
-                [void]$unresolvedProblems.Add(
-                    "диск $($driveStatus.Drive): залишилось $($driveStatus.FreeSpaceGB) GB, потрібно мінімум $MinimumFreeSpaceGB GB"
-                )
-            }
+    # Injectable -Drives тут використовує BRAVO.DiskSpace-конвенцію
+    # (властивість .Drive), а не .Name, як Get-BRAVOArchiveFreeSpaceResult
+    # вище в цьому файлі — сумісно з self-test фікстурами
+    # Get-BRAVOArchiveEstimatedSpaceRequirement (теж .Drive) і з усім
+    # BRAVO.DiskSpace модулем, куди ці об'єкти передаються далі незмінними.
+    $usingInjectedDrives = $PSBoundParameters.ContainsKey('Drives')
+    $healthDrives = @(if ($usingInjectedDrives) {
+        $Drives | Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed }
+    } else {
+        [System.IO.DriveInfo]::GetDrives() | Where-Object { $_.DriveType -eq [System.IO.DriveType]::Fixed }
+    })
+    foreach ($driveInfo in $healthDrives) {
+        $driveName = if ($usingInjectedDrives) {
+            ([string]$driveInfo.Drive).TrimEnd('\').ToUpperInvariant()
+        } else {
+            ([string]$driveInfo.Name).TrimEnd('\').ToUpperInvariant()
         }
-        $success = ($unresolvedProblems.Count -eq 0)
+        [void]$entitySpecs.Add([pscustomobject]@{
+            DisplayPath = "$driveName\"
+            Roles = @('HealthOnly')
+            RequiresAccess = $false
+            RequiresFreeSpace = $false
+            MinimumFreeSpaceGB = $MinimumFreeSpaceGB
+        })
     }
 
-    $finalProblems = @($unresolvedProblems.ToArray())
-    if (-not [bool]$EstimatedResult.Success) {
-        $success = $false
-        $finalProblems = @($finalProblems) + @($EstimatedResult.Problems)
+    foreach ($archive in $EnabledArchives) {
+        $componentType = [string]$archive.Type
+        $sourcePath = [string]$archive.Source
+        if (-not [string]::IsNullOrWhiteSpace($sourcePath)) {
+            [void]$entitySpecs.Add([pscustomobject]@{
+                DisplayPath = $sourcePath
+                Roles = @("${componentType}_SOURCE")
+                Components = @($componentType)
+                RequiresAccess = $true
+                RequiresFreeSpace = $false
+            })
+        }
+
+        $componentEstimate = @($EstimatedResult.ComponentEstimates | Where-Object { [string]$_.Type -eq $componentType } | Select-Object -First 1)
+        $requiredGB = $null
+        if ($componentEstimate.Count -gt 0 -and [bool]$componentEstimate[0].HasHistory) {
+            $requiredGB = [double]$componentEstimate[0].EstimatedBytes / 1GB
+        }
+        [void]$entitySpecs.Add([pscustomobject]@{
+            DisplayPath = [string]$archive.Destination
+            Roles = @("${componentType}_ARCHIVE_DESTINATION")
+            Components = @($componentType)
+            RequiresAccess = $true
+            RequiresFreeSpace = $true
+            RequirementGranularity = 'Entity'
+            RequiredGB = $requiredGB
+        })
     }
+
+    $classifierParams = @{
+        EntitySpecs = $entitySpecs.ToArray()
+        MinimumFreeSpaceGB = $MinimumFreeSpaceGB
+        ExcludedDrives = $ExcludedDrives
+        RequirementPolicy = 'ArchiveNotPeakSafe'
+    }
+    if ($PSBoundParameters.ContainsKey('Drives')) { $classifierParams.Drives = $Drives }
+
+    # Write-BRAVODiskSpaceDecisionLog (§58) навмисно НЕ викликається тут:
+    # ця функція лишається чистою (лише Invoke-BRAVODiskSpaceClassifier,
+    # без залежності від Write-Log), щоб self-test міг витягнути й
+    # викликати її ізольовано (New-BRAVOSelfTestRuntimeModule екстрагує
+    # ЛИШЕ AST названих функцій — Write-Log сюди не потрапив би).
+    # Логування декомпозиції виконує виклик-сайт у Main.
+    $classified = Invoke-BRAVODiskSpaceClassifier @classifierParams
 
     return [pscustomobject]@{
-        Success = $success
-        Problems = $finalProblems
-        Warnings = $warnings.ToArray()
+        Success = $classified.Success
+        Problems = $classified.Problems
+        Warnings = $classified.Warnings
+        Results = $classified.Results
     }
 }
 
@@ -6235,23 +6281,26 @@ function Main {
         ) -Level 'INFO'
     }
 
-    # Оператор (реальний acceptance, 2026-08-25): фіксований поріг
-    # (загальний OS-захист "не забити диск впритул", не прив'язаний до
-    # конкретного backup) не повинен блокувати архівацію, коли для САМЕ
-    # ЦЬОГО набору архівів розрахунково доведено достатньо місця.
-    # Merge-BRAVOArchiveSpaceCheckResults реалізує це строго по-диску —
-    # диск без жодного оціненого компонента (bootstrap, чи взагалі не
-    # бере участі в backup) лишається під фіксованим порогом без
-    # послаблень.
-    $mergedArchiveSpaceResult = Merge-BRAVOArchiveSpaceCheckResults `
-        -FloorResult $archiveFreeSpaceResult `
+    # Operation-aware рішення (fix/5.2.3-operation-aware-disk-space): спільний
+    # BRAVO.DiskSpace-класифікатор оцінює кожен volume/шлях відповідно до
+    # його реальної ролі в ЦІЙ операції (Participates/RequiresAccess/
+    # RequiresFreeSpace), а не як єдиний глобальний floor по всіх Fixed-
+    # дисках. $archiveFreeSpaceResult/$archiveEstimatedSpaceResult вище
+    # залишаються діагностичним джерелом для per-drive логів і DriveStatus,
+    # який Send-BRAVOArchiveFreeSpaceAlert використовує для тексту
+    # сповіщення — саме рішення (Success/Problems) тепер належить
+    # Resolve-BRAVOArchiveSpaceDecision.
+    $archiveSpaceDecision = Resolve-BRAVOArchiveSpaceDecision `
+        -EnabledArchives $enabledArchives `
         -EstimatedResult $archiveEstimatedSpaceResult `
-        -MinimumFreeSpaceGB $archiveMinimumFreeSpaceGB
-    foreach ($mergedWarning in @($mergedArchiveSpaceResult.Warnings)) {
-        Write-Log $mergedWarning -Level 'WARNING'
+        -MinimumFreeSpaceGB $archiveMinimumFreeSpaceGB `
+        -ExcludedDrives $archiveFreeSpaceExcludedDrives
+    Write-BRAVODiskSpaceDecisionLog -Results $archiveSpaceDecision.Results -Logger { param($line) Write-Log $line -Level 'INFO' }
+    foreach ($spaceWarning in @($archiveSpaceDecision.Warnings)) {
+        Write-Log $spaceWarning -Level 'WARNING'
     }
-    $archiveFreeSpaceResult.Success = $mergedArchiveSpaceResult.Success
-    $archiveFreeSpaceResult.Problems = $mergedArchiveSpaceResult.Problems
+    $archiveFreeSpaceResult.Success = $archiveSpaceDecision.Success
+    $archiveFreeSpaceResult.Problems = $archiveSpaceDecision.Problems
 
     $archiveFreeSpaceReason = if ($archiveFreeSpaceResult.Success) {
         $null
