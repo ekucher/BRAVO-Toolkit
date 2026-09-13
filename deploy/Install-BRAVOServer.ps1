@@ -385,7 +385,10 @@ if ($SkipSelfTest) {
     Write-Note 'виконується, це кілька хвилин...'
     Push-Location $RuntimeRoot
     try {
-        & (Join-Path $RuntimeRoot 'BRAVO_SELF_TEST.ps1')
+        # -NoPause обов'язковий: без нього self-test чекає клавішу
+        # (Wait-BRAVOManualExit) і зупиняє весь автоматичний прогін
+        # посеред кроку 6 — спіймано на реальній інсталяції.
+        & (Join-Path $RuntimeRoot 'BRAVO_SELF_TEST.ps1') -NoPause
         $selfTestCode = $LASTEXITCODE
     } finally {
         Pop-Location
@@ -393,7 +396,13 @@ if ($SkipSelfTest) {
     if ($selfTestCode -eq 0) {
         Write-Ok 'BRAVO_SELF_TEST.ps1 -> exit 0'
     } else {
-        Write-Bad ('BRAVO_SELF_TEST.ps1 -> exit ' + $selfTestCode + ' — розберіть вивід вище перед налаштуванням.')
+        Write-Bad ('BRAVO_SELF_TEST.ps1 -> exit ' + $selfTestCode)
+        Write-Host ''
+        Write-Host '  Комплект розгорнуто, але не провалідовано. Розберіть рядки [FAIL] вище' -ForegroundColor Yellow
+        Write-Host '  і журнал у LOGS\HELPERS перед налаштуванням. Частина перевірок залежить' -ForegroundColor Yellow
+        Write-Host '  від середовища хоста (політики PowerShell, доступність мережевих шляхів),' -ForegroundColor Yellow
+        Write-Host '  тому провал self-test не завжди означає дефект комплекту. Свідомо' -ForegroundColor Yellow
+        Write-Host '  пропустити перевірку можна параметром -SkipSelfTest.' -ForegroundColor Yellow
         exit $selfTestCode
     }
 }
