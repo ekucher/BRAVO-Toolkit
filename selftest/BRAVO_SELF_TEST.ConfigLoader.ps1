@@ -1191,3 +1191,38 @@ Test-BRAVOCondition `
     -Condition ($gitignoreLines -contains 'BRAVO.local.config') `
     -Name 'ConfigLoader/LocalConfigIsGitignored' `
     -Failure 'BRAVO.local.config (site-specific override-шар) мусить бути в .gitignore окремим рядком — інакше ручний git-запуск із робочої копії міг би закомітити site-дані'
+
+# A1 (#154, знахідка F2 аудиту 2026-09-14): документація мусить описувати
+# ФАКТИЧНУ суворість dot-шляху. ConvertTo-BRAVONestedOverride вимагає
+# існування лише БАТЬКІВСЬКИХ сегментів; сам leaf існувати не зобов'язаний
+# (свідома forward-compat, задокументована в модулі). Документи ж
+# стверджували беззастережно "опечатки не мовчать" — і оператор, звіряючись
+# із ними, вважав би мовчазно проігнорований ключ застосованим.
+#
+# Перевіряється текст, а не поведінка: сама поведінка покрита тестами
+# ConvertTo-BRAVONestedOverride у Configuration-фрагменті. Тут — саме
+# синхронність документації з нею.
+$leafDocPaths = @(
+    (Join-Path $root 'BRAVO.local.config.example'),
+    (Join-Path $root 'BRAVO_SETUP.md')
+)
+$leafDocProblems = New-Object System.Collections.Generic.List[string]
+foreach ($leafDocPath in $leafDocPaths) {
+    if (-not (Test-Path -LiteralPath $leafDocPath -PathType Leaf)) {
+        [void]$leafDocProblems.Add("$(Split-Path -Leaf $leafDocPath): файл відсутній")
+        continue
+    }
+    $leafDocText = [IO.File]::ReadAllText($leafDocPath, [Text.Encoding]::UTF8)
+    $leafDocName = Split-Path -Leaf $leafDocPath
+    if ($leafDocText -match 'опечатки\s+не\s+мовчать') {
+        [void]$leafDocProblems.Add("${leafDocName}: беззастережна заява 'опечатки не мовчать' суперечить фактичній поведінці leaf")
+    }
+    if ($leafDocText -notmatch '(?i)forward-compat') {
+        [void]$leafDocProblems.Add("${leafDocName}: не описано forward-compat-виняток для останнього сегмента")
+    }
+}
+Test-BRAVOCondition `
+    -Condition ($leafDocProblems.Count -eq 0) `
+    -Name 'ConfigLoader/LocalConfigLeafSemanticsDocumentedAccurately' `
+    -Failure ("документація BRAVO.local.config мусить описувати несиметричну суворість dot-шляху (батьківські сегменти — fail-closed, leaf — forward-compat): " +
+        (($leafDocProblems.ToArray()) -join '; '))
