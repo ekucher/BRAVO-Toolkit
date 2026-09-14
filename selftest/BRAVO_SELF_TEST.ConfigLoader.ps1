@@ -1220,6 +1220,14 @@ foreach ($leafDocPath in $leafDocPaths) {
     if ($leafDocText -notmatch '(?i)forward-compat') {
         [void]$leafDocProblems.Add("${leafDocName}: не описано forward-compat-виняток для останнього сегмента")
     }
+    # #154 (A1): після A2 невідомий leaf БІЛЬШЕ НЕ мовчить — є попередження
+    # й запис у метадані. Документи описували стан ДО A2 ("буде прийнято
+    # мовчки"), тобто відставали від поведінки в протилежний бік. Ім'я поля
+    # метаданих — стабільний якір: якщо його немає, документ або не згадує
+    # діагностику взагалі, або її прибрали.
+    if ($leafDocText -notmatch 'LocalConfigUnknownLeafOverrides') {
+        [void]$leafDocProblems.Add("${leafDocName}: не згадано LocalConfigUnknownLeafOverrides — опис відстає від A2, де невідомий leaf став видимим")
+    }
 }
 Test-BRAVOCondition `
     -Condition ($leafDocProblems.Count -eq 0) `
