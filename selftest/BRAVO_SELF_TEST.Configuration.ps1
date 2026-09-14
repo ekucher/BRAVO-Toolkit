@@ -433,6 +433,44 @@
             -Name "Delta/IdenticalGraphsProduceNoDifference" `
             -Failure "порівняння canonical defaults із самими собою має дати 0 відмінностей (отримано $($deltaNone.Count): $([string]::Join(', ', $deltaNonePaths)))"
 
+        # --- Delta/EmptyAndSingleElementArraysCompareEqual ---
+        # Регресія на реальний дефект (CI 2026-09-14): еталонне значення
+        # діставалось через "$x = if (...) { $hash[$key] } else { $null }",
+        # і присвоєння РЕЗУЛЬТАТУ statement-а розгортало колекцію —
+        # порожній масив ставав $null, одноелементний ставав самим
+        # елементом. Кандидат читався прямим індексуванням, тож
+        # порівнювались різні ТИПИ, і кожен такий ключ давав хибну
+        # "відмінність". Саме такі значення є в canonical defaults
+        # (ExcludedDrives = @(), RobocopyProgressOptions = @('/ETA')).
+        $deltaArrayShape = @{
+            emptyArray = @()
+            singleElement = @('one')
+            multiElement = @('a', 'b')
+            plainScalar = 'x'
+        }
+        $deltaArrayShapeCopy = @{
+            emptyArray = @()
+            singleElement = @('one')
+            multiElement = @('a', 'b')
+            plainScalar = 'x'
+        }
+        $deltaArrayShapeSame = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaArrayShape `
+            -CandidateConfiguration $deltaArrayShapeCopy)
+        $deltaArrayShapePaths = @($deltaArrayShapeSame | ForEach-Object { if ($null -eq $_) { '<null>' } else { [string]$_.Path } })
+        # Позитивний контроль: одноелементний масив з ІНШИМ значенням
+        # мусить лишатись видимою відмінністю — фікс не сміє "зрівняти все".
+        $deltaArrayShapeChanged = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ singleElement = @('one') } `
+            -CandidateConfiguration @{ singleElement = @('two') })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaArrayShapeSame.Count -eq 0 -and
+                $deltaArrayShapeChanged.Count -eq 1
+            ) `
+            -Name "Delta/EmptyAndSingleElementArraysCompareEqual" `
+            -Failure "порожній і одноелементний масиви з однаковим вмістом мусять бути РІВНИМИ, а зміна значення — видимою: однакові дали $($deltaArrayShapeSame.Count) ($([string]::Join(', ', $deltaArrayShapePaths))), змінений дав $($deltaArrayShapeChanged.Count)"
+
         # --- Delta/EmptyRecursionAddsNoNullEntry ---
         # Регресія на реальний дефект (CI 2026-09-14): рекурсія у вузол БЕЗ
         # відмінностей повертала порожній масив, який PowerShell розгортає

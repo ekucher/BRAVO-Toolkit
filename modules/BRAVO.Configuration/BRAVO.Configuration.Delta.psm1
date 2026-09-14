@@ -105,7 +105,21 @@ function Add-BRAVOConfigurationGraphDifference {
         $path = if ([string]::IsNullOrEmpty($PathPrefix)) { [string]$key } else { "$PathPrefix.$key" }
         $candidateValue = $CandidateConfiguration[$key]
         $referenceHasKey = $ReferenceConfiguration.Contains($key)
-        $referenceValue = if ($referenceHasKey) { $ReferenceConfiguration[$key] } else { $null }
+
+        # ПРЯМЕ присвоєння, а не $referenceValue = if (...) { ... } else { $null }:
+        # присвоєння РЕЗУЛЬТАТУ statement-а проганяє значення через
+        # output-pipeline, який РОЗГОРТАЄ колекції — порожній масив
+        # перетворюється на $null, а одноелементний на сам елемент. Кандидат
+        # при цьому читається прямим індексуванням і колекцією лишається,
+        # тож порівнювались різні ТИПИ. Емпірично: порівняння canonical
+        # defaults із самими собою давало рівно 3 хибні "відмінності" —
+        # maintenanceSettings.Limits.ExcludedDrives (@()),
+        # maintenanceSettings.Limits.MdFileSizeExclusions (@('...')) і
+        # progressSettings.RobocopyProgressOptions (@('/ETA')), тобто ВСІ
+        # порожні й одноелементні масиви дефолтів і жодного іншого
+        # (CI 2026-09-14).
+        $referenceValue = $null
+        if ($referenceHasKey) { $referenceValue = $ReferenceConfiguration[$key] }
 
         $candidateIsNode = ($candidateValue -is [hashtable])
         $referenceIsNode = ($referenceValue -is [hashtable])
