@@ -1085,6 +1085,46 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         -Name "Release/ArtifactWorkflowMarksPrerelease" `
         -Failure "release-artifact workflow має створювати dev/RC-реліз із --prerelease і виставляти прапорець наявному релізу, інакше неприйнятий кандидат стане Latest release (RELEASE_POLICY.md розділ 16)"
 
+    # --- #151 / RELEASE_POLICY.md §16.1: заміна ассетів дозволена ЛИШЕ для
+    # draft-релізу. Контракт "один тег — один незмінний набір артефактів"
+    # тримається на одному рядку коду, і саме він колись був порожнім:
+    # workflow запитував isDraft, але значення не використовував, тож
+    # --clobber виконувався й на опублікованому тезі.
+    #
+    # Перевіряється ФОРМА виклику, а не поведінка: сам workflow
+    # запускається лише від тега v*, тож жоден прогін CI його не виконує —
+    # без цієї перевірки повернення --clobber у гілку опублікованого
+    # релізу не помітив би ніхто аж до наступного релізу.
+    $releaseClobberCalls = [regex]::Matches(
+        $releaseArtifactWorkflowText, [regex]::Escape('gh release upload $tag --clobber'))
+    $releaseDraftGuardIndex = $releaseArtifactWorkflowText.IndexOf('if ([bool]$release.isDraft) {')
+    $releaseImmutabilityGuardIndex = $releaseArtifactWorkflowText.IndexOf('RELEASE_ASSET_IMMUTABILITY')
+    $releaseClobberIndex = if ($releaseClobberCalls.Count -gt 0) { $releaseClobberCalls[0].Index } else { -1 }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [string]::IsNullOrWhiteSpace($releaseArtifactWorkflowText) -and
+            # isDraft мусить ЧИТАТИСЬ у змінну разом зі списком ассетів:
+            # без assets гілка опублікованого релізу не знає, що вже існує.
+            $releaseArtifactWorkflowText.Contains('gh release view $tag --json isDraft,assets') -and
+            $releaseDraftGuardIndex -ge 0 -and
+            $releaseImmutabilityGuardIndex -gt $releaseDraftGuardIndex -and
+            # рівно один --clobber, і він УСЕРЕДИНІ draft-гілки:
+            # після її відкриття і до початку гілки опублікованого релізу
+            $releaseClobberCalls.Count -eq 1 -and
+            $releaseClobberIndex -gt $releaseDraftGuardIndex -and
+            $releaseClobberIndex -lt $releaseImmutabilityGuardIndex -and
+            # звірка опублікованого ассета мусить бути справжньою:
+            # завантажити й порахувати хеш, а не повірити .sha256-супутнику
+            # (супутник сам є ассетом і замінюється тим самим прогоном)
+            $releaseArtifactWorkflowText.Contains('gh release download $tag --pattern $assetName') -and
+            $releaseArtifactWorkflowText.Contains('Get-FileHash')
+        ) `
+        -Name "Release/ArtifactWorkflowNeverClobbersPublishedAssets" `
+        -Failure ("release-artifact workflow має замінювати ассети ЛИШЕ для draft-релізу (#151, RELEASE_POLICY.md §16.1): " +
+            "викликів --clobber $($releaseClobberCalls.Count) (очікується 1), індекс --clobber $releaseClobberIndex, " +
+            "відкриття draft-гілки $releaseDraftGuardIndex, початок гілки опублікованого релізу $releaseImmutabilityGuardIndex; " +
+            "--clobber мусить бути між ними, а звірка опублікованого ассета — через завантаження і Get-FileHash")
+
     $toolIntegrityTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_TOOL_INTEGRITY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
