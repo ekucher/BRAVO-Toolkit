@@ -558,7 +558,15 @@ function ConvertTo-BRAVONestedOverride {
     [OutputType([hashtable])]
     param(
         [Parameter(Mandatory = $true)][hashtable]$DotPathOverrides,
-        [Parameter(Mandatory = $true)][hashtable]$ReferenceConfiguration
+        [Parameter(Mandatory = $true)][hashtable]$ReferenceConfiguration,
+
+        # ДІАГНОСТИЧНИЙ вихід, не контроль: сюди додаються багатосегментні
+        # шляхи, чий БАТЬКІВСЬКИЙ вузол існує, а самого leaf у канонічній
+        # конфігурації немає. Такий шлях і далі ПРИЙМАЄТЬСЯ (forward-compat,
+        # див. коментар вище) — sink лише робить його видимим, бо мовчазно
+        # проігнорований ключ оператор вважає застосованим (#154, задача A2).
+        # Прийом/відхилення від наявності sink не залежить.
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
     )
 
     $nested = @{}
@@ -611,6 +619,14 @@ function ConvertTo-BRAVONestedOverride {
             }
             $targetNode = $targetNode[$segment]
         }
+        # Реєструємо невідомий leaf ПІСЛЯ перевірок прийнятності й ДО
+        # запису: до цього рядка доходять лише шляхи, які будуть
+        # застосовані, тож sink не змішує відхилені шляхи з прийнятими.
+        if ($null -ne $UnknownLeafPathSink -and $segments.Count -gt 1 -and
+            -not $referenceNode.Contains($leafSegment)) {
+            [void]$UnknownLeafPathSink.Add([string]$dotPath)
+        }
+
         $targetNode[$leafSegment] = Copy-BRAVOConfigurationGraphDeep -InputObject $DotPathOverrides[$dotPath]
     }
 
@@ -639,7 +655,11 @@ function Resolve-BRAVORawConfiguration {
     param(
         [Parameter(Mandatory = $true)][hashtable]$DefaultConfiguration,
         [AllowNull()][hashtable]$PrimaryOverrides,
-        [AllowNull()][hashtable]$LocalOverrides
+        [AllowNull()][hashtable]$LocalOverrides,
+
+        # Прокидається в ConvertTo-BRAVONestedOverride (діагностика
+        # невідомого leaf; прийом/відхилення не змінює).
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
     )
 
     $merged = Copy-BRAVOConfigurationGraphDeep -InputObject $DefaultConfiguration
@@ -649,7 +669,8 @@ function Resolve-BRAVORawConfiguration {
     }
 
     if ($null -ne $LocalOverrides -and $LocalOverrides.Count -gt 0) {
-        $localNested = ConvertTo-BRAVONestedOverride -DotPathOverrides $LocalOverrides -ReferenceConfiguration $merged
+        $localNested = ConvertTo-BRAVONestedOverride -DotPathOverrides $LocalOverrides -ReferenceConfiguration $merged `
+            -UnknownLeafPathSink $UnknownLeafPathSink
         $merged = Merge-BRAVOConfiguration -Base $merged -Override $localNested
     }
 
