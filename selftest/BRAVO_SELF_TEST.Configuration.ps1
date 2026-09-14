@@ -424,10 +424,40 @@
         $deltaDefaults = Get-BRAVODefaultConfiguration
         $deltaSame = Get-BRAVODefaultConfiguration
         $deltaNone = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $deltaDefaults -CandidateConfiguration $deltaSame)
+        # Повідомлення про провал називає САМІ шляхи: "отримано N" не дає
+        # жодної зачіпки, а порожній рядок у переліку одразу вказав би на
+        # null-запис від рекурсії (див. Delta/EmptyRecursionAddsNoNullEntry).
+        $deltaNonePaths = @($deltaNone | ForEach-Object { if ($null -eq $_) { '<null>' } else { [string]$_.Path } })
         Test-BRAVOCondition `
             -Condition ($deltaNone.Count -eq 0) `
             -Name "Delta/IdenticalGraphsProduceNoDifference" `
-            -Failure "порівняння canonical defaults із самими собою має дати 0 відмінностей (отримано $($deltaNone.Count))"
+            -Failure "порівняння canonical defaults із самими собою має дати 0 відмінностей (отримано $($deltaNone.Count): $([string]::Join(', ', $deltaNonePaths)))"
+
+        # --- Delta/EmptyRecursionAddsNoNullEntry ---
+        # Регресія на реальний дефект (CI 2026-09-14): рекурсія у вузол БЕЗ
+        # відмінностей повертала порожній масив, який PowerShell розгортає
+        # в $null, а @($null) — це масив з ОДНИМ елементом. Кожен такий
+        # вузол додавав порожній запис у результат. Тут два вкладені блоки
+        # без відмінностей і рівно одна справжня зміна.
+        $deltaNullProbe = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{
+                quiet1 = @{ a = 'x'; b = 'y' }
+                quiet2 = @{ c = @{ d = 'z' } }
+                loud = @{ value = 'before' }
+            } `
+            -CandidateConfiguration @{
+                quiet1 = @{ a = 'x'; b = 'y' }
+                quiet2 = @{ c = @{ d = 'z' } }
+                loud = @{ value = 'after' }
+            })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaNullProbe.Count -eq 1 -and
+                $null -ne $deltaNullProbe[0] -and
+                [string]$deltaNullProbe[0].Path -eq 'loud.value'
+            ) `
+            -Name "Delta/EmptyRecursionAddsNoNullEntry" `
+            -Failure "рекурсія у вузли без відмінностей не сміє додавати порожні (`$null) записи: очікувався рівно один результат 'loud.value', отримано $($deltaNullProbe.Count)"
 
         # --- Delta/ChangedLeafReportedWithDotPath ---
         $deltaReference = @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV'; StateRoot = 'C:\State' } }

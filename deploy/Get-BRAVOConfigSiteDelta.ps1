@@ -127,6 +127,12 @@ try {
     $unrepresentable = 0
 
     foreach ($difference in $differences) {
+        # Функція, що повертає порожній масив, у PowerShell не повертає
+        # нічого: @(<нічого>) дає @(), але @($null) — масив з ОДНИМ
+        # елементом. Явна перевірка тут коштує один рядок, а без неї
+        # звернення до .Path під Set-StrictMode впало б винятком.
+        if ($null -eq $difference) { continue }
+
         $path = [string]$difference.Path
 
         if ($difference.Kind -eq 'OnlyInReference') {

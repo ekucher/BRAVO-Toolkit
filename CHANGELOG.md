@@ -17,7 +17,7 @@
   `Import-BravoLegacyPrimaryConfiguration` окремою функцією й
   перевикористовується без зміни поведінки завантаження. Рендеринг
   літералів — наявний `ConvertTo-BRAVOConfiguratorPowerShellLiteral`.
-  Одинадцять регресій у `Delta/*`.
+  Дванадцять регресій у `Delta/*`.
 
 - **Невідомий кінцевий сегмент у `BRAVO.local.config` більше не
   мовчить (#154, A2)** — `ConvertTo-BRAVONestedOverride` навмисно
