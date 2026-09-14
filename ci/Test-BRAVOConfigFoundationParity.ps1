@@ -1,9 +1,19 @@
 ﻿[CmdletBinding()]
 param(
-    # Базовий коміт "ДО" (за замовчуванням — точка розгалуження PR C від
-    # PR B, обчислена динамічно; НЕ хардкодиться, щоб скрипт не застарів,
-    # якщо стек гілок зміниться). Приймає будь-який git-ref.
-    [string]$BaseRef = 'feature/config-foundation-derivation',
+    # Базова точка "ДО" — стан PR B (Configuration Foundation, до PR C).
+    #
+    # Тут НАВМИСНО стоїть незмінний SHA, а не ім'я гілки. Раніше дефолтом
+    # було 'feature/config-foundation-derivation'; ця гілка вже влита в
+    # developer, тож прибирання стале гілок (governance) видалило б
+    # єдину точку відліку для доказу паритету конфігурації — і зламало б
+    # цей інструмент мовчки, у момент, коли він найпотрібніший.
+    #
+    # 42cf9ad — тіп тієї самої гілки і предок developer, тож коміт
+    # лишається досяжним після видалення гілки. Allowlist навмисних
+    # відмінностей нижче прив'язаний саме до цього стану: підміна бази на
+    # master/тег зробила б результат неінтерпретовним (master ще не має
+    # Configuration Foundation). Інша база — лише явним -BaseRef.
+    [string]$BaseRef = '42cf9add7c9e9d40b7e6ae456518738c08e2cd4b',
 
     # Каталог комплекту "ПІСЛЯ" — за замовчуванням поточний working tree
     # (включно з незакомміченими змінами PR C) відносно розташування
@@ -48,8 +58,7 @@ param(
     повним переліком.
 .EXAMPLE
     .\ci\Test-BRAVOConfigFoundationParity.ps1
-    Порівнює merge-base (feature/config-foundation-derivation) з поточним
-    working tree.
+    Порівнює базовий стан PR B (коміт 42cf9ad) з поточним working tree.
 #>
 
 Set-StrictMode -Version 2.0
@@ -349,9 +358,19 @@ try {
     # виклику, перевірка $LASTEXITCODE нижче лишається справжнім gate.
     $callEap = $ErrorActionPreference
     $ErrorActionPreference = 'Continue'
-    $baseCommit = & git -C $AfterRoot rev-parse $BaseRef 2>&1
+    # --verify ... ^{commit} замість голого rev-parse: голий rev-parse
+    # повертає переданий SHA дослівно навіть тоді, коли самого об'єкта в
+    # репозиторії немає (напр. shallow clone), і помилка спливала б аж на
+    # 'git worktree add' у вигляді, з якого причина не читається.
+    $baseCommit = & git -C $AfterRoot rev-parse --verify "$BaseRef^{commit}" 2>&1
     $ErrorActionPreference = $callEap
-    if ($LASTEXITCODE -ne 0) { throw "Не вдалося resolve base ref '$BaseRef': $baseCommit" }
+    if ($LASTEXITCODE -ne 0) {
+        throw ("Не вдалося resolve base ref '$BaseRef': $baseCommit`n" +
+            "Дефолтна база — незмінний коміт, досяжний з developer. Якщо клон " +
+            "неповний (shallow) або гілка developer не вивантажена, виконайте " +
+            "'git fetch origin developer' і повторіть. Іншу базу задавайте явно: " +
+            "-BaseRef <ref>.")
+    }
     Write-Host "Base commit: $baseCommit" -ForegroundColor Cyan
 
     $tempRoot = [IO.Path]::GetTempPath()
