@@ -354,8 +354,11 @@ BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Детал
 
 **Config v2 — IN PROGRESS / не завершено.** `BRAVO.config` сам
 залишається виконуваним PowerShell-скриптом (не DATA-only),
-`VERSION.json.configSchemaVersion` = `1`, файл `BRAVO.config.local`
-(цільова v2-назва) у runtime ще не існує. Повний перелік
+`VERSION.json.configSchemaVersion` = `1`. Рішенням власника **D2**
+(2026-09-14) перейменування локального шару скасовано: назва
+`BRAVO.local.config` лишається, файлу `BRAVO.config.local` не буде, а
+цільова модель v2 — **двошарова** (`DEFAULT < BRAVO.config <
+BRAVO.local.config`), без окремого машинно-локального шару. Повний перелік
 залишкових gaps, target architecture, safe declarative parser
 requirement, schema v2, migration і DoD regression matrix —
 `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`.

@@ -40,7 +40,11 @@ backlog-нотатки; канонічний поточний пріоритет
 - hashtable зливаються рекурсивно;
 - scalar local override замінює default;
 - масив local override повністю замінює default-масив;
-- невідомий ключ або неправильний тип — fail-closed;
+- невідомий ключ або неправильний тип — fail-closed, **окрім
+  невідомого кінцевого сегмента (leaf)**: рішенням власника **D3**
+  (2026-09-14) для нього збережено forward-compat — він приймається,
+  але повідомляється (попередження плюс
+  `BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides`);
 - `$null` дозволений лише для явно nullable-параметрів;
 - критичні security-параметри не можна послабити звичайним local override.
 
@@ -119,9 +123,11 @@ backlog-нотатки; канонічний поточний пріоритет
       не опише: (1) як захистити `BRAVO.local.config` окремо від
       загального `RuntimeRoot` ACL; (2) backup-процедуру; (3)
       recovery/restore-процедуру; (4) сценарій зовнішнього ConfigRoot
-      (явний `-ConfigPath` поза `RuntimeRoot`). Еквівалентна документація
-      для v2 `BRAVO.config.local` буде додана разом із самим v2-форматом,
-      не раніше.
+      (явний `-ConfigPath` поза `RuntimeRoot`). Файл лишається той самий і
+      у v2: рішенням власника **D2** (2026-09-14) перейменування
+      скасовано, окремого `BRAVO.config.local` не буде, тож і окремої
+      документації для нього не потрібно — наведені чотири пункти
+      стосуються `BRAVO.local.config` незалежно від версії формату.
 
 Повний перелік залишкових Config v2 gaps і рекомендований PR-split —
 `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`.
