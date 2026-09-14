@@ -89,7 +89,16 @@ function Add-BRAVOConfigurationGraphDifference {
         [Parameter(Mandatory = $true)][hashtable]$CandidateConfiguration,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$PathPrefix,
         [switch]$IncludeMissingInCandidate,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Differences
+        # AllowEmptyCollection обов'язковий: Mandatory-параметр у PowerShell
+        # неявно відхиляє ПОРОЖНЮ колекцію ("Cannot bind argument to
+        # parameter 'Differences' because it is an empty collection"), а
+        # накопичувач на першому виклику завжди порожній. Так само
+        # AllowEmptyString вище для $PathPrefix: кореневий виклик передає ''.
+        # (Порожня hashtable під це правило НЕ підпадає — canonical
+        # -LocalOverrides @{} працює так з самого початку.)
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]]$Differences
     )
 
     foreach ($key in @($CandidateConfiguration.Keys)) {
