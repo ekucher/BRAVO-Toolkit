@@ -13,6 +13,20 @@ param(
     # відмінностей нижче прив'язаний саме до цього стану: підміна бази на
     # master/тег зробила б результат неінтерпретовним (master ще не має
     # Configuration Foundation). Інша база — лише явним -BaseRef.
+    #
+    # ПРО РЕКОМЕНДАЦІЮ "BaseRef = origin/master або тег" з #154 (A4): вона
+    # НЕ застосовна, поки stable лишається 5.2.4 — перевірено 2026-09-14,
+    # у origin/master немає навіть каталогу modules\BRAVO.Configuration\,
+    # тож порівнювати не було б із чим. Перепривʼязка бази має сенс лише
+    # після того, як Configuration Foundation потрапить у stable; доти
+    # база лишається на 42cf9ad.
+    #
+    # НАСЛІДОК, про який треба знати: доки база зафіксована, а лінія
+    # розробки йде вперед, allowlist нижче ЗРОСТАТИМЕ — кожен новий ключ
+    # конфігурації й кожне штампування версії додають очікувану
+    # відмінність. Це не гниття інструмента, а плата за незмінну точку
+    # відліку; поіменне внесення таких ключів свідоме (обґрунтування — у
+    # коментарях самого allowlist-а).
     [string]$BaseRef = '42cf9add7c9e9d40b7e6ae456518738c08e2cd4b',
 
     # Каталог комплекту "ПІСЛЯ" — за замовчуванням поточний working tree
@@ -339,6 +353,38 @@ $knownIntentionalDiffPrefixes = @(
     'BravoConfigurationMetadata.PrimaryConfigWasExplicit',
     # Час завантаження — очікувано різний між двома окремими прогонами.
     'BravoConfigurationMetadata.LoadedAt',
+    # ІДЕНТИЧНІСТЬ ВЕРСІЇ — той самий клас, що LoadedAt вище: ці поля
+    # відрізняються між БУДЬ-ЯКИМИ двома комітами, де версію штампували,
+    # бо беруться з VERSION.json, а не з конфігураційного пайплайна. База
+    # 42cf9ad — 5.3.0-dev.2/ff2fdc3; developer уже 5.3.0-dev.3/86270a1.
+    # Їх пропустили при першому складанні allowlist-а, і через це harness
+    # почав падати після ПЕРШОГО ж штампування версії — тобто гейт §14.4
+    # став непрохідним ні для чого (#154, A4; підтверджено прогоном на
+    # чистому developer 2026-09-14: ті самі 9 полів без жодного PR).
+    # Порівнювати їх тут і не потрібно: узгодженість версії й provenance
+    # перевіряють ci\Test-BRAVOReleasePolicy.ps1 і self-test
+    # Version/ModuleManifests, а не паритет конфігурації.
+    'BravoConfigurationMetadata.BuildId',
+    'BravoConfigurationMetadata.PackageVersion',
+    'ScriptVersion',
+    'ScriptBuildId',
+    # АДИТИВНІ КЛЮЧІ КОНФІГУРАЦІЇ, додані ПІСЛЯ бази 42cf9ad. У BEFORE їх
+    # не існує взагалі (звідси <null>), у AFTER вони мають свої дефолти —
+    # це ріст схеми на лінії розробки, а не зміна наявної поведінки.
+    # Усі п'ять прийшли одним комітом 5c14a70 (2026-09-04, "log-lifecycle
+    # P1/P2/P5/P6 — SFTP власних логів, legacy sweep, retention").
+    #
+    # Перелічені ПОІМЕННО навмисно. Загальне правило "BEFORE=null +
+    # AFTER≠null = адитивність, пропускаємо" було б зручнішим, але воно
+    # послабило б перевірку: поле, яке РАНІШЕ мало $null, а тепер має
+    # значення, — це справжня зміна поведінки, і від адитивного ключа
+    # автоматично не відрізняється. Тертя від поіменного переліку — це
+    # і є чесний сигнал, що база старіє.
+    'componentSettings.SFTP.ArchiveLogUploadEnabled',
+    'componentSettings.SFTP.MaintenanceLogUploadEnabled',
+    'maintenanceSettings.Retention.RawSourceGraceDays',
+    'sftpDirectories.ArchivLog',
+    'sftpDirectories.MaintenanceLog',
     # Секція 5, задокументований canonical-default фікс (перевірено
     # окремим self-test ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults):
     # "E:\Archiv" (застарілий placeholder BRAVO.config) -> "" (canonical).
