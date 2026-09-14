@@ -517,3 +517,78 @@ Test-BRAVOCondition `
     -Name 'DiskSpace/S64-WarningMessageNeverEndsWithEmptyReason' `
     -Failure ("warning-повідомлення не має закінчуватись двокрапкою без причини (отримано: " +
         ((@($s64.Warnings) | ForEach-Object { [string]$_ }) -join ' | ') + ')')
+# ============================================================
+# S65 — вироджений health-поріг для тому, меншого за поріг
+# (#155; docs\BRAVO_530_DISK_SPACE_HEALTH_SIGNAL_TASK.md пункт 1).
+#
+# Реальний випадок з парку: LIMS-TOP G: — 15 GB загальної ємності при
+# порозі 20 GB. Абсолютний поріг недосяжний за побудовою, тож кожен
+# прогін давав BelowHealthFloorNoFreeSpaceRequirement і exit 10, а
+# закрити це попередження оператор не міг жодною дією.
+#
+# Блок виконується в ДОЧІРНІЙ області (& { ... }): фрагменти self-test
+# dot-source'яться в одну область, а Windows PowerShell має ліміт
+# $MaximumVariableCount = 4096 змінних на область (див. #163).
+& {
+    # 15 GB * 10% = 1.5 GB. Вільно 5 GB -> вище виродженого порогу -> Success.
+    $s65a = Test-BRAVODiskSpaceEntity `
+        -EntitySpec ([pscustomobject]@{ DisplayPath = 'G:\LIMS'; RequiresAccess = $false; RequiresFreeSpace = $false; MinimumFreeSpaceGB = 20 }) `
+        -Drives @(New-DiskSpaceTestDrive -Drive 'G:' -AvailableGB 5 -TotalGB 15) -ExcludedDrives @()
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$s65a.Result.Status -eq 'Success' -and
+            [string]::IsNullOrWhiteSpace([string]$s65a.Result.Reason) -and
+            (@($s65a.Result.Flags) -join ',') -match 'DegradedHealthFloorGB=1\.5'
+        ) `
+        -Name 'DiskSpace/S65a-SmallVolumeAboveDegradedFloorIsSuccess' `
+        -Failure ("том 15 GB при порозі 20 GB з 5 GB вільного місця має бути Success із вироджениим порогом 1.5 GB у Flags; " +
+            "отримано Status=$($s65a.Result.Status) Reason=$($s65a.Result.Reason) Flags=$(@($s65a.Result.Flags) -join ',')")
+
+    # Той самий том, заповнений понад вироджений поріг -> Warning з НОВОЮ
+    # Reason і видимим фактичним порогом.
+    $s65b = Test-BRAVODiskSpaceEntity `
+        -EntitySpec ([pscustomobject]@{ DisplayPath = 'G:\LIMS'; RequiresAccess = $false; RequiresFreeSpace = $false; MinimumFreeSpaceGB = 20 }) `
+        -Drives @(New-DiskSpaceTestDrive -Drive 'G:' -AvailableGB 1 -TotalGB 15) -ExcludedDrives @()
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$s65b.Result.Status -eq 'Warning' -and
+            -not [bool]$s65b.Result.Blocks -and
+            [string]$s65b.Result.Reason -eq 'BelowDegradedHealthFloorSmallVolume' -and
+            (@($s65b.Result.Flags) -join ',') -match 'DegradedHealthFloorGB=1\.5'
+        ) `
+        -Name 'DiskSpace/S65b-SmallVolumeBelowDegradedFloorWarnsWithOwnReason' `
+        -Failure ("той самий том з 1 GB вільного місця має давати non-blocking Warning BelowDegradedHealthFloorSmallVolume " +
+            "з фактичним порогом у Flags; отримано Status=$($s65b.Result.Status) Blocks=$($s65b.Result.Blocks) " +
+            "Reason=$($s65b.Result.Reason) Flags=$(@($s65b.Result.Flags) -join ',')")
+
+    # Том, БІЛЬШИЙ за поріг: поведінка 5.2.4 не змінилась — стара Reason,
+    # жодного виродження.
+    $s65c = Test-BRAVODiskSpaceEntity `
+        -EntitySpec ([pscustomobject]@{ DisplayPath = 'D:\LIMS'; RequiresAccess = $false; RequiresFreeSpace = $false; MinimumFreeSpaceGB = 20 }) `
+        -Drives @(New-DiskSpaceTestDrive -Drive 'D:' -AvailableGB 5 -TotalGB 200) -ExcludedDrives @()
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$s65c.Result.Status -eq 'Warning' -and
+            [string]$s65c.Result.Reason -eq 'BelowHealthFloorNoFreeSpaceRequirement' -and
+            -not ((@($s65c.Result.Flags) -join ',') -match 'DegradedHealthFloor')
+        ) `
+        -Name 'DiskSpace/S65c-NormalVolumeBehaviourUnchanged' `
+        -Failure ("том 200 GB при порозі 20 GB з 5 GB вільного місця має лишатись BelowHealthFloorNoFreeSpaceRequirement " +
+            "без виродження порогу; отримано Reason=$($s65c.Result.Reason) Flags=$(@($s65c.Result.Flags) -join ',')")
+
+    # Вироджений поріг — ВИКЛЮЧНО health-оцінка. Той самий малий том, коли
+    # він операційно потрібен і місця бракує, блокується як і раніше:
+    # інакше фікс перетворився б на мовчазне послаблення гейта архівації.
+    $s65d = Invoke-BRAVODiskSpaceClassifier `
+        -EntitySpecs @([pscustomobject]@{ DisplayPath = 'G:\ARCHIV'; RequiresAccess = $true; RequiresFreeSpace = $true; RequirementGranularity = 'Entity'; RequiredGB = 10 }) `
+        -MinimumFreeSpaceGB 20 -RequirementPolicy 'ArchiveNotPeakSafe' `
+        -Drives @(New-DiskSpaceTestDrive -Drive 'G:' -AvailableGB 5 -TotalGB 15) -ExcludedDrives @()
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$s65d.Results[0].Blocks -and
+            [string]$s65d.Results[0].Reason -eq 'EstimatedRequirementNotMet'
+        ) `
+        -Name 'DiskSpace/S65d-DegradedFloorNeverWeakensOperationalRequirement' `
+        -Failure ("операційно потрібний малий том з недостатнім місцем має блокуватись як раніше (EstimatedRequirementNotMet); " +
+            "отримано Blocks=$($s65d.Results[0].Blocks) Reason=$($s65d.Results[0].Reason)")
+}
