@@ -19,6 +19,28 @@
   `Configuration/KnownLeafIsNeverReportedAsUnknown`,
   `Configuration/UnknownParentStillFailsClosedWithSink`.
 
+- **Health-поріг для тому, меншого за сам поріг (#155)** — коли
+  загальна ємність тому менша за налаштований `MinimumFreeSpaceGB`,
+  абсолютний поріг недосяжний за побудовою: попередження не можна
+  закрити жодною дією оператора, бо звільнити більше місця, ніж
+  фізично існує, неможливо (реальний випадок парку — `LIMS-TOP` `G:`,
+  15 GB ємності при порозі 20 GB, кожен прогін давав
+  `BelowHealthFloorNoFreeSpaceRequirement` і `exit 10`). Для такого
+  тому health-поріг тепер вироджується у частку його власної ємності
+  (`-SmallVolumeFloorPercent`, за замовчуванням 10%), а перевищення
+  виродженого порогу повідомляється окремою причиною
+  `BelowDegradedHealthFloorSmallVolume`; фактичний поріг видно у
+  `Flags` як `DegradedHealthFloorGB=<значення>`, інакше оператор бачив
+  би попередження про 1.5 GB при налаштованих 20 і не розумів би, звідки
+  це число. Виродження застосовується **виключно** до health-оцінки:
+  том, який операційно потрібен і на якому бракує місця, блокується як
+  раніше, `ExcludedDrives` зберігає нинішню семантику, а поведінка для
+  тому, більшого за поріг, не змінилась. Чотири регресії:
+  `DiskSpace/S65a-SmallVolumeAboveDegradedFloorIsSuccess`,
+  `S65b-SmallVolumeBelowDegradedFloorWarnsWithOwnReason`,
+  `S65c-NormalVolumeBehaviourUnchanged`,
+  `S65d-DegradedFloorNeverWeakensOperationalRequirement`.
+
 - **Опублікований release-артефакт більше не можна мовчки замінити
   (#151)** — `release-artifact.yml` запитував `gh release view --json
   isDraft`, але значення не використовував: `gh release upload --clobber`
