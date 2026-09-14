@@ -790,7 +790,15 @@ function Complete-BRAVOConfigurationLoad {
         # шлях приймається як і раніше, sink лише робить його видимим.
         # Власник стану — викликач (Import-BravoConfiguration), тут жодного
         # нового $global:.
-        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink,
+
+        # #154, A3/F1: імена $global:, які встановлює САМ канонічний
+        # pipeline (top-level ключі мерджу + явні поля нижче + усе, що
+        # створює derivation-резолвер). Викликач порівнює з цим переліком
+        # те, що оголосив BRAVO.config — і лише різниця є "ігнорується".
+        # Перелік збирається ТУТ, бо саме тут він і виникає: хардкоджений
+        # список у викликачі застарів би при першій же зміні деривації.
+        [AllowNull()][System.Collections.Generic.HashSet[string]]$CanonicalGlobalNameSink
     )
 
     # -Force НЕ використовується навмисно: повторний Import-Module тієї
@@ -834,6 +842,23 @@ function Complete-BRAVOConfigurationLoad {
     $global:archivePrefix = $global:bravoSettings.ArchivePrefix
     $global:discoverySettings = Get-BRAVOCanonicalDiscoverySettings
 
+    if ($null -ne $CanonicalGlobalNameSink) {
+        foreach ($topLevelKey in @($mergedConfiguration.Keys)) {
+            [void]$CanonicalGlobalNameSink.Add([string]$topLevelKey)
+        }
+        foreach ($explicitName in @('runtimeRoot', 'archivePrefix', 'discoverySettings')) {
+            [void]$CanonicalGlobalNameSink.Add($explicitName)
+        }
+    }
+
+    $globalNamesBeforeDerivation = $null
+    if ($null -ne $CanonicalGlobalNameSink) {
+        $globalNamesBeforeDerivation = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($existingVariable in @(Get-Variable -Scope Global -ErrorAction SilentlyContinue)) {
+            [void]$globalNamesBeforeDerivation.Add([string]$existingVariable.Name)
+        }
+    }
+
     Resolve-BRAVOConfigurationDerivation `
         -runtimeRoot $global:runtimeRoot `
         -bravoSettings $global:bravoSettings `
@@ -846,6 +871,19 @@ function Complete-BRAVOConfigurationLoad {
         -backupMonitoring $global:backupMonitoring `
         -schedulerSettings $global:schedulerSettings `
         -restoreVerifySettings $global:restoreVerifySettings
+
+    if ($null -ne $CanonicalGlobalNameSink) {
+        # Усе, що з'явилось у глобальній області ПІД ЧАС деривації, належить
+        # деривації — і значення BRAVO.config для такого імені все одно було
+        # б перезаписане. Знімок "до" береться вже ПІСЛЯ виконання
+        # BRAVO.config, тож імена, які оголосив сам config і яких деривація
+        # не створює, у перелік канонічних не потраплять — саме вони й є
+        # предметом попередження.
+        foreach ($afterVariable in @(Get-Variable -Scope Global -ErrorAction SilentlyContinue)) {
+            if ($globalNamesBeforeDerivation.Contains([string]$afterVariable.Name)) { continue }
+            [void]$CanonicalGlobalNameSink.Add([string]$afterVariable.Name)
+        }
+    }
 }
 
 function Import-BravoSyntheticConfiguration {
@@ -869,6 +907,60 @@ function Import-BravoSyntheticConfiguration {
         -UnknownLeafPathSink $UnknownLeafPathSink
 }
 
+function Get-BRAVODeclaredGlobalVariableName {
+    <#
+    .SYNOPSIS
+        Повертає імена $global:-змінних, яким присвоює значення переданий
+        scriptblock (скомпільований BRAVO.config).
+    .DESCRIPTION
+        Розбір через AST, а не порівняння знімків глобальної області ДО/ПІСЛЯ
+        виконання: знімок дав би шум від самого рантайму ($LASTEXITCODE, $?,
+        $Matches і будь-якої змінної, що її встановив попередній крок
+        entrypoint-а) і мовчки пропустив би присвоєння змінній, яка вже
+        існувала. AST відповідає рівно на те питання, яке ставить #154/F1 —
+        ЩО ЦЕЙ ФАЙЛ ОГОЛОШУЄ.
+
+        Парситься готовий AST уже скомпільованого scriptblock-а: другий
+        розбір того самого тексту був би зайвою роботою на кожному запуску.
+    #>
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$ScriptBlock
+    )
+
+    $names = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $assignments = @($ScriptBlock.Ast.FindAll(
+        { param($node) $node -is [System.Management.Automation.Language.AssignmentStatementAst] },
+        $true))
+
+    foreach ($assignment in $assignments) {
+        $target = $assignment.Left
+        # "[string]$global:x = ..." — присвоєння з приведенням типу: сама
+        # змінна лежить у Child, і без цього кроку такий рядок був би
+        # невидимий для перевірки.
+        if ($target -is [System.Management.Automation.Language.ConvertExpressionAst]) {
+            $target = $target.Child
+        }
+        if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+        if (-not $target.VariablePath.IsGlobal) { continue }
+        # UserPath, а не UnqualifiedPath: останньої властивості в
+        # System.Management.Automation.VariablePath Windows PowerShell 5.1
+        # ПУБЛІЧНО немає — звернення до неї падало з "The property
+        # 'UnqualifiedPath' cannot be found on this object" і завалювало
+        # завантаження конфігурації цілком (CI 2026-09-14). UserPath для
+        # $global:x повертає "global:x", тож префікс знімаємо явно.
+        $declaredName = [string]$target.VariablePath.UserPath -replace '^(?i)global:', ''
+        if ([string]::IsNullOrWhiteSpace($declaredName)) { continue }
+        [void]$names.Add($declaredName)
+    }
+
+    # @($names) для порожнього HashSet дає порожній масив, який PowerShell
+    # не повертає взагалі ($null у викликача) — тому викликач мусить
+    # перевіряти елемент на $null, і він це робить.
+    return @($names)
+}
+
 function Read-BRAVOLegacyPrimaryRawOverrides {
     # Canonical читач legacy primary-шару: виконує BRAVO.config ЛИШЕ як
     # джерело raw-значень і повертає hashtable з ключами canonical
@@ -890,7 +982,13 @@ function Read-BRAVOLegacyPrimaryRawOverrides {
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [Parameter(Mandatory = $true)][string]$ConfigRoot,
-        [Parameter(Mandatory = $true)][string]$RuntimeRoot
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+
+        # Діагностика асиметрії суворості шарів (#154, A3/F1): імена
+        # top-level $global:, які оголошує BRAVO.config. Порівняння з тим,
+        # що канонічний pipeline реально встановлює, робить викликач —
+        # тут лише збір факту.
+        [AllowNull()][System.Collections.Generic.HashSet[string]]$DeclaredGlobalNameSink
     )
 
     $configurationModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
@@ -903,6 +1001,14 @@ function Read-BRAVOLegacyPrimaryRawOverrides {
     # as a script block, preserving its param(ConfigRoot) contract.
     $legacyConfigText = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
     $legacyConfigScript = [scriptblock]::Create($legacyConfigText)
+
+    if ($null -ne $DeclaredGlobalNameSink) {
+        foreach ($declaredName in @(Get-BRAVODeclaredGlobalVariableName -ScriptBlock $legacyConfigScript)) {
+            if ([string]::IsNullOrWhiteSpace([string]$declaredName)) { continue }
+            [void]$DeclaredGlobalNameSink.Add([string]$declaredName)
+        }
+    }
+
     & $legacyConfigScript -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot
 
     $defaultConfiguration = Get-BRAVODefaultConfiguration
@@ -934,19 +1040,47 @@ function Import-BravoLegacyPrimaryConfiguration {
         [Parameter(Mandatory = $true)][string]$ConfigRoot,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [Parameter(Mandatory = $true)][hashtable]$LocalOverrides,
-        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink,
+
+        # #154, A3/F1 — симетрія діагностики шарів. Обидва sink-и опційні;
+        # поведінка прийому primary-шару НЕ змінюється, як і в A2.
+        [AllowNull()][System.Collections.Generic.HashSet[string]]$DeclaredGlobalNameSink,
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownPrimaryPathSink,
+        [AllowNull()][System.Collections.Generic.HashSet[string]]$CanonicalGlobalNameSink
     )
 
     $primaryRawOverrides = Read-BRAVOLegacyPrimaryRawOverrides `
         -ConfigPath $ConfigPath `
         -ConfigRoot $ConfigRoot `
-        -RuntimeRoot $RuntimeRoot
+        -RuntimeRoot $RuntimeRoot `
+        -DeclaredGlobalNameSink $DeclaredGlobalNameSink
+
+    # Невідомі ВКЛАДЕНІ ключі primary-шару (#154, F1): Merge-BRAVOConfiguration
+    # приймає їх мовчки — на відміну від site-шару, де невідомий батьківський
+    # вузол fail-closed. Поведінку тут НЕ змінюємо (це окреме рішення D3),
+    # але робимо факт видимим. Порівняння — canonical
+    # Compare-BRAVOConfigurationGraph, а не власний обхід графа.
+    if ($null -ne $UnknownPrimaryPathSink) {
+        $deltaModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Delta.psd1'
+        if (-not (Get-Module -Name 'BRAVO.Configuration.Delta')) {
+            Import-Module -Name $deltaModulePath -ErrorAction Stop
+        }
+        $primaryDifferences = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration (Get-BRAVODefaultConfiguration) `
+            -CandidateConfiguration $primaryRawOverrides)
+        foreach ($primaryDifference in $primaryDifferences) {
+            if ($null -eq $primaryDifference) { continue }
+            if ([string]$primaryDifference.Kind -ne 'OnlyInCandidate') { continue }
+            [void]$UnknownPrimaryPathSink.Add([string]$primaryDifference.Path)
+        }
+    }
 
     Complete-BRAVOConfigurationLoad `
         -RuntimeRoot $RuntimeRoot `
         -PrimaryOverrides $primaryRawOverrides `
         -LocalOverrides $LocalOverrides `
-        -UnknownLeafPathSink $UnknownLeafPathSink
+        -UnknownLeafPathSink $UnknownLeafPathSink `
+        -CanonicalGlobalNameSink $CanonicalGlobalNameSink
 }
 
 function Import-BravoConfiguration {
@@ -1059,6 +1193,21 @@ function Import-BravoConfiguration {
     $effectiveLocalOverrides = if ($null -ne $localOverrideState) { $localOverrideState.Overrides } else { @{} }
     $effectiveUnknownLeafSink = if ($null -ne $localOverrideState) { $localOverrideState.UnknownLeafPaths } else { $null }
 
+    # #154 (A3/F1): симетрія ДІАГНОСТИКИ шарів. Site-шар fail-closed на
+    # невідомий батьківський вузол і (з A2) звітує про невідомий leaf;
+    # primary-шар доти мовчав у ОБОХ випадках — невідомий top-level
+    # $global: просто не потрапляв у allowlist-збірку, невідомий вкладений
+    # ключ мовчки зливався. Стан тут, а не в $global: — власник той самий,
+    # що й для A2 (ця функція).
+    $primaryOverrideState = $null
+    if ($legacyConfigFileExists) {
+        $primaryOverrideState = [pscustomobject]@{
+            DeclaredGlobalNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            CanonicalGlobalNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            UnknownNestedPaths = New-Object 'System.Collections.Generic.List[string]'
+        }
+    }
+
     $configurationFormat = if ($legacyConfigFileExists) { 'legacy-config' } else { 'synthetic-no-config' }
 
     try {
@@ -1068,7 +1217,10 @@ function Import-BravoConfiguration {
                 -ConfigRoot $resolvedConfigRoot `
                 -RuntimeRoot $resolvedRuntimeRoot `
                 -LocalOverrides $effectiveLocalOverrides `
-                -UnknownLeafPathSink $effectiveUnknownLeafSink
+                -UnknownLeafPathSink $effectiveUnknownLeafSink `
+                -DeclaredGlobalNameSink $primaryOverrideState.DeclaredGlobalNames `
+                -UnknownPrimaryPathSink $primaryOverrideState.UnknownNestedPaths `
+                -CanonicalGlobalNameSink $primaryOverrideState.CanonicalGlobalNames
         } else {
             Import-BravoSyntheticConfiguration `
                 -RuntimeRoot $resolvedRuntimeRoot `
@@ -1163,6 +1315,40 @@ function Import-BravoConfiguration {
             )
         }
     }
+
+    # #154 (A3/F1): дзеркало попередження вище для primary-шару.
+    # Поведінка прийому НЕ змінюється — ні відмови, ні нового
+    # fail-closed: суворість primary-шару лишається окремим рішенням D3.
+    $ignoredPrimaryGlobalNames = @()
+    if ($null -ne $primaryOverrideState) {
+        $ignoredPrimaryGlobalNames = @(
+            @($primaryOverrideState.DeclaredGlobalNames) |
+                Where-Object { -not $primaryOverrideState.CanonicalGlobalNames.Contains([string]$_) } |
+                Sort-Object -Unique
+        )
+        if ($ignoredPrimaryGlobalNames.Count -gt 0) {
+            Write-Warning (
+                "BRAVO.config ('$resolvedConfigPath'): top-level `$global:-змінна(і) " +
+                ($ignoredPrimaryGlobalNames -join ', ') +
+                " НЕ впливають на ефективну конфігурацію — канонічний pipeline їх не приймає й не обчислює. " +
+                "Найімовірніша причина — поле застарілої версії комплекту або опечатка в назві блоку."
+            )
+        }
+    }
+
+    $unknownPrimaryNestedPaths = @()
+    if ($null -ne $primaryOverrideState) {
+        $unknownPrimaryNestedPaths = @(@($primaryOverrideState.UnknownNestedPaths) | Sort-Object -Unique)
+        if ($unknownPrimaryNestedPaths.Count -gt 0) {
+            Write-Warning (
+                "BRAVO.config ('$resolvedConfigPath'): вкладений(і) ключ(і) " +
+                ($unknownPrimaryNestedPaths -join ', ') +
+                " канонічній конфігурації невідомі. Вони зливаються в ефективну конфігурацію як є, але жоден " +
+                "споживач комплекту їх не читає. Звірте назву з коментарями відповідного блоку."
+            )
+        }
+    }
+
     $global:BravoLocalConfigOverrideState = $null
 
     Assert-BravoLoadedConfiguration -RuntimeRoot $resolvedRuntimeRoot
@@ -1251,6 +1437,13 @@ function Import-BravoConfiguration {
         LocalConfigUnknownLeafOverrides = @(
             if ($null -ne $localOverrideState) { @($localOverrideState.UnknownLeafPaths) | Sort-Object -Unique } else { @() }
         )
+        # Оголошені BRAVO.config top-level $global:, які канонічний pipeline
+        # не приймає й не обчислює (#154, A3). Порожньо = симетрія
+        # дотримана або BRAVO.config відсутній.
+        PrimaryConfigIgnoredGlobals = @($ignoredPrimaryGlobalNames)
+        # Вкладені ключі BRAVO.config, невідомі канонічній конфігурації
+        # (#154, A3/F1) — зливаються, але їх ніхто не читає.
+        PrimaryConfigUnknownNestedKeys = @($unknownPrimaryNestedPaths)
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
         LegacyScriptVersion = $legacyScriptVersion
         LegacyScriptVersionPresent = ($null -ne $legacyScriptVersionVariable)

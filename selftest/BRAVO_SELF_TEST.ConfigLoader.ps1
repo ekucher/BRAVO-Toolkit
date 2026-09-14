@@ -1226,3 +1226,152 @@ Test-BRAVOCondition `
     -Name 'ConfigLoader/LocalConfigLeafSemanticsDocumentedAccurately' `
     -Failure ("документація BRAVO.local.config мусить описувати несиметричну суворість dot-шляху (батьківські сегменти — fail-closed, leaf — forward-compat): " +
         (($leafDocProblems.ToArray()) -join '; '))
+
+# ============================================================
+# #154 (A3/F1): симетрія ДІАГНОСТИКИ primary-шару.
+# ============================================================
+# Site-шар fail-closed на невідомий батьківський вузол і (з A2) звітує про
+# невідомий leaf. Primary-шар доти мовчав в обох випадках: невідомий
+# top-level $global: не потрапляв в allowlist-збірку й зникав безслідно,
+# невідомий вкладений ключ мовчки зливався. Поведінка прийому НЕ змінена —
+# перевіряється саме ВИДИМІСТЬ.
+#
+# Окремий child scope (& { ... }): усі фрагменти self-test дот-сорсяться в
+# ОДИН scope і ділять ліміт $MaximumVariableCount.
+& {
+    $strictnessBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_PRIMARY_STRICTNESS_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($strictnessBackupRootDir)
+
+    function New-BRAVOConfigLoaderPrimaryStrictnessProbe {
+        # Сценарій-корінь із КОПІЄЮ реального BRAVO.config (плюс, за потреби,
+        # додані рядки) — той самий підхід, що й у parity-проб вище.
+        # Дочірній процес обов'язковий: Import-BravoConfiguration встановлює
+        # десятки $global:, змішувати які з рештою прогону не можна.
+        param([string]$ExtraConfigBody = '')
+
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) (
+            "BRAVO_PRIMARY_STRICTNESS_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            $primaryText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+            if (-not [string]::IsNullOrEmpty($ExtraConfigBody)) {
+                $primaryText = $primaryText + "`r`n" + $ExtraConfigBody + "`r`n"
+            }
+            [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.config'), $primaryText, (New-Object System.Text.UTF8Encoding($false)))
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.local.config'),
+                # Конкатенація, а не -f: рядок містить літеральні @{ і },
+                # які оператор форматування витлумачив би як плейсхолдери.
+                ("@{`r`n    'pathSettings.BackupRoot' = '" + $strictnessBackupRootDir.Replace("'", "''") + "'`r`n}`r`n"),
+                (New-Object System.Text.UTF8Encoding($false)))
+
+            $probeCommand = (
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+                "'RESULT:IGNORED=' + ((@(`$global:BravoConfigurationMetadata.PrimaryConfigIgnoredGlobals)) -join '|') + " +
+                "';UNKNOWN=' + ((@(`$global:BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys)) -join '|')" +
+                "} catch { 'THREW: ' + `$_.Exception.Message }"
+            )
+            $probeOutput = [string](
+                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            )
+            return $probeOutput.Trim()
+        } finally {
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    try {
+        # --- PrimaryStrictness/PristineConfigProducesNoDiagnostics ---
+        # НАЙВАЖЛИВІШЕ: комплектний BRAVO.config не сміє давати жодного
+        # попередження. Інакше кожен сервер отримав би шум на кожному
+        # запуску кожного entrypoint-а, і діагностика знецінилась би.
+        $strictnessPristine = New-BRAVOConfigLoaderPrimaryStrictnessProbe
+        Test-BRAVOCondition `
+            -Condition ($strictnessPristine -eq 'RESULT:IGNORED=;UNKNOWN=') `
+            -Name "PrimaryStrictness/PristineConfigProducesNoDiagnostics" `
+            -Failure "комплектний BRAVO.config має давати ПОРОЖНІ PrimaryConfigIgnoredGlobals і PrimaryConfigUnknownNestedKeys; отримано '$strictnessPristine'"
+
+        # --- PrimaryStrictness/UnknownTopLevelGlobalReported ---
+        # Сьогодні така змінна зникає безслідно: allowlist-збірка бере лише
+        # ключі Get-BRAVODefaultConfiguration, решта не потрапляє нікуди.
+        $strictnessUnknownGlobal = New-BRAVOConfigLoaderPrimaryStrictnessProbe `
+            -ExtraConfigBody '$global:selfTestObsoleteKnob = 42'
+        Test-BRAVOCondition `
+            -Condition (
+                $strictnessUnknownGlobal.Contains('IGNORED=selfTestObsoleteKnob') -and
+                $strictnessUnknownGlobal.Contains('UNKNOWN=')
+            ) `
+            -Name "PrimaryStrictness/UnknownTopLevelGlobalReported" `
+            -Failure "невідомий top-level `$global: у BRAVO.config має потрапити в PrimaryConfigIgnoredGlobals; отримано '$strictnessUnknownGlobal'"
+
+        # --- PrimaryStrictness/UnknownNestedKeyReported ---
+        # Індексне присвоєння, а не $global:x = — навмисно: так перевіряється
+        # саме ВКЛАДЕНИЙ шлях, і воно не має рахуватись оголошенням
+        # top-level змінної (інакше тест проходив би з хибної причини).
+        $strictnessUnknownNested = New-BRAVOConfigLoaderPrimaryStrictnessProbe `
+            -ExtraConfigBody "`$global:pathSettings['SelfTestUnknownNestedKey'] = 'x'"
+        Test-BRAVOCondition `
+            -Condition (
+                $strictnessUnknownNested.Contains('UNKNOWN=pathSettings.SelfTestUnknownNestedKey') -and
+                $strictnessUnknownNested.Contains('IGNORED=;')
+            ) `
+            -Name "PrimaryStrictness/UnknownNestedKeyReported" `
+            -Failure "невідомий вкладений ключ BRAVO.config має потрапити в PrimaryConfigUnknownNestedKeys і НЕ потрапити в IgnoredGlobals; отримано '$strictnessUnknownNested'"
+
+        # --- PrimaryStrictness/DiagnosticsNeverRejectConfiguration ---
+        # A3 — діагностика, а не новий fail-closed: обидва сценарії вище
+        # мусять ЗАВАНТАЖИТИСЬ. Рішення про сувору відмову — окреме (D3).
+        Test-BRAVOCondition `
+            -Condition (
+                -not $strictnessUnknownGlobal.StartsWith('THREW') -and
+                -not $strictnessUnknownNested.StartsWith('THREW')
+            ) `
+            -Name "PrimaryStrictness/DiagnosticsNeverRejectConfiguration" `
+            -Failure "невідомий ключ primary-шару має лишатись ПРИЙНЯТИМ (діагностика, не gate); global='$strictnessUnknownGlobal' nested='$strictnessUnknownNested'"
+
+        # --- PrimaryStrictness/DeclaredGlobalNameHelperReturnsNames ---
+        # Пряма перевірка самого helper-а, а не лише його наслідків: перша
+        # реалізація читала VariablePath.UnqualifiedPath, якої в
+        # System.Management.Automation.VariablePath Windows PowerShell 5.1
+        # ПУБЛІЧНО немає — завантаження конфігурації падало цілком
+        # ("The property 'UnqualifiedPath' cannot be found on this object",
+        # CI 2026-09-14). Текстовий guard нижче такого не ловить.
+        $strictnessHelperCommand = (
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "`$sb = [scriptblock]::Create('`$global:alpha = 1; `$global:beta = @{}; `$local:gamma = 3; `$delta = 4'); " +
+            "'RESULT:' + ((@(Get-BRAVODeclaredGlobalVariableName -ScriptBlock `$sb) | Sort-Object) -join '|')" +
+            "} catch { 'THREW: ' + `$_.Exception.Message }"
+        )
+        # Два кроки, а не [string](...).Trim(): у PowerShell приведення типу
+        # зв'язується СЛАБШЕ за виклик методу, тож однорядковий варіант
+        # означав би [string]($output.Trim()) — не те, що записано.
+        $strictnessHelperRaw = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $strictnessHelperCommand 2>&1 | Out-String
+        )
+        $strictnessHelperOutput = $strictnessHelperRaw.Trim()
+        Test-BRAVOCondition `
+            -Condition ($strictnessHelperOutput -eq 'RESULT:alpha|beta') `
+            -Name "PrimaryStrictness/DeclaredGlobalNameHelperReturnsNames" `
+            -Failure "Get-BRAVODeclaredGlobalVariableName має повертати ІМЕНА без префікса scope і лише для `$global: (очікувалось 'RESULT:alpha|beta'); отримано '$strictnessHelperOutput'"
+
+        # --- PrimaryStrictness/DeclaredGlobalNamesFromAstNotSnapshot ---
+        # Guard від регресії в бік знімка глобальної області: знімок ДО/ПІСЛЯ
+        # дав би шум рантайму й пропустив би присвоєння наявній змінній.
+        $strictnessLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition `
+            -Condition (
+                $strictnessLoaderText.Contains('AssignmentStatementAst') -and
+                $strictnessLoaderText.Contains('VariablePath.IsGlobal')
+            ) `
+            -Name "PrimaryStrictness/DeclaredGlobalNamesFromAstNotSnapshot" `
+            -Failure "перелік оголошених BRAVO.config top-level `$global: мусить будуватись з AST (AssignmentStatementAst + VariablePath.IsGlobal), а не зі знімка глобальної області"
+    } finally {
+        Remove-Item -LiteralPath $strictnessBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

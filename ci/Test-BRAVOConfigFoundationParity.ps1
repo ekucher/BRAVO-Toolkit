@@ -339,6 +339,12 @@ $knownIntentionalDiffPrefixes = @(
     # ключі BRAVO.local.config з невідомим кінцевим сегментом. Наявні поля
     # не змінює, на effective-конфігурацію не впливає.
     'BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides',
+    # Адитивні діагностичні поля (#154, A3/F1): top-level $global: з
+    # BRAVO.config, які канонічний pipeline не приймає й не обчислює, та
+    # вкладені ключі, невідомі канонічній конфігурації. Наявні поля не
+    # змінюють, на effective-конфігурацію не впливають.
+    'BravoConfigurationMetadata.PrimaryConfigIgnoredGlobals',
+    'BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys',
     'BravoConfigurationMetadata.LocalConfigPath',
     'BravoConfigurationMetadata.LocalConfigPresent',
     'BravoConfigurationMetadata.Mode',
