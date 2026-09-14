@@ -18597,27 +18597,24 @@ if (-not [string]::IsNullOrWhiteSpace([string]$script:selfTestConfigRoot) -and
 #
 # Get-Variable -Scope 0 на ВЕРХНЬОМУ рівні файлу — це саме та область,
 # у яку dot-source'яться всі фрагменти, тобто та сама, що переповнювалась.
-# Get-Variable -Scope 0 повертає ВИДИМІ змінні, тобто разом з
-# успадкованими з global. Ліміт же рахує ВЛАСНІ змінні області, у яку
-# додається нова, — тому самого "видимого" числа недостатньо: перший
-# прогін цієї перевірки дав рівно 4096 видимих, і з одного цього числа
-# неможливо сказати, скільки з них належать саме цій області.
-# Друкуються обидві складові, а запас рахується від оцінки ВЛАСНИХ.
-$script:selfTestScopeVisibleVariableCount = @(Get-Variable -Scope 0 -ErrorAction SilentlyContinue).Count
+# Запас рахується від Get-Variable -Scope 0 БЕЗ жодних відрахувань —
+# це саме те число, яке впирається в ліміт. Два прогони CI це показали:
+#   34795718300: Scope 0 = 4096 — рівно стеля, на якій PR #160 і впав;
+#   34796475880: Scope 0 = 4096, Scope Global = 148 (ІНШІ змінні).
+# Спроба відняти global (перша редакція цієї перевірки) занижувала
+# використання на ті 148 і робила запас оптимістичнішим за реальний.
+# Global друкується лише як контекст.
+$script:selfTestScopeVariableCount = @(Get-Variable -Scope 0 -ErrorAction SilentlyContinue).Count
 $script:selfTestGlobalVariableCount = @(Get-Variable -Scope Global -ErrorAction SilentlyContinue).Count
-$script:selfTestScopeVariableCount = [Math]::Max(
-    0, ($script:selfTestScopeVisibleVariableCount - $script:selfTestGlobalVariableCount))
 $script:selfTestScopeVariableHeadroom = $script:selfTestVariableCountLimit - $script:selfTestScopeVariableCount
-Write-Host ("Змінних в області self-test: власних ~{0}, видимих {1}, global {2}; ліміт {3} (запас {4})" -f `
-    $script:selfTestScopeVariableCount, $script:selfTestScopeVisibleVariableCount, `
-    $script:selfTestGlobalVariableCount, $script:selfTestVariableCountLimit, `
-    $script:selfTestScopeVariableHeadroom)
+Write-Host ("Змінних в області self-test: {0} з {1} (запас {2}); у global окремо: {3}" -f `
+    $script:selfTestScopeVariableCount, $script:selfTestVariableCountLimit, `
+    $script:selfTestScopeVariableHeadroom, $script:selfTestGlobalVariableCount)
 Test-BRAVOCondition `
     -Condition ($script:selfTestScopeVariableHeadroom -ge 256) `
     -Name "Framework/VariableScopeHeadroom" `
-    -Failure ("запас змінних області self-test вичерпується: використано ~" +
-        "$($script:selfTestScopeVariableCount) власних (видимих $($script:selfTestScopeVisibleVariableCount), " +
-        "global $($script:selfTestGlobalVariableCount)) з $($script:selfTestVariableCountLimit), лишилось " +
+    -Failure ("запас змінних області self-test вичерпується: використано " +
+        "$($script:selfTestScopeVariableCount) з $($script:selfTestVariableCountLimit), лишилось " +
         "$($script:selfTestScopeVariableHeadroom) (потрібно щонайменше 256). Нові блоки фрагментів " +
         "виконуйте в дочірній області (& { ... }) або підніміть " +
         "`$script:selfTestVariableCountLimit — інакше наступне переповнення знову спливе " +
