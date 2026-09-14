@@ -211,6 +211,81 @@ Test-BRAVOCondition `
     -Failure "спільний BLOCK одного CapacityKey має бути ОДНИМ записом у Problems з обома шляхами, не двома дубльованими повідомленнями; отримано $(@($s13.Problems).Count) запис(ів): $($s13.Problems -join ' | ')"
 
 # ============================================================
+# S13c — атрибуція Reason (аудит 2026-09-14; пункт 3
+# docs\BRAVO_530_DISK_SPACE_HEALTH_SIGNAL_TASK.md).
+#
+# Групування за самим CapacityKey брало Reason з ПЕРШОЇ entity, а решта
+# лише додавала свій DisplayPath — два шляхи одного тому з РІЗНИМИ
+# причинами зливались в одне повідомлення з чужою причиною для другого
+# шляху. Рішення про безпеку лишалось коректним (воно приймається по
+# кожній entity), але операторський рядок брехав.
+#
+# Тест перевіряє ІНВАРІАНТ, а не конкретну пару причин: для кожного
+# повідомлення кожен перелічений шлях мусить мати саме ту причину, яку
+# повідомлення називає. Окремий guard нижче стежить, щоб фікстура й далі
+# справді давала дві різні причини на одному CapacityKey — інакше тест
+# мовчки перестав би щось доводити.
+# ============================================================
+# ВЕСЬ блок S13c виконується у ДОЧІРНІЙ області (& { ... }), а не в
+# області self-test-скрипта. Причина технічна й жорстка: фрагменти
+# dot-source'яться в ОДНУ область, а Windows PowerShell має ліміт
+# $MaximumVariableCount = 4096 змінних на область. Перша ж версія цього
+# блоку (≈15 нових змінних) перевищила ліміт і повалила self-test
+# SessionStateOverflowException у геть іншому місці
+# (Isolation/NoSelfTestOwnedDynamicModuleExports..., рядок ~17339).
+# Дочірня область лишає в батьківській нуль нових змінних. Функції
+# self-test (Test-BRAVOCondition) і $script:-лічильники доступні звідси
+# без змін.
+& {
+    $s13cSpecs = @(
+        [pscustomobject]@{ DisplayPath = '\\server\share\UNAVAILABLE'; StorageKind = 'UNC'; RequiresAccess = $true; RequiresFreeSpace = $false; AccessStatusOverride = 'Unavailable' },
+        [pscustomobject]@{ DisplayPath = '\\server\share\UNKNOWN'; StorageKind = 'UNC'; RequiresAccess = $true; RequiresFreeSpace = $false; AccessStatusOverride = 'Unknown' }
+    )
+    $s13c = Invoke-BRAVODiskSpaceClassifier -EntitySpecs $s13cSpecs -MinimumFreeSpaceGB 10 -RequirementPolicy 'ArchiveNotPeakSafe'
+
+    # Guard фікстури: обидві entity мусять потрапити в ОДИН bucket
+    # (.Problems), мати ОДИН CapacityKey і РІЗНІ Reason — саме та комбінація,
+    # на якій проявлялась підміна причини. Якщо фікстура це втратить (напр.
+    # одна entity перестане блокувати й поїде у .Warnings), інваріантний тест
+    # нижче стане тривіально зеленим і перестане щось доводити.
+    $s13cReasons = @(@($s13c.Results | ForEach-Object { [string]$_.Reason }) | Select-Object -Unique)
+    $s13cKeys = @(@($s13c.Results | ForEach-Object { [string]$_.CapacityKey }) | Select-Object -Unique)
+    $s13cAllBlock = (@($s13c.Results | Where-Object { [bool]$_.Blocks }).Count -eq @($s13c.Results).Count)
+    Test-BRAVOCondition `
+        -Condition ($s13cKeys.Count -eq 1 -and $s13cReasons.Count -ge 2 -and $s13cAllBlock -and @($s13c.Results).Count -eq 2) `
+        -Name 'DiskSpace/S13c-FixtureProducesDistinctReasonsOnOneCapacityKey' `
+        -Failure ("фікстура S13c мусить давати дві блокуючі entity, ОДИН CapacityKey і щонайменше ДВІ різні Reason, " +
+            "інакше тест атрибуції нічого не доводить; ключів: $($s13cKeys -join ', '); причин: $($s13cReasons -join ', '); " +
+            "усі блокують: $s13cAllBlock")
+
+    # Сам інваріант: жодне повідомлення не приписує шляху чужу причину.
+    $s13cMessages = @(@($s13c.Problems) + @($s13c.Warnings))
+    $s13cMisattributed = New-Object System.Collections.Generic.List[string]
+    foreach ($s13cMessage in $s13cMessages) {
+        $s13cText = [string]$s13cMessage
+        $s13cSeparator = $s13cText.LastIndexOf(': ')
+        if ($s13cSeparator -lt 0) { continue }
+        $s13cPathsPart = $s13cText.Substring(0, $s13cSeparator)
+        $s13cReasonPart = $s13cText.Substring($s13cSeparator + 2)
+        foreach ($s13cPath in @($s13cPathsPart -split ', ')) {
+            $s13cOwner = @($s13c.Results | Where-Object { [string]$_.DisplayPath -eq [string]$s13cPath })
+            foreach ($s13cEntity in $s13cOwner) {
+                $s13cOwnReason = [string]$s13cEntity.Reason
+                if ([string]::IsNullOrWhiteSpace($s13cOwnReason)) { $s13cOwnReason = 'Unspecified' }
+                if ($s13cOwnReason -ne $s13cReasonPart) {
+                    [void]$s13cMisattributed.Add("$s13cPath має Reason='$s13cOwnReason', а повідомлення каже '$s13cReasonPart'")
+                }
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($s13cMisattributed.Count -eq 0) `
+        -Name 'DiskSpace/S13c-ReasonIsNeverAttributedToForeignPath' `
+        -Failure ("повідомлення не має приписувати шляху причину іншої entity того самого CapacityKey: " +
+            (($s13cMisattributed.ToArray()) -join '; '))
+}
+
+# ============================================================
 # S14 — дві UNC-цілі на різних share: незалежна оцінка
 # ============================================================
 $s14Specs = @(

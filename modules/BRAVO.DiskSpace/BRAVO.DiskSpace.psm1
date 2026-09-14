@@ -927,13 +927,36 @@ function Group-BRAVODiskSpaceMessagesByCapacityKey {
     # групуються по DisplayPath — кожен лишається окремим повідомленням.
     param([object[]]$Entities)
 
+    # Ключ групування — ПАРА CapacityKey + Reason, а не лише CapacityKey.
+    # Раніше Reason брався з ПЕРШОЇ entity групи, а решта лише додавала
+    # свій DisplayPath: два шляхи одного тому з РІЗНИМИ причинами
+    # зливались в одне повідомлення, де причина другого шляху
+    # підмінялась причиною першого. Рішення про безпеку від цього не
+    # змінювалось (воно приймається по кожній entity окремо, і
+    # структурований лог DiskSpace ... Reason=... лишався правдивим), але
+    # операторська діагностика показувала неправду — знахідка аудиту
+    # 2026-09-14 і пункт 3 docs\BRAVO_530_DISK_SPACE_HEALTH_SIGNAL_TASK.md.
+    #
+    # Намір §51.1 збережено: спільна причина для кількох шляхів одного
+    # capacity resource і далі повідомляється ОДИН раз із переліком
+    # шляхів. Розділяються лише групи, які й були різними по суті.
     $groups = [ordered]@{}
     foreach ($entity in $Entities) {
-        $key = if ([string]::IsNullOrWhiteSpace([string]$entity.CapacityKey)) {
+        $capacityKey = if ([string]::IsNullOrWhiteSpace([string]$entity.CapacityKey)) {
             "path:$($entity.DisplayPath)"
         } else {
             "key:$($entity.CapacityKey)"
         }
+        # Reason входить у ключ як є (включно з порожнім) — нормалізація
+        # порожнього в "Unspecified" лишається на етапі рендерингу нижче,
+        # щоб групування не склеювало entity з причиною і без неї.
+        #
+        # [char]31 (ASCII Unit Separator) як роздільник, а не звичайний
+        # символ: він не може трапитись ані в CapacityKey, ані в Reason,
+        # тож склеювання ключів неможливе. Escape `u{...} тут НЕ
+        # використовується — це синтаксис PowerShell 7, а проєкт лишається
+        # сумісним з Windows PowerShell 5.1.
+        $key = $capacityKey + ([char]31) + [string]$entity.Reason
         if (-not $groups.Contains($key)) {
             $groups[$key] = [pscustomobject]@{ Reason = $entity.Reason; Paths = New-Object System.Collections.Generic.List[string] }
         }
