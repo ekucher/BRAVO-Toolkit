@@ -40,7 +40,11 @@ backlog-нотатки; канонічний поточний пріоритет
 - hashtable зливаються рекурсивно;
 - scalar local override замінює default;
 - масив local override повністю замінює default-масив;
-- невідомий ключ або неправильний тип — fail-closed;
+- невідомий ключ або неправильний тип — fail-closed, **окрім
+  невідомого кінцевого сегмента (leaf)**: рішенням власника **D3**
+  (2026-09-14) для нього збережено forward-compat — він приймається,
+  але повідомляється (попередження плюс
+  `BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides`);
 - `$null` дозволений лише для явно nullable-параметрів;
 - критичні security-параметри не можна послабити звичайним local override.
 
