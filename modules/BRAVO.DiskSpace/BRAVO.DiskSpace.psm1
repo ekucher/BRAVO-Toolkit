@@ -479,7 +479,13 @@ function Test-BRAVODiskSpaceEntity {
     param(
         [Parameter(Mandatory = $true)]$EntitySpec,
         [object[]]$Drives,
-        [string[]]$ExcludedDrives = @()
+        [string[]]$ExcludedDrives = @(),
+
+        # Частка ЗАГАЛЬНОЇ ємності тому, яка стає health-порогом, коли
+        # налаштований абсолютний поріг перевищує саму ємність (див. крок 7).
+        # Значення за замовчуванням — стартова пропозиція специфікації
+        # docs\BRAVO_530_DISK_SPACE_HEALTH_SIGNAL_TASK.md (пункт 1).
+        [ValidateRange(0.1, 100)][double]$SmallVolumeFloorPercent = 10
     )
 
     $roles = @(if ($EntitySpec.PSObject.Properties.Match('Roles').Count -gt 0) { $EntitySpec.Roles } else { @() })
@@ -596,6 +602,34 @@ function Test-BRAVODiskSpaceEntity {
 
         $minimumGB = if ($EntitySpec.PSObject.Properties.Match('MinimumFreeSpaceGB').Count -gt 0) { [System.Nullable[double]]$EntitySpec.MinimumFreeSpaceGB } else { $null }
 
+        # §155 / docs\BRAVO_530_DISK_SPACE_HEALTH_SIGNAL_TASK.md пункт 1:
+        # якщо ЗАГАЛЬНА ємність тому менша за налаштований поріг, абсолютний
+        # поріг недосяжний за побудовою — попередження не можна закрити
+        # жодною дією оператора (звільнити більше місця, ніж фізично існує,
+        # неможливо), і датчик перетворюється на постійний шум. Приклад із
+        # парку: LIMS-TOP G: — 15 GB ємності при порозі 20 GB.
+        #
+        # Для ТАКОГО тому поріг вироджується у частку його власної ємності.
+        # Це стосується ВИКЛЮЧНО health-оцінки (RequiresFreeSpace = false).
+        # Гілка операційної потреби (крок 8+) не змінюється: том, який
+        # операційно потрібен і на якому бракує місця, блокується як раніше.
+        # ExcludedDrives зберігає нинішню семантику повністю.
+        $healthFloorGB = $minimumGB
+        $healthFloorDegraded = $false
+        if ($null -ne $minimumGB -and $healthCapacityState -eq 'Known' -and
+            $null -ne $healthTotalGB -and [double]$healthTotalGB -gt 0 -and
+            [double]$healthTotalGB -lt [double]$minimumGB) {
+            $healthFloorGB = [math]::Round(([double]$healthTotalGB * $SmallVolumeFloorPercent / 100), 2)
+            $healthFloorDegraded = $true
+            # Фактичний поріг у Flags, а не лише в Reason: інакше оператор
+            # побачив би попередження про 1.5 GB при налаштованих 20 і не
+            # зрозумів би, звідки це число. InvariantCulture обов'язкова —
+            # Flags склеюються комою, а локаль uk-UA дала б "1,5" і зламала
+            # розбір рядка.
+            [void]$flags.Add([string]::Format([Globalization.CultureInfo]::InvariantCulture,
+                'DegradedHealthFloorGB={0:0.##}', $healthFloorGB))
+        }
+
         $healthStatus = 'Success'
         $healthReason = $null
         if ($requiresAccess -and $accessStatus -eq 'Unavailable') {
@@ -607,9 +641,9 @@ function Test-BRAVODiskSpaceEntity {
             # коміт 457d3b8).
             $healthStatus = 'Warning'
             $healthReason = 'AccessUnavailableNoFreeSpaceRequirement'
-        } elseif ($null -ne $minimumGB -and $healthCapacityState -eq 'Known' -and $null -ne $healthAvailableGB -and [double]$healthAvailableGB -lt [double]$minimumGB) {
+        } elseif ($null -ne $minimumGB -and $healthCapacityState -eq 'Known' -and $null -ne $healthAvailableGB -and [double]$healthAvailableGB -lt [double]$healthFloorGB) {
             $healthStatus = 'Warning'
-            $healthReason = 'BelowHealthFloorNoFreeSpaceRequirement'
+            $healthReason = if ($healthFloorDegraded) { 'BelowDegradedHealthFloorSmallVolume' } else { 'BelowHealthFloorNoFreeSpaceRequirement' }
         } elseif ($healthCapacityState -ne 'Known') {
             # Reason обов'язковий: без нього warning-повідомлення виходило
             # порожнім ("C:\: ") і в консолі, і в журналі.
@@ -825,10 +859,14 @@ function Invoke-BRAVODiskSpaceClassifier {
         [string[]]$ExcludedDrives = @(),
         [Parameter(Mandatory = $true)][ValidateSet('ArchivePeakSafe', 'ArchiveNotPeakSafe', 'MaintenanceExactOnly')]
         [string]$RequirementPolicy,
-        [object[]]$Drives
+        [object[]]$Drives,
+
+        # Прокидається в Test-BRAVODiskSpaceEntity (крок 7, вироджений
+        # health-поріг для тому, меншого за налаштований поріг).
+        [ValidateRange(0.1, 100)][double]$SmallVolumeFloorPercent = 10
     )
 
-    $entityParams = @{ ExcludedDrives = $ExcludedDrives }
+    $entityParams = @{ ExcludedDrives = $ExcludedDrives; SmallVolumeFloorPercent = $SmallVolumeFloorPercent }
     if ($PSBoundParameters.ContainsKey('Drives')) { $entityParams.Drives = $Drives }
 
     $terminalResults = New-Object System.Collections.Generic.List[object]
