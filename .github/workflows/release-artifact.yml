@@ -93,8 +93,17 @@ jobs:
           # GitHub excludes pre-releases from Latest on its own, so the single
           # flag is enough - no --latest=false, which older gh versions reject.
           $isPrerelease = $tag -match '-(dev|rc)\.'
-          gh release view $tag --json isDraft
+          # isDraft is CAPTURED, not just probed for existence: it decides
+          # whether replacing assets is allowed at all (issue #151). Previously
+          # the value was printed and discarded, and --clobber ran for draft and
+          # published releases alike - a re-run on a published tag silently
+          # replaced the bytes operators had already downloaded.
+          # -join: gh returns the JSON as a string ARRAY when it spans lines,
+          # and Windows PowerShell 5.1 ConvertFrom-Json chokes on an array
+          # ("Invalid JSON primitive"). $LASTEXITCODE still reflects gh itself.
+          $viewJson = (gh release view $tag --json isDraft,assets) -join "`n"
           if ($LASTEXITCODE -eq 0) {
+              $release = $viewJson | ConvertFrom-Json
               if ($isPrerelease) {
                   # The release may predate this fix (or have been created by
                   # hand), so the flag is enforced instead of assumed.
@@ -106,12 +115,70 @@ jobs:
                   gh release edit $tag --prerelease
                   if ($LASTEXITCODE -ne 0) { exit 1 }
               }
-              # --clobber: on any re-run the assets already exist under the same
-              # names and plain upload aborts. Replacing them is safe because
-              # this step is reached only after the artifact passed both
-              # integrity manifests, BRAVO_RUNTIME_GUARD and the full self-test.
-              gh release upload $tag --clobber @files
-              if ($LASTEXITCODE -ne 0) { exit 1 }
+
+              if ([bool]$release.isDraft) {
+                  # DRAFT: nothing has been handed to operators yet, so the
+                  # repair path stays as it was.
+                  # --clobber: on any re-run the assets already exist under the
+                  # same names and plain upload aborts. Replacing them is safe
+                  # because this step is reached only after the artifact passed
+                  # both integrity manifests, BRAVO_RUNTIME_GUARD and the full
+                  # self-test.
+                  gh release upload $tag --clobber @files
+                  if ($LASTEXITCODE -ne 0) { exit 1 }
+              } else {
+                  # PUBLISHED: one tag - one immutable set of artifacts.
+                  #   same SHA-256  -> no-op, success (re-run stays idempotent)
+                  #   different     -> FAIL, nothing is replaced
+                  # The published asset is downloaded and hashed rather than
+                  # trusting the .sha256 sidecar: the sidecar is itself an asset
+                  # and would be replaced by the same run it is meant to guard.
+                  $publishedAssetNames = @($release.assets | ForEach-Object { [string]$_.name })
+                  $verifyRoot = Join-Path ([IO.Path]::GetTempPath()) ('bravo-release-verify-' + [guid]::NewGuid().ToString('N'))
+                  New-Item -ItemType Directory -Path $verifyRoot -Force | Out-Null
+                  try {
+                      $absentAssets = New-Object System.Collections.Generic.List[string]
+                      $mismatchedAssets = New-Object System.Collections.Generic.List[string]
+                      foreach ($file in $files) {
+                          $assetName = Split-Path -Leaf $file
+                          if ($publishedAssetNames -notcontains $assetName) {
+                              [void]$absentAssets.Add($file)
+                              continue
+                          }
+                          gh release download $tag --pattern $assetName --dir $verifyRoot
+                          if ($LASTEXITCODE -ne 0) {
+                              Write-Host "::error::RELEASE_ASSET_IMMUTABILITY: не вдалося завантажити опублікований ассет '$assetName' тега '$tag' для звірки SHA-256"
+                              exit 1
+                          }
+                          $publishedHash = (Get-FileHash -LiteralPath (Join-Path $verifyRoot $assetName) -Algorithm SHA256).Hash.ToUpperInvariant()
+                          $builtHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToUpperInvariant()
+                          if ($publishedHash -ne $builtHash) {
+                              [void]$mismatchedAssets.Add("$assetName (опубліковано $publishedHash, зібрано $builtHash)")
+                          }
+                      }
+
+                      if ($mismatchedAssets.Count -gt 0) {
+                          Write-Host "::error::RELEASE_ASSET_IMMUTABILITY: тег '$tag' уже опублікований, а перезбірка дала ІНШІ байти: $($mismatchedAssets -join '; '). Опублікований артефакт не замінюється. Якщо зміна навмисна - випустіть новий тег."
+                          exit 1
+                      }
+
+                      if ($absentAssets.Count -gt 0) {
+                          # Adding a MISSING asset replaces nothing, so it stays
+                          # allowed: it repairs a publish that uploaded only part
+                          # of the set. Plain upload without --clobber - if the
+                          # name turns out to exist after all, the command fails
+                          # instead of overwriting.
+                          $absentArgs = $absentAssets.ToArray()
+                          Write-Host "RELEASE_ASSET_IMMUTABILITY: тег '$tag' опублікований; доливаються лише ВІДСУТНІ ассети: $(($absentArgs | ForEach-Object { Split-Path -Leaf $_ }) -join ', ')"
+                          gh release upload $tag @absentArgs
+                          if ($LASTEXITCODE -ne 0) { exit 1 }
+                      } else {
+                          Write-Host "RELEASE_ASSET_IMMUTABILITY: усі ассети опублікованого тега '$tag' збігаються за SHA-256 - заміна не потрібна (no-op)."
+                      }
+                  } finally {
+                      Remove-Item -LiteralPath $verifyRoot -Recurse -Force -ErrorAction SilentlyContinue
+                  }
+              }
           } else {
               $createArgs = @(
                   '--draft',
