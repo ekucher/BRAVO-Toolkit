@@ -286,12 +286,30 @@ function Read-BRAVOLocalConfigurationOverrides {
     #         'sftpHostTemplate' = '{0}.example.com'
     #     }
     #
-    # Формат навмисно data-only (CheckRestrictedLanguage без жодної
-    # дозволеної команди): локальний файл не є кодом і не може виконувати
-    # дії — лише значення. Відсутній файл = штатний no-op.
+    # Формат навмисно data-only: локальний файл не є кодом і не може
+    # виконувати дії — лише значення. Відсутній файл = штатний no-op.
+    #
+    # #154 (B1): файл більше НЕ виконується. Раніше було
+    # [scriptblock]::Create -> CheckRestrictedLanguage(@(), @(), $false)
+    # -> & $scriptBlock, тобто «перевірити обмеженою мовою, потім
+    # виконати». Тепер — невиконуюче вилучення літералів з AST
+    # (ConvertFrom-BRAVOConfigurationDataFileText). Порожні allow-списки
+    # обмеженої мови відхиляли команди/функції/змінні, але сам блок
+    # ВИКЛИКАВСЯ, а обмежена мова все ще приймає деякі форми виразів —
+    # і такий вираз обчислювався. Тепер перелік дозволених вузлів наш,
+    # явний і fail-closed.
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][string]$ConfigDirectory
+        [Parameter(Mandatory = $true)][string]$ConfigDirectory,
+
+        # Корінь комплекту для пошуку модуля парсера. Дефолт —
+        # $PSScriptRoot САМОГО цього файлу: BRAVO_CONFIG_LOADER.ps1
+        # завжди лежить у корені комплекту поряд з modules\, а викликач
+        # (BRAVO.Configurator.Persistence) дот-сорсить цей loader і
+        # викликає функцію БЕЗ RuntimeRoot — додавати йому обов'язковий
+        # параметр означало б змінити публічний контракт заради
+        # внутрішньої деталі реалізації.
+        [string]$RuntimeRoot
     )
 
     $localOverridePath = Join-Path $ConfigDirectory 'BRAVO.local.config'
@@ -299,16 +317,25 @@ function Read-BRAVOLocalConfigurationOverrides {
         return [pscustomobject]@{ Path = $localOverridePath; Present = $false; Overrides = @{} }
     }
 
+    $effectiveRuntimeRoot = $RuntimeRoot
+    if ([string]::IsNullOrWhiteSpace($effectiveRuntimeRoot)) { $effectiveRuntimeRoot = $PSScriptRoot }
+    $dataFileModulePath = Join-Path $effectiveRuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.DataFile.psd1'
+    # Без -Force і без раннього виходу по Get-Module: повторний
+    # Import-Module вже завантаженого модуля НЕ перевиконує .psm1 (саме
+    # перевиконання ламало б function-shadowing фікстури self-test — через
+    # це -Force тут заборонений), але гарантує видимість експортованої
+    # функції в ЦІЙ області. Ранній вихід по Get-Module такої гарантії не
+    # дає: модуль може бути в таблиці модулів, а його команди —
+    # імпортованими в область, якої вже немає.
+    Import-Module -Name $dataFileModulePath -ErrorAction Stop
+
     $localOverrideText = Get-Content -LiteralPath $localOverridePath -Raw -Encoding UTF8 -ErrorAction Stop
-    $localOverrideScript = [scriptblock]::Create($localOverrideText)
     try {
-        # Порожні списки дозволених команд/змінних + заборона змінних
-        # оточення: як Import-PowerShellDataFile, лише літеральні дані.
-        $localOverrideScript.CheckRestrictedLanguage([string[]]@(), [string[]]@(), $false)
+        $localOverrideData = ConvertFrom-BRAVOConfigurationDataFileText `
+            -Text ([string]$localOverrideText) -SourceName $localOverridePath
     } catch {
         throw "BRAVO.local.config ('$localOverridePath') мусить бути data-only hashtable без виконуваного коду: $($_.Exception.Message)"
     }
-    $localOverrideData = & $localOverrideScript
     if ($localOverrideData -isnot [hashtable]) {
         throw "BRAVO.local.config ('$localOverridePath') мусить повертати hashtable «dot-шлях -> значення» (отримано: $(if ($null -eq $localOverrideData) { 'null' } else { $localOverrideData.GetType().Name }))."
     }
@@ -1175,7 +1202,8 @@ function Import-BravoConfiguration {
     # pipeline (Complete-BRAVOConfigurationLoad, Секція 3) — більше НЕ
     # двофазний Invoke-BRAVOLocalConfigurationOverridePhase.
     $localOverrideRead = Read-BRAVOLocalConfigurationOverrides `
-        -ConfigDirectory (Split-Path -Path $resolvedConfigPath -Parent)
+        -ConfigDirectory (Split-Path -Path $resolvedConfigPath -Parent) `
+        -RuntimeRoot $resolvedRuntimeRoot
     $localOverrideState = $null
     if ($localOverrideRead.Present) {
         $localOverrideState = [pscustomobject]@{

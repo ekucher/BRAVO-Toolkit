@@ -27,7 +27,7 @@ function Get-BRAVOConfiguratorProductionOverrideState {
     }
     . $loaderPath
 
-    $overrideRead = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $ProductionConfigDirectory
+    $overrideRead = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $ProductionConfigDirectory -RuntimeRoot $RuntimeRoot
     $baselineHash = if ($overrideRead.Present) {
         (Get-FileHash -LiteralPath $overrideRead.Path -Algorithm SHA256).Hash
     } else {
@@ -116,11 +116,11 @@ function Test-BRAVOConfiguratorCandidateOverrides {
     try {
         $isolated = New-BRAVOConfiguratorIsolatedConfigRoot -RuntimeRoot $RuntimeRoot -CandidateOverrides $MergedOverrides
 
-        # Крок 4: parse + restricted-language (canonical loader сам кине
-        # виняток, якщо candidate не data-only hashtable).
+        # Крок 4: невиконуюче вилучення даних з AST (canonical loader сам
+        # кине виняток, якщо candidate не data-only hashtable).
         $loaderPath = Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1'
         . $loaderPath
-        $parseResult = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $isolated.IsolatedRoot
+        $parseResult = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $isolated.IsolatedRoot -RuntimeRoot $RuntimeRoot
         if (-not $parseResult.Present -and $MergedOverrides.Count -gt 0) {
             $reasons.Add('Кандидатний BRAVO.local.config не було записано в isolated root — внутрішня помилка Persistence.')
         }
@@ -212,7 +212,7 @@ function Test-BRAVOConfiguratorPostApplyVerification {
     try {
         $loaderPath = Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1'
         . $loaderPath
-        $reloadResult = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $ProductionConfigDirectory
+        $reloadResult = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $ProductionConfigDirectory -RuntimeRoot $RuntimeRoot
         if (-not $reloadResult.Present) {
             throw 'Щойно записаний BRAVO.local.config не читається повторно.'
         }

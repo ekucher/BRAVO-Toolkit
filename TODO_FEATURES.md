@@ -82,12 +82,18 @@ backlog-нотатки; канонічний поточний пріоритет
       PLANNED (`configSchemaVersion` лишається `1`).
 - [ ] Config v2 як non-executing data-only формат для `BRAVO.config`
       **не реалізовано** — сам `BRAVO.config` досі виконуваний
-      PowerShell-скрипт. `BRAVO.local.config` (окремий, вже наявний
-      override-шар) сьогодні — restricted-language, validated ПЕРЕД
-      виконанням (`CheckRestrictedLanguage` з порожнім allow-list), але
-      validated `ScriptBlock` усе ще ВИКОНУЄТЬСЯ (`& $scriptBlock`);
-      це не те саме, що цільовий non-executing AST-only parser
-      Config v2 (`docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`).
+      PowerShell-скрипт (крок B4 у #154).
+- [x] `BRAVO.local.config` читається non-executing AST-парсером
+      (#154, B1): `ConvertFrom-BRAVOConfigurationDataFileText`
+      (`modules/BRAVO.Configuration/BRAVO.Configuration.DataFile.psm1`)
+      парсить текст у AST і вилучає значення за явним fail-closed
+      переліком дозволених вузлів-літералів. Scriptblock site-файлу не
+      створюється, не викликається і не dot-source'иться. Попередній
+      механізм (`CheckRestrictedLanguage` з порожнім allow-list, а
+      потім `& $scriptBlock`) блокував команди/функції/змінні, але
+      validated `ScriptBlock` ВИКОНУВАВСЯ, а restricted-language
+      граматика допускає окремі вирази — тож, наприклад, `1 + 1`
+      обчислювалось у `2`; тепер це відмова.
 - [x] Security invariants перевіряються після merge
       (`Test-BRAVOEffectiveSecurityInvariants`, `BRAVO_CONFIG_LOADER.ps1`):
       у стандартному `Enforce`-режимі (дефолт) послаблення ЕФЕКТИВНОЇ
