@@ -21,6 +21,27 @@ param(
 # очікувано і корисно (видно повільний старт), не дефект.
 $script:selfTestTotalStopwatch = [Diagnostics.Stopwatch]::StartNew()
 
+# #163: Windows PowerShell обмежує кількість змінних НА ОБЛАСТЬ
+# ($MaximumVariableCount, типово 4096). Усі фрагменти selftest\*.ps1
+# dot-source'яться в ЦЮ область, тож їхні змінні накопичуються разом.
+# Стеля вже досягалась на практиці: блок з ~15 новими змінними завалив
+# прогін помилкою "Cannot create variable ... capacity 4096 is exceeded"
+# у ГЕТЬ ІНШОМУ, не пов'язаному тесті — причину довелось шукати там, де
+# її не було.
+#
+# Ліміт піднімається явно й одразу, ДО будь-якого dot-source. Саме лише
+# підняття було б відкладеною тією самою проблемою, тому наприкінці
+# прогону є перевірка запасу (Framework/VariableScopeHeadroom): щойно
+# запас знову стане малим, self-test скаже це прямо, а не впаде
+# випадковим тестом.
+#
+# КОНВЕНЦІЯ ДЛЯ АВТОРІВ ТЕСТІВ: новий блок фрагмента виконуйте в
+# ДОЧІРНІЙ області — & { ... }. Тоді його змінні не залишаються тут
+# узагалі. Функції self-test (Test-BRAVOCondition) і $script:-лічильники
+# з дочірньої області доступні без змін.
+$script:selfTestVariableCountLimit = 8192
+$MaximumVariableCount = $script:selfTestVariableCountLimit
+
 # $root обчислюється тут — РАНІШЕ, ніж раніше у цьому файлі — бо потрібен
 # нижче для integrity-перевірки, яка має відбутись ДО Import-Module.
 # Дешеве, dependency-free (лише Split-Path/CurrentDirectory) обчислення;
@@ -18568,6 +18589,27 @@ if (-not [string]::IsNullOrWhiteSpace([string]$script:selfTestConfigRoot) -and
     [IO.Directory]::Exists($script:selfTestConfigRoot)) {
     [IO.Directory]::Delete($script:selfTestConfigRoot, $true)
 }
+
+# #163: перевірка запасу змінних області. Стеля $MaximumVariableCount
+# піднята на початку файлу; тут — доказ, що запас реальний. Без цієї
+# перевірки наступне вичерпання знову спливло б випадковою помилкою в
+# непов'язаному тесті, а не чесною діагностикою.
+#
+# Get-Variable -Scope 0 на ВЕРХНЬОМУ рівні файлу — це саме та область,
+# у яку dot-source'яться всі фрагменти, тобто та сама, що переповнювалась.
+$script:selfTestScopeVariableCount = @(Get-Variable -Scope 0 -ErrorAction SilentlyContinue).Count
+$script:selfTestScopeVariableHeadroom = $script:selfTestVariableCountLimit - $script:selfTestScopeVariableCount
+Write-Host ("Змінних в області self-test: {0} з {1} (запас {2})" -f `
+    $script:selfTestScopeVariableCount, $script:selfTestVariableCountLimit, $script:selfTestScopeVariableHeadroom)
+Test-BRAVOCondition `
+    -Condition ($script:selfTestScopeVariableHeadroom -ge 256) `
+    -Name "Framework/VariableScopeHeadroom" `
+    -Failure ("запас змінних області self-test вичерпується: використано " +
+        "$($script:selfTestScopeVariableCount) з $($script:selfTestVariableCountLimit), лишилось " +
+        "$($script:selfTestScopeVariableHeadroom) (потрібно щонайменше 256). Нові блоки фрагментів " +
+        "виконуйте в дочірній області (& { ... }) або підніміть " +
+        "`$script:selfTestVariableCountLimit — інакше наступне переповнення знову спливе " +
+        "помилкою SessionStateOverflowException у непов'язаному тесті (#163)")
 
 # P0 fail-fast/telemetry: увесь попередній inline reporting/exit-хвіст
 # (exit-code formula, operator summary, SELF-TEST PASSED/FAILED, Complete-
