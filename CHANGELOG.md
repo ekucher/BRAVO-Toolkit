@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Інструмент дельти site-конфігурації (#154, B0)** —
+  `deploy/Get-BRAVOConfigSiteDelta.ps1` порівнює `BRAVO.config` сервера з
+  канонічними built-in дефолтами й друкує лише відмінності у форматі
+  dot-path, готовому для `BRAVO.local.config`. Досі відповіді на питання
+  «що на цьому сервері справді перевизначено» не було ні в кого:
+  `BRAVO.config` епохи 5.2.0 мовчки затінює будь-яке покращення дефолтів,
+  а виявити це можна було лише побайтовим порівнянням двох файлів на 800
+  рядків. Інструмент **нічого не змінює**: вивід у консоль, запис лише за
+  явним `-OutputPath`, наявний файл не перезаписується. Порівняння графів
+  винесено в новий модуль `BRAVO.Configuration.Delta`
+  (`Compare-BRAVOConfigurationGraph`); читання primary-шару
+  (`Read-BRAVOLegacyPrimaryRawOverrides`) винесено з
+  `Import-BravoLegacyPrimaryConfiguration` окремою функцією й
+  перевикористовується без зміни поведінки завантаження. Рендеринг
+  літералів — наявний `ConvertTo-BRAVOConfiguratorPowerShellLiteral`.
+  Тринадцять регресій у `Delta/*`.
+
 - **Невідомий кінцевий сегмент у `BRAVO.local.config` більше не
   мовчить (#154, A2)** — `ConvertTo-BRAVONestedOverride` навмисно
   приймає dot-шлях, чий БАТЬКІВСЬКИЙ вузол існує, а самого leaf у
