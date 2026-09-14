@@ -207,6 +207,33 @@
             ) `
             -Name "Documentation/ReleasePolicyCoversVersionModel" `
             -Failure "RELEASE_POLICY.md має описувати prerelease-формати (dev/rc), releaseChannel, правило ModuleVersion і CI-gate ci\Test-BRAVOReleasePolicy.ps1"
+
+        # Паритет-harness конфігурації: політика мусить називати його
+        # обов'язковим кроком для змін конфігураційного пайплайна. Без
+        # цього єдиний доказ збереження повного графа $global: лишається
+        # інструментом, про який ніхто не знає (знахідка F4 аудиту
+        # 2026-09-14, задача A4 у #154).
+        Test-BRAVOCondition `
+            -Condition (
+                $releasePolicyText.Contains('ci\Test-BRAVOConfigFoundationParity.ps1') -and
+                $releasePolicyText.Contains('BRAVO_CONFIG_LOADER.ps1')
+            ) `
+            -Name "Documentation/ReleasePolicyRequiresConfigParityHarness" `
+            -Failure "RELEASE_POLICY.md має називати ci\Test-BRAVOConfigFoundationParity.ps1 обов'язковим кроком для PR, що змінюють конфігураційний пайплайн (BRAVO_CONFIG_LOADER.ps1 та ін.)"
+    }
+
+    # Дефолтна база harness-а мусить бути НЕЗМІННИМ комітом, а не іменем
+    # гілки: гілку feature/config-foundation-derivation уже влито, і
+    # прибирання стале гілок мовчки зламало б інструмент. Перевіряється
+    # саме форма дефолту, бо це єдине, що governance може довести без git.
+    $parityHarnessPath = Join-Path $root "ci\Test-BRAVOConfigFoundationParity.ps1"
+    if (Test-Path -LiteralPath $parityHarnessPath -PathType Leaf) {
+        $parityHarnessText = [IO.File]::ReadAllText($parityHarnessPath, [Text.Encoding]::UTF8)
+        $parityBaseRefMatch = [regex]::Match($parityHarnessText, '\[string\]\$BaseRef\s*=\s*''([^'']*)''')
+        Test-BRAVOCondition `
+            -Condition ($parityBaseRefMatch.Success -and $parityBaseRefMatch.Groups[1].Value -match '^[0-9a-f]{40}$') `
+            -Name "Governance/ConfigParityHarnessBaseRefIsImmutableCommit" `
+            -Failure "дефолтний -BaseRef у ci\Test-BRAVOConfigFoundationParity.ps1 має бути повним SHA-1 коміта, а не іменем гілки (гілку може видалити прибирання стале гілок); отримано: '$(if ($parityBaseRefMatch.Success) { $parityBaseRefMatch.Groups[1].Value } else { '<не знайдено>' })'"
     }
 
     # Політика, яку ніхто не перевіряє механічно, тримається лише на
