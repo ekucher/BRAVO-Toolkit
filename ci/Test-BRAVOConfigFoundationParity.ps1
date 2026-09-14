@@ -321,6 +321,10 @@ $knownIntentionalDiffPrefixes = @(
     # (властивість відсутня -> $null), PR C додав як НОВІ, не змінивши
     # жодне вже наявне поле.
     'BravoConfigurationMetadata.AppliedLocalOverrideKeys',
+    # Адитивне діагностичне поле (#154, A2): прийняті, але нерезультативні
+    # ключі BRAVO.local.config з невідомим кінцевим сегментом. Наявні поля
+    # не змінює, на effective-конфігурацію не впливає.
+    'BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides',
     'BravoConfigurationMetadata.LocalConfigPath',
     'BravoConfigurationMetadata.LocalConfigPresent',
     'BravoConfigurationMetadata.Mode',

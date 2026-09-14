@@ -784,7 +784,13 @@ function Complete-BRAVOConfigurationLoad {
     param(
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [AllowNull()][hashtable]$PrimaryOverrides,
-        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides,
+
+        # Діагностика невідомого leaf у BRAVO.local.config (#154, A2):
+        # шлях приймається як і раніше, sink лише робить його видимим.
+        # Власник стану — викликач (Import-BravoConfiguration), тут жодного
+        # нового $global:.
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
     )
 
     # -Force НЕ використовується навмисно: повторний Import-Module тієї
@@ -808,7 +814,8 @@ function Complete-BRAVOConfigurationLoad {
     $mergedConfiguration = Resolve-BRAVORawConfiguration `
         -DefaultConfiguration $defaultConfiguration `
         -PrimaryOverrides $PrimaryOverrides `
-        -LocalOverrides $LocalOverrides
+        -LocalOverrides $LocalOverrides `
+        -UnknownLeafPathSink $UnknownLeafPathSink
 
     # Проєкція кожного top-level ключа мерджу в $global: — той самий
     # контракт, що BRAVO.config колись встановлював власними
@@ -851,13 +858,15 @@ function Import-BravoSyntheticConfiguration {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides,
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
     )
 
     Complete-BRAVOConfigurationLoad `
         -RuntimeRoot $RuntimeRoot `
         -PrimaryOverrides $null `
-        -LocalOverrides $LocalOverrides
+        -LocalOverrides $LocalOverrides `
+        -UnknownLeafPathSink $UnknownLeafPathSink
 }
 
 function Import-BravoLegacyPrimaryConfiguration {
@@ -876,7 +885,8 @@ function Import-BravoLegacyPrimaryConfiguration {
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [Parameter(Mandatory = $true)][string]$ConfigRoot,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides,
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
     )
 
     $configurationModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
@@ -903,7 +913,8 @@ function Import-BravoLegacyPrimaryConfiguration {
     Complete-BRAVOConfigurationLoad `
         -RuntimeRoot $RuntimeRoot `
         -PrimaryOverrides $primaryRawOverrides `
-        -LocalOverrides $LocalOverrides
+        -LocalOverrides $LocalOverrides `
+        -UnknownLeafPathSink $UnknownLeafPathSink
 }
 
 function Import-BravoConfiguration {
@@ -1005,10 +1016,16 @@ function Import-BravoConfiguration {
             Path = [string]$localOverrideRead.Path
             Overrides = $localOverrideRead.Overrides
             Applied = New-Object 'System.Collections.Generic.HashSet[string]'
+            # Шляхи, чий БАТЬКІВСЬКИЙ вузол існує, а сам leaf канонічній
+            # конфігурації невідомий. Такий ключ приймається (forward-compat
+            # для новішого Configurator), але НЕ впливає ні на що — без
+            # цього переліку оператор вважав би його застосованим (#154, A2).
+            UnknownLeafPaths = New-Object 'System.Collections.Generic.List[string]'
         }
     }
     $global:BravoLocalConfigOverrideState = $localOverrideState
     $effectiveLocalOverrides = if ($null -ne $localOverrideState) { $localOverrideState.Overrides } else { @{} }
+    $effectiveUnknownLeafSink = if ($null -ne $localOverrideState) { $localOverrideState.UnknownLeafPaths } else { $null }
 
     $configurationFormat = if ($legacyConfigFileExists) { 'legacy-config' } else { 'synthetic-no-config' }
 
@@ -1018,11 +1035,13 @@ function Import-BravoConfiguration {
                 -ConfigPath $resolvedConfigPath `
                 -ConfigRoot $resolvedConfigRoot `
                 -RuntimeRoot $resolvedRuntimeRoot `
-                -LocalOverrides $effectiveLocalOverrides
+                -LocalOverrides $effectiveLocalOverrides `
+                -UnknownLeafPathSink $effectiveUnknownLeafSink
         } else {
             Import-BravoSyntheticConfiguration `
                 -RuntimeRoot $resolvedRuntimeRoot `
-                -LocalOverrides $effectiveLocalOverrides
+                -LocalOverrides $effectiveLocalOverrides `
+                -UnknownLeafPathSink $effectiveUnknownLeafSink
         }
     }
     catch {
@@ -1091,6 +1110,24 @@ function Import-BravoConfiguration {
                 "BRAVO.local.config ('$($localOverrideState.Path)'): не вдалося застосувати ключ(і): " +
                 ($unappliedOverrideKeys -join ', ') +
                 ". Перевірте dot-шлях (кореневий об'єкт і проміжні вузли мають існувати в BRAVO.config)."
+            )
+        }
+
+        # #154 (A2): невідомий ОСТАННІЙ сегмент приймається навмисно —
+        # forward-compat для новішого Configurator, який може покласти ключ,
+        # ще не описаний у схемі цієї версії комплекту. Але прийнятий такий
+        # ключ нічого не робить, і доти це було невидимо: оператор, що
+        # написав Limits.MinFreeSpaceGB замість Limits.MinimumFreeSpaceGB,
+        # вважав поріг зміненим. Тому — попередження в лозі й запис у
+        # метадані завантаження. Поведінка прийому НЕ змінюється: це
+        # діагностика, а не новий fail-closed (це окреме рішення D3 у #154).
+        $unknownLeafOverrideKeys = @(@($localOverrideState.UnknownLeafPaths) | Sort-Object -Unique)
+        if ($unknownLeafOverrideKeys.Count -gt 0) {
+            Write-Warning (
+                "BRAVO.local.config ('$($localOverrideState.Path)'): ключ(і) з невідомим кінцевим сегментом " +
+                "прийнято, але вони НЕ впливають на конфігурацію: " + ($unknownLeafOverrideKeys -join ', ') +
+                ". Найімовірніша причина — опечатка в назві останнього сегмента; звірте її з коментарями " +
+                "відповідного блоку BRAVO.config. Якщо ключ призначений новішій версії комплекту, це очікувано."
             )
         }
     }
@@ -1176,6 +1213,11 @@ function Import-BravoConfiguration {
         )
         AppliedLocalOverrideKeys = @(
             if ($null -ne $localOverrideState) { @($localOverrideState.Applied) | Sort-Object } else { @() }
+        )
+        # Прийняті, але нерезультативні ключі: кінцевий сегмент канонічній
+        # конфігурації невідомий (#154, A2). Порожньо = таких немає.
+        LocalConfigUnknownLeafOverrides = @(
+            if ($null -ne $localOverrideState) { @($localOverrideState.UnknownLeafPaths) | Sort-Object -Unique } else { @() }
         )
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
         LegacyScriptVersion = $legacyScriptVersion

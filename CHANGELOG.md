@@ -2,6 +2,23 @@
 
 ## Не випущено (developer)
 
+- **Невідомий кінцевий сегмент у `BRAVO.local.config` більше не
+  мовчить (#154, A2)** — `ConvertTo-BRAVONestedOverride` навмисно
+  приймає dot-шлях, чий БАТЬКІВСЬКИЙ вузол існує, а самого leaf у
+  канонічній конфігурації немає (forward-compat для новішого
+  Configurator). Прийнятий такий ключ, однак, ні на що не впливає, і
+  доти це було невидимо: оператор, що написав
+  `maintenanceSettings.Limits.MinFreeSpaceGB` замість
+  `MinimumFreeSpaceGB`, вважав поріг зміненим. Тепер завантаження
+  виводить попередження з переліком таких ключів і записує їх у
+  `BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides`.
+  **Прийом/відхилення не змінено** — це діагностика, а не новий
+  fail-closed (перехід на сувору відмову лишається окремим рішенням D3
+  у #154). Три регресії:
+  `Configuration/UnknownLeafIsAcceptedAndReported`,
+  `Configuration/KnownLeafIsNeverReportedAsUnknown`,
+  `Configuration/UnknownParentStillFailsClosedWithSink`.
+
 - **Health-поріг для тому, меншого за сам поріг (#155)** — коли
   загальна ємність тому менша за налаштований `MinimumFreeSpaceGB`,
   абсолютний поріг недосяжний за побудовою: попередження не можна

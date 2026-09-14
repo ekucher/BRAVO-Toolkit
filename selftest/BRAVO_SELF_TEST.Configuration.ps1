@@ -108,6 +108,57 @@
         -Name "Configuration/KnownDotPathConvertsToNestedGraph" `
         -Failure "відомий dot-path має коректно розгортатись у вкладений hashtable-вузол"
 
+    # --- #154 (A2): невідомий ОСТАННІЙ сегмент — приймається, але видимий ---
+    # Блок у дочірній області (& { ... }) через ліміт 4096 змінних на
+    # область self-test (#163).
+    & {
+        $unknownLeafSink = New-Object 'System.Collections.Generic.List[string]'
+        $unknownLeafResult = ConvertTo-BRAVONestedOverride `
+            -DotPathOverrides @{ 'maintenanceSettings.Limits.MinFreeSpaceGB' = 20 } `
+            -ReferenceConfiguration $configurationDefaults `
+            -UnknownLeafPathSink $unknownLeafSink
+        Test-BRAVOCondition `
+            -Condition (
+                $unknownLeafResult.maintenanceSettings.Limits.MinFreeSpaceGB -eq 20 -and
+                @($unknownLeafSink).Count -eq 1 -and
+                [string]$unknownLeafSink[0] -eq 'maintenanceSettings.Limits.MinFreeSpaceGB'
+            ) `
+            -Name 'Configuration/UnknownLeafIsAcceptedAndReported' `
+            -Failure ("невідомий кінцевий сегмент має ЛИШАТИСЬ прийнятим (forward-compat) і водночас потрапляти " +
+                "в UnknownLeafPathSink; отримано значення=$($unknownLeafResult.maintenanceSettings.Limits.MinFreeSpaceGB) " +
+                "sink=$(@($unknownLeafSink) -join ', ')")
+
+        # Відомий leaf не повинен потрапляти в sink — інакше попередження
+        # звучало б на кожному нормальному override і його перестали б читати.
+        $knownLeafSink = New-Object 'System.Collections.Generic.List[string]'
+        ConvertTo-BRAVONestedOverride `
+            -DotPathOverrides @{ 'maintenanceSettings.Limits.ExcludedDrives' = @('F:\') } `
+            -ReferenceConfiguration $configurationDefaults `
+            -UnknownLeafPathSink $knownLeafSink | Out-Null
+        Test-BRAVOCondition `
+            -Condition (@($knownLeafSink).Count -eq 0) `
+            -Name 'Configuration/KnownLeafIsNeverReportedAsUnknown' `
+            -Failure "відомий кінцевий сегмент не має потрапляти в UnknownLeafPathSink; отримано: $(@($knownLeafSink) -join ', ')"
+
+        # Діагностика не послаблює fail-closed: невідомий БАТЬКІВСЬКИЙ вузол
+        # і далі кидає виняток, і такий шлях у sink не потрапляє.
+        $rejectedSink = New-Object 'System.Collections.Generic.List[string]'
+        $rejectedThrew = $false
+        try {
+            ConvertTo-BRAVONestedOverride `
+                -DotPathOverrides @{ 'maintenanceSettings.Limit.ExcludedDrives' = @() } `
+                -ReferenceConfiguration $configurationDefaults `
+                -UnknownLeafPathSink $rejectedSink | Out-Null
+        } catch {
+            $rejectedThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition ($rejectedThrew -and @($rejectedSink).Count -eq 0) `
+            -Name 'Configuration/UnknownParentStillFailsClosedWithSink' `
+            -Failure ("невідомий батьківський вузол має лишатись fail-closed навіть із переданим sink, і не " +
+                "реєструватись як 'прийнятий невідомий leaf'; threw=$rejectedThrew sink=$(@($rejectedSink) -join ', ')")
+    }
+
     # --- Resolve-BRAVORawConfiguration: повна precedence DEFAULT < primary < local ---
     $precedencePrimary = @{ maintenanceSettings = @{ Restore = @{ Time = '22:00' } } }
     $precedenceLocal = @{ 'maintenanceSettings.Restore.Time' = '01:00' }
