@@ -944,9 +944,20 @@ function Get-BRAVODeclaredGlobalVariableName {
         }
         if ($target -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
         if (-not $target.VariablePath.IsGlobal) { continue }
-        [void]$names.Add([string]$target.VariablePath.UnqualifiedPath)
+        # UserPath, а не UnqualifiedPath: останньої властивості в
+        # System.Management.Automation.VariablePath Windows PowerShell 5.1
+        # ПУБЛІЧНО немає — звернення до неї падало з "The property
+        # 'UnqualifiedPath' cannot be found on this object" і завалювало
+        # завантаження конфігурації цілком (CI 2026-09-14). UserPath для
+        # $global:x повертає "global:x", тож префікс знімаємо явно.
+        $declaredName = [string]$target.VariablePath.UserPath -replace '^(?i)global:', ''
+        if ([string]::IsNullOrWhiteSpace($declaredName)) { continue }
+        [void]$names.Add($declaredName)
     }
 
+    # @($names) для порожнього HashSet дає порожній масив, який PowerShell
+    # не повертає взагалі ($null у викликача) — тому викликач мусить
+    # перевіряти елемент на $null, і він це робить.
     return @($names)
 }
 
@@ -993,6 +1004,7 @@ function Read-BRAVOLegacyPrimaryRawOverrides {
 
     if ($null -ne $DeclaredGlobalNameSink) {
         foreach ($declaredName in @(Get-BRAVODeclaredGlobalVariableName -ScriptBlock $legacyConfigScript)) {
+            if ([string]::IsNullOrWhiteSpace([string]$declaredName)) { continue }
             [void]$DeclaredGlobalNameSink.Add([string]$declaredName)
         }
     }
@@ -1057,6 +1069,7 @@ function Import-BravoLegacyPrimaryConfiguration {
             -ReferenceConfiguration (Get-BRAVODefaultConfiguration) `
             -CandidateConfiguration $primaryRawOverrides)
         foreach ($primaryDifference in $primaryDifferences) {
+            if ($null -eq $primaryDifference) { continue }
             if ([string]$primaryDifference.Kind -ne 'OnlyInCandidate') { continue }
             [void]$UnknownPrimaryPathSink.Add([string]$primaryDifference.Path)
         }

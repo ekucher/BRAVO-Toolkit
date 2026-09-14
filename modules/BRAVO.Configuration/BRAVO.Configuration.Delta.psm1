@@ -67,6 +67,118 @@ function Test-BRAVOConfigurationValueEquality {
     return ($Left -eq $Right)
 }
 
+function Add-BRAVOConfigurationGraphDifference {
+    # Приватний рекурсивний обхід. Приймає накопичувач ЯВНО (той самий
+    # List[object] по всій рекурсії) замість повернення масиву через
+    # `return` на кожному рівні.
+    #
+    # Це НЕ стильова вподобаність. Функція, що повертає ПОРОЖНІЙ масив,
+    # у PowerShell не повертає нічого: `$nested = Compare-... ` дає
+    # $null, а `@($nested)` перетворює його на масив з ОДНИМ елементом
+    # $null — і кожна рекурсія у вузол БЕЗ відмінностей додавала
+    # порожній запис у результат. Емпірично: порівняння canonical
+    # defaults із самими собою давало 3 "відмінності" замість 0
+    # (self-test Delta/IdenticalGraphsProduceNoDifference, CI 2026-09-14).
+    # Той самий клас проблеми вже задокументований у цьому репозиторії —
+    # Compare-BRAVOConfigurationGraphForParity у
+    # selftest\BRAVO_SELF_TEST.ConfigLoader.ps1 ("порожні diff-рядки") —
+    # і там застосовано те саме рішення.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$ReferenceConfiguration,
+        [Parameter(Mandatory = $true)][hashtable]$CandidateConfiguration,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$PathPrefix,
+        [switch]$IncludeMissingInCandidate,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Differences
+    )
+
+    foreach ($key in @($CandidateConfiguration.Keys)) {
+        $path = if ([string]::IsNullOrEmpty($PathPrefix)) { [string]$key } else { "$PathPrefix.$key" }
+        $candidateValue = $CandidateConfiguration[$key]
+        $referenceHasKey = $ReferenceConfiguration.Contains($key)
+        $referenceValue = if ($referenceHasKey) { $ReferenceConfiguration[$key] } else { $null }
+
+        $candidateIsNode = ($candidateValue -is [hashtable])
+        $referenceIsNode = ($referenceValue -is [hashtable])
+
+        if ($candidateIsNode -and $referenceIsNode) {
+            Add-BRAVOConfigurationGraphDifference `
+                -ReferenceConfiguration $referenceValue `
+                -CandidateConfiguration $candidateValue `
+                -PathPrefix $path `
+                -IncludeMissingInCandidate:$IncludeMissingInCandidate `
+                -Differences $Differences
+            continue
+        }
+
+        if (-not $referenceHasKey) {
+            # Вузол-hashtable, якого немає в еталоні, розкривається до
+            # листів: оператору потрібен конкретний dot-path, а не
+            # "десь у цьому блоці щось є".
+            if ($candidateIsNode) {
+                Add-BRAVOConfigurationGraphDifference `
+                    -ReferenceConfiguration @{} `
+                    -CandidateConfiguration $candidateValue `
+                    -PathPrefix $path `
+                    -IncludeMissingInCandidate:$IncludeMissingInCandidate `
+                    -Differences $Differences
+                continue
+            }
+            [void]$Differences.Add([pscustomobject]@{
+                Path           = $path
+                Kind           = 'OnlyInCandidate'
+                ReferenceValue = $null
+                CandidateValue = $candidateValue
+            })
+            continue
+        }
+
+        if ($candidateIsNode -ne $referenceIsNode) {
+            # Форма вузла змінилась (скаляр там, де еталон має блок, або
+            # навпаки) — це відмінність сама по собі, не привід рекурсувати.
+            [void]$Differences.Add([pscustomobject]@{
+                Path           = $path
+                Kind           = 'Changed'
+                ReferenceValue = $referenceValue
+                CandidateValue = $candidateValue
+            })
+            continue
+        }
+
+        if (-not (Test-BRAVOConfigurationValueEquality -Left $referenceValue -Right $candidateValue)) {
+            [void]$Differences.Add([pscustomobject]@{
+                Path           = $path
+                Kind           = 'Changed'
+                ReferenceValue = $referenceValue
+                CandidateValue = $candidateValue
+            })
+        }
+    }
+
+    if (-not $IncludeMissingInCandidate) { return }
+
+    foreach ($key in @($ReferenceConfiguration.Keys)) {
+        if ($CandidateConfiguration.Contains($key)) { continue }
+        $path = if ([string]::IsNullOrEmpty($PathPrefix)) { [string]$key } else { "$PathPrefix.$key" }
+        $referenceValue = $ReferenceConfiguration[$key]
+        if ($referenceValue -is [hashtable]) {
+            Add-BRAVOConfigurationGraphDifference `
+                -ReferenceConfiguration $referenceValue `
+                -CandidateConfiguration @{} `
+                -PathPrefix $path `
+                -IncludeMissingInCandidate `
+                -Differences $Differences
+            continue
+        }
+        [void]$Differences.Add([pscustomobject]@{
+            Path           = $path
+            Kind           = 'OnlyInReference'
+            ReferenceValue = $referenceValue
+            CandidateValue = $null
+        })
+    }
+}
+
 function Compare-BRAVOConfigurationGraph {
     <#
     .SYNOPSIS
@@ -86,6 +198,10 @@ function Compare-BRAVOConfigurationGraph {
         "що саме перевизначено на цьому сервері" відсутність ключа в
         site-конфігу означає "діє дефолт", а не відмінність. Вмикається
         прапорцем -IncludeMissingInCandidate, коли потрібна повна картина.
+
+        Сам обхід виконує приватний Add-BRAVOConfigurationGraphDifference
+        з явним накопичувачем; ця функція лише створює накопичувач і
+        повертає детермінований результат.
     #>
     [CmdletBinding()]
     param(
@@ -96,92 +212,12 @@ function Compare-BRAVOConfigurationGraph {
     )
 
     $differences = New-Object System.Collections.Generic.List[object]
-
-    foreach ($key in @($CandidateConfiguration.Keys)) {
-        $path = if ([string]::IsNullOrEmpty($PathPrefix)) { [string]$key } else { "$PathPrefix.$key" }
-        $candidateValue = $CandidateConfiguration[$key]
-        $referenceHasKey = $ReferenceConfiguration.Contains($key)
-        $referenceValue = if ($referenceHasKey) { $ReferenceConfiguration[$key] } else { $null }
-
-        $candidateIsNode = ($candidateValue -is [hashtable])
-        $referenceIsNode = ($referenceValue -is [hashtable])
-
-        if ($candidateIsNode -and $referenceIsNode) {
-            $nested = Compare-BRAVOConfigurationGraph `
-                -ReferenceConfiguration $referenceValue `
-                -CandidateConfiguration $candidateValue `
-                -PathPrefix $path `
-                -IncludeMissingInCandidate:$IncludeMissingInCandidate
-            foreach ($item in @($nested)) { [void]$differences.Add($item) }
-            continue
-        }
-
-        if (-not $referenceHasKey) {
-            # Вузол-hashtable, якого немає в еталоні, розкривається до
-            # листів: оператору потрібен конкретний dot-path, а не
-            # "десь у цьому блоці щось є".
-            if ($candidateIsNode) {
-                $nested = Compare-BRAVOConfigurationGraph `
-                    -ReferenceConfiguration @{} `
-                    -CandidateConfiguration $candidateValue `
-                    -PathPrefix $path `
-                    -IncludeMissingInCandidate:$IncludeMissingInCandidate
-                foreach ($item in @($nested)) { [void]$differences.Add($item) }
-                continue
-            }
-            [void]$differences.Add([pscustomobject]@{
-                Path           = $path
-                Kind           = 'OnlyInCandidate'
-                ReferenceValue = $null
-                CandidateValue = $candidateValue
-            })
-            continue
-        }
-
-        if ($candidateIsNode -ne $referenceIsNode) {
-            # Форма вузла змінилась (скаляр там, де еталон має блок, або
-            # навпаки) — це відмінність сама по собі, не привід рекурсувати.
-            [void]$differences.Add([pscustomobject]@{
-                Path           = $path
-                Kind           = 'Changed'
-                ReferenceValue = $referenceValue
-                CandidateValue = $candidateValue
-            })
-            continue
-        }
-
-        if (-not (Test-BRAVOConfigurationValueEquality -Left $referenceValue -Right $candidateValue)) {
-            [void]$differences.Add([pscustomobject]@{
-                Path           = $path
-                Kind           = 'Changed'
-                ReferenceValue = $referenceValue
-                CandidateValue = $candidateValue
-            })
-        }
-    }
-
-    if ($IncludeMissingInCandidate) {
-        foreach ($key in @($ReferenceConfiguration.Keys)) {
-            if ($CandidateConfiguration.Contains($key)) { continue }
-            $path = if ([string]::IsNullOrEmpty($PathPrefix)) { [string]$key } else { "$PathPrefix.$key" }
-            $referenceValue = $ReferenceConfiguration[$key]
-            if ($referenceValue -is [hashtable]) {
-                $nested = Compare-BRAVOConfigurationGraph `
-                    -ReferenceConfiguration $referenceValue `
-                    -CandidateConfiguration @{} `
-                    -PathPrefix $path `
-                    -IncludeMissingInCandidate
-                foreach ($item in @($nested)) { [void]$differences.Add($item) }
-                continue
-            }
-            [void]$differences.Add([pscustomobject]@{
-                Path           = $path
-                Kind           = 'OnlyInReference'
-                ReferenceValue = $referenceValue
-                CandidateValue = $null
-            })
-        }
-    }
+    Add-BRAVOConfigurationGraphDifference `
+        -ReferenceConfiguration $ReferenceConfiguration `
+        -CandidateConfiguration $CandidateConfiguration `
+        -PathPrefix $PathPrefix `
+        -IncludeMissingInCandidate:$IncludeMissingInCandidate `
+        -Differences $differences
 
     # Сортування за шляхом: вивід інструменту має бути детермінованим,
     # інакше два прогони на тому самому сервері дають різний порядок і

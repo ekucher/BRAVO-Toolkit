@@ -1333,6 +1333,33 @@ Test-BRAVOCondition `
             -Name "PrimaryStrictness/DiagnosticsNeverRejectConfiguration" `
             -Failure "невідомий ключ primary-шару має лишатись ПРИЙНЯТИМ (діагностика, не gate); global='$strictnessUnknownGlobal' nested='$strictnessUnknownNested'"
 
+        # --- PrimaryStrictness/DeclaredGlobalNameHelperReturnsNames ---
+        # Пряма перевірка самого helper-а, а не лише його наслідків: перша
+        # реалізація читала VariablePath.UnqualifiedPath, якої в
+        # System.Management.Automation.VariablePath Windows PowerShell 5.1
+        # ПУБЛІЧНО немає — завантаження конфігурації падало цілком
+        # ("The property 'UnqualifiedPath' cannot be found on this object",
+        # CI 2026-09-14). Текстовий guard нижче такого не ловить.
+        $strictnessHelperCommand = (
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "`$sb = [scriptblock]::Create('`$global:alpha = 1; `$global:beta = @{}; `$local:gamma = 3; `$delta = 4'); " +
+            "'RESULT:' + ((@(Get-BRAVODeclaredGlobalVariableName -ScriptBlock `$sb) | Sort-Object) -join '|')" +
+            "} catch { 'THREW: ' + `$_.Exception.Message }"
+        )
+        # Два кроки, а не [string](...).Trim(): у PowerShell приведення типу
+        # зв'язується СЛАБШЕ за виклик методу, тож однорядковий варіант
+        # означав би [string]($output.Trim()) — не те, що записано.
+        $strictnessHelperRaw = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $strictnessHelperCommand 2>&1 | Out-String
+        )
+        $strictnessHelperOutput = $strictnessHelperRaw.Trim()
+        Test-BRAVOCondition `
+            -Condition ($strictnessHelperOutput -eq 'RESULT:alpha|beta') `
+            -Name "PrimaryStrictness/DeclaredGlobalNameHelperReturnsNames" `
+            -Failure "Get-BRAVODeclaredGlobalVariableName має повертати ІМЕНА без префікса scope і лише для `$global: (очікувалось 'RESULT:alpha|beta'); отримано '$strictnessHelperOutput'"
+
         # --- PrimaryStrictness/DeclaredGlobalNamesFromAstNotSnapshot ---
         # Guard від регресії в бік знімка глобальної області: знімок ДО/ПІСЛЯ
         # дав би шум рантайму й пропустив би присвоєння наявній змінній.
