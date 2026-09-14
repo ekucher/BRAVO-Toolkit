@@ -407,3 +407,179 @@
         if ($null -ne $discoveryOverrideBeforePath) { $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $discoveryOverrideBeforePath }
         Remove-Item -LiteralPath $discoveryOverrideTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    # =====================================================================
+    # BRAVO.Configuration.Delta — порівняння графів (#154, задача B0)
+    # =====================================================================
+    # Окремий child scope (& { ... }): усі 25 фрагментів self-test
+    # дот-сорсяться в ОДИН scope, і кожна змінна тут з'їдала б спільний
+    # ліміт $MaximumVariableCount.
+    & {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Delta.psd1') -Force
+
+        # --- Delta/IdenticalGraphsProduceNoDifference ---
+        # Найважливіший інваріант інструменту: сервер, чий BRAVO.config
+        # побайтово збігається з дефолтами, мусить дати ПОРОЖНЮ дельту.
+        # Інакше міграція B5 перенесла б у site-файл копію дефолтів.
+        $deltaDefaults = Get-BRAVODefaultConfiguration
+        $deltaSame = Get-BRAVODefaultConfiguration
+        $deltaNone = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $deltaDefaults -CandidateConfiguration $deltaSame)
+        Test-BRAVOCondition `
+            -Condition ($deltaNone.Count -eq 0) `
+            -Name "Delta/IdenticalGraphsProduceNoDifference" `
+            -Failure "порівняння canonical defaults із самими собою має дати 0 відмінностей (отримано $($deltaNone.Count))"
+
+        # --- Delta/ChangedLeafReportedWithDotPath ---
+        $deltaReference = @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV'; StateRoot = 'C:\State' } }
+        $deltaCandidate = @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV_LIMS'; StateRoot = 'C:\State' } }
+        $deltaChanged = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $deltaReference -CandidateConfiguration $deltaCandidate)
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaChanged.Count -eq 1 -and
+                [string]$deltaChanged[0].Path -eq 'pathSettings.BackupRoot' -and
+                [string]$deltaChanged[0].Kind -eq 'Changed' -and
+                [string]$deltaChanged[0].CandidateValue -eq 'E:\ARCHIV_LIMS'
+            ) `
+            -Name "Delta/ChangedLeafReportedWithDotPath" `
+            -Failure "змінений лист має повертатись рівно один раз як Changed з dot-path 'pathSettings.BackupRoot'"
+
+        # --- Delta/StringComparisonIsCaseSensitive ---
+        # 'E:\ARCHIV' і 'e:\archiv' — та сама тека, але РІЗНИЙ site-запис:
+        # оператор мусить бачити, що на сервері значення записане інакше.
+        $deltaCaseChanged = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV' } } `
+            -CandidateConfiguration @{ pathSettings = @{ BackupRoot = 'e:\archiv' } })
+        Test-BRAVOCondition `
+            -Condition ($deltaCaseChanged.Count -eq 1) `
+            -Name "Delta/StringComparisonIsCaseSensitive" `
+            -Failure "різниця лише в регістрі рядка має бути ВИДИМОЮ відмінністю"
+
+        # --- Delta/ArrayComparedElementWiseNotFiltered ---
+        # Класична пастка Windows PowerShell 5.1: -eq з масивом ліворуч
+        # ФІЛЬТРУЄ й повертає підмножину замість булевого значення. Якби
+        # порівняння було через -eq, підмножина @('/E') проти @('/E','/R:3')
+        # дала б "рівні" й дельта мовчки загубила б site-значення.
+        $deltaArraySubset = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ robocopyOptions = @('/E', '/R:3') } `
+            -CandidateConfiguration @{ robocopyOptions = @('/E') })
+        $deltaArrayOrder = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ robocopyOptions = @('/E', '/R:3') } `
+            -CandidateConfiguration @{ robocopyOptions = @('/R:3', '/E') })
+        $deltaArrayEqual = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ robocopyOptions = @('/E', '/R:3') } `
+            -CandidateConfiguration @{ robocopyOptions = @('/E', '/R:3') })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaArraySubset.Count -eq 1 -and
+                $deltaArrayOrder.Count -eq 1 -and
+                $deltaArrayEqual.Count -eq 0
+            ) `
+            -Name "Delta/ArrayComparedElementWiseNotFiltered" `
+            -Failure "масиви мусять порівнюватись поелементно: підмножина й інший порядок = відмінність, ідентичний масив = ні (отримано $($deltaArraySubset.Count)/$($deltaArrayOrder.Count)/$($deltaArrayEqual.Count))"
+
+        # --- Delta/UnknownNestedKeyReportedAsOnlyInCandidate ---
+        # Саме ця гілка робить видимою знахідку F1 (#154): вкладений ключ,
+        # якого немає в канонічних дефолтах, сьогодні зливається МОВЧКИ.
+        $deltaUnknown = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV' } } `
+            -CandidateConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV'; LegacyRoot = 'D:\OLD' } })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaUnknown.Count -eq 1 -and
+                [string]$deltaUnknown[0].Path -eq 'pathSettings.LegacyRoot' -and
+                [string]$deltaUnknown[0].Kind -eq 'OnlyInCandidate'
+            ) `
+            -Name "Delta/UnknownNestedKeyReportedAsOnlyInCandidate" `
+            -Failure "невідомий канонічним дефолтам вкладений ключ має повертатись як OnlyInCandidate"
+
+        # --- Delta/UnknownNodeExpandedToLeafPaths ---
+        # Оператору потрібен конкретний dot-path, а не "десь у цьому блоці
+        # щось є": невідомий БЛОК розкривається до листів.
+        $deltaUnknownNode = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV' } } `
+            -CandidateConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV'; Legacy = @{ Root = 'D:\OLD'; Mode = 'Off' } } })
+        $deltaUnknownNodePaths = @($deltaUnknownNode | ForEach-Object { [string]$_.Path })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaUnknownNode.Count -eq 2 -and
+                $deltaUnknownNodePaths -contains 'pathSettings.Legacy.Mode' -and
+                $deltaUnknownNodePaths -contains 'pathSettings.Legacy.Root'
+            ) `
+            -Name "Delta/UnknownNodeExpandedToLeafPaths" `
+            -Failure "невідомий вкладений БЛОК має розкриватись до листових dot-path, а не повертатись одним вузлом"
+
+        # --- Delta/ShapeChangeReportedNotRecursed ---
+        $deltaShape = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ smbSettings = @{ RootPath = '' } } `
+            -CandidateConfiguration @{ smbSettings = 'ВИМКНЕНО' })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaShape.Count -eq 1 -and
+                [string]$deltaShape[0].Path -eq 'smbSettings' -and
+                [string]$deltaShape[0].Kind -eq 'Changed'
+            ) `
+            -Name "Delta/ShapeChangeReportedNotRecursed" `
+            -Failure "скаляр там, де еталон має блок, має повертатись одним Changed по шляху самого блоку"
+
+        # --- Delta/MissingInCandidateRequiresExplicitSwitch ---
+        # Для питання "що перевизначено на цьому сервері" відсутність ключа
+        # означає "діє дефолт", а не відмінність — інакше дельта містила б
+        # увесь канонічний граф.
+        $deltaMissingDefault = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV'; StateRoot = 'C:\State' } } `
+            -CandidateConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV' } })
+        $deltaMissingExplicit = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV'; StateRoot = 'C:\State' } } `
+            -CandidateConfiguration @{ pathSettings = @{ BackupRoot = 'E:\ARCHIV' } } `
+            -IncludeMissingInCandidate)
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaMissingDefault.Count -eq 0 -and
+                $deltaMissingExplicit.Count -eq 1 -and
+                [string]$deltaMissingExplicit[0].Kind -eq 'OnlyInReference' -and
+                [string]$deltaMissingExplicit[0].Path -eq 'pathSettings.StateRoot'
+            ) `
+            -Name "Delta/MissingInCandidateRequiresExplicitSwitch" `
+            -Failure "відсутній у кандидаті ключ має з'являтись ЛИШЕ з -IncludeMissingInCandidate"
+
+        # --- Delta/OutputOrderIsDeterministic ---
+        # Два прогони на тому самому сервері мусять давати однаковий вивід,
+        # інакше порівняти дельти між собою неможливо (порядок ключів
+        # hashtable у PowerShell не визначений).
+        $deltaOrderSource = @{ zebra = 'z'; alpha = 'a'; middle = 'm' }
+        $deltaOrderFirst = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration @{} -CandidateConfiguration $deltaOrderSource | ForEach-Object { [string]$_.Path })
+        $deltaOrderSecond = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration @{} -CandidateConfiguration $deltaOrderSource | ForEach-Object { [string]$_.Path })
+        Test-BRAVOCondition `
+            -Condition (
+                ([string]::Join('|', $deltaOrderFirst)) -eq 'alpha|middle|zebra' -and
+                ([string]::Join('|', $deltaOrderSecond)) -eq 'alpha|middle|zebra'
+            ) `
+            -Name "Delta/OutputOrderIsDeterministic" `
+            -Failure "вивід має бути відсортованим за Path і однаковим між прогонами (отримано '$([string]::Join('|', $deltaOrderFirst))')"
+
+        # --- Delta/SiteDeltaToolReusesCanonicalPrimaryReader ---
+        # Архітектурний guard: інструмент дельти НЕ сміє мати власної копії
+        # "виконати BRAVO.config і зібрати $global:" — це політика того, що
+        # комплект приймає від primary-шару, і вона має один екземпляр
+        # (Read-BRAVOLegacyPrimaryRawOverrides у BRAVO_CONFIG_LOADER.ps1).
+        $deltaToolPath = Join-Path $root 'deploy\Get-BRAVOConfigSiteDelta.ps1'
+        $deltaToolText = [IO.File]::ReadAllText($deltaToolPath, [Text.Encoding]::UTF8)
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaToolText.Contains('Read-BRAVOLegacyPrimaryRawOverrides') -and
+                -not $deltaToolText.Contains('[scriptblock]::Create')
+            ) `
+            -Name "Delta/SiteDeltaToolReusesCanonicalPrimaryReader" `
+            -Failure "deploy\Get-BRAVOConfigSiteDelta.ps1 мусить читати primary-шар через Read-BRAVOLegacyPrimaryRawOverrides і не містити власного [scriptblock]::Create"
+
+        # --- Delta/SiteDeltaToolNeverOverwrites ---
+        # Операторський інструмент на production-сервері: єдиний запис —
+        # явний -OutputPath, і наявний файл за ним не перезаписується.
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaToolText.Contains('уже існує — інструмент нічого не перезаписує') -and
+                ([regex]::Matches($deltaToolText, 'Set-Content').Count -eq 1)
+            ) `
+            -Name "Delta/SiteDeltaToolNeverOverwrites" `
+            -Failure "інструмент дельти мусить мати рівно один запис на диск (за -OutputPath) і відмовляти на наявному файлі"
+    }

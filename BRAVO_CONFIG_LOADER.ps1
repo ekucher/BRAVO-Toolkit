@@ -869,24 +869,28 @@ function Import-BravoSyntheticConfiguration {
         -UnknownLeafPathSink $UnknownLeafPathSink
 }
 
-function Import-BravoLegacyPrimaryConfiguration {
-    # P0 Configuration Foundation (PR C, Секція 3): BRAVO.config (legacy
-    # primary) виконується, але лише ЯК ДЖЕРЕЛО RAW-значень — файл більше
-    # НЕ викликає власний override-phase чи derivation (обидва видалені з
-    # самого BRAVO.config цим PR). Captured у $primaryRawOverrides ЛИШЕ
-    # ключі з canonical allowlist (Get-BRAVODefaultConfiguration.Keys) —
-    # жодного derived/невідомого $global:-значення (runtimeRoot,
-    # discoverySettings, operationLockSettings, archivePrefix, і будь-яке
-    # інше, обчислене derivation-резолвером) сюди НЕ потрапляє: ці поля
-    # canonical resolver перераховує ПІСЛЯ фінального merge, а не приймає
-    # від primary як необмежений вхід.
+function Read-BRAVOLegacyPrimaryRawOverrides {
+    # Canonical читач legacy primary-шару: виконує BRAVO.config ЛИШЕ як
+    # джерело raw-значень і повертає hashtable з ключами canonical
+    # allowlist (Get-BRAVODefaultConfiguration.Keys).
+    #
+    # Винесено з Import-BravoLegacyPrimaryConfiguration окремою функцією,
+    # бо цей самий крок потрібен і поза завантаженням конфігурації —
+    # інструменту дельти (deploy\Get-BRAVOConfigSiteDelta.ps1, #154 B0),
+    # який порівнює BRAVO.config сервера з canonical defaults. Дублювати
+    # [scriptblock]::Create + збирання $global: у другому місці не можна:
+    # це політика того, ЩО саме комплект приймає від primary-шару, і вона
+    # мусить лишатись в одному екземплярі.
+    #
+    # ПОБІЧНИЙ ЕФЕКТ (свідомий, наявна поведінка): виконання BRAVO.config
+    # створює $global:-змінні в поточному сеансі. Викликач, якому це
+    # небажано, мусить працювати в окремому процесі.
     [CmdletBinding()]
+    [OutputType([hashtable])]
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
         [Parameter(Mandatory = $true)][string]$ConfigRoot,
-        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
-        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides,
-        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot
     )
 
     $configurationModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
@@ -909,6 +913,34 @@ function Import-BravoLegacyPrimaryConfiguration {
             $primaryRawOverrides[$topLevelKey] = $legacyVariable.Value
         }
     }
+
+    return $primaryRawOverrides
+}
+
+function Import-BravoLegacyPrimaryConfiguration {
+    # P0 Configuration Foundation (PR C, Секція 3): BRAVO.config (legacy
+    # primary) виконується, але лише ЯК ДЖЕРЕЛО RAW-значень — файл більше
+    # НЕ викликає власний override-phase чи derivation (обидва видалені з
+    # самого BRAVO.config цим PR). Captured у $primaryRawOverrides ЛИШЕ
+    # ключі з canonical allowlist (Get-BRAVODefaultConfiguration.Keys) —
+    # жодного derived/невідомого $global:-значення (runtimeRoot,
+    # discoverySettings, operationLockSettings, archivePrefix, і будь-яке
+    # інше, обчислене derivation-резолвером) сюди НЕ потрапляє: ці поля
+    # canonical resolver перераховує ПІСЛЯ фінального merge, а не приймає
+    # від primary як необмежений вхід.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$ConfigPath,
+        [Parameter(Mandatory = $true)][string]$ConfigRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides,
+        [AllowNull()][System.Collections.Generic.List[string]]$UnknownLeafPathSink
+    )
+
+    $primaryRawOverrides = Read-BRAVOLegacyPrimaryRawOverrides `
+        -ConfigPath $ConfigPath `
+        -ConfigRoot $ConfigRoot `
+        -RuntimeRoot $RuntimeRoot
 
     Complete-BRAVOConfigurationLoad `
         -RuntimeRoot $RuntimeRoot `
