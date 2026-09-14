@@ -30,6 +30,40 @@
             ) `
             -Name "Documentation/SecurityMdCoversRequiredSections" `
             -Failure "SECURITY.md має покривати підтримувані версії, порядок повідомлення про вразливості, модель секретів/Tools/ACL і обмеження Credential Manager"
+
+        # Аудит 2026-09-14 (P1): SECURITY.md посилався на приватний
+        # репозиторій ekucher/ARCHIV_LIMS_MONOLITH і радив подавати
+        # вразливість через Issue. Репозиторій публічний з 2026-08-26
+        # (ROADMAP.md P0.2), тож та порада означала публічне розкриття
+        # вразливості до випуску виправлення. Застаріла ідентичність
+        # репозиторію в security-документі — не косметика: саме за нею
+        # дослідник обирає канал.
+        Test-BRAVOCondition `
+            -Condition (-not $securityDocText.Contains('ARCHIV_LIMS_MONOLITH')) `
+            -Name "Documentation/SecurityMdHasNoStaleRepositoryIdentity" `
+            -Failure "SECURITY.md не повинен посилатися на застарілий репозиторій ARCHIV_LIMS_MONOLITH — канонічна ідентичність: ekucher/BRAVO-Toolkit"
+        Test-BRAVOCondition `
+            -Condition ($securityDocText.Contains('ekucher/BRAVO-Toolkit')) `
+            -Name "Documentation/SecurityMdNamesCanonicalRepository" `
+            -Failure "SECURITY.md має називати канонічний репозиторій ekucher/BRAVO-Toolkit"
+        Test-BRAVOCondition `
+            -Condition (
+                $securityDocText.Contains('Private Vulnerability Reporting') -and
+                $securityDocText.Contains('Не подавайте вразливість через Issue')
+            ) `
+            -Name "Documentation/SecurityMdRequiresPrivateDisclosureChannel" `
+            -Failure "SECURITY.md має називати приватний канал (GitHub Private Vulnerability Reporting) основним і прямо забороняти подання вразливості через публічний Issue"
+        # Формулювання-пастка: будь-яка порада "подавайте Issue" у
+        # security-документі публічного репозиторію означає публічне
+        # розкриття. Перевіряємо саме заклик до дії, а не будь-яку згадку
+        # слова Issue (розділ вище свідомо пояснює, ЧОМУ Issue не можна).
+        Test-BRAVOCondition `
+            -Condition (-not [regex]::IsMatch(
+                $securityDocText,
+                '(?i)подавайте\s+(вразливість\s+)?Issue'
+            )) `
+            -Name "Documentation/SecurityMdNeverAdvisesPublicIssueDisclosure" `
+            -Failure "SECURITY.md не повинен радити подавати вразливість через Issue — репозиторій публічний, це розкриття до випуску виправлення"
     }
 
     # Аудит P1 (PSScriptAnalyzer майже не блокує небезпечні патерни):
@@ -207,6 +241,33 @@
             ) `
             -Name "Documentation/ReleasePolicyCoversVersionModel" `
             -Failure "RELEASE_POLICY.md має описувати prerelease-формати (dev/rc), releaseChannel, правило ModuleVersion і CI-gate ci\Test-BRAVOReleasePolicy.ps1"
+
+        # Паритет-harness конфігурації: політика мусить називати його
+        # обов'язковим кроком для змін конфігураційного пайплайна. Без
+        # цього єдиний доказ збереження повного графа $global: лишається
+        # інструментом, про який ніхто не знає (знахідка F4 аудиту
+        # 2026-09-14, задача A4 у #154).
+        Test-BRAVOCondition `
+            -Condition (
+                $releasePolicyText.Contains('ci\Test-BRAVOConfigFoundationParity.ps1') -and
+                $releasePolicyText.Contains('BRAVO_CONFIG_LOADER.ps1')
+            ) `
+            -Name "Documentation/ReleasePolicyRequiresConfigParityHarness" `
+            -Failure "RELEASE_POLICY.md має називати ci\Test-BRAVOConfigFoundationParity.ps1 обов'язковим кроком для PR, що змінюють конфігураційний пайплайн (BRAVO_CONFIG_LOADER.ps1 та ін.)"
+    }
+
+    # Дефолтна база harness-а мусить бути НЕЗМІННИМ комітом, а не іменем
+    # гілки: гілку feature/config-foundation-derivation уже влито, і
+    # прибирання стале гілок мовчки зламало б інструмент. Перевіряється
+    # саме форма дефолту, бо це єдине, що governance може довести без git.
+    $parityHarnessPath = Join-Path $root "ci\Test-BRAVOConfigFoundationParity.ps1"
+    if (Test-Path -LiteralPath $parityHarnessPath -PathType Leaf) {
+        $parityHarnessText = [IO.File]::ReadAllText($parityHarnessPath, [Text.Encoding]::UTF8)
+        $parityBaseRefMatch = [regex]::Match($parityHarnessText, '\[string\]\$BaseRef\s*=\s*''([^'']*)''')
+        Test-BRAVOCondition `
+            -Condition ($parityBaseRefMatch.Success -and $parityBaseRefMatch.Groups[1].Value -match '^[0-9a-f]{40}$') `
+            -Name "Governance/ConfigParityHarnessBaseRefIsImmutableCommit" `
+            -Failure "дефолтний -BaseRef у ci\Test-BRAVOConfigFoundationParity.ps1 має бути повним SHA-1 коміта, а не іменем гілки (гілку може видалити прибирання стале гілок); отримано: '$(if ($parityBaseRefMatch.Success) { $parityBaseRefMatch.Groups[1].Value } else { '<не знайдено>' })'"
     }
 
     # Політика, яку ніхто не перевіряє механічно, тримається лише на
