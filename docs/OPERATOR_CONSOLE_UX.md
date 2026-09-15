@@ -316,6 +316,15 @@ Production-операції не виконувались.
 
 Setup має wizard/stage-oriented UX. Детальний discovery-блок доречний саме тут.
 
+Блок `PRESENCE КОМПОНЕНТІВ` показує стан кожного компонента за контрактом
+`Present` / `Absent` / `Ambiguous` / `Error` (див. `Components` у результаті
+`Resolve-BRAVOInstallationDiscovery`). Він існує саме тому, що порожнє поле
+шляху не розрізняє «джерела немає» і «не вдалося дізнатись, чи воно є».
+Рядок з причиною друкується лише для непозитивних станів — для `Present`
+та сама причина вже стоїть поруч зі шляхом у блоці `DISCOVERY`. Кольори
+тут не декоративні: `Ambiguous` і `Error` зобов'язані виглядати інакше, ніж
+`Absent`, бо це різні дії оператора.
+
 ```text
 ============================================================
  BRAVO Setup <packageVersion>
@@ -341,6 +350,16 @@ BLOG:             D:\LIMS\BLOG
 BRAVOEXCH:        D:\LIMS\bravoexch
 BAZA_APP:         D:\LIMS\BAZA
 BAZA_WWW:         C:\Br-a-vo.web\www\BAZA
+
+ PRESENCE КОМПОНЕНТІВ
+  BRAVO_ROOT  Present    ServiceDiscovery
+  MODEL       Present    BravoIni
+  BLOG        Present    BravoIni
+  BRAVOEXCH   Absent     None
+               у canonical bravo.ini немає непорожнього ключа [model] BEXCH
+  BAZA_APP    Present    BravoIni
+  WEB_ROOT    Present    ServiceDiscovery
+  BAZA_WWW    Present    ApacheConfig
 
 Дрейф baseline:  НЕ ВИЯВЛЕНО
 ------------------------------------------------------------

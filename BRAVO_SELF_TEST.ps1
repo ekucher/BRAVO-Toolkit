@@ -10503,6 +10503,231 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             -Name "Discovery/TestBRAVOBazaWwwInstallationZeroOneManyEntries" `
             -Failure "Test-BRAVOBazaWwwInstallation має відхиляти відсутній і порожній каталог, приймати непорожній реальний каталог"
 
+        # === #158 (етап 2): presence-контракт для ВСІХ компонентів ===
+        # Власний ізольований root і власний try/finally: матриця має бути
+        # незалежною від фікстур BAZA_WWW вище (спільний $discoveryTestRoot
+        # навмисно НЕ створює каталоги MODEL/BLOG/BEXCH на диску, і саме це
+        # робить його непридатним для перевірки Present).
+        & {
+            $presenceRoot = Join-Path `
+                -Path ([IO.Path]::GetTempPath()) `
+                -ChildPath ("BRAVO_PRESENCE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+            try {
+                [void][IO.Directory]::CreateDirectory($presenceRoot)
+                $presenceInstallRoot = Join-Path $presenceRoot "install"
+                [void][IO.Directory]::CreateDirectory($presenceInstallRoot)
+
+                function New-BRAVOPresenceFixtureDirectory {
+                    param([string]$Path, [switch]$Empty)
+                    [void][IO.Directory]::CreateDirectory($Path)
+                    if (-not $Empty) {
+                        [IO.File]::WriteAllText((Join-Path $Path 'fixture.txt'), 'x', (New-Object Text.UTF8Encoding($false)))
+                    }
+                    return $Path
+                }
+
+                # Present-кандидати: реальні НЕПОРОЖНІ каталоги.
+                $presenceModelDir = New-BRAVOPresenceFixtureDirectory -Path (Join-Path $presenceInstallRoot "Model")
+                $presenceBlogDir = New-BRAVOPresenceFixtureDirectory -Path (Join-Path $presenceInstallRoot "BLOG")
+                [void](New-BRAVOPresenceFixtureDirectory -Path (Join-Path $presenceInstallRoot "BAZA"))
+                # Stale-кандидат: каталог існує, але порожній — сам факт
+                # наявності каталогу з правильною назвою НЕ робить Present.
+                $presenceStaleExchDir = New-BRAVOPresenceFixtureDirectory -Path (Join-Path $presenceInstallRoot "bravoexch") -Empty
+                $presenceBravoExePath = Join-Path $presenceInstallRoot "bravo.exe"
+                [IO.File]::WriteAllText($presenceBravoExePath, "stub")
+
+                $presenceSystemRoot = Join-Path $presenceRoot "FixtureWindows"
+                $presenceIniPath = Join-Path $presenceSystemRoot "SysWOW64\bravo.ini"
+                [void][IO.Directory]::CreateDirectory((Split-Path -Path $presenceIniPath -Parent))
+                [IO.File]::WriteAllLines($presenceIniPath, @(
+                    '[model]',
+                    ("MODEL={0}" -f (Join-Path $presenceModelDir "lims")),
+                    ("BLOG={0}\" -f $presenceBlogDir),
+                    ("BEXCH={0}" -f $presenceStaleExchDir)
+                ))
+
+                $presenceServices = @(
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $presenceBravoExePath) }
+                )
+
+                $presenceHappy = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $presenceInstallRoot `
+                    -BravoServiceName "BRAVO" `
+                    -WebServiceCandidates @("Apache2.4") `
+                    -Services $presenceServices `
+                    -SystemRoot $presenceSystemRoot `
+                    -Is64BitOperatingSystem $true
+
+                # Спільна структура результату — однакова для всіх
+                # компонентів, а не окрема модель на кожен.
+                $presenceExpectedComponents = @('BRAVO_ROOT', 'MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA_APP', 'WEB_ROOT', 'BAZA_WWW')
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceHappy.PSObject.Properties['Components'] -and
+                        $presenceHappy.Components -is [System.Collections.IDictionary] -and
+                        @($presenceExpectedComponents | Where-Object { -not $presenceHappy.Components.Contains($_) }).Count -eq 0 -and
+                        @(@($presenceHappy.Components.Keys) | Where-Object {
+                            $entry = $presenceHappy.Components[$_]
+                            -not ($entry.PSObject.Properties['Component'] -and
+                                $entry.PSObject.Properties['Presence'] -and
+                                $entry.PSObject.Properties['Source'] -and
+                                $entry.PSObject.Properties['Path'] -and
+                                $entry.PSObject.Properties['Reason'])
+                        }).Count -eq 0
+                    ) `
+                    -Name "Discovery/PresenceContractSharedShapeForAllComponents" `
+                    -Failure "Resolve-BRAVOInstallationDiscovery має повертати Components з однаковою структурою {Component;Presence;Source;Path;Reason} для кожного з: $($presenceExpectedComponents -join ', ')"
+
+                # Present -> Present (і Path заповнений лише тут).
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceHappy.Components['MODEL'].Presence -eq 'Present' -and
+                        $presenceHappy.Components['MODEL'].Source -eq 'BravoIni' -and
+                        $presenceHappy.Components['MODEL'].Path -eq $presenceModelDir -and
+                        $presenceHappy.Components['BLOG'].Presence -eq 'Present' -and
+                        $presenceHappy.Components['BLOG'].Path -eq $presenceBlogDir -and
+                        $presenceHappy.Components['BAZA_APP'].Presence -eq 'Present' -and
+                        $presenceHappy.Components['BAZA_APP'].Path -eq (Join-Path $presenceInstallRoot "BAZA") -and
+                        $presenceHappy.Components['BRAVO_ROOT'].Presence -eq 'Present' -and
+                        $presenceHappy.Components['BRAVO_ROOT'].Source -eq 'ServiceDiscovery'
+                    ) `
+                    -Name "Discovery/PresenceContractConfirmedSourcesArePresent" `
+                    -Failure "підтверджені однозначні джерела (bravo.ini + реальні непорожні каталоги, однозначна служба BRAVO) мають давати Presence='Present' з непорожнім Path"
+
+                # stale directory alone does not imply Present: BEXCH
+                # оголошений у bravo.ini, каталог існує, але порожній.
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceHappy.Components['BRAVOEXCH'].Presence -eq 'Absent' -and
+                        $null -eq $presenceHappy.Components['BRAVOEXCH'].Path -and
+                        (Test-Path -LiteralPath $presenceStaleExchDir -PathType Container)
+                    ) `
+                    -Name "Discovery/PresenceContractStaleDirectoryIsNotPresent" `
+                    -Failure "порожній каталог із правильною назвою (stale directory) НЕ має давати Presence='Present' — лише 'Absent' з порожнім Path"
+
+                # confirmed absence -> Absent: bravo.ini читається, ключа
+                # BEXCH у ньому немає взагалі.
+                $presenceNoKeySystemRoot = Join-Path $presenceRoot "FixtureWindowsNoBexch"
+                $presenceNoKeyIniPath = Join-Path $presenceNoKeySystemRoot "SysWOW64\bravo.ini"
+                [void][IO.Directory]::CreateDirectory((Split-Path -Path $presenceNoKeyIniPath -Parent))
+                [IO.File]::WriteAllLines($presenceNoKeyIniPath, @(
+                    '[model]',
+                    ("MODEL={0}" -f (Join-Path $presenceModelDir "lims"))
+                ))
+                $presenceNoKey = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $presenceInstallRoot `
+                    -BravoServiceName "BRAVO" `
+                    -WebServiceCandidates @("Apache2.4") `
+                    -Services $presenceServices `
+                    -SystemRoot $presenceNoKeySystemRoot `
+                    -Is64BitOperatingSystem $true
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceNoKey.Components['BRAVOEXCH'].Presence -eq 'Absent' -and
+                        $presenceNoKey.Components['BRAVOEXCH'].Source -eq 'None' -and
+                        $null -eq $presenceNoKey.Components['BRAVOEXCH'].Path -and
+                        $presenceNoKey.Components['MODEL'].Presence -eq 'Present'
+                    ) `
+                    -Name "Discovery/PresenceContractMissingIniKeyIsAbsentNotError" `
+                    -Failure "доступний canonical bravo.ini без ключа компонента — це достовірна відсутність (Presence='Absent', Source='None'), а не помилка провайдера"
+
+                # multiple candidates -> Ambiguous (і НЕ 'перший знайдений'),
+                # provider failure -> Error: bravo.ini недоступний, тому
+                # єдиним джерелом лишається служба, а служб дві з різними
+                # виконуваними файлами.
+                $presenceSecondBravoExe = Join-Path (New-BRAVOPresenceFixtureDirectory -Path (Join-Path $presenceRoot "second-install")) "bravo.exe"
+                [IO.File]::WriteAllText($presenceSecondBravoExe, "stub")
+                $presenceAmbiguousServices = @(
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $presenceBravoExePath) },
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Server"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $presenceSecondBravoExe) }
+                )
+                $presenceAmbiguous = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $presenceInstallRoot `
+                    -BravoServiceName "BRAVO" `
+                    -WebServiceCandidates @("Apache2.4") `
+                    -Services $presenceAmbiguousServices `
+                    -SystemRoot (Join-Path $presenceRoot "NoSuchSystemRoot") `
+                    -Is64BitOperatingSystem $true
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceAmbiguous.Components['BRAVO_ROOT'].Presence -eq 'Ambiguous' -and
+                        $null -eq $presenceAmbiguous.Components['BRAVO_ROOT'].Path -and
+                        $presenceAmbiguous.Components['BAZA_APP'].Presence -eq 'Ambiguous' -and
+                        $null -eq $presenceAmbiguous.Components['BAZA_APP'].Path -and
+                        -not [string]::IsNullOrWhiteSpace([string]$presenceAmbiguous.BRAVO_ROOT)
+                    ) `
+                    -Name "Discovery/PresenceContractMultipleCandidatesAreAmbiguousNotFirst" `
+                    -Failure "кілька служб BRAVO з різними виконуваними файлами мають давати Presence='Ambiguous' з порожнім Path для BRAVO_ROOT і BAZA_APP — навіть попри те, що сире поле BRAVO_ROOT для діагностики і далі показує перший варіант"
+
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceAmbiguous.Components['MODEL'].Presence -eq 'Error' -and
+                        $presenceAmbiguous.Components['BLOG'].Presence -eq 'Error' -and
+                        $presenceAmbiguous.Components['BRAVOEXCH'].Presence -eq 'Error' -and
+                        $null -eq $presenceAmbiguous.Components['MODEL'].Path
+                    ) `
+                    -Name "Discovery/PresenceContractProviderFailureIsErrorNotAbsent" `
+                    -Failure "недоступний canonical bravo.ini — це відмова провайдера discovery: MODEL/BLOG/BRAVOEXCH мають отримати Presence='Error', а НЕ 'Absent'"
+
+                # Явний override з невалідним шляхом — fail-closed Error без
+                # мовчазного fallback на робоче значення з bravo.ini.
+                $presenceInvalidOverride = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $presenceInstallRoot `
+                    -BravoServiceName "BRAVO" `
+                    -WebServiceCandidates @("Apache2.4") `
+                    -Services $presenceServices `
+                    -SystemRoot $presenceSystemRoot `
+                    -Is64BitOperatingSystem $true `
+                    -DiscoverySettings @{ Sources = @{ MODEL = (Join-Path $presenceRoot "NoSuchOverrideModel") } }
+                Test-BRAVOCondition `
+                    -Condition (
+                        $presenceInvalidOverride.Components['MODEL'].Presence -eq 'Error' -and
+                        $presenceInvalidOverride.Components['MODEL'].Source -eq 'ExplicitOverride' -and
+                        $null -eq $presenceInvalidOverride.Components['MODEL'].Path
+                    ) `
+                    -Name "Discovery/PresenceContractInvalidExplicitOverrideIsErrorNotFallback" `
+                    -Failure "явний discoverySettings.Sources.MODEL на неіснуючий каталог має давати Presence='Error' — без мовчазного fallback на значення з bravo.ini"
+
+                # Інваріант, який має триматись у КОЖНОМУ сценарії:
+                # непорожній Path існує виключно у стані Present.
+                $presenceAllResults = @($presenceHappy, $presenceNoKey, $presenceAmbiguous, $presenceInvalidOverride)
+                $presencePathLeaks = @($presenceAllResults | ForEach-Object {
+                    $currentResult = $_
+                    @($currentResult.Components.Keys) | Where-Object {
+                        $entry = $currentResult.Components[$_]
+                        ($entry.Presence -ne 'Present') -and (-not [string]::IsNullOrWhiteSpace([string]$entry.Path))
+                    }
+                })
+                Test-BRAVOCondition `
+                    -Condition ($presencePathLeaks.Count -eq 0) `
+                    -Name "Discovery/PresenceContractPathOnlyForPresent" `
+                    -Failure "Ambiguous/Error/Absent не мають права нести непорожній Path (інваріанти 'Ambiguous != Present' і 'Error != Absent' мають бути механічними, а не текстовими): $($presencePathLeaks -join ', ')"
+
+                # BAZA_WWW не отримує другої, несумісної моделі presence:
+                # Components лише віддзеркалює вже перевірений ланцюг.
+                Test-BRAVOCondition `
+                    -Condition (
+                        @($presenceAllResults | Where-Object {
+                            [string]$_.Components['BAZA_WWW'].Presence -ne [string]$_.BAZA_WWW_Presence -or
+                            [string]$_.Components['BAZA_WWW'].Source -ne [string]$_.BAZA_WWW_Source
+                        }).Count -eq 0
+                    ) `
+                    -Name "Discovery/PresenceContractBazaWwwMirrorsLegacyFields" `
+                    -Failure "Components['BAZA_WWW'] має точно віддзеркалювати BAZA_WWW_Presence/BAZA_WWW_Source, а не обчислювати другу, окрему модель presence"
+            } finally {
+                Remove-Item -LiteralPath $presenceRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Оператор мусить бачити presence-стан у BRAVO_SETUP.ps1
+        # -Action Test -ValidateOnly, інакше Ambiguous/Error виглядають
+        # як звичайна відсутність компонента.
+        $setupTextForPresence = Get-Content -LiteralPath (Join-Path $root "BRAVO_SETUP.ps1") -Raw -Encoding UTF8
+        Test-BRAVOCondition `
+            -Condition ($setupTextForPresence.Contains('Write-BRAVODiscoveryPresenceReport')) `
+            -Name "Discovery/PresenceContractShownBySetupValidateOnly" `
+            -Failure "BRAVO_SETUP.ps1 має виводити presence-стан компонентів через Write-BRAVODiscoveryPresenceReport"
+
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
         # структурно валідний (реальний, непорожній <DocumentRoot>\BAZA) —
