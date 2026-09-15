@@ -2,6 +2,52 @@
 
 ## Не випущено (developer)
 
+- **Presence-контракт поширено на всі компоненти (#158, етап 2)** —
+  `Resolve-BRAVOInstallationDiscovery` повертає нове поле `Components`:
+  по одному запису `{Component; Presence; Source; Path; Reason}` для
+  `BRAVO_ROOT`, `MODEL`, `BLOG`, `BRAVOEXCH`, `BAZA_APP`, `WEB_ROOT`,
+  `BAZA_WWW`. Стани ті самі, що вже діяли для `BAZA_WWW`:
+  `Present` / `Absent` / `Ambiguous` / `Error`.
+
+  **Що це лагодить.** Доти «джерела немає» і «не вдалося дізнатись, чи
+  воно є» виглядали для оператора однаково — порожнім полем. Тепер
+  недоступний canonical `bravo.ini` дає компонентам `MODEL`/`BLOG`/
+  `BRAVOEXCH` стан `Error` (відмова провайдера), а доступний `bravo.ini`
+  без відповідного ключа — `Absent` (достовірна відсутність). Кілька
+  служб BRAVO з різними виконуваними файлами дають `BRAVO_ROOT` і
+  `BAZA_APP` стан `Ambiguous`, а не мовчазний вибір першої служби.
+
+  **Інваріанти забезпечено механічно, а не текстом коментаря.**
+  `Path` непорожній ЛИШЕ у стані `Present`, тому `Ambiguous`/`Error`
+  неможливо випадково спожити як підтверджене джерело; `ValidateSet` не
+  дає з'явитись стану поза контрактом. Явний
+  `discoverySettings.Sources.*` на неіснуючий каталог лишається `Error`
+  без мовчазного fallback на автоматичне виявлення.
+
+  Перелік служб Windows тепер читається **рівно один раз** у самому
+  `Resolve-BRAVOInstallationDiscovery`: доти `Find-BRAVOServiceByCandidates`
+  повертав порожній список і коли служб справді немає, і коли WMI-запит
+  упав, тож відмова провайдера була невідрізнима від відсутності
+  компонента. Тепер вона дає `Error`.
+
+  Структурна перевірка каталогу-кандидата винесена у канонічну
+  `Test-BRAVODiscoverySourceDirectory`; `Test-BRAVOBazaWwwInstallation`
+  лишається BAZA_WWW-специфічною обгорткою над нею (без другої
+  реалізації). Сирі поля (`*_SOURCE`, `BAZA_APP`, `BRAVO_ROOT`,
+  `WEB_ROOT`, `BAZA_WWW`, `BAZA_WWW_Presence`, `BAZA_WWW_Source`) не
+  змінені — наявні споживачі працюють як раніше.
+
+  `BRAVO_SETUP.ps1 -Action Test -ValidateOnly` друкує блок
+  `PRESENCE КОМПОНЕНТІВ` (форматування належить `BRAVO.Discovery` як
+  власнику контракту, entrypoint лишається оркестрацією). Правила
+  enable/disable на цьому етапі свідомо не змінені — fail-closed
+  споживання baseline заплановане на етап 3.
+
+  Покриття: 9 регресій `Discovery/PresenceContract*`, серед них
+  `MultipleCandidatesAreAmbiguousNotFirst`,
+  `ProviderFailureIsErrorNotAbsent`, `StaleDirectoryIsNotPresent`,
+  `PathOnlyForPresent` і `BazaWwwMirrorsLegacyFields`.
+
 - **Discovery baseline переїхав у машинний стан (#158, етап 1)** —
   canonical розташування тепер
   `%ProgramData%\BRAVO\State\DISCOVERY_BASELINE.json` замість

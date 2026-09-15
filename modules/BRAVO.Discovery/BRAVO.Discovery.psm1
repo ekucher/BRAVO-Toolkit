@@ -332,6 +332,43 @@ function Get-BRAVOApacheDocumentRoot {
     return $null
 }
 
+function Test-BRAVODiscoverySourceDirectory {
+    # Канонічна структурна перевірка каталогу-кандидата для БУДЬ-ЯКОГО
+    # компонента discovery (#158, етап 2). Раніше рівно ця логіка існувала
+    # тільки всередині Test-BRAVOBazaWwwInstallation; presence-контракт
+    # решти компонентів потребує саме її, тому реалізація лишається одна,
+    # а BAZA_WWW-специфічна обгортка стоїть над нею (без copy/paste).
+    #
+    # Сигнал навмисно мінімальний, generic і недеструктивний: каталог
+    # існує, є РЕАЛЬНИМ каталогом (не reparse point/symlink — той самий
+    # клас перевірки, що вже застосовується для BRAVO.DataRestore
+    # live-source, аби уникнути path-traversal через підмінений каталог)
+    # і НЕ порожній. Порожній чи відсутній каталог з правильною назвою —
+    # законний привід лишитись Absent, а не Present з помилковими даними.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
+        # Лише для тексту Reason: "не схожий на реальну інсталяцію X".
+        [string]$ComponentLabel = 'компонента'
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path)) {
+        return [pscustomobject]@{ Valid = $false; Reason = "шлях не задано" }
+    }
+    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if ($null -eq $item -or -not $item.PSIsContainer) {
+        return [pscustomobject]@{ Valid = $false; Reason = "каталог не існує: $Path" }
+    }
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        return [pscustomobject]@{ Valid = $false; Reason = "каталог є reparse point/symlink — небезпечно приймати без ручної перевірки: $Path" }
+    }
+    $hasEntries = $null -ne (Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
+    if (-not $hasEntries) {
+        return [pscustomobject]@{ Valid = $false; Reason = "каталог порожній (не схожий на реальну інсталяцію $ComponentLabel): $Path" }
+    }
+    return [pscustomobject]@{ Valid = $true; Reason = $null }
+}
+
 function Test-BRAVOBazaWwwInstallation {
     # Структурна перевірка кандидата BAZA_WWW: сам факт наявності Apache
     # (навіть з дійсним DocumentRoot) ще НЕ означає, що BAZA_WWW присутній —
@@ -353,21 +390,7 @@ function Test-BRAVOBazaWwwInstallation {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    if ([string]::IsNullOrWhiteSpace($Path)) {
-        return [pscustomobject]@{ Valid = $false; Reason = "шлях не задано" }
-    }
-    $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-    if ($null -eq $item -or -not $item.PSIsContainer) {
-        return [pscustomobject]@{ Valid = $false; Reason = "каталог не існує: $Path" }
-    }
-    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        return [pscustomobject]@{ Valid = $false; Reason = "каталог є reparse point/symlink — небезпечно приймати без ручної перевірки: $Path" }
-    }
-    $hasEntries = $null -ne (Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue | Select-Object -First 1)
-    if (-not $hasEntries) {
-        return [pscustomobject]@{ Valid = $false; Reason = "каталог порожній (не схожий на реальну інсталяцію BAZA_WWW): $Path" }
-    }
-    return [pscustomobject]@{ Valid = $true; Reason = $null }
+    return Test-BRAVODiscoverySourceDirectory -Path $Path -ComponentLabel 'BAZA_WWW'
 }
 
 function Get-BRAVOSystemDirectoryPath {
@@ -431,6 +454,81 @@ function Get-BRAVOSystemRangeIdLogPath {
     return Join-Path $systemDirectory 'range_id_log.json'
 }
 
+function New-BRAVODiscoveryComponentPresence {
+    # Спільна структура presence-результату для всіх компонентів
+    # (#158, етап 2). Модель узагальнює те, що вже діяло для BAZA_WWW:
+    #
+    #   Present   — є однозначне підтверджене джерело;
+    #   Absent    — джерело достовірно відсутнє;
+    #   Ambiguous — кілька правдоподібних джерел (ніколи не "беремо перше");
+    #   Error     — стан НЕ визначено через технічну відмову discovery.
+    #
+    # Інваріанти, які тут забезпечуються механічно, а не домовленістю:
+    # Path непорожній ЛИШЕ для Present (тому Ambiguous/Error неможливо
+    # випадково спожити як Present), а ValidateSet не дає з'явитись
+    # четвертому-п'ятому стану поза контрактом.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Present', 'Absent', 'Ambiguous', 'Error')]
+        [string]$Presence,
+        [string]$Source = 'None',
+        [string]$Path,
+        [string]$Reason
+    )
+
+    return [pscustomobject]@{
+        Component = $Component
+        Presence = $Presence
+        Source = $Source
+        Path = $(if ($Presence -eq 'Present' -and -not [string]::IsNullOrWhiteSpace($Path)) { $Path } else { $null })
+        Reason = $Reason
+    }
+}
+
+function Resolve-BRAVODiscoveryPathComponentPresence {
+    # Presence для компонента, чиє значення — каталог-кандидат. Семантика
+    # взята з уже перевіреної поведінки BAZA_WWW і лише узагальнена:
+    #
+    #   явний override + непідтверджений шлях -> Error
+    #       (оператор задав шлях свідомо; хибне явне значення — це
+    #        помилка конфігурації, і мовчазний fallback на auto-discovery
+    #        заборонений);
+    #   auto-discovery + непідтверджений шлях -> Absent
+    #       (джерело просто не встановлене за цим шляхом — це не поломка
+    #        механізму discovery).
+    #
+    # Сам факт наявності каталогу з правильною назвою Present не робить:
+    # структурну перевірку виконує Test-BRAVODiscoverySourceDirectory.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [AllowEmptyString()][string]$Path,
+        [Parameter(Mandatory = $true)][string]$Source,
+        [string]$Reason
+    )
+
+    $isExplicit = ($Source -eq 'ExplicitOverride')
+    $failurePresence = $(if ($isExplicit) { 'Error' } else { 'Absent' })
+
+    if (-not (Test-BRAVOAbsolutePath -Path $Path)) {
+        return New-BRAVODiscoveryComponentPresence -Component $Component `
+            -Presence $failurePresence -Source $Source `
+            -Reason "$Reason [шлях не є absolute: '$Path']"
+    }
+
+    $structural = Test-BRAVODiscoverySourceDirectory -Path $Path -ComponentLabel $Component
+    if (-not $structural.Valid) {
+        return New-BRAVODiscoveryComponentPresence -Component $Component `
+            -Presence $failurePresence -Source $Source `
+            -Reason "$Reason [$($structural.Reason)]"
+    }
+
+    return New-BRAVODiscoveryComponentPresence -Component $Component `
+        -Presence 'Present' -Source $Source -Path $Path -Reason $Reason
+}
+
 function Resolve-BRAVOInstallationDiscovery {
     # Пріоритетний ланцюг (аудит/ТЗ CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md):
     # 1. CLI-параметри runtime-скриптів — не реалізовано в цій ітерації.
@@ -489,6 +587,30 @@ function Resolve-BRAVOInstallationDiscovery {
         $normalizedDiscoverySettings.Sources
     } else {
         @{}
+    }
+
+    # #158 (етап 2): перелік служб Windows читаємо РІВНО ОДИН раз і саме
+    # тут. Причина не продуктивність: Find-BRAVOServiceByCandidates
+    # повертає @() і коли служб справді немає, і коли сам WMI-запит упав,
+    # тому presence-контракт не міг відрізнити "компонента немає" від
+    # "провайдер discovery не відповів". Відмова провайдера має давати
+    # Error, а не Absent (fail-closed). Коли -Services передано явно
+    # (self-test), нічого не перелічуємо — поведінка незмінна.
+    $serviceEnumerationFailed = $false
+    $serviceEnumerationError = $null
+    if ($null -eq $Services) {
+        try {
+            $Services = @(
+                Get-BRAVOWmiInstance -ClassName Win32_Service |
+                    Where-Object {
+                        -not [string]::IsNullOrWhiteSpace([string]$_.PathName)
+                    }
+            )
+        } catch {
+            $serviceEnumerationFailed = $true
+            $serviceEnumerationError = $_.Exception.Message
+            $Services = @()
+        }
     }
 
     # --- BRAVO_ROOT і bravo.ini ---
@@ -902,6 +1024,12 @@ function Resolve-BRAVOInstallationDiscovery {
         # відсутність компонента.
         $bazaWwwPresence = 'Error'
         $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: $documentRootReason" }
+    } elseif ($serviceEnumerationFailed) {
+        # #158 (етап 2): Apache-службу не знайдено ЛИШЕ тому, що перелік
+        # служб Windows узагалі не вдалося прочитати. Відмова провайдера
+        # discovery — це Error, а не підтверджена відсутність компонента.
+        $bazaWwwPresence = 'Error'
+        $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: перелік служб Windows недоступний ($serviceEnumerationError)" }
     } else {
         $bazaWwwPresence = 'Absent'
         $bazaWwwResolved = [pscustomobject]@{ Value = $null; Reason = "BAZA_WWW не визначено: $documentRootReason" }
@@ -916,6 +1044,130 @@ function Resolve-BRAVOInstallationDiscovery {
     }
 
     $allServices = @($bravoServices) + @($webServices) + @($exchangeApiServices)
+
+    # --- Presence-контракт для всіх компонентів (#158, етап 2) ---
+    # Узагальнення моделі, що вже діяла для BAZA_WWW, на решту
+    # компонентів: кожен отримує явний стан Present/Absent/Ambiguous/Error
+    # з тими самими назвами полів і тією самою семантикою Reason. Це
+    # ДІАГНОСТИЧНИЙ результат: правила enable/disable
+    # (Test-BRAVODiscoveryResult) тут свідомо НЕ змінюються — fail-closed
+    # споживання baseline — це етап 3. Сирі поля (*_SOURCE, BAZA_APP,
+    # BRAVO_ROOT, WEB_ROOT) лишаються незмінними для наявних споживачів.
+    $bravoRootIsExplicit = $overrides.Contains('BravoRoot')
+    $webRootIsExplicit = $overrides.Contains('WebRoot')
+
+    function Resolve-BRAVOIniComponentPresence {
+        # MODEL/BLOG/BRAVOEXCH мають один і той самий провайдер (canonical
+        # bravo.ini) і тому одну й ту саму таблицю станів:
+        #   явний override            -> Present/Error за шляхом;
+        #   ключ у bravo.ini          -> Present/Absent за шляхом;
+        #   bravo.ini читається, ключа немає -> Absent (достовірна
+        #       відсутність: інсталяція не оголошує цей компонент);
+        #   bravo.ini недоступний     -> Error (провайдер не відповів,
+        #       це НЕ підтверджена відсутність).
+        param(
+            [string]$Component,
+            [object]$Resolved
+        )
+
+        if ($overrides.Contains($Component)) {
+            return Resolve-BRAVODiscoveryPathComponentPresence -Component $Component `
+                -Path ([string]$Resolved.Value) -Source 'ExplicitOverride' -Reason ([string]$Resolved.Reason)
+        }
+        if (-not [string]::IsNullOrWhiteSpace([string]$Resolved.Value)) {
+            return Resolve-BRAVODiscoveryPathComponentPresence -Component $Component `
+                -Path ([string]$Resolved.Value) -Source 'BravoIni' -Reason ([string]$Resolved.Reason)
+        }
+        if ($null -eq $iniData) {
+            return New-BRAVODiscoveryComponentPresence -Component $Component `
+                -Presence 'Error' -Source 'None' -Reason ([string]$Resolved.Reason)
+        }
+        return New-BRAVODiscoveryComponentPresence -Component $Component `
+            -Presence 'Absent' -Source 'None' -Reason ([string]$Resolved.Reason)
+    }
+
+    $components = [ordered]@{}
+
+    $components['BRAVO_ROOT'] = $(
+        if ($bravoRootIsExplicit) {
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BRAVO_ROOT' `
+                -Path ([string]$bravoRoot) -Source 'ExplicitOverride' -Reason $bravoRootReason
+        } elseif ($bravoRootAmbiguous) {
+            New-BRAVODiscoveryComponentPresence -Component 'BRAVO_ROOT' -Presence 'Ambiguous' `
+                -Source 'ServiceDiscovery' `
+                -Reason "кілька служб BRAVO з різними виконуваними файлами — authoritative BRAVO_ROOT не визначено ($($distinctBravoExecutables -join '; '))"
+        } elseif (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BRAVO_ROOT' `
+                -Path ([string]$bravoRoot) -Source 'ServiceDiscovery' -Reason $bravoRootReason
+        } elseif ($serviceEnumerationFailed) {
+            New-BRAVODiscoveryComponentPresence -Component 'BRAVO_ROOT' -Presence 'Error' -Source 'None' `
+                -Reason "перелік служб Windows недоступний ($serviceEnumerationError) — стан служби BRAVO не визначено"
+        } else {
+            New-BRAVODiscoveryComponentPresence -Component 'BRAVO_ROOT' -Presence 'Absent' -Source 'None' `
+                -Reason $bravoRootReason
+        }
+    )
+
+    $components['MODEL'] = Resolve-BRAVOIniComponentPresence -Component 'MODEL' -Resolved $modelResolved
+    $components['BLOG'] = Resolve-BRAVOIniComponentPresence -Component 'BLOG' -Resolved $blogResolved
+    $components['BRAVOEXCH'] = Resolve-BRAVOIniComponentPresence -Component 'BRAVOEXCH' -Resolved $bravoexchResolved
+
+    $components['BAZA_APP'] = $(
+        if ($overrides.Contains('BAZA_APP')) {
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BAZA_APP' `
+                -Path ([string]$bazaAppResolved.Value) -Source 'ExplicitOverride' -Reason ([string]$bazaAppResolved.Reason)
+        } elseif (-not [string]::IsNullOrWhiteSpace($iniInstallationRoot)) {
+            # bravo.ini authoritative: неоднозначність служб на це не
+            # впливає — шлях узято не зі служби.
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BAZA_APP' `
+                -Path ([string]$bazaAppResolved.Value) -Source 'BravoIni' -Reason ([string]$bazaAppResolved.Reason)
+        } elseif ($bravoRootAmbiguous -and -not $bravoRootIsExplicit) {
+            # Єдине джерело для BAZA_APP — каталог служби BRAVO, а їх
+            # кілька з різними виконуваними файлами. Сире поле BAZA_APP
+            # (сумісність) і далі показує перший варіант для діагностики,
+            # але presence НЕ має права називати це Present.
+            New-BRAVODiscoveryComponentPresence -Component 'BAZA_APP' -Presence 'Ambiguous' `
+                -Source 'ServiceDiscovery' `
+                -Reason "кілька служб BRAVO з різними виконуваними файлами — authoritative BAZA_APP не визначено ($($distinctBravoExecutables -join '; '))"
+        } elseif (-not [string]::IsNullOrWhiteSpace($bravoRoot)) {
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'BAZA_APP' `
+                -Path ([string]$bazaAppResolved.Value) `
+                -Source $(if ($bravoRootIsExplicit) { 'ExplicitOverride' } else { 'ServiceDiscovery' }) `
+                -Reason ([string]$bazaAppResolved.Reason)
+        } elseif ($serviceEnumerationFailed -or $null -eq $iniData) {
+            New-BRAVODiscoveryComponentPresence -Component 'BAZA_APP' -Presence 'Error' -Source 'None' `
+                -Reason ([string]$bazaAppResolved.Reason)
+        } else {
+            New-BRAVODiscoveryComponentPresence -Component 'BAZA_APP' -Presence 'Absent' -Source 'None' `
+                -Reason ([string]$bazaAppResolved.Reason)
+        }
+    )
+
+    $components['WEB_ROOT'] = $(
+        if ($webRootIsExplicit) {
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'WEB_ROOT' `
+                -Path ([string]$webRoot) -Source 'ExplicitOverride' -Reason $webRootReason
+        } elseif ($webRootAmbiguous) {
+            New-BRAVODiscoveryComponentPresence -Component 'WEB_ROOT' -Presence 'Ambiguous' `
+                -Source 'ServiceDiscovery' `
+                -Reason "кілька Apache-подібних служб з різними виконуваними файлами — authoritative WEB_ROOT не визначено ($($distinctWebExecutables -join '; '))"
+        } elseif (-not [string]::IsNullOrWhiteSpace($webRoot)) {
+            Resolve-BRAVODiscoveryPathComponentPresence -Component 'WEB_ROOT' `
+                -Path ([string]$webRoot) -Source 'ServiceDiscovery' -Reason $webRootReason
+        } elseif ($serviceEnumerationFailed) {
+            New-BRAVODiscoveryComponentPresence -Component 'WEB_ROOT' -Presence 'Error' -Source 'None' `
+                -Reason "перелік служб Windows недоступний ($serviceEnumerationError) — стан Apache-служби не визначено"
+        } else {
+            New-BRAVODiscoveryComponentPresence -Component 'WEB_ROOT' -Presence 'Absent' -Source 'None' `
+                -Reason $webRootReason
+        }
+    )
+
+    # BAZA_WWW уже має власний, раніше провалідований ланцюг пріоритетів —
+    # тут його НЕ переобчислюємо, лише приводимо до спільної структури.
+    $components['BAZA_WWW'] = New-BRAVODiscoveryComponentPresence -Component 'BAZA_WWW' `
+        -Presence $bazaWwwPresence -Source $bazaWwwSource `
+        -Path ([string]$bazaWwwResolved.Value) -Reason ([string]$bazaWwwResolved.Reason)
 
     return [pscustomobject]@{
         BRAVO_ROOT = $bravoRoot
@@ -943,6 +1195,10 @@ function Resolve-BRAVOInstallationDiscovery {
         # None), а не лише "чи присутній".
         BAZA_WWW_Presence = $bazaWwwPresence
         BAZA_WWW_Source = $bazaWwwSource
+        # Presence-контракт для всіх компонентів (#158, етап 2). Ключ —
+        # назва компонента, значення — {Component;Presence;Source;Path;
+        # Reason}. Path непорожній лише для Present.
+        Components = $components
         BACKUP_ROOT = $backupRootResolved.Value
         Services = $allServices
         Overrides = $overrides
@@ -961,6 +1217,48 @@ function Resolve-BRAVOInstallationDiscovery {
             BAZA_APP = $bazaAppResolved.Reason
             BAZA_WWW = $bazaWwwResolved.Reason
             BACKUP_ROOT = $backupRootResolved.Reason
+        }
+    }
+}
+
+function Write-BRAVODiscoveryPresenceReport {
+    # Операторський вивід presence-контракту (#158, етап 2). Живе тут, а
+    # не в BRAVO_SETUP.ps1, з двох причин: форму Components визначає цей
+    # модуль (власник контракту), а кореневий entrypoint має лишатись
+    # оркестрацією. Функція нічого не обчислює — лише форматує вже
+    # готовий результат Resolve-BRAVOInstallationDiscovery.
+    #
+    # Колір — не декорація: Ambiguous і Error зобов'язані виглядати
+    # інакше, ніж Absent, бо для оператора це різні дії (перевірити
+    # вручну / полагодити discovery проти "компонента тут немає").
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult
+    )
+
+    if (-not $DiscoveryResult.PSObject.Properties['Components'] -or
+        -not ($DiscoveryResult.Components -is [System.Collections.IDictionary])) {
+        return
+    }
+
+    Write-Host ''
+    Write-Host ' PRESENCE КОМПОНЕНТІВ'
+    foreach ($componentName in @($DiscoveryResult.Components.Keys)) {
+        $entry = $DiscoveryResult.Components[$componentName]
+        $presenceState = [string]$entry.Presence
+        $presenceColor = switch ($presenceState) {
+            'Present' { 'Green'; break }
+            'Ambiguous' { 'Yellow'; break }
+            'Error' { 'Red'; break }
+            default { 'Gray' }
+        }
+        Write-Host ("  {0,-12}{1,-11}{2}" -f $componentName, $presenceState, [string]$entry.Source) -ForegroundColor $presenceColor
+        # Reason друкуємо лише для непозитивних станів: для Present той
+        # самий текст уже стоїть у блоці DISCOVERY поруч зі шляхом, а тут
+        # він потрібен саме там, де оператор мусить щось зробити.
+        if ($presenceState -ne 'Present' -and
+            -not [string]::IsNullOrWhiteSpace([string]$entry.Reason)) {
+            Write-Host ("               {0}" -f [string]$entry.Reason)
         }
     }
 }
@@ -1657,6 +1955,7 @@ Export-ModuleMember -Function @(
     'ConvertTo-BRAVOIniPathValue',
     'Test-BRAVOAbsolutePath',
     'Get-BRAVOApacheDocumentRoot',
+    'Test-BRAVODiscoverySourceDirectory',
     'Test-BRAVOBazaWwwInstallation',
     'Get-BRAVOSystemDirectoryPath',
     'Get-BRAVOSystemBravoIniPath',
@@ -1668,6 +1967,7 @@ Export-ModuleMember -Function @(
     'Get-BRAVOEffectiveStorageConfiguration',
     'Get-BRAVOEffectiveSynchronizationConfiguration',
     'Test-BRAVODiscoveryResult',
+    'Write-BRAVODiscoveryPresenceReport',
     'Save-BRAVODiscoveryBaseline',
     'Compare-BRAVODiscoveryBaseline',
     'Get-BRAVODiscoveryBaselinePath',
