@@ -436,7 +436,174 @@ function Test-BRAVOConfigurationOverrideSchema {
     }
 }
 
+
+# ---------------------------------------------------------------------
+# Контракт версії схеми site-файлу (#154, B3)
+# ---------------------------------------------------------------------
+# УВАГА: це НЕ те саме, що VERSION.json.configSchemaVersion. Там —
+# версія схеми САМОГО КОМПЛЕКТУ (метадані релізу, споживач —
+# BRAVO_CONFIG_TEST.ps1). Тут — версія формату, яку ОГОЛОШУЄ конкретний
+# BRAVO.local.config. Значення збігаються за назвою ключа навмисно
+# (один семантичний ідентифікатор формату), але це два різні носії, і
+# B3 не змінює VERSION.json: зміна метаданих релізу разом зі зміною
+# runtime-поведінки заборонена політикою релізу.
+#
+# Маркер — ЗАРЕЗЕРВОВАНИЙ ключ, а не перевизначення. Site-файл є плоским
+# словником 'dot.path' = значення, тож 'configSchemaVersion' був би
+# односегментним, тобто TOP-LEVEL шляхом — і ConvertTo-BRAVONestedOverride
+# відхилив би його як невідомий ключ (fail-closed). Тому канонічний читач
+# знімає маркер ДО валідації шляхів, і жоден споживач .Overrides його не
+# бачить.
+$script:BRAVOConfigurationSchemaVersionKey = 'configSchemaVersion'
+
+# Версія, яку пише поточний комплект.
+$script:BRAVOConfigurationSchemaCurrentVersion = 2
+
+# Версія, яку означає ВІДСУТНІЙ маркер. Кожен розгорнутий сьогодні
+# site-файл не має маркера взагалі, тому "немає маркера" не може
+# означати відмову: це зупинило б увесь парк на першому ж оновленні.
+$script:BRAVOConfigurationSchemaLegacyVersion = 1
+
+# Підтримувані оголошені версії. Будь-яке інше число — fail closed:
+# файл, написаний новішим комплектом, НЕ можна читати як v2 "на удачу".
+$script:BRAVOConfigurationSchemaSupportedVersion = @(1, 2)
+
+# Цілочисельні System.TypeCode — маркер версії мусить бути цілим числом,
+# а не рядком '2' і не $true (та сама причина, що для решти типів: див.
+# коментар про TypeCode вище).
+$script:BRAVOConfigurationSchemaIntegerTypeCode = @(
+    'SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64'
+)
+
+function Get-BRAVOConfigurationSchemaVersionContract {
+    <#
+    .SYNOPSIS
+        Канонічний контракт версії схеми site-файлу (#154, B3).
+    .DESCRIPTION
+        Один опис для ВСІХ учасників: канонічний читач, який знімає
+        маркер, і серіалізатори Configurator-а, які його пишуть. Без
+        цього спільного джерела назва ключа й поточна версія існували б
+        у трьох місцях і розійшлися б при першій зміні.
+    .OUTPUTS
+        [pscustomobject] { KeyName; CurrentVersion; LegacyVersion; SupportedVersions }
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param()
+
+    return [pscustomobject]@{
+        KeyName           = $script:BRAVOConfigurationSchemaVersionKey
+        CurrentVersion    = $script:BRAVOConfigurationSchemaCurrentVersion
+        LegacyVersion     = $script:BRAVOConfigurationSchemaLegacyVersion
+        SupportedVersions = @($script:BRAVOConfigurationSchemaSupportedVersion)
+    }
+}
+
+function Resolve-BRAVOConfigurationSchemaVersion {
+    <#
+    .SYNOPSIS
+        Знімає й перевіряє маркер версії site-файлу (#154, B3).
+    .DESCRIPTION
+        Вхід — уже вилучені ДАНІ (результат
+        ConvertFrom-BRAVOConfigurationDataFileText), тому версія
+        читається з даних і НІКОЛИ не обчислюється виконанням файлу:
+        'configSchemaVersion = 1 + 1' не стає двійкою, а відхиляється ще
+        парсером як вираз.
+
+        Матриця (обсяг B3):
+            маркер відсутній              -> v1 (legacy), приймається
+            маркер = 1                    -> v1, приймається
+            маркер = 2                    -> v2, приймається
+            маркер іншого числа           -> FAIL CLOSED
+            маркер нецілого типу/$null    -> FAIL CLOSED
+
+        Рівно ОДИН вихід несе і версію, і очищені перевизначення: якби
+        зняття маркера лишилось на викликачеві, кожен із п'яти
+        споживачів канонічного читача мусив би повторити це правило.
+    .OUTPUTS
+        [pscustomobject] { DeclaredVersion; EffectiveVersion; WasDeclared; Overrides }
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$DataFileContent,
+        [Parameter(Mandatory = $true)][string]$SourceName
+    )
+
+    $keyName = $script:BRAVOConfigurationSchemaVersionKey
+    $overrides = @{}
+    $wasDeclared = $false
+    $declaredRaw = $null
+
+    foreach ($contentKey in @($DataFileContent.Keys)) {
+        if ([string]::Equals([string]$contentKey, $keyName, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $wasDeclared = $true
+            $declaredRaw = $DataFileContent[$contentKey]
+            continue
+        }
+        $overrides[$contentKey] = $DataFileContent[$contentKey]
+    }
+
+    if (-not $wasDeclared) {
+        return [pscustomobject]@{
+            DeclaredVersion  = $null
+            EffectiveVersion = $script:BRAVOConfigurationSchemaLegacyVersion
+            WasDeclared      = $false
+            Overrides        = $overrides
+        }
+    }
+
+    if ($null -eq $declaredRaw) {
+        throw "'$SourceName': '$keyName' не може бути `$null — очікується ціле число (підтримуються: $($script:BRAVOConfigurationSchemaSupportedVersion -join ', '))."
+    }
+
+    $declaredTypeCode = [string][System.Type]::GetTypeCode($declaredRaw.GetType())
+    if (-not ($script:BRAVOConfigurationSchemaIntegerTypeCode -contains $declaredTypeCode)) {
+        throw "'$SourceName': '$keyName' мусить бути цілим числом без лапок, отримано $($declaredRaw.GetType().Name) ('$declaredRaw'). Рядок '2' і `$true не є версією схеми."
+    }
+
+    $declaredVersion = [int]$declaredRaw
+    if (-not ($script:BRAVOConfigurationSchemaSupportedVersion -contains $declaredVersion)) {
+        throw "'$SourceName': '$keyName' = $declaredVersion не підтримується цим комплектом (підтримуються: $($script:BRAVOConfigurationSchemaSupportedVersion -join ', ')). Файл новішого формату НЕ читається як старіший — оновіть комплект."
+    }
+
+    return [pscustomobject]@{
+        DeclaredVersion  = $declaredVersion
+        EffectiveVersion = $declaredVersion
+        WasDeclared      = $true
+        Overrides        = $overrides
+    }
+}
+
+
+function Get-BRAVOConfigurationSchemaVersionDeclarationLine {
+    <#
+    .SYNOPSIS
+        Канонічна серіалізована форма маркера версії (#154, B3).
+    .DESCRIPTION
+        Рівно один запис: `configSchemaVersion = 2` (bareword-ключ і знак
+        рівності). Форма з двокрапкою не є валідним PowerShell-DATA
+        синтаксисом і тому не емітується ніколи; bareword навмисно
+        відрізняє маркер від перевизначень, які завжди беруться в лапки
+        як 'dot.path'.
+
+        Функція живе тут, а не в серіалізаторах Configurator-а, бо
+        серіалізаторів ДВА (production-запис і кандидат для ізольованого
+        обчислення effective), і копія форми в кожному розійшлася б.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([int]$IndentWidth = 4)
+
+    $indent = ''
+    if ($IndentWidth -gt 0) { $indent = ' ' * $IndentWidth }
+    return "$indent$($script:BRAVOConfigurationSchemaVersionKey) = $($script:BRAVOConfigurationSchemaCurrentVersion)"
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOConfigurationSchema',
-    'Test-BRAVOConfigurationOverrideSchema'
+    'Test-BRAVOConfigurationOverrideSchema',
+    'Get-BRAVOConfigurationSchemaVersionContract',
+    'Resolve-BRAVOConfigurationSchemaVersion',
+    'Get-BRAVOConfigurationSchemaVersionDeclarationLine'
 )

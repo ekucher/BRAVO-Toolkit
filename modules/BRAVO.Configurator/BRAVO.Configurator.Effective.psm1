@@ -92,8 +92,14 @@ function New-BRAVOConfiguratorIsolatedConfigRoot {
     }
 
     if ($CandidateOverrides.Count -gt 0) {
+        # #154 (B3): кандидат мусить нести ТУ САМУ версію формату, що й
+        # production-файл, інакше ізольоване обчислення effective
+        # відповідало б іншій версії, ніж те, що буде записано.
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
+
         $localConfigLines = New-Object System.Collections.Generic.List[string]
         $localConfigLines.Add('@{')
+        $localConfigLines.Add((Get-BRAVOConfigurationSchemaVersionDeclarationLine))
         foreach ($key in $CandidateOverrides.Keys) {
             $literalValue = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $CandidateOverrides[$key]
             $literalKey = [string]$key

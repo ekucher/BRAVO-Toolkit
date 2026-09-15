@@ -169,9 +169,17 @@ function ConvertTo-BRAVOConfiguratorLocalConfigText {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][hashtable]$MergedOverrides)
 
+    # #154 (B3): маркер версії формату. Форма маркера — канонічна й одна
+    # (BRAVO.Configuration.Schema), бо серіалізаторів site-файлу два.
+    # Саме цей запис закриває вікно сумісності: кожен файл, який
+    # Configurator перезаписує, стає явно версійованим, без ручного
+    # редагування на сервері.
+    Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
+
     $lines = New-Object System.Collections.Generic.List[string]
     $lines.Add('# Згенеровано BRAVO Configurator. Data-only hashtable "dot-шлях -> значення".')
     $lines.Add('@{')
+    $lines.Add((Get-BRAVOConfigurationSchemaVersionDeclarationLine))
     foreach ($key in ($MergedOverrides.Keys | Sort-Object)) {
         $literalValue = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $MergedOverrides[$key]
         $lines.Add("    '$key' = $literalValue")
