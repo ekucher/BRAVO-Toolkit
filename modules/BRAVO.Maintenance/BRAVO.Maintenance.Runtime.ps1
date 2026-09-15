@@ -1320,11 +1320,91 @@ function Add-BRAVOMaintenanceStepOutcome {
     }
     # Той самий запис, що йде в консоль, зберігається для фінального
     # сповіщення (див. коментар біля BRAVOMaintenanceStepLog вище).
+    #
+    # WarningCountAtOutcome (#175): зріз $script:BRAVOWarningCount у момент
+    # фіксації результату. Записи журналу йдуть у хронологічному порядку,
+    # тому попередження, що виникли між двома сусідніми результатами,
+    # належать пізнішому з них — а різниця «усього попереджень мінус
+    # приписані крокам» дає точну кількість попереджень, яких не забрав
+    # жоден крок (Resolve-BRAVOMaintenanceUnattributedWarningCount нижче).
     [void]$script:BRAVOMaintenanceStepLog.Add([pscustomobject]@{
         Name = $Name
         Status = $Status
         Details = [string]$Details
+        WarningCountAtOutcome = [int]$script:BRAVOWarningCount
     })
+}
+
+function Resolve-BRAVOMaintenanceUnattributedWarningCount {
+    <#
+    .SYNOPSIS
+        Кількість попереджень прогону, яких не забрав жоден крок (#175).
+    .DESCRIPTION
+        $script:BRAVOWarningCount рахує ЗАПИСИ Write-Log -Level WARNING і
+        визначає exit-code (10 = SuccessWithWarnings).
+        $script:BRAVOMaintenanceStepWarnCount рахує КРОКИ зі статусом WARN
+        і йде в підсумок. Це різні одиниці, і попередження, яке виникло
+        поза будь-яким кроком (preflight, конфігураційна фаза, ділянка
+        після останнього кроку), не потрапляло в жодну з них — звідси
+        суперечність «Попереджень: 0» при «Код завершення: 10».
+
+        Тут рахується саме РІЗНИЦЯ, а не повторний обхід журналу: для
+        кожного кроку зі статусом WARN приписані йому попередження — це
+        приріст лічильника від попереднього результату до його власного.
+        Кроки з іншим статусом нічого не «забирають»: якщо під час кроку
+        виникло попередження, Get-BRAVOMaintenanceStepStatus уже дав би
+        йому WARN.
+    #>
+    $attributed = 0
+    $previousWarningCount = 0
+    foreach ($entry in $script:BRAVOMaintenanceStepLog) {
+        # Захищене читання, а не $entry.WarningCountAtOutcome напряму: під
+        # Set-StrictMode звернення до відсутньої властивості фатальне, а
+        # записи журналу конструюють і тести (вони перевіряють рендер
+        # сповіщення й не знають про цей зріз). Запис без зрізу нічого не
+        # «забирає» — попередження лишаються неприписаними, тобто помилка
+        # в безпечний бік: оператор побачить попередження, а не втратить.
+        $entryWarningProperty = $entry.PSObject.Properties['WarningCountAtOutcome']
+        if ($null -eq $entryWarningProperty) { continue }
+        $entryWarningCount = [int]$entryWarningProperty.Value
+        if ([string]$entry.Status -eq 'WARN') {
+            $attributed += [Math]::Max(0, $entryWarningCount - $previousWarningCount)
+        }
+        $previousWarningCount = $entryWarningCount
+    }
+    return [Math]::Max(0, [int]$script:BRAVOWarningCount - $attributed)
+}
+
+function Add-BRAVOMaintenanceUnattributedWarningOutcome {
+    <#
+    .SYNOPSIS
+        Зводить попередження поза кроками в один явний результат (#175).
+    .DESCRIPTION
+        Викликається РІВНО перед рендером підсумку. Якщо попередження
+        поточного прогону лишились не приписаними жодному кроку, вони
+        отримують власний ненумерований результат — і тоді підсумковий
+        лічильник «Попереджень» їх бачить.
+
+        Чому окремий результат, а не просто інша формула поля: поля
+        «Кроків/Успішно/Попереджень/Пропущено/Помилок» арифметично
+        узгоджені з довжиною журналу етапів (див. коментар у фінальному
+        блоці про прогін 20:29). Додати число прямо в поле означало б
+        зламати цю узгодженість; окремий запис зберігає її і водночас
+        показує оператору, що попередження БУЛО, але жоден крок його не
+        пояснює.
+
+        Повідомлення не дублюється: сам текст попередження вже в журналі,
+        тут лише КІЛЬКІСТЬ. Лічильник не накручується штучно — за
+        відсутності таких попереджень результат не додається зовсім.
+    #>
+    $unattributedWarningCount = Resolve-BRAVOMaintenanceUnattributedWarningCount
+    if ($unattributedWarningCount -le 0) { return 0 }
+
+    Add-BRAVOMaintenanceStepOutcome `
+        -Name 'Попередження поза кроками' `
+        -Status 'WARN' `
+        -Details ("попереджень: {0} (див. журнал)" -f $unattributedWarningCount)
+    return $unattributedWarningCount
 }
 
 # Ненумерована операція Maintenance (Trace-SFTP, Очистка, Міграція,
@@ -7811,6 +7891,17 @@ if ($BravoWebMaintenanceEnabled -and $ApacheEnabled) {
 Write-Log -Message "==="
 Write-Log -Message "=== ПЕРЕВІРКА ВІЛЬНОГО МІСЦЯ ==="
 Write-BRAVOProgressPhase -Phase 'Перевірка вільного місця' -PercentComplete 5
+# #175: зріз лічильників ПЕРЕД preflight — той самий патерн, що в усіх
+# інших кроків (Зупинка служб, Перевірка розмірів .md тощо). Без нього
+# крок нижче штампувався 'OK' навіть тоді, коли класифікатор місця
+# видав non-blocking WARNING: Invoke-BRAVOMaintenanceDiskSpaceCheck
+# повертає $true і для успіху, і для попередження, а самі попередження
+# він пише через Write-Log -Level WARNING, тобто вони інкрементують
+# $script:BRAVOWarningCount -> exit 10. Підсумок при цьому читав
+# $script:BRAVOMaintenanceStepWarnCount, куди цей крок нічого не додавав,
+# і оператор бачив "Попереджень: 0" поряд з "Код завершення: 10".
+$spaceCheckCriticalBefore = $script:criticalErrorOccurred
+$spaceCheckWarningsBefore = $script:BRAVOWarningCount
 $spaceCheckResult = Invoke-BRAVOMaintenanceDiskSpaceCheck -ROOT_LIMS $ROOT_LIMS -ExcludedDrives $FREE_SPACE_EXCLUDED_DRIVES
 
 # Перевірка критичних помилок після перевірки місця
@@ -7819,6 +7910,10 @@ if (-not $spaceCheckResult) {
     Write-Log -Message "Критична помилка перевірки місця. Завершення скрипта." -Level "ERROR"
     $diskPreflightExitCode = Get-BRAVOMaintenanceResolvedExitCode
     $script:maintenanceRuntimeExitCode = $diskPreflightExitCode
+    # #175: той самий звід, що у фінальному блоці. Ранній вихід оминає
+    # його, тому виклик потрібен і тут — інакше прогін, який спершу видав
+    # попередження, а потім упав на місці, показував би "Попереджень: 0".
+    [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
     # Ранній вихід оминає фінальний блок — machine-readable статус (P2.1)
     # пишеться й тут, fail-soft (див. коментар у фінальному блоці).
     try {
@@ -7846,7 +7941,11 @@ if (-not $spaceCheckResult) {
     Wait-BRAVOManualExit -NoPause:$NoPause
     exit $diskPreflightExitCode
 }
-Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'OK'
+Write-BRAVOMaintenanceStep `
+    -Name 'Перевірка вільного місця' `
+    -Status (Get-BRAVOMaintenanceStepStatus `
+        -CriticalBefore $spaceCheckCriticalBefore `
+        -WarningsBefore $spaceCheckWarningsBefore)
 
 # ===== СТВОРЕННЯ НЕОБХІДНИХ ДИРЕКТОРІЙ =====
 # Перевіряємо, чи потрібно створювати будь-які директорії
@@ -10345,6 +10444,14 @@ if (-not $script:criticalErrorOccurred) {
 # змінена, лише піднята вище й винесена в один спільний виклик (той
 # самий, що вже дає "поточний знімок" для Send-FinalReport вище).
 $script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
+
+# #175: попередження, яких не забрав жоден крок (preflight, конфігураційна
+# фаза, ділянка після останнього кроку), зводяться в один явний результат
+# ДО запису machine-readable статусу і ДО рендера підсумку — інакше
+# stepsWarning у JSON і поле "Попереджень" на консолі показували б 0 при
+# exit 10. Викликається саме тут, після резолву exit-code: пізніше
+# попереджень уже не виникає, тож зріз повний.
+[void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
 
 $maintenanceEndedAt = Get-Date
 $totalTime = $maintenanceEndedAt - $script:ScriptStartTime
