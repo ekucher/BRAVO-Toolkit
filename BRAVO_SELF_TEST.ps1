@@ -11693,6 +11693,195 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             ) `
             -Name "Discovery/BaselineSaveAndDriftDetection" `
             -Failure "Save-BRAVODiscoveryBaseline має зберігати JSON-знімок, Compare-BRAVODiscoveryBaseline — виявляти зміну поля відносно нього й не повідомляти про дрейф, якщо baseline ще не існує"
+
+        # ============================================================
+        # #158 (етап 1): baseline — машинний стан у %ProgramData%\BRAVO\State
+        # ============================================================
+        # Перевіряється КОНТРАКТ розташування й міграції, а не конкретна
+        # реалізація читання: сценарії будуються з реальних файлів на диску
+        # і проходять через ті самі експортовані функції, що й BRAVO_SETUP.
+        & {
+            $baselineStateRoot = Join-Path $discoveryTestRoot 'ProgramData\BRAVO\State'
+            $baselineRuntimeRoot = Join-Path $discoveryTestRoot 'RuntimeA'
+            $baselineRuntimeRootB = Join-Path $discoveryTestRoot 'RuntimeB'
+            $baselineLegacyPath = Get-BRAVODiscoveryLegacyBaselinePath -RuntimeRoot $baselineRuntimeRoot
+            $baselineCanonicalPath = Get-BRAVODiscoveryBaselinePath -StateRoot $baselineStateRoot
+
+            # Вміст із «чужим» порядком полів і власним SavedAt — саме він
+            # мусить пережити міграцію дослівно.
+            $baselineLegacyText = '{"MODEL_SOURCE":"D:\\LIMS\\Model","SavedAt":"2026-01-02T03:04:05.0000000+02:00","BRAVO_ROOT":"D:\\BRAVO"}'
+
+            $baselineResetScenario = {
+                foreach ($pathToClear in @($baselineStateRoot, $baselineRuntimeRoot)) {
+                    if (Test-Path -LiteralPath $pathToClear) {
+                        Remove-Item -LiteralPath $pathToClear -Recurse -Force -ErrorAction SilentlyContinue
+                    }
+                }
+            }
+
+            # --- DiscoveryBaseline/CanonicalStatePathIsProgramData ---
+            # Canonical розташування — State-корінь, переданий викликачем
+            # ($global:stateRoot), а НЕ <RuntimeRoot>\LOGS.
+            Test-BRAVOCondition `
+                -Condition (
+                    $baselineCanonicalPath -eq (Join-Path $baselineStateRoot 'DISCOVERY_BASELINE.json') -and
+                    $baselineLegacyPath -eq (Join-Path $baselineRuntimeRoot 'LOGS\DISCOVERY_BASELINE.json') -and
+                    $baselineCanonicalPath -ne $baselineLegacyPath
+                ) `
+                -Name 'DiscoveryBaseline/CanonicalStatePathIsProgramData' `
+                -Failure "canonical baseline мусить лежати в State-корені (машинний стан), legacy — у <RuntimeRoot>\LOGS; отримано canonical='$baselineCanonicalPath' legacy='$baselineLegacyPath'"
+
+            # --- DiscoveryBaseline/BaselineLocationIndependentOfRuntimeRoot ---
+            # Перевстановлення комплекту в ІНШИЙ каталог не сміє змінювати
+            # розташування baseline — інакше новий RuntimeRoot бачив би
+            # «перший запуск» і будь-який зниклий компонент виглядав би
+            # легітимно відсутнім.
+            Test-BRAVOCondition `
+                -Condition (
+                    (Get-BRAVODiscoveryBaselinePath -StateRoot $baselineStateRoot) -eq
+                    $baselineCanonicalPath -and
+                    (Get-BRAVODiscoveryLegacyBaselinePath -RuntimeRoot $baselineRuntimeRootB) -ne $baselineLegacyPath
+                ) `
+                -Name 'DiscoveryBaseline/BaselineLocationIndependentOfRuntimeRoot' `
+                -Failure 'зміна RuntimeRoot не повинна змінювати canonical розташування baseline (саме через це чиста інсталяція раніше втрачала baseline)'
+
+            # --- DiscoveryBaseline/FirstRunWithoutEitherIsNotCorruption ---
+            & $baselineResetScenario
+            $baselineFirstRun = Import-BRAVODiscoveryBaseline -StateRoot $baselineStateRoot -RuntimeRoot $baselineRuntimeRoot
+            Test-BRAVOCondition `
+                -Condition (
+                    [string]$baselineFirstRun.Source -eq 'None' -and
+                    $null -eq $baselineFirstRun.Baseline -and
+                    @($baselineFirstRun.Problems).Count -eq 0 -and
+                    -not $baselineFirstRun.Migrated
+                ) `
+                -Name 'DiscoveryBaseline/FirstRunWithoutEitherIsNotCorruption' `
+                -Failure "відсутність обох файлів — перший запуск, а не пошкодження; отримано Source='$($baselineFirstRun.Source)' проблем=$(@($baselineFirstRun.Problems).Count)"
+
+            # --- DiscoveryBaseline/MigratesLegacyLogsBaseline ---
+            # + DiscoveryBaseline/MigrationPreservesContent
+            & $baselineResetScenario
+            [void][IO.Directory]::CreateDirectory((Split-Path -Path $baselineLegacyPath -Parent))
+            [IO.File]::WriteAllText($baselineLegacyPath, $baselineLegacyText, (New-Object Text.UTF8Encoding($false)))
+            $baselineMigrated = Import-BRAVODiscoveryBaseline -StateRoot $baselineStateRoot -RuntimeRoot $baselineRuntimeRoot
+            $baselineMigratedText = if (Test-Path -LiteralPath $baselineCanonicalPath -PathType Leaf) {
+                [IO.File]::ReadAllText($baselineCanonicalPath, [Text.Encoding]::UTF8)
+            } else { '<canonical відсутній>' }
+            Test-BRAVOCondition `
+                -Condition (
+                    [string]$baselineMigrated.Source -eq 'MigratedFromLegacy' -and
+                    $baselineMigrated.Migrated -and
+                    (Test-Path -LiteralPath $baselineCanonicalPath -PathType Leaf) -and
+                    [string]$baselineMigrated.Baseline.MODEL_SOURCE -eq 'D:\LIMS\Model'
+                ) `
+                -Name 'DiscoveryBaseline/MigratesLegacyLogsBaseline' `
+                -Failure "baseline зі старого розташування мусить бути перенесений у canonical без втрати; Source='$($baselineMigrated.Source)' Migrated=$($baselineMigrated.Migrated)"
+
+            Test-BRAVOCondition `
+                -Condition (
+                    $baselineMigratedText -ceq $baselineLegacyText -and
+                    (Test-Path -LiteralPath $baselineLegacyPath -PathType Leaf)
+                ) `
+                -Name 'DiscoveryBaseline/MigrationPreservesContent' `
+                -Failure 'міграція мусить переносити ВИХІДНИЙ текст дослівно (не перезбирати знімок — це було б новим підтвердженням, якого оператор не давав) і не видаляти файл оператора'
+
+            # --- DiscoveryBaseline/CanonicalWinsWhenBothExist ---
+            # Legacy лишився на місці після міграції — переконуємось, що
+            # читається саме canonical, навіть коли вміст розходиться.
+            [IO.File]::WriteAllText($baselineCanonicalPath,
+                '{"MODEL_SOURCE":"E:\\CANONICAL\\Model"}', (New-Object Text.UTF8Encoding($false)))
+            $baselineBoth = Import-BRAVODiscoveryBaseline -StateRoot $baselineStateRoot -RuntimeRoot $baselineRuntimeRoot
+            Test-BRAVOCondition `
+                -Condition (
+                    [string]$baselineBoth.Source -eq 'Canonical' -and
+                    -not $baselineBoth.Migrated -and
+                    [string]$baselineBoth.Baseline.MODEL_SOURCE -eq 'E:\CANONICAL\Model'
+                ) `
+                -Name 'DiscoveryBaseline/CanonicalWinsWhenBothExist' `
+                -Failure "за наявності обох мусить читатись canonical; Source='$($baselineBoth.Source)' MODEL_SOURCE='$($baselineBoth.Baseline.MODEL_SOURCE)'"
+
+            # --- DiscoveryBaseline/ReadsCanonicalState ---
+            & $baselineResetScenario
+            Save-BRAVODiscoveryBaseline -DiscoveryResult $autoDiscovery -BaselinePath $baselineCanonicalPath
+            $baselineCanonicalOnly = Import-BRAVODiscoveryBaseline -StateRoot $baselineStateRoot -RuntimeRoot $baselineRuntimeRoot
+            $baselineCanonicalDrift = @(Compare-BRAVODiscoveryBaseline `
+                -DiscoveryResult $autoDiscovery -Baseline $baselineCanonicalOnly.Baseline)
+            Test-BRAVOCondition `
+                -Condition (
+                    [string]$baselineCanonicalOnly.Source -eq 'Canonical' -and
+                    $null -ne $baselineCanonicalOnly.Baseline -and
+                    @($baselineCanonicalOnly.Problems).Count -eq 0 -and
+                    $baselineCanonicalDrift.Count -eq 0
+                ) `
+                -Name 'DiscoveryBaseline/ReadsCanonicalState' `
+                -Failure "збережений у State baseline мусить читатись і не давати хибного дрейфу; Source='$($baselineCanonicalOnly.Source)' дрейфів=$($baselineCanonicalDrift.Count)"
+
+            # --- DiscoveryBaseline/InvalidCanonicalFailsClosed ---
+            # Найважливіший сценарій: пошкоджений canonical НЕ сміє мовчки
+            # стати «перший запуск» або відкотитись на legacy. Інакше
+            # «baseline немає» -> «дрейфу немає» -> зниклий компонент
+            # виглядає легітимно відсутнім.
+            & $baselineResetScenario
+            [void][IO.Directory]::CreateDirectory((Split-Path -Path $baselineLegacyPath -Parent))
+            [IO.File]::WriteAllText($baselineLegacyPath, $baselineLegacyText, (New-Object Text.UTF8Encoding($false)))
+            [void][IO.Directory]::CreateDirectory($baselineStateRoot)
+            [IO.File]::WriteAllText($baselineCanonicalPath, '{ це не JSON', (New-Object Text.UTF8Encoding($false)))
+            $baselineInvalid = Import-BRAVODiscoveryBaseline -StateRoot $baselineStateRoot -RuntimeRoot $baselineRuntimeRoot
+            Test-BRAVOCondition `
+                -Condition (
+                    [string]$baselineInvalid.Source -eq 'Unreadable' -and
+                    $null -eq $baselineInvalid.Baseline -and
+                    @($baselineInvalid.Problems).Count -ge 1 -and
+                    -not $baselineInvalid.Migrated
+                ) `
+                -Name 'DiscoveryBaseline/InvalidCanonicalFailsClosed' `
+                -Failure "пошкоджений canonical мусить лишатись ВИДИМОЮ проблемою, а не мовчазним «перший запуск»/відкотом на legacy; Source='$($baselineInvalid.Source)' проблем=$(@($baselineInvalid.Problems).Count)"
+
+            # --- DiscoveryBaseline/InvalidLegacyIsReportedAndNotMigrated ---
+            & $baselineResetScenario
+            [void][IO.Directory]::CreateDirectory((Split-Path -Path $baselineLegacyPath -Parent))
+            [IO.File]::WriteAllText($baselineLegacyPath, '{ теж не JSON', (New-Object Text.UTF8Encoding($false)))
+            $baselineInvalidLegacy = Import-BRAVODiscoveryBaseline -StateRoot $baselineStateRoot -RuntimeRoot $baselineRuntimeRoot
+            Test-BRAVOCondition `
+                -Condition (
+                    @($baselineInvalidLegacy.Problems).Count -ge 1 -and
+                    -not $baselineInvalidLegacy.Migrated -and
+                    -not (Test-Path -LiteralPath $baselineCanonicalPath -PathType Leaf)
+                ) `
+                -Name 'DiscoveryBaseline/InvalidLegacyIsReportedAndNotMigrated' `
+                -Failure 'пошкоджений legacy мусить бути повідомлений, і міграція не має створювати canonical з непрочитаного вмісту'
+
+            # --- DiscoveryBaseline/SaveIsAtomic ---
+            # Атомарність не можна довести перериванням процесу в юніт-тесті,
+            # тому перевіряється спостережуваний наслідок патерну: після
+            # запису в каталозі немає ані .tmp, ані .bak залишків, а вміст
+            # валідний.
+            & $baselineResetScenario
+            Save-BRAVODiscoveryBaseline -DiscoveryResult $autoDiscovery -BaselinePath $baselineCanonicalPath
+            Save-BRAVODiscoveryBaseline -DiscoveryResult $autoDiscovery -BaselinePath $baselineCanonicalPath
+            $baselineLeftovers = @(Get-ChildItem -LiteralPath $baselineStateRoot -Filter '.DISCOVERY_BASELINE_*' -Force -ErrorAction SilentlyContinue)
+            Test-BRAVOCondition `
+                -Condition (
+                    $baselineLeftovers.Count -eq 0 -and
+                    (Test-Path -LiteralPath $baselineCanonicalPath -PathType Leaf) -and
+                    $null -ne ((Get-Content -LiteralPath $baselineCanonicalPath -Raw -Encoding UTF8) | ConvertFrom-Json)
+                ) `
+                -Name 'DiscoveryBaseline/SaveIsAtomic' `
+                -Failure "повторний запис baseline не має лишати тимчасових файлів (.tmp/.bak) і мусить давати валідний JSON; залишків=$($baselineLeftovers.Count)"
+
+            # --- DiscoveryBaseline/SetupUsesCanonicalStatePath ---
+            # Структурний guard: BRAVO_SETUP не сміє повернутись до
+            # обчислення шляху від $PSScriptRoot\LOGS.
+            $baselineSetupText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SETUP.ps1'), [Text.Encoding]::UTF8)
+            Test-BRAVOCondition `
+                -Condition (
+                    $baselineSetupText.Contains('Import-BRAVODiscoveryBaseline') -and
+                    $baselineSetupText.Contains('-StateRoot $global:stateRoot') -and
+                    -not $baselineSetupText.Contains('Join-Path $PSScriptRoot "LOGS\DISCOVERY_BASELINE.json"')
+                ) `
+                -Name 'DiscoveryBaseline/SetupUsesCanonicalStatePath' `
+                -Failure 'BRAVO_SETUP.ps1 мусить читати baseline через Import-BRAVODiscoveryBaseline зі $global:stateRoot, а не збирати шлях від $PSScriptRoot\LOGS (#158 етап 1)'
+        }
     } finally {
         if (Test-Path -LiteralPath $discoveryTestRoot) {
             Remove-Item -LiteralPath $discoveryTestRoot -Recurse -Force -ErrorAction SilentlyContinue

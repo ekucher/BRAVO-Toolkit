@@ -469,17 +469,47 @@ try {
         # baseline. Це лише read-only перевірка дрейфу — не блокує сама
         # собою; критичність (Fail vs Warn) лишається за адміністратором,
         # який бачить попередження й вирішує.
-        $discoveryBaselinePath = Join-Path $PSScriptRoot "LOGS\DISCOVERY_BASELINE.json"
-        $discoveryDrift = @(Compare-BRAVODiscoveryBaseline `
-            -DiscoveryResult $bravoDiscoveryResult `
-            -BaselinePath $discoveryBaselinePath)
+        #
+        # #158 (етап 1): baseline — машинний стан, тож canonical розташування
+        # тепер %ProgramData%\BRAVO\State, а не <RuntimeRoot>\LOGS. Читання
+        # іде через Import-BRAVODiscoveryBaseline, який за потреби переносить
+        # наявний файл зі старого розташування (сервери, що працюють давно,
+        # мають його саме там) і НІКОЛИ не відкочується мовчки на «перший
+        # запуск», якщо canonical пошкоджений.
+        $discoveryBaselineImport = Import-BRAVODiscoveryBaseline `
+            -StateRoot $global:stateRoot `
+            -RuntimeRoot $PSScriptRoot
+        $discoveryBaselinePath = [string]$discoveryBaselineImport.Path
+        foreach ($baselineProblem in @($discoveryBaselineImport.Problems)) {
+            Write-Host "УВАГА: $baselineProblem" -ForegroundColor Yellow
+        }
+        if ($discoveryBaselineImport.Migrated) {
+            Write-Host ("Discovery baseline перенесено у машинний стан: " +
+                "$($discoveryBaselineImport.LegacyPath) -> $discoveryBaselinePath") -ForegroundColor Green
+        }
+
+        # Baseline передається ОБ'ЄКТОМ, а не шляхом: файл уже прочитано
+        # вище (разом з міграцією й діагностикою), і другий читач того
+        # самого файлу розійшовся б з першим у трактуванні пошкодження.
+        $discoveryDrift = if ($null -ne $discoveryBaselineImport.Baseline) {
+            @(Compare-BRAVODiscoveryBaseline `
+                -DiscoveryResult $bravoDiscoveryResult `
+                -Baseline $discoveryBaselineImport.Baseline)
+        } else {
+            @()
+        }
         if ($discoveryDrift.Count -gt 0) {
             Write-Host "УВАГА: виявлено дрейф джерел відносно збереженого baseline:" -ForegroundColor Yellow
             foreach ($driftMessage in $discoveryDrift) {
                 Write-Host "  - $driftMessage" -ForegroundColor Yellow
             }
-        } elseif (Test-Path -LiteralPath $discoveryBaselinePath -PathType Leaf) {
+        } elseif ($null -ne $discoveryBaselineImport.Baseline) {
             Write-Host "Дрейфу джерел відносно збереженого baseline не виявлено."
+        } elseif ([string]$discoveryBaselineImport.Source -eq 'Unreadable') {
+            # Свідомо НЕ «ще не збережено»: baseline є, але непридатний, і
+            # видати це за перший запуск означало б приховати втрату
+            # захисту від тихого зникнення компонента.
+            Write-Host "Baseline discovery НЕПРИДАТНИЙ до читання — захист від дрейфу джерел зараз не діє." -ForegroundColor Yellow
         } else {
             Write-Host "Baseline discovery ще не збережено (перший запуск або ще не підтверджено)."
         }
