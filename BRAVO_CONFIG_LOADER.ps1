@@ -845,7 +845,40 @@ function Complete-BRAVOConfigurationLoad {
         Import-Module -Name $derivationModulePath -ErrorAction Stop
     }
 
+    $schemaModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name $schemaModulePath -ErrorAction Stop
+    }
+
     $defaultConfiguration = Get-BRAVODefaultConfiguration
+
+    # #154 (B2): валідація ТИПІВ site-шару — місце в канонічному
+    # конвеєрі v2 рівно тут: після невиконуючого вилучення даних і ДО
+    # мерджу. Схема будується з КАНОНІЧНИХ ДЕФОЛТІВ, а не зі
+    # змердженого графа: інакше значення з BRAVO.config могло б
+    # розширити схему й узаконити тип, якого канонічна форма не має.
+    #
+    # Перевіряється лише site-шар. Legacy BRAVO.config навмисно НЕ
+    # перевіряється типами: він розгорнутий на серверах, прибирається
+    # окремою задачею (#154, B4), і перетворення його розбіжностей на
+    # відмову запуску було б зміною поведінки поза обсягом B2 —
+    # асиметрія суворості шарів (F1) лишається предметом задачі A3,
+    # яка вже робить її ВИДИМОЮ через попередження.
+    #
+    # Невідомі шляхи тут не класифікуються: top-level/батьківський
+    # вузол і далі відхиляє ConvertTo-BRAVONestedOverride, невідомий
+    # кінцевий сегмент і далі приймається (рішення власника D3) та
+    # обліковується $UnknownLeafPathSink.
+    if ($LocalOverrides.Count -gt 0) {
+        $localSchemaResult = Test-BRAVOConfigurationOverrideSchema `
+            -DotPathOverrides $LocalOverrides `
+            -Schema (Get-BRAVOConfigurationSchema -ReferenceConfiguration $defaultConfiguration)
+        if (-not $localSchemaResult.IsValid) {
+            $localSchemaMessages = @(@($localSchemaResult.Violations) | ForEach-Object { [string]$_.Message })
+            throw ("BRAVO.local.config: недійсний тип значення — " + [string]::Join(' ', $localSchemaMessages))
+        }
+    }
+
     $mergedConfiguration = Resolve-BRAVORawConfiguration `
         -DefaultConfiguration $defaultConfiguration `
         -PrimaryOverrides $PrimaryOverrides `
