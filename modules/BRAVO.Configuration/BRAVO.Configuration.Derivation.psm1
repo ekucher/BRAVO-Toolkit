@@ -304,6 +304,27 @@ function Resolve-BRAVOConfigurationDerivation {
         -BazaWWWDetection $bazaWWWDetection `
         -SftpDirectories $sftpDirectories
 
+    # =============================================
+    # УВІМКНЕНІ КОМПОНЕНТИ DISCOVERY — ЄДИНЕ ДЖЕРЕЛО ПРАВДИ
+    # =============================================
+    # #158 (етап 3): і BRAVO_SETUP (-ValidateOnly), і Archive runtime мусять
+    # питати Discovery про ТОЙ САМИЙ набір увімкнених компонентів. Доти цей
+    # мапінг componentSettings -> {MODEL;BLOG;BRAVOEXCH;BAZA_APP;BAZA_WWW}
+    # будувався inline в BRAVO_SETUP.ps1; друга копія в Archive розійшлася б
+    # із першою рівно тоді, коли зміниться склад компонентів. Власник
+    # мапінгу — рівень конфігурації (саме він володіє componentSettings),
+    # а не BRAVO.Discovery, яка про схему конфігурації нічого не знає.
+    # Семантика збережена дослівно з наявного виклику Test-BRAVODiscoveryResult.
+    $global:discoveryEnabledComponents = @{
+        MODEL = [bool]$componentSettings.Archive.MODEL
+        BLOG = [bool]$componentSettings.Archive.BLOG
+        BRAVOEXCH = [bool]$componentSettings.Archive.BRAVOEXCH
+        BAZA_APP = ([bool]$componentSettings.Synchronization.BAZA_APP_LOCAL -or
+            [bool]$componentSettings.Synchronization.BAZA_APP_SFTP)
+        BAZA_WWW = ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP -or
+            [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL)
+    }
+
     # БАЗОВІ ШЛЯХИ, ЯКІ ПЕРЕВІРЯЮТЬСЯ ЗАВЖДИ
     $global:baseRequiredPaths = @(
         @{Path=$logPath; Description="Каталог логiв"; CreateIfMissing=$true}

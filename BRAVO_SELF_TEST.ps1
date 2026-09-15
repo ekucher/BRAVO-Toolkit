@@ -10728,6 +10728,268 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             -Name "Discovery/PresenceContractShownBySetupValidateOnly" `
             -Failure "BRAVO_SETUP.ps1 має виводити presence-стан компонентів через Write-BRAVODiscoveryPresenceReport"
 
+        # === #158 (етап 3): дрейф складу джерел відносно baseline ===
+        # Перевіряємо саме рішення (Test-BRAVODiscoveryComponentDrift) на
+        # РЕАЛЬНИХ результатах discovery, а не на синтетичних об'єктах:
+        # інакше тест зафіксував би власну копію presence-контракту замість
+        # фактичної поведінки пари "presence + baseline".
+        & {
+            $driftRoot = Join-Path `
+                -Path ([IO.Path]::GetTempPath()) `
+                -ChildPath ("BRAVO_DRIFT_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+            try {
+                [void][IO.Directory]::CreateDirectory($driftRoot)
+                $driftInstallRoot = Join-Path $driftRoot "install"
+                [void][IO.Directory]::CreateDirectory($driftInstallRoot)
+                foreach ($driftDirName in @("Model", "BLOG", "BAZA")) {
+                    $driftDirPath = Join-Path $driftInstallRoot $driftDirName
+                    [void][IO.Directory]::CreateDirectory($driftDirPath)
+                    [IO.File]::WriteAllText((Join-Path $driftDirPath 'fixture.txt'), 'x', (New-Object Text.UTF8Encoding($false)))
+                }
+                $driftBravoExePath = Join-Path $driftInstallRoot "bravo.exe"
+                [IO.File]::WriteAllText($driftBravoExePath, "stub")
+
+                $driftSystemRoot = Join-Path $driftRoot "FixtureWindows"
+                $driftIniPath = Join-Path $driftSystemRoot "SysWOW64\bravo.ini"
+                [void][IO.Directory]::CreateDirectory((Split-Path -Path $driftIniPath -Parent))
+                # BEXCH у bravo.ini свідомо НЕМАЄ: це і є "компонент
+                # достовірно відсутній" для матриці нижче.
+                [IO.File]::WriteAllLines($driftIniPath, @(
+                    '[model]',
+                    ("MODEL={0}" -f (Join-Path (Join-Path $driftInstallRoot "Model") "lims")),
+                    ("BLOG={0}\" -f (Join-Path $driftInstallRoot "BLOG"))
+                ))
+                $driftServices = @(
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $driftBravoExePath) }
+                )
+                $driftDiscovery = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $driftInstallRoot `
+                    -BravoServiceName "BRAVO" `
+                    -WebServiceCandidates @("Apache2.4") `
+                    -Services $driftServices `
+                    -SystemRoot $driftSystemRoot `
+                    -Is64BitOperatingSystem $true
+
+                $driftAllEnabled = @{
+                    MODEL = $true; BLOG = $true; BRAVOEXCH = $true
+                    BAZA_APP = $true; BAZA_WWW = $true
+                }
+                $driftAllDisabled = @{
+                    MODEL = $false; BLOG = $false; BRAVOEXCH = $false
+                    BAZA_APP = $false; BAZA_WWW = $false
+                }
+                function Get-BRAVODriftErrorComponents {
+                    param([object[]]$Findings)
+                    return @(@($Findings) | Where-Object { [string]$_.Severity -eq 'Error' } |
+                        ForEach-Object { [string]$_.Component })
+                }
+
+                # --- Presence/AbsentWithoutBaselineIsInformational ---
+                # BRAVOEXCH увімкнений, джерело достовірно відсутнє
+                # (bravo.ini читається, ключа BEXCH немає), у baseline його
+                # ніколи не було -> Info, прогін не зупиняється.
+                $driftNoBaseline = @(Test-BRAVODiscoveryComponentDrift `
+                    -DiscoveryResult $driftDiscovery `
+                    -Baseline $null `
+                    -BaselineSourceKind 'None' `
+                    -EnabledComponents $driftAllEnabled)
+                $driftNoBaselineErrors = @(Get-BRAVODriftErrorComponents -Findings $driftNoBaseline)
+                Test-BRAVOCondition `
+                    -Condition (
+                        $driftNoBaselineErrors.Count -eq 0 -and
+                        @($driftNoBaseline | Where-Object {
+                            [string]$_.Component -eq 'BRAVOEXCH' -and [string]$_.Severity -eq 'Info'
+                        }).Count -eq 1
+                    ) `
+                    -Name "Presence/AbsentWithoutBaselineIsInformational" `
+                    -Failure "компонент, достовірно відсутній і НЕ підтверджений раніше в baseline, має давати лише Info — прогін через нього зупинятись не повинен"
+
+                # --- Presence/FirstRunWithoutBaselineDoesNotTreatEverythingAsDisappeared ---
+                # Той самий результат, але дивимось на ВЕСЬ набір: перший
+                # запуск не має перетворити кожен компонент на "зниклий".
+                Test-BRAVOCondition `
+                    -Condition (
+                        $driftNoBaselineErrors.Count -eq 0 -and
+                        @($driftNoBaseline | Where-Object { [string]$_.Severity -eq 'Info' }).Count -ge 2
+                    ) `
+                    -Name "Presence/FirstRunWithoutBaselineDoesNotTreatEverythingAsDisappeared" `
+                    -Failure "перший запуск (baseline ще немає) не має давати жодної помилки дрейфу — порожній baseline не містить підтверджень, отже зникнути не могло нічого"
+
+                # --- Presence/AbsentKnownComponentFailsClosed ---
+                # Той самий Absent, але компонент БУВ підтверджений у
+                # baseline -> fail-closed. Це і є головний інваріант Issue:
+                # "не знайшли" != "значить не треба backup".
+                $driftStaleBaselinePath = Join-Path $driftRoot "stale-state"
+                [void][IO.Directory]::CreateDirectory($driftStaleBaselinePath)
+                $driftConfirmedExchSource = Join-Path $driftInstallRoot "bravoexch"
+                [IO.File]::WriteAllText(
+                    (Join-Path $driftStaleBaselinePath 'DISCOVERY_BASELINE.json'),
+                    ([pscustomobject]@{
+                        SavedAt = (Get-Date).ToString("o")
+                        MODEL_SOURCE = (Join-Path $driftInstallRoot "Model")
+                        BLOG_SOURCE = (Join-Path $driftInstallRoot "BLOG")
+                        BRAVOEXCH_SOURCE = $driftConfirmedExchSource
+                        BAZA_APP = (Join-Path $driftInstallRoot "BAZA")
+                    } | ConvertTo-Json),
+                    (New-Object Text.UTF8Encoding($false)))
+                $driftStaleImport = Import-BRAVODiscoveryBaseline `
+                    -StateRoot $driftStaleBaselinePath `
+                    -RuntimeRoot $driftRoot
+                $driftWithBaseline = @(Test-BRAVODiscoveryComponentDrift `
+                    -DiscoveryResult $driftDiscovery `
+                    -Baseline $driftStaleImport.Baseline `
+                    -BaselineSourceKind ([string]$driftStaleImport.Source) `
+                    -EnabledComponents $driftAllEnabled)
+                $driftWithBaselineExch = @($driftWithBaseline | Where-Object { [string]$_.Component -eq 'BRAVOEXCH' })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $driftWithBaselineExch.Count -eq 1 -and
+                        [string]$driftWithBaselineExch[0].Severity -eq 'Error' -and
+                        [string]$driftWithBaselineExch[0].Presence -eq 'Absent' -and
+                        [string]$driftWithBaselineExch[0].BaselineSource -eq $driftConfirmedExchSource -and
+                        [string]$driftWithBaselineExch[0].Message -match '(?i)BRAVOEXCH' -and
+                        [string]$driftWithBaselineExch[0].Message -match 'ConfirmDiscoveryBaseline'
+                    ) `
+                    -Name "Presence/AbsentKnownComponentFailsClosed" `
+                    -Failure "компонент, раніше підтверджений у baseline, а тепер Absent, має давати Error із назвою компонента, попереднім джерелом і canonical командою підтвердження"
+
+                # --- Presence/AmbiguousFailsClosed і Presence/ErrorFailsClosed ---
+                # bravo.ini недоступний (MODEL/BLOG/BRAVOEXCH -> Error) і
+                # дві служби BRAVO з різними exe (BAZA_APP -> Ambiguous).
+                $driftSecondInstall = Join-Path $driftRoot "second-install"
+                [void][IO.Directory]::CreateDirectory($driftSecondInstall)
+                $driftSecondExe = Join-Path $driftSecondInstall "bravo.exe"
+                [IO.File]::WriteAllText($driftSecondExe, "stub")
+                $driftAmbiguousServices = @(
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Service"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $driftBravoExePath) },
+                    [pscustomobject]@{ Name = "BRAVO"; DisplayName = "BRAVO Server"; State = "Running"; StartMode = "Auto"; PathName = ('"{0}"' -f $driftSecondExe) }
+                )
+                $driftUnknownDiscovery = Resolve-BRAVOInstallationDiscovery `
+                    -LimsRoot $driftInstallRoot `
+                    -BravoServiceName "BRAVO" `
+                    -WebServiceCandidates @("Apache2.4") `
+                    -Services $driftAmbiguousServices `
+                    -SystemRoot (Join-Path $driftRoot "NoSuchSystemRoot") `
+                    -Is64BitOperatingSystem $true
+                $driftUnknownFindings = @(Test-BRAVODiscoveryComponentDrift `
+                    -DiscoveryResult $driftUnknownDiscovery `
+                    -Baseline $null `
+                    -BaselineSourceKind 'None' `
+                    -EnabledComponents $driftAllEnabled)
+                $driftUnknownBazaApp = @($driftUnknownFindings | Where-Object { [string]$_.Component -eq 'BAZA_APP' })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $driftUnknownBazaApp.Count -eq 1 -and
+                        [string]$driftUnknownBazaApp[0].Severity -eq 'Error' -and
+                        [string]$driftUnknownBazaApp[0].Presence -eq 'Ambiguous'
+                    ) `
+                    -Name "Presence/AmbiguousFailsClosed" `
+                    -Failure "неоднозначне джерело увімкненого компонента має зупиняти прогін (Error) навіть без baseline — обирати кандидата автоматично заборонено"
+
+                $driftUnknownModel = @($driftUnknownFindings | Where-Object { [string]$_.Component -eq 'MODEL' })
+                Test-BRAVOCondition `
+                    -Condition (
+                        $driftUnknownModel.Count -eq 1 -and
+                        [string]$driftUnknownModel[0].Severity -eq 'Error' -and
+                        [string]$driftUnknownModel[0].Presence -eq 'Error'
+                    ) `
+                    -Name "Presence/ErrorFailsClosed" `
+                    -Failure "presence='Error' (відмова провайдера discovery) увімкненого компонента має зупиняти прогін і НЕ трактуватись як 'Absent'"
+
+                # --- Presence/ExplicitDisabledOverridesPresenceWithoutDriftError ---
+                # Той самий "поганий" результат, але всі компоненти вимкнені
+                # оператором: це свідома політика, а не дрейф.
+                $driftDisabledFindings = @(Test-BRAVODiscoveryComponentDrift `
+                    -DiscoveryResult $driftUnknownDiscovery `
+                    -Baseline $driftStaleImport.Baseline `
+                    -BaselineSourceKind ([string]$driftStaleImport.Source) `
+                    -EnabledComponents $driftAllDisabled)
+                Test-BRAVOCondition `
+                    -Condition (
+                        @(Get-BRAVODriftErrorComponents -Findings $driftDisabledFindings).Count -eq 0 -and
+                        @($driftDisabledFindings | Where-Object {
+                            [string]$_.Presence -eq 'Disabled' -and
+                            [string]$_.Message -match '(?i)вимкнено явною конфігурацією'
+                        }).Count -ge 1
+                    ) `
+                    -Name "Presence/ExplicitDisabledOverridesPresenceWithoutDriftError" `
+                    -Failure "явно вимкнений оператором компонент не має породжувати помилку дрейфу навіть при Ambiguous/Error чи наявному baseline — у журналі має бути сказано, що його пропущено через конфігурацію"
+
+                # --- Presence/ConfirmBaselineAcceptsLegitimateChange ---
+                # Оператор підтвердив новий склад через canonical
+                # -ConfirmDiscoveryBaseline: той самий прогін, який щойно
+                # падав, більше не має помилок дрейфу.
+                $driftConfirmedStateRoot = Join-Path $driftRoot "confirmed-state"
+                [void][IO.Directory]::CreateDirectory($driftConfirmedStateRoot)
+                Save-BRAVODiscoveryBaseline `
+                    -DiscoveryResult $driftDiscovery `
+                    -BaselinePath (Get-BRAVODiscoveryBaselinePath -StateRoot $driftConfirmedStateRoot)
+                $driftConfirmedImport = Import-BRAVODiscoveryBaseline `
+                    -StateRoot $driftConfirmedStateRoot `
+                    -RuntimeRoot $driftRoot
+                $driftAfterConfirm = @(Test-BRAVODiscoveryComponentDrift `
+                    -DiscoveryResult $driftDiscovery `
+                    -Baseline $driftConfirmedImport.Baseline `
+                    -BaselineSourceKind ([string]$driftConfirmedImport.Source) `
+                    -EnabledComponents $driftAllEnabled)
+                Test-BRAVOCondition `
+                    -Condition (
+                        @(Get-BRAVODriftErrorComponents -Findings $driftWithBaseline).Count -gt 0 -and
+                        @(Get-BRAVODriftErrorComponents -Findings $driftAfterConfirm).Count -eq 0 -and
+                        [string]$driftConfirmedImport.Source -eq 'Canonical'
+                    ) `
+                    -Name "Presence/ConfirmBaselineAcceptsLegitimateChange" `
+                    -Failure "після підтвердження нового baseline через Save-BRAVODiscoveryBaseline той самий discovery-результат не має давати помилок дрейфу (інакше легітимну зміну складу неможливо прийняти)"
+
+                # Пошкоджений baseline != 'baseline немає': відкат на
+                # 'перший запуск' знецінив би захист саме тоді, коли він
+                # потрібен.
+                $driftBrokenStateRoot = Join-Path $driftRoot "broken-state"
+                [void][IO.Directory]::CreateDirectory($driftBrokenStateRoot)
+                [IO.File]::WriteAllText(
+                    (Join-Path $driftBrokenStateRoot 'DISCOVERY_BASELINE.json'),
+                    '{ це не JSON',
+                    (New-Object Text.UTF8Encoding($false)))
+                $driftBrokenImport = Import-BRAVODiscoveryBaseline `
+                    -StateRoot $driftBrokenStateRoot `
+                    -RuntimeRoot $driftRoot
+                $driftBrokenFindings = @(Test-BRAVODiscoveryComponentDrift `
+                    -DiscoveryResult $driftDiscovery `
+                    -Baseline $driftBrokenImport.Baseline `
+                    -BaselineSourceKind ([string]$driftBrokenImport.Source) `
+                    -EnabledComponents $driftAllEnabled)
+                Test-BRAVOCondition `
+                    -Condition (
+                        [string]$driftBrokenImport.Source -eq 'Unreadable' -and
+                        @($driftBrokenFindings | Where-Object {
+                            [string]$_.Component -eq 'BASELINE' -and [string]$_.Severity -eq 'Error'
+                        }).Count -eq 1
+                    ) `
+                    -Name "Presence/UnreadableBaselineFailsClosed" `
+                    -Failure "непридатний до читання baseline має давати помилку (стан складу джерел невідомий), а не мовчазний відкат на 'перший запуск'"
+            } finally {
+                Remove-Item -LiteralPath $driftRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
+        # Структурні guard-и: рішення про дрейф має бути під'єднане і до
+        # операторської перевірки, і до production-прогону. Без другого
+        # захист діяв би лише тоді, коли оператор дивиться на екран.
+        $setupTextForDrift = Get-Content -LiteralPath (Join-Path $root "BRAVO_SETUP.ps1") -Raw -Encoding UTF8
+        $archiveRuntimeTextForDrift = Get-Content -LiteralPath (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1") -Raw -Encoding UTF8
+        $derivationTextForDrift = Get-Content -LiteralPath (Join-Path $root "modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1") -Raw -Encoding UTF8
+        Test-BRAVOCondition `
+            -Condition (
+                $setupTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
+                $archiveRuntimeTextForDrift.Contains('Test-BRAVODiscoveryComponentDrift') -and
+                $archiveRuntimeTextForDrift.Contains('-not $discoveryBaselineValid') -and
+                $derivationTextForDrift.Contains('$global:discoveryEnabledComponents') -and
+                $setupTextForDrift.Contains('$global:discoveryEnabledComponents') -and
+                $archiveRuntimeTextForDrift.Contains('$global:discoveryEnabledComponents')
+            ) `
+            -Name "Presence/DriftGateIsWiredIntoArchiveRuntimeAndSetup" `
+            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents, а не будуватись inline двічі"
+
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot
         # структурно валідний (реальний, непорожній <DocumentRoot>\BAZA) —

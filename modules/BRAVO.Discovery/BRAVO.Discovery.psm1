@@ -1296,13 +1296,11 @@ function Test-BRAVODiscoveryResult {
         }
     }
 
-    $sourceFieldsByComponent = @{
-        MODEL = "MODEL_SOURCE"
-        BLOG = "BLOG_SOURCE"
-        BRAVOEXCH = "BRAVOEXCH_SOURCE"
-        BAZA_APP = "BAZA_APP"
-        BAZA_WWW = "BAZA_WWW"
-    }
+    # Канонічна мапа компонент -> поле результату discovery живе на рівні
+    # модуля ($script:BRAVODiscoveryComponentSourceFields): її читає ще й
+    # Test-BRAVODiscoveryComponentDrift, а дві копії цієї відповідності
+    # розійшлися б рівно тоді, коли додасться новий компонент.
+    $sourceFieldsByComponent = $script:BRAVODiscoveryComponentSourceFields
 
     foreach ($componentName in $sourceFieldsByComponent.Keys) {
         if (-not $EnabledComponents.Contains($componentName) -or
@@ -1359,12 +1357,176 @@ function Test-BRAVODiscoveryResult {
     return $errors.ToArray()
 }
 
+$script:BRAVODiscoveryComponentSourceFields = [ordered]@{
+    MODEL = 'MODEL_SOURCE'
+    BLOG = 'BLOG_SOURCE'
+    BRAVOEXCH = 'BRAVOEXCH_SOURCE'
+    BAZA_APP = 'BAZA_APP'
+    BAZA_WWW = 'BAZA_WWW'
+}
+
+# Canonical механізм підтвердження baseline. Рядок згадується в кожному
+# повідомленні про дрейф, тому він тут один — нову команду під це НЕ
+# вигадуємо, -ConfirmDiscoveryBaseline уже існує й задокументований.
+$script:BRAVODiscoveryConfirmBaselineCommand = '.\BRAVO_SETUP.ps1 -Action Test -ValidateOnly -ConfirmDiscoveryBaseline'
+
 $script:BRAVODiscoveryBaselineFields = @(
     'BRAVO_ROOT', 'WEB_ROOT', 'MODEL_SOURCE', 'BLOG_SOURCE',
     'BRAVOEXCH_SOURCE', 'BAZA_APP', 'BAZA_WWW', 'BACKUP_ROOT'
 )
 
 $script:BRAVODiscoveryBaselineFileName = 'DISCOVERY_BASELINE.json'
+
+function New-BRAVODiscoveryDriftFinding {
+    # Спільна структура знахідки дрейфу (#158, етап 3). Severity лише
+    # 'Error' або 'Info': третього рівня тут навмисно немає — знахідка
+    # або зупиняє прогін, або пояснює оператору легітимний стан.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Component,
+        [Parameter(Mandatory = $true)][ValidateSet('Error', 'Info')][string]$Severity,
+        [string]$Presence = 'Unknown',
+        [string]$BaselineSource,
+        [Parameter(Mandatory = $true)][string]$Message
+    )
+
+    return [pscustomobject]@{
+        Component = $Component
+        Severity = $Severity
+        Presence = $Presence
+        BaselineSource = $BaselineSource
+        Message = $Message
+    }
+}
+
+function Test-BRAVODiscoveryComponentDrift {
+    # #158 (етап 3): компонент, який РАНІШЕ був підтверджений у baseline,
+    # не має права тихо зникнути з backup set. Це рішення про склад
+    # прогону, тому воно живе поруч із presence-контрактом і baseline, а
+    # не в кожному entrypoint окремо.
+    #
+    # Матриця (лише для УВІМКНЕНИХ компонентів):
+    #
+    #   Present                          -> компонент активний, знахідки немає
+    #   Absent  + у baseline немає       -> Info (легітимна відсутність)
+    #   Absent  + у baseline є           -> Error (fail-closed)
+    #   Ambiguous                        -> Error (fail-closed)
+    #   Error                            -> Error (fail-closed)
+    #   вимкнено в конфігурації           -> Info (свідома політика оператора)
+    #
+    # Інваріант, заради якого все це існує: "не знайшли" НІКОЛИ не означає
+    # "значить не треба backup", якщо компонент був у baseline. Перший
+    # запуск (baseline ще немає) не перетворює всі компоненти на зниклі —
+    # порожній baseline не містить жодного підтвердження.
+    #
+    # Ambiguous/Error блокують і БЕЗ baseline: це не "зник", це "не можемо
+    # визначити", а тиха неповна копія гірша за керовану помилку.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][object]$DiscoveryResult,
+        # Уже прочитаний baseline (об'єкт із Import-BRAVODiscoveryBaseline)
+        # або $null, якщо його ще немає. Читання файлу лишається за
+        # Import-BRAVODiscoveryBaseline — другого читача не вводимо.
+        [object]$Baseline,
+        # Source з Import-BRAVODiscoveryBaseline: Canonical /
+        # MigratedFromLegacy / None / Unreadable.
+        [string]$BaselineSourceKind = 'None',
+        [hashtable]$EnabledComponents = @{}
+    )
+
+    $findings = New-Object System.Collections.Generic.List[object]
+    $confirmHint = "Якщо зміна легітимна — підтвердіть новий baseline: $script:BRAVODiscoveryConfirmBaselineCommand"
+
+    if ([string]$BaselineSourceKind -eq 'Unreadable') {
+        # Пошкоджений baseline НЕ дорівнює "baseline немає": мовчазний
+        # відкат на "перший запуск" знецінив би весь захист рівно тоді,
+        # коли він потрібен. Стан невідомий -> fail-closed.
+        $findings.Add((New-BRAVODiscoveryDriftFinding `
+            -Component 'BASELINE' -Severity 'Error' -Presence 'Error' `
+            -Message ("Підтверджений discovery baseline непридатний до читання, тому неможливо " +
+                "встановити, чи зник раніше підтверджений компонент. Прогін зупинено. $confirmHint")))
+    }
+
+    if (-not $DiscoveryResult.PSObject.Properties['Components'] -or
+        -not ($DiscoveryResult.Components -is [System.Collections.IDictionary])) {
+        # Presence-контракт недоступний — оцінити склад джерел нічим.
+        $findings.Add((New-BRAVODiscoveryDriftFinding `
+            -Component 'BASELINE' -Severity 'Error' -Presence 'Error' `
+            -Message ('Результат discovery не містить presence-контракту (поле Components), ' +
+                'тому склад backup set перевірити неможливо.')))
+        return $findings.ToArray()
+    }
+
+    foreach ($componentName in $script:BRAVODiscoveryComponentSourceFields.Keys) {
+        $isEnabled = ($EnabledComponents.Contains($componentName) -and
+            [bool]$EnabledComponents[$componentName])
+        if (-not $isEnabled) {
+            # Explicit Disabled — свідома політика оператора, а не дрейф.
+            # Саме тому ця гілка стоїть ПЕРЕД будь-яким читанням presence:
+            # вимкнений компонент не має права зупинити прогін навіть у
+            # стані Ambiguous/Error.
+            $findings.Add((New-BRAVODiscoveryDriftFinding `
+                -Component $componentName -Severity 'Info' -Presence 'Disabled' `
+                -Message "Компонент '$componentName' пропущено: вимкнено явною конфігурацією оператора."))
+            continue
+        }
+
+        $componentEntry = $DiscoveryResult.Components[$componentName]
+        $presence = if ($null -ne $componentEntry) { [string]$componentEntry.Presence } else { 'Error' }
+        $presenceReason = if ($null -ne $componentEntry) { [string]$componentEntry.Reason } else { 'запису presence для компонента немає' }
+
+        $baselineFieldName = [string]$script:BRAVODiscoveryComponentSourceFields[$componentName]
+        $baselineValue = $null
+        if ($null -ne $Baseline -and $Baseline.PSObject.Properties[$baselineFieldName]) {
+            $baselineValue = [string]$Baseline.$baselineFieldName
+        }
+        $wasConfirmed = -not [string]::IsNullOrWhiteSpace($baselineValue)
+
+        if ($presence -eq 'Present') {
+            continue
+        }
+
+        if ($presence -eq 'Absent') {
+            if ($wasConfirmed) {
+                $findings.Add((New-BRAVODiscoveryDriftFinding `
+                    -Component $componentName -Severity 'Error' -Presence $presence `
+                    -BaselineSource $baselineValue `
+                    -Message ("Компонент '$componentName' раніше був підтверджений у baseline (джерело: " +
+                        "$baselineValue), а зараз має presence-стан 'Absent' ($presenceReason). " +
+                        'Склад backup set змінився: цей компонент більше не потрапляє в резервну копію. ' +
+                        "$confirmHint")))
+            } else {
+                $findings.Add((New-BRAVODiscoveryDriftFinding `
+                    -Component $componentName -Severity 'Info' -Presence $presence `
+                    -Message ("Компонент '$componentName' увімкнено, але джерело достовірно відсутнє й " +
+                        "у baseline раніше не підтверджувалось ($presenceReason).")))
+            }
+            continue
+        }
+
+        # Ambiguous і Error: стан джерела невідомий. Baseline тут нічого не
+        # змінює — підтверджене раніше джерело лише додає деталі до
+        # повідомлення.
+        $ambiguousOrErrorMessage = if ($presence -eq 'Ambiguous') {
+            "Компонент '$componentName' увімкнено, але джерело неоднозначне ($presenceReason). " +
+                'Обрати кандидата автоматично заборонено: резервна копія не того джерела виглядала б успішною.'
+        } else {
+            "Компонент '$componentName' увімкнено, але стан джерела визначити не вдалося ($presenceReason). " +
+                "'Не вдалося визначити' не дорівнює 'відсутній'."
+        }
+        if ($wasConfirmed) {
+            $ambiguousOrErrorMessage += " Раніше підтверджене джерело: $baselineValue."
+        }
+        $findings.Add((New-BRAVODiscoveryDriftFinding `
+            -Component $componentName -Severity 'Error' -Presence $presence `
+            -BaselineSource $baselineValue `
+            -Message ($ambiguousOrErrorMessage + " Прогін зупинено. $confirmHint")))
+    }
+
+    # Той самий контракт повернення, що й у Test-BRAVODiscoveryResult:
+    # звичайний масив, викликач обгортає @(...) сам.
+    return $findings.ToArray()
+}
 
 function Get-BRAVODiscoveryBaselinePath {
     <#
@@ -1967,6 +2129,7 @@ Export-ModuleMember -Function @(
     'Get-BRAVOEffectiveStorageConfiguration',
     'Get-BRAVOEffectiveSynchronizationConfiguration',
     'Test-BRAVODiscoveryResult',
+    'Test-BRAVODiscoveryComponentDrift',
     'Write-BRAVODiscoveryPresenceReport',
     'Save-BRAVODiscoveryBaseline',
     'Compare-BRAVODiscoveryBaseline',
