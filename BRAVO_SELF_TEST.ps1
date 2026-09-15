@@ -2399,65 +2399,68 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             $analyzedFile.FullName, [ref]$analyzedTokens, [ref]$analyzedErrors)
         if ($null -eq $analyzedAst) { continue }
 
-        $emptyCatches = @($analyzedAst.FindAll({
+        # #157 (фаза 1): ОДИН обхід дерева замість чотирьох. FindAll
+        # викликає PowerShell-scriptblock на КОЖЕН вузол AST — саме ці
+        # виклики, а не сам ParseFile, і є домінантною вартістю цих
+        # перевірок. Один предикат відбирає вузли всіх потрібних типів,
+        # а розбір за типом відбувається нижче, вже без повторних обходів.
+        $analyzedNodes = @($analyzedAst.FindAll({
             param($node)
-            $node -is [System.Management.Automation.Language.CatchClauseAst]
-        }, $true) | Where-Object { $_.Body.Statements.Count -eq 0 })
-
-        foreach ($emptyCatch in $emptyCatches) {
-            $bodyStart = $emptyCatch.Body.Extent.StartOffset
-            $bodyEnd = $emptyCatch.Body.Extent.EndOffset
-            $hasExplanation = @($analyzedTokens | Where-Object {
-                $_.Kind -eq 'Comment' -and
-                $_.Extent.StartOffset -ge $bodyStart -and
-                $_.Extent.EndOffset -le $bodyEnd
-            }).Count -gt 0
-            if (-not $hasExplanation) {
-                [void]$silentCatchFindings.Add(
-                    ("{0}:{1}" -f $analyzedFile.Name, $emptyCatch.Extent.StartLineNumber))
-            }
-        }
-
-        $commandNodes = @($analyzedAst.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.CommandAst]
-        }, $true))
-        foreach ($commandNode in $commandNodes) {
-            $commandName = $commandNode.GetCommandName()
-            if ($null -ne $commandName -and $neverCommandKeywords -contains $commandName.ToLowerInvariant()) {
-                [void]$keywordAsCommandFindings.Add(
-                    ("{0}:{1} ({2})" -f $analyzedFile.Name, $commandNode.Extent.StartLineNumber, $commandName))
-            }
-        }
-
-        $suspectNodes = @($analyzedAst.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
-            $node.Operator -eq 'Plus' -and
-            $node.Right -is [System.Management.Automation.Language.BinaryExpressionAst] -and
-            $node.Right.Operator -eq 'Format'
-        }, $true))
-        foreach ($suspectNode in $suspectNodes) {
-            if ($suspectNode.Left.Extent.Text -match '\{\d+\}') {
-                [void]$halfFormattedFindings.Add(
-                    ("{0}:{1}" -f $analyzedFile.Name, $suspectNode.Extent.StartLineNumber))
-            }
-        }
-
-        $literalNodes = @($analyzedAst.FindAll({
-            param($node)
+            $node -is [System.Management.Automation.Language.CatchClauseAst] -or
+            $node -is [System.Management.Automation.Language.CommandAst] -or
+            $node -is [System.Management.Automation.Language.BinaryExpressionAst] -or
             $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
             $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
         }, $true))
 
-        foreach ($literalNode in $literalNodes) {
-            $literalValue = [string]$literalNode.Extent.Text
+        foreach ($analyzedNode in $analyzedNodes) {
+            # --- порожній catch без пояснення ---
+            if ($analyzedNode -is [System.Management.Automation.Language.CatchClauseAst]) {
+                if ($analyzedNode.Body.Statements.Count -ne 0) { continue }
+                $bodyStart = $analyzedNode.Body.Extent.StartOffset
+                $bodyEnd = $analyzedNode.Body.Extent.EndOffset
+                $hasExplanation = @($analyzedTokens | Where-Object {
+                    $_.Kind -eq 'Comment' -and
+                    $_.Extent.StartOffset -ge $bodyStart -and
+                    $_.Extent.EndOffset -le $bodyEnd
+                }).Count -gt 0
+                if (-not $hasExplanation) {
+                    [void]$silentCatchFindings.Add(
+                        ("{0}:{1}" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
+                }
+                continue
+            }
+
+            # --- statement-keyword у позиції команди ---
+            if ($analyzedNode -is [System.Management.Automation.Language.CommandAst]) {
+                $commandName = $analyzedNode.GetCommandName()
+                if ($null -ne $commandName -and $neverCommandKeywords -contains $commandName.ToLowerInvariant()) {
+                    [void]$keywordAsCommandFindings.Add(
+                        ("{0}:{1} ({2})" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber, $commandName))
+                }
+                continue
+            }
+
+            # --- "a{0}" + "b{1}" -f args (форматується лише правий рядок) ---
+            if ($analyzedNode -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+                if ($analyzedNode.Operator -ne 'Plus') { continue }
+                if (-not ($analyzedNode.Right -is [System.Management.Automation.Language.BinaryExpressionAst])) { continue }
+                if ($analyzedNode.Right.Operator -ne 'Format') { continue }
+                if ($analyzedNode.Left.Extent.Text -match '\{\d+\}') {
+                    [void]$halfFormattedFindings.Add(
+                        ("{0}:{1}" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
+                }
+                continue
+            }
+
+            # --- рядкові літерали, що виглядають як облікові дані ---
+            $literalValue = [string]$analyzedNode.Extent.Text
             foreach ($credentialMatch in [regex]::Matches(
                     $literalValue, '(?i)sftp://[^:@\s/]+:([^@\s/]+)@')) {
                 $passwordPart = $credentialMatch.Groups[1].Value
                 if ($passwordPart -notmatch $placeholderPassword) {
                     [void]$credentialShapedLiterals.Add(
-                        ("{0}:{1} (sftp)" -f $analyzedFile.Name, $literalNode.Extent.StartLineNumber))
+                        ("{0}:{1} (sftp)" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
                 }
             }
             if ([regex]::IsMatch($literalValue,
@@ -2465,7 +2468,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                 $literalValue -notmatch '\*{3}' -and
                 $literalValue -notmatch '\{\d+\}') {
                 [void]$credentialShapedLiterals.Add(
-                    ("{0}:{1} (webhook)" -f $analyzedFile.Name, $literalNode.Extent.StartLineNumber))
+                    ("{0}:{1} (webhook)" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
             }
         }
     }
@@ -19430,16 +19433,22 @@ Test-BRAVOCondition `
     $perfMissingCollections = @($perfRequiredCollections | Where-Object {
         -not $perfMergedLoopText.Contains($_)
     })
+    # Обхід дерева теж має бути один: FindAll викликає scriptblock на
+    # КОЖЕН вузол, тож чотири обходи коштують учетверо більше за один —
+    # саме це, а не повторний ParseFile, було справжнім вузьким місцем.
+    $perfTreeWalkCount = @([regex]::Matches($perfMergedLoopText, '\.FindAll\(')).Count
     Test-BRAVOCondition `
         -Condition (
             $perfAnalysisLoops.Count -eq 1 -and
-            $perfMissingCollections.Count -eq 0
+            $perfMissingCollections.Count -eq 0 -and
+            $perfTreeWalkCount -eq 1
         ) `
         -Name "Perf/SingleAstPassOverRepositoryFiles" `
         -Failure ("по файлах комплекту має бути РІВНО ОДИН аналітичний AST-прохід, і він має живити всі " +
             "чотири аналізи (порожній catch, keyword-as-command, half-formatted -f, credential-shaped " +
-            "літерали). Фактично аналітичних проходів: $($perfAnalysisLoops.Count); не живляться з " +
-            "нього: $($perfMissingCollections -join ', ')")
+            "літерали), використавши РІВНО ОДИН обхід дерева (FindAll). Фактично аналітичних " +
+            "проходів: $($perfAnalysisLoops.Count); обходів дерева в ньому: $perfTreeWalkCount; " +
+            "не живляться з нього: $($perfMissingCollections -join ', ')")
 }
 
 # P0 fail-fast/telemetry: увесь попередній inline reporting/exit-хвіст
