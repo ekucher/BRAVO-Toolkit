@@ -220,6 +220,51 @@ try {
         -Name "ConfigLoader/LocalOverrideWrongTypeFailsClosed" `
         -Failure "рядок на місці числового ліста BRAVO.local.config мусить давати fail-closed з точним dot-шляхом у повідомленні; отримано: $localCfgWrongTypeProbe"
 
+    # --- Маркер версії: наскрізний диспетч (#154, B3).
+    # Доводить рівно те, чого модульний тест довести не може: маркер
+    # проходить увесь конвеєр завантаження й НЕ відхиляється як
+    # невідомий top-level ключ (ним він синтаксично і є).
+    [IO.File]::WriteAllText($localCfgOverridePath,
+        "@{ configSchemaVersion = 2`r`n'pathSettings.BackupRoot' = '$localCfgBackupLiteral' }",
+        (New-Object System.Text.UTF8Encoding $false))
+    $localCfgVersionProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+                "'RESULT:' + [string]`$global:BravoConfigurationMetadata.LocalConfigDeclaredSchemaVersion + " +
+                "';' + [string]`$global:pathSettings.BackupRoot } catch { 'THREW:' + `$_.Exception.Message }"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $localCfgVersionProbe.Contains('RESULT:2;') -and
+            $localCfgVersionProbe.Contains($localCfgBackupDir) -and
+            -not $localCfgVersionProbe.Contains('THREW')
+        ) `
+        -Name "ConfigLoader/LocalOverrideDeclaredSchemaVersionLoads" `
+        -Failure "оголошений configSchemaVersion = 2 мусить прийматись, потрапляти в метадані й не заважати перевизначенням; отримано: $localCfgVersionProbe"
+
+    # --- Непідтримувана версія -> fail closed наскрізно.
+    [IO.File]::WriteAllText($localCfgOverridePath,
+        "@{ configSchemaVersion = 99`r`n'pathSettings.BackupRoot' = '$localCfgBackupLiteral' }",
+        (New-Object System.Text.UTF8Encoding $false))
+    $localCfgFutureVersionProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW:' + `$_.Exception.Message }"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $localCfgFutureVersionProbe.Contains('THREW:') -and
+            -not $localCfgFutureVersionProbe.Contains('NO-THROW') -and
+            $localCfgFutureVersionProbe.Contains('99')
+        ) `
+        -Name "ConfigLoader/LocalOverrideUnsupportedSchemaVersionFailsClosed" `
+        -Failure "файл новішого формату мусить fail-closed, а не читатись як старіший; отримано: $localCfgFutureVersionProbe"
+
     # --- Виконуваний код у файлі -> відхилення (data-only контракт).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.BackupRoot' = (Get-Date).ToString() }",

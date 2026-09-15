@@ -1393,3 +1393,169 @@
         -Name "Schema/LoaderValidatesLocalLayerBeforeMerge" `
         -Failure "BRAVO_CONFIG_LOADER мусить валідувати типи site-шару ДО Resolve-BRAVORawConfiguration (validation=$schemaValidationIndex merge=$schemaMergeIndex)"
 }
+
+# =====================================================================
+# Версійний диспетч site-файлу (#154, B3)
+# =====================================================================
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.DataFile.psd1') -Force
+
+    $versionContract = Get-BRAVOConfigurationSchemaVersionContract
+
+    # --- ConfigVersion/V2Loads ---
+    # Маркер приймається, дає версію 2 і НЕ потрапляє в перевизначення.
+    $versionV2Data = ConvertFrom-BRAVOConfigurationDataFileText `
+        -Text "@{ configSchemaVersion = 2`r`n'pathSettings.BackupRoot' = 'E:\ARCHIV' }" `
+        -SourceName 'v2-fixture'
+    $versionV2 = Resolve-BRAVOConfigurationSchemaVersion -DataFileContent $versionV2Data -SourceName 'v2-fixture'
+    Test-BRAVOCondition `
+        -Condition (
+            [int]$versionV2.DeclaredVersion -eq 2 -and
+            [int]$versionV2.EffectiveVersion -eq 2 -and
+            [bool]$versionV2.WasDeclared -and
+            @($versionV2.Overrides.Keys).Count -eq 1 -and
+            $versionV2.Overrides.Contains('pathSettings.BackupRoot')
+        ) `
+        -Name "ConfigVersion/V2Loads" `
+        -Failure "оголошена версія 2 має прийматись, а маркер — НЕ ставати перевизначенням; declared=$($versionV2.DeclaredVersion) ключів=$(@($versionV2.Overrides.Keys) -join ', ')"
+
+    # --- ConfigVersion/MarkerIsNotATopLevelOverride ---
+    # Ключова причина, чому маркер знімається саме в канонічному читачі:
+    # 'configSchemaVersion' — односегментний dot-шлях, тобто top-level,
+    # і ConvertTo-BRAVONestedOverride відхилив би його fail-closed.
+    # Доводимо обидві половини: без зняття — відмова, зі зняттям — мердж.
+    $versionUnstrippedThrew = $false
+    try {
+        [void](Resolve-BRAVORawConfiguration `
+            -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+            -PrimaryOverrides $null `
+            -LocalOverrides @{ 'configSchemaVersion' = 2 })
+    } catch { $versionUnstrippedThrew = $true }
+    $versionStrippedMerged = Resolve-BRAVORawConfiguration `
+        -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+        -PrimaryOverrides $null `
+        -LocalOverrides $versionV2.Overrides
+    Test-BRAVOCondition `
+        -Condition (
+            $versionUnstrippedThrew -and
+            [string]$versionStrippedMerged.pathSettings.BackupRoot -eq 'E:\ARCHIV'
+        ) `
+        -Name "ConfigVersion/MarkerIsNotATopLevelOverride" `
+        -Failure "незнятий маркер мусить відхилятись як невідомий top-level ключ, а знятий — не заважати мерджу; unstrippedThrew=$versionUnstrippedThrew BackupRoot='$($versionStrippedMerged.pathSettings.BackupRoot)'"
+
+    # --- ConfigVersion/LegacyCompatibilityMatchesDocumentedPolicy ---
+    # Кожен розгорнутий сьогодні site-файл маркера НЕ має. Політика:
+    # приймається як версія 1 (інакше перше ж оновлення зупинило б увесь
+    # парк), і це саме те, що написано в задокументованому контракті.
+    $versionLegacyData = ConvertFrom-BRAVOConfigurationDataFileText `
+        -Text "@{ 'pathSettings.BackupRoot' = 'E:\ARCHIV' }" -SourceName 'legacy-fixture'
+    $versionLegacy = Resolve-BRAVOConfigurationSchemaVersion -DataFileContent $versionLegacyData -SourceName 'legacy-fixture'
+    $versionExampleText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.local.config.example'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $versionLegacy.DeclaredVersion -and
+            [int]$versionLegacy.EffectiveVersion -eq [int]$versionContract.LegacyVersion -and
+            [int]$versionContract.LegacyVersion -eq 1 -and
+            -not [bool]$versionLegacy.WasDeclared -and
+            $versionExampleText.Contains('маркера немає') -and
+            $versionExampleText.Contains('configSchemaVersion = 1 або 2')
+        ) `
+        -Name "ConfigVersion/LegacyCompatibilityMatchesDocumentedPolicy" `
+        -Failure "файл без маркера мусить прийматись як версія $($versionContract.LegacyVersion), і рівно це мусить бути задокументовано в BRAVO.local.config.example; effective=$($versionLegacy.EffectiveVersion) declared=$($versionLegacy.DeclaredVersion)"
+
+    # --- ConfigVersion/UnsupportedVersionFailsClosed ---
+    # Файл новішого формату НЕ читається як старіший "на удачу": це
+    # мовчазно застосувало б підмножину ключів за чужими правилами.
+    $versionUnsupportedThrew = $false
+    $versionUnsupportedMessage = ''
+    try {
+        [void](Resolve-BRAVOConfigurationSchemaVersion `
+            -DataFileContent @{ 'configSchemaVersion' = 99 } -SourceName 'future-fixture')
+    } catch { $versionUnsupportedThrew = $true; $versionUnsupportedMessage = [string]$_.Exception.Message }
+    Test-BRAVOCondition `
+        -Condition ($versionUnsupportedThrew -and $versionUnsupportedMessage.Contains('99')) `
+        -Name "ConfigVersion/UnsupportedVersionFailsClosed" `
+        -Failure "непідтримувана версія мусить fail-closed із вказанням значення; threw=$versionUnsupportedThrew message='$versionUnsupportedMessage'"
+
+    # --- ConfigVersion/VersionMustBeCorrectType ---
+    # '2' у лапках, $true, масив і $null — не версія схеми. Прийняти
+    # рядок означало б, що будь-яке значення, приводне до числа, стає
+    # версією — тобто контракт версії перестає бути контрактом.
+    # Перелік будується через List, а НЕ через @('2', $true, @(2), ...):
+    # PowerShell 5.1 розгортає вкладений масив у літералі масиву на один
+    # рівень, тому @(2) перетворився б на число 2 — і випадок "масив"
+    # мовчки перевіряв би зовсім не те.
+    $versionBadValues = New-Object System.Collections.Generic.List[object]
+    [void]$versionBadValues.Add('2')
+    [void]$versionBadValues.Add($true)
+    [void]$versionBadValues.Add(@(2))
+    [void]$versionBadValues.Add($null)
+    [void]$versionBadValues.Add(2.5)
+    $versionBadTypeResults = New-Object System.Collections.Generic.List[string]
+    foreach ($versionBadValue in $versionBadValues) {
+        $versionBadThrew = $false
+        try {
+            [void](Resolve-BRAVOConfigurationSchemaVersion `
+                -DataFileContent @{ 'configSchemaVersion' = $versionBadValue } -SourceName 'badtype-fixture')
+        } catch { $versionBadThrew = $true }
+        if (-not $versionBadThrew) {
+            [void]$versionBadTypeResults.Add("$(if ($null -eq $versionBadValue) { '$null' } else { [string]$versionBadValue })")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($versionBadTypeResults.Count -eq 0) `
+        -Name "ConfigVersion/VersionMustBeCorrectType" `
+        -Failure "версія мусить бути цілим числом; помилково прийнято: $([string]::Join(', ', $versionBadTypeResults))"
+
+    # --- ConfigVersion/VersionReadDoesNotExecuteFile ---
+    # Версія береться з ДАНИХ, а не з виконання: 'configSchemaVersion =
+    # 1 + 1' не стає двійкою, а відхиляється ще AST-парсером як вираз.
+    # Інакше маркер версії був би єдиним полем файлу, здатним виконати
+    # обчислення — тобто діркою в data-only контракті B1.
+    $versionExpressionThrew = $false
+    try {
+        [void](ConvertFrom-BRAVOConfigurationDataFileText `
+            -Text '@{ configSchemaVersion = 1 + 1 }' -SourceName 'expression-fixture')
+    } catch { $versionExpressionThrew = $true }
+    Test-BRAVOCondition `
+        -Condition $versionExpressionThrew `
+        -Name "ConfigVersion/VersionReadDoesNotExecuteFile" `
+        -Failure "вираз у значенні маркера версії мусить відхилятись парсером, а не обчислюватись"
+
+    # --- ConfigVersion/ConfiguratorWritesMarkerFromSingleSource ---
+    # Серіалізаторів site-файлу ДВА (production-запис і кандидат для
+    # ізольованого effective). Обидва мусять брати форму маркера з
+    # канонічної функції, інакше копії розійдуться, і кандидат почне
+    # відповідати іншій версії формату, ніж записаний файл.
+    $versionDeclarationLine = Get-BRAVOConfigurationSchemaVersionDeclarationLine
+    $versionPersistenceText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Persistence.psm1'), [Text.Encoding]::UTF8)
+    $versionEffectiveText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Effective.psm1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $versionDeclarationLine.Trim() -eq "$($versionContract.KeyName) = $($versionContract.CurrentVersion)" -and
+            $versionPersistenceText.Contains('Get-BRAVOConfigurationSchemaVersionDeclarationLine') -and
+            $versionEffectiveText.Contains('Get-BRAVOConfigurationSchemaVersionDeclarationLine')
+        ) `
+        -Name "ConfigVersion/ConfiguratorWritesMarkerFromSingleSource" `
+        -Failure "обидва серіалізатори site-файлу мусять брати маркер з канонічної функції; рядок='$versionDeclarationLine'"
+
+    # --- ConfigVersion/WrittenMarkerRoundTrips ---
+    # Найважливіше для вікна сумісності: файл, ЗАПИСАНИЙ комплектом,
+    # мусить читатись назад як версія 2 і не приносити зайвого ключа.
+    $versionRoundTripText = "@{`r`n$versionDeclarationLine`r`n    'consoleSettings.ConsoleLevel' = 'ERROR'`r`n}"
+    $versionRoundTripData = ConvertFrom-BRAVOConfigurationDataFileText `
+        -Text $versionRoundTripText -SourceName 'roundtrip-fixture'
+    $versionRoundTrip = Resolve-BRAVOConfigurationSchemaVersion `
+        -DataFileContent $versionRoundTripData -SourceName 'roundtrip-fixture'
+    Test-BRAVOCondition `
+        -Condition (
+            [int]$versionRoundTrip.EffectiveVersion -eq [int]$versionContract.CurrentVersion -and
+            @($versionRoundTrip.Overrides.Keys).Count -eq 1 -and
+            [string]$versionRoundTrip.Overrides['consoleSettings.ConsoleLevel'] -eq 'ERROR'
+        ) `
+        -Name "ConfigVersion/WrittenMarkerRoundTrips" `
+        -Failure "записаний комплектом маркер мусить читатись назад як версія $($versionContract.CurrentVersion) без зайвих ключів; effective=$($versionRoundTrip.EffectiveVersion) ключів=$(@($versionRoundTrip.Overrides.Keys) -join ', ')"
+}

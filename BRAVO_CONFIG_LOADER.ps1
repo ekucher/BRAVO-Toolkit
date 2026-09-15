@@ -314,12 +314,20 @@ function Read-BRAVOLocalConfigurationOverrides {
 
     $localOverridePath = Join-Path $ConfigDirectory 'BRAVO.local.config'
     if (-not (Test-Path -LiteralPath $localOverridePath -PathType Leaf)) {
-        return [pscustomobject]@{ Path = $localOverridePath; Present = $false; Overrides = @{} }
+        return [pscustomobject]@{
+            Path = $localOverridePath
+            Present = $false
+            Overrides = @{}
+            DeclaredSchemaVersion = $null
+            EffectiveSchemaVersion = $null
+            SchemaVersionWasDeclared = $false
+        }
     }
 
     $effectiveRuntimeRoot = $RuntimeRoot
     if ([string]::IsNullOrWhiteSpace($effectiveRuntimeRoot)) { $effectiveRuntimeRoot = $PSScriptRoot }
     $dataFileModulePath = Join-Path $effectiveRuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.DataFile.psd1'
+    $versionModulePath = Join-Path $effectiveRuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1'
     # Без -Force і без раннього виходу по Get-Module: повторний
     # Import-Module вже завантаженого модуля НЕ перевиконує .psm1 (саме
     # перевиконання ламало б function-shadowing фікстури self-test — через
@@ -328,6 +336,7 @@ function Read-BRAVOLocalConfigurationOverrides {
     # дає: модуль може бути в таблиці модулів, а його команди —
     # імпортованими в область, якої вже немає.
     Import-Module -Name $dataFileModulePath -ErrorAction Stop
+    Import-Module -Name $versionModulePath -ErrorAction Stop
 
     $localOverrideText = Get-Content -LiteralPath $localOverridePath -Raw -Encoding UTF8 -ErrorAction Stop
     try {
@@ -344,7 +353,25 @@ function Read-BRAVOLocalConfigurationOverrides {
             throw "BRAVO.local.config ('$localOverridePath'): порожній ключ неприпустимий."
         }
     }
-    return [pscustomobject]@{ Path = $localOverridePath; Present = $true; Overrides = $localOverrideData }
+
+    # #154 (B3): версійний диспетч. Маркер знімається ТУТ — у єдиного
+    # канонічного читача site-файлу, — а не в кожного з його п'яти
+    # споживачів: 'configSchemaVersion' є односегментним dot-шляхом,
+    # тобто TOP-LEVEL ключем, і без зняття ConvertTo-BRAVONestedOverride
+    # відхилив би його як невідомий (fail-closed). Версія береться з уже
+    # вилучених ДАНИХ, тому ніколи не обчислюється виконанням файлу:
+    # 'configSchemaVersion = 1 + 1' відхиляє ще AST-парсер як вираз.
+    $localSchemaVersion = Resolve-BRAVOConfigurationSchemaVersion `
+        -DataFileContent $localOverrideData -SourceName $localOverridePath
+
+    return [pscustomobject]@{
+        Path = $localOverridePath
+        Present = $true
+        Overrides = $localSchemaVersion.Overrides
+        DeclaredSchemaVersion = $localSchemaVersion.DeclaredVersion
+        EffectiveSchemaVersion = $localSchemaVersion.EffectiveVersion
+        SchemaVersionWasDeclared = [bool]$localSchemaVersion.WasDeclared
+    }
 }
 
 function Assert-BravoLoadedConfiguration {
@@ -1294,6 +1321,11 @@ function Import-BravoConfiguration {
             # для новішого Configurator), але НЕ впливає ні на що — без
             # цього переліку оператор вважав би його застосованим (#154, A2).
             UnknownLeafPaths = New-Object 'System.Collections.Generic.List[string]'
+            # #154 (B3): версія формату, яку оголосив САМ файл. $null =
+            # маркера немає (кожен розгорнутий сьогодні site-файл).
+            DeclaredSchemaVersion = $localOverrideRead.DeclaredSchemaVersion
+            EffectiveSchemaVersion = $localOverrideRead.EffectiveSchemaVersion
+            SchemaVersionWasDeclared = [bool]$localOverrideRead.SchemaVersionWasDeclared
         }
     }
     $global:BravoLocalConfigOverrideState = $localOverrideState
@@ -1421,6 +1453,21 @@ function Import-BravoConfiguration {
                 "відповідного блоку BRAVO.config. Якщо ключ призначений новішій версії комплекту, це очікувано."
             )
         }
+    }
+
+    # #154 (B3): маркер версії відсутній — файл написаний до введення
+    # версійного контракту. Приймається як v1 (інакше перше ж оновлення
+    # зупинило б кожен сервер із site-файлом), але мовчати не можна:
+    # доти, доки маркера немає, комплект не може вимагати семантику v2.
+    # Configurator дописує маркер при наступному ж записі файлу.
+    if ($null -ne $localOverrideState -and -not $localOverrideState.SchemaVersionWasDeclared) {
+        Write-Warning (
+            "BRAVO.local.config ('$($localOverrideState.Path)'): не оголошено " +
+            "configSchemaVersion — файл трактується як версія " +
+            "$($localOverrideState.EffectiveSchemaVersion) (формат до введення версійного " +
+            "контракту). Маркер з'явиться автоматично при наступному записі файлу " +
+            "через BRAVO Configurator; додати вручну — рядок 'configSchemaVersion = 2'."
+        )
     }
 
     # #154 (A3/F1): дзеркало попередження вище для primary-шару.
@@ -1551,7 +1598,14 @@ function Import-BravoConfiguration {
         # Вкладені ключі BRAVO.config, невідомі канонічній конфігурації
         # (#154, A3/F1) — зливаються, але їх ніхто не читає.
         PrimaryConfigUnknownNestedKeys = @($unknownPrimaryNestedPaths)
+        # Версія схеми САМОГО КОМПЛЕКТУ (VERSION.json) — не плутати з
+        # версією, яку оголошує site-файл (два поля нижче, #154 B3).
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
+        # Оголошена самим BRAVO.local.config; $null = маркера немає або
+        # файл відсутній.
+        LocalConfigDeclaredSchemaVersion = if ($null -ne $localOverrideState) { $localOverrideState.DeclaredSchemaVersion } else { $null }
+        # Версія, за якою файл фактично оброблено ($null = файла немає).
+        LocalConfigEffectiveSchemaVersion = if ($null -ne $localOverrideState) { $localOverrideState.EffectiveSchemaVersion } else { $null }
         LegacyScriptVersion = $legacyScriptVersion
         LegacyScriptVersionPresent = ($null -ne $legacyScriptVersionVariable)
         PackageVersion = [string]$global:ScriptVersion
