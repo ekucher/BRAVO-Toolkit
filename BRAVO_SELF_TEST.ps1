@@ -19176,6 +19176,11 @@ Test-BRAVOCondition `
     # прямим посиланням) писала б у $script:-простір ЦЬОГО фантомного
     # модуля замість реальних лічильників головного self-test.
     $realTestBRAVOConditionScriptBlock = (Get-Item -Path function:Test-BRAVOCondition).ScriptBlock
+    # #188: Test-BRAVOCondition делегує категорію результату цій функції, тому
+    # вона мусить і екстрагуватись у модуль, і відновлюватись у finally — за
+    # тією самою причиною, що описана вище (New-Module заміщує однойменні
+    # функції в Function:-drive головного процесу).
+    $realGetBRAVOSelfTestAssertionResultScriptBlock = (Get-Item -Path function:Get-BRAVOSelfTestAssertionResult).ScriptBlock
     $realEnterBRAVOSelfTestSuiteScriptBlock = (Get-Item -Path function:Enter-BRAVOSelfTestSuite).ScriptBlock
     $realCompleteBRAVOSelfTestActiveSuiteSpanScriptBlock = (Get-Item -Path function:Complete-BRAVOSelfTestActiveSuiteSpan).ScriptBlock
     $result = $null
@@ -19183,7 +19188,8 @@ Test-BRAVOCondition `
     try {
         $sourceText = Get-BRAVOSelfTestOwnSourceText
         $module = New-BRAVOSelfTestRuntimeModule -SourceText $sourceText `
-            -FunctionNames @('Enter-BRAVOSelfTestSuite', 'Complete-BRAVOSelfTestActiveSuiteSpan', 'Test-BRAVOCondition')
+            -FunctionNames @('Enter-BRAVOSelfTestSuite', 'Complete-BRAVOSelfTestActiveSuiteSpan',
+                'Test-BRAVOCondition', 'Get-BRAVOSelfTestAssertionResult')
         $result = & $module {
             function Write-Host { param([Parameter(ValueFromRemainingArguments = $true)]$IgnoredArgs) }
             Set-StrictMode -Version 2.0
@@ -19227,6 +19233,8 @@ Test-BRAVOCondition `
         $fixtureExceptionMessage = $_.Exception.Message
     } finally {
         Set-Item -Path function:Test-BRAVOCondition -Value $realTestBRAVOConditionScriptBlock -Force
+        Set-Item -Path function:Get-BRAVOSelfTestAssertionResult `
+            -Value $realGetBRAVOSelfTestAssertionResultScriptBlock -Force
         Set-Item -Path function:Enter-BRAVOSelfTestSuite -Value $realEnterBRAVOSelfTestSuiteScriptBlock -Force
         Set-Item -Path function:Complete-BRAVOSelfTestActiveSuiteSpan -Value $realCompleteBRAVOSelfTestActiveSuiteSpanScriptBlock -Force
         Clear-BRAVOSelfTestOwnedRuntimeModules
@@ -19292,6 +19300,9 @@ Test-BRAVOCondition `
 # script-scope після завершення.
 & {
 $realTestBRAVOConditionScriptBlock = (Get-Item -Path function:Test-BRAVOCondition).ScriptBlock
+# #188: див. коментар у фікстурі fatal-catch вище — функція рішення мусить
+# бути і в модулі, і відновленою після нього.
+$realGetBRAVOSelfTestAssertionResultScriptBlock = (Get-Item -Path function:Get-BRAVOSelfTestAssertionResult).ScriptBlock
 
 # PR #138 review (P2-C): відновлення оригінальної Test-BRAVOCondition і
 # owned-module cleanup ТЕПЕР усередині try/finally — раніше вони
@@ -19307,7 +19318,8 @@ $timingProbeResult = $null
 $timingProbeFixtureExceptionMessage = $null
 try {
     $timingProbeSourceText = Get-BRAVOSelfTestOwnSourceText
-    $timingProbeModule = New-BRAVOSelfTestRuntimeModule -SourceText $timingProbeSourceText -FunctionNames @('Test-BRAVOCondition')
+    $timingProbeModule = New-BRAVOSelfTestRuntimeModule -SourceText $timingProbeSourceText `
+        -FunctionNames @('Test-BRAVOCondition', 'Get-BRAVOSelfTestAssertionResult')
     $timingProbeResult = & $timingProbeModule {
         # Локальний silent-стаб Write-Host — той самий встановлений у файлі
         # прийом (test-only переозначення render-функції всередині ізольованого
@@ -19353,6 +19365,8 @@ try {
     # в реальні лічильники головного self-test (емпірично підтверджений
     # клас дефекту — див. коментар вище про New-Module function shadow).
     Set-Item -Path function:Test-BRAVOCondition -Value $realTestBRAVOConditionScriptBlock -Force
+    Set-Item -Path function:Get-BRAVOSelfTestAssertionResult `
+        -Value $realGetBRAVOSelfTestAssertionResultScriptBlock -Force
 
     # PR #138 review (P2-B, 2 threads — той самий technical finding): цей
     # timing-probe модуль (якщо встиг створитися) автоматично реєструється
@@ -19612,6 +19626,53 @@ Test-BRAVOCondition `
         ) `
         -Name "Framework/SuspensionProbeReportsItsOwnFailure" `
         -Failure "дочірня проба transcript мусить повертати власну помилку й код виходу — інакше на жорсткому хості причина відмови не фіксується ніде"
+
+    # КОРІНЬ ЧЕРВОНОГО CI ЦЬОГО Ж PR, закритий механічно. Дві Framework-
+    # фікстури (fatal-catch і timing-probe) AST-екстрагують СПРАВЖНІ функції
+    # цього файлу в ізольований модуль за списком імен. Щойно
+    # Test-BRAVOCondition почала делегувати категорію результату
+    # Get-BRAVOSelfTestAssertionResult, обидві фікстури впали з
+    # "The term ... is not recognized" — бо помічника в списку не було.
+    #
+    # Наступний, хто додасть виклик усередину Test-BRAVOCondition, має
+    # впертися в цю перевірку, а не в CI.
+    $assertionFunctionStart = $selfTestOwnSourceForRestriction.IndexOf("function Test-BRAVOCondition {")
+    $assertionFunctionEnd = if ($assertionFunctionStart -ge 0) {
+        $selfTestOwnSourceForRestriction.IndexOf("`n}", $assertionFunctionStart)
+    } else { -1 }
+    $assertionFunctionBody = if ($assertionFunctionEnd -gt $assertionFunctionStart) {
+        $selfTestOwnSourceForRestriction.Substring(
+            $assertionFunctionStart, $assertionFunctionEnd - $assertionFunctionStart)
+    } else { '' }
+    $assertionHelperNames = @(
+        [regex]::Matches($assertionFunctionBody, '\bGet-BRAVOSelfTest[A-Za-z]+\b') |
+            ForEach-Object { $_.Value } | Sort-Object -Unique)
+    # Списки імен кожної фікстури, яка екстрагує саме Test-BRAVOCondition.
+    $assertionFixtureLists = @(
+        [regex]::Matches($selfTestOwnSourceForRestriction,
+            "-FunctionNames @\(([^)]*'Test-BRAVOCondition'[^)]*)\)") |
+            ForEach-Object { $_.Groups[1].Value })
+    $assertionMissingHelpers = New-Object System.Collections.Generic.List[string]
+    foreach ($assertionFixtureList in $assertionFixtureLists) {
+        foreach ($assertionHelperName in $assertionHelperNames) {
+            if (-not $assertionFixtureList.Contains("'" + $assertionHelperName + "'")) {
+                [void]$assertionMissingHelpers.Add($assertionHelperName)
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $assertionFunctionBody.Length -gt 0 -and
+            @($assertionFixtureLists).Count -ge 2 -and
+            @($assertionHelperNames).Count -gt 0 -and
+            $assertionMissingHelpers.Count -eq 0
+        ) `
+        -Name "Framework/AssertionFixturesExtractEveryHelperItCalls" `
+        -Failure ("кожна Framework-фікстура, що екстрагує Test-BRAVOCondition, мусить екстрагувати й " +
+            "помічників, яких та викликає — інакше фікстура падає з 'is not recognized'. Знайдено " +
+            "фікстур: $(@($assertionFixtureLists).Count); помічників: " +
+            "$([string]::Join(', ', @($assertionHelperNames))); бракує: " +
+            "$([string]::Join(', ', @($assertionMissingHelpers.ToArray())))")
 }
 
 # ============================================================
