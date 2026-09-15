@@ -841,3 +841,285 @@
         -Name "DataFile/LoaderNoLongerInvokesSiteFile" `
         -Failure "Read-BRAVOLocalConfigurationOverrides мусить вилучати дані через ConvertFrom-BRAVOConfigurationDataFileText і не створювати/не викликати scriptblock site-файлу"
 }
+
+# =============================================================
+# #158 (етап 4): discovery overrides застосовуються ДО discovery
+# =============================================================
+# Перевіряється ВЕСЬ ланцюг, а не лише одна функція: flat dot-path з
+# BRAVO.local.config -> Resolve-BRAVORawConfiguration (фаза мерджу) ->
+# Resolve-BRAVOEffectiveDiscoverySettings (валідація/нормалізація) ->
+# Resolve-BRAVOInstallationDiscovery (фактичне discovery). Саме розрив
+# у цьому ланцюгу й був дефектом: раніше loader безумовно перезаписував
+# змерджене значення канонічним літералом.
+& {
+    if (-not (Get-Module -Name 'BRAVO.Discovery')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Discovery\BRAVO.Discovery.psd1') -ErrorAction Stop
+    }
+
+    $preloadSavedOverridePath = $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH
+    $preloadSavedHooks = $env:BRAVO_DATARESTORE_TEST_HOOKS
+    $preloadRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_DISCOVERY_PRELOAD_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        # Env-seam має бути вимкнений: він навмисно має ВИЩИЙ пріоритет за
+        # site-конфіг, тож активний seam знецінив би всі перевірки нижче.
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = ''
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = ''
+
+        [void][IO.Directory]::CreateDirectory($preloadRoot)
+        function New-BRAVOPreloadDirectory {
+            param([string]$Path)
+            [void][IO.Directory]::CreateDirectory($Path)
+            [IO.File]::WriteAllText((Join-Path $Path 'fixture.txt'), 'x', (New-Object Text.UTF8Encoding($false)))
+            return $Path
+        }
+
+        # Інсталяція, яку знаходить AUTO-discovery (служба + системний bravo.ini).
+        $preloadAutoInstall = Join-Path $preloadRoot 'auto-install'
+        $preloadAutoModel = New-BRAVOPreloadDirectory -Path (Join-Path $preloadAutoInstall 'Model')
+        $preloadAutoBlog = New-BRAVOPreloadDirectory -Path (Join-Path $preloadAutoInstall 'BLOG')
+        $preloadAutoExe = Join-Path $preloadAutoInstall 'bravo.exe'
+        [IO.File]::WriteAllText($preloadAutoExe, 'stub')
+
+        # Інсталяція, на яку вказує ЯВНИЙ site-override — інша, ніж AUTO.
+        $preloadExplicitInstall = Join-Path $preloadRoot 'explicit-install'
+        $preloadExplicitModel = New-BRAVOPreloadDirectory -Path (Join-Path $preloadExplicitInstall 'Model')
+        [void](New-BRAVOPreloadDirectory -Path $preloadExplicitInstall)
+        $preloadExplicitWebRoot = New-BRAVOPreloadDirectory -Path (Join-Path $preloadRoot 'explicit-web')
+
+        $preloadSystemRoot = Join-Path $preloadRoot 'FixtureWindows'
+        $preloadSystemIni = Join-Path $preloadSystemRoot 'SysWOW64\bravo.ini'
+        [void][IO.Directory]::CreateDirectory((Split-Path -Path $preloadSystemIni -Parent))
+        [IO.File]::WriteAllLines($preloadSystemIni, @(
+            '[model]',
+            ("MODEL={0}" -f (Join-Path $preloadAutoModel 'lims')),
+            ("BLOG={0}\" -f $preloadAutoBlog)
+        ))
+
+        # Альтернативний bravo.ini, який видно ЛИШЕ через явний BravoIniPath.
+        $preloadCustomIni = Join-Path (New-BRAVOPreloadDirectory -Path (Join-Path $preloadRoot 'custom-ini')) 'bravo.ini'
+        [IO.File]::WriteAllLines($preloadCustomIni, @(
+            '[model]',
+            ("MODEL={0}" -f (Join-Path $preloadExplicitModel 'lims'))
+        ))
+
+        $preloadServices = @(
+            [pscustomobject]@{ Name = 'BRAVO'; DisplayName = 'BRAVO Service'; State = 'Running'; StartMode = 'Auto'; PathName = ('"{0}"' -f $preloadAutoExe) }
+        )
+
+        # Повний ланцюг "як у loader-і", але без самого loader-а: саме так
+        # site-конфіг доходить до discovery у production.
+        function Resolve-BRAVOPreloadDiscovery {
+            param([hashtable]$LocalOverrides, [object[]]$Services)
+            $merged = Resolve-BRAVORawConfiguration `
+                -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+                -PrimaryOverrides $null `
+                -LocalOverrides $LocalOverrides
+            $effectiveDiscoverySettings = Resolve-BRAVOEffectiveDiscoverySettings `
+                -CanonicalBase (Get-BRAVOCanonicalDiscoverySettings) `
+                -SiteOverrides $merged['discoverySettings']
+            return Resolve-BRAVOInstallationDiscovery `
+                -LimsRoot $preloadAutoInstall `
+                -BravoServiceName 'BRAVO' `
+                -WebServiceCandidates @('Apache2.4') `
+                -Services $Services `
+                -SystemRoot $preloadSystemRoot `
+                -Is64BitOperatingSystem $true `
+                -DiscoverySettings $effectiveDiscoverySettings
+        }
+
+        # --- DiscoveryOverride/ModelSourceAffectsDiscovery ---
+        # bravo.ini оголошує MODEL в auto-інсталяції; site-override вказує
+        # на іншу. Раніше override сюди просто не доходив.
+        $preloadModelOverride = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.Sources.MODEL' = $preloadExplicitModel } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadModelOverride.MODEL_SOURCE -eq $preloadExplicitModel -and
+                [bool]$preloadModelOverride.Overrides['MODEL'] -and
+                [string]$preloadModelOverride.Reasons.MODEL -match '(?i)override'
+            ) `
+            -Name "DiscoveryOverride/ModelSourceAffectsDiscovery" `
+            -Failure "discoverySettings.Sources.MODEL з BRAVO.local.config має доходити до discovery і давати MODEL_SOURCE з override, а не з bravo.ini"
+
+        # --- DiscoveryOverride/BravoRootAffectsDiscovery ---
+        $preloadBravoRootOverride = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.BravoRoot' = $preloadExplicitInstall } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadBravoRootOverride.BRAVO_ROOT -eq $preloadExplicitInstall -and
+                [bool]$preloadBravoRootOverride.Overrides['BravoRoot']
+            ) `
+            -Name "DiscoveryOverride/BravoRootAffectsDiscovery" `
+            -Failure "discoverySettings.BravoRoot з BRAVO.local.config має визначати BRAVO_ROOT"
+
+        # --- DiscoveryOverride/WebRootAffectsDiscovery ---
+        $preloadWebRootOverride = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.WebRoot' = $preloadExplicitWebRoot } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadWebRootOverride.WEB_ROOT -eq $preloadExplicitWebRoot -and
+                [bool]$preloadWebRootOverride.Overrides['WebRoot']
+            ) `
+            -Name "DiscoveryOverride/WebRootAffectsDiscovery" `
+            -Failure "discoverySettings.WebRoot з BRAVO.local.config має визначати WEB_ROOT"
+
+        # --- DiscoveryOverride/BravoIniPathAffectsDiscovery ---
+        # Найсильніший доказ, що override діє ДО discovery: змінюється не
+        # готове значення, а сам ФАЙЛ, з якого discovery читає джерела.
+        $preloadIniOverride = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.BravoIniPath' = $preloadCustomIni } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadIniOverride.BravoIniPath -eq $preloadCustomIni -and
+                [string]$preloadIniOverride.MODEL_SOURCE -eq $preloadExplicitModel -and
+                [bool]$preloadIniOverride.Overrides['BravoIniPath']
+            ) `
+            -Name "DiscoveryOverride/BravoIniPathAffectsDiscovery" `
+            -Failure "discoverySettings.BravoIniPath має підмінити сам файл bravo.ini, з якого discovery читає MODEL/BLOG"
+
+        # --- DiscoveryOverride/ExplicitOverrideWins ---
+        # Служба BRAVO присутня й однозначна — auto-discovery дало б
+        # auto-інсталяцію. Явне значення все одно перемагає.
+        $preloadAutoOnly = Resolve-BRAVOPreloadDiscovery -LocalOverrides @{} -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadAutoOnly.BRAVO_ROOT -eq $preloadAutoInstall -and
+                [string]$preloadBravoRootOverride.BRAVO_ROOT -eq $preloadExplicitInstall
+            ) `
+            -Name "DiscoveryOverride/ExplicitOverrideWins" `
+            -Failure "за наявної однозначної служби BRAVO auto-discovery дає auto-каталог, але явний discoverySettings.BravoRoot мусить його перемагати"
+
+        # --- DiscoveryOverride/AutoDiscoveryNeverOverwritesExplicit ---
+        # Override одного поля не вимикає auto-discovery для сусідніх і не
+        # перезаписується ним: MODEL з override, BLOG і далі з bravo.ini.
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadModelOverride.MODEL_SOURCE -eq $preloadExplicitModel -and
+                [string]$preloadModelOverride.BLOG_SOURCE -eq $preloadAutoBlog -and
+                -not $preloadModelOverride.Overrides.Contains('BLOG')
+            ) `
+            -Name "DiscoveryOverride/AutoDiscoveryNeverOverwritesExplicit" `
+            -Failure "явне значення не має перезаписуватись автоматично знайденим, а сусідні поля мають лишатись на auto-discovery"
+
+        # --- DiscoveryOverride/UnknownParentStillFailsClosed ---
+        $preloadUnknownParentThrew = $false
+        try {
+            [void](Resolve-BRAVORawConfiguration `
+                -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+                -PrimaryOverrides $null `
+                -LocalOverrides @{ 'discoverySettingsTypo.BravoRoot' = 'C:\BRAVO' })
+        } catch {
+            $preloadUnknownParentThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition $preloadUnknownParentThrew `
+            -Name "DiscoveryOverride/UnknownParentStillFailsClosed" `
+            -Failure "невідомий батьківський/top-level ключ мусить лишатись fail-closed — контракт конфігурації не послаблюється тим, що discoverySettings став raw-блоком"
+
+        # --- DiscoveryOverride/UnknownLeafContractUnchanged ---
+        # Рішення D3: невідомий LEAF приймається з попередженням і
+        # метаданими, не валить запуск і не має ефекту.
+        $preloadUnknownLeafSink = New-Object System.Collections.Generic.List[string]
+        $preloadUnknownLeafThrew = $false
+        $preloadUnknownLeafMerged = $null
+        try {
+            $preloadUnknownLeafMerged = Resolve-BRAVORawConfiguration `
+                -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+                -PrimaryOverrides $null `
+                -LocalOverrides @{ 'discoverySettings.Sources.TYPO' = 'C:\BRAVO' } `
+                -UnknownLeafPathSink $preloadUnknownLeafSink
+        } catch {
+            $preloadUnknownLeafThrew = $true
+        }
+        $preloadUnknownLeafEffective = $null
+        if (-not $preloadUnknownLeafThrew) {
+            $preloadUnknownLeafEffective = Resolve-BRAVOEffectiveDiscoverySettings `
+                -CanonicalBase (Get-BRAVOCanonicalDiscoverySettings) `
+                -SiteOverrides $preloadUnknownLeafMerged['discoverySettings']
+        }
+        Test-BRAVOCondition `
+            -Condition (
+                -not $preloadUnknownLeafThrew -and
+                @($preloadUnknownLeafSink) -contains 'discoverySettings.Sources.TYPO' -and
+                $null -ne $preloadUnknownLeafEffective -and
+                -not $preloadUnknownLeafEffective['Sources'].Contains('TYPO')
+            ) `
+            -Name "DiscoveryOverride/UnknownLeafContractUnchanged" `
+            -Failure "невідомий leaf під discoverySettings має прийматись (D3: accept + warning + metadata), потрапляти в UnknownLeafPathSink і не мати ефекту — а не валити запуск"
+
+        # --- DiscoveryOverride/EmptyStringIsNotAnOverride ---
+        # Закоментований-і-повернений порожній ключ не має мовчки вимикати
+        # auto-discovery.
+        $preloadEmptyOverride = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.BravoRoot' = '' } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]$preloadEmptyOverride.BRAVO_ROOT -eq $preloadAutoInstall -and
+                -not $preloadEmptyOverride.Overrides.Contains('BravoRoot')
+            ) `
+            -Name "DiscoveryOverride/EmptyStringIsNotAnOverride" `
+            -Failure "порожній рядок у discoverySettings має означати 'не задано' (auto-discovery), а не явне порожнє значення"
+
+        # --- DiscoveryOverride/NonLocalPathFailsClosed ---
+        $preloadUncThrew = $false
+        try {
+            [void](Resolve-BRAVOEffectiveDiscoverySettings `
+                -CanonicalBase (Get-BRAVOCanonicalDiscoverySettings) `
+                -SiteOverrides @{
+                    BravoRoot = '\\NAS\BRAVO'
+                    Sources = @{}
+                })
+        } catch {
+            $preloadUncThrew = $true
+        }
+        Test-BRAVOCondition `
+            -Condition $preloadUncThrew `
+            -Name "DiscoveryOverride/NonLocalPathFailsClosed" `
+            -Failure "UNC/мережевий шлях у discoverySettings має відхилятись fail-closed тим самим правилом, що й у test-only env-seam"
+
+        # --- Configuration/DiscoverySettingsDefaultsMatchCanonical ---
+        # Механічний guard проти дрейфу двох описів однієї структури:
+        # raw-defaults (BRAVO.Configuration) і канонічної порожньої форми
+        # (BRAVO.Configuration.Derivation).
+        $preloadDefaultsBlock = (Get-BRAVODefaultConfiguration)['discoverySettings']
+        $preloadCanonicalBlock = Get-BRAVOCanonicalDiscoverySettings
+        $preloadDefaultKeys = @(@($preloadDefaultsBlock.Keys) | Sort-Object)
+        $preloadCanonicalKeys = @(@($preloadCanonicalBlock.Keys) | Sort-Object)
+        $preloadDefaultSourceKeys = @(@($preloadDefaultsBlock['Sources'].Keys) | Sort-Object)
+        $preloadCanonicalSourceKeys = @(@($preloadCanonicalBlock['Sources'].Keys) | Sort-Object)
+        $preloadDefaultsAllNull = @(@($preloadDefaultsBlock.Keys) | Where-Object {
+            $_ -ne 'Sources' -and $null -ne $preloadDefaultsBlock[$_]
+        }).Count -eq 0
+        Test-BRAVOCondition `
+            -Condition (
+                ($preloadDefaultKeys -join ',') -eq ($preloadCanonicalKeys -join ',') -and
+                ($preloadDefaultSourceKeys -join ',') -eq ($preloadCanonicalSourceKeys -join ',') -and
+                $preloadDefaultsAllNull
+            ) `
+            -Name "Configuration/DiscoverySettingsDefaultsMatchCanonical" `
+            -Failure "raw-defaults discoverySettings і Get-BRAVOCanonicalDiscoverySettings мусять мати ІДЕНТИЧНУ форму з усіма `$null — інакше site-override і canonical база розійдуться"
+
+        # --- Структурні guard-и ланцюга ---
+        $preloadLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+        $preloadExampleText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.local.config.example'), [Text.Encoding]::UTF8)
+        Test-BRAVOCondition `
+            -Condition (
+                $preloadLoaderText.Contains('Resolve-BRAVOEffectiveDiscoverySettings') -and
+                -not $preloadLoaderText.Contains('$global:discoverySettings = Get-BRAVOCanonicalDiscoverySettings') -and
+                -not $preloadExampleText.Contains('override не подіє')
+            ) `
+            -Name "DiscoveryOverride/LoaderAppliesOverridesBeforeDerivation" `
+            -Failure "BRAVO_CONFIG_LOADER мусить резолвити discoverySettings через Resolve-BRAVOEffectiveDiscoverySettings (а не перезаписувати змерджене значення канонічним літералом), а приклад site-конфігу не повинен далі стверджувати, що override не діє"
+    } finally {
+        $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $preloadSavedOverridePath
+        $env:BRAVO_DATARESTORE_TEST_HOOKS = $preloadSavedHooks
+        Remove-Item -LiteralPath $preloadRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}

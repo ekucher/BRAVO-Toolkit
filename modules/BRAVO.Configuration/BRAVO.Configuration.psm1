@@ -481,6 +481,31 @@ function Get-BRAVODefaultConfiguration {
             MinimumFileCount = 1
             MaxVerificationAgeHours = 216
         }
+
+        # #158 (етап 4): discoverySettings — повноцінний raw-блок, а не
+        # фіксована структура поверх мерджу. Усі значення $null означають
+        # "покластись на auto-discovery"; site-конфіг задає лише ті поля,
+        # де автоматичне визначення непридатне (кілька інсталяцій, кілька
+        # Apache-служб, нестандартний bravo.ini). Застосовується у ТІЙ
+        # САМІЙ фазі мерджу, що й решта блоків, тобто ДО discovery.
+        #
+        # Форма мусить збігатися з Get-BRAVOCanonicalDiscoverySettings
+        # (BRAVO.Configuration.Derivation) — це перевіряється механічно
+        # self-test-ом Configuration/DiscoverySettingsDefaultsMatchCanonical,
+        # а не домовленістю.
+        discoverySettings = @{
+            BravoIniPath = $null
+            BravoRoot = $null
+            WebRoot = $null
+            Sources = @{
+                MODEL = $null
+                BLOG = $null
+                BRAVOEXCH = $null
+                BAZA_APP = $null
+                BAZA_WWW = $null
+                BACKUP_ROOT = $null
+            }
+        }
     }
 
     return $defaults

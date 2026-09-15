@@ -862,18 +862,39 @@ function Complete-BRAVOConfigurationLoad {
 
     # Поля, які раніше обчислював сам BRAVO.config як тривіальні
     # проєкції/константи, а не через raw-блок (runtimeRoot — параметр
-    # виклику; archivePrefix — зручний alias на bravoSettings.
-    # ArchivePrefix; discoverySettings — фіксована НЕ raw-configurable
-    # структура, canonical для обох шляхів).
+    # виклику; archivePrefix — зручний alias на bravoSettings.ArchivePrefix).
     $global:runtimeRoot = $RuntimeRoot
     $global:archivePrefix = $global:bravoSettings.ArchivePrefix
-    $global:discoverySettings = Get-BRAVOCanonicalDiscoverySettings
+
+    # #158 (етап 4): discoverySettings тепер приходить із того самого
+    # мерджу, що й решта raw-блоків (проєкція вище вже поклала його в
+    # $global:), тому 'discoverySettings.*' у BRAVO.local.config реально
+    # діє — і діє ДО discovery. Раніше цей рядок БЕЗУМОВНО перезаписував
+    # змерджене значення канонічним літералом, через що site-override не
+    # просто не працював, а валив запуск як невідомий top-level ключ.
+    #
+    # Resolve-BRAVOEffectiveDiscoverySettings не мерджить удруге: мердж
+    # уже відбувся фазою вище, тут лише валідація форми (fail-closed для
+    # типів і шляхів) та нормалізація. Виклик стоїть ДО
+    # Resolve-BRAVOConfigurationDerivation, всередині якої й виконується
+    # Resolve-BRAVOInstallationDiscovery.
+    # Canonical база резолвиться САМЕ ТУТ, у scope цього скрипта: self-test
+    # підміняє Get-BRAVOCanonicalDiscoverySettings через function global:,
+    # а така підміна програє module-приватному визначенню (задокументовано
+    # в BRAVO.Configuration.Derivation). Two-factor test-only env-seam
+    # лишається всередині самої canonical-функції, без змін.
+    $global:discoverySettings = Resolve-BRAVOEffectiveDiscoverySettings `
+        -CanonicalBase (Get-BRAVOCanonicalDiscoverySettings) `
+        -SiteOverrides $global:discoverySettings
 
     if ($null -ne $CanonicalGlobalNameSink) {
         foreach ($topLevelKey in @($mergedConfiguration.Keys)) {
             [void]$CanonicalGlobalNameSink.Add([string]$topLevelKey)
         }
-        foreach ($explicitName in @('runtimeRoot', 'archivePrefix', 'discoverySettings')) {
+        # discoverySettings більше не перелічується тут явно: він уже
+        # приходить із $mergedConfiguration.Keys вище як звичайний
+        # raw-блок (#158, етап 4).
+        foreach ($explicitName in @('runtimeRoot', 'archivePrefix')) {
             [void]$CanonicalGlobalNameSink.Add($explicitName)
         }
     }
@@ -1057,10 +1078,15 @@ function Import-BravoLegacyPrimaryConfiguration {
     # самого BRAVO.config цим PR). Captured у $primaryRawOverrides ЛИШЕ
     # ключі з canonical allowlist (Get-BRAVODefaultConfiguration.Keys) —
     # жодного derived/невідомого $global:-значення (runtimeRoot,
-    # discoverySettings, operationLockSettings, archivePrefix, і будь-яке
-    # інше, обчислене derivation-резолвером) сюди НЕ потрапляє: ці поля
-    # canonical resolver перераховує ПІСЛЯ фінального merge, а не приймає
-    # від primary як необмежений вхід.
+    # operationLockSettings, archivePrefix, і будь-яке інше, обчислене
+    # derivation-резолвером) сюди НЕ потрапляє: ці поля canonical resolver
+    # перераховує ПІСЛЯ фінального merge, а не приймає від primary як
+    # необмежений вхід.
+    #
+    # #158 (етап 4): discoverySettings БІЛЬШЕ НЕ в цьому переліку — він
+    # став звичайним raw-блоком, тож legacy BRAVO.config, який усе ще
+    # оголошує його інлайн, тепер коректно працює як primary-шар
+    # (DEFAULT < BRAVO.config < BRAVO.local.config), а не відкидається.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$ConfigPath,
