@@ -660,4 +660,103 @@
         -Name "Governance/RequiredChecksListUsesPullRequestNames" `
         -Failure ("RELEASE_POLICY.md §13.3 не має містити імен із суфіксом ' (push)' — такий required " +
             "check на PR не з'являється й заблокував би мердж назавжди; знайдено: $($pushSuffixedCheckNames -join ', ')")
+
+# =====================================================================
+# Володіння site-конфігурацією при розкатці (#154, B6)
+# =====================================================================
+# Site-файл — стан ОПЕРАТОРА, комплект — стан вендора. Ці перевірки
+# статичні (реальні deploy-скрипти вимагають Windows-сервера, robocopy,
+# служб і Планувальника), але вони ловлять саме той клас регресії, який
+# коштує оператору втрати налаштувань: поява /MIR, зникнення /XF,
+# автоматичне створення активного override з прикладу.
+$deployUpdateText = [IO.File]::ReadAllText((Join-Path $root 'deploy\Update-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+$deployInstallText = [IO.File]::ReadAllText((Join-Path $root 'deploy\Install-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+$deployReadmeText = [IO.File]::ReadAllText((Join-Path $root 'deploy\README.md'), [Text.Encoding]::UTF8)
+
+# --- Update/PreservesExistingLocalConfig ---
+# Виключення з копіювання — єдине, що стоїть між оновленням і site-файлом.
+Test-BRAVOCondition `
+    -Condition (
+        $deployUpdateText.Contains("'BRAVO.local.config'") -and
+        $deployUpdateText.Contains('$excludeFiles') -and
+        $deployUpdateText.Contains("'/XF'")
+    ) `
+    -Name "Update/PreservesExistingLocalConfig" `
+    -Failure "deploy\Update-BRAVOServer.ps1 мусить виключати BRAVO.local.config з копіювання через /XF — інакше оновлення затирає site-налаштування сервера"
+
+# --- Update/DoesNotDeleteLocalConfig ---
+# /MIR і /PURGE роблять robocopy знищувальним: усе, чого немає в джерелі,
+# зникає з призначення. Site-файлу в артефакті немає за визначенням, тому
+# поява будь-якого з цих ключів = мовчазне видалення налаштувань.
+# Порівнюється ВИКОНУВАНИЙ код, не коментарі: обидва скрипти навмисно
+# пояснюють у коментарях, ЧОМУ /MIR і /PURGE тут заборонені, і наївний
+# пошук по всьому тексту спрацював би саме на цих поясненнях.
+$deployDestructiveSwitches = @('/MIR', '/PURGE')
+$deployExecutableDeployLines = @(
+    @($deployUpdateText -split "`r?`n") + @($deployInstallText -split "`r?`n") |
+        Where-Object { -not ($_.TrimStart().StartsWith('#')) }
+)
+$deployDestructiveFound = @($deployDestructiveSwitches | Where-Object {
+    $switchName = $_
+    @($deployExecutableDeployLines | Where-Object { $_.Contains($switchName) }).Count -gt 0
+})
+Test-BRAVOCondition `
+    -Condition ($deployDestructiveFound.Count -eq 0) `
+    -Name "Update/DoesNotDeleteLocalConfig" `
+    -Failure "скрипти розкатки не мають права використовувати знищувальні ключі robocopy; знайдено: $($deployDestructiveFound -join ', ')"
+
+# --- Update/DoesNotReplaceLocalConfigWithExample ---
+# Оновлення не має жодної причини торкатись прикладу як джерела для
+# активного файлу: відсутній site-файл — легальний стан, а не дефект.
+Test-BRAVOCondition `
+    -Condition (-not ($deployUpdateText -match 'Copy-Item[^\r\n]*BRAVO\.local\.config\.example')) `
+    -Name "Update/DoesNotReplaceLocalConfigWithExample" `
+    -Failure "deploy\Update-BRAVOServer.ps1 не повинен створювати активний BRAVO.local.config із прикладу — мовчазний override є зміною конфігурації, якої оператор не просив"
+
+# --- Install/DoesNotTreatExampleAsActiveConfig ---
+# Інсталяція копіює приклад ЛИШЕ на явний -SeedLocalConfig і ніколи не
+# перезаписує наявний файл.
+Test-BRAVOCondition `
+    -Condition (
+        $deployInstallText.Contains('$SeedLocalConfig') -and
+        $deployInstallText.Contains('BRAVO.local.config уже існує') -and
+        ($deployInstallText -match '(?s)Test-Path -LiteralPath \$localConfig[^\r\n]*\r?\n[^}]*?\} elseif \(\$SeedLocalConfig\)')
+    ) `
+    -Name "Install/DoesNotTreatExampleAsActiveConfig" `
+    -Failure "deploy\Install-BRAVOServer.ps1 мусить створювати BRAVO.local.config з прикладу ЛИШЕ за -SeedLocalConfig і не чіпати наявний файл"
+
+# --- Update/NewRuntimeKeepsOperatorOwnedConfigAccordingToMigrationContract ---
+# Автоматичного перенесення runtime-каталогу не існує — і саме тому
+# site-файл не може зникнути під час "переїзду". Контракт мусить бути
+# записаний в обох місцях: у самому скрипті й у документації розкатки.
+Test-BRAVOCondition `
+    -Condition (
+        $deployUpdateText.Contains('не перейменовує каталог runtime') -and
+        $deployReadmeText.Contains('перенесення runtime-каталогу — ручна операція')
+    ) `
+    -Name "Update/NewRuntimeKeepsOperatorOwnedConfigAccordingToMigrationContract" `
+    -Failure "контракт «оновлення розгортає на місці, перенесення каталогу — ручна операція оператора» мусить бути зафіксований і в deploy\Update-BRAVOServer.ps1, і в deploy\README.md"
+
+# --- Deploy/LocalConfigNeverShipsInArtifact ---
+# Site-файл одного сервера не може приїхати на інший: він git-ignored, а
+# артефакт збирається виключно git archive.
+$deployGitignoreText = [IO.File]::ReadAllText((Join-Path $root '.gitignore'), [Text.Encoding]::UTF8)
+$deployArtifactText = [IO.File]::ReadAllText((Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1'), [Text.Encoding]::UTF8)
+Test-BRAVOCondition `
+    -Condition (
+        ($deployGitignoreText -match '(?m)^BRAVO\.local\.config\s*$') -and
+        $deployArtifactText.Contains('archive --format=zip')
+    ) `
+    -Name "Deploy/LocalConfigNeverShipsInArtifact" `
+    -Failure "BRAVO.local.config мусить лишатись git-ignored, а артефакт — збиратись через git archive, інакше site-файл одного сервера потрапить у комплект для інших"
+
+# --- Deploy/OwnershipDocumentedForOperator ---
+Test-BRAVOCondition `
+    -Condition (
+        $deployReadmeText.Contains('Володіння: що належить оператору') -and
+        $deployReadmeText.Contains('оновлення ніколи не створює site-файл із прикладу')
+    ) `
+    -Name "Deploy/OwnershipDocumentedForOperator" `
+    -Failure "deploy\README.md мусить описувати межу володіння site-конфігурацією — інакше контракт існує лише в коді"
+
 }

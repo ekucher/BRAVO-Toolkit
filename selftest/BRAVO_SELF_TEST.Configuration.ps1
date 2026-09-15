@@ -1523,6 +1523,28 @@
         -Name "ConfigVersion/VersionReadDoesNotExecuteFile" `
         -Failure "вираз у значенні маркера версії мусить відхилятись парсером, а не обчислюватись"
 
+    # --- ConfigVersion/SeededExampleIsValidVersionedNoOpConfig ---
+    # deploy\Install-BRAVOServer.ps1 -SeedLocalConfig копіює приклад в
+    # АКТИВНИЙ site-файл. Отже приклад мусить бути не лише читабельним
+    # документом, а й валідною конфігурацією: розбиратись канонічним
+    # парсером, оголошувати поточну версію формату (інакше свіжий
+    # інстал одразу попереджав би про відсутній маркер) і при цьому НЕ
+    # перевизначати жодного ключа. Це також регресія на #154 B6:
+    # скопійований приклад ніколи не має ставати мовчазним override.
+    $versionExampleData = ConvertFrom-BRAVOConfigurationDataFileText `
+        -Text ([IO.File]::ReadAllText((Join-Path $root 'BRAVO.local.config.example'), [Text.Encoding]::UTF8)) `
+        -SourceName 'BRAVO.local.config.example'
+    $versionExampleResolved = Resolve-BRAVOConfigurationSchemaVersion `
+        -DataFileContent $versionExampleData -SourceName 'BRAVO.local.config.example'
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$versionExampleResolved.WasDeclared -and
+            [int]$versionExampleResolved.EffectiveVersion -eq [int]$versionContract.CurrentVersion -and
+            @($versionExampleResolved.Overrides.Keys).Count -eq 0
+        ) `
+        -Name "ConfigVersion/SeededExampleIsValidVersionedNoOpConfig" `
+        -Failure "BRAVO.local.config.example мусить бути валідним site-файлом, що оголошує версію $($versionContract.CurrentVersion) і не перевизначає нічого; declared=$($versionExampleResolved.WasDeclared) version=$($versionExampleResolved.EffectiveVersion) ключів=$(@($versionExampleResolved.Overrides.Keys) -join ', ')"
+
     # --- ConfigVersion/ConfiguratorWritesMarkerFromSingleSource ---
     # Серіалізаторів site-файлу ДВА (production-запис і кандидат для
     # ізольованого effective). Обидва мусять брати форму маркера з

@@ -2,6 +2,48 @@
 
 ## Не випущено (developer)
 
+- **`BRAVO.local.config` гарантовано переживає оновлення (#154, B6)** —
+  межа володіння між станом оператора й станом комплекту зафіксована в
+  документації розкатки і закрита механічними перевірками.
+
+  **Що вже було правильним і тепер доведено.** `Update-BRAVOServer.ps1`
+  копіює комплект поверх runtime без `/MIR` і `/PURGE` (нічого не
+  видаляє) і виключає `BRAVO.local.config` через `/XF`; backup і відкат
+  працюють із повною копією runtime, тому site-файл переживає й відкат;
+  `Install-BRAVOServer.ps1` створює site-файл із прикладу ЛИШЕ за
+  `-SeedLocalConfig` і ніколи не чіпає наявний; site-файл git-ignored, а
+  артефакт збирається виключно `git archive`, тож файл одного сервера
+  фізично не може приїхати на інший. Доти жодна з цих властивостей не
+  була перевіркою — вони трималися на тому, що ніхто не додасть `/MIR`.
+
+  **Виправлено реальний дефект, внесений задачею B3.**
+  `BRAVO.local.config.example` не оголошував версію формату, тому файл,
+  скопійований з нього (у т.ч. через `-SeedLocalConfig`), на кожному
+  завантаженні попереджав про відсутній маркер. Приклад отримав рівно
+  один активний рядок — `configSchemaVersion = 2`, — тож свіжий інстал
+  версійований з народження і при цьому лишається повним no-op:
+  завантажувач знімає маркер до перевірки шляхів.
+
+  **Перенесення runtime-каталогу лишається ручною операцією** — оновлення
+  розгортає комплект на місці й навмисно не перейменовує runtime (ACL
+  `BRAVO_TASKS_INSTALL`). Автоматичного шляху немає, і саме тому
+  site-файл не може зникнути під час «переїзду»; контракт тепер записаний
+  і в скрипті, і в `deploy/README.md`.
+
+  Покриття: 7 статичних guard-ів (`Update/PreservesExistingLocalConfig`,
+  `Update/DoesNotDeleteLocalConfig`,
+  `Update/DoesNotReplaceLocalConfigWithExample`,
+  `Install/DoesNotTreatExampleAsActiveConfig`,
+  `Update/NewRuntimeKeepsOperatorOwnedConfigAccordingToMigrationContract`,
+  `Deploy/LocalConfigNeverShipsInArtifact`,
+  `Deploy/OwnershipDocumentedForOperator`) плюс поведінкова
+  `ConfigVersion/SeededExampleIsValidVersionedNoOpConfig`, яка проганяє
+  сам приклад через канонічний парсер і резолвер версії.
+
+  Міграція парку (B5) свідомо НЕ реалізована в цій задачі.
+
+
+
 - **Версійний контракт site-конфігурації (#154, B3)** —
   `BRAVO.local.config` тепер може оголосити версію власного формату
   зарезервованим ключем `configSchemaVersion = 2`, і завантажувач має
