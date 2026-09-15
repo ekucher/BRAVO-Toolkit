@@ -588,6 +588,61 @@ function Complete-BRAVOSelfTestReport {
     }
 }
 
+# ============================================================
+# #157 (фаза 1): memo власного джерела self-test.
+#
+# Кілька структурних guard-ів нижче розбирають AST САМОГО
+# BRAVO_SELF_TEST.ps1 (найбільший файл комплекту, ~1.3 МБ) і ще кілька
+# читають його текст. Кожен робив це заново, хоча файл під час прогону
+# не змінюється. Memo тримає рівно ОДИН AST і ОДИН рядок на весь прогін.
+#
+# Ключем є не лише шлях, а й час модифікації та розмір: якщо файл усе ж
+# зміниться під час прогону, memo не віддасть застарілий розбір — тихий
+# застарілий AST був би гіршим за повторний парсинг.
+# ============================================================
+$script:BRAVOSelfTestOwnSourceKey = $null
+$script:BRAVOSelfTestOwnSourceText = $null
+$script:BRAVOSelfTestOwnSourceAst = $null
+
+function Get-BRAVOSelfTestOwnSourceStamp {
+    $item = Get-Item -LiteralPath $PSCommandPath -ErrorAction Stop
+    return ("{0}|{1}|{2}" -f $item.FullName, $item.LastWriteTimeUtc.Ticks, $item.Length)
+}
+
+function Reset-BRAVOSelfTestOwnSourceMemoIfStale {
+    # Скидає ОБИДВА memo разом і лише тоді, коли змінився сам файл. Окреме
+    # скидання "сусіда" було б гіршим за відсутність memo: чергування
+    # викликів Text/Ast тоді щоразу інвалідувало б попередній результат.
+    $stamp = Get-BRAVOSelfTestOwnSourceStamp
+    if ($script:BRAVOSelfTestOwnSourceKey -ne $stamp) {
+        $script:BRAVOSelfTestOwnSourceKey = $stamp
+        $script:BRAVOSelfTestOwnSourceText = $null
+        $script:BRAVOSelfTestOwnSourceAst = $null
+    }
+}
+
+function Get-BRAVOSelfTestOwnSourceText {
+    Reset-BRAVOSelfTestOwnSourceMemoIfStale
+    if ($null -eq $script:BRAVOSelfTestOwnSourceText) {
+        $script:BRAVOSelfTestOwnSourceText = [IO.File]::ReadAllText($PSCommandPath, [Text.Encoding]::UTF8)
+    }
+    return $script:BRAVOSelfTestOwnSourceText
+}
+
+function Get-BRAVOSelfTestOwnSourceAst {
+    Reset-BRAVOSelfTestOwnSourceMemoIfStale
+    if ($null -eq $script:BRAVOSelfTestOwnSourceAst) {
+        $ownTokens = $null
+        $ownErrors = $null
+        $script:BRAVOSelfTestOwnSourceAst = [Management.Automation.Language.Parser]::ParseFile(
+            $PSCommandPath,
+            [ref]$ownTokens,
+            [ref]$ownErrors
+        )
+    }
+    return $script:BRAVOSelfTestOwnSourceAst
+}
+
 try {
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     Write-Host "BRAVO SELF-TEST (STATIC + RUNTIME)" -ForegroundColor Cyan
@@ -2318,31 +2373,102 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # ci\* свідомо поза перевіркою: це допоміжні скрипти розробника, які
     # ніколи не виконуються від SYSTEM.
     $silentCatchFindings = New-Object System.Collections.ArrayList
+    $keywordAsCommandFindings = New-Object System.Collections.ArrayList
+    $neverCommandKeywords = @('if', 'elseif', 'else', 'switch', 'while', 'do', 'try', 'catch', 'finally', 'until')
+    $halfFormattedFindings = New-Object System.Collections.ArrayList
+    $credentialShapedLiterals = New-Object System.Collections.ArrayList
+    # Плейсхолдери, які нічого не розкривають: узагальнені слова, маска,
+    # підстановка формату й посилання на змінну. Останнє обов'язкове:
+    # New-BRAVOSftpUrl будує саме такий рядок із ${escapedPassword} —
+    # це робочий код, а не фікстура, і перша версія перевірки на ньому
+    # спіткнулась.
+    $placeholderPassword = '^(pass|password|\*{3}|\{\d+\}|\$\{?\w+\}?)$'
+    # #157 (фаза 1): ОДИН Parser::ParseFile на файл замість чотирьох.
+    # Раніше кожна з наступних чотирьох перевірок відкривала й повністю
+    # розбирала КОЖЕН файл комплекту заново — 4 повні проходи по ~4.7 МБ
+    # коду. Самі перевірки, їхні фільтри, тексти й ПОРЯДОК assert-ів нижче
+    # не змінені: спільним став лише розбір. AST не кешується між
+    # проходами навмисно — він живе рівно один виток циклу, тож пікова
+    # пам'ять лишається такою ж, як була для одного проходу.
     foreach ($analyzedFile in $powerShellFiles) {
         if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
 
-        $catchTokens = $null
-        $catchErrors = $null
-        $catchAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $analyzedFile.FullName, [ref]$catchTokens, [ref]$catchErrors)
-        if ($null -eq $catchAst) { continue }
+        $analyzedTokens = $null
+        $analyzedErrors = $null
+        $analyzedAst = [System.Management.Automation.Language.Parser]::ParseFile(
+            $analyzedFile.FullName, [ref]$analyzedTokens, [ref]$analyzedErrors)
+        if ($null -eq $analyzedAst) { continue }
 
-        $emptyCatches = @($catchAst.FindAll({
+        # #157 (фаза 1): ОДИН обхід дерева замість чотирьох. FindAll
+        # викликає PowerShell-scriptblock на КОЖЕН вузол AST — саме ці
+        # виклики, а не сам ParseFile, і є домінантною вартістю цих
+        # перевірок. Один предикат відбирає вузли всіх потрібних типів,
+        # а розбір за типом відбувається нижче, вже без повторних обходів.
+        $analyzedNodes = @($analyzedAst.FindAll({
             param($node)
-            $node -is [System.Management.Automation.Language.CatchClauseAst]
-        }, $true) | Where-Object { $_.Body.Statements.Count -eq 0 })
+            $node -is [System.Management.Automation.Language.CatchClauseAst] -or
+            $node -is [System.Management.Automation.Language.CommandAst] -or
+            $node -is [System.Management.Automation.Language.BinaryExpressionAst] -or
+            $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
+            $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
+        }, $true))
 
-        foreach ($emptyCatch in $emptyCatches) {
-            $bodyStart = $emptyCatch.Body.Extent.StartOffset
-            $bodyEnd = $emptyCatch.Body.Extent.EndOffset
-            $hasExplanation = @($catchTokens | Where-Object {
-                $_.Kind -eq 'Comment' -and
-                $_.Extent.StartOffset -ge $bodyStart -and
-                $_.Extent.EndOffset -le $bodyEnd
-            }).Count -gt 0
-            if (-not $hasExplanation) {
-                [void]$silentCatchFindings.Add(
-                    ("{0}:{1}" -f $analyzedFile.Name, $emptyCatch.Extent.StartLineNumber))
+        foreach ($analyzedNode in $analyzedNodes) {
+            # --- порожній catch без пояснення ---
+            if ($analyzedNode -is [System.Management.Automation.Language.CatchClauseAst]) {
+                if ($analyzedNode.Body.Statements.Count -ne 0) { continue }
+                $bodyStart = $analyzedNode.Body.Extent.StartOffset
+                $bodyEnd = $analyzedNode.Body.Extent.EndOffset
+                $hasExplanation = @($analyzedTokens | Where-Object {
+                    $_.Kind -eq 'Comment' -and
+                    $_.Extent.StartOffset -ge $bodyStart -and
+                    $_.Extent.EndOffset -le $bodyEnd
+                }).Count -gt 0
+                if (-not $hasExplanation) {
+                    [void]$silentCatchFindings.Add(
+                        ("{0}:{1}" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
+                }
+                continue
+            }
+
+            # --- statement-keyword у позиції команди ---
+            if ($analyzedNode -is [System.Management.Automation.Language.CommandAst]) {
+                $commandName = $analyzedNode.GetCommandName()
+                if ($null -ne $commandName -and $neverCommandKeywords -contains $commandName.ToLowerInvariant()) {
+                    [void]$keywordAsCommandFindings.Add(
+                        ("{0}:{1} ({2})" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber, $commandName))
+                }
+                continue
+            }
+
+            # --- "a{0}" + "b{1}" -f args (форматується лише правий рядок) ---
+            if ($analyzedNode -is [System.Management.Automation.Language.BinaryExpressionAst]) {
+                if ($analyzedNode.Operator -ne 'Plus') { continue }
+                if (-not ($analyzedNode.Right -is [System.Management.Automation.Language.BinaryExpressionAst])) { continue }
+                if ($analyzedNode.Right.Operator -ne 'Format') { continue }
+                if ($analyzedNode.Left.Extent.Text -match '\{\d+\}') {
+                    [void]$halfFormattedFindings.Add(
+                        ("{0}:{1}" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
+                }
+                continue
+            }
+
+            # --- рядкові літерали, що виглядають як облікові дані ---
+            $literalValue = [string]$analyzedNode.Extent.Text
+            foreach ($credentialMatch in [regex]::Matches(
+                    $literalValue, '(?i)sftp://[^:@\s/]+:([^@\s/]+)@')) {
+                $passwordPart = $credentialMatch.Groups[1].Value
+                if ($passwordPart -notmatch $placeholderPassword) {
+                    [void]$credentialShapedLiterals.Add(
+                        ("{0}:{1} (sftp)" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
+                }
+            }
+            if ([regex]::IsMatch($literalValue,
+                    '(?i)(hooks\.slack\.com/services|discord\.com/api/webhooks)/[^/\s"'']+/[^/\s"'']+/?[^/\s"'']*') -and
+                $literalValue -notmatch '\*{3}' -and
+                $literalValue -notmatch '\{\d+\}') {
+                [void]$credentialShapedLiterals.Add(
+                    ("{0}:{1} (webhook)" -f $analyzedFile.Name, $analyzedNode.Extent.StartLineNumber))
             }
         }
     }
@@ -2355,29 +2481,6 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # Guard: жодного CommandAst, чиє ім'я — statement-keyword, який
     # НІКОЛИ не буває легітимною командою (foreach/where свідомо поза
     # списком — це валідні alias-и ForEach-Object/Where-Object у pipeline).
-    $keywordAsCommandFindings = New-Object System.Collections.ArrayList
-    $neverCommandKeywords = @('if', 'elseif', 'else', 'switch', 'while', 'do', 'try', 'catch', 'finally', 'until')
-    foreach ($analyzedFile in $powerShellFiles) {
-        if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
-
-        $keywordTokens = $null
-        $keywordErrors = $null
-        $keywordAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $analyzedFile.FullName, [ref]$keywordTokens, [ref]$keywordErrors)
-        if ($null -eq $keywordAst) { continue }
-
-        $commandNodes = @($keywordAst.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.CommandAst]
-        }, $true))
-        foreach ($commandNode in $commandNodes) {
-            $commandName = $commandNode.GetCommandName()
-            if ($null -ne $commandName -and $neverCommandKeywords -contains $commandName.ToLowerInvariant()) {
-                [void]$keywordAsCommandFindings.Add(
-                    ("{0}:{1} ({2})" -f $analyzedFile.Name, $commandNode.Extent.StartLineNumber, $commandName))
-            }
-        }
-    }
     Test-BRAVOCondition `
         -Condition ($keywordAsCommandFindings.Count -eq 0) `
         -Name "Diagnostics/NoKeywordParsedAsCommand" `
@@ -2409,30 +2512,6 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # Guard: жодного Plus-виразу, чий ПРАВИЙ операнд — Format (-f), а лівий
     # бік містить непідставлені {N}-плейсхолдери (правильна форма —
     # ("a{0}" + "b{3}") -f args).
-    $halfFormattedFindings = New-Object System.Collections.ArrayList
-    foreach ($analyzedFile in $powerShellFiles) {
-        if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
-
-        $formatTokens = $null
-        $formatErrors = $null
-        $formatAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $analyzedFile.FullName, [ref]$formatTokens, [ref]$formatErrors)
-        if ($null -eq $formatAst) { continue }
-
-        $suspectNodes = @($formatAst.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.BinaryExpressionAst] -and
-            $node.Operator -eq 'Plus' -and
-            $node.Right -is [System.Management.Automation.Language.BinaryExpressionAst] -and
-            $node.Right.Operator -eq 'Format'
-        }, $true))
-        foreach ($suspectNode in $suspectNodes) {
-            if ($suspectNode.Left.Extent.Text -match '\{\d+\}') {
-                [void]$halfFormattedFindings.Add(
-                    ("{0}:{1}" -f $analyzedFile.Name, $suspectNode.Extent.StartLineNumber))
-            }
-        }
-    }
     Test-BRAVOCondition `
         -Condition ($halfFormattedFindings.Count -eq 0) `
         -Name "Diagnostics/NoHalfFormattedStringConcatenation" `
@@ -2447,47 +2526,6 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # Перевіряються лише СТРОКОВІ ЛІТЕРАЛИ з AST — коментарі й документація
     # свідомо поза межами: там форма URL з обліковими даними потрібна, щоб
     # пояснити, що саме маскується.
-    $credentialShapedLiterals = New-Object System.Collections.ArrayList
-    # Плейсхолдери, які нічого не розкривають: узагальнені слова, маска,
-    # підстановка формату й посилання на змінну. Останнє обов'язкове:
-    # New-BRAVOSftpUrl будує саме такий рядок із ${escapedPassword} —
-    # це робочий код, а не фікстура, і перша версія перевірки на ньому
-    # спіткнулась.
-    $placeholderPassword = '^(pass|password|\*{3}|\{\d+\}|\$\{?\w+\}?)$'
-    foreach ($analyzedFile in $powerShellFiles) {
-        if ($analyzedFile.Extension -notin @('.ps1', '.psm1')) { continue }
-
-        $literalTokens = $null
-        $literalErrors = $null
-        $literalAst = [System.Management.Automation.Language.Parser]::ParseFile(
-            $analyzedFile.FullName, [ref]$literalTokens, [ref]$literalErrors)
-        if ($null -eq $literalAst) { continue }
-
-        $literalNodes = @($literalAst.FindAll({
-            param($node)
-            $node -is [System.Management.Automation.Language.StringConstantExpressionAst] -or
-            $node -is [System.Management.Automation.Language.ExpandableStringExpressionAst]
-        }, $true))
-
-        foreach ($literalNode in $literalNodes) {
-            $literalValue = [string]$literalNode.Extent.Text
-            foreach ($credentialMatch in [regex]::Matches(
-                    $literalValue, '(?i)sftp://[^:@\s/]+:([^@\s/]+)@')) {
-                $passwordPart = $credentialMatch.Groups[1].Value
-                if ($passwordPart -notmatch $placeholderPassword) {
-                    [void]$credentialShapedLiterals.Add(
-                        ("{0}:{1} (sftp)" -f $analyzedFile.Name, $literalNode.Extent.StartLineNumber))
-                }
-            }
-            if ([regex]::IsMatch($literalValue,
-                    '(?i)(hooks\.slack\.com/services|discord\.com/api/webhooks)/[^/\s"'']+/[^/\s"'']+/?[^/\s"'']*') -and
-                $literalValue -notmatch '\*{3}' -and
-                $literalValue -notmatch '\{\d+\}') {
-                [void]$credentialShapedLiterals.Add(
-                    ("{0}:{1} (webhook)" -f $analyzedFile.Name, $literalNode.Extent.StartLineNumber))
-            }
-        }
-    }
     Test-BRAVOCondition `
         -Condition ($credentialShapedLiterals.Count -eq 0) `
         -Name "Secrets/NoCredentialShapedLiterals" `
@@ -18310,11 +18348,7 @@ function Remove-BRAVOSelfTestFixtureDirectory {
         # НЕ містить pre-delete existence-gate.
         $helperProbeTokens = $null
         $helperProbeErrors = $null
-        $helperProbeAst = [Management.Automation.Language.Parser]::ParseFile(
-            $PSCommandPath,
-            [ref]$helperProbeTokens,
-            [ref]$helperProbeErrors
-        )
+        $helperProbeAst = Get-BRAVOSelfTestOwnSourceAst
         $helperFunctionAst = $helperProbeAst.FindAll(
             {
                 param($candidate)
@@ -18372,11 +18406,7 @@ function Remove-BRAVOSelfTestFixtureDirectory {
 & {
     $tempRootProbeTokens = $null
     $tempRootProbeErrors = $null
-    $tempRootProbeAst = [Management.Automation.Language.Parser]::ParseFile(
-        $PSCommandPath,
-        [ref]$tempRootProbeTokens,
-        [ref]$tempRootProbeErrors
-    )
+    $tempRootProbeAst = Get-BRAVOSelfTestOwnSourceAst
     # Унікальний literal-маркер кожного з п'яти PR-added fixture-блоків —
     # той самий підхід, що ідентифікує КОНКРЕТНИЙ `& { ... }` вузол AST
     # серед десятків інших top-level scriptblock-виразів у файлі.
@@ -18660,11 +18690,7 @@ function Remove-BRAVOSelfTestFixtureDirectory {
 & {
     $boundaryProbeTokens = $null
     $boundaryProbeErrors = $null
-    $boundaryProbeAst = [Management.Automation.Language.Parser]::ParseFile(
-        $PSCommandPath,
-        [ref]$boundaryProbeTokens,
-        [ref]$boundaryProbeErrors
-    )
+    $boundaryProbeAst = Get-BRAVOSelfTestOwnSourceAst
     $reportFunctionAst = $boundaryProbeAst.FindAll(
         {
             param($candidate)
@@ -18747,7 +18773,7 @@ function Remove-BRAVOSelfTestFixtureDirectory {
 # scope — той самий механізм, що вже працює для 97+ інших викликів у
 # dot-sourced доменних фрагментах.
 & {
-    $sourceText = [IO.File]::ReadAllText($PSCommandPath, [Text.Encoding]::UTF8)
+    $sourceText = Get-BRAVOSelfTestOwnSourceText
     $guardPos = $sourceText.IndexOf('. (Join-Path $root "BRAVO_RUNTIME_GUARD.ps1")')
     $integrityPos = $sourceText.IndexOf('Test-BRAVORuntimeManifestIntegrity `')
     $helperLoggingImportPos = $sourceText.IndexOf('Import-Module -Name $helperLoggingPath -ErrorAction Stop')
@@ -19002,7 +19028,7 @@ Test-BRAVOCondition `
     $result = $null
     $fixtureExceptionMessage = $null
     try {
-        $sourceText = [IO.File]::ReadAllText($PSCommandPath, [Text.Encoding]::UTF8)
+        $sourceText = Get-BRAVOSelfTestOwnSourceText
         $module = New-BRAVOSelfTestRuntimeModule -SourceText $sourceText `
             -FunctionNames @('Enter-BRAVOSelfTestSuite', 'Complete-BRAVOSelfTestActiveSuiteSpan', 'Test-BRAVOCondition')
         $result = & $module {
@@ -19127,7 +19153,7 @@ $timingProbeModule = $null
 $timingProbeResult = $null
 $timingProbeFixtureExceptionMessage = $null
 try {
-    $timingProbeSourceText = [IO.File]::ReadAllText($PSCommandPath, [Text.Encoding]::UTF8)
+    $timingProbeSourceText = Get-BRAVOSelfTestOwnSourceText
     $timingProbeModule = New-BRAVOSelfTestRuntimeModule -SourceText $timingProbeSourceText -FunctionNames @('Test-BRAVOCondition')
     $timingProbeResult = & $timingProbeModule {
         # Локальний silent-стаб Write-Host — той самий встановлений у файлі
@@ -19335,6 +19361,95 @@ Test-BRAVOCondition `
         "виконуйте в дочірній області (& { ... }) або підніміть " +
         "`$script:selfTestVariableCountLimit — інакше наступне переповнення знову спливе " +
         "помилкою SessionStateOverflowException у непов'язаному тесті (#163)")
+
+# ============================================================
+# #157 (фаза 1): guard-и вартості прогону.
+#
+# Оптимізація, яку легко «покращити» видаленням перевірки, гірша за
+# повільний self-test. Тому тут не просто перевіряється memo, а й
+# механічно доводиться, що ЄДИНИЙ прохід по файлах комплекту й далі
+# живить УСІ чотири аналізи, які він замінив.
+# ============================================================
+& {
+    $perfOwnAstFirst = Get-BRAVOSelfTestOwnSourceAst
+    $perfOwnAstSecond = Get-BRAVOSelfTestOwnSourceAst
+    $perfOwnTextFirst = Get-BRAVOSelfTestOwnSourceText
+    $perfOwnTextSecond = Get-BRAVOSelfTestOwnSourceText
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $perfOwnAstFirst -and
+            [object]::ReferenceEquals($perfOwnAstFirst, $perfOwnAstSecond) -and
+            [object]::ReferenceEquals($perfOwnTextFirst, $perfOwnTextSecond)
+        ) `
+        -Name "Perf/OwnSourceMemoReturnsSameInstance" `
+        -Failure "повторний виклик Get-BRAVOSelfTestOwnSourceAst/Text має повертати ТОЙ САМИЙ екземпляр — інакше memo не діє і найбільший файл комплекту розбирається заново"
+
+    # Чергування Text/Ast не повинно інвалідувати сусіда: саме на цьому
+    # спотикається наївне memo, де кожен getter скидає інший.
+    $perfOwnAstAfterText = Get-BRAVOSelfTestOwnSourceAst
+    Test-BRAVOCondition `
+        -Condition ([object]::ReferenceEquals($perfOwnAstFirst, $perfOwnAstAfterText)) `
+        -Name "Perf/OwnSourceMemoSurvivesAlternatingAccess" `
+        -Failure "виклик Get-BRAVOSelfTestOwnSourceText не має скидати вже розібраний AST (і навпаки)"
+
+    # Ключ memo мусить враховувати фактичний стан файлу, а не лише шлях:
+    # застарілий AST був би гіршим за повторний парсинг.
+    $perfOwnItem = Get-Item -LiteralPath $PSCommandPath
+    $perfOwnStamp = Get-BRAVOSelfTestOwnSourceStamp
+    Test-BRAVOCondition `
+        -Condition (
+            $perfOwnStamp -like "*$($perfOwnItem.LastWriteTimeUtc.Ticks)*" -and
+            $perfOwnStamp -like "*$($perfOwnItem.Length)*"
+        ) `
+        -Name "Perf/OwnSourceMemoKeyTracksFileState" `
+        -Failure "ключ memo має містити час модифікації й розмір файлу, інакше зміна файлу під час прогону віддала б застарілий розбір; фактично: '$perfOwnStamp'"
+
+    # Головний anti-regression guard фази 1: рівно ОДИН АНАЛІТИЧНИЙ
+    # AST-прохід по $powerShellFiles, і він годує всі чотири набори
+    # знахідок. Цикл синтаксичної перевірки (Parser/<file>) теж розбирає
+    # ті самі файли й теж легітимний — його відрізняє саме те, що він не
+    # звертається до жодного з наборів знахідок нижче.
+    $perfRequiredCollections = @(
+        '$silentCatchFindings',
+        '$keywordAsCommandFindings',
+        '$halfFormattedFindings',
+        '$credentialShapedLiterals'
+    )
+    $perfRepoLoops = @($perfOwnAstFirst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.ForEachStatementAst] -and
+        $node.Condition.Extent.Text.Contains('powerShellFiles')
+    }, $true))
+    $perfAnalysisLoops = @($perfRepoLoops | Where-Object {
+        $loopText = [string]$_.Extent.Text
+        $loopText.Contains('Parser]::ParseFile') -and
+        @($perfRequiredCollections | Where-Object { $loopText.Contains($_) }).Count -gt 0
+    })
+    $perfMergedLoopText = if ($perfAnalysisLoops.Count -eq 1) {
+        [string]$perfAnalysisLoops[0].Extent.Text
+    } else {
+        ''
+    }
+    $perfMissingCollections = @($perfRequiredCollections | Where-Object {
+        -not $perfMergedLoopText.Contains($_)
+    })
+    # Обхід дерева теж має бути один: FindAll викликає scriptblock на
+    # КОЖЕН вузол, тож чотири обходи коштують учетверо більше за один —
+    # саме це, а не повторний ParseFile, було справжнім вузьким місцем.
+    $perfTreeWalkCount = @([regex]::Matches($perfMergedLoopText, '\.FindAll\(')).Count
+    Test-BRAVOCondition `
+        -Condition (
+            $perfAnalysisLoops.Count -eq 1 -and
+            $perfMissingCollections.Count -eq 0 -and
+            $perfTreeWalkCount -eq 1
+        ) `
+        -Name "Perf/SingleAstPassOverRepositoryFiles" `
+        -Failure ("по файлах комплекту має бути РІВНО ОДИН аналітичний AST-прохід, і він має живити всі " +
+            "чотири аналізи (порожній catch, keyword-as-command, half-formatted -f, credential-shaped " +
+            "літерали), використавши РІВНО ОДИН обхід дерева (FindAll). Фактично аналітичних " +
+            "проходів: $($perfAnalysisLoops.Count); обходів дерева в ньому: $perfTreeWalkCount; " +
+            "не живляться з нього: $($perfMissingCollections -join ', ')")
+}
 
 # P0 fail-fast/telemetry: увесь попередній inline reporting/exit-хвіст
 # (exit-code formula, operator summary, SELF-TEST PASSED/FAILED, Complete-
