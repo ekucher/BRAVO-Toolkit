@@ -529,15 +529,13 @@ try {
         }
 
         if ($ValidateOnly) {
+            # $global:discoveryEnabledComponents — канонічний мапінг
+            # componentSettings -> компоненти discovery (BRAVO.Configuration
+            # .Derivation). Раніше він будувався тут inline, і Archive
+            # runtime мусив би завести другу копію.
             $discoveryValidationErrors = @(Test-BRAVODiscoveryResult `
                 -DiscoveryResult $bravoDiscoveryResult `
-                -EnabledComponents @{
-                    MODEL = [bool]$componentSettings.Archive.MODEL
-                    BLOG = [bool]$componentSettings.Archive.BLOG
-                    BRAVOEXCH = [bool]$componentSettings.Archive.BRAVOEXCH
-                    BAZA_APP = ([bool]$componentSettings.Synchronization.BAZA_APP_LOCAL -or [bool]$componentSettings.Synchronization.BAZA_APP_SFTP)
-                    BAZA_WWW = ([bool]$componentSettings.Synchronization.BAZA_WWW_SFTP -or [bool]$componentSettings.Synchronization.BAZA_WWW_LOCAL)
-                } `
+                -EnabledComponents $global:discoveryEnabledComponents `
                 -DestinationPaths @{
                     MODEL = $archiveDirs.Model
                     BLOG = $archiveDirs.Blog
@@ -545,7 +543,37 @@ try {
                     BAZA_APP = $bazaAppPaths.Destination
                     BAZA_WWW = $bazaWWWPaths.Destination
                 })
-            if ($discoveryValidationErrors.Count -gt 0) {
+
+            # #158 (етап 3): склад backup set відносно підтвердженого
+            # baseline. Після -ConfirmDiscoveryBaseline порівнюємо з щойно
+            # збереженим знімком (це і є поточний результат), інакше
+            # підтвердження легітимної зміни ніколи не "заспокоїло" б вивід
+            # у тому самому прогоні.
+            $discoveryDriftBaseline = $(if ($ConfirmDiscoveryBaseline) {
+                $bravoDiscoveryResult
+            } else {
+                $discoveryBaselineImport.Baseline
+            })
+            $discoveryDriftBaselineKind = $(if ($ConfirmDiscoveryBaseline) {
+                'Canonical'
+            } else {
+                [string]$discoveryBaselineImport.Source
+            })
+            $discoveryDriftFindings = @(Test-BRAVODiscoveryComponentDrift `
+                -DiscoveryResult $bravoDiscoveryResult `
+                -Baseline $discoveryDriftBaseline `
+                -BaselineSourceKind $discoveryDriftBaselineKind `
+                -EnabledComponents $global:discoveryEnabledComponents)
+            $discoveryDriftErrors = @($discoveryDriftFindings | Where-Object { $_.Severity -eq 'Error' })
+            if ($discoveryDriftFindings.Count -gt 0) {
+                Write-Host 'Склад джерел відносно підтвердженого baseline:'
+                foreach ($driftFinding in $discoveryDriftFindings) {
+                    $driftColor = $(if ($driftFinding.Severity -eq 'Error') { 'Red' } else { 'Gray' })
+                    Write-Host "  - $($driftFinding.Message)" -ForegroundColor $driftColor
+                }
+            }
+
+            if ($discoveryValidationErrors.Count -gt 0 -or $discoveryDriftErrors.Count -gt 0) {
                 Write-Host "Результат перевірки discovery: ПОМИЛКИ" -ForegroundColor Red
                 foreach ($validationError in $discoveryValidationErrors) {
                     Write-Host "  - $validationError" -ForegroundColor Red

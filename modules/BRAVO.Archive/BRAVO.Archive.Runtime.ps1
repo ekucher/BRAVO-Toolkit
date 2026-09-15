@@ -6279,6 +6279,10 @@ function Main {
         2 +
         1 +
         1 +
+        # #158 (етап 3): "Перевірка складу джерел" — завжди присутній
+        # numbered крок (виконується незалежно від складу компонентів),
+        # тому доданок безумовний. Без нього Current перевищив би Total.
+        1 +
         $(if ($bazaAppLocalSyncEnabled) { 1 } else { 0 }) +
         $(if ($bazaWWWLocalSyncEnabled) { 1 } else { 0 }) +
         $enabledArchives.Count +
@@ -6304,6 +6308,10 @@ function Main {
     # Write-Host у runtime.
     $archivePlanEntries = [ordered]@{}
     $archivePlanEntries['Перевірка вільного місця'] = $true
+    # #158 (етап 3): оператор має бачити в плані, що склад джерел
+    # звіряється з підтвердженим baseline — інакше зупинка прогону через
+    # дрейф виглядала б як несподівана відмова невідомої природи.
+    $archivePlanEntries['Перевірка складу джерел'] = $true
     $archivePlanEntries['Локальна синхронізація BAZA_APP'] = [bool]$bazaAppLocalSyncEnabled
     $archivePlanEntries['Локальна синхронізація BAZA_WWW'] = [bool]$bazaWWWLocalSyncEnabled
     foreach ($archiveDefinition in $archiveDefinitions) {
@@ -6682,6 +6690,82 @@ function Main {
         -Name "Перевірка середовища" `
         -Status $(if ($environmentValid) { 'OK' } else { 'WARNING' })
 
+    # =============================================
+    # СКЛАД ДЖЕРЕЛ ВІДНОСНО ПІДТВЕРДЖЕНОГО BASELINE (#158, етап 3)
+    # =============================================
+    # Раніше baseline читав ЛИШЕ BRAVO_SETUP -ValidateOnly, і лише як
+    # необов'язкове попередження. Тобто захист від дрейфу діяв у момент,
+    # коли оператор дивиться на екран, і не діяв у запланованому нічному
+    # прогоні — саме там, де неповна копія лишається непоміченою. Для
+    # інструменту резервного копіювання це найгірший клас відмови.
+    #
+    # Перевірка стоїть ПЕРЕД перевіркою шляхів і перед будь-якою
+    # production-операцією: рішення "склад backup set змінився" не залежить
+    # від доступності конкретних каталогів.
+    #
+    # Гранулярність навмисна і збігається з уже наявним патерном SYSTEM
+    # access probe нижче: дрейф КОНКРЕТНОГО компонента вимикає САМЕ його
+    # (generation стає INCOMPLETE, а не FAILED), і лише неможливість
+    # оцінити baseline узагалі скасовує весь прогін. Зворотне рішення —
+    # "будь-який дрейф скасовує все" — означало б, що неоднозначний
+    # BAZA_WWW позбавляє резервної копії ще й MODEL/BLOG, тобто зменшує
+    # захист даних заради формальної суворості.
+    $discoveryBaselineValid = $true
+    $discoveryBaselineGlobalFailure = $false
+    $driftFailedComponents = @()
+    $discoveryDriftFindings = @()
+    try {
+        $discoveryBaselineImport = Import-BRAVODiscoveryBaseline `
+            -StateRoot $stateRoot `
+            -RuntimeRoot $runtimeRoot
+        foreach ($baselineProblem in @($discoveryBaselineImport.Problems)) {
+            Write-BRAVOLog -Component 'DISCOVERY' -Message ([string]$baselineProblem) -Level 'WARNING'
+        }
+        $discoveryDriftFindings = @(Test-BRAVODiscoveryComponentDrift `
+            -DiscoveryResult $bravoDiscoveryResult `
+            -Baseline $discoveryBaselineImport.Baseline `
+            -BaselineSourceKind ([string]$discoveryBaselineImport.Source) `
+            -EnabledComponents $discoveryEnabledComponents)
+    } catch {
+        # Fail-closed: якщо саму перевірку складу виконати не вдалося, ми
+        # НЕ знаємо, чи повний backup set. Мовчазне продовження тут
+        # повернуло б рівно той дефект, який закриває ця перевірка.
+        $discoveryBaselineValid = $false
+        $discoveryBaselineGlobalFailure = $true
+        Write-BRAVOLog -Component 'DISCOVERY' -Message (
+            "Перевірку складу джерел відносно baseline виконати не вдалося: $($_.Exception.Message)"
+        ) -Level 'ERROR'
+    }
+    foreach ($driftFinding in $discoveryDriftFindings) {
+        $driftLevel = $(if ([string]$driftFinding.Severity -eq 'Error') { 'ERROR' } else { 'INFO' })
+        Write-BRAVOLog -Component 'DISCOVERY' -Message ([string]$driftFinding.Message) -Level $driftLevel
+    }
+    # Знахідка з Component='BASELINE' означає "оцінити склад нічим"
+    # (непридатний до читання baseline, відсутній presence-контракт) —
+    # це глобальна умова, а не проблема одного компонента.
+    if (@($discoveryDriftFindings | Where-Object {
+            [string]$_.Severity -eq 'Error' -and [string]$_.Component -eq 'BASELINE'
+        }).Count -gt 0) {
+        $discoveryBaselineGlobalFailure = $true
+    }
+    $driftFailedComponents = @($discoveryDriftFindings |
+        Where-Object { [string]$_.Severity -eq 'Error' -and [string]$_.Component -ne 'BASELINE' } |
+        ForEach-Object { [string]$_.Component })
+    if ($discoveryBaselineGlobalFailure -or $driftFailedComponents.Count -gt 0) {
+        $discoveryBaselineValid = $false
+    }
+    $discoveryDriftDetails = $(if ($discoveryBaselineGlobalFailure) {
+        'склад джерел оцінити не вдалося; деталі у журналі.'
+    } elseif ($driftFailedComponents.Count -gt 0) {
+        "компонентів із дрейфом: $($driftFailedComponents -join ', '); деталі у журналі."
+    } else {
+        ''
+    })
+    Write-BRAVOArchiveStep `
+        -Name "Перевірка складу джерел" `
+        -Status $(if ($discoveryBaselineValid) { 'OK' } else { 'ERROR' }) `
+        -Details $discoveryDriftDetails
+
     Write-Log "=== ПЕРЕВIРКА НЕОБХIДНИХ ШЛЯХIВ ==="
     Show-ScriptProgress -Status "Перевiрка необхiдних шляхiв" -PercentComplete 15
     $requiredPaths = @($baseRequiredPaths)
@@ -6914,9 +6998,26 @@ function Main {
         }
     }
 
+    # Дві різні причини скасувати ВСІ production-операції — одна
+    # реалізація скасування. #158 (етап 3) додав другу причину (дрейф
+    # складу джерел відносно baseline); дублювати сам механізм зупинки
+    # заради неї означало б дві копії однієї політики.
+    $productionCancelLogMessage = $null
+    $productionCancelResultError = $null
     if (-not $sharedAccessValid) {
         # Спільна інфраструктура недоступна — виконувати нема куди й нема чим.
-        Write-BRAVOLog -Component 'PATHS' -Message 'Production operations cancelled because SYSTEM access preflight failed for shared infrastructure (logs/BackupRoot/lock/state)' -Level 'ERROR'
+        $productionCancelLogMessage = 'Production operations cancelled because SYSTEM access preflight failed for shared infrastructure (logs/BackupRoot/lock/state)'
+        $productionCancelResultError = 'SYSTEM access preflight failed for shared infrastructure'
+    } elseif ($discoveryBaselineGlobalFailure) {
+        # Не "компонент зник", а "не можемо встановити, чи зник" — оцінити
+        # склад backup set нічим, тому жодна production-операція не має
+        # права виглядати успішною.
+        $productionCancelLogMessage = 'Production operations cancelled because the confirmed discovery baseline could not be evaluated'
+        $productionCancelResultError = 'Discovery baseline could not be evaluated'
+    }
+
+    if ($null -ne $productionCancelLogMessage) {
+        Write-BRAVOLog -Component 'PATHS' -Message $productionCancelLogMessage -Level 'ERROR'
         # Кожен увімкнений компонент отримує явний результат-відмову: інакше
         # $results лишався порожнім, і РЕЗУЛЬТАТ показував "Створено архівів:
         # 0 з 0" замість "0 з 3", а причиною відмови помилково ставав перший-
@@ -6929,7 +7030,7 @@ function Main {
                 CreateSuccess = $false
                 IntegritySuccess = $false
                 ErrorStage = 'CONFIGURATION'
-                Error = 'SYSTEM access preflight failed for shared infrastructure'
+                Error = $productionCancelResultError
                 ToolFailure = $null
             }
         }
@@ -6938,6 +7039,7 @@ function Main {
         $bazaAppDestinationAvailable = $false
         $bazaWWWSourceAvailable = $false
         $bazaWWWDestinationAvailable = $false
+        $operationFailed = $true
     } elseif ($probeFailedComponents.Count -gt 0) {
         # Вимикаємо ЛИШЕ ті компоненти, чий власний probe не пройшов: решта
         # архівуються, а generation стає INCOMPLETE замість FAILED.
@@ -6956,6 +7058,37 @@ function Main {
         $failedComponentNames = @($probeFailedComponents)
         $readyArchives = @($readyArchives | Where-Object { $failedComponentNames -notcontains [string]$_.Type })
     }
+    # #158 (етап 3): компоненти з дрейфом вимикаються поіменно — той самий
+    # принцип, що й $probeFailedComponents вище. Робиться ПІСЛЯ probe-блоку,
+    # щоб не дублювати механіку вимкнення, і лише коли прогін не скасовано
+    # цілком (інакше вимикати вже нема чого).
+    if ($null -eq $productionCancelLogMessage -and $driftFailedComponents.Count -gt 0) {
+        foreach ($driftComponent in $driftFailedComponents) {
+            if ($driftComponent -eq 'BAZA_APP') {
+                $bazaAppSourceAvailable = $false
+                continue
+            }
+            if ($driftComponent -eq 'BAZA_WWW') {
+                $bazaWWWSourceAvailable = $false
+                continue
+            }
+            if ($results.ContainsKey($driftComponent)) { continue }
+            $results[$driftComponent] = @{
+                ArchiveSuccess = $false
+                HashSuccess = $false
+                CreateSuccess = $false
+                IntegritySuccess = $false
+                ErrorStage = 'CONFIGURATION'
+                Error = 'Discovery baseline drift: component state does not match the confirmed baseline'
+                ToolFailure = $null
+            }
+        }
+        $readyArchives = @($readyArchives | Where-Object {
+            $driftFailedComponents -notcontains [string]$_.Type
+        })
+        $operationFailed = $true
+    }
+
     if (-not $systemAccessValid) {
         $operationFailed = $true
     }
@@ -8089,7 +8222,7 @@ function Main {
         # найпріоритетнішу категорію відмови — жодна з ~26 точок
         # $operationFailed = $true вище не редагувалась.
         $script:processExitCode = Resolve-BRAVOExitCode `
-            -InvalidConfiguration:(-not $sftpConfigurationValid -or -not $smbConfigurationValid -or -not $archiveConsistencyValid -or -not $systemAccessValid) `
+            -InvalidConfiguration:(-not $sftpConfigurationValid -or -not $smbConfigurationValid -or -not $archiveConsistencyValid -or -not $systemAccessValid -or -not $discoveryBaselineValid) `
             -CredentialsUnavailable:(-not $archiveCredentialValid) `
             -LocalArchiveFailed:($anyLocalArchiveFailed -or $generationFinalizationFailed) `
             -IntegrityTestFailed:$anyIntegrityTestFailed `
