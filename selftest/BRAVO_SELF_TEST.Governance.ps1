@@ -659,7 +659,8 @@
         -Condition ($pushSuffixedCheckNames.Count -eq 0) `
         -Name "Governance/RequiredChecksListUsesPullRequestNames" `
         -Failure ("RELEASE_POLICY.md §13.3 не має містити імен із суфіксом ' (push)' — такий required " +
-            "check на PR не з'являється й заблокував би мердж назавжди; знайдено: $($pushSuffixedCheckNames -join ', ')")
+            "check на PR не з'являється й заблокував би мердж назавжди; знайдено: $($pushSuffixedCheckNames -join ', ')")
+
 # =====================================================================
 # Володіння site-конфігурацією при розкатці (#154, B6)
 # =====================================================================
