@@ -128,7 +128,7 @@ function Get-BRAVOConfigurationDataFileLiteralValue {
             $child -isnot [System.Management.Automation.Language.StringConstantExpressionAst] -and
             (
                 $child.Value -is [int] -or $child.Value -is [long] -or $child.Value -is [double] -or
-                $child.Value -is [decimal] -or $child.Value -is [single] -or $child.Value -is [short] -or
+                $child.Value -is [decimal] -or $child.Value -is [single] -or $child.Value -is [System.Int16] -or
                 $child.Value -is [byte]
             )
         )

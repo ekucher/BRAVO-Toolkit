@@ -50,6 +50,14 @@
 # переповнення стека.
 $script:BRAVOConfigurationSchemaMaximumDepth = 16
 
+# Повний перелік числових System.TypeCode. Boolean/Char/DateTime/String
+# сюди свідомо не входять: у .NET вони мають власні TypeCode й числами
+# у контракті конфігурації не є.
+$script:BRAVOConfigurationSchemaNumericTypeCode = @(
+    'SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32',
+    'Int64', 'UInt64', 'Single', 'Double', 'Decimal'
+)
+
 # Листи, чий рід НЕМОЖЛИВО вивести з канонічного дефолту.
 # Кожен запис мусить відповідати реальному листу канонічного графа —
 # зайвий запис ловить Schema/CoversEveryCanonicalLeaf.
@@ -87,9 +95,17 @@ function Get-BRAVOConfigurationSchemaValueKind {
     if ($Value -is [bool]) { return 'Boolean' }
     if ($Value -is [string]) { return 'String' }
     if ($Value -is [System.Collections.IDictionary]) { return 'Node' }
-    if ($Value -is [int] -or $Value -is [long] -or $Value -is [double] -or
-        $Value -is [decimal] -or $Value -is [single] -or $Value -is [short] -or
-        $Value -is [byte] -or $Value -is [uint32] -or $Value -is [uint64]) {
+    # Числові типи — через TypeCode, а НЕ через ланцюг `-is [accelerator]`.
+    # Причина емпірична (CI 2026-09-15): `[short]` не є прискорювачем типу
+    # у Windows PowerShell 5.1 (з'явився лише в PowerShell 6+), тому
+    # обчислення такого операнда кидає "Unable to find type [short]". У
+    # ланцюзі `-or` це виглядає безпечно рівно доти, доки якийсь ранній
+    # операнд істинний і ланцюг замикається достроково — а на першому ж
+    # НЕчисловому значенні обчислюються всі, і схема падає цілком.
+    # TypeCode покриває той самий набір типів, не залежить від таблиці
+    # прискорювачів конкретної версії й тому не має цього класу відмови.
+    $valueTypeCode = [string][System.Type]::GetTypeCode($Value.GetType())
+    if ($script:BRAVOConfigurationSchemaNumericTypeCode -contains $valueTypeCode) {
         return 'Number'
     }
     if ($Value -is [System.Collections.IEnumerable]) { return 'Array' }
