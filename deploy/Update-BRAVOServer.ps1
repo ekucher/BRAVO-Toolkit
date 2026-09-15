@@ -6,6 +6,7 @@ param(
     [string]$StagingRoot = 'C:\Temp\BRAVO_UPDATE',
     [string]$BackupRoot,
     [switch]$PreflightOnly,
+    [switch]$AllowPrereleaseChannel,
     [switch]$Force,
     [switch]$NoElevation,
     [switch]$NoPause
@@ -98,6 +99,16 @@ $script:Blockers = New-Object System.Collections.Generic.List[string]
 function Add-Blocker { param([string]$T) Write-Bad $T; [void]$script:Blockers.Add($T) }
 
 try {
+# Політика "який артефакт можна розгортати" спільна з Install-BRAVOServer.ps1 і
+# живе в одному екземплярі. Відсутність файлу зупиняє розкатку явно: тихо
+# продовжити означало б оновлювати БЕЗ гейта.
+$script:ReleaseGatePath = Join-Path $PSScriptRoot 'BRAVO.Deploy.ReleaseGate.ps1'
+if (-not (Test-Path -LiteralPath $script:ReleaseGatePath -PathType Leaf)) {
+    throw ('Поруч зі скриптом немає BRAVO.Deploy.ReleaseGate.ps1 (' + $script:ReleaseGatePath +
+        '). Це файл політики гейта релізу — скопіюйте весь каталог deploy\, а не один скрипт.')
+}
+. $script:ReleaseGatePath
+
 # --- 0. Права й цілісність цілі --------------------------------------------
 
 Write-Step '0. Передумови'
@@ -144,6 +155,7 @@ if (-not $isElevated) {
         [void]$argumentParts.Add('-BackupRoot'); [void]$argumentParts.Add('"' + $BackupRoot + '"')
     }
     if ($PreflightOnly) { [void]$argumentParts.Add('-PreflightOnly') }
+    if ($AllowPrereleaseChannel) { [void]$argumentParts.Add('-AllowPrereleaseChannel') }
     if ($Force) { [void]$argumentParts.Add('-Force') }
     if ($NoPause) { [void]$argumentParts.Add('-NoPause') }
     [void]$argumentParts.Add('-NoElevation')
@@ -327,6 +339,16 @@ if ([string]::IsNullOrWhiteSpace($ZipPath)) {
     Write-Note ('завантаження ' + $base + $zipName)
     Invoke-WebRequest -Uri ($base + $zipName) -OutFile $ZipPath -UseBasicParsing
     Invoke-WebRequest -Uri ($base + $zipName + '.sha256') -OutFile ($ZipPath + '.sha256') -UseBasicParsing
+    # release-manifest.json — окремий ассет релізу, тобто джерело провенансу,
+    # незалежне від самого архіву. Помилка завантаження не зупиняє оновлення:
+    # релізи до появи маніфесту його не мають, а без нього лишаються внутрішні
+    # інваріанти комплекту (їх перевіряє гейт нижче).
+    try {
+        Invoke-WebRequest -Uri ($base + 'release-manifest.json') `
+            -OutFile (Join-Path $downloadDir 'release-manifest.json') -UseBasicParsing
+    } catch {
+        Write-Warn2 ('release-manifest.json не завантажено: ' + $_.Exception.Message)
+    }
 } else {
     if (-not (Test-Path -LiteralPath $ZipPath -PathType Leaf)) { throw ('Архів не знайдено: ' + $ZipPath) }
 }
@@ -350,6 +372,38 @@ if ([string]$stagedVersion.packageVersion -ne $targetVersion) {
 }
 Write-Ok ('розпаковано: ' + $stagedVersion.packageVersion + ' / ' + $stagedVersion.releaseChannel +
           ' (sourceCommit ' + $stagedVersion.sourceCommit + ')')
+
+# --- Гейт релізу ------------------------------------------------------------
+# Доти оновлення НЕ перевіряло канал релізу взагалі — лише друкувало його.
+# Тобто prerelease-комплект приїжджав на сервер установи без жодного рішення.
+# Політика й тексти — спільні з Install-BRAVOServer.ps1 (BRAVO.Deploy.ReleaseGate.ps1).
+
+# Конвенція одна: release-manifest.json лежить поруч з архівом — і коли його
+# завантажив цей скрипт, і коли оператор приніс zip разом з ассетами релізу.
+$releaseManifestPath = Join-Path (Split-Path -Parent $ZipPath) 'release-manifest.json'
+$releaseManifest = $null
+if (Test-Path -LiteralPath $releaseManifestPath -PathType Leaf) {
+    try {
+        $releaseManifest = (Get-Content -LiteralPath $releaseManifestPath -Raw -Encoding UTF8 | ConvertFrom-Json)
+    } catch {
+        throw ('release-manifest.json пошкоджений (' + $releaseManifestPath + '): ' + $_.Exception.Message +
+            ' — провенанс не підтверджується, оновлення зупинено.')
+    }
+}
+
+$provenance = Get-BRAVODeployProvenanceVerdict -VersionMetadata $stagedVersion `
+    -ReleaseManifest $releaseManifest -ArtifactSha256 $actual -ExpectedTag $Tag
+if (-not $provenance.IsValid) {
+    throw $provenance.Message
+}
+if ($provenance.Severity -eq 'Warning') { Write-Warn2 $provenance.Message } else { Write-Ok $provenance.Message }
+
+$channelDecision = Get-BRAVODeployReleaseChannelDecision -VersionMetadata $stagedVersion `
+    -AllowPrereleaseChannel:$AllowPrereleaseChannel
+if (-not $channelDecision.Allowed) {
+    throw $channelDecision.Message
+}
+if ($channelDecision.OverrideUsed) { Write-Warn2 $channelDecision.Message } else { Write-Ok $channelDecision.Message }
 
 # Копіювання поверх НЕ видаляє файлів. Скрипт .ps1/.psm1/.psd1, якого немає
 # в новому RUNTIME_MANIFEST.json, після оновлення лишиться в комплекті — і
