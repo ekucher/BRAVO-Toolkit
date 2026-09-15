@@ -2,6 +2,77 @@
 
 ## Не випущено (developer)
 
+- **Discovery-overrides із site-конфігу нарешті діють (#158, етап 4)** —
+  `discoverySettings.BravoRoot`, `discoverySettings.WebRoot`,
+  `discoverySettings.BravoIniPath` і `discoverySettings.Sources.*` у
+  `BRAVO.local.config` застосовуються **до** discovery й реально
+  визначають джерела.
+
+  **Що було зламано.** `discoverySettings` не був raw-блоком: після
+  мерджу конфігурації завантажувач БЕЗУМОВНО перезаписував його
+  канонічним літералом. Наслідок для оператора був гіршим за «не
+  подіяло»: `discoverySettings.*` у site-конфігу трактувався як
+  невідомий top-level ключ і **валив запуск**, тому єдиним способом
+  закріпити джерела вручну лишалась правка `BRAVO.config`, яку затирає
+  кожне оновлення комплекту.
+
+  **Власність фаз визначена явно, подвійного застосування немає.**
+  Site-значення потрапляють у структуру рівно один раз — у тій самій
+  фазі мерджу, що й решта raw-блоків (`Resolve-BRAVORawConfiguration`).
+  Нова `Resolve-BRAVOEffectiveDiscoverySettings` нічого не мерджить
+  удруге: вона лише валідує форму й нормалізує вже змерджене значення
+  до канонічних ключів, і викликається один раз — після мерджу, до
+  `Resolve-BRAVOConfigurationDerivation`, всередині якої й виконується
+  discovery.
+
+  **Контракт конфігурації не послаблено.** Невідомий батьківський або
+  top-level ключ і далі fail-closed. Невідомий leaf під
+  `discoverySettings` зберігає рішення D3: приймається з попередженням
+  і метаданими, не валить запуск і не має ефекту. Типи й шляхи
+  перевіряються тим самим канонічним правилом, що й test-only env-seam
+  (`Assert-BRAVODiscoverySettingsShape` — одна реалізація на обидва
+  джерела): дозволені лише локальні absolute шляхи з літерою диска,
+  UNC/мережеві/відносні відхиляються fail-closed. Порожній рядок
+  означає «не задано», а не явне порожнє значення — інакше
+  розкоментований-і-очищений ключ мовчки вимикав би auto-discovery.
+
+  Явне значення завжди перемагає auto-discovery і ніколи ним не
+  замінюється; override одного поля не вимикає auto-discovery для
+  сусідніх.
+
+  Побічний коректний наслідок: legacy `BRAVO.config`, який усе ще
+  оголошує `discoverySettings` інлайн, тепер працює як звичайний
+  primary-шар (`DEFAULT < BRAVO.config < BRAVO.local.config`), а не
+  відкидається.
+
+  **Супутньо виправлено дефект capture primary-шару.** Ключі
+  `BRAVO.config` читались із `$global:` ПІСЛЯ виконання файлу, що не
+  відрізняє «файл це оголосив» від «змінна лишилась у процесі від
+  ПОПЕРЕДНЬОГО завантаження конфігурації». Для ключів, які `BRAVO.config`
+  оголошує, залишок щоразу перезаписувався, тому дефект був невидимий —
+  але `discoverySettings` цей файл не оголошує, тож у довгоживучому
+  процесі (Configurator, self-test, будь-який повторний
+  `Import-BravoConfiguration`) discoverySettings попереднього прогону
+  мовчки ставав primary-override наступного. Ключ тепер приймається лише
+  тоді, коли `BRAVO.config` його справді оголошує — за тим самим
+  AST-переліком, що вже живить діагностику `DeclaredGlobalNameSink`.
+  Для чистого процесу поведінка всіх інших ключів не змінюється.
+
+  `discoverySettings.*` додано до задокументованого override-контракту
+  (`BRAVO.local.config.example`) і до каталогу Configurator-а — 9 нових
+  дескрипторів у групі `Paths`/`Discovery`; механічна перевірка
+  повноти схеми лишається 1:1. Застаріле «через цей файл не
+  перевизначається» прибрано з прикладу конфігу і з
+  `docs/BRAVO_42_TO_524_MIGRATION_20260913.md` §4.4/§6.
+
+  Покриття: 11 регресій, серед них `DiscoveryOverride/*AffectsDiscovery`
+  для `MODEL`/`BravoRoot`/`WebRoot`/`BravoIniPath`,
+  `ExplicitOverrideWins`, `AutoDiscoveryNeverOverwritesExplicit`,
+  `UnknownParentStillFailsClosed`, `UnknownLeafContractUnchanged`,
+  `EmptyStringIsNotAnOverride`, `NonLocalPathFailsClosed` і механічний
+  guard `Configuration/DiscoverySettingsDefaultsMatchCanonical`, який не
+  дає розійтись raw-defaults і канонічній порожній формі.
+
 - **Зниклий компонент більше не зникає тихо (#158, етап 3)** —
   Archive звіряє presence-стан кожного увімкненого компонента з
   підтвердженим discovery baseline і не дає раніше підтвердженому

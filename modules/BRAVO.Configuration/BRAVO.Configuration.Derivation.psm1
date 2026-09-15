@@ -536,59 +536,95 @@ function Assert-BRAVODiscoverySettingsTestOverride {
         throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1 має повертати верхньорівневий hashtable (@{ ... }), fail-closed."
     }
 
-    $allowedTopLevelKeys = @('BravoIniPath', 'BravoRoot', 'WebRoot', 'Sources')
-    foreach ($key in $overrideData.Keys) {
-        if ($allowedTopLevelKeys -notcontains $key) {
-            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1 містить невідомий top-level ключ '$key', fail-closed. Дозволено лише: $($allowedTopLevelKeys -join ',')."
-        }
-    }
-
-    foreach ($scalarKey in @('BravoIniPath', 'BravoRoot', 'WebRoot')) {
-        if (-not $overrideData.Contains($scalarKey)) { continue }
-        $value = $overrideData[$scalarKey]
-        if ($null -ne $value -and -not ($value -is [string])) {
-            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: '$scalarKey' має бути `$null або string, fail-closed. Отримано тип: $($value.GetType().FullName)."
-        }
-        if ($value -is [string] -and -not [string]::IsNullOrEmpty($value) -and
-            -not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $value)) {
-            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: '$scalarKey' має бути локальним absolute drive-letter шляхом, fail-closed. Отримано: '$value'."
-        }
-    }
-
-    if ($overrideData.Contains('Sources')) {
-        $sourcesValue = $overrideData['Sources']
-        if ($null -ne $sourcesValue -and -not ($sourcesValue -is [hashtable])) {
-            throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: 'Sources' має бути hashtable (або `$null), fail-closed."
-        }
-        if ($sourcesValue -is [hashtable]) {
-            $allowedSourceKeys = @('MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA_APP', 'BAZA_WWW', 'BACKUP_ROOT')
-            foreach ($sourceKey in $sourcesValue.Keys) {
-                if ($allowedSourceKeys -notcontains $sourceKey) {
-                    throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: невідомий Sources-ключ '$sourceKey', fail-closed. Дозволено лише: $($allowedSourceKeys -join ',')."
-                }
-                $sourceValue = $sourcesValue[$sourceKey]
-                if ($null -ne $sourceValue -and -not ($sourceValue -is [string])) {
-                    throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: Sources.$sourceKey має бути `$null або string, fail-closed. Отримано тип: $($sourceValue.GetType().FullName)."
-                }
-                if ($sourceValue -is [string] -and -not [string]::IsNullOrEmpty($sourceValue) -and
-                    -not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $sourceValue)) {
-                    throw "BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1: Sources.$sourceKey має бути локальним absolute drive-letter шляхом, fail-closed. Отримано: '$sourceValue'."
-                }
-            }
-        }
-    }
+    Assert-BRAVODiscoverySettingsShape `
+        -DiscoverySettings $overrideData `
+        -Origin 'BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH .psd1'
 
     return $overrideData
 }
 
+$script:BRAVODiscoverySettingsScalarKeys = @('BravoIniPath', 'BravoRoot', 'WebRoot')
+$script:BRAVODiscoverySettingsSourceKeys = @('MODEL', 'BLOG', 'BRAVOEXCH', 'BAZA_APP', 'BAZA_WWW', 'BACKUP_ROOT')
+
+function Assert-BRAVODiscoverySettingsShape {
+    # Канонічна перевірка форми discoverySettings, спільна для ОБОХ джерел
+    # цієї структури: test-only env-seam (.psd1) і site-конфіг
+    # BRAVO.local.config (#158, етап 4). Друга копія цих самих правил
+    # розійшлася б із першою рівно тоді, коли зміниться перелік ключів.
+    #
+    # -AllowUnknownKeys існує через несиметричний контракт шляхів
+    # BRAVO.local.config (рішення D3): невідомий LEAF приймається з
+    # попередженням і метаданими, а не валить запуск. Env-seam такої
+    # поблажливості не має й не отримує: там невідомий ключ лишається
+    # fail-closed, як і був.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$DiscoverySettings,
+        [Parameter(Mandatory = $true)][string]$Origin,
+        [switch]$AllowUnknownKeys
+    )
+
+    $allowedTopLevelKeys = @($script:BRAVODiscoverySettingsScalarKeys) + @('Sources')
+    if (-not $AllowUnknownKeys) {
+        foreach ($key in $DiscoverySettings.Keys) {
+            if ($allowedTopLevelKeys -notcontains $key) {
+                throw "$Origin містить невідомий top-level ключ '$key', fail-closed. Дозволено лише: $($allowedTopLevelKeys -join ',')."
+            }
+        }
+    }
+
+    foreach ($scalarKey in @($script:BRAVODiscoverySettingsScalarKeys)) {
+        if (-not $DiscoverySettings.Contains($scalarKey)) { continue }
+        $value = $DiscoverySettings[$scalarKey]
+        if ($null -ne $value -and -not ($value -is [string])) {
+            throw "${Origin}: '$scalarKey' має бути `$null або string, fail-closed. Отримано тип: $($value.GetType().FullName)."
+        }
+        if ($value -is [string] -and -not [string]::IsNullOrEmpty($value) -and
+            -not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $value)) {
+            throw "${Origin}: '$scalarKey' має бути локальним absolute drive-letter шляхом, fail-closed. Отримано: '$value'."
+        }
+    }
+
+    if ($DiscoverySettings.Contains('Sources')) {
+        $sourcesValue = $DiscoverySettings['Sources']
+        if ($null -ne $sourcesValue -and -not ($sourcesValue -is [hashtable])) {
+            throw "${Origin}: 'Sources' має бути hashtable (або `$null), fail-closed."
+        }
+        if ($sourcesValue -is [hashtable]) {
+            $allowedSourceKeys = @($script:BRAVODiscoverySettingsSourceKeys)
+            foreach ($sourceKey in $sourcesValue.Keys) {
+                if ($allowedSourceKeys -notcontains $sourceKey) {
+                    if ($AllowUnknownKeys) { continue }
+                    throw "${Origin}: невідомий Sources-ключ '$sourceKey', fail-closed. Дозволено лише: $($allowedSourceKeys -join ',')."
+                }
+                $sourceValue = $sourcesValue[$sourceKey]
+                if ($null -ne $sourceValue -and -not ($sourceValue -is [string])) {
+                    throw "${Origin}: Sources.$sourceKey має бути `$null або string, fail-closed. Отримано тип: $($sourceValue.GetType().FullName)."
+                }
+                if ($sourceValue -is [string] -and -not [string]::IsNullOrEmpty($sourceValue) -and
+                    -not (Test-BRAVOLocalAbsoluteDriveLetterPath -CandidatePath $sourceValue)) {
+                    throw "${Origin}: Sources.$sourceKey має бути локальним absolute drive-letter шляхом, fail-closed. Отримано: '$sourceValue'."
+                }
+            }
+        }
+    }
+}
+
 function Get-BRAVOCanonicalDiscoverySettings {
-    # Канонічна, фіксована (НЕ raw-configurable) структура discoverySettings
-    # — той самий літерал, який BRAVO.config визначає інлайн (навмисно
-    # ПІСЛЯ фази local-overrides, щоб спроба перевизначити 'discoverySettings.*'
-    # через BRAVO.local.config провалювалась fail-closed, а не мовчки
-    # ігнорувалась). Винесено сюди як ОДНЕ джерело, яким користуються ОБИДВА
-    # шляхи (BRAVO.config present і absent) — без цього no-config-шлях мав би
-    # тримати другу незалежну копію цього самого літералу.
+    # Канонічна ПОРОЖНЯ структура discoverySettings (усі поля $null) —
+    # база, поверх якої site-конфіг накладає власні значення.
+    #
+    # #158 (етап 4): раніше ця структура була фіксованою й НЕ
+    # raw-configurable — BRAVO_CONFIG_LOADER перезаписував нею вже
+    # змерджене значення, тому 'discoverySettings.*' у BRAVO.local.config
+    # не просто не діяв, а валив запуск як невідомий top-level ключ.
+    # Тепер discoverySettings — звичайний raw-блок канонічних defaults
+    # (Get-BRAVODefaultConfiguration), і site-значення застосовуються у
+    # ТІЙ САМІЙ фазі мерджу, що й решта блоків, тобто ДО discovery.
+    # Структура тут будується з канонічних переліків ключів вище, а не
+    # з другого літерала: розбіжність між цією функцією і raw-defaults
+    # механічно перевіряється self-test-ом
+    # Configuration/DiscoverySettingsDefaultsMatchCanonical.
     #
     # CI remediation (BRAVO_DATA_RESTORE_MATRIX_TEST.ps1, E2E fixture):
     # раніше self-test обходив цю фіксацію через function global:
@@ -618,19 +654,95 @@ function Get-BRAVOCanonicalDiscoverySettings {
         return $override
     }
 
-    return @{
-        BravoIniPath = $null
-        BravoRoot = $null
-        WebRoot = $null
-        Sources = @{
-            MODEL = $null
-            BLOG = $null
-            BRAVOEXCH = $null
-            BAZA_APP = $null
-            BAZA_WWW = $null
-            BACKUP_ROOT = $null
+    $canonical = @{}
+    foreach ($scalarKey in @($script:BRAVODiscoverySettingsScalarKeys)) {
+        $canonical[$scalarKey] = $null
+    }
+    $canonicalSources = @{}
+    foreach ($sourceKey in @($script:BRAVODiscoverySettingsSourceKeys)) {
+        $canonicalSources[$sourceKey] = $null
+    }
+    $canonical['Sources'] = $canonicalSources
+    return $canonical
+}
+
+function Resolve-BRAVOEffectiveDiscoverySettings {
+    # #158 (етап 4): ЄДИНА точка, де визначається фактичний
+    # discoverySettings для прогону. Викликається BRAVO_CONFIG_LOADER
+    # рівно один раз — ПІСЛЯ мерджу raw-конфігурації і ДО
+    # Resolve-BRAVOConfigurationDerivation, яка запускає discovery.
+    #
+    # ВЛАСНІСТЬ ФАЗ (щоб не було подвійного застосування):
+    #   фаза мерджу  — Resolve-BRAVORawConfiguration накладає
+    #                  BRAVO.local.config на канонічні defaults; саме там
+    #                  і ТІЛЬКИ там site-значення потрапляють у структуру;
+    #   ця функція   — НЕ мерджить удруге: лише валідує форму й нормалізує
+    #                  вже змерджене значення до канонічних ключів;
+    #   discovery    — споживає результат; auto-discovery ніколи не
+    #                  перезаписує непорожнє явне значення (пріоритетний
+    #                  ланцюг Resolve-BRAVOInstallationDiscovery).
+    #
+    # Порожній рядок трактується як "не задано" (лишається $null): інакше
+    # закоментований-і-повернений ключ '' мовчки вимикав би auto-discovery.
+    #
+    # -CanonicalBase передається ЗЗОВНІ, а не читається тут викликом
+    # Get-BRAVOCanonicalDiscoverySettings. Причина не стильова: self-test
+    # підміняє canonical-функцію через function global:-shadowing, а
+    # global-shadow програє module-приватному визначенню (той самий
+    # емпірично підтверджений факт, що задокументований вище для
+    # MatrixTest). Виклик, зроблений у scope самого BRAVO_CONFIG_LOADER,
+    # цю підміну бачить — тому базу резолвить викликач, а ця функція
+    # лишається чистою: жодних прихованих читань env/глобального стану.
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$CanonicalBase,
+        [AllowNull()][hashtable]$SiteOverrides
+    )
+
+    $effective = @{}
+    foreach ($baseKey in @($CanonicalBase.Keys)) {
+        $effective[$baseKey] = $CanonicalBase[$baseKey]
+    }
+    $effectiveSources = @{}
+    if ($CanonicalBase.Contains('Sources') -and $CanonicalBase['Sources'] -is [hashtable]) {
+        foreach ($baseSourceKey in @($CanonicalBase['Sources'].Keys)) {
+            $effectiveSources[$baseSourceKey] = $CanonicalBase['Sources'][$baseSourceKey]
         }
     }
+    $effective['Sources'] = $effectiveSources
+
+    if ($null -eq $SiteOverrides) {
+        return $effective
+    }
+
+    # -AllowUnknownKeys: невідомий leaf у BRAVO.local.config приймається з
+    # попередженням (рішення D3), тому тут він не валить запуск — але й
+    # не потрапляє в нормалізований результат, тобто не має ефекту, рівно
+    # як це задокументовано для решти невідомих leaf-ключів.
+    Assert-BRAVODiscoverySettingsShape `
+        -DiscoverySettings $SiteOverrides `
+        -Origin 'BRAVO.local.config discoverySettings' `
+        -AllowUnknownKeys
+
+    foreach ($scalarKey in @($script:BRAVODiscoverySettingsScalarKeys)) {
+        if (-not $SiteOverrides.Contains($scalarKey)) { continue }
+        $value = [string]$SiteOverrides[$scalarKey]
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $effective[$scalarKey] = $value
+    }
+
+    if ($SiteOverrides.Contains('Sources') -and $SiteOverrides['Sources'] -is [hashtable]) {
+        $siteSources = $SiteOverrides['Sources']
+        foreach ($sourceKey in @($script:BRAVODiscoverySettingsSourceKeys)) {
+            if (-not $siteSources.Contains($sourceKey)) { continue }
+            $value = [string]$siteSources[$sourceKey]
+            if ([string]::IsNullOrWhiteSpace($value)) { continue }
+            $effective['Sources'][$sourceKey] = $value
+        }
+    }
+
+    return $effective
 }
 
 # R3-4 (PR #136, третє коло review): ЄДИНА canonical "чи потрібні SFTP-

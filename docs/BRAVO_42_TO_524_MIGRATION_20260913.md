@@ -131,12 +131,15 @@ preflight.** `BRAVO_CONFIG_LOADER.ps1` у 4.2 — 265 рядків проти 84
 
 ### 4.4. Чого через `BRAVO.local.config` перевизначати НЕ можна
 
-`discoverySettings` (споживається discovery до фази застосування override),
-похідні блоки `sourcePaths`, `archiveDirs`, `bazaAppPaths`, `bazaWWWPaths`,
+Похідні блоки `sourcePaths`, `archiveDirs`, `bazaAppPaths`, `bazaWWWPaths`,
 `archiveDefinitions`, а також `toolIntegritySettings` і runtime-шляхи.
 
-Якщо потрібно закріпити джерела вручну — це правка `discoverySettings` у
-самому `BRAVO.config` (розділ 6).
+`discoverySettings` до цього переліку більше НЕ належить (#158, етап 4):
+блок став звичайним raw-блоком фази 1, тому
+`discoverySettings.BravoRoot`, `discoverySettings.WebRoot`,
+`discoverySettings.BravoIniPath` і `discoverySettings.Sources.*` у
+`BRAVO.local.config` застосовуються ДО discovery й реально визначають
+джерела. Правити `BRAVO.config` вручну для цього більше не потрібно.
 
 ---
 
@@ -220,8 +223,9 @@ BRAVOEXCH, BAZA_APP і BAZA_WWW.
 інший каталог.
 
 Якщо discovery дає не те або повідомляє про кілька служб-кандидатів —
-закріпіть значення явно в `discoverySettings` у `BRAVO.config` (через
-`BRAVO.local.config` цей блок не перевизначається, розділ 4.4).
+закріпіть значення явно через `discoverySettings.*` у `BRAVO.local.config`
+(розділ 4.4). Явне значення завжди перемагає auto-discovery і ніколи ним
+не замінюється.
 
 Коли перелік джерел правильний, зафіксуйте базову лінію:
 

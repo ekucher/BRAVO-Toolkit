@@ -260,7 +260,7 @@ Test-BRAVOCondition ($settingScenarioJ.Count -eq 1 -and [bool]$settingScenarioJ[
 # missing=0, stale=0) уже перевірено вище ($configuratorSchemaResult,
 # IsComplete/MissingPaths/OrphanPaths) — не дублюємо ту саму перевірку.
 Test-BRAVOCondition ($configuratorSchemaResult.IsComplete -and $configuratorSchemaResult.SchemaDescriptors -eq $configuratorSchemaResult.ConfigurableTotal) `
-    'Configurator 5.2.2 Scenario K: descriptors == canonical documented paths (138), missing=0, stale=0' `
+    'Configurator 5.2.2 Scenario K: descriptors == canonical documented paths (152), missing=0, stale=0' `
     "SchemaDescriptors=$($configuratorSchemaResult.SchemaDescriptors) ConfigurableTotal=$($configuratorSchemaResult.ConfigurableTotal)"
 
 # ===== SMB.ArchiveCopy default (raw) лишається без override — Validation

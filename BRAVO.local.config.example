@@ -67,9 +67,8 @@
 #     через фазу 1.
 #
 # НЕ ПЕРЕВИЗНАЧАЙТЕ через цей файл: похідні блоки (sourcePaths, archiveDirs,
-# bazaAppPaths, bazaWWWPaths, archiveDefinitions), discoverySettings
-# (споживається discovery ДО фази 2 — override не подіє), toolIntegritySettings
-# та runtime-шляхи (ScriptPath/HelperPath) — вони обчислюються з розташування
+# bazaAppPaths, bazaWWWPaths, archiveDefinitions), toolIntegritySettings та
+# runtime-шляхи (ScriptPath/HelperPath) — вони обчислюються з розташування
 # комплекту.
 @{
     # =========================================================
@@ -115,6 +114,41 @@
     # 'pathSettings.SystemLogRoot' = 'E:\BACKUPS\LOGS'
     # BackupRoot: "" = AUTO -> <EffectiveLIMSRoot>\ARCHIV. Найтиповіший override.
     # 'pathSettings.BackupRoot' = 'E:\BACKUPS'
+
+    # =========================================================
+    # ЯВНЕ ВИЗНАЧЕННЯ ДЖЕРЕЛ (discoverySettings) — фаза 1
+    # =========================================================
+    # Потрібно ЛИШЕ тоді, коли автоматичне визначення непридатне: на машині
+    # співіснують кілька інсталяцій BRAVO, кілька Apache-подібних служб, або
+    # bravo.ini лежить не за очікуваним для архітектури ОС шляхом.
+    # $null (значення за замовчуванням) = покластись на auto-discovery.
+    #
+    # Явне значення ЗАВЖДИ перемагає auto-discovery і ніколи ним не
+    # замінюється. Хибне явне значення — це помилка конфігурації, а не
+    # привід тихо повернутись до автоматичного пошуку: presence-контракт
+    # дасть 'Error', а не 'Absent'.
+    #
+    # Порожній рядок трактується як "не задано" (тобто auto-discovery).
+    # Дозволені лише ЛОКАЛЬНІ absolute шляхи з літерою диска (C:\...):
+    # UNC/мережеві/відносні шляхи відхиляються fail-closed.
+    #
+    # Каталог інсталяції BRAVO (батько bravo.exe) і корінь веб-інсталяції
+    # (батько каталогу ServerRoot Apache):
+    # 'discoverySettings.BravoRoot' = 'D:\LIMS'
+    # 'discoverySettings.WebRoot' = 'C:\Br-a-vo.web'
+    # Canonical bravo.ini, якщо він не за системним шляхом архітектури ОС:
+    # 'discoverySettings.BravoIniPath' = 'C:\Windows\SysWOW64\bravo.ini'
+    #
+    # Джерела компонентів (перекривають і bravo.ini, і службовий пошук):
+    # 'discoverySettings.Sources.MODEL' = 'D:\LIMS\Model'
+    # 'discoverySettings.Sources.BLOG' = 'D:\LIMS\BLOG'
+    # 'discoverySettings.Sources.BRAVOEXCH' = 'D:\LIMS\bravoexch'
+    # 'discoverySettings.Sources.BAZA_APP' = 'D:\LIMS\BAZA'
+    # 'discoverySettings.Sources.BAZA_WWW' = 'C:\Br-a-vo.web\www\BAZA'
+    # BACKUP_ROOT тут НЕ визначає призначення бекапів — каталог призначення
+    # задається виключно pathSettings.BackupRoot; поле лишається для
+    # діагностики конфігів перехідного періоду:
+    # 'discoverySettings.Sources.BACKUP_ROOT' = 'E:\BACKUPS'
 
     # =========================================================
     # ОБСЛУГОВУВАННЯ (maintenanceSettings) — фаза 1
