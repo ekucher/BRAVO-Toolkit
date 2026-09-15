@@ -10985,10 +10985,10 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                 $archiveRuntimeTextForDrift.Contains('-not $discoveryBaselineValid') -and
                 $derivationTextForDrift.Contains('$global:discoveryEnabledComponents') -and
                 $setupTextForDrift.Contains('$global:discoveryEnabledComponents') -and
-                $archiveRuntimeTextForDrift.Contains('$global:discoveryEnabledComponents')
+                $archiveRuntimeTextForDrift.Contains('-EnabledComponents $discoveryEnabledComponents')
             ) `
             -Name "Presence/DriftGateIsWiredIntoArchiveRuntimeAndSetup" `
-            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents, а не будуватись inline двічі"
+            -Failure "Test-BRAVODiscoveryComponentDrift має викликатись і в BRAVO_SETUP.ps1, і в Archive runtime (де `$discoveryBaselineValid впливає на exit-код), а перелік увімкнених компонентів має братись з канонічного `$global:discoveryEnabledComponents (у самому runtime Archive — без `$global:-префікса, цього вимагає guard RuntimeScope/Archive), а не будуватись inline двічі"
 
         # 06: explicit override має АБСОЛЮТНИЙ пріоритет над Apache
         # discovery, навіть коли Apache-служба ОДНОЗНАЧНА і її DocumentRoot

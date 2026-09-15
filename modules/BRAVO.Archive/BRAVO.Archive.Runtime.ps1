@@ -6725,7 +6725,7 @@ function Main {
             -DiscoveryResult $bravoDiscoveryResult `
             -Baseline $discoveryBaselineImport.Baseline `
             -BaselineSourceKind ([string]$discoveryBaselineImport.Source) `
-            -EnabledComponents $global:discoveryEnabledComponents)
+            -EnabledComponents $discoveryEnabledComponents)
     } catch {
         # Fail-closed: якщо саму перевірку складу виконати не вдалося, ми
         # НЕ знаємо, чи повний backup set. Мовчазне продовження тут
