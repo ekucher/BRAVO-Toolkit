@@ -209,7 +209,28 @@ try {
     Test-BRAVOCondition `
         -Condition ($localCfgCodeProbe.Contains('THREW') -and -not $localCfgCodeProbe.Contains('NO-THROW')) `
         -Name "ConfigLoader/LocalOverrideRejectsExecutableCode" `
-        -Failure "BRAVO.local.config — data-only: файл із виконуваним кодом мусить відхилятись (CheckRestrictedLanguage); отримано: $localCfgCodeProbe"
+        -Failure "BRAVO.local.config — data-only: файл із виконуваним кодом мусить відхилятись (невиконуюче вилучення літералів з AST); отримано: $localCfgCodeProbe"
+
+    # --- Вираз, який СТАРИЙ механізм приймав і ОБЧИСЛЮВАВ -> відхилення
+    # (#154, B1). Регресія саме наскрізна, а не лише модульна: доводить,
+    # що canonical читач site-файлу справді перемкнено на невиконуюче
+    # вилучення, а не лише що модуль-парсер існує. Обмежена мова даних
+    # PowerShell приймала арифметику, і перевірений блок потім
+    # викликався — значення 1 + 1 ставало 2.
+    [IO.File]::WriteAllText($localCfgOverridePath,
+        "@{ 'bravoSettings.NotificationRequestTimeoutSeconds' = 1 + 1 }",
+        (New-Object System.Text.UTF8Encoding $false))
+    $localCfgExpressionProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW' }"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition ($localCfgExpressionProbe.Contains('THREW') -and -not $localCfgExpressionProbe.Contains('NO-THROW')) `
+        -Name "ConfigLoader/LocalOverrideRejectsEvaluatedExpression" `
+        -Failure "вираз у значенні BRAVO.local.config мусить відхилятись, а не обчислюватись (файл є ДАНИМИ); отримано: $localCfgExpressionProbe"
 
     # --- Без файла -> штатне завантаження, metadata порожній.
     Remove-Item -LiteralPath $localCfgOverridePath -Force

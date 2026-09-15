@@ -2,6 +2,51 @@
 
 ## Не випущено (developer)
 
+- **`BRAVO.local.config` більше не виконується (#154, B1)** — site-файл
+  читається невиконуючим AST-парсером
+  `ConvertFrom-BRAVOConfigurationDataFileText`
+  (`modules/BRAVO.Configuration/BRAVO.Configuration.DataFile.psm1`):
+  текст парситься в AST і обходиться за **явним fail-closed переліком
+  дозволених вузлів-літералів**, а скомпільований scriptblock не
+  створюється, не викликається і не dot-source'иться. Раніше було
+  «перевірити обмеженою мовою, потім виконати»
+  (`CheckRestrictedLanguage` з порожніми allow-списками, далі
+  `& $scriptBlock`): команди, функції та звернення до змінних справді
+  відхилялись до виконання, але сам блок ВИКОНУВАВСЯ, а
+  restricted-language граматика все ще приймає окремі вирази — тож,
+  наприклад, `1 + 1` у значенні **обчислювалось** у `2`, і перелік
+  дозволеного належав граматиці PowerShell, а не комплекту.
+
+  **Звуження прийнятого формату (свідоме).** Дозволені значення:
+  рядок, число, `$true`/`$false`/`$null`, масив `@( ... )`, вкладена
+  hashtable, знак `+`/`-` безпосередньо перед числом (форма запису
+  числа, не обчислення). Відхиляються: будь-які обчислення (включно з
+  арифметикою й діапазонами), виклики команд, доступ до членів,
+  приведення типів, підвирази, рядки з підстановкою, звернення до
+  змінних (`$env:`, `$global:`, `$script:`, довільне `$foo`, і
+  `$global:true`, що лише схожий на дозволену константу),
+  `param()`/`begin`/`process`/`dynamicparam`/`using`, друга інструкція
+  поряд з hashtable. Повторний ключ (регістронезалежно) і порожній
+  ключ відхиляються явно — раніше дублікат ловив сам PowerShell під
+  час виконання блока, а виконання більше немає. Усі форми, які
+  генерує Configurator
+  (`ConvertTo-BRAVOConfiguratorPowerShellLiteral`), лишаються
+  прийнятними; жодне значення в комплекті й у
+  `BRAVO.local.config.example` не потребує забороненої форми.
+
+  Канонічний читач лишається один (`Read-BRAVOLocalConfigurationOverrides`),
+  тож перехід автоматично отримали і Configurator (parse/verify/rollback
+  у `BRAVO.Configurator.Persistence`), і `deploy\Get-BRAVOConfigSiteDelta.ps1`.
+  Сам `BRAVO.config` (primary-шар) лишається виконуваним
+  PowerShell-скриптом — це окремий крок B4.
+
+  Покриття: 12 регресій `DataFile/*` у
+  `selftest/BRAVO_SELF_TEST.Configuration.ps1` (включно з
+  `EmptyArrayStaysEmptyArray` — пастка PS 5.1, де `return @()` з функції
+  розгортається в `$null`) і наскрізна
+  `ConfigLoader/LocalOverrideRejectsEvaluatedExpression`, яка доводить,
+  що canonical читач справді перемкнено, а не лише що модуль існує.
+
 - **D2 вирішено: назва `BRAVO.local.config` лишається (#154)** — разом
   із перейменуванням скасовано й окремий машинно-локальний шар, тож
   цільова модель Config v2 стає **двошаровою**:

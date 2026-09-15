@@ -508,7 +508,7 @@ try {
 # Test-BRAVOConfiguratorPostApplyVerification винесено з Invoke-BRAVOConfiguratorApply
 # (крок 13-14) саме для цього — hermetic виклик напряму з деліберативно
 # зіпсованим "щойно записаним" файлом (canonical Read-BRAVOLocalConfigurationOverrides
-# відхиляє $env:-звернення через CheckRestrictedLanguage), без залежності
+# відхиляє $env:-звернення невиконуючим AST-парсером), без залежності
 # від таймінгу/race файлової системи.
 $configuratorPostVerifyRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_CONFIGURATOR_POSTAPPLYVERIFY_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
@@ -518,8 +518,8 @@ try {
     $postVerifyBackupPath = "$postVerifyConfigPath.bak-selftest"
     $postVerifyOriginalContent = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'consoleSettings.ConsoleLevel' = 'ERROR' }
     [IO.File]::WriteAllText($postVerifyBackupPath, $postVerifyOriginalContent, (New-Object System.Text.UTF8Encoding($false)))
-    # "Щойно записаний" файл — синтаксично неприпустимий (CheckRestrictedLanguage
-    # відхилить $env: звернення) -> reload на кроці 13 гарантовано впаде.
+    # "Щойно записаний" файл — неприпустимий для data-only контракту
+    # (парсер відхилить $env:-звернення) -> reload на кроці 13 гарантовано впаде.
     [IO.File]::WriteAllText($postVerifyConfigPath, "@{ 'x' = `$env:PATH }", (New-Object System.Text.UTF8Encoding($false)))
 
     $postVerifyResultWithBackup = Test-BRAVOConfiguratorPostApplyVerification `

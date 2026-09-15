@@ -651,3 +651,193 @@
             -Name "Delta/SiteDeltaToolNeverOverwrites" `
             -Failure "інструмент дельти мусить мати рівно один запис на диск (за -OutputPath) і відмовляти на наявному файлі"
     }
+
+# =====================================================================
+# BRAVO.Configuration.DataFile — невиконуючий парсер site-файлу
+# (#154, задача B1)
+# =====================================================================
+# Окремий child scope (& { ... }) з тієї ж причини, що й блок Delta вище:
+# усі фрагменти self-test дот-сорсяться в ОДИН scope і ділять спільний
+# $MaximumVariableCount.
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.DataFile.psd1') -Force
+
+    # Спільний предикат "цей вміст МУСИТЬ бути відхилений". Окрема
+    # функція, а не 12 копій try/catch: кожна копія з'їдала б змінні
+    # спільного scope і ховала б, який саме випадок упав.
+    function Test-BRAVODataFileRejected {
+        param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Body)
+        try {
+            [void](ConvertFrom-BRAVOConfigurationDataFileText -Text $Body -SourceName 'selftest')
+            return $false
+        } catch {
+            return $true
+        }
+    }
+
+    # --- DataFile/AcceptsCanonicalSiteFileShape ---
+    # Усі форми значень, які реально генерує
+    # ConvertTo-BRAVOConfiguratorPowerShellLiteral, плюс коментарі й
+    # порожні рядки навколо них.
+    $dataFileAccepted = ConvertFrom-BRAVOConfigurationDataFileText -SourceName 'selftest' -Text @'
+# Згенеровано BRAVO Configurator.
+
+@{
+    'pathSettings.BackupRoot' = 'E:\ARCHIV_LIMS'
+    'bravoSettings.InstitutionName' = 'МОЯ УСТАНОВА'
+    'bravoSettings.NotificationRequestTimeoutSeconds' = 30
+    'maintenanceSettings.Limits.MaximumMdFileSizeGB' = 1.5
+    'maintenanceSettings.Services.BravoWebEnabled' = $true
+    'hostInformationSettings.PublicIPLookupEnabled' = $false
+    'componentSettings.SFTP.Enabled' = $null
+    'maintenanceSettings.Services.BravoDisplayName' = @('BRAVO Service', 'BRAVO Server')
+    'maintenanceSettings.Limits.ExcludedDrives' = @()
+}
+'@
+    Test-BRAVOCondition `
+        -Condition (
+            $dataFileAccepted -is [hashtable] -and
+            $dataFileAccepted.Count -eq 9 -and
+            [string]$dataFileAccepted['pathSettings.BackupRoot'] -ceq 'E:\ARCHIV_LIMS' -and
+            [string]$dataFileAccepted['bravoSettings.InstitutionName'] -ceq 'МОЯ УСТАНОВА' -and
+            $dataFileAccepted['bravoSettings.NotificationRequestTimeoutSeconds'] -eq 30 -and
+            $dataFileAccepted['maintenanceSettings.Limits.MaximumMdFileSizeGB'] -eq 1.5 -and
+            $dataFileAccepted['maintenanceSettings.Services.BravoWebEnabled'] -eq $true -and
+            $dataFileAccepted['hostInformationSettings.PublicIPLookupEnabled'] -eq $false -and
+            $null -eq $dataFileAccepted['componentSettings.SFTP.Enabled'] -and
+            @($dataFileAccepted['maintenanceSettings.Services.BravoDisplayName']).Count -eq 2
+        ) `
+        -Name "DataFile/AcceptsCanonicalSiteFileShape" `
+        -Failure "канонічна форма site-файлу (рядки, числа, `$true/`$false/`$null, масиви, коментарі) мусить вилучатись без виконання; отримано ключів: $(if ($dataFileAccepted -is [hashtable]) { $dataFileAccepted.Count } else { 'не hashtable' })"
+
+    # --- DataFile/EmptyArrayStaysEmptyArray ---
+    # PowerShell 5.1: результат функції проходить через output pipeline,
+    # який РОЗГОРТАЄ колекції — прямий `return @()` став би $null, і
+    # порожній ExcludedDrives мовчки перетворився б на «значення не
+    # задано». Саме тому вилучення значень іде через обгортку.
+    $dataFileEmptyArray = ConvertFrom-BRAVOConfigurationDataFileText -SourceName 'selftest' `
+        -Text "@{ 'a' = @(); 'b' = @('one') }"
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $dataFileEmptyArray['a'] -and
+            $dataFileEmptyArray['a'] -is [array] -and
+            @($dataFileEmptyArray['a']).Count -eq 0 -and
+            $dataFileEmptyArray['b'] -is [array] -and
+            @($dataFileEmptyArray['b']).Count -eq 1
+        ) `
+        -Name "DataFile/EmptyArrayStaysEmptyArray" `
+        -Failure "@() мусить лишитись ПОРОЖНІМ МАСИВОМ (не `$null), а @('one') — масивом з одного елемента (не рядком)"
+
+    # --- DataFile/RejectsArithmeticExpression ---
+    # Головна відмінність від попереднього механізму: обмежена мова даних
+    # PowerShell приймала арифметику, а перевірений блок ПОТІМ
+    # виконувався — тобто 1 + 1 обчислювалось у 2. Тепер це відмова.
+    Test-BRAVOCondition `
+        -Condition (Test-BRAVODataFileRejected -Body "@{ 'a' = 1 + 1 }") `
+        -Name "DataFile/RejectsArithmeticExpression" `
+        -Failure "арифметичний вираз у значенні мусить відхилятись (у файлі даних не може бути обчислень)"
+
+    # --- DataFile/RejectsRangeExpression ---
+    Test-BRAVOCondition `
+        -Condition (Test-BRAVODataFileRejected -Body "@{ 'a' = 1..3 }") `
+        -Name "DataFile/RejectsRangeExpression" `
+        -Failure "діапазон 1..3 мусить відхилятись — це обчислення, а не літерал"
+
+    # --- DataFile/RejectsCommandInvocation ---
+    Test-BRAVOCondition `
+        -Condition (Test-BRAVODataFileRejected -Body "@{ 'a' = (Get-Date).ToString() }") `
+        -Name "DataFile/RejectsCommandInvocation" `
+        -Failure "виклик команди мусить відхилятись"
+
+    # --- DataFile/RejectsEnvironmentAndScopedVariables ---
+    # Три різні форми звернення до стану сесії/середовища; жодна не є
+    # даними. `$global:true` — навмисно схожий на дозволену константу:
+    # розпізнавання йде за ТОЧНИМ UserPath, який зберігає префікс області.
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = `$env:PATH }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = `$global:bravoSettings }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = `$global:true }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = `$someVariable }")
+        ) `
+        -Name "DataFile/RejectsEnvironmentAndScopedVariables" `
+        -Failure "`$env:, `$global:, `$global:true і довільна `$змінна мусять відхилятись — дозволені лише `$true/`$false/`$null"
+
+    # --- DataFile/RejectsMemberAccessCastAndSubExpression ---
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = 'x'.Length }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = [int]'5' }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = `$('x') }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = { 'x' } }")
+        ) `
+        -Name "DataFile/RejectsMemberAccessCastAndSubExpression" `
+        -Failure "доступ до члена, приведення типу, підвираз і scriptblock мусять відхилятись"
+
+    # --- DataFile/RejectsInterpolatedString ---
+    Test-BRAVOCondition `
+        -Condition (Test-BRAVODataFileRejected -Body "@{ 'a' = `"prefix`$env:PATH`" }") `
+        -Name "DataFile/RejectsInterpolatedString" `
+        -Failure "рядок з підстановкою мусить відхилятись — підстановка читає стан середовища"
+
+    # --- DataFile/RejectsScriptShape ---
+    # Файл даних не має param()/begin/process і не містить другої
+    # інструкції поряд з hashtable.
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVODataFileRejected -Body "param(`$x)`r`n@{ 'a' = 1 }") -and
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = 1 }`r`n'друга інструкція'") -and
+            (Test-BRAVODataFileRejected -Body "'не hashtable'") -and
+            (Test-BRAVODataFileRejected -Body '')
+        ) `
+        -Name "DataFile/RejectsScriptShape" `
+        -Failure "param(), друга інструкція, не-hashtable верхній рівень і порожній вміст мусять відхилятись"
+
+    # --- DataFile/RejectsDuplicateAndEmptyKeys ---
+    # Повторний ключ раніше відхиляв САМ PowerShell під час виконання
+    # блока. Виконання більше немає — перевірка мусить жити в парсері,
+    # інакше дублікат мовчки перезаписував би попереднє значення.
+    Test-BRAVOCondition `
+        -Condition (
+            (Test-BRAVODataFileRejected -Body "@{ 'a' = 1; 'A' = 2 }") -and
+            (Test-BRAVODataFileRejected -Body "@{ '' = 1 }")
+        ) `
+        -Name "DataFile/RejectsDuplicateAndEmptyKeys" `
+        -Failure "повторний ключ (регістронезалежно) і порожній ключ мусять відхилятись"
+
+    # --- DataFile/AcceptsSignedNumber ---
+    # Знак перед числовою константою — форма запису ЧИСЛА, а не
+    # обчислення: PowerShell залежно від контексту розбирає -5 і як
+    # константу, і як унарний вираз, тому дозволено явно.
+    $dataFileSigned = ConvertFrom-BRAVOConfigurationDataFileText -SourceName 'selftest' `
+        -Text "@{ 'a' = -5; 'b' = +7 }"
+    Test-BRAVOCondition `
+        -Condition ($dataFileSigned['a'] -eq -5 -and $dataFileSigned['b'] -eq 7) `
+        -Name "DataFile/AcceptsSignedNumber" `
+        -Failure "від'ємне/додатне число мусить вилучатись як число; отримано a=$($dataFileSigned['a']) b=$($dataFileSigned['b'])"
+
+    # --- DataFile/NestedHashtableExtracted ---
+    $dataFileNested = ConvertFrom-BRAVOConfigurationDataFileText -SourceName 'selftest' `
+        -Text "@{ 'a' = @{ 'inner' = 'value' } }"
+    Test-BRAVOCondition `
+        -Condition (
+            $dataFileNested['a'] -is [hashtable] -and
+            [string]$dataFileNested['a']['inner'] -ceq 'value'
+        ) `
+        -Name "DataFile/NestedHashtableExtracted" `
+        -Failure "вкладений hashtable-літерал мусить вилучатись як дані"
+
+    # --- DataFile/LoaderNoLongerInvokesSiteFile ---
+    # Архітектурний guard: canonical читач site-файлу не сміє повернутись
+    # до «перевірити, потім виконати». Текстова перевірка тут доречна саме
+    # тому, що поведінкові тести вище доводять ВІДМОВУ, але не довели б
+    # відсутність виклику, якби хтось додав його поряд.
+    $dataFileLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $dataFileLoaderText.Contains('ConvertFrom-BRAVOConfigurationDataFileText') -and
+            -not $dataFileLoaderText.Contains('$localOverrideScript')
+        ) `
+        -Name "DataFile/LoaderNoLongerInvokesSiteFile" `
+        -Failure "Read-BRAVOLocalConfigurationOverrides мусить вилучати дані через ConvertFrom-BRAVOConfigurationDataFileText і не створювати/не викликати scriptblock site-файлу"
+}

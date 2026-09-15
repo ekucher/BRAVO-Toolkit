@@ -102,7 +102,7 @@ try {
     # окремо: переносити їх ще раз не потрібно, а мовчки видати їх у
     # списку "додайте це в site-файл" означало б штовхати оператора до
     # дубльованого запису.
-    $localOverrideState = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $resolvedConfigRoot
+    $localOverrideState = Read-BRAVOLocalConfigurationOverrides -ConfigDirectory $resolvedConfigRoot -RuntimeRoot $resolvedRuntimeRoot
     $localOverridePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($localKey in @($localOverrideState.Overrides.Keys)) {
         [void]$localOverridePaths.Add([string]$localKey)

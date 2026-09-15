@@ -338,16 +338,20 @@ canonical built-in defaults, deterministic deep merge (array replace,
 явний `@()` — валідний override, `Limits.ExcludedDrives` дефолт —
 `@()`), опційний `BRAVO.config`, `-ConfigPath` AUTO/EXPLICIT-контракт,
 derivation після merge, post-merge security-invariant re-validation,
-restricted-language `BRAVO.local.config` (dot-шлях → значення):
-`CheckRestrictedLanguage` з порожніми command/variable allow-lists
-блокує виклики cmdlet/функцій і посилання на недозволені змінні до
-виконання, але це НЕ робить граматику суто літеральною — restricted-
-language граматика PowerShell усе ще допускає окремі вирази
-(наприклад, арифметичні/range-вирази), а сам validated `ScriptBlock`
-усе ще ВИКОНУЄТЬСЯ (`& $scriptBlock`), тож будь-який дозволений вираз
-обчислюється, а не лише екстрактується як літерал — це не те саме, що
-non-executing AST-only parser (цільовий Config v2 контракт нижче,
-деталі — `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`).
+data-only `BRAVO.local.config` (dot-шлях → значення).
+
+**Site-шар перейшов на non-executing AST-parser (#154, B1).** Раніше
+тут було `CheckRestrictedLanguage` з порожніми command/variable
+allow-lists, а потім `& $scriptBlock`: виклики cmdlet/функцій і
+посилання на недозволені змінні блокувались до виконання, але
+граматика від цього не ставала суто літеральною (restricted-language
+усе ще допускає окремі вирази — наприклад, арифметичні/range), і
+validated `ScriptBlock` усе одно ВИКОНУВАВСЯ, тож дозволений вираз
+обчислювався. Тепер site-файл парситься в AST і обходиться за явним
+fail-closed переліком дозволених вузлів-літералів
+(`modules/BRAVO.Configuration/BRAVO.Configuration.DataFile.psm1`);
+scriptblock не створюється й не викликається. Сам `BRAVO.config`
+лишається виконуваним PowerShell-скриптом — це окремий крок B4.
 Precedence сьогодні: `DEFAULT <
 BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Деталі —
 `docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md`.
