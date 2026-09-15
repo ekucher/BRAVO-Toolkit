@@ -1050,18 +1050,38 @@ function Read-BRAVOLegacyPrimaryRawOverrides {
     $legacyConfigText = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 -ErrorAction Stop
     $legacyConfigScript = [scriptblock]::Create($legacyConfigText)
 
+    $declaredGlobalNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($declaredName in @(Get-BRAVODeclaredGlobalVariableName -ScriptBlock $legacyConfigScript)) {
+        if ([string]::IsNullOrWhiteSpace([string]$declaredName)) { continue }
+        [void]$declaredGlobalNames.Add([string]$declaredName)
+    }
     if ($null -ne $DeclaredGlobalNameSink) {
-        foreach ($declaredName in @(Get-BRAVODeclaredGlobalVariableName -ScriptBlock $legacyConfigScript)) {
-            if ([string]::IsNullOrWhiteSpace([string]$declaredName)) { continue }
+        foreach ($declaredName in $declaredGlobalNames) {
             [void]$DeclaredGlobalNameSink.Add([string]$declaredName)
         }
     }
 
     & $legacyConfigScript -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot
 
+    # Значення береться з $global: ПІСЛЯ виконання файлу, але ключ
+    # приймається лише тоді, коли BRAVO.config його СПРАВДІ оголошує (AST,
+    # той самий перелік, що йде в DeclaredGlobalNameSink).
+    #
+    # Без цієї умови "прочитати $global:<ключ> після виконання" не
+    # відрізняє "BRAVO.config це оголосив" від "змінна лишилась у процесі
+    # від ПОПЕРЕДНЬОГО завантаження конфігурації". Для ключів, які
+    # BRAVO.config оголошує, залишок щоразу перезаписується, тому дефект
+    # не був видимий. #158 (етап 4) зробив discoverySettings звичайним
+    # raw-блоком — а його BRAVO.config НЕ оголошує, тож у довгоживучому
+    # процесі (Configurator, self-test, будь-який повторний
+    # Import-BravoConfiguration) discoverySettings попереднього прогону
+    # мовчки ставав primary-override наступного. Перевірено CI: без цієї
+    # умови 7 ProductionConfig/Backup-регресій падають саме через
+    # перенесення чужого Sources.MODEL між прогонами.
     $defaultConfiguration = Get-BRAVODefaultConfiguration
     $primaryRawOverrides = @{}
     foreach ($topLevelKey in @($defaultConfiguration.Keys)) {
+        if (-not $declaredGlobalNames.Contains([string]$topLevelKey)) { continue }
         $legacyVariable = Get-Variable -Name $topLevelKey -Scope Global -ErrorAction SilentlyContinue
         if ($null -ne $legacyVariable -and $null -ne $legacyVariable.Value) {
             $primaryRawOverrides[$topLevelKey] = $legacyVariable.Value
