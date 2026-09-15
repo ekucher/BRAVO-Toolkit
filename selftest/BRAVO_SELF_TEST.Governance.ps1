@@ -760,3 +760,206 @@ Test-BRAVOCondition `
     -Failure "deploy\README.md мусить описувати межу володіння site-конфігурацією — інакше контракт існує лише в коді"
 
 }
+
+# --- #152: гейт релізу в скриптах розкатки ---------------------------------
+# Дефект, який закриває цей блок: prerelease-комплект розгортався в установі
+# без жодного свідомого рішення оператора (Install лише попереджав, Update не
+# перевіряв канал узагалі). Саме так LIMS-TOP тривало працював у production на
+# 5.2.0-rc.2 — версії, тега якої в репозиторії не існує.
+#
+# Блок виконується у власній області (& { ... }) за конвенцією #163.
+
+& {
+    $deployRoot = Join-Path $root 'deploy'
+    $releaseGatePath = Join-Path $deployRoot 'BRAVO.Deploy.ReleaseGate.ps1'
+    $installText = [IO.File]::ReadAllText((Join-Path $deployRoot 'Install-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+    $updateText = [IO.File]::ReadAllText((Join-Path $deployRoot 'Update-BRAVOServer.ps1'), [Text.Encoding]::UTF8)
+
+    # --- Структурні guard-и: одна реалізація політики, а не дві ------------
+
+    Test-BRAVOCondition `
+        -Condition (Test-Path -LiteralPath $releaseGatePath -PathType Leaf) `
+        -Name "Deploy/ReleaseGatePolicyFileExists" `
+        -Failure "deploy\BRAVO.Deploy.ReleaseGate.ps1 — канонічний власник політики гейта релізу; без нього обидва скрипти розкатки завели б власні копії"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $installText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.ReleaseGate.ps1'") -and
+            $updateText.Contains("Join-Path `$PSScriptRoot 'BRAVO.Deploy.ReleaseGate.ps1'")
+        ) `
+        -Name "Deploy/BothDeployScriptsUseSingleReleaseGate" `
+        -Failure "обидва скрипти розкатки мусять брати політику гейта з BRAVO.Deploy.ReleaseGate.ps1 — інакше рішення 'що можна розгортати' існує у двох копіях, які розійдуться"
+
+    # Копія рядка політики в самому скрипті розкатки означала б другу
+    # реалізацію: назва каналу мусить жити рівно в одному файлі.
+    Test-BRAVOCondition `
+        -Condition (
+            -not $installText.Contains("-ne 'stable'") -and
+            -not $updateText.Contains("-ne 'stable'") -and
+            -not $installText.Contains("-eq 'stable'") -and
+            -not $updateText.Contains("-eq 'stable'")
+        ) `
+        -Name "Deploy/NoSecondChannelPolicyCopyInDeployScripts" `
+        -Failure "скрипти розкатки не повинні самі порівнювати releaseChannel зі 'stable' — це робота BRAVO.Deploy.ReleaseGate.ps1"
+
+    # Найпідступніша регресія: елевований перезапуск губить рішення оператора,
+    # гейт спрацьовує вже під UAC, і причина виглядає як дефект комплекту.
+    Test-BRAVOCondition `
+        -Condition (
+            $installText.Contains("if (`$AllowPrereleaseChannel) { [void]`$argumentParts.Add('-AllowPrereleaseChannel') }") -and
+            $updateText.Contains("if (`$AllowPrereleaseChannel) { [void]`$argumentParts.Add('-AllowPrereleaseChannel') }")
+        ) `
+        -Name "Deploy/ElevationForwardsPrereleaseOverride" `
+        -Failure "UAC-перезапуск мусить передавати -AllowPrereleaseChannel далі — інакше явне рішення оператора зникає при підйомі прав"
+
+    # release-manifest.json — незалежне джерело провенансу. Доти розкатка
+    # звіряла VERSION.json архіву сам із собою.
+    Test-BRAVOCondition `
+        -Condition (
+            $installText.Contains("'release-manifest.json'") -and
+            $updateText.Contains("'release-manifest.json'")
+        ) `
+        -Name "Deploy/BothDeployScriptsConsultReleaseManifest" `
+        -Failure "обидва скрипти розкатки мусять звірятися з release-manifest.json — VERSION.json усередині архіву підтверджує лише сам себе"
+
+    # --- Поведінкові перевірки самої політики ------------------------------
+    # Файл — чисті функції без побічних ефектів, тому dot-source у ЦЮ область
+    # безпечний і не лишає нічого після себе.
+    . $releaseGatePath
+
+    $stableVersion = [pscustomobject]@{
+        packageVersion = '5.2.4'
+        releaseChannel = 'stable'
+        buildId        = '91db94c'
+        sourceCommit   = '91db94c00000000000000000000000000000abcd'
+    }
+    $prereleaseVersion = [pscustomobject]@{
+        packageVersion = '5.2.0-rc.2'
+        releaseChannel = 'prerelease'
+        buildId        = 'f7f6628'
+        sourceCommit   = 'f7f66280000000000000000000000000000012ab'
+    }
+
+    $stableDecision = Get-BRAVODeployReleaseChannelDecision -VersionMetadata $stableVersion
+    Test-BRAVOCondition `
+        -Condition ($stableDecision.Allowed -and -not $stableDecision.OverrideUsed -and $stableDecision.Severity -eq 'Ok') `
+        -Name "Deploy/ReleaseGateStableChannelIsAllowed" `
+        -Failure "stable-канал мусить проходити гейт без override і без попередження"
+
+    $refused = Get-BRAVODeployReleaseChannelDecision -VersionMetadata $prereleaseVersion
+    Test-BRAVOCondition `
+        -Condition (
+            -not $refused.Allowed -and $refused.Severity -eq 'Error' -and
+            $refused.Message.Contains('prerelease') -and
+            $refused.Message.Contains('-AllowPrereleaseChannel')
+        ) `
+        -Name "Deploy/ReleaseGatePrereleaseIsRefusedByDefault" `
+        -Failure "prerelease без явного рішення оператора мусить зупиняти розкатку, і повідомлення мусить називати канал і спосіб свідомо продовжити"
+
+    $overridden = Get-BRAVODeployReleaseChannelDecision -VersionMetadata $prereleaseVersion -AllowPrereleaseChannel
+    Test-BRAVOCondition `
+        -Condition (
+            $overridden.Allowed -and $overridden.OverrideUsed -and $overridden.Severity -eq 'Warning' -and
+            $overridden.Message.Contains('журналі розкатки')
+        ) `
+        -Name "Deploy/ReleaseGatePrereleaseNeedsExplicitOverride" `
+        -Failure "з -AllowPrereleaseChannel розкатка триває, але рішення мусить бути гучним і вимагати запису в журнал розкатки"
+
+    # Відсутній канал — не доказ стабільності. Найтиповіше джерело: комплект,
+    # зібраний не релізним конвеєром.
+    $noChannel = Get-BRAVODeployReleaseChannelDecision -VersionMetadata ([pscustomobject]@{ packageVersion = '9.9.9' })
+    Test-BRAVOCondition `
+        -Condition (-not $noChannel.Allowed -and $noChannel.Message.Contains('(не вказано)')) `
+        -Name "Deploy/ReleaseGateMissingChannelFailsClosed" `
+        -Failure "VERSION.json без releaseChannel мусить зупиняти розкатку fail-closed, а не трактуватись як stable"
+
+    # --- Провенанс ---------------------------------------------------------
+
+    $goodManifest = [pscustomobject]@{
+        schemaVersion  = 1
+        packageVersion = '5.2.4'
+        releaseChannel = 'stable'
+        sourceCommit   = '91db94c00000000000000000000000000000abcd'
+        buildId        = '91db94c'
+        tag            = 'v5.2.4'
+        artifact       = [pscustomobject]@{ name = 'BRAVO-Toolkit-5.2.4.zip'; sha256 = 'aa11bb22' }
+    }
+
+    $verdict = Get-BRAVODeployProvenanceVerdict -VersionMetadata $stableVersion `
+        -ReleaseManifest $goodManifest -ArtifactSha256 'AA11BB22' -ExpectedTag 'v5.2.4'
+    Test-BRAVOCondition `
+        -Condition ($verdict.IsValid -and $verdict.Severity -eq 'Ok') `
+        -Name "Deploy/ProvenanceAcceptsMatchingReleaseManifest" `
+        -Failure "узгоджений release-manifest.json мусить підтверджувати провенанс; порівняння SHA-256 нечутливе до регістру"
+
+    $shaMismatch = Get-BRAVODeployProvenanceVerdict -VersionMetadata $stableVersion `
+        -ReleaseManifest $goodManifest -ArtifactSha256 'deadbeef' -ExpectedTag 'v5.2.4'
+    Test-BRAVOCondition `
+        -Condition (-not $shaMismatch.IsValid -and $shaMismatch.Message.Contains('sha256')) `
+        -Name "Deploy/ProvenanceRejectsArtifactHashMismatch" `
+        -Failure "архів, хеш якого не збігається з release-manifest.json, мусить відхилятись"
+
+    $foreignManifest = [pscustomobject]@{
+        packageVersion = '5.2.4'
+        releaseChannel = 'stable'
+        sourceCommit   = '0000000000000000000000000000000000000000'
+        buildId        = '0000000'
+        tag            = 'v5.2.4'
+        artifact       = [pscustomobject]@{ sha256 = 'aa11bb22' }
+    }
+    $foreign = Get-BRAVODeployProvenanceVerdict -VersionMetadata $stableVersion `
+        -ReleaseManifest $foreignManifest -ArtifactSha256 'aa11bb22' -ExpectedTag 'v5.2.4'
+    Test-BRAVOCondition `
+        -Condition (-not $foreign.IsValid -and $foreign.Message.Contains('sourceCommit')) `
+        -Name "Deploy/ProvenanceRejectsForeignSourceCommit" `
+        -Failure "розбіжність sourceCommit між VERSION.json і release-manifest.json мусить зупиняти розкатку"
+
+    $tagMismatch = Get-BRAVODeployProvenanceVerdict -VersionMetadata $stableVersion `
+        -ReleaseManifest $goodManifest -ArtifactSha256 'aa11bb22' -ExpectedTag 'v5.2.5'
+    Test-BRAVOCondition `
+        -Condition (-not $tagMismatch.IsValid -and $tagMismatch.Message.Contains('v5.2.5')) `
+        -Name "Deploy/ProvenanceRejectsTagMismatch" `
+        -Failure "артефакт іншого тега мусить відхилятись — інакше -Tag перестає щось означати"
+
+    # Той самий інваріант, що накладає ci\New-BRAVOReleaseArtifact.ps1: його
+    # порушення означає, що комплект зібраний не релізним конвеєром.
+    $truncated = Get-BRAVODeployProvenanceVerdict -VersionMetadata ([pscustomobject]@{
+        packageVersion = '5.2.4'; releaseChannel = 'stable'; buildId = '91db94c'; sourceCommit = '91db94c'
+    })
+    Test-BRAVOCondition `
+        -Condition (-not $truncated.IsValid -and $truncated.Message.Contains('40-символьним')) `
+        -Name "Deploy/ProvenanceRejectsTruncatedSourceCommit" `
+        -Failure "sourceCommit, що не є повним git-hash, мусить відхилятись навіть без release-manifest.json"
+
+    $wrongBuildId = Get-BRAVODeployProvenanceVerdict -VersionMetadata ([pscustomobject]@{
+        packageVersion = '5.2.4'; releaseChannel = 'stable'; buildId = 'deadbee'
+        sourceCommit = '91db94c00000000000000000000000000000abcd'
+    })
+    Test-BRAVOCondition `
+        -Condition (-not $wrongBuildId.IsValid -and $wrongBuildId.Message.Contains('buildId')) `
+        -Name "Deploy/ProvenanceRejectsBuildIdMismatch" `
+        -Failure "buildId, що не є short(sourceCommit), мусить відхилятись"
+
+    # Локальний zip без маніфесту — документований сценарій -ZipPath на сервері
+    # без доступу до GitHub. Він мусить попереджати, а не блокувати.
+    $noManifest = Get-BRAVODeployProvenanceVerdict -VersionMetadata $stableVersion
+    Test-BRAVOCondition `
+        -Condition (
+            $noManifest.IsValid -and $noManifest.Severity -eq 'Warning' -and
+            $noManifest.Message.Contains('release-manifest.json')
+        ) `
+        -Name "Deploy/ProvenanceWithoutManifestWarnsButDoesNotBlock" `
+        -Failure "відсутній release-manifest.json мусить давати явне попередження, але не ламати документований сценарій -ZipPath"
+
+    # Форма реального маніфесту не повинна розійтися з тим, що читає розкатка.
+    $artifactBuilderText = [IO.File]::ReadAllText((Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1'), [Text.Encoding]::UTF8)
+    $manifestFieldsUsedByDeploy = @('packageVersion', 'releaseChannel', 'sourceCommit', 'buildId', 'tag')
+    $missingManifestFields = @(
+        $manifestFieldsUsedByDeploy | Where-Object { -not $artifactBuilderText.Contains($_) }
+    )
+    Test-BRAVOCondition `
+        -Condition (@($missingManifestFields).Count -eq 0) `
+        -Name "Deploy/ReleaseManifestShapeMatchesArtifactBuilder" `
+        -Failure ("release-manifest.json мусить містити поля, які читає розкатка; ci\New-BRAVOReleaseArtifact.ps1 не згадує: " +
+            [string]::Join(', ', @($missingManifestFields)))
+}
