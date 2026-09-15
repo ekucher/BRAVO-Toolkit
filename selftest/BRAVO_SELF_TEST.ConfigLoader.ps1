@@ -195,6 +195,31 @@ try {
         -Name "ConfigLoader/LocalOverrideUnknownKeyFailsClosed" `
         -Failure "невідомий dot-шлях у BRAVO.local.config мусить давати помилку конфігурації (конфіг, що бреше, гірший за помилку); отримано: $localCfgTypoProbe"
 
+    # --- Недійсний ТИП відомого ліста -> fail-closed (#154, B2).
+    # Наскрізна регресія, не лише модульна: доводить, що схема v2 реально
+    # стоїть у конвеєрі завантаження, а не лише існує як бібліотека.
+    # Значення синтаксично бездоганне (рядковий літерал), тому ні
+    # AST-парсер B1, ні перевірка невідомих шляхів його не ловлять — це
+    # ловить саме перевірка типів.
+    [IO.File]::WriteAllText($localCfgOverridePath,
+        "@{ 'maintenanceSettings.Limits.MinimumFreeSpaceGB' = 'not-a-number' }",
+        (New-Object System.Text.UTF8Encoding $false))
+    $localCfgWrongTypeProbe = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "try { [void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); 'NO-THROW' } catch { 'THREW:' + `$_.Exception.Message }"
+            ) 2>&1 | Out-String
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $localCfgWrongTypeProbe.Contains('THREW:') -and
+            -not $localCfgWrongTypeProbe.Contains('NO-THROW') -and
+            $localCfgWrongTypeProbe.Contains('maintenanceSettings.Limits.MinimumFreeSpaceGB')
+        ) `
+        -Name "ConfigLoader/LocalOverrideWrongTypeFailsClosed" `
+        -Failure "рядок на місці числового ліста BRAVO.local.config мусить давати fail-closed з точним dot-шляхом у повідомленні; отримано: $localCfgWrongTypeProbe"
+
     # --- Виконуваний код у файлі -> відхилення (data-only контракт).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.BackupRoot' = (Get-Date).ToString() }",

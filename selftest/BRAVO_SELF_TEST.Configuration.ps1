@@ -1123,3 +1123,273 @@
         Remove-Item -LiteralPath $preloadRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# =====================================================================
+# BRAVO.Configuration.Schema — формальна схема Configuration v2 (#154, B2)
+# =====================================================================
+# Окремий child scope (& { ... }) — з тієї самої причини, що й блок
+# Delta вище: усі фрагменти self-test дот-сорсяться в ОДИН scope.
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+
+    function Add-BRAVOSchemaTestLeaf {
+        # Плоский перелік ЛИСТІВ канонічного графа: 'dot.path' -> значення.
+        # Sink мутується, а не повертається: PowerShell 5.1 розгорнув би
+        # колекцію-значення, і масив-лист перетворився б на свій елемент.
+        [CmdletBinding()]
+        param(
+            [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Node,
+            [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prefix,
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Sink
+        )
+        if ($Node -is [hashtable]) {
+            foreach ($nodeKey in @($Node.Keys)) {
+                $childPrefix = ''
+                if ([string]::IsNullOrEmpty($Prefix)) { $childPrefix = [string]$nodeKey } else { $childPrefix = "$Prefix.$nodeKey" }
+                Add-BRAVOSchemaTestLeaf -Node $Node[$nodeKey] -Prefix $childPrefix -Sink $Sink
+            }
+            return
+        }
+        $Sink[$Prefix] = $Node
+    }
+
+    $schemaDefaults = Get-BRAVODefaultConfiguration
+    $schemaCatalog = Get-BRAVOConfigurationSchema -ReferenceConfiguration $schemaDefaults
+    $schemaCanonicalLeaves = @{}
+    Add-BRAVOSchemaTestLeaf -Node $schemaDefaults -Prefix '' -Sink $schemaCanonicalLeaves
+
+    # --- Schema/AcceptsCanonicalConfiguration ---
+    # Найсильніший інваріант: канонічна конфігурація, подана САМА СОБІ як
+    # шар перевизначень, мусить пройти схему без жодного порушення.
+    # Якщо ні — схема суперечить дефолтам, які вона описує.
+    $schemaSelfResult = Test-BRAVOConfigurationOverrideSchema -DotPathOverrides $schemaCanonicalLeaves -Schema $schemaCatalog
+    $schemaSelfMessages = @(@($schemaSelfResult.Violations) | ForEach-Object { [string]$_.Message })
+    Test-BRAVOCondition `
+        -Condition ([bool]$schemaSelfResult.IsValid) `
+        -Name "Schema/AcceptsCanonicalConfiguration" `
+        -Failure "канонічні дефолти мусять проходити власну схему без порушень; отримано $($schemaSelfMessages.Count): $([string]::Join(' | ', $schemaSelfMessages))"
+
+    # --- Schema/CoversEveryCanonicalLeaf ---
+    # "Обов'язковість" у термінах B2: жодного листа без типу. Перевіряє і
+    # зворотний бік — що в схемі немає дескриптора-листа, якому в
+    # канонічному графі ніщо не відповідає (застарілий запис таблиці
+    # невизначених листів).
+    $schemaLeafDescriptors = @(@($schemaCatalog.Keys) | Where-Object { [string]$schemaCatalog[$_].Kind -ne 'Node' })
+    $schemaMissingLeaves = @(@($schemaCanonicalLeaves.Keys) | Where-Object { -not $schemaCatalog.Contains([string]$_) })
+    $schemaOrphanLeaves = @(@($schemaLeafDescriptors) | Where-Object { -not $schemaCanonicalLeaves.Contains([string]$_) })
+    $schemaWeakDescriptors = @(@($schemaLeafDescriptors) | Where-Object {
+        $descriptor = $schemaCatalog[$_]
+        $kindIsKnown = @('Boolean', 'String', 'Number', 'Array') -contains [string]$descriptor.Kind
+        $elementIsKnown = $true
+        if ([string]$descriptor.Kind -eq 'Array') {
+            $elementIsKnown = @('Boolean', 'String', 'Number') -contains [string]$descriptor.ElementKind
+        }
+        -not ($kindIsKnown -and $elementIsKnown)
+    })
+    Test-BRAVOCondition `
+        -Condition (
+            $schemaMissingLeaves.Count -eq 0 -and
+            $schemaOrphanLeaves.Count -eq 0 -and
+            $schemaWeakDescriptors.Count -eq 0
+        ) `
+        -Name "Schema/CoversEveryCanonicalLeaf" `
+        -Failure "схема мусить покривати КОЖЕН канонічний лист типом, який реально перевіряється; без опису: $([string]::Join(', ', $schemaMissingLeaves)); зайві дескриптори: $([string]::Join(', ', $schemaOrphanLeaves)); без придатного роду: $([string]::Join(', ', $schemaWeakDescriptors))"
+
+    # --- Schema/RejectsWrongScalarType ---
+    $schemaWrongScalar = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.MinimumFreeSpaceGB' = 'двадцять' } `
+        -Schema $schemaCatalog
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$schemaWrongScalar.IsValid -and @($schemaWrongScalar.Violations).Count -eq 1) `
+        -Name "Schema/RejectsWrongScalarType" `
+        -Failure "рядок на місці числового ліста мусить бути порушенням схеми (отримано порушень: $(@($schemaWrongScalar.Violations).Count))"
+
+    # --- Schema/ReportsExactInvalidPath ---
+    # Повідомлення мусить називати САМЕ той шлях, який оператор написав:
+    # "недійсний тип у конфігурації" без шляху не дає що виправляти.
+    $schemaExactPathMessage = ''
+    if (@($schemaWrongScalar.Violations).Count -gt 0) { $schemaExactPathMessage = [string](@($schemaWrongScalar.Violations)[0].Message) }
+    Test-BRAVOCondition `
+        -Condition (
+            $schemaExactPathMessage.StartsWith('maintenanceSettings.Limits.MinimumFreeSpaceGB:') -and
+            $schemaExactPathMessage.Contains('двадцять')
+        ) `
+        -Name "Schema/ReportsExactInvalidPath" `
+        -Failure "повідомлення мусить починатись точним dot-шляхом і містити фактичне значення; отримано: '$schemaExactPathMessage'"
+
+    # --- Schema/RejectsWrongArrayType ---
+    # Дві різні помилки одного роду: скаляр замість масиву й елемент
+    # неправильного типу всередині масиву.
+    $schemaScalarForArray = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.MdFileSizeExclusions' = 'KZPpatArc.md' } `
+        -Schema $schemaCatalog
+    $schemaBadElement = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.MdFileSizeExclusions' = @('KZPpatArc.md', 5) } `
+        -Schema $schemaCatalog
+    $schemaBadElementPath = ''
+    if (@($schemaBadElement.Violations).Count -gt 0) { $schemaBadElementPath = [string](@($schemaBadElement.Violations)[0].Path) }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [bool]$schemaScalarForArray.IsValid -and
+            -not [bool]$schemaBadElement.IsValid -and
+            $schemaBadElementPath -eq 'maintenanceSettings.Limits.MdFileSizeExclusions[1]'
+        ) `
+        -Name "Schema/RejectsWrongArrayType" `
+        -Failure "скаляр замість масиву й нерядковий елемент мусять бути порушеннями, а індекс елемента — у шляху; отримано шлях '$schemaBadElementPath'"
+
+    # --- Schema/EmptyArraySemanticsPreserved ---
+    # Явний @() лишається ВАЛІДНИМ навмисним перевизначенням (контракт
+    # мерджу Foundation) — схема не сміє зробити його помилкою, і мердж
+    # після перевірки мусить дати саме порожній масив.
+    $schemaEmptyArrayResult = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.ExcludedDrives' = @() } `
+        -Schema $schemaCatalog
+    $schemaEmptyArrayMerged = Resolve-BRAVORawConfiguration `
+        -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+        -PrimaryOverrides @{ maintenanceSettings = @{ Limits = @{ ExcludedDrives = @('F:\') } } } `
+        -LocalOverrides @{ 'maintenanceSettings.Limits.ExcludedDrives' = @() }
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$schemaEmptyArrayResult.IsValid -and
+            @($schemaEmptyArrayMerged.maintenanceSettings.Limits.ExcludedDrives).Count -eq 0
+        ) `
+        -Name "Schema/EmptyArraySemanticsPreserved" `
+        -Failure "явний @() мусить лишатись валідним перевизначенням і після мерджу давати порожній масив (отримано елементів: $(@($schemaEmptyArrayMerged.maintenanceSettings.Limits.ExcludedDrives).Count))"
+
+    # --- Schema/NullSemanticsPreserved ---
+    # $null допустимий РІВНО там, де канонічний дефолт сам $null
+    # (discoverySettings.* = "покластись на auto-discovery", #158 етап 4),
+    # і ніде більше: $null у pathSettings.BackupRoot мовчки вимкнув би
+    # явно заданий корінь резервних копій.
+    $schemaNullAllowed = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'discoverySettings.BravoRoot' = $null } -Schema $schemaCatalog
+    $schemaNullRejected = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'pathSettings.BackupRoot' = $null } -Schema $schemaCatalog
+    $schemaEmptyStringAllowed = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'discoverySettings.BravoRoot' = '' } -Schema $schemaCatalog
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$schemaNullAllowed.IsValid -and
+            [bool]$schemaEmptyStringAllowed.IsValid -and
+            -not [bool]$schemaNullRejected.IsValid
+        ) `
+        -Name "Schema/NullSemanticsPreserved" `
+        -Failure "`$null мусить прийматись лише для nullable-листів (discoverySettings.*) і відхилятись для решти; allowed=$($schemaNullAllowed.IsValid) empty=$($schemaEmptyStringAllowed.IsValid) rejected=$($schemaNullRejected.IsValid)"
+
+    # --- Schema/NodeOverrideIsTypeChecked ---
+    # Перевизначення ЦІЛОГО вузла не повинно бути дірою в перевірці типів:
+    # 'bravoSettings.NotificationRouting' = @{ SUCCESS = 42 } мерджиться
+    # рекурсивно, тож і перевірятись мусить рекурсивно.
+    $schemaNodeOverride = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'bravoSettings.NotificationRouting' = @{ SUCCESS = 42 } } `
+        -Schema $schemaCatalog
+    $schemaNodeOverridePath = ''
+    if (@($schemaNodeOverride.Violations).Count -gt 0) { $schemaNodeOverridePath = [string](@($schemaNodeOverride.Violations)[0].Path) }
+    Test-BRAVOCondition `
+        -Condition (
+            -not [bool]$schemaNodeOverride.IsValid -and
+            $schemaNodeOverridePath -eq 'bravoSettings.NotificationRouting.SUCCESS'
+        ) `
+        -Name "Schema/NodeOverrideIsTypeChecked" `
+        -Failure "перевизначення вузла мусить перевірятись рекурсивно з точним шляхом листа; отримано '$schemaNodeOverridePath'"
+
+    # --- Schema/UnknownLeafForwardCompatibilityIsPreserved ---
+    # Рішення власника D3: невідомий КІНЦЕВИЙ сегмент і далі приймається
+    # (+ облік), а не відхиляється. Схема НЕ сміє це змінити — ні
+    # власним порушенням, ні через наскрізний мердж.
+    $schemaUnknownLeaf = Test-BRAVOConfigurationOverrideSchema `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.FutureKnobFromNewerToolkit' = 'x' } `
+        -Schema $schemaCatalog
+    $schemaUnknownLeafSink = New-Object System.Collections.Generic.List[string]
+    $schemaUnknownLeafMerged = Resolve-BRAVORawConfiguration `
+        -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+        -PrimaryOverrides $null `
+        -LocalOverrides @{ 'maintenanceSettings.Limits.FutureKnobFromNewerToolkit' = 'x' } `
+        -UnknownLeafPathSink $schemaUnknownLeafSink
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$schemaUnknownLeaf.IsValid -and
+            [string]$schemaUnknownLeafMerged.maintenanceSettings.Limits.FutureKnobFromNewerToolkit -eq 'x' -and
+            $schemaUnknownLeafSink.Count -eq 1
+        ) `
+        -Name "Schema/UnknownLeafForwardCompatibilityIsPreserved" `
+        -Failure "невідомий leaf мусить лишатись прийнятим і облікованим (рішення D3), а не ставати порушенням схеми; valid=$($schemaUnknownLeaf.IsValid) sink=$($schemaUnknownLeafSink.Count)"
+
+    # --- Schema/RejectsUnknownTopLevel ---
+    # Політика невідомих шляхів лишається за ConvertTo-BRAVONestedOverride
+    # (одна канонічна реалізація), тому перевіряється через наскрізний
+    # мердж: додавання схеми не сміє послабити цю відмову.
+    $schemaUnknownTopLevelThrew = $false
+    try {
+        [void](Resolve-BRAVORawConfiguration `
+            -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+            -PrimaryOverrides $null `
+            -LocalOverrides @{ 'noSuchTopLevelBlock' = 1 })
+    } catch { $schemaUnknownTopLevelThrew = $true }
+    Test-BRAVOCondition `
+        -Condition $schemaUnknownTopLevelThrew `
+        -Name "Schema/RejectsUnknownTopLevel" `
+        -Failure "невідомий top-level ключ мусить лишатись fail-closed після введення схеми v2"
+
+    # --- Schema/RejectsUnknownParent ---
+    $schemaUnknownParentThrew = $false
+    try {
+        [void](Resolve-BRAVORawConfiguration `
+            -DefaultConfiguration (Get-BRAVODefaultConfiguration) `
+            -PrimaryOverrides $null `
+            -LocalOverrides @{ 'maintenanceSettings.NoSuchNode.Leaf' = 1 })
+    } catch { $schemaUnknownParentThrew = $true }
+    Test-BRAVOCondition `
+        -Condition $schemaUnknownParentThrew `
+        -Name "Schema/RejectsUnknownParent" `
+        -Failure "невідомий батьківський вузол мусить лишатись fail-closed після введення схеми v2"
+
+    # --- Schema/DocumentedCatalogKindsAgree ---
+    # Замість другої копії типів із каталогу Configurator-а — механічний
+    # доказ, що обидві декларації описують ОДНУ форму. Розбіжність
+    # (напр. документований Integer там, де канонічний дефолт — рядок)
+    # валить перевірку замість того, щоб тихо жити в двох місцях.
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Schema.psd1')
+    $schemaCatalogKindByDocumentedType = @{
+        'String' = 'String'; 'Path' = 'String'; 'UNCPath' = 'String'; 'Time' = 'String'; 'Enum' = 'String'
+        'Integer' = 'Number'; 'Number' = 'Number'
+        'Boolean' = 'Boolean'
+        'StringArray' = 'Array:String'; 'NumberArray' = 'Array:Number'
+    }
+    $schemaCatalogMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($documentedDescriptor in @(Get-BRAVOConfiguratorSchemaCatalog)) {
+        $documentedPath = [string]$documentedDescriptor['Path']
+        if (-not $schemaCatalog.Contains($documentedPath)) { continue }
+        $documentedType = [string]$documentedDescriptor['Type']
+        if (-not $schemaCatalogKindByDocumentedType.Contains($documentedType)) {
+            [void]$schemaCatalogMismatches.Add("$documentedPath (невідомий документований тип '$documentedType')")
+            continue
+        }
+        $schemaDescriptor = $schemaCatalog[$documentedPath]
+        $actualKindText = [string]$schemaDescriptor.Kind
+        if ($actualKindText -eq 'Array') { $actualKindText = "Array:$([string]$schemaDescriptor.ElementKind)" }
+        if ($actualKindText -ne [string]$schemaCatalogKindByDocumentedType[$documentedType]) {
+            [void]$schemaCatalogMismatches.Add("$documentedPath (каталог '$documentedType' -> схема '$actualKindText')")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($schemaCatalogMismatches.Count -eq 0) `
+        -Name "Schema/DocumentedCatalogKindsAgree" `
+        -Failure "задокументований каталог Configurator-а і схема v2 мусять описувати однакові роди значень; розбіжності: $([string]::Join('; ', $schemaCatalogMismatches))"
+
+    # --- Schema/LoaderValidatesLocalLayerBeforeMerge ---
+    # Структурний guard: перевірка типів мусить стояти в канонічному
+    # конвеєрі ДО мерджу, інакше недійсне значення встигло б потрапити в
+    # ефективну конфігурацію, і "fail-closed" був би лише на папері.
+    $schemaLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+    $schemaValidationIndex = $schemaLoaderText.IndexOf('Test-BRAVOConfigurationOverrideSchema')
+    $schemaMergeIndex = $schemaLoaderText.IndexOf('$mergedConfiguration = Resolve-BRAVORawConfiguration')
+    Test-BRAVOCondition `
+        -Condition (
+            $schemaValidationIndex -gt 0 -and
+            $schemaMergeIndex -gt 0 -and
+            $schemaValidationIndex -lt $schemaMergeIndex
+        ) `
+        -Name "Schema/LoaderValidatesLocalLayerBeforeMerge" `
+        -Failure "BRAVO_CONFIG_LOADER мусить валідувати типи site-шару ДО Resolve-BRAVORawConfiguration (validation=$schemaValidationIndex merge=$schemaMergeIndex)"
+}
