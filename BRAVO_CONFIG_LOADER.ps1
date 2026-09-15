@@ -1179,7 +1179,12 @@ function Import-BravoLegacyPrimaryConfiguration {
         # поведінка прийому primary-шару НЕ змінюється, як і в A2.
         [AllowNull()][System.Collections.Generic.HashSet[string]]$DeclaredGlobalNameSink,
         [AllowNull()][System.Collections.Generic.List[string]]$UnknownPrimaryPathSink,
-        [AllowNull()][System.Collections.Generic.HashSet[string]]$CanonicalGlobalNameSink
+        [AllowNull()][System.Collections.Generic.HashSet[string]]$CanonicalGlobalNameSink,
+
+        # #154 (B4): dot-шляхи, де legacy BRAVO.config РЕАЛЬНО перевизначає
+        # канонічний дефолт. Саме вони — єдина причина, чому застарілий файл
+        # на сервері має значення: решта його вмісту дублює дефолти.
+        [AllowNull()][System.Collections.Generic.List[string]]$LegacyPrimaryOverridePathSink
     )
 
     $primaryRawOverrides = Read-BRAVOLegacyPrimaryRawOverrides `
@@ -1193,7 +1198,11 @@ function Import-BravoLegacyPrimaryConfiguration {
     # вузол fail-closed. Поведінку тут НЕ змінюємо (це окреме рішення D3),
     # але робимо факт видимим. Порівняння — canonical
     # Compare-BRAVOConfigurationGraph, а не власний обхід графа.
-    if ($null -ne $UnknownPrimaryPathSink) {
+    # #154 (B4): ТОЙ САМИЙ виклик Compare живить два різні спостереження —
+    # невідомі вкладені ключі (F1/A3) і реальні перевизначення канонічних
+    # дефолтів (B4). Другого проходу графа не робиться: різниця між ними —
+    # лише Kind, а не окреме порівняння.
+    if ($null -ne $UnknownPrimaryPathSink -or $null -ne $LegacyPrimaryOverridePathSink) {
         $deltaModulePath = Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Delta.psd1'
         if (-not (Get-Module -Name 'BRAVO.Configuration.Delta')) {
             Import-Module -Name $deltaModulePath -ErrorAction Stop
@@ -1203,8 +1212,17 @@ function Import-BravoLegacyPrimaryConfiguration {
             -CandidateConfiguration $primaryRawOverrides)
         foreach ($primaryDifference in $primaryDifferences) {
             if ($null -eq $primaryDifference) { continue }
-            if ([string]$primaryDifference.Kind -ne 'OnlyInCandidate') { continue }
-            [void]$UnknownPrimaryPathSink.Add([string]$primaryDifference.Path)
+            $primaryDifferenceKind = [string]$primaryDifference.Kind
+            if ($primaryDifferenceKind -eq 'OnlyInCandidate' -and $null -ne $UnknownPrimaryPathSink) {
+                [void]$UnknownPrimaryPathSink.Add([string]$primaryDifference.Path)
+                continue
+            }
+            # 'Changed' = шлях є в обох графах, але значення різні. Це і є
+            # «застарілий BRAVO.config затінює дефолт»: ключ, який комплект
+            # уже має, але сервер несе інше значення з попередньої версії.
+            if ($primaryDifferenceKind -eq 'Changed' -and $null -ne $LegacyPrimaryOverridePathSink) {
+                [void]$LegacyPrimaryOverridePathSink.Add([string]$primaryDifference.Path)
+            }
         }
     }
 
@@ -1344,6 +1362,12 @@ function Import-BravoConfiguration {
             DeclaredGlobalNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             CanonicalGlobalNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
             UnknownNestedPaths = New-Object 'System.Collections.Generic.List[string]'
+            # #154 (B4): шляхи, де цей BRAVO.config реально відхиляється від
+            # канонічного дефолту. На свіжому комплекті перелік порожній
+            # (комплектний файл дефолти не змінює — це доводить
+            # ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults);
+            # непорожній означає застарілий site-файл, що затінює дефолти.
+            LegacyOverridePaths = New-Object 'System.Collections.Generic.List[string]'
         }
     }
 
@@ -1359,7 +1383,8 @@ function Import-BravoConfiguration {
                 -UnknownLeafPathSink $effectiveUnknownLeafSink `
                 -DeclaredGlobalNameSink $primaryOverrideState.DeclaredGlobalNames `
                 -UnknownPrimaryPathSink $primaryOverrideState.UnknownNestedPaths `
-                -CanonicalGlobalNameSink $primaryOverrideState.CanonicalGlobalNames
+                -CanonicalGlobalNameSink $primaryOverrideState.CanonicalGlobalNames `
+                -LegacyPrimaryOverridePathSink $primaryOverrideState.LegacyOverridePaths
         } else {
             Import-BravoSyntheticConfiguration `
                 -RuntimeRoot $resolvedRuntimeRoot `
@@ -1490,6 +1515,33 @@ function Import-BravoConfiguration {
         }
     }
 
+    # #154 (B4): застарілий BRAVO.config перестає бути МОВЧАЗНИМ.
+    # Поведінку НЕ змінено — файл і далі читається як primary-шар, бо
+    # site-значення парку сьогодні живуть саме в ньому, а міграція парку
+    # (B5) ще не виконана. Прибрати його зараз означало б забрати в
+    # серверів їхні налаштування. Але оператор мусить бачити, ЩО САМЕ цей
+    # файл змінює відносно дефолтів комплекту — інакше застарілий конфіг
+    # епохи 5.2.0 роками тихо тримає сервер на старих значеннях, і ніде
+    # цього не видно.
+    $legacyPrimaryOverridePaths = @()
+    if ($null -ne $primaryOverrideState) {
+        $legacyPrimaryOverridePaths = @(@($primaryOverrideState.LegacyOverridePaths) | Sort-Object -Unique)
+        if ($legacyPrimaryOverridePaths.Count -gt 0) {
+            $legacyPrimaryPreview = @($legacyPrimaryOverridePaths | Select-Object -First 8)
+            $legacyPrimarySuffix = ''
+            if ($legacyPrimaryOverridePaths.Count -gt $legacyPrimaryPreview.Count) {
+                $legacyPrimarySuffix = " (та ще $($legacyPrimaryOverridePaths.Count - $legacyPrimaryPreview.Count))"
+            }
+            Write-Warning (
+                "BRAVO.config ('$resolvedConfigPath') перевизначає $($legacyPrimaryOverridePaths.Count) " +
+                "канонічний(их) дефолт(ів) комплекту: " + ($legacyPrimaryPreview -join ', ') + $legacyPrimarySuffix +
+                ". Це працює, але BRAVO.config більше не є рекомендованим місцем для site-значень: " +
+                "перенесіть їх у BRAVO.local.config (deploy\Get-BRAVOConfigSiteDelta.ps1 друкує готові " +
+                "dot-шляхи), після чого BRAVO.config можна прибрати — комплект працює без нього."
+            )
+        }
+    }
+
     $unknownPrimaryNestedPaths = @()
     if ($null -ne $primaryOverrideState) {
         $unknownPrimaryNestedPaths = @(@($primaryOverrideState.UnknownNestedPaths) | Sort-Object -Unique)
@@ -1598,6 +1650,10 @@ function Import-BravoConfiguration {
         # Вкладені ключі BRAVO.config, невідомі канонічній конфігурації
         # (#154, A3/F1) — зливаються, але їх ніхто не читає.
         PrimaryConfigUnknownNestedKeys = @($unknownPrimaryNestedPaths)
+        # Шляхи, де BRAVO.config реально відхиляється від канонічних
+        # дефолтів (#154, B4). Порожньо = файл нічого не затінює або
+        # відсутній; непорожньо = саме ці значення тримає site-файл.
+        PrimaryConfigOverridesCanonicalDefaults = @($legacyPrimaryOverridePaths)
         # Версія схеми САМОГО КОМПЛЕКТУ (VERSION.json) — не плутати з
         # версією, яку оголошує site-файл (два поля нижче, #154 B3).
         ConfigSchemaVersion = [int]$versionMetadata.ConfigSchemaVersion
