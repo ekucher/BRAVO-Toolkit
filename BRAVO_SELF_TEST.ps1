@@ -161,6 +161,20 @@ $script:failures = New-Object System.Collections.ArrayList
 $script:passCount = 0
 $script:selfTestConfigRoot = $null
 
+# #188: перевірка, яку НЕ ВДАЛОСЯ ВИКОНАТИ через обмеження хоста, — це не
+# те саме, що перевірка, яка не пройшла. На жорстко налаштованому сервері
+# (GPO-транскрипція PowerShell, Constrained Language Mode через
+# AppLocker/WDAC) дочірні проби не можуть стартувати, і оператор бачив
+# [FAIL], не відрізнимий від дефекту комплекту. Один такий [FAIL], що
+# нічого не означає, знецінює наступний, що означає реальний дефект.
+#
+# КОНТРАКТ FAIL-CLOSED: класифікація вимагає ДОВЕДЕНОГО факту про хост
+# (див. Get-BRAVOSelfTestHostRestriction). Відсутність доказу обмеження
+# лишає звичайний [FAIL] — "схоже на середовище" не є причиною.
+# Ці перевірки НЕ впливають на код завершення, тому вони мусять бути
+# видимі в підсумку окремим рядком, інакше загубляться серед [PASS].
+$script:environmentLimitations = New-Object System.Collections.ArrayList
+
 # PR #138 review (P2-A): baseline для Phase-0 hard-gate ініціалізується
 # тут, ОДРАЗУ після $script:failures/$script:passCount і ДО зовнішнього
 # main `try` нижче (Framework/ToolManifest/RuntimeGuard-фрагменти перед
@@ -258,25 +272,63 @@ function Exit-BRAVOSelfTestIsolationScope {
 # площин.
 $script:BRAVOSelfTestOwnedRuntimeModules = New-Object System.Collections.Generic.List[object]
 
+function Get-BRAVOSelfTestAssertionResult {
+    # #188: ЄДИНЕ місце, де вирішується категорія результату. Виділено з
+    # Test-BRAVOCondition навмисно: інакше та сама тернарна умова жила б і в
+    # гілці друку, і в телеметрії Result, і перевірити її можна було б лише
+    # справжнім викликом assert-а — тобто друком фікстурних [FAIL] у чистому
+    # прогоні. Функція чиста, тому її контракт перевіряється прямо.
+    param(
+        [bool]$Condition,
+        # Навмисно НЕ -EnvironmentLimitation: це ім'я лишається виключно за
+        # Test-BRAVOCondition, тому guard
+        # Framework/RestrictionReasonComesFromDetectorNotLiteral може точно
+        # відрізнити виклик assert-а від виклику цієї функції рішення.
+        [string]$Restriction = ''
+    )
+    if ($Condition) { return 'PASS' }
+    # Обмеження хоста розглядається ЛИШЕ для умови, що не виконалась, і лише
+    # коли причина названа. Порожня причина -> звичайний FAIL (fail-closed).
+    if (-not [string]::IsNullOrWhiteSpace($Restriction)) { return 'UNAVAILABLE' }
+    return 'FAIL'
+}
+
 function Test-BRAVOCondition {
     param(
         [bool]$Condition,
         [string]$Name,
-        [string]$Failure
+        [string]$Failure,
+        # #188: заповнюється ЛИШЕ доведеним фактом про хост, який робить
+        # перевірку невиконуваною. Порожній рядок (дефолт) = стара
+        # поведінка PASS/FAIL повністю без змін.
+        [string]$EnvironmentLimitation = ''
     )
     # P0 fail-fast/telemetry: $Condition уже обчислений PowerShell'ом ДО
     # виклику цієї функції — Stopwatch тут міряє ЛИШЕ саму
-    # Test-BRAVOCondition (PASS/FAIL API незмінний, жодного нового
-    # параметра, жодної зміни поведінки при $Condition=$true/$false).
+    # Test-BRAVOCondition (поведінка при $Condition=$true незмінна; #188 додав
+    # необов'язковий -EnvironmentLimitation, без якого контракт PASS/FAIL
+    # лишається точно тим самим).
     # LeadDurationMs (час МІЖ попереднім і цим викликом) — окремий сигнал,
     # де насправді ховається дорога підготовча робота.
     $nowBeforeMs = $script:selfTestTotalStopwatch.Elapsed.TotalMilliseconds
     $leadMs = $nowBeforeMs - $script:lastAssertionCompletedAtMs
+    # Ініціалізація ДО try: finally нижче читає цю змінну, і під
+    # Set-StrictMode невизначена змінна там дала б помилку, яка замаскувала б
+    # справжню причину. Дефолт — найсуворіша категорія.
+    $assertionResult = 'FAIL'
     $assertionStopwatch = [Diagnostics.Stopwatch]::StartNew()
     try {
-        if ($Condition) {
+        $assertionResult = Get-BRAVOSelfTestAssertionResult `
+            -Condition $Condition -Restriction $EnvironmentLimitation
+        if ($assertionResult -eq 'PASS') {
             $script:passCount++
             Write-Host "[PASS] $Name" -ForegroundColor Green
+        } elseif ($assertionResult -eq 'UNAVAILABLE') {
+            # НЕ помилка комплекту: перевірку неможливо виконати на цьому
+            # хості, і причина названа. У $script:failures не потрапляє,
+            # тому код завершення не змінюється.
+            Write-Host "[НЕДОСТУПНО] ${Name}: $EnvironmentLimitation" -ForegroundColor Yellow
+            [void]$script:environmentLimitations.Add("$Name — $EnvironmentLimitation")
         } else {
             Write-Host "[FAIL] ${Name}: $Failure" -ForegroundColor Red
             [void]$script:failures.Add("$Name — $Failure")
@@ -287,13 +339,50 @@ function Test-BRAVOCondition {
         [void]$script:testTimings.Add([pscustomobject]@{
             Name                = $Name
             Suite               = $script:currentSuiteName
-            Result              = if ($Condition) { 'PASS' } else { 'FAIL' }
+            Result              = $assertionResult
             LeadDurationMs      = $leadMs
             AssertionDurationMs = $assertionMs
             IntervalMs          = $leadMs + $assertionMs
         })
         $script:lastAssertionCompletedAtMs = $script:selfTestTotalStopwatch.Elapsed.TotalMilliseconds
     }
+}
+
+function Get-BRAVOSelfTestHostRestriction {
+    # #188: повертає ДОВЕДЕНУ причину, через яку дочірня проба не може
+    # виконатись на цьому хості, або порожній рядок.
+    #
+    # Порожній рядок означає "доказу немає", і перевірка лишається [FAIL].
+    # Асиметрія свідома: класифікувати дефект комплекту як обмеження
+    # середовища небезпечніше, ніж навпаки — перше ховає реальну ваду, друге
+    # лише змушує оператора подивитись уважніше. Тому "схоже на середовище"
+    # причиною не є; причиною є лише прочитаний факт про хост.
+    $hostRestrictionReasons = New-Object System.Collections.Generic.List[string]
+    try {
+        $hostLanguageMode = [string]$ExecutionContext.SessionState.LanguageMode
+        if ($hostLanguageMode -ne 'FullLanguage') {
+            [void]$hostRestrictionReasons.Add(
+                ("LanguageMode = {0} (обмеження AppLocker/WDAC)" -f $hostLanguageMode))
+        }
+    } catch {
+        # Недоступність самої перевірки не є доказом обмеження.
+    }
+    try {
+        $hostTranscriptionPolicy = Get-ItemProperty `
+            -LiteralPath 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription' `
+            -ErrorAction SilentlyContinue
+        if ($null -ne $hostTranscriptionPolicy -and
+            $null -ne $hostTranscriptionPolicy.PSObject.Properties['EnableTranscripting'] -and
+            [int]$hostTranscriptionPolicy.EnableTranscripting -eq 1) {
+            [void]$hostRestrictionReasons.Add(
+                'увімкнено політику PowerShell-транскрипції (EnableTranscripting = 1)')
+        }
+    } catch {
+        # Те саме: немає доступу до політики -> немає доказу.
+    }
+    if ($hostRestrictionReasons.Count -eq 0) { return '' }
+    return ('перевірку неможливо виконати на цьому хості: ' +
+        [string]::Join('; ', $hostRestrictionReasons.ToArray()))
 }
 
 # P0 fail-fast/telemetry: перемикання поточного suite-контексту для
@@ -545,8 +634,24 @@ function Complete-BRAVOSelfTestReport {
     Write-BRAVOResultField -Label 'Статус' -Value $script:selfTestStatusText -Color $script:selfTestStatusColor
     Write-BRAVOResultField -Label 'Перевірки' -Value ([string]$script:passCount)
     Write-BRAVOResultField -Label 'Помилки' -Value ([string]$script:failures.Count)
+    if ($script:environmentLimitations.Count -gt 0) {
+        # #188: рядок з'являється лише коли є що показати, але тоді
+        # з'являється ОБОВ'ЯЗКОВО: прогін, у якому частина перевірок не
+        # виконалась, не має виглядати як повний.
+        Write-BRAVOResultField -Label 'Недоступно (хост)' `
+            -Value ([string]$script:environmentLimitations.Count) -Color ([ConsoleColor]::Yellow)
+    }
     Write-BRAVOResultBlankLine
-    if ($script:selfTestExitCode -eq 0) {
+    if ($script:selfTestExitCode -eq 0 -and $script:environmentLimitations.Count -gt 0) {
+        # Найнебезпечніший стан: помилок немає, але прогін НЕ повний.
+        # Перевірка RC на реальних серверах (RELEASE_POLICY.md, розділ 9)
+        # вимагає фіксувати саме це окремо, а не зараховувати як успішне
+        # приймання. Деталі для оператора — OPERATIONS.md.
+        Write-Host 'Виявлених помилок немає, але прогін НЕ повний.'
+        Write-Host ('Перевірок не виконано через обмеження хоста: ' +
+            [string]$script:environmentLimitations.Count + ' (рядки [НЕДОСТУПНО] вище).')
+        Write-Host 'На такому хості self-test не є повноцінним gate інсталяції.'
+    } elseif ($script:selfTestExitCode -eq 0) {
         Write-Host 'Усі перевірки BRAVO-Toolkit успішно пройдено.'
         Write-Host 'Проблем не виявлено. Додаткові дії не потрібні.'
     } else {
@@ -752,6 +857,7 @@ function Invoke-SuspensionScenario {
     return [pscustomobject]@{ Verdict = $verdict; Suspended = $suspended; Text = $text }
 }
 
+try {
 $effective = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'effective.log')
 $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') -BreakSuspension
 
@@ -763,7 +869,13 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
     AfterLogged = $effective.Text.Contains('BRAVO-AFTER-WINDOW')
     CanaryTextLeaked = $effective.Text.Contains('BRAVO-LOG-SUSPENSION-CANARY')
     BrokenVerdict = [bool]$broken.Verdict
+    HostLanguageMode = [string]$ExecutionContext.SessionState.LanguageMode
 } | ConvertTo-Json -Compress
+} catch {
+    # #188: без цього причина відмови йшла у stderr батьківського процесу і
+    # не потрапляла нікуди — батько бачив лише "проба не повернула JSON".
+    [pscustomobject]@{ ProbeError = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+}
 '@
         $suspensionProbePath = Join-Path $logSuspensionTestRoot 'probe.ps1'
         [IO.File]::WriteAllText($suspensionProbePath, $suspensionProbeScript, (New-Object Text.UTF8Encoding($false)))
@@ -771,6 +883,7 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         $suspensionProbeOutput = & $hostExecutable -NoLogo -NoProfile -NonInteractive `
             -ExecutionPolicy Bypass -File $suspensionProbePath `
             (Join-Path $root 'modules\BRAVO.HelperLogging') $logSuspensionTestRoot
+        $suspensionProbeExitCode = $LASTEXITCODE
         $suspensionProbeJson = @($suspensionProbeOutput) |
             Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
             Select-Object -Last 1
@@ -778,6 +891,44 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $null
         } else {
             [string]$suspensionProbeJson | ConvertFrom-Json
+        }
+        # #188: проба, яка впала, звітує ProbeError замість результату.
+        # Такий об'єкт НЕ є результатом: далі він має поводитись як $null,
+        # інакше Set-StrictMode впаде на зверненні до CanaryVerdict.
+        $suspensionProbeError = ''
+        if ($null -ne $suspensionProbe -and
+            $null -ne $suspensionProbe.PSObject.Properties['ProbeError']) {
+            $suspensionProbeError = [string]$suspensionProbe.ProbeError
+            $suspensionProbe = $null
+        }
+        $suspensionProbeDiagnostics = if ($null -ne $suspensionProbe) {
+            ''
+        } else {
+            $suspensionProbeNoise = @(
+                @($suspensionProbeOutput) |
+                    Where-Object { $_ -is [string] -and -not $_.Trim().StartsWith('{') } |
+                    ForEach-Object { $_.Trim() } |
+                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+                    Select-Object -Last 3)
+            (" [код виходу проби: {0}{1}{2}]" -f
+                [string]$suspensionProbeExitCode,
+                $(if ([string]::IsNullOrWhiteSpace($suspensionProbeError)) { '' }
+                  else { '; помилка проби: ' + $suspensionProbeError }),
+                $(if (@($suspensionProbeNoise).Count -eq 0) { '' }
+                  else { '; вивід: ' + [string]::Join(' | ', @($suspensionProbeNoise)) }))
+        }
+        # Класифікація дозволена ЛИШЕ коли проба не дала результату ВЗАГАЛІ
+        # і хост доведено обмежений. Проба, яка відпрацювала і дала
+        # неправильний результат, — завжди [FAIL].
+        $suspensionHostRestriction = if ($null -ne $suspensionProbe) {
+            ''
+        } else {
+            $suspensionHostRestrictionReason = Get-BRAVOSelfTestHostRestriction
+            if ([string]::IsNullOrWhiteSpace($suspensionHostRestrictionReason)) {
+                ''
+            } else {
+                $suspensionHostRestrictionReason + $suspensionProbeDiagnostics
+            }
         }
         Test-BRAVOCondition `
             -Condition (
@@ -790,9 +941,10 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
                 -not $suspensionProbe.CanaryTextLeaked
             ) `
             -Name "HelperLogging/SuspensionHidesConsoleOutput" `
+            -EnvironmentLimitation $suspensionHostRestriction `
             -Failure ("пауза transcript має ховати вивід лише всередині вікна: рядки до і після мають лишатися в лозі, а canary-маркер не повинен туди потрапляти; фактично: " + $(
                 if ($null -eq $suspensionProbe) {
-                    'проба не повернула JSON'
+                    'проба не повернула JSON' + $suspensionProbeDiagnostics
                 } else {
                     'canary={0}; suspended={1}; before={2}; inside={3}; after={4}; canaryLeaked={5}' -f `
                         $suspensionProbe.CanaryVerdict, $suspensionProbe.Suspended, $suspensionProbe.BeforeLogged, `
@@ -801,7 +953,8 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
         Test-BRAVOCondition `
             -Condition ($null -ne $suspensionProbe -and -not $suspensionProbe.BrokenVerdict) `
             -Name "HelperLogging/CanaryDetectsIneffectiveSuspension" `
-            -Failure "якщо пауза transcript на хості не працює, canary-перевірка має повернути false — інакше відкритий ввід писався б прямо в журнал"
+            -EnvironmentLimitation $suspensionHostRestriction `
+            -Failure ("якщо пауза transcript на хості не працює, canary-перевірка має повернути false — інакше відкритий ввід писався б прямо в журнал" + $suspensionProbeDiagnostics)
     } finally {
         Remove-Item -LiteralPath $logSuspensionTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -19361,6 +19514,105 @@ Test-BRAVOCondition `
         "виконуйте в дочірній області (& { ... }) або підніміть " +
         "`$script:selfTestVariableCountLimit — інакше наступне переповнення знову спливе " +
         "помилкою SessionStateOverflowException у непов'язаному тесті (#163)")
+
+# ============================================================
+# #188: класифікація обмежень хоста замість [FAIL].
+#
+# На жорстко налаштованому сервері (GPO-транскрипція PowerShell,
+# Constrained Language Mode через AppLocker/WDAC) дочірні проби не можуть
+# стартувати, і оператор бачив [FAIL], не відрізнимий від дефекту
+# комплекту. Один [FAIL], що нічого не означає, знецінює наступний, що
+# означає реальний дефект.
+#
+# Контракт перевіряється на ЧИСТІЙ функції рішення, а не справжнім
+# викликом assert-а: фікстурні [FAIL]/[НЕДОСТУПНО] у чистому прогоні самі
+# були б тим шумом, проти якого ця задача.
+# ============================================================
+
+& {
+    Test-BRAVOCondition `
+        -Condition ((Get-BRAVOSelfTestAssertionResult -Condition $true -Restriction '') -eq 'PASS') `
+        -Name "Framework/AssertionResultPassUnchanged" `
+        -Failure "умова, що виконалась, мусить лишатись PASS — контракт PASS/FAIL не має змінюватись від появи -EnvironmentLimitation"
+
+    Test-BRAVOCondition `
+        -Condition ((Get-BRAVOSelfTestAssertionResult -Condition $false -Restriction '') -eq 'FAIL') `
+        -Name "Framework/AssertionResultFailWithoutProvenRestriction" `
+        -Failure "перевірка, що не пройшла без доведеної причини з боку хоста, мусить лишатись FAIL"
+
+    # Ключовий fail-closed інваріант: порожня або пробільна причина НЕ
+    # перетворює провал на «недоступно». Інакше достатньо було б передати
+    # порожній рядок, щоб заглушити будь-який дефект.
+    Test-BRAVOCondition `
+        -Condition (
+            (Get-BRAVOSelfTestAssertionResult -Condition $false -Restriction '   ') -eq 'FAIL'
+        ) `
+        -Name "Framework/BlankRestrictionNeverSilencesFailure" `
+        -Failure "порожня причина не може перетворювати [FAIL] на [НЕДОСТУПНО] — інакше класифікація стала б глушником дефектів"
+
+    Test-BRAVOCondition `
+        -Condition (
+            (Get-BRAVOSelfTestAssertionResult -Condition $false `
+                -Restriction 'LanguageMode = ConstrainedLanguage') -eq 'UNAVAILABLE'
+        ) `
+        -Name "Framework/ProvenRestrictionClassifiesAsUnavailable" `
+        -Failure "провал із названою доведеною причиною з боку хоста мусить класифікуватись як UNAVAILABLE, а не як помилка комплекту"
+
+    # Дзеркальний інваріант: класифікація не може «врятувати» перевірку,
+    # яка насправді пройшла б інакше — причина розглядається ЛИШЕ для
+    # умови, що не виконалась.
+    Test-BRAVOCondition `
+        -Condition (
+            (Get-BRAVOSelfTestAssertionResult -Condition $true `
+                -Restriction 'LanguageMode = ConstrainedLanguage') -eq 'PASS'
+        ) `
+        -Name "Framework/RestrictionDoesNotOverrideSatisfiedCondition" `
+        -Failure "названа причина не повинна впливати на умову, що виконалась"
+
+    # UNAVAILABLE не потрапляє в $script:failures, тому НЕ впливає на код
+    # завершення — саме тому воно мусить бути видимим окремо. На чистому
+    # раннері CI цей список порожній, і це теж частина контракту: детектор
+    # не має вигадувати обмежень там, де їх немає.
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $script:environmentLimitations -and
+            -not [object]::ReferenceEquals($script:environmentLimitations, $script:failures)
+        ) `
+        -Name "Framework/EnvironmentLimitationsAreTracked" `
+        -Failure "перелік недоступних перевірок мусить існувати ОКРЕМО від переліку помилок — інакше класифікація змінювала б код завершення"
+
+    $selfTestHostRestrictionOnThisHost = Get-BRAVOSelfTestHostRestriction
+    Test-BRAVOCondition `
+        -Condition ([string]::IsNullOrWhiteSpace($selfTestHostRestrictionOnThisHost)) `
+        -Name "Framework/HostRestrictionAbsentOnUnrestrictedHost" `
+        -Failure ("на хості без обмежень детектор мусить повертати порожню причину, інакше кожен звичайний " +
+            "провал класифікувався б як обмеження середовища; фактично: $selfTestHostRestrictionOnThisHost")
+
+    # Структурний guard: причина мусить братися з детектора, а не з
+    # літерала в місці виклику. Літеральна причина означала б, що автор
+    # тесту може оголосити будь-який провал «обмеженням хоста».
+    $selfTestOwnSourceForRestriction = Get-BRAVOSelfTestOwnSourceText
+    $selfTestLiteralRestrictionUses = @(
+        [regex]::Matches($selfTestOwnSourceForRestriction, "-EnvironmentLimitation\s+'[^']") |
+            ForEach-Object { $_.Value })
+    Test-BRAVOCondition `
+        -Condition (@($selfTestLiteralRestrictionUses).Count -eq 0) `
+        -Name "Framework/RestrictionReasonComesFromDetectorNotLiteral" `
+        -Failure ("-EnvironmentLimitation мусить отримувати причину від Get-BRAVOSelfTestHostRestriction, " +
+            "а не рядковий літерал у місці виклику; знайдено: " +
+            [string]::Join(', ', @($selfTestLiteralRestrictionUses)))
+
+    # Проба transcript мусить звітувати СВОЮ помилку в stdout: доти вона
+    # йшла у stderr батьківського процесу, і причина відмови зникала —
+    # батько бачив лише «проба не повернула JSON».
+    Test-BRAVOCondition `
+        -Condition (
+            $selfTestOwnSourceForRestriction.Contains('ProbeError') -and
+            $selfTestOwnSourceForRestriction.Contains('$suspensionProbeExitCode = $LASTEXITCODE')
+        ) `
+        -Name "Framework/SuspensionProbeReportsItsOwnFailure" `
+        -Failure "дочірня проба transcript мусить повертати власну помилку й код виходу — інакше на жорсткому хості причина відмови не фіксується ніде"
+}
 
 # ============================================================
 # #157 (фаза 1): guard-и вартості прогону.
