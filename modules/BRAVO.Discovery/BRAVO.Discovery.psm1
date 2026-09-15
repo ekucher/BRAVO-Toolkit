@@ -1066,6 +1066,207 @@ $script:BRAVODiscoveryBaselineFields = @(
     'BRAVOEXCH_SOURCE', 'BAZA_APP', 'BAZA_WWW', 'BACKUP_ROOT'
 )
 
+$script:BRAVODiscoveryBaselineFileName = 'DISCOVERY_BASELINE.json'
+
+function Get-BRAVODiscoveryBaselinePath {
+    <#
+    .SYNOPSIS
+        Canonical шлях machine state для discovery baseline (#158, етап 1).
+    .DESCRIPTION
+        Baseline — це МАШИННИЙ СТАН, а не журнал: він описує підтверджений
+        оператором склад джерел, а не хід прогону. Його місце —
+        %ProgramData%\BRAVO\State, поруч з рештою стану (operation lock,
+        BRAVO_RESTORE_STATE.json, quiescence-маркер), а не
+        <RuntimeRoot>\LOGS.
+
+        Практичний наслідок, а не лише охайність: чиста інсталяція комплекту
+        в ІНШИЙ каталог раніше лишала baseline позаду разом із захистом,
+        який він дає, — новий RuntimeRoot бачив «перший запуск» і будь-який
+        зниклий компонент виглядав легітимно відсутнім.
+
+        Корінь стану сюди ПЕРЕДАЄТЬСЯ ($global:stateRoot, який обчислює
+        canonical Resolve-BRAVOConfigurationDerivation), а не виводиться
+        тут удруге з %ProgramData%: політика розташування машинного стану
+        має одного власника.
+
+        ACL цього каталогу теж не наша справа: Protect-BRAVOMachineStateRoot
+        (BRAVO.System) уже зміцнює ВЕСЬ State-корінь, і baseline потрапляє
+        під той самий захист автоматично.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][string]$StateRoot)
+
+    if ([string]::IsNullOrWhiteSpace($StateRoot)) {
+        throw 'Get-BRAVODiscoveryBaselinePath: StateRoot не може бути порожнім.'
+    }
+    return (Join-Path $StateRoot $script:BRAVODiscoveryBaselineFileName)
+}
+
+function Get-BRAVODiscoveryLegacyBaselinePath {
+    <#
+    .SYNOPSIS
+        Шлях baseline до етапу 1 — <RuntimeRoot>\LOGS (#158).
+    .DESCRIPTION
+        Потрібен рівно для міграції й діагностики. Нові записи сюди не
+        робляться ніколи; існує тому, що на працюючих серверах baseline
+        лежить саме тут, і оновлення комплекту не сміє його втратити.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][string]$RuntimeRoot)
+
+    if ([string]::IsNullOrWhiteSpace($RuntimeRoot)) {
+        throw 'Get-BRAVODiscoveryLegacyBaselinePath: RuntimeRoot не може бути порожнім.'
+    }
+    return (Join-Path $RuntimeRoot (Join-Path 'LOGS' $script:BRAVODiscoveryBaselineFileName))
+}
+
+function Write-BRAVODiscoveryBaselineTextAtomic {
+    # Приватний: атомарний запис файлу машинного стану.
+    #
+    # Той самий патерн, що Write-BRAVOOperationStatus (BRAVO.Status):
+    # тимчасовий файл -> [IO.File]::Replace (або ::Move, коли цілі ще
+    # немає) -> прибирання в finally. Друга, несумісна реалізація тут не
+    # вводиться; повторно використано саме послідовність, а не скопійовано
+    # функцію, бо Status пише СВІЙ формат статусу операції, а не довільний
+    # текст стану.
+    #
+    # Навіщо взагалі атомарність: перерваний запис (живлення, kill) лишав
+    # би baseline напівзаписаним, а пошкоджений baseline — це втрата саме
+    # того доказу, заради якого він існує.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $directory = Split-Path -Path $Path -Parent
+    if (-not [string]::IsNullOrWhiteSpace($directory) -and -not [IO.Directory]::Exists($directory)) {
+        [void][IO.Directory]::CreateDirectory($directory)
+    }
+
+    $temporaryPath = Join-Path $directory ('.DISCOVERY_BASELINE_{0}.tmp' -f [guid]::NewGuid().ToString('N'))
+    $backupPath = Join-Path $directory ('.DISCOVERY_BASELINE_{0}.bak' -f [guid]::NewGuid().ToString('N'))
+    $replaced = $false
+    try {
+        [IO.File]::WriteAllText($temporaryPath, $Text, (New-Object Text.UTF8Encoding($false)))
+        if ([IO.File]::Exists($Path)) {
+            [IO.File]::Replace($temporaryPath, $Path, $backupPath)
+            $replaced = $true
+        } else {
+            [IO.File]::Move($temporaryPath, $Path)
+        }
+    } finally {
+        if ([IO.File]::Exists($temporaryPath)) { [IO.File]::Delete($temporaryPath) }
+        if ($replaced -and [IO.File]::Exists($backupPath)) {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Import-BRAVODiscoveryBaseline {
+    <#
+    .SYNOPSIS
+        Читає baseline з canonical machine state, за потреби мігрувавши
+        його з legacy-розташування в LOGS (#158, етап 1).
+    .DESCRIPTION
+        Порядок строгий:
+
+          1. canonical існує -> використовується він; legacy не читається
+             взагалі (canonical завжди виграє);
+          2. canonical відсутній, legacy існує і читається -> вміст
+             переноситься в canonical АТОМАРНО і ДОСЛІВНО, далі
+             використовується canonical;
+          3. немає жодного -> перший запуск. Це НЕ пошкодження і НЕ дрейф;
+          4. legacy пошкоджений -> проблема повідомляється, міграції немає;
+             оригінал не чіпається;
+          5. canonical пошкоджений -> fail closed: повідомляється проблема,
+             і функція НЕ відкочується ні на legacy, ні на «перший запуск».
+             Мовчазний відкат означав би «baseline немає» -> «дрейфу немає»
+             -> зниклий компонент виглядав би легітимно відсутнім. Саме це
+             найгірший клас відмови для інструменту резервного копіювання,
+             тому пошкоджений canonical лишається ВИДИМОЮ проблемою.
+
+        Legacy-файл після міграції НЕ видаляється: це дані оператора, і
+        етап 1 не отримував повноважень їх знищувати. Canonical виграє
+        завжди, тож залишений файл ні на що не впливає.
+
+        Функція нічого не друкує й не кидає на очікуваних сценаріях —
+        рішення, як показати проблеми, належить викликачу (BRAVO_SETUP).
+    .OUTPUTS
+        [pscustomobject] @{ Baseline; Source; Path; LegacyPath; Migrated; Problems }
+        Source: 'Canonical' | 'MigratedFromLegacy' | 'None' | 'Unreadable'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$StateRoot,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot
+    )
+
+    $canonicalPath = Get-BRAVODiscoveryBaselinePath -StateRoot $StateRoot
+    $legacyPath = Get-BRAVODiscoveryLegacyBaselinePath -RuntimeRoot $RuntimeRoot
+    $problems = New-Object System.Collections.Generic.List[string]
+
+    if (Test-Path -LiteralPath $canonicalPath -PathType Leaf) {
+        try {
+            $canonicalBaseline = (Get-Content -LiteralPath $canonicalPath -Raw -Encoding UTF8) | ConvertFrom-Json
+        } catch {
+            $problems.Add("Не вдалося прочитати discovery baseline '$canonicalPath': $($_.Exception.Message)")
+            return [pscustomobject]@{
+                Baseline = $null; Source = 'Unreadable'; Path = $canonicalPath
+                LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
+            }
+        }
+        return [pscustomobject]@{
+            Baseline = $canonicalBaseline; Source = 'Canonical'; Path = $canonicalPath
+            LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
+        }
+    }
+
+    if (Test-Path -LiteralPath $legacyPath -PathType Leaf) {
+        $legacyText = $null
+        try {
+            $legacyText = Get-Content -LiteralPath $legacyPath -Raw -Encoding UTF8
+            $legacyBaseline = $legacyText | ConvertFrom-Json
+        } catch {
+            $problems.Add(
+                "Знайдено baseline у старому розташуванні '$legacyPath', але прочитати його не вдалося: " +
+                "$($_.Exception.Message). Міграцію не виконано, файл не змінено.")
+            return [pscustomobject]@{
+                Baseline = $null; Source = 'Unreadable'; Path = $canonicalPath
+                LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
+            }
+        }
+
+        try {
+            # Переноситься САМЕ вихідний текст, а не перезібраний знімок:
+            # міграція не має права змінити ані SavedAt, ані порядок полів
+            # — інакше вона стає новим підтвердженням baseline, якого
+            # оператор не давав.
+            Write-BRAVODiscoveryBaselineTextAtomic -Path $canonicalPath -Text $legacyText
+        } catch {
+            $problems.Add(
+                "Не вдалося перенести discovery baseline з '$legacyPath' у '$canonicalPath': " +
+                "$($_.Exception.Message). Використано вміст зі старого розташування.")
+            return [pscustomobject]@{
+                Baseline = $legacyBaseline; Source = 'MigratedFromLegacy'; Path = $legacyPath
+                LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
+            }
+        }
+
+        return [pscustomobject]@{
+            Baseline = $legacyBaseline; Source = 'MigratedFromLegacy'; Path = $canonicalPath
+            LegacyPath = $legacyPath; Migrated = $true; Problems = $problems.ToArray()
+        }
+    }
+
+    return [pscustomobject]@{
+        Baseline = $null; Source = 'None'; Path = $canonicalPath
+        LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
+    }
+}
+
 function Save-BRAVODiscoveryBaseline {
     # AUD-007 (аудит P1.1/P1.2): зберігає останній підтверджений discovery-
     # результат на диск (JSON, без BOM — узгоджено з VERSION.json), щоб
@@ -1084,14 +1285,12 @@ function Save-BRAVODiscoveryBaseline {
         $snapshot[$fieldName] = [string]$DiscoveryResult.$fieldName
     }
 
-    $parentDir = Split-Path -Path $BaselinePath -Parent
-    if (-not [string]::IsNullOrWhiteSpace($parentDir) -and
-        -not (Test-Path -LiteralPath $parentDir -PathType Container)) {
-        [void](New-Item -ItemType Directory -Path $parentDir -Force)
-    }
-
+    # #158 (етап 1): запис АТОМАРНИЙ. Раніше був простий WriteAllText —
+    # перерваний запис (живлення, kill) лишав би baseline напівзаписаним,
+    # а пошкоджений baseline знецінює саме той доказ, заради якого він
+    # існує. Каталог створює сам helper.
     $json = [pscustomobject]$snapshot | ConvertTo-Json
-    [IO.File]::WriteAllText($BaselinePath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVODiscoveryBaselineTextAtomic -Path $BaselinePath -Text $json
 }
 
 function Compare-BRAVODiscoveryBaseline {
@@ -1470,5 +1669,8 @@ Export-ModuleMember -Function @(
     'Get-BRAVOEffectiveSynchronizationConfiguration',
     'Test-BRAVODiscoveryResult',
     'Save-BRAVODiscoveryBaseline',
-    'Compare-BRAVODiscoveryBaseline'
+    'Compare-BRAVODiscoveryBaseline',
+    'Get-BRAVODiscoveryBaselinePath',
+    'Get-BRAVODiscoveryLegacyBaselinePath',
+    'Import-BRAVODiscoveryBaseline'
 )
