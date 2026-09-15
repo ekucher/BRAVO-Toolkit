@@ -212,3 +212,204 @@ Remove-Item -LiteralPath $maintenanceDiskSpaceLogTempFile -Force -ErrorAction Si
 #         яка саме existing-детекція придатна для цього — окреме
 #         дослідження, віднесене до Stage 4/наступного циклу.
 # ============================================================
+
+# ============================================================
+# #175: підсумок Maintenance мусить враховувати preflight-попередження
+# ============================================================
+# Дефект: Invoke-BRAVOMaintenanceDiskSpaceCheck повертає $true і для
+# успіху, і для non-blocking WARNING, а самі попередження пише через
+# Write-Log -Level WARNING, тобто вони інкрементують
+# $script:BRAVOWarningCount -> Get-BRAVOMaintenanceResolvedExitCode дає 10.
+# Крок при цьому штампувався 'OK' незалежно від цього, а підсумок читає
+# $script:BRAVOMaintenanceStepWarnCount — звідси «Попереджень: 0» поряд з
+# «Код завершення: 10».
+#
+# Перевіряється ІНВАРІАНТ (узгодженість підсумку з exit-кодом), а не
+# конкретна реалізація: тести працюють через ті самі canonical функції
+# обліку, що й production, і не знають, який саме крок дав попередження.
+& {
+    $m175Module = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForDiskSpace `
+        -FunctionNames @(
+            'Add-BRAVOMaintenanceStepOutcome',
+            'Get-BRAVOMaintenanceStepStatus',
+            'Resolve-BRAVOMaintenanceUnattributedWarningCount',
+            'Add-BRAVOMaintenanceUnattributedWarningOutcome',
+            'Get-BRAVOMaintenanceResolvedExitCode')
+
+    # Чистий стан обліку перед кожним сценарієм. Ті самі імена змінних, що
+    # в production — модуль витягнутий з того ж тексту, тому працює з
+    # власним script-scope.
+    $m175Reset = {
+        & $m175Module {
+            $script:BRAVOWarningCount = 0
+            $script:criticalErrorOccurred = $false
+            $script:restoreArchiveFailed = $false
+            $script:restoreIntegrityFailed = $false
+            $script:restoreFailed = $false
+            $script:BRAVOMaintenanceStepOkCount = 0
+            $script:BRAVOMaintenanceStepWarnCount = 0
+            $script:BRAVOMaintenanceStepSkippedCount = 0
+            $script:BRAVOMaintenanceStepFailCount = 0
+            $script:BRAVOMaintenanceStepLog = New-Object System.Collections.Generic.List[object]
+        }
+    }
+
+    # --- Maintenance/PreflightWarningIsCountedInSummary ---
+    # Preflight видав попередження і повернув "продовжувати". Крок, що
+    # рахується від зрізу лічильників, мусить стати WARN — і саме це
+    # бачить підсумок.
+    & $m175Reset
+    $m175PreflightSummary = & $m175Module {
+        $criticalBefore = $script:criticalErrorOccurred
+        $warningsBefore = $script:BRAVOWarningCount
+        # Еквівалент Write-Log -Level WARNING усередині preflight.
+        $script:BRAVOWarningCount++
+        $status = Get-BRAVOMaintenanceStepStatus -CriticalBefore $criticalBefore -WarningsBefore $warningsBefore
+        Add-BRAVOMaintenanceStepOutcome -Name 'Перевірка вільного місця' -Status $status
+        [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
+        return [pscustomobject]@{
+            Status = $status
+            Warnings = $script:BRAVOMaintenanceStepWarnCount
+            ExitCode = Get-BRAVOMaintenanceResolvedExitCode
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$m175PreflightSummary.Status -eq 'WARN' -and
+            [int]$m175PreflightSummary.Warnings -ge 1 -and
+            [int]$m175PreflightSummary.ExitCode -eq 10
+        ) `
+        -Name 'Maintenance/PreflightWarningIsCountedInSummary' `
+        -Failure ("preflight-попередження мусить давати крок WARN і потрапляти в підсумковий лічильник; " +
+            "статус='$($m175PreflightSummary.Status)' Попереджень=$($m175PreflightSummary.Warnings) exit=$($m175PreflightSummary.ExitCode)")
+
+    # --- Maintenance/Exit10NeverReportsZeroWarningsForWarningOutcome ---
+    # Загальний інваріант, а не лише preflight: попередження, яке не забрав
+    # ЖОДЕН крок (конфігураційна фаза, ділянка після останнього кроку),
+    # теж мусить бути видиме в підсумку. Саме цей сценарій давав
+    # "Попереджень: 0" при exit 10 і після виправлення самого preflight.
+    & $m175Reset
+    $m175Unattributed = & $m175Module {
+        Add-BRAVOMaintenanceStepOutcome -Name 'Крок без проблем' -Status 'OK'
+        # Попередження ПОЗА будь-яким кроком.
+        $script:BRAVOWarningCount++
+        [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
+        return [pscustomobject]@{
+            Warnings = $script:BRAVOMaintenanceStepWarnCount
+            ExitCode = Get-BRAVOMaintenanceResolvedExitCode
+            Steps = $script:BRAVOMaintenanceStepLog.Count
+            Ok = $script:BRAVOMaintenanceStepOkCount
+            Skipped = $script:BRAVOMaintenanceStepSkippedCount
+            Failed = $script:BRAVOMaintenanceStepFailCount
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [int]$m175Unattributed.ExitCode -eq 10 -and
+            [int]$m175Unattributed.Warnings -ge 1 -and
+            # Арифметика підсумку лишається зімкненою:
+            # Кроків = Успішно + Попереджень + Пропущено + Помилок.
+            [int]$m175Unattributed.Steps -eq (
+                [int]$m175Unattributed.Ok + [int]$m175Unattributed.Warnings +
+                [int]$m175Unattributed.Skipped + [int]$m175Unattributed.Failed)
+        ) `
+        -Name 'Maintenance/Exit10NeverReportsZeroWarningsForWarningOutcome' `
+        -Failure ("exit 10 не може супроводжуватись «Попереджень: 0», і арифметика підсумку мусить " +
+            "лишатись зімкненою; exit=$($m175Unattributed.ExitCode) Попереджень=$($m175Unattributed.Warnings) " +
+            "Кроків=$($m175Unattributed.Steps) Успішно=$($m175Unattributed.Ok)")
+
+    # --- Maintenance/NoWarningsStillReportsZero ---
+    # Зворотний бік: лічильник не накручується. Прогін без попереджень
+    # лишається «Попереджень: 0» / exit 0, і жодного службового запису в
+    # журналі етапів не з'являється.
+    & $m175Reset
+    $m175Clean = & $m175Module {
+        Add-BRAVOMaintenanceStepOutcome -Name 'Крок 1' -Status 'OK'
+        Add-BRAVOMaintenanceStepOutcome -Name 'Крок 2' -Status 'SKIPPED'
+        [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
+        return [pscustomobject]@{
+            Warnings = $script:BRAVOMaintenanceStepWarnCount
+            ExitCode = Get-BRAVOMaintenanceResolvedExitCode
+            Steps = $script:BRAVOMaintenanceStepLog.Count
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [int]$m175Clean.Warnings -eq 0 -and
+            [int]$m175Clean.ExitCode -eq 0 -and
+            [int]$m175Clean.Steps -eq 2
+        ) `
+        -Name 'Maintenance/NoWarningsStillReportsZero' `
+        -Failure ("прогін без попереджень мусить лишатись «Попереджень: 0»/exit 0 без службових записів; " +
+            "Попереджень=$($m175Clean.Warnings) exit=$($m175Clean.ExitCode) Кроків=$($m175Clean.Steps)")
+
+    # --- Maintenance/WarningAttributedToStepIsNotCountedTwice ---
+    # Попередження, яке крок УЖЕ забрав (став WARN), не може додатково
+    # потрапити в звід «поза кроками»: інакше один і той самий факт
+    # рахувався б двічі, а саме це Issue прямо забороняє.
+    & $m175Reset
+    $m175NoDoubleCount = & $m175Module {
+        $warningsBefore = $script:BRAVOWarningCount
+        $script:BRAVOWarningCount += 2
+        Add-BRAVOMaintenanceStepOutcome -Name 'Крок із попередженнями' `
+            -Status (Get-BRAVOMaintenanceStepStatus -CriticalBefore $false -WarningsBefore $warningsBefore)
+        $added = Add-BRAVOMaintenanceUnattributedWarningOutcome
+        return [pscustomobject]@{
+            AddedOutcomes = [int]$added
+            Warnings = $script:BRAVOMaintenanceStepWarnCount
+            Steps = $script:BRAVOMaintenanceStepLog.Count
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [int]$m175NoDoubleCount.AddedOutcomes -eq 0 -and
+            [int]$m175NoDoubleCount.Warnings -eq 1 -and
+            [int]$m175NoDoubleCount.Steps -eq 1
+        ) `
+        -Name 'Maintenance/WarningAttributedToStepIsNotCountedTwice' `
+        -Failure ("два попередження всередині одного кроку — це ОДИН крок WARN і жодного зводу поза кроками; " +
+            "додано записів=$($m175NoDoubleCount.AddedOutcomes) Попереджень=$($m175NoDoubleCount.Warnings) Кроків=$($m175NoDoubleCount.Steps)")
+
+    # --- Maintenance/BlockingErrorIsNotMisclassifiedAsWarning ---
+    # Критична помилка лишається FAIL і зберігає власний exit-код: звід
+    # попереджень не має права перекласифікувати блокуючу помилку.
+    & $m175Reset
+    $m175Blocking = & $m175Module {
+        $criticalBefore = $script:criticalErrorOccurred
+        $warningsBefore = $script:BRAVOWarningCount
+        $script:criticalErrorOccurred = $true
+        $status = Get-BRAVOMaintenanceStepStatus -CriticalBefore $criticalBefore -WarningsBefore $warningsBefore
+        Add-BRAVOMaintenanceStepOutcome -Name 'Перевірка вільного місця' -Status $status
+        [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
+        return [pscustomobject]@{
+            Status = $status
+            Warnings = $script:BRAVOMaintenanceStepWarnCount
+            Failed = $script:BRAVOMaintenanceStepFailCount
+            ExitCode = Get-BRAVOMaintenanceResolvedExitCode
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$m175Blocking.Status -eq 'FAIL' -and
+            [int]$m175Blocking.Failed -eq 1 -and
+            [int]$m175Blocking.Warnings -eq 0 -and
+            [int]$m175Blocking.ExitCode -ne 10 -and
+            [int]$m175Blocking.ExitCode -ne 0
+        ) `
+        -Name 'Maintenance/BlockingErrorIsNotMisclassifiedAsWarning' `
+        -Failure ("блокуюча помилка мусить лишатись FAIL із власним exit-кодом, а не стати попередженням; " +
+            "статус='$($m175Blocking.Status)' Помилок=$($m175Blocking.Failed) Попереджень=$($m175Blocking.Warnings) exit=$($m175Blocking.ExitCode)")
+
+    # --- Maintenance/PreflightStepStatusIsDerivedFromCounters ---
+    # Структурний guard проти повернення дефекту: крок перевірки вільного
+    # місця не сміє знову отримати жорстко зашитий 'OK'. Поведінкові тести
+    # вище доводять облік, але не спіймали б повернення саме цього рядка.
+    Test-BRAVOCondition `
+        -Condition (
+            -not $maintenanceScriptTextForDiskSpace.Contains("Write-BRAVOMaintenanceStep -Name 'Перевірка вільного місця' -Status 'OK'") -and
+            $maintenanceScriptTextForDiskSpace.Contains('$spaceCheckWarningsBefore = $script:BRAVOWarningCount')
+        ) `
+        -Name 'Maintenance/PreflightStepStatusIsDerivedFromCounters' `
+        -Failure "крок 'Перевірка вільного місця' мусить брати статус з Get-BRAVOMaintenanceStepStatus за зрізом лічильників, а не зі сталого 'OK' (#175)"
+}
