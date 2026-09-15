@@ -1138,9 +1138,9 @@
         # колекцію-значення, і масив-лист перетворився б на свій елемент.
         [CmdletBinding()]
         param(
-            [Parameter(Mandatory = $true)][AllowNull()]$Node,
+            [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Node,
             [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Prefix,
-            [Parameter(Mandatory = $true)][hashtable]$Sink
+            [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Sink
         )
         if ($Node -is [hashtable]) {
             foreach ($nodeKey in @($Node.Keys)) {

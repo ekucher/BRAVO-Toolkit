@@ -45,6 +45,17 @@
 #     поза обсягом B2. Замість копії є механічний guard self-test-у, що
 #     звіряє РОДИ задокументованого каталогу Configurator-а зі схемою.
 
+# ПРО [AllowEmptyCollection()] НА ОБОВ'ЯЗКОВИХ ПАРАМЕТРАХ НИЖЧЕ.
+# Windows PowerShell відхиляє ПОРОЖНЮ колекцію, передану в обов'язковий
+# параметр, тим самим неявним контролем, що й $null та порожній рядок:
+# "Cannot bind argument to parameter 'X' because it is an empty
+# collection" (інцидент CI 2026-09-15). Для цього модуля порожня колекція
+# — штатне значення, а не помилка: порожній перелік порушень на валідній
+# конфігурації, дефолт-масив @() (Limits.ExcludedDrives) і щойно створена
+# схема @{} на початку побудови. Тому кожен обов'язковий параметр, який
+# може отримати колекцію, явно її дозволяє. Це НЕ послаблення перевірки:
+# самі значення далі перевіряються кодом функцій, а не прив'язкою.
+
 # Ліміт глибини: канонічний граф має щонайбільше 3 рівні; ліміт існує
 # лише щоб патологічно вкладений вхід давав зрозумілу відмову, а не
 # переповнення стека.
@@ -89,7 +100,7 @@ function Get-BRAVOConfigurationSchemaValueKind {
     #     робить намір видимим і не залежить від порядку нижче.
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory = $true)][AllowNull()]$Value)
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value)
 
     if ($null -eq $Value) { return 'Undetermined' }
     if ($Value -is [bool]) { return 'Boolean' }
@@ -134,7 +145,7 @@ function Get-BRAVOConfigurationSchemaValueCaption {
     # довгий масив зробив би повідомлення нечитабельним.
     [CmdletBinding()]
     [OutputType([string])]
-    param([Parameter(Mandatory = $true)][AllowNull()]$Value)
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value)
 
     if ($null -eq $Value) { return '$null' }
     $text = ''
@@ -157,9 +168,9 @@ function Add-BRAVOConfigurationSchemaLeaf {
     # проміжні колекції (.claude/rules/powershell.md).
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)][AllowNull()]$Node,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Node,
         [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path,
-        [Parameter(Mandatory = $true)][hashtable]$Schema,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Schema,
         [Parameter(Mandatory = $true)][int]$Depth
     )
 
@@ -277,7 +288,7 @@ function Get-BRAVOConfigurationSchema {
     [CmdletBinding()]
     [OutputType([hashtable])]
     param(
-        [Parameter(Mandatory = $true)][hashtable]$ReferenceConfiguration
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$ReferenceConfiguration
     )
 
     $schema = @{}
@@ -291,11 +302,11 @@ function Add-BRAVOConfigurationSchemaViolation {
     # схеми: повернення колекції через pipeline розгорталось би).
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory = $true)]$Descriptor,
-        [Parameter(Mandatory = $true)][AllowNull()]$Value,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()]$Descriptor,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][hashtable]$Schema,
-        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Violations,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Schema,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Violations,
         [Parameter(Mandatory = $true)][int]$Depth
     )
 
@@ -403,8 +414,8 @@ function Test-BRAVOConfigurationOverrideSchema {
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [Parameter(Mandatory = $true)][hashtable]$DotPathOverrides,
-        [Parameter(Mandatory = $true)][hashtable]$Schema
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$DotPathOverrides,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Schema
     )
 
     $violations = New-Object System.Collections.Generic.List[object]
