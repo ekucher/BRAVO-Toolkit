@@ -588,3 +588,76 @@
         -Condition ($foundStaleClaims.Count -eq 0) `
         -Name "Documentation/ThreatModelHasNoStaleResidualRisk" `
         -Failure "THREAT_MODEL.md містить твердження про залишковий ризик, який код уже закрив: $($foundStaleClaims -join '; ')"
+
+# =====================================================================
+# #149: перелік required checks у RELEASE_POLICY.md §13.3 мусить
+# покривати ВСІ задачі ci.yml
+# =====================================================================
+# Корінь issue #149 — не забута галочка в налаштуваннях, а те, що
+# перелік вівся вручну: ci.yml отримав задачу
+# BRAVO_DATA_RESTORE_MATRIX_TEST.ps1, §13 про неї не дізнався, і
+# провалений E2E-тест відновлення лишався технічно немерджблокуючим.
+# Галочку вмикає людина, але дрейф переліку далі ловить self-test.
+#
+# Перевірка НАВМИСНО одностороння (ci.yml -> §13.3, не навпаки):
+# «Secret scanning (gitleaks)» і «GitGuardian Security Checks» надає
+# зовнішній провайдер, а не workflow цього репозиторію, тож вимога
+# «кожен пункт §13.3 має бути задачею ci.yml» відхилила б їх хибно.
+#
+# Розбираються САМЕ пункти переліку (рядки "- `ім'я`"), а не весь текст
+# секції: пояснювальна проза поряд згадує й суфікс " (push)", і на
+# суцільному пошуку підрядка перевірка спрацьовувала б на власному
+# поясненні.
+& {
+    $requiredChecksPolicyText = [IO.File]::ReadAllText(
+        (Join-Path $root 'RELEASE_POLICY.md'), [Text.Encoding]::UTF8)
+    $requiredChecksWorkflowText = [IO.File]::ReadAllText(
+        (Join-Path $root '.github\workflows\ci.yml'), [Text.Encoding]::UTF8)
+
+    # Імена задач у ci.yml записані тернарником за подією; required
+    # check прив'язується до pull_request-варіанта, тому беремо саме
+    # перший літерал виразу.
+    $ciJobNameMatches = [regex]::Matches(
+        $requiredChecksWorkflowText, "'pull_request'\s*&&\s*'([^']+)'")
+    $ciPullRequestJobNames = @(
+        $ciJobNameMatches | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+
+    $requiredChecksSectionIndex = $requiredChecksPolicyText.IndexOf('### 13.3. Перелік required checks')
+    $listedCheckNames = @()
+    if ($requiredChecksSectionIndex -ge 0) {
+        # Від заголовка §13.3 до наступного абзацу після переліку —
+        # достатньо перших рядків секції, сам перелік іде одразу.
+        $requiredChecksSection = $requiredChecksPolicyText.Substring($requiredChecksSectionIndex)
+        $listedCheckNames = @(
+            [regex]::Matches($requiredChecksSection, '(?m)^-\s+`([^`]+)`\s*$') |
+                ForEach-Object { $_.Groups[1].Value })
+    }
+
+    $unlistedCiJobNames = @(
+        $ciPullRequestJobNames | Where-Object { $listedCheckNames -notcontains $_ })
+
+    Test-BRAVOCondition `
+        -Condition (
+            $requiredChecksSectionIndex -ge 0 -and
+            $ciPullRequestJobNames.Count -gt 0 -and
+            $listedCheckNames.Count -gt 0 -and
+            $unlistedCiJobNames.Count -eq 0
+        ) `
+        -Name "Governance/RequiredChecksListCoversCiWorkflowJobs" `
+        -Failure ("RELEASE_POLICY.md §13.3 мусить перелічувати кожну pull_request-задачу ci.yml " +
+            "(інакше повторюється #149: задача є, required check — ні). Задач у ci.yml: " +
+            "$($ciPullRequestJobNames.Count); пунктів у переліку: $($listedCheckNames.Count); " +
+            "відсутні: $(if ($unlistedCiJobNames.Count -gt 0) { $unlistedCiJobNames -join ', ' } else { '<немає>' })")
+
+    # Друга половина того самого кореня: імена в переліку мусять бути
+    # pull_request-варіантами. Суфікс " (push)" означав би required
+    # check, який на PR ніколи не з'явиться, тобто вічно заблокований
+    # мердж — рівно той інцидент промоції 5.1.0, через який імена й
+    # розділені за подією.
+    $pushSuffixedCheckNames = @($listedCheckNames | Where-Object { $_ -like '* (push)' })
+    Test-BRAVOCondition `
+        -Condition ($pushSuffixedCheckNames.Count -eq 0) `
+        -Name "Governance/RequiredChecksListUsesPullRequestNames" `
+        -Failure ("RELEASE_POLICY.md §13.3 не має містити імен із суфіксом ' (push)' — такий required " +
+            "check на PR не з'являється й заблокував би мердж назавжди; знайдено: $($pushSuffixedCheckNames -join ', ')")
+}
