@@ -2,6 +2,18 @@
 param(
     [string]$ConfigPath,
 
+    # #187 (фаза 2): вибірковий прогін suite-фрагментів — зручність
+    # РОЗРОБНИКА, не режим приймання. Порожній (за замовчуванням) = повний
+    # канонічний прогін, поведінка якого не змінюється взагалі.
+    # Невідоме ім'я зупиняє прогін fail-closed: мовчки виконати не те, що
+    # просили, гірше, ніж не виконати нічого.
+    #
+    # СТОЇТЬ ПЕРЕД $NoPause НАВМИСНО. ConsoleUX/28 вимагає, щоб рядок
+    # "[switch]$NoPause" був останнім у param() — без коми в кінці. Прив'язку
+    # це не змінює: [switch] ніколи не є позиційним, тому $ConfigPath
+    # лишається позицією 0, а $Suite — позицією 1 за будь-якого порядку.
+    [string[]]$Suite,
+
     # SELF-TEST Console UX (operator pause): та сама -NoPause семантика, що
     # Archive/Health/Maintenance — вимикає паузу перед закриттям вікна.
     # Без прапорця Wait-BRAVOManualExit сама вирішує (SYSTEM/non-interactive
@@ -174,6 +186,101 @@ $script:selfTestConfigRoot = $null
 # Ці перевірки НЕ впливають на код завершення, тому вони мусять бути
 # видимі в підсумку окремим рядком, інакше загубляться серед [PASS].
 $script:environmentLimitations = New-Object System.Collections.ArrayList
+
+# --- #187 (фаза 2): вибір suite-фрагментів ---------------------------------
+#
+# ПОВНИЙ КАНОНІЧНИЙ ПРОГІН ЛИШАЄТЬСЯ РЕЖИМОМ ЗА ЗАМОВЧУВАННЯМ і єдиним, що є
+# gate-ом мержу й релізу. -Suite не зменшує обсяг перевірок, які мусить
+# пройти зміна, — лише дає розробникові швидший зворотний зв'язок під час
+# роботи.
+#
+# ЧОМУ INLINE-ТІЛО КОРЕНЯ ВИКОНУЄТЬСЯ ЗАВЖДИ. Фрагменти не самодостатні:
+# вони споживають фікстури, які готує саме це тіло — $archiveScriptText
+# (11 вживань в ArchiveDiskSpace, жодного власного присвоєння),
+# $archiveRuntimeModuleText, $resolvedConfig, $backupRootPath, $statePath.
+# Пропустити корінь означало б упасти під Set-StrictMode на невизначеній
+# змінній, і виглядало б це як дефект обраного фрагмента, а не як обмеження
+# режиму — рівно той клас плутанини, який закриває #188.
+#
+# Тому економія часу обмежена зверху: корінь — це 961 з 2107 перевірок і
+# 188.6 с із 477.5 с sum-of-suites. Вибірковий прогін не може бути швидшим
+# за цю частину, і обіцяти більше було б неправдою.
+$script:BRAVOSelfTestSuiteCatalog = @(
+    'Archive', 'ArchiveDiskSpace', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
+    'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
+    'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
+    'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Paths',
+    'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence',
+    'SftpCredentialsRequired', 'Status', 'TraceArchive'
+)
+
+# $null = повний прогін. Непорожній масив = вибірковий.
+$script:BRAVOSelfTestSelectedSuite = $null
+if ($null -ne $Suite -and @($Suite).Count -gt 0) {
+    $selfTestRequestedSuite = @(
+        @($Suite) |
+            ForEach-Object { [string]$_ } |
+            Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+            ForEach-Object { $_.Trim() })
+    $selfTestUnknownSuite = @(
+        $selfTestRequestedSuite |
+            Where-Object { $script:BRAVOSelfTestSuiteCatalog -notcontains $_ })
+    if ($selfTestUnknownSuite.Count -gt 0) {
+        throw ("Невідомий suite: " + [string]::Join(', ', $selfTestUnknownSuite) +
+            ". Доступні: " + [string]::Join(', ', $script:BRAVOSelfTestSuiteCatalog) +
+            ". Без -Suite виконується повний канонічний прогін.")
+    }
+    if ($selfTestRequestedSuite.Count -gt 0) {
+        # -notcontains нечутливий до регістру, тому ім'я нормалізується до
+        # написання каталогу: інакше 'archive' і 'Archive' дали б два різні
+        # ключі в подальших порівняннях.
+        $script:BRAVOSelfTestSelectedSuite = @(
+            $selfTestRequestedSuite |
+                ForEach-Object {
+                    $selfTestSuiteName = $_
+                    @($script:BRAVOSelfTestSuiteCatalog |
+                        Where-Object { $_ -eq $selfTestSuiteName }) | Select-Object -First 1
+                } |
+                Select-Object -Unique)
+    }
+}
+
+function Test-BRAVOSelfTestSuiteEnabled {
+    # Єдине місце, де вирішується, чи виконувати фрагмент. Повний прогін —
+    # завжди $true, тобто без -Suite жодна гілка нижче не змінює поведінки.
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if ($null -eq $script:BRAVOSelfTestSelectedSuite) { return $true }
+    return ($script:BRAVOSelfTestSelectedSuite -contains $Name)
+}
+
+function Get-BRAVOSelfTestSuiteForChangedPath {
+    <#
+        Підказка "змінений файл -> suite" для розробника.
+
+        Порожній результат означає "не знаю", і це НЕ дозвіл звузити прогін:
+        викликач має виконати повний. Мапа свідомо мінімальна й перевірювана —
+        застаріла мапа гірша за її відсутність, бо тихо радить пропустити те,
+        що саме й зламано.
+    #>
+    param([Parameter(Mandatory = $true)][AllowEmptyString()][string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+    $changedPath = $Path.Replace('/', '\').Trim()
+    # 1. Сам фрагмент -> однойменний suite. Це механічно точно, без здогадок.
+    $changedFragment = [regex]::Match($changedPath, '(?i)selftest\\BRAVO_SELF_TEST\.([A-Za-z]+)\.ps1$')
+    if ($changedFragment.Success) {
+        $changedSuite = @($script:BRAVOSelfTestSuiteCatalog |
+            Where-Object { $_ -eq $changedFragment.Groups[1].Value })
+        if (@($changedSuite).Count -gt 0) { return @($changedSuite) }
+    }
+    # 2. Доменний модуль -> suite з тим самим іменем домену, якщо такий є.
+    $changedModule = [regex]::Match($changedPath, '(?i)^modules\\BRAVO\.([A-Za-z]+)')
+    if ($changedModule.Success) {
+        $changedSuite = @($script:BRAVOSelfTestSuiteCatalog |
+            Where-Object { $_ -eq $changedModule.Groups[1].Value })
+        if (@($changedSuite).Count -gt 0) { return @($changedSuite) }
+    }
+    return @()
+}
 
 # PR #138 review (P2-A): baseline для Phase-0 hard-gate ініціалізується
 # тут, ОДРАЗУ після $script:failures/$script:passCount і ДО зовнішнього
@@ -641,8 +748,24 @@ function Complete-BRAVOSelfTestReport {
         Write-BRAVOResultField -Label 'Недоступно (хост)' `
             -Value ([string]$script:environmentLimitations.Count) -Color ([ConsoleColor]::Yellow)
     }
+    if ($null -ne $script:BRAVOSelfTestSelectedSuite) {
+        # #187: режим мусить бути видимим у підсумку, а не лише в команді
+        # запуску — інакше вибірковий прогін легко переплутати з повним,
+        # дивлячись на сам звіт.
+        Write-BRAVOResultField -Label 'Режим' `
+            -Value ('вибірковий: ' + [string]::Join(', ', $script:BRAVOSelfTestSelectedSuite)) `
+            -Color ([ConsoleColor]::Yellow)
+    }
     Write-BRAVOResultBlankLine
-    if ($script:selfTestExitCode -eq 0 -and $script:environmentLimitations.Count -gt 0) {
+    if ($script:selfTestExitCode -eq 0 -and $null -ne $script:BRAVOSelfTestSelectedSuite) {
+        # #187: вибірковий прогін не має права виглядати як успішне
+        # завершення повного. Він нічого не доводить про фрагменти, які не
+        # виконувались.
+        Write-Host 'Виявлених помилок немає, але виконано ВИБІРКОВИЙ прогін.'
+        Write-Host ('Виконані suite-фрагменти: ' +
+            [string]::Join(', ', $script:BRAVOSelfTestSelectedSuite) + '.')
+        Write-Host 'Для мержу й релізу потрібен повний канонічний прогін без -Suite.'
+    } elseif ($script:selfTestExitCode -eq 0 -and $script:environmentLimitations.Count -gt 0) {
         # Найнебезпечніший стан: помилок немає, але прогін НЕ повний.
         # Перевірка RC на реальних серверах (RELEASE_POLICY.md, розділ 9)
         # вимагає фіксувати саме це окремо, а не зараховувати як успішне
@@ -664,6 +787,14 @@ function Complete-BRAVOSelfTestReport {
     # лише перенесені в операторський підсумок; текст незмінний.
     if ($script:selfTestExitCode -gt 0) {
         Write-Host "SELF-TEST FAILED: $($script:failures.Count)" -ForegroundColor Red
+    } elseif ($null -ne $script:BRAVOSelfTestSelectedSuite) {
+        # #187, ключова властивість fail-closed: вибірковий прогін НІКОЛИ не
+        # друкує "SELF-TEST PASSED". RELEASE_CHECKLIST.md вимагає саме цей
+        # дослівний маркер як доказ повного прогону, тому окремий маркер —
+        # це те, що робить неможливим випадкове зарахування вибіркового
+        # прогону як доказу релізу.
+        Write-Host ("SELF-TEST PARTIAL: " +
+            [string]::Join(',', $script:BRAVOSelfTestSelectedSuite)) -ForegroundColor Yellow
     } else {
         Write-Host "SELF-TEST PASSED" -ForegroundColor Green
     }
@@ -9429,8 +9560,10 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "ConfigurationLoader/CredentialsSetupNoNameCollision" `
         -Failure "локальний wrapper credentials-утиліти не повинен збігатися за ім'ям із Import-BravoConfiguration"
 
-    Enter-BRAVOSelfTestSuite -Name 'Governance'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Governance.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Governance') {
+        Enter-BRAVOSelfTestSuite -Name 'Governance'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Governance.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
     # ===== DRY-RUN МУСИТЬ ПЕРЕВІРЯТИ ЦІЛІСНІСТЬ =====
@@ -12893,12 +13026,16 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "RestoreDrill/ScriptImplementsFullDrillCycle" `
         -Failure "BRAVO_RESTORE_TEST.ps1 має вибирати один COMPLETE GenerationId для всіх компонентів через спільні функції BRAVO.ArchiveHelpers (не локальні копії), перевіряти SHA512/7za, розпаковувати в ізольований каталог, повертати контрактний exit code і прибирати за собою"
 
-    Enter-BRAVOSelfTestSuite -Name 'DataRestore'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DataRestore.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'DataRestore') {
+        Enter-BRAVOSelfTestSuite -Name 'DataRestore'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DataRestore.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
-    Enter-BRAVOSelfTestSuite -Name 'ServiceQuiescence'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceQuiescence.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ServiceQuiescence') {
+        Enter-BRAVOSelfTestSuite -Name 'ServiceQuiescence'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ServiceQuiescence.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
     # AUD-008 (аудит P1.6): sanity-check обсягу backup. Технічно валідний
@@ -13035,8 +13172,10 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "SizeSanity/WiredIntoArchiveRuntime" `
         -Failure "BRAVO.Archive.Runtime.ps1 має викликати Test-BRAVOBackupSizeAnomaly з налаштувань backupMonitoring.SizeSanity"
-    Enter-BRAVOSelfTestSuite -Name 'ManifestStorage'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ManifestStorage.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ManifestStorage') {
+        Enter-BRAVOSelfTestSuite -Name 'ManifestStorage'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ManifestStorage.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
     # ================================================================
@@ -15873,8 +16012,10 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Runtime/10-PreflightCoversAllRequiredRoots" `
         -Failure "SYSTEM preflight має перевіряти читання RuntimeRoot/ConfigPath/modules/Tools/LIMSRoot/bravo.ini і запис ArchiveRoot/BackupRoot/LOGS та всіх каталогів призначення ротації"
 
-    Enter-BRAVOSelfTestSuite -Name 'Paths'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Paths.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Paths') {
+        Enter-BRAVOSelfTestSuite -Name 'Paths'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Paths.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
     # ===== ВИПРАВЛЕННЯ ПІСЛЯ ТЕСТОВОГО РОЗГОРТАННЯ 5.0.0-dev.1
@@ -16482,11 +16623,15 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Version/StampConsistency" `
         -Failure "VERSION.json.buildId має бути префіксом 40-символьного sourceCommit; інакше артефакт pre-stamp/неузгоджений"
 
-    Enter-BRAVOSelfTestSuite -Name 'LogRotation'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.LogRotation.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'LogRotation') {
+        Enter-BRAVOSelfTestSuite -Name 'LogRotation'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.LogRotation.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
-    Enter-BRAVOSelfTestSuite -Name 'ConsoleUX'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConsoleUX.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConsoleUX') {
+        Enter-BRAVOSelfTestSuite -Name 'ConsoleUX'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConsoleUX.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 
     #####################################################################
@@ -18122,92 +18267,126 @@ function Write-BRAVOLog {
 
     # Archive (P2-1/P2-5, PR #136 review): рекурсивне впорядкування SFTP-
     # каталогів перед mkdir і єдиний call site вивантаження власного логу.
-    Enter-BRAVOSelfTestSuite -Name 'Archive'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Archive') {
+        Enter-BRAVOSelfTestSuite -Name 'Archive'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Archive.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
-    Enter-BRAVOSelfTestSuite -Name 'SftpCredentialsRequired'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.SftpCredentialsRequired.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'SftpCredentialsRequired') {
+        Enter-BRAVOSelfTestSuite -Name 'SftpCredentialsRequired'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.SftpCredentialsRequired.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
-    Enter-BRAVOSelfTestSuite -Name 'MaintenanceOwnLog'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceOwnLog.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceOwnLog') {
+        Enter-BRAVOSelfTestSuite -Name 'MaintenanceOwnLog'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceOwnLog.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
-    Enter-BRAVOSelfTestSuite -Name 'BazaSync'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'BazaSync') {
+        Enter-BRAVOSelfTestSuite -Name 'BazaSync'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # TraceArchive ПІСЛЯ BazaSync: SFTP-сценарії добового Trace-архіву
     # використовують New-BRAVOSelfTestFakeBazaSession, визначену там.
-    Enter-BRAVOSelfTestSuite -Name 'TraceArchive'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'TraceArchive') {
+        Enter-BRAVOSelfTestSuite -Name 'TraceArchive'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.TraceArchive.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # MaintenanceRepair: false-positive rollback після bravocmd repair +
     # Discord HTTP 429 retry (fix/repair-rollback-false-positive-and-discord-429).
-    Enter-BRAVOSelfTestSuite -Name 'MaintenanceRepair'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceRepair.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceRepair') {
+        Enter-BRAVOSelfTestSuite -Name 'MaintenanceRepair'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceRepair.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # RestoreSynthetic: наскрізний синтетичний тест відкату — справжній
     # tools\7za.exe (архів + цілісність + екстракція) на синтетичній моделі,
     # SHA256-верифікація відновлення, fail-closed на пошкодженому/відсутньому
     # архіві. Приймальну перевірку на DEV-LIMS не замінює.
-    Enter-BRAVOSelfTestSuite -Name 'RestoreSynthetic'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'RestoreSynthetic') {
+        Enter-BRAVOSelfTestSuite -Name 'RestoreSynthetic'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreSynthetic.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # RestoreVerify (P1.1): state-API верифікації відновлюваності, health-
     # оцінка віку, канонічний DaysOfWeek-mask, контракти scheduled drill і
     # loader-нормалізація legacy-конфігів без RestoreVerify-вузлів.
-    Enter-BRAVOSelfTestSuite -Name 'RestoreVerify'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreVerify.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'RestoreVerify') {
+        Enter-BRAVOSelfTestSuite -Name 'RestoreVerify'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.RestoreVerify.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Status (P2.1): machine-readable status contract v1 — атомарний
     # roundtrip, деривація status з exitCode, fail-closed схема,
     # відсутність секретів і fail-soft контракти чотирьох call-site'ів.
-    Enter-BRAVOSelfTestSuite -Name 'Status'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Status.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Status') {
+        Enter-BRAVOSelfTestSuite -Name 'Status'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Status.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # ConfigLoader: діагностичне збагачення помилки виконання BRAVO.config
     # (реальний DEV-майданчик, PowerShell 3.0 -> Get-BRAVOOSSupportTier hint
     # замість голої NullReferenceException).
-    Enter-BRAVOSelfTestSuite -Name 'ConfigLoader'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConfigLoader') {
+        Enter-BRAVOSelfTestSuite -Name 'ConfigLoader'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigLoader.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configuration Foundation (P0, PR A): canonical built-in raw defaults +
     # Merge-BRAVOConfiguration/ConvertTo-BRAVONestedOverride/
     # Resolve-BRAVORawConfiguration (modules/BRAVO.Configuration) — ще не
     # підключено до BRAVO_CONFIG_LOADER.ps1/BRAVO.config
     # (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
-    Enter-BRAVOSelfTestSuite -Name 'Configuration'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configuration.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Configuration') {
+        Enter-BRAVOSelfTestSuite -Name 'Configuration'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configuration.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configuration Foundation: AUTO/EXPLICIT намір -ConfigPath на межі
     # оператора + пропагація в runtime/child (регресія acceptance CF-17
     # та AUTO-intent класу дефектів root-entrypoint splat-ів).
-    Enter-BRAVOSelfTestSuite -Name 'ConfigIntent'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigIntent.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConfigIntent') {
+        Enter-BRAVOSelfTestSuite -Name 'ConfigIntent'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfigIntent.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configurator backend: Schema/Model/Effective/Validation/Persistence/
     # Credentials/Presets/Preview (docs/design/BRAVO_CONFIGURATOR_DESIGN.md).
-    Enter-BRAVOSelfTestSuite -Name 'Configurator'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Configurator') {
+        Enter-BRAVOSelfTestSuite -Name 'Configurator'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Configurator.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # Configurator UI: лише headless-тестовані pure-функції (coverage,
     # filters, search, category tree, boolean tri-state) — жодного
     # System.Windows.Forms-об'єкта в цьому фрагменті, ShowDialog() тут не
     # викликається.
-    Enter-BRAVOSelfTestSuite -Name 'ConfiguratorUI'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ConfiguratorUI') {
+        Enter-BRAVOSelfTestSuite -Name 'ConfiguratorUI'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ConfiguratorUI.ps1')
+    }
     # DiskSpace: спільний operation-aware класифікатор вільного місця/доступу
     # (fix/5.2.3-operation-aware-disk-space) — S1-S20, ізольовано від
     # Archive/Maintenance інтеграції.
-    Enter-BRAVOSelfTestSuite -Name 'DiskSpace'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DiskSpace.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'DiskSpace') {
+        Enter-BRAVOSelfTestSuite -Name 'DiskSpace'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.DiskSpace.ps1')
+    }
     # ArchiveDiskSpace: A1-A25, реальний виклик-сайт BRAVO_ARCHIV
     # (Resolve-BRAVOArchiveSpaceDecision) — на відміну від DiskSpace.ps1
     # вище, що тестує сам shared classifier ізольовано.
-    Enter-BRAVOSelfTestSuite -Name 'ArchiveDiskSpace'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ArchiveDiskSpace.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'ArchiveDiskSpace') {
+        Enter-BRAVOSelfTestSuite -Name 'ArchiveDiskSpace'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.ArchiveDiskSpace.ps1')
+    }
     # MaintenanceDiskSpace: M1-M11, реальний виклик-сайт BRAVO_MAINTENANCE
     # (Invoke-BRAVOMaintenanceDiskSpaceCheck).
-    Enter-BRAVOSelfTestSuite -Name 'MaintenanceDiskSpace'
-    . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1')
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'MaintenanceDiskSpace') {
+        Enter-BRAVOSelfTestSuite -Name 'MaintenanceDiskSpace'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.MaintenanceDiskSpace.ps1')
+    }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
 } catch {
     [void]$script:failures.Add($_.Exception.Message)
@@ -19673,6 +19852,154 @@ Test-BRAVOCondition `
             "фікстур: $(@($assertionFixtureLists).Count); помічників: " +
             "$([string]::Join(', ', @($assertionHelperNames))); бракує: " +
             "$([string]::Join(', ', @($assertionMissingHelpers.ToArray())))")
+}
+
+# ============================================================
+# #187 (фаза 2): вибірковий прогін suite-фрагментів.
+#
+# Найнебезпечніший спосіб зламати цю фічу — не помилка в предикаті, а те,
+# що вибірковий прогін колись почне виглядати як повний. Тому перевірки
+# нижче стережуть насамперед МЕЖУ режимів, а вже потім саму логіку.
+# ============================================================
+
+& {
+    $suiteOwnSource = Get-BRAVOSelfTestOwnSourceText
+
+    # Каталог — єдине джерело істини для -Suite. Якщо він розійдеться з
+    # фактичними сайтами підключення, -Suite почне мовчки не робити нічого
+    # для реального фрагмента або приймати ім'я, якого не існує.
+    $suiteGatedNames = @(
+        [regex]::Matches($suiteOwnSource, "(?m)^\s*if \(Test-BRAVOSelfTestSuiteEnabled -Name '([^']+)'\) \{") |
+            ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    $suiteCatalogSorted = @($script:BRAVOSelfTestSuiteCatalog | Sort-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition (
+            @($suiteGatedNames).Count -gt 0 -and
+            @($suiteGatedNames).Count -eq @($suiteCatalogSorted).Count -and
+            @(Compare-Object -ReferenceObject $suiteCatalogSorted -DifferenceObject $suiteGatedNames).Count -eq 0
+        ) `
+        -Name "Framework/SuiteCatalogMatchesGatedFragments" `
+        -Failure ("каталог -Suite мусить точно збігатися з переліком фрагментів, узятих під " +
+            "Test-BRAVOSelfTestSuiteEnabled; у каталозі $(@($suiteCatalogSorted).Count), " +
+            "під гейтом $(@($suiteGatedNames).Count)")
+
+    # Фрагмент, підключений повз гейт, ігнорував би -Suite — і прогін мовчки
+    # робив би більше, ніж просили.
+    $suiteFragmentDotSources = @(
+        [regex]::Matches($suiteOwnSource, "(?m)^\s*\. \(Join-Path \`$root 'selftest\\BRAVO_SELF_TEST\.([A-Za-z]+)\.ps1'\)") |
+            ForEach-Object { $_.Value })
+    $suiteGuardedDotSources = @(
+        [regex]::Matches($suiteOwnSource,
+            "(?m)^\s*if \(Test-BRAVOSelfTestSuiteEnabled -Name '[^']+'\) \{\r?\n\s*Enter-BRAVOSelfTestSuite -Name '[^']+'\r?\n\s*\. \(Join-Path \`$root 'selftest\\BRAVO_SELF_TEST\.[A-Za-z]+\.ps1'\)") |
+            ForEach-Object { $_.Value })
+    Test-BRAVOCondition `
+        -Condition (
+            @($suiteFragmentDotSources).Count -gt 0 -and
+            @($suiteFragmentDotSources).Count -eq @($suiteGuardedDotSources).Count
+        ) `
+        -Name "Framework/EverySuiteFragmentIsGated" `
+        -Failure ("кожне підключення suite-фрагмента мусить стояти під Test-BRAVOSelfTestSuiteEnabled; " +
+            "підключень $(@($suiteFragmentDotSources).Count), під гейтом $(@($suiteGuardedDotSources).Count)")
+
+    # Повний прогін — режим за замовчуванням. Саме цей прогін його і доводить:
+    # якби -Suite якось активувався без параметра, тут був би не $null.
+    Test-BRAVOCondition `
+        -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
+        -Name "Framework/FullCanonicalRunIsDefault" `
+        -Failure "без -Suite вибір фрагментів мусить лишатися невстановленим — інакше повний прогін перестав бути дефолтом"
+
+    $suiteAlwaysEnabled = @(
+        $script:BRAVOSelfTestSuiteCatalog |
+            Where-Object { -not (Test-BRAVOSelfTestSuiteEnabled -Name $_) })
+    Test-BRAVOCondition `
+        -Condition (@($suiteAlwaysEnabled).Count -eq 0) `
+        -Name "Framework/FullRunEnablesEverySuite" `
+        -Failure ("у повному прогоні кожен фрагмент каталогу мусить бути увімкнений; вимкнені: " +
+            [string]::Join(', ', @($suiteAlwaysEnabled)))
+
+    # КЛЮЧОВА властивість fail-closed: маркер релізу недосяжний з
+    # вибіркового прогону. RELEASE_CHECKLIST.md вимагає дослівний
+    # "SELF-TEST PASSED" як доказ повного прогону.
+    $suitePartialIndex = $suiteOwnSource.IndexOf('"SELF-TEST PARTIAL: "')
+    $suitePassedIndex = $suiteOwnSource.IndexOf('Write-Host "SELF-TEST PASSED" -ForegroundColor Green')
+    $suitePartialGuardIndex = $suiteOwnSource.IndexOf(
+        '} elseif ($null -ne $script:BRAVOSelfTestSelectedSuite) {')
+    Test-BRAVOCondition `
+        -Condition (
+            $suitePartialIndex -ge 0 -and $suitePassedIndex -ge 0 -and
+            $suitePartialGuardIndex -ge 0 -and
+            $suitePartialGuardIndex -lt $suitePartialIndex -and
+            $suitePartialIndex -lt $suitePassedIndex
+        ) `
+        -Name "Framework/SelectiveRunNeverPrintsReleaseMarker" `
+        -Failure ("вибірковий прогін мусить друкувати SELF-TEST PARTIAL у гілці, що стоїть ПЕРЕД " +
+            "гілкою SELF-TEST PASSED — інакше вибірковий прогін можна зарахувати як доказ релізу")
+
+    # CI не має права звужувати прогін: required check мусить лишатися повним.
+    $suiteCiWorkflowText = [IO.File]::ReadAllText(
+        (Join-Path $root '.github\workflows\ci.yml'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (-not [regex]::IsMatch($suiteCiWorkflowText, 'BRAVO_SELF_TEST\.ps1[^\r\n]*-Suite')) `
+        -Name "Framework/CiWorkflowNeverNarrowsSelfTest" `
+        -Failure "ci.yml не повинен передавати -Suite у BRAVO_SELF_TEST.ps1 — required check мусить лишатися повним канонічним прогоном"
+
+    # Невідоме ім'я зупиняє прогін і називає доступні: мовчки виконати не те,
+    # що просили, гірше, ніж не виконати нічого.
+    Test-BRAVOCondition `
+        -Condition (
+            $suiteOwnSource.Contains('throw ("Невідомий suite: "') -and
+            $suiteOwnSource.Contains('Доступні: ')
+        ) `
+        -Name "Framework/UnknownSuiteFailsClosed" `
+        -Failure "невідоме ім'я -Suite мусить зупиняти прогін з переліком доступних, а не мовчки нічого не виконувати"
+
+    # --- Предикат у вибірковому режимі ---------------------------------
+    # Стан відновлюється у finally: підсумок нижче читає ту саму змінну, і
+    # залишений вибір перетворив би повний прогін на "вибірковий" у звіті.
+    $suiteSelectionBefore = $script:BRAVOSelfTestSelectedSuite
+    try {
+        $script:BRAVOSelfTestSelectedSuite = @('Archive', 'Paths')
+        Test-BRAVOCondition `
+            -Condition (
+                (Test-BRAVOSelfTestSuiteEnabled -Name 'Archive') -and
+                (Test-BRAVOSelfTestSuiteEnabled -Name 'Paths') -and
+                -not (Test-BRAVOSelfTestSuiteEnabled -Name 'DataRestore')
+            ) `
+            -Name "Framework/SelectedSuitesRunAndOthersDoNot" `
+            -Failure "у вибірковому режимі мусять виконуватись рівно обрані фрагменти"
+    } finally {
+        $script:BRAVOSelfTestSelectedSuite = $suiteSelectionBefore
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -eq $script:BRAVOSelfTestSelectedSuite) `
+        -Name "Framework/SuiteSelectionProbeRestoresState" `
+        -Failure "проба предиката мусить відновити вибір фрагментів — інакше підсумок повного прогону назве себе вибірковим"
+
+    # --- Підказка "змінений файл -> suite" -----------------------------
+    Test-BRAVOCondition `
+        -Condition (
+            @(Get-BRAVOSelfTestSuiteForChangedPath -Path 'selftest\BRAVO_SELF_TEST.BazaSync.ps1') -contains 'BazaSync' -and
+            @(Get-BRAVOSelfTestSuiteForChangedPath -Path 'selftest/BRAVO_SELF_TEST.BazaSync.ps1') -contains 'BazaSync'
+        ) `
+        -Name "Framework/ChangedFragmentMapsToItsOwnSuite" `
+        -Failure "змінений фрагмент мусить відображатися на однойменний suite, незалежно від роздільника шляху"
+
+    Test-BRAVOCondition `
+        -Condition (@(Get-BRAVOSelfTestSuiteForChangedPath -Path 'modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psm1') -contains 'DiskSpace') `
+        -Name "Framework/ChangedModuleMapsToSuiteOfSameDomain" `
+        -Failure "доменний модуль мусить відображатися на suite з тим самим іменем домену, коли такий існує"
+
+    # Найважливіша властивість підказки: вона НЕ вгадує. Незнайомий шлях дає
+    # порожній результат, тобто "виконуй повний прогін", а не довільний suite.
+    $suiteHintUnknown = @(
+        @('BRAVO_ARCHIV.ps1', 'modules\BRAVO.Console\BRAVO.Console.psm1', 'README.md', '') |
+            ForEach-Object { @(Get-BRAVOSelfTestSuiteForChangedPath -Path $_) } |
+            Where-Object { $null -ne $_ })
+    Test-BRAVOCondition `
+        -Condition (@($suiteHintUnknown).Count -eq 0) `
+        -Name "Framework/ChangedPathHintNeverGuesses" `
+        -Failure ("для шляху без точної відповідності підказка мусить повертати порожньо (= повний прогін), " +
+            "а не вгадувати suite; повернуто: " + [string]::Join(', ', @($suiteHintUnknown)))
 }
 
 # ============================================================
