@@ -1488,4 +1488,30 @@ Test-BRAVOCondition `
         ) `
         -Name "Governance/ValidateOnlyDiscoveryBaselineGuardPatternIsMeaningful" `
         -Failure "перевірка вище не відрізняє захищений виклик від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
+
+    # Регресія на ГЛИБШИЙ P1-дефект того самого класу (незалежний Codex
+    # review PR #207, знайдений ПІСЛЯ фіксу вище): Import-
+    # BRAVODiscoveryBaseline сам може мігрувати legacy-baseline файл у
+    # canonical розташування (запис у $StateRoot) незалежно від
+    # -ConfirmDiscoveryBaseline — на самому лише виклику під час читання.
+    # Перевірка вище (Save-BRAVODiscoveryBaseline guard) цей шлях не
+    # покриває: Codex явно вказав, що "the new regex test also misses
+    # this path". -ReadOnly:$ValidateOnly у виклику нижче — фікс.
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptText -match '(?s)Import-BRAVODiscoveryBaseline\s*`\s*\r?\n\s*-StateRoot\s+\$global:stateRoot\s*`\s*\r?\n\s*-RuntimeRoot\s+\$PSScriptRoot\s*`\s*\r?\n\s*-ReadOnly:\$ValidateOnly'
+        ) `
+        -Name "Governance/ValidateOnlyNeverPersistsMigratedDiscoveryBaseline" `
+        -Failure "виклик Import-BRAVODiscoveryBaseline у BRAVO_SETUP.ps1 мусить передавати -ReadOnly:`$ValidateOnly — інакше legacy->canonical міграція baseline записує стан машини навіть під -ValidateOnly"
+
+    # Негативний контроль для перевірки вище.
+    $setupScriptImportRegressionShape = $setupScriptText -replace `
+        '-ReadOnly:\$ValidateOnly', `
+        ''
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptImportRegressionShape -notmatch '(?s)Import-BRAVODiscoveryBaseline\s*`\s*\r?\n\s*-StateRoot\s+\$global:stateRoot\s*`\s*\r?\n\s*-RuntimeRoot\s+\$PSScriptRoot\s*`\s*\r?\n\s*-ReadOnly:\$ValidateOnly'
+        ) `
+        -Name "Governance/ValidateOnlyMigratedDiscoveryBaselineGuardPatternIsMeaningful" `
+        -Failure "перевірка вище не відрізняє захищений виклик Import-BRAVODiscoveryBaseline від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
 }
