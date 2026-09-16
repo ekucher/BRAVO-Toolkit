@@ -2,6 +2,22 @@
 
 ## Не випущено (developer)
 
+- **Аналіз долі тега `v5.3.0-rc.1`** — новий документ
+  `docs/BRAVO_530_RC1_TAG_DISPOSITION.md`. Тег `v5.3.0-rc.1` — коректний
+  запис кандидата, який не проходив приймання (цикл 5.3.0 свідомо
+  повернуто в development, `RELEASE_POLICY.md` §20); з ним не треба
+  робити нічого, наступний кандидат — `rc.2`.
+
+  **Дрейф навколо тега — потребує дій.** Аналіз зафіксував чотири знахідки, з
+  них головна: `releaseDate` у `VERSION.json` гілки `developer`
+  заморожено на `2026-08-26` — даті штампу `rc.1` — і воно проходить
+  через `BRAVO_CONFIG_LOADER.ps1` у `ScriptDate` та через
+  `ci/New-BRAVOReleaseArtifact.ps1` у `release-manifest.json` кожного
+  артефакту. Жоден скрипт `ci/` це поле не записує і не звіряє.
+
+  Документ лише читання: жодної дії над тегами, релізами чи
+  `VERSION.json` за ним не виконано.
+
 - **Parity harness конфігурації виконується автоматично** — новий workflow
   `.github/workflows/config-parity.yml` запускає
   `ci\Test-BRAVOConfigFoundationParity.ps1` для PR, що торкаються
