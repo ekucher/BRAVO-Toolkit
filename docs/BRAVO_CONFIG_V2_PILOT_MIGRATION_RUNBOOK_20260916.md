@@ -112,7 +112,16 @@ primary-шар.
 
 ```powershell
 if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
-    Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$Ev\BRAVO.local.config.backup" -ErrorAction Stop
+    # Копія публікується під фінальним іменем ЛИШЕ після перевірки хешу.
+    # Обірвана копія (диск заповнився, збій ФС) під фінальним іменем
+    # виглядала б для відкату готовою резервною копією — і відкат
+    # перезаписав би нею справний файл.
+    Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$Ev\BRAVO.local.config.partial" -ErrorAction Stop
+    if ((Get-FileHash -LiteralPath "$Ev\BRAVO.local.config.partial" -Algorithm SHA256).Hash -ne
+        (Get-FileHash -LiteralPath "$Kit\BRAVO.local.config" -Algorithm SHA256).Hash) {
+        throw 'Резервна копія BRAVO.local.config не збігається з оригіналом — зупиніться.'
+    }
+    Rename-Item -LiteralPath "$Ev\BRAVO.local.config.partial" -NewName 'BRAVO.local.config.backup' -ErrorAction Stop
 } else {
     # Файла не було: позначаємо це, щоб відкат знав, що його треба ВИДАЛИТИ,
     # а не відновлювати.
@@ -188,7 +197,16 @@ if ($hasLocalBackup -eq $hasLocalAbsent) {
 Спочатку — резервна копія **поза** каталогом комплекту:
 
 ```powershell
-Copy-Item -LiteralPath "$Kit\BRAVO.config" -Destination "$Ev\BRAVO.config.backup" -ErrorAction Stop
+# Та сама атомарна публікація, що й для site-файла: фінальне ім'я
+# з'являється лише після звірки хешу. Інакше обірвана копія стала б для
+# відкату «готовим бекапом», яким він перезаписав би справний оригінал.
+Copy-Item -LiteralPath "$Kit\BRAVO.config" -Destination "$Ev\BRAVO.config.partial" -ErrorAction Stop
+if ((Get-FileHash -LiteralPath "$Ev\BRAVO.config.partial" -Algorithm SHA256).Hash -ne
+    (Get-FileHash -LiteralPath "$Kit\BRAVO.config" -Algorithm SHA256).Hash) {
+    throw 'Резервна копія BRAVO.config не збігається з оригіналом — НЕ видаляйте оригінал.'
+}
+Rename-Item -LiteralPath "$Ev\BRAVO.config.partial" -NewName 'BRAVO.config.backup' -ErrorAction Stop
+
 Remove-Item -LiteralPath "$Kit\BRAVO.config" -ErrorAction Stop
 if (Test-Path -LiteralPath "$Kit\BRAVO.config") {
     throw 'BRAVO.config усе ще на місці — знімок C знімати НЕ МОЖНА.'
