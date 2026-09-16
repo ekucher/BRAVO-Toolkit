@@ -1661,7 +1661,17 @@ function Import-BRAVODiscoveryBaseline {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$StateRoot,
-        [Parameter(Mandatory = $true)][string]$RuntimeRoot
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+
+        # Configuration v2 Pilot Preparation (незалежний review PR #207,
+        # 2026-09-16): legacy->canonical міграція нижче пише файл у
+        # $StateRoot незалежно від виклику — раніше BRAVO_SETUP.ps1
+        # -ValidateOnly викликав цю функцію без жодного способу
+        # придушити той запис, тобто -ValidateOnly фактично мутував стан
+        # машини на хостах з ще не мігрованим legacy baseline. За
+        # замовчуванням $false — існуючі виклики (BRAVO.Archive.Runtime,
+        # BRAVO_SELF_TEST.ps1) поведінки не змінюють.
+        [switch]$ReadOnly
     )
 
     $canonicalPath = Get-BRAVODiscoveryBaselinePath -StateRoot $StateRoot
@@ -1695,6 +1705,21 @@ function Import-BRAVODiscoveryBaseline {
                 "$($_.Exception.Message). Міграцію не виконано, файл не змінено.")
             return [pscustomobject]@{
                 Baseline = $null; Source = 'Unreadable'; Path = $canonicalPath
+                LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
+            }
+        }
+
+        if ($ReadOnly) {
+            # -ReadOnly: показуємо викликачу, що міграція ВІДБУЛАСЬ БИ
+            # (Source лишається 'MigratedFromLegacy'), але нічого не
+            # записуємо. Path навмисно $legacyPath, а не $canonicalPath —
+            # canonical-файл не створено, і повертати його шлях видало б
+            # запис за такий, що вже стався.
+            $problems.Add(
+                "Baseline у старому розташуванні '$legacyPath' МІГРУВАВ БИ в '$canonicalPath' " +
+                "на реальному запуску (без -ValidateOnly) — зараз нічого не записано.")
+            return [pscustomobject]@{
+                Baseline = $legacyBaseline; Source = 'MigratedFromLegacy'; Path = $legacyPath
                 LegacyPath = $legacyPath; Migrated = $false; Problems = $problems.ToArray()
             }
         }

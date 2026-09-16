@@ -483,9 +483,17 @@ try {
         # наявний файл зі старого розташування (сервери, що працюють давно,
         # мають його саме там) і НІКОЛИ не відкочується мовчки на «перший
         # запуск», якщо canonical пошкоджений.
+        # -ReadOnly:$ValidateOnly (незалежний review PR #207): без цього
+        # legacy->canonical міграція baseline всередині Import-
+        # BRAVODiscoveryBaseline записувала б файл у стан машини навіть
+        # під -ValidateOnly — єдиний реальний виняток із контракту
+        # "жодних записів під ValidateOnly", ширший за раніше знайдений
+        # -ConfirmDiscoveryBaseline (цей спрацьовує БЕЗ будь-якого
+        # додаткового прапорця, на самому лише читанні).
         $discoveryBaselineImport = Import-BRAVODiscoveryBaseline `
             -StateRoot $global:stateRoot `
-            -RuntimeRoot $PSScriptRoot
+            -RuntimeRoot $PSScriptRoot `
+            -ReadOnly:$ValidateOnly
         $discoveryBaselinePath = [string]$discoveryBaselineImport.Path
         foreach ($baselineProblem in @($discoveryBaselineImport.Problems)) {
             Write-Host "УВАГА: $baselineProblem" -ForegroundColor Yellow
@@ -521,11 +529,21 @@ try {
             Write-Host "Baseline discovery ще не збережено (перший запуск або ще не підтверджено)."
         }
 
-        if ($ConfirmDiscoveryBaseline) {
+        if ($ConfirmDiscoveryBaseline -and -not $ValidateOnly) {
             Save-BRAVODiscoveryBaseline `
                 -DiscoveryResult $bravoDiscoveryResult `
                 -BaselinePath $discoveryBaselinePath
             Write-Host "Discovery baseline підтверджено й збережено: $discoveryBaselinePath" -ForegroundColor Green
+        } elseif ($ConfirmDiscoveryBaseline -and $ValidateOnly) {
+            # Configuration v2 Pilot Preparation (незалежний аудит,
+            # 2026-09-16): -ValidateOnly мусить лишатись цілком read-only.
+            # Без цієї гілки -ValidateOnly -ConfirmDiscoveryBaseline разом
+            # persisted би $discoveryBaselinePath попри ValidateOnly —
+            # єдиний знайдений виняток із контракту "жодних записів під
+            # ValidateOnly". Drift-прев'ю нижче й далі коректно рахує "як
+            # би виглядало дрейф після підтвердження" від $ConfirmDiscoveryBaseline
+            # незалежно від того, чи файл справді записаний.
+            Write-Host "[ПЕРЕВІРКА] Discovery baseline НЕ записується під -ValidateOnly (файл лишається незмінним): $discoveryBaselinePath" -ForegroundColor Yellow
         }
 
         if ($ValidateOnly) {
