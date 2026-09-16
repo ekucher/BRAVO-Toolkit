@@ -212,8 +212,15 @@ if ($localBackup -eq $localAbsent) {
 Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
 
 if ($localAbsent) {
-    # Файла до пілота не було -> прибираємо створений нами.
-    Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
+    # Файла до пілота не було -> прибираємо створений нами. Але його може
+    # й не бути: якщо звірка на кроці 2 не відібрала жодного значення,
+    # site-файл не створювався взагалі (BRAVO.config лише дублював
+    # дефолти). Відсутність тут — ВЖЕ потрібний стан, а не помилка; без
+    # Test-Path відкат упав би саме на цьому рядку, після відновлення
+    # primary-шару й ДО контрольного знімка.
+    if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
+        Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
+    }
 } else {
     Copy-Item -LiteralPath "$Ev\BRAVO.local.config.backup" -Destination "$Kit\BRAVO.local.config" -Force -ErrorAction Stop
 }
