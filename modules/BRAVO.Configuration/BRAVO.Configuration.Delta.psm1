@@ -30,15 +30,30 @@ function Test-BRAVOConfigurationValueEquality {
     if ($null -eq $Left -and $null -eq $Right) { return $true }
     if ($null -eq $Left -or $null -eq $Right) { return $false }
 
-    # Словник, що НЕ є [hashtable] (наприклад [ordered]), сюди дійти не
-    # мав би: вузли-hashtable розкриває сам Compare-BRAVOConfigurationGraph.
-    # Якщо дійшов — порівнювати його як колекцію не можна: перелічення
-    # словника дає DictionaryEntry, і -eq порівняв би ПОСИЛАННЯ, мовчки
-    # оголосивши різні словники рівними/нерівними навмання. Звітуємо про
-    # відмінність: інструмент дельти покаже такий шлях оператору, замість
-    # тихо його загубити.
+    # Словник як ЛИСТОВЕ значення (а не вузол графа, який структурно
+    # розкриває сам Compare-BRAVOConfigurationGraph) дійти сюди МОЖЕ:
+    # масив-елементи (наприклад archiveDefinitions, bazaSyncEffective.
+    # Components) самі є hashtable, і рекурсія масиву нижче передає їх
+    # сюди по одному. Порівнювати такий словник через -eq не можна
+    # (перелічення дає DictionaryEntry, -eq порівняв би ПОСИЛАННЯ) — тому
+    # порівнюємо структурно (ключі + рекурсивно значення), а не
+    # оголошуємо "не рівні" безумовно: інакше БУДЬ-ЯКИЙ масив об'єктів
+    # завжди звітував би про зміну, навіть за повністю ідентичного
+    # вмісту (знайдено при першому реальному прогоні pilot-артефакту
+    # Configuration v2 на знімку з непорожнім archiveDefinitions/
+    # bazaSyncEffective.Components — #154, крок 2).
     if (($Left -is [System.Collections.IDictionary]) -or ($Right -is [System.Collections.IDictionary])) {
-        return $false
+        if (-not (($Left -is [System.Collections.IDictionary]) -and ($Right -is [System.Collections.IDictionary]))) {
+            return $false
+        }
+        $leftKeys = @($Left.Keys)
+        $rightKeys = @($Right.Keys)
+        if ($leftKeys.Count -ne $rightKeys.Count) { return $false }
+        foreach ($key in $leftKeys) {
+            if (-not $Right.Contains($key)) { return $false }
+            if (-not (Test-BRAVOConfigurationValueEquality -Left $Left[$key] -Right $Right[$key])) { return $false }
+        }
+        return $true
     }
 
     $leftIsCollection = ($Left -is [System.Collections.IEnumerable]) -and ($Left -isnot [string])

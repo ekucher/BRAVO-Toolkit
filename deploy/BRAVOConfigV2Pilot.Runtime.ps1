@@ -720,7 +720,14 @@ function New-BRAVOPilotBackup {
     )
 
     $stampUtc = [DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss')
-    $backupDir = Join-Path $EvidenceDir "backup-$stampUtc"
+    # Суфікс GUID — захист від колізії каталогу, якщо цю функцію викликано
+    # двічі в межах тієї самої секунди (секундна точність timestamp);
+    # без цього другий виклик дописав би файли в каталог першого backup і
+    # зіпсував би вже записаний backup-manifest.json.
+    $backupDir = Join-Path $EvidenceDir ("backup-{0}-{1}" -f $stampUtc, ([Guid]::NewGuid().ToString('N').Substring(0, 8)))
+    if (Test-Path -LiteralPath $backupDir) {
+        throw "PILOT_BACKUP_FAILED: каталог backup '$backupDir' уже існує — повторіть операцію."
+    }
     [void](New-Item -ItemType Directory -Path $backupDir -Force)
 
     $bravoConfigPath = Join-Path $InstallRoot 'BRAVO.config'
@@ -914,7 +921,10 @@ function Invoke-BRAVOPilotHealthCheck {
     $result = Invoke-BRAVOPilotHealthSnapshot -InstallRoot $InstallRoot -OutputPath $OutputPath
     $newDegradations = @()
     if ($null -ne $BeforeLines) {
-        $newDegradations = Get-BRAVOPilotHealthDegradationLines -BeforeLines $BeforeLines -AfterLines $result.Lines
+        # @(...) обов'язковий: порожній масив, повернений через `return`,
+        # PowerShell розгортає в $null — без обгортки .Count нижче впав би
+        # під Set-StrictMode ("The property 'Count' cannot be found").
+        $newDegradations = @(Get-BRAVOPilotHealthDegradationLines -BeforeLines $BeforeLines -AfterLines $result.Lines)
     }
     $pass = ($newDegradations.Count -eq 0)
     return [pscustomobject]@{ ExitCode = $result.ExitCode; Pass = $pass; NewDegradations = $newDegradations; Path = $OutputPath }

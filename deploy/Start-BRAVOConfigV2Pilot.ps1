@@ -163,6 +163,22 @@ try {
             $candidatePath = [string]$state.CandidatePath
             $approvedHash = [string]$state.CandidateHash
 
+            # Ідемпотентний повторний -Activate: якщо на сервері вже діє
+            # BRAVO.local.config з тим самим SHA-256, що й candidate, — це
+            # чистий no-op, і НОВИЙ backup створювати не можна. Інакше
+            # повторний виклик у ту саму секунду (yyyyMMdd-HHmmss) міг би
+            # вдруге записати той самий backup-каталог і пошкодити
+            # backup-manifest.json (self-referential hash mismatch), а
+            # головне — підмінити BackupDir у стані на backup ВЖЕ
+            # активованого стану замість справжнього pre-activation backup,
+            # яким має користуватись -Rollback.
+            if ((Test-Path -LiteralPath (Join-Path $EvidenceDir 'activation.json') -PathType Leaf) -and
+                (Test-BRAVOPilotActivationIsNoOp -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath)) {
+                Write-Host "[SUCCESS] Активація — no-op: BRAVO.local.config на сервері вже мав такий самий SHA-256. Backup не дублюється."
+                Write-Host "Наступний крок: -Validate -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`""
+                exit 0
+            }
+
             $backup = New-BRAVOPilotBackup -InstallRoot $resolvedInstallRoot -EvidenceDir $EvidenceDir
             Test-BRAVOPilotBackupIntegrity -BackupDir $backup.BackupDir | Out-Null
             Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'BackupCreated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
