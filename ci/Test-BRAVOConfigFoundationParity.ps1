@@ -78,37 +78,23 @@ param(
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-# ===== Список $global:-імен, які захоплюємо (повний перелік, зібраний з
-# BRAVO_CONFIG_LOADER.ps1 + BRAVO.config обох версій — grep
-# '\$global:[A-Za-z_]+' по обох файлах) =====
-$capturedNames = @(
-    'BravoConfigurationMetadata', 'BravoLocalConfigOverrideState',
-    'ScriptVersion', 'ScriptDate', 'ScriptBuildId',
-    'archivePrefix', 'backupConsistency', 'backupMonitoring', 'bravoSettings',
-    'componentSettings', 'credentialSettings', 'discoverySettings',
-    'maintenanceSettings', 'pathSettings', 'restoreVerifySettings',
-    'runtimeRoot', 'schedulerSettings', 'sftpDirectories', 'storageEffective',
-    'toolIntegritySettings', 'LogLevel', 'archiveFileFilter', 'archiveParams',
-    'archiveRetentionDays', 'archiveTimestampFormat', 'consoleSettings',
-    'defaultLogLevel', 'durationFormat', 'elevationSettings',
-    'enableArchiveDeletion', 'enableFailedArchiveDeletion',
-    'enableLunchArchiveCleanup', 'enableOrphanTempCleanup',
-    'failedArchiveRetentionDays', 'hashFileEncoding', 'hashFileExtension',
-    'hashFileFilter', 'hostInformationSettings', 'logColors',
-    'logFileDateFormat', 'logFileEncoding', 'logFileFilter',
-    'logFileNameTemplate', 'logLevels', 'logRetentionDays',
-    'logSeparatorLength', 'logTimestampFormat',
-    'lunchArchiveCleanupDirectories', 'lunchArchiveCleanupPath',
-    'lunchArchiveRetentionMonths', 'minimumRetainedVerifiedBackups',
-    'operationLockSettings', 'orphanTempRetentionHours', 'progressSettings',
-    'requireAdministrator', 'robocopyMaxSuccessExitCode', 'robocopyOptions',
-    'robocopyPath', 'robocopyWindowStyle', 'sftpConnectionTimeoutSeconds',
-    'sftpHostKey', 'sftpHostTemplate', 'sftpPort',
-    'sftpSynchronizationOptions', 'smbSettings', 'synchronizationSafety',
-    'winSCPIniPath', 'winSCPScriptEncoding', 'effectiveLimsRoot',
-    'systemLogRoot', 'backupRootPath', 'archiveDefinitions', 'archiveDirs',
-    'bazaAppPaths', 'bazaWWWPaths', 'sourcePaths', 'bazaSyncEffective'
-)
+# ===== Список $global:-імен, які захоплюємо =====
+#
+# Перелік БІЛЬШЕ НЕ ЖИВЕ ТУТ. Він переїхав у канонічного власника —
+# modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psm1 — бо
+# з'явився другий споживач: доказ pilot migration на сервері, де цей
+# git-залежний harness не запускається. Дві копії переліку означали б,
+# що доказ міграції й доказ паритету мовчки дивляться на різні графи.
+#
+# Модуль береться з AFTER-дерева (поточний working tree). Для BEFORE-боку
+# це коректно саме тому, що перелік ІМЕН — це питання "що взагалі
+# вважається ефективною конфігурацією", спільне для обох боків; самі
+# ЗНАЧЕННЯ кожен бік обчислює своїм власним лоадером.
+Import-Module -Name (Join-Path $AfterRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psd1') -Force -ErrorAction Stop
+$capturedNames = @(Get-BRAVOEffectiveConfigurationVariableName)
+if ($capturedNames.Count -eq 0) {
+    throw 'Get-BRAVOEffectiveConfigurationVariableName повернув порожній перелік — порівнювати не було б чого, і harness звітував би PASS ні про що.'
+}
 
 # ===== Широкий BRAVO.local.config, що покриває всі домени з Task #10 =====
 $localConfigLiteral = @'
@@ -189,6 +175,15 @@ $localConfigLiteral = @'
 
 # ===== Дочірній-процес шаблон: dot-source власного лоадера версії,
 # Import-BravoConfiguration -PassThru, JSON-знімок =====
+#
+# Сама МЕХАНІКА зчитування (Get-Variable -Scope Global + маркер
+# '<<ABSENT>>') тут СВІДОМО дублює
+# Get-BRAVOEffectiveConfigurationSnapshot, і конвергенція була б
+# НЕКОРЕКТНОЮ: BEFORE-бік виконується в дереві $BaseRef, де цього модуля
+# ще не існує. Імпортувати модуль з AFTER-дерева в BEFORE-захоплення
+# означало б внести код "після" в знімок "до" — тобто знецінити сам
+# characterization-тест. Спільним лишається тільки перелік ІМЕН, який
+# параметризується ззовні (__CAPTURED_NAMES_LITERAL__).
 $captureChildTemplate = @'
 param(
     [Parameter(Mandatory = $true)][string]$RuntimeRoot,

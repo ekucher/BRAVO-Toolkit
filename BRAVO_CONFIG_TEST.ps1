@@ -3,7 +3,17 @@
 [CmdletBinding()]
 param(
     [string]$ConfigPath,
-    [switch]$AsJson
+    [switch]$AsJson,
+
+    # ПОВНИЙ ефективний граф замість вибірки коренів (#154).
+    #
+    # Звичайний вивід показує корені й режим завантаження — цього
+    # достатньо для щоденної перевірки, але НЕ достатньо як доказ
+    # міграції site-значень у BRAVO.local.config: "ефективні значення не
+    # змінились" — твердження про ВЕСЬ граф. Перелік полів канонічний
+    # (BRAVO.Configuration.Snapshot), тому доказ на сервері й доказ
+    # паритету в CI дивляться на один і той самий граф.
+    [switch]$FullGraph
 )
 
 Set-StrictMode -Version 2.0
@@ -68,6 +78,19 @@ $validation = [pscustomobject]@{
     StateRoot = [string]$global:stateRoot
     OperationLockPath = [string]$global:operationLockSettings.Path
     LoadedAt = $result.Configuration.LoadedAt
+}
+
+if ($FullGraph) {
+    Import-Module -Name (Join-Path $scriptRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psd1') -Force -ErrorAction Stop
+    # Глибина 15 — та сама, що в parity harness: менша тихо обрізала б
+    # вкладені блоки (componentSettings, archiveDefinitions) до рядка
+    # "System.Collections.Hashtable", і два різні графи виглядали б
+    # однаково.
+    [pscustomobject]@{
+        Validation = $validation
+        EffectiveGraph = (Get-BRAVOEffectiveConfigurationSnapshot)
+    } | ConvertTo-Json -Depth 15
+    exit 0
 }
 
 if ($AsJson) {

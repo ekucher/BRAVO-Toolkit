@@ -30,7 +30,7 @@
             [string]$secondLoad.bravoSettings.InstitutionName -eq 'УСТАНОВА'
         ) `
         -Name "Configuration/NoCrossLoadLeakage" `
-        -Failure "мутація об'єкта, поверненого одним викликом Get-BRAVODefaultConfiguration, не повинна впливати на наступний виклик (spільний mutable reference)"
+        -Failure "мутація об'єкта, поверненого одним викликом Get-BRAVODefaultConfiguration, не повинна впливати на наступний виклик (спільний mutable reference)"
 
     # --- Merge: hashtable рекурсія зберігає sibling-поля ---
     $mergeBase = @{ scheduler = @{ Backup = @{ Enabled = $true; DailyAt = '23:00' } } }
@@ -1580,4 +1580,73 @@
         ) `
         -Name "ConfigVersion/WrittenMarkerRoundTrips" `
         -Failure "записаний комплектом маркер мусить читатись назад як версія $($versionContract.CurrentVersion) без зайвих ключів; effective=$($versionRoundTrip.EffectiveVersion) ключів=$(@($versionRoundTrip.Overrides.Keys) -join ', ')"
+
+    # =====================================================================
+    # BRAVO.Configuration.Snapshot — знімок ефективної конфігурації (#154)
+    # =====================================================================
+    # Окремий child scope (& { ... }) з тієї самої причини, що й у секції
+    # Delta вище: спільний $MaximumVariableCount на всі фрагменти.
+    & {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psd1') -Force
+
+        # --- Snapshot/VariableNameListIsUsable ---
+        # Перелік — єдине джерело істини для ДВОХ доказів (паритет у CI і
+        # міграція на сервері). Порожній або з дублікатами він знецінив би
+        # обидва: порожній дав би "відмінностей немає" ні про що, дублікат
+        # мовчки перезаписав би ключ у знімку.
+        $snapshotNames = @(Get-BRAVOEffectiveConfigurationVariableName)
+        $snapshotUnique = @($snapshotNames | Sort-Object -Unique)
+        Test-BRAVOCondition `
+            -Condition ($snapshotNames.Count -gt 0 -and $snapshotUnique.Count -eq $snapshotNames.Count) `
+            -Name "Snapshot/VariableNameListIsUsable" `
+            -Failure "канонічний перелік імен ефективної конфігурації має бути непорожнім і без дублікатів; усього=$($snapshotNames.Count) унікальних=$($snapshotUnique.Count)"
+
+        # --- Snapshot/AbsentIsDistinguishableFromNull ---
+        # $null є ЛЕГАЛЬНИМ значенням конфігурації. Якби відсутнє поле теж
+        # давало $null, доказ міграції не відрізнив би "поля не стало" від
+        # "поле дорівнює $null" — і зникнення значення пройшло б як PASS.
+        $snapshotNullName = 'BRAVOSelfTestSnapshotNullProbe'
+        $snapshotMissingName = 'BRAVOSelfTestSnapshotMissingProbe'
+        try {
+            Set-Variable -Name $snapshotNullName -Scope Global -Value $null
+            $snapshotProbe = Get-BRAVOEffectiveConfigurationSnapshot -VariableName @($snapshotNullName, $snapshotMissingName)
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $snapshotProbe[$snapshotNullName] -and
+                    [string]$snapshotProbe[$snapshotMissingName] -eq '<<ABSENT>>'
+                ) `
+                -Name "Snapshot/AbsentIsDistinguishableFromNull" `
+                -Failure "відсутня змінна має давати маркер '<<ABSENT>>', а наявна зі значенням `$null — саме `$null; отримано null-проба='$($snapshotProbe[$snapshotNullName])' missing-проба='$($snapshotProbe[$snapshotMissingName])'"
+        } finally {
+            Remove-Variable -Name $snapshotNullName -Scope Global -ErrorAction SilentlyContinue
+        }
+
+        # --- Snapshot/PreservesRequestedOrder ---
+        # Порядок ключів визначає порядок рядків у файлі доказу, який
+        # оператор порівнює побайтово. Хеш-таблиця без [ordered] дала б
+        # різний порядок між прогонами й зробила б порівняння неможливим.
+        $snapshotOrderNames = @('zzzSnapshotProbeC', 'aaaSnapshotProbeA', 'mmmSnapshotProbeB')
+        $snapshotOrdered = Get-BRAVOEffectiveConfigurationSnapshot -VariableName $snapshotOrderNames
+        $snapshotOrderedKeys = @($snapshotOrdered.Keys)
+        Test-BRAVOCondition `
+            -Condition ([string]::Join(',', $snapshotOrderedKeys) -ceq [string]::Join(',', $snapshotOrderNames)) `
+            -Name "Snapshot/PreservesRequestedOrder" `
+            -Failure "знімок має зберігати порядок запитаних імен; запитано=[$([string]::Join(',', $snapshotOrderNames))] отримано=[$([string]::Join(',', $snapshotOrderedKeys))]"
+
+        # --- Snapshot/ParityHarnessUsesCanonicalList ---
+        # Governance: перелік переїхав із ci\Test-BRAVOConfigFoundationParity.ps1
+        # у модуль саме тому, що споживачів стало двоє. Повернення літерала
+        # в harness відновило б дві копії — і доказ паритету в CI почав би
+        # мовчки дивитись на інший граф, ніж доказ міграції на сервері.
+        $snapshotHarnessPath = Join-Path $root 'ci\Test-BRAVOConfigFoundationParity.ps1'
+        $snapshotHarnessText = [IO.File]::ReadAllText($snapshotHarnessPath, [Text.Encoding]::UTF8)
+        $snapshotHarnessCallsCanonical = $snapshotHarnessText.Contains('Get-BRAVOEffectiveConfigurationVariableName')
+        # Літеральний перелік розпізнається за присвоєнням $capturedNames
+        # масиву, що ПОЧИНАЄТЬСЯ з рядка в лапках.
+        $snapshotHarnessHasLiteralList = [regex]::IsMatch($snapshotHarnessText, '\$capturedNames\s*=\s*@\(\s*[\r\n]*\s*[''"]')
+        Test-BRAVOCondition `
+            -Condition ($snapshotHarnessCallsCanonical -and -not $snapshotHarnessHasLiteralList) `
+            -Name "Snapshot/ParityHarnessUsesCanonicalList" `
+            -Failure "ci\Test-BRAVOConfigFoundationParity.ps1 має брати перелік імен з Get-BRAVOEffectiveConfigurationVariableName і не тримати власного літерального переліку; викликає=$snapshotHarnessCallsCanonical літерал=$snapshotHarnessHasLiteralList"
+    }
 }
