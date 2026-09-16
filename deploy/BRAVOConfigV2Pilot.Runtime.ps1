@@ -813,15 +813,21 @@ function Invoke-BRAVOPilotAtomicActivation {
 
     Test-BRAVOPilotCandidateSyntax -CandidatePath $CandidatePath | Out-Null
 
-    if (Test-BRAVOPilotActivationIsNoOp -InstallRoot $InstallRoot -CandidatePath $CandidatePath) {
-        return [pscustomobject]@{ Activated = $true; NoOp = $true; TargetPath = (Join-Path $InstallRoot 'BRAVO.local.config') }
-    }
-
     $targetPath = Join-Path $InstallRoot 'BRAVO.local.config'
     $tempPath = "$targetPath.pilot-candidate-$([Guid]::NewGuid().ToString('N')).tmp"
-    Copy-Item -LiteralPath $CandidatePath -Destination $tempPath -ErrorAction Stop
 
+    # Уся решта — від перевірки no-op (яка сама читає $targetPath і тому
+    # теж може впасти на заблокованому файлі) до атомарної заміни — під
+    # ОДНИМ try/catch: викликачу потрібен однаковий діагностований
+    # PILOT_ACTIVATION_FAILED незалежно від того, на якому саме кроці
+    # процес, що тримає файл відкритим, завадив активації.
     try {
+        if (Test-BRAVOPilotActivationIsNoOp -InstallRoot $InstallRoot -CandidatePath $CandidatePath) {
+            return [pscustomobject]@{ Activated = $true; NoOp = $true; TargetPath = $targetPath }
+        }
+
+        Copy-Item -LiteralPath $CandidatePath -Destination $tempPath -ErrorAction Stop
+
         if (Test-Path -LiteralPath $targetPath -PathType Leaf) {
             $replaceBackupPath = "$targetPath.pilot-replace-backup.tmp"
             if (Test-Path -LiteralPath $replaceBackupPath) { Remove-Item -LiteralPath $replaceBackupPath -Force -ErrorAction Stop }
@@ -832,7 +838,7 @@ function Invoke-BRAVOPilotAtomicActivation {
         }
     } catch {
         if (Test-Path -LiteralPath $tempPath) { Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue }
-        throw "PILOT_ACTIVATION_FAILED: атомарна заміна '$targetPath' провалилась: $($_.Exception.Message). Оригінальний файл лишається незмінним (File.Replace/Move — atomic on NTFS)."
+        throw "PILOT_ACTIVATION_FAILED: активація '$targetPath' провалилась: $($_.Exception.Message). Оригінальний файл лишається незмінним (File.Replace/Move — atomic on NTFS)."
     }
 
     $finalHash = Get-BRAVOPilotFileHash -Path $targetPath

@@ -303,6 +303,14 @@ try {
     $rbValidateOutput = & $startScript -Validate -InstallRoot $rollbackInstallRoot -EvidenceDir $rbEvidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Rollback/ValidateFailsOnInjectedSelfTestFailure' -Condition ($LASTEXITCODE -ne 0) -FailureDetail ([string]::Join(' | ', @($rbValidateOutput | Select-Object -Last 10)))
 
+    # Скидаємо ін'єктовану поломку ПЕРЕД -Rollback: SelfTest.ExitCode=1 мав
+    # лише провалити -Validate (щоб дати підставу для відкату). Rollback
+    # сам по собі ПОВТОРНО запускає BRAVO_SELF_TEST.ps1 як post-restore
+    # доказ, і на реальному сервері після відкату self-test знову проходить
+    # — інакше ROLLBACK INCOMPLETE тут був би НЕ хибним спрацюванням
+    # orchestrator-а, а коректним fail-closed результатом на зіпсованому
+    # тестовому фікстурі.
+    Set-BRAVOPilotStubBehavior -InstallRoot $rollbackInstallRoot -Behavior @{}
     $rbRollbackOutput = & $startScript -Rollback -InstallRoot $rollbackInstallRoot -EvidenceDir $rbEvidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Rollback/CommandSucceeds' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($rbRollbackOutput | Select-Object -Last 15)))
 
