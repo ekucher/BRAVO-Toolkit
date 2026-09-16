@@ -555,8 +555,29 @@
     # подвійних лапок — це літерал у тексті про код (наприклад у
     # -Failure іншого guard-а), а не звернення до змінної. Без цього
     # шаблон рахував два таких описи як живі залежності.
+    #
+    # ІМ'Я ФАЙЛУ звіряється РЕГІСТРОНЕЗАЛЕЖНО: цільова ФС регістру не
+    # розрізняє, тож Join-Path $root 'bravo.config' читається успішно, а
+    # статичні перевантаження [regex]::Matches/IsMatch за замовчуванням
+    # регістрочутливі — без (?i:...) guard звітував би PASS при живій
+    # прямій залежності.
+    #
+    # Ціна — обов'язкова МЕЖА імені файлу: без неї "BRAVO.config" збігся б
+    # усередині "BRAVO.Configuration" (modules\BRAVO.Configuration\...),
+    # якого тут багато. (?![A-Za-z0-9_]) вимагає, щоб після "config" не
+    # йшов символ імені; у реальних посиланнях там лапка або роздільник.
+    #
+    # ІМ'Я ЗМІННОЇ, навпаки, лишається регістрочутливим, хоч змінні
+    # PowerShell регістру не розрізняють. Це СВІДОМИЙ вибір, перевірений
+    # на фактичному файлі: з (?i) на весь шаблон з'являється четвертий
+    # збіг — $fixtureConfigPath = Join-Path $Root 'BRAVO.config' у
+    # New-BRAVOProductionConfigFixtureResult, де $Root — ПАРАМЕТР функції
+    # (тимчасовий fixture-корінь), а не корінь репозиторію. Тобто guard
+    # падав би на коректному коді. Конвенція цього файлу: $root —
+    # репозиторій, $Root — локальний параметр фікстури.
     $legacyConfigRootReference = '(?<!`)\$(root|PSScriptRoot)\b'
-    $legacyConfigPathPattern = ('({0}[^\r\n]{{0,80}}BRAVO\.config)|(BRAVO\.config[^\r\n]{{0,80}}{0})' -f $legacyConfigRootReference)
+    $legacyConfigFileReference = '(?i:BRAVO\.config)(?![A-Za-z0-9_])'
+    $legacyConfigPathPattern = ('({0}[^\r\n]{{0,80}}{1})|({1}[^\r\n]{{0,80}}{0})' -f $legacyConfigRootReference, $legacyConfigFileReference)
     $legacyConfigOwnerText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SELF_TEST.ps1'), [Text.Encoding]::UTF8)
     $legacyConfigOwnerMatches = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern))
     $legacyConfigOwnerHits = $legacyConfigOwnerMatches.Count
@@ -565,6 +586,9 @@
     # натомість додали пряме читання деінде, лічильник лишився б 2 і guard
     # звітував би PASS при живому обході. Тому звіряються самі РЯДКИ, у
     # яких стався збіг.
+    # Порівняння -ceq, а не -eq: рядкові оператори PowerShell за
+    # замовчуванням регістронезалежні, тож зміна регістру в тілі
+    # власника проїхала б повз звірку.
     $legacyConfigOwnerLines = @(
         $legacyConfigOwnerMatches | ForEach-Object {
             $matchIndex = $_.Index
@@ -619,7 +643,7 @@
     Test-BRAVOCondition `
         -Condition (
             $legacyConfigOwnerHits -eq 3 -and
-            $legacyConfigOwnerLinesText -eq $legacyConfigExpectedLinesText -and
+            $legacyConfigOwnerLinesText -ceq $legacyConfigExpectedLinesText -and
             $legacyConfigFragmentOffenders.Count -eq 0
         ) `
         -Name "Governance/LegacyConfigPathHasSingleOwner" `
