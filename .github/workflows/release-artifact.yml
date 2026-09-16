@@ -35,6 +35,14 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # ОБОВ'ЯЗКОВИЙ. ci\New-BRAVOReleaseArtifact.ps1 звіряє, що
+          # sourceCommit описує саме спаковане дерево: між ним і комітом
+          # архіву мають відрізнятися лише VERSION.json і
+          # RUNTIME_MANIFEST.json. sourceCommit — це БАТЬКО коміта-штампа
+          # (на тег вішається саме штамп), тому при shallow-checkout його
+          # в репозиторії немає і звірку неможливо виконати.
+          fetch-depth: 0
 
       - name: Збирання артефакту (git archive + інтегріті-перевірки)
         shell: powershell

@@ -11,7 +11,14 @@ param(
     # Очікуване ім'я тега (наприклад v5.0.2). Якщо задано, збірка падає,
     # коли тег не дорівнює "v" + packageVersion з VERSION.json на $Ref —
     # це захист від публікації артефакту з невідповідною версією.
-    [string]$ExpectedTag
+    [string]$ExpectedTag,
+
+    # Корінь репозиторію. Типово — батьківський каталог ci\, тобто цей же
+    # репозиторій. Параметр існує рівно з тієї ж причини, що й -Root у
+    # ci\Test-BRAVOReleasePolicy.ps1: без нього перевірки провенансу
+    # неможливо прогнати на ізольованій фікстурі, а тестувати їх
+    # переписуванням тієї самої логіки в тесті — безглуздо.
+    [string]$RepositoryRoot
 )
 
 # Збирання release-артефакту (P1.2, ROADMAP.md):
@@ -36,7 +43,11 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
 
-$repositoryRoot = Split-Path -Parent $PSScriptRoot
+$repositoryRoot = if ([string]::IsNullOrWhiteSpace($RepositoryRoot)) {
+    Split-Path -Parent $PSScriptRoot
+} else {
+    (Resolve-Path -LiteralPath $RepositoryRoot).ProviderPath
+}
 
 function Get-BRAVOArtifactVersionFromRef {
     param([string]$RepositoryRoot, [string]$GitRef)
@@ -75,6 +86,52 @@ if (-not [string]::IsNullOrWhiteSpace($ExpectedTag) -and $ExpectedTag -ne ('v' +
 $archiveCommit = (& git -C $repositoryRoot rev-parse ("{0}^{{commit}}" -f $Ref)).Trim()
 if ($LASTEXITCODE -ne 0 -or $archiveCommit -notmatch '^[0-9a-f]{40}$') {
     throw "Не вдалося розв'язати ref '$Ref' у commit."
+}
+
+# Провенанс має описувати САМЕ те дерево, що пакується (#199).
+#
+# Форма sourceCommit і префікс buildId вище нічого не кажуть про ВМІСТ:
+# перевірку проходив і провенанс, залишений від попереднього штампу тієї
+# самої версії. Перештампування однієї версії — штатна практика
+# (5.1.0-dev.1 штампували 25 разів), тому "та сама packageVersion" не є
+# доказом актуальності.
+#
+# Справжній інваріант встановлено з історії репозиторію: процедура
+# ci\Update-BRAVOVersionStamp.ps1 дає коміт-штамп, який відносно свого
+# sourceCommit змінює РІВНО два файли метаданих. Перевірено на всіх
+# коміт-штампах в історії — виняткiв немає.
+#
+# Тут це доречно, а в per-PR гейті ні: developer рухається, і між
+# штампами різниця проти sourceCommit законно стає сотнями файлів
+# (RELEASE_POLICY.md 5.3).
+# Без 2>$null навмисно — та сама причина, що й у
+# Get-BRAVOArtifactVersionFromRef вище: під $ErrorActionPreference='Stop'
+# редірект stderr нативної команди у PS 5.1 загортає її в terminating
+# NativeCommandError і маскує нашу власну діагностику нижче.
+$sourceObjectType = (& git -C $repositoryRoot cat-file -t $sourceCommit | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $sourceObjectType -ne 'commit') {
+    $seen = if ([string]::IsNullOrWhiteSpace($sourceObjectType)) { "об'єкт не знайдено" } else { "тип: $sourceObjectType" }
+    throw ("PROVENANCE_OBJECT: VERSION.json.sourceCommit ('$sourceCommit') не вказує на досяжний коміт ($seen). " +
+        "Причини: неповна історія (для CI потрібен fetch-depth: 0), неіснуючий hash або ID не-комітного об'єкта.")
+}
+
+$provenanceMetadataFiles = @('VERSION.json', 'RUNTIME_MANIFEST.json')
+$provenanceDiff = @(& git -C $repositoryRoot diff --name-only $sourceCommit $archiveCommit)
+if ($LASTEXITCODE -ne 0) {
+    throw "Не вдалося порівняти sourceCommit '$sourceCommit' з комітом архіву '$archiveCommit' (git diff завершився з кодом $LASTEXITCODE)."
+}
+# Обидва дозволені файли лежать у корені, тому роздільників у шляху не
+# буває; -notcontains у PowerShell і так порівнює регістронезалежно.
+$unexpectedProvenanceDiff = @(
+    $provenanceDiff |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Where-Object { $provenanceMetadataFiles -notcontains $_.Trim() }
+)
+if ($unexpectedProvenanceDiff.Count -gt 0) {
+    throw ("PROVENANCE_STALE: провенанс стале — між sourceCommit '$sourceCommit' і комітом архіву '$archiveCommit' " +
+        "відрізняються не лише метадані, а й " + $unexpectedProvenanceDiff.Count + " файл(ів): " +
+        ([string]::Join(', ', ($unexpectedProvenanceDiff | Select-Object -First 10))) +
+        ". Проставте штамп заново (ci\Update-BRAVOVersionStamp.ps1 -Apply на чистій копії) і перегенеруйте RUNTIME_MANIFEST.json.")
 }
 
 # --- 2. Збирання zip через git archive ----------------------------------
