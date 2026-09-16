@@ -309,7 +309,7 @@ if ([string]::IsNullOrWhiteSpace($sourceCommit)) {
         # би всі перевірки провенансу, і fetch-depth: 0, доданий саме заради
         # авторитетності цієї звірки, не давав би нічого. Якщо історія
         # неповна — це теж треба бачити, а не пропускати.
-        $sourceObjectTypeText = if ([string]::IsNullOrWhiteSpace($sourceObjectType)) { 'об'єкт не знайдено' } else { "тип об'єкта: $sourceObjectType" }
+        $sourceObjectTypeText = if ([string]::IsNullOrWhiteSpace($sourceObjectType)) { "об'єкт не знайдено" } else { "тип об'єкта: $sourceObjectType" }
         Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 7.2: sourceCommit '$sourceCommit' не вказує на досяжний коміт ($sourceObjectTypeText) — провенанс недоказовий. Причини: неповна історія (для CI потрібен fetch-depth: 0), неіснуючий hash або ID не-комітного об'єкта."
     } else {
         $provenanceVersion = [string]($provenanceJson | ConvertFrom-Json).packageVersion
