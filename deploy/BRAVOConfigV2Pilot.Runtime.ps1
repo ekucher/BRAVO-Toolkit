@@ -596,7 +596,11 @@ function Invoke-BRAVOPilotDeltaGeneration {
     if (Test-Path -LiteralPath $CandidatePath) {
         throw "PILOT_DELTA_FAILED: candidate-файл '$CandidatePath' уже існує — інструмент дельти нічого не перезаписує (ідемпотентний повторний прогін мусить вказати новий шлях або спершу прибрати попередній candidate свідомо)."
     }
-    & $deltaToolPath -RuntimeRoot $InstallRoot -OutputPath $CandidatePath
+    # Захоплюємо stdout ЯВНО: без цього консольний вивід інструмента
+    # (текст дельти, [INFO]-рядки) потрапляє у вихідний потік ЦІЄЇ функції
+    # й домішується до `return [pscustomobject]` нижче, перетворюючи
+    # результат на масив замість очікуваного об'єкта.
+    & $deltaToolPath -RuntimeRoot $InstallRoot -OutputPath $CandidatePath | Out-Null
     # Get-BRAVOConfigSiteDelta.ps1 НЕ викликає `exit 0` на щасливому шляху
     # (лише `exit 1` у catch) — $LASTEXITCODE на успіху непередбачуваний
     # (може лишитись від попередньої команди). Первинний доказ успіху —
