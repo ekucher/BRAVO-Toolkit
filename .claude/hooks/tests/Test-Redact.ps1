@@ -1,4 +1,4 @@
-<#
+﻿<#
     Test-Redact.ps1
     Unit tests for .claude/hooks/lib/Redact.ps1 (secret redaction before
     forwarding hook text to Slack). No network calls — Send-SlackMessage
@@ -51,9 +51,9 @@ $s2 = Protect-HookTextFailSafe -Text 'password=hunter2 more text'
 Assert-True 'failsafe masks password=... key-value pairs' `
     ($s2 -notmatch 'hunter2' -and $s2 -match 'password=\*\*\*') "(got: $s2)"
 
-$s3 = Protect-HookTextFailSafe -Text 'token: abcDEF123456'
+$s3 = Protect-HookTextFailSafe -Text 'token: placeholder-not-a-real-token'
 Assert-True 'failsafe masks token: ... key-value pairs' `
-    ($s3 -notmatch 'abcDEF123456' -and $s3 -match 'token:\s*\*\*\*') "(got: $s3)"
+    ($s3 -notmatch 'placeholder-not-a-real-token' -and $s3 -match 'token:\s*\*\*\*') "(got: $s3)"
 
 $s4 = Protect-HookTextFailSafe -Text 'https://hooks.slack.com/services/T000/B000/xxxxxxxxxxxxxxxxxxxxxxxx'
 Assert-True 'failsafe masks Slack webhook URL path' `

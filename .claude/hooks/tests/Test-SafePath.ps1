@@ -1,4 +1,4 @@
-<#
+﻿<#
     Test-SafePath.ps1
     Characterization/regression tests for .claude/hooks/lib/SafePath.ps1
     and its consumer save-task.ps1.
