@@ -37,3 +37,15 @@ artifacts/
 # запуску з робочої копії репозиторію. Трекається лише шаблон
 # BRAVO.local.config.example.
 BRAVO.local.config
+
+# Claude Code local runtime state — генерується інструментом на робочій
+# станції розробника (журнали хуків, збережені транскрипти/задачі сесій,
+# особисті permission-override'и, git worktree-метадані самого Claude
+# Code, lock-файл scheduled tasks). Нічого з цього не є частиною
+# комплекту BRAVO і може містити вміст приватних сесій — не повинно
+# потрапити в git при випадковому `git add -A`.
+.claude/logs/
+.claude/task-history/
+.claude/worktrees/
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
