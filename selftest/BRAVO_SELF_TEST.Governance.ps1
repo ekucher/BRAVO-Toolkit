@@ -576,7 +576,8 @@
     )
     $legacyConfigExpectedLines = @(
         '$ConfigPath = Join-Path $root "BRAVO.config"',
-        'return (Join-Path $root ''BRAVO.config'')'
+        'return (Join-Path $root ''BRAVO.config'')',
+        '$shippedConfigPath = Join-Path $root ''BRAVO.config'''
     ) | Sort-Object -Unique
     $legacyConfigOwnerLinesText = [string]::Join(' | ', $legacyConfigOwnerLines)
     $legacyConfigExpectedLinesText = [string]::Join(' | ', $legacyConfigExpectedLines)
@@ -590,22 +591,27 @@
         }
     }
 
-    # Рівно ДВА легальні входження в кореневому файлі, і це різні
-    # відповідальності, а не дубль:
+    # Рівно ТРИ легальні входження в кореневому файлі — три РІЗНІ
+    # відповідальності, а не дублі:
     #   1) тіло Get-BRAVOSelfTestLegacyConfigPath — джерело legacy-тексту
-    #      для фікстур;
-    #   2) дефолт -ConfigPath — ОПЕРАЦІЙНИЙ конфіг, з якого виводиться
+    #      для фікстур (клас A). На B4-2 перейде на заморожений актив;
+    #   2) тіло Get-BRAVOSelfTestShippedConfigPath — конфігурація, ЩО
+    #      ВІДВАНТАЖУЄТЬСЯ, для тверджень про пакет (клас B). На B4-2
+    #      перейде на канонічні дефолти, тобто В ІНШИЙ бік, ніж (1);
+    #   3) дефолт -ConfigPath — ОПЕРАЦІЙНИЙ конфіг, з якого виводиться
     #      $configRoot і поруч з яким мусить лежати BRAVO_CONFIG_LOADER.ps1.
-    # Злиття їх в одне вже було помилкою: на B4-2 воно дало б
-    # "Configuration loader not found" ще до запуску suite-ів.
+    #
+    # Кожне злиття цих ролей уже було помилкою в цьому ж PR: (1)+(3) дало
+    # б "Configuration loader not found" на старті, (1)+(2) — мовчазну
+    # втрату покриття тверджень про пакет.
     Test-BRAVOCondition `
         -Condition (
-            $legacyConfigOwnerHits -eq 2 -and
+            $legacyConfigOwnerHits -eq 3 -and
             $legacyConfigOwnerLinesText -eq $legacyConfigExpectedLinesText -and
             $legacyConfigFragmentOffenders.Count -eq 0
         ) `
         -Name "Governance/LegacyConfigPathHasSingleOwner" `
-        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно два посилання на кореневий BRAVO.config (тіло Get-BRAVOSelfTestLegacyConfigPath і дефолт -ConfigPath), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
+        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно три посилання на кореневий BRAVO.config (тіла Get-BRAVOSelfTestLegacyConfigPath і Get-BRAVOSelfTestShippedConfigPath та дефолт -ConfigPath), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
 
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть

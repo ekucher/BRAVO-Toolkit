@@ -211,7 +211,21 @@ function Get-BRAVOSelfTestShippedConfigText {
         Розділення зараз нічого не змінює в поведінці й коштує одну
         функцію; не розділити — означає закласти тиху втрату покриття.
     #>
-    return [IO.File]::ReadAllText((Get-BRAVOSelfTestLegacyConfigPath), [Text.Encoding]::UTF8)
+    return [IO.File]::ReadAllText((Get-BRAVOSelfTestShippedConfigPath), [Text.Encoding]::UTF8)
+}
+
+function Get-BRAVOSelfTestShippedConfigPath {
+    # Шлях до конфігурації, ЩО ВІДВАНТАЖУЄТЬСЯ. Тіло НАВМИСНО власне, а не
+    # делегування Get-BRAVOSelfTestLegacyConfigPath: інакше зміна того тіла
+    # на B4-2 мовчки потягла б за собою й твердження про пакет, тобто
+    # відтворила б рівно ту пастку, заради усунення якої існує це
+    # розділення.
+    #
+    # Рядок текстуально відрізняється від тіла legacy-accessor-а свідомо:
+    # guard звіряє САМІ рядки збігів, і два однакові рядки він розрізнити
+    # не зміг би.
+    $shippedConfigPath = Join-Path $root 'BRAVO.config'
+    return $shippedConfigPath
 }
 
 function Get-BRAVOSelfTestLegacyConfigText {
@@ -2917,7 +2931,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
 
     # Реальний BRAVO.config репозиторію мусить проходити власну перевірку.
     $securityRealConfig = Test-BRAVORuntimeSecuritySettings `
-        -ConfigPath (Get-BRAVOSelfTestLegacyConfigPath) -Mode Enforce -AllowWeakened ''
+        -ConfigPath (Get-BRAVOSelfTestShippedConfigPath) -Mode Enforce -AllowWeakened ''
     Test-BRAVOCondition `
         -Condition $securityRealConfig.IsValid `
         -Name "ConfigSecurity/RepositoryConfigIsStrict" `
@@ -5370,10 +5384,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Health/ElevationCancelledIsDetectedSpecifically" `
         -Failure "Test-BRAVOHealthElevationCancelled має розпізнавати саме Win32Exception(1223)/ERROR_CANCELLED (Cancel у UAC), а не будь-яку помилку Start-Process"
 
-    $bravoConfigText = [IO.File]::ReadAllText(
-        (Get-BRAVOSelfTestLegacyConfigPath),
-        [Text.Encoding]::UTF8
-    )
+    $bravoConfigText = (Get-BRAVOSelfTestShippedConfigText)
 
     # Health/SelfTestDoesNotModifyAcl: регресійний guard проти повернення
     # ACL-мутації в dev.13 test block (manual elevation + environment
@@ -6237,10 +6248,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Services/ArchiveReadOnly" `
         -Failure "BRAVO_ARCHIV не повинен зупиняти або запускати Windows-служби"
-    $bravoConfigTextForRetention = [IO.File]::ReadAllText(
-        (Get-BRAVOSelfTestLegacyConfigPath),
-        [Text.Encoding]::UTF8
-    )
+    $bravoConfigTextForRetention = (Get-BRAVOSelfTestShippedConfigText)
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('function Remove-BRAVOExpiredBackupGenerations') -and
@@ -12801,7 +12809,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # в самому BRAVO.config — перевірки нижче читають об'єднаний текст
     # обох файлів (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     $bravoConfigTextForDiscovery = (
-        (Get-BRAVOSelfTestLegacyConfigText) +
+        (Get-BRAVOSelfTestShippedConfigText) +
         [Environment]::NewLine +
         [IO.File]::ReadAllText(
             (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
@@ -13254,10 +13262,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
         [Text.Encoding]::UTF8
     )
-    $bravoConfigTextForSizeSanity = [IO.File]::ReadAllText(
-        (Get-BRAVOSelfTestLegacyConfigPath),
-        [Text.Encoding]::UTF8
-    )
+    $bravoConfigTextForSizeSanity = (Get-BRAVOSelfTestShippedConfigText)
     Test-BRAVOCondition `
         -Condition (
             $archiveRuntimeTextForSizeSanity.Contains("Test-BRAVOBackupSizeAnomaly") -and
