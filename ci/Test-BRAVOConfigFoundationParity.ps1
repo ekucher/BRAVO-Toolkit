@@ -345,6 +345,33 @@ $knownIntentionalDiffPrefixes = @(
     # змінюють, на effective-конфігурацію не впливають.
     'BravoConfigurationMetadata.PrimaryConfigIgnoredGlobals',
     'BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys',
+    # Адитивне поле версії site-формату (#154, B3; коміт cefcf50).
+    # АДИТИВНІСТЬ ДОВЕДЕНА, не припущена: у базі 42cf9ad рядок
+    # 'LocalConfigEffectiveSchemaVersion' не зустрічається в
+    # BRAVO_CONFIG_LOADER.ps1 ЖОДНОГО разу, тобто властивості не існувало
+    # (звідси BEFORE=<null>). У AFTER вона дорівнює 1 — фікстурний
+    # BRAVO.local.config не оголошує маркера, і резолвер трактує його як
+    # версію 1 за задокументованою legacy-політикою. Ефективних значень
+    # конфігурації поле не змінює.
+    #
+    # Сусіднє LocalConfigDeclaredSchemaVersion тут СВІДОМО не перелічене:
+    # у цій фікстурі воно $null і в BEFORE, і в AFTER, тож відмінності не
+    # дає. Вносити його наперед означало б заглушити майбутню справжню
+    # зміну ще до того, як вона станеться.
+    'BravoConfigurationMetadata.LocalConfigEffectiveSchemaVersion',
+    # Адитивне діагностичне поле (#154, B4 частина 1; коміт 6a37efd):
+    # dot-шляхи, де legacy BRAVO.config справді затіняє канонічний дефолт.
+    # У базі 42cf9ad рядка 'PrimaryConfigOverridesCanonicalDefaults' у
+    # завантажувачі немає взагалі.
+    #
+    # ЧОМУ ЗНАЧЕННЯ В AFTER НЕПОРОЖНЄ І ЧОМУ ЦЕ ПРАВИЛЬНО: воно дорівнює
+    # рівно ['pathSettings.BackupRoot','pathSettings.LIMSRoot'] — тобто
+    # саме тим двом шляхам, які New-PatchedFixtureConfigRoot вище підмінює
+    # у фікстурному BRAVO.config (без підміни auto-discovery впав би на
+    # машині без LIMS). Поле звітує про патч САМОЇ фікстури, а не про
+    # властивість комплекту, і значення детерміноване доти, доки фікстура
+    # патчить ті самі два рядки — а цього вимагає throw у самій функції.
+    'BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults',
     'BravoConfigurationMetadata.LocalConfigPath',
     'BravoConfigurationMetadata.LocalConfigPresent',
     'BravoConfigurationMetadata.Mode',
