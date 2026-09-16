@@ -16,6 +16,38 @@
 # з BRAVO.Configurator.Effective), інакше доменний модуль конфігурації
 # почав би залежати від модуля Configurator-а, тобто від вищого шару.
 
+function Get-BRAVOConfigurationValueTypeCategory {
+    # Приватний helper: КАТЕГОРІЯ типу листового значення.
+    #
+    # Навіщо. Оператори порівняння PowerShell приводять типи: $true -eq 1
+    # і $false -eq 0 дають True, а [string]30 -ceq '30' — теж True. Для
+    # доказу міграції це дірка: значення, що з $true стало 1 (або з 30
+    # стало '30'), змінює тип у JSON і в ефективній конфігурації, але
+    # порівняння оголосило б його незмінним, і інструмент звітував би
+    # [SUCCESS] про справжню зміну.
+    #
+    # Категорія, а не GetType(): усі цілі/дробові трактуються як одне
+    # число. Інакше Int32 проти Int64 (звичайна різниця між значенням у
+    # пам'яті й тим самим значенням після JSON-циклу) давала б хибну
+    # відмінність на двох ІДЕНТИЧНИХ знімках.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param($Value)
+
+    if ($null -eq $Value) { return 'Null' }
+    if ($Value -is [bool]) { return 'Boolean' }
+    if ($Value -is [string]) { return 'String' }
+    if ($Value -is [datetime]) { return 'DateTime' }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]) {
+        return 'Number'
+    }
+    return ('Other:' + $Value.GetType().FullName)
+}
+
 function Test-BRAVOConfigurationDictionaryEquality {
     # Приватний helper: СТРУКТУРНЕ порівняння двох словників.
     #
@@ -120,6 +152,15 @@ function Test-BRAVOConfigurationValueEquality {
             }
         }
         return $true
+    }
+
+    # Тип звіряється ДО значення: без цього приведення типів PowerShell
+    # оголосило б $true рівним 1, а 30 рівним '30'. Перевірка лише
+    # ДОДАЄ відмінності й ніколи не ховає наявних — напрямок, безпечний
+    # для доказу міграції.
+    if ((Get-BRAVOConfigurationValueTypeCategory -Value $Left) -ne
+        (Get-BRAVOConfigurationValueTypeCategory -Value $Right)) {
+        return $false
     }
 
     # Рядки порівнюються з урахуванням регістру: шлях 'E:\ARCHIV' і
