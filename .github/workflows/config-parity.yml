@@ -1,0 +1,69 @@
+name: Config parity
+
+# RELEASE_POLICY.md 14.4 називає ci\Test-BRAVOConfigFoundationParity.ps1
+# ОБОВ'ЯЗКОВИМ доказом для змін конфігураційного пайплайна — але виконувати
+# його треба було вручну, і за шість merged PR (#181, #183, #184, #185,
+# #186 і серію до них) він не запускався ЖОДНОГО разу. Обов'язок, який
+# тримається на людській дисципліні й не має механізму, не виконується.
+#
+# Скрипту потрібні лише git і Windows PowerShell 5.1: ні адмін-прав, ні
+# служб, ні 7-Zip/WinSCP, ні мережі, ні встановленого LIMS (шляхи
+# підмінено на фікстури всередині самого скрипта). Тобто перешкод для
+# автоматичного прогону не було — бракувало самого workflow.
+#
+# ОКРЕМИЙ ФАЙЛ, А НЕ ЗАДАЧА В ci.yml. Дві причини. По-перше, перевірка
+# доречна лише для PR, що торкаються конфігураційного пайплайна, а фільтр
+# paths у GitHub Actions задається на рівні workflow, не задачі. По-друге,
+# guard Governance/RequiredChecksListCoversCiWorkflowJobs вимагає, щоб
+# КОЖНА pull_request-задача ci.yml була перелічена в RELEASE_POLICY 13.3
+# як required check; додавання туди сьомої задачі означало б заявити
+# required check, якого насправді не ввімкнено (рівно дефект #149).
+#
+# ЦЕ НЕ REQUIRED CHECK. Наявність задачі в CI не робить її блокуючою:
+# перелік required checks — адміністративне налаштування GitHub (див.
+# #149). Промоція цієї перевірки в блокуючу — свідоме рішення власника, і
+# приймати його треба ПІСЛЯ того, як прогін стабільно зелений.
+#
+# ВІДОМИЙ НАСЛІДОК зафіксованої бази (див. коментар -BaseRef у самому
+# скрипті): allowlist навмисних відмінностей ЗРОСТАТИМЕ з кожним новим
+# ключем конфігурації. Червоний прогін тут означає "з'явилась відмінність,
+# якої ніхто не declared", і вимагає поіменного внесення ключа з
+# обґрунтуванням — а не послаблення перевірки.
+
+on:
+  pull_request:
+    paths:
+      - 'BRAVO_CONFIG_LOADER.ps1'
+      - 'BRAVO.config'
+      - 'BRAVO.local.config.example'
+      - 'modules/BRAVO.Configuration/**'
+      - 'modules/BRAVO.Configurator/**'
+      - 'ci/Test-BRAVOConfigFoundationParity.ps1'
+      - '.github/workflows/config-parity.yml'
+  workflow_dispatch:
+
+jobs:
+  config-parity:
+    name: Config parity (BRAVO_CONFIG_LOADER)
+    runs-on: windows-latest
+    steps:
+      # fetch-depth: 0 ОБОВ'ЯЗКОВИЙ. Скрипт створює ізольований
+      # git worktree за комітом 42cf9ad (незмінна точка відліку паритету);
+      # при типовому shallow-checkout цей коміт недосяжний, і git worktree
+      # add провалився б із причиною, яку легко сплутати з дефектом коду.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Same ASCII-only reason as ci.yml: GitHub Actions writes `run:`
+      # blocks to a temp .ps1 WITHOUT a BOM, and Windows PowerShell 5.1
+      # reads them in the system ANSI code page.
+      - name: Config foundation parity
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\ci\Test-BRAVOConfigFoundationParity.ps1
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Test-BRAVOConfigFoundationParity.ps1 exited with code $LASTEXITCODE"
+              exit 1
+          }
