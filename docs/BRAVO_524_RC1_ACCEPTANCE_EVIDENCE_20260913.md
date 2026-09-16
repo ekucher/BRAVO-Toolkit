@@ -16,7 +16,7 @@
 | releaseChannel | `prerelease` |
 | Артефакт | `BRAVO-Toolkit-5.2.4-rc.1.zip`, workflow `Release artifact` (run `34755687320`, job `103719544737`) |
 | SHA-256 артефакту | `f53088f4231cb8db77b0ce5655be2c27a21fcdaba1ef6e60cb2bfefe5a4934fa` |
-| Розгорнуто на | `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]), каталог `C:\Temp\BRAVO_524_rc1\kit` |
+| Розгорнуто на | production-сервер парку, каталог `C:\Temp\BRAVO_524_rc1\kit` |
 | Site-оверлей | `BRAVO.local.config`: `maintenanceSettings.Limits.ExcludedDrives = @('F:\','G:\')` |
 | Базова stable (поведінковий baseline) | `5.2.3` (тег `v5.2.3`) |
 
@@ -140,7 +140,7 @@ Margin 25% → 2000% (множник 16.8). Вимога масштабувал�
   юніт-тестами `…HistoryCappedBySmallerSource` і
   `…EstimatedSpaceBootstrapUsesSourceUpperBound`, обидва — через реальний
   `Get-ChildItem`/`Measure-Object`, не через інжектований override.
-- **Bootstrap-компонент без історії.** Усі три компоненти на `LIMS-TOP`
+- **Bootstrap-компонент без історії.** Усі три компоненти на production-сервері парку
   мають валідну історію. Покрито `Archive/A26` і
   `…EstimatedSpaceBootstrapUsesSourceUpperBound`.
 - **`ExclusionIgnoredForRequiredVolume`.** Перевірено в циклі 5.2.3
