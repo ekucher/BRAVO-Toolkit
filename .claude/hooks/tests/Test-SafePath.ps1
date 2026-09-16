@@ -76,7 +76,16 @@ function Invoke-SaveTaskHook {
     $hookPath = Join-Path $root '.claude\hooks\save-task.ps1'
     $env:CLAUDE_PROJECT_DIR = $ProjectDir
     try {
-        $json | & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $hookPath | Out-Null
+        # Без -ExecutionPolicy Bypass навмисно: ci/Test-BRAVOForbiddenPattern.ps1
+        # (сам відстежується RUNTIME_MANIFEST.json) блокує НОВІ Bypass-місця
+        # поза installer/task definitions, а правка манігфест-трекнутого файлу
+        # заради тестового allowlist-запису вимагала б окремого regen через
+        # ci\Update-BRAVORuntimeManifest.ps1 — окрема, свідома операція поза
+        # обсягом цього фіксу. save-task.ps1 — файл з локального checkout, не
+        # internet-zone, тому RemoteSigned (типовий дефолт) виконує його й без
+        # Bypass; сам продакшн-виклик хука в .claude/settings.json лишається
+        # незмінним і має свій -ExecutionPolicy Bypass.
+        $json | & powershell.exe -NoProfile -File $hookPath | Out-Null
     }
     finally {
         Remove-Item Env:\CLAUDE_PROJECT_DIR -ErrorAction SilentlyContinue

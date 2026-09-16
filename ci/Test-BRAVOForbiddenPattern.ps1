@@ -92,17 +92,7 @@ $bypassAllowlist = @(
     # ArgumentsTemplate, що сьогодні буквально в BRAVO.config вище —
     # canonical built-in default того самого self-elevation-опису, а не
     # нове виконуване Bypass-місце.
-    'BRAVO.Configuration.psm1',
-    # .claude/hooks/tests/Test-SafePath.ps1 (security-hardening хуків Claude
-    # Code): Invoke-SaveTaskHook запускає РЕАЛЬНИЙ .claude/hooks/save-task.ps1
-    # як ізольований дочірній powershell.exe з malicious session_id на stdin —
-    # той самий ізольований дочірній powershell.exe патерн, що self-test-файли
-    # вище (ConfigLoader/Governance/RestoreVerify/ConfigIntent). Bypass тут
-    # відтворює ТОЧНЕ реальне запрошення хука з .claude/settings.json
-    # ("powershell -NoProfile -ExecutionPolicy Bypass -File ...") — тест без
-    # Bypass перевіряв би інший виклик, ніж той, що Claude Code фактично
-    # робить у продакшені. Нового ВИКОНУВАНОГО Bypass-місця не додано.
-    'Test-SafePath.ps1'
+    'BRAVO.Configuration.psm1'
 )
 
 $forbiddenRules = @(
