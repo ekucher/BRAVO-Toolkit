@@ -121,9 +121,9 @@ D:\LIMS MaintenanceWorkingVolume CapacityState=Known AvailableGB=715.51 Status=S
 
 | Компонент | Архів | Статус | Файлів | Каталогів | Трив., с |
 |---|---|---|---|---|---|
-| MODEL | `vinnytsya_fitolab_v2412_20260913_035104.mdz` | PASS | 385 | 20 | 5.3 |
-| BLOG | `vinnytsya_fitolab_v2412_blog_20260913_035104.mdz` | PASS | 2 | 0 | 1.3 |
-| BRAVOEXCH | `vinnytsya_fitolab_v2412_bravoexch_20260913_035104.mdz` | PASS | 10715 | 9 | 30.7 |
+| MODEL | `<archivePrefix>_20260913_035104.mdz` | PASS | 385 | 20 | 5.3 |
+| BLOG | `<archivePrefix>_blog_20260913_035104.mdz` | PASS | 2 | 0 | 1.3 |
+| BRAVOEXCH | `<archivePrefix>_bravoexch_20260913_035104.mdz` | PASS | 10715 | 9 | 30.7 |
 
 Генерація створена самим кандидатом rc.6 у прогоні Archive 03:51 — тобто
 перевірено повний цикл «архів створено цією версією → відновлено цією ж
@@ -182,7 +182,7 @@ health OK, **exit 0**. Рішення класифікатора на групі
 | Повний self-test із бойового кореня | **1535 перевірок / 0 помилок**, exit **0** (включно з `DiskSpace/S63`, `S64`, серією `Maintenance/M*`) |
 | `BRAVO_SETUP.ps1 -ValidateOnly` | ГОТОВО ДО ЗАПУСКУ: dry-run 1 — PASS 48 / WARN 2 / FAIL 0; dry-run 2 з write-пробами — PASS 63 / WARN 0 / FAIL 0; SFTP-endpoint автентифіковано |
 | `BRAVO_SETUP.ps1` (повний) | ACL рекурсивно застосовано до `C:\Program Files\BRAVO-Toolkit`; 4 завдання **UPDATED**, 0 помилок |
-| `BRAVO_TASKS_DIAGNOSE` наскрізний dry-run від `NT AUTHORITY\SYSTEM` | усі перевірки PASS: write-проби під `C:\WINDOWS\SystemTemp\`, креденшели для `LimsTop` і `SYSTEM` — FOUND, тестове повідомлення Discord — HTTP 204 |
+| `BRAVO_TASKS_DIAGNOSE` наскрізний dry-run від `NT AUTHORITY\SYSTEM` | усі перевірки PASS: write-проби під `C:\WINDOWS\SystemTemp\`, креденшели для облікового запису завдань і `SYSTEM` — FOUND, тестове повідомлення Discord — HTTP 204 |
 | Аргументи завдань після переустановки | усі шляхи — `C:\Program Files\BRAVO-Toolkit\…`; **жодного входження `C:\Temp`** |
 | Ручний запуск `\BRAVO\BRAVO_ARCHIV_HEALTH` (принципал SYSTEM) | `LastTaskResult = 0` |
 | Ручний запуск `\BRAVO\BRAVO_MAINTENANCE` (принципал SYSTEM) | `LastTaskResult = 0` |
@@ -249,7 +249,7 @@ DiskSpace ... Roles=MODEL_ARCHIVE_DESTINATION ... AvailableGB=715.46
 контрольний `BRAVO_SETUP.ps1 -ValidateOnly` — ГОТОВО ДО ЗАПУСКУ,
 **PASS 63 / WARN 0 / FAIL 0**, усі 4 завдання зареєстровані й Ready,
 SFTP-endpoint автентифіковано, 16 з 16 записів Credential Manager FOUND для
-`LimsTop` і `SYSTEM`.
+облікового запису завдань і `SYSTEM`.
 
 ## 5. Передпольотна інвентаризація парку
 
