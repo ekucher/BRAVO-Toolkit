@@ -5384,6 +5384,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Health/ElevationCancelledIsDetectedSpecifically" `
         -Failure "Test-BRAVOHealthElevationCancelled має розпізнавати саме Win32Exception(1223)/ERROR_CANCELLED (Cancel у UAC), а не будь-яку помилку Start-Process"
 
+    # END-MARKER: dev.13 ACL guard block boundary
     $bravoConfigText = (Get-BRAVOSelfTestShippedConfigText)
 
     # Health/SelfTestDoesNotModifyAcl: регресійний guard проти повернення
@@ -5406,8 +5407,15 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $dev13AclTestBlockStart = $selfTestOwnSourceText.IndexOf(
         '# dev.13: manual elevation + environment preflight'
     )
+    # Межа кінця — ВИДІЛЕНИЙ маркер-коментар, а не рядок коду. Раніше тут
+    # шукався текст присвоєння $bravoConfigText; коли це присвоєння
+    # змінилося (перехід на Get-BRAVOSelfTestShippedConfigText), IndexOf
+    # почав знаходити власний рядковий літерал цього ж guard-а нижче,
+    # блок розтягувався на коментарі з назвами Set-Acl/AddAccessRule — і
+    # guard детерміновано падав. Маркер не є кодом, тому не залежить від
+    # рефакторингу сусідніх присвоєнь.
     $dev13AclTestBlockEnd = $selfTestOwnSourceText.IndexOf(
-        '$bravoConfigText = [IO.File]::ReadAllText(', $dev13AclTestBlockStart
+        '# END-MARKER: dev.13 ACL guard block boundary', $dev13AclTestBlockStart
     )
     $dev13AclTestBlockText = if ($dev13AclTestBlockStart -ge 0 -and $dev13AclTestBlockEnd -gt $dev13AclTestBlockStart) {
         $selfTestOwnSourceText.Substring(
