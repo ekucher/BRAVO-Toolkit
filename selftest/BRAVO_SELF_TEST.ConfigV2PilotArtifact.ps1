@@ -264,7 +264,7 @@ try {
     $acceptOutput = & $startScript -Accept -EvidenceDir $evidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Happy/AcceptSucceeds' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($acceptOutput | Select-Object -Last 10)))
     $acceptance = Get-Content -LiteralPath (Join-Path $evidenceDir 'acceptance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-    Test-BRAVOPilotSelfTestCondition -Name 'Happy/AcceptanceResultIsAccepted' -Condition ([string]$acceptance.Result -eq 'PILOT ACCEPTED') -FailureDetail [string]::Join(', ', @($acceptance.FailedCriteria))
+    Test-BRAVOPilotSelfTestCondition -Name 'Happy/AcceptanceResultIsAccepted' -Condition ([string]$acceptance.Result -eq 'PILOT ACCEPTED') -FailureDetail ([string]::Join(', ', @($acceptance.FailedCriteria)))
 
     # Секретна безпека: жоден evidence-файл не містить embedded-credential URI,
     # і жодне значення під sensitive-ключем поза reference-формою.
