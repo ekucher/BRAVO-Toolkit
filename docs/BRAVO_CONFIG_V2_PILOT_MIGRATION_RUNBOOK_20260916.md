@@ -97,6 +97,13 @@ UTF-8, тож перенаправлення через `>` дало б не «�
 primary-шар.
 
 ```powershell
+# Спершу прибираємо ОБИДВА артефакти попереднього прогону. Без цього
+# повторний пілот у тому самому $Ev успадкував би маркер .ABSENT від
+# минулого разу: резервна копія створилась би, але відкат усе одно пішов
+# би гілкою маркера й ВИДАЛИВ реальний site-файл замість відновлення.
+Remove-Item -LiteralPath "$Ev\BRAVO.local.config.backup" -ErrorAction SilentlyContinue
+Remove-Item -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -ErrorAction SilentlyContinue
+
 if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
     Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$Ev\BRAVO.local.config.backup" -ErrorAction Stop
 } else {
@@ -105,6 +112,9 @@ if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
     Set-Content -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -Value '' -Encoding UTF8
 }
 ```
+
+Два артефакти **взаємовиключні за побудовою**: або резервна копія, або
+маркер відсутності, ніколи обидва.
 
 Перенесіть відібрані рядки у `BRAVO.local.config` поруч із `BRAVO.config`.
 Якщо файл уже існує — **додайте** рядки, не замінюйте файл.
@@ -192,9 +202,16 @@ site-файл має вищий пріоритет, і залишені в нь�
 відновлений primary-шар — сервер виглядав би відкоченим, не будучи ним.
 
 ```powershell
+# Захист від суперечливого стану каталогу доказів: рівно один артефакт.
+$localBackup = Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup"
+$localAbsent = Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT"
+if ($localBackup -eq $localAbsent) {
+    throw "Стан site-файла в каталозі доказів неоднозначний (backup=$localBackup, absent=$localAbsent) — відкат зупинено."
+}
+
 Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
 
-if (Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT") {
+if ($localAbsent) {
     # Файла до пілота не було -> прибираємо створений нами.
     Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
 } else {
