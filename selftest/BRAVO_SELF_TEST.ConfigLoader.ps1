@@ -1370,7 +1370,8 @@ Test-BRAVOCondition `
                 ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
                 "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
                 "'RESULT:IGNORED=' + ((@(`$global:BravoConfigurationMetadata.PrimaryConfigIgnoredGlobals)) -join '|') + " +
-                "';UNKNOWN=' + ((@(`$global:BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys)) -join '|')" +
+                "';UNKNOWN=' + ((@(`$global:BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys)) -join '|') + " +
+                "';OVERRIDES=' + ((@(`$global:BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults)) -join '|')" +
                 "} catch { 'THREW: ' + `$_.Exception.Message }"
             )
             $probeOutput = [string](
@@ -1390,9 +1391,25 @@ Test-BRAVOCondition `
         # запуску кожного entrypoint-а, і діагностика знецінилась би.
         $strictnessPristine = New-BRAVOConfigLoaderPrimaryStrictnessProbe
         Test-BRAVOCondition `
-            -Condition ($strictnessPristine -eq 'RESULT:IGNORED=;UNKNOWN=') `
+            -Condition ($strictnessPristine -eq 'RESULT:IGNORED=;UNKNOWN=;OVERRIDES=') `
             -Name "PrimaryStrictness/PristineConfigProducesNoDiagnostics" `
-            -Failure "комплектний BRAVO.config має давати ПОРОЖНІ PrimaryConfigIgnoredGlobals і PrimaryConfigUnknownNestedKeys; отримано '$strictnessPristine'"
+            -Failure "комплектний BRAVO.config має давати ПОРОЖНІ PrimaryConfigIgnoredGlobals, PrimaryConfigUnknownNestedKeys і PrimaryConfigOverridesCanonicalDefaults; отримано '$strictnessPristine'"
+
+        # --- ConfigV2/StaleLegacyConfigCannotSilentlyOverrideDefaults ---
+        # Ядро B4. Застарілий BRAVO.config (значення епохи попередньої
+        # версії) і далі ПРАЦЮЄ — забрати його зараз означало б забрати в
+        # серверів їхні налаштування, бо міграція парку (B5) ще не
+        # виконана. Але він більше не МОВЧИТЬ: конкретний dot-шлях, який
+        # він затінює, потрапляє в метадані завантаження.
+        $strictnessStaleOverride = New-BRAVOConfigLoaderPrimaryStrictnessProbe `
+            -ExtraConfigBody '$global:logRetentionDays = 999'
+        Test-BRAVOCondition `
+            -Condition (
+                $strictnessStaleOverride.Contains('OVERRIDES=logRetentionDays') -and
+                -not $strictnessStaleOverride.StartsWith('THREW')
+            ) `
+            -Name "ConfigV2/StaleLegacyConfigCannotSilentlyOverrideDefaults" `
+            -Failure "BRAVO.config, що відхиляється від канонічного дефолту, мусить називати конкретний шлях у PrimaryConfigOverridesCanonicalDefaults і при цьому НЕ ламати завантаження; отримано '$strictnessStaleOverride'"
 
         # --- PrimaryStrictness/UnknownTopLevelGlobalReported ---
         # Сьогодні така змінна зникає безслідно: allowlist-збірка бере лише
