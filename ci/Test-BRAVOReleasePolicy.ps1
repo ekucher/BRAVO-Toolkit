@@ -285,8 +285,14 @@ if ([string]::IsNullOrWhiteSpace($sourceCommit)) {
             $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
             $hasGit = $normalizedTopLevel.Equals($normalizedRoot, [StringComparison]::OrdinalIgnoreCase)
         }
-        $provenanceJson = if ($hasGit) { (& git -C $Root show ("{0}:VERSION.json" -f $sourceCommit) 2>$null) | Out-String } else { '' }
-        $provenanceAvailable = ($hasGit -and $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($provenanceJson))
+        # Тип об'єкта перевіряємо ОКРЕМО і ПЕРШИМ: git show приймає будь-який
+        # tree-ish, тому 40-символьний ID дерева з підхожим VERSION.json у
+        # корені пройшов би і перевірку форми, і buildId-префікс, і саме
+        # читання файлу — провенанс, який не вказує на жоден коміт.
+        $sourceObjectType = if ($hasGit) { (& git -C $Root cat-file -t $sourceCommit 2>$null | Out-String).Trim() } else { '' }
+        $sourceIsCommit = ($hasGit -and $LASTEXITCODE -eq 0 -and $sourceObjectType -eq 'commit')
+        $provenanceJson = if ($sourceIsCommit) { (& git -C $Root show ("{0}:VERSION.json" -f $sourceCommit) 2>$null) | Out-String } else { '' }
+        $provenanceAvailable = ($sourceIsCommit -and $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($provenanceJson))
     } finally {
         $ErrorActionPreference = $previousErrorActionPreference
     }
@@ -303,7 +309,8 @@ if ([string]::IsNullOrWhiteSpace($sourceCommit)) {
         # би всі перевірки провенансу, і fetch-depth: 0, доданий саме заради
         # авторитетності цієї звірки, не давав би нічого. Якщо історія
         # неповна — це теж треба бачити, а не пропускати.
-        Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 7.2: коміт sourceCommit '$sourceCommit' недосяжний у цьому репозиторії (неповна історія або hash не існує) — провенанс недоказовий. Для CI потрібен fetch-depth: 0."
+        $sourceObjectTypeText = if ([string]::IsNullOrWhiteSpace($sourceObjectType)) { "об'єкт не знайдено" } else { "тип об'єкта: $sourceObjectType" }
+        Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 7.2: sourceCommit '$sourceCommit' не вказує на досяжний коміт ($sourceObjectTypeText) — провенанс недоказовий. Причини: неповна історія (для CI потрібен fetch-depth: 0), неіснуючий hash або ID не-комітного об'єкта."
     } else {
         $provenanceVersion = [string]($provenanceJson | ConvertFrom-Json).packageVersion
         if ($provenanceVersion -ne $packageVersion) {

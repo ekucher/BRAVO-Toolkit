@@ -279,10 +279,17 @@
         (Join-Path $root '.github\workflows\ci.yml'),
         [Text.Encoding]::UTF8
     )
+    # Шукаємо саме КРОК `run:`, а не згадку шляху будь-де у файлі.
+    # Підрядковий пошук був хибним: пояснювальний коментар біля
+    # fetch-depth: 0 містить той самий шлях, тому видалення справжнього
+    # кроку `run:` лишило б обидва guard-и зеленими — вони перевіряли б
+    # наявність коментаря про перевірку замість самої перевірки.
+    $releasePolicyRunStepPattern = '(?m)^\s*run:\s*\.\\ci\\Test-BRAVOReleasePolicy\.ps1\s*$'
+
     Test-BRAVOCondition `
         -Condition (
             (Test-Path -LiteralPath $releasePolicyGatePath -PathType Leaf) -and
-            $ciWorkflowTextForPolicy.Contains('ci\Test-BRAVOReleasePolicy.ps1')
+            ($ciWorkflowTextForPolicy -match $releasePolicyRunStepPattern)
         ) `
         -Name "ReleasePolicy/CiGateEnforcesBranchVersionChannel" `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має існувати і викликатися з .github\workflows\ci.yml — інакше відповідність гілки, версії та каналу тримається лише на пам'яті людини"
@@ -304,7 +311,7 @@
     Test-BRAVOCondition `
         -Condition (
             $releasePolicyJobMatch.Success -and
-            $releasePolicyJobBody.Contains('ci\Test-BRAVOReleasePolicy.ps1') -and
+            ($releasePolicyJobBody -match $releasePolicyRunStepPattern) -and
             $releasePolicyJobBody -match '(?m)^\s*fetch-depth:\s*0\s*$'
         ) `
         -Name "Governance/ReleasePolicyJobFetchesFullHistory" `
@@ -424,6 +431,7 @@
     # Version/StampConsistency такий стан пропускає.
     $provenanceProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_PROVENANCE_PROBE_{0}" -f [guid]::NewGuid().ToString('N'))
     $provenanceProbeExit = $null
+    $provenanceProbeOutput = ''
     $provenanceProbeLimitation = ''
     # Ініціалізація ДО try: під Set-StrictMode звертання до невизначеної
     # змінної нижче замаскувало б справжню причину відмови git. Дефолти —
@@ -459,7 +467,13 @@
         try {
             # -c замість git config: ідентичність коммітера на раннері може
             # бути не задана, і тоді git відмовить створювати коміт.
-            $null = & git -C $provenanceProbeRoot init --quiet 2>&1
+            # Гілку фікстури задаємо ЯВНО. Без цього на машині з
+            # init.defaultBranch=developer фікстура опинилась би на
+            # developer, перехресна перевірка каналу з .git/HEAD дала б
+            # 'development' проти 'stable' у VERSION.json, і скрипт вийшов
+            # би ненульовим ЧЕРЕЗ КАНАЛ — тобто тест лишався б зеленим
+            # навіть із повністю зламаною перевіркою провенансу.
+            $null = & git -C $provenanceProbeRoot -c init.defaultBranch=master init --quiet 2>&1
             $gitInitOk = ($LASTEXITCODE -eq 0)
             if ($gitInitOk) {
                 $null = & git -C $provenanceProbeRoot add -A 2>&1
@@ -487,7 +501,7 @@
             $previousErrorActionForProbe = $ErrorActionPreference
             $ErrorActionPreference = 'Continue'
             try {
-                $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\Test-BRAVOReleasePolicy.ps1') -Root $provenanceProbeRoot -Branch 'master' 2>&1
+                $provenanceProbeOutput = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\Test-BRAVOReleasePolicy.ps1') -Root $provenanceProbeRoot -Branch 'master' 2>&1 | Out-String
                 $provenanceProbeExit = $LASTEXITCODE
             } finally {
                 $ErrorActionPreference = $previousErrorActionForProbe
@@ -498,10 +512,14 @@
     }
 
     Test-BRAVOCondition `
-        -Condition ($null -ne $provenanceProbeExit -and $provenanceProbeExit -ne 0) `
+        -Condition (
+            $null -ne $provenanceProbeExit -and
+            $provenanceProbeExit -ne 0 -and
+            $provenanceProbeOutput.Contains('RELEASE_POLICY 7.2')
+        ) `
         -Name "ReleasePolicy/RejectsProvenanceFromDifferentVersion" `
         -EnvironmentLimitation $provenanceProbeLimitation `
-        -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де VERSION.json у коміті sourceCommit несе іншу packageVersion — саме так developer три доби ніс 5.3.0-dev.3 із провенансом 5.3.0-dev.2; код виходу: $provenanceProbeExit"
+        -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де VERSION.json у коміті sourceCommit несе іншу packageVersion, і назвати саме цю причину (маркер 'RELEASE_POLICY 7.2'), а не вийти ненульовим через щось інше; код виходу: $provenanceProbeExit"
 
     # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
     # stable-версії, а не лише нерівність рядків (стара реалізація
