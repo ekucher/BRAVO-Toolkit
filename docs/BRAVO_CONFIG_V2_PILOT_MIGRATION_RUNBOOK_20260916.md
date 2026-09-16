@@ -34,10 +34,24 @@ Runbook **не** прибирає `BRAVO.config` автоматично і не 
 
 Далі `$Kit` — каталог комплекту, `$Ev` — каталог доказів.
 
+**Кожен прогін пілота — у ВЛАСНОМУ, порожньому каталозі доказів.** Це не
+акуратність, а вимога коректності: у `$Ev` лежать артефакти, за якими
+відкат вирішує, що саме відновлювати. Успадкований від попереднього
+прогону `BRAVO.config.backup` змусив би відкат перезаписати цілий
+поточний `BRAVO.config` **застарілою** копією, а успадкований маркер
+`.ABSENT` — видалити реальний site-файл. Тому каталог створюється з
+міткою часу й порожнім, а не перевикористовується.
+
 ```powershell
 $Kit = 'C:\Program Files\BRAVO-Toolkit'
-$Ev  = 'D:\BRAVO_MIGRATION_EVIDENCE'
-New-Item -ItemType Directory -Path $Ev -Force | Out-Null
+$Ev  = Join-Path 'D:\BRAVO_MIGRATION_EVIDENCE' (Get-Date -Format 'yyyyMMdd_HHmmss')
+
+# -Force СВІДОМО не використовується: на наявному каталозі New-Item має
+# впасти, а не мовчки його прийняти.
+New-Item -ItemType Directory -Path $Ev -ErrorAction Stop | Out-Null
+if (@(Get-ChildItem -LiteralPath $Ev -Force).Count -ne 0) {
+    throw "Каталог доказів $Ev не порожній — почніть із чистого."
+}
 ```
 
 ## Крок 0. Знімок BEFORE
@@ -97,13 +111,6 @@ UTF-8, тож перенаправлення через `>` дало б не «�
 primary-шар.
 
 ```powershell
-# Спершу прибираємо ОБИДВА артефакти попереднього прогону. Без цього
-# повторний пілот у тому самому $Ev успадкував би маркер .ABSENT від
-# минулого разу: резервна копія створилась би, але відкат усе одно пішов
-# би гілкою маркера й ВИДАЛИВ реальний site-файл замість відновлення.
-Remove-Item -LiteralPath "$Ev\BRAVO.local.config.backup" -ErrorAction SilentlyContinue
-Remove-Item -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -ErrorAction SilentlyContinue
-
 if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
     Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$Ev\BRAVO.local.config.backup" -ErrorAction Stop
 } else {
@@ -112,10 +119,18 @@ if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
     Set-Content -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -Value '' -Encoding UTF8 -ErrorAction Stop
 }
 
-# Артефакт відкату мусить існувати ДО того, як ви торкнетесь site-файла.
-if (-not ((Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup") -or
-          (Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT"))) {
-    throw 'Артефакт стану site-файла не створено — НЕ змінюйте BRAVO.local.config.'
+# РІВНО ОДИН артефакт відкату мусить існувати ДО того, як ви торкнетесь
+# site-файла. Перевіряється саме «рівно один», а не «хоч якийсь»: два
+# артефакти означають суперечливий стан, і відкат на ньому зупиниться,
+# уже після того, як ви зміните сервер.
+# Свідомо БЕЗ підрахунку через Where-Object: у Windows PowerShell 5.1
+# pipeline без збігів дає $null, а @($null).Count дорівнює 1 — перевірка
+# "рівно один" мовчки пройшла б при ЖОДНОМУ артефакті. Порівняння двох
+# булевих значень цієї пастки не має й ловить обидва хибні стани.
+$hasLocalBackup = Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup"
+$hasLocalAbsent = Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT"
+if ($hasLocalBackup -eq $hasLocalAbsent) {
+    throw "Артефактів стану site-файла має бути рівно один (backup=$hasLocalBackup, absent=$hasLocalAbsent) — НЕ змінюйте BRAVO.local.config."
 }
 ```
 
