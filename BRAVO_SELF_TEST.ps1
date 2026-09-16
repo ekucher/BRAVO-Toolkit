@@ -193,7 +193,18 @@ function Get-BRAVOSelfTestLegacyConfigText {
 
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Get-BRAVOSelfTestLegacyConfigPath
+    # ОПЕРАЦІЙНИЙ конфіг комплекту — НЕ те саме, що джерело legacy-тексту
+    # для фікстур, хоч сьогодні обидва вказують на один файл.
+    #
+    # Нижче з $ConfigPath виводиться $configRoot, і поруч із ним мусить
+    # лежати BRAVO_CONFIG_LOADER.ps1 (інакше — throw "Configuration loader
+    # not found" ще до запуску suite-ів). Тому підставляти сюди
+    # Get-BRAVOSelfTestLegacyConfigPath не можна: на кроці B4-2 той
+    # accessor почне повертати заморожений актив із selftest\, поруч з
+    # яким лоадера немає, і весь набір упав би на старті.
+    #
+    # Дві відповідальності — два вирази. Guard нижче знає про обидва.
+    $ConfigPath = Join-Path $root "BRAVO.config"
 }
 
 # Canonical console/manual-exit helper (Write-BRAVOFinalSummaryHeader/Footer,

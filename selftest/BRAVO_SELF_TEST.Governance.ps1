@@ -535,13 +535,28 @@
     # рядковий літерал і інакше ловив би сам себе. Компроміс свідомий —
     # альтернатива (складніші межі сканування) коштувала б більше, ніж
     # дає.
-    # Два шаблони, бо пряма залежність ховається у двох формах. Перша —
-    # Join-Path. Друга — інтерполяція кореня разом з іменем файлу, у тому
-    # числі через вкладений вираз (наприклад екранування лапок усередині
-    # рядка команди дочірнього процесу). Саме друга форма пройшла повз
-    # першу редакцію цього guard-а: перевірка звітувала PASS, а пряме
-    # читання кореневого файлу лишалось.
-    $legacyConfigPathPattern = '(Join-Path\s+\$root\s+[''"]BRAVO\.config[''"])|(\$root[^\r\n]{0,60}\\BRAVO\.config)'
+    # Шаблон ловить співпадіння в ОДНОМУ РЯДКУ посилання на корінь
+    # репозиторію ($root / $PSScriptRoot) з іменем BRAVO.config — у будь-
+    # якому порядку. Це покриває позиційний Join-Path, іменовані
+    # параметри (-Path/-ChildPath, у будь-якій послідовності) та
+    # інтерполяцію, зокрема через вкладений вираз з екрануванням лапок:
+    # саме остання форма пройшла повз першу редакцію guard-а, і перевірка
+    # тоді звітувала PASS при живій прямій залежності.
+    #
+    # Межа чесна й названа: розрив виразу на кілька рядків шаблон не
+    # ловить. Це defence-in-depth, а не останній рубіж — остаточну
+    # відповідь дає сам крок B4-2, де зниклий файл валить будь-яке
+    # уціліле пряме читання. Точніший варіант — розбір AST — свідомо не
+    # вводиться тут: він коштує більше коду, ніж дає понад це.
+    #
+    # $scenarioRoot і подібні НЕ ловляться: \$root вимагає, щоб одразу
+    # після $ ішло саме "root", а \b відсікає $rootSomething.
+    # (?<!`) відсікає ЕКРАНОВАНИЙ долар: `$PSScriptRoot усередині
+    # подвійних лапок — це літерал у тексті про код (наприклад у
+    # -Failure іншого guard-а), а не звернення до змінної. Без цього
+    # шаблон рахував два таких описи як живі залежності.
+    $legacyConfigRootReference = '(?<!`)\$(root|PSScriptRoot)\b'
+    $legacyConfigPathPattern = ('({0}[^\r\n]{{0,80}}BRAVO\.config)|(BRAVO\.config[^\r\n]{{0,80}}{0})' -f $legacyConfigRootReference)
     $legacyConfigOwnerText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SELF_TEST.ps1'), [Text.Encoding]::UTF8)
     $legacyConfigOwnerHits = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern)).Count
 
@@ -554,10 +569,18 @@
         }
     }
 
+    # Рівно ДВА легальні входження в кореневому файлі, і це різні
+    # відповідальності, а не дубль:
+    #   1) тіло Get-BRAVOSelfTestLegacyConfigPath — джерело legacy-тексту
+    #      для фікстур;
+    #   2) дефолт -ConfigPath — ОПЕРАЦІЙНИЙ конфіг, з якого виводиться
+    #      $configRoot і поруч з яким мусить лежати BRAVO_CONFIG_LOADER.ps1.
+    # Злиття їх в одне вже було помилкою: на B4-2 воно дало б
+    # "Configuration loader not found" ще до запуску suite-ів.
     Test-BRAVOCondition `
-        -Condition ($legacyConfigOwnerHits -eq 1 -and $legacyConfigFragmentOffenders.Count -eq 0) `
+        -Condition ($legacyConfigOwnerHits -eq 2 -and $legacyConfigFragmentOffenders.Count -eq 0) `
         -Name "Governance/LegacyConfigPathHasSingleOwner" `
-        -Failure "шлях до кореневого BRAVO.config має знати лише Get-BRAVOSelfTestLegacyConfigPath: у BRAVO_SELF_TEST.ps1 знайдено $legacyConfigOwnerHits входжень (очікується 1), у фрагментах — $($legacyConfigFragmentOffenders.Count) ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray())))"
+        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно два посилання на кореневий BRAVO.config (тіло Get-BRAVOSelfTestLegacyConfigPath і дефолт -ConfigPath), у фрагментах — жодного: знайдено $legacyConfigOwnerHits у корені та $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray())))"
 
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
