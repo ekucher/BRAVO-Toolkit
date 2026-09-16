@@ -1214,10 +1214,16 @@ function Compare-BRAVOConfigurationGraphForParity {
 }
 
 $parityDefaultConfiguration = Get-BRAVODefaultConfiguration
+# Шлях до legacy-конфігурації бере канонічний accessor (#154, B4-2), а не
+# пряма інтерполяція кореня разом з іменем файлу: інакше ця точка
+# лишилась би залежністю від кореневого файлу, невидимою для
+# Governance/LegacyConfigPathHasSingleOwner — саме так вона й
+# ховалась, доки guard дивився тільки на Join-Path.
+$committedConfigLegacyPathLiteral = (Get-BRAVOSelfTestLegacyConfigPath).Replace("'", "''")
 $committedConfigProbeCommand = (
     "Import-Module -Name '$root\modules\BRAVO.Configuration\BRAVO.Configuration.psd1' -ErrorAction Stop; " +
     "`$default = Get-BRAVODefaultConfiguration; " +
-    "`$sb = [scriptblock]::Create([IO.File]::ReadAllText('$($root.Replace("'", "''"))\BRAVO.config', [Text.Encoding]::UTF8)); " +
+    "`$sb = [scriptblock]::Create([IO.File]::ReadAllText('$committedConfigLegacyPathLiteral', [Text.Encoding]::UTF8)); " +
     "& `$sb -ConfigRoot '$($root.Replace("'", "''"))' -RuntimeRoot '$($root.Replace("'", "''"))'; " +
     "`$primaryRaw = @{}; " +
     "foreach (`$k in @(`$default.Keys)) { `$v = Get-Variable -Name `$k -Scope Global -ErrorAction SilentlyContinue; if (`$null -ne `$v -and `$null -ne `$v.Value) { `$primaryRaw[`$k] = `$v.Value } }; " +

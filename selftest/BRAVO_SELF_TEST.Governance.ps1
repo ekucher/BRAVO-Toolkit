@@ -535,7 +535,13 @@
     # рядковий літерал і інакше ловив би сам себе. Компроміс свідомий —
     # альтернатива (складніші межі сканування) коштувала б більше, ніж
     # дає.
-    $legacyConfigPathPattern = 'Join-Path\s+\$root\s+[''"]BRAVO\.config[''"]'
+    # Два шаблони, бо пряма залежність ховається у двох формах. Перша —
+    # Join-Path. Друга — інтерполяція кореня разом з іменем файлу, у тому
+    # числі через вкладений вираз (наприклад екранування лапок усередині
+    # рядка команди дочірнього процесу). Саме друга форма пройшла повз
+    # першу редакцію цього guard-а: перевірка звітувала PASS, а пряме
+    # читання кореневого файлу лишалось.
+    $legacyConfigPathPattern = '(Join-Path\s+\$root\s+[''"]BRAVO\.config[''"])|(\$root[^\r\n]{0,60}\\BRAVO\.config)'
     $legacyConfigOwnerText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SELF_TEST.ps1'), [Text.Encoding]::UTF8)
     $legacyConfigOwnerHits = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern)).Count
 
