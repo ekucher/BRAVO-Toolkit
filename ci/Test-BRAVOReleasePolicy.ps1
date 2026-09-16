@@ -65,15 +65,20 @@ $releaseChannel = [string]$version.releaseChannel
 $branch = if (-not [string]::IsNullOrWhiteSpace($Branch)) { $Branch.Trim() } else { Resolve-BRAVOReleasePolicyBranch -RepositoryRoot $Root }
 
 # Гілка невідома лише у detached HEAD або в розпакованому архіві без
-# .git — там ця перевірка нічого не охороняє, тому не вигадуємо режим.
-if ([string]::IsNullOrWhiteSpace($branch)) {
-    Write-Host "Гілку визначити не вдалося (detached HEAD або копія без .git) — перевірку пропущено." -ForegroundColor Yellow
-    exit 0
+# .git. Раніше тут був exit 0 — і разом із гілковими перевірками мовчки
+# пропускались УСІ інші, зокрема звірка releaseDate з CHANGELOG.md, яку
+# §5.3 прямо називає придатною для розпакованого комплекту. Тепер
+# пропускаються рівно ті перевірки, які без гілки не мають змісту.
+$branchKnown = -not [string]::IsNullOrWhiteSpace($branch)
+if (-not $branchKnown) {
+    Write-Host "Гілку визначити не вдалося (detached HEAD або копія без .git) — гілкові перевірки пропущено, решта виконується." -ForegroundColor Yellow
 }
 
-$isStableBranch = $branch -in @('master', 'main')
+# Без відомої гілки трактуємо як не-stable: суворіші stable-правила
+# спираються саме на гілку, і застосовувати їх наосліп не можна.
+$isStableBranch = $branchKnown -and ($branch -in @('master', 'main'))
 
-Write-Host "Гілка:          $branch"
+Write-Host "Гілка:          $(if ($branchKnown) { $branch } else { '(невідома)' })"
 Write-Host "packageVersion: $packageVersion"
 Write-Host "releaseChannel: $releaseChannel"
 Write-Host ""
@@ -87,7 +92,9 @@ $strictNumberPattern = '(0|[1-9][0-9]*)'
 $stablePattern = "^$strictNumberPattern\.$strictNumberPattern\.$strictNumberPattern$"
 $prereleasePattern = "^$strictNumberPattern\.$strictNumberPattern\.$strictNumberPattern-(dev|rc)\.$strictNumberPattern$"
 
-if ($isStableBranch) {
+if (-not $branchKnown) {
+    Write-Host "Відповідність гілка <-> версія <-> канал не перевіряється: гілка невідома." -ForegroundColor Yellow
+} elseif ($isStableBranch) {
     if ($packageVersion -notmatch $stablePattern) {
         Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 2.2: на гілці '$branch' дозволені лише stable-версії X.Y.Z, а packageVersion = '$packageVersion'."
     }
@@ -228,6 +235,80 @@ if (-not [string]::IsNullOrWhiteSpace($gitChannel)) {
     $expectedForGitChannel = if ($gitChannel -eq 'stable') { @('stable') } else { @('development', 'prerelease') }
     if ($releaseChannel -notin $expectedForGitChannel) {
         Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 5.4: .git/HEAD вказує на канал '$gitChannel', а VERSION.json містить '$releaseChannel' — одне з двох неправильне."
+    }
+}
+
+# RELEASE_POLICY 7.2: провенанс має описувати ТОЙ САМИЙ реліз. Процедура
+# штампування (ci\Update-BRAVOVersionStamp.ps1) складається з двох комітів:
+# спершу коміт коду релізу з новою packageVersion, далі коміт-штамп, де
+# sourceCommit вказує на нього. Тому в будь-якому завершеному стані
+# VERSION.json у коміті sourceCommit несе ТУ САМУ packageVersion.
+#
+# Це прямо те, що обіцяє коментар self-test Version/StampConsistency
+# («packageVersion нова, а build/sourceCommit від іншого коміту»), але
+# сам він перевіряє лише, що buildId є префіксом sourceCommit — а це
+# виконується й тоді, коли штамп узагалі не оновлювали.
+#
+# Емпірична підстава: 5.3.0-dev.3 отримав версію всередині merge-резолюції
+# PR #143, кроки 2-3 процедури не виконувались, і три доби developer ніс
+# packageVersion 5.3.0-dev.3 з провенансом 5.3.0-dev.2 (86270a1). Прогін по
+# всіх станах VERSION.json в історії показав, що на КОЖНОМУ коміті-штампі
+# правило виконується — тобто воно вже діє, просто ніким не перевірялось.
+#
+# Перевірка git-залежна, тому живе тут, а не в BRAVO_SELF_TEST.ps1: той
+# набір мусить лишатись git-незалежним (RELEASE_POLICY 14.4). Потрібен
+# повний (не shallow) клон — .github\workflows\ci.yml задає fetch-depth: 0
+# для цієї задачі, а guard Governance/ReleasePolicyJobFetchesFullHistory
+# тримає опцію на місці.
+$sourceCommit = [string]$version.sourceCommit
+if ([string]::IsNullOrWhiteSpace($sourceCommit)) {
+    Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 7.2: VERSION.json не містить sourceCommit — провенанс пакета невідомий."
+} else {
+    # EAP=Continue лише навколо native-виклику: 2>$null під глобальним
+    # Stop перетворив би будь-який stderr-рядок git на terminating
+    # NativeCommandError і зірвав би скрипт замість чесної діагностики.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        # --show-toplevel, а НЕ --git-dir: пошук репозиторію в git іде вгору
+        # по батьківських каталогах, тому розпакований комплект, що лежить
+        # десь усередині чужого робочого дерева, помилково вважався б
+        # репозиторієм, і його sourceCommit звірявся б із ЧУЖОЮ історією.
+        # Нас цікавить лише випадок, коли корінь репозиторію — це і є $Root.
+        $repositoryTopLevel = (& git -C $Root rev-parse --show-toplevel 2>$null | Out-String).Trim()
+        $hasGit = $false
+        if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($repositoryTopLevel)) {
+            # git віддає шлях із прямими слешами; порівнюємо нормалізовані
+            # повні шляхи без кінцевого роздільника, регістронезалежно
+            # (Windows).
+            $normalizedTopLevel = [IO.Path]::GetFullPath($repositoryTopLevel.Replace('/', [IO.Path]::DirectorySeparatorChar)).TrimEnd([IO.Path]::DirectorySeparatorChar)
+            $normalizedRoot = [IO.Path]::GetFullPath($Root).TrimEnd([IO.Path]::DirectorySeparatorChar)
+            $hasGit = $normalizedTopLevel.Equals($normalizedRoot, [StringComparison]::OrdinalIgnoreCase)
+        }
+        $provenanceJson = if ($hasGit) { (& git -C $Root show ("{0}:VERSION.json" -f $sourceCommit) 2>$null) | Out-String } else { '' }
+        $provenanceAvailable = ($hasGit -and $LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($provenanceJson))
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+
+    if (-not $hasGit) {
+        # Єдиний легальний пропуск: $Root не є коренем git-репозиторію
+        # (розпакований комплект на сервері — зокрема й тоді, коли він
+        # випадково лежить усередині чужого робочого дерева). Там звіряти
+        # нема з чим, і звірка з чужою історією була б гіршою за пропуск.
+        Write-Host "$Root не є коренем git-репозиторію — провенанс sourceCommit не звіряється (розпакований комплект)." -ForegroundColor Yellow
+    } elseif (-not $provenanceAvailable) {
+        # Репозиторій є, а коміт недосяжний — це відмова, а не попередження.
+        # Інакше вигаданий 40-символьний hash із узгодженим buildId проходив
+        # би всі перевірки провенансу, і fetch-depth: 0, доданий саме заради
+        # авторитетності цієї звірки, не давав би нічого. Якщо історія
+        # неповна — це теж треба бачити, а не пропускати.
+        Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 7.2: коміт sourceCommit '$sourceCommit' недосяжний у цьому репозиторії (неповна історія або hash не існує) — провенанс недоказовий. Для CI потрібен fetch-depth: 0."
+    } else {
+        $provenanceVersion = [string]($provenanceJson | ConvertFrom-Json).packageVersion
+        if ($provenanceVersion -ne $packageVersion) {
+            Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 7.2: VERSION.json заявляє packageVersion '$packageVersion', але у коміті sourceCommit '$sourceCommit' записано '$provenanceVersion' — провенанс від іншого релізу. Проставте штамп заново (ci\Update-BRAVOVersionStamp.ps1 -Apply) і перегенеруйте RUNTIME_MANIFEST.json."
+        }
     }
 }
 
