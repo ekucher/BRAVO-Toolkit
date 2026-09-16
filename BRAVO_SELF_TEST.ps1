@@ -2,19 +2,24 @@
 param(
     [string]$ConfigPath,
 
-    # SELF-TEST Console UX (operator pause): та сама -NoPause семантика, що
-    # Archive/Health/Maintenance — вимикає паузу перед закриттям вікна.
-    # Без прапорця Wait-BRAVOManualExit сама вирішує (SYSTEM/non-interactive
-    # завжди повертається без очікування; тут лише явний opt-out для
-    # інтерактивного ручного запуску).
-    [switch]$NoPause,
-
     # #187 (фаза 2): вибірковий прогін suite-фрагментів — зручність
     # РОЗРОБНИКА, не режим приймання. Порожній (за замовчуванням) = повний
     # канонічний прогін, поведінка якого не змінюється взагалі.
     # Невідоме ім'я зупиняє прогін fail-closed: мовчки виконати не те, що
     # просили, гірше, ніж не виконати нічого.
-    [string[]]$Suite
+    #
+    # СТОЇТЬ ПЕРЕД $NoPause НАВМИСНО. ConsoleUX/28 вимагає, щоб рядок
+    # "[switch]$NoPause" був останнім у param() — без коми в кінці. Прив'язку
+    # це не змінює: [switch] ніколи не є позиційним, тому $ConfigPath
+    # лишається позицією 0, а $Suite — позицією 1 за будь-якого порядку.
+    [string[]]$Suite,
+
+    # SELF-TEST Console UX (operator pause): та сама -NoPause семантика, що
+    # Archive/Health/Maintenance — вимикає паузу перед закриттям вікна.
+    # Без прапорця Wait-BRAVOManualExit сама вирішує (SYSTEM/non-interactive
+    # завжди повертається без очікування; тут лише явний opt-out для
+    # інтерактивного ручного запуску).
+    [switch]$NoPause
 )
 
 # P0 fail-fast/telemetry (PR #138 review): dependency-free секундомір,
