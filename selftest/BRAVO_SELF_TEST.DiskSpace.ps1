@@ -460,7 +460,7 @@ $maintenanceRuntimeTextForPolicyCheck = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
     [Text.Encoding]::UTF8
 )
-$bravoConfigTextForPolicyCheck = (Get-BRAVOSelfTestLegacyConfigText)
+$bravoConfigTextForPolicyCheck = (Get-BRAVOSelfTestShippedConfigText)
 Test-BRAVOCondition `
     -Condition (
         -not $diskSpaceModuleText.Contains('DiskSpacePolicyMode') -and

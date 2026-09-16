@@ -27,7 +27,7 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
     # BRAVO.config — перевірки нижче читають об'єднаний текст обох
     # файлів (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     $bravoConfigTextForPaths = (
-        (Get-BRAVOSelfTestLegacyConfigText) +
+        (Get-BRAVOSelfTestShippedConfigText) +
         [Environment]::NewLine +
         [IO.File]::ReadAllText(
             (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),

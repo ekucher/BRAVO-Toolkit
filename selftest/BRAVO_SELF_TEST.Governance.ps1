@@ -558,7 +558,28 @@
     $legacyConfigRootReference = '(?<!`)\$(root|PSScriptRoot)\b'
     $legacyConfigPathPattern = ('({0}[^\r\n]{{0,80}}BRAVO\.config)|(BRAVO\.config[^\r\n]{{0,80}}{0})' -f $legacyConfigRootReference)
     $legacyConfigOwnerText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SELF_TEST.ps1'), [Text.Encoding]::UTF8)
-    $legacyConfigOwnerHits = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern)).Count
+    $legacyConfigOwnerMatches = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern))
+    $legacyConfigOwnerHits = $legacyConfigOwnerMatches.Count
+
+    # Самої КІЛЬКОСТІ замало: якби одне з легальних посилань прибрали, а
+    # натомість додали пряме читання деінде, лічильник лишився б 2 і guard
+    # звітував би PASS при живому обході. Тому звіряються самі РЯДКИ, у
+    # яких стався збіг.
+    $legacyConfigOwnerLines = @(
+        $legacyConfigOwnerMatches | ForEach-Object {
+            $matchIndex = $_.Index
+            $lineStart = $legacyConfigOwnerText.LastIndexOf("`n", $matchIndex) + 1
+            $lineEnd = $legacyConfigOwnerText.IndexOf("`n", $matchIndex)
+            if ($lineEnd -lt 0) { $lineEnd = $legacyConfigOwnerText.Length }
+            $legacyConfigOwnerText.Substring($lineStart, $lineEnd - $lineStart).Trim()
+        } | Sort-Object -Unique
+    )
+    $legacyConfigExpectedLines = @(
+        '$ConfigPath = Join-Path $root "BRAVO.config"',
+        'return (Join-Path $root ''BRAVO.config'')'
+    ) | Sort-Object -Unique
+    $legacyConfigOwnerLinesText = [string]::Join(' | ', $legacyConfigOwnerLines)
+    $legacyConfigExpectedLinesText = [string]::Join(' | ', $legacyConfigExpectedLines)
 
     $legacyConfigFragmentOffenders = New-Object System.Collections.ArrayList
     foreach ($fragmentFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter '*.ps1' -File)) {
@@ -578,9 +599,13 @@
     # Злиття їх в одне вже було помилкою: на B4-2 воно дало б
     # "Configuration loader not found" ще до запуску suite-ів.
     Test-BRAVOCondition `
-        -Condition ($legacyConfigOwnerHits -eq 2 -and $legacyConfigFragmentOffenders.Count -eq 0) `
+        -Condition (
+            $legacyConfigOwnerHits -eq 2 -and
+            $legacyConfigOwnerLinesText -eq $legacyConfigExpectedLinesText -and
+            $legacyConfigFragmentOffenders.Count -eq 0
+        ) `
         -Name "Governance/LegacyConfigPathHasSingleOwner" `
-        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно два посилання на кореневий BRAVO.config (тіло Get-BRAVOSelfTestLegacyConfigPath і дефолт -ConfigPath), у фрагментах — жодного: знайдено $legacyConfigOwnerHits у корені та $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray())))"
+        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно два посилання на кореневий BRAVO.config (тіло Get-BRAVOSelfTestLegacyConfigPath і дефолт -ConfigPath), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
 
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
