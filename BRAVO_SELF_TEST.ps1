@@ -2591,7 +2591,12 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             $fixtureReleaseDate = '2026-09-13'
             [IO.File]::WriteAllText(
                 (Join-Path $releasePolicyFixtureRoot 'VERSION.json'),
-                ('{{"packageVersion": "{0}", "releaseChannel": "prerelease", "releaseDate": "{1}"}}' -f $PackageVersion, $fixtureReleaseDate),
+                # buildId/sourceCommit синтетичні й самоузгоджені: без
+                # провенансу гейт відмовляє ще до перевірок версії, і assert
+                # "рівно один ::error::" почав би рахувати не те. У fixture
+                # немає .git, тому звірка провенансу з історією лише
+                # попереджає.
+                ('{{"packageVersion": "{0}", "releaseChannel": "prerelease", "releaseDate": "{1}", "buildId": "0123456", "sourceCommit": "0123456789abcdef0123456789abcdef01234567"}}' -f $PackageVersion, $fixtureReleaseDate),
                 [Text.Encoding]::UTF8
             )
             # CHANGELOG окремо: йому потрібен ДАТОВАНИЙ заголовок рівня

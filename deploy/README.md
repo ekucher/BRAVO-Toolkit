@@ -100,7 +100,10 @@ releaseChannel відсутній                         -> ВІДМОВА
 
 ```powershell
 # свідоме розгортання prerelease — пілот, перевірка виправлення
-.\Update-BRAVOServer.ps1 -Tag v5.3.0-rc.1 -AllowPrereleaseChannel
+# vX.Y.Z-rc.N — ПЛЕЙСХОЛДЕР. Підставте кандидата, який ви справді
+# збираєтесь розгорнути; конкретний тег тут не наводиться навмисно,
+# щоб приклад не почав читатись як рекомендація.
+.\Update-BRAVOServer.ps1 -Tag vX.Y.Z-rc.N -AllowPrereleaseChannel
 ```
 
 Рішення фіксується в журналі розкатки. Доти `Install-BRAVOServer.ps1`

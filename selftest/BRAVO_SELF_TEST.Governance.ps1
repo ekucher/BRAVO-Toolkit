@@ -287,6 +287,29 @@
         -Name "ReleasePolicy/CiGateEnforcesBranchVersionChannel" `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має існувати і викликатися з .github\workflows\ci.yml — інакше відповідність гілки, версії та каналу тримається лише на пам'яті людини"
 
+    # Перевірка провенансу в ci\Test-BRAVOReleasePolicy.ps1 читає VERSION.json
+    # у коміті sourceCommit. При shallow-checkout той коміт недосяжний, і
+    # перевірка ТИХО вимикається: гейт лишається в workflow, але перестає
+    # щось охороняти. Саме цей клас — «обов'язок без механізму» — уже
+    # коштував трьох діб неконсистентного провенансу на developer, тому
+    # fetch-depth: 0 тримається тестом, а не домовленістю.
+    #
+    # Розбираємо блок задачі текстово: у Windows PowerShell 5.1 немає
+    # вбудованого YAML-парсера, а тягнути модуль заради однієї перевірки
+    # означало б зробити self-test залежним від галереї.
+    $releasePolicyJobMatch = [regex]::Match(
+        $ciWorkflowTextForPolicy,
+        '(?ms)^  static-checks:\r?$(?<Body>.*?)(?=^  [A-Za-z0-9_-]+:\r?$|\z)')
+    $releasePolicyJobBody = if ($releasePolicyJobMatch.Success) { $releasePolicyJobMatch.Groups['Body'].Value } else { '' }
+    Test-BRAVOCondition `
+        -Condition (
+            $releasePolicyJobMatch.Success -and
+            $releasePolicyJobBody.Contains('ci\Test-BRAVOReleasePolicy.ps1') -and
+            $releasePolicyJobBody -match '(?m)^\s*fetch-depth:\s*0\s*$'
+        ) `
+        -Name "Governance/ReleasePolicyJobFetchesFullHistory" `
+        -Failure "задача static-checks у .github\workflows\ci.yml має і викликати ci\Test-BRAVOReleasePolicy.ps1, і задавати fetch-depth: 0 — без повної історії перевірка провенансу sourceCommit мовчки вимикається"
+
     # Функціональна перевірка самого gate-скрипта, а не лише факту його
     # існування. X.Y.Z завжди є підрядком X.Y.Z-dev.N/-rc.N — саме в
     # момент promotion у master, де ця перевірка найважливіша,
@@ -319,7 +342,13 @@
                 [string]$ReleaseDate = '2026-08-05'
             )
             $utf8NoBom = New-Object Text.UTF8Encoding($false)
-            [IO.File]::WriteAllText((Join-Path $ProbeRoot 'VERSION.json'), ('{{"packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"{0}"}}' -f $ReleaseDate), $utf8NoBom)
+            # buildId/sourceCommit: RELEASE_POLICY 7.2 вимагає провенанс, і без
+            # нього гейт відмовляє ще до перевірок нижче. Значення синтетичні
+            # й самоузгоджені (buildId = перші 7 символів sourceCommit); у
+            # probe-корені немає .git, тому звірка провенансу з історією тут
+            # лише попереджає — саме те, що треба, щоб ці випадки перевіряли
+            # CHANGELOG і заголовки, а не щось інше.
+            [IO.File]::WriteAllText((Join-Path $ProbeRoot 'VERSION.json'), ('{{"packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"{0}","buildId":"0123456","sourceCommit":"0123456789abcdef0123456789abcdef01234567"}}' -f $ReleaseDate), $utf8NoBom)
             [IO.File]::WriteAllText((Join-Path $ProbeRoot 'CHANGELOG.md'), "# Changelog`r`n`r`n$ChangelogHeading`r`n`r`nОпис.`r`n", $utf8NoBom)
             [IO.File]::WriteAllText((Join-Path $ProbeRoot 'README.md'), "$ReadmeHeader`r`n", $utf8NoBom)
             [IO.File]::WriteAllText((Join-Path $ProbeRoot 'BRAVO_SETUP.md'), "$ReadmeHeader`r`n", $utf8NoBom)
@@ -383,6 +412,96 @@
         -Condition ($releasePolicyProbeResults['UndatedStableHeading'] -ne 0) `
         -Name "ReleasePolicy/RejectsUndatedStableChangelogHeading" `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати promotion, якщо заголовок CHANGELOG.md для stable-версії не датований — звіряти releaseDate немає з чим; код виходу: $($releasePolicyProbeResults['UndatedStableHeading'])"
+
+    # --- Провенанс: sourceCommit має нести ТУ САМУ packageVersion --------
+    # Потрібен справжній git-репозиторій: перевірка читає VERSION.json у
+    # коміті sourceCommit. Фікстура вище його не має, тому тут окремий
+    # тимчасовий репозиторій із двох комітів.
+    #
+    # Відтворюємо рівно те, що сталося з 5.3.0-dev.3: коміт A несе одну
+    # packageVersion, робоче дерево — іншу, а sourceCommit лишився вказувати
+    # на A. buildId при цьому узгоджений із sourceCommit, тобто наявний
+    # Version/StampConsistency такий стан пропускає.
+    $provenanceProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_PROVENANCE_PROBE_{0}" -f [guid]::NewGuid().ToString('N'))
+    $provenanceProbeExit = $null
+    $provenanceProbeLimitation = ''
+    # Ініціалізація ДО try: під Set-StrictMode звертання до невизначеної
+    # змінної нижче замаскувало б справжню причину відмови git. Дефолти —
+    # найсуворіші (git не спрацював).
+    $gitInitOk = $false
+    $probeBaseCommit = ''
+    try {
+        [void][IO.Directory]::CreateDirectory((Join-Path $provenanceProbeRoot 'modules\BRAVO.Fake'))
+        $utf8NoBomProbe = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $provenanceProbeRoot 'BRAVO_SELF_TEST.ps1'), '', (New-Object Text.UTF8Encoding($true)))
+        Copy-Item -LiteralPath (Join-Path $root 'BRAVO_CONFIG_LOADER.ps1') -Destination (Join-Path $provenanceProbeRoot 'BRAVO_CONFIG_LOADER.ps1') -Force
+        [IO.File]::WriteAllText(
+            (Join-Path $provenanceProbeRoot 'modules\BRAVO.Fake\BRAVO.Fake.psd1'),
+            "@{`r`n    ModuleVersion = '4.5.0'`r`n    GUID = '22222222-2222-2222-2222-222222222222'`r`n    Author = 'BRAVO self-test'`r`n}`r`n",
+            (New-Object Text.UTF8Encoding($true))
+        )
+        foreach ($documentName in @('README.md', 'BRAVO_SETUP.md')) {
+            [IO.File]::WriteAllText((Join-Path $provenanceProbeRoot $documentName), "# BRAVO 4.5.0 — опис`r`n", $utf8NoBomProbe)
+        }
+        [IO.File]::WriteAllText(
+            (Join-Path $provenanceProbeRoot 'CHANGELOG.md'),
+            "# Changelog`r`n`r`n## 4.5.0 — 2026-08-05`r`n`r`nОпис.`r`n",
+            $utf8NoBomProbe)
+
+        # Коміт A: packageVersion 4.4.0 (СТАРА версія лінії).
+        [IO.File]::WriteAllText(
+            (Join-Path $provenanceProbeRoot 'VERSION.json'),
+            '{"packageVersion":"4.4.0","releaseChannel":"stable","releaseDate":"2026-08-05"}',
+            $utf8NoBomProbe)
+
+        $previousErrorActionForGit = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            # -c замість git config: ідентичність коммітера на раннері може
+            # бути не задана, і тоді git відмовить створювати коміт.
+            $null = & git -C $provenanceProbeRoot init --quiet 2>&1
+            $gitInitOk = ($LASTEXITCODE -eq 0)
+            if ($gitInitOk) {
+                $null = & git -C $provenanceProbeRoot add -A 2>&1
+                $null = & git -C $provenanceProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'probe base' --quiet 2>&1
+                $gitInitOk = ($LASTEXITCODE -eq 0)
+            }
+            if ($gitInitOk) {
+                $probeBaseCommit = (& git -C $provenanceProbeRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+                $gitInitOk = ($LASTEXITCODE -eq 0 -and $probeBaseCommit -match '^[0-9a-f]{40}$')
+            }
+        } finally {
+            $ErrorActionPreference = $previousErrorActionForGit
+        }
+
+        if (-not $gitInitOk) {
+            $provenanceProbeLimitation = 'git недоступний або не може створити коміт у тимчасовому репозиторії'
+        } else {
+            # Робоче дерево: packageVersion 4.5.0, а провенанс лишився від
+            # коміта A (4.4.0). buildId узгоджений із sourceCommit навмисно.
+            [IO.File]::WriteAllText(
+                (Join-Path $provenanceProbeRoot 'VERSION.json'),
+                ('{{"packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"2026-08-05","buildId":"{0}","sourceCommit":"{1}"}}' -f $probeBaseCommit.Substring(0, 7), $probeBaseCommit),
+                $utf8NoBomProbe)
+
+            $previousErrorActionForProbe = $ErrorActionPreference
+            $ErrorActionPreference = 'Continue'
+            try {
+                $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\Test-BRAVOReleasePolicy.ps1') -Root $provenanceProbeRoot -Branch 'master' 2>&1
+                $provenanceProbeExit = $LASTEXITCODE
+            } finally {
+                $ErrorActionPreference = $previousErrorActionForProbe
+            }
+        }
+    } finally {
+        Remove-Item -LiteralPath $provenanceProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Test-BRAVOCondition `
+        -Condition ($null -ne $provenanceProbeExit -and $provenanceProbeExit -ne 0) `
+        -Name "ReleasePolicy/RejectsProvenanceFromDifferentVersion" `
+        -EnvironmentLimitation $provenanceProbeLimitation `
+        -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де VERSION.json у коміті sourceCommit несе іншу packageVersion — саме так developer три доби ніс 5.3.0-dev.3 із провенансом 5.3.0-dev.2; код виходу: $provenanceProbeExit"
 
     # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
     # stable-версії, а не лише нерівність рядків (стара реалізація
