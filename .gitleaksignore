@@ -95,3 +95,16 @@
 # дефолтне правило generic-api-key матчить сам патерн імені ключа.
 # Фіксується per-fingerprint, без послаблення правила.
 074707db48546e31d04ce1842e8b48fc5e145a46:modules/BRAVO.Configuration/BRAVO.Configuration.psm1:generic-api-key:362
+
+# PR #206 (security-hardening хуків Claude Code), коміт b8a3b6d: тестова
+# фікстура у Test-Redact.ps1 — $s3 = Protect-HookTextFailSafe -Text
+# 'token: abcDEF123456'. Мішаний регістр + цифри поруч зі словом "token:"
+# збігається з entropy-евристикою generic-api-key; значення — синтетичний
+# літерал у juniор unit-тесті fail-safe redaction-логіки, ніколи не
+# credential, у жоден Credential Manager чи мережевий виклик не потрапляє
+# (Send-SlackMessage у цьому тесті взагалі не викликається). Наступний
+# коміт (daaf3ca) замінив значення на явно неправдоподібне
+# 'placeholder-not-a-real-token' саме щоб уникнути цього класу
+# false positive надалі; цей запис ігнорує лише історичну знахідку в уже
+# опублікованому коміті b8a3b6d, без rebase/force-push.
+b8a3b6d0a2ccc1417b6c151395827225206159b8:.claude/hooks/tests/Test-Redact.ps1:generic-api-key:54
