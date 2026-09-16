@@ -963,3 +963,115 @@ Test-BRAVOCondition `
         -Failure ("release-manifest.json мусить містити поля, які читає розкатка; ci\New-BRAVOReleaseArtifact.ps1 не згадує: " +
             [string]::Join(', ', @($missingManifestFields)))
 }
+
+# --- #153: RC-матриця приймання по ОС --------------------------------------
+# Дефект, який закриває цей блок: промоція RC -> stable не вимагала доказів
+# з реальних хостів, а формальної матриці ОС у RELEASE_POLICY.md не було —
+# лише епізодична згадка Server 2022/2016 у нотатці про acceptance 5.2.x.
+# Підстава емпірична: обидва дефекти PR #148 відтворювались лише на реальних
+# хостах і були невидимі для CI.
+#
+# Перевірки навмисно НЕ переписують класифікацію ОС: вона належить
+# modules\BRAVO.Compatibility і SECURITY.md. Тут доводиться лише те, що
+# матриця не винаходить паралельну класифікацію і не осиротіла.
+#
+# Блок виконується у власній області (& { ... }) за конвенцією #163.
+
+& {
+    $osMatrixPolicyText = [IO.File]::ReadAllText(
+        (Join-Path $root 'RELEASE_POLICY.md'), [Text.Encoding]::UTF8)
+    $osMatrixSecurityText = [IO.File]::ReadAllText(
+        (Join-Path $root 'SECURITY.md'), [Text.Encoding]::UTF8)
+    $osMatrixCompatibilityText = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Compatibility\BRAVO.Compatibility.psm1'), [Text.Encoding]::UTF8)
+
+    $osMatrixHeading = '### 9.4. RC-матриця приймання по ОС'
+    $osMatrixStart = $osMatrixPolicyText.IndexOf($osMatrixHeading)
+    $osMatrixSection = ''
+    if ($osMatrixStart -ge 0) {
+        $osMatrixEnd = $osMatrixPolicyText.IndexOf('## 10. Promotion', $osMatrixStart)
+        $osMatrixSection = if ($osMatrixEnd -gt $osMatrixStart) {
+            $osMatrixPolicyText.Substring($osMatrixStart, $osMatrixEnd - $osMatrixStart)
+        } else {
+            $osMatrixPolicyText.Substring($osMatrixStart)
+        }
+    }
+
+    Test-BRAVOCondition `
+        -Condition ($osMatrixStart -ge 0 -and $osMatrixSection.Length -gt 0) `
+        -Name "Governance/ReleasePolicyHasOsAcceptanceMatrix" `
+        -Failure "RELEASE_POLICY.md мусить містити розділ «$osMatrixHeading» — інакше промоція stable не має контракту приймання на реальних хостах"
+
+    # Матриця, на яку ніхто не посилається, — мертвий текст. Критерії
+    # готовності RC (§9.3) мусять її вимагати.
+    $osMatrixReadinessIndex = $osMatrixPolicyText.IndexOf("### 9.3. Критерії готовності")
+    $osMatrixReadinessSection = if ($osMatrixReadinessIndex -ge 0 -and $osMatrixStart -gt $osMatrixReadinessIndex) {
+        $osMatrixPolicyText.Substring($osMatrixReadinessIndex, $osMatrixStart - $osMatrixReadinessIndex)
+    } else { '' }
+    Test-BRAVOCondition `
+        -Condition ($osMatrixReadinessSection.Contains('§9.4')) `
+        -Name "Governance/OsAcceptanceMatrixIsWiredIntoRcReadiness" `
+        -Failure "критерії готовності RC (RELEASE_POLICY.md §9.3) мусять вимагати докази по матриці §9.4 — інакше матриця лишається текстом, який нічого не блокує"
+
+    # Обидві обов'язкові цілі мусять бути названі. Клієнтська Windows тут не
+    # косметика: саме на ній немає diskshadow.exe, і саме там знайдено
+    # перший дефект PR #148.
+    $osMatrixRequiredTargets = @('Windows Server 2022', 'Windows 11')
+    $osMatrixMissingTargets = @(
+        $osMatrixRequiredTargets | Where-Object { -not $osMatrixSection.Contains($_) })
+    Test-BRAVOCondition `
+        -Condition (@($osMatrixMissingTargets).Count -eq 0) `
+        -Name "Governance/OsAcceptanceMatrixNamesMandatoryTargets" `
+        -Failure ("матриця §9.4 мусить називати обов'язкові цілі приймання; бракує: " +
+            [string]::Join(', ', @($osMatrixMissingTargets)))
+
+    # Класифікація ОС належить modules\BRAVO.Compatibility і SECURITY.md.
+    # Матриця мусить користуватись ТИМИ САМИМИ рівнями, а не власними.
+    $osMatrixTierNames = @('Supported', 'LegacyBestEffort')
+    $osMatrixUnknownTiers = @(
+        $osMatrixTierNames | Where-Object { -not $osMatrixCompatibilityText.Contains($_) })
+    Test-BRAVOCondition `
+        -Condition (
+            @($osMatrixUnknownTiers).Count -eq 0 -and
+            $osMatrixSection.Contains('BRAVO.Compatibility') -and
+            $osMatrixSection.Contains('Supported') -and
+            $osMatrixSection.Contains('LegacyBestEffort')
+        ) `
+        -Name "Governance/OsAcceptanceMatrixReusesCompatibilityTiers" `
+        -Failure ("матриця §9.4 мусить посилатися на рівні modules\BRAVO.Compatibility, а не вводити " +
+            "паралельну класифікацію; невідомі модулю рівні: " +
+            [string]::Join(', ', @($osMatrixUnknownTiers)))
+
+    # Реальна суперечність, яку варто ловити механічно: ціль приймання з
+    # рівня Unsupported. Production-запуск на ній блокується кодом 30, тобто
+    # «приймання» там неможливе за побудовою.
+    $osMatrixUnsupportedRowIndex = $osMatrixSecurityText.IndexOf('**Unsupported**')
+    $osMatrixUnsupportedRow = if ($osMatrixUnsupportedRowIndex -ge 0) {
+        $osMatrixSecurityText.Substring($osMatrixUnsupportedRowIndex).Split([char]10)[0]
+    } else { '' }
+    $osMatrixUnsupportedNames = @(
+        @('Windows 7', 'Windows Server 2008 R2') |
+            Where-Object { $osMatrixUnsupportedRow.Contains($_) })
+    $osMatrixForbiddenTargets = @(
+        $osMatrixUnsupportedNames | Where-Object { $osMatrixSection.Contains($_) })
+    Test-BRAVOCondition `
+        -Condition (
+            $osMatrixUnsupportedRowIndex -ge 0 -and
+            @($osMatrixUnsupportedNames).Count -gt 0 -and
+            @($osMatrixForbiddenTargets).Count -eq 0
+        ) `
+        -Name "Governance/OsAcceptanceMatrixExcludesUnsupportedSystems" `
+        -Failure ("матриця §9.4 не може містити ціль приймання з рівня Unsupported (SECURITY.md): " +
+            "production-запуск там блокується кодом 30. Знайдено: " +
+            [string]::Join(', ', @($osMatrixForbiddenTargets)))
+
+    # Недоступність self-test на жорсткому хості мусить бути описана саме як
+    # класифікований стан, інакше оператор читає [FAIL] як дефект комплекту.
+    Test-BRAVOCondition `
+        -Condition (
+            $osMatrixSection.Contains('Constrained Language Mode') -and
+            $osMatrixSection.Contains('НЕДОСТУПНИЙ')
+        ) `
+        -Name "Governance/OsAcceptanceMatrixClassifiesUnavailableSelfTest" `
+        -Failure "матриця §9.4 мусить окремо класифікувати недоступність self-test на жорстко налаштованому хості — інакше провал приймання й обмеження хоста виглядають однаково"
+}
