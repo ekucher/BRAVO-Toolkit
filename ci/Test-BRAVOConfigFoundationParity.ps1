@@ -395,6 +395,15 @@ $knownIntentionalDiffPrefixes = @(
     'BravoConfigurationMetadata.PackageVersion',
     'ScriptVersion',
     'ScriptBuildId',
+    # ДАТА РЕЛІЗУ — той самий клас, і в цьому списку її бракувало лише
+    # тому, що releaseDate у developer був заморожений на 2026-08-26 ще
+    # з штампу 5.3.0-rc.1: поле не відрізнялось від бази 42cf9ad, тож
+    # відмінності не було видно. Щойно поле полагодили (звірка з
+    # заголовком CHANGELOG.md у ci\Test-BRAVOReleasePolicy.ps1), воно
+    # поводиться рівно як PackageVersion і BuildId вище — відрізняється
+    # між будь-якими двома комітами, де штампували версію.
+    'BravoConfigurationMetadata.ReleaseDate',
+    'ScriptDate',
     # АДИТИВНІ КЛЮЧІ КОНФІГУРАЦІЇ, додані ПІСЛЯ бази 42cf9ad. У BEFORE їх
     # не існує взагалі (звідси <null>), у AFTER вони мають свої дефолти —
     # це ріст схеми на лінії розробки, а не зміна наявної поведінки.
