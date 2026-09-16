@@ -1,0 +1,54 @@
+﻿{
+    "autoCompactWindow": 500000,
+    "hooks": {
+        "PreCompact": [
+            {
+                "hooks": [
+                    {
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/precompact-checkpoint.ps1\"",
+                        "type": "command"
+                    }
+                ]
+            }
+        ],
+        "UserPromptSubmit": [
+            {
+                "hooks": [
+                    {
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/save-task.ps1\"",
+                        "type": "command"
+                    }
+                ]
+            }
+        ],
+        "Notification": [
+            {
+                "matcher": "permission_prompt",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-slack.ps1\"",
+                        "async": true,
+                        "timeout": 15
+                    }
+                ]
+            }
+        ],
+        "Stop": [
+            {
+                "hooks": [
+                    {
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/save-task.ps1\"",
+                        "type": "command"
+                    },
+                    {
+                        "type": "command",
+                        "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-slack.ps1\"",
+                        "async": true,
+                        "timeout": 15
+                    }
+                ]
+            }
+        ]
+    }
+}
