@@ -521,6 +521,86 @@
         -EnvironmentLimitation $provenanceProbeLimitation `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де VERSION.json у коміті sourceCommit несе іншу packageVersion, і назвати саме цю причину (маркер 'RELEASE_POLICY 7.2'), а не вийти ненульовим через щось інше; код виходу: $provenanceProbeExit"
 
+    # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
+    # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
+    # про вміст: перештампування однієї версії штатне, тому залишений
+    # старий sourceCommit проходив би обидві перевірки. Інваріант
+    # ci\New-BRAVOReleaseArtifact.ps1: між sourceCommit і комітом архіву
+    # відрізняються РІВНО VERSION.json і RUNTIME_MANIFEST.json.
+    #
+    # Перевірка провенансу в скрипті стоїть ДО git archive, тому фікстурі
+    # не потрібен справжній комплект: негативний випадок падає саме на
+    # ній, а позитивний — гарантовано ПІСЛЯ неї, і це й перевіряється
+    # (відсутність маркера), а не код виходу.
+    #
+    # Маркери PROVENANCE_* свідомо ASCII: stderr дочірнього процесу
+    # кодується кодовою сторінкою консолі (CP437/CP866), і кириличний
+    # Contains давав би хибний результат залежно від chcp.
+    $artifactProbeRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_ARTIFACT_PROV_{0}" -f [guid]::NewGuid().ToString('N'))
+    $artifactProbeStale = ''
+    $artifactProbeFresh = ''
+    $artifactProbeLimitation = ''
+    $artifactProbeReady = $false
+    try {
+        [void][IO.Directory]::CreateDirectory($artifactProbeRoot)
+        $utf8NoBomArtifact = New-Object Text.UTF8Encoding($false)
+        $writeProbeVersion = {
+            param([string]$SourceCommit)
+            [IO.File]::WriteAllText(
+                (Join-Path $artifactProbeRoot 'VERSION.json'),
+                ('{{"product":"BRAVO-Toolkit","packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"2026-08-05","buildId":"{0}","sourceCommit":"{1}"}}' -f $SourceCommit.Substring(0, 7), $SourceCommit),
+                $utf8NoBomArtifact)
+        }
+
+        $previousErrorActionArtifact = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $null = & git -C $artifactProbeRoot -c init.defaultBranch=master init --quiet 2>&1
+            if ($LASTEXITCODE -eq 0) {
+                [IO.File]::WriteAllText((Join-Path $artifactProbeRoot 'code.txt'), "v1`r`n", $utf8NoBomArtifact)
+                [IO.File]::WriteAllText((Join-Path $artifactProbeRoot 'RUNTIME_MANIFEST.json'), "{}`r`n", $utf8NoBomArtifact)
+                & $writeProbeVersion '0000000000000000000000000000000000000000'
+                $null = & git -C $artifactProbeRoot add -A 2>&1
+                $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'code' --quiet 2>&1
+                $artifactProbeBase = (& git -C $artifactProbeRoot rev-parse HEAD 2>&1 | Out-String).Trim()
+                $artifactProbeReady = ($LASTEXITCODE -eq 0 -and $artifactProbeBase -match '^[0-9a-f]{40}$')
+            }
+
+            if ($artifactProbeReady) {
+                # ЧИСТИЙ штамп: відносно бази змінені лише два метаданих файли.
+                & $writeProbeVersion $artifactProbeBase
+                [IO.File]::WriteAllText((Join-Path $artifactProbeRoot 'RUNTIME_MANIFEST.json'), "{ }`r`n", $utf8NoBomArtifact)
+                $null = & git -C $artifactProbeRoot add -A 2>&1
+                $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'stamp' --quiet 2>&1
+                $artifactProbeFresh = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'HEAD' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
+
+                # СТАЛЕ: штамп зачіпає ще й код, тобто провенанс його не описує.
+                [IO.File]::WriteAllText((Join-Path $artifactProbeRoot 'code.txt'), "v2`r`n", $utf8NoBomArtifact)
+                $null = & git -C $artifactProbeRoot add -A 2>&1
+                $null = & git -C $artifactProbeRoot -c user.email='selftest@bravo.local' -c user.name='BRAVO self-test' commit -m 'stale stamp' --quiet 2>&1
+                $artifactProbeStale = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File (Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1') -RepositoryRoot $artifactProbeRoot -Ref 'HEAD' -OutputDir (Join-Path $artifactProbeRoot 'out') 2>&1 | Out-String
+            } else {
+                $artifactProbeLimitation = 'git недоступний або не може створити коміт у тимчасовому репозиторії'
+            }
+        } finally {
+            $ErrorActionPreference = $previousErrorActionArtifact
+        }
+    } finally {
+        Remove-Item -LiteralPath $artifactProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    Test-BRAVOCondition `
+        -Condition ($artifactProbeStale.Contains('PROVENANCE_STALE')) `
+        -Name "ReleaseArtifact/RejectsStaleProvenanceContent" `
+        -EnvironmentLimitation $artifactProbeLimitation `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 має відмовляти, коли між sourceCommit і комітом архіву змінені не лише VERSION.json і RUNTIME_MANIFEST.json (маркер PROVENANCE_STALE); вивід: $artifactProbeStale"
+
+    Test-BRAVOCondition `
+        -Condition (-not $artifactProbeFresh.Contains('PROVENANCE_STALE')) `
+        -Name "ReleaseArtifact/AcceptsCleanStampProvenance" `
+        -EnvironmentLimitation $artifactProbeLimitation `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 НЕ має відхиляти чистий коміт-штамп (змінені лише VERSION.json і RUNTIME_MANIFEST.json); вивід: $artifactProbeFresh"
+
     # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
     # stable-версії, а не лише нерівність рядків (стара реалізація
     # пропускала downgrade і prerelease). Реальна функція екстрагується з
