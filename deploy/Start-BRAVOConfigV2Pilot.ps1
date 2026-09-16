@@ -98,9 +98,14 @@ try {
             $resolvedInstallRoot = Resolve-BRAVOPilotFullPath $InstallRoot
             $resolvedArtifactRoot = Resolve-BRAVOPilotFullPath $ArtifactRoot
 
-            $preflight = Invoke-BRAVOPilotPreflight -InstallRoot $resolvedInstallRoot -ArtifactRoot $resolvedArtifactRoot -EvidenceRoot $EvidenceRoot
-            if (-not $preflight.Pass) {
-                Write-Host ("[FAILED] Preflight не пройдено — блокуючі перевірки: {0}. -Prepare зупинено." -f ([string]::Join(', ', $preflight.FailedBlockingChecks))) -ForegroundColor Red
+            # НЕ називати цю змінну $preflight: PowerShell-змінні
+            # регістронезалежні, а скрипт уже має типізований [switch]$Preflight
+            # (параметр-набір 'Preflight') — присвоєння PSCustomObject у змінну
+            # з тим самим ім'ям (без урахування регістру) намагається
+            # конвертувати результат у SwitchParameter і кидає виняток.
+            $preflightResult = Invoke-BRAVOPilotPreflight -InstallRoot $resolvedInstallRoot -ArtifactRoot $resolvedArtifactRoot -EvidenceRoot $EvidenceRoot
+            if (-not $preflightResult.Pass) {
+                Write-Host ("[FAILED] Preflight не пройдено — блокуючі перевірки: {0}. -Prepare зупинено." -f ([string]::Join(', ', $preflightResult.FailedBlockingChecks))) -ForegroundColor Red
                 exit 1
             }
 
@@ -108,7 +113,7 @@ try {
             Write-BRAVOPilotEvidenceJson -Path (Join-Path $dir 'artifact-manifest.json') -Object (
                 Get-Content -LiteralPath (Join-Path $resolvedArtifactRoot 'manifest\PILOT_MANIFEST.json') -Raw -Encoding UTF8 | ConvertFrom-Json
             )
-            Write-BRAVOPilotEvidenceJson -Path (Join-Path $dir 'preflight.json') -Object $preflight
+            Write-BRAVOPilotEvidenceJson -Path (Join-Path $dir 'preflight.json') -Object $preflightResult
             Set-BRAVOPilotState -EvidenceDir $dir -State 'PreflightPassed' | Out-Null
 
             Invoke-BRAVOPilotConfigSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $dir 'before.snapshot.json') | Out-Null
