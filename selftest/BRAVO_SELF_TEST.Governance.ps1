@@ -521,6 +521,134 @@
         -EnvironmentLimitation $provenanceProbeLimitation `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де VERSION.json у коміті sourceCommit несе іншу packageVersion, і назвати саме цю причину (маркер 'RELEASE_POLICY 7.2'), а не вийти ненульовим через щось інше; код виходу: $provenanceProbeExit"
 
+    # --- Володіння шляхом legacy BRAVO.config у self-test (#154, B4-2) ---
+    # Кореневий BRAVO.config зникне з пакета на кроці B4-2. Доки кожне
+    # місце будувало шлях самостійно, той крок означав переписати
+    # фікстурну тканину ОДНОЧАСНО зі зміною runtime-контракту — саме тому
+    # #154 і вважав його заблокованим.
+    #
+    # Тепер шлях знає рівно одна функція, і guard тримає це: у
+    # BRAVO_SELF_TEST.ps1 допускається РІВНО одне входження (тіло
+    # Get-BRAVOSelfTestLegacyConfigPath), у фрагментах — жодного.
+    #
+    # Сам цей файл виключено зі сканування: він містить шаблон як
+    # рядковий літерал і інакше ловив би сам себе. Компроміс свідомий —
+    # альтернатива (складніші межі сканування) коштувала б більше, ніж
+    # дає.
+    # Шаблон ловить співпадіння в ОДНОМУ РЯДКУ посилання на корінь
+    # репозиторію ($root / $PSScriptRoot) з іменем BRAVO.config — у будь-
+    # якому порядку. Це покриває позиційний Join-Path, іменовані
+    # параметри (-Path/-ChildPath, у будь-якій послідовності) та
+    # інтерполяцію, зокрема через вкладений вираз з екрануванням лапок:
+    # саме остання форма пройшла повз першу редакцію guard-а, і перевірка
+    # тоді звітувала PASS при живій прямій залежності.
+    #
+    # Межа чесна й названа: розрив виразу на кілька рядків шаблон не
+    # ловить. Це defence-in-depth, а не останній рубіж — остаточну
+    # відповідь дає сам крок B4-2, де зниклий файл валить будь-яке
+    # уціліле пряме читання. Точніший варіант — розбір AST — свідомо не
+    # вводиться тут: він коштує більше коду, ніж дає понад це.
+    #
+    # $scenarioRoot і подібні НЕ ловляться: \$root вимагає, щоб одразу
+    # після $ ішло саме "root", а \b відсікає $rootSomething.
+    # (?<!`) відсікає ЕКРАНОВАНИЙ долар: `$PSScriptRoot усередині
+    # подвійних лапок — це літерал у тексті про код (наприклад у
+    # -Failure іншого guard-а), а не звернення до змінної. Без цього
+    # шаблон рахував два таких описи як живі залежності.
+    #
+    # ІМ'Я ФАЙЛУ звіряється РЕГІСТРОНЕЗАЛЕЖНО: цільова ФС регістру не
+    # розрізняє, тож Join-Path $root 'bravo.config' читається успішно, а
+    # статичні перевантаження [regex]::Matches/IsMatch за замовчуванням
+    # регістрочутливі — без (?i:...) guard звітував би PASS при живій
+    # прямій залежності.
+    #
+    # Ціна — обов'язкова МЕЖА імені файлу: без неї "BRAVO.config" збігся б
+    # усередині "BRAVO.Configuration" (modules\BRAVO.Configuration\...),
+    # якого тут багато. (?![A-Za-z0-9_]) вимагає, щоб після "config" не
+    # йшов символ імені; у реальних посиланнях там лапка або роздільник.
+    #
+    # ІМ'Я ЗМІННОЇ, навпаки, лишається регістрочутливим, хоч змінні
+    # PowerShell регістру не розрізняють. Це СВІДОМИЙ вибір, перевірений
+    # на фактичному файлі: з (?i) на весь шаблон з'являється четвертий
+    # збіг — $fixtureConfigPath = Join-Path $Root 'BRAVO.config' у
+    # New-BRAVOProductionConfigFixtureResult, де $Root — ПАРАМЕТР функції
+    # (тимчасовий fixture-корінь), а не корінь репозиторію. Тобто guard
+    # падав би на коректному коді. Конвенція цього файлу: $root —
+    # репозиторій, $Root — локальний параметр фікстури.
+    $legacyConfigRootReference = '(?<!`)\$(root|PSScriptRoot)\b'
+    $legacyConfigFileReference = '(?i:BRAVO\.config)(?![A-Za-z0-9_])'
+    $legacyConfigPathPattern = ('({0}[^\r\n]{{0,80}}{1})|({1}[^\r\n]{{0,80}}{0})' -f $legacyConfigRootReference, $legacyConfigFileReference)
+    $legacyConfigOwnerText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SELF_TEST.ps1'), [Text.Encoding]::UTF8)
+    $legacyConfigOwnerMatches = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern))
+    $legacyConfigOwnerHits = $legacyConfigOwnerMatches.Count
+
+    # Самої КІЛЬКОСТІ замало: якби одне з легальних посилань прибрали, а
+    # натомість додали пряме читання деінде, лічильник лишився б 2 і guard
+    # звітував би PASS при живому обході. Тому звіряються самі РЯДКИ, у
+    # яких стався збіг.
+    # Порівняння -ceq, а не -eq: рядкові оператори PowerShell за
+    # замовчуванням регістронезалежні, тож зміна регістру в тілі
+    # власника проїхала б повз звірку.
+    $legacyConfigOwnerLines = @(
+        $legacyConfigOwnerMatches | ForEach-Object {
+            $matchIndex = $_.Index
+            $lineStart = $legacyConfigOwnerText.LastIndexOf("`n", $matchIndex) + 1
+            $lineEnd = $legacyConfigOwnerText.IndexOf("`n", $matchIndex)
+            if ($lineEnd -lt 0) { $lineEnd = $legacyConfigOwnerText.Length }
+            $legacyConfigOwnerText.Substring($lineStart, $lineEnd - $lineStart).Trim()
+        } | Sort-Object -Unique
+    )
+    $legacyConfigExpectedLines = @(
+        '$ConfigPath = Join-Path $root "BRAVO.config"',
+        'return (Join-Path $root ''BRAVO.config'')',
+        '$shippedConfigPath = Join-Path $root ''BRAVO.config'''
+    ) | Sort-Object -Unique
+    $legacyConfigOwnerLinesText = [string]::Join(' | ', $legacyConfigOwnerLines)
+    $legacyConfigExpectedLinesText = [string]::Join(' | ', $legacyConfigExpectedLines)
+
+    $legacyConfigFragmentOffenders = New-Object System.Collections.ArrayList
+    foreach ($fragmentFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter '*.ps1' -File)) {
+        if ($fragmentFile.Name -eq 'BRAVO_SELF_TEST.Governance.ps1') { continue }
+        $fragmentText = [IO.File]::ReadAllText($fragmentFile.FullName, [Text.Encoding]::UTF8)
+        if ([regex]::IsMatch($fragmentText, $legacyConfigPathPattern)) {
+            [void]$legacyConfigFragmentOffenders.Add($fragmentFile.Name)
+        }
+    }
+
+    # Рівно ТРИ легальні входження в кореневому файлі — три РІЗНІ
+    # відповідальності, а не дублі:
+    #   1) тіло Get-BRAVOSelfTestLegacyConfigPath — джерело legacy-тексту
+    #      для фікстур (клас A). На B4-2 перейде на заморожений актив;
+    #   2) тіло Get-BRAVOSelfTestShippedConfigPath — конфігурація, ЩО
+    #      ВІДВАНТАЖУЄТЬСЯ, для тверджень про пакет (клас B). На B4-2
+    #      перейде на канонічні дефолти, тобто В ІНШИЙ бік, ніж (1);
+    #   3) дефолт -ConfigPath — ОПЕРАЦІЙНИЙ конфіг, з якого виводиться
+    #      $configRoot і поруч з яким мусить лежати BRAVO_CONFIG_LOADER.ps1.
+    #
+    # Кожне злиття цих ролей уже було помилкою в цьому ж PR: (1)+(3) дало
+    # б "Configuration loader not found" на старті, (1)+(2) — мовчазну
+    # втрату покриття тверджень про пакет.
+    #
+    # ЩО СТАНЕТЬСЯ НА B4-2: цей guard ЗАПЛАНОВАНО впаде. Коли (1) перейде
+    # на заморожений актив, а (2) — на канонічні дефолти, кореневий шлях
+    # перестане згадуватись у їхніх тілах: кількість збігів впаде до
+    # одного (дефолт -ConfigPath), і $legacyConfigExpectedLines доведеться
+    # звузити. Це НЕ дефект guard-а і не «прихована зв'язаність»: guard
+    # фіксує саме те, що кореневий BRAVO.config читається рівно з
+    # перелічених місць, а зміна цього переліку — подія, яка мусить
+    # пройти рев'ю, а не проїхати мовчки. Ціна — один узгоджений правкою
+    # рядок у цьому файлі на кроці B4-2; тому обіцянка «зміниться рівно
+    # одне тіло функції» стосується СПОЖИВАЧІВ accessor-ів, а не цього
+    # guard-а.
+    Test-BRAVOCondition `
+        -Condition (
+            $legacyConfigOwnerHits -eq 3 -and
+            $legacyConfigOwnerLinesText -ceq $legacyConfigExpectedLinesText -and
+            $legacyConfigFragmentOffenders.Count -eq 0
+        ) `
+        -Name "Governance/LegacyConfigPathHasSingleOwner" `
+        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно три посилання на кореневий BRAVO.config (тіла Get-BRAVOSelfTestLegacyConfigPath і Get-BRAVOSelfTestShippedConfigPath та дефолт -ConfigPath), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
+
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
     # про вміст: перештампування однієї версії штатне, тому залишений

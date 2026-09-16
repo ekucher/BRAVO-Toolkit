@@ -134,7 +134,7 @@ try {
     # BRAVO.local.config перемагає явне значення з BRAVO.config).
     $localCfgDefaultBackupDir = Join-Path $localCfgScenarioRoot 'SITE_DEFAULT'
     [void][IO.Directory]::CreateDirectory($localCfgDefaultBackupDir)
-    $localCfgKitConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $localCfgKitConfigText = (Get-BRAVOSelfTestLegacyConfigText)
     $localCfgBackupRootLiteralLine = '    BackupRoot    = ""'
     if (-not $localCfgKitConfigText.Contains($localCfgBackupRootLiteralLine)) {
         throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$localCfgBackupRootLiteralLine' — оновіть підготовку local-config сценаріїв під нову форму конфігурації"
@@ -335,7 +335,7 @@ try {
     [void][IO.Directory]::CreateDirectory($busyWaitScenarioRoot)
     $busyWaitBackupDir = Join-Path $busyWaitScenarioRoot 'SITE_DEFAULT'
     [void][IO.Directory]::CreateDirectory($busyWaitBackupDir)
-    $busyWaitKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $busyWaitKitText = (Get-BRAVOSelfTestLegacyConfigText)
     $busyWaitBackupRootLine = '    BackupRoot    = ""'
     $busyWaitKeyLine = '        BusyWaitMinutes = 60'
     foreach ($busyWaitRequiredLine in @($busyWaitBackupRootLine, $busyWaitKeyLine)) {
@@ -405,7 +405,7 @@ try {
     [void][IO.Directory]::CreateDirectory($successDedupScenarioRoot)
     $successDedupBackupDir = Join-Path $successDedupScenarioRoot 'SITE_DEFAULT'
     [void][IO.Directory]::CreateDirectory($successDedupBackupDir)
-    $successDedupKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $successDedupKitText = (Get-BRAVOSelfTestLegacyConfigText)
     $successDedupBackupRootLine = '    BackupRoot    = ""'
     $successDedupKeyLine = '    SuccessDedupMinutes = 1380'
     # P0 Configuration Foundation (PR B): SuccessNotificationStatePath і
@@ -512,7 +512,7 @@ try {
     [void][IO.Directory]::CreateDirectory($storageSwitchScenarioRoot)
     $storageSwitchBackupDir = Join-Path $storageSwitchScenarioRoot 'SITE_DEFAULT'
     [void][IO.Directory]::CreateDirectory($storageSwitchBackupDir)
-    $storageSwitchKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+    $storageSwitchKitText = (Get-BRAVOSelfTestLegacyConfigText)
     $storageSwitchBackupRootLine = '    BackupRoot    = ""'
     # Префікс без закриваючої дужки: блок SFTP у committed BRAVO.config
     # тепер містить додаткові opt-in ключі (MaintenanceLogUploadEnabled/
@@ -805,7 +805,7 @@ try {
         # canonical defaults через $global:bravoSettings/... блоки-заглушки
         # реального BRAVO.config тут не потрібні, оскільки цей probe лише
         # перевіряє факт PASS/ERROR завантаження, не effective-значення.
-        $intentMatrixKitText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+        $intentMatrixKitText = (Get-BRAVOSelfTestLegacyConfigText)
         $intentMatrixBackupDir = Join-Path $intentMatrixExternalRoot 'SITE_BACKUP'
         [void][IO.Directory]::CreateDirectory($intentMatrixBackupDir)
         $intentMatrixBackupRootLine = '    BackupRoot    = ""'
@@ -962,7 +962,7 @@ function New-BRAVOConfigLoaderParityProbe {
     [void][IO.Directory]::CreateDirectory($scenarioRoot)
     try {
         if ($WithPrimary) {
-            $primaryText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+            $primaryText = (Get-BRAVOSelfTestLegacyConfigText)
             [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.config'), $primaryText, (New-Object System.Text.UTF8Encoding($false)))
         }
         [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.local.config'), $LocalConfigBody, (New-Object System.Text.UTF8Encoding($false)))
@@ -1054,7 +1054,7 @@ function New-BRAVOConfigLoaderSecurityDowngradeProbe {
     [void][IO.Directory]::CreateDirectory($scenarioRoot)
     try {
         if ($WithPrimary) {
-            $primaryText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+            $primaryText = (Get-BRAVOSelfTestLegacyConfigText)
             [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.config'), $primaryText, (New-Object System.Text.UTF8Encoding($false)))
         }
         [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.local.config'), $LocalConfigBody, (New-Object System.Text.UTF8Encoding($false)))
@@ -1214,10 +1214,16 @@ function Compare-BRAVOConfigurationGraphForParity {
 }
 
 $parityDefaultConfiguration = Get-BRAVODefaultConfiguration
+# Шлях до legacy-конфігурації бере канонічний accessor (#154, B4-2), а не
+# пряма інтерполяція кореня разом з іменем файлу: інакше ця точка
+# лишилась би залежністю від кореневого файлу, невидимою для
+# Governance/LegacyConfigPathHasSingleOwner — саме так вона й
+# ховалась, доки guard дивився тільки на Join-Path.
+$committedConfigLegacyPathLiteral = (Get-BRAVOSelfTestLegacyConfigPath).Replace("'", "''")
 $committedConfigProbeCommand = (
     "Import-Module -Name '$root\modules\BRAVO.Configuration\BRAVO.Configuration.psd1' -ErrorAction Stop; " +
     "`$default = Get-BRAVODefaultConfiguration; " +
-    "`$sb = [scriptblock]::Create([IO.File]::ReadAllText('$($root.Replace("'", "''"))\BRAVO.config', [Text.Encoding]::UTF8)); " +
+    "`$sb = [scriptblock]::Create([IO.File]::ReadAllText('$committedConfigLegacyPathLiteral', [Text.Encoding]::UTF8)); " +
     "& `$sb -ConfigRoot '$($root.Replace("'", "''"))' -RuntimeRoot '$($root.Replace("'", "''"))'; " +
     "`$primaryRaw = @{}; " +
     "foreach (`$k in @(`$default.Keys)) { `$v = Get-Variable -Name `$k -Scope Global -ErrorAction SilentlyContinue; if (`$null -ne `$v -and `$null -ne `$v.Value) { `$primaryRaw[`$k] = `$v.Value } }; " +
@@ -1353,7 +1359,7 @@ Test-BRAVOCondition `
             "BRAVO_PRIMARY_STRICTNESS_{0}" -f [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($scenarioRoot)
         try {
-            $primaryText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+            $primaryText = (Get-BRAVOSelfTestLegacyConfigText)
             if (-not [string]::IsNullOrEmpty($ExtraConfigBody)) {
                 $primaryText = $primaryText + "`r`n" + $ExtraConfigBody + "`r`n"
             }

@@ -156,8 +156,98 @@ Import-Module -Name $helperLoggingPath -ErrorAction Stop
 # альтернативний/другий шлях журналу.
 $script:selfTestHelperLogPath = Start-BRAVOHelperLog -ScriptPath $PSCommandPath -ConfigPath $ConfigPath
 
+function Get-BRAVOSelfTestLegacyConfigPath {
+    <#
+        ЄДИНЕ місце, яке знає, ДЕ лежить legacy-текст BRAVO.config для
+        self-test (#154, підготовка до B4-2).
+
+        Навіщо. Сьогодні ~20 місць у кореневому наборі й у фрагментах
+        незалежно будували шлях самі — хто як базу
+        для синтетичної фікстури, хто для статичного твердження про вміст
+        комплекту. Поки файл лежить у корені пакета, це працює. Але B4-2
+        прибирає його з пакета, і тоді кожна з цих точок ламається
+        окремо — саме тому #154 і вважав крок «прибрати файл»
+        заблокованим: він означав переписати фікстурну тканину
+        ОДНОЧАСНО зі зміною runtime-контракту.
+
+        Що змінює ця функція. Володіння шляхом стає канонічним. Сама
+        поведінка НЕ змінюється ані на байт: повертається той самий
+        кореневий файл, що й раніше. Коли B4-2 прибере його з пакета,
+        зміниться рівно одне тіло цієї функції (на заморожений тестовий
+        актив), а не 20 місць.
+
+        Чому НЕ заморожену копію вже зараз: доки файл є в пакеті,
+        фікстури мають читати саме ЙОГО — інакше вони перестануть
+        характеризувати те, що реально відвантажується, і розбіжність
+        між копією й оригіналом ніхто не помітить.
+    #>
+    return (Join-Path $root 'BRAVO.config')
+}
+
+function Get-BRAVOSelfTestShippedConfigText {
+    <#
+        Текст BRAVO.config, ЯКИЙ РЕАЛЬНО ВІДВАНТАЖУЄТЬСЯ в комплекті.
+
+        Сьогодні повертає те саме, що Get-BRAVOSelfTestLegacyConfigText —
+        і саме тому це окрема функція, а не аліас.
+
+        Два різні класи споживачів, які випадково збігаються ЛИШЕ доти,
+        доки файл лежить у пакеті:
+
+          A. фікстури (Get-BRAVOSelfTestLegacyConfigText) — їм потрібен
+             legacy-текст як база сценарію. Після B4-2 він стає
+             ЗАМОРОЖЕНИМ активом і навмисно перестає слідувати за пакетом;
+          B. твердження ПРО ПАКЕТ (ця функція) — наприклад «у
+             конфігурації немає DiskSpacePolicyMode». Їм потрібен ЖИВИЙ
+             стан того, що відвантажується, тобто після B4-2 —
+             канонічні дефолти.
+
+        Якби обидва класи ділили одну функцію, зміна її тіла на B4-2
+        мовчки перетворила б твердження класу B на перевірку мертвого
+        активу: додавання DiskSpacePolicyMode у канонічні дефолти
+        проходило б, доки заморожений файл лишається без змін. Тобто
+        перевірка звітувала б PASS, не перевіряючи нічого дійсного.
+
+        Розділення зараз нічого не змінює в поведінці й коштує одну
+        функцію; не розділити — означає закласти тиху втрату покриття.
+    #>
+    return [IO.File]::ReadAllText((Get-BRAVOSelfTestShippedConfigPath), [Text.Encoding]::UTF8)
+}
+
+function Get-BRAVOSelfTestShippedConfigPath {
+    # Шлях до конфігурації, ЩО ВІДВАНТАЖУЄТЬСЯ. Тіло НАВМИСНО власне, а не
+    # делегування Get-BRAVOSelfTestLegacyConfigPath: інакше зміна того тіла
+    # на B4-2 мовчки потягла б за собою й твердження про пакет, тобто
+    # відтворила б рівно ту пастку, заради усунення якої існує це
+    # розділення.
+    #
+    # Рядок текстуально відрізняється від тіла legacy-accessor-а свідомо:
+    # guard звіряє САМІ рядки збігів, і два однакові рядки він розрізнити
+    # не зміг би.
+    $shippedConfigPath = Join-Path $root 'BRAVO.config'
+    return $shippedConfigPath
+}
+
+function Get-BRAVOSelfTestLegacyConfigText {
+    # Текст legacy-конфігурації для фікстур і статичних тверджень.
+    # UTF8 явно: частина викликів історично читала без кодування, і різні
+    # гілки не повинні давати різний текст.
+    return [IO.File]::ReadAllText((Get-BRAVOSelfTestLegacyConfigPath), [Text.Encoding]::UTF8)
+}
+
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+    # ОПЕРАЦІЙНИЙ конфіг комплекту — НЕ те саме, що джерело legacy-тексту
+    # для фікстур, хоч сьогодні обидва вказують на один файл.
+    #
+    # Нижче з $ConfigPath виводиться $configRoot, і поруч із ним мусить
+    # лежати BRAVO_CONFIG_LOADER.ps1 (інакше — throw "Configuration loader
+    # not found" ще до запуску suite-ів). Тому підставляти сюди
+    # Get-BRAVOSelfTestLegacyConfigPath не можна: на кроці B4-2 той
+    # accessor почне повертати заморожений актив із selftest\, поруч з
+    # яким лоадера немає, і весь набір упав би на старті.
+    #
+    # Дві відповідальності — два вирази. Guard нижче знає про обидва.
     $ConfigPath = Join-Path $root "BRAVO.config"
 }
 
@@ -2841,7 +2931,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
 
     # Реальний BRAVO.config репозиторію мусить проходити власну перевірку.
     $securityRealConfig = Test-BRAVORuntimeSecuritySettings `
-        -ConfigPath (Join-Path $root "BRAVO.config") -Mode Enforce -AllowWeakened ''
+        -ConfigPath (Get-BRAVOSelfTestShippedConfigPath) -Mode Enforce -AllowWeakened ''
     Test-BRAVOCondition `
         -Condition $securityRealConfig.IsValid `
         -Name "ConfigSecurity/RepositoryConfigIsStrict" `
@@ -5294,10 +5384,8 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Health/ElevationCancelledIsDetectedSpecifically" `
         -Failure "Test-BRAVOHealthElevationCancelled має розпізнавати саме Win32Exception(1223)/ERROR_CANCELLED (Cancel у UAC), а не будь-яку помилку Start-Process"
 
-    $bravoConfigText = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
-        [Text.Encoding]::UTF8
-    )
+    # END-MARKER: dev.13 ACL guard block boundary
+    $bravoConfigText = (Get-BRAVOSelfTestShippedConfigText)
 
     # Health/SelfTestDoesNotModifyAcl: регресійний guard проти повернення
     # ACL-мутації в dev.13 test block (manual elevation + environment
@@ -5319,8 +5407,15 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $dev13AclTestBlockStart = $selfTestOwnSourceText.IndexOf(
         '# dev.13: manual elevation + environment preflight'
     )
+    # Межа кінця — ВИДІЛЕНИЙ маркер-коментар, а не рядок коду. Раніше тут
+    # шукався текст присвоєння $bravoConfigText; коли це присвоєння
+    # змінилося (перехід на Get-BRAVOSelfTestShippedConfigText), IndexOf
+    # почав знаходити власний рядковий літерал цього ж guard-а нижче,
+    # блок розтягувався на коментарі з назвами Set-Acl/AddAccessRule — і
+    # guard детерміновано падав. Маркер не є кодом, тому не залежить від
+    # рефакторингу сусідніх присвоєнь.
     $dev13AclTestBlockEnd = $selfTestOwnSourceText.IndexOf(
-        '$bravoConfigText = [IO.File]::ReadAllText(', $dev13AclTestBlockStart
+        '# END-MARKER: dev.13 ACL guard block boundary', $dev13AclTestBlockStart
     )
     $dev13AclTestBlockText = if ($dev13AclTestBlockStart -ge 0 -and $dev13AclTestBlockEnd -gt $dev13AclTestBlockStart) {
         $selfTestOwnSourceText.Substring(
@@ -6161,10 +6256,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Services/ArchiveReadOnly" `
         -Failure "BRAVO_ARCHIV не повинен зупиняти або запускати Windows-служби"
-    $bravoConfigTextForRetention = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
-        [Text.Encoding]::UTF8
-    )
+    $bravoConfigTextForRetention = (Get-BRAVOSelfTestShippedConfigText)
     Test-BRAVOCondition `
         -Condition (
             $archiveScriptText.Contains('function Remove-BRAVOExpiredBackupGenerations') -and
@@ -11718,7 +11810,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         }
 
         $prodLoaderConfigLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
-        $prodLoaderSourceConfigPath = Join-Path $root 'BRAVO.config'
+        $prodLoaderSourceConfigPath = Get-BRAVOSelfTestLegacyConfigPath
         $prodLoaderRoot = Join-Path `
             -Path ([IO.Path]::GetTempPath()) `
             -ChildPath ("BRAVO_PRODLOADER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -12725,7 +12817,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # в самому BRAVO.config — перевірки нижче читають об'єднаний текст
     # обох файлів (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     $bravoConfigTextForDiscovery = (
-        [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8) +
+        (Get-BRAVOSelfTestShippedConfigText) +
         [Environment]::NewLine +
         [IO.File]::ReadAllText(
             (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
@@ -13178,10 +13270,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
         [Text.Encoding]::UTF8
     )
-    $bravoConfigTextForSizeSanity = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
-        [Text.Encoding]::UTF8
-    )
+    $bravoConfigTextForSizeSanity = (Get-BRAVOSelfTestShippedConfigText)
     Test-BRAVOCondition `
         -Condition (
             $archiveRuntimeTextForSizeSanity.Contains("Test-BRAVOBackupSizeAnomaly") -and
@@ -15325,7 +15414,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SCHED_FIXTURE_' + [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($fixtureRoot)
         $fixtureConfigPath = Join-Path $fixtureRoot 'BRAVO.config'
-        $fixtureConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+        $fixtureConfigText = (Get-BRAVOSelfTestLegacyConfigText)
 
         # BackupRoot: завжди явний і валідний, незалежний від LIMSRoot/
         # service discovery — інакше безумовний throw BRAVO.config на

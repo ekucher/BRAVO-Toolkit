@@ -197,7 +197,7 @@
         # (Resolve-BRAVOConfigurationDerivation), решта — raw-листові
         # поля, що й далі лежать у самому BRAVO.config.
         $bravoConfigText = (
-            [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8) +
+            (Get-BRAVOSelfTestShippedConfigText) +
             [Environment]::NewLine +
             [IO.File]::ReadAllText(
                 (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
