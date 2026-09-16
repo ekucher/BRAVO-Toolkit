@@ -16,6 +16,51 @@
 # з BRAVO.Configurator.Effective), інакше доменний модуль конфігурації
 # почав би залежати від модуля Configurator-а, тобто від вищого шару.
 
+function Test-BRAVOConfigurationDictionaryEquality {
+    # Приватний helper: СТРУКТУРНЕ порівняння двох словників.
+    #
+    # Викликається лише з гілки колекцій Test-BRAVOConfigurationValue
+    # Equality. Окремою функцією, а не інлайном: словник усередині
+    # словника має порівнюватись тим самим правилом, і рекурсія тут
+    # чесніша за копію умови в двох місцях.
+    #
+    # Ключі звіряються РЕГІСТРОНЕЗАЛЕЖНО: hashtable у PowerShell саме
+    # такий, тож @{ Type = 'MODEL' } і @{ type = 'MODEL' } — один і той
+    # самий словник, і оголосити їх різними означало б вигадати
+    # відмінність, якої в конфігурації немає.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Left,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Right
+    )
+
+    $leftKeys = @(@($Left.Keys) | ForEach-Object { [string]$_ } | Sort-Object)
+    $rightKeys = @(@($Right.Keys) | ForEach-Object { [string]$_ } | Sort-Object)
+    if ($leftKeys.Count -ne $rightKeys.Count) { return $false }
+    for ($k = 0; $k -lt $leftKeys.Count; $k++) {
+        if ($leftKeys[$k] -ne $rightKeys[$k]) { return $false }
+    }
+
+    foreach ($key in $leftKeys) {
+        $leftValue = $Left[$key]
+        $rightValue = $Right[$key]
+        $leftValueIsDictionary = $leftValue -is [System.Collections.IDictionary]
+        $rightValueIsDictionary = $rightValue -is [System.Collections.IDictionary]
+        if ($leftValueIsDictionary -or $rightValueIsDictionary) {
+            if (-not ($leftValueIsDictionary -and $rightValueIsDictionary)) { return $false }
+            if (-not (Test-BRAVOConfigurationDictionaryEquality -Left $leftValue -Right $rightValue)) {
+                return $false
+            }
+            continue
+        }
+        if (-not (Test-BRAVOConfigurationValueEquality -Left $leftValue -Right $rightValue)) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-BRAVOConfigurationValueEquality {
     # Приватний helper: порівняння ЛИСТОВИХ значень.
     #
@@ -50,7 +95,27 @@ function Test-BRAVOConfigurationValueEquality {
         $rightItems = @($Right)
         if ($leftItems.Count -ne $rightItems.Count) { return $false }
         for ($i = 0; $i -lt $leftItems.Count; $i++) {
-            if (-not (Test-BRAVOConfigurationValueEquality -Left $leftItems[$i] -Right $rightItems[$i])) {
+            $leftItem = $leftItems[$i]
+            $rightItem = $rightItems[$i]
+            # Словник УСЕРЕДИНІ колекції — окремий випадок від словника,
+            # що прийшов сюди верхнім рівнем (блок вище). Верхній рівень
+            # сюди дійти не мав би, і відмова там свідома. А от масив
+            # словників — цілком штатна форма ефективної конфігурації
+            # ($global:archiveDefinitions — масив із трьох hashtable), і
+            # для неї "будь-який словник => різні" означало б, що два
+            # ІДЕНТИЧНІ знімки завжди звітують відмінність. Порівнюємо
+            # структурно; приховати справжню відмінність це не може —
+            # звіряються і набір ключів, і кожне значення.
+            $leftItemIsDictionary = $leftItem -is [System.Collections.IDictionary]
+            $rightItemIsDictionary = $rightItem -is [System.Collections.IDictionary]
+            if ($leftItemIsDictionary -or $rightItemIsDictionary) {
+                if (-not ($leftItemIsDictionary -and $rightItemIsDictionary)) { return $false }
+                if (-not (Test-BRAVOConfigurationDictionaryEquality -Left $leftItem -Right $rightItem)) {
+                    return $false
+                }
+                continue
+            }
+            if (-not (Test-BRAVOConfigurationValueEquality -Left $leftItem -Right $rightItem)) {
                 return $false
             }
         }

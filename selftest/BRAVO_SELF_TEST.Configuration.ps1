@@ -433,6 +433,59 @@
             -Name "Delta/IdenticalGraphsProduceNoDifference" `
             -Failure "порівняння canonical defaults із самими собою має дати 0 відмінностей (отримано $($deltaNone.Count): $([string]::Join(', ', $deltaNonePaths)))"
 
+        # --- Delta/ArraysOfDictionariesCompareStructurally ---
+        # Регресія на реальний дефект (рев'ю #203): гілка колекцій
+        # рекурсувала в Test-BRAVOConfigurationValueEquality, а той
+        # БЕЗУМОВНО повертав false для будь-якого словника. Наслідок:
+        # $global:archiveDefinitions — масив із трьох hashtable — завжди
+        # звітував "Changed", тож два ІДЕНТИЧНІ знімки ефективної
+        # конфігурації ніколи не могли зійтись, і доказ міграції був
+        # недосяжним за побудовою.
+        $deltaDictArray = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a' },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\b' }
+            )
+        }
+        $deltaDictArrayCopy = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a' },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\b' }
+            )
+        }
+        $deltaDictArraySame = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaDictArray `
+            -CandidateConfiguration $deltaDictArrayCopy)
+        # Позитивний контроль: справжня відмінність усередині словника
+        # масиву мусить лишитись видимою — фікс не сміє "зрівняти все".
+        $deltaDictArrayChangedCandidate = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a' },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\ІНШЕ' }
+            )
+        }
+        $deltaDictArrayChanged = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaDictArray `
+            -CandidateConfiguration $deltaDictArrayChangedCandidate)
+        # Другий контроль: зайвий ключ у словнику теж є відмінністю.
+        $deltaDictArrayExtraKey = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a'; Extra = 1 },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\b' }
+            )
+        }
+        $deltaDictArrayExtra = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaDictArray `
+            -CandidateConfiguration $deltaDictArrayExtraKey)
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaDictArraySame.Count -eq 0 -and
+                $deltaDictArrayChanged.Count -eq 1 -and
+                $deltaDictArrayExtra.Count -eq 1
+            ) `
+            -Name "Delta/ArraysOfDictionariesCompareStructurally" `
+            -Failure "масив словників має порівнюватись структурно: однакові=$($deltaDictArraySame.Count) (очікується 0), змінене значення=$($deltaDictArrayChanged.Count) (1), зайвий ключ=$($deltaDictArrayExtra.Count) (1)"
+
         # --- Delta/EmptyAndSingleElementArraysCompareEqual ---
         # Регресія на реальний дефект (CI 2026-09-14): еталонне значення
         # діставалось через "$x = if (...) { $hash[$key] } else { $null }",

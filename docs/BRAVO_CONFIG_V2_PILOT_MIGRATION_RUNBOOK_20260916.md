@@ -91,6 +91,21 @@ UTF-8, тож перенаправлення через `>` дало б не «�
 
 ## Крок 3. Запис `BRAVO.local.config`
 
+**Спершу збережіть поточний стан site-файла** — інакше відкат не поверне
+сервер у допілотний стан: крок 6 відновлює лише `BRAVO.config`, а додані
+локальні значення мають вищий пріоритет і мовчки затінювали б відновлений
+primary-шар.
+
+```powershell
+if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
+    Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$Ev\BRAVO.local.config.backup" -ErrorAction Stop
+} else {
+    # Файла не було: позначаємо це, щоб відкат знав, що його треба ВИДАЛИТИ,
+    # а не відновлювати.
+    Set-Content -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -Value '' -Encoding UTF8
+}
+```
+
 Перенесіть відібрані рядки у `BRAVO.local.config` поруч із `BRAVO.config`.
 Якщо файл уже існує — **додайте** рядки, не замінюйте файл.
 
@@ -143,8 +158,17 @@ UTF-8, тож перенаправлення через `>` дало б не «�
 
 ```powershell
 Copy-Item -LiteralPath "$Kit\BRAVO.config" -Destination "$Ev\BRAVO.config.backup" -ErrorAction Stop
-Remove-Item -LiteralPath "$Kit\BRAVO.config"
+Remove-Item -LiteralPath "$Kit\BRAVO.config" -ErrorAction Stop
+if (Test-Path -LiteralPath "$Kit\BRAVO.config") {
+    throw 'BRAVO.config усе ще на місці — знімок C знімати НЕ МОЖНА.'
+}
 ```
+
+**`-ErrorAction Stop` і перевірка `Test-Path` тут обов'язкові.** Без них
+відмова видалення (права, блокування файла, ФС) — **нетермінальна**: сесія
+пішла б далі й зняла знімок C при живому `BRAVO.config`. Граф тоді
+збігається з A, порівняння друкує `[SUCCESS]`, і міграція, яка насправді
+нічого не прибрала, була б прийнята.
 
 Одразу після цього — знімок і порівняння **з вихідним** станом A:
 
@@ -163,13 +187,39 @@ Remove-Item -LiteralPath "$Kit\BRAVO.config"
 
 ## Відкат
 
+Відновлюються **обидва** шари. Повернути лише `BRAVO.config` недостатньо:
+site-файл має вищий пріоритет, і залишені в ньому значення затінювали б
+відновлений primary-шар — сервер виглядав би відкоченим, не будучи ним.
+
 ```powershell
-Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force
+Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
+
+if (Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT") {
+    # Файла до пілота не було -> прибираємо створений нами.
+    Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
+} else {
+    Copy-Item -LiteralPath "$Ev\BRAVO.local.config.backup" -Destination "$Kit\BRAVO.local.config" -Force -ErrorAction Stop
+}
 ```
 
-Після відкату повторіть крок 0 і порівняйте з `snapshot-A-before.json` —
-стан має збігтись. `BRAVO.local.config` при відкаті можна лишити: доки його
-значення дублюють primary-шар, вони нічого не змінюють.
+Далі — контрольний знімок **під ОКРЕМИМ іменем**:
+
+```powershell
+& "$Kit\BRAVO_CONFIG_TEST.ps1" -FullGraph |
+    Set-Content -LiteralPath "$Ev\snapshot-R-rollback.json" -Encoding UTF8
+
+& "$Kit\deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1" `
+    -BeforePath "$Ev\snapshot-A-before.json" `
+    -AfterPath  "$Ev\snapshot-R-rollback.json" `
+    -RuntimeRoot $Kit
+```
+
+**Не перезаписуйте `snapshot-A-before.json`.** Якщо зняти відкочений стан
+поверх вихідного файла, наступне порівняння звірятиме файл сам із собою і
+неминуче дасть `[SUCCESS]`, нічого не довівши. Вихідний знімок A — єдина
+точка відліку, і він має пережити весь пілот.
+
+Очікується `[SUCCESS]`: відкат повернув ефективну конфігурацію до стану A.
 
 ## Що вважати прийняттям пілота
 
