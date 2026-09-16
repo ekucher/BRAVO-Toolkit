@@ -32,6 +32,15 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # ОБОВ'ЯЗКОВИЙ. ci\Test-BRAVOReleasePolicy.ps1 звіряє провенанс:
+          # VERSION.json у коміті sourceCommit має нести ту саму
+          # packageVersion. При shallow-checkout цей коміт недосяжний, і
+          # перевірка мовчки вимкнулась би — тобто гейт лишився б у
+          # workflow, але перестав би щось охороняти. Guard
+          # Governance/ReleasePolicyJobFetchesFullHistory тримає цю опцію
+          # на місці.
+          fetch-depth: 0
 
       - name: PowerShell parser (усі .ps1/.psm1/.psd1)
         shell: powershell
