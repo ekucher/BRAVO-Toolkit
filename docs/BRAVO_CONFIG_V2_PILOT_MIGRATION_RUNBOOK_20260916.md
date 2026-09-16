@@ -109,7 +109,13 @@ if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
 } else {
     # Файла не було: позначаємо це, щоб відкат знав, що його треба ВИДАЛИТИ,
     # а не відновлювати.
-    Set-Content -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -Value '' -Encoding UTF8
+    Set-Content -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -Value '' -Encoding UTF8 -ErrorAction Stop
+}
+
+# Артефакт відкату мусить існувати ДО того, як ви торкнетесь site-файла.
+if (-not ((Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup") -or
+          (Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT"))) {
+    throw 'Артефакт стану site-файла не створено — НЕ змінюйте BRAVO.local.config.'
 }
 ```
 
@@ -201,6 +207,17 @@ if (Test-Path -LiteralPath "$Kit\BRAVO.config") {
 site-файл має вищий пріоритет, і залишені в ньому значення затінювали б
 відновлений primary-шар — сервер виглядав би відкоченим, не будучи ним.
 
+Відкат можливий із **двох** точок, і порядок дій це враховує:
+
+- після кроку 5, коли порівняння A ↔ B впало. Крок 6 не виконувався,
+  `BRAVO.config` недоторканий, і резервної копії primary-шару ще **немає**;
+- після кроку 6, коли primary-шар уже прибрано.
+
+Тому site-шар відновлюється **першим і завжди**, а primary — **умовно**.
+Зворотний порядок означав би, що відкат із першої точки обривається на
+відсутній резервній копії, так і не прибравши змінений site-файл: невдалий
+пілот лишився б активним.
+
 ```powershell
 # Захист від суперечливого стану каталогу доказів: рівно один артефакт.
 $localBackup = Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup"
@@ -209,8 +226,7 @@ if ($localBackup -eq $localAbsent) {
     throw "Стан site-файла в каталозі доказів неоднозначний (backup=$localBackup, absent=$localAbsent) — відкат зупинено."
 }
 
-Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
-
+# 1) site-шар — завжди
 if ($localAbsent) {
     # Файла до пілота не було -> прибираємо створений нами. Але його може
     # й не бути: якщо звірка на кроці 2 не відібрала жодного значення,
@@ -223,6 +239,13 @@ if ($localAbsent) {
     }
 } else {
     Copy-Item -LiteralPath "$Ev\BRAVO.local.config.backup" -Destination "$Kit\BRAVO.local.config" -Force -ErrorAction Stop
+}
+
+# 2) primary-шар — лише якщо крок 6 виконувався
+if (Test-Path -LiteralPath "$Ev\BRAVO.config.backup") {
+    Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
+} elseif (-not (Test-Path -LiteralPath "$Kit\BRAVO.config")) {
+    throw 'BRAVO.config відсутній, а резервної копії немає — автоматичний відкат неможливий.'
 }
 ```
 
