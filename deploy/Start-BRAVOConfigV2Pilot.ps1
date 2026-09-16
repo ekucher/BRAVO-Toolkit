@@ -150,7 +150,11 @@ try {
             if ([string]::IsNullOrWhiteSpace($InstallRoot)) { throw "-InstallRoot є обов'язковим для -Activate." }
             if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { throw "-EvidenceDir є обов'язковим для -Activate." }
             $resolvedInstallRoot = Resolve-BRAVOPilotFullPath $InstallRoot
-            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Reviewed') -Operation '-Activate'
+            # 'Activated' також дозволений: повторний -Activate уже
+            # активованого candidate — ідемпотентна операція (§27) —
+            # Invoke-BRAVOPilotAtomicActivation виявляє однаковий hash і
+            # не пише файл вдруге.
+            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Reviewed', 'Activated') -Operation '-Activate'
             $candidatePath = [string]$state.CandidatePath
             $approvedHash = [string]$state.CandidateHash
 
@@ -175,7 +179,11 @@ try {
             if ([string]::IsNullOrWhiteSpace($InstallRoot)) { throw "-InstallRoot є обов'язковим для -Validate." }
             if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { throw "-EvidenceDir є обов'язковим для -Validate." }
             $resolvedInstallRoot = Resolve-BRAVOPilotFullPath $InstallRoot
-            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Activated') -Operation '-Validate'
+            # 'Validated' також дозволений: повторний -Validate — чисте
+            # повторне читання/верифікація, без мутуючих побічних ефектів
+            # (§27 ідемпотентність) — детермінований, безпечний повторний
+            # прогін тих самих read-only перевірок.
+            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Activated', 'Validated') -Operation '-Validate'
 
             $allPass = $true
 

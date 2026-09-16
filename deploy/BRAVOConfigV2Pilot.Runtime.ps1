@@ -41,6 +41,18 @@
 
 Set-StrictMode -Version 2.0
 
+function Get-BRAVOPilotSafeLastExitCode {
+    # $LASTEXITCODE — автозмінна PowerShell, але під Set-StrictMode
+    # -Version 2.0 читання МОЖЕ кинути "cannot be retrieved because it has
+    # not been set", якщо жоден native/script виклик, що явно встановлює
+    # exit code, ще не відбувся в поточному ланцюжку скоупів (canonical
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 не викликає `exit 0` на щасливому
+    # шляху — лише `exit 1` у catch). Пряме звернення до $LASTEXITCODE тут
+    # небезпечне; Get-Variable з -ErrorAction SilentlyContinue повертає
+    # $null замість винятку.
+    return Get-Variable -Name LASTEXITCODE -ValueOnly -Scope Global -ErrorAction SilentlyContinue
+}
+
 # --- Секретна безпека evidence --------------------------------------------
 
 # Категорії ключів, які потребують суворішої перевірки значення перед
@@ -443,7 +455,7 @@ function Invoke-BRAVOPilotPreflight {
     $verifierPath = Join-Path $ArtifactRoot 'Test-BRAVOConfigV2PilotArtifact.ps1'
     if (Test-Path -LiteralPath $verifierPath -PathType Leaf) {
         $verifyOutput = & $verifierPath -ArtifactRoot $ArtifactRoot -Quiet 2>&1
-        $verifyOk = $LASTEXITCODE -eq 0
+        $verifyOk = (Get-BRAVOPilotSafeLastExitCode) -eq 0
         Add-Check 'ArtifactIntegrityAndProvenance' $verifyOk ([string]::Join(' | ', @($verifyOutput | Select-Object -Last 5)))
     } else {
         Add-Check 'ArtifactIntegrityAndProvenance' $false ("Verifier не знайдено: {0}" -f $verifierPath)
@@ -503,8 +515,9 @@ function Invoke-BRAVOPilotConfigSnapshot {
     }
 
     $json = & $configTestPath -FullGraph
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($json | Out-String))) {
-        throw "PILOT_SNAPSHOT_FAILED: BRAVO_CONFIG_TEST.ps1 -FullGraph завершився з кодом $LASTEXITCODE або порожнім виводом — конфігурація, яка не завантажується, не може бути знята як baseline."
+    $snapshotExitCode = Get-BRAVOPilotSafeLastExitCode
+    if ($snapshotExitCode -ne 0 -or [string]::IsNullOrWhiteSpace(($json | Out-String))) {
+        throw "PILOT_SNAPSHOT_FAILED: BRAVO_CONFIG_TEST.ps1 -FullGraph завершився з кодом $snapshotExitCode або порожнім виводом — конфігурація, яка не завантажується, не може бути знята як baseline."
     }
     $text = ($json | Out-String).Trim()
     if (-not $text.StartsWith('{')) {
@@ -517,6 +530,14 @@ function Invoke-BRAVOPilotConfigSnapshot {
     if ($null -eq $parsed.PSObject.Properties['EffectiveGraph']) {
         throw "PILOT_SNAPSHOT_FAILED: знімок не містить EffectiveGraph — очікується вивід саме -FullGraph."
     }
+
+    # Секретна перевірка ОБОВ'ЯЗКОВА тут: EffectiveGraph містить
+    # credentialSettings/backupMonitoring.SFTP.*.Password — Configuration
+    # v2 гарантує, що це REFERENCE-ім'я, а не резолвнутий секрет
+    # (PilotSafety/CredentialReferenceNeverResolved), але цей знімок —
+    # межа довіри evidence-пакета, і перевірка тут — defense-in-depth,
+    # не довіра лише архітектурній гарантії десь-інде.
+    Assert-BRAVOPilotEvidenceSecretSafe -Object $parsed
 
     [System.IO.File]::WriteAllText($OutputPath, $text, (New-Object System.Text.UTF8Encoding($false)))
     return [pscustomobject]@{ Path = $OutputPath; PackageVersion = [string]$parsed.Validation.PackageVersion; ConfigSchemaVersion = [string]$parsed.Validation.ConfigSchemaVersion }
@@ -533,7 +554,7 @@ function Invoke-BRAVOPilotHealthSnapshot {
         throw "PILOT_HEALTH_FAILED: не знайдено $healthPath."
     }
     $output = @(& $healthPath -NoPause 2>&1 | ForEach-Object { [string]$_ })
-    $exitCode = $LASTEXITCODE
+    $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
     return [pscustomobject]@{ Path = $OutputPath; ExitCode = $exitCode; Lines = $output }
 }
@@ -576,9 +597,34 @@ function Invoke-BRAVOPilotDeltaGeneration {
         throw "PILOT_DELTA_FAILED: candidate-файл '$CandidatePath' уже існує — інструмент дельти нічого не перезаписує (ідемпотентний повторний прогін мусить вказати новий шлях або спершу прибрати попередній candidate свідомо)."
     }
     & $deltaToolPath -RuntimeRoot $InstallRoot -OutputPath $CandidatePath
-    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {
-        throw "PILOT_DELTA_FAILED: Get-BRAVOConfigSiteDelta.ps1 завершився з кодом $LASTEXITCODE."
+    # Get-BRAVOConfigSiteDelta.ps1 НЕ викликає `exit 0` на щасливому шляху
+    # (лише `exit 1` у catch) — $LASTEXITCODE на успіху непередбачуваний
+    # (може лишитись від попередньої команди). Первинний доказ успіху —
+    # сам факт створення candidate-файлу; $LASTEXITCODE перевіряється лише
+    # як додатковий сигнал явної відмови, коли файл НЕ створено.
+    if (-not (Test-Path -LiteralPath $CandidatePath -PathType Leaf)) {
+        throw "PILOT_DELTA_FAILED: Get-BRAVOConfigSiteDelta.ps1 не створив candidate-файл (код завершення $(Get-BRAVOPilotSafeLastExitCode))."
     }
+
+    # Секретна перевірка candidate — рядок за рядком, ключ+значення. На
+    # відміну від JSON-знімків, candidate генерує canonical інструмент
+    # ПРЯМО з raw BRAVO.config сайту: якщо сам сайт-файл колись помилково
+    # містив резолвнутий секрет замість reference-імені (не гарантія
+    # Configuration v2 — гарантія стосується ЕФЕКТИВНОГО графа, не
+    # довільного вхідного BRAVO.config), candidate відтворив би це
+    # буквально. Fail closed ДО показу diff оператору.
+    $candidateLines = @(Get-Content -LiteralPath $CandidatePath -Encoding UTF8)
+    foreach ($line in $candidateLines) {
+        if ($line -match "(?i)^\s*'([^']*(?:$($script:BRAVOPilotSensitiveKeyPattern -replace '^\(\?i\)',''))[^']*)'\s*=\s*'([^']*)'") {
+            $lineKey = $Matches[1]
+            $lineValue = $Matches[2]
+            if (-not (Test-BRAVOPilotSecretSafeString -Value $lineValue -KeyName $lineKey)) {
+                throw "SECRET_SAFE_VIOLATION: candidate-рядок для '$lineKey' виглядає як реальний секрет, а не Credential Manager reference-ім'я. Перенесення заблоковано (fail closed) — перевірте BRAVO.config сайту вручну."
+            }
+        }
+    }
+    Assert-BRAVOPilotTextSecretSafe -Lines $candidateLines
+
     return [pscustomobject]@{
         Path = $CandidatePath
         Sha256 = (Get-BRAVOPilotFileHash -Path $CandidatePath)
@@ -799,7 +845,7 @@ function Invoke-BRAVOPilotValidateOnly {
         throw "PILOT_VALIDATE_FAILED: не знайдено $setupPath."
     }
     $output = @(& $setupPath -ValidateOnly -NoPause 2>&1 | ForEach-Object { [string]$_ })
-    $exitCode = $LASTEXITCODE
+    $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
     return [pscustomobject]@{ ExitCode = $exitCode; Pass = ($exitCode -eq 0); Path = $OutputPath }
 }
@@ -817,7 +863,7 @@ function Invoke-BRAVOPilotSemanticParity {
         throw "PILOT_PARITY_FAILED: не знайдено $comparePath."
     }
     $output = @(& $comparePath -BeforePath $BeforePath -AfterPath $AfterPath -RuntimeRoot $InstallRoot 2>&1 | ForEach-Object { [string]$_ })
-    $exitCode = $LASTEXITCODE
+    $exitCode = Get-BRAVOPilotSafeLastExitCode
     $record = [ordered]@{
         RanAtUtc  = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
         BeforePath = $BeforePath
@@ -841,7 +887,7 @@ function Invoke-BRAVOPilotSelfTest {
         throw "PILOT_SELFTEST_FAILED: не знайдено $selfTestPath."
     }
     $output = @(& $selfTestPath -NoPause 2>&1 | ForEach-Object { [string]$_ })
-    $exitCode = $LASTEXITCODE
+    $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
 
     $hasUnavailable = @($output | Where-Object { $_ -match '\[НЕДОСТУПНО\]' }).Count -gt 0
@@ -881,7 +927,7 @@ function Invoke-BRAVOPilotArchiveSmoke {
         throw "PILOT_ARCHIVE_SMOKE_FAILED: не знайдено $dryRunPath."
     }
     $output = @(& $dryRunPath 2>&1 | ForEach-Object { [string]$_ })
-    $exitCode = $LASTEXITCODE
+    $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
     return [pscustomobject]@{ ExitCode = $exitCode; Pass = ($exitCode -eq 0); Path = $OutputPath }
 }
