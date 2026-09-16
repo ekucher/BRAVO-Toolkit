@@ -156,9 +156,44 @@ Import-Module -Name $helperLoggingPath -ErrorAction Stop
 # альтернативний/другий шлях журналу.
 $script:selfTestHelperLogPath = Start-BRAVOHelperLog -ScriptPath $PSCommandPath -ConfigPath $ConfigPath
 
+function Get-BRAVOSelfTestLegacyConfigPath {
+    <#
+        ЄДИНЕ місце, яке знає, ДЕ лежить legacy-текст BRAVO.config для
+        self-test (#154, підготовка до B4-2).
+
+        Навіщо. Сьогодні ~20 місць у кореневому наборі й у фрагментах
+        незалежно будували шлях самі — хто як базу
+        для синтетичної фікстури, хто для статичного твердження про вміст
+        комплекту. Поки файл лежить у корені пакета, це працює. Але B4-2
+        прибирає його з пакета, і тоді кожна з цих точок ламається
+        окремо — саме тому #154 і вважав крок «прибрати файл»
+        заблокованим: він означав переписати фікстурну тканину
+        ОДНОЧАСНО зі зміною runtime-контракту.
+
+        Що змінює ця функція. Володіння шляхом стає канонічним. Сама
+        поведінка НЕ змінюється ані на байт: повертається той самий
+        кореневий файл, що й раніше. Коли B4-2 прибере його з пакета,
+        зміниться рівно одне тіло цієї функції (на заморожений тестовий
+        актив), а не 20 місць.
+
+        Чому НЕ заморожену копію вже зараз: доки файл є в пакеті,
+        фікстури мають читати саме ЙОГО — інакше вони перестануть
+        характеризувати те, що реально відвантажується, і розбіжність
+        між копією й оригіналом ніхто не помітить.
+    #>
+    return (Join-Path $root 'BRAVO.config')
+}
+
+function Get-BRAVOSelfTestLegacyConfigText {
+    # Текст legacy-конфігурації для фікстур і статичних тверджень.
+    # UTF8 явно: частина викликів історично читала без кодування, і різні
+    # гілки не повинні давати різний текст.
+    return [IO.File]::ReadAllText((Get-BRAVOSelfTestLegacyConfigPath), [Text.Encoding]::UTF8)
+}
+
 $ErrorActionPreference = "Stop"
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
-    $ConfigPath = Join-Path $root "BRAVO.config"
+    $ConfigPath = Get-BRAVOSelfTestLegacyConfigPath
 }
 
 # Canonical console/manual-exit helper (Write-BRAVOFinalSummaryHeader/Footer,
@@ -2841,7 +2876,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
 
     # Реальний BRAVO.config репозиторію мусить проходити власну перевірку.
     $securityRealConfig = Test-BRAVORuntimeSecuritySettings `
-        -ConfigPath (Join-Path $root "BRAVO.config") -Mode Enforce -AllowWeakened ''
+        -ConfigPath (Get-BRAVOSelfTestLegacyConfigPath) -Mode Enforce -AllowWeakened ''
     Test-BRAVOCondition `
         -Condition $securityRealConfig.IsValid `
         -Name "ConfigSecurity/RepositoryConfigIsStrict" `
@@ -5295,7 +5330,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Failure "Test-BRAVOHealthElevationCancelled має розпізнавати саме Win32Exception(1223)/ERROR_CANCELLED (Cancel у UAC), а не будь-яку помилку Start-Process"
 
     $bravoConfigText = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
+        (Get-BRAVOSelfTestLegacyConfigPath),
         [Text.Encoding]::UTF8
     )
 
@@ -6162,7 +6197,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Services/ArchiveReadOnly" `
         -Failure "BRAVO_ARCHIV не повинен зупиняти або запускати Windows-служби"
     $bravoConfigTextForRetention = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
+        (Get-BRAVOSelfTestLegacyConfigPath),
         [Text.Encoding]::UTF8
     )
     Test-BRAVOCondition `
@@ -11718,7 +11753,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         }
 
         $prodLoaderConfigLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
-        $prodLoaderSourceConfigPath = Join-Path $root 'BRAVO.config'
+        $prodLoaderSourceConfigPath = Get-BRAVOSelfTestLegacyConfigPath
         $prodLoaderRoot = Join-Path `
             -Path ([IO.Path]::GetTempPath()) `
             -ChildPath ("BRAVO_PRODLOADER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -12725,7 +12760,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # в самому BRAVO.config — перевірки нижче читають об'єднаний текст
     # обох файлів (docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md).
     $bravoConfigTextForDiscovery = (
-        [IO.File]::ReadAllText((Join-Path $root "BRAVO.config"), [Text.Encoding]::UTF8) +
+        (Get-BRAVOSelfTestLegacyConfigText) +
         [Environment]::NewLine +
         [IO.File]::ReadAllText(
             (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psm1'),
@@ -13179,7 +13214,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         [Text.Encoding]::UTF8
     )
     $bravoConfigTextForSizeSanity = [IO.File]::ReadAllText(
-        (Join-Path $root "BRAVO.config"),
+        (Get-BRAVOSelfTestLegacyConfigPath),
         [Text.Encoding]::UTF8
     )
     Test-BRAVOCondition `
@@ -15325,7 +15360,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_SCHED_FIXTURE_' + [guid]::NewGuid().ToString('N'))
         [void][IO.Directory]::CreateDirectory($fixtureRoot)
         $fixtureConfigPath = Join-Path $fixtureRoot 'BRAVO.config'
-        $fixtureConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'), [Text.Encoding]::UTF8)
+        $fixtureConfigText = (Get-BRAVOSelfTestLegacyConfigText)
 
         # BackupRoot: завжди явний і валідний, незалежний від LIMSRoot/
         # service discovery — інакше безумовний throw BRAVO.config на

@@ -521,6 +521,38 @@
         -EnvironmentLimitation $provenanceProbeLimitation `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де VERSION.json у коміті sourceCommit несе іншу packageVersion, і назвати саме цю причину (маркер 'RELEASE_POLICY 7.2'), а не вийти ненульовим через щось інше; код виходу: $provenanceProbeExit"
 
+    # --- Володіння шляхом legacy BRAVO.config у self-test (#154, B4-2) ---
+    # Кореневий BRAVO.config зникне з пакета на кроці B4-2. Доки кожне
+    # місце будувало шлях самостійно, той крок означав переписати
+    # фікстурну тканину ОДНОЧАСНО зі зміною runtime-контракту — саме тому
+    # #154 і вважав його заблокованим.
+    #
+    # Тепер шлях знає рівно одна функція, і guard тримає це: у
+    # BRAVO_SELF_TEST.ps1 допускається РІВНО одне входження (тіло
+    # Get-BRAVOSelfTestLegacyConfigPath), у фрагментах — жодного.
+    #
+    # Сам цей файл виключено зі сканування: він містить шаблон як
+    # рядковий літерал і інакше ловив би сам себе. Компроміс свідомий —
+    # альтернатива (складніші межі сканування) коштувала б більше, ніж
+    # дає.
+    $legacyConfigPathPattern = 'Join-Path\s+\$root\s+[''"]BRAVO\.config[''"]'
+    $legacyConfigOwnerText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SELF_TEST.ps1'), [Text.Encoding]::UTF8)
+    $legacyConfigOwnerHits = @([regex]::Matches($legacyConfigOwnerText, $legacyConfigPathPattern)).Count
+
+    $legacyConfigFragmentOffenders = New-Object System.Collections.ArrayList
+    foreach ($fragmentFile in @(Get-ChildItem -LiteralPath (Join-Path $root 'selftest') -Filter '*.ps1' -File)) {
+        if ($fragmentFile.Name -eq 'BRAVO_SELF_TEST.Governance.ps1') { continue }
+        $fragmentText = [IO.File]::ReadAllText($fragmentFile.FullName, [Text.Encoding]::UTF8)
+        if ([regex]::IsMatch($fragmentText, $legacyConfigPathPattern)) {
+            [void]$legacyConfigFragmentOffenders.Add($fragmentFile.Name)
+        }
+    }
+
+    Test-BRAVOCondition `
+        -Condition ($legacyConfigOwnerHits -eq 1 -and $legacyConfigFragmentOffenders.Count -eq 0) `
+        -Name "Governance/LegacyConfigPathHasSingleOwner" `
+        -Failure "шлях до кореневого BRAVO.config має знати лише Get-BRAVOSelfTestLegacyConfigPath: у BRAVO_SELF_TEST.ps1 знайдено $legacyConfigOwnerHits входжень (очікується 1), у фрагментах — $($legacyConfigFragmentOffenders.Count) ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray())))"
+
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
     # про вміст: перештампування однієї версії штатне, тому залишений

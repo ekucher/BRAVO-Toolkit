@@ -49,7 +49,7 @@ Copy-Item -LiteralPath (Join-Path $root 'VERSION.json') -Destination (Join-Path 
 # (Discovery/Compatibility) мають лишатися canonical-кодом репозиторію,
 # не копією, що могла б непомітно розійтись.
 $null = cmd.exe /c mklink /J "$configuratorFixtureRuntimeRoot\modules" "$root\modules" 2>&1
-$configuratorKitConfigText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO.config'))
+$configuratorKitConfigText = (Get-BRAVOSelfTestLegacyConfigText)
 $configuratorLimsRootLiteralLine = '    LIMSRoot      = ""'
 $configuratorBackupRootLiteralLine = '    BackupRoot    = ""'
 if (-not $configuratorKitConfigText.Contains($configuratorLimsRootLiteralLine) -or
