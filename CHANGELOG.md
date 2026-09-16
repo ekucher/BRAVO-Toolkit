@@ -2,6 +2,49 @@
 
 ## Не випущено (developer)
 
+- **`releaseDate` перестав дрейфувати (П1 з аналізу тега `v5.3.0-rc.1`)** —
+  поле у `VERSION.json` гілки `developer` виправлено на `2026-09-13`
+  (дата заголовка `## 5.3.0-dev.3` у цьому файлі), і додано механічну
+  звірку в `ci\Test-BRAVOReleasePolicy.ps1`.
+
+  **Корінь.** Поле залишалось `2026-08-26` — датою штампу
+  `5.3.0-rc.1` — наскрізь через штампи `5.3.0-dev.2`, restamp `dev.2`
+  і `5.3.0-dev.3`, поки stable-штампи оновлювали його коректно
+  (`5.2.4` → `2026-09-13`). Жоден скрипт `ci\` поле не записував і не
+  звіряв: воно ведеться вручну, а ручна дисципліна не тримається.
+
+  **Чому це не косметика.** `BRAVO_CONFIG_LOADER.ps1` валідує поле й
+  віддає як `$global:ScriptDate`, а `ci\New-BRAVOReleaseArtifact.ps1`
+  переносить у `release-manifest.json` **кожного** артефакту. Три тижні
+  артефактів, зібраних з `developer`, заявляли дату 2026-08-26 —
+  оператор, який звіряє провенанс за `RELEASE_POLICY.md` §16.3, бачив
+  саме її.
+
+  **Джерело істини — заголовок `CHANGELOG.md`, а не дата коміту
+  `sourceCommit`.** Заголовок не потребує ані `.git`, ані повного (не
+  shallow) клону, тож перевірка працює й на розпакованому архіві — там,
+  де провенанс звірити вже нічим. Недатований заголовок лінії в роботі
+  (`## 5.2.3-dev.1 (…, у розробці)`) поза `master` дає попередження, на
+  `master` — відмову: кожен stable-заголовок датований, а вигадувати
+  дату заради проходження перевірки гірше, ніж не звіряти.
+
+  Регресії: `ReleasePolicy/RejectsReleaseDateDriftFromChangelog` і
+  `ReleasePolicy/RejectsUndatedStableChangelogHeading` — обидві
+  behavior-level, тобто запускають справжній gate-скрипт на
+  синтетичному комплекті, а не перевіряють текст. Наявні fixture
+  `ReleasePolicy/*` і `VersionState/ReleasePolicyCoreMatchesRuntimeContract`
+  доповнено полем `releaseDate` і датованим заголовком: без цього кожен
+  із них давав би зайву помилку дати, і assert «рівно один `::error::`»
+  перестав би означати те, заради чого його писали.
+
+  `ScriptDate` і `BravoConfigurationMetadata.ReleaseDate` додано в
+  allowlist parity harness — рівно там, де вже стоять `PackageVersion`,
+  `BuildId`, `ScriptVersion` і `ScriptBuildId`. У списку їх бракувало
+  лише тому, що заморожене поле не відрізнялось від бази `42cf9ad`.
+
+  Провенанс лінії (`buildId`/`sourceCommit` досі вказують на штамп
+  `5.3.0-dev.2`) цією зміною **не** чіпано — це окрема знахідка П2.
+
 - **Parity harness конфігурації виконується автоматично** — новий workflow
   `.github/workflows/config-parity.yml` запускає
   `ci\Test-BRAVOConfigFoundationParity.ps1` для PR, що торкаються

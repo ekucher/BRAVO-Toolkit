@@ -311,10 +311,15 @@
             param(
                 [Parameter(Mandatory = $true)][string]$ProbeRoot,
                 [Parameter(Mandatory = $true)][string]$ChangelogHeading,
-                [Parameter(Mandatory = $true)][string]$ReadmeHeader
+                [Parameter(Mandatory = $true)][string]$ReadmeHeader,
+                # RELEASE_POLICY 5.3: releaseDate звіряється з датою
+                # заголовка CHANGELOG.md. Дефолт збігається з датою в
+                # заголовках нижче, щоб наявні випадки перевіряли рівно
+                # те, що перевіряли; розбіжність задається явно.
+                [string]$ReleaseDate = '2026-08-05'
             )
             $utf8NoBom = New-Object Text.UTF8Encoding($false)
-            [IO.File]::WriteAllText((Join-Path $ProbeRoot 'VERSION.json'), '{"packageVersion":"4.5.0","releaseChannel":"stable"}', $utf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $ProbeRoot 'VERSION.json'), ('{{"packageVersion":"4.5.0","releaseChannel":"stable","releaseDate":"{0}"}}' -f $ReleaseDate), $utf8NoBom)
             [IO.File]::WriteAllText((Join-Path $ProbeRoot 'CHANGELOG.md'), "# Changelog`r`n`r`n$ChangelogHeading`r`n`r`nОпис.`r`n", $utf8NoBom)
             [IO.File]::WriteAllText((Join-Path $ProbeRoot 'README.md'), "$ReadmeHeader`r`n", $utf8NoBom)
             [IO.File]::WriteAllText((Join-Path $ProbeRoot 'BRAVO_SETUP.md'), "$ReadmeHeader`r`n", $utf8NoBom)
@@ -338,6 +343,20 @@
             Set-BRAVOReleasePolicyProbeContent -ProbeRoot $releasePolicyProbeRoot -ChangelogHeading '## 4.5.0-dev.1 — 2026-08-05' -ReadmeHeader '# BRAVO 4.5.0-dev.1 — опис'
             $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $releasePolicyGateScript -Root $releasePolicyProbeRoot -Branch 'master' 2>&1
             $releasePolicyProbeResults['StaleFromDev'] = $LASTEXITCODE
+
+            # Дрейф releaseDate: CHANGELOG і заголовки коректні, але
+            # VERSION.json несе іншу дату. Рівно так поле й поїхало на
+            # developer — лишалось датою штампу 5.3.0-rc.1 через три
+            # подальші штампи, і не ловилось нічим.
+            Set-BRAVOReleasePolicyProbeContent -ProbeRoot $releasePolicyProbeRoot -ChangelogHeading '## 4.5.0 — 2026-08-05' -ReadmeHeader '# BRAVO 4.5.0 — опис' -ReleaseDate '2026-08-04'
+            $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $releasePolicyGateScript -Root $releasePolicyProbeRoot -Branch 'master' 2>&1
+            $releasePolicyProbeResults['StaleReleaseDate'] = $LASTEXITCODE
+
+            # Недатований заголовок stable-версії: звіряти немає з чим,
+            # і на master це відмова, а не мовчазний пропуск.
+            Set-BRAVOReleasePolicyProbeContent -ProbeRoot $releasePolicyProbeRoot -ChangelogHeading '## 4.5.0 (у розробці)' -ReadmeHeader '# BRAVO 4.5.0 — опис'
+            $null = & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $releasePolicyGateScript -Root $releasePolicyProbeRoot -Branch 'master' 2>&1
+            $releasePolicyProbeResults['UndatedStableHeading'] = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $previousErrorAction
         }
@@ -354,6 +373,16 @@
         -Condition ($releasePolicyProbeResults['StaleFromDev'] -ne 0) `
         -Name "ReleasePolicy/RejectsStaleChangelogAndHeaderOnPromotion" `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати promotion, якщо CHANGELOG.md і заголовки README.md/BRAVO_SETUP.md лишились зі старої prerelease-версії — X.Y.Z як підрядок X.Y.Z-dev.N не повинен рахуватись збігом; код виходу: $($releasePolicyProbeResults['StaleFromDev'])"
+
+    Test-BRAVOCondition `
+        -Condition ($releasePolicyProbeResults['StaleReleaseDate'] -ne 0) `
+        -Name "ReleasePolicy/RejectsReleaseDateDriftFromChangelog" `
+        -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати комплект, де releaseDate у VERSION.json не збігається з датою заголовка CHANGELOG.md — саме так поле лишалось датою штампу 5.3.0-rc.1 через три подальші штампи; код виходу: $($releasePolicyProbeResults['StaleReleaseDate'])"
+
+    Test-BRAVOCondition `
+        -Condition ($releasePolicyProbeResults['UndatedStableHeading'] -ne 0) `
+        -Name "ReleasePolicy/RejectsUndatedStableChangelogHeading" `
+        -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати promotion, якщо заголовок CHANGELOG.md для stable-версії не датований — звіряти releaseDate немає з чим; код виходу: $($releasePolicyProbeResults['UndatedStableHeading'])"
 
     # ROADMAP P0.2: гейт master-промоції має вимагати СЕМАНТИЧНЕ збільшення
     # stable-версії, а не лише нерівність рядків (стара реалізація

@@ -2583,12 +2583,26 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         $releasePolicyPwsh = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         function Invoke-BRAVOReleasePolicyFixture {
             param([Parameter(Mandatory = $true)][string]$PackageVersion)
+            # RELEASE_POLICY 5.3: releaseDate звіряється з датою
+            # заголовка CHANGELOG.md, тому fixture несе обидва значення
+            # узгодженими. Інакше кожен випадок нижче давав би ЗАЙВУ
+            # помилку дати, і assert '::error:: рівно один' перестав би
+            # означати те, заради чого його писали.
+            $fixtureReleaseDate = '2026-09-13'
             [IO.File]::WriteAllText(
                 (Join-Path $releasePolicyFixtureRoot 'VERSION.json'),
-                ('{{"packageVersion": "{0}", "releaseChannel": "prerelease"}}' -f $PackageVersion),
+                ('{{"packageVersion": "{0}", "releaseChannel": "prerelease", "releaseDate": "{1}"}}' -f $PackageVersion, $fixtureReleaseDate),
                 [Text.Encoding]::UTF8
             )
-            foreach ($documentName in @('CHANGELOG.md', 'README.md', 'BRAVO_SETUP.md')) {
+            # CHANGELOG окремо: йому потрібен ДАТОВАНИЙ заголовок рівня
+            # '##', тоді як README.md/BRAVO_SETUP.md перевіряються за
+            # ПЕРШИМ рядком і лишаються як були.
+            [IO.File]::WriteAllText(
+                (Join-Path $releasePolicyFixtureRoot 'CHANGELOG.md'),
+                ("# BRAVO {0}`r`n`r`n## {0} — {1}`r`n" -f $PackageVersion, $fixtureReleaseDate),
+                [Text.Encoding]::UTF8
+            )
+            foreach ($documentName in @('README.md', 'BRAVO_SETUP.md')) {
                 [IO.File]::WriteAllText(
                     (Join-Path $releasePolicyFixtureRoot $documentName),
                     ("# BRAVO {0}`r`n" -f $PackageVersion),
