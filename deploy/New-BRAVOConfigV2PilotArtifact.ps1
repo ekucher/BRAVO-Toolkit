@@ -60,10 +60,46 @@ $fileMap = [ordered]@{
     'docs/BRAVO_CONFIG_V2_PILOT_RUNBOOK.md'         = 'docs\BRAVO_CONFIG_V2_PILOT_RUNBOOK.md'
 }
 
+function Assert-BRAVOPilotOutputDirSafeToDelete {
+    # Захист від випадкового `Remove-Item -Recurse -Force` по некоректному
+    # -OutputDir (typo, помилка CI-конфігурації): відмовляємось видаляти
+    # корінь диска, корінь репозиторію/його предків чи відомі системні
+    # каталоги. Не претендує на вичерпний allow-list — лише блокує
+    # найочевидніші катастрофічні цілі.
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$RepositoryRoot
+    )
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path).TrimEnd('\')
+    $repoFull = [System.IO.Path]::GetFullPath($RepositoryRoot).TrimEnd('\')
+    $pathRoot = [System.IO.Path]::GetPathRoot($fullPath).TrimEnd('\')
+
+    if ([string]::IsNullOrEmpty($fullPath) -or $fullPath -ieq $pathRoot) {
+        throw "OutputDir '$fullPath' — корінь диска/тому; відмовляюсь видаляти для безпеки."
+    }
+    if ($fullPath -ieq $repoFull) {
+        throw "OutputDir '$fullPath' збігається з коренем репозиторію; відмовляюсь видаляти для безпеки."
+    }
+    if ($repoFull.StartsWith(($fullPath + '\'), [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "OutputDir '$fullPath' є предком кореня репозиторію; відмовляюсь видаляти для безпеки."
+    }
+
+    $wellKnownRoots = @($env:SystemDrive, $env:SystemRoot, $env:ProgramData, $env:USERPROFILE, $env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object { [System.IO.Path]::GetFullPath($_).TrimEnd('\') }
+    foreach ($wellKnownRoot in $wellKnownRoots) {
+        if ($fullPath -ieq $wellKnownRoot) {
+            throw "OutputDir '$fullPath' збігається із системним каталогом '$wellKnownRoot'; відмовляюсь видаляти для безпеки."
+        }
+    }
+}
+
 if ([string]::IsNullOrWhiteSpace($OutputDir)) {
     $OutputDir = Join-Path $repositoryRoot 'artifacts\config-v2-pilot'
 }
 if (Test-Path -LiteralPath $OutputDir) {
+    Assert-BRAVOPilotOutputDirSafeToDelete -Path $OutputDir -RepositoryRoot $repositoryRoot
     Remove-Item -LiteralPath $OutputDir -Recurse -Force
 }
 [void](New-Item -ItemType Directory -Path $OutputDir -Force)

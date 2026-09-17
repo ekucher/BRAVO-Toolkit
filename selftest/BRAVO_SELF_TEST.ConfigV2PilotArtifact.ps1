@@ -50,6 +50,29 @@ function Test-BRAVOPilotSelfTestThrows {
         -FailureDetail "threw=$threw message='$message' expectedPattern='$ExpectedMessagePattern'"
 }
 
+function Invoke-BRAVOPilotOutputDirGuardIsolated {
+    # Тестує rejection-логіку Assert-BRAVOPilotOutputDirSafeToDelete
+    # (New-BRAVOConfigV2PilotArtifact.ps1) БЕЗ виконання побічних ефектів
+    # решти білдер-скрипта (git show тощо) і БЕЗ ризику реального
+    # Remove-Item по системних шляхах: витягуємо лише визначення функції
+    # через AST-парсер і викликаємо його ізольовано.
+    param([Parameter(Mandatory = $true)][string]$Path, [Parameter(Mandatory = $true)][string]$RepositoryRoot)
+
+    $builderPath = Join-Path $script:repoRoot 'deploy\New-BRAVOConfigV2PilotArtifact.ps1'
+    $tokens = $null
+    $parseErrors = $null
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($builderPath, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) {
+        throw "Не вдалося розпарсити '$builderPath': $([string]::Join(' | ', @($parseErrors | ForEach-Object { $_.Message })))"
+    }
+    $functionAst = $ast.Find({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Assert-BRAVOPilotOutputDirSafeToDelete' }, $true)
+    if (-not $functionAst) {
+        throw "Функцію 'Assert-BRAVOPilotOutputDirSafeToDelete' не знайдено в '$builderPath'."
+    }
+    $isolatedScriptBlock = [scriptblock]::Create($functionAst.Extent.Text + "`nAssert-BRAVOPilotOutputDirSafeToDelete -Path `$Path -RepositoryRoot `$RepositoryRoot")
+    & $isolatedScriptBlock
+}
+
 # --- Synthetic fixture construction ------------------------------------------
 
 function New-BRAVOPilotStubScript {
@@ -208,6 +231,37 @@ try {
 
     $verifyOutput = & (Join-Path $artifactRoot 'Test-BRAVOConfigV2PilotArtifact.ps1') -ArtifactRoot $artifactRoot 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Artifact/VerifiesAfterUnpack' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($verifyOutput | Select-Object -Last 5)))
+
+    # =========================================================================
+    # 1a) Guard проти unsafe -OutputDir перед Remove-Item -Recurse -Force
+    #     (Assert-BRAVOPilotOutputDirSafeToDelete)
+    # =========================================================================
+    Test-BRAVOPilotSelfTestThrows -Name 'Guard/RejectsDriveRoot' -ExpectedMessagePattern 'корінь диска' -ScriptBlock {
+        Invoke-BRAVOPilotOutputDirGuardIsolated -Path 'C:\' -RepositoryRoot $script:repoRoot
+    }
+    Test-BRAVOPilotSelfTestThrows -Name 'Guard/RejectsRepositoryRoot' -ExpectedMessagePattern 'коренем репозиторію' -ScriptBlock {
+        Invoke-BRAVOPilotOutputDirGuardIsolated -Path $script:repoRoot -RepositoryRoot $script:repoRoot
+    }
+    Test-BRAVOPilotSelfTestThrows -Name 'Guard/RejectsRepositoryRootAncestor' -ExpectedMessagePattern 'предком кореня репозиторію' -ScriptBlock {
+        Invoke-BRAVOPilotOutputDirGuardIsolated -Path (Split-Path -Parent $script:repoRoot) -RepositoryRoot $script:repoRoot
+    }
+    Test-BRAVOPilotSelfTestThrows -Name 'Guard/RejectsWellKnownSystemDir' -ExpectedMessagePattern 'системним каталогом' -ScriptBlock {
+        Invoke-BRAVOPilotOutputDirGuardIsolated -Path $env:SystemRoot -RepositoryRoot $script:repoRoot
+    }
+    $guardAllowsOrdinaryDir = $true
+    $guardAllowsOrdinaryDirDetail = ''
+    try {
+        Invoke-BRAVOPilotOutputDirGuardIsolated -Path $buildOutputDir -RepositoryRoot $script:repoRoot
+    } catch {
+        $guardAllowsOrdinaryDir = $false
+        $guardAllowsOrdinaryDirDetail = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'Guard/AllowsOrdinaryOutputDir' -Condition $guardAllowsOrdinaryDir -FailureDetail $guardAllowsOrdinaryDirDetail
+
+    # Реальний end-to-end прогін гілки Remove-Item + rebuild: $buildOutputDir
+    # уже існує з попереднього білда (тимчасовий каталог, безпечно).
+    $rebuildOutput = & (Join-Path $script:repoRoot 'deploy\New-BRAVOConfigV2PilotArtifact.ps1') -OutputDir $buildOutputDir 2>&1
+    Test-BRAVOPilotSelfTestCondition -Name 'Guard/RebuildIntoExistingOutputDirSucceeds' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($rebuildOutput | Select-Object -Last 5)))
 
     # =========================================================================
     # 2) Happy path end-to-end через розпакований артефакт
