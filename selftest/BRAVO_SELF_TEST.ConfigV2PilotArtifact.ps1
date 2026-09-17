@@ -85,11 +85,13 @@ param([string]$ConfigPath,[string]$Action,[string]$CredentialComponent,[string]$
 $behaviorPath = Join-Path $PSScriptRoot '.stub-behavior.json'
 $exitCode = 0
 $noOutput = $false
+$stdErrOnly = $false
 if (Test-Path -LiteralPath $behaviorPath) {
     $b = Get-Content -LiteralPath $behaviorPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if ($b.PSObject.Properties['Setup']) {
         $exitCode = [int]$b.Setup.ExitCode
         if ($b.Setup.PSObject.Properties['NoOutput']) { $noOutput = [bool]$b.Setup.NoOutput }
+        if ($b.Setup.PSObject.Properties['StdErrOnly']) { $stdErrOnly = [bool]$b.Setup.StdErrOnly }
     }
 }
 # NoOutput симулює реальний VM-прогін (2026-09-17), де BRAVO_SETUP.ps1
@@ -97,7 +99,13 @@ if (Test-Path -LiteralPath $behaviorPath) {
 # ані в success-, ані в error-стрім, який захоплює
 # Invoke-BRAVOPilotValidateOnly (2>&1 | ForEach-Object) — 0 захоплених
 # рядків є правдивим діагностичним станом, не браком стаба.
-if (-not $noOutput) {
+if ($stdErrOnly) {
+    # Стрес-тест merge 2>&1: помилка потрапляє лише в PowerShell
+    # error-стрім (ErrorRecord, не рядок success-стріму) — саме те, що
+    # реально захоплює Invoke-BRAVOPilotValidateOnly через `2>&1 |
+    # ForEach-Object { [string]$_ }`.
+    Write-Error "[STUB-SETUP-STDERR] exitCode=$exitCode" -ErrorAction Continue
+} elseif (-not $noOutput) {
     Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly SkipAccessTest=$SkipAccessTest exitCode=$exitCode"
 }
 exit $exitCode
@@ -591,6 +599,56 @@ try {
     Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/DefaultModeEvidenceRecordsPerformed' -Condition (
         @($f20StrictLines | Where-Object { $_ -match 'ExternalAccess: PERFORMED' }).Count -gt 0
     ) -FailureDetail ([string]::Join(' | ', $f20StrictLines))
+
+    # F21: exit 0 + ПОРОЖНІЙ вивід — відмінний кейс від F19 (exit 1 +
+    # порожній). Успішний дочірній прогін, що з якоїсь причини (напр.
+    # -NoPause на дуже ранньому success-шляху) не пише жодного рядка,
+    # МАЄ трактуватись як PASS з порожньою evidence, а не як прихована
+    # помилка.
+    $f21Install = Join-Path $tempRoot 'f21-exit0-empty-output'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f21Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f21Install -Behavior @{ Setup = @{ ExitCode = 0; NoOutput = $true } }
+    $f21OutputPath = Join-Path $tempRoot 'f21-validate.log'
+    $f21Threw = $false
+    $f21Error = $null
+    $f21Result = $null
+    try {
+        $f21Result = Invoke-BRAVOPilotValidateOnly -InstallRoot $f21Install -OutputPath $f21OutputPath
+    } catch {
+        $f21Threw = $true
+        $f21Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyExitZeroEmptyOutputNoSecondaryException' -Condition (-not $f21Threw) -FailureDetail $f21Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyExitZeroEmptyOutputReportsPass' -Condition (
+        (-not $f21Threw) -and $null -ne $f21Result -and $f21Result.ExitCode -eq 0 -and $f21Result.Pass -eq $true
+    ) -FailureDetail $(if ($null -ne $f21Result) { "ExitCode=$($f21Result.ExitCode) Pass=$($f21Result.Pass)" } else { '$f21Result є $null' })
+
+    # F22: помилка дочірнього процесу потрапляє ЛИШЕ в error-стрім
+    # (PowerShell ErrorRecord через Write-Error), success-стрім
+    # порожній. `2>&1 | ForEach-Object { [string]$_ }` мусить коректно
+    # злити обидва стріми в масив рядків без винятку прив'язки і без
+    # втрати діагностичної інформації про помилку.
+    $f22Install = Join-Path $tempRoot 'f22-stderr-only'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f22Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f22Install -Behavior @{ Setup = @{ ExitCode = 1; StdErrOnly = $true } }
+    $f22OutputPath = Join-Path $tempRoot 'f22-validate.log'
+    $f22Threw = $false
+    $f22Error = $null
+    $f22Result = $null
+    try {
+        $f22Result = Invoke-BRAVOPilotValidateOnly -InstallRoot $f22Install -OutputPath $f22OutputPath
+    } catch {
+        $f22Threw = $true
+        $f22Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyStdErrOnlyNoSecondaryException' -Condition (-not $f22Threw) -FailureDetail $f22Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyStdErrOnlyPreservesExitCode' -Condition (
+        (-not $f22Threw) -and $null -ne $f22Result -and $f22Result.ExitCode -eq 1 -and -not $f22Result.Pass
+    ) -FailureDetail $(if ($null -ne $f22Result) { "ExitCode=$($f22Result.ExitCode) Pass=$($f22Result.Pass)" } else { '$f22Result є $null' })
+    $f22Lines = @(Get-Content -LiteralPath $f22OutputPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyStdErrOnlyContentCaptured' -Condition (
+        @($f22Lines | Where-Object { $_ -match 'STUB-SETUP-STDERR' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f22Lines))
 
     # F8: read-only destination (EvidenceRoot без права на запис).
     $f8EvidenceRoot = Join-Path $tempRoot 'f8-readonly-evidence'
