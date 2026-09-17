@@ -328,10 +328,29 @@ try {
     $validateAgainOutput = & $startScript -Validate -InstallRoot $happyInstallRoot -EvidenceDir $evidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Idempotency/RepeatedValidateSucceeds' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($validateAgainOutput | Select-Object -Last 10)))
 
+    # P2 regression: acceptance.json.PreflightPass має бути evidence-based
+    # (читається з фактичного preflight.json), а не hardcoded true. Копія
+    # evidence-каталогу на стані Validated з видаленим preflight.json ->
+    # -Accept НЕ повинен звітувати PreflightPass=true й не повинен видати
+    # PILOT ACCEPTED, хоча решта доказів (Validated-стан, backup, health
+    # тощо) лишається валідною.
+    $tamperedEvidenceDir = Join-Path $tempRoot 'evidence-happy-missing-preflight'
+    Copy-Item -LiteralPath $evidenceDir -Destination $tamperedEvidenceDir -Recurse -Force
+    Remove-Item -LiteralPath (Join-Path $tamperedEvidenceDir 'preflight.json') -Force
+    $tamperedAcceptOutput = & $startScript -Accept -EvidenceDir $tamperedEvidenceDir 2>&1
+    $tamperedAcceptExit = $LASTEXITCODE
+    $tamperedAcceptance = Get-Content -LiteralPath (Join-Path $tamperedEvidenceDir 'acceptance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Test-BRAVOPilotSelfTestCondition -Name 'Security/AcceptWithMissingPreflightEvidenceDoesNotClaimPass' -Condition (
+        $tamperedAcceptExit -ne 0 -and
+        -not [bool]$tamperedAcceptance.Criteria.PreflightPass -and
+        [string]$tamperedAcceptance.Result -ne 'PILOT ACCEPTED'
+    ) -FailureDetail ("exit=$tamperedAcceptExit PreflightPass=$($tamperedAcceptance.Criteria.PreflightPass) Result=$($tamperedAcceptance.Result)")
+
     $acceptOutput = & $startScript -Accept -EvidenceDir $evidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Happy/AcceptSucceeds' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($acceptOutput | Select-Object -Last 10)))
     $acceptance = Get-Content -LiteralPath (Join-Path $evidenceDir 'acceptance.json') -Raw -Encoding UTF8 | ConvertFrom-Json
     Test-BRAVOPilotSelfTestCondition -Name 'Happy/AcceptanceResultIsAccepted' -Condition ([string]$acceptance.Result -eq 'PILOT ACCEPTED') -FailureDetail ([string]::Join(', ', @($acceptance.FailedCriteria)))
+    Test-BRAVOPilotSelfTestCondition -Name 'Happy/AcceptanceRecordsPreflightPassFromEvidence' -Condition ([bool]$acceptance.Criteria.PreflightPass) ''
 
     # Секретна безпека: жоден evidence-файл не містить embedded-credential URI,
     # і жодне значення під sensitive-ключем поза reference-формою.

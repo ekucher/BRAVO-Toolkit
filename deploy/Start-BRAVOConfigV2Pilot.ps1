@@ -257,9 +257,22 @@ try {
             $backupManifestExists = @(Get-ChildItem -LiteralPath $EvidenceDir -Directory -Filter 'backup-*').Count -gt 0
             $humanReviewExists = Test-Path -LiteralPath (Join-Path $EvidenceDir 'human-review.json') -PathType Leaf
 
+            # PreflightPass — з ФАКТИЧНОГО збереженого результату, а не
+            # припущення: -Prepare зупиняється (exit 1, preflight.json НЕ
+            # пишеться) до проходження блокуючих Preflight-перевірок, тому
+            # ArtifactIntegrityPass (файл існує) НЕ гарантує сам собою, що
+            # .Pass у ньому — true, якщо код -Prepare колись зміниться.
+            $preflightJson = $null
+            try {
+                $preflightRaw = Get-Content -LiteralPath (Join-Path $EvidenceDir 'preflight.json') -Raw -Encoding UTF8 -ErrorAction Stop
+                $preflightJson = $preflightRaw | ConvertFrom-Json
+            } catch {
+                $preflightJson = $null
+            }
+
             $criteria = @{
                 ArtifactIntegrityPass    = (Test-Path -LiteralPath (Join-Path $EvidenceDir 'preflight.json') -PathType Leaf)
-                PreflightPass            = $true
+                PreflightPass            = ($null -ne $preflightJson -and [bool]$preflightJson.Pass)
                 BaselineCaptured         = (Test-Path -LiteralPath (Join-Path $EvidenceDir 'before.snapshot.json') -PathType Leaf)
                 HumanReviewApproved      = $humanReviewExists
                 BackupVerified           = $backupManifestExists
@@ -270,6 +283,16 @@ try {
                 SelfTestNoUnavailable    = (@($selfTestLog | Where-Object { $_ -match '\[НЕДОСТУПНО\]' }).Count -eq 0)
                 HealthPass               = (Test-Path -LiteralPath (Join-Path $EvidenceDir 'health.log') -PathType Leaf)
                 ArchiveSmokePass         = (Test-Path -LiteralPath (Join-Path $EvidenceDir 'archive-smoke.log') -PathType Leaf)
+                # NoSecretExposureDetected: SafeByConstruction, не post-hoc
+                # сканування. Write-BRAVOPilotEvidenceJson/-Text викликають
+                # Assert-BRAVOPilotEvidenceSecretSafe/-TextSecretSafe на
+                # КОЖЕН запис доказу за весь час життєвого циклу
+                # (Preflight/Prepare/Approve/Activate/Validate) і кидають
+                # виняток, що зупиняє операцію, при виявленні секрето-
+                # подібного рядка. Якщо виконання дійшло до -Accept з
+                # повним пакетом доказів — жоден такий запис не міг
+                # пройти неперевіреним. Повторне сканування тут дублювало
+                # б ту саму канонічну реалізацію без додаткового доказу.
                 NoSecretExposureDetected = $true
             }
             $acceptance = New-BRAVOPilotAcceptanceRecord -EvidenceDir $EvidenceDir -Criteria $criteria
