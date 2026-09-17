@@ -651,15 +651,31 @@ try {
 
     $f17ResolvedInstallA = [System.IO.Path]::GetFullPath($f17aInstall)
     $f17HolderScriptPath = Join-Path $tempRoot 'f17-lock-holder.ps1'
+    $f17LockAcquiredMarker = Join-Path $tempRoot 'f17-lock-acquired.marker'
+    $f17HolderStdoutPath = Join-Path $tempRoot 'f17-holder.stdout.log'
+    $f17HolderStderrPath = Join-Path $tempRoot 'f17-holder.stderr.log'
     $f17HolderScript = @"
 . '$($script:repoRoot)\deploy\BRAVOConfigV2Pilot.Runtime.ps1'
 `$m = Enter-BRAVOPilotInstallRootLock -InstallRoot '$f17ResolvedInstallA' -TimeoutSeconds 10
+[System.IO.File]::WriteAllText('$f17LockAcquiredMarker', 'acquired')
 Start-Sleep -Seconds 4
 Exit-BRAVOPilotInstallRootLock -Mutex `$m
 "@
     [System.IO.File]::WriteAllText($f17HolderScriptPath, $f17HolderScript, (New-Object System.Text.UTF8Encoding($false)))
-    $f17HolderProc = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $f17HolderScriptPath) -PassThru -WindowStyle Hidden
-    Start-Sleep -Milliseconds 800
+    $f17HolderProc = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $f17HolderScriptPath) -PassThru -WindowStyle Hidden -RedirectStandardOutput $f17HolderStdoutPath -RedirectStandardError $f17HolderStderrPath
+
+    # Детерміноване очікування маркера замість фіксованого Start-Sleep:
+    # новий powershell.exe-процес + dot-source Runtime.ps1 має непередбачуваний
+    # холодний старт, фіксована пауза була б крихкою (спостережено — перший
+    # прогін фактично встиг активувати f17a ДО того, як власник локу набув
+    # володіння, і тест хибно провалився без будь-якого реального дефекту в
+    # самому locking-коді).
+    $f17MarkerDeadline = (Get-Date).AddSeconds(8)
+    while (-not (Test-Path -LiteralPath $f17LockAcquiredMarker) -and (Get-Date) -lt $f17MarkerDeadline) {
+        Start-Sleep -Milliseconds 100
+    }
+    $f17MarkerAppeared = Test-Path -LiteralPath $f17LockAcquiredMarker
+    Test-BRAVOPilotSelfTestCondition -Name 'Concurrency/LockHolderProcessAcquiredLock' -Condition $f17MarkerAppeared -FailureDetail ("holder stderr: " + (Get-Content -LiteralPath $f17HolderStderrPath -Raw -ErrorAction SilentlyContinue))
 
     $f17BlockedOutput = & $startScript -Activate -InstallRoot $f17aInstall -EvidenceDir $f17aEvidenceDir 2>&1
     $f17BlockedExit = $LASTEXITCODE
