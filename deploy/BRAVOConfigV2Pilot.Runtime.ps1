@@ -1073,3 +1073,58 @@ function Invoke-BRAVOPilotRollback {
     }
     return [pscustomobject]$record
 }
+
+# --- Взаємне виключення mutating-операцій над одним InstallRoot -----------
+
+function Enter-BRAVOPilotInstallRootLock {
+    # -Activate й -Rollback — обидві мутують файли на -InstallRoot
+    # (BRAVO.local.config / BRAVO.config) через окремі, кожен по собі
+    # атомарні, File.Replace/Copy-Item-виклики. Без взаємного виключення
+    # два одночасні виклики (Activate+Activate з різних EvidenceDir,
+    # Activate+Rollback, Rollback+Rollback) могли б чергувати ці окремі
+    # атомарні записи так, що на диску лишається несумісна КОМБІНАЦІЯ
+    # файлів (наприклад, BRAVO.config від одного відкату поруч із щойно
+    # активованим іншим BRAVO.local.config) — кожен файл коректний сам по
+    # собі, але пара суперечить будь-якому єдиному backup/candidate.
+    #
+    # Named Mutex, а не lock-файл: crash-safe за конструкцією ОС. Якщо
+    # процес-власник впаде без Release, ОС позначає mutex "abandoned", і
+    # наступний WaitOne() все одно отримує володіння (через
+    # AbandonedMutexException) — постійного "завислого" замка не виникає,
+    # на відміну від lock-файлу, що вимагав би окремої PID/staleness-
+    # евристики. Global\-простір імен: pilot вимагає RunningAsAdministrator
+    # (Preflight), тому право створення глобальних kernel-об'єктів уже є;
+    # без Global\ той самий оператор у двох сесіях RDP не побачив би чужий
+    # session-local mutex.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$InstallRoot,
+        [int]$TimeoutSeconds = 5
+    )
+
+    $normalizedPath = ([System.IO.Path]::GetFullPath($InstallRoot)).TrimEnd('\', '/').ToLowerInvariant()
+    $hashBytes = [System.Security.Cryptography.SHA256]::Create().ComputeHash([System.Text.Encoding]::UTF8.GetBytes($normalizedPath))
+    $hashHex = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+    $mutexName = "Global\BRAVOConfigV2Pilot-$hashHex"
+
+    $mutex = New-Object System.Threading.Mutex($false, $mutexName)
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+    } catch [System.Threading.AbandonedMutexException] {
+        # Попередній власник процесу впав без ReleaseMutex — лок і так наш.
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        throw "PILOT_INSTALLROOT_LOCKED: інша операція -Activate/-Rollback вже виконується над '$InstallRoot' (очікування $TimeoutSeconds с вичерпано). Дочекайтесь завершення або перевірте, чи немає завислого процесу pilot-скрипта."
+    }
+    return $mutex
+}
+
+function Exit-BRAVOPilotInstallRootLock {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][System.Threading.Mutex]$Mutex)
+    try { $Mutex.ReleaseMutex() } catch { }
+    $Mutex.Dispose()
+}

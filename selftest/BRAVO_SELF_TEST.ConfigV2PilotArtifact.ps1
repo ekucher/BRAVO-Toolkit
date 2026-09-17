@@ -624,6 +624,56 @@ try {
     $f16RollbackOutput = & $startScript -Rollback -InstallRoot $f16Install -EvidenceDir $f16EvidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/RollbackAvailableAfterActivationFailure' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($f16RollbackOutput | Select-Object -Last 5)))
 
+    # =========================================================================
+    # F17: взаємне виключення mutating-операцій над одним -InstallRoot
+    # (§concurrency-triage) — Enter-/Exit-BRAVOPilotInstallRootLock через
+    # повний CLI, з РЕАЛЬНИМ окремим процесом-власником локу (не той самий
+    # потік — named Mutex реентерабельний для одного потоку, тому лише
+    # окремий процес коректно моделює конкурентний -Activate).
+    # =========================================================================
+    $f17aInstall = Join-Path $tempRoot 'f17a-concurrency'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f17aInstall
+    $f17aEvidenceRoot = Join-Path $tempRoot 'f17a-evidence'
+    & $startScript -Preflight -InstallRoot $f17aInstall -ArtifactRoot $artifactRoot -EvidenceRoot $f17aEvidenceRoot 2>&1 | Out-Null
+    & $startScript -Prepare -InstallRoot $f17aInstall -ArtifactRoot $artifactRoot -EvidenceRoot $f17aEvidenceRoot 2>&1 | Out-Null
+    $f17aEvidenceDir = (Get-ChildItem -LiteralPath $f17aEvidenceRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+    $f17aState = Get-Content -LiteralPath (Join-Path $f17aEvidenceDir 'metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    & $startScript -Approve -EvidenceDir $f17aEvidenceDir -ApprovedCandidateHash ([string]$f17aState.CandidateHash) 2>&1 | Out-Null
+
+    $f17bInstall = Join-Path $tempRoot 'f17b-concurrency'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f17bInstall
+    $f17bEvidenceRoot = Join-Path $tempRoot 'f17b-evidence'
+    & $startScript -Preflight -InstallRoot $f17bInstall -ArtifactRoot $artifactRoot -EvidenceRoot $f17bEvidenceRoot 2>&1 | Out-Null
+    & $startScript -Prepare -InstallRoot $f17bInstall -ArtifactRoot $artifactRoot -EvidenceRoot $f17bEvidenceRoot 2>&1 | Out-Null
+    $f17bEvidenceDir = (Get-ChildItem -LiteralPath $f17bEvidenceRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+    $f17bState = Get-Content -LiteralPath (Join-Path $f17bEvidenceDir 'metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    & $startScript -Approve -EvidenceDir $f17bEvidenceDir -ApprovedCandidateHash ([string]$f17bState.CandidateHash) 2>&1 | Out-Null
+
+    $f17ResolvedInstallA = [System.IO.Path]::GetFullPath($f17aInstall)
+    $f17HolderScriptPath = Join-Path $tempRoot 'f17-lock-holder.ps1'
+    $f17HolderScript = @"
+. '$($script:repoRoot)\deploy\BRAVOConfigV2Pilot.Runtime.ps1'
+`$m = Enter-BRAVOPilotInstallRootLock -InstallRoot '$f17ResolvedInstallA' -TimeoutSeconds 10
+Start-Sleep -Seconds 4
+Exit-BRAVOPilotInstallRootLock -Mutex `$m
+"@
+    [System.IO.File]::WriteAllText($f17HolderScriptPath, $f17HolderScript, (New-Object System.Text.UTF8Encoding($false)))
+    $f17HolderProc = Start-Process -FilePath (Get-Process -Id $PID).Path -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $f17HolderScriptPath) -PassThru -WindowStyle Hidden
+    Start-Sleep -Milliseconds 800
+
+    $f17BlockedOutput = & $startScript -Activate -InstallRoot $f17aInstall -EvidenceDir $f17aEvidenceDir 2>&1
+    $f17BlockedExit = $LASTEXITCODE
+    Test-BRAVOPilotSelfTestCondition -Name 'Concurrency/ActivateBlockedWhileLockHeldBySameInstallRoot' -Condition (
+        $f17BlockedExit -ne 0 -and (($f17BlockedOutput | Out-String) -match 'PILOT_INSTALLROOT_LOCKED')
+    ) -FailureDetail ([string]::Join(' | ', @($f17BlockedOutput | Select-Object -Last 5)))
+
+    $f17IndependentOutput = & $startScript -Activate -InstallRoot $f17bInstall -EvidenceDir $f17bEvidenceDir 2>&1
+    Test-BRAVOPilotSelfTestCondition -Name 'Concurrency/DifferentInstallRootActivatesIndependently' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($f17IndependentOutput | Select-Object -Last 5)))
+
+    $f17HolderProc.WaitForExit()
+    $f17RetryOutput = & $startScript -Activate -InstallRoot $f17aInstall -EvidenceDir $f17aEvidenceDir 2>&1
+    Test-BRAVOPilotSelfTestCondition -Name 'Concurrency/ActivateSucceedsAfterLockReleased' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($f17RetryOutput | Select-Object -Last 5)))
+
 } catch {
     # Неперехоплена помилка десь у сценарії — це саме по собі провал
     # тесту, а не привід мовчки перервати прогін без summary/exit-коду.

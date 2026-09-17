@@ -155,61 +155,72 @@ try {
             if ([string]::IsNullOrWhiteSpace($InstallRoot)) { throw "-InstallRoot є обов'язковим для -Activate." }
             if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { throw "-EvidenceDir є обов'язковим для -Activate." }
             $resolvedInstallRoot = Resolve-BRAVOPilotFullPath $InstallRoot
-            # 'Activated' також дозволений: повторний -Activate уже
-            # активованого candidate — ідемпотентна операція (§27) —
-            # Invoke-BRAVOPilotAtomicActivation виявляє однаковий hash і
-            # не пише файл вдруге.
-            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Reviewed', 'Activated') -Operation '-Activate'
-            $candidatePath = [string]$state.CandidatePath
-            $approvedHash = [string]$state.CandidateHash
 
-            # Ідемпотентний повторний -Activate: якщо на сервері вже діє
-            # BRAVO.local.config з тим самим SHA-256, що й candidate, — це
-            # чистий no-op, і НОВИЙ backup створювати не можна. Інакше
-            # повторний виклик у ту саму секунду (yyyyMMdd-HHmmss) міг би
-            # вдруге записати той самий backup-каталог і пошкодити
-            # backup-manifest.json (self-referential hash mismatch), а
-            # головне — підмінити BackupDir у стані на backup ВЖЕ
-            # активованого стану замість справжнього pre-activation backup,
-            # яким має користуватись -Rollback.
-            if ((Test-Path -LiteralPath (Join-Path $EvidenceDir 'activation.json') -PathType Leaf) -and
-                (Test-BRAVOPilotActivationIsNoOp -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath)) {
-                Write-Host "[SUCCESS] Активація — no-op: BRAVO.local.config на сервері вже мав такий самий SHA-256. Backup не дублюється."
+            # Взаємне виключення з будь-яким іншим одночасним -Activate/
+            # -Rollback над цим самим -InstallRoot (§concurrency-triage):
+            # обидві операції мутують BRAVO.local.config/BRAVO.config через
+            # окремі атомарні записи, які без цього логу могли б чергуватись
+            # у несумісну комбінацію файлів на диску.
+            $pilotLock = Enter-BRAVOPilotInstallRootLock -InstallRoot $resolvedInstallRoot
+            try {
+                # 'Activated' також дозволений: повторний -Activate уже
+                # активованого candidate — ідемпотентна операція (§27) —
+                # Invoke-BRAVOPilotAtomicActivation виявляє однаковий hash і
+                # не пише файл вдруге.
+                $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Reviewed', 'Activated') -Operation '-Activate'
+                $candidatePath = [string]$state.CandidatePath
+                $approvedHash = [string]$state.CandidateHash
+
+                # Ідемпотентний повторний -Activate: якщо на сервері вже діє
+                # BRAVO.local.config з тим самим SHA-256, що й candidate, — це
+                # чистий no-op, і НОВИЙ backup створювати не можна. Інакше
+                # повторний виклик у ту саму секунду (yyyyMMdd-HHmmss) міг би
+                # вдруге записати той самий backup-каталог і пошкодити
+                # backup-manifest.json (self-referential hash mismatch), а
+                # головне — підмінити BackupDir у стані на backup ВЖЕ
+                # активованого стану замість справжнього pre-activation backup,
+                # яким має користуватись -Rollback.
+                if ((Test-Path -LiteralPath (Join-Path $EvidenceDir 'activation.json') -PathType Leaf) -and
+                    (Test-BRAVOPilotActivationIsNoOp -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath)) {
+                    Write-Host "[SUCCESS] Активація — no-op: BRAVO.local.config на сервері вже мав такий самий SHA-256. Backup не дублюється."
+                    Write-Host "Наступний крок: -Validate -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`""
+                    exit 0
+                }
+
+                $backup = New-BRAVOPilotBackup -InstallRoot $resolvedInstallRoot -EvidenceDir $EvidenceDir
+                Test-BRAVOPilotBackupIntegrity -BackupDir $backup.BackupDir | Out-Null
+                Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'BackupCreated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
+
+                # Якщо активація впаде тут, стан МАЄ перейти в 'Failed' (легальний
+                # перехід з 'BackupCreated' — уже описаний у
+                # $script:BRAVOPilotStateTransitions), інакше metadata.json
+                # назавжди лишається на 'BackupCreated', і повторний -Activate
+                # неможливий (Assert-BRAVOPilotState для -Activate вимагає
+                # 'Reviewed'/'Activated'), а зовнішній catch унизу файлу лише
+                # друкує помилку й виходить, не торкаючись стану. Backup уже
+                # верифікований (Test-BRAVOPilotBackupIntegrity вище) і
+                # лишається валідним — відновлення через -Rollback доступне
+                # незалежно від значення State (Invoke-BRAVOPilotRollback шукає
+                # каталог backup-*, а не читає metadata.json).
+                try {
+                    $activation = Invoke-BRAVOPilotAtomicActivation -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath -EvidenceDir $EvidenceDir -ApprovedCandidateHash $approvedHash
+                } catch {
+                    Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'Failed' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
+                    throw "$($_.Exception.Message) Backup перевірено й доступний у '$($backup.BackupDir)' — виконайте -Rollback -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`"."
+                }
+                Write-BRAVOPilotEvidenceJson -Path (Join-Path $EvidenceDir 'activation.json') -Object $activation
+                Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'Activated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
+
+                if ($activation.NoOp) {
+                    Write-Host "[SUCCESS] Активація — no-op: BRAVO.local.config на сервері вже мав такий самий SHA-256."
+                } else {
+                    Write-Host "[SUCCESS] BRAVO.local.config активовано атомарно: $($activation.TargetPath)"
+                }
                 Write-Host "Наступний крок: -Validate -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`""
                 exit 0
+            } finally {
+                Exit-BRAVOPilotInstallRootLock -Mutex $pilotLock
             }
-
-            $backup = New-BRAVOPilotBackup -InstallRoot $resolvedInstallRoot -EvidenceDir $EvidenceDir
-            Test-BRAVOPilotBackupIntegrity -BackupDir $backup.BackupDir | Out-Null
-            Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'BackupCreated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
-
-            # Якщо активація впаде тут, стан МАЄ перейти в 'Failed' (легальний
-            # перехід з 'BackupCreated' — уже описаний у
-            # $script:BRAVOPilotStateTransitions), інакше metadata.json
-            # назавжди лишається на 'BackupCreated', і повторний -Activate
-            # неможливий (Assert-BRAVOPilotState для -Activate вимагає
-            # 'Reviewed'/'Activated'), а зовнішній catch унизу файлу лише
-            # друкує помилку й виходить, не торкаючись стану. Backup уже
-            # верифікований (Test-BRAVOPilotBackupIntegrity вище) і
-            # лишається валідним — відновлення через -Rollback доступне
-            # незалежно від значення State (Invoke-BRAVOPilotRollback шукає
-            # каталог backup-*, а не читає metadata.json).
-            try {
-                $activation = Invoke-BRAVOPilotAtomicActivation -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath -EvidenceDir $EvidenceDir -ApprovedCandidateHash $approvedHash
-            } catch {
-                Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'Failed' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
-                throw "$($_.Exception.Message) Backup перевірено й доступний у '$($backup.BackupDir)' — виконайте -Rollback -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`"."
-            }
-            Write-BRAVOPilotEvidenceJson -Path (Join-Path $EvidenceDir 'activation.json') -Object $activation
-            Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'Activated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
-
-            if ($activation.NoOp) {
-                Write-Host "[SUCCESS] Активація — no-op: BRAVO.local.config на сервері вже мав такий самий SHA-256."
-            } else {
-                Write-Host "[SUCCESS] BRAVO.local.config активовано атомарно: $($activation.TargetPath)"
-            }
-            Write-Host "Наступний крок: -Validate -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`""
-            exit 0
         }
 
         'Validate' {
@@ -329,10 +340,15 @@ try {
             if ([string]::IsNullOrWhiteSpace($EvidenceDir)) { throw "-EvidenceDir є обов'язковим для -Rollback." }
             $resolvedInstallRoot = Resolve-BRAVOPilotFullPath $InstallRoot
 
-            $result = Invoke-BRAVOPilotRollback -InstallRoot $resolvedInstallRoot -EvidenceDir $EvidenceDir
-            Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'RolledBack' | Out-Null
-            Write-Host "[SUCCESS] $($result.Result)" -ForegroundColor Green
-            exit 0
+            $pilotLock = Enter-BRAVOPilotInstallRootLock -InstallRoot $resolvedInstallRoot
+            try {
+                $result = Invoke-BRAVOPilotRollback -InstallRoot $resolvedInstallRoot -EvidenceDir $EvidenceDir
+                Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'RolledBack' | Out-Null
+                Write-Host "[SUCCESS] $($result.Result)" -ForegroundColor Green
+                exit 0
+            } finally {
+                Exit-BRAVOPilotInstallRootLock -Mutex $pilotLock
+            }
         }
 
         'Status' {
