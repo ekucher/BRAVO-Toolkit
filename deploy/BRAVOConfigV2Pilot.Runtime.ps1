@@ -490,7 +490,12 @@ function Invoke-BRAVOPilotPreflight {
     foreach ($target in $credentialTargets) {
         try {
             $listOutput = (& cmdkey.exe /list:$target) 2>&1 | Out-String
-            $found = $listOutput -notmatch '(?i)No matching credentials|не знайдено відповідних облікових даних'
+            # Реальний вивід cmdkey.exe для відсутнього target на Windows
+            # Server 2022 (перевірено емпірично, 2026-09-18) — "* NONE *",
+            # а не "No matching credentials"; без цього патерну перевірка
+            # завжди повертала Found=$true незалежно від фактичної
+            # наявності запису (не блокуючий check, але вводив в оману).
+            $found = $listOutput -notmatch '(?i)No matching credentials|не знайдено відповідних облікових даних|\* NONE \*'
             $credentialFindings.Add("$target=$(if ($found) { 'Found' } else { 'Missing' })")
         } catch {
             $credentialFindings.Add("$target=Undetermined")

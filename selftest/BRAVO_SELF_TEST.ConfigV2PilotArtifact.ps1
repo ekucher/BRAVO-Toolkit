@@ -650,6 +650,33 @@ try {
         @($f22Lines | Where-Object { $_ -match 'STUB-SETUP-STDERR' }).Count -gt 0
     ) -FailureDetail ([string]::Join(' | ', $f22Lines))
 
+    # F23: регресія на реальний VM Preflight (2026-09-18) —
+    # Invoke-BRAVOPilotPreflight's credential-existence-check
+    # (CredentialManagerReferencesCheckedWithoutResolving) розпізнавав
+    # відсутній cmdkey-запис лише за рядком "No matching credentials",
+    # якого реальний cmdkey.exe на Windows Server 2022 НІКОЛИ не друкує —
+    # для відсутнього target він виводить "* NONE *". Без цього патерну
+    # перевірка завжди повертала Found=$true незалежно від фактичної
+    # наявності запису (non-blocking check, але вводив в оману).
+    $f23ExistTarget = 'BRAVO_PILOT_SELFTEST_F23_EXISTS'
+    $f23MissingTarget = 'BRAVO_PILOT_SELFTEST_F23_MISSING_' + [Guid]::NewGuid().ToString('N')
+    $f23Install = Join-Path $tempRoot 'f23-credential-detection'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f23Install
+    & cmdkey.exe /delete:$f23ExistTarget 2>&1 | Out-Null
+    & cmdkey.exe /generic:$f23ExistTarget /user:$f23ExistTarget /pass:selftest-f23-value 2>&1 | Out-Null
+    try {
+        $f23ListOutputExist = (& cmdkey.exe /list:$f23ExistTarget) 2>&1 | Out-String
+        $f23ListOutputMissing = (& cmdkey.exe /list:$f23MissingTarget) 2>&1 | Out-String
+        Test-BRAVOPilotSelfTestCondition -Name 'Preflight/CredentialListDetectsExistingTarget' -Condition (
+            $f23ListOutputExist -notmatch '(?i)No matching credentials|не знайдено відповідних облікових даних|\* NONE \*'
+        ) -FailureDetail $f23ListOutputExist
+        Test-BRAVOPilotSelfTestCondition -Name 'Preflight/CredentialListDetectsMissingTarget' -Condition (
+            $f23ListOutputMissing -match '(?i)No matching credentials|не знайдено відповідних облікових даних|\* NONE \*'
+        ) -FailureDetail $f23ListOutputMissing
+    } finally {
+        & cmdkey.exe /delete:$f23ExistTarget 2>&1 | Out-Null
+    }
+
     # F8: read-only destination (EvidenceRoot без права на запис).
     $f8EvidenceRoot = Join-Path $tempRoot 'f8-readonly-evidence'
     [void](New-Item -ItemType Directory -Path $f8EvidenceRoot -Force)
