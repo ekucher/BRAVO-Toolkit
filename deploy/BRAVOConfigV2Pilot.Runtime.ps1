@@ -160,7 +160,7 @@ function Assert-BRAVOPilotTextSecretSafe {
     # (немає структури), тож для логів діє вужчий, але детермінований
     # інваріант.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowNull()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$Lines)
 
     $lineNumber = 0
     foreach ($line in @($Lines)) {
@@ -189,10 +189,20 @@ function Write-BRAVOPilotEvidenceJson {
 }
 
 function Write-BRAVOPilotEvidenceText {
+    # Захоплений вивід дочірнього canonical-скрипта (BRAVO_SETUP.ps1,
+    # BRAVO_SELF_TEST.ps1, BRAVO_HEALTH.ps1, BRAVO_DRY_RUN.ps1) легітимно
+    # може виявитись порожнім масивом — коли дочірній скрипт завершується
+    # аварійно настільки рано, що ще нічого не встиг записати ні в
+    # success-, ні в error-стрім (0 рядків — це правдивий діагностичний
+    # стан, а не помилка виклику). Без [AllowEmptyCollection()] типізований
+    # масив-параметр за замовчуванням відхиляє порожній (не $null) масив
+    # (ParameterArgumentValidationErrorEmptyArrayNotAllowed), що ховає
+    # первинну помилку дочірнього скрипта за вторинним необробленим
+    # винятком тут.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowNull()][string[]]$Lines
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$Lines
     )
 
     Assert-BRAVOPilotTextSecretSafe -Lines $Lines
@@ -867,16 +877,45 @@ function Invoke-BRAVOPilotValidateOnly {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$InstallRoot,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+        # Явний, недвозначний прапорець для throwaway/offline pilot, де
+        # SFTP/SMB/webhook-цілі свідомо недосяжні (fake fixture-хости).
+        # Прокидається у BRAVO_SETUP.ps1 -SkipAccessTest, канонічний
+        # параметр якого вимикає ЛИШЕ мережеві проби доступу
+        # (BRAVO_DRY_RUN.ps1 -TestAccess: SFTP/SMB connect+probe, webhook
+        # TCP:443 reachability) і похідне відправлення тестового
+        # сповіщення. Credential Manager (2/5, 3/5), Планувальник (4/5) і
+        # цілісність рантайму лишаються повністю активними незалежно від
+        # цього прапорця. За замовчуванням $false — production/strict
+        # поведінка Validate не змінюється. Це НЕ хардкод hostname/
+        # середовища: оператор має явно передати прапорець на -Validate.
+        [switch]$AllowOfflineExternalAccess
     )
     $setupPath = Join-Path $InstallRoot 'BRAVO_SETUP.ps1'
     if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
         throw "PILOT_VALIDATE_FAILED: не знайдено $setupPath."
     }
-    $output = @(& $setupPath -ValidateOnly -NoPause 2>&1 | ForEach-Object { [string]$_ })
+    # Array-splat НЕ re-parse-ить '-SkipAccessTest' як ім'я параметра —
+    # елементи масиву прив'язуються ПОЗИЦІЙНО (перевірено емпірично на
+    # PowerShell 5.1: @('-A') зв'язується як позиційне значення, а не
+    # [switch]$A=$true). Іменована/switch-прив'язка через splat вимагає
+    # hashtable-сплату.
+    $setupSwitches = @{ ValidateOnly = $true; NoPause = $true }
+    if ($AllowOfflineExternalAccess) {
+        $setupSwitches.SkipAccessTest = $true
+    }
+    $output = @(& $setupPath @setupSwitches 2>&1 | ForEach-Object { [string]$_ })
     $exitCode = Get-BRAVOPilotSafeLastExitCode
-    Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
-    return [pscustomobject]@{ ExitCode = $exitCode; Pass = ($exitCode -eq 0); Path = $OutputPath }
+    # Правдивий доказ: якщо зовнішній мережевий доступ не перевірявся,
+    # це має бути видно в evidence явно, а не мовчки — щоб NOT PERFORMED
+    # ніколи не читалось як фабрикований PASS.
+    $externalAccessLine = if ($AllowOfflineExternalAccess) {
+        'ExternalAccess: NOT PERFORMED (AllowOfflineExternalAccess=true; Reason=OfflineThrowawayPilot; -SkipAccessTest передано в BRAVO_SETUP.ps1)'
+    } else {
+        'ExternalAccess: PERFORMED (SFTP/SMB/webhook перевірено через BRAVO_DRY_RUN.ps1 -TestAccess)'
+    }
+    Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines (@($externalAccessLine) + $output)
+    return [pscustomobject]@{ ExitCode = $exitCode; Pass = ($exitCode -eq 0); Path = $OutputPath; ExternalAccessPerformed = (-not $AllowOfflineExternalAccess) }
 }
 
 function Invoke-BRAVOPilotSemanticParity {

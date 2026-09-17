@@ -84,11 +84,30 @@ function New-BRAVOPilotStubScript {
 param([string]$ConfigPath,[string]$Action,[string]$CredentialComponent,[string]$StoreFor,[switch]$ValidateOnly,[switch]$ConfirmDiscoveryBaseline,[switch]$SkipAccessTest,[switch]$SkipTestNotification,[switch]$NoElevation,[switch]$NoPause)
 $behaviorPath = Join-Path $PSScriptRoot '.stub-behavior.json'
 $exitCode = 0
+$noOutput = $false
+$stdErrOnly = $false
 if (Test-Path -LiteralPath $behaviorPath) {
     $b = Get-Content -LiteralPath $behaviorPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($b.PSObject.Properties['Setup']) { $exitCode = [int]$b.Setup.ExitCode }
+    if ($b.PSObject.Properties['Setup']) {
+        $exitCode = [int]$b.Setup.ExitCode
+        if ($b.Setup.PSObject.Properties['NoOutput']) { $noOutput = [bool]$b.Setup.NoOutput }
+        if ($b.Setup.PSObject.Properties['StdErrOnly']) { $stdErrOnly = [bool]$b.Setup.StdErrOnly }
+    }
 }
-Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly exitCode=$exitCode"
+# NoOutput симулює реальний VM-прогін (2026-09-17), де BRAVO_SETUP.ps1
+# аварійно завершується настільки рано, що НІЧОГО не встигає потрапити
+# ані в success-, ані в error-стрім, який захоплює
+# Invoke-BRAVOPilotValidateOnly (2>&1 | ForEach-Object) — 0 захоплених
+# рядків є правдивим діагностичним станом, не браком стаба.
+if ($stdErrOnly) {
+    # Стрес-тест merge 2>&1: помилка потрапляє лише в PowerShell
+    # error-стрім (ErrorRecord, не рядок success-стріму) — саме те, що
+    # реально захоплює Invoke-BRAVOPilotValidateOnly через `2>&1 |
+    # ForEach-Object { [string]$_ }`.
+    Write-Error "[STUB-SETUP-STDERR] exitCode=$exitCode" -ErrorAction Continue
+} elseif (-not $noOutput) {
+    Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly SkipAccessTest=$SkipAccessTest exitCode=$exitCode"
+}
 exit $exitCode
 '@
         }
@@ -493,6 +512,143 @@ try {
     Set-BRAVOPilotStubBehavior -InstallRoot $f6Install -Behavior @{ Setup = @{ ExitCode = 1 } }
     $f6Validate = Invoke-BRAVOPilotValidateOnly -InstallRoot $f6Install -OutputPath (Join-Path $tempRoot 'f6-validate.log')
     Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyFailureDetected' -Condition (-not $f6Validate.Pass) ''
+
+    # F18: регресія на реальний VM P1 (2026-09-17) — Write-BRAVOPilotEvidenceText
+    # раніше кидала необроблений ParameterBindingValidationException для
+    # ПОРОЖНЬОГО (не $null) масиву -Lines, оскільки типізований масив-параметр
+    # без [AllowEmptyCollection()] відхиляє 0-елементний масив за замовчуванням.
+    # 0 захоплених рядків — легітимний діагностичний стан (дочірній скрипт
+    # аварійно завершився ДО того, як щось потрапило в success/error-стрім),
+    # а не помилка виклику; функція мусить записати правдивий (порожній)
+    # evidence-файл, а не впасти.
+    $f18EvidencePath = Join-Path $tempRoot 'f18-empty-lines.log'
+    $f18Threw = $false
+    $f18Error = $null
+    try {
+        Write-BRAVOPilotEvidenceText -Path $f18EvidencePath -Lines @()
+    } catch {
+        $f18Threw = $true
+        $f18Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'Security/EvidenceTextToleratesEmptyLines' -Condition (-not $f18Threw) -FailureDetail $f18Error
+    Test-BRAVOPilotSelfTestCondition -Name 'Security/EvidenceTextEmptyLinesWritesEmptyFile' -Condition (
+        (Test-Path -LiteralPath $f18EvidencePath -PathType Leaf) -and
+        ((Get-Content -LiteralPath $f18EvidencePath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -in @($null, ''))
+    ) ''
+
+    # F19: той самий сценарій, але через реальний call chain
+    # Invoke-BRAVOPilotValidateOnly -> дочірній BRAVO_SETUP.ps1, що аварійно
+    # завершується РІВНО з exit 1 і НУЛЬОВИМ захопленим виводом (NoOutput=$true
+    # в стабі) — точна репродукція реального VM-прогону. Первинна помилка
+    # (exit code) має зберегтися контрольовано, без вторинного винятку, що її
+    # ховає (§6/§7 контракт: child exit != 0 -> preserve, tolerate zero
+    # output lines, write truthful evidence, return controlled pilot failure).
+    $f19Install = Join-Path $tempRoot 'f19-empty-output-failure'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f19Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f19Install -Behavior @{ Setup = @{ ExitCode = 1; NoOutput = $true } }
+    $f19OutputPath = Join-Path $tempRoot 'f19-validate.log'
+    $f19Threw = $false
+    $f19Error = $null
+    $f19Result = $null
+    try {
+        $f19Result = Invoke-BRAVOPilotValidateOnly -InstallRoot $f19Install -OutputPath $f19OutputPath
+    } catch {
+        $f19Threw = $true
+        $f19Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputNoSecondaryException' -Condition (-not $f19Threw) -FailureDetail $f19Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputPreservesExitCode' -Condition (
+        (-not $f19Threw) -and $null -ne $f19Result -and $f19Result.ExitCode -eq 1 -and -not $f19Result.Pass
+    ) -FailureDetail $(if ($null -ne $f19Result) { "ExitCode=$($f19Result.ExitCode) Pass=$($f19Result.Pass)" } else { '$f19Result є $null' })
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputEvidenceWritten' -Condition (
+        Test-Path -LiteralPath $f19OutputPath -PathType Leaf
+    ) ''
+
+    # F20: явний offline-access контракт (config-v2-pilot-validate-blockers,
+    # 2026-09-17, §15-20) — throwaway pilot з fake/недосяжними SFTP/SMB/
+    # webhook fixture-цілями не повинен провалюватись на мережевій пробі
+    # доступу, якщо оператор ЯВНО передав -AllowOfflineExternalAccess.
+    # Перевіряється: (a) прапорець реально прокидається в BRAVO_SETUP.ps1
+    # -SkipAccessTest (не мовчки ігнорується), (b) evidence правдиво фіксує
+    # ExternalAccess: NOT PERFORMED з причиною (не фабрикований PASS),
+    # (c) за замовчуванням (без прапорця) поведінка НЕ змінюється —
+    # -SkipAccessTest не передається і evidence фіксує PERFORMED.
+    $f20Install = Join-Path $tempRoot 'f20-offline-access'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f20Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f20Install -Behavior @{ Setup = @{ ExitCode = 0 } }
+
+    $f20OfflineOutputPath = Join-Path $tempRoot 'f20-offline-validate.log'
+    $f20OfflineResult = Invoke-BRAVOPilotValidateOnly -InstallRoot $f20Install -OutputPath $f20OfflineOutputPath -AllowOfflineExternalAccess
+    $f20OfflineLines = @(Get-Content -LiteralPath $f20OfflineOutputPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/OfflineFlagForwardedToSetup' -Condition (
+        @($f20OfflineLines | Where-Object { $_ -match 'SkipAccessTest=True' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20OfflineLines))
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/OfflineEvidenceRecordsNotPerformedTruthfully' -Condition (
+        @($f20OfflineLines | Where-Object { $_ -match 'ExternalAccess: NOT PERFORMED' -and $_ -match 'OfflineThrowawayPilot' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20OfflineLines))
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/OfflineFlagDoesNotHideRealSetupFailure' -Condition (
+        $f20OfflineResult.Pass -eq $true -and $f20OfflineResult.ExitCode -eq 0
+    ) -FailureDetail "ExitCode=$($f20OfflineResult.ExitCode) Pass=$($f20OfflineResult.Pass)"
+
+    $f20StrictOutputPath = Join-Path $tempRoot 'f20-strict-validate.log'
+    $f20StrictResult = Invoke-BRAVOPilotValidateOnly -InstallRoot $f20Install -OutputPath $f20StrictOutputPath
+    $f20StrictLines = @(Get-Content -LiteralPath $f20StrictOutputPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/DefaultModeDoesNotSkipAccessTest' -Condition (
+        @($f20StrictLines | Where-Object { $_ -match 'SkipAccessTest=False' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20StrictLines))
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/DefaultModeEvidenceRecordsPerformed' -Condition (
+        @($f20StrictLines | Where-Object { $_ -match 'ExternalAccess: PERFORMED' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20StrictLines))
+
+    # F21: exit 0 + ПОРОЖНІЙ вивід — відмінний кейс від F19 (exit 1 +
+    # порожній). Успішний дочірній прогін, що з якоїсь причини (напр.
+    # -NoPause на дуже ранньому success-шляху) не пише жодного рядка,
+    # МАЄ трактуватись як PASS з порожньою evidence, а не як прихована
+    # помилка.
+    $f21Install = Join-Path $tempRoot 'f21-exit0-empty-output'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f21Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f21Install -Behavior @{ Setup = @{ ExitCode = 0; NoOutput = $true } }
+    $f21OutputPath = Join-Path $tempRoot 'f21-validate.log'
+    $f21Threw = $false
+    $f21Error = $null
+    $f21Result = $null
+    try {
+        $f21Result = Invoke-BRAVOPilotValidateOnly -InstallRoot $f21Install -OutputPath $f21OutputPath
+    } catch {
+        $f21Threw = $true
+        $f21Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyExitZeroEmptyOutputNoSecondaryException' -Condition (-not $f21Threw) -FailureDetail $f21Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyExitZeroEmptyOutputReportsPass' -Condition (
+        (-not $f21Threw) -and $null -ne $f21Result -and $f21Result.ExitCode -eq 0 -and $f21Result.Pass -eq $true
+    ) -FailureDetail $(if ($null -ne $f21Result) { "ExitCode=$($f21Result.ExitCode) Pass=$($f21Result.Pass)" } else { '$f21Result є $null' })
+
+    # F22: помилка дочірнього процесу потрапляє ЛИШЕ в error-стрім
+    # (PowerShell ErrorRecord через Write-Error), success-стрім
+    # порожній. `2>&1 | ForEach-Object { [string]$_ }` мусить коректно
+    # злити обидва стріми в масив рядків без винятку прив'язки і без
+    # втрати діагностичної інформації про помилку.
+    $f22Install = Join-Path $tempRoot 'f22-stderr-only'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f22Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f22Install -Behavior @{ Setup = @{ ExitCode = 1; StdErrOnly = $true } }
+    $f22OutputPath = Join-Path $tempRoot 'f22-validate.log'
+    $f22Threw = $false
+    $f22Error = $null
+    $f22Result = $null
+    try {
+        $f22Result = Invoke-BRAVOPilotValidateOnly -InstallRoot $f22Install -OutputPath $f22OutputPath
+    } catch {
+        $f22Threw = $true
+        $f22Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyStdErrOnlyNoSecondaryException' -Condition (-not $f22Threw) -FailureDetail $f22Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyStdErrOnlyPreservesExitCode' -Condition (
+        (-not $f22Threw) -and $null -ne $f22Result -and $f22Result.ExitCode -eq 1 -and -not $f22Result.Pass
+    ) -FailureDetail $(if ($null -ne $f22Result) { "ExitCode=$($f22Result.ExitCode) Pass=$($f22Result.Pass)" } else { '$f22Result є $null' })
+    $f22Lines = @(Get-Content -LiteralPath $f22OutputPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyStdErrOnlyContentCaptured' -Condition (
+        @($f22Lines | Where-Object { $_ -match 'STUB-SETUP-STDERR' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f22Lines))
 
     # F8: read-only destination (EvidenceRoot без права на запис).
     $f8EvidenceRoot = Join-Path $tempRoot 'f8-readonly-evidence'

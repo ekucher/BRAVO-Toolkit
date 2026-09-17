@@ -37,7 +37,15 @@ param(
 
     # -Preflight: опційно зберегти результат як окремий звіт (Preflight
     # сам по собі лишається read-only й нічого не персистить без цього).
-    [string]$ReportPath
+    [string]$ReportPath,
+
+    # -Validate: явний, недвозначний opt-in для throwaway/offline pilot,
+    # де SFTP/SMB/webhook-цілі свідомо недосяжні (fake fixture-хости).
+    # За замовчуванням $false — production/strict Validate (реальна
+    # мережева перевірка доступу) лишається незмінною. НЕ прив'язаний
+    # до hostname/середовища — оператор має усвідомлено передати цей
+    # прапорець.
+    [Parameter(ParameterSetName = 'Validate')][switch]$AllowOfflineExternalAccess
 )
 
 # Start-BRAVOConfigV2Pilot.ps1 — тонкий CLI-диспетчер контрольованого
@@ -235,8 +243,8 @@ try {
 
             $allPass = $true
 
-            $validateOnly = Invoke-BRAVOPilotValidateOnly -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $EvidenceDir 'validate-only.log')
-            Write-Host ("{0} ValidateOnly (exit {1})" -f $(if ($validateOnly.Pass) { '[OK]' } else { '[FAIL]' }), $validateOnly.ExitCode)
+            $validateOnly = Invoke-BRAVOPilotValidateOnly -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $EvidenceDir 'validate-only.log') -AllowOfflineExternalAccess:$AllowOfflineExternalAccess
+            Write-Host ("{0} ValidateOnly (exit {1}, ExternalAccess={2})" -f $(if ($validateOnly.Pass) { '[OK]' } else { '[FAIL]' }), $validateOnly.ExitCode, $(if ($validateOnly.ExternalAccessPerformed) { 'PERFORMED' } else { 'NOT PERFORMED (offline)' }))
             $allPass = $allPass -and $validateOnly.Pass
 
             $afterSnapshot = Invoke-BRAVOPilotConfigSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $EvidenceDir 'after.snapshot.json')
