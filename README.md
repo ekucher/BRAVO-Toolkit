@@ -1458,7 +1458,7 @@ technical evidence stays in the referenced log file.
 - 🚨 CRITICAL: backup, integrity, credentials or maintenance safety is at
   risk, with the reason and action at the top.
 
-Host information is compact: `🖥️ SERVER · 10.10.150.102`. Public IP is shown
+Host information is compact: `🖥️ SERVER · 192.0.2.102`. Public IP is shown
 only when lookup is enabled and a valid address is returned. Institution lines
 use `🏢`.
 

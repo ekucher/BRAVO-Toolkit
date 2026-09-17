@@ -1103,7 +1103,8 @@ function Get-BRAVODirectories {
 
         # ===== Порожні legacy каталоги-дати видаляються негайно, незалежно
         # від віку; непорожні лишаються недоторканими для звичайного
-        # age-gated Compress-OldData-шляху (регресія 2026-09, LIMS-TOP) =====
+        # age-gated Compress-OldData-шляху
+        # (регресія 2026-09, сервер парку) =====
         $taEmptyDirRoot = Join-Path $traceArchiveTestRoot 'EmptyDirCleanup'
         [void](New-Item -ItemType Directory -Path $taEmptyDirRoot -Force)
         try {

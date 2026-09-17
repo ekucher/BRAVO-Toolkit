@@ -474,7 +474,7 @@ Test-BRAVOCondition `
 # ============================================================
 # S63 — production-шлях health-only БЕЗ інжектованих -Drives
 # ============================================================
-# Регресія реального дефекту, знайденого acceptance rc.3 на LIMS-TOP
+# Регресія реального дефекту, знайденого acceptance rc.3 на сервері парку
 # (13.09.2026): у health-only гілці Test-BRAVODiskSpaceEntity capacity
 # читався викликом з безумовним -Drives @(). Оскільки
 # Get-BRAVODiskSpaceCapacityObservation трактує ЗВ'ЯЗАНИЙ -Drives як
@@ -521,7 +521,7 @@ Test-BRAVOCondition `
 # S65 — вироджений health-поріг для тому, меншого за поріг
 # (#155; docs\BRAVO_530_DISK_SPACE_HEALTH_SIGNAL_TASK.md пункт 1).
 #
-# Реальний випадок з парку: LIMS-TOP G: — 15 GB загальної ємності при
+# Реальний випадок з парку: том G: — 15 GB загальної ємності при
 # порозі 20 GB. Абсолютний поріг недосяжний за побудовою, тож кожен
 # прогін давав BelowHealthFloorNoFreeSpaceRequirement і exit 10, а
 # закрити це попередження оператор не міг жодною дією.

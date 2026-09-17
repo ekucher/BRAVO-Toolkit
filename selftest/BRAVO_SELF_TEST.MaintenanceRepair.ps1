@@ -814,7 +814,7 @@ Test-BRAVOCondition `
 
 # ============================================================
 # Invoke-BRAVOLegacySweep: одноразове маркер-гейтоване очищення
-# legacy-артефактів ери ARCHIV_LIMS-предка (регресія 2026-09, LIMS-TOP).
+# legacy-артефактів ери ARCHIV_LIMS-предка (регресія 2026-09, сервер парку).
 # ============================================================
 # Get-BRAVODirectories з опційним test-only гаком
 # $script:legacySweepVanishAfterDiscoveryPath (R4-2, PR #136 review, 4-е
