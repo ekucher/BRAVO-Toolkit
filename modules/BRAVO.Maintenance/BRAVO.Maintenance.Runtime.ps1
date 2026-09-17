@@ -9289,7 +9289,7 @@ if ($BravoMaintenanceEnabled -and $RangeIdMonitoringEnabled) {
 }
 
 # Порожні каталоги-дати — незалежно від віку: нема чого втрачати, тому
-# без ARCHIVE_RETENTION_DAYS-gate. Регресія (2026-09, real-server LIMS-TOP):
+# без ARCHIVE_RETENTION_DAYS-gate. Регресія (2026-09, сервер парку):
 # поточна ("5.2.0") модель Trace/exchangAPI/BravoWeb пише лише пласкі
 # timestamped-файли — жоден чинний код більше не пише у каталоги-дати
 # YYYY-MM-DD, тож щойно така тека спорожніла (увесь вміст архівовано),

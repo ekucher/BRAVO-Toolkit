@@ -15,7 +15,7 @@ restore drill і негативними сценаріями 4/5 disk-space poli
 | sourceCommit / buildId (`VERSION.json`) | `b872ce68cd970594e18b4b9688b3e35a6799a9a5` / `b872ce6` |
 | releaseChannel | `prerelease` |
 | Артефакт | `BRAVO-Toolkit-5.2.3-rc.6.zip`, зібраний і провалідований workflow `Release artifact` (run 34728417679) |
-| Розгорнуто на | `LIMS-TOP` (ВІННИЦЬКА ФВЛ [38511934]): спершу `C:\Temp\BRAVO_523_rc6\kit` (розділи 3-4), далі — бойовий runtime-корінь `C:\Program Files\BRAVO-Toolkit` (розділ 4.4) |
+| Розгорнуто на | production-сервер парку: спершу `C:\Temp\BRAVO_523_rc6\kit` (розділи 3-4), далі — бойовий runtime-корінь `C:\Program Files\BRAVO-Toolkit` (розділ 4.4) |
 | Site-оверлей | `BRAVO.local.config`: `maintenanceSettings.Limits.ExcludedDrives = @('F:\','G:\')` |
 | Базова stable (поведінковий baseline) | `5.2.2` (тег `v5.2.2` = `15ce820`) |
 
@@ -34,10 +34,10 @@ restore drill і негативними сценаріями 4/5 disk-space poli
 | Кандидат | Дата | Сервер | Обсяг | Результат |
 |---|---|---|---|---|
 | rc.1 | 2026-08-31 | — | замінено rc.2 до acceptance | n/a |
-| rc.2 | 2026-09-02 | `LIMS-TOP` | непортативність self-test-фікстур (11 сценаріїв залежали від наявності `D:`/`E:`) | FAIL → rc.3 |
-| rc.3 | 2026-09-13 | `LIMS-TOP` | повний прогін Archive+Maintenance | **FAIL** (розділ 2.1) |
+| rc.2 | 2026-09-02 | production-сервер парку | непортативність self-test-фікстур (11 сценаріїв залежали від наявності `D:`/`E:`) | FAIL → rc.3 |
+| rc.3 | 2026-09-13 | production-сервер парку | повний прогін Archive+Maintenance | **FAIL** (розділ 2.1) |
 | rc.4, rc.5 | — | — | номери зайняті паралельними деревами, кандидати не випускались | n/a |
-| rc.6 | 2026-09-13 03:44–03:56 | `LIMS-TOP` | self-test, Archive, Health, Maintenance на артефакті | **PASS** (розділи 3-4) |
+| rc.6 | 2026-09-13 03:44–03:56 | production-сервер парку | self-test, Archive, Health, Maintenance на артефакті | **PASS** (розділи 3-4) |
 
 ### 2.1. Чому rc.3 — FAIL
 
@@ -68,7 +68,7 @@ restore drill і негативними сценаріями 4/5 disk-space poli
 | Maintenance | **СТАТУС: УСПІШНО**, 0 попереджень, 0 помилок, 19 с | `BRAVO_MAINTENANCE_20260913_035612` |
 | Секрети в журналах | 0 входжень password/пароль | grep по журналах прогону |
 | Коди завершення | Archive «УСПIШНО», Maintenance `0 — Success` | консоль + журнали |
-| Сумісність | Windows PowerShell 5.1.19041.7725, LIMS-TOP | заголовки журналів |
+| Сумісність | Windows PowerShell 5.1.19041.7725, production-сервер парку | заголовки журналів |
 | Self-test на сервері | **1535 PASS / 0 FAIL**, exit 0 | `HELPERS/BRAVO_SELF_TEST_20260913_034434` |
 | Запуск від `NT AUTHORITY\SYSTEM` | **PASS** — `BRAVO_ARCHIV_HEALTH` і `BRAVO_MAINTENANCE` запущені вручну з бойового кореня, `LastTaskResult = 0` в обох | розділ 4.4 |
 | Доступи під SYSTEM (`-TestAccess`-еквівалент) | **PASS** — наскрізний dry-run `BRAVO_TASKS_DIAGNOSE` від `NT AUTHORITY\SYSTEM`: write-проби, обидва креденшели, Discord HTTP 204 | розділ 4.4 |
@@ -116,14 +116,14 @@ D:\LIMS MaintenanceWorkingVolume CapacityState=Known AvailableGB=715.51 Status=S
 ### 4.2. Restore drill (§9.1, обов'язковий)
 
 `BRAVO_RESTORE_TEST.ps1 -GenerationId 20260913_035104 -Component All -AsJson`,
-13.09.2026 04:13-04:14, `LIMS-TOP`, exit code **0**. Усі три компоненти —
+13.09.2026 04:13-04:14, production-сервер парку, exit code **0**. Усі три компоненти —
 з ОДНІЄЇ COMPLETE-генерації, не «найновіше по кожному окремо»:
 
 | Компонент | Архів | Статус | Файлів | Каталогів | Трив., с |
 |---|---|---|---|---|---|
-| MODEL | `vinnytsya_fitolab_v2412_20260913_035104.mdz` | PASS | 385 | 20 | 5.3 |
-| BLOG | `vinnytsya_fitolab_v2412_blog_20260913_035104.mdz` | PASS | 2 | 0 | 1.3 |
-| BRAVOEXCH | `vinnytsya_fitolab_v2412_bravoexch_20260913_035104.mdz` | PASS | 10715 | 9 | 30.7 |
+| MODEL | `<archivePrefix>_20260913_035104.mdz` | PASS | 385 | 20 | 5.3 |
+| BLOG | `<archivePrefix>_blog_20260913_035104.mdz` | PASS | 2 | 0 | 1.3 |
+| BRAVOEXCH | `<archivePrefix>_bravoexch_20260913_035104.mdz` | PASS | 10715 | 9 | 30.7 |
 
 Генерація створена самим кандидатом rc.6 у прогоні Archive 03:51 — тобто
 перевірено повний цикл «архів створено цією версією → відновлено цією ж
@@ -161,7 +161,7 @@ health OK, **exit 0**. Рішення класифікатора на групі
 
 ### 4.4. Розгортання в бойовий runtime-корінь і запуск від SYSTEM
 
-13.09.2026, `LIMS-TOP`. Кандидат розгорнуто в реальний runtime-корінь
+13.09.2026, production-сервер парку. Кандидат розгорнуто в реальний runtime-корінь
 `C:\Program Files\BRAVO-Toolkit` — саме той шлях, з якого працюють бойові
 завдання Планувальника.
 
@@ -182,7 +182,7 @@ health OK, **exit 0**. Рішення класифікатора на групі
 | Повний self-test із бойового кореня | **1535 перевірок / 0 помилок**, exit **0** (включно з `DiskSpace/S63`, `S64`, серією `Maintenance/M*`) |
 | `BRAVO_SETUP.ps1 -ValidateOnly` | ГОТОВО ДО ЗАПУСКУ: dry-run 1 — PASS 48 / WARN 2 / FAIL 0; dry-run 2 з write-пробами — PASS 63 / WARN 0 / FAIL 0; SFTP-endpoint автентифіковано |
 | `BRAVO_SETUP.ps1` (повний) | ACL рекурсивно застосовано до `C:\Program Files\BRAVO-Toolkit`; 4 завдання **UPDATED**, 0 помилок |
-| `BRAVO_TASKS_DIAGNOSE` наскрізний dry-run від `NT AUTHORITY\SYSTEM` | усі перевірки PASS: write-проби під `C:\WINDOWS\SystemTemp\`, креденшели для `LimsTop` і `SYSTEM` — FOUND, тестове повідомлення Discord — HTTP 204 |
+| `BRAVO_TASKS_DIAGNOSE` наскрізний dry-run від `NT AUTHORITY\SYSTEM` | усі перевірки PASS: write-проби під `C:\WINDOWS\SystemTemp\`, креденшели для облікового запису завдань і `SYSTEM` — FOUND, тестове повідомлення Discord — HTTP 204 |
 | Аргументи завдань після переустановки | усі шляхи — `C:\Program Files\BRAVO-Toolkit\…`; **жодного входження `C:\Temp`** |
 | Ручний запуск `\BRAVO\BRAVO_ARCHIV_HEALTH` (принципал SYSTEM) | `LastTaskResult = 0` |
 | Ручний запуск `\BRAVO\BRAVO_MAINTENANCE` (принципал SYSTEM) | `LastTaskResult = 0` |
@@ -195,7 +195,7 @@ health OK, **exit 0**. Рішення класифікатора на групі
 
 ### 4.5. Негативні сценарії 4 і 5 — блокувальні гілки класифікатора
 
-13.09.2026 04:57-04:59, `LIMS-TOP`, бойовий корінь. Дефіцит місця відтворено
+13.09.2026 04:57-04:59, production-сервер парку, бойовий корінь. Дефіцит місця відтворено
 **підняттям порога**, а не заповненням тому: `MinimumFreeSpaceGB` тимчасово
 переведено з 20 на 730 GB через `BRAVO.local.config` (data-only оверлей,
 жодної зміни коду чи бойового `BRAVO.config`). Обидва сценарії належать
@@ -249,20 +249,20 @@ DiskSpace ... Roles=MODEL_ARCHIVE_DESTINATION ... AvailableGB=715.46
 контрольний `BRAVO_SETUP.ps1 -ValidateOnly` — ГОТОВО ДО ЗАПУСКУ,
 **PASS 63 / WARN 0 / FAIL 0**, усі 4 завдання зареєстровані й Ready,
 SFTP-endpoint автентифіковано, 16 з 16 записів Credential Manager FOUND для
-`LimsTop` і `SYSTEM`.
+облікового запису завдань і `SYSTEM`.
 
 ## 5. Передпольотна інвентаризація парку
 
 | Сервер | `MinimumFreeSpaceGB` | Фактично на required томі | `ExcludedDrives` | Рішення |
 |---|---|---|---|---|
-| `LIMS-TOP` | 20 | `D:\LIMS` — 715.51 GB | `F:\`, `G:\` | `G:` (15 GB загальних) внесено у виключення: том фізично менший за поріг, тож інакше давав би постійне попередження |
+| production-сервер парку | 20 | `D:\LIMS` — 715.51 GB | `F:\`, `G:\` | `G:` (15 GB загальних) внесено у виключення: том фізично менший за поріг, тож інакше давав би постійне попередження |
 | решта парку | `<>` | `<>` | `<>` | `<перевірити до розкатки>` |
 
 ## 6. Мінімальний протокол (`RELEASE_POLICY.md` §9.2)
 
 ```text
-Server:               LIMS-TOP (ВІННИЦЬКА ФВЛ [38511934])
-OS:                   Windows (LIMS-TOP)
+Server:               <відредаговано>
+OS:                   Windows
 PowerShell:           5.1.19041.7725
 Previous version:     5.2.3-rc.3 (прогін 13.09 01:26-01:32), stable у парку — 5.2.2
 Tested version:       5.2.3-rc.6 (stamp 124140b, provenance b872ce6)
