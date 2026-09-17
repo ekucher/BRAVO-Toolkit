@@ -658,7 +658,13 @@ try {
 . '$($script:repoRoot)\deploy\BRAVOConfigV2Pilot.Runtime.ps1'
 `$m = Enter-BRAVOPilotInstallRootLock -InstallRoot '$f17ResolvedInstallA' -TimeoutSeconds 10
 [System.IO.File]::WriteAllText('$f17LockAcquiredMarker', 'acquired')
-Start-Sleep -Seconds 4
+# Довше за дефолтний TimeoutSeconds=5 у Enter-BRAVOPilotInstallRootLock:
+# конкуруючий -Activate нижче МАЄ вичерпати bounded wait і отримати
+# fail closed (PILOT_INSTALLROOT_LOCKED), а не просто дочекатись
+# звільнення й тихо пройти (перша версія цього тесту тримала лок лише
+# 4с < 5с timeout, тому "заблокований" виклик насправді просто чекав
+# і легітимно активувався — хибний provал тесту без реального дефекту).
+Start-Sleep -Seconds 8
 Exit-BRAVOPilotInstallRootLock -Mutex `$m
 "@
     [System.IO.File]::WriteAllText($f17HolderScriptPath, $f17HolderScript, (New-Object System.Text.UTF8Encoding($false)))
