@@ -175,6 +175,15 @@ function New-BRAVOPilotSyntheticInstallRoot {
         Remove-Item -LiteralPath $zipTemp -Force -ErrorAction SilentlyContinue
     }
 
+    # pathSettings.LIMSRoot МАЄ бути явним синтетичним шляхом: порожнє
+    # значення ("" = AUTO) вимагає реальної встановленої служби Windows
+    # "BRAVO" (Resolve-BRAVOEffectiveLimsRoot), якої на чистому CI-раннері
+    # немає — БЕЗ цього рядка Prepare падає fail-closed на
+    # "BackupRoot="" вимагає визначеного EffectiveLIMSRoot" лише на
+    # хостах без реально встановленого BRAVO (виявлено на CI, 2026-09-16).
+    $syntheticLimsRoot = Join-Path $Path 'SyntheticLIMS'
+    [void](New-Item -ItemType Directory -Path $syntheticLimsRoot -Force)
+
     $configText = @'
 param(
     [Parameter(Mandatory = $true)]
@@ -184,7 +193,11 @@ param(
 $global:bravoSettings = @{
     InstitutionName = "Synthetic Pilot Institution"
 }
+$global:pathSettings = @{
+    LIMSRoot = "__SYNTHETIC_LIMS_ROOT__"
+}
 '@
+    $configText = $configText.Replace('__SYNTHETIC_LIMS_ROOT__', $syntheticLimsRoot)
     [System.IO.File]::WriteAllText((Join-Path $Path 'BRAVO.config'), $configText, (New-Object System.Text.UTF8Encoding($true)))
 
     New-BRAVOPilotStubScript -Path (Join-Path $Path 'BRAVO_SETUP.ps1') -Kind Setup
