@@ -183,7 +183,23 @@ try {
             Test-BRAVOPilotBackupIntegrity -BackupDir $backup.BackupDir | Out-Null
             Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'BackupCreated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
 
-            $activation = Invoke-BRAVOPilotAtomicActivation -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath -EvidenceDir $EvidenceDir -ApprovedCandidateHash $approvedHash
+            # Якщо активація впаде тут, стан МАЄ перейти в 'Failed' (легальний
+            # перехід з 'BackupCreated' — уже описаний у
+            # $script:BRAVOPilotStateTransitions), інакше metadata.json
+            # назавжди лишається на 'BackupCreated', і повторний -Activate
+            # неможливий (Assert-BRAVOPilotState для -Activate вимагає
+            # 'Reviewed'/'Activated'), а зовнішній catch унизу файлу лише
+            # друкує помилку й виходить, не торкаючись стану. Backup уже
+            # верифікований (Test-BRAVOPilotBackupIntegrity вище) і
+            # лишається валідним — відновлення через -Rollback доступне
+            # незалежно від значення State (Invoke-BRAVOPilotRollback шукає
+            # каталог backup-*, а не читає metadata.json).
+            try {
+                $activation = Invoke-BRAVOPilotAtomicActivation -InstallRoot $resolvedInstallRoot -CandidatePath $candidatePath -EvidenceDir $EvidenceDir -ApprovedCandidateHash $approvedHash
+            } catch {
+                Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'Failed' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
+                throw "$($_.Exception.Message) Backup перевірено й доступний у '$($backup.BackupDir)' — виконайте -Rollback -InstallRoot `"$InstallRoot`" -EvidenceDir `"$EvidenceDir`"."
+            }
             Write-BRAVOPilotEvidenceJson -Path (Join-Path $EvidenceDir 'activation.json') -Object $activation
             Set-BRAVOPilotState -EvidenceDir $EvidenceDir -State 'Activated' -ExtraFields @{ CandidatePath = $candidatePath; CandidateHash = $approvedHash; BackupDir = $backup.BackupDir } | Out-Null
 

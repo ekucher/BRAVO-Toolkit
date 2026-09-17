@@ -588,6 +588,42 @@ try {
     $f15InstallConfigHashAfterRollback = (Get-FileHash -LiteralPath (Join-Path $f15Install 'BRAVO.config') -Algorithm SHA256).Hash
     Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/RollbackSourceCorruptionNoMutationAttempted' -Condition ($f15InstallConfigHashBeforeRollback -eq $f15InstallConfigHashAfterRollback) ''
 
+    # F16: -Activate провалюється ПІСЛЯ New-BRAVOPilotBackup/State=BackupCreated
+    # (P2-triage): candidate тампериться ПІСЛЯ -Approve (той самий TOCTOU
+    # клас, що й F10, але через повний CLI -Activate, а не напряму через
+    # Invoke-BRAVOPilotAtomicActivation) -> перевіряємо, що CLI-обгортка НЕ
+    # лишає metadata.json застряглим на 'BackupCreated' (dead-end без шляху
+    # вперед), backup лишається валідним, і -Rollback після цього працює.
+    $f16Install = Join-Path $tempRoot 'f16-activation-failure'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f16Install
+    $f16EvidenceRoot = Join-Path $tempRoot 'f16-evidence'
+    & $startScript -Preflight -InstallRoot $f16Install -ArtifactRoot $artifactRoot -EvidenceRoot $f16EvidenceRoot 2>&1 | Out-Null
+    & $startScript -Prepare -InstallRoot $f16Install -ArtifactRoot $artifactRoot -EvidenceRoot $f16EvidenceRoot 2>&1 | Out-Null
+    $f16EvidenceDir = (Get-ChildItem -LiteralPath $f16EvidenceRoot -Directory | Sort-Object Name -Descending | Select-Object -First 1).FullName
+    $f16State = Get-Content -LiteralPath (Join-Path $f16EvidenceDir 'metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    & $startScript -Approve -EvidenceDir $f16EvidenceDir -ApprovedCandidateHash ([string]$f16State.CandidateHash) 2>&1 | Out-Null
+    # Тамперимо candidate ПІСЛЯ approval — той самий SHA-256 у metadata.json
+    # уже не збігається з реальним файлом, тому Invoke-BRAVOPilotAtomicActivation
+    # кине TOCTOU-виняток УСЕРЕДИНІ CLI -Activate, вже ПІСЛЯ того, як backup
+    # створено й state='BackupCreated' записано.
+    [System.IO.File]::AppendAllText([string]$f16State.CandidatePath, "`n# tampered-after-approval`n")
+    $f16ActivateOutput = & $startScript -Activate -InstallRoot $f16Install -EvidenceDir $f16EvidenceDir 2>&1
+    $f16ActivateExit = $LASTEXITCODE
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ActivationFailureAfterBackupExitsNonZero' -Condition ($f16ActivateExit -ne 0) -FailureDetail ([string]::Join(' | ', @($f16ActivateOutput | Select-Object -Last 5)))
+
+    $f16StateAfterFailure = Get-Content -LiteralPath (Join-Path $f16EvidenceDir 'metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ActivationFailureTransitionsToFailedNotStuck' -Condition ([string]$f16StateAfterFailure.State -eq 'Failed') -FailureDetail "State=$([string]$f16StateAfterFailure.State)"
+
+    $f16BackupDirs = @(Get-ChildItem -LiteralPath $f16EvidenceDir -Directory -Filter 'backup-*')
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ActivationFailureBackupStillPresent' -Condition ($f16BackupDirs.Count -eq 1) ''
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ActivationFailureNoLocalConfigWritten' -Condition (-not (Test-Path -LiteralPath (Join-Path $f16Install 'BRAVO.local.config'))) ''
+
+    # Відновлення після 'Failed' -> -Rollback лишається доступним і успішним
+    # незалежно від застряглого стану (Invoke-BRAVOPilotRollback шукає
+    # каталог backup-*, а не читає metadata.json.State).
+    $f16RollbackOutput = & $startScript -Rollback -InstallRoot $f16Install -EvidenceDir $f16EvidenceDir 2>&1
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/RollbackAvailableAfterActivationFailure' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($f16RollbackOutput | Select-Object -Last 5)))
+
 } catch {
     # Неперехоплена помилка десь у сценарії — це саме по собі провал
     # тесту, а не привід мовчки перервати прогін без summary/exit-коду.
