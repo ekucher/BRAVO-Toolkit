@@ -4,7 +4,7 @@ name: Config v2 pilot artifact
 # Configuration v2 (#154, крок 2). НЕ окрема складна CI-інфраструктура:
 # один self-test-скрипт (selftest\BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1)
 # вже покриває build + integrity-верифікацію + синтетичний happy-path +
-# rollback + 15 failure-injection сценаріїв + idempotency-перевірки в
+# rollback + 17 failure-injection сценаріїв + idempotency-перевірки в
 # одному прогоні — тут лише запускаємо його на push/PR, що торкаються
 # самого артефакту.
 #
@@ -52,7 +52,7 @@ jobs:
       # Той самий ASCII-only run-блок, що й у ci.yml/config-parity.yml:
       # GitHub Actions пише `run:` у тимчасовий .ps1 БЕЗ BOM, а Windows
       # PowerShell 5.1 читає такі файли в системній ANSI-кодовій сторінці.
-      - name: Pilot artifact self-test (build + integrity + happy-path + rollback + F1..F15)
+      - name: Pilot artifact self-test (build + integrity + happy-path + rollback + F1..F17)
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
