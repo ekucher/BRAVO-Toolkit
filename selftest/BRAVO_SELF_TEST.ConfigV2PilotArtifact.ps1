@@ -84,11 +84,22 @@ function New-BRAVOPilotStubScript {
 param([string]$ConfigPath,[string]$Action,[string]$CredentialComponent,[string]$StoreFor,[switch]$ValidateOnly,[switch]$ConfirmDiscoveryBaseline,[switch]$SkipAccessTest,[switch]$SkipTestNotification,[switch]$NoElevation,[switch]$NoPause)
 $behaviorPath = Join-Path $PSScriptRoot '.stub-behavior.json'
 $exitCode = 0
+$noOutput = $false
 if (Test-Path -LiteralPath $behaviorPath) {
     $b = Get-Content -LiteralPath $behaviorPath -Raw -Encoding UTF8 | ConvertFrom-Json
-    if ($b.PSObject.Properties['Setup']) { $exitCode = [int]$b.Setup.ExitCode }
+    if ($b.PSObject.Properties['Setup']) {
+        $exitCode = [int]$b.Setup.ExitCode
+        if ($b.Setup.PSObject.Properties['NoOutput']) { $noOutput = [bool]$b.Setup.NoOutput }
+    }
 }
-Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly exitCode=$exitCode"
+# NoOutput симулює реальний VM-прогін (2026-09-17), де BRAVO_SETUP.ps1
+# аварійно завершується настільки рано, що НІЧОГО не встигає потрапити
+# ані в success-, ані в error-стрім, який захоплює
+# Invoke-BRAVOPilotValidateOnly (2>&1 | ForEach-Object) — 0 захоплених
+# рядків є правдивим діагностичним станом, не браком стаба.
+if (-not $noOutput) {
+    Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly exitCode=$exitCode"
+}
 exit $exitCode
 '@
         }
@@ -493,6 +504,57 @@ try {
     Set-BRAVOPilotStubBehavior -InstallRoot $f6Install -Behavior @{ Setup = @{ ExitCode = 1 } }
     $f6Validate = Invoke-BRAVOPilotValidateOnly -InstallRoot $f6Install -OutputPath (Join-Path $tempRoot 'f6-validate.log')
     Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyFailureDetected' -Condition (-not $f6Validate.Pass) ''
+
+    # F18: регресія на реальний VM P1 (2026-09-17) — Write-BRAVOPilotEvidenceText
+    # раніше кидала необроблений ParameterBindingValidationException для
+    # ПОРОЖНЬОГО (не $null) масиву -Lines, оскільки типізований масив-параметр
+    # без [AllowEmptyCollection()] відхиляє 0-елементний масив за замовчуванням.
+    # 0 захоплених рядків — легітимний діагностичний стан (дочірній скрипт
+    # аварійно завершився ДО того, як щось потрапило в success/error-стрім),
+    # а не помилка виклику; функція мусить записати правдивий (порожній)
+    # evidence-файл, а не впасти.
+    $f18EvidencePath = Join-Path $tempRoot 'f18-empty-lines.log'
+    $f18Threw = $false
+    $f18Error = $null
+    try {
+        Write-BRAVOPilotEvidenceText -Path $f18EvidencePath -Lines @()
+    } catch {
+        $f18Threw = $true
+        $f18Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'Security/EvidenceTextToleratesEmptyLines' -Condition (-not $f18Threw) -FailureDetail $f18Error
+    Test-BRAVOPilotSelfTestCondition -Name 'Security/EvidenceTextEmptyLinesWritesEmptyFile' -Condition (
+        (Test-Path -LiteralPath $f18EvidencePath -PathType Leaf) -and
+        ((Get-Content -LiteralPath $f18EvidencePath -Raw -Encoding UTF8 -ErrorAction SilentlyContinue) -in @($null, ''))
+    ) ''
+
+    # F19: той самий сценарій, але через реальний call chain
+    # Invoke-BRAVOPilotValidateOnly -> дочірній BRAVO_SETUP.ps1, що аварійно
+    # завершується РІВНО з exit 1 і НУЛЬОВИМ захопленим виводом (NoOutput=$true
+    # в стабі) — точна репродукція реального VM-прогону. Первинна помилка
+    # (exit code) має зберегтися контрольовано, без вторинного винятку, що її
+    # ховає (§6/§7 контракт: child exit != 0 -> preserve, tolerate zero
+    # output lines, write truthful evidence, return controlled pilot failure).
+    $f19Install = Join-Path $tempRoot 'f19-empty-output-failure'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f19Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f19Install -Behavior @{ Setup = @{ ExitCode = 1; NoOutput = $true } }
+    $f19OutputPath = Join-Path $tempRoot 'f19-validate.log'
+    $f19Threw = $false
+    $f19Error = $null
+    $f19Result = $null
+    try {
+        $f19Result = Invoke-BRAVOPilotValidateOnly -InstallRoot $f19Install -OutputPath $f19OutputPath
+    } catch {
+        $f19Threw = $true
+        $f19Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputNoSecondaryException' -Condition (-not $f19Threw) -FailureDetail $f19Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputPreservesExitCode' -Condition (
+        (-not $f19Threw) -and $null -ne $f19Result -and $f19Result.ExitCode -eq 1 -and -not $f19Result.Pass
+    ) -FailureDetail $(if ($null -ne $f19Result) { "ExitCode=$($f19Result.ExitCode) Pass=$($f19Result.Pass)" } else { '$f19Result є $null' })
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputEvidenceWritten' -Condition (
+        Test-Path -LiteralPath $f19OutputPath -PathType Leaf
+    ) ''
 
     # F8: read-only destination (EvidenceRoot без права на запис).
     $f8EvidenceRoot = Join-Path $tempRoot 'f8-readonly-evidence'

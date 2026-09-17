@@ -747,6 +747,16 @@ try {
     Write-BRAVOSeparator
     Write-BRAVOResultField -Label 'Статус' -Value 'ПОМИЛКА' -Color ([ConsoleColor]::Red)
     Write-BRAVOResultField -Label 'Причина' -Value $_.Exception.Message
+    # Тимчасова діагностика (config-v2-pilot-validate-blockers): точна
+    # локалізація discovery/baseline "Count cannot be found on this
+    # object" — top-level catch раніше друкував лише Message, без типу
+    # винятку/позиції/стека, тому root cause не можна було локалізувати з
+    # реального прогону. Не змінює жодної успішної гілки (лише catch);
+    # видалити після підтвердженого фіксу.
+    Write-BRAVOResultField -Label 'ExceptionType' -Value $_.Exception.GetType().FullName
+    Write-BRAVOResultField -Label 'Позиція' -Value $_.InvocationInfo.PositionMessage
+    Write-Host 'ScriptStackTrace:'
+    Write-Host $_.ScriptStackTrace
     Write-BRAVOResultBlankLine
     Write-BRAVOResultNote -Text 'Подальші етапи зупинено (fail-closed).'
     Write-BRAVOSeparator

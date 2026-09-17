@@ -160,7 +160,7 @@ function Assert-BRAVOPilotTextSecretSafe {
     # (немає структури), тож для логів діє вужчий, але детермінований
     # інваріант.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowNull()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$Lines)
 
     $lineNumber = 0
     foreach ($line in @($Lines)) {
@@ -189,10 +189,20 @@ function Write-BRAVOPilotEvidenceJson {
 }
 
 function Write-BRAVOPilotEvidenceText {
+    # Захоплений вивід дочірнього canonical-скрипта (BRAVO_SETUP.ps1,
+    # BRAVO_SELF_TEST.ps1, BRAVO_HEALTH.ps1, BRAVO_DRY_RUN.ps1) легітимно
+    # може виявитись порожнім масивом — коли дочірній скрипт завершується
+    # аварійно настільки рано, що ще нічого не встиг записати ні в
+    # success-, ні в error-стрім (0 рядків — це правдивий діагностичний
+    # стан, а не помилка виклику). Без [AllowEmptyCollection()] типізований
+    # масив-параметр за замовчуванням відхиляє порожній (не $null) масив
+    # (ParameterArgumentValidationErrorEmptyArrayNotAllowed), що ховає
+    # первинну помилку дочірнього скрипта за вторинним необробленим
+    # винятком тут.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowNull()][string[]]$Lines
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$Lines
     )
 
     Assert-BRAVOPilotTextSecretSafe -Lines $Lines
