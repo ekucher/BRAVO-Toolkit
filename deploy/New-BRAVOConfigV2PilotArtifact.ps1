@@ -116,10 +116,18 @@ foreach ($sourcePath in $fileMap.Keys) {
         [void](New-Item -ItemType Directory -Path $targetParent -Force)
     }
 
-    # git show повертає байти файлу таким, яким він закомічений
-    # (нормалізація CRLF/BOM уже застосована git-атрибутами при checkout;
-    # тут беремо саме blob, тому пишемо байти напряму, а не через
-    # Out-File/Set-Content, щоб не внести повторну нормалізацію).
+    # ПРИМІТКА (byte-fidelity, виявлено 2026-09-17): `& git show ... 1>
+    # $tempOut` у PowerShell НЕ є byte-safe для нативних команд — stdout
+    # проганяється крізь текстовий pipeline PowerShell, і LF, яким git
+    # фактично зберігає blob в object database, переписується на CRLF
+    # при серіалізації назад у файл. Отриманий на диску вміст тому НЕ
+    # тотожний байт-у-байт сирому git blob — але тотожний символ-у-символ
+    # (жодного пошкодження кодування/Cyrillic/BOM), і фактичні line
+    # endings збігаються з `.gitattributes: * text=auto eol=crlf` —
+    # тобто з тим, що видно на диску при звичайному checkout цього
+    # Windows-орієнтованого репозиторію для БУДЬ-ЯКОГО іншого файлу.
+    # Тому це не дефект цілісності вмісту, а неточність попереднього
+    # коментаря, що стверджував буквальну byte-for-byte передачу blob.
     $tempOut = [System.IO.Path]::GetTempFileName()
     try {
         & git -C $repositoryRoot show ("{0}:{1}" -f $Ref, $sourcePath) --  1> $tempOut
