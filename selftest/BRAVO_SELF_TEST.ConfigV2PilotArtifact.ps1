@@ -98,7 +98,7 @@ if (Test-Path -LiteralPath $behaviorPath) {
 # Invoke-BRAVOPilotValidateOnly (2>&1 | ForEach-Object) — 0 захоплених
 # рядків є правдивим діагностичним станом, не браком стаба.
 if (-not $noOutput) {
-    Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly exitCode=$exitCode"
+    Write-Output "[STUB-SETUP] ValidateOnly=$ValidateOnly SkipAccessTest=$SkipAccessTest exitCode=$exitCode"
 }
 exit $exitCode
 '@
@@ -555,6 +555,42 @@ try {
     Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/ValidateOnlyEmptyOutputEvidenceWritten' -Condition (
         Test-Path -LiteralPath $f19OutputPath -PathType Leaf
     ) ''
+
+    # F20: явний offline-access контракт (config-v2-pilot-validate-blockers,
+    # 2026-09-17, §15-20) — throwaway pilot з fake/недосяжними SFTP/SMB/
+    # webhook fixture-цілями не повинен провалюватись на мережевій пробі
+    # доступу, якщо оператор ЯВНО передав -AllowOfflineExternalAccess.
+    # Перевіряється: (a) прапорець реально прокидається в BRAVO_SETUP.ps1
+    # -SkipAccessTest (не мовчки ігнорується), (b) evidence правдиво фіксує
+    # ExternalAccess: NOT PERFORMED з причиною (не фабрикований PASS),
+    # (c) за замовчуванням (без прапорця) поведінка НЕ змінюється —
+    # -SkipAccessTest не передається і evidence фіксує PERFORMED.
+    $f20Install = Join-Path $tempRoot 'f20-offline-access'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f20Install
+    Set-BRAVOPilotStubBehavior -InstallRoot $f20Install -Behavior @{ Setup = @{ ExitCode = 0 } }
+
+    $f20OfflineOutputPath = Join-Path $tempRoot 'f20-offline-validate.log'
+    $f20OfflineResult = Invoke-BRAVOPilotValidateOnly -InstallRoot $f20Install -OutputPath $f20OfflineOutputPath -AllowOfflineExternalAccess
+    $f20OfflineLines = @(Get-Content -LiteralPath $f20OfflineOutputPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/OfflineFlagForwardedToSetup' -Condition (
+        @($f20OfflineLines | Where-Object { $_ -match 'SkipAccessTest=True' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20OfflineLines))
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/OfflineEvidenceRecordsNotPerformedTruthfully' -Condition (
+        @($f20OfflineLines | Where-Object { $_ -match 'ExternalAccess: NOT PERFORMED' -and $_ -match 'OfflineThrowawayPilot' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20OfflineLines))
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/OfflineFlagDoesNotHideRealSetupFailure' -Condition (
+        $f20OfflineResult.Pass -eq $true -and $f20OfflineResult.ExitCode -eq 0
+    ) -FailureDetail "ExitCode=$($f20OfflineResult.ExitCode) Pass=$($f20OfflineResult.Pass)"
+
+    $f20StrictOutputPath = Join-Path $tempRoot 'f20-strict-validate.log'
+    $f20StrictResult = Invoke-BRAVOPilotValidateOnly -InstallRoot $f20Install -OutputPath $f20StrictOutputPath
+    $f20StrictLines = @(Get-Content -LiteralPath $f20StrictOutputPath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/DefaultModeDoesNotSkipAccessTest' -Condition (
+        @($f20StrictLines | Where-Object { $_ -match 'SkipAccessTest=False' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20StrictLines))
+    Test-BRAVOPilotSelfTestCondition -Name 'ExternalAccess/DefaultModeEvidenceRecordsPerformed' -Condition (
+        @($f20StrictLines | Where-Object { $_ -match 'ExternalAccess: PERFORMED' }).Count -gt 0
+    ) -FailureDetail ([string]::Join(' | ', $f20StrictLines))
 
     # F8: read-only destination (EvidenceRoot без права на запис).
     $f8EvidenceRoot = Join-Path $tempRoot 'f8-readonly-evidence'
