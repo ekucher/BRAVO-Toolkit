@@ -433,6 +433,98 @@
             -Name "Delta/IdenticalGraphsProduceNoDifference" `
             -Failure "порівняння canonical defaults із самими собою має дати 0 відмінностей (отримано $($deltaNone.Count): $([string]::Join(', ', $deltaNonePaths)))"
 
+        # --- Delta/TypeChangeIsNotHiddenByCoercion ---
+        # Регресія на реальний дефект (рев'ю #205): оператори PowerShell
+        # приводять типи, тож $true -eq 1 і [string]30 -ceq '30' дають
+        # True. Для доказу міграції це дірка: значення, що з $true стало
+        # 1, змінює тип у JSON і в ефективній конфігурації, але
+        # порівняння оголосило б його незмінним.
+        $deltaTypeBool = @{ Enabled = $true }
+        $deltaTypeInt = @{ Enabled = 1 }
+        $deltaTypeBoolVsInt = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaTypeBool -CandidateConfiguration $deltaTypeInt)
+        $deltaTypeFalseVsZero = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ Enabled = $false } -CandidateConfiguration @{ Enabled = 0 })
+        $deltaTypeNumVsString = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ Days = 30 } -CandidateConfiguration @{ Days = '30' })
+        # Той самий дефект усередині масиву словників — шлях, доданий цим
+        # же PR.
+        $deltaTypeInArray = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ defs = @(@{ Enabled = $true }) } `
+            -CandidateConfiguration @{ defs = @(@{ Enabled = 1 }) })
+        # НЕГАТИВНИЙ контроль: Int32 і Int64 з тим самим значенням — це НЕ
+        # відмінність. Інакше звичайний JSON-цикл (який робить з Int32
+        # Int64) давав би хибну відмінність на двох ІДЕНТИЧНИХ знімках і
+        # знецінив би весь доказ.
+        $deltaTypeIntWidth = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ Days = [int32]30 } -CandidateConfiguration @{ Days = [int64]30 })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaTypeBoolVsInt.Count -eq 1 -and
+                $deltaTypeFalseVsZero.Count -eq 1 -and
+                $deltaTypeNumVsString.Count -eq 1 -and
+                $deltaTypeInArray.Count -eq 1 -and
+                $deltaTypeIntWidth.Count -eq 0
+            ) `
+            -Name "Delta/TypeChangeIsNotHiddenByCoercion" `
+            -Failure ("зміна ТИПУ значення має лишатись видимою відмінністю, а різна ширина цілого — ні; " +
+                "bool/int=$($deltaTypeBoolVsInt.Count) (1), false/0=$($deltaTypeFalseVsZero.Count) (1), " +
+                "num/string=$($deltaTypeNumVsString.Count) (1), у масиві=$($deltaTypeInArray.Count) (1), " +
+                "Int32/Int64=$($deltaTypeIntWidth.Count) (0)")
+
+        # --- Delta/ArraysOfDictionariesCompareStructurally ---
+        # Регресія на реальний дефект (рев'ю #203): гілка колекцій
+        # рекурсувала в Test-BRAVOConfigurationValueEquality, а той
+        # БЕЗУМОВНО повертав false для будь-якого словника. Наслідок:
+        # $global:archiveDefinitions — масив із трьох hashtable — завжди
+        # звітував "Changed", тож два ІДЕНТИЧНІ знімки ефективної
+        # конфігурації ніколи не могли зійтись, і доказ міграції був
+        # недосяжним за побудовою.
+        $deltaDictArray = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a' },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\b' }
+            )
+        }
+        $deltaDictArrayCopy = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a' },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\b' }
+            )
+        }
+        $deltaDictArraySame = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaDictArray `
+            -CandidateConfiguration $deltaDictArrayCopy)
+        # Позитивний контроль: справжня відмінність усередині словника
+        # масиву мусить лишитись видимою — фікс не сміє "зрівняти все".
+        $deltaDictArrayChangedCandidate = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a' },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\ІНШЕ' }
+            )
+        }
+        $deltaDictArrayChanged = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaDictArray `
+            -CandidateConfiguration $deltaDictArrayChangedCandidate)
+        # Другий контроль: зайвий ключ у словнику теж є відмінністю.
+        $deltaDictArrayExtraKey = @{
+            archiveDefinitions = @(
+                @{ Type = 'MODEL'; Enabled = $true; Source = 'D:\a'; Extra = 1 },
+                @{ Type = 'BLOG'; Enabled = $false; Source = 'D:\b' }
+            )
+        }
+        $deltaDictArrayExtra = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $deltaDictArray `
+            -CandidateConfiguration $deltaDictArrayExtraKey)
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaDictArraySame.Count -eq 0 -and
+                $deltaDictArrayChanged.Count -eq 1 -and
+                $deltaDictArrayExtra.Count -eq 1
+            ) `
+            -Name "Delta/ArraysOfDictionariesCompareStructurally" `
+            -Failure "масив словників має порівнюватись структурно: однакові=$($deltaDictArraySame.Count) (очікується 0), змінене значення=$($deltaDictArrayChanged.Count) (1), зайвий ключ=$($deltaDictArrayExtra.Count) (1)"
+
         # --- Delta/EmptyAndSingleElementArraysCompareEqual ---
         # Регресія на реальний дефект (CI 2026-09-14): еталонне значення
         # діставалось через "$x = if (...) { $hash[$key] } else { $null }",

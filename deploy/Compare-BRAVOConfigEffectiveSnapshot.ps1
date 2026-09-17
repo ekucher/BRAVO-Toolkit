@@ -77,11 +77,16 @@ function ConvertTo-SnapshotHashtable {
         return $result
     }
 
-    # @() навколо результату: у 5.1 pipeline розгортає одноелементний
-    # масив у скаляр, і масив з одного значення перестав би бути масивом —
-    # тобто два однакові знімки могли б дати хибну відмінність за ТИПОМ.
+    # КОМА перед масивом обов'язкова: return @(...) віддає масив У
+    # PIPELINE, а pipeline розгортає його — одноелементний масив стає
+    # скаляром, порожній не повертає нічого. Без коми міграція, що
+    # перетворила @('F:\') на скаляр 'F:\' або @() на $null, виглядала б
+    # у порівнянні ІДЕНТИЧНОЮ, і інструмент звітував би [SUCCESS] про
+    # зміну ТИПУ значення — рівно те, заради чого він існує.
+    # ",$array" повертає масив як ОДИН об'єкт, без перелічення.
     if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
-        return @(@($Value) | ForEach-Object { ConvertTo-SnapshotHashtable -Value $_ })
+        $convertedItems = @(@($Value) | ForEach-Object { ConvertTo-SnapshotHashtable -Value $_ })
+        return ,$convertedItems
     }
 
     return $Value

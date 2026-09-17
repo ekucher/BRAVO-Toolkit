@@ -176,7 +176,7 @@ Test-BRAVOCondition `
 # Regression: Write-Log у M1-M11 має реально писати в ізольований
 # $LOG_DIR/$LOG_FILE fixture, а не мовчки провалюватись у catch
 # Write-BRAVOMaintenanceLogFile через невстановлений $LOG_DIR=$null
-# (реальний production acceptance-інцидент на LIMS-TOP, 5.2.3-rc.1 —
+# (реальний production acceptance-інцидент на сервері парку, 5.2.3-rc.1 —
 # self-test PASS ховав 36 рядків "Помилка запису у файл логу:
 # Cannot bind argument to parameter 'Path' because it is null.").
 # Перевіряємо конкретний logging-fixture (файл на диску), не текст усієї

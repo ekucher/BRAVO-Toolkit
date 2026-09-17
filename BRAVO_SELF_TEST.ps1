@@ -3619,18 +3619,18 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
 
     $notifyHostOff = [pscustomobject]@{
         MachineName = "DEV-LIMS"
-        LocalIP = "10.10.150.102"
+        LocalIP = "192.0.2.102"
         PublicIP = "вимкнено"
     }
     $notifyHostUnavailable = [pscustomobject]@{
         MachineName = "DEV-LIMS"
-        LocalIP = "10.10.150.102"
+        LocalIP = "192.0.2.102"
         PublicIP = "недоступна"
     }
     $notifyHostPublic = [pscustomobject]@{
         MachineName = "DATA-SERVER"
-        LocalIP = "10.10.150.102 | 192.168.1.236"
-        PublicIP = "185.189.187.44"
+        LocalIP = "192.0.2.102 | 192.0.2.236"
+        PublicIP = "198.51.100.44"
     }
     $notifySuccess = New-BRAVOOperatorNotificationMessage `
         -Severity SUCCESS `
@@ -3690,9 +3690,9 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     Test-BRAVOCondition -Condition ($notifySuccess.Contains("Дій не потрібно")) -Name "Notifications/SuccessUsesNoActionRequired" -Failure "SUCCESS notification має явно казати, що дія не потрібна"
     Test-BRAVOCondition -Condition ($notifyWarning.Contains("Потрібна дія: перевірити виконання BRAVO_ARCHIV")) -Name "Notifications/WarningUsesConcreteAction" -Failure "WARNING/CRITICAL notification має показувати конкретну дію"
     Test-BRAVOCondition -Condition ($notifySuccess.Contains(":office: TEST-COMPANY [1234567890]")) -Name "Notifications/InstitutionUsesOfficeEmoji" -Failure "institution line має використовувати office token"
-    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("DEV-LIMS") -and $notifySuccess.Contains("10.10.150.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
+    Test-BRAVOCondition -Condition (-not $notifySuccess.Contains("Публічна IP") -and -not $notifySuccess.Contains("IP-адреси:") -and $notifySuccess.Contains("DEV-LIMS") -and $notifySuccess.Contains("192.0.2.102")) -Name "Notifications/DisabledPublicIpIsOmitted" -Failure "PublicIP=вимкнено не має показуватись у штатному повідомленні"
     Test-BRAVOCondition -Condition (-not $notifyUnavailable.Contains("Публічна IP")) -Name "Notifications/UnavailablePublicIpIsOmitted" -Failure "PublicIP=недоступна не має показуватись у штатному повідомленні"
-    Test-BRAVOCondition -Condition ($notifyPublic.Contains("Публічна IP: 185.189.187.44") -and $notifyPublic.Contains("DATA-SERVER · 10.10.150.102 · 192.168.1.236")) -Name "Notifications/AvailablePublicIpIsShown" -Failure "valid Public IP має показуватись окремим рядком"
+    Test-BRAVOCondition -Condition ($notifyPublic.Contains("Публічна IP: 198.51.100.44") -and $notifyPublic.Contains("DATA-SERVER · 192.0.2.102 · 192.0.2.236")) -Name "Notifications/AvailablePublicIpIsShown" -Failure "valid Public IP має показуватись окремим рядком"
     Test-BRAVOCondition -Condition ($notifySuccess.Contains("Остання резервна копія:")) -Name "Notifications/HealthSuccessUsesLastBackupTerm" -Failure "Health SUCCESS має використовувати термін Остання резервна копія"
     Test-BRAVOCondition -Condition ($notifyWarning.Contains("Остання успішна резервна копія:")) -Name "Notifications/HealthFailureUsesLastSuccessfulBackupTerm" -Failure "Health WARNING/ERROR має використовувати термін Остання успішна резервна копія"
     $legacyHealthyCopyText = "Остання справна " + "копія"
@@ -15405,7 +15405,7 @@ function Get-BRAVOMaintenanceSummaryResult {
             # на реальному сервері відрізняється від комплектної (у файлі два
             # блоки "SFTP = @{", інші відступи, у конфігах 5.2.1 і старіших
             # ключа Enabled немає взагалі), і regex-заміна там МОВЧКИ не
-            # спрацьовує — тест падав на LIMS-TOP при зеленому CI
+            # спрацьовує — тест падав на сервері парку при зеленому CI
             # (acceptance rc.3, 13.09.2026). Оверлей читається ДО виконання
             # BRAVO.config і застосовується у фазі 1, тобто ДО деривацій —
             # саме те, що ці тести й перевіряють.
@@ -15622,7 +15622,8 @@ function Get-BRAVOMaintenanceSummaryResult {
     # тести вище звіряють лише англомовні маркери на кшталт "LIMSRoot").
     #
     # РАХУНОК ВХОДЖЕНЬ НАЗВИ ЗАВДАННЯ ТУТ НЕ ПРАЦЮЄ (acceptance rc.3,
-    # LIMS-TOP, 13.09.2026). Кількість згадок "BRAVO BAZA Synchronization"
+    # сервер парку, 13.09.2026). Кількість згадок
+    # "BRAVO BAZA Synchronization"
     # залежить від того, чи завдання ВЖЕ зареєстроване в Планувальнику
     # цієї машини: на чистому раннері CI вимкнене завдання згадується один
     # раз, а на сервері з установленим комплектом — двічі (рядок плану

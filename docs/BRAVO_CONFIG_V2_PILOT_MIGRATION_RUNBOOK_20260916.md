@@ -333,7 +333,19 @@ if (Test-Path -LiteralPath "$backupDir\BRAVO.local.config") {
     Copy-Item -LiteralPath "$backupDir\BRAVO.local.config" -Destination "$Kit\BRAVO.local.config" -Force -ErrorAction Stop
 } elseif (Test-Path -LiteralPath "$backupDir\BRAVO.local.config.absent") {
     # До міграції файлу не було — відкат прибирає той, що міг з'явитись.
-    Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
+    # Test-Path обов'язковий: якщо звірка на Кроці 2 не відібрала жодного
+    # значення, site-файл не створювався взагалі, і його відсутність тут —
+    # ВЖЕ потрібний стан, а не помилка. Без цієї перевірки відкат упав би
+    # саме на цьому рядку, вже ПІСЛЯ відновлення primary-шару й ДО
+    # верифікації SHA-256 нижче.
+    if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
+        Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
+    }
+} else {
+    # Крок 2а гарантує рівно один із двох артефактів. Жодного — каталог
+    # доказів неповний/пошкоджений: мовчазне продовження лишило б site-шар
+    # у мігрованому стані, і A↔D цього не побачив би.
+    throw "У '$backupDir' немає ані BRAVO.local.config, ані BRAVO.local.config.absent — стан site-файла невідомий, відкат зупинено."
 }
 
 # Верифікація відновлення проти SHA-256 з backup-manifest.json (Крок 2а),

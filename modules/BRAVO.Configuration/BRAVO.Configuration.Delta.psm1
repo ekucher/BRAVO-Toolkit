@@ -16,6 +16,83 @@
 # з BRAVO.Configurator.Effective), інакше доменний модуль конфігурації
 # почав би залежати від модуля Configurator-а, тобто від вищого шару.
 
+function Get-BRAVOConfigurationValueTypeCategory {
+    # Приватний helper: КАТЕГОРІЯ типу листового значення.
+    #
+    # Навіщо. Оператори порівняння PowerShell приводять типи: $true -eq 1
+    # і $false -eq 0 дають True, а [string]30 -ceq '30' — теж True. Для
+    # доказу міграції це дірка: значення, що з $true стало 1 (або з 30
+    # стало '30'), змінює тип у JSON і в ефективній конфігурації, але
+    # порівняння оголосило б його незмінним, і інструмент звітував би
+    # [SUCCESS] про справжню зміну.
+    #
+    # Категорія, а не GetType(): усі цілі/дробові трактуються як одне
+    # число. Інакше Int32 проти Int64 (звичайна різниця між значенням у
+    # пам'яті й тим самим значенням після JSON-циклу) давала б хибну
+    # відмінність на двох ІДЕНТИЧНИХ знімках.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param($Value)
+
+    if ($null -eq $Value) { return 'Null' }
+    if ($Value -is [bool]) { return 'Boolean' }
+    if ($Value -is [string]) { return 'String' }
+    if ($Value -is [datetime]) { return 'DateTime' }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int32] -or $Value -is [uint32] -or
+        $Value -is [int64] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]) {
+        return 'Number'
+    }
+    return ('Other:' + $Value.GetType().FullName)
+}
+
+function Test-BRAVOConfigurationDictionaryEquality {
+    # Приватний helper: СТРУКТУРНЕ порівняння двох словників.
+    #
+    # Викликається лише з гілки колекцій Test-BRAVOConfigurationValue
+    # Equality. Окремою функцією, а не інлайном: словник усередині
+    # словника має порівнюватись тим самим правилом, і рекурсія тут
+    # чесніша за копію умови в двох місцях.
+    #
+    # Ключі звіряються РЕГІСТРОНЕЗАЛЕЖНО: hashtable у PowerShell саме
+    # такий, тож @{ Type = 'MODEL' } і @{ type = 'MODEL' } — один і той
+    # самий словник, і оголосити їх різними означало б вигадати
+    # відмінність, якої в конфігурації немає.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Left,
+        [Parameter(Mandatory = $true)][System.Collections.IDictionary]$Right
+    )
+
+    $leftKeys = @(@($Left.Keys) | ForEach-Object { [string]$_ } | Sort-Object)
+    $rightKeys = @(@($Right.Keys) | ForEach-Object { [string]$_ } | Sort-Object)
+    if ($leftKeys.Count -ne $rightKeys.Count) { return $false }
+    for ($k = 0; $k -lt $leftKeys.Count; $k++) {
+        if ($leftKeys[$k] -ne $rightKeys[$k]) { return $false }
+    }
+
+    foreach ($key in $leftKeys) {
+        $leftValue = $Left[$key]
+        $rightValue = $Right[$key]
+        $leftValueIsDictionary = $leftValue -is [System.Collections.IDictionary]
+        $rightValueIsDictionary = $rightValue -is [System.Collections.IDictionary]
+        if ($leftValueIsDictionary -or $rightValueIsDictionary) {
+            if (-not ($leftValueIsDictionary -and $rightValueIsDictionary)) { return $false }
+            if (-not (Test-BRAVOConfigurationDictionaryEquality -Left $leftValue -Right $rightValue)) {
+                return $false
+            }
+            continue
+        }
+        if (-not (Test-BRAVOConfigurationValueEquality -Left $leftValue -Right $rightValue)) {
+            return $false
+        }
+    }
+    return $true
+}
+
 function Test-BRAVOConfigurationValueEquality {
     # Приватний helper: порівняння ЛИСТОВИХ значень.
     #
@@ -65,11 +142,40 @@ function Test-BRAVOConfigurationValueEquality {
         $rightItems = @($Right)
         if ($leftItems.Count -ne $rightItems.Count) { return $false }
         for ($i = 0; $i -lt $leftItems.Count; $i++) {
-            if (-not (Test-BRAVOConfigurationValueEquality -Left $leftItems[$i] -Right $rightItems[$i])) {
+            $leftItem = $leftItems[$i]
+            $rightItem = $rightItems[$i]
+            # Словник УСЕРЕДИНІ колекції — окремий випадок від словника,
+            # що прийшов сюди верхнім рівнем (блок вище). Верхній рівень
+            # сюди дійти не мав би, і відмова там свідома. А от масив
+            # словників — цілком штатна форма ефективної конфігурації
+            # ($global:archiveDefinitions — масив із трьох hashtable), і
+            # для неї "будь-який словник => різні" означало б, що два
+            # ІДЕНТИЧНІ знімки завжди звітують відмінність. Порівнюємо
+            # структурно; приховати справжню відмінність це не може —
+            # звіряються і набір ключів, і кожне значення.
+            $leftItemIsDictionary = $leftItem -is [System.Collections.IDictionary]
+            $rightItemIsDictionary = $rightItem -is [System.Collections.IDictionary]
+            if ($leftItemIsDictionary -or $rightItemIsDictionary) {
+                if (-not ($leftItemIsDictionary -and $rightItemIsDictionary)) { return $false }
+                if (-not (Test-BRAVOConfigurationDictionaryEquality -Left $leftItem -Right $rightItem)) {
+                    return $false
+                }
+                continue
+            }
+            if (-not (Test-BRAVOConfigurationValueEquality -Left $leftItem -Right $rightItem)) {
                 return $false
             }
         }
         return $true
+    }
+
+    # Тип звіряється ДО значення: без цього приведення типів PowerShell
+    # оголосило б $true рівним 1, а 30 рівним '30'. Перевірка лише
+    # ДОДАЄ відмінності й ніколи не ховає наявних — напрямок, безпечний
+    # для доказу міграції.
+    if ((Get-BRAVOConfigurationValueTypeCategory -Value $Left) -ne
+        (Get-BRAVOConfigurationValueTypeCategory -Value $Right)) {
+        return $false
     }
 
     # Рядки порівнюються з урахуванням регістру: шлях 'E:\ARCHIV' і
