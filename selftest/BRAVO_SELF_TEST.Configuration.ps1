@@ -1650,3 +1650,200 @@
             -Failure "ci\Test-BRAVOConfigFoundationParity.ps1 має брати перелік імен з Get-BRAVOEffectiveConfigurationVariableName і не тримати власного літерального переліку; викликає=$snapshotHarnessCallsCanonical літерал=$snapshotHarnessHasLiteralList"
     }
 }
+
+# =====================================================================
+# Configuration v2 Pilot Safety — синтетична матриця + наскрізний round-trip
+# (Configuration v2 Pilot Preparation, розгортає прогалини, знайдені
+# незалежним аудитом перед першим реальним pilot-переносом)
+# =====================================================================
+# Окремий top-level child scope (& { ... }), той самий прийом, що й Delta/
+# DataFile вище: власний $MaximumVariableCount, не змішується з рештою
+# фрагментів файлу.
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Delta.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Effective.psd1') -Force
+
+    # --- PilotSafety/DeltaMatrix: типи, яких не було в наявній Delta/*-матриці ---
+    # Delta/* вище вже покриває no-changes/nested/array(incl. empty)/
+    # unknown-leaf/unknown-parent/wrong-type/legacy-only/детермінізм.
+    # Тут — конкретні прогалини, знайдені аудитом: scalar number, boolean
+    # true/false, явний empty string, і security-sensitive (credential
+    # reference) шлях. Один $matrixReference/$matrixCandidate на весь
+    # набір — кожен випадок змінює РІВНО одне поле, тож Test-BRAVOCondition
+    # для кожного випадку перевіряє саме той один шлях.
+    $matrixReference = @{
+        scalarNumber   = 24
+        scalarBoolTrue  = $true
+        scalarBoolFalse = $false
+        emptyString    = 'було-не-порожньо'
+        credentialRef  = 'BRAVO_SFTP_PASSWORD'
+    }
+    $matrixCandidate = @{
+        scalarNumber   = 40
+        scalarBoolTrue  = $false
+        scalarBoolFalse = $true
+        emptyString    = ''
+        credentialRef  = 'BRAVO_SFTP_PASSWORD_SITE2'
+    }
+    $matrixDiff = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $matrixReference -CandidateConfiguration $matrixCandidate)
+    $matrixByPath = @{}
+    foreach ($d in $matrixDiff) { $matrixByPath[[string]$d.Path] = $d }
+
+    Test-BRAVOCondition `
+        -Condition (
+            $matrixByPath.Contains('scalarNumber') -and
+            $matrixByPath['scalarNumber'].Kind -eq 'Changed' -and
+            $matrixByPath['scalarNumber'].CandidateValue -eq 40 -and
+            $matrixByPath['scalarNumber'].CandidateValue -isnot [string]
+        ) `
+        -Name "PilotSafety/DeltaMatrixScalarNumberChanged" `
+        -Failure "зміна числового скаляра (24 -> 40) має дати Changed зі збереженим числовим типом кандидата"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $matrixByPath.Contains('scalarBoolTrue') -and $matrixByPath['scalarBoolTrue'].Kind -eq 'Changed' -and
+            $matrixByPath['scalarBoolTrue'].CandidateValue -eq $false -and
+            $matrixByPath.Contains('scalarBoolFalse') -and $matrixByPath['scalarBoolFalse'].Kind -eq 'Changed' -and
+            $matrixByPath['scalarBoolFalse'].CandidateValue -eq $true
+        ) `
+        -Name "PilotSafety/DeltaMatrixBooleanBothDirectionsChanged" `
+        -Failure "зміна булевого скаляра в ОБИДВА боки (true->false і false->true) має дати Changed з коректним булевим кандидатом"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $matrixByPath.Contains('emptyString') -and $matrixByPath['emptyString'].Kind -eq 'Changed' -and
+            $matrixByPath['emptyString'].CandidateValue -is [string] -and
+            [string]$matrixByPath['emptyString'].CandidateValue -eq ''
+        ) `
+        -Name "PilotSafety/DeltaMatrixExplicitEmptyStringChanged" `
+        -Failure "явна зміна непорожнього рядка на порожній ('') має дати Changed з порожнім РЯДКОМ, а не `$null чи відсутнім записом"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $matrixByPath.Contains('credentialRef') -and $matrixByPath['credentialRef'].Kind -eq 'Changed' -and
+            [string]$matrixByPath['credentialRef'].CandidateValue -eq 'BRAVO_SFTP_PASSWORD_SITE2' -and
+            [string]$matrixByPath['credentialRef'].ReferenceValue -eq 'BRAVO_SFTP_PASSWORD'
+        ) `
+        -Name "PilotSafety/DeltaMatrixCredentialReferenceChanged" `
+        -Failure "зміна Credential Manager target-name (посилання, не секрет) має пройти компаратор як звичайний рядок без спеціальної обробки"
+
+    # --- PilotSafety/LiteralRoundTrip: ConvertTo-BRAVOConfiguratorPowerShellLiteral не мовчки коерсить типи ---
+    # Фіксує рендер РІВНО тих типів, які реально проходять через
+    # dot-path override (BRAVO.local.config є плоским скаляр|масив-
+    # контрактом — nested hashtable свідомо не підтримується, див.
+    # fail-closed throw у самій функції).
+    $literalCases = @(
+        @{ Value = 40; Expected = '40' },
+        @{ Value = $true; Expected = '$true' },
+        @{ Value = $false; Expected = '$false' },
+        @{ Value = ''; Expected = "''" },
+        @{ Value = 'BRAVO_SFTP_PASSWORD_SITE2'; Expected = "'BRAVO_SFTP_PASSWORD_SITE2'" },
+        @{ Value = $null; Expected = '$null' },
+        @{ Value = @('D:\', 'E:\'); Expected = "@('D:\', 'E:\')" }
+    )
+    $literalFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($case in $literalCases) {
+        $rendered = ConvertTo-BRAVOConfiguratorPowerShellLiteral -Value $case.Value
+        if ($rendered -cne $case.Expected) {
+            [void]$literalFailures.Add("очікував '$($case.Expected)', отримав '$rendered' для значення типу $(if ($null -eq $case.Value) { '<null>' } else { $case.Value.GetType().Name })")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($literalFailures.Count -eq 0) `
+        -Name "PilotSafety/LiteralRoundTripPreservesType" `
+        -Failure "ConvertTo-BRAVOConfiguratorPowerShellLiteral мусить рендерити число/bool/порожній рядок/`$null/масив БЕЗ коерсії в рядок: $([string]::Join(' | ', $literalFailures))"
+
+    # --- PilotSafety/EndToEndParity: головний семантичний інваріант пілота ---
+    # EffectiveConfig(original) == EffectiveConfig(canonical defaults +
+    # generated site delta). Раніше в репозиторії НЕ було тесту, що
+    # проганяє САМЕ ці кроки в САМЕ такому порядку (незалежний аудит
+    # Configuration v2 Pilot Preparation, 2026-09-16): ci\Test-
+    # BRAVOConfigFoundationParity.ps1 порівнює знімки одного great fixed
+    # override-набору між двома комітами (регресія pipeline), а не
+    # "дельта, згенерована з legacy-фікстури, відтворює legacy-фікстуру".
+    #
+    # Кроки навмисно ті самі функції, що й реальні інструменти оператора:
+    #   Compare-BRAVOConfigurationGraph      -- те саме, що deploy\Get-BRAVOConfigSiteDelta.ps1
+    #   ConvertTo-BRAVONestedOverride        -- те саме, що BRAVO_CONFIG_LOADER.ps1 для BRAVO.local.config
+    #   Merge-BRAVOConfiguration             -- те саме, що Resolve-BRAVORawConfiguration
+    # Текстовий рендер/парсинг BRAVO.local.config (AST-парсер у
+    # BRAVO.Configuration.DataFile) тут навмисно НЕ бере участі: він має
+    # власне окреме покриття (DataFile/* вище) і не є частиною семантики
+    # merge/delta, яку доводить саме цей тест.
+    $pilotDefaults = Get-BRAVODefaultConfiguration
+    $pilotLegacyRawOverrides = @{
+        bravoSettings = @{ InstitutionName = 'Синтетична Лікарня Pilot' }
+        maintenanceSettings = @{ Limits = @{ ExcludedDrives = @('D:\', 'E:\') } }
+        hostInformationSettings = @{ PublicIPLookupEnabled = $false }
+        backupMonitoring = @{ SFTP = @{ BAZA = @{ AutoArchiveMutationThreshold = 40 } } }
+        credentialSettings = @{ SFTPPassword = 'BRAVO_SFTP_PASSWORD_PILOT_SITE' }
+        sftpHostTemplate = ''
+    }
+    # "BEFORE" = ефективна конфігурація сервера з наявним BRAVO.config
+    # (тут — синтетична legacy-фікстура замість реального файлу).
+    $pilotBefore = Merge-BRAVOConfiguration -Base $pilotDefaults -Override $pilotLegacyRawOverrides
+
+    # Крок generate delta (двічі — доказ ідемпотентності: та сама пара
+    # графів на вході завжди дає той самий упорядкований набір відмінностей).
+    $pilotDeltaRun1 = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $pilotDefaults -CandidateConfiguration $pilotLegacyRawOverrides)
+    $pilotDeltaRun2 = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $pilotDefaults -CandidateConfiguration $pilotLegacyRawOverrides)
+    $pilotDeltaRun1Paths = [string]::Join('|', @($pilotDeltaRun1 | ForEach-Object { "$($_.Path)=$($_.CandidateValue)" }))
+    $pilotDeltaRun2Paths = [string]::Join('|', @($pilotDeltaRun2 | ForEach-Object { "$($_.Path)=$($_.CandidateValue)" }))
+    Test-BRAVOCondition `
+        -Condition ($pilotDeltaRun1.Count -gt 0 -and $pilotDeltaRun1Paths -ceq $pilotDeltaRun2Paths) `
+        -Name "PilotSafety/DeltaGenerationIsIdempotent" `
+        -Failure "повторна генерація дельти з тим самим входом мусить дати той самий упорядкований результат; run1=[$pilotDeltaRun1Paths] run2=[$pilotDeltaRun2Paths]"
+
+    # Крок "construct v2/local representation": те, що оператор вставив би
+    # у BRAVO.local.config, — плаский dot-path override для кожного
+    # Changed/OnlyInCandidate запису (те саме правило вибору, що
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 застосовує до свого виводу).
+    $pilotFlatOverrides = @{}
+    foreach ($d in $pilotDeltaRun1) {
+        if ($d.Kind -eq 'Changed' -or $d.Kind -eq 'OnlyInCandidate') {
+            $pilotFlatOverrides[[string]$d.Path] = $d.CandidateValue
+        }
+    }
+    $pilotNestedOverrides = ConvertTo-BRAVONestedOverride -DotPathOverrides $pilotFlatOverrides -ReferenceConfiguration $pilotDefaults
+
+    # "AFTER" = ефективна конфігурація сервера БЕЗ BRAVO.config, лише з
+    # BRAVO.local.config, що містить згенеровану дельту.
+    $pilotAfter = Merge-BRAVOConfiguration -Base $pilotDefaults -Override $pilotNestedOverrides
+
+    # Семантичне порівняння (не текстове): той самий Compare-
+    # BRAVOConfigurationGraph, з -IncludeMissingInCandidate, щоб зникнення
+    # ключа теж зареєструвалось як відмінність, а не мовчки пройшло як
+    # "діє дефолт".
+    $pilotParityDiff = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $pilotBefore -CandidateConfiguration $pilotAfter -IncludeMissingInCandidate)
+    $pilotParityDiffPaths = @($pilotParityDiff | ForEach-Object { "$($_.Path) ($($_.Kind)): '$($_.ReferenceValue)' -> '$($_.CandidateValue)'" })
+    Test-BRAVOCondition `
+        -Condition ($pilotParityDiff.Count -eq 0) `
+        -Name "PilotSafety/EndToEndParityBeforeEqualsAfter" `
+        -Failure "EffectiveConfig(original) має дорівнювати EffectiveConfig(defaults + згенерована дельта) семантично; знайдено $($pilotParityDiff.Count) відмінностей: $([string]::Join('; ', $pilotParityDiffPaths))"
+
+    # Ідемпотентність усього конвеєра "construct + merge", не лише самої
+    # генерації дельти вище: та сама flat-дельта, застосована двічі
+    # незалежно, має дати побітово той самий AFTER-граф.
+    $pilotNestedOverrides2 = ConvertTo-BRAVONestedOverride -DotPathOverrides $pilotFlatOverrides -ReferenceConfiguration $pilotDefaults
+    $pilotAfter2 = Merge-BRAVOConfiguration -Base $pilotDefaults -Override $pilotNestedOverrides2
+    $pilotReapplyDiff = @(Compare-BRAVOConfigurationGraph -ReferenceConfiguration $pilotAfter -CandidateConfiguration $pilotAfter2 -IncludeMissingInCandidate)
+    Test-BRAVOCondition `
+        -Condition ($pilotReapplyDiff.Count -eq 0) `
+        -Name "PilotSafety/ConstructAndMergeIsIdempotent" `
+        -Failure "повторне застосування тієї самої дельти (construct+merge) мусить дати той самий AFTER-граф; знайдено $($pilotReapplyDiff.Count) відмінностей"
+
+    # --- PilotSafety/CredentialReferenceNeverResolved ---
+    # Секретна безпека: credentialSettings у AFTER лишається символічним
+    # посиланням (те, що прийшло з legacy-фікстури як РЯДОК-ім'я запису
+    # Credential Manager), а НЕ якимось резолвнутим значенням. Якби десь
+    # у merge/delta/construct конвеєрі відбувалась підстановка реального
+    # секрету замість імені — це значення відрізнялось би від вхідного
+    # рядка фікстури.
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$pilotAfter.credentialSettings.SFTPPassword -eq 'BRAVO_SFTP_PASSWORD_PILOT_SITE'
+        ) `
+        -Name "PilotSafety/CredentialReferenceNeverResolved" `
+        -Failure "credentialSettings.SFTPPassword після повного конвеєра має лишатись ТОЧНО тим самим рядком-посиланням, що прийшов із legacy-фікстури ('BRAVO_SFTP_PASSWORD_PILOT_SITE'), не резолвнутим значенням; отримано '$($pilotAfter.credentialSettings.SFTPPassword)'"
+}
