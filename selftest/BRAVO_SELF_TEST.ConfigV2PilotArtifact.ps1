@@ -456,6 +456,34 @@ try {
         Test-BRAVOPilotCandidateSyntax -CandidatePath $f5CandidatePath
     } -ExpectedMessagePattern 'PILOT_CANDIDATE_INVALID'
 
+    # F5b: $true/$false/$null — PowerShell AST представляє їх як
+    # VariableExpressionAst, хоча семантично це константні літерали, не
+    # змінні. Без явного винятку для них БУДЬ-ЯКИЙ, повністю легітимний
+    # data-only candidate із boolean/null site-override (типовий випадок
+    # — напр. componentSettings.Archive.X = $false) хибно відхилявся б як
+    # "містить змінні" — реальний дефект, знайдений реальним VM pilot-
+    # прогоном 2026-09-17 (P1: -Activate відмовляв на легітимному
+    # candidate з $false). Це — регресійний тест на той P1.
+    $f5bCandidatePath = Join-Path $tempRoot 'f5b-candidate-boolean-null.config'
+    [System.IO.File]::WriteAllText($f5bCandidatePath, "@{ 'a' = `$true; 'b' = `$false; 'c' = `$null; 'd' = 'text'; 'e' = 42 }", (New-Object System.Text.UTF8Encoding($true)))
+    $f5bAccepted = $true
+    $f5bError = $null
+    try {
+        Test-BRAVOPilotCandidateSyntax -CandidatePath $f5bCandidatePath | Out-Null
+    } catch {
+        $f5bAccepted = $false
+        $f5bError = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'Security/CandidateBooleanNullLiteralsAccepted' -Condition $f5bAccepted -FailureDetail $f5bError
+
+    # F5c: справжня небезпечна змінна (не $true/$false/$null) все одно
+    # мусить відхилятись — регресія не повинна ослабити реальний захист.
+    $f5cCandidatePath = Join-Path $tempRoot 'f5c-candidate-real-variable.config'
+    [System.IO.File]::WriteAllText($f5cCandidatePath, "@{ 'a' = `$env:PATH }", (New-Object System.Text.UTF8Encoding($true)))
+    Test-BRAVOPilotSelfTestThrows -Name 'Security/CandidateRealVariableStillRejected' -ScriptBlock {
+        Test-BRAVOPilotCandidateSyntax -CandidatePath $f5cCandidatePath
+    } -ExpectedMessagePattern 'PILOT_CANDIDATE_INVALID'
+
     # F6: wrong type / F7: unknown parent — симулюються через стаб SETUP, що
     # відмовляє (реальний BRAVO_SETUP.ps1 -ValidateOnly ловить обидва класи
     # помилок через canonical Configuration-схему; тут перевіряється, що

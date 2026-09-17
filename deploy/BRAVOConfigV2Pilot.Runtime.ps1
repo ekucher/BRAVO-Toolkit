@@ -655,14 +655,26 @@ function Test-BRAVOPilotCandidateSyntax {
         $messages = @($errors | ForEach-Object { $_.Message })
         throw "PILOT_CANDIDATE_INVALID: candidate не парситься як PowerShell: $([string]::Join('; ', $messages))"
     }
+    # $true/$false/$null НЕ є "змінними" семантично (константні літерали),
+    # але PowerShell AST представляє їх саме як VariableExpressionAst з
+    # VariablePath.UserPath = 'true'/'false'/'null' — без цього винятку
+    # БУДЬ-ЯКИЙ data-only candidate із boolean/null-значенням (звичайний,
+    # представницький site-override, напр. componentSettings.Archive.X =
+    # $false) хибно відхилявся б як "містить змінні" (виявлено реальним
+    # VM pilot-прогоном 2026-09-17: boolean-override з delta.preview.txt
+    # блокував -Activate на повністю легітимному кандидаті).
+    $allowedAutomaticVariableNames = @('true', 'false', 'null')
     $forbidden = $ast.FindAll({
         param($node)
-        $node -is [System.Management.Automation.Language.CommandAst] -or
-        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -or
-        $node -is [System.Management.Automation.Language.VariableExpressionAst]
+        ($node -is [System.Management.Automation.Language.CommandAst]) -or
+        ($node -is [System.Management.Automation.Language.InvokeMemberExpressionAst]) -or
+        (
+            ($node -is [System.Management.Automation.Language.VariableExpressionAst]) -and
+            ($allowedAutomaticVariableNames -notcontains $node.VariablePath.UserPath)
+        )
     }, $true)
     if (@($forbidden).Count -gt 0) {
-        throw "PILOT_CANDIDATE_INVALID: candidate містить виклики команд/методів або змінні — дозволені лише data-only літерали (@{ 'path' = <literal> })."
+        throw "PILOT_CANDIDATE_INVALID: candidate містить виклики команд/методів або змінні — дозволені лише data-only літерали (@{ 'path' = <literal> }; \$true/\$false/\$null дозволені як константи)."
     }
     $hashtableCount = @($ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.HashtableAst] }, $false)).Count
     if ($hashtableCount -lt 1) {
