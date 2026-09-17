@@ -637,6 +637,24 @@
             -Name "Delta/ArrayComparedElementWiseNotFiltered" `
             -Failure "масиви мусять порівнюватись поелементно: підмножина й інший порядок = відмінність, ідентичний масив = ні (отримано $($deltaArraySubset.Count)/$($deltaArrayOrder.Count)/$($deltaArrayEqual.Count))"
 
+        # --- Delta/ArrayOfHashtableElementsComparedStructurally ---
+        # #154 крок 2: archiveDefinitions/bazaSyncEffective.Components —
+        # реальні масиви ХЕШ-ТАБЛИЦЬ, не рядків. Test-BRAVOConfigurationValueEquality
+        # раніше безумовно повертав $false для будь-якого елемента-словника
+        # (fail-safe для вузлів графа) — це означало, що ІДЕНТИЧНИЙ масив
+        # об'єктів завжди звітував про зміну (знайдено першим реальним
+        # прогоном pilot-артефакту Configuration v2 semantic parity).
+        $deltaHashArraySame = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ archiveDefinitions = @(@{ Type = 'MODEL'; Enabled = $true }, @{ Type = 'BLOG'; Enabled = $true }) } `
+            -CandidateConfiguration @{ archiveDefinitions = @(@{ Type = 'MODEL'; Enabled = $true }, @{ Type = 'BLOG'; Enabled = $true }) })
+        $deltaHashArrayChanged = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ archiveDefinitions = @(@{ Type = 'MODEL'; Enabled = $true }) } `
+            -CandidateConfiguration @{ archiveDefinitions = @(@{ Type = 'MODEL'; Enabled = $false }) })
+        Test-BRAVOCondition `
+            -Condition ($deltaHashArraySame.Count -eq 0 -and $deltaHashArrayChanged.Count -eq 1) `
+            -Name "Delta/ArrayOfHashtableElementsComparedStructurally" `
+            -Failure "масив ідентичних hashtable-елементів не повинен звітувати про зміну, а реально інший — повинен (отримано $($deltaHashArraySame.Count)/$($deltaHashArrayChanged.Count))"
+
         # --- Delta/UnknownNestedKeyReportedAsOnlyInCandidate ---
         # Саме ця гілка робить видимою знахідку F1 (#154): вкладений ключ,
         # якого немає в канонічних дефолтах, сьогодні зливається МОВЧКИ.

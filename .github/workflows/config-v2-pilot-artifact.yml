@@ -1,0 +1,63 @@
+name: Config v2 pilot artifact
+
+# Мінімальний CI-гейт для контрольованого real-pilot артефакту
+# Configuration v2 (#154, крок 2). НЕ окрема складна CI-інфраструктура:
+# один self-test-скрипт (selftest\BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1)
+# вже покриває build + integrity-верифікацію + синтетичний happy-path +
+# rollback + 17 failure-injection сценаріїв + idempotency-перевірки в
+# одному прогоні — тут лише запускаємо його на push/PR, що торкаються
+# самого артефакту.
+#
+# ОКРЕМИЙ ФАЙЛ, А НЕ ЗАДАЧА В ci.yml — та сама причина, що й у
+# config-parity.yml: paths-фільтр застосовується на рівні workflow, а
+# додавання задачі до ci.yml вимагало б перелічити її як required check
+# (Governance/RequiredChecksListCoversCiWorkflowJobs) — чого свідомо не
+# зроблено (див. коментар нижче).
+#
+# ЦЕ НЕ REQUIRED CHECK. Промоція в блокуючу перевірку — окреме рішення
+# власника після того, як прогін стабільно зелений.
+#
+# УСІ файлові операції self-test-скрипта — лише в $env:TEMP; жодного
+# production-запису, жодного реального BRAVO/LIMS-встановлення.
+
+on:
+  pull_request:
+    paths:
+      - 'deploy/New-BRAVOConfigV2PilotArtifact.ps1'
+      - 'deploy/Start-BRAVOConfigV2Pilot.ps1'
+      - 'deploy/BRAVOConfigV2Pilot.Runtime.ps1'
+      - 'deploy/Test-BRAVOConfigV2PilotArtifact.ps1'
+      - 'deploy/Get-BRAVOConfigSiteDelta.ps1'
+      - 'deploy/Compare-BRAVOConfigEffectiveSnapshot.ps1'
+      - 'modules/BRAVO.Configuration/**'
+      - 'docs/BRAVO_CONFIG_V2_PILOT_RUNBOOK.md'
+      - 'selftest/BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1'
+      - '.github/workflows/config-v2-pilot-artifact.yml'
+  workflow_dispatch:
+
+jobs:
+  pilot-artifact-selftest:
+    name: Build + verify + happy-path + rollback + failure-injection
+    runs-on: windows-latest
+    steps:
+      # fetch-depth: 0 обов'язковий: New-BRAVOConfigV2PilotArtifact.ps1
+      # читає вміст файлів через `git show HEAD:<path>` для детермінізму
+      # білда, а синтетичний InstallRoot self-test-скрипта будується через
+      # `git archive HEAD` — обидва потребують повної історії, не лише
+      # HEAD-комміта shallow-checkout.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # Той самий ASCII-only run-блок, що й у ci.yml/config-parity.yml:
+      # GitHub Actions пише `run:` у тимчасовий .ps1 БЕЗ BOM, а Windows
+      # PowerShell 5.1 читає такі файли в системній ANSI-кодовій сторінці.
+      - name: Pilot artifact self-test (build + integrity + happy-path + rollback + F1..F17)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\selftest\BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1 exited with code $LASTEXITCODE"
+              exit 1
+          }
