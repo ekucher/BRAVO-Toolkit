@@ -1449,3 +1449,69 @@ Test-BRAVOCondition `
         -Name "Governance/OsAcceptanceMatrixClassifiesUnavailableSelfTest" `
         -Failure "матриця §9.4 мусить окремо класифікувати недоступність self-test на жорстко налаштованому хості — інакше провал приймання й обмеження хоста виглядають однаково"
 }
+
+& {
+    # Configuration v2 Pilot Preparation (незалежний аудит, 2026-09-16):
+    # -ValidateOnly мусить лишатись цілком read-only — це передумова
+    # безпечного pilot-переносу на реальному сервері (оператор запускає
+    # -ValidateOnly ПЕРЕД будь-якою реальною зміною, і має право
+    # покладатись на те, що сам прогін нічого не змінив). Статична
+    # текстова перевірка, а не функціональний прогін: BRAVO_SETUP.ps1
+    # вимагає адміністративних прав/scheduler/Credential Manager для
+    # повного шляху, які self-test-середовище відтворити не зобов'язане;
+    # ті самі self-test-файли вже покладаються на текстові guard-перевірки
+    # для аналогічних інваріантів (див. Delta/SiteDeltaToolNeverOverwrites
+    # у BRAVO_SELF_TEST.Configuration.ps1).
+    $setupScriptText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_SETUP.ps1'), [Text.Encoding]::UTF8)
+
+    # Регресія на реальний P1-дефект (той самий аудит): Save-
+    # BRAVODiscoveryBaseline викликався БЕЗ перевірки -ValidateOnly, тобто
+    # "BRAVO_SETUP.ps1 -ValidateOnly -ConfirmDiscoveryBaseline" persisted
+    # discovery-baseline файл попри ValidateOnly. Єдиний знайдений виняток
+    # із контракту "жодних записів під ValidateOnly" в усьому скрипті.
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptText -match '(?s)if\s*\(\s*\$ConfirmDiscoveryBaseline\s+-and\s+-not\s+\$ValidateOnly\s*\)\s*\{\s*\r?\n\s*Save-BRAVODiscoveryBaseline'
+        ) `
+        -Name "Governance/ValidateOnlyNeverPersistsDiscoveryBaseline" `
+        -Failure "Save-BRAVODiscoveryBaseline у BRAVO_SETUP.ps1 мусить викликатись лише коли (-ConfirmDiscoveryBaseline -and -not -ValidateOnly) — інакше -ValidateOnly не є read-only"
+
+    # Негативний контроль: переконуємось, що правило вище дійсно ловить
+    # регресію, а не завжди повертає true через слабкий патерн — старий
+    # (дефектний) вигляд рядка не повинен випадково теж матчитись.
+    $setupScriptRegressionShape = $setupScriptText -replace `
+        '(?s)if\s*\(\s*\$ConfirmDiscoveryBaseline\s+-and\s+-not\s+\$ValidateOnly\s*\)', `
+        'if ($ConfirmDiscoveryBaseline)'
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptRegressionShape -notmatch '(?s)if\s*\(\s*\$ConfirmDiscoveryBaseline\s+-and\s+-not\s+\$ValidateOnly\s*\)\s*\{\s*\r?\n\s*Save-BRAVODiscoveryBaseline'
+        ) `
+        -Name "Governance/ValidateOnlyDiscoveryBaselineGuardPatternIsMeaningful" `
+        -Failure "перевірка вище не відрізняє захищений виклик від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
+
+    # Регресія на ГЛИБШИЙ P1-дефект того самого класу (незалежний Codex
+    # review PR #207, знайдений ПІСЛЯ фіксу вище): Import-
+    # BRAVODiscoveryBaseline сам може мігрувати legacy-baseline файл у
+    # canonical розташування (запис у $StateRoot) незалежно від
+    # -ConfirmDiscoveryBaseline — на самому лише виклику під час читання.
+    # Перевірка вище (Save-BRAVODiscoveryBaseline guard) цей шлях не
+    # покриває: Codex явно вказав, що "the new regex test also misses
+    # this path". -ReadOnly:$ValidateOnly у виклику нижче — фікс.
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptText -match '(?s)Import-BRAVODiscoveryBaseline\s*`\s*\r?\n\s*-StateRoot\s+\$global:stateRoot\s*`\s*\r?\n\s*-RuntimeRoot\s+\$PSScriptRoot\s*`\s*\r?\n\s*-ReadOnly:\$ValidateOnly'
+        ) `
+        -Name "Governance/ValidateOnlyNeverPersistsMigratedDiscoveryBaseline" `
+        -Failure "виклик Import-BRAVODiscoveryBaseline у BRAVO_SETUP.ps1 мусить передавати -ReadOnly:`$ValidateOnly — інакше legacy->canonical міграція baseline записує стан машини навіть під -ValidateOnly"
+
+    # Негативний контроль для перевірки вище.
+    $setupScriptImportRegressionShape = $setupScriptText -replace `
+        '-ReadOnly:\$ValidateOnly', `
+        ''
+    Test-BRAVOCondition `
+        -Condition (
+            $setupScriptImportRegressionShape -notmatch '(?s)Import-BRAVODiscoveryBaseline\s*`\s*\r?\n\s*-StateRoot\s+\$global:stateRoot\s*`\s*\r?\n\s*-RuntimeRoot\s+\$PSScriptRoot\s*`\s*\r?\n\s*-ReadOnly:\$ValidateOnly'
+        ) `
+        -Name "Governance/ValidateOnlyMigratedDiscoveryBaselineGuardPatternIsMeaningful" `
+        -Failure "перевірка вище не відрізняє захищений виклик Import-BRAVODiscoveryBaseline від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
+}

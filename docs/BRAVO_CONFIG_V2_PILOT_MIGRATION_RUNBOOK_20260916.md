@@ -34,24 +34,10 @@ Runbook **не** прибирає `BRAVO.config` автоматично і не 
 
 Далі `$Kit` — каталог комплекту, `$Ev` — каталог доказів.
 
-**Кожен прогін пілота — у ВЛАСНОМУ, порожньому каталозі доказів.** Це не
-акуратність, а вимога коректності: у `$Ev` лежать артефакти, за якими
-відкат вирішує, що саме відновлювати. Успадкований від попереднього
-прогону `BRAVO.config.backup` змусив би відкат перезаписати цілий
-поточний `BRAVO.config` **застарілою** копією, а успадкований маркер
-`.ABSENT` — видалити реальний site-файл. Тому каталог створюється з
-міткою часу й порожнім, а не перевикористовується.
-
 ```powershell
 $Kit = 'C:\Program Files\BRAVO-Toolkit'
-$Ev  = Join-Path 'D:\BRAVO_MIGRATION_EVIDENCE' (Get-Date -Format 'yyyyMMdd_HHmmss')
-
-# -Force СВІДОМО не використовується: на наявному каталозі New-Item має
-# впасти, а не мовчки його прийняти.
-New-Item -ItemType Directory -Path $Ev -ErrorAction Stop | Out-Null
-if (@(Get-ChildItem -LiteralPath $Ev -Force).Count -ne 0) {
-    throw "Каталог доказів $Ev не порожній — почніть із чистого."
-}
+$Ev  = 'D:\BRAVO_MIGRATION_EVIDENCE'
+New-Item -ItemType Directory -Path $Ev -Force | Out-Null
 ```
 
 ## Крок 0. Знімок BEFORE
@@ -72,6 +58,19 @@ UTF-8, тож перенаправлення через `>` дало б не «�
 
 Знімок містить `EffectiveGraph` — усі поля ефективної конфігурації, а не
 лише корені. Саме тому тут `-FullGraph`, а не `-AsJson`.
+
+## Крок 0а. Health-знімок BEFORE
+
+Без цього кроку Крок 5б («без нових деградацій відносно стану до міграції»)
+неможливо перевірити — порівнювати було б нема з чим.
+
+```powershell
+& "$Kit\BRAVO_HEALTH.ps1" 2>&1 | Tee-Object -FilePath "$Ev\health-A-before.log"
+```
+
+**Доказ:** `health-A-before.log` у `$Ev`. Збережіть його ДО Кроку 1 — health
+відображає стан середовища на момент прогону, і чим ближче він до Кроку 0,
+тим достовірніше подальше порівняння.
 
 ## Крок 1. Дельта site-значень
 
@@ -103,48 +102,52 @@ UTF-8, тож перенаправлення через `>` дало б не «�
 | `[УВАГА: значення не серіалізується...]` | перенести вручну; розібратись у причині |
 | `# НЕВІДОМИЙ канонічним дефолтам ключ` | звірити назву; ймовірна опечатка або ключ іншої версії |
 
-## Крок 3. Запис `BRAVO.local.config`
+## Крок 2а. Backup перед активацією
 
-**Спершу збережіть поточний стан site-файла** — інакше відкат не поверне
-сервер у допілотний стан: крок 6 відновлює лише `BRAVO.config`, а додані
-локальні значення мають вищий пріоритет і мовчки затінювали б відновлений
-primary-шар.
+**Обов'язковий крок перед будь-яким записом `BRAVO.local.config`** (доповнення
+незалежного аудиту Configuration v2 Pilot Preparation, 2026-09-16): до цього
+місця runbook був лише read-only, і резервна копія існувала лише перед
+деструктивним Кроком 6. Але Крок 3 нижче — це вже активація (перший
+реальний запис у каталог комплекту), і якщо після нього щось піде не так
+(помилка в шляху, невідповідність типу), відкат має спиратись на доведену
+копію стану "до", а не на припущення, що файл можна просто видалити.
 
 ```powershell
+$stampUtc = (Get-Date).ToUniversalTime().ToString('yyyyMMdd-HHmmss')
+$backupDir = Join-Path $Ev "backup-$stampUtc"
+New-Item -ItemType Directory -Path $backupDir -Force | Out-Null
+
+Copy-Item -LiteralPath "$Kit\BRAVO.config" -Destination "$backupDir\BRAVO.config" -ErrorAction Stop
 if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
-    # Копія публікується під фінальним іменем ЛИШЕ після перевірки хешу.
-    # Обірвана копія (диск заповнився, збій ФС) під фінальним іменем
-    # виглядала б для відкату готовою резервною копією — і відкат
-    # перезаписав би нею справний файл.
-    Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$Ev\BRAVO.local.config.partial" -ErrorAction Stop
-    if ((Get-FileHash -LiteralPath "$Ev\BRAVO.local.config.partial" -Algorithm SHA256).Hash -ne
-        (Get-FileHash -LiteralPath "$Kit\BRAVO.local.config" -Algorithm SHA256).Hash) {
-        throw 'Резервна копія BRAVO.local.config не збігається з оригіналом — зупиніться.'
-    }
-    Rename-Item -LiteralPath "$Ev\BRAVO.local.config.partial" -NewName 'BRAVO.local.config.backup' -ErrorAction Stop
+    Copy-Item -LiteralPath "$Kit\BRAVO.local.config" -Destination "$backupDir\BRAVO.local.config" -ErrorAction Stop
 } else {
-    # Файла не було: позначаємо це, щоб відкат знав, що його треба ВИДАЛИТИ,
-    # а не відновлювати.
-    Set-Content -LiteralPath "$Ev\BRAVO.local.config.ABSENT" -Value '' -Encoding UTF8 -ErrorAction Stop
+    # Відсутність файлу — теж частина стану "до"; фіксуємо це явно, а не
+    # мовчки пропускаємо, інакше відкат не знатиме, чи файл видаляти.
+    Set-Content -LiteralPath "$backupDir\BRAVO.local.config.absent" -Value "BRAVO.local.config був відсутній на момент backup ($stampUtc UTC)." -Encoding UTF8
 }
 
-# РІВНО ОДИН артефакт відкату мусить існувати ДО того, як ви торкнетесь
-# site-файла. Перевіряється саме «рівно один», а не «хоч якийсь»: два
-# артефакти означають суперечливий стан, і відкат на ньому зупиниться,
-# уже після того, як ви зміните сервер.
-# Свідомо БЕЗ підрахунку через Where-Object: у Windows PowerShell 5.1
-# pipeline без збігів дає $null, а @($null).Count дорівнює 1 — перевірка
-# "рівно один" мовчки пройшла б при ЖОДНОМУ артефакті. Порівняння двох
-# булевих значень цієї пастки не має й ловить обидва хибні стани.
-$hasLocalBackup = Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup"
-$hasLocalAbsent = Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT"
-if ($hasLocalBackup -eq $hasLocalAbsent) {
-    throw "Артефактів стану site-файла має бути рівно один (backup=$hasLocalBackup, absent=$hasLocalAbsent) — НЕ змінюйте BRAVO.local.config."
-}
+Get-ChildItem -LiteralPath $backupDir -File | ForEach-Object {
+    [pscustomobject]@{
+        File      = $_.Name
+        SHA256    = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
+        SizeBytes = $_.Length
+        TimestampUtc = $stampUtc
+    }
+} | ConvertTo-Json | Set-Content -LiteralPath "$backupDir\backup-manifest.json" -Encoding UTF8
 ```
 
-Два артефакти **взаємовиключні за побудовою**: або резервна копія, або
-маркер відсутності, ніколи обидва.
+**Очікуваний результат:** `$backupDir` містить `BRAVO.config` (побайтова
+копія), або `BRAVO.local.config`, або `BRAVO.local.config.absent`, і
+`backup-manifest.json` з SHA-256 кожного скопійованого файлу.
+
+**Критерій відмови:** будь-яка помилка `Copy-Item` — **зупиніться**, не
+переходьте до Кроку 3. Резервна копія поза `$Ev` не рахується (вона має
+пережити повторний запуск інструментів на цьому ж каталозі доказів).
+
+**Дія відкату:** див. розділ «Відкат» нижче — він тепер відновлює саме з
+`$backupDir`, а не лише з Кроку 6.
+
+## Крок 3. Запис `BRAVO.local.config`
 
 Перенесіть відібрані рядки у `BRAVO.local.config` поруч із `BRAVO.config`.
 Якщо файл уже існує — **додайте** рядки, не замінюйте файл.
@@ -185,39 +188,98 @@ if ($hasLocalBackup -eq $hasLocalAbsent) {
 перелічені в самому інструменті поіменно й виводяться окремим списком.
 
 Якщо ви бачите `[ERROR]` і перелік неочікуваних відмінностей — **зупиніться
-і не переходьте до кроку 6**. Найімовірніші причини:
+і не переходьте до кроку 5а**. Найімовірніші причини:
 
 - опечатка в останньому сегменті dot-шляху (див. крок 3) — значення не
   застосувалось;
 - перенесене значення відрізняється від того, що було в `BRAVO.config`;
 - у site-файлі опинилось похідне поле замість первинного.
 
+**Порядок кроків нижче навмисний.** `BRAVO_SELF_TEST.ps1` (Крок 5а) мусить
+запускатись, доки `BRAVO.config` ще на місці: self-test сьогодні
+безумовно читає файл за шляхом `Get-BRAVOSelfTestShippedConfigPath` для
+власних фікстур (`[IO.File]::ReadAllText`, без перевірки існування) —
+незалежний review PR #207 (2026-09-16) підтвердив, що прогін ПІСЛЯ
+видалення файлу (колишній Крок 6) не дав би `[FAIL]`, а завершився б
+неперехопленим винятком ще на етапі завантаження фікстур, і pilot
+примусово йшов би у відкат навіть при повністю коректній міграції.
+Прибирання `BRAVO.config` (Крок 6) лишається ОСТАННІМ і окремим кроком
+із власним, вужчим доказом (A↔C).
+
+## Крок 5а. `BRAVO_SELF_TEST.ps1`
+
+```powershell
+& "$Kit\BRAVO_SELF_TEST.ps1" 2>&1 | Tee-Object -FilePath "$Ev\self-test-after-migration.log"
+```
+
+**Очікується** код завершення 0 **І** відсутність рядків `[НЕДОСТУПНО]` у
+виводі (перевірте: `Select-String -Path "$Ev\self-test-after-migration.log"
+-Pattern '\[НЕДОСТУПНО\]'` не повинен нічого повернути). Кода завершення 0
+самого по собі НЕДОСТАТНЬО: `[НЕДОСТУПНО]` не впливає на exit code
+(`OPERATIONS.md`, розділ «`[НЕДОСТУПНО]` у self-test»), а прогін із такими
+рядками офіційно **не** зараховується як повне приймання (той самий
+розділ; `RELEASE_POLICY.md` розділ 9 — та сама вимога для приймання RC на
+реальних серверах). Якщо на цьому хості є легітимні `[НЕДОСТУПНО]`
+(Constrained Language Mode/AppLocker тощо) — задокументуйте причину
+окремо в `$Ev` і не покладайтесь на сам факт "код 0" як доказ.
+
+Це ширша перевірка, ніж Кроки 4-5: вона включно з `RuntimeIntegrityMode`,
+Configuration-модулями, Discovery і рештою доменів комплекту, а не лише
+конфігураційним графом.
+
+**Критерій відмови:** будь-який `[FAIL]` або непояснений `[НЕДОСТУПНО]` у
+виводі — **зупиніться**, перейдіть до розділу «Відкат». Не намагайтесь
+виправляти окремі `[FAIL]` на цьому етапі pilot — приймання зупиняється до
+з'ясування причини.
+
+**Доказ:** `self-test-after-migration.log` у `$Ev`.
+
+## Крок 5б. Health-перевірка
+
+```powershell
+& "$Kit\BRAVO_HEALTH.ps1" 2>&1 | Tee-Object -FilePath "$Ev\health-after-migration.log"
+```
+
+**Очікується** відсутність нових деградацій відносно `health-A-before.log`
+(Крок 0а) — порівняйте обидва файли вручну: health відображає стан
+середовища, а не самої конфігурації, тож автоматичного eталона-diff тут
+немає, але базовий артефакт для порівняння тепер є.
+
+**Критерій відмови:** нова деградація відносно `health-A-before.log`,
+якої не було до Кроку 3 — зупиніться, розберіться, чи це наслідок
+міграції, перш ніж продовжувати.
+
+**Доказ:** `health-after-migration.log` у `$Ev`.
+
+## Крок 5в. Archive smoke test
+
+Довід ефективної конфігурації (Кроки 0-5) навмисно **не замінює** перевірку
+поведінки продукту (див. «Відомі межі процедури» нижче). Мінімальний
+поведінковий доказ:
+
+```powershell
+& "$Kit\BRAVO_DRY_RUN.ps1" 2>&1 | Tee-Object -FilePath "$Ev\dry-run-after-migration.log"
+```
+
+**Очікується** успішне завершення dry-run (read-only перевірка доступу до
+джерел/призначень і креденшелів). Якщо процедура включає підтверджену
+maintenance-вікно — спостерігайте **першу реальну архівацію** після pilot і
+збережіть її лог окремо; це не автоматизується цим runbook.
+
+**Критерій відмови:** dry-run повідомляє про недоступний шлях/креденшел,
+якого не було до міграції — зупиніться.
+
+**Доказ:** `dry-run-after-migration.log` (+ лог першої реальної архівації,
+якщо вікно дозволяє в рамках цього ж pilot-візиту).
+
 ## Крок 6. Прибирання `BRAVO.config` (деструктивний крок)
 
 Спочатку — резервна копія **поза** каталогом комплекту:
 
 ```powershell
-# Та сама атомарна публікація, що й для site-файла: фінальне ім'я
-# з'являється лише після звірки хешу. Інакше обірвана копія стала б для
-# відкату «готовим бекапом», яким він перезаписав би справний оригінал.
-Copy-Item -LiteralPath "$Kit\BRAVO.config" -Destination "$Ev\BRAVO.config.partial" -ErrorAction Stop
-if ((Get-FileHash -LiteralPath "$Ev\BRAVO.config.partial" -Algorithm SHA256).Hash -ne
-    (Get-FileHash -LiteralPath "$Kit\BRAVO.config" -Algorithm SHA256).Hash) {
-    throw 'Резервна копія BRAVO.config не збігається з оригіналом — НЕ видаляйте оригінал.'
-}
-Rename-Item -LiteralPath "$Ev\BRAVO.config.partial" -NewName 'BRAVO.config.backup' -ErrorAction Stop
-
-Remove-Item -LiteralPath "$Kit\BRAVO.config" -ErrorAction Stop
-if (Test-Path -LiteralPath "$Kit\BRAVO.config") {
-    throw 'BRAVO.config усе ще на місці — знімок C знімати НЕ МОЖНА.'
-}
+Copy-Item -LiteralPath "$Kit\BRAVO.config" -Destination "$Ev\BRAVO.config.backup" -ErrorAction Stop
+Remove-Item -LiteralPath "$Kit\BRAVO.config"
 ```
-
-**`-ErrorAction Stop` і перевірка `Test-Path` тут обов'язкові.** Без них
-відмова видалення (права, блокування файла, ФС) — **нетермінальна**: сесія
-пішла б далі й зняла знімок C при живому `BRAVO.config`. Граф тоді
-збігається з A, порівняння друкує `[SUCCESS]`, і міграція, яка насправді
-нічого не прибрала, була б прийнята.
 
 Одразу після цього — знімок і порівняння **з вихідним** станом A:
 
@@ -234,79 +296,109 @@ if (Test-Path -LiteralPath "$Kit\BRAVO.config") {
 не A ↔ B, є доказом міграції: воно показує, що зникнення primary-шару не
 змінило жодного ефективного значення.
 
+**`BRAVO_SELF_TEST.ps1` після цього кроку НЕ перезапускається** — див.
+пояснення перед Кроком 5а. Знімок A↔C вище лишається єдиним автоматичним
+доказом саме цього кроку; ширші перевірки (5а-5в) вже дали свій PASS до
+видалення файлу.
+
+## Крок 6а. Формальне прийняття (Acceptance)
+
+Пілот вважається прийнятим лише коли оператор явно підтверджує кожен пункт
+розділу «Що вважати прийняттям пілота» нижче й зберігає підписаний/датований
+чекліст разом з рештою доказів у `$Ev`. До підтвердження перехід до B5
+(решта парку) не починається.
+
 ## Відкат
 
-Відновлюються **обидва** шари. Повернути лише `BRAVO.config` недостатньо:
-site-файл має вищий пріоритет, і залишені в ньому значення затінювали б
-відновлений primary-шар — сервер виглядав би відкоченим, не будучи ним.
+Відкат **не залежить** від того, на якому кроці зупинились — він завжди
+відновлює зі `$backupDir` Кроку 2а, а не з проміжного стану.
 
-Відкат можливий із **двох** точок, і порядок дій це враховує:
-
-- після кроку 5, коли порівняння A ↔ B впало. Крок 6 не виконувався,
-  `BRAVO.config` недоторканий, і резервної копії primary-шару ще **немає**;
-- після кроку 6, коли primary-шар уже прибрано.
-
-Тому site-шар відновлюється **першим і завжди**, а primary — **умовно**.
-Зворотний порядок означав би, що відкат із першої точки обривається на
-відсутній резервній копії, так і не прибравши змінений site-файл: невдалий
-пілот лишився б активним.
+**Критично: `-ErrorAction Stop` обов'язковий на КОЖНОМУ `Copy-Item` нижче.**
+Без нього заблокований ACL/lock-файл дає non-terminating помилку — скрипт
+мовчки йде далі, `BRAVO.config` відновлюється, а `BRAVO.local.config`
+лишається немігрованим станом, і жодна подальша команда цього не помітить
+(джерельні метадані навмисно виключені з semantic parity, тож A↔D
+пройшло б `[SUCCESS]` попри незавершений відкат).
 
 ```powershell
-# Захист від суперечливого стану каталогу доказів: рівно один артефакт.
-$localBackup = Test-Path -LiteralPath "$Ev\BRAVO.local.config.backup"
-$localAbsent = Test-Path -LiteralPath "$Ev\BRAVO.local.config.ABSENT"
-if ($localBackup -eq $localAbsent) {
-    throw "Стан site-файла в каталозі доказів неоднозначний (backup=$localBackup, absent=$localAbsent) — відкат зупинено."
-}
+Copy-Item -LiteralPath "$backupDir\BRAVO.config" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
 
-# 1) site-шар — завжди
-if ($localAbsent) {
-    # Файла до пілота не було -> прибираємо створений нами. Але його може
-    # й не бути: якщо звірка на кроці 2 не відібрала жодного значення,
-    # site-файл не створювався взагалі (BRAVO.config лише дублював
-    # дефолти). Відсутність тут — ВЖЕ потрібний стан, а не помилка; без
-    # Test-Path відкат упав би саме на цьому рядку, після відновлення
-    # primary-шару й ДО контрольного знімка.
+if (Test-Path -LiteralPath "$backupDir\BRAVO.local.config") {
+    Copy-Item -LiteralPath "$backupDir\BRAVO.local.config" -Destination "$Kit\BRAVO.local.config" -Force -ErrorAction Stop
+} elseif (Test-Path -LiteralPath "$backupDir\BRAVO.local.config.absent") {
+    # До міграції файлу не було — відкат прибирає той, що міг з'явитись.
+    # Test-Path обов'язковий: якщо звірка на Кроці 2 не відібрала жодного
+    # значення, site-файл не створювався взагалі, і його відсутність тут —
+    # ВЖЕ потрібний стан, а не помилка. Без цієї перевірки відкат упав би
+    # саме на цьому рядку, вже ПІСЛЯ відновлення primary-шару й ДО
+    # верифікації SHA-256 нижче.
     if (Test-Path -LiteralPath "$Kit\BRAVO.local.config") {
         Remove-Item -LiteralPath "$Kit\BRAVO.local.config" -ErrorAction Stop
     }
 } else {
-    Copy-Item -LiteralPath "$Ev\BRAVO.local.config.backup" -Destination "$Kit\BRAVO.local.config" -Force -ErrorAction Stop
+    # Крок 2а гарантує рівно один із двох артефактів. Жодного — каталог
+    # доказів неповний/пошкоджений: мовчазне продовження лишило б site-шар
+    # у мігрованому стані, і A↔D цього не побачив би.
+    throw "У '$backupDir' немає ані BRAVO.local.config, ані BRAVO.local.config.absent — стан site-файла невідомий, відкат зупинено."
 }
 
-# 2) primary-шар — лише якщо крок 6 виконувався
-if (Test-Path -LiteralPath "$Ev\BRAVO.config.backup") {
-    Copy-Item -LiteralPath "$Ev\BRAVO.config.backup" -Destination "$Kit\BRAVO.config" -Force -ErrorAction Stop
-} elseif (-not (Test-Path -LiteralPath "$Kit\BRAVO.config")) {
-    throw 'BRAVO.config відсутній, а резервної копії немає — автоматичний відкат неможливий.'
+# Верифікація відновлення проти SHA-256 з backup-manifest.json (Крок 2а),
+# а не просто "Copy-Item не кинув винятку": підмінений/пошкоджений
+# джерельний файл резервної копії теж мовчки скопіювався б.
+$backupManifest = Get-Content -LiteralPath "$backupDir\backup-manifest.json" -Raw -Encoding UTF8 | ConvertFrom-Json
+foreach ($entry in $backupManifest) {
+    $restoredPath = Join-Path $Kit $entry.File
+    if (-not (Test-Path -LiteralPath $restoredPath)) { continue }
+    $restoredHash = (Get-FileHash -LiteralPath $restoredPath -Algorithm SHA256).Hash
+    if ($restoredHash -ne $entry.SHA256) {
+        throw "Відкат $($entry.File): SHA-256 після відновлення ($restoredHash) не збігається з backup-manifest.json ($($entry.SHA256)) — ЗУПИНІТЬСЯ, не переходьте до перевірок нижче."
+    }
 }
 ```
 
-Далі — контрольний знімок **під ОКРЕМИМ іменем**:
+Після відновлення файлів пройдіть ту саму послідовність доказів, що й після
+міграції, порівнюючи з `snapshot-A-before.json`:
 
 ```powershell
+& "$Kit\BRAVO_SETUP.ps1" -ValidateOnly 2>&1 | Tee-Object -FilePath "$Ev\rollback-validate-only.log"
 & "$Kit\BRAVO_CONFIG_TEST.ps1" -FullGraph |
-    Set-Content -LiteralPath "$Ev\snapshot-R-rollback.json" -Encoding UTF8
-
+    Set-Content -LiteralPath "$Ev\snapshot-D-after-rollback.json" -Encoding UTF8
 & "$Kit\deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1" `
     -BeforePath "$Ev\snapshot-A-before.json" `
-    -AfterPath  "$Ev\snapshot-R-rollback.json" `
+    -AfterPath  "$Ev\snapshot-D-after-rollback.json" `
     -RuntimeRoot $Kit
+& "$Kit\BRAVO_SELF_TEST.ps1" 2>&1 | Tee-Object -FilePath "$Ev\self-test-after-rollback.log"
+& "$Kit\BRAVO_HEALTH.ps1" 2>&1 | Tee-Object -FilePath "$Ev\health-after-rollback.log"
 ```
 
-**Не перезаписуйте `snapshot-A-before.json`.** Якщо зняти відкочений стан
-поверх вихідного файла, наступне порівняння звірятиме файл сам із собою і
-неминуче дасть `[SUCCESS]`, нічого не довівши. Вихідний знімок A — єдина
-точка відліку, і він має пережити весь пілот.
+**Очікується:** `-ValidateOnly` без помилок, порівняння A↔D `[SUCCESS]`,
+`BRAVO_SELF_TEST.ps1` код 0, health без нових деградацій. Відкат не вважається
+завершеним, доки всі чотири не підтверджені — сам факт `Copy-Item` без
+помилки НЕ є доказом успішного відкату.
 
-Очікується `[SUCCESS]`: відкат повернув ефективну конфігурацію до стану A.
+Rollback executable незалежно від того, чи Крок 3-6 взагалі виконувались
+успішно: якщо Крок 3 (запис `BRAVO.local.config`) сам провалився/дав
+неочікуваний результат, той самий блок команд вище повертає сервер у стан
+Кроку 2а без додаткових умов.
 
 ## Що вважати прийняттям пілота
 
+- [ ] крок 0а (Health BEFORE) — `health-A-before.log` збережено;
+- [ ] крок 2а (backup) — `backup-manifest.json` збережено з SHA-256 обох
+      файлів (або явним `.absent`-маркером для відсутнього
+      `BRAVO.local.config`);
 - [ ] крок 5 (A ↔ B) — `[SUCCESS]`;
-- [ ] крок 6 (A ↔ C) — `[SUCCESS]`;
+- [ ] крок 5а (`BRAVO_SELF_TEST.ps1`) — код завершення 0 **і** жодного
+      рядка `[НЕДОСТУПНО]` у лозі (або задокументована причина для
+      кожного, якщо хост апаратно обмежений);
+- [ ] крок 5б (Health) — без нових деградацій відносно `health-A-before.log`;
+- [ ] крок 5в (Archive smoke) — `BRAVO_DRY_RUN.ps1` успішний; за наявності
+      вікна — перша реальна архівація після pilot спостережена й
+      залогована;
+- [ ] крок 6 (A ↔ C, після видалення `BRAVO.config`) — `[SUCCESS]`;
 - [ ] `BRAVO_SETUP.ps1 -ValidateOnly` після кроку 6 проходить;
-- [ ] усі чотири JSON-знімки збережені як докази.
+- [ ] усі знімки (A, B, C) і логи Кроків 0а, 5а-5в збережені як докази в `$Ev`;
+- [ ] чекліст цього розділу підписаний/датований оператором (крок 6а).
 
 Лише після цього має сенс переходити до B5 (решта парку).
 
@@ -323,3 +415,11 @@ if (Test-Path -LiteralPath "$Ev\BRAVO.config.backup") {
    у `deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1` поіменний і свідомий;
    якщо міграція змінить якесь поле поза цим переліком, інструмент
    доповість про це як про неочікувану відмінність — і це правильно.
+4. **`BRAVO_SELF_TEST.ps1` сьогодні вимагає присутності `BRAVO.config`.**
+   Фікстурна логіка (`Get-BRAVOSelfTestLegacyConfigText`) безумовно читає
+   шлях `Get-BRAVOSelfTestShippedConfigPath`; саме тому Крок 5а виконується
+   ДО Кроку 6, а після Кроку 6 self-test повторно не запускається. Це
+   відома, задокументована в самому комплекті межа (коментар при
+   `Get-BRAVOSelfTestLegacyConfigPath` — "на кроці B4-2 [прибирання файлу
+   з пакета] потягне переписати фікстурну тканину"), не дефект цього
+   runbook.
