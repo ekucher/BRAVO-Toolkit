@@ -12738,6 +12738,67 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                 -Name 'DiscoveryBaseline/ReadsCanonicalState' `
                 -Failure "збережений у State baseline мусить читатись і не давати хибного дрейфу; Source='$($baselineCanonicalOnly.Source)' дрейфів=$($baselineCanonicalDrift.Count)"
 
+            # --- DiscoveryBaseline/DriftAssignmentSurvivesStrictModeCountAccess ---
+            # Регресія на реальний VM (2026-09-18): BRAVO_SETUP.ps1:525-531
+            # присвоює результат саме через `$var = if (cond) {...} else {...}`
+            # (той самий вираз, що й тут), а потім читає `$var.Count`. Під
+            # Set-StrictMode -Version 2.0 такий if/else-як-вираз здатен
+            # розгорнути 0-елементний масив у $null, навіть коли кожна
+            # гілка обгорнута в `@(...)` — тоді `.Count` кидає
+            # PropertyNotFoundException. Фікс — унарна кома `,` ВСЕРЕДИНІ
+            # кожної гілки, безпосередньо перед `@(...)`. Тест відтворює
+            # ідентичний вираз для 0-, 1- і N-елементних результатів
+            # Compare-BRAVODiscoveryBaseline, включно з гілкою
+            # "baseline ще не існує" (`Baseline = $null`).
+            $driftedForCountTest = [pscustomobject]@{
+                BRAVO_ROOT = $autoDiscovery.BRAVO_ROOT
+                WEB_ROOT = $autoDiscovery.WEB_ROOT
+                MODEL_SOURCE = "C:\Completely\Different\Model"
+                BLOG_SOURCE = $autoDiscovery.BLOG_SOURCE
+                BRAVOEXCH_SOURCE = $autoDiscovery.BRAVOEXCH_SOURCE
+                BAZA_APP = $autoDiscovery.BAZA_APP
+                BAZA_WWW = $autoDiscovery.BAZA_WWW
+                BACKUP_ROOT = $autoDiscovery.BACKUP_ROOT
+            }
+            $countTestNoDriftThrew = $false
+            $countTestNoDriftCount = -1
+            try {
+                $noDriftAsExpression = if ($null -ne $baselineCanonicalOnly.Baseline) {
+                    , @(Compare-BRAVODiscoveryBaseline -DiscoveryResult $autoDiscovery -Baseline $baselineCanonicalOnly.Baseline)
+                } else {
+                    , @()
+                }
+                $countTestNoDriftCount = $noDriftAsExpression.Count
+            } catch { $countTestNoDriftThrew = $true }
+            $countTestDriftThrew = $false
+            $countTestDriftCount = -1
+            try {
+                $driftAsExpression = if ($null -ne $baselineCanonicalOnly.Baseline) {
+                    , @(Compare-BRAVODiscoveryBaseline -DiscoveryResult $driftedForCountTest -Baseline $baselineCanonicalOnly.Baseline)
+                } else {
+                    , @()
+                }
+                $countTestDriftCount = $driftAsExpression.Count
+            } catch { $countTestDriftThrew = $true }
+            $countTestNoBaselineThrew = $false
+            $countTestNoBaselineCount = -1
+            try {
+                $noBaselineAsExpression = if ($null -ne $null) {
+                    , @(Compare-BRAVODiscoveryBaseline -DiscoveryResult $autoDiscovery -Baseline $null)
+                } else {
+                    , @()
+                }
+                $countTestNoBaselineCount = $noBaselineAsExpression.Count
+            } catch { $countTestNoBaselineThrew = $true }
+            Test-BRAVOCondition `
+                -Condition (
+                    (-not $countTestNoDriftThrew) -and $countTestNoDriftCount -eq 0 -and
+                    (-not $countTestDriftThrew) -and $countTestDriftCount -eq 1 -and
+                    (-not $countTestNoBaselineThrew) -and $countTestNoBaselineCount -eq 0
+                ) `
+                -Name 'DiscoveryBaseline/DriftAssignmentSurvivesStrictModeCountAccess' `
+                -Failure "if/else-як-вираз навколо Compare-BRAVODiscoveryBaseline (той самий шаблон, що й у BRAVO_SETUP.ps1) не сміє кидати виняток або втрачати Count при читанні .Count: noDriftThrew=$countTestNoDriftThrew noDriftCount=$countTestNoDriftCount driftThrew=$countTestDriftThrew driftCount=$countTestDriftCount noBaselineThrew=$countTestNoBaselineThrew noBaselineCount=$countTestNoBaselineCount"
+
             # --- DiscoveryBaseline/InvalidCanonicalFailsClosed ---
             # Найважливіший сценарій: пошкоджений canonical НЕ сміє мовчки
             # стати «перший запуск» або відкотитись на legacy. Інакше
