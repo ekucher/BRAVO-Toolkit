@@ -580,9 +580,15 @@ function Get-BRAVOPilotHealthDegradationLines {
     # "Відомі межі процедури"), тому порівнюються МАРКОВАНІ проблемні рядки
     # ([CRITICAL]/[FAIL]/[ERROR]), а не побайтова рівність усього виводу —
     # часові мітки й лічильники в health legітимно різняться між прогонами.
+    # Без [AllowEmptyCollection()] mandatory-параметр [string[]] відхиляє
+    # порожній (не $null) масив ("Cannot bind argument... because it is
+    # an empty array") — той самий клас дефекту, що й у
+    # Write-BRAVOPilotEvidenceText/Assert-BRAVOPilotTextSecretSafe;
+    # відтворено на реальній VM: перший Validate-прогін на свіжому сервері
+    # не має health.before.log, тому $BeforeLines = @() (порожній, не $null).
     param(
-        [Parameter(Mandatory = $true)][AllowNull()][string[]]$BeforeLines,
-        [Parameter(Mandatory = $true)][AllowNull()][string[]]$AfterLines
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$BeforeLines,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$AfterLines
     )
     $pattern = '(?i)\[(CRITICAL|FAIL|ERROR)\]'
     $before = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)

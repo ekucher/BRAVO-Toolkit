@@ -677,6 +677,36 @@ try {
         & cmdkey.exe /delete:$f23ExistTarget 2>&1 | Out-Null
     }
 
+    # F24: регресія на реальний VM Validate (2026-09-18) — перший
+    # Validate-прогін на свіжому сервері не має health.before.log, тому
+    # `@(Get-Content ... -ErrorAction SilentlyContinue)` дає порожній
+    # (НЕ $null) масив. Invoke-BRAVOPilotHealthCheck передавав його як
+    # -BeforeLines у Get-BRAVOPilotHealthDegradationLines, чий параметр
+    # мав [Parameter(Mandatory=$true)][AllowNull()] БЕЗ
+    # [AllowEmptyCollection()] — PowerShell відхиляє непорожній
+    # non-null-but-empty масив для mandatory-параметра без цього
+    # атрибута ("Cannot bind argument... because it is an empty array").
+    $f24Install = Join-Path $tempRoot 'f24-health-empty-beforelines'
+    New-BRAVOPilotSyntheticInstallRoot -Path $f24Install
+    $f24OutputPath = Join-Path $tempRoot 'f24-health.log'
+    $f24MissingBeforePath = Join-Path $tempRoot 'f24-health.before.NONEXISTENT.log'
+    $f24BeforeLines = @(Get-Content -LiteralPath $f24MissingBeforePath -Encoding UTF8 -ErrorAction SilentlyContinue)
+    $f24Threw = $false
+    $f24Error = $null
+    $f24Result = $null
+    try {
+        $f24Result = Invoke-BRAVOPilotHealthCheck -InstallRoot $f24Install -OutputPath $f24OutputPath -BeforeLines $f24BeforeLines
+    } catch {
+        $f24Threw = $true
+        $f24Error = $_.Exception.Message
+    }
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/HealthCheckEmptyBeforeLinesNoBindingException' -Condition (
+        $f24BeforeLines.Count -eq 0 -and (-not $f24Threw)
+    ) -FailureDetail $f24Error
+    Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/HealthCheckEmptyBeforeLinesReturnsResult' -Condition (
+        (-not $f24Threw) -and $null -ne $f24Result -and $null -ne $f24Result.NewDegradations
+    ) -FailureDetail $(if ($null -ne $f24Result) { "NewDegradations=$($f24Result.NewDegradations)" } else { '$f24Result є $null' })
+
     # F8: read-only destination (EvidenceRoot без права на запис).
     $f8EvidenceRoot = Join-Path $tempRoot 'f8-readonly-evidence'
     [void](New-Item -ItemType Directory -Path $f8EvidenceRoot -Force)
