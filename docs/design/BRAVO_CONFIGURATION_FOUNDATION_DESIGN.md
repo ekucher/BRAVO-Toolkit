@@ -28,6 +28,18 @@
 > цей gate і НЕ завершений — статус і Definition of Done дивіться в
 > `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`.
 
+> **УТОЧНЕННЯ 2026-09-19 (#154, B1).** Там, де нижче сказано, що
+> `BRAVO.local.config` читається через
+> `[scriptblock]::CheckRestrictedLanguage(...)` з подальшим викликом
+> scriptblock-а, це опис механізму, який **більше не існує**. Site-файл
+> тепер парситься в AST і обходиться за явним fail-closed переліком
+> дозволених вузлів-літералів
+> (`ConvertFrom-BRAVOConfigurationDataFileText`,
+> `modules/BRAVO.Configuration/BRAVO.Configuration.DataFile.psm1`);
+> scriptblock не створюється, не викликається і не dot-source'иться.
+> Чинний контракт — `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`,
+> секція «Канонічний цільовий контракт Config v2».
+
 ## 0. Контекст
 
 Джерело завдання: "P0 Configuration Foundation" (feature-запит власника,

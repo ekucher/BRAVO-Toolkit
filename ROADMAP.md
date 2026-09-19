@@ -242,13 +242,38 @@ performance optimization. `SELF_TEST` не став суттєво швидши�
 
 ### P1.5 — Оптимізація продуктивності SELF_TEST
 
-**Статус: TODO / PLANNED.** Окремо від P1.4 (яка додала лише
-вимірювання, не пришвидшення).
+**Статус: IN PROGRESS.** Фаза 1 і селективний прогін реалізовані;
+подальші напрями лишаються відкритими. Окремо від P1.4, яка додала лише
+вимірювання, не пришвидшення.
 
-Можливі напрями (жоден ще не реалізований):
+**Фаза 1 — DONE** (PR #182, `0208515`; вихідна задача #157). Прибрано
+рівно ту роботу, що виконувалась кілька разів над тими самими файлами:
+чотири статичні аналізи, які кожен окремо повністю розбирав КОЖЕН файл
+комплекту, тепер живляться спільним AST (один розбір на файл); власне
+джерело `BRAVO_SELF_TEST.ps1` (~1.3 МБ) більше не розбирається заново
+трьома структурними guard-ами. Жодної перевірки не видалено, не
+пропущено й не переведено в selective-режим; порядок assert-ів не
+змінено. AST комплекту навмисно НЕ кешується між файлами, тож пікова
+пам'ять не зросла.
 
-- AST/text caching для повторюваних parse-операцій;
-- `-Suite` / `-Affected` — вибіркове виконання підмножини тестів;
+**Селективний прогін — DONE** (PR #192, `444f93c`; вихідна задача #187,
+фаза 2). `BRAVO_SELF_TEST.ps1 -Suite <Fragment>[,<Fragment>]` виконує
+лише названі фрагменти. Два обмеження зафіксовані в самій реалізації, а
+не в домовленості:
+
+- inline-тіло кореня виконується ЗАВЖДИ — фрагменти не самодостатні,
+  вони споживають фікстури, які готує саме це тіло (перевірено поіменно:
+  `$archiveScriptText`, `$archiveRuntimeModuleText`, `$resolvedConfig`,
+  `$backupRootPath`, `$statePath`). Тому економія обмежена зверху:
+  корінь — це 961 з 2107 перевірок і 188.6 с із 477.5 с сумарного часу
+  suite-ів;
+- **повний канонічний прогін без `-Suite` лишається ЄДИНИМ gate-ом
+  мержу й релізу.** `-Suite` — інструмент розробки, а не заміна
+  release-gate-у.
+
+Напрями, що **лишаються відкритими** (жоден ще не реалізований):
+
+- `-Affected` — вибір фрагментів за зміненими файлами;
 - оптимізація runtime child-process smoke-test фікстур;
 - декомпозиція кореневого `BRAVO_SELF_TEST.ps1` на менші одиниці
   виконання без втрати hermetic-гарантій;
@@ -257,8 +282,11 @@ performance optimization. `SELF_TEST` не став суттєво швидши�
 - безпечний паралелізм там, де fixture-ізоляція це дозволяє.
 
 Використовувати timing telemetry з P1.4 (per-suite wall-clock, Top 20
-найдовших assertion-інтервалів) як evidence base для пріоритизації
-цієї роботи, а не здогадки.
+найдовших assertion-інтервалів) як evidence base для пріоритизації цієї
+роботи, а не здогадки. Кожна наступна оптимізація приймається лише з
+BEFORE/AFTER raw timings щонайменше трьох повних прогонів того самого
+HEAD; за відсутності доказової переваги — не комітити спекулятивний
+rewrite.
 
 ## P2 — централізована експлуатація
 
@@ -326,12 +354,12 @@ Telemetry залишається outbound-only і не перетворюєть�
 
 ### P3.1 — Config v2
 
-**Статус: Foundation completed; final declarative Config v2 completion
-pending.**
+**Статус: Foundation completed; B0–B6 і pilot tooling merged; лишаються
+B5 (міграція парку), B4 частина 2 і B7.**
 
 FEAT-001 із `TODO_FEATURES.md` залишається важливим, але не випереджає production safety та restore verification.
 
-Ціль: package defaults + site-local data-only overrides + deterministic schema validation + legacy migration.
+Ціль: package defaults + site data-only overrides + deterministic schema validation + legacy migration.
 
 **P0 Configuration Foundation — DONE** (змерджено в `developer`):
 canonical built-in defaults, deterministic deep merge (array replace,
@@ -351,23 +379,60 @@ validated `ScriptBlock` усе одно ВИКОНУВАВСЯ, тож дозв�
 fail-closed переліком дозволених вузлів-літералів
 (`modules/BRAVO.Configuration/BRAVO.Configuration.DataFile.psm1`);
 scriptblock не створюється й не викликається. Сам `BRAVO.config`
-лишається виконуваним PowerShell-скриптом — це окремий крок B4.
-Precedence сьогодні: `DEFAULT <
+лишається виконуваним PowerShell-скриптом — і таким лишиться до
+прибирання з пакета (B4, частина 2); на DATA-only формат він не
+переводиться. Precedence сьогодні (перехідний стан): `DEFAULT <
 BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Деталі —
 `docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md`.
 
-**Config v2 — IN PROGRESS / не завершено.** `BRAVO.config` сам
-залишається виконуваним PowerShell-скриптом (не DATA-only),
-`VERSION.json.configSchemaVersion` = `1`. Рішенням власника **D2**
-(2026-09-14) перейменування локального шару скасовано: назва
-`BRAVO.local.config` лишається, файлу `BRAVO.config.local` не буде, а
-цільова модель v2 — **двошарова** (`DEFAULT < BRAVO.config <
-BRAVO.local.config`), без окремого машинно-локального шару. Повний перелік
-залишкових gaps, target architecture, safe declarative parser
-requirement, schema v2, migration і DoD regression matrix —
-`docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`.
+**Канонічний цільовий контракт (НОРМАТИВНО).** Цільова модель —
+**двошарова**:
 
-Починати наступний PR-цикл після стабілізації P0/P1, якщо ручний merge `BRAVO.config` продовжує створювати реальний операційний ризик.
+```text
+Built-in defaults  <  BRAVO.local.config (опціональний, DATA-only)
+```
+
+- рішенням власника **D2** (2026-09-14, PR #173) перейменування
+  локального шару скасовано: назва `BRAVO.local.config` лишається,
+  файлу `BRAVO.config.local` не буде, окремого машинно-локального шару
+  не буде;
+- рішенням власника від 2026-09-14 (#154) `BRAVO.config` **не
+  конвертується** у DATA-only формат — він прибирається з пакета (B4,
+  частина 2). DATA-only `BRAVO.config` не є і ніколи не був
+  затвердженою ціллю після цього рішення;
+- на час переходу завантажувач продовжує читати наявний на сервері
+  legacy `BRAVO.config` (пріоритет `DEFAULT < BRAVO.config <
+  BRAVO.local.config`), і комплект **ніколи** не видаляє цей файл із
+  сервера сам — крок виконує оператор після звірки;
+- рішенням власника **D3** (2026-09-14, PR #173) forward-compat для
+  невідомого КІНЦЕВОГО сегмента (leaf) збережено як кінцевий стан:
+  невідомий top-level блок і невідомий батьківський вузол — fail
+  closed, невідомий leaf — приймається з попередженням і метаданими.
+
+**Config v2 — IN PROGRESS / не завершено.** Merged: B0 (#169), B1
+(#174), B2 (#183), B3 (#184), B6 (#185), B4 частина 1 (#186), parity
+harness у CI (#193), а також контрольований pilot-інструментарій
+міграції — артефакт, оркестратор `deploy/Start-BRAVOConfigV2Pilot.ps1`
+та фікси, знайдені реальними e2e-прогонами на throwaway VM (#207–#212).
+`VERSION.json.configSchemaVersion` лишається `1`.
+
+**Залишилося рівно три етапи**, у жорсткому порядку:
+
+1. **B5** — послідовна міграція парку (по одному серверу) на
+   `BRAVO.local.config` без зміни ефективної конфігурації;
+2. **B4, частина 2** — прибирання `BRAVO.config` з пакета; блокується
+   B5, виконується окремими комітами (фікстури self-test → parity
+   harness → видалення файлу);
+3. **B7** — Definition-of-Done regression matrix на фінальному шляху
+   завантаження плюс промоція `Config parity (BRAVO_CONFIG_LOADER)` у
+   required status check.
+
+**Config v2 не можна позначати завершеним**, доки B5, B4 частина 2 і B7
+не завершені фактично, з доказами. Повний перелік залишкових gaps,
+target architecture, safe declarative parser requirement, схема,
+міграція й DoD regression matrix —
+`docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`; виконавча обгортка —
+Issue #154.
 
 ### P3.2 — Атомарний версійований deployment / rollback
 

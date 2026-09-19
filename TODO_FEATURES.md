@@ -5,23 +5,40 @@
 ## FEAT-001 — Config v2: package defaults + локальні overrides
 
 **Статус:** P0 Configuration Foundation — DONE (змерджено в
-`developer`); фінальний DATA-only Config v2 формат — IN PROGRESS /
-planned. Деталі поточного стану й залишкового scope —
+`developer`). Етапи B0–B6, B4 частина 1, parity harness у CI і
+контрольований pilot-інструментарій міграції (#207–#212) — merged.
+Лишаються **B5** (міграція парку), **B4 частина 2** (прибирання
+`BRAVO.config` з пакета) і **B7** (DoD regression matrix + parity як
+required check). Деталі поточного стану й залишкового scope —
 `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`. Цей файл
 (`TODO_FEATURES.md`) містить оригінальний feature-запит і детальні
 backlog-нотатки; канонічний поточний пріоритет/статус — `ROADMAP.md`,
 розділ P3.1.
 
+> **Канонічна цільова модель — двошарова**
+> (`Built-in defaults < BRAVO.local.config`). Рішенням власника **D2**
+> (2026-09-14) файл `BRAVO.config.local` і окремий машинно-локальний шар
+> скасовані; рішенням власника від 2026-09-14 (#154) `BRAVO.config`
+> **не конвертується** у DATA-only формат, а прибирається з пакета (B4,
+> частина 2). Критерії нижче, сформульовані до цих рішень, читати з цим
+> застереженням.
+
 **Пріоритет:** high
 
 **Залежності:** завершити поточний цикл Discovery; не змішувати з виправленнями source-of-truth.
 
-> Нижче — оригінальна ціль і критерії готовності, як сформульовані до
-> початку реалізації. Секцію не переписано заднім числом; фактичний
-> обсяг P0 Foundation, включно з відхиленнями від цього початкового
-> плану (наприклад, поточна назва локального override-файлу —
-> `BRAVO.local.config`, не `BRAVO.local.psd1`), задокументовано в
-> `CHANGELOG.md` та `docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md`.
+> **ІСТОРИЧНЕ.** Нижче — оригінальна ціль і критерії готовності, як
+> сформульовані до початку реалізації. Секцію не переписано заднім
+> числом, і **вона не є чинною вимогою**: назви файлів і точки входу в
+> ній не збігаються з фактичною реалізацією. Зокрема
+> `BRAVO.defaults.psd1`, `BRAVO.local.psd1` і `BRAVO_CONFIG_MIGRATE.ps1`
+> **не існують і не будуть створені** — канонічні відповідники це
+> `Get-BRAVODefaultConfiguration`, `BRAVO.local.config` і
+> `deploy/Start-BRAVOConfigV2Pilot.ps1`. Фактичний обсяг P0 Foundation
+> задокументовано в `CHANGELOG.md` та
+> `docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md`; чинний цільовий
+> контракт — `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`, секція
+> «Канонічний цільовий контракт Config v2».
 
 ### Мета
 
@@ -77,12 +94,24 @@ backlog-нотатки; канонічний поточний пріоритет
       `BRAVO.local.config.example` (інший формат/назва). PLANNED, якщо
       Config v2 обиратиме саме `.psd1`-подання.
 - [x] Deterministic deep merge реалізовано (`Merge-BRAVOConfiguration`).
-- [ ] Config v2 schema validation (unknown-key rejection, type
-      validation, `configSchemaVersion = 2`) — **не реалізовано**,
-      PLANNED (`configSchemaVersion` лишається `1`).
-- [ ] Config v2 як non-executing data-only формат для `BRAVO.config`
-      **не реалізовано** — сам `BRAVO.config` досі виконуваний
-      PowerShell-скрипт (крок B4 у #154).
+- [x] Schema validation реалізовано частково за фактичним обсягом
+      рішень: типи й fail-closed для невідомого top-level блоку та
+      невідомого батьківського вузла — `BRAVO.Configuration.Schema.psm1`
+      (#154, B2 / PR #183); маркер `configSchemaVersion` і диспетч за
+      версією site-файлу — `Get-BRAVOConfigurationSchemaVersionContract`,
+      `Resolve-BRAVOConfigurationSchemaVersion` (#154, B3 / PR #184).
+      Невідомий КІНЦЕВИЙ сегмент (leaf) свідомо НЕ відхиляється
+      (рішення D3). Перехід site-маркера на `2` не виконано — це
+      предмет B7; `VERSION.json.configSchemaVersion` лишається `1` і є
+      окремим полем з іншим предметом.
+- [ ] Config v2 як non-executing data-only формат для `BRAVO.config` —
+      **знято з обсягу**. Рішенням власника (#154) файл не
+      конвертується, а прибирається з пакета (B4, частина 2); до того
+      моменту він лишається виконуваним і читається наявним
+      legacy-шляхом. З #186 (B4, частина 1) завантаження більше не
+      мовчить про нього: точні dot-шляхи, де він затінює канонічні
+      дефолти, ідуть у попередження й у
+      `BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults`.
 - [x] `BRAVO.local.config` читається non-executing AST-парсером
       (#154, B1): `ConvertFrom-BRAVOConfigurationDataFileText`
       (`modules/BRAVO.Configuration/BRAVO.Configuration.DataFile.psm1`)
@@ -104,15 +133,31 @@ backlog-нотатки; канонічний поточний пріоритет
       обидва це задокументована, свідома, тимчасова поведінка, а не
       прогалина. Не описувати як "блокує в усіх режимах" — механізм і
       self-test-покриття (включно з `Warn`/override-шляхом) реалізовані.
-- [ ] Legacy vs config v2 еквівалентність — N/A, доки Config v2 формату
-      не існує; PLANNED як частина migration-етапу.
-- [ ] Міграція (dry-run/backup/rollback) — **не реалізована**;
-      `BRAVO_CONFIG_MIGRATE.ps1` не існує. PLANNED.
-- [ ] Self-test для v2-схеми (unknown keys, type mismatch, array
-      replacement, nullable values, security downgrade) — P0 Foundation
-      self-test покриває security-downgrade-інваріант і merge-семантику
-      сьогоднішнього формату; v2-schema-специфічні кейси PLANNED разом
-      зі схемою.
+- [ ] Legacy vs цільовий стан — еквівалентність ефективної
+      конфігурації (`EffectiveConfig(BEFORE) == EffectiveConfig(AFTER)`,
+      з урахуванням ТИПІВ значень) доводиться під час міграції
+      інструментарієм pilot. Регресійне покриття на контрольній
+      фікстурі — предмет B7; фактичні докази по парку — предмет B5.
+- [x] Міграція (dry-run/backup/rollback) — реалізована як
+      **контрольований pilot**, а не як `BRAVO_CONFIG_MIGRATE.ps1`
+      (такого скрипта не існує і не потрібно). Канонічна точка входу —
+      `deploy/Start-BRAVOConfigV2Pilot.ps1` зі станами
+      `Preflight → Prepare → Approve → Activate → Validate → Accept`,
+      з hash-bound approval, TOCTOU-gate і взаємним виключенням
+      мутуючих операцій (#208). Допоміжні:
+      `deploy/Get-BRAVOConfigSiteDelta.ps1` (#169),
+      `deploy/New-BRAVOConfigV2PilotArtifact.ps1` /
+      `deploy/Test-BRAVOConfigV2PilotArtifact.ps1` (#208),
+      `deploy/Compare-BRAVOConfigEffectiveSnapshot.ps1` (#205).
+      Дефекти, знайдені реальними e2e-прогонами на throwaway VM,
+      виправлені в #207, #209, #210, #211, #212. **Виконаних міграцій
+      парку це не замінює** — B5 лишається невиконаним.
+- [ ] Повна Definition-of-Done regression matrix на **фінальному**
+      шляху завантаження (parser/non-execution, схема, мердж,
+      деривація, безпека, намір AUTO/EXPLICIT, стан інсталяції,
+      еквівалентність, збереження при оновленні) — **предмет B7**.
+      Окремі фрагменти вже покриті (#183, #184, #186, #192), але
+      integration-доказ на фінальному call path — ні.
 - [x] `BRAVO_SETUP.ps1`, `BRAVO_ARCHIV.ps1`, `BRAVO_HEALTH.ps1`,
       `BRAVO_MAINTENANCE.ps1` і scheduler-контракт працюють через один
       canonical loader pipeline (`BRAVO_CONFIG_LOADER.ps1` +
