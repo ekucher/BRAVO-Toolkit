@@ -8,21 +8,49 @@ name: Config parity
 #
 # Скрипту потрібні лише git і Windows PowerShell 5.1: ні адмін-прав, ні
 # служб, ні 7-Zip/WinSCP, ні мережі, ні встановленого LIMS (шляхи
-# підмінено на фікстури всередині самого скрипта). Тобто перешкод для
-# автоматичного прогону не було — бракувало самого workflow.
+# підмінено на фікстури всередині самого скрипта).
 #
-# ОКРЕМИЙ ФАЙЛ, А НЕ ЗАДАЧА В ci.yml. Дві причини. По-перше, перевірка
-# доречна лише для PR, що торкаються конфігураційного пайплайна, а фільтр
-# paths у GitHub Actions задається на рівні workflow, не задачі. По-друге,
-# guard Governance/RequiredChecksListCoversCiWorkflowJobs вимагає, щоб
-# КОЖНА pull_request-задача ci.yml була перелічена в RELEASE_POLICY 13.3
-# як required check; додавання туди сьомої задачі означало б заявити
+# ОКРЕМИЙ ФАЙЛ, А НЕ ЗАДАЧА В ci.yml. Guard
+# Governance/RequiredChecksListCoversCiWorkflowJobs вимагає, щоб КОЖНА
+# pull_request-задача ci.yml була перелічена в RELEASE_POLICY 13.3 як
+# required check; додавання туди сьомої задачі означало б заявити
 # required check, якого насправді не ввімкнено (рівно дефект #149).
 #
-# ЦЕ НЕ REQUIRED CHECK. Наявність задачі в CI не робить її блокуючою:
-# перелік required checks — адміністративне налаштування GitHub (див.
-# #149). Промоція цієї перевірки в блокуючу — свідоме рішення власника, і
-# приймати його треба ПІСЛЯ того, як прогін стабільно зелений.
+# ЧОМУ ТУТ БІЛЬШЕ НЕМАЄ `paths:` — ГОЛОВНЕ В ЦЬОМУ ФАЙЛІ.
+#
+# Попередня редакція фільтрувала workflow за `pull_request.paths`. Це
+# коректно для необов'язкової перевірки й НЕПРИДАТНЕ для required status
+# check: фільтр діє на рівні WORKFLOW, тобто для PR поза переліком
+# workflow не запускається взагалі — жодного прогону, жодного check run,
+# жодного статусу. Branch protection зіставляє required checks за ІМЕНЕМ
+# і чекає на статус, якого ніхто не створить: PR, що змінює лише
+# README.md, лишився б заблокованим назавжди. Це не гіпотеза, а
+# задокументована поведінка GitHub Actions і той самий клас інциденту,
+# що й колізія імен під час промоції 5.1.0 (RELEASE_POLICY 13.3).
+#
+# Тому рішення «релевантно / не релевантно» перенесено ВСЕРЕДИНУ задачі:
+# workflow стартує на КОЖЕН pull_request, задача реально виконується й
+# завершується нулем, а check run з тим самим іменем з'являється завжди.
+# Для PR поза конфігураційним пайплайном задача звітує N/A і виходить 0;
+# для PR у межах пайплайна — запускає справжній harness.
+#
+# КАНОНІЧНИЙ ПЕРЕЛІК ШЛЯХІВ ЖИВЕ В КОДІ, А НЕ ТУТ:
+# ci\Test-BRAVOConfigParityRelevantPath.ps1
+# (Get-BRAVOConfigParityRelevantPathPattern). Це навмисно — перелік у
+# YAML не можна ні перевірити на синтетичних наборах, ні покрити
+# регресією. Self-test зіставляє логіку рішення з синтетичними наборами
+# (ConfigParity/*) і механічно тримає інваріант «required-capable
+# workflow не має workflow-level paths» (Governance/ConfigParity*).
+#
+# ІМЕНА РОЗДІЛЕНІ ЗА ПОДІЄЮ — та сама причина, що й у ci.yml
+# (інцидент промоції 5.1.0): required check прив'язується до імені, і
+# ручний workflow_dispatch-прогін над тим самим head SHA не повинен
+# конкурувати з мерж-гейтом. pull_request зберігає канонічне ім'я
+# «Config parity (BRAVO_CONFIG_LOADER)» без змін.
+#
+# ЦЕ ЩЕ НЕ REQUIRED CHECK. Наявність задачі в CI не робить її блокуючою:
+# перелік required checks — адміністративне налаштування GitHub (#149).
+# Цей файл робить промоцію БЕЗПЕЧНОЮ; саму промоцію виконує власник.
 #
 # ВІДОМИЙ НАСЛІДОК зафіксованої бази (див. коментар -BaseRef у самому
 # скрипті): allowlist навмисних відмінностей ЗРОСТАТИМЕ з кожним новим
@@ -30,35 +58,180 @@ name: Config parity
 # якої ніхто не declared", і вимагає поіменного внесення ключа з
 # обґрунтуванням — а не послаблення перевірки.
 
+
 on:
   pull_request:
-    paths:
-      - 'BRAVO_CONFIG_LOADER.ps1'
-      - 'BRAVO.config'
-      - 'BRAVO.local.config.example'
-      - 'modules/BRAVO.Configuration/**'
-      - 'modules/BRAVO.Configurator/**'
-      - 'ci/Test-BRAVOConfigFoundationParity.ps1'
-      - '.github/workflows/config-parity.yml'
   workflow_dispatch:
 
 jobs:
   config-parity:
-    name: Config parity (BRAVO_CONFIG_LOADER)
+    name: ${{ github.event_name == 'pull_request' && 'Config parity (BRAVO_CONFIG_LOADER)' || 'Config parity (BRAVO_CONFIG_LOADER) (push)' }}
     runs-on: windows-latest
     steps:
-      # fetch-depth: 0 ОБОВ'ЯЗКОВИЙ. Скрипт створює ізольований
-      # git worktree за комітом 42cf9ad (незмінна точка відліку паритету);
-      # при типовому shallow-checkout цей коміт недосяжний, і git worktree
-      # add провалився б із причиною, яку легко сплутати з дефектом коду.
+      # fetch-depth: 0 ОБОВ'ЯЗКОВИЙ, і тепер із двох причин.
+      #
+      # 1. Harness створює ізольований git worktree за комітом 42cf9ad
+      #    (незмінна точка відліку паритету); при типовому
+      #    shallow-checkout цей коміт недосяжний, і git worktree add
+      #    провалився б із причиною, яку легко сплутати з дефектом коду.
+      # 2. Крок рішення нижче рахує змінені файли між ТОЧНИМИ base/head
+      #    SHA з payload події; при shallow-checkout merge-base
+      #    недосяжна.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       # Same ASCII-only reason as ci.yml: GitHub Actions writes `run:`
       # blocks to a temp .ps1 WITHOUT a BOM, and Windows PowerShell 5.1
-      # reads them in the system ANSI code page.
+      # reads them in the system ANSI code page. YAML comments (like this
+      # one and the Ukrainian block above) are never executed.
+      - name: Relevance decision (changed files vs config pipeline)
+        id: relevance
+        shell: powershell
+        env:
+          # Через середовище, а НЕ підстановкою у тіло скрипта: у fork-PR
+          # шляхи файлів контролює автор PR, і ${{ }} прямо в `run:`
+          # означав би виконання його тексту як коду.
+          BRAVO_EVENT_NAME: ${{ github.event_name }}
+          BRAVO_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BRAVO_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          . .\ci\Test-BRAVOConfigParityRelevantPath.ps1
+
+          function Set-BRAVOStepOutput {
+              param([string]$Name, [string]$Value)
+              # UTF8Encoding($false): Out-File -Encoding utf8 under
+              # Windows PowerShell 5.1 emits a BOM, and a BOM in the first
+              # line of GITHUB_OUTPUT breaks the key parser.
+              # Newlines are stripped: a value that spans lines would be
+              # parsed as further keys.
+              $flat = ([string]$Value) -replace '[\r\n]+', ' '
+              [System.IO.File]::AppendAllText(
+                  $env:GITHUB_OUTPUT,
+                  ($Name + '=' + $flat + [Environment]::NewLine),
+                  (New-Object System.Text.UTF8Encoding($false)))
+          }
+
+          function Invoke-BRAVOGitQuery {
+              # Every git call in this step is a QUESTION, not an
+              # assertion. Under $ErrorActionPreference = 'Stop' a native
+              # command writing to stderr can surface as a terminating
+              # NativeCommandError in Windows PowerShell 5.1, which would
+              # abort the job on an ordinary "object not found".
+              #
+              # Array splatting is correct HERE because git is a native
+              # executable: elements become argv. (It does NOT bind named
+              # or switch parameters of a PowerShell function - that is
+              # the defect fixed in #207.)
+              param([string[]]$Argument)
+              $ErrorActionPreference = 'Continue'
+              $captured = & git @Argument 2>&1
+              $exitCode = $LASTEXITCODE
+              $lines = @(
+                  @($captured) |
+                      ForEach-Object { [string]$_ } |
+                      Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+              )
+              # No unary comma: inside a hashtable literal nothing
+              # unrolls, so ,@() would add a nesting level and .Count of
+              # an empty result would be 1 instead of 0.
+              return [pscustomobject]@{
+                  ExitCode = $exitCode
+                  Line     = @($lines)
+              }
+          }
+
+          $patterns = @(Get-BRAVOConfigParityRelevantPathPattern)
+          Write-Host 'Canonical config pipeline paths:'
+          $patterns | ForEach-Object { Write-Host ('  ' + $_) }
+          Write-Host ''
+
+          # Manual dispatch always runs the full harness: the operator
+          # asked for it explicitly, and there is no diff to reason about.
+          if ($env:BRAVO_EVENT_NAME -ne 'pull_request') {
+              Write-Host ('Event is ' + $env:BRAVO_EVENT_NAME + ' - running the full harness unconditionally.')
+              Set-BRAVOStepOutput -Name 'relevant' -Value 'true'
+              Set-BRAVOStepOutput -Name 'reason' -Value 'manual or non-pull_request event'
+              exit 0
+          }
+
+          $baseSha = [string]$env:BRAVO_BASE_SHA
+          $headSha = [string]$env:BRAVO_HEAD_SHA
+          Write-Host ('Base SHA: ' + $baseSha)
+          Write-Host ('Head SHA: ' + $headSha)
+          Write-Host ''
+
+          # FAIL TOWARDS RUNNING. Every failure below means "we could not
+          # PROVE this pull request is irrelevant", and an unprovable
+          # claim must never silence a mandatory check. The harness is
+          # cheap; a missed configuration regression is not.
+          function Use-BRAVOFallbackRun {
+              param([string]$Reason)
+              Write-Host ('::warning::Could not determine changed files (' + $Reason + '). Running the harness anyway.')
+              Set-BRAVOStepOutput -Name 'relevant' -Value 'true'
+              Set-BRAVOStepOutput -Name 'reason' -Value ('undetermined - ' + $Reason)
+              exit 0
+          }
+
+          if ([string]::IsNullOrWhiteSpace($baseSha) -or [string]::IsNullOrWhiteSpace($headSha)) {
+              Use-BRAVOFallbackRun -Reason 'base or head SHA missing from the event payload'
+          }
+
+          foreach ($sha in @($baseSha, $headSha)) {
+              $probe = Invoke-BRAVOGitQuery -Argument @('cat-file', '-e', ($sha + '^{commit}'))
+              if ($probe.ExitCode -ne 0) {
+                  # fetch-depth: 0 normally makes this unreachable; the
+                  # recovery exists so a force-push race cannot silently
+                  # turn this check into a no-op.
+                  [void](Invoke-BRAVOGitQuery -Argument @('fetch', '--no-tags', '--quiet', 'origin', $sha))
+                  $probe = Invoke-BRAVOGitQuery -Argument @('cat-file', '-e', ($sha + '^{commit}'))
+                  if ($probe.ExitCode -ne 0) {
+                      Use-BRAVOFallbackRun -Reason ('commit not reachable - ' + $sha)
+                  }
+              }
+          }
+
+          # Merge base, not the raw base SHA: base.sha is the base branch
+          # tip at the last synchronisation, so diffing against it
+          # directly would attribute unrelated base-branch commits to this
+          # pull request and make the decision depend on WHEN it runs.
+          $mergeBaseResult = Invoke-BRAVOGitQuery -Argument @('merge-base', $baseSha, $headSha)
+          if ($mergeBaseResult.ExitCode -ne 0 -or @($mergeBaseResult.Line).Count -eq 0) {
+              Use-BRAVOFallbackRun -Reason 'git merge-base failed'
+          }
+          $mergeBase = (@($mergeBaseResult.Line)[0]).Trim()
+          Write-Host ('Merge base: ' + $mergeBase)
+
+          $diffResult = Invoke-BRAVOGitQuery -Argument @('diff', '--name-only', $mergeBase, $headSha)
+          if ($diffResult.ExitCode -ne 0) {
+              Use-BRAVOFallbackRun -Reason 'git diff --name-only failed'
+          }
+
+          $changed = @($diffResult.Line)
+          Write-Host ('Changed files: ' + $changed.Count)
+          $changed | ForEach-Object { Write-Host ('  ' + $_) }
+          Write-Host ''
+
+          # An empty diff is a real, determinable answer (for example a
+          # pull request whose commits are already in the base): nothing
+          # changed, so nothing in the config pipeline changed either.
+          $decision = Test-BRAVOConfigParityRelevantPath -ChangedPath $changed
+
+          if ($decision.IsRelevant) {
+              Write-Host 'RELEVANT - this pull request touches the configuration pipeline.'
+              Write-Host 'Matched:'
+              @($decision.MatchedPath) | ForEach-Object { Write-Host ('  ' + $_) }
+              Set-BRAVOStepOutput -Name 'relevant' -Value 'true'
+              Set-BRAVOStepOutput -Name 'reason' -Value ('matched ' + @($decision.MatchedPath).Count + ' path(s)')
+          } else {
+              Write-Host 'NOT APPLICABLE - this pull request does not touch the configuration pipeline.'
+              Set-BRAVOStepOutput -Name 'relevant' -Value 'false'
+              Set-BRAVOStepOutput -Name 'reason' -Value 'no changed file matches the canonical config pipeline paths'
+          }
+
       - name: Config foundation parity
+        if: steps.relevance.outputs.relevant == 'true'
         shell: powershell
         run: |
           $ErrorActionPreference = 'Stop'
@@ -67,3 +240,22 @@ jobs:
               Write-Host "::error::Test-BRAVOConfigFoundationParity.ps1 exited with code $LASTEXITCODE"
               exit 1
           }
+
+      # Саме цей крок робить перевірку придатною до промоції в required:
+      # задача все одно виконується, все одно створює check run із тим
+      # самим іменем і все одно завершується успіхом. Пропущений WORKFLOW
+      # не створив би нічого — і заблокував би PR назавжди.
+      - name: Not applicable for this pull request
+        if: steps.relevance.outputs.relevant != 'true'
+        shell: powershell
+        env:
+          BRAVO_REASON: ${{ steps.relevance.outputs.reason }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host 'Config parity: NOT APPLICABLE.'
+          Write-Host ('Reason: ' + [string]$env:BRAVO_REASON)
+          Write-Host 'No file in this pull request belongs to the configuration pipeline,'
+          Write-Host 'so ci\Test-BRAVOConfigFoundationParity.ps1 has nothing to characterise.'
+          Write-Host 'The check succeeds on purpose: it must exist for EVERY pull request'
+          Write-Host 'so that it can safely be promoted to a required status check.'
+          exit 0

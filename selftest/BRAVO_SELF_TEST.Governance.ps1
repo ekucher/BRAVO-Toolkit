@@ -1036,6 +1036,218 @@
             "check на PR не з'являється й заблокував би мердж назавжди; знайдено: $($pushSuffixedCheckNames -join ', ')")
 
 # =====================================================================
+# Config parity придатний до промоції в required status check
+# =====================================================================
+# Корінь проблеми той самий, що й #149, але з іншого боку: раніше
+# .github\workflows\config-parity.yml мав workflow-level
+# `pull_request.paths`. Фільтр `paths` діє на рівні WORKFLOW — для PR
+# поза переліком workflow не запускається взагалі, тобто check run не
+# створюється. Branch protection зіставляє required checks за ІМЕНЕМ і
+# чекає на статус, якого ніхто не створить: PR, що змінює лише
+# README.md, лишився б заблокованим назавжди.
+#
+# Інваріант тримається механічно, а не коментарем: повернення `paths:`
+# у цей workflow валить self-test.
+& {
+    $configParityWorkflowPath = Join-Path $root '.github\workflows\config-parity.yml'
+    $configParityWorkflowText = [IO.File]::ReadAllText($configParityWorkflowPath, [Text.Encoding]::UTF8)
+    $configParityWorkflowLines = @($configParityWorkflowText -split "`r?`n")
+
+    # --- Governance/ConfigParityWorkflowHasNoWorkflowLevelPathFilter ---
+    # Розбирається САМЕ блок `on:` до першого рядка нульового відступу
+    # після нього: слово "paths" трапляється і в поясненні, і в назві
+    # кроку, і суцільний пошук підрядка спрацьовував би на власному
+    # коментарі — рівно той клас хибного спрацювання, який уже
+    # враховано в Governance/RequiredChecksListCoversCiWorkflowJobs.
+    $onBlockStartIndex = -1
+    for ($lineIndex = 0; $lineIndex -lt $configParityWorkflowLines.Count; $lineIndex++) {
+        if ($configParityWorkflowLines[$lineIndex] -match '^on:\s*$') {
+            $onBlockStartIndex = $lineIndex
+            break
+        }
+    }
+
+    $onBlockLines = @()
+    if ($onBlockStartIndex -ge 0) {
+        for ($lineIndex = $onBlockStartIndex + 1; $lineIndex -lt $configParityWorkflowLines.Count; $lineIndex++) {
+            $currentLine = $configParityWorkflowLines[$lineIndex]
+            if ($currentLine -match '^\S') { break }
+            $onBlockLines += $currentLine
+        }
+    }
+
+    $pathFilterLines = @(
+        $onBlockLines | Where-Object { $_ -match '^\s+paths(-ignore)?\s*:' }
+    )
+
+    Test-BRAVOCondition `
+        -Condition ($onBlockStartIndex -ge 0 -and $pathFilterLines.Count -eq 0) `
+        -Name "Governance/ConfigParityWorkflowHasNoWorkflowLevelPathFilter" `
+        -Failure ("config-parity.yml не повинен мати workflow-level paths/paths-ignore: фільтр не дає " +
+            "workflow запуститись, тож required check ніколи не з'явиться й заблокує PR назавжди. " +
+            "Блок on: знайдено: $($onBlockStartIndex -ge 0); знайдені фільтри: " +
+            "$(if ($pathFilterLines.Count -gt 0) { ($pathFilterLines | ForEach-Object { $_.Trim() }) -join '; ' } else { '<немає>' })")
+
+    # --- Governance/ConfigParityWorkflowRunsOnEveryPullRequest ---
+    $hasUnconditionalPullRequestTrigger = @(
+        $onBlockLines | Where-Object { $_ -match '^\s+pull_request\s*:\s*(\{\s*\})?\s*$' }
+    ).Count -gt 0
+
+    Test-BRAVOCondition `
+        -Condition $hasUnconditionalPullRequestTrigger `
+        -Name "Governance/ConfigParityWorkflowRunsOnEveryPullRequest" `
+        -Failure "config-parity.yml мусить тригеритись на КОЖЕН pull_request без умов — інакше check run з'являється не для кожного PR"
+
+    # --- Governance/ConfigParityCheckKeepsCanonicalName ---
+    # Ім'я — це і є контракт required check: branch protection тримає
+    # рядок, не посилання на задачу. Перейменування мовчки розірве
+    # прив'язку, і мердж-гейт перестане існувати, лишившись у
+    # налаштуваннях. Суфікс " (push)" для workflow_dispatch — та сама
+    # схема, що в ci.yml (інцидент промоції 5.1.0).
+    Test-BRAVOCondition `
+        -Condition ($configParityWorkflowText.Contains("'Config parity (BRAVO_CONFIG_LOADER)'")) `
+        -Name "Governance/ConfigParityCheckKeepsCanonicalName" `
+        -Failure "config-parity.yml мусить зберігати канонічне pull_request-ім'я 'Config parity (BRAVO_CONFIG_LOADER)'"
+
+    # --- Governance/ConfigParityWorkflowKeepsFullHistory ---
+    # Без fetch-depth: 0 недосяжні і коміт-база паритету (42cf9ad), і
+    # merge-base для рішення про релевантність. Перевірка мовчки
+    # перетворилась би на no-op.
+    Test-BRAVOCondition `
+        -Condition ($configParityWorkflowText -match 'fetch-depth:\s*0') `
+        -Name "Governance/ConfigParityWorkflowKeepsFullHistory" `
+        -Failure "config-parity.yml мусить робити checkout із fetch-depth: 0 — інакше ні база паритету, ні merge-base недосяжні"
+
+    # --- Governance/ConfigParityDecisionLogicIsNotInlineYaml ---
+    # Перелік шляхів живе в коді саме для того, щоб його можна було
+    # перевірити синтетичними наборами (ConfigParity/* нижче). Якщо
+    # workflow перестане його викликати, ці регресії охоронятимуть
+    # мертвий код.
+    Test-BRAVOCondition `
+        -Condition (
+            $configParityWorkflowText.Contains('ci\Test-BRAVOConfigParityRelevantPath.ps1') -and
+            $configParityWorkflowText.Contains('Test-BRAVOConfigParityRelevantPath -ChangedPath')
+        ) `
+        -Name "Governance/ConfigParityDecisionLogicIsNotInlineYaml" `
+        -Failure "config-parity.yml мусить приймати рішення через ci\Test-BRAVOConfigParityRelevantPath.ps1, а не інлайн-переліком у YAML"
+}
+
+# =====================================================================
+# ConfigParity/* — рішення "релевантно / не релевантно" на синтетичних
+# наборах
+# =====================================================================
+# Це та частина, яку workflow-фільтр `paths` не дозволяв перевірити
+# взагалі. Набори нижче — саме ті, що названі в постановці задачі, плюс
+# випадки, на яких наївна реалізація ламається: префікс каталогу без
+# роздільника, зворотні слеші, порожній набір.
+& {
+    . (Join-Path $root 'ci\Test-BRAVOConfigParityRelevantPath.ps1')
+
+    $canonicalPattern = @(Get-BRAVOConfigParityRelevantPathPattern)
+
+    # --- ConfigParity/CanonicalPatternCoversRequiredPaths ---
+    # Постановка задачі називає мінімальний перелік поіменно; guard
+    # ловить мовчазне звуження.
+    $requiredPattern = @(
+        'BRAVO_CONFIG_LOADER.ps1'
+        'BRAVO.config'
+        'BRAVO.local.config.example'
+        'modules/BRAVO.Configuration/**'
+        'modules/BRAVO.Configurator/**'
+        'ci/Test-BRAVOConfigFoundationParity.ps1'
+        '.github/workflows/config-parity.yml'
+    )
+    $missingPattern = @($requiredPattern | Where-Object { $canonicalPattern -notcontains $_ })
+    Test-BRAVOCondition `
+        -Condition ($missingPattern.Count -eq 0) `
+        -Name "ConfigParity/CanonicalPatternCoversRequiredPaths" `
+        -Failure "Канонічний перелік шляхів config-parity звузився; відсутні: $($missingPattern -join ', ')"
+
+    # --- ConfigParity/RelevantPathDecision ---
+    $relevanceCases = @(
+        @{ Name = 'README only';                 Changed = @('README.md');                                      Expected = $false }
+        @{ Name = 'config loader';               Changed = @('BRAVO_CONFIG_LOADER.ps1');                        Expected = $true }
+        @{ Name = 'Configuration module';        Changed = @('modules/BRAVO.Configuration/x.psm1');             Expected = $true }
+        @{ Name = 'Configurator module';         Changed = @('modules/BRAVO.Configurator/y.psm1');              Expected = $true }
+        @{ Name = 'the workflow itself';         Changed = @('.github/workflows/config-parity.yml');            Expected = $true }
+        @{ Name = 'the harness itself';          Changed = @('ci/Test-BRAVOConfigFoundationParity.ps1');        Expected = $true }
+        @{ Name = 'the decision logic itself';   Changed = @('ci/Test-BRAVOConfigParityRelevantPath.ps1');      Expected = $true }
+        @{ Name = 'legacy primary config';       Changed = @('BRAVO.config');                                   Expected = $true }
+        @{ Name = 'site config example';         Changed = @('BRAVO.local.config.example');                     Expected = $true }
+        @{ Name = 'mixed, one relevant';         Changed = @('README.md', 'CHANGELOG.md', 'modules/BRAVO.Configuration/x.psm1', 'docs/a.md'); Expected = $true }
+        @{ Name = 'mixed, none relevant';        Changed = @('README.md', 'CHANGELOG.md', 'docs/a.md');         Expected = $false }
+        @{ Name = 'empty change set';            Changed = @();                                                 Expected = $false }
+        # Наївна реалізація на StartsWith без роздільника сказала б
+        # "релевантно" — це не сусідній каталог, а інший каталог.
+        @{ Name = 'sibling directory prefix';    Changed = @('modules/BRAVO.ConfigurationBackup/x.psm1');       Expected = $false }
+        # git друкує "/", але локальний виклик і копіпаста дають "".
+        @{ Name = 'backslash separators';        Changed = @('modules\BRAVO.Configuration\x.psm1');            Expected = $true }
+        # Регістр: цільова файлова система регістронезалежна.
+        @{ Name = 'different case';              Changed = @('bravo_config_loader.ps1');                        Expected = $true }
+        # Файл із такою ж назвою, але в іншому каталозі, релевантним не є.
+        @{ Name = 'same name, other directory';  Changed = @('selftest/BRAVO_CONFIG_LOADER.ps1');               Expected = $false }
+    )
+
+    foreach ($relevanceCase in $relevanceCases) {
+        $caseDecision = Test-BRAVOConfigParityRelevantPath -ChangedPath @($relevanceCase.Changed)
+        Test-BRAVOCondition `
+            -Condition ($caseDecision.IsRelevant -eq $relevanceCase.Expected) `
+            -Name "ConfigParity/RelevantPathDecision ($($relevanceCase.Name))" `
+            -Failure ("Рішення про релевантність невірне для набору [$(@($relevanceCase.Changed) -join ', ')]: " +
+                "очікували IsRelevant=$($relevanceCase.Expected), отримали $($caseDecision.IsRelevant)")
+    }
+
+    # --- ConfigParity/RelevantPathDecisionReportsMatch ---
+    # "Не релевантно" без переліку розглянутих шляхів неможливо
+    # відрізнити від "перелік порожній через помилку", тому рішення несе
+    # причину, а не лише [bool].
+    $reportingDecision = Test-BRAVOConfigParityRelevantPath `
+        -ChangedPath @('README.md', 'modules/BRAVO.Configuration/x.psm1')
+    Test-BRAVOCondition `
+        -Condition (
+            @($reportingDecision.MatchedPath).Count -eq 1 -and
+            @($reportingDecision.MatchedPath)[0] -eq 'modules/BRAVO.Configuration/x.psm1' -and
+            @($reportingDecision.ConsideredPath).Count -eq 2
+        ) `
+        -Name "ConfigParity/RelevantPathDecisionReportsMatch" `
+        -Failure "Рішення мусить повідомляти, ЯКИЙ саме шлях збігся і скільки шляхів розглянуто"
+
+    # --- ConfigParity/RelevantPathDecisionSurvivesStrictModeCountAccess ---
+    # Той самий клас дефекту, що #212: 0-елементний результат, який під
+    # Set-StrictMode розгортається у $null, валить .Count із
+    # PropertyNotFoundException. Тут це означало б падіння задачі CI
+    # рівно на тих PR, які мали б завершитись N/A.
+    $emptyDecisionSucceeded = $false
+    try {
+        $emptyDecision = Test-BRAVOConfigParityRelevantPath -ChangedPath @()
+        $emptyDecisionSucceeded = (
+            @($emptyDecision.MatchedPath).Count -eq 0 -and
+            @($emptyDecision.ConsideredPath).Count -eq 0 -and
+            @($emptyDecision.Pattern).Count -gt 0 -and
+            -not $emptyDecision.IsRelevant
+        )
+    } catch {
+        $emptyDecisionSucceeded = $false
+    }
+    Test-BRAVOCondition `
+        -Condition $emptyDecisionSucceeded `
+        -Name "ConfigParity/RelevantPathDecisionSurvivesStrictModeCountAccess" `
+        -Failure "Порожній набір змінених файлів мусить давати валідний результат із доступним .Count, а не падати під Set-StrictMode"
+
+    # --- ConfigParity/RelevantPathDecisionAcceptsExplicitPattern ---
+    # Логіка зіставлення перевіряється окремо від канонічного переліку:
+    # інакше зміна переліку мовчки переписувала б і очікування тестів.
+    $syntheticDecision = Test-BRAVOConfigParityRelevantPath `
+        -ChangedPath @('some/dir/file.txt') -Pattern @('some/dir/**')
+    $syntheticNegative = Test-BRAVOConfigParityRelevantPath `
+        -ChangedPath @('some/dirother/file.txt') -Pattern @('some/dir/**')
+    Test-BRAVOCondition `
+        -Condition ($syntheticDecision.IsRelevant -and -not $syntheticNegative.IsRelevant) `
+        -Name "ConfigParity/RelevantPathDecisionAcceptsExplicitPattern" `
+        -Failure "Зіставлення за явним -Pattern працює невірно: префікс каталогу мусить враховувати роздільник"
+}
+
+# =====================================================================
 # Володіння site-конфігурацією при розкатці (#154, B6)
 # =====================================================================
 # Site-файл — стан ОПЕРАТОРА, комплект — стан вендора. Ці перевірки
