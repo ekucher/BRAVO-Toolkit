@@ -287,7 +287,7 @@ function Get-SetupConfiguration {
         # -ConfigPath — кожен дочірній процес сам виконує ту саму
         # AUTO-резолюцію проти власного RuntimeRoot (той самий контракт,
         # що BRAVO_TASKS_INSTALL.ps1, Секція 6).
-        ConfigPathArgument = if ($ConfigPathWasExplicit) { @('-ConfigPath', $resolvedPath) } else { @() }
+        ConfigPathArgument = if ($ConfigPathWasExplicit) { ,@('-ConfigPath', $resolvedPath) } else { ,@() }
         PrimaryConfigPresent = [bool]$global:BravoConfigurationMetadata.PrimaryConfigPresent
         Root = $runtimeRoot
         BackupRoot = [string]$global:backupRootPath
@@ -671,9 +671,9 @@ try {
     # перевіряємо стандартний безпечний набір Required для обох облікових записів.
     if ($Action -in @("Full", "Credentials", "Scheduler", "Test")) {
         $testComponents = if ($credentialWorkRequested) {
-            @($CredentialComponent)
+            ,@($CredentialComponent)
         } else {
-            @("Required")
+            ,@("Required")
         }
         $testStore = if ($credentialWorkRequested) { $StoreFor } else { "Both" }
         $credentialTestArguments = @($setup.ConfigPathArgument) + @(

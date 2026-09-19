@@ -528,9 +528,9 @@ function Test-DryRunWebhookCredential {
     # 'alerts' стояв першим). В errors_only GENERAL не перевіряється —
     # тестове повідомлення піде в ALERTS (єдиний активний канал режиму).
     $requiredRoutes = if ($NotificationMode -eq 'errors_only') {
-        @('alerts')
+        ,@('alerts')
     } else {
-        @('general', 'alerts')
+        ,@('general', 'alerts')
     }
     foreach ($route in $requiredRoutes) {
         $secret = $null

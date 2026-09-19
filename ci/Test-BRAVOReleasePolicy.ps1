@@ -232,7 +232,7 @@ $loaderPath = Join-Path $Root 'BRAVO_CONFIG_LOADER.ps1'
 . $loaderPath
 $gitChannel = Resolve-BRAVOReleaseChannelFromGit -ConfigRoot $Root
 if (-not [string]::IsNullOrWhiteSpace($gitChannel)) {
-    $expectedForGitChannel = if ($gitChannel -eq 'stable') { @('stable') } else { @('development', 'prerelease') }
+    $expectedForGitChannel = if ($gitChannel -eq 'stable') { ,@('stable') } else { ,@('development', 'prerelease') }
     if ($releaseChannel -notin $expectedForGitChannel) {
         Add-BRAVOReleasePolicyFailure "RELEASE_POLICY 5.4: .git/HEAD вказує на канал '$gitChannel', а VERSION.json містить '$releaseChannel' — одне з двох неправильне."
     }
