@@ -8,6 +8,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+try {
 Import-Module -Name (Join-Path $root "modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psd1") -Force -ErrorAction Stop
 
 function New-DiskSpaceTestDrive {
@@ -422,7 +423,11 @@ Test-BRAVOCondition `
     ) `
     -Name 'DiskSpace/S20-RemoteUnknownCapacityStopsArithmetic' `
     -Failure "remote CapacityState=Unknown має зупинити АРИФМЕТИКУ повністю (жодного ProjectedFreeGB/AggregatedRequiredGB порівняння з `$null)"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DiskSpace' -ErrorRecord $_
+}
 
+try {
 # ============================================================
 # S3 — notification wording: non-blocking Warning ніколи не формує текст
 # "операцію не розпочато"/CRITICAL (§51/§84.10). Warnings будуються лише
@@ -591,4 +596,7 @@ Test-BRAVOCondition `
         -Name 'DiskSpace/S65d-DegradedFloorNeverWeakensOperationalRequirement' `
         -Failure ("операційно потрібний малий том з недостатнім місцем має блокуватись як раніше (EstimatedRequirementNotMet); " +
             "отримано Blocks=$($s65d.Results[0].Blocks) Reason=$($s65d.Results[0].Reason)")
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DiskSpace #2' -ErrorRecord $_
 }

@@ -7,6 +7,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 -- НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+try {
     Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
 
     # --- Built-in default: ExcludedDrives = @() (розділ 5 ТЗ) ---
@@ -407,7 +408,11 @@
         if ($null -ne $discoveryOverrideBeforePath) { $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $discoveryOverrideBeforePath }
         Remove-Item -LiteralPath $discoveryOverrideTestRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Configuration' -ErrorRecord $_
+}
 
+try {
     # =====================================================================
     # BRAVO.Configuration.Delta — порівняння графів (#154, задача B0)
     # =====================================================================
@@ -761,7 +766,11 @@
             -Name "Delta/SiteDeltaToolNeverOverwrites" `
             -Failure "інструмент дельти мусить мати рівно один запис на диск (за -OutputPath) і відмовляти на наявному файлі"
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Delta' -ErrorRecord $_
+}
 
+try {
 # =====================================================================
 # BRAVO.Configuration.DataFile — невиконуючий парсер site-файлу
 # (#154, задача B1)
@@ -951,7 +960,11 @@
         -Name "DataFile/LoaderNoLongerInvokesSiteFile" `
         -Failure "Read-BRAVOLocalConfigurationOverrides мусить вилучати дані через ConvertFrom-BRAVOConfigurationDataFileText і не створювати/не викликати scriptblock site-файлу"
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataFile' -ErrorRecord $_
+}
 
+try {
 # =============================================================
 # #158 (етап 4): discovery overrides застосовуються ДО discovery
 # =============================================================
@@ -1233,7 +1246,11 @@
         Remove-Item -LiteralPath $preloadRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DiscoveryOverride' -ErrorRecord $_
+}
 
+try {
 # =====================================================================
 # BRAVO.Configuration.Schema — формальна схема Configuration v2 (#154, B2)
 # =====================================================================
@@ -1503,7 +1520,11 @@
         -Name "Schema/LoaderValidatesLocalLayerBeforeMerge" `
         -Failure "BRAVO_CONFIG_LOADER мусить валідувати типи site-шару ДО Resolve-BRAVORawConfiguration (validation=$schemaValidationIndex merge=$schemaMergeIndex)"
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Schema' -ErrorRecord $_
+}
 
+try {
 # =====================================================================
 # Версійний диспетч site-файлу (#154, B3)
 # =====================================================================
@@ -1760,7 +1781,11 @@
             -Failure "ci\Test-BRAVOConfigFoundationParity.ps1 має брати перелік імен з Get-BRAVOEffectiveConfigurationVariableName і не тримати власного літерального переліку; викликає=$snapshotHarnessCallsCanonical літерал=$snapshotHarnessHasLiteralList"
     }
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigVersion' -ErrorRecord $_
+}
 
+try {
 # =====================================================================
 # Configuration v2 Pilot Safety — синтетична матриця + наскрізний round-trip
 # (Configuration v2 Pilot Preparation, розгортає прогалини, знайдені
@@ -1956,4 +1981,7 @@
         ) `
         -Name "PilotSafety/CredentialReferenceNeverResolved" `
         -Failure "credentialSettings.SFTPPassword після повного конвеєра має лишатись ТОЧНО тим самим рядком-посиланням, що прийшов із legacy-фікстури ('BRAVO_SFTP_PASSWORD_PILOT_SITE'), не резолвнутим значенням; отримано '$($pilotAfter.credentialSettings.SFTPPassword)'"
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'PilotSafety' -ErrorRecord $_
 }

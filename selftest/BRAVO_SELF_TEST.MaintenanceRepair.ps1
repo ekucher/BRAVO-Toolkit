@@ -12,6 +12,7 @@
 # Успадковує з викликача: $root, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
 
+try {
 $maintenanceRepairScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -415,7 +416,11 @@ Test-BRAVOCondition `
     -Condition (-not $resultRootCaseMismatchSegment.HasCriticalChanges -and $resultRootCaseMismatchSegment.RemovedByRepairCount -eq 1) `
     -Name "Maintenance/CompareFileSizesRootCaseInsensitiveSegmentRemoved" `
     -Failure "при регістровому розсинхроні кореня зниклий сегмент .000 має класифікуватись RemovedByRepair(1), не CRITICAL; отримано HasCriticalChanges=$($resultRootCaseMismatchSegment.HasCriticalChanges), RemovedByRepairCount=$($resultRootCaseMismatchSegment.RemovedByRepairCount)"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Maintenance' -ErrorRecord $_
+}
 
+try {
 # --- Юніт-контракт Get-BRAVOModelRelativePath: регістронезалежний зріз
 # кореня, точний збіг -> '', шлях поза коренем -> без змін (fail-closed).
 $relativePathScenarios = @(
@@ -849,7 +854,11 @@ $legacySweepModule = New-BRAVOSelfTestRuntimeModule `
         'Read-BRAVOLegacySweepState',
         'Invoke-BRAVOLegacySweep'
     )
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Maintenance #2' -ErrorRecord $_
+}
 
+try {
 $legacySweepRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_LEGACY_SWEEP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
 try {
@@ -1095,4 +1104,7 @@ try {
     if (Test-Path -LiteralPath $legacySweepRootScopeRoot) {
         Remove-Item -LiteralPath $legacySweepRootScopeRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Maintenance #3' -ErrorRecord $_
 }

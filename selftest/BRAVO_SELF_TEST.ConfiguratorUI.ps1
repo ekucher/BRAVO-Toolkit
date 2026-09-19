@@ -15,6 +15,7 @@
 # Get-BRAVOConfiguratorSchemaCatalog (читає лише .psd1-каталог дескрипторів,
 # не production-конфіг) для перевірки 100%-покриття UI_REACHABLE.
 
+try {
 $configuratorUIModuleRoot = Join-Path $root 'modules\BRAVO.Configurator'
 Import-Module (Join-Path $configuratorUIModuleRoot 'BRAVO.Configurator.Schema.psm1') -Force
 Import-Module (Join-Path $configuratorUIModuleRoot 'BRAVO.Configurator.UI.psm1') -Force
@@ -435,7 +436,11 @@ foreach ($configuratorUIPathType in @('Path', 'UNCPath')) {
         "ConfiguratorUI P2-B regression (FAIL #11 follow-up): Type '$configuratorUIPathType' fail-closed на синтаксично некоректному шляху (не комітиться як default { return `$RawText })" `
         "Threw=$configuratorUIInvalidPathThrew"
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfiguratorUI (підготовка)' -ErrorRecord $_
+}
 
+try {
 # ===== 20: P2-B manual acceptance FAIL #11 (друга ітерація) — 'UNCPath'
 # вимагає ПОВНУ структурну UNC-форму (\\server\share[\subdir...]), не
 # лише префікс \\ (єдиний 'UNCPath'-дескриптор, smbSettings.RootPath, у
@@ -481,3 +486,6 @@ $configuratorUIPathSentinelResult = ConvertTo-BRAVOConfiguratorUITypedValue -Typ
 Test-BRAVOCondition ($configuratorUIPathSentinelResult -eq '123') `
     "ConfiguratorUI P2-B regression (FAIL #11, 2-га ітерація): Type 'Path' НЕ вимагає UNC-структуру (легальні абсолютні локальні шляхи/sentinel-значення на кшталт 'off')" `
     "Result='$configuratorUIPathSentinelResult'"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfiguratorUI (підготовка) #2' -ErrorRecord $_
+}

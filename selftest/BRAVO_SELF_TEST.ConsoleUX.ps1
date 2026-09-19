@@ -9,6 +9,7 @@
 # ConsoleUX-блоку. Той самий підхід, що й для ManifestStorage: локальні
 # read-only перечитування нижче (той самий вміст файлу, immutable протягом
 # self-test-прогону).
+try {
 $archiveScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -433,7 +434,11 @@ function Test-BRAVOSelfTestDuplicateDefinition {
         ) `
         -Name "ConsoleUX/26-SelfTestSummaryUsesDynamicPassCount" `
         -Failure "Перевірки: у operator summary мають братися з динамічного `$script:passCount (інкрементується в Test-BRAVOCondition), а не з hardcoded числа"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConsoleUX' -ErrorRecord $_
+}
 
+try {
     # 27. Один resolved exit code — обчислюється РІВНО один раз
     # ($script:selfTestExitCode) і використовується і для поля 'Код
     # завершення', і для Complete-BRAVOHelperLog -ExitCode; жодного
@@ -507,3 +512,6 @@ function Test-BRAVOSelfTestDuplicateDefinition {
         -Condition ($selfTestNoPauseElapsed.TotalSeconds -lt 2) `
         -Name "ConsoleUX/30-SelfTestNoPauseStillReturnsImmediately" `
         -Failure "Wait-BRAVOManualExit -NoPause (та сама функція, яку BRAVO_SELF_TEST.ps1 викликає наприкінці) має повертатися миттєво; зайняло $($selfTestNoPauseElapsed.TotalSeconds) с"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConsoleUX #2' -ErrorRecord $_
+}

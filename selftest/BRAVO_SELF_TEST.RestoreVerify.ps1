@@ -8,6 +8,7 @@
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures,
 # New-BRAVOSelfTestSchedulerFixtureConfig (fixture legacy-конфігів).
 
+try {
     Import-Module -Name (Join-Path $root 'modules\BRAVO.RestoreVerify\BRAVO.RestoreVerify.psd1') -Force
     Import-Module -Name (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psd1')
 
@@ -170,6 +171,11 @@
             "[IO.Path]::GetFileName([string]`$global:schedulerSettings.RestoreVerify.ScriptPath)"
         ) 2>&1
     $legacyRestoreVerifyProbeLast = ([string](@($legacyRestoreVerifyProbeOutput)[-1])).Trim()
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Scheduler' -ErrorRecord $_
+}
+
+try {
     Test-BRAVOCondition `
         -Condition (
             -not $legacyRestoreVerifyConfigText.Contains('RestoreVerify = @{') -and
@@ -178,3 +184,6 @@
         ) `
         -Name 'ConfigurationLoader/LegacyConfigSynthesizesRestoreVerifyDefaults' `
         -Failure "loader має синтезувати RestoreVerify-вузли для legacy-конфігів (Saturday/04:00/216/BRAVO_RESTORE_TEST.ps1 зі StrictMode без падінь); отримано: '$legacyRestoreVerifyProbeLast'"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigurationLoader' -ErrorRecord $_
+}

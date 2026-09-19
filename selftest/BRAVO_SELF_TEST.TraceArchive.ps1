@@ -7,6 +7,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
+try {
 $traceArchiveScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -106,7 +107,13 @@ function Get-BRAVODirectories {
     $traceArchiveTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_TRACE_ARCHIVE_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'TraceArchive (підготовка)' -ErrorRecord $_
+}
+
+try {
     try {
+        try {
         $taTrace = Join-Path $traceArchiveTestRoot "Trace"
         [void](New-Item -ItemType Directory -Path $taTrace -Force)
 
@@ -508,7 +515,11 @@ function Get-BRAVODirectories {
             [int]$taGraceOldResult.SourcesRetainedForGrace -eq 0 -and
             -not (Test-Path -LiteralPath $taGraceOldFile)
         ) -Name 'TraceArchive/RawSourceGraceDeletesOldVerifiedSource' -Failure "джерело старше grace-періоду має видалятись як завжди, попри встановлений RawSourceRetentionDays; факт: deleted=$($taGraceOldResult.SourcesDeleted) retained=$($taGraceOldResult.SourcesRetainedForGrace)"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'TraceArchive' -ErrorRecord $_
+        }
 
+        try {
         # ===== PR #136 review (P2-7): persisted completion state для
         # RawSourceGraceDays — без нього КОЖЕН прогін під час grace-вікна
         # re-verify+re-upload той самий незмінний daily-архів. =====
@@ -938,7 +949,11 @@ function Get-BRAVODirectories {
             $traceArchiveScriptText.Contains('$RAW_SOURCE_GRACE_DAYS = if ($MaintenanceConfig.Retention -is [System.Collections.IDictionary] -and') -and
             $traceArchiveScriptText.Contains('$MaintenanceConfig.Retention.Contains("RawSourceGraceDays")')
         ) -Name 'TraceArchive/RawSourceGraceDaysLegacyConfigDefaultsToZero' -Failure "RAW_SOURCE_GRACE_DAYS має захисно читатись через Contains-патерн (легасі-конфіг без ключа -> 0), а не прямим доступом під StrictMode"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'TraceArchive #2' -ErrorRecord $_
+        }
 
+        try {
         # ===== Узагальнений backlog: довільні basename (усі *.out) =====
         $taGenericBacklogDir = Join-Path $traceArchiveTestRoot "backlog-generic\Trace"
         [void](New-Item -ItemType Directory -Path $taGenericBacklogDir -Force)
@@ -1265,8 +1280,14 @@ function Get-BRAVODirectories {
             $taTasksInstallText -notmatch '(?i)BRAVO_TRACE' -and
             $taTasksInstallText -notmatch '(?i)TRACE_ROTATE|TRACE_UPLOAD'
         ) -Name 'TraceArchive/NoDedicatedTraceScheduledTask' -Failure "BRAVO_TASKS_INSTALL не повинен створювати окремих Trace-тасків — Trace обробляє лише BRAVO_MAINTENANCE"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'TraceArchive #3' -ErrorRecord $_
+        }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$traceArchiveTestRoot) -and (Test-Path -LiteralPath $traceArchiveTestRoot)) {
             Remove-Item -LiteralPath $traceArchiveTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'TraceArchive (фікстура)' -ErrorRecord $_
+}

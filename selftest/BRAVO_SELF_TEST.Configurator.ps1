@@ -26,6 +26,7 @@
 # зміною — явний LIMSRoot/BackupRoot замість AUTO (той самий text-replace
 # прийом, що ConfigLoader.ps1), а не реальний $root.
 
+try {
 $configuratorModuleRoot = Join-Path $root 'modules\BRAVO.Configurator'
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Schema.psm1') -Force
 Import-Module (Join-Path $configuratorModuleRoot 'BRAVO.Configurator.Effective.psm1') -Force
@@ -457,7 +458,11 @@ try {
     }
     Remove-Item -LiteralPath $configuratorBackupFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Configurator (підготовка)' -ErrorRecord $_
+}
 
+try {
 # ===== P2-A.1: hermetic AtomicReplace forced-failure (§Stage='AtomicReplace') =====
 # Crок 12 (Move-Item temp -> production) провалюється, якщо production-файл
 # відкритий БЕЗ FileShare.Delete — реальний, детермінований, без потреби у
@@ -867,7 +872,11 @@ Test-BRAVOCondition (-not $configuratorPreviewNoChangeResult.HasChanges) `
 
 $dirtyArrayPath = 'maintenanceSettings.Services.BravoDisplayName'
 $dirtyStringPath = 'consoleSettings.ConsoleLevel'
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Configurator (підготовка) #2' -ErrorRecord $_
+}
 
+try {
 # AD: чиста модель без overrides проти порожнього baseline -> Dirty=false
 $dirtyModelClean = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
 Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $dirtyModelClean -BaselineOverrides @{})) `
@@ -1087,3 +1096,6 @@ try {
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====
 Remove-Item -LiteralPath $configuratorFixtureRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Configurator (підготовка) #3' -ErrorRecord $_
+}

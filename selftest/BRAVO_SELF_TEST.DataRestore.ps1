@@ -6,6 +6,7 @@
 # baseline 93 тести DataRestore/*, рядки 7979-11279 оригінального файлу на
 # момент витягнення).
 
+try {
     # ============================================================
     # BRAVO_DATA_RESTORE (rc.2): поведінкові тести чистих функцій
     # відновлення даних. Функції витягуються з runtime за AST в
@@ -424,7 +425,11 @@ function Stop-Process {
             Remove-Item -LiteralPath $verifyTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore' -ErrorRecord $_
+}
 
+try {
     # --- 6. P1-a: крос-компонентний rollback InPlace ---
     # Збій одного компонента не має лишати production зі змішаними
     # generation: вже відновлені компоненти цього прогону повертаються
@@ -869,7 +874,11 @@ function Stop-Process {
             Remove-Item -LiteralPath $moveAsideFailureRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #2' -ErrorRecord $_
+}
 
+try {
     # --- 6.3. Restore safety review (PR #40): відкат САМОГО поточного
     # компонента, що провалився, теж може не завершитись — статус має
     # явно стати ROLLBACK_FAILED (не generic FAILED), а PrerestoreDirectory
@@ -1333,7 +1342,11 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $sftpFetchTestRoot2 -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #3' -ErrorRecord $_
+}
 
+try {
     # --- 6.8. Second restore safety review (PR #40): Local manifest identity
     # (canonical Get-BRAVORestoreGenerationManifest, BRAVO.ArchiveHelpers —
     # спільний з BRAVO_RESTORE_TEST.ps1, тому виправлення тут закриває обидва
@@ -1750,7 +1763,11 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         ) `
         -Name "DataRestore/GenerationIdSuffixOverflowNeverThrows" `
         -Failure "Test-BRAVODataRestoreGenerationIdFormat має приймати suffix у межах Int32 (напр. 2147483647) і відхиляти будь-який суфікс поза цим діапазоном як недопустимий формат; Get-BRAVODataRestoreGenerationIdSortKey не повинен кидати OverflowException навіть при виклику напряму з недовіреним suffix — некоректний формат трактується як найстаріший ключ, а не crash"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #4' -ErrorRecord $_
+}
 
+try {
     # --- 6.19d. Fourth restore safety review (PR #40): недовірений
     # component.ArchiveSize (SFTP manifest) — відсутнє/нульове/від'ємне/
     # нечислове значення відхиляється ДО участі в free-space preflight. ----
@@ -2203,7 +2220,11 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $bindingTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #5' -ErrorRecord $_
+}
 
+try {
     # ================================================================
     # Fifth restore safety review (PR #40): 5 нових findings (1 P1, 4 P2)
     # понад попередні 25. Усі тести нижче — детерміновані, ізольовані
@@ -2625,7 +2646,11 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Invoke-BRAVODataRestoreQuiescence -Snapshot $snap -StopTimeoutSeconds $stopT -PollIntervalSeconds $poll
         } $Snapshot $StopTimeout $PollInterval
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #6' -ErrorRecord $_
+}
 
+try {
     # A: служба вже Stopped, orphan-процес живий -> процес завершується
     # навіть без потреби зупиняти службу.
     [void](& $quiescenceSetStateInvoke $dataRestoreModule 'SVC_Q_A' 'Stopped')
@@ -3077,7 +3102,11 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Remove-Item -LiteralPath $aliasProtectedLive -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #7' -ErrorRecord $_
+}
 
+try {
     # --- 7.5. P2: локальні артефакти мають переживати relocation
     # backup-root — leaf-ім'я з manifest-шляху (недовірений вхід)
     # переприв'язується до ПОТОЧНОГО canonical каталогу компонента, а не
@@ -3557,7 +3586,11 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Condition (-not $dataRestoreRuntimeTextForTests.Contains('storageEffective')) `
         -Name "DataRestore/SftpRestoreDoesNotDependOnGlobalStorageSwitch" `
         -Failure "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1 не повинен посилатися на storageEffective — явний -Source SFTP лишається доступним незалежно від componentSettings.SFTP.Enabled (disaster recovery не має ставати заручником master-вимикача автоматичних операцій)"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #8' -ErrorRecord $_
+}
 
+try {
     $bazaReconcileScriptTextForStorageSwitch = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO_BAZA_RECONCILE.ps1"),
         [Text.Encoding]::UTF8
@@ -3566,3 +3599,6 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Condition (-not $bazaReconcileScriptTextForStorageSwitch.Contains('storageEffective')) `
         -Name "DataRestore/BazaReconcileDoesNotDependOnGlobalStorageSwitch" `
         -Failure "BRAVO_BAZA_RECONCILE.ps1 (операторський, ручний виклик) не повинен посилатися на storageEffective — узгодження мутацій має лишатися доступним незалежно від componentSettings.SFTP.Enabled"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'DataRestore #9' -ErrorRecord $_
+}

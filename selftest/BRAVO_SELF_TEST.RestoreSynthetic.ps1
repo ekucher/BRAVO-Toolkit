@@ -20,6 +20,7 @@
 # Успадковує з викликача: $root, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
 
+try {
 Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
 Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
 Import-Module -Name (Join-Path $root "modules\BRAVO.Notifications\BRAVO.Notifications.psd1") -Force -ErrorAction Stop
@@ -431,4 +432,7 @@ Test-BRAVOCondition `
     -Name "RestoreSynthetic/ServiceRestartGatedByIntegrity" `
     -Failure 'рестарт BRAVO має бути гейтований на $script:modelIntegrityEstablished, а recovery — через Invoke-BRAVOModelRestoreRecovery'
 
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'RestoreSynthetic' -ErrorRecord $_
 }

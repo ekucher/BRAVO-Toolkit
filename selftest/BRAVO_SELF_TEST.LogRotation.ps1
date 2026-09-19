@@ -18,6 +18,7 @@
 #
 # ПРИХОВАНА ЗАЛЕЖНІСТЬ: $maintenanceScriptText -- локальне перечитування
 # (той самий вміст файлу, immutable протягом self-test-прогону).
+try {
 $maintenanceScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -74,7 +75,13 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
     $rotationTestRoot = Join-Path `
         -Path ([IO.Path]::GetTempPath()) `
         -ChildPath ("BRAVO_LOG_ROTATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'LogRotation (підготовка)' -ErrorRecord $_
+}
+
+try {
     try {
+        try {
         [void][IO.Directory]::CreateDirectory($rotationTestRoot)
         $rotationLogMessages = New-Object System.Collections.Generic.List[string]
         $rotationLogger = {
@@ -489,7 +496,11 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/07b-TraceTimestampCollisionTakesNextSecond" `
             -Failure "колізія timestamp-імені має розв'язуватися наступною вільною секундою (183006), існуючий файл не перезаписується"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'LogRotation' -ErrorRecord $_
+        }
 
+        try {
         # --- Test 8: порожній Trace лишається в джерелі ---
         $test8Source = Join-Path $rotationTestRoot "test08\src"
         $test8Destination = Join-Path $rotationTestRoot "test08\dst"
@@ -901,7 +912,11 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/18-NoOverwriteOfExistingLog" `
             -Failure "наявний файл призначення не можна перезаписувати: потрібен новий MAX+1 і жодного Move-Item -Force"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'LogRotation #2' -ErrorRecord $_
+        }
 
+        try {
         # --- Test 19: структурований результат і перевірка після move ---
         $test19Source = Join-Path $rotationTestRoot "test19\src"
         $test19Destination = Join-Path $rotationTestRoot "test19\dst"
@@ -1315,7 +1330,11 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/LegacyExchangeApiOldSequenceCompatibility" `
             -Failure "стара поведінка для СПРАВЖНІХ legacy sequence-імен (exchangAPI_3.log) має лишитись незмінною: каталог-дата за LastWriteTime + sequence engine (exchangAPI_1.log), той самий контракт, що LogRotation/23"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'LogRotation #3' -ErrorRecord $_
+        }
 
+        try {
         # --- Test 24h: детектор timestamped-імені узгоджений з тим, які
         # файли поточна (НЕ-legacy) ротація exchangAPI взагалі вважає своїми ---
         $test24hPositive = @(
@@ -1461,8 +1480,14 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
             ) `
             -Name "LogRotation/27-ServiceRestorationIsIndependentOfRotation" `
             -Failure "ротація має виконуватись усередині try, а відновлення служб — у finally за збереженим початковим станом: помилка ротації не може залишити служби зупиненими"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'LogRotation #4' -ErrorRecord $_
+        }
     } finally {
         if (Test-Path -LiteralPath $rotationTestRoot) {
             Remove-Item -LiteralPath $rotationTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'LogRotation (фікстура)' -ErrorRecord $_
+}

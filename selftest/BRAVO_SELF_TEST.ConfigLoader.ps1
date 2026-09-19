@@ -14,6 +14,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 — НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+try {
 $configLoaderPath = Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'
 $configLoaderScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("BRAVO_CONFIG_LOADER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
@@ -499,6 +500,11 @@ try {
 } finally {
     Remove-Item -LiteralPath $successDedupScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigLoader' -ErrorRecord $_
+}
+
+try {
 # ============================================================
 # componentSettings.SFTP.Enabled / SMB.Enabled (5.2.2): глобальні
 # master-вимикачі зовнішніх сховищ. Loader-нормалізація (відсутній ключ =
@@ -927,7 +933,11 @@ try {
 } finally {
     Remove-Item -LiteralPath $noConfigScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigLoader #2' -ErrorRecord $_
+}
 
+try {
 # ============================================================
 # P0 Configuration Foundation (PR C, Секція 4): МЕХАНІЧНИЙ parity-тест —
 # ОДИН і той самий BRAVO.local.config має давати ОДНАКОВИЙ accept/reject
@@ -1331,7 +1341,11 @@ Test-BRAVOCondition `
     -Name 'ConfigLoader/LocalConfigLeafSemanticsDocumentedAccurately' `
     -Failure ("документація BRAVO.local.config мусить описувати несиметричну суворість dot-шляху (батьківські сегменти — fail-closed, leaf — forward-compat): " +
         (($leafDocProblems.ToArray()) -join '; '))
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigLoader #3' -ErrorRecord $_
+}
 
+try {
 # ============================================================
 # #154 (A3/F1): симетрія ДІАГНОСТИКИ primary-шару.
 # ============================================================
@@ -1496,4 +1510,7 @@ Test-BRAVOCondition `
     } finally {
         Remove-Item -LiteralPath $strictnessBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'PrimaryStrictness' -ErrorRecord $_
 }

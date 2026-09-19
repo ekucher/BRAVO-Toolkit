@@ -4,6 +4,7 @@
 # напряму. Успадковує з викликача: $root, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
 
+try {
     # ============================================================
     # State round-trip (BRAVO.System): реальні Write/Read/Clear/
     # Suppress у TEMP-каталозі — Get-BRAVOServiceQuiescenceStatePath
@@ -426,7 +427,11 @@ function Invoke-BRAVOSelfTestQuiescenceScenario {
         ) `
         -Name "ServiceQuiescence/WatchdogKeepsMarkerOnPartialStartFailure" `
         -Failure "частковий збій старту: маркер зберігається для повтору, issue перелічує невдалі служби"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ServiceQuiescence' -ErrorRecord $_
+}
 
+try {
     # (е) РЕГРЕСІЯ (review F2, TOCTOU): між першим Read і Start-Service
     # маркер перезаписав НОВИЙ власник (Maintenance о 23:55 перетнувся з
     # Health) або маркер зник — watchdog МУСИТЬ вийти без жодної дії
@@ -754,3 +759,6 @@ function Get-Service {
         -Condition ($watchdogFunctionBlock.Contains('Get-BRAVOQuiescenceWatchdogAllowedServiceNames')) `
         -Name "ServiceQuiescence/WatchdogConsultsManagedServiceWhitelist" `
         -Failure "watchdog має фільтрувати служби маркера через Get-BRAVOQuiescenceWatchdogAllowedServiceNames перед Start-Service"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ServiceQuiescence #2' -ErrorRecord $_
+}

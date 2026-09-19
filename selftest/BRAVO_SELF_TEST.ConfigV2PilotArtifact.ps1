@@ -1,5 +1,6 @@
 ﻿#requires -Version 3.0
 
+try {
 # BRAVO_SELF_TEST.ConfigV2PilotArtifact.ps1 — end-to-end і failure-injection
 # тест pilot-артефакту Configuration v2 (deploy\New-BRAVOConfigV2PilotArtifact.ps1,
 # deploy\Start-BRAVOConfigV2Pilot.ps1, deploy\BRAVOConfigV2Pilot.Runtime.ps1,
@@ -241,8 +242,13 @@ $sourceHashesBefore = @{}
 foreach ($rel in $sourceFilesToWatch) {
     $sourceHashesBefore[$rel] = (Get-FileHash -LiteralPath (Join-Path $script:repoRoot $rel) -Algorithm SHA256).Hash
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigV2PilotArtifact (підготовка)' -ErrorRecord $_
+}
 
 try {
+try {
+    try {
     # =========================================================================
     # 1) Build + verify artifact
     # =========================================================================
@@ -502,7 +508,11 @@ try {
     Test-BRAVOPilotSelfTestThrows -Name 'Security/CandidateRealVariableStillRejected' -ScriptBlock {
         Test-BRAVOPilotCandidateSyntax -CandidatePath $f5cCandidatePath
     } -ExpectedMessagePattern 'PILOT_CANDIDATE_INVALID'
+    } catch {
+        Register-BRAVOSelfTestSectionFault -Section 'Happy' -ErrorRecord $_
+    }
 
+    try {
     # F6: wrong type / F7: unknown parent — симулюються через стаб SETUP, що
     # відмовляє (реальний BRAVO_SETUP.ps1 -ValidateOnly ловить обидва класи
     # помилок через canonical Configuration-схему; тут перевіряється, що
@@ -864,7 +874,11 @@ try {
     # каталог backup-*, а не читає metadata.json.State).
     $f16RollbackOutput = & $startScript -Rollback -InstallRoot $f16Install -EvidenceDir $f16EvidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'FailureInjection/RollbackAvailableAfterActivationFailure' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($f16RollbackOutput | Select-Object -Last 5)))
+    } catch {
+        Register-BRAVOSelfTestSectionFault -Section 'FailureInjection' -ErrorRecord $_
+    }
 
+    try {
     # =========================================================================
     # F17: взаємне виключення mutating-операцій над одним -InstallRoot
     # (§concurrency-triage) — Enter-/Exit-BRAVOPilotInstallRootLock через
@@ -937,6 +951,9 @@ Exit-BRAVOPilotInstallRootLock -Mutex `$m
     $f17RetryOutput = & $startScript -Activate -InstallRoot $f17aInstall -EvidenceDir $f17aEvidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Concurrency/ActivateSucceedsAfterLockReleased' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($f17RetryOutput | Select-Object -Last 5)))
 
+    } catch {
+        Register-BRAVOSelfTestSectionFault -Section 'Concurrency' -ErrorRecord $_
+    }
 } catch {
     # Неперехоплена помилка десь у сценарії — це саме по собі провал
     # тесту, а не привід мовчки перервати прогін без summary/exit-коду.
@@ -953,7 +970,11 @@ Exit-BRAVOPilotInstallRootLock -Mutex `$m
 
     Remove-Item -LiteralPath $tempRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'FailureInjection (фікстура)' -ErrorRecord $_
+}
 
+try {
 Write-Host ''
 Write-Host ('=' * 70)
 Write-Host ("Усього перевірок: {0}; провалено: {1}" -f $script:total, $script:failedCount)
@@ -964,3 +985,6 @@ if ($script:failedCount -gt 0) {
 }
 Write-Host 'SELF-TEST PASSED' -ForegroundColor Green
 exit 0
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigV2PilotArtifact (підготовка) #2' -ErrorRecord $_
+}

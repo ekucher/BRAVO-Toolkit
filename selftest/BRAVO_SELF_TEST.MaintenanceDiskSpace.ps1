@@ -22,6 +22,7 @@
 # Успадковує з викликача: $root, Test-BRAVOCondition,
 # New-BRAVOSelfTestRuntimeModule, $script:failures.
 
+try {
 Import-Module -Name (Join-Path $root "modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psd1") -Force -ErrorAction Stop
 
 $maintenanceScriptTextForDiskSpace = [IO.File]::ReadAllText(
@@ -412,4 +413,7 @@ Remove-Item -LiteralPath $maintenanceDiskSpaceLogTempFile -Force -ErrorAction Si
         ) `
         -Name 'Maintenance/PreflightStepStatusIsDerivedFromCounters' `
         -Failure "крок 'Перевірка вільного місця' мусить брати статус з Get-BRAVOMaintenanceStepStatus за зрізом лічильників, а не зі сталого 'OK' (#175)"
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Maintenance' -ErrorRecord $_
 }

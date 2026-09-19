@@ -7,6 +7,7 @@
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 -- НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 
+try {
     Import-Module -Name (Join-Path $root 'modules\BRAVO.Status\BRAVO.Status.psd1') -Force
 
     # --- Roundtrip + деривація status + fail-closed читання ---
@@ -120,3 +121,6 @@
             -Name "Status/CallSiteIsFailSoft[$($statusCallSite.Label)]" `
             -Failure "$($statusCallSite.Path): Write-BRAVOOperationStatus має стояти ПІСЛЯ обчислення exit code і всередині try/catch (fail-soft; телеметрія не змінює результат операції)"
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Status' -ErrorRecord $_
+}

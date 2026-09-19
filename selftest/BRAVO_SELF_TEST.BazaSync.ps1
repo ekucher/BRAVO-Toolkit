@@ -5,6 +5,7 @@
 # розбиття, characterization baseline: 164 тести BazaSync/*, рядки
 # 18518-20376 оригінального файлу на момент витягнення).
 
+try {
     # =====================================================================
     # BAZA SYNC: incremental append-only synchronization engine
     # (BRAVO.BazaSync) -- Sync Cycle/Cutoff, persisted state, Fast Health
@@ -12,6 +13,7 @@
     # regression. Categories A-G per safety-review specification.
     # =====================================================================
     try {
+        try {
         Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveRuntime\BRAVO.ArchiveRuntime.psd1") -Force -ErrorAction Stop
         Import-Module -Name (Join-Path $root "modules\BRAVO.BazaSync\BRAVO.BazaSync.psd1") -Force -ErrorAction Stop
@@ -418,7 +420,11 @@
         $aaOverResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $aaOverLocal -RemoteRootPath '/baza_app' -Session $aaOverSession1 -StateRoot $aaOverState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
         Test-BRAVOCondition -Condition ($aaOverResult1.Status -eq 'COMPLETE' -and $aaOverResult1.Uploaded -eq 2) `
             -Name 'BazaSync/AutoArchiveOverThresholdSetupInitialUploadSucceeds' -Failure 'setup: обидва початкові upload мають пройти успішно'
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'BazaSync' -ErrorRecord $_
+        }
 
+        try {
         [IO.File]::WriteAllBytes($aaOverFile1, (New-Object byte[] 150))
         [IO.File]::WriteAllBytes($aaOverFile2, (New-Object byte[] 150))
         $aaOverSession2 = New-BRAVOSelfTestFakeBazaSession
@@ -793,7 +799,11 @@
         $drP13BadLock = Enter-BRAVOBazaSyncLock -StateRoot (Join-Path $bazaSyncTestRoot "DR_P13_BAD`0X") -Component 'BAZA_APP'
         Test-BRAVOCondition -Condition ($drP13BadLock.Success -eq $false -and $drP13BadLock.Classification -eq 'Error') `
             -Name 'BazaSync/LockGenericIoFailureIsError' -Failure "невалідний шлях має Classification=Error; Success=$($drP13BadLock.Success) Classification=$($drP13BadLock.Classification)"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'BazaSync #2' -ErrorRecord $_
+        }
 
+        try {
         # інфраструктурний збій lock у session-обгортці -> Status=ERROR -> Health issue
         # (WinSCP не потрібен: збій lock відбувається ДО відкриття сесії)
         $drP13SessionResult = Invoke-BRAVOBazaComponentSyncSession `
@@ -1172,7 +1182,11 @@
 
         Test-BRAVOCondition -Condition ((Test-BRAVOBazaRemoteNameCompatibility -RelativePath ('a' * 246)).Compatible -eq $true) `
             -Name 'BazaSync/FileName246Utf8BytesAccepted' -Failure "ім'я файлу рівно в 246 UTF-8 байтів має проходити (246 = 255 - 9 байт '.filepart')"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'BazaSync #3' -ErrorRecord $_
+        }
 
+        try {
         # 247 байтів: чиста перевірка на ASCII-рядку + поведінкова на
         # РЕАЛЬНОМУ файлі (123 кириличні + 1 ASCII = 247 UTF-8 байтів, але
         # лише 124 символи -- безпечно для Windows MAX_PATH)
@@ -1602,7 +1616,11 @@
             [string]$hr4PerStateAfter.State.LastSuccessfulSyncUtc -ceq $hr4PerProvenanceUtc -and
             [string]$hr4PerStateAfter.State.LastFullAuditUtc -cne $hr4PerAuditUtcBefore
         ) -Name 'BazaSync/AuditPendingDoesNotAdvanceLastSuccessfulSyncUtc' -Failure "AUDIT_DRIFT: LastSuccessfulSyncUtc НЕ просувається, але LastFullAuditUtc МОЖЕ (audit успішно завершився і виявив drift -- свіжість аудиту != успіх синхронізації); Provenance=$($hr4PerStateAfter.State.LastSuccessfulSyncUtc) було=$hr4PerProvenanceUtc AuditUtc=$($hr4PerStateAfter.State.LastFullAuditUtc)"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'BazaSync #4' -ErrorRecord $_
+        }
 
+        try {
         # audit підтвердив збіг -> сідиться Verified без жодного upload
         $hr4SeedRoot = Join-Path $bazaSyncTestRoot "HR4_Seed"
         $hr4SeedLocal = Join-Path $hr4SeedRoot "local"
@@ -2006,7 +2024,11 @@
 
         Test-BRAVOCondition -Condition ($hr6MkCycleDHealth.Healthy -eq $false) `
             -Name 'BazaSync/CrashBetweenAuditAndFinalStateSaveCannotBecomeHealthy' -Failure "crash між audit і фінальним збереженням НІКОЛИ не дає Healthy на наступному циклі; Healthy=$($hr6MkCycleDHealth.Healthy)"
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'BazaSync #5' -ErrorRecord $_
+        }
 
+        try {
         # Archive на pending-стані: реконсиляція примусова (без -ForceFullAudit),
         # маркер знімається лише після успішного фінального збереження
         $hr6MkMatchProbe = @{ Invoked = 0 }
@@ -2267,8 +2289,14 @@
         Test-BRAVOCondition -Condition (
             $mrReconcileEntrypointText -match '\$acceptList\s*=\s*@\(if\s'
         ) -Name 'BazaSync/ReconcileAcceptListAssignmentStaysArrayWrapped' -Failure 'BRAVO_BAZA_RECONCILE: $acceptList має присвоюватися як @(if ...) — if-вираз без обгортки розгортає одноелементний масив у скаляр і .Count падає під StrictMode 2.0'
+        } catch {
+            Register-BRAVOSelfTestSectionFault -Section 'BazaSync #6' -ErrorRecord $_
+        }
     } finally {
         if (-not [string]::IsNullOrWhiteSpace([string]$bazaSyncTestRoot) -and (Test-Path -LiteralPath $bazaSyncTestRoot)) {
             Remove-Item -LiteralPath $bazaSyncTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'BazaSync (фікстура)' -ErrorRecord $_
+}

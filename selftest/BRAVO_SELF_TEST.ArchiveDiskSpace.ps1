@@ -33,6 +33,7 @@
 #         storage-kind-агностичний, крок 6). SFTP-мітка на дублі цих же
 #         гілок не додає покриття, лише назву.
 
+try {
 Import-Module -Name (Join-Path $root "modules\BRAVO.DiskSpace\BRAVO.DiskSpace.psd1") -Force -ErrorAction Stop
 
 $archiveSpaceDecisionModule = New-BRAVOSelfTestRuntimeModule `
@@ -363,3 +364,6 @@ Test-BRAVOCondition `
     ) `
     -Name 'Archive/SpaceDecisionWiredIntoFreeSpaceCheck' `
     -Failure 'Resolve-BRAVOArchiveSpaceDecision має викликатися в тому самому preflight-кроці, ПІСЛЯ фіксованого порогу і розрахункової оцінки, ДО обчислення підсумкового Reason; стара Merge-BRAVOArchiveSpaceCheckResults має бути видалена, не залишена паралельно'
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Archive' -ErrorRecord $_
+}

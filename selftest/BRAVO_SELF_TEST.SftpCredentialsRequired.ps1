@@ -9,6 +9,7 @@
 # Реальний, вже імпортований production-модуль — жодних stub/fixture не
 # потрібно, функція чиста (лише булеві параметри, без I/O).
 
+try {
 Import-Module -Name (Join-Path $root `
     'modules\BRAVO.Configuration\BRAVO.Configuration.Derivation.psd1') -ErrorAction Stop
 
@@ -97,3 +98,6 @@ Test-BRAVOCondition -Condition (
     $sftpPredicateCallSiteCounts[2] -eq 1
 ) -Name 'SftpCredentialsRequired/AllFourCallSitesUseCanonicalFunction' `
     -Failure "очікувано: BRAVO_DRY_RUN.ps1=2, BRAVO_CREDENTIALS_SETUP.ps1=1, BRAVO.Configurator.Credentials.psm1=1 виклики Test-BRAVOSftpCredentialsRequired; факт: $($sftpPredicateCallSiteCounts -join ',')"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'SftpCredentialsRequired' -ErrorRecord $_
+}

@@ -8,6 +8,7 @@
 # напряму, тому цього не бачив. Dot-sourced з BRAVO_SELF_TEST.ps1 —
 # успадковує $root, Test-BRAVOCondition, New-BRAVOSelfTestRuntimeModule.
 
+try {
 # ===== E2E: реальні root-entrypoints + stub-runtime =====
 # Кожен сценарій запускає СПРАВЖНІЙ root <EP>.ps1 у fixture-каталозі зі
 # СПРАВЖНІМ BRAVO_RUNTIME_GUARD.ps1; runtime-модуль підмінений стабом, що
@@ -430,6 +431,11 @@ $configIntentHealthParamNames = @(
     $configIntentHealthCheckAst.Body.ParamBlock.Parameters |
         ForEach-Object { $_.Name.VariablePath.UserPath }
 )
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigIntent' -ErrorRecord $_
+}
+
+try {
 # Порядок exported-контракту ДО PR #134 (origin/developer) — не змінювати.
 $configIntentHealthBaselineOrder = @(
     'ConfigPath', 'ForceNotification', 'NotifyOnSuccess', 'NoSlack',
@@ -862,7 +868,11 @@ foreach ($probeCaseName in @($probeCases.Keys | Sort-Object)) {
         }
     }
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ConfigIntent #2' -ErrorRecord $_
+}
 
+try {
 # ===== Regression: SYSTEM worker без VersionState self-test relay =====
 # Review PR #137: BRAVO_CREDENTIALS_SETUP.ps1 не підключає
 # BRAVO_RUNTIME_GUARD.ps1, не викликає Test-BRAVOVersionDowngrade і не
@@ -912,3 +922,6 @@ Test-BRAVOCondition `
         'команду -File BRAVO_CREDENTIALS_SETUP.ps1 зі збереженими ' +
         '-ConfigPath (за наміром) / -ProtectedPayloadPath / -ResultPath'
     )
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Credentials' -ErrorRecord $_
+}

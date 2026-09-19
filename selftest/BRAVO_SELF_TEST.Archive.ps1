@@ -13,6 +13,7 @@
 # фрагменти цього self-test-у роблять для контрактів, які нереально
 # відтворити без повного продакшн-оточення.
 
+try {
 $archiveScriptPath = Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
 $archiveScriptText = [IO.File]::ReadAllText($archiveScriptPath, [Text.Encoding]::UTF8)
 
@@ -264,3 +265,6 @@ Test-BRAVOCondition -Condition (
     ([Text.RegularExpressions.Regex]::Match($archiveScriptText, '(?s)function Invoke-BRAVOArchiveOwnLogUpload \{.*?\n\}\r?\n')).Value -notmatch '\$script:processExitCode\s*='
 ) -Name 'Archive/OwnLogUploadNeverAssignsProcessExitCode' `
     -Failure "Invoke-BRAVOArchiveOwnLogUpload — другорядний/телеметричний ефект і не повинен присвоювати `$script:processExitCode"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Archive' -ErrorRecord $_
+}

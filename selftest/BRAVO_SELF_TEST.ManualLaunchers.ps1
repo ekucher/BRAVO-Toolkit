@@ -10,6 +10,7 @@
 # source-text змінні, вперше прочитані набагато раніше в монолітному файлі.
 # Локальні перечитування нижче (той самий вміст файлу, immutable протягом
 # self-test-прогону).
+try {
 $setupTextForDiscovery = [IO.File]::ReadAllText(
     (Join-Path $root "BRAVO_SETUP.ps1"),
     [Text.Encoding]::UTF8
@@ -64,7 +65,13 @@ $archiveScriptText = [IO.File]::ReadAllText(
         $manualLauncherRoot = Join-Path $manualLauncherTempBase (
             'BRAVO_MANUAL_LAUNCHERS_{0}' -f [guid]::NewGuid().ToString('N')
         )
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ManualLaunchers' -ErrorRecord $_
+}
+
+try {
         try {
+            try {
             $manualRuntimeOne = Join-Path $manualLauncherRoot 'Runtime One'
             $manualRuntimeTwo = Join-Path $manualLauncherRoot 'Runtime Two'
             $manualConfigDirectory = Join-Path $manualLauncherRoot 'Config Path'
@@ -396,6 +403,12 @@ $archiveScriptText = [IO.File]::ReadAllText(
                 ) `
                 -Name 'ManualLaunchers/ExplicitModeEmbedsExactConfigPathInGeneratedContent' `
                 -Failure 'EXPLICIT ConfigPathWasExplicit=$true має генерувати .cmd launcher з рівно одним точним -ConfigPath "<path>" у тексті'
+            } catch {
+                Register-BRAVOSelfTestSectionFault -Section 'ManualLaunchers #2' -ErrorRecord $_
+            }
         } finally {
             Remove-Item -LiteralPath $manualLauncherRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ManualLaunchers (фікстура)' -ErrorRecord $_
+}

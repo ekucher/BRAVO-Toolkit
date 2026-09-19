@@ -7,6 +7,7 @@
 # source-text змінні, вперше прочитані набагато раніше в монолітному файлі.
 # Локальні перечитування нижче (той самий вміст файлу, immutable протягом
 # self-test-прогону).
+try {
 $archiveScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -204,3 +205,6 @@ $maintenanceScriptText = [IO.File]::ReadAllText(
         -Condition $backupCompositionSafe `
         -Name "Paths/15-BackupCompositionOnAbsentDriveDoesNotThrow" `
         -Failure "побудова BackupRoot і призначень на відсутньому диску (Q:) не має кидати DriveNotFoundException — лише [IO.Path]::Combine, без Join-Path"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Paths' -ErrorRecord $_
+}

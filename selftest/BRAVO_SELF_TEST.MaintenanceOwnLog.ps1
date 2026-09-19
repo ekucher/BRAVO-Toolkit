@@ -12,6 +12,7 @@
 # самий прийом, що BRAVO_SELF_TEST.Archive.ps1 використовує для
 # Invoke-BRAVOArchiveOwnLogUpload.
 
+try {
 Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
 
 $maintenanceOwnLogScriptPath = Join-Path $root 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'
@@ -224,3 +225,6 @@ Test-BRAVOCondition (
     -Failure "живий файл змінився ПІСЛЯ снімку (симуляція служби BRAVO) — вивантажений вміст має лишитись ОРИГІНАЛЬНИМ (знятим до мутації); факт: sendCalls=$($maintOwnLogRaceResult.SendCalls) uploadedContent='$([string]$maintOwnLogRaceResult.SendCallContents[1])' liveContentAfter='$maintOwnLogLiveContentAfter'"
 
 Remove-Item -LiteralPath $maintenanceOwnLogTestRoot -Recurse -Force -ErrorAction SilentlyContinue
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Maintenance' -ErrorRecord $_
+}

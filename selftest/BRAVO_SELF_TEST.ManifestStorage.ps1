@@ -10,6 +10,7 @@
 # самого ManifestStorage-блоку. Замість крихкої міжфайлової залежності —
 # локальні read-only перечитування нижче (той самий вміст файлу, immutable
 # протягом self-test-прогону; ідентичне значення, лише додаткова I/O-операція).
+try {
 $archiveScriptText = [IO.File]::ReadAllText(
     (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
     [Text.Encoding]::UTF8
@@ -443,7 +444,11 @@ function Write-BRAVOLog {
             Remove-Item -LiteralPath $retentionCleanupTestRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ManifestStorage' -ErrorRecord $_
+}
 
+try {
     # --- Retention Safety Invariants (roadmap Етап 4): пошкоджена НАЙНОВІША
     # generation (manifest каже COMPLETE, але байти archive змінені після
     # запису .sha512) не повинна витісняти справді валідну СТАРІШУ
@@ -823,3 +828,6 @@ function Write-BRAVOLog {
         ) `
         -Name "ManifestStorage/MaintenanceMigrationCallSiteIsNonFatal" `
         -Failure "виклик Initialize-BRAVOBackupManifestStorage у Maintenance не повинен мати exit поруч — невдала міграція не має блокувати Maintenance"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ManifestStorage #2' -ErrorRecord $_
+}

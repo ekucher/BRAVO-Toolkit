@@ -9,6 +9,7 @@
 # Зовнішніх source-text залежностей не має: всі документи й конфіги
 # читаються локально в цьому фрагменті.
 
+try {
     # P2.4 аудиту: SECURITY.md — обов'язковий, легко забути оновити після
     # security-релевантних змін. Перевіряємо лише структуру (розділи є),
     # не зміст — зміст неможливо валідувати автоматично.
@@ -419,7 +420,11 @@
         -Condition ($releasePolicyProbeResults['UndatedStableHeading'] -ne 0) `
         -Name "ReleasePolicy/RejectsUndatedStableChangelogHeading" `
         -Failure "ci\Test-BRAVOReleasePolicy.ps1 має блокувати promotion, якщо заголовок CHANGELOG.md для stable-версії не датований — звіряти releaseDate немає з чим; код виходу: $($releasePolicyProbeResults['UndatedStableHeading'])"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Documentation' -ErrorRecord $_
+}
 
+try {
     # --- Провенанс: sourceCommit має нести ТУ САМУ packageVersion --------
     # Потрібен справжній git-репозиторій: перевірка читає VERSION.json у
     # коміті sourceCommit. Фікстура вище його не має, тому тут окремий
@@ -845,7 +850,11 @@
         ) `
         -Name "Documentation/ReadmeNeverAdvisesDeletingManifest" `
         -Failure "README.md не повинен радити видаляти маніфест цілісності — це вимикає перевірку, а не усуває причину"
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'ReleasePolicy' -ErrorRecord $_
+}
 
+try {
     # Зовнішнє рев'ю 2026-08-05, P1: SECURITY.md публікував порядок
     # повідомлення про вразливості із заглушками "[заповнити]" замість SLA.
     # Політика без строків не є політикою.
@@ -1134,7 +1143,11 @@ Test-BRAVOCondition `
     -Failure "deploy\README.md мусить описувати межу володіння site-конфігурацією — інакше контракт існує лише в коді"
 
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Documentation #2' -ErrorRecord $_
+}
 
+try {
 # --- #152: гейт релізу в скриптах розкатки ---------------------------------
 # Дефект, який закриває цей блок: prerelease-комплект розгортався в установі
 # без жодного свідомого рішення оператора (Install лише попереджав, Update не
@@ -1338,7 +1351,11 @@ Test-BRAVOCondition `
         -Failure ("release-manifest.json мусить містити поля, які читає розкатка; ci\New-BRAVOReleaseArtifact.ps1 не згадує: " +
             [string]::Join(', ', @($missingManifestFields)))
 }
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Deploy' -ErrorRecord $_
+}
 
+try {
 # --- #153: RC-матриця приймання по ОС --------------------------------------
 # Дефект, який закриває цей блок: промоція RC -> stable не вимагала доказів
 # з реальних хостів, а формальної матриці ОС у RELEASE_POLICY.md не було —
@@ -1515,4 +1532,7 @@ Test-BRAVOCondition `
         ) `
         -Name "Governance/ValidateOnlyMigratedDiscoveryBaselineGuardPatternIsMeaningful" `
         -Failure "перевірка вище не відрізняє захищений виклик Import-BRAVODiscoveryBaseline від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
+}
+} catch {
+    Register-BRAVOSelfTestSectionFault -Section 'Governance' -ErrorRecord $_
 }
