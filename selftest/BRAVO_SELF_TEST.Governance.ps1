@@ -1163,6 +1163,30 @@
         -Name "ConfigParity/CanonicalPatternCoversRequiredPaths" `
         -Failure "Канонічний перелік шляхів config-parity звузився; відсутні: $($missingPattern -join ', ')"
 
+    # --- ConfigParity/DefaultPatternIsLoadedWhenCallerPassesNone ---
+    # Регресія на реальний дефект першого CI-прогону #214.
+    #
+    # Визначення "переліку не передано" виводилось зі ЗНАЧЕННЯ
+    # незв'язаного параметра (@($Pattern).Count), і прогін упав із
+    # "The property 'Count' cannot be found on this object". Виняток був
+    # щасливим випадком: тихий варіант тієї ж помилки лишив би
+    # $effectivePattern порожнім, жоден шлях не збігся б із жодним,
+    # КОЖЕН PR діставав би NOT APPLICABLE — і перевірка була б вічно
+    # зеленою, не перевіряючи нічого. Тому доводиться не лише те, що
+    # виклик без -Pattern не падає, а й те, що він реально підставив
+    # КАНОНІЧНИЙ перелік і дійсно ним скористався.
+    $defaultPatternDecision = Test-BRAVOConfigParityRelevantPath `
+        -ChangedPath @('BRAVO_CONFIG_LOADER.ps1')
+    Test-BRAVOCondition `
+        -Condition (
+            @($defaultPatternDecision.Pattern).Count -eq $canonicalPattern.Count -and
+            $defaultPatternDecision.IsRelevant
+        ) `
+        -Name "ConfigParity/DefaultPatternIsLoadedWhenCallerPassesNone" `
+        -Failure ("Виклик без -Pattern мусить підставити канонічний перелік і ним скористатися; " +
+            "у переліку рішення: $(@($defaultPatternDecision.Pattern).Count), канонічних: " +
+            "$($canonicalPattern.Count); IsRelevant: $($defaultPatternDecision.IsRelevant)")
+
     # --- ConfigParity/RelevantPathDecision ---
     $relevanceCases = @(
         @{ Name = 'README only';                 Changed = @('README.md');                                      Expected = $false }

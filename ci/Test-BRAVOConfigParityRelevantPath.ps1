@@ -80,9 +80,30 @@ function Test-BRAVOConfigParityRelevantPath {
         [string[]]$Pattern
     )
 
-    $effectivePattern = @($Pattern)
-    if ($effectivePattern.Count -eq 0) {
-        $effectivePattern = @(Get-BRAVOConfigParityRelevantPathPattern)
+    # ЧОМУ $PSBoundParameters, А НЕ @($Pattern).Count.
+    #
+    # Питання тут — "чи передав викликач власний перелік?", і його треба
+    # ставити ПРЯМО. Попередня редакція виводила відповідь зі ЗНАЧЕННЯ
+    # ($effectivePattern = @($Pattern); if ($effectivePattern.Count -eq 0)),
+    # і це впало на першому ж реальному прогоні CI (#214): незв'язаний
+    # типізований параметр [string[]] дорівнює $null, а .Count такого
+    # виразу під Set-StrictMode не гарантований — прогін завершився
+    # "The property 'Count' cannot be found on this object".
+    #
+    # Виняток тут — ЩАСЛИВИЙ випадок. Тихий був би значно гіршим: якби
+    # .Count повернув 1 замість винятку, канонічний перелік НЕ
+    # завантажився б, жоден шлях не збігся б із жодним, кожен PR
+    # діставав би NOT APPLICABLE — і перевірка лишалась би вічно
+    # зеленою, не перевіряючи нічого. Саме тому нижче є окрема
+    # регресія ConfigParity/DefaultPatternIsLoadedWhenCallerPassesNone.
+    $effectivePattern = @(Get-BRAVOConfigParityRelevantPathPattern)
+    if ($PSBoundParameters.ContainsKey('Pattern')) {
+        $explicitPattern = @(
+            @($Pattern) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+        )
+        if ($explicitPattern.Count -gt 0) {
+            $effectivePattern = $explicitPattern
+        }
     }
 
     # Нормалізація обох боків до однієї форми: git друкує "/", Windows і
