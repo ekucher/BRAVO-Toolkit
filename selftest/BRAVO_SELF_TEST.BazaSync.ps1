@@ -368,6 +368,97 @@
         Test-BRAVOCondition -Condition ($fastHealthMutation.Healthy -eq $false -and $fastHealthMutation.Level -eq 'CRITICAL' -and $fastHealthMutation.Message -match 'verified\.txt') `
             -Name 'BazaSync/MutationViolationIsHealthCritical' -Failure 'MUTATION_VIOLATION має бути CRITICAL/unhealthy з іменем файлу в повідомленні'
 
+        # =======================================================================
+        # F-CROSSCHECK-02 (MEDIUM): невалідне MutationPolicy (напр. typo
+        # "Failed" замість "Fail") НЕ повинно мовчки поводитись як
+        # "альтернативна політика обробки мутації" (замість fail-closed
+        # блокування MUTATION_VIOLATION, $MutationPolicy -ne 'Fail' ->
+        # $true), інакше mutated-але-того-самого-розміру Verified-файл міг
+        # би дійти до upload/AlreadyRemote і отримати false-green
+        # Verified=true, хоча remote усе ще містить СТАРИЙ вміст.
+        # =======================================================================
+
+        # A. Невалідна політика відхиляється на межі параметра (ValidateSet),
+        # ДО того, як Get-BRAVOBazaSyncPlan взагалі зможе її інтерпретувати.
+        $mutTypoPlanError = $null
+        try {
+            [void](Get-BRAVOBazaSyncPlan -Snapshot ([pscustomobject]@{ Entries = @{} }) -State ([pscustomobject]@{ Files = @{} }) -MutationPolicy 'Failed')
+        } catch {
+            $mutTypoPlanError = $_.Exception.Message
+        }
+        Test-BRAVOCondition -Condition ($null -ne $mutTypoPlanError -and $mutTypoPlanError -match 'Failed') `
+            -Name 'BazaSync/InvalidMutationPolicyRejectedAtPlanBoundary' -Failure "Get-BRAVOBazaSyncPlan -MutationPolicy 'Failed' (typo) має відхилятись ValidateSet, а не мовчки трактуватись як policy != Fail; Error=$mutTypoPlanError"
+
+        # B. Той самий типо на межі повного sync-циклу: файл, попередньо
+        # Verified=true, мутує (той самий розмір, новий mtime/вміст) — з
+        # невалідною політикою цикл ПОВИНЕН впасти ДО планування/upload,
+        # а не дозволити мутації дійти до AlreadyRemote/Verified=true
+        # (false-green provenance).
+        $mutTypoRoot = Join-Path $bazaSyncTestRoot "A_MutationPolicyTypo"
+        $mutTypoLocal = Join-Path $mutTypoRoot "local"
+        $mutTypoState = Join-Path $mutTypoRoot "state"
+        New-Item -ItemType Directory -Path $mutTypoLocal -Force | Out-Null
+        $mutTypoFile = New-BRAVOSelfTestBazaFile -Directory $mutTypoLocal -RelativePath "verified.txt" -SizeBytes 500
+        $mutTypoSession1 = New-BRAVOSelfTestFakeBazaSession
+        $mutTypoResult1 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mutTypoLocal -RemoteRootPath '/baza_app' -Session $mutTypoSession1 -StateRoot $mutTypoState -BootstrapIfNeeded -FullAuditProvider $bazaFirstRunNoOpAuditProvider
+        Test-BRAVOCondition -Condition ($mutTypoResult1.Status -eq 'COMPLETE' -and $mutTypoResult1.Uploaded -eq 1) `
+            -Name 'BazaSync/MutationPolicyTypoSetupInitialUploadSucceeds' -Failure 'setup: перший upload має пройти успішно перед тестом typo-політики'
+
+        $mutTypoOriginalWriteTime = (Get-Item -LiteralPath $mutTypoFile).LastWriteTimeUtc
+        $mutTypoChangedBytes = New-Object byte[] 500
+        for ($mutTypoByteIndex = 0; $mutTypoByteIndex -lt $mutTypoChangedBytes.Length; $mutTypoByteIndex++) {
+            $mutTypoChangedBytes[$mutTypoByteIndex] = [byte]0xA5
+        }
+        [IO.File]::WriteAllBytes($mutTypoFile, $mutTypoChangedBytes)
+        (Get-Item -LiteralPath $mutTypoFile).LastWriteTimeUtc = $mutTypoOriginalWriteTime.AddSeconds(2)
+        $mutTypoStateBefore = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mutTypoState -Component 'BAZA_APP')
+        $mutTypoSession2 = New-BRAVOSelfTestFakeBazaSession
+        $mutTypoException2 = $null
+        try {
+            [void](Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mutTypoLocal -RemoteRootPath '/baza_app' -Session $mutTypoSession2 -StateRoot $mutTypoState -MutationPolicy 'Failed')
+        } catch {
+            $mutTypoException2 = $_.Exception.Message
+        }
+        $mutTypoStateAfter = Read-BRAVOBazaState -Path (Get-BRAVOBazaStatePath -StateRoot $mutTypoState -Component 'BAZA_APP')
+        Test-BRAVOCondition -Condition (
+            $null -ne $mutTypoException2 -and $mutTypoException2 -match 'Failed' -and
+            $mutTypoSession2.State.PutFilesCallCount -eq 0 -and
+            [bool]$mutTypoStateAfter.State.Files['verified.txt'].Verified -eq $true -and
+            [string]$mutTypoStateAfter.State.Files['verified.txt'].LastWriteTimeUtc -eq [string]$mutTypoStateBefore.State.Files['verified.txt'].LastWriteTimeUtc
+        ) -Name 'BazaSync/InvalidMutationPolicyBlocksSameSizeMutationFalseGreen' -Failure "невалідна MutationPolicy на межі повного циклу має fail-closed ДО планування (нуль PutFiles, state незмінний, БЕЗ AlreadyRemote/Verified=true для нового вмісту); Error=$mutTypoException2,PutFiles=$($mutTypoSession2.State.PutFilesCallCount),Verified=$($mutTypoStateAfter.State.Files['verified.txt'].Verified)"
+
+        # C. Валідна MutationPolicy='Fail' (типова, явно передана) лишається
+        # незмінною: та сама мутація і далі MUTATION_VIOLATION, без upload.
+        $mutTypoSession3 = New-BRAVOSelfTestFakeBazaSession
+        $mutTypoResult3 = Invoke-BRAVOBazaSynchronization -Component 'BAZA_APP' -LocalDirectory $mutTypoLocal -RemoteRootPath '/baza_app' -Session $mutTypoSession3 -StateRoot $mutTypoState -MutationPolicy 'Fail'
+        Test-BRAVOCondition -Condition (
+            $mutTypoResult3.Status -eq 'MUTATION_VIOLATION' -and $mutTypoResult3.MutationViolations.Count -eq 1 -and
+            $mutTypoResult3.MutationViolations[0].RelativePath -eq 'verified.txt' -and
+            $mutTypoSession3.State.PutFilesCallCount -eq 0
+        ) -Name 'BazaSync/ExplicitValidFailPolicyMutationBehaviorUnchanged' -Failure "явне MutationPolicy='Fail' на тій самій мутації має лишатись MUTATION_VIOLATION без upload (regression); Status=$($mutTypoResult3.Status),Violations=$($mutTypoResult3.MutationViolations.Count),PutFiles=$($mutTypoSession3.State.PutFilesCallCount)"
+
+        # D. Config-рівень (Get-BRAVOBazaSettingsEffective): невалідне
+        # значення відхиляється fail-closed з точним іменем ключа й
+        # значенням, БЕЗ мовчазної нормалізації до 'Fail'.
+        $mutCfgTypoPrevBackupMonitoring = $global:backupMonitoring
+        try {
+            $global:backupMonitoring = @{ SFTP = @{ BAZA = @{ MutationPolicy = 'Failed' } } }
+            $mutCfgTypoError = $null
+            try { [void](Get-BRAVOBazaSettingsEffective) } catch { $mutCfgTypoError = $_.Exception.Message }
+            Test-BRAVOCondition -Condition ($null -ne $mutCfgTypoError -and $mutCfgTypoError -match 'MutationPolicy' -and $mutCfgTypoError -match 'Failed') `
+                -Name 'BazaSync/ConfigContractInvalidMutationPolicyRejected' -Failure "backupMonitoring.SFTP.BAZA.MutationPolicy='Failed' (typo) має відхилятись fail-closed з точним ім'ям ключа й значенням, а не мовчки нормалізуватись; Error=$mutCfgTypoError"
+
+            $global:backupMonitoring = @{ SFTP = @{ BAZA = @{ MutationPolicy = 'Fail' } } }
+            $mutCfgValidError = $null
+            $mutCfgValidResult = $null
+            try { $mutCfgValidResult = Get-BRAVOBazaSettingsEffective } catch { $mutCfgValidError = $_.Exception.Message }
+            Test-BRAVOCondition -Condition ($null -eq $mutCfgValidError -and $null -ne $mutCfgValidResult -and $mutCfgValidResult.MutationPolicy -eq 'Fail') `
+                -Name 'BazaSync/ConfigContractValidMutationPolicyFailAccepted' -Failure "явне MutationPolicy='Fail' має проходити без помилки; Error=$mutCfgValidError"
+        }
+        finally {
+            $global:backupMonitoring = $mutCfgTypoPrevBackupMonitoring
+        }
+
         # AutoArchiveMutationThreshold: default (0, вимкнено) — $mutResult2
         # вище вже підтверджує regression без явного передавання параметра
         # (Invoke-BRAVOBazaSynchronization викликано без -AutoArchiveMutationThreshold).

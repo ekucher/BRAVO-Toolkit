@@ -307,6 +307,11 @@ function Get-BRAVOBazaSyncPlan {
     param(
         [Parameter(Mandatory = $true)][object]$Snapshot,
         [Parameter(Mandatory = $true)][object]$State,
+        # F-CROSSCHECK-02: єдине підтримуване значення — 'Fail'. ValidateSet
+        # fail-closed на межі параметра — типо (напр. 'Failed') не повинен
+        # мовчки поводитись як альтернативна політика й давати
+        # $MutationPolicy -ne 'Fail' == $true (мутація йде в ToUpload).
+        [ValidateSet('Fail')]
         [string]$MutationPolicy = 'Fail'
     )
 
@@ -815,6 +820,9 @@ function Invoke-BRAVOBazaSynchronization {
         [Parameter(Mandatory = $true)][string]$RemoteRootPath,
         [Parameter(Mandatory = $true)]$Session,
         [Parameter(Mandatory = $true)][string]$StateRoot,
+        # F-CROSSCHECK-02: fail-closed на межі — див. ValidateSet у
+        # Get-BRAVOBazaSyncPlan.
+        [ValidateSet('Fail')]
         [string]$MutationPolicy = 'Fail',
         # 0 (default) = вимкнено — MUTATION_VIOLATION поводиться як завжди
         # (жорсткий блок). > 0: якщо мутацій за цикл не більше порогу,
@@ -2171,6 +2179,9 @@ function Invoke-BRAVOBazaComponentSyncSession {
         [Parameter(Mandatory = $true)][string]$StateRoot,
         [int]$ConnectionTimeoutSeconds = 30,
         [int]$OperationTimeoutSeconds = 1800,
+        # F-CROSSCHECK-02: fail-closed на межі — див. ValidateSet у
+        # Get-BRAVOBazaSyncPlan.
+        [ValidateSet('Fail')]
         [string]$MutationPolicy = 'Fail',
         [int]$AutoArchiveMutationThreshold = 0,
         [switch]$BootstrapIfNeeded,
