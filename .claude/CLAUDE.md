@@ -66,7 +66,7 @@
 
    Повідом про відсутність або неповноту handoff.
 
-9. Якщо `origin/developer` змінився відносно записаного canonical HEAD:
+9. Якщо `origin/developer` змінився відносно записаного state baseline SHA:
 
    * визнач, які саме коміти/PR були додані;
    * визнач, чи змінюють вони передумови `NEXT ACTION`;
@@ -98,6 +98,12 @@ historical PR descriptions / old session context
 ```
 
 Не довіряй застарілому handoff більше, ніж фактичному стану репозиторію.
+
+`State baseline SHA` — це commit гілки `developer`, відносно якого стан у
+`PROJECT_STATE.md` був фактично перевірений. Він не є самопосилальним
+"поточним HEAD" і не зобов'язаний дорівнювати commit, який містить сам
+`PROJECT_STATE.md`. Якщо `origin/developer` пішов уперед, перевір delta від
+baseline та повторно валідуй лише зачеплені припущення.
 
 ## PROJECT_STATE не є авторизацією на mutation
 
@@ -152,7 +158,7 @@ historical PR descriptions / old session context
 Запиши лише перевірені факти:
 
 * canonical branch;
-* canonical HEAD;
+* state baseline SHA — commit `developer`, відносно якого handoff фактично перевірено;
 * активний issue;
 * активний PR, якщо є;
 * завершені хвилі/PR;
@@ -217,7 +223,7 @@ handoff зафіксовано.
 Збережи щонайменше:
 
 * expected result;
-* canonical branch/HEAD;
+* canonical branch / state baseline SHA;
 * active issue/PR;
 * прийняті архітектурні рішення;
 * фактично змінені файли;

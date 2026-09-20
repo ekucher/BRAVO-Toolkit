@@ -6,9 +6,9 @@ Last verified: 2026-09-21
 
 `developer`
 
-## Canonical HEAD
+## State baseline SHA
 
-`b5d1691d58f40b6b0a52408e5a628ddd209973b7`
+`832e238efd5563e6be6bf91bc42e2f3767ade69c`
 
 Before starting substantial work, verify:
 
@@ -20,7 +20,9 @@ git rev-parse HEAD
 git rev-parse origin/developer
 ```
 
-If `origin/developer` differs from the recorded canonical HEAD, determine which commits or PRs were added and whether they invalidate the recorded `NEXT ACTION`.
+This SHA is the `developer` commit against which this handoff state was verified. It is intentionally not a self-referential "current HEAD" and may differ from the commit that contains this file after the handoff itself is committed or merged.
+
+If `origin/developer` differs from the recorded state baseline SHA, inspect the commits/PRs added since the baseline and determine whether they invalidate the recorded `NEXT ACTION`. Do not treat the difference itself as an error.
 
 ## Current objective
 
@@ -122,6 +124,16 @@ Promotion preserved all previously required checks and unrelated branch-protecti
 
 Post-merge CI on current developer completed successfully.
 
+### Persistent Claude handoff
+
+PR #221 merged.
+
+Purpose: add the cross-session startup/handoff protocol and `PROJECT_STATE.md` without changing BRAVO runtime behavior.
+
+Merge commit:
+
+`832e238efd5563e6be6bf91bc42e2f3767ade69c`
+
 ## Closed / superseded work
 
 ### PR #213
@@ -201,8 +213,8 @@ Execute **Issue #216 Wave 0** against:
 
 ```text
 origin/developer
-expected baseline:
-b5d1691d58f40b6b0a52408e5a628ddd209973b7
+state baseline:
+832e238efd5563e6be6bf91bc42e2f3767ade69c
 ```
 
 Requirements:
@@ -297,7 +309,7 @@ Never silently trust stale handoff state over repository evidence.
 After each substantial completed wave:
 
 1. Verify canonical `origin/developer`.
-2. Update Canonical HEAD.
+2. Update State baseline SHA to the `developer` commit against which the handoff was actually verified. Do not try to make it equal to the commit that contains `PROJECT_STATE.md` itself.
 3. Keep completed work concise.
 4. Record actual validation evidence.
 5. Remove stale blockers.
