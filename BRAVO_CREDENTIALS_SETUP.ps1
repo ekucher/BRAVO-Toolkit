@@ -780,7 +780,8 @@ function Invoke-CredentialOperations {
                 "Test" {
                     $storedCredential = Get-BRAVOCredential -Target ([string]$entry.Target)
                     $status = if ($null -ne $storedCredential -and
-                        -not [string]::IsNullOrWhiteSpace([string]$storedCredential.Secret)) {
+                        $null -ne $storedCredential.Secret -and
+                        $storedCredential.Secret.Length -gt 0) {
                         "Found"
                     } else {
                         "Missing"
@@ -795,7 +796,7 @@ function Invoke-CredentialOperations {
                         if ($institutionSettingName) {
                             [void](Test-BRAVOInstitutionSettingValue `
                                 -Name $institutionSettingName `
-                                -Value ([string]$storedCredential.Secret))
+                                -Value (ConvertFrom-BRAVOSecureSecret -Secret $storedCredential.Secret))
                         }
                     }
                     $storedCredential = $null
@@ -831,40 +832,52 @@ function Invoke-CredentialOperations {
 function Get-CredentialOperationSnapshots {
     param([object[]]$Entries)
 
-    return @($Entries | ForEach-Object {
-        $stored = Get-BRAVOCredential -Target ([string]$_.Target)
-        [pscustomobject]@{
-            Component = [string]$_.Component
-            Target = [string]$_.Target
-            Existed = $null -ne $stored
-            UserName = if ($null -ne $stored) { [string]$stored.UserName } else { "" }
-            Secret = if ($null -ne $stored) { [string]$stored.Secret } else { $null }
+    $snapshots = New-Object System.Collections.ArrayList
+    try {
+        foreach ($entry in @($Entries)) {
+            $stored = Get-BRAVOCredential -Target ([string]$entry.Target)
+            $secureSecret = $null
+            try {
+                if ($null -ne $stored -and $null -ne $stored.Secret) {
+                    $secureSecret = $stored.Secret.Copy()
+                }
+            } finally {
+                # Тимчасовий SecureString від Get-BRAVOCredential звільняється
+                # одразу після того, як знімок узяв на себе його копію —
+                # знімок володіє лише власною Copy(), не оригіналом.
+                if ($null -ne $stored -and $null -ne $stored.Secret) {
+                    $stored.Secret.Dispose()
+                }
+            }
+            [void]$snapshots.Add([pscustomobject]@{
+                Component = [string]$entry.Component
+                Target = [string]$entry.Target
+                Existed = $null -ne $stored
+                UserName = if ($null -ne $stored) { [string]$stored.UserName } else { "" }
+                SecureSecret = $secureSecret
+            })
         }
-    })
+        return $snapshots.ToArray()
+    } catch {
+        # Часткова побудова: знімки, вже створені до збою, звільняються тут,
+        # щоб не лишити відкритими SecureString.Copy(), власника яких
+        # (викликача) ця функція так і не поверне.
+        Clear-CredentialOperationSnapshots -Snapshots $snapshots.ToArray()
+        throw
+    }
 }
 
 function Restore-CredentialOperationSnapshots {
-    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
-        'PSAvoidUsingConvertToSecureStringWithPlainText', '',
-        Justification = 'Rollback раніше збереженого запису Credential Manager — секрет уже походив звідти.')]
     param([object[]]$Snapshots)
 
     $restoreErrors = New-Object System.Collections.ArrayList
     foreach ($snapshot in $Snapshots) {
         try {
             if ($snapshot.Existed) {
-                $secureSecret = ConvertTo-SecureString `
-                    -String ([string]$snapshot.Secret) `
-                    -AsPlainText `
-                    -Force
-                try {
-                    Set-BRAVOCredential `
-                        -Target ([string]$snapshot.Target) `
-                        -UserName ([string]$snapshot.UserName) `
-                        -Secret $secureSecret
-                } finally {
-                    $secureSecret.Dispose()
-                }
+                Set-BRAVOCredential `
+                    -Target ([string]$snapshot.Target) `
+                    -UserName ([string]$snapshot.UserName) `
+                    -Secret $snapshot.SecureSecret
             } else {
                 [void](Remove-BRAVOCredential -Target ([string]$snapshot.Target))
             }
@@ -883,7 +896,10 @@ function Restore-CredentialOperationSnapshots {
 function Clear-CredentialOperationSnapshots {
     param([object[]]$Snapshots)
     foreach ($snapshot in @($Snapshots)) {
-        $snapshot.Secret = $null
+        if ($null -ne $snapshot.SecureSecret) {
+            $snapshot.SecureSecret.Dispose()
+        }
+        $snapshot.SecureSecret = $null
     }
 }
 
@@ -896,13 +912,17 @@ function Invoke-CredentialOperationsTransactional {
     if ($Operation -eq "Test") {
         return @(Invoke-CredentialOperations -Operation $Operation -Entries $Entries)
     }
-    $snapshots = @(Get-CredentialOperationSnapshots -Entries $Entries)
-    $results = @(Invoke-CredentialOperations -Operation $Operation -Entries $Entries)
-    if (@($results | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-        $results += @(Restore-CredentialOperationSnapshots -Snapshots $snapshots)
+    $snapshots = @()
+    try {
+        $snapshots = @(Get-CredentialOperationSnapshots -Entries $Entries)
+        $results = @(Invoke-CredentialOperations -Operation $Operation -Entries $Entries)
+        if (@($results | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+            $results += @(Restore-CredentialOperationSnapshots -Snapshots $snapshots)
+        }
+        return $results
+    } finally {
+        Clear-CredentialOperationSnapshots -Snapshots $snapshots
     }
-    Clear-CredentialOperationSnapshots -Snapshots $snapshots
-    return $results
 }
 
 function Write-OperationResults {
@@ -1533,48 +1553,55 @@ try {
         } else {
             @(Get-CredentialOperationSnapshots -Entries $currentUserEntries)
         }
-        $currentUserResults = @(
-            Invoke-CredentialOperationsTransactional `
-                -Operation $Action `
-                -Entries $currentUserEntries
-        )
-        $currentUserResults = @(Set-OperationResultScope -Results $currentUserResults -Scope $currentIdentity)
-        if (@($currentUserResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-            Clear-OperationEntries -Entries $systemEntries
-            $systemResults = @([pscustomobject]@{
-                Component = "SYSTEM"
-                Target = ""
-                Status = "Error"
-                Error = "операцію не розпочато через помилку поточного сховища"
-                Scope = "SYSTEM"
-            })
-        } else {
-            $systemResults = @(
-                Invoke-AsSystem `
-                    -ResolvedConfigPath $resolvedConfigPath `
-                    -ConfigPathWasExplicit $configPathWasExplicit `
+        try {
+            $currentUserResults = @(
+                Invoke-CredentialOperationsTransactional `
                     -Operation $Action `
-                    -Entries $systemEntries
+                    -Entries $currentUserEntries
             )
-            $systemResults = @(Set-OperationResultScope -Results $systemResults -Scope "SYSTEM")
-            if ($Action -ne "Test" -and
-                @($systemResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
-                $rollbackResults = @(
-                    Restore-CredentialOperationSnapshots `
-                        -Snapshots $currentUserSnapshots
+            $currentUserResults = @(Set-OperationResultScope -Results $currentUserResults -Scope $currentIdentity)
+            if (@($currentUserResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+                Clear-OperationEntries -Entries $systemEntries
+                $systemResults = @([pscustomobject]@{
+                    Component = "SYSTEM"
+                    Target = ""
+                    Status = "Error"
+                    Error = "операцію не розпочато через помилку поточного сховища"
+                    Scope = "SYSTEM"
+                })
+            } else {
+                $systemResults = @(
+                    Invoke-AsSystem `
+                        -ResolvedConfigPath $resolvedConfigPath `
+                        -ConfigPathWasExplicit $configPathWasExplicit `
+                        -Operation $Action `
+                        -Entries $systemEntries
                 )
-                if ($rollbackResults.Count -gt 0) {
-                    $currentUserResults += @(
-                        Set-OperationResultScope `
-                            -Results $rollbackResults `
-                            -Scope $currentIdentity
+                $systemResults = @(Set-OperationResultScope -Results $systemResults -Scope "SYSTEM")
+                if ($Action -ne "Test" -and
+                    @($systemResults | Where-Object { $_.Status -eq "Error" }).Count -gt 0) {
+                    $rollbackResults = @(
+                        Restore-CredentialOperationSnapshots `
+                            -Snapshots $currentUserSnapshots
                     )
-                } else {
-                    Write-Host "Поточне сховище повернуто до стану перед операцією." -ForegroundColor Yellow
+                    if ($rollbackResults.Count -gt 0) {
+                        $currentUserResults += @(
+                            Set-OperationResultScope `
+                                -Results $rollbackResults `
+                                -Scope $currentIdentity
+                        )
+                    } else {
+                        Write-Host "Поточне сховище повернуто до стану перед операцією." -ForegroundColor Yellow
+                    }
                 }
             }
+        } finally {
+            # currentUserSnapshots повинні звільнятися, навіть якщо
+            # Invoke-AsSystem кине виняток (worker timeout, FatalError,
+            # збій Task Scheduler тощо) — інакше SecureString.Copy() з
+            # моменту знімку лишиться недиспоузнутим.
+            Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshots
         }
-        Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshots
         $operationResults = @($currentUserResults) + @($systemResults)
     } elseif ($useSystemWorker) {
         Write-Host "Сховище для облікового запису: NT AUTHORITY\SYSTEM"
