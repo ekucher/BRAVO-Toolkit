@@ -1418,6 +1418,9 @@ health > лише попередження. Код `90` має найвищий 
 `development` (з `ReleaseChannelSource=git-branch`), а на `master`/`main`
 — ніколи не `development`.
 
+Повний перелік вимог до релізу (версіонування, CI-ворота, required
+checks, acceptance) — у `RELEASE_POLICY.md` у корені репозиторію.
+
 ## 14. Правила безпеки
 
 - не записуйте паролі, webhook URL або логіни у `.config`, `.ps1` чи
