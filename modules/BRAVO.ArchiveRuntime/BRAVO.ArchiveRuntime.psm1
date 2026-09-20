@@ -119,6 +119,23 @@ function Get-BRAVOBazaSettingsEffective {
         )
     }
 
+    # F-CROSSCHECK-02 (MEDIUM): MutationPolicy типізований лише як рядок —
+    # без цієї перевірки типо (напр. "Failed" замість "Fail") мовчки
+    # інтерпретувався б нижче за течією як "будь-яка НЕ-Fail політика" і
+    # проходив би повз жорсткий блок MUTATION_VIOLATION. Єдине підтримуване
+    # значення сьогодні — "Fail"; fail-closed тут (а не warn+нормалізація,
+    # як для BootRestoreMode/WeeklyOn), бо мовчазний fallback до "Fail" тут
+    # заховав би від оператора невалідний конфіг замість дати йому побачити
+    # й виправити typo.
+    if ($mutationPolicyEffective -ne 'Fail') {
+        throw (
+            "backupMonitoring.SFTP.BAZA.MutationPolicy = '$mutationPolicyEffective' не підтримується. " +
+            "Єдине підтримуване значення — 'Fail' (типова, безпечна поведінка: мутація вже Verified " +
+            "локального файлу жорстко блокує upload/MUTATION_VIOLATION, а не мовчки продовжує, " +
+            "нібито це свідомо налаштована альтернативна політика обробки мутації). Виправте значення в конфігурації."
+        )
+    }
+
     return [pscustomobject]@{
         Mode = $mode
         StateRoot = $stateRootEffective
