@@ -1,3 +1,238 @@
+# Контекст поточного стану проекту
+
+Поточний оперативний стан проекту зберігається у:
+
+```text
+.claude/PROJECT_STATE.md
+```
+
+Цей файл є handoff між сесіями Claude Code.
+
+## Startup protocol
+
+На початку КОЖНОЇ нової сесії:
+
+1. Прочитай `.claude/PROJECT_STATE.md`.
+
+2. Перевір фактичний стан репозиторію:
+
+   ```text
+   git status --short
+   git branch --show-current
+   git rev-parse HEAD
+   git log -5 --oneline --decorate
+   ```
+
+3. Виконай:
+
+   ```text
+   git fetch origin --prune
+   ```
+
+   якщо мережевий доступ і Git дозволені поточним завданням.
+
+4. Звір:
+
+   * поточний HEAD;
+   * `origin/developer`;
+   * активний issue/PR;
+   * завершені хвилі;
+   * останні validation results;
+   * записаний `NEXT ACTION`.
+
+5. Git/GitHub є фактичним джерелом істини.
+
+   Якщо `.claude/PROJECT_STATE.md` суперечить фактичному стану,
+   не продовжуй небезпечні або мутуючі дії на основі застарілого запису.
+
+   Спочатку встанови правильний стан.
+
+6. Якщо стан узгоджується — продовжуй з `NEXT ACTION`, не вимагаючи
+   від користувача повторного пояснення вже зафіксованого контексту.
+
+7. Не повторюй уже завершену роботу.
+
+8. Якщо `.claude/PROJECT_STATE.md` відсутній або не містить `NEXT ACTION`,
+   не вигадуй попередній стан роботи.
+
+   Встанови його з:
+
+   * Git;
+   * GitHub;
+   * поточного коду;
+   * тестів;
+   * активних issue/PR;
+   * repository documentation.
+
+   Повідом про відсутність або неповноту handoff.
+
+9. Якщо `origin/developer` змінився відносно записаного canonical HEAD:
+
+   * визнач, які саме коміти/PR були додані;
+   * визнач, чи змінюють вони передумови `NEXT ACTION`;
+   * повторно перевір лише ті припущення та докази, на які ці зміни
+     реально впливають;
+   * не повторюй повний аудит без необхідності.
+
+10. Якщо активний PR/issue, записаний у `PROJECT_STATE.md`, уже закритий,
+    merged, superseded або змінив head/base:
+
+    * встанови фактичний стан;
+    * не продовжуй старий план механічно;
+    * визнач наступну дію з фактичного repository state.
+
+## Source of truth priority
+
+Коли джерела стану суперечать одне одному, використовуй такий порядок:
+
+```text
+Git/GitHub factual state
+    >
+current repository code/tests/configuration
+    >
+.claude/PROJECT_STATE.md
+    >
+current plans / roadmap
+    >
+historical PR descriptions / old session context
+```
+
+Не довіряй застарілому handoff більше, ніж фактичному стану репозиторію.
+
+## PROJECT_STATE не є авторизацією на mutation
+
+`.claude/PROJECT_STATE.md` визначає:
+
+* що вже завершено;
+* де зупинилась робота;
+* що є наступною логічною дією.
+
+Але він НЕ є дозволом на Git/GitHub mutation.
+
+Якщо `NEXT ACTION` містить:
+
+* commit;
+* push;
+* amend;
+* reset;
+* rebase;
+* merge;
+* branch-protection change;
+* tag;
+* release;
+* deploy;
+* видалення branch;
+* іншу дію, яка за правилами проекту потребує явної авторизації,
+
+то така дія все одно потребує явного дозволу користувача в поточному
+завданні.
+
+У такому випадку:
+
+1. виконай усю дозволену підготовку;
+2. доведи readiness;
+3. повідом точну mutation-дію, яка лишилась;
+4. не виконуй її без авторизації.
+
+## Handoff наприкінці роботи
+
+Після кожної завершеної суттєвої:
+
+* хвилі;
+* PR;
+* merge;
+* аудиту;
+* governance-зміни;
+* release-gate;
+* acceptance-фази;
+
+онови `.claude/PROJECT_STATE.md`, якщо користувач дозволив зміни файлів
+репозиторію.
+
+Запиши лише перевірені факти:
+
+* canonical branch;
+* canonical HEAD;
+* активний issue;
+* активний PR, якщо є;
+* завершені хвилі/PR;
+* результати фактично виконаної валідації;
+* відкриті blockers;
+* поточний hard stop;
+* `NEXT ACTION`.
+
+Не перетворюй `PROJECT_STATE.md` на журнал сесій.
+
+Зберігай лише стан, необхідний наступній сесії.
+
+## Вимоги до NEXT ACTION
+
+Перед завершенням суттєвої роботи `NEXT ACTION` повинен бути конкретною
+виконуваною дією.
+
+Не використовуй нечіткі формулювання на кшталт:
+
+```text
+продовжити роботу над проектом
+```
+
+або:
+
+```text
+продовжити Config V2
+```
+
+Використовуй операційно конкретний handoff.
+
+Приклад:
+
+```text
+NEXT ACTION:
+Execute Issue #216 Wave 0 against developer <SHA>.
+Evidence-only. No repository modifications.
+```
+
+або:
+
+```text
+NEXT ACTION:
+Review PR #225 CI.
+If every required check is green, report MERGE READY.
+Do not merge without explicit authorization.
+```
+
+або:
+
+```text
+NEXT ACTION:
+Implement Wave 2 in a fresh isolated worktree from origin/developer <SHA>.
+Do not commit or push.
+```
+
+## Перед стисненням контексту
+
+Перед стисненням або втратою великого контексту переконайся, що актуальний
+handoff зафіксовано.
+
+Збережи щонайменше:
+
+* expected result;
+* canonical branch/HEAD;
+* active issue/PR;
+* прийняті архітектурні рішення;
+* фактично змінені файли;
+* виконані команди;
+* результати тестів;
+* невирішені збої;
+* blockers;
+* hard stops;
+* `NEXT ACTION`.
+
+Не переприймай уже встановлені архітектурні або release-рішення без нових
+доказів.
+
+---
+
 # Інструкції проекту
 
 ## Основні пріоритети
