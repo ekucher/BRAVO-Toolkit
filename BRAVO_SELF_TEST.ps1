@@ -4354,6 +4354,297 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name 'CredentialsSetup/SftpRequiredCoversBothBazaDirectionsAndGlobalSwitch' `
         -Failure 'sftpRequired має враховувати componentSettings.SFTP.Enabled і обидва напрямки BAZA (APP+WWW через canonical ScheduledSftpSyncRequired) — стара формула пропускала BAZA_WWW_SFTP'
 
+    # --- CredentialsSetup: F-CROSSCHECK-01/F-OPSAFETY-08 регресія.
+    # Раніше Get-CredentialOperationSnapshots робив [string]$stored.Secret —
+    # це перетворювало SecureString у ЛІТЕРАЛЬНИЙ рядок типу
+    # "System.Security.SecureString" замість реального секрету, тож rollback
+    # писав це сміття назад у Credential Manager. Той самий анти-патерн у
+    # -Action Test завжди давав непорожній рядок (тип-літерал ніколи не
+    # порожній), тому статус Found/Missing фактично не залежав від
+    # справжнього вмісту SecureString. Функціональна перевірка виконується
+    # в ІЗОЛЬОВАНОМУ дочірньому процесі (той самий підхід, що
+    # VersionState/SelfTestTupleSurvivesChildProcessChain вище): дочірній
+    # скрипт визначає fake Get/Set/Remove-BRAVOCredential (in-memory стаб
+    # Credential Manager, без торкання реального сховища), AST-витягує
+    # РЕАЛЬНІ Invoke-CredentialOperations(Transactional)/
+    # Get|Restore|Clear-CredentialOperationSnapshots з
+    # BRAVO_CREDENTIALS_SETUP.ps1 і прогонить сценарії A-E.
+    $credentialsTransactionalFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CREDENTIALS_TX_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($credentialsTransactionalFixtureRoot)
+        $credentialsTransactionalChildScript = Join-Path $credentialsTransactionalFixtureRoot 'child-probe.ps1'
+        $credentialsTransactionalResultPath = Join-Path $credentialsTransactionalFixtureRoot 'result.json'
+        [IO.File]::WriteAllText($credentialsTransactionalChildScript, @'
+param(
+    [Parameter(Mandatory = $true)][string]$SourcePath,
+    [Parameter(Mandatory = $true)][string]$ResultPath
+)
+$ErrorActionPreference = 'Stop'
+
+$script:FakeStore = @{}
+
+function Get-BRAVOCredential {
+    param([Parameter(Mandatory = $true)][string]$Target)
+    if (-not $script:FakeStore.ContainsKey($Target)) { return $null }
+    $entry = $script:FakeStore[$Target]
+    return [pscustomobject]@{
+        TargetName = $Target
+        UserName = $entry.UserName
+        Secret = $entry.Secret.Copy()
+    }
+}
+
+function Set-BRAVOCredential {
+    param(
+        [Parameter(Mandatory = $true)][string]$Target,
+        [string]$UserName = "",
+        [Parameter(Mandatory = $true)][Security.SecureString]$Secret
+    )
+    $script:FakeStore[$Target] = [pscustomobject]@{ UserName = $UserName; Secret = $Secret.Copy() }
+}
+
+function Remove-BRAVOCredential {
+    param([Parameter(Mandatory = $true)][string]$Target)
+    if ($script:FakeStore.ContainsKey($Target)) {
+        $script:FakeStore.Remove($Target)
+        return $true
+    }
+    return $false
+}
+
+function ConvertFrom-BRAVOSecureSecret {
+    param([AllowNull()][Security.SecureString]$Secret)
+    if ($null -eq $Secret) { return $null }
+    $bstr = [IntPtr]::Zero
+    try {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+        return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+    } finally {
+        if ($bstr -ne [IntPtr]::Zero) {
+            [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+        }
+    }
+}
+
+function New-BravoTestSecureString {
+    param([string]$PlainText)
+    $s = New-Object Security.SecureString
+    if ($PlainText) {
+        foreach ($ch in $PlainText.ToCharArray()) { $s.AppendChar($ch) }
+    }
+    $s.MakeReadOnly()
+    return $s
+}
+
+$parseTokens = $null
+$parseErrors = $null
+$sourceAst = [Management.Automation.Language.Parser]::ParseFile($SourcePath, [ref]$parseTokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    throw "parse errors in ${SourcePath}: $(($parseErrors | ForEach-Object { $_.Message }) -join ' | ')"
+}
+foreach ($functionName in @(
+        'Invoke-CredentialOperations',
+        'Get-CredentialOperationSnapshots',
+        'Restore-CredentialOperationSnapshots',
+        'Clear-CredentialOperationSnapshots',
+        'Invoke-CredentialOperationsTransactional'
+    )) {
+    $functionAst = $sourceAst.Find(
+        { param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $functionName },
+        $true
+    )
+    if ($null -eq $functionAst) {
+        throw "function $functionName not found in $SourcePath"
+    }
+    . ([scriptblock]::Create($functionAst.Extent.Text))
+}
+
+$results = @{}
+
+# --- A: existing credential survives rollback; restored value must be the
+# original secret, never the literal type-name string.
+$script:FakeStore = @{}
+$script:FakeStore['TARGET_A'] = [pscustomobject]@{ UserName = 'userA'; Secret = (New-BravoTestSecureString 'OriginalSecretA') }
+$entriesA = @(
+    [pscustomobject]@{ Component = 'A'; Target = 'TARGET_A'; UserName = 'userA'; SecureSecret = (New-BravoTestSecureString 'NewSecretA') },
+    [pscustomobject]@{ Component = 'B'; Target = 'TARGET_MISSING_A'; UserName = 'userB'; SecureSecret = (New-BravoTestSecureString 'NewSecretB') }
+)
+$opResultsA = @(Invoke-CredentialOperationsTransactional -Operation 'Update' -Entries $entriesA)
+$restoredCredA = Get-BRAVOCredential -Target 'TARGET_A'
+$restoredPlainA = ConvertFrom-BRAVOSecureSecret -Secret $restoredCredA.Secret
+$results['A_HasError'] = (@($opResultsA | Where-Object { $_.Status -eq 'Error' }).Count -gt 0)
+$results['A_NotLiteralTypeName'] = ($restoredPlainA -ne 'System.Security.SecureString')
+$results['A_EqualsOriginal'] = ($restoredPlainA -eq 'OriginalSecretA')
+
+# --- B: normal (non-SYSTEM) transactional happy path is unaffected.
+$script:FakeStore = @{}
+$entriesB = @([pscustomobject]@{ Component = 'C'; Target = 'TARGET_C'; UserName = 'userC'; SecureSecret = (New-BravoTestSecureString 'SecretC') })
+$opResultsB = @(Invoke-CredentialOperationsTransactional -Operation 'Set' -Entries $entriesB)
+$storedC = Get-BRAVOCredential -Target 'TARGET_C'
+$results['B_Status'] = [string]$opResultsB[0].Status
+$results['B_StoredPlain'] = ConvertFrom-BRAVOSecureSecret -Secret $storedC.Secret
+
+# --- C: StoreFor Both - CurrentUser succeeds, SYSTEM fails -> rollback of
+# the external CurrentUser snapshot (Existed=false -> removal branch).
+$script:FakeStore = @{}
+$entriesC = @([pscustomobject]@{ Component = 'D'; Target = 'TARGET_D'; UserName = 'userD'; SecureSecret = (New-BravoTestSecureString 'SecretD') })
+$currentUserSnapshotsC = @(Get-CredentialOperationSnapshots -Entries $entriesC)
+$currentUserResultsC = @(Invoke-CredentialOperationsTransactional -Operation 'Add' -Entries $entriesC)
+$results['C_CurrentUserSucceeded'] = ([string]$currentUserResultsC[0].Status -eq 'Added')
+$results['C_ExistedBeforeRollback'] = ($null -ne (Get-BRAVOCredential -Target 'TARGET_D'))
+$rollbackResultsC = @(Restore-CredentialOperationSnapshots -Snapshots $currentUserSnapshotsC)
+Clear-CredentialOperationSnapshots -Snapshots $currentUserSnapshotsC
+$results['C_RemovedAfterRollback'] = ($null -eq (Get-BRAVOCredential -Target 'TARGET_D'))
+$results['C_RollbackErrorCount'] = $rollbackResultsC.Count
+
+# --- D: -Action Test semantics must not rely on [string]SecureString.
+$script:FakeStore = @{}
+$entriesDMissing = @([pscustomobject]@{ Component = 'E'; Target = 'TARGET_MISSING_D'; UserName = ''; SecureSecret = $null })
+$testMissing = @(Invoke-CredentialOperationsTransactional -Operation 'Test' -Entries $entriesDMissing)
+$results['D_MissingStatus'] = [string]$testMissing[0].Status
+
+$script:FakeStore['TARGET_FOUND_D'] = [pscustomobject]@{ UserName = 'u'; Secret = (New-BravoTestSecureString 'x') }
+$entriesDFound = @([pscustomobject]@{ Component = 'F'; Target = 'TARGET_FOUND_D'; UserName = ''; SecureSecret = $null })
+$testFound = @(Invoke-CredentialOperationsTransactional -Operation 'Test' -Entries $entriesDFound)
+$results['D_FoundStatus'] = [string]$testFound[0].Status
+
+# Edge case regression: a stored zero-length SecureString must read as
+# Missing. The old `[string]$storedCredential.Secret` coercion produced the
+# literal, never-empty text "System.Security.SecureString" and would have
+# misreported this as Found.
+$script:FakeStore['TARGET_EMPTY_D'] = [pscustomobject]@{ UserName = 'u'; Secret = (New-Object Security.SecureString) }
+$entriesDEmpty = @([pscustomobject]@{ Component = 'G'; Target = 'TARGET_EMPTY_D'; UserName = ''; SecureSecret = $null })
+$testEmpty = @(Invoke-CredentialOperationsTransactional -Operation 'Test' -Entries $entriesDEmpty)
+$results['D_EmptySecretStatus'] = [string]$testEmpty[0].Status
+
+# --- E: snapshot SecureString is disposed deterministically on Clear.
+$script:FakeStore = @{}
+$script:FakeStore['TARGET_E'] = [pscustomobject]@{ UserName = 'userE'; Secret = (New-BravoTestSecureString 'SecretE') }
+$entriesE = @([pscustomobject]@{ Component = 'H'; Target = 'TARGET_E' })
+$snapshotsE = @(Get-CredentialOperationSnapshots -Entries $entriesE)
+$secureRefE = $snapshotsE[0].SecureSecret
+Clear-CredentialOperationSnapshots -Snapshots $snapshotsE
+$disposedE = $false
+try {
+    # Property-getter доступ через PS ETS-адаптер тихо ковтає
+    # ObjectDisposedException (емпірично перевірено: $s.Length після
+    # Dispose() повертає порожнє значення без винятку в $Error). Прямий
+    # виклик .NET-методу через Marshal коректно піднімає
+    # MethodInvocationException з InnerException ObjectDisposedException.
+    [void][Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureRefE)
+} catch {
+    $inner = $_.Exception.InnerException
+    if ($null -ne $inner -and $inner -is [ObjectDisposedException]) {
+        $disposedE = $true
+    }
+}
+$results['E_Disposed'] = $disposedE
+$results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
+
+($results | ConvertTo-Json -Depth 4) | Out-File -LiteralPath $ResultPath -Encoding utf8
+'@, (New-Object System.Text.UTF8Encoding($false)))
+
+        $credentialsTransactionalOutput = & powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+            -File $credentialsTransactionalChildScript `
+            -SourcePath (Join-Path $root 'BRAVO_CREDENTIALS_SETUP.ps1') `
+            -ResultPath $credentialsTransactionalResultPath 2>&1
+        $credentialsTransactionalExit = $LASTEXITCODE
+        $credentialsTransactionalResults = $null
+        if ([IO.File]::Exists($credentialsTransactionalResultPath)) {
+            $credentialsTransactionalResults = [IO.File]::ReadAllText(
+                $credentialsTransactionalResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+        }
+
+        Test-BRAVOCondition `
+            -Condition ($credentialsTransactionalExit -eq 0 -and $null -ne $credentialsTransactionalResults) `
+            -Name 'CredentialsSetup/TransactionalFixtureRunsCleanly' `
+            -Failure "ізольований fixture-процес для транзакційного rollback credential-операцій завершився з помилкою (exit=$credentialsTransactionalExit): $($credentialsTransactionalOutput -join ' | ')"
+
+        $crA_HasError = $false; $crA_NotLiteral = $false; $crA_EqualsOriginal = $false
+        $crB_Status = ''; $crB_StoredPlain = ''
+        $crC_Succeeded = $false; $crC_ExistedBeforeRollback = $false; $crC_Removed = $false; $crC_RollbackErrorCount = -1
+        $crD_Missing = ''; $crD_Found = ''; $crD_Empty = ''
+        $crE_Disposed = $false; $crE_Nulled = $false
+        if ($null -ne $credentialsTransactionalResults) {
+            $crA_HasError = [bool]$credentialsTransactionalResults.A_HasError
+            $crA_NotLiteral = [bool]$credentialsTransactionalResults.A_NotLiteralTypeName
+            $crA_EqualsOriginal = [bool]$credentialsTransactionalResults.A_EqualsOriginal
+            $crB_Status = [string]$credentialsTransactionalResults.B_Status
+            $crB_StoredPlain = [string]$credentialsTransactionalResults.B_StoredPlain
+            $crC_Succeeded = [bool]$credentialsTransactionalResults.C_CurrentUserSucceeded
+            $crC_ExistedBeforeRollback = [bool]$credentialsTransactionalResults.C_ExistedBeforeRollback
+            $crC_Removed = [bool]$credentialsTransactionalResults.C_RemovedAfterRollback
+            $crC_RollbackErrorCount = [int]$credentialsTransactionalResults.C_RollbackErrorCount
+            $crD_Missing = [string]$credentialsTransactionalResults.D_MissingStatus
+            $crD_Found = [string]$credentialsTransactionalResults.D_FoundStatus
+            $crD_Empty = [string]$credentialsTransactionalResults.D_EmptySecretStatus
+            $crE_Disposed = [bool]$credentialsTransactionalResults.E_Disposed
+            $crE_Nulled = [bool]$credentialsTransactionalResults.E_SnapshotNulled
+        }
+
+        Test-BRAVOCondition `
+            -Condition ($crA_HasError -and $crA_NotLiteral -and $crA_EqualsOriginal) `
+            -Name 'CredentialsSetup/RollbackRestoresOriginalSecretNotTypeNameLiteral' `
+            -Failure "F-CROSSCHECK-01: після невдалого multi-entry Update rollback має відновити ОРИГІНАЛЬНИЙ секрет (не літерал 'System.Security.SecureString'); HasError=$crA_HasError, NotLiteral=$crA_NotLiteral, EqualsOriginal=$crA_EqualsOriginal"
+
+        Test-BRAVOCondition `
+            -Condition ($crB_Status -eq 'Added' -and $crB_StoredPlain -eq 'SecretC') `
+            -Name 'CredentialsSetup/TransactionalHappyPathUnaffected' `
+            -Failure "звичайний (без SYSTEM) транзакційний шлях без помилок мусить лишитись працездатним після фіксу; Status=$crB_Status, StoredPlain=$crB_StoredPlain"
+
+        # Сценарій C викликає Get/Restore/Clear-CredentialOperationSnapshots
+        # напряму — це перевіряє МЕХАНІКУ зовнішнього снапшот-rollback-у
+        # (Existed=false -> видалення), а НЕ саму production-гілку StoreFor
+        # Both (яка викликає ці функції за умови SYSTEM Error). Ім'я і
+        # failure-текст навмисно це відображають; production-гілку окремо
+        # доводить AST/текстовий regression нижче
+        # (CredentialsSetup/BothStoreProductionBranchCallsRollbackAndProtectsCleanupWithFinally).
+        Test-BRAVOCondition `
+            -Condition ($crC_Succeeded -and $crC_ExistedBeforeRollback -and $crC_Removed -and $crC_RollbackErrorCount -eq 0) `
+            -Name 'CredentialsSetup/ExternalSnapshotRollbackRemovesNewlyAddedEntry' `
+            -Failure "зовнішній снапшот-rollback mechanics (Get/Restore/Clear-CredentialOperationSnapshots): коли Add succeeded і викликається rollback знімку з Existed=false, запис мусить бути ВИДАЛЕНИЙ; Succeeded=$crC_Succeeded, ExistedBeforeRollback=$crC_ExistedBeforeRollback, Removed=$crC_Removed, RollbackErrorCount=$crC_RollbackErrorCount"
+
+        Test-BRAVOCondition `
+            -Condition ($crD_Missing -eq 'Missing' -and $crD_Found -eq 'Found' -and $crD_Empty -eq 'Missing') `
+            -Name 'CredentialsSetup/ActionTestUsesSecureStringLengthNotStringCoercion' `
+            -Failure "F-OPSAFETY-08: -Action Test мусить визначати Found/Missing за SecureString.Length, а не [string]SecureString (літерал типу ніколи не порожній); Missing=$crD_Missing, Found=$crD_Found, EmptySecret(має бути Missing)=$crD_Empty"
+
+        Test-BRAVOCondition `
+            -Condition ($crE_Disposed -and $crE_Nulled) `
+            -Name 'CredentialsSetup/SnapshotSecureSecretDisposedDeterministically' `
+            -Failure "Clear-CredentialOperationSnapshots мусить детерміновано Dispose() SecureString-секрет знімку й занулити властивість; Disposed=$crE_Disposed, Nulled=$crE_Nulled"
+
+        # --- StoreFor Both production-гілка: текстовий/AST regression, що
+        # доводить (без великого orchestration-рефакторингу), що сама
+        # production-гілка (не fixture-виклики вище) справді викликає
+        # Restore-CredentialOperationSnapshots для $currentUserSnapshots,
+        # коли SYSTEM-результати містять Error, і що
+        # Clear-CredentialOperationSnapshots для $currentUserSnapshots
+        # захищено try/finally — переживає виняток з Invoke-AsSystem
+        # (worker timeout, FatalError, збій Task Scheduler тощо).
+        $bothStoreBlockMatch = [regex]::Match(
+            $credentialsSetupScriptText,
+            '\$currentUserSnapshots\s*=\s*if\s*\(\$Action[\s\S]*?\$operationResults\s*=\s*@\(\$currentUserResults\)\s*\+\s*@\(\$systemResults\)'
+        )
+        $bothStoreBlockText = if ($bothStoreBlockMatch.Success) { $bothStoreBlockMatch.Value } else { '' }
+
+        Test-BRAVOCondition `
+            -Condition (
+                $bothStoreBlockMatch.Success -and
+                $bothStoreBlockText -match 'try\s*\{' -and
+                $bothStoreBlockText -match '\}\s*finally\s*\{[\s\S]*Clear-CredentialOperationSnapshots -Snapshots \$currentUserSnapshots' -and
+                $bothStoreBlockText.Contains('Restore-CredentialOperationSnapshots') -and
+                $bothStoreBlockText.Contains('-Snapshots $currentUserSnapshots') -and
+                $bothStoreBlockText.Contains('$Action -ne "Test" -and')
+            ) `
+            -Name 'CredentialsSetup/BothStoreProductionBranchCallsRollbackAndProtectsCleanupWithFinally' `
+            -Failure 'production-гілка StoreFor Both мусить: (1) викликати Restore-CredentialOperationSnapshots -Snapshots $currentUserSnapshots, коли Action не Test і SYSTEM-результати містять Error; (2) звільняти $currentUserSnapshots через Clear-CredentialOperationSnapshots у finally, що переживає виняток з Invoke-AsSystem — інакше SecureString.Copy() лишиться недиспоузнутим при worker timeout/FatalError/збої Task Scheduler'
+    } finally {
+        if ([IO.Directory]::Exists($credentialsTransactionalFixtureRoot)) {
+            Remove-Item -LiteralPath $credentialsTransactionalFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Відновлюємо реальні модулі для решти self-test (наступні секції
     # покладаються на їх наявність, як і до цього ізольованого блоку).
     Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
