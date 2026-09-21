@@ -232,6 +232,46 @@ function New-PatchedFixtureConfigRoot {
     return [pscustomobject]@{ LimsRoot = $limsRoot; BackupRoot = $backupRoot }
 }
 
+function New-AbsentFixtureConfigRoot {
+    # Wave 1C (Issue #216): AFTER-ABSENT-фікстура — той самий широкий
+    # $localConfigLiteral (Секції 1-2 вище, спільний з present-фікстурою),
+    # програмно розширений РІВНО двома path-ключами
+    # (pathSettings.LIMSRoot/pathSettings.BackupRoot), БЕЗ жодного
+    # BRAVO.config. Present-фікстура отримує ці два значення з ПАТЧЕНОГО
+    # BRAVO.config (New-PatchedFixtureConfigRoot вище); у absent-режимі
+    # немає primary-конфігу, який міг би їх задати, тож єдиний спосіб
+    # зробити ефективні вхідні дані рівнозначними — local-override-шар
+    # (Секція 9 owner-runbook). Значення НЕ дублюють increase — це
+    # розширення того самого літералу, а не другий, незалежно підтримуваний
+    # текст.
+    param([Parameter(Mandatory = $true)][string]$DestConfigRoot)
+
+    $limsRoot = Join-Path $DestConfigRoot 'FIXTURE_LIMS'
+    $backupRoot = Join-Path $DestConfigRoot 'FIXTURE_BACKUP'
+    New-Item -ItemType Directory -Path $limsRoot -Force -ErrorAction Stop | Out-Null
+    New-Item -ItemType Directory -Path $backupRoot -Force -ErrorAction Stop | Out-Null
+
+    $absentLocalConfigLiteral = $localConfigLiteral.TrimEnd().TrimEnd('}').TrimEnd() + (
+        "`r`n" +
+        "    'pathSettings.LIMSRoot' = '$($limsRoot.Replace("'", "''"))'`r`n" +
+        "    'pathSettings.BackupRoot' = '$($backupRoot.Replace("'", "''"))'`r`n" +
+        "}`r`n"
+    )
+    [IO.File]::WriteAllText((Join-Path $DestConfigRoot 'BRAVO.local.config'), $absentLocalConfigLiteral, (New-Object System.Text.UTF8Encoding($false)))
+
+    # Fail-closed fixture-гарантія (owner-runbook, Секція 8): якщо
+    # BRAVO.config тут ЯКИМОСЬ чином опиниться (напр. майбутня зміна
+    # New-Item/копіювання помилково зачепить цей каталог), увесь
+    # AFTER-ABSENT-сценарій перестає доводити те, що заявляє його назва —
+    # мовчки продовжувати небезпечно, тому throw, а не попередження.
+    $absentPrimaryConfigPath = Join-Path $DestConfigRoot 'BRAVO.config'
+    if (Test-Path -LiteralPath $absentPrimaryConfigPath -PathType Leaf) {
+        throw "New-AbsentFixtureConfigRoot: BRAVO.config неочікувано присутній у absent-фікстурі ($absentPrimaryConfigPath) — AFTER-ABSENT-сценарій вимагає СПРАВЖНЬОЇ відсутності primary-конфігу."
+    }
+
+    return [pscustomobject]@{ LimsRoot = $limsRoot; BackupRoot = $backupRoot }
+}
+
 function Invoke-ParityCapture {
     param([Parameter(Mandatory = $true)][string]$RuntimeRoot, [Parameter(Mandatory = $true)][string]$ConfigRoot, [Parameter(Mandatory = $true)][string]$WorkDir)
 
@@ -289,7 +329,17 @@ function Get-ParityNormalizedString {
 }
 
 function Compare-ParitySnapshot {
-    param($Path, $Left, $Right, [System.Collections.Generic.List[string]]$Diffs, [string[]]$LeftRootPrefixes, [string[]]$RightRootPrefixes)
+    # Wave 1C (Issue #216): -LeftLabel/-RightLabel — опціональні, дефолт
+    # зберігає ТОЧНО попередній вивід ("BEFORE=...|AFTER=...") для наявного
+    # BEFORE/AFTER-виклику нижче. Третє порівняння (config-present vs
+    # config-absent) передає 'PRESENT'/'ABSENT' явно — без generic
+    # BEFORE/AFTER-міток, які тут були б оманливими (обидва боки — той
+    # самий AFTER-комплект, різниця лише в наявності BRAVO.config).
+    param(
+        $Path, $Left, $Right, [System.Collections.Generic.List[string]]$Diffs,
+        [string[]]$LeftRootPrefixes, [string[]]$RightRootPrefixes,
+        [string]$LeftLabel = 'BEFORE', [string]$RightLabel = 'AFTER'
+    )
 
     $leftIsObj = $null -ne $Left -and $Left -is [System.Management.Automation.PSCustomObject]
     $rightIsObj = $null -ne $Right -and $Right -is [System.Management.Automation.PSCustomObject]
@@ -299,7 +349,7 @@ function Compare-ParitySnapshot {
         foreach ($p in @($leftProps + $rightProps | Sort-Object -Unique)) {
             $lv = if ($leftIsObj -and $leftProps -contains $p) { $Left.$p } else { $null }
             $rv = if ($rightIsObj -and $rightProps -contains $p) { $Right.$p } else { $null }
-            Compare-ParitySnapshot "$Path.$p" $lv $rv $Diffs $LeftRootPrefixes $RightRootPrefixes
+            Compare-ParitySnapshot "$Path.$p" $lv $rv $Diffs $LeftRootPrefixes $RightRootPrefixes -LeftLabel $LeftLabel -RightLabel $RightLabel
         }
         return
     }
@@ -313,14 +363,14 @@ function Compare-ParitySnapshot {
         $rJson = ConvertTo-Json -InputObject @($Right) -Depth 10 -Compress
         $lNorm = Get-ParityNormalizedString -Value $lJson -RootPrefixes $LeftRootPrefixes
         $rNorm = Get-ParityNormalizedString -Value $rJson -RootPrefixes $RightRootPrefixes
-        if ($lNorm -ne $rNorm) { $Diffs.Add("$Path : BEFORE=$lJson | AFTER=$rJson") }
+        if ($lNorm -ne $rNorm) { $Diffs.Add("$Path : $LeftLabel=$lJson | $RightLabel=$rJson") }
         return
     }
     $lStr = if ($null -eq $Left) { '<null>' } else { [string]$Left }
     $rStr = if ($null -eq $Right) { '<null>' } else { [string]$Right }
     $lNorm = Get-ParityNormalizedString -Value $lStr -RootPrefixes $LeftRootPrefixes
     $rNorm = Get-ParityNormalizedString -Value $rStr -RootPrefixes $RightRootPrefixes
-    if ($lNorm -ne $rNorm) { $Diffs.Add("$Path : BEFORE=$lStr | AFTER=$rStr") }
+    if ($lNorm -ne $rNorm) { $Diffs.Add("$Path : $LeftLabel=$lStr | $RightLabel=$rStr") }
 }
 
 # ===== Відомі, задокументовані НАВМИСНІ відмінності (allowlist по
@@ -425,11 +475,52 @@ $knownIntentionalDiffPrefixes = @(
     'lunchArchiveCleanupPath'
 )
 
+# Wave 1C (Issue #216) — allowlist ДЛЯ ІНШОГО порівняння (AFTER-PRESENT
+# vs AFTER-ABSENT, той самий комплект/коміт по обидва боки). НЕ той
+# самий список, що $knownIntentionalDiffPrefixes вище (BEFORE — інший
+# коміт/лінія розробки, тут — той самий коміт, різниця лише в
+# наявності BRAVO.config): переносити BEFORE/AFTER-виправдання сюди
+# приховало б реальну регресію. Лише поля метаданих/provenance, явно
+# узгоджені з owner-runbook Секції 10 — жодного семантичного
+# effective-конфігураційного поля тут НЕМАЄ.
+$knownAbsentIntentionalDiffPrefixes = @(
+    # 'legacy-config' vs 'synthetic-no-config' / composition-мітка —
+    # ОБИДВА боки навмисно описують СПОСІБ композиції, не ефективні
+    # значення.
+    'BravoConfigurationMetadata.Format',
+    'BravoConfigurationMetadata.Mode',
+    'BravoConfigurationMetadata.PrimaryConfigPresent',
+    # Діагностичні поля, чий ЗМІСТ залежить від того, чи існує
+    # primary-конфіг узагалі (present-фікстура використовує реальний
+    # committed BRAVO.config з його власними ignored-globals/unknown-
+    # keys/override-шляхами; absent-фікстура не має primary-конфігу
+    # взагалі, тому ці списки структурно порожні/інші) — не ефективна
+    # конфігурація, а provenance САМОГО primary-файлу.
+    'BravoConfigurationMetadata.PrimaryConfigIgnoredGlobals',
+    'BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys',
+    'BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults',
+    # Версія, оголошена САМИМ primary BRAVO.config — відсутня, коли
+    # primary відсутній.
+    'BravoConfigurationMetadata.LegacyScriptVersion',
+    'BravoConfigurationMetadata.LegacyScriptVersionPresent',
+    'BravoConfigurationMetadata.PackageVersionMatchesLegacyConfig',
+    # Час завантаження — очікувано різний між двома окремими прогонами
+    # (той самий клас, що в BEFORE/AFTER allowlist вище).
+    'BravoConfigurationMetadata.LoadedAt'
+    # LocalConfigOverrides/AppliedLocalOverrideKeys/PrimaryConfigPath/
+    # ConfigPath/ConfigRoot/RuntimeRoot/LocalConfigPath СВІДОМО не
+    # перелічені тут: перші два вирівнюються програмно (видаленням двох
+    # fixture-only ключів з ABSENT-боку) нижче, а решта — шляхи, які вже
+    # нормалізує Get-ParityNormalizedString через RootPrefixes.
+)
+
 $worktreePath = $null
 $beforeConfigRoot = $null
 $afterConfigRoot = $null
 $beforeWorkDir = $null
 $afterWorkDir = $null
+$absentConfigRoot = $null
+$absentWorkDir = $null
 try {
     Write-Host "Base ref: $BaseRef" -ForegroundColor Cyan
     Write-Host "After root: $AfterRoot" -ForegroundColor Cyan
@@ -462,7 +553,9 @@ try {
     $afterConfigRoot = Join-Path $tempRoot ('BRAVO_PARITY_AFTER_' + [guid]::NewGuid().ToString('N'))
     $beforeWorkDir = Join-Path $tempRoot ('BRAVO_PARITY_BEFORE_CHILD_' + [guid]::NewGuid().ToString('N'))
     $afterWorkDir = Join-Path $tempRoot ('BRAVO_PARITY_AFTER_CHILD_' + [guid]::NewGuid().ToString('N'))
-    foreach ($d in @($beforeConfigRoot, $afterConfigRoot, $beforeWorkDir, $afterWorkDir)) {
+    $absentConfigRoot = Join-Path $tempRoot ('BRAVO_PARITY_ABSENT_' + [guid]::NewGuid().ToString('N'))
+    $absentWorkDir = Join-Path $tempRoot ('BRAVO_PARITY_ABSENT_CHILD_' + [guid]::NewGuid().ToString('N'))
+    foreach ($d in @($beforeConfigRoot, $afterConfigRoot, $beforeWorkDir, $afterWorkDir, $absentConfigRoot, $absentWorkDir)) {
         New-Item -ItemType Directory -Path $d -Force -ErrorAction Stop | Out-Null
     }
 
@@ -503,7 +596,59 @@ try {
     }
 
     Write-Host ""
-    Write-Host "PASS: config-present сценарій паритетний між BEFORE (PR B, $baseCommit) і AFTER — усі відмінності або path-артефакти fixture-методики, або задокументовані навмисні зміни (адитивні метадані Секцій 2-3, canonical-default фікс Секції 5)." -ForegroundColor Green
+    Write-Host "PASS: config-present parity PASS — BEFORE (PR B, $baseCommit) і AFTER паритетні: усі відмінності або path-артефакти fixture-методики, або задокументовані навмисні зміни (адитивні метадані Секцій 2-3, canonical-default фікс Секції 5)." -ForegroundColor Green
+
+    # ============================================================
+    # Wave 1C (Issue #216) — ТРЕТІЙ сценарій: AFTER-ABSENT. Доводить
+    # EffectiveConfig(config-absent) == EffectiveConfig(config-present) на
+    # ТОМУ САМОМУ комплекті (AfterRoot/поточний working tree), з тими
+    # самими site-вхідними даними — єдина відмінність фікстур: наявність
+    # BRAVO.config.
+    # ============================================================
+    $absentFixture = New-AbsentFixtureConfigRoot -DestConfigRoot $absentConfigRoot
+
+    Write-Host ""
+    Write-Host "Захоплення AFTER-ABSENT (без BRAVO.config) знімку..." -ForegroundColor Cyan
+    $absentSnapshot = Invoke-ParityCapture -RuntimeRoot $AfterRoot -ConfigRoot $absentConfigRoot -WorkDir $absentWorkDir
+
+    # Section 10 owner-runbook: LocalConfigOverrides/AppliedLocalOverrideKeys
+    # НЕ блокет-ігноруються. ABSENT-бік застосовує РІВНО на два local-
+    # override-ключі більше, ніж PRESENT (pathSettings.LIMSRoot,
+    # pathSettings.BackupRoot — у PRESENT ці два значення приходять з
+    # ПАТЧЕНОГО primary BRAVO.config, не з local override). Знімаємо
+    # рівно ці два ключі з ABSENT-списків ПЕРЕД порівнянням; усе інше в
+    # цих двох полях мусить збігатися з PRESENT точно.
+    $fixtureOnlyLocalOverrideKeys = @('pathSettings.LIMSRoot', 'pathSettings.BackupRoot')
+    foreach ($localOverrideFieldName in @('LocalConfigOverrides', 'AppliedLocalOverrideKeys')) {
+        $absentFieldValue = @($absentSnapshot.BravoConfigurationMetadata.$localOverrideFieldName)
+        $absentFieldValueTrimmed = @($absentFieldValue | Where-Object { $fixtureOnlyLocalOverrideKeys -notcontains $_ })
+        $absentSnapshot.BravoConfigurationMetadata.$localOverrideFieldName = $absentFieldValueTrimmed
+    }
+
+    $absentDiffs = New-Object System.Collections.Generic.List[string]
+    foreach ($name in $capturedNames) {
+        Compare-ParitySnapshot $name $afterSnapshot.$name $absentSnapshot.$name $absentDiffs `
+            @($afterConfigRoot, $AfterRoot) @($absentConfigRoot, $AfterRoot) -LeftLabel 'PRESENT' -RightLabel 'ABSENT'
+    }
+
+    $unexpectedAbsentDiffs = @($absentDiffs | Where-Object {
+        $line = $_
+        -not (@($knownAbsentIntentionalDiffPrefixes | Where-Object { $line.StartsWith($_) })).Count
+    })
+
+    Write-Host ""
+    Write-Host "Усього відмінностей PRESENT vs ABSENT (сирих, до фільтра root-шляхів і allowlist): $($absentDiffs.Count)" -ForegroundColor Cyan
+    Write-Host "Неочікуваних (потенційна регресія): $($unexpectedAbsentDiffs.Count)" -ForegroundColor $(if ($unexpectedAbsentDiffs.Count -gt 0) { 'Red' } else { 'Green' })
+
+    if ($unexpectedAbsentDiffs.Count -gt 0) {
+        Write-Host ""
+        Write-Host "РЕГРЕСІЯ: наступні поля effective graph відрізняються між AFTER-PRESENT і AFTER-ABSENT без задокументованого обґрунтування:" -ForegroundColor Red
+        $unexpectedAbsentDiffs | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "PASS: config-absent parity PASS — AFTER-PRESENT і AFTER-ABSENT паритетні на еквівалентних вхідних даних: усі відмінності або path-артефакти fixture-методики, або задокументовані provenance/метадані-винятки (owner-runbook Секція 10)." -ForegroundColor Green
     exit 0
 } finally {
     if ($worktreePath -and (Test-Path -LiteralPath $worktreePath)) {
@@ -512,7 +657,7 @@ try {
         & git -C $AfterRoot worktree remove --force $worktreePath 2>&1 | Out-Null
         $ErrorActionPreference = $callEap
     }
-    foreach ($d in @($beforeConfigRoot, $afterConfigRoot, $beforeWorkDir, $afterWorkDir)) {
+    foreach ($d in @($beforeConfigRoot, $afterConfigRoot, $beforeWorkDir, $afterWorkDir, $absentConfigRoot, $absentWorkDir)) {
         if ($d -and (Test-Path -LiteralPath $d)) {
             Remove-Item -LiteralPath $d -Recurse -Force -ErrorAction SilentlyContinue
         }
