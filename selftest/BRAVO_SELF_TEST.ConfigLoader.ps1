@@ -1046,7 +1046,12 @@ function New-BRAVOConfigLoaderSecurityDowngradeProbe {
     param(
         [Parameter(Mandatory = $true)][bool]$WithPrimary,
         [Parameter(Mandatory = $true)][string]$LocalConfigBody,
-        [string]$AllowWeakenedEnvValue = ''
+        [string]$AllowWeakenedEnvValue = '',
+        # Wave 1B (Issue #216): дозволяє викликачу перевіряти інший
+        # ефективний $global:-вузол (напр. requireAdministrator), ніж
+        # backupConsistency.Mode. Порожній рядок (default) зберігає ТОЧНО
+        # попередню поведінку для всіх наявних викликачів.
+        [string]$ResultExpression = ''
     )
     $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) (
         "BRAVO_SECDOWNGRADE_{0}_{1}" -f $(if ($WithPrimary) { 'PRIMARY' } else { 'NOCONFIG' }), [guid]::NewGuid().ToString('N')
@@ -1063,11 +1068,16 @@ function New-BRAVOConfigLoaderSecurityDowngradeProbe {
         } else {
             ''
         }
+        $resultExpr = if (-not [string]::IsNullOrWhiteSpace($ResultExpression)) {
+            $ResultExpression
+        } else {
+            "'RESULT:Mode=' + [string]`$global:backupConsistency.Mode"
+        }
         $probeCommand = (
             "try { $envPrefix" +
             ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
             "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
-            "'RESULT:Mode=' + [string]`$global:backupConsistency.Mode" +
+            "$resultExpr" +
             "} catch { 'THREW: ' + `$_.Exception.Message }"
         )
         $probeOutput = [string](
@@ -1142,6 +1152,168 @@ try {
 }
 
 # ============================================================
+# Wave 1B (Issue #216): requireAdministrator приєднано до ТОГО САМОГО
+# post-merge Test-BRAVOEffectiveSecurityInvariants-контролю, що
+# backupConsistency.Mode/toolIntegritySettings.Mode вище — той самий
+# Enforce/Warn + BRAVO_ALLOW_WEAKENED_SECURITY=1 механізм, ті самі
+# BRAVO.local.config-вектори обходу pre-trust guard. Три випадки
+# розрізняються явно: відсутній leaf / $false / не-Boolean значення.
+# ============================================================
+$reqAdminBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_REQADMIN_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($reqAdminBackupRootDir)
+$reqAdminBackupRootLiteral = $reqAdminBackupRootDir.Replace("'", "''")
+$reqAdminResultExpression = (
+    "`$reqAdminVar = Get-Variable -Name 'requireAdministrator' -Scope Global -ErrorAction SilentlyContinue; " +
+    "if (`$null -eq `$reqAdminVar) { 'RESULT:ReqAdmin=<missing>' } " +
+    "else { 'RESULT:ReqAdmin=' + [string]`$reqAdminVar.Value + ';Type=' + `$reqAdminVar.Value.GetType().Name }"
+)
+
+try {
+    # --- ConfigLoader/RequireAdministratorSecureValuePasses: жодного
+    # override requireAdministrator -> canonical default ($true) лишається
+    # ефективним, запуск НЕ повинен блокуватись.
+    $reqAdminSafeBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$reqAdminBackupRootLiteral'`r`n" +
+        "}`r`n"
+    )
+    $reqAdminSafeResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $reqAdminSafeBody -ResultExpression $reqAdminResultExpression
+    Test-BRAVOCondition `
+        -Condition ($reqAdminSafeResult -eq 'RESULT:ReqAdmin=True;Type=Boolean') `
+        -Name "ConfigLoader/RequireAdministratorSecureValuePasses" `
+        -Failure "canonical default requireAdministrator=`$true не повинен блокуватись і має лишитись Boolean `$true; отримано: $reqAdminSafeResult"
+
+    # --- ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedNoConfig:
+    # BRAVO.config відсутній, BRAVO.local.config встановлює
+    # requireAdministrator=$false -> МАЄ БЛОКУВАТИ (той самий вектор обходу
+    # pre-trust guard, що backupConsistency.Mode вище).
+    $reqAdminFalseBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$reqAdminBackupRootLiteral'`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "}`r`n"
+    )
+    $reqAdminNoConfigResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $reqAdminFalseBody -ResultExpression $reqAdminResultExpression
+    Test-BRAVOCondition `
+        -Condition (
+            $reqAdminNoConfigResult.StartsWith('THREW') -and
+            $reqAdminNoConfigResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ')
+        ) `
+        -Name "ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedNoConfig" `
+        -Failure "BRAVO.config відсутній + BRAVO.local.config встановлює requireAdministrator=`$false -> МАЄ БЛОКУВАТИ; отримано: $reqAdminNoConfigResult"
+
+    # --- ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedWithPrimary:
+    # те саме, але BRAVO.config ПРИСУТНІЙ — local override все одно
+    # перекриває на ефективному рівні -> МАЄ БЛОКУВАТИ так само.
+    $reqAdminWithPrimaryResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $true -LocalConfigBody $reqAdminFalseBody -ResultExpression $reqAdminResultExpression
+    Test-BRAVOCondition `
+        -Condition (
+            $reqAdminWithPrimaryResult.StartsWith('THREW') -and
+            $reqAdminWithPrimaryResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ')
+        ) `
+        -Name "ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedWithPrimary" `
+        -Failure "BRAVO.config присутній + BRAVO.local.config встановлює requireAdministrator=`$false -> МАЄ БЛОКУВАТИ; отримано: $reqAdminWithPrimaryResult"
+
+    # --- ConfigLoader/RequireAdministratorDowngradeAllowedWithExplicitOverride:
+    # BRAVO_ALLOW_WEAKENED_SECURITY=1 дозволяє свідоме послаблення (з
+    # видимим слідом), а не блокує.
+    $reqAdminOverrideResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $reqAdminFalseBody -AllowWeakenedEnvValue '1' `
+        -ResultExpression $reqAdminResultExpression
+    Test-BRAVOCondition `
+        -Condition ($reqAdminOverrideResult -eq 'RESULT:ReqAdmin=False;Type=Boolean') `
+        -Name "ConfigLoader/RequireAdministratorDowngradeAllowedWithExplicitOverride" `
+        -Failure "BRAVO_ALLOW_WEAKENED_SECURITY=1 має дозволяти requireAdministrator=`$false (з видимим слідом), а не блокувати; отримано: $reqAdminOverrideResult"
+
+    # --- ConfigLoader/RequireAdministratorDowngradeDiagnosticIsExplicit:
+    # реальний end-to-end шлях (BRAVO.local.config -> Import-BravoConfiguration)
+    # ловить не-Boolean requireAdministrator ЩЕ РАНІШЕ, ніж
+    # Test-BRAVOEffectiveSecurityInvariants: Test-BRAVOConfigurationOverrideSchema
+    # виводить очікуваний тип із canonical default ($true -> Boolean) і
+    # відхиляє 'STRING-NOT-BOOL' fail-closed з власним явним повідомленням.
+    # Це ВАЛІДНИЙ шар захисту в глибину (той самий підсумок: блокує, з
+    # явним типовим діагнозом, не мовчки [bool]-coerce), тому тест
+    # перевіряє САМЕ цей фактичний шлях.
+    $reqAdminNonBoolBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$reqAdminBackupRootLiteral'`r`n" +
+        "    'requireAdministrator' = 'STRING-NOT-BOOL'`r`n" +
+        "}`r`n"
+    )
+    $reqAdminNonBoolResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $reqAdminNonBoolBody -ResultExpression $reqAdminResultExpression
+    Test-BRAVOCondition `
+        -Condition (
+            $reqAdminNonBoolResult.StartsWith('THREW') -and
+            $reqAdminNonBoolResult.Contains('очікується логічне значення') -and
+            $reqAdminNonBoolResult.Contains('requireAdministrator')
+        ) `
+        -Name "ConfigLoader/RequireAdministratorDowngradeDiagnosticIsExplicit" `
+        -Failure "requireAdministrator='STRING-NOT-BOOL' (не-Boolean) МАЄ БЛОКУВАТИ з окремим, явним типовим діагностичним повідомленням (схема відхиляє нетипізоване значення ще до post-merge перевірки, не мовчки [bool]-coerce до `$true); отримано: $reqAdminNonBoolResult"
+
+    # --- ConfigLoader/RequireAdministratorInvariantOwnNonBooleanBranch:
+    # схема-шар вище блокує не-Boolean ЩЕ ДО Test-BRAVOEffectiveSecurityInvariants
+    # для звичайного BRAVO.local.config-шляху — цей тест викликає саму
+    # інваріант-функцію НАПРЯМУ з $global:requireAdministrator, встановленим
+    # у не-Boolean значення в обхід схеми, щоб довести, що ВЛАСНА
+    # "не є Boolean"-гілка Test-BRAVOEffectiveSecurityInvariants (не лише
+    # схема) теж явно блокує — захист у глибину, а не єдина точка відмови.
+    $reqAdminInvariantNonBoolProbeCommand = (
+        "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+        "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
+        "`$global:toolIntegritySettings = @{ Mode = 'Enforce' }; " +
+        "`$global:requireAdministrator = 'STRING-NOT-BOOL'; " +
+        "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
+    )
+    $reqAdminInvariantNonBoolResult = [string](
+        & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reqAdminInvariantNonBoolProbeCommand 2>&1 | Out-String
+    ).Trim()
+    Test-BRAVOCondition `
+        -Condition (
+            $reqAdminInvariantNonBoolResult.StartsWith('THREW') -and
+            $reqAdminInvariantNonBoolResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -and
+            $reqAdminInvariantNonBoolResult.Contains('не є Boolean-значенням')
+        ) `
+        -Name "ConfigLoader/RequireAdministratorInvariantOwnNonBooleanBranch" `
+        -Failure "Test-BRAVOEffectiveSecurityInvariants ВЛАСНА гілка не-Boolean (незалежно від схеми) мусить блокувати з повідомленням 'не є Boolean-значенням'; отримано: $reqAdminInvariantNonBoolResult"
+} finally {
+    Remove-Item -LiteralPath $reqAdminBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# --- ConfigLoader/RequireAdministratorMissingBlocks: викликає
+# Test-BRAVOEffectiveSecurityInvariants НАПРЯМУ у чистому процесі (без
+# Import-BravoConfiguration), тому $global:requireAdministrator фактично
+# ВІДСУТНІЙ (не просто $false) — окремий case від "$false", який
+# неможливо відтворити через звичайний override-шлях (canonical default
+# завжди встановлює якесь значення). backupConsistency/toolIntegritySettings
+# встановлюються явно безпечними значеннями, щоб StrictMode-звернення до
+# них у ЦІЙ самій функції не кинуло раніше, ніж дійде до перевірки
+# requireAdministrator (ізоляція однієї змінної під тестом).
+$reqAdminMissingProbeCommand = (
+    "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+    "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
+    "`$global:toolIntegritySettings = @{ Mode = 'Enforce' }; " +
+    "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$reqAdminMissingResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $reqAdminMissingProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition (
+        $reqAdminMissingResult.StartsWith('THREW') -and
+        $reqAdminMissingResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -and
+        $reqAdminMissingResult.Contains('requireAdministrator відсутній')
+    ) `
+    -Name "ConfigLoader/RequireAdministratorMissingBlocks" `
+    -Failure "відсутній `$global:requireAdministrator (не просто `$false) МАЄ БЛОКУВАТИ з окремим діагностичним повідомленням 'requireAdministrator відсутній'; отримано: $reqAdminMissingResult"
+
+# ============================================================
 # P0 Configuration Foundation (PR C, Секція 5.5): МЕХАНІЧНИЙ доказ, що
 # pre-trust AST-правила (BRAVO_RUNTIME_GUARD.ps1, статичний текст
 # BRAVO.config) і post-merge effective-правила
@@ -1206,11 +1378,75 @@ function Compare-BRAVOConfigurationGraphForParity {
         }
         return
     }
-    $actualText = if ($Actual -is [array]) { ($Actual -join ',') } else { [string]$Actual }
-    $expectedText = if ($Expected -is [array]) { ($Expected -join ',') } else { [string]$Expected }
+
+    # Wave 1A (Issue #216): попередня версія цього порівняння стрінгіфікувала
+    # обидва боки (-join ',' / [string]) ДО порівняння — '5' проти 5, 'True'
+    # проти $true, '' проти @(), @('a,b') проти @('a','a') усі виглядали б
+    # ІДЕНТИЧНИМИ й diff не з'являвся. $Actual тут завжди пройшов через
+    # ConvertTo-Json/ConvertFrom-Json round-trip (пробний процес серіалізує
+    # ефективні $global:-значення в JSON), тому точний CLR-тип (Int32 проти
+    # Int64) НЕ зберігається навіть для правильних значень — звідси
+    # порівняння за категорією типу (Kind), а не за точним .GetType(),
+    # інакше кожен цілочисельний leaf хибно позначався б як "тип
+    # відрізняється".
+    $actualIsArray = ($Actual -is [array])
+    $expectedIsArray = ($Expected -is [array])
+    if ($actualIsArray -or $expectedIsArray) {
+        if (-not ($actualIsArray -and $expectedIsArray)) {
+            [void]$Diffs.Add(
+                "$Path : BRAVO.config kind=$(Get-BRAVOParityValueKind $Actual) ('$Actual') " +
+                "canonical default kind=$(Get-BRAVOParityValueKind $Expected) ('$Expected') — масив проти не-масиву")
+            return
+        }
+        $actualArray = @($Actual)
+        $expectedArray = @($Expected)
+        if ($actualArray.Count -ne $expectedArray.Count) {
+            [void]$Diffs.Add(
+                "$Path : довжина масиву BRAVO.config=$($actualArray.Count) ('$($actualArray -join ',')') " +
+                "canonical default=$($expectedArray.Count) ('$($expectedArray -join ',')')")
+            return
+        }
+        for ($elementIndex = 0; $elementIndex -lt $actualArray.Count; $elementIndex++) {
+            Compare-BRAVOConfigurationGraphForParity `
+                -Actual $actualArray[$elementIndex] -Expected $expectedArray[$elementIndex] `
+                -Path "$Path[$elementIndex]" -Diffs $Diffs
+        }
+        return
+    }
+
+    $actualKind = Get-BRAVOParityValueKind -Value $Actual
+    $expectedKind = Get-BRAVOParityValueKind -Value $Expected
+    if ($actualKind -ne $expectedKind) {
+        [void]$Diffs.Add(
+            "$Path : тип BRAVO.config=$actualKind ('$Actual') тип canonical default=$expectedKind ('$Expected') — тип відрізняється")
+        return
+    }
+    if ($actualKind -eq 'Null') { return }
+
+    $actualText = [string]$Actual
+    $expectedText = [string]$Expected
     if ($actualText -ne $expectedText) {
         [void]$Diffs.Add("$Path : BRAVO.config='$actualText' canonical default='$expectedText'")
     }
+}
+
+function Get-BRAVOParityValueKind {
+    # Категорія типу, а не точний CLR-тип: значення $Actual пройшло через
+    # ConvertTo-Json/ConvertFrom-Json (див. коментар вище) — Int32 і Int64
+    # обидва мають потрапити в категорію 'Number', інакше типово коректний
+    # leaf хибно позначався б як розбіжність типу. String проти Number/
+    # Boolean лишаються РІЗНИМИ категоріями навмисно — саме це ловить
+    # '5' проти 5 і 'True' проти $true.
+    param($Value)
+    if ($null -eq $Value) { return 'Null' }
+    if ($Value -is [bool]) { return 'Boolean' }
+    if ($Value -is [string]) { return 'String' }
+    if ($Value -is [byte] -or $Value -is [sbyte] -or $Value -is [int16] -or $Value -is [uint16] -or `
+        $Value -is [int32] -or $Value -is [uint32] -or $Value -is [int64] -or $Value -is [uint64] -or `
+        $Value -is [single] -or $Value -is [double] -or $Value -is [decimal]) {
+        return 'Number'
+    }
+    return [string]$Value.GetType().Name
 }
 
 $parityDefaultConfiguration = Get-BRAVODefaultConfiguration
@@ -1270,6 +1506,39 @@ Test-BRAVOCondition `
     -Condition (-not $parityParseFailed -and @($parityDiffs).Count -eq 0) `
     -Name "ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults" `
     -Failure "committed BRAVO.config НЕ повинен мовчки дублювати canonical product-default ІНШИМ значенням (built-in defaults мають бути єдиним джерелом істини навіть у config-present режимі); parseFailed=$parityParseFailed diffs: $(if ($null -ne $parityDiffs) { $parityDiffs -join ' | ' } else { '(none captured)' })"
+
+# ============================================================
+# Wave 1A (Issue #216) — регресійний доказ, що
+# Compare-BRAVOConfigurationGraphForParity є type-aware, а не стрінгіфікує
+# обидва боки перед порівнянням (історичний ґеп: '5' проти 5, 'True'
+# проти $true, '' проти @(), @('a,b') проти @('a','b') раніше виглядали
+# ІДЕНТИЧНИМИ). Викликає компаратор напряму (не через повний JSON-пробник
+# BRAVO.config), щоб перевірка була детермінованою й не залежала від
+# фактичного вмісту committed BRAVO.config.
+# ============================================================
+$parityTypeAwareCases = @(
+    @{ Name = 'StringVsIntSameText'; Actual = @{ sftpPort = '22' }; Expected = @{ sftpPort = 22 }; ExpectDiff = $true }
+    @{ Name = 'StringVsIntDifferentText'; Actual = @{ sftpPort = 'STRING-NOT-INT' }; Expected = @{ sftpPort = 22 }; ExpectDiff = $true }
+    @{ Name = 'StringVsBoolSameText'; Actual = @{ Flag = 'True' }; Expected = @{ Flag = $true }; ExpectDiff = $true }
+    @{ Name = 'EmptyStringVsEmptyArray'; Actual = @{ List = '' }; Expected = @{ List = @() }; ExpectDiff = $true }
+    @{ Name = 'JoinedArrayVsSeparateElements'; Actual = @{ List = @('a,b') }; Expected = @{ List = @('a', 'b') }; ExpectDiff = $true }
+    @{ Name = 'SameIntDifferentCLRWidth'; Actual = @{ sftpPort = [int64]22 }; Expected = @{ sftpPort = [int32]22 }; ExpectDiff = $false }
+    @{ Name = 'IdenticalStrings'; Actual = @{ InstitutionCode = 'ABC' }; Expected = @{ InstitutionCode = 'ABC' }; ExpectDiff = $false }
+)
+$parityTypeAwareFailures = New-Object System.Collections.Generic.List[string]
+foreach ($parityCase in $parityTypeAwareCases) {
+    $caseDiffs = New-Object System.Collections.Generic.List[string]
+    Compare-BRAVOConfigurationGraphForParity -Actual $parityCase.Actual -Expected $parityCase.Expected -Path 'root' -Diffs $caseDiffs
+    $caseHasDiff = ($caseDiffs.Count -gt 0)
+    if ($caseHasDiff -ne $parityCase.ExpectDiff) {
+        [void]$parityTypeAwareFailures.Add(
+            "$($parityCase.Name): очікувалось ExpectDiff=$($parityCase.ExpectDiff), отримано diffCount=$($caseDiffs.Count) ($($caseDiffs -join ' | '))")
+    }
+}
+Test-BRAVOCondition `
+    -Condition ($parityTypeAwareFailures.Count -eq 0) `
+    -Name "ConfigLoader/ParityComparatorIsTypeAware" `
+    -Failure "Compare-BRAVOConfigurationGraphForParity мусить порівнювати тип leaf-значення явно (не -join ',' / [string]-стрінгіфікацію) — провалені кейси: $($parityTypeAwareFailures -join ' ;; ')"
 
 # P0 Configuration Foundation (PR C, Секція 9): BRAVO.local.config —
 # site-specific override-шар (LIMSRoot/BackupRoot/розклад/креденшел-таргети

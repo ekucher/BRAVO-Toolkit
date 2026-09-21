@@ -802,6 +802,28 @@ function Test-BRAVOEffectiveSecurityInvariants {
             "(підмінений 7za.exe/WinSCP більше не блокує запуск)")
     }
 
+    # Wave 1B (Issue #216): requireAdministrator — той самий post-merge
+    # ефективний контроль, що backupConsistency.Mode/toolIntegritySettings.Mode
+    # вище. Навмисно НЕ [bool]$value (у PowerShell [bool]'false' -eq $true —
+    # текстова "фальшива хибність" мовчки пройшла б як secure). Три випадки
+    # розрізняються явно: відсутній / не Boolean / Boolean-$false — усі три
+    # трактуються як послаблення й проходять через той самий
+    # Enforce/Warn + BRAVO_ALLOW_WEAKENED_SECURITY=1 механізм.
+    $requireAdministratorVariable = Get-Variable -Name 'requireAdministrator' -Scope Global -ErrorAction SilentlyContinue
+    if ($null -eq $requireAdministratorVariable) {
+        [void]$weakened.Add(
+            "requireAdministrator відсутній в ефективній конфігурації (очікується `$true — " +
+            "без нього не гарантована обов'язкова перевірка адміністративних прав)")
+    } elseif ($requireAdministratorVariable.Value -isnot [bool]) {
+        [void]$weakened.Add(
+            "requireAdministrator = '$($requireAdministratorVariable.Value)' не є Boolean-значенням " +
+            "(очікується саме `$true — нетипізоване значення не гарантує перевірку прав)")
+    } elseif ($requireAdministratorVariable.Value -eq $false) {
+        [void]$weakened.Add(
+            "requireAdministrator = `$false " +
+            "(процес може виконуватись без адміністративних прав — обов'язкова перевірка вимкнена)")
+    }
+
     if ($weakened.Count -eq 0) { return }
 
     if ($allowWeakened -eq '1') {
