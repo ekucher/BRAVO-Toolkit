@@ -71,10 +71,59 @@ function Merge-BRAVOConfiguratorCandidateOverrides {
     foreach ($path in $schemaPaths) {
         $setting = @($Model | Where-Object { $_.Path -eq $path })
         if ($setting.Count -ne 1) { continue }
+
+        if ($merged.Contains($path)) {
+            # Canonical leaf уже представлений плоским top-level ключем —
+            # поведінка ДО N1, без змін.
+            if ($setting[0].OverridePresent) {
+                $merged[$path] = $setting[0].OverrideValue
+            } else {
+                $merged.Remove($path)
+            }
+            continue
+        }
+
+        # PR #224 review, N1: плоский ключ відсутній — це НЕ те саме, що
+        # "leaf не supplied". Легасі pre-F1 файл міг supply-нути цей самий
+        # canonical leaf через вкладений Node-контейнер (напр.
+        # 'backupMonitoring.SFTP.BAZA' = @{ Mode = 'Legacy' }). БЕЗ цієї
+        # перевірки старий код мовчки додав/лишав контейнер незмінним і
+        # НІКОЛИ не міг видалити такий leaf через Clear (F2-стиль
+        # deadlock, але для вкладеної форми) — читаємо провенанс проти
+        # ПОТОЧНОГО $merged (не проти $ExistingOverrides), бо попередні
+        # ітерації цього ж циклу вже могли розгорнути той самий контейнер
+        # для сусіднього листа (напр. і Mode, і AutoArchiveMutationThreshold
+        # під одним 'backupMonitoring.SFTP.BAZA').
+        $suppliedNested = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $merged -LeafPath $path
+        if ($suppliedNested.Found -and $suppliedNested.NestedPath.Count -gt 0) {
+            # Canonical Configurator-серіалізатор (ConvertTo-BRAVOConfiguratorPowerShellLiteral)
+            # fail-closed відмовляється записувати hashtable-значення —
+            # Configurator ФІЗИЧНО не може зберегти вкладену форму.
+            # Розгортаємо ВЕСЬ контейнер (усі члени, включно з невідомими/
+            # новішими нащадками — §4: значення зберігаються, форма
+            # представлення міняється на плоску) у флет dot-шляхи ОДИН
+            # РАЗ — далі $path вже звичайний плоский ключ у $merged, і
+            # решта ітерацій циклу (для сусідніх листів того самого
+            # контейнера) природно потрапляють у гілку "уже плоский" вище.
+            Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $suppliedNested.TopLevelKey
+
+            if ($merged.Contains($path)) {
+                if ($setting[0].OverridePresent) {
+                    $merged[$path] = $setting[0].OverrideValue
+                } else {
+                    $merged.Remove($path)
+                }
+            } elseif ($setting[0].OverridePresent) {
+                $merged[$path] = $setting[0].OverrideValue
+            }
+            continue
+        }
+
+        # Справді новий override — жодної представленості (ні плоскої, ні
+        # вкладеної) не існувало. Поведінка ДО N1, без змін: OverridePresent=false
+        # тут завжди no-op (Contains($path) уже перевірено вище як false).
         if ($setting[0].OverridePresent) {
             $merged[$path] = $setting[0].OverrideValue
-        } elseif ($merged.Contains($path)) {
-            $merged.Remove($path)
         }
     }
 

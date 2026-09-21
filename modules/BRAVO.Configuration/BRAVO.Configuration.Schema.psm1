@@ -806,8 +806,28 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'schedulerSettings.WindowStyle' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Normal,Minimized,Maximized,Hidden' }
     'sftpConnectionTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.ArchivLog' = @{ Class = 'ALLOW_SITE' }
-    'sftpDirectories.BAZA' = @{ Class = 'DENY_DERIVED' }
-    'sftpDirectories.BAZAWWW' = @{ Class = 'DENY_DERIVED' }
+    # PR #224 review, N3: пере-класифіковано з DENY_DERIVED на ALLOW_SITE
+    # (2026-09-22, review remediation) — доведено фактичною трасою
+    # BRAVO.Configuration.Derivation.psm1:285-288 ("sftpDirectories — уже
+    # повністю raw-параметр (без похідних полів)", `$global:sftpDirectories
+    # = $sftpDirectories` — пряма проєкція без обчислення) і
+    # Get-BRAVOEffectiveSynchronizationConfiguration
+    # (BRAVO.Discovery.psm1:2112/2122), де `$SftpDirectories['BAZA']`/
+    # `['BAZAWWW']` передається в SftpRemoteDirectory АС IS, без деривації.
+    # Канонічний дефолт (BRAVO.Configuration.psm1:360-361, "baza_app"/
+    # "baza_www") — такий самий сирий рядок-каталог, що й усі сусідні
+    # sftpDirectories.* (MODEL/Blog/BravoExch/Manifest/...), усі вже
+    # ALLOW_SITE. Це НЕ шлях discovery BAZA_APP/BAZA_WWW SOURCE
+    # (BRAVO.Discovery.psm1 Resolve-BRAVODiscoveryPathComponentPresence) —
+    # той домен справді похідний/евристичний, але не має власного запису
+    # в цьому реєстрі; тут ідеться про ім'я SFTP remote-каталогу, суто
+    # site-конфігурований оператором рядок, без жодної деривації.
+    # Жоден security-інваріант не залежить від фіксованого імені цього
+    # каталогу — append-only mutation-детекція (BAZA.Mode/MutationPolicy,
+    # лишаються DENY_SECURITY_CONTROL) працює незалежно від того, як
+    # називається remote-каталог.
+    'sftpDirectories.BAZA' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.BAZAWWW' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.Blog' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.BravoExch' = @{ Class = 'ALLOW_SITE' }
     'sftpDirectories.ExchangeApiLogs' = @{ Class = 'ALLOW_SITE' }
@@ -1030,6 +1050,30 @@ function Test-BRAVOConfigurationAuthorizationUrlArray {
 }
 
 function Test-BRAVOConfigurationAuthorizationTaskSchedulerPath {
+    <#
+    .DESCRIPTION
+        PR #224 review, N2: попередня версія вимагала, щоб СИРЕ значення
+        вже було у нормалізованій формі `\...\` (regex `^\\.*\\$`) — це
+        суворіше за фактичний runtime-контракт. Канонічний нормалізатор
+        schedulerSettings.TaskPath — ConvertTo-BRAVOTaskPath
+        (modules/BRAVO.System/BRAVO.System.psm1) — робить
+        `.Trim().Trim('\')`, потім відхиляє неприпустимі символи
+        (`[/:*?"<>|]`) і dot-сегменти (`.`/`..`), і повертає
+        нормалізовану `\<value>\`. Форми на кшталт 'BRAVO', '\BRAVO',
+        'BRAVO\' — валідні pre-Wave-2 вхідні дані, що нормалізатор уже
+        приймав; ця авторизація мала їх помилково відхиляти.
+        Замість дублювання regex-граматики нормалізатора (друга,
+        незалежна копія тієї самої політики — заборонено архітектурною
+        політикою), авторизація ВИКЛИКАЄ сам канонічний
+        ConvertTo-BRAVOTaskPath і трактує виняток як IsValid=$false.
+        Напрямок залежності Configuration -> System безпечний: System —
+        листовий модуль (не має власних Import-Module, не залежить від
+        Configuration), тож циклу немає.
+        Валідація лише перевіряє прийнятність — САМЕ значення, що йде
+        далі в merge, НЕ підмінюється нормалізованою формою; runtime-
+        консюмер (BRAVO_TASKS_INSTALL.ps1 та інші) і далі сам викликає
+        ConvertTo-BRAVOTaskPath над сирим значенням у момент використання.
+    #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -1037,8 +1081,21 @@ function Test-BRAVOConfigurationAuthorizationTaskSchedulerPath {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    if ($null -eq $Value -or $Value -isnot [string] -or -not [regex]::IsMatch([string]$Value, '^\\.*\\$')) {
-        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: значення мусить починатись і закінчуватись символом '\'." }
+    if ($null -eq $Value -or $Value -isnot [string]) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: значення мусить бути рядком (шлях Task Scheduler)." }
+    }
+
+    if (-not (Get-Module -Name 'BRAVO.System')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop
+    }
+
+    try {
+        # Лише валідація — повернене нормалізоване значення свідомо
+        # відкидається ([void]), сире $Value НЕ мутується й НЕ
+        # повертається звідси.
+        [void](ConvertTo-BRAVOTaskPath -TaskPath ([string]$Value))
+    } catch {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: $($_.Exception.Message)" }
     }
     return [pscustomobject]@{ IsValid = $true; Message = $null }
 }

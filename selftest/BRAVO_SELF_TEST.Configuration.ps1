@@ -1562,15 +1562,23 @@
     $authDenySecurityCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_SECURITY_CONTROL'
     $authDenyExecutionCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_EXECUTION_CONTROL'
     $authDenyInternalCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_INTERNAL_METADATA'
+    # PR #224 review, N3 (2026-09-22): sftpDirectories.BAZA/BAZAWWW
+    # пере-класифіковано DENY_DERIVED -> ALLOW_SITE (доведено трасою:
+    # BRAVO.Configuration.Derivation.psm1:285-288, "sftpDirectories — уже
+    # повністю raw-параметр", пряма проєкція без деривації; та
+    # Get-BRAVOEffectiveSynchronizationConfiguration передає
+    # $SftpDirectories['BAZA']/['BAZAWWW'] as-is, без обчислення). ALLOW_SITE
+    # 200->202, DENY_DERIVED 2->0, TOTAL лишається 271, решта класів
+    # незмінні.
     Test-BRAVOCondition `
         -Condition (
-            $authAllowSiteCount -eq 200 -and $authAllowValidatorCount -eq 25 -and
-            $authDenyDerivedCount -eq 2 -and $authDenyCredentialCount -eq 0 -and
+            $authAllowSiteCount -eq 202 -and $authAllowValidatorCount -eq 25 -and
+            $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
             $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
             $authDenyInternalCount -eq 17
         ) `
         -Name "Authorization/ClassCountsMatchContract" `
-        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md: ALLOW_SITE=$authAllowSiteCount(200) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(25) DENY_DERIVED=$authDenyDerivedCount(2) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(202) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(25) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
 
     # --- Authorization/EveryValidatorIdentifierResolves ---
     # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,
@@ -1647,6 +1655,68 @@
         -Condition (-not [bool]$authInvalidValidatorResult.IsValid -and $authInvalidValidatorResult.Violations.Count -eq 1 -and [string]$authInvalidValidatorResult.Violations[0].Path -eq 'robocopyMaxSuccessExitCode') `
         -Name "Authorization/AllowWithValidatorInvalidRejected" `
         -Failure "robocopyMaxSuccessExitCode=8 (поза 0..7) мусить бути відхилений з точним rejected path"
+
+    # =====================================================================
+    # PR #224 review, N2: TaskSchedulerPath-валідатор раніше вимагав, щоб
+    # СИРЕ значення вже було у нормалізованій формі '\...\' — суворіше за
+    # канонічний runtime-контракт ConvertTo-BRAVOTaskPath
+    # (modules/BRAVO.System/BRAVO.System.psm1), який приймає 'BRAVO',
+    # '\BRAVO', 'BRAVO\' і нормалізує сам. Фікс — авторизація тепер РЕАЛЬНО
+    # викликає ConvertTo-BRAVOTaskPath (не дублює його regex-граматику) і
+    # трактує виняток як IsValid=$false. Матриця нижче доводить паритет
+    # прийняття/відхилення між авторизацією й самим нормалізатором на
+    # ідентичних значеннях.
+    # =====================================================================
+    if (-not (Get-Module -Name 'BRAVO.System')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psd1') -Force
+    }
+
+    $taskPathAcceptedValues = @('BRAVO', '\BRAVO', 'BRAVO\', '\BRAVO\', '  BRAVO', 'BRAVO  ', '\')
+    $taskPathParityMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($taskPathValue in $taskPathAcceptedValues) {
+        $normalizerThrew = $false
+        try { [void](ConvertTo-BRAVOTaskPath -TaskPath $taskPathValue) } catch { $normalizerThrew = $true }
+        $authResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $taskPathValue -Path 'schedulerSettings.TaskPath'
+        if ($normalizerThrew -or -not [bool]$authResult.IsValid) {
+            [void]$taskPathParityMismatches.Add("ACCEPT-case '$taskPathValue': normalizerThrew=$normalizerThrew authValid=$($authResult.IsValid)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($taskPathParityMismatches.Count -eq 0) `
+        -Name "Authorization/TaskSchedulerPathAcceptsHistoricalNormalizerForms" `
+        -Failure "усі історично прийнятні форми TaskPath ('BRAVO','\BRAVO','BRAVO\','\BRAVO\','  BRAVO','BRAVO  ','\') мусять бути прийняті і нормалізатором, і авторизацією; розбіжності: $($taskPathParityMismatches -join '; ')"
+
+    $taskPathRejectedValues = @('A/B', 'A:B', 'A*', 'A?', 'A"', 'A<', 'A>', 'A|', '.', '..', 'A\..\B', 'A\.\B', '   ')
+    $taskPathRejectParityMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($taskPathValue in $taskPathRejectedValues) {
+        $normalizerThrew = $false
+        try { [void](ConvertTo-BRAVOTaskPath -TaskPath $taskPathValue) } catch { $normalizerThrew = $true }
+        $authResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $taskPathValue -Path 'schedulerSettings.TaskPath'
+        if (-not $normalizerThrew -or [bool]$authResult.IsValid) {
+            [void]$taskPathRejectParityMismatches.Add("REJECT-case '$taskPathValue': normalizerThrew=$normalizerThrew authValid=$($authResult.IsValid)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($taskPathRejectParityMismatches.Count -eq 0) `
+        -Name "Authorization/TaskSchedulerPathRejectsInvalidFormsSameAsNormalizer" `
+        -Failure "усі історично неприпустимі форми TaskPath мусять бути відхилені і нормалізатором, і авторизацією; розбіжності: $($taskPathRejectParityMismatches -join '; ')"
+
+    # --- Authorization/TaskSchedulerPathRejectsNonStringAndNull ---
+    $taskPathNullResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $null -Path 'schedulerSettings.TaskPath'
+    $taskPathBoolResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $true -Path 'schedulerSettings.TaskPath'
+    $taskPathIntResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 7 -Path 'schedulerSettings.TaskPath'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$taskPathNullResult.IsValid) -and (-not [bool]$taskPathBoolResult.IsValid) -and (-not [bool]$taskPathIntResult.IsValid)) `
+        -Name "Authorization/TaskSchedulerPathRejectsNonStringAndNull" `
+        -Failure "`$null/Boolean/Integer мусять лишитись відхиленими; отримано Null=$($taskPathNullResult.IsValid) Bool=$($taskPathBoolResult.IsValid) Int=$($taskPathIntResult.IsValid)"
+
+    # --- Authorization/TaskSchedulerPathValidationDoesNotMutateOriginalValue ---
+    $taskPathMutationProbeOverrides = @{ 'schedulerSettings.TaskPath' = 'BRAVO' }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $taskPathMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$taskPathMutationProbeOverrides['schedulerSettings.TaskPath'] -eq 'BRAVO') `
+        -Name "Authorization/TaskSchedulerPathValidationDoesNotMutateOriginalValue" `
+        -Failure "авторизація НЕ повинна нормалізувати/мутувати сире значення на місці; отримано '$($taskPathMutationProbeOverrides['schedulerSettings.TaskPath'])' замість 'BRAVO'"
 
     # =====================================================================
     # PR #224 review, F3: enum-валідатор БЕЗ trim відхиляв би значення на
@@ -1785,13 +1855,63 @@
     }
 
     # --- Authorization/DenyDerivedRejected ---
-    $authDenyDerivedResult = Test-BRAVOConfigurationOverrideAuthorization `
-        -DotPathOverrides @{ 'sftpDirectories.BAZA' = '/custom' } `
+    # PR #224 review, N3 (2026-09-22): sftpDirectories.BAZA/BAZAWWW
+    # пере-класифіковано DENY_DERIVED -> ALLOW_SITE (сирі site-параметри,
+    # не похідні значення — див. коментар при реєстрації в
+    # BRAVO.Configuration.Schema.psm1). Реєстр більше не має ЖОДНОГО
+    # DENY_DERIVED-запису (клас лишається визначеним у механізмі
+    # дозволу/заборони, просто наразі без членів). Доводимо, що сам
+    # механізм класу DENY_DERIVED і далі безумовно відхиляє, через
+    # тимчасовий синтетичний лист у приватному script-стані модуля (той
+    # самий підхід, що Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed
+    # вище використовує для DENY_SECURITY_CONTROL) — видаляється у finally
+    # незалежно від результату.
+    & {
+        $denyDerivedProbePath = '__SELFTEST_SYNTHETIC_DENY_DERIVED_LEAF__'
+        $denyDerivedProbeModule = Get-Module -Name 'BRAVO.Configuration.Schema'
+        $denyDerivedProbeAdded = $false
+        try {
+            & $denyDerivedProbeModule {
+                param($path)
+                $script:BRAVOConfigurationSchemaAuthorizationClass[$path] = @{ Class = 'DENY_DERIVED' }
+            } $denyDerivedProbePath
+            $denyDerivedProbeAdded = $true
+
+            $denyDerivedProbeSchema = @{}
+            foreach ($k in @($authSchema.Keys)) { $denyDerivedProbeSchema[$k] = $authSchema[$k] }
+            $denyDerivedProbeSchema[$denyDerivedProbePath] = @{ Kind = 'String'; Nullable = $false }
+
+            $authDenyDerivedResult = Test-BRAVOConfigurationOverrideAuthorization `
+                -DotPathOverrides @{ $denyDerivedProbePath = 'anything' } `
+                -Schema $denyDerivedProbeSchema
+            Test-BRAVOCondition `
+                -Condition (
+                    -not [bool]$authDenyDerivedResult.IsValid -and
+                    $authDenyDerivedResult.Violations.Count -eq 1 -and
+                    [string]$authDenyDerivedResult.Violations[0].Class -eq 'DENY_DERIVED'
+                ) `
+                -Name "Authorization/DenyDerivedRejected" `
+                -Failure "клас DENY_DERIVED мусить безумовно відхиляти незалежно від запропонованого значення, навіть коли наразі жоден реальний лист цим класом не позначений; отримано IsValid=$($authDenyDerivedResult.IsValid)"
+        } finally {
+            if ($denyDerivedProbeAdded) {
+                & $denyDerivedProbeModule {
+                    param($path)
+                    $script:BRAVOConfigurationSchemaAuthorizationClass.Remove($path)
+                } $denyDerivedProbePath
+            }
+        }
+    }
+
+    # --- Authorization/SftpDirectoriesBazaAndBazaWwwAreSiteConfigurable ---
+    # N3: позитивний контрольний тест — обидва тепер ALLOW_SITE, кастомне
+    # значення оператора мусить прийматись без валідатора.
+    $authBazaAllowedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'sftpDirectories.BAZA' = 'custom_baza_app'; 'sftpDirectories.BAZAWWW' = 'custom_baza_www' } `
         -Schema $authSchema
     Test-BRAVOCondition `
-        -Condition (-not [bool]$authDenyDerivedResult.IsValid) `
-        -Name "Authorization/DenyDerivedRejected" `
-        -Failure "sftpDirectories.BAZA (DENY_DERIVED) мусить бути відхилений"
+        -Condition ([bool]$authBazaAllowedResult.IsValid) `
+        -Name "Authorization/SftpDirectoriesBazaAndBazaWwwAreSiteConfigurable" `
+        -Failure "sftpDirectories.BAZA/BAZAWWW (ALLOW_SITE після N3-корекції) мусять приймати довільне site-значення без валідатора; отримано IsValid=$($authBazaAllowedResult.IsValid) Violations=$($authBazaAllowedResult.Violations.Count)"
 
     # --- Authorization/DenySecurityControlRejected ---
     $authDenySecurityResult = Test-BRAVOConfigurationOverrideAuthorization `

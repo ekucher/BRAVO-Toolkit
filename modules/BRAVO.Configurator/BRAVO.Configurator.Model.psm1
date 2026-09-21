@@ -118,6 +118,159 @@ function Get-BRAVOConfiguratorValueAtPath {
     return $currentNode
 }
 
+function Resolve-BRAVOConfiguratorSuppliedLeafOverride {
+    <#
+    .SYNOPSIS
+        PR #224 review, N1: канонічна (ЄДИНА) проєкція "чи цей canonical
+        leaf-шлях реально СУПРОВОДЖУЄТЬСЯ значенням у сирому
+        LocalOverrides-шарі" — незалежно від того, у якій формі:
+        плаский dot-шлях ('backupMonitoring.SFTP.BAZA.Mode' = 'Legacy')
+        чи вкладений Node ('backupMonitoring.SFTP.BAZA' = @{ Mode = 'Legacy' }),
+        включно з довільною глибиною вкладеності (та сама D3/F1-межа, що
+        canonical loader-authorization уже застосовує).
+    .DESCRIPTION
+        Raw production BRAVO.local.config, записаний ДО Wave 2 (коли цей
+        лист ще був редагованим через Configurator у плоскій формі), і
+        BRAVO.local.config, записаний ДО F1 (нещодавно, у вкладеній
+        формі) — обидва законні pre-remediation представлення ОДНОГО й
+        того самого canonical leaf. Попередня Model-побудова перевіряла
+        лише `$LocalOverrides.Contains($path)` (точний плоский ключ) —
+        вкладена форма мовчки трактувалась як "override відсутній",
+        хоча canonical loader (після F1) її авторизує й мерджить.
+
+        Флат-форма МАЄ ПРІОРИТЕТ над вкладеною при обох присутніх
+        одночасно (малоймовірний, але детермінований tie-break) —
+        перевіряється першою (найдовший/точний префікс).
+
+        НЕ виконує PowerShell (лише навігація вже розпарсених
+        hashtable-значень). НЕ авторизує й НЕ валідує значення — це
+        відповідальність canonical loader/authorization-реєстру; ця
+        функція лише ЗНАХОДИТЬ supplied-значення й ЙОГО ПОХОДЖЕННЯ
+        (TopLevelKey + NestedPath), достатнє для точного,
+        нейдеструктивного видалення/оновлення пізніше
+        (Remove-BRAVOConfiguratorNestedOverrideLeaf /
+        Set-BRAVOConfiguratorNestedOverrideLeafValue).
+    .OUTPUTS
+        [pscustomobject]{ Found; Value; TopLevelKey; NestedPath }
+        NestedPath — [string[]]; порожній масив = плоска форма (TopLevelKey
+        сам дорівнює LeafPath); непорожній = сегменти всередині вкладеного
+        контейнера TopLevelKey, що ведуть до листа.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$LocalOverrides,
+        [Parameter(Mandatory = $true)][string]$LeafPath
+    )
+
+    $segments = @($LeafPath -split '\.')
+    for ($prefixLength = $segments.Count; $prefixLength -ge 1; $prefixLength--) {
+        $prefix = [string]::Join('.', $segments[0..($prefixLength - 1)])
+        if (-not $LocalOverrides.Contains($prefix)) { continue }
+        $candidateValue = $LocalOverrides[$prefix]
+
+        if ($prefixLength -eq $segments.Count) {
+            # Точний плоский dot-шлях — саме той canonical leaf, без
+            # вкладеності.
+            return [pscustomobject]@{
+                Found       = $true
+                Value       = $candidateValue
+                TopLevelKey = $prefix
+                NestedPath  = [string[]]@()
+            }
+        }
+
+        if ($candidateValue -isnot [hashtable]) {
+            # Значення на цьому префіксі існує, але не hashtable — не
+            # може містити решту сегментів. Пробуємо коротший префікс.
+            continue
+        }
+
+        $remainingSegments = @($segments[$prefixLength..($segments.Count - 1)])
+        $node = $candidateValue
+        $navigationOk = $true
+        foreach ($segment in $remainingSegments) {
+            if ($node -isnot [hashtable] -or -not $node.Contains($segment)) {
+                $navigationOk = $false
+                break
+            }
+            $node = $node[$segment]
+        }
+        if ($navigationOk) {
+            return [pscustomobject]@{
+                Found       = $true
+                Value       = $node
+                TopLevelKey = $prefix
+                NestedPath  = [string[]]$remainingSegments
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        Found       = $false
+        Value       = $null
+        TopLevelKey = $null
+        NestedPath  = [string[]]@()
+    }
+}
+
+function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
+    <#
+    .SYNOPSIS
+        PR #224 review, N1: розгортає ОДИН вкладений (Node) top-level
+        контейнер $Overrides[$TopLevelKey] у плоскі dot-шляхи
+        ("$TopLevelKey.<segment>..."; довільна глибина) і видаляє сам
+        TopLevelKey. Мутує $Overrides за посиланням.
+    .DESCRIPTION
+        Canonical Configurator-серіалізатор
+        (ConvertTo-BRAVOConfiguratorPowerShellLiteral, викликається і
+        production-записом, і isolated pre-Apply перевіркою) НАВМИСНО
+        fail-closed відмовляється серіалізувати hashtable/IDictionary-
+        значення (P2-фікс: "вкладена hashtable ніколи не мала тут
+        з'являтись") — тобто Configurator ФІЗИЧНО не може записати
+        canonical leaf у вкладеній формі, незалежно від того, як його
+        прочитано. Тому щойно Merge-BRAVOConfiguratorCandidateOverrides
+        торкається БУДЬ-ЯКОГО canonical-листа всередині легасі вкладеного
+        контейнера (зняття override, чи навіть просто "лишити
+        незміненим" для сусіднього листа з тим самим контейнером), УВЕСЬ
+        контейнер мігрує у плоску форму — це НЕ "нормалізація всього
+        local-config" (§4 задачі), бо торкається ЛИШЕ ЦЬОГО ОДНОГО
+        контейнера, і НЕ "силует мовчазна міграція значення" — значення
+        (включно з невідомими/новішими нащадками) зберігаються побайтово,
+        міняється лише форма представлення (вкладена -> плоска), що є
+        єдиним фізично можливим способом Configurator-у щось ЗАПИСАТИ.
+        Оригінальний вкладений hashtable-об'єкт (може бути спільним
+        посиланням з ProductionBaseline.Overrides викликача) лише
+        ЧИТАЄТЬСЯ, ніколи не мутується на місці.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Overrides,
+        [Parameter(Mandatory = $true)][string]$TopLevelKey
+    )
+
+    if (-not $Overrides.Contains($TopLevelKey)) { return }
+    $root = $Overrides[$TopLevelKey]
+    if ($root -isnot [hashtable]) { return }
+    $Overrides.Remove($TopLevelKey)
+
+    $pending = New-Object System.Collections.Generic.List[object]
+    [void]$pending.Add([pscustomobject]@{ Prefix = $TopLevelKey; Node = $root })
+    while ($pending.Count -gt 0) {
+        $current = $pending[$pending.Count - 1]
+        $pending.RemoveAt($pending.Count - 1)
+        foreach ($key in @($current.Node.Keys)) {
+            $childPath = "$($current.Prefix).$key"
+            $childValue = $current.Node[$key]
+            if ($childValue -is [hashtable]) {
+                [void]$pending.Add([pscustomobject]@{ Prefix = $childPath; Node = $childValue })
+            } else {
+                $Overrides[$childPath] = $childValue
+            }
+        }
+    }
+}
+
 function Get-BRAVOConfiguratorModel {
     <#
     .SYNOPSIS
@@ -145,8 +298,14 @@ function Get-BRAVOConfiguratorModel {
     foreach ($descriptor in $SchemaCatalog) {
         $path = [string]$descriptor.Path
         $defaultValue = Get-BRAVOConfiguratorValueAtPath -Root $DefaultConfig -Path $path
-        $overridePresent = $LocalOverrides.Contains($path)
-        $overrideValue = if ($overridePresent) { $LocalOverrides[$path] } else { $null }
+        # PR #224 review, N1: canonical leaf може бути supplied і плоским
+        # dot-шляхом, і вкладеним Node-контейнером (легасі pre-F1
+        # представлення) — Resolve-BRAVOConfiguratorSuppliedLeafOverride
+        # трактує обидві форми ідентично, замість колишнього точного
+        # $LocalOverrides.Contains($path), який бачив лише плоску форму.
+        $suppliedLeaf = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $LocalOverrides -LeafPath $path
+        $overridePresent = [bool]$suppliedLeaf.Found
+        $overrideValue = if ($overridePresent) { $suppliedLeaf.Value } else { $null }
 
         $model.Add([pscustomobject]@{
             Path             = $path
@@ -522,6 +681,8 @@ function Get-BRAVOConfiguratorSessionOutcome {
 
 Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorValueAtPath',
+    'Resolve-BRAVOConfiguratorSuppliedLeafOverride',
+    'Convert-BRAVOConfiguratorNestedContainerToFlatKeys',
     'Get-BRAVOConfiguratorModel',
     'Set-BRAVOConfiguratorOverride',
     'Clear-BRAVOConfiguratorOverride',
