@@ -590,8 +590,20 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'bravoSettings.ArchivePrefix' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.InstitutionCode' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.InstitutionName' = @{ Class = 'ALLOW_SITE' }
-    'bravoSettings.NotificationMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:none,errors_only,all' }
-    'bravoSettings.NotificationProvider' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:discord,slack' }
+    # PR #224 review, F3: EnumTrimmed (не Enum) — єдині 2 з 18
+    # enum-валідованих ALLOW_WITH_VALIDATOR-листів, для яких знайдено
+    # ДОКАЗ pre-Wave-2 tolerance до пробілів: усі runtime-споживачі
+    # (BRAVO_DRY_RUN.ps1 x4, BRAVO_NOTIFICATION_TEST.ps1,
+    # BRAVO_RESTORE_TEST.ps1) уже викликають
+    # .Trim().ToLowerInvariant() на цих двох значеннях ДО їх реального
+    # використання. Решта 16 enum-листів (ConsoleLevel/FileLevel/
+    # LogLevel/BootRestoreMode/robocopyWindowStyle/MultipleInstances/
+    # WeeklyOn/WindowStyle/backupConsistency.*/NotificationRouting.*)
+    # НЕ мають такого доказу в жодній точці споживання — лишаються на
+    # звичайному 'Enum:' (без trim), щоб не послаблювати авторизацію без
+    # підстави для листів, чия семантика не перевірена.
+    'bravoSettings.NotificationMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:none,errors_only,all' }
+    'bravoSettings.NotificationProvider' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:discord,slack' }
     'bravoSettings.NotificationRequestTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.NotificationRouting.CRITICAL' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
     'bravoSettings.NotificationRouting.ERROR' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
@@ -866,7 +878,16 @@ function Test-BRAVOConfigurationAuthorizationEnumValue {
     param(
         [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
         [Parameter(Mandatory = $true)][string[]]$AllowedValues,
-        [Parameter(Mandatory = $true)][string]$Path
+        [Parameter(Mandatory = $true)][string]$Path,
+        # PR #224 review, F3: лише для 'EnumTrimmed:'-диспетчеризованих
+        # листів (див. Test-BRAVOConfigurationAuthorizationValidatorValue) —
+        # порівняння відбувається з ОБРІЗАНИМ (Trim) значенням, але саме
+        # значення НЕ мутується й НЕ повертається звідси: авторизація
+        # лише каже "прийнятно/неприйнятно", збережене/повернене
+        # значення лишається таким, яким його ввів оператор (той самий
+        # незмінний runtime-consumer, що вже сам робить
+        # .Trim().ToLowerInvariant() перед використанням).
+        [switch]$TrimBeforeComparison
     )
 
     if ($null -eq $Value -or $Value -isnot [string]) {
@@ -876,8 +897,9 @@ function Test-BRAVOConfigurationAuthorizationEnumValue {
             Message = "${Path}: очікується рядок із переліку ($($AllowedValues -join ', ')), отримано $actualCaption."
         }
     }
+    $comparisonValue = if ($TrimBeforeComparison) { ([string]$Value).Trim() } else { [string]$Value }
     foreach ($allowed in $AllowedValues) {
-        if ([string]::Equals([string]$Value, $allowed, [System.StringComparison]::OrdinalIgnoreCase)) {
+        if ([string]::Equals($comparisonValue, $allowed, [System.StringComparison]::OrdinalIgnoreCase)) {
             return [pscustomobject]@{ IsValid = $true; Message = $null }
         }
     }
@@ -1066,6 +1088,16 @@ function Test-BRAVOConfigurationAuthorizationValidatorValue {
         $allowedValues = @($ValidatorId.Substring(5) -split ',')
         return Test-BRAVOConfigurationAuthorizationEnumValue -Value $Value -AllowedValues $allowedValues -Path $Path
     }
+    if ($ValidatorId.StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) {
+        # PR #224 review, F3: окремий (не гілка загального 'Enum:')
+        # named-валідатор — лише для листів, де ДОВЕДЕНО pre-Wave-2
+        # tolerance до пробілів на всіх реальних runtime-точках
+        # споживання (див. коментар біля реєстрації
+        # bravoSettings.NotificationMode/NotificationProvider). НЕ
+        # застосовується узагальнено до всіх enum-листів без доказу.
+        $allowedValues = @($ValidatorId.Substring(12) -split ',')
+        return Test-BRAVOConfigurationAuthorizationEnumValue -Value $Value -AllowedValues $allowedValues -Path $Path -TrimBeforeComparison
+    }
     if ($ValidatorId.StartsWith('IntegerRange:', [System.StringComparison]::Ordinal)) {
         $bounds = @($ValidatorId.Substring(13) -split ',')
         return Test-BRAVOConfigurationAuthorizationIntegerRange -Value $Value -Minimum ([int]$bounds[0]) -Maximum ([int]$bounds[1]) -Path $Path
@@ -1082,6 +1114,134 @@ function Test-BRAVOConfigurationAuthorizationValidatorValue {
         default {
             throw "Схема авторизації конфігурації: невідомий ідентифікатор валідатора '$ValidatorId' для '$Path' — це дефект реєстру схеми, не значення оператора."
         }
+    }
+}
+
+function Test-BRAVOConfigurationAuthorizationLeaf {
+    # Приватний helper (не експортується): оцінює АВТОРИЗАЦІЮ РІВНО
+    # ОДНОГО канонічного leaf-шляху й додає порушення (якщо є) у спільну
+    # колекцію викликача. Винесено з Test-BRAVOConfigurationOverrideAuthorization
+    # (PR #224 review, F1) — та сама логіка тепер викликається як з
+    # top-level циклу, так і рекурсивно для листів, супроводжуваних
+    # вкладеним (Node) local-override значенням; одна реалізація на
+    # "чи авторизований цей КОНКРЕТНИЙ leaf-шлях", без дублювання.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Violations
+    )
+
+    if (-not $script:BRAVOConfigurationSchemaAuthorizationClass.Contains($Path)) {
+        # Схема знає цей лист, але авторизаційний реєстр — ні. Це
+        # дефект РЕЄСТРУ (порушення умови self-test-повноти), не
+        # легітимний "невідомий шлях" (той випадок уже відсіяний
+        # викликачем через Schema.Contains). Fail closed: мовчазний
+        # allow-by-omission для КАНОНІЧНОГО листа заборонений
+        # архітектурним рішенням Wave 2 (WAVE2-CONTRACT.md, розділ 11.3).
+        [void]$Violations.Add([pscustomobject]@{
+            Path              = $Path
+            Class             = 'UNREGISTERED'
+            Validator         = $null
+            WeakeningOverride = $script:BRAVOConfigurationSchemaWeakeningOverrideNone
+            Reason            = 'MissingAuthorizationPolicy'
+            Message           = "${Path}: канонічний лист не має запису в авторизаційному реєстрі Wave 2 — це дефект реєстру схеми, не дозвіл."
+        })
+        return
+    }
+
+    $entry = $script:BRAVOConfigurationSchemaAuthorizationClass[$Path]
+    $class = [string]$entry.Class
+    # Fail-closed за замовчуванням: відсутність WeakeningOverride у
+    # записі реєстру ЗАВЖДИ означає 'None', НІКОЛИ мовчазний
+    # escapable-дозвіл (той самий дефолт, що Get-BRAVOConfigurationSchemaAuthorizationClass
+    # застосовує для зовнішніх читачів реєстру).
+    $weakeningOverride = $(if ($entry.Contains('WeakeningOverride')) { [string]$entry.WeakeningOverride } else { $script:BRAVOConfigurationSchemaWeakeningOverrideNone })
+
+    if ($class -eq 'ALLOW_SITE') { return }
+
+    if ($class -eq 'ALLOW_WITH_VALIDATOR') {
+        $validatorId = [string]$entry.Validator
+        $validationResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId $validatorId -Value $Value -Path $Path
+        if (-not $validationResult.IsValid) {
+            [void]$Violations.Add([pscustomobject]@{
+                Path              = $Path
+                Class             = $class
+                Validator         = $validatorId
+                WeakeningOverride = $weakeningOverride
+                Reason            = 'ValidatorRejected'
+                Message           = $validationResult.Message
+            })
+        }
+        return
+    }
+
+    # Усі DENY_*-класи: безумовна відмова, незалежно від значення.
+    # Escapability (чи МОЖЕ викликач запропонувати наявний
+    # BRAVO_ALLOW_WEAKENED_SECURITY-механізм для цього конкретного
+    # порушення) — це ВЛАСТИВІСТЬ порушення (WeakeningOverride вище),
+    # яку викликач (loader) читає з результату; ЦЯ функція нічого не
+    # вирішує про env-змінну і не знає жодної dot-path-назви окрім
+    # тієї, що обробляє в поточному виклику.
+    [void]$Violations.Add([pscustomobject]@{
+        Path              = $Path
+        Class             = $class
+        Validator         = $null
+        WeakeningOverride = $weakeningOverride
+        Reason            = 'DeniedClass'
+        Message           = "${Path}: локальне перевизначення заборонено (клас '$class') — BRAVO.local.config не має повноважень на цей лист незалежно від запропонованого значення."
+    })
+}
+
+function Test-BRAVOConfigurationAuthorizationNodeDescendants {
+    # Приватний helper (не експортується): рекурсивно авторизує КОЖЕН
+    # leaf усередині вкладеного (Node) local-override значення — та сама
+    # структурна рекурсія (batch/child-path побудова, D3 unknown-child
+    # skip, глибина обмежена $script:BRAVOConfigurationSchemaMaximumDepth),
+    # що Add-BRAVOConfigurationSchemaViolation вже застосовує для
+    # ТИПОВОЇ перевірки Node-значень (PR #224 review, F1): раніше
+    # авторизація не мала еквівалентної рекурсії й тому помилково
+    # трактувала кожен Node-шлях, супроводжуваний вкладеним hashtable, як
+    # "канонічний лист без запису в реєстрі" (UNREGISTERED) — реєстр НЕ
+    # містить записів на Node-шляхи, лише на leaf-шляхи, тому вимога була
+    # структурно нездійсненною.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Node,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Schema,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Violations,
+        [Parameter(Mandatory = $true)][int]$Depth
+    )
+
+    if ($Depth -gt $script:BRAVOConfigurationSchemaMaximumDepth) { return }
+
+    foreach ($childKey in @($Node.Keys)) {
+        $childPath = "$Path.$childKey"
+        # Невідомий ключ усередині вузла-override — той самий "невідомий
+        # кінцевий сегмент під відомим вузлом", що D3 (рішення власника
+        # 2026-09-14) вже лишає прийнятним для типової перевірки — тут
+        # лише пропуск, без ВЛАСНОЇ, ширшої, unknown-path-політики.
+        if (-not $Schema.Contains($childPath)) { continue }
+
+        $childDescriptor = $Schema[$childPath]
+        $childValue = $Node[$childKey]
+
+        if ([string]$childDescriptor.Kind -eq 'Node') {
+            # Вкладеність глибша за один рівень — рекурсуємо далі. Якщо
+            # значення НЕ hashtable (форма невірна), це вже відповідальність
+            # Test-BRAVOConfigurationOverrideSchema (типова перевірка, що
+            # ЗАВЖДИ запускається раніше в конвеєрі loader-а) — авторизація
+            # тут лишається мовчазною для НЕПРАВИЛЬНОЇ форми, а не намагається
+            # самостійно повторно діагностувати тип.
+            if ($childValue -is [hashtable]) {
+                Test-BRAVOConfigurationAuthorizationNodeDescendants -Node $childValue -Path $childPath `
+                    -Schema $Schema -Violations $Violations -Depth ($Depth + 1)
+            }
+            continue
+        }
+
+        Test-BRAVOConfigurationAuthorizationLeaf -Path $childPath -Value $childValue -Violations $Violations
     }
 }
 
@@ -1102,6 +1262,16 @@ function Test-BRAVOConfigurationOverrideAuthorization {
         Невідомий кінцевий сегмент (D3, рішення власника 2026-09-14)
         НАВМИСНО не класифікується тут.
 
+        Node-шляхи (PR #224 review, F1): реєстр Wave 2 навмисно містить
+        ЛИШЕ leaf-записи, НЕ Node-записи. Local-override значення на
+        Node-шляху (вкладений hashtable, наприклад
+        bravoSettings.NotificationRouting = @{ SUCCESS='general';
+        WARNING='alerts' }) авторизується рекурсивно ЧЕРЕЗ його
+        supplied-leaves (bravoSettings.NotificationRouting.SUCCESS,
+        ...WARNING) — Test-BRAVOConfigurationAuthorizationNodeDescendants
+        нижче, та сама D3-межа й глибина, що вже застосовує типова
+        перевірка. Реєстр і далі НІКОЛИ не отримує запису на сам Node-шлях.
+
         ALLOW_SITE      -> приймається без додаткової перевірки.
         ALLOW_WITH_VALIDATOR -> додатково проганяється через іменований
                                  валідатор (Test-BRAVOConfigurationAuthorizationValidatorValue).
@@ -1109,13 +1279,13 @@ function Test-BRAVOConfigurationOverrideAuthorization {
                             запропонованого значення (у т.ч. коли воно
                             збігається з канонічним дефолтом) —
                             авторизація тут про володіння ЛИСТОМ, а не
-                            про безпечність конкретного значення.
-
-        Викликач (BRAVO_CONFIG_LOADER.ps1) зобов'язаний трактувати
-        IsValid=$false як АТОМАРНУ відмову ВСЬОГО local-override шару:
-        ця функція не мерджить нічого сама — вона лише оцінює, виклик
-        Merge-BRAVOConfiguration/Resolve-BRAVORawConfiguration не
-        повинен відбутись, доки результат не IsValid=$true.
+                            про безпечність конкретного значення. Це
+                            діє ІДЕНТИЧНО для top-level DENY-листа й для
+                            DENY-листа, досягнутого через вкладену
+                            Node-форму — атомарність (одне порушення
+                            будь-де в шарі відхиляє ВЕСЬ шар) не залежить
+                            від того, якою формою супроводжувався
+                            конкретний leaf.
     .PARAMETER DotPathOverrides
         Плаский шар "dot-шлях -> значення" (формат BRAVO.local.config) —
         той самий вхід, що й Test-BRAVOConfigurationOverrideSchema.
@@ -1144,65 +1314,23 @@ function Test-BRAVOConfigurationOverrideAuthorization {
         if ([string]::IsNullOrWhiteSpace($path)) { continue }
         if (-not $Schema.Contains($path)) { continue }
 
-        if (-not $script:BRAVOConfigurationSchemaAuthorizationClass.Contains($path)) {
-            # Схема знає цей лист, але авторизаційний реєстр — ні. Це
-            # дефект РЕЄСТРУ (порушення умови self-test-повноти), не
-            # легітимний "невідомий шлях" (той випадок уже відсіяний
-            # вище через Schema.Contains). Fail closed: мовчазний
-            # allow-by-omission для КАНОНІЧНОГО листа заборонений
-            # архітектурним рішенням Wave 2 (WAVE2-CONTRACT.md, розділ 11.3).
-            [void]$violations.Add([pscustomobject]@{
-                Path              = $path
-                Class             = 'UNREGISTERED'
-                Validator         = $null
-                WeakeningOverride = $script:BRAVOConfigurationSchemaWeakeningOverrideNone
-                Reason            = 'MissingAuthorizationPolicy'
-                Message           = "${path}: канонічний лист не має запису в авторизаційному реєстрі Wave 2 — це дефект реєстру схеми, не дозвіл."
-            })
-            continue
-        }
+        $descriptor = $Schema[$path]
+        $value = $DotPathOverrides[$dotPath]
 
-        $entry = $script:BRAVOConfigurationSchemaAuthorizationClass[$path]
-        $class = [string]$entry.Class
-        # Fail-closed за замовчуванням: відсутність WeakeningOverride у
-        # записі реєстру ЗАВЖДИ означає 'None', НІКОЛИ мовчазний
-        # escapable-дозвіл (той самий дефолт, що Get-BRAVOConfigurationSchemaAuthorizationClass
-        # застосовує для зовнішніх читачів реєстру).
-        $weakeningOverride = $(if ($entry.Contains('WeakeningOverride')) { [string]$entry.WeakeningOverride } else { $script:BRAVOConfigurationSchemaWeakeningOverrideNone })
-
-        if ($class -eq 'ALLOW_SITE') { continue }
-
-        if ($class -eq 'ALLOW_WITH_VALIDATOR') {
-            $validatorId = [string]$entry.Validator
-            $validationResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId $validatorId -Value $DotPathOverrides[$dotPath] -Path $path
-            if (-not $validationResult.IsValid) {
-                [void]$violations.Add([pscustomobject]@{
-                    Path              = $path
-                    Class             = $class
-                    Validator         = $validatorId
-                    WeakeningOverride = $weakeningOverride
-                    Reason            = 'ValidatorRejected'
-                    Message           = $validationResult.Message
-                })
+        if ([string]$descriptor.Kind -eq 'Node') {
+            # Node-шлях: реєстр НІКОЛИ не містить запису на нього самого
+            # (F1) — авторизуємо кожен supplied descendant-leaf окремо.
+            # Неправильна форма (значення не hashtable) — відповідальність
+            # типової перевірки, яка вже проходить раніше в конвеєрі
+            # loader-а; тут просто нічого немає для рекурсії.
+            if ($value -is [hashtable]) {
+                Test-BRAVOConfigurationAuthorizationNodeDescendants -Node $value -Path $path `
+                    -Schema $Schema -Violations $violations -Depth 1
             }
             continue
         }
 
-        # Усі DENY_*-класи: безумовна відмова, незалежно від значення.
-        # Escapability (чи МОЖЕ викликач запропонувати наявний
-        # BRAVO_ALLOW_WEAKENED_SECURITY-механізм для цього конкретного
-        # порушення) — це ВЛАСТИВІСТЬ порушення (WeakeningOverride вище),
-        # яку викликач (loader) читає з результату; ЦЯ функція нічого не
-        # вирішує про env-змінну і не знає жодної dot-path-назви окрім
-        # тієї, що обробляє в поточній ітерації циклу.
-        [void]$violations.Add([pscustomobject]@{
-            Path              = $path
-            Class             = $class
-            Validator         = $null
-            WeakeningOverride = $weakeningOverride
-            Reason            = 'DeniedClass'
-            Message           = "${path}: локальне перевизначення заборонено (клас '$class') — BRAVO.local.config не має повноважень на цей лист незалежно від запропонованого значення."
-        })
+        Test-BRAVOConfigurationAuthorizationLeaf -Path $path -Value $value -Violations $violations
     }
 
     return [pscustomobject]@{

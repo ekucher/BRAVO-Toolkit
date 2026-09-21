@@ -176,15 +176,24 @@ function Resolve-BRAVOConfiguratorFieldAuthorization {
     foreach ($descriptor in $Descriptors) {
         $path = [string]$descriptor.Path
         $effectiveReadOnly = [bool]$descriptor.ReadOnly
+        # AuthorizationClass (PR #224 review, F2): surfaced поряд із
+        # ReadOnly, аби Configurator/UI-код, якому потрібне ПОВНЕ Wave 2
+        # рішення (не лише похідний Boolean), мав його з ТОГО САМОГО
+        # виклику — без другого окремого запиту до реєстру для того ж
+        # Path. $null, коли Path невідомий реєстру (не мало б статися для
+        # повного 271-переліку, але захисно — той самий випадок, що вже
+        # лишає статичне ReadOnly каталогу без змін).
+        $resolvedClass = $null
         if ($AuthorizationClass.Contains($path)) {
-            $class = [string]$AuthorizationClass[$path].Class
-            if ($class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
+            $resolvedClass = [string]$AuthorizationClass[$path].Class
+            if ($resolvedClass.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
                 $effectiveReadOnly = $true
             }
         }
         $clone = @{}
         foreach ($key in @($descriptor.Keys)) { $clone[$key] = $descriptor[$key] }
         $clone['ReadOnly'] = $effectiveReadOnly
+        $clone['AuthorizationClass'] = $resolvedClass
         [void]$resolved.Add($clone)
     }
     # Кома-оператор обов'язковий: без нього PowerShell розгортає

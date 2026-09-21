@@ -629,7 +629,16 @@ function New-BRAVOConfiguratorUISettingRow {
     $overrideCheckBox.Dock = [System.Windows.Forms.DockStyle]::Fill
     $overrideCheckBox.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
     $overrideCheckBox.Checked = [bool]$Setting.OverridePresent
-    $overrideCheckBox.Enabled = -not [bool]$Setting.Metadata.ReadOnly
+    # PR #224 review, F2: для ReadOnly (DENY_*) поля чекбокс лишається
+    # enabled ЛИШЕ коли override уже існує (legacy denied override,
+    # напр. успадкований backupMonitoring.SFTP.BAZA.Mode='Legacy') — це
+    # єдиний спосіб оператору його ЗНЯТИ (Clear-BRAVOConfiguratorOverride
+    # через OnChanged $false-гілку нижче). Для ReadOnly без наявного
+    # override чекбокс лишається disabled як і раніше — новий DENY_*
+    # override створити не можна. $valueControl.Enabled нижче й далі
+    # безумовно вимкнений для ReadOnly — нове значення ввести не можна
+    # НІКОЛИ, лише зняти вже наявне.
+    $overrideCheckBox.Enabled = (-not [bool]$Setting.Metadata.ReadOnly) -or [bool]$Setting.OverridePresent
     $overrideCheckBox.AccessibleName = "Override: $labelText"
     $overrideCheckBox.AccessibleDescription = 'Позначено = явний локальний override; знято = використовується значення за замовчуванням.'
     $ToolTip.SetToolTip($overrideCheckBox, 'Позначено = явний локальний override (записується у BRAVO.local.config). Знято = використовується Default.')

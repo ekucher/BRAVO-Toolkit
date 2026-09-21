@@ -1173,6 +1173,182 @@ try {
         'Configurator/Authorization/RawCatalogUnmutatedByAdapter' `
         "Resolve-BRAVOConfiguratorFieldAuthorization НЕ повинен мутувати вхідні дескриптори/повторні читання сирого каталогу; отримано ReadOnly=$($authAdapterRawAfter[0].ReadOnly)"
 }
+
+# =====================================================================
+# PR #224 review, F2: legacy denied override deadlockує Configurator при
+# старті. Pre-Wave-2 BRAVO.local.config міг уже містити
+# backupMonitoring.SFTP.BAZA.Mode='Legacy' (тоді ще editable через
+# Configurator, тепер DENY_SECURITY_CONTROL/ReadOnly). Тести нижче
+# доводять: (a) сам факт наявності такого override НЕ падає при
+# завантаженні/preview-обчисленні (ConvertTo-BRAVOConfiguratorOverrideHashtable
+# виключає DENY_* з проєкції ДЛЯ preview), (b) Apply-гейт і далі
+# коректно fail-closed, доки override не прибрано (Clear), (c) після
+# Clear — валідний candidate, Apply проходить, і результуючий файл
+# більше не містить denied override.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $legacyDeniedPath = 'backupMonitoring.SFTP.BAZA.Mode'
+    $legacyDeniedRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $legacyDeniedClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $legacyDeniedResolvedCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $legacyDeniedRawCatalog -AuthorizationClass $legacyDeniedClassRegistry
+
+    $legacyDeniedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_LEGACYDENIED_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($legacyDeniedScenarioRoot)
+    try {
+        # Продакшн-файл УЖЕ містить легасі-заборонений override — так,
+        # ніби записаний до-Wave-2 версією Configurator-а (не через
+        # поточний Set/Apply-конвеєр, який сам ніколи б такий override
+        # не створив).
+        # Section 6 (PR #224 review remediation): fixture також містить
+        # ОДИН сусідній ALLOW_SITE override (archiveRetentionDays), аби
+        # довести не лише "denied прибрано", а й "інший, валідний,
+        # override переживає весь цикл Clear -> Apply незмінним".
+        $legacyDeniedAllowedPath = 'archiveRetentionDays'
+        $legacyDeniedAllowedValue = 45
+        $legacyDeniedLocalConfigPath = Join-Path $legacyDeniedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $legacyDeniedLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $legacyDeniedPath        = 'Legacy'
+                $legacyDeniedAllowedPath = $legacyDeniedAllowedValue
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $legacyDeniedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot
+        Test-BRAVOCondition ($legacyDeniedBaseline.Overrides.Contains($legacyDeniedPath)) `
+            'Configurator/LegacyDeniedOverride/BaselineFixtureContainsIt' `
+            "fixture-передумова: baseline мусить містити $legacyDeniedPath='Legacy' перед рештою сценарію; отримано Contains=$($legacyDeniedBaseline.Overrides.Contains($legacyDeniedPath))"
+
+        $legacyDeniedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $legacyDeniedResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $legacyDeniedBaseline.Overrides
+        $legacyDeniedSetting = @($legacyDeniedModel | Where-Object { $_.Path -eq $legacyDeniedPath })
+
+        # --- Configurator/LegacyDeniedOverrideIsReadOnly ---
+        Test-BRAVOCondition (
+            $legacyDeniedSetting.Count -eq 1 -and [bool]$legacyDeniedSetting[0].OverridePresent -and
+            [bool]$legacyDeniedSetting[0].Metadata.ReadOnly -eq $true
+        ) `
+            'Configurator/LegacyDeniedOverrideIsReadOnly' `
+            "легасі-заборонений override мусить бути OverridePresent=`$true, Metadata.ReadOnly=`$true (canonical adapter forcing); отримано OverridePresent=$($legacyDeniedSetting[0].OverridePresent) ReadOnly=$($legacyDeniedSetting[0].Metadata.ReadOnly)"
+
+        # --- Configurator/LegacyDeniedOverrideDoesNotPreventStartup ---
+        # ГОЛОВНИЙ баг F2: Update-BRAVOConfiguratorEffective (звичайний
+        # UI startup/preview шлях, БЕЗ -CandidateOverridesOverride) НЕ
+        # повинен падати лише тому, що Model містить легасі-заборонений
+        # override.
+        $legacyDeniedStartupThrew = $false
+        $legacyDeniedStartupMessage = $null
+        $legacyDeniedModelAfterEffective = $null
+        try {
+            $legacyDeniedModelAfterEffective = Update-BRAVOConfiguratorEffective -Model $legacyDeniedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        } catch {
+            $legacyDeniedStartupThrew = $true
+            $legacyDeniedStartupMessage = $_.Exception.Message
+        }
+        Test-BRAVOCondition (-not $legacyDeniedStartupThrew) `
+            'Configurator/LegacyDeniedOverrideDoesNotPreventStartup' `
+            "наявність легасі-забороненого override у Model НЕ повинна кидати виняток при звичайному Update-BRAVOConfiguratorEffective (preview/startup шлях); помилка: $legacyDeniedStartupMessage"
+
+        # --- Configurator/LegacyDeniedOverrideCanBeCleared ---
+        $legacyDeniedCleared = Clear-BRAVOConfiguratorOverride -Model $legacyDeniedModel -Path $legacyDeniedPath
+        $legacyDeniedClearedSetting = @($legacyDeniedCleared | Where-Object { $_.Path -eq $legacyDeniedPath })
+        Test-BRAVOCondition (
+            $legacyDeniedClearedSetting.Count -eq 1 -and (-not [bool]$legacyDeniedClearedSetting[0].OverridePresent)
+        ) `
+            'Configurator/LegacyDeniedOverrideCanBeCleared' `
+            "оператор мусить мати змогу зняти легасі-заборонений override (Clear-BRAVOConfiguratorOverride) незалежно від ReadOnly; отримано OverridePresent=$($legacyDeniedClearedSetting[0].OverridePresent)"
+
+        # --- Configurator/LegacyDeniedOverrideCannotBeAppliedUnchanged ---
+        # Apply-гейт (Test-BRAVOConfiguratorCandidateOverrides, який
+        # ЗАВЖДИ обходить проєкцію через -CandidateOverridesOverride)
+        # мусить лишитись строгим: доки override НЕ прибрано, Apply
+        # мусить провалитись на Validation, а не мовчки пропустити.
+        # Section 6, Scenario A: захоплюємо байти файлу ДО спроби Apply, аби
+        # довести не лише Stage='Validation', а й що production-файл
+        # лишається побайтово незмінним (Validation повертається до кроку
+        # backup/atomic-replace у Invoke-BRAVOConfiguratorApply — write
+        # ще фізично не відбувся).
+        $legacyDeniedPreApplyBytes = [IO.File]::ReadAllBytes($legacyDeniedLocalConfigPath)
+        $legacyDeniedModelUnchanged = Update-BRAVOConfiguratorEffective -Model $legacyDeniedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $legacyDeniedApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot -Model $legacyDeniedModelUnchanged -SchemaCatalog $legacyDeniedResolvedCatalog -ProductionBaseline $legacyDeniedBaseline
+        $legacyDeniedPostApplyBytes = [IO.File]::ReadAllBytes($legacyDeniedLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$legacyDeniedApplyUnchanged.Applied) -and [string]$legacyDeniedApplyUnchanged.Stage -eq 'Validation'
+        ) `
+            'Configurator/LegacyDeniedOverrideCannotBeAppliedUnchanged' `
+            "Apply з незмінним (все ще присутнім) легасі-забороненим override мусить провалитись на стадії Validation, НЕ бути Applied; отримано Applied=$($legacyDeniedApplyUnchanged.Applied) Stage=$($legacyDeniedApplyUnchanged.Stage)"
+        Test-BRAVOCondition (
+            [Convert]::ToBase64String($legacyDeniedPreApplyBytes) -eq [Convert]::ToBase64String($legacyDeniedPostApplyBytes)
+        ) `
+            'Configurator/LegacyDeniedOverrideValidationFailureLeavesProductionFileByteIdentical' `
+            "провал Apply на стадії Validation НЕ повинен торкатись production BRAVO.local.config — файл мусить лишитись побайтово ідентичним ($($legacyDeniedPreApplyBytes.Length) байт до, $($legacyDeniedPostApplyBytes.Length) байт після)"
+
+        # --- Configurator/LegacyDeniedOverrideCannotBeChanged ---
+        # Навіть спроба ЗМІНИТИ (не лише лишити) заборонений override на
+        # ІНШЕ (так само заборонене) значення не повинна коли-небудь
+        # реально потрапити в продакшн — canonical loader відхиляє це
+        # незалежно від конкретного запропонованого значення (авторизація
+        # про володіння листом, не про безпечність значення).
+        $legacyDeniedModelChanged = Set-BRAVOConfiguratorOverride -Model $legacyDeniedModel -Path $legacyDeniedPath -Value 'IncrementalAppendOnly'
+        $legacyDeniedModelChanged = Update-BRAVOConfiguratorEffective -Model $legacyDeniedModelChanged -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $legacyDeniedApplyChanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot -Model $legacyDeniedModelChanged -SchemaCatalog $legacyDeniedResolvedCatalog -ProductionBaseline $legacyDeniedBaseline
+        Test-BRAVOCondition (
+            (-not [bool]$legacyDeniedApplyChanged.Applied) -and [string]$legacyDeniedApplyChanged.Stage -eq 'Validation'
+        ) `
+            'Configurator/LegacyDeniedOverrideCannotBeChanged' `
+            "спроба змінити легасі-заборонений override на ІНШЕ значення (замість Clear) мусить так само провалитись на Validation — DENY_* не редагується, лише знімається; отримано Applied=$($legacyDeniedApplyChanged.Applied) Stage=$($legacyDeniedApplyChanged.Stage)"
+
+        # --- Configurator/ClearingLegacyDeniedOverrideProducesValidCandidate ---
+        # Ізольована persistence-пайплайн перевірка: існуючий файл із
+        # denied override -> Clear -> Apply -> результуючий файл БІЛЬШЕ
+        # НЕ містить його (не production-файли, повністю ізольований
+        # $legacyDeniedScenarioRoot, прибирається у finally).
+        $legacyDeniedFinalModel = Update-BRAVOConfiguratorEffective -Model $legacyDeniedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $legacyDeniedFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot -Model $legacyDeniedFinalModel -SchemaCatalog $legacyDeniedResolvedCatalog -ProductionBaseline $legacyDeniedBaseline
+        $legacyDeniedFinalContent = if (Test-Path -LiteralPath (Join-Path $legacyDeniedScenarioRoot 'BRAVO.local.config')) {
+            Get-Content -LiteralPath (Join-Path $legacyDeniedScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$legacyDeniedFinalApply.Applied -and [string]$legacyDeniedFinalApply.Stage -eq 'Complete' -and
+            -not $legacyDeniedFinalContent.Contains($legacyDeniedPath)
+        ) `
+            'Configurator/ClearingLegacyDeniedOverrideProducesValidCandidate' `
+            "після Clear валідний candidate мусить пройти Apply (Applied=`$true, Stage=Complete) і результуючий BRAVO.local.config більше не повинен містити '$legacyDeniedPath'; отримано Applied=$($legacyDeniedFinalApply.Applied) Stage=$($legacyDeniedFinalApply.Stage) StillContains=$($legacyDeniedFinalContent.Contains($legacyDeniedPath))"
+
+        # Section 6, Scenario B: сусідній ALLOW_SITE override
+        # (archiveRetentionDays), присутній у тому самому production-файлі
+        # від самого початку, мусить пережити весь цикл Clear -> Apply
+        # НЕЗМІННИМ — не лише denied прибрано, а й валідний сусід
+        # збережений, і результуючий файл завантажується канонічним
+        # loader-ом.
+        Test-BRAVOCondition (
+            $legacyDeniedFinalContent.Contains($legacyDeniedAllowedPath) -and
+            $legacyDeniedFinalContent.Contains([string]$legacyDeniedAllowedValue)
+        ) `
+            'Configurator/ClearingLegacyDeniedOverrideDoesNotDisturbSiblingAllowedOverride' `
+            "сусідній ALLOW_SITE override '$legacyDeniedAllowedPath'=$legacyDeniedAllowedValue мусить лишитись у production BRAVO.local.config незмінним після Clear+Apply denied-листа; отримано вміст: $legacyDeniedFinalContent"
+
+        $legacyDeniedFinalLoadedOverrides = (Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot).Overrides
+        Test-BRAVOCondition (
+            $legacyDeniedFinalLoadedOverrides.Contains($legacyDeniedAllowedPath) -and
+            [string]$legacyDeniedFinalLoadedOverrides[$legacyDeniedAllowedPath] -eq [string]$legacyDeniedAllowedValue -and
+            (-not $legacyDeniedFinalLoadedOverrides.Contains($legacyDeniedPath))
+        ) `
+            'Configurator/ClearingLegacyDeniedOverrideResultLoadsCleanlyViaCanonicalReader' `
+            "результуючий production BRAVO.local.config мусить перезчитуватись канонічним читачем зі збереженим '$legacyDeniedAllowedPath'=$legacyDeniedAllowedValue і без '$legacyDeniedPath'"
+    } finally {
+        Remove-Item -LiteralPath $legacyDeniedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====

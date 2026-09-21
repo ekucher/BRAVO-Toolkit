@@ -1648,6 +1648,118 @@
         -Name "Authorization/AllowWithValidatorInvalidRejected" `
         -Failure "robocopyMaxSuccessExitCode=8 (поза 0..7) мусить бути відхилений з точним rejected path"
 
+    # =====================================================================
+    # PR #224 review, F3: enum-валідатор БЕЗ trim відхиляв би значення на
+    # кшталт ' all ' (з пробілами), хоча щонайменше два ALLOW_WITH_VALIDATOR
+    # enum-листи (bravoSettings.NotificationMode/NotificationProvider)
+    # мають ДОВЕДЕНУ pre-Wave-2 нормалізацію .Trim().ToLowerInvariant() на
+    # ВСІХ реальних runtime-точках споживання (BRAVO_DRY_RUN.ps1 x4,
+    # BRAVO_NOTIFICATION_TEST.ps1, BRAVO_RESTORE_TEST.ps1). Фікс — окремий
+    # named-валідатор 'EnumTrimmed:' (НЕ узагальнене послаблення 'Enum:'
+    # для всіх 18 enum-листів без доказу) — Test-BRAVOConfigurationAuthorizationEnumValue
+    # порівнює з Trim(), значення при цьому НЕ мутується.
+    # =====================================================================
+
+    # --- Authorization/NotificationModeWhitespaceTolerated ---
+    $authNotifModeWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = ' all ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNotifModeWhitespaceResult.IsValid) `
+        -Name "Authorization/NotificationModeWhitespaceTolerated" `
+        -Failure "bravoSettings.NotificationMode=' all ' (пробіли) мусить бути прийнятий — усі runtime-споживачі вже роблять .Trim() перед використанням; отримано IsValid=$($authNotifModeWhitespaceResult.IsValid)"
+
+    # --- Authorization/NotificationModeStillRejectsGenuinelyInvalidValue ---
+    $authNotifModeInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = ' definitely-invalid ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeInvalidResult.IsValid) `
+        -Name "Authorization/NotificationModeStillRejectsGenuinelyInvalidValue" `
+        -Failure "trim-tolerance НЕ повинна ослабити реальну enum-перевірку — ' definitely-invalid ' мусить лишитись відхиленим; отримано IsValid=$($authNotifModeInvalidResult.IsValid)"
+
+    # --- Authorization/NotificationModeNonStringStillRejected ---
+    $authNotifModeNonStringResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = 5 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeNonStringResult.IsValid) `
+        -Name "Authorization/NotificationModeNonStringStillRejected" `
+        -Failure "не-рядкове значення мусить лишитись відхиленим навіть для EnumTrimmed-валідатора (Trim — лише для рядків); отримано IsValid=$($authNotifModeNonStringResult.IsValid)"
+
+    # --- Authorization/NotificationModeBooleanStillRejected ---
+    $authNotifModeBooleanResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = $true } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeBooleanResult.IsValid) `
+        -Name "Authorization/NotificationModeBooleanStillRejected" `
+        -Failure "Boolean `$true мусить лишитись відхиленим навіть для EnumTrimmed-валідатора (Trim — лише для рядків, не для Boolean-to-string коерсії); отримано IsValid=$($authNotifModeBooleanResult.IsValid)"
+
+    # --- Authorization/NotificationModeNullStillRejected ---
+    $authNotifModeNullResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = $null } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeNullResult.IsValid) `
+        -Name "Authorization/NotificationModeNullStillRejected" `
+        -Failure "`$null мусить лишитись відхиленим і для EnumTrimmed-валідатора; отримано IsValid=$($authNotifModeNullResult.IsValid)"
+
+    # --- Authorization/EnumTrimmedValidationDoesNotMutateOriginalValue ---
+    # Валідація — лише перевірка; саме значення, що йде далі в merge, не
+    # повинно набувати обрізаної/lower-case форми звідси (той самий
+    # незмінний runtime-consumer сам робить .Trim().ToLowerInvariant()).
+    $authNotifModeMutationProbeValue = ' All '
+    $authNotifModeMutationProbeOverrides = @{ 'bravoSettings.NotificationMode' = $authNotifModeMutationProbeValue }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $authNotifModeMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$authNotifModeMutationProbeOverrides['bravoSettings.NotificationMode'] -eq $authNotifModeMutationProbeValue) `
+        -Name "Authorization/EnumTrimmedValidationDoesNotMutateOriginalValue" `
+        -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне значення на місці (Trim лише для внутрішнього порівняння); отримано '$($authNotifModeMutationProbeOverrides['bravoSettings.NotificationMode'])' замість очікуваного '$authNotifModeMutationProbeValue'"
+
+    # --- Authorization/NotificationModeWhitespaceAndCaseBothTolerated ---
+    $authNotifModeCaseWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = ' ALL ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNotifModeCaseWhitespaceResult.IsValid) `
+        -Name "Authorization/NotificationModeWhitespaceAndCaseBothTolerated" `
+        -Failure "trim і case-insensitive порівняння мусять діяти РАЗОМ (' ALL ' -> 'all'); отримано IsValid=$($authNotifModeCaseWhitespaceResult.IsValid)"
+
+    # --- Authorization/NotificationProviderWhitespaceTolerated ---
+    $authNotifProviderWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationProvider' = ' discord ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNotifProviderWhitespaceResult.IsValid) `
+        -Name "Authorization/NotificationProviderWhitespaceTolerated" `
+        -Failure "bravoSettings.NotificationProvider=' discord ' мусить бути прийнятий (та сама доведена trim-tolerance, що NotificationMode); отримано IsValid=$($authNotifProviderWhitespaceResult.IsValid)"
+
+    # --- Authorization/OtherEnumLeavesRemainUntrimmedByDefault ---
+    # Регресійна межа: інший enum-лист (consoleSettings.ConsoleLevel), для
+    # якого НЕМАЄ доказу pre-Wave-2 trim-tolerance, мусить лишитись на
+    # звичайному строгому 'Enum:' (без trim) — фікс не узагальнюється без
+    # підстави.
+    $authOtherEnumWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = ' WARNING ' } `
+        -Schema $authSchema
+    $authOtherEnumExactResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = 'WARNING' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$authOtherEnumWhitespaceResult.IsValid) -and [bool]$authOtherEnumExactResult.IsValid) `
+        -Name "Authorization/OtherEnumLeavesRemainUntrimmedByDefault" `
+        -Failure "consoleSettings.ConsoleLevel НЕ має доказу trim-tolerance — з пробілами мусить відхилятись (IsValid=$($authOtherEnumWhitespaceResult.IsValid)), точне значення мусить і далі прийматись (IsValid=$($authOtherEnumExactResult.IsValid))"
+
+    # --- Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths ---
+    Test-BRAVOCondition `
+        -Condition (
+            ([string]$authRegistry['bravoSettings.NotificationMode'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal) -and
+            ([string]$authRegistry['bravoSettings.NotificationProvider'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)
+        ) `
+        -Name "Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' саме для NotificationMode/NotificationProvider; отримано NotificationMode=$($authRegistry['bravoSettings.NotificationMode'].Validator) NotificationProvider=$($authRegistry['bravoSettings.NotificationProvider'].Validator)"
+
     # --- Authorization/RobocopyExitCodeBoundaryMatrix ---
     # Owner-decision test matrix (WAVE2-CONTRACT.md, розділ 11.0/11.6): 0/7
     # accepted; 8/-1/7.5/'7' rejected. Рядок '7' НЕ повинен коерситись у
@@ -1980,6 +2092,78 @@
             }
         }
     }
+
+    # =====================================================================
+    # PR #224 review, F1: вкладений (nested hashtable) Node-шлях local
+    # override мусить рекурсивно авторизуватись по КОЖНОМУ дочірньому
+    # листу — реєстр авторизації навмисно leaf-only (Node-записів немає),
+    # тож ДО фіксу такий override помилково провалювався з
+    # MissingAuthorizationPolicy/UNREGISTERED замість реальної
+    # leaf-по-leaf перевірки.
+    # =====================================================================
+
+    # --- Authorization/NestedAllowedNodeAccepted ---
+    $authNestedAllowedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationRouting' = @{ SUCCESS = 'general'; WARNING = 'alerts' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNestedAllowedResult.IsValid) `
+        -Name "Authorization/NestedAllowedNodeAccepted" `
+        -Failure "вкладений Node-override з усіма ALLOW_* дочірніми листами мусить бути прийнятий; отримано IsValid=$($authNestedAllowedResult.IsValid) Violations=$($authNestedAllowedResult.Violations.Count)"
+
+    # --- Authorization/NestedNodeDeniedLeafBlocked ---
+    $authNestedDeniedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services' = @{ BravoName = 'OtherService' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (
+            (-not [bool]$authNestedDeniedResult.IsValid) -and
+            $authNestedDeniedResult.Violations.Count -eq 1 -and
+            [string]$authNestedDeniedResult.Violations[0].Path -eq 'maintenanceSettings.Services.BravoName'
+        ) `
+        -Name "Authorization/NestedNodeDeniedLeafBlocked" `
+        -Failure "вкладений Node-override, чий єдиний дочірній лист DENY_*, мусить бути відхилений з точним Path дочірнього листа; отримано IsValid=$($authNestedDeniedResult.IsValid) Path=$(if ($authNestedDeniedResult.Violations.Count -gt 0) { $authNestedDeniedResult.Violations[0].Path } else { '<немає>' })"
+
+    # --- Authorization/NestedMixedAllowedAndDeniedFailsAtomically ---
+    # Node з ДВОМА дочірніми листами — один ALLOW_SITE
+    # (BravoDisplayName), один DENY_EXECUTION_CONTROL (BravoName) — весь
+    # ШАР мусить провалитись атомарно (не лише конкретний лист).
+    $authNestedMixedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services' = @{ BravoName = 'OtherService'; BravoDisplayName = 'Custom Display' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNestedMixedResult.IsValid) `
+        -Name "Authorization/NestedMixedAllowedAndDeniedFailsAtomically" `
+        -Failure "Node з мішаними ALLOW/DENY дочірніми листами мусить провалити ВЕСЬ шар атомарно; отримано IsValid=$($authNestedMixedResult.IsValid)"
+
+    # --- Authorization/NestedPathCaseInsensitive ---
+    $authNestedCaseResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'MAINTENANCESETTINGS.SERVICES' = @{ BRAVONAME = 'OtherService' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNestedCaseResult.IsValid) `
+        -Name "Authorization/NestedPathCaseInsensitive" `
+        -Failure "вкладена DENY-класифікація мусить діяти незалежно від регістру і батьківського Node-шляху, і дочірнього ключа; отримано IsValid=$($authNestedCaseResult.IsValid)"
+
+    # --- Authorization/NestedUnknownChildUnderKnownNodeStillD3Accepted ---
+    # D3 мусить лишитись незмінним і для вкладеної форми: невідомий
+    # дочірній ключ під ВІДОМИМ Node-шляхом — accept, не UNREGISTERED.
+    $authNestedD3Result = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits' = @{ SomeFutureLeaf = 'x' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNestedD3Result.IsValid) `
+        -Name "Authorization/NestedUnknownChildUnderKnownNodeStillD3Accepted" `
+        -Failure "невідомий дочірній ключ під відомим Node-шляхом мусить лишитись D3 ACCEPT у вкладеній формі так само, як у пласкій; отримано IsValid=$($authNestedD3Result.IsValid)"
+
+    # --- Authorization/NestedRegistryStaysLeafOnly ---
+    # Реєстр авторизації НЕ повинен отримати запис для самого Node-шляху
+    # (bravoSettings.NotificationRouting) — лише для його листів; фікс F1
+    # не мав додавати Node-записи в реєстр.
+    Test-BRAVOCondition `
+        -Condition (-not $authRegistry.Contains('bravoSettings.NotificationRouting')) `
+        -Name "Authorization/NestedRegistryStaysLeafOnly" `
+        -Failure "реєстр авторизації мусить лишатись leaf-only — bravoSettings.NotificationRouting (Node) не повинен мати власного запису в реєстрі"
 }
 
 # =====================================================================

@@ -237,17 +237,61 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
         Проєктує модель у candidate-overrides hashtable (dot-шлях -> значення)
         для передачі в Effective/Persistence — лише ті записи, де
         OverridePresent=$true.
+    .DESCRIPTION
+        PR #224 review, F2 (legacy denied override deadlockує Configurator
+        при старті): виключає з проєкції будь-який override, чий
+        канонічний Wave 2 Class — DENY_* (напр. legacy
+        backupMonitoring.SFTP.BAZA.Mode='Legacy' з часів, коли цей лист
+        іще був editable через Configurator). Це стосується ЛИШЕ ЦІЄЇ
+        функції — ефективного preview-обчислення
+        (Update-BRAVOConfiguratorEffective БЕЗ -CandidateOverridesOverride,
+        тобто звичайний UI startup/recalculate шлях). Apply-гейт
+        (Persistence::Test-BRAVOConfiguratorCandidateOverrides) цю функцію
+        НІКОЛИ не викликає — він завжди передає повний $MergedOverrides
+        напряму через -CandidateOverridesOverride, тож лишається так само
+        fail-closed: доки denied override не прибрано (Clear), Apply і
+        далі відхиляється canonical loader-ом.
+        Виключення значення з ТОГО, ЩО РЕАЛЬНО НАДСИЛАЄТЬСЯ canonical
+        loader-у для preview — не те саме, що авторизація цього значення;
+        сам Model-запис (OverridePresent/OverrideValue) не мутується цим
+        викликом, тож UI і далі бачить "legacy denied override існує" для
+        відображення/можливості Clear.
+        Читає канонічний реєстр напряму
+        (Get-BRAVOConfigurationSchemaAuthorizationClass), а не другу
+        копію 271-позиційної класифікації — той самий реєстр, який уже
+        використовують BRAVO_CONFIG_LOADER.ps1 і
+        Resolve-BRAVOConfiguratorFieldAuthorization; коректно незалежно
+        від того, який варіант schema-каталогу (сирий чи вже пропущений
+        через Resolve-BRAVOConfiguratorFieldAuthorization) конкретний
+        викликач використав для побудови Model.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][array]$Model
     )
 
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
+    }
+    $authorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+
     $overrides = @{}
     foreach ($setting in $Model) {
-        if ($setting.OverridePresent) {
-            $overrides[$setting.Path] = $setting.OverrideValue
+        if (-not $setting.OverridePresent) { continue }
+        $path = [string]$setting.Path
+        if ($authorizationClass.Contains($path)) {
+            $class = [string]$authorizationClass[$path].Class
+            if ($class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
+                # Legacy/сторонній DENY_*-override — не передається
+                # canonical loader-у для preview-обчислення (F2). Model
+                # лишається незмінною для UI.
+                continue
+            }
         }
+        $overrides[$path] = $setting.OverrideValue
     }
     return $overrides
 }

@@ -179,6 +179,37 @@ try {
         -Name "ConfigLoader/LocalOverridesApplyAcrossBothPhasesWithDerivations" `
         -Failure "BRAVO.local.config має перевизначати первинні поля ДО деривацій (BackupRoot -> archiveDirs.Model; BootRestoreMode -> Recovery.Enabled=True) і пізні leaf-поля (поріг BAZA=77), з обліком у metadata (4 ключі); отримано: '$localCfgProbeLast'"
 
+    # --- PR #224 review, F1: вкладений (nested hashtable) Node-шлях
+    # local override реально доходить до merge/global-стану ЦІЛИМ
+    # loader-конвеєром (не лише unit-виклик authorization-функції).
+    # bravoSettings.NotificationRouting.SUCCESS/WARNING —
+    # ALLOW_WITH_VALIDATOR-листи; ДО F1 такий вкладений override
+    # помилково провалювався в авторизації з
+    # MissingAuthorizationPolicy/UNREGISTERED, бо реєстр — leaf-only.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'bravoSettings.NotificationRouting' = @{`r`n" +
+        "        'SUCCESS' = 'general'`r`n" +
+        "        'WARNING' = 'alerts'`r`n" +
+        "    }`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgNestedProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'{0}|{1}' -f [string]`$global:bravoSettings.NotificationRouting.SUCCESS, " +
+            "[string]`$global:bravoSettings.NotificationRouting.WARNING " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgNestedProbeLast = ([string](@($localCfgNestedProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgNestedProbeLast -eq 'general|alerts') `
+        -Name "ConfigLoader/NestedNodeOverrideReachesMergeAndAppliesPerLeaf" `
+        -Failure "вкладений (hashtable-значення) Node-override bravoSettings.NotificationRouting мусить пройти авторизацію по кожному дочірньому листу окремо й дійти до merge/global стану; отримано: '$localCfgNestedProbeLast'"
+
     # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",
@@ -1964,6 +1995,35 @@ Test-BRAVOCondition `
             ) `
             -Name "Authorization/LoaderRejectsDeniedLeafAloneWithSameMessage" `
             -Failure "лише denied-лист (без сусіднього валідного override) мусить так само fail closed з тим самим повідомленням, що називає точний шлях; отримано: $atomicityDenyOnlyResult"
+
+        # --- Authorization/LoaderAtomicMergeRejectsWholeLocalLayerNestedForm ---
+        # PR #224 review, F1 (section 4): дзеркало
+        # LoaderAtomicMergeRejectsWholeLocalLayer вище, але DENY-лист
+        # супроводжується ВКЛАДЕНОЮ (hashtable-значення) Node-формою
+        # (maintenanceSettings.Services = @{ BravoName = 'EvilService' }),
+        # не пласким dot-шляхом. Той самий ізольований (без BRAVO.config)
+        # probe, тому archiveRetentionDays справді <unset> до спроби —
+        # доводить, що вкладена форма fail-closed ЦІЛИМ loader-конвеєром
+        # ДО merge так само атомарно, як пласка.
+        $atomicityNestedBody = (
+            "@{`r`n" +
+            "    'pathSettings.BackupRoot' = '$atomicityBackupRootLiteral'`r`n" +
+            "    'archiveRetentionDays' = 999`r`n" +
+            "    'maintenanceSettings.Services' = @{`r`n" +
+            "        'BravoName' = 'EvilService'`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        )
+        $atomicityNestedResult = New-BRAVOConfigLoaderAtomicityProbe -LocalConfigBody $atomicityNestedBody
+        Test-BRAVOCondition `
+            -Condition (
+                $atomicityNestedResult.StartsWith('THREW:') -and
+                $atomicityNestedResult.Contains('неавторизоване перевизначення') -and
+                $atomicityNestedResult.Contains('maintenanceSettings.Services.BravoName') -and
+                $atomicityNestedResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+            ) `
+            -Name "Authorization/LoaderAtomicMergeRejectsWholeLocalLayerNestedForm" `
+            -Failure "вкладений (hashtable-значення) Node-override, чий єдиний дочірній лист DENY_EXECUTION_CONTROL, мусить fail closed ЦІЛИМ loader-конвеєром ДО merge (сусідній ALLOW_SITE archiveRetentionDays=999 НЕ повинен потрапити в `$global:-стан); отримано: $atomicityNestedResult"
     } finally {
         Remove-Item -LiteralPath $atomicityBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
