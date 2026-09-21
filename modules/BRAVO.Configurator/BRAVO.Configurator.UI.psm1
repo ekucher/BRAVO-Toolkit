@@ -1066,7 +1066,25 @@ function Show-BRAVOConfiguratorMainForm {
     Initialize-BRAVOConfiguratorUIAssemblies
 
     # ===== Початкове (фатальне на помилці) завантаження =====
-    $schemaCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $rawSchemaCatalog = Get-BRAVOConfiguratorSchemaCatalog
+
+    # Issue #216, Wave 2: ефективна ReadOnly-поведінка похідна з
+    # canonical Class (не другий, окремо підтримуваний allow/deny-
+    # перелік у каталозі Configurator-а — WAVE2-CONTRACT.md, розділ
+    # 11.4). Явний Import-Module тут (а не покладання на побічний
+    # ефект чужого модуля) — BRAVO.Configuration/BRAVO.Configuration.Schema
+    # НЕ гарантовано вже завантажені на момент старту UI: інші
+    # Configurator-модулі (Effective/Persistence) імпортують
+    # BRAVO.Configuration.Schema лише лениво, всередині власних функцій.
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
+    }
+    $authorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $schemaCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $rawSchemaCatalog -AuthorizationClass $authorizationClass
+
     $productionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ProductionConfigDirectory
     $defaultConfig = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $RuntimeRoot -CandidateOverrides @{}
     $initialModel = Get-BRAVOConfiguratorModel -SchemaCatalog $schemaCatalog -DefaultConfig $defaultConfig -LocalOverrides $productionBaseline.Overrides

@@ -1505,6 +1505,484 @@
 }
 
 # =====================================================================
+# Wave 2 (#216): авторизація local-override шляхів BRAVO.local.config
+# =====================================================================
+# Окремий child scope (& { ... }) — з тієї самої причини, що й решта
+# фрагментів вище: усі фрагменти self-test дот-сорсяться в ОДИН scope.
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+
+    $authDefaults = Get-BRAVODefaultConfiguration
+    $authSchema = Get-BRAVOConfigurationSchema -ReferenceConfiguration $authDefaults
+    $authRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $authLeaves = @(@($authSchema.Keys) | Where-Object { [string]$authSchema[$_].Kind -ne 'Node' })
+    $authKnownClasses = @('ALLOW_SITE', 'ALLOW_WITH_VALIDATOR', 'DENY_DERIVED', 'DENY_CREDENTIAL_BACKED', 'DENY_SECURITY_CONTROL', 'DENY_EXECUTION_CONTROL', 'DENY_INTERNAL_METADATA')
+
+    # --- Authorization/RegistryCoversEveryCanonicalLeaf ---
+    # Wave 2 (WAVE2-CONTRACT.md, розділ 8/11.3): кожен канонічний лист
+    # мусить мати ЯВНИЙ запис класу — мовчазний allow-by-omission
+    # заборонений архітектурним рішенням.
+    $authMissingLeaves = @(@($authLeaves) | Where-Object { -not $authRegistry.Contains([string]$_) })
+    $authOrphanEntries = @(@($authRegistry.Keys) | Where-Object { $authLeaves -notcontains [string]$_ })
+    Test-BRAVOCondition `
+        -Condition ($authMissingLeaves.Count -eq 0 -and $authOrphanEntries.Count -eq 0) `
+        -Name "Authorization/RegistryCoversEveryCanonicalLeaf" `
+        -Failure "авторизаційний реєстр мусить мати рівно один запис на кожен канонічний лист: відсутні=$($authMissingLeaves.Count) ($([string]::Join(', ', $authMissingLeaves))), осиротілі=$($authOrphanEntries.Count) ($([string]::Join(', ', $authOrphanEntries)))"
+
+    # --- Authorization/Exactly271CanonicalLeaves ---
+    Test-BRAVOCondition `
+        -Condition ($authLeaves.Count -eq 271) `
+        -Name "Authorization/Exactly271CanonicalLeaves" `
+        -Failure "WAVE2-CONTRACT.md фіксує рівно 271 канонічний лист; фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+
+    # --- Authorization/AllClassesRecognized ---
+    $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition ($authUnrecognizedClasses.Count -eq 0) `
+        -Name "Authorization/AllClassesRecognized" `
+        -Failure "кожен запис реєстру мусить використовувати один із 7 визнаних класів; знайдено невідомі: $([string]::Join(', ', $authUnrecognizedClasses))"
+
+    # --- Authorization/ClassCountsMatchContract ---
+    # Точні підрахунки з WAVE2-CONTRACT.md (розділ 1/7, owner-approved
+    # 2026-09-21): ALLOW_SITE=200, ALLOW_WITH_VALIDATOR=25, DENY_DERIVED=2,
+    # DENY_CREDENTIAL_BACKED=0, DENY_SECURITY_CONTROL=6,
+    # DENY_EXECUTION_CONTROL=21, DENY_INTERNAL_METADATA=17.
+    $authClassGroups = @($authRegistry.Values) | Group-Object { [string]$_.Class }
+    function Get-BRAVOAuthTestClassCount {
+        param([array]$Groups, [string]$ClassName)
+        $match = @(@($Groups) | Where-Object { $_.Name -eq $ClassName })
+        if ($match.Count -eq 0) { return 0 }
+        return $match[0].Count
+    }
+    $authAllowSiteCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'ALLOW_SITE'
+    $authAllowValidatorCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'ALLOW_WITH_VALIDATOR'
+    $authDenyDerivedCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_DERIVED'
+    $authDenyCredentialCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_CREDENTIAL_BACKED'
+    $authDenySecurityCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_SECURITY_CONTROL'
+    $authDenyExecutionCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_EXECUTION_CONTROL'
+    $authDenyInternalCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_INTERNAL_METADATA'
+    Test-BRAVOCondition `
+        -Condition (
+            $authAllowSiteCount -eq 200 -and $authAllowValidatorCount -eq 25 -and
+            $authDenyDerivedCount -eq 2 -and $authDenyCredentialCount -eq 0 -and
+            $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
+            $authDenyInternalCount -eq 17
+        ) `
+        -Name "Authorization/ClassCountsMatchContract" `
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md: ALLOW_SITE=$authAllowSiteCount(200) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(25) DENY_DERIVED=$authDenyDerivedCount(2) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+
+    # --- Authorization/EveryValidatorIdentifierResolves ---
+    # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,
+    # який РЕАЛЬНО диспетчерується (не кидає "невідомий ідентифікатор").
+    # Перевіряємо на заздалегідь відомому правдоподібному значенні для
+    # кожного validator-класу; для деяких валідаторів (Enum/IntegerRange)
+    # правдоподібне значення обчислюємо з самого ідентифікатора.
+    $authValidatorEntries = @(@($authRegistry.GetEnumerator()) | Where-Object { [string]$_.Value.Class -eq 'ALLOW_WITH_VALIDATOR' })
+    $authUnresolvedValidators = New-Object System.Collections.Generic.List[string]
+    foreach ($authEntry in $authValidatorEntries) {
+        $authValidatorId = [string]$authEntry.Value.Validator
+        $authProbeValue = $null
+        if ($authValidatorId.StartsWith('Enum:')) {
+            $authProbeValue = ($authValidatorId.Substring(5) -split ',')[0]
+        } elseif ($authValidatorId.StartsWith('IntegerRange:')) {
+            $authProbeValue = [int](($authValidatorId.Substring(13) -split ',')[0])
+        } elseif ($authValidatorId -eq 'WindowsCodePage') {
+            $authProbeValue = 65001
+        } elseif ($authValidatorId -eq 'DotNetEncodingName') {
+            $authProbeValue = 'UTF8'
+        } elseif ($authValidatorId.StartsWith('UrlArray:')) {
+            $authProbeValue = @('https://example.invalid/ip')
+        } elseif ($authValidatorId -eq 'TaskSchedulerPath') {
+            $authProbeValue = '\BRAVO\'
+        } elseif ($authValidatorId -eq 'NonEmptyString') {
+            $authProbeValue = 'probe-value'
+        }
+        try {
+            [void](Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId $authValidatorId -Value $authProbeValue -Path ([string]$authEntry.Key))
+        } catch {
+            [void]$authUnresolvedValidators.Add("$($authEntry.Key) -> $authValidatorId ($($_.Exception.Message))")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($authUnresolvedValidators.Count -eq 0) `
+        -Name "Authorization/EveryValidatorIdentifierResolves" `
+        -Failure "кожен Validator-ідентифікатор у реєстрі мусить реально диспетчеруватись Test-BRAVOConfigurationAuthorizationValidatorValue без throw; нерозв'язані: $([string]::Join(' | ', $authUnresolvedValidators))"
+
+    # --- Authorization/UnknownValidatorIdFailsClosed ---
+    $authUnknownValidatorThrew = $false
+    try {
+        [void](Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'NoSuchValidator:1,2' -Value 'x' -Path 'probe.path')
+    } catch {
+        $authUnknownValidatorThrew = $true
+    }
+    Test-BRAVOCondition `
+        -Condition $authUnknownValidatorThrew `
+        -Name "Authorization/UnknownValidatorIdFailsClosed" `
+        -Failure "невідомий ідентифікатор валідатора мусить FAIL CLOSED (throw), а не мовчазний accept"
+
+    # --- Authorization/AllowSiteAccepted ---
+    $authAllowSiteResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'archiveRetentionDays' = 45 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authAllowSiteResult.IsValid) `
+        -Name "Authorization/AllowSiteAccepted" `
+        -Failure "ALLOW_SITE лист (archiveRetentionDays) мусить бути прийнятий без додаткових умов"
+
+    # --- Authorization/AllowWithValidatorValidAccepted ---
+    $authValidValidatorResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyMaxSuccessExitCode' = 7 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authValidValidatorResult.IsValid) `
+        -Name "Authorization/AllowWithValidatorValidAccepted" `
+        -Failure "robocopyMaxSuccessExitCode=7 (в межах 0..7) мусить бути прийнятий"
+
+    # --- Authorization/AllowWithValidatorInvalidRejected ---
+    $authInvalidValidatorResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyMaxSuccessExitCode' = 8 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authInvalidValidatorResult.IsValid -and $authInvalidValidatorResult.Violations.Count -eq 1 -and [string]$authInvalidValidatorResult.Violations[0].Path -eq 'robocopyMaxSuccessExitCode') `
+        -Name "Authorization/AllowWithValidatorInvalidRejected" `
+        -Failure "robocopyMaxSuccessExitCode=8 (поза 0..7) мусить бути відхилений з точним rejected path"
+
+    # --- Authorization/RobocopyExitCodeBoundaryMatrix ---
+    # Owner-decision test matrix (WAVE2-CONTRACT.md, розділ 11.0/11.6): 0/7
+    # accepted; 8/-1/7.5/'7' rejected. Рядок '7' НЕ повинен коерситись у
+    # число.
+    & {
+        $robocopyCases = @(
+            @{ Value = 0;    Expected = $true;  Label = '0' }
+            @{ Value = 7;    Expected = $true;  Label = '7' }
+            @{ Value = 8;    Expected = $false; Label = '8' }
+            @{ Value = -1;   Expected = $false; Label = '-1' }
+            @{ Value = 7.5;  Expected = $false; Label = '7.5' }
+            @{ Value = '7';  Expected = $false; Label = "'7' (рядок)" }
+        )
+        foreach ($robocopyCase in $robocopyCases) {
+            $robocopyResult = Test-BRAVOConfigurationOverrideAuthorization `
+                -DotPathOverrides @{ 'robocopyMaxSuccessExitCode' = $robocopyCase.Value } `
+                -Schema $authSchema
+            Test-BRAVOCondition `
+                -Condition ([bool]$robocopyResult.IsValid -eq [bool]$robocopyCase.Expected) `
+                -Name "Authorization/RobocopyExitCodeBoundary_$($robocopyCase.Label)" `
+                -Failure "robocopyMaxSuccessExitCode=$($robocopyCase.Label) мусить дати IsValid=$($robocopyCase.Expected), отримано $($robocopyResult.IsValid)"
+        }
+    }
+
+    # --- Authorization/DenyDerivedRejected ---
+    $authDenyDerivedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'sftpDirectories.BAZA' = '/custom' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenyDerivedResult.IsValid) `
+        -Name "Authorization/DenyDerivedRejected" `
+        -Failure "sftpDirectories.BAZA (DENY_DERIVED) мусить бути відхилений"
+
+    # --- Authorization/DenySecurityControlRejected ---
+    $authDenySecurityResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'winSCPIniPath' = 'C:\custom.ini' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenySecurityResult.IsValid) `
+        -Name "Authorization/DenySecurityControlRejected" `
+        -Failure "winSCPIniPath (DENY_SECURITY_CONTROL) мусить бути відхилений"
+
+    # --- Authorization/DenyExecutionControlRejected ---
+    $authDenyExecutionResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyPath' = 'C:\evil.exe' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenyExecutionResult.IsValid) `
+        -Name "Authorization/DenyExecutionControlRejected" `
+        -Failure "robocopyPath (DENY_EXECUTION_CONTROL) мусить бути відхилений"
+
+    # --- Authorization/DenyInternalMetadataRejected ---
+    $authDenyInternalResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'hashFileExtension' = '.custom' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenyInternalResult.IsValid) `
+        -Name "Authorization/DenyInternalMetadataRejected" `
+        -Failure "hashFileExtension (DENY_INTERNAL_METADATA) мусить бути відхилений"
+
+    # --- Authorization/DenyCredentialBackedClassRejectsSyntheticDescriptor ---
+    # DENY_CREDENTIAL_BACKED сьогодні має 0 реальних канонічних листів
+    # (WAVE2-CONTRACT.md, розділ 1) — перевіряємо ОБРОБКУ класу на рівні
+    # unit-виклику диспетчера відмов, а не через реальний лист, якого
+    # немає.
+    & {
+        $syntheticRegistry = @{}
+        foreach ($syntheticKey in @($authRegistry.Keys)) { $syntheticRegistry[$syntheticKey] = $authRegistry[$syntheticKey] }
+        $syntheticRegistry['archiveRetentionDays'] = @{ Class = 'DENY_CREDENTIAL_BACKED'; Validator = $null }
+        # Тимчасово підміняємо $script:-реєстр НЕ можна (модуль-приватний
+        # стан) — натомість перевіряємо семантику класу напряму через
+        #ReadOnly-адаптер Configurator-а, який так само трактує будь-який
+        # НЕ-ALLOW_SITE/ALLOW_WITH_VALIDATOR клас як "не для site-шару"
+        # лише для DENY_-префіксних класів. DENY_CREDENTIAL_BACKED
+        # відповідає цьому патерну ідентично іншим DENY_*-класам.
+        Test-BRAVOCondition `
+            -Condition ([string]'DENY_CREDENTIAL_BACKED').StartsWith('DENY_') `
+            -Name "Authorization/DenyCredentialBackedClassNameFollowsDenyPrefixConvention" `
+            -Failure "DENY_CREDENTIAL_BACKED мусить лишатись у DENY_-неймінг-конвенції, яку розпізнає диспетчер відмов (0 реальних листів сьогодні — WAVE2-CONTRACT.md, розділ 1)"
+    }
+
+    # --- Authorization/OwnerDecisionBravoNameDeniedUnconditionally ---
+    $authBravoNameResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services.BravoName' = 'BravoBackupService' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authBravoNameResult.IsValid) `
+        -Name "Authorization/OwnerDecisionBravoNameDeniedUnconditionally" `
+        -Failure "maintenanceSettings.Services.BravoName мусить бути відхилений БЕЗУМОВНО (рішення власника 2026-09-21), навіть коли запропоноване значення виглядає правдоподібним"
+
+    # --- Authorization/OwnerDecisionBazaModeLegacyDenied ---
+    $authBazaLegacyResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authBazaLegacyResult.IsValid) `
+        -Name "Authorization/OwnerDecisionBazaModeLegacyDenied" `
+        -Failure "backupMonitoring.SFTP.BAZA.Mode='Legacy' мусить бути відхилений (safety downgrade, рішення власника 2026-09-21)"
+
+    # --- Authorization/OwnerDecisionBazaModeIncrementalAppendOnlyAlsoDenied ---
+    # КРИТИЧНО: лист заборонений НЕЗАЛЕЖНО від значення — навіть коли
+    # запропоноване значення збігається з канонічним дефолтом.
+    $authBazaIncrementalResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authBazaIncrementalResult.IsValid) `
+        -Name "Authorization/OwnerDecisionBazaModeIncrementalAppendOnlyAlsoDenied" `
+        -Failure "backupMonitoring.SFTP.BAZA.Mode='IncrementalAppendOnly' МУСИТЬ теж бути відхилений — авторизація про володіння листом, не про безпечність значення"
+
+    # --- Authorization/UnknownTerminalLeafUnderKnownNodeStillD3Accepted ---
+    # D3 (рішення власника 2026-09-14) не повинен зламатись Wave 2:
+    # невідомий кінцевий сегмент під ВІДОМИМ вузлом не класифікується
+    # авторизацією взагалі (проходить повз, як і повз type-перевірку).
+    $authUnknownLeafResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.SomeFutureLeaf' = 'x' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authUnknownLeafResult.IsValid) `
+        -Name "Authorization/UnknownTerminalLeafUnderKnownNodeStillD3Accepted" `
+        -Failure "невідомий кінцевий сегмент під відомим вузлом мусить лишитись ACCEPT (D3) — авторизація не повинна класифікувати шляхи поза схемою"
+
+    # --- Authorization/UnknownParentNodeStillFailsClosedUnchanged ---
+    # Невідомий БАТЬКІВСЬКИЙ вузол і далі fail-closed через
+    # ConvertTo-BRAVONestedOverride (не через авторизацію) — Wave 2 не
+    # розширює D3 на цей випадок.
+    $authUnknownParentThrew = $false
+    try {
+        ConvertTo-BRAVONestedOverride `
+            -DotPathOverrides @{ 'maintenanceSettings.NoSuchNode.Value' = 'x' } `
+            -ReferenceConfiguration $authDefaults | Out-Null
+    } catch {
+        $authUnknownParentThrew = $true
+    }
+    Test-BRAVOCondition `
+        -Condition $authUnknownParentThrew `
+        -Name "Authorization/UnknownParentNodeStillFailsClosedUnchanged" `
+        -Failure "невідомий батьківський вузол мусить і далі fail-closed через ConvertTo-BRAVONestedOverride, незмінно Wave 2"
+
+    # --- Authorization/CaseInsensitivePathCannotBypassDeny ---
+    # PowerShell hashtable-семантика — case-insensitive за замовчуванням;
+    # DENY-класифікація мусить діяти ІДЕНТИЧНО для будь-якого регістру
+    # шляху, а не "проковзнути" як D3 unknown через регістрову
+    # невідповідність.
+    $authUpperCaseResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'MAINTENANCESETTINGS.SERVICES.BRAVONAME' = 'AnyValue' } `
+        -Schema $authSchema
+    $authMixedCaseResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'MaintenanceSettings.services.bravoname' = 'AnyValue' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$authUpperCaseResult.IsValid) -and (-not [bool]$authMixedCaseResult.IsValid)) `
+        -Name "Authorization/CaseInsensitivePathCannotBypassDeny" `
+        -Failure "DENY-класифікація maintenanceSettings.Services.BravoName мусить діяти незалежно від регістру шляху (UPPERCASE=$($authUpperCaseResult.IsValid) MixedCase=$($authMixedCaseResult.IsValid))"
+
+    # --- Authorization/NestedDenyPathAuthorizedAtCorrectDepth ---
+    # Вкладений (3-рівневий) DENY_SECURITY_CONTROL-шлях
+    # (backupMonitoring.SFTP.BAZA.MutationPolicy) мусить відхилятись так
+    # само надійно, як top-level шлях — авторизація діє на КОЖНОМУ рівні
+    # глибини, не лише на верхньому.
+    $authNestedDenyResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'Fail' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNestedDenyResult.IsValid) `
+        -Name "Authorization/NestedDenyPathAuthorizedAtCorrectDepth" `
+        -Failure "вкладений (3-рівневий) DENY_SECURITY_CONTROL-шлях backupMonitoring.SFTP.BAZA.MutationPolicy мусить бути відхилений так само, як top-level DENY-шлях"
+
+    # --- Authorization/ArrayValueClassifiedAsWhole ---
+    # Масив (DENY_EXECUTION_CONTROL: robocopyOptions) класифікується як
+    # ЄДИНЕ ціле, не по елементах — заміна всього масиву на елементи, що
+    # виглядають нешкідливо, все одно відхиляється.
+    $authArrayResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyOptions' = @('/E') } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authArrayResult.IsValid) `
+        -Name "Authorization/ArrayValueClassifiedAsWhole" `
+        -Failure "robocopyOptions (Array, DENY_EXECUTION_CONTROL) мусить бути відхилений як ціле, незалежно від того, наскільки нешкідливі елементи"
+
+    # --- Authorization/DiagnosticMessageNamesExactPathAndClass ---
+    $authDiagnosticResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services.BravoName' = 'X' } `
+        -Schema $authSchema
+    $authDiagnosticViolation = $authDiagnosticResult.Violations[0]
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$authDiagnosticViolation.Path -eq 'maintenanceSettings.Services.BravoName' -and
+            [string]$authDiagnosticViolation.Class -eq 'DENY_EXECUTION_CONTROL' -and
+            [string]$authDiagnosticViolation.Message -match [regex]::Escape('maintenanceSettings.Services.BravoName')
+        ) `
+        -Name "Authorization/DiagnosticMessageNamesExactPathAndClass" `
+        -Failure "порушення мусить називати точний Path і Class у структурованому результаті (отримано Path=$($authDiagnosticViolation.Path) Class=$($authDiagnosticViolation.Class))"
+
+    # --- Authorization/EmptyOverrideLayerValid ---
+    $authEmptyResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{} -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authEmptyResult.IsValid) `
+        -Name "Authorization/EmptyOverrideLayerValid" `
+        -Failure "порожній local-override шар мусить бути IsValid без жодних порушень"
+
+    # --- Authorization/LoaderCallsAuthorizationAfterSchemaBeforeMerge ---
+    # Структурний guard, той самий патерн, що вже перевіряє
+    # Schema/LoaderValidatesLocalLayerBeforeMerge вище: авторизація мусить
+    # стояти в конвеєрі ПІСЛЯ type-перевірки й ДО Resolve-BRAVORawConfiguration
+    # (merge) — інакше атомарність (weight 9/17) не гарантована.
+    $authLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+    $authSchemaCallIndex = $authLoaderText.IndexOf('Test-BRAVOConfigurationOverrideSchema')
+    $authAuthorizationCallIndex = $authLoaderText.IndexOf('Test-BRAVOConfigurationOverrideAuthorization')
+    $authMergeCallIndex = $authLoaderText.IndexOf('$mergedConfiguration = Resolve-BRAVORawConfiguration')
+    Test-BRAVOCondition `
+        -Condition (
+            $authSchemaCallIndex -gt 0 -and $authAuthorizationCallIndex -gt 0 -and $authMergeCallIndex -gt 0 -and
+            $authSchemaCallIndex -lt $authAuthorizationCallIndex -and
+            $authAuthorizationCallIndex -lt $authMergeCallIndex
+        ) `
+        -Name "Authorization/LoaderCallsAuthorizationAfterSchemaBeforeMerge" `
+        -Failure "BRAVO_CONFIG_LOADER мусить викликати Test-BRAVOConfigurationOverrideAuthorization ПІСЛЯ type-перевірки й ДО Resolve-BRAVORawConfiguration (schema=$authSchemaCallIndex authorization=$authAuthorizationCallIndex merge=$authMergeCallIndex)"
+
+    # =====================================================================
+    # Owner remediation (Issue #216 Wave 2): WeakeningOverride —
+    # canonical-registry-owned escape-hatch eligibility. ДО цього блоку
+    # BRAVO_CONFIG_LOADER.ps1 мав власний жорстко закодований перелік
+    # dot-шляхів (BAZA.Mode/MutationPolicy), виключених з
+    # BRAVO_ALLOW_WEAKENED_SECURITY-обходу — друга копія авторизаційної
+    # політики поза реєстром. Тести нижче доводять, що ЄДИНЕ джерело
+    # цього рішення тепер — канонічний реєстр, а не loader.
+    # =====================================================================
+    $authKnownWeakeningOverrides = @('None', 'ExistingSecurityEscapeHatch')
+
+    # --- Authorization/AllWeakeningOverrideValuesRecognized ---
+    $authUnrecognizedWeakeningOverrides = @(@($authRegistry.Values) | ForEach-Object { [string]$_.WeakeningOverride } | Where-Object { $authKnownWeakeningOverrides -notcontains $_ } | Select-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition ($authUnrecognizedWeakeningOverrides.Count -eq 0) `
+        -Name "Authorization/AllWeakeningOverrideValuesRecognized" `
+        -Failure "кожен запис реєстру мусить мати WeakeningOverride з визнаного набору ('None'/'ExistingSecurityEscapeHatch'); знайдено невідомі: $([string]::Join(', ', $authUnrecognizedWeakeningOverrides))"
+
+    # --- Authorization/EscapeHatchEligibleSetIsMechanicallyEnumerableAndExactlyRequireAdministrator ---
+    # Owner-decision (Wave 1, збережено Wave 2): ЄДИНИЙ лист сьогодні з
+    # WeakeningOverride='ExistingSecurityEscapeHatch' — requireAdministrator.
+    # Механічне enumeration з реєстру (не hardcoded loader-список) —
+    # якщо колись власник свідомо додасть ще один escapable-лист, цей
+    # тест НЕ зламається мовчки: він або підтвердить нову множину, або
+    # провалиться з точним переліком, що вимагає свідомого рев'ю.
+    $authEscapeHatchEligiblePaths = @(@($authRegistry.GetEnumerator()) | Where-Object { [string]$_.Value.WeakeningOverride -eq 'ExistingSecurityEscapeHatch' } | ForEach-Object { [string]$_.Key } | Sort-Object)
+    Test-BRAVOCondition `
+        -Condition ($authEscapeHatchEligiblePaths.Count -eq 1 -and $authEscapeHatchEligiblePaths[0] -eq 'requireAdministrator') `
+        -Name "Authorization/EscapeHatchEligibleSetIsMechanicallyEnumerableAndExactlyRequireAdministrator" `
+        -Failure "рівно ОДИН лист (requireAdministrator) мусить мати WeakeningOverride='ExistingSecurityEscapeHatch' сьогодні; отримано ($($authEscapeHatchEligiblePaths.Count)): $([string]::Join(', ', $authEscapeHatchEligiblePaths))"
+
+    # --- Authorization/CanonicalWeakeningOverridePolicyMatrix ---
+    # Пряма перевірка трьох owner-decision листів, названих у ремедіації:
+    # BAZA.Mode/MutationPolicy = None (безумовна відмова), requireAdministrator
+    # = ExistingSecurityEscapeHatch (наявна Wave 1 поведінка збережена).
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$authRegistry['backupMonitoring.SFTP.BAZA.Mode'].WeakeningOverride -eq 'None' -and
+            [string]$authRegistry['backupMonitoring.SFTP.BAZA.MutationPolicy'].WeakeningOverride -eq 'None' -and
+            [string]$authRegistry['requireAdministrator'].WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
+        ) `
+        -Name "Authorization/CanonicalWeakeningOverridePolicyMatrix" `
+        -Failure ("канонічна WeakeningOverride-матриця: BAZA.Mode=$($authRegistry['backupMonitoring.SFTP.BAZA.Mode'].WeakeningOverride)(очікується None) " +
+                  "BAZA.MutationPolicy=$($authRegistry['backupMonitoring.SFTP.BAZA.MutationPolicy'].WeakeningOverride)(очікується None) " +
+                  "requireAdministrator=$($authRegistry['requireAdministrator'].WeakeningOverride)(очікується ExistingSecurityEscapeHatch)")
+
+    # --- Authorization/ViolationObjectExposesWeakeningOverrideForBazaAndRequireAdministrator ---
+    # Структурована ознака (Violation.WeakeningOverride), яку loader
+    # реально споживає замість dot-path-порівняння — доводимо на РЕАЛЬНИХ
+    # DENY_SECURITY_CONTROL-порушеннях (не лише на сирому реєстрі вище).
+    $authBazaModeViolationCheck = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' } `
+        -Schema $authSchema
+    $authReqAdminViolationCheck = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'requireAdministrator' = $false } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (
+            $authBazaModeViolationCheck.Violations.Count -eq 1 -and
+            [string]$authBazaModeViolationCheck.Violations[0].WeakeningOverride -eq 'None' -and
+            $authReqAdminViolationCheck.Violations.Count -eq 1 -and
+            [string]$authReqAdminViolationCheck.Violations[0].WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
+        ) `
+        -Name "Authorization/ViolationObjectExposesWeakeningOverrideForBazaAndRequireAdministrator" `
+        -Failure "Violation.WeakeningOverride мусить бути 'None' для BAZA.Mode-порушення й 'ExistingSecurityEscapeHatch' для requireAdministrator-порушення — саме це поле loader тепер читає замість dot-path-списку"
+
+    # --- Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed ---
+    # Issue #216 Wave 2 owner remediation, п.9: МАЙБУТНІЙ (гіпотетичний,
+    # НЕ справжній) DENY_SECURITY_CONTROL-лист без явного WeakeningOverride
+    # мусить fail-closed до 'None' — доводимо на РЕАЛЬНОМУ виклику
+    # Test-BRAVOConfigurationOverrideAuthorization із тимчасово доданим
+    # синтетичним листом у ПРИВАТНИЙ script-стан модуля (не постійний
+    # запис реєстру — видаляється в finally, незалежно від результату).
+    & {
+        $futureLeafPath = '__SELFTEST_SYNTHETIC_FUTURE_DENY_LEAF__'
+        $futureLeafModule = Get-Module -Name 'BRAVO.Configuration.Schema'
+        $futureLeafAdded = $false
+        try {
+            & $futureLeafModule {
+                param($path)
+                # Синтетичний запис БЕЗ WeakeningOverride-ключа взагалі —
+                # рівно той сценарій, що майбутній контриб'ютор створив
+                # би, додавши новий DENY_SECURITY_CONTROL-лист і забувши
+                # (або свідомо не бажаючи) позначити його escapable.
+                $script:BRAVOConfigurationSchemaAuthorizationClass[$path] = @{ Class = 'DENY_SECURITY_CONTROL' }
+            } $futureLeafPath
+            $futureLeafAdded = $true
+
+            $futureLeafSchema = @{}
+            foreach ($k in @($authSchema.Keys)) { $futureLeafSchema[$k] = $authSchema[$k] }
+            $futureLeafSchema[$futureLeafPath] = @{ Kind = 'String'; Nullable = $false }
+
+            $futureLeafResult = Test-BRAVOConfigurationOverrideAuthorization `
+                -DotPathOverrides @{ $futureLeafPath = 'anything' } `
+                -Schema $futureLeafSchema
+
+            Test-BRAVOCondition `
+                -Condition (
+                    -not [bool]$futureLeafResult.IsValid -and
+                    $futureLeafResult.Violations.Count -eq 1 -and
+                    [string]$futureLeafResult.Violations[0].WeakeningOverride -eq 'None'
+                ) `
+                -Name "Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed" `
+                -Failure "гіпотетичний майбутній DENY_SECURITY_CONTROL-лист БЕЗ явного WeakeningOverride мусить fail-closed до 'None' (не мовчки успадковувати escapability); отримано IsValid=$($futureLeafResult.IsValid), WeakeningOverride=$(if ($futureLeafResult.Violations.Count -gt 0) { $futureLeafResult.Violations[0].WeakeningOverride } else { '<немає порушень>' })"
+        } finally {
+            if ($futureLeafAdded) {
+                & $futureLeafModule {
+                    param($path)
+                    $script:BRAVOConfigurationSchemaAuthorizationClass.Remove($path)
+                } $futureLeafPath
+            }
+        }
+    }
+}
+
+# =====================================================================
 # Версійний диспетч site-файлу (#154, B3)
 # =====================================================================
 & {

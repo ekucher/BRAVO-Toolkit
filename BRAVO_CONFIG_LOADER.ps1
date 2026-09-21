@@ -919,12 +919,89 @@ function Complete-BRAVOConfigurationLoad {
     # кінцевий сегмент і далі приймається (рішення власника D3) та
     # обліковується $UnknownLeafPathSink.
     if ($LocalOverrides.Count -gt 0) {
+        $canonicalSchemaForLocalOverrides = Get-BRAVOConfigurationSchema -ReferenceConfiguration $defaultConfiguration
+
         $localSchemaResult = Test-BRAVOConfigurationOverrideSchema `
             -DotPathOverrides $LocalOverrides `
-            -Schema (Get-BRAVOConfigurationSchema -ReferenceConfiguration $defaultConfiguration)
+            -Schema $canonicalSchemaForLocalOverrides
         if (-not $localSchemaResult.IsValid) {
             $localSchemaMessages = @(@($localSchemaResult.Violations) | ForEach-Object { [string]$_.Message })
             throw ("BRAVO.local.config: недійсний тип значення — " + [string]::Join(' ', $localSchemaMessages))
+        }
+
+        # Issue #216, Wave 2: авторизація — ОКРЕМИЙ шар від щойно
+        # пройденої type-перевірки вище. Type-перевірка каже "значення
+        # правильної форми"; ця перевірка каже "BRAVO.local.config МАЄ
+        # ПРАВО перевизначати цей лист узагалі". Обидва виклики
+        # відбуваються ДО Resolve-BRAVORawConfiguration (merge) — throw
+        # тут зупиняє виконання ДО того, як хоч один рядок $LocalOverrides
+        # потрапить у мердж, тому відмова атомарна для ВСЬОГО
+        # local-override шару: жоден інший, дозволений, override з того
+        # самого файлу не застосовується частково (WAVE2-CONTRACT.md,
+        # розділ 11.2/11.6, тест-кейс 12).
+        $localAuthorizationResult = Test-BRAVOConfigurationOverrideAuthorization `
+            -DotPathOverrides $LocalOverrides `
+            -Schema $canonicalSchemaForLocalOverrides
+        if (-not $localAuthorizationResult.IsValid) {
+            # Ескалаційний шлях (owner-approved Wave 2 authorization
+            # contract, розділ 5 — планувальний документ узгоджений з
+            # власником поза репозиторієм, не файл у дереві коду) — ТОЙ
+            # САМИЙ BRAVO_ALLOW_WEAKENED_SECURITY=1 операторський
+            # контракт, що Test-BRAVOEffectiveSecurityInvariants нижче
+            # вже застосовує до backupConsistency.Mode/
+            # toolIntegritySettings.Mode/requireAdministrator, поширений
+            # на ЦЕЙ (більш ранній) шар — не новий винахід Wave 2.
+            #
+            # Owner remediation (Issue #216 Wave 2): loader НЕ знає
+            # жодної dot-path-назви й НЕ вирішує, який лист має право на
+            # цей escape hatch — це питання власника ЄДИНОГО канонічного
+            # авторизаційного реєстру (BRAVO.Configuration.Schema.psm1),
+            # яке loader читає з кожного Violation.WeakeningOverride:
+            #   'ExistingSecurityEscapeHatch' -> цей конкретний DENY_SECURITY_CONTROL-
+            #                                     лист МОЖЕ пройти через
+            #                                     BRAVO_ALLOW_WEAKENED_SECURITY=1
+            #                                     (сьогодні: лише requireAdministrator).
+            #   'None' (або відсутність позначки) -> безумовна відмова,
+            #                                     незалежно від класу й
+            #                                     від значення env-змінної
+            #                                     (сьогодні: BAZA.Mode/
+            #                                     MutationPolicy — append-
+            #                                     only/mutation-detection
+            #                                     цілісність BAZA, той
+            #                                     самий клас гарантії, що
+            #                                     .claude/rules/07-bravo-runtime-invariants.md
+            #                                     вимагає окремого
+            #                                     свідомого рішення
+            #                                     власника для послаблення).
+            # ДО цього блоку тут стояв жорстко закодований
+            # $localAuthorizationUnconditionalPaths-перелік dot-шляхів —
+            # друга, окрема копія тієї самої політики поза реєстром
+            # (ризик розбіжності). Раніше видалений: рішення "хто
+            # escapable" живе ВИКЛЮЧНО в каноничному реєстрі тепер.
+            $localAuthorizationSecurityViolations = @(@($localAuthorizationResult.Violations) | Where-Object {
+                [string]$_.WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
+            })
+            $localAuthorizationHardViolations = @(@($localAuthorizationResult.Violations) | Where-Object {
+                [string]$_.WeakeningOverride -ne 'ExistingSecurityEscapeHatch'
+            })
+            $localAuthorizationAllowWeakened = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+
+            if ($localAuthorizationHardViolations.Count -gt 0 -or $localAuthorizationAllowWeakened -ne '1') {
+                $localAuthorizationMessages = @(@($localAuthorizationResult.Violations) | ForEach-Object { [string]$_.Message })
+                throw ("BRAVO.local.config: неавторизоване перевизначення — " + [string]::Join(' ', $localAuthorizationMessages))
+            }
+
+            # Лишились ЛИШЕ DENY_SECURITY_CONTROL-порушення, і оператор
+            # явно підтвердив BRAVO_ALLOW_WEAKENED_SECURITY=1 — свідоме
+            # послаблення продовжується (лишає видимий слід), а не мовчки
+            # застосовується; $LocalOverrides нижче мерджиться ПОВНІСТЮ як
+            # завжди, тому дозволене значення реально стає ефективним.
+            $localAuthorizationSecurityMessages = @(@($localAuthorizationSecurityViolations) | ForEach-Object { [string]$_.Message })
+            Write-Warning (
+                "УВАГА: BRAVO.local.config перевизначає security-critical лист(и), заборонені за замовчуванням: " +
+                "$([string]::Join(' ', $localAuthorizationSecurityMessages)) Продовжено через BRAVO_ALLOW_WEAKENED_SECURITY=1. " +
+                "Це тимчасовий режим міграції, не для постійної експлуатації."
+            )
         }
     }
 

@@ -436,6 +436,782 @@ function Test-BRAVOConfigurationOverrideSchema {
     }
 }
 
+# =========================================================================
+# Wave 2 (#216): авторизація local-override шляхів BRAVO.local.config.
+# =========================================================================
+#
+# ЩО ЦЕ. Test-BRAVOConfigurationOverrideSchema (вище) перевіряє лише ТИП
+# значення. Wave 2 додає ОРТОГОНАЛЬНИЙ шар: чи МАЄ BRAVO.local.config
+# ПРАВО перевизначати конкретний лист узагалі, незалежно від того,
+# наскільки правильне запропоноване значення. Контракт (owner-approved,
+# WAVE2-CONTRACT.md, 2026-09-21) класифікує кожен із 271 канонічних
+# листів в один із семи класів:
+#
+#   ALLOW_SITE             — звичайне site-значення, без обмежень.
+#   ALLOW_WITH_VALIDATOR   — дозволено, але семантично обмежене (Enum,
+#                            діапазон, формат) — Validator називає
+#                            конкретний іменований валідатор нижче.
+#   DENY_DERIVED            — значення обчислюється похідною логікою;
+#                            local-override сюди ніколи не гарантовано
+#                            узгоджено застосується.
+#   DENY_CREDENTIAL_BACKED  — ніс би сам секрет (сьогодні 0 листів; клас
+#                            зарезервований на майбутнє).
+#   DENY_SECURITY_CONTROL   — security-critical перемикач.
+#   DENY_EXECUTION_CONTROL  — керує тим, ЩО/ЯК/ПІД КИМ виконується
+#                            (шлях виконуваного файлу, аргументи
+#                            командного рядка, ідентичність служби/задачі).
+#   DENY_INTERNAL_METADATA  — внутрішній контракт формату (glob/ordinal/
+#                            timestamp), на який покладаються кілька
+#                            підсистем незалежно від оператора.
+#
+# ЧОМУ ОКРЕМИЙ ШАР, А НЕ РОЗШИРЕННЯ ТИПОВОЇ ПЕРЕВІРКИ. Правильний ТИП
+# значення (String/Number/...) нічого не каже про те, чи ЦЕЙ шлях
+# узагалі дозволено перевизначати з site-шару — 05-architecture.md
+# вимагає одного канонічного власника на відповідальність, тому
+# авторизація живе тут (поруч зі схемою форми), а не дублюється в
+# BRAVO_CONFIG_LOADER.ps1 чи Configurator-і.
+#
+# ДЖЕРЕЛО КЛАСИФІКАЦІЇ. "WAVE2-CONTRACT.md", згаданий у коментарях
+# нижче й посилання на нього нижче за текстом — це ЗОВНІШНІЙ,
+# попередньо узгоджений з власником планувальний документ (Issue #216,
+# Wave 2), який навмисно НЕ закомічений у це дерево коду (аналогічно
+# іншим planning/acceptance-артефактам, що не належать до runtime).
+# Він є джерелом 271-позиційного переліку й per-класового обґрунтування
+# нижче; сам реєстр і self-test-покриття (селф-тест-файли
+# Configuration/ConfigLoader/Configurator) — це відтворювана,
+# перевірювана В РЕПОЗИТОРІЇ форма цього рішення.
+#
+# МЕЖА З D3 (unknown-leaf accept+warn, рішення власника 2026-09-14).
+# Авторизаційний реєстр нижче — це той самий периметр, що вже перевіряє
+# Test-BRAVOConfigurationOverrideSchema: КОЖЕН шлях спершу проходить
+# через $Schema.Contains($path) (див. Test-BRAVOConfigurationOverrideAuthorization
+# нижче) — шлях, якого немає в канонічній схемі, НЕ класифікується тут
+# узагалі й проходить повз цей шар так само, як повз type-перевірку.
+# Це свідоме узгодження з D3, не недогляд (WAVE2-CONTRACT.md, розділ 5/11.3).
+#
+# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 271 канонічних листів (а не
+# лише на DENY/VALIDATOR-підмножину) — навмисно: WAVE2-CONTRACT.md
+# (розділ 8/11.3) вимагає, щоб кожен НОВИЙ канонічний лист отримував
+# явне класифікаційне рішення (навіть якщо це явний ALLOW_SITE), а не
+# мовчазний allow-by-omission. Повнота реєстру перевіряється в
+# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "271/271
+# coverage" — фейлить, якщо реєстр і канонічна схема розійшлися в
+# обидва боки: зайвий запис АБО відсутній запис); у цьому модулі немає
+# окремої функції з такою назвою.
+#
+# WEAKENINGOVERRIDE (owner remediation, Issue #216 Wave 2 — усунення
+# дублювання політики). ДО цього поля BRAVO_CONFIG_LOADER.ps1 містив
+# власний, жорстко закодований перелік dot-шляхів (BAZA.Mode/
+# MutationPolicy), які виключені з BRAVO_ALLOW_WEAKENED_SECURITY-обходу
+# — друга, окрема копія авторизаційної політики поза канонічним
+# реєстром (ризик розбіжності). WeakeningOverride переносить ЦЕ рішення
+# в canonical реєстр — loader питає РЕЗУЛЬТАТ (Violation.WeakeningOverride),
+# а не порівнює dot-шлях.
+#
+#   None                        — DENY_*-порушення на цьому листі НІКОЛИ
+#                                  не може використати наявний
+#                                  BRAVO_ALLOW_WEAKENED_SECURITY-механізм
+#                                  (fail closed за замовчуванням — див.
+#                                  нижче).
+#   ExistingSecurityEscapeHatch — DENY_SECURITY_CONTROL-порушення на
+#                                  цьому листі МОЖЕ пройти через наявний
+#                                  BRAVO_ALLOW_WEAKENED_SECURITY=1
+#                                  оператора-контракт (той самий
+#                                  механізм, що вже застосовує
+#                                  Test-BRAVOEffectiveSecurityInvariants
+#                                  до backupConsistency.Mode/
+#                                  toolIntegritySettings.Mode) — НЕ новий
+#                                  bypass, лише перенесення РІШЕННЯ "хто
+#                                  може використати наявний механізм" у
+#                                  канонічний реєстр.
+#
+# FAIL-CLOSED ЗА ЗАМОВЧУВАННЯМ: явна відсутність ключа WeakeningOverride
+# у записі реєстру трактується як 'None' (Get-BRAVOConfigurationSchemaAuthorizationClass
+# і Test-BRAVOConfigurationOverrideAuthorization нижче обидва
+# застосовують цей дефолт explicit) — тому кожен МАЙБУТНІЙ DENY_*-лист,
+# доданий у реєстр без явного WeakeningOverride, автоматично НЕ може
+# використати обхід, а не мовчки успадковує його.
+#
+# Сьогодні рівно ОДИН лист має ExistingSecurityEscapeHatch:
+# requireAdministrator (Wave 1 — наявна, свідомо збережена поведінка).
+# backupMonitoring.SFTP.BAZA.Mode/.MutationPolicy НЕ отримують цього
+# ключа — DENY_SECURITY_CONTROL + відсутній WeakeningOverride = 'None' =
+# безумовна відмова незалежно від BRAVO_ALLOW_WEAKENED_SECURITY.
+$script:BRAVOConfigurationSchemaWeakeningOverrideNone = 'None'
+$script:BRAVOConfigurationSchemaWeakeningOverrideExistingEscapeHatch = 'ExistingSecurityEscapeHatch'
+$script:BRAVOConfigurationSchemaValidWeakeningOverrides = @(
+    $script:BRAVOConfigurationSchemaWeakeningOverrideNone,
+    $script:BRAVOConfigurationSchemaWeakeningOverrideExistingEscapeHatch
+)
+
+$script:BRAVOConfigurationSchemaAuthorizationClass = @{
+    'archiveFileFilter' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'archiveParams' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'archiveRetentionDays' = @{ Class = 'ALLOW_SITE' }
+    'archiveTimestampFormat' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'backupConsistency.Mode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:VSS,Direct' }
+    'backupConsistency.SnapshotContext' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:ClientAccessible' }
+    'backupMonitoring.CandidateLimit' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.CheckManagedServices' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.LogFileNameTemplate' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.MaxBackupAgeHours' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.NotifyOnSuccessAfterBackup' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.RepeatAlertAfterHours' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.RunAfterBackup' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZA.FastHealthEnabled' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZA.FullAuditEnabled' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZA.FullAuditEveryDays' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZA.Mode' = @{ Class = 'DENY_SECURITY_CONTROL' }
+    'backupMonitoring.SFTP.BAZA.MutationPolicy' = @{ Class = 'DENY_SECURITY_CONTROL' }
+    'backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZAPendingAlertAfterHours' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.BAZAPreviewOptions' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'backupMonitoring.SFTP.CheckArchiveUploads' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.CheckBAZASynchronization' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.DifferenceDetailLimit' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.OperationTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.RemoteBackupMaxAgeHours' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.RequireServerSideArchiveHash' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.SynchronizationTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SFTP.VerifyRemoteArchiveHash' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SizeSanity.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SizeSanity.HistoryCount' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SizeSanity.MaxSizeDropPercent' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SizeSanity.MinimumBytes' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SMB.CheckArchiveCopies' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SMB.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SMB.RemoteBackupMaxAgeHours' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SMB.VerifyRemoteArchiveHash' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.SuccessDedupMinutes' = @{ Class = 'ALLOW_SITE' }
+    'backupMonitoring.VerifyFileHash' = @{ Class = 'ALLOW_SITE' }
+    'bravoSettings.ArchivePrefix' = @{ Class = 'ALLOW_SITE' }
+    'bravoSettings.InstitutionCode' = @{ Class = 'ALLOW_SITE' }
+    'bravoSettings.InstitutionName' = @{ Class = 'ALLOW_SITE' }
+    'bravoSettings.NotificationMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:none,errors_only,all' }
+    'bravoSettings.NotificationProvider' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:discord,slack' }
+    'bravoSettings.NotificationRequestTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'bravoSettings.NotificationRouting.CRITICAL' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
+    'bravoSettings.NotificationRouting.ERROR' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
+    'bravoSettings.NotificationRouting.SUCCESS' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
+    'bravoSettings.NotificationRouting.WARNING' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:general,alerts' }
+    'componentSettings.Archive.BLOG' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Archive.BRAVOEXCH' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Archive.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SFTP.ArchiveLogUploadEnabled' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SFTP.ArchiveUpload' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SFTP.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SFTP.MaintenanceLogUploadEnabled' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SMB.ArchiveCopy' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.SMB.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Synchronization.BAZA_APP_LOCAL' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Synchronization.BAZA_APP_SFTP' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Synchronization.BAZA_WWW_LOCAL' = @{ Class = 'ALLOW_SITE' }
+    'componentSettings.Synchronization.BAZA_WWW_SFTP' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.BackgroundColor' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.ClearOnStart' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.ConsoleLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'consoleSettings.FileLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'consoleSettings.ForegroundColor' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.OutputEncodingCodePage' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'WindowsCodePage' }
+    'consoleSettings.PauseOnExit' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.PausePrompt' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.ShowTimestampsInConsole' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.StepWidth' = @{ Class = 'ALLOW_SITE' }
+    'consoleSettings.WindowTitleTemplate' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.ArchivePassword' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.ArchivePrefix' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.DiscordWebhookAlerts' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.DiscordWebhookGeneral' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.InstitutionCode' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.InstitutionName' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.SFTPLogin' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.SFTPPassword' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.SlackWebhookAlerts' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.SlackWebhookGeneral' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.SMBLogin' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.SMBPassword' = @{ Class = 'ALLOW_SITE' }
+    'defaultLogLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'discoverySettings.BravoIniPath' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.BravoRoot' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.Sources.BACKUP_ROOT' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.Sources.BAZA_APP' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.Sources.BAZA_WWW' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.Sources.BLOG' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.Sources.BRAVOEXCH' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.Sources.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'discoverySettings.WebRoot' = @{ Class = 'ALLOW_SITE' }
+    'durationFormat' = @{ Class = 'ALLOW_SITE' }
+    'elevationSettings.ArgumentsTemplate' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'elevationSettings.PowerShellExecutable' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'elevationSettings.Verb' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'elevationSettings.WindowStyle' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'enableArchiveDeletion' = @{ Class = 'ALLOW_SITE' }
+    'enableFailedArchiveDeletion' = @{ Class = 'ALLOW_SITE' }
+    'enableLunchArchiveCleanup' = @{ Class = 'ALLOW_SITE' }
+    'enableOrphanTempCleanup' = @{ Class = 'ALLOW_SITE' }
+    'failedArchiveRetentionDays' = @{ Class = 'ALLOW_SITE' }
+    'hashFileEncoding' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'hashFileExtension' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'hashFileFilter' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'hostInformationSettings.PublicIPLookupEnabled' = @{ Class = 'ALLOW_SITE' }
+    'hostInformationSettings.PublicIPLookupTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'hostInformationSettings.PublicIPLookupUrls' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'UrlArray:http,https' }
+    'logColors.DEBUG' = @{ Class = 'ALLOW_SITE' }
+    'logColors.Default' = @{ Class = 'ALLOW_SITE' }
+    'logColors.ERROR' = @{ Class = 'ALLOW_SITE' }
+    'logColors.Header' = @{ Class = 'ALLOW_SITE' }
+    'logColors.Progress' = @{ Class = 'ALLOW_SITE' }
+    'logColors.SUCCESS' = @{ Class = 'ALLOW_SITE' }
+    'logColors.WARNING' = @{ Class = 'ALLOW_SITE' }
+    'logFileDateFormat' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logFileEncoding' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logFileFilter' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logFileNameTemplate' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'LogLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'logLevels.DEBUG' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logLevels.ERROR' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logLevels.INFO' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logLevels.SUCCESS' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logLevels.WARNING' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'logRetentionDays' = @{ Class = 'ALLOW_SITE' }
+    'logSeparatorLength' = @{ Class = 'ALLOW_SITE' }
+    'logTimestampFormat' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'lunchArchiveCleanupDirectories' = @{ Class = 'ALLOW_SITE' }
+    'lunchArchiveCleanupPath' = @{ Class = 'ALLOW_SITE' }
+    'lunchArchiveRetentionMonths' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Archiver.CommandTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Archiver.IntegrityTestTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Archiver.Parameters' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'maintenanceSettings.Automation.ArchiveAfterMaintenance' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Automation.AutoShutdown' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Automation.ShutdownTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.FileOperations.MoveRetryCount' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.FileOperations.MoveRetryDelaySeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.General.BravoWebDirectory' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Limits.EstimatedSpaceMarginPercent' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Limits.ExcludedDrives' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Limits.MaximumMdFileSizeGB' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Limits.MdFileSizeExclusions' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Limits.MinimumFreeSpaceGB' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Logging.Level' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'maintenanceSettings.RangeIdMonitoring.CheckDelaySeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.RangeIdMonitoring.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.RangeIdMonitoring.ThresholdPercent' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.ArchivesKeepCount' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.BootRestoreMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:None,HoldServices' }
+    'maintenanceSettings.Restore.Day' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.StartupDelayMinutes' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.Time' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.WindowEnd' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Restore.WindowStart' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Retention.ArchiveDays' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Retention.CompressedLogDays' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Retention.CompressedLogDeletionEnabled' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Retention.FailedArchiveDays' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Retention.LogDays' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Retention.RawSourceGraceDays' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.BravoDisplayName' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.BravoName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'maintenanceSettings.Services.BravoWebCandidates' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.BravoWebEnabled' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.ExchangeApiName' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.PollIntervalSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.StartTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Services.StopTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'maintenanceSettings.Trace.BISSourcePath' = @{ Class = 'ALLOW_SITE' }
+    'minimumRetainedVerifiedBackups' = @{ Class = 'ALLOW_SITE' }
+    'orphanTempRetentionHours' = @{ Class = 'ALLOW_SITE' }
+    'pathSettings.BackupRoot' = @{ Class = 'ALLOW_SITE' }
+    'pathSettings.LIMSRoot' = @{ Class = 'ALLOW_SITE' }
+    'pathSettings.SystemLogRoot' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.Activity' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.RobocopyProgressOptions' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'progressSettings.SevenZipProgressSwitch' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'progressSettings.SevenZipTestTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.SevenZipTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.ShowOverallProgress' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.ShowRobocopyOutput' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.ShowSevenZipOutput' = @{ Class = 'ALLOW_SITE' }
+    'progressSettings.ShowWinSCPOutput' = @{ Class = 'ALLOW_SITE' }
+    'requireAdministrator' = @{ Class = 'DENY_SECURITY_CONTROL'; WeakeningOverride = 'ExistingSecurityEscapeHatch' }
+    'restoreVerifySettings.MaxVerificationAgeHours' = @{ Class = 'ALLOW_SITE' }
+    'restoreVerifySettings.MinimumFileCount' = @{ Class = 'ALLOW_SITE' }
+    'robocopyMaxSuccessExitCode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:0,7' }
+    'robocopyOptions' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'robocopyPath' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'robocopyWindowStyle' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Normal,Minimized,Maximized,Hidden' }
+    'schedulerSettings.AllowStartIfOnBatteries' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Backup.DailyAt' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Backup.Description' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Backup.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Backup.ExecutionTimeLimitHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Backup.TaskName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.BAZASync.Description' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.BAZASync.ExecutionTimeLimitHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.BAZASync.RepeatEveryHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.BAZASync.StartAt' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.BAZASync.TaskName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.DontStopIfGoingOnBatteries' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.BusyWaitMinutes' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.Description' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.ExecutionTimeLimitHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.RepeatEveryMinutes' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.SkipIfBackupTaskRunning' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.StartAt' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Health.TaskName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.Hidden' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.LegacyTaskNames' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'schedulerSettings.LegacyTaskPath' = @{ Class = 'DENY_INTERNAL_METADATA' }
+    'schedulerSettings.LogonType' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.Maintenance.DailyAt' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Maintenance.Description' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Maintenance.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Maintenance.ExecutionTimeLimitHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Maintenance.TaskName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.MultipleInstances' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Parallel,Queue,IgnoreNew,StopExisting' }
+    'schedulerSettings.OperationLockWaitMinutes' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Recovery.Description' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Recovery.ExecutionTimeLimitHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.Recovery.TaskName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.RequireProtectedRuntime' = @{ Class = 'DENY_SECURITY_CONTROL' }
+    'schedulerSettings.RestartCount' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.RestartIntervalMinutes' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.RestoreVerify.At' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.RestoreVerify.Description' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.RestoreVerify.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.RestoreVerify.ExecutionTimeLimitHours' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.RestoreVerify.TaskName' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.RestoreVerify.WeeklyOn' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Monday,Tuesday,Wednesday,Thursday,Friday,Saturday,Sunday' }
+    'schedulerSettings.RunAsUser' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'schedulerSettings.StartWhenAvailable' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.TaskPath' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'TaskSchedulerPath' }
+    'schedulerSettings.WakeToRun' = @{ Class = 'ALLOW_SITE' }
+    'schedulerSettings.WindowStyle' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:Normal,Minimized,Maximized,Hidden' }
+    'sftpConnectionTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.ArchivLog' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.BAZA' = @{ Class = 'DENY_DERIVED' }
+    'sftpDirectories.BAZAWWW' = @{ Class = 'DENY_DERIVED' }
+    'sftpDirectories.Blog' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.BravoExch' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.ExchangeApiLogs' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.MaintenanceLog' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.Manifest' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.Trace' = @{ Class = 'ALLOW_SITE' }
+    'sftpDirectories.TraceLogs' = @{ Class = 'ALLOW_SITE' }
+    'sftpHostKey' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'NonEmptyString' }
+    'sftpHostTemplate' = @{ Class = 'ALLOW_SITE' }
+    'sftpPort' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:1,65535' }
+    'sftpSynchronizationOptions' = @{ Class = 'DENY_EXECUTION_CONTROL' }
+    'smbSettings.CopyBufferSizeMB' = @{ Class = 'ALLOW_SITE' }
+    'smbSettings.Directories.BLOG' = @{ Class = 'ALLOW_SITE' }
+    'smbSettings.Directories.BRAVOEXCH' = @{ Class = 'ALLOW_SITE' }
+    'smbSettings.Directories.MODEL' = @{ Class = 'ALLOW_SITE' }
+    'smbSettings.RootPath' = @{ Class = 'ALLOW_SITE' }
+    'synchronizationSafety.RequireNonEmptyBAZASource' = @{ Class = 'DENY_SECURITY_CONTROL' }
+    'winSCPIniPath' = @{ Class = 'DENY_SECURITY_CONTROL' }
+    'winSCPScriptEncoding' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'DotNetEncodingName' }
+}
+
+function Get-BRAVOConfigurationSchemaAuthorizationClass {
+    <#
+    .SYNOPSIS
+        Захисна копія авторизаційного реєстру Wave 2 (#216).
+    .DESCRIPTION
+        Повертає НОВУ hashtable (не посилання на $script:-стан) — викликач
+        не може мутувати канонічний реєстр через повернене значення.
+        Використовується loader-ом непрямо (через Test-BRAVOConfigurationOverrideAuthorization)
+        і self-test-ами повноти схеми напряму (перевірка, що кожен
+        канонічний лист має рівно один запис і жоден запис не осиротів).
+    .OUTPUTS
+        [hashtable]
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param()
+
+    $copy = @{}
+    foreach ($path in @($script:BRAVOConfigurationSchemaAuthorizationClass.Keys)) {
+        $entry = $script:BRAVOConfigurationSchemaAuthorizationClass[$path]
+        $copy[$path] = @{
+            Class             = [string]$entry.Class
+            Validator         = $(if ($entry.Contains('Validator')) { [string]$entry.Validator } else { $null })
+            # WeakeningOverride: FAIL-CLOSED за замовчуванням. Відсутність
+            # явного запису в канонічному реєстрі НІКОЛИ не мовчки
+            # інтерпретується як "escapable" — лише явний
+            # 'ExistingSecurityEscapeHatch' у реєстрі надає доступ до
+            # наявного BRAVO_ALLOW_WEAKENED_SECURITY-механізму (owner
+            # remediation, Issue #216 Wave 2: канонічний реєстр — ЄДИНИЙ
+            # власник цієї політики, loader більше не знає жодної
+            # dot-path-назви).
+            WeakeningOverride = $(if ($entry.Contains('WeakeningOverride')) { [string]$entry.WeakeningOverride } else { $script:BRAVOConfigurationSchemaWeakeningOverrideNone })
+        }
+    }
+    return $copy
+}
+
+function Test-BRAVOConfigurationAuthorizationEnumValue {
+    # Регістронезалежне порівняння (як і решта схеми — та сама
+    # case-insensitive-семантика, що hashtable PowerShell); значення
+    # МУСИТЬ бути рядком — не-рядок (Number/Boolean/Array/$null) завжди
+    # відхиляється, навіть якщо його текстове представлення випадково
+    # збігається з дозволеним значенням.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string[]]$AllowedValues,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value -or $Value -isnot [string]) {
+        $actualCaption = if ($null -eq $Value) { '$null' } else { $Value.GetType().Name }
+        return [pscustomobject]@{
+            IsValid = $false
+            Message = "${Path}: очікується рядок із переліку ($($AllowedValues -join ', ')), отримано $actualCaption."
+        }
+    }
+    foreach ($allowed in $AllowedValues) {
+        if ([string]::Equals([string]$Value, $allowed, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return [pscustomobject]@{ IsValid = $true; Message = $null }
+        }
+    }
+    return [pscustomobject]@{
+        IsValid = $false
+        Message = "${Path}: значення '$Value' недопустиме. Дозволено: $($AllowedValues -join ', ')."
+    }
+}
+
+function Test-BRAVOConfigurationAuthorizationIntegerRange {
+    # Ціле число БЕЗ рядкової коерсії: '7' (рядок), $true/$false, масив і
+    # дробове значення (7.5) відхиляються так само, як значення поза
+    # діапазоном — TypeCode-перевірка (та сама причина, що
+    # Get-BRAVOConfigurationSchemaValueKind: короткі типи-прискорювачі
+    # не всюди доступні в Windows PowerShell 5.1), а не `-is [int]`-ланцюг.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][int]$Minimum,
+        [Parameter(Mandatory = $true)][int]$Maximum,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value) {
+        return [pscustomobject]@{
+            IsValid = $false
+            Message = "${Path}: очікується ціле число в діапазоні $Minimum..$Maximum, отримано `$null."
+        }
+    }
+    $typeCode = [string][System.Type]::GetTypeCode($Value.GetType())
+    if ($script:BRAVOConfigurationSchemaNumericTypeCode -notcontains $typeCode) {
+        return [pscustomobject]@{
+            IsValid = $false
+            Message = "${Path}: очікується ціле число без лапок (діапазон $Minimum..$Maximum), отримано $($Value.GetType().Name)."
+        }
+    }
+    $doubleValue = [double]$Value
+    if ($doubleValue -ne [System.Math]::Truncate($doubleValue)) {
+        return [pscustomobject]@{
+            IsValid = $false
+            Message = "${Path}: значення '$Value' має дробову частину — очікується ціле число (діапазон $Minimum..$Maximum)."
+        }
+    }
+    $intValue = [int64]$doubleValue
+    if ($intValue -lt $Minimum -or $intValue -gt $Maximum) {
+        return [pscustomobject]@{
+            IsValid = $false
+            Message = "${Path}: значення '$Value' поза допустимим діапазоном $Minimum..$Maximum."
+        }
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = $null }
+}
+
+function Test-BRAVOConfigurationAuthorizationWindowsCodePage {
+    # Число ДОДАТКОВО мусить бути розпізнаваним .NET Encoding code page —
+    # ціле в правдоподібному діапазоні, яке .NET все одно не знає, все
+    # одно відхиляється (напр. 99999).
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    $rangeResult = Test-BRAVOConfigurationAuthorizationIntegerRange -Value $Value -Minimum 1 -Maximum 65535 -Path $Path
+    if (-not $rangeResult.IsValid) { return $rangeResult }
+    try {
+        [void][System.Text.Encoding]::GetEncoding([int]$Value)
+        return [pscustomobject]@{ IsValid = $true; Message = $null }
+    } catch {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: код сторінки '$Value' не розпізнається .NET Encoding." }
+    }
+}
+
+function Test-BRAVOConfigurationAuthorizationEncodingName {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value -or $Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: очікується непорожнє ім'я .NET-кодування (напр. UTF8, ASCII)." }
+    }
+    try {
+        [void][System.Text.Encoding]::GetEncoding([string]$Value)
+        return [pscustomobject]@{ IsValid = $true; Message = $null }
+    } catch {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: кодування '$Value' не розпізнається .NET Encoding." }
+    }
+}
+
+function Test-BRAVOConfigurationAuthorizationUrlArray {
+    # Кожен елемент — абсолютний URL з дозволеною схемою (http/https).
+    # Масив як ціле не перевіряється по-елементно за схожими родами —
+    # елемент, що не є рядком, чи невалідний URL відхиляє весь масив
+    # (перше порушення — точний індекс у повідомленні).
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string[]]$AllowedSchemes,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value -or $Value -isnot [System.Collections.IEnumerable] -or $Value -is [string]) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: очікується масив URL-рядків." }
+    }
+    $index = 0
+    foreach ($item in $Value) {
+        $elementPath = '{0}[{1}]' -f $Path, $index
+        if ($null -eq $item -or $item -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$item)) {
+            return [pscustomobject]@{ IsValid = $false; Message = "${elementPath}: очікується непорожній рядок URL." }
+        }
+        $parsedUri = $null
+        if (-not [System.Uri]::TryCreate([string]$item, [System.UriKind]::Absolute, [ref]$parsedUri)) {
+            return [pscustomobject]@{ IsValid = $false; Message = "${elementPath}: '$item' не є коректним абсолютним URL." }
+        }
+        $scheme = $parsedUri.Scheme.ToLowerInvariant()
+        if ($AllowedSchemes -notcontains $scheme) {
+            return [pscustomobject]@{ IsValid = $false; Message = "${elementPath}: схема '$scheme' недопустима — дозволено: $($AllowedSchemes -join ', ')." }
+        }
+        $index++
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = $null }
+}
+
+function Test-BRAVOConfigurationAuthorizationTaskSchedulerPath {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value -or $Value -isnot [string] -or -not [regex]::IsMatch([string]$Value, '^\\.*\\$')) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: значення мусить починатись і закінчуватись символом '\'." }
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = $null }
+}
+
+function Test-BRAVOConfigurationAuthorizationNonEmptyString {
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value -or $Value -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$Value)) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: значення не може бути порожнім." }
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = $null }
+}
+
+function Test-BRAVOConfigurationAuthorizationValidatorValue {
+    <#
+    .SYNOPSIS
+        Диспетчер іменованих валідаторів для ALLOW_WITH_VALIDATOR (#216, Wave 2).
+    .DESCRIPTION
+        Валідатори — іменовані PowerShell-функції, диспетчеровані за
+        стабільним рядковим ідентифікатором ('Enum:...', 'IntegerRange:...',
+        'WindowsCodePage', ...), а НЕ scriptblock-и, вбудовані в
+        дескриптор: scriptblock у data-реєстрі ускладнює
+        integrity-верифікацію (RUNTIME_MANIFEST), тестування й PS
+        5.1-серіалізацію (WAVE2-CONTRACT.md, розділ 11.5).
+
+        Невідомий ідентифікатор валідатора — FAIL CLOSED (throw), а не
+        мовчазний accept: якщо реєстр посилається на валідатор, якого
+        немає, це дефект реєстру схеми, не легітимне "порожнє" значення
+        оператора.
+    .OUTPUTS
+        [pscustomobject] { IsValid; Message }
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][string]$ValidatorId,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()]$Value,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($ValidatorId.StartsWith('Enum:', [System.StringComparison]::Ordinal)) {
+        $allowedValues = @($ValidatorId.Substring(5) -split ',')
+        return Test-BRAVOConfigurationAuthorizationEnumValue -Value $Value -AllowedValues $allowedValues -Path $Path
+    }
+    if ($ValidatorId.StartsWith('IntegerRange:', [System.StringComparison]::Ordinal)) {
+        $bounds = @($ValidatorId.Substring(13) -split ',')
+        return Test-BRAVOConfigurationAuthorizationIntegerRange -Value $Value -Minimum ([int]$bounds[0]) -Maximum ([int]$bounds[1]) -Path $Path
+    }
+    if ($ValidatorId.StartsWith('UrlArray:', [System.StringComparison]::Ordinal)) {
+        $allowedSchemes = @($ValidatorId.Substring(9) -split ',')
+        return Test-BRAVOConfigurationAuthorizationUrlArray -Value $Value -AllowedSchemes $allowedSchemes -Path $Path
+    }
+    switch ($ValidatorId) {
+        'WindowsCodePage'    { return Test-BRAVOConfigurationAuthorizationWindowsCodePage -Value $Value -Path $Path }
+        'DotNetEncodingName' { return Test-BRAVOConfigurationAuthorizationEncodingName -Value $Value -Path $Path }
+        'TaskSchedulerPath'  { return Test-BRAVOConfigurationAuthorizationTaskSchedulerPath -Value $Value -Path $Path }
+        'NonEmptyString'     { return Test-BRAVOConfigurationAuthorizationNonEmptyString -Value $Value -Path $Path }
+        default {
+            throw "Схема авторизації конфігурації: невідомий ідентифікатор валідатора '$ValidatorId' для '$Path' — це дефект реєстру схеми, не значення оператора."
+        }
+    }
+}
+
+function Test-BRAVOConfigurationOverrideAuthorization {
+    <#
+    .SYNOPSIS
+        Перевіряє АВТОРИЗАЦІЮ (не тип) кожного local-override шляху проти
+        канонічного класифікаційного реєстру Wave 2 (#216).
+    .DESCRIPTION
+        ОКРЕМИЙ виклик від Test-BRAVOConfigurationOverrideSchema (яка
+        перевіряє лише ФОРМУ/тип значення) — авторизація визначає, чи
+        БУДЬ-ЯКЕ значення на цьому шляху дозволено перевизначати з
+        BRAVO.local.config, незалежно від того, наскільки воно
+        правильного типу.
+
+        Перевіряються ЛИШЕ шляхи, відомі схемі ($Schema.Contains($path)) —
+        та сама межа, що й у Test-BRAVOConfigurationOverrideSchema.
+        Невідомий кінцевий сегмент (D3, рішення власника 2026-09-14)
+        НАВМИСНО не класифікується тут.
+
+        ALLOW_SITE      -> приймається без додаткової перевірки.
+        ALLOW_WITH_VALIDATOR -> додатково проганяється через іменований
+                                 валідатор (Test-BRAVOConfigurationAuthorizationValidatorValue).
+        DENY_*          -> відхиляється БЕЗУМОВНО, незалежно від
+                            запропонованого значення (у т.ч. коли воно
+                            збігається з канонічним дефолтом) —
+                            авторизація тут про володіння ЛИСТОМ, а не
+                            про безпечність конкретного значення.
+
+        Викликач (BRAVO_CONFIG_LOADER.ps1) зобов'язаний трактувати
+        IsValid=$false як АТОМАРНУ відмову ВСЬОГО local-override шару:
+        ця функція не мерджить нічого сама — вона лише оцінює, виклик
+        Merge-BRAVOConfiguration/Resolve-BRAVORawConfiguration не
+        повинен відбутись, доки результат не IsValid=$true.
+    .PARAMETER DotPathOverrides
+        Плаский шар "dot-шлях -> значення" (формат BRAVO.local.config) —
+        той самий вхід, що й Test-BRAVOConfigurationOverrideSchema.
+    .PARAMETER Schema
+        Результат Get-BRAVOConfigurationSchema.
+    .OUTPUTS
+        [pscustomobject] { IsValid; Violations }
+        Кожне порушення: [pscustomobject]{ Path; Class; Validator; WeakeningOverride; Reason; Message }.
+        WeakeningOverride ('None'|'ExistingSecurityEscapeHatch') — чи МОЖЕ
+        викликач (loader) запропонувати наявний
+        BRAVO_ALLOW_WEAKENED_SECURITY-механізм для САМЕ ЦЬОГО порушення;
+        похідне з канонічного реєстру, fail-closed 'None' за
+        замовчуванням, коли реєстр не містить явного значення.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$DotPathOverrides,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$Schema
+    )
+
+    $violations = New-Object System.Collections.Generic.List[object]
+
+    foreach ($dotPath in @($DotPathOverrides.Keys)) {
+        $path = [string]$dotPath
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        if (-not $Schema.Contains($path)) { continue }
+
+        if (-not $script:BRAVOConfigurationSchemaAuthorizationClass.Contains($path)) {
+            # Схема знає цей лист, але авторизаційний реєстр — ні. Це
+            # дефект РЕЄСТРУ (порушення умови self-test-повноти), не
+            # легітимний "невідомий шлях" (той випадок уже відсіяний
+            # вище через Schema.Contains). Fail closed: мовчазний
+            # allow-by-omission для КАНОНІЧНОГО листа заборонений
+            # архітектурним рішенням Wave 2 (WAVE2-CONTRACT.md, розділ 11.3).
+            [void]$violations.Add([pscustomobject]@{
+                Path              = $path
+                Class             = 'UNREGISTERED'
+                Validator         = $null
+                WeakeningOverride = $script:BRAVOConfigurationSchemaWeakeningOverrideNone
+                Reason            = 'MissingAuthorizationPolicy'
+                Message           = "${path}: канонічний лист не має запису в авторизаційному реєстрі Wave 2 — це дефект реєстру схеми, не дозвіл."
+            })
+            continue
+        }
+
+        $entry = $script:BRAVOConfigurationSchemaAuthorizationClass[$path]
+        $class = [string]$entry.Class
+        # Fail-closed за замовчуванням: відсутність WeakeningOverride у
+        # записі реєстру ЗАВЖДИ означає 'None', НІКОЛИ мовчазний
+        # escapable-дозвіл (той самий дефолт, що Get-BRAVOConfigurationSchemaAuthorizationClass
+        # застосовує для зовнішніх читачів реєстру).
+        $weakeningOverride = $(if ($entry.Contains('WeakeningOverride')) { [string]$entry.WeakeningOverride } else { $script:BRAVOConfigurationSchemaWeakeningOverrideNone })
+
+        if ($class -eq 'ALLOW_SITE') { continue }
+
+        if ($class -eq 'ALLOW_WITH_VALIDATOR') {
+            $validatorId = [string]$entry.Validator
+            $validationResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId $validatorId -Value $DotPathOverrides[$dotPath] -Path $path
+            if (-not $validationResult.IsValid) {
+                [void]$violations.Add([pscustomobject]@{
+                    Path              = $path
+                    Class             = $class
+                    Validator         = $validatorId
+                    WeakeningOverride = $weakeningOverride
+                    Reason            = 'ValidatorRejected'
+                    Message           = $validationResult.Message
+                })
+            }
+            continue
+        }
+
+        # Усі DENY_*-класи: безумовна відмова, незалежно від значення.
+        # Escapability (чи МОЖЕ викликач запропонувати наявний
+        # BRAVO_ALLOW_WEAKENED_SECURITY-механізм для цього конкретного
+        # порушення) — це ВЛАСТИВІСТЬ порушення (WeakeningOverride вище),
+        # яку викликач (loader) читає з результату; ЦЯ функція нічого не
+        # вирішує про env-змінну і не знає жодної dot-path-назви окрім
+        # тієї, що обробляє в поточній ітерації циклу.
+        [void]$violations.Add([pscustomobject]@{
+            Path              = $path
+            Class             = $class
+            Validator         = $null
+            WeakeningOverride = $weakeningOverride
+            Reason            = 'DeniedClass'
+            Message           = "${path}: локальне перевизначення заборонено (клас '$class') — BRAVO.local.config не має повноважень на цей лист незалежно від запропонованого значення."
+        })
+    }
+
+    return [pscustomobject]@{
+        IsValid    = ($violations.Count -eq 0)
+        Violations = $violations.ToArray()
+    }
+}
+
+
 
 # ---------------------------------------------------------------------
 # Контракт версії схеми site-файлу (#154, B3)
@@ -606,4 +1382,7 @@ Export-ModuleMember -Function @(
     'Get-BRAVOConfigurationSchemaVersionContract',
     'Resolve-BRAVOConfigurationSchemaVersion',
     'Get-BRAVOConfigurationSchemaVersionDeclarationLine'
+    ,'Test-BRAVOConfigurationOverrideAuthorization'
+    ,'Get-BRAVOConfigurationSchemaAuthorizationClass'
+    ,'Test-BRAVOConfigurationAuthorizationValidatorValue'
 )

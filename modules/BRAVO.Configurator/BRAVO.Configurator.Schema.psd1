@@ -19,7 +19,7 @@
     ModuleVersion = '5.3.0'
     GUID = 'e5a7b6c4-0f5e-4c0e-af6c-5e6f7081a2b3'
     PowerShellVersion = '5.1'
-    FunctionsToExport = @('Get-BRAVOConfiguratorSchemaCatalog', 'Get-BRAVOConfiguratorDocumentedOverridePaths', 'Test-BRAVOConfiguratorSchemaCompleteness')
+    FunctionsToExport = @('Get-BRAVOConfiguratorSchemaCatalog', 'Get-BRAVOConfiguratorDocumentedOverridePaths', 'Test-BRAVOConfiguratorSchemaCompleteness', 'Resolve-BRAVOConfiguratorFieldAuthorization')
     VariablesToExport = @()
     CmdletsToExport = @()
     AliasesToExport = @()

@@ -408,7 +408,14 @@ try {
     $backupFailureBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorBackupFailureRoot
     $backupFailureContentBefore = Get-Content -LiteralPath $backupFailureConfigPath -Raw -Encoding UTF8
     $backupFailureModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $backupFailureBaseline.Overrides
-    $backupFailureModel = Set-BRAVOConfiguratorOverride -Model $backupFailureModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARN'
+    # Issue #216, Wave 2: 'WARN' НЕ є валідним ConsoleLevel-значенням
+    # (канонічний enum — TRACE/DEBUG/INFO/SUCCESS/WARNING/ERROR/FATAL,
+    # BRAVO.Configuration.Schema.psm1); до Wave 2 це проходило
+    # непоміченим (лише String type-check), тепер canonical loader
+    # коректно відхиляє його РАНІШЕ. Тест перевіряє backup-on-apply/
+    # atomic-replace, а не enum-семантику, тому досить БУДЬ-ЯКОГО
+    # валідного значення, відмінного від baseline 'ERROR'.
+    $backupFailureModel = Set-BRAVOConfiguratorOverride -Model $backupFailureModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARNING'
     $backupFailureModel = Update-BRAVOConfiguratorEffective -Model $backupFailureModel -RuntimeRoot $configuratorFixtureRuntimeRoot
 
     $backupFailureAcl = Get-Acl -Path $configuratorBackupFailureRoot
@@ -476,7 +483,9 @@ try {
     $atomicReplaceBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorAtomicReplaceRoot
     $atomicReplaceContentBefore = Get-Content -LiteralPath $atomicReplaceConfigPath -Raw -Encoding UTF8
     $atomicReplaceModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $atomicReplaceBaseline.Overrides
-    $atomicReplaceModel = Set-BRAVOConfiguratorOverride -Model $atomicReplaceModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARN'
+    # Issue #216, Wave 2: див. коментар у аналогічному backup-failure
+    # тесті вище — 'WARN' не є валідним ConsoleLevel-значенням.
+    $atomicReplaceModel = Set-BRAVOConfiguratorOverride -Model $atomicReplaceModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARNING'
     $atomicReplaceModel = Update-BRAVOConfiguratorEffective -Model $atomicReplaceModel -RuntimeRoot $configuratorFixtureRuntimeRoot
 
     $atomicReplaceLockStream = [System.IO.File]::Open(
@@ -1083,6 +1092,87 @@ try {
     Remove-Item -LiteralPath $configuratorNoConfigRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+
+# =====================================================================
+# Wave 2 (#216): Configurator споживає canonical authorization Class
+# =====================================================================
+# Доводить, що Resolve-BRAVOConfiguratorFieldAuthorization ГЕНУЇННО
+# читає canonical реєстр (не другу, окремо підтримувану копію) — і що
+# drift-приклад із WAVE2-CONTRACT.md (розділ 11.4,
+# backupMonitoring.SFTP.BAZA.Mode) фактично усунутий.
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $authAdapterRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $authAdapterClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $authAdapterResolved = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $authAdapterRawCatalog -AuthorizationClass $authAdapterClassRegistry
+
+    # --- Configurator/Authorization/AllowSiteFieldRemainsEditable ---
+    $authAdapterAllowSite = @($authAdapterResolved | Where-Object { $_.Path -eq 'archiveRetentionDays' })
+    Test-BRAVOCondition ($authAdapterAllowSite.Count -eq 1 -and [bool]$authAdapterAllowSite[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/AllowSiteFieldRemainsEditable' `
+        "archiveRetentionDays (ALLOW_SITE) мусить лишитись ReadOnly=`$false; отримано count=$($authAdapterAllowSite.Count) ReadOnly=$($authAdapterAllowSite[0].ReadOnly)"
+
+    # --- Configurator/Authorization/AllowWithValidatorFieldRemainsEditable ---
+    $authAdapterAllowValidator = @($authAdapterResolved | Where-Object { $_.Path -eq 'bravoSettings.NotificationMode' })
+    Test-BRAVOCondition ($authAdapterAllowValidator.Count -eq 1 -and [bool]$authAdapterAllowValidator[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/AllowWithValidatorFieldRemainsEditable' `
+        "bravoSettings.NotificationMode (ALLOW_WITH_VALIDATOR) мусить лишитись ReadOnly=`$false; отримано count=$($authAdapterAllowValidator.Count) ReadOnly=$($authAdapterAllowValidator[0].ReadOnly)"
+
+    # --- Configurator/Authorization/BazaModeNoLongerEmittedAsEditable ---
+    # Конкретна drift-позиція з WAVE2-CONTRACT.md (розділ 11.4): статичний
+    # каталог документує ReadOnly=$false, AllowedValues=@('IncrementalAppendOnly','Legacy')
+    # — canonical DENY_SECURITY_CONTROL мусить примусово зробити її
+    # ефективно read-only.
+    $authAdapterBazaModeRaw = @($authAdapterRawCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    $authAdapterBazaModeResolved = @($authAdapterResolved | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    Test-BRAVOCondition (
+        $authAdapterBazaModeRaw.Count -eq 1 -and [bool]$authAdapterBazaModeRaw[0].ReadOnly -eq $false -and
+        $authAdapterBazaModeResolved.Count -eq 1 -and [bool]$authAdapterBazaModeResolved[0].ReadOnly -eq $true
+    ) `
+        'Configurator/Authorization/BazaModeNoLongerEmittedAsEditable' `
+        ("статичний каталог документує backupMonitoring.SFTP.BAZA.Mode як ReadOnly=`$false (RawReadOnly=$($authAdapterBazaModeRaw[0].ReadOnly)), " +
+         "але canonical adapter мусить примусово дати ReadOnly=`$true (ResolvedReadOnly=$($authAdapterBazaModeResolved[0].ReadOnly)) — інакше Configurator генерував би override, який loader після Wave 2 відхилить")
+
+    # --- Configurator/Authorization/DenyExecutionControlFieldNotEditable ---
+    # maintenanceSettings.Services.BravoName НЕ задокументований у
+    # каталозі Configurator-а сьогодні (DENY_EXECUTION_CONTROL, ніколи не
+    # мав редагованого поля) — перевіряємо клас через синтетичний
+    # дескриптор, що доводить: adapter форсує ReadOnly для БУДЬ-ЯКОГО
+    # DENY_-класу, не лише для вже задокументованого BAZA.Mode-кейса.
+    $authAdapterSyntheticDescriptors = @(
+        @{ Path = 'maintenanceSettings.Services.BravoName'; Group = 'Maintenance'; Section = 'Services'; Label = 'probe'; Description = ''; Type = 'String'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 1 }
+    )
+    $authAdapterSyntheticResolved = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $authAdapterSyntheticDescriptors -AuthorizationClass $authAdapterClassRegistry
+    Test-BRAVOCondition ([bool]$authAdapterSyntheticResolved[0].ReadOnly -eq $true) `
+        'Configurator/Authorization/DenyExecutionControlFieldNotEditable' `
+        "синтетичний дескриптор на DENY_EXECUTION_CONTROL-шляху (statically ReadOnly=`$false) мусить отримати effective ReadOnly=`$true; отримано $($authAdapterSyntheticResolved[0].ReadOnly)"
+
+    # --- Configurator/Authorization/AdapterGenuinelyConsumesCanonicalClass ---
+    # Мутуємо ЛИШЕ canonical Class копії реєстру (не каталог) і доводимо,
+    # що вихід adapter-а міняється відповідно — інакше ReadOnly=$true для
+    # BAZA.Mode міг би бути жорстко закодований в adapter-і, а не реально
+    # похідний від реєстру.
+    $authAdapterMutatedRegistry = @{}
+    foreach ($mutateKey in @($authAdapterClassRegistry.Keys)) { $authAdapterMutatedRegistry[$mutateKey] = $authAdapterClassRegistry[$mutateKey] }
+    $authAdapterMutatedRegistry['backupMonitoring.SFTP.BAZA.Mode'] = @{ Class = 'ALLOW_SITE'; Validator = $null }
+    $authAdapterMutatedResolved = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $authAdapterRawCatalog -AuthorizationClass $authAdapterMutatedRegistry
+    $authAdapterMutatedBazaMode = @($authAdapterMutatedResolved | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    Test-BRAVOCondition ($authAdapterMutatedBazaMode.Count -eq 1 -and [bool]$authAdapterMutatedBazaMode[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/AdapterGenuinelyConsumesCanonicalClass' `
+        "мутація ЛИШЕ canonical Class (BAZA.Mode -> ALLOW_SITE у копії реєстру) мусить змінити ефективний ReadOnly на `$false — доводить, що adapter реально читає реєстр, а не жорстко кодує рішення для конкретного шляху; отримано $($authAdapterMutatedBazaMode[0].ReadOnly)"
+
+    # --- Configurator/Authorization/RawCatalogUnmutatedByAdapter ---
+    $authAdapterRawAfter = @(Get-BRAVOConfiguratorSchemaCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    Test-BRAVOCondition ($authAdapterRawAfter.Count -eq 1 -and [bool]$authAdapterRawAfter[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/RawCatalogUnmutatedByAdapter' `
+        "Resolve-BRAVOConfiguratorFieldAuthorization НЕ повинен мутувати вхідні дескриптори/повторні читання сирого каталогу; отримано ReadOnly=$($authAdapterRawAfter[0].ReadOnly)"
+}
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====

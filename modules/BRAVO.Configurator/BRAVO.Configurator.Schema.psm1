@@ -123,8 +123,81 @@ function Test-BRAVOConfiguratorSchemaCompleteness {
     }
 }
 
+function Resolve-BRAVOConfiguratorFieldAuthorization {
+    <#
+    .SYNOPSIS
+        Похідна (derived) ефективна ReadOnly-поведінка дескрипторів
+        каталогу Configurator-а з canonical Class Wave 2 (#216).
+    .DESCRIPTION
+        Каталог Configurator-а (BRAVO.Configurator.Schema.psd1) лишається
+        джерелом UI-презентаційних метаданих (Label/Group/Section/Order/
+        Description/AllowedValues) — але ЕФЕКТИВНУ ReadOnly-поведінку
+        для DENY_*-класифікованих шляхів ця функція обчислює з
+        канонічного реєстру схеми (Get-BRAVOConfigurationSchemaAuthorizationClass
+        з BRAVO.Configuration.Schema), а не з власного статичного
+        ReadOnly-поля каталогу. Це усуває drift СТРУКТУРНО, не патчем
+        однієї позиції (WAVE2-CONTRACT.md, розділ 11.4): статичний
+        ReadOnly=$false у каталозі для DENY-шляху (наприклад,
+        backupMonitoring.SFTP.BAZA.Mode, .psd1-рядок з AllowedValues
+        @('IncrementalAppendOnly','Legacy')) більше не може розійтись із
+        тим, що loader реально прийме — canonical Class ЗАВЖДИ виграє,
+        якщо каталог і реєстр колись розійдуться.
+
+        НЕ дублює 271-позиційну класифікацію в другому файлі — читає
+        той самий canonical реєстр, який використовує
+        BRAVO_CONFIG_LOADER.ps1 (Test-BRAVOConfigurationOverrideAuthorization).
+        Вхідний масив дескрипторів НЕ мутується — повертаються нові
+        hashtable-копії (та сама "форма" елемента, що вже повертає
+        Get-BRAVOConfiguratorSchemaCatalog).
+    .PARAMETER Descriptors
+        Масив каталогових дескрипторів (типово — результат
+        Get-BRAVOConfiguratorSchemaCatalog).
+    .PARAMETER AuthorizationClass
+        Hashtable Path -> @{ Class; Validator } (типово — результат
+        Get-BRAVOConfigurationSchemaAuthorizationClass з
+        BRAVO.Configuration.Schema).
+    .OUTPUTS
+        [object[]] — копії дескрипторів: ReadOnly примусово $true для
+        будь-якого DENY_*-класу, незалежно від статичного значення в
+        каталозі; для ALLOW_SITE/ALLOW_WITH_VALIDATOR лишається
+        статичне ReadOnly каталогу (презентаційна відповідальність
+        каталогу — не змінена Wave 2). Каталоговий Path, якого немає в
+        AuthorizationClass (не мало б статися для повного 271-переліку,
+        але захисно), лишає статичне ReadOnly каталогу без змін.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][array]$Descriptors,
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$AuthorizationClass
+    )
+
+    $resolved = New-Object System.Collections.Generic.List[object]
+    foreach ($descriptor in $Descriptors) {
+        $path = [string]$descriptor.Path
+        $effectiveReadOnly = [bool]$descriptor.ReadOnly
+        if ($AuthorizationClass.Contains($path)) {
+            $class = [string]$AuthorizationClass[$path].Class
+            if ($class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
+                $effectiveReadOnly = $true
+            }
+        }
+        $clone = @{}
+        foreach ($key in @($descriptor.Keys)) { $clone[$key] = $descriptor[$key] }
+        $clone['ReadOnly'] = $effectiveReadOnly
+        [void]$resolved.Add($clone)
+    }
+    # Кома-оператор обов'язковий: без нього PowerShell розгортає
+    # односимвольний/порожній масив у пайплайні при поверненні з функції
+    # (caller отримав би голий hashtable замість object[] для 1 елемента,
+    # або $null для 0) — той самий клас дефекту, від якого захищають
+    # OutboundMessagesAssignmentsKeepOuterArrayWrapper-подібні self-test.
+    return ,$resolved.ToArray()
+}
+
 Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorSchemaCatalog',
     'Get-BRAVOConfiguratorDocumentedOverridePaths',
-    'Test-BRAVOConfiguratorSchemaCompleteness'
+    'Test-BRAVOConfiguratorSchemaCompleteness',
+    'Resolve-BRAVOConfiguratorFieldAuthorization'
 )
