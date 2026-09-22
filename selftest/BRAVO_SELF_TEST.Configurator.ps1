@@ -1552,6 +1552,288 @@ try {
 }
 
 # =====================================================================
+# PR #224 review, четверте коло (P2): backupMonitoring.SFTP.BAZA.MutationPolicy
+# отримав canonical Configurator-дескриптор (recovery-only, дзеркалить
+# сусідній Mode-блок вище) — до цього легасі MutationPolicy-override не
+# мав жодного Model-рядка, через який оператор міг би його транзакційно
+# зняти: loader fail-closed блокував запуск, а Configurator НЕ показував
+# жодного шляху відновлення (той самий баг-клас, що F2 закрив для Mode).
+# Дескриптор НЕ робить лист звичайним редагованим site-налаштуванням —
+# canonical Class лишається DENY_SECURITY_CONTROL,
+# WeakeningOverride='None' (BRAVO.Configuration.Schema.psm1); ReadOnly
+# похідний (Resolve-BRAVOConfiguratorFieldAuthorization примусово $true
+# для будь-якого DENY_*-класу) — жодної MutationPolicy-специфічної гілки
+# коду в Model/Persistence не додано, той самий generic-механізм, що вже
+# обслуговує Mode.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $mutPolPath = 'backupMonitoring.SFTP.BAZA.MutationPolicy'
+    $mutPolContainerPath = 'backupMonitoring.SFTP.BAZA'
+    $mutPolSiblingPath = 'backupMonitoring.SFTP.BAZA.FullAuditEnabled'
+    $mutPolSiblingValue = $true
+    $mutPolRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $mutPolClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $mutPolResolvedCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $mutPolRawCatalog -AuthorizationClass $mutPolClassRegistry
+
+    # --- Configurator/MutationPolicyRecoveryDescriptorExists ---
+    $mutPolDescriptor = @($mutPolRawCatalog | Where-Object { $_.Path -eq $mutPolPath })
+    Test-BRAVOCondition (
+        $mutPolDescriptor.Count -eq 1 -and [string]$mutPolClassRegistry[$mutPolPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        [string]$mutPolClassRegistry[$mutPolPath].WeakeningOverride -ne 'ExistingSecurityEscapeHatch'
+    ) `
+        'Configurator/MutationPolicyRecoveryDescriptorExists' `
+        "рівно ОДИН Configurator-дескриптор мусить існувати для $mutPolPath, а canonical авторизація мусить лишатись DENY_SECURITY_CONTROL/не-escapable; отримано DescriptorCount=$($mutPolDescriptor.Count) Class=$($mutPolClassRegistry[$mutPolPath].Class) WeakeningOverride=$($mutPolClassRegistry[$mutPolPath].WeakeningOverride)"
+
+    # ===== Плоский (flat) легасі-override =====
+    $mutPolFlatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_FLAT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolFlatScenarioRoot)
+    try {
+        $mutPolFlatLocalConfigPath = Join-Path $mutPolFlatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $mutPolFlatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $mutPolPath        = 'Fail'
+                $mutPolSiblingPath = $mutPolSiblingValue
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mutPolFlatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolFlatScenarioRoot
+        $mutPolFlatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolFlatBaseline.Overrides
+        $mutPolFlatSetting = @($mutPolFlatModel | Where-Object { $_.Path -eq $mutPolPath })
+
+        # --- Configurator/MutationPolicyLegacyFlatOverrideDetected ---
+        Test-BRAVOCondition (
+            $mutPolFlatSetting.Count -eq 1 -and [bool]$mutPolFlatSetting[0].OverridePresent -and
+            [string]$mutPolFlatSetting[0].OverrideValue -eq 'Fail'
+        ) `
+            'Configurator/MutationPolicyLegacyFlatOverrideDetected' `
+            "плоский легасі $mutPolPath='Fail' мусить бути виявлений Model-побудовою; отримано OverridePresent=$($mutPolFlatSetting[0].OverridePresent) Value=$($mutPolFlatSetting[0].OverrideValue)"
+
+        # --- Configurator/MutationPolicyLegacyOverrideIsReadOnlyButClearable ---
+        $mutPolFlatCleared = Clear-BRAVOConfiguratorOverride -Model $mutPolFlatModel -Path $mutPolPath
+        $mutPolFlatClearedSetting = @($mutPolFlatCleared | Where-Object { $_.Path -eq $mutPolPath })
+        Test-BRAVOCondition (
+            [bool]$mutPolFlatSetting[0].Metadata.ReadOnly -eq $true -and
+            $mutPolFlatClearedSetting.Count -eq 1 -and (-not [bool]$mutPolFlatClearedSetting[0].OverridePresent)
+        ) `
+            'Configurator/MutationPolicyLegacyOverrideIsReadOnlyButClearable' `
+            "легасі MutationPolicy-override мусить бути ReadOnly=`$true (canonical adapter), але й далі знімний через Clear-BRAVOConfiguratorOverride; отримано ReadOnly=$($mutPolFlatSetting[0].Metadata.ReadOnly) OverridePresentAfterClear=$($mutPolFlatClearedSetting[0].OverridePresent)"
+
+        # --- Configurator/MutationPolicyApplyWithoutClearFails ---
+        $mutPolFlatPreApplyBytes = [IO.File]::ReadAllBytes($mutPolFlatLocalConfigPath)
+        $mutPolFlatModelUnchanged = Update-BRAVOConfiguratorEffective -Model $mutPolFlatModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolFlatApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolFlatScenarioRoot -Model $mutPolFlatModelUnchanged -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolFlatBaseline
+        $mutPolFlatPostApplyBytes = [IO.File]::ReadAllBytes($mutPolFlatLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$mutPolFlatApplyUnchanged.Applied) -and [string]$mutPolFlatApplyUnchanged.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($mutPolFlatPreApplyBytes) -eq [Convert]::ToBase64String($mutPolFlatPostApplyBytes))
+        ) `
+            'Configurator/MutationPolicyApplyWithoutClearFails' `
+            "Apply з незмінним MutationPolicy-override мусить провалитись на Validation, production-файл лишається побайтово незмінним; отримано Applied=$($mutPolFlatApplyUnchanged.Applied) Stage=$($mutPolFlatApplyUnchanged.Stage)"
+
+        # --- Configurator/MutationPolicyClearSucceeds ---
+        # --- Configurator/MutationPolicyClearPreservesSibling ---
+        $mutPolFlatFinalModel = Update-BRAVOConfiguratorEffective -Model $mutPolFlatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolFlatFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolFlatScenarioRoot -Model $mutPolFlatFinalModel -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolFlatBaseline
+        $mutPolFlatFinalContent = if (Test-Path -LiteralPath $mutPolFlatLocalConfigPath) {
+            Get-Content -LiteralPath $mutPolFlatLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$mutPolFlatFinalApply.Applied -and [string]$mutPolFlatFinalApply.Stage -eq 'Complete' -and
+            (-not $mutPolFlatFinalContent.Contains($mutPolPath))
+        ) `
+            'Configurator/MutationPolicyClearSucceeds' `
+            "після Clear валідний candidate мусить пройти Apply (Applied=`$true, Stage=Complete), результуючий файл більше не повинен містити '$mutPolPath'; отримано Applied=$($mutPolFlatFinalApply.Applied) Stage=$($mutPolFlatFinalApply.Stage)"
+        Test-BRAVOCondition (
+            $mutPolFlatFinalContent.Contains($mutPolSiblingPath)
+        ) `
+            'Configurator/MutationPolicyClearPreservesSibling' `
+            "сусідній ALLOW_SITE-лист '$mutPolSiblingPath' мусить пережити Clear+Apply MutationPolicy незмінним; вміст: $mutPolFlatFinalContent"
+
+        # --- Configurator/MutationPolicyNotEscapableWithWeakenedSecurity ---
+        $mutPolWeakenOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+        try {
+            [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+            $mutPolEscapeHatchResult = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $mutPolPath
+            $mutPolPreviewWithEnv = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $mutPolFlatModel
+            Test-BRAVOCondition (
+                (-not $mutPolEscapeHatchResult) -and (-not $mutPolPreviewWithEnv.Contains($mutPolPath))
+            ) `
+                'Configurator/MutationPolicyNotEscapableWithWeakenedSecurity' `
+                "$mutPolPath мусить лишитись non-escapable навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 (WeakeningOverride='None'), і preview мусить і далі виключати його; отримано EscapeHatchAllowed=$mutPolEscapeHatchResult PreviewContains=$($mutPolPreviewWithEnv.Contains($mutPolPath))"
+        } finally {
+            [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $mutPolWeakenOriginalEnv)
+        }
+    } finally {
+        Remove-Item -LiteralPath $mutPolFlatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Вкладена (nested) легасі-форма =====
+    $mutPolNestedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_NESTED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolNestedScenarioRoot)
+    try {
+        $mutPolNestedLocalConfigPath = Join-Path $mutPolNestedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $mutPolNestedLocalConfigPath, (
+                "@{`r`n" +
+                "    '$mutPolContainerPath' = @{`r`n" +
+                "        'MutationPolicy' = 'Fail'`r`n" +
+                "        'FullAuditEnabled' = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mutPolNestedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolNestedScenarioRoot
+        $mutPolNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolNestedBaseline.Overrides
+        $mutPolNestedSetting = @($mutPolNestedModel | Where-Object { $_.Path -eq $mutPolPath })
+
+        # --- Configurator/MutationPolicyNestedOverrideDetected ---
+        Test-BRAVOCondition (
+            $mutPolNestedSetting.Count -eq 1 -and [bool]$mutPolNestedSetting[0].OverridePresent -and
+            [string]$mutPolNestedSetting[0].OverrideValue -eq 'Fail' -and [bool]$mutPolNestedSetting[0].Metadata.ReadOnly -eq $true
+        ) `
+            'Configurator/MutationPolicyNestedOverrideDetected' `
+            "вкладений $mutPolPath мусить бути виявлений як canonical leaf (OverridePresent=`$true, Value='Fail', ReadOnly=`$true); отримано OverridePresent=$($mutPolNestedSetting[0].OverridePresent) Value=$($mutPolNestedSetting[0].OverrideValue) ReadOnly=$($mutPolNestedSetting[0].Metadata.ReadOnly)"
+
+        # --- Configurator/MutationPolicyNestedClearPreservesSibling ---
+        $mutPolNestedCleared = Clear-BRAVOConfiguratorOverride -Model $mutPolNestedModel -Path $mutPolPath
+        $mutPolNestedFinalModel = Update-BRAVOConfiguratorEffective -Model $mutPolNestedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolNestedFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolNestedScenarioRoot -Model $mutPolNestedFinalModel -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolNestedBaseline
+        $mutPolNestedFinalContent = if (Test-Path -LiteralPath $mutPolNestedLocalConfigPath) {
+            Get-Content -LiteralPath $mutPolNestedLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$mutPolNestedFinalApply.Applied -and [string]$mutPolNestedFinalApply.Stage -eq 'Complete' -and
+            (-not $mutPolNestedFinalContent.Contains("'Fail'")) -and
+            $mutPolNestedFinalContent.Contains($mutPolSiblingPath)
+        ) `
+            'Configurator/MutationPolicyNestedClearPreservesSibling' `
+            "після Clear вкладеного MutationPolicy: Apply мусить успішно пройти (flatten-on-touch розгортає контейнер), 'Fail' мусить зникнути, а сусід $mutPolSiblingPath мусить лишитись; отримано Applied=$($mutPolNestedFinalApply.Applied) Stage=$($mutPolNestedFinalApply.Stage) Content=$mutPolNestedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $mutPolNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Неможливо створити НОВИЙ MutationPolicy-override =====
+    $mutPolCleanScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_CLEAN_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolCleanScenarioRoot)
+    try {
+        # Жодного BRAVO.local.config у цій директорії — справді чистий
+        # старт (той самий патерн, що "14: candidate valid -> atomic
+        # apply (на порожній production-директорії)" вище у цьому файлі).
+        $mutPolCleanBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolCleanScenarioRoot
+        Test-BRAVOCondition (-not $mutPolCleanBaseline.Overrides.Contains($mutPolPath)) `
+            'Configurator/MutationPolicyCannotBeNewlyCreated/BaselineStartsClean' `
+            "fixture-передумова: чистий baseline НЕ повинен вже містити $mutPolPath; отримано Contains=$($mutPolCleanBaseline.Overrides.Contains($mutPolPath))"
+
+        $mutPolCleanModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolCleanBaseline.Overrides
+        # Оператор (чи UI, що не звірив ReadOnly) намагається СТВОРИТИ
+        # override, якого раніше не було — Set-BRAVOConfiguratorOverride
+        # сам по собі не перевіряє ReadOnly (презентаційна відповідальність
+        # UI-шару), тому справжній gate — canonical Apply-конвеєр нижче.
+        $mutPolCleanAttempt = Set-BRAVOConfiguratorOverride -Model $mutPolCleanModel -Path $mutPolPath -Value 'Fail'
+        $mutPolCleanAttempt = Update-BRAVOConfiguratorEffective -Model $mutPolCleanAttempt -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolCleanApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolCleanScenarioRoot -Model $mutPolCleanAttempt -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolCleanBaseline
+        $mutPolCleanConfigPath = Join-Path $mutPolCleanScenarioRoot 'BRAVO.local.config'
+        Test-BRAVOCondition (
+            (-not [bool]$mutPolCleanApply.Applied) -and [string]$mutPolCleanApply.Stage -eq 'Validation' -and
+            (-not (Test-Path -LiteralPath $mutPolCleanConfigPath))
+        ) `
+            'Configurator/MutationPolicyCannotBeNewlyCreated' `
+            "спроба ВПЕРШЕ створити $mutPolPath через Configurator-конвеєр мусить провалитись fail-closed на Validation, і жоден production-файл не повинен бути записаний; отримано Applied=$($mutPolCleanApply.Applied) Stage=$($mutPolCleanApply.Stage) FileExists=$(Test-Path -LiteralPath $mutPolCleanConfigPath)"
+    } finally {
+        Remove-Item -LiteralPath $mutPolCleanScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Змішаний контейнер: Mode + MutationPolicy обидва DENY =====
+    # Доводить, що recovery leaf-специфічний і атомарний: часткове Clear
+    # (лише одного з двох DENY-сусідів у тому самому контейнері) НЕ
+    # повинно дозволяти Apply, доки НЕ прибрано ОБИДВА.
+    $mutPolMixedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_MIXED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolMixedScenarioRoot)
+    try {
+        $mutPolMixedLocalConfigPath = Join-Path $mutPolMixedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $mutPolMixedLocalConfigPath, (
+                "@{`r`n" +
+                "    '$mutPolContainerPath' = @{`r`n" +
+                "        'Mode' = 'Legacy'`r`n" +
+                "        'MutationPolicy' = 'Fail'`r`n" +
+                "        'FullAuditEnabled' = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mutPolMixedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot
+        $mutPolMixedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolMixedBaseline.Overrides
+        $mutPolMixedPreBytes = [IO.File]::ReadAllBytes($mutPolMixedLocalConfigPath)
+
+        # --- Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific ---
+        # Сценарій A: прибрати ЛИШЕ Mode -> MutationPolicy лишається,
+        # Apply і далі відхиляється, файл незмінний.
+        $mutPolMixedClearModeOnly = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedModel -Path 'backupMonitoring.SFTP.BAZA.Mode'
+        $mutPolMixedClearModeOnly = Update-BRAVOConfiguratorEffective -Model $mutPolMixedClearModeOnly -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolMixedApplyModeOnly = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot -Model $mutPolMixedClearModeOnly -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolMixedBaseline
+        $mutPolMixedPostBytesA = [IO.File]::ReadAllBytes($mutPolMixedLocalConfigPath)
+
+        # Сценарій B: прибрати ЛИШЕ MutationPolicy -> Mode лишається,
+        # Apply і далі відхиляється, файл незмінний. Той самий незмінний
+        # $mutPolMixedModel/$mutPolMixedBaseline (Сценарій A нічого не
+        # записав — Applied=false зупиняється до atomic replace), тож
+        # обидва сценарії genuinely незалежні, не кумулятивні.
+        $mutPolMixedClearPolicyOnly = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedModel -Path $mutPolPath
+        $mutPolMixedClearPolicyOnly = Update-BRAVOConfiguratorEffective -Model $mutPolMixedClearPolicyOnly -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolMixedApplyPolicyOnly = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot -Model $mutPolMixedClearPolicyOnly -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolMixedBaseline
+        $mutPolMixedPostBytesB = [IO.File]::ReadAllBytes($mutPolMixedLocalConfigPath)
+
+        Test-BRAVOCondition (
+            (-not [bool]$mutPolMixedApplyModeOnly.Applied) -and [string]$mutPolMixedApplyModeOnly.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($mutPolMixedPreBytes) -eq [Convert]::ToBase64String($mutPolMixedPostBytesA)) -and
+            (-not [bool]$mutPolMixedApplyPolicyOnly.Applied) -and [string]$mutPolMixedApplyPolicyOnly.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($mutPolMixedPreBytes) -eq [Convert]::ToBase64String($mutPolMixedPostBytesB))
+        ) `
+            'Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific' `
+            ("часткове Clear лише ОДНОГО з двох DENY-сусідів (Mode або MutationPolicy) у тому самому контейнері НЕ повинно дозволяти Apply, доки лишається другий; " +
+             "отримано ClearModeOnly: Applied=$($mutPolMixedApplyModeOnly.Applied) Stage=$($mutPolMixedApplyModeOnly.Stage) FileChanged=$([Convert]::ToBase64String($mutPolMixedPreBytes) -ne [Convert]::ToBase64String($mutPolMixedPostBytesA)); " +
+             "ClearPolicyOnly: Applied=$($mutPolMixedApplyPolicyOnly.Applied) Stage=$($mutPolMixedApplyPolicyOnly.Stage) FileChanged=$([Convert]::ToBase64String($mutPolMixedPreBytes) -ne [Convert]::ToBase64String($mutPolMixedPostBytesB))")
+
+        # --- Configurator/BazaBothDeniedLeavesClearedApplySucceeds ---
+        $mutPolMixedClearBoth = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedModel -Path 'backupMonitoring.SFTP.BAZA.Mode'
+        $mutPolMixedClearBoth = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedClearBoth -Path $mutPolPath
+        $mutPolMixedClearBoth = Update-BRAVOConfiguratorEffective -Model $mutPolMixedClearBoth -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolMixedApplyBoth = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot -Model $mutPolMixedClearBoth -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolMixedBaseline
+        $mutPolMixedFinalContent = if (Test-Path -LiteralPath $mutPolMixedLocalConfigPath) {
+            Get-Content -LiteralPath $mutPolMixedLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$mutPolMixedApplyBoth.Applied -and [string]$mutPolMixedApplyBoth.Stage -eq 'Complete' -and
+            (-not $mutPolMixedFinalContent.Contains("'Legacy'")) -and
+            (-not $mutPolMixedFinalContent.Contains("'Fail'")) -and
+            $mutPolMixedFinalContent.Contains($mutPolSiblingPath)
+        ) `
+            'Configurator/BazaBothDeniedLeavesClearedApplySucceeds' `
+            "після Clear ОБОХ (Mode і MutationPolicy) Apply мусить успішно пройти (Applied=`$true, Stage=Complete), жоден із двох DENY-листів не повинен лишитись, а ALLOW_SITE-сусід $mutPolSiblingPath мусить пережити; отримано Applied=$($mutPolMixedApplyBoth.Applied) Stage=$($mutPolMixedApplyBoth.Stage) Content=$mutPolMixedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $mutPolMixedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
 # PR #224 third review, R3-1: Configurator effective preview повинна
 # відображати наявний BRAVO_ALLOW_WEAKENED_SECURITY=1 escape hatch для
 # requireAdministrator (canonical WeakeningOverride='ExistingSecurityEscapeHatch'),
@@ -1828,10 +2110,23 @@ try {
         'Contract/BazaModeExplicitlyLabeledNonOverridable' `
         "backupMonitoring.SFTP.BAZA.Mode мусить лишитись задокументованим (schema-повнота), але з явним NON-OVERRIDABLE-маркером поруч"
 
-    # --- Contract/BazaMutationPolicyNotAdvertised ---
-    Test-BRAVOCondition (-not ($r34DocumentedPaths -contains 'backupMonitoring.SFTP.BAZA.MutationPolicy')) `
-        'Contract/BazaMutationPolicyNotAdvertised' `
-        "backupMonitoring.SFTP.BAZA.MutationPolicy НЕ повинен з'являтись у задокументованому override-переліку взагалі (немає Configurator-дескриптора)"
+    # --- Contract/BazaMutationPolicyExplicitlyLabeledNonOverridable ---
+    # PR #224 review (P2, четверте коло): MutationPolicy тепер МАЄ
+    # canonical Configurator-дескриптор (recovery-only) — schema-повнота
+    # (Test-BRAVOConfiguratorSchemaCompleteness) вимагає документування
+    # 1:1, тож "взагалі не з'являється" більше не є правильним контрактом
+    # (той тест існував ДО додавання дескриптора). Замість цього — той
+    # самий доказ, що вже застосовує Mode: задокументований, але з явним
+    # NON-OVERRIDABLE-маркером, тож generic-перевірка вище
+    # (Contract/DocumentedOverrideTemplateDoesNotExposeDeniedLeaves) не
+    # знаходить його непозначеним.
+    Test-BRAVOCondition (
+        $r34DocumentedPaths -contains 'backupMonitoring.SFTP.BAZA.MutationPolicy' -and
+        $r34ExampleText.Contains("'backupMonitoring.SFTP.BAZA.MutationPolicy'") -and
+        $r34ExampleText.Contains('NON-OVERRIDABLE')
+    ) `
+        'Contract/BazaMutationPolicyExplicitlyLabeledNonOverridable' `
+        "backupMonitoring.SFTP.BAZA.MutationPolicy мусить лишитись задокументованим (schema-повнота — тепер має Configurator-дескриптор), але з явним NON-OVERRIDABLE-маркером поруч"
 }
 
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
