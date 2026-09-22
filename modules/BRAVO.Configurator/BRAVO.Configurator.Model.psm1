@@ -567,15 +567,16 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
     <#
     .SYNOPSIS
         PR #224 review (P2, "Expose validator-rejected noncatalog overrides
-        for recovery"): один augmented каталог дескрипторів для ПОТОЧНОЇ
-        сесії — статичний каталог (типово
-        Resolve-BRAVOConfiguratorFieldAuthorization-результат) плюс
-        ДИНАМІЧНО синтезовані recovery-only дескриптори для canonical
-        ALLOW_WITH_VALIDATOR-листів, яких немає у статичному каталозі, але
-        чиє ПОТОЧНЕ supplied-значення canonical авторизація відхиляє
-        (Reason='ValidatorRejected').
+        for recovery"; розширено — "Generalize noncatalog DENY recovery"):
+        один augmented каталог дескрипторів для ПОТОЧНОЇ сесії — статичний
+        каталог (типово Resolve-BRAVOConfiguratorFieldAuthorization-
+        результат) плюс ДИНАМІЧНО синтезовані recovery-only дескриптори
+        для canonical листів, яких немає у статичному каталозі, але чиє
+        ПОТОЧНЕ supplied-значення canonical авторизація відхиляє — або
+        ALLOW_WITH_VALIDATOR-лист з Reason='ValidatorRejected', або
+        БУДЬ-ЯКИЙ DENY_*-лист з Reason='DeniedClass' (не escapable зараз).
     .DESCRIPTION
-        Приклад: schedulerSettings.RestoreVerify.WeeklyOn='Funday' —
+        Приклад 1 (ValidatorRejected): schedulerSettings.RestoreVerify.WeeklyOn='Funday' —
         canonical leaf, ALLOW_WITH_VALIDATOR, ІСТОРИЧНО loader сам
         нормалізував невідоме значення в попередження + safe fallback
         (Saturday) ДО Wave 2, але не має статичного Configurator-
@@ -584,6 +585,18 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         незмінним при КОЖНОМУ Apply, а canonical loader відхиляє КОЖЕН
         Apply — оператор не може прибрати легасі-значення через
         Configurator (recovery deadlock).
+
+        Приклад 2 (DeniedClass, розширення цього кола): winSCPIniPath —
+        canonical leaf, DENY_SECURITY_CONTROL, БЕЗ статичного
+        Configurator-дескриптора (як і решта 41 DENY_*-листа, відсутнього
+        у статичному каталозі). Той самий deadlock: якщо оператор (чи
+        стара версія toolkit) залишив local override на такому листі,
+        Configurator про нього нічого не знав і не міг Clear через UI.
+        Детекція для ОБОХ прикладів похідна ЦІЛКОМ від ОДНОГО canonical
+        виклику Test-BRAVOConfigurationOverrideAuthorization нижче — жодної
+        другої/дублюючої класифікаційної таблиці DENY-шляхів тут немає;
+        яка саме множина шляхів зараз DENY_*, повністю визначає
+        $script:BRAVOConfigurationSchemaAuthorizationClass у Schema.psm1.
 
         Детекція ЦІЛКОМ похідна від canonical
         Test-BRAVOConfigurationOverrideAuthorization (включно з
@@ -612,11 +625,20 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
           - НЕ додається для Path, вже представленого статичним
             каталогом (нормальна UI-експозиція лишається під контролем
             каталогу, не цієї функції) — жоден canonical/DENY_*-шлях, уже
-            маючий дескриптор (у т.ч. BAZA.Mode/.MutationPolicy), тут не
-            дублюється;
-          - НЕ додається для DENY_*-класу (той механізм — окремий, уже
-            існуючий, статичний дескриптор +
-            Resolve-BRAVOConfiguratorFieldAuthorization);
+            маючий дескриптор (у т.ч. BAZA.Mode/.MutationPolicy, для яких
+            ReadOnly-статус і так уже дає окремий, існуючий, статичний
+            механізм через Resolve-BRAVOConfiguratorFieldAuthorization),
+            тут не дублюється;
+          - для DENY_*-класу ДОДАЄТЬСЯ (Section='DeniedOverride'), ЛИШЕ
+            якщо canonical Test-BRAVOConfigurationOverrideAuthorization
+            повертає Reason='DeniedClass' для цього Path — і ЛИШЕ якщо
+            Test-BRAVOConfigurationWeakeningEscapeHatchAllowed для цього
+            ж Path зараз $false (той самий, ЄДИНИЙ canonical виклик, що
+            ConvertTo-BRAVOConfiguratorOverrideHashtable вже використовує
+            для R3-1/requireAdministrator — не дубльовано, не
+            переоцінено тут окремою логікою); якщо escape hatch зараз
+            дозволений для цього Path, значення фактично приймається
+            canonical loader-ом і recovery-рядок НЕ синтезується;
           - НЕ додається для валідного supplied-значення (авторизація
             IsValid=$true — нормальний ALLOW_WITH_VALIDATOR override,
             нічого відновлювати, D3/невідомі ключі лишаються geть
@@ -663,7 +685,10 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
     foreach ($path in @($authorizationClass.Keys | Sort-Object)) {
         if ($staticPaths.Contains($path)) { continue }
         $entry = $authorizationClass[$path]
-        if ([string]$entry.Class -ne 'ALLOW_WITH_VALIDATOR') { continue }
+        $class = [string]$entry.Class
+        $isValidatorClass = ($class -eq 'ALLOW_WITH_VALIDATOR')
+        $isDenyClass = $class.StartsWith('DENY_')
+        if (-not $isValidatorClass -and -not $isDenyClass) { continue }
 
         $supplied = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $LocalOverrides -LeafPath $path
         if (-not $supplied.Found) { continue }
@@ -671,15 +696,39 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         $authResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ $path = $supplied.Value } -Schema $canonicalSchema
         if ($authResult.IsValid) { continue }
         $violation = @($authResult.Violations | Where-Object { [string]$_.Path -eq $path })
-        if ($violation.Count -eq 0 -or [string]$violation[0].Reason -ne 'ValidatorRejected') { continue }
+        if ($violation.Count -eq 0) { continue }
+        $reason = [string]$violation[0].Reason
+        if ($isValidatorClass -and $reason -ne 'ValidatorRejected') { continue }
+        if ($isDenyClass -and $reason -ne 'DeniedClass') { continue }
+        if ($isDenyClass -and (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $path -AuthorizationClass $authorizationClass)) {
+            # Той самий escape-hatch-шлях, що ConvertTo-BRAVOConfiguratorOverrideHashtable
+            # вже застосовує (R3-1, наразі лише requireAdministrator):
+            # canonical loader ЗАРАЗ приймає це значення через
+            # BRAVO_ALLOW_WEAKENED_SECURITY=1 — не синтезувати
+            # "заборонено" recovery-рядок для override, який фактично не
+            # відхиляється в поточному процесі.
+            continue
+        }
 
         $recoveryOrder++
+        if ($reason -eq 'ValidatorRejected') {
+            $section = 'ValidatorRejected'
+            $label = "Відновлення (невалідне значення): $path"
+            $description = "Наявний local override для '$path' не проходить canonical валідацію: $($violation[0].Message) Поле лише для перегляду/Clear через Configurator; нове значення тут ввести не можна. Виправте значення напряму у BRAVO.local.config, щоб знову зробити цей лист звичайним редагованим полем."
+        } else {
+            # DeniedClass: не розкриваємо саме значення класу/причини
+            # заборони (security-sensitive деталь) — лише факт, що поле
+            # заборонене і його можна прибрати через Clear.
+            $section = 'DeniedOverride'
+            $label = "Відновлення (заборонений override): $path"
+            $description = "Наявний local override для '$path' встановлює заборонену політику й canonical loader його відхиляє. Поле лише для перегляду/Clear через Configurator; нове значення тут ввести не можна. Приберіть цей запис напряму з BRAVO.local.config, якщо override більше не потрібен."
+        }
         [void]$augmented.Add(@{
             Path        = $path
             Group       = 'Recovery'
-            Section     = 'ValidatorRejected'
-            Label       = "Відновлення (невалідне значення): $path"
-            Description = "Наявний local override для '$path' не проходить canonical валідацію: $($violation[0].Message) Поле лише для перегляду/Clear через Configurator; нове значення тут ввести не можна. Виправте значення напряму у BRAVO.local.config, щоб знову зробити цей лист звичайним редагованим полем."
+            Section     = $section
+            Label       = $label
+            Description = $description
             Type        = 'String'
             Phase       = 1
             Advanced    = $true

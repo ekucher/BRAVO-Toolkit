@@ -265,6 +265,39 @@ try {
         -Name "Loader/OutputEncodingCodePageZeroCompatibility" `
         -Failure "consoleSettings.OutputEncodingCodePage=0 мусить проходити реальний Import-BravoConfiguration без throw; отримано: '$localCfgCodePageProbeLast'"
 
+    # --- Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException
+    # (PR #224 review, шосте коло, P2 "IntegerRange overflow hardening"):
+    # sftpPort=[uint64]::MaxValue МУСИТЬ і надалі fail-closed зупиняти
+    # завантаження (ValidatorRejected — canonical авторизаційний контракт
+    # незмінний), АЛЕ керованим throw ("неавторизоване перевизначення" з
+    # loader-а), НЕ неконтрольованим .NET OverflowException від звуження
+    # [int64] усередині Test-BRAVOConfigurationAuthorizationIntegerRange.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'sftpPort' = 18446744073709551615`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgSftpPortProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'UNEXPECTED-NOTHREW' " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgSftpPortProbeLast = ([string](@($localCfgSftpPortProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition (
+            $localCfgSftpPortProbeLast.StartsWith('CHILD-ERROR:') -and
+            $localCfgSftpPortProbeLast.Contains('BRAVO.local.config: неавторизоване перевизначення') -and
+            $localCfgSftpPortProbeLast.Contains('sftpPort') -and
+            (-not $localCfgSftpPortProbeLast.Contains('OverflowException')) -and
+            (-not $localCfgSftpPortProbeLast.Contains('overflow'))
+        ) `
+        -Name "Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException" `
+        -Failure "sftpPort=[uint64]::MaxValue мусить fail-closed зупинити завантаження КЕРОВАНИМ throw ('неавторизоване перевизначення'), БЕЗ OverflowException; отримано: '$localCfgSftpPortProbeLast'"
+
     # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",

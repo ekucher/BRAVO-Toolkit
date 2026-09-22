@@ -2371,6 +2371,312 @@ try {
 }
 
 # =====================================================================
+# PR #224 review, шосте коло (P2, "Generalize noncatalog DENY recovery"):
+# той самий recovery deadlock, що п'яте коло вирішило для ALLOW_WITH_
+# VALIDATOR-листів без статичного дескриптора, існує так само для
+# DENY_*-листів без статичного дескриптора (напр. winSCPIniPath,
+# schedulerSettings.RequireProtectedRuntime — 41 з 42 DENY_*-шляхів
+# сьогодні). Get-BRAVOConfiguratorSessionSchemaCatalog тепер синтезує
+# recovery-only рядок (Section='DeniedOverride') і для ЦИХ шляхів —
+# ЦІЛКОМ похідно від того самого canonical
+# Test-BRAVOConfigurationOverrideAuthorization + ЄДИНОГО, вже наявного
+# Test-BRAVOConfigurationWeakeningEscapeHatchAllowed (не дубльовано,
+# requireAdministrator лишається єдиним escapable шляхом). Жодного
+# per-path спецкоду й жодної другої 42-шляхової таблиці — детекція
+# похідна напряму від реєстру.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $dnFlatPath = 'winSCPIniPath'
+    $dnNestedContainerPath = 'schedulerSettings'
+    $dnNestedLeaf = 'RequireProtectedRuntime'
+    $dnNestedPath = 'schedulerSettings.RequireProtectedRuntime'
+    $dnNestedSiblingLeaf = 'AllowStartIfOnBatteries'
+    $dnNestedSiblingPath = 'schedulerSettings.AllowStartIfOnBatteries'
+    $dnRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $dnAuthClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+
+    Test-BRAVOCondition (
+        $dnAuthClass.Contains($dnFlatPath) -and [string]$dnAuthClass[$dnFlatPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        (-not (@($dnRawCatalog | Where-Object { $_.Path -eq $dnFlatPath })))
+    ) `
+        'Configurator/DeniedRecoveryFixturePreconditions/WinSCPIniPath' `
+        "передумова: $dnFlatPath мусить лишатись DENY_SECURITY_CONTROL і БЕЗ статичного Configurator-дескриптора; отримано Class=$($dnAuthClass[$dnFlatPath].Class) StaticHasIt=$([bool](@($dnRawCatalog | Where-Object { $_.Path -eq $dnFlatPath })))"
+    Test-BRAVOCondition (
+        $dnAuthClass.Contains($dnNestedPath) -and [string]$dnAuthClass[$dnNestedPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        (-not (@($dnRawCatalog | Where-Object { $_.Path -eq $dnNestedPath })))
+    ) `
+        'Configurator/DeniedRecoveryFixturePreconditions/RequireProtectedRuntime' `
+        "передумова: $dnNestedPath мусить лишатись DENY_SECURITY_CONTROL і БЕЗ статичного Configurator-дескриптора; отримано Class=$($dnAuthClass[$dnNestedPath].Class) StaticHasIt=$([bool](@($dnRawCatalog | Where-Object { $_.Path -eq $dnNestedPath })))"
+
+    # --- Configurator/DeniedNonCatalogRecoveryRowCannotCreateFreshOverride (чистий конфіг) ---
+    $dnCleanSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{}
+    Test-BRAVOCondition (
+        -not (@($dnCleanSessionCatalog | Where-Object { $_.Path -eq $dnFlatPath -or $_.Path -eq $dnNestedPath }))
+    ) `
+        'Configurator/DeniedNonCatalogRecoveryRowCannotCreateFreshOverride' `
+        "БЕЗ наявного denied override augmented-каталог НЕ повинен синтезувати recovery-рядок для $dnFlatPath/$dnNestedPath — оператор не може створити їх з чистого конфігу через Configurator"
+
+    # ===== Плоский (flat) DENY-override: winSCPIniPath =====
+    $dnFlatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DENIEDRECOVERY_FLAT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dnFlatScenarioRoot)
+    try {
+        $dnFlatLocalConfigPath = Join-Path $dnFlatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $dnFlatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $dnFlatPath                = 'C:\Legacy\WinSCP.ini'
+                'schedulerSettings.Hidden' = $true
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $dnFlatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnFlatScenarioRoot
+        $dnFlatSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnFlatBaseline.Overrides
+        $dnFlatRecoveryDescriptor = @($dnFlatSessionCatalog | Where-Object { $_.Path -eq $dnFlatPath })
+        $dnFlatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $dnFlatSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $dnFlatBaseline.Overrides
+        $dnFlatSetting = @($dnFlatModel | Where-Object { $_.Path -eq $dnFlatPath })
+
+        # --- Configurator/DeniedNonCatalogRecoveryRowExists ---
+        Test-BRAVOCondition (
+            $dnFlatRecoveryDescriptor.Count -eq 1 -and [bool]$dnFlatRecoveryDescriptor[0].ReadOnly -and
+            [string]$dnFlatRecoveryDescriptor[0].Section -eq 'DeniedOverride' -and
+            $dnFlatSetting.Count -eq 1 -and [bool]$dnFlatSetting[0].OverridePresent -and [string]$dnFlatSetting[0].OverrideValue -eq 'C:\Legacy\WinSCP.ini'
+        ) `
+            'Configurator/DeniedNonCatalogRecoveryRowExists' `
+            "$dnFlatPath не має статичного дескриптора, але з наявним denied override augmented-каталог мусить синтезувати РІВНО один recovery-only (ReadOnly, Section=DeniedOverride) рядок, а Model — показувати OverridePresent=true; отримано RecoveryCount=$($dnFlatRecoveryDescriptor.Count) Section=$($dnFlatRecoveryDescriptor[0].Section) OverridePresent=$($dnFlatSetting[0].OverridePresent)"
+
+        # --- Configurator/DeniedNonCatalogFlatClearSucceeds ---
+        $dnFlatCleared = Clear-BRAVOConfiguratorOverride -Model $dnFlatModel -Path $dnFlatPath
+        $dnFlatCleared = Update-BRAVOConfiguratorEffective -Model $dnFlatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $dnFlatApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnFlatScenarioRoot -Model $dnFlatCleared -SchemaCatalog $dnFlatSessionCatalog -ProductionBaseline $dnFlatBaseline
+        $dnFlatFinalContent = if (Test-Path -LiteralPath $dnFlatLocalConfigPath) { Get-Content -LiteralPath $dnFlatLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$dnFlatApply.Applied -and [string]$dnFlatApply.Stage -eq 'Complete' -and
+            (-not $dnFlatFinalContent.Contains('WinSCP.ini')) -and $dnFlatFinalContent.Contains('schedulerSettings.Hidden')
+        ) `
+            'Configurator/DeniedNonCatalogFlatClearSucceeds' `
+            "Clear заблокованого плоского $dnFlatPath мусить дозволити успішний Apply (Applied=`$true, Stage=Complete), значення зникає з файлу, сусідній schedulerSettings.Hidden переживає; отримано Applied=$($dnFlatApply.Applied) Stage=$($dnFlatApply.Stage) Content=$dnFlatFinalContent"
+
+        # --- Post-Clear: рядок природно зникає з наступного augmented-каталогу ---
+        $dnFlatBaselineAfter = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnFlatScenarioRoot
+        $dnFlatSessionCatalogAfter = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnFlatBaselineAfter.Overrides
+        Test-BRAVOCondition (
+            -not (@($dnFlatSessionCatalogAfter | Where-Object { $_.Path -eq $dnFlatPath }))
+        ) `
+            'Configurator/DeniedNonCatalogRecoveryRowDisappearsAfterClear' `
+            "після успішного Clear+Apply наступний Get-BRAVOConfiguratorSessionSchemaCatalog-виклик (Reload) БІЛЬШЕ не повинен синтезувати recovery-рядок для $dnFlatPath"
+    } finally {
+        Remove-Item -LiteralPath $dnFlatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Вкладена (nested) форма: schedulerSettings.RequireProtectedRuntime =====
+    $dnNestedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DENIEDRECOVERY_NESTED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dnNestedScenarioRoot)
+    try {
+        $dnNestedLocalConfigPath = Join-Path $dnNestedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $dnNestedLocalConfigPath,
+            (
+                "@{`r`n" +
+                "    '$dnNestedContainerPath' = @{`r`n" +
+                "        '$dnNestedLeaf' = `$true`r`n" +
+                "        '$dnNestedSiblingLeaf' = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $dnNestedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnNestedScenarioRoot
+        $dnNestedSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnNestedBaseline.Overrides
+        $dnNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $dnNestedSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $dnNestedBaseline.Overrides
+        $dnNestedSetting = @($dnNestedModel | Where-Object { $_.Path -eq $dnNestedPath })
+
+        # --- Configurator/DeniedNonCatalogNestedRecoveryRowDetected ---
+        Test-BRAVOCondition (
+            $dnNestedSetting.Count -eq 1 -and [bool]$dnNestedSetting[0].OverridePresent -and [bool]$dnNestedSetting[0].OverrideValue -eq $true
+        ) `
+            'Configurator/DeniedNonCatalogNestedRecoveryRowDetected' `
+            "вкладена форма ($dnNestedContainerPath = @{ $dnNestedLeaf=`$true; $dnNestedSiblingLeaf=`$true }) мусить так само синтезувати recovery-рядок для $dnNestedPath; отримано OverridePresent=$($dnNestedSetting[0].OverridePresent) Value=$($dnNestedSetting[0].OverrideValue)"
+
+        # --- Configurator/DeniedNonCatalogNestedClearPreservesSibling ---
+        $dnNestedCleared = Clear-BRAVOConfiguratorOverride -Model $dnNestedModel -Path $dnNestedPath
+        $dnNestedCleared = Update-BRAVOConfiguratorEffective -Model $dnNestedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $dnNestedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnNestedScenarioRoot -Model $dnNestedCleared -SchemaCatalog $dnNestedSessionCatalog -ProductionBaseline $dnNestedBaseline
+        $dnNestedFinalContent = if (Test-Path -LiteralPath $dnNestedLocalConfigPath) { Get-Content -LiteralPath $dnNestedLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$dnNestedApply.Applied -and [string]$dnNestedApply.Stage -eq 'Complete' -and
+            (-not $dnNestedFinalContent.Contains($dnNestedLeaf)) -and $dnNestedFinalContent.Contains($dnNestedSiblingPath)
+        ) `
+            'Configurator/DeniedNonCatalogNestedClearPreservesSibling' `
+            "Clear забороненого вкладеного $dnNestedPath мусить дозволити успішний Apply, контейнер розгортається у флет dot-шляхи, значення зникає, сусідній $dnNestedSiblingPath переживає; отримано Applied=$($dnNestedApply.Applied) Stage=$($dnNestedApply.Stage) Content=$dnNestedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $dnNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Не дублюється для шляху зі статичним дескриптором (BAZA.Mode) =====
+    $dnStaticScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DENIEDRECOVERY_STATICNODUP_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dnStaticScenarioRoot)
+    try {
+        $dnStaticLocalConfigPath = Join-Path $dnStaticScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $dnStaticLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $dnStaticBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnStaticScenarioRoot
+        $dnStaticSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnStaticBaseline.Overrides
+        $dnStaticMatches = @($dnStaticSessionCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+
+        # --- Configurator/DeniedRecoveryDoesNotDuplicateStaticDescriptor ---
+        Test-BRAVOCondition ($dnStaticMatches.Count -eq 1) `
+            'Configurator/DeniedRecoveryDoesNotDuplicateStaticDescriptor' `
+            "backupMonitoring.SFTP.BAZA.Mode вже має статичний Configurator-дескриптор (окремий ReadOnly-механізм) — augmented-каталог НЕ повинен додавати другий (синтезований) дескриптор для того самого Path; отримано Count=$($dnStaticMatches.Count)"
+    } finally {
+        Remove-Item -LiteralPath $dnStaticScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Escape hatch (requireAdministrator): вплив на синтез recovery-рядка =====
+    $dnEscOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $dnEscWithoutEnvCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'requireAdministrator' = $false }
+        $dnEscWithoutEnvRow = @($dnEscWithoutEnvCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
+
+        # --- Configurator/DeniedRecoverySynthesizedWithoutEscapeHatch ---
+        Test-BRAVOCondition (
+            $dnEscWithoutEnvRow.Count -eq 1 -and [string]$dnEscWithoutEnvRow[0].Section -eq 'DeniedOverride'
+        ) `
+            'Configurator/DeniedRecoverySynthesizedWithoutEscapeHatch' `
+            "БЕЗ BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator=`$false МУСИТЬ синтезувати DeniedOverride recovery-рядок (canonical loader його зараз відхиляє); отримано Count=$($dnEscWithoutEnvRow.Count)"
+
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $dnEscWithEnvCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'requireAdministrator' = $false }
+        $dnEscWithEnvRow = @($dnEscWithEnvCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
+
+        # --- Configurator/DeniedRecoveryNotSynthesizedWithEscapeHatchAllowed ---
+        Test-BRAVOCondition (
+            $dnEscWithEnvRow.Count -eq 0
+        ) `
+            'Configurator/DeniedRecoveryNotSynthesizedWithEscapeHatchAllowed' `
+            "З BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator=`$false МУСИТЬ бути прийнятий canonical loader-ом через наявний escape hatch — recovery-рядок НЕ повинен синтезуватись (це не фактично denied override); отримано Count=$($dnEscWithEnvRow.Count)"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnEscOriginalEnv)
+    }
+
+    # ===== Data-driven повнота: КОЖЕН non-catalog DENY_*-шлях отримує recovery-рядок =====
+    # Намірено НЕ хардкодить перелік 42 шляхів — множина похідна напряму
+    # з $dnAuthClass (canonical реєстр) мінус $dnRawCatalog (статичний
+    # каталог), той самий підхід, що Get-BRAVOConfiguratorSessionSchemaCatalog
+    # сам використовує внутрішньо. Це та сама перевірка, яку п'яте коло
+    # виконало для ValidatorRejected-множини — тепер симетрично для DENY_*.
+    $dnCompletenessOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $dnStaticPathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($d in $dnRawCatalog) { [void]$dnStaticPathSet.Add([string]$d.Path) }
+
+        $dnNonCatalogDenyPaths = @(
+            $dnAuthClass.Keys | Where-Object {
+                [string]$dnAuthClass[$_].Class -like 'DENY_*' -and (-not $dnStaticPathSet.Contains($_))
+            } | Sort-Object
+        )
+        Test-BRAVOCondition ($dnNonCatalogDenyPaths.Count -gt 0) `
+            'Configurator/NonCatalogDenyPathSetNonEmpty' `
+            "fixture-передумова: реєстр мусить мати щонайменше один DENY_*-шлях без статичного Configurator-дескриптора; отримано Count=$($dnNonCatalogDenyPaths.Count)"
+
+        $dnCompletenessOverrides = @{}
+        foreach ($p in $dnNonCatalogDenyPaths) { $dnCompletenessOverrides[$p] = 'selftest-denied-recovery-completeness-probe' }
+        $dnCompletenessCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnCompletenessOverrides
+        $dnCompletenessRecoveryPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($d in $dnCompletenessCatalog) {
+            if ($d -is [hashtable] -and [string]$d.Section -eq 'DeniedOverride') { [void]$dnCompletenessRecoveryPaths.Add([string]$d.Path) }
+        }
+        $dnCompletenessMissing = @($dnNonCatalogDenyPaths | Where-Object {
+            (-not $dnCompletenessRecoveryPaths.Contains($_)) -and
+            (-not (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $_ -AuthorizationClass $dnAuthClass))
+        })
+
+        # --- Configurator/AllRejectedNonCatalogSuppliedLeavesHaveRecoveryRows ---
+        Test-BRAVOCondition ($dnCompletenessMissing.Count -eq 0) `
+            'Configurator/AllRejectedNonCatalogSuppliedLeavesHaveRecoveryRows' `
+            "КОЖЕН non-catalog DENY_*-шлях (Count=$($dnNonCatalogDenyPaths.Count)) з supplied override і без escape hatch мусить отримати recovery-рядок; відсутні: $($dnCompletenessMissing -join ', ')"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnCompletenessOriginalEnv)
+    }
+}
+
+# =====================================================================
+# PR #224 review, шосте коло (P2, "IntegerRange overflow hardening"):
+# sftpPort МАЄ статичний Configurator-дескриптор (Storage/SFTP, Order 20)
+# — той самий "cataloged-лист з невалідним значенням" шлях, що п'яте
+# коло вже довело для BootRestoreMode (ConvertTo-BRAVOConfiguratorOverrideHashtable
+# виключає ValidatorRejected із preview-candidate замість того, щоб дати
+# canonical loader-у throw при КОЖНОМУ Apply/startup). Тут перевіряється,
+# що надто велике числове значення (раніше кидало OverflowException
+# всередині IntegerRange-валідатора) так само не кидає з Model/preview-
+# конвеєра Configurator-а — лише коректно виключається з preview-
+# candidate, лишаючись видимим у Model для виправлення/Clear.
+# =====================================================================
+& {
+    $irSftpPath = 'sftpPort'
+    $irSftpScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_INTEGERRANGE_OVERSIZED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($irSftpScenarioRoot)
+    try {
+        $irSftpLocalConfigPath = Join-Path $irSftpScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $irSftpLocalConfigPath,
+            (
+                "@{`r`n" +
+                "    '$irSftpPath' = 18446744073709551615`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $irSftpBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $irSftpScenarioRoot
+        $irSftpModelThrew = $false
+        $irSftpModel = $null
+        try {
+            $irSftpModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $irSftpBaseline.Overrides
+        } catch {
+            $irSftpModelThrew = $true
+        }
+        $irSftpSetting = @($(if ($irSftpModel) { $irSftpModel | Where-Object { $_.Path -eq $irSftpPath } }))
+
+        $irSftpPreviewThrew = $false
+        $irSftpPreview = $null
+        try {
+            $irSftpPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $irSftpModel
+        } catch {
+            $irSftpPreviewThrew = $true
+        }
+
+        # --- Configurator/OversizedCatalogIntegerOverridePreviewDoesNotThrow ---
+        Test-BRAVOCondition (
+            (-not $irSftpModelThrew) -and (-not $irSftpPreviewThrew) -and
+            $irSftpSetting.Count -eq 1 -and [bool]$irSftpSetting[0].OverridePresent -and
+            $null -ne $irSftpPreview -and (-not $irSftpPreview.Contains($irSftpPath))
+        ) `
+            'Configurator/OversizedCatalogIntegerOverridePreviewDoesNotThrow' `
+            "$irSftpPath=[uint64]::MaxValue МУСИТЬ лишитись у Model (OverridePresent=true) для виправлення/Clear, БЕЗ throw під час Model/preview-побудови, і бути виключеним із preview-candidate; отримано ModelThrew=$irSftpModelThrew PreviewThrew=$irSftpPreviewThrew SettingCount=$($irSftpSetting.Count) PreviewContains=$($(if ($irSftpPreview) { $irSftpPreview.Contains($irSftpPath) } else { 'N/A' }))"
+    } finally {
+        Remove-Item -LiteralPath $irSftpScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
 # PR #224 third review, R3-2/R3-3: Convert-BRAVOConfiguratorNestedContainerToFlatKeys
 # — explicit flat-key precedence під час flatten-on-touch (R3-2) і
 # fail-closed на порожньому вкладеному вузлі (R3-3).

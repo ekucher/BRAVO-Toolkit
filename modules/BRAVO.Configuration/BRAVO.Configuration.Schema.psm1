@@ -1049,8 +1049,12 @@ function Test-BRAVOConfigurationAuthorizationIntegerRange {
             Message = "${Path}: значення '$Value' має дробову частину — очікується ціле число (діапазон $Minimum..$Maximum)."
         }
     }
-    $intValue = [int64]$doubleValue
-    if ($intValue -lt $Minimum -or $intValue -gt $Maximum) {
+    # Порівняння як [double], НЕ звуження в [int64]: $Minimum/$Maximum —
+    # завжди [int] (обмежений діапазон), тож будь-яке структурно ціле
+    # $Value поза цим діапазоном (напр. [uint64]::MaxValue,
+    # [decimal]::MaxValue) коректно провалює цю перевірку ще ДО того, як
+    # звуження в [int64] могло б кинути OverflowException.
+    if ($doubleValue -lt [double]$Minimum -or $doubleValue -gt [double]$Maximum) {
         return [pscustomobject]@{
             IsValid = $false
             Message = "${Path}: значення '$Value' поза допустимим діапазоном $Minimum..$Maximum."

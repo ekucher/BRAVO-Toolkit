@@ -1697,6 +1697,96 @@
         -Name "Configuration/WindowsCodePageValidationDoesNotMutateOriginalValue" `
         -Failure "валідація НЕ повинна мутувати вхідне значення на місці; отримано '$($wcpMutationProbeOverrides['consoleSettings.OutputEncodingCodePage'])' замість очікуваного 0"
 
+    # =====================================================================
+    # PR #224 review, шосте коло (P2, "IntegerRange overflow hardening"):
+    # Test-BRAVOConfigurationAuthorizationIntegerRange РАНІШЕ звужувала
+    # [double]$Value у [int64] ПЕРЕД порівнянням з Minimum/Maximum — для
+    # структурно цілого, але надто великого значення (напр.
+    # [uint64]::MaxValue, [decimal]::MaxValue) це звуження кидало
+    # OverflowException, порушуючи контракт "завжди структурований
+    # IsValid/Message, ніколи throw". Фікс порівнює як [double] НАПРЯМУ
+    # (Minimum/Maximum завжди [int], тож жодне число поза їхнім діапазоном
+    # не потребує звуження в [int64] взагалі) — без clamp/truncate/coerce,
+    # без per-path спецкоду.
+    # =====================================================================
+
+    # --- Configuration/IntegerRangeMinimumBoundaryAccepted / MaximumBoundaryAccepted ---
+    $irMinResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 0 -Path 'selftest.probe.IntegerRange'
+    $irMaxResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 100 -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition ([bool]$irMinResult.IsValid -and [bool]$irMaxResult.IsValid) `
+        -Name "Configuration/IntegerRangeBoundaryValuesAccepted" `
+        -Failure "точні межі діапазону (Minimum=0, Maximum=100) мусять бути прийняті; отримано Min.IsValid=$($irMinResult.IsValid) Max.IsValid=$($irMaxResult.IsValid)"
+
+    # --- Configuration/IntegerRangeJustBelowMinimumRejected / JustAboveMaximumRejected ---
+    $irBelowResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value -1 -Path 'selftest.probe.IntegerRange'
+    $irAboveResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 101 -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$irBelowResult.IsValid) -and (-not [bool]$irAboveResult.IsValid)) `
+        -Name "Configuration/IntegerRangeJustOutsideBoundsRejected" `
+        -Failure "значення на 1 поза межами (Minimum-1=-1, Maximum+1=101) мусять бути відхилені; отримано Below.IsValid=$($irBelowResult.IsValid) Above.IsValid=$($irAboveResult.IsValid)"
+
+    # --- Configuration/IntegerRangeFractionInRangeRejected ---
+    $irFractionResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 50.5 -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$irFractionResult.IsValid) `
+        -Name "Configuration/IntegerRangeFractionInRangeRejected" `
+        -Failure "дробове значення в межах діапазону (50.5) мусить лишитись відхиленим — очікується ціле число; отримано IsValid=$($irFractionResult.IsValid)"
+
+    # --- Configuration/IntegerRangeNumericStringBoolNullRejected ---
+    $irStringResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value '50' -Path 'selftest.probe.IntegerRange'
+    $irBoolResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value $true -Path 'selftest.probe.IntegerRange'
+    $irNullResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value $null -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$irStringResult.IsValid) -and (-not [bool]$irBoolResult.IsValid) -and (-not [bool]$irNullResult.IsValid)) `
+        -Name "Configuration/IntegerRangeNumericStringBoolNullRejected" `
+        -Failure "рядок '50'/Boolean/`$null мусять лишитись відхиленими без коерсії; отримано String.IsValid=$($irStringResult.IsValid) Bool.IsValid=$($irBoolResult.IsValid) Null.IsValid=$($irNullResult.IsValid)"
+
+    # --- Configuration/IntegerRangeOversizedValuesRejectedWithoutOverflowException ---
+    # Основний регрес-тест: КОЖНЕ з цих значень раніше кидало
+    # OverflowException при звуженні [double] -> [int64]; тепер усі
+    # мусять повернути структурований IsValid=$false БЕЗ throw.
+    $irOversizedProbes = @(
+        @{ Label = 'Int64MaxValue'; Value = [int64]::MaxValue }
+        @{ Label = 'Int64MinValue'; Value = [int64]::MinValue }
+        @{ Label = 'UInt64MaxValue'; Value = [uint64]::MaxValue }
+        @{ Label = 'DecimalMaxValue'; Value = [decimal]::MaxValue }
+        @{ Label = 'LargeFractionalDouble'; Value = [double]1.7976931348623157E+300 }
+    )
+    $irOversizedThrew = New-Object System.Collections.Generic.List[string]
+    $irOversizedAcceptedWrongly = New-Object System.Collections.Generic.List[string]
+    foreach ($probe in $irOversizedProbes) {
+        try {
+            $irProbeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value $probe.Value -Path 'selftest.probe.IntegerRange'
+            if ([bool]$irProbeResult.IsValid) { [void]$irOversizedAcceptedWrongly.Add([string]$probe.Label) }
+        } catch {
+            [void]$irOversizedThrew.Add("$($probe.Label): $($_.Exception.Message)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($irOversizedThrew.Count -eq 0 -and $irOversizedAcceptedWrongly.Count -eq 0) `
+        -Name "Configuration/IntegerRangeOversizedValuesRejectedWithoutOverflowException" `
+        -Failure "структурно числові, але надто великі значення мусять повертати IsValid=`$false БЕЗ throw (жодного OverflowException від звуження [int64]); Threw=$([string]::Join(' | ', $irOversizedThrew)) AcceptedWrongly=$([string]::Join(', ', $irOversizedAcceptedWrongly))"
+
+    # --- Configuration/SftpPortOversizedValueRejectedNotException ---
+    # Наскрізна перевірка на РЕАЛЬНОМУ production-споживачі валідатора
+    # (sftpPort, IntegerRange:1,65535) — не лише на синтетичних межах.
+    $irSftpPortThrew = $false
+    $irSftpPortResult = $null
+    try {
+        $irSftpPortResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'sftpPort' = [uint64]::MaxValue } -Schema $authSchema
+    } catch {
+        $irSftpPortThrew = $true
+    }
+    $irSftpPortViolation = @($(if ($irSftpPortResult) { $irSftpPortResult.Violations | Where-Object { [string]$_.Path -eq 'sftpPort' } }))
+    Test-BRAVOCondition `
+        -Condition (
+            (-not $irSftpPortThrew) -and $null -ne $irSftpPortResult -and (-not [bool]$irSftpPortResult.IsValid) -and
+            $irSftpPortViolation.Count -eq 1 -and [string]$irSftpPortViolation[0].Reason -eq 'ValidatorRejected'
+        ) `
+        -Name "Configuration/SftpPortOversizedValueRejectedNotException" `
+        -Failure "sftpPort=[uint64]::MaxValue мусить повернутись як звичайне ValidatorRejected-порушення (canonical авторизація), НЕ як throw; отримано Threw=$irSftpPortThrew IsValid=$($irSftpPortResult.IsValid) ViolationCount=$($irSftpPortViolation.Count)"
+
     # --- Authorization/AllowSiteAccepted ---
     $authAllowSiteResult = Test-BRAVOConfigurationOverrideAuthorization `
         -DotPathOverrides @{ 'archiveRetentionDays' = 45 } `
