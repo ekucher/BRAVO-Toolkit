@@ -113,7 +113,7 @@
 
         # ===== Maintenance / 7-Zip =====
         @{ Path = 'maintenanceSettings.Archiver.CommandTimeoutSeconds'; Group = 'Maintenance'; Section = 'SevenZip'; Label = 'Таймаут 7-Zip команди (с)'; Description = ''; Type = 'Integer'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 10 }
-        @{ Path = 'maintenanceSettings.Logging.Level'; Group = 'Maintenance'; Section = 'SevenZip'; Label = 'Рівень логування обслуговування'; Description = ''; Type = 'Enum'; AllowedValues = @('TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'FATAL'); Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 20 }
+        @{ Path = 'maintenanceSettings.Logging.Level'; Group = 'Maintenance'; Section = 'SevenZip'; Label = 'Рівень логування обслуговування'; Description = ''; Type = 'Enum'; AllowedValues = @('DEBUG', 'INFO', 'WARNING', 'ERROR', 'SUCCESS'); Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 20 }
 
         # ===== Components (componentSettings) — фаза 1 =====
         @{ Path = 'componentSettings.Archive.MODEL'; Group = 'Components'; Section = 'Archive'; Label = 'Архівація MODEL'; Description = ''; Type = 'Boolean'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }

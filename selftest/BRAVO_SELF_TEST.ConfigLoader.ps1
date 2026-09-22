@@ -298,6 +298,63 @@ try {
         -Name "Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException" `
         -Failure "sftpPort=[uint64]::MaxValue мусить fail-closed зупинити завантаження КЕРОВАНИМ throw ('неавторизоване перевизначення'), БЕЗ OverflowException; отримано: '$localCfgSftpPortProbeLast'"
 
+    # --- Loader/MaintenanceLoggingSuccessLoadsSuccessfully (PR #224 review,
+    # шосте коло, P2 "Restrict maintenance log levels to runtime-supported
+    # values"): SUCCESS — runtime-підтримуваний рівень (Maintenance
+    # startup-gate), мусить проходити реальний Import-BravoConfiguration
+    # без throw.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'maintenanceSettings.Logging.Level' = 'SUCCESS'`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgMlSuccessProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'NOTHREW:' + [string]`$global:maintenanceSettings.Logging.Level " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgMlSuccessProbeLast = ([string](@($localCfgMlSuccessProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgMlSuccessProbeLast -eq 'NOTHREW:SUCCESS') `
+        -Name "Loader/MaintenanceLoggingSuccessLoadsSuccessfully" `
+        -Failure "maintenanceSettings.Logging.Level='SUCCESS' мусить проходити реальний Import-BravoConfiguration без throw; отримано: '$localCfgMlSuccessProbeLast'"
+
+    # --- Loader/MaintenanceLoggingTraceRejectedByCanonicalAuthorization /
+    # Loader/MaintenanceLoggingFatalRejectedByCanonicalAuthorization ---
+    # TRACE/FATAL мусять бути відхилені canonical авторизацією НА ЕТАПІ
+    # завантаження конфігурації — керованим throw ('неавторизоване
+    # перевизначення'), а НЕ пропущені далі до того, як Maintenance
+    # startup-gate сам впаде з непрозорим exit 30.
+    foreach ($mlUnsupported in @('TRACE', 'FATAL')) {
+        [IO.File]::WriteAllText($localCfgOverridePath, (
+            "@{`r`n" +
+            "    'maintenanceSettings.Logging.Level' = '$mlUnsupported'`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding $false))
+        $localCfgMlUnsupportedProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                "Set-StrictMode -Version 2.0; " +
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+                "'UNEXPECTED-NOTHREW' " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+            ) 2>&1
+        $localCfgMlUnsupportedProbeLast = ([string](@($localCfgMlUnsupportedProbe)[-1])).Trim()
+        Test-BRAVOCondition `
+            -Condition (
+                $localCfgMlUnsupportedProbeLast.StartsWith('CHILD-ERROR:') -and
+                $localCfgMlUnsupportedProbeLast.Contains('BRAVO.local.config: неавторизоване перевизначення') -and
+                $localCfgMlUnsupportedProbeLast.Contains('maintenanceSettings.Logging.Level')
+            ) `
+            -Name "Loader/MaintenanceLogging$($mlUnsupported.Substring(0,1) + $mlUnsupported.Substring(1).ToLowerInvariant())RejectedByCanonicalAuthorization" `
+            -Failure "maintenanceSettings.Logging.Level='$mlUnsupported' мусить бути відхилений canonical авторизацією ПІД ЧАС завантаження конфігурації (не пропущений до Maintenance startup-gate); отримано: '$localCfgMlUnsupportedProbeLast'"
+    }
+
     # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",

@@ -736,7 +736,20 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'maintenanceSettings.Limits.MaximumMdFileSizeGB' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Limits.MdFileSizeExclusions' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Limits.MinimumFreeSpaceGB' = @{ Class = 'ALLOW_SITE' }
-    'maintenanceSettings.Logging.Level' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    # Issue #216, шосте коло ревю ("Restrict maintenance log levels to
+    # runtime-supported values"): канонічний реєстр РАНІШЕ дозволяв
+    # TRACE/FATAL, хоча Maintenance startup-gate
+    # (modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1, ~рядок
+    # 608) приймає ЛИШЕ DEBUG/INFO/WARNING/ERROR/SUCCESS і завершується з
+    # exit 30 для будь-якого іншого значення — операторський override з
+    # TRACE/FATAL проходив би canonical авторизацію (ValidatorRejected
+    # НІКОЛИ не спрацював би), а потім ламав би Maintenance startup
+    # непрозорим exit-кодом замість зрозумілого відхилення на етапі
+    # завантаження конфігурації. Enum звужено до фактично підтримуваного
+    # runtime-набору; TRACE/FATAL лишаються легітимними severity-назвами
+    # ІНШИХ, окремих контрактів (consoleSettings.ConsoleLevel/FileLevel,
+    # defaultLogLevel) — тут звужується ЛИШЕ цей конкретний лист.
+    'maintenanceSettings.Logging.Level' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:DEBUG,INFO,WARNING,ERROR,SUCCESS' }
     'maintenanceSettings.RangeIdMonitoring.CheckDelaySeconds' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.RangeIdMonitoring.Enabled' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.RangeIdMonitoring.ThresholdPercent' = @{ Class = 'ALLOW_SITE' }

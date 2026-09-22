@@ -1981,6 +1981,93 @@
         -Name "Authorization/OtherEnumLeavesRemainUntrimmedByDefault" `
         -Failure "maintenanceSettings.Logging.Level НЕ має доказу trim-tolerance — з пробілами мусить відхилятись (IsValid=$($authOtherEnumWhitespaceResult.IsValid)), точне значення мусить і далі прийматись (IsValid=$($authOtherEnumExactResult.IsValid))"
 
+    # =====================================================================
+    # PR #224 review, шосте коло (P2, "Restrict maintenance log levels to
+    # runtime-supported values"): канонічний реєстр РАНІШЕ дозволяв
+    # TRACE/FATAL для maintenanceSettings.Logging.Level, але Maintenance
+    # startup-gate (modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1,
+    # ~рядок 608, $script:LogLevel -notin @("DEBUG","INFO","WARNING","ERROR","SUCCESS"))
+    # відхиляє ЦІ значення з exit 30 — оператор міг пройти canonical
+    # авторизацію з TRACE/FATAL, а зламати Maintenance ЛИШЕ на реальному
+    # запуску. Enum звужено до фактично підтримуваного runtime-набору;
+    # ЦЕ НЕ EnumTrimmed-зміна (whitespace-межа з блоку вище лишається
+    # незміненою) і не стосується consoleSettings.ConsoleLevel/FileLevel/
+    # defaultLogLevel (окремі, вже доведені контракти, де TRACE/FATAL
+    # лишаються легітимними).
+    # =====================================================================
+    $mlSupportedValues = @('DEBUG', 'INFO', 'WARNING', 'ERROR', 'SUCCESS')
+    $mlUnsupportedValues = @('TRACE', 'FATAL')
+
+    # --- Configuration/MaintenanceLogging<Level>Accepted (data-driven) ---
+    $mlAcceptedFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($lvl in $mlSupportedValues) {
+        $mlResult = Test-BRAVOConfigurationOverrideAuthorization `
+            -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = $lvl } `
+            -Schema $authSchema
+        if (-not [bool]$mlResult.IsValid) { [void]$mlAcceptedFailures.Add("$lvl (IsValid=$($mlResult.IsValid))") }
+    }
+    Test-BRAVOCondition `
+        -Condition ($mlAcceptedFailures.Count -eq 0) `
+        -Name "Configuration/MaintenanceLoggingRuntimeSupportedValuesAccepted" `
+        -Failure "усі runtime-підтримувані рівні (DEBUG/INFO/WARNING/ERROR/SUCCESS) мусять бути прийняті canonical авторизацією для maintenanceSettings.Logging.Level; відхилено: $($mlAcceptedFailures -join ', ')"
+
+    # --- Configuration/MaintenanceLogging<Level>Rejected (TRACE/FATAL) ---
+    $mlRejectedFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($lvl in $mlUnsupportedValues) {
+        $mlResult = Test-BRAVOConfigurationOverrideAuthorization `
+            -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = $lvl } `
+            -Schema $authSchema
+        if ([bool]$mlResult.IsValid) {
+            [void]$mlRejectedFailures.Add("$lvl (IsValid=$($mlResult.IsValid))")
+        } else {
+            $mlViolation = @($mlResult.Violations | Where-Object { [string]$_.Path -eq 'maintenanceSettings.Logging.Level' })
+            if ($mlViolation.Count -ne 1 -or [string]$mlViolation[0].Reason -ne 'ValidatorRejected' -or [string]$mlViolation[0].Class -ne 'ALLOW_WITH_VALIDATOR') {
+                [void]$mlRejectedFailures.Add("$lvl (unexpected violation shape: Count=$($mlViolation.Count) Reason=$($(if ($mlViolation.Count) { $mlViolation[0].Reason } else { 'N/A' })) Class=$($(if ($mlViolation.Count) { $mlViolation[0].Class } else { 'N/A' })))")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($mlRejectedFailures.Count -eq 0) `
+        -Name "Configuration/MaintenanceLoggingRuntimeUnsupportedValuesRejected" `
+        -Failure "TRACE/FATAL мусять бути відхилені (Reason=ValidatorRejected, Class=ALLOW_WITH_VALIDATOR) для maintenanceSettings.Logging.Level — Maintenance startup-gate їх не підтримує; порушення: $($mlRejectedFailures -join ', ')"
+
+    # --- Configuration/MaintenanceLoggingCaseInsensitive ---
+    $mlCaseResults = @(
+        Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'warning' } -Schema $authSchema
+        Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'Warning' } -Schema $authSchema
+        Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'WARNING' } -Schema $authSchema
+    )
+    Test-BRAVOCondition `
+        -Condition (@($mlCaseResults | ForEach-Object { [bool]$_.IsValid }) -notcontains $false) `
+        -Name "Configuration/MaintenanceLoggingCaseInsensitive" `
+        -Failure "canonical Enum-порівняння лишається регістронезалежним для maintenanceSettings.Logging.Level ('warning'/'Warning'/'WARNING' мусять усі бути прийняті); отримано IsValid=$(@($mlCaseResults | ForEach-Object { [bool]$_.IsValid }) -join ',')"
+
+    # --- Configuration/MaintenanceLoggingWhitespaceStillRejected ---
+    # Дублює Authorization/OtherEnumLeavesRemainUntrimmedByDefault намірено
+    # під іменем, прив'язаним до цього конкретного ревю-раунду — ця
+    # ремедіація змінює МНОЖИНУ допустимих значень, не whitespace-семантику.
+    $mlWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = ' WARNING ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$mlWhitespaceResult.IsValid) `
+        -Name "Configuration/MaintenanceLoggingWhitespaceStillRejected" `
+        -Failure "' WARNING ' (з пробілами) мусить і далі відхилятись — ця ремедіація НЕ робить лист EnumTrimmed; отримано IsValid=$($mlWhitespaceResult.IsValid)"
+
+    # --- Configuration/MaintenanceLoggingConfiguratorAllowedValuesMatchRuntimeContract ---
+    if (-not (Get-Module -Name 'BRAVO.Configurator.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Schema.psd1') -Force
+    }
+    $mlCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $mlDescriptor = @($mlCatalog | Where-Object { $_.Path -eq 'maintenanceSettings.Logging.Level' })
+    $mlDescriptorAllowedSorted = if ($mlDescriptor.Count -eq 1) { @($mlDescriptor[0].AllowedValues | Sort-Object) } else { @() }
+    $mlSupportedSorted = @($mlSupportedValues | Sort-Object)
+    $mlAllowedDelta = Compare-Object -ReferenceObject $mlSupportedSorted -DifferenceObject $mlDescriptorAllowedSorted
+    Test-BRAVOCondition `
+        -Condition ($mlDescriptor.Count -eq 1 -and (-not $mlAllowedDelta)) `
+        -Name "Configuration/MaintenanceLoggingConfiguratorAllowedValuesMatchRuntimeContract" `
+        -Failure "Configurator-дескриптор maintenanceSettings.Logging.Level мусить рекламувати ТОЧНО DEBUG/INFO/WARNING/ERROR/SUCCESS (без TRACE/FATAL); отримано DescriptorCount=$($mlDescriptor.Count) AllowedValues=$($mlDescriptorAllowedSorted -join ',')"
+
     # --- Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths ---
     Test-BRAVOCondition `
         -Condition (
