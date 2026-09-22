@@ -1903,6 +1903,85 @@
         -Name "Preview/ConsoleLevelValidationDoesNotMutateOriginalValue" `
         -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне ConsoleLevel-значення на місці; отримано '$($r35ConsoleLevelMutationProbeOverrides['consoleSettings.ConsoleLevel'])' замість очікуваного '$r35ConsoleLevelMutationProbeValue'"
 
+    # =====================================================================
+    # PR #224 review, четвертий раунд (P2, "Preserve trimming for
+    # defaultLogLevel"): Write-Log (modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1)
+    # використовує $defaultLogLevel як default для параметра $Level і сам
+    # нормалізує через `$Level.Trim().ToUpperInvariant()` ПЕРЕД
+    # порівнянням з переліком рівнів — та сама доведена pre-Wave-2
+    # tolerance-семантика, що NotificationMode/NotificationProvider/
+    # ConsoleLevel/FileLevel вище. Раніше цей лист лишався на звичайному
+    # 'Enum:' (без trim) — startup-регресія для існуючих
+    # ' ERROR '-подібних значень.
+    # =====================================================================
+
+    # --- Configuration/DefaultLogLevelValidatorIsTrimmed ---
+    Test-BRAVOCondition `
+        -Condition (([string]$authRegistry['defaultLogLevel'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) `
+        -Name "Configuration/DefaultLogLevelValidatorIsTrimmed" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' для defaultLogLevel; отримано $($authRegistry['defaultLogLevel'].Validator)"
+
+    # --- Configuration/DefaultLogLevelTrimmedAccepted (B1/B2) ---
+    $defaultLogLevelErrorWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' ERROR ' } `
+        -Schema $authSchema
+    $defaultLogLevelInfoWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' INFO ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$defaultLogLevelErrorWhitespaceResult.IsValid -and [bool]$defaultLogLevelInfoWhitespaceResult.IsValid) `
+        -Name "Configuration/DefaultLogLevelTrimmedAccepted" `
+        -Failure "defaultLogLevel=' ERROR '/' INFO ' мусять бути прийняті (доведена trim-tolerance Write-Log); отримано ERROR.IsValid=$($defaultLogLevelErrorWhitespaceResult.IsValid) INFO.IsValid=$($defaultLogLevelInfoWhitespaceResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelWhitespaceAndCaseBothTolerated (B3) ---
+    # Write-Log сам робить .Trim().ToUpperInvariant(), а
+    # Test-BRAVOConfigurationAuthorizationEnumValue завжди порівнює
+    # case-insensitive (не лише для EnumTrimmed) — реальна runtime-
+    # семантика й авторизація мусять узгоджуватись для мішаного case.
+    $defaultLogLevelLowerWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' warning ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$defaultLogLevelLowerWhitespaceResult.IsValid) `
+        -Name "Configuration/DefaultLogLevelWhitespaceAndCaseBothTolerated" `
+        -Failure "defaultLogLevel=' warning ' (пробіли + нижній регістр) мусить бути прийнятий (той самий .Trim().ToUpperInvariant(), що Write-Log); отримано IsValid=$($defaultLogLevelLowerWhitespaceResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelInvalidRejected (B4/B5) ---
+    $defaultLogLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = 'BOGUS' } `
+        -Schema $authSchema
+    $defaultLogLevelInvalidWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' BOGUS ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$defaultLogLevelInvalidResult.IsValid) -and (-not [bool]$defaultLogLevelInvalidWhitespaceResult.IsValid)) `
+        -Name "Configuration/DefaultLogLevelInvalidRejected" `
+        -Failure "trim не повинен послаблювати перелік дозволених значень — 'BOGUS'/' BOGUS ' мусять лишитись відхиленими; отримано Exact.IsValid=$($defaultLogLevelInvalidResult.IsValid) Whitespace.IsValid=$($defaultLogLevelInvalidWhitespaceResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelNonStringRejected (B6) ---
+    $defaultLogLevelIntResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = 5 } `
+        -Schema $authSchema
+    $defaultLogLevelBoolResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = $true } `
+        -Schema $authSchema
+    $defaultLogLevelNullResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = $null } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$defaultLogLevelIntResult.IsValid) -and (-not [bool]$defaultLogLevelBoolResult.IsValid) -and (-not [bool]$defaultLogLevelNullResult.IsValid)) `
+        -Name "Configuration/DefaultLogLevelNonStringRejected" `
+        -Failure "не-рядкове/`$null значення мусить лишитись відхиленим навіть для EnumTrimmed-валідатора; отримано Int.IsValid=$($defaultLogLevelIntResult.IsValid) Bool.IsValid=$($defaultLogLevelBoolResult.IsValid) Null.IsValid=$($defaultLogLevelNullResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelValidationDoesNotMutateOriginalValue (B7) ---
+    $defaultLogLevelMutationProbeValue = ' Error '
+    $defaultLogLevelMutationProbeOverrides = @{ 'defaultLogLevel' = $defaultLogLevelMutationProbeValue }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $defaultLogLevelMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$defaultLogLevelMutationProbeOverrides['defaultLogLevel'] -eq $defaultLogLevelMutationProbeValue) `
+        -Name "Configuration/DefaultLogLevelValidationDoesNotMutateOriginalValue" `
+        -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне defaultLogLevel-значення на місці; отримано '$($defaultLogLevelMutationProbeOverrides['defaultLogLevel'])' замість очікуваного '$defaultLogLevelMutationProbeValue'"
+
     # --- Authorization/RobocopyExitCodeBoundaryMatrix ---
     # Owner-decision test matrix (WAVE2-CONTRACT.md, розділ 11.0/11.6): 0/7
     # accepted; 8/-1/7.5/'7' rejected. Рядок '7' НЕ повинен коерситись у

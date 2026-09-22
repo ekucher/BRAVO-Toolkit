@@ -590,10 +590,10 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'bravoSettings.ArchivePrefix' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.InstitutionCode' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.InstitutionName' = @{ Class = 'ALLOW_SITE' }
-    # PR #224 review, F3 + R3-5: EnumTrimmed (не Enum) — 4 з 18
-    # enum-валідованих ALLOW_WITH_VALIDATOR-листів, для яких знайдено
-    # ДОКАЗ pre-Wave-2 tolerance до пробілів у РЕАЛЬНОМУ runtime-
-    # споживачі:
+    # PR #224 review, F3 + R3-5 + P2 (defaultLogLevel): EnumTrimmed (не
+    # Enum) — 5 з 18 enum-валідованих ALLOW_WITH_VALIDATOR-листів, для
+    # яких знайдено ДОКАЗ pre-Wave-2 tolerance до пробілів у РЕАЛЬНОМУ
+    # runtime-споживачі:
     #   - NotificationMode/NotificationProvider (F3): усі runtime-
     #     споживачі (BRAVO_DRY_RUN.ps1 x4, BRAVO_NOTIFICATION_TEST.ps1,
     #     BRAVO_RESTORE_TEST.ps1) уже викликають
@@ -609,14 +609,19 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     #     consumed by Write-BRAVOLog), а не звичайну прямо порівнювану
     #     Enum-семантику. Wave 2 не мав ставати першим випадком, коли
     #     ' ERROR '/' INFO ' (історично прийнятні цими двома листами)
-    #     перетворюються на startup-помилку.
-    # Решта 14 enum-листів (defaultLogLevel/LogLevel/BootRestoreMode/
-    # robocopyWindowStyle/MultipleInstances/WeeklyOn/
-    # backupConsistency.*/NotificationRouting.*/maintenanceSettings.Logging.Level/
-    # schedulerSettings.WindowStyle) НЕ мають такого доказу в жодній
-    # точці споживання — лишаються на звичайному 'Enum:' (без trim), щоб
-    # не послаблювати авторизацію без підстави для листів, чия семантика
-    # не перевірена.
+    #     перетворюються на startup-помилку;
+    #   - defaultLogLevel (PR #224 review, четвертий раунд): Write-Log
+    #     (modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1) використовує
+    #     $defaultLogLevel як default для параметра $Level і сам
+    #     нормалізує через `$Level.Trim().ToUpperInvariant()` перед
+    #     порівнянням з тим самим переліком рівнів — та сама доведена
+    #     tolerance-семантика, що й вище.
+    # Решта 13 enum-листів (LogLevel/BootRestoreMode/robocopyWindowStyle/
+    # MultipleInstances/WeeklyOn/backupConsistency.*/NotificationRouting.*/
+    # maintenanceSettings.Logging.Level/schedulerSettings.WindowStyle) НЕ
+    # мають такого доказу в жодній точці споживання — лишаються на
+    # звичайному 'Enum:' (без trim), щоб не послаблювати авторизацію без
+    # підстави для листів, чия семантика не перевірена.
     'bravoSettings.NotificationMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:none,errors_only,all' }
     'bravoSettings.NotificationProvider' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:discord,slack' }
     'bravoSettings.NotificationRequestTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
@@ -660,7 +665,15 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'credentialSettings.Targets.SlackWebhookGeneral' = @{ Class = 'ALLOW_SITE' }
     'credentialSettings.Targets.SMBLogin' = @{ Class = 'ALLOW_SITE' }
     'credentialSettings.Targets.SMBPassword' = @{ Class = 'ALLOW_SITE' }
-    'defaultLogLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    # PR #224 review (P2, "Preserve trimming for defaultLogLevel"):
+    # EnumTrimmed (не Enum) — той самий доведений pre-Wave-2 tolerance, що
+    # ConsoleLevel/FileLevel вище: Write-Log (BRAVO.Archive.Runtime.ps1)
+    # використовує defaultLogLevel як default для $Level і сам нормалізує
+    # через $Level.Trim().ToUpperInvariant() перед enum-порівнянням —
+    # значення з пробілами навколо (' ERROR ') раніше приймались і
+    # коректно оброблялись рантаймом, exact-match Enum: тут хибно
+    # відхиляв би всю конфігурацію.
+    'defaultLogLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
     'discoverySettings.BravoIniPath' = @{ Class = 'ALLOW_SITE' }
     'discoverySettings.BravoRoot' = @{ Class = 'ALLOW_SITE' }
     'discoverySettings.Sources.BACKUP_ROOT' = @{ Class = 'ALLOW_SITE' }

@@ -939,6 +939,110 @@ Test-BRAVOCondition (
     'Configurator Dirty: масив з іншим порядком елементів проти baseline -> true' `
     "ArrayCount=$($dirtyArrayReversedList.Count) Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelArrayReordered -BaselineOverrides $dirtyBaselineWithArray)"
 
+# ===== PR #224 review (P2, "Resolve nested baselines in dirty checks") —
+# Test-BRAVOConfiguratorModelDirty тепер читає baseline через канонічний
+# Resolve-BRAVOConfiguratorSuppliedLeafOverride (замість прямого
+# $BaselineOverrides.Contains($setting.Path)), тому вкладена (Node)
+# baseline-форма розпізнається так само, як і плоска. =====
+
+$nestedDirtyContainerPath = 'bravoSettings.NotificationRouting'
+$nestedDirtySuccessPath = 'bravoSettings.NotificationRouting.SUCCESS'
+$nestedDirtyWarningPath = 'bravoSettings.NotificationRouting.WARNING'
+
+# A1 / Configurator/NestedBaselineUntouchedIsNotDirty: baseline supplied у
+# вкладеній Node-формі, модель побудована з неї й НЕ торкана -> false
+# (пряме відтворення review-знахідки: раніше Contains($setting.Path)
+# завжди повертав $false для цього baseline і звітував dirty=true).
+$nestedDirtyBaseline = @{ $nestedDirtyContainerPath = @{ SUCCESS = 'alerts'; WARNING = 'general' } }
+$nestedDirtyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyBaseline
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModel -BaselineOverrides $nestedDirtyBaseline)) `
+    'Configurator/NestedBaselineUntouchedIsNotDirty: вкладена (Node) baseline, модель нею ж побудована й не торкана -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModel -BaselineOverrides $nestedDirtyBaseline)"
+
+# A2 / Configurator/NestedBaselineChangedIsDirty: змінити один вкладений
+# leaf -> true.
+$nestedDirtyModelChanged = Set-BRAVOConfiguratorOverride -Model $nestedDirtyModel -Path $nestedDirtySuccessPath -Value 'general'
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelChanged -BaselineOverrides $nestedDirtyBaseline) `
+    'Configurator/NestedBaselineChangedIsDirty: зміна одного вкладеного leaf проти вкладеного baseline -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelChanged -BaselineOverrides $nestedDirtyBaseline)"
+
+# A3 / Configurator/NestedBaselineRevertedIsNotDirty: змінити, потім
+# повернути значення назад до baseline ('alerts') -> false. Свідомо НЕ
+# покладається на подієвий Model[].Dirty (лишався б true).
+$nestedDirtyModelReverted = Set-BRAVOConfiguratorOverride -Model $nestedDirtyModelChanged -Path $nestedDirtySuccessPath -Value 'alerts'
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelReverted -BaselineOverrides $nestedDirtyBaseline)) `
+    'Configurator/NestedBaselineRevertedIsNotDirty: вкладений leaf змінено, потім повернуто до baseline-значення -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelReverted -BaselineOverrides $nestedDirtyBaseline)"
+
+# A4 / Configurator/NestedBaselineClearIsDirty: вкладений baseline-leaf
+# існував, Clear прибирає його -> true (presence-diff значущий).
+$nestedDirtyModelCleared = Clear-BRAVOConfiguratorOverride -Model $nestedDirtyModel -Path $nestedDirtySuccessPath
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelCleared -BaselineOverrides $nestedDirtyBaseline) `
+    'Configurator/NestedBaselineClearIsDirty: вкладений baseline-leaf прибрано через Clear -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelCleared -BaselineOverrides $nestedDirtyBaseline)"
+
+# A5 / Configurator/NestedBaselineFalseLikeValuePresence: вкладений
+# boolean-leaf з "falsy" значенням $false МАЄ трактуватись як present,
+# не як absent (та сама "false override != absent override" семантика,
+# що AI-тест вище, але тепер через вкладену Node-форму, 2 рівні
+# вкладеності: 'componentSettings' -> 'SFTP' -> 'ArchiveUpload').
+$nestedDirtyBooleanPath = 'componentSettings.SFTP.ArchiveUpload'
+$nestedDirtyBooleanBaseline = @{ componentSettings = @{ SFTP = @{ ArchiveUpload = $false } } }
+$nestedDirtyBooleanModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyBooleanBaseline
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanModel -BaselineOverrides $nestedDirtyBooleanBaseline)) `
+    'Configurator/NestedBaselineFalseLikeValuePresence: вкладений override=false, модель побудована з нього -> false (присутній, не absent)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanModel -BaselineOverrides $nestedDirtyBooleanBaseline)"
+$nestedDirtyBooleanCleared = Clear-BRAVOConfiguratorOverride -Model $nestedDirtyBooleanModel -Path $nestedDirtyBooleanPath
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanCleared -BaselineOverrides $nestedDirtyBooleanBaseline) `
+    'Configurator/NestedBaselineFalseLikeValuePresence: Clear вкладеного false-override -> true (presence, не value, змінився)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanCleared -BaselineOverrides $nestedDirtyBooleanBaseline)"
+
+# A6 / Configurator/NestedBaselineFlatPrecedence: baseline містить ОБИДВІ
+# представлення одночасно (флат + вкладена, флат МАЄ пріоритет —
+# Resolve-BRAVOConfiguratorSuppliedLeafOverride та сама D3/F1-межа, що й
+# canonical model-load). Untouched модель, побудована з ТОГО САМОГО
+# baseline, повинна лишатись чистою — dirty-check не має розходитись із
+# model-load precedence-семантикою.
+$nestedDirtyMixedBaseline = @{
+    $nestedDirtySuccessPath = 'alerts'
+    $nestedDirtyContainerPath = @{ SUCCESS = 'general'; WARNING = 'alerts' }
+}
+$nestedDirtyMixedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyMixedBaseline
+$nestedDirtyMixedSuccessRow = @($nestedDirtyMixedModel | Where-Object { $_.Path -eq $nestedDirtySuccessPath })[0]
+Test-BRAVOCondition ([string]$nestedDirtyMixedSuccessRow.OverrideValue -eq 'alerts') `
+    'Configurator/NestedBaselineFlatPrecedence: model-load сам обирає флат-значення (alerts) при мішаному baseline' `
+    "OverrideValue=$($nestedDirtyMixedSuccessRow.OverrideValue)"
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyMixedModel -BaselineOverrides $nestedDirtyMixedBaseline)) `
+    'Configurator/NestedBaselineFlatPrecedence: untouched модель проти мішаного (флат+вкладений) baseline -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyMixedModel -BaselineOverrides $nestedDirtyMixedBaseline)"
+
+# A7: глибша вкладеність (2 сегменти під TopLevelKey замість 1) —
+# 'componentSettings' -> 'SFTP' -> 'ArchiveUpload', НЕ 'componentSettings.SFTP' -> 'ArchiveUpload'.
+$nestedDirtyDeepBaseline = @{ componentSettings = @{ SFTP = @{ ArchiveUpload = $true } } }
+$nestedDirtyDeepModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyDeepBaseline
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModel -BaselineOverrides $nestedDirtyDeepBaseline)) `
+    'Configurator/NestedBaselineDeepSegments: 2-сегментна вкладеність (componentSettings.SFTP.ArchiveUpload), untouched -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModel -BaselineOverrides $nestedDirtyDeepBaseline)"
+$nestedDirtyDeepModelChanged = Set-BRAVOConfiguratorOverride -Model $nestedDirtyDeepModel -Path $nestedDirtyBooleanPath -Value $false
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModelChanged -BaselineOverrides $nestedDirtyDeepBaseline) `
+    'Configurator/NestedBaselineDeepSegments: 2-сегментна вкладеність, значення змінено -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModelChanged -BaselineOverrides $nestedDirtyDeepBaseline)"
+
+# Non-mutation guard (§4 задачі): Test-BRAVOConfiguratorModelDirty
+# лишається read-only — не мутує ні $BaselineOverrides (включно з
+# вкладеними hashtable-значеннями), ні $Model.
+$nestedDirtyGuardBaselineBefore = ConvertTo-Json -InputObject $nestedDirtyMixedBaseline -Depth 10 -Compress
+$nestedDirtyGuardModelBefore = ConvertTo-Json -InputObject $nestedDirtyMixedModel -Depth 10 -Compress
+[void](Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyMixedModel -BaselineOverrides $nestedDirtyMixedBaseline)
+$nestedDirtyGuardBaselineAfter = ConvertTo-Json -InputObject $nestedDirtyMixedBaseline -Depth 10 -Compress
+$nestedDirtyGuardModelAfter = ConvertTo-Json -InputObject $nestedDirtyMixedModel -Depth 10 -Compress
+Test-BRAVOCondition (
+    ($nestedDirtyGuardBaselineBefore -eq $nestedDirtyGuardBaselineAfter) -and
+    ($nestedDirtyGuardModelBefore -eq $nestedDirtyGuardModelAfter)
+) `
+    'Configurator/NestedBaselineDirtyCheckIsReadOnly: Test-BRAVOConfiguratorModelDirty не мутує ні BaselineOverrides, ні Model' `
+    "BaselineUnchanged=$($nestedDirtyGuardBaselineBefore -eq $nestedDirtyGuardBaselineAfter) ModelUnchanged=$($nestedDirtyGuardModelBefore -eq $nestedDirtyGuardModelAfter)"
+
 # AK: Reset-BRAVOConfiguratorSetting — еквівалентний Clear (Boolean повертається
 # до Default, а не матеріалізується як False).
 $dirtyModelForResetSetting = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyBooleanPath -Value $false

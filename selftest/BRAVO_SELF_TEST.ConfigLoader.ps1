@@ -210,6 +210,33 @@ try {
         -Name "ConfigLoader/NestedNodeOverrideReachesMergeAndAppliesPerLeaf" `
         -Failure "вкладений (hashtable-значення) Node-override bravoSettings.NotificationRouting мусить пройти авторизацію по кожному дочірньому листу окремо й дійти до merge/global стану; отримано: '$localCfgNestedProbeLast'"
 
+    # --- Loader/DefaultLogLevelWhitespaceCompatibility (PR #224 review,
+    # четвертий раунд, P2 "Preserve trimming for defaultLogLevel"):
+    # defaultLogLevel=' ERROR ' (пробіли навколо) мусить пройти весь
+    # loader-конвеєр БЕЗ throw — доведена pre-Wave-2 tolerance, бо
+    # Write-Log сам робить .Trim().ToUpperInvariant() перед використанням
+    # значення. Регресія перевіряється через реальний Import-BravoConfiguration
+    # (не лише ізольований виклик валідатора вище).
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'defaultLogLevel' = ' ERROR '`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgDefaultLogLevelProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'NOTHREW:' + [string]`$global:defaultLogLevel " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgDefaultLogLevelProbeLast = ([string](@($localCfgDefaultLogLevelProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgDefaultLogLevelProbeLast -eq 'NOTHREW: ERROR') `
+        -Name "Loader/DefaultLogLevelWhitespaceCompatibility" `
+        -Failure "defaultLogLevel=' ERROR ' (з пробілами) мусить проходити реальний Import-BravoConfiguration без throw і без мутації сирого значення; отримано: '$localCfgDefaultLogLevelProbeLast'"
+
     # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",

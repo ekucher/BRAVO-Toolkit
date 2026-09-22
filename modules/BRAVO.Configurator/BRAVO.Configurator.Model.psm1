@@ -639,6 +639,19 @@ function Test-BRAVOConfiguratorModelDirty {
         Обчислені/непersisted поля моделі (EffectiveValue, EffectiveSource,
         ValidationState, DependencyState, DisabledReason) свідомо НЕ
         враховуються — вони не є частиною BRAVO.local.config.
+
+        PR #224 review (P2, "Resolve nested baselines in dirty checks"):
+        baseline presence/value РАНІШЕ читались напряму через
+        $BaselineOverrides.Contains($setting.Path) — розуміє лише плаский
+        dot-шлях. Якщо той самий baseline supplied у вкладеній Node-формі
+        ('backupMonitoring.SFTP.BAZA' = @{ Mode = 'Legacy' }),
+        $setting.OverridePresent (обчислений моделлю через канонічний
+        Resolve-BRAVOConfiguratorSuppliedLeafOverride) коректно $true, але
+        пряма перевірка Contains($setting.Path) хибно повертала $false —
+        неторкана вкладена baseline завжди звітувала як dirty. Тепер
+        baseline проєктується через ТОЙ САМИЙ канонічний resolver, що й
+        сама модель — єдине джерело істини для "плаский vs вкладений
+        supplied leaf", без дублювання вкладеної навігації тут.
     #>
     [CmdletBinding()]
     param(
@@ -647,9 +660,10 @@ function Test-BRAVOConfiguratorModelDirty {
     )
 
     foreach ($setting in $Model) {
-        $baselinePresent = $BaselineOverrides.Contains($setting.Path)
+        $baseline = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $BaselineOverrides -LeafPath $setting.Path
+        $baselinePresent = [bool]$baseline.Found
         if ([bool]$setting.OverridePresent -ne $baselinePresent) { return $true }
-        if ($baselinePresent -and -not (Test-BRAVOConfiguratorValueEquality -Left $setting.OverrideValue -Right $BaselineOverrides[$setting.Path])) {
+        if ($baselinePresent -and -not (Test-BRAVOConfiguratorValueEquality -Left $setting.OverrideValue -Right $baseline.Value)) {
             return $true
         }
     }
