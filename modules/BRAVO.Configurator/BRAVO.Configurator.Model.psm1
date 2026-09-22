@@ -242,6 +242,29 @@ function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
         Оригінальний вкладений hashtable-об'єкт (може бути спільним
         посиланням з ProductionBaseline.Overrides викликача) лише
         ЧИТАЄТЬСЯ, ніколи не мутується на місці.
+
+        PR #224 review, R3-2: явний плоский top-level ключ, що вже існує
+        в $Overrides (canonical precedence "explicit flat leaf > nested
+        representation" — той самий canonical leaf, supplied ОБОМА
+        формами водночас), НЕ перезаписується значенням, знайденим під
+        час розгортання вкладеного контейнера. Порівняння Path через
+        Hashtable.Contains — та сама регістронезалежна семантика ключів
+        PowerShell hashtable, що вже використовує решта Configurator-коду
+        (BRAVO.local.config-ключі регістронезалежні).
+
+        PR #224 review, R3-3: ПЕРЕД будь-якою мутацією $Overrides
+        виконується preflight-обхід усього $root — якщо на БУДЬ-ЯКІЙ
+        глибині трапляється порожній вкладений hashtable (без жодного
+        leaf-нащадка), функція fail-closed кидає виняток і НЕ видаляє
+        $TopLevelKey й НЕ записує жодного дочірнього ключа. Порожній
+        вузол не має жодного leaf-значення, яке можна розгорнути у
+        плоский dot-шлях — canonical серіалізатор
+        (ConvertTo-BRAVOConfiguratorPowerShellLiteral) однаково не вміє
+        записати hashtable-значення, тож мовчазне пропущення такого вузла
+        незворотно втратило б його. Викликач (Merge-BRAVOConfiguratorCandidateOverrides
+        -> Test-BRAVOConfiguratorCandidateOverrides -> Invoke-BRAVOConfiguratorApply)
+        не продовжує до atomic replace після винятку тут, тож продакшн
+        BRAVO.local.config лишається байт-в-байт незмінним.
     #>
     [CmdletBinding()]
     param(
@@ -252,6 +275,35 @@ function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
     if (-not $Overrides.Contains($TopLevelKey)) { return }
     $root = $Overrides[$TopLevelKey]
     if ($root -isnot [hashtable]) { return }
+
+    $emptyDescendantPaths = New-Object System.Collections.Generic.List[string]
+    $preflightPending = New-Object System.Collections.Generic.List[object]
+    [void]$preflightPending.Add([pscustomobject]@{ Prefix = $TopLevelKey; Node = $root })
+    while ($preflightPending.Count -gt 0) {
+        $preflightCurrent = $preflightPending[$preflightPending.Count - 1]
+        $preflightPending.RemoveAt($preflightPending.Count - 1)
+        $preflightChildKeys = @($preflightCurrent.Node.Keys)
+        if ($preflightChildKeys.Count -eq 0) {
+            [void]$emptyDescendantPaths.Add($preflightCurrent.Prefix)
+            continue
+        }
+        foreach ($preflightKey in $preflightChildKeys) {
+            $preflightChildValue = $preflightCurrent.Node[$preflightKey]
+            if ($preflightChildValue -is [hashtable]) {
+                [void]$preflightPending.Add([pscustomobject]@{
+                    Prefix = "$($preflightCurrent.Prefix).$preflightKey"
+                    Node   = $preflightChildValue
+                })
+            }
+        }
+    }
+    if ($emptyDescendantPaths.Count -gt 0) {
+        throw ("BRAVO.Configurator: неможливо безпечно розгорнути вкладений контейнер '$TopLevelKey' у плоскі dot-шляхи — " +
+            "порожній вкладений вузол без жодного leaf-нащадка виявлено на: $([string]::Join(', ', @($emptyDescendantPaths))). " +
+            "Canonical серіалізатор не вміє записати hashtable-значення, тож цей вузол було б мовчки втрачено при флеттенізації; " +
+            "операцію скасовано ДО будь-якої мутації — продакшн-файл лишається незмінним.")
+    }
+
     $Overrides.Remove($TopLevelKey)
 
     $pending = New-Object System.Collections.Generic.List[object]
@@ -264,7 +316,7 @@ function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
             $childValue = $current.Node[$key]
             if ($childValue -is [hashtable]) {
                 [void]$pending.Add([pscustomobject]@{ Prefix = $childPath; Node = $childValue })
-            } else {
+            } elseif (-not $Overrides.Contains($childPath)) {
                 $Overrides[$childPath] = $childValue
             }
         }
@@ -415,9 +467,26 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
         сам Model-запис (OverridePresent/OverrideValue) не мутується цим
         викликом, тож UI і далі бачить "legacy denied override існує" для
         відображення/можливості Clear.
+        PR #224 review, R3-1: З ОДНИМ винятком — якщо ЦЕЙ КОНКРЕТНИЙ
+        Path canonical реєстр позначив
+        WeakeningOverride='ExistingSecurityEscapeHatch' (сьогодні лише
+        requireAdministrator) І оператор явно підтвердив ПОТОЧНИМ
+        процесом BRAVO_ALLOW_WEAKENED_SECURITY=1, override і далі
+        передається loader-у, тому Effective-preview показує РІВНО те
+        значення, яке реально стане ефективним (canonical loader
+        прийняв би той самий override з тим самим env — Configurator
+        preview більше не розходиться з реальною loader-поведінкою).
+        Без цього env-підтвердження override лишається виключеним, як і
+        для WeakeningOverride='None'-листів (напр.
+        backupMonitoring.SFTP.BAZA.Mode/.MutationPolicy — вони НІКОЛИ не
+        escapable, незалежно від env). Model лишається незмінною для UI
+        в обох випадках.
         Читає канонічний реєстр напряму
-        (Get-BRAVOConfigurationSchemaAuthorizationClass), а не другу
-        копію 271-позиційної класифікації — той самий реєстр, який уже
+        (Get-BRAVOConfigurationSchemaAuthorizationClass) і canonical
+        рішення "чи escapable ЗАРАЗ"
+        (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed) — не другу
+        копію 271-позиційної класифікації чи власне порівняння
+        env-змінної: той самий реєстр і та сама функція, яку
         використовують BRAVO_CONFIG_LOADER.ps1 і
         Resolve-BRAVOConfiguratorFieldAuthorization; коректно незалежно
         від того, який варіант schema-каталогу (сирий чи вже пропущений
@@ -444,10 +513,14 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
         if ($authorizationClass.Contains($path)) {
             $class = [string]$authorizationClass[$path].Class
             if ($class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
-                # Legacy/сторонній DENY_*-override — не передається
-                # canonical loader-у для preview-обчислення (F2). Model
-                # лишається незмінною для UI.
-                continue
+                $escapeHatchAllowed = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $path -AuthorizationClass $authorizationClass
+                if (-not $escapeHatchAllowed) {
+                    # Legacy/сторонній DENY_*-override, не escapable
+                    # зараз (R3-1) — не передається canonical loader-у
+                    # для preview-обчислення (F2). Model лишається
+                    # незмінною для UI.
+                    continue
+                }
             }
         }
         $overrides[$path] = $setting.OverrideValue

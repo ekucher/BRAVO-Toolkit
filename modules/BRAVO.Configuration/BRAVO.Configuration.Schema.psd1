@@ -11,7 +11,8 @@
         'Get-BRAVOConfigurationSchemaVersionDeclarationLine',
         'Test-BRAVOConfigurationOverrideAuthorization',
         'Get-BRAVOConfigurationSchemaAuthorizationClass',
-        'Test-BRAVOConfigurationAuthorizationValidatorValue'
+        'Test-BRAVOConfigurationAuthorizationValidatorValue',
+        'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed'
     )
     VariablesToExport = @()
     CmdletsToExport = @()

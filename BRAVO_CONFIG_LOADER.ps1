@@ -952,51 +952,58 @@ function Complete-BRAVOConfigurationLoad {
             # toolIntegritySettings.Mode/requireAdministrator, поширений
             # на ЦЕЙ (більш ранній) шар — не новий винахід Wave 2.
             #
-            # Owner remediation (Issue #216 Wave 2): loader НЕ знає
-            # жодної dot-path-назви й НЕ вирішує, який лист має право на
-            # цей escape hatch — це питання власника ЄДИНОГО канонічного
-            # авторизаційного реєстру (BRAVO.Configuration.Schema.psm1),
-            # яке loader читає з кожного Violation.WeakeningOverride:
-            #   'ExistingSecurityEscapeHatch' -> цей конкретний DENY_SECURITY_CONTROL-
-            #                                     лист МОЖЕ пройти через
-            #                                     BRAVO_ALLOW_WEAKENED_SECURITY=1
-            #                                     (сьогодні: лише requireAdministrator).
-            #   'None' (або відсутність позначки) -> безумовна відмова,
-            #                                     незалежно від класу й
-            #                                     від значення env-змінної
-            #                                     (сьогодні: BAZA.Mode/
-            #                                     MutationPolicy — append-
-            #                                     only/mutation-detection
-            #                                     цілісність BAZA, той
-            #                                     самий клас гарантії, що
-            #                                     .claude/rules/07-bravo-runtime-invariants.md
-            #                                     вимагає окремого
-            #                                     свідомого рішення
-            #                                     власника для послаблення).
+            # Owner remediation (Issue #216 Wave 2, PR #224 third review
+            # R3-1 cleanup): loader НЕ знає жодної dot-path-назви й НЕ
+            # вирішує, який лист має право на цей escape hatch, і більше
+            # НЕ інтерпретує Violation.WeakeningOverride/env-змінну
+            # самостійно — це питання власника ЄДИНОГО канонічного
+            # авторизаційного реєстру (BRAVO.Configuration.Schema.psm1).
+            # Loader делегує РІШЕННЯ ЦІЛКОМ (реєстр + фактичний стан
+            # BRAVO_ALLOW_WEAKENED_SECURITY у поточному процесі) єдиній
+            # canonical функції Test-BRAVOConfigurationWeakeningEscapeHatchAllowed
+            # — тій самій, яку викликає Configurator-preview
+            # (ConvertTo-BRAVOConfiguratorOverrideHashtable), щоб обидва
+            # викликачі не могли розійтись у висновку "чи escapable ЗАРАЗ":
+            #   $true  -> цей конкретний DENY_SECURITY_CONTROL-лист МОЖЕ
+            #             пройти зараз (сьогодні: лише requireAdministrator,
+            #             і лише коли BRAVO_ALLOW_WEAKENED_SECURITY=1).
+            #   $false -> безумовна відмова — або тому, що реєстр
+            #             позначив цей лист WeakeningOverride='None'
+            #             (сьогодні: BAZA.Mode/MutationPolicy — append-
+            #             only/mutation-detection цілісність BAZA, той
+            #             самий клас гарантії, що
+            #             .claude/rules/07-bravo-runtime-invariants.md
+            #             вимагає окремого свідомого рішення власника для
+            #             послаблення), або тому, що оператор ще не
+            #             підтвердив послаблення поточним процесом.
             # ДО цього блоку тут стояв жорстко закодований
             # $localAuthorizationUnconditionalPaths-перелік dot-шляхів —
             # друга, окрема копія тієї самої політики поза реєстром
-            # (ризик розбіжності). Раніше видалений: рішення "хто
-            # escapable" живе ВИКЛЮЧНО в каноничному реєстрі тепер.
-            $localAuthorizationSecurityViolations = @(@($localAuthorizationResult.Violations) | Where-Object {
-                [string]$_.WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
+            # (ризик розбіжності); пізніше — власна WeakeningOverride/env-
+            # комбінація тут у loader (PR #224 third review, R3-1) —
+            # третя копія ТІЄЇ САМОЇ логіки. Обидві видалені: рішення
+            # "чи ЦЕЙ Path escapable ЗАРАЗ" живе ВИКЛЮЧНО в
+            # Test-BRAVOConfigurationWeakeningEscapeHatchAllowed тепер.
+            $localAuthorizationEscapableViolations = @(@($localAuthorizationResult.Violations) | Where-Object {
+                Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $_.Path
             })
             $localAuthorizationHardViolations = @(@($localAuthorizationResult.Violations) | Where-Object {
-                [string]$_.WeakeningOverride -ne 'ExistingSecurityEscapeHatch'
+                -not (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $_.Path)
             })
-            $localAuthorizationAllowWeakened = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
 
-            if ($localAuthorizationHardViolations.Count -gt 0 -or $localAuthorizationAllowWeakened -ne '1') {
+            if ($localAuthorizationHardViolations.Count -gt 0) {
                 $localAuthorizationMessages = @(@($localAuthorizationResult.Violations) | ForEach-Object { [string]$_.Message })
                 throw ("BRAVO.local.config: неавторизоване перевизначення — " + [string]::Join(' ', $localAuthorizationMessages))
             }
 
-            # Лишились ЛИШЕ DENY_SECURITY_CONTROL-порушення, і оператор
-            # явно підтвердив BRAVO_ALLOW_WEAKENED_SECURITY=1 — свідоме
-            # послаблення продовжується (лишає видимий слід), а не мовчки
-            # застосовується; $LocalOverrides нижче мерджиться ПОВНІСТЮ як
-            # завжди, тому дозволене значення реально стає ефективним.
-            $localAuthorizationSecurityMessages = @(@($localAuthorizationSecurityViolations) | ForEach-Object { [string]$_.Message })
+            # Лишились ЛИШЕ порушення, для яких canonical helper щойно
+            # підтвердив escape ЗАРАЗ (реєстр дозволяє І оператор явно
+            # підтвердив BRAVO_ALLOW_WEAKENED_SECURITY=1 поточним
+            # процесом) — свідоме послаблення продовжується (лишає
+            # видимий слід), а не мовчки застосовується; $LocalOverrides
+            # нижче мерджиться ПОВНІСТЮ як завжди, тому дозволене
+            # значення реально стає ефективним.
+            $localAuthorizationSecurityMessages = @(@($localAuthorizationEscapableViolations) | ForEach-Object { [string]$_.Message })
             Write-Warning (
                 "УВАГА: BRAVO.local.config перевизначає security-critical лист(и), заборонені за замовчуванням: " +
                 "$([string]::Join(' ', $localAuthorizationSecurityMessages)) Продовжено через BRAVO_ALLOW_WEAKENED_SECURITY=1. " +

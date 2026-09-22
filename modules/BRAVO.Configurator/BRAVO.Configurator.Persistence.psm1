@@ -325,8 +325,28 @@ function Invoke-BRAVOConfiguratorApply {
     )
 
     # Крок 3: злиття (Model edits + збереження невідомих ключів).
-    $mergedOverrides = Merge-BRAVOConfiguratorCandidateOverrides `
-        -ExistingOverrides $ProductionBaseline.Overrides -Model $Model -SchemaCatalog $SchemaCatalog
+    # PR #224 review, R3-3: Convert-BRAVOConfiguratorNestedContainerToFlatKeys
+    # (викликається зсередини Merge-BRAVOConfiguratorCandidateOverrides,
+    # коли торкнутий canonical leaf досягається через легасі вкладений
+    # контейнер) fail-closed кидає виняток, якщо контейнер містить
+    # порожній вкладений вузол, який неможливо безпечно розгорнути у
+    # плоскі dot-шляхи. Без цього try/catch такий виняток пробивав би
+    # Invoke-BRAVOConfiguratorApply наскрізь необробленим, порушуючи той
+    # самий задокументований контракт "завжди повертає структурований
+    # [pscustomobject]@{ Applied = ... }", що вже захищають try/catch
+    # нижче для RaceCheckFailed/Serialization (P1.1/P2-фікси). Продакшн-
+    # файл на цьому кроці ще не чіпався (backup/atomic replace — нижче),
+    # тож він лишається незмінним.
+    try {
+        $mergedOverrides = Merge-BRAVOConfiguratorCandidateOverrides `
+            -ExistingOverrides $ProductionBaseline.Overrides -Model $Model -SchemaCatalog $SchemaCatalog
+    } catch {
+        return [pscustomobject]@{
+            Applied = $false
+            Stage   = 'Merge'
+            Reasons = @("Не вдалося злити candidate-редагування з наявними overrides: $($_.Exception.Message). Production файл НЕ змінено.")
+        }
+    }
 
     # Крок 4-7: parse + schema + dependency + canonical validation.
     $validationResult = Test-BRAVOConfiguratorCandidateOverrides `

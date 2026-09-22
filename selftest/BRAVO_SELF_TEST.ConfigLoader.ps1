@@ -1440,6 +1440,171 @@ try {
 }
 
 # ============================================================
+# PR #224 third review, final cleanup: BRAVO_CONFIG_LOADER.ps1 більше
+# не інтерпретує WeakeningOverride/BRAVO_ALLOW_WEAKENED_SECURITY
+# самостійно — Complete-BRAVOConfigurationLoad делегує рішення "чи ЦЕЙ
+# Path escapable ЗАРАЗ" canonical Test-BRAVOConfigurationWeakeningEscapeHatchAllowed
+# (BRAVO.Configuration.Schema.psm1), тій самій функції, яку викликає
+# Configurator-preview. Блоки вище (requireAdministrator/BAZA.Mode/
+# BAZA.MutationPolicy, кожен окремо) уже e2e-доводять, що рефакторинг
+# зберіг поведінку через реальний Import-BravoConfiguration — цей блок
+# додає лише те, чого не було: (a) явні тести з іменами, які прямо
+# називають canonical-helper-делегування, і (b) ключовий MIXED-кейс —
+# ОДИН escapable-лист (requireAdministrator) РАЗОМ з ОДНИМ hard-листом
+# (BAZA.Mode) в ОДНОМУ файлі з BRAVO_ALLOW_WEAKENED_SECURITY=1: увесь
+# шар мусить fail-closed атомарно, бо хоча б одне порушення лишається
+# невирішеним — старий inline-код (2 окремі Where-Object-партиції +
+# один спільний env-прапор) і новий canonical-helper-код дають той
+# самий результат ТІЛЬКИ якщо helper дійсно застосовується ПЕР-VIOLATION,
+# а не глобально.
+# ============================================================
+$weakeningCleanupBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_WEAKENCLEANUP_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($weakeningCleanupBackupRootDir)
+$weakeningCleanupBackupRootLiteral = $weakeningCleanupBackupRootDir.Replace("'", "''")
+
+function New-BRAVOConfigLoaderWeakeningMixedProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalConfigBody,
+        [string]$AllowWeakenedEnvValue = ''
+    )
+    $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_WEAKENCLEANUP_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($scenarioRoot)
+    try {
+        [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.local.config'), $LocalConfigBody, (New-Object System.Text.UTF8Encoding($false)))
+        $envPrefix = if (-not [string]::IsNullOrWhiteSpace($AllowWeakenedEnvValue)) {
+            "`$env:BRAVO_ALLOW_WEAKENED_SECURITY = '$AllowWeakenedEnvValue'; "
+        } else {
+            ''
+        }
+        # Той самий доказ атомарності, що New-BRAVOConfigLoaderAtomicityProbe
+        # вище (archiveRetentionDays лишається <unset> на throw) — тут
+        # додатково перевіряємо requireAdministrator, бо саме цей лист
+        # проходить через escape-hatch-гілку коду, яку рефакторинг змінив.
+        $probeCommand = (
+            "try { $envPrefix" +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+            "'NOTHREW:ArchiveRetentionDays=' + [string]`$global:archiveRetentionDays " +
+            "} catch { " +
+            "`$archiveVar = Get-Variable -Name 'archiveRetentionDays' -Scope Global -ErrorAction SilentlyContinue; " +
+            "`$archiveState = if (`$null -eq `$archiveVar) { '<unset>' } else { [string]`$archiveVar.Value }; " +
+            "`$reqAdminVar = Get-Variable -Name 'requireAdministrator' -Scope Global -ErrorAction SilentlyContinue; " +
+            "`$reqAdminState = if (`$null -eq `$reqAdminVar) { '<unset>' } else { [string]`$reqAdminVar.Value }; " +
+            "'THREW:' + `$_.Exception.Message + ';ArchiveRetentionDaysAfterThrow=' + `$archiveState + ';ReqAdminAfterThrow=' + `$reqAdminState" +
+            "}"
+        )
+        $probeOutput = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+        )
+        return $probeOutput.Trim()
+    } finally {
+        Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+try {
+    # --- Loader/RequireAdministratorWeakeningRejectedWithoutEnv ---
+    $weakeningReqAdminOnlyBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "}`r`n"
+    )
+    $weakeningReqAdminNoEnvResult = New-BRAVOConfigLoaderWeakeningMixedProbe -LocalConfigBody $weakeningReqAdminOnlyBody
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningReqAdminNoEnvResult.StartsWith('THREW:') -and
+            $weakeningReqAdminNoEnvResult.Contains('неавторизоване перевизначення') -and
+            $weakeningReqAdminNoEnvResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+        ) `
+        -Name "Loader/RequireAdministratorWeakeningRejectedWithoutEnv" `
+        -Failure "requireAdministrator=`$false БЕЗ BRAVO_ALLOW_WEAKENED_SECURITY=1 мусить fail-closed через canonical helper (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed повертає `$false); отримано: $weakeningReqAdminNoEnvResult"
+
+    # --- Loader/RequireAdministratorWeakeningAllowedWithEnv ---
+    $weakeningReqAdminOnlyBody999 = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'archiveRetentionDays' = 999`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "}`r`n"
+    )
+    $weakeningReqAdminWithEnvResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningReqAdminOnlyBody999 -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition ($weakeningReqAdminWithEnvResult -eq 'NOTHREW:ArchiveRetentionDays=999') `
+        -Name "Loader/RequireAdministratorWeakeningAllowedWithEnv" `
+        -Failure "requireAdministrator=`$false З BRAVO_ALLOW_WEAKENED_SECURITY=1 мусить пройти через canonical helper (сусідній archiveRetentionDays=999 мусить застосуватись, шар НЕ відхилений); отримано: $weakeningReqAdminWithEnvResult"
+
+    # --- Loader/BazaModeNotEscapableWithWeakeningEnv ---
+    $weakeningBazaModeOnlyBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'`r`n" +
+        "}`r`n"
+    )
+    $weakeningBazaModeResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningBazaModeOnlyBody -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningBazaModeResult.StartsWith('THREW:') -and
+            $weakeningBazaModeResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "Loader/BazaModeNotEscapableWithWeakeningEnv" `
+        -Failure "backupMonitoring.SFTP.BAZA.Mode мусить лишитись fail-closed через canonical helper навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 (WeakeningOverride='None'); отримано: $weakeningBazaModeResult"
+
+    # --- Loader/BazaMutationPolicyNotEscapableWithWeakeningEnv ---
+    $weakeningBazaMutationPolicyOnlyBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'AllowOverwrite'`r`n" +
+        "}`r`n"
+    )
+    $weakeningBazaMutationPolicyResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningBazaMutationPolicyOnlyBody -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningBazaMutationPolicyResult.StartsWith('THREW:') -and
+            $weakeningBazaMutationPolicyResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "Loader/BazaMutationPolicyNotEscapableWithWeakeningEnv" `
+        -Failure "backupMonitoring.SFTP.BAZA.MutationPolicy мусить лишитись fail-closed через canonical helper навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 (WeakeningOverride='None'); отримано: $weakeningBazaMutationPolicyResult"
+
+    # --- Loader/MixedEscapableAndHardViolationRejectsAtomically ---
+    # КЛЮЧОВИЙ тест цього блоку: requireAdministrator=$false (escapable)
+    # РАЗОМ з backupMonitoring.SFTP.BAZA.Mode='Legacy' (hard) в ОДНОМУ
+    # файлі, з BRAVO_ALLOW_WEAKENED_SECURITY=1. Якби рефакторинг помилково
+    # застосував helper ДО всього набору порушень одразу (напр. "чи БУДЬ-
+    # ЯКЕ порушення escapable"), а не ПЕР-violation, цей тест виявив би
+    # це — весь шар мусить відхилитись, і жоден сусідній ALLOW_SITE
+    # override (archiveRetentionDays) не повинен потрапити в ефективний
+    # стан навіть частково.
+    $weakeningMixedBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'archiveRetentionDays' = 999`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'`r`n" +
+        "}`r`n"
+    )
+    $weakeningMixedResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningMixedBody -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningMixedResult.StartsWith('THREW:') -and
+            $weakeningMixedResult.Contains('неавторизоване перевизначення') -and
+            $weakeningMixedResult.Contains('backupMonitoring.SFTP.BAZA.Mode') -and
+            $weakeningMixedResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>') -and
+            $weakeningMixedResult.Contains('ReqAdminAfterThrow=<unset>')
+        ) `
+        -Name "Loader/MixedEscapableAndHardViolationRejectsAtomically" `
+        -Failure "requireAdministrator=`$false (escapable) + BAZA.Mode='Legacy' (hard) + BRAVO_ALLOW_WEAKENED_SECURITY=1 мусить відхилити ЦІЛИЙ local-override шар атомарно (жоден лист, у т.ч. escapable requireAdministrator чи сусідній ALLOW_SITE archiveRetentionDays, не повинен потрапити в ефективний стан); отримано: $weakeningMixedResult"
+} finally {
+    Remove-Item -LiteralPath $weakeningCleanupBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================
 # P0 Configuration Foundation (PR C, Секція 5.5): МЕХАНІЧНИЙ доказ, що
 # pre-trust AST-правила (BRAVO_RUNTIME_GUARD.ps1, статичний текст
 # BRAVO.config) і post-merge effective-правила

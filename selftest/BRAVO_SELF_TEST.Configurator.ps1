@@ -1551,6 +1551,289 @@ try {
     }
 }
 
+# =====================================================================
+# PR #224 third review, R3-1: Configurator effective preview повинна
+# відображати наявний BRAVO_ALLOW_WEAKENED_SECURITY=1 escape hatch для
+# requireAdministrator (canonical WeakeningOverride='ExistingSecurityEscapeHatch'),
+# і БЕЗУМОВНО відхиляти backupMonitoring.SFTP.BAZA.Mode/.MutationPolicy
+# незалежно від env (WeakeningOverride='None' — fail-closed за
+# замовчуванням). Env-змінна процесу зберігається/відновлюється в
+# try/finally, щоб не протікати в інші self-test-фрагменти.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $r31OriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+
+        # --- Preview/RequireAdministratorWeakeningRejectedWithoutEnv ---
+        $r31WithoutEnv = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'requireAdministrator'
+        Test-BRAVOCondition (-not $r31WithoutEnv) `
+            'Preview/RequireAdministratorWeakeningRejectedWithoutEnv' `
+            "без BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator НЕ повинен бути escapable; отримано $r31WithoutEnv"
+
+        $r31BaseModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
+
+        # requireAdministrator НЕ має власного Configurator UI-дескриптора
+        # (не редагується через Configurator взагалі — підтверджено:
+        # немає запису в BRAVO.Configurator.Schema.psd1), тому
+        # Get-BRAVOConfiguratorModel/Set-BRAVOConfiguratorOverride НІКОЛИ
+        # не можуть створити для нього Setting-рядок. ConvertTo-BRAVOConfiguratorOverrideHashtable
+        # приймає БУДЬ-ЯКИЙ масив об'єктів з Path/OverridePresent/OverrideValue
+        # (контракт функції не вимагає походження саме від SchemaCatalog) —
+        # синтетичний рядок тестує САМЕ ЦЮ функцію напряму, без залежності
+        # від того, чи colись з'явиться UI-дескриптор для цього листа.
+        # Властивості нижче (EffectiveValue/EffectiveSource/DisabledReason/
+        # ValidationState/DependencyState/Dirty) присутні порожніми, бо
+        # Update-BRAVOConfiguratorEffective (нижче, блок
+        # RequireAdministratorWeakeningAllowed/EffectiveReflectsLoader) під
+        # Set-StrictMode -Version 2.0 присвоює $clone.EffectiveValue/
+        # .DisabledReason/.EffectiveSource на PSObject.Copy() цього рядка —
+        # той самий canonical Setting-shape, що Get-BRAVOConfiguratorModel
+        # створює (BRAVO.Configurator.Model.psm1, ~рядок 362), інакше
+        # присвоєння неіснуючої властивості PSCustomObject кидає виняток.
+        $r31ModelWithOverride = @(
+            [pscustomobject]@{
+                Path            = 'requireAdministrator'
+                Metadata        = $null
+                DefaultValue    = $true
+                OverridePresent = $true
+                OverrideValue   = $false
+                EffectiveValue  = $null
+                EffectiveSource = $null
+                DisabledReason  = $null
+                ValidationState = $null
+                DependencyState = $null
+                Dirty           = $false
+            }
+        )
+
+        $r31PreviewWithoutEnv = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $r31ModelWithOverride
+        Test-BRAVOCondition (-not $r31PreviewWithoutEnv.Contains('requireAdministrator')) `
+            'Preview/RequireAdministratorWeakeningRejectedWithoutEnv/ProjectionExcludesOverride' `
+            "без env-підтвердження requireAdministrator=`$false НЕ повинен передаватись canonical loader-у для preview; Contains=$($r31PreviewWithoutEnv.Contains('requireAdministrator'))"
+
+        # --- Preview/RequireAdministratorWeakeningAllowed ---
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+
+        $r31WithEnv = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'requireAdministrator'
+        Test-BRAVOCondition ([bool]$r31WithEnv) `
+            'Preview/RequireAdministratorWeakeningAllowed' `
+            "з BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator МУСИТЬ бути escapable (canonical WeakeningOverride='ExistingSecurityEscapeHatch'); отримано $r31WithEnv"
+
+        $r31PreviewWithEnv = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $r31ModelWithOverride
+        Test-BRAVOCondition (
+            $r31PreviewWithEnv.Contains('requireAdministrator') -and [bool]$r31PreviewWithEnv['requireAdministrator'] -eq $false
+        ) `
+            'Preview/RequireAdministratorWeakeningAllowed/ProjectionIncludesOverride' `
+            "з env-підтвердженням requireAdministrator=`$false МУСИТЬ передаватись canonical loader-у для preview; Contains=$($r31PreviewWithEnv.Contains('requireAdministrator')) Value=$($r31PreviewWithEnv['requireAdministrator'])"
+
+        # Наскрізна перевірка: Effective дійсно стає $false через реальний
+        # canonical loader (child-process), не лише проєкція hashtable —
+        # Start-Process успадковує env поточного процесу за замовчуванням.
+        $r31EffectiveModel = Update-BRAVOConfiguratorEffective -Model $r31ModelWithOverride -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $r31RequireAdminSetting = @($r31EffectiveModel | Where-Object { $_.Path -eq 'requireAdministrator' })
+        Test-BRAVOCondition (
+            $r31RequireAdminSetting.Count -eq 1 -and [bool]$r31RequireAdminSetting[0].EffectiveValue -eq $false
+        ) `
+            'Preview/RequireAdministratorWeakeningAllowed/EffectiveReflectsLoader' `
+            "з env-підтвердженням canonical loader МУСИТЬ прийняти override, тож Effective мусить стати `$false; отримано EffectiveValue=$($r31RequireAdminSetting[0].EffectiveValue)"
+
+        # --- Preview/BazaModeStillRejectedWithWeakeningEnv ---
+        # (env і далі '1' з блоку вище — саме цей стан мусить лишатись недостатнім для BAZA.*)
+        $r31BazaModeResult = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'backupMonitoring.SFTP.BAZA.Mode'
+        Test-BRAVOCondition (-not $r31BazaModeResult) `
+            'Preview/BazaModeStillRejectedWithWeakeningEnv' `
+            "backupMonitoring.SFTP.BAZA.Mode НІКОЛИ не escapable, незалежно від BRAVO_ALLOW_WEAKENED_SECURITY (WeakeningOverride='None'); отримано $r31BazaModeResult"
+
+        $r31BazaModeSetting = @($r31BaseModel | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+        Test-BRAVOCondition ($r31BazaModeSetting.Count -eq 1) `
+            'Preview/BazaModeStillRejectedWithWeakeningEnv/DescriptorExists' `
+            "fixture-передумова: backupMonitoring.SFTP.BAZA.Mode мусить мати Configurator-дескриптор; отримано Count=$($r31BazaModeSetting.Count)"
+        $r31BazaModeModel = Set-BRAVOConfiguratorOverride -Model $r31BaseModel -Path 'backupMonitoring.SFTP.BAZA.Mode' -Value 'Legacy'
+        $r31BazaModePreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $r31BazaModeModel
+        Test-BRAVOCondition (-not $r31BazaModePreview.Contains('backupMonitoring.SFTP.BAZA.Mode')) `
+            'Preview/BazaModeStillRejectedWithWeakeningEnv/ProjectionExcludesOverride' `
+            "навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 BAZA.Mode НЕ повинен передаватись canonical loader-у для preview; Contains=$($r31BazaModePreview.Contains('backupMonitoring.SFTP.BAZA.Mode'))"
+
+        # --- Preview/BazaMutationPolicyStillRejectedWithWeakeningEnv ---
+        # MutationPolicy не має власного Configurator-дескриптора (UI не
+        # рендерить цей лист) — перевірка на рівні canonical рішення, того
+        # самого, яке ConvertTo-BRAVOConfiguratorOverrideHashtable викликав
+        # би, якби такий дескриптор існував.
+        $r31BazaMutationPolicyResult = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'backupMonitoring.SFTP.BAZA.MutationPolicy'
+        Test-BRAVOCondition (-not $r31BazaMutationPolicyResult) `
+            'Preview/BazaMutationPolicyStillRejectedWithWeakeningEnv' `
+            "backupMonitoring.SFTP.BAZA.MutationPolicy НІКОЛИ не escapable, незалежно від BRAVO_ALLOW_WEAKENED_SECURITY (WeakeningOverride='None'); отримано $r31BazaMutationPolicyResult"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $r31OriginalEnv)
+    }
+}
+
+# =====================================================================
+# PR #224 third review, R3-2/R3-3: Convert-BRAVOConfiguratorNestedContainerToFlatKeys
+# — explicit flat-key precedence під час flatten-on-touch (R3-2) і
+# fail-closed на порожньому вкладеному вузлі (R3-3).
+# =====================================================================
+& {
+    # --- Flatten/ExplicitFlatLeafPrecedenceOverNestedRepresentation ---
+    # R3-2 приклад із задачі: SUCCESS заданий і плоским, і вкладеним
+    # (різні значення) одночасно; торкання WARNING (сусід у тому самому
+    # контейнері) не повинно перезаписати вже явний плоский SUCCESS.
+    $r32Overrides = @{
+        'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS = 'general'
+            WARNING = 'alerts'
+        }
+    }
+    Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r32Overrides -TopLevelKey 'bravoSettings.NotificationRouting'
+    Test-BRAVOCondition (
+        $r32Overrides.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+        [string]$r32Overrides['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
+        $r32Overrides.Contains('bravoSettings.NotificationRouting.WARNING') -and
+        [string]$r32Overrides['bravoSettings.NotificationRouting.WARNING'] -eq 'alerts' -and
+        (-not $r32Overrides.Contains('bravoSettings.NotificationRouting'))
+    ) `
+        'Flatten/ExplicitFlatLeafPrecedenceOverNestedRepresentation' `
+        ("явний плоский SUCCESS='alerts' мусить пережити флеттенізацію контейнера (не перезаписаний вкладеним 'general'), " +
+         "а WARNING мусить взятись із вкладеного значення; отримано SUCCESS=$($r32Overrides['bravoSettings.NotificationRouting.SUCCESS']) " +
+         "WARNING=$($r32Overrides['bravoSettings.NotificationRouting.WARNING']) ContainerStillPresent=$($r32Overrides.Contains('bravoSettings.NotificationRouting'))")
+
+    # --- Flatten/EmptyUnknownNestedContainerFailsClosed ---
+    $r33Overrides = @{
+        'Some.Container' = @{
+            KnownLeaf      = 'value'
+            FutureSettings = @{}
+        }
+    }
+    $r33Threw = $false
+    $r33Message = $null
+    try {
+        Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r33Overrides -TopLevelKey 'Some.Container'
+    } catch {
+        $r33Threw = $true
+        $r33Message = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        $r33Threw -and
+        $r33Overrides.Contains('Some.Container') -and
+        ($r33Overrides['Some.Container'] -is [hashtable]) -and
+        [string]$r33Overrides['Some.Container']['KnownLeaf'] -eq 'value' -and
+        $r33Overrides['Some.Container'].Contains('FutureSettings')
+    ) `
+        'Flatten/EmptyUnknownNestedContainerFailsClosed' `
+        ("порожній вкладений вузол ('FutureSettings' = @{}) мусить fail-closed зупинити флеттенізацію ДО будь-якої мутації — контейнер " +
+         "мусить лишитись повністю незміненим (не частково розгорнутим); отримано Threw=$r33Threw ContainerPresent=$($r33Overrides.Contains('Some.Container')) Message=$r33Message")
+
+    # --- Apply/EmptyUnknownNestedContainerProductionFileUnchanged ---
+    $r33ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_EMPTYNESTED_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($r33ApplyScenarioRoot)
+    try {
+        $r33ApplyConfigPath = Join-Path $r33ApplyScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $r33ApplyConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'CRITICAL' = 'alerts'`r`n" +
+                "        'FutureRoutingGroup' = @{}`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $r33ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r33ApplyScenarioRoot
+        $r33ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $r33ApplyBaseline.Overrides
+        # Торкаємо САМЕ той canonical leaf, що вже supplied усередині
+        # контейнера (CRITICAL) — це те, що реально резолвиться через
+        # Resolve-BRAVOConfiguratorSuppliedLeafOverride як "supplied
+        # nested" і форсує флеттенізацію; невідомий (не-schema) leaf
+        # типу WARNING-без-попереднього-значення НЕ форсував би її
+        # (нема чого резолвити всередині контейнера).
+        $r33ApplyModelEdited = Set-BRAVOConfiguratorOverride -Model $r33ApplyModel -Path 'bravoSettings.NotificationRouting.CRITICAL' -Value 'general'
+        $r33ApplyPreBytes = [IO.File]::ReadAllBytes($r33ApplyConfigPath)
+        $r33ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r33ApplyScenarioRoot `
+            -Model $r33ApplyModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $r33ApplyBaseline
+        $r33ApplyPostBytes = [IO.File]::ReadAllBytes($r33ApplyConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$r33ApplyResult.Applied) -and [string]$r33ApplyResult.Stage -eq 'Merge' -and
+            ([Convert]::ToBase64String($r33ApplyPreBytes) -eq [Convert]::ToBase64String($r33ApplyPostBytes))
+        ) `
+            'Apply/EmptyUnknownNestedContainerProductionFileUnchanged' `
+            ("Apply мусить провалитись fail-closed (Stage='Merge') замість мовчазної втрати порожнього невідомого вкладеного вузла, і " +
+             "продакшн-файл мусить лишитись побайтово незмінним; отримано Applied=$($r33ApplyResult.Applied) Stage=$($r33ApplyResult.Stage)")
+    } finally {
+        Remove-Item -LiteralPath $r33ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 third review, R3-4: BRAVO.local.config.example не повинен
+# рекламувати DENY_*-листи як звичайний перелік override-ів, доступних
+# для розкоментовування.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+    $r34DocumentedPaths = Get-BRAVOConfiguratorDocumentedOverridePaths -ExamplePath (Join-Path $root 'BRAVO.local.config.example')
+    $r34ClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $r34ExampleText = Get-Content -LiteralPath (Join-Path $root 'BRAVO.local.config.example') -Raw -Encoding UTF8
+
+    # --- Contract/DocumentedOverrideTemplateDoesNotExposeDeniedLeaves ---
+    # "рекламує як звичайний override" = задокументований шлях є DENY_*
+    # БЕЗ явного NON-OVERRIDABLE-маркера поруч із ним у файлі — сам факт
+    # присутності в задокументованому переліку (потрібен для 1:1 schema-
+    # повноти) не є порушенням, якщо рядок явно позначений як recovery-only.
+    $r34UnlabeledDeniedLeaves = New-Object System.Collections.Generic.List[string]
+    foreach ($r34Path in $r34DocumentedPaths) {
+        if (-not $r34ClassRegistry.Contains($r34Path)) { continue }
+        $r34Class = [string]$r34ClassRegistry[$r34Path].Class
+        if (-not $r34Class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) { continue }
+        if (-not $r34ExampleText.Contains("'$r34Path'") ) { continue }
+        # Шукаємо NON-OVERRIDABLE-маркер у безпосередній близькості (той
+        # самий рядок) — dot-шлях може з'являтися в файлі кілька разів
+        # (напр. попереджувальний коментар-заголовок і сам
+        # закоментований entry-рядок нижче), тож перевіряємо УСІ рядки,
+        # що містять цей dot-шлях у лапках, а не лише перший знайдений
+        # (regex-парсер каталогу читає той самий entry-рядок, що і
+        # реальний override-запис, не заголовок).
+        # [^\n] (не [^\r\n]) навмисно: файл має CRLF-закінчення рядків, а
+        # $ у Multiline-режимі .NET прив'язується безпосередньо ПЕРЕД \n
+        # (не перед \r) — виключення \r із класу символів робило б символ
+        # \r перед \n непоглинутим, і $ ніколи не міг би збігтись
+        # (MatchCount завжди 0 на CRLF-файлах). \r у складі рядка тут
+        # нешкідливий — просто ще один звичайний символ вмісту рядка.
+        $r34LineMatches = [regex]::Matches($r34ExampleText, "^[^\n]*'$([regex]::Escape($r34Path))'[^\n]*$", [System.Text.RegularExpressions.RegexOptions]::Multiline)
+        $r34HasLabeledLine = $false
+        foreach ($r34LineMatch in $r34LineMatches) {
+            if ($r34LineMatch.Value.Contains('NON-OVERRIDABLE')) { $r34HasLabeledLine = $true; break }
+        }
+        if ($r34HasLabeledLine) { continue }
+        [void]$r34UnlabeledDeniedLeaves.Add($r34Path)
+    }
+    Test-BRAVOCondition ($r34UnlabeledDeniedLeaves.Count -eq 0) `
+        'Contract/DocumentedOverrideTemplateDoesNotExposeDeniedLeaves' `
+        "задокументовані DENY_*-листи мусять бути явно позначені NON-OVERRIDABLE, а не представлені як звичайний override; непозначені: $($r34UnlabeledDeniedLeaves -join ', ')"
+
+    # --- Contract/BazaModeExplicitlyLabeledNonOverridable ---
+    Test-BRAVOCondition ($r34ExampleText.Contains("'backupMonitoring.SFTP.BAZA.Mode'") -and $r34ExampleText.Contains('NON-OVERRIDABLE')) `
+        'Contract/BazaModeExplicitlyLabeledNonOverridable' `
+        "backupMonitoring.SFTP.BAZA.Mode мусить лишитись задокументованим (schema-повнота), але з явним NON-OVERRIDABLE-маркером поруч"
+
+    # --- Contract/BazaMutationPolicyNotAdvertised ---
+    Test-BRAVOCondition (-not ($r34DocumentedPaths -contains 'backupMonitoring.SFTP.BAZA.MutationPolicy')) `
+        'Contract/BazaMutationPolicyNotAdvertised' `
+        "backupMonitoring.SFTP.BAZA.MutationPolicy НЕ повинен з'являтись у задокументованому override-переліку взагалі (немає Configurator-дескриптора)"
+}
+
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====

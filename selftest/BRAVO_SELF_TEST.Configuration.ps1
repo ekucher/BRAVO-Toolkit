@@ -1806,20 +1806,22 @@
         -Failure "bravoSettings.NotificationProvider=' discord ' мусить бути прийнятий (та сама доведена trim-tolerance, що NotificationMode); отримано IsValid=$($authNotifProviderWhitespaceResult.IsValid)"
 
     # --- Authorization/OtherEnumLeavesRemainUntrimmedByDefault ---
-    # Регресійна межа: інший enum-лист (consoleSettings.ConsoleLevel), для
-    # якого НЕМАЄ доказу pre-Wave-2 trim-tolerance, мусить лишитись на
+    # Регресійна межа: інший enum-лист (maintenanceSettings.Logging.Level),
+    # для якого НЕМАЄ доказу pre-Wave-2 trim-tolerance, мусить лишитись на
     # звичайному строгому 'Enum:' (без trim) — фікс не узагальнюється без
-    # підстави.
+    # підстави. ConsoleLevel/FileLevel більше НЕ підходять для цього
+    # регресійного зразка (R3-5, PR #224 third review): обидва тепер самі
+    # мають доведену trim-tolerance і перевіряються окремим блоком нижче.
     $authOtherEnumWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
-        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = ' WARNING ' } `
+        -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = ' WARNING ' } `
         -Schema $authSchema
     $authOtherEnumExactResult = Test-BRAVOConfigurationOverrideAuthorization `
-        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = 'WARNING' } `
+        -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'WARNING' } `
         -Schema $authSchema
     Test-BRAVOCondition `
         -Condition ((-not [bool]$authOtherEnumWhitespaceResult.IsValid) -and [bool]$authOtherEnumExactResult.IsValid) `
         -Name "Authorization/OtherEnumLeavesRemainUntrimmedByDefault" `
-        -Failure "consoleSettings.ConsoleLevel НЕ має доказу trim-tolerance — з пробілами мусить відхилятись (IsValid=$($authOtherEnumWhitespaceResult.IsValid)), точне значення мусить і далі прийматись (IsValid=$($authOtherEnumExactResult.IsValid))"
+        -Failure "maintenanceSettings.Logging.Level НЕ має доказу trim-tolerance — з пробілами мусить відхилятись (IsValid=$($authOtherEnumWhitespaceResult.IsValid)), точне значення мусить і далі прийматись (IsValid=$($authOtherEnumExactResult.IsValid))"
 
     # --- Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths ---
     Test-BRAVOCondition `
@@ -1829,6 +1831,77 @@
         ) `
         -Name "Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths" `
         -Failure "реєстр мусить використовувати 'EnumTrimmed:' саме для NotificationMode/NotificationProvider; отримано NotificationMode=$($authRegistry['bravoSettings.NotificationMode'].Validator) NotificationProvider=$($authRegistry['bravoSettings.NotificationProvider'].Validator)"
+
+    # =====================================================================
+    # PR #224 third review, R3-5: consoleSettings.ConsoleLevel/FileLevel —
+    # canonical runtime-споживач (Get-BRAVOLogSeverityValue,
+    # modules/BRAVO.Logging/BRAVO.Logging.psm1) уже робить
+    # .Trim().ToUpperInvariant() ДО порівняння з таблицею рівнів, тому ці
+    # два листи мусять зберегти pre-Wave-2 tolerance до пробілів.
+    # =====================================================================
+
+    # --- Authorization/ConsoleLevelValidatorIsTrimmed ---
+    Test-BRAVOCondition `
+        -Condition (([string]$authRegistry['consoleSettings.ConsoleLevel'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) `
+        -Name "Authorization/ConsoleLevelValidatorIsTrimmed" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' для consoleSettings.ConsoleLevel; отримано $($authRegistry['consoleSettings.ConsoleLevel'].Validator)"
+
+    # --- Authorization/FileLevelValidatorIsTrimmed ---
+    Test-BRAVOCondition `
+        -Condition (([string]$authRegistry['consoleSettings.FileLevel'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) `
+        -Name "Authorization/FileLevelValidatorIsTrimmed" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' для consoleSettings.FileLevel; отримано $($authRegistry['consoleSettings.FileLevel'].Validator)"
+
+    # --- Preview/ConsoleLevelWhitespaceAccepted ---
+    $r35ConsoleLevelWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = ' ERROR ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$r35ConsoleLevelWhitespaceResult.IsValid) `
+        -Name "Preview/ConsoleLevelWhitespaceAccepted" `
+        -Failure "consoleSettings.ConsoleLevel=' ERROR ' мусить бути прийнятий (доведена trim-tolerance runtime-споживача); отримано IsValid=$($r35ConsoleLevelWhitespaceResult.IsValid)"
+
+    # --- Preview/FileLevelWhitespaceAccepted ---
+    $r35FileLevelWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.FileLevel' = ' INFO ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$r35FileLevelWhitespaceResult.IsValid) `
+        -Name "Preview/FileLevelWhitespaceAccepted" `
+        -Failure "consoleSettings.FileLevel=' INFO ' мусить бути прийнятий (доведена trim-tolerance runtime-споживача); отримано IsValid=$($r35FileLevelWhitespaceResult.IsValid)"
+
+    # --- Preview/ConsoleFileLevelInvalidValueStillRejected ---
+    $r35ConsoleLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = ' NOTALEVEL ' } `
+        -Schema $authSchema
+    $r35FileLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.FileLevel' = ' NOTALEVEL ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$r35ConsoleLevelInvalidResult.IsValid) -and (-not [bool]$r35FileLevelInvalidResult.IsValid)) `
+        -Name "Preview/ConsoleFileLevelInvalidValueStillRejected" `
+        -Failure "trim не повинен послаблювати перелік дозволених значень — невідомий рівень мусить лишитись відхиленим для обох листів; отримано ConsoleLevel.IsValid=$($r35ConsoleLevelInvalidResult.IsValid) FileLevel.IsValid=$($r35FileLevelInvalidResult.IsValid)"
+
+    # --- Preview/ConsoleFileLevelNonStringStillRejected ---
+    $r35ConsoleLevelNonStringResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = 5 } `
+        -Schema $authSchema
+    $r35FileLevelNonStringResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.FileLevel' = $true } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$r35ConsoleLevelNonStringResult.IsValid) -and (-not [bool]$r35FileLevelNonStringResult.IsValid)) `
+        -Name "Preview/ConsoleFileLevelNonStringStillRejected" `
+        -Failure "не-рядкове значення мусить лишитись відхиленим для обох листів навіть після EnumTrimmed; отримано ConsoleLevel.IsValid=$($r35ConsoleLevelNonStringResult.IsValid) FileLevel.IsValid=$($r35FileLevelNonStringResult.IsValid)"
+
+    # --- Preview/ConsoleLevelValidationDoesNotMutateOriginalValue ---
+    $r35ConsoleLevelMutationProbeValue = ' ERROR '
+    $r35ConsoleLevelMutationProbeOverrides = @{ 'consoleSettings.ConsoleLevel' = $r35ConsoleLevelMutationProbeValue }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $r35ConsoleLevelMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$r35ConsoleLevelMutationProbeOverrides['consoleSettings.ConsoleLevel'] -eq $r35ConsoleLevelMutationProbeValue) `
+        -Name "Preview/ConsoleLevelValidationDoesNotMutateOriginalValue" `
+        -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне ConsoleLevel-значення на місці; отримано '$($r35ConsoleLevelMutationProbeOverrides['consoleSettings.ConsoleLevel'])' замість очікуваного '$r35ConsoleLevelMutationProbeValue'"
 
     # --- Authorization/RobocopyExitCodeBoundaryMatrix ---
     # Owner-decision test matrix (WAVE2-CONTRACT.md, розділ 11.0/11.6): 0/7
@@ -2146,8 +2219,11 @@
                   "requireAdministrator=$($authRegistry['requireAdministrator'].WeakeningOverride)(очікується ExistingSecurityEscapeHatch)")
 
     # --- Authorization/ViolationObjectExposesWeakeningOverrideForBazaAndRequireAdministrator ---
-    # Структурована ознака (Violation.WeakeningOverride), яку loader
-    # реально споживає замість dot-path-порівняння — доводимо на РЕАЛЬНИХ
+    # Структурована ознака (Violation.WeakeningOverride), яку canonical
+    # Test-BRAVOConfigurationWeakeningEscapeHatchAllowed реально читає
+    # ЗАМІСТЬ dot-path-порівняння (PR #224 third review, final cleanup:
+    # BRAVO_CONFIG_LOADER.ps1 більше не читає це поле напряму — делегує
+    # рішення повністю canonical helper-у) — доводимо на РЕАЛЬНИХ
     # DENY_SECURITY_CONTROL-порушеннях (не лише на сирому реєстрі вище).
     $authBazaModeViolationCheck = Test-BRAVOConfigurationOverrideAuthorization `
         -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' } `
@@ -2163,7 +2239,7 @@
             [string]$authReqAdminViolationCheck.Violations[0].WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
         ) `
         -Name "Authorization/ViolationObjectExposesWeakeningOverrideForBazaAndRequireAdministrator" `
-        -Failure "Violation.WeakeningOverride мусить бути 'None' для BAZA.Mode-порушення й 'ExistingSecurityEscapeHatch' для requireAdministrator-порушення — саме це поле loader тепер читає замість dot-path-списку"
+        -Failure "Violation.WeakeningOverride мусить бути 'None' для BAZA.Mode-порушення й 'ExistingSecurityEscapeHatch' для requireAdministrator-порушення — саме це поле canonical Test-BRAVOConfigurationWeakeningEscapeHatchAllowed тепер читає замість dot-path-списку"
 
     # --- Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed ---
     # Issue #216 Wave 2 owner remediation, п.9: МАЙБУТНІЙ (гіпотетичний,

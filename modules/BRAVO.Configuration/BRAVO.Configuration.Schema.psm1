@@ -590,18 +590,33 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'bravoSettings.ArchivePrefix' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.InstitutionCode' = @{ Class = 'ALLOW_SITE' }
     'bravoSettings.InstitutionName' = @{ Class = 'ALLOW_SITE' }
-    # PR #224 review, F3: EnumTrimmed (не Enum) — єдині 2 з 18
+    # PR #224 review, F3 + R3-5: EnumTrimmed (не Enum) — 4 з 18
     # enum-валідованих ALLOW_WITH_VALIDATOR-листів, для яких знайдено
-    # ДОКАЗ pre-Wave-2 tolerance до пробілів: усі runtime-споживачі
-    # (BRAVO_DRY_RUN.ps1 x4, BRAVO_NOTIFICATION_TEST.ps1,
-    # BRAVO_RESTORE_TEST.ps1) уже викликають
-    # .Trim().ToLowerInvariant() на цих двох значеннях ДО їх реального
-    # використання. Решта 16 enum-листів (ConsoleLevel/FileLevel/
-    # LogLevel/BootRestoreMode/robocopyWindowStyle/MultipleInstances/
-    # WeeklyOn/WindowStyle/backupConsistency.*/NotificationRouting.*)
-    # НЕ мають такого доказу в жодній точці споживання — лишаються на
-    # звичайному 'Enum:' (без trim), щоб не послаблювати авторизацію без
-    # підстави для листів, чия семантика не перевірена.
+    # ДОКАЗ pre-Wave-2 tolerance до пробілів у РЕАЛЬНОМУ runtime-
+    # споживачі:
+    #   - NotificationMode/NotificationProvider (F3): усі runtime-
+    #     споживачі (BRAVO_DRY_RUN.ps1 x4, BRAVO_NOTIFICATION_TEST.ps1,
+    #     BRAVO_RESTORE_TEST.ps1) уже викликають
+    #     .Trim().ToLowerInvariant() на цих двох значеннях ДО їх
+    #     реального використання;
+    #   - consoleSettings.ConsoleLevel/consoleSettings.FileLevel (R3-5,
+    #     PR #224 third review): canonical runtime-споживач
+    #     Get-BRAVOLogSeverityValue (modules/BRAVO.Logging/BRAVO.Logging.psm1)
+    #     уже викликає `.Trim().ToUpperInvariant()` на значенні ПЕРЕД
+    #     порівнянням із таблицею рівнів — обидва листи проєктуються в
+    #     нього незмінними через Initialize-BRAVOLog
+    #     ($script:BRAVOLogConsoleLevel/$script:BRAVOLogFileLevel,
+    #     consumed by Write-BRAVOLog), а не звичайну прямо порівнювану
+    #     Enum-семантику. Wave 2 не мав ставати першим випадком, коли
+    #     ' ERROR '/' INFO ' (історично прийнятні цими двома листами)
+    #     перетворюються на startup-помилку.
+    # Решта 14 enum-листів (defaultLogLevel/LogLevel/BootRestoreMode/
+    # robocopyWindowStyle/MultipleInstances/WeeklyOn/
+    # backupConsistency.*/NotificationRouting.*/maintenanceSettings.Logging.Level/
+    # schedulerSettings.WindowStyle) НЕ мають такого доказу в жодній
+    # точці споживання — лишаються на звичайному 'Enum:' (без trim), щоб
+    # не послаблювати авторизацію без підстави для листів, чия семантика
+    # не перевірена.
     'bravoSettings.NotificationMode' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:none,errors_only,all' }
     'bravoSettings.NotificationProvider' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:discord,slack' }
     'bravoSettings.NotificationRequestTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
@@ -624,8 +639,8 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'componentSettings.Synchronization.BAZA_WWW_SFTP' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.BackgroundColor' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.ClearOnStart' = @{ Class = 'ALLOW_SITE' }
-    'consoleSettings.ConsoleLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
-    'consoleSettings.FileLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'consoleSettings.ConsoleLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    'consoleSettings.FileLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
     'consoleSettings.ForegroundColor' = @{ Class = 'ALLOW_SITE' }
     'consoleSettings.OutputEncodingCodePage' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'WindowsCodePage' }
     'consoleSettings.PauseOnExit' = @{ Class = 'ALLOW_SITE' }
@@ -885,6 +900,63 @@ function Get-BRAVOConfigurationSchemaAuthorizationClass {
         }
     }
     return $copy
+}
+
+function Test-BRAVOConfigurationWeakeningEscapeHatchAllowed {
+    <#
+    .SYNOPSIS
+        Єдина canonical перевірка: чи МОЖЕ конкретний DENY_*-лист пройти
+        через наявний BRAVO_ALLOW_WEAKENED_SECURITY=1 механізм ЗАРАЗ
+        (PR #224 review, R3-1).
+    .DESCRIPTION
+        Комбінує дві незалежні умови в ОДНЕ рішення, щоб жоден викликач
+        (loader, Configurator preview) не повторював цю комбінацію
+        самостійно:
+          1. WeakeningOverride запису реєстру для цього Path —
+             'ExistingSecurityEscapeHatch' (canonical дозвіл на ЦЕЙ лист;
+             fail-closed 'None' за замовчуванням — див.
+             Get-BRAVOConfigurationSchemaAuthorizationClass);
+          2. фактичний стан env-змінної BRAVO_ALLOW_WEAKENED_SECURITY у
+             ПОТОЧНОМУ процесі (оператор дійсно підтвердив послаблення
+             зараз, а не лише "цей лист теоретично escapable").
+        Обидві умови МУСЯТЬ бути істинними, інакше DENY_*-порушення на
+        цьому Path лишається безумовною відмовою — той самий висновок,
+        що вже виводить BRAVO_CONFIG_LOADER.ps1 (Test-BRAVOConfigurationOverrideAuthorization
+        + власний WeakeningOverride/env-читання), тепер доступний як
+        одна canonical функція для будь-якого викликача, якому потрібне
+        те саме рішення без повторної реалізації порівняння.
+        Не приймає Value/Class — навмисно: рішення "чи ЦЕЙ Path escapable
+        ЗАРАЗ" не залежить від запропонованого значення (DENY_* — про
+        володіння листом, не про безпечність конкретного значення).
+    .PARAMETER Path
+        Канонічний dot-шлях, що перевіряється.
+    .PARAMETER AuthorizationClass
+        Опційно — вже отриманий результат Get-BRAVOConfigurationSchemaAuthorizationClass
+        (уникає повторного виклику, коли викликач уже його має). За
+        замовчуванням функція отримує свіжу копію сама.
+    .OUTPUTS
+        [bool]
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [hashtable]$AuthorizationClass
+    )
+
+    $registry = $AuthorizationClass
+    if ($null -eq $registry) {
+        $registry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    }
+
+    if (-not $registry.Contains($Path)) { return $false }
+
+    $weakeningOverride = [string]$registry[$Path].WeakeningOverride
+    if ($weakeningOverride -ne $script:BRAVOConfigurationSchemaWeakeningOverrideExistingEscapeHatch) {
+        return $false
+    }
+
+    return ([System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY') -eq '1')
 }
 
 function Test-BRAVOConfigurationAuthorizationEnumValue {
@@ -1570,4 +1642,5 @@ Export-ModuleMember -Function @(
     ,'Test-BRAVOConfigurationOverrideAuthorization'
     ,'Get-BRAVOConfigurationSchemaAuthorizationClass'
     ,'Test-BRAVOConfigurationAuthorizationValidatorValue'
+    ,'Test-BRAVOConfigurationWeakeningEscapeHatchAllowed'
 )
