@@ -1092,9 +1092,20 @@ function Show-BRAVOConfiguratorMainForm {
         Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
     }
     $authorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
-    $schemaCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $rawSchemaCatalog -AuthorizationClass $authorizationClass
+    $staticSchemaCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $rawSchemaCatalog -AuthorizationClass $authorizationClass
 
     $productionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $RuntimeRoot -ProductionConfigDirectory $ProductionConfigDirectory
+    # PR #224 review (P2, "Expose validator-rejected noncatalog overrides
+    # for recovery"): $staticSchemaCatalog доповнюється (не замінюється)
+    # 0..N синтезованими recovery-only дескрипторами для canonical
+    # ALLOW_WITH_VALIDATOR-листів без статичного дескриптора, чиє ПОТОЧНЕ
+    # supplied-значення canonical авторизація відхиляє. $schemaCatalog
+    # (augmented) — єдине джерело істини для Model/UI/Persistence цієї
+    # сесії; $staticSchemaCatalog зберігається окремо в $state, щоб
+    # Reload/post-Apply-reload нижче могли перерахувати augmented-каталог
+    # зі свіжим LocalOverrides (рядок природно зникає, коли значення
+    # прибрано з диска).
+    $schemaCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $staticSchemaCatalog -LocalOverrides $productionBaseline.Overrides
     $defaultConfig = Invoke-BRAVOConfiguratorEffectiveComputation -RuntimeRoot $RuntimeRoot -CandidateOverrides @{}
     $initialModel = Get-BRAVOConfiguratorModel -SchemaCatalog $schemaCatalog -DefaultConfig $defaultConfig -LocalOverrides $productionBaseline.Overrides
     $initialModel = Update-BRAVOConfiguratorEffective -Model $initialModel -RuntimeRoot $RuntimeRoot
@@ -1104,6 +1115,7 @@ function Show-BRAVOConfiguratorMainForm {
         RuntimeRoot               = $RuntimeRoot
         ProductionConfigDirectory = $ProductionConfigDirectory
         SchemaCatalog              = $schemaCatalog
+        StaticSchemaCatalog        = $staticSchemaCatalog
         ProductionBaseline         = $productionBaseline
         OriginalModel              = $initialModel
         Model                      = $initialModel
@@ -1679,6 +1691,10 @@ function Show-BRAVOConfiguratorMainForm {
             Show-BRAVOConfiguratorUIMessage -Text "Застосовано успішно. Змінені шляхи: $($applyResult.AppliedPaths -join ', ')"
             # Reload з диску — стан після Apply стає новим baseline/OriginalModel.
             $state.ProductionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $state.RuntimeRoot -ProductionConfigDirectory $state.ProductionConfigDirectory
+            # P2 (recovery-only rows): перерахувати augmented-каталог зі
+            # свіжим LocalOverrides — successfully cleared/corrected
+            # validator-rejected лист більше не синтезує recovery-рядок.
+            $state.SchemaCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $state.StaticSchemaCatalog -LocalOverrides $state.ProductionBaseline.Overrides
             $reloadedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $state.SchemaCatalog -DefaultConfig $defaultConfig -LocalOverrides $state.ProductionBaseline.Overrides
             $reloadedModel = Update-BRAVOConfiguratorEffective -Model $reloadedModel -RuntimeRoot $state.RuntimeRoot
             $state.Model = $reloadedModel
@@ -1717,6 +1733,10 @@ function Show-BRAVOConfiguratorMainForm {
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
         try {
             $state.ProductionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $state.RuntimeRoot -ProductionConfigDirectory $state.ProductionConfigDirectory
+            # P2 (recovery-only rows): перерахувати augmented-каталог зі
+            # свіжим LocalOverrides — та сама причина, що Apply-success
+            # reload вище.
+            $state.SchemaCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $state.StaticSchemaCatalog -LocalOverrides $state.ProductionBaseline.Overrides
             $reloadedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $state.SchemaCatalog -DefaultConfig $defaultConfig -LocalOverrides $state.ProductionBaseline.Overrides
             $reloadedModel = Update-BRAVOConfiguratorEffective -Model $reloadedModel -RuntimeRoot $state.RuntimeRoot
             $state.Model = $reloadedModel

@@ -237,6 +237,34 @@ try {
         -Name "Loader/DefaultLogLevelWhitespaceCompatibility" `
         -Failure "defaultLogLevel=' ERROR ' (з пробілами) мусить проходити реальний Import-BravoConfiguration без throw і без мутації сирого значення; отримано: '$localCfgDefaultLogLevelProbeLast'"
 
+    # --- Loader/OutputEncodingCodePageZeroCompatibility (PR #224 review,
+    # п'яте коло, P2 "Permit the valid Windows code page zero"):
+    # consoleSettings.OutputEncodingCodePage=0 мусить проходити весь
+    # loader-конвеєр БЕЗ throw — [System.Text.Encoding]::GetEncoding(0),
+    # реальний production-споживач (BRAVO.Archive.Runtime.ps1), сам
+    # приймає 0 (системна ANSI code page). Регресія перевіряється через
+    # реальний Import-BravoConfiguration (не лише ізольований виклик
+    # валідатора вище).
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'consoleSettings.OutputEncodingCodePage' = 0`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgCodePageProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'NOTHREW:' + [string]`$global:consoleSettings.OutputEncodingCodePage " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgCodePageProbeLast = ([string](@($localCfgCodePageProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgCodePageProbeLast -eq 'NOTHREW:0') `
+        -Name "Loader/OutputEncodingCodePageZeroCompatibility" `
+        -Failure "consoleSettings.OutputEncodingCodePage=0 мусить проходити реальний Import-BravoConfiguration без throw; отримано: '$localCfgCodePageProbeLast'"
+
     # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",

@@ -1629,6 +1629,74 @@
         -Name "Authorization/UnknownValidatorIdFailsClosed" `
         -Failure "невідомий ідентифікатор валідатора мусить FAIL CLOSED (throw), а не мовчазний accept"
 
+    # =====================================================================
+    # PR #224 review, п'яте коло (P2, "Permit the valid Windows code page
+    # zero"): production-споживач (consoleSettings.OutputEncodingCodePage,
+    # modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1:513) викликає
+    # [System.Text.Encoding]::GetEncoding($Value) НАПРЯМУ, а
+    # Encoding.GetEncoding(0) — ВАЛІДНИЙ .NET-виклик (системна ANSI code
+    # page за замовчуванням). Мінімум IntegerRange змінено з 1 на 0 —
+    # жодного окремого спецвипадку для 0, canonical Encoding.GetEncoding
+    # і далі вирішує, чи саме число розпізнається.
+    # =====================================================================
+
+    # --- Configuration/WindowsCodePageZeroAccepted ---
+    $wcpZeroResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 0 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition ([bool]$wcpZeroResult.IsValid) `
+        -Name "Configuration/WindowsCodePageZeroAccepted" `
+        -Failure "0 мусить бути прийнятий — [System.Text.Encoding]::GetEncoding(0) валідний .NET-виклик (системна ANSI code page); отримано IsValid=$($wcpZeroResult.IsValid) Message=$($wcpZeroResult.Message)"
+
+    # --- Configuration/WindowsCodePageKnownValidAccepted ---
+    $wcpKnownResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65001 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition ([bool]$wcpKnownResult.IsValid) `
+        -Name "Configuration/WindowsCodePageKnownValidAccepted" `
+        -Failure "65001 (UTF-8) мусить лишитись прийнятим після зміни мінімуму діапазону; отримано IsValid=$($wcpKnownResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageNegativeRejected ---
+    $wcpNegativeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value -1 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$wcpNegativeResult.IsValid) `
+        -Name "Configuration/WindowsCodePageNegativeRejected" `
+        -Failure "від'ємне значення (-1) мусить лишитись відхиленим — розширення діапазону стосується лише 0, не негативних чисел; отримано IsValid=$($wcpNegativeResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageTooLargeRejected ---
+    $wcpTooLargeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65536 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$wcpTooLargeResult.IsValid) `
+        -Name "Configuration/WindowsCodePageTooLargeRejected" `
+        -Failure "значення понад 65535 мусить лишитись відхиленим; отримано IsValid=$($wcpTooLargeResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageUnsupportedPositiveRejected ---
+    $wcpUnsupportedResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 99999999 -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpUnsupportedInRangeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65535 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$wcpUnsupportedResult.IsValid) -and (-not [bool]$wcpUnsupportedInRangeResult.IsValid)) `
+        -Name "Configuration/WindowsCodePageUnsupportedPositiveRejected" `
+        -Failure "структурно допустиме, але .NET Encoding-ом нерозпізнаване число (напр. 65535, поза range у 99999999) мусить лишитись відхиленим canonical Encoding.GetEncoding; отримано OutOfRange.IsValid=$($wcpUnsupportedResult.IsValid) InRangeUnknown.IsValid=$($wcpUnsupportedInRangeResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageNonIntegerRejected ---
+    $wcpStringResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value '65001' -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpDecimalResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65001.5 -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpBoolResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value $true -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpNullResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value $null -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition (
+            (-not [bool]$wcpStringResult.IsValid) -and (-not [bool]$wcpDecimalResult.IsValid) -and
+            (-not [bool]$wcpBoolResult.IsValid) -and (-not [bool]$wcpNullResult.IsValid)
+        ) `
+        -Name "Configuration/WindowsCodePageNonIntegerRejected" `
+        -Failure "рядок/дробове/Boolean/`$null мусять лишитись відхиленими; отримано String.IsValid=$($wcpStringResult.IsValid) Decimal.IsValid=$($wcpDecimalResult.IsValid) Bool.IsValid=$($wcpBoolResult.IsValid) Null.IsValid=$($wcpNullResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageValidationDoesNotMutateOriginalValue ---
+    $wcpMutationProbeOverrides = @{ 'consoleSettings.OutputEncodingCodePage' = 0 }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $wcpMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([int]$wcpMutationProbeOverrides['consoleSettings.OutputEncodingCodePage'] -eq 0) `
+        -Name "Configuration/WindowsCodePageValidationDoesNotMutateOriginalValue" `
+        -Failure "валідація НЕ повинна мутувати вхідне значення на місці; отримано '$($wcpMutationProbeOverrides['consoleSettings.OutputEncodingCodePage'])' замість очікуваного 0"
+
     # --- Authorization/AllowSiteAccepted ---
     $authAllowSiteResult = Test-BRAVOConfigurationOverrideAuthorization `
         -DotPathOverrides @{ 'archiveRetentionDays' = 45 } `

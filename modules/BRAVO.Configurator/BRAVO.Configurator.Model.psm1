@@ -492,6 +492,31 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
         від того, який варіант schema-каталогу (сирий чи вже пропущений
         через Resolve-BRAVOConfiguratorFieldAuthorization) конкретний
         викликач використав для побудови Model.
+
+        PR #224 review (P1, "Let Configurator recover validator-rejected
+        overrides"): раніше цикл нижче перевіряв ЛИШЕ DENY_*-клас напряму
+        з реєстру — ALLOW_WITH_VALIDATOR-лист з невалідним supplied-
+        значенням (напр. maintenanceSettings.Restore.BootRestoreMode =
+        'Bogus', legacy-значення, яке ІСТОРИЧНО canonical loader сам
+        нормалізував у попередження + безпечний fallback ДО Wave 2)
+        проєктувався в preview НЕЗМІНЕНИМ і canonical loader відхиляв
+        його під час КОЖНОГО startup/recalculate — Configurator взагалі
+        не міг відкритись, щоб дати оператору виправити чи Clear-нути
+        значення. Тепер ОДИН прохід через canonical
+        Test-BRAVOConfigurationOverrideAuthorization (та сама функція, що
+        й loader/Persistence-гейт використовують) над усім проєктованим
+        candidate-шаром класифікує КОЖЕН OverridePresent-лист одразу —
+        жодного окремого дублювання per-Class логіки для
+        ValidatorRejected. Violations із Reason='ValidatorRejected'
+        ЗАВЖДИ виключаються з preview-candidate (незалежно від
+        WeakeningOverride — послаблення стосується лише DENY_*-власності
+        листа, не невалідного значення валідованого листа). Violations із
+        Class, що починається на 'DENY_', виключаються ЯКЩО НЕ escapable
+        зараз — той самий F2/R3-1-контракт, що діяв і до цього рефакторингу,
+        збережений через ІДЕНТИЧНУ Test-BRAVOConfigurationWeakeningEscapeHatchAllowed-
+        перевірку. Модель (OverridePresent/OverrideValue) НІКОЛИ не
+        мутується цим викликом — і DENY_*, і ValidatorRejected-значення
+        лишаються видимими UI для відображення/Clear/виправлення.
     #>
     [CmdletBinding()]
     param(
@@ -509,23 +534,162 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
     $overrides = @{}
     foreach ($setting in $Model) {
         if (-not $setting.OverridePresent) { continue }
-        $path = [string]$setting.Path
-        if ($authorizationClass.Contains($path)) {
-            $class = [string]$authorizationClass[$path].Class
-            if ($class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
-                $escapeHatchAllowed = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $path -AuthorizationClass $authorizationClass
-                if (-not $escapeHatchAllowed) {
-                    # Legacy/сторонній DENY_*-override, не escapable
-                    # зараз (R3-1) — не передається canonical loader-у
-                    # для preview-обчислення (F2). Model лишається
-                    # незмінною для UI.
-                    continue
-                }
+        $overrides[[string]$setting.Path] = $setting.OverrideValue
+    }
+    if ($overrides.Count -eq 0) { return $overrides }
+
+    $canonicalSchema = Get-BRAVOConfigurationSchema -ReferenceConfiguration (Get-BRAVODefaultConfiguration)
+    $authorizationResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $overrides -Schema $canonicalSchema
+
+    foreach ($violation in @($authorizationResult.Violations)) {
+        $violationPath = [string]$violation.Path
+        $violationClass = [string]$violation.Class
+        if ($violationClass.StartsWith('DENY_', [System.StringComparison]::Ordinal)) {
+            $escapeHatchAllowed = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $violationPath -AuthorizationClass $authorizationClass
+            if ($escapeHatchAllowed) {
+                # DENY_*, але зараз escapable (R3-1, лише requireAdministrator
+                # сьогодні) -> preview МАЄ показати те саме значення, яке
+                # реально стане ефективним у canonical loader з тим самим env.
+                continue
             }
         }
-        $overrides[$path] = $setting.OverrideValue
+        # DENY_* (не escapable зараз) АБО ValidatorRejected (невалідне
+        # ALLOW_WITH_VALIDATOR-значення) АБО будь-яка інша канонічна
+        # відмова — не передається canonical loader-у для preview-
+        # обчислення. Model лишається незмінною для UI.
+        [void]$overrides.Remove($violationPath)
     }
+
     return $overrides
+}
+
+function Get-BRAVOConfiguratorSessionSchemaCatalog {
+    <#
+    .SYNOPSIS
+        PR #224 review (P2, "Expose validator-rejected noncatalog overrides
+        for recovery"): один augmented каталог дескрипторів для ПОТОЧНОЇ
+        сесії — статичний каталог (типово
+        Resolve-BRAVOConfiguratorFieldAuthorization-результат) плюс
+        ДИНАМІЧНО синтезовані recovery-only дескриптори для canonical
+        ALLOW_WITH_VALIDATOR-листів, яких немає у статичному каталозі, але
+        чиє ПОТОЧНЕ supplied-значення canonical авторизація відхиляє
+        (Reason='ValidatorRejected').
+    .DESCRIPTION
+        Приклад: schedulerSettings.RestoreVerify.WeeklyOn='Funday' —
+        canonical leaf, ALLOW_WITH_VALIDATOR, ІСТОРИЧНО loader сам
+        нормалізував невідоме значення в попередження + safe fallback
+        (Saturday) ДО Wave 2, але не має статичного Configurator-
+        дескриптора — тож без цієї функції Model про нього нічого не
+        знає, Merge-BRAVOConfiguratorCandidateOverrides лишає значення
+        незмінним при КОЖНОМУ Apply, а canonical loader відхиляє КОЖЕН
+        Apply — оператор не може прибрати легасі-значення через
+        Configurator (recovery deadlock).
+
+        Детекція ЦІЛКОМ похідна від canonical
+        Test-BRAVOConfigurationOverrideAuthorization (включно з
+        Resolve-BRAVOConfiguratorSuppliedLeafOverride для нейтральної
+        плоскої/вкладеної форми supplied-значення) — жодного другого
+        валідатора чи власної класифікаційної таблиці тут немає.
+
+        ОДИН session-рівня результат ЦІЄЇ функції МАЄ передаватись
+        консистентно в Get-BRAVOConfiguratorModel, dirty tracking, UI-
+        рендер і Invoke-BRAVOConfiguratorApply (через $state.SchemaCatalog) —
+        інакше Model бачила б recovery-рядок, а
+        Merge-BRAVOConfiguratorCandidateOverrides (яка ітерує ЛИШЕ по
+        $SchemaCatalog.Path) його не бачила б, і Clear мовчки ігнорувався
+        б при Apply. Викликач ПОВИНЕН перевикликати цю функцію після
+        кожного Reload/успішного Apply (зі свіжим LocalOverrides), щоб
+        рядок, чий override зник з диска, природно перестав
+        синтезуватись — жодного явного "видалення рядка" не потрібно.
+
+        Синтезований дескриптор:
+          - ReadOnly = $true (той самий UI-механізм, що вже дає "зняти
+            наявний override можна, створити новий не можна" для
+            backupMonitoring.SFTP.BAZA.Mode/.MutationPolicy — F2:
+            checkbox.Enabled лишається $true, коли OverridePresent,
+            valueControl.Enabled завжди $false для ReadOnly — редагувати
+            значення через Configurator неможливо, лише Clear);
+          - НЕ додається для Path, вже представленого статичним
+            каталогом (нормальна UI-експозиція лишається під контролем
+            каталогу, не цієї функції) — жоден canonical/DENY_*-шлях, уже
+            маючий дескриптор (у т.ч. BAZA.Mode/.MutationPolicy), тут не
+            дублюється;
+          - НЕ додається для DENY_*-класу (той механізм — окремий, уже
+            існуючий, статичний дескриптор +
+            Resolve-BRAVOConfiguratorFieldAuthorization);
+          - НЕ додається для валідного supplied-значення (авторизація
+            IsValid=$true — нормальний ALLOW_WITH_VALIDATOR override,
+            нічого відновлювати, D3/невідомі ключі лишаються geть
+            незачепленими цією функцією).
+    .PARAMETER StaticCatalog
+        Звичайний UI-каталог (типово результат
+        Resolve-BRAVOConfiguratorFieldAuthorization) — статичні
+        дескриптори НЕ мутуються, лише доповнюються.
+    .PARAMETER LocalOverrides
+        Поточний production override-шар (типово
+        Read-BRAVOLocalConfigurationOverrides.Overrides /
+        Get-BRAVOConfiguratorProductionOverrideState.Overrides).
+    .OUTPUTS
+        [object[]] — $StaticCatalog + 0..N синтезованих recovery-only
+        дескрипторів.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true)][array]$StaticCatalog,
+        [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
+    )
+
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
+    }
+
+    $augmented = New-Object System.Collections.Generic.List[object]
+    $staticPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($descriptor in $StaticCatalog) {
+        [void]$augmented.Add($descriptor)
+        [void]$staticPaths.Add([string]$descriptor.Path)
+    }
+
+    if ($LocalOverrides.Count -eq 0) { return $augmented.ToArray() }
+
+    $authorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $canonicalSchema = Get-BRAVOConfigurationSchema -ReferenceConfiguration (Get-BRAVODefaultConfiguration)
+
+    $recoveryOrder = 90000
+    foreach ($path in @($authorizationClass.Keys | Sort-Object)) {
+        if ($staticPaths.Contains($path)) { continue }
+        $entry = $authorizationClass[$path]
+        if ([string]$entry.Class -ne 'ALLOW_WITH_VALIDATOR') { continue }
+
+        $supplied = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $LocalOverrides -LeafPath $path
+        if (-not $supplied.Found) { continue }
+
+        $authResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ $path = $supplied.Value } -Schema $canonicalSchema
+        if ($authResult.IsValid) { continue }
+        $violation = @($authResult.Violations | Where-Object { [string]$_.Path -eq $path })
+        if ($violation.Count -eq 0 -or [string]$violation[0].Reason -ne 'ValidatorRejected') { continue }
+
+        $recoveryOrder++
+        [void]$augmented.Add(@{
+            Path        = $path
+            Group       = 'Recovery'
+            Section     = 'ValidatorRejected'
+            Label       = "Відновлення (невалідне значення): $path"
+            Description = "Наявний local override для '$path' не проходить canonical валідацію: $($violation[0].Message) Поле лише для перегляду/Clear через Configurator; нове значення тут ввести не можна. Виправте значення напряму у BRAVO.local.config, щоб знову зробити цей лист звичайним редагованим полем."
+            Type        = 'String'
+            Phase       = 1
+            Advanced    = $true
+            ReadOnly    = $true
+            Secret      = $false
+            Order       = $recoveryOrder
+        })
+    }
+
+    return $augmented.ToArray()
 }
 
 function Test-BRAVOConfiguratorValueEquality {
@@ -774,6 +938,7 @@ Export-ModuleMember -Function @(
     'Set-BRAVOConfiguratorOverride',
     'Clear-BRAVOConfiguratorOverride',
     'ConvertTo-BRAVOConfiguratorOverrideHashtable',
+    'Get-BRAVOConfiguratorSessionSchemaCatalog',
     'Test-BRAVOConfiguratorValueEquality',
     'Update-BRAVOConfiguratorEffective',
     'Test-BRAVOConfiguratorModelDirty',

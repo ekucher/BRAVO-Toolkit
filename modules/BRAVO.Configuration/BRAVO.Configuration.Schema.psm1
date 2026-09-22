@@ -1063,6 +1063,17 @@ function Test-BRAVOConfigurationAuthorizationWindowsCodePage {
     # Число ДОДАТКОВО мусить бути розпізнаваним .NET Encoding code page —
     # ціле в правдоподібному діапазоні, яке .NET все одно не знає, все
     # одно відхиляється (напр. 99999).
+    #
+    # PR #224 review (P2, "Permit the valid Windows code page zero"):
+    # мінімум навмисно 0 (не 1) — [System.Text.Encoding]::GetEncoding(0)
+    # ВАЛІДНИЙ .NET-виклик (системна ANSI code page за замовчуванням),
+    # той самий API, що й production-споживач консолі/WinSCP-кодування
+    # використовує напряму. Діапазон нижче лише відсіює структурно
+    # неможливі значення (від'ємні/дробові/нецілі/понад 65535) ДО
+    # звернення до .NET; чи КОНКРЕТНЕ невід'ємне число (0 включно) —
+    # розпізнаваний code page, і далі вирішує вже сам
+    # Encoding.GetEncoding нижче — жодного окремого спецвипадку для 0
+    # тут не додано.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -1070,7 +1081,7 @@ function Test-BRAVOConfigurationAuthorizationWindowsCodePage {
         [Parameter(Mandatory = $true)][string]$Path
     )
 
-    $rangeResult = Test-BRAVOConfigurationAuthorizationIntegerRange -Value $Value -Minimum 1 -Maximum 65535 -Path $Path
+    $rangeResult = Test-BRAVOConfigurationAuthorizationIntegerRange -Value $Value -Minimum 0 -Maximum 65535 -Path $Path
     if (-not $rangeResult.IsValid) { return $rangeResult }
     try {
         [void][System.Text.Encoding]::GetEncoding([int]$Value)

@@ -1938,6 +1938,314 @@ try {
 }
 
 # =====================================================================
+# PR #224 review, п'яте коло (P1, "Let Configurator recover validator-
+# rejected overrides"): cataloged ALLOW_WITH_VALIDATOR-лист з невалідним
+# supplied-значенням (напр. maintenanceSettings.Restore.BootRestoreMode =
+# 'Bogus', legacy-значення, яке ІСТОРИЧНО loader сам нормалізував у
+# попередження + safe fallback ДО Wave 2) раніше проєктувався в preview
+# незмінено, і canonical loader відхиляв ЙОГО ПРИ КОЖНОМУ startup/
+# recalculate — Configurator взагалі не міг відкритись. Тепер
+# ConvertTo-BRAVOConfiguratorOverrideHashtable виключає такий лист із
+# preview-candidate (Model лишається незмінною — OverridePresent/
+# OverrideValue видимі для виправлення/Clear).
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $vrCatPath = 'maintenanceSettings.Restore.BootRestoreMode'
+    $vrCatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_CATALOG_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrCatScenarioRoot)
+    try {
+        $vrCatLocalConfigPath = Join-Path $vrCatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrCatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrCatPath = 'Bogus' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $vrCatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatScenarioRoot
+        $vrCatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrCatBaseline.Overrides
+        $vrCatSetting = @($vrCatModel | Where-Object { $_.Path -eq $vrCatPath })
+
+        # --- Configurator/ValidatorRejectedCatalogOverridePreviewIsRecoverable ---
+        $vrCatPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $vrCatModel
+        Test-BRAVOCondition (
+            $vrCatSetting.Count -eq 1 -and [bool]$vrCatSetting[0].OverridePresent -and [string]$vrCatSetting[0].OverrideValue -eq 'Bogus' -and
+            (-not $vrCatPreview.Contains($vrCatPath))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverridePreviewIsRecoverable' `
+            "невалідне ALLOW_WITH_VALIDATOR-значення ($vrCatPath='Bogus') мусить лишитись у Model (OverridePresent/OverrideValue), АЛЕ бути виключеним із preview-candidate, щоб canonical loader не блокував старт Configurator-а; отримано OverridePresent=$($vrCatSetting[0].OverridePresent) OverrideValue=$($vrCatSetting[0].OverrideValue) PreviewContains=$($vrCatPreview.Contains($vrCatPath))"
+
+        $vrCatEffectiveThrew = $false
+        $vrCatModelWithEffective = $vrCatModel
+        try {
+            $vrCatModelWithEffective = Update-BRAVOConfiguratorEffective -Model $vrCatModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        } catch {
+            $vrCatEffectiveThrew = $true
+        }
+        Test-BRAVOCondition (-not $vrCatEffectiveThrew) `
+            'Configurator/ValidatorRejectedCatalogOverrideStartupPreviewDoesNotThrow' `
+            'Update-BRAVOConfiguratorEffective (startup/recalculate preview) НЕ повинен кинути виняток лише через невалідне ALLOW_WITH_VALIDATOR-значення в Model'
+
+        # --- Configurator/ValidatorRejectedCatalogOverrideApplyUnchangedFails ---
+        $vrCatPreApplyBytes = [IO.File]::ReadAllBytes($vrCatLocalConfigPath)
+        $vrCatApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatScenarioRoot -Model $vrCatModelWithEffective -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $vrCatBaseline
+        $vrCatPostApplyBytes = [IO.File]::ReadAllBytes($vrCatLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$vrCatApplyUnchanged.Applied) -and
+            ([Convert]::ToBase64String($vrCatPreApplyBytes) -eq [Convert]::ToBase64String($vrCatPostApplyBytes))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideApplyUnchangedFails' `
+            "Apply з незмінним невалідним $vrCatPath='Bogus' мусить провалитись (fail-closed через canonical loader), production-файл лишається побайтово незмінним; отримано Applied=$($vrCatApplyUnchanged.Applied) Stage=$($vrCatApplyUnchanged.Stage)"
+
+        # --- Configurator/ValidatorRejectedCatalogOverrideCanBeCorrected ---
+        $vrCatCorrectedModel = Set-BRAVOConfiguratorOverride -Model $vrCatModel -Path $vrCatPath -Value 'None'
+        $vrCatCorrectedModel = Update-BRAVOConfiguratorEffective -Model $vrCatCorrectedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrCatApplyCorrected = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatScenarioRoot -Model $vrCatCorrectedModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $vrCatBaseline
+        Test-BRAVOCondition (
+            [bool]$vrCatApplyCorrected.Applied -and [string]$vrCatApplyCorrected.Stage -eq 'Complete'
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideCanBeCorrected' `
+            "виправлення $vrCatPath на валідне 'None' мусить дозволити успішний Apply; отримано Applied=$($vrCatApplyCorrected.Applied) Stage=$($vrCatApplyCorrected.Stage)"
+    } finally {
+        Remove-Item -LiteralPath $vrCatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Configurator/ValidatorRejectedCatalogOverrideCanBeCleared --- (незалежний сценарій)
+    $vrCatClearScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_CLEAR_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrCatClearScenarioRoot)
+    try {
+        $vrCatClearLocalConfigPath = Join-Path $vrCatClearScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrCatClearLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrCatPath = 'Bogus' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $vrCatClearBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatClearScenarioRoot
+        $vrCatClearModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrCatClearBaseline.Overrides
+        $vrCatCleared = Clear-BRAVOConfiguratorOverride -Model $vrCatClearModel -Path $vrCatPath
+        $vrCatCleared = Update-BRAVOConfiguratorEffective -Model $vrCatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrCatApplyCleared = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatClearScenarioRoot -Model $vrCatCleared -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $vrCatClearBaseline
+        $vrCatClearFinalContent = if (Test-Path -LiteralPath $vrCatClearLocalConfigPath) { Get-Content -LiteralPath $vrCatClearLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$vrCatApplyCleared.Applied -and [string]$vrCatApplyCleared.Stage -eq 'Complete' -and (-not $vrCatClearFinalContent.Contains($vrCatPath))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideCanBeCleared' `
+            "Clear невалідного $vrCatPath мусить дозволити успішний Apply, результат більше не містить цей шлях; отримано Applied=$($vrCatApplyCleared.Applied) Stage=$($vrCatApplyCleared.Stage)"
+    } finally {
+        Remove-Item -LiteralPath $vrCatClearScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Configurator/ValidatorRejectedCatalogOverrideGenericAcrossPaths ---
+    # Доказ generic-механізму: ДРУГИЙ cataloged ALLOW_WITH_VALIDATOR-лист
+    # (consoleSettings.ConsoleLevel, НЕ BootRestoreMode) з невалідним
+    # значенням поводиться ідентично — жодного per-path спецкоду.
+    $vrGenericPath = 'consoleSettings.ConsoleLevel'
+    $vrGenericScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_GENERIC_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrGenericScenarioRoot)
+    try {
+        [IO.File]::WriteAllText(
+            (Join-Path $vrGenericScenarioRoot 'BRAVO.local.config'),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrGenericPath = 'NOTALEVEL' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $vrGenericBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrGenericScenarioRoot
+        $vrGenericModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrGenericBaseline.Overrides
+        $vrGenericPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $vrGenericModel
+        $vrGenericSetting = @($vrGenericModel | Where-Object { $_.Path -eq $vrGenericPath })
+        Test-BRAVOCondition (
+            $vrGenericSetting.Count -eq 1 -and [bool]$vrGenericSetting[0].OverridePresent -and (-not $vrGenericPreview.Contains($vrGenericPath))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideGenericAcrossPaths' `
+            "механізм preview-фільтрації мусить бути generic (не BootRestoreMode-специфічним) — той самий ефект для $vrGenericPath='NOTALEVEL'; отримано OverridePresent=$($vrGenericSetting[0].OverridePresent) PreviewContains=$($vrGenericPreview.Contains($vrGenericPath))"
+    } finally {
+        Remove-Item -LiteralPath $vrGenericScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 review, п'яте коло (P2, "Expose validator-rejected noncatalog
+# overrides for recovery"): schedulerSettings.RestoreVerify.WeeklyOn —
+# canonical ALLOW_WITH_VALIDATOR-лист, ІСТОРИЧНО loader сам нормалізував
+# невідоме значення в попередження + safe fallback ('Saturday') ДО Wave 2,
+# але БЕЗ статичного Configurator-дескриптора: Model про нього нічого не
+# знала, Merge-BRAVOConfiguratorCandidateOverrides лишав значення
+# незмінним при КОЖНОМУ Apply, canonical loader відхиляв КОЖЕН Apply —
+# оператор не міг прибрати легасі-значення через Configurator (recovery
+# deadlock). Get-BRAVOConfiguratorSessionSchemaCatalog синтезує
+# recovery-only дескриптор ЛИШЕ поки невалідний override існує — жодного
+# per-path спецкоду, ЦІЛКОМ похідно від canonical
+# Test-BRAVOConfigurationOverrideAuthorization.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $vrNcPath = 'schedulerSettings.RestoreVerify.WeeklyOn'
+    $vrNcContainerPath = 'schedulerSettings.RestoreVerify'
+    $vrNcSiblingPath = 'schedulerSettings.RestoreVerify.Enabled'
+    $vrNcValidNoncatalogPath = 'schedulerSettings.RestoreVerify.At'
+    $vrNcRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+
+    # --- Configurator/RecoveryRowCannotCreateFreshOverride (чистий конфіг) ---
+    $vrNcCleanSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides @{}
+    Test-BRAVOCondition (
+        -not (@($vrNcCleanSessionCatalog | Where-Object { $_.Path -eq $vrNcPath }))
+    ) `
+        'Configurator/RecoveryRowCannotCreateFreshOverride' `
+        "БЕЗ наявного invalid override augmented-каталог НЕ повинен синтезувати recovery-рядок для $vrNcPath — оператор не може створити його з чистого конфігу через Configurator"
+
+    # ===== Плоский (flat) легасі-override =====
+    $vrNcFlatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_NONCATALOG_FLAT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrNcFlatScenarioRoot)
+    try {
+        $vrNcFlatLocalConfigPath = Join-Path $vrNcFlatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrNcFlatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $vrNcPath        = 'Funday'
+                $vrNcSiblingPath = $true
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $vrNcFlatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcFlatScenarioRoot
+        $vrNcFlatSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcFlatBaseline.Overrides
+        $vrNcFlatRecoveryDescriptor = @($vrNcFlatSessionCatalog | Where-Object { $_.Path -eq $vrNcPath })
+        $vrNcFlatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $vrNcFlatSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrNcFlatBaseline.Overrides
+        $vrNcFlatSetting = @($vrNcFlatModel | Where-Object { $_.Path -eq $vrNcPath })
+
+        # --- Configurator/ValidatorRejectedNonCatalogRecoveryRowExists ---
+        Test-BRAVOCondition (
+            (-not (@($vrNcRawCatalog | Where-Object { $_.Path -eq $vrNcPath }))) -and
+            $vrNcFlatRecoveryDescriptor.Count -eq 1 -and [bool]$vrNcFlatRecoveryDescriptor[0].ReadOnly -and
+            $vrNcFlatSetting.Count -eq 1 -and [bool]$vrNcFlatSetting[0].OverridePresent -and [string]$vrNcFlatSetting[0].OverrideValue -eq 'Funday'
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogRecoveryRowExists' `
+            "$vrNcPath не має статичного дескриптора, але з наявним невалідним override augmented-каталог мусить синтезувати РІВНО один recovery-only (ReadOnly) рядок, а Model — показувати OverridePresent=true/OverrideValue='Funday'; отримано StaticHasIt=$([bool](@($vrNcRawCatalog | Where-Object { $_.Path -eq $vrNcPath }))) RecoveryCount=$($vrNcFlatRecoveryDescriptor.Count) OverridePresent=$($vrNcFlatSetting[0].OverridePresent) Value=$($vrNcFlatSetting[0].OverrideValue)"
+
+        # --- Configurator/ValidatorRejectedNonCatalogFlatClearSucceeds ---
+        $vrNcFlatCleared = Clear-BRAVOConfiguratorOverride -Model $vrNcFlatModel -Path $vrNcPath
+        $vrNcFlatCleared = Update-BRAVOConfiguratorEffective -Model $vrNcFlatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrNcFlatApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcFlatScenarioRoot -Model $vrNcFlatCleared -SchemaCatalog $vrNcFlatSessionCatalog -ProductionBaseline $vrNcFlatBaseline
+        $vrNcFlatFinalContent = if (Test-Path -LiteralPath $vrNcFlatLocalConfigPath) { Get-Content -LiteralPath $vrNcFlatLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$vrNcFlatApply.Applied -and [string]$vrNcFlatApply.Stage -eq 'Complete' -and
+            (-not $vrNcFlatFinalContent.Contains('Funday')) -and $vrNcFlatFinalContent.Contains($vrNcSiblingPath)
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogFlatClearSucceeds' `
+            "Clear невалідного плоского $vrNcPath мусить дозволити успішний Apply (Applied=`$true, Stage=Complete), 'Funday' зникає з файлу, сусідній $vrNcSiblingPath переживає; отримано Applied=$($vrNcFlatApply.Applied) Stage=$($vrNcFlatApply.Stage) Content=$vrNcFlatFinalContent"
+
+        # --- Post-Clear: рядок природно зникає з наступного augmented-каталогу ---
+        $vrNcFlatBaselineAfter = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcFlatScenarioRoot
+        $vrNcFlatSessionCatalogAfter = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcFlatBaselineAfter.Overrides
+        Test-BRAVOCondition (
+            -not (@($vrNcFlatSessionCatalogAfter | Where-Object { $_.Path -eq $vrNcPath }))
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogRecoveryRowDisappearsAfterClear' `
+            "після успішного Clear+Apply наступний Get-BRAVOConfiguratorSessionSchemaCatalog-виклик (Reload) БІЛЬШЕ не повинен синтезувати recovery-рядок для $vrNcPath"
+    } finally {
+        Remove-Item -LiteralPath $vrNcFlatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Вкладена (nested) легасі-форма =====
+    $vrNcNestedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_NONCATALOG_NESTED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrNcNestedScenarioRoot)
+    try {
+        $vrNcNestedLocalConfigPath = Join-Path $vrNcNestedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrNcNestedLocalConfigPath,
+            (
+                "@{`r`n" +
+                "    '$vrNcContainerPath' = @{`r`n" +
+                "        'WeeklyOn' = 'Funday'`r`n" +
+                "        'Enabled'  = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $vrNcNestedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcNestedScenarioRoot
+        $vrNcNestedSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcNestedBaseline.Overrides
+        $vrNcNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $vrNcNestedSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrNcNestedBaseline.Overrides
+        $vrNcNestedSetting = @($vrNcNestedModel | Where-Object { $_.Path -eq $vrNcPath })
+
+        Test-BRAVOCondition (
+            $vrNcNestedSetting.Count -eq 1 -and [bool]$vrNcNestedSetting[0].OverridePresent -and [string]$vrNcNestedSetting[0].OverrideValue -eq 'Funday'
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogNestedRecoveryRowDetected' `
+            "вкладена легасі-форма ($vrNcContainerPath = @{ WeeklyOn='Funday'; Enabled=`$true }) мусить так само синтезувати recovery-рядок для $vrNcPath; отримано OverridePresent=$($vrNcNestedSetting[0].OverridePresent) Value=$($vrNcNestedSetting[0].OverrideValue)"
+
+        # --- Configurator/ValidatorRejectedNonCatalogNestedClearPreservesSibling ---
+        $vrNcNestedCleared = Clear-BRAVOConfiguratorOverride -Model $vrNcNestedModel -Path $vrNcPath
+        $vrNcNestedCleared = Update-BRAVOConfiguratorEffective -Model $vrNcNestedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrNcNestedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcNestedScenarioRoot -Model $vrNcNestedCleared -SchemaCatalog $vrNcNestedSessionCatalog -ProductionBaseline $vrNcNestedBaseline
+        $vrNcNestedFinalContent = if (Test-Path -LiteralPath $vrNcNestedLocalConfigPath) { Get-Content -LiteralPath $vrNcNestedLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$vrNcNestedApply.Applied -and [string]$vrNcNestedApply.Stage -eq 'Complete' -and
+            (-not $vrNcNestedFinalContent.Contains('Funday')) -and $vrNcNestedFinalContent.Contains($vrNcSiblingPath)
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogNestedClearPreservesSibling' `
+            "Clear невалідного вкладеного $vrNcPath мусить дозволити успішний Apply, контейнер розгортається у флет dot-шляхи (canonical серіалізатор не пише hashtable), 'Funday' зникає, сусідній $vrNcSiblingPath переживає; отримано Applied=$($vrNcNestedApply.Applied) Stage=$($vrNcNestedApply.Stage) Content=$vrNcNestedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $vrNcNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Валідний noncatalog override (At) — НЕ мусить ставати recovery-рядком =====
+    $vrNcValidScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_NONCATALOG_VALID_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrNcValidScenarioRoot)
+    try {
+        $vrNcValidLocalConfigPath = Join-Path $vrNcValidScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrNcValidLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrNcValidNoncatalogPath = '03:00' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $vrNcValidBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcValidScenarioRoot
+        $vrNcValidSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcValidBaseline.Overrides
+
+        # --- Configurator/ValidNonCatalogOverrideIsPreserved (не стає recovery-рядком) ---
+        Test-BRAVOCondition (
+            -not (@($vrNcValidSessionCatalog | Where-Object { $_.Path -eq $vrNcValidNoncatalogPath }))
+        ) `
+            'Configurator/ValidNonCatalogOverrideIsPreserved' `
+            "валідний noncatalog ALLOW_SITE-override ($vrNcValidNoncatalogPath='03:00') НЕ повинен синтезувати recovery-рядок — авторизація для нього IsValid=`$true"
+
+        # Unrelated Apply (WeeklyOn-раунд вище довів, що ClearOnly-Apply
+        # не чіпає невідомі схемі ключі — тут перевіряємо те саме на
+        # ЦІЛКОМ порожньому редагуванні моделі) не повинен видалити/
+        # зіпсувати валідний noncatalog override.
+        $vrNcValidModel = Get-BRAVOConfiguratorModel -SchemaCatalog $vrNcValidSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrNcValidBaseline.Overrides
+        $vrNcValidModel = Update-BRAVOConfiguratorEffective -Model $vrNcValidModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrNcValidNoopApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcValidScenarioRoot -Model $vrNcValidModel -SchemaCatalog $vrNcValidSessionCatalog -ProductionBaseline $vrNcValidBaseline
+        $vrNcValidFinalContent = Get-Content -LiteralPath $vrNcValidLocalConfigPath -Raw -Encoding UTF8
+        Test-BRAVOCondition (
+            $vrNcValidFinalContent.Contains($vrNcValidNoncatalogPath) -and $vrNcValidFinalContent.Contains('03:00')
+        ) `
+            'Configurator/ValidNonCatalogOverrideSurvivesUnrelatedApply' `
+            "валідний noncatalog override $vrNcValidNoncatalogPath='03:00' мусить пережити no-op Apply незмінним; отримано NoopApplied=$($vrNcValidNoopApply.Applied) Content=$vrNcValidFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $vrNcValidScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
 # PR #224 third review, R3-1: Configurator effective preview повинна
 # відображати наявний BRAVO_ALLOW_WEAKENED_SECURITY=1 escape hatch для
 # requireAdministrator (canonical WeakeningOverride='ExistingSecurityEscapeHatch'),
