@@ -707,6 +707,20 @@ function Send-ToolIntegrityAlert {
         # Неможливість сповістити не змінює рішення блокувати запуск.
         Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити критичне сповіщення про цілісність інструментів: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
     }
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity 'CRITICAL' `
+                -Component 'Archive' `
+                -Message "Порушено цілісність комплекту: $([string]$Result.Message)"
+        } catch {
+            Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити подію в Operations: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "WARNING"
+        }
+    }
 }
 
 function Send-BRAVOArchiveFreeSpaceAlert {
@@ -799,6 +813,21 @@ function Send-BRAVOArchiveFreeSpaceAlert {
             'Не вдалося відправити критичне сповіщення про нестачу вільного місця: ' +
             (Protect-BRAVOLogSecret -Text $_.Exception.Message)
         ) -Level 'ERROR'
+    }
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity 'CRITICAL' `
+                -Component 'Archive' `
+                -Message 'Недостатньо вільного місця для архівації' `
+                -Details @{ minimumFreeSpaceGB = $MinimumFreeSpaceGB; problems = @($Result.Problems) }
+        } catch {
+            Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити подію в Operations: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "WARNING"
+        }
     }
 }
 
@@ -4591,6 +4620,21 @@ function Send-BAZAIncompatibleNameAlert {
         Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про $($Issues.Count) несумісних імен $ComponentName відправлено у $($script:notificationProviderDisplayName)$chunkText" -Level "SUCCESS"
     } catch {
         Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
+    }
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity 'WARNING' `
+                -Component $ComponentName `
+                -Message "$($Issues.Count) файлів не синхронізовано через несумісні для SFTP імена" `
+                -Details @{ maximumUtf8Bytes = $Issues[0].MaximumUtf8Bytes; issueCount = $Issues.Count }
+        } catch {
+            Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити подію в Operations: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "WARNING"
+        }
     }
 }
 

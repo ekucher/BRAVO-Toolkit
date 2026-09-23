@@ -433,6 +433,9 @@
     # 'operationsReportingSettings.ApiBaseUrl' = 'https://operations.bsystem.example/api'
     # 'operationsReportingSettings.RequestTimeoutSeconds' = 30
     # 'operationsReportingSettings.HeartbeatIntervalMinutes' = 60
+    # На сервері лише один продукт — LIMS або VETOFFICE. Дефолт LIMS;
+    # розкоментуйте на серверах VetOffice:
+    # 'operationsReportingSettings.ProductType' = 'VETOFFICE'
 
     # Bootstrap-секрет для first-run self-enrollment (видається окремо
     # адміністратором Operations, не є product-default):
