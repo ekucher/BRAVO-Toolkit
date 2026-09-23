@@ -3303,6 +3303,174 @@ try {
 }
 
 # =====================================================================
+# Codex review PR #224 (P2, thread lGNJ5, "Flatten every nested
+# representation when clearing a leaf"): попередній односхідчастий
+# Resolve+Convert (виправлений блоком вище — лише ОДИН рівень
+# вкладеності) зупинявся на НАЙДОВШОМУ присутньому префіксі й ніколи не
+# перевіряв, чи той самий canonical leaf ТАКОЖ supplied ЩЕ ОДНИМ
+# вкладеним контейнером на ІНШІЙ глибині (флет + рівень A + рівень B
+# одночасно — легасі-файл, що пережив кілька міграцій формату). Тепер
+# Merge-BRAVOConfiguratorCandidateOverrides сходиться циклом, доки
+# Resolve-BRAVOConfiguratorSuppliedLeafOverride більше не знаходить
+# ЖОДНОЇ representation цього leaf.
+# =====================================================================
+& {
+    $mlLeafPath = 'backupMonitoring.SFTP.BAZA.Mode'
+    $mlSiblingPath = 'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold'
+    $mlUnknownDescendantPath = 'backupMonitoring.SFTP.BAZA.UnknownFutureBazaKey'
+
+    # Три незалежні представлення ОДНОГО canonical leaf одночасно: точний
+    # флет, вкладений контейнер на рівні A (з сусідом AutoArchiveMutationThreshold),
+    # і вкладений контейнер на рівні B (з невідомим D3-нащадком).
+    $mlExisting = @{
+        'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'
+        'backupMonitoring.SFTP.BAZA' = @{
+            Mode = 'LegacyA'
+            AutoArchiveMutationThreshold = 60
+        }
+        'backupMonitoring' = @{
+            SFTP = @{
+                BAZA = @{
+                    Mode = 'LegacyB'
+                    UnknownFutureBazaKey = 'preserved-unknown'
+                }
+            }
+        }
+    }
+    $mlBaselineModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mlExisting
+
+    # --- Merge/MultiLevelDuplicateClearRemovesAllRepresentations ---
+    $mlClearModel = Clear-BRAVOConfiguratorOverride -Model $mlBaselineModel -Path $mlLeafPath
+    $mlClearMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlExisting -Model $mlClearModel -SchemaCatalog $configuratorSchemaCatalog
+    Test-BRAVOCondition (
+        (-not $mlClearMerged.Contains($mlLeafPath)) -and
+        (-not $mlClearMerged.Contains('backupMonitoring.SFTP.BAZA')) -and
+        (-not $mlClearMerged.Contains('backupMonitoring'))
+    ) `
+        'Merge/MultiLevelDuplicateClearRemovesAllRepresentations' `
+        ("Clear на leaf, supplied ОДНОЧАСНО флетом + двома вкладеними контейнерами на різних глибинах, мусить прибрати УСІ три representations " +
+         "(не лише найдовшу знайдену); отримано FlatPresent=$($mlClearMerged.Contains($mlLeafPath)) LevelAPresent=$($mlClearMerged.Contains('backupMonitoring.SFTP.BAZA')) LevelBPresent=$($mlClearMerged.Contains('backupMonitoring'))")
+
+    # --- Merge/MultiLevelDuplicateSiblingsSurviveAtBothLevels ---
+    Test-BRAVOCondition (
+        $mlClearMerged.Contains($mlSiblingPath) -and [int]$mlClearMerged[$mlSiblingPath] -eq 60
+    ) `
+        'Merge/MultiLevelDuplicateSiblingsSurviveAtBothLevels' `
+        "сусід рівня A ($mlSiblingPath=60) мусить пережити конвергенцію через обидва рівні флеттенізації; отримано Present=$($mlClearMerged.Contains($mlSiblingPath)) Value=$($(if ($mlClearMerged.Contains($mlSiblingPath)) { $mlClearMerged[$mlSiblingPath] } else { 'N/A' }))"
+
+    # --- Merge/MultiLevelDuplicateUnknownDescendantSurvives ---
+    Test-BRAVOCondition (
+        $mlClearMerged.Contains($mlUnknownDescendantPath) -and [string]$mlClearMerged[$mlUnknownDescendantPath] -eq 'preserved-unknown'
+    ) `
+        'Merge/MultiLevelDuplicateUnknownDescendantSurvives' `
+        "невідомий D3-нащадок рівня B ($mlUnknownDescendantPath) мусить пережити флеттенізацію контейнера-рівня-B у плоску форму; отримано Present=$($mlClearMerged.Contains($mlUnknownDescendantPath)) Value=$($(if ($mlClearMerged.Contains($mlUnknownDescendantPath)) { $mlClearMerged[$mlUnknownDescendantPath] } else { 'N/A' }))"
+
+    # --- Merge/MultiLevelDuplicateEditKeepsSingleFlatLeaf ---
+    $mlEditModel = Set-BRAVOConfiguratorOverride -Model $mlBaselineModel -Path $mlLeafPath -Value 'NewCanonical'
+    $mlEditMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlExisting -Model $mlEditModel -SchemaCatalog $configuratorSchemaCatalog
+    Test-BRAVOCondition (
+        $mlEditMerged.Contains($mlLeafPath) -and [string]$mlEditMerged[$mlLeafPath] -eq 'NewCanonical' -and
+        (-not $mlEditMerged.Contains('backupMonitoring.SFTP.BAZA')) -and
+        (-not $mlEditMerged.Contains('backupMonitoring'))
+    ) `
+        'Merge/MultiLevelDuplicateEditKeepsSingleFlatLeaf' `
+        ("редагування (не Clear) leaf, supplied трьома representations, мусить лишити РІВНО один флет-ключ з Model-значенням ('NewCanonical'), обидва контейнери прибрані; " +
+         "отримано Value=$($(if ($mlEditMerged.Contains($mlLeafPath)) { $mlEditMerged[$mlLeafPath] } else { 'ABSENT' })) LevelAPresent=$($mlEditMerged.Contains('backupMonitoring.SFTP.BAZA')) LevelBPresent=$($mlEditMerged.Contains('backupMonitoring'))")
+
+    # --- Merge/MultiLevelDuplicateDoesNotMutateCallerInput ---
+    Test-BRAVOCondition (
+        [string]$mlExisting[$mlLeafPath] -eq 'Legacy' -and
+        ($mlExisting['backupMonitoring.SFTP.BAZA'] -is [hashtable]) -and
+        [string]$mlExisting['backupMonitoring.SFTP.BAZA']['Mode'] -eq 'LegacyA' -and
+        [int]$mlExisting['backupMonitoring.SFTP.BAZA']['AutoArchiveMutationThreshold'] -eq 60 -and
+        ($mlExisting['backupMonitoring'] -is [hashtable]) -and
+        [string]$mlExisting['backupMonitoring']['SFTP']['BAZA']['Mode'] -eq 'LegacyB' -and
+        [string]$mlExisting['backupMonitoring']['SFTP']['BAZA']['UnknownFutureBazaKey'] -eq 'preserved-unknown'
+    ) `
+        'Merge/MultiLevelDuplicateDoesNotMutateCallerInput' `
+        "Merge-BRAVOConfiguratorCandidateOverrides НЕ повинна мутувати переданий ExistingOverrides hashtable на жодному з трьох рівнів representation — вона повертає НОВИЙ результат"
+
+    # --- Merge/MultiLevelDuplicateResultIsSerializable ---
+    $mlSerializeThrew = $false
+    $mlSerializeText = $null
+    try {
+        $mlSerializeText = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mlClearMerged
+    } catch {
+        $mlSerializeThrew = $true
+    }
+    Test-BRAVOCondition (
+        (-not $mlSerializeThrew) -and ($null -ne $mlSerializeText) -and
+        $mlSerializeText.Contains('AutoArchiveMutationThreshold') -and
+        (-not $mlSerializeText.Contains("'backupMonitoring' = @{")) -and
+        (-not $mlSerializeText.Contains("'backupMonitoring.SFTP.BAZA' = @{"))
+    ) `
+        'Merge/MultiLevelDuplicateResultIsSerializable' `
+        "результат Merge на дубльованому багаторівневому сценарії мусить бути серіалізовний canonical серіалізатором (жодного залишкового hashtable-значення); Threw=$mlSerializeThrew"
+
+    # --- Merge/TwoNestedOnlyDuplicateConvergesWithoutInfiniteLoop ---
+    # Той самий leaf, БЕЗ точного флета — лише два незалежні вкладені
+    # контейнери на різних глибинах. Доводить, що конвергенція не
+    # прив'язана до наявності флет-анкера і не залежить від порядку
+    # $SchemaCatalog.
+    $mlTwoNestedExisting = @{
+        'backupMonitoring.SFTP.BAZA' = @{ Mode = 'LegacyA' }
+        'backupMonitoring' = @{ SFTP = @{ BAZA = @{ Mode = 'LegacyB' } } }
+    }
+    $mlTwoNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mlTwoNestedExisting
+    $mlTwoNestedClearModel = Clear-BRAVOConfiguratorOverride -Model $mlTwoNestedModel -Path $mlLeafPath
+    $mlTwoNestedThrew = $false
+    $mlTwoNestedMessage = $null
+    $mlTwoNestedMerged = $null
+    try {
+        $mlTwoNestedMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlTwoNestedExisting -Model $mlTwoNestedClearModel -SchemaCatalog $configuratorSchemaCatalog
+    } catch {
+        $mlTwoNestedThrew = $true
+        $mlTwoNestedMessage = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        (-not $mlTwoNestedThrew) -and ($null -ne $mlTwoNestedMerged) -and
+        (-not $mlTwoNestedMerged.Contains($mlLeafPath)) -and
+        (-not $mlTwoNestedMerged.Contains('backupMonitoring.SFTP.BAZA')) -and
+        (-not $mlTwoNestedMerged.Contains('backupMonitoring'))
+    ) `
+        'Merge/TwoNestedOnlyDuplicateConvergesWithoutInfiniteLoop' `
+        "два вкладені (без флета) представлення одного leaf на різних глибинах мусять зійтись без винятку конвергенц-guard-у й без жодної залишкової representation; Threw=$mlTwoNestedThrew Message=$mlTwoNestedMessage"
+
+    # --- Merge/EmptyNestedDescendantStillFailsClosedAtSecondConvergenceLevel ---
+    # Порожній вкладений вузол-сусід ЛИШЕ на глибшому (рівень B) дублікаті
+    # — доводить, що fail-closed на порожньому нащадку (Convert-
+    # BRAVOConfiguratorNestedContainerToFlatKeys, R3-3) спрацьовує так само
+    # на ДРУГІЙ ітерації циклу конвергенції, не лише на першій.
+    $mlEmptyExisting = @{
+        'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'
+        'backupMonitoring.SFTP.BAZA' = @{ Mode = 'LegacyA' }
+        'backupMonitoring' = @{
+            SFTP = @{
+                BAZA = @{
+                    Mode = 'LegacyB'
+                    EmptySiblingContainer = @{}
+                }
+            }
+        }
+    }
+    $mlEmptyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mlEmptyExisting
+    $mlEmptyClearModel = Clear-BRAVOConfiguratorOverride -Model $mlEmptyModel -Path $mlLeafPath
+    $mlEmptyThrew = $false
+    $mlEmptyMessage = $null
+    try {
+        [void](Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlEmptyExisting -Model $mlEmptyClearModel -SchemaCatalog $configuratorSchemaCatalog)
+    } catch {
+        $mlEmptyThrew = $true
+        $mlEmptyMessage = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        $mlEmptyThrew -and ($null -ne $mlEmptyMessage) -and $mlEmptyMessage.Contains('EmptySiblingContainer')
+    ) `
+        'Merge/EmptyNestedDescendantStillFailsClosedAtSecondConvergenceLevel' `
+        "порожній вкладений вузол-сусід на ГЛИБШОМУ (другому) рівні конвергенції мусить fail-closed кинути виняток (не мовчки втратити вузол); Threw=$mlEmptyThrew Message=$mlEmptyMessage"
+}
+
+# =====================================================================
 # PR #224 third review, R3-4: BRAVO.local.config.example не повинен
 # рекламувати DENY_*-листи як звичайний перелік override-ів, доступних
 # для розкоментовування.

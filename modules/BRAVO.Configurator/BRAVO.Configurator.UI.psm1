@@ -215,6 +215,135 @@ function Get-BRAVOConfiguratorUICategoryTree {
     return $tree.ToArray()
 }
 
+function Resolve-BRAVOConfiguratorUICategoryTreeSelection {
+    <#
+    .SYNOPSIS
+        (Codex review PR #224, P2, thread lGNJ9) Чиста (headless, без
+        System.Windows.Forms) проекція: з ПОТОЧНОГО SchemaCatalog і
+        попередньо обраного Group/Section визначає (1) актуальну
+        Group->Section[] структуру (Get-BRAVOConfiguratorUICategoryTree)
+        і (2) який Group/Section МАЄ лишитись обраним — точний логічний
+        збіг, якщо він ще існує в новій схемі, інакше детермінований
+        fallback ($null/$null = кореневий вузол "Усі категорії").
+    .DESCRIPTION
+        Винесено окремо від WinForms-глюї (Update-BRAVOConfiguratorUICategoryTreeNodes),
+        щоб рішення "що МАЄ бути обрано після rebuild" лишалось headless-
+        тестованим — той самий принцип, що вже застосовує решта P2-B
+        pure-функцій цього модуля (жодного System.Windows.Forms-об'єкта в
+        сигнатурі/тілі).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][array]$SchemaCatalog,
+        [AllowNull()][string]$PreviousGroup,
+        [AllowNull()][string]$PreviousSection
+    )
+
+    # @() обов'язковий: PowerShell розгортає одноелементний масив у скаляр
+    # при простому присвоєнні $var = <виклик-функції> — при рівно ОДНІЙ
+    # Group у SchemaCatalog $tree став би pscustomobject, не масивом, і
+    # .Tree.Count у викликача впав би під Set-StrictMode ("властивість
+    # 'Count' не знайдено").
+    $tree = @(Get-BRAVOConfiguratorUICategoryTree -SchemaCatalog $SchemaCatalog)
+
+    $matched = $false
+    if (-not [string]::IsNullOrEmpty($PreviousGroup)) {
+        foreach ($groupEntry in $tree) {
+            if ($groupEntry.Group -ne $PreviousGroup) { continue }
+            if ([string]::IsNullOrEmpty($PreviousSection)) {
+                $matched = $true
+            } else {
+                foreach ($sectionEntry in $groupEntry.Sections) {
+                    if ($sectionEntry.Section -eq $PreviousSection) { $matched = $true; break }
+                }
+            }
+            break
+        }
+    }
+
+    return [pscustomobject]@{
+        Tree            = $tree
+        SelectedGroup   = if ($matched) { $PreviousGroup } else { $null }
+        SelectedSection = if ($matched) { $PreviousSection } else { $null }
+    }
+}
+
+function Update-BRAVOConfiguratorUICategoryTreeNodes {
+    <#
+    .SYNOPSIS
+        (Codex review PR #224, P2, thread lGNJ9) Перебудовує TreeView-
+        вузли з ПОТОЧНОГО SchemaCatalog — тонка WinForms-глюя навколо
+        headless Resolve-BRAVOConfiguratorUICategoryTreeSelection.
+    .DESCRIPTION
+        Початкова побудова TreeView (Show-BRAVOConfiguratorMainForm) і
+        Reload (успішний Apply, і явна кнопка Reload) перераховують
+        $state.SchemaCatalog — augmented-каталог із динамічними recovery-
+        категоріями (ValidatorRejected/DeniedOverride/EscapableOverride)
+        може змінитись між запуском і Reload. Попередня реалізація
+        будувала TreeView.Nodes РІВНО ОДИН РАЗ, при запуску форми — Reload
+        оновлював лише центральну панель, лишаючи дерево категорій
+        застарілим (нові recovery-категорії не з'являлись, зниклі не
+        прибирались).
+
+        BeginUpdate/EndUpdate навколо повного Clear+rebuild — той самий
+        підхід, що й решта UI-шару (Set-BRAVOConfiguratorUISplitterDistanceSafe),
+        запобігає миготінню й ГАРАНТУЄ відсутність дублікатів вузлів
+        (Clear() перед кожним rebuild, не додавання поверх наявних).
+
+        Встановлення $CategoryTree.SelectedNode нижче синхронно піднімає
+        Add_AfterSelect (wiring у Show-BRAVOConfiguratorMainForm), який
+        сам оновлює $state.SelectedGroup/SelectedSection й викликає
+        refresh центральної панелі — той самий canonical шлях, що й
+        інтерактивний клік користувача по дереву, а не паралельна копія
+        цієї логіки тут.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]$CategoryTree,
+        [Parameter(Mandatory = $true)][array]$SchemaCatalog,
+        [AllowNull()][string]$PreviousGroup,
+        [AllowNull()][string]$PreviousSection
+    )
+
+    $resolved = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $SchemaCatalog -PreviousGroup $PreviousGroup -PreviousSection $PreviousSection
+
+    $CategoryTree.BeginUpdate()
+    try {
+        $CategoryTree.Nodes.Clear()
+        $rootNode = New-Object System.Windows.Forms.TreeNode('Усі категорії')
+        [void]$CategoryTree.Nodes.Add($rootNode)
+
+        $matchedNode = $null
+        foreach ($groupEntry in $resolved.Tree) {
+            $groupNode = New-Object System.Windows.Forms.TreeNode("$($groupEntry.Group) ($($groupEntry.DescriptorCount))")
+            $groupNode.Tag = @{ Group = $groupEntry.Group; Section = $null }
+            if (($null -eq $matchedNode) -and $groupEntry.Group -eq $resolved.SelectedGroup -and [string]::IsNullOrEmpty($resolved.SelectedSection)) {
+                $matchedNode = $groupNode
+            }
+            foreach ($sectionEntry in $groupEntry.Sections) {
+                $sectionNode = New-Object System.Windows.Forms.TreeNode("$($sectionEntry.Section) ($($sectionEntry.DescriptorCount))")
+                $sectionNode.Tag = @{ Group = $groupEntry.Group; Section = $sectionEntry.Section }
+                if (($null -eq $matchedNode) -and $groupEntry.Group -eq $resolved.SelectedGroup -and $sectionEntry.Section -eq $resolved.SelectedSection) {
+                    $matchedNode = $sectionNode
+                }
+                [void]$groupNode.Nodes.Add($sectionNode)
+            }
+            [void]$rootNode.Nodes.Add($groupNode)
+        }
+        $rootNode.Expand()
+
+        if ($null -ne $matchedNode) {
+            $CategoryTree.SelectedNode = $matchedNode
+            $matchedNode.EnsureVisible()
+        } else {
+            $CategoryTree.SelectedNode = $rootNode
+        }
+    } finally {
+        $CategoryTree.EndUpdate()
+    }
+}
+
 function Get-BRAVOConfiguratorUIBooleanTriState {
     <#
     .SYNOPSIS
@@ -1503,20 +1632,10 @@ function Show-BRAVOConfiguratorMainForm {
     $rightSplit.Add_SizeChanged({ & $applyLayoutMode })
 
     # ===== Заповнення TreeView з чистої Get-BRAVOConfiguratorUICategoryTree =====
-    $categoryTreeData = Get-BRAVOConfiguratorUICategoryTree -SchemaCatalog $schemaCatalog
-    $rootNode = New-Object System.Windows.Forms.TreeNode('Усі категорії')
-    [void]$categoryTree.Nodes.Add($rootNode)
-    foreach ($groupEntry in $categoryTreeData) {
-        $groupNode = New-Object System.Windows.Forms.TreeNode("$($groupEntry.Group) ($($groupEntry.DescriptorCount))")
-        $groupNode.Tag = @{ Group = $groupEntry.Group; Section = $null }
-        foreach ($sectionEntry in $groupEntry.Sections) {
-            $sectionNode = New-Object System.Windows.Forms.TreeNode("$($sectionEntry.Section) ($($sectionEntry.DescriptorCount))")
-            $sectionNode.Tag = @{ Group = $groupEntry.Group; Section = $sectionEntry.Section }
-            [void]$groupNode.Nodes.Add($sectionNode)
-        }
-        [void]$rootNode.Nodes.Add($groupNode)
-    }
-    $rootNode.Expand()
+    # (lGNJ9) Той самий canonical rebuild-helper, що Reload викликає
+    # нижче — початкова побудова не має попереднього виділення, тож
+    # передає $null/$null (helper детерміновано падає на кореневий вузол).
+    Update-BRAVOConfiguratorUICategoryTreeNodes -CategoryTree $categoryTree -SchemaCatalog $schemaCatalog -PreviousGroup $null -PreviousSection $null
 
     # ===== Callbacks, спільні для рядків налаштувань =====
     # P1-фікс (stabilization): без .GetNewClosure() — ці scriptblock-и
@@ -1701,6 +1820,11 @@ function Show-BRAVOConfiguratorMainForm {
         if ($applyResult.Applied) {
             $state.AnyApplySucceeded = $true
             Show-BRAVOConfiguratorUIMessage -Text "Застосовано успішно. Змінені шляхи: $($applyResult.AppliedPaths -join ', ')"
+            # (lGNJ9) Попереднє виділення — за ЛОГІЧНОЮ ідентичністю, до
+            # перебудови дерева нижче (сам rebuild скидає $state.Selected*
+            # через Add_AfterSelect на щойно встановленому вузлі).
+            $reloadPreviousGroup = $state.SelectedGroup
+            $reloadPreviousSection = $state.SelectedSection
             # Reload з диску — стан після Apply стає новим baseline/OriginalModel.
             $state.ProductionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $state.RuntimeRoot -ProductionConfigDirectory $state.ProductionConfigDirectory
             # P2 (recovery-only rows): перерахувати augmented-каталог зі
@@ -1719,6 +1843,10 @@ function Show-BRAVOConfiguratorMainForm {
             } catch {
                 $state.RequirementBefore = $null
             }
+            # (lGNJ9) Дерево категорій мусить відображати ЩОЙНО перерахований
+            # $state.SchemaCatalog (нові/зниклі recovery-категорії), не
+            # застаріле дерево з моменту запуску форми.
+            Update-BRAVOConfiguratorUICategoryTreeNodes -CategoryTree $categoryTree -SchemaCatalog $state.SchemaCatalog -PreviousGroup $reloadPreviousGroup -PreviousSection $reloadPreviousSection
             & $refreshCenterPanel
             Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
         } elseif ($applyResult.Stage -eq 'RaceDetection') {
@@ -1743,6 +1871,10 @@ function Show-BRAVOConfiguratorMainForm {
     $reloadButton.Add_Click({
         if (-not (Confirm-BRAVOConfiguratorUIDiscardChanges -State $state)) { return }
         $form.Cursor = [System.Windows.Forms.Cursors]::WaitCursor
+        # (lGNJ9) Попереднє виділення — за логічною ідентичністю, до
+        # перебудови дерева нижче.
+        $reloadButtonPreviousGroup = $state.SelectedGroup
+        $reloadButtonPreviousSection = $state.SelectedSection
         try {
             $state.ProductionBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $state.RuntimeRoot -ProductionConfigDirectory $state.ProductionConfigDirectory
             # P2 (recovery-only rows): перерахувати augmented-каталог зі
@@ -1767,6 +1899,8 @@ function Show-BRAVOConfiguratorMainForm {
             return
         }
         $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        # (lGNJ9) Той самий rebuild-helper, що Apply-success reload вище.
+        Update-BRAVOConfiguratorUICategoryTreeNodes -CategoryTree $categoryTree -SchemaCatalog $state.SchemaCatalog -PreviousGroup $reloadButtonPreviousGroup -PreviousSection $reloadButtonPreviousSection
         & $refreshCenterPanel
         Update-BRAVOConfiguratorUIStatusLabels -DirtyLabel $dirtyLabel -ValidationLabel $validationLabel -State $state
     })
@@ -1832,6 +1966,7 @@ Export-ModuleMember -Function @(
     'Get-BRAVOConfiguratorUIFilteredSettings',
     'Get-BRAVOConfiguratorUISearchMatches',
     'Get-BRAVOConfiguratorUICategoryTree',
+    'Resolve-BRAVOConfiguratorUICategoryTreeSelection',
     'Get-BRAVOConfiguratorUIBooleanTriState',
     'ConvertTo-BRAVOConfiguratorUIDisplayText',
     'ConvertTo-BRAVOConfiguratorUITypedValue',

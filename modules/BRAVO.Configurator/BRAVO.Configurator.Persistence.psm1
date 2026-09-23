@@ -72,88 +72,50 @@ function Merge-BRAVOConfiguratorCandidateOverrides {
         $setting = @($Model | Where-Object { $_.Path -eq $path })
         if ($setting.Count -ne 1) { continue }
 
-        if ($merged.Contains($path)) {
-            # Canonical leaf представлений плоским top-level ключем.
-            #
-            # Codex review PR #224 (P2, "Remove nested duplicates when
-            # clearing a flat override"): той самий canonical leaf МІГ
-            # бути supplied ОДНОЧАСНО й флетом, і вкладеним Node-
-            # контейнером (легасі-файл, де обидві форми співіснують —
-            # напр. 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' поряд із
-            # 'backupMonitoring.SFTP.BAZA' = @{ Mode = 'Legacy'; ... }).
-            # Попередня гілка (`continue` одразу після флет-рішення)
-            # ніколи не торкалась вкладеної копії — Resolve-.../
-            # Convert-...ToFlatKeys нижче виконуються лише для шляхів,
-            # де ФЛЕТ-ключ відсутній, тож Clear на флеті лишав вкладений
-            # дублікат у $merged назавжди (Apply або падав на
-            # серіалізації hashtable-значення, або canonical
-            # авторизація його відхиляла).
-            #
-            # Тимчасово знімаємо флет-ключ, щоб та сама provenance-
-            # перевірка (Resolve-BRAVOConfiguratorSuppliedLeafOverride),
-            # що вже працює для "лише вкладений" шляху нижче, могла
-            # побачити вкладену копію ЦЬОГО САМОГО leaf, якщо вона є —
-            # флет мав пріоритет лише при ОДНОЧАСНІЙ присутності обох
-            # форм, тож без флета вкладена форма (якщо є) стає видимою.
-            # Якщо знайдено — розгортаємо ЇЇ контейнер (той самий
-            # Convert-BRAVOConfiguratorNestedContainerToFlatKeys, що
-            # зберігає сусідні/невідомі члени й не мутує оригінальний
-            # вкладений hashtable-об'єкт викликача). Після цього
-            # застосовуємо ОСТАТОЧНЕ рішення Model-і як ЄДИНЕ джерело
-            # істини для цього leaf — а не проміжне значення, яке
-            # flatten міг відновити з вкладеної копії.
-            $merged.Remove($path)
-            $duplicateNested = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $merged -LeafPath $path
-            if ($duplicateNested.Found -and $duplicateNested.NestedPath.Count -gt 0) {
-                Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $duplicateNested.TopLevelKey
+        # Codex review PR #224 (P2, "Flatten every nested representation
+        # when clearing a leaf"): той самий canonical leaf МІГ бути
+        # supplied ОДНОЧАСНО кількома незалежними representations —
+        # точним флетом, і вкладеним Node-контейнером на будь-якій
+        # глибині, і ЩЕ ОДНИМ вкладеним контейнером на ІНШІЙ глибині
+        # (напр. 'backupMonitoring.SFTP.BAZA.Mode' поряд із
+        # 'backupMonitoring.SFTP.BAZA' = @{ Mode = ... } поряд із
+        # 'backupMonitoring' = @{ SFTP = @{ BAZA = @{ Mode = ... } } }).
+        # Одноразовий Resolve+Convert (попередня версія) знімав ЛИШЕ
+        # НАЙДОВШИЙ присутній префікс і зупинявся — решта дублікатів
+        # лишалась у $merged назавжди. Замість фіксованої кількості
+        # проходів — цикл, що сходиться: на кожній ітерації знаходимо
+        # ЩЕ ОДНУ representation цього самого leaf (Resolve-
+        # BRAVOConfiguratorSuppliedLeafOverride проти ПОТОЧНОГО $merged,
+        # не проти $ExistingOverrides — бачить і representations, які
+        # попередні ітерації цього самого циклу вже розгорнули) і знімаємо
+        # її (точний флет — Remove; вкладений контейнер —
+        # Convert-BRAVOConfiguratorNestedContainerToFlatKeys, який
+        # зберігає сусідні/невідомі нащадки й НЕ мутує оригінальний
+        # вкладений hashtable-об'єкт викликача, і fail-closed кидає
+        # виняток на порожньому вкладеному вузлі). Convert може відновити
+        # $path як НОВИЙ флет-ключ (значення з щойно розгорнутого
+        # контейнера) — наступна ітерація резолву або зніме його знову
+        # (NestedPath.Count -eq 0), або (якщо жодної representation
+        # більше немає) цикл завершується. Коли жодної representation не
+        # лишилось — Model є ЄДИНИМ джерелом істини: OverridePresent=true
+        # встановлює рівно один флет-ключ; OverridePresent=false лишає
+        # leaf відсутнім у будь-якій формі.
+        $convergenceGuard = 0
+        while ($true) {
+            $convergenceGuard++
+            if ($convergenceGuard -gt 64) {
+                throw ("BRAVO.Configurator: Merge-BRAVOConfiguratorCandidateOverrides не зійшовся для '$path' " +
+                    "після $convergenceGuard ітерацій розгортання вкладених представлень — можливий цикл/пошкоджений ExistingOverrides.")
             }
-            if ($setting[0].OverridePresent) {
-                $merged[$path] = $setting[0].OverrideValue
-            } else {
+            $supplied = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $merged -LeafPath $path
+            if (-not $supplied.Found) { break }
+            if ($supplied.NestedPath.Count -eq 0) {
                 $merged.Remove($path)
+            } else {
+                Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $supplied.TopLevelKey
             }
-            continue
         }
 
-        # PR #224 review, N1: плоский ключ відсутній — це НЕ те саме, що
-        # "leaf не supplied". Легасі pre-F1 файл міг supply-нути цей самий
-        # canonical leaf через вкладений Node-контейнер (напр.
-        # 'backupMonitoring.SFTP.BAZA' = @{ Mode = 'Legacy' }). БЕЗ цієї
-        # перевірки старий код мовчки додав/лишав контейнер незмінним і
-        # НІКОЛИ не міг видалити такий leaf через Clear (F2-стиль
-        # deadlock, але для вкладеної форми) — читаємо провенанс проти
-        # ПОТОЧНОГО $merged (не проти $ExistingOverrides), бо попередні
-        # ітерації цього ж циклу вже могли розгорнути той самий контейнер
-        # для сусіднього листа (напр. і Mode, і AutoArchiveMutationThreshold
-        # під одним 'backupMonitoring.SFTP.BAZA').
-        $suppliedNested = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $merged -LeafPath $path
-        if ($suppliedNested.Found -and $suppliedNested.NestedPath.Count -gt 0) {
-            # Canonical Configurator-серіалізатор (ConvertTo-BRAVOConfiguratorPowerShellLiteral)
-            # fail-closed відмовляється записувати hashtable-значення —
-            # Configurator ФІЗИЧНО не може зберегти вкладену форму.
-            # Розгортаємо ВЕСЬ контейнер (усі члени, включно з невідомими/
-            # новішими нащадками — §4: значення зберігаються, форма
-            # представлення міняється на плоску) у флет dot-шляхи ОДИН
-            # РАЗ — далі $path вже звичайний плоский ключ у $merged, і
-            # решта ітерацій циклу (для сусідніх листів того самого
-            # контейнера) природно потрапляють у гілку "уже плоский" вище.
-            Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $suppliedNested.TopLevelKey
-
-            if ($merged.Contains($path)) {
-                if ($setting[0].OverridePresent) {
-                    $merged[$path] = $setting[0].OverrideValue
-                } else {
-                    $merged.Remove($path)
-                }
-            } elseif ($setting[0].OverridePresent) {
-                $merged[$path] = $setting[0].OverrideValue
-            }
-            continue
-        }
-
-        # Справді новий override — жодної представленості (ні плоскої, ні
-        # вкладеної) не існувало. Поведінка ДО N1, без змін: OverridePresent=false
-        # тут завжди no-op (Contains($path) уже перевірено вище як false).
         if ($setting[0].OverridePresent) {
             $merged[$path] = $setting[0].OverrideValue
         }
