@@ -2787,7 +2787,7 @@ try {
         # --- Configurator/EscapableNonCatalogOverridePreviewMatchesLoader (env ON) ---
         $eoOnLoaderThrew = $false
         $eoOnLoaderProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            -NoLogo -NoProfile -NonInteractive -Command (
                 "Set-StrictMode -Version 2.0; " +
                 "`$env:BRAVO_ALLOW_WEAKENED_SECURITY = '1'; " +
                 "try { " +
@@ -2946,7 +2946,7 @@ try {
             "} catch { 'CATALOG-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
         )
         $mdCatalogProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $mdCommand 2>&1
+            -NoLogo -NoProfile -NonInteractive -Command $mdCommand 2>&1
         $mdCatalogProbeLast = ([string](@($mdCatalogProbe)[-1])).Trim()
 
         # --- Configurator/ModelSessionCatalogWorksWithForeignModuleInstancePresent ---
@@ -2975,7 +2975,7 @@ try {
             "} catch { 'PREVIEW-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
         )
         $mdPreviewProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
-            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $mdPreviewCommand 2>&1
+            -NoLogo -NoProfile -NonInteractive -Command $mdPreviewCommand 2>&1
         $mdPreviewProbeLast = ([string](@($mdPreviewProbe)[-1])).Trim()
 
         # --- Configurator/ModelPreviewWorksWithForeignModuleInstancePresent ---
