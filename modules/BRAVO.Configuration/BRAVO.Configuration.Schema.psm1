@@ -1,5 +1,27 @@
 ﻿Set-StrictMode -Version 2.0
 
+# Codex review PR #224 (P2, "Import the task-path normalizer into this
+# module scope"): Test-BRAVOConfigurationAuthorizationTaskSchedulerPath
+# раніше перевіряла `Get-Module -Name 'BRAVO.System'` і імпортувала
+# залежність ЛИШЕ якщо модуля не знайдено в процесі — та сама небезпечна
+# умова Windows PowerShell 5.1 module session-state семантики, що вже
+# виправлена в BRAVO.Configurator.Model.psm1/BRAVO.Configurator.UI.psm1
+# (див. коментарі там): `Get-Module` доводить лише, що ІНСТАНС модуля
+# десь ЗАВАНТАЖЕНИЙ у процесі, а не що його exported-команди видимі у
+# ВЛАСНОМУ session state САМЕ цього модуля (BRAVO.Configuration.Schema).
+# За такої умови guard міг мовчки "проходити" (Get-Module каже "вже
+# завантажено"), а виклик ConvertTo-BRAVOTaskPath — падати
+# CommandNotFoundException, який catch перетворює на ValidatorRejected
+# (невалідний, але насправді валідний schedulerSettings.TaskPath
+# override). Імпорт тепер БЕЗУМОВНИЙ у власний module scope цього файлу
+# — той самий патерн, що в Model.psm1/UI.psm1 — виконується ОДИН раз при
+# imports .psm1, незалежно від Get-Module-видимості деінде в процесі.
+# Напрямок залежності Configuration.Schema -> System безпечний: System —
+# листовий модуль (не має власних Import-Module, не залежить від
+# Configuration), тож циклу немає.
+$script:BRAVOConfigurationSchemaDependencyRoot = Split-Path -Path $PSScriptRoot -Parent
+Import-Module -Name (Join-Path $script:BRAVOConfigurationSchemaDependencyRoot 'BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop -Scope Local
+
 # BRAVO.Configuration.Schema — формальна схема Configuration v2 (#154, B2).
 #
 # ЩО ЦЕ. Машинно перевірювана декларація ФОРМИ канонічної конфігурації:
@@ -710,7 +732,16 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'logFileEncoding' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'logFileFilter' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'logFileNameTemplate' = @{ Class = 'DENY_INTERNAL_METADATA' }
-    'LogLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
+    # Codex review PR #224 (P2, "Preserve whitespace tolerance for legacy
+    # LogLevel"): EnumTrimmed (не Enum) — той самий whitespace-tolerance
+    # паритет, що defaultLogLevel уже отримав (PR #224 review, четвертий
+    # раунд). Репо-wide пошук показує, що ЄДИНЕ production-читання
+    # $LogLevel — modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1:6346 —
+    # лише інтерполює його в інформаційне повідомлення (фактичні
+    # console/file-пороги йдуть з consoleSettings.FileLevel/ConsoleLevel);
+    # ' DEBUG ' раніше приймалось і не міняло поведінку логування —
+    # exact-match Enum: тут хибно відхиляв би всю конфігурацію.
+    'LogLevel' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'EnumTrimmed:TRACE,DEBUG,INFO,SUCCESS,WARNING,ERROR,FATAL' }
     'logLevels.DEBUG' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'logLevels.ERROR' = @{ Class = 'DENY_INTERNAL_METADATA' }
     'logLevels.INFO' = @{ Class = 'DENY_INTERNAL_METADATA' }
@@ -1132,6 +1163,18 @@ function Test-BRAVOConfigurationAuthorizationUrlArray {
     # Масив як ціле не перевіряється по-елементно за схожими родами —
     # елемент, що не є рядком, чи невалідний URL відхиляє весь масив
     # (перше порушення — точний індекс у повідомленні).
+    #
+    # Codex review PR #224 (P2, "Ignore blank lookup URL entries before
+    # validating"): порожній/whitespace-елемент — семантично ВІДСУТНІЙ
+    # lookup-запис, не помилка. Єдиний production-споживач
+    # (BRAVO.Notifications.psm1, Get-BRAVOHostInformationConfiguration)
+    # НАВМИСНО фільтрує null/whitespace-елементи ПЕРЕД використанням і
+    # відкочується до дефолтних URL, якщо після фільтрації нічого не
+    # лишилось — легасі local override з таким "порожнім плейсхолдером"
+    # раніше працював без зміни поведінки lookup. Фільтрація тут — та сама
+    # передача через [string]::IsNullOrWhiteSpace, що споживач уже
+    # використовує; НЕЛЕГІТИМНИЙ (non-string) елемент і НЕПОРОЖНІЙ, але
+    # некоректний URL і далі fail-closed відхиляються.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -1146,7 +1189,16 @@ function Test-BRAVOConfigurationAuthorizationUrlArray {
     $index = 0
     foreach ($item in $Value) {
         $elementPath = '{0}[{1}]' -f $Path, $index
-        if ($null -eq $item -or $item -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$item)) {
+        if ($item -is [string] -and [string]::IsNullOrWhiteSpace($item)) {
+            # Семантично відсутній lookup-запис (той самий фільтр, що
+            # BRAVO.Notifications.psm1 уже застосовує перед використанням)
+            # — пропускаємо БЕЗ звернення до URL-валідації, індекс
+            # елемента нижче не зачіпається (лишається точним для
+            # повідомлень про наступні непропущені елементи).
+            $index++
+            continue
+        }
+        if ($null -eq $item -or $item -isnot [string]) {
             return [pscustomobject]@{ IsValid = $false; Message = "${elementPath}: очікується непорожній рядок URL." }
         }
         $parsedUri = $null
@@ -1198,9 +1250,10 @@ function Test-BRAVOConfigurationAuthorizationTaskSchedulerPath {
         return [pscustomobject]@{ IsValid = $false; Message = "${Path}: значення мусить бути рядком (шлях Task Scheduler)." }
     }
 
-    if (-not (Get-Module -Name 'BRAVO.System')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop
-    }
+    # Codex review PR #224 (P2, "Import the task-path normalizer into this
+    # module scope"): залежність BRAVO.System імпортується БЕЗУМОВНО при
+    # завантаженні .psm1 (див. коментар біля Set-StrictMode на початку
+    # файлу) — жодної Get-Module-перевірки тут більше не потрібно.
 
     try {
         # Лише валідація — повернене нормалізоване значення свідомо

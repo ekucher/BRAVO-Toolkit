@@ -1877,6 +1877,203 @@
         -Failure "авторизація НЕ повинна нормалізувати/мутувати сире значення на місці; отримано '$($taskPathMutationProbeOverrides['schedulerSettings.TaskPath'])' замість 'BRAVO'"
 
     # =====================================================================
+    # Codex review PR #224 (P2, "Import the task-path normalizer into this
+    # module scope"): Test-BRAVOConfigurationAuthorizationTaskSchedulerPath
+    # раніше перевіряла `Get-Module -Name 'BRAVO.System'` і імпортувала
+    # залежність ЛИШЕ якщо модуля не знайдено в процесі — тепер БЕЗУМОВНИЙ
+    # module-scope import (див. коментар біля Set-StrictMode у
+    # BRAVO.Configuration.Schema.psm1). Регресія нижче відтворює РЕАЛЬНУ
+    # foreign/private-session-state умову (BRAVO.System, завантажений
+    # десь у процесі приватним, неекспортованим шляхом через New-Module
+    # foreign-loader — той самий паттерн, що вже підтверджує аналогічні
+    # фікси для BRAVO.Configurator.Model.psm1/UI.psm1) у ІЗОЛЬОВАНОМУ
+    # дочірньому процесі, ПОТІМ напряму імпортує
+    # BRAVO.Configuration.Schema.psd1 і викликає авторизацію
+    # schedulerSettings.TaskPath — доводить, що команда нормалізатора
+    # реально виконується зі Schema-scope незалежно від того, чи
+    # BRAVO.System уже "видимий" деінде у процесі.
+    # =====================================================================
+    & {
+        $tpRoot = $root
+        $tpCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader_TaskPath' -ScriptBlock { " +
+            "param(`$root) " +
+            "function Invoke-ForeignSystemLoad { param(`$root) " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop " +
+            "}; Export-ModuleMember -Function Invoke-ForeignSystemLoad " +
+            "} -ArgumentList '$tpRoot'; " +
+            "Import-Module `$foreignModule -Force; " +
+            "Invoke-ForeignSystemLoad -root '$tpRoot'; " +
+            "Import-Module -Name '$tpRoot\modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1' -Force; " +
+            "try { " +
+            "`$r = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 'BRAVO' -Path 'schedulerSettings.TaskPath'; " +
+            "'RESULT-OK:' + [string]`$r.IsValid " +
+            "} catch { 'RESULT-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $tpProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $tpCommand 2>&1
+        $tpProbeLast = ([string](@($tpProbe)[-1])).Trim()
+
+        # --- Configuration/SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent ---
+        Test-BRAVOCondition (
+            $tpProbeLast -eq 'RESULT-OK:True'
+        ) `
+            'Configuration/SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent' `
+            "Test-BRAVOConfigurationAuthorizationTaskSchedulerPath МУСИТЬ працювати навіть коли BRAVO.System уже завантажений десь у процесі приватним, неекспортованим шляхом (New-Module foreign loader) — жодного CommandNotFoundException; отримано: '$tpProbeLast'"
+
+        # --- Configuration/SchemaImportsSystemUnconditionallyAtModuleLoad ---
+        # Прямий доказ БЕЗУМОВНОГО імпорту: свіжий дочірній процес, де
+        # BRAVO.System НІДЕ не завантажений заздалегідь — сам факт, що
+        # ConvertTo-BRAVOTaskPath виконується одразу після Import-Module
+        # Schema.psd1 (без жодного попереднього BRAVO.System-імпорту в
+        # цьому процесі), доводить, що Schema.psm1 сам імпортував
+        # залежність при завантаженні .psm1, а не покладався на чиєсь
+        # інше попереднє завантаження.
+        $tpFreshCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "Import-Module -Name '$tpRoot\modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1' -Force; " +
+            "try { " +
+            "`$r = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 'BRAVO' -Path 'schedulerSettings.TaskPath'; " +
+            "'RESULT-OK:' + [string]`$r.IsValid " +
+            "} catch { 'RESULT-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $tpFreshProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $tpFreshCommand 2>&1
+        $tpFreshProbeLast = ([string](@($tpFreshProbe)[-1])).Trim()
+        Test-BRAVOCondition (
+            $tpFreshProbeLast -eq 'RESULT-OK:True'
+        ) `
+            'Configuration/SchemaImportsSystemUnconditionallyAtModuleLoad' `
+            "У свіжому процесі БЕЗ жодного попереднього BRAVO.System-імпорту Test-BRAVOConfigurationAuthorizationTaskSchedulerPath однаково МУСИТЬ спрацювати одразу після Import-Module Schema.psd1 — доказ безумовного module-load-time імпорту; отримано: '$tpFreshProbeLast'"
+
+        # --- Configuration/SchemaSystemImportHasNoProcessWidePresenceGuard ---
+        # ДВІ тестові умови вище (SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent/
+        # SchemaImportsSystemUnconditionallyAtModuleLoad) — behavioral safety/
+        # parity-покриття: доводять, що ПОТОЧНА реалізація коректно працює
+        # в кількох PS 5.1 session-state-топологіях. Вони НЕ доводять
+        # регресію проти СТАРОГО guard-коду — сім добросовісних спроб
+        # відтворити стан "Get-Module truthy, але ConvertTo-BRAVOTaskPath
+        # невидимий у Schema-сесії" не дали живого провального сценарію.
+        # Цей тест — СТРУКТУРНИЙ/архітектурний інваріант, що прямо читає
+        # ЗАТРЕКАНИЙ вихідний код Schema.psm1 (а не поведінку через
+        # виконання) і ловить САМЕ старий забороненй патерн: (1) жодного
+        # `if (-not (Get-Module -Name 'BRAVO.System'))) {...}` guard-у в
+        # коді (не в коментарях-поясненнях фіксу — вони навмисно
+        # цитують старий патерн для документації); (2) module-load-time
+        # preamble (код ДО першого `function`-оголошення) МУСИТЬ містити
+        # безумовний `Import-Module ... BRAVO.System\BRAVO.System.psd1 ...
+        # -Scope Local`. Це справжній old-vs-new regression guard для
+        # цієї конкретної Codex-знахідки.
+        $ssgSchemaPath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1'
+        $ssgLines = Get-Content -LiteralPath $ssgSchemaPath
+        $ssgCodeLines = $ssgLines | Where-Object { -not ($_.TrimStart().StartsWith('#')) }
+        $ssgCodeSrc = [string]::Join([Environment]::NewLine, $ssgCodeLines)
+        $ssgFunctionMatch = [regex]::Match($ssgCodeSrc, '(?m)^function\s')
+        $ssgPreamble = if ($ssgFunctionMatch.Success) { $ssgCodeSrc.Substring(0, $ssgFunctionMatch.Index) } else { $ssgCodeSrc }
+        $ssgHasOldGuard = [regex]::IsMatch($ssgCodeSrc, "if\s*\(\s*-not\s*\(\s*Get-Module\s+-Name\s+'BRAVO\.System'\s*\)\s*\)")
+        $ssgHasUnconditionalPreambleImport = [regex]::IsMatch($ssgPreamble, 'Import-Module[^\r\n]*BRAVO\.System[\\/]BRAVO\.System\.psd1[^\r\n]*-Scope\s+Local')
+        Test-BRAVOCondition (
+            (-not $ssgHasOldGuard) -and $ssgHasUnconditionalPreambleImport
+        ) `
+            'Configuration/SchemaSystemImportHasNoProcessWidePresenceGuard' `
+            "Schema.psm1 МУСИТЬ імпортувати BRAVO.System БЕЗУМОВНО при завантаженні модуля (module-load-time preamble), БЕЗ process-wide Get-Module presence guard; отримано hasOldGuard=$ssgHasOldGuard hasUnconditionalPreambleImport=$ssgHasUnconditionalPreambleImport"
+    }
+
+    # =====================================================================
+    # Codex review PR #224 (P2, "Ignore blank lookup URL entries before
+    # validating"): Test-BRAVOConfigurationAuthorizationUrlArray раніше
+    # відхиляла ВЕСЬ масив, якщо хоча б один елемент був порожнім/
+    # whitespace-рядком, хоча production-споживач (BRAVO.Notifications.psm1)
+    # НАВМИСНО фільтрує такі елементи перед використанням.
+    # =====================================================================
+
+    # --- Authorization/UrlArrayIgnoresEmptyStringEntry ---
+    $urlArrayEmptyResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('https://api.example.test', '') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayEmptyResult.IsValid) `
+        -Name "Authorization/UrlArrayIgnoresEmptyStringEntry" `
+        -Failure "порожній рядок серед URL-елементів мусить бути проігнорований (не відхиляти весь масив); отримано IsValid=$($urlArrayEmptyResult.IsValid) Message=$($urlArrayEmptyResult.Message)"
+
+    # --- Authorization/UrlArrayIgnoresWhitespaceOnlyEntry ---
+    $urlArrayWhitespaceResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('https://api.example.test', '   ') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayWhitespaceResult.IsValid) `
+        -Name "Authorization/UrlArrayIgnoresWhitespaceOnlyEntry" `
+        -Failure "whitespace-only рядок серед URL-елементів мусить бути проігнорований; отримано IsValid=$($urlArrayWhitespaceResult.IsValid) Message=$($urlArrayWhitespaceResult.Message)"
+
+    # --- Authorization/UrlArrayValidEntriesAcceptedWithBlanksMixedIn ---
+    $urlArrayMixedResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('https://api.example.test', '', '   ', 'https://backup.example.test') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayMixedResult.IsValid) `
+        -Name "Authorization/UrlArrayValidEntriesAcceptedWithBlanksMixedIn" `
+        -Failure "дійсні URL-елементи навколо порожніх записів мусять бути прийняті; отримано IsValid=$($urlArrayMixedResult.IsValid) Message=$($urlArrayMixedResult.Message)"
+
+    # --- Authorization/UrlArrayMalformedNonblankStillRejected ---
+    $urlArrayMalformedResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('not a url') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$urlArrayMalformedResult.IsValid) `
+        -Name "Authorization/UrlArrayMalformedNonblankStillRejected" `
+        -Failure "непорожній, але некоректний URL мусить лишитись відхиленим навіть після фільтрації порожніх елементів; отримано IsValid=$($urlArrayMalformedResult.IsValid)"
+
+    # --- Authorization/UrlArrayAllBlankEntriesAccepted ---
+    # Той самий контракт, що споживач (BRAVO.Notifications.psm1) реалізує:
+    # якщо ПІСЛЯ фільтрації порожніх записів нічого не лишилось, споживач
+    # відкочується до дефолтних lookup URL — авторизація тут не повинна
+    # відхиляти весь масив лише через відсутність непорожніх елементів.
+    $urlArrayAllBlankResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('', '   ') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayAllBlankResult.IsValid) `
+        -Name "Authorization/UrlArrayAllBlankEntriesAccepted" `
+        -Failure "масив, що складається ЛИШЕ з порожніх/whitespace-записів, мусить бути прийнятий (споживач відкочується до дефолту); отримано IsValid=$($urlArrayAllBlankResult.IsValid) Message=$($urlArrayAllBlankResult.Message)"
+
+    # --- Authorization/UrlArrayBlankMixedWithBadSchemeStillRejected ---
+    $urlArrayBlankBadSchemeResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('', 'ftp://bad.scheme.test') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$urlArrayBlankBadSchemeResult.IsValid) `
+        -Name "Authorization/UrlArrayBlankMixedWithBadSchemeStillRejected" `
+        -Failure "недопустима схема поруч із порожнім записом мусить лишитись відхиленою — фільтрація порожніх записів НЕ повинна ширше послаблювати перевірку схеми/формату; отримано IsValid=$($urlArrayBlankBadSchemeResult.IsValid)"
+
+    # =====================================================================
+    # Codex review PR #224 (P2, "Preserve whitespace tolerance for legacy
+    # LogLevel"): LogLevel раніше використовував точний 'Enum:' валідатор,
+    # хоча defaultLogLevel уже отримав whitespace-tolerant 'EnumTrimmed:' —
+    # значення на кшталт ' ERROR ' раніше приймались (єдиний production-
+    # читач, BRAVO.Archive.Runtime.ps1:6346, лише інтерполює $LogLevel в
+    # інформаційне повідомлення) і не повинні ламати конфігурацію зараз.
+    # =====================================================================
+
+    # --- Authorization/LogLevelWhitespaceTrimmedValueAccepted ---
+    $logLevelTrimmedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'LogLevel' = ' ERROR ' } -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$logLevelTrimmedResult.IsValid) `
+        -Name "Authorization/LogLevelWhitespaceTrimmedValueAccepted" `
+        -Failure "LogLevel=' ERROR ' (whitespace навколо валідного значення) мусить бути прийнятий, як і defaultLogLevel; отримано IsValid=$($logLevelTrimmedResult.IsValid)"
+
+    # --- Authorization/LogLevelInvalidTrimmedValueRejected ---
+    $logLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'LogLevel' = ' BOGUS ' } -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$logLevelInvalidResult.IsValid) `
+        -Name "Authorization/LogLevelInvalidTrimmedValueRejected" `
+        -Failure "LogLevel=' BOGUS ' мусить лишитись відхиленим — EnumTrimmed прибирає лише пробіли, не розширює множину допустимих значень; отримано IsValid=$($logLevelInvalidResult.IsValid)"
+
+    # --- Authorization/DefaultLogLevelBehaviorUnchangedByLogLevelFix ---
+    $defaultLogLevelStillTrimmedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' ERROR ' } -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$defaultLogLevelStillTrimmedResult.IsValid) `
+        -Name "Authorization/DefaultLogLevelBehaviorUnchangedByLogLevelFix" `
+        -Failure "фікс LogLevel не повинен зачіпати вже існуючу поведінку defaultLogLevel; отримано IsValid=$($defaultLogLevelStillTrimmedResult.IsValid)"
+
+    # =====================================================================
     # PR #224 review, F3: enum-валідатор БЕЗ trim відхиляв би значення на
     # кшталт ' all ' (з пробілами), хоча щонайменше два ALLOW_WITH_VALIDATOR
     # enum-листи (bravoSettings.NotificationMode/NotificationProvider)

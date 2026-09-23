@@ -2246,6 +2246,136 @@ try {
 }
 
 # =====================================================================
+# Codex review PR #224 (P2, "Inspect every representation when
+# generating recovery rows"): Get-BRAVOConfiguratorSessionSchemaCatalog
+# раніше викликала Resolve-BRAVOConfiguratorSuppliedLeafOverride, яка
+# повертає ЛИШЕ ОДНЕ (найдовше/пріоритетне) supplied-представлення
+# canonical leaf-а. Якщо САМЕ це представлення проходило авторизацію,
+# код одразу `continue`-ився — і НІКОЛИ не перевіряв інші представлення
+# того самого leaf-а: валідний дублікат мовчки маскував невалідний, і
+# жодного recovery-рядка не синтезувалось, хоча canonical Apply назавжди
+# відхилявся б через невалидну копію без жодного UI-поля для Clear.
+# Get-BRAVOConfiguratorSuppliedLeafRepresentations тепер перераховує УСІ
+# представлення, і recovery-синтез бере перше, що не проходить
+# авторизацію.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $mrPath = 'schedulerSettings.RestoreVerify.WeeklyOn'
+    $mrContainerPath = 'schedulerSettings.RestoreVerify'
+    $mrDeniedFlatPath = 'winSCPIniPath'
+    $mrRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+
+    # --- Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow ---
+    $mrValidFlatInvalidNestedOverrides = @{
+        $mrPath          = 'Saturday'
+        $mrContainerPath = @{ WeeklyOn = 'Funday' }
+    }
+    $mrCatalog1 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrValidFlatInvalidNestedOverrides)
+    Test-BRAVOCondition (
+        [bool]@($mrCatalog1 | Where-Object { $_.Path -eq $mrPath })
+    ) `
+        'Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow' `
+        "$mrPath валідний плоским ключем ('Saturday'), але невалідний вкладеним дублікатом (WeeklyOn='Funday') — recovery-рядок МУСИТЬ синтезуватись, бо canonical Apply все одно відхилив би вкладену копію"
+
+    # --- Configurator/MultiRepresentationInvalidFlatValidNestedProducesRecoveryRow ---
+    $mrInvalidFlatValidNestedOverrides = @{
+        $mrPath          = 'Funday'
+        $mrContainerPath = @{ WeeklyOn = 'Saturday' }
+    }
+    $mrCatalog2 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrInvalidFlatValidNestedOverrides)
+    Test-BRAVOCondition (
+        [bool]@($mrCatalog2 | Where-Object { $_.Path -eq $mrPath })
+    ) `
+        'Configurator/MultiRepresentationInvalidFlatValidNestedProducesRecoveryRow' `
+        "$mrPath невалідний плоским ключем ('Funday') при валідному вкладеному дублікаті — recovery-рядок МУСИТЬ синтезуватись незалежно від того, яке представлення резолвер обирає пріоритетним"
+
+    # --- Configurator/MultiRepresentationDeniedFlatInvalidNestedProducesSingleRecoveryRow (3-рівнева форма, DENY-клас) ---
+    $mrDeniedOverrides = @{ $mrDeniedFlatPath = 'C:\Legacy\WinSCP.ini' }
+    $mrCatalog3 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrDeniedOverrides)
+    $mrRows3 = @($mrCatalog3 | Where-Object { $_.Path -eq $mrDeniedFlatPath })
+    Test-BRAVOCondition (
+        $mrRows3.Count -eq 1 -and [string]$mrRows3[0].Section -eq 'DeniedOverride'
+    ) `
+        'Configurator/MultiRepresentationDeniedFlatInvalidNestedProducesSingleRecoveryRow' `
+        "DENY_*-клас (winSCPIniPath) без статичного дескриптора мусить синтезувати РІВНО один DeniedOverride recovery-рядок; отримано count=$($mrRows3.Count) section=$([string]$mrRows3[0].Section)"
+
+    # --- Configurator/MultiRepresentationTwoInvalidRepresentationsProduceExactlyOneRecoveryRow ---
+    $mrTwoInvalidOverrides = @{
+        $mrPath          = 'Funday'
+        $mrContainerPath = @{ WeeklyOn = 'Bogus' }
+    }
+    $mrCatalog4 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrTwoInvalidOverrides)
+    $mrRows4 = @($mrCatalog4 | Where-Object { $_.Path -eq $mrPath })
+    Test-BRAVOCondition (
+        $mrRows4.Count -eq 1
+    ) `
+        'Configurator/MultiRepresentationTwoInvalidRepresentationsProduceExactlyOneRecoveryRow' `
+        "два одночасно невалідних представлення ОДНОГО canonical leaf-а мусять синтезувати РІВНО один recovery-рядок (без дублікатів); отримано count=$($mrRows4.Count)"
+
+    # --- Configurator/MultiRepresentationTwoValidRepresentationsProduceNoFalseRecoveryRow ---
+    $mrTwoValidOverrides = @{
+        $mrPath          = 'Saturday'
+        $mrContainerPath = @{ WeeklyOn = 'Sunday' }
+    }
+    $mrCatalog5 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrTwoValidOverrides)
+    Test-BRAVOCondition (
+        -not (@($mrCatalog5 | Where-Object { $_.Path -eq $mrPath }))
+    ) `
+        'Configurator/MultiRepresentationTwoValidRepresentationsProduceNoFalseRecoveryRow' `
+        "два одночасно ВАЛІДНИХ представлення ОДНОГО canonical leaf-а НЕ повинні синтезувати жодного recovery-рядка"
+
+    # --- Configurator/MultiRepresentationStaticDescriptorNotDuplicated ---
+    $mrStaticPath = [string]$mrRawCatalog[0].Path
+    $mrCatalog6 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides @{})
+    $mrStaticDupCount = @($mrCatalog6 | Where-Object { $_.Path -eq $mrStaticPath }).Count
+    Test-BRAVOCondition (
+        $mrStaticDupCount -eq 1
+    ) `
+        'Configurator/MultiRepresentationStaticDescriptorNotDuplicated' `
+        "статичний дескриптор ($mrStaticPath) не повинен дублюватись recovery-синтезом; отримано count=$mrStaticDupCount"
+
+    # --- Configurator/MultiRepresentationDoesNotMutateSuppliedOverrides ---
+    $mrMutationProbeOverrides = @{
+        $mrPath          = 'Saturday'
+        $mrContainerPath = @{ WeeklyOn = 'Funday' }
+    }
+    $mrMutationProbeOverridesBeforeFlat = [string]$mrMutationProbeOverrides[$mrPath]
+    $mrMutationProbeOverridesBeforeNested = [string]$mrMutationProbeOverrides[$mrContainerPath]['WeeklyOn']
+    $mrMutationProbeOverridesBeforeCount = $mrMutationProbeOverrides.Count
+    [void](Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrMutationProbeOverrides)
+    Test-BRAVOCondition (
+        $mrMutationProbeOverrides.Count -eq $mrMutationProbeOverridesBeforeCount -and
+        [string]$mrMutationProbeOverrides[$mrPath] -eq $mrMutationProbeOverridesBeforeFlat -and
+        [string]$mrMutationProbeOverrides[$mrContainerPath]['WeeklyOn'] -eq $mrMutationProbeOverridesBeforeNested
+    ) `
+        'Configurator/MultiRepresentationDoesNotMutateSuppliedOverrides' `
+        "recovery-row-синтез ЛИШЕ читає LocalOverrides — вхідний hashtable-об'єкт викликача (флат і вкладений вміст) не повинен змінитись"
+
+    # --- Configurator/MultiRepresentationOrderIndependentAcrossInsertionOrder ---
+    $mrOrderA = [ordered]@{}
+    $mrOrderA[$mrPath] = 'Saturday'
+    $mrOrderA[$mrContainerPath] = @{ WeeklyOn = 'Funday' }
+    $mrOrderB = [ordered]@{}
+    $mrOrderB[$mrContainerPath] = @{ WeeklyOn = 'Funday' }
+    $mrOrderB[$mrPath] = 'Saturday'
+    $mrCatalogOrderA = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides ([hashtable]$mrOrderA))
+    $mrCatalogOrderB = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides ([hashtable]$mrOrderB))
+    Test-BRAVOCondition (
+        [bool]@($mrCatalogOrderA | Where-Object { $_.Path -eq $mrPath }) -and
+        [bool]@($mrCatalogOrderB | Where-Object { $_.Path -eq $mrPath })
+    ) `
+        'Configurator/MultiRepresentationOrderIndependentAcrossInsertionOrder' `
+        "результат recovery-синтезу не повинен залежати від порядку вставки ключів у hashtable LocalOverrides"
+}
+
+# =====================================================================
 # PR #224 third review, R3-1: Configurator effective preview повинна
 # відображати наявний BRAVO_ALLOW_WEAKENED_SECURITY=1 escape hatch для
 # requireAdministrator (canonical WeakeningOverride='ExistingSecurityEscapeHatch'),

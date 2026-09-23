@@ -189,6 +189,64 @@ function Resolve-BRAVOConfiguratorSuppliedLeafOverride {
         [Parameter(Mandatory = $true)][string]$LeafPath
     )
 
+    $representations = @(Get-BRAVOConfiguratorSuppliedLeafRepresentations -LocalOverrides $LocalOverrides -LeafPath $LeafPath)
+    if ($representations.Count -eq 0) {
+        return [pscustomobject]@{
+            Found       = $false
+            Value       = $null
+            TopLevelKey = $null
+            NestedPath  = [string[]]@()
+        }
+    }
+
+    # Флат-форма МАЄ ПРІОРИТЕТ над вкладеною при обох присутніх одночасно —
+    # Get-BRAVOConfiguratorSuppliedLeafRepresentations повертає представлення
+    # у тому самому порядку (найдовший/точний префікс першим), тож перше
+    # представлення тут — той самий детермінований tie-break, що раніше.
+    $first = $representations[0]
+    return [pscustomobject]@{
+        Found       = $true
+        Value       = $first.Value
+        TopLevelKey = $first.TopLevelKey
+        NestedPath  = $first.NestedPath
+    }
+}
+
+function Get-BRAVOConfiguratorSuppliedLeafRepresentations {
+    <#
+    .SYNOPSIS
+        Codex review PR #224 (P2, "Inspect every representation when
+        generating recovery rows"): канонічна (ЄДИНА) перерахунок УСІХ
+        supplied-представлень одного canonical leaf-шляху в сирому
+        LocalOverrides-шарі — на відміну від
+        Resolve-BRAVOConfiguratorSuppliedLeafOverride (яка повертає лише
+        ПЕРШЕ/найдовше представлення, канонічне для Merge/dirty-логіки),
+        ця функція повертає масив УСІХ знайдених представлень (флат +
+        кожен вкладений префікс, що навігується до листа), необхідний
+        recovery-row-синтезу (Get-BRAVOConfiguratorSessionSchemaCatalog),
+        де ОДНЕ невалідне представлення НЕ повинно ховатись за іншим
+        валідним представленням того самого canonical leaf.
+    .DESCRIPTION
+        Той самий алгоритм сканування префіксів (найдовший -> найкоротший),
+        що Resolve-BRAVOConfiguratorSuppliedLeafOverride використовує —
+        єдина реалізація навігації, обидві функції ділять цей код (без
+        дублювання dot-path traversal). Resolve-...Override делегує сюди й
+        повертає ЛИШЕ перший елемент (той самий канонічний tie-break, що
+        й раніше); ця функція повертає ВСІ елементи для викликачів, яким
+        потрібна повна множина (наразі — лише recovery-row-синтез).
+    .OUTPUTS
+        [pscustomobject[]] { Value; TopLevelKey; NestedPath } — у порядку
+        від найдовшого (точного флат) до найкоротшого знайденого префіксу;
+        порожній масив, якщо жодного представлення не знайдено.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject[]])]
+    param(
+        [Parameter(Mandatory = $true)][AllowEmptyCollection()][hashtable]$LocalOverrides,
+        [Parameter(Mandatory = $true)][string]$LeafPath
+    )
+
+    $representations = New-Object System.Collections.Generic.List[object]
     $segments = @($LeafPath -split '\.')
     for ($prefixLength = $segments.Count; $prefixLength -ge 1; $prefixLength--) {
         $prefix = [string]::Join('.', $segments[0..($prefixLength - 1)])
@@ -198,12 +256,12 @@ function Resolve-BRAVOConfiguratorSuppliedLeafOverride {
         if ($prefixLength -eq $segments.Count) {
             # Точний плоский dot-шлях — саме той canonical leaf, без
             # вкладеності.
-            return [pscustomobject]@{
-                Found       = $true
+            [void]$representations.Add([pscustomobject]@{
                 Value       = $candidateValue
                 TopLevelKey = $prefix
                 NestedPath  = [string[]]@()
-            }
+            })
+            continue
         }
 
         if ($candidateValue -isnot [hashtable]) {
@@ -223,21 +281,15 @@ function Resolve-BRAVOConfiguratorSuppliedLeafOverride {
             $node = $node[$segment]
         }
         if ($navigationOk) {
-            return [pscustomobject]@{
-                Found       = $true
+            [void]$representations.Add([pscustomobject]@{
                 Value       = $node
                 TopLevelKey = $prefix
                 NestedPath  = [string[]]$remainingSegments
-            }
+            })
         }
     }
 
-    return [pscustomobject]@{
-        Found       = $false
-        Value       = $null
-        TopLevelKey = $null
-        NestedPath  = [string[]]@()
-    }
+    return $representations.ToArray()
 }
 
 function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
@@ -725,16 +777,43 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         $isDenyClass = $class.StartsWith('DENY_')
         if (-not $isValidatorClass -and -not $isDenyClass) { continue }
 
-        $supplied = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $LocalOverrides -LeafPath $path
-        if (-not $supplied.Found) { continue }
+        # Codex review PR #224 (P2, "Inspect every representation when
+        # generating recovery rows"): раніше тут викликався
+        # Resolve-BRAVOConfiguratorSuppliedLeafOverride, що повертає ЛИШЕ
+        # ОДНЕ (найдовше/пріоритетне) supplied-представлення canonical
+        # leaf-а. Якщо САМЕ це представлення проходило авторизацію
+        # (IsValid=$true), код одразу `continue`-ився — і НІКОЛИ не
+        # перевіряв інші представлення того самого leaf-а (той самий
+        # canonical leaf МІГ бути supplied ОДНОЧАСНО валідним точним
+        # ключем і невалідним вкладеним дублікатом, чи навпаки), тож
+        # валідний дублікат мовчки маскував невалідний і жодного
+        # recovery-рядка не синтезувалось — Apply назавжди відхилявся
+        # canonical authorization без жодного UI-поля для Clear. Тепер
+        # перевіряються УСІ представлення (Get-BRAVOConfiguratorSuppliedLeafRepresentations,
+        # та сама детермінована послідовність найдовший->найкоротший
+        # префікс) — синтезується РІВНО один recovery-рядок на leaf,
+        # щойно ХОЧА Б ОДНЕ представлення відповідає Reason, релевантному
+        # класу цього leaf-а (ValidatorRejected для ALLOW_WITH_VALIDATOR,
+        # DeniedClass для DENY_*); LocalOverrides лише ЧИТАЄТЬСЯ, не
+        # мутується.
+        $representations = @(Get-BRAVOConfiguratorSuppliedLeafRepresentations -LocalOverrides $LocalOverrides -LeafPath $path)
+        if ($representations.Count -eq 0) { continue }
 
-        $authResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ $path = $supplied.Value } -Schema $canonicalSchema
-        if ($authResult.IsValid) { continue }
-        $violation = @($authResult.Violations | Where-Object { [string]$_.Path -eq $path })
-        if ($violation.Count -eq 0) { continue }
-        $reason = [string]$violation[0].Reason
-        if ($isValidatorClass -and $reason -ne 'ValidatorRejected') { continue }
-        if ($isDenyClass -and $reason -ne 'DeniedClass') { continue }
+        $violatingViolation = $null
+        foreach ($representation in $representations) {
+            $representationAuthResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ $path = $representation.Value } -Schema $canonicalSchema
+            if ($representationAuthResult.IsValid) { continue }
+            $representationViolation = @($representationAuthResult.Violations | Where-Object { [string]$_.Path -eq $path })
+            if ($representationViolation.Count -eq 0) { continue }
+            $representationReason = [string]$representationViolation[0].Reason
+            if ($isValidatorClass -and $representationReason -ne 'ValidatorRejected') { continue }
+            if ($isDenyClass -and $representationReason -ne 'DeniedClass') { continue }
+            $violatingViolation = $representationViolation[0]
+            break
+        }
+        if ($null -eq $violatingViolation) { continue }
+        $violation = @($violatingViolation)
+        $reason = [string]$violatingViolation.Reason
 
         $recoveryOrder++
         if ($reason -eq 'ValidatorRejected') {
