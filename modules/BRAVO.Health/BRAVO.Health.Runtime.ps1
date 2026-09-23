@@ -3749,6 +3749,81 @@ function Get-ManagedServiceHealthIssues {
     return @($issues)
 }
 
+function Get-BRAVOManagedServiceStatusSnapshot {
+    # Незалежний від Get-ManagedServiceHealthIssues знімок статусу
+    # ключових служб (BSYSTEM Operations, Task #10). НАВМИСНО не
+    # ділить internal-цикл із Get-ManagedServiceHealthIssues і не
+    # модифікує її: та функція повертає лише issue-записи (Running
+    # службу пропускає без структурованого запису), і її споживач
+    # (Write-BRAVOHealthStep 'Керовані служби') трактує будь-який
+    # структурований запис як проблему — додавання сюди "Running"
+    # зламало б наявний Health-звіт. Ця функція, навпаки, ЗАВЖДИ
+    # повертає явний статус (running/stopped/unknown) для кожної
+    # налаштованої служби, незалежно від того, чи є проблема.
+    [OutputType([object[]])]
+    param()
+
+    if ($null -eq $maintenanceSettings -or $null -eq $maintenanceSettings.Services) {
+        return @()
+    }
+
+    $resolveStatus = {
+        param([object]$Service)
+
+        if ($null -eq $Service) {
+            return "unknown"
+        }
+        switch ($Service.Status) {
+            ([System.ServiceProcess.ServiceControllerStatus]::Running) { return "running" }
+            ([System.ServiceProcess.ServiceControllerStatus]::Stopped) { return "stopped" }
+            default { return "unknown" }
+        }
+    }
+
+    $snapshot = New-Object System.Collections.ArrayList
+    $addSnapshotEntry = {
+        param([string]$Name, [object]$Service)
+
+        if ([string]::IsNullOrWhiteSpace($Name)) {
+            return
+        }
+        if (@($snapshot | Where-Object { $_.Name -ieq $Name }).Count -gt 0) {
+            return
+        }
+        [void]$snapshot.Add([pscustomobject]@{
+            Name = $Name
+            Status = (& $resolveStatus $Service)
+        })
+    }
+
+    foreach ($serviceName in @(
+            [string]$maintenanceSettings.Services.BravoName,
+            [string]$maintenanceSettings.Services.ExchangeApiName
+        )) {
+        if (-not [string]::IsNullOrWhiteSpace($serviceName)) {
+            & $addSnapshotEntry $serviceName (Get-Service -Name $serviceName -ErrorAction SilentlyContinue)
+        }
+    }
+
+    if (Test-BRAVOSettingEnabled -Value $maintenanceSettings.Services.BravoWebEnabled) {
+        foreach ($candidate in @($maintenanceSettings.Services.BravoWebCandidates)) {
+            if ([string]::IsNullOrWhiteSpace([string]$candidate)) {
+                continue
+            }
+            $webService = Get-Service -Name ([string]$candidate) -ErrorAction SilentlyContinue
+            if ($null -eq $webService) {
+                $webService = Get-Service -DisplayName ([string]$candidate) -ErrorAction SilentlyContinue
+            }
+            if ($null -ne $webService) {
+                & $addSnapshotEntry ([string]$candidate) $webService
+                break
+            }
+        }
+    }
+
+    return @($snapshot)
+}
+
 function Get-HealthIssueComponentName {
     param([object]$Issue)
 
@@ -5024,6 +5099,21 @@ if (-not $environmentPreflight.IsWritable) {
             $environmentNotificationStatus = "Failed"
             Write-HealthLog "Не вдалося відправити сповіщення про недоступність середовища у ${NotificationProviderDisplayName}: $($_.Exception.Message)" -Level "ERROR"
         }
+
+        if ($null -ne $operationsReportingSettings) {
+            try {
+                Send-BRAVOOperationsEvent `
+                    -OperationsReportingSettings $operationsReportingSettings `
+                    -CredentialTargets $credentialSettings.Targets `
+                    -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                    -Category 'health' -Severity 'CRITICAL' `
+                    -Component 'Health' `
+                    -Message 'Недоступне середовище виконання BRAVO Health' `
+                    -Details @{ failedPath = [string]$environmentPreflight.FailedPath; isPrivilegeFailure = [bool]$environmentPreflight.IsPrivilegeFailure }
+            } catch {
+                Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+            }
+        }
     }
 
     return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
@@ -5520,6 +5610,20 @@ if ($healthIssues.Count -eq 0) {
                 -MessageChunks $successChunks `
                 -TimeoutSeconds $NotificationRequestTimeoutSeconds
             Write-HealthLog "Успішний звіт відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
+            if ($null -ne $operationsReportingSettings) {
+                try {
+                    Send-BRAVOOperationsEvent `
+                        -OperationsReportingSettings $operationsReportingSettings `
+                        -CredentialTargets $credentialSettings.Targets `
+                        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                        -Category 'health' -Severity 'SUCCESS' `
+                        -Component 'Health' `
+                        -Message 'Health-перевірка успішна' `
+                        -Services (Get-BRAVOManagedServiceStatusSnapshot)
+                } catch {
+                    Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+                }
+            }
             try {
                 Save-BRAVOHealthSuccessNotificationState -Fingerprint $successFingerprint
             } catch {
@@ -5696,6 +5800,21 @@ try {
         -TimeoutSeconds $NotificationRequestTimeoutSeconds
     Save-AlertState -Fingerprint $alertFingerprint
     Write-HealthLog "Критичне повідомлення успішно відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'health' -Severity 'CRITICAL' `
+                -Component 'Health' `
+                -Message "Виявлено $($healthIssues.Count) проблем(и) під час Health-перевірки" `
+                -Services (Get-BRAVOManagedServiceStatusSnapshot) `
+                -Details @{ issueCount = $healthIssues.Count }
+        } catch {
+            Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
     return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
         Status = "Critical"
         IssueCount = $healthIssues.Count

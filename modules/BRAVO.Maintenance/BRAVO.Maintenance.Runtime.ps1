@@ -7162,7 +7162,21 @@ function Send-FinalReport {
         }
         Write-Log -Message "ПОМИЛКА відправки фінального повідомлення: $errorDetails" -Level "ERROR"
     }
-    
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+                -Category 'maintenance' -Severity $notificationSeverity `
+                -Component 'Maintenance' `
+                -Message "Обслуговування завершено: $notificationSeverity"
+        } catch {
+            Write-Log -Message "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+
     Write-Log -Message "==="
 }
 

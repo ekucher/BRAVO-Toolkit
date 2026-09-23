@@ -494,6 +494,7 @@ function Get-BRAVODefaultConfiguration {
             ApiBaseUrl = ""
             RequestTimeoutSeconds = 30
             HeartbeatIntervalMinutes = 60
+            ProductType = "LIMS"
         }
 
         # #158 (етап 4): discoverySettings — повноцінний raw-блок, а не
