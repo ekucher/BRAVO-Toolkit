@@ -34,6 +34,26 @@
 
 Set-StrictMode -Version 2.0
 
+# Codex review PR #224 (P1, "Import authorization modules into the UI
+# scope unconditionally"): Show-BRAVOConfiguratorMainForm раніше
+# перевіряла `Get-Module -Name 'BRAVO.Configuration'/'...Schema'` і
+# імпортувала ЛИШЕ якщо модуля не знайдено в процесі — та сама
+# небезпечна умова, що вже виправлена в BRAVO.Configurator.Model.psm1
+# (див. коментар там): `Get-Module` доводить лише, що ІНСТАНС модуля
+# десь ЗАВАНТАЖЕНИЙ у процесі (напр. приватно, всередині
+# BRAVO.Configurator.Model, без Export-ModuleMember далі), а не що його
+# exported-команди видимі у ВЛАСНОМУ, окремому session state цього
+# модуля (BRAVO.Configurator.UI). За такої умови guard мовчки "проходить"
+# (Get-Module каже "вже завантажено"), а
+# Get-BRAVOConfigurationSchemaAuthorizationClass падає
+# CommandNotFoundException ще до відкриття форми. Імпорт тепер
+# БЕЗУМОВНИЙ у власний module scope цього файлу — той самий патерн, що
+# в BRAVO.Configurator.Model.psm1 — виконується ОДИН раз при imports
+# .psm1, незалежно від Get-Module-видимості деінде в процесі.
+$script:BRAVOConfiguratorUIDependencyRoot = Split-Path -Path $PSScriptRoot -Parent
+Import-Module -Name (Join-Path $script:BRAVOConfiguratorUIDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop -Scope Local
+Import-Module -Name (Join-Path $script:BRAVOConfiguratorUIDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop -Scope Local
+
 # =====================================================================
 # 1. Чисті функції (без System.Windows.Forms у сигнатурі/тілі)
 # =====================================================================
@@ -1080,17 +1100,9 @@ function Show-BRAVOConfiguratorMainForm {
     # Issue #216, Wave 2: ефективна ReadOnly-поведінка похідна з
     # canonical Class (не другий, окремо підтримуваний allow/deny-
     # перелік у каталозі Configurator-а — WAVE2-CONTRACT.md, розділ
-    # 11.4). Явний Import-Module тут (а не покладання на побічний
-    # ефект чужого модуля) — BRAVO.Configuration/BRAVO.Configuration.Schema
-    # НЕ гарантовано вже завантажені на момент старту UI: інші
-    # Configurator-модулі (Effective/Persistence) імпортують
-    # BRAVO.Configuration.Schema лише лениво, всередині власних функцій.
-    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
-    }
-    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
-    }
+    # 11.4). BRAVO.Configuration/BRAVO.Configuration.Schema імпортовані
+    # безумовно на рівні модуля (див. коментар на початку файлу) — тут
+    # лише виклик, без повторної Get-Module-перевірки.
     $authorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
     $staticSchemaCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $rawSchemaCatalog -AuthorizationClass $authorizationClass
 

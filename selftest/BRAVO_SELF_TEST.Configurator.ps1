@@ -2990,6 +2990,61 @@ try {
 }
 
 # =====================================================================
+# Codex review PR #224 (P1, "Import authorization modules into the UI
+# scope unconditionally"): та сама РЕАЛЬНА private-session-state умова,
+# що блок вище для Model (New-Module foreign loader у ІЗОЛЬОВАНОМУ
+# дочірньому процесі, команди BRAVO.Configuration/Schema лишаються
+# приватними для foreign-модуля), тепер для
+# BRAVO.Configurator.UI.psm1 — Get-Module підтверджує, що інстанс
+# модуля ЗАВАНТАЖЕНИЙ десь у процесі, але БЕЗ безумовного module-level
+# Import-Module (фікс P1) UI.psm1 усе одно НЕ бачив би команд у
+# ВЛАСНОМУ session state. Пряма перевірка
+# Get-BRAVOConfigurationSchemaAuthorizationClass (не через
+# Show-BRAVOConfiguratorMainForm — той вимагає STA/WinForms ShowDialog,
+# несумісний із headless self-test) — та сама функція, що
+# Show-BRAVOConfiguratorMainForm викликає одразу після module-level
+# імпорту.
+# =====================================================================
+& {
+    $uiScopeCommand = (
+        "Set-StrictMode -Version 2.0; " +
+        "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader' -ScriptBlock { " +
+        "param(`$root) " +
+        "function Invoke-ForeignConfigurationLoad { param(`$root) " +
+        "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop; " +
+        "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop " +
+        "}; Export-ModuleMember -Function Invoke-ForeignConfigurationLoad " +
+        "} -ArgumentList '$root'; " +
+        "Import-Module `$foreignModule -Force; " +
+        "Invoke-ForeignConfigurationLoad -root '$root'; " +
+        "`$uiModule = Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.UI.psm1' -Force -PassThru; " +
+        "try { " +
+        # Виклик через `& $uiModule { ... }` (не напряму з top-level
+        # scope дочірнього процесу) НАВМИСНИЙ — саме так PowerShell
+        # виконує код У ВЛАСНОМУ session state модуля, тобто те, що
+        # РЕАЛЬНО відбувається, коли функція, визначена ВСЕРЕДИНІ
+        # BRAVO.Configurator.UI.psm1 (Show-BRAVOConfiguratorMainForm),
+        # викликає Get-BRAVOConfigurationSchemaAuthorizationClass. Прямий
+        # виклик з top-level scope дочірнього процесу довів би НЕ ТЕ —
+        # команди, імпортовані з `-Scope Local` на рівні модуля, НІКОЛИ
+        # не видимі викликачу ЗОВНІ модуля незалежно від фіксу.
+        "`$classes = & `$uiModule { Get-BRAVOConfigurationSchemaAuthorizationClass }; " +
+        "'AUTHCLASS-OK:' + [string]`$classes.Count " +
+        "} catch { 'AUTHCLASS-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+    )
+    $uiScopeProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -NoLogo -NoProfile -NonInteractive -Command $uiScopeCommand 2>&1
+    $uiScopeProbeLast = ([string](@($uiScopeProbe)[-1])).Trim()
+
+    # --- Configurator/UIModuleScopeWorksWithForeignModuleInstancePresent ---
+    Test-BRAVOCondition (
+        $uiScopeProbeLast -match '^AUTHCLASS-OK:\d+$'
+    ) `
+        'Configurator/UIModuleScopeWorksWithForeignModuleInstancePresent' `
+        "Import BRAVO.Configurator.UI.psm1 (той самий foreign-private-loader сценарій, що Model вище) МУСИТЬ дозволити Get-BRAVOConfigurationSchemaAuthorizationClass (виклик, з якого починається Show-BRAVOConfiguratorMainForm) успішно виконатись навіть коли BRAVO.Configuration/Schema вже завантажені приватним, неекспортованим шляхом — жодного CommandNotFoundException; отримано: '$uiScopeProbeLast'"
+}
+
+# =====================================================================
 # PR #224 third review, R3-2/R3-3: Convert-BRAVOConfiguratorNestedContainerToFlatKeys
 # — explicit flat-key precedence під час flatten-on-touch (R3-2) і
 # fail-closed на порожньому вкладеному вузлі (R3-3).
@@ -3084,6 +3139,135 @@ try {
              "продакшн-файл мусить лишитись побайтово незмінним; отримано Applied=$($r33ApplyResult.Applied) Stage=$($r33ApplyResult.Stage)")
     } finally {
         Remove-Item -LiteralPath $r33ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Codex review PR #224 (P2, "Remove nested duplicates when clearing a
+# flat override"): Merge-BRAVOConfiguratorCandidateOverrides раніше
+# обробляла плоский top-level ключ і одразу `continue`-ила — НІКОЛИ не
+# перевіряючи, чи той самий canonical leaf ТАКОЖ представлений
+# вкладеним Node-контейнером (легасі-файл, де обидві форми
+# співіснують). Clear на флеті лишав вкладений дублікат назавжди в
+# merged-результаті.
+# =====================================================================
+& {
+    # --- Merge/DuplicateFlatAndNestedClearRemovesBothRepresentations ---
+    # --- Merge/DuplicateFlatAndNestedSiblingSurvivesFlattening ---
+    # --- Merge/DuplicateFlatAndNestedDoesNotMutateCallerInput ---
+    # Той самий canonical leaf (SUCCESS) supplied ОДНОЧАСНО й флетом
+    # (значення, яке фактично читається — флет має пріоритет), і
+    # вкладеним контейнером (застаріле значення, ІГНОРУЄТЬСЯ при читанні,
+    # але ФІЗИЧНО присутнє на диску) поряд із сусіднім WARNING, супроводжуваним
+    # ЛИШЕ вкладено.
+    $p2ClearExisting = @{
+        'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS = 'general'
+            WARNING = 'alerts'
+        }
+    }
+    $p2ClearModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $p2ClearExisting
+    $p2ClearModelEdited = Clear-BRAVOConfiguratorOverride -Model $p2ClearModel -Path 'bravoSettings.NotificationRouting.SUCCESS'
+    $p2ClearMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $p2ClearExisting -Model $p2ClearModelEdited -SchemaCatalog $configuratorSchemaCatalog
+
+    Test-BRAVOCondition (
+        (-not $p2ClearMerged.Contains('bravoSettings.NotificationRouting.SUCCESS')) -and
+        (-not $p2ClearMerged.Contains('bravoSettings.NotificationRouting'))
+    ) `
+        'Merge/DuplicateFlatAndNestedClearRemovesBothRepresentations' `
+        ("Clear на флет-SUCCESS, коли той самий leaf ТАКОЖ supplied вкладеним контейнером, мусить прибрати ОБИДВІ представленості (флет і вкладений контейнер), " +
+         "а не лишити вкладений дублікат назавжди; отримано FlatPresent=$($p2ClearMerged.Contains('bravoSettings.NotificationRouting.SUCCESS')) ContainerPresent=$($p2ClearMerged.Contains('bravoSettings.NotificationRouting'))")
+
+    Test-BRAVOCondition (
+        $p2ClearMerged.Contains('bravoSettings.NotificationRouting.WARNING') -and
+        [string]$p2ClearMerged['bravoSettings.NotificationRouting.WARNING'] -eq 'alerts'
+    ) `
+        'Merge/DuplicateFlatAndNestedSiblingSurvivesFlattening' `
+        ("сусідній WARNING (supplied лише вкладено, у тому самому контейнері, що дубльований SUCCESS) мусить пережити флеттенізацію, " +
+         "спричинену обробкою SUCCESS-дубліката, зі своїм значенням незмінним; отримано Present=$($p2ClearMerged.Contains('bravoSettings.NotificationRouting.WARNING')) Value=$($(if ($p2ClearMerged.Contains('bravoSettings.NotificationRouting.WARNING')) { $p2ClearMerged['bravoSettings.NotificationRouting.WARNING'] } else { 'N/A' }))")
+
+    Test-BRAVOCondition (
+        $p2ClearExisting.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+        [string]$p2ClearExisting['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
+        $p2ClearExisting.Contains('bravoSettings.NotificationRouting') -and
+        ($p2ClearExisting['bravoSettings.NotificationRouting'] -is [hashtable]) -and
+        [string]$p2ClearExisting['bravoSettings.NotificationRouting']['SUCCESS'] -eq 'general' -and
+        [string]$p2ClearExisting['bravoSettings.NotificationRouting']['WARNING'] -eq 'alerts'
+    ) `
+        'Merge/DuplicateFlatAndNestedDoesNotMutateCallerInput' `
+        ("Merge-BRAVOConfiguratorCandidateOverrides НЕ повинна мутувати переданий ExistingOverrides hashtable (ні top-level ключі, ні вкладений hashtable-об'єкт) — " +
+         "вона повертає НОВИЙ результат; отримано FlatSurvives=$($p2ClearExisting.Contains('bravoSettings.NotificationRouting.SUCCESS')) ContainerSurvives=$($p2ClearExisting.Contains('bravoSettings.NotificationRouting'))")
+
+    # --- Merge/DuplicateFlatAndNestedEditKeepsSingleFlatLeaf ---
+    # Той самий дубльований сценарій, але Model-рішення — НЕ Clear, а
+    # редагування (OverridePresent=true з НОВИМ значенням, відмінним від
+    # обох старих representations) — після Merge мусить лишитись РІВНО
+    # один флет-ключ з Model-значенням, без жодного залишку вкладеної
+    # форми.
+    $p2EditExisting = @{
+        'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS = 'general'
+            WARNING = 'general'
+        }
+    }
+    $p2EditModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $p2EditExisting
+    $p2EditModelEdited = Set-BRAVOConfiguratorOverride -Model $p2EditModel -Path 'bravoSettings.NotificationRouting.SUCCESS' -Value 'general'
+    $p2EditMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $p2EditExisting -Model $p2EditModelEdited -SchemaCatalog $configuratorSchemaCatalog
+
+    Test-BRAVOCondition (
+        $p2EditMerged.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+        [string]$p2EditMerged['bravoSettings.NotificationRouting.SUCCESS'] -eq 'general' -and
+        (-not $p2EditMerged.Contains('bravoSettings.NotificationRouting')) -and
+        $p2EditMerged.Contains('bravoSettings.NotificationRouting.WARNING') -and
+        [string]$p2EditMerged['bravoSettings.NotificationRouting.WARNING'] -eq 'general'
+    ) `
+        'Merge/DuplicateFlatAndNestedEditKeepsSingleFlatLeaf' `
+        ("редагування (не Clear) дубльованого SUCCESS мусить лишити РІВНО один флет-ключ з Model-значенням ('general'), контейнер прибраний, WARNING-сусід переживає флеттенізацію; " +
+         "отримано SUCCESS=$($(if ($p2EditMerged.Contains('bravoSettings.NotificationRouting.SUCCESS')) { $p2EditMerged['bravoSettings.NotificationRouting.SUCCESS'] } else { 'ABSENT' })) ContainerPresent=$($p2EditMerged.Contains('bravoSettings.NotificationRouting')) WARNING=$($(if ($p2EditMerged.Contains('bravoSettings.NotificationRouting.WARNING')) { $p2EditMerged['bravoSettings.NotificationRouting.WARNING'] } else { 'ABSENT' }))")
+
+    # --- Apply/DuplicateFlatAndNestedProducesSerializableCandidate ---
+    # End-to-end через реальний Invoke-BRAVOConfiguratorApply (не лише
+    # Merge у пам'яті): доводить, що дубльований flat+nested сценарій НЕ
+    # призводить до hashtable-значення в кінцевому candidate (canonical
+    # серіалізатор fail-closed відмовляється писати hashtable), і Apply
+    # реально УСПІШНО записує production-файл.
+    $p2ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DUPLICATEFLATNESTED_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($p2ApplyScenarioRoot)
+    try {
+        $p2ApplyConfigPath = Join-Path $p2ApplyScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $p2ApplyConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'SUCCESS' = 'general'`r`n" +
+                "        'WARNING' = 'alerts'`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $p2ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $p2ApplyScenarioRoot
+        $p2ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $p2ApplyBaseline.Overrides
+        $p2ApplyModelEdited = Clear-BRAVOConfiguratorOverride -Model $p2ApplyModel -Path 'bravoSettings.NotificationRouting.SUCCESS'
+        $p2ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $p2ApplyScenarioRoot `
+            -Model $p2ApplyModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $p2ApplyBaseline
+        $p2ApplyPostText = if (Test-Path -LiteralPath $p2ApplyConfigPath -PathType Leaf) { Get-Content -LiteralPath $p2ApplyConfigPath -Raw -Encoding UTF8 } else { $null }
+
+        Test-BRAVOCondition (
+            [bool]$p2ApplyResult.Applied -and [string]$p2ApplyResult.Stage -eq 'Complete' -and
+            ($null -ne $p2ApplyPostText) -and
+            (-not $p2ApplyPostText.Contains("'bravoSettings.NotificationRouting.SUCCESS'")) -and
+            (-not $p2ApplyPostText.Contains("'bravoSettings.NotificationRouting' = @{"))
+        ) `
+            'Apply/DuplicateFlatAndNestedProducesSerializableCandidate' `
+            ("Apply на дубльованому flat+nested сценарії (Clear флет-SUCCESS) мусить УСПІШНО записати production-файл (Applied=true, Stage=Complete) без жодної hashtable-серіалізації " +
+             "чи залишку флет-SUCCESS; отримано Applied=$($p2ApplyResult.Applied) Stage=$($p2ApplyResult.Stage)")
+    } finally {
+        Remove-Item -LiteralPath $p2ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 
