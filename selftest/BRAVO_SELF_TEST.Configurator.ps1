@@ -2715,10 +2715,23 @@ try {
     [void][IO.Directory]::CreateDirectory($eoScenarioRoot)
     $eoOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
     try {
+        # $eoScenarioRoot навмисно без BRAVO.config (той самий synthetic-
+        # no-config шлях, що й Секція 8 вище) — тож pathSettings.LIMSRoot/
+        # BackupRoot мусять бути явними тут, інакше canonical loader
+        # намагається AUTO-визначити їх через реальну службу Windows
+        # "BRAVO" (Resolve-BRAVOEffectiveLimsRoot), якої немає на CI-
+        # runner-і — негерметична залежність, що ламала пряму дочірню
+        # canonical-loader-пробу нижче (EscapableNonCatalogOverridePreview-
+        # MatchesLoader) на GitHub Actions windows-latest, хоча решта
+        # сценарію тут коректно ізольована через $configuratorFixtureRuntimeRoot.
         $eoLocalConfigPath = Join-Path $eoScenarioRoot 'BRAVO.local.config'
         [IO.File]::WriteAllText(
             $eoLocalConfigPath,
-            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $eoPath = $false }),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $eoPath = $false
+                'pathSettings.LIMSRoot' = $configuratorFixtureLimsRoot
+                'pathSettings.BackupRoot' = $configuratorFixtureBackupRoot
+            }),
             (New-Object System.Text.UTF8Encoding($false))
         )
 
@@ -2785,25 +2798,43 @@ try {
             "З env синтезований рядок МУСИТЬ мати Section='EscapableOverride' (НЕ DeniedOverride/ValidatorRejected — значення фактично прийняте), і лишатись ReadOnly; отримано Section=$($(if ($eoOnRow.Count) { $eoOnRow[0].Section } else { 'N/A' })) ReadOnly=$($(if ($eoOnRow.Count) { $eoOnRow[0].ReadOnly } else { 'N/A' }))"
 
         # --- Configurator/EscapableNonCatalogOverridePreviewMatchesLoader (env ON) ---
+        # Пряма дочірня canonical-loader-проба МУСИТЬ лишатись герметичною,
+        # як і решта цього сценарію: $configuratorFixtureRuntimeRoot (не
+        # $root) — інакше -RuntimeRoot вказує на справжній репозиторій, а
+        # AUTO-дефолт pathSettings.LIMSRoot/BackupRoot ("") намагається
+        # знайти реальну службу Windows "BRAVO" (Resolve-BRAVOEffectiveLimsRoot),
+        # якої на CI-runner-і немає.
         $eoOnLoaderThrew = $false
         $eoOnLoaderProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
             -NoLogo -NoProfile -NonInteractive -Command (
                 "Set-StrictMode -Version 2.0; " +
                 "`$env:BRAVO_ALLOW_WEAKENED_SECURITY = '1'; " +
                 "try { " +
-                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
-                "[void](Import-BravoConfiguration -ConfigRoot '$eoScenarioRoot' -RuntimeRoot '$root'); " +
-                "'NOTHREW:' + [string]`$global:requireAdministrator " +
+                ". '$configuratorFixtureRuntimeRoot\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$eoScenarioRoot' -RuntimeRoot '$configuratorFixtureRuntimeRoot'); " +
+                "'NOTHREW:' + [string]`$global:requireAdministrator + '|LIMSROOT:' + [string]`$global:effectiveLimsRoot " +
                 "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
             ) 2>&1
         $eoOnLoaderProbeLast = ([string](@($eoOnLoaderProbe)[-1])).Trim()
+        $eoOnLoaderProbeParts = $eoOnLoaderProbeLast -split '\|LIMSROOT:', 2
+        $eoOnLoaderProbeNoThrewPart = [string]$eoOnLoaderProbeParts[0]
+        # Не лише "не впало" — доводимо, що реальний canonical loader
+        # дійсно резолвнув $global:effectiveLimsRoot (Resolve-
+        # BRAVOEffectiveLimsRoot, Source=ExplicitConfig) з явного
+        # герметичного override-у ($configuratorFixtureLimsRoot), а НЕ
+        # мовчки прослизнув через AUTO-визначення служби Windows "BRAVO"
+        # (Source=ServiceDiscovery/Error) — саме ця AUTO-гілка недоступна
+        # на CI-runner-і й раніше ламала цю пробу.
+        $eoOnLoaderProbeLimsRoot = if ($eoOnLoaderProbeParts.Count -eq 2) { [string]$eoOnLoaderProbeParts[1] } else { $null }
         Test-BRAVOCondition (
             $eoOnPreview.Contains($eoPath) -and [bool]$eoOnPreview[$eoPath] -eq $false -and
             $eoOnEffectiveSetting.Count -eq 1 -and [bool]$eoOnEffectiveSetting[0].EffectiveValue -eq $false -and
-            $eoOnLoaderProbeLast -eq 'NOTHREW:False'
+            $eoOnLoaderProbeNoThrewPart -eq 'NOTHREW:False' -and
+            $null -ne $eoOnLoaderProbeLimsRoot -and
+            $eoOnLoaderProbeLimsRoot.TrimEnd('\', '/') -eq $configuratorFixtureLimsRoot.TrimEnd('\', '/')
         ) `
             'Configurator/EscapableNonCatalogOverridePreviewMatchesLoader' `
-            "З env preview-candidate МУСИТЬ включати $eoPath=false, Effective preview = false, і РЕАЛЬНИЙ canonical loader (child-process) з тим самим env мусить прийняти те саме значення; отримано PreviewContains=$($eoOnPreview.Contains($eoPath)) PreviewValue=$($(if ($eoOnPreview.Contains($eoPath)) { $eoOnPreview[$eoPath] } else { 'N/A' })) EffectiveValue=$($eoOnEffectiveSetting[0].EffectiveValue) LoaderProbe=$eoOnLoaderProbeLast"
+            "З env preview-candidate МУСИТЬ включати $eoPath=false, Effective preview = false, РЕАЛЬНИЙ canonical loader (child-process) з тим самим env мусить прийняти те саме значення, і LIMSRoot мусить прийти з герметичного override-у (не AUTO); отримано PreviewContains=$($eoOnPreview.Contains($eoPath)) PreviewValue=$($(if ($eoOnPreview.Contains($eoPath)) { $eoOnPreview[$eoPath] } else { 'N/A' })) EffectiveValue=$($eoOnEffectiveSetting[0].EffectiveValue) LoaderProbe=$eoOnLoaderProbeLast Expected LIMSRoot=$configuratorFixtureLimsRoot"
 
         # --- Configurator/EscapableNonCatalogOverrideApplyUnchangedSucceeds ---
         $eoOnUnchangedModel = Update-BRAVOConfiguratorEffective -Model $eoOnModel -RuntimeRoot $configuratorFixtureRuntimeRoot
