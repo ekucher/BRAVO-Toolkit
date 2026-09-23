@@ -422,4 +422,20 @@
     # 'schedulerSettings.Health.BusyWaitMinutes' = 60   # 0 = негайне відкладення при зайнятій архівації
     # 'schedulerSettings.BAZASync.StartAt' = '00:00'
     # 'schedulerSettings.BAZASync.RepeatEveryHours' = 4
+
+    # =========================================================
+    # BSYSTEM OPERATIONS (operationsReportingSettings) — fleet-моніторинг
+    # =========================================================
+    # Вимкнено за замовчуванням (opt-in). Вмикайте усвідомлено, по одному
+    # серверу: після self-enrollment сервер зʼявляється в Operations зі
+    # статусом "Pending", доки адміністратор не підтвердить його вручну.
+    # 'operationsReportingSettings.Enabled' = $true
+    # 'operationsReportingSettings.ApiBaseUrl' = 'https://operations.bsystem.example/api'
+    # 'operationsReportingSettings.RequestTimeoutSeconds' = 30
+    # 'operationsReportingSettings.HeartbeatIntervalMinutes' = 60
+
+    # Bootstrap-секрет для first-run self-enrollment (видається окремо
+    # адміністратором Operations, не є product-default):
+    # 'credentialSettings.Targets.OperationsBootstrapSecret' = 'BRAVO_OPERATIONS_BOOTSTRAP_SECRET'
+    # 'credentialSettings.Targets.OperationsApiKey' = 'BRAVO_OPERATIONS_API_KEY'
 }
