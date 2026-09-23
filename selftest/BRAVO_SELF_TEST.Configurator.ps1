@@ -2565,11 +2565,19 @@ try {
         $dnEscWithEnvRow = @($dnEscWithEnvCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
 
         # --- Configurator/DeniedRecoveryNotSynthesizedWithEscapeHatchAllowed ---
+        # Issue #216, сьоме коло ревю ("Keep escapable noncatalog overrides
+        # in the session model"): раніше escapable DENY просто НЕ
+        # синтезував жодного рядка (Count=0) — Model про override нічого
+        # не знала, preview помилково відкочувався до canonical default.
+        # Тепер рядок ІСНУЄ (Count=1), АЛЕ з Section='EscapableOverride' —
+        # НЕ 'DeniedOverride' (значення фактично прийняте, не відхилене).
+        # Повний матрікс цього Case C — окремий блок нижче
+        # (Configurator/EscapableNonCatalogOverride*).
         Test-BRAVOCondition (
-            $dnEscWithEnvRow.Count -eq 0
+            $dnEscWithEnvRow.Count -eq 1 -and [string]$dnEscWithEnvRow[0].Section -eq 'EscapableOverride'
         ) `
             'Configurator/DeniedRecoveryNotSynthesizedWithEscapeHatchAllowed' `
-            "З BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator=`$false МУСИТЬ бути прийнятий canonical loader-ом через наявний escape hatch — recovery-рядок НЕ повинен синтезуватись (це не фактично denied override); отримано Count=$($dnEscWithEnvRow.Count)"
+            "З BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator=`$false МУСИТЬ бути прийнятий canonical loader-ом через наявний escape hatch — синтезований рядок МУСИТЬ існувати, АЛЕ з Section='EscapableOverride' (НЕ 'DeniedOverride' — значення фактично не відхилене); отримано Count=$($dnEscWithEnvRow.Count) Section=$($(if ($dnEscWithEnvRow.Count) { $dnEscWithEnvRow[0].Section } else { 'N/A' }))"
     } finally {
         [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnEscOriginalEnv)
     }
@@ -2673,6 +2681,311 @@ try {
             "$irSftpPath=[uint64]::MaxValue МУСИТЬ лишитись у Model (OverridePresent=true) для виправлення/Clear, БЕЗ throw під час Model/preview-побудови, і бути виключеним із preview-candidate; отримано ModelThrew=$irSftpModelThrew PreviewThrew=$irSftpPreviewThrew SettingCount=$($irSftpSetting.Count) PreviewContains=$($(if ($irSftpPreview) { $irSftpPreview.Contains($irSftpPath) } else { 'N/A' }))"
     } finally {
         Remove-Item -LiteralPath $irSftpScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Issue #216, сьоме коло ревю (P2, "Keep escapable noncatalog overrides
+# in the session model"): requireAdministrator=$false БЕЗ статичного
+# Configurator-дескриптора, DENY_SECURITY_CONTROL,
+# WeakeningOverride='ExistingSecurityEscapeHatch' — canonical loader
+# ПРИЙМАЄ це значення, КОЛИ BRAVO_ALLOW_WEAKENED_SECURITY=1. Раніше
+# Get-BRAVOConfiguratorSessionSchemaCatalog просто `continue`-ила Case C
+# (escapable DENY) — Model про override НІЧОГО не знала, preview
+# помилково відкочувався до canonical default $true. Тепер синтезується
+# session-preservation рядок (Section='EscapableOverride', ВІДМІННИЙ від
+# 'DeniedOverride'/'ValidatorRejected') — ReadOnly/existing-only/Clear-
+# only, як і решта recovery-рядків, АЛЕ бере участь у preview-candidate.
+# =====================================================================
+& {
+    $eoPath = 'requireAdministrator'
+    $eoRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $eoAuthClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+
+    Test-BRAVOCondition (
+        $eoAuthClass.Contains($eoPath) -and [string]$eoAuthClass[$eoPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        [string]$eoAuthClass[$eoPath].WeakeningOverride -eq 'ExistingSecurityEscapeHatch' -and
+        (-not (@($eoRawCatalog | Where-Object { $_.Path -eq $eoPath })))
+    ) `
+        'Configurator/EscapableSessionFixturePreconditions' `
+        "передумова: $eoPath мусить лишатись DENY_SECURITY_CONTROL/ExistingSecurityEscapeHatch і БЕЗ статичного Configurator-дескриптора; отримано Class=$($eoAuthClass[$eoPath].Class) WeakeningOverride=$($eoAuthClass[$eoPath].WeakeningOverride) StaticHasIt=$([bool](@($eoRawCatalog | Where-Object { $_.Path -eq $eoPath })))"
+
+    $eoScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_ESCAPABLESESSION_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($eoScenarioRoot)
+    $eoOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        $eoLocalConfigPath = Join-Path $eoScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $eoLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $eoPath = $false }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        # ===== Environment OFF =====
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $eoOffBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot
+        $eoOffCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOffBaseline.Overrides
+        $eoOffRow = @($eoOffCatalog | Where-Object { $_.Path -eq $eoPath })
+        $eoOffModel = Get-BRAVOConfiguratorModel -SchemaCatalog $eoOffCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $eoOffBaseline.Overrides
+        $eoOffSetting = @($eoOffModel | Where-Object { $_.Path -eq $eoPath })
+        $eoOffPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $eoOffModel
+        $eoOffEffectiveModel = Update-BRAVOConfiguratorEffective -Model $eoOffModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOffEffectiveSetting = @($eoOffEffectiveModel | Where-Object { $_.Path -eq $eoPath })
+
+        Test-BRAVOCondition (
+            $eoOffRow.Count -eq 1 -and [string]$eoOffRow[0].Section -eq 'DeniedOverride' -and [bool]$eoOffRow[0].ReadOnly -and
+            $eoOffSetting.Count -eq 1 -and [bool]$eoOffSetting[0].OverridePresent -and [bool]$eoOffSetting[0].OverrideValue -eq $false
+        ) `
+            'Configurator/NonEscapableDeniedRecoveryStillWorks' `
+            "БЕЗ env $eoPath мусить лишитись звичайним DeniedOverride recovery-рядком (Section=DeniedOverride, ReadOnly), Model OverridePresent=true/OverrideValue=false; отримано RowCount=$($eoOffRow.Count) Section=$($(if ($eoOffRow.Count) { $eoOffRow[0].Section } else { 'N/A' })) OverridePresent=$($eoOffSetting[0].OverridePresent) Value=$($eoOffSetting[0].OverrideValue)"
+
+        Test-BRAVOCondition (
+            (-not $eoOffPreview.Contains($eoPath)) -and
+            $eoOffEffectiveSetting.Count -eq 1 -and [bool]$eoOffEffectiveSetting[0].EffectiveValue -eq $true
+        ) `
+            'Configurator/EscapableNonCatalogOverridePreviewMatchesLoader/EnvOff' `
+            "БЕЗ env preview МУСИТЬ виключити $eoPath, а Effective лишитись canonical default `$true (те саме, що реально прийме loader БЕЗ BRAVO_ALLOW_WEAKENED_SECURITY=1); отримано PreviewContains=$($eoOffPreview.Contains($eoPath)) EffectiveValue=$($eoOffEffectiveSetting[0].EffectiveValue)"
+
+        # --- Apply unchanged (env OFF) мусить fail-closed провалитись ---
+        $eoOffUnchangedModel = Update-BRAVOConfiguratorEffective -Model $eoOffModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOffUnchangedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot -Model $eoOffUnchangedModel -SchemaCatalog $eoOffCatalog -ProductionBaseline $eoOffBaseline
+        $eoOffUnchangedContent = Get-Content -LiteralPath $eoLocalConfigPath -Raw -Encoding UTF8
+        Test-BRAVOCondition (
+            (-not [bool]$eoOffUnchangedApply.Applied) -and $eoOffUnchangedContent.Contains($eoPath)
+        ) `
+            'Configurator/EscapableNonCatalogOverrideApplyUnchangedFailsWithoutEnv' `
+            "БЕЗ env Apply незміненого $eoPath=false МУСИТЬ fail-closed провалитись (canonical loader відхиляє), файл лишається незмінним; отримано Applied=$($eoOffUnchangedApply.Applied) Content=$eoOffUnchangedContent"
+
+        # ===== Environment ON =====
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $eoOnBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot
+        $eoOnCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOnBaseline.Overrides
+        $eoOnRow = @($eoOnCatalog | Where-Object { $_.Path -eq $eoPath })
+        $eoOnModel = Get-BRAVOConfiguratorModel -SchemaCatalog $eoOnCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $eoOnBaseline.Overrides
+        $eoOnSetting = @($eoOnModel | Where-Object { $_.Path -eq $eoPath })
+        $eoOnPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $eoOnModel
+        $eoOnEffectiveModel = Update-BRAVOConfiguratorEffective -Model $eoOnModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOnEffectiveSetting = @($eoOnEffectiveModel | Where-Object { $_.Path -eq $eoPath })
+
+        # --- Configurator/EscapableNonCatalogOverrideHasSessionRow ---
+        Test-BRAVOCondition (
+            $eoOnRow.Count -eq 1 -and $eoOnSetting.Count -eq 1 -and [bool]$eoOnSetting[0].OverridePresent -and [bool]$eoOnSetting[0].OverrideValue -eq $false
+        ) `
+            'Configurator/EscapableNonCatalogOverrideHasSessionRow' `
+            "З env $eoPath МУСИТЬ мати рівно один синтезований рядок і бути видимим у Model (OverridePresent=true/OverrideValue=false); отримано RowCount=$($eoOnRow.Count) OverridePresent=$($(if ($eoOnSetting.Count) { $eoOnSetting[0].OverridePresent } else { 'N/A' }))"
+
+        # --- Configurator/EscapableNonCatalogOverrideIsNotDeniedRecovery ---
+        Test-BRAVOCondition (
+            $eoOnRow.Count -eq 1 -and [string]$eoOnRow[0].Section -eq 'EscapableOverride' -and
+            [string]$eoOnRow[0].Section -ne 'DeniedOverride' -and [string]$eoOnRow[0].Section -ne 'ValidatorRejected' -and
+            [bool]$eoOnRow[0].ReadOnly
+        ) `
+            'Configurator/EscapableNonCatalogOverrideIsNotDeniedRecovery' `
+            "З env синтезований рядок МУСИТЬ мати Section='EscapableOverride' (НЕ DeniedOverride/ValidatorRejected — значення фактично прийняте), і лишатись ReadOnly; отримано Section=$($(if ($eoOnRow.Count) { $eoOnRow[0].Section } else { 'N/A' })) ReadOnly=$($(if ($eoOnRow.Count) { $eoOnRow[0].ReadOnly } else { 'N/A' }))"
+
+        # --- Configurator/EscapableNonCatalogOverridePreviewMatchesLoader (env ON) ---
+        $eoOnLoaderThrew = $false
+        $eoOnLoaderProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                "Set-StrictMode -Version 2.0; " +
+                "`$env:BRAVO_ALLOW_WEAKENED_SECURITY = '1'; " +
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$eoScenarioRoot' -RuntimeRoot '$root'); " +
+                "'NOTHREW:' + [string]`$global:requireAdministrator " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+            ) 2>&1
+        $eoOnLoaderProbeLast = ([string](@($eoOnLoaderProbe)[-1])).Trim()
+        Test-BRAVOCondition (
+            $eoOnPreview.Contains($eoPath) -and [bool]$eoOnPreview[$eoPath] -eq $false -and
+            $eoOnEffectiveSetting.Count -eq 1 -and [bool]$eoOnEffectiveSetting[0].EffectiveValue -eq $false -and
+            $eoOnLoaderProbeLast -eq 'NOTHREW:False'
+        ) `
+            'Configurator/EscapableNonCatalogOverridePreviewMatchesLoader' `
+            "З env preview-candidate МУСИТЬ включати $eoPath=false, Effective preview = false, і РЕАЛЬНИЙ canonical loader (child-process) з тим самим env мусить прийняти те саме значення; отримано PreviewContains=$($eoOnPreview.Contains($eoPath)) PreviewValue=$($(if ($eoOnPreview.Contains($eoPath)) { $eoOnPreview[$eoPath] } else { 'N/A' })) EffectiveValue=$($eoOnEffectiveSetting[0].EffectiveValue) LoaderProbe=$eoOnLoaderProbeLast"
+
+        # --- Configurator/EscapableNonCatalogOverrideApplyUnchangedSucceeds ---
+        $eoOnUnchangedModel = Update-BRAVOConfiguratorEffective -Model $eoOnModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOnUnchangedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot -Model $eoOnUnchangedModel -SchemaCatalog $eoOnCatalog -ProductionBaseline $eoOnBaseline
+        $eoOnUnchangedContent = Get-Content -LiteralPath $eoLocalConfigPath -Raw -Encoding UTF8
+        Test-BRAVOCondition (
+            [bool]$eoOnUnchangedApply.Applied -and [string]$eoOnUnchangedApply.Stage -eq 'Complete' -and $eoOnUnchangedContent.Contains($eoPath)
+        ) `
+            'Configurator/EscapableNonCatalogOverrideApplyUnchangedSucceeds' `
+            "З env Apply НЕЗМІНЕНОГО $eoPath=false МУСИТЬ успішно пройти (той самий escape hatch, що приймає canonical loader); отримано Applied=$($eoOnUnchangedApply.Applied) Stage=$($eoOnUnchangedApply.Stage) Content=$eoOnUnchangedContent"
+
+        # --- Configurator/EscapableNonCatalogOverrideCanBeCleared ---
+        $eoOnCleared = Clear-BRAVOConfiguratorOverride -Model $eoOnModel -Path $eoPath
+        $eoOnCleared = Update-BRAVOConfiguratorEffective -Model $eoOnCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOnClearApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot -Model $eoOnCleared -SchemaCatalog $eoOnCatalog -ProductionBaseline $eoOnBaseline
+        $eoOnClearedContent = if (Test-Path -LiteralPath $eoLocalConfigPath) { Get-Content -LiteralPath $eoLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$eoOnClearApply.Applied -and [string]$eoOnClearApply.Stage -eq 'Complete' -and (-not $eoOnClearedContent.Contains($eoPath))
+        ) `
+            'Configurator/EscapableNonCatalogOverrideCanBeCleared' `
+            "Clear+Apply $eoPath (env ON) мусить успішно прибрати override з файлу; отримано Applied=$($eoOnClearApply.Applied) Stage=$($eoOnClearApply.Stage) Content=$eoOnClearedContent"
+
+        # --- Configurator/EscapableNonCatalogOverrideCannotBeCreatedFromClean ---
+        $eoCleanCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides @{}
+        Test-BRAVOCondition (
+            -not (@($eoCleanCatalog | Where-Object { $_.Path -eq $eoPath }))
+        ) `
+            'Configurator/EscapableNonCatalogOverrideCannotBeCreatedFromClean' `
+            "НАВІТЬ з BRAVO_ALLOW_WEAKENED_SECURITY=1 (env усе ще ON) чистий конфіг (LocalOverrides=@{}) НЕ повинен синтезувати рядок для $eoPath — Configurator не може створити НОВИЙ послаблений override, лише зберегти вже наявний"
+
+        # --- Configurator/EscapableNonCatalogOverridePolicyTransition ---
+        # Той самий supplied local-файл (requireAdministrator=false, ще не
+        # Clear-нутий у цій гілці тесту), перерахований під ОБОМА
+        # env-станами — Section мусить коректно переключатись без
+        # дублікатів і без застряглої класифікації.
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $eoTransitionOffCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOffBaseline.Overrides
+        $eoTransitionOffRow = @($eoTransitionOffCatalog | Where-Object { $_.Path -eq $eoPath })
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $eoTransitionOnCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOffBaseline.Overrides
+        $eoTransitionOnRow = @($eoTransitionOnCatalog | Where-Object { $_.Path -eq $eoPath })
+        Test-BRAVOCondition (
+            $eoTransitionOffRow.Count -eq 1 -and [string]$eoTransitionOffRow[0].Section -eq 'DeniedOverride' -and
+            $eoTransitionOnRow.Count -eq 1 -and [string]$eoTransitionOnRow[0].Section -eq 'EscapableOverride'
+        ) `
+            'Configurator/EscapableNonCatalogOverridePolicyTransition' `
+            "той самий supplied local-файл, перерахований під env OFF -> ON, мусить перейти РІВНО з одного DeniedOverride-рядка на РІВНО один EscapableOverride-рядок (без дублікатів, без застряглої класифікації); отримано OffCount=$($eoTransitionOffRow.Count)/OffSection=$($(if ($eoTransitionOffRow.Count) { $eoTransitionOffRow[0].Section } else { 'N/A' })) OnCount=$($eoTransitionOnRow.Count)/OnSection=$($(if ($eoTransitionOnRow.Count) { $eoTransitionOnRow[0].Section } else { 'N/A' }))"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $eoOriginalEnv)
+        Remove-Item -LiteralPath $eoScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Configurator/StaticDeniedDescriptorNotDuplicated ---
+    # BAZA.Mode/.MutationPolicy: статичний ReadOnly-дескриптор УЖЕ існує
+    # (окремий, давніший механізм через Resolve-BRAVOConfiguratorFieldAuthorization) —
+    # навіть з env ON (де ці шляхи все одно НЕ escapable — WeakeningOverride='None')
+    # augmented-каталог НЕ повинен додавати другий дескриптор.
+    $sddScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_STATICNODUP_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($sddScenarioRoot)
+    $sddOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        [IO.File]::WriteAllText(
+            (Join-Path $sddScenarioRoot 'BRAVO.local.config'),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                'backupMonitoring.SFTP.BAZA.Mode'           = 'Legacy'
+                'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'Warn'
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $sddBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $sddScenarioRoot
+        $sddCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $sddBaseline.Overrides
+        $sddModeMatches = @($sddCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+        $sddMutationMatches = @($sddCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.MutationPolicy' })
+        Test-BRAVOCondition (
+            $sddModeMatches.Count -eq 1 -and $sddMutationMatches.Count -eq 1
+        ) `
+            'Configurator/StaticDeniedDescriptorNotDuplicated' `
+            "BAZA.Mode/.MutationPolicy вже мають статичні дескриптори (окремий, давніший ReadOnly-механізм) — навіть з env ON augmented-каталог НЕ повинен додавати другий дескриптор; отримано ModeCount=$($sddModeMatches.Count) MutationPolicyCount=$($sddMutationMatches.Count)"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $sddOriginalEnv)
+        Remove-Item -LiteralPath $sddScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Issue #216, сьоме коло ревю (P1, "Import configuration dependencies
+# into the model scope"): раніше ConvertTo-BRAVOConfiguratorOverrideHashtable/
+# Get-BRAVOConfiguratorSessionSchemaCatalog покладались на `Get-Module -Name
+# 'BRAVO.Configuration'/'...Schema'` як доказ видимості команд у ВЛАСНОМУ
+# module scope BRAVO.Configurator.Model — небезпечне припущення під
+# Windows PowerShell 5.1 module session-state семантикою: Get-Module
+# може підтвердити, що інстанс модуля ЗАВАНТАЖЕНИЙ десь у процесі (напр.
+# інший компонент імпортував його у ВЛАСНИЙ, непублічний module scope,
+# не експортуючи залежність далі), тоді як Model.psm1 усе одно не бачить
+# його команд. Залежності тепер імпортуються БЕЗУМОВНО в module scope
+# самого Model.psm1 (при завантаженні файлу, до жодного виклику
+# функції) — жодної Get-Module-перевірки більше немає.
+#
+# Регресія нижче відтворює РЕАЛЬНУ private-session-state умову через
+# New-Module (динамічний модуль у пам'яті, без Export-ModuleMember для
+# BRAVO.Configuration/Schema — команди лишаються приватними для цього
+# foreign-модуля) у ІЗОЛЬОВАНОМУ дочірньому процесі, ПОТІМ напряму
+# імпортує BRAVO.Configurator.Model.psm1 (та сама схема імпорту, що
+# production BRAVO_CONFIGURATOR.ps1 і self-test використовують) і
+# викликає ОБИДВІ production-функції з НЕПОРОЖНІМ LocalOverrides/Model —
+# порожній набір ($LocalOverrides.Count -eq 0) обходить залежні виклики
+# й зробив би регресію марною.
+# =====================================================================
+& {
+    $mdScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MODELDEPSCOPE_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mdScenarioRoot)
+    try {
+        [IO.File]::WriteAllText(
+            (Join-Path $mdScenarioRoot 'BRAVO.local.config'),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'winSCPIniPath' = 'C:\Legacy\WinSCP.ini' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mdCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader' -ScriptBlock { " +
+            "param(`$root) " +
+            "function Invoke-ForeignConfigurationLoad { param(`$root) " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop; " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop " +
+            "}; Export-ModuleMember -Function Invoke-ForeignConfigurationLoad " +
+            "} -ArgumentList '$root'; " +
+            "Import-Module `$foreignModule -Force; " +
+            "Invoke-ForeignConfigurationLoad -root '$root'; " +
+            "Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.Schema.psd1' -Force; " +
+            "Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.Model.psm1' -Force; " +
+            "try { " +
+            "`$raw = Get-BRAVOConfiguratorSchemaCatalog; " +
+            "`$catalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog `$raw -LocalOverrides @{ 'winSCPIniPath' = 'C:\Legacy\WinSCP.ini' }; " +
+            "`$row = `$catalog | Where-Object { `$_.Path -eq 'winSCPIniPath' }; " +
+            "'CATALOG-OK:' + [string]`$row.Section " +
+            "} catch { 'CATALOG-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $mdCatalogProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $mdCommand 2>&1
+        $mdCatalogProbeLast = ([string](@($mdCatalogProbe)[-1])).Trim()
+
+        # --- Configurator/ModelSessionCatalogWorksWithForeignModuleInstancePresent ---
+        Test-BRAVOCondition (
+            $mdCatalogProbeLast -eq 'CATALOG-OK:DeniedOverride'
+        ) `
+            'Configurator/ModelSessionCatalogWorksWithForeignModuleInstancePresent' `
+            "Get-BRAVOConfiguratorSessionSchemaCatalog (нонемпті LocalOverrides) МУСИТЬ працювати навіть коли BRAVO.Configuration/Schema вже завантажені десь у процесі приватним, неекспортованим шляхом (New-Module foreign loader) — жодного CommandNotFoundException; отримано: '$mdCatalogProbeLast'"
+
+        $mdPreviewCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader' -ScriptBlock { " +
+            "param(`$root) " +
+            "function Invoke-ForeignConfigurationLoad { param(`$root) " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop; " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop " +
+            "}; Export-ModuleMember -Function Invoke-ForeignConfigurationLoad " +
+            "} -ArgumentList '$root'; " +
+            "Import-Module `$foreignModule -Force; " +
+            "Invoke-ForeignConfigurationLoad -root '$root'; " +
+            "Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.Model.psm1' -Force; " +
+            "try { " +
+            "`$model = @([pscustomobject]@{ Path = 'sftpPort'; OverridePresent = `$true; OverrideValue = 2222 }); " +
+            "`$preview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model `$model; " +
+            "'PREVIEW-OK:' + [string]`$preview['sftpPort'] " +
+            "} catch { 'PREVIEW-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $mdPreviewProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $mdPreviewCommand 2>&1
+        $mdPreviewProbeLast = ([string](@($mdPreviewProbe)[-1])).Trim()
+
+        # --- Configurator/ModelPreviewWorksWithForeignModuleInstancePresent ---
+        Test-BRAVOCondition (
+            $mdPreviewProbeLast -eq 'PREVIEW-OK:2222'
+        ) `
+            'Configurator/ModelPreviewWorksWithForeignModuleInstancePresent' `
+            "ConvertTo-BRAVOConfiguratorOverrideHashtable (нонемпті Model, allowed ALLOW_SITE-подібне значення, що форсує canonical авторизацію) МУСИТЬ повернути коректний preview-hashtable навіть коли BRAVO.Configuration/Schema вже завантажені приватним, неекспортованим шляхом; отримано: '$mdPreviewProbeLast'"
+    } finally {
+        Remove-Item -LiteralPath $mdScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

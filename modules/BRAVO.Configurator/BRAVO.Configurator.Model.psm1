@@ -21,6 +21,32 @@
 
 Set-StrictMode -Version 2.0
 
+# Issue #216, сьоме коло ревю (P1, "Import configuration dependencies into
+# the model scope"): раніше ConvertTo-BRAVOConfiguratorOverrideHashtable/
+# Get-BRAVOConfiguratorSessionSchemaCatalog перевіряли `Get-Module -Name
+# 'BRAVO.Configuration'/'...Schema'` і імпортували ЛИШЕ якщо модуля не
+# знайдено в процесі — небезпечне припущення під Windows PowerShell 5.1
+# module session-state семантикою: `Get-Module` показує, що інстанс
+# модуля ЗАВАНТАЖЕНИЙ десь у процесі, але НЕ доводить, що його exported
+# команди видимі у ПРИВАТНОМУ session state САМЕ модуля
+# BRAVO.Configurator.Model (напр. якщо той самий модуль уже імпортовано
+# лише в глобальну сесію викликача, а не dot-sourced/imported у сесію
+# ЦЬОГО модуля). Тоді виклики на кшталт
+# Get-BRAVOConfigurationSchemaAuthorizationClass/Get-BRAVODefaultConfiguration/
+# Get-BRAVOConfigurationSchema/Test-BRAVOConfigurationOverrideAuthorization
+# нижче падають CommandNotFoundException — і це особливо непомітно, бо
+# guard-и мовчки "проходять" (Get-Module каже "вже завантажено"), а
+# реальний виклик падає лише коли $LocalOverrides.Count -gt 0 (ранній
+# return на порожньому наборі ховає залежність узагалі). Імпорт тепер
+# БЕЗУМОВНИЙ у власний module scope цього файлу (без залежності від
+# Get-Module як доказу видимості команд) — виконується ОДИН раз при
+# imports .psm1, працює однаково незалежно від того, чи файл
+# завантажується через Model.psd1 (RequiredModules) чи напряму (як це
+# роблять і production BRAVO_CONFIGURATOR.ps1, і self-test).
+$script:BRAVOConfiguratorModelDependencyRoot = Split-Path -Path $PSScriptRoot -Parent
+Import-Module -Name (Join-Path $script:BRAVOConfiguratorModelDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop -Scope Local
+Import-Module -Name (Join-Path $script:BRAVOConfiguratorModelDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop -Scope Local
+
 function Resolve-BRAVOConfiguratorGatedEffective {
     <#
     .SYNOPSIS
@@ -523,12 +549,10 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
         [Parameter(Mandatory = $true)][array]$Model
     )
 
-    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
-    }
-    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
-    }
+    # Залежності (BRAVO.Configuration/BRAVO.Configuration.Schema) імпортовані
+    # безумовно у module scope цього файлу при завантаженні .psm1 (див.
+    # коментар біля Set-StrictMode на початку файлу) — жодної Get-Module-
+    # перевірки тут більше не потрібно.
     $authorizationClass = Get-BRAVOConfigurationSchemaAuthorizationClass
 
     $overrides = @{}
@@ -567,14 +591,25 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
     <#
     .SYNOPSIS
         PR #224 review (P2, "Expose validator-rejected noncatalog overrides
-        for recovery"; розширено — "Generalize noncatalog DENY recovery"):
-        один augmented каталог дескрипторів для ПОТОЧНОЇ сесії — статичний
-        каталог (типово Resolve-BRAVOConfiguratorFieldAuthorization-
-        результат) плюс ДИНАМІЧНО синтезовані recovery-only дескриптори
-        для canonical листів, яких немає у статичному каталозі, але чиє
-        ПОТОЧНЕ supplied-значення canonical авторизація відхиляє — або
-        ALLOW_WITH_VALIDATOR-лист з Reason='ValidatorRejected', або
-        БУДЬ-ЯКИЙ DENY_*-лист з Reason='DeniedClass' (не escapable зараз).
+        for recovery"; розширено — "Generalize noncatalog DENY recovery";
+        розширено далі — "Keep escapable noncatalog overrides in the
+        session model"): один augmented каталог дескрипторів для ПОТОЧНОЇ
+        сесії — статичний каталог (типово
+        Resolve-BRAVOConfiguratorFieldAuthorization-результат) плюс
+        ДИНАМІЧНО синтезовані дескриптори для canonical листів, яких
+        немає у статичному каталозі, але чиє ПОТОЧНЕ supplied-значення
+        canonical авторизація трактує як одне з трьох:
+          A. ALLOW_WITH_VALIDATOR + Reason='ValidatorRejected'
+             -> recovery-only дескриптор (Section='ValidatorRejected');
+          B. DENY_* + Reason='DeniedClass' + escape hatch НЕ дозволений
+             зараз -> recovery-only дескриптор (Section='DeniedOverride');
+          C. DENY_* + Reason='DeniedClass' + canonical escape hatch
+             ЗАРАЗ дозволений (R3-1, сьогодні лише requireAdministrator)
+             -> дескриптор session-preservation (Section='EscapableOverride') —
+             це НЕ відхилене значення: canonical loader його зараз
+             приймає, тож Model МУСИТЬ бачити той самий override, інакше
+             preview/Effective розійшлися б із реальним canonical
+             результатом.
     .DESCRIPTION
         Приклад 1 (ValidatorRejected): schedulerSettings.RestoreVerify.WeeklyOn='Funday' —
         canonical leaf, ALLOW_WITH_VALIDATOR, ІСТОРИЧНО loader сам
@@ -629,16 +664,19 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
             ReadOnly-статус і так уже дає окремий, існуючий, статичний
             механізм через Resolve-BRAVOConfiguratorFieldAuthorization),
             тут не дублюється;
-          - для DENY_*-класу ДОДАЄТЬСЯ (Section='DeniedOverride'), ЛИШЕ
-            якщо canonical Test-BRAVOConfigurationOverrideAuthorization
-            повертає Reason='DeniedClass' для цього Path — і ЛИШЕ якщо
-            Test-BRAVOConfigurationWeakeningEscapeHatchAllowed для цього
-            ж Path зараз $false (той самий, ЄДИНИЙ canonical виклик, що
-            ConvertTo-BRAVOConfiguratorOverrideHashtable вже використовує
-            для R3-1/requireAdministrator — не дубльовано, не
-            переоцінено тут окремою логікою); якщо escape hatch зараз
-            дозволений для цього Path, значення фактично приймається
-            canonical loader-ом і recovery-рядок НЕ синтезується;
+          - для DENY_*-класу з Reason='DeniedClass' синтезується РІВНО
+            один рядок, чий Section визначається ЄДИНИМ canonical
+            викликом Test-BRAVOConfigurationWeakeningEscapeHatchAllowed
+            (той самий виклик, що ConvertTo-BRAVOConfiguratorOverrideHashtable
+            вже використовує для R3-1/requireAdministrator — не
+            дубльовано, не переоцінено тут окремою логікою): $false ->
+            Section='DeniedOverride' (Case B, значення фактично
+            відхилене); $true -> Section='EscapableOverride' (Case C,
+            значення фактично ПРИЙНЯТЕ зараз через затверджений escape
+            hatch) — В ОБОХ випадках рядок лишається ReadOnly/existing-
+            only/Clear-only, різниться лише презентація й той факт, що
+            Case C-значення продовжує брати участь у preview-candidate
+            (див. ConvertTo-BRAVOConfiguratorOverrideHashtable);
           - НЕ додається для валідного supplied-значення (авторизація
             IsValid=$true — нормальний ALLOW_WITH_VALIDATOR override,
             нічого відновлювати, D3/невідомі ключі лишаються geть
@@ -662,12 +700,9 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         [Parameter(Mandatory = $true)][hashtable]$LocalOverrides
     )
 
-    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop
-    }
-    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
-        Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop
-    }
+    # Залежності імпортовані безумовно у module scope цього файлу (див.
+    # коментар біля Set-StrictMode на початку файлу) — жодної Get-Module-
+    # перевірки тут більше не потрібно.
 
     $augmented = New-Object System.Collections.Generic.List[object]
     $staticPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
@@ -700,25 +735,40 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         $reason = [string]$violation[0].Reason
         if ($isValidatorClass -and $reason -ne 'ValidatorRejected') { continue }
         if ($isDenyClass -and $reason -ne 'DeniedClass') { continue }
-        if ($isDenyClass -and (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $path -AuthorizationClass $authorizationClass)) {
-            # Той самий escape-hatch-шлях, що ConvertTo-BRAVOConfiguratorOverrideHashtable
-            # вже застосовує (R3-1, наразі лише requireAdministrator):
-            # canonical loader ЗАРАЗ приймає це значення через
-            # BRAVO_ALLOW_WEAKENED_SECURITY=1 — не синтезувати
-            # "заборонено" recovery-рядок для override, який фактично не
-            # відхиляється в поточному процесі.
-            continue
-        }
 
         $recoveryOrder++
         if ($reason -eq 'ValidatorRejected') {
             $section = 'ValidatorRejected'
             $label = "Відновлення (невалідне значення): $path"
             $description = "Наявний local override для '$path' не проходить canonical валідацію: $($violation[0].Message) Поле лише для перегляду/Clear через Configurator; нове значення тут ввести не можна. Виправте значення напряму у BRAVO.local.config, щоб знову зробити цей лист звичайним редагованим полем."
+        } elseif (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $path -AuthorizationClass $authorizationClass) {
+            # Issue #216, сьоме коло ревю (P2, "Keep escapable noncatalog
+            # overrides in the session model"): Case C — DeniedClass, АЛЕ
+            # canonical escape hatch ЗАРАЗ активний для цього Path (R3-1,
+            # сьогодні лише requireAdministrator + BRAVO_ALLOW_WEAKENED_SECURITY=1).
+            # Це НЕ відхилене значення — canonical loader ПРИЙМАЄ його
+            # прямо зараз (той самий, ЄДИНИЙ canonical виклик
+            # Test-BRAVOConfigurationWeakeningEscapeHatchAllowed, що
+            # ConvertTo-BRAVOConfiguratorOverrideHashtable вже використовує,
+            # щоб включити цей самий override у preview-candidate). Раніше
+            # цей випадок просто `continue`-ився (рядок НЕ синтезувався) —
+            # Model про override взагалі не знала, тож ConvertTo-BRAVOConfiguratorOverrideHashtable
+            # (яка будує candidate ЛИШЕ з OverridePresent-рядків Model)
+            # ніколи не бачила цей override, а startup Effective preview
+            # мовчки відкочувався до canonical default замість фактичного
+            # значення, яке canonical loader реально застосує. Тепер рядок
+            # синтезується під ОКРЕМИМ Section='EscapableOverride' — НЕ
+            # 'DeniedOverride'/'ValidatorRejected', щоб не називати
+            # прийняте значення відхиленим — і лишається ReadOnly/existing-
+            # only/Clear-only, як і решта recovery-рядків: Configurator НЕ
+            # дозволяє створити НОВИЙ послаблений override через це поле.
+            $section = 'EscapableOverride'
+            $label = "Активний override під дозволеним послабленням: $path"
+            $description = "Наявний local override для '$path' активний лише завдяки затвердженому механізму послаблення безпеки (BRAVO_ALLOW_WEAKENED_SECURITY=1) — canonical loader ЗАРАЗ приймає це значення. Configurator відображає й зберігає наявний override для узгодженості з реальним ефективним значенням, але НЕ дозволяє створити новий послаблений override через це поле; нове значення тут ввести не можна. Clear прибирає override повністю."
         } else {
-            # DeniedClass: не розкриваємо саме значення класу/причини
-            # заборони (security-sensitive деталь) — лише факт, що поле
-            # заборонене і його можна прибрати через Clear.
+            # DeniedClass, НЕ escapable зараз: не розкриваємо саме значення
+            # класу/причини заборони (security-sensitive деталь) — лише
+            # факт, що поле заборонене і його можна прибрати через Clear.
             $section = 'DeniedOverride'
             $label = "Відновлення (заборонений override): $path"
             $description = "Наявний local override для '$path' встановлює заборонену політику й canonical loader його відхиляє. Поле лише для перегляду/Clear через Configurator; нове значення тут ввести не можна. Приберіть цей запис напряму з BRAVO.local.config, якщо override більше не потрібен."
