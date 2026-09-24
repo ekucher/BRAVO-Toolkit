@@ -51,6 +51,10 @@ $script:BRAVOHealthStepOkCount = 0
 $script:BRAVOHealthStepWarningCount = 0
 $script:BRAVOHealthStepErrorCount = 0
 $script:BRAVOHealthLastStepTime = $null
+# Накопичує кожен Write-BRAVOHealthStep за весь прогін (як
+# $script:BRAVOArchiveStepHistory в Archive) — Operations-подія SUCCESS/
+# CRITICAL нижче читає це для per-stage деталізації.
+$script:BRAVOHealthStepHistory = [System.Collections.Generic.List[object]]::new()
 # Перевірка цілісності інструментів виконується значно нижче, але
 # Complete-BRAVOHealthResult читає її результат — а через цю функцію
 # проходить КОЖЕН вихід Health, зокрема ранні (моніторинг вимкнено,
@@ -94,11 +98,19 @@ function Write-BRAVOHealthStep {
         $stepDuration = (Get-Date) - $script:BRAVOHealthLastStepTime
     }
     $script:BRAVOHealthLastStepTime = Get-Date
+    $script:BRAVOHealthStepHistory.Add([ordered]@{
+        name = $Name
+        status = $Status
+        details = $Details
+        durationMs = if ($null -ne $stepDuration) { [Math]::Round($stepDuration.TotalMilliseconds) } else { $null }
+    })
     # Вбудований виклик з Archive (SuppressHeader) не друкує власну
     # покрокову нумерацію [N/5]: вона стоїть поряд із власною нумерацією
     # Archive [N/7] і виглядає як другий незалежний прогін замість одного
     # кроку "Перевірка резервних копій". Лічильник вище лишається
-    # безумовним — від нього залежить нумерація кроку "Сповіщення".
+    # безумовним — від нього залежить нумерація кроку "Сповіщення". Історія
+    # (вище) теж лишається безумовною: embedded-прогін завершується власною
+    # Operations-подією Health і має бачити свої ж етапи.
     if ($SuppressHeader) {
         return
     }
@@ -5619,7 +5631,14 @@ if ($healthIssues.Count -eq 0) {
                         -Category 'health' -Severity 'SUCCESS' `
                         -Component 'Health' `
                         -Message 'Health-перевірка успішна' `
-                        -Services (Get-BRAVOManagedServiceStatusSnapshot)
+                        -Services (Get-BRAVOManagedServiceStatusSnapshot) `
+                        -Details @{
+                            stages = @($script:BRAVOHealthStepHistory)
+                            okCount = $script:BRAVOHealthStepOkCount
+                            warnCount = $script:BRAVOHealthStepWarningCount
+                            errorCount = $script:BRAVOHealthStepErrorCount
+                            durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
+                        }
                 } catch {
                     Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
                 }
@@ -5810,7 +5829,14 @@ try {
                 -Component 'Health' `
                 -Message "Виявлено $($healthIssues.Count) проблем(и) під час Health-перевірки" `
                 -Services (Get-BRAVOManagedServiceStatusSnapshot) `
-                -Details @{ issueCount = $healthIssues.Count }
+                -Details @{
+                    issueCount = $healthIssues.Count
+                    stages = @($script:BRAVOHealthStepHistory)
+                    okCount = $script:BRAVOHealthStepOkCount
+                    warnCount = $script:BRAVOHealthStepWarningCount
+                    errorCount = $script:BRAVOHealthStepErrorCount
+                    durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
+                }
         } catch {
             Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
         }
