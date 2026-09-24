@@ -7165,13 +7165,33 @@ function Send-FinalReport {
 
     if ($null -ne $operationsReportingSettings) {
         try {
+            # $script:BRAVOMaintenanceStepLog — той самий журнал, що вже
+            # живить фінальне Slack/Discord-повідомлення (New-BRAVOMaintenanceCompletedLines)
+            # і консольний РЕЗУЛЬТАТ: реальні кроки (Trace/Очистка/Міграція/
+            # Архівація/Автовимкнення тощо) з фактичним Status/Details, а не
+            # єдиний узагальнений 'Maintenance'-рядок, як було раніше.
+            $maintenanceStages = @($script:BRAVOMaintenanceStepLog | ForEach-Object {
+                [ordered]@{
+                    name = [string]$_.Name
+                    status = [string]$_.Status
+                    details = if ([string]::IsNullOrWhiteSpace([string]$_.Details)) { $null } else { [string]$_.Details }
+                }
+            })
             Send-BRAVOOperationsEvent `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
                 -Category 'maintenance' -Severity $notificationSeverity `
                 -Component 'Maintenance' `
-                -Message "Обслуговування завершено: $notificationSeverity"
+                -Message "Обслуговування завершено: $notificationSeverity" `
+                -Details @{
+                    durationMs = [Math]::Round($elapsedTime.TotalMilliseconds)
+                    okCount = $script:BRAVOMaintenanceStepOkCount
+                    warnCount = $script:BRAVOMaintenanceStepWarnCount
+                    skippedCount = $script:BRAVOMaintenanceStepSkippedCount
+                    failCount = $script:BRAVOMaintenanceStepFailCount
+                    stages = $maintenanceStages
+                }
         } catch {
             Write-Log -Message "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
         }
