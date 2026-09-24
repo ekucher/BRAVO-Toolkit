@@ -383,13 +383,43 @@ function Get-BRAVOOperationsHttpStatusCode {
 }
 
 function Get-BRAVOOperationsHttpErrorBody {
-    # Best-effort парсинг JSON-тіла помилки (напр. {error, status} на 409)
-    # — лише для діагностичного логування, ніколи не для гілкування логіки
-    # (щоб не залежати від точного формату помилки бекенду).
+    # Парсинг JSON-тіла помилки (напр. {error, status} на 409). Це вже НЕ
+    # лише діагностика — POST /enroll's 409-гілка вище branches на
+    # $errorCode ('claim_mismatch' vs already_finalized) і на
+    # $finalStatus ('approved' vs 'revoked'/інше), тож ця функція мусить
+    # надійно повертати реальне тіло, а не мовчки $null.
+    #
+    # G3 E2E fix: попередня реалізація читала тіло через
+    # $response.GetResponseStream().ReadToEnd() -- на РЕАЛЬНОМУ Windows
+    # PowerShell 5.1 (перевірено проти живого bsystem-operations API, не
+    # мока) Invoke-WebRequest вже сам повністю вичитує response stream
+    # non-2xx відповіді, щоб заповнити $ErrorRecord.ErrorDetails.Message
+    # -- до моменту виклику цієї функції стрім уже на EOF, і повторний
+    # ReadToEnd() мовчки повертає порожній рядок (не викидає -- swallow'
+    # ed тим самим try/catch, що мав ловити СПРАВЖНІ помилки парсингу).
+    # Наслідок був реальним і 100% відтворюваним, не теоретичним:
+    # claim_mismatch/already_finalized НІКОЛИ фактично не розрізнялись
+    # (обидва виглядали як "тіло відсутнє"), і -- після виправлення
+    # already_finalized-гілки нижче, щоб не бути термінальною для
+    # status=approved -- $finalStatus теж завжди виходив порожнім/
+    # 'невідомо', тож навіть успішний approve назавжди трактувався як
+    # неапрувнутий фінал. $ErrorRecord.ErrorDetails.Message -- це те, що
+    # Invoke-WebRequest САМ уже прочитав з того самого стріму, і є
+    # надійним джерелом тіла в PS 5.1; ручне читання стріму лишається
+    # єдиним fallback-ом для гіпотетичних середовищ/версій, де
+    # ErrorDetails порожній, а стрім усе ще не вичерпаний.
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$ErrorRecord)
 
     try {
+        $detailsText = $null
+        if ($null -ne $ErrorRecord.ErrorDetails -and -not [string]::IsNullOrWhiteSpace([string]$ErrorRecord.ErrorDetails.Message)) {
+            $detailsText = [string]$ErrorRecord.ErrorDetails.Message
+        }
+        if (-not [string]::IsNullOrWhiteSpace($detailsText)) {
+            return ($detailsText | ConvertFrom-Json -ErrorAction Stop)
+        }
+
         $response = $ErrorRecord.Exception.Response
         if ($null -eq $response) { return $null }
         $stream = $response.GetResponseStream()
@@ -622,17 +652,45 @@ function Invoke-BRAVOOperationsEnrollment {
             }
             $finalStatusRaw = Get-BRAVOOperationsJsonPropertyString -Object $errorBody -Name 'status'
             $finalStatus = if (-not [string]::IsNullOrWhiteSpace($finalStatusRaw)) { $finalStatusRaw } else { 'невідомо' }
-            if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastFinalizedLoggedAtUtc) {
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-                    -Message "Сервер уже фіналізований в Operations (status=$finalStatus) — POST /enroll відхилено (409 already_finalized). Це термінально для цього серверного ідентифікатора: якщо status=revoked, звітність зупинена до нового enrollment адміністратором; якщо status=approved, а локальний API-ключ втрачено, потрібне ручне admin reissue (агент не може самообслуговуватись у цьому випадку)."
-                $enrollmentState.LastFinalizedLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-                Set-BRAVOOperationsEnrollmentState -State $enrollmentState
+            if ($finalStatus -eq 'approved') {
+                # G3 E2E fix: 409 already_finalized/status=approved is NOT
+                # terminal the way revoked is. POST /enroll is attempted
+                # unconditionally on every call (see A7 comment above) --
+                # so the very first call after an admin approves a
+                # still-pending server will ALWAYS hit this branch (the
+                # row is already 'approved' by the time this POST runs),
+                # before this function has ever had a chance to reach the
+                # GET /enroll/{serverId} poll below that actually returns
+                # the apiKey. Treating this as terminal here (the previous
+                # behavior: `return $null` unconditionally) meant the
+                # agent could NEVER retrieve its API key through the
+                # normal periodic enrollment call -- every real
+                # pending->approved transition would permanently strand
+                # the agent, confirmed by a real cross-repo E2E run
+                # against a live bsystem-operations API (Wave 2 gate G3).
+                # Falling through to the GET poll below (instead of
+                # returning) fetches the apiKey normally; the GET path
+                # already correctly reports the TTL-expired case
+                # (approved-without-apiKey -> needs manual admin reissue)
+                # if the 5-minute window has passed.
+                if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotReadyLoggedAtUtc) {
+                    Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
+                        -Message 'POST /enroll відхилено (409 already_finalized, status=approved) — сервер уже підтверджено адміністратором; переходимо одразу до GET /enroll/{serverId} для отримання API-ключа.'
+                }
+            } else {
+                if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastFinalizedLoggedAtUtc) {
+                    Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                        -Message "Сервер уже фіналізований в Operations (status=$finalStatus) — POST /enroll відхилено (409 already_finalized). Це термінально для цього серверного ідентифікатора: звітність зупинена до нового enrollment адміністратором."
+                    $enrollmentState.LastFinalizedLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+                    Set-BRAVOOperationsEnrollmentState -State $enrollmentState
+                }
+                return $null
             }
+        } else {
+            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                -Message "Не вдалося зареєструвати сервер в Operations (enroll): $($_.Exception.Message)"
             return $null
         }
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-            -Message "Не вдалося зареєструвати сервер в Operations (enroll): $($_.Exception.Message)"
-        return $null
     }
     # A1/A2: 202-відповідь — лише {status}, claimToken більше не
     # повертається (нема чого повертати — claim уже в нас, локально). Тут
