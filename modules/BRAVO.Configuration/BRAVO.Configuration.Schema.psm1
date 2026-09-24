@@ -1,26 +1,28 @@
 ﻿Set-StrictMode -Version 2.0
 
 # Codex review PR #224 (P2, "Import the task-path normalizer into this
-# module scope"): Test-BRAVOConfigurationAuthorizationTaskSchedulerPath
-# раніше перевіряла `Get-Module -Name 'BRAVO.System'` і імпортувала
-# залежність ЛИШЕ якщо модуля не знайдено в процесі — та сама небезпечна
-# умова Windows PowerShell 5.1 module session-state семантики, що вже
-# виправлена в BRAVO.Configurator.Model.psm1/BRAVO.Configurator.UI.psm1
-# (див. коментарі там): `Get-Module` доводить лише, що ІНСТАНС модуля
-# десь ЗАВАНТАЖЕНИЙ у процесі, а не що його exported-команди видимі у
-# ВЛАСНОМУ session state САМЕ цього модуля (BRAVO.Configuration.Schema).
-# За такої умови guard міг мовчки "проходити" (Get-Module каже "вже
-# завантажено"), а виклик ConvertTo-BRAVOTaskPath — падати
-# CommandNotFoundException, який catch перетворює на ValidatorRejected
-# (невалідний, але насправді валідний schedulerSettings.TaskPath
-# override). Імпорт тепер БЕЗУМОВНИЙ у власний module scope цього файлу
-# — той самий патерн, що в Model.psm1/UI.psm1 — виконується ОДИН раз при
-# imports .psm1, незалежно від Get-Module-видимості деінде в процесі.
-# Напрямок залежності Configuration.Schema -> System безпечний: System —
-# листовий модуль (не має власних Import-Module, не залежить від
-# Configuration), тож циклу немає.
-$script:BRAVOConfigurationSchemaDependencyRoot = Split-Path -Path $PSScriptRoot -Parent
-Import-Module -Name (Join-Path $script:BRAVOConfigurationSchemaDependencyRoot 'BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop -Scope Local
+# module scope") + Config v2 pilot artifact regression, п'ятий раунд:
+# BRAVO.System — ЄДИНА optional-залежність цього файлу, потрібна ЛИШЕ
+# Test-BRAVOConfigurationAuthorizationTaskSchedulerPath (нижче). Перша
+# спроба фіксу зробила цей імпорт БЕЗУМОВНИМ на module-load-time (тут,
+# у preamble) — виправляло Codex-знахідку (Get-Module-presence guard
+# ненадійний під PS 5.1 module session-state семантикою), але ввело
+# РЕГРЕСІЮ: deploy\New-BRAVOConfigV2PilotArtifact.ps1 НАВМИСНО не
+# бандлить modules\BRAVO.System\ (документований архітектурний
+# контракт, коментар на початку того файлу) — кожен імпорт
+# Schema.psm1 у pilot-артефакті тепер падав з module-not-found ще ДО
+# того, як хоч один override реально потребував TaskPath-валідації
+# (Config v2 pilot artifact CI, Happy/PrepareSucceeds).
+# Залежність тепер знову ЛІНИВА (імпортується лише всередині
+# Test-BRAVOConfigurationAuthorizationTaskSchedulerPath, безпосередньо
+# перед ConvertTo-BRAVOTaskPath) — БЕЗ відновлення забороненого
+# Get-Module-presence guard (`if (-not (Get-Module -Name 'BRAVO.System'))`):
+# безумовний Import-Module виконується щоразу, коли функція реально
+# викликається, а не мовчки пропускається на підставі ненадійної
+# перевірки видимості. Це зберігає ОБИДВА інваріанти одночасно: Schema
+# завантажується без BRAVO.System, коли TaskPath не зачіпається (pilot-
+# артефакт), і TaskPath-валідатор надійно бачить ConvertTo-BRAVOTaskPath
+# незалежно від Get-Module-видимості деінде в процесі (Codex-фікс).
 
 # BRAVO.Configuration.Schema — формальна схема Configuration v2 (#154, B2).
 #
@@ -1251,9 +1253,14 @@ function Test-BRAVOConfigurationAuthorizationTaskSchedulerPath {
     }
 
     # Codex review PR #224 (P2, "Import the task-path normalizer into this
-    # module scope"): залежність BRAVO.System імпортується БЕЗУМОВНО при
-    # завантаженні .psm1 (див. коментар біля Set-StrictMode на початку
-    # файлу) — жодної Get-Module-перевірки тут більше не потрібно.
+    # module scope") + Config v2 pilot artifact regression, п'ятий раунд
+    # (див. коментар біля Set-StrictMode на початку файлу): залежність
+    # BRAVO.System — ЛІНИВА, імпортується САМЕ ТУТ, безпосередньо перед
+    # ConvertTo-BRAVOTaskPath, БЕЗУМОВНО (без `Get-Module`-presence
+    # guard) — щоразу, коли ЦЯ функція реально викликається, а НЕ на
+    # module-load-time (той preamble-варіант ламав pilot-артефакт, що
+    # навмисно не бандлить modules\BRAVO.System\ — деталі там же).
+    Import-Module -Name (Join-Path (Split-Path -Path $PSScriptRoot -Parent) 'BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop -Scope Local
 
     try {
         # Лише валідація — повернене нормалізоване значення свідомо

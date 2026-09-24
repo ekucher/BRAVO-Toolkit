@@ -1922,62 +1922,147 @@
             'Configuration/SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent' `
             "Test-BRAVOConfigurationAuthorizationTaskSchedulerPath МУСИТЬ працювати навіть коли BRAVO.System уже завантажений десь у процесі приватним, неекспортованим шляхом (New-Module foreign loader) — жодного CommandNotFoundException; отримано: '$tpProbeLast'"
 
-        # --- Configuration/SchemaImportsSystemUnconditionallyAtModuleLoad ---
-        # Прямий доказ БЕЗУМОВНОГО імпорту: свіжий дочірній процес, де
-        # BRAVO.System НІДЕ не завантажений заздалегідь — сам факт, що
-        # ConvertTo-BRAVOTaskPath виконується одразу після Import-Module
-        # Schema.psd1 (без жодного попереднього BRAVO.System-імпорту в
-        # цьому процесі), доводить, що Schema.psm1 сам імпортував
-        # залежність при завантаженні .psm1, а не покладався на чиєсь
-        # інше попереднє завантаження.
+        # --- Configuration/SchemaTaskSchedulerPathLazilyLoadsSystemWhenUsed ---
+        # ПЕРЕЙМЕНОВАНО й ПЕРЕПИСАНО (Config v2 pilot artifact regression,
+        # п'ятий раунд): попередня версія цього тесту називалась
+        # "...UnconditionallyAtModuleLoad" і стверджувала, що
+        # BRAVO.System імпортується на module-load-time — це формулювання
+        # кодувало АРХІТЕКТУРУ, яка й спричинила регресію (Config v2
+        # pilot artifact НАВМИСНО не бандлить modules\BRAVO.System\ —
+        # module-load-time імпорт ламав КОЖЕН Schema.psm1-імпорт там,
+        # незалежно від того, чи TaskPath взагалі зачіпається). Залежність
+        # тепер ЛІНИВА — імпортується лише всередині
+        # Test-BRAVOConfigurationAuthorizationTaskSchedulerPath, у момент
+        # реального виклику. Цей тест доводить САМЕ це: у свіжому процесі
+        # БЕЗ жодного попереднього BRAVO.System-імпорту, одразу після
+        # Import-Module Schema.psd1 (без виклику TaskPath-валідатора),
+        # BRAVO.System ще НЕ завантажений — і лише ВИКЛИК валідатора
+        # успішно довантажує його й повертає коректний результат.
         $tpFreshCommand = (
             "Set-StrictMode -Version 2.0; " +
             "Import-Module -Name '$tpRoot\modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1' -Force; " +
+            "`$beforeCallLoaded = [bool](Get-Module -Name 'BRAVO.System' -All); " +
             "try { " +
             "`$r = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 'BRAVO' -Path 'schedulerSettings.TaskPath'; " +
-            "'RESULT-OK:' + [string]`$r.IsValid " +
+            "'RESULT-OK:' + [string]`$beforeCallLoaded + ':' + [string]`$r.IsValid " +
             "} catch { 'RESULT-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
         )
         $tpFreshProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
             -NoLogo -NoProfile -NonInteractive -Command $tpFreshCommand 2>&1
         $tpFreshProbeLast = ([string](@($tpFreshProbe)[-1])).Trim()
         Test-BRAVOCondition (
-            $tpFreshProbeLast -eq 'RESULT-OK:True'
+            $tpFreshProbeLast -eq 'RESULT-OK:False:True'
         ) `
-            'Configuration/SchemaImportsSystemUnconditionallyAtModuleLoad' `
-            "У свіжому процесі БЕЗ жодного попереднього BRAVO.System-імпорту Test-BRAVOConfigurationAuthorizationTaskSchedulerPath однаково МУСИТЬ спрацювати одразу після Import-Module Schema.psd1 — доказ безумовного module-load-time імпорту; отримано: '$tpFreshProbeLast'"
+            'Configuration/SchemaTaskSchedulerPathLazilyLoadsSystemWhenUsed' `
+            "Одразу після Import-Module Schema.psd1 (ДО виклику валідатора) BRAVO.System НЕ мусить бути завантажений (лінива залежність); сам виклик Test-BRAVOConfigurationAuthorizationTaskSchedulerPath МУСИТЬ його довантажити й повернути IsValid=True; отримано: '$tpFreshProbeLast' (очікується 'RESULT-OK:False:True')"
 
-        # --- Configuration/SchemaSystemImportHasNoProcessWidePresenceGuard ---
-        # ДВІ тестові умови вище (SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent/
-        # SchemaImportsSystemUnconditionallyAtModuleLoad) — behavioral safety/
-        # parity-покриття: доводять, що ПОТОЧНА реалізація коректно працює
-        # в кількох PS 5.1 session-state-топологіях. Вони НЕ доводять
-        # регресію проти СТАРОГО guard-коду — сім добросовісних спроб
-        # відтворити стан "Get-Module truthy, але ConvertTo-BRAVOTaskPath
-        # невидимий у Schema-сесії" не дали живого провального сценарію.
-        # Цей тест — СТРУКТУРНИЙ/архітектурний інваріант, що прямо читає
-        # ЗАТРЕКАНИЙ вихідний код Schema.psm1 (а не поведінку через
-        # виконання) і ловить САМЕ старий забороненй патерн: (1) жодного
-        # `if (-not (Get-Module -Name 'BRAVO.System'))) {...}` guard-у в
-        # коді (не в коментарях-поясненнях фіксу — вони навмисно
-        # цитують старий патерн для документації); (2) module-load-time
-        # preamble (код ДО першого `function`-оголошення) МУСИТЬ містити
-        # безумовний `Import-Module ... BRAVO.System\BRAVO.System.psd1 ...
-        # -Scope Local`. Це справжній old-vs-new regression guard для
-        # цієї конкретної Codex-знахідки.
+        # --- Configuration/SchemaTaskPathImportHasNoProcessWidePresenceGuard ---
+        # СТРУКТУРНИЙ/архітектурний інваріант (Test A з задачі "F1 lazy
+        # dependency regression remediation"): читає ЗАТРЕКАНИЙ вихідний
+        # код Schema.psm1 (не поведінку через виконання) і ловить
+        # заборонений `if (-not (Get-Module -Name 'BRAVO.System'))) {...}`
+        # guard у КОДІ (не в коментарях-поясненнях фіксу — вони навмисно
+        # цитують старий патерн для документації). МУСИТЬ провалитись
+        # проти ОРИГІНАЛЬНОЇ guard-реалізації (до Codex review 5290816507)
+        # і МУСИТЬ проходити на поточній.
         $ssgSchemaPath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1'
         $ssgLines = Get-Content -LiteralPath $ssgSchemaPath
-        $ssgCodeLines = $ssgLines | Where-Object { -not ($_.TrimStart().StartsWith('#')) }
+        $ssgRawSrc = [string]::Join([Environment]::NewLine, $ssgLines)
+        # ВАЖЛИВО: спершу прибираємо <# ... #> block-коментарі (comment-
+        # based help) із СИРОГО тексту, ДО пострядкового `#`-фільтра.
+        # Причина порядку: закриваючий рядок такого блоку (`    #>`)
+        # сам починається з '#' після TrimStart — якби пострядковий
+        # фільтр йшов першим, він би видалив САМЕ закриваючий тег і
+        # залишив незакритий `<#`, через що ця non-greedy заміна не
+        # знаходила б жодного `#>` і НІЧОГО не прибирала б (тоді текст
+        # усередині блоку, напр. .DESCRIPTION, що згадує
+        # ConvertTo-BRAVOTaskPath у прозі, хибно "видавався" б за код).
+        $ssgRawSrc = [regex]::Replace($ssgRawSrc, '(?s)<#.*?#>', '')
+        $ssgCodeLines = $ssgRawSrc -split "`r?`n" | Where-Object { -not ($_.TrimStart().StartsWith('#')) }
         $ssgCodeSrc = [string]::Join([Environment]::NewLine, $ssgCodeLines)
-        $ssgFunctionMatch = [regex]::Match($ssgCodeSrc, '(?m)^function\s')
-        $ssgPreamble = if ($ssgFunctionMatch.Success) { $ssgCodeSrc.Substring(0, $ssgFunctionMatch.Index) } else { $ssgCodeSrc }
         $ssgHasOldGuard = [regex]::IsMatch($ssgCodeSrc, "if\s*\(\s*-not\s*\(\s*Get-Module\s+-Name\s+'BRAVO\.System'\s*\)\s*\)")
-        $ssgHasUnconditionalPreambleImport = [regex]::IsMatch($ssgPreamble, 'Import-Module[^\r\n]*BRAVO\.System[\\/]BRAVO\.System\.psd1[^\r\n]*-Scope\s+Local')
         Test-BRAVOCondition (
-            (-not $ssgHasOldGuard) -and $ssgHasUnconditionalPreambleImport
+            -not $ssgHasOldGuard
         ) `
-            'Configuration/SchemaSystemImportHasNoProcessWidePresenceGuard' `
-            "Schema.psm1 МУСИТЬ імпортувати BRAVO.System БЕЗУМОВНО при завантаженні модуля (module-load-time preamble), БЕЗ process-wide Get-Module presence guard; отримано hasOldGuard=$ssgHasOldGuard hasUnconditionalPreambleImport=$ssgHasUnconditionalPreambleImport"
+            'Configuration/SchemaTaskPathImportHasNoProcessWidePresenceGuard' `
+            "Schema.psm1 НЕ повинен містити process-wide Get-Module presence guard для BRAVO.System у виконуваному коді; отримано hasOldGuard=$ssgHasOldGuard"
+
+        # --- Configuration/SchemaSystemDependencyIsLazyTaskPathOnly ---
+        # СТРУКТУРНИЙ Test B: доводить ОБИДВА боки правильної архітектури
+        # одночасно — (1) module-load-time preamble (код ДО першого
+        # `function`-оголошення) НЕ містить жодного BRAVO.System-імпорту
+        # (інакше pilot-артефакт знову зламається); (2)
+        # Test-BRAVOConfigurationAuthorizationTaskSchedulerPath сама
+        # МІСТИТЬ безумовний BRAVO.System-імпорт, і цей імпорт
+        # розташований у тексті функції ДО виклику ConvertTo-BRAVOTaskPath
+        # (порядок рядків, без прив'язки до точних номерів). МУСИТЬ
+        # провалитись проти b1d7054 (де преамбула МІСТИТЬ безумовний
+        # імпорт) і проходити на поточній реалізації.
+        $ssgFunctionMatch = [regex]::Match($ssgCodeSrc, '(?m)^function\s+Test-BRAVOConfigurationAuthorizationTaskSchedulerPath\b')
+        $ssgPreamble = if ($ssgFunctionMatch.Success) { $ssgCodeSrc.Substring(0, $ssgFunctionMatch.Index) } else { $ssgCodeSrc }
+        $ssgPreambleHasSystemImport = [regex]::IsMatch($ssgPreamble, 'Import-Module[^\r\n]*BRAVO\.System[\\/]BRAVO\.System\.psd1')
+
+        $ssgNextFunctionMatch = if ($ssgFunctionMatch.Success) {
+            [regex]::Match($ssgCodeSrc.Substring($ssgFunctionMatch.Index + 1), '(?m)^function\s')
+        } else { [regex]::Match('', '.') }
+        $ssgFunctionBody = if ($ssgFunctionMatch.Success) {
+            if ($ssgNextFunctionMatch.Success) {
+                $ssgCodeSrc.Substring($ssgFunctionMatch.Index, $ssgNextFunctionMatch.Index + 1)
+            } else {
+                $ssgCodeSrc.Substring($ssgFunctionMatch.Index)
+            }
+        } else { '' }
+        $ssgImportMatch = [regex]::Match($ssgFunctionBody, 'Import-Module[^\r\n]*BRAVO\.System[\\/]BRAVO\.System\.psd1[^\r\n]*-Scope\s+Local')
+        $ssgUseMatch = [regex]::Match($ssgFunctionBody, 'ConvertTo-BRAVOTaskPath')
+        $ssgFunctionHasLazyImportBeforeUse = $ssgImportMatch.Success -and $ssgUseMatch.Success -and ($ssgImportMatch.Index -lt $ssgUseMatch.Index)
+
+        Test-BRAVOCondition (
+            (-not $ssgPreambleHasSystemImport) -and $ssgFunctionHasLazyImportBeforeUse
+        ) `
+            'Configuration/SchemaSystemDependencyIsLazyTaskPathOnly' `
+            "BRAVO.System МУСИТЬ НЕ імпортуватись у module-load-time preamble (pilot-артефакт не бандлить цей модуль) і МУСИТЬ імпортуватись безумовно ВСЕРЕДИНІ Test-BRAVOConfigurationAuthorizationTaskSchedulerPath, ДО виклику ConvertTo-BRAVOTaskPath; отримано preambleHasImport=$ssgPreambleHasSystemImport functionHasLazyImportBeforeUse=$ssgFunctionHasLazyImportBeforeUse"
+
+        # --- Configuration/SchemaImportAndUnrelatedAuthorizationSucceedWithoutSystemModule ---
+        # ПОВЕДІНКОВА перевірка (Phase 5, пункти 1/2 задачі "F1 lazy
+        # dependency regression remediation"): ЖОДНОГО symlink/mock —
+        # створюємо ІЗОЛЬОВАНУ копію ЛИШЕ modules\BRAVO.Configuration\ у
+        # тимчасовому каталозі, БЕЗ жодного сусіднього modules\BRAVO.System\
+        # (той самий структурний контракт, що й pilot-артефакт: див.
+        # deploy\New-BRAVOConfigV2PilotArtifact.ps1:16). У свіжому
+        # дочірньому процесі доводимо: (1) Import-Module
+        # BRAVO.Configuration.Schema.psd1 сам по собі УСПІШНИЙ навіть коли
+        # BRAVO.System відсутній деінде у файловій системі поруч; (2)
+        # НЕпов'язана з TaskPath авторизація (robocopyMaxSuccessExitCode)
+        # так само успішна, не торкаючись BRAVO.System.
+        $sciIsolatedRoot = Join-Path $env:TEMP ("BRAVO_SelfTest_SchemaIsolated_" + [System.Guid]::NewGuid().ToString('N'))
+        try {
+            $sciModulesRoot = Join-Path $sciIsolatedRoot 'modules'
+            $sciConfigDest = Join-Path $sciModulesRoot 'BRAVO.Configuration'
+            New-Item -ItemType Directory -Path $sciConfigDest -Force | Out-Null
+            Copy-Item -Path (Join-Path $root 'modules\BRAVO.Configuration\*') -Destination $sciConfigDest -Recurse -Force
+            if (Test-Path -LiteralPath (Join-Path $sciModulesRoot 'BRAVO.System')) {
+                throw "тестова ізоляція порушена: modules\BRAVO.System\ присутній у копії"
+            }
+            $sciCommand = (
+                "Set-StrictMode -Version 2.0; " +
+                "Import-Module -Name '$sciConfigDest\BRAVO.Configuration.Schema.psd1' -Force -ErrorAction Stop; " +
+                "`$systemLoaded = [bool](Get-Module -Name 'BRAVO.System' -All); " +
+                "`$unrelated = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,7' -Value 7 -Path 'robocopyMaxSuccessExitCode'; " +
+                "'RESULT-OK:' + [string]`$systemLoaded + ':' + [string]`$unrelated.IsValid"
+            )
+            $sciProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+                -NoLogo -NoProfile -NonInteractive -Command $sciCommand 2>&1
+            $sciProbeLast = ([string](@($sciProbe)[-1])).Trim()
+        } finally {
+            if (Test-Path -LiteralPath $sciIsolatedRoot) {
+                Remove-Item -LiteralPath $sciIsolatedRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Test-BRAVOCondition (
+            $sciProbeLast -eq 'RESULT-OK:False:True'
+        ) `
+            'Configuration/SchemaImportAndUnrelatedAuthorizationSucceedWithoutSystemModule' `
+            "Import-Module Schema.psd1 і НЕпов'язана з TaskPath авторизація (robocopyMaxSuccessExitCode) МУСЯТЬ бути успішними в ІЗОЛЬОВАНІЙ копії БЕЗ modules\BRAVO.System\ поруч (той самий контракт, що й pilot-артефакт), а BRAVO.System НЕ мусить довантажуватись, доки TaskPath-валідатор реально не викликаний; отримано: '$sciProbeLast' (очікується 'RESULT-OK:False:True')"
     }
 
     # =====================================================================
