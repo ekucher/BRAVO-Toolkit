@@ -59,11 +59,25 @@ function Get-BRAVOOperationsServerIdStatePath {
 }
 
 function Get-BRAVOOperationsEnrollmentStatePath {
-    # Локальний claim-токен (D1) + throttle-мітки логування, отримані від
-    # останнього POST /enroll. НЕ секрет фонду (bootstrap secret) і не
-    # API-ключ — компрометація сама по собі не дає доступу до чужих
-    # серверів (claimMatches прив'язаний до ServerId), тож зберігається як
-    # звичайний JSON, а не Credential Manager secret.
+    # A1/A2 (bsystem-operations Wave 2 hardening): зберігає АГЕНТ-
+    # ЗГЕНЕРОВАНИЙ enrollment claim (не сервером виданий/ротований —
+    # дивись Get-BRAVOOperationsEnrollmentClaim) + throttle-мітки
+    # логування. Claim генерується ОДИН раз на серверну ідентичність і
+    # живе ПОРУЧ з BRAVO_OPERATIONS_SERVER_ID.json увесь час її життя
+    # (той самий каталог, той самий atomic-write патерн) — той самий
+    # локальний файл, що раніше тримав сервер-видани claimToken під
+    # старим протоколом, тепер перевикористаний під агент-згенерований
+    # claim нового протоколу.
+    #
+    # Свідомий вибір F4: НЕ Credential Manager. Це не fleet-wide секрет
+    # (як bootstrap-секрет) і не видана авторизація (як API-ключ) —
+    # компрометація ЦЬОГО claim шкодить ЛИШЕ pending/lifecycle
+    # enrollment-у ЦЬОГО одного серверId (сервер прив'язує claim-hash до
+    # конкретного ServerRow, D1/A3), не fleet-wide доступу. Додавання
+    # третьої Credential Manager-цілі заради значення з таким вузьким
+    # blast radius — зайва складність без відповідного захисту, який
+    # виправдав би її; звичайний JSON поруч зі server-id state — простіше
+    # і достатньо.
     [CmdletBinding()]
     param()
 
@@ -170,38 +184,84 @@ function Get-BRAVOOperationsServerId {
 # ---------------------------------------------------------------------
 
 function Get-BRAVOOperationsEnrollmentState {
-    # Пошкоджений/відсутній файл тут НЕ є identity-критичним (на відміну
-    # від server-id): claimToken можна отримати заново звичайним повторним
-    # POST /enroll, тож тут достатньо трактувати непарсований файл як
-    # "відсутній" — це не fail-closed кейс E9.
+    # Пошкоджений/відсутній файл тут НЕ є identity-критичним у сенсі E9
+    # (на відміну від server-id): відсутній Claim тут просто означає
+    # "згенеруємо новий" (Get-BRAVOOperationsEnrollmentClaim нижче) — тож
+    # непарсований файл трактується як "відсутній", не fail-closed. Варто
+    # памʼятати: якщо сервер уже 'pending' на API зі СТАРИМ claim-hash, а
+    # локальний файл щойно згенерував НОВИЙ claim через втрату/
+    # пошкодження цього файлу — наступний POST /enroll отримає 409
+    # claim_mismatch (термінально для тієї спроби, див. F6/Invoke-
+    # BRAVOOperationsEnrollment) — це прийнятний, задокументований
+    # залишковий ризик втрати ЦЬОГО файлу, а не помилка цієї функції.
     [CmdletBinding()]
     param()
 
     $path = Get-BRAVOOperationsEnrollmentStatePath
     if (-not [IO.File]::Exists($path)) {
         return [pscustomobject]@{
-            ClaimToken = $null
+            Claim = $null
             LastNotReadyLoggedAtUtc = $null
             LastTtlExpiredLoggedAtUtc = $null
             LastFinalizedLoggedAtUtc = $null
+            LastNotConfiguredLoggedAtUtc = $null
         }
     }
     try {
         $raw = ([IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -ErrorAction Stop)
         return [pscustomobject]@{
-            ClaimToken = if ($null -ne $raw.ClaimToken) { [string]$raw.ClaimToken } else { $null }
+            Claim = if ($null -ne $raw.Claim) { [string]$raw.Claim } else { $null }
             LastNotReadyLoggedAtUtc = if ($null -ne $raw.LastNotReadyLoggedAtUtc) { [string]$raw.LastNotReadyLoggedAtUtc } else { $null }
             LastTtlExpiredLoggedAtUtc = if ($null -ne $raw.LastTtlExpiredLoggedAtUtc) { [string]$raw.LastTtlExpiredLoggedAtUtc } else { $null }
             LastFinalizedLoggedAtUtc = if ($null -ne $raw.LastFinalizedLoggedAtUtc) { [string]$raw.LastFinalizedLoggedAtUtc } else { $null }
+            LastNotConfiguredLoggedAtUtc = if ($null -ne $raw.LastNotConfiguredLoggedAtUtc) { [string]$raw.LastNotConfiguredLoggedAtUtc } else { $null }
         }
     } catch {
         return [pscustomobject]@{
-            ClaimToken = $null
+            Claim = $null
             LastNotReadyLoggedAtUtc = $null
             LastTtlExpiredLoggedAtUtc = $null
             LastFinalizedLoggedAtUtc = $null
+            LastNotConfiguredLoggedAtUtc = $null
         }
     }
+}
+
+function Get-BRAVOOperationsEnrollmentClaim {
+    # A1/A2 (bsystem-operations Wave 2 hardening — fixes PR #2 review
+    # finding P1, repository.ts:148 at the time): цей claim ТЕПЕР
+    # генерується АГЕНТОМ, один раз на серверну ідентичність, і живе
+    # ЛОКАЛЬНО (Get-BRAVOOperationsEnrollmentStatePath) увесь час життя
+    # цієї ідентичності — POST /enroll і GET /enroll/:id завжди несуть
+    # ОДИН і той самий claim, доки серверId не буде замінений повністю
+    # новим enrollment (нова ідентичність = новий server-id state-файл,
+    # окрема дія, яку цей модуль сам не ініціює). Стара модель (сервер
+    # РОТУВАВ/повертав claim у 202-відповіді POST) дозволяла перехопити
+    # чужий pending-enrollment, знаючи лише fleet-wide bootstrap-секрет +
+    # вгадуваний serverId — тепер claim ніколи не подорожує сервер->агент.
+    #
+    # Never-throw: якщо диск недоступний для запису, claim ЛИШЕ ДЛЯ
+    # ЦЬОГО прогону все одно повертається (щоб спроба enrollment не
+    # зривалась взагалі) — з WARNING, бо нестабільний claim між прогонами
+    # означає 409 claim_mismatch на наступному POST для вже-pending
+    # серверId.
+    [CmdletBinding()]
+    param()
+
+    $state = Get-BRAVOOperationsEnrollmentState
+    if (-not [string]::IsNullOrWhiteSpace($state.Claim)) {
+        return $state.Claim
+    }
+
+    $newClaim = [guid]::NewGuid().ToString()
+    $state.Claim = $newClaim
+    try {
+        Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsEnrollmentStatePath) -Object $state
+    } catch {
+        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+            -Message "Не вдалося зберегти новостворений enrollment-claim на диск: $($_.Exception.Message) — цей прогін використає його лише в памʼяті; якщо диск лишиться недоступним, наступний прогін згенерує ІНШИЙ claim, що дасть 409 claim_mismatch, якщо серверId уже pending на API"
+    }
+    return $newClaim
 }
 
 function Set-BRAVOOperationsEnrollmentState {
@@ -407,19 +467,42 @@ function Invoke-BRAVOOperationsEnrollment {
     # перед КОЖНОЮ подією/heartbeat: якщо API-ключ уже отримано —
     # миттєвий no-op (лише читання Credential Manager, без мережі).
     # Повертає API-ключ (string) при успіху, $null інакше (pending/
-    # revoked/already_finalized/TTL-expired/не сконфігуровано/мережевий
-    # збій) — виклик НІКОЛИ не кидає.
+    # revoked/already_finalized/claim_mismatch/TTL-expired/не
+    # сконфігуровано/мережевий збій) — виклик НІКОЛИ не кидає.
     #
-    # D1/D2/D3 (фінальний контракт bsystem-operations):
+    # A1-A7/D1-D7 (фінальний, ПОТОЧНИЙ контракт bsystem-operations —
+    # замінив старий server-rotated-claim протокол, під який був написаний
+    # попередній варіант цієї функції):
     #   - bootstrap-секрет ЛИШЕ в заголовку X-Bootstrap-Secret (POST і GET
-    #     однаково) — раніше POST його ще й дублював у тілі.
-    #   - POST /enroll повертає claimToken (202) — зберігається локально,
-    #     обов'язковий для GET через X-Enrollment-Claim.
-    #   - POST /enroll на вже фіналізований (approved/revoked) серверID
-    #     повертає 409 already_finalized — термінально для цієї спроби.
+    #     однаково), НЕ дублюється в тілі.
+    #   - X-Enrollment-Claim ТЕПЕР обов'язковий і на POST, і на GET —
+    #     АГЕНТ сам генерує цей claim (Get-BRAVOOperationsEnrollmentClaim,
+    #     один раз на серверну ідентичність, персистентний), сервер його
+    #     НІКОЛИ не видає й не ротує. 202-відповідь POST — це просто
+    #     {status}, claimToken у ній більше немає (нема чого повертати —
+    #     агент уже тримає свій claim).
+    #   - A7 (lost-response recovery СПРОЩЕНО проти старого протоколу): що
+    #     втрачена відповідь POST, що звичайний повторний виклик — це
+    #     РІВНО той самий serverId+claim+metadata, що природно потрапляє в
+    #     ідемпотентну 'updated'-гілку repository.upsertPendingServer, без
+    #     жодної спеціальної обробки в цьому коді.
+    #   - POST /enroll на вже фіналізований (approved/revoked) серверId
+    #     повертає 409 {error:'already_finalized', status} — термінально
+    #     для цієї спроби (як і раніше).
+    #   - POST /enroll на ІНШИЙ claim, ніж уже збережений для pending
+    #     серверId, повертає 409 {error:'claim_mismatch'} — НОВЕ; для
+    #     цього коду це має бути практично недосяжно (claim стабільний і
+    #     генерується лише цим агентом), тож трактується як термінальний
+    #     сигнал можливого пошкодження/втрати локального enrollment-стану,
+    #     не loop/retry.
+    #   - 503 {error:'enrollment_not_configured'} — НОВЕ; відмінне від 401
+    #     (невірний секрет): функціонал enrollment на бекенді взагалі не
+    #     ввімкнено. Трактується як "ще не доступно" (та сама постава, що
+    #     pending), throttled INFO-лог, без ERROR-спаму, без тісного
+    #     retry.
     #   - GET без валідного claim -> 404 (навмисно невідрізнюваний від
-    #     "не існує"/revoked) -> трактується як "ще не готово", локальний
-    #     pending-стан зберігається, лог throttled.
+    #     "не існує"/revoked/wrong-claim) -> трактується як "ще не
+    #     готово", локальний pending-стан зберігається, лог throttled.
     #   - approved-відповідь БЕЗ apiKey означає TTL (5 хв) вичерпано —
     #     потрібне ручне admin reissue, агент сам це не вирішує.
     [CmdletBinding()]
@@ -475,16 +558,28 @@ function Invoke-BRAVOOperationsEnrollment {
     }
     $timeoutSeconds = [int]$OperationsReportingSettings.RequestTimeoutSeconds
 
+    $claim = Get-BRAVOOperationsEnrollmentClaim
     $enrollmentState = Get-BRAVOOperationsEnrollmentState
+    # Гарантія проти застарілого знімка стану: Get-BRAVOOperationsEnrollmentClaim
+    # МІГ щойно згенерувати й персистувати НОВИЙ claim (перший запуск для
+    # цієї ідентичності) незалежно від $enrollmentState, зчитаного рядком
+    # вище -- без цього присвоєння будь-який ПОДАЛЬШИЙ
+    # Set-BRAVOOperationsEnrollmentState нижче (throttle-мітки pending/
+    # TTL/already_finalized/not_configured) переписав би файл стану СТАРИМ
+    # знімком і мовчки СТЕР би щойно збережений Claim із диска.
+    $enrollmentState.Claim = $claim
 
-    # POST /enroll: завжди намагаємось (навіть якщо claim уже є локально)
-    # — сервер безпечно ротує/повертає usable claim, доки серверId ще
-    # pending (design bsystem-operations: "lost response recovered by
-    # re-POSTing"); якщо серверId уже фіналізований — 409 нижче.
+    # POST /enroll: завжди намагаємось (навіть якщо серверId уже мав
+    # попередню pending-спробу) — A7: агент несе РІВНО той самий
+    # serverId+claim+metadata щоразу, тож повторний POST після втраченої
+    # відповіді природно потрапляє в ідемпотентну 'updated'-гілку на
+    # сервері; якщо серверId уже фіналізований — 409 already_finalized
+    # нижче; якщо (аномально) claim розійшовся з уже збереженим для цього
+    # pending серверId — 409 claim_mismatch нижче.
     try {
         $enrollResult = Invoke-BRAVOOperationsApiRequest `
             -BaseUrl $apiBaseUrl -Path '/api/v1/enroll' -Method 'POST' `
-            -Headers @{ 'X-Bootstrap-Secret' = $bootstrapSecret } `
+            -Headers @{ 'X-Bootstrap-Secret' = $bootstrapSecret; 'X-Enrollment-Claim' = $claim } `
             -Body @{
                 serverId = $serverId
                 institutionCode = $InstitutionCode
@@ -494,8 +589,37 @@ function Invoke-BRAVOOperationsEnrollment {
             -TimeoutSeconds $timeoutSeconds
     } catch {
         $statusCode = Get-BRAVOOperationsHttpStatusCode -ErrorRecord $_
+        if ($statusCode -eq 503) {
+            # A5: enrollment взагалі не сконфігуровано на бекенді (немає
+            # bootstrap-секрету) — відмінно від 401 (невірний секрет).
+            # Та сама постава, що pending: не помилка, не спамимо ERROR/
+            # WARNING, просто зачекаємо наступного природного циклу.
+            if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotConfiguredLoggedAtUtc) {
+                Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
+                    -Message 'Operations enrollment ще не сконфігуровано на боці API (503 enrollment_not_configured) — очікуємо, поки бекенд увімкне цю функцію; це НЕ помилка бажаного секрету (401), а відсутність самої можливості'
+                $enrollmentState.LastNotConfiguredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+                Set-BRAVOOperationsEnrollmentState -State $enrollmentState
+            }
+            return $null
+        }
         if ($statusCode -eq 409) {
             $errorBody = Get-BRAVOOperationsHttpErrorBody -ErrorRecord $_
+            $errorCode = Get-BRAVOOperationsJsonPropertyString -Object $errorBody -Name 'error'
+            if ($errorCode -eq 'claim_mismatch') {
+                # A3: наш локально збережений claim розійшовся з тим, що
+                # вже збережений на сервері для цього (все ще pending)
+                # серверId. За коректної роботи цього агента (стабільний,
+                # ніколи не ротований claim) це має бути практично
+                # недосяжно — сигнал, що локальний enrollment-стан
+                # (Get-BRAVOOperationsEnrollmentStatePath) було втрачено/
+                # пошкоджено і згенеровано НОВИЙ claim поверх уже
+                # існуючого pending серверId. Термінально для цієї
+                # спроби — НЕ ретраїмо тісно (сама лише повторна спроба з
+                # тим же новим claim дасть той самий 409 знову).
+                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                    -Message "POST /enroll відхилено (409 claim_mismatch) — локальний enrollment-claim НЕ збігається з тим, що вже збережений на сервері для серверId=$serverId. Це означає локальний стан ($((Get-BRAVOOperationsEnrollmentStatePath))) було втрачено/пошкоджено після початкового enrollment. Термінально для цієї спроби: САМООБСЛУГОВУВАННЯ НЕ виконується (щоб не мати вигляду takeover-спроби); якщо цей сервер дійсно мав бути новою ідентичністю, свідомо видаліть server-id/enrollment state-файли для повного повторного enrollment."
+                return $null
+            }
             $finalStatusRaw = Get-BRAVOOperationsJsonPropertyString -Object $errorBody -Name 'status'
             $finalStatus = if (-not [string]::IsNullOrWhiteSpace($finalStatusRaw)) { $finalStatusRaw } else { 'невідомо' }
             if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastFinalizedLoggedAtUtc) {
@@ -510,24 +634,27 @@ function Invoke-BRAVOOperationsEnrollment {
             -Message "Не вдалося зареєструвати сервер в Operations (enroll): $($_.Exception.Message)"
         return $null
     }
-
-    $claimTokenFromEnroll = Get-BRAVOOperationsJsonPropertyString -Object $enrollResult -Name 'claimToken'
-    if ([string]::IsNullOrWhiteSpace($claimTokenFromEnroll)) {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-            -Message 'Відповідь POST /enroll не містила claimToken — enrollment відкладено до наступної спроби'
-        return $null
-    }
-    $claimToken = $claimTokenFromEnroll
-    $enrollmentState.ClaimToken = $claimToken
-    Set-BRAVOOperationsEnrollmentState -State $enrollmentState
+    # A1/A2: 202-відповідь — лише {status}, claimToken більше не
+    # повертається (нема чого повертати — claim уже в нас, локально). Тут
+    # свідомо НЕ читаємо/не очікуємо жодного claim-поля з $enrollResult.
 
     try {
         $pollResult = Invoke-BRAVOOperationsApiRequest `
             -BaseUrl $apiBaseUrl -Path "/api/v1/enroll/$serverId" -Method 'GET' `
-            -Headers @{ 'X-Bootstrap-Secret' = $bootstrapSecret; 'X-Enrollment-Claim' = $claimToken } `
+            -Headers @{ 'X-Bootstrap-Secret' = $bootstrapSecret; 'X-Enrollment-Claim' = $claim } `
             -TimeoutSeconds $timeoutSeconds
     } catch {
         $statusCode = Get-BRAVOOperationsHttpStatusCode -ErrorRecord $_
+        if ($statusCode -eq 503) {
+            # A5, symmetrically to POST above.
+            if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotConfiguredLoggedAtUtc) {
+                Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
+                    -Message 'Operations enrollment ще не сконфігуровано на боці API (503 enrollment_not_configured) на GET-опитуванні статусу — очікуємо наступного природного циклу'
+                $enrollmentState.LastNotConfiguredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+                Set-BRAVOOperationsEnrollmentState -State $enrollmentState
+            }
+            return $null
+        }
         if ($statusCode -eq 404) {
             # D7: 404 тут навмисно невідрізнюваний бекендом від "невідомий
             # id"/"revoked"/"неправильний claim" — трактуємо як "ще не
@@ -558,7 +685,10 @@ function Invoke-BRAVOOperationsEnrollment {
         # нешкідливо, і покриває гіпотетичну майбутню зміну контракту.
         Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
             -Message "Сервер відкликано (revoked) в Operations — звітність призупинена, доки адміністратор не перевидасть доступ"
-        Clear-BRAVOOperationsEnrollmentState
+        # НЕ Clear-BRAVOOperationsEnrollmentState: claim лишається (той
+        # самий D1-інваріант, що й у success-гілці нижче) — якщо
+        # адміністратор колись зробить revoked->approved reissue для ЦІЄЇ
+        # ж ідентичності, наступний GET має нести ТОЙ САМИЙ claim.
         return $null
     }
     if ($status -ne 'approved') {
@@ -590,7 +720,18 @@ function Invoke-BRAVOOperationsEnrollment {
     } finally {
         $secureApiKey = $null
     }
-    Clear-BRAVOOperationsEnrollmentState
+    # A1/A2 (F4): НАВМИСНО НЕ викликаємо Clear-BRAVOOperationsEnrollmentState
+    # тут — на відміну від старого server-rotated-claim протоколу (де
+    # claimToken був одноразовим і безпечно скидався після approve), Claim
+    # тепер ідентифікаційний і має жити ВЕСЬ час життя цієї серверної
+    # ідентичності (D1: наступний GET /enroll/:id — напр. після майбутнього
+    # TTL-вікна reissue, чи після 401->re-enroll циклу E11 — МУСИТЬ нести
+    # ТОЙ САМИЙ claim, бо claimMatches на сервері звіряє його з
+    # enrollment_claim_hash, збереженим при першому POST; новий claim тут
+    # означав би постійну 404 на всіх майбутніх GET-опитуваннях цього
+    # серверId). Throttle-мітки (LastNotReadyLoggedAtUtc тощо) в цьому ж
+    # файлі лишаються як є — застарілі, але нешкідливі (природно
+    # перезаписуються за потреби).
     # E8: bootstrap-секрет НЕ видаляється автоматично тут (рішення
     # свідоме, задокументоване в модульному коментарі нижче,
     # Remove-BRAVOOperationsBootstrapSecretIfUnneeded) — лише

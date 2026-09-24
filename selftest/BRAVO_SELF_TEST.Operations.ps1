@@ -11,6 +11,13 @@
 # видаляється, подія НЕ йде в нескінченний outbox-retry), dead-letter для
 # справжньої 4xx-помилки валідації (400).
 #
+# A1-A7 (Wave 2 протокол enrollment, замінив старий server-rotated-claim
+# протокол): агент сам генерує claim (X-Enrollment-Claim на POST і GET),
+# 202-відповідь POST — лише {status} без claimToken, 409 claim_mismatch
+# (термінально, окремо від already_finalized), 503 enrollment_not_configured
+# (не помилка, та сама постава що pending), A7 lost-response recovery
+# (повторний POST з тим самим serverId+claim+metadata — без спецобробки).
+#
 # HTTP-транспорт мокається підміною ГЛОБАЛЬНОЇ функції Invoke-WebRequest
 # (BRAVO.Operations викликає її неявно, не якісним іменем модуля — той
 # самий принцип, що New-BRAVOSelfTestRuntimeModule використовує для
@@ -355,17 +362,19 @@
         -Failure "HTTP 400 (справжня помилка валідації) має піти в DeadLetter\ (знайдено $($deadLetterAfter400.Count)), НЕ в звичайний retry-Outbox\ (знайдено $($normalOutboxAfter400.Count))"
 
     # =====================================================================
-    # ENROLLMENT: header-only bootstrap secret (POST-тіло БЕЗ
-    # bootstrapSecret), claimToken persisted + переданий у GET як
-    # X-Enrollment-Claim, TTL-expired (approved БЕЗ apiKey) не падає в
-    # нескінченний тісний цикл (повертає $null, не кидає).
+    # ENROLLMENT (A1-A7 протокол — агент сам генерує claim, сервер його
+    # НІКОЛИ не видає/не ротує): header-only bootstrap secret (POST-тіло
+    # БЕЗ bootstrapSecret/claim), X-Enrollment-Claim агент-згенерований і
+    # ІДЕНТИЧНИЙ на POST і GET, 202-відповідь POST БЕЗ claimToken-поля,
+    # TTL-expired (approved БЕЗ apiKey) не падає в нескінченний тісний
+    # цикл (повертає $null, не кидає).
     # =====================================================================
     $enrollDir = Join-Path $opsSelfTestRoot 'Enroll'
     Set-BRAVOOpsSelfTestStateDirectory -Directory $enrollDir
     $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestBootstrap' = 'fleet-bootstrap-secret' }
     $global:BRAVOOpsSelfTestHttpQueue.Clear()
     $global:BRAVOOpsSelfTestHttpCalls.Clear()
-    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'pending'; claimToken = 'claim_abc123' }
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'pending' }   # A1/A2: 202 body no longer carries claimToken
     Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'approved' }   # apiKey deliberately absent -> TTL expired
 
     $enrollApiKeyResult = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $opsSettings `
@@ -383,6 +392,19 @@
     ) -Name 'Operations/PostEnrollSendsBootstrapSecretOnlyViaHeaderNotBody' `
       -Failure "POST /enroll має нести bootstrap-секрет ЛИШЕ в заголовку X-Bootstrap-Secret, БЕЗ дублювання bootstrapSecret у JSON-тілі; body=$($postEnrollCall.BodyText)"
 
+    # A1/A2: агент сам генерує claim (не з тіла запиту -- лише заголовок),
+    # і воно валідний непорожній рядок (GUID), надіслане в заголовку, а не
+    # в JSON-тілі.
+    $generatedClaim = $null
+    if ($null -ne $postEnrollCall) { $generatedClaim = [string]$postEnrollCall.Headers['X-Enrollment-Claim'] }
+    $generatedClaimParsed = [guid]::Empty
+    Test-BRAVOCondition -Condition (
+        -not [string]::IsNullOrWhiteSpace($generatedClaim) -and
+        [guid]::TryParse($generatedClaim, [ref]$generatedClaimParsed) -and
+        $postEnrollCall.BodyText -notmatch 'claim'
+    ) -Name 'Operations/PostEnrollSendsAgentGeneratedClaimHeaderNotInBody' `
+      -Failure "POST /enroll має нести АГЕНТ-ЗГЕНЕРОВАНИЙ X-Enrollment-Claim (валідний GUID) у заголовку, НЕ в JSON-тілі; заголовок='$generatedClaim' body=$($postEnrollCall.BodyText)"
+
     # E10 regression guard на РЕАЛЬНОМУ функціональному шляху (не лише
     # ізольований виклик Join-BRAVOOperationsApiUrl вище): $opsSettings.ApiBaseUrl
     # тут навмисно БЕЗ '/api' (документована конвенція) — якщо колись хтось
@@ -396,25 +418,56 @@
     $getEnrollCall = @($global:BRAVOOpsSelfTestHttpCalls | Where-Object { $_.Method -eq 'GET' }) | Select-Object -First 1
     Test-BRAVOCondition -Condition (
         $null -ne $getEnrollCall -and
-        $getEnrollCall.Headers['X-Enrollment-Claim'] -eq 'claim_abc123' -and
+        -not [string]::IsNullOrWhiteSpace($generatedClaim) -and
+        $getEnrollCall.Headers['X-Enrollment-Claim'] -eq $generatedClaim -and
         $getEnrollCall.Headers['X-Bootstrap-Secret'] -eq 'fleet-bootstrap-secret'
-    ) -Name 'Operations/GetEnrollPollSendsClaimTokenFromPostResponse' `
-      -Failure 'GET /enroll/:id має нести X-Enrollment-Claim, отриманий з попереднього POST /enroll (claimToken), плюс X-Bootstrap-Secret'
+    ) -Name 'Operations/GetEnrollPollSendsSameAgentGeneratedClaimAsPost' `
+      -Failure 'GET /enroll/:id має нести ТОЙ САМИЙ агент-згенерований X-Enrollment-Claim, що й POST /enroll (не сервер-виданий), плюс X-Bootstrap-Secret'
 
-    # 404 на poll (D7: невідрізнюваний "не готово"/revoked/wrong-claim) не
-    # кидає і не губить локальний pending-стан (claim лишається на диску).
+    # Claim персистований локально (той самий atomic-write патерн, що
+    # server-id) -- незалежна перевірка вмісту файлу стану, а не лише
+    # заголовків HTTP-викликів вище.
+    $persistedEnrollmentStatePath = Join-Path $enrollDir 'BRAVO_OPERATIONS_ENROLLMENT.json'
+    $persistedClaimOnDisk = $null
+    if ([IO.File]::Exists($persistedEnrollmentStatePath)) {
+        $persistedClaimOnDisk = [string]([IO.File]::ReadAllText($persistedEnrollmentStatePath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json).Claim
+    }
+    Test-BRAVOCondition -Condition ($persistedClaimOnDisk -eq $generatedClaim) `
+        -Name 'Operations/EnrollmentClaimPersistedToDiskMatchesSentClaim' `
+        -Failure "claim, надісланий у HTTP-заголовках, має бути персистований на диску ($persistedEnrollmentStatePath) для повторного використання; на диску='$persistedClaimOnDisk' надіслано='$generatedClaim'"
+
+    # =====================================================================
+    # A7: lost-response recovery -- повторний Invoke (симулює повторну
+    # спробу після втраченої HTTP-відповіді на попередній цикл) несе РІВНО
+    # ТОЙ САМИЙ serverId (незмінний, стан на диску) + ТОЙ САМИЙ claim
+    # (персистований, НЕ перегенерований) -- жодної спеціальної обробки в
+    # коді, просто природний ідемпотентний повтор.
+    # =====================================================================
     $global:BRAVOOpsSelfTestHttpQueue.Clear()
-    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'pending'; claimToken = 'claim_xyz789' }
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'pending' }
     Enqueue-BRAVOOpsSelfTestHttpError -StatusCode 404 -BodyObject @{ error = 'not_found' }
-    $enroll404Result = $null
-    $enroll404Threw = $false
+    $enrollRetryResult = $null
+    $enrollRetryThrew = $false
     try {
-        $enroll404Result = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $opsSettings `
+        $enrollRetryResult = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $opsSettings `
             -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
     } catch {
-        $enroll404Threw = $true
+        $enrollRetryThrew = $true
     }
-    Test-BRAVOCondition -Condition (-not $enroll404Threw -and $null -eq $enroll404Result) `
+    $retryPostCall = @($global:BRAVOOpsSelfTestHttpCalls | Where-Object { $_.Uri -like '*api/v1/enroll' -and $_.Method -eq 'POST' }) | Select-Object -First 1
+    Test-BRAVOCondition -Condition (
+        -not $enrollRetryThrew -and $null -eq $enrollRetryResult -and
+        $null -ne $retryPostCall -and
+        [string]$retryPostCall.Headers['X-Enrollment-Claim'] -eq $generatedClaim
+    ) -Name 'Operations/LostResponseRetryReusesSameClaimNoSpecialHandling' `
+      -Failure "повторний POST /enroll (симуляція втраченої відповіді попереднього циклу) має нести ТОЙ САМИЙ claim без жодної спецобробки; очікувано='$generatedClaim' надіслано='$($retryPostCall.Headers['X-Enrollment-Claim'])'"
+
+    # 404 на poll (D7: невідрізнюваний "не готово"/revoked/wrong-claim) не
+    # кидає і не губить локальний pending-стан (claim лишається на диску) --
+    # уже покрито вище (retryPostCall/404), тут -- окрема регресія на
+    # never-throw контракт.
+    Test-BRAVOCondition -Condition (-not $enrollRetryThrew -and $null -eq $enrollRetryResult) `
         -Name 'Operations/PollNotFound404NeverThrowsReturnsNull' `
         -Failure '404 на GET /enroll/:id (D7 not_found) має повернути $null без винятку (never-throw invariant)'
 
@@ -437,6 +490,49 @@
     Test-BRAVOCondition -Condition (-not $enroll409Threw -and $null -eq $enroll409Result) `
         -Name 'Operations/PostEnrollAlreadyFinalized409NeverThrowsReturnsNull' `
         -Failure '409 already_finalized на POST /enroll має повернути $null без винятку -- термінально для цієї спроби, не loop'
+
+    # =====================================================================
+    # NEW (A3): 409 claim_mismatch -- відмінне від already_finalized,
+    # термінально для цієї спроби, ніколи не кидає, НЕ ретраїться тісно.
+    # =====================================================================
+    $enrollClaimMismatchDir = Join-Path $opsSelfTestRoot 'EnrollClaimMismatch'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $enrollClaimMismatchDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestBootstrap' = 'fleet-bootstrap-secret' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpError -StatusCode 409 -BodyObject @{ error = 'claim_mismatch' }
+    $enrollClaimMismatchThrew = $false
+    $enrollClaimMismatchResult = $null
+    try {
+        $enrollClaimMismatchResult = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $opsSettings `
+            -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
+    } catch {
+        $enrollClaimMismatchThrew = $true
+    }
+    Test-BRAVOCondition -Condition (-not $enrollClaimMismatchThrew -and $null -eq $enrollClaimMismatchResult) `
+        -Name 'Operations/PostEnrollClaimMismatch409NeverThrowsReturnsNullTerminal' `
+        -Failure '409 claim_mismatch на POST /enroll має повернути $null без винятку -- термінально для цієї спроби (можливе пошкодження локального claim-стану), не loop/retry'
+
+    # =====================================================================
+    # NEW (A5): 503 enrollment_not_configured -- відмінне від pending чи
+    # від 401 (невірний секрет): функція взагалі не ввімкнена на бекенді.
+    # Та сама постава, що pending -- $null, ніколи не кидає.
+    # =====================================================================
+    $enrollNotConfiguredDir = Join-Path $opsSelfTestRoot 'EnrollNotConfigured'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $enrollNotConfiguredDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestBootstrap' = 'fleet-bootstrap-secret' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpError -StatusCode 503 -BodyObject @{ error = 'enrollment_not_configured' }
+    $enrollNotConfiguredThrew = $false
+    $enrollNotConfiguredResult = $null
+    try {
+        $enrollNotConfiguredResult = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $opsSettings `
+            -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
+    } catch {
+        $enrollNotConfiguredThrew = $true
+    }
+    Test-BRAVOCondition -Condition (-not $enrollNotConfiguredThrew -and $null -eq $enrollNotConfiguredResult) `
+        -Name 'Operations/PostEnroll503NotConfiguredNeverThrowsReturnsNullSamePostureAsPending' `
+        -Failure '503 enrollment_not_configured на POST /enroll має повернути $null без винятку -- "ще не доступно" (та сама постава, що pending), не hard error'
 
     # ---------------------------------------------------------------
     # Прибирання: зняти всі self-test overrides з function:-drive (той
