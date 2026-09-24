@@ -863,16 +863,41 @@ function New-BRAVOConfiguratorUISettingRow {
         }
     }.GetNewClosure()
 
+    # Audit finding F32 (Codex review PR #224, exact-head 2026-09-24,
+    # thread PRRT_kwDOTlGKD86lmD3r): synthesized recovery-row descriptors
+    # (Get-BRAVOConfiguratorSessionSchemaCatalog) hardcode Metadata.Type =
+    # 'String' regardless of the leaf's real CLR type (e.g.
+    # requireAdministrator=$false under BRAVO_ALLOW_WEAKENED_SECURITY=1).
+    # $valueControl.Enabled is ALWAYS $false for ReadOnly rows (line above)
+    # — the operator can never actually edit the displayed text — so
+    # re-deriving the override from $getConvertedValue on recheck means
+    # parsing the row's DISPLAY text (built once via
+    # ConvertTo-BRAVOConfiguratorUIDisplayText, itself driven by the same
+    # wrong Type) instead of using the value that was already known,
+    # correctly typed, at row-build time. For Boolean this silently turns
+    # $false into the string "False", which then fails canonical schema
+    # validation on Apply and blocks the entire edit session. Since a
+    # ReadOnly row's value can never be genuinely edited through this UI,
+    # capturing the original typed OverrideValue once and restoring it
+    # directly on recheck is correct for ReadOnly rows in general, not
+    # only for the recovery-row case — it bypasses the lossy text
+    # round-trip entirely rather than papering over one Type value.
+    $originalTypedOverrideValue = if ([bool]$Setting.OverridePresent) { $Setting.OverrideValue } else { $null }
+
     $overrideCheckBox.Add_CheckedChanged({
         $valueControl.Enabled = $overrideCheckBox.Checked -and (-not [bool]$Setting.Metadata.ReadOnly)
         if ($overrideCheckBox.Checked) {
-            try {
-                $convertedValue = & $getConvertedValue
-                & $OnChanged $currentPath $true $convertedValue
-                & $updateRevertBaseline
-            } catch {
-                & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
-                & $restoreLastValidValue
+            if ([bool]$Setting.Metadata.ReadOnly) {
+                & $OnChanged $currentPath $true $originalTypedOverrideValue
+            } else {
+                try {
+                    $convertedValue = & $getConvertedValue
+                    & $OnChanged $currentPath $true $convertedValue
+                    & $updateRevertBaseline
+                } catch {
+                    & $showMessageRef -Text "Некоректне значення для '$currentPath': $($_.Exception.Message)" -Icon Warning
+                    & $restoreLastValidValue
+                }
             }
         } else {
             & $OnChanged $currentPath $false $null

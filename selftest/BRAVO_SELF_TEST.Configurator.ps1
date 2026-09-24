@@ -3673,6 +3673,160 @@ try {
         "backupMonitoring.SFTP.BAZA.MutationPolicy мусить лишитись задокументованим (schema-повнота — тепер має Configurator-дескриптор), але з явним NON-OVERRIDABLE-маркером поруч"
 }
 
+# =====================================================================
+# TASK-001 (F32, deep-audit synthesis §O.2, Codex review PR #224):
+# Get-BRAVOConfiguratorSessionSchemaCatalog синтезує recovery-рядки з
+# ЖОРСТКО закодованим Metadata.Type='String' незалежно від реального
+# CLR-типу leaf-а (Model.psm1, синтезований дескриптор вище). Для
+# ReadOnly-рядка New-BRAVOConfiguratorUISettingRow (UI.psm1) будує
+# TextBox і на recheck-обробнику CheckedChanged раніше РЕПАРСИВ поточний
+# ДИСПЛЕЙ-ТЕКСТ через ConvertTo-BRAVOConfiguratorUITypedValue -Type
+# 'String' — для типу без явного case ця функція падає у
+# default-гілку й повертає СИРИЙ текст без конвертації, перетворюючи
+# [bool]$false на [string]"False". Ця зіпсована рядкова копія потім не
+# проходить типову перевірку Test-BRAVOConfigurationOverrideSchema
+# (BRAVO_CONFIG_LOADER.ps1) і блокує ВЕСЬ сеанс Apply, а не лише це
+# поле. Фікс: захоплена $originalTypedOverrideValue відновлюється
+# напряму на recheck для ReadOnly-рядків, минаючи текстовий
+# repars-шлях повністю (UI.psm1, New-BRAVOConfiguratorUISettingRow).
+#
+# New-BRAVOConfiguratorUISettingRow — приватна (не експортована)
+# функція; UI.psm1 не імпортований у сесію верхнього рівня цього
+# фрагмента (лише Schema/Effective/Model/Validation/Persistence/
+# Credentials/Presets/Preview вище) — Import-Module -PassThru + виклик
+# через `& $uiModule { ... }` виконує код У ВЛАСНОМУ session state
+# модуля, той самий прийом, що застосований вище для P1
+# (UIModuleScopeWorksWithForeignModuleInstancePresent). На відміну від
+# того блоку, тут НЕ потрібна ізоляція в дочірньому процесі — сама
+# перевірка не залежить від foreign-private-module-instance стану,
+# лише від того, що функція приватна відносно свого модуля.
+# =====================================================================
+& {
+    $f32ConfiguratorModuleRoot = Join-Path $root 'modules\BRAVO.Configurator'
+    $f32UiModule = Import-Module -Name (Join-Path $f32ConfiguratorModuleRoot 'BRAVO.Configurator.UI.psm1') -Force -PassThru
+    # Initialize-BRAVOConfiguratorUIAssemblies (canonical, лінива
+    # WinForms-ініціалізація — UI.psm1:663) МУСИТЬ виконатись ДО будь-якого
+    # New-Object System.Windows.Forms.*; Show-BRAVOConfiguratorMainForm
+    # робить це першим кроком, тому цей self-test-фрагмент відтворює той
+    # самий порядок замість дублювання Add-Type напряму.
+    & $f32UiModule { Initialize-BRAVOConfiguratorUIAssemblies }
+
+    function Invoke-F32SettingRowCheckedRoundTrip {
+        <#
+        .SYNOPSIS
+            Будує ряд через New-BRAVOConfiguratorUISettingRow (у сесії
+            $f32UiModule), симулює uncheck->recheck на його CheckBox і
+            повертає масив захоплених OnChanged-викликів.
+        #>
+        param($UiModule, $Setting)
+
+        $captured = New-Object System.Collections.Generic.List[object]
+        $onChanged = {
+            param($settingPath, $present, $value)
+            $captured.Add([pscustomobject]@{ Path = $settingPath; Present = $present; Value = $value })
+        }.GetNewClosure()
+        $onSelected = { param($settingPath) }.GetNewClosure()
+        $state = @{}
+        $tooltip = New-Object System.Windows.Forms.ToolTip
+
+        $row = & $UiModule {
+            param($s, $st, $oc, $os, $tt)
+            New-BRAVOConfiguratorUISettingRow -Setting $s -State $st -OnChanged $oc -OnSelected $os -ToolTip $tt
+        } $Setting $state $onChanged $onSelected $tooltip
+
+        $checkBox = @($row.Controls | Where-Object { $_ -is [System.Windows.Forms.CheckBox] })[0]
+        $checkBox.Checked = $false
+        $checkBox.Checked = $true
+
+        return $captured.ToArray()
+    }
+
+    # ===== Case 1: реальний synthesized recovery-рядок (requireAdministrator=$false, ReadOnly boolean leaf) =====
+    $f32EnvOriginal = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $f32Overrides = @{ 'requireAdministrator' = $false }
+        $f32SchemaCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $configuratorSchemaCatalog -LocalOverrides $f32Overrides
+        $f32Model = Get-BRAVOConfiguratorModel -SchemaCatalog $f32SchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $f32Overrides
+        $f32Setting = @($f32Model | Where-Object { $_.Path -eq 'requireAdministrator' })[0]
+
+        Test-BRAVOCondition (
+            $null -ne $f32Setting -and [bool]$f32Setting.Metadata.ReadOnly -and [bool]$f32Setting.OverridePresent -and
+            ($f32Setting.OverrideValue -is [bool]) -and ([bool]$f32Setting.OverrideValue -eq $false)
+        ) `
+            'Configurator/F32RecoveryRowFixturePreconditionIsBooleanReadOnly' `
+            ("fixture-передумова: синтезований recovery-рядок requireAdministrator=`$false МУСИТЬ бути ReadOnly з реальним boolean OverrideValue ДО будь-якого UI-round-trip; " +
+             "отримано Found=$($null -ne $f32Setting) ReadOnly=$($(if ($f32Setting) { $f32Setting.Metadata.ReadOnly } else { 'N/A' })) ValueType=$($(if ($f32Setting) { $f32Setting.OverrideValue.GetType().FullName } else { 'N/A' }))")
+
+        $f32Calls = Invoke-F32SettingRowCheckedRoundTrip -UiModule $f32UiModule -Setting $f32Setting
+        $f32RecheckCall = @($f32Calls | Where-Object { [bool]$_.Present })[-1]
+
+        # --- Configurator/UIRecoveryRowCheckedRoundTripPreservesBooleanType ---
+        Test-BRAVOCondition (
+            $null -ne $f32RecheckCall -and ($f32RecheckCall.Value -is [bool]) -and ([bool]$f32RecheckCall.Value -eq $false)
+        ) `
+            'Configurator/UIRecoveryRowCheckedRoundTripPreservesBooleanType' `
+            ("F32: uncheck->recheck ReadOnly recovery-рядка (requireAdministrator=`$false) через реальний CheckedChanged-обробник МУСИТЬ повернути `$OnChanged значення типу [bool] `$false, а НЕ рядок 'False' (втрачений тип через ConvertTo-BRAVOConfiguratorUITypedValue -Type 'String' на TextBox-репарсі); " +
+             "отримано Present=$($(if ($f32RecheckCall) { $f32RecheckCall.Present } else { 'N/A' })) ValueType=$($(if ($f32RecheckCall) { $(if ($null -eq $f32RecheckCall.Value) { 'NULL' } else { $f32RecheckCall.Value.GetType().FullName }) } else { 'N/A' })) Value=$($(if ($f32RecheckCall) { $f32RecheckCall.Value } else { 'N/A' }))")
+
+        # ===== Case 2: end-to-end Invoke-BRAVOConfiguratorApply з UI-round-trip значенням =====
+        $f32ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+            ("BRAVO_CONFIGURATOR_F32_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($f32ApplyScenarioRoot)
+        try {
+            $f32ApplyConfigPath = Join-Path $f32ApplyScenarioRoot 'BRAVO.local.config'
+            [IO.File]::WriteAllText(
+                $f32ApplyConfigPath,
+                "@{`r`n    'requireAdministrator' = `$false`r`n}`r`n",
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $f32ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $f32ApplyScenarioRoot
+            $f32ApplySchemaCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $configuratorSchemaCatalog -LocalOverrides $f32ApplyBaseline.Overrides
+            $f32ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $f32ApplySchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $f32ApplyBaseline.Overrides
+            $f32ApplySetting = @($f32ApplyModel | Where-Object { $_.Path -eq 'requireAdministrator' })[0]
+
+            $f32ApplyCalls = Invoke-F32SettingRowCheckedRoundTrip -UiModule $f32UiModule -Setting $f32ApplySetting
+            $f32ApplyRecheckCall = @($f32ApplyCalls | Where-Object { [bool]$_.Present })[-1]
+            $f32ApplyModelEdited = Set-BRAVOConfiguratorOverride -Model $f32ApplyModel -Path 'requireAdministrator' -Value $f32ApplyRecheckCall.Value
+
+            $f32ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $f32ApplyScenarioRoot `
+                -Model $f32ApplyModelEdited -SchemaCatalog $f32ApplySchemaCatalog -ProductionBaseline $f32ApplyBaseline
+
+            # --- Apply/UIRoundTripReadOnlyRecoveryRowDoesNotBlockSession ---
+            Test-BRAVOCondition ([bool]$f32ApplyResult.Applied -eq $true) `
+                'Apply/UIRoundTripReadOnlyRecoveryRowDoesNotBlockSession' `
+                ("F32 end-to-end: Apply ПІСЛЯ uncheck->recheck ReadOnly recovery-рядка (значення фактично незмінне, лише пройшло через UI-round-trip) МУСИТЬ пройти (Applied=`$true) — " +
+                 "до фіксу зіпсований рядок 'False' провалював Test-BRAVOConfigurationOverrideSchema й блокував ВЕСЬ сеанс (Stage='Validation'); отримано Applied=$($f32ApplyResult.Applied) Stage=$($f32ApplyResult.Stage)")
+        } finally {
+            Remove-Item -LiteralPath $f32ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $f32EnvOriginal)
+    }
+
+    # ===== Case 3: синтетичний array-kind ReadOnly recovery-рядок — тип не лише bool, а й масив мусить пережити round-trip =====
+    $f32ArraySetting = [pscustomobject]@{
+        Path            = 'synthetic.F32.ArrayRecoveryLeaf'
+        Metadata        = @{ Path = 'synthetic.F32.ArrayRecoveryLeaf'; Type = 'String'; Label = 'F32 array fixture'; ReadOnly = $true; Secret = $false }
+        OverridePresent = $true
+        OverrideValue   = [string[]]@('alpha', 'beta', 'gamma')
+        DefaultValue    = $null
+        EffectiveSource = 'Override'
+        DisabledReason  = $null
+    }
+    $f32ArrayCalls = Invoke-F32SettingRowCheckedRoundTrip -UiModule $f32UiModule -Setting $f32ArraySetting
+    $f32ArrayRecheckCall = @($f32ArrayCalls | Where-Object { [bool]$_.Present })[-1]
+
+    # --- Configurator/UIRecoveryRowCheckedRoundTripPreservesArrayType ---
+    Test-BRAVOCondition (
+        $null -ne $f32ArrayRecheckCall -and ($f32ArrayRecheckCall.Value -is [array]) -and
+        (@(Compare-Object -ReferenceObject @('alpha', 'beta', 'gamma') -DifferenceObject @($f32ArrayRecheckCall.Value) -SyncWindow 0).Count -eq 0)
+    ) `
+        'Configurator/UIRecoveryRowCheckedRoundTripPreservesArrayType' `
+        ("F32: uncheck->recheck ReadOnly recovery-рядка з масивовим OverrideValue МУСИТЬ повернути ТОЙ САМИЙ масив (не comma-joined рядок через ConvertTo-BRAVOConfiguratorUIDisplayText/ConvertTo-BRAVOConfiguratorUITypedValue); " +
+         "отримано ValueType=$($(if ($f32ArrayRecheckCall) { $(if ($null -eq $f32ArrayRecheckCall.Value) { 'NULL' } else { $f32ArrayRecheckCall.Value.GetType().FullName }) } else { 'N/A' })) Value=$($(if ($f32ArrayRecheckCall) { $f32ArrayRecheckCall.Value -join ',' } else { 'N/A' }))")
+}
+
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
 # початку файлу). Remove-Item на директорію-junction видаляє лише сам
 # reparse point, не рекурсує в реальний modules\ репозиторію. =====
