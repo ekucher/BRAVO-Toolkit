@@ -430,7 +430,12 @@
     # серверу: після self-enrollment сервер зʼявляється в Operations зі
     # статусом "Pending", доки адміністратор не підтвердить його вручну.
     # 'operationsReportingSettings.Enabled' = $true
-    # 'operationsReportingSettings.ApiBaseUrl' = 'https://operations.bsystem.example/api'
+    # УВАГА: без кінцевого '/api' — модуль сам додає повний '/api/v1/...'
+    # шлях (Join-BRAVOOperationsApiUrl, BRAVO.Operations.psm1); зайвий
+    # '/api' тут дає подвоєний .../api/api/v1/... (E10-регресія, знайдена
+    # й виправлена при написанні цього прикладу — див. E10-коментар у
+    # BRAVO.Operations.psm1 для деталей).
+    # 'operationsReportingSettings.ApiBaseUrl' = 'https://operations.bsystem.example'
     # 'operationsReportingSettings.RequestTimeoutSeconds' = 30
     # 'operationsReportingSettings.HeartbeatIntervalMinutes' = 60
     # На сервері лише один продукт — LIMS або VETOFFICE. Дефолт LIMS;

@@ -299,7 +299,7 @@ $script:BRAVOSelfTestSuiteCatalog = @(
     'Archive', 'ArchiveDiskSpace', 'BazaSync', 'ConfigIntent', 'ConfigLoader',
     'Configuration', 'Configurator', 'ConfiguratorUI', 'ConsoleUX', 'DataRestore',
     'DiskSpace', 'Governance', 'LogRotation', 'MaintenanceDiskSpace',
-    'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Paths',
+    'MaintenanceOwnLog', 'MaintenanceRepair', 'ManifestStorage', 'Operations', 'Paths',
     'RestoreSynthetic', 'RestoreVerify', 'ServiceQuiescence',
     'SftpCredentialsRequired', 'Status', 'TraceArchive'
 )
@@ -18746,6 +18746,11 @@ function Write-BRAVOLog {
     if (Test-BRAVOSelfTestSuiteEnabled -Name 'BazaSync') {
         Enter-BRAVOSelfTestSuite -Name 'BazaSync'
         . (Join-Path $root 'selftest\BRAVO_SELF_TEST.BazaSync.ps1')
+    }
+    Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
+    if (Test-BRAVOSelfTestSuiteEnabled -Name 'Operations') {
+        Enter-BRAVOSelfTestSuite -Name 'Operations'
+        . (Join-Path $root 'selftest\BRAVO_SELF_TEST.Operations.ps1')
     }
     Enter-BRAVOSelfTestSuite -Name 'Root (inline)'
     # TraceArchive ПІСЛЯ BazaSync: SFTP-сценарії добового Trace-архіву
