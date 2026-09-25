@@ -437,7 +437,9 @@
     # BRAVO.Operations.psm1 для деталей).
     # 'operationsReportingSettings.ApiBaseUrl' = 'https://operations.bsystem.example'
     # 'operationsReportingSettings.RequestTimeoutSeconds' = 30
-    # 'operationsReportingSettings.HeartbeatIntervalMinutes' = 60
+    # HeartbeatIntervalMinutes видалено з контракту (PR #225, thread 7) —
+    # ключ ніколи не читався жодним рантайм-споживачем; див. коментар у
+    # канонічному BRAVO.config.
     # На сервері лише один продукт — LIMS або VETOFFICE. Дефолт LIMS;
     # розкоментуйте на серверах VetOffice:
     # 'operationsReportingSettings.ProductType' = 'VETOFFICE'

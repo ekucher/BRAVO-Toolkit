@@ -493,11 +493,9 @@ function Get-BRAVODefaultConfiguration {
             Enabled = $false
             ApiBaseUrl = ""
             RequestTimeoutSeconds = 30
-            # УВАГА: не вмикає автоматичний heartbeat сама по собі —
-            # BRAVO_TASKS_INSTALL.ps1 ще не реєструє періодичне завдання
-            # для BRAVO_OPERATIONS_HEARTBEAT.ps1 (див. коментар у
-            # канонічному BRAVO.config).
-            HeartbeatIntervalMinutes = 60
+            # HeartbeatIntervalMinutes видалено з дефолтів (PR #225,
+            # thread 7) — ключ ніколи не читався жодним рантайм-споживачем;
+            # див. коментар у канонічному BRAVO.config.
             ProductType = "LIMS"
         }
 

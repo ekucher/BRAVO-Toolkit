@@ -253,7 +253,9 @@
         @{ Path = 'operationsReportingSettings.Enabled'; Group = 'Operations'; Section = 'Reporting'; Label = 'Звітність в Operations увімкнена'; Description = 'Opt-in, вимкнено за замовчуванням. Вмикайте усвідомлено, по одному серверу.'; Type = 'Boolean'; Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }
         @{ Path = 'operationsReportingSettings.ApiBaseUrl'; Group = 'Operations'; Section = 'Reporting'; Label = 'Базова адреса Operations API'; Description = 'HTTPS-адреса bsystem-operations API.'; Type = 'String'; Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 20 }
         @{ Path = 'operationsReportingSettings.RequestTimeoutSeconds'; Group = 'Operations'; Section = 'Reporting'; Label = 'Таймаут запиту до Operations (с)'; Description = ''; Type = 'Integer'; Phase = 2; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 30 }
-        @{ Path = 'operationsReportingSettings.HeartbeatIntervalMinutes'; Group = 'Operations'; Section = 'Reporting'; Label = 'Інтервал heartbeat (хв)'; Description = ''; Type = 'Integer'; Phase = 2; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 40 }
+        # HeartbeatIntervalMinutes видалено зі схеми (PR #225, thread 7) —
+        # ключ ніколи не читався жодним рантайм-споживачем; див. коментар
+        # у канонічному BRAVO.config.
         @{ Path = 'operationsReportingSettings.ProductType'; Group = 'Operations'; Section = 'Reporting'; Label = 'Продукт на цьому сервері'; Description = 'LIMS | VETOFFICE. На сервері лише один продукт.'; Type = 'Enum'; AllowedValues = @('LIMS', 'VETOFFICE'); Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 50 }
     )
     }
