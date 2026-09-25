@@ -1088,13 +1088,33 @@ function Test-BRAVOConfigurationAuthorizationIntegerRange {
             Message = "${Path}: очікується ціле число без лапок (діапазон $Minimum..$Maximum), отримано $($Value.GetType().Name)."
         }
     }
-    $doubleValue = [double]$Value
-    if ($doubleValue -ne [System.Math]::Truncate($doubleValue)) {
+    # Codex review PR #224 (P2, "Preserve precision when checking integer
+    # ranges"): fractional-перевірка МУСИТЬ відбуватись у ТОМУ Ж домені,
+    # що й сам $Value, коли це [decimal] — double має лише ~15-17
+    # значущих десяткових цифр, тож звуження ВИСОКОточного decimal
+    # (напр. 6.9999999999999999999999999999D, 28 дев'яток) у [double]
+    # ДО перевірки дробової частини могло округлити його рівно до 7.0,
+    # хибно проходячи як ціле число, тоді як фактичне decimal-значення
+    # (і те, що потрапляє в merged-конфігурацію) лишається меншим за 7 —
+    # runtime-споживач (напр. robocopyMaxSuccessExitCode) тоді трактує
+    # код завершення 7 як провал, хоча авторизація вважала 7 прийнятним
+    # верхнім кордоном. Для [decimal] Math.Truncate працює в 28-29-
+    # значущій decimal-точності без цього округлення; для решти
+    # numeric TypeCode (Int*/UInt*/Single/Double) — жодної фактичної
+    # дробової частини, яку double міг би загубити при звичайному
+    # діапазоні цієї схеми, тож звична [double]-перевірка лишається.
+    $isFractional = if ($Value -is [decimal]) {
+        ([decimal]$Value -ne [System.Math]::Truncate([decimal]$Value))
+    } else {
+        ([double]$Value -ne [System.Math]::Truncate([double]$Value))
+    }
+    if ($isFractional) {
         return [pscustomobject]@{
             IsValid = $false
             Message = "${Path}: значення '$Value' має дробову частину — очікується ціле число (діапазон $Minimum..$Maximum)."
         }
     }
+    $doubleValue = [double]$Value
     # Порівняння як [double], НЕ звуження в [int64]: $Minimum/$Maximum —
     # завжди [int] (обмежений діапазон), тож будь-яке структурно ціле
     # $Value поза цим діапазоном (напр. [uint64]::MaxValue,

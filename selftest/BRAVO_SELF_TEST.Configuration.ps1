@@ -1787,6 +1787,38 @@
         -Name "Configuration/SftpPortOversizedValueRejectedNotException" `
         -Failure "sftpPort=[uint64]::MaxValue мусить повернутись як звичайне ValidatorRejected-порушення (canonical авторизація), НЕ як throw; отримано Threw=$irSftpPortThrew IsValid=$($irSftpPortResult.IsValid) ViolationCount=$($irSftpPortViolation.Count)"
 
+    # =====================================================================
+    # PR #224 review (P2, "Preserve precision when checking integer
+    # ranges"): Test-BRAVOConfigurationAuthorizationIntegerRange РАНІШЕ
+    # звужувала [decimal]$Value у [double] ПЕРЕД перевіркою дробової
+    # частини — double має лише ~15-17 значущих десяткових цифр, тож
+    # високоточний decimal (28-29 значущих цифр) міг округлитись рівно
+    # до цілого числа й хибно пройти fractional-перевірку, хоча реальне
+    # decimal-значення (яке й далі йде в merged-конфігурацію) лишається
+    # дробовим і меншим за верхню межу — конкретно
+    # robocopyMaxSuccessExitCode=6.9999999999999999999999999999D
+    # проходило б як 7 (валідний код успіху), хоча фактичний код
+    # завершення 7 мав би трактуватись як провал.
+    # =====================================================================
+
+    # --- Configuration/IntegerRangeHighPrecisionDecimalFractionRejected ---
+    $irHighPrecisionDecimalValue = [decimal]::Parse('6.9999999999999999999999999999', [System.Globalization.CultureInfo]::InvariantCulture)
+    $irHighPrecisionDecimalResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,7' -Value $irHighPrecisionDecimalValue -Path 'robocopyMaxSuccessExitCode'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$irHighPrecisionDecimalResult.IsValid) `
+        -Name "Configuration/IntegerRangeHighPrecisionDecimalFractionRejected" `
+        -Failure "високоточний дробовий decimal (6.9999999999999999999999999999, [double]-звуження округлює рівно до 7.0) мусить лишитись відхиленим як дробове значення, не проходити через double-precision-loss; отримано IsValid=$($irHighPrecisionDecimalResult.IsValid)"
+
+    # --- Configuration/IntegerRangeExactDecimalIntegerAccepted ---
+    # Негативний контроль: справжнє ціле decimal (без дробової частини)
+    # і далі мусить проходити — фікс не мав стати надто суворим.
+    $irExactDecimalValue = [decimal]7
+    $irExactDecimalResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,7' -Value $irExactDecimalValue -Path 'robocopyMaxSuccessExitCode'
+    Test-BRAVOCondition `
+        -Condition ([bool]$irExactDecimalResult.IsValid) `
+        -Name "Configuration/IntegerRangeExactDecimalIntegerAccepted" `
+        -Failure "справжнє ціле decimal-значення (7) у межах діапазону мусить бути прийняте; отримано IsValid=$($irExactDecimalResult.IsValid)"
+
     # --- Authorization/AllowSiteAccepted ---
     $authAllowSiteResult = Test-BRAVOConfigurationOverrideAuthorization `
         -DotPathOverrides @{ 'archiveRetentionDays' = 45 } `
