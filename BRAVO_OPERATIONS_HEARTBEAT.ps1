@@ -99,13 +99,15 @@ if (Test-Path -LiteralPath $runtimeGuardPath -PathType Leaf) {
     exit 33
 }
 
-$operationsModulePath = Join-Path $PSScriptRoot 'modules\BRAVO.Operations\BRAVO.Operations.psd1'
-try {
-    Import-Module -Name $operationsModulePath -ErrorAction Stop
-} catch {
-    Write-Host "КРИТИЧНА ПОМИЛКА: не вдалося завантажити модуль $operationsModulePath : $($_.Exception.Message)" -ForegroundColor Red
-    Wait-BRAVOEarlyManualExit -NoPause:$NoPause
-    exit 90
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.Logging', 'BRAVO.Operations')) {
+    $moduleManifestPath = Join-Path $PSScriptRoot "modules\$moduleName\$moduleName.psd1"
+    try {
+        Import-Module -Name $moduleManifestPath -ErrorAction Stop
+    } catch {
+        Write-Host "КРИТИЧНА ПОМИЛКА: не вдалося завантажити модуль $moduleManifestPath : $($_.Exception.Message)" -ForegroundColor Red
+        Wait-BRAVOEarlyManualExit -NoPause:$NoPause
+        exit 90
+    }
 }
 
 try {
