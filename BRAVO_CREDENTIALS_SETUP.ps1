@@ -21,6 +21,7 @@ param(
         "Discord.Alerts",
         "Archive",
         "Institution",
+        "Operations",
         "BRAVO_7Z_PASSWORD",
         "BRAVO_SFTP_LOGIN",
         "BRAVO_SFTP_PASSWORD",
@@ -32,7 +33,8 @@ param(
         "BRAVO_DISCORD_ALERTS_URL",
         "BRAVO_INSTITUTION_NAME",
         "BRAVO_INSTITUTION_CODE",
-        "BRAVO_ARCHIVE_PREFIX"
+        "BRAVO_ARCHIVE_PREFIX",
+        "BRAVO_OPERATIONS_BOOTSTRAP_SECRET"
     )]
     [string[]]$Component = @("All"),
 
@@ -242,6 +244,15 @@ function Resolve-RequestedComponents {
                         }
                     }
                 }
+
+                # BSYSTEM Operations: оператор явно увімкнув звітність на
+                # цьому сервері (operationsReportingSettings.Enabled) —
+                # bootstrap-секрет потрібен для self-enrollment.
+                if ($null -ne $operationsReportingSettings -and
+                    [bool]$operationsReportingSettings.Enabled -and
+                    -not $resolved.Contains("Operations")) {
+                    [void]$resolved.Add("Operations")
+                }
             }
             "All" {
                 # 5.2.1: legacy provider-wide групи "Slack"/"Discord"
@@ -250,7 +261,8 @@ function Resolve-RequestedComponents {
                 $allNames = @(
                     "Archive", "SFTP", "SMB",
                     "Slack.General", "Slack.Alerts",
-                    "Discord.General", "Discord.Alerts"
+                    "Discord.General", "Discord.Alerts",
+                    "Operations"
                 )
                 if ($null -ne $bravoSettings.InstitutionName -and
                     $null -ne $bravoSettings.InstitutionCode -and
@@ -290,6 +302,7 @@ function Get-CredentialTarget {
         "InstitutionName" { return $(if ($credentialSettings.Targets.InstitutionName) { [string]$credentialSettings.Targets.InstitutionName } else { "BRAVO_INSTITUTION_NAME" }) }
         "InstitutionCode" { return $(if ($credentialSettings.Targets.InstitutionCode) { [string]$credentialSettings.Targets.InstitutionCode } else { "BRAVO_INSTITUTION_CODE" }) }
         "ArchivePrefix" { return $(if ($credentialSettings.Targets.ArchivePrefix) { [string]$credentialSettings.Targets.ArchivePrefix } else { "BRAVO_ARCHIVE_PREFIX" }) }
+        "OperationsBootstrapSecret" { return $(if ($credentialSettings.Targets.OperationsBootstrapSecret) { [string]$credentialSettings.Targets.OperationsBootstrapSecret } else { "BRAVO_OPERATIONS_BOOTSTRAP_SECRET" }) }
         default { throw "Невідомий компонент секрету: $Name" }
     }
 }
@@ -504,6 +517,20 @@ function Get-CredentialDescriptors {
                     Prompt = "Префікс імен архівів"
                     InputMode = "Text"
                     Validation = "ArchivePrefix"
+                })
+            }
+            "Operations" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "BRAVO_OPERATIONS_BOOTSTRAP_SECRET"
+                    Target = Get-CredentialTarget -Name "OperationsBootstrapSecret"
+                    Prompt = "BSYSTEM Operations bootstrap-секрет (видає адміністратор Operations для self-enrollment цього сервера)"
+                })
+            }
+            "BRAVO_OPERATIONS_BOOTSTRAP_SECRET" {
+                [void]$descriptors.Add([pscustomobject]@{
+                    Component = "BRAVO_OPERATIONS_BOOTSTRAP_SECRET"
+                    Target = Get-CredentialTarget -Name "OperationsBootstrapSecret"
+                    Prompt = "BSYSTEM Operations bootstrap-секрет (видає адміністратор Operations для self-enrollment цього сервера)"
                 })
             }
         }
@@ -1102,7 +1129,9 @@ function Show-BRAVOCredentialMenu {
         [pscustomobject]@{ Number = 17; Value = "Slack.General"; Label = "Slack webhook — загальні повідомлення" },
         [pscustomobject]@{ Number = 18; Value = "Slack.Alerts"; Label = "Slack webhook — проблеми та аварії" },
         [pscustomobject]@{ Number = 19; Value = "Discord.General"; Label = "Discord webhook — загальні повідомлення" },
-        [pscustomobject]@{ Number = 20; Value = "Discord.Alerts"; Label = "Discord webhook — проблеми та аварії" }
+        [pscustomobject]@{ Number = 20; Value = "Discord.Alerts"; Label = "Discord webhook — проблеми та аварії" },
+        [pscustomobject]@{ Number = 21; Value = "Operations"; Label = "BSYSTEM Operations bootstrap-секрет" },
+        [pscustomobject]@{ Number = 22; Value = "BRAVO_OPERATIONS_BOOTSTRAP_SECRET"; Label = "BRAVO_OPERATIONS_BOOTSTRAP_SECRET" }
     )
 
     :ActionMenu while ($true) {
