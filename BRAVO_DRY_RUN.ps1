@@ -1117,11 +1117,16 @@ try {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
+    # Issue #216 (Wave B): production operator entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $resolvedConfigPath `
         -RuntimeRoot $runtimeRoot `
-        -ConfigPathWasExplicit:$configPathWasExplicit
+        -ConfigPathWasExplicit:$configPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
     # P0 Configuration Foundation: у режимі без BRAVO.config (Format =
     # synthetic-no-config) $resolvedConfigPath законно не існує — це не
     # помилка. Нижче (readAccessTargets) враховуємо Format, щоб не

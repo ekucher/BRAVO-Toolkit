@@ -326,10 +326,20 @@ if (-not $channelDecision.Allowed) {
 if ($channelDecision.OverrideUsed) { Write-Warn2 $channelDecision.Message } else { Write-Ok $channelDecision.Message }
 
 foreach ($required in @('BRAVO_RUNTIME_GUARD.ps1', 'RUNTIME_MANIFEST.json', 'BRAVO_SETUP.ps1',
-                        'BRAVO_CONFIG_LOADER.ps1', 'BRAVO.config', 'Tools\TOOLS_MANIFEST.json')) {
+                        'BRAVO_CONFIG_LOADER.ps1', 'Tools\TOOLS_MANIFEST.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $staged $required) -PathType Leaf)) {
         throw ('У комплекті бракує обов''язкового файлу: ' + $required)
     }
+}
+# BRAVO.config (issue #216, Wave B, B4-2): з 5.3 більше НЕ входить у
+# комплект і не є обов'язковим — production entrypoints тепер
+# синтезують BuiltInOnly/BuiltIn+Local ефективну конфігурацію без
+# нього (-DisallowLegacyPrimaryAutoDetect). Толерантність в обидва
+# боки: старіші комплекти (до 5.3), де файл ще фізично лежить поруч
+# з архівом, лишаються встановлюваними — просто без окремої
+# обов'язкової перевірки цього файлу.
+if (Test-Path -LiteralPath (Join-Path $staged 'BRAVO.config') -PathType Leaf) {
+    Write-Note 'BRAVO.config присутній у комплекті (старший пакет до 5.3) — інсталятор його ігнорує, production entrypoints не читають його автоматично'
 }
 Write-Ok 'обов''язкові файли комплекту на місці'
 

@@ -1300,21 +1300,40 @@ function Import-BravoConfiguration {
         # $legacyPrimaryAutoDetectBlocked.
         #
         # ЧОМУ ОПЦІЙНИЙ ПРАПОРЕЦЬ, А НЕ НОВИЙ ДЕФОЛТ ДЛЯ ВСІХ ВИКЛИКАЧІВ.
-        # Import-BravoConfiguration має ~14 прямих викликачів: 4 канонічні
-        # production runtime-entrypoint-и (Archive/Health/Maintenance/
-        # DataRestore через відповідні *.Runtime.ps1), BRAVO_SETUP.ps1,
-        # BRAVO_CREDENTIALS_SETUP.ps1, BRAVO_CONFIG_TEST.ps1 — і окремо
-        # migration/deploy-інструментарій (BRAVO_CONFIG_INTEGRATE.ps1,
-        # deploy\Update-BRAVOServer.ps1, BRAVO_TASKS_*, BRAVO_RESTORE_TEST.ps1,
-        # BRAVO_NOTIFICATION_TEST.ps1, BRAVO_DRY_RUN.ps1,
-        # BRAVO_BAZA_RECONCILE.ps1), для яких auto-detect легасі-primary —
-        # навмисна, задокументована поведінка (site BRAVO.config — легітимний
-        # 5.2-стан, який ці скрипти читають/мігрують/копіюють). Зміна
-        # дефолту для ВСІХ викликачів одночасно означала б непровалідовану
-        # зміну поведінки поза межами 7 production-entrypoint-ів, названих
-        # у Definition of Done issue #216. Тому прапорець — явний opt-in,
-        # який передають лише ті 7 production-entrypoint-ів; решта
-        # викликачів лишається на попередній перевіреній поведінці.
+        # Import-BravoConfiguration має прямих викликачів двох класів (Wave
+        # B, issue #216):
+        #
+        #   ПЕРЕДАЮТЬ прапорець (14, production/operator entrypoint-и —
+        #   оператор НЕ очікує, що підкладений поруч BRAVO.config мовчки
+        #   стане primary-шаром): 4 канонічні production runtime-
+        #   entrypoint-и (Archive/Health/Maintenance/DataRestore через
+        #   відповідні *.Runtime.ps1), BRAVO_SETUP.ps1,
+        #   BRAVO_CREDENTIALS_SETUP.ps1, BRAVO_CONFIG_TEST.ps1 (перші 7,
+        #   первинний Definition of Done issue #216), і після аудиту кроку 2
+        #   ще 7: BRAVO_BAZA_RECONCILE.ps1, BRAVO_DRY_RUN.ps1,
+        #   BRAVO_NOTIFICATION_TEST.ps1, BRAVO_RESTORE_TEST.ps1,
+        #   BRAVO_TASKS_DIAGNOSE.ps1, BRAVO_TASKS_INSTALL.ps1,
+        #   BRAVO_TASKS_UNINSTALL.ps1 — усі це штатні інструменти
+        #   оператора, а не migration-tooling.
+        #
+        #   НЕ передають прапорець (migration/deploy-інструментарій, де
+        #   читання РЕАЛЬНОГО поточного/site BRAVO.config — сама мета
+        #   інструмента, а не випадковість): deploy\Get-BRAVOConfigSiteDelta.ps1
+        #   (site-diff за визначенням читає обидва боки, включно з
+        #   реальним поточним BRAVO.config) і deploy\Update-BRAVOServer.ps1
+        #   (preflight-пробник явно читає ВЖЕ ВСТАНОВЛЕНИЙ на сервері
+        #   BRAVO.config, щоб порівняти пороги перед оновленням).
+        #   BRAVO_CONFIG_INTEGRATE.ps1, deploy\Compare-
+        #   BRAVOConfigEffectiveSnapshot.ps1, deploy\Start-
+        #   BRAVOConfigV2Pilot.ps1, deploy\New-BRAVOConfigV2PilotArtifact.ps1
+        #   і deploy\BRAVOConfigV2Pilot.Runtime.ps1 НЕ викликають цю функцію
+        #   напряму (інший механізм читання/порівняння конфігурації) —
+        #   поза цим прапорцем за визначенням, не через свідоме
+        #   виключення.
+        #
+        # Зміна дефолту для ВСІХ викликачів одночасно означала б
+        # непровалідовану зміну поведінки поза межами явно перевіреного
+        # execution-контракту. Тому прапорець лишається явним opt-in.
         [switch]$DisallowLegacyPrimaryAutoDetect,
 
         [switch]$PassThru

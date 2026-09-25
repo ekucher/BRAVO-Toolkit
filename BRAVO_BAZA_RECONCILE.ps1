@@ -144,11 +144,16 @@ try {
 
     $configurationLoaderPath = Join-Path $PSScriptRoot 'BRAVO_CONFIG_LOADER.ps1'
     . $configurationLoaderPath
+    # Issue #216 (Wave B): production operator entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
     Import-BravoConfiguration `
         -ConfigRoot (Split-Path -Path $ConfigPath -Parent) `
         -ConfigPath $ConfigPath `
         -RuntimeRoot $PSScriptRoot `
-        -ConfigPathWasExplicit:$configPathWasExplicit
+        -ConfigPathWasExplicit:$configPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
 
     Initialize-BRAVOConsole
     Initialize-BRAVOProgress -Enabled $false

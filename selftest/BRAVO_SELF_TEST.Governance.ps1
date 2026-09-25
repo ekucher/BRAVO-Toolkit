@@ -599,9 +599,7 @@
         } | Sort-Object -Unique
     )
     $legacyConfigExpectedLines = @(
-        '$ConfigPath = Join-Path $root "BRAVO.config"',
-        'return (Join-Path $root ''BRAVO.config'')',
-        '$shippedConfigPath = Join-Path $root ''BRAVO.config'''
+        '$ConfigPath = Join-Path $root "BRAVO.config"'
     ) | Sort-Object -Unique
     $legacyConfigOwnerLinesText = [string]::Join(' | ', $legacyConfigOwnerLines)
     $legacyConfigExpectedLinesText = [string]::Join(' | ', $legacyConfigExpectedLines)
@@ -629,25 +627,25 @@
     # б "Configuration loader not found" на старті, (1)+(2) — мовчазну
     # втрату покриття тверджень про пакет.
     #
-    # ЩО СТАНЕТЬСЯ НА B4-2: цей guard ЗАПЛАНОВАНО впаде. Коли (1) перейде
-    # на заморожений актив, а (2) — на канонічні дефолти, кореневий шлях
-    # перестане згадуватись у їхніх тілах: кількість збігів впаде до
-    # одного (дефолт -ConfigPath), і $legacyConfigExpectedLines доведеться
-    # звузити. Це НЕ дефект guard-а і не «прихована зв'язаність»: guard
-    # фіксує саме те, що кореневий BRAVO.config читається рівно з
-    # перелічених місць, а зміна цього переліку — подія, яка мусить
-    # пройти рев'ю, а не проїхати мовчки. Ціна — один узгоджений правкою
-    # рядок у цьому файлі на кроці B4-2; тому обіцянка «зміниться рівно
-    # одне тіло функції» стосується СПОЖИВАЧІВ accessor-ів, а не цього
-    # guard-а.
+    # B4-2 ВИКОНАНО (issue #216, Wave B): кореневий BRAVO.config прибрано
+    # з git-tracking і з пакета. Get-BRAVOSelfTestLegacyConfigPath і
+    # Get-BRAVOSelfTestShippedConfigPath тепер повертають шлях до
+    # замороженого тестового активу (selftest\fixtures\
+    # BravoConfigLegacyFrozen.config) — їхні тіла більше НЕ згадують
+    # $root поруч з "BRAVO.config" (ім'я fixture-файлу навмисно не
+    # містить літералу "BRAVO.config", тож і не збігається з цим
+    # patterns). Лишається рівно ОДНЕ легітимне посилання — дефолт
+    # -ConfigPath (операційний конфіг комплекту, якого це прибирання не
+    # стосується: оператор і сьогодні може покласти явний BRAVO.config
+    # поруч з entrypoint-ом через -ConfigPath).
     Test-BRAVOCondition `
         -Condition (
-            $legacyConfigOwnerHits -eq 3 -and
+            $legacyConfigOwnerHits -eq 1 -and
             $legacyConfigOwnerLinesText -ceq $legacyConfigExpectedLinesText -and
             $legacyConfigFragmentOffenders.Count -eq 0
         ) `
         -Name "Governance/LegacyConfigPathHasSingleOwner" `
-        -Failure "у BRAVO_SELF_TEST.ps1 дозволені рівно три посилання на кореневий BRAVO.config (тіла Get-BRAVOSelfTestLegacyConfigPath і Get-BRAVOSelfTestShippedConfigPath та дефолт -ConfigPath), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
+        -Failure "у BRAVO_SELF_TEST.ps1 дозволене рівно одне посилання на кореневий BRAVO.config (дефолт -ConfigPath; B4-2 прибрав файл з пакета, тож accessor-и фікстур більше не читають кореневий шлях), у фрагментах — жодного. Знайдено: $legacyConfigOwnerHits у корені, $($legacyConfigFragmentOffenders.Count) у фрагментах ($([string]::Join(', ', $legacyConfigFragmentOffenders.ToArray()))). Рядки збігів: [$legacyConfigOwnerLinesText]; очікувані: [$legacyConfigExpectedLinesText]"
 
     # --- Провенанс артефакту: sourceCommit описує САМЕ спаковане дерево ---
     # #199. Форма sourceCommit і рівність packageVersion нічого не кажуть
@@ -1150,7 +1148,7 @@
     # ловить мовчазне звуження.
     $requiredPattern = @(
         'BRAVO_CONFIG_LOADER.ps1'
-        'BRAVO.config'
+        'selftest/fixtures/BravoConfigLegacyFrozen.config'
         'BRAVO.local.config.example'
         'modules/BRAVO.Configuration/**'
         'modules/BRAVO.Configurator/**'
@@ -1196,7 +1194,7 @@
         @{ Name = 'the workflow itself';         Changed = @('.github/workflows/config-parity.yml');            Expected = $true }
         @{ Name = 'the harness itself';          Changed = @('ci/Test-BRAVOConfigFoundationParity.ps1');        Expected = $true }
         @{ Name = 'the decision logic itself';   Changed = @('ci/Test-BRAVOConfigParityRelevantPath.ps1');      Expected = $true }
-        @{ Name = 'legacy primary config';       Changed = @('BRAVO.config');                                   Expected = $true }
+        @{ Name = 'legacy primary config';       Changed = @('selftest/fixtures/BravoConfigLegacyFrozen.config'); Expected = $true }
         @{ Name = 'site config example';         Changed = @('BRAVO.local.config.example');                     Expected = $true }
         @{ Name = 'mixed, one relevant';         Changed = @('README.md', 'CHANGELOG.md', 'modules/BRAVO.Configuration/x.psm1', 'docs/a.md'); Expected = $true }
         @{ Name = 'mixed, none relevant';        Changed = @('README.md', 'CHANGELOG.md', 'docs/a.md');         Expected = $false }

@@ -176,31 +176,44 @@ try {
     Pop-Location
 }
 
-# --- 3a. Гейт issue #216 (Wave B): жоден production entrypoint у          --
+# --- 3a. Гейт issue #216 (Wave B): жоден production/operator entrypoint у --
 #     staged-комплекті не сміє автоматично виконувати довільний            --
 #     BRAVO.config, підкладений поруч --------------------------------------
 #
 # ПОВНЕ прибирання BRAVO.config з комплекту (issue #154, крок B4-2)
-# навмисно заблоковане в репозиторії — воно вимагало б ОДНОЧАСНО
-# переписати ~20 фікстур і три незалежні системи, що досі покладаються на
-# фізичну присутність файлу: deploy\Install-BRAVOServer.ps1 (required-file
-# перевірка), ci\Test-BRAVOConfigFoundationParity.ps1 (BEFORE/AFTER
-# fixture) і BRAVO_SELF_TEST.ConfigLoader.ps1
-# (ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults) — див.
-# коментар Get-BRAVOSelfTestLegacyConfigPath у BRAVO_SELF_TEST.ps1. Робити
-# це наосліп у Wave B цієї задачі означало б непровалідовану зміну поза
-# межами production-entrypoint execution-контракту, який ця хвиля
-# закриває.
+# ВИКОНАНО в цій хвилі: кореневий файл більше не входить у пакет і не
+# відстежується git (заморожений тестовий актив —
+# selftest\fixtures\BravoConfigLegacyFrozen.config; deploy\
+# Install-BRAVOServer.ps1 більше не вимагає файл; ci\
+# Test-BRAVOConfigFoundationParity.ps1 і
+# BRAVO_SELF_TEST.ConfigLoader.ps1/CommittedBravoConfigMatchesCanonicalDefaults
+# читають той самий заморожений актив через
+# Get-BRAVOSelfTestLegacyConfigPath).
 #
-# Той факт, що committed BRAVO.config ніколи не відхиляється від
-# built-in-дефолтів, уже доведено окремим self-test
-# (CommittedBravoConfigMatchesCanonicalDefaults, виконується в
-# release-artifact workflow одразу після цього скрипта на тому самому
-# staging-каталозі) — тому реальний залишковий ризик тут не "файл
-# присутній", а "виконавчий контракт: чи МІГ би production entrypoint
-# автоматично підхопити ІНШИЙ (підмінений) BRAVO.config без явного
-# наміру оператора". Це і є гейт нижче: детерміністична текстова
-# перевірка, що кожен production entrypoint staged-комплекту передає
+# Перелік нижче розширено з 7 до 14: аудит (issue #216, крок 2) додав
+# 7 раніше не охоплених production/operator-скриптів
+# (BRAVO_BAZA_RECONCILE.ps1, BRAVO_DRY_RUN.ps1,
+# BRAVO_NOTIFICATION_TEST.ps1, BRAVO_RESTORE_TEST.ps1,
+# BRAVO_TASKS_DIAGNOSE.ps1, BRAVO_TASKS_INSTALL.ps1,
+# BRAVO_TASKS_UNINSTALL.ps1) — усі вони штатні інструменти оператора
+# (діагностика/драй-ран/встановлення й прибирання завдань планувальника/
+# реконсиляція BAZA/тест сповіщень/тест відновлення), а не migration-
+# tooling, тож так само не повинні автоматично виконувати підкладений
+# файл. Свідомо залишено ПОЗА цим гейтом (migration/deploy tooling, де
+# читання РЕАЛЬНОГО поточного BRAVO.config встановленого сервера — сама
+# мета інструмента, а не випадковість): BRAVO_CONFIG_INTEGRATE.ps1,
+# deploy\Get-BRAVOConfigSiteDelta.ps1,
+# deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1,
+# deploy\Start-BRAVOConfigV2Pilot.ps1,
+# deploy\New-BRAVOConfigV2PilotArtifact.ps1,
+# deploy\BRAVOConfigV2Pilot.Runtime.ps1 і deploy\Update-BRAVOServer.ps1
+# (його preflight-пробник явно читає ВЖЕ ВСТАНОВЛЕНИЙ на сервері
+# BRAVO.config, щоб порівняти пороги перед оновленням, — це не
+# "випадково підкладений файл", а фактичний стан продакшн-сервера, який
+# інструмент зобов'язаний побачити).
+#
+# Гейт нижче: детерміністична текстова перевірка, що кожен
+# production/operator entrypoint staged-комплекту передає
 # -DisallowLegacyPrimaryAutoDetect у виклик Import-BravoConfiguration
 # (BRAVO_CONFIG_LOADER.ps1) — так само, як RUNTIME_MANIFEST/TOOLS_MANIFEST
 # гейти вище, provalidовано на РЕАЛЬНОМУ staged-вмісті, не на джерелі.
@@ -212,8 +225,23 @@ $productionEntryPointGuardTargets = @(
     'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1',
     'BRAVO_SETUP.ps1',
     'BRAVO_CREDENTIALS_SETUP.ps1',
-    'BRAVO_CONFIG_TEST.ps1'
+    'BRAVO_CONFIG_TEST.ps1',
+    'BRAVO_BAZA_RECONCILE.ps1',
+    'BRAVO_DRY_RUN.ps1',
+    'BRAVO_NOTIFICATION_TEST.ps1',
+    'BRAVO_RESTORE_TEST.ps1',
+    'BRAVO_TASKS_DIAGNOSE.ps1',
+    'BRAVO_TASKS_INSTALL.ps1',
+    'BRAVO_TASKS_UNINSTALL.ps1'
 )
+
+# BRAVO.config більше не входить у staged-комплект (B4-2). Явна перевірка
+# відсутності — щоб регресія (файл випадково знову потрапив у git tree)
+# провалила release-artifact build детерміністично, а не мовчки.
+if (Test-Path -LiteralPath (Join-Path $stagingDir 'BRAVO.config') -PathType Leaf) {
+    throw 'Гейт LEGACY_CONFIG_REMOVED (issue #216, B4-2): BRAVO.config неочікувано присутній у staged-комплекті — файл мав бути прибраний з git tracking.'
+}
+Write-Host 'Гейт LEGACY_CONFIG_REMOVED (issue #216, B4-2): BRAVO.config відсутній у staged-комплекті.'
 $legacyConfigAutoExecGuardMissing = New-Object System.Collections.Generic.List[string]
 foreach ($relativeGuardTarget in $productionEntryPointGuardTargets) {
     $guardTargetPath = Join-Path $stagingDir $relativeGuardTarget
