@@ -42,6 +42,16 @@ $script:CapturedGlobalNames = @(
     'lunchArchiveRetentionMonths', 'sftpHostTemplate', 'sftpPort',
     'sftpHostKey', 'sftpConnectionTimeoutSeconds',
     'effectiveLimsRoot', 'systemLogRoot', 'backupRootPath',
+    # Issue #216, сьоме коло ревю ("Keep escapable noncatalog overrides in
+    # the session model"): requireAdministrator раніше НЕ захоплювався
+    # тут — Get-BRAVOConfiguratorModel/Update-BRAVOConfiguratorEffective
+    # не могли отримати ані DefaultValue, ані EffectiveValue для цього
+    # листа взагалі (порожнє значення завжди), хоча він тепер бере участь
+    # у session-preservation Model-рядку (Case C, Model.psm1). Без цього
+    # захоплення неможливо довести "Effective дійсно відповідає canonical
+    # loader" — ані для non-escapable (canonical default true), ані для
+    # escapable-прийнятого (значення override) шляху.
+    'requireAdministrator',
     # 5.2.2 reconciliation: canonical storage/synchronization effective-
     # resolvers (modules/BRAVO.Discovery). componentSettings саме по собі
     # завжди RAW (master ніколи не мутує дочірні прапорці) — тому

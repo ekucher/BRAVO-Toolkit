@@ -19,7 +19,7 @@
     ModuleVersion = '5.3.0'
     GUID = 'e5a7b6c4-0f5e-4c0e-af6c-5e6f7081a2b3'
     PowerShellVersion = '5.1'
-    FunctionsToExport = @('Get-BRAVOConfiguratorSchemaCatalog', 'Get-BRAVOConfiguratorDocumentedOverridePaths', 'Test-BRAVOConfiguratorSchemaCompleteness')
+    FunctionsToExport = @('Get-BRAVOConfiguratorSchemaCatalog', 'Get-BRAVOConfiguratorDocumentedOverridePaths', 'Test-BRAVOConfiguratorSchemaCompleteness', 'Resolve-BRAVOConfiguratorFieldAuthorization')
     VariablesToExport = @()
     CmdletsToExport = @()
     AliasesToExport = @()
@@ -113,7 +113,7 @@
 
         # ===== Maintenance / 7-Zip =====
         @{ Path = 'maintenanceSettings.Archiver.CommandTimeoutSeconds'; Group = 'Maintenance'; Section = 'SevenZip'; Label = 'Таймаут 7-Zip команди (с)'; Description = ''; Type = 'Integer'; Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 10 }
-        @{ Path = 'maintenanceSettings.Logging.Level'; Group = 'Maintenance'; Section = 'SevenZip'; Label = 'Рівень логування обслуговування'; Description = ''; Type = 'Enum'; AllowedValues = @('TRACE', 'DEBUG', 'INFO', 'WARNING', 'ERROR', 'FATAL'); Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 20 }
+        @{ Path = 'maintenanceSettings.Logging.Level'; Group = 'Maintenance'; Section = 'SevenZip'; Label = 'Рівень логування обслуговування'; Description = ''; Type = 'Enum'; AllowedValues = @('DEBUG', 'INFO', 'WARNING', 'ERROR', 'SUCCESS'); Phase = 1; Advanced = $true; ReadOnly = $false; Secret = $false; Order = 20 }
 
         # ===== Components (componentSettings) — фаза 1 =====
         @{ Path = 'componentSettings.Archive.MODEL'; Group = 'Components'; Section = 'Archive'; Label = 'Архівація MODEL'; Description = ''; Type = 'Boolean'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }
@@ -215,6 +215,19 @@
 
         # ===== Health / BAZA append-only двигун =====
         @{ Path = 'backupMonitoring.SFTP.BAZA.Mode'; Group = 'Health'; Section = 'BAZA'; Label = 'Режим BAZA-синхронізації'; Description = 'IncrementalAppendOnly | Legacy.'; Type = 'Enum'; AllowedValues = @('IncrementalAppendOnly', 'Legacy'); Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 10 }
+        # PR #224 review (P2, четверте коло): дескриптор існує ВИКЛЮЧНО для
+        # recovery-механізму (detect/read-only/Clear) вже наявного legacy-
+        # override — не робить лист звичайним site-налаштуванням. Канонічна
+        # авторизація (DENY_SECURITY_CONTROL, WeakeningOverride='None' —
+        # BRAVO.Configuration.Schema.psm1) лишається єдиним джерелом істини
+        # для editability; Resolve-BRAVOConfiguratorFieldAuthorization
+        # примусово встановлює ReadOnly=$true для цього Path незалежно від
+        # статичного ReadOnly нижче (та сама похідна семантика, що вже діє
+        # для BAZA.Mode вище). AllowedValues=@('Fail') відображає єдине
+        # підтримуване BazaSync-значення ([ValidateSet('Fail')],
+        # BRAVO.BazaSync.psm1) — інформаційно, не як пропозицію нового
+        # редагованого значення.
+        @{ Path = 'backupMonitoring.SFTP.BAZA.MutationPolicy'; Group = 'Health'; Section = 'BAZA'; Label = 'Політика обробки мутацій BAZA'; Description = 'Security-controlled (append-only-цілісність BAZA) — єдине підтримуване значення Fail; наявний legacy-override можна лише прибрати (Clear), не редагувати.'; Type = 'Enum'; AllowedValues = @('Fail'); Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 15 }
         @{ Path = 'backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth'; Group = 'Health'; Section = 'BAZA'; Label = 'Синхронізувати перед health'; Description = ''; Type = 'Boolean'; Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 20 }
         @{ Path = 'backupMonitoring.SFTP.BAZA.FastHealthEnabled'; Group = 'Health'; Section = 'BAZA'; Label = 'Швидкий health-режим'; Description = ''; Type = 'Boolean'; Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 30 }
         @{ Path = 'backupMonitoring.SFTP.BAZA.FullAuditEnabled'; Group = 'Health'; Section = 'BAZA'; Label = 'Повний аудит увімкнено'; Description = ''; Type = 'Boolean'; Phase = 2; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 40 }

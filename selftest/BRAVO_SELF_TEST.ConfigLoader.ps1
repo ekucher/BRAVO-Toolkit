@@ -179,6 +179,182 @@ try {
         -Name "ConfigLoader/LocalOverridesApplyAcrossBothPhasesWithDerivations" `
         -Failure "BRAVO.local.config має перевизначати первинні поля ДО деривацій (BackupRoot -> archiveDirs.Model; BootRestoreMode -> Recovery.Enabled=True) і пізні leaf-поля (поріг BAZA=77), з обліком у metadata (4 ключі); отримано: '$localCfgProbeLast'"
 
+    # --- PR #224 review, F1: вкладений (nested hashtable) Node-шлях
+    # local override реально доходить до merge/global-стану ЦІЛИМ
+    # loader-конвеєром (не лише unit-виклик authorization-функції).
+    # bravoSettings.NotificationRouting.SUCCESS/WARNING —
+    # ALLOW_WITH_VALIDATOR-листи; ДО F1 такий вкладений override
+    # помилково провалювався в авторизації з
+    # MissingAuthorizationPolicy/UNREGISTERED, бо реєстр — leaf-only.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'bravoSettings.NotificationRouting' = @{`r`n" +
+        "        'SUCCESS' = 'general'`r`n" +
+        "        'WARNING' = 'alerts'`r`n" +
+        "    }`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgNestedProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'{0}|{1}' -f [string]`$global:bravoSettings.NotificationRouting.SUCCESS, " +
+            "[string]`$global:bravoSettings.NotificationRouting.WARNING " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgNestedProbeLast = ([string](@($localCfgNestedProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgNestedProbeLast -eq 'general|alerts') `
+        -Name "ConfigLoader/NestedNodeOverrideReachesMergeAndAppliesPerLeaf" `
+        -Failure "вкладений (hashtable-значення) Node-override bravoSettings.NotificationRouting мусить пройти авторизацію по кожному дочірньому листу окремо й дійти до merge/global стану; отримано: '$localCfgNestedProbeLast'"
+
+    # --- Loader/DefaultLogLevelWhitespaceCompatibility (PR #224 review,
+    # четвертий раунд, P2 "Preserve trimming for defaultLogLevel"):
+    # defaultLogLevel=' ERROR ' (пробіли навколо) мусить пройти весь
+    # loader-конвеєр БЕЗ throw — доведена pre-Wave-2 tolerance, бо
+    # Write-Log сам робить .Trim().ToUpperInvariant() перед використанням
+    # значення. Регресія перевіряється через реальний Import-BravoConfiguration
+    # (не лише ізольований виклик валідатора вище).
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'defaultLogLevel' = ' ERROR '`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgDefaultLogLevelProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'NOTHREW:' + [string]`$global:defaultLogLevel " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgDefaultLogLevelProbeLast = ([string](@($localCfgDefaultLogLevelProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgDefaultLogLevelProbeLast -eq 'NOTHREW: ERROR') `
+        -Name "Loader/DefaultLogLevelWhitespaceCompatibility" `
+        -Failure "defaultLogLevel=' ERROR ' (з пробілами) мусить проходити реальний Import-BravoConfiguration без throw і без мутації сирого значення; отримано: '$localCfgDefaultLogLevelProbeLast'"
+
+    # --- Loader/OutputEncodingCodePageZeroCompatibility (PR #224 review,
+    # п'яте коло, P2 "Permit the valid Windows code page zero"):
+    # consoleSettings.OutputEncodingCodePage=0 мусить проходити весь
+    # loader-конвеєр БЕЗ throw — [System.Text.Encoding]::GetEncoding(0),
+    # реальний production-споживач (BRAVO.Archive.Runtime.ps1), сам
+    # приймає 0 (системна ANSI code page). Регресія перевіряється через
+    # реальний Import-BravoConfiguration (не лише ізольований виклик
+    # валідатора вище).
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'consoleSettings.OutputEncodingCodePage' = 0`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgCodePageProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'NOTHREW:' + [string]`$global:consoleSettings.OutputEncodingCodePage " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgCodePageProbeLast = ([string](@($localCfgCodePageProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgCodePageProbeLast -eq 'NOTHREW:0') `
+        -Name "Loader/OutputEncodingCodePageZeroCompatibility" `
+        -Failure "consoleSettings.OutputEncodingCodePage=0 мусить проходити реальний Import-BravoConfiguration без throw; отримано: '$localCfgCodePageProbeLast'"
+
+    # --- Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException
+    # (PR #224 review, шосте коло, P2 "IntegerRange overflow hardening"):
+    # sftpPort=[uint64]::MaxValue МУСИТЬ і надалі fail-closed зупиняти
+    # завантаження (ValidatorRejected — canonical авторизаційний контракт
+    # незмінний), АЛЕ керованим throw ("неавторизоване перевизначення" з
+    # loader-а), НЕ неконтрольованим .NET OverflowException від звуження
+    # [int64] усередині Test-BRAVOConfigurationAuthorizationIntegerRange.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'sftpPort' = 18446744073709551615`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgSftpPortProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'UNEXPECTED-NOTHREW' " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgSftpPortProbeLast = ([string](@($localCfgSftpPortProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition (
+            $localCfgSftpPortProbeLast.StartsWith('CHILD-ERROR:') -and
+            $localCfgSftpPortProbeLast.Contains('BRAVO.local.config: неавторизоване перевизначення') -and
+            $localCfgSftpPortProbeLast.Contains('sftpPort') -and
+            (-not $localCfgSftpPortProbeLast.Contains('OverflowException')) -and
+            (-not $localCfgSftpPortProbeLast.Contains('overflow'))
+        ) `
+        -Name "Loader/SftpPortOversizedValueFailsClosedWithoutOverflowException" `
+        -Failure "sftpPort=[uint64]::MaxValue мусить fail-closed зупинити завантаження КЕРОВАНИМ throw ('неавторизоване перевизначення'), БЕЗ OverflowException; отримано: '$localCfgSftpPortProbeLast'"
+
+    # --- Loader/MaintenanceLoggingSuccessLoadsSuccessfully (PR #224 review,
+    # шосте коло, P2 "Restrict maintenance log levels to runtime-supported
+    # values"): SUCCESS — runtime-підтримуваний рівень (Maintenance
+    # startup-gate), мусить проходити реальний Import-BravoConfiguration
+    # без throw.
+    [IO.File]::WriteAllText($localCfgOverridePath, (
+        "@{`r`n" +
+        "    'maintenanceSettings.Logging.Level' = 'SUCCESS'`r`n" +
+        "}`r`n"
+    ), (New-Object System.Text.UTF8Encoding $false))
+    $localCfgMlSuccessProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+            "Set-StrictMode -Version 2.0; " +
+            "try { " +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+            "'NOTHREW:' + [string]`$global:maintenanceSettings.Logging.Level " +
+            "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+        ) 2>&1
+    $localCfgMlSuccessProbeLast = ([string](@($localCfgMlSuccessProbe)[-1])).Trim()
+    Test-BRAVOCondition `
+        -Condition ($localCfgMlSuccessProbeLast -eq 'NOTHREW:SUCCESS') `
+        -Name "Loader/MaintenanceLoggingSuccessLoadsSuccessfully" `
+        -Failure "maintenanceSettings.Logging.Level='SUCCESS' мусить проходити реальний Import-BravoConfiguration без throw; отримано: '$localCfgMlSuccessProbeLast'"
+
+    # --- Loader/MaintenanceLoggingTraceRejectedByCanonicalAuthorization /
+    # Loader/MaintenanceLoggingFatalRejectedByCanonicalAuthorization ---
+    # TRACE/FATAL мусять бути відхилені canonical авторизацією НА ЕТАПІ
+    # завантаження конфігурації — керованим throw ('неавторизоване
+    # перевизначення'), а НЕ пропущені далі до того, як Maintenance
+    # startup-gate сам впаде з непрозорим exit 30.
+    foreach ($mlUnsupported in @('TRACE', 'FATAL')) {
+        [IO.File]::WriteAllText($localCfgOverridePath, (
+            "@{`r`n" +
+            "    'maintenanceSettings.Logging.Level' = '$mlUnsupported'`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding $false))
+        $localCfgMlUnsupportedProbe = & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command (
+                "Set-StrictMode -Version 2.0; " +
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$localCfgScenarioRoot' -RuntimeRoot '$root'); " +
+                "'UNEXPECTED-NOTHREW' " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+            ) 2>&1
+        $localCfgMlUnsupportedProbeLast = ([string](@($localCfgMlUnsupportedProbe)[-1])).Trim()
+        Test-BRAVOCondition `
+            -Condition (
+                $localCfgMlUnsupportedProbeLast.StartsWith('CHILD-ERROR:') -and
+                $localCfgMlUnsupportedProbeLast.Contains('BRAVO.local.config: неавторизоване перевизначення') -and
+                $localCfgMlUnsupportedProbeLast.Contains('maintenanceSettings.Logging.Level')
+            ) `
+            -Name "Loader/MaintenanceLogging$($mlUnsupported.Substring(0,1) + $mlUnsupported.Substring(1).ToLowerInvariant())RejectedByCanonicalAuthorization" `
+            -Failure "maintenanceSettings.Logging.Level='$mlUnsupported' мусить бути відхилений canonical авторизацією ПІД ЧАС завантаження конфігурації (не пропущений до Maintenance startup-gate); отримано: '$localCfgMlUnsupportedProbeLast'"
+    }
+
     # --- Опечатка в dot-шляху -> помилка конфігурації (не мовчазне ігнорування).
     [IO.File]::WriteAllText($localCfgOverridePath,
         "@{ 'pathSettings.NoSuchKeyRoot.Sub' = 'x' }",
@@ -1189,6 +1365,18 @@ try {
     # BRAVO.config відсутній, BRAVO.local.config встановлює
     # requireAdministrator=$false -> МАЄ БЛОКУВАТИ (той самий вектор обходу
     # pre-trust guard, що backupConsistency.Mode вище).
+    #
+    # Issue #216, Wave 2: requireAdministrator тепер класифікований
+    # DENY_SECURITY_CONTROL у canonical authorization-реєстрі, тому
+    # звичайний BRAVO.local.config-шлях блокується РАНІШЕ —
+    # Test-BRAVOConfigurationOverrideAuthorization (pre-merge), а не лише
+    # Test-BRAVOEffectiveSecurityInvariants (post-merge, 'ПОСЛАБЛЮЄ
+    # ЗАХИСТ'). Обидва повідомлення приймаються тут як доказ блокування:
+    # Wave 1 POST-merge інваріант і далі незалежно перевіряється напряму
+    # (ConfigLoader/RequireAdministratorInvariantOwnNonBooleanBranch,
+    # ConfigLoader/RequireAdministratorMissingBlocks нижче — обидва
+    # викликають Test-BRAVOEffectiveSecurityInvariants НАПРЯМУ, в обхід
+    # Wave 2, і лишаються незміненими).
     $reqAdminFalseBody = (
         "@{`r`n" +
         "    'pathSettings.BackupRoot' = '$reqAdminBackupRootLiteral'`r`n" +
@@ -1200,10 +1388,10 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $reqAdminNoConfigResult.StartsWith('THREW') -and
-            $reqAdminNoConfigResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ')
+            ($reqAdminNoConfigResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -or $reqAdminNoConfigResult.Contains('неавторизоване перевизначення'))
         ) `
         -Name "ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedNoConfig" `
-        -Failure "BRAVO.config відсутній + BRAVO.local.config встановлює requireAdministrator=`$false -> МАЄ БЛОКУВАТИ; отримано: $reqAdminNoConfigResult"
+        -Failure "BRAVO.config відсутній + BRAVO.local.config встановлює requireAdministrator=`$false -> МАЄ БЛОКУВАТИ (Wave 1 post-merge АБО Wave 2 pre-merge); отримано: $reqAdminNoConfigResult"
 
     # --- ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedWithPrimary:
     # те саме, але BRAVO.config ПРИСУТНІЙ — local override все одно
@@ -1213,10 +1401,10 @@ try {
     Test-BRAVOCondition `
         -Condition (
             $reqAdminWithPrimaryResult.StartsWith('THREW') -and
-            $reqAdminWithPrimaryResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ')
+            ($reqAdminWithPrimaryResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -or $reqAdminWithPrimaryResult.Contains('неавторизоване перевизначення'))
         ) `
         -Name "ConfigLoader/RequireAdministratorDowngradeViaLocalConfigBlockedWithPrimary" `
-        -Failure "BRAVO.config присутній + BRAVO.local.config встановлює requireAdministrator=`$false -> МАЄ БЛОКУВАТИ; отримано: $reqAdminWithPrimaryResult"
+        -Failure "BRAVO.config присутній + BRAVO.local.config встановлює requireAdministrator=`$false -> МАЄ БЛОКУВАТИ (Wave 1 post-merge АБО Wave 2 pre-merge); отримано: $reqAdminWithPrimaryResult"
 
     # --- ConfigLoader/RequireAdministratorDowngradeAllowedWithExplicitOverride:
     # BRAVO_ALLOW_WEAKENED_SECURITY=1 дозволяє свідоме послаблення (з
@@ -1312,6 +1500,254 @@ Test-BRAVOCondition `
     ) `
     -Name "ConfigLoader/RequireAdministratorMissingBlocks" `
     -Failure "відсутній `$global:requireAdministrator (не просто `$false) МАЄ БЛОКУВАТИ з окремим діагностичним повідомленням 'requireAdministrator відсутній'; отримано: $reqAdminMissingResult"
+
+# ============================================================
+# Issue #216, Wave 2 review-фікс: backupMonitoring.SFTP.BAZA.Mode/
+# .MutationPolicy — owner-decision листи, для яких DENY_SECURITY_CONTROL
+# класифікація САМА ПО СОБІ не надає доступу до BRAVO_ALLOW_WEAKENED_SECURITY
+# escape hatch (на відміну від requireAdministrator вище). BAZA
+# append-only/mutation-detection цілісність — той самий клас гарантії,
+# що .claude/rules/07-bravo-runtime-invariants.md вимагає окремого
+# свідомого рішення власника для послаблення (як AutoArchiveMutationThreshold),
+# а не побічного входження через загальний клас-based escape hatch.
+# Незалежний рев'ювер (Wave 2, раунд 1) знайшов, що документація
+# твердила про "безумовну" відмову, а код фактично поширював генеричний
+# DENY_SECURITY_CONTROL escape hatch і на ЦІ листи — цей блок:
+#   (a) доводить, що звичайний шлях блокує (як і всі DENY_SECURITY_CONTROL);
+#   (b) доводить, що BRAVO_ALLOW_WEAKENED_SECURITY=1 НЕ відкриває їх
+#       (на відміну від requireAdministrator/backupConsistency.Mode) —
+#       саме цього e2e-доказу раніше бракувало.
+# ============================================================
+$bazaModeBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_BAZAMODE_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($bazaModeBackupRootDir)
+$bazaModeBackupRootLiteral = $bazaModeBackupRootDir.Replace("'", "''")
+$bazaModeResultExpression = (
+    "'RESULT:BazaMode=' + [string]`$global:backupMonitoring.SFTP.BAZA.Mode"
+)
+try {
+    $bazaModeOverrideBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$bazaModeBackupRootLiteral'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'`r`n" +
+        "}`r`n"
+    )
+
+    # --- ConfigLoader/BazaModeDowngradeBlockedNoConfig: звичайний шлях
+    # МАЄ блокувати (як і будь-який інший DENY_SECURITY_CONTROL-лист).
+    $bazaModeNoConfigResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $bazaModeOverrideBody -ResultExpression $bazaModeResultExpression
+    Test-BRAVOCondition `
+        -Condition (
+            $bazaModeNoConfigResult.StartsWith('THREW') -and
+            $bazaModeNoConfigResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "ConfigLoader/BazaModeDowngradeBlockedNoConfig" `
+        -Failure "BRAVO.local.config встановлює backupMonitoring.SFTP.BAZA.Mode='Legacy' -> МАЄ БЛОКУВАТИ; отримано: $bazaModeNoConfigResult"
+
+    # --- ConfigLoader/BazaModeDowngradeNotEscapableWithWeakenedSecurity:
+    # КЛЮЧОВИЙ тест цього блоку — на відміну від requireAdministrator/
+    # backupConsistency.Mode, BRAVO_ALLOW_WEAKENED_SECURITY=1 НЕ повинен
+    # відкривати BAZA.Mode: очікується ТЕ САМЕ блокування, що й без
+    # env-змінної.
+    $bazaModeEscapeAttemptResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $bazaModeOverrideBody -AllowWeakenedEnvValue '1' `
+        -ResultExpression $bazaModeResultExpression
+    Test-BRAVOCondition `
+        -Condition (
+            $bazaModeEscapeAttemptResult.StartsWith('THREW') -and
+            $bazaModeEscapeAttemptResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "ConfigLoader/BazaModeDowngradeNotEscapableWithWeakenedSecurity" `
+        -Failure "BRAVO_ALLOW_WEAKENED_SECURITY=1 НЕ повинен відкривати backupMonitoring.SFTP.BAZA.Mode (owner-decision лист, безумовна відмова) — на відміну від requireAdministrator; отримано: $bazaModeEscapeAttemptResult"
+
+    # --- ConfigLoader/BazaMutationPolicyDowngradeNotEscapableWithWeakenedSecurity:
+    # той самий доказ для сусіднього MutationPolicy-листа (та сама
+    # append-only-гарантія BAZA, той самий клас ризику).
+    $bazaMutationPolicyOverrideBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$bazaModeBackupRootLiteral'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'AllowOverwrite'`r`n" +
+        "}`r`n"
+    )
+    $bazaMutationPolicyEscapeAttemptResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $bazaMutationPolicyOverrideBody -AllowWeakenedEnvValue '1' `
+        -ResultExpression $bazaModeResultExpression
+    Test-BRAVOCondition `
+        -Condition (
+            $bazaMutationPolicyEscapeAttemptResult.StartsWith('THREW') -and
+            $bazaMutationPolicyEscapeAttemptResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "ConfigLoader/BazaMutationPolicyDowngradeNotEscapableWithWeakenedSecurity" `
+        -Failure "BRAVO_ALLOW_WEAKENED_SECURITY=1 НЕ повинен відкривати backupMonitoring.SFTP.BAZA.MutationPolicy (owner-decision лист, безумовна відмова); отримано: $bazaMutationPolicyEscapeAttemptResult"
+} finally {
+    Remove-Item -LiteralPath $bazaModeBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================
+# PR #224 third review, final cleanup: BRAVO_CONFIG_LOADER.ps1 більше
+# не інтерпретує WeakeningOverride/BRAVO_ALLOW_WEAKENED_SECURITY
+# самостійно — Complete-BRAVOConfigurationLoad делегує рішення "чи ЦЕЙ
+# Path escapable ЗАРАЗ" canonical Test-BRAVOConfigurationWeakeningEscapeHatchAllowed
+# (BRAVO.Configuration.Schema.psm1), тій самій функції, яку викликає
+# Configurator-preview. Блоки вище (requireAdministrator/BAZA.Mode/
+# BAZA.MutationPolicy, кожен окремо) уже e2e-доводять, що рефакторинг
+# зберіг поведінку через реальний Import-BravoConfiguration — цей блок
+# додає лише те, чого не було: (a) явні тести з іменами, які прямо
+# називають canonical-helper-делегування, і (b) ключовий MIXED-кейс —
+# ОДИН escapable-лист (requireAdministrator) РАЗОМ з ОДНИМ hard-листом
+# (BAZA.Mode) в ОДНОМУ файлі з BRAVO_ALLOW_WEAKENED_SECURITY=1: увесь
+# шар мусить fail-closed атомарно, бо хоча б одне порушення лишається
+# невирішеним — старий inline-код (2 окремі Where-Object-партиції +
+# один спільний env-прапор) і новий canonical-helper-код дають той
+# самий результат ТІЛЬКИ якщо helper дійсно застосовується ПЕР-VIOLATION,
+# а не глобально.
+# ============================================================
+$weakeningCleanupBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_WEAKENCLEANUP_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($weakeningCleanupBackupRootDir)
+$weakeningCleanupBackupRootLiteral = $weakeningCleanupBackupRootDir.Replace("'", "''")
+
+function New-BRAVOConfigLoaderWeakeningMixedProbe {
+    param(
+        [Parameter(Mandatory = $true)][string]$LocalConfigBody,
+        [string]$AllowWeakenedEnvValue = ''
+    )
+    $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_WEAKENCLEANUP_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($scenarioRoot)
+    try {
+        [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.local.config'), $LocalConfigBody, (New-Object System.Text.UTF8Encoding($false)))
+        $envPrefix = if (-not [string]::IsNullOrWhiteSpace($AllowWeakenedEnvValue)) {
+            "`$env:BRAVO_ALLOW_WEAKENED_SECURITY = '$AllowWeakenedEnvValue'; "
+        } else {
+            ''
+        }
+        # Той самий доказ атомарності, що New-BRAVOConfigLoaderAtomicityProbe
+        # вище (archiveRetentionDays лишається <unset> на throw) — тут
+        # додатково перевіряємо requireAdministrator, бо саме цей лист
+        # проходить через escape-hatch-гілку коду, яку рефакторинг змінив.
+        $probeCommand = (
+            "try { $envPrefix" +
+            ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+            "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+            "'NOTHREW:ArchiveRetentionDays=' + [string]`$global:archiveRetentionDays " +
+            "} catch { " +
+            "`$archiveVar = Get-Variable -Name 'archiveRetentionDays' -Scope Global -ErrorAction SilentlyContinue; " +
+            "`$archiveState = if (`$null -eq `$archiveVar) { '<unset>' } else { [string]`$archiveVar.Value }; " +
+            "`$reqAdminVar = Get-Variable -Name 'requireAdministrator' -Scope Global -ErrorAction SilentlyContinue; " +
+            "`$reqAdminState = if (`$null -eq `$reqAdminVar) { '<unset>' } else { [string]`$reqAdminVar.Value }; " +
+            "'THREW:' + `$_.Exception.Message + ';ArchiveRetentionDaysAfterThrow=' + `$archiveState + ';ReqAdminAfterThrow=' + `$reqAdminState" +
+            "}"
+        )
+        $probeOutput = [string](
+            & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+        )
+        return $probeOutput.Trim()
+    } finally {
+        Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+try {
+    # --- Loader/RequireAdministratorWeakeningRejectedWithoutEnv ---
+    $weakeningReqAdminOnlyBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "}`r`n"
+    )
+    $weakeningReqAdminNoEnvResult = New-BRAVOConfigLoaderWeakeningMixedProbe -LocalConfigBody $weakeningReqAdminOnlyBody
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningReqAdminNoEnvResult.StartsWith('THREW:') -and
+            $weakeningReqAdminNoEnvResult.Contains('неавторизоване перевизначення') -and
+            $weakeningReqAdminNoEnvResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+        ) `
+        -Name "Loader/RequireAdministratorWeakeningRejectedWithoutEnv" `
+        -Failure "requireAdministrator=`$false БЕЗ BRAVO_ALLOW_WEAKENED_SECURITY=1 мусить fail-closed через canonical helper (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed повертає `$false); отримано: $weakeningReqAdminNoEnvResult"
+
+    # --- Loader/RequireAdministratorWeakeningAllowedWithEnv ---
+    $weakeningReqAdminOnlyBody999 = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'archiveRetentionDays' = 999`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "}`r`n"
+    )
+    $weakeningReqAdminWithEnvResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningReqAdminOnlyBody999 -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition ($weakeningReqAdminWithEnvResult -eq 'NOTHREW:ArchiveRetentionDays=999') `
+        -Name "Loader/RequireAdministratorWeakeningAllowedWithEnv" `
+        -Failure "requireAdministrator=`$false З BRAVO_ALLOW_WEAKENED_SECURITY=1 мусить пройти через canonical helper (сусідній archiveRetentionDays=999 мусить застосуватись, шар НЕ відхилений); отримано: $weakeningReqAdminWithEnvResult"
+
+    # --- Loader/BazaModeNotEscapableWithWeakeningEnv ---
+    $weakeningBazaModeOnlyBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'`r`n" +
+        "}`r`n"
+    )
+    $weakeningBazaModeResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningBazaModeOnlyBody -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningBazaModeResult.StartsWith('THREW:') -and
+            $weakeningBazaModeResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "Loader/BazaModeNotEscapableWithWeakeningEnv" `
+        -Failure "backupMonitoring.SFTP.BAZA.Mode мусить лишитись fail-closed через canonical helper навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 (WeakeningOverride='None'); отримано: $weakeningBazaModeResult"
+
+    # --- Loader/BazaMutationPolicyNotEscapableWithWeakeningEnv ---
+    $weakeningBazaMutationPolicyOnlyBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'AllowOverwrite'`r`n" +
+        "}`r`n"
+    )
+    $weakeningBazaMutationPolicyResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningBazaMutationPolicyOnlyBody -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningBazaMutationPolicyResult.StartsWith('THREW:') -and
+            $weakeningBazaMutationPolicyResult.Contains('неавторизоване перевизначення')
+        ) `
+        -Name "Loader/BazaMutationPolicyNotEscapableWithWeakeningEnv" `
+        -Failure "backupMonitoring.SFTP.BAZA.MutationPolicy мусить лишитись fail-closed через canonical helper навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 (WeakeningOverride='None'); отримано: $weakeningBazaMutationPolicyResult"
+
+    # --- Loader/MixedEscapableAndHardViolationRejectsAtomically ---
+    # КЛЮЧОВИЙ тест цього блоку: requireAdministrator=$false (escapable)
+    # РАЗОМ з backupMonitoring.SFTP.BAZA.Mode='Legacy' (hard) в ОДНОМУ
+    # файлі, з BRAVO_ALLOW_WEAKENED_SECURITY=1. Якби рефакторинг помилково
+    # застосував helper ДО всього набору порушень одразу (напр. "чи БУДЬ-
+    # ЯКЕ порушення escapable"), а не ПЕР-violation, цей тест виявив би
+    # це — весь шар мусить відхилитись, і жоден сусідній ALLOW_SITE
+    # override (archiveRetentionDays) не повинен потрапити в ефективний
+    # стан навіть частково.
+    $weakeningMixedBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$weakeningCleanupBackupRootLiteral'`r`n" +
+        "    'archiveRetentionDays' = 999`r`n" +
+        "    'requireAdministrator' = `$false`r`n" +
+        "    'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'`r`n" +
+        "}`r`n"
+    )
+    $weakeningMixedResult = New-BRAVOConfigLoaderWeakeningMixedProbe `
+        -LocalConfigBody $weakeningMixedBody -AllowWeakenedEnvValue '1'
+    Test-BRAVOCondition `
+        -Condition (
+            $weakeningMixedResult.StartsWith('THREW:') -and
+            $weakeningMixedResult.Contains('неавторизоване перевизначення') -and
+            $weakeningMixedResult.Contains('backupMonitoring.SFTP.BAZA.Mode') -and
+            $weakeningMixedResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>') -and
+            $weakeningMixedResult.Contains('ReqAdminAfterThrow=<unset>')
+        ) `
+        -Name "Loader/MixedEscapableAndHardViolationRejectsAtomically" `
+        -Failure "requireAdministrator=`$false (escapable) + BAZA.Mode='Legacy' (hard) + BRAVO_ALLOW_WEAKENED_SECURITY=1 мусить відхилити ЦІЛИЙ local-override шар атомарно (жоден лист, у т.ч. escapable requireAdministrator чи сусідній ALLOW_SITE archiveRetentionDays, не повинен потрапити в ефективний стан); отримано: $weakeningMixedResult"
+} finally {
+    Remove-Item -LiteralPath $weakeningCleanupBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # ============================================================
 # P0 Configuration Foundation (PR C, Секція 5.5): МЕХАНІЧНИЙ доказ, що
@@ -1764,5 +2200,141 @@ Test-BRAVOCondition `
             -Failure "перелік оголошених BRAVO.config top-level `$global: мусить будуватись з AST (AssignmentStatementAst + VariablePath.IsGlobal), а не зі знімка глобальної області"
     } finally {
         Remove-Item -LiteralPath $strictnessBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Wave 2 (#216): атомарність авторизаційного шару BRAVO.local.config
+# =====================================================================
+# Наскрізний тест реального production-конвеєра loader-а (не лише
+# ізольованої Test-BRAVOConfigurationOverrideAuthorization) — доводить,
+# що ОДИН denied-лист у файлі з кількома override-ами зупиняє мердж ДО
+# того, як хоч ОДИН, у т.ч. валідний, override застосувався (WAVE2-CONTRACT.md,
+# розділ 11.2/11.6, тест-кейс 12).
+& {
+    $atomicityBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_AUTHATOMIC_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($atomicityBackupRootDir)
+    $atomicityBackupRootLiteral = $atomicityBackupRootDir.Replace("'", "''")
+
+    function New-BRAVOConfigLoaderAtomicityProbe {
+        param(
+            [Parameter(Mandatory = $true)][string]$LocalConfigBody
+        )
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AUTHATOMIC_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            [IO.File]::WriteAllText((Join-Path $scenarioRoot 'BRAVO.local.config'), $LocalConfigBody, (New-Object System.Text.UTF8Encoding($false)))
+            # Перевірка стану ВСЕРЕДИНІ catch — якщо Import-BravoConfiguration
+            # кидає виняток ДО Set-Variable-проєкції top-level ключів
+            # (Complete-BRAVOConfigurationLoad), $global:archiveRetentionDays
+            # НІКОЛИ не оголошується в цьому дочірньому процесі. Це прямий
+            # доказ атомарності (не лише "виняток кинуто", а "жоден валідний
+            # override з того самого файлу не потрапив у ефективний стан").
+            $probeCommand = (
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+                "'NOTHREW:ArchiveRetentionDays=' + [string]`$global:archiveRetentionDays " +
+                "} catch { " +
+                "`$archiveVar = Get-Variable -Name 'archiveRetentionDays' -Scope Global -ErrorAction SilentlyContinue; " +
+                "`$archiveState = if (`$null -eq `$archiveVar) { '<unset>' } else { [string]`$archiveVar.Value }; " +
+                "'THREW:' + `$_.Exception.Message + ';ArchiveRetentionDaysAfterThrow=' + `$archiveState" +
+                "}"
+            )
+            $probeOutput = [string](
+                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            )
+            return $probeOutput.Trim()
+        } finally {
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    try {
+        # --- Authorization/LoaderAtomicMergeRejectsWholeLocalLayer ---
+        # Один валідний ALLOW_SITE override (archiveRetentionDays) РАЗОМ з
+        # одним DENY_EXECUTION_CONTROL override (BravoName) в ОДНОМУ файлі.
+        $atomicityMixedBody = (
+            "@{`r`n" +
+            "    'pathSettings.BackupRoot' = '$atomicityBackupRootLiteral'`r`n" +
+            "    'archiveRetentionDays' = 999`r`n" +
+            "    'maintenanceSettings.Services.BravoName' = 'EvilService'`r`n" +
+            "}`r`n"
+        )
+        $atomicityMixedResult = New-BRAVOConfigLoaderAtomicityProbe -LocalConfigBody $atomicityMixedBody
+        Test-BRAVOCondition `
+            -Condition (
+                $atomicityMixedResult.StartsWith('THREW:') -and
+                $atomicityMixedResult.Contains('неавторизоване перевизначення') -and
+                $atomicityMixedResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+            ) `
+            -Name "Authorization/LoaderAtomicMergeRejectsWholeLocalLayer" `
+            -Failure "мішаний local-config (1 валідний ALLOW_SITE + 1 DENY_EXECUTION_CONTROL) мусить fail closed ЦІЛИМ шаром, і archiveRetentionDays НЕ повинен потрапити в ефективний `$global:-стан навіть частково; отримано: $atomicityMixedResult"
+
+        # --- Authorization/LoaderAtomicMergeSanityAllValidStillApplies ---
+        # Контрольний sanity-кейс: без denied-листа той самий валідний
+        # override застосовується нормально (доводить, що попередній тест
+        # не є хибним провалом самого archiveRetentionDays-шляху).
+        $atomicitySafeBody = (
+            "@{`r`n" +
+            "    'pathSettings.BackupRoot' = '$atomicityBackupRootLiteral'`r`n" +
+            "    'archiveRetentionDays' = 999`r`n" +
+            "}`r`n"
+        )
+        $atomicitySafeResult = New-BRAVOConfigLoaderAtomicityProbe -LocalConfigBody $atomicitySafeBody
+        Test-BRAVOCondition `
+            -Condition ($atomicitySafeResult -eq 'NOTHREW:ArchiveRetentionDays=999') `
+            -Name "Authorization/LoaderAtomicMergeSanityAllValidStillApplies" `
+            -Failure "той самий archiveRetentionDays=999 БЕЗ denied-листа мусить застосуватись нормально (sanity-контроль для атомарного тесту вище); отримано: $atomicitySafeResult"
+
+        # --- Authorization/LoaderRejectsDeniedLeafAloneWithSameMessage ---
+        $atomicityDenyOnlyBody = (
+            "@{`r`n" +
+            "    'pathSettings.BackupRoot' = '$atomicityBackupRootLiteral'`r`n" +
+            "    'maintenanceSettings.Services.BravoName' = 'EvilService'`r`n" +
+            "}`r`n"
+        )
+        $atomicityDenyOnlyResult = New-BRAVOConfigLoaderAtomicityProbe -LocalConfigBody $atomicityDenyOnlyBody
+        Test-BRAVOCondition `
+            -Condition (
+                $atomicityDenyOnlyResult.StartsWith('THREW:') -and
+                $atomicityDenyOnlyResult.Contains('неавторизоване перевизначення') -and
+                $atomicityDenyOnlyResult.Contains('maintenanceSettings.Services.BravoName')
+            ) `
+            -Name "Authorization/LoaderRejectsDeniedLeafAloneWithSameMessage" `
+            -Failure "лише denied-лист (без сусіднього валідного override) мусить так само fail closed з тим самим повідомленням, що називає точний шлях; отримано: $atomicityDenyOnlyResult"
+
+        # --- Authorization/LoaderAtomicMergeRejectsWholeLocalLayerNestedForm ---
+        # PR #224 review, F1 (section 4): дзеркало
+        # LoaderAtomicMergeRejectsWholeLocalLayer вище, але DENY-лист
+        # супроводжується ВКЛАДЕНОЮ (hashtable-значення) Node-формою
+        # (maintenanceSettings.Services = @{ BravoName = 'EvilService' }),
+        # не пласким dot-шляхом. Той самий ізольований (без BRAVO.config)
+        # probe, тому archiveRetentionDays справді <unset> до спроби —
+        # доводить, що вкладена форма fail-closed ЦІЛИМ loader-конвеєром
+        # ДО merge так само атомарно, як пласка.
+        $atomicityNestedBody = (
+            "@{`r`n" +
+            "    'pathSettings.BackupRoot' = '$atomicityBackupRootLiteral'`r`n" +
+            "    'archiveRetentionDays' = 999`r`n" +
+            "    'maintenanceSettings.Services' = @{`r`n" +
+            "        'BravoName' = 'EvilService'`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        )
+        $atomicityNestedResult = New-BRAVOConfigLoaderAtomicityProbe -LocalConfigBody $atomicityNestedBody
+        Test-BRAVOCondition `
+            -Condition (
+                $atomicityNestedResult.StartsWith('THREW:') -and
+                $atomicityNestedResult.Contains('неавторизоване перевизначення') -and
+                $atomicityNestedResult.Contains('maintenanceSettings.Services.BravoName') -and
+                $atomicityNestedResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+            ) `
+            -Name "Authorization/LoaderAtomicMergeRejectsWholeLocalLayerNestedForm" `
+            -Failure "вкладений (hashtable-значення) Node-override, чий єдиний дочірній лист DENY_EXECUTION_CONTROL, мусить fail closed ЦІЛИМ loader-конвеєром ДО merge (сусідній ALLOW_SITE archiveRetentionDays=999 НЕ повинен потрапити в `$global:-стан); отримано: $atomicityNestedResult"
+    } finally {
+        Remove-Item -LiteralPath $atomicityBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }

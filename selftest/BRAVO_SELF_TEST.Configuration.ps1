@@ -1505,6 +1505,1502 @@
 }
 
 # =====================================================================
+# Wave 2 (#216): авторизація local-override шляхів BRAVO.local.config
+# =====================================================================
+# Окремий child scope (& { ... }) — з тієї самої причини, що й решта
+# фрагментів вище: усі фрагменти self-test дот-сорсяться в ОДИН scope.
+& {
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+
+    $authDefaults = Get-BRAVODefaultConfiguration
+    $authSchema = Get-BRAVOConfigurationSchema -ReferenceConfiguration $authDefaults
+    $authRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $authLeaves = @(@($authSchema.Keys) | Where-Object { [string]$authSchema[$_].Kind -ne 'Node' })
+    $authKnownClasses = @('ALLOW_SITE', 'ALLOW_WITH_VALIDATOR', 'DENY_DERIVED', 'DENY_CREDENTIAL_BACKED', 'DENY_SECURITY_CONTROL', 'DENY_EXECUTION_CONTROL', 'DENY_INTERNAL_METADATA')
+
+    # --- Authorization/RegistryCoversEveryCanonicalLeaf ---
+    # Wave 2 (WAVE2-CONTRACT.md, розділ 8/11.3): кожен канонічний лист
+    # мусить мати ЯВНИЙ запис класу — мовчазний allow-by-omission
+    # заборонений архітектурним рішенням.
+    $authMissingLeaves = @(@($authLeaves) | Where-Object { -not $authRegistry.Contains([string]$_) })
+    $authOrphanEntries = @(@($authRegistry.Keys) | Where-Object { $authLeaves -notcontains [string]$_ })
+    Test-BRAVOCondition `
+        -Condition ($authMissingLeaves.Count -eq 0 -and $authOrphanEntries.Count -eq 0) `
+        -Name "Authorization/RegistryCoversEveryCanonicalLeaf" `
+        -Failure "авторизаційний реєстр мусить мати рівно один запис на кожен канонічний лист: відсутні=$($authMissingLeaves.Count) ($([string]::Join(', ', $authMissingLeaves))), осиротілі=$($authOrphanEntries.Count) ($([string]::Join(', ', $authOrphanEntries)))"
+
+    # --- Authorization/Exactly271CanonicalLeaves ---
+    Test-BRAVOCondition `
+        -Condition ($authLeaves.Count -eq 271) `
+        -Name "Authorization/Exactly271CanonicalLeaves" `
+        -Failure "WAVE2-CONTRACT.md фіксує рівно 271 канонічний лист; фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+
+    # --- Authorization/AllClassesRecognized ---
+    $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition ($authUnrecognizedClasses.Count -eq 0) `
+        -Name "Authorization/AllClassesRecognized" `
+        -Failure "кожен запис реєстру мусить використовувати один із 7 визнаних класів; знайдено невідомі: $([string]::Join(', ', $authUnrecognizedClasses))"
+
+    # --- Authorization/ClassCountsMatchContract ---
+    # Точні підрахунки з WAVE2-CONTRACT.md (розділ 1/7, owner-approved
+    # 2026-09-21): ALLOW_SITE=200, ALLOW_WITH_VALIDATOR=25, DENY_DERIVED=2,
+    # DENY_CREDENTIAL_BACKED=0, DENY_SECURITY_CONTROL=6,
+    # DENY_EXECUTION_CONTROL=21, DENY_INTERNAL_METADATA=17.
+    $authClassGroups = @($authRegistry.Values) | Group-Object { [string]$_.Class }
+    function Get-BRAVOAuthTestClassCount {
+        param([array]$Groups, [string]$ClassName)
+        $match = @(@($Groups) | Where-Object { $_.Name -eq $ClassName })
+        if ($match.Count -eq 0) { return 0 }
+        return $match[0].Count
+    }
+    $authAllowSiteCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'ALLOW_SITE'
+    $authAllowValidatorCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'ALLOW_WITH_VALIDATOR'
+    $authDenyDerivedCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_DERIVED'
+    $authDenyCredentialCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_CREDENTIAL_BACKED'
+    $authDenySecurityCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_SECURITY_CONTROL'
+    $authDenyExecutionCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_EXECUTION_CONTROL'
+    $authDenyInternalCount = Get-BRAVOAuthTestClassCount -Groups $authClassGroups -ClassName 'DENY_INTERNAL_METADATA'
+    # PR #224 review, N3 (2026-09-22): sftpDirectories.BAZA/BAZAWWW
+    # пере-класифіковано DENY_DERIVED -> ALLOW_SITE (доведено трасою:
+    # BRAVO.Configuration.Derivation.psm1:285-288, "sftpDirectories — уже
+    # повністю raw-параметр", пряма проєкція без деривації; та
+    # Get-BRAVOEffectiveSynchronizationConfiguration передає
+    # $SftpDirectories['BAZA']/['BAZAWWW'] as-is, без обчислення). ALLOW_SITE
+    # 200->202, DENY_DERIVED 2->0, TOTAL лишається 271, решта класів
+    # незмінні.
+    Test-BRAVOCondition `
+        -Condition (
+            $authAllowSiteCount -eq 202 -and $authAllowValidatorCount -eq 25 -and
+            $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
+            $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
+            $authDenyInternalCount -eq 17
+        ) `
+        -Name "Authorization/ClassCountsMatchContract" `
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(202) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(25) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+
+    # --- Authorization/EveryValidatorIdentifierResolves ---
+    # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,
+    # який РЕАЛЬНО диспетчерується (не кидає "невідомий ідентифікатор").
+    # Перевіряємо на заздалегідь відомому правдоподібному значенні для
+    # кожного validator-класу; для деяких валідаторів (Enum/IntegerRange)
+    # правдоподібне значення обчислюємо з самого ідентифікатора.
+    $authValidatorEntries = @(@($authRegistry.GetEnumerator()) | Where-Object { [string]$_.Value.Class -eq 'ALLOW_WITH_VALIDATOR' })
+    $authUnresolvedValidators = New-Object System.Collections.Generic.List[string]
+    foreach ($authEntry in $authValidatorEntries) {
+        $authValidatorId = [string]$authEntry.Value.Validator
+        $authProbeValue = $null
+        if ($authValidatorId.StartsWith('Enum:')) {
+            $authProbeValue = ($authValidatorId.Substring(5) -split ',')[0]
+        } elseif ($authValidatorId.StartsWith('IntegerRange:')) {
+            $authProbeValue = [int](($authValidatorId.Substring(13) -split ',')[0])
+        } elseif ($authValidatorId -eq 'WindowsCodePage') {
+            $authProbeValue = 65001
+        } elseif ($authValidatorId -eq 'DotNetEncodingName') {
+            $authProbeValue = 'UTF8'
+        } elseif ($authValidatorId.StartsWith('UrlArray:')) {
+            $authProbeValue = @('https://example.invalid/ip')
+        } elseif ($authValidatorId -eq 'TaskSchedulerPath') {
+            $authProbeValue = '\BRAVO\'
+        } elseif ($authValidatorId -eq 'NonEmptyString') {
+            $authProbeValue = 'probe-value'
+        }
+        try {
+            [void](Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId $authValidatorId -Value $authProbeValue -Path ([string]$authEntry.Key))
+        } catch {
+            [void]$authUnresolvedValidators.Add("$($authEntry.Key) -> $authValidatorId ($($_.Exception.Message))")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($authUnresolvedValidators.Count -eq 0) `
+        -Name "Authorization/EveryValidatorIdentifierResolves" `
+        -Failure "кожен Validator-ідентифікатор у реєстрі мусить реально диспетчеруватись Test-BRAVOConfigurationAuthorizationValidatorValue без throw; нерозв'язані: $([string]::Join(' | ', $authUnresolvedValidators))"
+
+    # --- Authorization/UnknownValidatorIdFailsClosed ---
+    $authUnknownValidatorThrew = $false
+    try {
+        [void](Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'NoSuchValidator:1,2' -Value 'x' -Path 'probe.path')
+    } catch {
+        $authUnknownValidatorThrew = $true
+    }
+    Test-BRAVOCondition `
+        -Condition $authUnknownValidatorThrew `
+        -Name "Authorization/UnknownValidatorIdFailsClosed" `
+        -Failure "невідомий ідентифікатор валідатора мусить FAIL CLOSED (throw), а не мовчазний accept"
+
+    # =====================================================================
+    # PR #224 review, п'яте коло (P2, "Permit the valid Windows code page
+    # zero"): production-споживач (consoleSettings.OutputEncodingCodePage,
+    # modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1:513) викликає
+    # [System.Text.Encoding]::GetEncoding($Value) НАПРЯМУ, а
+    # Encoding.GetEncoding(0) — ВАЛІДНИЙ .NET-виклик (системна ANSI code
+    # page за замовчуванням). Мінімум IntegerRange змінено з 1 на 0 —
+    # жодного окремого спецвипадку для 0, canonical Encoding.GetEncoding
+    # і далі вирішує, чи саме число розпізнається.
+    # =====================================================================
+
+    # --- Configuration/WindowsCodePageZeroAccepted ---
+    $wcpZeroResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 0 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition ([bool]$wcpZeroResult.IsValid) `
+        -Name "Configuration/WindowsCodePageZeroAccepted" `
+        -Failure "0 мусить бути прийнятий — [System.Text.Encoding]::GetEncoding(0) валідний .NET-виклик (системна ANSI code page); отримано IsValid=$($wcpZeroResult.IsValid) Message=$($wcpZeroResult.Message)"
+
+    # --- Configuration/WindowsCodePageKnownValidAccepted ---
+    $wcpKnownResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65001 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition ([bool]$wcpKnownResult.IsValid) `
+        -Name "Configuration/WindowsCodePageKnownValidAccepted" `
+        -Failure "65001 (UTF-8) мусить лишитись прийнятим після зміни мінімуму діапазону; отримано IsValid=$($wcpKnownResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageNegativeRejected ---
+    $wcpNegativeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value -1 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$wcpNegativeResult.IsValid) `
+        -Name "Configuration/WindowsCodePageNegativeRejected" `
+        -Failure "від'ємне значення (-1) мусить лишитись відхиленим — розширення діапазону стосується лише 0, не негативних чисел; отримано IsValid=$($wcpNegativeResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageTooLargeRejected ---
+    $wcpTooLargeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65536 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$wcpTooLargeResult.IsValid) `
+        -Name "Configuration/WindowsCodePageTooLargeRejected" `
+        -Failure "значення понад 65535 мусить лишитись відхиленим; отримано IsValid=$($wcpTooLargeResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageUnsupportedPositiveRejected ---
+    $wcpUnsupportedResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 99999999 -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpUnsupportedInRangeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65535 -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$wcpUnsupportedResult.IsValid) -and (-not [bool]$wcpUnsupportedInRangeResult.IsValid)) `
+        -Name "Configuration/WindowsCodePageUnsupportedPositiveRejected" `
+        -Failure "структурно допустиме, але .NET Encoding-ом нерозпізнаване число (напр. 65535, поза range у 99999999) мусить лишитись відхиленим canonical Encoding.GetEncoding; отримано OutOfRange.IsValid=$($wcpUnsupportedResult.IsValid) InRangeUnknown.IsValid=$($wcpUnsupportedInRangeResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageNonIntegerRejected ---
+    $wcpStringResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value '65001' -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpDecimalResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value 65001.5 -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpBoolResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value $true -Path 'consoleSettings.OutputEncodingCodePage'
+    $wcpNullResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'WindowsCodePage' -Value $null -Path 'consoleSettings.OutputEncodingCodePage'
+    Test-BRAVOCondition `
+        -Condition (
+            (-not [bool]$wcpStringResult.IsValid) -and (-not [bool]$wcpDecimalResult.IsValid) -and
+            (-not [bool]$wcpBoolResult.IsValid) -and (-not [bool]$wcpNullResult.IsValid)
+        ) `
+        -Name "Configuration/WindowsCodePageNonIntegerRejected" `
+        -Failure "рядок/дробове/Boolean/`$null мусять лишитись відхиленими; отримано String.IsValid=$($wcpStringResult.IsValid) Decimal.IsValid=$($wcpDecimalResult.IsValid) Bool.IsValid=$($wcpBoolResult.IsValid) Null.IsValid=$($wcpNullResult.IsValid)"
+
+    # --- Configuration/WindowsCodePageValidationDoesNotMutateOriginalValue ---
+    $wcpMutationProbeOverrides = @{ 'consoleSettings.OutputEncodingCodePage' = 0 }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $wcpMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([int]$wcpMutationProbeOverrides['consoleSettings.OutputEncodingCodePage'] -eq 0) `
+        -Name "Configuration/WindowsCodePageValidationDoesNotMutateOriginalValue" `
+        -Failure "валідація НЕ повинна мутувати вхідне значення на місці; отримано '$($wcpMutationProbeOverrides['consoleSettings.OutputEncodingCodePage'])' замість очікуваного 0"
+
+    # =====================================================================
+    # PR #224 review, шосте коло (P2, "IntegerRange overflow hardening"):
+    # Test-BRAVOConfigurationAuthorizationIntegerRange РАНІШЕ звужувала
+    # [double]$Value у [int64] ПЕРЕД порівнянням з Minimum/Maximum — для
+    # структурно цілого, але надто великого значення (напр.
+    # [uint64]::MaxValue, [decimal]::MaxValue) це звуження кидало
+    # OverflowException, порушуючи контракт "завжди структурований
+    # IsValid/Message, ніколи throw". Фікс порівнює як [double] НАПРЯМУ
+    # (Minimum/Maximum завжди [int], тож жодне число поза їхнім діапазоном
+    # не потребує звуження в [int64] взагалі) — без clamp/truncate/coerce,
+    # без per-path спецкоду.
+    # =====================================================================
+
+    # --- Configuration/IntegerRangeMinimumBoundaryAccepted / MaximumBoundaryAccepted ---
+    $irMinResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 0 -Path 'selftest.probe.IntegerRange'
+    $irMaxResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 100 -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition ([bool]$irMinResult.IsValid -and [bool]$irMaxResult.IsValid) `
+        -Name "Configuration/IntegerRangeBoundaryValuesAccepted" `
+        -Failure "точні межі діапазону (Minimum=0, Maximum=100) мусять бути прийняті; отримано Min.IsValid=$($irMinResult.IsValid) Max.IsValid=$($irMaxResult.IsValid)"
+
+    # --- Configuration/IntegerRangeJustBelowMinimumRejected / JustAboveMaximumRejected ---
+    $irBelowResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value -1 -Path 'selftest.probe.IntegerRange'
+    $irAboveResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 101 -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$irBelowResult.IsValid) -and (-not [bool]$irAboveResult.IsValid)) `
+        -Name "Configuration/IntegerRangeJustOutsideBoundsRejected" `
+        -Failure "значення на 1 поза межами (Minimum-1=-1, Maximum+1=101) мусять бути відхилені; отримано Below.IsValid=$($irBelowResult.IsValid) Above.IsValid=$($irAboveResult.IsValid)"
+
+    # --- Configuration/IntegerRangeFractionInRangeRejected ---
+    $irFractionResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value 50.5 -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$irFractionResult.IsValid) `
+        -Name "Configuration/IntegerRangeFractionInRangeRejected" `
+        -Failure "дробове значення в межах діапазону (50.5) мусить лишитись відхиленим — очікується ціле число; отримано IsValid=$($irFractionResult.IsValid)"
+
+    # --- Configuration/IntegerRangeNumericStringBoolNullRejected ---
+    $irStringResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value '50' -Path 'selftest.probe.IntegerRange'
+    $irBoolResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value $true -Path 'selftest.probe.IntegerRange'
+    $irNullResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value $null -Path 'selftest.probe.IntegerRange'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$irStringResult.IsValid) -and (-not [bool]$irBoolResult.IsValid) -and (-not [bool]$irNullResult.IsValid)) `
+        -Name "Configuration/IntegerRangeNumericStringBoolNullRejected" `
+        -Failure "рядок '50'/Boolean/`$null мусять лишитись відхиленими без коерсії; отримано String.IsValid=$($irStringResult.IsValid) Bool.IsValid=$($irBoolResult.IsValid) Null.IsValid=$($irNullResult.IsValid)"
+
+    # --- Configuration/IntegerRangeOversizedValuesRejectedWithoutOverflowException ---
+    # Основний регрес-тест: КОЖНЕ з цих значень раніше кидало
+    # OverflowException при звуженні [double] -> [int64]; тепер усі
+    # мусять повернути структурований IsValid=$false БЕЗ throw.
+    $irOversizedProbes = @(
+        @{ Label = 'Int64MaxValue'; Value = [int64]::MaxValue }
+        @{ Label = 'Int64MinValue'; Value = [int64]::MinValue }
+        @{ Label = 'UInt64MaxValue'; Value = [uint64]::MaxValue }
+        @{ Label = 'DecimalMaxValue'; Value = [decimal]::MaxValue }
+        @{ Label = 'LargeFractionalDouble'; Value = [double]1.7976931348623157E+300 }
+    )
+    $irOversizedThrew = New-Object System.Collections.Generic.List[string]
+    $irOversizedAcceptedWrongly = New-Object System.Collections.Generic.List[string]
+    foreach ($probe in $irOversizedProbes) {
+        try {
+            $irProbeResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,100' -Value $probe.Value -Path 'selftest.probe.IntegerRange'
+            if ([bool]$irProbeResult.IsValid) { [void]$irOversizedAcceptedWrongly.Add([string]$probe.Label) }
+        } catch {
+            [void]$irOversizedThrew.Add("$($probe.Label): $($_.Exception.Message)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($irOversizedThrew.Count -eq 0 -and $irOversizedAcceptedWrongly.Count -eq 0) `
+        -Name "Configuration/IntegerRangeOversizedValuesRejectedWithoutOverflowException" `
+        -Failure "структурно числові, але надто великі значення мусять повертати IsValid=`$false БЕЗ throw (жодного OverflowException від звуження [int64]); Threw=$([string]::Join(' | ', $irOversizedThrew)) AcceptedWrongly=$([string]::Join(', ', $irOversizedAcceptedWrongly))"
+
+    # --- Configuration/SftpPortOversizedValueRejectedNotException ---
+    # Наскрізна перевірка на РЕАЛЬНОМУ production-споживачі валідатора
+    # (sftpPort, IntegerRange:1,65535) — не лише на синтетичних межах.
+    $irSftpPortThrew = $false
+    $irSftpPortResult = $null
+    try {
+        $irSftpPortResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'sftpPort' = [uint64]::MaxValue } -Schema $authSchema
+    } catch {
+        $irSftpPortThrew = $true
+    }
+    $irSftpPortViolation = @($(if ($irSftpPortResult) { $irSftpPortResult.Violations | Where-Object { [string]$_.Path -eq 'sftpPort' } }))
+    Test-BRAVOCondition `
+        -Condition (
+            (-not $irSftpPortThrew) -and $null -ne $irSftpPortResult -and (-not [bool]$irSftpPortResult.IsValid) -and
+            $irSftpPortViolation.Count -eq 1 -and [string]$irSftpPortViolation[0].Reason -eq 'ValidatorRejected'
+        ) `
+        -Name "Configuration/SftpPortOversizedValueRejectedNotException" `
+        -Failure "sftpPort=[uint64]::MaxValue мусить повернутись як звичайне ValidatorRejected-порушення (canonical авторизація), НЕ як throw; отримано Threw=$irSftpPortThrew IsValid=$($irSftpPortResult.IsValid) ViolationCount=$($irSftpPortViolation.Count)"
+
+    # =====================================================================
+    # PR #224 review (P2, "Preserve precision when checking integer
+    # ranges"): Test-BRAVOConfigurationAuthorizationIntegerRange РАНІШЕ
+    # звужувала [decimal]$Value у [double] ПЕРЕД перевіркою дробової
+    # частини — double має лише ~15-17 значущих десяткових цифр, тож
+    # високоточний decimal (28-29 значущих цифр) міг округлитись рівно
+    # до цілого числа й хибно пройти fractional-перевірку, хоча реальне
+    # decimal-значення (яке й далі йде в merged-конфігурацію) лишається
+    # дробовим і меншим за верхню межу — конкретно
+    # robocopyMaxSuccessExitCode=6.9999999999999999999999999999D
+    # проходило б як 7 (валідний код успіху), хоча фактичний код
+    # завершення 7 мав би трактуватись як провал.
+    # =====================================================================
+
+    # --- Configuration/IntegerRangeHighPrecisionDecimalFractionRejected ---
+    $irHighPrecisionDecimalValue = [decimal]::Parse('6.9999999999999999999999999999', [System.Globalization.CultureInfo]::InvariantCulture)
+    $irHighPrecisionDecimalResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,7' -Value $irHighPrecisionDecimalValue -Path 'robocopyMaxSuccessExitCode'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$irHighPrecisionDecimalResult.IsValid) `
+        -Name "Configuration/IntegerRangeHighPrecisionDecimalFractionRejected" `
+        -Failure "високоточний дробовий decimal (6.9999999999999999999999999999, [double]-звуження округлює рівно до 7.0) мусить лишитись відхиленим як дробове значення, не проходити через double-precision-loss; отримано IsValid=$($irHighPrecisionDecimalResult.IsValid)"
+
+    # --- Configuration/IntegerRangeExactDecimalIntegerAccepted ---
+    # Негативний контроль: справжнє ціле decimal (без дробової частини)
+    # і далі мусить проходити — фікс не мав стати надто суворим.
+    $irExactDecimalValue = [decimal]7
+    $irExactDecimalResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,7' -Value $irExactDecimalValue -Path 'robocopyMaxSuccessExitCode'
+    Test-BRAVOCondition `
+        -Condition ([bool]$irExactDecimalResult.IsValid) `
+        -Name "Configuration/IntegerRangeExactDecimalIntegerAccepted" `
+        -Failure "справжнє ціле decimal-значення (7) у межах діапазону мусить бути прийняте; отримано IsValid=$($irExactDecimalResult.IsValid)"
+
+    # --- Authorization/AllowSiteAccepted ---
+    $authAllowSiteResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'archiveRetentionDays' = 45 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authAllowSiteResult.IsValid) `
+        -Name "Authorization/AllowSiteAccepted" `
+        -Failure "ALLOW_SITE лист (archiveRetentionDays) мусить бути прийнятий без додаткових умов"
+
+    # --- Authorization/AllowWithValidatorValidAccepted ---
+    $authValidValidatorResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyMaxSuccessExitCode' = 7 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authValidValidatorResult.IsValid) `
+        -Name "Authorization/AllowWithValidatorValidAccepted" `
+        -Failure "robocopyMaxSuccessExitCode=7 (в межах 0..7) мусить бути прийнятий"
+
+    # --- Authorization/AllowWithValidatorInvalidRejected ---
+    $authInvalidValidatorResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyMaxSuccessExitCode' = 8 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authInvalidValidatorResult.IsValid -and $authInvalidValidatorResult.Violations.Count -eq 1 -and [string]$authInvalidValidatorResult.Violations[0].Path -eq 'robocopyMaxSuccessExitCode') `
+        -Name "Authorization/AllowWithValidatorInvalidRejected" `
+        -Failure "robocopyMaxSuccessExitCode=8 (поза 0..7) мусить бути відхилений з точним rejected path"
+
+    # =====================================================================
+    # PR #224 review, N2: TaskSchedulerPath-валідатор раніше вимагав, щоб
+    # СИРЕ значення вже було у нормалізованій формі '\...\' — суворіше за
+    # канонічний runtime-контракт ConvertTo-BRAVOTaskPath
+    # (modules/BRAVO.System/BRAVO.System.psm1), який приймає 'BRAVO',
+    # '\BRAVO', 'BRAVO\' і нормалізує сам. Фікс — авторизація тепер РЕАЛЬНО
+    # викликає ConvertTo-BRAVOTaskPath (не дублює його regex-граматику) і
+    # трактує виняток як IsValid=$false. Матриця нижче доводить паритет
+    # прийняття/відхилення між авторизацією й самим нормалізатором на
+    # ідентичних значеннях.
+    # =====================================================================
+    if (-not (Get-Module -Name 'BRAVO.System')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psd1') -Force
+    }
+
+    $taskPathAcceptedValues = @('BRAVO', '\BRAVO', 'BRAVO\', '\BRAVO\', '  BRAVO', 'BRAVO  ', '\')
+    $taskPathParityMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($taskPathValue in $taskPathAcceptedValues) {
+        $normalizerThrew = $false
+        try { [void](ConvertTo-BRAVOTaskPath -TaskPath $taskPathValue) } catch { $normalizerThrew = $true }
+        $authResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $taskPathValue -Path 'schedulerSettings.TaskPath'
+        if ($normalizerThrew -or -not [bool]$authResult.IsValid) {
+            [void]$taskPathParityMismatches.Add("ACCEPT-case '$taskPathValue': normalizerThrew=$normalizerThrew authValid=$($authResult.IsValid)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($taskPathParityMismatches.Count -eq 0) `
+        -Name "Authorization/TaskSchedulerPathAcceptsHistoricalNormalizerForms" `
+        -Failure "усі історично прийнятні форми TaskPath ('BRAVO','\BRAVO','BRAVO\','\BRAVO\','  BRAVO','BRAVO  ','\') мусять бути прийняті і нормалізатором, і авторизацією; розбіжності: $($taskPathParityMismatches -join '; ')"
+
+    $taskPathRejectedValues = @('A/B', 'A:B', 'A*', 'A?', 'A"', 'A<', 'A>', 'A|', '.', '..', 'A\..\B', 'A\.\B', '   ')
+    $taskPathRejectParityMismatches = New-Object System.Collections.Generic.List[string]
+    foreach ($taskPathValue in $taskPathRejectedValues) {
+        $normalizerThrew = $false
+        try { [void](ConvertTo-BRAVOTaskPath -TaskPath $taskPathValue) } catch { $normalizerThrew = $true }
+        $authResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $taskPathValue -Path 'schedulerSettings.TaskPath'
+        if (-not $normalizerThrew -or [bool]$authResult.IsValid) {
+            [void]$taskPathRejectParityMismatches.Add("REJECT-case '$taskPathValue': normalizerThrew=$normalizerThrew authValid=$($authResult.IsValid)")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($taskPathRejectParityMismatches.Count -eq 0) `
+        -Name "Authorization/TaskSchedulerPathRejectsInvalidFormsSameAsNormalizer" `
+        -Failure "усі історично неприпустимі форми TaskPath мусять бути відхилені і нормалізатором, і авторизацією; розбіжності: $($taskPathRejectParityMismatches -join '; ')"
+
+    # --- Authorization/TaskSchedulerPathRejectsNonStringAndNull ---
+    $taskPathNullResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $null -Path 'schedulerSettings.TaskPath'
+    $taskPathBoolResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value $true -Path 'schedulerSettings.TaskPath'
+    $taskPathIntResult = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 7 -Path 'schedulerSettings.TaskPath'
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$taskPathNullResult.IsValid) -and (-not [bool]$taskPathBoolResult.IsValid) -and (-not [bool]$taskPathIntResult.IsValid)) `
+        -Name "Authorization/TaskSchedulerPathRejectsNonStringAndNull" `
+        -Failure "`$null/Boolean/Integer мусять лишитись відхиленими; отримано Null=$($taskPathNullResult.IsValid) Bool=$($taskPathBoolResult.IsValid) Int=$($taskPathIntResult.IsValid)"
+
+    # --- Authorization/TaskSchedulerPathValidationDoesNotMutateOriginalValue ---
+    $taskPathMutationProbeOverrides = @{ 'schedulerSettings.TaskPath' = 'BRAVO' }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $taskPathMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$taskPathMutationProbeOverrides['schedulerSettings.TaskPath'] -eq 'BRAVO') `
+        -Name "Authorization/TaskSchedulerPathValidationDoesNotMutateOriginalValue" `
+        -Failure "авторизація НЕ повинна нормалізувати/мутувати сире значення на місці; отримано '$($taskPathMutationProbeOverrides['schedulerSettings.TaskPath'])' замість 'BRAVO'"
+
+    # =====================================================================
+    # Codex review PR #224 (P2, "Import the task-path normalizer into this
+    # module scope"): Test-BRAVOConfigurationAuthorizationTaskSchedulerPath
+    # раніше перевіряла `Get-Module -Name 'BRAVO.System'` і імпортувала
+    # залежність ЛИШЕ якщо модуля не знайдено в процесі — тепер БЕЗУМОВНИЙ
+    # module-scope import (див. коментар біля Set-StrictMode у
+    # BRAVO.Configuration.Schema.psm1). Регресія нижче відтворює РЕАЛЬНУ
+    # foreign/private-session-state умову (BRAVO.System, завантажений
+    # десь у процесі приватним, неекспортованим шляхом через New-Module
+    # foreign-loader — той самий паттерн, що вже підтверджує аналогічні
+    # фікси для BRAVO.Configurator.Model.psm1/UI.psm1) у ІЗОЛЬОВАНОМУ
+    # дочірньому процесі, ПОТІМ напряму імпортує
+    # BRAVO.Configuration.Schema.psd1 і викликає авторизацію
+    # schedulerSettings.TaskPath — доводить, що команда нормалізатора
+    # реально виконується зі Schema-scope незалежно від того, чи
+    # BRAVO.System уже "видимий" деінде у процесі.
+    # =====================================================================
+    & {
+        $tpRoot = $root
+        $tpCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader_TaskPath' -ScriptBlock { " +
+            "param(`$root) " +
+            "function Invoke-ForeignSystemLoad { param(`$root) " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.System\BRAVO.System.psd1') -ErrorAction Stop " +
+            "}; Export-ModuleMember -Function Invoke-ForeignSystemLoad " +
+            "} -ArgumentList '$tpRoot'; " +
+            "Import-Module `$foreignModule -Force; " +
+            "Invoke-ForeignSystemLoad -root '$tpRoot'; " +
+            "Import-Module -Name '$tpRoot\modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1' -Force; " +
+            "try { " +
+            "`$r = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 'BRAVO' -Path 'schedulerSettings.TaskPath'; " +
+            "'RESULT-OK:' + [string]`$r.IsValid " +
+            "} catch { 'RESULT-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $tpProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $tpCommand 2>&1
+        $tpProbeLast = ([string](@($tpProbe)[-1])).Trim()
+
+        # --- Configuration/SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent ---
+        Test-BRAVOCondition (
+            $tpProbeLast -eq 'RESULT-OK:True'
+        ) `
+            'Configuration/SchemaTaskSchedulerPathWorksWithForeignSystemModuleInstancePresent' `
+            "Test-BRAVOConfigurationAuthorizationTaskSchedulerPath МУСИТЬ працювати навіть коли BRAVO.System уже завантажений десь у процесі приватним, неекспортованим шляхом (New-Module foreign loader) — жодного CommandNotFoundException; отримано: '$tpProbeLast'"
+
+        # --- Configuration/SchemaTaskSchedulerPathLazilyLoadsSystemWhenUsed ---
+        # ПЕРЕЙМЕНОВАНО й ПЕРЕПИСАНО (Config v2 pilot artifact regression,
+        # п'ятий раунд): попередня версія цього тесту називалась
+        # "...UnconditionallyAtModuleLoad" і стверджувала, що
+        # BRAVO.System імпортується на module-load-time — це формулювання
+        # кодувало АРХІТЕКТУРУ, яка й спричинила регресію (Config v2
+        # pilot artifact НАВМИСНО не бандлить modules\BRAVO.System\ —
+        # module-load-time імпорт ламав КОЖЕН Schema.psm1-імпорт там,
+        # незалежно від того, чи TaskPath взагалі зачіпається). Залежність
+        # тепер ЛІНИВА — імпортується лише всередині
+        # Test-BRAVOConfigurationAuthorizationTaskSchedulerPath, у момент
+        # реального виклику. Цей тест доводить САМЕ це: у свіжому процесі
+        # БЕЗ жодного попереднього BRAVO.System-імпорту, одразу після
+        # Import-Module Schema.psd1 (без виклику TaskPath-валідатора),
+        # BRAVO.System ще НЕ завантажений — і лише ВИКЛИК валідатора
+        # успішно довантажує його й повертає коректний результат.
+        $tpFreshCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "Import-Module -Name '$tpRoot\modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1' -Force; " +
+            "`$beforeCallLoaded = [bool](Get-Module -Name 'BRAVO.System' -All); " +
+            "try { " +
+            "`$r = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'TaskSchedulerPath' -Value 'BRAVO' -Path 'schedulerSettings.TaskPath'; " +
+            "'RESULT-OK:' + [string]`$beforeCallLoaded + ':' + [string]`$r.IsValid " +
+            "} catch { 'RESULT-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $tpFreshProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $tpFreshCommand 2>&1
+        $tpFreshProbeLast = ([string](@($tpFreshProbe)[-1])).Trim()
+        Test-BRAVOCondition (
+            $tpFreshProbeLast -eq 'RESULT-OK:False:True'
+        ) `
+            'Configuration/SchemaTaskSchedulerPathLazilyLoadsSystemWhenUsed' `
+            "Одразу після Import-Module Schema.psd1 (ДО виклику валідатора) BRAVO.System НЕ мусить бути завантажений (лінива залежність); сам виклик Test-BRAVOConfigurationAuthorizationTaskSchedulerPath МУСИТЬ його довантажити й повернути IsValid=True; отримано: '$tpFreshProbeLast' (очікується 'RESULT-OK:False:True')"
+
+        # --- Configuration/SchemaTaskPathImportHasNoProcessWidePresenceGuard ---
+        # СТРУКТУРНИЙ/архітектурний інваріант (Test A з задачі "F1 lazy
+        # dependency regression remediation"): читає ЗАТРЕКАНИЙ вихідний
+        # код Schema.psm1 (не поведінку через виконання) і ловить
+        # заборонений `if (-not (Get-Module -Name 'BRAVO.System'))) {...}`
+        # guard у КОДІ (не в коментарях-поясненнях фіксу — вони навмисно
+        # цитують старий патерн для документації). МУСИТЬ провалитись
+        # проти ОРИГІНАЛЬНОЇ guard-реалізації (до Codex review 5290816507)
+        # і МУСИТЬ проходити на поточній.
+        $ssgSchemaPath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psm1'
+        $ssgLines = Get-Content -LiteralPath $ssgSchemaPath
+        $ssgRawSrc = [string]::Join([Environment]::NewLine, $ssgLines)
+        # ВАЖЛИВО: спершу прибираємо <# ... #> block-коментарі (comment-
+        # based help) із СИРОГО тексту, ДО пострядкового `#`-фільтра.
+        # Причина порядку: закриваючий рядок такого блоку (`    #>`)
+        # сам починається з '#' після TrimStart — якби пострядковий
+        # фільтр йшов першим, він би видалив САМЕ закриваючий тег і
+        # залишив незакритий `<#`, через що ця non-greedy заміна не
+        # знаходила б жодного `#>` і НІЧОГО не прибирала б (тоді текст
+        # усередині блоку, напр. .DESCRIPTION, що згадує
+        # ConvertTo-BRAVOTaskPath у прозі, хибно "видавався" б за код).
+        $ssgRawSrc = [regex]::Replace($ssgRawSrc, '(?s)<#.*?#>', '')
+        $ssgCodeLines = $ssgRawSrc -split "`r?`n" | Where-Object { -not ($_.TrimStart().StartsWith('#')) }
+        $ssgCodeSrc = [string]::Join([Environment]::NewLine, $ssgCodeLines)
+        $ssgHasOldGuard = [regex]::IsMatch($ssgCodeSrc, "if\s*\(\s*-not\s*\(\s*Get-Module\s+-Name\s+'BRAVO\.System'\s*\)\s*\)")
+        Test-BRAVOCondition (
+            -not $ssgHasOldGuard
+        ) `
+            'Configuration/SchemaTaskPathImportHasNoProcessWidePresenceGuard' `
+            "Schema.psm1 НЕ повинен містити process-wide Get-Module presence guard для BRAVO.System у виконуваному коді; отримано hasOldGuard=$ssgHasOldGuard"
+
+        # --- Configuration/SchemaSystemDependencyIsLazyTaskPathOnly ---
+        # СТРУКТУРНИЙ Test B: доводить ОБИДВА боки правильної архітектури
+        # одночасно — (1) module-load-time preamble (код ДО першого
+        # `function`-оголошення) НЕ містить жодного BRAVO.System-імпорту
+        # (інакше pilot-артефакт знову зламається); (2)
+        # Test-BRAVOConfigurationAuthorizationTaskSchedulerPath сама
+        # МІСТИТЬ безумовний BRAVO.System-імпорт, і цей імпорт
+        # розташований у тексті функції ДО виклику ConvertTo-BRAVOTaskPath
+        # (порядок рядків, без прив'язки до точних номерів). МУСИТЬ
+        # провалитись проти b1d7054 (де преамбула МІСТИТЬ безумовний
+        # імпорт) і проходити на поточній реалізації.
+        $ssgFunctionMatch = [regex]::Match($ssgCodeSrc, '(?m)^function\s+Test-BRAVOConfigurationAuthorizationTaskSchedulerPath\b')
+        $ssgPreamble = if ($ssgFunctionMatch.Success) { $ssgCodeSrc.Substring(0, $ssgFunctionMatch.Index) } else { $ssgCodeSrc }
+        $ssgPreambleHasSystemImport = [regex]::IsMatch($ssgPreamble, 'Import-Module[^\r\n]*BRAVO\.System[\\/]BRAVO\.System\.psd1')
+
+        $ssgNextFunctionMatch = if ($ssgFunctionMatch.Success) {
+            [regex]::Match($ssgCodeSrc.Substring($ssgFunctionMatch.Index + 1), '(?m)^function\s')
+        } else { [regex]::Match('', '.') }
+        $ssgFunctionBody = if ($ssgFunctionMatch.Success) {
+            if ($ssgNextFunctionMatch.Success) {
+                $ssgCodeSrc.Substring($ssgFunctionMatch.Index, $ssgNextFunctionMatch.Index + 1)
+            } else {
+                $ssgCodeSrc.Substring($ssgFunctionMatch.Index)
+            }
+        } else { '' }
+        $ssgImportMatch = [regex]::Match($ssgFunctionBody, 'Import-Module[^\r\n]*BRAVO\.System[\\/]BRAVO\.System\.psd1[^\r\n]*-Scope\s+Local')
+        $ssgUseMatch = [regex]::Match($ssgFunctionBody, 'ConvertTo-BRAVOTaskPath')
+        $ssgFunctionHasLazyImportBeforeUse = $ssgImportMatch.Success -and $ssgUseMatch.Success -and ($ssgImportMatch.Index -lt $ssgUseMatch.Index)
+
+        Test-BRAVOCondition (
+            (-not $ssgPreambleHasSystemImport) -and $ssgFunctionHasLazyImportBeforeUse
+        ) `
+            'Configuration/SchemaSystemDependencyIsLazyTaskPathOnly' `
+            "BRAVO.System МУСИТЬ НЕ імпортуватись у module-load-time preamble (pilot-артефакт не бандлить цей модуль) і МУСИТЬ імпортуватись безумовно ВСЕРЕДИНІ Test-BRAVOConfigurationAuthorizationTaskSchedulerPath, ДО виклику ConvertTo-BRAVOTaskPath; отримано preambleHasImport=$ssgPreambleHasSystemImport functionHasLazyImportBeforeUse=$ssgFunctionHasLazyImportBeforeUse"
+
+        # --- Configuration/SchemaImportAndUnrelatedAuthorizationSucceedWithoutSystemModule ---
+        # ПОВЕДІНКОВА перевірка (Phase 5, пункти 1/2 задачі "F1 lazy
+        # dependency regression remediation"): ЖОДНОГО symlink/mock —
+        # створюємо ІЗОЛЬОВАНУ копію ЛИШЕ modules\BRAVO.Configuration\ у
+        # тимчасовому каталозі, БЕЗ жодного сусіднього modules\BRAVO.System\
+        # (той самий структурний контракт, що й pilot-артефакт: див.
+        # deploy\New-BRAVOConfigV2PilotArtifact.ps1:16). У свіжому
+        # дочірньому процесі доводимо: (1) Import-Module
+        # BRAVO.Configuration.Schema.psd1 сам по собі УСПІШНИЙ навіть коли
+        # BRAVO.System відсутній деінде у файловій системі поруч; (2)
+        # НЕпов'язана з TaskPath авторизація (robocopyMaxSuccessExitCode)
+        # так само успішна, не торкаючись BRAVO.System.
+        $sciIsolatedRoot = Join-Path $env:TEMP ("BRAVO_SelfTest_SchemaIsolated_" + [System.Guid]::NewGuid().ToString('N'))
+        try {
+            $sciModulesRoot = Join-Path $sciIsolatedRoot 'modules'
+            $sciConfigDest = Join-Path $sciModulesRoot 'BRAVO.Configuration'
+            New-Item -ItemType Directory -Path $sciConfigDest -Force | Out-Null
+            Copy-Item -Path (Join-Path $root 'modules\BRAVO.Configuration\*') -Destination $sciConfigDest -Recurse -Force
+            if (Test-Path -LiteralPath (Join-Path $sciModulesRoot 'BRAVO.System')) {
+                throw "тестова ізоляція порушена: modules\BRAVO.System\ присутній у копії"
+            }
+            $sciCommand = (
+                "Set-StrictMode -Version 2.0; " +
+                "Import-Module -Name '$sciConfigDest\BRAVO.Configuration.Schema.psd1' -Force -ErrorAction Stop; " +
+                "`$systemLoaded = [bool](Get-Module -Name 'BRAVO.System' -All); " +
+                "`$unrelated = Test-BRAVOConfigurationAuthorizationValidatorValue -ValidatorId 'IntegerRange:0,7' -Value 7 -Path 'robocopyMaxSuccessExitCode'; " +
+                "'RESULT-OK:' + [string]`$systemLoaded + ':' + [string]`$unrelated.IsValid"
+            )
+            $sciProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+                -NoLogo -NoProfile -NonInteractive -Command $sciCommand 2>&1
+            $sciProbeLast = ([string](@($sciProbe)[-1])).Trim()
+        } finally {
+            if (Test-Path -LiteralPath $sciIsolatedRoot) {
+                Remove-Item -LiteralPath $sciIsolatedRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+        Test-BRAVOCondition (
+            $sciProbeLast -eq 'RESULT-OK:False:True'
+        ) `
+            'Configuration/SchemaImportAndUnrelatedAuthorizationSucceedWithoutSystemModule' `
+            "Import-Module Schema.psd1 і НЕпов'язана з TaskPath авторизація (robocopyMaxSuccessExitCode) МУСЯТЬ бути успішними в ІЗОЛЬОВАНІЙ копії БЕЗ modules\BRAVO.System\ поруч (той самий контракт, що й pilot-артефакт), а BRAVO.System НЕ мусить довантажуватись, доки TaskPath-валідатор реально не викликаний; отримано: '$sciProbeLast' (очікується 'RESULT-OK:False:True')"
+    }
+
+    # =====================================================================
+    # Codex review PR #224 (P2, "Ignore blank lookup URL entries before
+    # validating"): Test-BRAVOConfigurationAuthorizationUrlArray раніше
+    # відхиляла ВЕСЬ масив, якщо хоча б один елемент був порожнім/
+    # whitespace-рядком, хоча production-споживач (BRAVO.Notifications.psm1)
+    # НАВМИСНО фільтрує такі елементи перед використанням.
+    # =====================================================================
+
+    # --- Authorization/UrlArrayIgnoresEmptyStringEntry ---
+    $urlArrayEmptyResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('https://api.example.test', '') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayEmptyResult.IsValid) `
+        -Name "Authorization/UrlArrayIgnoresEmptyStringEntry" `
+        -Failure "порожній рядок серед URL-елементів мусить бути проігнорований (не відхиляти весь масив); отримано IsValid=$($urlArrayEmptyResult.IsValid) Message=$($urlArrayEmptyResult.Message)"
+
+    # --- Authorization/UrlArrayIgnoresWhitespaceOnlyEntry ---
+    $urlArrayWhitespaceResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('https://api.example.test', '   ') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayWhitespaceResult.IsValid) `
+        -Name "Authorization/UrlArrayIgnoresWhitespaceOnlyEntry" `
+        -Failure "whitespace-only рядок серед URL-елементів мусить бути проігнорований; отримано IsValid=$($urlArrayWhitespaceResult.IsValid) Message=$($urlArrayWhitespaceResult.Message)"
+
+    # --- Authorization/UrlArrayValidEntriesAcceptedWithBlanksMixedIn ---
+    $urlArrayMixedResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('https://api.example.test', '', '   ', 'https://backup.example.test') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayMixedResult.IsValid) `
+        -Name "Authorization/UrlArrayValidEntriesAcceptedWithBlanksMixedIn" `
+        -Failure "дійсні URL-елементи навколо порожніх записів мусять бути прийняті; отримано IsValid=$($urlArrayMixedResult.IsValid) Message=$($urlArrayMixedResult.Message)"
+
+    # --- Authorization/UrlArrayMalformedNonblankStillRejected ---
+    $urlArrayMalformedResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('not a url') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$urlArrayMalformedResult.IsValid) `
+        -Name "Authorization/UrlArrayMalformedNonblankStillRejected" `
+        -Failure "непорожній, але некоректний URL мусить лишитись відхиленим навіть після фільтрації порожніх елементів; отримано IsValid=$($urlArrayMalformedResult.IsValid)"
+
+    # --- Authorization/UrlArrayAllBlankEntriesAccepted ---
+    # Той самий контракт, що споживач (BRAVO.Notifications.psm1) реалізує:
+    # якщо ПІСЛЯ фільтрації порожніх записів нічого не лишилось, споживач
+    # відкочується до дефолтних lookup URL — авторизація тут не повинна
+    # відхиляти весь масив лише через відсутність непорожніх елементів.
+    $urlArrayAllBlankResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('', '   ') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition ([bool]$urlArrayAllBlankResult.IsValid) `
+        -Name "Authorization/UrlArrayAllBlankEntriesAccepted" `
+        -Failure "масив, що складається ЛИШЕ з порожніх/whitespace-записів, мусить бути прийнятий (споживач відкочується до дефолту); отримано IsValid=$($urlArrayAllBlankResult.IsValid) Message=$($urlArrayAllBlankResult.Message)"
+
+    # --- Authorization/UrlArrayBlankMixedWithBadSchemeStillRejected ---
+    $urlArrayBlankBadSchemeResult = Test-BRAVOConfigurationAuthorizationValidatorValue `
+        -ValidatorId 'UrlArray:http,https' -Value @('', 'ftp://bad.scheme.test') -Path 'hostInformationSettings.PublicIPLookupUrls'
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$urlArrayBlankBadSchemeResult.IsValid) `
+        -Name "Authorization/UrlArrayBlankMixedWithBadSchemeStillRejected" `
+        -Failure "недопустима схема поруч із порожнім записом мусить лишитись відхиленою — фільтрація порожніх записів НЕ повинна ширше послаблювати перевірку схеми/формату; отримано IsValid=$($urlArrayBlankBadSchemeResult.IsValid)"
+
+    # =====================================================================
+    # Codex review PR #224 (P2, "Preserve whitespace tolerance for legacy
+    # LogLevel"): LogLevel раніше використовував точний 'Enum:' валідатор,
+    # хоча defaultLogLevel уже отримав whitespace-tolerant 'EnumTrimmed:' —
+    # значення на кшталт ' ERROR ' раніше приймались (єдиний production-
+    # читач, BRAVO.Archive.Runtime.ps1:6346, лише інтерполює $LogLevel в
+    # інформаційне повідомлення) і не повинні ламати конфігурацію зараз.
+    # =====================================================================
+
+    # --- Authorization/LogLevelWhitespaceTrimmedValueAccepted ---
+    $logLevelTrimmedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'LogLevel' = ' ERROR ' } -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$logLevelTrimmedResult.IsValid) `
+        -Name "Authorization/LogLevelWhitespaceTrimmedValueAccepted" `
+        -Failure "LogLevel=' ERROR ' (whitespace навколо валідного значення) мусить бути прийнятий, як і defaultLogLevel; отримано IsValid=$($logLevelTrimmedResult.IsValid)"
+
+    # --- Authorization/LogLevelInvalidTrimmedValueRejected ---
+    $logLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'LogLevel' = ' BOGUS ' } -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$logLevelInvalidResult.IsValid) `
+        -Name "Authorization/LogLevelInvalidTrimmedValueRejected" `
+        -Failure "LogLevel=' BOGUS ' мусить лишитись відхиленим — EnumTrimmed прибирає лише пробіли, не розширює множину допустимих значень; отримано IsValid=$($logLevelInvalidResult.IsValid)"
+
+    # --- Authorization/DefaultLogLevelBehaviorUnchangedByLogLevelFix ---
+    $defaultLogLevelStillTrimmedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' ERROR ' } -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$defaultLogLevelStillTrimmedResult.IsValid) `
+        -Name "Authorization/DefaultLogLevelBehaviorUnchangedByLogLevelFix" `
+        -Failure "фікс LogLevel не повинен зачіпати вже існуючу поведінку defaultLogLevel; отримано IsValid=$($defaultLogLevelStillTrimmedResult.IsValid)"
+
+    # =====================================================================
+    # PR #224 review, F3: enum-валідатор БЕЗ trim відхиляв би значення на
+    # кшталт ' all ' (з пробілами), хоча щонайменше два ALLOW_WITH_VALIDATOR
+    # enum-листи (bravoSettings.NotificationMode/NotificationProvider)
+    # мають ДОВЕДЕНУ pre-Wave-2 нормалізацію .Trim().ToLowerInvariant() на
+    # ВСІХ реальних runtime-точках споживання (BRAVO_DRY_RUN.ps1 x4,
+    # BRAVO_NOTIFICATION_TEST.ps1, BRAVO_RESTORE_TEST.ps1). Фікс — окремий
+    # named-валідатор 'EnumTrimmed:' (НЕ узагальнене послаблення 'Enum:'
+    # для всіх 18 enum-листів без доказу) — Test-BRAVOConfigurationAuthorizationEnumValue
+    # порівнює з Trim(), значення при цьому НЕ мутується.
+    # =====================================================================
+
+    # --- Authorization/NotificationModeWhitespaceTolerated ---
+    $authNotifModeWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = ' all ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNotifModeWhitespaceResult.IsValid) `
+        -Name "Authorization/NotificationModeWhitespaceTolerated" `
+        -Failure "bravoSettings.NotificationMode=' all ' (пробіли) мусить бути прийнятий — усі runtime-споживачі вже роблять .Trim() перед використанням; отримано IsValid=$($authNotifModeWhitespaceResult.IsValid)"
+
+    # --- Authorization/NotificationModeStillRejectsGenuinelyInvalidValue ---
+    $authNotifModeInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = ' definitely-invalid ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeInvalidResult.IsValid) `
+        -Name "Authorization/NotificationModeStillRejectsGenuinelyInvalidValue" `
+        -Failure "trim-tolerance НЕ повинна ослабити реальну enum-перевірку — ' definitely-invalid ' мусить лишитись відхиленим; отримано IsValid=$($authNotifModeInvalidResult.IsValid)"
+
+    # --- Authorization/NotificationModeNonStringStillRejected ---
+    $authNotifModeNonStringResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = 5 } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeNonStringResult.IsValid) `
+        -Name "Authorization/NotificationModeNonStringStillRejected" `
+        -Failure "не-рядкове значення мусить лишитись відхиленим навіть для EnumTrimmed-валідатора (Trim — лише для рядків); отримано IsValid=$($authNotifModeNonStringResult.IsValid)"
+
+    # --- Authorization/NotificationModeBooleanStillRejected ---
+    $authNotifModeBooleanResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = $true } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeBooleanResult.IsValid) `
+        -Name "Authorization/NotificationModeBooleanStillRejected" `
+        -Failure "Boolean `$true мусить лишитись відхиленим навіть для EnumTrimmed-валідатора (Trim — лише для рядків, не для Boolean-to-string коерсії); отримано IsValid=$($authNotifModeBooleanResult.IsValid)"
+
+    # --- Authorization/NotificationModeNullStillRejected ---
+    $authNotifModeNullResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = $null } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNotifModeNullResult.IsValid) `
+        -Name "Authorization/NotificationModeNullStillRejected" `
+        -Failure "`$null мусить лишитись відхиленим і для EnumTrimmed-валідатора; отримано IsValid=$($authNotifModeNullResult.IsValid)"
+
+    # --- Authorization/EnumTrimmedValidationDoesNotMutateOriginalValue ---
+    # Валідація — лише перевірка; саме значення, що йде далі в merge, не
+    # повинно набувати обрізаної/lower-case форми звідси (той самий
+    # незмінний runtime-consumer сам робить .Trim().ToLowerInvariant()).
+    $authNotifModeMutationProbeValue = ' All '
+    $authNotifModeMutationProbeOverrides = @{ 'bravoSettings.NotificationMode' = $authNotifModeMutationProbeValue }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $authNotifModeMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$authNotifModeMutationProbeOverrides['bravoSettings.NotificationMode'] -eq $authNotifModeMutationProbeValue) `
+        -Name "Authorization/EnumTrimmedValidationDoesNotMutateOriginalValue" `
+        -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне значення на місці (Trim лише для внутрішнього порівняння); отримано '$($authNotifModeMutationProbeOverrides['bravoSettings.NotificationMode'])' замість очікуваного '$authNotifModeMutationProbeValue'"
+
+    # --- Authorization/NotificationModeWhitespaceAndCaseBothTolerated ---
+    $authNotifModeCaseWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationMode' = ' ALL ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNotifModeCaseWhitespaceResult.IsValid) `
+        -Name "Authorization/NotificationModeWhitespaceAndCaseBothTolerated" `
+        -Failure "trim і case-insensitive порівняння мусять діяти РАЗОМ (' ALL ' -> 'all'); отримано IsValid=$($authNotifModeCaseWhitespaceResult.IsValid)"
+
+    # --- Authorization/NotificationProviderWhitespaceTolerated ---
+    $authNotifProviderWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationProvider' = ' discord ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNotifProviderWhitespaceResult.IsValid) `
+        -Name "Authorization/NotificationProviderWhitespaceTolerated" `
+        -Failure "bravoSettings.NotificationProvider=' discord ' мусить бути прийнятий (та сама доведена trim-tolerance, що NotificationMode); отримано IsValid=$($authNotifProviderWhitespaceResult.IsValid)"
+
+    # --- Authorization/OtherEnumLeavesRemainUntrimmedByDefault ---
+    # Регресійна межа: інший enum-лист (maintenanceSettings.Logging.Level),
+    # для якого НЕМАЄ доказу pre-Wave-2 trim-tolerance, мусить лишитись на
+    # звичайному строгому 'Enum:' (без trim) — фікс не узагальнюється без
+    # підстави. ConsoleLevel/FileLevel більше НЕ підходять для цього
+    # регресійного зразка (R3-5, PR #224 third review): обидва тепер самі
+    # мають доведену trim-tolerance і перевіряються окремим блоком нижче.
+    $authOtherEnumWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = ' WARNING ' } `
+        -Schema $authSchema
+    $authOtherEnumExactResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'WARNING' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$authOtherEnumWhitespaceResult.IsValid) -and [bool]$authOtherEnumExactResult.IsValid) `
+        -Name "Authorization/OtherEnumLeavesRemainUntrimmedByDefault" `
+        -Failure "maintenanceSettings.Logging.Level НЕ має доказу trim-tolerance — з пробілами мусить відхилятись (IsValid=$($authOtherEnumWhitespaceResult.IsValid)), точне значення мусить і далі прийматись (IsValid=$($authOtherEnumExactResult.IsValid))"
+
+    # =====================================================================
+    # PR #224 review, шосте коло (P2, "Restrict maintenance log levels to
+    # runtime-supported values"): канонічний реєстр РАНІШЕ дозволяв
+    # TRACE/FATAL для maintenanceSettings.Logging.Level, але Maintenance
+    # startup-gate (modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1,
+    # ~рядок 608, $script:LogLevel -notin @("DEBUG","INFO","WARNING","ERROR","SUCCESS"))
+    # відхиляє ЦІ значення з exit 30 — оператор міг пройти canonical
+    # авторизацію з TRACE/FATAL, а зламати Maintenance ЛИШЕ на реальному
+    # запуску. Enum звужено до фактично підтримуваного runtime-набору;
+    # ЦЕ НЕ EnumTrimmed-зміна (whitespace-межа з блоку вище лишається
+    # незміненою) і не стосується consoleSettings.ConsoleLevel/FileLevel/
+    # defaultLogLevel (окремі, вже доведені контракти, де TRACE/FATAL
+    # лишаються легітимними).
+    # =====================================================================
+    $mlSupportedValues = @('DEBUG', 'INFO', 'WARNING', 'ERROR', 'SUCCESS')
+    $mlUnsupportedValues = @('TRACE', 'FATAL')
+
+    # --- Configuration/MaintenanceLogging<Level>Accepted (data-driven) ---
+    $mlAcceptedFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($lvl in $mlSupportedValues) {
+        $mlResult = Test-BRAVOConfigurationOverrideAuthorization `
+            -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = $lvl } `
+            -Schema $authSchema
+        if (-not [bool]$mlResult.IsValid) { [void]$mlAcceptedFailures.Add("$lvl (IsValid=$($mlResult.IsValid))") }
+    }
+    Test-BRAVOCondition `
+        -Condition ($mlAcceptedFailures.Count -eq 0) `
+        -Name "Configuration/MaintenanceLoggingRuntimeSupportedValuesAccepted" `
+        -Failure "усі runtime-підтримувані рівні (DEBUG/INFO/WARNING/ERROR/SUCCESS) мусять бути прийняті canonical авторизацією для maintenanceSettings.Logging.Level; відхилено: $($mlAcceptedFailures -join ', ')"
+
+    # --- Configuration/MaintenanceLogging<Level>Rejected (TRACE/FATAL) ---
+    $mlRejectedFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($lvl in $mlUnsupportedValues) {
+        $mlResult = Test-BRAVOConfigurationOverrideAuthorization `
+            -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = $lvl } `
+            -Schema $authSchema
+        if ([bool]$mlResult.IsValid) {
+            [void]$mlRejectedFailures.Add("$lvl (IsValid=$($mlResult.IsValid))")
+        } else {
+            $mlViolation = @($mlResult.Violations | Where-Object { [string]$_.Path -eq 'maintenanceSettings.Logging.Level' })
+            if ($mlViolation.Count -ne 1 -or [string]$mlViolation[0].Reason -ne 'ValidatorRejected' -or [string]$mlViolation[0].Class -ne 'ALLOW_WITH_VALIDATOR') {
+                [void]$mlRejectedFailures.Add("$lvl (unexpected violation shape: Count=$($mlViolation.Count) Reason=$($(if ($mlViolation.Count) { $mlViolation[0].Reason } else { 'N/A' })) Class=$($(if ($mlViolation.Count) { $mlViolation[0].Class } else { 'N/A' })))")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($mlRejectedFailures.Count -eq 0) `
+        -Name "Configuration/MaintenanceLoggingRuntimeUnsupportedValuesRejected" `
+        -Failure "TRACE/FATAL мусять бути відхилені (Reason=ValidatorRejected, Class=ALLOW_WITH_VALIDATOR) для maintenanceSettings.Logging.Level — Maintenance startup-gate їх не підтримує; порушення: $($mlRejectedFailures -join ', ')"
+
+    # --- Configuration/MaintenanceLoggingCaseInsensitive ---
+    $mlCaseResults = @(
+        Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'warning' } -Schema $authSchema
+        Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'Warning' } -Schema $authSchema
+        Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = 'WARNING' } -Schema $authSchema
+    )
+    Test-BRAVOCondition `
+        -Condition (@($mlCaseResults | ForEach-Object { [bool]$_.IsValid }) -notcontains $false) `
+        -Name "Configuration/MaintenanceLoggingCaseInsensitive" `
+        -Failure "canonical Enum-порівняння лишається регістронезалежним для maintenanceSettings.Logging.Level ('warning'/'Warning'/'WARNING' мусять усі бути прийняті); отримано IsValid=$(@($mlCaseResults | ForEach-Object { [bool]$_.IsValid }) -join ',')"
+
+    # --- Configuration/MaintenanceLoggingWhitespaceStillRejected ---
+    # Дублює Authorization/OtherEnumLeavesRemainUntrimmedByDefault намірено
+    # під іменем, прив'язаним до цього конкретного ревю-раунду — ця
+    # ремедіація змінює МНОЖИНУ допустимих значень, не whitespace-семантику.
+    $mlWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Logging.Level' = ' WARNING ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$mlWhitespaceResult.IsValid) `
+        -Name "Configuration/MaintenanceLoggingWhitespaceStillRejected" `
+        -Failure "' WARNING ' (з пробілами) мусить і далі відхилятись — ця ремедіація НЕ робить лист EnumTrimmed; отримано IsValid=$($mlWhitespaceResult.IsValid)"
+
+    # --- Configuration/MaintenanceLoggingConfiguratorAllowedValuesMatchRuntimeContract ---
+    if (-not (Get-Module -Name 'BRAVO.Configurator.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configurator\BRAVO.Configurator.Schema.psd1') -Force
+    }
+    $mlCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $mlDescriptor = @($mlCatalog | Where-Object { $_.Path -eq 'maintenanceSettings.Logging.Level' })
+    $mlDescriptorAllowedSorted = if ($mlDescriptor.Count -eq 1) { @($mlDescriptor[0].AllowedValues | Sort-Object) } else { @() }
+    $mlSupportedSorted = @($mlSupportedValues | Sort-Object)
+    $mlAllowedDelta = Compare-Object -ReferenceObject $mlSupportedSorted -DifferenceObject $mlDescriptorAllowedSorted
+    Test-BRAVOCondition `
+        -Condition ($mlDescriptor.Count -eq 1 -and (-not $mlAllowedDelta)) `
+        -Name "Configuration/MaintenanceLoggingConfiguratorAllowedValuesMatchRuntimeContract" `
+        -Failure "Configurator-дескриптор maintenanceSettings.Logging.Level мусить рекламувати ТОЧНО DEBUG/INFO/WARNING/ERROR/SUCCESS (без TRACE/FATAL); отримано DescriptorCount=$($mlDescriptor.Count) AllowedValues=$($mlDescriptorAllowedSorted -join ',')"
+
+    # --- Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths ---
+    Test-BRAVOCondition `
+        -Condition (
+            ([string]$authRegistry['bravoSettings.NotificationMode'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal) -and
+            ([string]$authRegistry['bravoSettings.NotificationProvider'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)
+        ) `
+        -Name "Authorization/EnumTrimmedValidatorRegisteredForBothEvidencedPaths" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' саме для NotificationMode/NotificationProvider; отримано NotificationMode=$($authRegistry['bravoSettings.NotificationMode'].Validator) NotificationProvider=$($authRegistry['bravoSettings.NotificationProvider'].Validator)"
+
+    # =====================================================================
+    # PR #224 third review, R3-5: consoleSettings.ConsoleLevel/FileLevel —
+    # canonical runtime-споживач (Get-BRAVOLogSeverityValue,
+    # modules/BRAVO.Logging/BRAVO.Logging.psm1) уже робить
+    # .Trim().ToUpperInvariant() ДО порівняння з таблицею рівнів, тому ці
+    # два листи мусять зберегти pre-Wave-2 tolerance до пробілів.
+    # =====================================================================
+
+    # --- Authorization/ConsoleLevelValidatorIsTrimmed ---
+    Test-BRAVOCondition `
+        -Condition (([string]$authRegistry['consoleSettings.ConsoleLevel'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) `
+        -Name "Authorization/ConsoleLevelValidatorIsTrimmed" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' для consoleSettings.ConsoleLevel; отримано $($authRegistry['consoleSettings.ConsoleLevel'].Validator)"
+
+    # --- Authorization/FileLevelValidatorIsTrimmed ---
+    Test-BRAVOCondition `
+        -Condition (([string]$authRegistry['consoleSettings.FileLevel'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) `
+        -Name "Authorization/FileLevelValidatorIsTrimmed" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' для consoleSettings.FileLevel; отримано $($authRegistry['consoleSettings.FileLevel'].Validator)"
+
+    # --- Preview/ConsoleLevelWhitespaceAccepted ---
+    $r35ConsoleLevelWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = ' ERROR ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$r35ConsoleLevelWhitespaceResult.IsValid) `
+        -Name "Preview/ConsoleLevelWhitespaceAccepted" `
+        -Failure "consoleSettings.ConsoleLevel=' ERROR ' мусить бути прийнятий (доведена trim-tolerance runtime-споживача); отримано IsValid=$($r35ConsoleLevelWhitespaceResult.IsValid)"
+
+    # --- Preview/FileLevelWhitespaceAccepted ---
+    $r35FileLevelWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.FileLevel' = ' INFO ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$r35FileLevelWhitespaceResult.IsValid) `
+        -Name "Preview/FileLevelWhitespaceAccepted" `
+        -Failure "consoleSettings.FileLevel=' INFO ' мусить бути прийнятий (доведена trim-tolerance runtime-споживача); отримано IsValid=$($r35FileLevelWhitespaceResult.IsValid)"
+
+    # --- Preview/ConsoleFileLevelInvalidValueStillRejected ---
+    $r35ConsoleLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = ' NOTALEVEL ' } `
+        -Schema $authSchema
+    $r35FileLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.FileLevel' = ' NOTALEVEL ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$r35ConsoleLevelInvalidResult.IsValid) -and (-not [bool]$r35FileLevelInvalidResult.IsValid)) `
+        -Name "Preview/ConsoleFileLevelInvalidValueStillRejected" `
+        -Failure "trim не повинен послаблювати перелік дозволених значень — невідомий рівень мусить лишитись відхиленим для обох листів; отримано ConsoleLevel.IsValid=$($r35ConsoleLevelInvalidResult.IsValid) FileLevel.IsValid=$($r35FileLevelInvalidResult.IsValid)"
+
+    # --- Preview/ConsoleFileLevelNonStringStillRejected ---
+    $r35ConsoleLevelNonStringResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.ConsoleLevel' = 5 } `
+        -Schema $authSchema
+    $r35FileLevelNonStringResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'consoleSettings.FileLevel' = $true } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$r35ConsoleLevelNonStringResult.IsValid) -and (-not [bool]$r35FileLevelNonStringResult.IsValid)) `
+        -Name "Preview/ConsoleFileLevelNonStringStillRejected" `
+        -Failure "не-рядкове значення мусить лишитись відхиленим для обох листів навіть після EnumTrimmed; отримано ConsoleLevel.IsValid=$($r35ConsoleLevelNonStringResult.IsValid) FileLevel.IsValid=$($r35FileLevelNonStringResult.IsValid)"
+
+    # --- Preview/ConsoleLevelValidationDoesNotMutateOriginalValue ---
+    $r35ConsoleLevelMutationProbeValue = ' ERROR '
+    $r35ConsoleLevelMutationProbeOverrides = @{ 'consoleSettings.ConsoleLevel' = $r35ConsoleLevelMutationProbeValue }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $r35ConsoleLevelMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$r35ConsoleLevelMutationProbeOverrides['consoleSettings.ConsoleLevel'] -eq $r35ConsoleLevelMutationProbeValue) `
+        -Name "Preview/ConsoleLevelValidationDoesNotMutateOriginalValue" `
+        -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне ConsoleLevel-значення на місці; отримано '$($r35ConsoleLevelMutationProbeOverrides['consoleSettings.ConsoleLevel'])' замість очікуваного '$r35ConsoleLevelMutationProbeValue'"
+
+    # =====================================================================
+    # PR #224 review, четвертий раунд (P2, "Preserve trimming for
+    # defaultLogLevel"): Write-Log (modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1)
+    # використовує $defaultLogLevel як default для параметра $Level і сам
+    # нормалізує через `$Level.Trim().ToUpperInvariant()` ПЕРЕД
+    # порівнянням з переліком рівнів — та сама доведена pre-Wave-2
+    # tolerance-семантика, що NotificationMode/NotificationProvider/
+    # ConsoleLevel/FileLevel вище. Раніше цей лист лишався на звичайному
+    # 'Enum:' (без trim) — startup-регресія для існуючих
+    # ' ERROR '-подібних значень.
+    # =====================================================================
+
+    # --- Configuration/DefaultLogLevelValidatorIsTrimmed ---
+    Test-BRAVOCondition `
+        -Condition (([string]$authRegistry['defaultLogLevel'].Validator).StartsWith('EnumTrimmed:', [System.StringComparison]::Ordinal)) `
+        -Name "Configuration/DefaultLogLevelValidatorIsTrimmed" `
+        -Failure "реєстр мусить використовувати 'EnumTrimmed:' для defaultLogLevel; отримано $($authRegistry['defaultLogLevel'].Validator)"
+
+    # --- Configuration/DefaultLogLevelTrimmedAccepted (B1/B2) ---
+    $defaultLogLevelErrorWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' ERROR ' } `
+        -Schema $authSchema
+    $defaultLogLevelInfoWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' INFO ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$defaultLogLevelErrorWhitespaceResult.IsValid -and [bool]$defaultLogLevelInfoWhitespaceResult.IsValid) `
+        -Name "Configuration/DefaultLogLevelTrimmedAccepted" `
+        -Failure "defaultLogLevel=' ERROR '/' INFO ' мусять бути прийняті (доведена trim-tolerance Write-Log); отримано ERROR.IsValid=$($defaultLogLevelErrorWhitespaceResult.IsValid) INFO.IsValid=$($defaultLogLevelInfoWhitespaceResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelWhitespaceAndCaseBothTolerated (B3) ---
+    # Write-Log сам робить .Trim().ToUpperInvariant(), а
+    # Test-BRAVOConfigurationAuthorizationEnumValue завжди порівнює
+    # case-insensitive (не лише для EnumTrimmed) — реальна runtime-
+    # семантика й авторизація мусять узгоджуватись для мішаного case.
+    $defaultLogLevelLowerWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' warning ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$defaultLogLevelLowerWhitespaceResult.IsValid) `
+        -Name "Configuration/DefaultLogLevelWhitespaceAndCaseBothTolerated" `
+        -Failure "defaultLogLevel=' warning ' (пробіли + нижній регістр) мусить бути прийнятий (той самий .Trim().ToUpperInvariant(), що Write-Log); отримано IsValid=$($defaultLogLevelLowerWhitespaceResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelInvalidRejected (B4/B5) ---
+    $defaultLogLevelInvalidResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = 'BOGUS' } `
+        -Schema $authSchema
+    $defaultLogLevelInvalidWhitespaceResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = ' BOGUS ' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$defaultLogLevelInvalidResult.IsValid) -and (-not [bool]$defaultLogLevelInvalidWhitespaceResult.IsValid)) `
+        -Name "Configuration/DefaultLogLevelInvalidRejected" `
+        -Failure "trim не повинен послаблювати перелік дозволених значень — 'BOGUS'/' BOGUS ' мусять лишитись відхиленими; отримано Exact.IsValid=$($defaultLogLevelInvalidResult.IsValid) Whitespace.IsValid=$($defaultLogLevelInvalidWhitespaceResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelNonStringRejected (B6) ---
+    $defaultLogLevelIntResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = 5 } `
+        -Schema $authSchema
+    $defaultLogLevelBoolResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = $true } `
+        -Schema $authSchema
+    $defaultLogLevelNullResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'defaultLogLevel' = $null } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$defaultLogLevelIntResult.IsValid) -and (-not [bool]$defaultLogLevelBoolResult.IsValid) -and (-not [bool]$defaultLogLevelNullResult.IsValid)) `
+        -Name "Configuration/DefaultLogLevelNonStringRejected" `
+        -Failure "не-рядкове/`$null значення мусить лишитись відхиленим навіть для EnumTrimmed-валідатора; отримано Int.IsValid=$($defaultLogLevelIntResult.IsValid) Bool.IsValid=$($defaultLogLevelBoolResult.IsValid) Null.IsValid=$($defaultLogLevelNullResult.IsValid)"
+
+    # --- Configuration/DefaultLogLevelValidationDoesNotMutateOriginalValue (B7) ---
+    $defaultLogLevelMutationProbeValue = ' Error '
+    $defaultLogLevelMutationProbeOverrides = @{ 'defaultLogLevel' = $defaultLogLevelMutationProbeValue }
+    [void](Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides $defaultLogLevelMutationProbeOverrides -Schema $authSchema)
+    Test-BRAVOCondition `
+        -Condition ([string]$defaultLogLevelMutationProbeOverrides['defaultLogLevel'] -eq $defaultLogLevelMutationProbeValue) `
+        -Name "Configuration/DefaultLogLevelValidationDoesNotMutateOriginalValue" `
+        -Failure "Test-BRAVOConfigurationOverrideAuthorization НЕ повинен мутувати вхідне defaultLogLevel-значення на місці; отримано '$($defaultLogLevelMutationProbeOverrides['defaultLogLevel'])' замість очікуваного '$defaultLogLevelMutationProbeValue'"
+
+    # --- Authorization/RobocopyExitCodeBoundaryMatrix ---
+    # Owner-decision test matrix (WAVE2-CONTRACT.md, розділ 11.0/11.6): 0/7
+    # accepted; 8/-1/7.5/'7' rejected. Рядок '7' НЕ повинен коерситись у
+    # число.
+    & {
+        $robocopyCases = @(
+            @{ Value = 0;    Expected = $true;  Label = '0' }
+            @{ Value = 7;    Expected = $true;  Label = '7' }
+            @{ Value = 8;    Expected = $false; Label = '8' }
+            @{ Value = -1;   Expected = $false; Label = '-1' }
+            @{ Value = 7.5;  Expected = $false; Label = '7.5' }
+            @{ Value = '7';  Expected = $false; Label = "'7' (рядок)" }
+        )
+        foreach ($robocopyCase in $robocopyCases) {
+            $robocopyResult = Test-BRAVOConfigurationOverrideAuthorization `
+                -DotPathOverrides @{ 'robocopyMaxSuccessExitCode' = $robocopyCase.Value } `
+                -Schema $authSchema
+            Test-BRAVOCondition `
+                -Condition ([bool]$robocopyResult.IsValid -eq [bool]$robocopyCase.Expected) `
+                -Name "Authorization/RobocopyExitCodeBoundary_$($robocopyCase.Label)" `
+                -Failure "robocopyMaxSuccessExitCode=$($robocopyCase.Label) мусить дати IsValid=$($robocopyCase.Expected), отримано $($robocopyResult.IsValid)"
+        }
+    }
+
+    # --- Authorization/DenyDerivedRejected ---
+    # PR #224 review, N3 (2026-09-22): sftpDirectories.BAZA/BAZAWWW
+    # пере-класифіковано DENY_DERIVED -> ALLOW_SITE (сирі site-параметри,
+    # не похідні значення — див. коментар при реєстрації в
+    # BRAVO.Configuration.Schema.psm1). Реєстр більше не має ЖОДНОГО
+    # DENY_DERIVED-запису (клас лишається визначеним у механізмі
+    # дозволу/заборони, просто наразі без членів). Доводимо, що сам
+    # механізм класу DENY_DERIVED і далі безумовно відхиляє, через
+    # тимчасовий синтетичний лист у приватному script-стані модуля (той
+    # самий підхід, що Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed
+    # вище використовує для DENY_SECURITY_CONTROL) — видаляється у finally
+    # незалежно від результату.
+    & {
+        $denyDerivedProbePath = '__SELFTEST_SYNTHETIC_DENY_DERIVED_LEAF__'
+        $denyDerivedProbeModule = Get-Module -Name 'BRAVO.Configuration.Schema'
+        $denyDerivedProbeAdded = $false
+        try {
+            & $denyDerivedProbeModule {
+                param($path)
+                $script:BRAVOConfigurationSchemaAuthorizationClass[$path] = @{ Class = 'DENY_DERIVED' }
+            } $denyDerivedProbePath
+            $denyDerivedProbeAdded = $true
+
+            $denyDerivedProbeSchema = @{}
+            foreach ($k in @($authSchema.Keys)) { $denyDerivedProbeSchema[$k] = $authSchema[$k] }
+            $denyDerivedProbeSchema[$denyDerivedProbePath] = @{ Kind = 'String'; Nullable = $false }
+
+            $authDenyDerivedResult = Test-BRAVOConfigurationOverrideAuthorization `
+                -DotPathOverrides @{ $denyDerivedProbePath = 'anything' } `
+                -Schema $denyDerivedProbeSchema
+            Test-BRAVOCondition `
+                -Condition (
+                    -not [bool]$authDenyDerivedResult.IsValid -and
+                    $authDenyDerivedResult.Violations.Count -eq 1 -and
+                    [string]$authDenyDerivedResult.Violations[0].Class -eq 'DENY_DERIVED'
+                ) `
+                -Name "Authorization/DenyDerivedRejected" `
+                -Failure "клас DENY_DERIVED мусить безумовно відхиляти незалежно від запропонованого значення, навіть коли наразі жоден реальний лист цим класом не позначений; отримано IsValid=$($authDenyDerivedResult.IsValid)"
+        } finally {
+            if ($denyDerivedProbeAdded) {
+                & $denyDerivedProbeModule {
+                    param($path)
+                    $script:BRAVOConfigurationSchemaAuthorizationClass.Remove($path)
+                } $denyDerivedProbePath
+            }
+        }
+    }
+
+    # --- Authorization/SftpDirectoriesBazaAndBazaWwwAreSiteConfigurable ---
+    # N3: позитивний контрольний тест — обидва тепер ALLOW_SITE, кастомне
+    # значення оператора мусить прийматись без валідатора.
+    $authBazaAllowedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'sftpDirectories.BAZA' = 'custom_baza_app'; 'sftpDirectories.BAZAWWW' = 'custom_baza_www' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authBazaAllowedResult.IsValid) `
+        -Name "Authorization/SftpDirectoriesBazaAndBazaWwwAreSiteConfigurable" `
+        -Failure "sftpDirectories.BAZA/BAZAWWW (ALLOW_SITE після N3-корекції) мусять приймати довільне site-значення без валідатора; отримано IsValid=$($authBazaAllowedResult.IsValid) Violations=$($authBazaAllowedResult.Violations.Count)"
+
+    # --- Authorization/DenySecurityControlRejected ---
+    $authDenySecurityResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'winSCPIniPath' = 'C:\custom.ini' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenySecurityResult.IsValid) `
+        -Name "Authorization/DenySecurityControlRejected" `
+        -Failure "winSCPIniPath (DENY_SECURITY_CONTROL) мусить бути відхилений"
+
+    # --- Authorization/DenyExecutionControlRejected ---
+    $authDenyExecutionResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyPath' = 'C:\evil.exe' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenyExecutionResult.IsValid) `
+        -Name "Authorization/DenyExecutionControlRejected" `
+        -Failure "robocopyPath (DENY_EXECUTION_CONTROL) мусить бути відхилений"
+
+    # --- Authorization/DenyInternalMetadataRejected ---
+    $authDenyInternalResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'hashFileExtension' = '.custom' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authDenyInternalResult.IsValid) `
+        -Name "Authorization/DenyInternalMetadataRejected" `
+        -Failure "hashFileExtension (DENY_INTERNAL_METADATA) мусить бути відхилений"
+
+    # --- Authorization/DenyCredentialBackedClassRejectsSyntheticDescriptor ---
+    # DENY_CREDENTIAL_BACKED сьогодні має 0 реальних канонічних листів
+    # (WAVE2-CONTRACT.md, розділ 1) — перевіряємо ОБРОБКУ класу на рівні
+    # unit-виклику диспетчера відмов, а не через реальний лист, якого
+    # немає.
+    & {
+        $syntheticRegistry = @{}
+        foreach ($syntheticKey in @($authRegistry.Keys)) { $syntheticRegistry[$syntheticKey] = $authRegistry[$syntheticKey] }
+        $syntheticRegistry['archiveRetentionDays'] = @{ Class = 'DENY_CREDENTIAL_BACKED'; Validator = $null }
+        # Тимчасово підміняємо $script:-реєстр НЕ можна (модуль-приватний
+        # стан) — натомість перевіряємо семантику класу напряму через
+        #ReadOnly-адаптер Configurator-а, який так само трактує будь-який
+        # НЕ-ALLOW_SITE/ALLOW_WITH_VALIDATOR клас як "не для site-шару"
+        # лише для DENY_-префіксних класів. DENY_CREDENTIAL_BACKED
+        # відповідає цьому патерну ідентично іншим DENY_*-класам.
+        Test-BRAVOCondition `
+            -Condition ([string]'DENY_CREDENTIAL_BACKED').StartsWith('DENY_') `
+            -Name "Authorization/DenyCredentialBackedClassNameFollowsDenyPrefixConvention" `
+            -Failure "DENY_CREDENTIAL_BACKED мусить лишатись у DENY_-неймінг-конвенції, яку розпізнає диспетчер відмов (0 реальних листів сьогодні — WAVE2-CONTRACT.md, розділ 1)"
+    }
+
+    # --- Authorization/OwnerDecisionBravoNameDeniedUnconditionally ---
+    $authBravoNameResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services.BravoName' = 'BravoBackupService' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authBravoNameResult.IsValid) `
+        -Name "Authorization/OwnerDecisionBravoNameDeniedUnconditionally" `
+        -Failure "maintenanceSettings.Services.BravoName мусить бути відхилений БЕЗУМОВНО (рішення власника 2026-09-21), навіть коли запропоноване значення виглядає правдоподібним"
+
+    # --- Authorization/OwnerDecisionBazaModeLegacyDenied ---
+    $authBazaLegacyResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authBazaLegacyResult.IsValid) `
+        -Name "Authorization/OwnerDecisionBazaModeLegacyDenied" `
+        -Failure "backupMonitoring.SFTP.BAZA.Mode='Legacy' мусить бути відхилений (safety downgrade, рішення власника 2026-09-21)"
+
+    # --- Authorization/OwnerDecisionBazaModeIncrementalAppendOnlyAlsoDenied ---
+    # КРИТИЧНО: лист заборонений НЕЗАЛЕЖНО від значення — навіть коли
+    # запропоноване значення збігається з канонічним дефолтом.
+    $authBazaIncrementalResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authBazaIncrementalResult.IsValid) `
+        -Name "Authorization/OwnerDecisionBazaModeIncrementalAppendOnlyAlsoDenied" `
+        -Failure "backupMonitoring.SFTP.BAZA.Mode='IncrementalAppendOnly' МУСИТЬ теж бути відхилений — авторизація про володіння листом, не про безпечність значення"
+
+    # --- Authorization/UnknownTerminalLeafUnderKnownNodeStillD3Accepted ---
+    # D3 (рішення власника 2026-09-14) не повинен зламатись Wave 2:
+    # невідомий кінцевий сегмент під ВІДОМИМ вузлом не класифікується
+    # авторизацією взагалі (проходить повз, як і повз type-перевірку).
+    $authUnknownLeafResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits.SomeFutureLeaf' = 'x' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authUnknownLeafResult.IsValid) `
+        -Name "Authorization/UnknownTerminalLeafUnderKnownNodeStillD3Accepted" `
+        -Failure "невідомий кінцевий сегмент під відомим вузлом мусить лишитись ACCEPT (D3) — авторизація не повинна класифікувати шляхи поза схемою"
+
+    # --- Authorization/UnknownParentNodeStillFailsClosedUnchanged ---
+    # Невідомий БАТЬКІВСЬКИЙ вузол і далі fail-closed через
+    # ConvertTo-BRAVONestedOverride (не через авторизацію) — Wave 2 не
+    # розширює D3 на цей випадок.
+    $authUnknownParentThrew = $false
+    try {
+        ConvertTo-BRAVONestedOverride `
+            -DotPathOverrides @{ 'maintenanceSettings.NoSuchNode.Value' = 'x' } `
+            -ReferenceConfiguration $authDefaults | Out-Null
+    } catch {
+        $authUnknownParentThrew = $true
+    }
+    Test-BRAVOCondition `
+        -Condition $authUnknownParentThrew `
+        -Name "Authorization/UnknownParentNodeStillFailsClosedUnchanged" `
+        -Failure "невідомий батьківський вузол мусить і далі fail-closed через ConvertTo-BRAVONestedOverride, незмінно Wave 2"
+
+    # --- Authorization/CaseInsensitivePathCannotBypassDeny ---
+    # PowerShell hashtable-семантика — case-insensitive за замовчуванням;
+    # DENY-класифікація мусить діяти ІДЕНТИЧНО для будь-якого регістру
+    # шляху, а не "проковзнути" як D3 unknown через регістрову
+    # невідповідність.
+    $authUpperCaseResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'MAINTENANCESETTINGS.SERVICES.BRAVONAME' = 'AnyValue' } `
+        -Schema $authSchema
+    $authMixedCaseResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'MaintenanceSettings.services.bravoname' = 'AnyValue' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ((-not [bool]$authUpperCaseResult.IsValid) -and (-not [bool]$authMixedCaseResult.IsValid)) `
+        -Name "Authorization/CaseInsensitivePathCannotBypassDeny" `
+        -Failure "DENY-класифікація maintenanceSettings.Services.BravoName мусить діяти незалежно від регістру шляху (UPPERCASE=$($authUpperCaseResult.IsValid) MixedCase=$($authMixedCaseResult.IsValid))"
+
+    # --- Authorization/NestedDenyPathAuthorizedAtCorrectDepth ---
+    # Вкладений (3-рівневий) DENY_SECURITY_CONTROL-шлях
+    # (backupMonitoring.SFTP.BAZA.MutationPolicy) мусить відхилятись так
+    # само надійно, як top-level шлях — авторизація діє на КОЖНОМУ рівні
+    # глибини, не лише на верхньому.
+    $authNestedDenyResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'Fail' } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNestedDenyResult.IsValid) `
+        -Name "Authorization/NestedDenyPathAuthorizedAtCorrectDepth" `
+        -Failure "вкладений (3-рівневий) DENY_SECURITY_CONTROL-шлях backupMonitoring.SFTP.BAZA.MutationPolicy мусить бути відхилений так само, як top-level DENY-шлях"
+
+    # --- Authorization/ArrayValueClassifiedAsWhole ---
+    # Масив (DENY_EXECUTION_CONTROL: robocopyOptions) класифікується як
+    # ЄДИНЕ ціле, не по елементах — заміна всього масиву на елементи, що
+    # виглядають нешкідливо, все одно відхиляється.
+    $authArrayResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'robocopyOptions' = @('/E') } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authArrayResult.IsValid) `
+        -Name "Authorization/ArrayValueClassifiedAsWhole" `
+        -Failure "robocopyOptions (Array, DENY_EXECUTION_CONTROL) мусить бути відхилений як ціле, незалежно від того, наскільки нешкідливі елементи"
+
+    # --- Authorization/DiagnosticMessageNamesExactPathAndClass ---
+    $authDiagnosticResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services.BravoName' = 'X' } `
+        -Schema $authSchema
+    $authDiagnosticViolation = $authDiagnosticResult.Violations[0]
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$authDiagnosticViolation.Path -eq 'maintenanceSettings.Services.BravoName' -and
+            [string]$authDiagnosticViolation.Class -eq 'DENY_EXECUTION_CONTROL' -and
+            [string]$authDiagnosticViolation.Message -match [regex]::Escape('maintenanceSettings.Services.BravoName')
+        ) `
+        -Name "Authorization/DiagnosticMessageNamesExactPathAndClass" `
+        -Failure "порушення мусить називати точний Path і Class у структурованому результаті (отримано Path=$($authDiagnosticViolation.Path) Class=$($authDiagnosticViolation.Class))"
+
+    # --- Authorization/EmptyOverrideLayerValid ---
+    $authEmptyResult = Test-BRAVOConfigurationOverrideAuthorization -DotPathOverrides @{} -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authEmptyResult.IsValid) `
+        -Name "Authorization/EmptyOverrideLayerValid" `
+        -Failure "порожній local-override шар мусить бути IsValid без жодних порушень"
+
+    # --- Authorization/LoaderCallsAuthorizationAfterSchemaBeforeMerge ---
+    # Структурний guard, той самий патерн, що вже перевіряє
+    # Schema/LoaderValidatesLocalLayerBeforeMerge вище: авторизація мусить
+    # стояти в конвеєрі ПІСЛЯ type-перевірки й ДО Resolve-BRAVORawConfiguration
+    # (merge) — інакше атомарність (weight 9/17) не гарантована.
+    $authLoaderText = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_CONFIG_LOADER.ps1'), [Text.Encoding]::UTF8)
+    $authSchemaCallIndex = $authLoaderText.IndexOf('Test-BRAVOConfigurationOverrideSchema')
+    $authAuthorizationCallIndex = $authLoaderText.IndexOf('Test-BRAVOConfigurationOverrideAuthorization')
+    $authMergeCallIndex = $authLoaderText.IndexOf('$mergedConfiguration = Resolve-BRAVORawConfiguration')
+    Test-BRAVOCondition `
+        -Condition (
+            $authSchemaCallIndex -gt 0 -and $authAuthorizationCallIndex -gt 0 -and $authMergeCallIndex -gt 0 -and
+            $authSchemaCallIndex -lt $authAuthorizationCallIndex -and
+            $authAuthorizationCallIndex -lt $authMergeCallIndex
+        ) `
+        -Name "Authorization/LoaderCallsAuthorizationAfterSchemaBeforeMerge" `
+        -Failure "BRAVO_CONFIG_LOADER мусить викликати Test-BRAVOConfigurationOverrideAuthorization ПІСЛЯ type-перевірки й ДО Resolve-BRAVORawConfiguration (schema=$authSchemaCallIndex authorization=$authAuthorizationCallIndex merge=$authMergeCallIndex)"
+
+    # =====================================================================
+    # Owner remediation (Issue #216 Wave 2): WeakeningOverride —
+    # canonical-registry-owned escape-hatch eligibility. ДО цього блоку
+    # BRAVO_CONFIG_LOADER.ps1 мав власний жорстко закодований перелік
+    # dot-шляхів (BAZA.Mode/MutationPolicy), виключених з
+    # BRAVO_ALLOW_WEAKENED_SECURITY-обходу — друга копія авторизаційної
+    # політики поза реєстром. Тести нижче доводять, що ЄДИНЕ джерело
+    # цього рішення тепер — канонічний реєстр, а не loader.
+    # =====================================================================
+    $authKnownWeakeningOverrides = @('None', 'ExistingSecurityEscapeHatch')
+
+    # --- Authorization/AllWeakeningOverrideValuesRecognized ---
+    $authUnrecognizedWeakeningOverrides = @(@($authRegistry.Values) | ForEach-Object { [string]$_.WeakeningOverride } | Where-Object { $authKnownWeakeningOverrides -notcontains $_ } | Select-Object -Unique)
+    Test-BRAVOCondition `
+        -Condition ($authUnrecognizedWeakeningOverrides.Count -eq 0) `
+        -Name "Authorization/AllWeakeningOverrideValuesRecognized" `
+        -Failure "кожен запис реєстру мусить мати WeakeningOverride з визнаного набору ('None'/'ExistingSecurityEscapeHatch'); знайдено невідомі: $([string]::Join(', ', $authUnrecognizedWeakeningOverrides))"
+
+    # --- Authorization/EscapeHatchEligibleSetIsMechanicallyEnumerableAndExactlyRequireAdministrator ---
+    # Owner-decision (Wave 1, збережено Wave 2): ЄДИНИЙ лист сьогодні з
+    # WeakeningOverride='ExistingSecurityEscapeHatch' — requireAdministrator.
+    # Механічне enumeration з реєстру (не hardcoded loader-список) —
+    # якщо колись власник свідомо додасть ще один escapable-лист, цей
+    # тест НЕ зламається мовчки: він або підтвердить нову множину, або
+    # провалиться з точним переліком, що вимагає свідомого рев'ю.
+    $authEscapeHatchEligiblePaths = @(@($authRegistry.GetEnumerator()) | Where-Object { [string]$_.Value.WeakeningOverride -eq 'ExistingSecurityEscapeHatch' } | ForEach-Object { [string]$_.Key } | Sort-Object)
+    Test-BRAVOCondition `
+        -Condition ($authEscapeHatchEligiblePaths.Count -eq 1 -and $authEscapeHatchEligiblePaths[0] -eq 'requireAdministrator') `
+        -Name "Authorization/EscapeHatchEligibleSetIsMechanicallyEnumerableAndExactlyRequireAdministrator" `
+        -Failure "рівно ОДИН лист (requireAdministrator) мусить мати WeakeningOverride='ExistingSecurityEscapeHatch' сьогодні; отримано ($($authEscapeHatchEligiblePaths.Count)): $([string]::Join(', ', $authEscapeHatchEligiblePaths))"
+
+    # --- Authorization/CanonicalWeakeningOverridePolicyMatrix ---
+    # Пряма перевірка трьох owner-decision листів, названих у ремедіації:
+    # BAZA.Mode/MutationPolicy = None (безумовна відмова), requireAdministrator
+    # = ExistingSecurityEscapeHatch (наявна Wave 1 поведінка збережена).
+    Test-BRAVOCondition `
+        -Condition (
+            [string]$authRegistry['backupMonitoring.SFTP.BAZA.Mode'].WeakeningOverride -eq 'None' -and
+            [string]$authRegistry['backupMonitoring.SFTP.BAZA.MutationPolicy'].WeakeningOverride -eq 'None' -and
+            [string]$authRegistry['requireAdministrator'].WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
+        ) `
+        -Name "Authorization/CanonicalWeakeningOverridePolicyMatrix" `
+        -Failure ("канонічна WeakeningOverride-матриця: BAZA.Mode=$($authRegistry['backupMonitoring.SFTP.BAZA.Mode'].WeakeningOverride)(очікується None) " +
+                  "BAZA.MutationPolicy=$($authRegistry['backupMonitoring.SFTP.BAZA.MutationPolicy'].WeakeningOverride)(очікується None) " +
+                  "requireAdministrator=$($authRegistry['requireAdministrator'].WeakeningOverride)(очікується ExistingSecurityEscapeHatch)")
+
+    # --- Authorization/ViolationObjectExposesWeakeningOverrideForBazaAndRequireAdministrator ---
+    # Структурована ознака (Violation.WeakeningOverride), яку canonical
+    # Test-BRAVOConfigurationWeakeningEscapeHatchAllowed реально читає
+    # ЗАМІСТЬ dot-path-порівняння (PR #224 third review, final cleanup:
+    # BRAVO_CONFIG_LOADER.ps1 більше не читає це поле напряму — делегує
+    # рішення повністю canonical helper-у) — доводимо на РЕАЛЬНИХ
+    # DENY_SECURITY_CONTROL-порушеннях (не лише на сирому реєстрі вище).
+    $authBazaModeViolationCheck = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' } `
+        -Schema $authSchema
+    $authReqAdminViolationCheck = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'requireAdministrator' = $false } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (
+            $authBazaModeViolationCheck.Violations.Count -eq 1 -and
+            [string]$authBazaModeViolationCheck.Violations[0].WeakeningOverride -eq 'None' -and
+            $authReqAdminViolationCheck.Violations.Count -eq 1 -and
+            [string]$authReqAdminViolationCheck.Violations[0].WeakeningOverride -eq 'ExistingSecurityEscapeHatch'
+        ) `
+        -Name "Authorization/ViolationObjectExposesWeakeningOverrideForBazaAndRequireAdministrator" `
+        -Failure "Violation.WeakeningOverride мусить бути 'None' для BAZA.Mode-порушення й 'ExistingSecurityEscapeHatch' для requireAdministrator-порушення — саме це поле canonical Test-BRAVOConfigurationWeakeningEscapeHatchAllowed тепер читає замість dot-path-списку"
+
+    # --- Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed ---
+    # Issue #216 Wave 2 owner remediation, п.9: МАЙБУТНІЙ (гіпотетичний,
+    # НЕ справжній) DENY_SECURITY_CONTROL-лист без явного WeakeningOverride
+    # мусить fail-closed до 'None' — доводимо на РЕАЛЬНОМУ виклику
+    # Test-BRAVOConfigurationOverrideAuthorization із тимчасово доданим
+    # синтетичним листом у ПРИВАТНИЙ script-стан модуля (не постійний
+    # запис реєстру — видаляється в finally, незалежно від результату).
+    & {
+        $futureLeafPath = '__SELFTEST_SYNTHETIC_FUTURE_DENY_LEAF__'
+        $futureLeafModule = Get-Module -Name 'BRAVO.Configuration.Schema'
+        $futureLeafAdded = $false
+        try {
+            & $futureLeafModule {
+                param($path)
+                # Синтетичний запис БЕЗ WeakeningOverride-ключа взагалі —
+                # рівно той сценарій, що майбутній контриб'ютор створив
+                # би, додавши новий DENY_SECURITY_CONTROL-лист і забувши
+                # (або свідомо не бажаючи) позначити його escapable.
+                $script:BRAVOConfigurationSchemaAuthorizationClass[$path] = @{ Class = 'DENY_SECURITY_CONTROL' }
+            } $futureLeafPath
+            $futureLeafAdded = $true
+
+            $futureLeafSchema = @{}
+            foreach ($k in @($authSchema.Keys)) { $futureLeafSchema[$k] = $authSchema[$k] }
+            $futureLeafSchema[$futureLeafPath] = @{ Kind = 'String'; Nullable = $false }
+
+            $futureLeafResult = Test-BRAVOConfigurationOverrideAuthorization `
+                -DotPathOverrides @{ $futureLeafPath = 'anything' } `
+                -Schema $futureLeafSchema
+
+            Test-BRAVOCondition `
+                -Condition (
+                    -not [bool]$futureLeafResult.IsValid -and
+                    $futureLeafResult.Violations.Count -eq 1 -and
+                    [string]$futureLeafResult.Violations[0].WeakeningOverride -eq 'None'
+                ) `
+                -Name "Authorization/FutureLeafWithoutExplicitWeakeningOverrideFailsClosed" `
+                -Failure "гіпотетичний майбутній DENY_SECURITY_CONTROL-лист БЕЗ явного WeakeningOverride мусить fail-closed до 'None' (не мовчки успадковувати escapability); отримано IsValid=$($futureLeafResult.IsValid), WeakeningOverride=$(if ($futureLeafResult.Violations.Count -gt 0) { $futureLeafResult.Violations[0].WeakeningOverride } else { '<немає порушень>' })"
+        } finally {
+            if ($futureLeafAdded) {
+                & $futureLeafModule {
+                    param($path)
+                    $script:BRAVOConfigurationSchemaAuthorizationClass.Remove($path)
+                } $futureLeafPath
+            }
+        }
+    }
+
+    # =====================================================================
+    # PR #224 review, F1: вкладений (nested hashtable) Node-шлях local
+    # override мусить рекурсивно авторизуватись по КОЖНОМУ дочірньому
+    # листу — реєстр авторизації навмисно leaf-only (Node-записів немає),
+    # тож ДО фіксу такий override помилково провалювався з
+    # MissingAuthorizationPolicy/UNREGISTERED замість реальної
+    # leaf-по-leaf перевірки.
+    # =====================================================================
+
+    # --- Authorization/NestedAllowedNodeAccepted ---
+    $authNestedAllowedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'bravoSettings.NotificationRouting' = @{ SUCCESS = 'general'; WARNING = 'alerts' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNestedAllowedResult.IsValid) `
+        -Name "Authorization/NestedAllowedNodeAccepted" `
+        -Failure "вкладений Node-override з усіма ALLOW_* дочірніми листами мусить бути прийнятий; отримано IsValid=$($authNestedAllowedResult.IsValid) Violations=$($authNestedAllowedResult.Violations.Count)"
+
+    # --- Authorization/NestedNodeDeniedLeafBlocked ---
+    $authNestedDeniedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services' = @{ BravoName = 'OtherService' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (
+            (-not [bool]$authNestedDeniedResult.IsValid) -and
+            $authNestedDeniedResult.Violations.Count -eq 1 -and
+            [string]$authNestedDeniedResult.Violations[0].Path -eq 'maintenanceSettings.Services.BravoName'
+        ) `
+        -Name "Authorization/NestedNodeDeniedLeafBlocked" `
+        -Failure "вкладений Node-override, чий єдиний дочірній лист DENY_*, мусить бути відхилений з точним Path дочірнього листа; отримано IsValid=$($authNestedDeniedResult.IsValid) Path=$(if ($authNestedDeniedResult.Violations.Count -gt 0) { $authNestedDeniedResult.Violations[0].Path } else { '<немає>' })"
+
+    # --- Authorization/NestedMixedAllowedAndDeniedFailsAtomically ---
+    # Node з ДВОМА дочірніми листами — один ALLOW_SITE
+    # (BravoDisplayName), один DENY_EXECUTION_CONTROL (BravoName) — весь
+    # ШАР мусить провалитись атомарно (не лише конкретний лист).
+    $authNestedMixedResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Services' = @{ BravoName = 'OtherService'; BravoDisplayName = 'Custom Display' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNestedMixedResult.IsValid) `
+        -Name "Authorization/NestedMixedAllowedAndDeniedFailsAtomically" `
+        -Failure "Node з мішаними ALLOW/DENY дочірніми листами мусить провалити ВЕСЬ шар атомарно; отримано IsValid=$($authNestedMixedResult.IsValid)"
+
+    # --- Authorization/NestedPathCaseInsensitive ---
+    $authNestedCaseResult = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'MAINTENANCESETTINGS.SERVICES' = @{ BRAVONAME = 'OtherService' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition (-not [bool]$authNestedCaseResult.IsValid) `
+        -Name "Authorization/NestedPathCaseInsensitive" `
+        -Failure "вкладена DENY-класифікація мусить діяти незалежно від регістру і батьківського Node-шляху, і дочірнього ключа; отримано IsValid=$($authNestedCaseResult.IsValid)"
+
+    # --- Authorization/NestedUnknownChildUnderKnownNodeStillD3Accepted ---
+    # D3 мусить лишитись незмінним і для вкладеної форми: невідомий
+    # дочірній ключ під ВІДОМИМ Node-шляхом — accept, не UNREGISTERED.
+    $authNestedD3Result = Test-BRAVOConfigurationOverrideAuthorization `
+        -DotPathOverrides @{ 'maintenanceSettings.Limits' = @{ SomeFutureLeaf = 'x' } } `
+        -Schema $authSchema
+    Test-BRAVOCondition `
+        -Condition ([bool]$authNestedD3Result.IsValid) `
+        -Name "Authorization/NestedUnknownChildUnderKnownNodeStillD3Accepted" `
+        -Failure "невідомий дочірній ключ під відомим Node-шляхом мусить лишитись D3 ACCEPT у вкладеній формі так само, як у пласкій; отримано IsValid=$($authNestedD3Result.IsValid)"
+
+    # --- Authorization/NestedRegistryStaysLeafOnly ---
+    # Реєстр авторизації НЕ повинен отримати запис для самого Node-шляху
+    # (bravoSettings.NotificationRouting) — лише для його листів; фікс F1
+    # не мав додавати Node-записи в реєстр.
+    Test-BRAVOCondition `
+        -Condition (-not $authRegistry.Contains('bravoSettings.NotificationRouting')) `
+        -Name "Authorization/NestedRegistryStaysLeafOnly" `
+        -Failure "реєстр авторизації мусить лишатись leaf-only — bravoSettings.NotificationRouting (Node) не повинен мати власного запису в реєстрі"
+}
+
+# =====================================================================
 # Версійний диспетч site-файлу (#154, B3)
 # =====================================================================
 & {

@@ -381,7 +381,24 @@
     # 'backupMonitoring.SFTP.BAZAPendingAlertAfterHours' = 26
 
     # --- BAZA append-only двигун ---
-    # 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly'  # | 'Legacy'
+    # УВАГА, НЕ РОЗКОМЕНТОВУВАТИ: 'backupMonitoring.SFTP.BAZA.Mode'
+    # класифікований у Wave 2 authorization-реєстрі (Issue #216;
+    # modules/BRAVO.Configuration/BRAVO.Configuration.Schema.psm1) як
+    # DENY_SECURITY_CONTROL — BRAVO.local.config НЕ МАЄ повноважень
+    # перевизначати цей лист; canonical loader відхилить перевизначення
+    # fail-closed незалежно від запропонованого значення (append-only
+    # mutation-детекція BAZA — security-critical, не оператора рішення).
+    # Рядок нижче лишається задокументованим ЛИШЕ для розпізнавання й
+    # ручного recovery легасі-значення в наявних site-файлах (Configurator
+    # Clear-механізм) — НЕ як звичайний перелік доступних для
+    # розкоментовування override-ів:
+    # 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly'  # | 'Legacy' — NON-OVERRIDABLE (DENY_SECURITY_CONTROL, лише recovery-довідка)
+    # УВАГА, НЕ РОЗКОМЕНТОВУВАТИ: 'backupMonitoring.SFTP.BAZA.MutationPolicy'
+    # так само DENY_SECURITY_CONTROL — єдине підтримуване BazaSync-значення
+    # 'Fail' ([ValidateSet('Fail')], modules/BRAVO.BazaSync/BRAVO.BazaSync.psm1);
+    # рядок нижче лишається задокументованим ЛИШЕ для розпізнавання й
+    # ручного recovery легасі-значення (Configurator Clear-механізм):
+    # 'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'Fail' — NON-OVERRIDABLE (DENY_SECURITY_CONTROL, лише recovery-довідка)
     # 'backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth' = $true
     # 'backupMonitoring.SFTP.BAZA.FastHealthEnabled' = $true
     # 'backupMonitoring.SFTP.BAZA.FullAuditEnabled' = $true

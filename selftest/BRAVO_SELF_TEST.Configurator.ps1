@@ -408,7 +408,14 @@ try {
     $backupFailureBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorBackupFailureRoot
     $backupFailureContentBefore = Get-Content -LiteralPath $backupFailureConfigPath -Raw -Encoding UTF8
     $backupFailureModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $backupFailureBaseline.Overrides
-    $backupFailureModel = Set-BRAVOConfiguratorOverride -Model $backupFailureModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARN'
+    # Issue #216, Wave 2: 'WARN' НЕ є валідним ConsoleLevel-значенням
+    # (канонічний enum — TRACE/DEBUG/INFO/SUCCESS/WARNING/ERROR/FATAL,
+    # BRAVO.Configuration.Schema.psm1); до Wave 2 це проходило
+    # непоміченим (лише String type-check), тепер canonical loader
+    # коректно відхиляє його РАНІШЕ. Тест перевіряє backup-on-apply/
+    # atomic-replace, а не enum-семантику, тому досить БУДЬ-ЯКОГО
+    # валідного значення, відмінного від baseline 'ERROR'.
+    $backupFailureModel = Set-BRAVOConfiguratorOverride -Model $backupFailureModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARNING'
     $backupFailureModel = Update-BRAVOConfiguratorEffective -Model $backupFailureModel -RuntimeRoot $configuratorFixtureRuntimeRoot
 
     $backupFailureAcl = Get-Acl -Path $configuratorBackupFailureRoot
@@ -476,7 +483,9 @@ try {
     $atomicReplaceBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $configuratorAtomicReplaceRoot
     $atomicReplaceContentBefore = Get-Content -LiteralPath $atomicReplaceConfigPath -Raw -Encoding UTF8
     $atomicReplaceModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $atomicReplaceBaseline.Overrides
-    $atomicReplaceModel = Set-BRAVOConfiguratorOverride -Model $atomicReplaceModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARN'
+    # Issue #216, Wave 2: див. коментар у аналогічному backup-failure
+    # тесті вище — 'WARN' не є валідним ConsoleLevel-значенням.
+    $atomicReplaceModel = Set-BRAVOConfiguratorOverride -Model $atomicReplaceModel -Path 'consoleSettings.ConsoleLevel' -Value 'WARNING'
     $atomicReplaceModel = Update-BRAVOConfiguratorEffective -Model $atomicReplaceModel -RuntimeRoot $configuratorFixtureRuntimeRoot
 
     $atomicReplaceLockStream = [System.IO.File]::Open(
@@ -930,6 +939,110 @@ Test-BRAVOCondition (
     'Configurator Dirty: масив з іншим порядком елементів проти baseline -> true' `
     "ArrayCount=$($dirtyArrayReversedList.Count) Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $dirtyModelArrayReordered -BaselineOverrides $dirtyBaselineWithArray)"
 
+# ===== PR #224 review (P2, "Resolve nested baselines in dirty checks") —
+# Test-BRAVOConfiguratorModelDirty тепер читає baseline через канонічний
+# Resolve-BRAVOConfiguratorSuppliedLeafOverride (замість прямого
+# $BaselineOverrides.Contains($setting.Path)), тому вкладена (Node)
+# baseline-форма розпізнається так само, як і плоска. =====
+
+$nestedDirtyContainerPath = 'bravoSettings.NotificationRouting'
+$nestedDirtySuccessPath = 'bravoSettings.NotificationRouting.SUCCESS'
+$nestedDirtyWarningPath = 'bravoSettings.NotificationRouting.WARNING'
+
+# A1 / Configurator/NestedBaselineUntouchedIsNotDirty: baseline supplied у
+# вкладеній Node-формі, модель побудована з неї й НЕ торкана -> false
+# (пряме відтворення review-знахідки: раніше Contains($setting.Path)
+# завжди повертав $false для цього baseline і звітував dirty=true).
+$nestedDirtyBaseline = @{ $nestedDirtyContainerPath = @{ SUCCESS = 'alerts'; WARNING = 'general' } }
+$nestedDirtyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyBaseline
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModel -BaselineOverrides $nestedDirtyBaseline)) `
+    'Configurator/NestedBaselineUntouchedIsNotDirty: вкладена (Node) baseline, модель нею ж побудована й не торкана -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModel -BaselineOverrides $nestedDirtyBaseline)"
+
+# A2 / Configurator/NestedBaselineChangedIsDirty: змінити один вкладений
+# leaf -> true.
+$nestedDirtyModelChanged = Set-BRAVOConfiguratorOverride -Model $nestedDirtyModel -Path $nestedDirtySuccessPath -Value 'general'
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelChanged -BaselineOverrides $nestedDirtyBaseline) `
+    'Configurator/NestedBaselineChangedIsDirty: зміна одного вкладеного leaf проти вкладеного baseline -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelChanged -BaselineOverrides $nestedDirtyBaseline)"
+
+# A3 / Configurator/NestedBaselineRevertedIsNotDirty: змінити, потім
+# повернути значення назад до baseline ('alerts') -> false. Свідомо НЕ
+# покладається на подієвий Model[].Dirty (лишався б true).
+$nestedDirtyModelReverted = Set-BRAVOConfiguratorOverride -Model $nestedDirtyModelChanged -Path $nestedDirtySuccessPath -Value 'alerts'
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelReverted -BaselineOverrides $nestedDirtyBaseline)) `
+    'Configurator/NestedBaselineRevertedIsNotDirty: вкладений leaf змінено, потім повернуто до baseline-значення -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelReverted -BaselineOverrides $nestedDirtyBaseline)"
+
+# A4 / Configurator/NestedBaselineClearIsDirty: вкладений baseline-leaf
+# існував, Clear прибирає його -> true (presence-diff значущий).
+$nestedDirtyModelCleared = Clear-BRAVOConfiguratorOverride -Model $nestedDirtyModel -Path $nestedDirtySuccessPath
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelCleared -BaselineOverrides $nestedDirtyBaseline) `
+    'Configurator/NestedBaselineClearIsDirty: вкладений baseline-leaf прибрано через Clear -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyModelCleared -BaselineOverrides $nestedDirtyBaseline)"
+
+# A5 / Configurator/NestedBaselineFalseLikeValuePresence: вкладений
+# boolean-leaf з "falsy" значенням $false МАЄ трактуватись як present,
+# не як absent (та сама "false override != absent override" семантика,
+# що AI-тест вище, але тепер через вкладену Node-форму, 2 рівні
+# вкладеності: 'componentSettings' -> 'SFTP' -> 'ArchiveUpload').
+$nestedDirtyBooleanPath = 'componentSettings.SFTP.ArchiveUpload'
+$nestedDirtyBooleanBaseline = @{ componentSettings = @{ SFTP = @{ ArchiveUpload = $false } } }
+$nestedDirtyBooleanModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyBooleanBaseline
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanModel -BaselineOverrides $nestedDirtyBooleanBaseline)) `
+    'Configurator/NestedBaselineFalseLikeValuePresence: вкладений override=false, модель побудована з нього -> false (присутній, не absent)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanModel -BaselineOverrides $nestedDirtyBooleanBaseline)"
+$nestedDirtyBooleanCleared = Clear-BRAVOConfiguratorOverride -Model $nestedDirtyBooleanModel -Path $nestedDirtyBooleanPath
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanCleared -BaselineOverrides $nestedDirtyBooleanBaseline) `
+    'Configurator/NestedBaselineFalseLikeValuePresence: Clear вкладеного false-override -> true (presence, не value, змінився)' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyBooleanCleared -BaselineOverrides $nestedDirtyBooleanBaseline)"
+
+# A6 / Configurator/NestedBaselineFlatPrecedence: baseline містить ОБИДВІ
+# представлення одночасно (флат + вкладена, флат МАЄ пріоритет —
+# Resolve-BRAVOConfiguratorSuppliedLeafOverride та сама D3/F1-межа, що й
+# canonical model-load). Untouched модель, побудована з ТОГО САМОГО
+# baseline, повинна лишатись чистою — dirty-check не має розходитись із
+# model-load precedence-семантикою.
+$nestedDirtyMixedBaseline = @{
+    $nestedDirtySuccessPath = 'alerts'
+    $nestedDirtyContainerPath = @{ SUCCESS = 'general'; WARNING = 'alerts' }
+}
+$nestedDirtyMixedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyMixedBaseline
+$nestedDirtyMixedSuccessRow = @($nestedDirtyMixedModel | Where-Object { $_.Path -eq $nestedDirtySuccessPath })[0]
+Test-BRAVOCondition ([string]$nestedDirtyMixedSuccessRow.OverrideValue -eq 'alerts') `
+    'Configurator/NestedBaselineFlatPrecedence: model-load сам обирає флат-значення (alerts) при мішаному baseline' `
+    "OverrideValue=$($nestedDirtyMixedSuccessRow.OverrideValue)"
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyMixedModel -BaselineOverrides $nestedDirtyMixedBaseline)) `
+    'Configurator/NestedBaselineFlatPrecedence: untouched модель проти мішаного (флат+вкладений) baseline -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyMixedModel -BaselineOverrides $nestedDirtyMixedBaseline)"
+
+# A7: глибша вкладеність (2 сегменти під TopLevelKey замість 1) —
+# 'componentSettings' -> 'SFTP' -> 'ArchiveUpload', НЕ 'componentSettings.SFTP' -> 'ArchiveUpload'.
+$nestedDirtyDeepBaseline = @{ componentSettings = @{ SFTP = @{ ArchiveUpload = $true } } }
+$nestedDirtyDeepModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDirtyDeepBaseline
+Test-BRAVOCondition (-not (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModel -BaselineOverrides $nestedDirtyDeepBaseline)) `
+    'Configurator/NestedBaselineDeepSegments: 2-сегментна вкладеність (componentSettings.SFTP.ArchiveUpload), untouched -> false' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModel -BaselineOverrides $nestedDirtyDeepBaseline)"
+$nestedDirtyDeepModelChanged = Set-BRAVOConfiguratorOverride -Model $nestedDirtyDeepModel -Path $nestedDirtyBooleanPath -Value $false
+Test-BRAVOCondition (Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModelChanged -BaselineOverrides $nestedDirtyDeepBaseline) `
+    'Configurator/NestedBaselineDeepSegments: 2-сегментна вкладеність, значення змінено -> true' `
+    "Dirty=$(Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyDeepModelChanged -BaselineOverrides $nestedDirtyDeepBaseline)"
+
+# Non-mutation guard (§4 задачі): Test-BRAVOConfiguratorModelDirty
+# лишається read-only — не мутує ні $BaselineOverrides (включно з
+# вкладеними hashtable-значеннями), ні $Model.
+$nestedDirtyGuardBaselineBefore = ConvertTo-Json -InputObject $nestedDirtyMixedBaseline -Depth 10 -Compress
+$nestedDirtyGuardModelBefore = ConvertTo-Json -InputObject $nestedDirtyMixedModel -Depth 10 -Compress
+[void](Test-BRAVOConfiguratorModelDirty -Model $nestedDirtyMixedModel -BaselineOverrides $nestedDirtyMixedBaseline)
+$nestedDirtyGuardBaselineAfter = ConvertTo-Json -InputObject $nestedDirtyMixedBaseline -Depth 10 -Compress
+$nestedDirtyGuardModelAfter = ConvertTo-Json -InputObject $nestedDirtyMixedModel -Depth 10 -Compress
+Test-BRAVOCondition (
+    ($nestedDirtyGuardBaselineBefore -eq $nestedDirtyGuardBaselineAfter) -and
+    ($nestedDirtyGuardModelBefore -eq $nestedDirtyGuardModelAfter)
+) `
+    'Configurator/NestedBaselineDirtyCheckIsReadOnly: Test-BRAVOConfiguratorModelDirty не мутує ні BaselineOverrides, ні Model' `
+    "BaselineUnchanged=$($nestedDirtyGuardBaselineBefore -eq $nestedDirtyGuardBaselineAfter) ModelUnchanged=$($nestedDirtyGuardModelBefore -eq $nestedDirtyGuardModelAfter)"
+
 # AK: Reset-BRAVOConfiguratorSetting — еквівалентний Clear (Boolean повертається
 # до Default, а не матеріалізується як False).
 $dirtyModelForResetSetting = Set-BRAVOConfiguratorOverride -Model $dirtyModelClean -Path $dirtyBooleanPath -Value $false
@@ -1081,6 +1194,2666 @@ try {
     }
 } finally {
     Remove-Item -LiteralPath $configuratorNoConfigRuntimeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+
+# =====================================================================
+# Wave 2 (#216): Configurator споживає canonical authorization Class
+# =====================================================================
+# Доводить, що Resolve-BRAVOConfiguratorFieldAuthorization ГЕНУЇННО
+# читає canonical реєстр (не другу, окремо підтримувану копію) — і що
+# drift-приклад із WAVE2-CONTRACT.md (розділ 11.4,
+# backupMonitoring.SFTP.BAZA.Mode) фактично усунутий.
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $authAdapterRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $authAdapterClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $authAdapterResolved = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $authAdapterRawCatalog -AuthorizationClass $authAdapterClassRegistry
+
+    # --- Configurator/Authorization/AllowSiteFieldRemainsEditable ---
+    $authAdapterAllowSite = @($authAdapterResolved | Where-Object { $_.Path -eq 'archiveRetentionDays' })
+    Test-BRAVOCondition ($authAdapterAllowSite.Count -eq 1 -and [bool]$authAdapterAllowSite[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/AllowSiteFieldRemainsEditable' `
+        "archiveRetentionDays (ALLOW_SITE) мусить лишитись ReadOnly=`$false; отримано count=$($authAdapterAllowSite.Count) ReadOnly=$($authAdapterAllowSite[0].ReadOnly)"
+
+    # --- Configurator/Authorization/AllowWithValidatorFieldRemainsEditable ---
+    $authAdapterAllowValidator = @($authAdapterResolved | Where-Object { $_.Path -eq 'bravoSettings.NotificationMode' })
+    Test-BRAVOCondition ($authAdapterAllowValidator.Count -eq 1 -and [bool]$authAdapterAllowValidator[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/AllowWithValidatorFieldRemainsEditable' `
+        "bravoSettings.NotificationMode (ALLOW_WITH_VALIDATOR) мусить лишитись ReadOnly=`$false; отримано count=$($authAdapterAllowValidator.Count) ReadOnly=$($authAdapterAllowValidator[0].ReadOnly)"
+
+    # --- Configurator/Authorization/BazaModeNoLongerEmittedAsEditable ---
+    # Конкретна drift-позиція з WAVE2-CONTRACT.md (розділ 11.4): статичний
+    # каталог документує ReadOnly=$false, AllowedValues=@('IncrementalAppendOnly','Legacy')
+    # — canonical DENY_SECURITY_CONTROL мусить примусово зробити її
+    # ефективно read-only.
+    $authAdapterBazaModeRaw = @($authAdapterRawCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    $authAdapterBazaModeResolved = @($authAdapterResolved | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    Test-BRAVOCondition (
+        $authAdapterBazaModeRaw.Count -eq 1 -and [bool]$authAdapterBazaModeRaw[0].ReadOnly -eq $false -and
+        $authAdapterBazaModeResolved.Count -eq 1 -and [bool]$authAdapterBazaModeResolved[0].ReadOnly -eq $true
+    ) `
+        'Configurator/Authorization/BazaModeNoLongerEmittedAsEditable' `
+        ("статичний каталог документує backupMonitoring.SFTP.BAZA.Mode як ReadOnly=`$false (RawReadOnly=$($authAdapterBazaModeRaw[0].ReadOnly)), " +
+         "але canonical adapter мусить примусово дати ReadOnly=`$true (ResolvedReadOnly=$($authAdapterBazaModeResolved[0].ReadOnly)) — інакше Configurator генерував би override, який loader після Wave 2 відхилить")
+
+    # --- Configurator/Authorization/DenyExecutionControlFieldNotEditable ---
+    # maintenanceSettings.Services.BravoName НЕ задокументований у
+    # каталозі Configurator-а сьогодні (DENY_EXECUTION_CONTROL, ніколи не
+    # мав редагованого поля) — перевіряємо клас через синтетичний
+    # дескриптор, що доводить: adapter форсує ReadOnly для БУДЬ-ЯКОГО
+    # DENY_-класу, не лише для вже задокументованого BAZA.Mode-кейса.
+    $authAdapterSyntheticDescriptors = @(
+        @{ Path = 'maintenanceSettings.Services.BravoName'; Group = 'Maintenance'; Section = 'Services'; Label = 'probe'; Description = ''; Type = 'String'; Phase = 1; Advanced = $false; ReadOnly = $false; Secret = $false; Order = 1 }
+    )
+    $authAdapterSyntheticResolved = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $authAdapterSyntheticDescriptors -AuthorizationClass $authAdapterClassRegistry
+    Test-BRAVOCondition ([bool]$authAdapterSyntheticResolved[0].ReadOnly -eq $true) `
+        'Configurator/Authorization/DenyExecutionControlFieldNotEditable' `
+        "синтетичний дескриптор на DENY_EXECUTION_CONTROL-шляху (statically ReadOnly=`$false) мусить отримати effective ReadOnly=`$true; отримано $($authAdapterSyntheticResolved[0].ReadOnly)"
+
+    # --- Configurator/Authorization/AdapterGenuinelyConsumesCanonicalClass ---
+    # Мутуємо ЛИШЕ canonical Class копії реєстру (не каталог) і доводимо,
+    # що вихід adapter-а міняється відповідно — інакше ReadOnly=$true для
+    # BAZA.Mode міг би бути жорстко закодований в adapter-і, а не реально
+    # похідний від реєстру.
+    $authAdapterMutatedRegistry = @{}
+    foreach ($mutateKey in @($authAdapterClassRegistry.Keys)) { $authAdapterMutatedRegistry[$mutateKey] = $authAdapterClassRegistry[$mutateKey] }
+    $authAdapterMutatedRegistry['backupMonitoring.SFTP.BAZA.Mode'] = @{ Class = 'ALLOW_SITE'; Validator = $null }
+    $authAdapterMutatedResolved = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $authAdapterRawCatalog -AuthorizationClass $authAdapterMutatedRegistry
+    $authAdapterMutatedBazaMode = @($authAdapterMutatedResolved | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    Test-BRAVOCondition ($authAdapterMutatedBazaMode.Count -eq 1 -and [bool]$authAdapterMutatedBazaMode[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/AdapterGenuinelyConsumesCanonicalClass' `
+        "мутація ЛИШЕ canonical Class (BAZA.Mode -> ALLOW_SITE у копії реєстру) мусить змінити ефективний ReadOnly на `$false — доводить, що adapter реально читає реєстр, а не жорстко кодує рішення для конкретного шляху; отримано $($authAdapterMutatedBazaMode[0].ReadOnly)"
+
+    # --- Configurator/Authorization/RawCatalogUnmutatedByAdapter ---
+    $authAdapterRawAfter = @(Get-BRAVOConfiguratorSchemaCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+    Test-BRAVOCondition ($authAdapterRawAfter.Count -eq 1 -and [bool]$authAdapterRawAfter[0].ReadOnly -eq $false) `
+        'Configurator/Authorization/RawCatalogUnmutatedByAdapter' `
+        "Resolve-BRAVOConfiguratorFieldAuthorization НЕ повинен мутувати вхідні дескриптори/повторні читання сирого каталогу; отримано ReadOnly=$($authAdapterRawAfter[0].ReadOnly)"
+}
+
+# =====================================================================
+# PR #224 review, F2: legacy denied override deadlockує Configurator при
+# старті. Pre-Wave-2 BRAVO.local.config міг уже містити
+# backupMonitoring.SFTP.BAZA.Mode='Legacy' (тоді ще editable через
+# Configurator, тепер DENY_SECURITY_CONTROL/ReadOnly). Тести нижче
+# доводять: (a) сам факт наявності такого override НЕ падає при
+# завантаженні/preview-обчисленні (ConvertTo-BRAVOConfiguratorOverrideHashtable
+# виключає DENY_* з проєкції ДЛЯ preview), (b) Apply-гейт і далі
+# коректно fail-closed, доки override не прибрано (Clear), (c) після
+# Clear — валідний candidate, Apply проходить, і результуючий файл
+# більше не містить denied override.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $legacyDeniedPath = 'backupMonitoring.SFTP.BAZA.Mode'
+    $legacyDeniedRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $legacyDeniedClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $legacyDeniedResolvedCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $legacyDeniedRawCatalog -AuthorizationClass $legacyDeniedClassRegistry
+
+    $legacyDeniedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_LEGACYDENIED_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($legacyDeniedScenarioRoot)
+    try {
+        # Продакшн-файл УЖЕ містить легасі-заборонений override — так,
+        # ніби записаний до-Wave-2 версією Configurator-а (не через
+        # поточний Set/Apply-конвеєр, який сам ніколи б такий override
+        # не створив).
+        # Section 6 (PR #224 review remediation): fixture також містить
+        # ОДИН сусідній ALLOW_SITE override (archiveRetentionDays), аби
+        # довести не лише "denied прибрано", а й "інший, валідний,
+        # override переживає весь цикл Clear -> Apply незмінним".
+        $legacyDeniedAllowedPath = 'archiveRetentionDays'
+        $legacyDeniedAllowedValue = 45
+        $legacyDeniedLocalConfigPath = Join-Path $legacyDeniedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $legacyDeniedLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $legacyDeniedPath        = 'Legacy'
+                $legacyDeniedAllowedPath = $legacyDeniedAllowedValue
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $legacyDeniedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot
+        Test-BRAVOCondition ($legacyDeniedBaseline.Overrides.Contains($legacyDeniedPath)) `
+            'Configurator/LegacyDeniedOverride/BaselineFixtureContainsIt' `
+            "fixture-передумова: baseline мусить містити $legacyDeniedPath='Legacy' перед рештою сценарію; отримано Contains=$($legacyDeniedBaseline.Overrides.Contains($legacyDeniedPath))"
+
+        $legacyDeniedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $legacyDeniedResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $legacyDeniedBaseline.Overrides
+        $legacyDeniedSetting = @($legacyDeniedModel | Where-Object { $_.Path -eq $legacyDeniedPath })
+
+        # --- Configurator/LegacyDeniedOverrideIsReadOnly ---
+        Test-BRAVOCondition (
+            $legacyDeniedSetting.Count -eq 1 -and [bool]$legacyDeniedSetting[0].OverridePresent -and
+            [bool]$legacyDeniedSetting[0].Metadata.ReadOnly -eq $true
+        ) `
+            'Configurator/LegacyDeniedOverrideIsReadOnly' `
+            "легасі-заборонений override мусить бути OverridePresent=`$true, Metadata.ReadOnly=`$true (canonical adapter forcing); отримано OverridePresent=$($legacyDeniedSetting[0].OverridePresent) ReadOnly=$($legacyDeniedSetting[0].Metadata.ReadOnly)"
+
+        # --- Configurator/LegacyDeniedOverrideDoesNotPreventStartup ---
+        # ГОЛОВНИЙ баг F2: Update-BRAVOConfiguratorEffective (звичайний
+        # UI startup/preview шлях, БЕЗ -CandidateOverridesOverride) НЕ
+        # повинен падати лише тому, що Model містить легасі-заборонений
+        # override.
+        $legacyDeniedStartupThrew = $false
+        $legacyDeniedStartupMessage = $null
+        $legacyDeniedModelAfterEffective = $null
+        try {
+            $legacyDeniedModelAfterEffective = Update-BRAVOConfiguratorEffective -Model $legacyDeniedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        } catch {
+            $legacyDeniedStartupThrew = $true
+            $legacyDeniedStartupMessage = $_.Exception.Message
+        }
+        Test-BRAVOCondition (-not $legacyDeniedStartupThrew) `
+            'Configurator/LegacyDeniedOverrideDoesNotPreventStartup' `
+            "наявність легасі-забороненого override у Model НЕ повинна кидати виняток при звичайному Update-BRAVOConfiguratorEffective (preview/startup шлях); помилка: $legacyDeniedStartupMessage"
+
+        # --- Configurator/LegacyDeniedOverrideCanBeCleared ---
+        $legacyDeniedCleared = Clear-BRAVOConfiguratorOverride -Model $legacyDeniedModel -Path $legacyDeniedPath
+        $legacyDeniedClearedSetting = @($legacyDeniedCleared | Where-Object { $_.Path -eq $legacyDeniedPath })
+        Test-BRAVOCondition (
+            $legacyDeniedClearedSetting.Count -eq 1 -and (-not [bool]$legacyDeniedClearedSetting[0].OverridePresent)
+        ) `
+            'Configurator/LegacyDeniedOverrideCanBeCleared' `
+            "оператор мусить мати змогу зняти легасі-заборонений override (Clear-BRAVOConfiguratorOverride) незалежно від ReadOnly; отримано OverridePresent=$($legacyDeniedClearedSetting[0].OverridePresent)"
+
+        # --- Configurator/LegacyDeniedOverrideCannotBeAppliedUnchanged ---
+        # Apply-гейт (Test-BRAVOConfiguratorCandidateOverrides, який
+        # ЗАВЖДИ обходить проєкцію через -CandidateOverridesOverride)
+        # мусить лишитись строгим: доки override НЕ прибрано, Apply
+        # мусить провалитись на Validation, а не мовчки пропустити.
+        # Section 6, Scenario A: захоплюємо байти файлу ДО спроби Apply, аби
+        # довести не лише Stage='Validation', а й що production-файл
+        # лишається побайтово незмінним (Validation повертається до кроку
+        # backup/atomic-replace у Invoke-BRAVOConfiguratorApply — write
+        # ще фізично не відбувся).
+        $legacyDeniedPreApplyBytes = [IO.File]::ReadAllBytes($legacyDeniedLocalConfigPath)
+        $legacyDeniedModelUnchanged = Update-BRAVOConfiguratorEffective -Model $legacyDeniedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $legacyDeniedApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot -Model $legacyDeniedModelUnchanged -SchemaCatalog $legacyDeniedResolvedCatalog -ProductionBaseline $legacyDeniedBaseline
+        $legacyDeniedPostApplyBytes = [IO.File]::ReadAllBytes($legacyDeniedLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$legacyDeniedApplyUnchanged.Applied) -and [string]$legacyDeniedApplyUnchanged.Stage -eq 'Validation'
+        ) `
+            'Configurator/LegacyDeniedOverrideCannotBeAppliedUnchanged' `
+            "Apply з незмінним (все ще присутнім) легасі-забороненим override мусить провалитись на стадії Validation, НЕ бути Applied; отримано Applied=$($legacyDeniedApplyUnchanged.Applied) Stage=$($legacyDeniedApplyUnchanged.Stage)"
+        Test-BRAVOCondition (
+            [Convert]::ToBase64String($legacyDeniedPreApplyBytes) -eq [Convert]::ToBase64String($legacyDeniedPostApplyBytes)
+        ) `
+            'Configurator/LegacyDeniedOverrideValidationFailureLeavesProductionFileByteIdentical' `
+            "провал Apply на стадії Validation НЕ повинен торкатись production BRAVO.local.config — файл мусить лишитись побайтово ідентичним ($($legacyDeniedPreApplyBytes.Length) байт до, $($legacyDeniedPostApplyBytes.Length) байт після)"
+
+        # --- Configurator/LegacyDeniedOverrideCannotBeChanged ---
+        # Навіть спроба ЗМІНИТИ (не лише лишити) заборонений override на
+        # ІНШЕ (так само заборонене) значення не повинна коли-небудь
+        # реально потрапити в продакшн — canonical loader відхиляє це
+        # незалежно від конкретного запропонованого значення (авторизація
+        # про володіння листом, не про безпечність значення).
+        $legacyDeniedModelChanged = Set-BRAVOConfiguratorOverride -Model $legacyDeniedModel -Path $legacyDeniedPath -Value 'IncrementalAppendOnly'
+        $legacyDeniedModelChanged = Update-BRAVOConfiguratorEffective -Model $legacyDeniedModelChanged -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $legacyDeniedApplyChanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot -Model $legacyDeniedModelChanged -SchemaCatalog $legacyDeniedResolvedCatalog -ProductionBaseline $legacyDeniedBaseline
+        Test-BRAVOCondition (
+            (-not [bool]$legacyDeniedApplyChanged.Applied) -and [string]$legacyDeniedApplyChanged.Stage -eq 'Validation'
+        ) `
+            'Configurator/LegacyDeniedOverrideCannotBeChanged' `
+            "спроба змінити легасі-заборонений override на ІНШЕ значення (замість Clear) мусить так само провалитись на Validation — DENY_* не редагується, лише знімається; отримано Applied=$($legacyDeniedApplyChanged.Applied) Stage=$($legacyDeniedApplyChanged.Stage)"
+
+        # --- Configurator/ClearingLegacyDeniedOverrideProducesValidCandidate ---
+        # Ізольована persistence-пайплайн перевірка: існуючий файл із
+        # denied override -> Clear -> Apply -> результуючий файл БІЛЬШЕ
+        # НЕ містить його (не production-файли, повністю ізольований
+        # $legacyDeniedScenarioRoot, прибирається у finally).
+        $legacyDeniedFinalModel = Update-BRAVOConfiguratorEffective -Model $legacyDeniedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $legacyDeniedFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot -Model $legacyDeniedFinalModel -SchemaCatalog $legacyDeniedResolvedCatalog -ProductionBaseline $legacyDeniedBaseline
+        $legacyDeniedFinalContent = if (Test-Path -LiteralPath (Join-Path $legacyDeniedScenarioRoot 'BRAVO.local.config')) {
+            Get-Content -LiteralPath (Join-Path $legacyDeniedScenarioRoot 'BRAVO.local.config') -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$legacyDeniedFinalApply.Applied -and [string]$legacyDeniedFinalApply.Stage -eq 'Complete' -and
+            -not $legacyDeniedFinalContent.Contains($legacyDeniedPath)
+        ) `
+            'Configurator/ClearingLegacyDeniedOverrideProducesValidCandidate' `
+            "після Clear валідний candidate мусить пройти Apply (Applied=`$true, Stage=Complete) і результуючий BRAVO.local.config більше не повинен містити '$legacyDeniedPath'; отримано Applied=$($legacyDeniedFinalApply.Applied) Stage=$($legacyDeniedFinalApply.Stage) StillContains=$($legacyDeniedFinalContent.Contains($legacyDeniedPath))"
+
+        # Section 6, Scenario B: сусідній ALLOW_SITE override
+        # (archiveRetentionDays), присутній у тому самому production-файлі
+        # від самого початку, мусить пережити весь цикл Clear -> Apply
+        # НЕЗМІННИМ — не лише denied прибрано, а й валідний сусід
+        # збережений, і результуючий файл завантажується канонічним
+        # loader-ом.
+        Test-BRAVOCondition (
+            $legacyDeniedFinalContent.Contains($legacyDeniedAllowedPath) -and
+            $legacyDeniedFinalContent.Contains([string]$legacyDeniedAllowedValue)
+        ) `
+            'Configurator/ClearingLegacyDeniedOverrideDoesNotDisturbSiblingAllowedOverride' `
+            "сусідній ALLOW_SITE override '$legacyDeniedAllowedPath'=$legacyDeniedAllowedValue мусить лишитись у production BRAVO.local.config незмінним після Clear+Apply denied-листа; отримано вміст: $legacyDeniedFinalContent"
+
+        $legacyDeniedFinalLoadedOverrides = (Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $legacyDeniedScenarioRoot).Overrides
+        Test-BRAVOCondition (
+            $legacyDeniedFinalLoadedOverrides.Contains($legacyDeniedAllowedPath) -and
+            [string]$legacyDeniedFinalLoadedOverrides[$legacyDeniedAllowedPath] -eq [string]$legacyDeniedAllowedValue -and
+            (-not $legacyDeniedFinalLoadedOverrides.Contains($legacyDeniedPath))
+        ) `
+            'Configurator/ClearingLegacyDeniedOverrideResultLoadsCleanlyViaCanonicalReader' `
+            "результуючий production BRAVO.local.config мусить перезчитуватись канонічним читачем зі збереженим '$legacyDeniedAllowedPath'=$legacyDeniedAllowedValue і без '$legacyDeniedPath'"
+    } finally {
+        Remove-Item -LiteralPath $legacyDeniedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 review, N1: те саме, що блок LegacyDenied вище, але для
+# ВКЛАДЕНОЇ (Node) форми легасі-забороненого override-у — pre-F1 файл
+# міг містити 'backupMonitoring.SFTP.BAZA' = @{ Mode = 'Legacy'; ... }
+# замість плоского 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'.
+# ConvertTo-BRAVOConfiguratorLocalConfigText НЕ вміє (і не повинен уміти)
+# серіалізувати hashtable-значення (ConvertTo-BRAVOConfiguratorPowerShellLiteral
+# fail-closed на IDictionary) — вкладена форма існує ЛИШЕ як легасі
+# артефакт, записаний до появи Configurator-а/іншим інструментом, тож
+# fixture-файл пишеться напряму (той самий підхід, що F1-тести).
+# Сусід AutoArchiveMutationThreshold (ALLOW_SITE, не DENY) — навмисно,
+# щоб Scenario B (Apply після Clear лише Mode) справді могла УСПІШНО
+# пройти Validation: MutationPolicy теж DENY_SECURITY_CONTROL і зробив
+# би сценарій недосяжним, якби був присутній як сусід у тому самому
+# контейнері.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $nestedDeniedContainerPath = 'backupMonitoring.SFTP.BAZA'
+    $nestedDeniedLeafPath = 'backupMonitoring.SFTP.BAZA.Mode'
+    $nestedDeniedSiblingLeafPath = 'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold'
+    $nestedDeniedSiblingValue = 50
+    $nestedDeniedUnknownDescendant = 'UnknownFutureKey'
+    $nestedDeniedRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $nestedDeniedClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $nestedDeniedResolvedCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $nestedDeniedRawCatalog -AuthorizationClass $nestedDeniedClassRegistry
+
+    $nestedDeniedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_NESTEDLEGACYDENIED_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($nestedDeniedScenarioRoot)
+    try {
+        $nestedDeniedLocalConfigPath = Join-Path $nestedDeniedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $nestedDeniedLocalConfigPath, (
+                "@{`r`n" +
+                "    '$nestedDeniedContainerPath' = @{`r`n" +
+                "        'Mode' = 'Legacy'`r`n" +
+                "        'AutoArchiveMutationThreshold' = $nestedDeniedSiblingValue`r`n" +
+                "        '$nestedDeniedUnknownDescendant' = 'x'`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $nestedDeniedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $nestedDeniedScenarioRoot
+        Test-BRAVOCondition ($nestedDeniedBaseline.Overrides.Contains($nestedDeniedContainerPath)) `
+            'Configurator/NestedLegacyDeniedOverride/BaselineFixtureContainsIt' `
+            "fixture-передумова: baseline мусить містити вкладений контейнер '$nestedDeniedContainerPath'; отримано Contains=$($nestedDeniedBaseline.Overrides.Contains($nestedDeniedContainerPath))"
+
+        $nestedDeniedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $nestedDeniedResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $nestedDeniedBaseline.Overrides
+        $nestedDeniedSetting = @($nestedDeniedModel | Where-Object { $_.Path -eq $nestedDeniedLeafPath })
+        $nestedDeniedSiblingSetting = @($nestedDeniedModel | Where-Object { $_.Path -eq $nestedDeniedSiblingLeafPath })
+
+        # --- Configurator/NestedDeniedOverrideDetectedAsCanonicalLeaf ---
+        Test-BRAVOCondition (
+            $nestedDeniedSetting.Count -eq 1 -and [bool]$nestedDeniedSetting[0].OverridePresent -and
+            [string]$nestedDeniedSetting[0].OverrideValue -eq 'Legacy'
+        ) `
+            'Configurator/NestedDeniedOverrideDetectedAsCanonicalLeaf' `
+            "вкладений $nestedDeniedLeafPath мусить бути виявлений Model-побудовою як OverridePresent=`$true, OverrideValue='Legacy' (не лише плоска форма); отримано OverridePresent=$($nestedDeniedSetting[0].OverridePresent) Value=$($nestedDeniedSetting[0].OverrideValue)"
+
+        # --- Configurator/NestedDeniedOverrideIsReadOnlyButClearable ---
+        Test-BRAVOCondition (
+            [bool]$nestedDeniedSetting[0].Metadata.ReadOnly -eq $true
+        ) `
+            'Configurator/NestedDeniedOverrideIsReadOnlyButClearable' `
+            "вкладений легасі-заборонений override мусить бути ReadOnly (не редагується), незалежно від форми представлення; отримано ReadOnly=$($nestedDeniedSetting[0].Metadata.ReadOnly)"
+        $nestedDeniedCleared = Clear-BRAVOConfiguratorOverride -Model $nestedDeniedModel -Path $nestedDeniedLeafPath
+        $nestedDeniedClearedSetting = @($nestedDeniedCleared | Where-Object { $_.Path -eq $nestedDeniedLeafPath })
+        Test-BRAVOCondition (
+            $nestedDeniedClearedSetting.Count -eq 1 -and (-not [bool]$nestedDeniedClearedSetting[0].OverridePresent)
+        ) `
+            'Configurator/NestedDeniedOverrideClearSucceeds' `
+            "той самий Clear-BRAVOConfiguratorOverride механізм мусить прибирати вкладений override так само, як плоский; отримано OverridePresent=$($nestedDeniedClearedSetting[0].OverridePresent)"
+
+        # --- Configurator/NestedDeniedOverrideDoesNotPreventStartup ---
+        $nestedDeniedStartupThrew = $false
+        $nestedDeniedStartupMessage = $null
+        try {
+            [void](Update-BRAVOConfiguratorEffective -Model $nestedDeniedModel -RuntimeRoot $configuratorFixtureRuntimeRoot)
+        } catch {
+            $nestedDeniedStartupThrew = $true
+            $nestedDeniedStartupMessage = $_.Exception.Message
+        }
+        Test-BRAVOCondition (-not $nestedDeniedStartupThrew) `
+            'Configurator/NestedDeniedOverrideDoesNotPreventStartup' `
+            "наявність вкладеного легасі-забороненого override у Model НЕ повинна кидати виняток при звичайному Update-BRAVOConfiguratorEffective; помилка: $nestedDeniedStartupMessage"
+
+        # --- Configurator/NestedDeniedOverrideExcludedFromPreview ---
+        $nestedDeniedPreviewOverrides = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $nestedDeniedModel
+        Test-BRAVOCondition (
+            (-not $nestedDeniedPreviewOverrides.Contains($nestedDeniedLeafPath)) -and
+            $nestedDeniedPreviewOverrides.Contains($nestedDeniedSiblingLeafPath)
+        ) `
+            'Configurator/NestedDeniedOverrideExcludedFromPreview' `
+            "preview-проєкція мусить виключати вкладений денайд-лист, зберігаючи сусідній ALLOW_SITE лист; отримано Contains(denied)=$($nestedDeniedPreviewOverrides.Contains($nestedDeniedLeafPath)) Contains(sibling)=$($nestedDeniedPreviewOverrides.Contains($nestedDeniedSiblingLeafPath))"
+
+        # --- Configurator/NestedDeniedOverrideApplyWithoutClearFails ---
+        $nestedDeniedPreApplyBytes = [IO.File]::ReadAllBytes($nestedDeniedLocalConfigPath)
+        $nestedDeniedModelUnchanged = Update-BRAVOConfiguratorEffective -Model $nestedDeniedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $nestedDeniedApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $nestedDeniedScenarioRoot -Model $nestedDeniedModelUnchanged -SchemaCatalog $nestedDeniedResolvedCatalog -ProductionBaseline $nestedDeniedBaseline
+        $nestedDeniedPostApplyBytes = [IO.File]::ReadAllBytes($nestedDeniedLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$nestedDeniedApplyUnchanged.Applied) -and [string]$nestedDeniedApplyUnchanged.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($nestedDeniedPreApplyBytes) -eq [Convert]::ToBase64String($nestedDeniedPostApplyBytes))
+        ) `
+            'Configurator/NestedDeniedOverrideApplyWithoutClearFails' `
+            "Apply з незмінним вкладеним денайд-листом мусить провалитись на Validation, і production-файл мусить лишитись побайтово незмінним; отримано Applied=$($nestedDeniedApplyUnchanged.Applied) Stage=$($nestedDeniedApplyUnchanged.Stage)"
+
+        # --- Configurator/NestedDeniedOverrideClearPreservesSiblingMembers ---
+        # --- Configurator/NestedDeniedOverrideClearRemovesEmptyContainer (перевіряється разом: контейнер НЕ порожній після Clear, бо є 2 сусіди) ---
+        $nestedDeniedFinalModel = Update-BRAVOConfiguratorEffective -Model $nestedDeniedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $nestedDeniedFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $nestedDeniedScenarioRoot -Model $nestedDeniedFinalModel -SchemaCatalog $nestedDeniedResolvedCatalog -ProductionBaseline $nestedDeniedBaseline
+        $nestedDeniedFinalContent = if (Test-Path -LiteralPath $nestedDeniedLocalConfigPath) {
+            Get-Content -LiteralPath $nestedDeniedLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$nestedDeniedFinalApply.Applied -and [string]$nestedDeniedFinalApply.Stage -eq 'Complete' -and
+            (-not $nestedDeniedFinalContent.Contains('Legacy')) -and
+            $nestedDeniedFinalContent.Contains($nestedDeniedUnknownDescendant) -and
+            $nestedDeniedFinalContent.Contains([string]$nestedDeniedSiblingValue)
+        ) `
+            'Configurator/NestedDeniedOverrideClearPreservesSiblingMembers' `
+            "після Clear лише Mode: Apply мусить успішно пройти (Applied=`$true, Stage=Complete), 'Legacy' мусить зникнути, а ALLOW_SITE-сусід ($nestedDeniedSiblingLeafPath=$nestedDeniedSiblingValue) і невідомий D3-нащадок ($nestedDeniedUnknownDescendant) мусять лишитись; отримано Applied=$($nestedDeniedFinalApply.Applied) Stage=$($nestedDeniedFinalApply.Stage) Content=$nestedDeniedFinalContent"
+
+        # Canonical Configurator-серіалізатор фізично не може записати
+        # вкладену форму (fail-closed на IDictionary) — Apply неминуче
+        # розгортає контейнер, якого торкається, у плоскі dot-шляхи
+        # (Convert-BRAVOConfiguratorNestedContainerToFlatKeys). Тому
+        # результат перевіряється як плоскі листи, а не як той самий
+        # вкладений контейнер.
+        $nestedDeniedFinalLoadedOverrides = (Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $nestedDeniedScenarioRoot).Overrides
+        Test-BRAVOCondition (
+            $nestedDeniedFinalLoadedOverrides.Contains($nestedDeniedSiblingLeafPath) -and
+            [string]$nestedDeniedFinalLoadedOverrides[$nestedDeniedSiblingLeafPath] -eq [string]$nestedDeniedSiblingValue -and
+            (-not $nestedDeniedFinalLoadedOverrides.Contains($nestedDeniedLeafPath)) -and
+            (-not $nestedDeniedFinalLoadedOverrides.Contains($nestedDeniedContainerPath))
+        ) `
+            'Configurator/NestedLegacyDeniedOverride/ResultLoadsCleanlyViaCanonicalReader' `
+            "результуючий production BRAVO.local.config мусить перезчитуватись канонічним читачем зі збереженим плоским '$nestedDeniedSiblingLeafPath'=$nestedDeniedSiblingValue, без '$nestedDeniedLeafPath' і без вкладеного контейнера '$nestedDeniedContainerPath' (Apply неминуче розгортає торкнутий контейнер у плоску форму — Configurator-серіалізатор не вміє записувати вкладені значення)"
+
+        # --- Configurator/NestedDeniedOverrideClearRemovesEmptyContainer ---
+        # Окремий, ІЗОЛЬОВАНИЙ сценарій: контейнер, ЄДИНИЙ член якого —
+        # сам denied-лист. Після Clear контейнер мусить спорожніти і
+        # ЗНИКНУТИ з persisted output цілком (не лишитись як '= @{}').
+        $emptyContainerScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+            ("BRAVO_CONFIGURATOR_NESTEDDENIED_EMPTYCONTAINER_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($emptyContainerScenarioRoot)
+        try {
+            $emptyContainerLocalConfigPath = Join-Path $emptyContainerScenarioRoot 'BRAVO.local.config'
+            [IO.File]::WriteAllText(
+                $emptyContainerLocalConfigPath, (
+                    "@{`r`n" +
+                    "    '$nestedDeniedContainerPath' = @{`r`n" +
+                    "        'Mode' = 'Legacy'`r`n" +
+                    "    }`r`n" +
+                    "}`r`n"
+                ),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+            $emptyContainerBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $emptyContainerScenarioRoot
+            $emptyContainerModel = Get-BRAVOConfiguratorModel -SchemaCatalog $nestedDeniedResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $emptyContainerBaseline.Overrides
+            $emptyContainerCleared = Clear-BRAVOConfiguratorOverride -Model $emptyContainerModel -Path $nestedDeniedLeafPath
+            $emptyContainerFinalModel = Update-BRAVOConfiguratorEffective -Model $emptyContainerCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+            $emptyContainerFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $emptyContainerScenarioRoot -Model $emptyContainerFinalModel -SchemaCatalog $nestedDeniedResolvedCatalog -ProductionBaseline $emptyContainerBaseline
+            $emptyContainerFinalContent = if (Test-Path -LiteralPath $emptyContainerLocalConfigPath) {
+                Get-Content -LiteralPath $emptyContainerLocalConfigPath -Raw -Encoding UTF8
+            } else { '' }
+            Test-BRAVOCondition (
+                [bool]$emptyContainerFinalApply.Applied -and [string]$emptyContainerFinalApply.Stage -eq 'Complete' -and
+                (-not $emptyContainerFinalContent.Contains($nestedDeniedContainerPath))
+            ) `
+                'Configurator/NestedDeniedOverrideClearRemovesEmptyContainer' `
+                "коли Clear прибирає ЄДИНОГО члена вкладеного контейнера, сам контейнер мусить зникнути з persisted output цілком (не лишитись порожнім '= @{}'); отримано Applied=$($emptyContainerFinalApply.Applied) Stage=$($emptyContainerFinalApply.Stage) Content=$emptyContainerFinalContent"
+        } finally {
+            Remove-Item -LiteralPath $emptyContainerScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+
+        # --- Configurator/FlatDeniedOverrideRecoveryStillWorks ---
+        # N1 регресійний контроль: плоска (флат) форма (F2-фікс) і далі
+        # працює ідентично через ЦЕЙ САМИЙ Resolve-BRAVOConfiguratorSuppliedLeafOverride,
+        # не лише через окремий, історичний тестовий блок вище.
+        $flatRegressionOverrides = @{ $nestedDeniedLeafPath = 'Legacy' }
+        $flatRegressionResolved = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $flatRegressionOverrides -LeafPath $nestedDeniedLeafPath
+        Test-BRAVOCondition (
+            [bool]$flatRegressionResolved.Found -and [string]$flatRegressionResolved.Value -eq 'Legacy' -and
+            @($flatRegressionResolved.NestedPath).Count -eq 0 -and [string]$flatRegressionResolved.TopLevelKey -eq $nestedDeniedLeafPath
+        ) `
+            'Configurator/FlatDeniedOverrideRecoveryStillWorks' `
+            "плоска форма мусить і далі коректно резолвитись (NestedPath=[] порожній, TopLevelKey=точний leaf-шлях); отримано Found=$($flatRegressionResolved.Found) NestedPath.Count=$(@($flatRegressionResolved.NestedPath).Count)"
+    } finally {
+        Remove-Item -LiteralPath $nestedDeniedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 review, четверте коло (P2): backupMonitoring.SFTP.BAZA.MutationPolicy
+# отримав canonical Configurator-дескриптор (recovery-only, дзеркалить
+# сусідній Mode-блок вище) — до цього легасі MutationPolicy-override не
+# мав жодного Model-рядка, через який оператор міг би його транзакційно
+# зняти: loader fail-closed блокував запуск, а Configurator НЕ показував
+# жодного шляху відновлення (той самий баг-клас, що F2 закрив для Mode).
+# Дескриптор НЕ робить лист звичайним редагованим site-налаштуванням —
+# canonical Class лишається DENY_SECURITY_CONTROL,
+# WeakeningOverride='None' (BRAVO.Configuration.Schema.psm1); ReadOnly
+# похідний (Resolve-BRAVOConfiguratorFieldAuthorization примусово $true
+# для будь-якого DENY_*-класу) — жодної MutationPolicy-специфічної гілки
+# коду в Model/Persistence не додано, той самий generic-механізм, що вже
+# обслуговує Mode.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $mutPolPath = 'backupMonitoring.SFTP.BAZA.MutationPolicy'
+    $mutPolContainerPath = 'backupMonitoring.SFTP.BAZA'
+    $mutPolSiblingPath = 'backupMonitoring.SFTP.BAZA.FullAuditEnabled'
+    $mutPolSiblingValue = $true
+    $mutPolRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $mutPolClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $mutPolResolvedCatalog = Resolve-BRAVOConfiguratorFieldAuthorization -Descriptors $mutPolRawCatalog -AuthorizationClass $mutPolClassRegistry
+
+    # --- Configurator/MutationPolicyRecoveryDescriptorExists ---
+    $mutPolDescriptor = @($mutPolRawCatalog | Where-Object { $_.Path -eq $mutPolPath })
+    Test-BRAVOCondition (
+        $mutPolDescriptor.Count -eq 1 -and [string]$mutPolClassRegistry[$mutPolPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        [string]$mutPolClassRegistry[$mutPolPath].WeakeningOverride -ne 'ExistingSecurityEscapeHatch'
+    ) `
+        'Configurator/MutationPolicyRecoveryDescriptorExists' `
+        "рівно ОДИН Configurator-дескриптор мусить існувати для $mutPolPath, а canonical авторизація мусить лишатись DENY_SECURITY_CONTROL/не-escapable; отримано DescriptorCount=$($mutPolDescriptor.Count) Class=$($mutPolClassRegistry[$mutPolPath].Class) WeakeningOverride=$($mutPolClassRegistry[$mutPolPath].WeakeningOverride)"
+
+    # ===== Плоский (flat) легасі-override =====
+    $mutPolFlatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_FLAT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolFlatScenarioRoot)
+    try {
+        $mutPolFlatLocalConfigPath = Join-Path $mutPolFlatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $mutPolFlatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $mutPolPath        = 'Fail'
+                $mutPolSiblingPath = $mutPolSiblingValue
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mutPolFlatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolFlatScenarioRoot
+        $mutPolFlatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolFlatBaseline.Overrides
+        $mutPolFlatSetting = @($mutPolFlatModel | Where-Object { $_.Path -eq $mutPolPath })
+
+        # --- Configurator/MutationPolicyLegacyFlatOverrideDetected ---
+        Test-BRAVOCondition (
+            $mutPolFlatSetting.Count -eq 1 -and [bool]$mutPolFlatSetting[0].OverridePresent -and
+            [string]$mutPolFlatSetting[0].OverrideValue -eq 'Fail'
+        ) `
+            'Configurator/MutationPolicyLegacyFlatOverrideDetected' `
+            "плоский легасі $mutPolPath='Fail' мусить бути виявлений Model-побудовою; отримано OverridePresent=$($mutPolFlatSetting[0].OverridePresent) Value=$($mutPolFlatSetting[0].OverrideValue)"
+
+        # --- Configurator/MutationPolicyLegacyOverrideIsReadOnlyButClearable ---
+        $mutPolFlatCleared = Clear-BRAVOConfiguratorOverride -Model $mutPolFlatModel -Path $mutPolPath
+        $mutPolFlatClearedSetting = @($mutPolFlatCleared | Where-Object { $_.Path -eq $mutPolPath })
+        Test-BRAVOCondition (
+            [bool]$mutPolFlatSetting[0].Metadata.ReadOnly -eq $true -and
+            $mutPolFlatClearedSetting.Count -eq 1 -and (-not [bool]$mutPolFlatClearedSetting[0].OverridePresent)
+        ) `
+            'Configurator/MutationPolicyLegacyOverrideIsReadOnlyButClearable' `
+            "легасі MutationPolicy-override мусить бути ReadOnly=`$true (canonical adapter), але й далі знімний через Clear-BRAVOConfiguratorOverride; отримано ReadOnly=$($mutPolFlatSetting[0].Metadata.ReadOnly) OverridePresentAfterClear=$($mutPolFlatClearedSetting[0].OverridePresent)"
+
+        # --- Configurator/MutationPolicyApplyWithoutClearFails ---
+        $mutPolFlatPreApplyBytes = [IO.File]::ReadAllBytes($mutPolFlatLocalConfigPath)
+        $mutPolFlatModelUnchanged = Update-BRAVOConfiguratorEffective -Model $mutPolFlatModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolFlatApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolFlatScenarioRoot -Model $mutPolFlatModelUnchanged -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolFlatBaseline
+        $mutPolFlatPostApplyBytes = [IO.File]::ReadAllBytes($mutPolFlatLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$mutPolFlatApplyUnchanged.Applied) -and [string]$mutPolFlatApplyUnchanged.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($mutPolFlatPreApplyBytes) -eq [Convert]::ToBase64String($mutPolFlatPostApplyBytes))
+        ) `
+            'Configurator/MutationPolicyApplyWithoutClearFails' `
+            "Apply з незмінним MutationPolicy-override мусить провалитись на Validation, production-файл лишається побайтово незмінним; отримано Applied=$($mutPolFlatApplyUnchanged.Applied) Stage=$($mutPolFlatApplyUnchanged.Stage)"
+
+        # --- Configurator/MutationPolicyClearSucceeds ---
+        # --- Configurator/MutationPolicyClearPreservesSibling ---
+        $mutPolFlatFinalModel = Update-BRAVOConfiguratorEffective -Model $mutPolFlatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolFlatFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolFlatScenarioRoot -Model $mutPolFlatFinalModel -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolFlatBaseline
+        $mutPolFlatFinalContent = if (Test-Path -LiteralPath $mutPolFlatLocalConfigPath) {
+            Get-Content -LiteralPath $mutPolFlatLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$mutPolFlatFinalApply.Applied -and [string]$mutPolFlatFinalApply.Stage -eq 'Complete' -and
+            (-not $mutPolFlatFinalContent.Contains($mutPolPath))
+        ) `
+            'Configurator/MutationPolicyClearSucceeds' `
+            "після Clear валідний candidate мусить пройти Apply (Applied=`$true, Stage=Complete), результуючий файл більше не повинен містити '$mutPolPath'; отримано Applied=$($mutPolFlatFinalApply.Applied) Stage=$($mutPolFlatFinalApply.Stage)"
+        Test-BRAVOCondition (
+            $mutPolFlatFinalContent.Contains($mutPolSiblingPath)
+        ) `
+            'Configurator/MutationPolicyClearPreservesSibling' `
+            "сусідній ALLOW_SITE-лист '$mutPolSiblingPath' мусить пережити Clear+Apply MutationPolicy незмінним; вміст: $mutPolFlatFinalContent"
+
+        # --- Configurator/MutationPolicyNotEscapableWithWeakenedSecurity ---
+        $mutPolWeakenOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+        try {
+            [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+            $mutPolEscapeHatchResult = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $mutPolPath
+            $mutPolPreviewWithEnv = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $mutPolFlatModel
+            Test-BRAVOCondition (
+                (-not $mutPolEscapeHatchResult) -and (-not $mutPolPreviewWithEnv.Contains($mutPolPath))
+            ) `
+                'Configurator/MutationPolicyNotEscapableWithWeakenedSecurity' `
+                "$mutPolPath мусить лишитись non-escapable навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 (WeakeningOverride='None'), і preview мусить і далі виключати його; отримано EscapeHatchAllowed=$mutPolEscapeHatchResult PreviewContains=$($mutPolPreviewWithEnv.Contains($mutPolPath))"
+        } finally {
+            [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $mutPolWeakenOriginalEnv)
+        }
+    } finally {
+        Remove-Item -LiteralPath $mutPolFlatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Вкладена (nested) легасі-форма =====
+    $mutPolNestedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_NESTED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolNestedScenarioRoot)
+    try {
+        $mutPolNestedLocalConfigPath = Join-Path $mutPolNestedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $mutPolNestedLocalConfigPath, (
+                "@{`r`n" +
+                "    '$mutPolContainerPath' = @{`r`n" +
+                "        'MutationPolicy' = 'Fail'`r`n" +
+                "        'FullAuditEnabled' = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mutPolNestedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolNestedScenarioRoot
+        $mutPolNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolNestedBaseline.Overrides
+        $mutPolNestedSetting = @($mutPolNestedModel | Where-Object { $_.Path -eq $mutPolPath })
+
+        # --- Configurator/MutationPolicyNestedOverrideDetected ---
+        Test-BRAVOCondition (
+            $mutPolNestedSetting.Count -eq 1 -and [bool]$mutPolNestedSetting[0].OverridePresent -and
+            [string]$mutPolNestedSetting[0].OverrideValue -eq 'Fail' -and [bool]$mutPolNestedSetting[0].Metadata.ReadOnly -eq $true
+        ) `
+            'Configurator/MutationPolicyNestedOverrideDetected' `
+            "вкладений $mutPolPath мусить бути виявлений як canonical leaf (OverridePresent=`$true, Value='Fail', ReadOnly=`$true); отримано OverridePresent=$($mutPolNestedSetting[0].OverridePresent) Value=$($mutPolNestedSetting[0].OverrideValue) ReadOnly=$($mutPolNestedSetting[0].Metadata.ReadOnly)"
+
+        # --- Configurator/MutationPolicyNestedClearPreservesSibling ---
+        $mutPolNestedCleared = Clear-BRAVOConfiguratorOverride -Model $mutPolNestedModel -Path $mutPolPath
+        $mutPolNestedFinalModel = Update-BRAVOConfiguratorEffective -Model $mutPolNestedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolNestedFinalApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolNestedScenarioRoot -Model $mutPolNestedFinalModel -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolNestedBaseline
+        $mutPolNestedFinalContent = if (Test-Path -LiteralPath $mutPolNestedLocalConfigPath) {
+            Get-Content -LiteralPath $mutPolNestedLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$mutPolNestedFinalApply.Applied -and [string]$mutPolNestedFinalApply.Stage -eq 'Complete' -and
+            (-not $mutPolNestedFinalContent.Contains("'Fail'")) -and
+            $mutPolNestedFinalContent.Contains($mutPolSiblingPath)
+        ) `
+            'Configurator/MutationPolicyNestedClearPreservesSibling' `
+            "після Clear вкладеного MutationPolicy: Apply мусить успішно пройти (flatten-on-touch розгортає контейнер), 'Fail' мусить зникнути, а сусід $mutPolSiblingPath мусить лишитись; отримано Applied=$($mutPolNestedFinalApply.Applied) Stage=$($mutPolNestedFinalApply.Stage) Content=$mutPolNestedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $mutPolNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Неможливо створити НОВИЙ MutationPolicy-override =====
+    $mutPolCleanScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_CLEAN_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolCleanScenarioRoot)
+    try {
+        # Жодного BRAVO.local.config у цій директорії — справді чистий
+        # старт (той самий патерн, що "14: candidate valid -> atomic
+        # apply (на порожній production-директорії)" вище у цьому файлі).
+        $mutPolCleanBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolCleanScenarioRoot
+        Test-BRAVOCondition (-not $mutPolCleanBaseline.Overrides.Contains($mutPolPath)) `
+            'Configurator/MutationPolicyCannotBeNewlyCreated/BaselineStartsClean' `
+            "fixture-передумова: чистий baseline НЕ повинен вже містити $mutPolPath; отримано Contains=$($mutPolCleanBaseline.Overrides.Contains($mutPolPath))"
+
+        $mutPolCleanModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolCleanBaseline.Overrides
+        # Оператор (чи UI, що не звірив ReadOnly) намагається СТВОРИТИ
+        # override, якого раніше не було — Set-BRAVOConfiguratorOverride
+        # сам по собі не перевіряє ReadOnly (презентаційна відповідальність
+        # UI-шару), тому справжній gate — canonical Apply-конвеєр нижче.
+        $mutPolCleanAttempt = Set-BRAVOConfiguratorOverride -Model $mutPolCleanModel -Path $mutPolPath -Value 'Fail'
+        $mutPolCleanAttempt = Update-BRAVOConfiguratorEffective -Model $mutPolCleanAttempt -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolCleanApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolCleanScenarioRoot -Model $mutPolCleanAttempt -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolCleanBaseline
+        $mutPolCleanConfigPath = Join-Path $mutPolCleanScenarioRoot 'BRAVO.local.config'
+        Test-BRAVOCondition (
+            (-not [bool]$mutPolCleanApply.Applied) -and [string]$mutPolCleanApply.Stage -eq 'Validation' -and
+            (-not (Test-Path -LiteralPath $mutPolCleanConfigPath))
+        ) `
+            'Configurator/MutationPolicyCannotBeNewlyCreated' `
+            "спроба ВПЕРШЕ створити $mutPolPath через Configurator-конвеєр мусить провалитись fail-closed на Validation, і жоден production-файл не повинен бути записаний; отримано Applied=$($mutPolCleanApply.Applied) Stage=$($mutPolCleanApply.Stage) FileExists=$(Test-Path -LiteralPath $mutPolCleanConfigPath)"
+    } finally {
+        Remove-Item -LiteralPath $mutPolCleanScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Змішаний контейнер: Mode + MutationPolicy обидва DENY =====
+    # Доводить, що recovery leaf-специфічний і атомарний: часткове Clear
+    # (лише одного з двох DENY-сусідів у тому самому контейнері) НЕ
+    # повинно дозволяти Apply, доки НЕ прибрано ОБИДВА.
+    $mutPolMixedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MUTATIONPOLICY_MIXED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mutPolMixedScenarioRoot)
+    try {
+        $mutPolMixedLocalConfigPath = Join-Path $mutPolMixedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $mutPolMixedLocalConfigPath, (
+                "@{`r`n" +
+                "    '$mutPolContainerPath' = @{`r`n" +
+                "        'Mode' = 'Legacy'`r`n" +
+                "        'MutationPolicy' = 'Fail'`r`n" +
+                "        'FullAuditEnabled' = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mutPolMixedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot
+        $mutPolMixedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $mutPolResolvedCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mutPolMixedBaseline.Overrides
+        $mutPolMixedPreBytes = [IO.File]::ReadAllBytes($mutPolMixedLocalConfigPath)
+
+        # --- Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific ---
+        # Сценарій A: прибрати ЛИШЕ Mode -> MutationPolicy лишається,
+        # Apply і далі відхиляється, файл незмінний.
+        $mutPolMixedClearModeOnly = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedModel -Path 'backupMonitoring.SFTP.BAZA.Mode'
+        $mutPolMixedClearModeOnly = Update-BRAVOConfiguratorEffective -Model $mutPolMixedClearModeOnly -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolMixedApplyModeOnly = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot -Model $mutPolMixedClearModeOnly -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolMixedBaseline
+        $mutPolMixedPostBytesA = [IO.File]::ReadAllBytes($mutPolMixedLocalConfigPath)
+
+        # Сценарій B: прибрати ЛИШЕ MutationPolicy -> Mode лишається,
+        # Apply і далі відхиляється, файл незмінний. Той самий незмінний
+        # $mutPolMixedModel/$mutPolMixedBaseline (Сценарій A нічого не
+        # записав — Applied=false зупиняється до atomic replace), тож
+        # обидва сценарії genuinely незалежні, не кумулятивні.
+        $mutPolMixedClearPolicyOnly = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedModel -Path $mutPolPath
+        $mutPolMixedClearPolicyOnly = Update-BRAVOConfiguratorEffective -Model $mutPolMixedClearPolicyOnly -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolMixedApplyPolicyOnly = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot -Model $mutPolMixedClearPolicyOnly -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolMixedBaseline
+        $mutPolMixedPostBytesB = [IO.File]::ReadAllBytes($mutPolMixedLocalConfigPath)
+
+        Test-BRAVOCondition (
+            (-not [bool]$mutPolMixedApplyModeOnly.Applied) -and [string]$mutPolMixedApplyModeOnly.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($mutPolMixedPreBytes) -eq [Convert]::ToBase64String($mutPolMixedPostBytesA)) -and
+            (-not [bool]$mutPolMixedApplyPolicyOnly.Applied) -and [string]$mutPolMixedApplyPolicyOnly.Stage -eq 'Validation' -and
+            ([Convert]::ToBase64String($mutPolMixedPreBytes) -eq [Convert]::ToBase64String($mutPolMixedPostBytesB))
+        ) `
+            'Configurator/BazaDeniedSiblingRecoveryIsLeafSpecific' `
+            ("часткове Clear лише ОДНОГО з двох DENY-сусідів (Mode або MutationPolicy) у тому самому контейнері НЕ повинно дозволяти Apply, доки лишається другий; " +
+             "отримано ClearModeOnly: Applied=$($mutPolMixedApplyModeOnly.Applied) Stage=$($mutPolMixedApplyModeOnly.Stage) FileChanged=$([Convert]::ToBase64String($mutPolMixedPreBytes) -ne [Convert]::ToBase64String($mutPolMixedPostBytesA)); " +
+             "ClearPolicyOnly: Applied=$($mutPolMixedApplyPolicyOnly.Applied) Stage=$($mutPolMixedApplyPolicyOnly.Stage) FileChanged=$([Convert]::ToBase64String($mutPolMixedPreBytes) -ne [Convert]::ToBase64String($mutPolMixedPostBytesB))")
+
+        # --- Configurator/BazaBothDeniedLeavesClearedApplySucceeds ---
+        $mutPolMixedClearBoth = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedModel -Path 'backupMonitoring.SFTP.BAZA.Mode'
+        $mutPolMixedClearBoth = Clear-BRAVOConfiguratorOverride -Model $mutPolMixedClearBoth -Path $mutPolPath
+        $mutPolMixedClearBoth = Update-BRAVOConfiguratorEffective -Model $mutPolMixedClearBoth -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $mutPolMixedApplyBoth = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $mutPolMixedScenarioRoot -Model $mutPolMixedClearBoth -SchemaCatalog $mutPolResolvedCatalog -ProductionBaseline $mutPolMixedBaseline
+        $mutPolMixedFinalContent = if (Test-Path -LiteralPath $mutPolMixedLocalConfigPath) {
+            Get-Content -LiteralPath $mutPolMixedLocalConfigPath -Raw -Encoding UTF8
+        } else { '' }
+        Test-BRAVOCondition (
+            [bool]$mutPolMixedApplyBoth.Applied -and [string]$mutPolMixedApplyBoth.Stage -eq 'Complete' -and
+            (-not $mutPolMixedFinalContent.Contains("'Legacy'")) -and
+            (-not $mutPolMixedFinalContent.Contains("'Fail'")) -and
+            $mutPolMixedFinalContent.Contains($mutPolSiblingPath)
+        ) `
+            'Configurator/BazaBothDeniedLeavesClearedApplySucceeds' `
+            "після Clear ОБОХ (Mode і MutationPolicy) Apply мусить успішно пройти (Applied=`$true, Stage=Complete), жоден із двох DENY-листів не повинен лишитись, а ALLOW_SITE-сусід $mutPolSiblingPath мусить пережити; отримано Applied=$($mutPolMixedApplyBoth.Applied) Stage=$($mutPolMixedApplyBoth.Stage) Content=$mutPolMixedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $mutPolMixedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 review, п'яте коло (P1, "Let Configurator recover validator-
+# rejected overrides"): cataloged ALLOW_WITH_VALIDATOR-лист з невалідним
+# supplied-значенням (напр. maintenanceSettings.Restore.BootRestoreMode =
+# 'Bogus', legacy-значення, яке ІСТОРИЧНО loader сам нормалізував у
+# попередження + safe fallback ДО Wave 2) раніше проєктувався в preview
+# незмінено, і canonical loader відхиляв ЙОГО ПРИ КОЖНОМУ startup/
+# recalculate — Configurator взагалі не міг відкритись. Тепер
+# ConvertTo-BRAVOConfiguratorOverrideHashtable виключає такий лист із
+# preview-candidate (Model лишається незмінною — OverridePresent/
+# OverrideValue видимі для виправлення/Clear).
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $vrCatPath = 'maintenanceSettings.Restore.BootRestoreMode'
+    $vrCatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_CATALOG_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrCatScenarioRoot)
+    try {
+        $vrCatLocalConfigPath = Join-Path $vrCatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrCatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrCatPath = 'Bogus' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $vrCatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatScenarioRoot
+        $vrCatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrCatBaseline.Overrides
+        $vrCatSetting = @($vrCatModel | Where-Object { $_.Path -eq $vrCatPath })
+
+        # --- Configurator/ValidatorRejectedCatalogOverridePreviewIsRecoverable ---
+        $vrCatPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $vrCatModel
+        Test-BRAVOCondition (
+            $vrCatSetting.Count -eq 1 -and [bool]$vrCatSetting[0].OverridePresent -and [string]$vrCatSetting[0].OverrideValue -eq 'Bogus' -and
+            (-not $vrCatPreview.Contains($vrCatPath))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverridePreviewIsRecoverable' `
+            "невалідне ALLOW_WITH_VALIDATOR-значення ($vrCatPath='Bogus') мусить лишитись у Model (OverridePresent/OverrideValue), АЛЕ бути виключеним із preview-candidate, щоб canonical loader не блокував старт Configurator-а; отримано OverridePresent=$($vrCatSetting[0].OverridePresent) OverrideValue=$($vrCatSetting[0].OverrideValue) PreviewContains=$($vrCatPreview.Contains($vrCatPath))"
+
+        $vrCatEffectiveThrew = $false
+        $vrCatModelWithEffective = $vrCatModel
+        try {
+            $vrCatModelWithEffective = Update-BRAVOConfiguratorEffective -Model $vrCatModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        } catch {
+            $vrCatEffectiveThrew = $true
+        }
+        Test-BRAVOCondition (-not $vrCatEffectiveThrew) `
+            'Configurator/ValidatorRejectedCatalogOverrideStartupPreviewDoesNotThrow' `
+            'Update-BRAVOConfiguratorEffective (startup/recalculate preview) НЕ повинен кинути виняток лише через невалідне ALLOW_WITH_VALIDATOR-значення в Model'
+
+        # --- Configurator/ValidatorRejectedCatalogOverrideApplyUnchangedFails ---
+        $vrCatPreApplyBytes = [IO.File]::ReadAllBytes($vrCatLocalConfigPath)
+        $vrCatApplyUnchanged = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatScenarioRoot -Model $vrCatModelWithEffective -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $vrCatBaseline
+        $vrCatPostApplyBytes = [IO.File]::ReadAllBytes($vrCatLocalConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$vrCatApplyUnchanged.Applied) -and
+            ([Convert]::ToBase64String($vrCatPreApplyBytes) -eq [Convert]::ToBase64String($vrCatPostApplyBytes))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideApplyUnchangedFails' `
+            "Apply з незмінним невалідним $vrCatPath='Bogus' мусить провалитись (fail-closed через canonical loader), production-файл лишається побайтово незмінним; отримано Applied=$($vrCatApplyUnchanged.Applied) Stage=$($vrCatApplyUnchanged.Stage)"
+
+        # --- Configurator/ValidatorRejectedCatalogOverrideCanBeCorrected ---
+        $vrCatCorrectedModel = Set-BRAVOConfiguratorOverride -Model $vrCatModel -Path $vrCatPath -Value 'None'
+        $vrCatCorrectedModel = Update-BRAVOConfiguratorEffective -Model $vrCatCorrectedModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrCatApplyCorrected = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatScenarioRoot -Model $vrCatCorrectedModel -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $vrCatBaseline
+        Test-BRAVOCondition (
+            [bool]$vrCatApplyCorrected.Applied -and [string]$vrCatApplyCorrected.Stage -eq 'Complete'
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideCanBeCorrected' `
+            "виправлення $vrCatPath на валідне 'None' мусить дозволити успішний Apply; отримано Applied=$($vrCatApplyCorrected.Applied) Stage=$($vrCatApplyCorrected.Stage)"
+    } finally {
+        Remove-Item -LiteralPath $vrCatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Configurator/ValidatorRejectedCatalogOverrideCanBeCleared --- (незалежний сценарій)
+    $vrCatClearScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_CLEAR_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrCatClearScenarioRoot)
+    try {
+        $vrCatClearLocalConfigPath = Join-Path $vrCatClearScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrCatClearLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrCatPath = 'Bogus' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $vrCatClearBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatClearScenarioRoot
+        $vrCatClearModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrCatClearBaseline.Overrides
+        $vrCatCleared = Clear-BRAVOConfiguratorOverride -Model $vrCatClearModel -Path $vrCatPath
+        $vrCatCleared = Update-BRAVOConfiguratorEffective -Model $vrCatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrCatApplyCleared = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrCatClearScenarioRoot -Model $vrCatCleared -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $vrCatClearBaseline
+        $vrCatClearFinalContent = if (Test-Path -LiteralPath $vrCatClearLocalConfigPath) { Get-Content -LiteralPath $vrCatClearLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$vrCatApplyCleared.Applied -and [string]$vrCatApplyCleared.Stage -eq 'Complete' -and (-not $vrCatClearFinalContent.Contains($vrCatPath))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideCanBeCleared' `
+            "Clear невалідного $vrCatPath мусить дозволити успішний Apply, результат більше не містить цей шлях; отримано Applied=$($vrCatApplyCleared.Applied) Stage=$($vrCatApplyCleared.Stage)"
+    } finally {
+        Remove-Item -LiteralPath $vrCatClearScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Configurator/ValidatorRejectedCatalogOverrideGenericAcrossPaths ---
+    # Доказ generic-механізму: ДРУГИЙ cataloged ALLOW_WITH_VALIDATOR-лист
+    # (consoleSettings.ConsoleLevel, НЕ BootRestoreMode) з невалідним
+    # значенням поводиться ідентично — жодного per-path спецкоду.
+    $vrGenericPath = 'consoleSettings.ConsoleLevel'
+    $vrGenericScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_GENERIC_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrGenericScenarioRoot)
+    try {
+        [IO.File]::WriteAllText(
+            (Join-Path $vrGenericScenarioRoot 'BRAVO.local.config'),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrGenericPath = 'NOTALEVEL' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $vrGenericBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrGenericScenarioRoot
+        $vrGenericModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrGenericBaseline.Overrides
+        $vrGenericPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $vrGenericModel
+        $vrGenericSetting = @($vrGenericModel | Where-Object { $_.Path -eq $vrGenericPath })
+        Test-BRAVOCondition (
+            $vrGenericSetting.Count -eq 1 -and [bool]$vrGenericSetting[0].OverridePresent -and (-not $vrGenericPreview.Contains($vrGenericPath))
+        ) `
+            'Configurator/ValidatorRejectedCatalogOverrideGenericAcrossPaths' `
+            "механізм preview-фільтрації мусить бути generic (не BootRestoreMode-специфічним) — той самий ефект для $vrGenericPath='NOTALEVEL'; отримано OverridePresent=$($vrGenericSetting[0].OverridePresent) PreviewContains=$($vrGenericPreview.Contains($vrGenericPath))"
+    } finally {
+        Remove-Item -LiteralPath $vrGenericScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 review, п'яте коло (P2, "Expose validator-rejected noncatalog
+# overrides for recovery"): schedulerSettings.RestoreVerify.WeeklyOn —
+# canonical ALLOW_WITH_VALIDATOR-лист, ІСТОРИЧНО loader сам нормалізував
+# невідоме значення в попередження + safe fallback ('Saturday') ДО Wave 2,
+# але БЕЗ статичного Configurator-дескриптора: Model про нього нічого не
+# знала, Merge-BRAVOConfiguratorCandidateOverrides лишав значення
+# незмінним при КОЖНОМУ Apply, canonical loader відхиляв КОЖЕН Apply —
+# оператор не міг прибрати легасі-значення через Configurator (recovery
+# deadlock). Get-BRAVOConfiguratorSessionSchemaCatalog синтезує
+# recovery-only дескриптор ЛИШЕ поки невалідний override існує — жодного
+# per-path спецкоду, ЦІЛКОМ похідно від canonical
+# Test-BRAVOConfigurationOverrideAuthorization.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $vrNcPath = 'schedulerSettings.RestoreVerify.WeeklyOn'
+    $vrNcContainerPath = 'schedulerSettings.RestoreVerify'
+    $vrNcSiblingPath = 'schedulerSettings.RestoreVerify.Enabled'
+    $vrNcValidNoncatalogPath = 'schedulerSettings.RestoreVerify.At'
+    $vrNcRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+
+    # --- Configurator/RecoveryRowCannotCreateFreshOverride (чистий конфіг) ---
+    $vrNcCleanSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides @{}
+    Test-BRAVOCondition (
+        -not (@($vrNcCleanSessionCatalog | Where-Object { $_.Path -eq $vrNcPath }))
+    ) `
+        'Configurator/RecoveryRowCannotCreateFreshOverride' `
+        "БЕЗ наявного invalid override augmented-каталог НЕ повинен синтезувати recovery-рядок для $vrNcPath — оператор не може створити його з чистого конфігу через Configurator"
+
+    # ===== Плоский (flat) легасі-override =====
+    $vrNcFlatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_NONCATALOG_FLAT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrNcFlatScenarioRoot)
+    try {
+        $vrNcFlatLocalConfigPath = Join-Path $vrNcFlatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrNcFlatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $vrNcPath        = 'Funday'
+                $vrNcSiblingPath = $true
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $vrNcFlatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcFlatScenarioRoot
+        $vrNcFlatSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcFlatBaseline.Overrides
+        $vrNcFlatRecoveryDescriptor = @($vrNcFlatSessionCatalog | Where-Object { $_.Path -eq $vrNcPath })
+        $vrNcFlatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $vrNcFlatSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrNcFlatBaseline.Overrides
+        $vrNcFlatSetting = @($vrNcFlatModel | Where-Object { $_.Path -eq $vrNcPath })
+
+        # --- Configurator/ValidatorRejectedNonCatalogRecoveryRowExists ---
+        Test-BRAVOCondition (
+            (-not (@($vrNcRawCatalog | Where-Object { $_.Path -eq $vrNcPath }))) -and
+            $vrNcFlatRecoveryDescriptor.Count -eq 1 -and [bool]$vrNcFlatRecoveryDescriptor[0].ReadOnly -and
+            $vrNcFlatSetting.Count -eq 1 -and [bool]$vrNcFlatSetting[0].OverridePresent -and [string]$vrNcFlatSetting[0].OverrideValue -eq 'Funday'
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogRecoveryRowExists' `
+            "$vrNcPath не має статичного дескриптора, але з наявним невалідним override augmented-каталог мусить синтезувати РІВНО один recovery-only (ReadOnly) рядок, а Model — показувати OverridePresent=true/OverrideValue='Funday'; отримано StaticHasIt=$([bool](@($vrNcRawCatalog | Where-Object { $_.Path -eq $vrNcPath }))) RecoveryCount=$($vrNcFlatRecoveryDescriptor.Count) OverridePresent=$($vrNcFlatSetting[0].OverridePresent) Value=$($vrNcFlatSetting[0].OverrideValue)"
+
+        # --- Configurator/ValidatorRejectedNonCatalogFlatClearSucceeds ---
+        $vrNcFlatCleared = Clear-BRAVOConfiguratorOverride -Model $vrNcFlatModel -Path $vrNcPath
+        $vrNcFlatCleared = Update-BRAVOConfiguratorEffective -Model $vrNcFlatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrNcFlatApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcFlatScenarioRoot -Model $vrNcFlatCleared -SchemaCatalog $vrNcFlatSessionCatalog -ProductionBaseline $vrNcFlatBaseline
+        $vrNcFlatFinalContent = if (Test-Path -LiteralPath $vrNcFlatLocalConfigPath) { Get-Content -LiteralPath $vrNcFlatLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$vrNcFlatApply.Applied -and [string]$vrNcFlatApply.Stage -eq 'Complete' -and
+            (-not $vrNcFlatFinalContent.Contains('Funday')) -and $vrNcFlatFinalContent.Contains($vrNcSiblingPath)
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogFlatClearSucceeds' `
+            "Clear невалідного плоского $vrNcPath мусить дозволити успішний Apply (Applied=`$true, Stage=Complete), 'Funday' зникає з файлу, сусідній $vrNcSiblingPath переживає; отримано Applied=$($vrNcFlatApply.Applied) Stage=$($vrNcFlatApply.Stage) Content=$vrNcFlatFinalContent"
+
+        # --- Post-Clear: рядок природно зникає з наступного augmented-каталогу ---
+        $vrNcFlatBaselineAfter = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcFlatScenarioRoot
+        $vrNcFlatSessionCatalogAfter = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcFlatBaselineAfter.Overrides
+        Test-BRAVOCondition (
+            -not (@($vrNcFlatSessionCatalogAfter | Where-Object { $_.Path -eq $vrNcPath }))
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogRecoveryRowDisappearsAfterClear' `
+            "після успішного Clear+Apply наступний Get-BRAVOConfiguratorSessionSchemaCatalog-виклик (Reload) БІЛЬШЕ не повинен синтезувати recovery-рядок для $vrNcPath"
+    } finally {
+        Remove-Item -LiteralPath $vrNcFlatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Вкладена (nested) легасі-форма =====
+    $vrNcNestedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_NONCATALOG_NESTED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrNcNestedScenarioRoot)
+    try {
+        $vrNcNestedLocalConfigPath = Join-Path $vrNcNestedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrNcNestedLocalConfigPath,
+            (
+                "@{`r`n" +
+                "    '$vrNcContainerPath' = @{`r`n" +
+                "        'WeeklyOn' = 'Funday'`r`n" +
+                "        'Enabled'  = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $vrNcNestedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcNestedScenarioRoot
+        $vrNcNestedSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcNestedBaseline.Overrides
+        $vrNcNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $vrNcNestedSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrNcNestedBaseline.Overrides
+        $vrNcNestedSetting = @($vrNcNestedModel | Where-Object { $_.Path -eq $vrNcPath })
+
+        Test-BRAVOCondition (
+            $vrNcNestedSetting.Count -eq 1 -and [bool]$vrNcNestedSetting[0].OverridePresent -and [string]$vrNcNestedSetting[0].OverrideValue -eq 'Funday'
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogNestedRecoveryRowDetected' `
+            "вкладена легасі-форма ($vrNcContainerPath = @{ WeeklyOn='Funday'; Enabled=`$true }) мусить так само синтезувати recovery-рядок для $vrNcPath; отримано OverridePresent=$($vrNcNestedSetting[0].OverridePresent) Value=$($vrNcNestedSetting[0].OverrideValue)"
+
+        # --- Configurator/ValidatorRejectedNonCatalogNestedClearPreservesSibling ---
+        $vrNcNestedCleared = Clear-BRAVOConfiguratorOverride -Model $vrNcNestedModel -Path $vrNcPath
+        $vrNcNestedCleared = Update-BRAVOConfiguratorEffective -Model $vrNcNestedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrNcNestedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcNestedScenarioRoot -Model $vrNcNestedCleared -SchemaCatalog $vrNcNestedSessionCatalog -ProductionBaseline $vrNcNestedBaseline
+        $vrNcNestedFinalContent = if (Test-Path -LiteralPath $vrNcNestedLocalConfigPath) { Get-Content -LiteralPath $vrNcNestedLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$vrNcNestedApply.Applied -and [string]$vrNcNestedApply.Stage -eq 'Complete' -and
+            (-not $vrNcNestedFinalContent.Contains('Funday')) -and $vrNcNestedFinalContent.Contains($vrNcSiblingPath)
+        ) `
+            'Configurator/ValidatorRejectedNonCatalogNestedClearPreservesSibling' `
+            "Clear невалідного вкладеного $vrNcPath мусить дозволити успішний Apply, контейнер розгортається у флет dot-шляхи (canonical серіалізатор не пише hashtable), 'Funday' зникає, сусідній $vrNcSiblingPath переживає; отримано Applied=$($vrNcNestedApply.Applied) Stage=$($vrNcNestedApply.Stage) Content=$vrNcNestedFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $vrNcNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Валідний noncatalog override (At) — НЕ мусить ставати recovery-рядком =====
+    $vrNcValidScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_VALIDATORREJECTED_NONCATALOG_VALID_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($vrNcValidScenarioRoot)
+    try {
+        $vrNcValidLocalConfigPath = Join-Path $vrNcValidScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $vrNcValidLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ $vrNcValidNoncatalogPath = '03:00' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $vrNcValidBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcValidScenarioRoot
+        $vrNcValidSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $vrNcRawCatalog -LocalOverrides $vrNcValidBaseline.Overrides
+
+        # --- Configurator/ValidNonCatalogOverrideIsPreserved (не стає recovery-рядком) ---
+        Test-BRAVOCondition (
+            -not (@($vrNcValidSessionCatalog | Where-Object { $_.Path -eq $vrNcValidNoncatalogPath }))
+        ) `
+            'Configurator/ValidNonCatalogOverrideIsPreserved' `
+            "валідний noncatalog ALLOW_SITE-override ($vrNcValidNoncatalogPath='03:00') НЕ повинен синтезувати recovery-рядок — авторизація для нього IsValid=`$true"
+
+        # Unrelated Apply (WeeklyOn-раунд вище довів, що ClearOnly-Apply
+        # не чіпає невідомі схемі ключі — тут перевіряємо те саме на
+        # ЦІЛКОМ порожньому редагуванні моделі) не повинен видалити/
+        # зіпсувати валідний noncatalog override.
+        $vrNcValidModel = Get-BRAVOConfiguratorModel -SchemaCatalog $vrNcValidSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $vrNcValidBaseline.Overrides
+        $vrNcValidModel = Update-BRAVOConfiguratorEffective -Model $vrNcValidModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $vrNcValidNoopApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $vrNcValidScenarioRoot -Model $vrNcValidModel -SchemaCatalog $vrNcValidSessionCatalog -ProductionBaseline $vrNcValidBaseline
+        $vrNcValidFinalContent = Get-Content -LiteralPath $vrNcValidLocalConfigPath -Raw -Encoding UTF8
+        Test-BRAVOCondition (
+            $vrNcValidFinalContent.Contains($vrNcValidNoncatalogPath) -and $vrNcValidFinalContent.Contains('03:00')
+        ) `
+            'Configurator/ValidNonCatalogOverrideSurvivesUnrelatedApply' `
+            "валідний noncatalog override $vrNcValidNoncatalogPath='03:00' мусить пережити no-op Apply незмінним; отримано NoopApplied=$($vrNcValidNoopApply.Applied) Content=$vrNcValidFinalContent"
+    } finally {
+        Remove-Item -LiteralPath $vrNcValidScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Codex review PR #224 (P2, "Inspect every representation when
+# generating recovery rows"): Get-BRAVOConfiguratorSessionSchemaCatalog
+# раніше викликала Resolve-BRAVOConfiguratorSuppliedLeafOverride, яка
+# повертає ЛИШЕ ОДНЕ (найдовше/пріоритетне) supplied-представлення
+# canonical leaf-а. Якщо САМЕ це представлення проходило авторизацію,
+# код одразу `continue`-ився — і НІКОЛИ не перевіряв інші представлення
+# того самого leaf-а: валідний дублікат мовчки маскував невалідний, і
+# жодного recovery-рядка не синтезувалось, хоча canonical Apply назавжди
+# відхилявся б через невалидну копію без жодного UI-поля для Clear.
+# Get-BRAVOConfiguratorSuppliedLeafRepresentations тепер перераховує УСІ
+# представлення, і recovery-синтез бере перше, що не проходить
+# авторизацію.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $mrPath = 'schedulerSettings.RestoreVerify.WeeklyOn'
+    $mrContainerPath = 'schedulerSettings.RestoreVerify'
+    $mrDeniedFlatPath = 'winSCPIniPath'
+    $mrRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+
+    # --- Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow ---
+    $mrValidFlatInvalidNestedOverrides = @{
+        $mrPath          = 'Saturday'
+        $mrContainerPath = @{ WeeklyOn = 'Funday' }
+    }
+    $mrCatalog1 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrValidFlatInvalidNestedOverrides)
+    Test-BRAVOCondition (
+        [bool]@($mrCatalog1 | Where-Object { $_.Path -eq $mrPath })
+    ) `
+        'Configurator/MultiRepresentationValidFlatInvalidNestedProducesRecoveryRow' `
+        "$mrPath валідний плоским ключем ('Saturday'), але невалідний вкладеним дублікатом (WeeklyOn='Funday') — recovery-рядок МУСИТЬ синтезуватись, бо canonical Apply все одно відхилив би вкладену копію"
+
+    # --- Configurator/MultiRepresentationInvalidFlatValidNestedProducesRecoveryRow ---
+    $mrInvalidFlatValidNestedOverrides = @{
+        $mrPath          = 'Funday'
+        $mrContainerPath = @{ WeeklyOn = 'Saturday' }
+    }
+    $mrCatalog2 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrInvalidFlatValidNestedOverrides)
+    Test-BRAVOCondition (
+        [bool]@($mrCatalog2 | Where-Object { $_.Path -eq $mrPath })
+    ) `
+        'Configurator/MultiRepresentationInvalidFlatValidNestedProducesRecoveryRow' `
+        "$mrPath невалідний плоским ключем ('Funday') при валідному вкладеному дублікаті — recovery-рядок МУСИТЬ синтезуватись незалежно від того, яке представлення резолвер обирає пріоритетним"
+
+    # --- Configurator/MultiRepresentationDeniedFlatInvalidNestedProducesSingleRecoveryRow (3-рівнева форма, DENY-клас) ---
+    $mrDeniedOverrides = @{ $mrDeniedFlatPath = 'C:\Legacy\WinSCP.ini' }
+    $mrCatalog3 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrDeniedOverrides)
+    $mrRows3 = @($mrCatalog3 | Where-Object { $_.Path -eq $mrDeniedFlatPath })
+    Test-BRAVOCondition (
+        $mrRows3.Count -eq 1 -and [string]$mrRows3[0].Section -eq 'DeniedOverride'
+    ) `
+        'Configurator/MultiRepresentationDeniedFlatInvalidNestedProducesSingleRecoveryRow' `
+        "DENY_*-клас (winSCPIniPath) без статичного дескриптора мусить синтезувати РІВНО один DeniedOverride recovery-рядок; отримано count=$($mrRows3.Count) section=$([string]$mrRows3[0].Section)"
+
+    # --- Configurator/MultiRepresentationTwoInvalidRepresentationsProduceExactlyOneRecoveryRow ---
+    $mrTwoInvalidOverrides = @{
+        $mrPath          = 'Funday'
+        $mrContainerPath = @{ WeeklyOn = 'Bogus' }
+    }
+    $mrCatalog4 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrTwoInvalidOverrides)
+    $mrRows4 = @($mrCatalog4 | Where-Object { $_.Path -eq $mrPath })
+    Test-BRAVOCondition (
+        $mrRows4.Count -eq 1
+    ) `
+        'Configurator/MultiRepresentationTwoInvalidRepresentationsProduceExactlyOneRecoveryRow' `
+        "два одночасно невалідних представлення ОДНОГО canonical leaf-а мусять синтезувати РІВНО один recovery-рядок (без дублікатів); отримано count=$($mrRows4.Count)"
+
+    # --- Configurator/MultiRepresentationTwoValidRepresentationsProduceNoFalseRecoveryRow ---
+    $mrTwoValidOverrides = @{
+        $mrPath          = 'Saturday'
+        $mrContainerPath = @{ WeeklyOn = 'Sunday' }
+    }
+    $mrCatalog5 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrTwoValidOverrides)
+    Test-BRAVOCondition (
+        -not (@($mrCatalog5 | Where-Object { $_.Path -eq $mrPath }))
+    ) `
+        'Configurator/MultiRepresentationTwoValidRepresentationsProduceNoFalseRecoveryRow' `
+        "два одночасно ВАЛІДНИХ представлення ОДНОГО canonical leaf-а НЕ повинні синтезувати жодного recovery-рядка"
+
+    # --- Configurator/MultiRepresentationStaticDescriptorNotDuplicated ---
+    $mrStaticPath = [string]$mrRawCatalog[0].Path
+    $mrCatalog6 = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides @{})
+    $mrStaticDupCount = @($mrCatalog6 | Where-Object { $_.Path -eq $mrStaticPath }).Count
+    Test-BRAVOCondition (
+        $mrStaticDupCount -eq 1
+    ) `
+        'Configurator/MultiRepresentationStaticDescriptorNotDuplicated' `
+        "статичний дескриптор ($mrStaticPath) не повинен дублюватись recovery-синтезом; отримано count=$mrStaticDupCount"
+
+    # --- Configurator/MultiRepresentationDoesNotMutateSuppliedOverrides ---
+    $mrMutationProbeOverrides = @{
+        $mrPath          = 'Saturday'
+        $mrContainerPath = @{ WeeklyOn = 'Funday' }
+    }
+    $mrMutationProbeOverridesBeforeFlat = [string]$mrMutationProbeOverrides[$mrPath]
+    $mrMutationProbeOverridesBeforeNested = [string]$mrMutationProbeOverrides[$mrContainerPath]['WeeklyOn']
+    $mrMutationProbeOverridesBeforeCount = $mrMutationProbeOverrides.Count
+    [void](Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides $mrMutationProbeOverrides)
+    Test-BRAVOCondition (
+        $mrMutationProbeOverrides.Count -eq $mrMutationProbeOverridesBeforeCount -and
+        [string]$mrMutationProbeOverrides[$mrPath] -eq $mrMutationProbeOverridesBeforeFlat -and
+        [string]$mrMutationProbeOverrides[$mrContainerPath]['WeeklyOn'] -eq $mrMutationProbeOverridesBeforeNested
+    ) `
+        'Configurator/MultiRepresentationDoesNotMutateSuppliedOverrides' `
+        "recovery-row-синтез ЛИШЕ читає LocalOverrides — вхідний hashtable-об'єкт викликача (флат і вкладений вміст) не повинен змінитись"
+
+    # --- Configurator/MultiRepresentationOrderIndependentAcrossInsertionOrder ---
+    $mrOrderA = [ordered]@{}
+    $mrOrderA[$mrPath] = 'Saturday'
+    $mrOrderA[$mrContainerPath] = @{ WeeklyOn = 'Funday' }
+    $mrOrderB = [ordered]@{}
+    $mrOrderB[$mrContainerPath] = @{ WeeklyOn = 'Funday' }
+    $mrOrderB[$mrPath] = 'Saturday'
+    $mrCatalogOrderA = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides ([hashtable]$mrOrderA))
+    $mrCatalogOrderB = @(Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $mrRawCatalog -LocalOverrides ([hashtable]$mrOrderB))
+    Test-BRAVOCondition (
+        [bool]@($mrCatalogOrderA | Where-Object { $_.Path -eq $mrPath }) -and
+        [bool]@($mrCatalogOrderB | Where-Object { $_.Path -eq $mrPath })
+    ) `
+        'Configurator/MultiRepresentationOrderIndependentAcrossInsertionOrder' `
+        "результат recovery-синтезу не повинен залежати від порядку вставки ключів у hashtable LocalOverrides"
+}
+
+# =====================================================================
+# PR #224 third review, R3-1: Configurator effective preview повинна
+# відображати наявний BRAVO_ALLOW_WEAKENED_SECURITY=1 escape hatch для
+# requireAdministrator (canonical WeakeningOverride='ExistingSecurityEscapeHatch'),
+# і БЕЗУМОВНО відхиляти backupMonitoring.SFTP.BAZA.Mode/.MutationPolicy
+# незалежно від env (WeakeningOverride='None' — fail-closed за
+# замовчуванням). Env-змінна процесу зберігається/відновлюється в
+# try/finally, щоб не протікати в інші self-test-фрагменти.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $r31OriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+
+        # --- Preview/RequireAdministratorWeakeningRejectedWithoutEnv ---
+        $r31WithoutEnv = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'requireAdministrator'
+        Test-BRAVOCondition (-not $r31WithoutEnv) `
+            'Preview/RequireAdministratorWeakeningRejectedWithoutEnv' `
+            "без BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator НЕ повинен бути escapable; отримано $r31WithoutEnv"
+
+        $r31BaseModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides @{}
+
+        # requireAdministrator НЕ має власного Configurator UI-дескриптора
+        # (не редагується через Configurator взагалі — підтверджено:
+        # немає запису в BRAVO.Configurator.Schema.psd1), тому
+        # Get-BRAVOConfiguratorModel/Set-BRAVOConfiguratorOverride НІКОЛИ
+        # не можуть створити для нього Setting-рядок. ConvertTo-BRAVOConfiguratorOverrideHashtable
+        # приймає БУДЬ-ЯКИЙ масив об'єктів з Path/OverridePresent/OverrideValue
+        # (контракт функції не вимагає походження саме від SchemaCatalog) —
+        # синтетичний рядок тестує САМЕ ЦЮ функцію напряму, без залежності
+        # від того, чи colись з'явиться UI-дескриптор для цього листа.
+        # Властивості нижче (EffectiveValue/EffectiveSource/DisabledReason/
+        # ValidationState/DependencyState/Dirty) присутні порожніми, бо
+        # Update-BRAVOConfiguratorEffective (нижче, блок
+        # RequireAdministratorWeakeningAllowed/EffectiveReflectsLoader) під
+        # Set-StrictMode -Version 2.0 присвоює $clone.EffectiveValue/
+        # .DisabledReason/.EffectiveSource на PSObject.Copy() цього рядка —
+        # той самий canonical Setting-shape, що Get-BRAVOConfiguratorModel
+        # створює (BRAVO.Configurator.Model.psm1, ~рядок 362), інакше
+        # присвоєння неіснуючої властивості PSCustomObject кидає виняток.
+        $r31ModelWithOverride = @(
+            [pscustomobject]@{
+                Path            = 'requireAdministrator'
+                Metadata        = $null
+                DefaultValue    = $true
+                OverridePresent = $true
+                OverrideValue   = $false
+                EffectiveValue  = $null
+                EffectiveSource = $null
+                DisabledReason  = $null
+                ValidationState = $null
+                DependencyState = $null
+                Dirty           = $false
+            }
+        )
+
+        $r31PreviewWithoutEnv = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $r31ModelWithOverride
+        Test-BRAVOCondition (-not $r31PreviewWithoutEnv.Contains('requireAdministrator')) `
+            'Preview/RequireAdministratorWeakeningRejectedWithoutEnv/ProjectionExcludesOverride' `
+            "без env-підтвердження requireAdministrator=`$false НЕ повинен передаватись canonical loader-у для preview; Contains=$($r31PreviewWithoutEnv.Contains('requireAdministrator'))"
+
+        # --- Preview/RequireAdministratorWeakeningAllowed ---
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+
+        $r31WithEnv = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'requireAdministrator'
+        Test-BRAVOCondition ([bool]$r31WithEnv) `
+            'Preview/RequireAdministratorWeakeningAllowed' `
+            "з BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator МУСИТЬ бути escapable (canonical WeakeningOverride='ExistingSecurityEscapeHatch'); отримано $r31WithEnv"
+
+        $r31PreviewWithEnv = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $r31ModelWithOverride
+        Test-BRAVOCondition (
+            $r31PreviewWithEnv.Contains('requireAdministrator') -and [bool]$r31PreviewWithEnv['requireAdministrator'] -eq $false
+        ) `
+            'Preview/RequireAdministratorWeakeningAllowed/ProjectionIncludesOverride' `
+            "з env-підтвердженням requireAdministrator=`$false МУСИТЬ передаватись canonical loader-у для preview; Contains=$($r31PreviewWithEnv.Contains('requireAdministrator')) Value=$($r31PreviewWithEnv['requireAdministrator'])"
+
+        # Наскрізна перевірка: Effective дійсно стає $false через реальний
+        # canonical loader (child-process), не лише проєкція hashtable —
+        # Start-Process успадковує env поточного процесу за замовчуванням.
+        $r31EffectiveModel = Update-BRAVOConfiguratorEffective -Model $r31ModelWithOverride -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $r31RequireAdminSetting = @($r31EffectiveModel | Where-Object { $_.Path -eq 'requireAdministrator' })
+        Test-BRAVOCondition (
+            $r31RequireAdminSetting.Count -eq 1 -and [bool]$r31RequireAdminSetting[0].EffectiveValue -eq $false
+        ) `
+            'Preview/RequireAdministratorWeakeningAllowed/EffectiveReflectsLoader' `
+            "з env-підтвердженням canonical loader МУСИТЬ прийняти override, тож Effective мусить стати `$false; отримано EffectiveValue=$($r31RequireAdminSetting[0].EffectiveValue)"
+
+        # --- Preview/BazaModeStillRejectedWithWeakeningEnv ---
+        # (env і далі '1' з блоку вище — саме цей стан мусить лишатись недостатнім для BAZA.*)
+        $r31BazaModeResult = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'backupMonitoring.SFTP.BAZA.Mode'
+        Test-BRAVOCondition (-not $r31BazaModeResult) `
+            'Preview/BazaModeStillRejectedWithWeakeningEnv' `
+            "backupMonitoring.SFTP.BAZA.Mode НІКОЛИ не escapable, незалежно від BRAVO_ALLOW_WEAKENED_SECURITY (WeakeningOverride='None'); отримано $r31BazaModeResult"
+
+        $r31BazaModeSetting = @($r31BaseModel | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+        Test-BRAVOCondition ($r31BazaModeSetting.Count -eq 1) `
+            'Preview/BazaModeStillRejectedWithWeakeningEnv/DescriptorExists' `
+            "fixture-передумова: backupMonitoring.SFTP.BAZA.Mode мусить мати Configurator-дескриптор; отримано Count=$($r31BazaModeSetting.Count)"
+        $r31BazaModeModel = Set-BRAVOConfiguratorOverride -Model $r31BaseModel -Path 'backupMonitoring.SFTP.BAZA.Mode' -Value 'Legacy'
+        $r31BazaModePreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $r31BazaModeModel
+        Test-BRAVOCondition (-not $r31BazaModePreview.Contains('backupMonitoring.SFTP.BAZA.Mode')) `
+            'Preview/BazaModeStillRejectedWithWeakeningEnv/ProjectionExcludesOverride' `
+            "навіть з BRAVO_ALLOW_WEAKENED_SECURITY=1 BAZA.Mode НЕ повинен передаватись canonical loader-у для preview; Contains=$($r31BazaModePreview.Contains('backupMonitoring.SFTP.BAZA.Mode'))"
+
+        # --- Preview/BazaMutationPolicyStillRejectedWithWeakeningEnv ---
+        # MutationPolicy не має власного Configurator-дескриптора (UI не
+        # рендерить цей лист) — перевірка на рівні canonical рішення, того
+        # самого, яке ConvertTo-BRAVOConfiguratorOverrideHashtable викликав
+        # би, якби такий дескриптор існував.
+        $r31BazaMutationPolicyResult = Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path 'backupMonitoring.SFTP.BAZA.MutationPolicy'
+        Test-BRAVOCondition (-not $r31BazaMutationPolicyResult) `
+            'Preview/BazaMutationPolicyStillRejectedWithWeakeningEnv' `
+            "backupMonitoring.SFTP.BAZA.MutationPolicy НІКОЛИ не escapable, незалежно від BRAVO_ALLOW_WEAKENED_SECURITY (WeakeningOverride='None'); отримано $r31BazaMutationPolicyResult"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $r31OriginalEnv)
+    }
+}
+
+# =====================================================================
+# PR #224 review, шосте коло (P2, "Generalize noncatalog DENY recovery"):
+# той самий recovery deadlock, що п'яте коло вирішило для ALLOW_WITH_
+# VALIDATOR-листів без статичного дескриптора, існує так само для
+# DENY_*-листів без статичного дескриптора (напр. winSCPIniPath,
+# schedulerSettings.RequireProtectedRuntime — 41 з 42 DENY_*-шляхів
+# сьогодні). Get-BRAVOConfiguratorSessionSchemaCatalog тепер синтезує
+# recovery-only рядок (Section='DeniedOverride') і для ЦИХ шляхів —
+# ЦІЛКОМ похідно від того самого canonical
+# Test-BRAVOConfigurationOverrideAuthorization + ЄДИНОГО, вже наявного
+# Test-BRAVOConfigurationWeakeningEscapeHatchAllowed (не дубльовано,
+# requireAdministrator лишається єдиним escapable шляхом). Жодного
+# per-path спецкоду й жодної другої 42-шляхової таблиці — детекція
+# похідна напряму від реєстру.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -Force
+    }
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+
+    $dnFlatPath = 'winSCPIniPath'
+    $dnNestedContainerPath = 'schedulerSettings'
+    $dnNestedLeaf = 'RequireProtectedRuntime'
+    $dnNestedPath = 'schedulerSettings.RequireProtectedRuntime'
+    $dnNestedSiblingLeaf = 'AllowStartIfOnBatteries'
+    $dnNestedSiblingPath = 'schedulerSettings.AllowStartIfOnBatteries'
+    $dnRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $dnAuthClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+
+    Test-BRAVOCondition (
+        $dnAuthClass.Contains($dnFlatPath) -and [string]$dnAuthClass[$dnFlatPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        (-not (@($dnRawCatalog | Where-Object { $_.Path -eq $dnFlatPath })))
+    ) `
+        'Configurator/DeniedRecoveryFixturePreconditions/WinSCPIniPath' `
+        "передумова: $dnFlatPath мусить лишатись DENY_SECURITY_CONTROL і БЕЗ статичного Configurator-дескриптора; отримано Class=$($dnAuthClass[$dnFlatPath].Class) StaticHasIt=$([bool](@($dnRawCatalog | Where-Object { $_.Path -eq $dnFlatPath })))"
+    Test-BRAVOCondition (
+        $dnAuthClass.Contains($dnNestedPath) -and [string]$dnAuthClass[$dnNestedPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        (-not (@($dnRawCatalog | Where-Object { $_.Path -eq $dnNestedPath })))
+    ) `
+        'Configurator/DeniedRecoveryFixturePreconditions/RequireProtectedRuntime' `
+        "передумова: $dnNestedPath мусить лишатись DENY_SECURITY_CONTROL і БЕЗ статичного Configurator-дескриптора; отримано Class=$($dnAuthClass[$dnNestedPath].Class) StaticHasIt=$([bool](@($dnRawCatalog | Where-Object { $_.Path -eq $dnNestedPath })))"
+
+    # --- Configurator/DeniedNonCatalogRecoveryRowCannotCreateFreshOverride (чистий конфіг) ---
+    $dnCleanSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{}
+    Test-BRAVOCondition (
+        -not (@($dnCleanSessionCatalog | Where-Object { $_.Path -eq $dnFlatPath -or $_.Path -eq $dnNestedPath }))
+    ) `
+        'Configurator/DeniedNonCatalogRecoveryRowCannotCreateFreshOverride' `
+        "БЕЗ наявного denied override augmented-каталог НЕ повинен синтезувати recovery-рядок для $dnFlatPath/$dnNestedPath — оператор не може створити їх з чистого конфігу через Configurator"
+
+    # ===== Плоский (flat) DENY-override: winSCPIniPath =====
+    $dnFlatScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DENIEDRECOVERY_FLAT_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dnFlatScenarioRoot)
+    try {
+        $dnFlatLocalConfigPath = Join-Path $dnFlatScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $dnFlatLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $dnFlatPath                = 'C:\Legacy\WinSCP.ini'
+                'schedulerSettings.Hidden' = $true
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $dnFlatBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnFlatScenarioRoot
+        $dnFlatSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnFlatBaseline.Overrides
+        $dnFlatRecoveryDescriptor = @($dnFlatSessionCatalog | Where-Object { $_.Path -eq $dnFlatPath })
+        $dnFlatModel = Get-BRAVOConfiguratorModel -SchemaCatalog $dnFlatSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $dnFlatBaseline.Overrides
+        $dnFlatSetting = @($dnFlatModel | Where-Object { $_.Path -eq $dnFlatPath })
+
+        # --- Configurator/DeniedNonCatalogRecoveryRowExists ---
+        Test-BRAVOCondition (
+            $dnFlatRecoveryDescriptor.Count -eq 1 -and [bool]$dnFlatRecoveryDescriptor[0].ReadOnly -and
+            [string]$dnFlatRecoveryDescriptor[0].Section -eq 'DeniedOverride' -and
+            $dnFlatSetting.Count -eq 1 -and [bool]$dnFlatSetting[0].OverridePresent -and [string]$dnFlatSetting[0].OverrideValue -eq 'C:\Legacy\WinSCP.ini'
+        ) `
+            'Configurator/DeniedNonCatalogRecoveryRowExists' `
+            "$dnFlatPath не має статичного дескриптора, але з наявним denied override augmented-каталог мусить синтезувати РІВНО один recovery-only (ReadOnly, Section=DeniedOverride) рядок, а Model — показувати OverridePresent=true; отримано RecoveryCount=$($dnFlatRecoveryDescriptor.Count) Section=$($dnFlatRecoveryDescriptor[0].Section) OverridePresent=$($dnFlatSetting[0].OverridePresent)"
+
+        # --- Configurator/DeniedNonCatalogFlatClearSucceeds ---
+        $dnFlatCleared = Clear-BRAVOConfiguratorOverride -Model $dnFlatModel -Path $dnFlatPath
+        $dnFlatCleared = Update-BRAVOConfiguratorEffective -Model $dnFlatCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $dnFlatApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnFlatScenarioRoot -Model $dnFlatCleared -SchemaCatalog $dnFlatSessionCatalog -ProductionBaseline $dnFlatBaseline
+        $dnFlatFinalContent = if (Test-Path -LiteralPath $dnFlatLocalConfigPath) { Get-Content -LiteralPath $dnFlatLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$dnFlatApply.Applied -and [string]$dnFlatApply.Stage -eq 'Complete' -and
+            (-not $dnFlatFinalContent.Contains('WinSCP.ini')) -and $dnFlatFinalContent.Contains('schedulerSettings.Hidden')
+        ) `
+            'Configurator/DeniedNonCatalogFlatClearSucceeds' `
+            "Clear заблокованого плоского $dnFlatPath мусить дозволити успішний Apply (Applied=`$true, Stage=Complete), значення зникає з файлу, сусідній schedulerSettings.Hidden переживає; отримано Applied=$($dnFlatApply.Applied) Stage=$($dnFlatApply.Stage) Content=$dnFlatFinalContent"
+
+        # --- Post-Clear: рядок природно зникає з наступного augmented-каталогу ---
+        $dnFlatBaselineAfter = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnFlatScenarioRoot
+        $dnFlatSessionCatalogAfter = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnFlatBaselineAfter.Overrides
+        Test-BRAVOCondition (
+            -not (@($dnFlatSessionCatalogAfter | Where-Object { $_.Path -eq $dnFlatPath }))
+        ) `
+            'Configurator/DeniedNonCatalogRecoveryRowDisappearsAfterClear' `
+            "після успішного Clear+Apply наступний Get-BRAVOConfiguratorSessionSchemaCatalog-виклик (Reload) БІЛЬШЕ не повинен синтезувати recovery-рядок для $dnFlatPath"
+    } finally {
+        Remove-Item -LiteralPath $dnFlatScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Вкладена (nested) форма: schedulerSettings.RequireProtectedRuntime =====
+    $dnNestedScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DENIEDRECOVERY_NESTED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dnNestedScenarioRoot)
+    try {
+        $dnNestedLocalConfigPath = Join-Path $dnNestedScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $dnNestedLocalConfigPath,
+            (
+                "@{`r`n" +
+                "    '$dnNestedContainerPath' = @{`r`n" +
+                "        '$dnNestedLeaf' = `$true`r`n" +
+                "        '$dnNestedSiblingLeaf' = `$true`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $dnNestedBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnNestedScenarioRoot
+        $dnNestedSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnNestedBaseline.Overrides
+        $dnNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $dnNestedSessionCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $dnNestedBaseline.Overrides
+        $dnNestedSetting = @($dnNestedModel | Where-Object { $_.Path -eq $dnNestedPath })
+
+        # --- Configurator/DeniedNonCatalogNestedRecoveryRowDetected ---
+        Test-BRAVOCondition (
+            $dnNestedSetting.Count -eq 1 -and [bool]$dnNestedSetting[0].OverridePresent -and [bool]$dnNestedSetting[0].OverrideValue -eq $true
+        ) `
+            'Configurator/DeniedNonCatalogNestedRecoveryRowDetected' `
+            "вкладена форма ($dnNestedContainerPath = @{ $dnNestedLeaf=`$true; $dnNestedSiblingLeaf=`$true }) мусить так само синтезувати recovery-рядок для $dnNestedPath; отримано OverridePresent=$($dnNestedSetting[0].OverridePresent) Value=$($dnNestedSetting[0].OverrideValue)"
+
+        # --- Configurator/DeniedNonCatalogNestedClearPreservesSibling ---
+        $dnNestedCleared = Clear-BRAVOConfiguratorOverride -Model $dnNestedModel -Path $dnNestedPath
+        $dnNestedCleared = Update-BRAVOConfiguratorEffective -Model $dnNestedCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $dnNestedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnNestedScenarioRoot -Model $dnNestedCleared -SchemaCatalog $dnNestedSessionCatalog -ProductionBaseline $dnNestedBaseline
+        $dnNestedFinalContent = if (Test-Path -LiteralPath $dnNestedLocalConfigPath) { Get-Content -LiteralPath $dnNestedLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$dnNestedApply.Applied -and [string]$dnNestedApply.Stage -eq 'Complete' -and
+            (-not $dnNestedFinalContent.Contains($dnNestedLeaf)) -and $dnNestedFinalContent.Contains($dnNestedSiblingPath)
+        ) `
+            'Configurator/DeniedNonCatalogNestedClearPreservesSibling' `
+            "Clear забороненого вкладеного $dnNestedPath мусить дозволити успішний Apply, контейнер розгортається у флет dot-шляхи, значення зникає, сусідній $dnNestedSiblingPath переживає; отримано Applied=$($dnNestedApply.Applied) Stage=$($dnNestedApply.Stage) Content=$dnNestedFinalContent Reasons=$($dnNestedApply.Reasons -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $dnNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Не дублюється для шляху зі статичним дескриптором (BAZA.Mode) =====
+    $dnStaticScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DENIEDRECOVERY_STATICNODUP_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($dnStaticScenarioRoot)
+    try {
+        $dnStaticLocalConfigPath = Join-Path $dnStaticScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $dnStaticLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $dnStaticBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $dnStaticScenarioRoot
+        $dnStaticSessionCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnStaticBaseline.Overrides
+        $dnStaticMatches = @($dnStaticSessionCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+
+        # --- Configurator/DeniedRecoveryDoesNotDuplicateStaticDescriptor ---
+        Test-BRAVOCondition ($dnStaticMatches.Count -eq 1) `
+            'Configurator/DeniedRecoveryDoesNotDuplicateStaticDescriptor' `
+            "backupMonitoring.SFTP.BAZA.Mode вже має статичний Configurator-дескриптор (окремий ReadOnly-механізм) — augmented-каталог НЕ повинен додавати другий (синтезований) дескриптор для того самого Path; отримано Count=$($dnStaticMatches.Count)"
+    } finally {
+        Remove-Item -LiteralPath $dnStaticScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # ===== Escape hatch (requireAdministrator): вплив на синтез recovery-рядка =====
+    $dnEscOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $dnEscWithoutEnvCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'requireAdministrator' = $false }
+        $dnEscWithoutEnvRow = @($dnEscWithoutEnvCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
+
+        # --- Configurator/DeniedRecoverySynthesizedWithoutEscapeHatch ---
+        Test-BRAVOCondition (
+            $dnEscWithoutEnvRow.Count -eq 1 -and [string]$dnEscWithoutEnvRow[0].Section -eq 'DeniedOverride'
+        ) `
+            'Configurator/DeniedRecoverySynthesizedWithoutEscapeHatch' `
+            "БЕЗ BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator=`$false МУСИТЬ синтезувати DeniedOverride recovery-рядок (canonical loader його зараз відхиляє); отримано Count=$($dnEscWithoutEnvRow.Count)"
+
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $dnEscWithEnvCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'requireAdministrator' = $false }
+        $dnEscWithEnvRow = @($dnEscWithEnvCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
+
+        # --- Configurator/DeniedRecoveryNotSynthesizedWithEscapeHatchAllowed ---
+        # Issue #216, сьоме коло ревю ("Keep escapable noncatalog overrides
+        # in the session model"): раніше escapable DENY просто НЕ
+        # синтезував жодного рядка (Count=0) — Model про override нічого
+        # не знала, preview помилково відкочувався до canonical default.
+        # Тепер рядок ІСНУЄ (Count=1), АЛЕ з Section='EscapableOverride' —
+        # НЕ 'DeniedOverride' (значення фактично прийняте, не відхилене).
+        # Повний матрікс цього Case C — окремий блок нижче
+        # (Configurator/EscapableNonCatalogOverride*).
+        Test-BRAVOCondition (
+            $dnEscWithEnvRow.Count -eq 1 -and [string]$dnEscWithEnvRow[0].Section -eq 'EscapableOverride'
+        ) `
+            'Configurator/DeniedRecoveryNotSynthesizedWithEscapeHatchAllowed' `
+            "З BRAVO_ALLOW_WEAKENED_SECURITY=1 requireAdministrator=`$false МУСИТЬ бути прийнятий canonical loader-ом через наявний escape hatch — синтезований рядок МУСИТЬ існувати, АЛЕ з Section='EscapableOverride' (НЕ 'DeniedOverride' — значення фактично не відхилене); отримано Count=$($dnEscWithEnvRow.Count) Section=$($(if ($dnEscWithEnvRow.Count) { $dnEscWithEnvRow[0].Section } else { 'N/A' }))"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnEscOriginalEnv)
+    }
+
+    # ===== Codex review PR #224 (P2, "Preserve typed values in synthesized
+    # recovery rows"): синтезований recovery-дескриптор МУСИТЬ мати Type,
+    # що відповідає РЕАЛЬНОМУ .NET-типу supplied-значення — раніше Type
+    # був захардкожений 'String' для КОЖНОГО recovery-рядка незалежно від
+    # значення, тож escapable requireAdministrator=$false (Boolean)
+    # синтезувався з Type='String'; після round-trip через checkbox
+    # uncheck+recheck (UI серіалізує через TextBox-текст для 'String')
+    # override перетворювався на рядок 'False' замість Boolean $false, і
+    # наступний Apply відхилявся schema-валідацією (canonical лист
+    # requireAdministrator очікує Boolean, не String). =====
+    $tpOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $tpBoolCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'requireAdministrator' = $false }
+        $tpBoolRow = @($tpBoolCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
+
+        # --- Configurator/RecoveryRowPreservesBooleanType ---
+        Test-BRAVOCondition (
+            $tpBoolRow.Count -eq 1 -and [string]$tpBoolRow[0].Type -eq 'Boolean'
+        ) `
+            'Configurator/RecoveryRowPreservesBooleanType' `
+            "синтезований recovery-рядок для requireAdministrator=`$false (escapable, Boolean) мусить отримати Type='Boolean', а не захардкоджений 'String'; отримано Count=$($tpBoolRow.Count) Type=$($(if ($tpBoolRow.Count) { $tpBoolRow[0].Type } else { 'N/A' }))"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $tpOriginalEnv)
+    }
+
+    # --- Configurator/RecoveryRowPreservesStringTypeForNonBooleanValidatorRejected ---
+    # Негативний контроль: типовий ValidatorRejected-легасі override
+    # (рядкове enum-значення) і далі мусить синтезуватись із Type='String'
+    # — фікс не мав змінити поведінку для звичайного рядкового випадку.
+    $tpStringCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'schedulerSettings.RestoreVerify.WeeklyOn' = 'Funday' }
+    $tpStringRow = @($tpStringCatalog | Where-Object { $_.Path -eq 'schedulerSettings.RestoreVerify.WeeklyOn' })
+    Test-BRAVOCondition (
+        $tpStringRow.Count -eq 1 -and [string]$tpStringRow[0].Type -eq 'String'
+    ) `
+        'Configurator/RecoveryRowPreservesStringTypeForNonBooleanValidatorRejected' `
+        "синтезований recovery-рядок для рядкового ValidatorRejected-значення (WeeklyOn='Funday') мусить лишитись Type='String'; отримано Count=$($tpStringRow.Count) Type=$($(if ($tpStringRow.Count) { $tpStringRow[0].Type } else { 'N/A' }))"
+
+    # ===== Data-driven повнота: КОЖЕН non-catalog DENY_*-шлях отримує recovery-рядок =====
+    # Намірено НЕ хардкодить перелік 42 шляхів — множина похідна напряму
+    # з $dnAuthClass (canonical реєстр) мінус $dnRawCatalog (статичний
+    # каталог), той самий підхід, що Get-BRAVOConfiguratorSessionSchemaCatalog
+    # сам використовує внутрішньо. Це та сама перевірка, яку п'яте коло
+    # виконало для ValidatorRejected-множини — тепер симетрично для DENY_*.
+    $dnCompletenessOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $dnStaticPathSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($d in $dnRawCatalog) { [void]$dnStaticPathSet.Add([string]$d.Path) }
+
+        $dnNonCatalogDenyPaths = @(
+            $dnAuthClass.Keys | Where-Object {
+                [string]$dnAuthClass[$_].Class -like 'DENY_*' -and (-not $dnStaticPathSet.Contains($_))
+            } | Sort-Object
+        )
+        Test-BRAVOCondition ($dnNonCatalogDenyPaths.Count -gt 0) `
+            'Configurator/NonCatalogDenyPathSetNonEmpty' `
+            "fixture-передумова: реєстр мусить мати щонайменше один DENY_*-шлях без статичного Configurator-дескриптора; отримано Count=$($dnNonCatalogDenyPaths.Count)"
+
+        $dnCompletenessOverrides = @{}
+        foreach ($p in $dnNonCatalogDenyPaths) { $dnCompletenessOverrides[$p] = 'selftest-denied-recovery-completeness-probe' }
+        $dnCompletenessCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides $dnCompletenessOverrides
+        $dnCompletenessRecoveryPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($d in $dnCompletenessCatalog) {
+            if ($d -is [hashtable] -and [string]$d.Section -eq 'DeniedOverride') { [void]$dnCompletenessRecoveryPaths.Add([string]$d.Path) }
+        }
+        $dnCompletenessMissing = @($dnNonCatalogDenyPaths | Where-Object {
+            (-not $dnCompletenessRecoveryPaths.Contains($_)) -and
+            (-not (Test-BRAVOConfigurationWeakeningEscapeHatchAllowed -Path $_ -AuthorizationClass $dnAuthClass))
+        })
+
+        # --- Configurator/AllRejectedNonCatalogSuppliedLeavesHaveRecoveryRows ---
+        Test-BRAVOCondition ($dnCompletenessMissing.Count -eq 0) `
+            'Configurator/AllRejectedNonCatalogSuppliedLeavesHaveRecoveryRows' `
+            "КОЖЕН non-catalog DENY_*-шлях (Count=$($dnNonCatalogDenyPaths.Count)) з supplied override і без escape hatch мусить отримати recovery-рядок; відсутні: $($dnCompletenessMissing -join ', ')"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnCompletenessOriginalEnv)
+    }
+}
+
+# =====================================================================
+# PR #224 review, шосте коло (P2, "IntegerRange overflow hardening"):
+# sftpPort МАЄ статичний Configurator-дескриптор (Storage/SFTP, Order 20)
+# — той самий "cataloged-лист з невалідним значенням" шлях, що п'яте
+# коло вже довело для BootRestoreMode (ConvertTo-BRAVOConfiguratorOverrideHashtable
+# виключає ValidatorRejected із preview-candidate замість того, щоб дати
+# canonical loader-у throw при КОЖНОМУ Apply/startup). Тут перевіряється,
+# що надто велике числове значення (раніше кидало OverflowException
+# всередині IntegerRange-валідатора) так само не кидає з Model/preview-
+# конвеєра Configurator-а — лише коректно виключається з preview-
+# candidate, лишаючись видимим у Model для виправлення/Clear.
+# =====================================================================
+& {
+    $irSftpPath = 'sftpPort'
+    $irSftpScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_INTEGERRANGE_OVERSIZED_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($irSftpScenarioRoot)
+    try {
+        $irSftpLocalConfigPath = Join-Path $irSftpScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $irSftpLocalConfigPath,
+            (
+                "@{`r`n" +
+                "    '$irSftpPath' = 18446744073709551615`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $irSftpBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $irSftpScenarioRoot
+        $irSftpModelThrew = $false
+        $irSftpModel = $null
+        try {
+            $irSftpModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $irSftpBaseline.Overrides
+        } catch {
+            $irSftpModelThrew = $true
+        }
+        $irSftpSetting = @($(if ($irSftpModel) { $irSftpModel | Where-Object { $_.Path -eq $irSftpPath } }))
+
+        $irSftpPreviewThrew = $false
+        $irSftpPreview = $null
+        try {
+            $irSftpPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $irSftpModel
+        } catch {
+            $irSftpPreviewThrew = $true
+        }
+
+        # --- Configurator/OversizedCatalogIntegerOverridePreviewDoesNotThrow ---
+        Test-BRAVOCondition (
+            (-not $irSftpModelThrew) -and (-not $irSftpPreviewThrew) -and
+            $irSftpSetting.Count -eq 1 -and [bool]$irSftpSetting[0].OverridePresent -and
+            $null -ne $irSftpPreview -and (-not $irSftpPreview.Contains($irSftpPath))
+        ) `
+            'Configurator/OversizedCatalogIntegerOverridePreviewDoesNotThrow' `
+            "$irSftpPath=[uint64]::MaxValue МУСИТЬ лишитись у Model (OverridePresent=true) для виправлення/Clear, БЕЗ throw під час Model/preview-побудови, і бути виключеним із preview-candidate; отримано ModelThrew=$irSftpModelThrew PreviewThrew=$irSftpPreviewThrew SettingCount=$($irSftpSetting.Count) PreviewContains=$($(if ($irSftpPreview) { $irSftpPreview.Contains($irSftpPath) } else { 'N/A' }))"
+    } finally {
+        Remove-Item -LiteralPath $irSftpScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Issue #216, сьоме коло ревю (P2, "Keep escapable noncatalog overrides
+# in the session model"): requireAdministrator=$false БЕЗ статичного
+# Configurator-дескриптора, DENY_SECURITY_CONTROL,
+# WeakeningOverride='ExistingSecurityEscapeHatch' — canonical loader
+# ПРИЙМАЄ це значення, КОЛИ BRAVO_ALLOW_WEAKENED_SECURITY=1. Раніше
+# Get-BRAVOConfiguratorSessionSchemaCatalog просто `continue`-ила Case C
+# (escapable DENY) — Model про override НІЧОГО не знала, preview
+# помилково відкочувався до canonical default $true. Тепер синтезується
+# session-preservation рядок (Section='EscapableOverride', ВІДМІННИЙ від
+# 'DeniedOverride'/'ValidatorRejected') — ReadOnly/existing-only/Clear-
+# only, як і решта recovery-рядків, АЛЕ бере участь у preview-candidate.
+# =====================================================================
+& {
+    $eoPath = 'requireAdministrator'
+    $eoRawCatalog = Get-BRAVOConfiguratorSchemaCatalog
+    $eoAuthClass = Get-BRAVOConfigurationSchemaAuthorizationClass
+
+    Test-BRAVOCondition (
+        $eoAuthClass.Contains($eoPath) -and [string]$eoAuthClass[$eoPath].Class -eq 'DENY_SECURITY_CONTROL' -and
+        [string]$eoAuthClass[$eoPath].WeakeningOverride -eq 'ExistingSecurityEscapeHatch' -and
+        (-not (@($eoRawCatalog | Where-Object { $_.Path -eq $eoPath })))
+    ) `
+        'Configurator/EscapableSessionFixturePreconditions' `
+        "передумова: $eoPath мусить лишатись DENY_SECURITY_CONTROL/ExistingSecurityEscapeHatch і БЕЗ статичного Configurator-дескриптора; отримано Class=$($eoAuthClass[$eoPath].Class) WeakeningOverride=$($eoAuthClass[$eoPath].WeakeningOverride) StaticHasIt=$([bool](@($eoRawCatalog | Where-Object { $_.Path -eq $eoPath })))"
+
+    $eoScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_ESCAPABLESESSION_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($eoScenarioRoot)
+    $eoOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        # $eoScenarioRoot навмисно без BRAVO.config (той самий synthetic-
+        # no-config шлях, що й Секція 8 вище) — тож pathSettings.LIMSRoot/
+        # BackupRoot мусять бути явними тут, інакше canonical loader
+        # намагається AUTO-визначити їх через реальну службу Windows
+        # "BRAVO" (Resolve-BRAVOEffectiveLimsRoot), якої немає на CI-
+        # runner-і — негерметична залежність, що ламала пряму дочірню
+        # canonical-loader-пробу нижче (EscapableNonCatalogOverridePreview-
+        # MatchesLoader) на GitHub Actions windows-latest, хоча решта
+        # сценарію тут коректно ізольована через $configuratorFixtureRuntimeRoot.
+        $eoLocalConfigPath = Join-Path $eoScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $eoLocalConfigPath,
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                $eoPath = $false
+                'pathSettings.LIMSRoot' = $configuratorFixtureLimsRoot
+                'pathSettings.BackupRoot' = $configuratorFixtureBackupRoot
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        # ===== Environment OFF =====
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $eoOffBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot
+        $eoOffCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOffBaseline.Overrides
+        $eoOffRow = @($eoOffCatalog | Where-Object { $_.Path -eq $eoPath })
+        $eoOffModel = Get-BRAVOConfiguratorModel -SchemaCatalog $eoOffCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $eoOffBaseline.Overrides
+        $eoOffSetting = @($eoOffModel | Where-Object { $_.Path -eq $eoPath })
+        $eoOffPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $eoOffModel
+        $eoOffEffectiveModel = Update-BRAVOConfiguratorEffective -Model $eoOffModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOffEffectiveSetting = @($eoOffEffectiveModel | Where-Object { $_.Path -eq $eoPath })
+
+        Test-BRAVOCondition (
+            $eoOffRow.Count -eq 1 -and [string]$eoOffRow[0].Section -eq 'DeniedOverride' -and [bool]$eoOffRow[0].ReadOnly -and
+            $eoOffSetting.Count -eq 1 -and [bool]$eoOffSetting[0].OverridePresent -and [bool]$eoOffSetting[0].OverrideValue -eq $false
+        ) `
+            'Configurator/NonEscapableDeniedRecoveryStillWorks' `
+            "БЕЗ env $eoPath мусить лишитись звичайним DeniedOverride recovery-рядком (Section=DeniedOverride, ReadOnly), Model OverridePresent=true/OverrideValue=false; отримано RowCount=$($eoOffRow.Count) Section=$($(if ($eoOffRow.Count) { $eoOffRow[0].Section } else { 'N/A' })) OverridePresent=$($eoOffSetting[0].OverridePresent) Value=$($eoOffSetting[0].OverrideValue)"
+
+        Test-BRAVOCondition (
+            (-not $eoOffPreview.Contains($eoPath)) -and
+            $eoOffEffectiveSetting.Count -eq 1 -and [bool]$eoOffEffectiveSetting[0].EffectiveValue -eq $true
+        ) `
+            'Configurator/EscapableNonCatalogOverridePreviewMatchesLoader/EnvOff' `
+            "БЕЗ env preview МУСИТЬ виключити $eoPath, а Effective лишитись canonical default `$true (те саме, що реально прийме loader БЕЗ BRAVO_ALLOW_WEAKENED_SECURITY=1); отримано PreviewContains=$($eoOffPreview.Contains($eoPath)) EffectiveValue=$($eoOffEffectiveSetting[0].EffectiveValue)"
+
+        # --- Apply unchanged (env OFF) мусить fail-closed провалитись ---
+        $eoOffUnchangedModel = Update-BRAVOConfiguratorEffective -Model $eoOffModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOffUnchangedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot -Model $eoOffUnchangedModel -SchemaCatalog $eoOffCatalog -ProductionBaseline $eoOffBaseline
+        $eoOffUnchangedContent = Get-Content -LiteralPath $eoLocalConfigPath -Raw -Encoding UTF8
+        Test-BRAVOCondition (
+            (-not [bool]$eoOffUnchangedApply.Applied) -and $eoOffUnchangedContent.Contains($eoPath)
+        ) `
+            'Configurator/EscapableNonCatalogOverrideApplyUnchangedFailsWithoutEnv' `
+            "БЕЗ env Apply незміненого $eoPath=false МУСИТЬ fail-closed провалитись (canonical loader відхиляє), файл лишається незмінним; отримано Applied=$($eoOffUnchangedApply.Applied) Content=$eoOffUnchangedContent"
+
+        # ===== Environment ON =====
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $eoOnBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot
+        $eoOnCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOnBaseline.Overrides
+        $eoOnRow = @($eoOnCatalog | Where-Object { $_.Path -eq $eoPath })
+        $eoOnModel = Get-BRAVOConfiguratorModel -SchemaCatalog $eoOnCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $eoOnBaseline.Overrides
+        $eoOnSetting = @($eoOnModel | Where-Object { $_.Path -eq $eoPath })
+        $eoOnPreview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model $eoOnModel
+        $eoOnEffectiveModel = Update-BRAVOConfiguratorEffective -Model $eoOnModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOnEffectiveSetting = @($eoOnEffectiveModel | Where-Object { $_.Path -eq $eoPath })
+
+        # --- Configurator/EscapableNonCatalogOverrideHasSessionRow ---
+        Test-BRAVOCondition (
+            $eoOnRow.Count -eq 1 -and $eoOnSetting.Count -eq 1 -and [bool]$eoOnSetting[0].OverridePresent -and [bool]$eoOnSetting[0].OverrideValue -eq $false
+        ) `
+            'Configurator/EscapableNonCatalogOverrideHasSessionRow' `
+            "З env $eoPath МУСИТЬ мати рівно один синтезований рядок і бути видимим у Model (OverridePresent=true/OverrideValue=false); отримано RowCount=$($eoOnRow.Count) OverridePresent=$($(if ($eoOnSetting.Count) { $eoOnSetting[0].OverridePresent } else { 'N/A' }))"
+
+        # --- Configurator/EscapableNonCatalogOverrideIsNotDeniedRecovery ---
+        Test-BRAVOCondition (
+            $eoOnRow.Count -eq 1 -and [string]$eoOnRow[0].Section -eq 'EscapableOverride' -and
+            [string]$eoOnRow[0].Section -ne 'DeniedOverride' -and [string]$eoOnRow[0].Section -ne 'ValidatorRejected' -and
+            [bool]$eoOnRow[0].ReadOnly
+        ) `
+            'Configurator/EscapableNonCatalogOverrideIsNotDeniedRecovery' `
+            "З env синтезований рядок МУСИТЬ мати Section='EscapableOverride' (НЕ DeniedOverride/ValidatorRejected — значення фактично прийняте), і лишатись ReadOnly; отримано Section=$($(if ($eoOnRow.Count) { $eoOnRow[0].Section } else { 'N/A' })) ReadOnly=$($(if ($eoOnRow.Count) { $eoOnRow[0].ReadOnly } else { 'N/A' }))"
+
+        # --- Configurator/EscapableNonCatalogOverridePreviewMatchesLoader (env ON) ---
+        # Пряма дочірня canonical-loader-проба МУСИТЬ лишатись герметичною,
+        # як і решта цього сценарію: $configuratorFixtureRuntimeRoot (не
+        # $root) — інакше -RuntimeRoot вказує на справжній репозиторій, а
+        # AUTO-дефолт pathSettings.LIMSRoot/BackupRoot ("") намагається
+        # знайти реальну службу Windows "BRAVO" (Resolve-BRAVOEffectiveLimsRoot),
+        # якої на CI-runner-і немає.
+        $eoOnLoaderThrew = $false
+        $eoOnLoaderProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command (
+                "Set-StrictMode -Version 2.0; " +
+                "`$env:BRAVO_ALLOW_WEAKENED_SECURITY = '1'; " +
+                "try { " +
+                ". '$configuratorFixtureRuntimeRoot\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$eoScenarioRoot' -RuntimeRoot '$configuratorFixtureRuntimeRoot'); " +
+                "'NOTHREW:' + [string]`$global:requireAdministrator + '|LIMSROOT:' + [string]`$global:effectiveLimsRoot " +
+                "} catch { 'CHILD-ERROR: ' + `$_.Exception.Message }"
+            ) 2>&1
+        $eoOnLoaderProbeLast = ([string](@($eoOnLoaderProbe)[-1])).Trim()
+        $eoOnLoaderProbeParts = $eoOnLoaderProbeLast -split '\|LIMSROOT:', 2
+        $eoOnLoaderProbeNoThrewPart = [string]$eoOnLoaderProbeParts[0]
+        # Не лише "не впало" — доводимо, що реальний canonical loader
+        # дійсно резолвнув $global:effectiveLimsRoot (Resolve-
+        # BRAVOEffectiveLimsRoot, Source=ExplicitConfig) з явного
+        # герметичного override-у ($configuratorFixtureLimsRoot), а НЕ
+        # мовчки прослизнув через AUTO-визначення служби Windows "BRAVO"
+        # (Source=ServiceDiscovery/Error) — саме ця AUTO-гілка недоступна
+        # на CI-runner-і й раніше ламала цю пробу.
+        $eoOnLoaderProbeLimsRoot = if ($eoOnLoaderProbeParts.Count -eq 2) { [string]$eoOnLoaderProbeParts[1] } else { $null }
+        Test-BRAVOCondition (
+            $eoOnPreview.Contains($eoPath) -and [bool]$eoOnPreview[$eoPath] -eq $false -and
+            $eoOnEffectiveSetting.Count -eq 1 -and [bool]$eoOnEffectiveSetting[0].EffectiveValue -eq $false -and
+            $eoOnLoaderProbeNoThrewPart -eq 'NOTHREW:False' -and
+            $null -ne $eoOnLoaderProbeLimsRoot -and
+            $eoOnLoaderProbeLimsRoot.TrimEnd('\', '/') -eq $configuratorFixtureLimsRoot.TrimEnd('\', '/')
+        ) `
+            'Configurator/EscapableNonCatalogOverridePreviewMatchesLoader' `
+            "З env preview-candidate МУСИТЬ включати $eoPath=false, Effective preview = false, РЕАЛЬНИЙ canonical loader (child-process) з тим самим env мусить прийняти те саме значення, і LIMSRoot мусить прийти з герметичного override-у (не AUTO); отримано PreviewContains=$($eoOnPreview.Contains($eoPath)) PreviewValue=$($(if ($eoOnPreview.Contains($eoPath)) { $eoOnPreview[$eoPath] } else { 'N/A' })) EffectiveValue=$($eoOnEffectiveSetting[0].EffectiveValue) LoaderProbe=$eoOnLoaderProbeLast Expected LIMSRoot=$configuratorFixtureLimsRoot"
+
+        # --- Configurator/EscapableNonCatalogOverrideApplyUnchangedSucceeds ---
+        $eoOnUnchangedModel = Update-BRAVOConfiguratorEffective -Model $eoOnModel -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOnUnchangedApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot -Model $eoOnUnchangedModel -SchemaCatalog $eoOnCatalog -ProductionBaseline $eoOnBaseline
+        $eoOnUnchangedContent = Get-Content -LiteralPath $eoLocalConfigPath -Raw -Encoding UTF8
+        Test-BRAVOCondition (
+            [bool]$eoOnUnchangedApply.Applied -and [string]$eoOnUnchangedApply.Stage -eq 'Complete' -and $eoOnUnchangedContent.Contains($eoPath)
+        ) `
+            'Configurator/EscapableNonCatalogOverrideApplyUnchangedSucceeds' `
+            "З env Apply НЕЗМІНЕНОГО $eoPath=false МУСИТЬ успішно пройти (той самий escape hatch, що приймає canonical loader); отримано Applied=$($eoOnUnchangedApply.Applied) Stage=$($eoOnUnchangedApply.Stage) Content=$eoOnUnchangedContent"
+
+        # --- Configurator/EscapableNonCatalogOverrideCanBeCleared ---
+        $eoOnCleared = Clear-BRAVOConfiguratorOverride -Model $eoOnModel -Path $eoPath
+        $eoOnCleared = Update-BRAVOConfiguratorEffective -Model $eoOnCleared -RuntimeRoot $configuratorFixtureRuntimeRoot
+        $eoOnClearApply = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $eoScenarioRoot -Model $eoOnCleared -SchemaCatalog $eoOnCatalog -ProductionBaseline $eoOnBaseline
+        $eoOnClearedContent = if (Test-Path -LiteralPath $eoLocalConfigPath) { Get-Content -LiteralPath $eoLocalConfigPath -Raw -Encoding UTF8 } else { '' }
+        Test-BRAVOCondition (
+            [bool]$eoOnClearApply.Applied -and [string]$eoOnClearApply.Stage -eq 'Complete' -and (-not $eoOnClearedContent.Contains($eoPath))
+        ) `
+            'Configurator/EscapableNonCatalogOverrideCanBeCleared' `
+            "Clear+Apply $eoPath (env ON) мусить успішно прибрати override з файлу; отримано Applied=$($eoOnClearApply.Applied) Stage=$($eoOnClearApply.Stage) Content=$eoOnClearedContent"
+
+        # --- Configurator/EscapableNonCatalogOverrideCannotBeCreatedFromClean ---
+        $eoCleanCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides @{}
+        Test-BRAVOCondition (
+            -not (@($eoCleanCatalog | Where-Object { $_.Path -eq $eoPath }))
+        ) `
+            'Configurator/EscapableNonCatalogOverrideCannotBeCreatedFromClean' `
+            "НАВІТЬ з BRAVO_ALLOW_WEAKENED_SECURITY=1 (env усе ще ON) чистий конфіг (LocalOverrides=@{}) НЕ повинен синтезувати рядок для $eoPath — Configurator не може створити НОВИЙ послаблений override, лише зберегти вже наявний"
+
+        # --- Configurator/EscapableNonCatalogOverridePolicyTransition ---
+        # Той самий supplied local-файл (requireAdministrator=false, ще не
+        # Clear-нутий у цій гілці тесту), перерахований під ОБОМА
+        # env-станами — Section мусить коректно переключатись без
+        # дублікатів і без застряглої класифікації.
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $null)
+        $eoTransitionOffCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOffBaseline.Overrides
+        $eoTransitionOffRow = @($eoTransitionOffCatalog | Where-Object { $_.Path -eq $eoPath })
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $eoTransitionOnCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $eoOffBaseline.Overrides
+        $eoTransitionOnRow = @($eoTransitionOnCatalog | Where-Object { $_.Path -eq $eoPath })
+        Test-BRAVOCondition (
+            $eoTransitionOffRow.Count -eq 1 -and [string]$eoTransitionOffRow[0].Section -eq 'DeniedOverride' -and
+            $eoTransitionOnRow.Count -eq 1 -and [string]$eoTransitionOnRow[0].Section -eq 'EscapableOverride'
+        ) `
+            'Configurator/EscapableNonCatalogOverridePolicyTransition' `
+            "той самий supplied local-файл, перерахований під env OFF -> ON, мусить перейти РІВНО з одного DeniedOverride-рядка на РІВНО один EscapableOverride-рядок (без дублікатів, без застряглої класифікації); отримано OffCount=$($eoTransitionOffRow.Count)/OffSection=$($(if ($eoTransitionOffRow.Count) { $eoTransitionOffRow[0].Section } else { 'N/A' })) OnCount=$($eoTransitionOnRow.Count)/OnSection=$($(if ($eoTransitionOnRow.Count) { $eoTransitionOnRow[0].Section } else { 'N/A' }))"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $eoOriginalEnv)
+        Remove-Item -LiteralPath $eoScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Configurator/StaticDeniedDescriptorNotDuplicated ---
+    # BAZA.Mode/.MutationPolicy: статичний ReadOnly-дескриптор УЖЕ існує
+    # (окремий, давніший механізм через Resolve-BRAVOConfiguratorFieldAuthorization) —
+    # навіть з env ON (де ці шляхи все одно НЕ escapable — WeakeningOverride='None')
+    # augmented-каталог НЕ повинен додавати другий дескриптор.
+    $sddScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_STATICNODUP_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($sddScenarioRoot)
+    $sddOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        [IO.File]::WriteAllText(
+            (Join-Path $sddScenarioRoot 'BRAVO.local.config'),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{
+                'backupMonitoring.SFTP.BAZA.Mode'           = 'Legacy'
+                'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'Warn'
+            }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $sddBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $sddScenarioRoot
+        $sddCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $eoRawCatalog -LocalOverrides $sddBaseline.Overrides
+        $sddModeMatches = @($sddCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.Mode' })
+        $sddMutationMatches = @($sddCatalog | Where-Object { $_.Path -eq 'backupMonitoring.SFTP.BAZA.MutationPolicy' })
+        Test-BRAVOCondition (
+            $sddModeMatches.Count -eq 1 -and $sddMutationMatches.Count -eq 1
+        ) `
+            'Configurator/StaticDeniedDescriptorNotDuplicated' `
+            "BAZA.Mode/.MutationPolicy вже мають статичні дескриптори (окремий, давніший ReadOnly-механізм) — навіть з env ON augmented-каталог НЕ повинен додавати другий дескриптор; отримано ModeCount=$($sddModeMatches.Count) MutationPolicyCount=$($sddMutationMatches.Count)"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $sddOriginalEnv)
+        Remove-Item -LiteralPath $sddScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Issue #216, сьоме коло ревю (P1, "Import configuration dependencies
+# into the model scope"): раніше ConvertTo-BRAVOConfiguratorOverrideHashtable/
+# Get-BRAVOConfiguratorSessionSchemaCatalog покладались на `Get-Module -Name
+# 'BRAVO.Configuration'/'...Schema'` як доказ видимості команд у ВЛАСНОМУ
+# module scope BRAVO.Configurator.Model — небезпечне припущення під
+# Windows PowerShell 5.1 module session-state семантикою: Get-Module
+# може підтвердити, що інстанс модуля ЗАВАНТАЖЕНИЙ десь у процесі (напр.
+# інший компонент імпортував його у ВЛАСНИЙ, непублічний module scope,
+# не експортуючи залежність далі), тоді як Model.psm1 усе одно не бачить
+# його команд. Залежності тепер імпортуються БЕЗУМОВНО в module scope
+# самого Model.psm1 (при завантаженні файлу, до жодного виклику
+# функції) — жодної Get-Module-перевірки більше немає.
+#
+# Регресія нижче відтворює РЕАЛЬНУ private-session-state умову через
+# New-Module (динамічний модуль у пам'яті, без Export-ModuleMember для
+# BRAVO.Configuration/Schema — команди лишаються приватними для цього
+# foreign-модуля) у ІЗОЛЬОВАНОМУ дочірньому процесі, ПОТІМ напряму
+# імпортує BRAVO.Configurator.Model.psm1 (та сама схема імпорту, що
+# production BRAVO_CONFIGURATOR.ps1 і self-test використовують) і
+# викликає ОБИДВІ production-функції з НЕПОРОЖНІМ LocalOverrides/Model —
+# порожній набір ($LocalOverrides.Count -eq 0) обходить залежні виклики
+# й зробив би регресію марною.
+# =====================================================================
+& {
+    $mdScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_MODELDEPSCOPE_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($mdScenarioRoot)
+    try {
+        [IO.File]::WriteAllText(
+            (Join-Path $mdScenarioRoot 'BRAVO.local.config'),
+            (ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides @{ 'winSCPIniPath' = 'C:\Legacy\WinSCP.ini' }),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $mdCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader' -ScriptBlock { " +
+            "param(`$root) " +
+            "function Invoke-ForeignConfigurationLoad { param(`$root) " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop; " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop " +
+            "}; Export-ModuleMember -Function Invoke-ForeignConfigurationLoad " +
+            "} -ArgumentList '$root'; " +
+            "Import-Module `$foreignModule -Force; " +
+            "Invoke-ForeignConfigurationLoad -root '$root'; " +
+            "Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.Schema.psd1' -Force; " +
+            "Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.Model.psm1' -Force; " +
+            "try { " +
+            "`$raw = Get-BRAVOConfiguratorSchemaCatalog; " +
+            "`$catalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog `$raw -LocalOverrides @{ 'winSCPIniPath' = 'C:\Legacy\WinSCP.ini' }; " +
+            "`$row = `$catalog | Where-Object { `$_.Path -eq 'winSCPIniPath' }; " +
+            "'CATALOG-OK:' + [string]`$row.Section " +
+            "} catch { 'CATALOG-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $mdCatalogProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $mdCommand 2>&1
+        $mdCatalogProbeLast = ([string](@($mdCatalogProbe)[-1])).Trim()
+
+        # --- Configurator/ModelSessionCatalogWorksWithForeignModuleInstancePresent ---
+        Test-BRAVOCondition (
+            $mdCatalogProbeLast -eq 'CATALOG-OK:DeniedOverride'
+        ) `
+            'Configurator/ModelSessionCatalogWorksWithForeignModuleInstancePresent' `
+            "Get-BRAVOConfiguratorSessionSchemaCatalog (нонемпті LocalOverrides) МУСИТЬ працювати навіть коли BRAVO.Configuration/Schema вже завантажені десь у процесі приватним, неекспортованим шляхом (New-Module foreign loader) — жодного CommandNotFoundException; отримано: '$mdCatalogProbeLast'"
+
+        $mdPreviewCommand = (
+            "Set-StrictMode -Version 2.0; " +
+            "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader' -ScriptBlock { " +
+            "param(`$root) " +
+            "function Invoke-ForeignConfigurationLoad { param(`$root) " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop; " +
+            "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop " +
+            "}; Export-ModuleMember -Function Invoke-ForeignConfigurationLoad " +
+            "} -ArgumentList '$root'; " +
+            "Import-Module `$foreignModule -Force; " +
+            "Invoke-ForeignConfigurationLoad -root '$root'; " +
+            "Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.Model.psm1' -Force; " +
+            "try { " +
+            "`$model = @([pscustomobject]@{ Path = 'sftpPort'; OverridePresent = `$true; OverrideValue = 2222 }); " +
+            "`$preview = ConvertTo-BRAVOConfiguratorOverrideHashtable -Model `$model; " +
+            "'PREVIEW-OK:' + [string]`$preview['sftpPort'] " +
+            "} catch { 'PREVIEW-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+        )
+        $mdPreviewProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+            -NoLogo -NoProfile -NonInteractive -Command $mdPreviewCommand 2>&1
+        $mdPreviewProbeLast = ([string](@($mdPreviewProbe)[-1])).Trim()
+
+        # --- Configurator/ModelPreviewWorksWithForeignModuleInstancePresent ---
+        Test-BRAVOCondition (
+            $mdPreviewProbeLast -eq 'PREVIEW-OK:2222'
+        ) `
+            'Configurator/ModelPreviewWorksWithForeignModuleInstancePresent' `
+            "ConvertTo-BRAVOConfiguratorOverrideHashtable (нонемпті Model, allowed ALLOW_SITE-подібне значення, що форсує canonical авторизацію) МУСИТЬ повернути коректний preview-hashtable навіть коли BRAVO.Configuration/Schema вже завантажені приватним, неекспортованим шляхом; отримано: '$mdPreviewProbeLast'"
+    } finally {
+        Remove-Item -LiteralPath $mdScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Codex review PR #224 (P1, "Import authorization modules into the UI
+# scope unconditionally"): та сама РЕАЛЬНА private-session-state умова,
+# що блок вище для Model (New-Module foreign loader у ІЗОЛЬОВАНОМУ
+# дочірньому процесі, команди BRAVO.Configuration/Schema лишаються
+# приватними для foreign-модуля), тепер для
+# BRAVO.Configurator.UI.psm1 — Get-Module підтверджує, що інстанс
+# модуля ЗАВАНТАЖЕНИЙ десь у процесі, але БЕЗ безумовного module-level
+# Import-Module (фікс P1) UI.psm1 усе одно НЕ бачив би команд у
+# ВЛАСНОМУ session state. Пряма перевірка
+# Get-BRAVOConfigurationSchemaAuthorizationClass (не через
+# Show-BRAVOConfiguratorMainForm — той вимагає STA/WinForms ShowDialog,
+# несумісний із headless self-test) — та сама функція, що
+# Show-BRAVOConfiguratorMainForm викликає одразу після module-level
+# імпорту.
+# =====================================================================
+& {
+    $uiScopeCommand = (
+        "Set-StrictMode -Version 2.0; " +
+        "`$foreignModule = New-Module -Name 'BRAVO_SelfTest_ForeignLoader' -ScriptBlock { " +
+        "param(`$root) " +
+        "function Invoke-ForeignConfigurationLoad { param(`$root) " +
+        "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop; " +
+        "Import-Module -Name (Join-Path `$root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop " +
+        "}; Export-ModuleMember -Function Invoke-ForeignConfigurationLoad " +
+        "} -ArgumentList '$root'; " +
+        "Import-Module `$foreignModule -Force; " +
+        "Invoke-ForeignConfigurationLoad -root '$root'; " +
+        "`$uiModule = Import-Module -Name '$root\modules\BRAVO.Configurator\BRAVO.Configurator.UI.psm1' -Force -PassThru; " +
+        "try { " +
+        # Виклик через `& $uiModule { ... }` (не напряму з top-level
+        # scope дочірнього процесу) НАВМИСНИЙ — саме так PowerShell
+        # виконує код У ВЛАСНОМУ session state модуля, тобто те, що
+        # РЕАЛЬНО відбувається, коли функція, визначена ВСЕРЕДИНІ
+        # BRAVO.Configurator.UI.psm1 (Show-BRAVOConfiguratorMainForm),
+        # викликає Get-BRAVOConfigurationSchemaAuthorizationClass. Прямий
+        # виклик з top-level scope дочірнього процесу довів би НЕ ТЕ —
+        # команди, імпортовані з `-Scope Local` на рівні модуля, НІКОЛИ
+        # не видимі викликачу ЗОВНІ модуля незалежно від фіксу.
+        "`$classes = & `$uiModule { Get-BRAVOConfigurationSchemaAuthorizationClass }; " +
+        "'AUTHCLASS-OK:' + [string]`$classes.Count " +
+        "} catch { 'AUTHCLASS-ERROR: ' + `$_.Exception.GetType().FullName + ': ' + `$_.Exception.Message }"
+    )
+    $uiScopeProbe = & (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe') `
+        -NoLogo -NoProfile -NonInteractive -Command $uiScopeCommand 2>&1
+    $uiScopeProbeLast = ([string](@($uiScopeProbe)[-1])).Trim()
+
+    # --- Configurator/UIModuleScopeWorksWithForeignModuleInstancePresent ---
+    Test-BRAVOCondition (
+        $uiScopeProbeLast -match '^AUTHCLASS-OK:\d+$'
+    ) `
+        'Configurator/UIModuleScopeWorksWithForeignModuleInstancePresent' `
+        "Import BRAVO.Configurator.UI.psm1 (той самий foreign-private-loader сценарій, що Model вище) МУСИТЬ дозволити Get-BRAVOConfigurationSchemaAuthorizationClass (виклик, з якого починається Show-BRAVOConfiguratorMainForm) успішно виконатись навіть коли BRAVO.Configuration/Schema вже завантажені приватним, неекспортованим шляхом — жодного CommandNotFoundException; отримано: '$uiScopeProbeLast'"
+}
+
+# =====================================================================
+# PR #224 third review, R3-2/R3-3: Convert-BRAVOConfiguratorNestedContainerToFlatKeys
+# — explicit flat-key precedence під час flatten-on-touch (R3-2) і
+# fail-closed на порожньому вкладеному вузлі (R3-3).
+# =====================================================================
+& {
+    # --- Flatten/ExplicitFlatLeafPrecedenceOverNestedRepresentation ---
+    # R3-2 приклад із задачі: SUCCESS заданий і плоским, і вкладеним
+    # (різні значення) одночасно; торкання WARNING (сусід у тому самому
+    # контейнері) не повинно перезаписати вже явний плоский SUCCESS.
+    $r32Overrides = @{
+        'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS = 'general'
+            WARNING = 'alerts'
+        }
+    }
+    Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r32Overrides -TopLevelKey 'bravoSettings.NotificationRouting' -SchemaCatalog $configuratorSchemaCatalog
+    Test-BRAVOCondition (
+        $r32Overrides.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+        [string]$r32Overrides['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
+        $r32Overrides.Contains('bravoSettings.NotificationRouting.WARNING') -and
+        [string]$r32Overrides['bravoSettings.NotificationRouting.WARNING'] -eq 'alerts' -and
+        (-not $r32Overrides.Contains('bravoSettings.NotificationRouting'))
+    ) `
+        'Flatten/ExplicitFlatLeafPrecedenceOverNestedRepresentation' `
+        ("явний плоский SUCCESS='alerts' мусить пережити флеттенізацію контейнера (не перезаписаний вкладеним 'general'), " +
+         "а WARNING мусить взятись із вкладеного значення; отримано SUCCESS=$($r32Overrides['bravoSettings.NotificationRouting.SUCCESS']) " +
+         "WARNING=$($r32Overrides['bravoSettings.NotificationRouting.WARNING']) ContainerStillPresent=$($r32Overrides.Contains('bravoSettings.NotificationRouting'))")
+
+    # --- Flatten/EmptyUnknownNestedContainerFailsClosed ---
+    $r33Overrides = @{
+        'Some.Container' = @{
+            KnownLeaf      = 'value'
+            FutureSettings = @{}
+        }
+    }
+    $r33Threw = $false
+    $r33Message = $null
+    try {
+        Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r33Overrides -TopLevelKey 'Some.Container' -SchemaCatalog $configuratorSchemaCatalog
+    } catch {
+        $r33Threw = $true
+        $r33Message = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        $r33Threw -and
+        $r33Overrides.Contains('Some.Container') -and
+        ($r33Overrides['Some.Container'] -is [hashtable]) -and
+        [string]$r33Overrides['Some.Container']['KnownLeaf'] -eq 'value' -and
+        $r33Overrides['Some.Container'].Contains('FutureSettings')
+    ) `
+        'Flatten/EmptyUnknownNestedContainerFailsClosed' `
+        ("порожній вкладений вузол ('FutureSettings' = @{}) мусить fail-closed зупинити флеттенізацію ДО будь-якої мутації — контейнер " +
+         "мусить лишитись повністю незміненим (не частково розгорнутим); отримано Threw=$r33Threw ContainerPresent=$($r33Overrides.Contains('Some.Container')) Message=$r33Message")
+
+    # --- Apply/EmptyUnknownNestedContainerProductionFileUnchanged ---
+    $r33ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_EMPTYNESTED_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($r33ApplyScenarioRoot)
+    try {
+        $r33ApplyConfigPath = Join-Path $r33ApplyScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $r33ApplyConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'CRITICAL' = 'alerts'`r`n" +
+                "        'FutureRoutingGroup' = @{}`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $r33ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r33ApplyScenarioRoot
+        $r33ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $r33ApplyBaseline.Overrides
+        # Торкаємо САМЕ той canonical leaf, що вже supplied усередині
+        # контейнера (CRITICAL) — це те, що реально резолвиться через
+        # Resolve-BRAVOConfiguratorSuppliedLeafOverride як "supplied
+        # nested" і форсує флеттенізацію; невідомий (не-schema) leaf
+        # типу WARNING-без-попереднього-значення НЕ форсував би її
+        # (нема чого резолвити всередині контейнера).
+        $r33ApplyModelEdited = Set-BRAVOConfiguratorOverride -Model $r33ApplyModel -Path 'bravoSettings.NotificationRouting.CRITICAL' -Value 'general'
+        $r33ApplyPreBytes = [IO.File]::ReadAllBytes($r33ApplyConfigPath)
+        $r33ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r33ApplyScenarioRoot `
+            -Model $r33ApplyModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $r33ApplyBaseline
+        $r33ApplyPostBytes = [IO.File]::ReadAllBytes($r33ApplyConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$r33ApplyResult.Applied) -and [string]$r33ApplyResult.Stage -eq 'Merge' -and
+            ([Convert]::ToBase64String($r33ApplyPreBytes) -eq [Convert]::ToBase64String($r33ApplyPostBytes))
+        ) `
+            'Apply/EmptyUnknownNestedContainerProductionFileUnchanged' `
+            ("Apply мусить провалитись fail-closed (Stage='Merge') замість мовчазної втрати порожнього невідомого вкладеного вузла, і " +
+             "продакшн-файл мусить лишитись побайтово незмінним; отримано Applied=$($r33ApplyResult.Applied) Stage=$($r33ApplyResult.Stage)")
+    } finally {
+        Remove-Item -LiteralPath $r33ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 fourth review ("Preserve unknown nested leaf values while
+# flattening"): forward-compatible dictionary-значений (не порожній)
+# leaf, ще не описаний schema-каталогом, всередині легасі вкладеного
+# контейнера з ВІДОМИМ сусіднім leaf (SUCCESS) МУСИВ раніше рекурсивно
+# розгортатись у ЩЕ ГЛИБШИЙ dot-шлях (...FutureSettings.Enabled), який
+# canonical loader (ConvertTo-BRAVONestedOverride) fail-closed
+# відхиляв ПІЗНІШЕ, на Validation-стадії, з плутаючим повідомленням про
+# "невідомий ключ конфігурації" — хоча початковий (нерозгорнутий) файл
+# був повністю валідним. Фікс зупиняє розгортання РІВНО на межі
+# останнього відомого schema-предка (Merge-стадія, чітке повідомлення,
+# нульова мутація) — той самий контракт, що R3-3 вище для порожнього
+# вузла.
+# =====================================================================
+& {
+    # --- Flatten/UnknownDictionaryValuedLeafFailsClosed ---
+    # Точний приклад із review: SUCCESS — відомий schema-leaf, FutureSettings —
+    # ще НЕ описаний схемою leaf, чиє ЗНАЧЕННЯ саме по собі hashtable
+    # (не порожній — на відміну від R3-3 вище).
+    $r4Overrides = @{
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS        = 'general'
+            FutureSettings = @{ Enabled = $true }
+        }
+    }
+    $r4Threw = $false
+    $r4Message = $null
+    try {
+        Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r4Overrides -TopLevelKey 'bravoSettings.NotificationRouting' -SchemaCatalog $configuratorSchemaCatalog
+    } catch {
+        $r4Threw = $true
+        $r4Message = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        $r4Threw -and
+        $r4Message -match 'FutureSettings' -and
+        $r4Overrides.Contains('bravoSettings.NotificationRouting') -and
+        ($r4Overrides['bravoSettings.NotificationRouting'] -is [hashtable]) -and
+        [string]$r4Overrides['bravoSettings.NotificationRouting']['SUCCESS'] -eq 'general' -and
+        ($r4Overrides['bravoSettings.NotificationRouting']['FutureSettings'] -is [hashtable]) -and
+        [bool]$r4Overrides['bravoSettings.NotificationRouting']['FutureSettings']['Enabled'] -eq $true
+    ) `
+        'Flatten/UnknownDictionaryValuedLeafFailsClosed' `
+        ("forward-compatible dictionary-значення (FutureSettings), ще не описане каталогом, мусить fail-closed зупинити " +
+         "флеттенізацію ДО будь-якої мутації (той самий контракт, що R3-3), а не рекурсивно розгортатись у dot-шлях, " +
+         "який canonical loader відхилив би пізніше з менш зрозумілою діагностикою; отримано Threw=$r4Threw Message=$r4Message " +
+         "ContainerUnchanged=$($r4Overrides.Contains('bravoSettings.NotificationRouting'))")
+
+    # --- Apply/UnknownDictionaryValuedLeafFailsClosedAtMergeStage ---
+    # Повний Apply pipeline, той самий сценарій, що review навів
+    # буквально: Apply МУСИТЬ провалитись fail-closed на Merge-стадії
+    # (ЧІТКА Configurator-діагностика ДО будь-якої мутації), а НЕ падати
+    # на Validation-стадії з плутаючим повідомленням "невідомий ключ
+    # конфігурації" від зовсім іншого (canonical loader) шару вже ПІСЛЯ
+    # того, як контейнер синтетично розгорнуто.
+    $r4ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_UNKNOWNDICTLEAF_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($r4ApplyScenarioRoot)
+    try {
+        $r4ApplyConfigPath = Join-Path $r4ApplyScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $r4ApplyConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'SUCCESS' = 'general'`r`n" +
+                "        'FutureSettings' = @{ 'Enabled' = `$true }`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $r4ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4ApplyScenarioRoot
+        $r4ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $r4ApplyBaseline.Overrides
+        # Торкаємо той самий canonical leaf (SUCCESS), що вже supplied
+        # усередині контейнера — форсує флеттенізацію контейнера (той
+        # самий тригер, що R3-3/R3-2 вище).
+        $r4ApplyModelEdited = Set-BRAVOConfiguratorOverride -Model $r4ApplyModel -Path 'bravoSettings.NotificationRouting.SUCCESS' -Value 'alerts'
+        $r4ApplyPreBytes = [IO.File]::ReadAllBytes($r4ApplyConfigPath)
+        $r4ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4ApplyScenarioRoot `
+            -Model $r4ApplyModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $r4ApplyBaseline
+        $r4ApplyPostBytes = [IO.File]::ReadAllBytes($r4ApplyConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$r4ApplyResult.Applied) -and [string]$r4ApplyResult.Stage -eq 'Merge' -and
+            ([Convert]::ToBase64String($r4ApplyPreBytes) -eq [Convert]::ToBase64String($r4ApplyPostBytes))
+        ) `
+            'Apply/UnknownDictionaryValuedLeafFailsClosedAtMergeStage' `
+            ("Apply мусить провалитись fail-closed на Merge-стадії (не Validation) з чіткою Configurator-діагностикою, і " +
+             "продакшн-файл мусить лишитись побайтово незмінним; отримано Applied=$($r4ApplyResult.Applied) Stage=$($r4ApplyResult.Stage) " +
+             "Reasons=$($r4ApplyResult.Reasons -join '; ')")
+    } finally {
+        Remove-Item -LiteralPath $r4ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Apply/NestedContainerFlattenRoundTripSurvivesReload ---
+    # Round-trip: легітимний сценарій (без forward-compat dictionary-
+    # значення — лише відомі schema-leaf-и всередині легасі контейнера,
+    # той самий клас, що R3-2 вище) МУСИТЬ і далі успішно Apply-итись, і
+    # ЩОЙНО ЗАПИСАНЕ значення мусить пережити ПОВТОРНЕ читання файлу
+    # (Reload) байт-в-байт тим самим — фікс НЕ мав зламати звичайний
+    # флеттенізаційний шлях.
+    $r4RoundTripScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_FLATTEN_ROUNDTRIP_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($r4RoundTripScenarioRoot)
+    try {
+        $r4RoundTripConfigPath = Join-Path $r4RoundTripScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $r4RoundTripConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'SUCCESS' = 'general'`r`n" +
+                "        'WARNING' = 'alerts'`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $r4RoundTripBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4RoundTripScenarioRoot
+        $r4RoundTripModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $r4RoundTripBaseline.Overrides
+        $r4RoundTripModelEdited = Set-BRAVOConfiguratorOverride -Model $r4RoundTripModel -Path 'bravoSettings.NotificationRouting.SUCCESS' -Value 'alerts'
+        $r4RoundTripApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4RoundTripScenarioRoot `
+            -Model $r4RoundTripModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $r4RoundTripBaseline
+        # Reload — НЕЗАЛЕЖНЕ, ПОВТОРНЕ читання щойно записаного production
+        # файлу (не той самий $r4RoundTripBaseline-знімок).
+        $r4RoundTripReloaded = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4RoundTripScenarioRoot
+        Test-BRAVOCondition (
+            [bool]$r4RoundTripApplyResult.Applied -and
+            $r4RoundTripReloaded.Present -and
+            $r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+            [string]$r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
+            $r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting.WARNING') -and
+            [string]$r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.WARNING'] -eq 'alerts' -and
+            (-not $r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting'))
+        ) `
+            'Apply/NestedContainerFlattenRoundTripSurvivesReload' `
+            ("легітимна флеттенізація (без forward-compat dictionary-значення) мусить і далі успішно Apply-итись, і щойно " +
+             "записане значення мусить пережити повторне читання (Reload) без втрати/спотворення; отримано " +
+             "Applied=$($r4RoundTripApplyResult.Applied) Present=$($r4RoundTripReloaded.Present) " +
+             "SUCCESS=$($r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.SUCCESS']) " +
+             "WARNING=$($r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.WARNING']) " +
+             "ContainerStillPresent=$($r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting'))")
+    } finally {
+        Remove-Item -LiteralPath $r4RoundTripScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Codex review PR #224 (P2, "Remove nested duplicates when clearing a
+# flat override"): Merge-BRAVOConfiguratorCandidateOverrides раніше
+# обробляла плоский top-level ключ і одразу `continue`-ила — НІКОЛИ не
+# перевіряючи, чи той самий canonical leaf ТАКОЖ представлений
+# вкладеним Node-контейнером (легасі-файл, де обидві форми
+# співіснують). Clear на флеті лишав вкладений дублікат назавжди в
+# merged-результаті.
+# =====================================================================
+& {
+    # --- Merge/DuplicateFlatAndNestedClearRemovesBothRepresentations ---
+    # --- Merge/DuplicateFlatAndNestedSiblingSurvivesFlattening ---
+    # --- Merge/DuplicateFlatAndNestedDoesNotMutateCallerInput ---
+    # Той самий canonical leaf (SUCCESS) supplied ОДНОЧАСНО й флетом
+    # (значення, яке фактично читається — флет має пріоритет), і
+    # вкладеним контейнером (застаріле значення, ІГНОРУЄТЬСЯ при читанні,
+    # але ФІЗИЧНО присутнє на диску) поряд із сусіднім WARNING, супроводжуваним
+    # ЛИШЕ вкладено.
+    $p2ClearExisting = @{
+        'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS = 'general'
+            WARNING = 'alerts'
+        }
+    }
+    $p2ClearModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $p2ClearExisting
+    $p2ClearModelEdited = Clear-BRAVOConfiguratorOverride -Model $p2ClearModel -Path 'bravoSettings.NotificationRouting.SUCCESS'
+    $p2ClearMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $p2ClearExisting -Model $p2ClearModelEdited -SchemaCatalog $configuratorSchemaCatalog
+
+    Test-BRAVOCondition (
+        (-not $p2ClearMerged.Contains('bravoSettings.NotificationRouting.SUCCESS')) -and
+        (-not $p2ClearMerged.Contains('bravoSettings.NotificationRouting'))
+    ) `
+        'Merge/DuplicateFlatAndNestedClearRemovesBothRepresentations' `
+        ("Clear на флет-SUCCESS, коли той самий leaf ТАКОЖ supplied вкладеним контейнером, мусить прибрати ОБИДВІ представленості (флет і вкладений контейнер), " +
+         "а не лишити вкладений дублікат назавжди; отримано FlatPresent=$($p2ClearMerged.Contains('bravoSettings.NotificationRouting.SUCCESS')) ContainerPresent=$($p2ClearMerged.Contains('bravoSettings.NotificationRouting'))")
+
+    Test-BRAVOCondition (
+        $p2ClearMerged.Contains('bravoSettings.NotificationRouting.WARNING') -and
+        [string]$p2ClearMerged['bravoSettings.NotificationRouting.WARNING'] -eq 'alerts'
+    ) `
+        'Merge/DuplicateFlatAndNestedSiblingSurvivesFlattening' `
+        ("сусідній WARNING (supplied лише вкладено, у тому самому контейнері, що дубльований SUCCESS) мусить пережити флеттенізацію, " +
+         "спричинену обробкою SUCCESS-дубліката, зі своїм значенням незмінним; отримано Present=$($p2ClearMerged.Contains('bravoSettings.NotificationRouting.WARNING')) Value=$($(if ($p2ClearMerged.Contains('bravoSettings.NotificationRouting.WARNING')) { $p2ClearMerged['bravoSettings.NotificationRouting.WARNING'] } else { 'N/A' }))")
+
+    Test-BRAVOCondition (
+        $p2ClearExisting.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+        [string]$p2ClearExisting['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
+        $p2ClearExisting.Contains('bravoSettings.NotificationRouting') -and
+        ($p2ClearExisting['bravoSettings.NotificationRouting'] -is [hashtable]) -and
+        [string]$p2ClearExisting['bravoSettings.NotificationRouting']['SUCCESS'] -eq 'general' -and
+        [string]$p2ClearExisting['bravoSettings.NotificationRouting']['WARNING'] -eq 'alerts'
+    ) `
+        'Merge/DuplicateFlatAndNestedDoesNotMutateCallerInput' `
+        ("Merge-BRAVOConfiguratorCandidateOverrides НЕ повинна мутувати переданий ExistingOverrides hashtable (ні top-level ключі, ні вкладений hashtable-об'єкт) — " +
+         "вона повертає НОВИЙ результат; отримано FlatSurvives=$($p2ClearExisting.Contains('bravoSettings.NotificationRouting.SUCCESS')) ContainerSurvives=$($p2ClearExisting.Contains('bravoSettings.NotificationRouting'))")
+
+    # --- Merge/DuplicateFlatAndNestedEditKeepsSingleFlatLeaf ---
+    # Той самий дубльований сценарій, але Model-рішення — НЕ Clear, а
+    # редагування (OverridePresent=true з НОВИМ значенням, відмінним від
+    # обох старих representations) — після Merge мусить лишитись РІВНО
+    # один флет-ключ з Model-значенням, без жодного залишку вкладеної
+    # форми.
+    $p2EditExisting = @{
+        'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS = 'general'
+            WARNING = 'general'
+        }
+    }
+    $p2EditModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $p2EditExisting
+    $p2EditModelEdited = Set-BRAVOConfiguratorOverride -Model $p2EditModel -Path 'bravoSettings.NotificationRouting.SUCCESS' -Value 'general'
+    $p2EditMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $p2EditExisting -Model $p2EditModelEdited -SchemaCatalog $configuratorSchemaCatalog
+
+    Test-BRAVOCondition (
+        $p2EditMerged.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+        [string]$p2EditMerged['bravoSettings.NotificationRouting.SUCCESS'] -eq 'general' -and
+        (-not $p2EditMerged.Contains('bravoSettings.NotificationRouting')) -and
+        $p2EditMerged.Contains('bravoSettings.NotificationRouting.WARNING') -and
+        [string]$p2EditMerged['bravoSettings.NotificationRouting.WARNING'] -eq 'general'
+    ) `
+        'Merge/DuplicateFlatAndNestedEditKeepsSingleFlatLeaf' `
+        ("редагування (не Clear) дубльованого SUCCESS мусить лишити РІВНО один флет-ключ з Model-значенням ('general'), контейнер прибраний, WARNING-сусід переживає флеттенізацію; " +
+         "отримано SUCCESS=$($(if ($p2EditMerged.Contains('bravoSettings.NotificationRouting.SUCCESS')) { $p2EditMerged['bravoSettings.NotificationRouting.SUCCESS'] } else { 'ABSENT' })) ContainerPresent=$($p2EditMerged.Contains('bravoSettings.NotificationRouting')) WARNING=$($(if ($p2EditMerged.Contains('bravoSettings.NotificationRouting.WARNING')) { $p2EditMerged['bravoSettings.NotificationRouting.WARNING'] } else { 'ABSENT' }))")
+
+    # --- Apply/DuplicateFlatAndNestedProducesSerializableCandidate ---
+    # End-to-end через реальний Invoke-BRAVOConfiguratorApply (не лише
+    # Merge у пам'яті): доводить, що дубльований flat+nested сценарій НЕ
+    # призводить до hashtable-значення в кінцевому candidate (canonical
+    # серіалізатор fail-closed відмовляється писати hashtable), і Apply
+    # реально УСПІШНО записує production-файл.
+    $p2ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_DUPLICATEFLATNESTED_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($p2ApplyScenarioRoot)
+    try {
+        $p2ApplyConfigPath = Join-Path $p2ApplyScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $p2ApplyConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting.SUCCESS' = 'alerts'`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'SUCCESS' = 'general'`r`n" +
+                "        'WARNING' = 'alerts'`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $p2ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $p2ApplyScenarioRoot
+        $p2ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $p2ApplyBaseline.Overrides
+        $p2ApplyModelEdited = Clear-BRAVOConfiguratorOverride -Model $p2ApplyModel -Path 'bravoSettings.NotificationRouting.SUCCESS'
+        $p2ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $p2ApplyScenarioRoot `
+            -Model $p2ApplyModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $p2ApplyBaseline
+        $p2ApplyPostText = if (Test-Path -LiteralPath $p2ApplyConfigPath -PathType Leaf) { Get-Content -LiteralPath $p2ApplyConfigPath -Raw -Encoding UTF8 } else { $null }
+
+        Test-BRAVOCondition (
+            [bool]$p2ApplyResult.Applied -and [string]$p2ApplyResult.Stage -eq 'Complete' -and
+            ($null -ne $p2ApplyPostText) -and
+            (-not $p2ApplyPostText.Contains("'bravoSettings.NotificationRouting.SUCCESS'")) -and
+            (-not $p2ApplyPostText.Contains("'bravoSettings.NotificationRouting' = @{"))
+        ) `
+            'Apply/DuplicateFlatAndNestedProducesSerializableCandidate' `
+            ("Apply на дубльованому flat+nested сценарії (Clear флет-SUCCESS) мусить УСПІШНО записати production-файл (Applied=true, Stage=Complete) без жодної hashtable-серіалізації " +
+             "чи залишку флет-SUCCESS; отримано Applied=$($p2ApplyResult.Applied) Stage=$($p2ApplyResult.Stage)")
+    } finally {
+        Remove-Item -LiteralPath $p2ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# Codex review PR #224 (P2, thread lGNJ5, "Flatten every nested
+# representation when clearing a leaf"): попередній односхідчастий
+# Resolve+Convert (виправлений блоком вище — лише ОДИН рівень
+# вкладеності) зупинявся на НАЙДОВШОМУ присутньому префіксі й ніколи не
+# перевіряв, чи той самий canonical leaf ТАКОЖ supplied ЩЕ ОДНИМ
+# вкладеним контейнером на ІНШІЙ глибині (флет + рівень A + рівень B
+# одночасно — легасі-файл, що пережив кілька міграцій формату). Тепер
+# Merge-BRAVOConfiguratorCandidateOverrides сходиться циклом, доки
+# Resolve-BRAVOConfiguratorSuppliedLeafOverride більше не знаходить
+# ЖОДНОЇ representation цього leaf.
+# =====================================================================
+& {
+    $mlLeafPath = 'backupMonitoring.SFTP.BAZA.Mode'
+    $mlSiblingPath = 'backupMonitoring.SFTP.BAZA.AutoArchiveMutationThreshold'
+    $mlUnknownDescendantPath = 'backupMonitoring.SFTP.BAZA.UnknownFutureBazaKey'
+
+    # Три незалежні представлення ОДНОГО canonical leaf одночасно: точний
+    # флет, вкладений контейнер на рівні A (з сусідом AutoArchiveMutationThreshold),
+    # і вкладений контейнер на рівні B (з невідомим D3-нащадком).
+    $mlExisting = @{
+        'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'
+        'backupMonitoring.SFTP.BAZA' = @{
+            Mode = 'LegacyA'
+            AutoArchiveMutationThreshold = 60
+        }
+        'backupMonitoring' = @{
+            SFTP = @{
+                BAZA = @{
+                    Mode = 'LegacyB'
+                    UnknownFutureBazaKey = 'preserved-unknown'
+                }
+            }
+        }
+    }
+    $mlBaselineModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mlExisting
+
+    # --- Merge/MultiLevelDuplicateClearRemovesAllRepresentations ---
+    $mlClearModel = Clear-BRAVOConfiguratorOverride -Model $mlBaselineModel -Path $mlLeafPath
+    $mlClearMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlExisting -Model $mlClearModel -SchemaCatalog $configuratorSchemaCatalog
+    Test-BRAVOCondition (
+        (-not $mlClearMerged.Contains($mlLeafPath)) -and
+        (-not $mlClearMerged.Contains('backupMonitoring.SFTP.BAZA')) -and
+        (-not $mlClearMerged.Contains('backupMonitoring'))
+    ) `
+        'Merge/MultiLevelDuplicateClearRemovesAllRepresentations' `
+        ("Clear на leaf, supplied ОДНОЧАСНО флетом + двома вкладеними контейнерами на різних глибинах, мусить прибрати УСІ три representations " +
+         "(не лише найдовшу знайдену); отримано FlatPresent=$($mlClearMerged.Contains($mlLeafPath)) LevelAPresent=$($mlClearMerged.Contains('backupMonitoring.SFTP.BAZA')) LevelBPresent=$($mlClearMerged.Contains('backupMonitoring'))")
+
+    # --- Merge/MultiLevelDuplicateSiblingsSurviveAtBothLevels ---
+    Test-BRAVOCondition (
+        $mlClearMerged.Contains($mlSiblingPath) -and [int]$mlClearMerged[$mlSiblingPath] -eq 60
+    ) `
+        'Merge/MultiLevelDuplicateSiblingsSurviveAtBothLevels' `
+        "сусід рівня A ($mlSiblingPath=60) мусить пережити конвергенцію через обидва рівні флеттенізації; отримано Present=$($mlClearMerged.Contains($mlSiblingPath)) Value=$($(if ($mlClearMerged.Contains($mlSiblingPath)) { $mlClearMerged[$mlSiblingPath] } else { 'N/A' }))"
+
+    # --- Merge/MultiLevelDuplicateUnknownDescendantSurvives ---
+    Test-BRAVOCondition (
+        $mlClearMerged.Contains($mlUnknownDescendantPath) -and [string]$mlClearMerged[$mlUnknownDescendantPath] -eq 'preserved-unknown'
+    ) `
+        'Merge/MultiLevelDuplicateUnknownDescendantSurvives' `
+        "невідомий D3-нащадок рівня B ($mlUnknownDescendantPath) мусить пережити флеттенізацію контейнера-рівня-B у плоску форму; отримано Present=$($mlClearMerged.Contains($mlUnknownDescendantPath)) Value=$($(if ($mlClearMerged.Contains($mlUnknownDescendantPath)) { $mlClearMerged[$mlUnknownDescendantPath] } else { 'N/A' }))"
+
+    # --- Merge/MultiLevelDuplicateEditKeepsSingleFlatLeaf ---
+    $mlEditModel = Set-BRAVOConfiguratorOverride -Model $mlBaselineModel -Path $mlLeafPath -Value 'NewCanonical'
+    $mlEditMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlExisting -Model $mlEditModel -SchemaCatalog $configuratorSchemaCatalog
+    Test-BRAVOCondition (
+        $mlEditMerged.Contains($mlLeafPath) -and [string]$mlEditMerged[$mlLeafPath] -eq 'NewCanonical' -and
+        (-not $mlEditMerged.Contains('backupMonitoring.SFTP.BAZA')) -and
+        (-not $mlEditMerged.Contains('backupMonitoring'))
+    ) `
+        'Merge/MultiLevelDuplicateEditKeepsSingleFlatLeaf' `
+        ("редагування (не Clear) leaf, supplied трьома representations, мусить лишити РІВНО один флет-ключ з Model-значенням ('NewCanonical'), обидва контейнери прибрані; " +
+         "отримано Value=$($(if ($mlEditMerged.Contains($mlLeafPath)) { $mlEditMerged[$mlLeafPath] } else { 'ABSENT' })) LevelAPresent=$($mlEditMerged.Contains('backupMonitoring.SFTP.BAZA')) LevelBPresent=$($mlEditMerged.Contains('backupMonitoring'))")
+
+    # --- Merge/MultiLevelDuplicateDoesNotMutateCallerInput ---
+    Test-BRAVOCondition (
+        [string]$mlExisting[$mlLeafPath] -eq 'Legacy' -and
+        ($mlExisting['backupMonitoring.SFTP.BAZA'] -is [hashtable]) -and
+        [string]$mlExisting['backupMonitoring.SFTP.BAZA']['Mode'] -eq 'LegacyA' -and
+        [int]$mlExisting['backupMonitoring.SFTP.BAZA']['AutoArchiveMutationThreshold'] -eq 60 -and
+        ($mlExisting['backupMonitoring'] -is [hashtable]) -and
+        [string]$mlExisting['backupMonitoring']['SFTP']['BAZA']['Mode'] -eq 'LegacyB' -and
+        [string]$mlExisting['backupMonitoring']['SFTP']['BAZA']['UnknownFutureBazaKey'] -eq 'preserved-unknown'
+    ) `
+        'Merge/MultiLevelDuplicateDoesNotMutateCallerInput' `
+        "Merge-BRAVOConfiguratorCandidateOverrides НЕ повинна мутувати переданий ExistingOverrides hashtable на жодному з трьох рівнів representation — вона повертає НОВИЙ результат"
+
+    # --- Merge/MultiLevelDuplicateResultIsSerializable ---
+    $mlSerializeThrew = $false
+    $mlSerializeText = $null
+    try {
+        $mlSerializeText = ConvertTo-BRAVOConfiguratorLocalConfigText -MergedOverrides $mlClearMerged
+    } catch {
+        $mlSerializeThrew = $true
+    }
+    Test-BRAVOCondition (
+        (-not $mlSerializeThrew) -and ($null -ne $mlSerializeText) -and
+        $mlSerializeText.Contains('AutoArchiveMutationThreshold') -and
+        (-not $mlSerializeText.Contains("'backupMonitoring' = @{")) -and
+        (-not $mlSerializeText.Contains("'backupMonitoring.SFTP.BAZA' = @{"))
+    ) `
+        'Merge/MultiLevelDuplicateResultIsSerializable' `
+        "результат Merge на дубльованому багаторівневому сценарії мусить бути серіалізовний canonical серіалізатором (жодного залишкового hashtable-значення); Threw=$mlSerializeThrew"
+
+    # --- Merge/TwoNestedOnlyDuplicateConvergesWithoutInfiniteLoop ---
+    # Той самий leaf, БЕЗ точного флета — лише два незалежні вкладені
+    # контейнери на різних глибинах. Доводить, що конвергенція не
+    # прив'язана до наявності флет-анкера і не залежить від порядку
+    # $SchemaCatalog.
+    $mlTwoNestedExisting = @{
+        'backupMonitoring.SFTP.BAZA' = @{ Mode = 'LegacyA' }
+        'backupMonitoring' = @{ SFTP = @{ BAZA = @{ Mode = 'LegacyB' } } }
+    }
+    $mlTwoNestedModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mlTwoNestedExisting
+    $mlTwoNestedClearModel = Clear-BRAVOConfiguratorOverride -Model $mlTwoNestedModel -Path $mlLeafPath
+    $mlTwoNestedThrew = $false
+    $mlTwoNestedMessage = $null
+    $mlTwoNestedMerged = $null
+    try {
+        $mlTwoNestedMerged = Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlTwoNestedExisting -Model $mlTwoNestedClearModel -SchemaCatalog $configuratorSchemaCatalog
+    } catch {
+        $mlTwoNestedThrew = $true
+        $mlTwoNestedMessage = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        (-not $mlTwoNestedThrew) -and ($null -ne $mlTwoNestedMerged) -and
+        (-not $mlTwoNestedMerged.Contains($mlLeafPath)) -and
+        (-not $mlTwoNestedMerged.Contains('backupMonitoring.SFTP.BAZA')) -and
+        (-not $mlTwoNestedMerged.Contains('backupMonitoring'))
+    ) `
+        'Merge/TwoNestedOnlyDuplicateConvergesWithoutInfiniteLoop' `
+        "два вкладені (без флета) представлення одного leaf на різних глибинах мусять зійтись без винятку конвергенц-guard-у й без жодної залишкової representation; Threw=$mlTwoNestedThrew Message=$mlTwoNestedMessage"
+
+    # --- Merge/EmptyNestedDescendantStillFailsClosedAtSecondConvergenceLevel ---
+    # Порожній вкладений вузол-сусід ЛИШЕ на глибшому (рівень B) дублікаті
+    # — доводить, що fail-closed на порожньому нащадку (Convert-
+    # BRAVOConfiguratorNestedContainerToFlatKeys, R3-3) спрацьовує так само
+    # на ДРУГІЙ ітерації циклу конвергенції, не лише на першій.
+    $mlEmptyExisting = @{
+        'backupMonitoring.SFTP.BAZA.Mode' = 'Legacy'
+        'backupMonitoring.SFTP.BAZA' = @{ Mode = 'LegacyA' }
+        'backupMonitoring' = @{
+            SFTP = @{
+                BAZA = @{
+                    Mode = 'LegacyB'
+                    EmptySiblingContainer = @{}
+                }
+            }
+        }
+    }
+    $mlEmptyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $mlEmptyExisting
+    $mlEmptyClearModel = Clear-BRAVOConfiguratorOverride -Model $mlEmptyModel -Path $mlLeafPath
+    $mlEmptyThrew = $false
+    $mlEmptyMessage = $null
+    try {
+        [void](Merge-BRAVOConfiguratorCandidateOverrides -ExistingOverrides $mlEmptyExisting -Model $mlEmptyClearModel -SchemaCatalog $configuratorSchemaCatalog)
+    } catch {
+        $mlEmptyThrew = $true
+        $mlEmptyMessage = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        $mlEmptyThrew -and ($null -ne $mlEmptyMessage) -and $mlEmptyMessage.Contains('EmptySiblingContainer')
+    ) `
+        'Merge/EmptyNestedDescendantStillFailsClosedAtSecondConvergenceLevel' `
+        "порожній вкладений вузол-сусід на ГЛИБШОМУ (другому) рівні конвергенції мусить fail-closed кинути виняток (не мовчки втратити вузол); Threw=$mlEmptyThrew Message=$mlEmptyMessage"
+}
+
+# =====================================================================
+# PR #224 third review, R3-4: BRAVO.local.config.example не повинен
+# рекламувати DENY_*-листи як звичайний перелік override-ів, доступних
+# для розкоментовування.
+# =====================================================================
+& {
+    if (-not (Get-Module -Name 'BRAVO.Configuration.Schema')) {
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -Force
+    }
+    $r34DocumentedPaths = Get-BRAVOConfiguratorDocumentedOverridePaths -ExamplePath (Join-Path $root 'BRAVO.local.config.example')
+    $r34ClassRegistry = Get-BRAVOConfigurationSchemaAuthorizationClass
+    $r34ExampleText = Get-Content -LiteralPath (Join-Path $root 'BRAVO.local.config.example') -Raw -Encoding UTF8
+
+    # --- Contract/DocumentedOverrideTemplateDoesNotExposeDeniedLeaves ---
+    # "рекламує як звичайний override" = задокументований шлях є DENY_*
+    # БЕЗ явного NON-OVERRIDABLE-маркера поруч із ним у файлі — сам факт
+    # присутності в задокументованому переліку (потрібен для 1:1 schema-
+    # повноти) не є порушенням, якщо рядок явно позначений як recovery-only.
+    $r34UnlabeledDeniedLeaves = New-Object System.Collections.Generic.List[string]
+    foreach ($r34Path in $r34DocumentedPaths) {
+        if (-not $r34ClassRegistry.Contains($r34Path)) { continue }
+        $r34Class = [string]$r34ClassRegistry[$r34Path].Class
+        if (-not $r34Class.StartsWith('DENY_', [System.StringComparison]::Ordinal)) { continue }
+        if (-not $r34ExampleText.Contains("'$r34Path'") ) { continue }
+        # Шукаємо NON-OVERRIDABLE-маркер у безпосередній близькості (той
+        # самий рядок) — dot-шлях може з'являтися в файлі кілька разів
+        # (напр. попереджувальний коментар-заголовок і сам
+        # закоментований entry-рядок нижче), тож перевіряємо УСІ рядки,
+        # що містять цей dot-шлях у лапках, а не лише перший знайдений
+        # (regex-парсер каталогу читає той самий entry-рядок, що і
+        # реальний override-запис, не заголовок).
+        # [^\n] (не [^\r\n]) навмисно: файл має CRLF-закінчення рядків, а
+        # $ у Multiline-режимі .NET прив'язується безпосередньо ПЕРЕД \n
+        # (не перед \r) — виключення \r із класу символів робило б символ
+        # \r перед \n непоглинутим, і $ ніколи не міг би збігтись
+        # (MatchCount завжди 0 на CRLF-файлах). \r у складі рядка тут
+        # нешкідливий — просто ще один звичайний символ вмісту рядка.
+        $r34LineMatches = [regex]::Matches($r34ExampleText, "^[^\n]*'$([regex]::Escape($r34Path))'[^\n]*$", [System.Text.RegularExpressions.RegexOptions]::Multiline)
+        $r34HasLabeledLine = $false
+        foreach ($r34LineMatch in $r34LineMatches) {
+            if ($r34LineMatch.Value.Contains('NON-OVERRIDABLE')) { $r34HasLabeledLine = $true; break }
+        }
+        if ($r34HasLabeledLine) { continue }
+        [void]$r34UnlabeledDeniedLeaves.Add($r34Path)
+    }
+    Test-BRAVOCondition ($r34UnlabeledDeniedLeaves.Count -eq 0) `
+        'Contract/DocumentedOverrideTemplateDoesNotExposeDeniedLeaves' `
+        "задокументовані DENY_*-листи мусять бути явно позначені NON-OVERRIDABLE, а не представлені як звичайний override; непозначені: $($r34UnlabeledDeniedLeaves -join ', ')"
+
+    # --- Contract/BazaModeExplicitlyLabeledNonOverridable ---
+    Test-BRAVOCondition ($r34ExampleText.Contains("'backupMonitoring.SFTP.BAZA.Mode'") -and $r34ExampleText.Contains('NON-OVERRIDABLE')) `
+        'Contract/BazaModeExplicitlyLabeledNonOverridable' `
+        "backupMonitoring.SFTP.BAZA.Mode мусить лишитись задокументованим (schema-повнота), але з явним NON-OVERRIDABLE-маркером поруч"
+
+    # --- Contract/BazaMutationPolicyExplicitlyLabeledNonOverridable ---
+    # PR #224 review (P2, четверте коло): MutationPolicy тепер МАЄ
+    # canonical Configurator-дескриптор (recovery-only) — schema-повнота
+    # (Test-BRAVOConfiguratorSchemaCompleteness) вимагає документування
+    # 1:1, тож "взагалі не з'являється" більше не є правильним контрактом
+    # (той тест існував ДО додавання дескриптора). Замість цього — той
+    # самий доказ, що вже застосовує Mode: задокументований, але з явним
+    # NON-OVERRIDABLE-маркером, тож generic-перевірка вище
+    # (Contract/DocumentedOverrideTemplateDoesNotExposeDeniedLeaves) не
+    # знаходить його непозначеним.
+    Test-BRAVOCondition (
+        $r34DocumentedPaths -contains 'backupMonitoring.SFTP.BAZA.MutationPolicy' -and
+        $r34ExampleText.Contains("'backupMonitoring.SFTP.BAZA.MutationPolicy'") -and
+        $r34ExampleText.Contains('NON-OVERRIDABLE')
+    ) `
+        'Contract/BazaMutationPolicyExplicitlyLabeledNonOverridable' `
+        "backupMonitoring.SFTP.BAZA.MutationPolicy мусить лишитись задокументованим (schema-повнота — тепер має Configurator-дескриптор), але з явним NON-OVERRIDABLE-маркером поруч"
 }
 
 # ===== Прибирання fixture RuntimeRoot (герметичність, див. коментар на
