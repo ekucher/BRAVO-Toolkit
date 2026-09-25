@@ -5128,6 +5128,31 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Version/BuildIdSurfacedInRuntimes" `
         -Failure "buildId має потрапляти в runtime-метадані"
 
+    # PR #225 (раунд 3, review): environment-preflight CRITICAL Operations-
+    # подія (BRAVO.Health.Runtime.ps1) раніше жила ВСЕРЕДИНІ гейту
+    # ((-not $NoSlack) -and ($NotificationMode -ne "none")) -- коли
+    # сповіщення вимкнено параметрами запуску/конфігурацією, dashboard
+    # мовчки не бачив CRITICAL-подію про недоступне середовище виконання.
+    # Функціональна ізоляція (як для Archive-функцій вище) тут
+    # непропорційно дорога -- цей блок живе у величезній Main()
+    # BRAVO.Health.Runtime.ps1 з десятками попередніх script-scope
+    # залежностей; натомість структурний regression-guard: gate-блок НЕ
+    # повинен містити виклик Send-BRAVOOperationsEvent, а сам виклик має
+    # бути СИБЛІНГОМ (той самий 4-пробільний відступ, ПІСЛЯ закритої
+    # gate-дужки), не вкладеним усередину gate.
+    $healthEnvironmentGatingMatch = [regex]::Match(
+        $healthScriptTextForBuildId,
+        '(?s)if \(\(-not \$NoSlack\) -and \(\$NotificationMode -ne "none"\)\) \{(?<gate>.*?)\r?\n    \}\r?\n\r?\n(?<after>.{0,900})'
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $healthEnvironmentGatingMatch.Success -and
+            $healthEnvironmentGatingMatch.Groups['gate'].Value -notmatch 'Send-BRAVOOperationsEvent' -and
+            $healthEnvironmentGatingMatch.Groups['after'].Value -match '(?s)if \(\$null -ne \$operationsReportingSettings\) \{\s*try \{\s*Send-BRAVOOperationsEvent'
+        ) `
+        -Name "Health/EnvironmentPreflightOperationsEventNotGatedByNotificationSwitch" `
+        -Failure "environment-preflight CRITICAL Operations-подія (BRAVO.Health.Runtime.ps1) має викликатись ЗА МЕЖАМИ гейту (-not `$NoSlack) -and (`$NotificationMode -ne 'none') -- інакше dashboard не бачить CRITICAL-подію лише тому, що Slack/Discord вимкнено на цьому сервері (review finding, PR #225 раунд 3)"
+
     # Аудит P4: короткий buildId не дає однозначної відповіді, який саме
     # код розгорнуто (короткі hash збігаються й погано шукаються).
     $versionMetadataForCommit = Get-BravoVersionMetadata -ConfigRoot $root

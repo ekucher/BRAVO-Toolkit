@@ -5111,20 +5111,27 @@ if (-not $environmentPreflight.IsWritable) {
             $environmentNotificationStatus = "Failed"
             Write-HealthLog "Не вдалося відправити сповіщення про недоступність середовища у ${NotificationProviderDisplayName}: $($_.Exception.Message)" -Level "ERROR"
         }
+    }
 
-        if ($null -ne $operationsReportingSettings) {
-            try {
-                Send-BRAVOOperationsEvent `
-                    -OperationsReportingSettings $operationsReportingSettings `
-                    -CredentialTargets $credentialSettings.Targets `
-                    -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-                    -Category 'health' -Severity 'CRITICAL' `
-                    -Component 'Health' `
-                    -Message 'Недоступне середовище виконання BRAVO Health' `
-                    -Details @{ failedPath = [string]$environmentPreflight.FailedPath; isPrivilegeFailure = [bool]$environmentPreflight.IsPrivilegeFailure }
-            } catch {
-                Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
-            }
+    # Operations-подія винесена ЗА межі гейту (-not $NoSlack) -and
+    # ($NotificationMode -ne "none") вище: коли сповіщення вимкнено
+    # параметрами запуску/конфігурацією, dashboard раніше мовчки не бачив
+    # CRITICAL-подію про недоступне середовище лише тому, що Slack/Discord
+    # вимкнено на цьому сервері (review finding, той самий клас, що для
+    # Archive Send-ToolIntegrityAlert/Send-BRAVOArchiveFreeSpaceAlert).
+    # Operations-звітність — незалежний канал від Slack/Discord-нотифікації.
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'health' -Severity 'CRITICAL' `
+                -Component 'Health' `
+                -Message 'Недоступне середовище виконання BRAVO Health' `
+                -Details @{ failedPath = [string]$environmentPreflight.FailedPath; isPrivilegeFailure = [bool]$environmentPreflight.IsPrivilegeFailure }
+        } catch {
+            Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
         }
     }
 
