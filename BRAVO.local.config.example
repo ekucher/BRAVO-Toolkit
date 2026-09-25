@@ -422,4 +422,30 @@
     # 'schedulerSettings.Health.BusyWaitMinutes' = 60   # 0 = негайне відкладення при зайнятій архівації
     # 'schedulerSettings.BAZASync.StartAt' = '00:00'
     # 'schedulerSettings.BAZASync.RepeatEveryHours' = 4
+
+    # =========================================================
+    # BSYSTEM OPERATIONS (operationsReportingSettings) — fleet-моніторинг
+    # =========================================================
+    # Вимкнено за замовчуванням (opt-in). Вмикайте усвідомлено, по одному
+    # серверу: після self-enrollment сервер зʼявляється в Operations зі
+    # статусом "Pending", доки адміністратор не підтвердить його вручну.
+    # 'operationsReportingSettings.Enabled' = $true
+    # УВАГА: без кінцевого '/api' — модуль сам додає повний '/api/v1/...'
+    # шлях (Join-BRAVOOperationsApiUrl, BRAVO.Operations.psm1); зайвий
+    # '/api' тут дає подвоєний .../api/api/v1/... (E10-регресія, знайдена
+    # й виправлена при написанні цього прикладу — див. E10-коментар у
+    # BRAVO.Operations.psm1 для деталей).
+    # 'operationsReportingSettings.ApiBaseUrl' = 'https://operations.bsystem.example'
+    # 'operationsReportingSettings.RequestTimeoutSeconds' = 30
+    # HeartbeatIntervalMinutes видалено з контракту (PR #225, thread 7) —
+    # ключ ніколи не читався жодним рантайм-споживачем; див. коментар у
+    # канонічному BRAVO.config.
+    # На сервері лише один продукт — LIMS або VETOFFICE. Дефолт LIMS;
+    # розкоментуйте на серверах VetOffice:
+    # 'operationsReportingSettings.ProductType' = 'VETOFFICE'
+
+    # Bootstrap-секрет для first-run self-enrollment (видається окремо
+    # адміністратором Operations, не є product-default):
+    # 'credentialSettings.Targets.OperationsBootstrapSecret' = 'BRAVO_OPERATIONS_BOOTSTRAP_SECRET'
+    # 'credentialSettings.Targets.OperationsApiKey' = 'BRAVO_OPERATIONS_API_KEY'
 }

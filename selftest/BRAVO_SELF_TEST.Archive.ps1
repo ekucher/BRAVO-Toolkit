@@ -264,3 +264,128 @@ Test-BRAVOCondition -Condition (
     ([Text.RegularExpressions.Regex]::Match($archiveScriptText, '(?s)function Invoke-BRAVOArchiveOwnLogUpload \{.*?\n\}\r?\n')).Value -notmatch '\$script:processExitCode\s*='
 ) -Name 'Archive/OwnLogUploadNeverAssignsProcessExitCode' `
     -Failure "Invoke-BRAVOArchiveOwnLogUpload — другорядний/телеметричний ефект і не повинен присвоювати `$script:processExitCode"
+
+# ============================================================
+# PR #225 (раунд 3, review): Send-ToolIntegrityAlert/Send-BRAVOArchiveFreeSpaceAlert/
+# Send-BAZAIncompatibleNameAlert — гейт нотифікації (NoSlack/notificationMode=
+# none/route=none/webhook не налаштовано) раніше завершував функцію через
+# ранній `return` ДО Operations-події внизу -- dashboard мовчки не бачив
+# CRITICAL/WARNING Operations-подію лише тому, що Slack/Discord вимкнено на
+# цьому сервері. Фікс: notification-блок більше не `return`-ить -- лише
+# логує причину недоставки й падає крізь решту функції; Operations-подія
+# викликається завжди незалежно від стану гейту.
+#
+# Функціональна ізоляція: реальний текст 3 функцій + стаби залежностей
+# (New-BRAVOSelfTestRuntimeModule, той самий прийом, що P2-5 OwnLogUpload
+# вище) -- $NoSlack = $true детерміновано вмикає гейт (найпростіший спосіб
+# відтворити "сповіщення вимкнено"), Send-BRAVOOperationsEvent замінено на
+# лічильник викликів замість реального HTTP.
+# ============================================================
+
+$archiveGatingStub = @'
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO") }
+function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+function Get-HostInformation { return [pscustomobject]@{} }
+function Format-BRAVOUkrainianCount { param($Count, $One, $Few, $Many) return "$Count $Few" }
+function New-BRAVOOperatorNotificationMessage {
+    param(
+        [string]$Severity, [string]$Operation, [string]$ActionText,
+        [string[]]$ReasonLines, [string]$InstitutionName, [string]$InstitutionCode,
+        $HostInformation, [string[]]$ResultLines, $Timestamp, [string]$ProductName,
+        [string]$Version, [string]$BuildId, [string]$LogPath, [string]$LogLabel
+    )
+    return "stub-notification-message"
+}
+function Resolve-BRAVONotificationRoute {
+    param($Severity, $NotificationMode, $RoutingTable)
+    # Не повинно викликатись у $NoSlack=$true сценарії (гейт коротко
+    # замикає ДО цього виклику) -- якщо все ж викликано, повертаємо 'none'
+    # (найбезпечніший fallback), а не кидаємо, щоб не приховати справжню
+    # причину провалу тесту нижче.
+    return 'none'
+}
+function Resolve-BRAVONotificationEndpoint {
+    param($Provider, $Route, $CredentialTargets)
+    throw "self-test: Resolve-BRAVONotificationEndpoint НЕ повинен викликатись, коли notification-гейт активний (`$NoSlack=`$true)"
+}
+function ConvertTo-BRAVONotificationPayloadText { param($Provider, $Message) return @($Message) }
+function Send-BRAVONotificationChunks {
+    param($Provider, $WebhookUrl, $MessageChunks, $TimeoutSeconds)
+    throw "self-test: Send-BRAVONotificationChunks НЕ повинен викликатись, коли notification-гейт активний (`$NoSlack=`$true)"
+}
+function Send-BRAVOOperationsEvent {
+    param($OperationsReportingSettings, $CredentialTargets, $InstitutionCode, $Category, $Severity, $Component, $Message, $Services, $Details)
+    $script:archiveGatingTestState.OperationsEventCalls++
+    $script:archiveGatingTestState.LastMessage = $Message
+    $script:archiveGatingTestState.LastSeverity = $Severity
+}
+'@
+$archiveGatingFunctionNames = @(
+    'Write-BRAVOLog', 'Protect-BRAVOLogSecret', 'Get-HostInformation', 'Format-BRAVOUkrainianCount',
+    'New-BRAVOOperatorNotificationMessage', 'Resolve-BRAVONotificationRoute', 'Resolve-BRAVONotificationEndpoint',
+    'ConvertTo-BRAVONotificationPayloadText', 'Send-BRAVONotificationChunks', 'Send-BRAVOOperationsEvent',
+    'Send-ToolIntegrityAlert', 'Send-BRAVOArchiveFreeSpaceAlert', 'Send-BAZAIncompatibleNameAlert'
+)
+$archiveGatingCombinedSource = $archiveGatingStub + "`n" + $archiveScriptText
+$archiveGatingModule = New-BRAVOSelfTestRuntimeModule -SourceText $archiveGatingCombinedSource -FunctionNames $archiveGatingFunctionNames
+
+function Initialize-BRAVOSelfTestArchiveGatingScriptScope {
+    param([Parameter(Mandatory = $true)][object]$Module)
+    & $Module {
+        $script:archiveGatingTestState = [pscustomobject]@{ OperationsEventCalls = 0; LastMessage = $null; LastSeverity = $null }
+        $script:NoSlack = $true
+        $script:notificationMode = 'discord'
+        $script:notificationProvider = 'discord'
+        $script:notificationProviderDisplayName = 'Discord'
+        $script:notificationRequestTimeoutSeconds = 5
+        $script:logFile = 'C:\selftest\archiv.log'
+        $script:ScriptBuildId = 'selftest-build'
+        $global:ScriptVersion = '9.9.9-selftest'
+        $global:ScriptBuildId = 'selftest-build'
+        $script:backupMonitoring = [pscustomobject]@{
+            InstitutionName = 'SelfTest Institution'; InstitutionCode = 'ST1'
+            NotificationRouting = @{}; NotificationCredentialTargets = @{}
+        }
+        $script:operationsReportingSettings = @{ Enabled = $true }
+        $script:credentialSettings = [pscustomobject]@{ Targets = @{} }
+    }
+}
+
+# (a) Send-ToolIntegrityAlert: $NoSlack=$true (гейт активний) -> Operations-
+# подія МАЄ БУТИ надіслана рівно 1 раз, попри вимкнене сповіщення.
+Initialize-BRAVOSelfTestArchiveGatingScriptScope -Module $archiveGatingModule
+$toolIntegrityGatingResult = & $archiveGatingModule {
+    Send-ToolIntegrityAlert -Result ([pscustomobject]@{ Message = 'selftest: runtime manifest hash mismatch' })
+    $script:archiveGatingTestState
+}
+Test-BRAVOCondition -Condition (
+    $toolIntegrityGatingResult.OperationsEventCalls -eq 1 -and
+    $toolIntegrityGatingResult.LastSeverity -eq 'CRITICAL' -and
+    $toolIntegrityGatingResult.LastMessage -match 'selftest: runtime manifest hash mismatch'
+) -Name 'Archive/ToolIntegrityAlertSendsOperationsEventEvenWhenNotificationGated' `
+    -Failure "Send-ToolIntegrityAlert з `$NoSlack=`$true (сповіщення вимкнено) все одно МАЄ надіслати РІВНО 1 Operations-подію (review finding: раніше ранній `return` пропускав цю подію повністю); отримано calls=$($toolIntegrityGatingResult.OperationsEventCalls) severity=$($toolIntegrityGatingResult.LastSeverity)"
+
+# (b) Send-BRAVOArchiveFreeSpaceAlert: та сама перевірка.
+Initialize-BRAVOSelfTestArchiveGatingScriptScope -Module $archiveGatingModule
+$freeSpaceGatingResult = & $archiveGatingModule {
+    Send-BRAVOArchiveFreeSpaceAlert -Result ([pscustomobject]@{ Problems = @('C: недостатньо місця'); DriveStatus = @() }) -MinimumFreeSpaceGB 10
+    $script:archiveGatingTestState
+}
+Test-BRAVOCondition -Condition (
+    $freeSpaceGatingResult.OperationsEventCalls -eq 1 -and
+    $freeSpaceGatingResult.LastSeverity -eq 'CRITICAL'
+) -Name 'Archive/FreeSpaceAlertSendsOperationsEventEvenWhenNotificationGated' `
+    -Failure "Send-BRAVOArchiveFreeSpaceAlert з `$NoSlack=`$true все одно МАЄ надіслати РІВНО 1 Operations-подію; отримано calls=$($freeSpaceGatingResult.OperationsEventCalls) severity=$($freeSpaceGatingResult.LastSeverity)"
+
+# (c) Send-BAZAIncompatibleNameAlert: та сама перевірка (severity WARNING,
+# не CRITICAL -- відмінний контракт цієї функції, не регресія).
+Initialize-BRAVOSelfTestArchiveGatingScriptScope -Module $archiveGatingModule
+$bazaNameGatingResult = & $archiveGatingModule {
+    Send-BAZAIncompatibleNameAlert -Issues @([pscustomobject]@{ Name = 'дуже_довге_імя_файлу.dat'; Utf8ByteCount = 300; MaximumUtf8Bytes = 255 })
+    $script:archiveGatingTestState
+}
+Test-BRAVOCondition -Condition (
+    $bazaNameGatingResult.OperationsEventCalls -eq 1 -and
+    $bazaNameGatingResult.LastSeverity -eq 'WARNING'
+) -Name 'Archive/BAZAIncompatibleNameAlertSendsOperationsEventEvenWhenNotificationGated' `
+    -Failure "Send-BAZAIncompatibleNameAlert з `$NoSlack=`$true все одно МАЄ надіслати РІВНО 1 Operations-подію; отримано calls=$($bazaNameGatingResult.OperationsEventCalls) severity=$($bazaNameGatingResult.LastSeverity)"

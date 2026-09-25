@@ -466,6 +466,18 @@ $knownIntentionalDiffPrefixes = @(
     'maintenanceSettings.Retention.RawSourceGraceDays',
     'sftpDirectories.ArchivLog',
     'sftpDirectories.MaintenanceLog',
+    # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
+    # ключі bootstrap-секрету self-enrollment і виданого API-ключа.
+    # У BEFORE (42cf9ad) секції credentialSettings.Targets / legacy
+    # дзеркала backupMonitoring.NotificationCredentialTargets не існує
+    # взагалі (звідси BEFORE=<null>) — це ріст схеми на лінії розробки,
+    # не зміна наявної поведінки. Записи в Credential Manager створює
+    # BRAVO_CREDENTIALS_SETUP.ps1 лише коли оператор явно вмикає
+    # operationsReportingSettings.Enabled на цьому сервері.
+    'credentialSettings.Targets.OperationsApiKey',
+    'credentialSettings.Targets.OperationsBootstrapSecret',
+    'backupMonitoring.NotificationCredentialTargets.OperationsApiKey',
+    'backupMonitoring.NotificationCredentialTargets.OperationsBootstrapSecret',
     # Секція 5, задокументований canonical-default фікс (перевірено
     # окремим self-test ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults):
     # "E:\Archiv" (застарілий placeholder BRAVO.config) -> "" (canonical).

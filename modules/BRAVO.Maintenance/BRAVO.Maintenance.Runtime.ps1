@@ -38,7 +38,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
 # проти другої власної реалізації; нейтральний власник SFTP-примітивів —
 # тема окремого рефактора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -6965,12 +6965,12 @@ function Send-FinalReport {
     param(
         $LOG_FILE
     )
-    
+
     # Перевірка режиму "none" - повне вимкнення
     if ($script:SlackMode -eq "none") {
         return
     }
-    
+
     $elapsedTime = (Get-Date) - $script:ScriptStartTime
     $notificationMessage = ""
     $shouldSend = $false
@@ -7136,12 +7136,12 @@ function Send-FinalReport {
             return
         }
     }
-    
+
     # Якщо повідомлення не повинно відправлятися - виходимо
     if (-not $shouldSend) {
         return
     }
-    
+
     # Показуємо заголовок тільки якщо відправка дійсно відбувається
     Write-Log -Message "==="
     Write-Log -Message "=== ВІДПРАВКА ПОВІДОМЛЕННЯ ПРО ПОДІЮ ==="
@@ -7162,8 +7162,82 @@ function Send-FinalReport {
         }
         Write-Log -Message "ПОМИЛКА відправки фінального повідомлення: $errorDetails" -Level "ERROR"
     }
-    
+
     Write-Log -Message "==="
+}
+
+function Send-BRAVOMaintenanceOperationsEvent {
+    # Канонічне, ЄДИНЕ місце відправлення Operations-події про
+    # завершення Maintenance-прогону. НЕ викликається зсередини
+    # Send-FinalReport (де жила попередня версія цього блоку) — Send-
+    # FinalReport виконується ВСЕРЕДИНІ зовнішнього try, ДО catch і ДО
+    # фінального обчислення $script:maintenanceRuntimeExitCode, тому подія
+    # звідти бачила лише "поточний знімок" на момент виклику: якщо виняток
+    # стався ПІСЛЯ Send-FinalReport (напр. Write-BRAVOTaskExecutionState),
+    # Operations уже отримав SUCCESS/WARNING, хоча прогін щойно позначено
+    # critical у зовнішньому catch; а якщо виняток стався РАНІШЕ (Cleanup/
+    # Archive/AutoShutdown-намір), Send-FinalReport узагалі не встигав
+    # виконатись — Operations не бачив події про цей прогін ВЗАГАЛІ (review
+    # finding). Викликається рівно один раз, ПІСЛЯ закриття зовнішнього
+    # try/catch і ПІСЛЯ обчислення фінального
+    # $script:maintenanceRuntimeExitCode — той самий канонічний
+    # Get-BRAVOMaintenanceResolvedExitCode/Get-BRAVOMaintenanceFinalStatus,
+    # що вже керує процесним exit code, тож Operations завжди бачить ТОЙ
+    # САМИЙ фінальний результат, що й оператор у "=== СТАТУС ===" нижче —
+    # незалежно від NotificationMode/SlackMode (навмисно НЕ гейтиться тут:
+    # той самий review finding, що для Send-FinalReport — dashboard не
+    # повинен мовчки не побачити подію лише тому, що Slack/Discord
+    # вимкнено чи в режимі errors_only на цьому сервері).
+    param(
+        [Parameter(Mandatory = $true)][int]$ExitCode,
+        [Parameter(Mandatory = $true)][TimeSpan]$ElapsedTime
+    )
+
+    if ($null -eq $operationsReportingSettings) {
+        return
+    }
+
+    try {
+        $finalStatus = Get-BRAVOMaintenanceFinalStatus -ExitCode $ExitCode
+        $isPureSuccess = $finalStatus.Text -eq 'УСПІШНО'
+        $operationsSeverity = if ($script:criticalErrorOccurred) {
+            'CRITICAL'
+        } elseif ($isPureSuccess) {
+            'SUCCESS'
+        } else {
+            'WARNING'
+        }
+
+        # $script:BRAVOMaintenanceStepLog — той самий журнал, що вже живить
+        # фінальне Slack/Discord-повідомлення (New-BRAVOMaintenanceCompletedLines)
+        # і консольний РЕЗУЛЬТАТ: реальні кроки (Trace/Очистка/Міграція/
+        # Архівація/Автовимкнення тощо) з фактичним Status/Details, а не
+        # єдиний узагальнений 'Maintenance'-рядок.
+        $maintenanceStages = @($script:BRAVOMaintenanceStepLog | ForEach-Object {
+            [ordered]@{
+                name = [string]$_.Name
+                status = [string]$_.Status
+                details = if ([string]::IsNullOrWhiteSpace([string]$_.Details)) { $null } else { [string]$_.Details }
+            }
+        })
+        Send-BRAVOOperationsEvent `
+            -OperationsReportingSettings $operationsReportingSettings `
+            -CredentialTargets $credentialSettings.Targets `
+            -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
+            -Category 'maintenance' -Severity $operationsSeverity `
+            -Component 'Maintenance' `
+            -Message "Обслуговування завершено: $operationsSeverity" `
+            -Details @{
+                durationMs = [Math]::Round($ElapsedTime.TotalMilliseconds)
+                okCount = $script:BRAVOMaintenanceStepOkCount
+                warnCount = $script:BRAVOMaintenanceStepWarnCount
+                skippedCount = $script:BRAVOMaintenanceStepSkippedCount
+                failCount = $script:BRAVOMaintenanceStepFailCount
+                stages = $maintenanceStages
+            }
+    } catch {
+        Write-Log -Message "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+    }
 }
 
 # ===== ОСНОВНИЙ КОД СКРИПТУ =====
@@ -10447,11 +10521,26 @@ $script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
 
 # #175: попередження, яких не забрав жоден крок (preflight, конфігураційна
 # фаза, ділянка після останнього кроку), зводяться в один явний результат
-# ДО запису machine-readable статусу і ДО рендера підсумку — інакше
-# stepsWarning у JSON і поле "Попереджень" на консолі показували б 0 при
-# exit 10. Викликається саме тут, після резолву exit-code: пізніше
-# попереджень уже не виникає, тож зріз повний.
+# ДО запису machine-readable статусу, ДО рендера підсумку і (review, PR
+# #225 раунд 3) ДО Operations-події нижче — інакше stepsWarning у JSON,
+# поле "Попереджень" на консолі, і warnCount у Operations-payload
+# розходились би: перші два показували б реальний warnCount, а
+# Operations бачив би 0 лише тому, що подія відправлялась до цього
+# зведення. Викликається саме тут, після резолву exit-code (сама формула
+# exit-code не залежить від зведення — критичність/warnings/success уже
+# визначені), але ДО Send-BRAVOMaintenanceOperationsEvent: пізніше
+# попереджень уже не виникає, тож зріз повний і Operations бачить той
+# самий warnCount, що й усі інші споживачі.
 [void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
+
+# Operations-подія про завершення прогону — навмисно ТУТ, після фінального
+# резолву exit code (а не всередині Send-FinalReport вище): бачить ТОЙ
+# САМИЙ результат, що й "=== СТАТУС ===" нижче, включно з винятком,
+# спійманим зовнішнім catch ПІСЛЯ виклику Send-FinalReport (див. коментар
+# у визначенні Send-BRAVOMaintenanceOperationsEvent).
+Send-BRAVOMaintenanceOperationsEvent `
+    -ExitCode $script:maintenanceRuntimeExitCode `
+    -ElapsedTime ((Get-Date) - $script:ScriptStartTime)
 
 $maintenanceEndedAt = Get-Date
 $totalTime = $maintenanceEndedAt - $script:ScriptStartTime
