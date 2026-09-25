@@ -749,7 +749,24 @@
         -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
     $emptyUrlWarningsAfterSecond = $emptyUrlWarnings.Count
 
-    Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+    # Pre-existing self-test harness bug (виявлено регресійними тестами
+    # PR #225 раунд 3, thread 4/5 нижче): $originalWriteBravoLog вище
+    # захоплював РЕАЛЬНИЙ Write-BRAVOLog ДО перевизначення, але ніколи не
+    # використовувався для відновлення -- голий Remove-Item просто видаляв
+    # global Function:-drive entry ПОВНІСТЮ (New-Module -ScriptBlock
+    # матеріалізує функцію напряму в $global:Function:-drive, замінюючи
+    # той самий entry, що Import-Module BRAVO.Logging туди поклав; Remove-
+    # Item після цього лишає ІМ'Я взагалі без жодного визначення -- не
+    # "падіння" назад до module-exported версії). Будь-який Operations-код,
+    # що викликає Write-BRAVOLog ПІСЛЯ цього блоку (наприклад,
+    # Invoke-BRAVOOperationsOutboxDrain у тестах нижче), падав з "term
+    # 'Write-BRAVOLog' is not recognized". Фікс: відновити РЕАЛЬНИЙ
+    # ScriptBlock, захоплений вище, замість видалення entry.
+    if ($null -ne $originalWriteBravoLog) {
+        Set-Item -Path function:Write-BRAVOLog -Value $originalWriteBravoLog.ScriptBlock -Force
+    } else {
+        Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+    }
 
     Test-BRAVOCondition -Condition ($null -eq $emptyUrl1 -and $null -eq $emptyUrl2) `
         -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' `
@@ -762,6 +779,182 @@
         -Failure "повторний виклик у межах throttle-вікна (типово 15 хв) НЕ повинен додавати ще один WARNING -- очікувано лишити лічильник=1, отримано $emptyUrlWarningsAfterSecond"
 
     Remove-Variable -Name BRAVOOpsSelfTestApiBaseUrlWarnings -Scope Global -Force -ErrorAction SilentlyContinue
+
+    # =====================================================================
+    # PR #225 review-фікси (раунд 3): regression-тести для двох виправлень
+    # без попереднього committed покриття -- unbounded outbox drain (thread
+    # 4) і втрата подій під час pending-enrollment (thread 5).
+    # =====================================================================
+
+    # ---------------------------------------------------------------------
+    # Thread 4 (review): unbounded outbox drain -- MaxItemsPerDrain/
+    # MaxDrainDurationSeconds обмежують ОДИН виклик Invoke-BRAVOOperationsOutboxDrain,
+    # щоб черга, що накопичилась під час тривалого простою backend, не
+    # блокувала Archive/Health/Maintenance-прогін на необмежений час,
+    # намагаючись здренувати все одразу.
+    # ---------------------------------------------------------------------
+    $boundedDrainDir = Join-Path $opsSelfTestRoot 'BoundedDrain'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $boundedDrainDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'bounded-drain-api-key' }
+    $boundedOutboxDirFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsOutboxDirectory} }
+    $boundedOutboxDir = & $boundedOutboxDirFn
+    New-Item -ItemType Directory -Path $boundedOutboxDir -Force | Out-Null
+
+    # 5 валідних, усі due (NextRetryAtUtc у минулому), EnqueuedAtUtc
+    # зростає (FIFO), записані напряму на диск -- той самий формат, що
+    # Add-BRAVOOperationsOutboxItem продукує (той самий прийом, що
+    # PoisonOutbox-тест вище).
+    for ($i = 0; $i -lt 5; $i++) {
+        $boundedEventId = "bounded-item-$i-" + [guid]::NewGuid().ToString()
+        $boundedItemPath = Join-Path $boundedOutboxDir "$boundedEventId.json"
+        $boundedPayload = [pscustomobject]@{
+            Kind = 'event'; EventId = $boundedEventId
+            OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            SchemaVersion = 1; ApiPath = '/api/v1/events'
+            RequestBody = @{ category = 'health'; severity = 'SUCCESS' }
+            EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-100 + $i).ToString('o')
+            AttemptCount = 1
+            NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+            LastError = $null
+        }
+        [IO.File]::WriteAllText($boundedItemPath, ($boundedPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+    }
+
+    # (a) MaxItemsPerDrain: рівно 2 замокованих HTTP-успіхи в черзі -- якщо
+    # дренаж спробує обробити 3-й item, фейковий Invoke-WebRequest кине
+    # "жодної замокованої відповіді в черзі" (перевіряється нижче через
+    # -not $itemCountDrainThrew).
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    $itemCountDrainThrew = $false
+    try {
+        Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'bounded-drain-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5 -MaxItemsPerDrain 2
+    } catch {
+        $itemCountDrainThrew = $true
+    }
+    $boundedItemsAfterCountLimit = @(Get-ChildItem -LiteralPath $boundedOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (-not $itemCountDrainThrew) `
+        -Name 'Operations/DrainMaxItemsPerDrainDoesNotThrow' `
+        -Failure 'дренаж з -MaxItemsPerDrain 2 не повинен кидати виняток (never-throw invariant)'
+    Test-BRAVOCondition -Condition ($boundedItemsAfterCountLimit.Count -eq 3) `
+        -Name 'Operations/DrainMaxItemsPerDrainStopsAtLimitLeavesRestForNextDrain' `
+        -Failure "-MaxItemsPerDrain 2 має обробити РІВНО 2 з 5 due-items за один виклик, лишивши 3 для наступного дренажу; знайдено $($boundedItemsAfterCountLimit.Count) (очікувано 3)"
+
+    # (b) MaxDrainDurationSeconds: 0 -> stopwatch.Elapsed.TotalSeconds
+    # (>= 0.0 одразу після StartNew()) негайно перевищує ліміт -- дренаж
+    # має зупинитись ДО обробки першого ж item, без жодного HTTP-виклику
+    # (порожня черга замокованих відповідей -- будь-яка спроба виклику
+    # Invoke-WebRequest кинула б виняток, який тест ловить нижче).
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $durationDrainThrew = $false
+    try {
+        Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'bounded-drain-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5 -MaxItemsPerDrain 500 -MaxDrainDurationSeconds 0
+    } catch {
+        $durationDrainThrew = $true
+    }
+    $boundedItemsAfterDurationLimit = @(Get-ChildItem -LiteralPath $boundedOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (-not $durationDrainThrew -and $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0) `
+        -Name 'Operations/DrainMaxDrainDurationSecondsStopsBeforeAnyHttpCall' `
+        -Failure "-MaxDrainDurationSeconds 0 має зупинити дренаж ДО будь-якого HTTP-виклику (never-throw, 0 HTTP calls); threw=$durationDrainThrew httpCalls=$($global:BRAVOOpsSelfTestHttpCalls.Count)"
+    Test-BRAVOCondition -Condition ($boundedItemsAfterDurationLimit.Count -eq 3) `
+        -Name 'Operations/DrainMaxDrainDurationSecondsLeavesQueueForNextDrain' `
+        -Failure "-MaxDrainDurationSeconds 0 не повинен видаляти жодного item з Outbox\ (та сама черга з 3 items з попередньої перевірки); знайдено $($boundedItemsAfterDurationLimit.Count)"
+
+    # ---------------------------------------------------------------------
+    # Companion (Add-BRAVOOperationsOutboxItem, module-internal): bounded
+    # outbox size -- найстаріший item (за FIFO/EnqueuedAtUtc) витісняється в
+    # DeadLetter\, коли черга досягає MaxOutboxItems, замість необмеженого
+    # росту (постійно pending/revoked ідентичність могла б накопичувати
+    # items назавжди без цієї межі).
+    # ---------------------------------------------------------------------
+    $evictDir = Join-Path $opsSelfTestRoot 'OutboxEviction'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $evictDir
+    $addOutboxItemFn = & $opsSelfTestModule { ${function:Add-BRAVOOperationsOutboxItem} }
+
+    $evictEventId1 = 'evict-oldest-' + [guid]::NewGuid().ToString()
+    $evictEventId2 = 'evict-middle-' + [guid]::NewGuid().ToString()
+    $evictEventId3 = 'evict-newest-' + [guid]::NewGuid().ToString()
+    & $addOutboxItemFn -Kind 'event' -EventId $evictEventId1 -OccurredAtUtc (Get-Date).ToUniversalTime().ToString('o') `
+        -SchemaVersion 1 -ApiPath '/api/v1/events' -RequestBody @{ category = 'health'; severity = 'SUCCESS' } -MaxOutboxItems 2
+    Start-Sleep -Milliseconds 20
+    & $addOutboxItemFn -Kind 'event' -EventId $evictEventId2 -OccurredAtUtc (Get-Date).ToUniversalTime().ToString('o') `
+        -SchemaVersion 1 -ApiPath '/api/v1/events' -RequestBody @{ category = 'health'; severity = 'SUCCESS' } -MaxOutboxItems 2
+    Start-Sleep -Milliseconds 20
+    # Третій item переповнює ліміт (MaxOutboxItems=2, уже 2 на диску) ->
+    # найстаріший (evictEventId1) має бути витіснений у DeadLetter\ ПЕРЕД
+    # записом цього item.
+    & $addOutboxItemFn -Kind 'event' -EventId $evictEventId3 -OccurredAtUtc (Get-Date).ToUniversalTime().ToString('o') `
+        -SchemaVersion 1 -ApiPath '/api/v1/events' -RequestBody @{ category = 'health'; severity = 'SUCCESS' } -MaxOutboxItems 2
+
+    $evictOutboxDirFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsOutboxDirectory} }
+    $evictDeadLetterDirFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsOutboxDeadLetterDirectory} }
+    $evictOutboxDir = & $evictOutboxDirFn
+    $evictDeadLetterDir = & $evictDeadLetterDirFn
+    $evictOutboxItems = @(Get-ChildItem -LiteralPath $evictOutboxDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $evictDeadLetterItems = @(Get-ChildItem -LiteralPath $evictDeadLetterDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+
+    Test-BRAVOCondition -Condition ($evictOutboxItems.Count -eq 2 -and $evictDeadLetterItems.Count -eq 1) `
+        -Name 'Operations/OutboxEvictsOldestWhenMaxOutboxItemsExceeded' `
+        -Failure "3-й item з -MaxOutboxItems 2 має витіснити 1 найстаріший item у DeadLetter\, лишивши рівно 2 в Outbox\; отримано outbox=$($evictOutboxItems.Count) deadLetter=$($evictDeadLetterItems.Count)"
+    Test-BRAVOCondition -Condition (
+        -not (Test-Path -LiteralPath (Join-Path $evictOutboxDir "$evictEventId1.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $evictDeadLetterDir "$evictEventId1.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $evictOutboxDir "$evictEventId2.json") -PathType Leaf) -and
+        (Test-Path -LiteralPath (Join-Path $evictOutboxDir "$evictEventId3.json") -PathType Leaf)
+    ) -Name 'Operations/OutboxEvictionPicksOldestByEnqueuedAtUtcNotNewest' `
+      -Failure "витіснений item має бути САМЕ найстаріший ($evictEventId1, FIFO/EnqueuedAtUtc) -- новіші items ($evictEventId2/$evictEventId3) мають лишитись в активному Outbox\"
+
+    # ---------------------------------------------------------------------
+    # Thread 5 (review): event loss during pending enrollment -- подія,
+    # надіслана поки enrollment ще pending/не сконфігуровано (apiKey
+    # порожній, apiKey ще НЕ намагались отримати мережею в цьому сценарії,
+    # bootstrap-секрет просто відсутній у Credential Manager), раніше
+    # губилась НАЗАВЖДИ (лише лог, без outbox). Тепер вона потрапляє в
+    # ТОЙ САМИЙ durable outbox, що обслуговує transient HTTP-збої.
+    # ---------------------------------------------------------------------
+    $pendingLossDir = Join-Path $opsSelfTestRoot 'PendingEnrollmentEventLoss'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $pendingLossDir
+    # Порожній credential store -- жодного bootstrap-секрету -> Invoke-
+    # BRAVOOperationsEnrollment повертає $null ОДРАЗУ (WARNING-лог), БЕЗ
+    # жодної спроби мережевого виклику -- саме тому черга замокованих HTTP-
+    # відповідей нижче лишається порожньою: будь-який несподіваний HTTP-
+    # виклик кинув би виняток і тест впав би на -not $pendingLossThrew.
+    $global:BRAVOOpsSelfTestCredentialStore = @{}
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $pendingLossThrew = $false
+    try {
+        Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+            -InstitutionCode 'INST1' -Category 'health' -Severity 'WARNING' -Component 'Health' `
+            -Message 'pending enrollment event loss regression test'
+    } catch {
+        $pendingLossThrew = $true
+    }
+
+    $pendingLossOutboxItems = @(Get-ChildItem -LiteralPath (Join-Path $pendingLossDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (-not $pendingLossThrew -and $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0) `
+        -Name 'Operations/EventDuringPendingEnrollmentNeverThrowsNoNetworkAttempt' `
+        -Failure "подія під час pending enrollment (без bootstrap-секрету) має повернутись без винятку і БЕЗ жодної мережевої спроби; threw=$pendingLossThrew httpCalls=$($global:BRAVOOpsSelfTestHttpCalls.Count)"
+    Test-BRAVOCondition -Condition ($pendingLossOutboxItems.Count -eq 1) `
+        -Name 'Operations/EventDuringPendingEnrollmentIsBufferedToOutboxNotDropped' `
+        -Failure "подія, надіслана поки enrollment pending, раніше губилась НАЗАВЖДИ (review finding) -- тепер має бути буферизована в durable Outbox\; знайдено $($pendingLossOutboxItems.Count) файлів (очікувано 1)"
+
+    if ($pendingLossOutboxItems.Count -eq 1) {
+        $pendingLossItemRaw = ([IO.File]::ReadAllText($pendingLossOutboxItems[0].FullName, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json)
+        Test-BRAVOCondition -Condition (
+            $pendingLossItemRaw.RequestBody.category -eq 'health' -and
+            $pendingLossItemRaw.RequestBody.severity -eq 'WARNING' -and
+            $pendingLossItemRaw.RequestBody.payload.message -eq 'pending enrollment event loss regression test' -and
+            $pendingLossItemRaw.RequestBody.payload.component -eq 'Health' -and
+            $pendingLossItemRaw.AttemptCount -eq 0
+        ) -Name 'Operations/EventDuringPendingEnrollmentOutboxItemCarriesOriginalPayload' `
+          -Failure "буферизований item має нести ОРИГІНАЛЬНІ category/severity/message/component цієї події, з AttemptCount=0 (без штучного стартового затримання); отримано $($pendingLossItemRaw | ConvertTo-Json -Compress -Depth 6)"
+    }
 
     # ---------------------------------------------------------------
     # Прибирання: зняти всі self-test overrides з function:-drive (той

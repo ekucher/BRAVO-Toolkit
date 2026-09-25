@@ -871,9 +871,28 @@ function Invoke-BRAVOOperationsEnrollment {
         # збій: повторний тісний retry нічого не змінить, потрібне ручне
         # admin reissue. Логуємо throttled (нормальний poll-cadence, не
         # тісний цикл).
+        #
+        # Review finding (reveal window vs poll cadence, thread 6): цей GET
+        # /enroll-поллінг виконується лише ПОБІЧНО, як частина кожного
+        # Send-BRAVOOperationsEvent/Heartbeat (Archive/Health/Maintenance-
+        # прогону чи ручного BRAVO_OPERATIONS_HEARTBEAT.ps1) — жодного
+        # виділеного heartbeat-розкладу наразі не реєструє
+        # BRAVO_TASKS_INSTALL.ps1 (свідоме рішення цієї хвилі, PR #225
+        # thread 7: сира конфігурація HeartbeatIntervalMinutes видалена як
+        # orphaned, а не вдягнута в необкатаний Scheduled Task). Дефолтний
+        # Health-інтервал (schedulerSettings.Health.RepeatEveryMinutes,
+        # типово 240 хв) НАБАГАТО перевищує 5-хвилинне вікно видачі ключа
+        # — типовий сервер практично ЗАВЖДИ пропустить вікно між approve/
+        # reissue й наступним природним поллінгом. 5-хвилинне вікно —
+        # рішення бекенду bsystem-operations (інший репозиторій, не в
+        # межах цієї зміни); наразі єдина надійна дія оператора: одразу
+        # ПІСЛЯ approve/reissue в Operations UI вручну запустити
+        # BRAVO_OPERATIONS_HEARTBEAT.ps1 на цьому сервері (чи дочекатись
+        # найближчого Archive/Health/Maintenance-прогону, якщо він
+        # природно потрапляє в 5-хвилинне вікно).
         if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastTtlExpiredLoggedAtUtc) {
             Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-                -Message 'Сервер approved в Operations, але API-ключ більше недоступний (5-хвилинне вікно видачі вичерпано) — потрібне ручне admin reissue; агент продовжить періодично перевіряти, але не намагатиметься "самовиправитись"'
+                -Message 'Сервер approved в Operations, але API-ключ більше недоступний (5-хвилинне вікно видачі вичерпано) — потрібне ручне admin reissue в Operations UI; ОДРАЗУ ПІСЛЯ reissue вручну запустіть BRAVO_OPERATIONS_HEARTBEAT.ps1 на цьому сервері (наступний природний Archive/Health/Maintenance-прогін може не встигнути в 5-хвилинне вікно — типовий Health-інтервал 240 хв). Агент сам НЕ намагатиметься "самовиправитись" тісним retry.'
             $enrollmentState.LastTtlExpiredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
             Set-BRAVOOperationsEnrollmentState -State $enrollmentState
         }
@@ -993,10 +1012,34 @@ function Add-BRAVOOperationsOutboxItem {
         [Parameter(Mandatory = $true)][string]$ApiPath,
         [Parameter(Mandatory = $true)][hashtable]$RequestBody,
         [int]$AttemptCount = 1,
-        [string]$LastError
+        [string]$LastError,
+        [int]$MaxOutboxItems = 500
     )
 
     try {
+        # Bounded outbox size (thread 5 fix companion): Send-BRAVOOperationsEvent
+        # тепер буферизує події сюди й тоді, коли enrollment ще pending (не
+        # лише при transient HTTP-збоях) — без цієї межі постійно pending/
+        # revoked ідентичність могла б накопичувати items необмежено.
+        # Найстаріші items (за FIFO/EnqueuedAtUtc) витісняються в dead-letter
+        # (сам dead-letter теж має власну bounded ретенцію, 200 файлів).
+        try {
+            $existingItems = Get-BRAVOOperationsOutboxItems
+            $existingCount = @($existingItems).Count
+            if ($existingCount -ge $MaxOutboxItems) {
+                $evictCount = ($existingCount - $MaxOutboxItems) + 1
+                foreach ($stale in @($existingItems | Select-Object -First $evictCount)) {
+                    Move-BRAVOOperationsOutboxItemToDeadLetter -Item $stale -Reason "Outbox переповнено (ліміт $MaxOutboxItems items) — найстаріший item витіснено"
+                }
+                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                    -Message "Outbox Operations переповнено (ліміт $MaxOutboxItems) — витіснено $evictCount найстаріших item(ів) у dead-letter"
+            }
+        } catch {
+            # Never-throw: якщо перевірка розміру outbox сама впала, все одно
+            # продовжуємо запис нового item — краще ризикнути тимчасовим
+            # переповненням, ніж втратити цю подію взагалі.
+        }
+
         $item = [pscustomobject]@{
             Kind = $Kind
             EventId = $EventId
@@ -1211,13 +1254,24 @@ function Invoke-BRAVOOperationsOutboxDrain {
         [Parameter(Mandatory = $true)][string]$ApiBaseUrl,
         [Parameter(Mandatory = $true)][string]$ApiKey,
         [Parameter(Mandatory = $true)][hashtable]$CredentialTargets,
-        [Parameter(Mandatory = $true)][int]$TimeoutSeconds
+        [Parameter(Mandatory = $true)][int]$TimeoutSeconds,
+        [int]$MaxItemsPerDrain = 200,
+        [int]$MaxDrainDurationSeconds = 60
     )
 
     try {
         $items = Get-BRAVOOperationsOutboxItems
         $now = (Get-Date).ToUniversalTime()
+        $drainStopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+        $processedCount = 0
         foreach ($item in $items) {
+            if ($processedCount -ge $MaxItemsPerDrain -or
+                $drainStopwatch.Elapsed.TotalSeconds -ge $MaxDrainDurationSeconds) {
+                $remainingCount = @($items).Count - $processedCount
+                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' -Message "Дренаж Operations outbox зупинено достроково (ліміт items=$MaxItemsPerDrain, ліміт часу=${MaxDrainDurationSeconds}с) - залишилось items у черзі для наступного дренажу: $remainingCount"
+                break
+            }
+
             $nextRetry = $now
             try {
                 $nextRetry = [datetime]::Parse([string]$item.NextRetryAtUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
@@ -1227,6 +1281,7 @@ function Invoke-BRAVOOperationsOutboxDrain {
             if ($nextRetry -gt $now) {
                 continue
             }
+            $processedCount++
 
             # Isolate-per-item (review P2): якщо item — валідний JSON, але
             # RequestBody відсутнє/не об'єкт (схемна зміна, ручне
@@ -1324,12 +1379,36 @@ function Send-BRAVOOperationsEvent {
             -CredentialTargets $CredentialTargets `
             -InstitutionCode $InstitutionCode
         if ([string]::IsNullOrWhiteSpace($apiKey)) {
-            # Pending/не сконфігуровано/мережевий збій/401-invalidated —
-            # уже залоговано всередині Invoke-BRAVOOperationsEnrollment
-            # (чи Clear-BRAVOOperationsInvalidCredential на попередньому
-            # виклику). Подія цього разу НЕ ставиться в outbox — немає
-            # валідного ключа, яким її можна було б колись відправити;
-            # наступний цикл, коли ключ з'явиться, понесе свої нові події.
+            # Review finding (event loss during pending enrollment): раніше
+            # подія тут губилась назавжди — валідного apiKey ще немає
+            # (pending/не сконфігуровано/мережевий збій/401-invalidated,
+            # уже залоговано всередині Invoke-BRAVOOperationsEnrollment /
+            # Clear-BRAVOOperationsInvalidCredential). Тепер вона
+            # ставиться в ТОЙ САМИЙ durable outbox, що вже обслуговує
+            # transient HTTP-збої — коли enrollment завершиться, наступний
+            # природний Send-BRAVOOperationsEvent/Heartbeat задренує чергу
+            # (FIFO). AttemptCount=0 -> без штучного стартового backoff.
+            $pendingPayload = @{ message = $Message }
+            if (-not [string]::IsNullOrWhiteSpace($Component)) {
+                $pendingPayload.component = $Component
+            }
+            if ($null -ne $Services -and @($Services).Count -gt 0) {
+                $pendingPayload.services = @($Services)
+            }
+            if ($null -ne $Details -and $Details.Count -gt 0) {
+                $pendingPayload.details = $Details
+            }
+            $pendingRequestBody = @{
+                category = $Category
+                severity = $Severity
+                payload = $pendingPayload
+                eventId = $envelope.EventId
+                occurredAt = $envelope.OccurredAtUtc
+                schemaVersion = $envelope.SchemaVersion
+            }
+            Add-BRAVOOperationsOutboxItem -Kind 'event' -EventId $envelope.EventId `
+                -OccurredAtUtc $envelope.OccurredAtUtc -SchemaVersion $envelope.SchemaVersion `
+                -ApiPath '/api/v1/events' -RequestBody $pendingRequestBody -AttemptCount 0
             return
         }
 
