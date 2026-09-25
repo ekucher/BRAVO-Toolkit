@@ -5186,6 +5186,53 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Condition ($notificationScriptText.Contains("function Format-BRAVOOperatorStatusLine")) `
         -Name "Notifications/StatusLineHelperExists" `
         -Failure "BRAVO.Notifications повинен експортувати Format-BRAVOOperatorStatusLine для status-first component rows"
+
+    # --- PR #225 review thread 4/Health (397b1e5): regression-guard --
+    # Operations SUCCESS/CRITICAL події МАЮТЬ бути НЕЗАЛЕЖНІ від
+    # NotificationMode/-NoSlack/success-dedup-гейтингу -- dashboard не
+    # повинен мовчки не побачити реальний healthy/critical стан лише тому,
+    # що оператор вимкнув/придушив Slack/Discord на цьому сервері. Text-
+    # position канарка (той самий idiom, що інші regex/Contains-перевірки в
+    # цьому файлі): канонічний виклик має існувати РІВНО один раз кожен, і
+    # його offset у файлі МАЄ бути РАНІШЕ за offset відповідного
+    # гейтингового `if`, інакше він або перенесений усередину гейту, або
+    # дубльований.
+    $healthOpsSuccessCallMarker = "-Category 'health' -Severity 'SUCCESS'"
+    $healthOpsCriticalCallMarker = "-Category 'health' -Severity 'CRITICAL'"
+    $healthSuccessGateMarker = 'if ($sendSuccessNotification) {'
+    $healthCriticalGateMarker = 'if ($NoSlack -or $NotificationMode -eq "none") {'
+
+    $healthOpsSuccessCallCount = ([regex]::Matches($healthScriptText, [regex]::Escape($healthOpsSuccessCallMarker))).Count
+    $healthOpsSuccessCallIndex = $healthScriptText.IndexOf($healthOpsSuccessCallMarker)
+    $healthSuccessGateIndex = $healthScriptText.IndexOf($healthSuccessGateMarker)
+
+    Test-BRAVOCondition `
+        -Condition (
+            $healthOpsSuccessCallCount -eq 1 -and $healthOpsSuccessCallIndex -ge 0 -and
+            $healthSuccessGateIndex -ge 0 -and $healthOpsSuccessCallIndex -lt $healthSuccessGateIndex
+        ) `
+        -Name 'Health/OperationsSuccessEventNotGatedByNotificationMode' `
+        -Failure "Send-BRAVOOperationsEvent(Severity=SUCCESS) для Health МАЄ викликатись РІВНО один раз і РАНІШЕ за `if (`$sendSuccessNotification) {` (тобто поза цим гейтингом) -- знайдено викликів: $healthOpsSuccessCallCount, offset виклику=$healthOpsSuccessCallIndex, offset гейту=$healthSuccessGateIndex (регресія thread 4 review PR #225)"
+
+    # CRITICAL: РІВНО ДВА легітимних call-сайти -- (1) ранній
+    # environment-preflight early-exit (недоступне середовище виконання,
+    # окремий незалежний шлях, ніколи не мав NotificationMode-гейтингу
+    # взагалі, тому цей thread його не стосується), і (2) головний,
+    # issue-count-based CRITICAL, ЩО САМЕ БУВ зсередини -NoSlack/
+    # NotificationMode="none" гейтингу (thread 4). Канарка перевіряє
+    # ОСТАННІЙ (головний) call-сайт -- має бути РАНІШЕ за відповідний
+    # `if ($NoSlack -or ...)`, а НЕ всередині нього.
+    $healthOpsCriticalCallCount = ([regex]::Matches($healthScriptText, [regex]::Escape($healthOpsCriticalCallMarker))).Count
+    $healthOpsCriticalCallLastIndex = $healthScriptText.LastIndexOf($healthOpsCriticalCallMarker)
+    $healthCriticalGateIndex = $healthScriptText.IndexOf($healthCriticalGateMarker)
+
+    Test-BRAVOCondition `
+        -Condition (
+            $healthOpsCriticalCallCount -eq 2 -and $healthOpsCriticalCallLastIndex -ge 0 -and
+            $healthCriticalGateIndex -ge 0 -and $healthOpsCriticalCallLastIndex -lt $healthCriticalGateIndex
+        ) `
+        -Name 'Health/OperationsCriticalEventNotGatedByNoSlackOrNotificationModeNone' `
+        -Failure "Send-BRAVOOperationsEvent(Severity=CRITICAL) для Health МАЄ мати РІВНО ДВА call-сайти (ранній environment-preflight + головний issue-count-based), і ОСТАННІЙ (головний) -- РАНІШЕ за `if (`$NoSlack -or `$NotificationMode -eq `"none`") {` (тобто поза -NoSlack/NotificationMode=none гейтингом) -- знайдено викликів: $healthOpsCriticalCallCount, offset останнього виклику=$healthOpsCriticalCallLastIndex, offset гейту=$healthCriticalGateIndex (регресія thread 4 review PR #225)"
     # dev.12: реальні component-рядки Health SUCCESS (BLOG/BRAVOEXCH/MODEL,
     # Local, SFTP, BAZA_APP/BAZA_WWW, SMB) мають будуватись через helper, а
     # не через стару схему з фіксованими пробілами перед :white_check_mark:.
@@ -18437,6 +18484,58 @@ function Write-BRAVOLog {
         ) `
         -Name 'Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy' `
         -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 5 разів (ЛОГ/консоль/notification/ранній disk-preflight summary/Send-BRAVOMaintenanceOperationsEvent), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
+
+    # --- PR #225 review thread 9/Maintenance (414b4a4): regression-guard
+    # AST-канарка на ПОРЯДОК -- Send-BRAVOMaintenanceOperationsEvent (ЦЕЙ
+    # виклик, не власне визначення функції) МАЄ виконуватись (a) ПІСЛЯ
+    # обчислення $script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
+    # (той самий резолвер, що керує процесним exit code) і (b) НЕ зсередини
+    # Send-FinalReport (де жила стара версія цього блоку, усередині
+    # зовнішнього try, ДО catch і ДО фінального резолву exit code -- якщо
+    # виняток стався ПІСЛЯ Send-FinalReport, Operations бачив би застарілий
+    # SUCCESS/WARNING, а якщо РАНІШЕ -- не бачив би події взагалі).
+    $maintenanceOpsEventCallAsts = @($maintenanceTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Send-BRAVOMaintenanceOperationsEvent'
+        },
+        $true
+    ))
+    $maintenanceResolvedExitCodeCallAsts = @($maintenanceTotalAst.FindAll(
+        {
+            param($candidate)
+            $candidate -is [Management.Automation.Language.CommandAst] -and
+            $candidate.GetCommandName() -eq 'Get-BRAVOMaintenanceResolvedExitCode'
+        },
+        $true
+    ))
+    $maintenanceOpsEventCallInsideSendFinalReport = $false
+    if ($maintenanceOpsEventCallAsts.Count -eq 1) {
+        $maintenanceOpsEventCallAncestor = $maintenanceOpsEventCallAsts[0].Parent
+        while ($null -ne $maintenanceOpsEventCallAncestor) {
+            if ($maintenanceOpsEventCallAncestor -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $maintenanceOpsEventCallAncestor.Name -eq 'Send-FinalReport') {
+                $maintenanceOpsEventCallInsideSendFinalReport = $true
+                break
+            }
+            $maintenanceOpsEventCallAncestor = $maintenanceOpsEventCallAncestor.Parent
+        }
+    }
+    $maintenanceOpsEventCallAfterResolvedExitCode = (
+        $maintenanceOpsEventCallAsts.Count -eq 1 -and $maintenanceResolvedExitCodeCallAsts.Count -ge 1 -and
+        $maintenanceOpsEventCallAsts[0].Extent.StartOffset -gt (
+            ($maintenanceResolvedExitCodeCallAsts | ForEach-Object { $_.Extent.EndOffset } | Measure-Object -Maximum).Maximum
+        )
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceOpsEventCallAsts.Count -eq 1 -and
+            -not $maintenanceOpsEventCallInsideSendFinalReport -and
+            $maintenanceOpsEventCallAfterResolvedExitCode
+        ) `
+        -Name 'Maintenance/OperationsEventOnlyAfterFinalResolvedExitCode' `
+        -Failure "Send-BRAVOMaintenanceOperationsEvent МАЄ викликатись РІВНО один раз, ПОЗА Send-FinalReport, і ПІСЛЯ фінального `$script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode` -- знайдено викликів: $($maintenanceOpsEventCallAsts.Count), усередині Send-FinalReport: $maintenanceOpsEventCallInsideSendFinalReport, після резолву exit code: $maintenanceOpsEventCallAfterResolvedExitCode (регресія thread 9 review PR #225 -- Operations НЕ повинен бачити застарілий/відсутній фінальний статус прогону)"
 
     # ================================================================
     # Група 2 — Maintenance: голий "==="-роздільник більше не пише

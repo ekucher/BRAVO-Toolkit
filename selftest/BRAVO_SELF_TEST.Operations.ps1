@@ -534,6 +534,235 @@
         -Name 'Operations/PostEnroll503NotConfiguredNeverThrowsReturnsNullSamePostureAsPending' `
         -Failure '503 enrollment_not_configured на POST /enroll має повернути $null без винятку -- "ще не доступно" (та сама постава, що pending), не hard error'
 
+    # =====================================================================
+    # PR #225 review-фікси (раунд 2, thread 7/9/6): regression-тести для
+    # трьох виправлень, які раніше мали лише ad-hoc ручну перевірку під час
+    # розробки (d2d1136), без committed regression-покриття.
+    # =====================================================================
+
+    # ---------------------------------------------------------------------
+    # Thread 7 (review): serialize first-time enrollment claim creation.
+    #
+    # Get-BRAVOOperationsEnrollmentClaim (module-internal) серіалізує
+    # генерацію+запис ПЕРШОГО claim через cross-process named mutex
+    # (Enter-/Exit-BRAVOOperationsEnrollmentClaimLock) + double-checked
+    # locking (перечитує стан ПІСЛЯ отримання локу). Без цього дві
+    # одночасні "перші" спроби (напр. Health+Maintenance стартують за
+    # розкладом одночасно) могли б прочитати ВІДСУТНІЙ claim, згенерувати
+    # РІЗНІ GUID і атомарно перезаписати той самий файл -- переможець
+    # запису лишає claim, якого "програвець" ніколи не побачив і надішле
+    # СВІЙ (застарілий) GUID серверу, що дає постійний 409 claim_mismatch.
+    #
+    # Тест відтворює це напряму на рівні локу (не через окремі процеси):
+    # 1) наш процес тримає named mutex ("виграв" перегонку першим);
+    # 2) паралельний PowerShell-job (окремий процес, той самий
+    #    Global\-простір імен мьютекса) намагається згенерувати claim
+    #    того самого serverId одночасно -- має ЗАБЛОКУВАТИСЯ на mutex;
+    # 3) наш процес персистує claim і звільняє лок;
+    # 4) job має прокинутись, ПЕРЕЧИТАТИ вже записаний claim (double-check)
+    #    і повернути РІВНО той самий claim, а НЕ згенерувати власний.
+    # ---------------------------------------------------------------------
+    $raceDir = Join-Path $opsSelfTestRoot 'EnrollmentClaimRace'
+    New-Item -ItemType Directory -Path $raceDir -Force | Out-Null
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $raceDir
+    $opsModulePsd1Path = Join-Path $root "modules\BRAVO.Operations\BRAVO.Operations.psd1"
+
+    $enterLockFn = & $opsSelfTestModule { ${function:Enter-BRAVOOperationsEnrollmentClaimLock} }
+    $exitLockFn = & $opsSelfTestModule { ${function:Exit-BRAVOOperationsEnrollmentClaimLock} }
+    $stateGetFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsEnrollmentState} }
+    $statePathFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsEnrollmentStatePath} }
+    $writeAtomicFn = & $opsSelfTestModule { ${function:Write-BRAVOOperationsAtomicJsonFile} }
+
+    $raceStatePath = & $statePathFn
+    $ourMutex = & $enterLockFn -Path $raceStatePath -TimeoutSeconds 10
+    $raceJob = $null
+    $raceClaimFromJob = $null
+    $raceJobThrew = $false
+    $winnerClaim = $null
+    try {
+        Test-BRAVOCondition -Condition ($null -ne $ourMutex) `
+            -Name 'Operations/EnrollmentClaimRacePrecondition_LockAcquired' `
+            -Failure 'не вдалося отримати cross-process claim-lock у власному процесі -- передумова race-тесту не виконана'
+
+        $raceJob = Start-Job -ScriptBlock {
+            param($ModulePath, $StateDir)
+            [Environment]::SetEnvironmentVariable('BRAVO_OPERATIONS_TEST_STATE_DIR', $StateDir)
+            Import-Module -Name $ModulePath -Force -ErrorAction Stop
+            $mod = Get-Module -Name 'BRAVO.Operations'
+            # Приватна функція -- виконуємо всередині module session state
+            # тим самим прийомом, що self-test суїта використовує для
+            # $joinUrlFn вище.
+            & $mod { Get-BRAVOOperationsEnrollmentClaim }
+        } -ArgumentList $opsModulePsd1Path, $raceDir
+
+        # Дати job-у реальний шанс дійти до Enter-Lock і заблокуватись на
+        # нашому mutex (без цього тест міг би "випадково" пройти навіть
+        # без коректної серіалізації, якщо job ще навіть не стартував).
+        Start-Sleep -Milliseconds 800
+
+        $winnerClaim = [guid]::NewGuid().ToString()
+        $raceState = & $stateGetFn
+        $raceState.Claim = $winnerClaim
+        & $writeAtomicFn -Path $raceStatePath -Object $raceState
+    } finally {
+        if ($null -ne $ourMutex) { & $exitLockFn -Mutex $ourMutex }
+    }
+
+    if ($null -ne $raceJob) {
+        try {
+            $raceJobResult = $raceJob | Wait-Job -Timeout 20 | Receive-Job -ErrorAction Stop
+            $raceClaimFromJob = [string]$raceJobResult
+        } catch {
+            $raceJobThrew = $true
+        } finally {
+            Remove-Job -Job $raceJob -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    Test-BRAVOCondition -Condition (
+        -not $raceJobThrew -and
+        -not [string]::IsNullOrWhiteSpace($raceClaimFromJob) -and
+        $raceClaimFromJob -eq $winnerClaim
+    ) -Name 'Operations/EnrollmentClaimFirstCreationRaceSerializedNoOverwrite' `
+      -Failure "конкурентна перша генерація claim має серіалізуватись через cross-process lock -- паралельний процес мав дочекатись і повернути ТОЙ САМИЙ claim, що записав переможець ('$winnerClaim'), а не власний GUID; отримано з job='$raceClaimFromJob' threw=$raceJobThrew"
+
+    # ---------------------------------------------------------------------
+    # Thread 9 (review): isolate malformed/poison outbox item during drain.
+    #
+    # Один item з відсутнім/невалідним RequestBody (пошкоджений на диску
+    # вручну, схемна зміна, партиальний запис) НЕ повинен зупиняти дренаж
+    # усієї черги -- раніше виняток при парсингу PSObject.Properties цього
+    # ОДНОГО item летів у зовнішній try функції й переривав обробку ВСІХ
+    # наступних items (FIFO-порядок), тож битий item "отруював" би чергу
+    # на кожному наступному прогоні. Фікс: per-item isolation -> зіпсований
+    # item іде в DeadLetter, решта (справний item) обробляється далі.
+    # ---------------------------------------------------------------------
+    $poisonDir = Join-Path $opsSelfTestRoot 'PoisonOutbox'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $poisonDir
+    $outboxDirFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsOutboxDirectory} }
+    $outboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $outboxDir -Force | Out-Null
+
+    # Обидва items записані НАПРЯМУ на диск (той самий формат, що Add-
+    # BRAVOOperationsOutboxItem продукує) замість через Add-BRAVOOperationsOutboxItem
+    # -- останній обчислює NextRetryAtUtc = зараз+30с (перший backoff-крок),
+    # тобто щойно доданий item НЕ due для дренажу негайно; тест мусить
+    # контролювати EnqueuedAtUtc (FIFO-порядок) і NextRetryAtUtc (due "в
+    # минулому") явно, щоб обидва items реально дренувались у ЦЬОМУ виклику.
+
+    # Item 1 (валідний) -- має бути доставлений успішно.
+    $goodEventId = [guid]::NewGuid().ToString()
+    $goodItemPath = Join-Path $outboxDir "$goodEventId.json"
+    $goodPayload = [pscustomobject]@{
+        Kind = 'event'; EventId = $goodEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        SchemaVersion = 1; ApiPath = '/api/v1/events'
+        RequestBody = @{ category = 'health'; severity = 'SUCCESS' }
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-1).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        LastError = $null
+    }
+    [IO.File]::WriteAllText($goodItemPath, ($goodPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+    # Item 2 (пошкоджений, EnqueuedAtUtc РАНІШЕ за item 1, щоб гарантовано
+    # опинитись першим у FIFO-порядку дренажу, який Get-BRAVOOperationsOutboxItems
+    # сортує саме за EnqueuedAtUtc) -- RequestBody замінено на рядок (не
+    # об'єкт) прямим записом JSON на диск, імітуючи пошкодження/ручне
+    # редагування/схемну неузгодженість.
+    $poisonEventId = '0000-poison-' + [guid]::NewGuid().ToString()
+    $poisonItemPath = Join-Path $outboxDir "$poisonEventId.json"
+    $poisonPayload = [pscustomobject]@{
+        Kind = 'event'; EventId = $poisonEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        SchemaVersion = 1; ApiPath = '/api/v1/events'
+        RequestBody = 'not-an-object-broken-payload'
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        LastError = $null
+    }
+    [IO.File]::WriteAllText($poisonItemPath, ($poisonPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    $drainThrew = $false
+    try {
+        Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'test-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5
+    } catch {
+        $drainThrew = $true
+    }
+
+    $deadLetterDirFn = & $opsSelfTestModule { ${function:Get-BRAVOOperationsOutboxDeadLetterDirectory} }
+    $deadLetterDir = & $deadLetterDirFn
+    $poisonMovedToDeadLetter = Test-Path -LiteralPath (Join-Path $deadLetterDir "$poisonEventId.json") -PathType Leaf
+    $poisonRemainsInOutbox = Test-Path -LiteralPath $poisonItemPath -PathType Leaf
+    $goodItemRemainsInOutbox = Test-Path -LiteralPath (Join-Path $outboxDir "$goodEventId.json") -PathType Leaf
+    $goodItemWasSent = @($global:BRAVOOpsSelfTestHttpCalls | Where-Object { $_.Uri -like '*api/v1/events*' }).Count -ge 1
+
+    Test-BRAVOCondition -Condition (-not $drainThrew) `
+        -Name 'Operations/PoisonOutboxItemDoesNotAbortDrainForWholeQueue' `
+        -Failure 'один пошкоджений outbox-item НЕ повинен кидати виняток, що зупиняє дренаж всієї черги (never-throw invariant дренажу)'
+    Test-BRAVOCondition -Condition ($poisonMovedToDeadLetter -and -not $poisonRemainsInOutbox) `
+        -Name 'Operations/PoisonOutboxItemIsolatedToDeadLetterNotLost' `
+        -Failure "пошкоджений item (RequestBody не об'єкт) має бути переміщений у DeadLetter і видалений з активного outbox -- movedToDeadLetter=$poisonMovedToDeadLetter remainsInOutbox=$poisonRemainsInOutbox (item НЕ повинен просто губитись мовчки і НЕ повинен лишатись у активній черзі, блокуючи наступні прогони)"
+    Test-BRAVOCondition -Condition (-not $goodItemRemainsInOutbox -and $goodItemWasSent) `
+        -Name 'Operations/PoisonOutboxItemDoesNotBlockRemainingQueueDrain' `
+        -Failure "справний item ($goodEventId) МАВ БУТИ успішно доставлений і видалений з outbox, попри поруч зіпсований item -- rest-of-queue має продовжити дренуватись; wasSent=$goodItemWasSent remainsInOutbox=$goodItemRemainsInOutbox"
+
+    # ---------------------------------------------------------------------
+    # Thread 6/P2 (review): Enabled=true + порожній ApiBaseUrl -- НЕ
+    # мовчазний no-op. Throttled WARNING (LastApiBaseUrlMissingLoggedAtUtc),
+    # та сама throttle-політика, що pending/404/TTL-expired (типово 15 хв):
+    # перший виклик логує, ПОВТОРНИЙ виклик у межах throttle-вікна -- ні.
+    # ---------------------------------------------------------------------
+    $emptyUrlDir = Join-Path $opsSelfTestRoot 'EmptyApiBaseUrl'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $emptyUrlDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{}
+    $emptyUrlSettings = @{ Enabled = $true; ApiBaseUrl = ''; ProductType = 'LIMS'; RequestTimeoutSeconds = 5 }
+
+    $emptyUrlWarnings = New-Object System.Collections.Generic.List[object]
+    $originalWriteBravoLog = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
+    [void](New-Module -ScriptBlock {
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Level, [string]$Message)
+            if ($Component -eq 'Operations' -and $Level -eq 'WARNING' -and $Message -like '*ApiBaseUrl порожній*') {
+                [void]$global:BRAVOOpsSelfTestApiBaseUrlWarnings.Add($Message)
+            }
+        }
+    })
+    $global:BRAVOOpsSelfTestApiBaseUrlWarnings = $emptyUrlWarnings
+
+    # Перший виклик: Enabled=true, ApiBaseUrl порожній -> має повернути
+    # $null (fail-closed, не намагається енролитись без URL) І залогувати
+    # РІВНО один throttled WARNING (не мовчазний no-op, review P2).
+    $emptyUrl1 = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $emptyUrlSettings `
+        -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
+    $emptyUrlWarningsAfterFirst = $emptyUrlWarnings.Count
+
+    # Другий виклик одразу за першим (у межах throttle-вікна) -- НЕ повинен
+    # додати ще один WARNING (throttle працює), лишаючись при цьому
+    # so само fail-closed ($null).
+    $emptyUrl2 = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $emptyUrlSettings `
+        -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
+    $emptyUrlWarningsAfterSecond = $emptyUrlWarnings.Count
+
+    Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+
+    Test-BRAVOCondition -Condition ($null -eq $emptyUrl1 -and $null -eq $emptyUrl2) `
+        -Name 'Operations/EnabledWithEmptyApiBaseUrlFailsClosedReturnsNull' `
+        -Failure 'Enabled=true з порожнім ApiBaseUrl має повернути $null (fail-closed), без спроби реального enrollment'
+    Test-BRAVOCondition -Condition ($emptyUrlWarningsAfterFirst -eq 1) `
+        -Name 'Operations/EnabledWithEmptyApiBaseUrlLogsWarningNotSilent' `
+        -Failure "Enabled=true + порожній ApiBaseUrl МАЄ залогувати WARNING (review P2: раніше цей шлях був повністю мовчазним) -- очікувано рівно 1 WARNING після першого виклику, отримано $emptyUrlWarningsAfterFirst"
+    Test-BRAVOCondition -Condition ($emptyUrlWarningsAfterSecond -eq 1) `
+        -Name 'Operations/EnabledWithEmptyApiBaseUrlWarningIsThrottledNotSpammed' `
+        -Failure "повторний виклик у межах throttle-вікна (типово 15 хв) НЕ повинен додавати ще один WARNING -- очікувано лишити лічильник=1, отримано $emptyUrlWarningsAfterSecond"
+
+    Remove-Variable -Name BRAVOOpsSelfTestApiBaseUrlWarnings -Scope Global -Force -ErrorAction SilentlyContinue
+
     # ---------------------------------------------------------------
     # Прибирання: зняти всі self-test overrides з function:-drive (той
     # самий клас cleanup, що Clear-BRAVOSelfTestOwnedRuntimeModules робить
