@@ -2648,7 +2648,7 @@ try {
             (-not $dnNestedFinalContent.Contains($dnNestedLeaf)) -and $dnNestedFinalContent.Contains($dnNestedSiblingPath)
         ) `
             'Configurator/DeniedNonCatalogNestedClearPreservesSibling' `
-            "Clear забороненого вкладеного $dnNestedPath мусить дозволити успішний Apply, контейнер розгортається у флет dot-шляхи, значення зникає, сусідній $dnNestedSiblingPath переживає; отримано Applied=$($dnNestedApply.Applied) Stage=$($dnNestedApply.Stage) Content=$dnNestedFinalContent"
+            "Clear забороненого вкладеного $dnNestedPath мусить дозволити успішний Apply, контейнер розгортається у флет dot-шляхи, значення зникає, сусідній $dnNestedSiblingPath переживає; отримано Applied=$($dnNestedApply.Applied) Stage=$($dnNestedApply.Stage) Content=$dnNestedFinalContent Reasons=$($dnNestedApply.Reasons -join ' | ')"
     } finally {
         Remove-Item -LiteralPath $dnNestedScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -3260,7 +3260,7 @@ try {
             WARNING = 'alerts'
         }
     }
-    Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r32Overrides -TopLevelKey 'bravoSettings.NotificationRouting'
+    Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r32Overrides -TopLevelKey 'bravoSettings.NotificationRouting' -SchemaCatalog $configuratorSchemaCatalog
     Test-BRAVOCondition (
         $r32Overrides.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
         [string]$r32Overrides['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
@@ -3283,7 +3283,7 @@ try {
     $r33Threw = $false
     $r33Message = $null
     try {
-        Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r33Overrides -TopLevelKey 'Some.Container'
+        Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r33Overrides -TopLevelKey 'Some.Container' -SchemaCatalog $configuratorSchemaCatalog
     } catch {
         $r33Threw = $true
         $r33Message = $_.Exception.Message
@@ -3338,6 +3338,151 @@ try {
              "продакшн-файл мусить лишитись побайтово незмінним; отримано Applied=$($r33ApplyResult.Applied) Stage=$($r33ApplyResult.Stage)")
     } finally {
         Remove-Item -LiteralPath $r33ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
+# PR #224 fourth review ("Preserve unknown nested leaf values while
+# flattening"): forward-compatible dictionary-значений (не порожній)
+# leaf, ще не описаний schema-каталогом, всередині легасі вкладеного
+# контейнера з ВІДОМИМ сусіднім leaf (SUCCESS) МУСИВ раніше рекурсивно
+# розгортатись у ЩЕ ГЛИБШИЙ dot-шлях (...FutureSettings.Enabled), який
+# canonical loader (ConvertTo-BRAVONestedOverride) fail-closed
+# відхиляв ПІЗНІШЕ, на Validation-стадії, з плутаючим повідомленням про
+# "невідомий ключ конфігурації" — хоча початковий (нерозгорнутий) файл
+# був повністю валідним. Фікс зупиняє розгортання РІВНО на межі
+# останнього відомого schema-предка (Merge-стадія, чітке повідомлення,
+# нульова мутація) — той самий контракт, що R3-3 вище для порожнього
+# вузла.
+# =====================================================================
+& {
+    # --- Flatten/UnknownDictionaryValuedLeafFailsClosed ---
+    # Точний приклад із review: SUCCESS — відомий schema-leaf, FutureSettings —
+    # ще НЕ описаний схемою leaf, чиє ЗНАЧЕННЯ саме по собі hashtable
+    # (не порожній — на відміну від R3-3 вище).
+    $r4Overrides = @{
+        'bravoSettings.NotificationRouting' = @{
+            SUCCESS        = 'general'
+            FutureSettings = @{ Enabled = $true }
+        }
+    }
+    $r4Threw = $false
+    $r4Message = $null
+    try {
+        Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $r4Overrides -TopLevelKey 'bravoSettings.NotificationRouting' -SchemaCatalog $configuratorSchemaCatalog
+    } catch {
+        $r4Threw = $true
+        $r4Message = $_.Exception.Message
+    }
+    Test-BRAVOCondition (
+        $r4Threw -and
+        $r4Message -match 'FutureSettings' -and
+        $r4Overrides.Contains('bravoSettings.NotificationRouting') -and
+        ($r4Overrides['bravoSettings.NotificationRouting'] -is [hashtable]) -and
+        [string]$r4Overrides['bravoSettings.NotificationRouting']['SUCCESS'] -eq 'general' -and
+        ($r4Overrides['bravoSettings.NotificationRouting']['FutureSettings'] -is [hashtable]) -and
+        [bool]$r4Overrides['bravoSettings.NotificationRouting']['FutureSettings']['Enabled'] -eq $true
+    ) `
+        'Flatten/UnknownDictionaryValuedLeafFailsClosed' `
+        ("forward-compatible dictionary-значення (FutureSettings), ще не описане каталогом, мусить fail-closed зупинити " +
+         "флеттенізацію ДО будь-якої мутації (той самий контракт, що R3-3), а не рекурсивно розгортатись у dot-шлях, " +
+         "який canonical loader відхилив би пізніше з менш зрозумілою діагностикою; отримано Threw=$r4Threw Message=$r4Message " +
+         "ContainerUnchanged=$($r4Overrides.Contains('bravoSettings.NotificationRouting'))")
+
+    # --- Apply/UnknownDictionaryValuedLeafFailsClosedAtMergeStage ---
+    # Повний Apply pipeline, той самий сценарій, що review навів
+    # буквально: Apply МУСИТЬ провалитись fail-closed на Merge-стадії
+    # (ЧІТКА Configurator-діагностика ДО будь-якої мутації), а НЕ падати
+    # на Validation-стадії з плутаючим повідомленням "невідомий ключ
+    # конфігурації" від зовсім іншого (canonical loader) шару вже ПІСЛЯ
+    # того, як контейнер синтетично розгорнуто.
+    $r4ApplyScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_UNKNOWNDICTLEAF_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($r4ApplyScenarioRoot)
+    try {
+        $r4ApplyConfigPath = Join-Path $r4ApplyScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $r4ApplyConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'SUCCESS' = 'general'`r`n" +
+                "        'FutureSettings' = @{ 'Enabled' = `$true }`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $r4ApplyBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4ApplyScenarioRoot
+        $r4ApplyModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $r4ApplyBaseline.Overrides
+        # Торкаємо той самий canonical leaf (SUCCESS), що вже supplied
+        # усередині контейнера — форсує флеттенізацію контейнера (той
+        # самий тригер, що R3-3/R3-2 вище).
+        $r4ApplyModelEdited = Set-BRAVOConfiguratorOverride -Model $r4ApplyModel -Path 'bravoSettings.NotificationRouting.SUCCESS' -Value 'alerts'
+        $r4ApplyPreBytes = [IO.File]::ReadAllBytes($r4ApplyConfigPath)
+        $r4ApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4ApplyScenarioRoot `
+            -Model $r4ApplyModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $r4ApplyBaseline
+        $r4ApplyPostBytes = [IO.File]::ReadAllBytes($r4ApplyConfigPath)
+        Test-BRAVOCondition (
+            (-not [bool]$r4ApplyResult.Applied) -and [string]$r4ApplyResult.Stage -eq 'Merge' -and
+            ([Convert]::ToBase64String($r4ApplyPreBytes) -eq [Convert]::ToBase64String($r4ApplyPostBytes))
+        ) `
+            'Apply/UnknownDictionaryValuedLeafFailsClosedAtMergeStage' `
+            ("Apply мусить провалитись fail-closed на Merge-стадії (не Validation) з чіткою Configurator-діагностикою, і " +
+             "продакшн-файл мусить лишитись побайтово незмінним; отримано Applied=$($r4ApplyResult.Applied) Stage=$($r4ApplyResult.Stage) " +
+             "Reasons=$($r4ApplyResult.Reasons -join '; ')")
+    } finally {
+        Remove-Item -LiteralPath $r4ApplyScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- Apply/NestedContainerFlattenRoundTripSurvivesReload ---
+    # Round-trip: легітимний сценарій (без forward-compat dictionary-
+    # значення — лише відомі schema-leaf-и всередині легасі контейнера,
+    # той самий клас, що R3-2 вище) МУСИТЬ і далі успішно Apply-итись, і
+    # ЩОЙНО ЗАПИСАНЕ значення мусить пережити ПОВТОРНЕ читання файлу
+    # (Reload) байт-в-байт тим самим — фікс НЕ мав зламати звичайний
+    # флеттенізаційний шлях.
+    $r4RoundTripScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_CONFIGURATOR_FLATTEN_ROUNDTRIP_APPLY_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($r4RoundTripScenarioRoot)
+    try {
+        $r4RoundTripConfigPath = Join-Path $r4RoundTripScenarioRoot 'BRAVO.local.config'
+        [IO.File]::WriteAllText(
+            $r4RoundTripConfigPath, (
+                "@{`r`n" +
+                "    'bravoSettings.NotificationRouting' = @{`r`n" +
+                "        'SUCCESS' = 'general'`r`n" +
+                "        'WARNING' = 'alerts'`r`n" +
+                "    }`r`n" +
+                "}`r`n"
+            ),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+        $r4RoundTripBaseline = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4RoundTripScenarioRoot
+        $r4RoundTripModel = Get-BRAVOConfiguratorModel -SchemaCatalog $configuratorSchemaCatalog -DefaultConfig $configuratorDefaultConfig -LocalOverrides $r4RoundTripBaseline.Overrides
+        $r4RoundTripModelEdited = Set-BRAVOConfiguratorOverride -Model $r4RoundTripModel -Path 'bravoSettings.NotificationRouting.SUCCESS' -Value 'alerts'
+        $r4RoundTripApplyResult = Invoke-BRAVOConfiguratorApply -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4RoundTripScenarioRoot `
+            -Model $r4RoundTripModelEdited -SchemaCatalog $configuratorSchemaCatalog -ProductionBaseline $r4RoundTripBaseline
+        # Reload — НЕЗАЛЕЖНЕ, ПОВТОРНЕ читання щойно записаного production
+        # файлу (не той самий $r4RoundTripBaseline-знімок).
+        $r4RoundTripReloaded = Get-BRAVOConfiguratorProductionOverrideState -RuntimeRoot $configuratorFixtureRuntimeRoot -ProductionConfigDirectory $r4RoundTripScenarioRoot
+        Test-BRAVOCondition (
+            [bool]$r4RoundTripApplyResult.Applied -and
+            $r4RoundTripReloaded.Present -and
+            $r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting.SUCCESS') -and
+            [string]$r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.SUCCESS'] -eq 'alerts' -and
+            $r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting.WARNING') -and
+            [string]$r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.WARNING'] -eq 'alerts' -and
+            (-not $r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting'))
+        ) `
+            'Apply/NestedContainerFlattenRoundTripSurvivesReload' `
+            ("легітимна флеттенізація (без forward-compat dictionary-значення) мусить і далі успішно Apply-итись, і щойно " +
+             "записане значення мусить пережити повторне читання (Reload) без втрати/спотворення; отримано " +
+             "Applied=$($r4RoundTripApplyResult.Applied) Present=$($r4RoundTripReloaded.Present) " +
+             "SUCCESS=$($r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.SUCCESS']) " +
+             "WARNING=$($r4RoundTripReloaded.Overrides['bravoSettings.NotificationRouting.WARNING']) " +
+             "ContainerStillPresent=$($r4RoundTripReloaded.Overrides.Contains('bravoSettings.NotificationRouting'))")
+    } finally {
+        Remove-Item -LiteralPath $r4RoundTripScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 

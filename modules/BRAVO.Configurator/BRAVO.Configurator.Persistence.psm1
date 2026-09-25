@@ -112,7 +112,7 @@ function Merge-BRAVOConfiguratorCandidateOverrides {
             if ($supplied.NestedPath.Count -eq 0) {
                 $merged.Remove($path)
             } else {
-                Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $supplied.TopLevelKey
+                Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $supplied.TopLevelKey -SchemaCatalog $SchemaCatalog
             }
         }
 

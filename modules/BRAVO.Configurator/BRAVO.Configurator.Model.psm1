@@ -353,18 +353,55 @@ function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
         -> Test-BRAVOConfiguratorCandidateOverrides -> Invoke-BRAVOConfiguratorApply)
         не продовжує до atomic replace після винятку тут, тож продакшн
         BRAVO.local.config лишається байт-в-байт незмінним.
+
+        PR #224 четверте review ("Preserve unknown nested leaf values
+        while flattening"): $SchemaCatalog визначає, ЯКІ dot-шляхи
+        всередині $root дійсно є ПРОМІЖНИМИ вузлами схеми (тобто
+        префіксом якогось відомого $descriptor.Path) — рекурсія
+        продовжується ЛИШЕ в них. Якщо hashtable-значення трапляється на
+        шляху, що НЕ є префіксом жодного відомого schema Path (forward-
+        compatible/ще не описаний каталогом dictionary-значений leaf,
+        напр. 'FutureSettings' поряд із відомим 'SUCCESS' в тому самому
+        легасі контейнері) — це, з погляду canonical серіалізатора, той
+        самий "hashtable-значення, яке неможливо записати", що й
+        порожній вузол вище: preflight fail-closed кидає виняток ДО
+        будь-якої мутації, замість мовчки рекурсивно розгортати його у
+        ЩЕ ГЛИБШИЙ dot-шлях, який canonical loader (не Configurator)
+        пізніше відхилив би на Validation-стадії з менш зрозумілою
+        діагностикою "невідомий ключ конфігурації" — хоча початковий
+        (нерозгорнутий) файл був повністю валідним forward-compatible
+        станом.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][hashtable]$Overrides,
-        [Parameter(Mandatory = $true)][string]$TopLevelKey
+        [Parameter(Mandatory = $true)][string]$TopLevelKey,
+        [Parameter(Mandatory = $true)][array]$SchemaCatalog
     )
 
     if (-not $Overrides.Contains($TopLevelKey)) { return }
     $root = $Overrides[$TopLevelKey]
     if ($root -isnot [hashtable]) { return }
 
+    # Схема-префікси: множина усіх власних предків кожного відомого
+    # $descriptor.Path (наприклад, для 'backupMonitoring.SFTP.BAZA.Mode'
+    # це 'backupMonitoring', 'backupMonitoring.SFTP',
+    # 'backupMonitoring.SFTP.BAZA') — САМ Path у цю множину НЕ входить,
+    # бо canonical leaf ніколи сам по собі не є вузлом, який ця функція
+    # рекурсивно розгортає (він або плоский leaf, або кінцева hashtable-
+    # representation, яку резолвить Resolve-BRAVOConfiguratorSuppliedLeafOverride
+    # вище по стеку викликів).
+    $schemaAncestorPrefixes = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($descriptor in $SchemaCatalog) {
+        $descriptorPath = [string]$descriptor.Path
+        $descriptorSegments = $descriptorPath -split '\.'
+        for ($i = 1; $i -lt $descriptorSegments.Count; $i++) {
+            [void]$schemaAncestorPrefixes.Add([string]::Join('.', @($descriptorSegments[0..($i - 1)])))
+        }
+    }
+
     $emptyDescendantPaths = New-Object System.Collections.Generic.List[string]
+    $unknownDictionaryLeafPaths = New-Object System.Collections.Generic.List[string]
     $preflightPending = New-Object System.Collections.Generic.List[object]
     [void]$preflightPending.Add([pscustomobject]@{ Prefix = $TopLevelKey; Node = $root })
     while ($preflightPending.Count -gt 0) {
@@ -378,8 +415,13 @@ function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
         foreach ($preflightKey in $preflightChildKeys) {
             $preflightChildValue = $preflightCurrent.Node[$preflightKey]
             if ($preflightChildValue -is [hashtable]) {
+                $preflightChildPath = "$($preflightCurrent.Prefix).$preflightKey"
+                if (-not $schemaAncestorPrefixes.Contains($preflightChildPath)) {
+                    [void]$unknownDictionaryLeafPaths.Add($preflightChildPath)
+                    continue
+                }
                 [void]$preflightPending.Add([pscustomobject]@{
-                    Prefix = "$($preflightCurrent.Prefix).$preflightKey"
+                    Prefix = $preflightChildPath
                     Node   = $preflightChildValue
                 })
             }
@@ -390,6 +432,14 @@ function Convert-BRAVOConfiguratorNestedContainerToFlatKeys {
             "порожній вкладений вузол без жодного leaf-нащадка виявлено на: $([string]::Join(', ', @($emptyDescendantPaths))). " +
             "Canonical серіалізатор не вміє записати hashtable-значення, тож цей вузол було б мовчки втрачено при флеттенізації; " +
             "операцію скасовано ДО будь-якої мутації — продакшн-файл лишається незмінним.")
+    }
+    if ($unknownDictionaryLeafPaths.Count -gt 0) {
+        throw ("BRAVO.Configurator: неможливо безпечно розгорнути вкладений контейнер '$TopLevelKey' у плоскі dot-шляхи — " +
+            "forward-compatible dictionary-значений leaf, ще не описаний schema-каталогом, виявлено на: " +
+            "$([string]::Join(', ', @($unknownDictionaryLeafPaths))). Canonical серіалізатор не вміє записати " +
+            "hashtable-значення, а подальше рекурсивне розгортання цього вузла у ще глибший dot-шлях canonical loader " +
+            "пізніше відхилив би як невідомий ключ конфігурації; операцію скасовано ДО будь-якої мутації — продакшн-файл " +
+            "лишається незмінним.")
     }
 
     $Overrides.Remove($TopLevelKey)
