@@ -47,6 +47,16 @@ $script:BRAVOConfiguratorModelDependencyRoot = Split-Path -Path $PSScriptRoot -P
 Import-Module -Name (Join-Path $script:BRAVOConfiguratorModelDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.psd1') -ErrorAction Stop -Scope Local
 Import-Module -Name (Join-Path $script:BRAVOConfiguratorModelDependencyRoot 'BRAVO.Configuration\BRAVO.Configuration.Schema.psd1') -ErrorAction Stop -Scope Local
 
+# Codex review PR #224 (P2, "Preserve typed values in synthesized recovery
+# rows") — Get-BRAVOConfiguratorRecoveryValueType нижче. Локальна копія
+# TypeCode-переліків (не той самий $script:-стан, що
+# BRAVO.Configuration.Schema.psm1 тримає для integer-range-валідації —
+# інший module scope, той самий .NET TypeCode-набір, суто UI-класифікація
+# "як редагувати значення", а не authorization-політика).
+$script:BRAVOConfiguratorRecoveryIntegerTypeCode = @('SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64')
+$script:BRAVOConfiguratorRecoveryFractionalTypeCode = @('Single', 'Double', 'Decimal')
+$script:BRAVOConfiguratorRecoveryNumericTypeCode = $script:BRAVOConfiguratorRecoveryIntegerTypeCode + $script:BRAVOConfiguratorRecoveryFractionalTypeCode
+
 function Resolve-BRAVOConfiguratorGatedEffective {
     <#
     .SYNOPSIS
@@ -639,6 +649,64 @@ function ConvertTo-BRAVOConfiguratorOverrideHashtable {
     return $overrides
 }
 
+function Get-BRAVOConfiguratorRecoveryValueType {
+    <#
+    .SYNOPSIS
+        Codex review PR #224 (P2, "Preserve typed values in synthesized
+        recovery rows"): визначає Configurator-дескрипторний Type
+        ('Boolean'/'Integer'/'Number'/'StringArray'/'NumberArray'/'String')
+        із фактичного .NET-типу supplied-значення для синтезованого
+        recovery-дескриптора в Get-BRAVOConfiguratorSessionSchemaCatalog.
+    .DESCRIPTION
+        Приватний helper — не публічний контракт, використовується лише
+        цим модулем. Раніше Type для КОЖНОГО recovery-рядка був
+        захардкожений 'String' незалежно від реального типу значення
+        (напр. escapable requireAdministrator=$false — Boolean). UI-шар
+        (BRAVO.Configurator.UI.psm1) використовує $Setting.Metadata.Type
+        для ДВОХ речей: як рендерити редактор (TextBox для 'String', але
+        ComboBox Так/Ні для 'Boolean') і як парсити текст редактора назад
+        у типізоване значення (ConvertTo-BRAVOConfiguratorUITypedValue).
+        Для ReadOnly-рядків редактор завжди disabled, але checkbox і далі
+        можна зняти й повернути — рецикл через невірний 'String' відправляв
+        рядкове представлення ('False') замість оригінального Boolean, і
+        наступний Apply відхилявся schema-валідацією (тип override
+        відрізнявся від canonical типу листа).
+        Не намагається відрізнити Integer/Number за точністю величини —
+        будь-яке ціле число (типовий-код SByte..UInt64) мапиться в
+        'Integer', будь-яке дробове (Single/Double/Decimal) — у 'Number';
+        обидва раунд-тріпляться через той самий шлях, що звичайні
+        Integer/Number-дескриптори (ConvertTo-BRAVOConfiguratorUITypedValue
+        парсить обидва як [double]/[int] відповідно — сама Apply-валідація
+        (Schema.psm1) — єдине джерело істини для того, чи конкретне число
+        прийнятне для конкретного canonical листа).
+    .OUTPUTS
+        [string]
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()][AllowEmptyCollection()]$Value
+    )
+
+    if ($null -eq $Value) { return 'String' }
+    if ($Value -is [bool]) { return 'Boolean' }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = @($Value)
+        if ($items.Count -eq 0) { return 'StringArray' }
+        $allNumeric = $true
+        foreach ($item in $items) {
+            if ($null -eq $item -or $item -is [bool]) { $allNumeric = $false; break }
+            $itemTypeCode = [string][System.Type]::GetTypeCode($item.GetType())
+            if ($script:BRAVOConfiguratorRecoveryNumericTypeCode -notcontains $itemTypeCode) { $allNumeric = $false; break }
+        }
+        return $(if ($allNumeric) { 'NumberArray' } else { 'StringArray' })
+    }
+    $typeCode = [string][System.Type]::GetTypeCode($Value.GetType())
+    if ($script:BRAVOConfiguratorRecoveryIntegerTypeCode -contains $typeCode) { return 'Integer' }
+    if ($script:BRAVOConfiguratorRecoveryFractionalTypeCode -contains $typeCode) { return 'Number' }
+    return 'String'
+}
+
 function Get-BRAVOConfiguratorSessionSchemaCatalog {
     <#
     .SYNOPSIS
@@ -815,6 +883,26 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
         $violation = @($violatingViolation)
         $reason = [string]$violatingViolation.Reason
 
+        # Codex review PR #224 (P2, "Preserve typed values in synthesized
+        # recovery rows"): Type МУСИТЬ відповідати фактичному .NET-типу
+        # значення, яке Get-BRAVOConfiguratorModel реально покладе в
+        # $Setting.OverrideValue для ЦЬОГО descriptor.Path — а це завжди
+        # (для будь-якого дескриптора, у т.ч. синтезованого тут) саме
+        # Resolve-BRAVOConfiguratorSuppliedLeafOverride.Value (той самий
+        # canonical "єдине preferred representation"-резолвер, викликаний
+        # там ЩЕ РАЗ із тими самими $LocalOverrides/$path — не другий
+        # незалежний вибір representation). Раніше Type завжди був
+        # захардкожений 'String': UI показує значення в disabled TextBox
+        # через ConvertTo-BRAVOConfiguratorUIDisplayText -Type 'String' —
+        # для Boolean/Number-значень ($false) це саме по собі лише
+        # косметика — але uncheck+recheck ReadOnly-чекбоксу читає той
+        # самий TextBox назад через ConvertTo-BRAVOConfiguratorUITypedValue
+        # -Type 'String', що повертає СИРИЙ РЯДОК ('False') замість
+        # оригінального типу — наступний Apply відхиляв candidate
+        # schema-валідацією, бо тип override змінився з Boolean на String.
+        $recoverySuppliedLeaf = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $LocalOverrides -LeafPath $path
+        $recoveryType = Get-BRAVOConfiguratorRecoveryValueType -Value $recoverySuppliedLeaf.Value
+
         $recoveryOrder++
         if ($reason -eq 'ValidatorRejected') {
             $section = 'ValidatorRejected'
@@ -858,7 +946,7 @@ function Get-BRAVOConfiguratorSessionSchemaCatalog {
             Section     = $section
             Label       = $label
             Description = $description
-            Type        = 'String'
+            Type        = $recoveryType
             Phase       = 1
             Advanced    = $true
             ReadOnly    = $true

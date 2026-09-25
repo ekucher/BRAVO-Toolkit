@@ -2712,6 +2712,44 @@ try {
         [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $dnEscOriginalEnv)
     }
 
+    # ===== Codex review PR #224 (P2, "Preserve typed values in synthesized
+    # recovery rows"): синтезований recovery-дескриптор МУСИТЬ мати Type,
+    # що відповідає РЕАЛЬНОМУ .NET-типу supplied-значення — раніше Type
+    # був захардкожений 'String' для КОЖНОГО recovery-рядка незалежно від
+    # значення, тож escapable requireAdministrator=$false (Boolean)
+    # синтезувався з Type='String'; після round-trip через checkbox
+    # uncheck+recheck (UI серіалізує через TextBox-текст для 'String')
+    # override перетворювався на рядок 'False' замість Boolean $false, і
+    # наступний Apply відхилявся schema-валідацією (canonical лист
+    # requireAdministrator очікує Boolean, не String). =====
+    $tpOriginalEnv = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
+    try {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', '1')
+        $tpBoolCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'requireAdministrator' = $false }
+        $tpBoolRow = @($tpBoolCatalog | Where-Object { $_.Path -eq 'requireAdministrator' })
+
+        # --- Configurator/RecoveryRowPreservesBooleanType ---
+        Test-BRAVOCondition (
+            $tpBoolRow.Count -eq 1 -and [string]$tpBoolRow[0].Type -eq 'Boolean'
+        ) `
+            'Configurator/RecoveryRowPreservesBooleanType' `
+            "синтезований recovery-рядок для requireAdministrator=`$false (escapable, Boolean) мусить отримати Type='Boolean', а не захардкоджений 'String'; отримано Count=$($tpBoolRow.Count) Type=$($(if ($tpBoolRow.Count) { $tpBoolRow[0].Type } else { 'N/A' }))"
+    } finally {
+        [System.Environment]::SetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY', $tpOriginalEnv)
+    }
+
+    # --- Configurator/RecoveryRowPreservesStringTypeForNonBooleanValidatorRejected ---
+    # Негативний контроль: типовий ValidatorRejected-легасі override
+    # (рядкове enum-значення) і далі мусить синтезуватись із Type='String'
+    # — фікс не мав змінити поведінку для звичайного рядкового випадку.
+    $tpStringCatalog = Get-BRAVOConfiguratorSessionSchemaCatalog -StaticCatalog $dnRawCatalog -LocalOverrides @{ 'schedulerSettings.RestoreVerify.WeeklyOn' = 'Funday' }
+    $tpStringRow = @($tpStringCatalog | Where-Object { $_.Path -eq 'schedulerSettings.RestoreVerify.WeeklyOn' })
+    Test-BRAVOCondition (
+        $tpStringRow.Count -eq 1 -and [string]$tpStringRow[0].Type -eq 'String'
+    ) `
+        'Configurator/RecoveryRowPreservesStringTypeForNonBooleanValidatorRejected' `
+        "синтезований recovery-рядок для рядкового ValidatorRejected-значення (WeeklyOn='Funday') мусить лишитись Type='String'; отримано Count=$($tpStringRow.Count) Type=$($(if ($tpStringRow.Count) { $tpStringRow[0].Type } else { 'N/A' }))"
+
     # ===== Data-driven повнота: КОЖЕН non-catalog DENY_*-шлях отримує recovery-рядок =====
     # Намірено НЕ хардкодить перелік 42 шляхів — множина похідна напряму
     # з $dnAuthClass (canonical реєстр) мінус $dnRawCatalog (статичний
