@@ -435,6 +435,14 @@ $knownIntentionalDiffPrefixes = @(
     # властивість комплекту, і значення детерміноване доти, доки фікстура
     # патчить ті самі два рядки — а цього вимагає throw у самій функції.
     'BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults',
+    # Адитивне діагностичне поле (Issue #216, Wave B): PR B (база 42cf9ad)
+    # взагалі не блокував auto-detect застарілого BRAVO.config, тож поля
+    # не існувало (BEFORE=<null>). AFTER додає його як провенанс-маркер
+    # "чи саме auto-detect заблокував ефективну присутність primary-файлу"
+    # — той самий клас, що PrimaryConfigPresentOnDisk поруч у
+    # BRAVO_CONFIG_LOADER.ps1: описує ДЖЕРЕЛО/провенанс рішення, а не
+    # ефективне значення конфігурації.
+    'BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked',
     'BravoConfigurationMetadata.LocalConfigPath',
     'BravoConfigurationMetadata.LocalConfigPresent',
     'BravoConfigurationMetadata.Mode',
