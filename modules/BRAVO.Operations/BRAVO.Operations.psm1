@@ -119,7 +119,7 @@ function Write-BRAVOOperationsAtomicJsonFile {
     $wasReplaced = $false
     try {
         $json = $Object | ConvertTo-Json -Depth 8
-        [IO.File]::WriteAllText($temporaryPath, $json, [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($temporaryPath, $json, (New-Object Text.UTF8Encoding($false)))
         if ([IO.File]::Exists($Path)) {
             [IO.File]::Replace($temporaryPath, $Path, $backupPath)
             $wasReplaced = $true
@@ -155,7 +155,7 @@ function Get-BRAVOOperationsServerId {
     $statePath = Get-BRAVOOperationsServerIdStatePath
     if ([IO.File]::Exists($statePath)) {
         try {
-            $existing = ([IO.File]::ReadAllText($statePath, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -ErrorAction Stop)
+            $existing = ([IO.File]::ReadAllText($statePath, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json -ErrorAction Stop)
             $existingId = [string]$existing.ServerId
             $parsedGuid = [guid]::Empty
             if ([guid]::TryParse($existingId, [ref]$parsedGuid)) {
@@ -205,16 +205,18 @@ function Get-BRAVOOperationsEnrollmentState {
             LastTtlExpiredLoggedAtUtc = $null
             LastFinalizedLoggedAtUtc = $null
             LastNotConfiguredLoggedAtUtc = $null
+            LastApiBaseUrlMissingLoggedAtUtc = $null
         }
     }
     try {
-        $raw = ([IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -ErrorAction Stop)
+        $raw = ([IO.File]::ReadAllText($path, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json -ErrorAction Stop)
         return [pscustomobject]@{
             Claim = if ($null -ne $raw.Claim) { [string]$raw.Claim } else { $null }
             LastNotReadyLoggedAtUtc = if ($null -ne $raw.LastNotReadyLoggedAtUtc) { [string]$raw.LastNotReadyLoggedAtUtc } else { $null }
             LastTtlExpiredLoggedAtUtc = if ($null -ne $raw.LastTtlExpiredLoggedAtUtc) { [string]$raw.LastTtlExpiredLoggedAtUtc } else { $null }
             LastFinalizedLoggedAtUtc = if ($null -ne $raw.LastFinalizedLoggedAtUtc) { [string]$raw.LastFinalizedLoggedAtUtc } else { $null }
             LastNotConfiguredLoggedAtUtc = if ($null -ne $raw.LastNotConfiguredLoggedAtUtc) { [string]$raw.LastNotConfiguredLoggedAtUtc } else { $null }
+            LastApiBaseUrlMissingLoggedAtUtc = if ($null -ne $raw.LastApiBaseUrlMissingLoggedAtUtc) { [string]$raw.LastApiBaseUrlMissingLoggedAtUtc } else { $null }
         }
     } catch {
         return [pscustomobject]@{
@@ -223,8 +225,71 @@ function Get-BRAVOOperationsEnrollmentState {
             LastTtlExpiredLoggedAtUtc = $null
             LastFinalizedLoggedAtUtc = $null
             LastNotConfiguredLoggedAtUtc = $null
+            LastApiBaseUrlMissingLoggedAtUtc = $null
         }
     }
+}
+
+function Enter-BRAVOOperationsEnrollmentClaimLock {
+    # Cross-process серіалізація першостворення claim (review P1): Get-
+    # BRAVOOperationsEnrollmentClaim нижче — read-then-write (прочитати
+    # стан, якщо Claim відсутній — згенерувати й записати). Write-
+    # BRAVOOperationsAtomicJsonFile сам по собі атомарний (temp+rename),
+    # але це захищає лише ЦІЛІСНІСТЬ ОДНОГО запису, не CAS між двома
+    # одночасними першими прогонами (Maintenance/Health/Archive/heartbeat
+    # можуть стартувати одночасно за розкладом): обидва можуть прочитати
+    # ВІДСУТНІЙ claim, згенерувати РІЗНІ GUID і атомарно перезаписати той
+    # самий файл — переможець запису лишає claim, якого процес-програвець
+    # ніколи не побачив (він уже тримає СВІЙ GUID у пам'яті й надішле
+    # ЙОГО в POST /enroll). Сервер зв'яже serverId із claim переможця
+    # запису файлу; кожен наступний прогін програвця (з тим самим,
+    # застарілим claim, доки файл знову не прочитають) отримає постійний
+    # 409 claim_mismatch.
+    #
+    # Named Mutex (той самий канонічний підхід, що
+    # Enter-BRAVOPilotInstallRootLock у deploy/BRAVOConfigV2Pilot.Runtime.ps1):
+    # crash-safe за конструкцією ОС — впалий власник без Release не лишає
+    # постійного замка (AbandonedMutexException -> лок і так наш).
+    # Global\-простір імен: BRAVO-процеси (Scheduled Task під SYSTEM чи
+    # сервісним акаунтом чи heartbeat-сесія оператора) можуть виконуватись
+    # у різних сесіях; без Global\ інша сесія не побачила б цей mutex.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$TimeoutSeconds = 10
+    )
+
+    $normalizedPath = ([IO.Path]::GetFullPath($Path)).TrimEnd('\', '/').ToLowerInvariant()
+    $hashBytes = [Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes($normalizedPath))
+    $hashHex = -join ($hashBytes | ForEach-Object { $_.ToString('x2') })
+    $mutexName = "Global\BRAVOOperationsEnrollmentClaim-$hashHex"
+
+    $mutex = New-Object Threading.Mutex($false, $mutexName)
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($TimeoutSeconds))
+    } catch [Threading.AbandonedMutexException] {
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        return $null
+    }
+    return $mutex
+}
+
+function Exit-BRAVOOperationsEnrollmentClaimLock {
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][Threading.Mutex]$Mutex)
+    try {
+        $Mutex.ReleaseMutex()
+    } catch {
+        # best effort: Dispose() нижче виконується безумовно й звільняє
+        # kernel-об'єкт навіть якщо ReleaseMutex кинув (напр. виклик з
+        # потоку, що не тримав mutex, чого тут статично не буває, але
+        # немає сенсу переривати finally-подібний cleanup через це).
+    }
+    $Mutex.Dispose()
 }
 
 function Get-BRAVOOperationsEnrollmentClaim {
@@ -253,15 +318,41 @@ function Get-BRAVOOperationsEnrollmentClaim {
         return $state.Claim
     }
 
-    $newClaim = [guid]::NewGuid().ToString()
-    $state.Claim = $newClaim
-    try {
-        Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsEnrollmentStatePath) -Object $state
-    } catch {
+    # Claim відсутній — критична секція генерації+запису серіалізується
+    # cross-process mutex-ом (Enter-BRAVOOperationsEnrollmentClaimLock
+    # вище), щоб два одночасні "першостворення" не породили два різні
+    # GUID для того самого serverId.
+    $lockMutex = Enter-BRAVOOperationsEnrollmentClaimLock -Path (Get-BRAVOOperationsEnrollmentStatePath)
+    if ($null -eq $lockMutex) {
+        # Лок не отримано за таймаут — той самий never-throw fallback, що
+        # й раніше для збою диска: claim генерується лише для ПАМ'ЯТІ
+        # цього прогону, без запису (щоб точно не перезаписати те, що
+        # власник локу саме зараз пише).
         Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-            -Message "Не вдалося зберегти новостворений enrollment-claim на диск: $($_.Exception.Message) — цей прогін використає його лише в памʼяті; якщо диск лишиться недоступним, наступний прогін згенерує ІНШИЙ claim, що дасть 409 claim_mismatch, якщо серверId уже pending на API"
+            -Message 'Не вдалося отримати cross-process лок для першостворення enrollment-claim (інший процес BRAVO, ймовірно, робить це паралельно) — цей прогін використає claim лише в памʼяті, без запису на диск'
+        return [guid]::NewGuid().ToString()
     }
-    return $newClaim
+    try {
+        # Double-checked locking: поки чекали на mutex, інший процес міг
+        # уже прочитати відсутній claim, згенерувати й записати СВІЙ —
+        # перечитуємо стан ПІСЛЯ отримання локу, щоб не створити другий,
+        # зайвий GUID і не перезаписати вже узгоджений з сервером claim.
+        $state = Get-BRAVOOperationsEnrollmentState
+        if (-not [string]::IsNullOrWhiteSpace($state.Claim)) {
+            return $state.Claim
+        }
+        $newClaim = [guid]::NewGuid().ToString()
+        $state.Claim = $newClaim
+        try {
+            Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsEnrollmentStatePath) -Object $state
+        } catch {
+            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                -Message "Не вдалося зберегти новостворений enrollment-claim на диск: $($_.Exception.Message) — цей прогін використає його лише в памʼяті; якщо диск лишиться недоступним, наступний прогін згенерує ІНШИЙ claim, що дасть 409 claim_mismatch, якщо серверId уже pending на API"
+        }
+        return $newClaim
+    } finally {
+        Exit-BRAVOOperationsEnrollmentClaimLock -Mutex $lockMutex
+    }
 }
 
 function Set-BRAVOOperationsEnrollmentState {
@@ -535,6 +626,9 @@ function Invoke-BRAVOOperationsEnrollment {
     #     готово", локальний pending-стан зберігається, лог throttled.
     #   - approved-відповідь БЕЗ apiKey означає TTL (5 хв) вичерпано —
     #     потрібне ручне admin reissue, агент сам це не вирішує.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingConvertToSecureStringWithPlainText', '',
+        Justification = 'API-ключ приходить у JSON-тілі approve-відповіді Operations-бекенду (мережа за визначенням передає його як plaintext); SecureString тут — формат негайного зберігання в Credential Manager через Set-BRAVOCredential, а не джерело секрету. Змінна очищається у finally одразу після запису.')]
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][hashtable]$OperationsReportingSettings,
@@ -557,6 +651,21 @@ function Invoke-BRAVOOperationsEnrollment {
 
     $apiBaseUrl = [string]$OperationsReportingSettings.ApiBaseUrl
     if ([string]::IsNullOrWhiteSpace($apiBaseUrl)) {
+        # Fail-closed ДІАГНОСТИКА (review P2): Enabled=true, але ApiBaseUrl
+        # порожній — це помилка конфігурації оператора, а не транзиєнтний
+        # pending/мережевий стан. Раніше цей return був повністю мовчазним
+        # (без жодного логу) — кожна подія/heartbeat просто зникала, і
+        # оператор не мав жодного сигналу, чому dashboard нічого не бачить.
+        # Throttled WARNING (той самий шаблон, що LastNotConfiguredLoggedAtUtc
+        # нижче) — видимий, але не спамить лог на кожному Archive/Health/
+        # Maintenance-прогоні.
+        $apiBaseUrlMissingState = Get-BRAVOOperationsEnrollmentState
+        if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $apiBaseUrlMissingState.LastApiBaseUrlMissingLoggedAtUtc) {
+            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                -Message 'operationsReportingSettings.Enabled=true, але ApiBaseUrl порожній — Operations-звітність не працюватиме, доки оператор не вкаже коректний HTTPS-URL бекенду в конфігурації'
+            $apiBaseUrlMissingState.LastApiBaseUrlMissingLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            Set-BRAVOOperationsEnrollmentState -State $apiBaseUrlMissingState
+        }
         return $null
     }
 
@@ -925,7 +1034,7 @@ function Get-BRAVOOperationsOutboxItems {
     }
     foreach ($file in @(Get-ChildItem -LiteralPath $directory -Filter '*.json' -File -ErrorAction SilentlyContinue)) {
         try {
-            $parsed = ([IO.File]::ReadAllText($file.FullName, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json -ErrorAction Stop)
+            $parsed = ([IO.File]::ReadAllText($file.FullName, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json -ErrorAction Stop)
             $parsed | Add-Member -MemberType NoteProperty -Name '__Path' -Value $file.FullName -Force
             [void]$items.Add($parsed)
         } catch {
@@ -1119,9 +1228,29 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 continue
             }
 
-            $requestBodyHashtable = @{}
-            foreach ($property in $item.RequestBody.PSObject.Properties) {
-                $requestBodyHashtable[$property.Name] = $property.Value
+            # Isolate-per-item (review P2): якщо item — валідний JSON, але
+            # RequestBody відсутнє/не об'єкт (схемна зміна, ручне
+            # відновлення, локальна пошкодженість) — PSObject.Properties
+            # на $null/не-об'єкті кидає виняток. Раніше він летів у
+            # ЗОВНІШНІЙ try функції (нижче), зупиняючи дренаж ЦІЛКОМ:
+            # жодного remove/dead-letter для цього item, тож він лишався б
+            # першим у FIFO-черзі і "отруював" би обробку ВСІХ наступних
+            # items на КОЖНОМУ наступному прогоні. Тепер такий item сам
+            # dead-letter-иться і drain продовжує решту.
+            $requestBodyHashtable = $null
+            try {
+                $requestBodyHashtable = @{}
+                if ($null -eq $item.RequestBody -or $item.RequestBody -isnot [PSCustomObject]) {
+                    throw "RequestBody відсутнє або має неочікуваний тип: $(if ($null -eq $item.RequestBody) { '<null>' } else { $item.RequestBody.GetType().FullName })"
+                }
+                foreach ($property in $item.RequestBody.PSObject.Properties) {
+                    $requestBodyHashtable[$property.Name] = $property.Value
+                }
+            } catch {
+                Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "Пошкоджений outbox item (невалідне RequestBody) при дренажі: $($_.Exception.Message)"
+                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                    -Message "Пошкоджений outbox item (eventId=$([string]$item.EventId)) переміщено в dead-letter при дренажі — решта черги обробляється далі"
+                continue
             }
 
             try {
