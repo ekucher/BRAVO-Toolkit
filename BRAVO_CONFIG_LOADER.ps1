@@ -1291,6 +1291,32 @@ function Import-BravoConfiguration {
         # значення шляху.
         [switch]$ConfigPathWasExplicit,
 
+        # Issue #216 (P0 Config V2 cutover, Wave B): вимикає АВТОМАТИЧНЕ
+        # підхоплення BRAVO.config, знайденого лише тому, що він фізично
+        # лежить за auto-derived шляхом (ConfigRoot\BRAVO.config), коли
+        # ОПЕРАТОР ЙОГО НЕ ЗАПИТУВАВ (-ConfigPathWasExplicit не задано).
+        # Явний -ConfigPath лишається авторитетним наміром і НЕ блокується
+        # цим прапорцем — див. коментар нижче біля обчислення
+        # $legacyPrimaryAutoDetectBlocked.
+        #
+        # ЧОМУ ОПЦІЙНИЙ ПРАПОРЕЦЬ, А НЕ НОВИЙ ДЕФОЛТ ДЛЯ ВСІХ ВИКЛИКАЧІВ.
+        # Import-BravoConfiguration має ~14 прямих викликачів: 4 канонічні
+        # production runtime-entrypoint-и (Archive/Health/Maintenance/
+        # DataRestore через відповідні *.Runtime.ps1), BRAVO_SETUP.ps1,
+        # BRAVO_CREDENTIALS_SETUP.ps1, BRAVO_CONFIG_TEST.ps1 — і окремо
+        # migration/deploy-інструментарій (BRAVO_CONFIG_INTEGRATE.ps1,
+        # deploy\Update-BRAVOServer.ps1, BRAVO_TASKS_*, BRAVO_RESTORE_TEST.ps1,
+        # BRAVO_NOTIFICATION_TEST.ps1, BRAVO_DRY_RUN.ps1,
+        # BRAVO_BAZA_RECONCILE.ps1), для яких auto-detect легасі-primary —
+        # навмисна, задокументована поведінка (site BRAVO.config — легітимний
+        # 5.2-стан, який ці скрипти читають/мігрують/копіюють). Зміна
+        # дефолту для ВСІХ викликачів одночасно означала б непровалідовану
+        # зміну поведінки поза межами 7 production-entrypoint-ів, названих
+        # у Definition of Done issue #216. Тому прапорець — явний opt-in,
+        # який передають лише ті 7 production-entrypoint-ів; решта
+        # викликачів лишається на попередній перевіреній поведінці.
+        [switch]$DisallowLegacyPrimaryAutoDetect,
+
         [switch]$PassThru
     )
 
@@ -1315,7 +1341,36 @@ function Import-BravoConfiguration {
     }
 
     $resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
-    $legacyConfigFileExists = Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf
+    $legacyConfigFileExistsOnDisk = Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf
+
+    # Issue #216 (Wave B): "STOPPED does not mean owned" — тут еквівалент:
+    # "файл присутній не означає, що його треба виконати". Блокуємо лише
+    # AUTO-DERIVED, неявний випадок (оператор нічого не запитував); явний
+    # -ConfigPath завжди лишається авторитетним наміром і НІКОЛИ не
+    # блокується — так само, як явний -ConfigPath завжди вимагав існування
+    # файлу до цієї зміни.
+    $legacyPrimaryAutoDetectBlocked = [bool]$DisallowLegacyPrimaryAutoDetect -and
+        $legacyConfigFileExistsOnDisk -and
+        -not $configPathWasExplicit
+
+    # Далі за функцією $legacyConfigFileExists — єдине джерело істини про
+    # те, чи діє legacy-primary шар. Коли блоковано, він трактується як
+    # "відсутній": Complete-BRAVOConfigurationLoad піде тим самим
+    # синтетичним (BuiltInOnly/BuiltIn+Local) шляхом, яким і так вже йде
+    # свіжий сервер без BRAVO.config — тут нема нового коду виконання
+    # конфігурації, лише блокування auto-detect гілки.
+    $legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked
+
+    if ($legacyPrimaryAutoDetectBlocked) {
+        Write-Warning (
+            "BRAVO.config знайдено за auto-derived шляхом '$resolvedConfigPath', але цей production-" +
+            'entrypoint не виконує його автоматично (issue #216, Wave B): файл не був явно запитаний ' +
+            '(-ConfigPath). Діють канонічні built-in дефолти + BRAVO.local.config. Якщо цей BRAVO.config ' +
+            'дійсно потрібен (legacy 5.2-сервер, ще не мігрований), запустіть цей самий скрипт із явним ' +
+            "-ConfigPath '$resolvedConfigPath', або скористайтесь migration-інструментарієм " +
+            '(BRAVO_CONFIG_INTEGRATE.ps1 / deploy\\Get-BRAVOConfigSiteDelta.ps1).'
+        )
+    }
 
     if ($configPathWasExplicit -or $legacyConfigFileExists) {
         # Явний -ConfigPath завжди мусить існувати (свідомий намір
@@ -1650,6 +1705,14 @@ function Import-BravoConfiguration {
         PrimaryConfigPath = $resolvedConfigPath
         PrimaryConfigPresent = $legacyConfigFileExists
         PrimaryConfigWasExplicit = $configPathWasExplicit
+        # Issue #216 (Wave B): діагностика для операторів/CONFIG_TEST.
+        # PrimaryConfigPresent вище — це ЕФЕКТИВНА присутність (після
+        # блокування auto-detect); ці два поля показують СИРИЙ факт "файл
+        # фізично лежить на диску" і "чи саме тому його проігноровано" —
+        # без них зникнення файлу з ефективної конфігурації виглядало б як
+        # "файлу взагалі нема", хоча він є, просто проігнорований навмисно.
+        PrimaryConfigPresentOnDisk = $legacyConfigFileExistsOnDisk
+        PrimaryConfigAutoDetectBlocked = $legacyPrimaryAutoDetectBlocked
         LocalConfigPath = if ($null -ne $localOverrideState) { [string]$localOverrideState.Path } else { $null }
         LocalConfigPresent = ($null -ne $localOverrideState)
         # Ключі з BRAVO.local.config, реально застосовані цим завантаженням

@@ -176,6 +176,63 @@ try {
     Pop-Location
 }
 
+# --- 3a. Гейт issue #216 (Wave B): жоден production entrypoint у          --
+#     staged-комплекті не сміє автоматично виконувати довільний            --
+#     BRAVO.config, підкладений поруч --------------------------------------
+#
+# ПОВНЕ прибирання BRAVO.config з комплекту (issue #154, крок B4-2)
+# навмисно заблоковане в репозиторії — воно вимагало б ОДНОЧАСНО
+# переписати ~20 фікстур і три незалежні системи, що досі покладаються на
+# фізичну присутність файлу: deploy\Install-BRAVOServer.ps1 (required-file
+# перевірка), ci\Test-BRAVOConfigFoundationParity.ps1 (BEFORE/AFTER
+# fixture) і BRAVO_SELF_TEST.ConfigLoader.ps1
+# (ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults) — див.
+# коментар Get-BRAVOSelfTestLegacyConfigPath у BRAVO_SELF_TEST.ps1. Робити
+# це наосліп у Wave B цієї задачі означало б непровалідовану зміну поза
+# межами production-entrypoint execution-контракту, який ця хвиля
+# закриває.
+#
+# Той факт, що committed BRAVO.config ніколи не відхиляється від
+# built-in-дефолтів, уже доведено окремим self-test
+# (CommittedBravoConfigMatchesCanonicalDefaults, виконується в
+# release-artifact workflow одразу після цього скрипта на тому самому
+# staging-каталозі) — тому реальний залишковий ризик тут не "файл
+# присутній", а "виконавчий контракт: чи МІГ би production entrypoint
+# автоматично підхопити ІНШИЙ (підмінений) BRAVO.config без явного
+# наміру оператора". Це і є гейт нижче: детерміністична текстова
+# перевірка, що кожен production entrypoint staged-комплекту передає
+# -DisallowLegacyPrimaryAutoDetect у виклик Import-BravoConfiguration
+# (BRAVO_CONFIG_LOADER.ps1) — так само, як RUNTIME_MANIFEST/TOOLS_MANIFEST
+# гейти вище, provalidовано на РЕАЛЬНОМУ staged-вмісті, не на джерелі.
+
+$productionEntryPointGuardTargets = @(
+    'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1',
+    'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
+    'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1',
+    'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1',
+    'BRAVO_SETUP.ps1',
+    'BRAVO_CREDENTIALS_SETUP.ps1',
+    'BRAVO_CONFIG_TEST.ps1'
+)
+$legacyConfigAutoExecGuardMissing = New-Object System.Collections.Generic.List[string]
+foreach ($relativeGuardTarget in $productionEntryPointGuardTargets) {
+    $guardTargetPath = Join-Path $stagingDir $relativeGuardTarget
+    if (-not (Test-Path -LiteralPath $guardTargetPath -PathType Leaf)) {
+        throw "Гейт LEGACY_CONFIG_AUTOEXEC (issue #216): production entrypoint '$relativeGuardTarget' відсутній у staged-комплекті."
+    }
+    $guardTargetText = Get-Content -LiteralPath $guardTargetPath -Raw -Encoding UTF8
+    if ($guardTargetText -notmatch '(?s)Import-BravoConfiguration.{0,400}?-DisallowLegacyPrimaryAutoDetect') {
+        [void]$legacyConfigAutoExecGuardMissing.Add($relativeGuardTarget)
+    }
+}
+if ($legacyConfigAutoExecGuardMissing.Count -gt 0) {
+    throw ('LEGACY_CONFIG_AUTOEXEC (issue #216): у staged-комплекті ' + $legacyConfigAutoExecGuardMissing.Count +
+        ' production entrypoint(и) викликають Import-BravoConfiguration БЕЗ -DisallowLegacyPrimaryAutoDetect ' +
+        '— довільний BRAVO.config, підкладений поруч без наміру оператора, знову виконувався б автоматично: ' +
+        ([string]::Join(', ', $legacyConfigAutoExecGuardMissing.ToArray())))
+}
+Write-Host ("Гейт LEGACY_CONFIG_AUTOEXEC (issue #216): усі {0} production entrypoint(и) staged-комплекту блокують auto-detect BRAVO.config." -f $productionEntryPointGuardTargets.Count)
+
 # --- 4. release-manifest.json + SHA-256 ---------------------------------
 
 $fileEntries = New-Object System.Collections.Generic.List[object]
