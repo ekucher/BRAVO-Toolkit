@@ -803,6 +803,35 @@
         } finally {
             Remove-Item -LiteralPath $deltaMarkerScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
+
+        # --- Delta/SecurityWeakeningOverrideSurfacedNotSuppressed ---
+        # Issue #216 (Agent D, міграційний шлях 5.2 -> 5.3): дельта-інструмент
+        # НЕ дублює й НЕ обходить перевірку безпеки — 'DENY'-класифіковане
+        # значення (напр. backupConsistency.Mode='Direct', замість канонічного
+        # 'VSS') має з'явитись у виводі дельти як звичайний Changed-рядок
+        # (оператор його ПОБАЧИТЬ перед перенесенням), а НЕ бути мовчки
+        # відфільтрованим чи проігнорованим на цьому кроці. Канонічний
+        # fail-closed gate, що не дає такому значенню стати ЕФЕКТИВНИМ без
+        # свідомого BRAVO_ALLOW_WEAKENED_SECURITY=1, — це
+        # Test-BRAVOEffectiveSecurityInvariants (BRAVO_CONFIG_LOADER.ps1,
+        # покрито окремо в BRAVO_SELF_TEST.ConfigLoader.ps1, Test 5.4/5.4c і
+        # Wave 1B requireAdministrator). Друга копія цієї політики тут була б
+        # забороненою дублікацією (.claude/rules/05-architecture.md); ця
+        # перевірка лише встановлює, що дельта-інструмент НЕ приховує
+        # security-значущу відмінність від оператора під час підготовки
+        # candidate-файлу.
+        $deltaSecurityWeakening = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration @{ backupConsistency = @{ Mode = 'VSS' } } `
+            -CandidateConfiguration @{ backupConsistency = @{ Mode = 'Direct' } })
+        Test-BRAVOCondition `
+            -Condition (
+                $deltaSecurityWeakening.Count -eq 1 -and
+                [string]$deltaSecurityWeakening[0].Path -eq 'backupConsistency.Mode' -and
+                [string]$deltaSecurityWeakening[0].Kind -eq 'Changed' -and
+                [string]$deltaSecurityWeakening[0].CandidateValue -eq 'Direct'
+            ) `
+            -Name "Delta/SecurityWeakeningOverrideSurfacedNotSuppressed" `
+            -Failure "security-значуще перевизначення (backupConsistency.Mode='Direct') мусить з'являтись у дельті як звичайний Changed-рядок, видимий оператору перед перенесенням, а не бути прихованим цим інструментом"
     }
 
 # =====================================================================
