@@ -18404,8 +18404,11 @@ function Write-BRAVOLog {
     # статусу 'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (як STRING-літерал в AST, не
     # рахуючи пояснювальні коментарі) має існувати РІВНО один раз —
     # усередині самої Get-BRAVOMaintenanceFinalStatus, — а сама функція
-    # має викликатися рівно чотири рази поза власним визначенням (звичайні
-    # ЛОГ/консоль/notification Title + ранній disk-preflight summary).
+    # має викликатися рівно п'ять разів поза власним визначенням (звичайні
+    # ЛОГ/консоль/notification Title + ранній disk-preflight summary + PR
+    # #225 Send-BRAVOMaintenanceOperationsEvent, яка навмисно повторно
+    # використовує ЦЕЙ САМИЙ канонічний резолвер для Operations-severity,
+    # а не заводить власну паралельну класифікацію).
     $maintenanceTotalTokens = $null
     $maintenanceTotalErrors = $null
     $maintenanceTotalAst = [Management.Automation.Language.Parser]::ParseInput(
@@ -18430,10 +18433,10 @@ function Write-BRAVOLog {
     Test-BRAVOCondition `
         -Condition (
             $maintenanceSuccessWithWarningsLiteralAsts.Count -eq 1 -and
-            $maintenanceFinalStatusCallAsts.Count -eq 4
+            $maintenanceFinalStatusCallAsts.Count -eq 5
         ) `
         -Name 'Maintenance/FinalStatusDoesNotCallIndependentWarningPolicy' `
-        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 4 рази (ЛОГ/консоль/notification/ранній disk-preflight summary), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
+        -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' має бути ОДНИМ канонічним літералом (усередині Get-BRAVOMaintenanceFinalStatus), а сама функція — викликатись РІВНО 5 разів (ЛОГ/консоль/notification/ранній disk-preflight summary/Send-BRAVOMaintenanceOperationsEvent), а не мати незалежні дубльовані `if (`$script:BRAVOWarningCount -gt 0)` гілки з власним текстом статусу; знайдено літералів: $($maintenanceSuccessWithWarningsLiteralAsts.Count), викликів: $($maintenanceFinalStatusCallAsts.Count)"
 
     # ================================================================
     # Група 2 — Maintenance: голий "==="-роздільник більше не пише
