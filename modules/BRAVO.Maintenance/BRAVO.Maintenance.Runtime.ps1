@@ -10519,6 +10519,20 @@ if (-not $script:criticalErrorOccurred) {
 # самий, що вже дає "поточний знімок" для Send-FinalReport вище).
 $script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
 
+# #175: попередження, яких не забрав жоден крок (preflight, конфігураційна
+# фаза, ділянка після останнього кроку), зводяться в один явний результат
+# ДО запису machine-readable статусу, ДО рендера підсумку і (review, PR
+# #225 раунд 3) ДО Operations-події нижче — інакше stepsWarning у JSON,
+# поле "Попереджень" на консолі, і warnCount у Operations-payload
+# розходились би: перші два показували б реальний warnCount, а
+# Operations бачив би 0 лише тому, що подія відправлялась до цього
+# зведення. Викликається саме тут, після резолву exit-code (сама формула
+# exit-code не залежить від зведення — критичність/warnings/success уже
+# визначені), але ДО Send-BRAVOMaintenanceOperationsEvent: пізніше
+# попереджень уже не виникає, тож зріз повний і Operations бачить той
+# самий warnCount, що й усі інші споживачі.
+[void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
+
 # Operations-подія про завершення прогону — навмисно ТУТ, після фінального
 # резолву exit code (а не всередині Send-FinalReport вище): бачить ТОЙ
 # САМИЙ результат, що й "=== СТАТУС ===" нижче, включно з винятком,
@@ -10527,14 +10541,6 @@ $script:maintenanceRuntimeExitCode = Get-BRAVOMaintenanceResolvedExitCode
 Send-BRAVOMaintenanceOperationsEvent `
     -ExitCode $script:maintenanceRuntimeExitCode `
     -ElapsedTime ((Get-Date) - $script:ScriptStartTime)
-
-# #175: попередження, яких не забрав жоден крок (preflight, конфігураційна
-# фаза, ділянка після останнього кроку), зводяться в один явний результат
-# ДО запису machine-readable статусу і ДО рендера підсумку — інакше
-# stepsWarning у JSON і поле "Попереджень" на консолі показували б 0 при
-# exit 10. Викликається саме тут, після резолву exit-code: пізніше
-# попереджень уже не виникає, тож зріз повний.
-[void](Add-BRAVOMaintenanceUnattributedWarningOutcome)
 
 $maintenanceEndedAt = Get-Date
 $totalTime = $maintenanceEndedAt - $script:ScriptStartTime
