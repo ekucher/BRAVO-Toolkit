@@ -492,6 +492,67 @@
         -Failure '409 already_finalized на POST /enroll має повернути $null без винятку -- термінально для цієї спроби, не loop'
 
     # =====================================================================
+    # PR #225 thread @ line 870 (reveal window vs poll cadence): TTL-
+    # expired (approved БЕЗ apiKey) WARNING має нести КОНКРЕТНУ, дієву
+    # діагностику -- причину (5-хвилинне вікно видачі вичерпано), потрібну
+    # дію (ручне admin reissue в Operations UI) і негайний наступний крок
+    # (вручну запустити BRAVO_OPERATIONS_HEARTBEAT.ps1) -- НЕ generic
+    # помилку і НЕ мовчазне залишення pending-стану назавжди. Return-
+    # контракт ($null, never-throw) уже покритий
+    # Operations/ApprovedWithoutApiKeyMeansTtlExpiredReturnsNullNoThrow
+    # вище -- цей тест закриває окремий ґап: досі ніщо не перевіряло ТЕКСТ
+    # повідомлення, лише факт повернення $null.
+    # =====================================================================
+    $ttlWarnDir = Join-Path $opsSelfTestRoot 'TtlExpiredWarningText'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $ttlWarnDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestBootstrap' = 'fleet-bootstrap-secret' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'pending' }
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'approved' }   # apiKey deliberately absent -> TTL expired
+
+    $global:BRAVOOpsSelfTestTtlExpiredWarnings = New-Object System.Collections.Generic.List[object]
+    $originalWriteBravoLogForTtlTest = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
+    [void](New-Module -ScriptBlock {
+        function Write-BRAVOLog {
+            param([string]$Component, [string]$Level, [string]$Message)
+            if ($Component -eq 'Operations' -and $Level -eq 'WARNING' -and $Message -like '*API-ключ*') {
+                [void]$global:BRAVOOpsSelfTestTtlExpiredWarnings.Add($Message)
+            }
+        }
+    })
+
+    $ttlWarnResult = $null
+    $ttlWarnThrew = $false
+    try {
+        $ttlWarnResult = Invoke-BRAVOOperationsEnrollment -OperationsReportingSettings $opsSettings `
+            -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1'
+    } catch {
+        $ttlWarnThrew = $true
+    }
+
+    if ($null -ne $originalWriteBravoLogForTtlTest) {
+        Set-Item -Path function:Write-BRAVOLog -Value $originalWriteBravoLogForTtlTest.ScriptBlock -Force
+    } else {
+        Remove-Item -Path function:Write-BRAVOLog -Force -ErrorAction SilentlyContinue
+    }
+
+    $ttlWarningText = if ($global:BRAVOOpsSelfTestTtlExpiredWarnings.Count -gt 0) { [string]$global:BRAVOOpsSelfTestTtlExpiredWarnings[0] } else { '' }
+    Test-BRAVOCondition -Condition (-not $ttlWarnThrew -and $null -eq $ttlWarnResult) `
+        -Name 'Operations/TtlExpiredWarningPathNeverThrowsReturnsNull' `
+        -Failure 'TTL-expired (approved без apiKey) шлях, що продукує діагностичний WARNING, все ще має повернути $null без винятку'
+    Test-BRAVOCondition -Condition (
+        $global:BRAVOOpsSelfTestTtlExpiredWarnings.Count -ge 1 -and
+        $ttlWarningText -match '(?i)approved' -and
+        $ttlWarningText -match '5-хвилинне вікно' -and
+        $ttlWarningText -match '(?i)admin reissue' -and
+        $ttlWarningText -match 'BRAVO_OPERATIONS_HEARTBEAT\.ps1'
+    ) -Name 'Operations/TtlExpiredWarningIsActionableNotGeneric' `
+      -Failure "TTL-expired WARNING (approved без apiKey) має явно називати причину (5-хвилинне вікно), потрібну дію (admin reissue в Operations UI) і негайний наступний крок (запустити BRAVO_OPERATIONS_HEARTBEAT.ps1) -- не generic помилку; отримано ($($global:BRAVOOpsSelfTestTtlExpiredWarnings.Count) WARNING(-и)): '$ttlWarningText'"
+
+    Remove-Variable -Name BRAVOOpsSelfTestTtlExpiredWarnings -Scope Global -Force -ErrorAction SilentlyContinue
+
+    # =====================================================================
     # NEW (A3): 409 claim_mismatch -- відмінне від already_finalized,
     # термінально для цієї спроби, ніколи не кидає, НЕ ретраїться тісно.
     # =====================================================================
