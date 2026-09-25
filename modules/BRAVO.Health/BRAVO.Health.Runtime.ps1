@@ -54,7 +54,7 @@ $script:BRAVOHealthLastStepTime = $null
 # Накопичує кожен Write-BRAVOHealthStep за весь прогін (як
 # $script:BRAVOArchiveStepHistory в Archive) — Operations-подія SUCCESS/
 # CRITICAL нижче читає це для per-stage деталізації.
-$script:BRAVOHealthStepHistory = [System.Collections.Generic.List[object]]::new()
+$script:BRAVOHealthStepHistory = New-Object System.Collections.Generic.List[object]
 # Перевірка цілісності інструментів виконується значно нижче, але
 # Complete-BRAVOHealthResult читає її результат — а через цю функцію
 # проходить КОЖЕН вихід Health, зокрема ранні (моніторинг вимкнено,
@@ -437,7 +437,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify', 'BRAVO.Status')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify', 'BRAVO.Status', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -5571,6 +5571,37 @@ if ($healthIssues.Count -eq 0) {
         -SftpDeferred ([bool]$script:BRAVOHealthSftpCheckDeferredByBusyWinSCP) `
         -EnabledCheckNames $successEnabledCheckNames `
         -ArchiveIdentities $successArchiveIdentities
+
+    # Operations: НАВМИСНО ПОЗА $sendSuccessNotification/success-dedup
+    # гейтингом нижче (review finding) — healthy-подія на dashboard не
+    # повинна залежати від того, чи оператор увімкнув -NotifyOnSuccess,
+    # NotificationMode=all, чи від semantic-дедуплікації Slack/Discord
+    # success-звітів. Health справді успішний (ми всередині
+    # $healthIssues.Count -eq 0) незалежно від того, чи хтось про це
+    # сповіщається у Slack/Discord.
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            $operationsHealthDuration = (Get-Date) - $healthCheckStarted
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'health' -Severity 'SUCCESS' `
+                -Component 'Health' `
+                -Message 'Health-перевірка успішна' `
+                -Services (Get-BRAVOManagedServiceStatusSnapshot) `
+                -Details @{
+                    stages = @($script:BRAVOHealthStepHistory)
+                    okCount = $script:BRAVOHealthStepOkCount
+                    warnCount = $script:BRAVOHealthStepWarningCount
+                    errorCount = $script:BRAVOHealthStepErrorCount
+                    durationMs = [Math]::Round($operationsHealthDuration.TotalMilliseconds)
+                }
+        } catch {
+            Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+        }
+    }
+
     if ($sendSuccessNotification) {
         $previousSuccessState = $null
         if (-not $ForceNotification -and -not $SuppressHeader -and
@@ -5622,27 +5653,9 @@ if ($healthIssues.Count -eq 0) {
                 -MessageChunks $successChunks `
                 -TimeoutSeconds $NotificationRequestTimeoutSeconds
             Write-HealthLog "Успішний звіт відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
-            if ($null -ne $operationsReportingSettings) {
-                try {
-                    Send-BRAVOOperationsEvent `
-                        -OperationsReportingSettings $operationsReportingSettings `
-                        -CredentialTargets $credentialSettings.Targets `
-                        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-                        -Category 'health' -Severity 'SUCCESS' `
-                        -Component 'Health' `
-                        -Message 'Health-перевірка успішна' `
-                        -Services (Get-BRAVOManagedServiceStatusSnapshot) `
-                        -Details @{
-                            stages = @($script:BRAVOHealthStepHistory)
-                            okCount = $script:BRAVOHealthStepOkCount
-                            warnCount = $script:BRAVOHealthStepWarningCount
-                            errorCount = $script:BRAVOHealthStepErrorCount
-                            durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
-                        }
-                } catch {
-                    Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
-                }
-            }
+            # Operations-подія про успіх УЖЕ надіслана вище (поза цим
+            # $sendSuccessNotification-гейтингом) — тут другий раз не
+            # дублюємо.
             try {
                 Save-BRAVOHealthSuccessNotificationState -Fingerprint $successFingerprint
             } catch {
@@ -5778,6 +5791,33 @@ $healthDuration = (Get-Date) - $healthCheckStarted
 $slackMessage = New-SlackAlertMessage -Issues $healthIssues -Duration $healthDuration
 $alertFingerprint = Get-AlertFingerprint -Issues $healthIssues
 
+# Operations: НАВМИСНО ПОЗА -NoSlack/NotificationMode="none"/alert-
+# suppression гейтингом нижче (review finding) — dashboard має бачити
+# CRITICAL-подію незалежно від того, чи Slack/Discord вимкнено чи
+# тимчасово пригнічено дедуплікацією однакового алерту на цьому сервері.
+if ($null -ne $operationsReportingSettings) {
+    try {
+        Send-BRAVOOperationsEvent `
+            -OperationsReportingSettings $operationsReportingSettings `
+            -CredentialTargets $credentialSettings.Targets `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -Category 'health' -Severity 'CRITICAL' `
+            -Component 'Health' `
+            -Message "Виявлено $($healthIssues.Count) проблем(и) під час Health-перевірки" `
+            -Services (Get-BRAVOManagedServiceStatusSnapshot) `
+            -Details @{
+                issueCount = $healthIssues.Count
+                stages = @($script:BRAVOHealthStepHistory)
+                okCount = $script:BRAVOHealthStepOkCount
+                warnCount = $script:BRAVOHealthStepWarningCount
+                errorCount = $script:BRAVOHealthStepErrorCount
+                durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
+            }
+    } catch {
+        Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+    }
+}
+
 if ($NoSlack -or $NotificationMode -eq "none") {
     $disabledReason = if ($NoSlack) { "параметром -NoSlack" } else { "режимом none" }
     Write-HealthLog "Відправлення повідомлення вимкнено $disabledReason" -Level "WARNING"
@@ -5819,28 +5859,9 @@ try {
         -TimeoutSeconds $NotificationRequestTimeoutSeconds
     Save-AlertState -Fingerprint $alertFingerprint
     Write-HealthLog "Критичне повідомлення успішно відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
-    if ($null -ne $operationsReportingSettings) {
-        try {
-            Send-BRAVOOperationsEvent `
-                -OperationsReportingSettings $operationsReportingSettings `
-                -CredentialTargets $credentialSettings.Targets `
-                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-                -Category 'health' -Severity 'CRITICAL' `
-                -Component 'Health' `
-                -Message "Виявлено $($healthIssues.Count) проблем(и) під час Health-перевірки" `
-                -Services (Get-BRAVOManagedServiceStatusSnapshot) `
-                -Details @{
-                    issueCount = $healthIssues.Count
-                    stages = @($script:BRAVOHealthStepHistory)
-                    okCount = $script:BRAVOHealthStepOkCount
-                    warnCount = $script:BRAVOHealthStepWarningCount
-                    errorCount = $script:BRAVOHealthStepErrorCount
-                    durationMs = [Math]::Round($healthDuration.TotalMilliseconds)
-                }
-        } catch {
-            Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
-        }
-    }
+    # Operations-подія про CRITICAL УЖЕ надіслана вище (поза -NoSlack/
+    # NotificationMode/alert-suppression-гейтингом) — тут другий раз не
+    # дублюємо.
     return Complete-BRAVOHealthResult -Result ([pscustomobject]@{
         Status = "Critical"
         IssueCount = $healthIssues.Count
