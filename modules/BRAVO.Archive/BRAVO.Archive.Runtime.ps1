@@ -25,7 +25,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -1071,7 +1071,7 @@ $script:BRAVOStepTotal = 0
 # скидається у Initialize-BRAVOArchiveSteps — той викликається кілька разів
 # за один прогін для різних фаз, а зведена Operations-подія генерації
 # (нижче, після фіналізації generation) має бачити етапи з усіх фаз).
-$script:BRAVOArchiveStepHistory = [System.Collections.Generic.List[object]]::new()
+$script:BRAVOArchiveStepHistory = New-Object System.Collections.Generic.List[object]
 
 function Initialize-BRAVOArchiveSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
