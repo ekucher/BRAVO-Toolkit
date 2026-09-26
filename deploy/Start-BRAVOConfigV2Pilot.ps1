@@ -256,11 +256,36 @@ try {
             Write-Host ("{0} ValidateOnly (exit {1}, ExternalAccess={2})" -f $(if ($validateOnly.Pass) { '[OK]' } else { '[FAIL]' }), $validateOnly.ExitCode, $(if ($validateOnly.ExternalAccessPerformed) { 'PERFORMED' } else { 'NOT PERFORMED (offline)' }))
             $allPass = $allPass -and $validateOnly.Pass
 
-            $afterSnapshot = Invoke-BRAVOPilotConfigSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $EvidenceDir 'after.snapshot.json')
-            $parity = Invoke-BRAVOPilotSemanticParity -InstallRoot $resolvedInstallRoot `
-                -BeforePath (Join-Path $EvidenceDir 'before.snapshot.json') `
-                -AfterPath (Join-Path $EvidenceDir 'after.snapshot.json') `
-                -OutputPath (Join-Path $EvidenceDir 'parity.json')
+            # Fail-closed, але з повним доказом (issue #216, Wave B):
+            # активований candidate теоретично МІГ загубити частину
+            # реальної делти BRAVO.config (напр. пошкоджений/неповний
+            # candidate, що не переносить LIMSRoot) — тоді AFTER-знімок
+            # сам кидає виняток (EffectiveLIMSRoot не визначено), а не
+            # просто повертає Pass=false. Necaught crash тут забрав би
+            # операторський доказ (parity.json) саме тоді, коли він
+            # найпотрібніший для діагностики перед -Rollback. Перетворюємо
+            # такий crash на явний FAIL з parity.json, не на fabricated
+            # PASS — Validate однаково завершується неуспішно.
+            try {
+                $afterSnapshot = Invoke-BRAVOPilotConfigSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $EvidenceDir 'after.snapshot.json')
+                $parity = Invoke-BRAVOPilotSemanticParity -InstallRoot $resolvedInstallRoot `
+                    -BeforePath (Join-Path $EvidenceDir 'before.snapshot.json') `
+                    -AfterPath (Join-Path $EvidenceDir 'after.snapshot.json') `
+                    -OutputPath (Join-Path $EvidenceDir 'parity.json')
+            } catch {
+                $parity = [pscustomobject]@{
+                    Pass   = $false
+                    Output = @("AFTER-знімок ефективної конфігурації не вдався: $($_.Exception.Message)")
+                }
+                Write-BRAVOPilotEvidenceJson -Path (Join-Path $EvidenceDir 'parity.json') -Object ([ordered]@{
+                    RanAtUtc   = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+                    BeforePath = (Join-Path $EvidenceDir 'before.snapshot.json')
+                    AfterPath  = (Join-Path $EvidenceDir 'after.snapshot.json')
+                    ExitCode   = $null
+                    Pass       = $false
+                    Output     = $parity.Output
+                })
+            }
             Write-Host ("{0} Semantic parity BEFORE==AFTER" -f $(if ($parity.Pass) { '[OK]' } else { '[FAIL]' }))
             $allPass = $allPass -and $parity.Pass
 
