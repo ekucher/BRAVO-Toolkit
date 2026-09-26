@@ -521,7 +521,18 @@ function Invoke-BRAVOPilotConfigSnapshot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$InstallRoot,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+
+        # Issue #216 (Wave B): BRAVO_CONFIG_TEST.ps1 — один із 14 guarded
+        # production entrypoint'ів (LEGACY_CONFIG_AUTOEXEC) — без явного
+        # -ConfigPath він більше не бачить легасі BRAVO.config автоматично.
+        # BASELINE-знімок (перед активацією Config V2, "BaselineCaptured")
+        # має навмисно прочитати легасі файл, якщо він присутній —
+        # рівно той "explicitly isolated migration path", який issue #216
+        # дозволяє. AFTER-знімок (після активації) цей параметр НЕ передає:
+        # там легасі файл або вже відсутній, або його наявність навмисно
+        # мусить лишатись без ефекту (Proof B).
+        [string]$LegacyConfigPath
     )
 
     $configTestPath = Join-Path $InstallRoot 'BRAVO_CONFIG_TEST.ps1'
@@ -529,7 +540,16 @@ function Invoke-BRAVOPilotConfigSnapshot {
         throw "PILOT_SNAPSHOT_FAILED: не знайдено $configTestPath."
     }
 
-    $json = & $configTestPath -FullGraph
+    # Hashtable-splat навмисно, не масив: `@('-FullGraph', '-ConfigPath', $v)`
+    # емпірично ламає прив'язку параметрів BRAVO_CONFIG_TEST.ps1 (switch
+    # перед named-параметром у масив-сплаті плутає binder — підтверджено
+    # прямим прогоном), тоді як прямий виклик і hashtable-сплат працюють
+    # однаково коректно.
+    $configTestArgs = @{ FullGraph = $true }
+    if (-not [string]::IsNullOrWhiteSpace($LegacyConfigPath)) {
+        $configTestArgs['ConfigPath'] = $LegacyConfigPath
+    }
+    $json = & $configTestPath @configTestArgs
     $snapshotExitCode = Get-BRAVOPilotSafeLastExitCode
     if ($snapshotExitCode -ne 0 -or [string]::IsNullOrWhiteSpace(($json | Out-String))) {
         throw "PILOT_SNAPSHOT_FAILED: BRAVO_CONFIG_TEST.ps1 -FullGraph завершився з кодом $snapshotExitCode або порожнім виводом — конфігурація, яка не завантажується, не може бути знята як baseline."
@@ -900,7 +920,14 @@ function Invoke-BRAVOPilotValidateOnly {
         # цього прапорця. За замовчуванням $false — production/strict
         # поведінка Validate не змінюється. Це НЕ хардкод hostname/
         # середовища: оператор має явно передати прапорець на -Validate.
-        [switch]$AllowOfflineExternalAccess
+        [switch]$AllowOfflineExternalAccess,
+        # Rollback-сценарій (issue #216, Wave B): коли легасі BRAVO.config
+        # щойно відновлено, а BRAVO.local.config відсутній,
+        # EffectiveLIMSRoot ніде більше не визначений — без явного
+        # -ConfigPath AUTOEXEC-guard заблокував би відновлений файл як
+        # auto-derived. Той самий дозволений pilot/migration-виняток, що
+        # й для config-знімків.
+        [string]$ConfigPath
     )
     $setupPath = Join-Path $InstallRoot 'BRAVO_SETUP.ps1'
     if (-not (Test-Path -LiteralPath $setupPath -PathType Leaf)) {
@@ -914,6 +941,9 @@ function Invoke-BRAVOPilotValidateOnly {
     $setupSwitches = @{ ValidateOnly = $true; NoPause = $true }
     if ($AllowOfflineExternalAccess) {
         $setupSwitches.SkipAccessTest = $true
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
+        $setupSwitches.ConfigPath = $ConfigPath
     }
     $output = @(& $setupPath @setupSwitches 2>&1 | ForEach-Object { [string]$_ })
     $exitCode = Get-BRAVOPilotSafeLastExitCode
@@ -1104,10 +1134,27 @@ function Invoke-BRAVOPilotRollback {
     $selfTestLogPath = Join-Path $EvidenceDir 'rollback.self-test.log'
     $healthLogPath = Join-Path $EvidenceDir 'rollback.health.log'
 
-    $validateResult = Invoke-BRAVOPilotValidateOnly -InstallRoot $InstallRoot -OutputPath $validateLogPath
+    # -Rollback навмисно відновлює ЛЕГАСІ-стан ДО пілота (BRAVO.config
+    # повернуто, BRAVO.local.config видалено, якщо його не було раніше) —
+    # це не той самий "після успішної міграції" стан, де LIMSRoot живе в
+    # BRAVO.local.config (тому AFTER-знімок у Start-BRAVOConfigV2Pilot.ps1
+    # свідомо не передає -LegacyConfigPath). Тут навпаки: якщо
+    # BRAVO.local.config відсутній, EffectiveLIMSRoot ніде більше не
+    # визначений, і AUTOEXEC-guard (issue #216, Wave B) заблокував би
+    # щойно відновлений BRAVO.config як auto-derived — BackupRoot не
+    # резолвиться, дочірній production-скрипт кидає виняток, і весь
+    # -Rollback валиться ДО запису rollback.json. Явний -ConfigPath/
+    # -LegacyConfigPath на відновлений файл — той самий дозволений
+    # pilot/migration-виняток, що вже застосовано до BEFORE-знімку.
+    $rollbackLegacyConfigPath = Join-Path $InstallRoot 'BRAVO.config'
+    if (-not (Test-Path -LiteralPath $rollbackLegacyConfigPath -PathType Leaf)) {
+        $rollbackLegacyConfigPath = $null
+    }
+
+    $validateResult = Invoke-BRAVOPilotValidateOnly -InstallRoot $InstallRoot -OutputPath $validateLogPath -ConfigPath $rollbackLegacyConfigPath
     $steps['ValidateOnlyPass'] = $validateResult.Pass
 
-    Invoke-BRAVOPilotConfigSnapshot -InstallRoot $InstallRoot -OutputPath $rollbackSnapshotPath | Out-Null
+    Invoke-BRAVOPilotConfigSnapshot -InstallRoot $InstallRoot -OutputPath $rollbackSnapshotPath -LegacyConfigPath $rollbackLegacyConfigPath | Out-Null
     $parityResult = if (Test-Path -LiteralPath $beforeSnapshotPath) {
         Invoke-BRAVOPilotSemanticParity -InstallRoot $InstallRoot -BeforePath $beforeSnapshotPath -AfterPath $rollbackSnapshotPath -OutputPath $parityPath
     } else {

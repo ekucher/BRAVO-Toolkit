@@ -267,9 +267,13 @@ function Get-SetupConfiguration {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
+    # Issue #216 (Wave B): production entrypoint — не виконує BRAVO.config
+    # автоматично лише тому, що він опинився поруч на диску; див. коментар
+    # біля $DisallowLegacyPrimaryAutoDetect у BRAVO_CONFIG_LOADER.ps1.
     Import-BravoConfiguration `
         -ConfigRoot $configRoot -ConfigPath $resolvedPath -RuntimeRoot $runtimeRoot `
-        -ConfigPathWasExplicit:$ConfigPathWasExplicit
+        -ConfigPathWasExplicit:$ConfigPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
 
     $credentialScript = if ($null -ne $credentialSettings -and
         -not [string]::IsNullOrWhiteSpace([string]$credentialSettings.SetupScriptPath)) {

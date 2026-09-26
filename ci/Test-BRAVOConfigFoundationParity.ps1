@@ -218,11 +218,29 @@ function New-PatchedFixtureConfigRoot {
     New-Item -ItemType Directory -Path $limsRoot -Force -ErrorAction Stop | Out-Null
     New-Item -ItemType Directory -Path $backupRoot -Force -ErrorAction Stop | Out-Null
 
-    $kitConfigText = Get-Content -LiteralPath (Join-Path $SourceKitRoot 'BRAVO.config') -Raw
+    # Issue #216 (Wave B, B4-2): кореневий BRAVO.config прибрано з пакета й
+    # git-tracking у поточному дереві. $SourceKitRoot буває ДВОХ видів у
+    # цьому скрипті: BEFORE-worktree на застарілому $BaseRef (42cf9ad),
+    # де кореневий файл ще існує в git-історії, і AFTER = $AfterRoot
+    # (поточне робоче дерево), де його вже немає — там текст живе у
+    # selftest\fixtures\BravoConfigLegacyFrozen.config (той самий текст,
+    # лише переміщений; self-test читає його через
+    # Get-BRAVOSelfTestLegacyConfigPath). Перевага кореневому файлу,
+    # коли він є, зберігає BEFORE-бік характеризації недоторканим.
+    $rootConfigCandidate = Join-Path $SourceKitRoot 'BRAVO.config'
+    $frozenConfigCandidate = Join-Path $SourceKitRoot 'selftest\fixtures\BravoConfigLegacyFrozen.config'
+    $sourceConfigPath = if (Test-Path -LiteralPath $rootConfigCandidate -PathType Leaf) {
+        $rootConfigCandidate
+    } elseif (Test-Path -LiteralPath $frozenConfigCandidate -PathType Leaf) {
+        $frozenConfigCandidate
+    } else {
+        throw "New-PatchedFixtureConfigRoot: не знайдено ні кореневого BRAVO.config, ні замороженої фікстури в $SourceKitRoot"
+    }
+    $kitConfigText = Get-Content -LiteralPath $sourceConfigPath -Raw
     $limsLine = '    LIMSRoot      = ""'
     $backupLine = '    BackupRoot    = ""'
     if (-not $kitConfigText.Contains($limsLine) -or -not $kitConfigText.Contains($backupLine)) {
-        throw "New-PatchedFixtureConfigRoot: очікувані рядки LIMSRoot/BackupRoot не знайдено в $SourceKitRoot\BRAVO.config"
+        throw "New-PatchedFixtureConfigRoot: очікувані рядки LIMSRoot/BackupRoot не знайдено в $sourceConfigPath"
     }
     $patched = $kitConfigText.
         Replace($limsLine, "    LIMSRoot      = '$($limsRoot.Replace("'", "''"))'").
@@ -417,6 +435,14 @@ $knownIntentionalDiffPrefixes = @(
     # властивість комплекту, і значення детерміноване доти, доки фікстура
     # патчить ті самі два рядки — а цього вимагає throw у самій функції.
     'BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults',
+    # Адитивне діагностичне поле (Issue #216, Wave B): PR B (база 42cf9ad)
+    # взагалі не блокував auto-detect застарілого BRAVO.config, тож поля
+    # не існувало (BEFORE=<null>). AFTER додає його як провенанс-маркер
+    # "чи саме auto-detect заблокував ефективну присутність primary-файлу"
+    # — той самий клас, що PrimaryConfigPresentOnDisk поруч у
+    # BRAVO_CONFIG_LOADER.ps1: описує ДЖЕРЕЛО/провенанс рішення, а не
+    # ефективне значення конфігурації.
+    'BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked',
     'BravoConfigurationMetadata.LocalConfigPath',
     'BravoConfigurationMetadata.LocalConfigPresent',
     'BravoConfigurationMetadata.Mode',

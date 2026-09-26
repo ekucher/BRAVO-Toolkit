@@ -313,11 +313,16 @@ try {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
+    # Issue #216 (Wave B): production runtime entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $ConfigPath `
         -RuntimeRoot $bravoScriptDirectory `
-        -ConfigPathWasExplicit:$configPathWasExplicit
+        -ConfigPathWasExplicit:$configPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
     $script:ScriptVersion = [string]$global:ScriptVersion
     $script:ScriptDate = [string]$global:ScriptDate
     $script:ScriptBuildId = [string]$global:ScriptBuildId

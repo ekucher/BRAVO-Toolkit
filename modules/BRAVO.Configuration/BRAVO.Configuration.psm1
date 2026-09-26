@@ -701,3 +701,39 @@ function Resolve-BRAVORawConfiguration {
 
     return $merged
 }
+
+function Test-BRAVOSecurityInvariantValueWeakened {
+    # Issue #216: канонічний предикат "чи це окреме (Path, Value) значення
+    # само по собі послаблює security-інваріант". Єдине джерело істини для
+    # трьох ключів, які перевіряє Test-BRAVOEffectiveSecurityInvariants
+    # (BRAVO_CONFIG_LOADER.ps1, post-merge ефективна конфігурація) і які
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 мусить видимо позначати (DENY-UX,
+    # issue #216 §9) — БЕЗ повторної незалежної копії цієї логіки
+    # (`.claude/rules/05-architecture.md`, "Політика дублікації": один
+    # canonical owner на security-політику).
+    #
+    # Навмисно повертає лише bool-вердикт, без повідомлення: обидва
+    # викликачі формують РІЗНІ, контекстно доречні тексти навколо цього
+    # самого вердикту (Test-BRAVOEffectiveSecurityInvariants — детальні
+    # причини для requireAdministrator missing/non-bool/false окремо;
+    # site-delta — попередження про майбутню відмову активації).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        $Value
+    )
+
+    switch ($Path) {
+        'backupConsistency.Mode' {
+            return -not [string]::Equals([string]$Value, 'VSS', [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        'toolIntegritySettings.Mode' {
+            return -not [string]::Equals([string]$Value, 'Enforce', [System.StringComparison]::OrdinalIgnoreCase)
+        }
+        'requireAdministrator' {
+            return ($Value -isnot [bool]) -or ($Value -eq $false)
+        }
+        default { return $false }
+    }
+}

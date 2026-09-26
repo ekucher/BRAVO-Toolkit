@@ -692,11 +692,16 @@ try {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
+    # Issue #216 (Wave B): production operator entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $resolvedConfigPath `
         -RuntimeRoot $bravoScriptDirectory `
-        -ConfigPathWasExplicit:$configPathWasExplicit
+        -ConfigPathWasExplicit:$configPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
 
     # schedulerSettings.BAZASync (разом із його .Enabled) визначає BRAVO.config
     # через канонічний $bazaSyncEffective (BAZA_APP_SFTP OR BAZA_WWW_SFTP).

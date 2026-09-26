@@ -760,6 +760,49 @@
             ) `
             -Name "Delta/SiteDeltaToolNeverOverwrites" `
             -Failure "інструмент дельти мусить мати рівно один запис на диск (за -OutputPath) і відмовляти на наявному файлі"
+
+        # =========================================================
+        # Issue #216 (§9 п.5): значення, що пройде парсинг/типізацію, але
+        # заблокує активацію на Test-BRAVOEffectiveSecurityInvariants
+        # (BRAVO_CONFIG_LOADER.ps1), раніше в дельті виглядало як звичайний
+        # рядок — без видимого попередження до фактичної спроби активації.
+        # Реальний subprocess-прогін інструмента на сфабрикованому
+        # BRAVO.config (не текстовий Contains-guard вище: тут перевіряється
+        # ФАКТИЧНА поведінка форматування виводу).
+        # ---------------------------------------------------------
+        $deltaMarkerScenarioRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DELTAMARKER_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($deltaMarkerScenarioRoot)
+        try {
+            $deltaMarkerLegacyText = [IO.File]::ReadAllText(
+                (Join-Path $root 'selftest\fixtures\BravoConfigLegacyFrozen.config'), [Text.Encoding]::UTF8
+            )
+            $deltaMarkerPoisonBody = (
+                "`r`n" +
+                "`$global:backupConsistency.Mode = 'Direct'`r`n" +
+                "`$global:requireAdministrator = `$false`r`n"
+            )
+            [IO.File]::WriteAllText(
+                (Join-Path $deltaMarkerScenarioRoot 'BRAVO.config'),
+                ($deltaMarkerLegacyText + $deltaMarkerPoisonBody),
+                (New-Object Text.UTF8Encoding($false))
+            )
+            $deltaMarkerOutput = [string](
+                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+                    -File $deltaToolPath -RuntimeRoot $root -ConfigRoot $deltaMarkerScenarioRoot 2>&1 | Out-String
+            )
+            Test-BRAVOCondition `
+                -Condition (
+                    $deltaMarkerOutput -match "(?m)^\s*'backupConsistency\.Mode'.*Test-BRAVOEffectiveSecurityInvariants" -and
+                    $deltaMarkerOutput -match "(?m)^\s*'requireAdministrator'.*Test-BRAVOEffectiveSecurityInvariants" -and
+                    $deltaMarkerOutput.Contains('[WARN]') -and
+                    $deltaMarkerOutput -match 'Test-BRAVOEffectiveSecurityInvariants.*:\s*2'
+                ) `
+                -Name "Delta/SecurityInvariantValuesAreVisiblyMarked" `
+                -Failure "значення backupConsistency.Mode='Direct' і requireAdministrator=`$false (обидва блокують активацію на Test-BRAVOEffectiveSecurityInvariants) мусили отримати видиму позначку в дельті й у [WARN]-підсумку; вивід: $deltaMarkerOutput"
+        } finally {
+            Remove-Item -LiteralPath $deltaMarkerScenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
 # =====================================================================
@@ -1227,6 +1270,80 @@
             ) `
             -Name "DiscoveryOverride/LoaderAppliesOverridesBeforeDerivation" `
             -Failure "BRAVO_CONFIG_LOADER мусить резолвити discoverySettings через Resolve-BRAVOEffectiveDiscoverySettings (а не перезаписувати змерджене значення канонічним літералом), а приклад site-конфігу не повинен далі стверджувати, що override не діє"
+
+        # =========================================================
+        # Issue #216 (ALLOW_WITH_VALIDATOR, §9 п.9): discoverySettings.*
+        # раніше приймав absolute/local override (пройшов
+        # NonLocalPathFailsClosed вище) без ЖОДНОЇ перевірки, що шлях
+        # реально існує на диску — на відміну від discoverySettings.
+        # Sources.BAZA_WWW, який уже мав такий Presence/Error-контракт.
+        # Нижче — той самий контракт для BravoRoot/BravoIniPath/WebRoot/
+        # Sources.MODEL/BLOG/BRAVOEXCH/BAZA_APP: неіснуючий явний override
+        # -> $null + видима причина в Reasons, БЕЗ мовчазного прийняття
+        # й БЕЗ silent fallback на auto-discovery (той самий принцип, що
+        # для BAZA_WWW).
+        # ---------------------------------------------------------
+        $preloadNonexistentDir = Join-Path $preloadRoot 'DOES_NOT_EXIST_XYZ'
+
+        # --- DiscoveryOverride/NonexistentBravoRootFailsClosed ---
+        $preloadInvalidBravoRoot = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.BravoRoot' = $preloadNonexistentDir } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$preloadInvalidBravoRoot.BRAVO_ROOT) -and
+                [string]$preloadInvalidBravoRoot.Reasons.BravoRoot -match '(?i)не існує'
+            ) `
+            -Name "DiscoveryOverride/NonexistentBravoRootFailsClosed" `
+            -Failure "explicit discoverySettings.BravoRoot, що вказує на неіснуючий каталог, мусив дати BRAVO_ROOT=`$null з видимою причиною, а не мовчки прийняти шлях; отримано BRAVO_ROOT='$($preloadInvalidBravoRoot.BRAVO_ROOT)' Reason='$($preloadInvalidBravoRoot.Reasons.BravoRoot)'"
+
+        # --- DiscoveryOverride/NonexistentWebRootFailsClosed ---
+        $preloadInvalidWebRoot = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.WebRoot' = $preloadNonexistentDir } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$preloadInvalidWebRoot.WEB_ROOT) -and
+                [string]$preloadInvalidWebRoot.Reasons.WebRoot -match '(?i)не існує'
+            ) `
+            -Name "DiscoveryOverride/NonexistentWebRootFailsClosed" `
+            -Failure "explicit discoverySettings.WebRoot, що вказує на неіснуючий каталог, мусив дати WEB_ROOT=`$null з видимою причиною; отримано WEB_ROOT='$($preloadInvalidWebRoot.WEB_ROOT)' Reason='$($preloadInvalidWebRoot.Reasons.WebRoot)'"
+
+        # --- DiscoveryOverride/NonexistentBravoIniPathFailsClosed ---
+        $preloadNonexistentIni = Join-Path $preloadRoot 'DOES_NOT_EXIST_XYZ.ini'
+        $preloadInvalidIni = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.BravoIniPath' = $preloadNonexistentIni } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition ([string]$preloadInvalidIni.Reasons.BravoIniPath -match '(?i)не існує') `
+            -Name "DiscoveryOverride/NonexistentBravoIniPathFailsClosed" `
+            -Failure "explicit discoverySettings.BravoIniPath, що вказує на неіснуючий файл, мусив дати видиму причину відмови; отримано Reason='$($preloadInvalidIni.Reasons.BravoIniPath)'"
+
+        # --- DiscoveryOverride/NonexistentModelSourceFailsClosed ---
+        # MODEL/BLOG/BRAVOEXCH проходять через один Resolve-BRAVOSourceField
+        # — одна перевірка тут покриває всі три.
+        $preloadInvalidModel = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.Sources.MODEL' = $preloadNonexistentDir } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$preloadInvalidModel.MODEL_SOURCE) -and
+                [string]$preloadInvalidModel.Reasons.MODEL -match '(?i)не існує'
+            ) `
+            -Name "DiscoveryOverride/NonexistentModelSourceFailsClosed" `
+            -Failure "explicit discoverySettings.Sources.MODEL, що вказує на неіснуючий каталог, мусив дати MODEL_SOURCE=`$null з видимою причиною; отримано MODEL_SOURCE='$($preloadInvalidModel.MODEL_SOURCE)' Reason='$($preloadInvalidModel.Reasons.MODEL)'"
+
+        # --- DiscoveryOverride/NonexistentBazaAppFailsClosed ---
+        $preloadInvalidBazaApp = Resolve-BRAVOPreloadDiscovery `
+            -LocalOverrides @{ 'discoverySettings.Sources.BAZA_APP' = $preloadNonexistentDir } `
+            -Services $preloadServices
+        Test-BRAVOCondition `
+            -Condition (
+                [string]::IsNullOrWhiteSpace([string]$preloadInvalidBazaApp.BAZA_APP) -and
+                [string]$preloadInvalidBazaApp.Reasons.BAZA_APP -match '(?i)не існує'
+            ) `
+            -Name "DiscoveryOverride/NonexistentBazaAppFailsClosed" `
+            -Failure "explicit discoverySettings.Sources.BAZA_APP, що вказує на неіснуючий каталог, мусив дати BAZA_APP=`$null з видимою причиною; отримано BAZA_APP='$($preloadInvalidBazaApp.BAZA_APP)' Reason='$($preloadInvalidBazaApp.Reasons.BAZA_APP)'"
     } finally {
         $env:BRAVO_DISCOVERY_SETTINGS_OVERRIDE_PATH = $preloadSavedOverridePath
         $env:BRAVO_DATARESTORE_TEST_HOOKS = $preloadSavedHooks
