@@ -218,47 +218,13 @@ try {
 # (BRAVO_CONFIG_LOADER.ps1) — так само, як RUNTIME_MANIFEST/TOOLS_MANIFEST
 # гейти вище, provalidовано на РЕАЛЬНОМУ staged-вмісті, не на джерелі.
 
-$productionEntryPointGuardTargets = @(
-    'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1',
-    'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
-    'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1',
-    'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1',
-    'BRAVO_SETUP.ps1',
-    'BRAVO_CREDENTIALS_SETUP.ps1',
-    'BRAVO_CONFIG_TEST.ps1',
-    'BRAVO_BAZA_RECONCILE.ps1',
-    'BRAVO_DRY_RUN.ps1',
-    'BRAVO_NOTIFICATION_TEST.ps1',
-    'BRAVO_RESTORE_TEST.ps1',
-    'BRAVO_TASKS_DIAGNOSE.ps1',
-    'BRAVO_TASKS_INSTALL.ps1',
-    'BRAVO_TASKS_UNINSTALL.ps1'
-)
-
-# BRAVO.config більше не входить у staged-комплект (B4-2). Явна перевірка
-# відсутності — щоб регресія (файл випадково знову потрапив у git tree)
-# провалила release-artifact build детерміністично, а не мовчки.
-if (Test-Path -LiteralPath (Join-Path $stagingDir 'BRAVO.config') -PathType Leaf) {
-    throw 'Гейт LEGACY_CONFIG_REMOVED (issue #216, B4-2): BRAVO.config неочікувано присутній у staged-комплекті — файл мав бути прибраний з git tracking.'
+. (Join-Path $PSScriptRoot 'BRAVOConfigV2CutoverGates.ps1')
+$productionEntryPointGuardTargets = Get-BRAVOProductionEntryPointRelativePath
+$cutoverGateResult = Test-BRAVOConfigV2CutoverGates -Root $stagingDir -ProductionEntryPointRelativePath $productionEntryPointGuardTargets
+if (-not $cutoverGateResult.Passed) {
+    throw ([string]::Join(' ', $cutoverGateResult.Failures))
 }
 Write-Host 'Гейт LEGACY_CONFIG_REMOVED (issue #216, B4-2): BRAVO.config відсутній у staged-комплекті.'
-$legacyConfigAutoExecGuardMissing = New-Object System.Collections.Generic.List[string]
-foreach ($relativeGuardTarget in $productionEntryPointGuardTargets) {
-    $guardTargetPath = Join-Path $stagingDir $relativeGuardTarget
-    if (-not (Test-Path -LiteralPath $guardTargetPath -PathType Leaf)) {
-        throw "Гейт LEGACY_CONFIG_AUTOEXEC (issue #216): production entrypoint '$relativeGuardTarget' відсутній у staged-комплекті."
-    }
-    $guardTargetText = Get-Content -LiteralPath $guardTargetPath -Raw -Encoding UTF8
-    if ($guardTargetText -notmatch '(?s)Import-BravoConfiguration.{0,400}?-DisallowLegacyPrimaryAutoDetect') {
-        [void]$legacyConfigAutoExecGuardMissing.Add($relativeGuardTarget)
-    }
-}
-if ($legacyConfigAutoExecGuardMissing.Count -gt 0) {
-    throw ('LEGACY_CONFIG_AUTOEXEC (issue #216): у staged-комплекті ' + $legacyConfigAutoExecGuardMissing.Count +
-        ' production entrypoint(и) викликають Import-BravoConfiguration БЕЗ -DisallowLegacyPrimaryAutoDetect ' +
-        '— довільний BRAVO.config, підкладений поруч без наміру оператора, знову виконувався б автоматично: ' +
-        ([string]::Join(', ', $legacyConfigAutoExecGuardMissing.ToArray())))
-}
 Write-Host ("Гейт LEGACY_CONFIG_AUTOEXEC (issue #216): усі {0} production entrypoint(и) staged-комплекту блокують auto-detect BRAVO.config." -f $productionEntryPointGuardTargets.Count)
 
 # --- 4. release-manifest.json + SHA-256 ---------------------------------

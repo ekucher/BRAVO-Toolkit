@@ -781,14 +781,32 @@ function Test-BRAVOEffectiveSecurityInvariants {
     [CmdletBinding()]
     param()
 
+    # Issue #216 (§9): цю функцію можуть викликати одразу після dot-source
+    # BRAVO_CONFIG_LOADER.ps1, без попереднього Import-BravoConfiguration
+    # (напр. точкові self-test-проби, що ізолюють саме цю перевірку) — тоді
+    # BRAVO.Configuration ще не завантажений. Той самий idempotent-паттерн
+    # Get-Module-перед-Import, що вже застосовує Import-BravoConfiguration
+    # нижче в цьому файлі, тут — гарантія, що Test-BRAVOSecurityInvariant
+    # ValueWeakened завжди доступна, без повторного дублювання її логіки.
+    if (-not (Get-Command -Name 'Test-BRAVOSecurityInvariantValueWeakened' -ErrorAction SilentlyContinue)) {
+        $configurationModulePathForInvariants = Join-Path $PSScriptRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
+        Import-Module -Name $configurationModulePathForInvariants -ErrorAction Stop
+    }
+
     $integrityMode = if ($env:BRAVO_RUNTIME_INTEGRITY_MODE -eq 'Warn') { 'Warn' } else { 'Enforce' }
     $allowWeakened = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
 
     $weakened = New-Object System.Collections.Generic.List[string]
 
+    # Issue #216 (§9): bool-вердикт "чи це значення саме по собі послаблює
+    # інваріант" делегується канонічному Test-BRAVOSecurityInvariantValueWeakened
+    # (modules\BRAVO.Configuration) — той самий предикат, яким
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 позначає DENY-значення видимо ДО
+    # активації. Повідомлення лишаються тут: лише ця функція знає точний
+    # операторський контекст (пост-merge ефективна конфігурація).
     if ($global:backupConsistency -is [hashtable] -and
         $global:backupConsistency.Contains('Mode') -and
-        -not [string]::Equals([string]$global:backupConsistency.Mode, 'VSS', [System.StringComparison]::OrdinalIgnoreCase)) {
+        (Test-BRAVOSecurityInvariantValueWeakened -Path 'backupConsistency.Mode' -Value $global:backupConsistency.Mode)) {
         [void]$weakened.Add(
             "backupConsistency.Mode = '$($global:backupConsistency.Mode)' замість 'VSS' " +
             "(архів читається з live-каталогу, файли належать різним моментам часу)")
@@ -796,7 +814,7 @@ function Test-BRAVOEffectiveSecurityInvariants {
 
     if ($global:toolIntegritySettings -is [hashtable] -and
         $global:toolIntegritySettings.Contains('Mode') -and
-        -not [string]::Equals([string]$global:toolIntegritySettings.Mode, 'Enforce', [System.StringComparison]::OrdinalIgnoreCase)) {
+        (Test-BRAVOSecurityInvariantValueWeakened -Path 'toolIntegritySettings.Mode' -Value $global:toolIntegritySettings.Mode)) {
         [void]$weakened.Add(
             "toolIntegritySettings.Mode = '$($global:toolIntegritySettings.Mode)' замість 'Enforce' " +
             "(підмінений 7za.exe/WinSCP більше не блокує запуск)")
@@ -804,11 +822,10 @@ function Test-BRAVOEffectiveSecurityInvariants {
 
     # Wave 1B (Issue #216): requireAdministrator — той самий post-merge
     # ефективний контроль, що backupConsistency.Mode/toolIntegritySettings.Mode
-    # вище. Навмисно НЕ [bool]$value (у PowerShell [bool]'false' -eq $true —
-    # текстова "фальшива хибність" мовчки пройшла б як secure). Три випадки
-    # розрізняються явно: відсутній / не Boolean / Boolean-$false — усі три
-    # трактуються як послаблення й проходять через той самий
-    # Enforce/Warn + BRAVO_ALLOW_WEAKENED_SECURITY=1 механізм.
+    # вище. "Відсутній" не можна змоделювати спільним предикатом (він
+    # приймає лише вже наявне значення) — лишається окремою гілкою; "не
+    # Boolean"/"Boolean-$false" делегуються тому самому
+    # Test-BRAVOSecurityInvariantValueWeakened, що й вище.
     $requireAdministratorVariable = Get-Variable -Name 'requireAdministrator' -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $requireAdministratorVariable) {
         [void]$weakened.Add(
@@ -818,7 +835,7 @@ function Test-BRAVOEffectiveSecurityInvariants {
         [void]$weakened.Add(
             "requireAdministrator = '$($requireAdministratorVariable.Value)' не є Boolean-значенням " +
             "(очікується саме `$true — нетипізоване значення не гарантує перевірку прав)")
-    } elseif ($requireAdministratorVariable.Value -eq $false) {
+    } elseif (Test-BRAVOSecurityInvariantValueWeakened -Path 'requireAdministrator' -Value $requireAdministratorVariable.Value) {
         [void]$weakened.Add(
             "requireAdministrator = `$false " +
             "(процес може виконуватись без адміністративних прав — обов'язкова перевірка вимкнена)")
@@ -1444,7 +1461,19 @@ function Import-BravoConfiguration {
     }
     $global:BravoLocalConfigOverrideState = $localOverrideState
     $effectiveLocalOverrides = if ($null -ne $localOverrideState) { $localOverrideState.Overrides } else { @{} }
-    $effectiveUnknownLeafSink = if ($null -ne $localOverrideState) { $localOverrideState.UnknownLeafPaths } else { $null }
+    # R2 (Issue #216): НЕ через if-вираз, як $effectiveLocalOverrides вище —
+    # PowerShell розгортає порожній IEnumerable (List[string] із Count=0),
+    # що виходить із гілки if-виразу через звичайний output-стрім, у $null
+    # (перевірено емпірично); непорожній список тієї ж дорогою розгортається
+    # в останній елемент, а не в сам список. UnknownLeafPaths стартує
+    # порожнім, тож sink завжди був $null у момент передачі нижче — D3
+    # unknown-leaf warning (#154/A2) мовчки ніколи не спрацьовувала.
+    # Hashtable (рядок вище) цій пастці не піддається — PowerShell не
+    # розгортає Hashtable по елементах, тож там той самий паттерн безпечний.
+    $effectiveUnknownLeafSink = $null
+    if ($null -ne $localOverrideState) {
+        $effectiveUnknownLeafSink = $localOverrideState.UnknownLeafPaths
+    }
 
     # #154 (A3/F1): симетрія ДІАГНОСТИКИ шарів. Site-шар fail-closed на
     # невідомий батьківський вузол і (з A2) звітує про невідомий leaf;

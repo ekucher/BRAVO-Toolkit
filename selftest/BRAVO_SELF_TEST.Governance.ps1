@@ -1270,6 +1270,164 @@
 }
 
 # =====================================================================
+# ReleaseGate/* (Issue #216, §9 п.3/п.4): гейти LEGACY_CONFIG_REMOVED/
+# AUTOEXEC винесені в ci\BRAVOConfigV2CutoverGates.ps1 — R2 знайшов, що
+# попередня inline-версія в ci\New-BRAVOReleaseArtifact.ps1 перевіряла
+# лише ТЕКСТОВУ присутність -DisallowLegacyPrimaryAutoDetect, тож явний
+# `-DisallowLegacyPrimaryAutoDetect:$false` (чи `:0`) проходив би як
+# коректний. Синтетичні фікстури тут — той самий підхід, що й
+# ConfigParity/* вище: перевіряємо ЛОГІКУ функції на текстових
+# сніпетах, а не через повну збірку release-артефакту (дорого й
+# непотрібно для цього дефекту).
+& {
+    . (Join-Path $root 'ci\BRAVOConfigV2CutoverGates.ps1')
+
+    function New-BRAVOReleaseGateFixtureRoot {
+        param([string]$EntryPointText)
+        $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_RELEASEGATE_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($fixtureRoot)
+        [IO.File]::WriteAllText(
+            (Join-Path $fixtureRoot 'entry.ps1'), $EntryPointText, (New-Object Text.UTF8Encoding($false))
+        )
+        return $fixtureRoot
+    }
+
+    $releaseGateBareFlagRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $releaseGateBareFlagResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateBareFlagRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition ($releaseGateBareFlagResult.Passed) `
+            -Name "ReleaseGate/CutoverGateAcceptsBareFlag" `
+            -Failure "бекар (implicit `$true) -DisallowLegacyPrimaryAutoDetect мусить проходити гейт AUTOEXEC; отримано Failures=$($releaseGateBareFlagResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $releaseGateBareFlagRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $releaseGateTrueBindingRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect:$true'
+    try {
+        $releaseGateTrueBindingResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateTrueBindingRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition ($releaseGateTrueBindingResult.Passed) `
+            -Name "ReleaseGate/CutoverGateAcceptsExplicitTrueBinding" `
+            -Failure "явний -DisallowLegacyPrimaryAutoDetect:`$true мусить проходити гейт AUTOEXEC; отримано Failures=$($releaseGateTrueBindingResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $releaseGateTrueBindingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # R2: до фіксу цей кейс ХИБНО проходив гейт — текст прапорця присутній,
+    # хоча ефективно auto-detect НЕ блокується.
+    $releaseGateFalseBindingRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect:$false'
+    try {
+        $releaseGateFalseBindingResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateFalseBindingRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (-not $releaseGateFalseBindingResult.Passed) `
+            -Name "ReleaseGate/CutoverGateRejectsExplicitFalseBinding" `
+            -Failure "явний -DisallowLegacyPrimaryAutoDetect:`$false ЕФЕКТИВНО вимикає блокування auto-detect — гейт AUTOEXEC мусить це виявляти, а не пропускати через текстову присутність назви прапорця"
+    } finally {
+        Remove-Item -LiteralPath $releaseGateFalseBindingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $releaseGateZeroBindingRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect:0'
+    try {
+        $releaseGateZeroBindingResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateZeroBindingRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (-not $releaseGateZeroBindingResult.Passed) `
+            -Name "ReleaseGate/CutoverGateRejectsExplicitZeroBinding" `
+            -Failure "явний -DisallowLegacyPrimaryAutoDetect:0 ЕФЕКТИВНО вимикає блокування auto-detect — гейт AUTOEXEC мусить це виявляти"
+    } finally {
+        Remove-Item -LiteralPath $releaseGateZeroBindingRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    $releaseGateMissingFlagRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X'
+    try {
+        $releaseGateMissingFlagResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateMissingFlagRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (-not $releaseGateMissingFlagResult.Passed) `
+            -Name "ReleaseGate/CutoverGateRejectsMissingFlag" `
+            -Failure "виклик Import-BravoConfiguration без -DisallowLegacyPrimaryAutoDetect взагалі мусить провалювати гейт AUTOEXEC"
+    } finally {
+        Remove-Item -LiteralPath $releaseGateMissingFlagRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateDetectsLegacyConfigPresent ---
+    $releaseGateLegacyRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        [IO.File]::WriteAllText((Join-Path $releaseGateLegacyRoot 'BRAVO.config'), '# poisoned', (New-Object Text.UTF8Encoding($false)))
+        $releaseGateLegacyResult = Test-BRAVOConfigV2CutoverGates -Root $releaseGateLegacyRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $releaseGateLegacyResult.Passed -and
+                @($releaseGateLegacyResult.Failures | Where-Object { $_.Contains('LEGACY_CONFIG_REMOVED') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateDetectsLegacyConfigPresent" `
+            -Failure "BRAVO.config, присутній у корені комплекту, мусить провалювати гейт LEGACY_CONFIG_REMOVED"
+    } finally {
+        Remove-Item -LiteralPath $releaseGateLegacyRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
+    # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
+    # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну
+    # реалізацію, а не тримати незалежні копії регексу/переліку.
+    $releaseArtifactBuilderText = [IO.File]::ReadAllText((Join-Path $root 'ci\New-BRAVOReleaseArtifact.ps1'), [Text.Encoding]::UTF8)
+    $prGateScriptText = [IO.File]::ReadAllText((Join-Path $root 'ci\Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $releaseArtifactBuilderText.Contains('BRAVOConfigV2CutoverGates.ps1') -and
+            $releaseArtifactBuilderText.Contains('Test-BRAVOConfigV2CutoverGates') -and
+            $prGateScriptText.Contains('BRAVOConfigV2CutoverGates.ps1') -and
+            $prGateScriptText.Contains('Test-BRAVOConfigV2CutoverGates')
+        ) `
+        -Name "ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow" `
+        -Failure "ci\New-BRAVOReleaseArtifact.ps1 (release-шлях) і ci\Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1 (PR-шлях, issue #216 H-1) мусять dot-source'ити ОДНУ спільну ci\BRAVOConfigV2CutoverGates.ps1, а не тримати незалежні копії гейту"
+
+    # --- ReleaseGate/PullRequestWorkflowInvokesCutoverGateUnconditionally ---
+    $configParityWorkflowTextForGate = [IO.File]::ReadAllText((Join-Path $root '.github\workflows\config-parity.yml'), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition ($configParityWorkflowTextForGate.Contains('Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1')) `
+        -Name "ReleaseGate/PullRequestWorkflowInvokesCutoverGateUnconditionally" `
+        -Failure "config-parity.yml (issue #216, H-1) мусить викликати ci\Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1 — інакше гейт LEGACY_CONFIG_REMOVED/AUTOEXEC і далі спрацьовує лише при tag/workflow_dispatch, ніколи на pull_request"
+}
+
+# =====================================================================
+# Health — Config V2 контракт (issue #216, §9 п.9): Health був єдиним
+# доменом без ЖОДНОГО прямого доказу дотримання Config V2 (лише
+# опосередковано — через свою присутність у канонічному списку 14
+# production entrypoint'ів гейту AUTOEXEC, ReleaseGate/* вище). Повний
+# Invoke-BRAVOHealth тут НЕ запускається — той самий принцип, що вже
+# документований на початку BRAVO_SELF_TEST.Archive.ps1 ("Main() ... не
+# запускається тут повністю"): реальні health-перевірки дисків/сервісів
+# нереалістично й небезпечно відтворювати в self-test. Натомість —
+# структурна перевірка того самого класу, що вже існує для інших
+# доменів у цьому файлі: Health.Runtime.ps1 отримує ефективну
+# конфігурацію ВИКЛЮЧНО через канонічний Import-BravoConfiguration і
+# ніде незалежно не парсить BRAVO.config сам (що відкрило б другий,
+# непокритий Proof B шлях просочування legacy-значень).
+& {
+    $healthRuntimeTextForConfigV2 = [IO.File]::ReadAllText(
+        (Join-Path $root 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
+
+    # --- ConfigParity/HealthRuntimeUsesCanonicalLoaderOnly ---
+    Test-BRAVOCondition `
+        -Condition (
+            $healthRuntimeTextForConfigV2.Contains('Import-BravoConfiguration') -and
+            $healthRuntimeTextForConfigV2.Contains('-DisallowLegacyPrimaryAutoDetect')
+        ) `
+        -Name "ConfigParity/HealthRuntimeUsesCanonicalLoaderOnly" `
+        -Failure "BRAVO.Health.Runtime.ps1 мусить завантажувати конфігурацію через Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect (той самий гейт, що ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow вище перевіряє текстово через AUTOEXEC-регекс)"
+
+    # --- ConfigParity/HealthRuntimeNoIndependentLegacyConfigParsing ---
+    $healthIndependentConfigParsingPattern = [regex]::Matches(
+        $healthRuntimeTextForConfigV2,
+        '(?i)Get-Content[^\n]*BRAVO\.config|ConvertFrom-StringData[^\n]*BRAVO\.config'
+    )
+    Test-BRAVOCondition `
+        -Condition ($healthIndependentConfigParsingPattern.Count -eq 0) `
+        -Name "ConfigParity/HealthRuntimeNoIndependentLegacyConfigParsing" `
+        -Failure "BRAVO.Health.Runtime.ps1 не повинен незалежно парсити BRAVO.config поза канонічним Import-BravoConfiguration — знайдено $($healthIndependentConfigParsingPattern.Count) підозрілих збігів; такий другий шлях не покривався би Proof B (ConfigLoader.ps1)"
+}
+
+# =====================================================================
 # Володіння site-конфігурацією при розкатці (#154, B6)
 # =====================================================================
 # Site-файл — стан ОПЕРАТОРА, комплект — стан вендора. Ці перевірки

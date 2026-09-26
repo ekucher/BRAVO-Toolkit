@@ -1313,6 +1313,35 @@ Test-BRAVOCondition `
     -Name "ConfigLoader/RequireAdministratorMissingBlocks" `
     -Failure "відсутній `$global:requireAdministrator (не просто `$false) МАЄ БЛОКУВАТИ з окремим діагностичним повідомленням 'requireAdministrator відсутній'; отримано: $reqAdminMissingResult"
 
+# --- ConfigLoader/ToolIntegrityModeWeakenedBlocks (Issue #216, §9 п.6):
+# toolIntegritySettings.Mode НЕ raw-configurable (канонічна константа) —
+# у звичайних probe-ах вище він СВІДОМО завжди встановлюється безпечним
+# значенням ('Enforce'), щоб не заважати ізоляції ІНШИХ змінних. Тому
+# власна DENY-гілка Test-BRAVOEffectiveSecurityInvariants для цього
+# canary (BRAVO_CONFIG_LOADER.ps1: "toolIntegritySettings.Mode = '...'
+# замість 'Enforce'") досі не мала жодного прямого тесту — лише pre-trust
+# AST-дзеркало (BRAVO_RUNTIME_GUARD.ps1) нижче. Той самий прямий-виклик
+# паттерн, що RequireAdministratorMissingBlocks вище.
+$toolIntegrityWeakenedProbeCommand = (
+    "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+    "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
+    "`$global:toolIntegritySettings = @{ Mode = 'Warn' }; " +
+    "`$global:requireAdministrator = `$true; " +
+    "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolIntegrityWeakenedResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolIntegrityWeakenedProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition (
+        $toolIntegrityWeakenedResult.StartsWith('THREW') -and
+        $toolIntegrityWeakenedResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -and
+        $toolIntegrityWeakenedResult.Contains("toolIntegritySettings.Mode = 'Warn'")
+    ) `
+    -Name "ConfigLoader/ToolIntegrityModeWeakenedBlocks" `
+    -Failure "ефективний `$global:toolIntegritySettings.Mode = 'Warn' (замість 'Enforce') МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants навіть якщо ця canary-гілка сьогодні недосяжна звичайним raw-override-шляхом; отримано: $toolIntegrityWeakenedResult"
+
 # ============================================================
 # P0 Configuration Foundation (PR C, Секція 5.5): МЕХАНІЧНИЙ доказ, що
 # pre-trust AST-правила (BRAVO_RUNTIME_GUARD.ps1, статичний текст
@@ -1765,6 +1794,78 @@ Test-BRAVOCondition `
     } finally {
         Remove-Item -LiteralPath $strictnessBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# ============================================================
+# Issue #216 (R2, §9 п.3 HIGH, 2026-09-26): дефект знайдено адверсаріальним
+# незалежним рев'ю R2, не дублікат fail-open/H-1 теми. У
+# BRAVO_CONFIG_LOADER.ps1 (Complete-BRAVOConfigurationLoad, ~рядок 1447)
+# $effectiveUnknownLeafSink будувався через if-вираз:
+#     $effectiveUnknownLeafSink = if (...) { $localOverrideState.UnknownLeafPaths } else { $null }
+# PowerShell на цьому шляху розгортає ПОРОЖНІЙ IEnumerable (List[string] із
+# Count=0), що виходить із гілки if-виразу через звичайний output-стрім, у
+# $null (емпірично перевірено мінімальним репро) — а не непорожній список
+# розгорнув би не в null, а в останній елемент. UnknownLeafPaths стартує
+# порожнім щоразу, тож sink, який фактично передавався нижче в
+# Resolve-BRAVORawConfiguration/ConvertTo-BRAVONestedOverride, був ЗАВЖДИ
+# $null — D3 unknown-leaf діагностика (#154/A2, і Write-Warning, і
+# $global:BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides) мовчки
+# ніколи не спрацьовувала, незалежно від того, скільки насправді невідомих
+# кінцевих сегментів містив BRAVO.local.config. Функціональний
+# observability-регрес, НЕ security bypass (fail-closed на невідомий
+# БАТЬКІВСЬКИЙ вузол цим sink-ом не керується;
+# Test-BRAVOEffectiveSecurityInvariants перевіряє реальні пост-мердж
+# $global: незалежно від цього шляху).
+# ============================================================
+$r2UnknownLeafBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_R2_UNKNOWNLEAF_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($r2UnknownLeafBackupRootDir)
+$r2UnknownLeafBackupRootLiteral = $r2UnknownLeafBackupRootDir.Replace("'", "''")
+$r2UnknownLeafResultExpression = (
+    "'RESULT:Count=' + [string]`$global:BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides.Count + " +
+    "';Leaves=' + (`$global:BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides -join ',')"
+)
+
+try {
+    # --- ConfigLoader/R2UnknownLeafSinkActuallyPopulated: генуїнно невідомий
+    # КІНЦЕВИЙ сегмент під реальним hashtable-батьківським вузлом
+    # (maintenanceSettings — той самий forward-compat-приклад, що й у
+    # LocalOverrideParityForwardCompatLeaf вище) МАЄ з'явитись у
+    # LocalConfigUnknownLeafOverrides. До фіксу цей sink був мертвим кодом —
+    # Count завжди дорівнював 0 незалежно від вмісту BRAVO.local.config.
+    $r2UnknownLeafBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$r2UnknownLeafBackupRootLiteral'`r`n" +
+        "    'maintenanceSettings.FutureFieldNotYetInSchema' = 'preserve-me'`r`n" +
+        "}`r`n"
+    )
+    $r2UnknownLeafResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $r2UnknownLeafBody -ResultExpression $r2UnknownLeafResultExpression
+    Test-BRAVOCondition `
+        -Condition ($r2UnknownLeafResult -eq 'RESULT:Count=1;Leaves=maintenanceSettings.FutureFieldNotYetInSchema') `
+        -Name "ConfigLoader/R2UnknownLeafSinkActuallyPopulated" `
+        -Failure (
+            "genuinely невідомий кінцевий сегмент 'maintenanceSettings.FutureFieldNotYetInSchema' " +
+            "мав з'явитись у BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides (sink НЕ мертвий код); " +
+            "отримано: $r2UnknownLeafResult"
+        )
+
+    # --- ConfigLoader/R2UnknownLeafSinkEmptyWhenNoUnknownLeaf (sanity): без
+    # жодного невідомого leaf sink має лишатись порожнім (0), а не
+    # false-positive.
+    $r2KnownLeafBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$r2UnknownLeafBackupRootLiteral'`r`n" +
+        "}`r`n"
+    )
+    $r2KnownLeafResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $r2KnownLeafBody -ResultExpression $r2UnknownLeafResultExpression
+    Test-BRAVOCondition `
+        -Condition ($r2KnownLeafResult -eq 'RESULT:Count=0;Leaves=') `
+        -Name "ConfigLoader/R2UnknownLeafSinkEmptyWhenNoUnknownLeaf" `
+        -Failure "BRAVO.local.config без невідомих leaf-ів має дати Count=0; отримано: $r2KnownLeafResult"
+} finally {
+    Remove-Item -LiteralPath $r2UnknownLeafBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # ============================================================
