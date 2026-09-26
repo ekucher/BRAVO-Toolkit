@@ -124,7 +124,16 @@ try {
             Write-BRAVOPilotEvidenceJson -Path (Join-Path $dir 'preflight.json') -Object $preflightResult
             Set-BRAVOPilotState -EvidenceDir $dir -State 'PreflightPassed' | Out-Null
 
-            Invoke-BRAVOPilotConfigSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $dir 'before.snapshot.json') | Out-Null
+            # Issue #216: baseline-знімок навмисно передає легасі
+            # BRAVO.config явно (-ConfigPath), коли він присутній — інакше
+            # LEGACY_CONFIG_AUTOEXEC guard у BRAVO_CONFIG_TEST.ps1 мовчки
+            # проігнорував би його, і baseline не відбив би реальний
+            # передміграційний стан сервера.
+            $legacyConfigPathForBaseline = Join-Path $resolvedInstallRoot 'BRAVO.config'
+            if (-not (Test-Path -LiteralPath $legacyConfigPathForBaseline -PathType Leaf)) {
+                $legacyConfigPathForBaseline = $null
+            }
+            Invoke-BRAVOPilotConfigSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $dir 'before.snapshot.json') -LegacyConfigPath $legacyConfigPathForBaseline | Out-Null
             Invoke-BRAVOPilotHealthSnapshot -InstallRoot $resolvedInstallRoot -OutputPath (Join-Path $dir 'health.before.log') | Out-Null
             Set-BRAVOPilotState -EvidenceDir $dir -State 'BaselineCaptured' | Out-Null
 

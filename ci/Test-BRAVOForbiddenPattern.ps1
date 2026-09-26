@@ -72,6 +72,13 @@ $bypassAllowlist = @(
     # powershell.exe зі stub-runtime (той самий патерн, що ConfigLoader/
     # Governance вище). Нових ВИКОНУВАНИХ Bypass-місць не додано.
     'BRAVO_SELF_TEST.ConfigIntent.ps1',
+    # Issue #216 (§9): Delta/SecurityInvariantValuesAreVisiblyMarked —
+    # реальний subprocess-прогін deploy\Get-BRAVOConfigSiteDelta.ps1 на
+    # сфабрикованому BRAVO.config, той самий ізольований дочірній
+    # powershell.exe патерн, що ConfigLoader/Governance вище (уникає
+    # змішування глобального стану із рештою self-test-прогону). Нових
+    # ВИКОНУВАНИХ Bypass-місць не додано.
+    'BRAVO_SELF_TEST.Configuration.ps1',
     'BRAVO.Archive.Runtime.ps1',
     'BRAVO.Maintenance.Runtime.ps1',
     # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той

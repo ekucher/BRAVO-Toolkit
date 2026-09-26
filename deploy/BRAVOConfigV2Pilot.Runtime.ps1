@@ -521,7 +521,18 @@ function Invoke-BRAVOPilotConfigSnapshot {
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$InstallRoot,
-        [Parameter(Mandatory = $true)][string]$OutputPath
+        [Parameter(Mandatory = $true)][string]$OutputPath,
+
+        # Issue #216 (Wave B): BRAVO_CONFIG_TEST.ps1 — один із 14 guarded
+        # production entrypoint'ів (LEGACY_CONFIG_AUTOEXEC) — без явного
+        # -ConfigPath він більше не бачить легасі BRAVO.config автоматично.
+        # BASELINE-знімок (перед активацією Config V2, "BaselineCaptured")
+        # має навмисно прочитати легасі файл, якщо він присутній —
+        # рівно той "explicitly isolated migration path", який issue #216
+        # дозволяє. AFTER-знімок (після активації) цей параметр НЕ передає:
+        # там легасі файл або вже відсутній, або його наявність навмисно
+        # мусить лишатись без ефекту (Proof B).
+        [string]$LegacyConfigPath
     )
 
     $configTestPath = Join-Path $InstallRoot 'BRAVO_CONFIG_TEST.ps1'
@@ -529,7 +540,16 @@ function Invoke-BRAVOPilotConfigSnapshot {
         throw "PILOT_SNAPSHOT_FAILED: не знайдено $configTestPath."
     }
 
-    $json = & $configTestPath -FullGraph
+    # Hashtable-splat навмисно, не масив: `@('-FullGraph', '-ConfigPath', $v)`
+    # емпірично ламає прив'язку параметрів BRAVO_CONFIG_TEST.ps1 (switch
+    # перед named-параметром у масив-сплаті плутає binder — підтверджено
+    # прямим прогоном), тоді як прямий виклик і hashtable-сплат працюють
+    # однаково коректно.
+    $configTestArgs = @{ FullGraph = $true }
+    if (-not [string]::IsNullOrWhiteSpace($LegacyConfigPath)) {
+        $configTestArgs['ConfigPath'] = $LegacyConfigPath
+    }
+    $json = & $configTestPath @configTestArgs
     $snapshotExitCode = Get-BRAVOPilotSafeLastExitCode
     if ($snapshotExitCode -ne 0 -or [string]::IsNullOrWhiteSpace(($json | Out-String))) {
         throw "PILOT_SNAPSHOT_FAILED: BRAVO_CONFIG_TEST.ps1 -FullGraph завершився з кодом $snapshotExitCode або порожнім виводом — конфігурація, яка не завантажується, не може бути знята як baseline."
