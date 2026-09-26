@@ -1353,9 +1353,19 @@ Test-BRAVOCondition `
 # AST-літерал до Import-Module vs. ефективне значення після повного
 # мержу) — тому перевіряється текстова присутність тих самих
 # Variable/Key/Expected-трійок в обох файлах, а не спільний виклик.
+#
+# Issue #216 (§9, Крок 0): сам bool-вердикт "Enforce"/"VSS" тепер
+# централізовано в Test-BRAVOSecurityInvariantValueWeakened
+# (modules\BRAVO.Configuration) — Test-BRAVOEffectiveSecurityInvariants
+# (BRAVO_CONFIG_LOADER.ps1) лише делегує туди й лишає $global:-
+# посилання/операторські повідомлення. Тому Expected-літерали
+# перевіряються в каноничному модулі-предикаті, а не в самому loader-і;
+# $global:-посилання (доказ, ЩО саме перевіряється) — все ще в loader-і.
 # ============================================================
 $guardTextForParity = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_RUNTIME_GUARD.ps1'), [Text.Encoding]::UTF8)
 $loaderTextForSecurityParity = [IO.File]::ReadAllText($configLoaderPath, [Text.Encoding]::UTF8)
+$securityInvariantPredicatePath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psm1'
+$securityInvariantPredicateText = [IO.File]::ReadAllText($securityInvariantPredicatePath, [Text.Encoding]::UTF8)
 Test-BRAVOCondition `
     -Condition (
         $guardTextForParity.Contains("Variable = 'toolIntegritySettings'") -and
@@ -1363,12 +1373,13 @@ Test-BRAVOCondition `
         $guardTextForParity.Contains("Variable = 'backupConsistency'") -and
         $guardTextForParity.Contains("Expected = 'VSS'") -and
         $loaderTextForSecurityParity.Contains('$global:toolIntegritySettings.Mode') -and
-        $loaderTextForSecurityParity.Contains("'Enforce', [System.StringComparison]::OrdinalIgnoreCase") -and
         $loaderTextForSecurityParity.Contains('$global:backupConsistency.Mode') -and
-        $loaderTextForSecurityParity.Contains("'VSS', [System.StringComparison]::OrdinalIgnoreCase")
+        $loaderTextForSecurityParity.Contains('Test-BRAVOSecurityInvariantValueWeakened') -and
+        $securityInvariantPredicateText.Contains("'Enforce', [System.StringComparison]::OrdinalIgnoreCase") -and
+        $securityInvariantPredicateText.Contains("'VSS', [System.StringComparison]::OrdinalIgnoreCase")
     ) `
     -Name "ConfigLoader/SecurityRuleParityGuardVsEffectiveCheck" `
-    -Failure "pre-trust guard (BRAVO_RUNTIME_GUARD.ps1) і post-merge effective-перевірка (BRAVO_CONFIG_LOADER.ps1) мають перевіряти ОДНАКОВІ Expected-значення (toolIntegritySettings.Mode='Enforce', backupConsistency.Mode='VSS') — розбіжність тут означає, що два набори правил розійшлися"
+    -Failure "pre-trust guard (BRAVO_RUNTIME_GUARD.ps1) і post-merge effective-перевірка (BRAVO_CONFIG_LOADER.ps1 -> канонічний Test-BRAVOSecurityInvariantValueWeakened) мають перевіряти ОДНАКОВІ Expected-значення (toolIntegritySettings.Mode='Enforce', backupConsistency.Mode='VSS') — розбіжність тут означає, що два набори правил розійшлися"
 
 # ============================================================
 # P0 Configuration Foundation (PR C, owner-checkpoint п.6): МЕХАНІЧНИЙ

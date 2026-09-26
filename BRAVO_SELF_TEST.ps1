@@ -10871,21 +10871,27 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Name "Discovery/ResolvesFromServiceAndIniWithoutOverride" `
             -Failure "MODEL/BLOG/BRAVOEXCH мають походити з canonical bravo.ini; BAZA_WWW без DocumentRoot і BACKUP_ROOT без pathSettings не повинні виводитись евристично"
 
+        # Explicit override тепер валідується (absolute + directory
+        # existence, issue #216 ALLOW_WITH_VALIDATOR) перед прийняттям —
+        # без реального каталогу override давав би Value=$null/помилку,
+        # не перемогу над авто-визначеним значенням.
+        $modelOverridePath = Join-Path $discoveryTestRoot "ExplicitOverrideModel"
+        [void][IO.Directory]::CreateDirectory($modelOverridePath)
         $overriddenDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
             -WebServiceCandidates @("Apache2.4") `
             -Services $syntheticServices `
             -SystemRoot $noSuchSystemRoot `
-            -DiscoverySettings @{ Sources = @{ MODEL = "C:\Explicit\Override\Model" } }
+            -DiscoverySettings @{ Sources = @{ MODEL = $modelOverridePath } }
         Test-BRAVOCondition `
             -Condition (
-                $overriddenDiscovery.MODEL_SOURCE -eq "C:\Explicit\Override\Model" -and
+                $overriddenDiscovery.MODEL_SOURCE -eq $modelOverridePath -and
                 [bool]$overriddenDiscovery.Overrides["MODEL"] -and
                 [string]::IsNullOrWhiteSpace([string]$overriddenDiscovery.BLOG_SOURCE)
             ) `
             -Name "Discovery/ExplicitOverrideWinsAndIsNeverReplaced" `
-            -Failure "явний discoverySettings.Sources.MODEL override має перемагати над автоматично знайденим значенням, не зачіпаючи інші поля"
+            -Failure "явний, валідний (absolute + existing) discoverySettings.Sources.MODEL override має перемагати над автоматично знайденим значенням, не зачіпаючи інші поля"
 
         $noServiceDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
@@ -12153,11 +12159,15 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $prodLoaderExplicitBlogSource = Join-Path $prodLoaderRoot 'ExplicitBlog'
             $prodLoaderExplicitBravoexchSource = Join-Path $prodLoaderRoot 'ExplicitBravoexch'
             $prodLoaderBazaWWWOverride = Join-Path $prodLoaderRoot 'ExplicitBazaWWW'
-            # Explicit override BAZA_WWW валідується на existence (на
-            # відміну від MODEL/BLOG/BRAVOEXCH override, чия existence
-            # перевіряється пізніше, при archive) — без каталогу на диску
-            # Presence був би Error, не Present.
+            # Explicit override (issue #216, ALLOW_WITH_VALIDATOR) —
+            # BAZA_WWW і MODEL/BLOG/BRAVOEXCH усі валідуються на existence
+            # у Resolve-BRAVOInstallationDiscovery (Resolve-BRAVOSourceField)
+            # — без реального каталогу на диску Presence був би Error, не
+            # Present/переможний override.
             [void][IO.Directory]::CreateDirectory($prodLoaderBazaWWWOverride)
+            [void][IO.Directory]::CreateDirectory($prodLoaderExplicitModelSource)
+            [void][IO.Directory]::CreateDirectory($prodLoaderExplicitBlogSource)
+            [void][IO.Directory]::CreateDirectory($prodLoaderExplicitBravoexchSource)
             $prodLoaderNoSuchIniPath = Join-Path $prodLoaderRoot 'NoSuchDir\bravo.ini'
 
             # --- Acceptance 1: BRAVO absent + canonical bravo.ini + usable
