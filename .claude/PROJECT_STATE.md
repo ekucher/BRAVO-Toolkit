@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — Current Project State
 
-Last verified: 2026-09-27
+Last verified: 2026-09-28
 
 ## Canonical branch
 
@@ -8,7 +8,7 @@ Last verified: 2026-09-27
 
 ## State baseline SHA
 
-`0a237ea518798bc60fff0f44b2152f5911abbb03`
+`4b672657ded1e34058baaf10ef50a04eb8b16d95`
 
 Before starting substantial work, verify:
 
@@ -270,6 +270,39 @@ Commit-message history is **not** being rewritten: `rebase`/`filter-repo` + forc
 every existing clone, every PR/issue cross-reference, and the `VERSION.json.sourceCommit` provenance chain.
 The rule therefore binds new commits only. Do not re-litigate this without new evidence.
 
+### Issue #216 B7 — LEGACY_READER_ISOLATION governance gate (PR #238, merged 2026-09-27)
+
+PR #238 (`feature/issue-216-b7-governance-hardening` → `developer`) merged as merge commit `4b67265`.
+
+Delivered:
+
+* A third governance gate, `LEGACY_READER_ISOLATION`, added to `ci/BRAVOConfigV2CutoverGates.ps1` (alongside
+  the existing `LEGACY_CONFIG_REMOVED` and `LEGACY_CONFIG_AUTOEXEC` gates, same function
+  `Test-BRAVOConfigV2CutoverGates`, dot-sourced by both `ci/New-BRAVOReleaseArtifact.ps1` and
+  `ci/Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1`). It AST-scans production entrypoints/modules and
+  fails the gate if the legacy migration-only reader functions
+  (`Read-BRAVOLegacyPrimaryRawOverrides` / `Import-BravoLegacyPrimaryConfiguration`) are called outside the
+  sanctioned call-site pairs inside `BRAVO_CONFIG_LOADER.ps1`, including through simple variable indirection
+  (`$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $reader ...`), with scope/order/reassignment/shadowing
+  and `$script:`-qualifier awareness.
+* `.github/workflows/config-v2-pilot-artifact.yml` trigger widened from a path-filtered `pull_request` to an
+  unconditional `pull_request: {}` (still not a required check).
+* 29 new regression tests in `selftest/BRAVO_SELF_TEST.Governance.ps1` (ReleaseGate fixture block).
+
+Process note: 18 Codex review findings across 7 rounds were fixed (compound-assignment mishandling,
+scriptblock-literal false positive, `AssignmentStatementAst.Right` shape assumption bug, a scope-qualifier
+regression introduced by the fixer's own round-6 commit, and others); the owner explicitly stopped the cycle
+after round 8 rather than continuing indefinitely. **8 known static-analysis limitations were deliberately
+deferred, not fixed** — documented in GitHub **issue #239** (execution-order-vs-text-offset, guard
+control-flow not verified, if/else mutually-exclusive branches not modeled, `Count=0` "exactly one call"
+gap, Set-Alias/New-Alias indirection, non-literal reassignment, typed-variable unwrapping, and the concluding
+owner decision that further hardening should be a deliberate dataflow-analysis design effort rather than more
+incremental patches). **Issue #239 remains open** — do not treat it as done or close it.
+
+This is incremental progress on the Issue #216 B7 backlog item (a permanent governance gate exists now), but
+it is **not** the full "v2-path regression matrix" and does **not** promote Config parity to a required
+status check — see item 2/3 in `NEXT ACTION` below, which still stand.
+
 ## Closed / superseded work
 
 ### PR #213
@@ -306,9 +339,14 @@ progression, and per the 2026-09-27 audit above, still is not fully current:
 B5/B7 remain open — see "Issue #216 Wave B — B4 part 2 (2026-09-27 status
 audit)"). The open Config V2 work is B5 (fleet migration — requires real
 servers, not available to an automated session) and B7 (v2-path regression
-matrix + parity required-check promotion).
+matrix + parity required-check promotion). PR #238 (merged 2026-09-27, see
+"Issue #216 B7 — LEGACY_READER_ISOLATION governance gate" above) landed one
+concrete B7 governance-gate artifact but did not close B7 as a whole — the
+regression-matrix/required-check-promotion pieces are still open, tracked as
+items 2/3 below, and 8 known static-analysis gaps in that new gate are
+tracked as open in issue #239.
 
-**No documentation PR is open as of 2026-09-27 18:00 UTC.** The AI-attribution
+**No PR is open as of 2026-09-27 18:00 UTC** (PR #238 merged; no other PR followed it in this window). The AI-attribution
 work is finished and merged: PR #235 (`f76ff42`, the rule text in
 `.claude/CLAUDE.md`) and PR #234 (`0a237ea`, this file's audited figures). Both
 went through three Codex review rounds; every content finding was verified and
@@ -440,9 +478,13 @@ item needs from the owner, so the question can be asked without re-deriving it:
    docs/BRAVO_CONFIG_V2_PILOT_MIGRATION_RUNBOOK_20260916.md. Until this happens, do NOT deploy current
    `developer` to any real fleet server — see the operational-risk note under "Issue #216 Wave B — B4 part 2"
    above (silent loss of legacy `BRAVO.config` site overrides).
-2. B7 (v2-path regression matrix + Config parity promoted to a required status check) has no distinct
-   artifact yet. Issue #216 Phase 11's checklist is the closest current restatement — decide with the owner
-   whether to treat that as the canonical B7 definition going forward, or to write a dedicated matrix.
+2. B7 (v2-path regression matrix + Config parity promoted to a required status check): PR #238 (merged
+   2026-09-27) added one governance-gate artifact (`LEGACY_READER_ISOLATION` in
+   `ci/BRAVOConfigV2CutoverGates.ps1`, see "Issue #216 B7" entry above), but the regression matrix and the
+   required-check promotion are still not distinct artifacts. Issue #216 Phase 11's checklist is the closest
+   current restatement — decide with the owner whether to treat that as the canonical B7 definition going
+   forward, or to write a dedicated matrix. 8 static-analysis limitations in the new gate are tracked, open,
+   in issue #239 — decide with the owner whether/when to pick any of those up.
 3. `developer` branch protection currently does not exist at all (see the corrected "Config parity required
    promotion" section above) - creating it needs either the repository owner acting directly in the GitHub
    UI, or a PAT with `Administration` scope, since the installed GitHub App cannot obtain that scope. A
