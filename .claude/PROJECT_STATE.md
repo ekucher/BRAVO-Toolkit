@@ -410,24 +410,37 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 entry (whose items 1-3 remain valid and are carried forward below) rather than patching it, per this file's
 maintenance rule #7.**
 
-No uncommitted work is pending and no PR is open against Issue #216. The remaining three items all need the
-owner or real servers — none can be closed by an automated session alone:
+No uncommitted work is pending and no PR is open against Issue #216. All three remaining backlog items need
+the owner or real servers, so the one concrete executable step is:
 
 ```text
-1. B5 (fleet migration) has zero evidence of execution anywhere in the repository and requires real
-   production servers. Confirm with the owner whether/when a pilot migration + fleet rollout will happen,
-   using the existing tooling (deploy/Start-BRAVOConfigV2Pilot.ps1,
-   deploy/Get-BRAVOConfigSiteDelta.ps1, deploy/Compare-BRAVOConfigEffectiveSnapshot.ps1) and the runbook
-   docs/BRAVO_CONFIG_V2_PILOT_MIGRATION_RUNBOOK_20260916.md. Until this happens, do NOT deploy current
-   `developer` to any real fleet server — see the operational-risk note under "Issue #216 Wave B — B4 part 2"
-   above (silent loss of legacy `BRAVO.config` site overrides).
-2. B7 (v2-path regression matrix + Config parity promoted to a required status check) has no distinct
-   artifact yet. Issue #216 Phase 11's checklist is the closest current restatement — decide with the owner
-   whether to treat that as the canonical B7 definition going forward, or to write a dedicated matrix.
-3. `developer` branch protection currently does not exist at all (see the corrected "Config parity required
-   promotion" section above) - creating it needs either the repository owner acting directly in the GitHub
-   UI, or a PAT with `Administration` scope, since the installed GitHub App cannot obtain that scope. A
-   candidate required-checks list and settings are recorded in that section.
+Escalate to the owner: obtain a decision on which of B5 / B7 / developer-branch-protection to prioritize
+next (see "Issue #216 backlog" below for what each entails). Do not start implementation work on any of the
+three without that prioritization decision — none can be completed by an automated session alone, and
+picking one unprompted would just substitute a guess for the owner's actual priority.
+
+Recommended default if the owner has no preference: B5 first (fleet migration) — the operational-risk note
+under "Issue #216 Wave B — B4 part 2" above means the current developer build is already unsafe to deploy to
+a real 5.2-era fleet server, which makes B5 the one with an active safety consequence for delay.
+```
+
+### Issue #216 backlog (not NEXT ACTION — status context, needs owner prioritization above)
+
+```text
+B5 (fleet migration): zero evidence of execution anywhere in the repository; requires real production
+servers. Existing tooling: deploy/Start-BRAVOConfigV2Pilot.ps1, deploy/Get-BRAVOConfigSiteDelta.ps1,
+deploy/Compare-BRAVOConfigEffectiveSnapshot.ps1; runbook:
+docs/BRAVO_CONFIG_V2_PILOT_MIGRATION_RUNBOOK_20260916.md. Until this happens, do NOT deploy current
+`developer` to any real fleet server (silent loss of legacy `BRAVO.config` site overrides).
+
+B7 (v2-path regression matrix + Config parity promoted to a required status check): no distinct artifact
+yet. Issue #216 Phase 11's checklist is the closest current restatement — needs an owner decision on whether
+to treat that as the canonical B7 definition, or write a dedicated matrix.
+
+developer branch protection: does not exist at all (see the corrected "Config parity required promotion"
+section above). Creating it needs either the repository owner acting directly in the GitHub UI, or a PAT
+with `Administration` scope, since the installed GitHub App cannot obtain that scope. A candidate
+required-checks list and settings are recorded in that section.
 ```
 
 Note for any session that reaches a merge step: merging a PR from an automated session is refused by the
