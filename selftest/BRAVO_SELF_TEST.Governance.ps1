@@ -1615,6 +1615,114 @@
         Remove-Item -LiteralPath $legacyReaderBenignIndirectFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateIgnoresReassignedIndirectionVariable ---
+    # Codex-знахідка (gate-review, R5): попередня версія тримала плаский
+    # HashSet імен змінних на весь файл — reassignment тієї самої змінної
+    # на щось безпечне ПІСЛЯ ризикового присвоєння хибно провалював би
+    # гейт, хоча реально виконується лише безпечна команда.
+    $legacyReaderReassignFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $reassignDir = Join-Path $legacyReaderReassignFixtureRoot 'modules\BRAVO.Reassign'
+        [void][IO.Directory]::CreateDirectory($reassignDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $reassignDir 'BRAVO.Reassign.psm1'),
+            "function Invoke-Reassign { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$cmd = 'Get-ChildItem'; & `$cmd -Path X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderReassignFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderReassignFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderReassignFixtureResult.Passed -and
+                @($legacyReaderReassignFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateIgnoresReassignedIndirectionVariable" `
+            -Failure "reassignment змінної на безпечне значення ПІСЛЯ ризикового присвоєння (`$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$cmd = 'Get-ChildItem'; & `$cmd) не сміє провалювати гейт LEGACY_READER_ISOLATION — реально виконується лише Get-ChildItem; отримано Failures=$($legacyReaderReassignFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderReassignFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateIsolatesIndirectionVariableByScope ---
+    # Контрольний тест до попереднього: та сама назва змінної, привласнена
+    # безпечному значенню в ІНШІЙ функції того самого файлу, не повинна
+    # хибно позначатись як ризикова через саму назву.
+    $legacyReaderScopeFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $scopeDir = Join-Path $legacyReaderScopeFixtureRoot 'modules\BRAVO.CrossScope'
+        [void][IO.Directory]::CreateDirectory($scopeDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $scopeDir 'BRAVO.CrossScope.psm1'),
+            "function Invoke-Benign { `$cmd = 'Get-ChildItem'; & `$cmd -Path X }`nfunction Invoke-BenignToo { & `$cmd -Path Y }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderScopeFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderScopeFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderScopeFixtureResult.Passed -and
+                @($legacyReaderScopeFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateIsolatesIndirectionVariableByScope" `
+            -Failure "та сама назва змінної в іншій функції, без власного присвоєння в межах ТІЄЇ функції, не сміє провалювати гейт LEGACY_READER_ISOLATION; отримано Failures=$($legacyReaderScopeFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderScopeFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateNarrowsCanonicalLoaderExemptionToSanctionedCallSites ---
+    # Codex-знахідка (gate-review, R5): попередня версія повністю
+    # виключала BRAVO_CONFIG_LOADER.ps1 зі сканування, ховаючи МАЙБУТНІЙ
+    # негвардований виклик десь-інде в тому самому файлі. Тепер файл
+    # сканується, як усі інші, але звіряється проти точного переліку
+    # санкціонованих пар (Read-... лише з Import-BravoLegacyPrimaryConfiguration,
+    # Import-BravoLegacyPrimaryConfiguration лише з Import-BravoConfiguration).
+    $legacyReaderLoaderSanctionedFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $sanctionedLoaderText = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`n" +
+            "function Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`n" +
+            "function Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); if (-not `$DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }"
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderLoaderSanctionedFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
+            $sanctionedLoaderText,
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderLoaderSanctionedFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderLoaderSanctionedFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderLoaderSanctionedFixtureResult.Passed -and
+                @($legacyReaderLoaderSanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateNarrowsCanonicalLoaderExemptionToSanctionedCallSites" `
+            -Failure "BRAVO_CONFIG_LOADER.ps1, що містить ЛИШЕ два санкціоновані внутрішні виклики (Import-BravoLegacyPrimaryConfiguration->Read-BRAVOLegacyPrimaryRawOverrides, Import-BravoConfiguration->Import-BravoLegacyPrimaryConfiguration), не сміє провалювати гейт LEGACY_READER_ISOLATION; отримано Failures=$($legacyReaderLoaderSanctionedFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderLoaderSanctionedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateDetectsUnsanctionedCallSiteInsideCanonicalLoader ---
+    # Контрольний тест до попереднього: ТРЕТІЙ, не санкціонований, виклик
+    # Read-BRAVOLegacyPrimaryRawOverrides з будь-якої іншої функції в
+    # тому самому BRAVO_CONFIG_LOADER.ps1 мусить і надалі провалювати
+    # гейт — файл більше не отримує повний file-level allowlist.
+    $legacyReaderLoaderUnsanctionedFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $unsanctionedLoaderText = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`n" +
+            "function Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`n" +
+            "function Import-BravoConfiguration { param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect); if (-not `$DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X } }`n" +
+            "function Invoke-RogueShortcut { Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath Y }"
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderLoaderUnsanctionedFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
+            $unsanctionedLoaderText,
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderLoaderUnsanctionedFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderLoaderUnsanctionedFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderLoaderUnsanctionedFixtureResult.Passed -and
+                @($legacyReaderLoaderUnsanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateDetectsUnsanctionedCallSiteInsideCanonicalLoader" `
+            -Failure "не санкціонований третій виклик Read-BRAVOLegacyPrimaryRawOverrides з довільної функції всередині самого BRAVO_CONFIG_LOADER.ps1 мусить провалювати гейт LEGACY_READER_ISOLATION"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderLoaderUnsanctionedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну

@@ -145,8 +145,15 @@ function Test-BRAVOConfigV2CutoverGates {
     # мусить узгоджено виключати той самий перелік — інакше той самий
     # інструмент, що вже офіційно поза гейтом AUTOEXEC, міг би несподівано
     # провалити ЦЕЙ гейт, щойно виконає свою санкціоновану роботу.
+    # R5 (issue #216, gate-review): BRAVO_CONFIG_LOADER.ps1 УМИСНО прибрано
+    # з цього повного file-level allowlist — на відміну від migration-
+    # інструментів нижче (чия ЗАЯВЛЕНА мета — весь файл читати legacy-шар
+    # без guard'у), цей файл — канонічний ВЛАСНИК guard'у: повне
+    # виключення ховало б МАЙБУТНІЙ негвардований виклик десь-інде в
+    # тому самому файлі. Замість цього файл сканується як усі інші, але
+    # звіряється проти точного переліку санкціонованих пар (викликана
+    # функція -> функція-викликач) нижче — $legacyReaderSanctionedCallSitePairs.
     $legacyReaderAllowedRelativePaths = @(
-        'BRAVO_CONFIG_LOADER.ps1',
         'BRAVO_CONFIG_INTEGRATE.ps1',
         'deploy\Get-BRAVOConfigSiteDelta.ps1',
         'deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1',
@@ -155,6 +162,39 @@ function Test-BRAVOConfigV2CutoverGates {
         'deploy\BRAVOConfigV2Pilot.Runtime.ps1',
         'deploy\Update-BRAVOServer.ps1'
     )
+    # R5: точні два реальні внутрішні виклики в BRAVO_CONFIG_LOADER.ps1 —
+    # Import-BravoLegacyPrimaryConfiguration викликає
+    # Read-BRAVOLegacyPrimaryRawOverrides (винесення в окрему функцію), і
+    # Import-BravoConfiguration викликає Import-BravoLegacyPrimaryConfiguration
+    # під $legacyConfigFileExists-guard'ом (гейт 2 вище доводить, що
+    # -DisallowLegacyPrimaryAutoDetect увімкнено скрізь). Будь-який ІНШИЙ
+    # виклик цих двох функцій — навіть у самому BRAVO_CONFIG_LOADER.ps1 —
+    # не санкціонований і мусить провалювати гейт.
+    $legacyReaderSanctionedCallSitePairs = @{
+        'Read-BRAVOLegacyPrimaryRawOverrides'    = 'Import-BravoLegacyPrimaryConfiguration'
+        'Import-BravoLegacyPrimaryConfiguration' = 'Import-BravoConfiguration'
+    }
+
+    function Get-BRAVOAstEnclosingFunctionName {
+        param($AstNode)
+        $current = $AstNode.Parent
+        while ($current) {
+            if ($current -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                return $current.Name
+            }
+            $current = $current.Parent
+        }
+        return $null
+    }
+
+    function Get-BRAVOAstEnclosingScriptBlock {
+        param($AstNode)
+        $current = $AstNode.Parent
+        while ($current -and -not ($current -is [System.Management.Automation.Language.ScriptBlockAst])) {
+            $current = $current.Parent
+        }
+        return $current
+    }
     # R2 (issue #216, gate-review): попередня версія обмежувалась modules\ і
     # лише 14 AUTOEXEC-цілями (Get-BRAVOProductionEntryPointRelativePath), що
     # пропускало кореневі тонкі entrypoint-обгортки поза цим списком (напр.
@@ -205,20 +245,31 @@ function Test-BRAVOConfigV2CutoverGates {
                 )
                 continue
             }
+            $legacyReaderIsCanonicalLoaderFile = [string]::Equals(
+                $fileRelativePath, 'BRAVO_CONFIG_LOADER.ps1', [StringComparison]::OrdinalIgnoreCase
+            )
+
             # R4 (issue #216, gate-review): найпростіша форма непрямого
             # виклику — `$var = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $var`
             # — CommandAst.GetCommandName() повертає null для команди-змінної,
             # тож нижче окремо збираємо ПРОСТІ прямі присвоєння змінної
-            # рядковому літералу з іменем рідера в межах цього ж файлу й
-            # зіставляємо їх із подальшими викликами через `&`/`.` тим самим
-            # іменем змінної. Це НЕ повна dataflow-аналіза (обчислені/
-            # конкатеновані імена, reassignment через параметр, значення з
-            # іншого файлу — поза межами статичного гейту; таке
-            # обфускування статичний CI-лінт принципово не може довести
-            # безпечно чи небезпечно без повного виконання) — лише
-            # найдешевший практичний випадок, який реально трапляється
-            # випадково (a не зловмисно), покрито явно.
-            $legacyReaderRiskyVariableNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            # рядковому літералу з іменем рідера в межах цього ж файлу.
+            # R5 (issue #216, gate-review): попередня версія тримала лише
+            # плаский HashSet імен змінних на весь файл — reassignment тієї
+            # самої змінної на щось безпечне ПІСЛЯ підозрілого присвоєння, чи
+            # той самий текстовий варіант імені змінної в ІНШІЙ функції,
+            # хибно позначались як FAIL. Тепер для кожного присвоєння
+            # запам'ятовуємо охоплюючий ScriptBlockAst і текстовий offset, а
+            # для кожного виклику через змінну шукаємо НАЙБЛИЖЧЕ ПОПЕРЕДНЄ
+            # (за offset) присвоєння ТІЄЇ Ж змінної в межах ТОГО САМОГО
+            # ScriptBlockAst (тобто тієї самої функції чи того самого
+            # верхньорівневого скрипта) — це не повна dataflow-аналіза
+            # (обчислені/конкатеновані імена, значення з параметра чи іншого
+            # файлу — поза межами статичного гейту; таке обфускування
+            # статичний CI-лінт принципово не може довести безпечно чи
+            # небезпечно без повного виконання), лише порядко- й
+            # scope-обізнаний найдешевший практичний випадок.
+            $legacyReaderAssignmentRecords = New-Object System.Collections.Generic.List[object]
             $legacyReaderAssignmentAsts = $legacyReaderFileAst.FindAll(
                 { param($astNode) $astNode -is [System.Management.Automation.Language.AssignmentStatementAst] },
                 $true
@@ -229,17 +280,36 @@ function Test-BRAVOConfigV2CutoverGates {
                 if ($assignmentTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
+                # R5: записуємо значення КОЖНОГО простого присвоєння рядковому
+                # літералу (не лише "ризикових") — інакше reassignment на щось
+                # безпечне ПІСЛЯ підозрілого присвоєння не мав би запису, і
+                # "найближче попереднє" знову знайшло б застаріле ризикове
+                # значення замість актуального. $assignmentValueAst — це
+                # PipelineAst/StatementAst-обгортка, тому шукаємо рядковий
+                # літерал усередині; "проста" форма присвоєння визначена як
+                # РІВНО один такий літерал у правій частині (не конкатенація/
+                # виклик команди з кількома аргументами-рядками) — інакше
+                # значення непередбачуване статично, і запис пропускається.
                 $assignmentValueStringAsts = @($assignmentValueAst.FindAll(
                     { param($astNode) $astNode -is [System.Management.Automation.Language.StringConstantExpressionAst] },
                     $true
                 ))
-                foreach ($assignmentValueStringAst in $assignmentValueStringAsts) {
-                    foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
-                        if ([string]::Equals($assignmentValueStringAst.Value, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
-                            [void]$legacyReaderRiskyVariableNames.Add($assignmentTarget.VariablePath.UserPath)
-                        }
+                if ($assignmentValueStringAsts.Count -ne 1) {
+                    continue
+                }
+                $matchedReaderFunctionName = $null
+                foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                    if ([string]::Equals($assignmentValueStringAsts[0].Value, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                        $matchedReaderFunctionName = $legacyReaderFunctionName
+                        break
                     }
                 }
+                [void]$legacyReaderAssignmentRecords.Add([pscustomobject]@{
+                    VariableName       = $assignmentTarget.VariablePath.UserPath
+                    ScriptBlock        = (Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderAssignmentAst)
+                    StartOffset        = $legacyReaderAssignmentAst.Extent.StartOffset
+                    ReaderFunctionName = $matchedReaderFunctionName
+                })
             }
 
             $legacyReaderCommandAsts = $legacyReaderFileAst.FindAll(
@@ -247,20 +317,45 @@ function Test-BRAVOConfigV2CutoverGates {
                 $true
             )
             foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
+                $enclosingFunctionName = Get-BRAVOAstEnclosingFunctionName -AstNode $legacyReaderCommandAst
                 $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
                 if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
                     foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
-                        if ([string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
-                            [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
+                        if (-not [string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            continue
                         }
+                        if ($legacyReaderIsCanonicalLoaderFile -and
+                            $legacyReaderSanctionedCallSitePairs.ContainsKey($legacyReaderFunctionName) -and
+                            [string]::Equals($legacyReaderSanctionedCallSitePairs[$legacyReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            continue
+                        }
+                        [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
                     }
                     continue
                 }
                 $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
-                if ($firstCommandElement -is [System.Management.Automation.Language.VariableExpressionAst] -and
-                    $legacyReaderRiskyVariableNames.Contains($firstCommandElement.VariablePath.UserPath)) {
-                    [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені legacy-рідера)")
+                if ($firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+                    continue
                 }
+                $callScriptBlock = Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderCommandAst
+                $callOffset = $legacyReaderCommandAst.Extent.StartOffset
+                $nearestPrecedingAssignment = $legacyReaderAssignmentRecords |
+                    Where-Object {
+                        [string]::Equals($_.VariableName, $firstCommandElement.VariablePath.UserPath, [StringComparison]::OrdinalIgnoreCase) -and
+                        [object]::ReferenceEquals($_.ScriptBlock, $callScriptBlock) -and
+                        $_.StartOffset -lt $callOffset
+                    } |
+                    Sort-Object -Property StartOffset -Descending |
+                    Select-Object -First 1
+                if (-not $nearestPrecedingAssignment -or -not $nearestPrecedingAssignment.ReaderFunctionName) {
+                    continue
+                }
+                if ($legacyReaderIsCanonicalLoaderFile -and
+                    $legacyReaderSanctionedCallSitePairs.ContainsKey($nearestPrecedingAssignment.ReaderFunctionName) -and
+                    [string]::Equals($legacyReaderSanctionedCallSitePairs[$nearestPrecedingAssignment.ReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                    continue
+                }
+                [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені legacy-рідера)")
             }
         }
     }
