@@ -109,6 +109,64 @@ function Test-BRAVOConfigV2CutoverGates {
         )
     }
 
+    # --- Гейт 3: LEGACY_READER_ISOLATION (issue #216, Phase 11 п.11) ---
+    # Import-BravoConfiguration (BRAVO_CONFIG_LOADER.ps1) сама викликає
+    # legacy-рідер лише під -DisallowLegacyPrimaryAutoDetect-guard'ом (гейт 2
+    # вище доводить, що guard увімкнено скрізь). Але той guard нічого не
+    # каже про файл, який обходить публічну Import-BravoConfiguration і
+    # звертається до рідера НАПРЯМУ — тому потрібен окремий гейт: жоден файл
+    # під modules\ чи серед production entrypoint-ів, окрім самого
+    # канонічного визначення, не сміє згадувати ці дві функції. Migration-only
+    # інструментарій під deploy\ (deploy\Get-BRAVOConfigSiteDelta.ps1 і т.п.)
+    # свідомо поза обсягом цього гейту — Issue #216 Phase 6 санкціонує йому
+    # прямий доступ до legacy-шару, і BRAVO_SELF_TEST.Configuration.ps1 вже
+    # окремо доводить, що той інструмент читає через канонічний
+    # Read-BRAVOLegacyPrimaryRawOverrides, а не власну реалізацію.
+    $legacyReaderFunctionNames = @(
+        'Import-BravoLegacyPrimaryConfiguration',
+        'Read-BRAVOLegacyPrimaryRawOverrides'
+    )
+    $legacyReaderAllowedRelativePaths = @(
+        'BRAVO_CONFIG_LOADER.ps1'
+    )
+    $legacyReaderScanTargets = @('modules') + $ProductionEntryPointRelativePath
+    $legacyReaderViolations = New-Object System.Collections.Generic.List[string]
+    $legacyReaderScannedRelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $resolvedRootPathItem = Get-Item -LiteralPath $Root
+    foreach ($scanTargetRelativePath in $legacyReaderScanTargets) {
+        $scanTargetPath = Join-Path $Root $scanTargetRelativePath
+        $scanTargetFiles = @()
+        if (Test-Path -LiteralPath $scanTargetPath -PathType Container) {
+            $scanTargetFiles = @(Get-ChildItem -LiteralPath $scanTargetPath -Recurse -File -Include '*.ps1', '*.psm1')
+        } elseif (Test-Path -LiteralPath $scanTargetPath -PathType Leaf) {
+            $scanTargetFiles = @(Get-Item -LiteralPath $scanTargetPath)
+        }
+        foreach ($scanTargetFile in $scanTargetFiles) {
+            $fileRelativePath = $scanTargetFile.FullName.Substring($resolvedRootPathItem.FullName.Length).TrimStart('\', '/')
+            if (-not $legacyReaderScannedRelativePaths.Add($fileRelativePath)) {
+                continue
+            }
+            if ($legacyReaderAllowedRelativePaths -contains $fileRelativePath) {
+                continue
+            }
+            $scanTargetFileText = Get-Content -LiteralPath $scanTargetFile.FullName -Raw -Encoding UTF8
+            foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                if ($scanTargetFileText.Contains($legacyReaderFunctionName)) {
+                    [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
+                }
+            }
+        }
+    }
+    if ($legacyReaderViolations.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт LEGACY_READER_ISOLATION (issue #216, Phase 11 п.11): ' + $legacyReaderViolations.Count +
+            ' звернення(ь) до legacy-рідера поза канонічним визначенням у modules\ чи production entrypoint-і — ' +
+            'production-код не сміє викликати Import-BravoLegacyPrimaryConfiguration/Read-BRAVOLegacyPrimaryRawOverrides ' +
+            'напряму, минаючи guard Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect: ' +
+            ([string]::Join(', ', $legacyReaderViolations.ToArray()))
+        )
+    }
+
     return [pscustomobject]@{
         Passed   = ($failures.Count -eq 0)
         Failures = @($failures.ToArray())
