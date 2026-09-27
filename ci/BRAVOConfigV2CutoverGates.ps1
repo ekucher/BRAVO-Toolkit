@@ -109,6 +109,381 @@ function Test-BRAVOConfigV2CutoverGates {
         )
     }
 
+    # --- Гейт 3: LEGACY_READER_ISOLATION (issue #216, Phase 11 п.11) ---
+    # Import-BravoConfiguration (BRAVO_CONFIG_LOADER.ps1) сама викликає
+    # legacy-рідер лише під -DisallowLegacyPrimaryAutoDetect-guard'ом (гейт 2
+    # вище доводить, що guard увімкнено скрізь). Але той guard нічого не
+    # каже про файл, який обходить публічну Import-BravoConfiguration і
+    # звертається до рідера НАПРЯМУ — тому потрібен окремий гейт: жоден файл
+    # під modules\ чи серед кореневих BRAVO_*.ps1-скриптів, окрім самого
+    # канонічного визначення, не сміє згадувати ці дві функції. Migration-only
+    # інструментарій під deploy\ (deploy\Get-BRAVOConfigSiteDelta.ps1 і т.п.)
+    # свідомо поза обсягом цього гейту — Issue #216 Phase 6 санкціонує йому
+    # прямий доступ до legacy-шару, і BRAVO_SELF_TEST.Configuration.ps1 вже
+    # окремо доводить, що той інструмент читає через канонічний
+    # Read-BRAVOLegacyPrimaryRawOverrides, а не власну реалізацію.
+    #
+    # R3 (issue #216, gate-review): текстовий `.IndexOf` бачить кожну
+    # ТЕКСТОВУ появу імені функції — включно з коментарями/help-текстом/
+    # рядковими літералами у fixture-даних self-test-ів (сам блоковий
+    # allowlist для BRAVO_SELF_TEST.ps1 у попередній версії був прямим
+    # доказом цього false-positive класу) — і водночас пропустив би
+    # реальний виклик через `& $variable`/aliasing. Замість текстового
+    # пошуку розбираємо файл через PowerShell AST і зіставляємо лише
+    # СПРАВЖНІ виклики команд (CommandAst.GetCommandName()) — коментар чи
+    # рядковий літерал з тим самим текстом більше не породжує FAIL, а
+    # окремий file-level allowlist для test-харнесу більше не потрібен.
+    $legacyReaderFunctionNames = @(
+        'Import-BravoLegacyPrimaryConfiguration',
+        'Read-BRAVOLegacyPrimaryRawOverrides'
+    )
+    # R3 (issue #216, gate-review): ci\New-BRAVOReleaseArtifact.ps1 (коментар
+    # біля рядка 200) уже документує канонічний перелік migration/deploy-
+    # інструментів, чия ЗАЯВЛЕНА мета — читати РЕАЛЬНИЙ встановлений
+    # BRAVO.config/legacy-шар (Issue #216 Phase 6 санкціонує це для
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 зокрема). Гейт LEGACY_READER_ISOLATION
+    # мусить узгоджено виключати той самий перелік — інакше той самий
+    # інструмент, що вже офіційно поза гейтом AUTOEXEC, міг би несподівано
+    # провалити ЦЕЙ гейт, щойно виконає свою санкціоновану роботу.
+    # R5 (issue #216, gate-review): BRAVO_CONFIG_LOADER.ps1 УМИСНО прибрано
+    # з цього повного file-level allowlist — на відміну від migration-
+    # інструментів нижче (чия ЗАЯВЛЕНА мета — весь файл читати legacy-шар
+    # без guard'у), цей файл — канонічний ВЛАСНИК guard'у: повне
+    # виключення ховало б МАЙБУТНІЙ негвардований виклик десь-інде в
+    # тому самому файлі. Замість цього файл сканується як усі інші, але
+    # звіряється проти точного переліку санкціонованих пар (викликана
+    # функція -> функція-викликач) нижче — $legacyReaderSanctionedCallSitePairs.
+    $legacyReaderAllowedRelativePaths = @(
+        'BRAVO_CONFIG_INTEGRATE.ps1',
+        'deploy\Get-BRAVOConfigSiteDelta.ps1',
+        'deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1',
+        'deploy\Start-BRAVOConfigV2Pilot.ps1',
+        'deploy\New-BRAVOConfigV2PilotArtifact.ps1',
+        'deploy\BRAVOConfigV2Pilot.Runtime.ps1',
+        'deploy\Update-BRAVOServer.ps1'
+    )
+    # R5: точні два реальні внутрішні виклики в BRAVO_CONFIG_LOADER.ps1 —
+    # Import-BravoLegacyPrimaryConfiguration викликає
+    # Read-BRAVOLegacyPrimaryRawOverrides (винесення в окрему функцію), і
+    # Import-BravoConfiguration викликає Import-BravoLegacyPrimaryConfiguration
+    # під $legacyConfigFileExists-guard'ом (гейт 2 вище доводить, що
+    # -DisallowLegacyPrimaryAutoDetect увімкнено скрізь). Будь-який ІНШИЙ
+    # виклик цих двох функцій — навіть у самому BRAVO_CONFIG_LOADER.ps1 —
+    # не санкціонований і мусить провалювати гейт.
+    $legacyReaderSanctionedCallSitePairs = @{
+        'Read-BRAVOLegacyPrimaryRawOverrides'    = 'Import-BravoLegacyPrimaryConfiguration'
+        'Import-BravoLegacyPrimaryConfiguration' = 'Import-BravoConfiguration'
+    }
+
+    # R9 (issue #216, gate-review): VariablePath.UserPath включає scope-
+    # префікс (`script:`, `global:`, `local:`, `private:`) як частину
+    # рядка — `$script:reader` і `$reader`, попри те що PowerShell
+    # резолвить друге з батьківського scope до того самого значення,
+    # порівнювались як РІЗНІ імена. Знімаємо відомий scope-префікс перед
+    # порівнянням.
+    function Get-BRAVOAstNormalizedVariableName {
+        param([string]$UserPath)
+        foreach ($scopePrefix in @('script:', 'global:', 'local:', 'private:', 'using:')) {
+            if ($UserPath.StartsWith($scopePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                return $UserPath.Substring($scopePrefix.Length)
+            }
+        }
+        return $UserPath
+    }
+
+    function Get-BRAVOAstEnclosingFunctionName {
+        param($AstNode)
+        $current = $AstNode.Parent
+        while ($current) {
+            if ($current -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                return $current.Name
+            }
+            $current = $current.Parent
+        }
+        return $null
+    }
+
+    function Get-BRAVOAstEnclosingScriptBlock {
+        param($AstNode)
+        $current = $AstNode.Parent
+        while ($current -and -not ($current -is [System.Management.Automation.Language.ScriptBlockAst])) {
+            $current = $current.Parent
+        }
+        return $current
+    }
+
+    # R6 (issue #216, gate-review): PowerShell лексично резолвить змінну
+    # НЕ лише в тому самому ScriptBlockAst, а й у ВСІХ охоплюючих (parent)
+    # scope — `$reader = '...'` на рівні модуля/скрипта й подальший
+    # `& $reader` всередині вкладеної функції реально виконує рідер, хоча
+    # це РІЗНІ ScriptBlockAst-об'єкти. Повертаємо весь ланцюжок
+    # охоплюючих ScriptBlockAst від найглибшого (сам вузол) до
+    # найзовнішнього (корінь файлу), щоб зіставлення могло перевірити
+    # кожен рівень.
+    function Get-BRAVOAstEnclosingScriptBlockChain {
+        param($AstNode)
+        $chain = New-Object System.Collections.Generic.List[object]
+        $current = Get-BRAVOAstEnclosingScriptBlock -AstNode $AstNode
+        while ($current) {
+            [void]$chain.Add($current)
+            $current = Get-BRAVOAstEnclosingScriptBlock -AstNode $current
+        }
+        return $chain
+    }
+    # R2 (issue #216, gate-review): попередня версія обмежувалась modules\ і
+    # лише 14 AUTOEXEC-цілями (Get-BRAVOProductionEntryPointRelativePath), що
+    # пропускало кореневі тонкі entrypoint-обгортки поза цим списком (напр.
+    # BRAVO_ARCHIV.ps1, BRAVO_HEALTH.ps1, BRAVO_MAINTENANCE.ps1,
+    # BRAVO_DATA_RESTORE.ps1, BRAVO_CONFIGURATOR.ps1) — усі кореневі
+    # BRAVO_*.ps1-скрипти є production/operator-поверхнею репозиторію
+    # (архітектурна політика 05-architecture.md), тому скануються всі, не
+    # лише підмножина з AUTOEXEC-переліку.
+    # R3 (issue #216, gate-review): deploy\ раніше не сканувався ЗОВСІМ —
+    # додано, щоб deploy\Install-BRAVOServer.ps1 та інші не-migration
+    # скрипти цього каталогу теж підлягали ізоляції.
+    $legacyReaderRootEntryScripts = @(Get-ChildItem -LiteralPath $Root -File -Filter 'BRAVO_*.ps1' -ErrorAction SilentlyContinue) |
+        ForEach-Object { $_.Name }
+    $legacyReaderScanTargets = @('modules', 'deploy') + $ProductionEntryPointRelativePath + $legacyReaderRootEntryScripts
+    $legacyReaderViolations = New-Object System.Collections.Generic.List[string]
+    $legacyReaderScannedRelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $resolvedRootPathItem = Get-Item -LiteralPath $Root
+    foreach ($scanTargetRelativePath in $legacyReaderScanTargets) {
+        $scanTargetPath = Join-Path $Root $scanTargetRelativePath
+        $scanTargetFiles = @()
+        if (Test-Path -LiteralPath $scanTargetPath -PathType Container) {
+            # R3: `-Include` разом із `-LiteralPath` на Windows PowerShell 5.1
+            # ненадійний (відомий gotcha — фільтр мовчки ігнорується), тому
+            # розширення відфільтровано вручну після перерахування файлів.
+            $scanTargetFiles = @(Get-ChildItem -LiteralPath $scanTargetPath -Recurse -File |
+                Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.psm1' })
+        } elseif (Test-Path -LiteralPath $scanTargetPath -PathType Leaf) {
+            $scanTargetFiles = @(Get-Item -LiteralPath $scanTargetPath)
+        }
+        foreach ($scanTargetFile in $scanTargetFiles) {
+            $fileRelativePath = $scanTargetFile.FullName.Substring($resolvedRootPathItem.FullName.Length).TrimStart('\', '/')
+            if (-not $legacyReaderScannedRelativePaths.Add($fileRelativePath)) {
+                continue
+            }
+            if ($legacyReaderAllowedRelativePaths -contains $fileRelativePath) {
+                continue
+            }
+            $scanTargetFileText = Get-Content -LiteralPath $scanTargetFile.FullName -Raw -Encoding UTF8
+            $legacyReaderParseErrors = $null
+            $legacyReaderFileAst = [System.Management.Automation.Language.Parser]::ParseInput(
+                $scanTargetFileText, [ref]$null, [ref]$legacyReaderParseErrors
+            )
+            if ($legacyReaderParseErrors -and $legacyReaderParseErrors.Count -gt 0) {
+                # Fail closed: незрозумілий для парсера файл не можна довести
+                # безпечним — гейт відмовляє явно, а не мовчки пропускає скан.
+                [void]$legacyReaderViolations.Add(
+                    "$fileRelativePath (не вдалося розібрати AST для перевірки LEGACY_READER_ISOLATION: $($legacyReaderParseErrors[0].Message))"
+                )
+                continue
+            }
+            $legacyReaderIsCanonicalLoaderFile = [string]::Equals(
+                $fileRelativePath, 'BRAVO_CONFIG_LOADER.ps1', [StringComparison]::OrdinalIgnoreCase
+            )
+
+            # R4 (issue #216, gate-review): найпростіша форма непрямого
+            # виклику — `$var = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $var`
+            # — CommandAst.GetCommandName() повертає null для команди-змінної,
+            # тож нижче окремо збираємо ПРОСТІ прямі присвоєння змінної
+            # рядковому літералу з іменем рідера в межах цього ж файлу.
+            # R5 (issue #216, gate-review): попередня версія тримала лише
+            # плаский HashSet імен змінних на весь файл — reassignment тієї
+            # самої змінної на щось безпечне ПІСЛЯ підозрілого присвоєння, чи
+            # той самий текстовий варіант імені змінної в ІНШІЙ функції,
+            # хибно позначались як FAIL. Тепер для кожного присвоєння
+            # запам'ятовуємо охоплюючий ScriptBlockAst і текстовий offset, а
+            # для кожного виклику через змінну шукаємо НАЙБЛИЖЧЕ ПОПЕРЕДНЄ
+            # (за offset) присвоєння ТІЄЇ Ж змінної в межах ТОГО САМОГО
+            # ScriptBlockAst (тобто тієї самої функції чи того самого
+            # верхньорівневого скрипта) — це не повна dataflow-аналіза
+            # (обчислені/конкатеновані імена, значення з параметра чи іншого
+            # файлу — поза межами статичного гейту; таке обфускування
+            # статичний CI-лінт принципово не може довести безпечно чи
+            # небезпечно без повного виконання), лише порядко- й
+            # scope-обізнаний найдешевший практичний випадок.
+            $legacyReaderAssignmentRecords = New-Object System.Collections.Generic.List[object]
+            $legacyReaderAssignmentAsts = $legacyReaderFileAst.FindAll(
+                { param($astNode) $astNode -is [System.Management.Automation.Language.AssignmentStatementAst] },
+                $true
+            )
+            foreach ($legacyReaderAssignmentAst in $legacyReaderAssignmentAsts) {
+                $assignmentTarget = $legacyReaderAssignmentAst.Left
+                $assignmentValueAst = $legacyReaderAssignmentAst.Right
+                if ($assignmentTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+                    continue
+                }
+                # R8 (issue #216, gate-review): складене присвоєння (`+=` і
+                # подібні) НЕ замінює значення змінної — воно доповнює
+                # попереднє. Записувати його як "нове" значення (в т.ч. як
+                # "безпечне" reassignment) хибно перекрило б реально
+                # ризикове попереднє присвоєння. Лише простий `=` трактується
+                # як повна заміна; складене присвоєння пропускається зі
+                # списку записів, тож попередній простий запис лишається
+                # найближчим авторитетним значенням.
+                if ($legacyReaderAssignmentAst.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
+                    continue
+                }
+                # R5: записуємо значення КОЖНОГО простого присвоєння рядковому
+                # літералу (не лише "ризикових") — інакше reassignment на щось
+                # безпечне ПІСЛЯ підозрілого присвоєння не мав би запису, і
+                # "найближче попереднє" знову знайшло б застаріле ризикове
+                # значення замість актуального.
+                # R9 (issue #216, gate-review): попередня версія шукала БУДЬ-
+                # ЯКИЙ StringConstantExpressionAst у правій частині рекурсивно
+                # через FindAll — це заходило й у ВКЛАДЕНІ scriptblock-и:
+                # `$cmd = { 'Read-...' }` записувало ризиковий літерал, хоча
+                # `& $cmd` реально виконує СКРИПТБЛОК (що лише повертає текст,
+                # не викликає команду). "Проста" форма присвоєння тепер
+                # визначена якомога вужче: права частина — це PipelineAst з
+                # РІВНО ОДНИМ CommandExpressionAst, чий вираз — САМЕ
+                # StringConstantExpressionAst (без розпаковування вкладених
+                # scriptblock/підвиразів) — не рекурсивний пошук.
+                $assignmentValueLiteralAst = $null
+                if ($assignmentValueAst -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                    $assignmentValueLiteralAst = $assignmentValueAst.Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
+                } elseif ($assignmentValueAst -is [System.Management.Automation.Language.PipelineAst] -and
+                    $assignmentValueAst.PipelineElements.Count -eq 1 -and
+                    $assignmentValueAst.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                    $assignmentValueLiteralAst = $assignmentValueAst.PipelineElements[0].Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
+                }
+                if (-not $assignmentValueLiteralAst) {
+                    continue
+                }
+                $matchedReaderFunctionName = $null
+                foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                    if ([string]::Equals($assignmentValueLiteralAst.Value, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                        $matchedReaderFunctionName = $legacyReaderFunctionName
+                        break
+                    }
+                }
+                [void]$legacyReaderAssignmentRecords.Add([pscustomobject]@{
+                    VariableName       = (Get-BRAVOAstNormalizedVariableName -UserPath $assignmentTarget.VariablePath.UserPath)
+                    ScriptBlock        = (Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderAssignmentAst)
+                    StartOffset        = $legacyReaderAssignmentAst.Extent.StartOffset
+                    ReaderFunctionName = $matchedReaderFunctionName
+                })
+            }
+
+            # R7 (issue #216, gate-review): "той самий callee викликаний із
+            # санкціонованого викликача" перевіряє лише ІМ'Я охоплюючої
+            # функції, не ідентичність/control-flow конкретного guard'ованого
+            # виклику — додатковий, ще не написаний виклик усередині ТІЄЇ Ж
+            # санкціонованої функції (напр. поза $legacyConfigFileExists-
+            # guard'ом) пройшов би так само непоміченим. Повна перевірка
+            # control-flow guard'у статичним AST-гейтом невиправдано складна
+            # (довелося б відтворити семантику довільного if/else); натомість
+            # — дешева, детерміністична інваріанта: у кожної санкціонованої
+            # пари має бути РІВНО ОДИН виклик з відповідного викликача в
+            # усьому файлі. Другий (і будь-який подальший) виклик того самого
+            # callee з того самого санкціонованого викликача провалює гейт.
+            $legacyReaderSanctionedCallSiteHits = New-Object System.Collections.Generic.List[object]
+
+            $legacyReaderCommandAsts = $legacyReaderFileAst.FindAll(
+                { param($astNode) $astNode -is [System.Management.Automation.Language.CommandAst] },
+                $true
+            )
+            foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
+                $enclosingFunctionName = Get-BRAVOAstEnclosingFunctionName -AstNode $legacyReaderCommandAst
+                $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
+                if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
+                    foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                        if (-not [string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            continue
+                        }
+                        if ($legacyReaderIsCanonicalLoaderFile -and
+                            $legacyReaderSanctionedCallSitePairs.ContainsKey($legacyReaderFunctionName) -and
+                            [string]::Equals($legacyReaderSanctionedCallSitePairs[$legacyReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            [void]$legacyReaderSanctionedCallSiteHits.Add($legacyReaderFunctionName)
+                            continue
+                        }
+                        [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
+                    }
+                    continue
+                }
+                $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
+                if ($firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+                    continue
+                }
+                # R6: перевіряємо КОЖЕН рівень охоплюючого scope (від
+                # найглибшого до кореня файлу) — лексичний scoping
+                # PowerShell резолвить змінну назовні, якщо в поточній
+                # функції немає власного присвоєння; перший рівень із
+                # найближчим ПОПЕРЕДНІМ присвоєнням (за offset ТОГО САМОГО
+                # рівня) вважається джерелом значення — це відтворює
+                # звичайне затінення (shadowing), а не повну dataflow.
+                # R10 (issue #216, gate-review): R9 знімала scope-префікс з
+                # ІМЕНІ змінної для порівняння, але це стирало ЗМІСТ
+                # префікса в місці ВИКЛИКУ — явний `& $script:reader`
+                # цілеспрямовано звертається ЛИШЕ до script-scope (кореня
+                # файлу), навіть якщо вкладена функція має власне
+                # незакваліфіковане `$reader` ближче. Тому обхід по scope-
+                # ланцюжку тепер звужується залежно від кваліфікатора В
+                # МІСЦІ ВИКЛИКУ: незакваліфіковане ім'я — повний ланцюжок
+                # (як і раніше); `script:` — лише корінь файлу (найзовнішній
+                # рівень ланцюжка); будь-який інший кваліфікатор
+                # (`global:`/`local:`/`private:`/drive-qualified) — поза
+                # межами цієї статичної евристики, не зіставляється.
+                $callScopeChain = @(Get-BRAVOAstEnclosingScriptBlockChain -AstNode $legacyReaderCommandAst)
+                $callVariablePath = $firstCommandElement.VariablePath
+                if ($callVariablePath.IsScript) {
+                    $callScopeLevelsToSearch = @($callScopeChain | Select-Object -Last 1)
+                } elseif ($callVariablePath.IsUnqualified) {
+                    $callScopeLevelsToSearch = $callScopeChain
+                } else {
+                    $callScopeLevelsToSearch = @()
+                }
+                $callOffset = $legacyReaderCommandAst.Extent.StartOffset
+                $nearestPrecedingAssignment = $null
+                foreach ($callScopeLevel in $callScopeLevelsToSearch) {
+                    $nearestPrecedingAssignment = $legacyReaderAssignmentRecords |
+                        Where-Object {
+                            [string]::Equals($_.VariableName, (Get-BRAVOAstNormalizedVariableName -UserPath $callVariablePath.UserPath), [StringComparison]::OrdinalIgnoreCase) -and
+                            [object]::ReferenceEquals($_.ScriptBlock, $callScopeLevel) -and
+                            $_.StartOffset -lt $callOffset
+                        } |
+                        Sort-Object -Property StartOffset -Descending |
+                        Select-Object -First 1
+                    if ($nearestPrecedingAssignment) {
+                        break
+                    }
+                }
+                if (-not $nearestPrecedingAssignment -or -not $nearestPrecedingAssignment.ReaderFunctionName) {
+                    continue
+                }
+                if ($legacyReaderIsCanonicalLoaderFile -and
+                    $legacyReaderSanctionedCallSitePairs.ContainsKey($nearestPrecedingAssignment.ReaderFunctionName) -and
+                    [string]::Equals($legacyReaderSanctionedCallSitePairs[$nearestPrecedingAssignment.ReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                    [void]$legacyReaderSanctionedCallSiteHits.Add($nearestPrecedingAssignment.ReaderFunctionName)
+                    continue
+                }
+                [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені legacy-рідера)")
+            }
+
+            if ($legacyReaderIsCanonicalLoaderFile) {
+                $legacyReaderSanctionedCallSiteHits |
+                    Group-Object |
+                    Where-Object { $_.Count -gt 1 } |
+                    ForEach-Object {
+                        [void]$legacyReaderViolations.Add(
+                            "$fileRelativePath ($($_.Name): знайдено $($_.Count) виклик(ів) із санкціонованого викликача — очікується рівно 1; додатковий виклик поза відомим guard'ом підозрілий)"
+                        )
+                    }
+            }
+        }
+    }
+    if ($legacyReaderViolations.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт LEGACY_READER_ISOLATION (issue #216, Phase 11 п.11): ' + $legacyReaderViolations.Count +
+            ' звернення(ь) до legacy-рідера поза канонічним визначенням у modules\ чи кореневому BRAVO_*.ps1 — ' +
+            'production-код не сміє викликати Import-BravoLegacyPrimaryConfiguration/Read-BRAVOLegacyPrimaryRawOverrides ' +
+            'напряму, минаючи guard Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect: ' +
+            ([string]::Join(', ', $legacyReaderViolations.ToArray()))
+        )
+    }
+
     return [pscustomobject]@{
         Passed   = ($failures.Count -eq 0)
         Failures = @($failures.ToArray())
