@@ -2832,3 +2832,106 @@ try {
             "конфігурацію production-entrypoint-а, що передає -DisallowLegacyPrimaryAutoDetect: очікувалось " +
             "RETENTION=31 (canonical-дефолт), FORMAT=synthetic-no-config, BLOCKED=True, PRESENT=True; отримано '$postUpdateProtected'")
 }
+
+# Issue #216 (Phase 11, п.8): "malformed local config fails closed" мав
+# fail-closed throw-шляхи в Read-BRAVOLocalConfigurationOverrides
+# (BRAVO_CONFIG_LOADER.ps1: "мусить бути data-only hashtable", "мусить
+# повертати hashtable", "порожній ключ неприпустимий") від початку
+# ConvertFrom-BRAVOConfigurationDataFileText-переходу (#154, B1), але без
+# regression-покриття НА РІВНІ повного Import-BravoConfiguration-конвеєра
+# (лише DataFile/Rejects*-тести на самому парсері вище в цьому файлі,
+# т.з. #154). Тут — наскрізний доказ: реальний зіпсований
+# BRAVO.local.config кидає той самий throw через увесь конвеєр, і жоден
+# валідний сусідній override з того самого некоректного файлу не потрапляє
+# в ефективний `$global:`-стан (той самий атомарний контракт, що
+# Authorization/LoaderAtomicMergeRejectsWholeLocalLayer вище, але
+# тригер — синтаксична/типова несправність файлу, не DENY-лист).
+& {
+    function Invoke-BRAVOMalformedLocalConfigProbe {
+        param(
+            [Parameter(Mandatory = $true)][string]$LocalConfigBody
+        )
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) `
+            ("BRAVO_MALFORMED_LOCAL_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.local.config'), $LocalConfigBody, (New-Object System.Text.UTF8Encoding($false)))
+            # Немає BRAVO.config: throw у Read-BRAVOLocalConfigurationOverrides
+            # трапляється ДО обчислення BackupRoot/derivation, тому синтетичний
+            # no-config-шлях сюди не доходить — герметичний BackupRoot-фікстур
+            # не потрібен (на відміну від PostUpdateStaleConfig-проб вище).
+            $probeCommand = (
+                "try { " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root' 3>`$null); " +
+                "'NOTHREW:ArchiveRetentionDays=' + [string]`$global:archiveRetentionDays " +
+                "} catch { " +
+                "`$archiveVar = Get-Variable -Name 'archiveRetentionDays' -Scope Global -ErrorAction SilentlyContinue; " +
+                "`$archiveState = if (`$null -eq `$archiveVar) { '<unset>' } else { [string]`$archiveVar.Value }; " +
+                "'THREW:' + `$_.Exception.Message + ';ArchiveRetentionDaysAfterThrow=' + `$archiveState" +
+                "}"
+            )
+            $probeOutput = [string](
+                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            )
+            return $probeOutput.Trim()
+        } finally {
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- ConfigLoader/MalformedLocalConfigSyntaxErrorFailsClosed ---
+    # Незакрита дужка — синтаксична помилка ловиться самим парсером AST
+    # (ConvertFrom-BRAVOConfigurationDataFileText), обгортається
+    # "мусить бути data-only hashtable".
+    $malformedSyntaxResult = Invoke-BRAVOMalformedLocalConfigProbe -LocalConfigBody "@{`r`n    'archiveRetentionDays' = 999`r`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $malformedSyntaxResult.StartsWith('THREW:') -and
+            $malformedSyntaxResult.Contains('мусить бути data-only hashtable') -and
+            $malformedSyntaxResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+        ) `
+        -Name "ConfigLoader/MalformedLocalConfigSyntaxErrorFailsClosed" `
+        -Failure "BRAVO.local.config із синтаксичною помилкою (незакрита @{ ) мусить fail closed через увесь Import-BravoConfiguration-конвеєр з повідомленням про data-only hashtable, і archiveRetentionDays НЕ повинен потрапити в ефективний `$global:-стан; отримано: $malformedSyntaxResult"
+
+    # --- ConfigLoader/MalformedLocalConfigNonHashtableTopLevelFailsClosed ---
+    # Валідний PowerShell-літерал, але НЕ hashtable на верхньому рівні —
+    # масив рядків. ConvertFrom-BRAVOConfigurationDataFileText сам кидає
+    # виняток на такій формі (не hashtable-літерал), і Read-
+    # BRAVOLocalConfigurationOverrides ловить його тим самим зовнішнім
+    # catch, що й синтаксичну помилку вище — обгортає тим самим "мусить
+    # бути data-only hashtable" (перевірено емпірично: рядок 348
+    # BRAVO_CONFIG_LOADER.ps1, "мусить повертати hashtable", технічно
+    # недосяжний через публічний шлях парсера — цей парсер завжди або
+    # повертає справжній [hashtable], або кидає виняток раніше).
+    $malformedArrayResult = Invoke-BRAVOMalformedLocalConfigProbe -LocalConfigBody "@('archiveRetentionDays', 999)`r`n"
+    Test-BRAVOCondition `
+        -Condition (
+            $malformedArrayResult.StartsWith('THREW:') -and
+            $malformedArrayResult.Contains('мусить бути data-only hashtable') -and
+            $malformedArrayResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+        ) `
+        -Name "ConfigLoader/MalformedLocalConfigNonHashtableTopLevelFailsClosed" `
+        -Failure "BRAVO.local.config, що повертає масив замість hashtable, мусить fail closed через увесь конвеєр з повідомленням про очікуваний data-only hashtable, і archiveRetentionDays НЕ повинен потрапити в ефективний `$global:-стан; отримано: $malformedArrayResult"
+
+    # --- ConfigLoader/MalformedLocalConfigEmptyKeyFailsClosed ---
+    # Синтаксично коректний hashtable, але з порожнім ключем поруч із
+    # валідним override — доводить атомарність: сусідній валідний
+    # archiveRetentionDays теж НЕ застосовується.
+    $malformedEmptyKeyResult = Invoke-BRAVOMalformedLocalConfigProbe -LocalConfigBody (
+        "@{`r`n" +
+        "    'archiveRetentionDays' = 999`r`n" +
+        "    '' = 'orphaned-value'`r`n" +
+        "}`r`n"
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $malformedEmptyKeyResult.StartsWith('THREW:') -and
+            $malformedEmptyKeyResult.Contains('порожній ключ неприпустимий') -and
+            $malformedEmptyKeyResult.Contains('ArchiveRetentionDaysAfterThrow=<unset>')
+        ) `
+        -Name "ConfigLoader/MalformedLocalConfigEmptyKeyFailsClosed" `
+        -Failure "BRAVO.local.config з порожнім ключем поруч із валідним override мусить fail closed ЦІЛИМ шаром (атомарно) — сусідній archiveRetentionDays=999 НЕ повинен потрапити в ефективний `$global:-стан; отримано: $malformedEmptyKeyResult"
+}
