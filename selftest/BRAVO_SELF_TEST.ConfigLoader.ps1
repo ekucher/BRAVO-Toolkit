@@ -2166,10 +2166,41 @@ try {
             # не видаляється) за auto-derived шляхом ($ConfigRoot\BRAVO.config),
             # БЕЗ жодного явного -ConfigPath — точний контракт "оператор його
             # не запитував".
-            $staleText = (Get-BRAVOSelfTestLegacyConfigText) + "`r`n" +
-                '$global:logRetentionDays = 999' + "`r`n"
+            # BackupRoot="" (AUTO) вимагає EffectiveLIMSRoot, похідного від
+            # реальної служби BRAVO на хості — на self-test/CI-хості такої
+            # служби немає. Тест перевіряє лише RETENTION/FORMAT/BLOCKED/
+            # PRESENT, не BackupRoot, тож запікаємо явний літерал (той самий
+            # паттерн, що й інші сценарії вище в цьому файлі).
+            $staleBackupDir = Join-Path $scenarioRoot 'BACKUP'
+            [void][IO.Directory]::CreateDirectory($staleBackupDir)
+            $staleBackupRootLiteralLine = '    BackupRoot    = ""'
+            $staleKitText = (Get-BRAVOSelfTestLegacyConfigText)
+            if (-not $staleKitText.Contains($staleBackupRootLiteralLine)) {
+                throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$staleBackupRootLiteralLine' — оновіть підготовку post-update-stale-config сценарію під нову форму конфігурації"
+            }
+            $staleText = $staleKitText.Replace(
+                $staleBackupRootLiteralLine,
+                "    BackupRoot    = '$($staleBackupDir.Replace("'", "''"))'"
+            ) + "`r`n" + '$global:logRetentionDays = 999' + "`r`n"
             [IO.File]::WriteAllText(
                 (Join-Path $scenarioRoot 'BRAVO.config'), $staleText, (New-Object System.Text.UTF8Encoding($false)))
+
+            # Заблокований ($DisallowAutoDetect) прогін ІГНОРУЄ BRAVO.config
+            # повністю й переходить на Import-BravoSyntheticConfiguration —
+            # той самий "герметичність на машині без LIMS" паттерн, що й
+            # ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic вище:
+            # BackupRoot="" (canonical-дефолт) все ще вимагає
+            # EffectiveLIMSRoot, тож синтетичний шлях теж потребує
+            # BRAVO.local.config з явним BackupRoot.
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.local.config'),
+                (
+                    "@{`r`n" +
+                    "    'pathSettings.BackupRoot' = '$($staleBackupDir.Replace("'", "''"))'`r`n" +
+                    "}`r`n"
+                ),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
 
             $disallowArg = if ($DisallowAutoDetect) { ' -DisallowLegacyPrimaryAutoDetect' } else { '' }
             $probeCommand = (
