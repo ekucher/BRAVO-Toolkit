@@ -299,6 +299,17 @@ function Test-BRAVOConfigV2CutoverGates {
                 if ($assignmentTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
+                # R8 (issue #216, gate-review): складене присвоєння (`+=` і
+                # подібні) НЕ замінює значення змінної — воно доповнює
+                # попереднє. Записувати його як "нове" значення (в т.ч. як
+                # "безпечне" reassignment) хибно перекрило б реально
+                # ризикове попереднє присвоєння. Лише простий `=` трактується
+                # як повна заміна; складене присвоєння пропускається зі
+                # списку записів, тож попередній простий запис лишається
+                # найближчим авторитетним значенням.
+                if ($legacyReaderAssignmentAst.Operator -ne [System.Management.Automation.Language.TokenKind]::Equals) {
+                    continue
+                }
                 # R5: записуємо значення КОЖНОГО простого присвоєння рядковому
                 # літералу (не лише "ризикових") — інакше reassignment на щось
                 # безпечне ПІСЛЯ підозрілого присвоєння не мав би запису, і

@@ -1812,6 +1812,35 @@
         Remove-Item -LiteralPath $legacyReaderSecondCallFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateTreatsCompoundAssignmentAsNonReplacing ---
+    # Codex-знахідка (gate-review, R8) — РЕАЛЬНИЙ баг у самій реалізації
+    # гейту (не крайовий випадок статичного аналізу): складене присвоєння
+    # (`+=`) не ЗАМІНЮЄ значення змінної, а доповнює його, але попередня
+    # версія записувала будь-який AssignmentStatementAst як повну заміну —
+    # `$cmd += ''` після ризикового `$cmd = 'Read-...'` хибно "очищав"
+    # запис, і подальший `& $cmd` (що реально й надалі викликає рідер)
+    # проходив гейт непоміченим.
+    $legacyReaderCompoundAssignFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $compoundAssignDir = Join-Path $legacyReaderCompoundAssignFixtureRoot 'modules\BRAVO.CompoundAssign'
+        [void][IO.Directory]::CreateDirectory($compoundAssignDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $compoundAssignDir 'BRAVO.CompoundAssign.psm1'),
+            "function Invoke-Sneaky { `$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'; `$cmd += ''; & `$cmd -ConfigPath X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderCompoundAssignFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderCompoundAssignFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderCompoundAssignFixtureResult.Passed -and
+                @($legacyReaderCompoundAssignFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO.CompoundAssign.psm1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateTreatsCompoundAssignmentAsNonReplacing" `
+            -Failure "складене присвоєння (+=) ПІСЛЯ ризикового простого присвоєння (`$cmd = 'Read-...'; `$cmd += ''; & `$cmd) не сміє 'очищати' ризиковий запис — PowerShell реально й надалі викликає рідер, гейт мусить провалюватись"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderCompoundAssignFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну
