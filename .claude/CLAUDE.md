@@ -470,13 +470,23 @@ commit-повідомленнях немає жодного — борг скл�
    harness. В історії присутні обидва написання (694 рядки одного, 16
    іншого), тому матч **обов'язково case-insensitive** (`-i`).
 
-Перед вимірюванням:
+Відтворення чисел вище. Ref — **незмінний `64a8b11`**, а не рухомий
+`origin/developer`: інакше результат поповзе з кожним новим комітом і
+перестане відтворювати зафіксовану базову лінію. Компоненти — окремими
+викликами, бо кілька `--grep` в одному виклику дають об'єднання (OR), а не
+кожен набір:
 
 ```text
-git rev-parse --is-shallow-repository      # має бути false
-git fetch --unshallow origin               # якщо true
-git rev-list --count -i --grep='<co-author trailer>' --grep='<session trailer>' origin/developer
+git rev-parse --is-shallow-repository                                   # має бути false
+git fetch --unshallow origin                                            # якщо true
+git rev-list --count 64a8b11                                            # 1073
+git rev-list --count -i --grep='<co-author trailer>' 64a8b11            # 690
+git rev-list --count -i --grep='<session trailer>'   64a8b11            # 511
+git rev-list --count -i --grep='<co-author trailer>' --grep='<session trailer>' 64a8b11   # 690 (об'єднання)
 ```
+
+Щоб міряти поточний стан, а не базову лінію, підстав актуальний commit
+`developer` замість `64a8b11` — і зафіксуй, який саме.
 
 Підстав замість заповнювачів фактичні рядки трейлерів. Вони тут навмисно не
 наведені дослівно: інакше механічний сканер заборонених приписок відмічав би
