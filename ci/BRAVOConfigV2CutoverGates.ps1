@@ -195,6 +195,25 @@ function Test-BRAVOConfigV2CutoverGates {
         }
         return $current
     }
+
+    # R6 (issue #216, gate-review): PowerShell лексично резолвить змінну
+    # НЕ лише в тому самому ScriptBlockAst, а й у ВСІХ охоплюючих (parent)
+    # scope — `$reader = '...'` на рівні модуля/скрипта й подальший
+    # `& $reader` всередині вкладеної функції реально виконує рідер, хоча
+    # це РІЗНІ ScriptBlockAst-об'єкти. Повертаємо весь ланцюжок
+    # охоплюючих ScriptBlockAst від найглибшого (сам вузол) до
+    # найзовнішнього (корінь файлу), щоб зіставлення могло перевірити
+    # кожен рівень.
+    function Get-BRAVOAstEnclosingScriptBlockChain {
+        param($AstNode)
+        $chain = New-Object System.Collections.Generic.List[object]
+        $current = Get-BRAVOAstEnclosingScriptBlock -AstNode $AstNode
+        while ($current) {
+            [void]$chain.Add($current)
+            $current = Get-BRAVOAstEnclosingScriptBlock -AstNode $current
+        }
+        return $chain
+    }
     # R2 (issue #216, gate-review): попередня версія обмежувалась modules\ і
     # лише 14 AUTOEXEC-цілями (Get-BRAVOProductionEntryPointRelativePath), що
     # пропускало кореневі тонкі entrypoint-обгортки поза цим списком (напр.
@@ -312,6 +331,20 @@ function Test-BRAVOConfigV2CutoverGates {
                 })
             }
 
+            # R7 (issue #216, gate-review): "той самий callee викликаний із
+            # санкціонованого викликача" перевіряє лише ІМ'Я охоплюючої
+            # функції, не ідентичність/control-flow конкретного guard'ованого
+            # виклику — додатковий, ще не написаний виклик усередині ТІЄЇ Ж
+            # санкціонованої функції (напр. поза $legacyConfigFileExists-
+            # guard'ом) пройшов би так само непоміченим. Повна перевірка
+            # control-flow guard'у статичним AST-гейтом невиправдано складна
+            # (довелося б відтворити семантику довільного if/else); натомість
+            # — дешева, детерміністична інваріанта: у кожної санкціонованої
+            # пари має бути РІВНО ОДИН виклик з відповідного викликача в
+            # усьому файлі. Другий (і будь-який подальший) виклик того самого
+            # callee з того самого санкціонованого викликача провалює гейт.
+            $legacyReaderSanctionedCallSiteHits = New-Object System.Collections.Generic.List[object]
+
             $legacyReaderCommandAsts = $legacyReaderFileAst.FindAll(
                 { param($astNode) $astNode -is [System.Management.Automation.Language.CommandAst] },
                 $true
@@ -327,6 +360,7 @@ function Test-BRAVOConfigV2CutoverGates {
                         if ($legacyReaderIsCanonicalLoaderFile -and
                             $legacyReaderSanctionedCallSitePairs.ContainsKey($legacyReaderFunctionName) -and
                             [string]::Equals($legacyReaderSanctionedCallSitePairs[$legacyReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            [void]$legacyReaderSanctionedCallSiteHits.Add($legacyReaderFunctionName)
                             continue
                         }
                         [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
@@ -337,25 +371,49 @@ function Test-BRAVOConfigV2CutoverGates {
                 if ($firstCommandElement -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
                     continue
                 }
-                $callScriptBlock = Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderCommandAst
+                # R6: перевіряємо КОЖЕН рівень охоплюючого scope (від
+                # найглибшого до кореня файлу) — лексичний scoping
+                # PowerShell резолвить змінну назовні, якщо в поточній
+                # функції немає власного присвоєння; перший рівень із
+                # найближчим ПОПЕРЕДНІМ присвоєнням (за offset ТОГО САМОГО
+                # рівня) вважається джерелом значення — це відтворює
+                # звичайне затінення (shadowing), а не повну dataflow.
                 $callOffset = $legacyReaderCommandAst.Extent.StartOffset
-                $nearestPrecedingAssignment = $legacyReaderAssignmentRecords |
-                    Where-Object {
-                        [string]::Equals($_.VariableName, $firstCommandElement.VariablePath.UserPath, [StringComparison]::OrdinalIgnoreCase) -and
-                        [object]::ReferenceEquals($_.ScriptBlock, $callScriptBlock) -and
-                        $_.StartOffset -lt $callOffset
-                    } |
-                    Sort-Object -Property StartOffset -Descending |
-                    Select-Object -First 1
+                $nearestPrecedingAssignment = $null
+                foreach ($callScopeLevel in (Get-BRAVOAstEnclosingScriptBlockChain -AstNode $legacyReaderCommandAst)) {
+                    $nearestPrecedingAssignment = $legacyReaderAssignmentRecords |
+                        Where-Object {
+                            [string]::Equals($_.VariableName, $firstCommandElement.VariablePath.UserPath, [StringComparison]::OrdinalIgnoreCase) -and
+                            [object]::ReferenceEquals($_.ScriptBlock, $callScopeLevel) -and
+                            $_.StartOffset -lt $callOffset
+                        } |
+                        Sort-Object -Property StartOffset -Descending |
+                        Select-Object -First 1
+                    if ($nearestPrecedingAssignment) {
+                        break
+                    }
+                }
                 if (-not $nearestPrecedingAssignment -or -not $nearestPrecedingAssignment.ReaderFunctionName) {
                     continue
                 }
                 if ($legacyReaderIsCanonicalLoaderFile -and
                     $legacyReaderSanctionedCallSitePairs.ContainsKey($nearestPrecedingAssignment.ReaderFunctionName) -and
                     [string]::Equals($legacyReaderSanctionedCallSitePairs[$nearestPrecedingAssignment.ReaderFunctionName], $enclosingFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                    [void]$legacyReaderSanctionedCallSiteHits.Add($nearestPrecedingAssignment.ReaderFunctionName)
                     continue
                 }
                 [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені legacy-рідера)")
+            }
+
+            if ($legacyReaderIsCanonicalLoaderFile) {
+                $legacyReaderSanctionedCallSiteHits |
+                    Group-Object |
+                    Where-Object { $_.Count -gt 1 } |
+                    ForEach-Object {
+                        [void]$legacyReaderViolations.Add(
+                            "$fileRelativePath ($($_.Name): знайдено $($_.Count) виклик(ів) із санкціонованого викликача — очікується рівно 1; додатковий виклик поза відомим guard'ом підозрілий)"
+                        )
+                    }
             }
         }
     }

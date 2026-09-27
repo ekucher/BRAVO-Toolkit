@@ -1723,6 +1723,95 @@
         Remove-Item -LiteralPath $legacyReaderLoaderUnsanctionedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateResolvesIndirectionThroughParentScope ---
+    # Codex-знахідка (gate-review, R6): попередня версія вимагала точної
+    # рівності ScriptBlockAst — присвоєння на рівні модуля/скрипта й
+    # виклик через ту саму змінну ВСЕРЕДИНІ вкладеної функції реально
+    # резолвиться лексично (PowerShell читає змінну з батьківського
+    # scope), але точна рівність ScriptBlockAst це відкидала, пропускаючи
+    # реальний обхід. Гейт мусить перевіряти весь ланцюжок охоплюючих
+    # scope, а не лише точний.
+    $legacyReaderParentScopeFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $parentScopeDir = Join-Path $legacyReaderParentScopeFixtureRoot 'modules\BRAVO.ParentScope'
+        [void][IO.Directory]::CreateDirectory($parentScopeDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $parentScopeDir 'BRAVO.ParentScope.psm1'),
+            "`$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction Invoke-FromNested { & `$reader -ConfigPath X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderParentScopeFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderParentScopeFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderParentScopeFixtureResult.Passed -and
+                @($legacyReaderParentScopeFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO.ParentScope.psm1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateResolvesIndirectionThroughParentScope" `
+            -Failure "присвоєння змінної на рівні модуля/скрипта, використане через `& `$var` усередині ВКЛАДЕНОЇ функції, мусить провалювати гейт LEGACY_READER_ISOLATION — PowerShell реально резолвить це значення лексично з батьківського scope"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderParentScopeFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateInnerShadowOverridesOuterRiskyAssignment ---
+    # Контрольний тест до попереднього: коли ВКЛАДЕНА функція сама
+    # перевизначає ту саму змінну на безпечне значення ПЕРЕД викликом,
+    # затінення (shadowing) означає, що реально виконується безпечна
+    # команда — гейт не повинен провалюватись через зовнішнє ризикове
+    # присвоєння, яке перекрите.
+    $legacyReaderShadowFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $shadowDir = Join-Path $legacyReaderShadowFixtureRoot 'modules\BRAVO.Shadow'
+        [void][IO.Directory]::CreateDirectory($shadowDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $shadowDir 'BRAVO.Shadow.psm1'),
+            "`$cmd = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction Invoke-Shadowed { `$cmd = 'Get-ChildItem'; & `$cmd -Path X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderShadowFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderShadowFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderShadowFixtureResult.Passed -and
+                @($legacyReaderShadowFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateInnerShadowOverridesOuterRiskyAssignment" `
+            -Failure "власне присвоєння змінної ВСЕРЕДИНІ вкладеної функції (shadowing) на безпечне значення не сміє провалювати гейт LEGACY_READER_ISOLATION лише через зовнішнє ризикове присвоєння тієї самої назви; отримано Failures=$($legacyReaderShadowFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderShadowFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateDetectsSecondUnguardedCallFromSanctionedCaller ---
+    # Codex-знахідка (gate-review, R7): перевірка санкціонованої пари за
+    # ІМЕНЕМ охоплюючої функції не бачить, що конкретний виклик реально
+    # guard'ований — другий, негвардований виклик Import-BravoLegacyPrimaryConfiguration
+    # десь-інде всередині ТІЄЇ Ж Import-BravoConfiguration проходив би
+    # непоміченим. Дешева інваріанта: рівно один виклик на санкціоновану
+    # пару в усьому файлі — другий провалює гейт.
+    $legacyReaderSecondCallFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $secondCallLoaderText = "function Read-BRAVOLegacyPrimaryRawOverrides { param(`$ConfigPath) }`n" +
+            "function Import-BravoLegacyPrimaryConfiguration { param(`$ConfigPath); `$x = Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath `$ConfigPath }`n" +
+            "function Import-BravoConfiguration {`n" +
+            "    param(`$ConfigRoot, [switch]`$DisallowLegacyPrimaryAutoDetect)`n" +
+            "    if (-not `$DisallowLegacyPrimaryAutoDetect) { Import-BravoLegacyPrimaryConfiguration -ConfigPath X }`n" +
+            "    Import-BravoLegacyPrimaryConfiguration -ConfigPath Y`n" +
+            "}"
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderSecondCallFixtureRoot 'BRAVO_CONFIG_LOADER.ps1'),
+            $secondCallLoaderText,
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderSecondCallFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderSecondCallFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderSecondCallFixtureResult.Passed -and
+                @($legacyReaderSecondCallFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_CONFIG_LOADER.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateDetectsSecondUnguardedCallFromSanctionedCaller" `
+            -Failure "другий виклик Import-BravoLegacyPrimaryConfiguration з Import-BravoConfiguration (поза відомим guard'ом) мусить провалювати гейт LEGACY_READER_ISOLATION, навіть коли перший виклик санкціонований"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderSecondCallFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну
