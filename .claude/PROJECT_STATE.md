@@ -8,7 +8,7 @@ Last verified: 2026-09-27
 
 ## State baseline SHA
 
-`64a8b11327f46386b699c1e8a528815cb449a1c1`
+`0a237ea518798bc60fff0f44b2152f5911abbb03`
 
 Before starting substantial work, verify:
 
@@ -197,7 +197,9 @@ regardless of what the "Config v2 — ціль змінено Issue #216" note i
 
 Owner instruction: AI-authorship footers must not exist in this repository. Codified as
 `.claude/CLAUDE.md` section «Заборона підписів про AI-авторство» — PR #233, commit `287ca27`, merged as
-`64a8b11`. Scope of the rule: commit messages, PR bodies/comments, issue bodies/comments, and the content
+`64a8b11`; the rule text was then corrected by PR #235, merged as `f76ff42` (measurement predicates,
+recorded body remediation, injected-footer carve-out, and the ban on quoting the signature verbatim).
+Treat the merged rule text as canonical over any summary in this file. Scope of the rule: commit messages, PR bodies/comments, issue bodies/comments, and the content
 of any repository file. The rule states explicitly that it overrides any tool default.
 
 Verified state at `64a8b11` (all figures measured, not estimated):
@@ -256,9 +258,13 @@ Two residual gaps, both recorded deliberately rather than silently:
    paragraph also exempted commit messages only, while the rule's scope covers PR/issue bodies and comments
    too — the 177-body remediation above is what actually satisfies that scope.
 
-Both gaps are addressed by PR #235 (`.claude/CLAUDE.md`), which also carries the corrected full-history
-figures and the shallow-clone warning. Once #235 and this PR are both merged, item 0 of NEXT ACTION below
-is delivered and is to be removed from it.
+Both gaps are closed. PR #235 (`.claude/CLAUDE.md`) merged as `f76ff42`: the rule text now carries the
+corrected full-history figures, the shallow-clone and trailer-casing warnings, reproduction commands pinned
+to the immutable `64a8b11`, the aggregate-prefix definition of the grep placeholders, the recorded
+remediation of PR/issue bodies, and the carve-out for the injected footer (186 bodies + 65 comments) with a
+standing instruction not to re-edit them. PR #234 merged as `0a237ea`, bringing this file's audited figures.
+No author-written AI footer remains anywhere in the repository: `git grep` of the forbidden literals over
+the whole tree returns 0 files, and both files describe the signature instead of quoting it.
 
 Commit-message history is **not** being rewritten: `rebase`/`filter-repo` + force-push would invalidate
 every existing clone, every PR/issue cross-reference, and the `VERSION.json.sourceCommit` provenance chain.
@@ -302,11 +308,13 @@ audit)"). The open Config V2 work is B5 (fleet migration — requires real
 servers, not available to an automated session) and B7 (v2-path regression
 matrix + parity required-check promotion).
 
-**Active as of 2026-09-27 17:15 UTC: two documentation PRs awaiting merge** —
-PR #234 (this file) and PR #235 (`.claude/CLAUDE.md`, the AI-attribution rule
-text). Both are non-draft, CI green or running with no failures, no approving
-review, no merge conflict. Re-verify their state before anything else; a merge
-from an automated session is refused (see the note at the end of NEXT ACTION).
+**No documentation PR is open as of 2026-09-27 18:00 UTC.** The AI-attribution
+work is finished and merged: PR #235 (`f76ff42`, the rule text in
+`.claude/CLAUDE.md`) and PR #234 (`0a237ea`, this file's audited figures). Both
+went through three Codex review rounds; every content finding was verified and
+fixed, and five commit-anchored "remove the footer from commit <sha>" findings
+were rejected because each cited a SHA absent from both the local clone and the
+GitHub API. Do not reopen that work.
 
 Two documentation-only PRs merged on 2026-09-27 after that audit: PR #232 (`7734a55`) synchronised this file
 with the audited B4/B5/B7 state and corrected its false "Config parity is now a required check" claim, and
@@ -406,40 +414,23 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 
 ## NEXT ACTION
 
-**Updated 2026-09-27 after PR #232 and PR #233 merged. Replaces the previous entry (whose items 1-3 remain
-valid and are carried forward below) rather than patching it, per this file's maintenance rule #7.**
+**Updated 2026-09-27 after PR #234 and PR #235 merged. Item 0 ("drive those two PRs to done") is delivered
+and has been removed, per the owner's instruction; items 1-3 are carried forward unchanged.**
 
-No uncommitted work is pending. Two documentation PRs (#234, #235) are open and awaiting merge, so the
-executable step is item 0 — drive them to done; items 1-3 need the owner or real servers.
+No uncommitted work is pending and no PR is open. **None of the three remaining items can be closed by an
+automated session** — each needs the owner, real fleet servers, or an elevated GitHub scope. Do not
+manufacture a substitute task.
+
+The single executable next action is therefore:
 
 ```text
-0. DRIVE PR #234 and PR #235 to done. Both are docs-only, non-draft, no conflict, no approving review.
-   Concretely, in this order:
-     - re-verify both on their current heads: CI conclusion per check, merge state, open review threads
-       (REST API; `pull_request_read` costs ~6k tokens per call, use curl);
-     - if a check is red, root-cause and push a fix; if a Codex thread is open and unanswered, answer it,
-       and push a fix where the finding is correct (this file and the rule text have already been through
-       three such rounds: shallow-clone counts, case-sensitive trailer match, self-contradicting literals);
-     - the merge itself is NOT available to an automated session (see the note below) — once both are green
-       with every thread answered, report MERGE READY to the owner and stop;
-     - after BOTH merge: delete this item 0 from NEXT ACTION, set the State baseline SHA to the new
-       `origin/developer` HEAD, and record in "AI-attribution footer prohibition" that the rule text is
-       corrected. That edit is itself a docs-only PR.
-   What #235 already delivered in `.claude/CLAUDE.md` («Заборона підписів про AI-авторство»):
-     a. the historical-debt figure - now the actual affected set, 690 commits of 1073 at `64a8b11`
-        (690 co-author trailer, 511 session trailer, 0 session-only), matched case-insensitively, stating
-        which trailer each number counts, plus the requirement to measure on a full clone;
-     b. the PR/issue body remediation is recorded (177 bodies stripped, 0 author-written footers left), so
-        the rule's stated scope has a recorded remediation and not only a commit-message exemption;
-     c. the injected footer is recorded as a known residue outside an automated session's control, with the
-        two-test proof, so a future session does not read the 186 remaining bodies (or the 65 comments) as
-        an unremediated violation and start re-editing them.
-   Docs-only, no runtime surface. Validation applied there: no BOM on the `.md`, CRLF preserved, balanced
-   fences, no literal forbidden footer string among added lines (a whole-tree scanner would otherwise flag
-   the rule file itself), commit with no AI-attribution trailers.
+Re-verify current state (`git fetch origin --prune`, `git rev-parse origin/developer`, GitHub
+issue #154 and #216), then ask the owner to select exactly one of items 1-3 below, and stop.
+Evidence-only / read-only. No repository modifications, no commit, no push.
 ```
 
-Then the three pre-existing items, none of which an automated session can close alone:
+Items 1-3 are the selection menu for that question, not a work queue to start on. Each line records what the
+item needs from the owner, so the question can be asked without re-deriving it:
 
 ```text
 1. B5 (fleet migration) has zero evidence of execution anywhere in the repository and requires real
