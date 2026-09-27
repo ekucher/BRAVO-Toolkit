@@ -2,6 +2,34 @@
 
 ## Не випущено (developer)
 
+- **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
+  runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
+  у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися
+  чи мовчки підхоплюватися нормальним виконанням взагалі — легітимні
+  винятки лишаються лише для міграції 5.2→5.3, міграційних тестів/
+  фікстур, доказів паритету й історичної документації. Це замінює цільову
+  «двошарову, постійну» модель рішення власника D2 (2026-09-14, див.
+  `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`), де `BRAVO.config`
+  мав лишатися опціональним DATA-only шаром назавжди.
+
+  **Що змінено в рантаймі.** Усі 4 канонічні production-runtime
+  (Archive/Health/Maintenance/DataRestore) і 10 operator-entrypoint-ів
+  передають новий прапорець `-DisallowLegacyPrimaryAutoDetect` у
+  `Import-BravoConfiguration` (`BRAVO_CONFIG_LOADER.ps1`): `BRAVO.config`,
+  знайдений лише тому, що він фізично лежить за auto-derived шляхом
+  (оператор не запитував його явним `-ConfigPath`), більше не
+  підхоплюється мовчки — діють built-in дефолти + `BRAVO.local.config`.
+  Явний `-ConfigPath` лишається авторитетним наміром оператора і не
+  блокується (потрібен для migration-tooling — `deploy\Get-BRAVOConfigSiteDelta.ps1`,
+  `deploy\Update-BRAVOServer.ps1`). Кореневий `BRAVO.config` прибрано зі
+  staged-комплекту й не відстежується git; точний історичний текст
+  збережено побайтово як `selftest/fixtures/BravoConfigLegacyFrozen.config`
+  для CI-паритету й forbidden-pattern перевірок.
+
+  **Валідація.** `BRAVO_SELF_TEST.ps1` зелений на новому контракті;
+  `ci/Test-BRAVOConfigFoundationParity.ps1` і суміжні parity-harness'и
+  перенесено на заморожений фікстурний файл замість кореневого.
+
 - **Ідентифікатори реальних серверів і установи прибрано з репозиторію.**
   Функціональних змін немає: у коді всі згадки були **коментарями**, а в
   self-test — фікстурними значеннями, і всі парні твердження оновлено

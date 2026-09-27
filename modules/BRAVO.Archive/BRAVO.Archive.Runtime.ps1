@@ -109,11 +109,16 @@ try {
 
     . $loaderPath
 
+    # Issue #216 (Wave B): production runtime entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
     Import-BravoConfiguration `
         -ConfigRoot (Split-Path -Path ([System.IO.Path]::GetFullPath($ConfigPath)) -Parent) `
         -ConfigPath $ConfigPath `
         -RuntimeRoot $bravoScriptDirectory `
-        -ConfigPathWasExplicit:$configPathWasExplicit
+        -ConfigPathWasExplicit:$configPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
 
     $configPath = [string]$global:BravoConfigurationMetadata.ConfigPath
     Write-Host "Конфiгурацiю завантажено успiшно: $configPath" -ForegroundColor $logColors.SUCCESS

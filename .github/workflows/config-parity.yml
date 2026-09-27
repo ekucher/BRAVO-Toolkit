@@ -81,6 +81,24 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Issue #216, H-1: LEGACY_CONFIG_REMOVED/AUTOEXEC gates previously
+      # ran ONLY inside ci\New-BRAVOReleaseArtifact.ps1, which fires only
+      # on a tag push or workflow_dispatch (release-artifact.yml) - never
+      # on a pull_request. Runs UNCONDITIONALLY (not gated by the
+      # relevance decision below): both gates are pure text checks over
+      # the checked-out tree, no build required, and any pull request -
+      # not only ones that touch the config pipeline paths - could
+      # reintroduce BRAVO.config or drop the flag from an entrypoint.
+      - name: Config V2 cutover gates (LEGACY_CONFIG_REMOVED / AUTOEXEC)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\ci\Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::Test-BRAVOConfigV2CutoverGatesOnPullRequest.ps1 exited with code $LASTEXITCODE"
+              exit 1
+          }
+
       # Same ASCII-only reason as ci.yml: GitHub Actions writes `run:`
       # blocks to a temp .ps1 WITHOUT a BOM, and Windows PowerShell 5.1
       # reads them in the system ANSI code page. YAML comments (like this

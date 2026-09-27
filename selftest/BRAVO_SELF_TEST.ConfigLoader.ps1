@@ -1501,6 +1501,35 @@ Test-BRAVOCondition `
     -Name "ConfigLoader/RequireAdministratorMissingBlocks" `
     -Failure "відсутній `$global:requireAdministrator (не просто `$false) МАЄ БЛОКУВАТИ з окремим діагностичним повідомленням 'requireAdministrator відсутній'; отримано: $reqAdminMissingResult"
 
+# --- ConfigLoader/ToolIntegrityModeWeakenedBlocks (Issue #216, §9 п.6):
+# toolIntegritySettings.Mode НЕ raw-configurable (канонічна константа) —
+# у звичайних probe-ах вище він СВІДОМО завжди встановлюється безпечним
+# значенням ('Enforce'), щоб не заважати ізоляції ІНШИХ змінних. Тому
+# власна DENY-гілка Test-BRAVOEffectiveSecurityInvariants для цього
+# canary (BRAVO_CONFIG_LOADER.ps1: "toolIntegritySettings.Mode = '...'
+# замість 'Enforce'") досі не мала жодного прямого тесту — лише pre-trust
+# AST-дзеркало (BRAVO_RUNTIME_GUARD.ps1) нижче. Той самий прямий-виклик
+# паттерн, що RequireAdministratorMissingBlocks вище.
+$toolIntegrityWeakenedProbeCommand = (
+    "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+    "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
+    "`$global:toolIntegritySettings = @{ Mode = 'Warn' }; " +
+    "`$global:requireAdministrator = `$true; " +
+    "Test-BRAVOEffectiveSecurityInvariants } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolIntegrityWeakenedResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolIntegrityWeakenedProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition (
+        $toolIntegrityWeakenedResult.StartsWith('THREW') -and
+        $toolIntegrityWeakenedResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -and
+        $toolIntegrityWeakenedResult.Contains("toolIntegritySettings.Mode = 'Warn'")
+    ) `
+    -Name "ConfigLoader/ToolIntegrityModeWeakenedBlocks" `
+    -Failure "ефективний `$global:toolIntegritySettings.Mode = 'Warn' (замість 'Enforce') МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants навіть якщо ця canary-гілка сьогодні недосяжна звичайним raw-override-шляхом; отримано: $toolIntegrityWeakenedResult"
+
 # ============================================================
 # Issue #216, Wave 2 review-фікс: backupMonitoring.SFTP.BAZA.Mode/
 # .MutationPolicy — owner-decision листи, для яких DENY_SECURITY_CONTROL
@@ -1760,9 +1789,19 @@ try {
 # AST-літерал до Import-Module vs. ефективне значення після повного
 # мержу) — тому перевіряється текстова присутність тих самих
 # Variable/Key/Expected-трійок в обох файлах, а не спільний виклик.
+#
+# Issue #216 (§9, Крок 0): сам bool-вердикт "Enforce"/"VSS" тепер
+# централізовано в Test-BRAVOSecurityInvariantValueWeakened
+# (modules\BRAVO.Configuration) — Test-BRAVOEffectiveSecurityInvariants
+# (BRAVO_CONFIG_LOADER.ps1) лише делегує туди й лишає $global:-
+# посилання/операторські повідомлення. Тому Expected-літерали
+# перевіряються в каноничному модулі-предикаті, а не в самому loader-і;
+# $global:-посилання (доказ, ЩО саме перевіряється) — все ще в loader-і.
 # ============================================================
 $guardTextForParity = [IO.File]::ReadAllText((Join-Path $root 'BRAVO_RUNTIME_GUARD.ps1'), [Text.Encoding]::UTF8)
 $loaderTextForSecurityParity = [IO.File]::ReadAllText($configLoaderPath, [Text.Encoding]::UTF8)
+$securityInvariantPredicatePath = Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.psm1'
+$securityInvariantPredicateText = [IO.File]::ReadAllText($securityInvariantPredicatePath, [Text.Encoding]::UTF8)
 Test-BRAVOCondition `
     -Condition (
         $guardTextForParity.Contains("Variable = 'toolIntegritySettings'") -and
@@ -1770,12 +1809,13 @@ Test-BRAVOCondition `
         $guardTextForParity.Contains("Variable = 'backupConsistency'") -and
         $guardTextForParity.Contains("Expected = 'VSS'") -and
         $loaderTextForSecurityParity.Contains('$global:toolIntegritySettings.Mode') -and
-        $loaderTextForSecurityParity.Contains("'Enforce', [System.StringComparison]::OrdinalIgnoreCase") -and
         $loaderTextForSecurityParity.Contains('$global:backupConsistency.Mode') -and
-        $loaderTextForSecurityParity.Contains("'VSS', [System.StringComparison]::OrdinalIgnoreCase")
+        $loaderTextForSecurityParity.Contains('Test-BRAVOSecurityInvariantValueWeakened') -and
+        $securityInvariantPredicateText.Contains("'Enforce', [System.StringComparison]::OrdinalIgnoreCase") -and
+        $securityInvariantPredicateText.Contains("'VSS', [System.StringComparison]::OrdinalIgnoreCase")
     ) `
     -Name "ConfigLoader/SecurityRuleParityGuardVsEffectiveCheck" `
-    -Failure "pre-trust guard (BRAVO_RUNTIME_GUARD.ps1) і post-merge effective-перевірка (BRAVO_CONFIG_LOADER.ps1) мають перевіряти ОДНАКОВІ Expected-значення (toolIntegritySettings.Mode='Enforce', backupConsistency.Mode='VSS') — розбіжність тут означає, що два набори правил розійшлися"
+    -Failure "pre-trust guard (BRAVO_RUNTIME_GUARD.ps1) і post-merge effective-перевірка (BRAVO_CONFIG_LOADER.ps1 -> канонічний Test-BRAVOSecurityInvariantValueWeakened) мають перевіряти ОДНАКОВІ Expected-значення (toolIntegritySettings.Mode='Enforce', backupConsistency.Mode='VSS') — розбіжність тут означає, що два набори правил розійшлися"
 
 # ============================================================
 # P0 Configuration Foundation (PR C, owner-checkpoint п.6): МЕХАНІЧНИЙ
@@ -2337,4 +2377,458 @@ Test-BRAVOCondition `
     } finally {
         Remove-Item -LiteralPath $atomicityBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
     }
+}
+
+# Issue #216 (R2, §9 п.3 HIGH, 2026-09-26): дефект знайдено адверсаріальним
+# незалежним рев'ю R2, не дублікат fail-open/H-1 теми. У
+# BRAVO_CONFIG_LOADER.ps1 (Complete-BRAVOConfigurationLoad, ~рядок 1447)
+# $effectiveUnknownLeafSink будувався через if-вираз:
+#     $effectiveUnknownLeafSink = if (...) { $localOverrideState.UnknownLeafPaths } else { $null }
+# PowerShell на цьому шляху розгортає ПОРОЖНІЙ IEnumerable (List[string] із
+# Count=0), що виходить із гілки if-виразу через звичайний output-стрім, у
+# $null (емпірично перевірено мінімальним репро) — а не непорожній список
+# розгорнув би не в null, а в останній елемент. UnknownLeafPaths стартує
+# порожнім щоразу, тож sink, який фактично передавався нижче в
+# Resolve-BRAVORawConfiguration/ConvertTo-BRAVONestedOverride, був ЗАВЖДИ
+# $null — D3 unknown-leaf діагностика (#154/A2, і Write-Warning, і
+# $global:BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides) мовчки
+# ніколи не спрацьовувала, незалежно від того, скільки насправді невідомих
+# кінцевих сегментів містив BRAVO.local.config. Функціональний
+# observability-регрес, НЕ security bypass (fail-closed на невідомий
+# БАТЬКІВСЬКИЙ вузол цим sink-ом не керується;
+# Test-BRAVOEffectiveSecurityInvariants перевіряє реальні пост-мердж
+# $global: незалежно від цього шляху).
+# ============================================================
+$r2UnknownLeafBackupRootDir = Join-Path ([IO.Path]::GetTempPath()) `
+    ("BRAVO_R2_UNKNOWNLEAF_BACKUP_{0}" -f [guid]::NewGuid().ToString("N"))
+[void][IO.Directory]::CreateDirectory($r2UnknownLeafBackupRootDir)
+$r2UnknownLeafBackupRootLiteral = $r2UnknownLeafBackupRootDir.Replace("'", "''")
+$r2UnknownLeafResultExpression = (
+    "'RESULT:Count=' + [string]`$global:BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides.Count + " +
+    "';Leaves=' + (`$global:BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides -join ',')"
+)
+
+try {
+    # --- ConfigLoader/R2UnknownLeafSinkActuallyPopulated: генуїнно невідомий
+    # КІНЦЕВИЙ сегмент під реальним hashtable-батьківським вузлом
+    # (maintenanceSettings — той самий forward-compat-приклад, що й у
+    # LocalOverrideParityForwardCompatLeaf вище) МАЄ з'явитись у
+    # LocalConfigUnknownLeafOverrides. До фіксу цей sink був мертвим кодом —
+    # Count завжди дорівнював 0 незалежно від вмісту BRAVO.local.config.
+    $r2UnknownLeafBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$r2UnknownLeafBackupRootLiteral'`r`n" +
+        "    'maintenanceSettings.FutureFieldNotYetInSchema' = 'preserve-me'`r`n" +
+        "}`r`n"
+    )
+    $r2UnknownLeafResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $r2UnknownLeafBody -ResultExpression $r2UnknownLeafResultExpression
+    Test-BRAVOCondition `
+        -Condition ($r2UnknownLeafResult -eq 'RESULT:Count=1;Leaves=maintenanceSettings.FutureFieldNotYetInSchema') `
+        -Name "ConfigLoader/R2UnknownLeafSinkActuallyPopulated" `
+        -Failure (
+            "genuinely невідомий кінцевий сегмент 'maintenanceSettings.FutureFieldNotYetInSchema' " +
+            "мав з'явитись у BravoConfigurationMetadata.LocalConfigUnknownLeafOverrides (sink НЕ мертвий код); " +
+            "отримано: $r2UnknownLeafResult"
+        )
+
+    # --- ConfigLoader/R2UnknownLeafSinkEmptyWhenNoUnknownLeaf (sanity): без
+    # жодного невідомого leaf sink має лишатись порожнім (0), а не
+    # false-positive.
+    $r2KnownLeafBody = (
+        "@{`r`n" +
+        "    'pathSettings.BackupRoot' = '$r2UnknownLeafBackupRootLiteral'`r`n" +
+        "}`r`n"
+    )
+    $r2KnownLeafResult = New-BRAVOConfigLoaderSecurityDowngradeProbe `
+        -WithPrimary $false -LocalConfigBody $r2KnownLeafBody -ResultExpression $r2UnknownLeafResultExpression
+    Test-BRAVOCondition `
+        -Condition ($r2KnownLeafResult -eq 'RESULT:Count=0;Leaves=') `
+        -Name "ConfigLoader/R2UnknownLeafSinkEmptyWhenNoUnknownLeaf" `
+        -Failure "BRAVO.local.config без невідомих leaf-ів має дати Count=0; отримано: $r2KnownLeafResult"
+} finally {
+    Remove-Item -LiteralPath $r2UnknownLeafBackupRootDir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ============================================================
+# Issue #216 (Proof B, Lead-звіт 2026-09-26, §9 п.1 HIGH): permanent
+# regression-покриття емпіричного інваріанта Config V2 cutover.
+#
+# ІНВАРІАНТ, ЩО ДОВОДИТЬСЯ: сторонній BRAVO.config, що лежить поруч із
+# ConfigRoot, за -DisallowLegacyPrimaryAutoDetect НЕ впливає на жодне
+# значення ефективної конфігурації — лише на provenance-поля
+# BravoConfigurationMetadata (LoadedAt/PrimaryConfigPresentOnDisk/
+# PrimaryConfigAutoDetectBlocked), які самі описують ФАКТ виявлення
+# файлу, а не результат його виконання. Раніше доведено лише ОДНОРАЗОВО
+# вручну (R1, 2026-09-26, "8 різнотипних значень, 422 захоплені листи,
+# рівно 3 відмінності — усі provenance"); тут — permanent-версія того
+# самого прогону, а не новий незалежний доказ.
+#
+# МЕТОДОЛОГІЯ (та сама, що й у R1, включно з обсягом): один і той самий
+# ConfigRoot із ідентичним BRAVO.local.config, знятий у ДВОХ окремих
+# дочірніх процесах — раз з отруєним BRAVO.config (8 різнотипних
+# перезаписів, включно з найризиковішими полями pathSettings.LIMSRoot і
+# pathSettings.BackupRoot), раз без нього — обидва рази з
+# -DisallowLegacyPrimaryAutoDetect. Порівнюється ПОВНИЙ канонічний
+# знімок (Get-BRAVOEffectiveConfigurationSnapshot), включно з
+# BravoConfigurationMetadata/BravoLocalConfigOverrideState — не
+# довільна вибірка полів.
+#
+# ЧОМУ BravoConfigurationMetadata/BravoLocalConfigOverrideState
+# ПОТРЕБУЮТЬ ОДНОРІВНЕВОГО СПЛОЩЕННЯ (а не блокового виключення з
+# порівняння): обидва — [pscustomobject] з ЛИШЕ листовими полями
+# (BRAVO_CONFIG_LOADER.ps1:1718-1776 / :1429-1443 — жодне поле САМЕ не є
+# вкладеним PSCustomObject), а Compare-BRAVOConfigurationGraph
+# (BRAVO.Configuration.Delta) розкриває рекурсивно лише
+# [hashtable]-вузли (Add-BRAVOConfigurationGraphDifference, перевірка
+# "-is [hashtable]") — PSCustomObject він порівняв би одним непрозорим
+# `-eq` на весь об'єкт (завжди "Changed", різні інстанси в різних
+# дочірніх процесах), не заглиблюючись у поля, а виключення цих двох
+# імен з переліку взагалі означало би довіряти РІВНОСТІ їхніх ~20 полів
+# на слово, а не доводити її — саме та слабина, яку R1 фактично закрив
+# повним знімком. Тут — примітивне ОДНОРІВНЕВЕ spread ([pscustomobject]
+# -> [hashtable] через PSObject.Properties, без рекурсії), достатнє
+# саме тому, що вкладеності немає; НЕ другий загальний глибокий
+# конвертер довільного дерева, як у deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1
+# (той обслуговує інший споживач — CLI-порівняння двох JSON-знімків з
+# довільною глибиною; той інструмент має власний mandatory-param
+# CLI-контракт і не призначений для dot-source-повторного використання
+# звідси).
+#
+# Cross-process передача — Export-Clixml/Import-Clixml, а не JSON: усі
+# значення канонічного знімка (після однорівневого сплощення двох
+# вузлів вище) — реальні .NET hashtable/array/string/bool/number/
+# datetime, і CliXml (на відміну від ConvertFrom-Json у Windows
+# PowerShell 5.1, який завжди повертає PSCustomObject) відновлює їх
+# ТОЧНИМ типом без додаткового конвертера.
+& {
+    $proofBRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_PROOFB_SELF_TEST_{0}" -f [guid]::NewGuid().ToString('N'))
+    [void][IO.Directory]::CreateDirectory($proofBRoot)
+    try {
+        # ОДИН спільний ConfigRoot для обох знімків (не окремі CLEAN/
+        # POISONED-каталоги): якби кожен бік мав власний тимчасовий шлях,
+        # ConfigRoot/ConfigPath/LocalConfigPath/PrimaryConfigPath
+        # відрізнялись би МІЖ ЗНІМКАМИ через саму лише різницю шляхів
+        # фікстури — це затінило б справжній інваріант і фактично довело
+        # б "різні директорії дають різні шляхи", а не "сторонній
+        # BRAVO.config не впливає на ефективну конфігурацію" (реально
+        # відтворено при розробці цього тесту — 4 хибних path-diff
+        # зникли одразу після переходу на спільний ConfigRoot).
+        $proofBConfigRoot = Join-Path $proofBRoot 'CONFIGROOT'
+        [void][IO.Directory]::CreateDirectory($proofBConfigRoot)
+
+        $proofBBackupDir = Join-Path $proofBRoot 'SITE_BACKUP'
+        [void][IO.Directory]::CreateDirectory($proofBBackupDir)
+        $proofBLocalConfigLiteral = (
+            "@{`r`n" +
+            "    'pathSettings.BackupRoot' = '$($proofBBackupDir.Replace("'", "''"))'`r`n" +
+            "}`r`n"
+        )
+        [IO.File]::WriteAllText((Join-Path $proofBConfigRoot 'BRAVO.local.config'), $proofBLocalConfigLiteral, (New-Object System.Text.UTF8Encoding($false)))
+
+        $proofBChildTemplate = @'
+param(
+    [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+    [Parameter(Mandatory = $true)][string]$ConfigRoot,
+    [Parameter(Mandatory = $true)][string]$OutputPath,
+    [Parameter(Mandatory = $true)][string]$ErrorPath
+)
+Set-StrictMode -Version 2.0
+$ErrorActionPreference = 'Stop'
+$WarningPreference = 'SilentlyContinue'
+try {
+    . (Join-Path $RuntimeRoot 'BRAVO_CONFIG_LOADER.ps1')
+    Import-BravoConfiguration -ConfigRoot $ConfigRoot -RuntimeRoot $RuntimeRoot -DisallowLegacyPrimaryAutoDetect
+    Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.Snapshot.psd1') -Force
+    # Compare-BRAVOConfigurationGraph розкриває рекурсивно лише
+    # [hashtable]-вузли ("-is [hashtable]" у Add-BRAVOConfigurationGraphDifference/
+    # BRAVO.Configuration.Delta) — PSCustomObject він порівняв би одним
+    # непрозорим `-eq` на весь об'єкт (завжди "Changed" для двох різних
+    # інстансів із двох дочірніх процесів, незалежно від фактичних
+    # значень полів). У канонічному знімку [pscustomobject] зустрічається
+    # НЕ лише на верхньому рівні (BravoConfigurationMetadata/
+    # BravoLocalConfigOverrideState), а й вкладено (storageEffective.SFTP/
+    # .SMB, bazaSyncEffective.Components — Get-BRAVOEffectiveStorageConfiguration/
+    # Get-BRAVOEffectiveSynchronizationConfiguration у BRAVO.Discovery
+    # повертають [pscustomobject] на кожному рівні) — реально відтворено
+    # при розробці цього тесту: одноразове (не рекурсивне) сплощення
+    # лишало саме ці вузли непорівнюваними й давало 3 хибних "Changed".
+    # Тому конвертація — рекурсивна на будь-яку глибину, а не спеціальний
+    # випадок для двох конкретних імен.
+    function ConvertTo-ProofBComparableValue {
+        param($Value)
+        if ($null -eq $Value) { return $null }
+        if ($Value -is [System.Management.Automation.PSCustomObject]) {
+            $result = @{}
+            foreach ($property in $Value.PSObject.Properties) {
+                $result[$property.Name] = ConvertTo-ProofBComparableValue -Value $property.Value
+            }
+            return $result
+        }
+        if (($Value -is [System.Collections.IEnumerable]) -and -not ($Value -is [string]) -and -not ($Value -is [System.Collections.IDictionary])) {
+            return ,@(@($Value) | ForEach-Object { ConvertTo-ProofBComparableValue -Value $_ })
+        }
+        return $Value
+    }
+
+    $names = @(Get-BRAVOEffectiveConfigurationVariableName)
+    $snapshot = Get-BRAVOEffectiveConfigurationSnapshot -VariableName $names
+    $captured = @{}
+    foreach ($name in $names) {
+        $captured[$name] = ConvertTo-ProofBComparableValue -Value $snapshot[$name]
+    }
+    $captured | Export-Clixml -LiteralPath $OutputPath -Depth 20
+} catch {
+    [pscustomobject]@{ Message = $_.Exception.Message; ScriptStackTrace = $_.ScriptStackTrace } |
+        Export-Clixml -LiteralPath $ErrorPath -Depth 5
+    exit 1
+}
+'@
+        $proofBChildScriptPath = Join-Path $proofBRoot 'ProofBCaptureChild.ps1'
+        [IO.File]::WriteAllText($proofBChildScriptPath, $proofBChildTemplate, (New-Object System.Text.UTF8Encoding($false)))
+
+        function Invoke-BRAVOProofBCapture {
+            # Окремий дочірній процес per side (той самий підхід, що й у
+            # Invoke-ParityCapture ci\Test-BRAVOConfigFoundationParity.ps1):
+            # Import-BravoConfiguration встановлює десятки $global:, які
+            # небезпечно змішувати між CLEAN і POISONED прогонами в
+            # одному процесі.
+            param([Parameter(Mandatory = $true)][string]$ConfigRoot, [Parameter(Mandatory = $true)][string]$Label)
+
+            $workDir = Join-Path $proofBRoot $Label
+            [void][IO.Directory]::CreateDirectory($workDir)
+            $outputPath = Join-Path $workDir 'snapshot.clixml'
+            $errorPath = Join-Path $workDir 'error.clixml'
+            $stdoutPath = Join-Path $workDir 'stdout.log'
+            $stderrPath = Join-Path $workDir 'stderr.log'
+            $processArgs = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $proofBChildScriptPath,
+                '-RuntimeRoot', $root, '-ConfigRoot', $ConfigRoot, '-OutputPath', $outputPath, '-ErrorPath', $errorPath)
+            $process = Start-Process -FilePath 'powershell.exe' -ArgumentList $processArgs -NoNewWindow -PassThru -Wait `
+                -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
+
+            if ($process.ExitCode -ne 0 -or (Test-Path -LiteralPath $errorPath -PathType Leaf)) {
+                $errorDetail = if (Test-Path -LiteralPath $errorPath -PathType Leaf) { (Import-Clixml -LiteralPath $errorPath).Message } else { '' }
+                $stderrText = if (Test-Path -LiteralPath $stderrPath -PathType Leaf) { Get-Content -LiteralPath $stderrPath -Raw } else { '' }
+                throw "Invoke-BRAVOProofBCapture($Label): дочірній процес завершився з помилкою (ExitCode=$($process.ExitCode)). $errorDetail $stderrText"
+            }
+            return (Import-Clixml -LiteralPath $outputPath)
+        }
+
+        # CLEAN-знімок ЗНІМАЄТЬСЯ ПЕРШИМ, до появи отруєного BRAVO.config —
+        # той самий $proofBConfigRoot удруге отримає лише один новий файл,
+        # більше нічого в ньому не зміниться.
+        $proofBCleanCapture = Invoke-BRAVOProofBCapture -ConfigRoot $proofBConfigRoot -Label 'CLEAN'
+
+        # Отруєний BRAVO.config: заморожений legacy-текст + 8 різнотипних
+        # перезаписів у КІНЦІ файлу (виконувались би останніми, якби файл
+        # виконувався) — bool/string/number/array/nested-leaf, включно з
+        # двома найризиковішими полями — самими коренями даних LIMSRoot і
+        # BackupRoot. Файл НІКОЛИ не виконується під
+        # -DisallowLegacyPrimaryAutoDetect (перевіряється нижче окремо) —
+        # точний вміст після заголовка функціонально неважливий, лише сам
+        # факт присутності файлу на диску.
+        $proofBPoisonBody = (
+            "`$global:LogLevel = 'PROOFB_POISONED'`r`n" +
+            "`$global:archiveRetentionDays = 999999`r`n" +
+            "`$global:sftpPort = 65535`r`n" +
+            "`$global:enableArchiveDeletion = `$true`r`n" +
+            "`$global:robocopyOptions = @('/POISONED')`r`n" +
+            "`$global:bravoSettings['InstitutionName'] = 'PROOFB_POISONED_INSTITUTION'`r`n" +
+            "`$global:pathSettings['LIMSRoot'] = 'C:\PROOFB_NONEXISTENT_LIMS_BOGUS_PATH'`r`n" +
+            "`$global:pathSettings['BackupRoot'] = 'C:\PROOFB_NONEXISTENT_BOGUS_PATH'`r`n"
+        )
+        [IO.File]::WriteAllText(
+            (Join-Path $proofBConfigRoot 'BRAVO.config'),
+            ((Get-BRAVOSelfTestLegacyConfigText) + "`r`n" + $proofBPoisonBody),
+            (New-Object System.Text.UTF8Encoding($false))
+        )
+
+        $proofBPoisonedCapture = Invoke-BRAVOProofBCapture -ConfigRoot $proofBConfigRoot -Label 'POISONED'
+
+        # Тест не повинен бути пустим: обидва боки мають підтвердити, що
+        # фікстура реально відрізнялась ФАКТОМ на диску (інакше "0
+        # відмінностей" довело б лише те, що файл ніде не з'явився).
+        Test-BRAVOCondition `
+            -Condition (
+                $proofBPoisonedCapture['BravoConfigurationMetadata'].PrimaryConfigPresentOnDisk -eq $true -and
+                $proofBPoisonedCapture['BravoConfigurationMetadata'].PrimaryConfigAutoDetectBlocked -eq $true
+            ) `
+            -Name 'ConfigLoader/ProofBPoisonedFixtureActuallyDetectedAndBlocked' `
+            -Failure 'фікстура має підтвердити, що отруєний BRAVO.config справді лежав на диску й був заблокований auto-detect (інакше порівняння нижче довело б нуль лише тому, що файл узагалі не існував)'
+        Test-BRAVOCondition `
+            -Condition (
+                $proofBCleanCapture['BravoConfigurationMetadata'].PrimaryConfigPresentOnDisk -eq $false -and
+                $proofBCleanCapture['BravoConfigurationMetadata'].PrimaryConfigAutoDetectBlocked -eq $false
+            ) `
+            -Name 'ConfigLoader/ProofBCleanFixtureHasNoPrimaryConfigOnDisk' `
+            -Failure 'чистий бік доказу не повинен мати BRAVO.config на диску взагалі — інакше порівняння нижче не доводить те, що заявляє'
+
+        Import-Module -Name (Join-Path $root 'modules\BRAVO.Configuration\BRAVO.Configuration.Delta.psd1') -Force
+        $proofBDifferences = @(Compare-BRAVOConfigurationGraph `
+            -ReferenceConfiguration $proofBCleanCapture `
+            -CandidateConfiguration $proofBPoisonedCapture `
+            -IncludeMissingInCandidate)
+        # Точковий allowlist — рівно ті самі 3 dot-шляхи, які R1 знайшов
+        # уручну (не блокове виключення цілого вузла): вони описують
+        # ДЖЕРЕЛО/факт виявлення файлу (LoadedAt — час прогону,
+        # PrimaryConfigPresentOnDisk/PrimaryConfigAutoDetectBlocked —
+        # прямий наслідок присутності фікстури, уже підтверджений двома
+        # умовами вище), а не ефективне значення конфігурації. Усе інше в
+        # BravoConfigurationMetadata (Mode/Format/PrimaryConfigPresent/
+        # PrimaryConfigIgnoredGlobals/... і 15+ інших полів) і в
+        # BravoLocalConfigOverrideState тепер РЕАЛЬНО звіряється — не
+        # виключено з розгляду.
+        $proofBExpectedDiffPaths = @(
+            'BravoConfigurationMetadata.LoadedAt',
+            'BravoConfigurationMetadata.PrimaryConfigPresentOnDisk',
+            'BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked'
+        )
+        $proofBUnexpected = @($proofBDifferences | Where-Object { $proofBExpectedDiffPaths -notcontains $_.Path })
+
+        Test-BRAVOCondition `
+            -Condition ($proofBUnexpected.Count -eq 0) `
+            -Name 'ConfigLoader/ProofBPoisonedPrimaryConfigHasZeroEffectiveEffect' `
+            -Failure (
+                "Issue #216 Proof B (Lead-звіт 2026-09-26): сторонній BRAVO.config при -DisallowLegacyPrimaryAutoDetect " +
+                "не повинен змінювати ЖОДНОГО значення ефективної конфігурації поза provenance-полями метаданих; " +
+                "знайдено $($proofBUnexpected.Count) неочікуваних відмінностей: " +
+                (($proofBUnexpected | ForEach-Object { "$($_.Path) [$($_.Kind)]" }) -join '; ')
+            )
+    } finally {
+        Remove-Item -LiteralPath $proofBRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# Issue #216 (Wave B/Agent E deploy-cutover audit): post-update-доказ,
+# що фізично залишений на диску застарілий BRAVO.config НЕ впливає на
+# ефективну конфігурацію production-entrypoint-а після успішного
+# Update-BRAVOServer.ps1. Update-BRAVOServer.ps1 НІКОЛИ не видаляє
+# BRAVO.config (виключений з robocopy /XF, ретирування — окрема дія
+# оператора) — тож сценарій "стара БRAVO.config лишилась поруч після
+# оновлення до 5.3" є звичайним, очікуваним станом парку, а не
+# гіпотетичним. Захист від нього — саме
+# -DisallowLegacyPrimaryAutoDetect (уже проведений у 14 production/
+# operator entrypoint-ів, ci/New-BRAVOReleaseArtifact.ps1/
+# LEGACY_CONFIG_AUTOEXEC статично звіряє це на staged-комплекті). Той
+# гейт лише скенує ТЕКСТ виклику — тут перевіряється фактична
+# RUNTIME-поведінка: ефективна конфігурація дійсно ігнорує вміст файлу.
+#
+# Окремий child scope (& { ... }): усі фрагменти self-test дот-сорсяться в
+# ОДИН scope і ділять ліміт $MaximumVariableCount.
+& {
+    function Invoke-BRAVOPostUpdateStaleConfigProbe {
+        # $DisallowAutoDetect симулює production-entrypoint після Wave B
+        # (Archive/Health/Maintenance/DataRestore Runtime.ps1, BRAVO_SETUP.ps1
+        # та інші 10) — auto-derived BRAVO.config, залишений на диску без
+        # явного наміру оператора, мусить трактуватись як відсутній.
+        # Без прапорця відтворюється ДОвave-B/migration-tooling поведінка —
+        # використовується лише як контрольний (sanity) прогін нижче, щоб
+        # довести, що маркер override дійсно спрацьовує, коли ЩОСЬ його
+        # читає (інакше PASS вище був би тавтологією "нічого не сталося").
+        param([switch]$DisallowAutoDetect)
+
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) (
+            "BRAVO_POSTUPDATE_STALE_CONFIG_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            # Стара конфігурація 5.2-епохи лишилась ФІЗИЧНО поруч (саме так,
+            # як Update-BRAVOServer.ps1 її залишає — /XF BRAVO.config, ніколи
+            # не видаляється) за auto-derived шляхом ($ConfigRoot\BRAVO.config),
+            # БЕЗ жодного явного -ConfigPath — точний контракт "оператор його
+            # не запитував".
+            # BackupRoot="" (AUTO) вимагає EffectiveLIMSRoot, похідного від
+            # реальної служби BRAVO на хості — на self-test/CI-хості такої
+            # служби немає. Тест перевіряє лише RETENTION/FORMAT/BLOCKED/
+            # PRESENT, не BackupRoot, тож запікаємо явний літерал (той самий
+            # паттерн, що й інші сценарії вище в цьому файлі).
+            $staleBackupDir = Join-Path $scenarioRoot 'BACKUP'
+            [void][IO.Directory]::CreateDirectory($staleBackupDir)
+            $staleBackupRootLiteralLine = '    BackupRoot    = ""'
+            $staleKitText = (Get-BRAVOSelfTestLegacyConfigText)
+            if (-not $staleKitText.Contains($staleBackupRootLiteralLine)) {
+                throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$staleBackupRootLiteralLine' — оновіть підготовку post-update-stale-config сценарію під нову форму конфігурації"
+            }
+            $staleText = $staleKitText.Replace(
+                $staleBackupRootLiteralLine,
+                "    BackupRoot    = '$($staleBackupDir.Replace("'", "''"))'"
+            ) + "`r`n" + '$global:logRetentionDays = 999' + "`r`n"
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.config'), $staleText, (New-Object System.Text.UTF8Encoding($false)))
+
+            # Заблокований ($DisallowAutoDetect) прогін ІГНОРУЄ BRAVO.config
+            # повністю й переходить на Import-BravoSyntheticConfiguration —
+            # той самий "герметичність на машині без LIMS" паттерн, що й
+            # ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic вище:
+            # BackupRoot="" (canonical-дефолт) все ще вимагає
+            # EffectiveLIMSRoot, тож синтетичний шлях теж потребує
+            # BRAVO.local.config з явним BackupRoot.
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.local.config'),
+                (
+                    "@{`r`n" +
+                    "    'pathSettings.BackupRoot' = '$($staleBackupDir.Replace("'", "''"))'`r`n" +
+                    "}`r`n"
+                ),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+
+            $disallowArg = if ($DisallowAutoDetect) { ' -DisallowLegacyPrimaryAutoDetect' } else { '' }
+            $probeCommand = (
+                "try { " +
+                "Set-StrictMode -Version 2.0; " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root'$disallowArg 3>`$null); " +
+                "'RETENTION=' + [string]`$global:logRetentionDays + " +
+                "';FORMAT=' + [string]`$global:BravoConfigurationMetadata.Format + " +
+                "';BLOCKED=' + [string]`$global:BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked + " +
+                "';PRESENT=' + [string]`$global:BravoConfigurationMetadata.PrimaryConfigPresentOnDisk" +
+                "} catch { 'THREW: ' + `$_.Exception.Message }"
+            )
+            $probeOutput = [string](
+                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            )
+            return $probeOutput.Trim()
+        } finally {
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Sanity/контроль: БЕЗ -DisallowLegacyPrimaryAutoDetect застарілий
+    # файл дійсно підхоплюється (доводить, що маркер override взагалі щось
+    # означає — інакше PASS нижче був би тавтологією). Це той самий шлях,
+    # яким і сьогодні йде migration/deploy-інструментарій (Get-
+    # BRAVOConfigSiteDelta.ps1, Update-BRAVOServer.ps1 preflight-пробник) —
+    # свідомо, не регресія.
+    $postUpdateBaseline = Invoke-BRAVOPostUpdateStaleConfigProbe
+    Test-BRAVOCondition `
+        -Condition (
+            $postUpdateBaseline.Contains('RETENTION=999') -and
+            $postUpdateBaseline.Contains('PRESENT=True') -and
+            -not $postUpdateBaseline.StartsWith('THREW')
+        ) `
+        -Name "ConfigV2/PostUpdateStaleConfigBaselineAutoDetectPicksItUp" `
+        -Failure ("контрольний прогін без -DisallowLegacyPrimaryAutoDetect мусить довести, що маркер override " +
+            "(logRetentionDays=999) взагалі читається з auto-derived BRAVO.config — інакше наступна перевірка " +
+            "нічого не доводить; отримано '$postUpdateBaseline'")
+
+    # --- Основний доказ (Proof I, Agent E): production-entrypoint після
+    # успішного Update-BRAVOServer.ps1, з фізично залишеним на диску
+    # застарілим BRAVO.config, ІГНОРУЄ його повністю — ефективна
+    # logRetentionDays лишається canonical-дефолтом (31), а не 999.
+    $postUpdateProtected = Invoke-BRAVOPostUpdateStaleConfigProbe -DisallowAutoDetect
+    Test-BRAVOCondition `
+        -Condition (
+            $postUpdateProtected.Contains('RETENTION=31') -and
+            $postUpdateProtected.Contains('FORMAT=synthetic-no-config') -and
+            $postUpdateProtected.Contains('BLOCKED=True') -and
+            $postUpdateProtected.Contains('PRESENT=True') -and
+            -not $postUpdateProtected.StartsWith('THREW')
+        ) `
+        -Name "ConfigV2/PostUpdateStaleConfigIgnoredByProductionEntrypoint" `
+        -Failure ("фізично залишений на диску застарілий BRAVO.config (issue #216, стан сервера ПІСЛЯ успішного " +
+            "Update-BRAVOServer.ps1, який ніколи його не видаляє) мусить давати НУЛЬОВИЙ ефект на ефективну " +
+            "конфігурацію production-entrypoint-а, що передає -DisallowLegacyPrimaryAutoDetect: очікувалось " +
+            "RETENTION=31 (canonical-дефолт), FORMAT=synthetic-no-config, BLOCKED=True, PRESENT=True; отримано '$postUpdateProtected'")
 }

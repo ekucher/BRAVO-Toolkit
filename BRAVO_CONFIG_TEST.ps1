@@ -39,10 +39,16 @@ if (-not (Test-Path -LiteralPath $loaderPath -PathType Leaf)) {
 $configPathWasExplicit = $PSBoundParameters.ContainsKey('ConfigPath') -and
     -not [string]::IsNullOrWhiteSpace($ConfigPath)
 
+# Issue #216 (Wave B): CONFIG_TEST мусить показувати ту саму ефективну
+# конфігурацію, яку реально побачить production-entrypoint (Archive/
+# Health/Maintenance/DataRestore/Setup/CredentialsSetup) — тому й тут
+# auto-detect BRAVO.config за неявним шляхом заблоковано; явний -ConfigPath
+# лишається авторитетним, як і раніше.
 $result = Import-BravoConfiguration `
     -ConfigRoot $scriptRoot `
     -ConfigPath $ConfigPath `
     -ConfigPathWasExplicit:$configPathWasExplicit `
+    -DisallowLegacyPrimaryAutoDetect `
     -PassThru
 
 # Ефективні корені (з урахуванням AUTO) обчислює BRAVO.config і публікує

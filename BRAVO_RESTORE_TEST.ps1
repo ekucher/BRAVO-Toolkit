@@ -310,7 +310,11 @@ try {
         throw "Не знайдено BRAVO_CONFIG_LOADER.ps1: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $runtimeRoot -ConfigPathWasExplicit:$configPathWasExplicit
+    # Issue #216 (Wave B): production operator entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
+    Import-BravoConfiguration -ConfigRoot $configRoot -ConfigPath $resolvedConfigPath -RuntimeRoot $runtimeRoot -ConfigPathWasExplicit:$configPathWasExplicit -DisallowLegacyPrimaryAutoDetect
 
     # Поріг із конфігурації ($restoreVerifySettings, нормалізований
     # loader-ом і для legacy-конфігів) — але явний параметр командного

@@ -652,9 +652,21 @@ function Resolve-BRAVOInstallationDiscovery {
     $bravoRoot = $null
     $bravoRootReason = $null
     if (-not [string]::IsNullOrWhiteSpace($bravoRootOverride)) {
-        $bravoRoot = $bravoRootOverride
         $overrides["BravoRoot"] = $true
-        $bravoRootReason = "явний override discoverySettings.BravoRoot"
+        # Issue #216 (ALLOW_WITH_VALIDATOR): раніше override приймався
+        # без жодної перевірки — неіснуючий шлях мовчки ставав BRAVO_ROOT
+        # і годував подальше визначення джерел Archive/backup. Той самий
+        # принцип, що вже діє для discoverySettings.Sources.BAZA_WWW
+        # нижче: невалідний override -> видима причина, БЕЗ мовчазного
+        # прийняття хибного шляху.
+        if (-not (Test-BRAVOAbsolutePath -Path $bravoRootOverride)) {
+            $bravoRootReason = "явний override discoverySettings.BravoRoot не є absolute шляхом: $bravoRootOverride"
+        } elseif (-not (Test-Path -LiteralPath $bravoRootOverride -PathType Container)) {
+            $bravoRootReason = "явний override discoverySettings.BravoRoot вказує на каталог, якого не існує: $bravoRootOverride"
+        } else {
+            $bravoRoot = $bravoRootOverride
+            $bravoRootReason = "явний override discoverySettings.BravoRoot"
+        }
     } elseif ($null -ne $bravoServiceMatch -and
         -not [string]::IsNullOrWhiteSpace($bravoServiceMatch.ExecutablePath)) {
         $bravoRoot = Split-Path -Path $bravoServiceMatch.ExecutablePath -Parent
@@ -685,9 +697,17 @@ function Resolve-BRAVOInstallationDiscovery {
     $bravoIniPath = $null
     $bravoIniReason = $null
     if (-not [string]::IsNullOrWhiteSpace($bravoIniPathOverride)) {
-        $bravoIniPath = $bravoIniPathOverride
         $overrides["BravoIniPath"] = $true
-        $bravoIniReason = "явний override discoverySettings.BravoIniPath"
+        # Issue #216 (ALLOW_WITH_VALIDATOR) — той самий принцип, що для
+        # BravoRoot вище: невалідний override не приймається мовчки.
+        if (-not (Test-BRAVOAbsolutePath -Path $bravoIniPathOverride)) {
+            $bravoIniReason = "явний override discoverySettings.BravoIniPath не є absolute шляхом: $bravoIniPathOverride"
+        } elseif (-not (Test-Path -LiteralPath $bravoIniPathOverride -PathType Leaf)) {
+            $bravoIniReason = "явний override discoverySettings.BravoIniPath вказує на файл, якого не існує: $bravoIniPathOverride"
+        } else {
+            $bravoIniPath = $bravoIniPathOverride
+            $bravoIniReason = "явний override discoverySettings.BravoIniPath"
+        }
     } elseif ([string]::IsNullOrWhiteSpace($systemBravoIniPath)) {
         $bravoIniReason = "не вдалося визначити системний каталог Windows (%SystemRoot%), тому очікуваний шлях bravo.ini невідомий"
     } elseif (Test-Path -LiteralPath $systemBravoIniPath -PathType Leaf) {
@@ -716,8 +736,27 @@ function Resolve-BRAVOInstallationDiscovery {
         if ($sourceOverrides.Contains($FieldName) -and
             -not [string]::IsNullOrWhiteSpace([string]$sourceOverrides[$FieldName])) {
             $overrides[$FieldName] = $true
+            $overrideValue = [string]$sourceOverrides[$FieldName]
+            # Issue #216 (ALLOW_WITH_VALIDATOR) — той самий принцип, що для
+            # BravoRoot/BravoIniPath/BAZA_WWW: невалідний override не
+            # приймається мовчки. MODEL/BLOG/BRAVOEXCH — усі три завжди
+            # каталоги (той самий контракт, що й ini-похідне значення
+            # нижче: MODEL — Split-Path -Parent файлу, BLOG/BRAVOEXCH —
+            # TrimEnd роздільника).
+            if (-not (Test-BRAVOAbsolutePath -Path $overrideValue)) {
+                return [pscustomobject]@{
+                    Value = $null
+                    Reason = "явний override discoverySettings.Sources.$FieldName не є absolute шляхом: $overrideValue"
+                }
+            }
+            if (-not (Test-Path -LiteralPath $overrideValue -PathType Container)) {
+                return [pscustomobject]@{
+                    Value = $null
+                    Reason = "явний override discoverySettings.Sources.$FieldName вказує на каталог, якого не існує: $overrideValue"
+                }
+            }
             return [pscustomobject]@{
-                Value = [string]$sourceOverrides[$FieldName]
+                Value = $overrideValue
                 Reason = "явний override discoverySettings.Sources.$FieldName"
             }
         }
@@ -838,9 +877,23 @@ function Resolve-BRAVOInstallationDiscovery {
     }
     $bazaAppResolved = if (-not [string]::IsNullOrWhiteSpace($bazaAppOverrideValue)) {
         $overrides["BAZA_APP"] = $true
-        [pscustomobject]@{
-            Value = $bazaAppOverrideValue
-            Reason = "явний override discoverySettings.Sources.BAZA_APP"
+        # Issue #216 (ALLOW_WITH_VALIDATOR) — той самий принцип, що для
+        # BravoRoot/BravoIniPath/Sources.MODEL/BLOG/BRAVOEXCH/BAZA_WWW.
+        if (-not (Test-BRAVOAbsolutePath -Path $bazaAppOverrideValue)) {
+            [pscustomobject]@{
+                Value = $null
+                Reason = "явний override discoverySettings.Sources.BAZA_APP не є absolute шляхом: $bazaAppOverrideValue"
+            }
+        } elseif (-not (Test-Path -LiteralPath $bazaAppOverrideValue -PathType Container)) {
+            [pscustomobject]@{
+                Value = $null
+                Reason = "явний override discoverySettings.Sources.BAZA_APP вказує на каталог, якого не існує: $bazaAppOverrideValue"
+            }
+        } else {
+            [pscustomobject]@{
+                Value = $bazaAppOverrideValue
+                Reason = "явний override discoverySettings.Sources.BAZA_APP"
+            }
         }
     } elseif (-not [string]::IsNullOrWhiteSpace($iniInstallationRoot)) {
         [pscustomobject]@{
@@ -905,9 +958,17 @@ function Resolve-BRAVOInstallationDiscovery {
     # ServerRoot потрібен лише для пошуку самого httpd.conf.
     $apacheServerRoot = $null
     if (-not [string]::IsNullOrWhiteSpace($webRootOverride)) {
-        $webRoot = $webRootOverride
         $overrides["WebRoot"] = $true
-        $webRootReason = "явний override discoverySettings.WebRoot"
+        # Issue #216 (ALLOW_WITH_VALIDATOR) — той самий принцип, що для
+        # BravoRoot вище.
+        if (-not (Test-BRAVOAbsolutePath -Path $webRootOverride)) {
+            $webRootReason = "явний override discoverySettings.WebRoot не є absolute шляхом: $webRootOverride"
+        } elseif (-not (Test-Path -LiteralPath $webRootOverride -PathType Container)) {
+            $webRootReason = "явний override discoverySettings.WebRoot вказує на каталог, якого не існує: $webRootOverride"
+        } else {
+            $webRoot = $webRootOverride
+            $webRootReason = "явний override discoverySettings.WebRoot"
+        }
     } elseif ($null -ne $webServiceMatch -and
         -not [string]::IsNullOrWhiteSpace($webServiceMatch.ExecutablePath) -and
         [System.IO.Path]::GetFileName($webServiceMatch.ExecutablePath) -ieq "httpd.exe") {

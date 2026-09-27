@@ -781,14 +781,32 @@ function Test-BRAVOEffectiveSecurityInvariants {
     [CmdletBinding()]
     param()
 
+    # Issue #216 (§9): цю функцію можуть викликати одразу після dot-source
+    # BRAVO_CONFIG_LOADER.ps1, без попереднього Import-BravoConfiguration
+    # (напр. точкові self-test-проби, що ізолюють саме цю перевірку) — тоді
+    # BRAVO.Configuration ще не завантажений. Той самий idempotent-паттерн
+    # Get-Module-перед-Import, що вже застосовує Import-BravoConfiguration
+    # нижче в цьому файлі, тут — гарантія, що Test-BRAVOSecurityInvariant
+    # ValueWeakened завжди доступна, без повторного дублювання її логіки.
+    if (-not (Get-Command -Name 'Test-BRAVOSecurityInvariantValueWeakened' -ErrorAction SilentlyContinue)) {
+        $configurationModulePathForInvariants = Join-Path $PSScriptRoot 'modules\BRAVO.Configuration\BRAVO.Configuration.psd1'
+        Import-Module -Name $configurationModulePathForInvariants -ErrorAction Stop
+    }
+
     $integrityMode = if ($env:BRAVO_RUNTIME_INTEGRITY_MODE -eq 'Warn') { 'Warn' } else { 'Enforce' }
     $allowWeakened = [System.Environment]::GetEnvironmentVariable('BRAVO_ALLOW_WEAKENED_SECURITY')
 
     $weakened = New-Object System.Collections.Generic.List[string]
 
+    # Issue #216 (§9): bool-вердикт "чи це значення саме по собі послаблює
+    # інваріант" делегується канонічному Test-BRAVOSecurityInvariantValueWeakened
+    # (modules\BRAVO.Configuration) — той самий предикат, яким
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 позначає DENY-значення видимо ДО
+    # активації. Повідомлення лишаються тут: лише ця функція знає точний
+    # операторський контекст (пост-merge ефективна конфігурація).
     if ($global:backupConsistency -is [hashtable] -and
         $global:backupConsistency.Contains('Mode') -and
-        -not [string]::Equals([string]$global:backupConsistency.Mode, 'VSS', [System.StringComparison]::OrdinalIgnoreCase)) {
+        (Test-BRAVOSecurityInvariantValueWeakened -Path 'backupConsistency.Mode' -Value $global:backupConsistency.Mode)) {
         [void]$weakened.Add(
             "backupConsistency.Mode = '$($global:backupConsistency.Mode)' замість 'VSS' " +
             "(архів читається з live-каталогу, файли належать різним моментам часу)")
@@ -796,7 +814,7 @@ function Test-BRAVOEffectiveSecurityInvariants {
 
     if ($global:toolIntegritySettings -is [hashtable] -and
         $global:toolIntegritySettings.Contains('Mode') -and
-        -not [string]::Equals([string]$global:toolIntegritySettings.Mode, 'Enforce', [System.StringComparison]::OrdinalIgnoreCase)) {
+        (Test-BRAVOSecurityInvariantValueWeakened -Path 'toolIntegritySettings.Mode' -Value $global:toolIntegritySettings.Mode)) {
         [void]$weakened.Add(
             "toolIntegritySettings.Mode = '$($global:toolIntegritySettings.Mode)' замість 'Enforce' " +
             "(підмінений 7za.exe/WinSCP більше не блокує запуск)")
@@ -804,11 +822,10 @@ function Test-BRAVOEffectiveSecurityInvariants {
 
     # Wave 1B (Issue #216): requireAdministrator — той самий post-merge
     # ефективний контроль, що backupConsistency.Mode/toolIntegritySettings.Mode
-    # вище. Навмисно НЕ [bool]$value (у PowerShell [bool]'false' -eq $true —
-    # текстова "фальшива хибність" мовчки пройшла б як secure). Три випадки
-    # розрізняються явно: відсутній / не Boolean / Boolean-$false — усі три
-    # трактуються як послаблення й проходять через той самий
-    # Enforce/Warn + BRAVO_ALLOW_WEAKENED_SECURITY=1 механізм.
+    # вище. "Відсутній" не можна змоделювати спільним предикатом (він
+    # приймає лише вже наявне значення) — лишається окремою гілкою; "не
+    # Boolean"/"Boolean-$false" делегуються тому самому
+    # Test-BRAVOSecurityInvariantValueWeakened, що й вище.
     $requireAdministratorVariable = Get-Variable -Name 'requireAdministrator' -Scope Global -ErrorAction SilentlyContinue
     if ($null -eq $requireAdministratorVariable) {
         [void]$weakened.Add(
@@ -818,7 +835,7 @@ function Test-BRAVOEffectiveSecurityInvariants {
         [void]$weakened.Add(
             "requireAdministrator = '$($requireAdministratorVariable.Value)' не є Boolean-значенням " +
             "(очікується саме `$true — нетипізоване значення не гарантує перевірку прав)")
-    } elseif ($requireAdministratorVariable.Value -eq $false) {
+    } elseif (Test-BRAVOSecurityInvariantValueWeakened -Path 'requireAdministrator' -Value $requireAdministratorVariable.Value) {
         [void]$weakened.Add(
             "requireAdministrator = `$false " +
             "(процес може виконуватись без адміністративних прав — обов'язкова перевірка вимкнена)")
@@ -1375,6 +1392,51 @@ function Import-BravoConfiguration {
         # значення шляху.
         [switch]$ConfigPathWasExplicit,
 
+        # Issue #216 (P0 Config V2 cutover, Wave B): вимикає АВТОМАТИЧНЕ
+        # підхоплення BRAVO.config, знайденого лише тому, що він фізично
+        # лежить за auto-derived шляхом (ConfigRoot\BRAVO.config), коли
+        # ОПЕРАТОР ЙОГО НЕ ЗАПИТУВАВ (-ConfigPathWasExplicit не задано).
+        # Явний -ConfigPath лишається авторитетним наміром і НЕ блокується
+        # цим прапорцем — див. коментар нижче біля обчислення
+        # $legacyPrimaryAutoDetectBlocked.
+        #
+        # ЧОМУ ОПЦІЙНИЙ ПРАПОРЕЦЬ, А НЕ НОВИЙ ДЕФОЛТ ДЛЯ ВСІХ ВИКЛИКАЧІВ.
+        # Import-BravoConfiguration має прямих викликачів двох класів (Wave
+        # B, issue #216):
+        #
+        #   ПЕРЕДАЮТЬ прапорець (14, production/operator entrypoint-и —
+        #   оператор НЕ очікує, що підкладений поруч BRAVO.config мовчки
+        #   стане primary-шаром): 4 канонічні production runtime-
+        #   entrypoint-и (Archive/Health/Maintenance/DataRestore через
+        #   відповідні *.Runtime.ps1), BRAVO_SETUP.ps1,
+        #   BRAVO_CREDENTIALS_SETUP.ps1, BRAVO_CONFIG_TEST.ps1 (перші 7,
+        #   первинний Definition of Done issue #216), і після аудиту кроку 2
+        #   ще 7: BRAVO_BAZA_RECONCILE.ps1, BRAVO_DRY_RUN.ps1,
+        #   BRAVO_NOTIFICATION_TEST.ps1, BRAVO_RESTORE_TEST.ps1,
+        #   BRAVO_TASKS_DIAGNOSE.ps1, BRAVO_TASKS_INSTALL.ps1,
+        #   BRAVO_TASKS_UNINSTALL.ps1 — усі це штатні інструменти
+        #   оператора, а не migration-tooling.
+        #
+        #   НЕ передають прапорець (migration/deploy-інструментарій, де
+        #   читання РЕАЛЬНОГО поточного/site BRAVO.config — сама мета
+        #   інструмента, а не випадковість): deploy\Get-BRAVOConfigSiteDelta.ps1
+        #   (site-diff за визначенням читає обидва боки, включно з
+        #   реальним поточним BRAVO.config) і deploy\Update-BRAVOServer.ps1
+        #   (preflight-пробник явно читає ВЖЕ ВСТАНОВЛЕНИЙ на сервері
+        #   BRAVO.config, щоб порівняти пороги перед оновленням).
+        #   BRAVO_CONFIG_INTEGRATE.ps1, deploy\Compare-
+        #   BRAVOConfigEffectiveSnapshot.ps1, deploy\Start-
+        #   BRAVOConfigV2Pilot.ps1, deploy\New-BRAVOConfigV2PilotArtifact.ps1
+        #   і deploy\BRAVOConfigV2Pilot.Runtime.ps1 НЕ викликають цю функцію
+        #   напряму (інший механізм читання/порівняння конфігурації) —
+        #   поза цим прапорцем за визначенням, не через свідоме
+        #   виключення.
+        #
+        # Зміна дефолту для ВСІХ викликачів одночасно означала б
+        # непровалідовану зміну поведінки поза межами явно перевіреного
+        # execution-контракту. Тому прапорець лишається явним opt-in.
+        [switch]$DisallowLegacyPrimaryAutoDetect,
+
         [switch]$PassThru
     )
 
@@ -1399,7 +1461,36 @@ function Import-BravoConfiguration {
     }
 
     $resolvedConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
-    $legacyConfigFileExists = Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf
+    $legacyConfigFileExistsOnDisk = Test-Path -LiteralPath $resolvedConfigPath -PathType Leaf
+
+    # Issue #216 (Wave B): "STOPPED does not mean owned" — тут еквівалент:
+    # "файл присутній не означає, що його треба виконати". Блокуємо лише
+    # AUTO-DERIVED, неявний випадок (оператор нічого не запитував); явний
+    # -ConfigPath завжди лишається авторитетним наміром і НІКОЛИ не
+    # блокується — так само, як явний -ConfigPath завжди вимагав існування
+    # файлу до цієї зміни.
+    $legacyPrimaryAutoDetectBlocked = [bool]$DisallowLegacyPrimaryAutoDetect -and
+        $legacyConfigFileExistsOnDisk -and
+        -not $configPathWasExplicit
+
+    # Далі за функцією $legacyConfigFileExists — єдине джерело істини про
+    # те, чи діє legacy-primary шар. Коли блоковано, він трактується як
+    # "відсутній": Complete-BRAVOConfigurationLoad піде тим самим
+    # синтетичним (BuiltInOnly/BuiltIn+Local) шляхом, яким і так вже йде
+    # свіжий сервер без BRAVO.config — тут нема нового коду виконання
+    # конфігурації, лише блокування auto-detect гілки.
+    $legacyConfigFileExists = $legacyConfigFileExistsOnDisk -and -not $legacyPrimaryAutoDetectBlocked
+
+    if ($legacyPrimaryAutoDetectBlocked) {
+        Write-Warning (
+            "BRAVO.config знайдено за auto-derived шляхом '$resolvedConfigPath', але цей production-" +
+            'entrypoint не виконує його автоматично (issue #216, Wave B): файл не був явно запитаний ' +
+            '(-ConfigPath). Діють канонічні built-in дефолти + BRAVO.local.config. Якщо цей BRAVO.config ' +
+            'дійсно потрібен (legacy 5.2-сервер, ще не мігрований), запустіть цей самий скрипт із явним ' +
+            "-ConfigPath '$resolvedConfigPath', або скористайтесь migration-інструментарієм " +
+            '(BRAVO_CONFIG_INTEGRATE.ps1 / deploy\\Get-BRAVOConfigSiteDelta.ps1).'
+        )
+    }
 
     if ($configPathWasExplicit -or $legacyConfigFileExists) {
         # Явний -ConfigPath завжди мусить існувати (свідомий намір
@@ -1454,7 +1545,19 @@ function Import-BravoConfiguration {
     }
     $global:BravoLocalConfigOverrideState = $localOverrideState
     $effectiveLocalOverrides = if ($null -ne $localOverrideState) { $localOverrideState.Overrides } else { @{} }
-    $effectiveUnknownLeafSink = if ($null -ne $localOverrideState) { $localOverrideState.UnknownLeafPaths } else { $null }
+    # R2 (Issue #216): НЕ через if-вираз, як $effectiveLocalOverrides вище —
+    # PowerShell розгортає порожній IEnumerable (List[string] із Count=0),
+    # що виходить із гілки if-виразу через звичайний output-стрім, у $null
+    # (перевірено емпірично); непорожній список тієї ж дорогою розгортається
+    # в останній елемент, а не в сам список. UnknownLeafPaths стартує
+    # порожнім, тож sink завжди був $null у момент передачі нижче — D3
+    # unknown-leaf warning (#154/A2) мовчки ніколи не спрацьовувала.
+    # Hashtable (рядок вище) цій пастці не піддається — PowerShell не
+    # розгортає Hashtable по елементах, тож там той самий паттерн безпечний.
+    $effectiveUnknownLeafSink = $null
+    if ($null -ne $localOverrideState) {
+        $effectiveUnknownLeafSink = $localOverrideState.UnknownLeafPaths
+    }
 
     # #154 (A3/F1): симетрія ДІАГНОСТИКИ шарів. Site-шар fail-closed на
     # невідомий батьківський вузол і (з A2) звітує про невідомий leaf;
@@ -1734,6 +1837,14 @@ function Import-BravoConfiguration {
         PrimaryConfigPath = $resolvedConfigPath
         PrimaryConfigPresent = $legacyConfigFileExists
         PrimaryConfigWasExplicit = $configPathWasExplicit
+        # Issue #216 (Wave B): діагностика для операторів/CONFIG_TEST.
+        # PrimaryConfigPresent вище — це ЕФЕКТИВНА присутність (після
+        # блокування auto-detect); ці два поля показують СИРИЙ факт "файл
+        # фізично лежить на диску" і "чи саме тому його проігноровано" —
+        # без них зникнення файлу з ефективної конфігурації виглядало б як
+        # "файлу взагалі нема", хоча він є, просто проігнорований навмисно.
+        PrimaryConfigPresentOnDisk = $legacyConfigFileExistsOnDisk
+        PrimaryConfigAutoDetectBlocked = $legacyPrimaryAutoDetectBlocked
         LocalConfigPath = if ($null -ne $localOverrideState) { [string]$localOverrideState.Path } else { $null }
         LocalConfigPresent = ($null -ne $localOverrideState)
         # Ключі з BRAVO.local.config, реально застосовані цим завантаженням
