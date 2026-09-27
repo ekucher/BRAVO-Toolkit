@@ -61,8 +61,6 @@ $validation = [pscustomobject]@{
     Status = 'OK'
     Product = $result.Version.Product
     PackageVersion = $result.Version.PackageVersion
-    LegacyScriptVersion = $result.Configuration.LegacyScriptVersion
-    PackageVersionMatchesLegacyConfig = $result.Configuration.PackageVersionMatchesLegacyConfig
     ConfigSchemaVersion = $result.Configuration.ConfigSchemaVersion
     ConfigFormat = $result.Configuration.Format
     ConfigMode = $result.Configuration.Mode
@@ -114,7 +112,6 @@ if ($validation.PrimaryConfigPresent) {
         $validation.ConfigMode, $(if ($validation.LocalConfigPresent) { ' + BRAVO.local.config' } else { '' }))
 }
 Write-Host ('[INFO] Package version: {0}' -f $validation.PackageVersion)
-Write-Host ('[INFO] Legacy config version: {0}' -f $validation.LegacyScriptVersion)
 Write-Host ('[INFO] Configuration schema: {0}' -f $validation.ConfigSchemaVersion)
 Write-Host ('[INFO] RuntimeRoot: {0}' -f $validation.RuntimeRoot)
 Write-Host ('[INFO] RuntimeLogRoot (script logs): {0}' -f $validation.RuntimeLogRoot)
@@ -123,14 +120,6 @@ Write-Host ('[INFO] SystemLogRoot: configured="{0}" effective="{1}" source={2}' 
 Write-Host ('[INFO] BackupRoot: configured="{0}" effective="{1}" source={2}' -f $validation.ConfiguredBackupRoot, $validation.EffectiveBackupRoot, $validation.BackupRootSource)
 Write-Host ('[INFO] StateRoot: {0}' -f $validation.StateRoot)
 Write-Host ('[INFO] Operation lock: {0}' -f $validation.OperationLockPath)
-
-if (-not [string]::IsNullOrWhiteSpace([string]$validation.LegacyScriptVersion) -and
-    -not $validation.PackageVersionMatchesLegacyConfig) {
-    Write-Warning (
-        'Transitional state: VERSION.json and BRAVO.config have different versions. ' +
-        'This is allowed only until loader integration into production scripts is complete.'
-    )
-}
 
 Write-Host '[SUCCESS] Configuration validation completed successfully.'
 exit 0
