@@ -670,7 +670,7 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 Лише перевірка конфігурації, файлів, каталогів, tools і плану операцій:
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_DRY_RUN.ps1
 ```
 
 Додатково перевірити реальну автентифікацію та доступ (містить проби
@@ -678,13 +678,13 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 призначення на SFTP):
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_DRY_RUN.ps1 -TestAccess
 ```
 
 End-to-end тест із одним реальним Slack/Discord повідомленням:
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess -SendTestNotification
+.\BRAVO_DRY_RUN.ps1 -TestAccess -SendTestNotification
 ```
 
 `-TestAccess` виконує:
@@ -717,14 +717,14 @@ Dry-run їх не запускає.
 Ручний запуск:
 
 ```powershell
-.\BRAVO_RESTORE_TEST.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_RESTORE_TEST.ps1
 ```
 
 Для контрольованого відновлення конкретної точки в часі задайте generation
 явно. Не змішуйте independently newest MODEL/BLOG/BRAVOEXCH:
 
 ```powershell
-.\BRAVO_RESTORE_TEST.ps1 -GenerationId "20260808_154300" -ConfigPath ".\BRAVO.config"
+.\BRAVO_RESTORE_TEST.ps1 -GenerationId "20260808_154300"
 ```
 
 Лише один компонент, машинно-читаний JSON-результат і вища мінімальна
@@ -759,7 +759,7 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 елевації):
 
 ```powershell
-.\BRAVO_DATA_RESTORE.ps1 -ListGenerations -ConfigPath ".\BRAVO.config"
+.\BRAVO_DATA_RESTORE.ps1 -ListGenerations
 ```
 
 **OutOfPlace** (типово) — розпакування у порожні підкаталоги вказаної
@@ -767,7 +767,7 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 
 ```powershell
 .\BRAVO_DATA_RESTORE.ps1 -GenerationId "20260808_154300" `
-    -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK" -ConfigPath ".\BRAVO.config"
+    -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK"
 ```
 
 **InPlace** — відновлення у production-шляхи (їх визначає discovery за
@@ -780,7 +780,7 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 
 ```powershell
 .\BRAVO_DATA_RESTORE.ps1 -GenerationId "20260808_154300" `
-    -Mode InPlace -ConfigPath ".\BRAVO.config"
+    -Mode InPlace
 ```
 
 Джерелом може бути не лише локальний `BackupRoot`, а й SFTP
@@ -926,19 +926,19 @@ WARNING/ERROR/CRITICAL (recovery) надсилаються завжди, нез�
 Встановити або оновити лише завдання:
 
 ```powershell
-.\BRAVO_TASKS_INSTALL.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_TASKS_INSTALL.ps1
 ```
 
 Перевірити визначення без встановлення:
 
 ```powershell
-.\BRAVO_TASKS_INSTALL.ps1 -ConfigPath ".\BRAVO.config" -ValidateOnly
+.\BRAVO_TASKS_INSTALL.ps1 -ValidateOnly
 ```
 
 Видалити завдання:
 
 ```powershell
-.\BRAVO_TASKS_UNINSTALL.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_TASKS_UNINSTALL.ps1
 ```
 
 Перед реальним встановленням скрипт:
@@ -1080,14 +1080,14 @@ UAC — можливий подальший крок, якщо той самий
 Виконайте від адміністратора:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -InspectOnly
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 Для перевірки webhook одним реальним повідомленням:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess -SendTestNotification
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess -SendTestNotification
 ```
 
 Діагностика показує:
