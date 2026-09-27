@@ -256,9 +256,10 @@ Two residual gaps, both recorded deliberately rather than silently:
    paragraph also exempted commit messages only, while the rule's scope covers PR/issue bodies and comments
    too — the 177-body remediation above is what actually satisfies that scope.
 
-Both gaps are addressed by PR #235 (`.claude/CLAUDE.md`), which also carries the corrected full-history
-figures and the shallow-clone warning. Once #235 and this PR are both merged, item 0 of NEXT ACTION below
-is delivered and is to be removed from it.
+Both gaps were addressed by PR #235 (`.claude/CLAUDE.md`), **merged 2026-09-27 as `f76ff42`**, which also
+carries the corrected full-history figures, the shallow-clone and trailer-casing warnings, and the
+reproduction commands pinned to `64a8b11`. Once this PR merges too, item 0 of NEXT ACTION below is delivered
+and is to be removed from it.
 
 Commit-message history is **not** being rewritten: `rebase`/`filter-repo` + force-push would invalidate
 every existing clone, every PR/issue cross-reference, and the `VERSION.json.sourceCommit` provenance chain.
@@ -302,11 +303,12 @@ audit)"). The open Config V2 work is B5 (fleet migration — requires real
 servers, not available to an automated session) and B7 (v2-path regression
 matrix + parity required-check promotion).
 
-**Active as of 2026-09-27 17:15 UTC: two documentation PRs awaiting merge** —
-PR #234 (this file) and PR #235 (`.claude/CLAUDE.md`, the AI-attribution rule
-text). Both are non-draft, CI green or running with no failures, no approving
-review, no merge conflict. Re-verify their state before anything else; a merge
-from an automated session is refused (see the note at the end of NEXT ACTION).
+**Active as of 2026-09-27 17:57 UTC: one documentation PR awaiting merge** —
+PR #234 (this file). Its sibling PR #235 (`.claude/CLAUDE.md`, the
+AI-attribution rule text) merged as `f76ff42`. PR #234 is non-draft, 7/7 checks
+green, `mergeable_state: clean`, all 9 review threads resolved, no approving
+review. Re-verify its state before anything else; a merge from an automated
+session is refused (see the note at the end of NEXT ACTION).
 
 Two documentation-only PRs merged on 2026-09-27 after that audit: PR #232 (`7734a55`) synchronised this file
 with the audited B4/B5/B7 state and corrected its false "Config parity is now a required check" claim, and
@@ -409,11 +411,11 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 **Updated 2026-09-27 after PR #232 and PR #233 merged. Replaces the previous entry (whose items 1-3 remain
 valid and are carried forward below) rather than patching it, per this file's maintenance rule #7.**
 
-No uncommitted work is pending. Two documentation PRs (#234, #235) are open and awaiting merge, so the
-executable step is item 0 — drive them to done; items 1-3 need the owner or real servers.
+No uncommitted work is pending. PR #235 merged (`f76ff42`); PR #234 (this file) is still open, so the
+executable step is item 0 — drive it to done; items 1-3 need the owner or real servers.
 
 ```text
-0. DRIVE PR #234 and PR #235 to done. Both are docs-only, non-draft, no conflict, no approving review.
+0. DRIVE PR #234 to done (PR #235 already merged as `f76ff42`). Docs-only, non-draft, no conflict.
    Concretely, in this order:
      - re-verify both on their current heads: CI conclusion per check, merge state, open review threads
        (REST API; `pull_request_read` costs ~6k tokens per call, use curl);
@@ -422,7 +424,7 @@ executable step is item 0 — drive them to done; items 1-3 need the owner or re
        three such rounds: shallow-clone counts, case-sensitive trailer match, self-contradicting literals);
      - the merge itself is NOT available to an automated session (see the note below) — once both are green
        with every thread answered, report MERGE READY to the owner and stop;
-     - after BOTH merge: delete this item 0 from NEXT ACTION, set the State baseline SHA to the new
+     - after it merges: delete this item 0 from NEXT ACTION, set the State baseline SHA to the new
        `origin/developer` HEAD, and record in "AI-attribution footer prohibition" that the rule text is
        corrected. That edit is itself a docs-only PR.
    What #235 already delivered in `.claude/CLAUDE.md` («Заборона підписів про AI-авторство»):
