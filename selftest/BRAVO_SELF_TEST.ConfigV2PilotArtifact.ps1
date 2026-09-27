@@ -347,6 +347,22 @@ try {
     $validateAgainOutput = & $startScript -Validate -InstallRoot $happyInstallRoot -EvidenceDir $evidenceDir 2>&1
     Test-BRAVOPilotSelfTestCondition -Name 'Idempotency/RepeatedValidateSucceeds' -Condition ($LASTEXITCODE -eq 0) -FailureDetail ([string]::Join(' | ', @($validateAgainOutput | Select-Object -Last 10)))
 
+    # Issue #216 Phase 11 п.10 (migration is idempotent): повторний -Validate
+    # мусить не лише повернути exit 0 (вже перевірено вище), а й реально
+    # лишити стан термінальним ('Validated', не регресувати в 'Failed' чи
+    # інший стан) і зберегти той самий (не fabricated) семантичний
+    # parity-результат — без цього "RepeatedValidateSucceeds" довів би лише
+    # відсутність крашу, а не справжню ідемпотентність migration-шляху.
+    $stateAfterRepeatedValidate = Get-Content -LiteralPath (Join-Path $evidenceDir 'metadata.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Test-BRAVOPilotSelfTestCondition -Name 'Idempotency/RepeatedValidateStateStaysValidated' -Condition (
+        [string]$stateAfterRepeatedValidate.State -eq 'Validated'
+    ) -FailureDetail ([string]$stateAfterRepeatedValidate.State)
+
+    $parityAfterRepeatedValidate = Get-Content -LiteralPath (Join-Path $evidenceDir 'parity.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+    Test-BRAVOPilotSelfTestCondition -Name 'Idempotency/RepeatedValidateParityStillPasses' -Condition (
+        [bool]$parityAfterRepeatedValidate.Pass
+    ) -FailureDetail ([string]::Join(' | ', @($parityAfterRepeatedValidate.Output)))
+
     # P2 regression: acceptance.json.PreflightPass має бути evidence-based
     # (читається з фактичного preflight.json), а не hardcoded true. Копія
     # evidence-каталогу на стані Validated з видаленим preflight.json ->
