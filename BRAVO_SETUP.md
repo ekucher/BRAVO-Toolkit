@@ -261,19 +261,19 @@ retention нового запуску шукають уже новий преф�
 Діагностика реєстрації, `LastTaskResult` і end-to-end доступу від `SYSTEM`:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 Лише перегляд реєстрації без UAC і без тимчасового SYSTEM-завдання:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -InspectOnly
+.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly
 ```
 
 З одним тестовим повідомленням від `SYSTEM`:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess -SendTestNotification
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess -SendTestNotification
 ```
 
 Тільки комплексна перевірка без змін:
@@ -287,19 +287,19 @@ retention нового запуску шукають уже новий преф�
 Без мережевої автентифікації:
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_DRY_RUN.ps1
 ```
 
 З перевіркою доступів (містить проби запису — див. вище):
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_DRY_RUN.ps1 -TestAccess
 ```
 
 З end-to-end надсиланням одного тестового повідомлення:
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess -SendTestNotification
+.\BRAVO_DRY_RUN.ps1 -TestAccess -SendTestNotification
 ```
 
 `-TestAccess` виконує:

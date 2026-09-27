@@ -777,7 +777,7 @@ Get-ChildItem "<runtimeLogRoot>\BRAVO_DATA_RESTORE_*.log" |
     Sort-Object LastWriteTime | Select-Object -Last 1
 
 # Які generation узагалі придатні (read-only, без елевації)
-.\BRAVO_DATA_RESTORE.ps1 -ListGenerations -ConfigPath ".\BRAVO.config"
+.\BRAVO_DATA_RESTORE.ps1 -ListGenerations
 
 # Стан керованих служб
 Get-Service | Where-Object { $_.Name -in @('<BravoName>', '<ExchangeApiName>') }
@@ -935,7 +935,7 @@ Start-Service '<BravoWebName>'
 Крок 7. Перевірте систему:
 
 ```powershell
-.\BRAVO_HEALTH.ps1 -ConfigPath ".\BRAVO.config" -NoPause
+.\BRAVO_HEALTH.ps1 -NoPause
 ```
 
 **Якщо `.prerestore_*` кілька (від різних спроб) — НІКОЛИ не беріть
@@ -981,7 +981,7 @@ man-in-the-middle. Підганяння значення під те, що пр�
 
 ```powershell
 Test-NetConnection -ComputerName <sftp-host> -Port 22
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 **Розвилка.**
@@ -1027,7 +1027,7 @@ SFTP-хост не резолвиться — інтернет і DNS працю
 **Діагностика.**
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 Перевіряє доступ саме від `SYSTEM`, а не від вашого облікового запису —
@@ -1690,8 +1690,8 @@ credentials і мережеві доступи вашого облікового
 **Діагностика.**
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -InspectOnly
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 **Типові `LastTaskResult`.**
@@ -1937,7 +1937,7 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
    **до** розпакування в production:
 
    ```powershell
-   .\BRAVO_RESTORE_TEST.ps1 -GenerationId "<yyyyMMdd_HHmmss>" -ConfigPath ".\BRAVO.config"
+   .\BRAVO_RESTORE_TEST.ps1 -GenerationId "<yyyyMMdd_HHmmss>"
    ```
 
    Це read-only: розпаковує в ізольований тимчасовий каталог, звіряє
@@ -1950,12 +1950,12 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
    ```powershell
    # Спершу без ризику: розпакувати в порожній каталог і подивитись на дані.
    .\BRAVO_DATA_RESTORE.ps1 -GenerationId "<yyyyMMdd_HHmmss>" `
-       -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK" -ConfigPath ".\BRAVO.config"
+       -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK"
 
    # Далі — у production-шляхи (зупиняє служби, зносить поточні дані вбік
    # у <каталог>.prerestore_<timestamp>, вимагає набрати GenerationId).
    .\BRAVO_DATA_RESTORE.ps1 -GenerationId "<yyyyMMdd_HHmmss>" `
-       -Mode InPlace -ConfigPath ".\BRAVO.config"
+       -Mode InPlace
    ```
 
    Ціль InPlace визначає discovery (`bravo.ini`), а не параметр. При збої
