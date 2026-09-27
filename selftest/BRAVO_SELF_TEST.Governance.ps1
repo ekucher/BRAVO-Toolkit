@@ -1483,6 +1483,87 @@
         Remove-Item -LiteralPath $legacyReaderRootEntryFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateIgnoresCommentOnlyLegacyReaderMention ---
+    # Codex-знахідка (gate-review, R3): текстовий пошук бачив би цю появу
+    # назви функції в коментарі як FAIL, хоча жодного виклику команди тут
+    # немає — гейт мусить розбирати AST і зіставляти лише СПРАВЖНІ виклики
+    # команд, а не будь-яку текстову появу імені.
+    $legacyReaderCommentOnlyFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $commentOnlyDir = Join-Path $legacyReaderCommentOnlyFixtureRoot 'modules\BRAVO.Comment'
+        [void][IO.Directory]::CreateDirectory($commentOnlyDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $commentOnlyDir 'BRAVO.Comment.psm1'),
+            "# делегує в Import-BravoLegacyPrimaryConfiguration/Read-BRAVOLegacyPrimaryRawOverrides для сумісності`nfunction Invoke-Noop { 'noop' }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderCommentOnlyFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderCommentOnlyFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderCommentOnlyFixtureResult.Passed -and
+                @($legacyReaderCommentOnlyFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateIgnoresCommentOnlyLegacyReaderMention" `
+            -Failure "коментар, що лише ЗГАДУЄ назву legacy-рідера (без виклику команди), не сміє провалювати гейт LEGACY_READER_ISOLATION; отримано Failures=$($legacyReaderCommentOnlyFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderCommentOnlyFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateScansDeployDirectoryForLegacyReaderCalls ---
+    # Codex-знахідка (gate-review): deploy\ раніше не сканувався ЗОВСІМ —
+    # не-migration скрипт (напр. deploy\Install-BRAVOServer.ps1) міг би
+    # напряму викликати legacy-рідер без жодного FAIL.
+    $legacyReaderDeployFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        [void][IO.Directory]::CreateDirectory((Join-Path $legacyReaderDeployFixtureRoot 'deploy'))
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderDeployFixtureRoot 'deploy\Rogue-NotSanctioned.ps1'),
+            'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X',
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderDeployFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderDeployFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderDeployFixtureResult.Passed -and
+                @($legacyReaderDeployFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('Rogue-NotSanctioned.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateScansDeployDirectoryForLegacyReaderCalls" `
+            -Failure "не-migration скрипт під deploy\, що напряму викликає Read-BRAVOLegacyPrimaryRawOverrides, мусить провалювати гейт LEGACY_READER_ISOLATION — deploy\ мусить скануватись так само, як modules\"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderDeployFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateExemptsSanctionedMigrationToolsFromLegacyReaderIsolation ---
+    # ci\New-BRAVOReleaseArtifact.ps1 (коментар біля рядка 200) документує
+    # канонічний перелік migration/deploy-інструментів, чия ЗАЯВЛЕНА мета —
+    # читати РЕАЛЬНИЙ встановлений legacy-шар (Issue #216 Phase 6 санкціонує
+    # це напряму для deploy\Get-BRAVOConfigSiteDelta.ps1). Гейт
+    # LEGACY_READER_ISOLATION мусить узгоджено виключати той самий перелік.
+    $legacyReaderSanctionedFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderSanctionedFixtureRoot 'BRAVO_CONFIG_INTEGRATE.ps1'),
+            'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X',
+            (New-Object Text.UTF8Encoding($false))
+        )
+        [void][IO.Directory]::CreateDirectory((Join-Path $legacyReaderSanctionedFixtureRoot 'deploy'))
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderSanctionedFixtureRoot 'deploy\Get-BRAVOConfigSiteDelta.ps1'),
+            'Read-BRAVOLegacyPrimaryRawOverrides -ConfigPath X',
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderSanctionedFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderSanctionedFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderSanctionedFixtureResult.Passed -and
+                @($legacyReaderSanctionedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateExemptsSanctionedMigrationToolsFromLegacyReaderIsolation" `
+            -Failure "BRAVO_CONFIG_INTEGRATE.ps1 і deploy\Get-BRAVOConfigSiteDelta.ps1 — санкціоновані Issue #216 Phase 6 migration-інструменти — не сміють провалювати гейт LEGACY_READER_ISOLATION лише за виконання своєї заявленої мети; отримано Failures=$($legacyReaderSanctionedFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderSanctionedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну

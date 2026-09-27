@@ -123,19 +123,37 @@ function Test-BRAVOConfigV2CutoverGates {
     # окремо доводить, що той інструмент читає через канонічний
     # Read-BRAVOLegacyPrimaryRawOverrides, а не власну реалізацію.
     #
-    # R2 (issue #216, gate-review): PowerShell розв'язує імена команд
-    # регістронезалежно, тому `.Contains` (ordinal, регістрозалежний) пропустив
-    # би виклик іншим регістром символів — порівнюємо через
-    # OrdinalIgnoreCase.IndexOf.
+    # R3 (issue #216, gate-review): текстовий `.IndexOf` бачить кожну
+    # ТЕКСТОВУ появу імені функції — включно з коментарями/help-текстом/
+    # рядковими літералами у fixture-даних self-test-ів (сам блоковий
+    # allowlist для BRAVO_SELF_TEST.ps1 у попередній версії був прямим
+    # доказом цього false-positive класу) — і водночас пропустив би
+    # реальний виклик через `& $variable`/aliasing. Замість текстового
+    # пошуку розбираємо файл через PowerShell AST і зіставляємо лише
+    # СПРАВЖНІ виклики команд (CommandAst.GetCommandName()) — коментар чи
+    # рядковий літерал з тим самим текстом більше не породжує FAIL, а
+    # окремий file-level allowlist для test-харнесу більше не потрібен.
     $legacyReaderFunctionNames = @(
         'Import-BravoLegacyPrimaryConfiguration',
         'Read-BRAVOLegacyPrimaryRawOverrides'
     )
+    # R3 (issue #216, gate-review): ci\New-BRAVOReleaseArtifact.ps1 (коментар
+    # біля рядка 200) уже документує канонічний перелік migration/deploy-
+    # інструментів, чия ЗАЯВЛЕНА мета — читати РЕАЛЬНИЙ встановлений
+    # BRAVO.config/legacy-шар (Issue #216 Phase 6 санкціонує це для
+    # deploy\Get-BRAVOConfigSiteDelta.ps1 зокрема). Гейт LEGACY_READER_ISOLATION
+    # мусить узгоджено виключати той самий перелік — інакше той самий
+    # інструмент, що вже офіційно поза гейтом AUTOEXEC, міг би несподівано
+    # провалити ЦЕЙ гейт, щойно виконає свою санкціоновану роботу.
     $legacyReaderAllowedRelativePaths = @(
         'BRAVO_CONFIG_LOADER.ps1',
-        # Test-харнес, не production runtime: одна історична КОМЕНТАР-згадка
-        # назви функції (не виклик) — self-test не консультує legacy-рідер.
-        'BRAVO_SELF_TEST.ps1'
+        'BRAVO_CONFIG_INTEGRATE.ps1',
+        'deploy\Get-BRAVOConfigSiteDelta.ps1',
+        'deploy\Compare-BRAVOConfigEffectiveSnapshot.ps1',
+        'deploy\Start-BRAVOConfigV2Pilot.ps1',
+        'deploy\New-BRAVOConfigV2PilotArtifact.ps1',
+        'deploy\BRAVOConfigV2Pilot.Runtime.ps1',
+        'deploy\Update-BRAVOServer.ps1'
     )
     # R2 (issue #216, gate-review): попередня версія обмежувалась modules\ і
     # лише 14 AUTOEXEC-цілями (Get-BRAVOProductionEntryPointRelativePath), що
@@ -145,9 +163,12 @@ function Test-BRAVOConfigV2CutoverGates {
     # BRAVO_*.ps1-скрипти є production/operator-поверхнею репозиторію
     # (архітектурна політика 05-architecture.md), тому скануються всі, не
     # лише підмножина з AUTOEXEC-переліку.
+    # R3 (issue #216, gate-review): deploy\ раніше не сканувався ЗОВСІМ —
+    # додано, щоб deploy\Install-BRAVOServer.ps1 та інші не-migration
+    # скрипти цього каталогу теж підлягали ізоляції.
     $legacyReaderRootEntryScripts = @(Get-ChildItem -LiteralPath $Root -File -Filter 'BRAVO_*.ps1' -ErrorAction SilentlyContinue) |
         ForEach-Object { $_.Name }
-    $legacyReaderScanTargets = @('modules') + $ProductionEntryPointRelativePath + $legacyReaderRootEntryScripts
+    $legacyReaderScanTargets = @('modules', 'deploy') + $ProductionEntryPointRelativePath + $legacyReaderRootEntryScripts
     $legacyReaderViolations = New-Object System.Collections.Generic.List[string]
     $legacyReaderScannedRelativePaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     $resolvedRootPathItem = Get-Item -LiteralPath $Root
@@ -155,7 +176,11 @@ function Test-BRAVOConfigV2CutoverGates {
         $scanTargetPath = Join-Path $Root $scanTargetRelativePath
         $scanTargetFiles = @()
         if (Test-Path -LiteralPath $scanTargetPath -PathType Container) {
-            $scanTargetFiles = @(Get-ChildItem -LiteralPath $scanTargetPath -Recurse -File -Include '*.ps1', '*.psm1')
+            # R3: `-Include` разом із `-LiteralPath` на Windows PowerShell 5.1
+            # ненадійний (відомий gotcha — фільтр мовчки ігнорується), тому
+            # розширення відфільтровано вручну після перерахування файлів.
+            $scanTargetFiles = @(Get-ChildItem -LiteralPath $scanTargetPath -Recurse -File |
+                Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.psm1' })
         } elseif (Test-Path -LiteralPath $scanTargetPath -PathType Leaf) {
             $scanTargetFiles = @(Get-Item -LiteralPath $scanTargetPath)
         }
@@ -168,9 +193,31 @@ function Test-BRAVOConfigV2CutoverGates {
                 continue
             }
             $scanTargetFileText = Get-Content -LiteralPath $scanTargetFile.FullName -Raw -Encoding UTF8
-            foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
-                if ($scanTargetFileText.IndexOf($legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase) -ge 0) {
-                    [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
+            $legacyReaderParseErrors = $null
+            $legacyReaderFileAst = [System.Management.Automation.Language.Parser]::ParseInput(
+                $scanTargetFileText, [ref]$null, [ref]$legacyReaderParseErrors
+            )
+            if ($legacyReaderParseErrors -and $legacyReaderParseErrors.Count -gt 0) {
+                # Fail closed: незрозумілий для парсера файл не можна довести
+                # безпечним — гейт відмовляє явно, а не мовчки пропускає скан.
+                [void]$legacyReaderViolations.Add(
+                    "$fileRelativePath (не вдалося розібрати AST для перевірки LEGACY_READER_ISOLATION: $($legacyReaderParseErrors[0].Message))"
+                )
+                continue
+            }
+            $legacyReaderCommandAsts = $legacyReaderFileAst.FindAll(
+                { param($astNode) $astNode -is [System.Management.Automation.Language.CommandAst] },
+                $true
+            )
+            foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
+                $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
+                if ([string]::IsNullOrEmpty($invokedCommandName)) {
+                    continue
+                }
+                foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                    if ([string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                        [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
+                    }
                 }
             }
         }
