@@ -36,6 +36,20 @@
 > відображають поточний production-стан (backend/UI/Presets/Credentials/
 > Preview вже змерджені), але в частині "manual/DPI acceptance NOT
 > EXECUTED" (§12.6) вони лишаються актуальними — цей пробіл не закрито.
+>
+> **ЗАСТАРІЛО з 2026-09-26 (§1).** §1 описує `BRAVO.config` як "canonical
+> defaults", виконуваний PowerShell-скрипт, що є кореневим джерелом
+> raw-конфігурації для Configurator. Це відображало стан на момент
+> написання, але з Issue #216 (owner-мандат, 2026-09-24/26: «У версії
+> 5.3 взагалі не повинно бути BRAVO.config») кореневий `BRAVO.config`
+> прибрано з release-пакета (issue #154 крок B4-2), а production-runtime
+> і operator-entrypoint-и (включно з `BRAVO_CONFIGURATOR.ps1`) не
+> підхоплюють його автоматично (`-DisallowLegacyPrimaryAutoDetect`,
+> `BRAVO_CONFIG_LOADER.ps1`). Канонічні built-in дефолти в 5.3 —
+> код (`Get-BRAVODefaultConfiguration`), а не файл `BRAVO.config`; сам
+> `BRAVO.config` лишається доступним лише через явний `-ConfigPath` для
+> міграції 5.2→5.3. §1 нижче не переписано заднім числом — читайте його
+> як опис стану до Issue #216.
 
 Статус (первинний): **DRAFT — architecture freeze для перегляду перед
 стартом Agent 1-6.**
@@ -68,7 +82,9 @@
   додані при P0 reconciliation after 5.2.2 (§2.1):
   `componentSettings.SFTP.Enabled`, `componentSettings.SMB.Enabled`.
 - **Двофазне застосування overrides** (`BRAVO_CONFIG_LOADER.ps1:323`,
-  `Invoke-BRAVOLocalConfigurationOverridePhase`) — критична семантика,
+  на момент написання — `Invoke-BRAVOLocalConfigurationOverridePhase`;
+  функцію відтоді згорнуто в єдину `Complete-BRAVOConfigurationLoad`,
+  назва нижче — історична, не поточна) — критична семантика,
   яку Configurator **зобов'язаний** відтворювати, а не ігнорувати:
   - Фаза 1 (первинні поля: `bravoSettings`, `pathSettings`,
     `maintenanceSettings`, `componentSettings`, sftp/smb-скаляри) —

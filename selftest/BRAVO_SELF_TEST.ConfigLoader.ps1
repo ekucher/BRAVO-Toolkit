@@ -2128,3 +2128,136 @@ try {
         Remove-Item -LiteralPath $proofBRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
+
+# Issue #216 (Wave B/Agent E deploy-cutover audit): post-update-доказ,
+# що фізично залишений на диску застарілий BRAVO.config НЕ впливає на
+# ефективну конфігурацію production-entrypoint-а після успішного
+# Update-BRAVOServer.ps1. Update-BRAVOServer.ps1 НІКОЛИ не видаляє
+# BRAVO.config (виключений з robocopy /XF, ретирування — окрема дія
+# оператора) — тож сценарій "стара БRAVO.config лишилась поруч після
+# оновлення до 5.3" є звичайним, очікуваним станом парку, а не
+# гіпотетичним. Захист від нього — саме
+# -DisallowLegacyPrimaryAutoDetect (уже проведений у 14 production/
+# operator entrypoint-ів, ci/New-BRAVOReleaseArtifact.ps1/
+# LEGACY_CONFIG_AUTOEXEC статично звіряє це на staged-комплекті). Той
+# гейт лише скенує ТЕКСТ виклику — тут перевіряється фактична
+# RUNTIME-поведінка: ефективна конфігурація дійсно ігнорує вміст файлу.
+#
+# Окремий child scope (& { ... }): усі фрагменти self-test дот-сорсяться в
+# ОДИН scope і ділять ліміт $MaximumVariableCount.
+& {
+    function Invoke-BRAVOPostUpdateStaleConfigProbe {
+        # $DisallowAutoDetect симулює production-entrypoint після Wave B
+        # (Archive/Health/Maintenance/DataRestore Runtime.ps1, BRAVO_SETUP.ps1
+        # та інші 10) — auto-derived BRAVO.config, залишений на диску без
+        # явного наміру оператора, мусить трактуватись як відсутній.
+        # Без прапорця відтворюється ДОвave-B/migration-tooling поведінка —
+        # використовується лише як контрольний (sanity) прогін нижче, щоб
+        # довести, що маркер override дійсно спрацьовує, коли ЩОСЬ його
+        # читає (інакше PASS вище був би тавтологією "нічого не сталося").
+        param([switch]$DisallowAutoDetect)
+
+        $scenarioRoot = Join-Path ([IO.Path]::GetTempPath()) (
+            "BRAVO_POSTUPDATE_STALE_CONFIG_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($scenarioRoot)
+        try {
+            # Стара конфігурація 5.2-епохи лишилась ФІЗИЧНО поруч (саме так,
+            # як Update-BRAVOServer.ps1 її залишає — /XF BRAVO.config, ніколи
+            # не видаляється) за auto-derived шляхом ($ConfigRoot\BRAVO.config),
+            # БЕЗ жодного явного -ConfigPath — точний контракт "оператор його
+            # не запитував".
+            # BackupRoot="" (AUTO) вимагає EffectiveLIMSRoot, похідного від
+            # реальної служби BRAVO на хості — на self-test/CI-хості такої
+            # служби немає. Тест перевіряє лише RETENTION/FORMAT/BLOCKED/
+            # PRESENT, не BackupRoot, тож запікаємо явний літерал (той самий
+            # паттерн, що й інші сценарії вище в цьому файлі).
+            $staleBackupDir = Join-Path $scenarioRoot 'BACKUP'
+            [void][IO.Directory]::CreateDirectory($staleBackupDir)
+            $staleBackupRootLiteralLine = '    BackupRoot    = ""'
+            $staleKitText = (Get-BRAVOSelfTestLegacyConfigText)
+            if (-not $staleKitText.Contains($staleBackupRootLiteralLine)) {
+                throw "BRAVO_SELF_TEST.ConfigLoader: у BRAVO.config не знайдено рядок '$staleBackupRootLiteralLine' — оновіть підготовку post-update-stale-config сценарію під нову форму конфігурації"
+            }
+            $staleText = $staleKitText.Replace(
+                $staleBackupRootLiteralLine,
+                "    BackupRoot    = '$($staleBackupDir.Replace("'", "''"))'"
+            ) + "`r`n" + '$global:logRetentionDays = 999' + "`r`n"
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.config'), $staleText, (New-Object System.Text.UTF8Encoding($false)))
+
+            # Заблокований ($DisallowAutoDetect) прогін ІГНОРУЄ BRAVO.config
+            # повністю й переходить на Import-BravoSyntheticConfiguration —
+            # той самий "герметичність на машині без LIMS" паттерн, що й
+            # ConfigLoader/NoConfigAutoDerivedPathSucceedsAsSynthetic вище:
+            # BackupRoot="" (canonical-дефолт) все ще вимагає
+            # EffectiveLIMSRoot, тож синтетичний шлях теж потребує
+            # BRAVO.local.config з явним BackupRoot.
+            [IO.File]::WriteAllText(
+                (Join-Path $scenarioRoot 'BRAVO.local.config'),
+                (
+                    "@{`r`n" +
+                    "    'pathSettings.BackupRoot' = '$($staleBackupDir.Replace("'", "''"))'`r`n" +
+                    "}`r`n"
+                ),
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+
+            $disallowArg = if ($DisallowAutoDetect) { ' -DisallowLegacyPrimaryAutoDetect' } else { '' }
+            $probeCommand = (
+                "try { " +
+                "Set-StrictMode -Version 2.0; " +
+                ". '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+                "[void](Import-BravoConfiguration -ConfigRoot '$scenarioRoot' -RuntimeRoot '$root'$disallowArg 3>`$null); " +
+                "'RETENTION=' + [string]`$global:logRetentionDays + " +
+                "';FORMAT=' + [string]`$global:BravoConfigurationMetadata.Format + " +
+                "';BLOCKED=' + [string]`$global:BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked + " +
+                "';PRESENT=' + [string]`$global:BravoConfigurationMetadata.PrimaryConfigPresentOnDisk" +
+                "} catch { 'THREW: ' + `$_.Exception.Message }"
+            )
+            $probeOutput = [string](
+                & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+                    -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $probeCommand 2>&1 | Out-String
+            )
+            return $probeOutput.Trim()
+        } finally {
+            Remove-Item -LiteralPath $scenarioRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Sanity/контроль: БЕЗ -DisallowLegacyPrimaryAutoDetect застарілий
+    # файл дійсно підхоплюється (доводить, що маркер override взагалі щось
+    # означає — інакше PASS нижче був би тавтологією). Це той самий шлях,
+    # яким і сьогодні йде migration/deploy-інструментарій (Get-
+    # BRAVOConfigSiteDelta.ps1, Update-BRAVOServer.ps1 preflight-пробник) —
+    # свідомо, не регресія.
+    $postUpdateBaseline = Invoke-BRAVOPostUpdateStaleConfigProbe
+    Test-BRAVOCondition `
+        -Condition (
+            $postUpdateBaseline.Contains('RETENTION=999') -and
+            $postUpdateBaseline.Contains('PRESENT=True') -and
+            -not $postUpdateBaseline.StartsWith('THREW')
+        ) `
+        -Name "ConfigV2/PostUpdateStaleConfigBaselineAutoDetectPicksItUp" `
+        -Failure ("контрольний прогін без -DisallowLegacyPrimaryAutoDetect мусить довести, що маркер override " +
+            "(logRetentionDays=999) взагалі читається з auto-derived BRAVO.config — інакше наступна перевірка " +
+            "нічого не доводить; отримано '$postUpdateBaseline'")
+
+    # --- Основний доказ (Proof I, Agent E): production-entrypoint після
+    # успішного Update-BRAVOServer.ps1, з фізично залишеним на диску
+    # застарілим BRAVO.config, ІГНОРУЄ його повністю — ефективна
+    # logRetentionDays лишається canonical-дефолтом (31), а не 999.
+    $postUpdateProtected = Invoke-BRAVOPostUpdateStaleConfigProbe -DisallowAutoDetect
+    Test-BRAVOCondition `
+        -Condition (
+            $postUpdateProtected.Contains('RETENTION=31') -and
+            $postUpdateProtected.Contains('FORMAT=synthetic-no-config') -and
+            $postUpdateProtected.Contains('BLOCKED=True') -and
+            $postUpdateProtected.Contains('PRESENT=True') -and
+            -not $postUpdateProtected.StartsWith('THREW')
+        ) `
+        -Name "ConfigV2/PostUpdateStaleConfigIgnoredByProductionEntrypoint" `
+        -Failure ("фізично залишений на диску застарілий BRAVO.config (issue #216, стан сервера ПІСЛЯ успішного " +
+            "Update-BRAVOServer.ps1, який ніколи його не видаляє) мусить давати НУЛЬОВИЙ ефект на ефективну " +
+            "конфігурацію production-entrypoint-а, що передає -DisallowLegacyPrimaryAutoDetect: очікувалось " +
+            "RETENTION=31 (canonical-дефолт), FORMAT=synthetic-no-config, BLOCKED=True, PRESENT=True; отримано '$postUpdateProtected'")
+}
