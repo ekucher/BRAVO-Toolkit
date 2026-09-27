@@ -1564,6 +1564,57 @@
         Remove-Item -LiteralPath $legacyReaderSanctionedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateDetectsSimpleVariableIndirectionLegacyReaderCall ---
+    # Codex-знахідка (gate-review, R4): `$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $reader`
+    # обходить пряме зіставлення CommandAst.GetCommandName() (повертає null
+    # для команди-змінної). Гейт мусить ловити принаймні цю просту форму
+    # непрямого виклику через локальне присвоєння рядкового літералу.
+    $legacyReaderIndirectFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $indirectDir = Join-Path $legacyReaderIndirectFixtureRoot 'modules\BRAVO.Indirect'
+        [void][IO.Directory]::CreateDirectory($indirectDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $indirectDir 'BRAVO.Indirect.psm1'),
+            "function Invoke-Sneaky { `$reader = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$reader -ConfigPath X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderIndirectFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderIndirectFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderIndirectFixtureResult.Passed -and
+                @($legacyReaderIndirectFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO.Indirect.psm1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateDetectsSimpleVariableIndirectionLegacyReaderCall" `
+            -Failure "виклик legacy-рідера через змінну, присвоєну рядковому літералу з іменем рідера (`$var = 'Read-BRAVOLegacyPrimaryRawOverrides'; & `$var), мусить провалювати гейт LEGACY_READER_ISOLATION"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderIndirectFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateIgnoresUnrelatedVariableIndirectionCalls ---
+    # Контрольний негативний тест до попереднього: змінна, присвоєна
+    # ЧОМУСЬ ІНШОМУ й потім викликана через `&`, не повинна породжувати
+    # false positive.
+    $legacyReaderBenignIndirectFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $benignIndirectDir = Join-Path $legacyReaderBenignIndirectFixtureRoot 'modules\BRAVO.BenignIndirect'
+        [void][IO.Directory]::CreateDirectory($benignIndirectDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $benignIndirectDir 'BRAVO.BenignIndirect.psm1'),
+            "function Invoke-Benign { `$cmd = 'Get-ChildItem'; & `$cmd -Path X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderBenignIndirectFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderBenignIndirectFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderBenignIndirectFixtureResult.Passed -and
+                @($legacyReaderBenignIndirectFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateIgnoresUnrelatedVariableIndirectionCalls" `
+            -Failure "змінна, присвоєна імені команди, що НЕ є legacy-рідером, і викликана через `&`, не сміє провалювати гейт LEGACY_READER_ISOLATION; отримано Failures=$($legacyReaderBenignIndirectFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderBenignIndirectFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну

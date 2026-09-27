@@ -205,19 +205,61 @@ function Test-BRAVOConfigV2CutoverGates {
                 )
                 continue
             }
+            # R4 (issue #216, gate-review): найпростіша форма непрямого
+            # виклику — `$var = 'Read-BRAVOLegacyPrimaryRawOverrides'; & $var`
+            # — CommandAst.GetCommandName() повертає null для команди-змінної,
+            # тож нижче окремо збираємо ПРОСТІ прямі присвоєння змінної
+            # рядковому літералу з іменем рідера в межах цього ж файлу й
+            # зіставляємо їх із подальшими викликами через `&`/`.` тим самим
+            # іменем змінної. Це НЕ повна dataflow-аналіза (обчислені/
+            # конкатеновані імена, reassignment через параметр, значення з
+            # іншого файлу — поза межами статичного гейту; таке
+            # обфускування статичний CI-лінт принципово не може довести
+            # безпечно чи небезпечно без повного виконання) — лише
+            # найдешевший практичний випадок, який реально трапляється
+            # випадково (a не зловмисно), покрито явно.
+            $legacyReaderRiskyVariableNames = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+            $legacyReaderAssignmentAsts = $legacyReaderFileAst.FindAll(
+                { param($astNode) $astNode -is [System.Management.Automation.Language.AssignmentStatementAst] },
+                $true
+            )
+            foreach ($legacyReaderAssignmentAst in $legacyReaderAssignmentAsts) {
+                $assignmentTarget = $legacyReaderAssignmentAst.Left
+                $assignmentValueAst = $legacyReaderAssignmentAst.Right
+                if ($assignmentTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) {
+                    continue
+                }
+                $assignmentValueStringAsts = @($assignmentValueAst.FindAll(
+                    { param($astNode) $astNode -is [System.Management.Automation.Language.StringConstantExpressionAst] },
+                    $true
+                ))
+                foreach ($assignmentValueStringAst in $assignmentValueStringAsts) {
+                    foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                        if ([string]::Equals($assignmentValueStringAst.Value, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            [void]$legacyReaderRiskyVariableNames.Add($assignmentTarget.VariablePath.UserPath)
+                        }
+                    }
+                }
+            }
+
             $legacyReaderCommandAsts = $legacyReaderFileAst.FindAll(
                 { param($astNode) $astNode -is [System.Management.Automation.Language.CommandAst] },
                 $true
             )
             foreach ($legacyReaderCommandAst in $legacyReaderCommandAsts) {
                 $invokedCommandName = $legacyReaderCommandAst.GetCommandName()
-                if ([string]::IsNullOrEmpty($invokedCommandName)) {
+                if (-not [string]::IsNullOrEmpty($invokedCommandName)) {
+                    foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
+                        if ([string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                            [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
+                        }
+                    }
                     continue
                 }
-                foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
-                    if ([string]::Equals($invokedCommandName, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
-                        [void]$legacyReaderViolations.Add("$fileRelativePath ($legacyReaderFunctionName)")
-                    }
+                $firstCommandElement = $legacyReaderCommandAst.CommandElements | Select-Object -First 1
+                if ($firstCommandElement -is [System.Management.Automation.Language.VariableExpressionAst] -and
+                    $legacyReaderRiskyVariableNames.Contains($firstCommandElement.VariablePath.UserPath)) {
+                    [void]$legacyReaderViolations.Add("$fileRelativePath (виклик через змінну `$$($firstCommandElement.VariablePath.UserPath), присвоєну імені legacy-рідера)")
                 }
             }
         }
