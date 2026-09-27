@@ -209,18 +209,30 @@ PR/issue bodies scanned                         : 233
   left carrying ONLY the injected footer         : 186
 issue comments scanned / injected / author-written  : 144 / 44 / 0
 review comments scanned / injected / author-written : 668 / 21 / 0
-commit messages, FULL history at 64a8b11 (1073 commits):
-  with the AI co-author trailer                  : 683
+commit messages, FULL history at 64a8b11, case-insensitive match (1073 commits):
+  with the AI co-author trailer                  : 690
   with the session-link trailer                  : 511
-  union of the two (actual affected set)          : 690   (7 carry only the session trailer)
+  union of the two (actual affected set)          : 690   (0 carry only the session trailer;
+                                                           179 carry only the co-author trailer)
   with a "Generated with/by ..." footer           : 0
 ```
 
-**Measure commit trailers only on a full clone.** The first pass of these figures was wrong — taken in a
-shallow clone (`git rev-parse --is-shallow-repository` -> `true`, `.git/shallow` present, 10+ synthetic
-roots), where `git rev-list` silently counts only the reachable slice and reported 904/559/474/690 instead
-of 1073/683/511/690. Check `--is-shallow-repository` and run `git fetch --unshallow origin` before
-measuring. Codex caught this on PR #235 and PR #234; the correction landed in both.
+The union equals the co-author count because every commit carrying the session trailer also carries the
+co-author trailer. The affected set is **690 of 1073**.
+
+**Two measurement traps, both hit on the first pass; both are why the figures above changed twice.**
+
+1. *Shallow clone.* The first pass ran in a shallow clone
+   (`git rev-parse --is-shallow-repository` -> `true`, `.git/shallow` present, 10+ synthetic roots), where
+   `git rev-list` silently counts only the reachable slice: it reported 904 commits and 559/474/566 instead
+   of 1073 and 690/511/690. Check `--is-shallow-repository` and run `git fetch --unshallow origin` first.
+2. *Case-sensitive trailer match.* The second pass, already on full history, matched the co-author trailer
+   case-sensitively and so reported 683 with "7 commits carrying only the session trailer". Those 7 are not
+   session-only at all: they spell the trailer `Co-authored-by:` (git's own canonical casing) rather than
+   `Co-Authored-By:`. Both spellings occur in this history (694 vs 16 trailer lines), so **match
+   case-insensitively** (`git rev-list -i --grep=`) or the breakdown is wrong.
+
+Codex caught both, on PR #235 and PR #234; the corrections landed in both.
 
 The 44 + 21 = 65 comments carrying a footer are **all** the injected form — not one was author-written, so
 there is nothing to remediate there, and they are not unexplained violations. Same for the 186 bodies. Do
@@ -286,9 +298,15 @@ Issue #216 has progressed well past Wave 0 (see git/GitHub history for the
 actual wave sequence — this file was not kept current through that
 progression, and per the 2026-09-27 audit above, still is not fully current:
 B5/B7 remain open — see "Issue #216 Wave B — B4 part 2 (2026-09-27 status
-audit)"). There is no single active PR right now; the open work is B5 (fleet
-migration — requires real servers, not available to an automated session)
-and B7 (v2-path regression matrix + parity required-check promotion).
+audit)"). The open Config V2 work is B5 (fleet migration — requires real
+servers, not available to an automated session) and B7 (v2-path regression
+matrix + parity required-check promotion).
+
+**Active as of 2026-09-27 17:15 UTC: two documentation PRs awaiting merge** —
+PR #234 (this file) and PR #235 (`.claude/CLAUDE.md`, the AI-attribution rule
+text). Both are non-draft, CI green or running with no failures, no approving
+review, no merge conflict. Re-verify their state before anything else; a merge
+from an automated session is refused (see the note at the end of NEXT ACTION).
 
 Two documentation-only PRs merged on 2026-09-27 after that audit: PR #232 (`7734a55`) synchronised this file
 with the audited B4/B5/B7 state and corrected its false "Config parity is now a required check" claim, and
@@ -391,17 +409,26 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 **Updated 2026-09-27 after PR #232 and PR #233 merged. Replaces the previous entry (whose items 1-3 remain
 valid and are carried forward below) rather than patching it, per this file's maintenance rule #7.**
 
-No PR is currently active and no uncommitted work is pending. The one action that is fully executable by an
-automated session — no fleet, no owner UI, no elevated scope required — is item 0:
+No uncommitted work is pending. Two documentation PRs (#234, #235) are open and awaiting merge, so the
+executable step is item 0 — drive them to done; items 1-3 need the owner or real servers.
 
 ```text
-0. DELIVERED by PR #235, awaiting merge — nothing left to implement; remove this item once #235 and the
-   PR carrying this file are both merged. It corrected the `.claude/CLAUDE.md` section
-   «Заборона підписів про AI-авторство» on three points:
+0. DRIVE PR #234 and PR #235 to done. Both are docs-only, non-draft, no conflict, no approving review.
+   Concretely, in this order:
+     - re-verify both on their current heads: CI conclusion per check, merge state, open review threads
+       (REST API; `pull_request_read` costs ~6k tokens per call, use curl);
+     - if a check is red, root-cause and push a fix; if a Codex thread is open and unanswered, answer it,
+       and push a fix where the finding is correct (this file and the rule text have already been through
+       three such rounds: shallow-clone counts, case-sensitive trailer match, self-contradicting literals);
+     - the merge itself is NOT available to an automated session (see the note below) — once both are green
+       with every thread answered, report MERGE READY to the owner and stop;
+     - after BOTH merge: delete this item 0 from NEXT ACTION, set the State baseline SHA to the new
+       `origin/developer` HEAD, and record in "AI-attribution footer prohibition" that the rule text is
+       corrected. That edit is itself a docs-only PR.
+   What #235 already delivered in `.claude/CLAUDE.md` («Заборона підписів про AI-авторство»):
      a. the historical-debt figure - now the actual affected set, 690 commits of 1073 at `64a8b11`
-        (683 co-author trailer, 511 session trailer, 7 session-only), stating which trailer each number
-        counts, plus the requirement to measure on a full clone (the first figures were taken in a shallow
-        clone and were wrong);
+        (690 co-author trailer, 511 session trailer, 0 session-only), matched case-insensitively, stating
+        which trailer each number counts, plus the requirement to measure on a full clone;
      b. the PR/issue body remediation is recorded (177 bodies stripped, 0 author-written footers left), so
         the rule's stated scope has a recorded remediation and not only a commit-message exemption;
      c. the injected footer is recorded as a known residue outside an automated session's control, with the
