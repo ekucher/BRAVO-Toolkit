@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — Current Project State
 
-Last verified: 2026-09-24
+Last verified: 2026-09-27
 
 ## Canonical branch
 
@@ -8,7 +8,7 @@ Last verified: 2026-09-24
 
 ## State baseline SHA
 
-`3e9e172a4b1fc1b41da8066b105ff46dadf66cb3`
+`ff6ee75fef10ecd1b24be2c39998be1c714c3a4d`
 
 Before starting substantial work, verify:
 
@@ -104,9 +104,29 @@ Merge commit:
 
 `b5d1691d58f40b6b0a52408e5a628ddd209973b7`
 
-`Config parity (BRAVO_CONFIG_LOADER)` is now a required check on `developer`.
+**CORRECTION (2026-09-27, verified against live GitHub state, not trusted from this file):** the paragraph
+below (previously claiming the promotion was applied) was **false**. Direct verification found:
 
-Recorded required checks:
+```text
+GET /repos/ekucher/BRAVO-Toolkit/branches/developer/protection -> HTTP 403
+  (integration token lacks the Administration permission scope; this repo's
+  installed GitHub App does not request that scope at all, so no
+  installation-settings change can grant it)
+GET /repos/ekucher/BRAVO-Toolkit/rulesets -> 200, only one ruleset
+  ("protected-release-tags", target: tag) - nothing touching `developer`
+GitHub UI screenshot of Settings -> Branches -> Branch protection rules:
+  only `master` is listed ("Currently applies to 1 branch") - `developer`
+  has NO classic protection rule either
+```
+
+**`developer` currently has zero branch protection of any kind** (no classic rule, no ruleset). None of the
+required checks below are actually enforced; nothing currently blocks a merge into `developer` even with red
+CI. The list, `strict` setting, and "promotion preserved..." claim that follow are **what a future branch
+protection rule should contain when created**, not a record of an applied setting - do not repeat the error
+of citing this file as evidence that it was applied.
+
+Prepared (not yet applied) required-checks list, exact `pull_request`-event names (verified live against a
+recent PR head commit, e.g. #231):
 
 * Parser / BOM / JSON
 * PSScriptAnalyzer
@@ -114,15 +134,16 @@ Recorded required checks:
 * Secret scanning (gitleaks)
 * GitGuardian Security Checks
 * BRAVO_DATA_RESTORE_MATRIX_TEST.ps1
-* Config parity (BRAVO_CONFIG_LOADER)
+* Config parity (BRAVO_CONFIG_LOADER) — both required live proofs already exist (RUN on PR #214, NOT
+  APPLICABLE on PR #221/#231), so it is ready to include once the rule is created
 
-Recorded branch-protection setting:
+Recommended settings for the `developer` rule: PR required, the 7 checks above required, `strict = false`
+(per `RELEASE_POLICY.md` §13.2/§13.3 — `developer`, unlike `master`, does not require an up-to-date branch),
+`enforce_admins = true`, force-push and branch deletion disabled.
 
-`strict = true`
-
-Promotion preserved all previously required checks and unrelated branch-protection settings.
-
-Post-merge CI on current developer completed successfully.
+Creating this branch-protection rule requires either (a) the repository owner doing it directly in the
+GitHub UI, or (b) a credential with the `Administration` scope (a PAT), since the installed GitHub App
+structurally cannot obtain it. This is a pending action, not completed work.
 
 ### Persistent Claude handoff
 
@@ -133,6 +154,44 @@ Purpose: add the cross-session startup/handoff protocol and `PROJECT_STATE.md` w
 Merge commit:
 
 `832e238efd5563e6be6bf91bc42e2f3767ade69c`
+
+### Issue #216 Wave B — B4 part 2 (2026-09-27 status audit)
+
+Read-only audit against `origin/developer` HEAD `ff6ee75`, cross-referenced with Issue #154's own B4/B5/B7
+tracker and Issue #216. This was verification, not new implementation.
+
+**B4 part 2 — physical removal of `BRAVO.config` from the package — is DONE.** Commit `75b3b39` (2026-09-25,
+merged via PR #226/#227 line) untracked the root `BRAVO.config` from git and the staged bundle, froze its
+exact byte content as `selftest/fixtures/BravoConfigLegacyFrozen.config`, extended
+`-DisallowLegacyPrimaryAutoDetect` to all 14 production/operator entrypoints, and added the
+`LEGACY_CONFIG_REMOVED` release-artifact gate. Full self-test PASS (2225/0) is cited in that commit.
+
+**B5 — fleet migration — is NOT done.** No evidence of any real server migration exists anywhere in the
+repository. `CHANGELOG.md` states outright ("Міграція парку (B5) свідомо НЕ реалізована в цій задачі").
+`deploy/Update-BRAVOServer.ps1` still deliberately excludes `BRAVO.config`/`BRAVO.local.config` from what it
+touches on a target server (line ~472) and contains no migration/parity-verification gate before deploying.
+
+**B7 — v2-path regression matrix + parity as a mandatory gate — is NOT done** as a distinct deliverable. The
+one `B7` string found in the repo is an unrelated, coincidentally-reused label on a self-test case name
+(`BRAVO_SELF_TEST.Configuration.ps1:2681`), not the actual matrix. Issue #216 Phase 11 ("Permanent governance
+tests") is the closest current restatement of the same requirement and its checklist is entirely unchecked.
+
+**Operational risk flagged, not yet mitigated.** Issue #154's own "Problem" section explicitly warned that
+removing `BRAVO.config` from the package does **not** remove it from already-deployed fleet servers, and its
+"Remaining work" checklist explicitly required pilot migration + full B5 to happen *before* B4 part 2
+("Пункт 3 не можна робити раніше за 1-2"). That ordering was overridden by the later Issue #216 owner mandate
+(2026-09-24/26: "у версії 5.3 взагалі не повинно бути BRAVO.config"), which landed B4 part 2 first. The
+practical consequence: deploying the current `developer` build via `deploy/Update-BRAVOServer.ps1` to a real
+5.2-era fleet server that has **not** been through the pilot migration would silently drop that server's
+legacy `BRAVO.config` site overrides (e.g. a non-default `BackupRoot`) on the next Archive/Maintenance run,
+because the newly-unconditional `-DisallowLegacyPrimaryAutoDetect` guard makes production runtime ignore the
+physically-present legacy file. This was a deliberate, owner-confirmed re-sequencing decision (Issue #216 is
+later and owner-confirmed), not a defect introduced by this audit — but it means Issue #154/#216 must not be
+declared complete, and this `developer` build must not be pushed to real fleet servers, until B5 has actual
+evidence.
+
+Do not treat Config V2 (Issue #154 / Issue #216) as closed while B5 and B7-equivalent evidence are missing,
+regardless of what the "Config v2 — ціль змінено Issue #216" note in `ROADMAP.md` might otherwise suggest.
 
 ## Closed / superseded work
 
@@ -158,16 +217,21 @@ Issue #219 remains backlog work unless explicitly reprioritized.
 
 ## Current active work
 
+**CORRECTION (2026-09-27):** this section described PR #224 as the active unit of work with an OPEN state
+verified 2026-09-23. That is stale. PR #224 **merged** into `developer` as merge commit `2c5e82b` (part of
+the commit range already folded into the current State baseline SHA above). The detailed record below is
+kept as an accurate historical account of that PR's F1 remediation (including the reusable pilot-artifact
+validation technique), not as a description of current active work.
+
 Issue #216 has progressed well past Wave 0 (see git/GitHub history for the
 actual wave sequence — this file was not kept current through that
-progression). The active unit of work now is **PR #224**
-(`fix/config-v2-local-override-authorization` -> `developer`), worked in
-isolated worktree `E:\GitHub\BRAVO-Toolkit-216-wave2`.
+progression, and per the 2026-09-27 audit above, still is not fully current:
+B5/B7 remain open — see "Issue #216 Wave B — B4 part 2 (2026-09-27 status
+audit)"). There is no single active PR right now; the open work is B5 (fleet
+migration — requires real servers, not available to an automated session)
+and B7 (v2-path regression matrix + parity required-check promotion).
 
-PR #224 state verified 2026-09-23: OPEN, MERGEABLE, base `developer`,
-reviewDecision empty (no formal review decision recorded yet).
-
-### PR #224 — F1 lazy dependency regression remediation (COMMITTED, PUSHED)
+### PR #224 — F1 lazy dependency regression remediation (MERGED, historical record)
 
 Context: PR #224 has been through multiple Codex review rounds (fixes
 tracked informally as F1..F17-style labels in self-test comments, not a
@@ -260,39 +324,33 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 
 ## NEXT ACTION
 
-The F1 lazy dependency regression fix (see "Current active work" above)
-was committed and pushed 2026-09-24 with explicit user authorization:
-commit `276d25755bdfd23b293029727b7cdb35f5425c3f` on
-`fix/config-v2-local-override-authorization`. PR #224 CI re-triggered on
-this HEAD; `mergeStateStatus=BLOCKED` (branch protection requires all
-checks green — several were still `pending`, including the pilot-artifact
-check this fix targets, at last observation). No merge attempted or
-authorized.
+**Updated 2026-09-27, replacing a stale entry that still referenced PR #224 as open/blocked. PR #224 is
+merged (`2c5e82b`); that entry's premise no longer holds. Per this file's own maintenance rule #7, replaced
+rather than patched.**
 
-Before doing anything else, re-verify this state is still accurate
-(`git status --short`, `git rev-parse HEAD`, `git rev-parse
-origin/fix/config-v2-local-override-authorization`, `gh pr checks 224`) —
-do not trust this file if the worktree, remote, or CI has moved.
+No PR is currently active and no uncommitted work is pending in this session. The concrete next step is a
+decision point that this file's own scope (an automated session, no real fleet access) cannot resolve alone:
 
 ```text
-Re-check PR #224 CI on HEAD 276d257 (gh pr checks 224). If the pilot-
-artifact check and all other required checks are now green, report
-MERGE READY. If still failing, diagnose against the new HEAD before
-assuming this fix was insufficient. Separately, PR #224 still carries 18
-unresolved Codex review threads (2xP1 whitespace/enum-normalization
-regressions, 16xP2) from the 2026-09-24 audit — decide with the user
-whether those must be addressed before merge, independent of the CI
-gate (developer branch protection does not require conversation
-resolution or any approving review, so it is not a hard technical
-blocker, only a project-policy one).
+1. B5 (fleet migration) has zero evidence of execution anywhere in the repository and requires real
+   production servers. Confirm with the owner whether/when a pilot migration + fleet rollout will happen,
+   using the existing tooling (deploy/Start-BRAVOConfigV2Pilot.ps1,
+   deploy/Get-BRAVOConfigSiteDelta.ps1, deploy/Compare-BRAVOConfigEffectiveSnapshot.ps1) and the runbook
+   docs/BRAVO_CONFIG_V2_PILOT_MIGRATION_RUNBOOK_20260916.md. Until this happens, do NOT deploy current
+   `developer` to any real fleet server — see the operational-risk note under "Issue #216 Wave B — B4 part 2"
+   above (silent loss of legacy `BRAVO.config` site overrides).
+2. B7 (v2-path regression matrix + Config parity promoted to a required status check) has no distinct
+   artifact yet. Issue #216 Phase 11's checklist is the closest current restatement — decide with the owner
+   whether to treat that as the canonical B7 definition going forward, or to write a dedicated matrix.
+3. `developer` branch protection currently does not exist at all (see the corrected "Config parity required
+   promotion" section above) - creating it needs either the repository owner acting directly in the GitHub
+   UI, or a PAT with `Administration` scope, since the installed GitHub App cannot obtain that scope. A
+   candidate required-checks list and settings are recorded in that section.
 ```
 
-Commit/push of any further changes still require explicit user
-authorization in the session, per standing project Git policy.
-
-If state does NOT match (worktree dirty differently, HEAD moved, PR #224
-closed/merged/retargeted): stop, establish actual current state from
-git/GitHub, and do not proceed mechanically from this stale note.
+Before acting on any of the above, re-verify current state
+(`git fetch origin --prune`, `git rev-parse origin/developer`, `gh issue view 154`, `gh issue view 216`) —
+do not trust this file if the remote has moved past the State baseline SHA recorded above.
 
 ## Standard workflow
 
