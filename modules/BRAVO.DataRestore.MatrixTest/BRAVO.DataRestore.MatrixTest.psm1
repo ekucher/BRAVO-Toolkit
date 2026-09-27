@@ -77,8 +77,20 @@ function New-BRAVODataRestoreMatrixFixtureConfig {
         }
     }
 
+    # Issue #216 (Wave B, B4-2): кореневий BRAVO.config прибрано з пакета й
+    # git-tracking — той самий текст живе далі як заморожений тестовий
+    # актив (той самий фолбек-паттерн, що ci\Test-BRAVOConfigFoundation
+    # Parity.ps1 уже застосовує для того самого переходу).
     $realConfigPath = Join-Path $RepoRoot 'BRAVO.config'
-    $configText = Get-Content -LiteralPath $realConfigPath -Raw -Encoding UTF8
+    $frozenConfigPath = Join-Path $RepoRoot 'selftest\fixtures\BravoConfigLegacyFrozen.config'
+    $sourceConfigPath = if (Test-Path -LiteralPath $realConfigPath -PathType Leaf) {
+        $realConfigPath
+    } elseif (Test-Path -LiteralPath $frozenConfigPath -PathType Leaf) {
+        $frozenConfigPath
+    } else {
+        throw "New-BRAVODataRestoreMatrixFixtureConfig: не знайдено ні кореневого BRAVO.config, ні замороженої фікстури в $RepoRoot"
+    }
+    $configText = Get-Content -LiteralPath $sourceConfigPath -Raw -Encoding UTF8
 
     $fixturePathSettingsBlock = @"
 `$global:pathSettings = @{

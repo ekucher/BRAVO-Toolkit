@@ -245,20 +245,31 @@ $global:pathSettings = @{
 це окремо, разом із фактичним правом запису під SYSTEM (створити → записати →
 прочитати назад → видалити probe-файл).
 
-## 3. Що налаштувати у `BRAVO.config`
+## 3. Що налаштувати (built-in дефолти + `BRAVO.local.config`)
 
-`BRAVO.config` є PowerShell-конфігурацією, тому зберігайте його кодування і
-синтаксис. Паролі, логіни та webhook URL у файл не записуються.
+> **Змінено в 5.3 (issue #216).** `BRAVO.config` більше НЕ входить у
+> release-пакет і не є частиною нормального runtime-конфігураційного
+> графа: production-скрипти й `BRAVO_CONFIGURATOR.ps1` не підхоплюють
+> його автоматично, навіть якщо він фізично лежить поруч. Канонічні
+> built-in дефолти в 5.3 — це код комплекту, а не файл; будь-яке
+> відхилення від дефолту задається через **`BRAVO.local.config`**
+> (data-only, `'dot.path' = значення`, шаблон — `BRAVO.local.config.example`),
+> а секрети — через Windows Credential Manager. `BRAVO.config` лишається
+> актуальним лише для інсталяцій, що ще мігрують з 5.2 (розділ 10) —
+> нову production-інсталяцію 5.3 наводьте без нього.
 
-> Замість ручного редагування можна скористатися `.\BRAVO_CONFIGURATOR.ps1` —
-> інтерактивним GUI поверх `BRAVO.local.config` (не `BRAVO.config`): schema-
-> driven форма з усіма 138 override-ключами, presets, керуванням Credential
-> Manager, попереднім переглядом ефективної конфігурації і атомарним
-> застосуванням (backup + перевірка хешу + автоматичний rollback при
-> помилці). `BRAVO.config` лишається canonical-дефолтами й редагується
-> вручну, як і раніше.
+Рекомендований спосіб — `.\BRAVO_CONFIGURATOR.ps1`: інтерактивний GUI поверх
+`BRAVO.local.config` — schema-driven форма з усіма 138 override-ключами,
+presets, керуванням Credential Manager, попереднім переглядом ефективної
+конфігурації і атомарним застосуванням (backup + перевірка хешу +
+автоматичний rollback при помилці). Ручне редагування `BRAVO.local.config`
+(текстовий data-only hashtable-файл, ніколи не виконується як код) так само
+підтримується.
 
-Перед першим запуском перевірте такі секції:
+Перед першим запуском перевірте, чи потрібні override для таких секцій
+(ключі задаються в `BRAVO.local.config` через dot-path, наприклад
+`'pathSettings.BackupRoot' = 'E:\ARCHIV'`; повний канонічний перелік і
+значення за замовчуванням — `BRAVO.local.config.example`):
 
 | Секція | Що перевірити |
 |---|---|
@@ -659,7 +670,7 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 Лише перевірка конфігурації, файлів, каталогів, tools і плану операцій:
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_DRY_RUN.ps1
 ```
 
 Додатково перевірити реальну автентифікацію та доступ (містить проби
@@ -667,13 +678,13 @@ Self-test перевіряє синтаксис усіх PowerShell-файлів
 призначення на SFTP):
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_DRY_RUN.ps1 -TestAccess
 ```
 
 End-to-end тест із одним реальним Slack/Discord повідомленням:
 
 ```powershell
-.\BRAVO_DRY_RUN.ps1 -ConfigPath ".\BRAVO.config" -TestAccess -SendTestNotification
+.\BRAVO_DRY_RUN.ps1 -TestAccess -SendTestNotification
 ```
 
 `-TestAccess` виконує:
@@ -706,14 +717,14 @@ Dry-run їх не запускає.
 Ручний запуск:
 
 ```powershell
-.\BRAVO_RESTORE_TEST.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_RESTORE_TEST.ps1
 ```
 
 Для контрольованого відновлення конкретної точки в часі задайте generation
 явно. Не змішуйте independently newest MODEL/BLOG/BRAVOEXCH:
 
 ```powershell
-.\BRAVO_RESTORE_TEST.ps1 -GenerationId "20260808_154300" -ConfigPath ".\BRAVO.config"
+.\BRAVO_RESTORE_TEST.ps1 -GenerationId "20260808_154300"
 ```
 
 Лише один компонент, машинно-читаний JSON-результат і вища мінімальна
@@ -748,7 +759,7 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 елевації):
 
 ```powershell
-.\BRAVO_DATA_RESTORE.ps1 -ListGenerations -ConfigPath ".\BRAVO.config"
+.\BRAVO_DATA_RESTORE.ps1 -ListGenerations
 ```
 
 **OutOfPlace** (типово) — розпакування у порожні підкаталоги вказаної
@@ -756,7 +767,7 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 
 ```powershell
 .\BRAVO_DATA_RESTORE.ps1 -GenerationId "20260808_154300" `
-    -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK" -ConfigPath ".\BRAVO.config"
+    -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK"
 ```
 
 **InPlace** — відновлення у production-шляхи (їх визначає discovery за
@@ -769,7 +780,7 @@ manifest, SHA512 sidecar, фактичний хеш архіву, `7za t` і в�
 
 ```powershell
 .\BRAVO_DATA_RESTORE.ps1 -GenerationId "20260808_154300" `
-    -Mode InPlace -ConfigPath ".\BRAVO.config"
+    -Mode InPlace
 ```
 
 Джерелом може бути не лише локальний `BackupRoot`, а й SFTP
@@ -915,19 +926,19 @@ WARNING/ERROR/CRITICAL (recovery) надсилаються завжди, нез�
 Встановити або оновити лише завдання:
 
 ```powershell
-.\BRAVO_TASKS_INSTALL.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_TASKS_INSTALL.ps1
 ```
 
 Перевірити визначення без встановлення:
 
 ```powershell
-.\BRAVO_TASKS_INSTALL.ps1 -ConfigPath ".\BRAVO.config" -ValidateOnly
+.\BRAVO_TASKS_INSTALL.ps1 -ValidateOnly
 ```
 
 Видалити завдання:
 
 ```powershell
-.\BRAVO_TASKS_UNINSTALL.ps1 -ConfigPath ".\BRAVO.config"
+.\BRAVO_TASKS_UNINSTALL.ps1
 ```
 
 Перед реальним встановленням скрипт:
@@ -991,17 +1002,22 @@ UAC — можливий подальший крок, якщо той самий
 що переживає заміну комплекту байт-у-байт.
 
 1. Атомарно замініть весь комплект новою версією: виконувані `.ps1`,
-   `VERSION.json`, документацію, `BRAVO.config` (новий default-шар) та весь
-   каталог `modules`. Не змішуйте модулі й wrappers із різних версій.
+   `VERSION.json`, документацію та весь каталог `modules`. Не змішуйте
+   модулі й wrappers із різних версій. **З 5.3 (issue #216) `BRAVO.config`
+   не входить у release-пакет** — заміняти/постачати цей файл більше не
+   потрібно; канонічні дефолти йдуть у коді комплекту.
 2. **НЕ торкайтесь** `BRAVO.local.config` — він лежить поруч (той самий
-   каталог, що `BRAVO.config`/effective ConfigPath) і не є частиною
-   release-архіву; заміна комплекту його не перезаписує.
+   каталог, що effective ConfigPath) і не є частиною release-архіву;
+   заміна комплекту його не перезаписує.
 3. Якщо в установі ще немає `BRAVO.local.config` (сайт не мігрував на цю
-   схему), а старий `BRAVO.config` мав ручні site-правки — перенесіть ЛИШЕ
-   ці відмінності у НОВИЙ `BRAVO.local.config` (скопіюйте
-   `BRAVO.local.config.example`, розкоментуйте потрібні `'dot.path' =
-   значення`), а не в сам `BRAVO.config`. Це одноразова міграція за
-   установу, не за кожне оновлення.
+   схему), а старий (5.2) `BRAVO.config` мав ручні site-правки —
+   перенесіть ЛИШЕ ці відмінності у НОВИЙ `BRAVO.local.config`
+   (скопіюйте `BRAVO.local.config.example`, розкоментуйте потрібні
+   `'dot.path' = значення`). Старий `BRAVO.config` при цьому не
+   видаляйте — використайте його явним `-ConfigPath` лише як джерело
+   для порівняння нижче; у звичайному (AUTO, без `-ConfigPath`)
+   виконанні 5.3-скрипти його все одно ігнорують. Це одноразова
+   міграція за установу, не за кожне оновлення.
 
    Шукати ці відмінності вручну не потрібно —
    `.\deploy\Get-BRAVOConfigSiteDelta.ps1` порівнює `BRAVO.config` сервера
@@ -1064,14 +1080,14 @@ UAC — можливий подальший крок, якщо той самий
 Виконайте від адміністратора:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -InspectOnly
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 Для перевірки webhook одним реальним повідомленням:
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess -SendTestNotification
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess -SendTestNotification
 ```
 
 Діагностика показує:
@@ -1375,7 +1391,7 @@ health > лише попередження. Код `90` має найвищий 
 
 | Файл | Призначення |
 |---|---|
-| `BRAVO.config` | головна конфігурація BRAVO |
+| `BRAVO.config` | legacy-конфігурація 5.2 (у 5.3 не входить у комплект; читається лише явним `-ConfigPath` під час міграції 5.2→5.3, розділ 10) |
 | `BRAVO_CREDENTIALS_SETUP.ps1` | керування записами Credential Manager |
 | `modules\BRAVO.Credentials` | модуль читання/запису credentials |
 | `modules\BRAVO.HelperLogging` | модуль transcript-журналювання допоміжних скриптів |

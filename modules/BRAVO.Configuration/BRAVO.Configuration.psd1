@@ -7,7 +7,8 @@
         'Get-BRAVODefaultConfiguration',
         'Merge-BRAVOConfiguration',
         'ConvertTo-BRAVONestedOverride',
-        'Resolve-BRAVORawConfiguration'
+        'Resolve-BRAVORawConfiguration',
+        'Test-BRAVOSecurityInvariantValueWeakened'
     )
     VariablesToExport = @()
     CmdletsToExport = @()

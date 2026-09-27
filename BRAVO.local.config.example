@@ -1,15 +1,21 @@
 # BRAVO.local.config — приклад локальних site-відмінностей (повний каталог).
 #
-# ЯК КОРИСТУВАТИСЬ: скопіюйте цей файл як BRAVO.local.config у той самий
-# каталог, де лежить effective BRAVO.config, розкоментуйте/додайте потрібні
-# ключі. Файл ПЕРЕЖИВАЄ оновлення комплекту (оновлення замінює BRAVO.config,
-# але не чіпає BRAVO.local.config) — редагувати BRAVO.config вручну більше
-# не потрібно.
+# ЯК КОРИСТУВАТИСЬ: скопіюйте цей файл як BRAVO.local.config у ефективний
+# ConfigRoot інсталяції (той самий каталог, де раніше лежав BRAVO.config;
+# з 5.3, issue #216 — BRAVO.config більше не входить у комплект і не є
+# частиною нормального runtime-конфігураційного графа), розкоментуйте/
+# додайте потрібні ключі. Файл ПЕРЕЖИВАЄ оновлення комплекту незалежно
+# від того, чи є на інсталяції ще не мігрований legacy BRAVO.config
+# (оновлення замінює лише сам комплект, BRAVO.local.config не чіпається).
 #
-# ФОРМАТ: data-only hashtable «dot-шлях -> значення». Ключ — шлях від імені
-# глобального блоку BRAVO.config через крапки до кінцевого поля. Дозволені
-# значення і семантика кожного поля — у коментарях відповідного блоку
-# BRAVO.config.
+# ФОРМАТ: data-only hashtable «dot-шлях -> значення». Ключ — шлях від назви
+# історичного глобального блоку BRAVO.config (успадкована структура імен,
+# сам файл із 5.3 у комплект не входить) через крапки до кінцевого поля.
+# Дозволені значення для кожного поля — див. нижче по секціях цього файлу
+# й schema-довідник `BRAVO_CONFIGURATOR.ps1` (перегляд/preview ефективної
+# конфігурації); окремого зведеного глосарію семантики полів поза цим
+# файлом на сьогодні немає (документаційний пробіл, не покритий цим
+# коментарем).
 #
 # ЦЕЙ ФАЙЛ НІКОЛИ НЕ ВИКОНУЄТЬСЯ. Комплект парсить його в AST і вилучає
 # лише літеральні значення; скомпільований scriptblock не створюється й
@@ -381,7 +387,24 @@
     # 'backupMonitoring.SFTP.BAZAPendingAlertAfterHours' = 26
 
     # --- BAZA append-only двигун ---
-    # 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly'  # | 'Legacy'
+    # УВАГА, НЕ РОЗКОМЕНТОВУВАТИ: 'backupMonitoring.SFTP.BAZA.Mode'
+    # класифікований у Wave 2 authorization-реєстрі (Issue #216;
+    # modules/BRAVO.Configuration/BRAVO.Configuration.Schema.psm1) як
+    # DENY_SECURITY_CONTROL — BRAVO.local.config НЕ МАЄ повноважень
+    # перевизначати цей лист; canonical loader відхилить перевизначення
+    # fail-closed незалежно від запропонованого значення (append-only
+    # mutation-детекція BAZA — security-critical, не оператора рішення).
+    # Рядок нижче лишається задокументованим ЛИШЕ для розпізнавання й
+    # ручного recovery легасі-значення в наявних site-файлах (Configurator
+    # Clear-механізм) — НЕ як звичайний перелік доступних для
+    # розкоментовування override-ів:
+    # 'backupMonitoring.SFTP.BAZA.Mode' = 'IncrementalAppendOnly'  # | 'Legacy' — NON-OVERRIDABLE (DENY_SECURITY_CONTROL, лише recovery-довідка)
+    # УВАГА, НЕ РОЗКОМЕНТОВУВАТИ: 'backupMonitoring.SFTP.BAZA.MutationPolicy'
+    # так само DENY_SECURITY_CONTROL — єдине підтримуване BazaSync-значення
+    # 'Fail' ([ValidateSet('Fail')], modules/BRAVO.BazaSync/BRAVO.BazaSync.psm1);
+    # рядок нижче лишається задокументованим ЛИШЕ для розпізнавання й
+    # ручного recovery легасі-значення (Configurator Clear-механізм):
+    # 'backupMonitoring.SFTP.BAZA.MutationPolicy' = 'Fail' — NON-OVERRIDABLE (DENY_SECURITY_CONTROL, лише recovery-довідка)
     # 'backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth' = $true
     # 'backupMonitoring.SFTP.BAZA.FastHealthEnabled' = $true
     # 'backupMonitoring.SFTP.BAZA.FullAuditEnabled' = $true

@@ -104,8 +104,10 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 **Симптом.** Перший `[ERROR]` одразу після
 `=== ПЕРЕВІРКА СУМІСНОСТІ СИСТЕМИ ===`.
 
-**Що означає.** `BRAVO.config` не пройшов валідацію, або ОС/PowerShell
-у рівні `Unsupported`.
+**Що означає.** Ефективна конфігурація (built-in дефолти +
+`BRAVO.local.config`, або legacy `BRAVO.config` за явним `-ConfigPath`
+на інсталяціях, що ще мігрують з 5.2 — issue #216) не пройшла валідацію,
+або ОС/PowerShell у рівні `Unsupported`.
 
 > **Гола `.NET`-помилка замість зрозумілого повідомлення (виправлено
 > 2026-08-24).** Якщо `BRAVO_SETUP.ps1`/`BRAVO_SELF_TEST.ps1`/
@@ -127,10 +129,11 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 > BRAVO за Name ТА DisplayName одночасно (навмисний захист від хибного
 > співставлення з чужим сервісом) — з 2026-08-24 приймає обидва відомі
 > реальні варіанти написання, `"BRAVO Service"` і `"BRAVO Server"`
-> (`maintenanceSettings.Services.BravoDisplayName` у `BRAVO.config`, за
-> замовчуванням масив з обома). Якщо на вашому сервері DisplayName
-> інший за обидва — допишіть його третім елементом списку (не
-> замінюйте наявні два).
+> (`maintenanceSettings.Services.BravoDisplayName`, за замовчуванням
+> масив з обома; override — через `BRAVO.local.config`, на 5.2-інсталяції,
+> що ще мігрує, — через `BRAVO.config`). Якщо на вашому сервері
+> DisplayName інший за обидва — допишіть його третім елементом списку
+> (не замінюйте наявні два).
 
 **Чого не робити.** Не встановлювати `BRAVO_ALLOW_UNSUPPORTED_OS=1`
 як спосіб «прибрати помилку» — це свідоме зняття гарантій, а не
@@ -144,8 +147,10 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 
 Відтворює ту саму перевірку без production-дій і без елевації.
 
-**Виправлення.** Виправити названий у помилці розділ `BRAVO.config`.
-Після правки — повторний `-ValidateOnly` до чистого результату.
+**Виправлення.** Виправити названий у помилці розділ ефективної
+конфігурації — override у `BRAVO.local.config`, або, на 5.2-інсталяції,
+що ще мігрує, у `BRAVO.config`. Після правки — повторний `-ValidateOnly`
+до чистого результату.
 
 **Ескалація.** Якщо `-ValidateOnly` зелений, а production-запуск усе
 одно дає `30` — це розбіжність контекстів (див.
@@ -162,8 +167,9 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 потрібного компонента — найчастіше він створений для адміністратора,
 але не для `SYSTEM`.
 
-**Чого не робити.** Не вписувати пароль у `BRAVO.config`. Секрети в
-конфігурацію не записуються ніколи (SECURITY.md, розділ 3).
+**Чого не робити.** Не вписувати пароль у `BRAVO.local.config` (чи в
+legacy `BRAVO.config`). Секрети в конфігурацію не записуються ніколи
+(SECURITY.md, розділ 3).
 
 **Діагностика.**
 
@@ -771,7 +777,7 @@ Get-ChildItem "<runtimeLogRoot>\BRAVO_DATA_RESTORE_*.log" |
     Sort-Object LastWriteTime | Select-Object -Last 1
 
 # Які generation узагалі придатні (read-only, без елевації)
-.\BRAVO_DATA_RESTORE.ps1 -ListGenerations -ConfigPath ".\BRAVO.config"
+.\BRAVO_DATA_RESTORE.ps1 -ListGenerations
 
 # Стан керованих служб
 Get-Service | Where-Object { $_.Name -in @('<BravoName>', '<ExchangeApiName>') }
@@ -929,7 +935,7 @@ Start-Service '<BravoWebName>'
 Крок 7. Перевірте систему:
 
 ```powershell
-.\BRAVO_HEALTH.ps1 -ConfigPath ".\BRAVO.config" -NoPause
+.\BRAVO_HEALTH.ps1 -NoPause
 ```
 
 **Якщо `.prerestore_*` кілька (від різних спроб) — НІКОЛИ не беріть
@@ -975,7 +981,7 @@ man-in-the-middle. Підганяння значення під те, що пр�
 
 ```powershell
 Test-NetConnection -ComputerName <sftp-host> -Port 22
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 **Розвилка.**
@@ -1021,7 +1027,7 @@ SFTP-хост не резолвиться — інтернет і DNS працю
 **Діагностика.**
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 Перевіряє доступ саме від `SYSTEM`, а не від вашого облікового запису —
@@ -1684,8 +1690,8 @@ credentials і мережеві доступи вашого облікового
 **Діагностика.**
 
 ```powershell
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -InspectOnly
-.\BRAVO_TASKS_DIAGNOSE.ps1 -ConfigPath ".\BRAVO.config" -TestAccess
+.\BRAVO_TASKS_DIAGNOSE.ps1 -InspectOnly
+.\BRAVO_TASKS_DIAGNOSE.ps1 -TestAccess
 ```
 
 **Типові `LastTaskResult`.**
@@ -1749,8 +1755,14 @@ BRAVO/LIMS, не backup. Змінивши її, ви вплинете на ро�
 Вивід показує знайдені служби, використаний `bravo.ini` і **причину**
 для кожного значення — звідки воно взялось.
 
-**Виправлення.** Задайте явний override у `BRAVO.config`
-(`$global:discoverySettings`). Явно задане значення виграє над
+**Виправлення.** Задайте явний override `$global:discoverySettings`. На
+5.2-інсталяції, що ще мігрує, це робиться в `BRAVO.config`. **З 5.3
+(issue #216) `BRAVO.config` не входить у комплект** — чи є еквівалентний
+шлях перевизначення `discoverySettings` через `BRAVO.local.config` на
+момент написання цього рядка НЕ перевірено (`discoverySettings` історично
+класифікувався як похідний/недоступний для local-override блок, див.
+`BRAVO.local.config.example`); це відкрите питання для перевірки, а не
+підтверджена інструкція для 5.3. Явно задане значення виграє над
 знайденим і ніколи не перезаписується автоматично.
 
 **Окремо про відносні шляхи.** Якщо `bravo.ini` містить відносний шлях,
@@ -1925,7 +1937,7 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
    **до** розпакування в production:
 
    ```powershell
-   .\BRAVO_RESTORE_TEST.ps1 -GenerationId "<yyyyMMdd_HHmmss>" -ConfigPath ".\BRAVO.config"
+   .\BRAVO_RESTORE_TEST.ps1 -GenerationId "<yyyyMMdd_HHmmss>"
    ```
 
    Це read-only: розпаковує в ізольований тимчасовий каталог, звіряє
@@ -1938,12 +1950,12 @@ Get-ScheduledTask -TaskPath "\BRAVO\*" | Disable-ScheduledTask
    ```powershell
    # Спершу без ризику: розпакувати в порожній каталог і подивитись на дані.
    .\BRAVO_DATA_RESTORE.ps1 -GenerationId "<yyyyMMdd_HHmmss>" `
-       -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK" -ConfigPath ".\BRAVO.config"
+       -Mode OutOfPlace -TargetPath "D:\RESTORE_CHECK"
 
    # Далі — у production-шляхи (зупиняє служби, зносить поточні дані вбік
    # у <каталог>.prerestore_<timestamp>, вимагає набрати GenerationId).
    .\BRAVO_DATA_RESTORE.ps1 -GenerationId "<yyyyMMdd_HHmmss>" `
-       -Mode InPlace -ConfigPath ".\BRAVO.config"
+       -Mode InPlace
    ```
 
    Ціль InPlace визначає discovery (`bravo.ini`), а не параметр. При збої

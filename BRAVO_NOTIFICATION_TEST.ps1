@@ -110,7 +110,11 @@ try {
         throw "Не знайдено BRAVO_CONFIG_LOADER.ps1: $configurationLoaderPath"
     }
     . $configurationLoaderPath
-    Import-BravoConfiguration -ConfigRoot $PSScriptRoot -ConfigPath $ConfigPath -RuntimeRoot $PSScriptRoot -ConfigPathWasExplicit:$configPathWasExplicit
+    # Issue #216 (Wave B): production operator entrypoint — не виконує
+    # BRAVO.config автоматично лише тому, що він опинився поруч на диску;
+    # див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1.
+    Import-BravoConfiguration -ConfigRoot $PSScriptRoot -ConfigPath $ConfigPath -RuntimeRoot $PSScriptRoot -ConfigPathWasExplicit:$configPathWasExplicit -DisallowLegacyPrimaryAutoDetect
 
     foreach ($moduleName in @("BRAVO.Compatibility", "BRAVO.Credentials", "BRAVO.Notifications")) {
         $modulePath = Join-Path $PSScriptRoot "modules\$moduleName\$moduleName.psd1"

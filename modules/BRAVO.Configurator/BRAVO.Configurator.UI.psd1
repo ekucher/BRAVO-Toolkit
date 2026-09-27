@@ -15,6 +15,7 @@
         'Get-BRAVOConfiguratorUIFilteredSettings',
         'Get-BRAVOConfiguratorUISearchMatches',
         'Get-BRAVOConfiguratorUICategoryTree',
+        'Resolve-BRAVOConfiguratorUICategoryTreeSelection',
         'Get-BRAVOConfiguratorUIBooleanTriState',
         'ConvertTo-BRAVOConfiguratorUIDisplayText',
         'ConvertTo-BRAVOConfiguratorUITypedValue',

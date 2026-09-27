@@ -98,6 +98,15 @@ try {
         -CandidateConfiguration $primaryRawOverrides `
         -IncludeMissingInCandidate:$IncludeMissingInCandidate)
 
+    # Issue #216 (§9 п.5): дельта раніше показувала перенесені значення без
+    # позначки, що якесь з них ЗАБЛОКУЄ активацію на post-merge
+    # Test-BRAVOEffectiveSecurityInvariants (BRAVO_CONFIG_LOADER.ps1) —
+    # оператор дізнавався про це лише в момент фактичної спроби активації
+    # (-Validate), не з самої дельти. Предикат — Test-BRAVOSecurityInvariant
+    # ValueWeakened (modules\BRAVO.Configuration, вже імпортований вище) —
+    # той самий canonical owner, яким Test-BRAVOEffectiveSecurityInvariants
+    # перевіряє ці самі ключі, без окремої копії (`.claude/rules/05-architecture.md`).
+
     # Шляхи, які вже перевизначені в BRAVO.local.config, позначаються
     # окремо: переносити їх ще раз не потрібно, а мовчки видати їх у
     # списку "додайте це в site-файл" означало б штовхати оператора до
@@ -125,6 +134,7 @@ try {
     $emitted = 0
     $skippedLocal = 0
     $unrepresentable = 0
+    $securityDenied = 0
 
     foreach ($difference in $differences) {
         # Функція, що повертає порожній масив, у PowerShell не повертає
@@ -171,9 +181,13 @@ try {
         } else {
             ''
         }
+        if (Test-BRAVOSecurityInvariantValueWeakened -Path $path -Value $difference.CandidateValue) {
+            $marker += '  # УВАГА: заблокує активацію (Test-BRAVOEffectiveSecurityInvariants, fail-closed) без BRAVO_ALLOW_WEAKENED_SECURITY=1'
+            $securityDenied++
+        }
 
         if ($localOverridePaths.Contains($path)) {
-            [void]$lines.Add("    # [уже є в BRAVO.local.config] '$path' = $literal")
+            [void]$lines.Add("    # [уже є в BRAVO.local.config] '$path' = $literal$marker")
             $skippedLocal++
             continue
         }
@@ -192,6 +206,9 @@ try {
     Write-Output "[INFO] Уже є в BRAVO.local.config: $skippedLocal"
     if ($unrepresentable -gt 0) {
         Write-Output "[WARN] Потребують ручного перенесення: $unrepresentable"
+    }
+    if ($securityDenied -gt 0) {
+        Write-Output "[WARN] Заблокують активацію (Test-BRAVOEffectiveSecurityInvariants): $securityDenied — позначено в дельті вище"
     }
 
     if ($null -ne $resolvedOutputPath) {

@@ -356,16 +356,24 @@ Precedence сьогодні: `DEFAULT <
 BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Деталі —
 `docs/design/BRAVO_CONFIGURATION_FOUNDATION_DESIGN.md`.
 
-**Config v2 — IN PROGRESS / не завершено.** `BRAVO.config` сам
-залишається виконуваним PowerShell-скриптом (не DATA-only),
-`VERSION.json.configSchemaVersion` = `1`. Рішенням власника **D2**
-(2026-09-14) перейменування локального шару скасовано: назва
-`BRAVO.local.config` лишається, файлу `BRAVO.config.local` не буде, а
-цільова модель v2 — **двошарова** (`DEFAULT < BRAVO.config <
-BRAVO.local.config`), без окремого машинно-локального шару. Повний перелік
-залишкових gaps, target architecture, safe declarative parser
-requirement, schema v2, migration і DoD regression matrix —
-`docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md`.
+**Config v2 — ціль змінено Issue #216 (2026-09-24, замінює D2).**
+Рішення власника **D2** (2026-09-14) визначало цільову модель v2 як
+**двошарову, постійну** (`DEFAULT < BRAVO.config < BRAVO.local.config`,
+`BRAVO.config` лишається назавжди опціональним DATA-only шаром
+перевизначення сайту/розгортання). Це рішення **застаріло**: чинний
+мандат — Issue #216, підтверджений власником прямо в сесії 2026-09-26
+(«У версії 5.3 взагалі не повинно бути BRAVO.config»). Для 5.3
+`BRAVO.config` не читається, не шукається й не виконується у
+нормальному production-виконанні взагалі — legacy `BRAVO.config`
+допускається лише для міграції 5.2→5.3, міграційних тестів/фікстур,
+доказів паритету й історичної документації. Це вже реалізовано в
+рантаймі: усі канонічні production-runtime і operator-entrypoint-и
+передають `-DisallowLegacyPrimaryAutoDetect` у `Import-BravoConfiguration`
+(`BRAVO_CONFIG_LOADER.ps1`, issue #216 Wave B), а кореневий `BRAVO.config`
+прибрано з release-пакета (issue #154 крок B4-2). Повний перелік
+залишкових gaps, історія D2-дизайну (B1–B3) і DoD regression matrix —
+`docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md` (там же — банер про
+заміну D2 на початку документа).
 
 Починати наступний PR-цикл після стабілізації P0/P1, якщо ручний merge `BRAVO.config` продовжує створювати реальний операційний ризик.
 

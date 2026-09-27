@@ -72,6 +72,13 @@ $bypassAllowlist = @(
     # powershell.exe зі stub-runtime (той самий патерн, що ConfigLoader/
     # Governance вище). Нових ВИКОНУВАНИХ Bypass-місць не додано.
     'BRAVO_SELF_TEST.ConfigIntent.ps1',
+    # Issue #216 (§9): Delta/SecurityInvariantValuesAreVisiblyMarked —
+    # реальний subprocess-прогін deploy\Get-BRAVOConfigSiteDelta.ps1 на
+    # сфабрикованому BRAVO.config, той самий ізольований дочірній
+    # powershell.exe патерн, що ConfigLoader/Governance вище (уникає
+    # змішування глобального стану із рештою self-test-прогону). Нових
+    # ВИКОНУВАНИХ Bypass-місць не додано.
+    'BRAVO_SELF_TEST.Configuration.ps1',
     'BRAVO.Archive.Runtime.ps1',
     'BRAVO.Maintenance.Runtime.ps1',
     # Self-elevation (-Verb RunAs) і дочірній запуск BRAVO_HEALTH — той
@@ -87,6 +94,11 @@ $bypassAllowlist = @(
     # schtasks) — та сама категорія "описує завдання", що TASKS_INSTALL.
     # Config увійшов у скан заради правила legacy-webhook нижче.
     'BRAVO.config',
+    # Issue #216 (B4-2): кореневий BRAVO.config прибрано з пакета й git-
+    # tracking; той самий текст живе далі як заморожений тестовий актив
+    # (selftest\fixtures\BravoConfigLegacyFrozen.config), той самий
+    # ArgumentsTemplate у ньому — той самий, вище вже дозволений запис.
+    'BravoConfigLegacyFrozen.config',
     # BRAVO.Configuration.psm1 (P0 Configuration Foundation, PR A):
     # Get-BRAVODefaultConfiguration повертає ТОЙ САМИЙ elevationSettings.
     # ArgumentsTemplate, що сьогодні буквально в BRAVO.config вище —
@@ -157,11 +169,20 @@ $files = @(Get-BRAVOAnalyzableFile -Root $Root)
 # Активні конфігураційні файли — не .ps1/.psm1/.psd1, тому поза
 # Get-BRAVOAnalyzableFile, але legacy webhook-літерали (та інші заборонені
 # патерни) не мають права з'являтись і в них.
-foreach ($configFileName in @('BRAVO.config', 'BRAVO.local.config.example')) {
+foreach ($configFileName in @('BRAVO.local.config.example')) {
     $configFilePath = Join-Path $Root $configFileName
     if (Test-Path -LiteralPath $configFilePath -PathType Leaf) {
         $files += @(Get-Item -LiteralPath $configFilePath)
     }
+}
+# Issue #216 (B4-2): кореневий BRAVO.config прибрано з пакета й git-
+# tracking. Заморожений текст (той самий legacy-контент, лише
+# переміщений) далі сканується з нового місця, інакше видалення файлу
+# з кореня мовчки прибрало б покриття forbidden-pattern для цього
+# контенту.
+$frozenLegacyConfigPath = Join-Path $Root 'selftest\fixtures\BravoConfigLegacyFrozen.config'
+if (Test-Path -LiteralPath $frozenLegacyConfigPath -PathType Leaf) {
+    $files += @(Get-Item -LiteralPath $frozenLegacyConfigPath)
 }
 
 $violationCount = 0

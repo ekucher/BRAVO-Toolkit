@@ -41,6 +41,16 @@ $expectedSourceFields = @(
     'BravoConfigurationMetadata.PrimaryConfigPath',
     'BravoConfigurationMetadata.PrimaryConfigPresent',
     'BravoConfigurationMetadata.PrimaryConfigWasExplicit',
+    # Issue #216 (Wave B): дві нові діагностичні поля
+    # $DisallowLegacyPrimaryAutoDetect (BRAVO_CONFIG_LOADER.ps1) — так само
+    # описують ДЖЕРЕЛО завантаження (чи фізично лежить файл на диску; чи
+    # саме auto-detect production-entrypoint-а його проігнорував), а не
+    # ефективне ЗНАЧЕННЯ конфігурації. BEFORE (explicit -ConfigPath,
+    # auto-detect не задіяний) і AFTER (production-режим CONFIG_TEST,
+    # auto-detect заблокований) законно відрізняються тут навіть коли
+    # PrimaryConfigPresent і весь інший граф значень ідентичні.
+    'BravoConfigurationMetadata.PrimaryConfigPresentOnDisk',
+    'BravoConfigurationMetadata.PrimaryConfigAutoDetectBlocked',
     'BravoConfigurationMetadata.PrimaryConfigOverridesCanonicalDefaults',
     'BravoConfigurationMetadata.PrimaryConfigIgnoredGlobals',
     'BravoConfigurationMetadata.PrimaryConfigUnknownNestedKeys',

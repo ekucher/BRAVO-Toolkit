@@ -176,55 +176,55 @@ function Get-BRAVOSelfTestLegacyConfigPath {
         зміниться рівно одне тіло цієї функції (на заморожений тестовий
         актив), а не 20 місць.
 
-        Чому НЕ заморожену копію вже зараз: доки файл є в пакеті,
-        фікстури мають читати саме ЙОГО — інакше вони перестануть
-        характеризувати те, що реально відвантажується, і розбіжність
-        між копією й оригіналом ніхто не помітить.
+        B4-2 ВИКОНАНО (Issue #216, Wave B, крок "прибери BRAVO.config з
+        комплекту"): кореневий файл більше не входить у пакет і не
+        відстежується git. Ця функція тепер повертає шлях до
+        ЗАМОРОЖЕНОГО тестового активу — точної побайтової копії
+        кореневого BRAVO.config, знятої в момент прибирання файлу з
+        пакета. Копія навмисно НЕ слідує за майбутніми змінами
+        canonical-дефолтів: вона фіксує legacy-текст, потрібний
+        фікстурам як синтетична БАЗА сценарію (LIMSRoot/BackupRoot
+        підміняються самим викликачем), а не живий стан продукту.
     #>
-    return (Join-Path $root 'BRAVO.config')
+    return (Join-Path $root 'selftest\fixtures\BravoConfigLegacyFrozen.config')
 }
 
 function Get-BRAVOSelfTestShippedConfigText {
     <#
-        Текст BRAVO.config, ЯКИЙ РЕАЛЬНО ВІДВАНТАЖУЄТЬСЯ в комплекті.
+        B4-2 ВИКОНАНО. Файл BRAVO.config більше не відвантажується в
+        пакеті — "ЩО ВІДВАНТАЖУЄТЬСЯ" як окремий live-артефакт більше
+        не існує, тож ця функція фактично зливається з класом A.
 
-        Сьогодні повертає те саме, що Get-BRAVOSelfTestLegacyConfigText —
-        і саме тому це окрема функція, а не аліас.
-
-        Два різні класи споживачів, які випадково збігаються ЛИШЕ доти,
-        доки файл лежить у пакеті:
-
-          A. фікстури (Get-BRAVOSelfTestLegacyConfigText) — їм потрібен
-             legacy-текст як база сценарію. Після B4-2 він стає
-             ЗАМОРОЖЕНИМ активом і навмисно перестає слідувати за пакетом;
-          B. твердження ПРО ПАКЕТ (ця функція) — наприклад «у
-             конфігурації немає DiskSpacePolicyMode». Їм потрібен ЖИВИЙ
-             стан того, що відвантажується, тобто після B4-2 —
-             канонічні дефолти.
-
-        Якби обидва класи ділили одну функцію, зміна її тіла на B4-2
-        мовчки перетворила б твердження класу B на перевірку мертвого
-        активу: додавання DiskSpacePolicyMode у канонічні дефолти
-        проходило б, доки заморожений файл лишається без змін. Тобто
-        перевірка звітувала б PASS, не перевіряючи нічого дійсного.
-
-        Розділення зараз нічого не змінює в поведінці й коштує одну
-        функцію; не розділити — означає закласти тиху втрату покриття.
+        Аудит УСІХ споживачів класу B перед злиттям (issue #216, Wave B,
+        крок B4-2) показав: жоден із них не перевіряє ЖИВІ canonical-
+        дефолти — усі перевіряють СТРУКТУРУ власного вбудованого
+        PowerShell-коду шаблону BRAVO.config (наявність рядків оголошення
+        ключів на кшталт "LIMSRoot =", виклики Resolve-BRAVOEffective*,
+        присвоєння $global:runtimeLogRoot/$global:minimumRetainedVerifiedBackups,
+        підрядки "SizeSanity"/"MaxSizeDropPercent"/"DiskSpacePolicyMode").
+        Це характеризаційні твердження ПРО САМ ШАБЛОН, а не про
+        обчислені значення — тобто рівно те саме, що потрібно класу A.
+        Тому "канонічні дефолти", згадані в попередній версії цього
+        коментаря, виявились неточним прогнозом: живий еквівалент цих
+        перевірок — не Get-BRAVODefaultConfiguration (хеш-таблиця
+        значень), а сам заморожений текст шаблону. Розділення функцій
+        збережено (для явності викликів на місці споживання), тіла тепер
+        навмисно ідентичні.
     #>
     return [IO.File]::ReadAllText((Get-BRAVOSelfTestShippedConfigPath), [Text.Encoding]::UTF8)
 }
 
 function Get-BRAVOSelfTestShippedConfigPath {
-    # Шлях до конфігурації, ЩО ВІДВАНТАЖУЄТЬСЯ. Тіло НАВМИСНО власне, а не
-    # делегування Get-BRAVOSelfTestLegacyConfigPath: інакше зміна того тіла
-    # на B4-2 мовчки потягла б за собою й твердження про пакет, тобто
-    # відтворила б рівно ту пастку, заради усунення якої існує це
-    # розділення.
+    # Після B4-2 — той самий заморожений актив, що й
+    # Get-BRAVOSelfTestLegacyConfigPath (обґрунтування — коментар
+    # Get-BRAVOSelfTestShippedConfigText вище). НЕ делегування виклику
+    # (щоб лишити на цьому рядку власний літерал для інвентаризації
+    # Governance/LegacyConfigPathHasSingleOwner), сам шлях — той самий.
     #
     # Рядок текстуально відрізняється від тіла legacy-accessor-а свідомо:
     # guard звіряє САМІ рядки збігів, і два однакові рядки він розрізнити
     # не зміг би.
-    $shippedConfigPath = Join-Path $root 'BRAVO.config'
+    $shippedConfigPath = Join-Path $root 'selftest\fixtures\BravoConfigLegacyFrozen.config'
     return $shippedConfigPath
 }
 
@@ -236,7 +236,19 @@ function Get-BRAVOSelfTestLegacyConfigText {
 }
 
 $ErrorActionPreference = "Stop"
-if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
+# Issue #216 (B4-2): захоплюємо ЩЕ ДО присвоєння дефолту — чи $ConfigPath
+# узагалі не був переданий викликачем. Version/AuthoritativeLoader-блок
+# нижче (~3538) використовує цей прапорець, щоб відрізнити "викликач не
+# передав -ConfigPath" (тоді джерело legacy-тексту — заморожений fixture-
+# актив, бо кореневого BRAVO.config з 5.3 більше немає) від "викликач
+# передав СПРАВЖНІЙ шлях, якого не існує" (це лишається реальною
+# помилкою). Прапорець, а не повторне порівняння з жорстко заданим
+# кореневим шляхом старого legacy-файлу — таке порівняння саме й стало б
+# другим збігом Governance/LegacyConfigPathHasSingleOwner (guard навмисно
+# рахує посилання типу "коренева змінна поруч з ім'ям legacy-конфігу" —
+# формулювання цього коментаря свідомо уникає такого буквального збігу).
+$script:selfTestConfigPathWasDefaulted = [string]::IsNullOrWhiteSpace($ConfigPath)
+if ($script:selfTestConfigPathWasDefaulted) {
     # ОПЕРАЦІЙНИЙ конфіг комплекту — НЕ те саме, що джерело legacy-тексту
     # для фікстур, хоч сьогодні обидва вказують на один файл.
     #
@@ -3513,7 +3525,16 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Scheduler/SystemSidMismatch" `
         -Failure "SYSTEM не повинен збігатися з NETWORK SERVICE"
 
-    $sourceConfigPath = (Resolve-Path -LiteralPath $ConfigPath).Path
+    # Issue #216 (B4-2): за замовчуванням $ConfigPath вказує на кореневий
+    # BRAVO.config, якого з 5.3 фізично немає в комплекті/git tree (P0
+    # Configuration Foundation зробив primary-шар опційним). Resolve-Path
+    # вимагав існування файлу — той самий клас проблеми, що вже
+    # задокументований у BRAVO_DRY_RUN.ps1/BRAVO_RESTORE_TEST.ps1 (P0
+    # Configuration Foundation, коментар "GetFullPath, а не Resolve-Path,
+    # нормалізує шлях без вимоги існування"). $configRoot тут потрібен
+    # лише для пошуку сусіднього BRAVO_CONFIG_LOADER.ps1, не для читання
+    # самого файлу.
+    $sourceConfigPath = [System.IO.Path]::GetFullPath($ConfigPath)
     $configRoot = Split-Path -Path $sourceConfigPath -Parent
     $configurationLoaderPath = Join-Path $configRoot 'BRAVO_CONFIG_LOADER.ps1'
     if (-not (Test-Path -LiteralPath $configurationLoaderPath -PathType Leaf)) {
@@ -3527,10 +3548,21 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     [void][IO.Directory]::CreateDirectory($versionConfigRoot)
     $script:selfTestConfigRoot = $versionConfigRoot
     try {
-        $versionConfigText = [IO.File]::ReadAllText(
-            $sourceConfigPath,
-            [Text.Encoding]::UTF8
-        )
+        # Issue #216 (B4-2): $sourceConfigPath за замовчуванням вказує на
+        # кореневий BRAVO.config, якого з 5.3 фізично немає (файл
+        # прибрано з пакета/git tree). Якщо викликач self-test передав
+        # СПРАВЖНІЙ явний -ConfigPath — читаємо саме його (як і раніше:
+        # відсутність такого файлу лишається реальною помилкою). Якщо ж
+        # це default-шлях і файлу немає — це legacy-текст для
+        # синтетичної version-фікстури нижче, тож джерело — той самий
+        # заморожений актив, що й для інших фікстур self-test.
+        $versionConfigText = if (Test-Path -LiteralPath $sourceConfigPath -PathType Leaf) {
+            [IO.File]::ReadAllText($sourceConfigPath, [Text.Encoding]::UTF8)
+        } elseif ($script:selfTestConfigPathWasDefaulted) {
+            Get-BRAVOSelfTestLegacyConfigText
+        } else {
+            throw "Не знайдено конфігураційний файл: $sourceConfigPath"
+        }
         $explicitLimsRoot = $versionConfigRoot.Replace("'", "''")
         $limsRootReplacement = [Text.RegularExpressions.MatchEvaluator] {
             param($match)
@@ -10911,21 +10943,27 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             -Name "Discovery/ResolvesFromServiceAndIniWithoutOverride" `
             -Failure "MODEL/BLOG/BRAVOEXCH мають походити з canonical bravo.ini; BAZA_WWW без DocumentRoot і BACKUP_ROOT без pathSettings не повинні виводитись евристично"
 
+        # Explicit override тепер валідується (absolute + directory
+        # existence, issue #216 ALLOW_WITH_VALIDATOR) перед прийняттям —
+        # без реального каталогу override давав би Value=$null/помилку,
+        # не перемогу над авто-визначеним значенням.
+        $modelOverridePath = Join-Path $discoveryTestRoot "ExplicitOverrideModel"
+        [void][IO.Directory]::CreateDirectory($modelOverridePath)
         $overriddenDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
             -BravoServiceName "BRAVO" `
             -WebServiceCandidates @("Apache2.4") `
             -Services $syntheticServices `
             -SystemRoot $noSuchSystemRoot `
-            -DiscoverySettings @{ Sources = @{ MODEL = "C:\Explicit\Override\Model" } }
+            -DiscoverySettings @{ Sources = @{ MODEL = $modelOverridePath } }
         Test-BRAVOCondition `
             -Condition (
-                $overriddenDiscovery.MODEL_SOURCE -eq "C:\Explicit\Override\Model" -and
+                $overriddenDiscovery.MODEL_SOURCE -eq $modelOverridePath -and
                 [bool]$overriddenDiscovery.Overrides["MODEL"] -and
                 [string]::IsNullOrWhiteSpace([string]$overriddenDiscovery.BLOG_SOURCE)
             ) `
             -Name "Discovery/ExplicitOverrideWinsAndIsNeverReplaced" `
-            -Failure "явний discoverySettings.Sources.MODEL override має перемагати над автоматично знайденим значенням, не зачіпаючи інші поля"
+            -Failure "явний, валідний (absolute + existing) discoverySettings.Sources.MODEL override має перемагати над автоматично знайденим значенням, не зачіпаючи інші поля"
 
         $noServiceDiscovery = Resolve-BRAVOInstallationDiscovery `
             -LimsRoot $discoveryTestRoot `
@@ -12193,11 +12231,15 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $prodLoaderExplicitBlogSource = Join-Path $prodLoaderRoot 'ExplicitBlog'
             $prodLoaderExplicitBravoexchSource = Join-Path $prodLoaderRoot 'ExplicitBravoexch'
             $prodLoaderBazaWWWOverride = Join-Path $prodLoaderRoot 'ExplicitBazaWWW'
-            # Explicit override BAZA_WWW валідується на existence (на
-            # відміну від MODEL/BLOG/BRAVOEXCH override, чия existence
-            # перевіряється пізніше, при archive) — без каталогу на диску
-            # Presence був би Error, не Present.
+            # Explicit override (issue #216, ALLOW_WITH_VALIDATOR) —
+            # BAZA_WWW і MODEL/BLOG/BRAVOEXCH усі валідуються на existence
+            # у Resolve-BRAVOInstallationDiscovery (Resolve-BRAVOSourceField)
+            # — без реального каталогу на диску Presence був би Error, не
+            # Present/переможний override.
             [void][IO.Directory]::CreateDirectory($prodLoaderBazaWWWOverride)
+            [void][IO.Directory]::CreateDirectory($prodLoaderExplicitModelSource)
+            [void][IO.Directory]::CreateDirectory($prodLoaderExplicitBlogSource)
+            [void][IO.Directory]::CreateDirectory($prodLoaderExplicitBravoexchSource)
             $prodLoaderNoSuchIniPath = Join-Path $prodLoaderRoot 'NoSuchDir\bravo.ini'
 
             # --- Acceptance 1: BRAVO absent + canonical bravo.ini + usable
