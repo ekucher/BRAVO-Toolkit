@@ -1841,6 +1841,62 @@
         Remove-Item -LiteralPath $legacyReaderCompoundAssignFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateIgnoresScriptBlockLiteralAssignment ---
+    # Codex-знахідка (gate-review, R9) — РЕАЛЬНИЙ false-positive баг у
+    # самій реалізації гейту: рекурсивний FindAll шукав StringConstantExpressionAst
+    # будь-де в правій частині присвоєння, включно з УСЕРЕДИНІ вкладеного
+    # scriptblock-виразу. `$cmd = { 'Read-...' }` записувало ризиковий
+    # літерал, хоча `& $cmd` реально виконує СКРИПТБЛОК (що просто
+    # повертає текст, не викликає жодної команди) — легітимний код хибно
+    # провалював гейт.
+    $legacyReaderScriptBlockLiteralFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $sbLiteralDir = Join-Path $legacyReaderScriptBlockLiteralFixtureRoot 'modules\BRAVO.ScriptBlockLiteral'
+        [void][IO.Directory]::CreateDirectory($sbLiteralDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $sbLiteralDir 'BRAVO.ScriptBlockLiteral.psm1'),
+            "function Invoke-Harmless { `$cmd = { 'Read-BRAVOLegacyPrimaryRawOverrides' }; & `$cmd -Path X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderScriptBlockLiteralFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderScriptBlockLiteralFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $legacyReaderScriptBlockLiteralFixtureResult.Passed -and
+                @($legacyReaderScriptBlockLiteralFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') }).Count -eq 0
+            ) `
+            -Name "ReleaseGate/CutoverGateIgnoresScriptBlockLiteralAssignment" `
+            -Failure "присвоєння змінної SCRIPTBLOCK-виразу, що лише МІСТИТЬ текст імені legacy-рідера як рядок усередині блоку (не виклик), не сміє провалювати гейт LEGACY_READER_ISOLATION; отримано Failures=$($legacyReaderScriptBlockLiteralFixtureResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderScriptBlockLiteralFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateNormalizesScopeQualifiedVariableName ---
+    # Codex-знахідка (gate-review, R9): VariablePath.UserPath включає
+    # scope-префікс (`script:`) як частину рядка — `$script:reader` і
+    # `$reader` (яке PowerShell реально резолвить з батьківського scope
+    # до того самого значення) порівнювались як РІЗНІ імена, тож ця
+    # форма parent-scope indirection досі проходила гейт непоміченою.
+    $legacyReaderScopeQualifiedFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $scopeQualifiedDir = Join-Path $legacyReaderScopeQualifiedFixtureRoot 'modules\BRAVO.ScopeQualified'
+        [void][IO.Directory]::CreateDirectory($scopeQualifiedDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $scopeQualifiedDir 'BRAVO.ScopeQualified.psm1'),
+            "`$script:reader = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction Invoke-FromNested { & `$reader -ConfigPath X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderScopeQualifiedFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderScopeQualifiedFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderScopeQualifiedFixtureResult.Passed -and
+                @($legacyReaderScopeQualifiedFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO.ScopeQualified.psm1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateNormalizesScopeQualifiedVariableName" `
+            -Failure "`$script:reader = 'Read-...' на рівні модуля, використане через незакваліфіковане `& `$reader` усередині вкладеної функції, мусить провалювати гейт LEGACY_READER_ISOLATION — scope-префікс не повинен заважати зіставленню"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderScopeQualifiedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну

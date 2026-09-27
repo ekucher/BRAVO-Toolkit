@@ -175,6 +175,22 @@ function Test-BRAVOConfigV2CutoverGates {
         'Import-BravoLegacyPrimaryConfiguration' = 'Import-BravoConfiguration'
     }
 
+    # R9 (issue #216, gate-review): VariablePath.UserPath включає scope-
+    # префікс (`script:`, `global:`, `local:`, `private:`) як частину
+    # рядка — `$script:reader` і `$reader`, попри те що PowerShell
+    # резолвить друге з батьківського scope до того самого значення,
+    # порівнювались як РІЗНІ імена. Знімаємо відомий scope-префікс перед
+    # порівнянням.
+    function Get-BRAVOAstNormalizedVariableName {
+        param([string]$UserPath)
+        foreach ($scopePrefix in @('script:', 'global:', 'local:', 'private:', 'using:')) {
+            if ($UserPath.StartsWith($scopePrefix, [StringComparison]::OrdinalIgnoreCase)) {
+                return $UserPath.Substring($scopePrefix.Length)
+            }
+        }
+        return $UserPath
+    }
+
     function Get-BRAVOAstEnclosingFunctionName {
         param($AstNode)
         $current = $AstNode.Parent
@@ -314,28 +330,37 @@ function Test-BRAVOConfigV2CutoverGates {
                 # літералу (не лише "ризикових") — інакше reassignment на щось
                 # безпечне ПІСЛЯ підозрілого присвоєння не мав би запису, і
                 # "найближче попереднє" знову знайшло б застаріле ризикове
-                # значення замість актуального. $assignmentValueAst — це
-                # PipelineAst/StatementAst-обгортка, тому шукаємо рядковий
-                # літерал усередині; "проста" форма присвоєння визначена як
-                # РІВНО один такий літерал у правій частині (не конкатенація/
-                # виклик команди з кількома аргументами-рядками) — інакше
-                # значення непередбачуване статично, і запис пропускається.
-                $assignmentValueStringAsts = @($assignmentValueAst.FindAll(
-                    { param($astNode) $astNode -is [System.Management.Automation.Language.StringConstantExpressionAst] },
-                    $true
-                ))
-                if ($assignmentValueStringAsts.Count -ne 1) {
+                # значення замість актуального.
+                # R9 (issue #216, gate-review): попередня версія шукала БУДЬ-
+                # ЯКИЙ StringConstantExpressionAst у правій частині рекурсивно
+                # через FindAll — це заходило й у ВКЛАДЕНІ scriptblock-и:
+                # `$cmd = { 'Read-...' }` записувало ризиковий літерал, хоча
+                # `& $cmd` реально виконує СКРИПТБЛОК (що лише повертає текст,
+                # не викликає команду). "Проста" форма присвоєння тепер
+                # визначена якомога вужче: права частина — це PipelineAst з
+                # РІВНО ОДНИМ CommandExpressionAst, чий вираз — САМЕ
+                # StringConstantExpressionAst (без розпаковування вкладених
+                # scriptblock/підвиразів) — не рекурсивний пошук.
+                $assignmentValueLiteralAst = $null
+                if ($assignmentValueAst -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                    $assignmentValueLiteralAst = $assignmentValueAst.Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
+                } elseif ($assignmentValueAst -is [System.Management.Automation.Language.PipelineAst] -and
+                    $assignmentValueAst.PipelineElements.Count -eq 1 -and
+                    $assignmentValueAst.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                    $assignmentValueLiteralAst = $assignmentValueAst.PipelineElements[0].Expression -as [System.Management.Automation.Language.StringConstantExpressionAst]
+                }
+                if (-not $assignmentValueLiteralAst) {
                     continue
                 }
                 $matchedReaderFunctionName = $null
                 foreach ($legacyReaderFunctionName in $legacyReaderFunctionNames) {
-                    if ([string]::Equals($assignmentValueStringAsts[0].Value, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
+                    if ([string]::Equals($assignmentValueLiteralAst.Value, $legacyReaderFunctionName, [StringComparison]::OrdinalIgnoreCase)) {
                         $matchedReaderFunctionName = $legacyReaderFunctionName
                         break
                     }
                 }
                 [void]$legacyReaderAssignmentRecords.Add([pscustomobject]@{
-                    VariableName       = $assignmentTarget.VariablePath.UserPath
+                    VariableName       = (Get-BRAVOAstNormalizedVariableName -UserPath $assignmentTarget.VariablePath.UserPath)
                     ScriptBlock        = (Get-BRAVOAstEnclosingScriptBlock -AstNode $legacyReaderAssignmentAst)
                     StartOffset        = $legacyReaderAssignmentAst.Extent.StartOffset
                     ReaderFunctionName = $matchedReaderFunctionName
@@ -394,7 +419,7 @@ function Test-BRAVOConfigV2CutoverGates {
                 foreach ($callScopeLevel in (Get-BRAVOAstEnclosingScriptBlockChain -AstNode $legacyReaderCommandAst)) {
                     $nearestPrecedingAssignment = $legacyReaderAssignmentRecords |
                         Where-Object {
-                            [string]::Equals($_.VariableName, $firstCommandElement.VariablePath.UserPath, [StringComparison]::OrdinalIgnoreCase) -and
+                            [string]::Equals($_.VariableName, (Get-BRAVOAstNormalizedVariableName -UserPath $firstCommandElement.VariablePath.UserPath), [StringComparison]::OrdinalIgnoreCase) -and
                             [object]::ReferenceEquals($_.ScriptBlock, $callScopeLevel) -and
                             $_.StartOffset -lt $callOffset
                         } |
