@@ -160,6 +160,93 @@ Test-BRAVOCondition ($configuratorUISec1.Count -eq 1 -and $configuratorUISec1[0]
     'ConfiguratorUI CategoryTree: Section-рівень DescriptorCount коректний (Sec1 = 2 дескриптори)' `
     "Sec1.DescriptorCount=$($configuratorUISec1[0].DescriptorCount)"
 
+# =====================================================================
+# Codex review PR #224 (P2, thread lGNJ9, "Rebuild the category tree
+# after refreshing the schema"): Reload перераховував $state.SchemaCatalog
+# (динамічні recovery-категорії ValidatorRejected/DeniedOverride/
+# EscapableOverride можуть з'явитись/зникнути), але TreeView.Nodes
+# лишався побудованим лише один раз при запуску. Resolve-
+# BRAVOConfiguratorUICategoryTreeSelection — headless-тестована частина
+# фіксу (яку Group/Section МАЄ бути обрано після rebuild); WinForms-глюя
+# (Update-BRAVOConfiguratorUICategoryTreeNodes) навмисно поза межами
+# цього headless-фрагмента (той самий принцип, що заголовок файлу).
+# =====================================================================
+$configuratorUITreeBeforeSchema = @(
+    @{ Path = 'general.x.setting'; Group = 'General'; Section = 'X'; Type = 'String' }
+)
+$configuratorUITreeAfterSchema = @(
+    @{ Path = 'general.x.setting'; Group = 'General'; Section = 'X'; Type = 'String' }
+    @{ Path = 'recovery.leaf'; Group = 'Recovery'; Section = 'ValidatorRejected'; Type = 'String' }
+)
+
+# --- ConfiguratorUI CategoryTreeSelection: reload додає динамічну Recovery-категорію -> вона з'являється ---
+$configuratorUITreeSelAdd = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $configuratorUITreeAfterSchema -PreviousGroup 'General' -PreviousSection 'X'
+$configuratorUITreeSelAddGroups = @($configuratorUITreeSelAdd.Tree | ForEach-Object { $_.Group })
+Test-BRAVOCondition (
+    $configuratorUITreeSelAddGroups -contains 'Recovery'
+) `
+    'ConfiguratorUI CategoryTreeSelection: reload, що додає динамічну Recovery-категорію, робить її видимою в перерахованому дереві' `
+    "Groups=$($configuratorUITreeSelAddGroups -join ',')"
+
+# --- ConfiguratorUI CategoryTreeSelection: reload прибирає динамічну Recovery-категорію -> вона зникає ---
+$configuratorUITreeSelRemove = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $configuratorUITreeBeforeSchema -PreviousGroup 'General' -PreviousSection 'X'
+$configuratorUITreeSelRemoveGroups = @($configuratorUITreeSelRemove.Tree | ForEach-Object { $_.Group })
+Test-BRAVOCondition (
+    $configuratorUITreeSelRemoveGroups -notcontains 'Recovery'
+) `
+    'ConfiguratorUI CategoryTreeSelection: reload, що прибирає динамічну Recovery-категорію, більше не показує її' `
+    "Groups=$($configuratorUITreeSelRemoveGroups -join ',')"
+
+# --- ConfiguratorUI CategoryTreeSelection: наявне виділення переживає reload, коли Group/Section і далі існують ---
+Test-BRAVOCondition (
+    [string]$configuratorUITreeSelAdd.SelectedGroup -eq 'General' -and [string]$configuratorUITreeSelAdd.SelectedSection -eq 'X'
+) `
+    'ConfiguratorUI CategoryTreeSelection: наявне виділення (General/X) переживає reload, коли воно й далі валідне' `
+    "SelectedGroup=$($configuratorUITreeSelAdd.SelectedGroup) SelectedSection=$($configuratorUITreeSelAdd.SelectedSection)"
+
+# --- ConfiguratorUI CategoryTreeSelection: зниклий вибір -> детермінований fallback (root, null/null) ---
+$configuratorUITreeSelFallback = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $configuratorUITreeBeforeSchema -PreviousGroup 'Recovery' -PreviousSection 'ValidatorRejected'
+Test-BRAVOCondition (
+    ($null -eq $configuratorUITreeSelFallback.SelectedGroup) -and ($null -eq $configuratorUITreeSelFallback.SelectedSection)
+) `
+    'ConfiguratorUI CategoryTreeSelection: обраний Group/Section, що зник (Recovery/ValidatorRejected), дає детермінований fallback (SelectedGroup=null/SelectedSection=null -> корінь)' `
+    "SelectedGroup=$($configuratorUITreeSelFallback.SelectedGroup) SelectedSection=$($configuratorUITreeSelFallback.SelectedSection)"
+
+# --- ConfiguratorUI CategoryTreeSelection: перша побудова (PreviousGroup=$null) теж падає на root, без винятку ---
+$configuratorUITreeSelInitial = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $configuratorUITreeBeforeSchema -PreviousGroup $null -PreviousSection $null
+Test-BRAVOCondition (
+    ($null -eq $configuratorUITreeSelInitial.SelectedGroup) -and ($null -eq $configuratorUITreeSelInitial.SelectedSection) -and
+    $configuratorUITreeSelInitial.Tree.Count -eq 1
+) `
+    'ConfiguratorUI CategoryTreeSelection: перша побудова (без попереднього виділення) детерміновано падає на корінь' `
+    "SelectedGroup=$($configuratorUITreeSelInitial.SelectedGroup) SelectedSection=$($configuratorUITreeSelInitial.SelectedSection) TreeCount=$($configuratorUITreeSelInitial.Tree.Count)"
+
+# --- ConfiguratorUI CategoryTreeSelection: повторний виклик з тим самим SchemaCatalog детерміновано ідемпотентний ---
+# (Update-BRAVOConfiguratorUICategoryTreeNodes безумовно викликає
+# $CategoryTree.Nodes.Clear() ПЕРЕД кожним rebuild — механічна гарантія
+# відсутності дублікатів вузлів при повторному Reload; сам WinForms-виклик
+# навмисно поза межами цього headless-фрагмента, ідемпотентність ДАНИХ
+# перевіряється тут.)
+$configuratorUITreeSelRepeat1 = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $configuratorUITreeAfterSchema -PreviousGroup 'General' -PreviousSection 'X'
+$configuratorUITreeSelRepeat2 = Resolve-BRAVOConfiguratorUICategoryTreeSelection -SchemaCatalog $configuratorUITreeAfterSchema -PreviousGroup $configuratorUITreeSelRepeat1.SelectedGroup -PreviousSection $configuratorUITreeSelRepeat1.SelectedSection
+Test-BRAVOCondition (
+    $configuratorUITreeSelRepeat1.Tree.Count -eq $configuratorUITreeSelRepeat2.Tree.Count -and
+    ([string]$configuratorUITreeSelRepeat1.SelectedGroup -eq [string]$configuratorUITreeSelRepeat2.SelectedGroup) -and
+    ([string]$configuratorUITreeSelRepeat1.SelectedSection -eq [string]$configuratorUITreeSelRepeat2.SelectedSection)
+) `
+    'ConfiguratorUI CategoryTreeSelection: повторний reload з незміненою схемою дає ідентичну структуру/виділення (без накопичення)' `
+    "Repeat1.TreeCount=$($configuratorUITreeSelRepeat1.Tree.Count) Repeat2.TreeCount=$($configuratorUITreeSelRepeat2.Tree.Count)"
+
+# --- ConfiguratorUI CategoryTreeSelection: UI_REACHABLE-покриття тримається і на "до", і на "після" схемі ---
+$configuratorUITreeReachableBefore = @(Get-BRAVOConfiguratorUIReachablePaths -SchemaCatalog $configuratorUITreeBeforeSchema)
+$configuratorUITreeReachableAfter = @(Get-BRAVOConfiguratorUIReachablePaths -SchemaCatalog $configuratorUITreeAfterSchema)
+Test-BRAVOCondition (
+    $configuratorUITreeReachableBefore.Count -eq $configuratorUITreeBeforeSchema.Count -and
+    $configuratorUITreeReachableAfter.Count -eq $configuratorUITreeAfterSchema.Count
+) `
+    'ConfiguratorUI CategoryTreeSelection: центральна панель (UI_REACHABLE) лишається узгодженою з перерахованою схемою і до, і після reload' `
+    "Before=$($configuratorUITreeReachableBefore.Count)/$($configuratorUITreeBeforeSchema.Count) After=$($configuratorUITreeReachableAfter.Count)/$($configuratorUITreeAfterSchema.Count)"
+
 # ===== 8: Boolean tri-state — 3 генуїнно різні стани =====
 $configuratorUITriStateDefault = Get-BRAVOConfiguratorUIBooleanTriState -OverridePresent $false -OverrideValue $null
 $configuratorUITriStateTrue = Get-BRAVOConfiguratorUIBooleanTriState -OverridePresent $true -OverrideValue $true

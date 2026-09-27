@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — Current Project State
 
-Last verified: 2026-09-21
+Last verified: 2026-09-24
 
 ## Canonical branch
 
@@ -8,7 +8,7 @@ Last verified: 2026-09-21
 
 ## State baseline SHA
 
-`832e238efd5563e6be6bf91bc42e2f3767ade69c`
+`3e9e172a4b1fc1b41da8066b105ff46dadf66cb3`
 
 Before starting substantial work, verify:
 
@@ -158,35 +158,86 @@ Issue #219 remains backlog work unless explicitly reprioritized.
 
 ## Current active work
 
-Issue #216 — Wave 0:
+Issue #216 has progressed well past Wave 0 (see git/GitHub history for the
+actual wave sequence — this file was not kept current through that
+progression). The active unit of work now is **PR #224**
+(`fix/config-v2-local-override-authorization` -> `developer`), worked in
+isolated worktree `E:\GitHub\BRAVO-Toolkit-216-wave2`.
 
-**Baseline + Configuration Graph Inventory + Default-Parity Gap Map**
+PR #224 state verified 2026-09-23: OPEN, MERGEABLE, base `developer`,
+reviewDecision empty (no formal review decision recorded yet).
 
-Wave 0 is evidence-only.
+### PR #224 — F1 lazy dependency regression remediation (COMMITTED, PUSHED)
 
-No Config V2 implementation changes are authorized during Wave 0.
+Context: PR #224 has been through multiple Codex review rounds (fixes
+tracked informally as F1..F17-style labels in self-test comments, not a
+formal numbering owned by this file). Push
+`b1d705464030b9d907e78c4b9c5c87d0e1e7339e` fixed a Codex F1 finding
+(unreliable `Get-Module` presence guard around a `BRAVO.System` import
+inside `Test-BRAVOConfigurationAuthorizationTaskSchedulerPath`) but in
+doing so introduced a **regression**: the `BRAVO.System` import was
+moved to module-load time in `BRAVO.Configuration.Schema.psm1`'s
+preamble, which broke the `Config v2 pilot artifact` GitHub Actions
+workflow (that artifact intentionally does NOT bundle
+`modules\BRAVO.System\` — `deploy/New-BRAVOConfigV2PilotArtifact.ps1:16`).
+Independently rediscovered and confirmed by a 2026-09-24 read-only
+project-wide audit (Phase 2/3/6).
 
-Required analysis:
+This was root-caused and remediated in this worktree, restoring the
+dependency to **lazy** (imported only inside
+`Test-BRAVOConfigurationAuthorizationTaskSchedulerPath`, immediately
+before `ConvertTo-BRAVOTaskPath`) while keeping it **unconditional** (no
+`Get-Module` guard — the original Codex F1 finding stays fixed).
 
-1. Verify current `developer` baseline.
-2. Run current canonical validation.
-3. Inspect current release artifact composition.
-4. Inventory every meaningful `BRAVO.config` dependency.
-5. Classify each dependency by role.
-6. Trace production configuration call graphs.
-7. Inventory effective configuration keys from actual consumers.
-8. Determine source/provenance for every effective key.
-9. Identify settings whose only remaining source is legacy `BRAVO.config`.
-10. Audit the allowed `BRAVO.local.config` override surface.
-11. Audit `-ConfigPath` semantics and call sites.
-12. Audit migration/pilot isolation.
-13. Audit Runtime Guard.
-14. Audit clean-install and 5.2 → 5.3 update paths.
-15. Audit release artifact composition.
-16. Map current tests to final Config V2 invariants.
-17. Identify exact cutover blockers.
-18. Design atomic implementation waves.
-19. Select exactly one recommended first implementation wave.
+Committed and pushed 2026-09-24 with explicit user authorization:
+commit `276d25755bdfd23b293029727b7cdb35f5425c3f` on
+`fix/config-v2-local-override-authorization`, now = `origin/...` HEAD
+(0 ahead/0 behind).
+
+Working tree contents of that commit:
+
+* `modules/BRAVO.Configuration/BRAVO.Configuration.Schema.psm1` — production fix.
+* `selftest/BRAVO_SELF_TEST.Configuration.ps1` — corrected structural tests
+  (`SchemaTaskPathImportHasNoProcessWidePresenceGuard`,
+  `SchemaSystemDependencyIsLazyTaskPathOnly`) + new behavioral coverage
+  (`SchemaTaskSchedulerPathLazilyLoadsSystemWhenUsed`,
+  `SchemaImportAndUnrelatedAuthorizationSucceedWithoutSystemModule`).
+* `RUNTIME_MANIFEST.json` — regenerated via `ci\Update-BRAVORuntimeManifest.ps1 -Apply`
+  (exactly the 2 changed-file hashes; no unrelated drift).
+
+Validation actually executed and passed in this worktree (see full 21-item
+report in-session for exact evidence):
+
+* Pilot artifact regression reproduced pre-fix, resolved post-fix (verified
+  via a non-mutating simulation — see below — since the real builder reads
+  content via `git show HEAD:...`, and HEAD cannot reflect an uncommitted
+  fix without violating the no-commit boundary).
+* Full `BRAVO_SELF_TEST.ps1`: **2483 PASS / 0 FAIL / 0 exceptions**,
+  `SELF-TEST PASSED`, wall-clock ~12m28s.
+* `ci\Invoke-BRAVOSecurityAnalysis.ps1`, `ci\Test-BRAVOForbiddenPattern.ps1`,
+  `git diff --check`: all clean.
+* F2 (UrlArray blank handling)/F3 (Configurator MultiRepresentation
+  recovery)/F4 (LogLevel EnumTrimmed) regression fragments re-run
+  standalone: 208/208 (Configuration) and 209/209 (Configurator) PASS.
+
+Known environment quirk (not a defect): running
+`BRAVO_SELF_TEST.ps1` via `-NonInteractive` without `-NoPause` hangs on a
+"press any key" prompt after all checks already completed and were
+logged — pass `-NoPause` next time to avoid needing to kill the process.
+
+Known technique used for pilot-artifact validation without committing:
+`deploy/New-BRAVOConfigV2PilotArtifact.ps1` and the self-test's
+`New-BRAVOPilotSyntheticInstallRoot` both source content via
+`git show`/`git archive` against a ref (default `HEAD`), by deliberate
+design (byte-fidelity, independent of working-tree state) — so an
+uncommitted fix is invisible to them. Validated instead via a scratch copy
+of the self-test script with a `Copy-Item` overlay of the working-tree
+file added right after the `git archive` extraction step — no git
+mutation, only file copies, real logic otherwise unchanged. This is the
+correct way to validate an uncommitted fix against `git`-ref-based
+builders in this repository; reuse it rather than `git stash create` (a
+stash operation is explicitly out of bounds under a "no stash" mutation
+rule) or an actual commit.
 
 ## Issue #216 target invariants
 
@@ -209,36 +260,39 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 
 ## NEXT ACTION
 
-Execute **Issue #216 Wave 0** against:
+The F1 lazy dependency regression fix (see "Current active work" above)
+was committed and pushed 2026-09-24 with explicit user authorization:
+commit `276d25755bdfd23b293029727b7cdb35f5425c3f` on
+`fix/config-v2-local-override-authorization`. PR #224 CI re-triggered on
+this HEAD; `mergeStateStatus=BLOCKED` (branch protection requires all
+checks green — several were still `pending`, including the pilot-artifact
+check this fix targets, at last observation). No merge attempted or
+authorized.
+
+Before doing anything else, re-verify this state is still accurate
+(`git status --short`, `git rev-parse HEAD`, `git rev-parse
+origin/fix/config-v2-local-override-authorization`, `gh pr checks 224`) —
+do not trust this file if the worktree, remote, or CI has moved.
 
 ```text
-origin/developer
-state baseline:
-832e238efd5563e6be6bf91bc42e2f3767ade69c
+Re-check PR #224 CI on HEAD 276d257 (gh pr checks 224). If the pilot-
+artifact check and all other required checks are now green, report
+MERGE READY. If still failing, diagnose against the new HEAD before
+assuming this fix was insufficient. Separately, PR #224 still carries 18
+unresolved Codex review threads (2xP1 whitespace/enum-normalization
+regressions, 16xP2) from the 2026-09-24 audit — decide with the user
+whether those must be addressed before merge, independent of the CI
+gate (developer branch protection does not require conversation
+resolution or any approving review, so it is not a hard technical
+blocker, only a project-policy one).
 ```
 
-Requirements:
+Commit/push of any further changes still require explicit user
+authorization in the session, per standing project Git policy.
 
-* use an isolated worktree;
-* evidence-only;
-* do not modify repository files;
-* do not implement the Config V2 cutover.
-
-Expected final classification:
-
-```text
-ISSUE #216 BASELINE COMPLETE — READY FOR IMPLEMENTATION WAVES
-```
-
-or:
-
-```text
-ISSUE #216 BASELINE BLOCKED
-```
-
-with exact evidence.
-
-After Wave 0, replace this `NEXT ACTION` with the exact approved first implementation wave.
+If state does NOT match (worktree dirty differently, HEAD moved, PR #224
+closed/merged/retargeted): stop, establish actual current state from
+git/GitHub, and do not proceed mechanically from this stale note.
 
 ## Standard workflow
 

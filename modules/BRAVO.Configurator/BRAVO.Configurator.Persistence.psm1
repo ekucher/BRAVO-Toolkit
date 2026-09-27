@@ -71,10 +71,53 @@ function Merge-BRAVOConfiguratorCandidateOverrides {
     foreach ($path in $schemaPaths) {
         $setting = @($Model | Where-Object { $_.Path -eq $path })
         if ($setting.Count -ne 1) { continue }
+
+        # Codex review PR #224 (P2, "Flatten every nested representation
+        # when clearing a leaf"): той самий canonical leaf МІГ бути
+        # supplied ОДНОЧАСНО кількома незалежними representations —
+        # точним флетом, і вкладеним Node-контейнером на будь-якій
+        # глибині, і ЩЕ ОДНИМ вкладеним контейнером на ІНШІЙ глибині
+        # (напр. 'backupMonitoring.SFTP.BAZA.Mode' поряд із
+        # 'backupMonitoring.SFTP.BAZA' = @{ Mode = ... } поряд із
+        # 'backupMonitoring' = @{ SFTP = @{ BAZA = @{ Mode = ... } } }).
+        # Одноразовий Resolve+Convert (попередня версія) знімав ЛИШЕ
+        # НАЙДОВШИЙ присутній префікс і зупинявся — решта дублікатів
+        # лишалась у $merged назавжди. Замість фіксованої кількості
+        # проходів — цикл, що сходиться: на кожній ітерації знаходимо
+        # ЩЕ ОДНУ representation цього самого leaf (Resolve-
+        # BRAVOConfiguratorSuppliedLeafOverride проти ПОТОЧНОГО $merged,
+        # не проти $ExistingOverrides — бачить і representations, які
+        # попередні ітерації цього самого циклу вже розгорнули) і знімаємо
+        # її (точний флет — Remove; вкладений контейнер —
+        # Convert-BRAVOConfiguratorNestedContainerToFlatKeys, який
+        # зберігає сусідні/невідомі нащадки й НЕ мутує оригінальний
+        # вкладений hashtable-об'єкт викликача, і fail-closed кидає
+        # виняток на порожньому вкладеному вузлі). Convert може відновити
+        # $path як НОВИЙ флет-ключ (значення з щойно розгорнутого
+        # контейнера) — наступна ітерація резолву або зніме його знову
+        # (NestedPath.Count -eq 0), або (якщо жодної representation
+        # більше немає) цикл завершується. Коли жодної representation не
+        # лишилось — Model є ЄДИНИМ джерелом істини: OverridePresent=true
+        # встановлює рівно один флет-ключ; OverridePresent=false лишає
+        # leaf відсутнім у будь-якій формі.
+        $convergenceGuard = 0
+        while ($true) {
+            $convergenceGuard++
+            if ($convergenceGuard -gt 64) {
+                throw ("BRAVO.Configurator: Merge-BRAVOConfiguratorCandidateOverrides не зійшовся для '$path' " +
+                    "після $convergenceGuard ітерацій розгортання вкладених представлень — можливий цикл/пошкоджений ExistingOverrides.")
+            }
+            $supplied = Resolve-BRAVOConfiguratorSuppliedLeafOverride -LocalOverrides $merged -LeafPath $path
+            if (-not $supplied.Found) { break }
+            if ($supplied.NestedPath.Count -eq 0) {
+                $merged.Remove($path)
+            } else {
+                Convert-BRAVOConfiguratorNestedContainerToFlatKeys -Overrides $merged -TopLevelKey $supplied.TopLevelKey -SchemaCatalog $SchemaCatalog
+            }
+        }
+
         if ($setting[0].OverridePresent) {
             $merged[$path] = $setting[0].OverrideValue
-        } elseif ($merged.Contains($path)) {
-            $merged.Remove($path)
         }
     }
 
@@ -276,8 +319,28 @@ function Invoke-BRAVOConfiguratorApply {
     )
 
     # Крок 3: злиття (Model edits + збереження невідомих ключів).
-    $mergedOverrides = Merge-BRAVOConfiguratorCandidateOverrides `
-        -ExistingOverrides $ProductionBaseline.Overrides -Model $Model -SchemaCatalog $SchemaCatalog
+    # PR #224 review, R3-3: Convert-BRAVOConfiguratorNestedContainerToFlatKeys
+    # (викликається зсередини Merge-BRAVOConfiguratorCandidateOverrides,
+    # коли торкнутий canonical leaf досягається через легасі вкладений
+    # контейнер) fail-closed кидає виняток, якщо контейнер містить
+    # порожній вкладений вузол, який неможливо безпечно розгорнути у
+    # плоскі dot-шляхи. Без цього try/catch такий виняток пробивав би
+    # Invoke-BRAVOConfiguratorApply наскрізь необробленим, порушуючи той
+    # самий задокументований контракт "завжди повертає структурований
+    # [pscustomobject]@{ Applied = ... }", що вже захищають try/catch
+    # нижче для RaceCheckFailed/Serialization (P1.1/P2-фікси). Продакшн-
+    # файл на цьому кроці ще не чіпався (backup/atomic replace — нижче),
+    # тож він лишається незмінним.
+    try {
+        $mergedOverrides = Merge-BRAVOConfiguratorCandidateOverrides `
+            -ExistingOverrides $ProductionBaseline.Overrides -Model $Model -SchemaCatalog $SchemaCatalog
+    } catch {
+        return [pscustomobject]@{
+            Applied = $false
+            Stage   = 'Merge'
+            Reasons = @("Не вдалося злити candidate-редагування з наявними overrides: $($_.Exception.Message). Production файл НЕ змінено.")
+        }
+    }
 
     # Крок 4-7: parse + schema + dependency + canonical validation.
     $validationResult = Test-BRAVOConfiguratorCandidateOverrides `

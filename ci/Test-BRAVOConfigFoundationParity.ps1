@@ -132,7 +132,11 @@ $localConfigLiteral = @'
     'backupMonitoring.SFTP.VerifyRemoteArchiveHash' = $true
     'backupMonitoring.SFTP.RequireServerSideArchiveHash' = $true
     'backupMonitoring.SFTP.BAZAPendingAlertAfterHours' = 12
-    'backupMonitoring.SFTP.BAZA.Mode' = 'Full'
+    # backupMonitoring.SFTP.BAZA.Mode навмисно НЕ перевизначається тут:
+    # Issue #216 Wave 2 класифікує цей лист як DENY_SECURITY_CONTROL
+    # (безумовна відмова local-override, незалежно від значення) —
+    # parity-фікстура мусить лишатись реалістичним ДОЗВОЛЕНИМ local-config,
+    # а не прикладом того, що тепер fail-closed.
     'backupMonitoring.SFTP.BAZA.SynchronizeBeforeHealth' = $true
     'backupMonitoring.SFTP.BAZA.FastHealthEnabled' = $true
     'backupMonitoring.SFTP.BAZA.FullAuditEnabled' = $true
