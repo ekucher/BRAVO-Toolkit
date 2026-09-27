@@ -414,12 +414,33 @@ function Test-BRAVOConfigV2CutoverGates {
                 # найближчим ПОПЕРЕДНІМ присвоєнням (за offset ТОГО САМОГО
                 # рівня) вважається джерелом значення — це відтворює
                 # звичайне затінення (shadowing), а не повну dataflow.
+                # R10 (issue #216, gate-review): R9 знімала scope-префікс з
+                # ІМЕНІ змінної для порівняння, але це стирало ЗМІСТ
+                # префікса в місці ВИКЛИКУ — явний `& $script:reader`
+                # цілеспрямовано звертається ЛИШЕ до script-scope (кореня
+                # файлу), навіть якщо вкладена функція має власне
+                # незакваліфіковане `$reader` ближче. Тому обхід по scope-
+                # ланцюжку тепер звужується залежно від кваліфікатора В
+                # МІСЦІ ВИКЛИКУ: незакваліфіковане ім'я — повний ланцюжок
+                # (як і раніше); `script:` — лише корінь файлу (найзовнішній
+                # рівень ланцюжка); будь-який інший кваліфікатор
+                # (`global:`/`local:`/`private:`/drive-qualified) — поза
+                # межами цієї статичної евристики, не зіставляється.
+                $callScopeChain = @(Get-BRAVOAstEnclosingScriptBlockChain -AstNode $legacyReaderCommandAst)
+                $callVariablePath = $firstCommandElement.VariablePath
+                if ($callVariablePath.IsScript) {
+                    $callScopeLevelsToSearch = @($callScopeChain | Select-Object -Last 1)
+                } elseif ($callVariablePath.IsUnqualified) {
+                    $callScopeLevelsToSearch = $callScopeChain
+                } else {
+                    $callScopeLevelsToSearch = @()
+                }
                 $callOffset = $legacyReaderCommandAst.Extent.StartOffset
                 $nearestPrecedingAssignment = $null
-                foreach ($callScopeLevel in (Get-BRAVOAstEnclosingScriptBlockChain -AstNode $legacyReaderCommandAst)) {
+                foreach ($callScopeLevel in $callScopeLevelsToSearch) {
                     $nearestPrecedingAssignment = $legacyReaderAssignmentRecords |
                         Where-Object {
-                            [string]::Equals($_.VariableName, (Get-BRAVOAstNormalizedVariableName -UserPath $firstCommandElement.VariablePath.UserPath), [StringComparison]::OrdinalIgnoreCase) -and
+                            [string]::Equals($_.VariableName, (Get-BRAVOAstNormalizedVariableName -UserPath $callVariablePath.UserPath), [StringComparison]::OrdinalIgnoreCase) -and
                             [object]::ReferenceEquals($_.ScriptBlock, $callScopeLevel) -and
                             $_.StartOffset -lt $callOffset
                         } |

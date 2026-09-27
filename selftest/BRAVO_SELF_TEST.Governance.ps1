@@ -1897,6 +1897,35 @@
         Remove-Item -LiteralPath $legacyReaderScopeQualifiedFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateRespectsExplicitScriptScopeQualifierAtCallSite ---
+    # Codex-знахідка (gate-review, R10) — прямий регрес від R9: нормалізація
+    # scope-префіксу знімала ЗМІСТ явного кваліфікатора В МІСЦІ ВИКЛИКУ.
+    # `& $script:reader` ЦІЛЕСПРЯМОВАНО звертається лише до script-scope
+    # (кореня файлу), навіть коли вкладена функція має власне
+    # незакваліфіковане `$reader`, що затінює його локально — PowerShell
+    # реально виконує рідер зі script-scope, а не локальне безпечне
+    # значення.
+    $legacyReaderExplicitScopeFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $explicitScopeDir = Join-Path $legacyReaderExplicitScopeFixtureRoot 'modules\BRAVO.QualifiedCall'
+        [void][IO.Directory]::CreateDirectory($explicitScopeDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $explicitScopeDir 'BRAVO.QualifiedCall.psm1'),
+            "`$script:reader = 'Read-BRAVOLegacyPrimaryRawOverrides'`nfunction Invoke-Explicit { `$reader = 'Get-ChildItem'; & `$script:reader -ConfigPath X }",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderExplicitScopeFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderExplicitScopeFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderExplicitScopeFixtureResult.Passed -and
+                @($legacyReaderExplicitScopeFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO.QualifiedCall.psm1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateRespectsExplicitScriptScopeQualifierAtCallSite" `
+            -Failure "явний `$script: кваліфікатор у МІСЦІ ВИКЛИКУ (`& `$script:reader) мусить цілеспрямовано резолвитись зі script-scope, навіть коли вкладена функція має власне незакваліфіковане `$reader — гейт не сміє пропускати цей виклик лише тому, що знайшов найближче (але семантично неправильне) локальне присвоєння"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderExplicitScopeFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну
