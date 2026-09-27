@@ -419,8 +419,18 @@ and has been removed, per the owner's instruction; items 1-3 are carried forward
 
 No uncommitted work is pending and no PR is open. **None of the three remaining items can be closed by an
 automated session** — each needs the owner, real fleet servers, or an elevated GitHub scope. Do not
-manufacture a substitute task: establish the state, then report which of the three the owner wants to move
-and what it needs from them.
+manufacture a substitute task.
+
+The single executable next action is therefore:
+
+```text
+Re-verify current state (`git fetch origin --prune`, `git rev-parse origin/developer`, GitHub
+issue #154 and #216), then ask the owner to select exactly one of items 1-3 below, and stop.
+Evidence-only / read-only. No repository modifications, no commit, no push.
+```
+
+Items 1-3 are the selection menu for that question, not a work queue to start on. Each line records what the
+item needs from the owner, so the question can be asked without re-deriving it:
 
 ```text
 1. B5 (fleet migration) has zero evidence of execution anywhere in the repository and requires real
