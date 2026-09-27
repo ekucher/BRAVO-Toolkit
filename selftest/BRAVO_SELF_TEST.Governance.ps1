@@ -1431,6 +1431,58 @@
         Remove-Item -LiteralPath $legacyReaderSelfReferenceFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 
+    # --- ReleaseGate/CutoverGateDetectsLegacyReaderCallCaseInsensitively ---
+    # Codex-знахідка (gate-review): PowerShell розв'язує імена команд
+    # регістронезалежно, тож інший регістр символів мусить так само
+    # провалювати гейт, а не пройти через ordinal-порівняння.
+    $legacyReaderCaseInsensitiveFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        $rogueCaseDir = Join-Path $legacyReaderCaseInsensitiveFixtureRoot 'modules\BRAVO.RogueCase'
+        [void][IO.Directory]::CreateDirectory($rogueCaseDir)
+        [IO.File]::WriteAllText(
+            (Join-Path $rogueCaseDir 'BRAVO.RogueCase.psm1'),
+            'function Invoke-RogueCase { import-bravolegacyprimaryconfiguration -ConfigPath X }',
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderCaseInsensitiveFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderCaseInsensitiveFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderCaseInsensitiveFixtureResult.Passed -and
+                @($legacyReaderCaseInsensitiveFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO.RogueCase.psm1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateDetectsLegacyReaderCallCaseInsensitively" `
+            -Failure "виклик легального PowerShell-імені іншим регістром символів (import-bravolegacyprimaryconfiguration) мусить так само провалювати гейт LEGACY_READER_ISOLATION, як і канонічний регістр"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderCaseInsensitiveFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGateScansAllRootEntryScriptsNotOnlyAutoexecList ---
+    # Codex-знахідка (gate-review): попередня версія сканувала лише 14
+    # AUTOEXEC-цілей (Get-BRAVOProductionEntryPointRelativePath), пропускаючи
+    # кореневі тонкі entrypoint-обгортки поза цим списком (напр.
+    # BRAVO_ARCHIV.ps1/BRAVO_HEALTH.ps1/BRAVO_MAINTENANCE.ps1/
+    # BRAVO_DATA_RESTORE.ps1/BRAVO_CONFIGURATOR.ps1). Тут фікстура НЕ передає
+    # цільовий файл через -ProductionEntryPointRelativePath взагалі — гейт
+    # мусить знайти його самостійно через власне сканування кореня.
+    $legacyReaderRootEntryFixtureRoot = New-BRAVOReleaseGateFixtureRoot -EntryPointText 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+    try {
+        [IO.File]::WriteAllText(
+            (Join-Path $legacyReaderRootEntryFixtureRoot 'BRAVO_HEALTH.ps1'),
+            "Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect`nRead-BRAVOLegacyPrimaryRawOverrides -ConfigPath X",
+            (New-Object Text.UTF8Encoding($false))
+        )
+        $legacyReaderRootEntryFixtureResult = Test-BRAVOConfigV2CutoverGates -Root $legacyReaderRootEntryFixtureRoot -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $legacyReaderRootEntryFixtureResult.Passed -and
+                @($legacyReaderRootEntryFixtureResult.Failures | Where-Object { $_.Contains('LEGACY_READER_ISOLATION') -and $_.Contains('BRAVO_HEALTH.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGateScansAllRootEntryScriptsNotOnlyAutoexecList" `
+            -Failure "кореневий BRAVO_*.ps1-скрипт поза списком AUTOEXEC-цілей, що напряму викликає Read-BRAVOLegacyPrimaryRawOverrides, мусить провалювати гейт LEGACY_READER_ISOLATION, навіть коли його немає в -ProductionEntryPointRelativePath"
+    } finally {
+        Remove-Item -LiteralPath $legacyReaderRootEntryFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
     # --- ReleaseGate/CutoverGateSharedByReleaseArtifactAndPRWorkflow ---
     # Той самий клас перевірки, що ConfigParity/DecisionLogicIsNotInlineYaml
     # вище: обидва споживачі мусять dot-source'ити ОДНУ канонічну
