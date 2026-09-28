@@ -35,13 +35,22 @@ function Get-BRAVOEffectiveConfigurationVariableName {
         Порядок імен збережено з тієї реалізації навмисно: він визначає
         порядок ключів у знімку, тобто й у файлах доказів, які оператор
         порівнюватиме побайтово.
+
+        operationsReportingSettings додано в 5.3.0 (BSYSTEM Operations) на
+        АЛФАВІТНЕ місце серед top-level блоків, а не в кінець переліку:
+        цей блок є повноцінною частиною ефективної конфігурації (Enabled,
+        ApiBaseUrl, ProductType, таймаут), і без нього
+        Compare-BRAVOConfigEffectiveSnapshot звітував би про еквівалентність
+        міграції, яка насправді загубила або змінила всю Operations-
+        конфігурацію — знімок просто не дивився б на неї.
     #>
     return @(
         'BravoConfigurationMetadata', 'BravoLocalConfigOverrideState',
         'ScriptVersion', 'ScriptDate', 'ScriptBuildId', 'archivePrefix',
         'backupConsistency', 'backupMonitoring', 'bravoSettings',
         'componentSettings', 'credentialSettings', 'discoverySettings',
-        'maintenanceSettings', 'pathSettings', 'restoreVerifySettings',
+        'maintenanceSettings', 'operationsReportingSettings',
+        'pathSettings', 'restoreVerifySettings',
         'runtimeRoot', 'schedulerSettings', 'sftpDirectories',
         'storageEffective', 'toolIntegritySettings', 'LogLevel',
         'archiveFileFilter', 'archiveParams', 'archiveRetentionDays',

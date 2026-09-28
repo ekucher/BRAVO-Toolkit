@@ -39,7 +39,8 @@ function Write-BRAVOLog {
         [string]$Component = 'GENERAL',
         [switch]$Console,
         [switch]$NoConsole,
-        [switch]$Environmental
+        [switch]$Environmental,
+        [switch]$Secondary
     )
 }
 '@

@@ -1676,11 +1676,23 @@
         -Name "Authorization/RegistryCoversEveryCanonicalLeaf" `
         -Failure "авторизаційний реєстр мусить мати рівно один запис на кожен канонічний лист: відсутні=$($authMissingLeaves.Count) ($([string]::Join(', ', $authMissingLeaves))), осиротілі=$($authOrphanEntries.Count) ($([string]::Join(', ', $authOrphanEntries)))"
 
-    # --- Authorization/Exactly271CanonicalLeaves ---
+    # --- Authorization/Exactly277CanonicalLeaves ---
+    # 271 -> 277 (BSYSTEM Operations, 5.3.0). Це НЕ мовчазне підняття
+    # очікуваного числа під фактичний результат: додано рівно шість НОВИХ
+    # канонічних листів однією фічею, і кожен отримав ЯВНИЙ запис у
+    # авторизаційному реєстрі (див. BRAVO.Configuration.Schema.psm1):
+    #   credentialSettings.Targets.OperationsApiKey            ALLOW_SITE
+    #   credentialSettings.Targets.OperationsBootstrapSecret   ALLOW_SITE
+    #   operationsReportingSettings.Enabled                    ALLOW_SITE
+    #   operationsReportingSettings.ApiBaseUrl                 ALLOW_WITH_VALIDATOR (OptionalUrl:https)
+    #   operationsReportingSettings.ProductType                ALLOW_WITH_VALIDATOR (Enum:LIMS,VETOFFICE)
+    #   operationsReportingSettings.RequestTimeoutSeconds      ALLOW_WITH_VALIDATOR (IntegerRange:1,600)
+    # Жоден НАЯВНИЙ лист не змінив класу — саме тому дельта класів нижче
+    # рівно +3 ALLOW_SITE і +3 ALLOW_WITH_VALIDATOR, а не перерозподіл.
     Test-BRAVOCondition `
-        -Condition ($authLeaves.Count -eq 271) `
-        -Name "Authorization/Exactly271CanonicalLeaves" `
-        -Failure "WAVE2-CONTRACT.md фіксує рівно 271 канонічний лист; фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
+        -Condition ($authLeaves.Count -eq 277) `
+        -Name "Authorization/Exactly277CanonicalLeaves" `
+        -Failure "контракт фіксує рівно 277 канонічних листів (271 Wave 2 + 6 BSYSTEM Operations 5.3.0); фактично отримано $($authLeaves.Count) — контракт і схема розійшлися, потребує повторного узгодження, а не мовчазної зміни очікуваного числа"
 
     # --- Authorization/AllClassesRecognized ---
     $authUnrecognizedClasses = @(@($authRegistry.Values) | ForEach-Object { [string]$_.Class } | Where-Object { $authKnownClasses -notcontains $_ } | Select-Object -Unique)
@@ -1716,15 +1728,20 @@
     # $SftpDirectories['BAZA']/['BAZAWWW'] as-is, без обчислення). ALLOW_SITE
     # 200->202, DENY_DERIVED 2->0, TOTAL лишається 271, решта класів
     # незмінні.
+    #
+    # BSYSTEM Operations (5.3.0): +3 ALLOW_SITE (202->205) і
+    # +3 ALLOW_WITH_VALIDATOR (25->28), TOTAL 271->277. Перелік цих шести
+    # листів і клас кожного — у коментарі до Exactly277CanonicalLeaves
+    # вище; жоден наявний лист класу не змінив.
     Test-BRAVOCondition `
         -Condition (
-            $authAllowSiteCount -eq 202 -and $authAllowValidatorCount -eq 25 -and
+            $authAllowSiteCount -eq 205 -and $authAllowValidatorCount -eq 28 -and
             $authDenyDerivedCount -eq 0 -and $authDenyCredentialCount -eq 0 -and
             $authDenySecurityCount -eq 6 -and $authDenyExecutionCount -eq 21 -and
             $authDenyInternalCount -eq 17
         ) `
         -Name "Authorization/ClassCountsMatchContract" `
-        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(202) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(25) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
+        -Failure "class counts мусять точно збігатись з WAVE2-CONTRACT.md (з урахуванням N3-корекції sftpDirectories.BAZA/BAZAWWW): ALLOW_SITE=$authAllowSiteCount(205) ALLOW_WITH_VALIDATOR=$authAllowValidatorCount(28) DENY_DERIVED=$authDenyDerivedCount(0) DENY_CREDENTIAL_BACKED=$authDenyCredentialCount(0) DENY_SECURITY_CONTROL=$authDenySecurityCount(6) DENY_EXECUTION_CONTROL=$authDenyExecutionCount(21) DENY_INTERNAL_METADATA=$authDenyInternalCount(17)"
 
     # --- Authorization/EveryValidatorIdentifierResolves ---
     # Кожен ALLOW_WITH_VALIDATOR-запис мусить посилатись на валідатор,
@@ -1745,6 +1762,12 @@
             $authProbeValue = 65001
         } elseif ($authValidatorId -eq 'DotNetEncodingName') {
             $authProbeValue = 'UTF8'
+        } elseif ($authValidatorId.StartsWith('OptionalUrl:')) {
+            # Непорожнє правдоподібне значення навмисно (а не ''): порожнє
+            # валідатор приймає беззастережно, тож probe на '' не довів би,
+            # що ідентифікатор диспетчерується, а не тихо провалюється в
+            # default-гілку.
+            $authProbeValue = ('{0}://example.invalid/api' -f ($authValidatorId.Substring(12) -split ',')[0])
         } elseif ($authValidatorId.StartsWith('UrlArray:')) {
             $authProbeValue = @('https://example.invalid/ip')
         } elseif ($authValidatorId -eq 'TaskSchedulerPath') {

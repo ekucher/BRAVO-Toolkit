@@ -122,6 +122,41 @@ function Resolve-BRAVOExitCode {
     return 0
 }
 
+function Get-BRAVOExitCodeSeverity {
+    <#
+        Канонічне відображення коду завершення BRAVO на severity звітності
+        (SUCCESS | WARNING | ERROR | CRITICAL — рівно набір, який приймає
+        Send-BRAVOOperationsEvent).
+
+        Живе ТУТ, а не в кожному runtime, з тієї самої причини, що й сама
+        таблиця кодів: цей модуль володіє контрактом кодів і їхньою
+        ІНТЕРПРЕТАЦІЄЮ. Три runtime (Archive/Health/Maintenance) інакше
+        тримали б три копії одного switch-а, які розійшлися б при кожному
+        новому коді.
+
+        Причина появи (review PR #225): Archive виводив severity події лише
+        зі статусу generation, тому прогін зі статусом COMPLETE і фактично
+        резолвленим кодом 10 (SuccessWithWarnings) звітував у dashboard
+        SUCCESS — подія суперечила власному полю exitCode у своєму ж
+        payload.
+
+        CRITICAL зарезервовано за подіями безпеки/цілісності (32-35) і
+        HealthCritical (70): у dashboard вони мусять відрізнятись від
+        звичайної операційної відмови, бо вимагають реакції людини, а не
+        повторного прогону. 20 (SkippedLockBusy) — не відмова: інший
+        екземпляр уже працює, тому WARNING, а не ERROR.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param([Parameter(Mandatory = $true)][int]$Code)
+
+    if ($Code -eq 0) { return 'SUCCESS' }
+    if ($Code -eq 10) { return 'WARNING' }
+    if ($Code -eq 20) { return 'WARNING' }
+    if ($Code -eq 32 -or $Code -eq 33 -or $Code -eq 34 -or $Code -eq 35 -or $Code -eq 70) { return 'CRITICAL' }
+    return 'ERROR'
+}
+
 function Get-BRAVOExitCodeName {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][int]$Code)
@@ -134,5 +169,6 @@ function Get-BRAVOExitCodeName {
 
 Export-ModuleMember -Function @(
     'Resolve-BRAVOExitCode',
-    'Get-BRAVOExitCodeName'
+    'Get-BRAVOExitCodeName',
+    'Get-BRAVOExitCodeSeverity'
 )

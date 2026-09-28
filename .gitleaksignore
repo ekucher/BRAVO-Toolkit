@@ -108,3 +108,20 @@
 # false positive надалі; цей запис ігнорує лише історичну знахідку в уже
 # опублікованому коміті b8a3b6d, без rebase/force-push.
 b8a3b6d0a2ccc1417b6c151395827225206159b8:.claude/hooks/tests/Test-Redact.ps1:generic-api-key:54
+
+# PR #225 (BSYSTEM Operations enrollment protocol v2), коміт 21d44020:
+# ізольований self-test enrollment-циклу в
+# selftest/BRAVO_SELF_TEST.Operations.ps1 — HTTP-фікстура черги мок-
+# відповідей Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status =
+# 'pending'; claimToken = 'claim_abc123' } (і сусідній 'claim_xyz789').
+# Значення — синтетичний літерал тестової фікстури, що симулює
+# claimToken-поле у відповіді 202 POST /enroll; реальний мережевий виклик
+# чи Credential Manager тут не задіяні (весь HTTP-шар замокано модульним
+# $global:BRAVOOpsSelfTestHttpQueue). Слово "claim" + мішаний
+# alnum-суфікс поруч зі значенням збігається з entropy-евристикою
+# generic-api-key. Наступний комміт baba701 (той самий PR) прибрав
+# claimToken із тіла 202-відповіді взагалі (протокол більше не передає
+# claim у тілі) — рядок 407 у поточному working tree вже не існує; цей
+# запис ігнорує лише історичну знахідку в уже опублікованому коміті
+# 21d44020, без rebase/force-push.
+21d44020da56800c60e752229aab4b291f10316f:selftest/BRAVO_SELF_TEST.Operations.ps1:generic-api-key:407

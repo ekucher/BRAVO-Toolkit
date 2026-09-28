@@ -496,6 +496,29 @@ $knownIntentionalDiffPrefixes = @(
     'maintenanceSettings.Retention.RawSourceGraceDays',
     'sftpDirectories.ArchivLog',
     'sftpDirectories.MaintenanceLog',
+    # BSYSTEM Operations (5.3.0), коміт 021fdbf — нові credential-target
+    # ключі bootstrap-секрету self-enrollment і виданого API-ключа.
+    # У BEFORE (42cf9ad) секції credentialSettings.Targets / legacy
+    # дзеркала backupMonitoring.NotificationCredentialTargets не існує
+    # взагалі (звідси BEFORE=<null>) — це ріст схеми на лінії розробки,
+    # не зміна наявної поведінки. Записи в Credential Manager створює
+    # BRAVO_CREDENTIALS_SETUP.ps1 лише коли оператор явно вмикає
+    # operationsReportingSettings.Enabled на цьому сервері.
+    'credentialSettings.Targets.OperationsApiKey',
+    'credentialSettings.Targets.OperationsBootstrapSecret',
+    'backupMonitoring.NotificationCredentialTargets.OperationsApiKey',
+    'backupMonitoring.NotificationCredentialTargets.OperationsBootstrapSecret',
+    # BSYSTEM Operations (5.3.0) — новий top-level блок конфігурації.
+    # Увійшов у канонічний перелік Get-BRAVOEffectiveConfigurationVariableName,
+    # тому знімок його тепер захоплює по обидва боки; у BEFORE (42cf9ad)
+    # блоку не існує взагалі (BEFORE=<null>). Перелічено ПОІМЕННО, за тим
+    # самим правилом, що й адитивні ключі вище: загальний префікс
+    # 'operationsReportingSettings' приховав би майбутню зміну наявного
+    # поля цього блоку.
+    'operationsReportingSettings.ApiBaseUrl',
+    'operationsReportingSettings.Enabled',
+    'operationsReportingSettings.ProductType',
+    'operationsReportingSettings.RequestTimeoutSeconds',
     # Секція 5, задокументований canonical-default фікс (перевірено
     # окремим self-test ConfigLoader/CommittedBravoConfigMatchesCanonicalDefaults):
     # "E:\Archiv" (застарілий placeholder BRAVO.config) -> "" (canonical).

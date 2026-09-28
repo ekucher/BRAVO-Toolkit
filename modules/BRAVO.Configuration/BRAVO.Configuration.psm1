@@ -118,6 +118,8 @@ function Get-BRAVODefaultConfiguration {
                 InstitutionName = "BRAVO_INSTITUTION_NAME"
                 InstitutionCode = "BRAVO_INSTITUTION_CODE"
                 ArchivePrefix = "BRAVO_ARCHIVE_PREFIX"
+                OperationsBootstrapSecret = "BRAVO_OPERATIONS_BOOTSTRAP_SECRET"
+                OperationsApiKey = "BRAVO_OPERATIONS_API_KEY"
             }
         }
 
@@ -480,6 +482,21 @@ function Get-BRAVODefaultConfiguration {
         restoreVerifySettings = @{
             MinimumFileCount = 1
             MaxVerificationAgeHours = 216
+        }
+
+        # BSYSTEM Operations (fleet-моніторинг флоту, dashboard замість
+        # ручного аналізу Discord) — Enabled=$false є БЕЗПЕЧНИМ дефолтом:
+        # відправка подій в Operations вмикається явно оператором на
+        # кожному сервері окремо (opt-in ролаут), а не мовчки для всього
+        # вже розгорнутого флоту. ApiBaseUrl порожній, доки не вказаний.
+        operationsReportingSettings = @{
+            Enabled = $false
+            ApiBaseUrl = ""
+            RequestTimeoutSeconds = 30
+            # HeartbeatIntervalMinutes видалено з дефолтів (PR #225,
+            # thread 7) — ключ ніколи не читався жодним рантайм-споживачем;
+            # див. коментар у канонічному BRAVO.config.
+            ProductType = "LIMS"
         }
 
         # #158 (етап 4): discoverySettings — повноцінний raw-блок, а не

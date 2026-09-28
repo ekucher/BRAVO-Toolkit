@@ -25,7 +25,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -654,63 +654,88 @@ function Send-ToolIntegrityAlert {
     # інших "тихих" режимів: це подія безпеки, а не рутинний статус
     # backup. Єдине, що її придушує, — явно вимкнені сповіщення
     # (-NoSlack / notificationMode = none) або ненастроєний webhook.
+    #
+    # Гейт нотифікації (NoSlack/notificationMode=none/route=none/
+    # webhook не налаштовано) раніше завершував функцію через `return`
+    # ДО Operations-події внизу — dashboard мовчки не бачив CRITICAL-подію
+    # про порушення цілісності лише тому, що Slack/Discord вимкнено на
+    # цьому сервері (review finding). Тепер нотифікаційний блок НЕ
+    # використовує ранній `return`: він або надсилає сповіщення, або лише
+    # логує причину недоставки, а Operations-подія внизу виконується
+    # завжди незалежно від результату.
     if ($NoSlack -or $script:notificationMode -eq "none") {
         Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: сповіщення вимкнено параметрами запуску або конфігурацією" -Level "WARNING"
-        return
-    }
-    # Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
-    # централізований API BRAVO.Notifications; Archive сам канал не обирає.
-    $notificationRoute = Resolve-BRAVONotificationRoute `
-        -Severity "CRITICAL" `
-        -NotificationMode $script:notificationMode `
-        -RoutingTable $backupMonitoring.NotificationRouting
-    if ($notificationRoute -eq "none") {
-        Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: сповіщення вимкнено параметрами запуску або конфігурацією" -Level "WARNING"
-        return
-    }
-    try {
-        $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
-            -Provider $script:notificationProvider `
-            -Route $notificationRoute `
-            -CredentialTargets $backupMonitoring.NotificationCredentialTargets
-    } catch {
-        Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: webhook не налаштовано" -Level "WARNING"
-        return
-    }
-
-    try {
-        $hostInformation = Get-HostInformation
-        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
-            "невідома"
-        } else {
-            [string]$ScriptBuildId
-        }
-        $alertText = New-BRAVOOperatorNotificationMessage `
+    } else {
+        # Маршрутизація (GENERAL/ALERTS) і резолв webhook — виключно через
+        # централізований API BRAVO.Notifications; Archive сам канал не обирає.
+        $notificationRoute = Resolve-BRAVONotificationRoute `
             -Severity "CRITICAL" `
-            -Operation "BRAVO — ПОРУШЕНО ЦІЛІСНІСТЬ КОМПЛЕКТУ" `
-            -ActionText "не запускати backup вручну; перевірити RUNTIME_MANIFEST/TOOLS_MANIFEST та походження змінених файлів." `
-            -ReasonLines @([string]$Result.Message) `
-            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
-            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-            -HostInformation $hostInformation `
-            -ResultLines @("Архівацію не виконано (код завершення 32).") `
-            -Timestamp (Get-Date) `
-            -ProductName "BRAVO Archive" `
-            -Version ([string]$global:ScriptVersion) `
-            -BuildId $archiveBuildIdText `
-            -LogPath ([string]$script:logFile) `
-            -LogLabel "Журнал"
+            -NotificationMode $script:notificationMode `
+            -RoutingTable $backupMonitoring.NotificationRouting
+        if ($notificationRoute -eq "none") {
+            Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: сповіщення вимкнено параметрами запуску або конфігурацією" -Level "WARNING"
+        } else {
+            $notificationWebhookUrl = $null
+            try {
+                $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
+                    -Provider $script:notificationProvider `
+                    -Route $notificationRoute `
+                    -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+            } catch {
+                Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів не відправлено: webhook не налаштовано" -Level "WARNING"
+            }
 
-        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
-        Send-BRAVONotificationChunks `
-            -Provider $script:notificationProvider `
-            -WebhookUrl $notificationWebhookUrl `
-            -MessageChunks $outboundMessages `
-            -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-        Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів відправлено у $($script:notificationProviderDisplayName)" -Level "SUCCESS"
-    } catch {
-        # Неможливість сповістити не змінює рішення блокувати запуск.
-        Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити критичне сповіщення про цілісність інструментів: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
+            if ($notificationWebhookUrl) {
+                try {
+                    $hostInformation = Get-HostInformation
+                    $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+                        "невідома"
+                    } else {
+                        [string]$ScriptBuildId
+                    }
+                    $alertText = New-BRAVOOperatorNotificationMessage `
+                        -Severity "CRITICAL" `
+                        -Operation "BRAVO — ПОРУШЕНО ЦІЛІСНІСТЬ КОМПЛЕКТУ" `
+                        -ActionText "не запускати backup вручну; перевірити RUNTIME_MANIFEST/TOOLS_MANIFEST та походження змінених файлів." `
+                        -ReasonLines @([string]$Result.Message) `
+                        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+                        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                        -HostInformation $hostInformation `
+                        -ResultLines @("Архівацію не виконано (код завершення 32).") `
+                        -Timestamp (Get-Date) `
+                        -ProductName "BRAVO Archive" `
+                        -Version ([string]$global:ScriptVersion) `
+                        -BuildId $archiveBuildIdText `
+                        -LogPath ([string]$script:logFile) `
+                        -LogLabel "Журнал"
+
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    Send-BRAVONotificationChunks `
+                        -Provider $script:notificationProvider `
+                        -WebhookUrl $notificationWebhookUrl `
+                        -MessageChunks $outboundMessages `
+                        -TimeoutSeconds $script:notificationRequestTimeoutSeconds
+                    Write-BRAVOLog -Component 'STARTUP' -Message "Критичне сповіщення про цілісність інструментів відправлено у $($script:notificationProviderDisplayName)" -Level "SUCCESS"
+                } catch {
+                    # Неможливість сповістити не змінює рішення блокувати запуск.
+                    Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити критичне сповіщення про цілісність інструментів: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
+                }
+            }
+        }
+    }
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity 'CRITICAL' `
+                -Component 'Archive' `
+                -Message "Порушено цілісність комплекту: $([string]$Result.Message)"
+        } catch {
+            Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити подію в Operations: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "WARNING"
+        }
     }
 }
 
@@ -720,90 +745,111 @@ function Send-BRAVOArchiveFreeSpaceAlert {
         [Parameter(Mandatory = $true)][double]$MinimumFreeSpaceGB
     )
 
+    # Гейт нотифікації нижче раніше завершував функцію через `return` ДО
+    # Operations-події внизу (той самий review finding, що для
+    # Send-ToolIntegrityAlert) — тепер лише логує причину недоставки
+    # сповіщення й не блокує Operations-подію.
     if ($NoSlack -or $script:notificationMode -eq 'none') {
         Write-BRAVOLog -Component 'STARTUP' -Message (
             'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
             'сповіщення вимкнено параметрами запуску або конфігурацією'
         ) -Level 'WARNING'
-        return
-    }
-    $notificationRoute = Resolve-BRAVONotificationRoute `
-        -Severity 'CRITICAL' `
-        -NotificationMode $script:notificationMode `
-        -RoutingTable $backupMonitoring.NotificationRouting
-    if ($notificationRoute -eq 'none') {
-        Write-BRAVOLog -Component 'STARTUP' -Message (
-            'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
-            'сповіщення вимкнено параметрами запуску або конфігурацією'
-        ) -Level 'WARNING'
-        return
-    }
-    try {
-        $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
-            -Provider $script:notificationProvider `
-            -Route $notificationRoute `
-            -CredentialTargets $backupMonitoring.NotificationCredentialTargets
-    } catch {
-        Write-BRAVOLog -Component 'STARTUP' -Message (
-            'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
-            "webhook для $($script:notificationProviderDisplayName) не налаштовано"
-        ) -Level 'WARNING'
-        return
-    }
-
-    try {
-        $hostInformation = Get-HostInformation
-        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
-            'невідома'
-        } else {
-            [string]$ScriptBuildId
-        }
-        $reasonLines = @(
-            @($Result.Problems) |
-                ForEach-Object { ":x: $([string]$_)" }
-        )
-        $driveLines = @(
-            @($Result.DriveStatus) |
-                ForEach-Object {
-                    ':floppy_disk: {0}: {1} GB вільно з {2} GB' -f `
-                        ([string]$_.Drive).TrimEnd(':'), $_.FreeSpaceGB, $_.TotalSpaceGB
-                }
-        )
-        $alertText = New-BRAVOOperatorNotificationMessage `
+    } else {
+        $notificationRoute = Resolve-BRAVONotificationRoute `
             -Severity 'CRITICAL' `
-            -Operation 'BRAVO ARCHIVE — НЕДОСТАТНЬО ВІЛЬНОГО МІСЦЯ' `
-            -ActionText 'звільнити місце на проблемному диску та повторити запуск архівації.' `
-            -ReasonLines $reasonLines `
-            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
-            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-            -HostInformation $hostInformation `
-            -ResultLines (@(
-                    'Архівацію не розпочато (код завершення 40).',
-                    "Порогове значення: $MinimumFreeSpaceGB GB на кожному локальному Fixed-диску"
-                ) + $driveLines) `
-            -Timestamp (Get-Date) `
-            -ProductName 'BRAVO Archive' `
-            -Version ([string]$global:ScriptVersion) `
-            -BuildId $archiveBuildIdText `
-            -LogPath ([string]$script:logFile) `
-            -LogLabel 'Журнал'
+            -NotificationMode $script:notificationMode `
+            -RoutingTable $backupMonitoring.NotificationRouting
+        if ($notificationRoute -eq 'none') {
+            Write-BRAVOLog -Component 'STARTUP' -Message (
+                'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
+                'сповіщення вимкнено параметрами запуску або конфігурацією'
+            ) -Level 'WARNING'
+        } else {
+            $notificationWebhookUrl = $null
+            try {
+                $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
+                    -Provider $script:notificationProvider `
+                    -Route $notificationRoute `
+                    -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+            } catch {
+                Write-BRAVOLog -Component 'STARTUP' -Message (
+                    'Критичне сповіщення про нестачу вільного місця не відправлено: ' +
+                    "webhook для $($script:notificationProviderDisplayName) не налаштовано"
+                ) -Level 'WARNING'
+            }
 
-        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
-        Send-BRAVONotificationChunks `
-            -Provider $script:notificationProvider `
-            -WebhookUrl $notificationWebhookUrl `
-            -MessageChunks $outboundMessages `
-            -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-        Write-BRAVOLog -Component 'STARTUP' -Message (
-            "Критичне повідомлення (помилки місця) відправлено в " +
-            $script:notificationProviderDisplayName
-        ) -Level 'SUCCESS'
-    } catch {
-        # Сповіщення є вторинним каналом: його збій не змінює primary exit 40.
-        Write-BRAVOLog -Component 'STARTUP' -Message (
-            'Не вдалося відправити критичне сповіщення про нестачу вільного місця: ' +
-            (Protect-BRAVOLogSecret -Text $_.Exception.Message)
-        ) -Level 'ERROR'
+            if ($notificationWebhookUrl) {
+                try {
+                    $hostInformation = Get-HostInformation
+                    $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+                        'невідома'
+                    } else {
+                        [string]$ScriptBuildId
+                    }
+                    $reasonLines = @(
+                        @($Result.Problems) |
+                            ForEach-Object { ":x: $([string]$_)" }
+                    )
+                    $driveLines = @(
+                        @($Result.DriveStatus) |
+                            ForEach-Object {
+                                ':floppy_disk: {0}: {1} GB вільно з {2} GB' -f `
+                                    ([string]$_.Drive).TrimEnd(':'), $_.FreeSpaceGB, $_.TotalSpaceGB
+                            }
+                    )
+                    $alertText = New-BRAVOOperatorNotificationMessage `
+                        -Severity 'CRITICAL' `
+                        -Operation 'BRAVO ARCHIVE — НЕДОСТАТНЬО ВІЛЬНОГО МІСЦЯ' `
+                        -ActionText 'звільнити місце на проблемному диску та повторити запуск архівації.' `
+                        -ReasonLines $reasonLines `
+                        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+                        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                        -HostInformation $hostInformation `
+                        -ResultLines (@(
+                                'Архівацію не розпочато (код завершення 40).',
+                                "Порогове значення: $MinimumFreeSpaceGB GB на кожному локальному Fixed-диску"
+                            ) + $driveLines) `
+                        -Timestamp (Get-Date) `
+                        -ProductName 'BRAVO Archive' `
+                        -Version ([string]$global:ScriptVersion) `
+                        -BuildId $archiveBuildIdText `
+                        -LogPath ([string]$script:logFile) `
+                        -LogLabel 'Журнал'
+
+                    $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $alertText
+                    Send-BRAVONotificationChunks `
+                        -Provider $script:notificationProvider `
+                        -WebhookUrl $notificationWebhookUrl `
+                        -MessageChunks $outboundMessages `
+                        -TimeoutSeconds $script:notificationRequestTimeoutSeconds
+                    Write-BRAVOLog -Component 'STARTUP' -Message (
+                        "Критичне повідомлення (помилки місця) відправлено в " +
+                        $script:notificationProviderDisplayName
+                    ) -Level 'SUCCESS'
+                } catch {
+                    # Сповіщення є вторинним каналом: його збій не змінює primary exit 40.
+                    Write-BRAVOLog -Component 'STARTUP' -Message (
+                        'Не вдалося відправити критичне сповіщення про нестачу вільного місця: ' +
+                        (Protect-BRAVOLogSecret -Text $_.Exception.Message)
+                    ) -Level 'ERROR'
+                }
+            }
+        }
+    }
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity 'CRITICAL' `
+                -Component 'Archive' `
+                -Message 'Недостатньо вільного місця для архівації' `
+                -Details @{ minimumFreeSpaceGB = $MinimumFreeSpaceGB; problems = @($Result.Problems) }
+        } catch {
+            Write-BRAVOLog -Component 'STARTUP' -Message "Не вдалося відправити подію в Operations: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "WARNING"
+        }
     }
 }
 
@@ -1043,6 +1089,12 @@ function Show-ItemProgress {
 $script:BRAVOStepCurrent = 0
 $script:BRAVOStepTotal = 0
 
+# Накопичує кожен Write-BRAVOArchiveStep за весь прогін скрипта (НЕ
+# скидається у Initialize-BRAVOArchiveSteps — той викликається кілька разів
+# за один прогін для різних фаз, а зведена Operations-подія генерації
+# (нижче, після фіналізації generation) має бачити етапи з усіх фаз).
+$script:BRAVOArchiveStepHistory = New-Object System.Collections.Generic.List[object]
+
 function Initialize-BRAVOArchiveSteps {
     param([Parameter(Mandatory = $true)][int]$Total)
 
@@ -1067,6 +1119,13 @@ function Write-BRAVOArchiveStep {
         -Status $Status `
         -Details $Details `
         -Duration $Duration
+
+    $script:BRAVOArchiveStepHistory.Add([ordered]@{
+        name = $Name
+        status = $Status
+        details = $Details
+        durationMs = if ($null -ne $Duration) { [Math]::Round($Duration.TotalMilliseconds) } else { $null }
+    })
 }
 
 function Show-RunningProgress {
@@ -4485,117 +4544,152 @@ function Send-BAZAIncompatibleNameAlert {
         [string]$ComponentName = "BAZA"
     )
 
+    # Гейт нотифікації нижче раніше завершував функцію через `return` ДО
+    # Operations-події внизу (той самий review finding, що для
+    # Send-ToolIntegrityAlert/Send-BRAVOArchiveFreeSpaceAlert). Замінено на
+    # $notificationWebhookUrl = $null як сигнал "сповіщення пропущено", щоб
+    # решта функції (побудова повідомлення й Operations-подія) виконувалась
+    # незалежно від стану нотифікаційного гейту.
+    $notificationWebhookUrl = $null
     if ($NoSlack -or $script:notificationMode -eq "none") {
         Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про несумісні імена $ComponentName вимкнено параметрами запуску або конфігурацією" -Level "INFO"
-        return
-    }
-    $notificationRoute = Resolve-BRAVONotificationRoute `
-        -Severity "WARNING" `
-        -NotificationMode $script:notificationMode `
-        -RoutingTable $backupMonitoring.NotificationRouting
-    if ($notificationRoute -eq "none") {
-        Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про несумісні імена $ComponentName вимкнено параметрами запуску або конфігурацією" -Level "INFO"
-        return
-    }
-    try {
-        $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
-            -Provider $script:notificationProvider `
-            -Route $notificationRoute `
-            -CredentialTargets $backupMonitoring.NotificationCredentialTargets
-    } catch {
-        Write-BRAVOLog -Component 'SFTP' -Message (
-            "Сповіщення про несумісні імена $ComponentName не відправлено: " +
-            "webhook для $($script:notificationProviderDisplayName) не налаштовано"
-        ) -Level "INFO"
-        return
-    }
-
-    $examples = @(
-        $Issues |
-            Select-Object -First 3 |
-            ForEach-Object {
-                $displayName = [string]$_.Name
-                if ($displayName.Length -gt 120) {
-                    $displayName = $displayName.Substring(0, 117) + "..."
-                }
-
-                # The health formatter lives in a different function scope.
-                # Keep this standalone mode self-contained and only apply
-                # Markdown escaping when the selected provider is Discord.
-                if ($script:notificationProvider -eq "discord") {
-                    $displayName = $displayName.Replace("\", "\\")
-                    $displayName = $displayName.Replace("*", "\*")
-                    $displayName = $displayName.Replace("_", "\_")
-                    $displayName = $displayName.Replace("~", "\~")
-                    $displayName = $displayName.Replace("|", "\|")
-                    $displayName = $displayName.Replace(">", "\>")
-                }
-                $overflowBytes = [int]$_.Utf8ByteCount - [int]$_.MaximumUtf8Bytes
-                ":x: $($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) байт · перевищення +$overflowBytes байт`n$displayName"
-            }
-    )
-    $exampleLines = New-Object System.Collections.Generic.List[string]
-    if ($examples.Count -gt 0) {
-        $exampleLines.Add("Приклади:")
-        $exampleLines.Add("")
-        foreach ($example in $examples) {
-            $exampleLines.Add([string]$example)
-            $exampleLines.Add("")
-        }
-    }
-    $hostInformation = Get-HostInformation
-    $notificationTime = Get-Date
-    $archiveVersionText = [string]$global:ScriptVersion
-    $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
-        "невідома"
     } else {
-        [string]$ScriptBuildId
-    }
-    $logFilePath = if (-not [string]::IsNullOrWhiteSpace([string]$script:logFile)) {
-        [string]$script:logFile
-    } else {
-        "журнал BRAVO_ARCHIV"
-    }
-    $fileCountText = Format-BRAVOUkrainianCount -Count $Issues.Count -One "файл" -Few "файли" -Many "файлів"
-    $fileCountHeaderText = $fileCountText.ToUpperInvariant()
-    $resultLines = @(
-        "Причина:",
-        "Назви $fileCountText перевищують допустиму довжину для передачі через SFTP.",
-        "Проблемні файли пропущено; інші файли синхронізуються штатно.",
-        "",
-        "Ліміт: $($Issues[0].MaximumUtf8Bytes) UTF-8 байт",
-        "Проблемних файлів: $($Issues.Count)"
-    ) + $exampleLines.ToArray()
-    $message = New-BRAVOOperatorNotificationMessage `
-        -Severity "WARNING" `
-        -Operation "$ComponentName — $fileCountHeaderText НЕ СИНХРОНІЗОВАНО" `
-        -ActionText "скоротити назви зазначених файлів." `
-        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
-        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-        -HostInformation $hostInformation `
-        -ResultLines $resultLines `
-        -Timestamp $notificationTime `
-        -ProductName "BRAVO Archive" `
-        -Version $archiveVersionText `
-        -BuildId $archiveBuildIdText `
-        -LogPath $logFilePath `
-        -LogLabel "Повний перелік"
-
-    try {
-        $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
-        Send-BRAVONotificationChunks `
-            -Provider $script:notificationProvider `
-            -WebhookUrl $notificationWebhookUrl `
-            -MessageChunks $outboundMessages `
-            -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-        $chunkText = if ($outboundMessages.Count -gt 1) {
-            " частинами: $($outboundMessages.Count)"
+        $notificationRoute = Resolve-BRAVONotificationRoute `
+            -Severity "WARNING" `
+            -NotificationMode $script:notificationMode `
+            -RoutingTable $backupMonitoring.NotificationRouting
+        if ($notificationRoute -eq "none") {
+            Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про несумісні імена $ComponentName вимкнено параметрами запуску або конфігурацією" -Level "INFO"
         } else {
-            ""
+            try {
+                $notificationWebhookUrl = Resolve-BRAVONotificationEndpoint `
+                    -Provider $script:notificationProvider `
+                    -Route $notificationRoute `
+                    -CredentialTargets $backupMonitoring.NotificationCredentialTargets
+            } catch {
+                Write-BRAVOLog -Component 'SFTP' -Message (
+                    "Сповіщення про несумісні імена $ComponentName не відправлено: " +
+                    "webhook для $($script:notificationProviderDisplayName) не налаштовано"
+                ) -Level "INFO"
+            }
         }
-        Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про $($Issues.Count) несумісних імен $ComponentName відправлено у $($script:notificationProviderDisplayName)$chunkText" -Level "SUCCESS"
-    } catch {
-        Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
+    }
+
+    # Review finding (thread 20, rendering cost when the channel is off):
+    # гейт нотифікації тепер стоїть ПЕРЕД побудовою повідомлення, а не
+    # після неї — так само, як у Send-ToolIntegrityAlert і
+    # Send-BRAVOArchiveFreeSpaceAlert. Раніше заміна ранніх `return` на
+    # $notificationWebhookUrl = $null лишила всю побудову безумовною, тож
+    # при -NoSlack / NotificationMode=none / відсутньому маршруті чи
+    # webhook (і навіть при ВИМКНЕНІЙ Operations-звітності) виконувався
+    # Get-HostInformation, який без теплого кешу робить зовнішній
+    # публічний IP-запит із 5-секундним таймаутом — Archive платив
+    # затримкою й робив несподіваний зовнішній запит виключно щоб
+    # сформувати текст, який ніколи не буде надіслано. Operations-подія
+    # нижче лишається ПОЗА цим гейтом (їй потрібні лише $Issues).
+    if ($notificationWebhookUrl) {
+        $examples = @(
+            $Issues |
+                Select-Object -First 3 |
+                ForEach-Object {
+                    $displayName = [string]$_.Name
+                    if ($displayName.Length -gt 120) {
+                        $displayName = $displayName.Substring(0, 117) + "..."
+                    }
+
+                    # The health formatter lives in a different function scope.
+                    # Keep this standalone mode self-contained and only apply
+                    # Markdown escaping when the selected provider is Discord.
+                    if ($script:notificationProvider -eq "discord") {
+                        $displayName = $displayName.Replace("\", "\\")
+                        $displayName = $displayName.Replace("*", "\*")
+                        $displayName = $displayName.Replace("_", "\_")
+                        $displayName = $displayName.Replace("~", "\~")
+                        $displayName = $displayName.Replace("|", "\|")
+                        $displayName = $displayName.Replace(">", "\>")
+                    }
+                    $overflowBytes = [int]$_.Utf8ByteCount - [int]$_.MaximumUtf8Bytes
+                    ":x: $($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) байт · перевищення +$overflowBytes байт`n$displayName"
+                }
+        )
+        $exampleLines = New-Object System.Collections.Generic.List[string]
+        if ($examples.Count -gt 0) {
+            $exampleLines.Add("Приклади:")
+            $exampleLines.Add("")
+            foreach ($example in $examples) {
+                $exampleLines.Add([string]$example)
+                $exampleLines.Add("")
+            }
+        }
+        $hostInformation = Get-HostInformation
+        $notificationTime = Get-Date
+        $archiveVersionText = [string]$global:ScriptVersion
+        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+            "невідома"
+        } else {
+            [string]$ScriptBuildId
+        }
+        $logFilePath = if (-not [string]::IsNullOrWhiteSpace([string]$script:logFile)) {
+            [string]$script:logFile
+        } else {
+            "журнал BRAVO_ARCHIV"
+        }
+        $fileCountText = Format-BRAVOUkrainianCount -Count $Issues.Count -One "файл" -Few "файли" -Many "файлів"
+        $fileCountHeaderText = $fileCountText.ToUpperInvariant()
+        $resultLines = @(
+            "Причина:",
+            "Назви $fileCountText перевищують допустиму довжину для передачі через SFTP.",
+            "Проблемні файли пропущено; інші файли синхронізуються штатно.",
+            "",
+            "Ліміт: $($Issues[0].MaximumUtf8Bytes) UTF-8 байт",
+            "Проблемних файлів: $($Issues.Count)"
+        ) + $exampleLines.ToArray()
+        $message = New-BRAVOOperatorNotificationMessage `
+            -Severity "WARNING" `
+            -Operation "$ComponentName — $fileCountHeaderText НЕ СИНХРОНІЗОВАНО" `
+            -ActionText "скоротити назви зазначених файлів." `
+            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -HostInformation $hostInformation `
+            -ResultLines $resultLines `
+            -Timestamp $notificationTime `
+            -ProductName "BRAVO Archive" `
+            -Version $archiveVersionText `
+            -BuildId $archiveBuildIdText `
+            -LogPath $logFilePath `
+            -LogLabel "Повний перелік"
+
+            try {
+                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
+                Send-BRAVONotificationChunks `
+                    -Provider $script:notificationProvider `
+                    -WebhookUrl $notificationWebhookUrl `
+                    -MessageChunks $outboundMessages `
+                    -TimeoutSeconds $script:notificationRequestTimeoutSeconds
+                $chunkText = if ($outboundMessages.Count -gt 1) {
+                    " частинами: $($outboundMessages.Count)"
+                } else {
+                    ""
+                }
+                Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про $($Issues.Count) несумісних імен $ComponentName відправлено у $($script:notificationProviderDisplayName)$chunkText" -Level "SUCCESS"
+            } catch {
+                Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
+            }
+    }
+
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity 'WARNING' `
+                -Component $ComponentName `
+                -Message "$($Issues.Count) файлів не синхронізовано через несумісні для SFTP імена" `
+                -Details @{ maximumUtf8Bytes = $Issues[0].MaximumUtf8Bytes; issueCount = $Issues.Count }
+        } catch {
+            Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити подію в Operations: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "WARNING"
+        }
     }
 }
 
@@ -7541,6 +7635,19 @@ function Main {
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
 
+    # Зведена Operations-подія на generation НЕ надсилається тут (review
+    # finding, thread 11): у цій точці відомий лише
+    # $script:backupGenerationStatus, а retention cleanup, SFTP/SMB-
+    # трансфер, post-backup health-check і фінальний запис маніфесту ще
+    # НЕ виконані — кожен із них може підняти $operationFailed і дати
+    # ненульовий код завершення. Подія, надіслана звідси, показувала б у
+    # dashboard SUCCESS для прогону, який фактично завершився помилкою, а
+    # її stages-список не містив би саме провалених фаз. Надсилання
+    # перенесено ПІСЛЯ резолюції $script:processExitCode — той самий
+    # канонічний патерн, що Send-BRAVOMaintenanceOperationsEvent
+    # (BRAVO.Maintenance.Runtime.ps1), який приймає вже обчислений
+    # ExitCode. Шукайте "Operations-подія generation" нижче.
+
     # dev.16: одна аггрегована unnumbered-операція "Очищення старих backup
     # generation" покриває обидва блоки нижче (generation retention, що
     # всередині Remove-BRAVOExpiredBackupGenerations також прибирає
@@ -8239,6 +8346,63 @@ function Main {
         $script:processExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
 
+    # Operations-подія generation — ОДНА зведена подія на прогін.
+    #
+    # Тут збирається лише КОНТЕКСТ (message + Details), а сама відправка
+    # виконується канонічною Send-BRAVOArchiveFinalOperationsEvent, яку
+    # викликає також finally нижче. Причина (review PR #225, P1 "Report
+    # Archive failures that bypass the end of Main"): цей блок лежить у
+    # ХВОСТІ Main, тому його обходили і зовнішній catch (exit code 90), і
+    # п'ять контрольованих ранніх return-ів Main (lock busy, збій
+    # прибирання orphan VSS, ручна синхронізація, preflight free-space) —
+    # прогін звітував про відмову і в процесі, і в локальному статус-файлі,
+    # а dashboard не бачив ЖОДНОЇ події. Це та сама причина, з якої
+    # вивантаження власного логу вже живе у finally, а не в хвості Main
+    # (той самий контракт, з тієї самої причини).
+    #
+    # Severity більше НЕ виводиться зі статусу generation: вона походить
+    # від фактично резолвленого $script:processExitCode через канонічну
+    # Get-BRAVOExitCodeSeverity (BRAVO.ExitCodes). Раніше generation
+    # COMPLETE з резолвленим кодом 10 (SuccessWithWarnings) звітував
+    # SUCCESS — подія суперечила власному полю exitCode у своєму ж payload.
+    # Побудова контексту — теж fail-soft (інваріант «телеметрія не змінює
+    # exit code»): збій тут не сміє перетворити успішний бекап у код 90
+    # через зовнішній catch. Сама відправка має власний try/catch
+    # усередині Send-BRAVOArchiveFinalOperationsEvent; на цьому кроці
+    # контекст лишається $null, і finally надішле мінімальну подію з
+    # фактичним кодом завершення — це краще за тишу.
+    try {
+        $generationEventOutcome = if ($operationFailed) {
+            if ($successCount -gt 0) { 'ЧАСТКОВО' } else { 'ПОМИЛКА' }
+        } else {
+            'УСПІШНО'
+        }
+        $script:archiveFinalOperationsEventContext = @{
+            Message = "Generation ${generationId}: $($script:backupGenerationStatus), прогін $generationEventOutcome (опубліковано $publishedComponentCount з $($enabledArchives.Count), код завершення $($script:processExitCode))"
+            Details = @{
+                generationId = $generationId
+                status = [string]$script:backupGenerationStatus
+                runOutcome = [string]$generationEventOutcome
+                publishedComponentCount = $publishedComponentCount
+                enabledComponentCount = $enabledArchives.Count
+                snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
+                durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
+                # .ToArray(), а НЕ @($script:BRAVOArchiveStepHistory): у Windows
+                # PowerShell 5.1 (і в PowerShell 7) загортання
+                # System.Collections.Generic.List[object] у @() кидає ArgumentException
+                # "Argument types do not match" — той самий задокументований гейт, що
+                # вже описаний біля $probeGroupList (BRAVO.Archive.Runtime.ps1) і
+                # $emptyDirs (BRAVO.Maintenance.Runtime.ps1). Спрацьовувало на кожному
+                # прогоні: подія в Operations не доходила взагалі.
+                stages = $script:BRAVOArchiveStepHistory.ToArray()
+            }
+        }
+    } catch {
+        $script:archiveFinalOperationsEventContext = $null
+        Write-Log "Не вдалося зібрати контекст фінальної події Operations: $($_.Exception.Message) — буде надіслано мінімальну подію" -Level "WARNING"
+    }
+    Send-BRAVOArchiveFinalOperationsEvent
+
     # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
     # ПІСЛЯ обчислення exit code, fail-soft — помилка запису лише
     # логується і ніколи не змінює результат Archive (інваріант
@@ -8464,6 +8628,90 @@ function Invoke-BRAVOArchiveOwnLogUpload {
 $script:processExitCode = 0
 $script:archiveProcessLock = $null
 $script:archiveProcessLockPath = $null
+$script:archiveFinalOperationsEventSent = $false
+$script:archiveFinalOperationsEventContext = $null
+
+function Send-BRAVOArchiveFinalOperationsEvent {
+    <#
+        ЄДИНИЙ call site відправки фінальної Operations-події прогону
+        Archive — рівно один на прогін, незалежно від того, як прогін
+        завершився: нормально в хвості Main, одним із контрольованих ранніх
+        return-ів Main, чи необробленим винятком у зовнішньому catch.
+
+        Ідемпотентна (прапорець $script:archiveFinalOperationsEventSent):
+        нормальний шлях викликає її з Main, finally викликає повторно й
+        отримує no-op. Fail-soft за контрактом звітності: жодна помилка тут
+        не змінює $script:processExitCode.
+
+        Дозована обережність із наявністю стану навмисна: крах може статися
+        ДО завантаження конфігурації або ДО Import-Module, тому і
+        конфігурація, і самі функції перевіряються на існування, а не
+        припускаються. Під Set-StrictMode звернення до неіснуючої змінної
+        кинуло б виняток — у finally це замаскувало б первинну помилку.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:archiveFinalOperationsEventSent) { return }
+    $script:archiveFinalOperationsEventSent = $true
+
+    try {
+        # Посилання БЕЗ префікса $global: — цього вимагає guard
+        # RuntimeScope/Archive (BRAVO_SELF_TEST.ps1): runtime-стан Archive
+        # тримається script-scoped, а перелік дозволених global-змінних у
+        # цьому модулі закритий. Конфігурація читається так само, як в
+        # усіх інших точках цього файлу (напр. рядки 727/840/4680), тобто
+        # неквадифікованим ім'ям; провайдер Variable: розв'язує його за
+        # звичайними правилами scope-ланцюга, тому перевірка наявності
+        # лишається такою ж надійною, як і з явним global:, і додатково не
+        # припускає, у якому саме scope конфігурацію завантажено.
+        if (-not (Test-Path -LiteralPath 'Variable:operationsReportingSettings')) { return }
+        $finalOperationsSettings = $operationsReportingSettings
+        if ($null -eq $finalOperationsSettings) { return }
+        if (-not (Test-Path -LiteralPath 'Variable:credentialSettings')) { return }
+        if (-not (Get-Command -Name 'Send-BRAVOOperationsEvent' -ErrorAction SilentlyContinue)) { return }
+        if (-not (Get-Command -Name 'Get-BRAVOExitCodeSeverity' -ErrorAction SilentlyContinue)) { return }
+
+        $finalExitCode = [int]$script:processExitCode
+        $finalSeverity = Get-BRAVOExitCodeSeverity -Code $finalExitCode
+        $finalExitCodeName = Get-BRAVOExitCodeName -Code $finalExitCode
+        $finalInstitutionCode = ''
+        if (Test-Path -LiteralPath 'Variable:backupMonitoring') {
+            $finalInstitutionCode = [string]$backupMonitoring.InstitutionCode
+        }
+
+        if ($null -ne $script:archiveFinalOperationsEventContext) {
+            $finalMessage = [string]$script:archiveFinalOperationsEventContext.Message
+            $finalDetails = $script:archiveFinalOperationsEventContext.Details
+        } else {
+            # Прогін не дійшов до хвоста Main — багатої зведеної статистики
+            # не існує. Мінімальна подія все одно краща за тишу: dashboard
+            # мусить бачити, що прогін був і чим завершився, а не вважати
+            # актуальним результат попереднього прогону.
+            $finalMessage = "Прогін BRAVO_ARCHIV завершився без зведення generation (код завершення $finalExitCode / $finalExitCodeName) — зупинка сталася до фінального етапу"
+            $finalDetails = @{ earlyTermination = $true }
+        }
+        $finalDetails['exitCode'] = $finalExitCode
+        $finalDetails['exitCodeName'] = [string]$finalExitCodeName
+
+        Send-BRAVOOperationsEvent `
+            -OperationsReportingSettings $finalOperationsSettings `
+            -CredentialTargets $credentialSettings.Targets `
+            -InstitutionCode $finalInstitutionCode `
+            -Category 'backup' -Severity $finalSeverity `
+            -Component 'Archive' `
+            -Message $finalMessage `
+            -Details $finalDetails
+    } catch {
+        try {
+            Write-Log "Не вдалося відправити фінальну подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Крах міг статись до ініціалізації log writer — телеметрія не
+            # має права замаскувати первинну причину завершення прогону.
+        }
+    }
+}
+
 try {
     Main
 } catch {
@@ -8519,6 +8767,16 @@ try {
     # НЕ re-throw: скрипт доходить до власного Exit $script:processExitCode
     # нижче (=90), тож .psm1-обгортка отримує той самий код через $LASTEXITCODE.
 } finally {
+    # Фінальна Operations-подія — ПЕРЕД вивантаженням власного логу, щоб її
+    # рядок потрапив у вивантажений лог, і ПЕРЕД cleanup, щоб dashboard
+    # отримав результат навіть якщо cleanup сам щось зламає. Ідемпотентна:
+    # на нормальному шляху Main уже її відправив і тут буде no-op. У
+    # finally — з тієї самої причини, що вивантаження власного логу
+    # нижче: лише finally виконується для БУДЬ-ЯКОГО виходу з try
+    # (нормальне завершення, п'ять контрольованих ранніх return-ів Main,
+    # необроблений виняток -> код 90).
+    Send-BRAVOArchiveFinalOperationsEvent
+
     # P2-5 (PR #136 review): ЄДИНИЙ спільний call site для вивантаження
     # власного логу — рівно тут, у finally, а НЕ в хвості Main()/catch.
     # Main() має 5 контрольованих раннix return (lock busy, VSS orphan
