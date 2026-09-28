@@ -8346,52 +8346,44 @@ function Main {
         $script:processExitCode = Resolve-BRAVOExitCode -HasWarnings
     }
 
-    # Operations-подія generation — ОДНА зведена подія на прогін,
-    # надіслана ПІСЛЯ резолюції $script:processExitCode (review finding,
-    # thread 11; той самий канонічний патерн, що
-    # Send-BRAVOMaintenanceOperationsEvent).
+    # Operations-подія generation — ОДНА зведена подія на прогін.
     #
-    # Severity тепер походить з ДВОХ джерел, а не лише зі статусу
-    # generation: сам generation міг завершитись COMPLETE, але пізніші
-    # фази (retention cleanup, SFTP/SMB, post-backup health, фінальний
-    # маніфест) могли підняти $operationFailed. Раніше подія надсилалась
-    # ще до них і в такому разі рапортувала SUCCESS для прогону з
-    # ненульовим кодом завершення. Fail-soft, як і решта звітності: жодна
-    # помилка тут не змінює $script:processExitCode.
-    if ($null -ne $operationsReportingSettings) {
-        try {
-            $generationEventSeverity = switch ($script:backupGenerationStatus) {
-                'COMPLETE'   { if ($operationFailed) { 'WARNING' } else { 'SUCCESS' } }
-                'INCOMPLETE' { 'WARNING' }
-                default      { 'ERROR' }
-            }
-            $generationEventOutcome = if ($operationFailed) {
-                if ($successCount -gt 0) { 'ЧАСТКОВО' } else { 'ПОМИЛКА' }
-            } else {
-                'УСПІШНО'
-            }
-            Send-BRAVOOperationsEvent `
-                -OperationsReportingSettings $operationsReportingSettings `
-                -CredentialTargets $credentialSettings.Targets `
-                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-                -Category 'backup' -Severity $generationEventSeverity `
-                -Component 'Archive' `
-                -Message "Generation ${generationId}: $($script:backupGenerationStatus), прогін $generationEventOutcome (опубліковано $publishedComponentCount з $($enabledArchives.Count), код завершення $($script:processExitCode))" `
-                -Details @{
-                    generationId = $generationId
-                    status = [string]$script:backupGenerationStatus
-                    runOutcome = [string]$generationEventOutcome
-                    exitCode = [int]$script:processExitCode
-                    publishedComponentCount = $publishedComponentCount
-                    enabledComponentCount = $enabledArchives.Count
-                    snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
-                    durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
-                    stages = @($script:BRAVOArchiveStepHistory)
-                }
-        } catch {
-            Write-Log "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+    # Тут збирається лише КОНТЕКСТ (message + Details), а сама відправка
+    # виконується канонічною Send-BRAVOArchiveFinalOperationsEvent, яку
+    # викликає також finally нижче. Причина (review PR #225, P1 "Report
+    # Archive failures that bypass the end of Main"): цей блок лежить у
+    # ХВОСТІ Main, тому його обходили і зовнішній catch (exit code 90), і
+    # п'ять контрольованих ранніх return-ів Main (lock busy, збій
+    # прибирання orphan VSS, ручна синхронізація, preflight free-space) —
+    # прогін звітував про відмову і в процесі, і в локальному статус-файлі,
+    # а dashboard не бачив ЖОДНОЇ події. Це та сама причина, з якої
+    # вивантаження власного логу вже живе у finally, а не в хвості Main
+    # (той самий контракт, з тієї самої причини).
+    #
+    # Severity більше НЕ виводиться зі статусу generation: вона походить
+    # від фактично резолвленого $script:processExitCode через канонічну
+    # Get-BRAVOExitCodeSeverity (BRAVO.ExitCodes). Раніше generation
+    # COMPLETE з резолвленим кодом 10 (SuccessWithWarnings) звітував
+    # SUCCESS — подія суперечила власному полю exitCode у своєму ж payload.
+    $generationEventOutcome = if ($operationFailed) {
+        if ($successCount -gt 0) { 'ЧАСТКОВО' } else { 'ПОМИЛКА' }
+    } else {
+        'УСПІШНО'
+    }
+    $script:archiveFinalOperationsEventContext = @{
+        Message = "Generation ${generationId}: $($script:backupGenerationStatus), прогін $generationEventOutcome (опубліковано $publishedComponentCount з $($enabledArchives.Count), код завершення $($script:processExitCode))"
+        Details = @{
+            generationId = $generationId
+            status = [string]$script:backupGenerationStatus
+            runOutcome = [string]$generationEventOutcome
+            publishedComponentCount = $publishedComponentCount
+            enabledComponentCount = $enabledArchives.Count
+            snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
+            durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
+            stages = @($script:BRAVOArchiveStepHistory)
         }
     }
+    Send-BRAVOArchiveFinalOperationsEvent
 
     # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
     # ПІСЛЯ обчислення exit code, fail-soft — помилка запису лише
@@ -8618,6 +8610,81 @@ function Invoke-BRAVOArchiveOwnLogUpload {
 $script:processExitCode = 0
 $script:archiveProcessLock = $null
 $script:archiveProcessLockPath = $null
+$script:archiveFinalOperationsEventSent = $false
+$script:archiveFinalOperationsEventContext = $null
+
+function Send-BRAVOArchiveFinalOperationsEvent {
+    <#
+        ЄДИНИЙ call site відправки фінальної Operations-події прогону
+        Archive — рівно один на прогін, незалежно від того, як прогін
+        завершився: нормально в хвості Main, одним із контрольованих ранніх
+        return-ів Main, чи необробленим винятком у зовнішньому catch.
+
+        Ідемпотентна (прапорець $script:archiveFinalOperationsEventSent):
+        нормальний шлях викликає її з Main, finally викликає повторно й
+        отримує no-op. Fail-soft за контрактом звітності: жодна помилка тут
+        не змінює $script:processExitCode.
+
+        Дозована обережність із наявністю стану навмисна: крах може статися
+        ДО завантаження конфігурації або ДО Import-Module, тому і
+        конфігурація, і самі функції перевіряються на існування, а не
+        припускаються. Під Set-StrictMode звернення до неіснуючої змінної
+        кинуло б виняток — у finally це замаскувало б первинну помилку.
+    #>
+    [CmdletBinding()]
+    param()
+
+    if ($script:archiveFinalOperationsEventSent) { return }
+    $script:archiveFinalOperationsEventSent = $true
+
+    try {
+        if (-not (Test-Path -LiteralPath 'Variable:global:operationsReportingSettings')) { return }
+        $finalOperationsSettings = $global:operationsReportingSettings
+        if ($null -eq $finalOperationsSettings) { return }
+        if (-not (Test-Path -LiteralPath 'Variable:global:credentialSettings')) { return }
+        if (-not (Get-Command -Name 'Send-BRAVOOperationsEvent' -ErrorAction SilentlyContinue)) { return }
+        if (-not (Get-Command -Name 'Get-BRAVOExitCodeSeverity' -ErrorAction SilentlyContinue)) { return }
+
+        $finalExitCode = [int]$script:processExitCode
+        $finalSeverity = Get-BRAVOExitCodeSeverity -Code $finalExitCode
+        $finalExitCodeName = Get-BRAVOExitCodeName -Code $finalExitCode
+        $finalInstitutionCode = ''
+        if (Test-Path -LiteralPath 'Variable:global:backupMonitoring') {
+            $finalInstitutionCode = [string]$global:backupMonitoring.InstitutionCode
+        }
+
+        if ($null -ne $script:archiveFinalOperationsEventContext) {
+            $finalMessage = [string]$script:archiveFinalOperationsEventContext.Message
+            $finalDetails = $script:archiveFinalOperationsEventContext.Details
+        } else {
+            # Прогін не дійшов до хвоста Main — багатої зведеної статистики
+            # не існує. Мінімальна подія все одно краща за тишу: dashboard
+            # мусить бачити, що прогін був і чим завершився, а не вважати
+            # актуальним результат попереднього прогону.
+            $finalMessage = "Прогін BRAVO_ARCHIV завершився без зведення generation (код завершення $finalExitCode / $finalExitCodeName) — зупинка сталася до фінального етапу"
+            $finalDetails = @{ earlyTermination = $true }
+        }
+        $finalDetails['exitCode'] = $finalExitCode
+        $finalDetails['exitCodeName'] = [string]$finalExitCodeName
+
+        Send-BRAVOOperationsEvent `
+            -OperationsReportingSettings $finalOperationsSettings `
+            -CredentialTargets $global:credentialSettings.Targets `
+            -InstitutionCode $finalInstitutionCode `
+            -Category 'backup' -Severity $finalSeverity `
+            -Component 'Archive' `
+            -Message $finalMessage `
+            -Details $finalDetails
+    } catch {
+        try {
+            Write-Log "Не вдалося відправити фінальну подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+        } catch {
+            # Крах міг статись до ініціалізації log writer — телеметрія не
+            # має права замаскувати первинну причину завершення прогону.
+        }
+    }
+}
+
 try {
     Main
 } catch {
@@ -8673,6 +8740,16 @@ try {
     # НЕ re-throw: скрипт доходить до власного Exit $script:processExitCode
     # нижче (=90), тож .psm1-обгортка отримує той самий код через $LASTEXITCODE.
 } finally {
+    # Фінальна Operations-подія — ПЕРЕД вивантаженням власного логу, щоб її
+    # рядок потрапив у вивантажений лог, і ПЕРЕД cleanup, щоб dashboard
+    # отримав результат навіть якщо cleanup сам щось зламає. Ідемпотентна:
+    # на нормальному шляху Main уже її відправив і тут буде no-op. У
+    # finally — з тієї самої причини, що вивантаження власного логу
+    # нижче: лише finally виконується для БУДЬ-ЯКОГО виходу з try
+    # (нормальне завершення, п'ять контрольованих ранніх return-ів Main,
+    # необроблений виняток -> код 90).
+    Send-BRAVOArchiveFinalOperationsEvent
+
     # P2-5 (PR #136 review): ЄДИНИЙ спільний call site для вивантаження
     # власного логу — рівно тут, у finally, а НЕ в хвості Main()/catch.
     # Main() має 5 контрольованих раннix return (lock busy, VSS orphan

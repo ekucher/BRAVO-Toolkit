@@ -255,8 +255,14 @@ Test-BRAVOCondition -Condition (
 ) -Name 'Archive/OwnLogUploadCallSiteIsInFinallyBlock' `
     -Failure "єдиний call site Invoke-BRAVOArchiveOwnLogUpload має бути у finally — виконується для БУДЬ-ЯКОГО виходу з try (успіх/ранній return/необроблений виняток), рівно один раз"
 
+# Між `} finally {` і вивантаженням логу тепер стоїть ще один спільний
+# call site — Send-BRAVOArchiveFinalOperationsEvent (PR #225, P1: фінальна
+# Operations-подія мусить відправлятись і для контрольованих ранніх
+# return-ів Main, і для фатального краху). Тому шаблон допускає його поряд
+# із коментарями, але вимога лишається та сама: вивантаження логу — ДО
+# dispose lock-файлу.
 Test-BRAVOCondition -Condition (
-    $archiveScriptText -match '(?s)\} finally \{\s*(#[^\r\n]*\r?\n\s*)*Invoke-BRAVOArchiveOwnLogUpload\r?\n\s*if \(\$script:archiveProcessLock\)'
+    $archiveScriptText -match '(?s)\} finally \{\s*((#[^\r\n]*|Send-BRAVOArchiveFinalOperationsEvent)\r?\n\s*)*Invoke-BRAVOArchiveOwnLogUpload\r?\n\s*if \(\$script:archiveProcessLock\)'
 ) -Name 'Archive/OwnLogUploadPrecedesLockDisposalInFinally' `
     -Failure "вивантаження власного логу має відбуватись ДО dispose lock-файлу/Wait-ForManualExit у finally"
 
@@ -264,6 +270,172 @@ Test-BRAVOCondition -Condition (
     ([Text.RegularExpressions.Regex]::Match($archiveScriptText, '(?s)function Invoke-BRAVOArchiveOwnLogUpload \{.*?\n\}\r?\n')).Value -notmatch '\$script:processExitCode\s*='
 ) -Name 'Archive/OwnLogUploadNeverAssignsProcessExitCode' `
     -Failure "Invoke-BRAVOArchiveOwnLogUpload — другорядний/телеметричний ефект і не повинен присвоювати `$script:processExitCode"
+
+# ============================================================
+# PR #225 (P1 "Report Archive failures that bypass the end of Main"):
+# фінальна Operations-подія прогону мусить мати ОДИН спільний шлях
+# відправки, який виконується і для нормального завершення, і для п'яти
+# контрольованих ранніх return-ів Main, і для фатального краху (код 90).
+# Раніше блок лежав у ХВОСТІ Main, тому кожен із цих шляхів лишав
+# dashboard без жодної події, хоч і процес, і локальний статус-файл
+# рапортували відмову. Той самий структурний контракт, що вже покриває
+# Invoke-BRAVOArchiveOwnLogUpload вище, і з тієї самої причини: відрізнити
+# ці сценарії без повного продакшн-запуску Main() неможливо.
+# ============================================================
+
+Test-BRAVOCondition -Condition (
+    ([Text.RegularExpressions.Regex]::Matches($archiveScriptText, 'Send-BRAVOArchiveFinalOperationsEvent\s*$', [Text.RegularExpressions.RegexOptions]::Multiline)).Count -eq 2
+) -Name 'Archive/FinalOperationsEventHasExactlyTwoCallSites' `
+    -Failure "Send-BRAVOArchiveFinalOperationsEvent має викликатись РІВНО двічі: у хвості Main (багатий контекст) і у finally (гарантія для ранніх return/краху). Сама функція ідемпотентна, тому другий виклик на нормальному шляху -- no-op; будь-яка інша кількість call site-ів означає або втрачений шлях, або дубльовану політику"
+
+Test-BRAVOCondition -Condition (
+    $archiveScriptText -match '(?s)\} finally \{\s*((#[^\r\n]*|Invoke-BRAVOArchiveOwnLogUpload)\r?\n\s*)*Send-BRAVOArchiveFinalOperationsEvent'
+) -Name 'Archive/FinalOperationsEventCallSiteIsInFinallyBlock' `
+    -Failure "один із двох call site-ів Send-BRAVOArchiveFinalOperationsEvent мусить бути у finally: лише finally виконується для БУДЬ-ЯКОГО виходу з try (успіх, контрольований ранній return, необроблений виняток -> код 90)"
+
+$archiveFinalOpsEventBody = ([Text.RegularExpressions.Regex]::Match(
+    $archiveScriptText, '(?s)function Send-BRAVOArchiveFinalOperationsEvent \{.*?\n\}\r?\n')).Value
+Test-BRAVOCondition -Condition (
+    $archiveFinalOpsEventBody -notmatch '\$script:processExitCode\s*=' -and
+    $archiveFinalOpsEventBody -match '\$script:archiveFinalOperationsEventSent' -and
+    $archiveFinalOpsEventBody -match 'Get-BRAVOExitCodeSeverity'
+) -Name 'Archive/FinalOperationsEventIsIdempotentAndNeverChangesExitCode' `
+    -Failure "Send-BRAVOArchiveFinalOperationsEvent мусить бути ідемпотентною (прапорець `$script:archiveFinalOperationsEventSent), брати severity з канонічної Get-BRAVOExitCodeSeverity (а не зі статусу generation -- COMPLETE з кодом 10 звітував SUCCESS) і НІКОЛИ не присвоювати `$script:processExitCode (телеметрія не змінює результат прогону)"
+
+Test-BRAVOCondition -Condition (
+    ([Text.RegularExpressions.Regex]::Matches($archiveScriptText, 'Send-BRAVOOperationsEvent\s+`')).Count -ge 1 -and
+    $archiveFinalOpsEventBody -match 'Send-BRAVOOperationsEvent'
+) -Name 'Archive/FinalOperationsEventOwnsTheGenerationEmission' `
+    -Failure "сама відправка зведеної generation-події мусить жити всередині Send-BRAVOArchiveFinalOperationsEvent, а не дублюватись у хвості Main -- інакше дві копії політики severity/Details розійдуться"
+
+# Функціональна ізоляція тієї самої функції: реальний її текст + стаби
+# Send-BRAVOOperationsEvent/Write-Log (New-BRAVOSelfTestRuntimeModule тут не
+# підходить -- функція читає $script:-стан, який тест мусить виставляти
+# всередині того самого module scope, тому модуль складається напряму з
+# тексту функції плюс стаби). Перевіряється саме те, що структурний тест
+# перевірити не може: який severity і які Details виходять для кожного
+# класу завершення прогону.
+$archiveFinalOpsStub = @'
+function Send-BRAVOOperationsEvent {
+    param($OperationsReportingSettings, $CredentialTargets, [string]$InstitutionCode,
+          [string]$Category, [string]$Severity, [string]$Message, [string]$Component,
+          $Services, $Details)
+    [void]$global:BRAVOArchiveSelfTestFinalOpsEvents.Add([pscustomobject]@{
+        Severity = $Severity; Message = $Message; Details = $Details; InstitutionCode = $InstitutionCode })
+}
+function Write-Log { param([string]$Message, [string]$Level = 'INFO') }
+'@
+$archiveFinalOpsModule = New-Module -ScriptBlock ([scriptblock]::Create(
+    $archiveFinalOpsStub + "`r`n" + $archiveFinalOpsEventBody))
+Import-Module $archiveFinalOpsModule -Force
+$global:BRAVOArchiveSelfTestFinalOpsEvents = New-Object System.Collections.Generic.List[object]
+
+function Invoke-BRAVOSelfTestArchiveFinalOpsScenario {
+    # Виставляє $script:-стан ВСЕРЕДИНІ module scope (де функція його й
+    # читає) і повертає зібрані події.
+    param([AllowNull()]$Context, [Parameter(Mandatory = $true)][int]$ExitCode)
+
+    $global:BRAVOArchiveSelfTestFinalOpsEvents.Clear()
+    # Вхідні дані передаються через $global:, а не позиційними аргументами
+    # scriptblock-а: значення мусять бути видимі САМЕ в module scope, де
+    # функція читає свій $script:-стан.
+    $global:BRAVOArchiveSelfTestFinalOpsContext = $Context
+    $global:BRAVOArchiveSelfTestFinalOpsExitCode = $ExitCode
+    & $archiveFinalOpsModule {
+        $script:archiveFinalOperationsEventSent = $false
+        $script:archiveFinalOperationsEventContext = $global:BRAVOArchiveSelfTestFinalOpsContext
+        $script:processExitCode = $global:BRAVOArchiveSelfTestFinalOpsExitCode
+        Send-BRAVOArchiveFinalOperationsEvent
+    }
+    # .ToArray(), а не @($list) напряму: та сама причина, з якої
+    # BRAVO_SELF_TEST.ConfigLoader.ps1 робить $parityDiffsList.ToArray() --
+    # розгортання generic-списку в масив мусить бути явним.
+    return @($global:BRAVOArchiveSelfTestFinalOpsEvents.ToArray())
+}
+
+# Наявні $global:-значення конфігурації зберігаються й відновлюються нижче:
+# цей self-test-фрагмент виконується в тому самому процесі, що й решта, і
+# мовчки прибрати чи підмінити реальну конфігурацію означало б зламати
+# наступні фрагменти. '<<ABSENT>>' відрізняє "змінної не було" від
+# "змінна була і дорівнювала $null" -- той самий прийом, що
+# Get-BRAVOEffectiveConfigurationSnapshot.
+$archiveFinalOpsSavedGlobals = @{}
+foreach ($archiveFinalOpsGlobalName in @('operationsReportingSettings', 'credentialSettings', 'backupMonitoring')) {
+    $archiveFinalOpsSavedVariable = Get-Variable -Name $archiveFinalOpsGlobalName -Scope Global -ErrorAction SilentlyContinue
+    $archiveFinalOpsSavedGlobals[$archiveFinalOpsGlobalName] = if ($null -ne $archiveFinalOpsSavedVariable) { @{ Present = $true; Value = $archiveFinalOpsSavedVariable.Value } } else { @{ Present = $false; Value = $null } }
+}
+
+# Крах ДО завантаження конфігурації: жодної події, жодного винятку (у
+# finally виняток телеметрії замаскував би первинну причину завершення).
+Remove-Variable -Name operationsReportingSettings -Scope Global -Force -ErrorAction SilentlyContinue
+$archiveFinalOpsNoConfigThrew = $false
+try { [void](Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context $null -ExitCode 90) } catch { $archiveFinalOpsNoConfigThrew = $true }
+Test-BRAVOCondition -Condition (-not $archiveFinalOpsNoConfigThrew -and $global:BRAVOArchiveSelfTestFinalOpsEvents.Count -eq 0) `
+    -Name 'Archive/FinalOperationsEventMissingConfigIsSilentNoOpNotThrow' `
+    -Failure "крах до завантаження конфігурації не має давати ні події, ні винятку (Set-StrictMode: звернення до неіснуючої `$global: кинуло б у finally і замаскувало первинну причину); threw=$archiveFinalOpsNoConfigThrew events=$($global:BRAVOArchiveSelfTestFinalOpsEvents.Count)"
+
+$global:operationsReportingSettings = @{ Enabled = $true; ApiBaseUrl = 'https://ops.example.invalid'; ProductType = 'LIMS'; RequestTimeoutSeconds = 5 }
+$global:credentialSettings = @{ Targets = @{ OperationsApiKey = 'K'; OperationsBootstrapSecret = 'B' } }
+$global:backupMonitoring = @{ InstitutionCode = 'SELFTEST' }
+
+# Контрольований ранній return Main (lock busy, код 20): багатого зведення
+# generation не існує, але подія мусить бути -- інакше dashboard вважав би
+# актуальним результат ПОПЕРЕДНЬОГО прогону.
+$archiveFinalOpsEarly = Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context $null -ExitCode 20
+Test-BRAVOCondition -Condition (
+    $archiveFinalOpsEarly.Count -eq 1 -and
+    $archiveFinalOpsEarly[0].Severity -eq 'WARNING' -and
+    [int]$archiveFinalOpsEarly[0].Details.exitCode -eq 20 -and
+    [string]$archiveFinalOpsEarly[0].Details.exitCodeName -eq 'SkippedLockBusy' -and
+    [bool]$archiveFinalOpsEarly[0].Details.earlyTermination -and
+    [string]$archiveFinalOpsEarly[0].InstitutionCode -eq 'SELFTEST'
+) -Name 'Archive/FinalOperationsEventCoversControlledEarlyReturn' `
+    -Failure "ранній return Main (код 20) мусить давати РІВНО одну подію з severity WARNING, exitCode/exitCodeName і маркером earlyTermination; отримано $($archiveFinalOpsEarly | ConvertTo-Json -Compress -Depth 5)"
+
+# Ідемпотентність: Main і finally викликають функцію обидва.
+$archiveFinalOpsIdempotent = Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context $null -ExitCode 40
+& $archiveFinalOpsModule { Send-BRAVOArchiveFinalOperationsEvent }
+Test-BRAVOCondition -Condition ($global:BRAVOArchiveSelfTestFinalOpsEvents.Count -eq 1) `
+    -Name 'Archive/FinalOperationsEventIsSentExactlyOncePerRun' `
+    -Failure "на нормальному шляху функцію викликають ДВІЧІ (хвіст Main і finally) -- подія мусить піти РІВНО один раз; відправлено $($global:BRAVOArchiveSelfTestFinalOpsEvents.Count)"
+
+# Регресія severity: generation COMPLETE, але резолвлений код 10.
+$archiveFinalOpsWarnContext = @{
+    Message = 'Generation G1: COMPLETE, прогін УСПІШНО'
+    Details = @{ generationId = 'G1'; status = 'COMPLETE'; runOutcome = 'УСПІШНО' }
+}
+$archiveFinalOpsWarn = Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context $archiveFinalOpsWarnContext -ExitCode 10
+Test-BRAVOCondition -Condition (
+    $archiveFinalOpsWarn.Count -eq 1 -and
+    $archiveFinalOpsWarn[0].Severity -eq 'WARNING' -and
+    [int]$archiveFinalOpsWarn[0].Details.exitCode -eq 10 -and
+    [string]$archiveFinalOpsWarn[0].Details.status -eq 'COMPLETE'
+) -Name 'Archive/FinalOperationsEventSeverityFollowsResolvedExitCode' `
+    -Failure "generation COMPLETE з резолвленим кодом 10 (SuccessWithWarnings) мусить давати WARNING, а не SUCCESS -- інакше подія суперечить власному полю exitCode у своєму ж payload; отримано $($archiveFinalOpsWarn | ConvertTo-Json -Compress -Depth 5)"
+
+$archiveFinalOpsClean = Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context @{ Message = 'Generation G2: COMPLETE'; Details = @{ generationId = 'G2' } } -ExitCode 0
+$archiveFinalOpsFatal = Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context $null -ExitCode 90
+$archiveFinalOpsIntegrity = Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Context $null -ExitCode 33
+Test-BRAVOCondition -Condition (
+    $archiveFinalOpsClean[0].Severity -eq 'SUCCESS' -and
+    $archiveFinalOpsFatal[0].Severity -eq 'ERROR' -and
+    $archiveFinalOpsIntegrity[0].Severity -eq 'CRITICAL'
+) -Name 'Archive/FinalOperationsEventMapsExitCodeClassesToSeverity' `
+    -Failure "0 -> SUCCESS, 90 (InternalError) -> ERROR, 33 (RuntimeIntegrityViolation) -> CRITICAL; отримано $($archiveFinalOpsClean[0].Severity)/$($archiveFinalOpsFatal[0].Severity)/$($archiveFinalOpsIntegrity[0].Severity)"
+
+Remove-Module -Name $archiveFinalOpsModule.Name -Force -ErrorAction SilentlyContinue
+Remove-Item -Path function:Invoke-BRAVOSelfTestArchiveFinalOpsScenario -Force -ErrorAction SilentlyContinue
+Remove-Variable -Name BRAVOArchiveSelfTestFinalOpsEvents -Scope Global -Force -ErrorAction SilentlyContinue
+Remove-Variable -Name BRAVOArchiveSelfTestFinalOpsContext -Scope Global -Force -ErrorAction SilentlyContinue
+Remove-Variable -Name BRAVOArchiveSelfTestFinalOpsExitCode -Scope Global -Force -ErrorAction SilentlyContinue
+foreach ($archiveFinalOpsGlobalName in @($archiveFinalOpsSavedGlobals.Keys)) {
+    $archiveFinalOpsSavedEntry = $archiveFinalOpsSavedGlobals[$archiveFinalOpsGlobalName]
+    if ([bool]$archiveFinalOpsSavedEntry.Present) {
+        Set-Variable -Name $archiveFinalOpsGlobalName -Scope Global -Value $archiveFinalOpsSavedEntry.Value
+    } else {
+        Remove-Variable -Name $archiveFinalOpsGlobalName -Scope Global -Force -ErrorAction SilentlyContinue
+    }
+}
 
 # ============================================================
 # PR #225 (раунд 3, review): Send-ToolIntegrityAlert/Send-BRAVOArchiveFreeSpaceAlert/
