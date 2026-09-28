@@ -1973,7 +1973,43 @@ try {
             -Actual $committedRawHashtable[$topKey] -Expected $parityDefaultConfiguration[$topKey] `
             -Path $topKey -Diffs $parityDiffsList
     }
-    $parityDiffs = @($parityDiffsList.ToArray())
+    # АДИТИВНІ КАНОНІЧНІ ЛИСТИ, додані ПІСЛЯ заморожування legacy-фікстури
+    # (B4-2, коміт 75b3b39). Фікстура selftest\fixtures\BravoConfigLegacyFrozen.config
+    # за своїм контрактом (Get-BRAVOSelfTestLegacyConfigPath у BRAVO_SELF_TEST.ps1)
+    # НЕ слідує за майбутніми змінами canonical-дефолтів: вона фіксує
+    # pre-B4-2 legacy-текст як синтетичну БАЗУ сценарію. Тому для НОВОГО
+    # канонічного листа очікуваний стан фікстури — саме 'відсутній', і
+    # дописування такого листа у фікстуру (що й робив PR #225 до цієї
+    # правки) знецінило б паритет-harness: він перестав би перевіряти
+    # реальну pre-5.3 конфігурацію, бо очікуваний вхід і реалізація
+    # оновлювались би разом.
+    #
+    # Перелічено ПОІМЕННО — той самий принцип, що в
+    # ci\Test-BRAVOConfigFoundationParity.ps1 (`$knownIntentionalDiffPrefixes):
+    # загальне правило 'відсутнє у фікстурі -> пропускаємо' приховало б
+    # справжню регресію (лист, який у фікстурі БУВ і зник). Пропускається
+    # рівно один вид розбіжності — 'відсутнє в BRAVO.config'; той самий
+    # лист з ІНШИМ значенням і далі fail-closed позначається як diff.
+    #
+    # Тертя від поіменного переліку — чесний сигнал, що фікстура старіє.
+    $parityFrozenFixtureAdditiveLeaves = @(
+        # BSYSTEM Operations (5.3.0): імена записів Credential Manager для
+        # bootstrap-секрету self-enrollment і виданого API-ключа.
+        'credentialSettings.Targets.OperationsApiKey',
+        'credentialSettings.Targets.OperationsBootstrapSecret'
+    )
+    $parityAdditiveAbsenceSuffix = ' : відсутнє в BRAVO.config'
+    $parityDiffs = @(@($parityDiffsList.ToArray()) | Where-Object {
+        $diffLine = [string]$_
+        $isAllowedAbsence = $false
+        foreach ($additiveLeaf in $parityFrozenFixtureAdditiveLeaves) {
+            if ($diffLine -ceq ($additiveLeaf + $parityAdditiveAbsenceSuffix)) {
+                $isAllowedAbsence = $true
+                break
+            }
+        }
+        -not $isAllowedAbsence
+    })
 } catch {
     $parityParseFailed = $true
 }

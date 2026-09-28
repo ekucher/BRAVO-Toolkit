@@ -513,12 +513,12 @@ function Test-BRAVOConfigurationOverrideSchema {
 # узагалі й проходить повз цей шар так само, як повз type-перевірку.
 # Це свідоме узгодження з D3, не недогляд (WAVE2-CONTRACT.md, розділ 5/11.3).
 #
-# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 271 канонічних листів (а не
+# ФОРМАТ РЕЄСТРУ. Явний запис на КОЖЕН із 277 канонічних листів (а не
 # лише на DENY/VALIDATOR-підмножину) — навмисно: WAVE2-CONTRACT.md
 # (розділ 8/11.3) вимагає, щоб кожен НОВИЙ канонічний лист отримував
 # явне класифікаційне рішення (навіть якщо це явний ALLOW_SITE), а не
 # мовчазний allow-by-omission. Повнота реєстру перевіряється в
-# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "271/271
+# selftest\BRAVO_SELF_TEST.Configuration.ps1 (перевірка "277/277
 # coverage" — фейлить, якщо реєстр і канонічна схема розійшлися в
 # обидва боки: зайвий запис АБО відсутній запис); у цьому модулі немає
 # окремої функції з такою назвою.
@@ -689,6 +689,16 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'credentialSettings.Targets.SlackWebhookGeneral' = @{ Class = 'ALLOW_SITE' }
     'credentialSettings.Targets.SMBLogin' = @{ Class = 'ALLOW_SITE' }
     'credentialSettings.Targets.SMBPassword' = @{ Class = 'ALLOW_SITE' }
+    # BSYSTEM Operations (5.3.0). Ті самі семантика й клас, що й решта
+    # credentialSettings.Targets.*: значення — це ІМ'Я запису Windows
+    # Credential Manager, а не сам секрет, і воно є site-специфічним
+    # (сервер може тримати записи під власними іменами). Сам секрет
+    # ніколи не потрапляє в конфігурацію, тому перейменування таргета не
+    # послаблює жодного контролю безпеки — звідси ALLOW_SITE, а не
+    # DENY_CREDENTIAL_BACKED (цей клас у реєстрі має 0 записів саме тому,
+    # що таргети — імена, а не креденшели).
+    'credentialSettings.Targets.OperationsApiKey' = @{ Class = 'ALLOW_SITE' }
+    'credentialSettings.Targets.OperationsBootstrapSecret' = @{ Class = 'ALLOW_SITE' }
     # PR #224 review (P2, "Preserve trimming for defaultLogLevel"):
     # EnumTrimmed (не Enum) — той самий доведений pre-Wave-2 tolerance, що
     # ConsoleLevel/FileLevel вище: Write-Log (BRAVO.Archive.Runtime.ps1)
@@ -809,6 +819,26 @@ $script:BRAVOConfigurationSchemaAuthorizationClass = @{
     'maintenanceSettings.Services.StopTimeoutSeconds' = @{ Class = 'ALLOW_SITE' }
     'maintenanceSettings.Trace.BISSourcePath' = @{ Class = 'ALLOW_SITE' }
     'minimumRetainedVerifiedBackups' = @{ Class = 'ALLOW_SITE' }
+    # BSYSTEM Operations (5.3.0) — fleet-моніторинг. Opt-in per-server:
+    # Enabled є site-рішенням оператора (ALLOW_SITE), але ApiBaseUrl,
+    # RequestTimeoutSeconds і ProductType отримують валідатори, бо кожен
+    # із них рантайм уже інтерпретує суворо: Resolve-BRAVOOperationsApiUri
+    # кидає на не-HTTPS URL, таймаут передається в Invoke-WebRequest, а
+    # ProductType поза LIMS/VETOFFICE зупиняє enrollment. Без запису тут
+    # Test-BRAVOConfigurationAuthorizationLeaf трактував би канонічний
+    # лист як дефект реєстру (MissingAuthorizationPolicy) і завалював би
+    # завантаження конфігурації при будь-якому local-override цих полів.
+    #
+    # ApiBaseUrl: 'OptionalUrl:https' — порожнє значення є канонічним
+    # дефолтом і означає 'Operations не сконфігуровано' (рантайм у цьому
+    # разі лише логує діагностику й не відправляє нічого), тому порожній
+    # рядок мусить лишатись валідним; непорожнє значення зобов'язане бути
+    # абсолютним HTTPS-URL — той самий контракт, що вже перевіряє
+    # Resolve-BRAVOOperationsApiUri, лише fail-closed на крок раніше.
+    'operationsReportingSettings.ApiBaseUrl' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'OptionalUrl:https' }
+    'operationsReportingSettings.Enabled' = @{ Class = 'ALLOW_SITE' }
+    'operationsReportingSettings.ProductType' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'Enum:LIMS,VETOFFICE' }
+    'operationsReportingSettings.RequestTimeoutSeconds' = @{ Class = 'ALLOW_WITH_VALIDATOR'; Validator = 'IntegerRange:1,600' }
     'orphanTempRetentionHours' = @{ Class = 'ALLOW_SITE' }
     'pathSettings.BackupRoot' = @{ Class = 'ALLOW_SITE' }
     'pathSettings.LIMSRoot' = @{ Class = 'ALLOW_SITE' }
@@ -1180,6 +1210,41 @@ function Test-BRAVOConfigurationAuthorizationEncodingName {
     }
 }
 
+function Test-BRAVOConfigurationAuthorizationOptionalUrl {
+    # СКАЛЯРНИЙ URL, у якого порожнє значення є легітимним і означає
+    # "не сконфігуровано" — НЕ гілка UrlArray (той вимагає масив і
+    # відхиляє рядок як "очікується масив URL-рядків"). Введено разом із
+    # operationsReportingSettings.ApiBaseUrl (5.3.0): канонічний дефолт
+    # цього листа — порожній рядок, і саме порожнє значення рантайм
+    # трактує як "Operations не налаштовано" (діагностика без відправки),
+    # тому вимагати тут непорожній URL означало б відхиляти канонічний
+    # дефолт. Непорожнє значення перевіряється тим самим контрактом, що
+    # Resolve-BRAVOOperationsApiUri застосовує в рантаймі: абсолютний URL
+    # з дозволеною схемою.
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyString()]$Value,
+        [Parameter(Mandatory = $true)][string[]]$AllowedSchemes,
+        [Parameter(Mandatory = $true)][string]$Path
+    )
+
+    if ($null -eq $Value) { return [pscustomobject]@{ IsValid = $true; Message = $null } }
+    if ($Value -isnot [string]) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: очікується рядок URL (або порожній рядок, якщо не сконфігуровано)." }
+    }
+    if ([string]::IsNullOrWhiteSpace([string]$Value)) { return [pscustomobject]@{ IsValid = $true; Message = $null } }
+    $parsedUri = $null
+    if (-not [System.Uri]::TryCreate([string]$Value, [System.UriKind]::Absolute, [ref]$parsedUri)) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: '$Value' не є коректним абсолютним URL." }
+    }
+    $scheme = $parsedUri.Scheme.ToLowerInvariant()
+    if ($AllowedSchemes -notcontains $scheme) {
+        return [pscustomobject]@{ IsValid = $false; Message = "${Path}: схема '$scheme' недопустима — дозволено: $($AllowedSchemes -join ', ')." }
+    }
+    return [pscustomobject]@{ IsValid = $true; Message = $null }
+}
+
 function Test-BRAVOConfigurationAuthorizationUrlArray {
     # Кожен елемент — абсолютний URL з дозволеною схемою (http/https).
     # Масив як ціле не перевіряється по-елементно за схожими родами —
@@ -1351,6 +1416,10 @@ function Test-BRAVOConfigurationAuthorizationValidatorValue {
     if ($ValidatorId.StartsWith('IntegerRange:', [System.StringComparison]::Ordinal)) {
         $bounds = @($ValidatorId.Substring(13) -split ',')
         return Test-BRAVOConfigurationAuthorizationIntegerRange -Value $Value -Minimum ([int]$bounds[0]) -Maximum ([int]$bounds[1]) -Path $Path
+    }
+    if ($ValidatorId.StartsWith('OptionalUrl:', [System.StringComparison]::Ordinal)) {
+        $allowedSchemes = @($ValidatorId.Substring(12) -split ',')
+        return Test-BRAVOConfigurationAuthorizationOptionalUrl -Value $Value -AllowedSchemes $allowedSchemes -Path $Path
     }
     if ($ValidatorId.StartsWith('UrlArray:', [System.StringComparison]::Ordinal)) {
         $allowedSchemes = @($ValidatorId.Substring(9) -split ',')
