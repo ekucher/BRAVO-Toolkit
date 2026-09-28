@@ -5286,7 +5286,15 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
     # його offset у файлі МАЄ бути РАНІШЕ за offset відповідного
     # гейтингового `if`, інакше він або перенесений усередину гейту, або
     # дубльований.
-    $healthOpsSuccessCallMarker = "-Category 'health' -Severity 'SUCCESS'"
+    # Маркер містить ЗМІННУ, а не літерал 'SUCCESS': severity цієї події
+    # стала похідною (`$operationsHealthSeverity` = 'SUCCESS' у нормі й
+    # 'CRITICAL', коли маніфест інструментів має ShouldBlock -- review
+    # thread 15 PR #225, бо Complete-BRAVOHealthResult перекриває результат
+    # ToolIntegrityViolation). Сам контракт цієї канарки не змінився: подія
+    # існує РІВНО один раз і РАНІШЕ за success-гейт. Що саме підставляється
+    # в severity, перевіряє окремий assertion нижче -- щоб покриття "healthy
+    # прогін рапортує SUCCESS" не зникло разом із літералом.
+    $healthOpsSuccessCallMarker = "-Category 'health' -Severity `$operationsHealthSeverity"
     $healthOpsCriticalCallMarker = "-Category 'health' -Severity 'CRITICAL'"
     $healthSuccessGateMarker = 'if ($sendSuccessNotification) {'
     $healthCriticalGateMarker = 'if ($NoSlack -or $NotificationMode -eq "none") {'
@@ -5302,6 +5310,19 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name 'Health/OperationsSuccessEventNotGatedByNotificationMode' `
         -Failure "Send-BRAVOOperationsEvent(Severity=SUCCESS) для Health МАЄ викликатись РІВНО один раз і РАНІШЕ за `if (`$sendSuccessNotification) {` (тобто поза цим гейтингом) -- знайдено викликів: $healthOpsSuccessCallCount, offset виклику=$healthOpsSuccessCallIndex, offset гейту=$healthSuccessGateIndex (регресія thread 4 review PR #225)"
+
+    # Похідна severity тієї самої події: дефолт 'SUCCESS', ескалація в
+    # 'CRITICAL' лише при ShouldBlock маніфесту інструментів. Без цього
+    # assertion-а перехід маркера вище на змінну втратив би саме те
+    # покриття, задля якого канарка й існує.
+    Test-BRAVOCondition `
+        -Condition (
+            $healthScriptText.Contains("`$operationsHealthSeverity = 'SUCCESS'") -and
+            $healthScriptText.Contains("`$operationsHealthSeverity = 'CRITICAL'") -and
+            $healthScriptText.Contains('$script:BRAVOToolManifest.ShouldBlock')
+        ) `
+        -Name 'Health/OperationsSuccessEventSeverityEscalatesOnToolIntegrityBlock' `
+        -Failure "severity health-події без issue мусить бути 'SUCCESS' за замовчуванням і ескалювати в 'CRITICAL' при ShouldBlock маніфесту інструментів (інакше подія рапортує SUCCESS для прогону, який процес завершує ToolIntegrityViolation -- review thread 15 PR #225)"
 
     # CRITICAL: РІВНО ДВА легітимних call-сайти -- (1) ранній
     # environment-preflight early-exit (недоступне середовище виконання,

@@ -8656,10 +8656,19 @@ function Send-BRAVOArchiveFinalOperationsEvent {
     $script:archiveFinalOperationsEventSent = $true
 
     try {
-        if (-not (Test-Path -LiteralPath 'Variable:global:operationsReportingSettings')) { return }
-        $finalOperationsSettings = $global:operationsReportingSettings
+        # Посилання БЕЗ префікса $global: — цього вимагає guard
+        # RuntimeScope/Archive (BRAVO_SELF_TEST.ps1): runtime-стан Archive
+        # тримається script-scoped, а перелік дозволених global-змінних у
+        # цьому модулі закритий. Конфігурація читається так само, як в
+        # усіх інших точках цього файлу (напр. рядки 727/840/4680), тобто
+        # неквадифікованим ім'ям; провайдер Variable: розв'язує його за
+        # звичайними правилами scope-ланцюга, тому перевірка наявності
+        # лишається такою ж надійною, як і з явним global:, і додатково не
+        # припускає, у якому саме scope конфігурацію завантажено.
+        if (-not (Test-Path -LiteralPath 'Variable:operationsReportingSettings')) { return }
+        $finalOperationsSettings = $operationsReportingSettings
         if ($null -eq $finalOperationsSettings) { return }
-        if (-not (Test-Path -LiteralPath 'Variable:global:credentialSettings')) { return }
+        if (-not (Test-Path -LiteralPath 'Variable:credentialSettings')) { return }
         if (-not (Get-Command -Name 'Send-BRAVOOperationsEvent' -ErrorAction SilentlyContinue)) { return }
         if (-not (Get-Command -Name 'Get-BRAVOExitCodeSeverity' -ErrorAction SilentlyContinue)) { return }
 
@@ -8667,8 +8676,8 @@ function Send-BRAVOArchiveFinalOperationsEvent {
         $finalSeverity = Get-BRAVOExitCodeSeverity -Code $finalExitCode
         $finalExitCodeName = Get-BRAVOExitCodeName -Code $finalExitCode
         $finalInstitutionCode = ''
-        if (Test-Path -LiteralPath 'Variable:global:backupMonitoring') {
-            $finalInstitutionCode = [string]$global:backupMonitoring.InstitutionCode
+        if (Test-Path -LiteralPath 'Variable:backupMonitoring') {
+            $finalInstitutionCode = [string]$backupMonitoring.InstitutionCode
         }
 
         if ($null -ne $script:archiveFinalOperationsEventContext) {
@@ -8687,7 +8696,7 @@ function Send-BRAVOArchiveFinalOperationsEvent {
 
         Send-BRAVOOperationsEvent `
             -OperationsReportingSettings $finalOperationsSettings `
-            -CredentialTargets $global:credentialSettings.Targets `
+            -CredentialTargets $credentialSettings.Targets `
             -InstitutionCode $finalInstitutionCode `
             -Category 'backup' -Severity $finalSeverity `
             -Component 'Archive' `
