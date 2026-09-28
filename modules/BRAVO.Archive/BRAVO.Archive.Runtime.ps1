@@ -7623,39 +7623,18 @@ function Main {
     }
     Show-ItemProgress -Id 10 -Activity "BRAVO_ARCHIV — архiвацiя компонентiв" -Completed
 
-    # Одна зведена Operations-подія на generation (SUCCESS-шлях backup
-    # категорії раніше не існував узагалі — лише 3 error/warning-виклики
-    # вище в цьому файлі). Розташована ПІСЛЯ try/catch фіналізації, а не
-    # всередині try, щоб бачити остаточний $script:backupGenerationStatus
-    # незалежно від того, яка гілка (успішна фіналізація чи catch) його
-    # визначила.
-    if ($null -ne $operationsReportingSettings) {
-        try {
-            $generationEventSeverity = switch ($script:backupGenerationStatus) {
-                'COMPLETE'   { 'SUCCESS' }
-                'INCOMPLETE' { 'WARNING' }
-                default      { 'ERROR' }
-            }
-            Send-BRAVOOperationsEvent `
-                -OperationsReportingSettings $operationsReportingSettings `
-                -CredentialTargets $credentialSettings.Targets `
-                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-                -Category 'backup' -Severity $generationEventSeverity `
-                -Component 'Archive' `
-                -Message "Generation ${generationId}: $($script:backupGenerationStatus) (опубліковано $publishedComponentCount з $($enabledArchives.Count))" `
-                -Details @{
-                    generationId = $generationId
-                    status = [string]$script:backupGenerationStatus
-                    publishedComponentCount = $publishedComponentCount
-                    enabledComponentCount = $enabledArchives.Count
-                    snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
-                    durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
-                    stages = @($script:BRAVOArchiveStepHistory)
-                }
-        } catch {
-            Write-Log "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
-        }
-    }
+    # Зведена Operations-подія на generation НЕ надсилається тут (review
+    # finding, thread 11): у цій точці відомий лише
+    # $script:backupGenerationStatus, а retention cleanup, SFTP/SMB-
+    # трансфер, post-backup health-check і фінальний запис маніфесту ще
+    # НЕ виконані — кожен із них може підняти $operationFailed і дати
+    # ненульовий код завершення. Подія, надіслана звідси, показувала б у
+    # dashboard SUCCESS для прогону, який фактично завершився помилкою, а
+    # її stages-список не містив би саме провалених фаз. Надсилання
+    # перенесено ПІСЛЯ резолюції $script:processExitCode — той самий
+    # канонічний патерн, що Send-BRAVOMaintenanceOperationsEvent
+    # (BRAVO.Maintenance.Runtime.ps1), який приймає вже обчислений
+    # ExitCode. Шукайте "Operations-подія generation" нижче.
 
     # dev.16: одна аггрегована unnumbered-операція "Очищення старих backup
     # generation" покриває обидва блоки нижче (generation retention, що
@@ -8353,6 +8332,53 @@ function Main {
             -HealthCritical:$healthCriticalFailure
     } elseif ($logStatistics.Warnings -gt 0) {
         $script:processExitCode = Resolve-BRAVOExitCode -HasWarnings
+    }
+
+    # Operations-подія generation — ОДНА зведена подія на прогін,
+    # надіслана ПІСЛЯ резолюції $script:processExitCode (review finding,
+    # thread 11; той самий канонічний патерн, що
+    # Send-BRAVOMaintenanceOperationsEvent).
+    #
+    # Severity тепер походить з ДВОХ джерел, а не лише зі статусу
+    # generation: сам generation міг завершитись COMPLETE, але пізніші
+    # фази (retention cleanup, SFTP/SMB, post-backup health, фінальний
+    # маніфест) могли підняти $operationFailed. Раніше подія надсилалась
+    # ще до них і в такому разі рапортувала SUCCESS для прогону з
+    # ненульовим кодом завершення. Fail-soft, як і решта звітності: жодна
+    # помилка тут не змінює $script:processExitCode.
+    if ($null -ne $operationsReportingSettings) {
+        try {
+            $generationEventSeverity = switch ($script:backupGenerationStatus) {
+                'COMPLETE'   { if ($operationFailed) { 'WARNING' } else { 'SUCCESS' } }
+                'INCOMPLETE' { 'WARNING' }
+                default      { 'ERROR' }
+            }
+            $generationEventOutcome = if ($operationFailed) {
+                if ($successCount -gt 0) { 'ЧАСТКОВО' } else { 'ПОМИЛКА' }
+            } else {
+                'УСПІШНО'
+            }
+            Send-BRAVOOperationsEvent `
+                -OperationsReportingSettings $operationsReportingSettings `
+                -CredentialTargets $credentialSettings.Targets `
+                -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+                -Category 'backup' -Severity $generationEventSeverity `
+                -Component 'Archive' `
+                -Message "Generation ${generationId}: $($script:backupGenerationStatus), прогін $generationEventOutcome (опубліковано $publishedComponentCount з $($enabledArchives.Count), код завершення $($script:processExitCode))" `
+                -Details @{
+                    generationId = $generationId
+                    status = [string]$script:backupGenerationStatus
+                    runOutcome = [string]$generationEventOutcome
+                    exitCode = [int]$script:processExitCode
+                    publishedComponentCount = $publishedComponentCount
+                    enabledComponentCount = $enabledArchives.Count
+                    snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
+                    durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
+                    stages = @($script:BRAVOArchiveStepHistory)
+                }
+        } catch {
+            Write-Log "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
+        }
     }
 
     # Machine-readable status contract v1 (ROADMAP P2.1, BRAVO.Status):
