@@ -248,7 +248,18 @@ try {
             # повторне читання/верифікація, без мутуючих побічних ефектів
             # (§27 ідемпотентність) — детермінований, безпечний повторний
             # прогін тих самих read-only перевірок.
-            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Activated', 'Validated') -Operation '-Validate'
+            #
+            # 'Failed' також дозволений з тієї самої причини: -Validate не
+            # робить нічого мутуючого понад запис evidence/стану — сам
+            # BRAVO.local.config, активований на кроці -Activate, ним не
+            # чіпається. Без цього після одного неуспішного -Validate
+            # (наприклад, через довкіллєву причину поза межами міграції —
+            # відтворено на реальному сервері DEV-LIMS 2026-09-29: відсутній
+            # git у PATH ламав self-test) не було жодного шляху повторити
+            # ті самі read-only перевірки без -Rollback, що суперечить
+            # власному §27-ідемпотентному наміру цієї функції, описаному
+            # коментарем вище.
+            $state = Assert-BRAVOPilotState -EvidenceDir $EvidenceDir -RequiredState @('Activated', 'Validated', 'Failed') -Operation '-Validate'
 
             $allPass = $true
 

@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — Current Project State
 
-Last verified: 2026-09-28 03:10 UTC
+Last verified: 2026-09-29 02:40 UTC
 
 ## Canonical branch
 
@@ -8,7 +8,10 @@ Last verified: 2026-09-28 03:10 UTC
 
 ## State baseline SHA
 
-`cb44151f9d9fcc9ae0f4e04221b85c610d7ec7eb`
+`7aa167833fe0af0c733397f82b9ba67624991ceb`
+
+(Only change since the previous baseline `cb44151`: PR #241, a docs-only `PROJECT_STATE.md` sync commit
+`e78f086`. No runtime behavior changed between the two SHAs.)
 
 Before starting substantial work, verify:
 
@@ -362,6 +365,84 @@ Process note: пройдено 6 раундів рев'ю Codex, 25+ знахі�
 3. **`NotificationError` у Health.** Половину тред-знахідки (severity при `ShouldBlock` маніфесту) закрито;
    друга половина вимагає централізації Operations-звітності в `Complete-BRAVOHealthResult` для **всіх 13
    exit-шляхів** із характеризаційним покриттям кожного — окрема хвиля, а не правка в межах рев'ю.
+
+### Issue #216 B5 — DEV-LIMS pilot migration executed (2026-09-29)
+
+Real-server pilot migration executed on DEV-LIMS (10.10.200.105, Windows Server 2022, non-critical pilot
+host), using `deploy/Update-BRAVOServer.ps1` + `deploy/Start-BRAVOConfigV2Pilot.ps1` per
+`docs/BRAVO_CONFIG_V2_PILOT_RUNBOOK.md`. This is the owner confirmation that item 1 below had been
+waiting for.
+
+Sequence: updated DEV-LIMS from stable 5.2.4 to an `origin/developer` build (5.3.0-dev.3, HEAD `7aa1678`,
+packaged via plain `git archive` since the kit's `VERSION.json.sourceCommit` predates current HEAD by
+several merges and would fail `ci/New-BRAVOReleaseArtifact.ps1`'s `PROVENANCE_STALE` gate — not used for
+this non-release deployment) -> pilot Preflight/Prepare/Approve/Activate/Validate/Accept via
+`deploy/Start-BRAVOConfigV2Pilot.ps1`.
+
+Human-reviewed delta: 5 of 43 `BRAVO.config`-vs-canonical-default differences were genuine site overrides
+worth migrating (`hostInformationSettings.PublicIPLookupEnabled`, `lunchArchiveCleanupPath`,
+`maintenanceSettings.Limits.ExcludedDrives`, `maintenanceSettings.Restore.Time`, `smbSettings.RootPath`);
+the other 38 were derived/Phase-2/example fields or stale values (notably
+`maintenanceSettings.General.ArchivePrefix='lab_v2412'`, superseded by the live `test_company_v2412`
+already sourced from Credential Manager — migrating it would have been a regression).
+`BRAVO.local.config` activated on DEV-LIMS with only the 5 confirmed keys; `BRAVO.config` left in place
+(Крок 6 / physical removal explicitly out of scope for this pilot, deferred).
+
+Final `acceptance.json` (`C:\ProgramData\BRAVO\ConfigV2PilotEvidence\DEV-LIMS-20260928-215036`): 12 of 13
+criteria PASS (`PreflightPass`, `ArtifactIntegrityPass`, `BaselineCaptured`, `HumanReviewApproved`,
+`BackupVerified`, `ActivationPass`, `ValidateOnlyReadOnlyPass`, `SemanticParityZeroDiff`, `HealthPass`,
+`ArchiveSmokePass`, `SelfTestNoUnavailable`, `NoSecretExposureDetected`); `SelfTestPass=false` is the sole
+failing criterion, `Result: "PILOT NOT ACCEPTED"`. Root cause: self-test assertion
+`Notifications/PublicIPLookupEnabledByDefault` — DEV-LIMS's `BRAVO.config` already had
+`PublicIPLookupEnabled=false` before this pilot (one of the 5 migrated overrides, deliberately preserved
+for parity), which conflicts with the 2026-08-30 owner decision that this should default to `true`
+fleet-wide. This is a pre-existing site-policy gap independent of the Config V2 migration itself, proven
+by `SemanticParityZeroDiff=true` (BEFORE==AFTER effective config, zero unexpected diff) and
+`HealthPass=true` (zero new degradations vs the pre-activation baseline). Owner decision: fix
+`PublicIPLookupEnabled` on DEV-LIMS as a **separate** follow-up (changing it as part of this pilot's
+evidence would itself break `SemanticParityZeroDiff`), then re-run `-Validate`/`-Accept` for a clean
+`PILOT ACCEPTED` — not yet done.
+
+**Two real bugs found and fixed in the pilot tool itself** (this was its first-ever real-server
+execution). Fixed in a local worktree on branch `fix/config-v2-pilot-allowemptystring` (based on
+`origin/developer` `7aa1678`), **not committed/pushed**:
+
+1. `deploy/BRAVOConfigV2Pilot.Runtime.ps1` — 4 mandatory `[string[]]` evidence-capture parameters
+   (`Write-BRAVOPilotEvidenceText`, `Assert-BRAVOPilotTextSecretSafe`,
+   `Get-BRAVOPilotHealthDegradationLines` x2) had `[AllowEmptyCollection()]` but not
+   `[AllowEmptyString()]` — PowerShell's mandatory-parameter check rejects any non-empty array containing
+   an empty-string element even with `AllowEmptyCollection`, and captured console output routinely
+   contains blank lines. Fixed by adding `[AllowEmptyString()]` alongside.
+2. Same file, `Invoke-BRAVOPilotHealthSnapshot`/`Invoke-BRAVOPilotSelfTest`/`Invoke-BRAVOPilotArchiveSmoke`
+   — captured child-process output via `2>&1`, which only merges the Error stream; `BRAVO_HEALTH.ps1` /
+   `BRAVO_SELF_TEST.ps1` / `BRAVO_DRY_RUN.ps1` run in-process and write via `Write-Host` (Information
+   stream 6), so evidence silently captured near-zero lines (root-caused by a local Claude Code instance
+   running interactively on DEV-LIMS). Fixed with `*>&1` (all streams) plus explicit `Write-Host`
+   passthrough to preserve live console output for the operator.
+3. `deploy/Start-BRAVOConfigV2Pilot.ps1` — `-Validate`'s `Assert-BRAVOPilotState` only allowed
+   `@('Activated', 'Validated')`, contradicting its own idempotent-retry design comment; a failed
+   `-Validate` had no retry path except `-Rollback`. Fixed by adding `'Failed'` to the allowed set.
+
+These are genuine tooling defects, not migration-safety issues — worth a small standalone PR before any
+further fleet rollout uses this tool.
+
+**Operational footprint left on DEV-LIMS, not yet cleaned up:**
+
+* Git for Windows installed (`C:\Program Files\Git`) — needed because a self-test `ReleasePolicy`
+  assertion crashes outright (not gracefully skip) when `git.exe` is entirely absent from PATH, even
+  though the deployed kit has no `.git` checkout.
+* A Scheduled Task named `BRAVO-Agent-Runner` (Batch logon, `Admin` password stored in the task
+  definition) was registered, owner-authorized for this session, to let an automated session trigger
+  PowerShell with full Credential Manager access via WinRM (plain WinRM network logon cannot reach
+  DPAPI-protected Credential Manager entries). **Remove this task and its stored credential once
+  DEV-LIMS autonomous work is no longer needed** — it is a standing credential-storage footprint on a
+  real host.
+* Pilot artifact + patched runtime files live under `C:\Temp\BRAVO_UPDATE\` on DEV-LIMS, not cleaned up.
+
+**Explicitly not done, deferred by design:** Крок 6 (physical removal of `BRAVO.config` from DEV-LIMS),
+and fleet migration to any other real server — both require separate, explicit per-server owner
+authorization.
+
 ## Closed / superseded work
 
 ### PR #213
@@ -511,24 +592,25 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 
 ## NEXT ACTION
 
-**Updated 2026-09-28 after PR #225 merged as `cb44151`, with explicit owner authorization for the merge.**
-No uncommitted work is pending and no PR is open.
-
-**CORRECTION to the previous wording of this section.** It said "none of the three remaining items can be
-closed by an automated session ... do not manufacture a substitute task", which conflated two different
-things: items 1-3 below (genuinely owner-blocked) and the repository's remaining work as a whole. The latter
-is **not** owner-blocked — a 2026-09-28 read-only audit produced a concrete autonomous backlog (block A
-below), every item of which an automated session can take to a green PR under the standing contract (branch,
-commit, push, PR, fix CI; merge/tag/release/deploy still require explicit authorization). Do not read this
-section as "nothing can be done without the owner".
+**Updated 2026-09-29 after the DEV-LIMS B5 pilot (see "Issue #216 B5 — DEV-LIMS pilot migration executed"
+above).** Uncommitted work exists: 2 real bugs fixed in `deploy/BRAVOConfigV2Pilot.Runtime.ps1` +
+`deploy/Start-BRAVOConfigV2Pilot.ps1`, in a local worktree on branch
+`fix/config-v2-pilot-allowemptystring` (based on `7aa1678`), not pushed, no PR open. Do not lose or
+re-derive this fix from scratch — locate that branch/worktree first.
 
 The single executable next action is therefore:
 
 ```text
-Re-verify current state (`git fetch origin --prune`, `git rev-parse origin/developer`, GitHub
-issue #154, #216, #219, #239), then ask the owner to select one item from block A (autonomous)
-or items 1-3 (owner-blocked) below, and stop.
-Evidence-only / read-only. No repository modifications, no commit, no push.
+Ask the owner which of the following to do first (all are ready to execute, none require
+further investigation):
+  (a) commit + push the fix/config-v2-pilot-allowemptystring worktree, open a PR;
+  (b) fix PublicIPLookupEnabled on DEV-LIMS separately, re-run -Validate/-Accept for a clean
+      PILOT ACCEPTED;
+  (c) decide the fleet-rollout authorization model (per-server vs blanket) for the remaining
+      real servers;
+  (d) clean up the BRAVO-Agent-Runner Scheduled Task + stored credential on DEV-LIMS;
+  (e) pick an item from Block A (autonomous) or items 2-3 (owner-blocked) below instead.
+Do not repeat the DEV-LIMS diagnosis — it is fully recorded above.
 ```
 
 ### Block A — autonomous backlog (no owner, no real servers, no elevated scope)
@@ -573,13 +655,22 @@ Items 1-3 are a selection menu, not a work queue. Each line records what the
 item needs from the owner, so the question can be asked without re-deriving it:
 
 ```text
-1. B5 (fleet migration) has zero evidence of execution anywhere in the repository and requires real
-   production servers. Confirm with the owner whether/when a pilot migration + fleet rollout will happen,
-   using the existing tooling (deploy/Start-BRAVOConfigV2Pilot.ps1,
-   deploy/Get-BRAVOConfigSiteDelta.ps1, deploy/Compare-BRAVOConfigEffectiveSnapshot.ps1) and the runbook
-   docs/BRAVO_CONFIG_V2_PILOT_MIGRATION_RUNBOOK_20260916.md. Until this happens, do NOT deploy current
-   `developer` to any real fleet server — see the operational-risk note under "Issue #216 Wave B — B4 part 2"
-   above (silent loss of legacy `BRAVO.config` site overrides).
+1. B5 pilot (DEV-LIMS) executed 2026-09-29 — see "Issue #216 B5 — DEV-LIMS pilot migration executed"
+   above. `PILOT NOT ACCEPTED` only on `SelfTestPass`, a pre-existing site-policy gap unrelated to
+   migration safety (parity/health/archive all PASS). Remaining owner decisions before B5 can be
+   considered closed and fleet rollout can start:
+   (a) fix `PublicIPLookupEnabled` on DEV-LIMS as a separate step, re-run `-Validate`/`-Accept` for a
+       clean `PILOT ACCEPTED`;
+   (b) commit/push the 2 real pilot-tool bugs fixed in `fix/config-v2-pilot-allowemptystring` (based on
+       `7aa1678`) to `developer` before any other server uses this tool;
+   (c) decide whether DEV-LIMS's own fleet-migration counts as sufficient precedent to proceed to other
+       real servers, or whether each server needs its own owner go-ahead (this session treated DEV-LIMS
+       as a one-server-at-a-time authorization, not a blanket one);
+   (d) clean up the `BRAVO-Agent-Runner` Scheduled Task + stored credential on DEV-LIMS once no longer
+       needed.
+   Until (a)-(c) are resolved, do NOT deploy current `developer` to any OTHER real fleet server — see the
+   operational-risk note under "Issue #216 Wave B — B4 part 2" above (silent loss of legacy `BRAVO.config`
+   site overrides) for servers that have not been through their own pilot migration.
 2. B7 (v2-path regression matrix + Config parity promoted to a required status check): PR #238 (merged
    2026-09-27) added one governance-gate artifact (`LEGACY_READER_ISOLATION` in
    `ci/BRAVOConfigV2CutoverGates.ps1`, see "Issue #216 B7" entry above), but the regression matrix and the
