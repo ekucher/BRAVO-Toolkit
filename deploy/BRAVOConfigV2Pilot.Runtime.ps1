@@ -159,8 +159,19 @@ function Assert-BRAVOPilotTextSecretSafe {
     # key/value перевірку для вільного тексту застосувати неможливо
     # (немає структури), тож для логів діє вужчий, але детермінований
     # інваріант.
+    #
+    # [AllowEmptyString()] обов'язковий поруч із [AllowEmptyCollection()]:
+    # остання дозволяє лише масив нульової довжини в цілому, але mandatory
+    # [string[]]-параметр за замовчуванням однаково відхиляє БУДЬ-ЯКИЙ
+    # непорожній масив, що містить хоча б один порожній рядок-елемент
+    # ("Cannot bind argument to parameter 'Lines' because it is an empty
+    # string.") — а захоплений вивід дочірнього процесу (BRAVO_SETUP.ps1
+    # тощо) майже завжди містить порожні рядки для порожніх рядків
+    # консольного виводу. Відтворено й підтверджено на реальному сервері
+    # (DEV-LIMS) 2026-09-29: перший реальний прогін -Validate впав саме на
+    # цьому.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$Lines)
+    param([Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
 
     $lineNumber = 0
     foreach ($line in @($Lines)) {
@@ -199,10 +210,16 @@ function Write-BRAVOPilotEvidenceText {
     # (ParameterArgumentValidationErrorEmptyArrayNotAllowed), що ховає
     # первинну помилку дочірнього скрипта за вторинним необробленим
     # винятком тут.
+    #
+    # [AllowEmptyString()] обов'язковий поруч: mandatory [string[]] окремо
+    # відхиляє й будь-який непорожній масив із порожнім рядком-елементом
+    # (звичайна річ у захопленому консольному виводі) — той самий клас
+    # дефекту, що описаний вище для порожнього масиву в цілому. Відтворено
+    # й підтверджено на реальному сервері (DEV-LIMS) 2026-09-29.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][string]$Path,
-        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$Lines
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines
     )
 
     Assert-BRAVOPilotTextSecretSafe -Lines $Lines
@@ -588,7 +605,15 @@ function Invoke-BRAVOPilotHealthSnapshot {
     if (-not (Test-Path -LiteralPath $healthPath -PathType Leaf)) {
         throw "PILOT_HEALTH_FAILED: не знайдено $healthPath."
     }
-    $output = @(& $healthPath -NoPause 2>&1 | ForEach-Object { [string]$_ })
+    # *>&1, НЕ 2>&1: canonical entrypoint-и (BRAVO_HEALTH/BRAVO_SELF_TEST/
+    # BRAVO_DRY_RUN) виконуються in-process і пишуть результат через
+    # Write-Host — це Information stream (6), який 2>&1 НЕ зливає в pipeline.
+    # З 2>&1 evidence лишався порожнім, а [FAIL]/[НЕДОСТУПНО]/деградації
+    # мовчки не детектувались (stub-и self-test-у використовують
+    # Write-Output, тому дефект там не відтворювався). Відтворено на
+    # реальному сервері (DEV-LIMS) 2026-09-29. Write-Host у ForEach-Object
+    # зберігає живий консольний вивід для оператора, як і раніше.
+    $output = @(& $healthPath -NoPause *>&1 | ForEach-Object { $line = [string]$_; Write-Host $line; $line })
     $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
     return [pscustomobject]@{ Path = $OutputPath; ExitCode = $exitCode; Lines = $output }
@@ -606,9 +631,15 @@ function Get-BRAVOPilotHealthDegradationLines {
     # Write-BRAVOPilotEvidenceText/Assert-BRAVOPilotTextSecretSafe;
     # відтворено на реальній VM: перший Validate-прогін на свіжому сервері
     # не має health.before.log, тому $BeforeLines = @() (порожній, не $null).
+    #
+    # [AllowEmptyString()] обов'язковий поруч: mandatory [string[]] окремо
+    # відхиляє й будь-який непорожній масив із порожнім рядком-елементом —
+    # той самий клас дефекту, що й вище; health-вивід рясніє порожніми
+    # рядками. Відтворено й підтверджено на реальному сервері (DEV-LIMS)
+    # 2026-09-29.
     param(
-        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$BeforeLines,
-        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][string[]]$AfterLines
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$BeforeLines,
+        [Parameter(Mandatory = $true)][AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$AfterLines
     )
     $pattern = '(?i)\[(CRITICAL|FAIL|ERROR)\]'
     $before = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
@@ -995,7 +1026,8 @@ function Invoke-BRAVOPilotSelfTest {
     if (-not (Test-Path -LiteralPath $selfTestPath -PathType Leaf)) {
         throw "PILOT_SELFTEST_FAILED: не знайдено $selfTestPath."
     }
-    $output = @(& $selfTestPath -NoPause 2>&1 | ForEach-Object { [string]$_ })
+    # *>&1 — див. коментар в Invoke-BRAVOPilotHealthSnapshot (Write-Host).
+    $output = @(& $selfTestPath -NoPause *>&1 | ForEach-Object { $line = [string]$_; Write-Host $line; $line })
     $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
 
@@ -1038,7 +1070,8 @@ function Invoke-BRAVOPilotArchiveSmoke {
     if (-not (Test-Path -LiteralPath $dryRunPath -PathType Leaf)) {
         throw "PILOT_ARCHIVE_SMOKE_FAILED: не знайдено $dryRunPath."
     }
-    $output = @(& $dryRunPath 2>&1 | ForEach-Object { [string]$_ })
+    # *>&1 — див. коментар в Invoke-BRAVOPilotHealthSnapshot (Write-Host).
+    $output = @(& $dryRunPath *>&1 | ForEach-Object { $line = [string]$_; Write-Host $line; $line })
     $exitCode = Get-BRAVOPilotSafeLastExitCode
     Write-BRAVOPilotEvidenceText -Path $OutputPath -Lines $output
     return [pscustomobject]@{ ExitCode = $exitCode; Pass = ($exitCode -eq 0); Path = $OutputPath }
