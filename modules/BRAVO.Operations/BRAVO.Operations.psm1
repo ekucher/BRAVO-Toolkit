@@ -171,12 +171,58 @@ function Get-BRAVOOperationsServerId {
         }
     }
 
-    $newServerId = [guid]::NewGuid().ToString()
-    Write-BRAVOOperationsAtomicJsonFile -Path $statePath -Object ([pscustomobject]@{
-        ServerId = $newServerId
-        CreatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-    })
-    return $newServerId
+    # Review finding (thread 7, concurrent first-time identity creation):
+    # read-then-write вище не був серіалізований. Два одночасні прогони
+    # (Archive/Health/Maintenance/heartbeat можуть стартувати за
+    # розкладом разом) обидва бачили відсутній файл, генерували РІЗНІ
+    # GUID, і Write-BRAVOOperationsAtomicJsonFile -> [IO.File]::Move
+    # у програвця кидав виняток (призначення вже існує). Той виняток
+    # обходив outbox-шлях і назавжди губив подію програвця. Claim-лок
+    # цього не покривав — він серіалізує ІНШИЙ файл стану.
+    #
+    # Той самий канонічний named-mutex, що для claim: серіалізуємо
+    # критичну секцію, після отримання локу перечитуємо стан
+    # (double-checked locking), і навіть якщо лок не дався — не пишемо
+    # конкурентний GUID, а перечитуємо переможця.
+    $lockMutex = Enter-BRAVOOperationsEnrollmentClaimLock -Path $statePath
+    try {
+        if ([IO.File]::Exists($statePath)) {
+            # Поки чекали на лок, власник уже створив ідентичність —
+            # повертаємо ЇЇ, а не другий, зайвий GUID.
+            try {
+                $winner = ([IO.File]::ReadAllText($statePath, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json -ErrorAction Stop)
+                $winnerGuid = [guid]::Empty
+                if ([guid]::TryParse([string]$winner.ServerId, [ref]$winnerGuid)) {
+                    return $winnerGuid.ToString()
+                }
+            } catch {
+                # Впасти сюди означає, що файл щойно створено, але він
+                # непарсований — той самий fail-closed контракт, що вище.
+            }
+            Write-BRAVOLog -Component 'Operations' -Level 'ERROR' `
+                -Message "Файл ідентичності Operations ($statePath) створено паралельним процесом, але прочитати з нього валідний ServerId не вдалося — звітність Operations пропущено цей прогін (ідентичність НЕ перезаписується, щоб не створити ghost-ідентичність)."
+            return $null
+        }
+        if ($null -eq $lockMutex) {
+            # Лок не отримано за таймаут І файлу все ще немає: не пишемо
+            # свій GUID (це і є race, від якої захищаємось) — пропускаємо
+            # звітність цей прогін. Подія не губиться: порожній apiKey у
+            # Send-BRAVOOperationsEvent буферизує її в durable outbox.
+            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                -Message 'Не вдалося отримати cross-process лок для першостворення ідентичності Operations (інший процес BRAVO, ймовірно, робить це паралельно) — звітність Operations пропущено цей прогін, щоб не створити другу, конкурентну ідентичність'
+            return $null
+        }
+        $newServerId = [guid]::NewGuid().ToString()
+        Write-BRAVOOperationsAtomicJsonFile -Path $statePath -Object ([pscustomobject]@{
+            ServerId = $newServerId
+            CreatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        })
+        return $newServerId
+    } finally {
+        if ($null -ne $lockMutex) {
+            Exit-BRAVOOperationsEnrollmentClaimLock -Mutex $lockMutex
+        }
+    }
 }
 
 # ---------------------------------------------------------------------
@@ -328,9 +374,21 @@ function Get-BRAVOOperationsEnrollmentClaim {
         # й раніше для збою диска: claim генерується лише для ПАМ'ЯТІ
         # цього прогону, без запису (щоб точно не перезаписати те, що
         # власник локу саме зараз пише).
+        # Review finding (thread 12, ephemeral claim after lock timeout):
+        # раніше тут генерувався НОВИЙ claim лише в памʼяті й одразу йшов
+        # у POST /enroll. Якщо такий ephemeral POST діставав API ПЕРШИМ,
+        # сервер зв'язував саме цей claim, а власник локу тим часом
+        # персистував СВІЙ — після чого кожен наступний прогін читав з
+        # диска claim-програвець і отримував постійний 409 claim_mismatch.
+        # Тобто fallback відтворював ту саму race, яку лок мав прибрати.
+        # Тепер: enrollment цього прогону просто пропускається ($null) —
+        # власник локу його завершить, а наступна подія/heartbeat
+        # прочитає вже персистований claim. Втрати подій немає:
+        # Send-BRAVOOperationsEvent на порожній apiKey буферизує подію в
+        # durable outbox.
         Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-            -Message 'Не вдалося отримати cross-process лок для першостворення enrollment-claim (інший процес BRAVO, ймовірно, робить це паралельно) — цей прогін використає claim лише в памʼяті, без запису на диск'
-        return [guid]::NewGuid().ToString()
+            -Message 'Не вдалося отримати cross-process лок для першостворення enrollment-claim (інший процес BRAVO, ймовірно, робить це паралельно) — enrollment цього прогону пропущено, щоб не надіслати конкурентний claim; наступна подія/heartbeat використає claim, персистований власником локу'
+        return $null
     }
     try {
         # Double-checked locking: поки чекали на mutex, інший процес міг
@@ -698,6 +756,13 @@ function Invoke-BRAVOOperationsEnrollment {
     $timeoutSeconds = [int]$OperationsReportingSettings.RequestTimeoutSeconds
 
     $claim = Get-BRAVOOperationsEnrollmentClaim
+    if ([string]::IsNullOrWhiteSpace($claim)) {
+        # Get-BRAVOOperationsEnrollmentClaim уже залогувала WARNING (лок
+        # першостворення claim тримає інший процес BRAVO) — enrollment
+        # пропускається цей прогін, БЕЗ POST з порожнім/конкурентним
+        # claim-заголовком.
+        return $null
+    }
     $enrollmentState = Get-BRAVOOperationsEnrollmentState
     # Гарантія проти застарілого знімка стану: Get-BRAVOOperationsEnrollmentClaim
     # МІГ щойно згенерувати й персистувати НОВИЙ claim (перший запуск для
@@ -1049,7 +1114,24 @@ function Add-BRAVOOperationsOutboxItem {
             RequestBody = $RequestBody
             EnqueuedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
             AttemptCount = $AttemptCount
-            NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds((Get-BRAVOOperationsOutboxBackoffSeconds -AttemptCount $AttemptCount)).ToString('o')
+            # Review finding (thread 10, attempt-zero backoff): для
+            # AttemptCount=0 (подія буферизована, бо enrollment ще
+            # pending — це НЕ невдала спроба відправки) стартового
+            # backoff бути не повинно. Раніше значення йшло в
+            # Get-BRAVOOperationsOutboxBackoffSeconds, який клампить 0 до
+            # 1 і давав +30с: одразу після approve/reissue ручний
+            # BRAVO_OPERATIONS_HEARTBEAT.ps1 отримував ключ, але щойно
+            # поставлену подію ще НЕ бачив як due й пропускав — вона
+            # чекала наступного природного Archive/Health/Maintenance
+            # прогону (години). Тепер attempt 0 = due негайно, як і
+            # обіцяє коментар викликача.
+            NextRetryAtUtc = $(
+                if ($AttemptCount -le 0) {
+                    (Get-Date).ToUniversalTime().ToString('o')
+                } else {
+                    (Get-Date).ToUniversalTime().AddSeconds((Get-BRAVOOperationsOutboxBackoffSeconds -AttemptCount $AttemptCount)).ToString('o')
+                }
+            )
             LastError = $LastError
         }
         Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsOutboxItemPath -EventId $EventId) -Object $item
@@ -1206,14 +1288,28 @@ function Send-BRAVOOperationsEnvelope {
         $statusCode = Get-BRAVOOperationsHttpStatusCode -ErrorRecord $_
         if ($statusCode -eq 401) {
             Clear-BRAVOOperationsInvalidCredential -CredentialTargets $CredentialTargets
-            # Не enqueue: цей самий ключ ніколи не стане валідним — outbox
-            # ретраяв би вічно марно. Подія для ЦІЄЇ спроби втрачається
-            # (той самий залишковий ризик, що й попередня поведінка "log
-            # and drop"); наступний успішний enrollment почне з чистого
-            # потоку нових подій.
+            # Review finding (thread 5, event loss on 401): раніше тут
+            # стояло "не enqueue, бо цей ключ ніколи не стане валідним".
+            # Аргумент хибний: outbox item НЕ зберігає ключ — дренаж
+            # підставляє той, що валідний на момент дренажу
+            # (Invoke-BRAVOOperationsOutboxDrain -ApiKey). Тож подія, яка
+            # САМЕ і виявила інвалідизацію ключа (результат backup/health/
+            # maintenance), не має гинути: після наступного успішного
+            # enrollment вона доставиться нормально. Вічного ретраю немає
+            # — і 401 у дренажі зупиняє дренаж, і сам outbox обмежений
+            # (MaxOutboxItems, витіснення найстарших у dead-letter).
+            Add-BRAVOOperationsOutboxItem -Kind $Kind -EventId $EventId -OccurredAtUtc $OccurredAtUtc `
+                -SchemaVersion $SchemaVersion -ApiPath $ApiPath -RequestBody $RequestBody `
+                -AttemptCount 0 -LastError "HTTP 401 (ключ відхилено як недійсний): $($_.Exception.Message)"
             return $false
         }
-        if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 429) {
+        # Review finding (thread 8, HTTP 408): 408 Request Timeout —
+        # відповідь "я не дочекався твого запиту", а не "твій payload
+        # невалідний": вона не встановлює ні прийняття, ні відхилення
+        # події. Ретрай із ТИМ САМИМ eventId ідемпотентний на стороні API
+        # (UNIQUE(server_id, event_id)), тож 408 виключено з
+        # dead-letter-предикату так само, як 429.
+        if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 429 -and $statusCode -ne 408) {
             # Справжня помилка валідації (напр. 400) — не транзиєнтна,
             # ретрай нічого не змінить. Dead-letter, не тісний retry-цикл.
             $item = [pscustomobject]@{
@@ -1327,11 +1423,30 @@ function Invoke-BRAVOOperationsOutboxDrain {
                     # успішного enrollment.
                     return
                 }
-                if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 429) {
+                # Той самий 408-виняток, що й у Send-BRAVOOperationsEnvelope
+                # (review thread 8: "apply the same correction to the
+                # equivalent drain predicate") — інакше предикати дренажу
+                # й негайної відправки розійшлися б у семантиці.
+                if ($null -ne $statusCode -and $statusCode -ge 400 -and $statusCode -lt 500 -and $statusCode -ne 429 -and $statusCode -ne 408) {
                     Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "HTTP $statusCode при дренажі: $($_.Exception.Message)"
                     continue
                 }
+                # Review finding (thread 3, unbounded stall on a dead API):
+                # transient збій цього item означає, що транспорт/сервер
+                # зараз недоступний — решта items у цій пачці впадуть так
+                # само, кожен по повному TimeoutSeconds. Раніше дренаж
+                # ішов далі й з'їдав увесь MaxDrainDurationSeconds-бюджет
+                # (плюс overshoot на останній таймаут) у КОЖНОМУ прогоні
+                # Archive/Health/Maintenance, хоч жодна доставка вже не
+                # могла вдатись. Тепер — як і для 401 — зупиняємось після
+                # ПЕРШОГО transient збою: item лишається в outbox зі
+                # зростаючим backoff, решта черги недоторкана, наступний
+                # прогін спробує знову.
                 Update-BRAVOOperationsOutboxItemAfterFailure -Item $item -LastError $_.Exception.Message
+                $remainingAfterTransient = @($items).Count - $processedCount
+                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                    -Message "Дренаж Operations outbox зупинено після першого transient збою (транспорт/таймаут/5xx/429) — API зараз недоступний, решта items не перевірялась цим прогоном: $remainingAfterTransient. Спроба повториться на наступній події/heartbeat."
+                return
             }
         }
     } catch {

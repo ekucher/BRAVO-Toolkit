@@ -323,8 +323,18 @@
       -Failure "backoff має бути 30/60/120s на спробах 1/2/3 і не перевищувати стелю 1800s на дуже великих attempt count; отримано $backoff1/$backoff2/$backoff3/$backoffHuge"
 
     # =====================================================================
-    # E11: 401 на надсиланні -> локальний API-ключ видаляється, подія НЕ
-    # потрапляє в нескінченний outbox-retry (запис не з'являється в Outbox\).
+    # E11: 401 на надсиланні -> локальний API-ключ видаляється, а сама
+    # подія ЗБЕРІГАЄТЬСЯ в durable outbox.
+    #
+    # Контракт свідомо змінений (review thread 5, PR #225): раніше тут
+    # перевірялось ПРОТИЛЕЖНЕ — що 401 НЕ ставить подію в outbox, бо "цей
+    # самий ключ ніколи не стане валідним і retry був би вічним". Той
+    # аргумент хибний: outbox item НЕ зберігає ключ, дренаж підставляє
+    # той, що валідний на момент дренажу. Тож стара очікуваність означала
+    # гарантовану втрату саме тієї події (результату backup/health/
+    # maintenance), яка й виявила інвалідизацію ключа. Вічного retry немає
+    # й тепер: 401 у дренажі зупиняє дренаж, а outbox обмежений
+    # (MaxOutboxItems -> витіснення найстарших у dead-letter).
     # =====================================================================
     $e11Dir = Join-Path $opsSelfTestRoot 'E11_Revoked'
     Set-BRAVOOpsSelfTestStateDirectory -Directory $e11Dir
@@ -339,9 +349,26 @@
         -Failure '401 на event-надсиланні має призвести до видалення локального збереженого API-ключа (E11)'
 
     $e11OutboxItems = @(Get-ChildItem -LiteralPath (Join-Path $e11Dir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
-    Test-BRAVOCondition -Condition ($e11OutboxItems.Count -eq 0) `
-        -Name 'Operations/HttpUnauthorizedDoesNotEnqueueOutboxRetry' `
-        -Failure "401 НЕ повинен ставити подію в outbox для нескінченного марного retry тим самим невалідним ключем; знайдено $($e11OutboxItems.Count) файлів"
+    Test-BRAVOCondition -Condition ($e11OutboxItems.Count -eq 1) `
+        -Name 'Operations/HttpUnauthorizedEnqueuesEventForLaterKey' `
+        -Failure "401 має ЗБЕРЕГТИ подію в durable outbox (ключ у item не зберігається — дренаж підставить валідний після наступного enrollment); знайдено $($e11OutboxItems.Count) файлів замість 1"
+
+    # Той самий item мусить лишитись негайно дренажним (AttemptCount=0 —
+    # це не невдала спроба доставки, а відкладення через невалідний
+    # ключ), інакше подія чекала б штучні 30с і її пропустив би ручний
+    # BRAVO_OPERATIONS_HEARTBEAT.ps1 одразу після reissue ключа.
+    $e11Item = $null
+    if ($e11OutboxItems.Count -eq 1) {
+        $e11Item = ([IO.File]::ReadAllText($e11OutboxItems[0].FullName, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json)
+    }
+    $e11DueNow = $false
+    if ($null -ne $e11Item) {
+        $e11NextRetry = [datetime]::Parse([string]$e11Item.NextRetryAtUtc, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind).ToUniversalTime()
+        $e11DueNow = ([int]$e11Item.AttemptCount -eq 0) -and ($e11NextRetry -le (Get-Date).ToUniversalTime().AddSeconds(1))
+    }
+    Test-BRAVOCondition -Condition $e11DueNow `
+        -Name 'Operations/AttemptZeroOutboxItemIsImmediatelyDue' `
+        -Failure 'Item, поставлений в outbox з AttemptCount=0 (401 або pending enrollment), мусить бути негайно дренажним: AttemptCount=0 і NextRetryAtUtc <= now, БЕЗ штучного стартового backoff 30с'
 
     # =====================================================================
     # DEAD-LETTER: справжня 4xx-помилка валідації (400) НЕ повинна вічно
@@ -360,6 +387,67 @@
     Test-BRAVOCondition -Condition ($normalOutboxAfter400.Count -eq 0 -and $deadLetterAfter400.Count -eq 1) `
         -Name 'Operations/PermanentValidationErrorGoesToDeadLetterNotRetryOutbox' `
         -Failure "HTTP 400 (справжня помилка валідації) має піти в DeadLetter\ (знайдено $($deadLetterAfter400.Count)), НЕ в звичайний retry-Outbox\ (знайдено $($normalOutboxAfter400.Count))"
+
+    # =====================================================================
+    # HTTP 408: Request Timeout — НЕ постійна помилка валідації.
+    #
+    # Review finding (thread 8, PR #225): попередній предикат dead-letter
+    # покривав увесь діапазон 4xx крім 429, тож 408 від API чи проміжного
+    # gateway трактувався як "payload відхилено" й подія переносилась у
+    # DeadLetter\ назавжди — хоча 408 означає лише "я не дочекався твого
+    # запиту" і не встановлює ні прийняття, ні відхилення. Ретрай із ТИМ
+    # САМИМ eventId ідемпотентний на стороні API (UNIQUE(server_id,
+    # event_id)), тому 408 має йти в звичайний retry-Outbox\, як 429.
+    # =====================================================================
+    $timeout408Dir = Join-Path $opsSelfTestRoot 'Timeout408'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $timeout408Dir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'valid-api-key' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpError -StatusCode 408 -BodyObject @{ error = 'request_timeout' }
+    Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings -CredentialTargets $opsCredentialTargets `
+        -InstitutionCode 'INST1' -Category 'backup' -Severity 'SUCCESS' -Message '408 retry test event'
+
+    $outboxAfter408 = @(Get-ChildItem -LiteralPath (Join-Path $timeout408Dir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $deadLetterAfter408 = @(Get-ChildItem -LiteralPath (Join-Path $timeout408Dir 'Outbox\DeadLetter') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition ($outboxAfter408.Count -eq 1 -and $deadLetterAfter408.Count -eq 0) `
+        -Name 'Operations/RequestTimeout408RetriesInsteadOfDeadLetter' `
+        -Failure "HTTP 408 має піти в звичайний retry-Outbox\ (знайдено $($outboxAfter408.Count), очікувалось 1), а НЕ в DeadLetter\ (знайдено $($deadLetterAfter408.Count), очікувалось 0)"
+
+    # =====================================================================
+    # ДРЕНАЖ: зупинка після ПЕРШОГО transient збою.
+    #
+    # Review finding (thread 3, PR #225): коли API недоступний, кожен
+    # due-item у пачці падав по повному RequestTimeoutSeconds, а дренаж
+    # ішов далі — Archive/Health/Maintenance платили за це затримкою в
+    # кожному прогоні, хоча жодна доставка вже не могла вдатись. Тепер
+    # дренаж зупиняється після першого transient збою (як і для 401):
+    # рівно ОДНА HTTP-спроба, і ЖОДЕН item не втрачено.
+    # =====================================================================
+    $drainStopDir = Join-Path $opsSelfTestRoot 'DrainStop'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $drainStopDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'valid-api-key' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    foreach ($seedIndex in 1..3) {
+        & $opsSelfTestModule {
+            param($n)
+            Add-BRAVOOperationsOutboxItem -Kind 'event' -EventId "drainstop-$n" `
+                -OccurredAtUtc ((Get-Date).ToUniversalTime().ToString('o')) -SchemaVersion 1 `
+                -ApiPath '/api/v1/events' `
+                -RequestBody @{ category = 'backup'; severity = 'SUCCESS'; payload = @{ message = "seed$n" } } `
+                -AttemptCount 0
+        } $seedIndex
+    }
+    $seededDrainItems = @(Get-ChildItem -LiteralPath (Join-Path $drainStopDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    1..3 | ForEach-Object { Enqueue-BRAVOOpsSelfTestHttpNetworkError }
+    Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl ([string]$opsSettings.ApiBaseUrl) -ApiKey 'valid-api-key' `
+        -CredentialTargets $opsCredentialTargets -TimeoutSeconds ([int]$opsSettings.RequestTimeoutSeconds)
+    $drainItemsAfter = @(Get-ChildItem -LiteralPath (Join-Path $drainStopDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $seededDrainItems.Count -eq 3 -and $global:BRAVOOpsSelfTestHttpCalls.Count -eq 1 -and $drainItemsAfter.Count -eq 3
+    ) -Name 'Operations/OutboxDrainStopsAfterFirstTransientFailure' `
+      -Failure "Дренаж при недоступному API має зробити РІВНО одну HTTP-спробу й не втратити жодного item; засіяно $($seededDrainItems.Count) (очікувалось 3), HTTP-спроб $($global:BRAVOOpsSelfTestHttpCalls.Count) (очікувалось 1), лишилось у черзі $($drainItemsAfter.Count) (очікувалось 3)"
 
     # =====================================================================
     # ENROLLMENT (A1-A7 протокол — агент сам генерує claim, сервер його
