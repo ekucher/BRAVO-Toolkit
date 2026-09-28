@@ -4575,94 +4575,106 @@ function Send-BAZAIncompatibleNameAlert {
         }
     }
 
-    $examples = @(
-        $Issues |
-            Select-Object -First 3 |
-            ForEach-Object {
-                $displayName = [string]$_.Name
-                if ($displayName.Length -gt 120) {
-                    $displayName = $displayName.Substring(0, 117) + "..."
-                }
-
-                # The health formatter lives in a different function scope.
-                # Keep this standalone mode self-contained and only apply
-                # Markdown escaping when the selected provider is Discord.
-                if ($script:notificationProvider -eq "discord") {
-                    $displayName = $displayName.Replace("\", "\\")
-                    $displayName = $displayName.Replace("*", "\*")
-                    $displayName = $displayName.Replace("_", "\_")
-                    $displayName = $displayName.Replace("~", "\~")
-                    $displayName = $displayName.Replace("|", "\|")
-                    $displayName = $displayName.Replace(">", "\>")
-                }
-                $overflowBytes = [int]$_.Utf8ByteCount - [int]$_.MaximumUtf8Bytes
-                ":x: $($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) байт · перевищення +$overflowBytes байт`n$displayName"
-            }
-    )
-    $exampleLines = New-Object System.Collections.Generic.List[string]
-    if ($examples.Count -gt 0) {
-        $exampleLines.Add("Приклади:")
-        $exampleLines.Add("")
-        foreach ($example in $examples) {
-            $exampleLines.Add([string]$example)
-            $exampleLines.Add("")
-        }
-    }
-    $hostInformation = Get-HostInformation
-    $notificationTime = Get-Date
-    $archiveVersionText = [string]$global:ScriptVersion
-    $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
-        "невідома"
-    } else {
-        [string]$ScriptBuildId
-    }
-    $logFilePath = if (-not [string]::IsNullOrWhiteSpace([string]$script:logFile)) {
-        [string]$script:logFile
-    } else {
-        "журнал BRAVO_ARCHIV"
-    }
-    $fileCountText = Format-BRAVOUkrainianCount -Count $Issues.Count -One "файл" -Few "файли" -Many "файлів"
-    $fileCountHeaderText = $fileCountText.ToUpperInvariant()
-    $resultLines = @(
-        "Причина:",
-        "Назви $fileCountText перевищують допустиму довжину для передачі через SFTP.",
-        "Проблемні файли пропущено; інші файли синхронізуються штатно.",
-        "",
-        "Ліміт: $($Issues[0].MaximumUtf8Bytes) UTF-8 байт",
-        "Проблемних файлів: $($Issues.Count)"
-    ) + $exampleLines.ToArray()
-    $message = New-BRAVOOperatorNotificationMessage `
-        -Severity "WARNING" `
-        -Operation "$ComponentName — $fileCountHeaderText НЕ СИНХРОНІЗОВАНО" `
-        -ActionText "скоротити назви зазначених файлів." `
-        -InstitutionName ([string]$backupMonitoring.InstitutionName) `
-        -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-        -HostInformation $hostInformation `
-        -ResultLines $resultLines `
-        -Timestamp $notificationTime `
-        -ProductName "BRAVO Archive" `
-        -Version $archiveVersionText `
-        -BuildId $archiveBuildIdText `
-        -LogPath $logFilePath `
-        -LogLabel "Повний перелік"
-
+    # Review finding (thread 20, rendering cost when the channel is off):
+    # гейт нотифікації тепер стоїть ПЕРЕД побудовою повідомлення, а не
+    # після неї — так само, як у Send-ToolIntegrityAlert і
+    # Send-BRAVOArchiveFreeSpaceAlert. Раніше заміна ранніх `return` на
+    # $notificationWebhookUrl = $null лишила всю побудову безумовною, тож
+    # при -NoSlack / NotificationMode=none / відсутньому маршруті чи
+    # webhook (і навіть при ВИМКНЕНІЙ Operations-звітності) виконувався
+    # Get-HostInformation, який без теплого кешу робить зовнішній
+    # публічний IP-запит із 5-секундним таймаутом — Archive платив
+    # затримкою й робив несподіваний зовнішній запит виключно щоб
+    # сформувати текст, який ніколи не буде надіслано. Operations-подія
+    # нижче лишається ПОЗА цим гейтом (їй потрібні лише $Issues).
     if ($notificationWebhookUrl) {
-        try {
-            $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
-            Send-BRAVONotificationChunks `
-                -Provider $script:notificationProvider `
-                -WebhookUrl $notificationWebhookUrl `
-                -MessageChunks $outboundMessages `
-                -TimeoutSeconds $script:notificationRequestTimeoutSeconds
-            $chunkText = if ($outboundMessages.Count -gt 1) {
-                " частинами: $($outboundMessages.Count)"
-            } else {
-                ""
+        $examples = @(
+            $Issues |
+                Select-Object -First 3 |
+                ForEach-Object {
+                    $displayName = [string]$_.Name
+                    if ($displayName.Length -gt 120) {
+                        $displayName = $displayName.Substring(0, 117) + "..."
+                    }
+
+                    # The health formatter lives in a different function scope.
+                    # Keep this standalone mode self-contained and only apply
+                    # Markdown escaping when the selected provider is Discord.
+                    if ($script:notificationProvider -eq "discord") {
+                        $displayName = $displayName.Replace("\", "\\")
+                        $displayName = $displayName.Replace("*", "\*")
+                        $displayName = $displayName.Replace("_", "\_")
+                        $displayName = $displayName.Replace("~", "\~")
+                        $displayName = $displayName.Replace("|", "\|")
+                        $displayName = $displayName.Replace(">", "\>")
+                    }
+                    $overflowBytes = [int]$_.Utf8ByteCount - [int]$_.MaximumUtf8Bytes
+                    ":x: $($_.Utf8ByteCount)/$($_.MaximumUtf8Bytes) байт · перевищення +$overflowBytes байт`n$displayName"
+                }
+        )
+        $exampleLines = New-Object System.Collections.Generic.List[string]
+        if ($examples.Count -gt 0) {
+            $exampleLines.Add("Приклади:")
+            $exampleLines.Add("")
+            foreach ($example in $examples) {
+                $exampleLines.Add([string]$example)
+                $exampleLines.Add("")
             }
-            Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про $($Issues.Count) несумісних імен $ComponentName відправлено у $($script:notificationProviderDisplayName)$chunkText" -Level "SUCCESS"
-        } catch {
-            Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
         }
+        $hostInformation = Get-HostInformation
+        $notificationTime = Get-Date
+        $archiveVersionText = [string]$global:ScriptVersion
+        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+            "невідома"
+        } else {
+            [string]$ScriptBuildId
+        }
+        $logFilePath = if (-not [string]::IsNullOrWhiteSpace([string]$script:logFile)) {
+            [string]$script:logFile
+        } else {
+            "журнал BRAVO_ARCHIV"
+        }
+        $fileCountText = Format-BRAVOUkrainianCount -Count $Issues.Count -One "файл" -Few "файли" -Many "файлів"
+        $fileCountHeaderText = $fileCountText.ToUpperInvariant()
+        $resultLines = @(
+            "Причина:",
+            "Назви $fileCountText перевищують допустиму довжину для передачі через SFTP.",
+            "Проблемні файли пропущено; інші файли синхронізуються штатно.",
+            "",
+            "Ліміт: $($Issues[0].MaximumUtf8Bytes) UTF-8 байт",
+            "Проблемних файлів: $($Issues.Count)"
+        ) + $exampleLines.ToArray()
+        $message = New-BRAVOOperatorNotificationMessage `
+            -Severity "WARNING" `
+            -Operation "$ComponentName — $fileCountHeaderText НЕ СИНХРОНІЗОВАНО" `
+            -ActionText "скоротити назви зазначених файлів." `
+            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -HostInformation $hostInformation `
+            -ResultLines $resultLines `
+            -Timestamp $notificationTime `
+            -ProductName "BRAVO Archive" `
+            -Version $archiveVersionText `
+            -BuildId $archiveBuildIdText `
+            -LogPath $logFilePath `
+            -LogLabel "Повний перелік"
+
+            try {
+                $outboundMessages = ConvertTo-BRAVONotificationPayloadText -Provider $script:notificationProvider -Message $message
+                Send-BRAVONotificationChunks `
+                    -Provider $script:notificationProvider `
+                    -WebhookUrl $notificationWebhookUrl `
+                    -MessageChunks $outboundMessages `
+                    -TimeoutSeconds $script:notificationRequestTimeoutSeconds
+                $chunkText = if ($outboundMessages.Count -gt 1) {
+                    " частинами: $($outboundMessages.Count)"
+                } else {
+                    ""
+                }
+                Write-BRAVOLog -Component 'SFTP' -Message "Сповіщення про $($Issues.Count) несумісних імен $ComponentName відправлено у $($script:notificationProviderDisplayName)$chunkText" -Level "SUCCESS"
+            } catch {
+                Write-BRAVOLog -Component 'SFTP' -Message "Не вдалося відправити сповіщення про несумісні імена $ComponentName у $($script:notificationProviderDisplayName): $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level "ERROR"
+            }
     }
 
     if ($null -ne $operationsReportingSettings) {

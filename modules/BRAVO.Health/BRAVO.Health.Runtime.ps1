@@ -5594,13 +5594,30 @@ if ($healthIssues.Count -eq 0) {
     if ($null -ne $operationsReportingSettings) {
         try {
             $operationsHealthDuration = (Get-Date) - $healthCheckStarted
+            # Review finding (thread 15, severity vs фактичний exit status):
+            # ця гілка виконується, коли ЗВИЧАЙНІ перевірки не дали жодного
+            # issue — але Complete-BRAVOHealthResult нижче ще перекриє
+            # результат кодом ToolIntegrityViolation, якщо маніфест
+            # інструментів має ShouldBlock (напр. при вимкненому
+            # SFTP-моніторингу порушення цілісності не створює SFTP-issue,
+            # тож $healthIssues лишається порожнім). Раніше подія в такому
+            # разі рапортувала SUCCESS для прогону, який процес завершував
+            # порушенням цілісності. $script:BRAVOToolManifest уже
+            # обчислений вище (Test-BRAVOToolManifestIntegrity), тож тут це
+            # відомо без жодного перенесення логіки.
+            $operationsHealthSeverity = 'SUCCESS'
+            $operationsHealthMessage = 'Health-перевірка успішна'
+            if ($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock) {
+                $operationsHealthSeverity = 'CRITICAL'
+                $operationsHealthMessage = 'Health-перевірки без issue, але порушено цілісність комплекту інструментів — результат Health перекривається ToolIntegrityViolation'
+            }
             Send-BRAVOOperationsEvent `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
-                -Category 'health' -Severity 'SUCCESS' `
+                -Category 'health' -Severity $operationsHealthSeverity `
                 -Component 'Health' `
-                -Message 'Health-перевірка успішна' `
+                -Message $operationsHealthMessage `
                 -Services (Get-BRAVOManagedServiceStatusSnapshot) `
                 -Details @{
                     stages = @($script:BRAVOHealthStepHistory)
@@ -5608,6 +5625,7 @@ if ($healthIssues.Count -eq 0) {
                     warnCount = $script:BRAVOHealthStepWarningCount
                     errorCount = $script:BRAVOHealthStepErrorCount
                     durationMs = [Math]::Round($operationsHealthDuration.TotalMilliseconds)
+                    toolIntegrityShouldBlock = [bool]($null -ne $script:BRAVOToolManifest -and $script:BRAVOToolManifest.ShouldBlock)
                 }
         } catch {
             Write-HealthLog "Не вдалося відправити подію в Operations: $($_.Exception.Message)" -Level "WARNING"
