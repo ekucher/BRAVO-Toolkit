@@ -450,6 +450,107 @@
       -Failure "Дренаж при недоступному API має зробити РІВНО одну HTTP-спробу й не втратити жодного item; засіяно $($seededDrainItems.Count) (очікувалось 3), HTTP-спроб $($global:BRAVOOpsSelfTestHttpCalls.Count) (очікувалось 1), лишилось у черзі $($drainItemsAfter.Count) (очікувалось 3)"
 
     # =====================================================================
+    # Після transient-збою дренажу негайна відправка ПРОПУСКАЄТЬСЯ.
+    #
+    # Review finding (thread 19, PR #225): дренаж зупиняється на першому
+    # transient збої, але викликач цього не бачив і одразу робив ЩЕ ОДИН
+    # синхронний запит до того самого щойно недоступного API — подвійний
+    # RequestTimeoutSeconds у кожному прогоні. Тепер
+    # Invoke-BRAVOOperationsOutboxDrain повертає результат, і на
+    # 'transient'/'unauthorized' поточний envelope одразу ставиться в
+    # outbox. Разом із цим перевіряємо, що захоплений результат НЕ
+    # потрапляє у вихідний потік Send-BRAVOOperationsEvent.
+    # =====================================================================
+    $drainSkipDir = Join-Path $opsSelfTestRoot 'DrainSkip'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $drainSkipDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'valid-api-key' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    & $opsSelfTestModule {
+        Add-BRAVOOperationsOutboxItem -Kind 'event' -EventId 'drainskip-backlog' `
+            -OccurredAtUtc ((Get-Date).ToUniversalTime().ToString('o')) -SchemaVersion 1 `
+            -ApiPath '/api/v1/events' `
+            -RequestBody @{ category = 'backup'; severity = 'SUCCESS'; payload = @{ message = 'backlog' } } `
+            -AttemptCount 0
+    }
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpNetworkError
+    $drainSkipEmitted = @(Send-BRAVOOperationsEvent -OperationsReportingSettings $opsSettings `
+        -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1' `
+        -Category 'health' -Severity 'WARNING' -Message 'drain skip test event')
+    $drainSkipOutbox = @(Get-ChildItem -LiteralPath (Join-Path $drainSkipDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 1 -and $drainSkipOutbox.Count -eq 2 -and $drainSkipEmitted.Count -eq 0
+    ) -Name 'Operations/TransientDrainFailureSkipsImmediateSend' `
+      -Failure "Після transient-збою дренажу має бути РІВНО одна HTTP-спроба (отримано $($global:BRAVOOpsSelfTestHttpCalls.Count)), у черзі 2 items — backlog і поточна подія (отримано $($drainSkipOutbox.Count)), і ЖОДНОГО об'єкта у вихідному потоці Send-BRAVOOperationsEvent (отримано $($drainSkipEmitted.Count))"
+
+    # =====================================================================
+    # Item чужої серверної ідентичності карантиниться, а не надсилається.
+    #
+    # Review finding (thread 16, PR #225): після задокументованого
+    # відновлення від claim_mismatch оператор замінює server-id/enrollment
+    # state, але наявні файли в outbox лишались непривʼязаними — дренаж
+    # надсилав їх ключем НОВОЇ ідентичності, і бекенд приписував події
+    # старого сервера новому. Тепер item несе ідентичність, яка його
+    # породила, і розбіжність веде в dead-letter БЕЗ мережевої спроби.
+    # =====================================================================
+    $identityDir = Join-Path $opsSelfTestRoot 'IdentityReset'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $identityDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{ 'OpsSelfTestApiKey' = 'valid-api-key' }
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    & $opsSelfTestModule {
+        Add-BRAVOOperationsOutboxItem -Kind 'event' -EventId 'identity-orphan' `
+            -OccurredAtUtc ((Get-Date).ToUniversalTime().ToString('o')) -SchemaVersion 1 `
+            -ApiPath '/api/v1/events' `
+            -RequestBody @{ category = 'backup'; severity = 'SUCCESS'; payload = @{ message = 'orphan' } } `
+            -AttemptCount 0
+    }
+    $orphanFiles = @(Get-ChildItem -LiteralPath (Join-Path $identityDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if ($orphanFiles.Count -eq 1) {
+        $orphanObject = ([IO.File]::ReadAllText($orphanFiles[0].FullName, (New-Object Text.UTF8Encoding($false))) | ConvertFrom-Json)
+        $orphanObject.ServerId = [guid]::NewGuid().ToString()
+        [IO.File]::WriteAllText($orphanFiles[0].FullName, ($orphanObject | ConvertTo-Json -Depth 8), (New-Object Text.UTF8Encoding($false)))
+    }
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    [void](Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl ([string]$opsSettings.ApiBaseUrl) -ApiKey 'valid-api-key' `
+        -CredentialTargets $opsCredentialTargets -TimeoutSeconds ([int]$opsSettings.RequestTimeoutSeconds))
+    $orphanOutboxAfter = @(Get-ChildItem -LiteralPath (Join-Path $identityDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $orphanDeadAfter = @(Get-ChildItem -LiteralPath (Join-Path $identityDir 'Outbox\DeadLetter') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (
+        $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0 -and $orphanOutboxAfter.Count -eq 0 -and $orphanDeadAfter.Count -eq 1
+    ) -Name 'Operations/ForeignServerIdentityItemIsQuarantinedNotSent' `
+      -Failure "Item чужої ідентичності НЕ має надсилатись (HTTP-спроб $($global:BRAVOOpsSelfTestHttpCalls.Count), очікувалось 0) і має піти в dead-letter (outbox $($orphanOutboxAfter.Count) очікувалось 0, dead-letter $($orphanDeadAfter.Count) очікувалось 1)"
+
+    # =====================================================================
+    # State-файл БЕЗ новішого optional-поля зберігає свій claim.
+    #
+    # Review finding (thread 17, PR #225): під активним у модулі
+    # Set-StrictMode -Version 2.0 прямий доступ до відсутньої властивості
+    # КИДАЄ, а не дає $null. Файл, записаний до появи в контракті чергової
+    # throttle-мітки, містить валідний Claim — але виняток відправляв увесь
+    # об'єкт у catch, який повертав Claim = $null, і наступний прогін
+    # генерував ІНШИЙ claim -> постійний 409 claim_mismatch для вже-pending
+    # серверId. Тест імітує саме такий pre-upgrade файл.
+    # =====================================================================
+    $legacyStateDir = Join-Path $opsSelfTestRoot 'LegacyState'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $legacyStateDir
+    $legacyStatePath = & $opsSelfTestModule { Get-BRAVOOperationsEnrollmentStatePath }
+    $legacyStateClaim = [guid]::NewGuid().ToString()
+    if (-not (Test-Path -LiteralPath (Split-Path -Parent $legacyStatePath) -PathType Container)) {
+        New-Item -ItemType Directory -Path (Split-Path -Parent $legacyStatePath) -Force | Out-Null
+    }
+    # LastApiBaseUrlMissingLoggedAtUtc НАВМИСНО відсутнє — саме це поле
+    # додали в контракт останнім.
+    [IO.File]::WriteAllText($legacyStatePath, (@{ Claim = $legacyStateClaim; LastNotReadyLoggedAtUtc = $null } | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
+    $legacyStateReadClaim = & $opsSelfTestModule { (Get-BRAVOOperationsEnrollmentState).Claim }
+    $legacyStateMintedClaim = & $opsSelfTestModule { Get-BRAVOOperationsEnrollmentClaim }
+    Test-BRAVOCondition -Condition (
+        $legacyStateReadClaim -eq $legacyStateClaim -and $legacyStateMintedClaim -eq $legacyStateClaim
+    ) -Name 'Operations/StateFileMissingNewerOptionalFieldKeepsClaim' `
+      -Failure "State-файл без новішого optional-поля мусить зберегти персистований claim ($legacyStateClaim); прочитано [$legacyStateReadClaim], Get-BRAVOOperationsEnrollmentClaim повернув [$legacyStateMintedClaim] (якщо він інший — наступний POST /enroll дав би постійний 409 claim_mismatch)"
+
+    # =====================================================================
     # ENROLLMENT (A1-A7 протокол — агент сам генерує claim, сервер його
     # НІКОЛИ не видає/не ротує): header-only bootstrap secret (POST-тіло
     # БЕЗ bootstrapSecret/claim), X-Enrollment-Claim агент-згенерований і
