@@ -437,7 +437,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # (централізований read-only reader generation manifest-ів, MANIFESTS +
 # legacy fallback) — Health лишається read-only, з ArchiveHelpers
 # використовується лише читання; функція міграції/запису сюди не викликається.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify', 'BRAVO.Status')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.ArchiveHelpers', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.System', 'BRAVO.RestoreVerify', 'BRAVO.Status', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -5114,7 +5114,7 @@ if (-not $environmentPreflight.IsWritable) {
 
         if ($null -ne $operationsReportingSettings) {
             try {
-                Send-BRAVOOperationsEvent `
+                Send-BRAVOOperationsEventSafely `
                     -OperationsReportingSettings $operationsReportingSettings `
                     -CredentialTargets $credentialSettings.Targets `
                     -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -5624,7 +5624,7 @@ if ($healthIssues.Count -eq 0) {
             Write-HealthLog "Успішний звіт відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
             if ($null -ne $operationsReportingSettings) {
                 try {
-                    Send-BRAVOOperationsEvent `
+                    Send-BRAVOOperationsEventSafely `
                         -OperationsReportingSettings $operationsReportingSettings `
                         -CredentialTargets $credentialSettings.Targets `
                         -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -5821,7 +5821,7 @@ try {
     Write-HealthLog "Критичне повідомлення успішно відправлено у $NotificationProviderDisplayName" -Level "SUCCESS"
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `

@@ -344,6 +344,57 @@ function Send-BRAVOOperationsHeartbeat {
     }
 }
 
+function Send-BRAVOOperationsEventSafely {
+    # Тонка обгортка над Send-BRAVOOperationsEvent для викликів з
+    # Archive/Health/Maintenance: об'єднує null-check
+    # OperationsReportingSettings + побудову payload (Component/Services/
+    # Details пропускаються, коли не задані), що раніше дублювалось у
+    # 8 call site'ах (Health x3, Archive x4, Maintenance x1). try/catch
+    # НАВМИСНО лишається на call site, а не тут: self-test ізолює окремі
+    # функції (New-BRAVOSelfTestRuntimeModule -FunctionNames) в динамічний
+    # модуль без BRAVO.Operations, і викликач мусить сам пережити
+    # CommandNotFoundException на розв'язанні ІМЕНІ цієї функції — таку
+    # помилку try/catch УСЕРЕДИНІ самої функції ловити не може (вона
+    # трапляється до входу в тіло функції).
+    [CmdletBinding()]
+    param(
+        [hashtable]$OperationsReportingSettings,
+        [Parameter(Mandatory = $true)][hashtable]$CredentialTargets,
+        [Parameter(Mandatory = $true)][string]$InstitutionCode,
+
+        [Parameter(Mandatory = $true)][ValidateSet('backup', 'maintenance', 'health')][string]$Category,
+        [Parameter(Mandatory = $true)][ValidateSet('SUCCESS', 'WARNING', 'ERROR', 'CRITICAL')][string]$Severity,
+        [Parameter(Mandatory = $true)][string]$Message,
+        [string]$Component,
+        [object[]]$Services,
+        [hashtable]$Details
+    )
+
+    if ($null -eq $OperationsReportingSettings) {
+        return
+    }
+
+    $eventParameters = @{
+        OperationsReportingSettings = $OperationsReportingSettings
+        CredentialTargets = $CredentialTargets
+        InstitutionCode = $InstitutionCode
+        Category = $Category
+        Severity = $Severity
+        Message = $Message
+    }
+    if (-not [string]::IsNullOrWhiteSpace($Component)) {
+        $eventParameters.Component = $Component
+    }
+    if ($null -ne $Services) {
+        $eventParameters.Services = $Services
+    }
+    if ($null -ne $Details) {
+        $eventParameters.Details = $Details
+    }
+
+    Send-BRAVOOperationsEvent @eventParameters
+}
+
 function Test-BRAVOOperationsSettingEnabled {
     # Той самий permissive-boolean парсинг, що Test-BRAVOSettingEnabled
     # (BRAVO.Health) — окрема копія, а не cross-module залежність від

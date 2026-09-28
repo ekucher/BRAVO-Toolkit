@@ -7,6 +7,7 @@
         'Get-BRAVOOperationsServerId',
         'Invoke-BRAVOOperationsEnrollment',
         'Send-BRAVOOperationsEvent',
+        'Send-BRAVOOperationsEventSafely',
         'Send-BRAVOOperationsHeartbeat'
     )
     VariablesToExport = @()

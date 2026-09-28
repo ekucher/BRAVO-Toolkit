@@ -25,7 +25,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -710,7 +710,7 @@ function Send-ToolIntegrityAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -817,7 +817,7 @@ function Send-BRAVOArchiveFreeSpaceAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -4637,7 +4637,7 @@ function Send-BAZAIncompatibleNameAlert {
 
     if ($null -ne $operationsReportingSettings) {
         try {
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
@@ -7606,7 +7606,7 @@ function Main {
                 'INCOMPLETE' { 'WARNING' }
                 default      { 'ERROR' }
             }
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `

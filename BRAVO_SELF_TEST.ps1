@@ -12878,6 +12878,57 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                     -Failure ("Унарна кома `,@(...)` у 5 профілактично зміцнених `if/else`-присвоєннях (BRAVO_DRY_RUN.ps1, BRAVO_SETUP.ps1 x2, BRAVO_CREDENTIALS_SETUP.ps1, ci/Test-BRAVOReleasePolicy.ps1) мусить утримувати форму масиву під Set-StrictMode -Version 2.0 для 0/1/N-елементних гілок; провали: " + ($arrayCollapseFailures -join '; '))
             }
 
+            # --- OperationsHooks/NotificationCallSiteCountMatchesRecord ---
+            # Код-рев'ю дифу feature/bsystem-operations-foundation vs
+            # origin/developer (2026-09-27) виявив, що commit-повідомлення
+            # 620f2b0 заявляє "7 наявних точок сповіщень (Archive x3, Health
+            # x3, Maintenance x1)", але Archive насправді має 4 виклики
+            # (tool-integrity alert, free-space alert, BAZA incompatible-
+            # name alert, generation-summary в Main) — реальна сума 8, не
+            # 7. Подальша дедуплікація (код-рев'ю 2026-09-28) винесла
+            # спільний null-check/payload-шаблон у канонічний
+            # Send-BRAVOOperationsEventSafely (BRAVO.Operations.psm1) —
+            # call site'и більше не викликають Send-BRAVOOperationsEvent
+            # напряму, лише цю обгортку. try/catch НАВМИСНО лишився на
+            # call site (не всередині обгортки): self-test ізолює окремі
+            # функції в динамічний модуль без BRAVO.Operations
+            # (New-BRAVOSelfTestRuntimeModule -FunctionNames), і виклик
+            # мусить пережити CommandNotFoundException на розв'язанні
+            # самого імені функції — обгортка це впіймати не може, бо
+            # помилка трапляється до входу в її тіло. Цей тест рахує
+            # фактичні виклики Send-BRAVOOperationsEventSafely у трьох
+            # Runtime.ps1-файлах і закріплює реальну цифру 4/3/1 = 8.
+            $operationsHooksArchiveText = [IO.File]::ReadAllText(
+                (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
+                [Text.Encoding]::UTF8
+            )
+            $operationsHooksHealthText = [IO.File]::ReadAllText(
+                (Join-Path $root "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1"),
+                [Text.Encoding]::UTF8
+            )
+            $operationsHooksMaintenanceText = [IO.File]::ReadAllText(
+                (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+                [Text.Encoding]::UTF8
+            )
+            $operationsHooksCallPattern = '(?m)^\s*Send-BRAVOOperationsEventSafely\s'
+            $operationsHooksArchiveCount = [regex]::Matches($operationsHooksArchiveText, $operationsHooksCallPattern).Count
+            $operationsHooksHealthCount = [regex]::Matches($operationsHooksHealthText, $operationsHooksCallPattern).Count
+            $operationsHooksMaintenanceCount = [regex]::Matches($operationsHooksMaintenanceText, $operationsHooksCallPattern).Count
+            $operationsHooksTotalCount = $operationsHooksArchiveCount + $operationsHooksHealthCount + $operationsHooksMaintenanceCount
+            Test-BRAVOCondition `
+                -Condition (
+                    $operationsHooksArchiveCount -eq 4 -and
+                    $operationsHooksHealthCount -eq 3 -and
+                    $operationsHooksMaintenanceCount -eq 1 -and
+                    $operationsHooksTotalCount -eq 8
+                ) `
+                -Name 'OperationsHooks/NotificationCallSiteCountMatchesRecord' `
+                -Failure ("кількість викликів Send-BRAVOOperationsEventSafely мусить лишатися Archive=4/Health=3/" +
+                    "Maintenance=1 (разом 8); фактично Archive=$operationsHooksArchiveCount, " +
+                    "Health=$operationsHooksHealthCount, Maintenance=$operationsHooksMaintenanceCount, " +
+                    "разом=$operationsHooksTotalCount — якщо цифра змінилась навмисно, онови й це " +
+                    "очікування, і опис у відповідному commit/PR")
+
             # --- DiscoveryBaseline/InvalidCanonicalFailsClosed ---
             # Найважливіший сценарій: пошкоджений canonical НЕ сміє мовчки
             # стати «перший запуск» або відкотитись на legacy. Інакше

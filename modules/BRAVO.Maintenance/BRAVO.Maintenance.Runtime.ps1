@@ -38,7 +38,7 @@ $bravoScriptDirectory = $RuntimeRoot
 # Архітектурний борг: префікс Baza в Trace-контексті — свідомий компроміс
 # проти другої власної реалізації; нейтральний власник SFTP-примітивів —
 # тема окремого рефактора.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveHelpers', 'BRAVO.ArchiveRuntime', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Discovery', 'BRAVO.System', 'BRAVO.BazaSync', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -7166,10 +7166,11 @@ function Send-FinalReport {
     if ($null -ne $operationsReportingSettings) {
         try {
             # $script:BRAVOMaintenanceStepLog — той самий журнал, що вже
-            # живить фінальне Slack/Discord-повідомлення (New-BRAVOMaintenanceCompletedLines)
-            # і консольний РЕЗУЛЬТАТ: реальні кроки (Trace/Очистка/Міграція/
-            # Архівація/Автовимкнення тощо) з фактичним Status/Details, а не
-            # єдиний узагальнений 'Maintenance'-рядок, як було раніше.
+            # живить фінальне Slack/Discord-повідомлення
+            # (New-BRAVOMaintenanceCompletedLines) і консольний РЕЗУЛЬТАТ:
+            # реальні кроки (Trace/Очистка/Міграція/Архівація/
+            # Автовимкнення тощо) з фактичним Status/Details, а не єдиний
+            # узагальнений 'Maintenance'-рядок, як було раніше.
             $maintenanceStages = @($script:BRAVOMaintenanceStepLog | ForEach-Object {
                 [ordered]@{
                     name = [string]$_.Name
@@ -7177,7 +7178,7 @@ function Send-FinalReport {
                     details = if ([string]::IsNullOrWhiteSpace([string]$_.Details)) { $null } else { [string]$_.Details }
                 }
             })
-            Send-BRAVOOperationsEvent `
+            Send-BRAVOOperationsEventSafely `
                 -OperationsReportingSettings $operationsReportingSettings `
                 -CredentialTargets $credentialSettings.Targets `
                 -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
