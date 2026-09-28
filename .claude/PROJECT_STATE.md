@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — Current Project State
 
-Last verified: 2026-09-28
+Last verified: 2026-09-28 03:10 UTC
 
 ## Canonical branch
 
@@ -8,7 +8,7 @@ Last verified: 2026-09-28
 
 ## State baseline SHA
 
-`4b672657ded1e34058baaf10ef50a04eb8b16d95`
+`cb44151f9d9fcc9ae0f4e04221b85c610d7ec7eb`
 
 Before starting substantial work, verify:
 
@@ -303,6 +303,65 @@ This is incremental progress on the Issue #216 B7 backlog item (a permanent gove
 it is **not** the full "v2-path regression matrix" and does **not** promote Config parity to a required
 status check — see item 2/3 in `NEXT ACTION` below, which still stand.
 
+### Operations protocol v2 — enrollment + durable outbox (PR #225, merged 2026-09-28)
+
+PR #225 (`feat/operations-protocol-v2` → `developer`) merged as merge commit `cb44151`.
+
+Delivered:
+
+* `modules/BRAVO.Operations/` — enrollment переписано на agent-generated claim; durable outbox для подій
+  і heartbeat (dead-letter для отруйних items, карантин чужої server-identity, backoff, ліміти дренажу).
+* Уся діагностика модуля йде через єдину канонічну `Write-BRAVOOperationsLog` (37 call-site-ів), яка
+  використовує новий `Write-BRAVOLog -Secondary`: вторинна телеметрія лишається видимою, але більше не
+  інкрементує лічильник попереджень прогону, тобто недоступність Operations не змінює exit code первинної
+  операції (Archive резолвив будь-яке попередження в код 10).
+* Фінальна Operations-подія Archive надсилається зі спільного шляху (хвіст `Main` + зовнішній `finally`),
+  ідемпотентно, рівно один раз на прогін — покриває всі 5 контрольованих ранніх return-ів і зовнішній catch.
+* `modules/BRAVO.ExitCodes/` — новий канонічний `Get-BRAVOExitCodeSeverity`: severity події походить від
+  резолвленого exit code, а не від статусу generation.
+* 6 нових канонічних листів конфігурації зареєстровано в authorization registry (271 → 277, новий скалярний
+  валідатор `OptionalUrl:<схеми>`) і `operationsReportingSettings` додано в канонічний перелік
+  effective-snapshot та в `$knownIntentionalDiffPrefixes` паритет-harness-у.
+
+**Латентний дефект, який цей PR виявив і закрив.** `stages` у payload Operations-подій Archive і Health
+загортались як `@($List[object])`, що кидає `ArgumentException "Argument types do not match"` у
+`PSToObjectArrayBinder` і у Windows PowerShell 5.1, і в PowerShell 7 — той самий задокументований гейт, що
+вже описаний біля `$probeGroupList`, `$emptyDirs` і `$model`. Спрацьовувало на **кожному** прогоні з
+непорожньою історією кроків, тобто зведена generation-подія Archive і дві health-події **не доходили в
+Operations узагалі**; виняток поглинав внутрішній `try/catch`. Виправлено через `.ToArray()` (`583fef1`),
+плюс fail-soft `try/catch` навколо побудови контексту (збій телеметрії не сміє перетворити успішний бекап у
+код 90) і цільовий guard `Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression`. Загальний AST-guard
+по всьому репозиторію був спробований і відкинутий: `VariablePath.DriveName` для `$script:X` порожній (scope
+живе в `UserPath`), що дало 2192 false positive.
+
+**Два guard-и, які довелось перенацілити, а не послабити** (`c24d193`): `RuntimeScope/Archive` — нова
+функція читала конфігурацію через явний `$global:`, тоді як перелік дозволених global-змінних Archive
+закритий, а решта файлу читає ті самі значення неквадифікованим ім'ям; префікси прибрано, перевірки
+наявності — `Variable:<name>` (провайдер `Variable:` розв'язує неквадифіковане ім'я за звичайними правилами
+scope-ланцюга, тому StrictMode-захист не послаблено). `Health/OperationsSuccessEventNotGatedByNotificationMode`
+— канарка матчила літерал `-Severity 'SUCCESS'`, який зник, коли severity стала похідною; маркер
+перенацілено на змінну, а покриття «healthy прогін рапортує SUCCESS» збережено окремим assertion-ом
+`Health/OperationsSuccessEventSeverityEscalatesOnToolIntegrityBlock`.
+
+CI на `c24d193`: усі 8 checks зелені, `BRAVO_SELF_TEST.ps1` — **PASSED, 2616 PASS**. 9 рядків `[FAIL]` у лозі
+належать навмисним fixture-банерам (`НАВМИСНИЙ FIXTURE-ТЕСТ`), де дочірній скрипт падає за дизайном.
+
+Process note: пройдено 6 раундів рев'ю Codex, 25+ знахідок верифіковано й виправлено; Codex вичерпав квоту
+на рев'ю в останньому раунді. **Три треди лишились відкритими свідомо** — кожен виходить за межі цього PR і
+передається окремою роботою:
+
+1. **5-хвилинне вікно видачі API-ключа** після approve/reissue — корінь у бекенді `bsystem-operations`, не в
+   цьому репозиторії. Агент може лише опитувати частіше, а це вимагає нового Scheduled Task
+   (`HeartbeatIntervalMinutes` прибрано як orphaned-контракт). Наразі в коді документована дія оператора:
+   одразу після approve/reissue вручну запустити `BRAVO_OPERATIONS_HEARTBEAT.ps1`.
+2. **Скоуп креденшела під SYSTEM.** `Set-BRAVOCredential` пише у сховище поточного процесу, без `-StoreFor`.
+   Коли ключ збирає Scheduled Task під SYSTEM — проблеми немає; коли адміністратор запускає heartbeat
+   вручну, ключ потрапляє в його сховище й SYSTEM його не побачить. Коректний фікс переносить транзієнтний
+   SYSTEM-Scheduled-Task із `BRAVO_CREDENTIALS_SETUP.ps1` у канонічний `BRAVO.Credentials`, тобто рухає межу
+   довіри креденшелів — архітектурне рішення власника.
+3. **`NotificationError` у Health.** Половину тред-знахідки (severity при `ShouldBlock` маніфесту) закрито;
+   друга половина вимагає централізації Operations-звітності в `Complete-BRAVOHealthResult` для **всіх 13
+   exit-шляхів** із характеризаційним покриттям кожного — окрема хвиля, а не правка в межах рев'ю.
 ## Closed / superseded work
 
 ### PR #213
@@ -346,7 +405,7 @@ regression-matrix/required-check-promotion pieces are still open, tracked as
 items 2/3 below, and 8 known static-analysis gaps in that new gate are
 tracked as open in issue #239.
 
-**No PR is open as of 2026-09-27 18:00 UTC** (PR #238 merged; no other PR followed it in this window). The AI-attribution
+**No PR is open as of 2026-09-28 03:10 UTC** (PR #225 merged as `cb44151`; PR #238 and #240 merged earlier). The paragraph that stood here previously claimed the same for 2026-09-27 18:00 UTC while PR #225 was in fact open — that claim was stale, not a statement of fact about this window. The AI-attribution
 work is finished and merged: PR #235 (`f76ff42`, the rule text in
 `.claude/CLAUDE.md`) and PR #234 (`0a237ea`, this file's audited figures). Both
 went through three Codex review rounds; every content finding was verified and
@@ -452,22 +511,65 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 
 ## NEXT ACTION
 
-**Updated 2026-09-27 after PR #234 and PR #235 merged. Item 0 ("drive those two PRs to done") is delivered
-and has been removed, per the owner's instruction; items 1-3 are carried forward unchanged.**
+**Updated 2026-09-28 after PR #225 merged as `cb44151`, with explicit owner authorization for the merge.**
+No uncommitted work is pending and no PR is open.
 
-No uncommitted work is pending and no PR is open. **None of the three remaining items can be closed by an
-automated session** — each needs the owner, real fleet servers, or an elevated GitHub scope. Do not
-manufacture a substitute task.
+**CORRECTION to the previous wording of this section.** It said "none of the three remaining items can be
+closed by an automated session ... do not manufacture a substitute task", which conflated two different
+things: items 1-3 below (genuinely owner-blocked) and the repository's remaining work as a whole. The latter
+is **not** owner-blocked — a 2026-09-28 read-only audit produced a concrete autonomous backlog (block A
+below), every item of which an automated session can take to a green PR under the standing contract (branch,
+commit, push, PR, fix CI; merge/tag/release/deploy still require explicit authorization). Do not read this
+section as "nothing can be done without the owner".
 
 The single executable next action is therefore:
 
 ```text
 Re-verify current state (`git fetch origin --prune`, `git rev-parse origin/developer`, GitHub
-issue #154 and #216), then ask the owner to select exactly one of items 1-3 below, and stop.
+issue #154, #216, #219, #239), then ask the owner to select one item from block A (autonomous)
+or items 1-3 (owner-blocked) below, and stop.
 Evidence-only / read-only. No repository modifications, no commit, no push.
 ```
 
-Items 1-3 are the selection menu for that question, not a work queue to start on. Each line records what the
+### Block A — autonomous backlog (no owner, no real servers, no elevated scope)
+
+Verified against `cb44151`. Sizes are the measured line counts, not estimates.
+
+```text
+A1. Issue #239 — 8 відкладених обмежень статичного аналізу в гейті LEGACY_READER_ISOLATION
+    (ci/BRAVOConfigV2CutoverGates.ps1). Власник закрив цикл інкрементальних патчів, тож
+    починати з dataflow-дизайну, а не з нового патча.
+A2. B7, частина "v2-path regression matrix" — окремий артефакт матриці (Issue #216 Phase 11).
+    Required-check promotion із цього НЕ робиться (див. item 3).
+A3. Issue #219 — ізоляція фатальних збоїв секцій self-test без приховування решти діагностики.
+    PR #215 не ресурсувати.
+A4. Fail-closed pre-deploy parity gate у deploy/Update-BRAVOServer.ps1 — мітигація операційного
+    ризику B5 (тихе втрачання legacy site-overrides) БЕЗ доступу до реальних серверів. Гейт лише
+    блокує розгортання, нічого не змінює на цілі.
+A5. Репо-wide аудит binder-гейту @($List[object]) — один канонічний guard замість трьох точкових
+    (див. запис про PR #225 вище). AST, не regex.
+A6. Репо-wide аудит суміжного класу: return @(...) -> скаляр -> .Count під Set-StrictMode 2.0
+    (один такий дефект знайдено в PR #225 і виправлено unary comma).
+A7. Read-only інвентаризація архітектури й дублікації за розділом "Широка модуляризація"
+    .claude/rules/05-architecture.md — передумова A8/A9.
+A8. Централізація Operations-звітності в Complete-BRAVOHealthResult (13 exit-шляхів) — відкладена
+    половина треда 3 з PR #225.
+A9. Потоншення кореневих entrypoint-ів (ціль <=250, review >350): BRAVO_DRY_RUN.ps1 2099,
+    BRAVO_CREDENTIALS_SETUP.ps1 1682, BRAVO_TASKS_INSTALL.ps1 1120, BRAVO_SETUP.ps1 785,
+    BRAVO_RESTORE_TEST.ps1 726, BRAVO_TASKS_DIAGNOSE.ps1 657, BRAVO_HEALTH.ps1 404.
+    BRAVO_RUNTIME_GUARD.ps1 (1007) — ВИНЯТОК за rules/05: pre-trust bootstrap, стратегія
+    "перенеси в модуль" до нього не застосовується. Лише після A7, строго інкрементально.
+A10. Аудит відповідності .claude/rules/08-documentation-language.md по docs/, README, CHANGELOG.
+A11. Acceptance-issue #152/#155/#158/#188 — НЕ автономні (реальні хости парку), перелічені тут
+     лише щоб наступна сесія не шукала їх у блоці A.
+```
+
+Рекомендований порядок: A5+A6+A10 однією дешевою хвилею -> A7 (read-only вхід) -> A4 -> A1/A2/A3
+паралельно -> A8 -> A9 інкрементально.
+
+### Items 1-3 — owner-blocked
+
+Items 1-3 are a selection menu, not a work queue. Each line records what the
 item needs from the owner, so the question can be asked without re-deriving it:
 
 ```text
