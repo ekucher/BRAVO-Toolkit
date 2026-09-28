@@ -308,6 +308,41 @@ Test-BRAVOCondition -Condition (
 ) -Name 'Archive/FinalOperationsEventOwnsTheGenerationEmission' `
     -Failure "сама відправка зведеної generation-події мусить жити всередині Send-BRAVOArchiveFinalOperationsEvent, а не дублюватись у хвості Main -- інакше дві копії політики severity/Details розійдуться"
 
+# Регресія PS 5.1 binder (знайдено CI цього PR, BRAVO_DATA_RESTORE_MATRIX_TEST):
+# @($script:BRAVOArchiveStepHistory) кидав ArgumentException "Argument types
+# do not match" (PSToObjectArrayBinder, той самий задокументований edge-case,
+# що вже описаний біля $probeGroupList у цьому модулі, біля $emptyDirs у
+# BRAVO.Maintenance.Runtime.ps1 і біля $model у BRAVO.Configurator.Model.psm1).
+# Спрацьовувало на КОЖНОМУ прогоні з непорожньою історією кроків, тобто
+# зведена generation-подія не доходила в Operations узагалі. Той самий
+# цільовий guard, що вже існує для $generationResults
+# (Archive/GenerationResultsMaterializeSafely у BRAVO_SELF_TEST.ps1).
+$archiveStepHistoryFiles = @(
+    @{ Path = 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'; Variable = '$script:BRAVOArchiveStepHistory' },
+    @{ Path = 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1';   Variable = '$script:BRAVOHealthStepHistory' }
+)
+$archiveStepHistoryProblems = New-Object System.Collections.Generic.List[string]
+foreach ($archiveStepHistoryEntry in $archiveStepHistoryFiles) {
+    $archiveStepHistoryText = [IO.File]::ReadAllText((Join-Path $root $archiveStepHistoryEntry.Path), [Text.Encoding]::UTF8)
+    $archiveStepHistoryVariable = [string]$archiveStepHistoryEntry.Variable
+    # Матчимо лише виконуваний рядок присвоєння поля payload-а, а не згадку в
+    # коментарі (коментарі в цих файлах НАВМИСНО цитують заборонену форму, щоб
+    # пояснити, чому її не використовують).
+    $archiveStepHistoryWrapPattern = '(?m)^\s*stages\s*=\s*@\(\s*' + [Text.RegularExpressions.Regex]::Escape($archiveStepHistoryVariable) + '\s*\)'
+    $archiveStepHistoryToArrayPattern = '(?m)^\s*stages\s*=\s*' + [Text.RegularExpressions.Regex]::Escape($archiveStepHistoryVariable) + '\.ToArray\(\)'
+    if ([Text.RegularExpressions.Regex]::IsMatch($archiveStepHistoryText, $archiveStepHistoryWrapPattern)) {
+        [void]$archiveStepHistoryProblems.Add("$($archiveStepHistoryEntry.Path): знайдено заборонену форму stages = @($archiveStepHistoryVariable)")
+    }
+    if (-not [Text.RegularExpressions.Regex]::IsMatch($archiveStepHistoryText, $archiveStepHistoryToArrayPattern)) {
+        [void]$archiveStepHistoryProblems.Add("$($archiveStepHistoryEntry.Path): не знайдено жодного stages = $archiveStepHistoryVariable.ToArray()")
+    }
+}
+Test-BRAVOCondition -Condition ($archiveStepHistoryProblems.Count -eq 0) `
+    -Name 'Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression' `
+    -Failure ("історія кроків у payload Operations-події мусить розгортатись через .ToArray(), а не @(...): прямий @()-каст " +
+        "System.Collections.Generic.List[object] під Windows PowerShell 5.1 кидає ArgumentException у PSToObjectArrayBinder і " +
+        "подія не доходить узагалі. Проблеми: " + ([string]::Join('; ', $archiveStepHistoryProblems.ToArray())))
+
 # Функціональна ізоляція тієї самої функції: реальний її текст + стаби
 # Send-BRAVOOperationsEvent/Write-Log (New-BRAVOSelfTestRuntimeModule тут не
 # підходить -- функція читає $script:-стан, який тест мусить виставляти
@@ -350,7 +385,16 @@ function Invoke-BRAVOSelfTestArchiveFinalOpsScenario {
     # .ToArray(), а не @($list) напряму: та сама причина, з якої
     # BRAVO_SELF_TEST.ConfigLoader.ps1 робить $parityDiffsList.ToArray() --
     # розгортання generic-списку в масив мусить бути явним.
-    return @($global:BRAVOArchiveSelfTestFinalOpsEvents.ToArray())
+    #
+    # Unary comma перед результатом обов'язкова: `return @(...)` віддає
+    # значення в output stream, і для РІВНО одного елемента викликач
+    # отримав би скаляр, а наступний `.Count` під Set-StrictMode 2.0 кинув
+    # би PropertyNotFoundException (той самий гейт, що вже описаний біля
+    # ConvertTo-BRAVONotificationPayloadText у BRAVO_SELF_TEST.ps1). Усі
+    # сценарії нижче очікують саме масив -- один із них навмисно перевіряє
+    # РІВНО одну подію.
+    $archiveFinalOpsCollectedEvents = $global:BRAVOArchiveSelfTestFinalOpsEvents.ToArray()
+    return ,$archiveFinalOpsCollectedEvents
 }
 
 # Наявні $global:-значення конфігурації зберігаються й відновлюються нижче:

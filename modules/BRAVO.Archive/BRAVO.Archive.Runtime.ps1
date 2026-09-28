@@ -8365,23 +8365,41 @@ function Main {
     # Get-BRAVOExitCodeSeverity (BRAVO.ExitCodes). Раніше generation
     # COMPLETE з резолвленим кодом 10 (SuccessWithWarnings) звітував
     # SUCCESS — подія суперечила власному полю exitCode у своєму ж payload.
-    $generationEventOutcome = if ($operationFailed) {
-        if ($successCount -gt 0) { 'ЧАСТКОВО' } else { 'ПОМИЛКА' }
-    } else {
-        'УСПІШНО'
-    }
-    $script:archiveFinalOperationsEventContext = @{
-        Message = "Generation ${generationId}: $($script:backupGenerationStatus), прогін $generationEventOutcome (опубліковано $publishedComponentCount з $($enabledArchives.Count), код завершення $($script:processExitCode))"
-        Details = @{
-            generationId = $generationId
-            status = [string]$script:backupGenerationStatus
-            runOutcome = [string]$generationEventOutcome
-            publishedComponentCount = $publishedComponentCount
-            enabledComponentCount = $enabledArchives.Count
-            snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
-            durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
-            stages = @($script:BRAVOArchiveStepHistory)
+    # Побудова контексту — теж fail-soft (інваріант «телеметрія не змінює
+    # exit code»): збій тут не сміє перетворити успішний бекап у код 90
+    # через зовнішній catch. Сама відправка має власний try/catch
+    # усередині Send-BRAVOArchiveFinalOperationsEvent; на цьому кроці
+    # контекст лишається $null, і finally надішле мінімальну подію з
+    # фактичним кодом завершення — це краще за тишу.
+    try {
+        $generationEventOutcome = if ($operationFailed) {
+            if ($successCount -gt 0) { 'ЧАСТКОВО' } else { 'ПОМИЛКА' }
+        } else {
+            'УСПІШНО'
         }
+        $script:archiveFinalOperationsEventContext = @{
+            Message = "Generation ${generationId}: $($script:backupGenerationStatus), прогін $generationEventOutcome (опубліковано $publishedComponentCount з $($enabledArchives.Count), код завершення $($script:processExitCode))"
+            Details = @{
+                generationId = $generationId
+                status = [string]$script:backupGenerationStatus
+                runOutcome = [string]$generationEventOutcome
+                publishedComponentCount = $publishedComponentCount
+                enabledComponentCount = $enabledArchives.Count
+                snapshotSetId = if ($null -ne $generationSnapshotSet) { $generationSnapshotSet.SnapshotSetId } else { $null }
+                durationMs = [Math]::Round(((Get-Date) - $scriptStartTime).TotalMilliseconds)
+                # .ToArray(), а НЕ @($script:BRAVOArchiveStepHistory): у Windows
+                # PowerShell 5.1 (і в PowerShell 7) загортання
+                # System.Collections.Generic.List[object] у @() кидає ArgumentException
+                # "Argument types do not match" — той самий задокументований гейт, що
+                # вже описаний біля $probeGroupList (BRAVO.Archive.Runtime.ps1) і
+                # $emptyDirs (BRAVO.Maintenance.Runtime.ps1). Спрацьовувало на кожному
+                # прогоні: подія в Operations не доходила взагалі.
+                stages = $script:BRAVOArchiveStepHistory.ToArray()
+            }
+        }
+    } catch {
+        $script:archiveFinalOperationsEventContext = $null
+        Write-Log "Не вдалося зібрати контекст фінальної події Operations: $($_.Exception.Message) — буде надіслано мінімальну подію" -Level "WARNING"
     }
     Send-BRAVOArchiveFinalOperationsEvent
 

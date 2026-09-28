@@ -5620,7 +5620,14 @@ if ($healthIssues.Count -eq 0) {
                 -Message $operationsHealthMessage `
                 -Services (Get-BRAVOManagedServiceStatusSnapshot) `
                 -Details @{
-                    stages = @($script:BRAVOHealthStepHistory)
+                    # .ToArray(), а НЕ @($script:BRAVOHealthStepHistory): у Windows
+                    # PowerShell 5.1 (і в PowerShell 7) загортання
+                    # System.Collections.Generic.List[object] у @() кидає ArgumentException
+                    # "Argument types do not match" — той самий задокументований гейт, що
+                    # вже описаний біля $probeGroupList (BRAVO.Archive.Runtime.ps1) і
+                    # $emptyDirs (BRAVO.Maintenance.Runtime.ps1). Спрацьовувало на кожному
+                    # прогоні: подія в Operations не доходила взагалі.
+                    stages = $script:BRAVOHealthStepHistory.ToArray()
                     okCount = $script:BRAVOHealthStepOkCount
                     warnCount = $script:BRAVOHealthStepWarningCount
                     errorCount = $script:BRAVOHealthStepErrorCount
@@ -5837,7 +5844,14 @@ if ($null -ne $operationsReportingSettings) {
             -Services (Get-BRAVOManagedServiceStatusSnapshot) `
             -Details @{
                 issueCount = $healthIssues.Count
-                stages = @($script:BRAVOHealthStepHistory)
+                # .ToArray(), а НЕ @($script:BRAVOHealthStepHistory): у Windows
+                # PowerShell 5.1 (і в PowerShell 7) загортання
+                # System.Collections.Generic.List[object] у @() кидає ArgumentException
+                # "Argument types do not match" — той самий задокументований гейт, що
+                # вже описаний біля $probeGroupList (BRAVO.Archive.Runtime.ps1) і
+                # $emptyDirs (BRAVO.Maintenance.Runtime.ps1). Спрацьовувало на кожному
+                # прогоні: подія в Operations не доходила взагалі.
+                stages = $script:BRAVOHealthStepHistory.ToArray()
                 okCount = $script:BRAVOHealthStepOkCount
                 warnCount = $script:BRAVOHealthStepWarningCount
                 errorCount = $script:BRAVOHealthStepErrorCount
