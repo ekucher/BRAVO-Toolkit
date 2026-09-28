@@ -42,7 +42,7 @@ $restoreSyntheticRuntimeText = [IO.File]::ReadAllText(
 $restoreSyntheticStubText = @'
 function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp) }
 function Send-SlackAlert { param($Message, [switch]$IsCritical) }
-function Write-BRAVOLog { param($Component, $Message, $Level) }
+function Write-BRAVOLog { param($Component, $Message, $Level, [switch]$Secondary) }
 function Format-BRAVODuration { param($Duration) return [string]$Duration }
 function Get-BRAVOFiles { BRAVO.Compatibility\Get-BRAVOFiles @args }
 function ConvertTo-BRAVOWindowsCommandLineArgument { BRAVO.Compatibility\ConvertTo-BRAVOWindowsCommandLineArgument @args }

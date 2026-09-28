@@ -3042,6 +3042,38 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Logging/ProtectSecretMasksKnownShapes" `
         -Failure "Protect-BRAVOLogSecret має маскувати SFTP-паролі, Slack/Discord webhook-токени і паролі 7-Zip, не займаючи -path"
+    # Review PR #225 (P1): -Secondary -- діагностика ДРУГОРЯДНОЇ операції
+    # (телеметрія Operations). Лишається видимим WARNING-ом, але НЕ важить у
+    # спільному лічильнику попереджень, бо BRAVO_ARCHIV резолвить будь-яке
+    # попередження прогону в exit code 10 (SuccessWithWarnings, ЧАСТКОВО) --
+    # інакше збій вторинної телеметрії змінював рапортований результат
+    # успішного бекапу. Рівень ERROR і далі рахується (прапорець знімає вагу
+    # ПОПЕРЕДЖЕННЯ, а не приховує справжню відмову) -- та сама межа, що в
+    # -Environmental.
+    #
+    # Лічильники модуля після перевірки скидаються повторним Import-Module
+    # -Force, щоб ці штучні записи не протікали в наступні фрагменти suite.
+    $secondaryBefore = Get-BRAVOLogStatistics
+    Write-BRAVOLog -Component 'SELFTEST' -Level 'WARNING' -Message 'secondary warning probe' -NoConsole -Secondary
+    $secondaryAfterSecondaryWarning = Get-BRAVOLogStatistics
+    Write-BRAVOLog -Component 'SELFTEST' -Level 'WARNING' -Message 'primary warning probe' -NoConsole
+    $secondaryAfterPrimaryWarning = Get-BRAVOLogStatistics
+    Write-BRAVOLog -Component 'SELFTEST' -Level 'ERROR' -Message 'secondary error probe' -NoConsole -Secondary
+    $secondaryAfterSecondaryError = Get-BRAVOLogStatistics
+    Test-BRAVOCondition `
+        -Condition (
+            $secondaryAfterSecondaryWarning.Warnings -eq $secondaryBefore.Warnings -and
+            $secondaryAfterPrimaryWarning.Warnings -eq ($secondaryBefore.Warnings + 1) -and
+            $secondaryAfterSecondaryError.Errors -eq ($secondaryBefore.Errors + 1)
+        ) `
+        -Name "Logging/SecondaryWarningDoesNotCountTowardPrimaryOperation" `
+        -Failure ("-Secondary мусить лишати WARNING видимим, але не інкрементувати лічильник попереджень (інакше збій телеметрії Operations дає успішному бекапу exit code 10), " +
+            "і НЕ мусить знімати вагу з ERROR: before=W$($secondaryBefore.Warnings)/E$($secondaryBefore.Errors) " +
+            "afterSecondaryWarning=W$($secondaryAfterSecondaryWarning.Warnings) afterPrimaryWarning=W$($secondaryAfterPrimaryWarning.Warnings) " +
+            "afterSecondaryError=E$($secondaryAfterSecondaryError.Errors)")
+    Remove-Module -Name 'BRAVO.Logging' -Force -ErrorAction SilentlyContinue
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Logging\BRAVO.Logging.psd1") -Force -ErrorAction Stop
+
     $healthScriptTextForSecretMasking = [IO.File]::ReadAllText(
         (Join-Path $root "modules\BRAVO.Health\BRAVO.Health.Runtime.ps1"),
         [Text.Encoding]::UTF8

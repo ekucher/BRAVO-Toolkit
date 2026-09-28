@@ -100,7 +100,7 @@ Test-BRAVOCondition -Condition (
 # ============================================================
 
 $archiveOwnLogStub = @'
-function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO") }
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$Secondary) }
 function Initialize-BRAVOSFTPRemoteDirectories {
     param([string]$WinSCPPath, [string]$RepositorySFTPUrl, [string]$HostKey, [string[]]$RemoteDirectories)
     $script:archiveOwnLogTestState.InitDirCalls++
@@ -283,7 +283,7 @@ Test-BRAVOCondition -Condition (
 # ============================================================
 
 $archiveGatingStub = @'
-function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO") }
+function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level = "INFO", [switch]$Secondary) }
 function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
 function Get-HostInformation { return [pscustomobject]@{} }
 function Format-BRAVOUkrainianCount { param($Count, $One, $Few, $Many) return "$Count $Few" }

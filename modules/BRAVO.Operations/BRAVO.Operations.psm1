@@ -28,6 +28,34 @@
 # STATE: каталоги/шляхи
 # ---------------------------------------------------------------------
 
+function Write-BRAVOOperationsLog {
+    # КАНОНІЧНА точка логування цього модуля. Уся діагностика BRAVO.Operations
+    # проходить через неї, і жодна функція модуля не викликає Write-BRAVOLog
+    # напряму (структурно перевіряється self-test-ом
+    # Operations/ModuleLogsOnlyThroughSecondaryWrapper).
+    #
+    # Причина (review PR #225, P1 "Keep Operations failures out of Archive
+    # warning counts"): Operations — ДРУГОРЯДНИЙ канал звітності з fail-soft
+    # контрактом; ні його недоступність, ні pending enrollment не є
+    # результатом бекапу/обслуговування/health-прогону. Але Write-BRAVOLog
+    # інкрементує спільний лічильник попереджень, а BRAVO_ARCHIV резолвить
+    # будь-яке попередження прогону в exit code 10 (SuccessWithWarnings,
+    # статус ЧАСТКОВО). Тобто збій телеметрії мовчки змінював рапортований
+    # результат успішного бекапу. Тому кожен запис звідси йде з -Secondary:
+    # лишається ПОВНІСТЮ видимим у лозі (рівень не знижено, текст не
+    # змінено), але не важить у лічильнику первинної операції.
+    #
+    # Рівень ERROR і далі рахується як помилка — -Secondary, як і
+    # -Environmental, знімає лише вагу ПОПЕРЕДЖЕННЯ (див. Write-BRAVOLog).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][ValidateSet('TRACE', 'DEBUG', 'INFO', 'SUCCESS', 'WARNING', 'ERROR', 'FATAL')][string]$Level,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Message
+    )
+
+    Write-BRAVOLog -Component 'Operations' -Level $Level -Message $Message -Secondary
+}
+
 function Get-BRAVOOperationsStateDirectory {
     # Тестова ізоляція (той самий принцип, що BRAVO_SELFTEST_ROOT/
     # BRAVO_SELFTEST_VERSION_STATE_PATH у BRAVO_SELF_TEST.ps1): якщо
@@ -161,11 +189,11 @@ function Get-BRAVOOperationsServerId {
             if ([guid]::TryParse($existingId, [ref]$parsedGuid)) {
                 return $parsedGuid.ToString()
             }
-            Write-BRAVOLog -Component 'Operations' -Level 'ERROR' `
+            Write-BRAVOOperationsLog -Level 'ERROR' `
                 -Message "Файл ідентичності Operations ($statePath) прочитано, але ServerId у ньому не є валідним GUID — звітність Operations пропущено цей прогін. Це НЕ автоматично виправляється (щоб не створити ghost-ідентичність поверх уже approved сервера); відновіть файл з резервної копії, або свідомо видаліть його, якщо потрібне нове enrollment."
             return $null
         } catch {
-            Write-BRAVOLog -Component 'Operations' -Level 'ERROR' `
+            Write-BRAVOOperationsLog -Level 'ERROR' `
                 -Message "Файл ідентичності Operations ($statePath) пошкоджений/не парситься ($($_.Exception.Message)) — звітність Operations пропущено цей прогін. Це НЕ автоматично виправляється (щоб не створити ghost-ідентичність поверх уже approved сервера); відновіть файл з резервної копії, або свідомо видаліть його, якщо потрібне нове enrollment."
             return $null
         }
@@ -199,7 +227,7 @@ function Get-BRAVOOperationsServerId {
                 # Впасти сюди означає, що файл щойно створено, але він
                 # непарсований — той самий fail-closed контракт, що вище.
             }
-            Write-BRAVOLog -Component 'Operations' -Level 'ERROR' `
+            Write-BRAVOOperationsLog -Level 'ERROR' `
                 -Message "Файл ідентичності Operations ($statePath) створено паралельним процесом, але прочитати з нього валідний ServerId не вдалося — звітність Operations пропущено цей прогін (ідентичність НЕ перезаписується, щоб не створити ghost-ідентичність)."
             return $null
         }
@@ -208,7 +236,7 @@ function Get-BRAVOOperationsServerId {
             # свій GUID (це і є race, від якої захищаємось) — пропускаємо
             # звітність цей прогін. Подія не губиться: порожній apiKey у
             # Send-BRAVOOperationsEvent буферизує її в durable outbox.
-            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+            Write-BRAVOOperationsLog -Level 'WARNING' `
                 -Message 'Не вдалося отримати cross-process лок для першостворення ідентичності Operations (інший процес BRAVO, ймовірно, робить це паралельно) — звітність Operations пропущено цей прогін, щоб не створити другу, конкурентну ідентичність'
             return $null
         }
@@ -399,7 +427,7 @@ function Get-BRAVOOperationsEnrollmentClaim {
         # прочитає вже персистований claim. Втрати подій немає:
         # Send-BRAVOOperationsEvent на порожній apiKey буферизує подію в
         # durable outbox.
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message 'Не вдалося отримати cross-process лок для першостворення enrollment-claim (інший процес BRAVO, ймовірно, робить це паралельно) — enrollment цього прогону пропущено, щоб не надіслати конкурентний claim; наступна подія/heartbeat використає claim, персистований власником локу'
         return $null
     }
@@ -417,8 +445,22 @@ function Get-BRAVOOperationsEnrollmentClaim {
         try {
             Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsEnrollmentStatePath) -Object $state
         } catch {
-            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-                -Message "Не вдалося зберегти новостворений enrollment-claim на диск: $($_.Exception.Message) — цей прогін використає його лише в памʼяті; якщо диск лишиться недоступним, наступний прогін згенерує ІНШИЙ claim, що дасть 409 claim_mismatch, якщо серверId уже pending на API"
+            # Review finding (PR #225, "Abort enrollment when the claim
+            # cannot be persisted"): раніше тут повертався claim, який на
+            # диск НЕ потрапив. POST /enroll зв'язував його на сервері, а
+            # наступний прогін, не знайшовши claim у стані, генерував
+            # ІНШИЙ — і отримував постійний 409 claim_mismatch, тобто
+            # сервер лишався заблокованим до ручного відновлення
+            # ідентичності. Це та сама причина, з якої fallback після
+            # таймауту локу вище вже не мінтить ephemeral claim.
+            #
+            # Fail-closed: enrollment цього прогону пропускається. Втрати
+            # подій немає — Send-BRAVOOperationsEvent на порожній apiKey
+            # буферизує подію в durable outbox, а наступний прогін
+            # повторить спробу, коли диск стане доступним.
+            Write-BRAVOOperationsLog -Level 'WARNING' `
+                -Message "Не вдалося зберегти новостворений enrollment-claim на диск: $($_.Exception.Message) — enrollment цього прогону пропущено, щоб не зв'язати на сервері claim, якого локально не існує (це дало б постійний 409 claim_mismatch); події тим часом буферизуються в outbox"
+            return $null
         }
         return $newClaim
     } finally {
@@ -654,6 +696,48 @@ function Invoke-BRAVOOperationsApiRequest {
 # ENROLLMENT
 # ---------------------------------------------------------------------
 
+function Write-BRAVOOperationsEnrollment503Diagnostic {
+    # КАНОНІЧНА класифікація HTTP 503 від enrollment-ендпоінтів Operations —
+    # одна реалізація на ОБИДВІ точки виклику (POST /enroll і GET
+    # /enroll/{serverId}). Винесено (review PR #225) саме тому, що дві
+    # незалежні копії цієї політики вже розійшлися: POST отримав перевірку
+    # коду в тілі відповіді, GET лишився status-only й далі діагностував
+    # будь-яку недоступність сервісу як "enrollment не сконфігуровано".
+    #
+    # Розрізняє два принципово різні стани, які обидва дають 503:
+    #   - {error:'enrollment_not_configured'} — функціонал enrollment на
+    #     бекенді не ввімкнено. Не помилка цього сервера: throttled INFO,
+    #     та сама постава, що pending.
+    #   - будь-який інший 503 (реверс-проксі, сервіс лежить) — проблема
+    #     ДОСТУПНОСТІ: throttled WARNING, який прямо каже НЕ шукати причину
+    #     в bootstrap-provisioning.
+    #
+    # Ніколи не кидає (never-throw контракт модуля) і нічого не повертає:
+    # обидві точки виклику після неї роблять `return $null` самостійно, тому
+    # значення в потоці виводу викликача було б забрудненням.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][System.Management.Automation.ErrorRecord]$ErrorRecord,
+        [Parameter(Mandatory = $true)]$EnrollmentState,
+        [Parameter(Mandatory = $true)][string]$RequestPhase
+    )
+
+    $errorBody = Get-BRAVOOperationsHttpErrorBody -ErrorRecord $ErrorRecord
+    $errorCode = Get-BRAVOOperationsJsonPropertyString -Object $errorBody -Name 'error'
+    if (-not (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $EnrollmentState.LastNotConfiguredLoggedAtUtc)) {
+        return
+    }
+    if ($errorCode -eq 'enrollment_not_configured') {
+        Write-BRAVOOperationsLog -Level 'INFO' `
+            -Message "Operations enrollment ще не сконфігуровано на боці API (503 enrollment_not_configured, $RequestPhase) — очікуємо, поки бекенд увімкне цю функцію; це НЕ помилка бажаного секрету (401), а відсутність самої можливості"
+    } else {
+        Write-BRAVOOperationsLog -Level 'WARNING' `
+            -Message "Operations API недоступний (HTTP 503 без коду enrollment_not_configured, $RequestPhase) — це проблема ДОСТУПНОСТІ сервісу чи проксі, а не конфігурації enrollment; спроба повториться на наступній події/heartbeat. Не шукайте причину в bootstrap-provisioning цього сервера."
+    }
+    $EnrollmentState.LastNotConfiguredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Set-BRAVOOperationsEnrollmentState -State $EnrollmentState
+}
+
 function Invoke-BRAVOOperationsEnrollment {
     # Ідемпотентна перевірка/спроба self-enrollment. Безпечна викликати
     # перед КОЖНОЮ подією/heartbeat: якщо API-ключ уже отримано —
@@ -707,6 +791,38 @@ function Invoke-BRAVOOperationsEnrollment {
         [Parameter(Mandatory = $true)][string]$InstitutionCode
     )
 
+    $apiBaseUrl = [string]$OperationsReportingSettings.ApiBaseUrl
+    if ([string]::IsNullOrWhiteSpace($apiBaseUrl)) {
+        # Fail-closed ДІАГНОСТИКА (review P2): Enabled=true, але ApiBaseUrl
+        # порожній — це помилка конфігурації оператора, а не транзиєнтний
+        # pending/мережевий стан. Раніше цей return був повністю мовчазним
+        # (без жодного логу) — кожна подія/heartbeat просто зникала, і
+        # оператор не мав жодного сигналу, чому dashboard нічого не бачить.
+        # Throttled WARNING (той самий шаблон, що LastNotConfiguredLoggedAtUtc
+        # нижче) — видимий, але не спамить лог на кожному Archive/Health/
+        # Maintenance-прогоні.
+        #
+        # ПОРЯДОК ІСТОТНИЙ (review PR #225, "Validate the API URL before
+        # returning a stored key"): ця перевірка мусить стояти ПЕРЕД
+        # early-return зі збереженим API-ключем нижче. Інакше на вже
+        # enrolled сервері, якому потім очистили ApiBaseUrl, діагностика не
+        # виконувалась узагалі: ключ повертався, відправка падала на
+        # валідації URL у Resolve-BRAVOOperationsApiUri, помилка
+        # класифікувалась як транзиєнтний транспортний збій — і outbox
+        # нескінченно накопичував та ретраїв елементи, жодного разу не
+        # сказавши оператору, що конфігурація недійсна. Порожній ApiBaseUrl
+        # не є транзиєнтним станом, і $null тут коректний: викликач
+        # буферизує подію в durable outbox замість платити таймаутом.
+        $apiBaseUrlMissingState = Get-BRAVOOperationsEnrollmentState
+        if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $apiBaseUrlMissingState.LastApiBaseUrlMissingLoggedAtUtc) {
+            Write-BRAVOOperationsLog -Level 'WARNING' `
+                -Message 'operationsReportingSettings.Enabled=true, але ApiBaseUrl порожній — Operations-звітність не працюватиме, доки оператор не вкаже коректний HTTPS-URL бекенду в конфігурації'
+            $apiBaseUrlMissingState.LastApiBaseUrlMissingLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+            Set-BRAVOOperationsEnrollmentState -State $apiBaseUrlMissingState
+        }
+        return $null
+    }
+
     $apiKeyTarget = [string]$CredentialTargets.OperationsApiKey
     try {
         $existingApiKey = Get-BRAVOCredentialSecret -Target $apiKeyTarget
@@ -720,26 +836,6 @@ function Invoke-BRAVOOperationsEnrollment {
         # в лозі).
     }
 
-    $apiBaseUrl = [string]$OperationsReportingSettings.ApiBaseUrl
-    if ([string]::IsNullOrWhiteSpace($apiBaseUrl)) {
-        # Fail-closed ДІАГНОСТИКА (review P2): Enabled=true, але ApiBaseUrl
-        # порожній — це помилка конфігурації оператора, а не транзиєнтний
-        # pending/мережевий стан. Раніше цей return був повністю мовчазним
-        # (без жодного логу) — кожна подія/heartbeat просто зникала, і
-        # оператор не мав жодного сигналу, чому dashboard нічого не бачить.
-        # Throttled WARNING (той самий шаблон, що LastNotConfiguredLoggedAtUtc
-        # нижче) — видимий, але не спамить лог на кожному Archive/Health/
-        # Maintenance-прогоні.
-        $apiBaseUrlMissingState = Get-BRAVOOperationsEnrollmentState
-        if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $apiBaseUrlMissingState.LastApiBaseUrlMissingLoggedAtUtc) {
-            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-                -Message 'operationsReportingSettings.Enabled=true, але ApiBaseUrl порожній — Operations-звітність не працюватиме, доки оператор не вкаже коректний HTTPS-URL бекенду в конфігурації'
-            $apiBaseUrlMissingState.LastApiBaseUrlMissingLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-            Set-BRAVOOperationsEnrollmentState -State $apiBaseUrlMissingState
-        }
-        return $null
-    }
-
     $bootstrapSecretTarget = [string]$CredentialTargets.OperationsBootstrapSecret
     $bootstrapSecret = $null
     try {
@@ -748,14 +844,14 @@ function Invoke-BRAVOOperationsEnrollment {
         $bootstrapSecret = $null
     }
     if ([string]::IsNullOrWhiteSpace($bootstrapSecret)) {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "operationsReportingSettings.Enabled=true, але bootstrap-секрет ($bootstrapSecretTarget) не знайдено в Credential Manager — enrollment неможливий"
         return $null
     }
 
     $productType = [string]$OperationsReportingSettings.ProductType
     if ($productType -notin @('LIMS', 'VETOFFICE')) {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "operationsReportingSettings.ProductType = '$productType' не розпізнано (очікується LIMS/VETOFFICE) — enrollment пропущено"
         return $null
     }
@@ -822,23 +918,8 @@ function Invoke-BRAVOOperationsEnrollment {
             # у тілі відповіді; решта 503 логується як transient-
             # недоступність (той самий рівень WARNING, що й інші
             # transient-збої нижче, і той самий throttle).
-            $notConfiguredBody = Get-BRAVOOperationsHttpErrorBody -ErrorRecord $_
-            $notConfiguredCode = Get-BRAVOOperationsJsonPropertyString -Object $notConfiguredBody -Name 'error'
-            if ($notConfiguredCode -eq 'enrollment_not_configured') {
-                if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotConfiguredLoggedAtUtc) {
-                    Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
-                        -Message 'Operations enrollment ще не сконфігуровано на боці API (503 enrollment_not_configured) — очікуємо, поки бекенд увімкне цю функцію; це НЕ помилка бажаного секрету (401), а відсутність самої можливості'
-                    $enrollmentState.LastNotConfiguredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-                    Set-BRAVOOperationsEnrollmentState -State $enrollmentState
-                }
-                return $null
-            }
-            if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotConfiguredLoggedAtUtc) {
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-                    -Message "Operations API недоступний (HTTP 503 без коду enrollment_not_configured) — це проблема ДОСТУПНОСТІ сервісу чи проксі, а не конфігурації enrollment; спроба повториться на наступній події/heartbeat. Не шукайте причину в bootstrap-provisioning цього сервера."
-                $enrollmentState.LastNotConfiguredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-                Set-BRAVOOperationsEnrollmentState -State $enrollmentState
-            }
+            Write-BRAVOOperationsEnrollment503Diagnostic `
+                -ErrorRecord $_ -EnrollmentState $enrollmentState -RequestPhase 'POST /enroll'
             return $null
         }
         if ($statusCode -eq 409) {
@@ -855,7 +936,7 @@ function Invoke-BRAVOOperationsEnrollment {
                 # існуючого pending серверId. Термінально для цієї
                 # спроби — НЕ ретраїмо тісно (сама лише повторна спроба з
                 # тим же новим claim дасть той самий 409 знову).
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                Write-BRAVOOperationsLog -Level 'WARNING' `
                     -Message "POST /enroll відхилено (409 claim_mismatch) — локальний enrollment-claim НЕ збігається з тим, що вже збережений на сервері для серверId=$serverId. Це означає локальний стан ($((Get-BRAVOOperationsEnrollmentStatePath))) було втрачено/пошкоджено після початкового enrollment. Термінально для цієї спроби: САМООБСЛУГОВУВАННЯ НЕ виконується (щоб не мати вигляду takeover-спроби); якщо цей сервер дійсно мав бути новою ідентичністю, свідомо видаліть server-id/enrollment state-файли для повного повторного enrollment."
                 return $null
             }
@@ -883,12 +964,12 @@ function Invoke-BRAVOOperationsEnrollment {
                 # (approved-without-apiKey -> needs manual admin reissue)
                 # if the 5-minute window has passed.
                 if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotReadyLoggedAtUtc) {
-                    Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
+                    Write-BRAVOOperationsLog -Level 'INFO' `
                         -Message 'POST /enroll відхилено (409 already_finalized, status=approved) — сервер уже підтверджено адміністратором; переходимо одразу до GET /enroll/{serverId} для отримання API-ключа.'
                 }
             } else {
                 if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastFinalizedLoggedAtUtc) {
-                    Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                    Write-BRAVOOperationsLog -Level 'WARNING' `
                         -Message "Сервер уже фіналізований в Operations (status=$finalStatus) — POST /enroll відхилено (409 already_finalized). Це термінально для цього серверного ідентифікатора: звітність зупинена до нового enrollment адміністратором."
                     $enrollmentState.LastFinalizedLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
                     Set-BRAVOOperationsEnrollmentState -State $enrollmentState
@@ -896,7 +977,7 @@ function Invoke-BRAVOOperationsEnrollment {
                 return $null
             }
         } else {
-            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+            Write-BRAVOOperationsLog -Level 'WARNING' `
                 -Message "Не вдалося зареєструвати сервер в Operations (enroll): $($_.Exception.Message)"
             return $null
         }
@@ -913,13 +994,19 @@ function Invoke-BRAVOOperationsEnrollment {
     } catch {
         $statusCode = Get-BRAVOOperationsHttpStatusCode -ErrorRecord $_
         if ($statusCode -eq 503) {
-            # A5, symmetrically to POST above.
-            if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotConfiguredLoggedAtUtc) {
-                Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
-                    -Message 'Operations enrollment ще не сконфігуровано на боці API (503 enrollment_not_configured) на GET-опитуванні статусу — очікуємо наступного природного циклу'
-                $enrollmentState.LastNotConfiguredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-                Set-BRAVOOperationsEnrollmentState -State $enrollmentState
-            }
+            # A5, симетрично до POST вище — ТОЮ САМОЮ реалізацією.
+            #
+            # Review finding (PR #225, "Verify the error code for GET
+            # enrollment 503 responses"): раніше ця гілка була status-only —
+            # ЛЮБИЙ 503 на GET-опитуванні статусу діагностувався як
+            # enrollment_not_configured, хоча симетричну правку POST уже
+            # отримав. Оператор під час звичайної недоступності сервісу чи
+            # проксі бачив "enrollment не сконфігуровано" й шукав причину в
+            # bootstrap-provisioning. Політика класифікації 503 тепер має
+            # ОДНУ канонічну реалізацію на обидві точки виклику, а не дві
+            # копії, які вже один раз розійшлися саме так.
+            Write-BRAVOOperationsEnrollment503Diagnostic `
+                -ErrorRecord $_ -EnrollmentState $enrollmentState -RequestPhase 'GET /enroll/{serverId}'
             return $null
         }
         if ($statusCode -eq 404) {
@@ -930,14 +1017,14 @@ function Invoke-BRAVOOperationsEnrollment {
             # самий виклик відбудеться природно на наступній події/
             # heartbeat).
             if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastNotReadyLoggedAtUtc) {
-                Write-BRAVOLog -Component 'Operations' -Level 'INFO' `
+                Write-BRAVOOperationsLog -Level 'INFO' `
                     -Message 'Сервер ще не готовий в Operations (pending/не знайдено з поточним claim) — очікуємо ручного підтвердження в UI'
                 $enrollmentState.LastNotReadyLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
                 Set-BRAVOOperationsEnrollmentState -State $enrollmentState
             }
             return $null
         }
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Не вдалося опитати статус enrollment в Operations: $($_.Exception.Message)"
         return $null
     }
@@ -950,7 +1037,7 @@ function Invoke-BRAVOOperationsEnrollment {
         # Захисна гілка: реальний бекенд віддає 404 (не 200/revoked) для
         # revoked-серверів (перехоплено в catch вище). Лишено як-є —
         # нешкідливо, і покриває гіпотетичну майбутню зміну контракту.
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Сервер відкликано (revoked) в Operations — звітність призупинена, доки адміністратор не перевидасть доступ"
         # НЕ Clear-BRAVOOperationsEnrollmentState: claim лишається (той
         # самий D1-інваріант, що й у success-гілці нижче) — якщо
@@ -991,7 +1078,7 @@ function Invoke-BRAVOOperationsEnrollment {
         # найближчого Archive/Health/Maintenance-прогону, якщо він
         # природно потрапляє в 5-хвилинне вікно).
         if (Test-BRAVOOperationsLogThrottleElapsed -LastLoggedAtUtc $enrollmentState.LastTtlExpiredLoggedAtUtc) {
-            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+            Write-BRAVOOperationsLog -Level 'WARNING' `
                 -Message 'Сервер approved в Operations, але API-ключ більше недоступний (5-хвилинне вікно видачі вичерпано) — потрібне ручне admin reissue в Operations UI; ОДРАЗУ ПІСЛЯ reissue вручну запустіть BRAVO_OPERATIONS_HEARTBEAT.ps1 на цьому сервері (наступний природний Archive/Health/Maintenance-прогін може не встигнути в 5-хвилинне вікно — типовий Health-інтервал 240 хв). Агент сам НЕ намагатиметься "самовиправитись" тісним retry.'
             $enrollmentState.LastTtlExpiredLoggedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
             Set-BRAVOOperationsEnrollmentState -State $enrollmentState
@@ -1014,7 +1101,7 @@ function Invoke-BRAVOOperationsEnrollment {
         $secureApiKey = ConvertTo-SecureString -String $newApiKey -AsPlainText -Force
         Set-BRAVOCredential -Target $apiKeyTarget -Secret $secureApiKey
     } catch {
-        Write-BRAVOLog -Component 'Operations' -Level 'ERROR' `
+        Write-BRAVOOperationsLog -Level 'ERROR' `
             -Message "Сервер підтверджено (approved) в Operations і API-ключ отримано, але зберегти його в Credential Manager ($apiKeyTarget) не вдалося: $($_.Exception.Message). Подію цього прогону поставлено в durable outbox. УВАГА: якщо запис не вдасться і в межах 5-хвилинного вікна видачі, знадобиться ручний admin reissue в Operations UI — перевірте права акаунта, під яким виконується BRAVO, на Credential Manager."
         return $null
     } finally {
@@ -1047,7 +1134,7 @@ function Invoke-BRAVOOperationsEnrollment {
     # секрету — що прямо суперечило б задокументованому вище циклу
     # "401 -> re-enroll". Лог тепер називає цю умову замість того, щоб
     # називати видалення безпечним.
-    Write-BRAVOLog -Component 'Operations' -Level 'SUCCESS' `
+    Write-BRAVOOperationsLog -Level 'SUCCESS' `
         -Message "Сервер підтверджено (approved) в Operations — API-ключ збережено. Bootstrap-секрет ($bootstrapSecretTarget) для ЗВИЧАЙНОЇ роботи більше не потрібен, але НЕ видаляйте його без потреби: відновлення (повторний enrollment після втрати ключа, або reissue після 401) вимагає саме його, бо і POST /enroll, і GET /enroll/:id несуть X-Bootstrap-Secret. Якщо секрет усе ж видалено, перед відновленням його потрібно надати заново (reprovisioning)."
     return $newApiKey
 }
@@ -1156,7 +1243,7 @@ function Add-BRAVOOperationsOutboxItem {
                 foreach ($stale in @($existingItems | Select-Object -First $evictCount)) {
                     Move-BRAVOOperationsOutboxItemToDeadLetter -Item $stale -Reason "Outbox переповнено (ліміт $MaxOutboxItems items) — найстаріший item витіснено"
                 }
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                Write-BRAVOOperationsLog -Level 'WARNING' `
                     -Message "Outbox Operations переповнено (ліміт $MaxOutboxItems) — витіснено $evictCount найстаріших item(ів) у dead-letter"
             }
         } catch {
@@ -1209,10 +1296,10 @@ function Add-BRAVOOperationsOutboxItem {
             LastError = $LastError
         }
         Write-BRAVOOperationsAtomicJsonFile -Path (Get-BRAVOOperationsOutboxItemPath -EventId $EventId) -Object $item
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Подію Operations ($Kind, eventId=$EventId) не вдалося доставити негайно — поставлено в локальний outbox для повторної спроби"
     } catch {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Не вдалося поставити подію Operations ($Kind, eventId=$EventId) в outbox: $($_.Exception.Message) — подію втрачено"
     }
 }
@@ -1275,7 +1362,7 @@ function Move-BRAVOOperationsOutboxItemToDeadLetter {
             }
         }
     } catch {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Не вдалося перемістити подію Operations (eventId=$([string]$Item.EventId)) у dead-letter: $($_.Exception.Message)"
     }
 }
@@ -1325,10 +1412,10 @@ function Clear-BRAVOOperationsInvalidCredential {
     try {
         $apiKeyTarget = [string]$CredentialTargets.OperationsApiKey
         [void](Remove-BRAVOCredential -Target $apiKeyTarget)
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Operations API-ключ ($apiKeyTarget) відхилено сервером (401) — трактуємо як відкликаний/недійсний, локальний ключ видалено. Наступний цикл спробує звичайний enrollment заново (природно зупиниться, якщо сервер дійсно revoked)."
     } catch {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Operations API-ключ відхилено сервером (401), але не вдалося видалити локальний збережений ключ: $($_.Exception.Message)"
     }
 }
@@ -1397,7 +1484,7 @@ function Send-BRAVOOperationsEnvelope {
                 AttemptCount = 1
             }
             Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "HTTP $statusCode при першій спробі: $($_.Exception.Message)"
-            Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+            Write-BRAVOOperationsLog -Level 'WARNING' `
                 -Message "Подію Operations ($Kind, eventId=$EventId) відхилено як невалідну (HTTP $statusCode) — переміщено в dead-letter, повтор не матиме сенсу"
             return $false
         }
@@ -1451,7 +1538,7 @@ function Invoke-BRAVOOperationsOutboxDrain {
             if ($processedCount -ge $MaxItemsPerDrain -or
                 $drainStopwatch.Elapsed.TotalSeconds -ge $MaxDrainDurationSeconds) {
                 $remainingCount = @($items).Count - $processedCount
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' -Message "Дренаж Operations outbox зупинено достроково (ліміт items=$MaxItemsPerDrain, ліміт часу=${MaxDrainDurationSeconds}с) - залишилось items у черзі для наступного дренажу: $remainingCount"
+                Write-BRAVOOperationsLog -Level 'WARNING' -Message "Дренаж Operations outbox зупинено достроково (ліміт items=$MaxItemsPerDrain, ліміт часу=${MaxDrainDurationSeconds}с) - залишилось items у черзі для наступного дренажу: $remainingCount"
                 break
             }
 
@@ -1474,7 +1561,7 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 $itemServerId -ne $drainServerId) {
                 Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item `
                     -Reason "Item належить іншій серверній ідентичності ($itemServerId), а дренаж виконується під $drainServerId — надсилання приписало б подію старого сервера новому"
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                Write-BRAVOOperationsLog -Level 'WARNING' `
                     -Message "Outbox item (eventId=$([string]$item.EventId)) породжений іншою серверною ідентичністю ($itemServerId), ніж поточна ($drainServerId) — переміщено в dead-letter без надсилання. Це очікувано після свідомої заміни ідентичності (відновлення від claim_mismatch); історія старої ідентичності лишається в dead-letter."
                 continue
             }
@@ -1492,9 +1579,25 @@ function Invoke-BRAVOOperationsOutboxDrain {
             # першим у FIFO-черзі і "отруював" би обробку ВСІХ наступних
             # items на КОЖНОМУ наступному прогоні. Тепер такий item сам
             # dead-letter-иться і drain продовжує решту.
+            #
+            # Review finding (PR #225, "Quarantine outbox items with a
+            # missing API path"): перша версія цієї ізоляції валідувала
+            # ЛИШЕ RequestBody. Item з коректним тілом, але без ApiPath,
+            # доходив до Invoke-BRAVOOperationsApiRequest із порожнім
+            # ОБОВ'ЯЗКОВИМ -Path; PowerShell відхиляв це на binding-у, тобто
+            # НЕ HTTP-збоєм — statusCode виходив $null, catch нижче
+            # класифікував це як transient, оновлював item і виходив із
+            # ЦІЛОГО дренажу. Item лишався першим у FIFO-черзі й блокував
+            # усі наступні події на КОЖНОМУ due-ретраї — та сама отрута, яку
+            # ця ізоляція мала прибрати, лише через інше поле. Тому тут
+            # валідуються ВСІ обов'язкові поля конверта перед транспортом.
             $requestBodyHashtable = $null
             try {
                 $requestBodyHashtable = @{}
+                $itemApiPath = Get-BRAVOOperationsJsonPropertyString -Object $item -Name 'ApiPath'
+                if ([string]::IsNullOrWhiteSpace($itemApiPath)) {
+                    throw "ApiPath відсутнє або порожнє — надіслати item нікуди"
+                }
                 if ($null -eq $item.RequestBody -or $item.RequestBody -isnot [PSCustomObject]) {
                     throw "RequestBody відсутнє або має неочікуваний тип: $(if ($null -eq $item.RequestBody) { '<null>' } else { $item.RequestBody.GetType().FullName })"
                 }
@@ -1502,20 +1605,20 @@ function Invoke-BRAVOOperationsOutboxDrain {
                     $requestBodyHashtable[$property.Name] = $property.Value
                 }
             } catch {
-                Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "Пошкоджений outbox item (невалідне RequestBody) при дренажі: $($_.Exception.Message)"
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
-                    -Message "Пошкоджений outbox item (eventId=$([string]$item.EventId)) переміщено в dead-letter при дренажі — решта черги обробляється далі"
+                Move-BRAVOOperationsOutboxItemToDeadLetter -Item $item -Reason "Пошкоджений outbox item (невалідний конверт: ApiPath/RequestBody) при дренажі: $($_.Exception.Message)"
+                Write-BRAVOOperationsLog -Level 'WARNING' `
+                    -Message "Пошкоджений outbox item (eventId=$([string]$item.EventId)) переміщено в dead-letter при дренажі — решта черги обробляється далі. Причина: $($_.Exception.Message)"
                 continue
             }
 
             try {
                 [void](Invoke-BRAVOOperationsApiRequest `
-                    -BaseUrl $ApiBaseUrl -Path ([string]$item.ApiPath) -Method 'POST' `
+                    -BaseUrl $ApiBaseUrl -Path $itemApiPath -Method 'POST' `
                     -Headers @{ 'X-Api-Key' = $ApiKey } `
                     -Body $requestBodyHashtable `
                     -TimeoutSeconds $TimeoutSeconds)
                 Remove-BRAVOOperationsOutboxItem -Item $item
-                Write-BRAVOLog -Component 'Operations' -Level 'SUCCESS' `
+                Write-BRAVOOperationsLog -Level 'SUCCESS' `
                     -Message "Подію Operations з outbox доставлено (eventId=$([string]$item.EventId))"
             } catch {
                 $statusCode = Get-BRAVOOperationsHttpStatusCode -ErrorRecord $_
@@ -1548,14 +1651,14 @@ function Invoke-BRAVOOperationsOutboxDrain {
                 # прогін спробує знову.
                 Update-BRAVOOperationsOutboxItemAfterFailure -Item $item -LastError $_.Exception.Message
                 $remainingAfterTransient = @($items).Count - $processedCount
-                Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+                Write-BRAVOOperationsLog -Level 'WARNING' `
                     -Message "Дренаж Operations outbox зупинено після першого transient збою (транспорт/таймаут/5xx/429) — API зараз недоступний, решта items не перевірялась цим прогоном: $remainingAfterTransient. Спроба повториться на наступній події/heartbeat."
                 return 'transient'
             }
         }
         return 'ok'
     } catch {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Дренаж Operations outbox завершився з помилкою: $($_.Exception.Message)"
         # Невідомий збій самого дренажу — не привід вважати API
         # недоступним і пропускати негайну відправку поточної події.
@@ -1685,7 +1788,7 @@ function Send-BRAVOOperationsEvent {
     } catch {
         # Never-throw invariant: жодна несподівана помилка тут не сміє
         # переривати виклик Archive/Maintenance/Health.
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Неочікувана помилка Send-BRAVOOperationsEvent: $($_.Exception.Message)"
     }
 }
@@ -1711,6 +1814,31 @@ function Send-BRAVOOperationsHeartbeat {
             -CredentialTargets $CredentialTargets `
             -InstitutionCode $InstitutionCode
         if ([string]::IsNullOrWhiteSpace($apiKey)) {
+            # Review finding (PR #225, "Buffer heartbeats while enrollment
+            # is unavailable"): раніше heartbeat тут просто зникав разом зі
+            # своїм eventId/occurredAt. Шлях подій уже виправлено під ТОЮ
+            # САМОЮ умовою (enrollment pending / не сконфігуровано /
+            # мережевий збій / 401-invalidated), а heartbeat лишався
+            # винятком — і контракт durability модуля виконувався лише
+            # наполовину. Та сама асиметрія була і всередині цієї функції:
+            # на 'transient'/'unauthorized' від дренажу heartbeat у outbox
+            # СТАВИВСЯ (нижче), а на відсутній ключ — ні.
+            #
+            # Тіло будується тут, до постановки в чергу, щоб повторна
+            # спроба несла ОРИГІНАЛЬНІ eventId/occurredAt цього heartbeat
+            # (E4/E7), а не час майбутнього дренажу. AttemptCount=0 —
+            # без штучного стартового backoff.
+            $pendingHeartbeatBody = @{
+                eventId = $envelope.EventId
+                occurredAt = $envelope.OccurredAtUtc
+                schemaVersion = $envelope.SchemaVersion
+            }
+            if (-not [string]::IsNullOrWhiteSpace($BravoVersion)) {
+                $pendingHeartbeatBody.bravoVersion = $BravoVersion
+            }
+            Add-BRAVOOperationsOutboxItem -Kind 'heartbeat' -EventId $envelope.EventId `
+                -OccurredAtUtc $envelope.OccurredAtUtc -SchemaVersion $envelope.SchemaVersion `
+                -ApiPath '/api/v1/heartbeat' -RequestBody $pendingHeartbeatBody -AttemptCount 0
             return
         }
 
@@ -1751,10 +1879,10 @@ function Send-BRAVOOperationsHeartbeat {
             -Kind 'heartbeat' -ApiPath '/api/v1/heartbeat' -RequestBody $requestBody `
             -EventId $envelope.EventId -OccurredAtUtc $envelope.OccurredAtUtc -SchemaVersion $envelope.SchemaVersion
         if ($sent) {
-            Write-BRAVOLog -Component 'Operations' -Level 'SUCCESS' -Message 'Heartbeat відправлено в Operations'
+            Write-BRAVOOperationsLog -Level 'SUCCESS' -Message 'Heartbeat відправлено в Operations'
         }
     } catch {
-        Write-BRAVOLog -Component 'Operations' -Level 'WARNING' `
+        Write-BRAVOOperationsLog -Level 'WARNING' `
             -Message "Неочікувана помилка Send-BRAVOOperationsHeartbeat: $($_.Exception.Message)"
     }
 }

@@ -704,7 +704,7 @@
     $originalWriteBravoLogForTtlTest = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
     [void](New-Module -ScriptBlock {
         function Write-BRAVOLog {
-            param([string]$Component, [string]$Level, [string]$Message)
+            param([string]$Component, [string]$Level, [string]$Message, [switch]$Secondary)
             if ($Component -eq 'Operations' -and $Level -eq 'WARNING' -and $Message -like '*API-ключ*') {
                 [void]$global:BRAVOOpsSelfTestTtlExpiredWarnings.Add($Message)
             }
@@ -963,6 +963,72 @@
         -Failure "справний item ($goodEventId) МАВ БУТИ успішно доставлений і видалений з outbox, попри поруч зіпсований item -- rest-of-queue має продовжити дренуватись; wasSent=$goodItemWasSent remainsInOutbox=$goodItemRemainsInOutbox"
 
     # ---------------------------------------------------------------------
+    # Review PR #225: item з валідним RequestBody, але БЕЗ ApiPath. Перша
+    # версія per-item ізоляції валідувала лише RequestBody, тому такий item
+    # доходив до Invoke-BRAVOOperationsApiRequest із порожнім ОБОВ'ЯЗКОВИМ
+    # -Path; PowerShell відхиляв це на binding-у (НЕ HTTP-збій, statusCode
+    # $null), catch класифікував як transient і виходив із ЦІЛОГО дренажу.
+    # Item лишався першим у FIFO і блокував усю чергу на кожному ретраї.
+    # Той самий сценарій, що PoisonOutbox вище, лише інше поле конверта.
+    # ---------------------------------------------------------------------
+    $noPathDir = Join-Path $opsSelfTestRoot 'OutboxMissingApiPath'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $noPathDir
+    $noPathOutboxDir = & $outboxDirFn
+    New-Item -ItemType Directory -Path $noPathOutboxDir -Force | Out-Null
+
+    # Справний item -- новіший за битий, тобто в FIFO-порядку ПІСЛЯ нього.
+    $noPathGoodEventId = [guid]::NewGuid().ToString()
+    $noPathGoodPayload = [pscustomobject]@{
+        Kind = 'event'; EventId = $noPathGoodEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        SchemaVersion = 1; ApiPath = '/api/v1/events'
+        RequestBody = @{ category = 'health'; severity = 'SUCCESS' }
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-1).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        LastError = $null
+    }
+    [IO.File]::WriteAllText((Join-Path $noPathOutboxDir "$noPathGoodEventId.json"), ($noPathGoodPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+    $noPathEventId = '0000-nopath-' + [guid]::NewGuid().ToString()
+    $noPathItemPath = Join-Path $noPathOutboxDir "$noPathEventId.json"
+    $noPathPayload = [pscustomobject]@{
+        Kind = 'event'; EventId = $noPathEventId
+        OccurredAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        SchemaVersion = 1; ApiPath = ''
+        RequestBody = @{ category = 'health'; severity = 'SUCCESS' }
+        EnqueuedAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-2).ToString('o')
+        AttemptCount = 1
+        NextRetryAtUtc = (Get-Date).ToUniversalTime().AddSeconds(-5).ToString('o')
+        LastError = $null
+    }
+    [IO.File]::WriteAllText($noPathItemPath, ($noPathPayload | ConvertTo-Json -Depth 6), (New-Object Text.UTF8Encoding($false)))
+
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    Enqueue-BRAVOOpsSelfTestHttpSuccess -ContentObject @{ status = 'accepted' }
+    $noPathDrainOutcome = $null
+    $noPathDrainThrew = $false
+    try {
+        $noPathDrainOutcome = Invoke-BRAVOOperationsOutboxDrain -ApiBaseUrl $opsSettings.ApiBaseUrl -ApiKey 'test-api-key' `
+            -CredentialTargets $opsCredentialTargets -TimeoutSeconds 5
+    } catch {
+        $noPathDrainThrew = $true
+    }
+
+    $noPathDeadLetterDir = & $deadLetterDirFn
+    $noPathMovedToDeadLetter = Test-Path -LiteralPath (Join-Path $noPathDeadLetterDir "$noPathEventId.json") -PathType Leaf
+    $noPathRemainsInOutbox = Test-Path -LiteralPath $noPathItemPath -PathType Leaf
+    $noPathGoodRemainsInOutbox = Test-Path -LiteralPath (Join-Path $noPathOutboxDir "$noPathGoodEventId.json") -PathType Leaf
+
+    Test-BRAVOCondition -Condition (-not $noPathDrainThrew -and $noPathMovedToDeadLetter -and -not $noPathRemainsInOutbox) `
+        -Name 'Operations/OutboxItemWithoutApiPathIsDeadLetteredNotRetriedForever' `
+        -Failure "item без ApiPath має бути карантинований у DeadLetter ще ДО транспорту (порожній -Path дав би parameter-binding збій, який класифікувався б як transient і повертався б на кожному ретраї); threw=$noPathDrainThrew movedToDeadLetter=$noPathMovedToDeadLetter remainsInOutbox=$noPathRemainsInOutbox"
+    Test-BRAVOCondition -Condition (-not $noPathGoodRemainsInOutbox -and $noPathDrainOutcome -eq 'ok') `
+        -Name 'Operations/OutboxItemWithoutApiPathDoesNotBlockRemainingQueueDrain' `
+        -Failure "справний item після item-а без ApiPath МАВ БУТИ доставлений у тому самому дренажі, а результат дренажу -- 'ok', а не 'transient'; outcome=$noPathDrainOutcome goodRemainsInOutbox=$noPathGoodRemainsInOutbox"
+
+    # ---------------------------------------------------------------------
     # Thread 6/P2 (review): Enabled=true + порожній ApiBaseUrl -- НЕ
     # мовчазний no-op. Throttled WARNING (LastApiBaseUrlMissingLoggedAtUtc),
     # та сама throttle-політика, що pending/404/TTL-expired (типово 15 хв):
@@ -977,7 +1043,7 @@
     $originalWriteBravoLog = Get-Command -Name Write-BRAVOLog -CommandType Function -ErrorAction SilentlyContinue
     [void](New-Module -ScriptBlock {
         function Write-BRAVOLog {
-            param([string]$Component, [string]$Level, [string]$Message)
+            param([string]$Component, [string]$Level, [string]$Message, [switch]$Secondary)
             if ($Component -eq 'Operations' -and $Level -eq 'WARNING' -and $Message -like '*ApiBaseUrl порожній*') {
                 [void]$global:BRAVOOpsSelfTestApiBaseUrlWarnings.Add($Message)
             }
@@ -1205,6 +1271,74 @@
         ) -Name 'Operations/EventDuringPendingEnrollmentOutboxItemCarriesOriginalPayload' `
           -Failure "буферизований item має нести ОРИГІНАЛЬНІ category/severity/message/component цієї події, з AttemptCount=0 (без штучного стартового затримання); отримано $($pendingLossItemRaw | ConvertTo-Json -Compress -Depth 6)"
     }
+
+    # ---------------------------------------------------------------------
+    # Review PR #225: heartbeat під час недоступного enrollment. Шлях подій
+    # уже буферизувався (тест вище), а heartbeat під ТОЮ САМОЮ умовою просто
+    # зникав разом зі своїм eventId/occurredAt -- контракт durability
+    # виконувався лише наполовину. Та сама асиметрія була і в межах самої
+    # Send-BRAVOOperationsHeartbeat: на 'transient' від дренажу heartbeat у
+    # outbox ставився, а на відсутній ключ -- ні.
+    # ---------------------------------------------------------------------
+    $heartbeatPendingDir = Join-Path $opsSelfTestRoot 'PendingEnrollmentHeartbeatLoss'
+    Set-BRAVOOpsSelfTestStateDirectory -Directory $heartbeatPendingDir
+    $global:BRAVOOpsSelfTestCredentialStore = @{}
+    $global:BRAVOOpsSelfTestHttpQueue.Clear()
+    $global:BRAVOOpsSelfTestHttpCalls.Clear()
+    $heartbeatPendingThrew = $false
+    try {
+        Send-BRAVOOperationsHeartbeat -OperationsReportingSettings $opsSettings `
+            -CredentialTargets $opsCredentialTargets -InstitutionCode 'INST1' -BravoVersion '5.3.0-test'
+    } catch {
+        $heartbeatPendingThrew = $true
+    }
+
+    $heartbeatPendingItems = @(Get-ChildItem -LiteralPath (Join-Path $heartbeatPendingDir 'Outbox') -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    Test-BRAVOCondition -Condition (-not $heartbeatPendingThrew -and $global:BRAVOOpsSelfTestHttpCalls.Count -eq 0 -and $heartbeatPendingItems.Count -eq 1) `
+        -Name 'Operations/HeartbeatDuringPendingEnrollmentIsBufferedToOutboxNotDropped' `
+        -Failure "heartbeat під час pending enrollment має буферизуватись у durable Outbox (як подія), без винятку і без мережевої спроби; threw=$heartbeatPendingThrew httpCalls=$($global:BRAVOOpsSelfTestHttpCalls.Count) items=$($heartbeatPendingItems.Count)"
+
+    if ($heartbeatPendingItems.Count -eq 1) {
+        $heartbeatPendingRaw = ([IO.File]::ReadAllText($heartbeatPendingItems[0].FullName, [Text.UTF8Encoding]::new($false)) | ConvertFrom-Json)
+        Test-BRAVOCondition -Condition (
+            [string]$heartbeatPendingRaw.Kind -eq 'heartbeat' -and
+            [string]$heartbeatPendingRaw.ApiPath -eq '/api/v1/heartbeat' -and
+            [string]$heartbeatPendingRaw.RequestBody.bravoVersion -eq '5.3.0-test' -and
+            [string]$heartbeatPendingRaw.RequestBody.eventId -eq [string]$heartbeatPendingRaw.EventId -and
+            [string]$heartbeatPendingRaw.RequestBody.occurredAt -eq [string]$heartbeatPendingRaw.OccurredAtUtc -and
+            [int]$heartbeatPendingRaw.AttemptCount -eq 0
+        ) -Name 'Operations/BufferedHeartbeatKeepsOriginalEnvelopeAndVersion' `
+          -Failure "буферизований heartbeat має нести ОРИГІНАЛЬНІ eventId/occurredAt цього heartbeat (E4/E7, а не час майбутнього дренажу), bravoVersion і AttemptCount=0; отримано $($heartbeatPendingRaw | ConvertTo-Json -Compress -Depth 6)"
+    }
+
+    # ---------------------------------------------------------------------
+    # Review PR #225 (P1): Operations -- ДРУГОРЯДНИЙ канал звітності. Його
+    # WARNING-и не сміють важити в спільному лічильнику попереджень, бо
+    # BRAVO_ARCHIV резолвить будь-яке попередження прогону в exit code 10
+    # (SuccessWithWarnings, статус ЧАСТКОВО): недоступність телеметрії
+    # змінювала рапортований результат УСПІШНОГО бекапу.
+    #
+    # Перевірка СТРУКТУРНА: інваріант мусить триматись на вигляді коду, а
+    # не на дисциплінованості кожного майбутнього call-site. Модуль має
+    # РІВНО одну згадку Write-BRAVOLog у виконуваному коді -- усередині
+    # Write-BRAVOOperationsLog, і саме з -Secondary.
+    # ---------------------------------------------------------------------
+    $opsModuleText = [IO.File]::ReadAllText((Join-Path $root 'modules\BRAVO.Operations\BRAVO.Operations.psm1'), [Text.Encoding]::UTF8)
+    $opsModuleCodeLines = @(
+        @($opsModuleText -split "`r?`n") |
+            Where-Object { $_ -notmatch '^\s*#' }
+    )
+    $opsDirectLogLines = @(@($opsModuleCodeLines) | Where-Object { $_ -match 'Write-BRAVOLog\b' })
+    $opsWrapperCallLines = @(@($opsModuleCodeLines) | Where-Object { $_ -match 'Write-BRAVOOperationsLog\b' })
+    Test-BRAVOCondition -Condition (
+        $opsDirectLogLines.Count -eq 1 -and
+        $opsDirectLogLines[0] -match "-Component\s+'Operations'" -and
+        $opsDirectLogLines[0] -match '-Secondary' -and
+        $opsWrapperCallLines.Count -ge 30
+    ) -Name 'Operations/ModuleLogsOnlyThroughSecondaryWrapper' `
+      -Failure ("уся діагностика BRAVO.Operations мусить іти через Write-BRAVOOperationsLog (який додає -Secondary), інакше збій вторинної телеметрії " +
+        "знову підніматиме лічильник попереджень і даватиме успішному бекапу exit code 10; прямих Write-BRAVOLog рядків=$($opsDirectLogLines.Count) " +
+        "(очікувано рівно 1 -- усередині обгортки, з -Secondary), викликів обгортки=$($opsWrapperCallLines.Count)")
 
     # ---------------------------------------------------------------
     # Прибирання: зняти всі self-test overrides з function:-drive (той

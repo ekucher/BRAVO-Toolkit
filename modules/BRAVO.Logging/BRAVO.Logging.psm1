@@ -136,16 +136,36 @@ function Write-BRAVOLog {
         # інакше кожен успішний прогін на невідновленому сервері назавжди
         # завершувався б кодом 10 (SuccessWithWarnings) зі статусом ЧАСТКОВО,
         # поки адміністратор не встановить оновлення Windows.
-        [switch]$Environmental
+        [switch]$Environmental,
+
+        # Діагностика ДРУГОРЯДНОЇ (не основної) операції прогону —
+        # телеметрія, звітність, фонова синхронізація стану. Такий запис
+        # лишається видимим як WARNING, але НЕ інкрементує лічильник
+        # попереджень, бо він не описує результат того, заради чого прогін
+        # виконувався.
+        #
+        # Той самий механізм і та сама мотивація, що в $Environmental вище,
+        # інша причина: там стан середовища, тут — побічний канал. Спільна
+        # гілка нижче навмисно одна: політика "що рахується попередженням"
+        # мусить лишатись в ОДНОМУ місці.
+        #
+        # Приклад, заради якого введено (review PR #225, P1): недоступність
+        # Operations API під час post-backup Health робила
+        # $logStatistics.Warnings > 0, і BRAVO_ARCHIV резолвив успішному
+        # бекапу exit code 10 (SuccessWithWarnings, статус ЧАСТКОВО). Тобто
+        # збій вторинної телеметрії змінював рапортований результат
+        # ПЕРВИННОЇ операції, всупереч fail-soft інваріанту звітності.
+        [switch]$Secondary
     )
 
     $severity = Get-BRAVOLogSeverityValue -Level $Level
     if ($severity -ge (Get-BRAVOLogSeverityValue -Level 'WARNING')) {
         if ($severity -ge (Get-BRAVOLogSeverityValue -Level 'ERROR')) {
-            # $Environmental свідомо НЕ впливає на помилки: прапорець знімає
-            # лише вагу попередження, а не приховує справжню відмову.
+            # $Environmental/$Secondary свідомо НЕ впливають на помилки:
+            # прапорець знімає лише вагу попередження, а не приховує
+            # справжню відмову.
             $script:BRAVOLogErrorCount++
-        } elseif (-not $Environmental) {
+        } elseif (-not $Environmental -and -not $Secondary) {
             $script:BRAVOLogWarningCount++
         }
     }
