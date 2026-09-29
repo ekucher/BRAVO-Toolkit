@@ -3405,13 +3405,17 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # Провал реставрації, що потребував відкату, мапиться на
             # RestoreFailed (43) — окремо від збою СТВОРЕННЯ архіву (40).
             $maintenanceRuntimeTextForExitCodes.Contains('-RestoreFailed:$script:restoreFailed') -and
-            # 11 точок restoreArchiveFailed; 11 точок restoreIntegrityFailed.
+            # 11 точок restoreArchiveFailed; 10 точок restoreIntegrityFailed.
             # +1 integrity проти fix/repair-rollback-false-positive:
             # Invoke-BRAVOModelRestoreRecovery після успішного відкату повторно
             # валідує модель і, якщо вона ВСЕ ОДНО не консистентна, позначає
             # restoreIntegrityFailed (rollback=FAILED, служби гейтуються).
+            # -1 integrity (T004/F002): дві гілки before-архіву («не пройшов
+            # 7z t» / «не вдалося створити SHA512») злито в одну гілку
+            # Verify-Backup (7z t + SHA512); збій 7z t і далі виставляє
+            # restoreIntegrityFailed у Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 11)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
@@ -15160,6 +15164,227 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (-not $restoreCleanupRemainingThrew) `
         -Name "Maintenance/RestoreCleanupSingleRemainingFileDoesNotThrow" `
         -Failure ("коли після видалення лишається рівно один файл із префіксом, `$remainingFiles.Count не повинен кидати виняток під Set-StrictMode; кинуто: {0}" -f $restoreCleanupRemainingErrorMessage)
+
+    # ================================================================
+    # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
+    # мусить РЕАЛЬНО перевіряти архів, а не лише писати .sha512 і
+    # повертати $true для будь-якого наявного файлу. Реальні функції
+    # (AST-екстракція): Verify-Backup, Get-SHA512HashCompatible,
+    # Test-BRAVOMaintenanceSevenZipArchiveIntegrity (політика прапорців
+    # Maintenance) і канонічний BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity
+    # (рішення успіх/збій). Застабовано лише шар запуску процесу 7-Zip
+    # (Invoke-BRAVOSevenZipIntegrityTest) детермінованим fake-7z, що
+    # повертає той самий об'єкт результату: успіх лише для «цілого»
+    # вмісту архіву з правильним паролем; для відсутнього інструмента —
+    # ExitCode $null, як справжній Invoke-BRAVOSevenZipIntegrityTestCore;
+    # «зламаний» інструмент — ненульовий код. Справжній 7za.exe тут не
+    # предмет тесту (його покривають B2/* і RestoreSynthetic/*).
+    # ================================================================
+    $verifyBackupSourceText = (
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        ) + "`n" +
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1"),
+            [Text.Encoding]::UTF8
+        )
+    )
+    $verifyBackupModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $verifyBackupSourceText `
+        -FunctionNames @(
+            'Verify-Backup', 'Get-SHA512HashCompatible',
+            'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog'
+        )
+    $verifyBackupStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            [void]$script:verifyBackupLogLines.Add("[$Level] $Message")
+        }
+        function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+        function Get-BRAVOFileHash {
+            param([string]$Path, [string]$Algorithm)
+            return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+        }
+        function Invoke-BRAVOSevenZipIntegrityTest {
+            param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+            $null = $TimeoutSeconds
+            $script:verifyBackupSevenZipCalls++
+            if (-not (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $null
+                    Description = "7-Zip не знайдено: $SevenZipPath"
+                    StandardOutput = ''; StandardError = ''
+                }
+            }
+            if ([IO.File]::ReadAllText($SevenZipPath) -ne 'FAKE-7Z-OK') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 8
+                    Description = 'Not enough memory for operation'
+                    StandardOutput = ''; StandardError = 'ERROR: fake tool failure'
+                }
+            }
+            if ([IO.File]::ReadAllText($ArchivePath) -ne 'FAKE-7Z-INTACT-ARCHIVE') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error'
+                }
+            }
+            if ($Password -cne $script:verifyBackupExpectedPassword) {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'
+                    StandardOutput = ''; StandardError = 'ERROR: Wrong password'
+                }
+            }
+            return New-Object PSObject -Property @{
+                Success = $true; ExitCode = 0; Description = 'No error'
+                StandardOutput = 'Everything is Ok'; StandardError = ''
+            }
+        }
+    }.ToString()
+    # Фікстурний пароль складається з частин (див. коментар у
+    # RestoreSynthetic щодо entropy-евристики gitleaks); живе лише в
+    # межах прогону і нікуди не пишеться.
+    $verifyBackupPassword = @('verify', 'backup', 'selftest', 'fixture') -join '-'
+    $verifyBackupRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_VERIFY_BACKUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($verifyBackupRoot)
+    $verifyBackupInvoke = {
+        # Без [string]-обмеження: `$null означає «файл не створювати».
+        param([string]$Scenario, $ArchiveContent, $SevenZipContent, [string]$ArchivePassword)
+        $scenarioDir = Join-Path $verifyBackupRoot $Scenario
+        [void][IO.Directory]::CreateDirectory($scenarioDir)
+        $archiveName = "MODEL_before_20260101_0100.mdz"
+        $archivePath = Join-Path $scenarioDir $archiveName
+        if ($null -ne $ArchiveContent) {
+            [IO.File]::WriteAllText($archivePath, $ArchiveContent)
+        }
+        $sevenZipPath = Join-Path $scenarioDir '7za.exe'
+        if ($null -ne $SevenZipContent) {
+            [IO.File]::WriteAllText($sevenZipPath, $SevenZipContent)
+        }
+        $outcome = & $verifyBackupModule {
+            param($SevenZip, $Archive, $Password, $ExpectedPassword, $StubScriptText)
+            Set-StrictMode -Version Latest
+            . ([scriptblock]::Create($StubScriptText))
+            $script:verifyBackupLogLines = New-Object System.Collections.ArrayList
+            $script:verifyBackupSevenZipCalls = 0
+            $script:verifyBackupExpectedPassword = $ExpectedPassword
+            $script:ArchivePassword = $Password
+            $script:SevenZipIntegrityTestTimeoutSeconds = 60
+            $script:criticalErrorOccurred = $false
+            $script:restoreIntegrityFailed = $false
+            $threw = $null
+            $result = $null
+            try {
+                $result = Verify-Backup -SevenZipPath $SevenZip -ArchivePath $Archive
+            } catch {
+                $threw = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Result = $result
+                Threw = $threw
+                CriticalErrorOccurred = [bool]$script:criticalErrorOccurred
+                RestoreIntegrityFailed = [bool]$script:restoreIntegrityFailed
+                SevenZipCalls = [int]$script:verifyBackupSevenZipCalls
+                LogText = (@($script:verifyBackupLogLines) -join "`n")
+            }
+        } $sevenZipPath $archivePath $ArchivePassword $verifyBackupPassword $verifyBackupStubScriptText
+        $hashPath = "$archivePath.sha512"
+        $outcome | Add-Member -NotePropertyName HashExists -NotePropertyValue (Test-Path -LiteralPath $hashPath -PathType Leaf)
+        $outcome | Add-Member -NotePropertyName HashText -NotePropertyValue $(
+            if ($outcome.HashExists) { [IO.File]::ReadAllText($hashPath) } else { $null })
+        $outcome | Add-Member -NotePropertyName ArchiveHash -NotePropertyValue $(
+            if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
+                (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+            } else { $null })
+        $outcome | Add-Member -NotePropertyName ArchiveName -NotePropertyValue $archiveName
+        return $outcome
+    }
+    try {
+        $verifyBackupValid = & $verifyBackupInvoke 'valid' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupCorrupt = & $verifyBackupInvoke 'corrupt' 'truncated-or-corrupted-bytes' 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupWrongPassword = & $verifyBackupInvoke 'wrongpassword' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' 'not-the-archive-password'
+        $verifyBackupMissingArchive = & $verifyBackupInvoke 'missingarchive' $null 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupToolMissing = & $verifyBackupInvoke 'toolmissing' 'FAKE-7Z-INTACT-ARCHIVE' $null $verifyBackupPassword
+        $verifyBackupToolFailure = & $verifyBackupInvoke 'toolfailure' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-BROKEN' $verifyBackupPassword
+    } finally {
+        if (Test-Path -LiteralPath $verifyBackupRoot) {
+            Remove-Item -LiteralPath $verifyBackupRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Цілий архів: успіх, як і раніше, + .sha512 у тому самому форматі,
+    # який читає Remove-OldRestoreArchives ("<HASH> *<ім'я архіву>").
+    $verifyBackupValidHashMatch = if ($null -ne $verifyBackupValid.HashText) {
+        [regex]::Match($verifyBackupValid.HashText.Trim(), '^(?<Hash>[A-F0-9]{128}) \*(?<FileName>.+)$')
+    } else { $null }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $verifyBackupValid.Threw -and
+            $verifyBackupValid.Result -eq $true -and
+            $verifyBackupValid.SevenZipCalls -eq 1 -and
+            -not $verifyBackupValid.CriticalErrorOccurred -and
+            -not $verifyBackupValid.RestoreIntegrityFailed -and
+            $verifyBackupValid.HashExists -and
+            $null -ne $verifyBackupValidHashMatch -and $verifyBackupValidHashMatch.Success -and
+            $verifyBackupValidHashMatch.Groups['Hash'].Value -ceq $verifyBackupValid.ArchiveHash -and
+            $verifyBackupValidHashMatch.Groups['FileName'].Value -ceq $verifyBackupValid.ArchiveName
+        ) `
+        -Name "Maintenance/VerifyBackupValidArchivePassesAndWritesSha512" `
+        -Failure ("цілий архів має пройти 7z t рівно один раз, повернути `$true без критичних прапорців і записати '<SHA512> *<ім'я>'; Result=$($verifyBackupValid.Result), 7z calls=$($verifyBackupValid.SevenZipCalls), hash='$($verifyBackupValid.HashText)', threw=$($verifyBackupValid.Threw)")
+
+    # Негативні сценарії: жоден не може дати «перевірено», жоден не лишає
+    # .sha512 (інакше артефакт виглядав би валідною точкою відновлення).
+    foreach ($verifyBackupNegative in @(
+        @{ Outcome = $verifyBackupCorrupt; Name = 'Maintenance/VerifyBackupCorruptedArchiveFailsClosed'; What = 'пошкоджений архів'; ExpectSevenZip = $true },
+        @{ Outcome = $verifyBackupWrongPassword; Name = 'Maintenance/VerifyBackupWrongPasswordFailsClosed'; What = 'невірний пароль архіву'; ExpectSevenZip = $true },
+        @{ Outcome = $verifyBackupMissingArchive; Name = 'Maintenance/VerifyBackupMissingArchiveFailsClosed'; What = 'відсутній архів'; ExpectSevenZip = $false },
+        @{ Outcome = $verifyBackupToolMissing; Name = 'Maintenance/VerifyBackupMissingSevenZipFailsClosed'; What = 'відсутній 7-Zip'; ExpectSevenZip = $true },
+        @{ Outcome = $verifyBackupToolFailure; Name = 'Maintenance/VerifyBackupSevenZipFailureFailsClosed'; What = 'ненульовий код 7-Zip'; ExpectSevenZip = $true }
+    )) {
+        $negativeOutcome = $verifyBackupNegative.Outcome
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $negativeOutcome.Threw -and
+                $negativeOutcome.Result -eq $false -and
+                $negativeOutcome.CriticalErrorOccurred -and
+                $negativeOutcome.RestoreIntegrityFailed -and
+                -not $negativeOutcome.HashExists -and
+                $negativeOutcome.LogText.Contains('[ERROR]') -and
+                (($negativeOutcome.SevenZipCalls -ge 1) -eq $verifyBackupNegative.ExpectSevenZip)
+            ) `
+            -Name $verifyBackupNegative.Name `
+            -Failure ("$($verifyBackupNegative.What): Verify-Backup має повернути `$false (fail-closed) з ERROR у журналі, criticalErrorOccurred/restoreIntegrityFailed і без .sha512; Result=$($negativeOutcome.Result), critical=$($negativeOutcome.CriticalErrorOccurred), integrity=$($negativeOutcome.RestoreIntegrityFailed), sha512=$($negativeOutcome.HashExists), 7z calls=$($negativeOutcome.SevenZipCalls), threw=$($negativeOutcome.Threw)")
+    }
+
+    $verifyBackupAllLogText = @(
+        $verifyBackupValid, $verifyBackupCorrupt, $verifyBackupWrongPassword,
+        $verifyBackupMissingArchive, $verifyBackupToolMissing, $verifyBackupToolFailure
+    ) | ForEach-Object { $_.LogText }
+    Test-BRAVOCondition `
+        -Condition (-not (($verifyBackupAllLogText -join "`n").Contains($verifyBackupPassword))) `
+        -Name "Maintenance/VerifyBackupDoesNotLogPassword" `
+        -Failure "пароль архіву не повинен потрапляти в журнал Verify-Backup ні на успіху, ні на збої"
+
+    # Додатковий структурний guard: обидва call sites before/after-архіву
+    # проходять саме через повну перевірку (з 7-Zip), а не через голий
+    # запис SHA512.
+    $verifyBackupRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $verifyBackupRuntimeText.Contains('(Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $beforeArchivePath)') -and
+            $verifyBackupRuntimeText.Contains('(Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $afterArchivePath)') -and
+            -not $verifyBackupRuntimeText.Contains('Verify-Backup -ArchivePath')
+        ) `
+        -Name "Maintenance/BeforeAfterArchivesUseFullVerification" `
+        -Failure "before/after-архіви реставрації мають перевірятися через Verify-Backup -SevenZipPath `$ARC_PATH (7z t + SHA512)"
 
     # ================================================================
     # dev.16: operator-visibility pass — Migration/Cleanup/Archive/
