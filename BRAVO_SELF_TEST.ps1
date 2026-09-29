@@ -11754,6 +11754,10 @@ function Write-BRAVOLog {
 function Get-BRAVOOSSupportTier {
     return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = '0'; PowerShellVersion = '5.1'; DotNetRelease = '0'; Message = '' }
 }
+# T006: legacy BOM-у-паролі fallback (BRAVO.ArchiveHelpers) у пробі не імпортується;
+# сценарії проби його не використовують: fallback не спрацьовує, рядків сповіщення немає.
+function Register-BRAVOLegacyBomPasswordFallback { param($Result, $ArchivePath, $Collector, $Logger) return $false }
+function Get-BRAVOLegacyBomFallbackNotificationLines { param($ArchiveNames) return @() }
 function Initialize-BRAVOConsole { }
 function Initialize-BRAVOProgress { param($Enabled) }
 function Write-BRAVOHeader { param($Title, $Institution, $InstitutionCode, $Mode) }
