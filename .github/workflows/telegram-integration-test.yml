@@ -105,7 +105,7 @@ jobs:
           echo "Telegram API HTTP status: $http_status"
 
           delivered="false"
-          if [ "$http_status" = "200" ] && grep -q '"ok":true' "$response_file"; then
+          if [ "$http_status" = "200" ] && jq -e '.ok == true' "$response_file" >/dev/null 2>&1; then
             delivered="true"
           fi
 
