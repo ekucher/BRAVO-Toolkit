@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **TLS 1.2 більше не вимикає інші протоколи, дозволені хостом.** Старт
+  `BRAVO_MAINTENANCE` і `BRAVO_DATA_RESTORE`, а також перевірка webhook-ів
+  у `BRAVO_DRY_RUN.ps1` не перезаписують `SecurityProtocol` процесу
+  значенням «лише TLS 1.2», а ДОДАЮТЬ TLS 1.2 до вже явно ввімкнених
+  протоколів (наприклад, TLS 1.3) — так, як це вже робили інші компоненти
+  й deploy-скрипти (канонічний `Enable-BRAVOTls12`). Якщо в процесі вже
+  ввімкнено TLS 1.3, webhook-сповіщення цих компонентів більше не
+  обмежуються TLS 1.2.
+
+  Self-test поведінково перевіряє кожну точку ввімкнення (попередній
+  прапор зберігається, TLS 1.2 додається), а AST-guard
+  `StaticAnalysis/SecurityProtocolAssignmentsAreAdditive` блокує пряме
+  присвоєння `[Net.ServicePointManager]::SecurityProtocol` у production-коді.
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися

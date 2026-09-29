@@ -164,6 +164,111 @@
             -Failure "версія PSScriptAnalyzer має бути зафіксована через -RequiredVersion"
     }
 
+    # T030: [Net.ServicePointManager]::SecurityProtocol у production-коді
+    # змінюється лише АДИТИВНО (поточне значення -bor прапор). Пряме
+    # присвоєння (`= 3072`) мовчки вимикало протоколи, вже ввімкнені
+    # хостом (напр. Tls13, Tls11) — так було в Maintenance/DataRestore
+    # runtime і dry-run. Канонічна форма — Enable-BRAVOTls12
+    # (BRAVO.Compatibility). Аналіз через AST, тож коментарі та рядкові
+    # літерали не дають хибних збігів, а багаторядкові присвоєння
+    # розпізнаються так само, як однорядкові. Self-test (корінь і
+    # selftest\) виключено: він мусить відновлювати початкове значення.
+    function Get-BRAVOSelfTestSecurityProtocolOverwrite {
+        param(
+            [Parameter(Mandatory = $true)][Management.Automation.Language.Ast]$Ast,
+            [Parameter(Mandatory = $true)][string]$Label
+        )
+        $isSecurityProtocolMember = {
+            param($node)
+            while ($node -is [Management.Automation.Language.ParenExpressionAst]) {
+                $node = $node.Pipeline
+                if ($node -is [Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1 -and
+                    $node.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) {
+                    $node = $node.PipelineElements[0].Expression
+                }
+            }
+            if (-not ($node -is [Management.Automation.Language.MemberExpressionAst]) -or -not $node.Static) { return $false }
+            if (-not ($node.Expression -is [Management.Automation.Language.TypeExpressionAst])) { return $false }
+            if (-not ($node.Member -is [Management.Automation.Language.StringConstantExpressionAst])) { return $false }
+            $typeName = $node.Expression.TypeName.FullName -replace '^(?i)System\.', ''
+            return ($typeName -eq 'Net.ServicePointManager' -and $node.Member.Value -eq 'SecurityProtocol')
+        }
+        $findings = @()
+        $assignments = @($Ast.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.AssignmentStatementAst]
+                }, $true))
+        foreach ($assignment in $assignments) {
+            if (-not (& $isSecurityProtocolMember $assignment.Left)) { continue }
+            $right = $assignment.Right
+            if ($right -is [Management.Automation.Language.PipelineAst] -and $right.PipelineElements.Count -eq 1) {
+                $right = $right.PipelineElements[0]
+            }
+            if ($right -is [Management.Automation.Language.CommandExpressionAst]) {
+                $right = $right.Expression
+            }
+            $isAdditive = (
+                $assignment.Operator -eq [Management.Automation.Language.TokenKind]::Equals -and
+                $right -is [Management.Automation.Language.BinaryExpressionAst] -and
+                $right.Operator -eq [Management.Automation.Language.TokenKind]::Bor -and
+                ((& $isSecurityProtocolMember $right.Left) -or (& $isSecurityProtocolMember $right.Right))
+            )
+            if (-not $isAdditive) {
+                $findings += "${Label}:$($assignment.Extent.StartLineNumber)"
+            }
+        }
+        return $findings
+    }
+
+    $securityProtocolGuardFixtures = @(
+        @{ Expected = 1; Text = '[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)' },
+        @{ Expected = 1; Text = "[System.Net.ServicePointManager]::SecurityProtocol =`n    [Net.SecurityProtocolType]::Tls12" },
+        @{ Expected = 1; Text = 'function f { [Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 }' },
+        @{ Expected = 0; Text = "[Net.ServicePointManager]::SecurityProtocol =`n    [Net.ServicePointManager]::SecurityProtocol -bor [Enum]::ToObject([Net.SecurityProtocolType], 3072)" },
+        @{ Expected = 0; Text = '[System.Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [System.Net.ServicePointManager]::SecurityProtocol' },
+        @{ Expected = 0; Text = "# [Net.ServicePointManager]::SecurityProtocol = 3072`n`$x = '[Net.ServicePointManager]::SecurityProtocol = 3072'" }
+    )
+    $securityProtocolGuardMismatches = @()
+    for ($securityProtocolFixtureIndex = 0; $securityProtocolFixtureIndex -lt $securityProtocolGuardFixtures.Count; $securityProtocolFixtureIndex++) {
+        $securityProtocolFixture = $securityProtocolGuardFixtures[$securityProtocolFixtureIndex]
+        $securityProtocolFixtureAst = [Management.Automation.Language.Parser]::ParseInput(
+            $securityProtocolFixture.Text, [ref]$null, [ref]$null)
+        $securityProtocolFixtureFindings = @(Get-BRAVOSelfTestSecurityProtocolOverwrite `
+                -Ast $securityProtocolFixtureAst -Label "fixture$securityProtocolFixtureIndex")
+        if (@($securityProtocolFixtureFindings).Count -ne $securityProtocolFixture.Expected) {
+            $securityProtocolGuardMismatches += "fixture$securityProtocolFixtureIndex (очікувано $($securityProtocolFixture.Expected), знайдено $(@($securityProtocolFixtureFindings).Count))"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($securityProtocolGuardMismatches.Count -eq 0) `
+        -Name "StaticAnalysis/SecurityProtocolGuardDetectsOverwrite" `
+        -Failure "AST-guard SecurityProtocol мусить ловити пряме присвоєння (одно- й багаторядкове, [System.Net.]/[Net.]) і пропускати адитивне -bor, коментарі та рядки: $($securityProtocolGuardMismatches -join '; ')"
+
+    $analyzableFilesHelperPath = Join-Path $root 'ci\BRAVOAnalyzableFiles.ps1'
+    $securityProtocolOverwrites = @()
+    $securityProtocolScannedCount = 0
+    if (Test-Path -LiteralPath $analyzableFilesHelperPath -PathType Leaf) {
+        . $analyzableFilesHelperPath
+        $securityProtocolProductionFiles = @(
+            Get-BRAVOAnalyzableFile -Root $root | Where-Object {
+                ($_.FullName -replace '/', '\') -notlike '*\selftest\*' -and
+                $_.Name -ne 'BRAVO_SELF_TEST.ps1'
+            }
+        )
+        foreach ($securityProtocolProductionFile in $securityProtocolProductionFiles) {
+            $securityProtocolProductionAst = [Management.Automation.Language.Parser]::ParseFile(
+                $securityProtocolProductionFile.FullName, [ref]$null, [ref]$null)
+            $securityProtocolOverwrites += @(Get-BRAVOSelfTestSecurityProtocolOverwrite `
+                    -Ast $securityProtocolProductionAst `
+                    -Label $securityProtocolProductionFile.FullName)
+            $securityProtocolScannedCount++
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($securityProtocolScannedCount -gt 0 -and $securityProtocolOverwrites.Count -eq 0) `
+        -Name "StaticAnalysis/SecurityProtocolAssignmentsAreAdditive" `
+        -Failure "production-код мусить вмикати протоколи адитивно ([Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor ... або Enable-BRAVOTls12); пряме присвоєння затирає вже ввімкнені протоколи (перевірено файлів: $securityProtocolScannedCount): $($securityProtocolOverwrites -join ', ')"
+
     # Аудит P5: threat model як окремий документ із чесним розділом
     # залишкового ризику для кожного сценарію.
     $threatModelPath = Join-Path $root "THREAT_MODEL.md"
