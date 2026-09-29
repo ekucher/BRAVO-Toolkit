@@ -22,6 +22,31 @@ param(
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
 )
 
+# Тіло runtime — одна функція, за зразком BRAVO.Health.Runtime.ps1
+# (Invoke-BRAVOHealth) і BRAVO.DataRestore.Runtime.ps1
+# (Invoke-BRAVODataRestore): прямий запуск файлу (& у BRAVO.Archive.psm1)
+# виконує тіло через invocation guard наприкінці файлу, а dot-source лише
+# визначає функцію й нічого не виконує. param() функції повторює param()
+# скрипта один в один. Функції runtime тепер визначаються в scope обгортки
+# і, як і раніше, бачать змінні тіла через динамічний scope (усі вони
+# викликаються зсередини обгортки); стан, який читають через $script:,
+# тіло пише явно через $script:, а exit усередині функції завершує весь
+# скрипт тим самим кодом.
+function Invoke-BRAVOArchive {
+    param(
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit = $false,
+        [switch]$SyncBAZA,
+        [switch]$HealthCheckOnly,
+        [switch]$ForceNotification,
+        [switch]$NotifyOnSuccess,
+        [switch]$NoSlack,
+        [switch]$SkipIfBackupTaskRunning,
+        [switch]$NoPause,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath
+    )
+
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
@@ -510,7 +535,11 @@ if ($credentialHelperLoaded -and $smbCredentialRequired) {
 # =============================================
 
 # РЕЖИМ СУМІСНОСТІ
-$compatibilityMode = $false  # Автоматично визначається нижче
+# Явно $script: — ту саму змінну пише Test-Compatibility
+# ($script:compatibilityMode) і читають New-SHA512Hash ($script:) та Main
+# (без scope). Некваліфіковане присвоєння всередині Invoke-BRAVOArchive
+# створило б локальну копію, яка затінила б для Main фактичний режим.
+$script:compatibilityMode = $false  # Автоматично визначається нижче
 
 # =============================================
 # НАЛАШТУВАННЯ КОНСОЛІ
@@ -8898,3 +8927,21 @@ if ($script:processExitCode -ne 0) {
     Exit $script:processExitCode
 }
 Exit 0
+}
+# END BRAVO ARCHIVE RUNTIME
+if ($MyInvocation.InvocationName -ne '.') {
+    $archiveRuntimeParameters = @{
+        ConfigPath = $ConfigPath
+        ConfigPathWasExplicit = $ConfigPathWasExplicit
+        SyncBAZA = $SyncBAZA
+        HealthCheckOnly = $HealthCheckOnly
+        ForceNotification = $ForceNotification
+        NotifyOnSuccess = $NotifyOnSuccess
+        NoSlack = $NoSlack
+        SkipIfBackupTaskRunning = $SkipIfBackupTaskRunning
+        NoPause = $NoPause
+        RuntimeRoot = $RuntimeRoot
+        EntryScriptPath = $EntryScriptPath
+    }
+    Invoke-BRAVOArchive @archiveRuntimeParameters
+}

@@ -7233,8 +7233,32 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $scopeName -ne 'Start-BRAVOProcessWithBomFreeInput') {
                     $violations.Add("$location — інстансний .Start() поза Start-BRAVOProcessWithBomFreeInput")
                 }
+                # Область = сама функція БЕЗ тіл вкладених функцій: після T010
+                # тіло runtime є функцією-обгорткою, у якій вкладені функції
+                # (напр. запуск процесу зі stdin) мають власну область; їхній
+                # RedirectStandardInput не робить статичний ::Start() обгортки
+                # (напр. UAC-перезапуск з -Verb RunAs) порушенням.
+                $scopeOwnText = $scopeNode.Extent.Text
+                if ($scopeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    $nestedScopes = @($scopeNode.Body.FindAll({
+                        param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                    }, $true) | Sort-Object { $_.Extent.StartOffset })
+                    $maskedUntilOffset = -1
+                    $ownTextBuilder = New-Object System.Text.StringBuilder
+                    $ownTextCursor = 0
+                    foreach ($nestedScope in $nestedScopes) {
+                        if ($nestedScope.Extent.StartOffset -lt $maskedUntilOffset) { continue }
+                        $nestedStart = $nestedScope.Extent.StartOffset - $scopeNode.Extent.StartOffset
+                        $nestedLength = $nestedScope.Extent.EndOffset - $nestedScope.Extent.StartOffset
+                        [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor, $nestedStart - $ownTextCursor))
+                        $ownTextCursor = $nestedStart + $nestedLength
+                        $maskedUntilOffset = $nestedScope.Extent.EndOffset
+                    }
+                    [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor))
+                    $scopeOwnText = $ownTextBuilder.ToString()
+                }
                 if ($call.Static -and $memberName -eq 'Start' -and
-                    $scopeNode.Extent.Text.Contains('RedirectStandardInput')) {
+                    $scopeOwnText.Contains('RedirectStandardInput')) {
                     $violations.Add("$location — статичний ::Start() в області з RedirectStandardInput")
                 }
                 if ($memberName -match '^Write(Line)?$' -and
@@ -7299,11 +7323,54 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Remove-Item -LiteralPath $bomFreeGuardProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    # Область функції не включає вкладені функції (T010): статичний ::Start()
+    # у функції-обгортці без власного RedirectStandardInput дозволений, навіть
+    # якщо RedirectStandardInput є у ВКЛАДЕНІЙ функції; але статичний ::Start()
+    # у самій вкладеній функції з RedirectStandardInput усе одно порушення.
+    $bomFreeNestedProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_BOMFREE_NESTED_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    $bomFreeNestedAllowedViolations = @()
+    $bomFreeNestedForbiddenViolations = @()
+    try {
+        [void][IO.Directory]::CreateDirectory($bomFreeNestedProbeRoot)
+        $bomFreeNestedAllowedFile = Join-Path $bomFreeNestedProbeRoot 'wrapper.ps1'
+        [IO.File]::WriteAllText($bomFreeNestedAllowedFile, (
+            "function Invoke-Wrapper {`r`n" +
+            "    [void][System.Diagnostics.Process]::Start('elevated.exe')`r`n" +
+            "    function Get-Nested {`r`n" +
+            "        `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "        `$psi.RedirectStandardInput = `$true`r`n" +
+            "        return `$psi`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeNestedForbiddenFile = Join-Path $bomFreeNestedProbeRoot 'nested.ps1'
+        [IO.File]::WriteAllText($bomFreeNestedForbiddenFile, (
+            "function Invoke-Wrapper {`r`n" +
+            "    function Start-Nested {`r`n" +
+            "        `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "        `$psi.RedirectStandardInput = `$true`r`n" +
+            "        [void][System.Diagnostics.Process]::Start(`$psi)`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeNestedAllowedViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeNestedProbeRoot -Files @(Get-Item -LiteralPath $bomFreeNestedAllowedFile))
+        $bomFreeNestedForbiddenViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeNestedProbeRoot -Files @(Get-Item -LiteralPath $bomFreeNestedForbiddenFile))
+    } finally {
+        if (Test-Path -LiteralPath $bomFreeNestedProbeRoot) {
+            Remove-Item -LiteralPath $bomFreeNestedProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Test-BRAVOCondition `
         -Condition (
             $bomFreeProductionFiles.Count -gt 0 -and
             $bomFreeViolations.Count -eq 0 -and
-            $bomFreeProbeViolations.Count -eq 4
+            $bomFreeProbeViolations.Count -eq 4 -and
+            $bomFreeNestedAllowedViolations.Count -eq 0 -and
+            $bomFreeNestedForbiddenViolations.Count -eq 1
         ) `
         -Name "Secrets/StdinProcessStartOnlyViaBomFreeHelper" `
         -Failure ("процес із redirected stdin має запускатися лише через Start-BRAVOProcessWithBomFreeInput, а stdin писатися лише через Write-BRAVOProcessInputText; порушення: {0}; контроль гарда (очікувано 4): {1}" -f
@@ -11726,6 +11793,200 @@ try {
         ) `
         -Name "Console/MaintenanceAcceptsNoPauseParameter" `
         -Failure "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1 має приймати -NoPause у param()"
+
+    # Archive.Runtime.ps1: тіло runtime загорнуте в Invoke-BRAVOArchive за
+    # зразком Invoke-BRAVOHealth. Структура (AST): на верхньому рівні — лише
+    # функція-обгортка й invocation guard останнім оператором, КОЖЕН exit —
+    # усередині обгортки, guard передає функції рівно параметри param()
+    # скрипта (інакше забутий параметр мовчки перестав би доходити до тіла).
+    # Окремо — клас пасток обгортання: ім'я, яке тіло пише БЕЗ scope, а
+    # хтось у файлі читає/пише через $script:. До обгортання це була одна
+    # script-змінна; у функції некваліфіковане присвоєння створює локальну
+    # копію, що затінює $script:-значення для вкладених функцій (так було б
+    # із $compatibilityMode: Main показав би «ВИМКНЕНО» замість фактичного
+    # режиму, визначеного Test-Compatibility).
+    $archiveRuntimePathForWrapper = Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"
+    $archiveWrapperParseErrors = $null
+    $archiveWrapperAst = [Management.Automation.Language.Parser]::ParseFile(
+        $archiveRuntimePathForWrapper, [ref]$null, [ref]$archiveWrapperParseErrors)
+    $archiveWrapperTopStatements = @($archiveWrapperAst.EndBlock.Statements)
+    $archiveWrapperFunctions = @($archiveWrapperTopStatements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOArchive'
+        })
+    $archiveWrapperFunction = $archiveWrapperFunctions | Select-Object -First 1
+    $archiveWrapperGuard = $archiveWrapperTopStatements | Select-Object -Last 1
+    $archiveWrapperExits = @($archiveWrapperAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.ExitStatementAst]
+            }, $true))
+    $archiveWrapperExitsOutside = @($archiveWrapperExits | Where-Object {
+            $null -eq $archiveWrapperFunction -or
+            $_.Extent.StartOffset -lt $archiveWrapperFunction.Extent.StartOffset -or
+            $_.Extent.EndOffset -gt $archiveWrapperFunction.Extent.EndOffset
+        })
+    $archiveWrapperFunctionParameters = ''
+    $archiveWrapperShadowedScriptNames = @()
+    if ($null -ne $archiveWrapperFunction) {
+        $archiveWrapperFunctionParameters = (@($archiveWrapperFunction.Body.ParamBlock.Parameters |
+                    ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ','
+        $archiveWrapperScriptQualifiedNames = @{}
+        foreach ($archiveWrapperVariable in @($archiveWrapperAst.FindAll({
+                        param($node) $node -is [Management.Automation.Language.VariableExpressionAst]
+                    }, $true))) {
+            if ($archiveWrapperVariable.VariablePath.UserPath -match '^(?i)script:(.+)$') {
+                $archiveWrapperScriptQualifiedNames[$Matches[1].ToLowerInvariant()] = $true
+            }
+        }
+        $archiveWrapperBodyUnqualifiedNames = @{}
+        foreach ($archiveWrapperAssignment in @($archiveWrapperFunction.Body.FindAll({
+                        param($node) $node -is [Management.Automation.Language.AssignmentStatementAst]
+                    }, $true))) {
+            # Лише присвоєння рівня тіла обгортки: не у вкладеній функції й
+            # не у scriptblock-літералі (ті мають власний scope і до
+            # обгортання).
+            $archiveWrapperOwner = $archiveWrapperAssignment.Parent
+            while ($null -ne $archiveWrapperOwner -and
+                -not ($archiveWrapperOwner -is [Management.Automation.Language.FunctionDefinitionAst]) -and
+                -not ($archiveWrapperOwner -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                $archiveWrapperOwner = $archiveWrapperOwner.Parent
+            }
+            if (-not [object]::ReferenceEquals($archiveWrapperOwner, $archiveWrapperFunction)) {
+                continue
+            }
+            $archiveWrapperTarget = $archiveWrapperAssignment.Left
+            if ($archiveWrapperTarget -is [Management.Automation.Language.ConvertExpressionAst]) {
+                $archiveWrapperTarget = $archiveWrapperTarget.Child
+            }
+            if ($archiveWrapperTarget -is [Management.Automation.Language.VariableExpressionAst] -and
+                $archiveWrapperTarget.VariablePath.IsUnqualified) {
+                $archiveWrapperBodyUnqualifiedNames[$archiveWrapperTarget.VariablePath.UserPath.ToLowerInvariant()] = $true
+            }
+        }
+        $archiveWrapperShadowedScriptNames = @($archiveWrapperBodyUnqualifiedNames.Keys | Where-Object {
+                $archiveWrapperScriptQualifiedNames.ContainsKey($_)
+            } | Sort-Object)
+    }
+    $archiveWrapperScriptParameters = (@($archiveWrapperAst.ParamBlock.Parameters |
+                ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ','
+    $archiveWrapperGuardIsInvocation = $false
+    $archiveWrapperGuardSplatKeys = ''
+    if ($archiveWrapperGuard -is [Management.Automation.Language.IfStatementAst] -and
+        @($archiveWrapperGuard.Clauses).Count -eq 1 -and
+        $archiveWrapperGuard.Clauses[0].Item1.Extent.Text -eq "`$MyInvocation.InvocationName -ne '.'") {
+        $archiveWrapperGuardIsInvocation = @($archiveWrapperGuard.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Invoke-BRAVOArchive'
+                }, $true)).Count -eq 1
+        $archiveWrapperGuardSplat = @($archiveWrapperGuard.FindAll({
+                    param($node) $node -is [Management.Automation.Language.HashtableAst]
+                }, $true)) | Select-Object -First 1
+        if ($null -ne $archiveWrapperGuardSplat) {
+            $archiveWrapperGuardSplatKeys = (@($archiveWrapperGuardSplat.KeyValuePairs |
+                        ForEach-Object { $_.Item1.Extent.Text }) | Sort-Object) -join ','
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($archiveWrapperParseErrors).Count -eq 0 -and
+            $archiveWrapperFunctions.Count -eq 1 -and
+            $archiveWrapperTopStatements.Count -eq 2 -and
+            $archiveWrapperExits.Count -gt 0 -and
+            $archiveWrapperExitsOutside.Count -eq 0 -and
+            $archiveWrapperShadowedScriptNames.Count -eq 0 -and
+            $archiveWrapperGuardIsInvocation -and
+            -not [string]::IsNullOrEmpty($archiveWrapperScriptParameters) -and
+            $archiveWrapperFunctionParameters -eq $archiveWrapperScriptParameters -and
+            $archiveWrapperGuardSplatKeys -eq $archiveWrapperScriptParameters
+        ) `
+        -Name "Console/ArchiveRuntimeWrappedInFunction" `
+        -Failure "Archive.Runtime.ps1: на верхньому рівні мають бути лише функція Invoke-BRAVOArchive (з усіма exit) і останнім оператором guard `$MyInvocation.InvocationName -ne '.', що передає рівно параметри param() скрипта; тіло не повинно писати без scope імена, які файл використовує через `$script: (операторів верхнього рівня: $($archiveWrapperTopStatements.Count); exit поза функцією: $($archiveWrapperExitsOutside.Count); затінені `$script:-імена: $($archiveWrapperShadowedScriptNames -join ', '); параметри функції: $archiveWrapperFunctionParameters; splat guard: $archiveWrapperGuardSplatKeys; param() скрипта: $archiveWrapperScriptParameters)"
+
+    # Поведінка обгортки — у дочірньому процесі (runtime імпортує модулі й
+    # перемикає кодування консолі, це не повинно торкатися сесії самотесту).
+    # DotSource: dot-source лише визначає Invoke-BRAVOArchive — тіло НЕ
+    # виконується (без guard-а воно б відпрацювало й завершило процес, а
+    # функції runtime, як-от Main, лишилися б визначеними). Invoke: справжній
+    # production-шлях Invoke-BRAVOArchiveEntrypoint -> & runtime -> guard ->
+    # тіло; явно вказаний відсутній -ConfigPath дає exit 1 з catch
+    # завантаження конфігурації ВСЕРЕДИНІ функції (поточний код; те, що це
+    # 1, а не контрактний 30, — окремий відомий дефект, і його виправлення
+    # має оновити цю перевірку). $LASTEXITCODE перед викликом = 77, тож
+    # пропущене тіло не може випадково дати 1.
+    $archiveWrapperProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_ARCHIVE_WRAPPER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($archiveWrapperProbeRoot)
+        $archiveWrapperProbeScript = @'
+param([string]$Mode, [string]$RuntimeRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeRuntimePath = Join-Path $RuntimeRoot 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
+$probeParameters = @{
+    RuntimeRoot = $RuntimeRoot
+    EntryScriptPath = (Join-Path $RuntimeRoot 'BRAVO_ARCHIV.ps1')
+    ConfigPath = (Join-Path $ProbeRoot 'missing\BRAVO.config')
+    ConfigPathWasExplicit = $true
+    NoPause = $true
+}
+try {
+    if ($Mode -eq 'DotSource') {
+        . $probeRuntimePath @probeParameters
+        [pscustomobject]@{
+            DotSourceReturned = $true
+            FunctionDefined = [bool](Get-Command -Name 'Invoke-BRAVOArchive' -CommandType Function -ErrorAction SilentlyContinue)
+            BodyStateAbsent = (-not (Test-Path -LiteralPath 'variable:bravoScriptDirectory')) -and
+                (-not (Get-Command -Name 'Main' -CommandType Function -ErrorAction SilentlyContinue))
+        } | ConvertTo-Json -Compress
+    } else {
+        Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Archive\BRAVO.Archive.psd1') -Force
+        $global:LASTEXITCODE = 77
+        $probeExitCode = Invoke-BRAVOArchiveEntrypoint -Parameters $probeParameters
+        [pscustomobject]@{ ExitCode = [int]$probeExitCode } | ConvertTo-Json -Compress
+    }
+} catch {
+    [pscustomobject]@{ ProbeError = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+}
+'@
+        $archiveWrapperProbePath = Join-Path $archiveWrapperProbeRoot 'probe.ps1'
+        [IO.File]::WriteAllText($archiveWrapperProbePath, $archiveWrapperProbeScript, (New-Object Text.UTF8Encoding($false)))
+        $archiveWrapperHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $archiveWrapperResults = @{}
+        foreach ($archiveWrapperMode in @('DotSource', 'Invoke')) {
+            $archiveWrapperOutput = & $archiveWrapperHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $archiveWrapperProbePath `
+                -Mode $archiveWrapperMode -RuntimeRoot $root -ProbeRoot $archiveWrapperProbeRoot
+            $archiveWrapperJson = @($archiveWrapperOutput) |
+                Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
+                Select-Object -Last 1
+            $archiveWrapperResults[$archiveWrapperMode] = if ([string]::IsNullOrWhiteSpace([string]$archiveWrapperJson)) {
+                [pscustomobject]@{ ProbeError = "проба не повернула JSON (код виходу $LASTEXITCODE)" }
+            } else {
+                [string]$archiveWrapperJson | ConvertFrom-Json
+            }
+        }
+        $archiveWrapperDotSource = $archiveWrapperResults['DotSource']
+        $archiveWrapperInvoke = $archiveWrapperResults['Invoke']
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveWrapperDotSource.PSObject.Properties['ProbeError'] -and
+                $archiveWrapperDotSource.DotSourceReturned -eq $true -and
+                $archiveWrapperDotSource.FunctionDefined -eq $true -and
+                $archiveWrapperDotSource.BodyStateAbsent -eq $true
+            ) `
+            -Name "Console/ArchiveRuntimeDotSourceDefinesWithoutRunning" `
+            -Failure "dot-source Archive.Runtime.ps1 має лише визначити Invoke-BRAVOArchive, не виконуючи тіло; проба: $($archiveWrapperDotSource | ConvertTo-Json -Compress)"
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveWrapperInvoke.PSObject.Properties['ProbeError'] -and
+                $archiveWrapperInvoke.ExitCode -eq 1
+            ) `
+            -Name "Console/ArchiveRuntimeDirectInvocationRunsBody" `
+            -Failure "Invoke-BRAVOArchiveEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 1 з catch завантаження конфігурації; проба: $($archiveWrapperInvoke | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $archiveWrapperProbeRoot -PathType Container) {
+            Remove-Item -LiteralPath $archiveWrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # Кожен entrypoint має прокидати -NoPause у свій runtime, інакше сам
     # параметр command-line нічого не змінює.
