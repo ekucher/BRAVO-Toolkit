@@ -16132,12 +16132,93 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "успіх/помилка 'Архівація після maintenance' мають визначатись через Get-BRAVOMaintenanceStepStatus за тим самим `$script:criticalErrorOccurred, що дочірній процес уже виставляє"
     Test-BRAVOCondition `
         -Condition (
-            $archiveResultCallWindow.Contains('"BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"') -and
+            $archiveResultCallWindow.Contains('$archiveOperationDetail = Register-BRAVOMaintenanceArchiveChildResult -ExitCode $archivProcess.ExitCode') -and
             $archiveResultCallWindow.Contains('"скрипт не знайдено: $bravoArchivePath"') -and
             $archiveResultCallWindow.Contains("archiveOperationDetail = 'перевірте LOG для деталей'")
         ) `
         -Name "Maintenance/ArchiveFailureRendersFail" `
         -Failure "FAIL 'Архівація після maintenance' (exit!=0/не знайдено/exception) має показувати конкретну коротку причину в Details"
+
+    # --- Archive after maintenance: exit-код дочірнього BRAVO_ARCHIV.
+    # Раніше будь-який ненульовий код, включно з 10 (SuccessWithWarnings),
+    # виставляв $script:criticalErrorOccurred, і Maintenance завершувався
+    # кодом 60 (MaintenanceFailed) за фактично успішної архівації.
+    # Поведінковий round-trip через РЕАЛЬНІ Register-BRAVOMaintenanceArchiveChildResult,
+    # Write-Log (лічильник попереджень), Get-BRAVOMaintenanceStepStatus і
+    # Get-BRAVOMaintenanceResolvedExitCode; коди — з BRAVO.ExitCodes.
+    $archiveChildExitTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MAINT_ARCHIVE_CHILD_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
+    $archiveChildExitModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @(
+            'Write-Log',
+            'Write-BRAVOMaintenanceLogFile',
+            'Register-BRAVOMaintenanceArchiveChildResult',
+            'Get-BRAVOMaintenanceStepStatus',
+            'Get-BRAVOMaintenanceResolvedExitCode'
+        )
+    $archiveChildExitScenario = {
+        param($LogFilePath, $ChildExitCode)
+        $LOG_DIR = [IO.Path]::GetDirectoryName($LogFilePath)
+        $LOG_FILE = $LogFilePath
+        $script:LogLevel = 'INFO'
+        $script:BRAVOWarningCount = 0
+        $script:criticalErrorOccurred = $false
+        $script:restoreArchiveFailed = $false
+        $script:restoreIntegrityFailed = $false
+        $script:restoreFailed = $false
+        $detail = Register-BRAVOMaintenanceArchiveChildResult -ExitCode $ChildExitCode
+        [pscustomobject]@{
+            Detail = $detail
+            Critical = [bool]$script:criticalErrorOccurred
+            Warnings = [int]$script:BRAVOWarningCount
+            StepStatus = Get-BRAVOMaintenanceStepStatus -CriticalBefore $false -WarningsBefore 0
+            RunExitCode = [int](Get-BRAVOMaintenanceResolvedExitCode)
+        }
+    }
+    $archiveChildSuccessCode = Resolve-BRAVOExitCode
+    $archiveChildWarningsCode = Resolve-BRAVOExitCode -HasWarnings
+    $archiveChildFailureCode = Resolve-BRAVOExitCode -LocalArchiveFailed
+    $global:consoleSettings = @{ ConsoleLevel = 'FATAL'; ShowTimestampsInConsole = $false }
+    try {
+        $archiveChildSuccess = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $archiveChildSuccessCode
+        $archiveChildWarnings = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $archiveChildWarningsCode
+        $archiveChildFailure = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $archiveChildFailureCode
+        $archiveChildNull = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $null
+    } finally {
+        $global:consoleSettings = $null
+        Remove-Item -LiteralPath $archiveChildExitTempFile -Force -ErrorAction SilentlyContinue
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $archiveChildSuccess.Critical -and
+            $archiveChildSuccess.Warnings -eq 0 -and
+            $null -eq $archiveChildSuccess.Detail -and
+            $archiveChildSuccess.StepStatus -eq 'OK' -and
+            (Get-BRAVOExitCodeName -Code $archiveChildSuccess.RunExitCode) -eq 'Success'
+        ) `
+        -Name "Maintenance/ArchiveChildExitSuccessIsOk" `
+        -Failure "BRAVO_ARCHIV exit $archiveChildSuccessCode (Success) має давати OK без попереджень; отримано Critical=$($archiveChildSuccess.Critical) Warnings=$($archiveChildSuccess.Warnings) Step=$($archiveChildSuccess.StepStatus) Run=$($archiveChildSuccess.RunExitCode)"
+    Test-BRAVOCondition `
+        -Condition (
+            -not $archiveChildWarnings.Critical -and
+            $archiveChildWarnings.Warnings -eq 1 -and
+            $archiveChildWarnings.StepStatus -eq 'WARN' -and
+            (Get-BRAVOExitCodeName -Code $archiveChildWarnings.RunExitCode) -eq 'SuccessWithWarnings' -and
+            [string]$archiveChildWarnings.Detail -like '*попередженнями*SuccessWithWarnings*'
+        ) `
+        -Name "Maintenance/ArchiveChildExitSuccessWithWarningsIsNotCritical" `
+        -Failure "BRAVO_ARCHIV exit $archiveChildWarningsCode (SuccessWithWarnings) має давати WARN і прогін SuccessWithWarnings, а не critical/MaintenanceFailed; отримано Critical=$($archiveChildWarnings.Critical) Warnings=$($archiveChildWarnings.Warnings) Step=$($archiveChildWarnings.StepStatus) Run=$($archiveChildWarnings.RunExitCode) Detail='$($archiveChildWarnings.Detail)'"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveChildFailure.Critical -and
+            $archiveChildFailure.StepStatus -eq 'FAIL' -and
+            (Get-BRAVOExitCodeName -Code $archiveChildFailure.RunExitCode) -eq 'MaintenanceFailed' -and
+            [string]$archiveChildFailure.Detail -eq "BRAVO_ARCHIV завершився з кодом $archiveChildFailureCode" -and
+            $archiveChildNull.Critical -and
+            $archiveChildNull.StepStatus -eq 'FAIL'
+        ) `
+        -Name "Maintenance/ArchiveChildExitFailureStaysCritical" `
+        -Failure "BRAVO_ARCHIV exit $archiveChildFailureCode (LocalArchiveFailed) чи невідомий (`$null) код має лишатись critical/FAIL/MaintenanceFailed; отримано Critical=$($archiveChildFailure.Critical) Step=$($archiveChildFailure.StepStatus) Run=$($archiveChildFailure.RunExitCode) Detail='$($archiveChildFailure.Detail)' NullCritical=$($archiveChildNull.Critical)"
 
     # --- AutoShutdown: SKIPPED/OK/FAIL wiring (Invoke-AutoShutdown реально
     # НЕ викликається в тесті — це системна команда shutdown; лише
