@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **Одна реалізація чанкера Discord (BRAVO-T023, крок 1).** `BRAVO.Archive.Runtime.ps1`
+  більше не оголошує власну `function global:Split-DiscordNotificationText`, яка тінила
+  експорт `BRAVO.Notifications` у всьому процесі. Канонічною стала поведінка з Archive:
+  рядки всередині частини з'єднуються LF (раніше модуль з'єднував через
+  `[Environment]::NewLine`, тобто CRLF на Windows), межі `MaximumLength` перевіряються, порожнє
+  повідомлення дає одну порожню частину. Для оператора змінюється лише те, що довгі
+  Discord-повідомлення поза Archive можуть ділитися на трохи менше частин. Нові самотести
+  `Notifications/DiscordChunksJoinWithLineFeed` і `Notifications/DiscordChunkerHasSingleDefinition`.
+
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
   використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний
