@@ -11012,6 +11012,462 @@ try {
         }
     }
 
+    # T011: оркестрація Maintenance — поведінкові перевірки порядку кроків
+    # [1/8]..[8/8] і відновлення служб у finally після збою кроку.
+    # Повний прогін Invoke-BRAVOMaintenance тут неможливий без реальної
+    # конфігурації, служб і прав адміністратора, тому дочірній процес
+    # збирає runtime з ДОСЛІВНОГО тексту Maintenance.Runtime.ps1 (AST):
+    # справжні функції тіла, визначені до кроків, і справжня оркестрація від
+    # Initialize-BRAVOMaintenanceSteps -Total 8 до кінця зовнішнього try
+    # (кроки, try/finally служб, lock, фінальний exit) плюс справжній
+    # зовнішній finally. Преамбулу (імпорт модулів, конфігурацію, елевацію)
+    # замінює seed змінних, а служби, lock, маркер quiescence, диски, файли й
+    # мережу — стаби, що пишуть події у журнал (стаб Write-BRAVOStepResult
+    # бачить номер і назву, які обчислила справжня
+    # Write-BRAVOMaintenanceStep). Зібраний runtime запускається через
+    # справжній Invoke-BRAVOMaintenanceEntrypoint (& runtime, $LASTEXITCODE,
+    # catch -> 90). Стаби живуть лише в дочірньому процесі й не можуть
+    # просочитися в сесію самотесту; реальні служби не чіпаються.
+    $maintenanceOrchestrationRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_MAINTENANCE_ORCHESTRATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationRoot)
+        $maintenanceOrchestrationStubs = @'
+function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Get-Service {
+    param([string]$Name, $ErrorAction)
+    if (-not $script:ProbeServices.ContainsKey($Name)) { throw "self-test: невідома служба $Name" }
+    $probeService = [pscustomobject]@{ Name = $Name; Status = [string]$script:ProbeServices[$Name] }
+    $probeService | Add-Member -MemberType ScriptMethod -Name Refresh -Value { }
+    return $probeService
+}
+function Start-Service {
+    param([string]$Name, $WarningAction, $ErrorAction, $ErrorVariable)
+    Add-ProbeEvent "START $Name"
+    $script:ProbeServices[$Name] = 'Running'
+}
+function Stop-Service {
+    param([string]$Name, [switch]$Force, $WarningAction, $ErrorAction, $ErrorVariable)
+    Add-ProbeEvent "STOP $Name"
+    $script:ProbeServices[$Name] = 'Stopped'
+}
+function Get-Process { param($Name, $ErrorAction) }
+function Start-Sleep { param($Seconds, $Milliseconds) }
+function Write-Log {
+    param([string]$Message, [string]$Level = 'INFO', [int]$SeparatorLength = 100, [switch]$NoTimestamp, [switch]$NoConsole, [switch]$Environmental)
+    if ($Level -eq 'WARNING' -and -not $Environmental) { $script:BRAVOWarningCount++ }
+    if ($Level -eq 'WARNING' -or $Level -eq 'ERROR') { Add-ProbeEvent "LOG-$Level $Message" }
+}
+function Write-BRAVOStepResult {
+    param([int]$Current, [int]$Total, [string]$Name, [string]$Status, [string]$Details, $Duration)
+    Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
+}
+function Write-BRAVOServiceQuiescenceState {
+    param([string]$Owner, [object[]]$Services, [string]$LogFile, [switch]$RestartSuppressed)
+    Add-ProbeEvent ("MARKER-WRITE " + ((@($Services) | ForEach-Object { $_.Name }) -join ','))
+}
+function Clear-BRAVOServiceQuiescenceState { param($ExpectedState) Add-ProbeEvent 'MARKER-CLEAR'; return $true }
+function Set-BRAVOServiceQuiescenceRestartSuppressed { param([bool]$Suppressed) }
+function Enter-BRAVOMaintenanceOperationLock {
+    Add-ProbeEvent 'LOCK-ENTER'
+    return [pscustomobject]@{ Success = $true; Stream = $null; Path = 'self-test-lock'; Error = $null }
+}
+function Exit-BRAVOMaintenanceOperationLock { Add-ProbeEvent 'LOCK-EXIT' }
+function Invoke-BRAVOMaintenanceDiskSpaceCheck { param($ROOT_LIMS, $ExcludedDrives) return $true }
+function Initialize-BRAVOBackupManifestStorage {
+    param($BackupRoot, $Logger)
+    return [pscustomobject]@{ Errors = @(); Migrated = @(); Deduplicated = @(); Conflicts = @(); ManifestRootCreated = $false; ManifestRoot = '' }
+}
+function Check-MdFileSizes {
+    param($MODEL_PATH, $MAX_MD_FILE_SIZE, $ExcludePatterns)
+    Add-ProbeEvent 'SIZE-CHECK'
+    if ($script:ProbeThrowInSizeCheck) { throw 'self-test: імітований збій кроку перевірки розмірів .md' }
+}
+function Get-BRAVOTraceConfiguration {
+    param($DiscoveryResult, $TraceRootDirectory, $DateFolderName)
+    return [pscustomobject]@{ IsValid = $true; TracePath = 'self-test-trace.log'; IniPath = 'self-test.ini'; InstallationDirectory = 'self-test'; DestinationDirectory = 'self-test'; IsOutsideInstallation = $false; Reason = $null }
+}
+function Get-BRAVOInstallationTraceOutSources { param($InstallationRoot, $LimsRoot, $SrvTracePath, $ExplicitBisPath) return [pscustomobject]@{ Sources = @(); ScanRoot = 'self-test'; ScanRootReason = 'self-test' } }
+function Resolve-BRAVOExchangeApiRuntimeDirectory { param($ServiceName, $FallbackDirectory) return [pscustomobject]@{ Directory = 'self-test'; Reason = 'self-test' } }
+function Get-BRAVOOSSupportTier { return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = 0; PowerShellVersion = '5.1'; DotNetRelease = 0; Message = '' } }
+function Get-BRAVOToolIntegrityRecommendation { param($ToolPaths, $ManifestPath) return [pscustomobject]@{ HasIntegrityIssue = $false; Message = '' } }
+function Test-BRAVOToolManifestIntegrity { param($ToolsDirectory, $ManifestPath, $Mode) return [pscustomobject]@{ IsValid = $true; ShouldBlock = $false; Message = '' } }
+function Invoke-BRAVOTraceRotation { return [pscustomobject]@{ Moved = 0; Errors = 0 } }
+function Invoke-BRAVOExchangeApiLogRotation { return [pscustomobject]@{ Found = 0; Moved = 0; Errors = 0 } }
+function Invoke-BRAVOLegacySweep { }
+function Invoke-BRAVOLegacyModelArchiveLocalMigration { }
+function Invoke-BRAVOTraceArchiveMaintenance { return [pscustomobject]@{ Errors = 0; DatesProcessed = 0; ArchivesUpdated = 0; Uploaded = 0; SourcesDeleted = 0; UploadsDeferred = 0; Conflicts = 0 } }
+function Get-BRAVOTraceGraceCompletionStatePath { param($ComponentLabel) return 'self-test' }
+function Remove-BRAVOEmptyLogDateDirectories { param($Path, $Label) return [pscustomobject]@{ DeletedCount = 0; WarningCount = 0; EnumerationWarnings = 0; DeletionWarnings = 0 } }
+function Get-BRAVOExpiredLogDateDirectories { param($Path, $RetentionDays) return @() }
+function Get-BRAVOFiles { return @() }
+function Get-ChildItem { return @() }
+function Wait-BRAVORangeIdLogFile { param($Path, $TimeoutSeconds) return $true }
+function Test-RangeIdUsage { param($Path, $ThresholdPercent, $WaitedForFileSeconds) return [pscustomobject]@{ Reason = $null } }
+function Send-FinalReport { param($LOG_FILE) Add-ProbeEvent 'FINAL-REPORT' }
+function Send-BRAVOMaintenanceOperationsEvent { param($ExitCode, $ElapsedTime) }
+function Write-BRAVOTaskExecutionState { param($TaskName) }
+function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
+function Invoke-BRAVOMaintenanceOwnLogUpload { }
+function Wait-BRAVOManualExit { param([switch]$NoPause) }
+'@
+        $maintenanceOrchestrationSeed = @'
+$global:ScriptVersion = 'self-test'
+$script:ScriptVersion = 'self-test'
+$script:ScriptStartTime = Get-Date
+$script:BRAVOWarningCount = 0
+$script:criticalErrorOccurred = $false
+$script:CriticalErrors = $false
+$script:SlackMode = 'none'
+$script:ObjectName = 'self-test'
+$script:EnableAutoShutdown = $false
+$script:EnableArchiveAfterMaintenance = $false
+$script:BRAVOMaintenanceMigrationStepEnabled = $false
+$script:BRAVOMaintenanceLegacyMigrationPlan = @()
+$script:BRAVOMaintenanceCheckSizeStepEnabled = $true
+$script:BRAVOMaintenanceRestoreStepEnabled = $false
+$script:BRAVOMaintenanceArchiveStepEnabled = $false
+$script:BRAVOMaintenanceLogsStepEnabled = $true
+$script:modelIntegrityEstablished = $true
+$script:restoreArchiveFailed = $false
+$script:restoreIntegrityFailed = $false
+$script:restoreFailed = $false
+$script:ArchivePassword = 'self-test-placeholder'
+$currentDate = Get-Date
+$currentIdentity = [pscustomobject]@{ User = [pscustomobject]@{ Value = 'S-1-5-18' } }
+$bravoSettings = [pscustomobject]@{ InstitutionName = 'self-test'; InstitutionCode = 'SELFTEST'; NotificationRouting = $null }
+$BRAVOCompatibility = [pscustomobject]@{ WindowsVersion = 'self-test'; PowerShellVersion = 'self-test'; WmiProvider = 'self-test'; FileHashProvider = 'self-test'; ChildItemProvider = 'self-test' }
+$BRAVOPowerShellUpdate = [pscustomobject]@{ IsUpdateRecommended = $false; Message = '' }
+$BravoServiceName = 'BRAVO'
+$ExchangAPIServiceName = 'exchangAPI'
+$BravoWebServiceName = 'BravoWeb'
+$BravoWebServiceDisplayName = 'BravoWeb'
+$BravoMaintenanceEnabled = $true
+$exchangAPIServiceEnabled = $true
+$exchangAPIServiceDisabled = $false
+$exchangAPIService = Get-Service -Name 'exchangAPI'
+$BravoWebMaintenanceEnabled = $true
+$BravoWebComponentEnabled = $true
+$BravoWebServiceDisabledBySystem = $false
+$BravoServiceDisabledBySystem = $false
+$BravoWebLegacyDataEnabled = $false
+$ApacheServiceExists = $false
+$ApacheEnabled = $false
+$bravoWebComponentPlan = [pscustomobject]@{ WarnDuplicateService = $false }
+$RunMissedRestoreOnly = $false
+$ForceRestore = $false
+$missedDailyWork = $false
+$missedRestoreDue = $false
+$restoreWindowOpen = $true
+$bootRestoreIgnoresWindow = $false
+$shouldRestore = $false
+$restoreReason = ''
+$weeklyRestoreQuotaConsumed = $false
+$restoreSkippedByWindow = $false
+$isRestoreDay = $false
+$isAfterRestoreTime = $false
+$maintenanceDailyAtInsideRestoreWindow = $true
+$RestoreTime = '00:00'
+$RestoreWindowStart = '00:00'
+$RestoreWindowEnd = '23:59'
+$CheckSize = $true
+$MARKER_FILE = Join-Path $probeWorkRoot 'restore_done.marker'
+$ROOT_LIMS = Join-Path $probeWorkRoot 'lims'
+$LOG_DIR = Join-Path $probeWorkRoot 'logs'
+$LOG_FILE = Join-Path $probeWorkRoot 'logs\maintenance.log'
+$TRACE_DIR = Join-Path $probeWorkRoot 'system\Trace'
+$TRACE_ARCHIV_DIR = Join-Path $probeWorkRoot 'system\Trace\archiv'
+$EXCHANGE_LOG_DIR = Join-Path $probeWorkRoot 'system\exchangAPI'
+$ARC_DIR = Join-Path $probeWorkRoot 'backup\MODEL'
+$ARC_PATH = Join-Path $probeWorkRoot 'Tools\7za.exe'
+$MODEL_PATH = Join-Path $probeWorkRoot 'lims\Model'
+$backupRootPath = Join-Path $probeWorkRoot 'backup'
+$archiveDirs = [pscustomobject]@{ Model = (Join-Path $probeWorkRoot 'backup\MODEL') }
+$stateRoot = Join-Path $probeWorkRoot 'state'
+$toolsPath = Join-Path $probeWorkRoot 'Tools'
+$arcPath = $ARC_PATH
+$winSCPPath = Join-Path $probeWorkRoot 'Tools\WinSCP.com'
+$winSCPAssemblyPath = Join-Path $probeWorkRoot 'Tools\WinSCPnet.dll'
+$toolIntegritySettings = $null
+$freeSpaceExclusionsText = 'немає'
+$FREE_SPACE_EXCLUDED_DRIVES = @()
+$MAX_MD_FILE_SIZE = 1
+$MD_FILE_SIZE_EXCLUSIONS = @()
+$RangeIdMonitoringEnabled = $false
+$NotificationProviderDisplayName = 'self-test'
+$bravoDiscoveryResult = [pscustomobject]@{ BRAVO_ROOT = ''; MODEL_SOURCE = ''; MODEL_PROJECT_FILE = '' }
+$MaintenanceConfig = [pscustomobject]@{ Trace = [pscustomobject]@{ BISSourcePath = '' } }
+$LOG_DATE_FOLDER = 'self-test'
+$exchangeApiSftpRemoteDirectory = 'self-test'
+$EXCHANGAPI_LOG_FILTERS = @('exchangAPI*.log')
+$MoveRetryCount = 0
+$MoveRetryDelaySeconds = 0
+$ServiceStopTimeoutSeconds = 1
+$ServiceStartTimeoutSeconds = 1
+$ServicePollIntervalSeconds = 1
+$storageEffective = [pscustomobject]@{ SFTP = [pscustomobject]@{ Enabled = $false; DisabledReason = 'self-test' } }
+$COMPRESSED_LOG_DELETION_ENABLED = $false
+$ARCHIVE_RETENTION_DAYS = 14
+$LOG_RETENTION_DAYS = 14
+$RESTORE_ARCHIVES_KEEP_COUNT = 1
+$ArchivePrefix = 'self-test'
+$ArchivePrefixRegex = 'self-test'
+$ShutdownTimeout = 60
+$traceArchiveAddParams = @()
+$traceSftpRemoteDirectory = 'self-test'
+$NativeCommandTimeoutSeconds = 1
+$SevenZipIntegrityTestTimeoutSeconds = 1
+$RAW_SOURCE_GRACE_DAYS = 1
+'@
+        $maintenanceOrchestrationProbeScript = @'
+param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeResultPath = Join-Path $ProbeRoot 'result.json'
+$probeUtf8 = New-Object Text.UTF8Encoding($false)
+try {
+    $probeRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $probeParseErrors = $null
+    $probeAst = [Management.Automation.Language.Parser]::ParseInput($probeRuntimeText, [ref]$null, [ref]$probeParseErrors)
+    if (@($probeParseErrors).Count -gt 0) { throw "runtime не парситься: $($probeParseErrors[0].Message)" }
+    $probeWrapper = @($probeAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOMaintenance'
+        }) | Select-Object -First 1
+    if ($null -eq $probeWrapper) { throw 'у runtime немає функції Invoke-BRAVOMaintenance' }
+    $probeOuterTry = @($probeWrapper.Body.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.TryStatementAst]
+        }) | Select-Object -First 1
+    if ($null -eq $probeOuterTry -or $null -eq $probeOuterTry.Finally) { throw 'у тілі немає зовнішнього try/finally' }
+    $probeStatements = @($probeOuterTry.Body.Statements)
+    $probeStepsStart = -1
+    for ($probeIndex = 0; $probeIndex -lt $probeStatements.Count; $probeIndex++) {
+        if ($probeStatements[$probeIndex].Extent.Text -match '^Initialize-BRAVOMaintenanceSteps\s+-Total\s+8\s*$') {
+            $probeStepsStart = $probeIndex
+            break
+        }
+    }
+    if ($probeStepsStart -lt 0) { throw 'у тілі немає Initialize-BRAVOMaintenanceSteps -Total 8' }
+
+    $probeStubs = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'stubs.ps1'), [Text.Encoding]::UTF8)
+    $probeStubNames = @{}
+    foreach ($probeStubAst in @([Management.Automation.Language.Parser]::ParseInput($probeStubs, [ref]$null, [ref]$null).EndBlock.Statements)) {
+        if ($probeStubAst -is [Management.Automation.Language.FunctionDefinitionAst]) { $probeStubNames[$probeStubAst.Name] = $true }
+    }
+    # Справжні функції тіла, визначені до кроків (крім затінених стабами).
+    $probeFunctionTexts = New-Object System.Collections.Generic.List[string]
+    for ($probeIndex = 0; $probeIndex -lt $probeStepsStart; $probeIndex++) {
+        $probeStatement = $probeStatements[$probeIndex]
+        if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            -not $probeStubNames.ContainsKey($probeStatement.Name)) {
+            $probeFunctionTexts.Add($probeStatement.Extent.Text)
+        }
+    }
+    # Дослівна оркестрація до кінця зовнішнього try (включно з exit).
+    # Затінені стабами визначення функцій усередині неї замінюються
+    # пробілами, інакше вони перевизначили б стаб під час виконання.
+    $probeRegionStart = $probeStatements[$probeStepsStart].Extent.StartOffset
+    $probeRegionEnd = $probeStatements[$probeStatements.Count - 1].Extent.EndOffset
+    $probeRegion = New-Object Text.StringBuilder($probeRuntimeText.Substring($probeRegionStart, $probeRegionEnd - $probeRegionStart))
+    foreach ($probeDefinition in @($probeOuterTry.Body.FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object {
+                $_.Extent.StartOffset -ge $probeRegionStart -and $probeStubNames.ContainsKey($_.Name)
+            })) {
+        $probeLength = $probeDefinition.Extent.EndOffset - $probeDefinition.Extent.StartOffset
+        [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
+        [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
+    }
+
+    $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
+    $probeServiceTable = if ($Scenario -eq 'Happy') {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
+    } else {
+        "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
+    }
+    $probeScenarioSeed = @(
+        ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
+        ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
+        ('$script:ProbeServices = {0}' -f $probeServiceTable),
+        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' }))
+    ) -join "`n"
+    $probeGenerated = @(
+        $probeAst.ParamBlock.Extent.Text,
+        'function Invoke-BRAVOMaintenanceOrchestrationProbe {',
+        'Set-StrictMode -Version 2.0',
+        ($probeFunctionTexts -join "`n`n"),
+        $probeStubs,
+        $probeScenarioSeed,
+        [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        'try {',
+        $probeRegion.ToString(),
+        ('} finally ' + $probeOuterTry.Finally.Extent.Text),
+        '}',
+        'Invoke-BRAVOMaintenanceOrchestrationProbe'
+    ) -join "`n"
+    $probeGeneratedPath = Join-Path $ProbeRoot 'runtime.ps1'
+    [IO.File]::WriteAllText($probeGeneratedPath, $probeGenerated, (New-Object Text.UTF8Encoding($true)))
+
+    foreach ($probeModule in @('BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Maintenance')) {
+        Import-Module -Name (Join-Path $RepositoryRoot "modules\$probeModule\$probeModule.psd1") -Force
+    }
+    & (Get-Module -Name 'BRAVO.Maintenance') { param($Path) $script:runtimePath = $Path } $probeGeneratedPath
+    $global:LASTEXITCODE = 77
+    $probeErrors = $null
+    $ErrorActionPreference = 'Continue'
+    $probeExitCode = Invoke-BRAVOMaintenanceEntrypoint -Parameters @{
+        RuntimeRoot = $ProbeRoot
+        EntryScriptPath = (Join-Path $ProbeRoot 'BRAVO_MAINTENANCE.ps1')
+        NoPause = $true
+    } -ErrorVariable probeErrors 2>$null
+    $probeEvents = @()
+    if (Test-Path -LiteralPath $probeEventsPath -PathType Leaf) {
+        $probeEvents = @([IO.File]::ReadAllLines($probeEventsPath, [Text.Encoding]::UTF8))
+    }
+    $probeResult = [pscustomobject]@{
+        ExitCode = [int]$probeExitCode
+        ExitCodeName = [string](Get-BRAVOExitCodeName -Code ([int]$probeExitCode))
+        Events = $probeEvents
+        Errors = @(@($probeErrors) | ForEach-Object { [string]$_ })
+    }
+} catch {
+    $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
+}
+[IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+'@
+        $maintenanceOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'stubs.ps1'), $maintenanceOrchestrationStubs, $maintenanceOrchestrationUtf8)
+        [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'seed.ps1'), $maintenanceOrchestrationSeed, $maintenanceOrchestrationUtf8)
+        $maintenanceOrchestrationProbePath = Join-Path $maintenanceOrchestrationRoot 'probe.ps1'
+        [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
+        $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $maintenanceOrchestrationResults = @{}
+        foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck')) {
+            $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
+            [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
+            $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $maintenanceOrchestrationProbePath `
+                -Scenario $maintenanceOrchestrationScenario -RepositoryRoot $root -ProbeRoot $maintenanceOrchestrationScenarioRoot
+            $maintenanceOrchestrationResultPath = Join-Path $maintenanceOrchestrationScenarioRoot 'result.json'
+            $maintenanceOrchestrationResults[$maintenanceOrchestrationScenario] = if (Test-Path -LiteralPath $maintenanceOrchestrationResultPath -PathType Leaf) {
+                [IO.File]::ReadAllText($maintenanceOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            } else {
+                [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
+            }
+        }
+        $maintenanceOrchestrationStepPattern = '^STEP (\d+)/(\d+) (.+) (OK|SKIPPED|WARN|FAIL)$'
+        $maintenanceOrchestrationEventIndex = {
+            param([object[]]$Events, [string]$Pattern)
+            for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                if ([string]$Events[$eventIndex] -match $Pattern) { return $eventIndex }
+            }
+            return -1
+        }
+
+        # (1) Щасливий шлях: рівно 8 кроків у затвердженому порядку [1/8]..[8/8];
+        # маркер quiescence до першої зупинки, зупинки — між кроками 2 і 3,
+        # старти — між кроками 6 і 7 (finally), маркер прибрано до кроку 7,
+        # lock звільнено останнім; код завершення 0 (Success).
+        $maintenanceHappy = $maintenanceOrchestrationResults['Happy']
+        $maintenanceHappyEvents = @()
+        $maintenanceHappyStepLabels = @()
+        if ($null -eq $maintenanceHappy.PSObject.Properties['ProbeError']) {
+            $maintenanceHappyEvents = @($maintenanceHappy.Events | ForEach-Object { [string]$_ })
+            $maintenanceHappyStepLabels = @($maintenanceHappyEvents | Where-Object { $_ -match $maintenanceOrchestrationStepPattern } | ForEach-Object {
+                    [void]($_ -match $maintenanceOrchestrationStepPattern)
+                    "[{0}/{1}] {2}" -f $Matches[1], $Matches[2], $Matches[3]
+                })
+        }
+        $maintenanceExpectedStepLabels = @(
+            '[1/8] Перевірка вільного місця',
+            '[2/8] Створення необхідних директорій',
+            '[3/8] Зупинка служб',
+            '[4/8] Перевірка розмірів .md',
+            '[5/8] Реставрація моделі',
+            '[6/8] Обробка trace і логів',
+            '[7/8] Відновлення стану служб',
+            '[8/8] Контроль діапазонів ID'
+        )
+        $maintenanceOrchestrationHappyStep2 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 2/8 '
+        $maintenanceOrchestrationHappyStep3 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 3/8 '
+        $maintenanceOrchestrationHappyStep6 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 6/8 '
+        $maintenanceOrchestrationHappyStep7 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 7/8 '
+        $maintenanceOrchestrationHappyMarkerWrite = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^MARKER-WRITE '
+        $maintenanceOrchestrationHappyMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^MARKER-CLEAR$'
+        $maintenanceOrchestrationHappyStops = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents ('^STOP {0}$' -f $maintenanceOrchestrationServiceName) })
+        $maintenanceOrchestrationHappyStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $maintenanceHappy.PSObject.Properties['ProbeError'] -and
+                $maintenanceHappy.ExitCode -eq 0 -and
+                ($maintenanceHappyStepLabels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|') -and
+                @($maintenanceHappyEvents | Where-Object { $_ -match '^STEP .* FAIL$' }).Count -eq 0 -and
+                $maintenanceOrchestrationHappyMarkerWrite -ge 0 -and $maintenanceOrchestrationHappyMarkerWrite -gt $maintenanceOrchestrationHappyStep2 -and
+                @($maintenanceOrchestrationHappyStops | Where-Object { $_ -le $maintenanceOrchestrationHappyMarkerWrite -or $_ -ge $maintenanceOrchestrationHappyStep3 }).Count -eq 0 -and
+                @($maintenanceOrchestrationHappyStarts | Where-Object { $_ -le $maintenanceOrchestrationHappyStep6 -or $_ -ge $maintenanceOrchestrationHappyStep7 }).Count -eq 0 -and
+                $maintenanceOrchestrationHappyMarkerClear -gt ($maintenanceOrchestrationHappyStarts | Measure-Object -Maximum).Maximum -and
+                $maintenanceOrchestrationHappyMarkerClear -lt $maintenanceOrchestrationHappyStep7 -and
+                $maintenanceHappyEvents.Count -gt 0 -and
+                $maintenanceHappyEvents[$maintenanceHappyEvents.Count - 1] -eq 'LOCK-EXIT'
+            ) `
+            -Name "Maintenance/OrchestrationRunsStepsInContractOrder" `
+            -Failure "Maintenance на щасливому шляху має виконати рівно [1/8]..[8/8] у затвердженому порядку (зупинка служб між 2 і 3, старт між 6 і 7, маркер до першої зупинки й прибраний до [7/8], lock звільнено останнім) і завершитися кодом 0; проба: $($maintenanceHappy | ConvertTo-Json -Compress -Depth 4)"
+
+        # (2) Виняток у кроці [4/8]: finally служб усе одно відновлює служби
+        # (крок 'Відновлення стану служб'), маркер прибрано, lock звільнено;
+        # кроки 4–6 і 8 не рендеряться, а виняток доходить до catch
+        # Invoke-BRAVOMaintenanceEntrypoint -> 90 (InternalError). Номер кроку
+        # відновлення тут не фіксується: лічильник кроків послідовний, тому
+        # після пропущених 4–6 він показує не 7.
+        $maintenanceThrow = $maintenanceOrchestrationResults['ThrowInSizeCheck']
+        $maintenanceThrowEvents = @()
+        if ($null -eq $maintenanceThrow.PSObject.Properties['ProbeError']) {
+            $maintenanceThrowEvents = @($maintenanceThrow.Events | ForEach-Object { [string]$_ })
+        }
+        $maintenanceOrchestrationThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^SIZE-CHECK$'
+        $maintenanceOrchestrationThrowRestoreStep = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^STEP \d+/8 Відновлення стану служб (OK|WARN)$'
+        $maintenanceOrchestrationThrowStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
+        $maintenanceOrchestrationThrowMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^MARKER-CLEAR$'
+        $maintenanceOrchestrationThrowLockExit = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^LOCK-EXIT$'
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $maintenanceThrow.PSObject.Properties['ProbeError'] -and
+                $maintenanceThrow.ExitCode -eq 90 -and
+                $maintenanceThrow.ExitCodeName -eq 'InternalError' -and
+                @($maintenanceThrow.Errors | Where-Object { ([string]$_).Contains('self-test: імітований збій кроку перевірки розмірів .md') }).Count -gt 0 -and
+                $maintenanceOrchestrationThrowSizeCheck -ge 0 -and
+                $maintenanceOrchestrationThrowRestoreStep -gt $maintenanceOrchestrationThrowSizeCheck -and
+                @($maintenanceOrchestrationThrowStarts | Where-Object { $_ -le $maintenanceOrchestrationThrowSizeCheck -or $_ -ge $maintenanceOrchestrationThrowRestoreStep }).Count -eq 0 -and
+                $maintenanceOrchestrationThrowMarkerClear -gt ($maintenanceOrchestrationThrowStarts | Measure-Object -Maximum).Maximum -and
+                $maintenanceOrchestrationThrowMarkerClear -lt $maintenanceOrchestrationThrowRestoreStep -and
+                $maintenanceOrchestrationThrowLockExit -gt $maintenanceOrchestrationThrowRestoreStep -and
+                @($maintenanceThrowEvents | Where-Object {
+                        $_ -match '^STEP \d+/8 (Перевірка розмірів \.md|Реставрація моделі|Обробка trace і логів|Контроль діапазонів ID) ' -or
+                        $_ -eq 'FINAL-REPORT'
+                    }).Count -eq 0
+            ) `
+            -Name "Maintenance/OrchestrationRestoresServicesWhenStepThrows" `
+            -Failure "виняток у кроці [4/8] має пройти крізь finally служб: служби, зупинені прогоном, запущено, маркер прибрано, lock звільнено, а Invoke-BRAVOMaintenanceEntrypoint повертає 90 (InternalError); проба: $($maintenanceThrow | ConvertTo-Json -Compress -Depth 4)"
+
+        # (3) Служба, що була зупинена ДО прогону (exchangAPI), не потрапляє
+        # в маркер, не зупиняється й не запускається відновленням; решта
+        # запускається рівно по одному разу.
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $maintenanceThrow.PSObject.Properties['ProbeError'] -and
+                (@($maintenanceThrowEvents | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,BravoWeb' -and
+                (@($maintenanceThrowEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb' -and
+                (@($maintenanceThrowEvents | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb' -and
+                (@($maintenanceHappyEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI'
+            ) `
+            -Name "Maintenance/OrchestrationRestoreSkipsServicesStoppedBeforeRun" `
+            -Failure "відновлення служб має запускати лише служби, що працювали до прогону (зупинена exchangAPI не запускається); події: $($maintenanceThrowEvents -join ' || ')"
+    } finally {
+        if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
+            Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # -NoPause має надходити у Maintenance.Runtime.ps1 через параметр,
     # інакше зовнішній try/finally вище нічим не керує.
     Test-BRAVOCondition `
