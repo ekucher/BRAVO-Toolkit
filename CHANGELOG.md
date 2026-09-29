@@ -2,6 +2,38 @@
 
 ## Не випущено (developer)
 
+- **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
+  у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
+  той самий патерн, що `BRAVO.Health.Runtime.ps1` (`Invoke-BRAVOHealth`).
+  Для оператора нічого не змінилось: ті самі параметри (включно з alias
+  `-ArchivLims`), коди завершення, кроки `[1/8]`…`[8/8]`, відновлення служб у
+  `finally`, пауза `-NoPause` і вивід. Guard передає функції лише справді
+  задані параметри (`$PSBoundParameters`), тож `-AutoShutdown` і
+  `-ArchiveAfterMaintenance` з командного рядка, як і раніше, мають
+  пріоритет над конфігурацією, а незадані беруться з неї. Дві правки в
+  тілі зберігають наявну поведінку: сирий режим повідомлень і шлях журналу
+  `$LOG_FILE` тепер явно пишуться в `$script:` — інакше валідація
+  конфігурації побачила б сирий замість ефективного режиму (з
+  `-DisableAllSlack`/`-EnableAllSlack`), а вивантаження власного журналу
+  Maintenance на SFTP мовчки перестало б працювати. Dot-source файлу тепер
+  лише визначає функцію й нічого не виконує.
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/MaintenanceRuntimeWrappedInFunction` (AST: на верхньому рівні
+  лише обгортка й guard, кожен `exit` — усередині обгортки, `param()`
+  функції тотожний `param()` скрипта, guard викликає
+  `Invoke-BRAVOMaintenance @PSBoundParameters`, тіло не пише без scope
+  імен, які файл використовує через `$script:` чи
+  `Get-Variable -Scope Script`),
+  `Console/MaintenanceRuntimeGuardForwardsBoundParametersOnly` (проба з
+  реального тексту файлу: до й після обгортання однакові ключі
+  `$PSBoundParameters` і значення параметрів),
+  `Console/MaintenanceRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/MaintenanceRuntimeDirectInvocationRunsBody` (дочірній процес).
+  Перевірку порядку
+  `Maintenance/LegacySweepDependencyFunctionsDefinedBeforeTopLevelInvocation`
+  оновлено: оператори обгортки вважаються верхнім рівнем тіла.
 - **Maintenance: перевірка before/after-архівів реставрації моделі тепер
   зосереджена в одному місці й завжди включає 7z t (T004/F002).**
   `Verify-Backup` раніше лише записував `.sha512` і повертав успіх для будь-

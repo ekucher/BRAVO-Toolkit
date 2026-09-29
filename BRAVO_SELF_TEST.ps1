@@ -11789,6 +11789,344 @@ try {
         -Name "Console/MaintenancePausesOnEveryExitPath" `
         -Failure "Maintenance.Runtime.ps1 має один зовнішній try/finally з Wait-BRAVOManualExit, що охоплює геть усі exit-и файлу — від елевації до фінального exit 0"
 
+    # Maintenance.Runtime.ps1: тіло runtime загорнуте в
+    # Invoke-BRAVOMaintenance за зразком Invoke-BRAVOHealth. Структура (AST):
+    # на верхньому рівні — лише функція-обгортка й invocation guard останнім
+    # оператором, КОЖЕН exit — усередині обгортки, кожен параметр функції
+    # текстуально тотожний параметру param() скрипта (тип, атрибути, alias,
+    # ValidateSet, значення за замовчуванням), а guard передає функції рівно
+    # @PSBoundParameters скрипта: тіло читає
+    # $PSBoundParameters.ContainsKey('AutoShutdown'/'ArchiveAfterMaintenance'),
+    # тож hashtable з УСІМА параметрами зробив би "задано явно" кожен із них.
+    # Окремо — клас пасток обгортання: ім'я, яке тіло пише БЕЗ scope, а хтось
+    # у файлі читає/пише через $script: або Get-Variable -Scope Script. До
+    # обгортання це була одна script-змінна; у функції некваліфіковане
+    # присвоєння створює локальну копію (так було б із $SlackMode —
+    # валідація конфігурації побачила б сирий, а не ефективний режим, — і з
+    # $LOG_FILE — upload власного журналу мовчки перестав би працювати).
+    $maintenanceWrapperCheck = & {
+        $wrapperRuntimePath = Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"
+        $wrapperParseErrors = $null
+        $wrapperAst = [Management.Automation.Language.Parser]::ParseFile(
+            $wrapperRuntimePath, [ref]$null, [ref]$wrapperParseErrors)
+        $wrapperTopStatements = @($wrapperAst.EndBlock.Statements)
+        $wrapperFunctions = @($wrapperTopStatements | Where-Object {
+                $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOMaintenance'
+            })
+        $wrapperFunction = $wrapperFunctions | Select-Object -First 1
+        $wrapperGuard = $wrapperTopStatements | Select-Object -Last 1
+        $wrapperExits = @($wrapperAst.FindAll({
+                    param($node) $node -is [Management.Automation.Language.ExitStatementAst]
+                }, $true))
+        $wrapperExitsOutside = @($wrapperExits | Where-Object {
+                $null -eq $wrapperFunction -or
+                $_.Extent.StartOffset -lt $wrapperFunction.Extent.StartOffset -or
+                $_.Extent.EndOffset -gt $wrapperFunction.Extent.EndOffset
+            })
+        # Текст кожного параметра з нормалізованими пробілами (відступ
+        # багаторядкових параметрів у функції інший).
+        $scriptParameterTexts = @($wrapperAst.ParamBlock.Parameters | ForEach-Object { $_.Extent.Text -replace '\s+', ' ' })
+        $functionParameterTexts = @()
+        $shadowedScriptNames = @()
+        if ($null -ne $wrapperFunction -and $null -ne $wrapperFunction.Body.ParamBlock) {
+            $functionParameterTexts = @($wrapperFunction.Body.ParamBlock.Parameters | ForEach-Object { $_.Extent.Text -replace '\s+', ' ' })
+        }
+        if ($null -ne $wrapperFunction) {
+            $scriptScopedNames = @{}
+            foreach ($wrapperVariable in @($wrapperAst.FindAll({
+                            param($node) $node -is [Management.Automation.Language.VariableExpressionAst]
+                        }, $true))) {
+                if ($wrapperVariable.VariablePath.UserPath -match '^(?i)script:(.+)$') {
+                    $scriptScopedNames[$Matches[1].ToLowerInvariant()] = $true
+                }
+            }
+            # Get-Variable/Set-Variable/... -Name X -Scope Script — та сама
+            # script-змінна, лише звернення через cmdlet.
+            foreach ($wrapperCommand in @($wrapperAst.FindAll({
+                            param($node)
+                            $node -is [Management.Automation.Language.CommandAst] -and
+                            [string]$node.GetCommandName() -match '^(?i)(Get|Set|New|Remove|Clear)-Variable$'
+                        }, $true))) {
+                $commandElements = @($wrapperCommand.CommandElements)
+                $scopeIsScript = $false
+                $variableName = $null
+                for ($elementIndex = 1; $elementIndex -lt $commandElements.Count - 1; $elementIndex++) {
+                    $element = $commandElements[$elementIndex]
+                    if ($element -is [Management.Automation.Language.CommandParameterAst]) {
+                        $nextText = $commandElements[$elementIndex + 1].Extent.Text.Trim("'", '"')
+                        if ($element.ParameterName -eq 'Scope' -and $nextText -eq 'Script') { $scopeIsScript = $true }
+                        if ($element.ParameterName -eq 'Name') { $variableName = $nextText }
+                    }
+                }
+                if ($scopeIsScript -and -not [string]::IsNullOrEmpty($variableName)) {
+                    $scriptScopedNames[$variableName.ToLowerInvariant()] = $true
+                }
+            }
+            $bodyUnqualifiedNames = @{}
+            foreach ($wrapperAssignment in @($wrapperFunction.Body.FindAll({
+                            param($node)
+                            $node -is [Management.Automation.Language.AssignmentStatementAst] -or
+                            $node -is [Management.Automation.Language.ForEachStatementAst]
+                        }, $true))) {
+                # Лише присвоєння рівня тіла обгортки: не у вкладеній функції й
+                # не у scriptblock-літералі (ті мають власний scope і до
+                # обгортання).
+                $wrapperOwner = $wrapperAssignment.Parent
+                while ($null -ne $wrapperOwner -and
+                    -not ($wrapperOwner -is [Management.Automation.Language.FunctionDefinitionAst]) -and
+                    -not ($wrapperOwner -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                    $wrapperOwner = $wrapperOwner.Parent
+                }
+                if (-not [object]::ReferenceEquals($wrapperOwner, $wrapperFunction)) {
+                    continue
+                }
+                $wrapperTarget = if ($wrapperAssignment -is [Management.Automation.Language.ForEachStatementAst]) {
+                    $wrapperAssignment.Variable
+                } else {
+                    $wrapperAssignment.Left
+                }
+                if ($wrapperTarget -is [Management.Automation.Language.ConvertExpressionAst]) {
+                    $wrapperTarget = $wrapperTarget.Child
+                }
+                if ($wrapperTarget -is [Management.Automation.Language.VariableExpressionAst] -and
+                    $wrapperTarget.VariablePath.IsUnqualified) {
+                    $bodyUnqualifiedNames[$wrapperTarget.VariablePath.UserPath.ToLowerInvariant()] = $true
+                }
+            }
+            $shadowedScriptNames = @($bodyUnqualifiedNames.Keys | Where-Object {
+                    $scriptScopedNames.ContainsKey($_)
+                } | Sort-Object)
+        }
+        $guardIsInvocation = $false
+        if ($wrapperGuard -is [Management.Automation.Language.IfStatementAst] -and
+            @($wrapperGuard.Clauses).Count -eq 1 -and
+            $null -eq $wrapperGuard.ElseClause -and
+            $wrapperGuard.Clauses[0].Item1.Extent.Text -eq "`$MyInvocation.InvocationName -ne '.'") {
+            $guardCommands = @($wrapperGuard.FindAll({
+                        param($node) $node -is [Management.Automation.Language.CommandAst]
+                    }, $true))
+            $guardStatements = @($wrapperGuard.Clauses[0].Item2.Statements)
+            if ($guardCommands.Count -eq 1 -and $guardStatements.Count -eq 1) {
+                $guardElements = @($guardCommands[0].CommandElements)
+                $guardIsInvocation = (
+                    $guardCommands[0].GetCommandName() -eq 'Invoke-BRAVOMaintenance' -and
+                    $guardElements.Count -eq 2 -and
+                    $guardElements[1] -is [Management.Automation.Language.VariableExpressionAst] -and
+                    $guardElements[1].Splatted -and
+                    $guardElements[1].VariablePath.UserPath -eq 'PSBoundParameters'
+                )
+            }
+        }
+        [pscustomobject]@{
+            Ast = $wrapperAst
+            Function = $wrapperFunction
+            Guard = $wrapperGuard
+            Passed = (
+                @($wrapperParseErrors).Count -eq 0 -and
+                $wrapperFunctions.Count -eq 1 -and
+                $wrapperTopStatements.Count -eq 2 -and
+                $wrapperExits.Count -gt 0 -and
+                $wrapperExitsOutside.Count -eq 0 -and
+                $shadowedScriptNames.Count -eq 0 -and
+                $guardIsInvocation -and
+                $scriptParameterTexts.Count -gt 0 -and
+                ($functionParameterTexts -join "`n") -ceq ($scriptParameterTexts -join "`n")
+            )
+            Detail = "операторів верхнього рівня: $($wrapperTopStatements.Count); exit поза функцією: $($wrapperExitsOutside.Count); затінені `$script:-імена: $($shadowedScriptNames -join ', '); guard викликає Invoke-BRAVOMaintenance @PSBoundParameters: $guardIsInvocation; параметри функції: $($functionParameterTexts.Count); param() скрипта: $($scriptParameterTexts.Count); тотожні: $(($functionParameterTexts -join "`n") -ceq ($scriptParameterTexts -join "`n"))"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition $maintenanceWrapperCheck.Passed `
+        -Name "Console/MaintenanceRuntimeWrappedInFunction" `
+        -Failure "Maintenance.Runtime.ps1: на верхньому рівні мають бути лише функція Invoke-BRAVOMaintenance (з усіма exit і param(), тотожним param() скрипта) і останнім оператором guard `$MyInvocation.InvocationName -ne '.' з рівно Invoke-BRAVOMaintenance @PSBoundParameters; тіло не повинно писати без scope імена, які файл використовує через `$script: чи Get-Variable -Scope Script ($($maintenanceWrapperCheck.Detail))"
+
+    # Поведінкова проба передачі параметрів, зібрана з РЕАЛЬНОГО тексту
+    # файлу: param() скрипта, param() обгортки й guard. Варіант "як до
+    # обгортання" віддає $PSBoundParameters і значення параметрів прямо з
+    # тіла скрипта, варіант "обгорнутий" — з тіла Invoke-BRAVOMaintenance,
+    # викликаної справжнім guard-ом. Для кожного набору аргументів (без
+    # необов'язкових, з alias ArchivLims, з явним -EnableAllSlack:$false
+    # тощо) обидва варіанти мусять дати однаковий набір ключів
+    # $PSBoundParameters і однакові значення, включно з незаданими.
+    $maintenanceWrapperProbeResults = @()
+    if ($null -ne $maintenanceWrapperCheck.Function -and
+        $null -ne $maintenanceWrapperCheck.Function.Body.ParamBlock -and
+        $null -ne $maintenanceWrapperCheck.Ast.ParamBlock) {
+        $maintenanceWrapperProbeEmit = @'
+[pscustomobject]@{
+    Bound = ((@($PSBoundParameters.Keys) | Sort-Object) -join ',')
+    Values = ((@(foreach ($probeName in @('ForceRestore', 'RunMissedRestoreOnly', 'DisableSizeCheck', 'EnableAllSlack', 'DisableAllSlack', 'AutoShutdown', 'ArchiveAfterMaintenance', 'ConfigPath', 'ConfigPathWasExplicit', 'NoPause', 'RuntimeRoot', 'EntryScriptPath')) {
+        $probeValue = Get-Variable -Name $probeName -ValueOnly
+        '{0}={1}:{2}' -f $probeName, $(if ($null -eq $probeValue) { 'null' } else { $probeValue.GetType().Name }), [string]$probeValue
+    })) -join ';')
+}
+'@
+        $maintenanceWrapperDirectProbe = [scriptblock]::Create(
+            $maintenanceWrapperCheck.Ast.ParamBlock.Extent.Text + "`n" + $maintenanceWrapperProbeEmit)
+        $maintenanceWrapperWrappedProbe = [scriptblock]::Create(
+            $maintenanceWrapperCheck.Ast.ParamBlock.Extent.Text + "`n" +
+            "function Invoke-BRAVOMaintenance {`n" + $maintenanceWrapperCheck.Function.Body.ParamBlock.Extent.Text + "`n" +
+            $maintenanceWrapperProbeEmit + "`n}`n" + $maintenanceWrapperCheck.Guard.Extent.Text)
+        foreach ($maintenanceWrapperProbeArguments in @(
+                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E' },
+                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; AutoShutdown = 'on'; ArchivLims = 'off' },
+                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; ConfigPath = 'C:\probe\BRAVO.config'; ConfigPathWasExplicit = $true; NoPause = $true; ForceRestore = $true; DisableAllSlack = $true },
+                @{ RuntimeRoot = 'R'; EntryScriptPath = 'E'; EnableAllSlack = $false; ArchiveAfterMaintenance = 'on'; RunMissedRestoreOnly = $true; DisableSizeCheck = $true }
+            )) {
+            $maintenanceWrapperDirect = @(& $maintenanceWrapperDirectProbe @maintenanceWrapperProbeArguments)
+            $maintenanceWrapperWrapped = @(& $maintenanceWrapperWrappedProbe @maintenanceWrapperProbeArguments)
+            $maintenanceWrapperProbeResults += [pscustomobject]@{
+                Same = (
+                    $maintenanceWrapperDirect.Count -eq 1 -and
+                    $maintenanceWrapperWrapped.Count -eq 1 -and
+                    -not [string]::IsNullOrEmpty([string]$maintenanceWrapperDirect[0].Bound) -and
+                    $maintenanceWrapperDirect[0].Bound -ceq $maintenanceWrapperWrapped[0].Bound -and
+                    $maintenanceWrapperDirect[0].Values -ceq $maintenanceWrapperWrapped[0].Values
+                )
+                Direct = @($maintenanceWrapperDirect | ForEach-Object { "$($_.Bound) | $($_.Values)" }) -join ' / '
+                Wrapped = @($maintenanceWrapperWrapped | ForEach-Object { "$($_.Bound) | $($_.Values)" }) -join ' / '
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $maintenanceWrapperProbeResults.Count -eq 4 -and
+            @($maintenanceWrapperProbeResults | Where-Object { -not $_.Same }).Count -eq 0
+        ) `
+        -Name "Console/MaintenanceRuntimeGuardForwardsBoundParametersOnly" `
+        -Failure "guard Maintenance.Runtime.ps1 має передавати в Invoke-BRAVOMaintenance рівно `$PSBoundParameters скрипта, а param() функції — давати ті самі значення незаданим параметрам; розбіжності: $(@($maintenanceWrapperProbeResults | Where-Object { -not $_.Same } | ForEach-Object { "до: $($_.Direct); після: $($_.Wrapped)" }) -join ' || ')"
+
+    # Точкове придушення PSAvoidUsingUsernameAndPasswordParams на обгортці
+    # охоплює extent усіх вкладених функцій, тож PSSA більше не побачить пару
+    # user/password в ОКРЕМІЙ вкладеній функції. Ця перевірка повертає це
+    # покриття: жодна вкладена функція не має водночас параметра з "user" і
+    # параметра з "pass" у назві, якщо пароль не SecureString/PSCredential.
+    $maintenanceNestedUserPasswordFunctions = @()
+    if ($null -ne $maintenanceWrapperCheck.Function) {
+        $maintenanceNestedUserPasswordFunctions = @($maintenanceWrapperCheck.Function.Body.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object {
+                $nestedFunctionAst = $_
+                $ownParameters = @($nestedFunctionAst.Body.FindAll({
+                            param($node)
+                            $node -is [System.Management.Automation.Language.ParameterAst]
+                        }, $true) | Where-Object {
+                        $owner = $_.Parent
+                        while ($null -ne $owner -and -not ($owner -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+                            $owner = $owner.Parent
+                        }
+                        $owner -eq $nestedFunctionAst
+                    })
+                $hasUser = @($ownParameters | Where-Object { $_.Name.VariablePath.UserPath -match 'user' }).Count -gt 0
+                $hasPlainPassword = @($ownParameters | Where-Object {
+                        $_.Name.VariablePath.UserPath -match 'pass' -and
+                        $_.StaticType -ne [System.Security.SecureString] -and
+                        $_.StaticType -ne [System.Management.Automation.PSCredential]
+                    }).Count -gt 0
+                $hasUser -and $hasPlainPassword
+            } | ForEach-Object { $_.Name })
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $maintenanceWrapperCheck.Function -and $maintenanceNestedUserPasswordFunctions.Count -eq 0) `
+        -Name "Console/MaintenanceRuntimeNestedFunctionsNoUserAndPasswordParams" `
+        -Failure "вкладені функції Invoke-BRAVOMaintenance мають водночас параметр user і plain-text pass: $($maintenanceNestedUserPasswordFunctions -join ', ')"
+
+    # Поведінка обгортки — у дочірньому процесі (runtime імпортує модулі й
+    # перемикає кодування консолі, це не повинно торкатися сесії самотесту).
+    # RuntimeRoot — порожній тимчасовий каталог: перший же оператор тіла
+    # (імпорт спільних модулів з RuntimeRoot) кидає "модуль не знайдено" ДО
+    # перевірки прав адміністратора, тож проба ніколи не доходить до
+    # UAC-елевації чи реальної роботи й детермінована на будь-якому хості.
+    # DotSource: dot-source лише визначає Invoke-BRAVOMaintenance — тіло НЕ
+    # виконується (без guard-а воно б кинуло виняток імпорту). Invoke:
+    # справжній production-шлях Invoke-BRAVOMaintenanceEntrypoint -> &
+    # runtime -> guard -> тіло; виняток тіла ловить catch модуля й повертає
+    # 90 (так само, як до обгортання). $LASTEXITCODE перед викликом = 77,
+    # тож пропущене тіло дало б 77, а не 90.
+    $maintenanceWrapperProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_MAINTENANCE_WRAPPER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory((Join-Path $maintenanceWrapperProbeRoot 'runtime'))
+        $maintenanceWrapperProbeScript = @'
+param([string]$Mode, [string]$RepositoryRoot, [string]$ProbeRoot)
+$probeRuntimePath = Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1'
+$probeFakeRuntimeRoot = Join-Path $ProbeRoot 'runtime'
+$probeParameters = @{
+    RuntimeRoot = $probeFakeRuntimeRoot
+    EntryScriptPath = (Join-Path $probeFakeRuntimeRoot 'BRAVO_MAINTENANCE.ps1')
+    ConfigPath = (Join-Path $ProbeRoot 'missing\BRAVO.config')
+    ConfigPathWasExplicit = $true
+    NoPause = $true
+}
+try {
+    if ($Mode -eq 'DotSource') {
+        . $probeRuntimePath @probeParameters
+        [pscustomobject]@{
+            DotSourceReturned = $true
+            FunctionDefined = [bool](Get-Command -Name 'Invoke-BRAVOMaintenance' -CommandType Function -ErrorAction SilentlyContinue)
+            BodyStateAbsent = (-not (Test-Path -LiteralPath 'variable:bravoScriptDirectory')) -and
+                (-not (Get-Command -Name 'Invoke-BRAVOMaintenanceOwnLogUpload' -CommandType Function -ErrorAction SilentlyContinue))
+        } | ConvertTo-Json -Compress
+    } else {
+        Import-Module -Name (Join-Path $RepositoryRoot 'modules\BRAVO.Maintenance\BRAVO.Maintenance.psd1') -Force
+        $global:LASTEXITCODE = 77
+        $probeErrors = $null
+        $probeExitCode = Invoke-BRAVOMaintenanceEntrypoint -Parameters $probeParameters -ErrorVariable probeErrors 2>$null
+        [pscustomobject]@{
+            ExitCode = [int]$probeExitCode
+            BodyImportFailureReported = [bool](@($probeErrors) | Where-Object {
+                    ([string]$_).Contains('BRAVO.Compatibility.psd1')
+                })
+        } | ConvertTo-Json -Compress
+    }
+} catch {
+    [pscustomobject]@{ ProbeError = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+}
+'@
+        $maintenanceWrapperProbePath = Join-Path $maintenanceWrapperProbeRoot 'probe.ps1'
+        [IO.File]::WriteAllText($maintenanceWrapperProbePath, $maintenanceWrapperProbeScript, (New-Object Text.UTF8Encoding($false)))
+        $maintenanceWrapperHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $maintenanceWrapperResults = @{}
+        foreach ($maintenanceWrapperMode in @('DotSource', 'Invoke')) {
+            $maintenanceWrapperOutput = & $maintenanceWrapperHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $maintenanceWrapperProbePath `
+                -Mode $maintenanceWrapperMode -RepositoryRoot $root -ProbeRoot $maintenanceWrapperProbeRoot
+            $maintenanceWrapperJson = @($maintenanceWrapperOutput) |
+                Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
+                Select-Object -Last 1
+            $maintenanceWrapperResults[$maintenanceWrapperMode] = if ([string]::IsNullOrWhiteSpace([string]$maintenanceWrapperJson)) {
+                [pscustomobject]@{ ProbeError = "проба не повернула JSON (код виходу $LASTEXITCODE)" }
+            } else {
+                [string]$maintenanceWrapperJson | ConvertFrom-Json
+            }
+        }
+        $maintenanceWrapperDotSource = $maintenanceWrapperResults['DotSource']
+        $maintenanceWrapperInvoke = $maintenanceWrapperResults['Invoke']
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $maintenanceWrapperDotSource.PSObject.Properties['ProbeError'] -and
+                $maintenanceWrapperDotSource.DotSourceReturned -eq $true -and
+                $maintenanceWrapperDotSource.FunctionDefined -eq $true -and
+                $maintenanceWrapperDotSource.BodyStateAbsent -eq $true
+            ) `
+            -Name "Console/MaintenanceRuntimeDotSourceDefinesWithoutRunning" `
+            -Failure "dot-source Maintenance.Runtime.ps1 має лише визначити Invoke-BRAVOMaintenance, не виконуючи тіло; проба: $($maintenanceWrapperDotSource | ConvertTo-Json -Compress)"
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $maintenanceWrapperInvoke.PSObject.Properties['ProbeError'] -and
+                $maintenanceWrapperInvoke.ExitCode -eq 90 -and
+                $maintenanceWrapperInvoke.BodyImportFailureReported -eq $true
+            ) `
+            -Name "Console/MaintenanceRuntimeDirectInvocationRunsBody" `
+            -Failure "Invoke-BRAVOMaintenanceEntrypoint з RuntimeRoot без modules\ має виконати тіло через guard (виняток імпорту BRAVO.Compatibility) і повернути 90 з catch модуля; проба: $($maintenanceWrapperInvoke | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $maintenanceWrapperProbeRoot -PathType Container) {
+            Remove-Item -LiteralPath $maintenanceWrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # -NoPause має надходити у Maintenance.Runtime.ps1 через параметр,
     # інакше зовнішній try/finally вище нічим не керує.
     Test-BRAVOCondition `
@@ -20431,7 +20769,7 @@ function Write-BRAVOLog {
             $maintenanceScriptTextForManifestStorage.Contains(
                 "`$maintenanceLogRunId = `"{0}_PID{1}`" -f `$currentDate.ToString(`"yyyyMMdd_HHmmss`"), `$PID") -and
             $maintenanceScriptTextForManifestStorage.Contains(
-                "`$LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$maintenanceLogRunId.log`"") -and
+                "`$script:LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$maintenanceLogRunId.log`"") -and
             -not $maintenanceScriptTextForManifestStorage.Contains(
                 "`$LOG_FILE = `"`$LOG_DIR\BRAVO_MAINTENANCE_`$NOW.log`"")
         ) `
