@@ -707,10 +707,13 @@ function Send-TestWebhookNotification {
     }
 
     # Windows 7 / Server 2008 R2 потребують явного ввімкнення TLS 1.2.
-    [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject(
-        [Net.SecurityProtocolType],
-        3072
-    )
+    # Адитивно (-bor), як канонічний Enable-BRAVOTls12 з BRAVO.Compatibility:
+    # уже ввімкнені протоколи (напр. Tls13, Tls11) не затираються. Сам
+    # helper тут не викликається — dry-run імпортує Compatibility лише
+    # умовно й пізніше. 3072 = TLS 1.2 (старі .NET не мають імені Tls12).
+    [Net.ServicePointManager]::SecurityProtocol =
+        [Net.ServicePointManager]::SecurityProtocol -bor
+        [Enum]::ToObject([Net.SecurityProtocolType], 3072)
     [Net.ServicePointManager]::Expect100Continue = $false
 
     $request = [Net.WebRequest]::Create($uri)

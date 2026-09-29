@@ -2,8 +2,8 @@
 # Documentation/* (SECURITY.md, THREAT_MODEL.md, RELEASE_CHECKLIST.md,
 # RELEASE_POLICY.md, README.md, OPERATIONS.md -- обов'язкові розділи,
 # відповідність реалізованим контролям), StaticAnalysis/* (PSScriptAnalyzer
-# settings, ci.yml: блокуючі security-правила, ASCII-only run-блоки,
-# pinned action SHA), ReleasePolicy/* (CI-гейт гілка/версія/канал).
+# settings, ci.yml: блокуючі security-правила; усі .github\workflows:
+# ASCII-only run-блоки, pinned action SHA), ReleasePolicy/* (CI-гейт гілка/версія/канал).
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 -- НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 # Зовнішніх source-text залежностей не має: всі документи й конфіги
@@ -123,46 +123,293 @@
             ) `
             -Name "StaticAnalysis/CiUsesSettingsAndForbiddenPatterns" `
             -Failure "ci.yml має викликати ci\Invoke-BRAVOSecurityAnalysis.ps1 і ci\Test-BRAVOForbiddenPattern.ps1"
-
-        # GitHub Actions записує вміст `run:` у тимчасовий .ps1 БЕЗ BOM,
-        # і Windows PowerShell 5.1 читає його в системній ANSI-кодовій
-        # сторінці — кирилиця там декодується в сміття, а окремі байти
-        # стають control-символами, що ламають парсер ще до виконання
-        # кроку. Реальне падіння CI сталося саме через це. Логіку з
-        # кирилицею тримаємо у файлах репозиторію (мають BOM), а `run:`
-        # лишається ASCII-only.
-        $ciRunBlockLines = @(
-            $ciWorkflowText -split '\r?\n' |
-                Where-Object { $_ -match '[Ѐ-ӿ]' } |
-                Where-Object { $_ -notmatch '^\s*#' } |
-                Where-Object { $_ -notmatch '^\s*-?\s*name:' }
-        )
-        Test-BRAVOCondition `
-            -Condition ($ciRunBlockLines.Count -eq 0) `
-            -Name "StaticAnalysis/CiRunBlocksAreAsciiOnly" `
-            -Failure "ci.yml: виконуваний рядок з кирилицею поза коментарем/name (GitHub Actions пише run: без BOM, PowerShell 5.1 ламається): $($ciRunBlockLines -join ' | ')"
     }
 
+    # T015: статичний конструктор `[T]::new(...)` існує лише з PowerShell
+    # 5.0, а маніфести декларують PowerShellVersion = '3.0'. Реальний
+    # дефект: Maintenance будував блок успішного сповіщення
+    # (NotificationMode=all) через List[string]::new() — на 3.0/4.0 гілка
+    # падала б лише в момент надсилання. Той самий AST-детектор і той
+    # самий production-набір, що й CI-гейт ci\Test-BRAVOForbiddenPattern.ps1
+    # (обидва — з ci\BRAVOAnalyzableFiles.ps1), тож self-test і CI не
+    # можуть розійтись у визначенні.
+    . (Join-Path $root 'ci\BRAVOAnalyzableFiles.ps1')
+
+    # Детектор не повинен бути ні сліпим, ні шумним: згадка в коментарі,
+    # у рядковому літералі та в here-string — НЕ виклик; реальний виклик
+    # (включно з регістром 'New') — виклик.
+    $staticNewProbePath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_STATIC_NEW_PROBE_{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $staticNewProbeLines = @(
+            '# коментар: [Uri]::new($base, $relative)',
+            '$text = "[System.Text.StringBuilder]::new()"',
+            '$here = @''',
+            '[Collections.Generic.List[string]]::new()',
+            '''@',
+            '$list = New-Object ''System.Collections.Generic.List[string]''',
+            '$real = [System.Collections.Generic.List[string]]::New()',
+            '$other = [string]::Join(",", @("a"))'
+        )
+        [IO.File]::WriteAllText($staticNewProbePath, ($staticNewProbeLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+        $staticNewProbeFindings = @(Find-BRAVOStaticNewInvocation -LiteralPath $staticNewProbePath)
+        Test-BRAVOCondition `
+            -Condition (
+                $staticNewProbeFindings.Count -eq 1 -and
+                $staticNewProbeFindings[0].Line -eq 7
+            ) `
+            -Name "StaticAnalysis/StaticNewDetectorMatchesOnlyRealInvocations" `
+            -Failure "Find-BRAVOStaticNewInvocation мав знайти рівно один виклик (рядок 7) і пропустити коментар/рядок/here-string; знайдено: $(@($staticNewProbeFindings | ForEach-Object { '{0}:{1}' -f $_.Line, $_.Text }) -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $staticNewProbePath -Force -ErrorAction SilentlyContinue
+    }
+
+    $staticNewProductionFiles = @(Get-BRAVOProductionPowerShellFile -Root $root)
+    $staticNewProductionFindings = @(
+        foreach ($staticNewProductionFile in $staticNewProductionFiles) {
+            Find-BRAVOStaticNewInvocation -LiteralPath $staticNewProductionFile.FullName
+        }
+    )
+    $staticNewScopeNames = @($staticNewProductionFiles | ForEach-Object { $_.Name })
+    Test-BRAVOCondition `
+        -Condition (
+            $staticNewProductionFiles.Count -gt 0 -and
+            $staticNewScopeNames -contains 'BRAVO.Maintenance.Runtime.ps1' -and
+            $staticNewScopeNames -notcontains 'BRAVO_SELF_TEST.ps1' -and
+            $staticNewProductionFindings.Count -eq 0
+        ) `
+        -Name "StaticAnalysis/NoStaticNewConstructorInProductionCode" `
+        -Failure "production PowerShell-код не повинен викликати [T]::new() (потрібен PowerShell 5.0+, маніфести декларують 3.0) — використовуйте New-Object; знайдено: $(@($staticNewProductionFindings | ForEach-Object { '{0}:{1}: {2}' -f $_.Path, $_.Line, $_.Text }) -join ' | ')"
+
+    # --- Інваріанти, спільні для ВСІХ workflow (T022) ---------------------
+    # Раніше ASCII-only і pin на SHA перевірялися лише для ci.yml, тож
+    # порушення в інших workflow (release-artifact.yml мав кирилицю у
+    # `run:`) лишалося непоміченим: той workflow запускається лише від
+    # тега, і жоден PR-прогін його не виконує. Перелік файлів береться
+    # динамічно, щоб новий workflow потрапляв під ті самі правила без
+    # правки тесту. ci.yml-специфічні інваріанти (ExcludeRule,
+    # -RequiredVersion PSScriptAnalyzer, виклики ci\*.ps1) лишаються вище
+    # і нижче лише на ci.yml.
+    #
+    # GitHub Actions записує вміст `run:` у тимчасовий .ps1 БЕЗ BOM,
+    # і Windows PowerShell 5.1 читає його в системній ANSI-кодовій
+    # сторінці — не-ASCII там декодується в сміття, а окремі байти
+    # стають control-символами або типографськими лапками, які парсер
+    # сприймає як межу рядка. Реальне падіння CI сталося саме через це;
+    # гірший варіант — скрипт парситься без помилки, але з іншою
+    # структурою (зсунуті лапки ковтають `exit 1`). Логіку з кирилицею
+    # тримаємо у файлах репозиторію (мають BOM), а виконувані рядки
+    # workflow лишаються ASCII-only. Коментарі й `name:` не виконуються
+    # PowerShell-ом, тому їх дозволено.
+    $workflowGovFindNonAsciiLines = {
+        param([string]$WorkflowText)
+        $workflowLines = @($WorkflowText -split '\r?\n')
+        for ($lineIndex = 0; $lineIndex -lt $workflowLines.Count; $lineIndex++) {
+            $workflowLine = $workflowLines[$lineIndex]
+            if ($workflowLine -match '[^\x00-\x7F]' -and
+                $workflowLine -notmatch '^\s*#' -and
+                $workflowLine -notmatch '^\s*-?\s*name:') {
+                "{0}: {1}" -f ($lineIndex + 1), $workflowLine.Trim()
+            }
+        }
+    }
     # Аудит P3: сторонні actions зафіксовані на повний commit SHA, а не
     # на рухомий тег. Тег можна переписати — pin на SHA цього не
-    # дозволяє. Версія PSScriptAnalyzer теж зафіксована, інакше нове
-    # правило або зміна поведінки ламає CI без жодної зміни коду.
-    if (Test-Path -LiteralPath $ciWorkflowPath -PathType Leaf) {
-        $unpinnedActions = @(
-            [regex]::Matches($ciWorkflowText, 'uses:\s*(?<Ref>[^\r\n]+)') |
-                ForEach-Object { $_.Groups['Ref'].Value.Trim() } |
-                Where-Object { $_ -notmatch '@[0-9a-f]{40}\b' }
-        )
-        Test-BRAVOCondition `
-            -Condition ($unpinnedActions.Count -eq 0) `
-            -Name "StaticAnalysis/ActionsPinnedToCommitSha" `
-            -Failure "усі GitHub Actions мають бути зафіксовані на повний commit SHA; не закріплені: $($unpinnedActions -join ', ')"
+    # дозволяє.
+    $workflowGovFindUnpinnedActions = {
+        param([string]$WorkflowText)
+        [regex]::Matches($WorkflowText, 'uses:\s*(?<Ref>[^\r\n]+)') |
+            ForEach-Object { $_.Groups['Ref'].Value.Trim() } |
+            Where-Object { $_ -notmatch '@[0-9a-f]{40}\b' }
+    }
 
+    # Предикати мусять ловити порушення в будь-якому workflow, а не лише
+    # в уже відомих: синтетичний новий workflow з кирилицею в `run:` і
+    # action на рухомому тезі має бути знайдений, а коментар і `name:` з
+    # кирилицею — ні.
+    $workflowGovSyntheticText = (@(
+        'name: Synthetic new workflow',
+        'jobs:',
+        '  demo:',
+        '    runs-on: windows-latest',
+        '    steps:',
+        '      # коментар кирилицею дозволений',
+        '      - uses: actions/checkout@v4',
+        '      - name: Крок з кириличною назвою',
+        '        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1',
+        '      - shell: powershell',
+        '        run: |',
+        '          Write-Host "::error::тег не опублікований"',
+        '          exit 1'
+    ) -join "`r`n")
+    $workflowGovSyntheticNonAscii = @(& $workflowGovFindNonAsciiLines $workflowGovSyntheticText)
+    $workflowGovSyntheticUnpinned = @(& $workflowGovFindUnpinnedActions $workflowGovSyntheticText)
+    Test-BRAVOCondition `
+        -Condition (
+            $workflowGovSyntheticNonAscii.Count -eq 1 -and
+            $workflowGovSyntheticNonAscii[0] -like '12: Write-Host*' -and
+            $workflowGovSyntheticUnpinned.Count -eq 1 -and
+            $workflowGovSyntheticUnpinned[0] -eq 'actions/checkout@v4'
+        ) `
+        -Name "StaticAnalysis/WorkflowInvariantsCatchNewWorkflow" `
+        -Failure ("предикати workflow-інваріантів мусять ловити синтетичний новий workflow: не-ASCII рядки " +
+            "[$($workflowGovSyntheticNonAscii -join ' | ')] (очікується рівно рядок 12), не закріплені actions " +
+            "[$($workflowGovSyntheticUnpinned -join ', ')] (очікується рівно actions/checkout@v4)")
+
+    $workflowGovRoot = Join-Path $root ".github\workflows"
+    $workflowGovFiles = @(
+        if (Test-Path -LiteralPath $workflowGovRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $workflowGovRoot -File |
+                Where-Object { $_.Extension -eq '.yml' -or $_.Extension -eq '.yaml' } |
+                Sort-Object Name
+        }
+    )
+    # Порожній перелік зробив би обидві перевірки нижче зеленими ні на
+    # чому. На момент T022 у репозиторії 4 workflow: ci.yml,
+    # config-parity.yml, config-v2-pilot-artifact.yml, release-artifact.yml.
+    $workflowGovNames = @($workflowGovFiles | ForEach-Object { $_.Name })
+    Test-BRAVOCondition `
+        -Condition (
+            $workflowGovFiles.Count -ge 4 -and
+            $workflowGovNames -contains 'ci.yml' -and
+            $workflowGovNames -contains 'release-artifact.yml'
+        ) `
+        -Name "StaticAnalysis/WorkflowEnumerationIsNotEmpty" `
+        -Failure "перелік .github\workflows\*.yml|*.yaml має містити щонайменше 4 файли, включно з ci.yml і release-artifact.yml; знайдено: $($workflowGovNames -join ', ')"
+
+    $workflowGovNonAsciiViolations = New-Object System.Collections.Generic.List[string]
+    $workflowGovUnpinnedViolations = New-Object System.Collections.Generic.List[string]
+    foreach ($workflowGovFile in $workflowGovFiles) {
+        $workflowGovText = [IO.File]::ReadAllText($workflowGovFile.FullName, [Text.Encoding]::UTF8)
+        foreach ($workflowGovLine in @(& $workflowGovFindNonAsciiLines $workflowGovText)) {
+            [void]$workflowGovNonAsciiViolations.Add("$($workflowGovFile.Name):$workflowGovLine")
+        }
+        foreach ($workflowGovRef in @(& $workflowGovFindUnpinnedActions $workflowGovText)) {
+            [void]$workflowGovUnpinnedViolations.Add("$($workflowGovFile.Name): $workflowGovRef")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($workflowGovFiles.Count -gt 0 -and $workflowGovNonAsciiViolations.Count -eq 0) `
+        -Name "StaticAnalysis/CiRunBlocksAreAsciiOnly" `
+        -Failure "workflow: виконуваний не-ASCII рядок поза коментарем/name (GitHub Actions пише run: без BOM, PowerShell 5.1 ламається): $($workflowGovNonAsciiViolations -join ' | ')"
+    Test-BRAVOCondition `
+        -Condition ($workflowGovFiles.Count -gt 0 -and $workflowGovUnpinnedViolations.Count -eq 0) `
+        -Name "StaticAnalysis/ActionsPinnedToCommitSha" `
+        -Failure "усі GitHub Actions в усіх workflow мають бути зафіксовані на повний commit SHA; не закріплені: $($workflowGovUnpinnedViolations -join ', ')"
+
+    # Версія PSScriptAnalyzer зафіксована, інакше нове правило або зміна
+    # поведінки ламає CI без жодної зміни коду. Аналізатор запускає лише
+    # ci.yml, тому інваріант — ci.yml-специфічний.
+    if (Test-Path -LiteralPath $ciWorkflowPath -PathType Leaf) {
         Test-BRAVOCondition `
             -Condition ($ciWorkflowText -match 'PSScriptAnalyzer\s+-RequiredVersion\s+\d+\.\d+') `
             -Name "StaticAnalysis/AnalyzerVersionPinned" `
             -Failure "версія PSScriptAnalyzer має бути зафіксована через -RequiredVersion"
     }
+
+    # T030: [Net.ServicePointManager]::SecurityProtocol у production-коді
+    # змінюється лише АДИТИВНО (поточне значення -bor прапор). Пряме
+    # присвоєння (`= 3072`) мовчки вимикало протоколи, вже ввімкнені
+    # хостом (напр. Tls13, Tls11) — так було в Maintenance/DataRestore
+    # runtime і dry-run. Канонічна форма — Enable-BRAVOTls12
+    # (BRAVO.Compatibility). Аналіз через AST, тож коментарі та рядкові
+    # літерали не дають хибних збігів, а багаторядкові присвоєння
+    # розпізнаються так само, як однорядкові. Self-test (корінь і
+    # selftest\) виключено: він мусить відновлювати початкове значення.
+    function Get-BRAVOSelfTestSecurityProtocolOverwrite {
+        param(
+            [Parameter(Mandatory = $true)][Management.Automation.Language.Ast]$Ast,
+            [Parameter(Mandatory = $true)][string]$Label
+        )
+        $isSecurityProtocolMember = {
+            param($node)
+            while ($node -is [Management.Automation.Language.ParenExpressionAst]) {
+                $node = $node.Pipeline
+                if ($node -is [Management.Automation.Language.PipelineAst] -and $node.PipelineElements.Count -eq 1 -and
+                    $node.PipelineElements[0] -is [Management.Automation.Language.CommandExpressionAst]) {
+                    $node = $node.PipelineElements[0].Expression
+                }
+            }
+            if (-not ($node -is [Management.Automation.Language.MemberExpressionAst]) -or -not $node.Static) { return $false }
+            if (-not ($node.Expression -is [Management.Automation.Language.TypeExpressionAst])) { return $false }
+            if (-not ($node.Member -is [Management.Automation.Language.StringConstantExpressionAst])) { return $false }
+            $typeName = $node.Expression.TypeName.FullName -replace '^(?i)System\.', ''
+            return ($typeName -eq 'Net.ServicePointManager' -and $node.Member.Value -eq 'SecurityProtocol')
+        }
+        $findings = @()
+        $assignments = @($Ast.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.AssignmentStatementAst]
+                }, $true))
+        foreach ($assignment in $assignments) {
+            if (-not (& $isSecurityProtocolMember $assignment.Left)) { continue }
+            $right = $assignment.Right
+            if ($right -is [Management.Automation.Language.PipelineAst] -and $right.PipelineElements.Count -eq 1) {
+                $right = $right.PipelineElements[0]
+            }
+            if ($right -is [Management.Automation.Language.CommandExpressionAst]) {
+                $right = $right.Expression
+            }
+            $isAdditive = (
+                $assignment.Operator -eq [Management.Automation.Language.TokenKind]::Equals -and
+                $right -is [Management.Automation.Language.BinaryExpressionAst] -and
+                $right.Operator -eq [Management.Automation.Language.TokenKind]::Bor -and
+                ((& $isSecurityProtocolMember $right.Left) -or (& $isSecurityProtocolMember $right.Right))
+            )
+            if (-not $isAdditive) {
+                $findings += "${Label}:$($assignment.Extent.StartLineNumber)"
+            }
+        }
+        return $findings
+    }
+
+    $securityProtocolGuardFixtures = @(
+        @{ Expected = 1; Text = '[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)' },
+        @{ Expected = 1; Text = "[System.Net.ServicePointManager]::SecurityProtocol =`n    [Net.SecurityProtocolType]::Tls12" },
+        @{ Expected = 1; Text = 'function f { [Net.ServicePointManager]::SecurityProtocol = 3072 -bor 768 }' },
+        @{ Expected = 0; Text = "[Net.ServicePointManager]::SecurityProtocol =`n    [Net.ServicePointManager]::SecurityProtocol -bor [Enum]::ToObject([Net.SecurityProtocolType], 3072)" },
+        @{ Expected = 0; Text = '[System.Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [System.Net.ServicePointManager]::SecurityProtocol' },
+        @{ Expected = 0; Text = "# [Net.ServicePointManager]::SecurityProtocol = 3072`n`$x = '[Net.ServicePointManager]::SecurityProtocol = 3072'" }
+    )
+    $securityProtocolGuardMismatches = @()
+    for ($securityProtocolFixtureIndex = 0; $securityProtocolFixtureIndex -lt $securityProtocolGuardFixtures.Count; $securityProtocolFixtureIndex++) {
+        $securityProtocolFixture = $securityProtocolGuardFixtures[$securityProtocolFixtureIndex]
+        $securityProtocolFixtureAst = [Management.Automation.Language.Parser]::ParseInput(
+            $securityProtocolFixture.Text, [ref]$null, [ref]$null)
+        $securityProtocolFixtureFindings = @(Get-BRAVOSelfTestSecurityProtocolOverwrite `
+                -Ast $securityProtocolFixtureAst -Label "fixture$securityProtocolFixtureIndex")
+        if (@($securityProtocolFixtureFindings).Count -ne $securityProtocolFixture.Expected) {
+            $securityProtocolGuardMismatches += "fixture$securityProtocolFixtureIndex (очікувано $($securityProtocolFixture.Expected), знайдено $(@($securityProtocolFixtureFindings).Count))"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($securityProtocolGuardMismatches.Count -eq 0) `
+        -Name "StaticAnalysis/SecurityProtocolGuardDetectsOverwrite" `
+        -Failure "AST-guard SecurityProtocol мусить ловити пряме присвоєння (одно- й багаторядкове, [System.Net.]/[Net.]) і пропускати адитивне -bor, коментарі та рядки: $($securityProtocolGuardMismatches -join '; ')"
+
+    $analyzableFilesHelperPath = Join-Path $root 'ci\BRAVOAnalyzableFiles.ps1'
+    $securityProtocolOverwrites = @()
+    $securityProtocolScannedCount = 0
+    if (Test-Path -LiteralPath $analyzableFilesHelperPath -PathType Leaf) {
+        . $analyzableFilesHelperPath
+        $securityProtocolProductionFiles = @(
+            Get-BRAVOAnalyzableFile -Root $root | Where-Object {
+                ($_.FullName -replace '/', '\') -notlike '*\selftest\*' -and
+                $_.Name -ne 'BRAVO_SELF_TEST.ps1'
+            }
+        )
+        foreach ($securityProtocolProductionFile in $securityProtocolProductionFiles) {
+            $securityProtocolProductionAst = [Management.Automation.Language.Parser]::ParseFile(
+                $securityProtocolProductionFile.FullName, [ref]$null, [ref]$null)
+            $securityProtocolOverwrites += @(Get-BRAVOSelfTestSecurityProtocolOverwrite `
+                    -Ast $securityProtocolProductionAst `
+                    -Label $securityProtocolProductionFile.FullName)
+            $securityProtocolScannedCount++
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($securityProtocolScannedCount -gt 0 -and $securityProtocolOverwrites.Count -eq 0) `
+        -Name "StaticAnalysis/SecurityProtocolAssignmentsAreAdditive" `
+        -Failure "production-код мусить вмикати протоколи адитивно ([Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor ... або Enable-BRAVOTls12); пряме присвоєння затирає вже ввімкнені протоколи (перевірено файлів: $securityProtocolScannedCount): $($securityProtocolOverwrites -join ', ')"
 
     # Аудит P5: threat model як окремий документ із чесним розділом
     # залишкового ризику для кожного сценарію.

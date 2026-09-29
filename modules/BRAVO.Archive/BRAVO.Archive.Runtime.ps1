@@ -22,10 +22,35 @@ param(
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
 )
 
+# Тіло runtime — одна функція, за зразком BRAVO.Health.Runtime.ps1
+# (Invoke-BRAVOHealth) і BRAVO.DataRestore.Runtime.ps1
+# (Invoke-BRAVODataRestore): прямий запуск файлу (& у BRAVO.Archive.psm1)
+# виконує тіло через invocation guard наприкінці файлу, а dot-source лише
+# визначає функцію й нічого не виконує. param() функції повторює param()
+# скрипта один в один. Функції runtime тепер визначаються в scope обгортки
+# і, як і раніше, бачать змінні тіла через динамічний scope (усі вони
+# викликаються зсередини обгортки); стан, який читають через $script:,
+# тіло пише явно через $script:, а exit усередині функції завершує весь
+# скрипт тим самим кодом.
+function Invoke-BRAVOArchive {
+    param(
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit = $false,
+        [switch]$SyncBAZA,
+        [switch]$HealthCheckOnly,
+        [switch]$ForceNotification,
+        [switch]$NotifyOnSuccess,
+        [switch]$NoSlack,
+        [switch]$SkipIfBackupTaskRunning,
+        [switch]$NoPause,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath
+    )
+
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.System', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -510,7 +535,11 @@ if ($credentialHelperLoaded -and $smbCredentialRequired) {
 # =============================================
 
 # РЕЖИМ СУМІСНОСТІ
-$compatibilityMode = $false  # Автоматично визначається нижче
+# Явно $script: — ту саму змінну пише Test-Compatibility
+# ($script:compatibilityMode) і читають New-SHA512Hash ($script:) та Main
+# (без scope). Некваліфіковане присвоєння всередині Invoke-BRAVOArchive
+# створило б локальну копію, яка затінила б для Main фактичний режим.
+$script:compatibilityMode = $false  # Автоматично визначається нижче
 
 # =============================================
 # НАЛАШТУВАННЯ КОНСОЛІ
@@ -3018,7 +3047,9 @@ function New-BRAVOArchiveCreationResult {
         [string]$ArchivePath,
         [Nullable[int]]$ExitCode,
         [string]$ErrorStage,
-        [string]$Error
+        [string]$Error,
+        # T006: 7z t пройшов лише через legacy BOM-у-паролі fallback.
+        [bool]$LegacyBomFallbackUsed = $false
     )
 
     [pscustomobject]@{
@@ -3028,6 +3059,7 @@ function New-BRAVOArchiveCreationResult {
         ExitCode = $ExitCode
         ErrorStage = $ErrorStage
         Error = $Error
+        LegacyBomPasswordFallbackUsed = $LegacyBomFallbackUsed
     }
 }
 
@@ -3120,8 +3152,12 @@ function New-Archive {
         # Сучасні ОС використовують ReadToEndAsync, Windows 7/.NET 4.0 —
         # сумісний подієвий механізм зі спільного модуля.
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($script:archivePassword)
-        $process.StandardInput.Close()
+        # Пароль пишеться канонічним BOM-free Write-BRAVOProcessInputText
+        # (BRAVO.Compatibility): вона ж закриває stdin (EOF). Прямий
+        # StandardInput.WriteLine кодує Console.InputEncoding і під UTF-8
+        # кодовою сторінкою вводу консолі (chcp 65001) додавав BOM перед
+        # паролем — архів шифрувався паролем "U+FEFF<пароль>".
+        Write-BRAVOProcessInputText -Process $process -Text $script:archivePassword
         $sevenZipProgressId = 2
         $progressActivity = "7-Zip — $ArchiveName"
         $archiveStarted = Get-Date
@@ -3187,18 +3223,23 @@ function New-Archive {
 
         if ($process.ExitCode -eq 0) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено; виконується контроль цiлiсностi: $fullArchivePath" -Level "INFO"
+            # T006: fallback-успіх пише WARNING (-> код 10 через статистику
+            # журналу) і позначається в результаті для одного сповіщення на прогін.
+            $legacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
             if (Test-SevenZipArchiveIntegrity `
                 -SevenZipPath $ArcPath `
                 -ArchivePath $fullArchivePath `
                 -Password $script:archivePassword `
                 -TimeoutSeconds $integrityTestTimeoutSeconds `
-                -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level }) {
+                -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
+                -LegacyBomFallbackCollector $legacyBomFallbackArchives) {
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено та перевiрено: $fullArchivePath" -Level "SUCCESS"
                 return (New-BRAVOArchiveCreationResult `
                     -CreateSuccess $true `
                     -IntegritySuccess $true `
                     -ArchivePath $fullArchivePath `
-                    -ExitCode 0)
+                    -ExitCode 0 `
+                    -LegacyBomFallbackUsed ($legacyBomFallbackArchives.Count -gt 0))
             }
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Пошкоджений або неперевiрений архiв не буде опублiковано як backup: $fullArchivePath" -Level "ERROR"
             $script:lastArchiveToolFailure = [pscustomobject]@{
@@ -3297,6 +3338,7 @@ function Invoke-BRAVOComponentBackup {
         SHA512 = $null
         ErrorStage = $null
         Error = $null
+        LegacyBomPasswordFallbackUsed = $false
     }
     $finalArchivePath = $null
     $finalHashPath = $null
@@ -3340,6 +3382,7 @@ function Invoke-BRAVOComponentBackup {
             -ArcParams $ArcParams
         $result.CreateSuccess = [bool]$creationResult.CreateSuccess
         $result.IntegritySuccess = [bool]$creationResult.IntegritySuccess
+        $result.LegacyBomPasswordFallbackUsed = [bool]$creationResult.LegacyBomPasswordFallbackUsed
         if (-not $result.CreateSuccess -or -not $result.IntegritySuccess) {
             $result.ErrorStage = ([string]$creationResult.ErrorStage).ToUpperInvariant()
             $result.Error = [string]$creationResult.Error
@@ -4536,6 +4579,67 @@ function global:Split-DiscordNotificationText {
     }
 
     return $chunks.ToArray()
+}
+
+function Send-BRAVOArchiveLegacyBomFallbackAlert {
+    # T006 (рішення власника 2026-09-29): РІВНО одне WARNING-сповіщення на
+    # прогін, якщо хоча б один опублікований архів пройшов 7z t лише через
+    # legacy BOM-у-паролі fallback. Перелік і підказка — канонічні
+    # (Get-BRAVOLegacyBomFallbackNotificationLines, BRAVO.ArchiveHelpers);
+    # маршрут/доставка — канонічна Send-BRAVONotification. Збій доставки
+    # лише логується і не змінює результат backup.
+    param([Parameter(Mandatory = $true)][hashtable]$Results)
+
+    $archiveNames = @(
+        $Results.Values |
+            Where-Object {
+                $_ -is [hashtable] -and
+                $_.ContainsKey('LegacyBomPasswordFallbackUsed') -and
+                [bool]$_.LegacyBomPasswordFallbackUsed -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.ArchivePath)
+            } |
+            ForEach-Object { Split-Path -Path ([string]$_.ArchivePath) -Leaf } |
+            Sort-Object -Unique
+    )
+    if ($archiveNames.Count -eq 0) {
+        return
+    }
+    if ($NoSlack -or $script:notificationMode -eq 'none') {
+        Write-BRAVOLog -Component 'ARCHIVE' -Message 'Сповіщення про legacy BOM-пароль архівів вимкнено параметрами запуску або конфігурацією' -Level 'INFO'
+        return
+    }
+    try {
+        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+            'невідома'
+        } else {
+            [string]$ScriptBuildId
+        }
+        $message = New-BRAVOOperatorNotificationMessage `
+            -Severity 'WARNING' `
+            -Operation 'BRAVO ARCHIVE — АРХІВИ З LEGACY BOM-ПАРОЛЕМ' `
+            -ActionText 'створити нові резервні копії перелічених даних поточною версією BRAVO.' `
+            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -HostInformation (Get-HostInformation) `
+            -ResultLines @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames $archiveNames) `
+            -Timestamp (Get-Date) `
+            -ProductName 'BRAVO Archive' `
+            -Version ([string]$global:ScriptVersion) `
+            -BuildId $archiveBuildIdText `
+            -LogPath ([string]$script:logFile) `
+            -LogLabel 'Журнал'
+        [void](Send-BRAVONotification `
+            -Severity 'WARNING' `
+            -Message $message `
+            -Provider $script:notificationProvider `
+            -NotificationMode $script:notificationMode `
+            -RoutingTable $backupMonitoring.NotificationRouting `
+            -CredentialTargets $backupMonitoring.NotificationCredentialTargets `
+            -TimeoutSeconds $script:notificationRequestTimeoutSeconds)
+        Write-BRAVOLog -Component 'ARCHIVE' -Message "Сповіщення про $($archiveNames.Count) архів(и) з legacy BOM-паролем відправлено у $($script:notificationProviderDisplayName)" -Level 'INFO'
+    } catch {
+        Write-BRAVOLog -Component 'ARCHIVE' -Message "Не вдалося відправити сповіщення про архіви з legacy BOM-паролем: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level 'WARNING'
+    }
 }
 
 function Send-BAZAIncompatibleNameAlert {
@@ -6111,7 +6215,7 @@ function Write-BRAVOBackupExecutionState {
     $state = @{}
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         try {
-            $previous = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $state.Maintenance = [string]$previous.Maintenance
             $state.Backup = [string]$previous.Backup
         } catch {
@@ -6126,7 +6230,7 @@ function Write-BRAVOBackupExecutionState {
         }
     }
     $state.Backup = ([datetime]::Now).ToString('o')
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json)
 }
 
 function Main {
@@ -7499,6 +7603,9 @@ function Main {
                     }
                     $results[$archive.Type].Bytes = $createdArchiveSize
                     $results[$archive.Type].SizeAnomaly = $sizeAnomalyResult
+                    if ([bool]$componentResult.LegacyBomPasswordFallbackUsed) {
+                        $results[$archive.Type].LegacyBomPasswordFallbackUsed = $true
+                    }
                 }
             }
             $archiveStepStatus = if (-not $success) {
@@ -8171,6 +8278,13 @@ function Main {
                     $backupNotificationMode.ToLowerInvariant() -eq "all") {
                     $healthParameters.NotifyOnSuccess = $true
                 }
+                # -NoSlack оператора діє на ВЕСЬ прогін, включно з вбудованим
+                # Health: без прокидання Health міг надіслати повідомлення,
+                # хоча запуск явно заборонив Slack. Передається лише коли
+                # прапорець встановлено — поведінка за замовчуванням незмінна.
+                if ($NoSlack) {
+                    $healthParameters.NoSlack = $true
+                }
                 $healthModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Health\BRAVO.Health.psd1'
                 if (-not (Test-Path -LiteralPath $healthModulePath -PathType Leaf)) {
                     throw "Не знайдено модуль health-check: $healthModulePath"
@@ -8279,6 +8393,11 @@ function Main {
             Write-BRAVOLog -Component 'SUMMARY' -Message "Не вдалося фіналізувати generation manifest: $($_.Exception.Message)" -Level 'ERROR'
         }
     }
+
+    # T006: одне WARNING-сповіщення на прогін про архіви, що пройшли 7z t
+    # лише через legacy BOM-у-паролі fallback. Код 10 уже забезпечено
+    # WARNING-записом кожного такого архіву (статистика журналу нижче).
+    Send-BRAVOArchiveLegacyBomFallbackAlert -Results $results
 
     # Секція health-check (якщо вона виконувалась) залишає компонент журналу
     # на "HEALTH" — без явного повернення на "SUMMARY" підсумковий рядок
@@ -8808,3 +8927,21 @@ if ($script:processExitCode -ne 0) {
     Exit $script:processExitCode
 }
 Exit 0
+}
+# END BRAVO ARCHIVE RUNTIME
+if ($MyInvocation.InvocationName -ne '.') {
+    $archiveRuntimeParameters = @{
+        ConfigPath = $ConfigPath
+        ConfigPathWasExplicit = $ConfigPathWasExplicit
+        SyncBAZA = $SyncBAZA
+        HealthCheckOnly = $HealthCheckOnly
+        ForceNotification = $ForceNotification
+        NotifyOnSuccess = $NotifyOnSuccess
+        NoSlack = $NoSlack
+        SkipIfBackupTaskRunning = $SkipIfBackupTaskRunning
+        NoPause = $NoPause
+        RuntimeRoot = $RuntimeRoot
+        EntryScriptPath = $EntryScriptPath
+    }
+    Invoke-BRAVOArchive @archiveRuntimeParameters
+}
