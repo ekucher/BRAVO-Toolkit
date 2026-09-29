@@ -2,6 +2,33 @@
 
 ## Не випущено (developer)
 
+- **Health: поведінкові тести оркестрації `Invoke-BRAVOHealth` (T011, аудит F010).**
+  Досі оркестрацію Health перевіряли лише текстові контракти (`IndexOf`/`Contains`
+  по тексту runtime). Шість нових перевірок `BRAVO_SELF_TEST.ps1` справді
+  виконують її в дочірньому процесі: runtime збирається з дослівного тексту
+  `modules/BRAVO.Health/BRAVO.Health.Runtime.ps1` (AST) — справжні
+  `Initialize-BRAVOHealthSteps`, кроки, гейти сповіщень,
+  `Get-SFTPHealthIssues`/`Test-SFTPHealthConfiguration`, `Write-HealthLog`,
+  `Complete-BRAVOHealthResult` і invocation guard з `exit` — і запускається через
+  справжній `Invoke-BRAVOHealthEntrypoint`. Преамбулу замінює seed змінних, а самі
+  перевірки, WinSCP, стан алертів, статус-файл і доставку сповіщень — стаби, що
+  пишуть події в журнал; служби, мережа й реальні інструменти не чіпаються.
+  Перевірки фіксують: порядок секцій `[1/9]`…`[9/9]` (кожна перевірка — перед своїм
+  кроком, «Сповіщення» — останнім)
+  (`Health/OrchestrationRunsChecksInContractOrder`); збій служб і NAS/SMB не
+  перериває решту перевірок, обидві проблеми йдуть в одне CRITICAL-сповіщення, код
+  `70` (`Health/OrchestrationFailedCheckDoesNotHideOtherChecks`); порушення
+  цілісності інструментів пропускає лише SFTP-гілку без жодного виклику WinSCP,
+  локальні перевірки виконуються, код `32` перекриває `70`
+  (`Health/OrchestrationToolIntegritySkipsOnlySftp`); `-NoSlack` прибирає лише
+  маршрутизацію й доставку сповіщень і крок «Сповіщення», не змінюючи перевірок і
+  коду (`Health/OrchestrationNoSlackSuppressesNotificationOnly`); відкладена
+  SFTP-перевірка дає `10`, а збій доставки — `70` з кроком «Сповіщення» `ERROR`
+  (`Health/OrchestrationResolvesWarningAndDeliveryFailureCodes`); ранні виходи
+  (вимкнений моніторинг `0`, небезпечний webhook `30`, недоступний `LOGS` через
+  права `36`) завершуються до перевірок (`Health/OrchestrationEarlyExitsSkipChecks`).
+  Продакшн-код не змінено.
+
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
   використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний
