@@ -694,7 +694,7 @@ Get-WinEvent -FilterHashtable @{LogName='System'; ProviderName='disk','Ntfs'} -M
 > - `rollback=FAILED` / «цілісність моделі НЕ встановлено» — **служби BRAVO
 >   свідомо НЕ піднято** (fail-closed), quiescence-маркер лишається suppressed;
 >   потрібне ручне відновлення MODEL із before-архіву
->   (`<ArchiveRoot>\MODEL\<prefix>_before_<timestamp>.mdz`) перед запуском служб.
+>   (`<BackupRoot>\MODEL\<prefix>_before_<timestamp>.mdz`) перед запуском служб.
 >
 > before-архів реставрації недоторканий до підтвердженої консистентності —
 > це ваша копія для ручного відкату. Самоперевірка реставрації

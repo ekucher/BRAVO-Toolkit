@@ -257,12 +257,14 @@ tasks.
 ще не було.
 
 Тому сервер запам'ятовує найвищу версію, яку на ньому запускали
-(`LOGS\BRAVO_VERSION_STATE.json`: `highestVersion`, `sourceCommit`,
-`recordedAt`), і відмовляється виконувати старішу. Свідомий відкат —
-через `BRAVO_ALLOW_DOWNGRADE=1`.
+(`highestVersion`, `sourceCommit`, `recordedAt` у
+`C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json` — каталог
+`CommonApplicationData`, а не `LOGS`), і відмовляється виконувати
+старішу. Свідомий відкат — через `BRAVO_ALLOW_DOWNGRADE=1`.
 
-Чесна межа: файл стану лежить поруч із логами, і той, хто має права
-підмінити комплект, зазвичай має права й видалити цей файл. Перевірка не
+Чесна межа: файл стану лежить поза комплектом, у звичайному каталозі
+стану, і той, хто має права підмінити комплект, зазвичай має права й
+видалити цей файл. Перевірка не
 робить відкат неможливим — вона робить його помітним і таким, що
 потребує ще однієї свідомої дії. Проти випадкового відкату (розгорнули не
 той архів) вона працює повністю. На відміну від маніфеста, пошкоджений
@@ -520,7 +522,7 @@ Credential Manager або необхідний міст до .NET/зовнішн
 `Invoke-BRAVOSevenZipExtraction` (`BRAVO.Compatibility`);
 `Test-SevenZipArchiveIntegrity` (`BRAVO.ArchiveHelpers`);
 `Read-SecretEntries`, `Restore-CredentialOperationSnapshots`
-(`BRAVO_CREDENTIALS_SETUP.ps1`); `Test-SftpReadOnlyAccess`,
+(`BRAVO_CREDENTIALS_SETUP.ps1`); `Test-SftpDestinationAccess`,
 `Test-SmbReadOnlyAccess` (`BRAVO_DRY_RUN.ps1`). Плюс три suppressions
 для **хибних спрацювань** правила на параметрах, чия назва містить
 «Credential», але які не є секретом (`$CredentialSettings`,

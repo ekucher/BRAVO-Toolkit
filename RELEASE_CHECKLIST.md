@@ -132,17 +132,20 @@ stdin, чи будь-яку іншу поведінку, що впливає н�
   `-ExecutionPolicy Bypass`.
 - Підписаний (GPG) git tag — теги анотовані, але не підписані.
 - Зібраний окремий release artifact (архів дистрибутиву з контрольною
-  сумою) — оновлення відбувається прямою заміною файлів комплекту, без
-  окремого артефакту.
+  сумою) — тепер існує: workflow `.github/workflows/release-artifact.yml`
+  на push тега `v*` збирає через `ci/New-BRAVOReleaseArtifact.ps1`
+  `BRAVO-Toolkit-X.Y.Z.zip`, `.zip.sha256` і `release-manifest.json` та
+  прикріплює їх до DRAFT Release лише після integrity-маніфестів,
+  `BRAVO_RUNTIME_GUARD.ps1` і повного `BRAVO_SELF_TEST.ps1` (деталі —
+  `BRAVO_SETUP.md`). Архів і маніфест не підписані (див. пункт вище).
 - Перевірка clean installation / update installation / rollback на
   реальному сервері перед релізом — не формалізована як обов'язковий
   крок; `BRAVO_SETUP.ps1 -ValidateOnly` і `BRAVO_DRY_RUN.ps1` дають
   часткову впевненість, але не замінюють реальний прогін.
 - Restore drill (`BRAVO_RESTORE_TEST.ps1`, аудит AUD-004/P0.4) — існує
-  (розділ 6.1 README.md), але НЕ входить до типового набору завдань
-  `BRAVO_TASKS_INSTALL.ps1` і не запускається автоматично при релізі;
-  його регулярний запуск (щотижня/щомісяця) — окреме завдання
-  Планувальника, яке треба додати вручну на кожному сервері.
+  (розділ 6.1 README.md) і з 5.3.0 входить до типового набору завдань
+  `BRAVO_TASKS_INSTALL.ps1` (`BRAVO_RESTORE_VERIFY`, щотижня), але не
+  запускається автоматично при релізі.
 
 ## 3. Після релізу
 

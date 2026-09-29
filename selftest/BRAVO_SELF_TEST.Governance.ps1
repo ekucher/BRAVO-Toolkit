@@ -2738,4 +2738,163 @@ Test-BRAVOCondition `
     finally {
         Remove-Item -LiteralPath $docLinkFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
+
+    # T027 (аудит 5.2.4): ідентифікатори й шляхи в `inline-коді` живої
+    # документації мусять існувати. Аудит знайшов у документах застарілі
+    # назви (перейменована функція, неіснуючий шлях); посилання-лінк їх не
+    # ловить, бо це не лінки. Перевіряється:
+    #  - функція: перше слово span-у має форму Verb-Noun із затвердженим
+    #    дієсловом (Get-Verb) і мусить бути визначена (function X) у
+    #    якомусь tracked .ps1/.psm1;
+    #  - шлях: span без пробілів і без <placeholder>/%VAR%/$var/wildcard,
+    #    не абсолютний; перевіряється, якщо закінчується на .ps1/.psm1/
+    #    .psd1/.md або починається з tracked-каталогу верхнього рівня
+    #    (modules/, ci/, docs/ ...). Він мусить бути tracked-файлом чи
+    #    каталогом; ім'я без каталогу — збіг з іменем будь-якого tracked-файлу.
+    # Runtime-шляхи (LOGS\, MANIFESTS\, *.json стану, BRAVO.config) не є
+    # файлами репозиторію й під правило не підпадають. Обсяг — лише живі
+    # документи; CHANGELOG, ROADMAP, docs/ (датовані evidence/runbook-и)
+    # і .claude/ — історичні, там старі назви доречні.
+    $docRefMarkdownPath = @(
+        'README.md', 'SECURITY.md', 'OPERATIONS.md', 'RELEASE_CHECKLIST.md',
+        'RELEASE_POLICY.md', 'THREAT_MODEL.md', 'BRAVO_SETUP.md', 'deploy/README.md'
+    )
+    # Навмисні зовнішні/історичні/runtime-посилання. Кожен новий запис —
+    # свідоме рішення; список має лишатись коротким.
+    $docRefAllowedFunction = @(
+        # Вбудовані cmdlet-и PowerShell / Defender (не визначаються в репо).
+        'Add-MpPreference', 'Get-Command', 'Get-Content', 'Get-Item',
+        'Get-MpComputerStatus', 'Import-Module', 'Invoke-Expression',
+        'New-ModuleManifest', 'Read-Host', 'Remove-Item', 'Rename-Item',
+        'Set-Content', 'Start-Transcript', 'Test-Path', 'Write-Error',
+        # Видалено в 5.2.3; README згадує в примітці про оновлення з 5.2.1/5.2.2.
+        'Merge-BRAVOArchiveSpaceCheckResults'
+    )
+    $docRefAllowedPath = @(
+        # Заплановано (ROADMAP P3.2a), ще не існує.
+        'BRAVO_UPDATE.ps1', 'modules/BRAVO.Update',
+        # Застарілі root-бібліотеки, які README велить видалити при оновленні.
+        'BRAVO_COMPATIBILITY.ps1', 'BRAVO_CREDENTIALS.ps1', 'BRAVO_HELPER_LOGGING.ps1',
+        'BRAVO_NOTIFICATION.ps1', 'BRAVO_ARCHIVE_HELPERS.ps1', 'BRAVO_ARCHIV_RUNTIME.ps1',
+        'BRAVO_SYSTEM_HELPERS.ps1',
+        # Evidence лежить в окремій гілці evidence/219c55b-rc4-devlims-acceptance-pass.
+        'docs/BRAVO_DATA_RESTORE_RC4_DEVLIMS_ACCEPTANCE_20260820.md',
+        # Генерується на кожному сервері при першому запуску (TOFU).
+        'Tools/TOOLS_INTEGRITY.json'
+    )
+
+    function Find-BRAVODocReferenceProblem {
+        param(
+            [string]$Root,
+            [string[]]$MarkdownPath,
+            [string[]]$KnownPath,
+            [string[]]$AllowedFunction,
+            [string[]]$AllowedPath,
+            [string[]]$Verb
+        )
+        $known = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $topDirs = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $baseNames = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        $defined = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($p in $KnownPath) {
+            $parts = $p.Split('/')
+            [void]$known.Add($p)
+            [void]$baseNames.Add($parts[$parts.Length - 1])
+            if ($parts.Length -gt 1) { [void]$topDirs.Add($parts[0]) }
+            for ($k = 1; $k -lt $parts.Length; $k++) {
+                [void]$known.Add(($parts[0..($k - 1)] -join '/'))
+            }
+            if ($p -match '\.ps(m)?1$') {
+                $source = [IO.File]::ReadAllText((Join-Path $Root $p), [Text.Encoding]::UTF8)
+                foreach ($fm in [regex]::Matches($source, '(?im)^\s*function\s+(?:global:|script:)?([A-Za-z]+-[A-Za-z0-9_]+)')) {
+                    [void]$defined.Add($fm.Groups[1].Value)
+                }
+            }
+        }
+        $verbSet = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($v in $Verb) { [void]$verbSet.Add($v) }
+        $allowedFn = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+        foreach ($a in $AllowedFunction) { [void]$allowedFn.Add($a) }
+        $allowedP = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
+        foreach ($a in $AllowedPath) { [void]$allowedP.Add($a) }
+
+        $problems = New-Object Collections.Generic.List[string]
+        foreach ($mdPath in $MarkdownPath) {
+            foreach ($entry in (Get-BRAVODocLinkLines -FullPath (Join-Path $Root $mdPath))) {
+                if ($entry.IsCode) { continue }
+                foreach ($span in [regex]::Matches($entry.Text, '(?<!`)`([^`]+)`(?!`)')) {
+                    $token = $span.Groups[1].Value.Trim()
+                    if ($token.Length -eq 0) { continue }
+                    $firstWord = ($token -split '\s+')[0]
+                    $fn = [regex]::Match($firstWord, '^([A-Z][a-z]+)-([A-Za-z][A-Za-z0-9]*)$')
+                    if ($fn.Success -and $verbSet.Contains($fn.Groups[1].Value)) {
+                        if (-not $defined.Contains($firstWord) -and -not $allowedFn.Contains($firstWord)) {
+                            $problems.Add(('{0}:{1}: функцію не визначено -> {2}' -f $mdPath, $entry.Number, $firstWord))
+                        }
+                        continue
+                    }
+                    if ($token -match '[\s<>*%?${}|"'']' -or $token -match '^[A-Za-z]:' -or
+                        $token.StartsWith('\\') -or $token.StartsWith('-')) { continue }
+                    $path = $token.Replace('\', '/')
+                    if ($path.StartsWith('./')) { $path = $path.Substring(2) }
+                    $path = $path.TrimEnd('/')
+                    if ($path.Length -eq 0) { continue }
+                    $isCodeFile = $path -match '[^/.][^/]*\.(ps1|psm1|psd1|md)$'
+                    $segments = $path.Split('/')
+                    $underRepoDir = ($segments.Length -gt 1 -and $topDirs.Contains($segments[0]))
+                    if (-not $isCodeFile -and -not $underRepoDir) { continue }
+                    if ($known.Contains($path) -or $allowedP.Contains($path)) { continue }
+                    if ($segments.Length -eq 1 -and $baseNames.Contains($path)) { continue }
+                    $problems.Add(('{0}:{1}: шлях не існує в репозиторії -> {2}' -f $mdPath, $entry.Number, $token))
+                }
+            }
+        }
+        return $problems.ToArray()
+    }
+
+    $docRefVerb = @(Get-Verb | ForEach-Object { [string]$_.Verb })
+    $docRefExisting = @($docRefMarkdownPath | Where-Object { $docLinkKnownPath -contains $_ })
+    $docRefProblems = @(Find-BRAVODocReferenceProblem -Root $root -MarkdownPath $docRefExisting `
+            -KnownPath $docLinkKnownPath -AllowedFunction $docRefAllowedFunction `
+            -AllowedPath $docRefAllowedPath -Verb $docRefVerb)
+    Test-BRAVOCondition `
+        -Condition ($docRefExisting.Count -eq $docRefMarkdownPath.Count -and $docRefProblems.Count -eq 0) `
+        -Name "Documentation/InlineReferencesResolve" `
+        -Failure ("застарілі функції/шляхи в документації (перевірено: {0}): {1}" -f ($docRefExisting -join ', '), ($docRefProblems -join ' | '))
+
+    # Негативний контроль для перевірки вище: фікстура з одним визначеним і
+    # одним невизначеним ім'ям функції, cmdlet-ом з allow-list, наявним і
+    # відсутнім шляхом та runtime-шляхами/placeholder-ами, які не
+    # перевіряються.
+    $docRefFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DOCREF_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $docRefFixtureModules = Join-Path $docRefFixtureRoot 'modules'
+        [void][IO.Directory]::CreateDirectory($docRefFixtureModules)
+        $utf8NoBomRef = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $docRefFixtureModules 'Fixture.psm1'),
+            "function Get-BRAVOFixtureDefined { }`n", $utf8NoBomRef)
+        [IO.File]::WriteAllText((Join-Path $docRefFixtureRoot 'README.md'), (@(
+                    '`Get-BRAVOFixtureDefined -Name x` і `Get-Content` та `modules\Fixture.psm1`, `Fixture.psm1`.',
+                    '`<BackupRoot>\MODEL\x.mdz`, `C:\ProgramData\BRAVO\State\s.json`, `LOGS\`, `.ps1`, `Config-V2`.',
+                    '```',
+                    '`Remove-BRAVOInsideFence`',
+                    '```',
+                    'Застаріле: `Test-SftpReadOnlyAccess`,',
+                    'і `modules/Missing.psm1`.'
+                ) -join "`n"), $utf8NoBomRef)
+        $docRefFixtureResult = @(Find-BRAVODocReferenceProblem -Root $docRefFixtureRoot `
+                -MarkdownPath @('README.md') -KnownPath @('README.md', 'modules/Fixture.psm1') `
+                -AllowedFunction @('Get-Content') -AllowedPath @() -Verb $docRefVerb)
+        $docRefExpected = @(
+            'README.md:6: функцію не визначено -> Test-SftpReadOnlyAccess',
+            'README.md:7: шлях не існує в репозиторії -> modules/Missing.psm1'
+        )
+        Test-BRAVOCondition `
+            -Condition (($docRefFixtureResult -join '|') -eq ($docRefExpected -join '|')) `
+            -Name "Documentation/InlineReferencesCheckIsMeaningful" `
+            -Failure ("перевірка inline-посилань на фікстурі мала дати [{0}], отримано [{1}]" -f ($docRefExpected -join ' | '), ($docRefFixtureResult -join ' | '))
+    }
+    finally {
+        Remove-Item -LiteralPath $docRefFixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

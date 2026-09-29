@@ -2,23 +2,36 @@
 
 ## Не випущено (developer)
 
-- **Відносні посилання в документації перевіряє self-test (T027).**
-  Нова перевірка `Documentation/RelativeLinksResolve` у фрагменті
-  Governance проходить усі tracked `*.md` і падає, якщо відносне
-  посилання веде на файл чи каталог, якого немає в репозиторії (регістр
-  значущий, як на GitHub), або на `#якір`, якого немає в цільовому
-  документі. Якорі будуються за правилами slug GitHub, включно з
-  кирилицею; враховуються ATX-заголовки та явні `<a name/id>`,
-  setext-заголовки — ні. Посилання зі схемою (`http:`, `https:`,
-  `mailto:`), fenced-блоки та inline-код не перевіряються. У повідомленні
-  про провал — `файл:рядок` кожного битого посилання. Негативний контроль
-  `Documentation/RelativeLinksCheckIsMeaningful` доводить на фікстурі, що
-  перевірка ловить биту ціль, битий якір і вихід за межі репозиторію.
+- **Документацію звірено з кодом, а self-test тепер ловить застарілі
+  посилання, назви функцій і шляхи (T027, аудит 5.2.4).** Виправлено
+  місця, де документи розходились із фактичною поведінкою:
+  - `SECURITY.md`: файл стану захисту від відкату версії лежить у
+    `C:\ProgramData\BRAVO\State\BRAVO_VERSION_STATE.json`, а не в
+    `LOGS`; у переліку suppressions функція SFTP-перевірки
+    `BRAVO_DRY_RUN.ps1` названа своєю поточною назвою
+    `Test-SftpDestinationAccess`.
+  - `OPERATIONS.md`: before-архів реставрації MODEL для ручного
+    відновлення шукайте в `<BackupRoot>\MODEL\`, а не в `<ArchiveRoot>`.
+  - `README.md`, розділ 8: таблиця завдань Планувальника перелічує всі
+    шість, які створює `BRAVO_TASKS_INSTALL.ps1`, а не три — додано
+    `BRAVO_RESTORE_VERIFY`, `BRAVO_RESTORE_RECOVERY` (лише профіль
+    робочого часу) і `BRAVO BAZA Synchronization` (лише з BAZA SFTP).
+  - `RELEASE_CHECKLIST.md`: release artifact (zip + `.sha256` +
+    `release-manifest.json`) уже збирає workflow `release-artifact`, а
+    restore drill уже входить до типового набору завдань — обидва пункти
+    більше не значаться неавтоматизованими.
 
-  Повторна перевірка на `e781b37` битих відносних посилань не виявила:
-  п'ять місць, названих аудитом (`SECURITY.md`, `OPERATIONS.md`,
-  `README.md`, `RELEASE_CHECKLIST.md`), посилань не містять, тож
-  документацію не змінено.
+  Нові перевірки у фрагменті Governance:
+  `Documentation/RelativeLinksResolve` — відносні посилання й `#якорі`
+  в усіх tracked `*.md` (slug за правилами GitHub, включно з кирилицею;
+  без `http:`/`https:`/`mailto:`); `Documentation/InlineReferencesResolve`
+  — імена функцій Verb-Noun і шляхи репозиторію в inline-коді живих
+  документів (`README.md`, `SECURITY.md`, `OPERATIONS.md`,
+  `RELEASE_CHECKLIST.md`, `RELEASE_POLICY.md`, `THREAT_MODEL.md`,
+  `BRAVO_SETUP.md`, `deploy/README.md`) мусять існувати в коді;
+  cmdlet-и, заплановані, історичні та runtime-файли — у короткому явному
+  allow-list. Обидві повідомляють `файл:рядок` і мають негативний
+  контроль на фікстурі.
 
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
