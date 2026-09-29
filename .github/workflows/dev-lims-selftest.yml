@@ -5,7 +5,10 @@ name: DEV-LIMS self-test
 # Це ДОДАТКОВИЙ acceptance-рівень: він не замінює звичайний CI (ci.yml).
 #
 # Модель довіри:
-# - Сам workflow береться з default branch (master), тобто з довіреного коду.
+# - Файл workflow має існувати в default branch (master), щоб workflow_dispatch
+#   був доступний, але прогін виконує версію файлу з ref, вказаного при
+#   dispatch. Реальний захист - перевірка актора (github.actor і
+#   github.triggering_actor == ekucher), а не походження файлу.
 # - Тестоване дерево - рівно той commit, SHA якого задано входом commit_sha.
 #   Ім'я гілки змінюване, тому acceptance прив'язується лише до exact SHA:
 #   після checkout фактичний HEAD звіряється з очікуваним, і за розбіжності

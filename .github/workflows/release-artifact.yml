@@ -155,18 +155,18 @@ jobs:
                           }
                           gh release download $tag --pattern $assetName --dir $verifyRoot
                           if ($LASTEXITCODE -ne 0) {
-                              Write-Host "::error::RELEASE_ASSET_IMMUTABILITY: не вдалося завантажити опублікований ассет '$assetName' тега '$tag' для звірки SHA-256"
+                              Write-Host "::error::RELEASE_ASSET_IMMUTABILITY: failed to download published asset '$assetName' of tag '$tag' for SHA-256 comparison"
                               exit 1
                           }
                           $publishedHash = (Get-FileHash -LiteralPath (Join-Path $verifyRoot $assetName) -Algorithm SHA256).Hash.ToUpperInvariant()
                           $builtHash = (Get-FileHash -LiteralPath $file -Algorithm SHA256).Hash.ToUpperInvariant()
                           if ($publishedHash -ne $builtHash) {
-                              [void]$mismatchedAssets.Add("$assetName (опубліковано $publishedHash, зібрано $builtHash)")
+                              [void]$mismatchedAssets.Add("$assetName (published $publishedHash, built $builtHash)")
                           }
                       }
 
                       if ($mismatchedAssets.Count -gt 0) {
-                          Write-Host "::error::RELEASE_ASSET_IMMUTABILITY: тег '$tag' уже опублікований, а перезбірка дала ІНШІ байти: $($mismatchedAssets -join '; '). Опублікований артефакт не замінюється. Якщо зміна навмисна - випустіть новий тег."
+                          Write-Host "::error::RELEASE_ASSET_IMMUTABILITY: tag '$tag' is already published and the rebuild produced DIFFERENT bytes: $($mismatchedAssets -join '; '). The published artifact is not replaced. If the change is intentional - release a new tag."
                           exit 1
                       }
 
@@ -177,11 +177,11 @@ jobs:
                           # name turns out to exist after all, the command fails
                           # instead of overwriting.
                           $absentArgs = $absentAssets.ToArray()
-                          Write-Host "RELEASE_ASSET_IMMUTABILITY: тег '$tag' опублікований; доливаються лише ВІДСУТНІ ассети: $(($absentArgs | ForEach-Object { Split-Path -Leaf $_ }) -join ', ')"
+                          Write-Host "RELEASE_ASSET_IMMUTABILITY: tag '$tag' is published; uploading only MISSING assets: $(($absentArgs | ForEach-Object { Split-Path -Leaf $_ }) -join ', ')"
                           gh release upload $tag @absentArgs
                           if ($LASTEXITCODE -ne 0) { exit 1 }
                       } else {
-                          Write-Host "RELEASE_ASSET_IMMUTABILITY: усі ассети опублікованого тега '$tag' збігаються за SHA-256 - заміна не потрібна (no-op)."
+                          Write-Host "RELEASE_ASSET_IMMUTABILITY: all assets of published tag '$tag' match by SHA-256 - no replacement needed (no-op)."
                       }
                   } finally {
                       Remove-Item -LiteralPath $verifyRoot -Recurse -Force -ErrorAction SilentlyContinue
