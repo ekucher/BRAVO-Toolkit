@@ -1,0 +1,193 @@
+name: DEV-LIMS self-test
+
+# Ручний прогін повного BRAVO_SELF_TEST.ps1 на self-hosted раннері DEV-LIMS
+# (Windows PowerShell 5.1 на реальному цільовому хості, а не windows-latest).
+# Це ДОДАТКОВИЙ acceptance-рівень: він не замінює звичайний CI (ci.yml).
+#
+# Модель довіри:
+# - Файл workflow має існувати в default branch (master), щоб workflow_dispatch
+#   був доступний, але прогін виконує версію файлу з ref, вказаного при
+#   dispatch. Реальний захист - перевірка актора (github.actor і
+#   github.triggering_actor == ekucher), а не походження файлу.
+# - Тестоване дерево - рівно той commit, SHA якого задано входом commit_sha.
+#   Ім'я гілки змінюване, тому acceptance прив'язується лише до exact SHA:
+#   після checkout фактичний HEAD звіряється з очікуваним, і за розбіжності
+#   self-test НЕ запускається.
+#
+# Безпека (репозиторій ПУБЛІЧНИЙ):
+# - Лише workflow_dispatch; жодних pull_request / push тригерів.
+# - Запуск і повторний запуск - лише власник (github.actor і
+#   github.triggering_actor == ekucher); для інших задача skipped.
+# - permissions: contents: read обмежує ЛИШЕ GITHUB_TOKEN. Код із
+#   репозиторію виконується на DEV-LIMS із правами облікового запису
+#   служби раннера - це окрема межа довіри (див. опис PR).
+# - Повний вивід self-test пишеться у локальний файл на DEV-LIMS
+#   (%ProgramData%\BRAVO-DevLimsAcceptance\<run>), а в публічну консоль
+#   задачі потрапляє лише підсумок: SHA, версія PowerShell, кількість
+#   PASS/FAIL, імена провалених перевірок (без повідомлень), exit code,
+#   тривалість. Лог НЕ вивантажується артефактом.
+# - Exit code self-test не маскується: ненульовий код - задача FAILED.
+# - checkout clean: true очищає лише робочу теку Git, а не стан хоста.
+# - Не змінює -Suite: прогін завжди повний канонічний.
+#
+# Раннер обирається за окремою custom-міткою dev-lims (плюс self-hosted,
+# Windows, X64), тож задача ніколи не потрапить на інший self-hosted раннер.
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: 'Exact 40-char commit SHA to test (required)'
+        required: true
+        type: string
+      pr:
+        description: 'PR number for the record (optional, digits only)'
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-lims-selftest
+  cancel-in-progress: false
+
+jobs:
+  self-test:
+    name: BRAVO_SELF_TEST.ps1 (DEV-LIMS)
+    if: >
+      github.repository == 'ekucher/BRAVO-Toolkit' &&
+      github.actor == 'ekucher' &&
+      github.triggering_actor == 'ekucher'
+    runs-on: [self-hosted, Windows, X64, dev-lims]
+    timeout-minutes: 120
+    env:
+      EXPECTED_SHA: ${{ inputs.commit_sha }}
+      PR_NUMBER: ${{ inputs.pr }}
+    steps:
+      - name: Validate inputs
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:EXPECTED_SHA -cnotmatch '^[0-9a-f]{40}$') {
+              Write-Host "::error::commit_sha must be a full 40-char lowercase hex SHA"
+              exit 1
+          }
+          if ($env:PR_NUMBER -and $env:PR_NUMBER -notmatch '^[0-9]{1,6}$') {
+              Write-Host "::error::pr must be digits only"
+              exit 1
+          }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.commit_sha }}
+          clean: true
+          persist-credentials: false
+
+      - name: Verify exact SHA
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $actualSha = (git rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $actualSha = $actualSha.Trim()
+          Write-Host ("PR:           " + $env:PR_NUMBER)
+          Write-Host ("Expected SHA: " + $env:EXPECTED_SHA)
+          Write-Host ("Actual SHA:   " + $actualSha)
+          if ($actualSha -cne $env:EXPECTED_SHA) {
+              Write-Host "::error::Checked-out SHA does not match expected SHA; self-test not started"
+              exit 1
+          }
+
+      - name: Full self-test (summary only in public log)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host ("PowerShell " + $PSVersionTable.PSVersion.ToString() + " / " + $PSVersionTable.PSEdition)
+          $logRoot = Join-Path $env:ProgramData 'BRAVO-DevLimsAcceptance'
+          if (-not (Test-Path -LiteralPath $logRoot)) {
+              [void][IO.Directory]::CreateDirectory($logRoot)
+              # Local log holds host details (user, computer, paths): only
+              # SYSTEM, Administrators and the runner account may read it.
+              & icacls.exe $logRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' ($env:USERNAME + ':(OI)(CI)F') | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::error::could not restrict ACL on the local log directory"
+                  exit 1
+              }
+          }
+          $runDir = Join-Path $logRoot ("run-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
+          [void][IO.Directory]::CreateDirectory($runDir)
+          $stdoutPath = Join-Path $runDir 'selftest.stdout.log'
+          $stderrPath = Join-Path $runDir 'selftest.stderr.log'
+          $selfTestPath = Join-Path (Get-Location).Path 'BRAVO_SELF_TEST.ps1'
+          $started = Get-Date
+          $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
+              -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $selfTestPath + '"'), '-NoPause') `
+              -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
+              -NoNewWindow -PassThru
+          $null = $process.Handle
+          $timedOut = -not $process.WaitForExit(110 * 60 * 1000)
+          if ($timedOut) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Null
+              [void]$process.WaitForExit(60000)
+          }
+          $duration = (Get-Date) - $started
+          $exitCode = $process.ExitCode
+          $helperLogs = Join-Path (Get-Location).Path 'LOGS\HELPERS'
+          if (Test-Path -LiteralPath $helperLogs) {
+              Copy-Item -Path (Join-Path $helperLogs '*') -Destination $runDir -Force
+          }
+          # The child shares this console, so its stdout uses the same OutputEncoding.
+          $lines = @([IO.File]::ReadAllLines($stdoutPath, [Console]::OutputEncoding))
+          $passCount = @($lines | Where-Object { $_ -match '^\[PASS\] ' }).Count
+          $failLines = @($lines | Where-Object { $_ -match '^\[FAIL\] ' })
+          # "[NEDOSTUPNO]" lines: count only, reasons describe host security posture.
+          $unavailableCount = @($lines | Where-Object { $_ -match '^\[\u041D\u0415\u0414\u041E\u0421\u0422\u0423\u041F\u041D\u041E\]' }).Count
+          $marker = '<none>'
+          foreach ($line in $lines) {
+              if ($line -match '^SELF-TEST (PASSED|FAILED: [0-9]+|PARTIAL)') { $marker = 'SELF-TEST ' + $Matches[1] }
+          }
+          $stopToken = [guid]::NewGuid().ToString('N')
+          Write-Host ("::stop-commands::" + $stopToken)
+          Write-Host ("Tested SHA:        " + $env:EXPECTED_SHA)
+          Write-Host ("Marker:            " + $marker)
+          Write-Host ("PASS count:        " + $passCount)
+          Write-Host ("FAIL count:        " + $failLines.Count)
+          Write-Host ("Unavailable count: " + $unavailableCount)
+          $printed = 0
+          foreach ($failLine in $failLines) {
+              if ($printed -ge 50) {
+                  Write-Host ("FAILED:            ... " + ($failLines.Count - $printed) + " more (see local log)")
+                  break
+              }
+              $failName = $failLine.Substring(7)
+              $separator = $failName.IndexOf(': ')
+              if ($separator -ge 0) { $failName = $failName.Substring(0, $separator) }
+              if ($failName -cmatch '^[A-Za-z0-9_./\[\]=()+ -]{1,120}$') {
+                  Write-Host ("FAILED:            " + $failName)
+              } else {
+                  Write-Host "FAILED:            <unparsed>"
+              }
+              $printed++
+          }
+          Write-Host ("Exit code:         " + $exitCode)
+          Write-Host ("Duration:          " + $duration.ToString('hh\:mm\:ss'))
+          Write-Host "Full log is kept on the runner host only (ProgramData\BRAVO-DevLimsAcceptance)."
+          Write-Host ("::" + $stopToken + "::")
+          if ($timedOut) {
+              Write-Host "::error::self-test timed out and was terminated"
+              exit 1
+          }
+          if ($null -eq $exitCode) {
+              Write-Host "::error::self-test exit code unavailable"
+              exit 1
+          }
+          if ($exitCode -ne 0) {
+              Write-Host ("::error::BRAVO_SELF_TEST.ps1 exited with code " + $exitCode)
+              exit 1
+          }
+          if ($failLines.Count -gt 0 -or $passCount -eq 0 -or $marker -ne 'SELF-TEST PASSED') {
+              Write-Host "::error::self-test exit code 0 but result markers are inconsistent"
+              exit 1
+          }

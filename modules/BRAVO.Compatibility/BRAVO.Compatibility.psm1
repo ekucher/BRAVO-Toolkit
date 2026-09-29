@@ -2534,11 +2534,20 @@ function Send-BRAVOWebhookNotification {
     # щоб надсилання сповіщення не перекривало смугу прогресу BRAVO.
     $ProgressPreference = 'SilentlyContinue'
 
-    # HTTP 429 (Too Many Requests) обмежений retry з пріоритетом на
-    # Retry-After: максимум 4 спроби сумарно (1 первинна + 3 повтори).
-    # Будь-яка інша помилка (не 429) прокидається одразу — без ретраю, як і
-    # раніше. Успішна відповідь після retry вважається тим самим успішним
-    # відправленням цього chunk — виклик далі не знає про кількість спроб.
+    # Transient HTTP-статуси мають обмежений retry: максимум 4 спроби
+    # сумарно (1 первинна + 3 повтори). Transient = 429 (Too Many Requests)
+    # і 500/502/503/504 — тимчасові збої сервера/проміжного шлюзу (Discord/
+    # Slack/Cloudflare-фронт), які зазвичай минають за секунди. НЕ transient:
+    # 501 (Not Implemented) і 505 (HTTP Version Not Supported) — постійна
+    # властивість endpoint'а, повтор дасть той самий результат; решта 5xx
+    # (506-511 тощо) і всі 4xx, крім 429, так само прокидаються одразу, як і
+    # мережеві збої без HTTP-статусу. Retry-After (з капом 30с) враховується
+    # для 429 і 503 — саме для них RFC 6585/9110 визначають цей заголовок;
+    # для 500/502/504 — фолбек 1с/2с/4с. Успішна відповідь після retry
+    # вважається тим самим успішним відправленням цього chunk — виклик далі
+    # не знає про кількість спроб.
+    $transientWebhookStatusCodes = @(429, 500, 502, 503, 504)
+    $retryAfterWebhookStatusCodes = @(429, 503)
     $maxWebhookAttempts = 4
     $webhookAttempt = 0
     $response = $null
@@ -2553,17 +2562,23 @@ function Send-BRAVOWebhookNotification {
             if ($null -ne $webResponse) {
                 try { $statusCode = [int]$webResponse.StatusCode } catch { $statusCode = $null }
             }
-            if ($statusCode -ne 429) {
+            if ($null -eq $statusCode -or $transientWebhookStatusCodes -notcontains $statusCode) {
                 throw
             }
             if ($webhookAttempt -ge $maxWebhookAttempts) {
-                # Оператор має бачити, що це саме rate limit і скільки спроб
+                # Оператор має бачити конкретний HTTP-статус і скільки спроб
                 # зроблено, а не генеричну помилку webhook.
-                throw "Webhook $Provider`: HTTP 429 після $maxWebhookAttempts спроб (rate limit не знято): $($_.Exception.Message)"
+                $exhaustionReason = if ($statusCode -eq 429) {
+                    "rate limit не знято"
+                } else {
+                    "сервер webhook тимчасово недоступний"
+                }
+                throw "Webhook $Provider`: HTTP $statusCode після $maxWebhookAttempts спроб ($exhaustionReason): $($_.Exception.Message)"
             }
 
             $retryAfterSeconds = $null
-            if ($null -ne $webResponse -and $null -ne $webResponse.Headers) {
+            if ($retryAfterWebhookStatusCodes -contains $statusCode -and
+                $null -ne $webResponse -and $null -ne $webResponse.Headers) {
                 $retryAfterRaw = $webResponse.Headers["Retry-After"]
                 if (-not [string]::IsNullOrWhiteSpace($retryAfterRaw)) {
                     # InvariantCulture: на uk-UA (десяткова кома) дробове
@@ -2591,7 +2606,7 @@ function Send-BRAVOWebhookNotification {
                 $retryAfterSeconds = [math]::Min(10, [math]::Pow(2, $webhookAttempt - 1))
             }
             $delaySeconds = $retryAfterSeconds + 0.25
-            Write-Verbose "Webhook $Provider повернув 429 (спроба $webhookAttempt/$maxWebhookAttempts); повтор через $delaySeconds сек."
+            Write-Verbose "Webhook $Provider повернув HTTP $statusCode (спроба $webhookAttempt/$maxWebhookAttempts); повтор через $delaySeconds сек."
             Start-Sleep -Milliseconds ([int][math]::Ceiling($delaySeconds * 1000))
         }
     }

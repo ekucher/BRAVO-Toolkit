@@ -1238,6 +1238,101 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             )) `
         -Name "Compatibility/ImportHasNoConsoleSideEffects" `
         -Failure "імпорт Compatibility не повинен змінювати global OutputEncoding"
+
+    # --- T030: TLS 1.2 вмикається АДИТИВНО в усіх production-точках ---
+    # Регресія: Maintenance/DataRestore runtime і dry-run webhook-перевірка
+    # ПРИСВОЮВАЛИ SecurityProtocol = 3072, мовчки вимикаючи вже ввімкнені
+    # протоколи (напр. Tls13/Tls11, задані хостом або іншим кодом процесу). Поведінковий
+    # тест: попередній прапор (Tls11 = 768, числом — як і 3072, бо старі
+    # .NET не мають імен) виставляється перед РЕАЛЬНИМ кодом увімкнення, а
+    # після нього мусять стояти і він, і Tls12. Оригінальне значення
+    # процесу відновлюється у finally. Кодові точки беруться з AST реальних
+    # файлів, а не з переписаної копії.
+    $tls12Flag = [int]3072
+    $tls12PriorFlag = [int]768
+    $tls12EnablementResults = @()
+    $tls12OriginalProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $tls12EnablementSites = @()
+        $tls12EnablementSites += New-Object PSObject -Property @{
+            Label = 'BRAVO.Compatibility::Enable-BRAVOTls12'
+            Code = { Enable-BRAVOTls12 }
+        }
+        foreach ($tls12RuntimeRelativePath in @(
+                'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
+                'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1')) {
+            $tls12RuntimeParseErrors = $null
+            $tls12RuntimeAst = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $root $tls12RuntimeRelativePath), [ref]$null, [ref]$tls12RuntimeParseErrors)
+            # Лише виклик у тілі скрипта (не всередині функції): саме він
+            # виконується на старті runtime перед webhook-ами. Тіло runtime
+            # обгорнуте зовнішнім try/finally, тому шукаємо не лише серед
+            # statement-ів верхнього рівня.
+            $tls12RuntimeCall = @($tls12RuntimeAst.FindAll({
+                        param($candidate)
+                        if (-not ($candidate -is [Management.Automation.Language.CommandAst]) -or
+                            $candidate.GetCommandName() -ne 'Enable-BRAVOTls12') { return $false }
+                        for ($tls12Parent = $candidate.Parent; $null -ne $tls12Parent; $tls12Parent = $tls12Parent.Parent) {
+                            if ($tls12Parent -is [Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+                        }
+                        return $true
+                    }, $true)) | Select-Object -First 1
+            $tls12EnablementSites += New-Object PSObject -Property @{
+                Label = $tls12RuntimeRelativePath
+                Code = if ($null -ne $tls12RuntimeCall) { [scriptblock]::Create($tls12RuntimeCall.Extent.Text) } else { $null }
+            }
+        }
+        $tls12DryRunParseErrors = $null
+        $tls12DryRunAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [ref]$null, [ref]$tls12DryRunParseErrors)
+        $tls12DryRunFunction = @($tls12DryRunAst.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $candidate.Name -eq 'Send-TestWebhookNotification'
+                }, $true)) | Select-Object -First 1
+        $tls12DryRunAssignment = $null
+        if ($null -ne $tls12DryRunFunction) {
+            $tls12DryRunAssignment = @($tls12DryRunFunction.Body.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                        $candidate.Left.Extent.Text -match '(?i)ServicePointManager\]::SecurityProtocol$'
+                    }, $true)) | Select-Object -First 1
+        }
+        $tls12EnablementSites += New-Object PSObject -Property @{
+            Label = 'BRAVO_DRY_RUN.ps1::Send-TestWebhookNotification'
+            Code = if ($null -ne $tls12DryRunAssignment) { [scriptblock]::Create($tls12DryRunAssignment.Extent.Text) } else { $null }
+        }
+
+        foreach ($tls12Site in $tls12EnablementSites) {
+            [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], $tls12PriorFlag)
+            $tls12Before = [int][Net.ServicePointManager]::SecurityProtocol
+            $tls12After = $null
+            if ($null -ne $tls12Site.Code) {
+                & $tls12Site.Code
+                $tls12After = [int][Net.ServicePointManager]::SecurityProtocol
+            }
+            $tls12EnablementResults += New-Object PSObject -Property @{
+                Label = $tls12Site.Label
+                Found = ($null -ne $tls12Site.Code)
+                Before = $tls12Before
+                After = $tls12After
+                Passed = (
+                    $null -ne $tls12Site.Code -and
+                    $tls12Before -eq $tls12PriorFlag -and
+                    ($tls12After -band $tls12PriorFlag) -eq $tls12PriorFlag -and
+                    ($tls12After -band $tls12Flag) -eq $tls12Flag
+                )
+            }
+        }
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $tls12OriginalProtocol
+    }
+    $tls12FailedSites = @($tls12EnablementResults | Where-Object { -not $_.Passed })
+    Test-BRAVOCondition `
+        -Condition ($tls12EnablementResults.Count -eq 4 -and $tls12FailedSites.Count -eq 0) `
+        -Name "Compatibility/Tls12EnablementPreservesExistingProtocols" `
+        -Failure ("кожна production-точка ввімкнення TLS 1.2 (Enable-BRAVOTls12, старт Maintenance/DataRestore runtime, dry-run webhook) мусить ДОДАВАТИ Tls12 (-bor), не затираючи вже ввімкнені протоколи; порушено: " +
+            (@($tls12FailedSites | ForEach-Object { "$($_.Label) (знайдено=$($_.Found), до=$($_.Before), після=$($_.After))" }) -join '; '))
     $staleHotfix = [pscustomobject]@{ InstalledOn = (Get-Date).AddDays(-400) }
     $stalePatchLevel = Get-BRAVOWindowsPatchLevelRecommendation `
         -InstalledHotfixes @($staleHotfix) `
@@ -5179,6 +5274,88 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Maintenance/SuccessWithWarningsRoutesToAlertsNotGeneral" `
         -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (:warning:) має маршрутизуватись через notificationSeverity=WARNING на ALERTS webhook, а не через SUCCESS на GENERAL (review finding #1: routing severity мав завжди збігатися з фактичним final status)"
+
+    # --- Maintenance (T015): блок "Виконано" успішного сповіщення
+    # (NotificationMode=all) будується через New-Object List[string], а не
+    # [T]::new() (PowerShell 5.0+; маніфести декларують 3.0). Регресія
+    # семантики колекції під Set-StrictMode 2.0: 0/1/багато рядків від
+    # New-BRAVOMaintenanceCompletedLines мають дійти в -Details рівно тим
+    # самим набором і порядком. Сам заборонений виклик ловить
+    # StaticAnalysis/NoStaticNewConstructorInProductionCode (Governance).
+    $completedLinesModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @('Send-FinalReport')
+    $completedLinesScenarios = @(
+        @{ Name = 'Zero'; Lines = @() },
+        @{ Name = 'One'; Lines = @('Виконано:') },
+        @{ Name = 'Many'; Lines = @('Виконано:', ':white_check_mark: Реставрація — за планом', ':floppy_disk: C: 100 ГБ') }
+    )
+    foreach ($completedLinesScenario in $completedLinesScenarios) {
+        $completedLinesCapture = & $completedLinesModule {
+            param([string[]]$ScenarioLines)
+            Set-StrictMode -Version 2.0
+            $script:SlackMode = "all"
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $NotificationProviderDisplayName = "STUB"
+            $script:capturedDetails = $null
+            $script:deliveredCount = 0
+            $LOG_DIR = "STUB-LOG-DIR"
+            $BravoMaintenanceEnabled = $true
+            $CheckSize = $false
+            $RangeIdMonitoringEnabled = $false
+            $traceOutputProcessed = $false
+            $exchangAPILogsProcessedCount = 0
+            $restoreCompletedAt = Get-Date
+            $script:scenarioCompletedLines = @($ScenarioLines)
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Get-BRAVOFiles { param($Path, $Filter) return @() }
+            function Get-MaintenanceMinimumFreeSpaceLines { return @() }
+            function Get-MaintenanceFreeSpaceInlineText { return ":floppy_disk: C: 100 ГБ · поріг: 20 ГБ" }
+            function New-BRAVOMaintenanceCompletedLines {
+                param($LastRestoreText, $FreeSpaceInlineText, $TraceCountText, $ExchangeCountText)
+                return $script:scenarioCompletedLines
+            }
+            function Format-BRAVOUkrainianCount { param([int]$Count, [string]$One, [string]$Few, [string]$Many) return "$Count" }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                return "general"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredCount++
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                $script:capturedDetails = @($Details)
+                return "TITLE=$Title"
+            }
+            function Get-BRAVOMaintenanceResolvedExitCode { return 0 }
+            function Get-BRAVOMaintenanceFinalStatus { param($ExitCode) return [pscustomobject]@{ Text = 'УСПІШНО' } }
+
+            Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+
+            [pscustomobject]@{
+                DeliveredCount = $script:deliveredCount
+                DetailsCount = @($script:capturedDetails).Count
+                DetailsJoined = (@($script:capturedDetails) -join '|')
+            }
+        } $completedLinesScenario.Lines
+        $expectedCompletedLines = @($completedLinesScenario.Lines)
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $completedLinesCapture -and
+                $completedLinesCapture.DeliveredCount -eq 1 -and
+                $completedLinesCapture.DetailsCount -eq $expectedCompletedLines.Count -and
+                $completedLinesCapture.DetailsJoined -eq ($expectedCompletedLines -join '|')
+            ) `
+            -Name "Maintenance/SuccessNotificationCompletedLines_$($completedLinesScenario.Name)" `
+            -Failure "успішне сповіщення (mode=all) мало передати в -Details $($expectedCompletedLines.Count) рядк(ів) '$($expectedCompletedLines -join '|')'; отримано: $(if ($null -eq $completedLinesCapture) { '<немає результату>' } else { '{0} доставлено, {1} рядк(ів) ''{2}''' -f $completedLinesCapture.DeliveredCount, $completedLinesCapture.DetailsCount, $completedLinesCapture.DetailsJoined })"
+    }
 
     # Модель release channel (P0.6 аудиту): developer -> development,
     # master/main -> stable. Перевірка навмисно не обов'язкова — release-пакет
@@ -18133,6 +18310,112 @@ function Write-BRAVOLog {
         ) `
         -Name 'Archive/EmbeddedHealthRemainsOneStep' `
         -Failure '''Перевірка резервних копій'' має рендеритись РІВНО один раз (один Write-BRAVOArchiveStep) незалежно від Invoke-BRAVOHealthCheck.Status — жодного вкладеного Health-виводу'
+
+    # --- Archive: -NoSlack прогону має доходити до вбудованого Health
+    # (T014). Поведінковий тест: РЕАЛЬНІ оператори з try-блоку Archive від
+    # `$healthParameters = @{` до виклику Invoke-BRAVOHealthCheck
+    # виконуються ізольовано (окремий New-Module) з підміненим
+    # Invoke-BRAVOHealthCheck, що фіксує фактично зв'язані параметри.
+    $archiveHealthNoSlackAst = [Management.Automation.Language.Parser]::ParseInput(
+        $archiveScriptText, [ref]$null, [ref]$null)
+    $archiveHealthTryAst = @(
+        $archiveHealthNoSlackAst.FindAll(
+            {
+                param($node)
+                $node -is [Management.Automation.Language.TryStatementAst] -and
+                $node.Body.Extent.Text.Contains('$healthParameters = @{') -and
+                $node.Body.Extent.Text.Contains('Invoke-BRAVOHealthCheck @healthParameters')
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    $archiveHealthBuildText = $null
+    if ($null -ne $archiveHealthTryAst) {
+        $archiveHealthBuildStatements = New-Object System.Collections.Generic.List[string]
+        $archiveHealthBuildStarted = $false
+        foreach ($archiveHealthStatement in $archiveHealthTryAst.Body.Statements) {
+            $archiveHealthStatementText = $archiveHealthStatement.Extent.Text
+            if ($archiveHealthStatementText.StartsWith('$healthParameters = @{')) {
+                $archiveHealthBuildStarted = $true
+            }
+            if ($archiveHealthBuildStarted) {
+                $archiveHealthBuildStatements.Add($archiveHealthStatementText)
+            }
+            if ($archiveHealthBuildStarted -and
+                $archiveHealthStatementText.Contains('Invoke-BRAVOHealthCheck @healthParameters')) {
+                break
+            }
+        }
+        if ($archiveHealthBuildStatements.Count -gt 0) {
+            $archiveHealthBuildText = $archiveHealthBuildStatements -join "`r`n"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $archiveHealthBuildText) `
+        -Name 'Archive/HealthParametersBlockFound' `
+        -Failure 'не знайдено try-блок Archive з `$healthParameters = @{ ... } і Invoke-BRAVOHealthCheck @healthParameters -- тест T014 потребує оновлення'
+    if ($null -ne $archiveHealthBuildText) {
+        $archiveHealthNoSlackScenarios = @(
+            @{ NoSlack = $true; Name = 'Archive/NoSlackPropagatedToEmbeddedHealth' }
+            @{ NoSlack = $false; Name = 'Archive/EmbeddedHealthDefaultWithoutNoSlackUnchanged' }
+        )
+        foreach ($archiveHealthNoSlackScenario in $archiveHealthNoSlackScenarios) {
+            $archiveHealthEvalModule = New-Module -ScriptBlock {}
+            $archiveHealthBound = & $archiveHealthEvalModule {
+                param($NoSlackValue, $BuildText)
+                $NoSlack = [switch]$NoSlackValue
+                $configPath = 'STUB-CONFIG-PATH'
+                $configPathWasExplicit = $false
+                $bravoScriptDirectory = 'STUB-RUNTIME-ROOT'
+                $backupMonitoring = @{ NotificationMode = 'errors_only'; NotifyOnSuccessAfterBackup = $false }
+                $transferResults = @{
+                    BAZA_APP = @{ Attempted = $false }
+                    BAZA_WWW = @{ Attempted = $false }
+                }
+                $script:bazaAppSyncResult = $null
+                $script:bazaWWWSyncResult = $null
+                $script:capturedHealthParameters = $null
+                function Test-Path { param([string]$LiteralPath, [string]$PathType) return $true }
+                function Import-Module { param([string]$Name, $ErrorAction) }
+                function Invoke-BRAVOHealthCheck {
+                    param(
+                        [string]$ConfigPath,
+                        [switch]$ForceNotification,
+                        [switch]$NotifyOnSuccess,
+                        [switch]$NoSlack,
+                        [switch]$SkipIfBackupTaskRunning,
+                        [string]$RuntimeRoot,
+                        [string]$EntryScriptPath,
+                        [hashtable]$BazaSyncResults,
+                        [bool]$ConfigPathWasExplicit = $false
+                    )
+                    $script:capturedHealthParameters = @{} + $PSBoundParameters
+                    return [pscustomobject]@{ Status = 'Healthy'; Notification = 'STUB' }
+                }
+                . ([scriptblock]::Create($BuildText))
+                return $script:capturedHealthParameters
+            } $archiveHealthNoSlackScenario.NoSlack $archiveHealthBuildText
+            Remove-Module -ModuleInfo $archiveHealthEvalModule -ErrorAction SilentlyContinue
+            if ($archiveHealthNoSlackScenario.NoSlack) {
+                $archiveHealthNoSlackOk = (
+                    $null -ne $archiveHealthBound -and
+                    $archiveHealthBound.ContainsKey('NoSlack') -and
+                    [bool]$archiveHealthBound['NoSlack']
+                )
+                $archiveHealthNoSlackFailure = 'Archive, запущений з -NoSlack, мусить передавати -NoSlack у Invoke-BRAVOHealthCheck -- інакше вбудований Health може надіслати повідомлення попри заборону оператора'
+            } else {
+                $archiveHealthNoSlackOk = (
+                    $null -ne $archiveHealthBound -and
+                    -not $archiveHealthBound.ContainsKey('NoSlack')
+                )
+                $archiveHealthNoSlackFailure = 'без -NoSlack Archive не має передавати NoSlack у Invoke-BRAVOHealthCheck -- поведінка за замовчуванням має лишитися незмінною'
+            }
+            Test-BRAVOCondition `
+                -Condition $archiveHealthNoSlackOk `
+                -Name $archiveHealthNoSlackScenario.Name `
+                -Failure $archiveHealthNoSlackFailure
+        }
+    }
 
     # --- Health: "План перевірок" рендериться ЛИШЕ у самостійному запуску
     # (не при SuppressHeader — вбудований виклик з Archive) і через
