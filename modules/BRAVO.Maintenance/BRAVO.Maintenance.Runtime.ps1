@@ -1294,6 +1294,45 @@ function Get-BRAVOMaintenanceFinalStatus {
     }
 }
 
+# Облік exit-коду дочірнього BRAVO_ARCHIV (архівація після maintenance).
+# Раніше будь-який ненульовий код, включно з 10 (SuccessWithWarnings —
+# архів створено, але з попередженнями), логувався як ERROR і виставляв
+# $script:criticalErrorOccurred, тож Maintenance завершувався кодом 60
+# (MaintenanceFailed) за успішної архівації. Класифікація — за назвою коду
+# з BRAVO.ExitCodes (Get-BRAVOExitCodeName), без власної числової таблиці:
+#   Success             -> SUCCESS, без деталей;
+#   SuccessWithWarnings -> WARNING (інкрементує $script:BRAVOWarningCount,
+#                          тож операція стає WARN, а прогін — 10), не critical;
+#   будь-що інше (і $null) -> ERROR + $script:criticalErrorOccurred, як і раніше.
+# Повертає текст Details для операції 'Архівація після maintenance' або $null.
+function Register-BRAVOMaintenanceArchiveChildResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$ExitCode
+    )
+
+    # $null не приводиться до [int] (це дало б 0 = Success): невідомий код
+    # дочірнього процесу лишається помилкою, як і в попередній перевірці -eq 0.
+    $exitCodeName = if ($null -eq $ExitCode) { $null } else { Get-BRAVOExitCodeName -Code ([int]$ExitCode) }
+    switch ($exitCodeName) {
+        'Success' {
+            Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 успішно виконано" -Level "SUCCESS"
+            return $null
+        }
+        'SuccessWithWarnings' {
+            $exitCodeText = "{0} — {1}" -f $ExitCode, $exitCodeName
+            Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з попередженнями (код $exitCodeText); деталі — у журналі BRAVO_ARCHIV" -Level "WARNING"
+            return "BRAVO_ARCHIV завершився з попередженнями (код $exitCodeText)"
+        }
+        default {
+            Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з кодом помилки: $ExitCode" -Level "ERROR"
+            $script:criticalErrorOccurred = $true
+            return "BRAVO_ARCHIV завершився з кодом $ExitCode"
+        }
+    }
+}
+
 # ЄДИНА канонічна точка обліку результату етапу — і лічильники підсумкового
 # блоку РЕЗУЛЬТАТ, і журнал для фінального сповіщення. Викликається з ОБОХ
 # рендерів: Write-BRAVOMaintenanceStep (пронумеровані [N/Total]) і
@@ -10339,13 +10378,9 @@ if ($script:EnableArchiveAfterMaintenance) {
                 -PassThru `
                 -NoNewWindow
 
-            if ($archivProcess.ExitCode -eq 0) {
-                Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 успішно виконано" -Level "SUCCESS"
-            } else {
-                Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з кодом помилки: $($archivProcess.ExitCode)" -Level "ERROR"
-                $script:criticalErrorOccurred = $true
-                $archiveOperationDetail = "BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"
-            }
+            # 0 -> SUCCESS; 10 (SuccessWithWarnings) -> WARNING, не critical;
+            # інше -> ERROR + critical (див. Register-BRAVOMaintenanceArchiveChildResult).
+            $archiveOperationDetail = Register-BRAVOMaintenanceArchiveChildResult -ExitCode $archivProcess.ExitCode
         } else {
             Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 не знайдено за шляхом: $bravoArchivePath" -Level "ERROR"
             $script:criticalErrorOccurred = $true
