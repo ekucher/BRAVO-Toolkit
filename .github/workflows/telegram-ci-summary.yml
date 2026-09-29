@@ -33,7 +33,7 @@ jobs:
   telegram-ci-summary:
     name: Telegram CI summary
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 65
     env:
       GH_TOKEN: ${{ github.token }}
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
