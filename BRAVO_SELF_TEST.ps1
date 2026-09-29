@@ -13625,6 +13625,373 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         }
     }
 
+    # ================================================================
+    # T006 (рішення власника 2026-09-29): успіх 7-Zip ЛИШЕ через legacy
+    # BOM-у-паролі fallback більше не мовчазний — WARNING з іменем архіву,
+    # код завершення щонайменше 10 (SuccessWithWarnings) і РІВНО одне
+    # сповіщення на прогін з переліком архівів. Процесний шар 7-Zip
+    # (Invoke-BRAVOSevenZip*Core у BRAVO.Compatibility) підмінено стабом:
+    # «legacy*»-архіви відкриваються лише паролем із U+FEFF-префіксом
+    # (перша спроба — "Wrong password"), «normal*» — з першої спроби. Уся
+    # решта ланцюга (fallback-логіка Compatibility, ArchiveHelpers,
+    # runtime-функції Maintenance/Archive) — справжній production-код.
+    # ================================================================
+    Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    Import-Module -Name (Join-Path $root "modules\BRAVO.ExitCodes\BRAVO.ExitCodes.psd1") -Force -ErrorAction Stop
+    # Фікстурне значення складається з частин (той самий прийом проти
+    # entropy-евристики gitleaks, що в RestoreSynthetic); нікуди не пишеться.
+    $t006Secret = @('t006', 'legacy', 'bom', 'fixture') -join '-'
+    $t006BomChar = [string][char]0xFEFF
+    try {
+        & (Get-Module -Name 'BRAVO.Compatibility') {
+            function script:New-BRAVOT006StubSevenZipResult {
+                param([string]$ArchivePath, [string]$Secret)
+                $leaf = Split-Path -Path $ArchivePath -Leaf
+                # Ordinal-перевірка першого символу: культурна StartsWith
+                # ігнорує U+FEFF (ignorable) і дала б true для будь-якого рядка.
+                $hasBomPrefix = $Secret.Length -gt 0 -and $Secret[0] -eq [char]0xFEFF
+                $opened = if ($leaf -like 'legacy*') { $hasBomPrefix } else { -not $hasBomPrefix }
+                if ($opened) {
+                    return New-Object PSObject -Property @{
+                        Success = $true; ExitCode = 0; Description = 'OK'; TimedOut = $false
+                        StandardOutput = 'Everything is Ok'; StandardError = ''; Error = $null
+                    }
+                }
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2; Description = 'Fatal error'; TimedOut = $false
+                    StandardOutput = ''
+                    StandardError = "ERROR: Data Error in encrypted file. Wrong password? : payload.txt"
+                    Error = $null
+                }
+            }
+            function script:Invoke-BRAVOSevenZipIntegrityTestCore {
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                    'PSAvoidUsingPlainTextForPassword', 'Password',
+                    Justification = 'Self-test стаб процесного шару 7-Zip: той самий контракт параметрів, що production-ядро; значення фікстурне.')]
+                param([string]$SevenZipPath, [string]$ArchivePath, [string]$Password, [int]$TimeoutSeconds)
+                return New-BRAVOT006StubSevenZipResult -ArchivePath $ArchivePath -Secret $Password
+            }
+            function script:Invoke-BRAVOSevenZipExtractionCore {
+                [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                    'PSAvoidUsingPlainTextForPassword', 'Password',
+                    Justification = 'Self-test стаб процесного шару 7-Zip: той самий контракт параметрів, що production-ядро; значення фікстурне.')]
+                param([string]$SevenZipPath, [string]$ArchivePath, [string]$Password, [string]$ExtractDirectory, [int]$TimeoutSeconds)
+                return New-BRAVOT006StubSevenZipResult -ArchivePath $ArchivePath -Secret $Password
+            }
+        }
+
+        # --- ArchiveHelpers: канонічна реєстрація fallback-у.
+        $t006LogEntries = New-Object System.Collections.Generic.List[object]
+        $t006Logger = { param($Message, $Level) $t006LogEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006Collector = New-Object 'System.Collections.Generic.List[string]'
+        $t006HelperResults = @()
+        foreach ($t006ArchiveName in @('legacy_MODEL.7z', 'legacy_BLOG.7z', 'legacy_MODEL.7z')) {
+            $t006HelperResults += [bool](Test-SevenZipArchiveIntegrity `
+                -SevenZipPath 'stub-7za' `
+                -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) $t006ArchiveName) `
+                -Password $t006Secret `
+                -Logger $t006Logger `
+                -LegacyBomFallbackCollector $t006Collector)
+        }
+        $t006FallbackWarnings = @($t006LogEntries | Where-Object { $_.Level -eq 'WARNING' })
+        Test-BRAVOCondition `
+            -Condition (
+                (@($t006HelperResults | Where-Object { $_ }).Count -eq 3) -and
+                $t006Collector.Count -eq 2 -and
+                $t006Collector.Contains('legacy_MODEL.7z') -and
+                $t006Collector.Contains('legacy_BLOG.7z') -and
+                $t006FallbackWarnings.Count -eq 3 -and
+                ($t006FallbackWarnings[0].Message -match 'legacy_MODEL\.7z') -and
+                ($t006FallbackWarnings[1].Message -match 'legacy_BLOG\.7z')
+            ) `
+            -Name "LegacyBomFallback/IntegrityHelperWarnsAndCollectsEachArchiveOnce" `
+            -Failure "Test-SevenZipArchiveIntegrity на fallback-успіху має лишати bool-контракт (true), писати WARNING з іменем архіву і реєструвати ім'я в колекторі прогону рівно один раз; results=$($t006HelperResults -join ','), collector=$($t006Collector -join ','), warnings=$($t006FallbackWarnings.Count)"
+        Test-BRAVOCondition `
+            -Condition ($t006FallbackWarnings.Count -gt 0 -and -not ($t006FallbackWarnings[0].Message -match '5\.2\.0 під UTF-8|до 5\.2\.0')) `
+            -Name "LegacyBomFallback/WarningDoesNotClaimPre520Only" `
+            -Failure "Текст попередження має існувати й не стверджувати, що такі архіви створені лише версіями до 5.2.0 (BOM-префікс давали й 5.2.x): $(@($t006FallbackWarnings | ForEach-Object { $_.Message }) -join ' | ')"
+
+        $t006NormalEntries = New-Object System.Collections.Generic.List[object]
+        $t006NormalLogger = { param($Message, $Level) $t006NormalEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006NormalCollector = New-Object 'System.Collections.Generic.List[string]'
+        $t006NormalResult = Test-SevenZipArchiveIntegrity `
+            -SevenZipPath 'stub-7za' `
+            -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'normal_MODEL.7z') `
+            -Password $t006Secret `
+            -Logger $t006NormalLogger `
+            -LegacyBomFallbackCollector $t006NormalCollector
+        Test-BRAVOCondition `
+            -Condition (
+                $t006NormalResult -eq $true -and
+                $t006NormalCollector.Count -eq 0 -and
+                @($t006NormalEntries | Where-Object { $_.Level -eq 'WARNING' }).Count -eq 0
+            ) `
+            -Name "LegacyBomFallback/NormalSuccessStaysSilent" `
+            -Failure "Звичайний успіх 7z t (без fallback) не повинен давати WARNING чи запис у колектор"
+
+        # Розпакування (DataRestore / Restore Drill): той самий канонічний
+        # реєстратор над результатом Invoke-BRAVOSevenZipExtraction.
+        $t006ExtractionCollector = New-Object 'System.Collections.Generic.List[string]'
+        $t006ExtractionEntries = New-Object System.Collections.Generic.List[object]
+        $t006ExtractionLogger = { param($Message, $Level) $t006ExtractionEntries.Add([pscustomobject]@{ Message = [string]$Message; Level = [string]$Level }) }.GetNewClosure()
+        $t006LegacyExtraction = Invoke-BRAVOSevenZipExtraction `
+            -SevenZipPath 'stub-7za' `
+            -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'legacy_BAZA.7z') `
+            -Password $t006Secret `
+            -ExtractDirectory ([IO.Path]::GetTempPath())
+        $t006NormalExtraction = Invoke-BRAVOSevenZipExtraction `
+            -SevenZipPath 'stub-7za' `
+            -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'normal_BAZA.7z') `
+            -Password $t006Secret `
+            -ExtractDirectory ([IO.Path]::GetTempPath())
+        $t006LegacyRegistered = Register-BRAVOLegacyBomPasswordFallback `
+            -Result $t006LegacyExtraction `
+            -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'legacy_BAZA.7z') `
+            -Collector $t006ExtractionCollector `
+            -Logger $t006ExtractionLogger
+        $t006NormalRegistered = Register-BRAVOLegacyBomPasswordFallback `
+            -Result $t006NormalExtraction `
+            -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) 'normal_BAZA.7z') `
+            -Collector $t006ExtractionCollector `
+            -Logger $t006ExtractionLogger
+        Test-BRAVOCondition `
+            -Condition (
+                [bool]$t006LegacyExtraction.Success -and $t006LegacyRegistered -eq $true -and
+                [bool]$t006NormalExtraction.Success -and $t006NormalRegistered -eq $false -and
+                $t006ExtractionCollector.Count -eq 1 -and $t006ExtractionCollector[0] -eq 'legacy_BAZA.7z' -and
+                @($t006ExtractionEntries | Where-Object { $_.Level -eq 'WARNING' -and $_.Message -match 'legacy_BAZA\.7z' }).Count -eq 1
+            ) `
+            -Name "LegacyBomFallback/ExtractionFallbackRegisteredOnce" `
+            -Failure "Register-BRAVOLegacyBomPasswordFallback має реєструвати fallback-успіх розпакування (WARNING + колектор) і ігнорувати звичайний успіх; legacy=$t006LegacyRegistered, normal=$t006NormalRegistered, collector=$($t006ExtractionCollector -join ',')"
+
+        # Перелік у сповіщенні обмежений; підказка українською.
+        $t006ManyNames = @(1..12 | ForEach-Object { "legacy_{0:D2}.7z" -f $_ })
+        $t006Lines = @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames $t006ManyNames)
+        $t006LinesText = $t006Lines -join "`n"
+        $t006EmptyLines = @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames @())
+        Test-BRAVOCondition `
+            -Condition (
+                $t006LinesText.Contains('legacy_01.7z') -and $t006LinesText.Contains('legacy_10.7z') -and
+                -not $t006LinesText.Contains('legacy_11.7z') -and $t006LinesText.Contains('та ще 2') -and
+                $t006LinesText.Contains('12') -and $t006LinesText.Contains('Що зробити') -and
+                $t006EmptyLines.Count -eq 0
+            ) `
+            -Name "LegacyBomFallback/NotificationListIsBoundedWithRemediation" `
+            -Failure "Get-BRAVOLegacyBomFallbackNotificationLines має показувати не більше 10 імен + 'та ще N', загальну кількість і підказку 'Що зробити'; порожній вхід -> 0 рядків. Отримано: $t006LinesText"
+
+        # --- Maintenance: справжні Write-Log (лічильник WARNING),
+        # Get-BRAVOMaintenanceResolvedExitCode, Test-BRAVOMaintenanceSevenZipArchiveIntegrity,
+        # Add-BRAVOMaintenanceLegacyBomFallbackAlert, Send-SlackAlert, Send-FinalReport.
+        $t006MaintenanceSource = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"), [Text.Encoding]::UTF8)
+        $t006MaintenanceModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $t006MaintenanceSource `
+            -FunctionNames @(
+                'Write-Log', 'Get-BRAVOMaintenanceResolvedExitCode',
+                'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+                'Add-BRAVOMaintenanceLegacyBomFallbackAlert',
+                'Send-SlackAlert', 'Send-FinalReport'
+            )
+        $t006MaintenanceScenario = {
+            param([string[]]$ArchiveNames, [string]$Secret)
+            & $t006MaintenanceModule {
+                param($ArchiveNamesInner, $SecretInner)
+                $script:ArchivePassword = $SecretInner
+                $SevenZipIntegrityTestTimeoutSeconds = 60
+                $script:BRAVOWarningCount = 0
+                $script:criticalErrorOccurred = $false
+                $script:restoreArchiveFailed = $false
+                $script:restoreIntegrityFailed = $false
+                $script:restoreFailed = $false
+                $script:CriticalErrors = $false
+                $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+                $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+                $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+                $script:SlackMode = 'errors_only'
+                $script:LogLevel = 'INFO'
+                $script:NotificationWebhookUrls = @{ alerts = 'STUB-ALERTS-URL'; general = 'STUB-GENERAL-URL' }
+                $script:ScriptStartTime = Get-Date
+                $consoleSettings = @{ ConsoleLevel = 'FATAL'; ShowTimestampsInConsole = $false }
+                $bravoSettings = @{ NotificationRouting = @{} }
+                $LOG_FILE = 'STUB-LOG-PATH'
+                $NotificationProviderDisplayName = 'STUB'
+                $script:t006LogFileEntries = New-Object System.Collections.Generic.List[string]
+                $script:t006Delivered = New-Object System.Collections.Generic.List[object]
+                function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+                function Write-BRAVOConsoleMessage { param($Message, $Level) }
+                function Write-BRAVOMaintenanceLogFile { param([AllowEmptyString()][string]$Entry) $script:t006LogFileEntries.Add($Entry) }
+                function Resolve-BRAVONotificationRoute {
+                    param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                    if ($NotificationMode -eq 'none') { return 'none' }
+                    if ($Severity -eq 'SUCCESS') { if ($NotificationMode -eq 'errors_only') { return 'none' }; return 'general' }
+                    return 'alerts'
+                }
+                function Invoke-NotificationWebhook {
+                    param([string]$Message, [string]$WebhookUrl)
+                    $script:t006Delivered.Add([pscustomobject]@{ Message = $Message; WebhookUrl = $WebhookUrl })
+                }
+                function New-MaintenanceNotificationMessage {
+                    param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                    return "SEVERITY=$Severity|DETAILS=$($Details -join ';')"
+                }
+                foreach ($archiveName in $ArchiveNamesInner) {
+                    [void](Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
+                        -SevenZipPath 'stub-7za' `
+                        -ArchivePath (Join-Path ([IO.Path]::GetTempPath()) $archiveName))
+                }
+                $exitCode = Get-BRAVOMaintenanceResolvedExitCode
+                Add-BRAVOMaintenanceLegacyBomFallbackAlert
+                Send-FinalReport -LOG_FILE $LOG_FILE
+                [pscustomobject]@{
+                    ExitCode = $exitCode
+                    Delivered = @($script:t006Delivered.ToArray())
+                    LogText = ($script:t006LogFileEntries.ToArray() -join "`n")
+                }
+            } $ArchiveNames $Secret
+        }
+        $t006MaintLegacy = & $t006MaintenanceScenario -ArchiveNames @('legacy_before_1.7z', 'legacy_before_2.7z', 'legacy_before_1.7z', 'normal_after.7z') -Secret $t006Secret
+        $t006MaintNormal = & $t006MaintenanceScenario -ArchiveNames @('normal_before.7z', 'normal_after.7z') -Secret $t006Secret
+        $t006MaintDeliveredText = if ($t006MaintLegacy.Delivered.Count -gt 0) { [string]$t006MaintLegacy.Delivered[0].Message } else { '' }
+        Test-BRAVOCondition `
+            -Condition ($t006MaintLegacy.ExitCode -eq (Resolve-BRAVOExitCode -HasWarnings)) `
+            -Name "LegacyBomFallback/MaintenanceEscalatesToSuccessWithWarnings" `
+            -Failure "Maintenance із fallback-архівами має резолвити SuccessWithWarnings; отримано $($t006MaintLegacy.ExitCode)"
+        Test-BRAVOCondition `
+            -Condition (
+                $t006MaintLegacy.Delivered.Count -eq 1 -and
+                $t006MaintDeliveredText.Contains('SEVERITY=WARNING') -and
+                $t006MaintDeliveredText.Contains('legacy_before_1.7z') -and
+                $t006MaintDeliveredText.Contains('legacy_before_2.7z') -and
+                -not $t006MaintDeliveredText.Contains('normal_after.7z') -and
+                [string]$t006MaintLegacy.Delivered[0].WebhookUrl -eq 'STUB-ALERTS-URL'
+            ) `
+            -Name "LegacyBomFallback/MaintenanceSendsExactlyOneNotificationPerRun" `
+            -Failure "Maintenance має надіслати РІВНО одне WARNING-сповіщення на прогін з обома legacy-архівами (і без normal); delivered=$($t006MaintLegacy.Delivered.Count), text=$t006MaintDeliveredText"
+        Test-BRAVOCondition `
+            -Condition (
+                $t006MaintLegacy.LogText.Contains('legacy_before_2.7z') -and
+                -not $t006MaintLegacy.LogText.Contains($t006Secret) -and
+                -not $t006MaintDeliveredText.Contains($t006Secret) -and
+                -not $t006MaintLegacy.LogText.Contains($t006BomChar)
+            ) `
+            -Name "LegacyBomFallback/MaintenanceNeverLogsPassword" `
+            -Failure "Журнал/сповіщення Maintenance мають називати архів, але ніколи не містити пароль чи BOM-префіксований пароль"
+        Test-BRAVOCondition `
+            -Condition ($t006MaintNormal.ExitCode -eq 0 -and $t006MaintNormal.Delivered.Count -eq 0) `
+            -Name "LegacyBomFallback/MaintenanceNormalSuccessStaysExit0" `
+            -Failure "Maintenance без fallback має лишатись exit 0 без сповіщення (errors_only); exit=$($t006MaintNormal.ExitCode), delivered=$($t006MaintNormal.Delivered.Count)"
+
+        # --- Archive: справжня Send-BRAVOArchiveLegacyBomFallbackAlert над
+        # $results Main (ключ LegacyBomPasswordFallbackUsed лише у тих, хто
+        # пройшов через fallback). Код 10 в Archive дає WARNING-запис
+        # (Logger -> Write-BRAVOLog, статистика журналу; перевірено вище як
+        # Level=WARNING).
+        $t006ArchiveSource = [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+        $t006ArchiveModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $t006ArchiveSource `
+            -FunctionNames @('Send-BRAVOArchiveLegacyBomFallbackAlert')
+        $t006ArchiveScenario = {
+            param([hashtable]$Results, [bool]$NoSlackValue)
+            & $t006ArchiveModule {
+                param($ResultsInner, $NoSlackInner)
+                $NoSlack = $NoSlackInner
+                $ScriptBuildId = 'stub-build'
+                $script:notificationMode = 'errors_only'
+                $script:notificationProvider = 'discord'
+                $script:notificationProviderDisplayName = 'STUB'
+                $script:notificationRequestTimeoutSeconds = 5
+                $script:logFile = 'STUB-LOG'
+                $backupMonitoring = @{
+                    InstitutionName = 'STUB'; InstitutionCode = '000'
+                    NotificationRouting = @{}; NotificationCredentialTargets = @{}
+                }
+                $script:t006ArchiveSent = New-Object System.Collections.Generic.List[object]
+                function Write-BRAVOLog { param($Component, $Message, $Level) }
+                function Get-HostInformation { return 'STUB-HOST' }
+                function Protect-BRAVOLogSecret { param([string]$Text) return $Text }
+                function New-BRAVOOperatorNotificationMessage {
+                    param($Severity, $Operation, $ActionText, $InstitutionName, $InstitutionCode, $HostInformation,
+                        [string[]]$ResultLines, $Timestamp, $ProductName, $Version, $BuildId, $LogPath, $LogLabel)
+                    return "SEVERITY=$Severity|LINES=$($ResultLines -join ';')"
+                }
+                function Send-BRAVONotification {
+                    param($Severity, $Message, $Provider, $NotificationMode, $RoutingTable, $CredentialTargets, $TimeoutSeconds)
+                    $script:t006ArchiveSent.Add([pscustomobject]@{ Severity = [string]$Severity; Message = [string]$Message })
+                }
+                Send-BRAVOArchiveLegacyBomFallbackAlert -Results $ResultsInner
+                @($script:t006ArchiveSent.ToArray())
+            } $Results $NoSlackValue
+        }
+        $t006ArchiveResults = @{
+            MODEL = @{ ArchiveSuccess = $true; ArchivePath = 'D:\Backup\MODEL\legacy_MODEL_20260929.7z'; LegacyBomPasswordFallbackUsed = $true }
+            BLOG = @{ ArchiveSuccess = $true; ArchivePath = 'D:\Backup\BLOG\legacy_BLOG_20260929.7z'; LegacyBomPasswordFallbackUsed = $true }
+            BAZA = @{ ArchiveSuccess = $true; ArchivePath = 'D:\Backup\BAZA\normal_BAZA_20260929.7z' }
+        }
+        $t006ArchiveSentLegacy = @(& $t006ArchiveScenario -Results $t006ArchiveResults -NoSlackValue $false)
+        $t006ArchiveSentNormal = @(& $t006ArchiveScenario -Results @{ BAZA = @{ ArchiveSuccess = $true; ArchivePath = 'D:\Backup\BAZA\normal_BAZA_20260929.7z' } } -NoSlackValue $false)
+        $t006ArchiveSentNoSlack = @(& $t006ArchiveScenario -Results $t006ArchiveResults -NoSlackValue $true)
+        $t006ArchiveSentText = if ($t006ArchiveSentLegacy.Count -gt 0) { [string]$t006ArchiveSentLegacy[0].Message } else { '' }
+        Test-BRAVOCondition `
+            -Condition (
+                $t006ArchiveSentLegacy.Count -eq 1 -and
+                [string]$t006ArchiveSentLegacy[0].Severity -eq 'WARNING' -and
+                $t006ArchiveSentText.Contains('legacy_MODEL_20260929.7z') -and
+                $t006ArchiveSentText.Contains('legacy_BLOG_20260929.7z') -and
+                -not $t006ArchiveSentText.Contains('normal_BAZA_20260929.7z') -and
+                $t006ArchiveSentNormal.Count -eq 0 -and
+                $t006ArchiveSentNoSlack.Count -eq 0
+            ) `
+            -Name "LegacyBomFallback/ArchiveSendsExactlyOneNotificationPerRun" `
+            -Failure "Archive має надіслати РІВНО одне WARNING-сповіщення на прогін з усіма fallback-архівами; без fallback чи з -NoSlack — жодного; legacy=$($t006ArchiveSentLegacy.Count), normal=$($t006ArchiveSentNormal.Count), noslack=$($t006ArchiveSentNoSlack.Count), text=$t006ArchiveSentText"
+    } catch {
+        Test-BRAVOCondition `
+            -Condition $false `
+            -Name "LegacyBomFallback/ScenarioCompleted" `
+            -Failure "T006-сценарій legacy BOM fallback впав: $($_.Exception.Message)"
+    } finally {
+        # Прибрати стаби процесного шару для решти self-test.
+        Import-Module -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") -Force -ErrorAction Stop
+        Import-Module -Name (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psd1") -Force -ErrorAction Stop
+    }
+
+    # Прокидання сигналу в кожен entrypoint, чий головний потік не можна
+    # виконати в self-test (inline Main): додатковий текстовий guard проти
+    # регресії — поведінку канонічних частин перевірено вище.
+    $t006ArchiveRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $t006DataRestoreRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"), [Text.Encoding]::UTF8)
+    $t006RestoreDrillText = [IO.File]::ReadAllText(
+        (Join-Path $root "BRAVO_RESTORE_TEST.ps1"), [Text.Encoding]::UTF8)
+    Test-BRAVOCondition `
+        -Condition (
+            $t006ArchiveRuntimeText.Contains('-LegacyBomFallbackCollector $legacyBomFallbackArchives') -and
+            $t006ArchiveRuntimeText.Contains('$result.LegacyBomPasswordFallbackUsed = [bool]$creationResult.LegacyBomPasswordFallbackUsed') -and
+            $t006ArchiveRuntimeText.Contains('$results[$archive.Type].LegacyBomPasswordFallbackUsed = $true') -and
+            ([regex]::Matches($t006ArchiveRuntimeText, [regex]::Escape('Send-BRAVOArchiveLegacyBomFallbackAlert -Results $results')).Count -eq 1)
+        ) `
+        -Name "LegacyBomFallback/ArchiveRuntimePropagatesSignal" `
+        -Failure "Archive: New-Archive має передавати колектор у Test-SevenZipArchiveIntegrity, результат — нести LegacyBomPasswordFallbackUsed до `$results, а Main — рівно раз викликати Send-BRAVOArchiveLegacyBomFallbackAlert"
+    Test-BRAVOCondition `
+        -Condition (
+            $t006DataRestoreRuntimeText.Contains('-LegacyBomFallbackCollector $script:dataRestoreLegacyBomFallbackArchives') -and
+            $t006DataRestoreRuntimeText.Contains('-Result $extractionResult') -and
+            $t006DataRestoreRuntimeText.Contains('-HasWarnings:($script:dataRestoreWarningCount -gt 0 -or $script:dataRestoreLegacyBomFallbackArchives.Count -gt 0)') -and
+            $t006DataRestoreRuntimeText.Contains('Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames @($script:dataRestoreLegacyBomFallbackArchives)')
+        ) `
+        -Name "LegacyBomFallback/DataRestoreRuntimePropagatesSignal" `
+        -Failure "DataRestore: 7z t і 7z x мають реєструвати fallback у колекторі прогону, колектор — піднімати HasWarnings (код 10), а перелік — іти в єдине фінальне сповіщення"
+    Test-BRAVOCondition `
+        -Condition (
+            $t006RestoreDrillText.Contains('-LegacyBomFallbackCollector $legacyBomFallbackArchives') -and
+            $t006RestoreDrillText.Contains('-Result $extractionResult') -and
+            $t006RestoreDrillText.Contains("Add-RestoreDrillResult WARN 'Legacy BOM-пароль'")
+        ) `
+        -Name "LegacyBomFallback/RestoreDrillPropagatesSignal" `
+        -Failure "Restore drill: 7z t і 7z x мають реєструвати fallback, а після циклу — один WARN-результат (код 10 і перелік у єдиному сповіщенні drill)"
+
     $restoreTestScriptText = [IO.File]::ReadAllText(
         (Join-Path $root "BRAVO_RESTORE_TEST.ps1"),
         [Text.Encoding]::UTF8
