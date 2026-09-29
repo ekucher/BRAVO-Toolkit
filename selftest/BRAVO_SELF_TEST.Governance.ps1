@@ -2770,6 +2770,31 @@ Test-BRAVOCondition `
             }
             return '<script>'
         }
+        # Ланцюг охоплюючих функцій від найближчої до зовнішньої і '<script>'.
+        # Після T010 великі частини runtime живуть усередині обгортки
+        # Invoke-BRAVO<X> (вкладені функції читають її змінні за динамічним
+        # scope): пошук лише в найближчій функції та '<script>' пропускав би
+        # @($список) із вкладеної функції, де список створено в обгортці.
+        # Параметр вкладеної функції з тим самим ім'ям затіняє змінну обгортки:
+        # далі вгору по ланцюгу такий пошук не йде (типи параметрів
+        # розбирає окрема гілка прохода 4).
+        $hasSource = {
+            param($Sources, $Node, [string]$NormalizedName)
+            $parentNode = $Node.Parent
+            while ($null -ne $parentNode) {
+                if ($parentNode -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+                    if ($Sources.ContainsKey($parentNode.Name + '|' + $NormalizedName)) { return $true }
+                    $declaredParameters = @()
+                    if ($null -ne $parentNode.Body.ParamBlock) { $declaredParameters += @($parentNode.Body.ParamBlock.Parameters) }
+                    if ($null -ne $parentNode.Parameters) { $declaredParameters += @($parentNode.Parameters) }
+                    foreach ($declaredParameter in $declaredParameters) {
+                        if ((& $getNormalizedName $declaredParameter.Name.VariablePath.UserPath) -eq $NormalizedName) { return $false }
+                    }
+                }
+                $parentNode = $parentNode.Parent
+            }
+            return $Sources.ContainsKey('<script>|' + $NormalizedName)
+        }
         $unwrapExpression = {
             param($Node)
             $current = $Node
@@ -2826,7 +2851,7 @@ Test-BRAVOCondition `
                     if ($rightNode -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
                     $rightScope = & $getScopeName $assignment
                     $rightName = & $getNormalizedName $rightNode.VariablePath.UserPath
-                    if (-not ($Unit.Sources.ContainsKey($rightScope + '|' + $rightName) -or $Unit.Sources.ContainsKey('<script>|' + $rightName))) { continue }
+                    if (-not (& $hasSource $Unit.Sources $assignment $rightName)) { continue }
                     $leftPath = $assignment.Left.VariablePath.UserPath
                     $leftScope = if ($leftPath -match '^(script|global):') { '<script>' } else { $rightScope }
                     $aliasKey = $leftScope + '|' + (& $getNormalizedName $leftPath)
@@ -2841,7 +2866,7 @@ Test-BRAVOCondition `
                 if ($commaTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
                 $commaScope = & $getScopeName $commaNode
                 $commaName = & $getNormalizedName $commaTarget.VariablePath.UserPath
-                if ($commaScope -ne '<script>' -and ($unit.Sources.ContainsKey($commaScope + '|' + $commaName) -or $unit.Sources.ContainsKey('<script>|' + $commaName))) {
+                if ($commaScope -ne '<script>' -and (& $hasSource $unit.Sources $commaNode $commaName)) {
                     $wrappedListFunctions[$commaScope.ToLowerInvariant()] = $true
                 }
             }
@@ -2905,7 +2930,7 @@ Test-BRAVOCondition `
                     if ($argumentValue -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
                     $argumentScope = & $getScopeName $commandNode
                     $argumentName = & $getNormalizedName $argumentValue.VariablePath.UserPath
-                    if ($unit.Sources.ContainsKey($argumentScope + '|' + $argumentName) -or $unit.Sources.ContainsKey('<script>|' + $argumentName)) {
+                    if (& $hasSource $unit.Sources $commandNode $argumentName) {
                         [void]$listArguments.Add([pscustomobject]@{
                             Callee = ($commandName -replace '^.*\\', '').ToLowerInvariant()
                             Parameter = $parameterName
@@ -2931,7 +2956,7 @@ Test-BRAVOCondition `
                 $sinkScope = & $getScopeName $arrayNode
                 $sinkName = & $getNormalizedName $wrappedNode.VariablePath.UserPath
                 $reason = $null
-                if ($unit.Sources.ContainsKey($sinkScope + '|' + $sinkName) -or $unit.Sources.ContainsKey('<script>|' + $sinkName)) {
+                if (& $hasSource $unit.Sources $arrayNode $sinkName) {
                     $reason = 'змінна тримає New-Object List[object]'
                 } elseif ($sinkScope -ne '<script>' -and $parameterTypes.ContainsKey($sinkScope.ToLowerInvariant()) -and
                     $parameterTypes[$sinkScope.ToLowerInvariant()].ContainsKey($sinkName)) {
@@ -2995,14 +3020,20 @@ function Get-SafeTypedParameter([object[]]$Items) { return @($Items) }
 function Invoke-SafeTypedParameter { $items = New-Object System.Collections.Generic.List[object]; Get-SafeTypedParameter -Items $items }
 function Get-SafePsObjectList { $items = New-Object System.Collections.Generic.List[psobject]; return @($items) }
 function Get-SafeCommand { return @(Get-LocalForm) }
+function Invoke-RuntimeWrapper { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedForm { return @($items) }; return $null }
+function Invoke-RuntimeWrapper2 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedParam($Items) { return @($Items) }; Get-NestedParam -Items $items }
+function Invoke-RuntimeWrapper3 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedSafe { return @($items.ToArray()) }; return $null }
+function Invoke-RuntimeWrapper4 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedTyped([object[]]$Items) { return @($Items) }; Get-NestedTyped -Items $items }
+function Invoke-RuntimeWrapper5 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedAlias { $copy = $items; return @($copy) }; return $null }
+function Invoke-RuntimeWrapper6 { $items = New-Object System.Collections.Generic.List[object]; function Get-NestedObj([object]$Items) { return @($Items) }; Get-NestedObj -Items $items }
 '@
     $binderGateFixtureFindings = Find-BRAVOObjectListArraySubexpression -Source @(
         [pscustomobject]@{ Name = 'fixture'; Text = $binderGateFixture })
     $binderGateFixtureLines = @($binderGateFixtureFindings | ForEach-Object { [int](($_ -split ':')[1]) } | Sort-Object)
     Test-BRAVOCondition `
-        -Condition (($binderGateFixtureLines -join ',') -eq '2,3,4,5,8') `
+        -Condition (($binderGateFixtureLines -join ',') -eq '2,3,4,5,8,14,15,18,19') `
         -Name "Governance/GenericObjectListBinderGuardIsMeaningful" `
-        -Failure ("detector binder-гейту має знаходити рівно рядки 2,3,4,5,8 синтетичної фікстури " +
+        -Failure ("detector binder-гейту має знаходити рівно рядки 2,3,4,5,8,14,15,18,19 синтетичної фікстури (14-19 — форми всередині обгортки Invoke-BRAVO<X> після T010) " +
             "(небезпечні форми) і не знаходити безпечні; фактично: " +
             $(if ($binderGateFixtureFindings.Count -gt 0) { $binderGateFixtureFindings -join '; ' } else { '<нічого>' }))
 }
