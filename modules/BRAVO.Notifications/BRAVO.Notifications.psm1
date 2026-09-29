@@ -761,6 +761,14 @@ function Send-BRAVONotification {
 
         [int]$TimeoutSeconds = 30,
 
+        # BRAVO-T023: частина runtime трактує ненастроєний webhook як
+        # штатний пропуск (WARNING у журналі, результат операції не
+        # змінюється), а збій доставки — як окрему подію. Із цим перемикачем
+        # збій Resolve-BRAVONotificationEndpoint не кидає, а повертає
+        # Sent = $false і Reason = 'EndpointUnavailable' (з -PassThru), тож
+        # викликач розрізняє ці випадки без власної копії конвеєра.
+        [switch]$SkipWhenEndpointUnavailable,
+
         [switch]$PassThru
     )
 
@@ -778,7 +786,23 @@ function Send-BRAVONotification {
         return $null
     }
 
-    $webhookUrl = Resolve-BRAVONotificationEndpoint -Provider $Provider -Route $route -CredentialTargets $CredentialTargets
+    try {
+        $webhookUrl = Resolve-BRAVONotificationEndpoint -Provider $Provider -Route $route -CredentialTargets $CredentialTargets
+    } catch {
+        if (-not $SkipWhenEndpointUnavailable) {
+            throw
+        }
+        if ($PassThru) {
+            return [pscustomobject]@{
+                Sent = $false
+                Route = $route
+                Reason = 'EndpointUnavailable'
+                ChunkCount = 0
+                EndpointError = [string]$_.Exception.Message
+            }
+        }
+        return $null
+    }
     $chunks = ConvertTo-BRAVONotificationPayloadText -Provider $Provider -Message $Message
     Send-BRAVONotificationChunks -Provider $Provider -WebhookUrl $webhookUrl -MessageChunks $chunks -TimeoutSeconds $TimeoutSeconds
 
