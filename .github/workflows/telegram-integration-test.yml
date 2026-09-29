@@ -69,7 +69,7 @@ jobs:
       # Decodes to: checkmark BRAVO-Toolkit / blank line / test-tube
       # GitHub Actions -> Telegram / Ukrainian: "Test message delivered
       # successfully." See the "Message encoding" note above.
-      TELEGRAM_MESSAGE: "\u2705 BRAVO-Toolkit\n\n\ud83e\uddea GitHub Actions \u2192 Telegram\n\u0422\u0435\u0441\u0442\u043e\u0432\u0435 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f \u0443\u0441\u043f\u0456\u0448\u043d\u043e \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e."
+      TELEGRAM_MESSAGE: "\u2705 BRAVO-Toolkit\n\n\U0001F9EA GitHub Actions \u2192 Telegram\n\u0422\u0435\u0441\u0442\u043e\u0432\u0435 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f \u0443\u0441\u043f\u0456\u0448\u043d\u043e \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e."
     steps:
       - name: Validate required secrets are present
         shell: bash
