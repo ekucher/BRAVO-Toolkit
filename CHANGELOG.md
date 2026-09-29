@@ -16,6 +16,16 @@
   `StaticAnalysis/SecurityProtocolAssignmentsAreAdditive` блокує пряме
   присвоєння `[Net.ServicePointManager]::SecurityProtocol` у production-коді.
 
+  **Обмеження (свідомо прийняте рішення власника).** Раніше ці два runtime
+  примусово залишали в процесі лише TLS 1.2. Тепер вони лише додають
+  TLS 1.2, тож протоколи, які хост уже вмикає за замовчуванням, лишаються
+  дозволеними. На старих хостах .NET 4.5/4.6 без `SchUseStrongCrypto`
+  дефолт — `Ssl3, Tls`, тому SSL 3.0 і TLS 1.0 там лишаються ввімкненими
+  для HTTPS-з'єднань Maintenance і DataRestore. Практичний ризик низький:
+  endpoints сповіщень і Operations приймають лише TLS 1.2+, тож з'єднання
+  все одно встановлюється по TLS 1.2. Щоб прибрати застарілі протоколи на
+  такому хості, увімкніть `SchUseStrongCrypto` у реєстрі .NET Framework.
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися
