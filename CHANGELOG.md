@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+- **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
+  `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
+  ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
+  канонічного `<RuntimeRoot>\Tools\TOOLS_MANIFEST.json`, вважається послабленням захисту
+  і в режимі `Enforce` блокує запуск, як і `toolIntegritySettings.Mode`. Сьогодні цей ключ
+  не можна перевизначити через конфігурацію (його завжди виводить
+  `Resolve-BRAVOConfigurationDerivation`), тому на наявних серверах поведінка не
+  змінюється; перевірка захищає від майбутньої регресії, за якої підмінений 7-Zip чи
+  WinSCP пройшов би перевірку цілісності проти чужого маніфесту. Нові self-test
+  перевірки: `ConfigLoader/ToolManifestPathRedirectionBlocks`,
+  `ConfigLoader/ToolManifestPathCanonicalAllowed`.
+
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
   використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний

@@ -1530,6 +1530,55 @@ Test-BRAVOCondition `
     -Name "ConfigLoader/ToolIntegrityModeWeakenedBlocks" `
     -Failure "ефективний `$global:toolIntegritySettings.Mode = 'Warn' (замість 'Enforce') МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants навіть якщо ця canary-гілка сьогодні недосяжна звичайним raw-override-шляхом; отримано: $toolIntegrityWeakenedResult"
 
+# --- ConfigLoader/ToolManifestPathRedirectionBlocks та
+# ConfigLoader/ToolManifestPathCanonicalAllowed (BRAVO-T001, аудит F001):
+# toolIntegritySettings.ManifestPath, як і Mode, виводиться канонічно
+# (<toolsPath>\TOOLS_MANIFEST.json) і не є raw-configurable. Canary-гілка
+# Test-BRAVOEffectiveSecurityInvariants блокує будь-яке інше значення —
+# перенаправлений маніфест тихо легітимізував би підмінений бінарник у
+# Enforce. Негативний і позитивний випадки викликають функцію НАПРЯМУ
+# (той самий паттерн, що ToolIntegrityModeWeakenedBlocks вище), щоб
+# довести саму гілку, а не лише те, що derivation сьогодні її не досягає.
+$toolManifestProbeToolsPath = Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_T001_RUNTIME\Tools'
+$toolManifestProbeToolsLiteral = $toolManifestProbeToolsPath.Replace("'", "''")
+$toolManifestProbePrefix = (
+    "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+    "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
+    "`$global:requireAdministrator = `$true; " +
+    "`$global:toolsPath = '$toolManifestProbeToolsLiteral'; "
+)
+$toolManifestRedirectedProbeCommand = (
+    $toolManifestProbePrefix +
+    "`$global:toolIntegritySettings = @{ Mode = 'Enforce'; ManifestPath = 'C:\Attacker\TOOLS_MANIFEST.json' }; " +
+    "Test-BRAVOEffectiveSecurityInvariants; 'NO-THROW' } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolManifestRedirectedResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestRedirectedProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition (
+        $toolManifestRedirectedResult.StartsWith('THREW') -and
+        $toolManifestRedirectedResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -and
+        $toolManifestRedirectedResult.Contains("toolIntegritySettings.ManifestPath = 'C:\Attacker\TOOLS_MANIFEST.json'")
+    ) `
+    -Name "ConfigLoader/ToolManifestPathRedirectionBlocks" `
+    -Failure "ефективний toolIntegritySettings.ManifestPath поза <toolsPath>\TOOLS_MANIFEST.json МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants; отримано: $toolManifestRedirectedResult"
+
+$toolManifestCanonicalProbeCommand = (
+    $toolManifestProbePrefix +
+    "`$global:toolIntegritySettings = @{ Mode = 'Enforce'; ManifestPath = (Join-Path `$global:toolsPath 'TOOLS_MANIFEST.json') }; " +
+    "Test-BRAVOEffectiveSecurityInvariants; 'NO-THROW' } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolManifestCanonicalResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestCanonicalProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition ($toolManifestCanonicalResult -eq 'NO-THROW') `
+    -Name "ConfigLoader/ToolManifestPathCanonicalAllowed" `
+    -Failure "канонічний toolIntegritySettings.ManifestPath (<toolsPath>\TOOLS_MANIFEST.json) не повинен блокуватись; отримано: $toolManifestCanonicalResult"
+
 # ============================================================
 # Issue #216, Wave 2 review-фікс: backupMonitoring.SFTP.BAZA.Mode/
 # .MutationPolicy — owner-decision листи, для яких DENY_SECURITY_CONTROL
