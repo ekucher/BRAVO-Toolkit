@@ -12333,6 +12333,8 @@ $traceArchiveAddParams = @()
 $traceSftpRemoteDirectory = 'self-test'
 $NativeCommandTimeoutSeconds = 1
 $SevenZipIntegrityTestTimeoutSeconds = 1
+# T006: колектор legacy BOM-fallback, який читає фінальний звіт Maintenance.
+$script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
 $RAW_SOURCE_GRACE_DAYS = 1
 '@
         $maintenanceOrchestrationProbeScript = @'
