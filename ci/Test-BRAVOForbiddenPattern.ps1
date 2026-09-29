@@ -217,6 +217,26 @@ foreach ($file in $files) {
     }
 }
 
+# Статичний конструктор `[T]::new(...)` (PowerShell 5.0+) у production-коді.
+# Маніфести модулів декларують PowerShellVersion = '3.0'; на 3.0/4.0 такий
+# виклик падає лише під час виконання, тож у рідкісній гілці (реальний
+# випадок: успішне сповіщення Maintenance при NotificationMode=all)
+# дефект невидимий, доки гілка не спрацює. Окремо від $forbiddenRules,
+# бо рядкове правило тут дає хибні спрацювання на коментарях і рядкових
+# літералах — пошук іде за AST (Find-BRAVOStaticNewInvocation).
+# Набір файлів — Get-BRAVOProductionPowerShellFile (analyzable-набір без
+# self-test-у); цей скрипт сам у ньому, але містить `::new` лише в
+# коментарях, тож AST-пошук його не зачіпає.
+$staticNewScannedCount = 0
+foreach ($productionFile in @(Get-BRAVOProductionPowerShellFile -Root $Root)) {
+    $staticNewScannedCount++
+    foreach ($invocation in @(Find-BRAVOStaticNewInvocation -LiteralPath $productionFile.FullName)) {
+        Write-Host "::error file=$($invocation.Path),line=$($invocation.Line)::Заборонений патерн (статичний конструктор ::new(), потрібен PowerShell 5.0+; використовуйте New-Object): $($invocation.Text)"
+        $violationCount++
+    }
+}
+Write-Host "Статичний конструктор ::new(): перевірено production-файлів: $staticNewScannedCount."
+
 if ($violationCount -gt 0) {
     Write-Host "::error::Знайдено заборонених патернів: $violationCount. Ці конструкції не мають легітимного застосування в цьому репозиторії."
     exit 1
