@@ -16824,6 +16824,19 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
     $lockBudgetArchiveResult = $null
     $lockBudgetMaintenanceResult = $null
     $lockBudgetRunError = $null
+    # New-Module матеріалізує заглушки у Function:-drive цієї сесії (див.
+    # $script:BRAVOSelfTestOwnedRuntimeModules). Кидаючий Start-Sleep і
+    # німі Write-Log/Write-BRAVOLog не повинні пережити цей тест: інакше
+    # кожен наступний Start-Sleep у self-test падає з SELFTEST-SLEEP.
+    $lockBudgetStubNames = @('Start-Sleep', 'Write-BRAVOLog', 'Write-Log')
+    $lockBudgetPriorFunctions = @{}
+    foreach ($lockBudgetStubName in $lockBudgetStubNames) {
+        $lockBudgetPriorItem = Get-Item -LiteralPath "function:$lockBudgetStubName" -ErrorAction SilentlyContinue
+        if ($null -ne $lockBudgetPriorItem) {
+            $lockBudgetPriorFunctions[$lockBudgetStubName] = $lockBudgetPriorItem.ScriptBlock
+        }
+    }
+    $lockBudgetModule = $null
     try {
         [void](New-Item -ItemType Directory -Path $lockBudgetRoot -Force -ErrorAction Stop)
         $lockBudgetLockPath = Join-Path $lockBudgetRoot 'BRAVO_OPERATION.lock'
@@ -16858,6 +16871,17 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
     } finally {
         if ($null -ne $lockBudgetHolder) { $lockBudgetHolder.Dispose() }
         Remove-Item -LiteralPath $lockBudgetRoot -Recurse -Force -ErrorAction SilentlyContinue
+        if ($null -ne $lockBudgetModule) {
+            foreach ($lockBudgetStubName in $lockBudgetStubNames) {
+                $lockBudgetLeakedItem = Get-Item -LiteralPath "function:$lockBudgetStubName" -ErrorAction SilentlyContinue
+                if ($null -ne $lockBudgetLeakedItem -and $lockBudgetLeakedItem.ModuleName -eq $lockBudgetModule.Name) {
+                    Remove-Item -LiteralPath "function:$lockBudgetStubName" -Force -ErrorAction Stop
+                    if ($lockBudgetPriorFunctions.ContainsKey($lockBudgetStubName)) {
+                        Set-Item -LiteralPath "function:$lockBudgetStubName" -Value $lockBudgetPriorFunctions[$lockBudgetStubName]
+                    }
+                }
+            }
+        }
     }
     Test-BRAVOCondition `
         -Condition (
