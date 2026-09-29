@@ -169,7 +169,9 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 
 **Чого не робити.** Не вписувати пароль у `BRAVO.local.config` (чи в
 legacy `BRAVO.config`). Секрети в конфігурацію не записуються ніколи
-(SECURITY.md, розділ 3).
+(SECURITY.md, розділ 3), і runtime їх звідти не читає — єдине джерело
+секретів Credential Manager; повний порядок джерел — README.md, розділ 4,
+підрозділ «Пріоритет джерел секретів і параметрів установи».
 
 **Діагностика.**
 

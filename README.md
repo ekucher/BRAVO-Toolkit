@@ -517,10 +517,63 @@ preflight: перевірка вільного місця».
 | `BRAVO_SLACK_ALERTS_URL` | Slack webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
 | `BRAVO_DISCORD_GENERAL_URL` | Discord webhook — лише штатні (SUCCESS) сповіщення |
 | `BRAVO_DISCORD_ALERTS_URL` | Discord webhook — попередження й помилки (WARNING/ERROR/CRITICAL) |
+| `BRAVO_OPERATIONS_BOOTSTRAP_SECRET` | bootstrap-секрет enrollment BSYSTEM Operations |
+| `BRAVO_OPERATIONS_API_KEY` | API-ключ BSYSTEM Operations (записує сам runtime після enrollment) |
 
-Значення `InstitutionName`, `InstitutionCode` і `ArchivePrefix` у
-`BRAVO.config` — лише fallback для першого запуску. Після налаштування
-використовуються записи Credential Manager.
+### Пріоритет джерел секретів і параметрів установи
+
+Це канонічний опис порядку; `SECURITY.md` і `OPERATIONS.md` посилаються
+сюди, а не повторюють його.
+
+**Credential Manager завжди має пріоритет над `BRAVO.local.config`** (і над
+legacy `BRAVO.config`). Читається сховище того облікового запису, від якого
+запущено процес: адміністратора — для ручних запусків, `SYSTEM` — для
+завдань Планувальника (див. нижче про `-StoreFor Both`).
+
+**Секрети** — пароль архівів, SFTP- і SMB-логін/пароль, webhook-и
+Slack/Discord, секрети BSYSTEM Operations — мають **єдине** джерело:
+Windows Credential Manager. Альтернативного джерела немає: змінні середовища,
+`BRAVO.local.config`, legacy `BRAVO.config` і аргументи командного рядка
+секретів не постачають. Конфігурація визначає лише **ім'я** запису:
+
+1. `credentialSettings.Targets.<Ключ>` з ефективної конфігурації
+   (built-in дефолт < legacy `BRAVO.config` за явним `-ConfigPath` <
+   `BRAVO.local.config`);
+2. якщо цей ключ порожній — канонічне ім'я з таблиці вище
+   (`BRAVO_7Z_PASSWORD`, `BRAVO_SFTP_*`, `BRAVO_SMB_*`,
+   `BRAVO_<SLACK|DISCORD>_<GENERAL|ALERTS>_URL`). Для
+   `OperationsApiKey`/`OperationsBootstrapSecret` окремого запасного імені в
+   коді немає — діє ім'я з built-in дефолту.
+
+Запасного пошуку секрету під іншим ім'ям немає: явно заданий target — єдиний
+кандидат; webhook не підміняється ні legacy provider-wide записом, ні
+записом іншого каналу (розділ «Маршрутизація сповіщень» нижче).
+
+**Параметри установи** (`InstitutionName`, `InstitutionCode`,
+`ArchivePrefix`) — не секрети, тому мають запасне джерело. Порядок:
+
+1. запис Credential Manager (`credentialSettings.Targets.InstitutionName`
+   тощо; порожній ключ → `BRAVO_INSTITUTION_NAME`, `BRAVO_INSTITUTION_CODE`,
+   `BRAVO_ARCHIVE_PREFIX`);
+2. лише якщо запису немає або він порожній — `bravoSettings.<Параметр>` з
+   ефективної конфігурації, тобто `BRAVO.local.config`, інакше legacy
+   `BRAVO.config` за явним `-ConfigPath`, інакше built-in placeholder.
+
+Значення з конфігурації — лише fallback для першого запуску: щойно запис є в
+Credential Manager, `bravoSettings.*` у `BRAVO.local.config` для цього
+параметра ігнорується. Обране значення в обох випадках проходить ту саму
+валідацію формату; некоректне значення зупиняє запуск.
+
+**Відсутній секрет — fail-closed.** Порожній запис дорівнює відсутньому.
+Компонент, якому потрібен відсутній секрет, не виконується і не намагається
+працювати без нього. У `BRAVO_ARCHIV`: без пароля архівів архіви не
+створюються (код `31`); без SFTP/SMB-креденшелів пропускається відповідна
+передача, а локальна архівація продовжується (помилка конфігурації
+передачі). Без webhook сповіщення не надсилається, причина фіксується в лозі.
+Без API-ключа Operations подія лишається в локальному outbox до enrollment.
+Недоступний сам Credential Manager під час читання параметрів установи
+зупиняє запуск.
+Коди завершення — розділ 12 «Коди завершення production-скриптів».
 
 ### Маршрутизація сповіщень (GENERAL/ALERTS)
 
