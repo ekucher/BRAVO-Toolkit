@@ -2,8 +2,8 @@
 # Documentation/* (SECURITY.md, THREAT_MODEL.md, RELEASE_CHECKLIST.md,
 # RELEASE_POLICY.md, README.md, OPERATIONS.md -- обов'язкові розділи,
 # відповідність реалізованим контролям), StaticAnalysis/* (PSScriptAnalyzer
-# settings, ci.yml: блокуючі security-правила, ASCII-only run-блоки,
-# pinned action SHA), ReleasePolicy/* (CI-гейт гілка/версія/канал).
+# settings, ci.yml: блокуючі security-правила; усі .github\workflows:
+# ASCII-only run-блоки, pinned action SHA), ReleasePolicy/* (CI-гейт гілка/версія/канал).
 # Dot-sourced з кореневого BRAVO_SELF_TEST.ps1 -- НЕ запускається напряму.
 # Успадковує з викликача: $root, Test-BRAVOCondition, $script:failures.
 # Зовнішніх source-text залежностей не має: всі документи й конфіги
@@ -123,24 +123,6 @@
             ) `
             -Name "StaticAnalysis/CiUsesSettingsAndForbiddenPatterns" `
             -Failure "ci.yml має викликати ci\Invoke-BRAVOSecurityAnalysis.ps1 і ci\Test-BRAVOForbiddenPattern.ps1"
-
-        # GitHub Actions записує вміст `run:` у тимчасовий .ps1 БЕЗ BOM,
-        # і Windows PowerShell 5.1 читає його в системній ANSI-кодовій
-        # сторінці — кирилиця там декодується в сміття, а окремі байти
-        # стають control-символами, що ламають парсер ще до виконання
-        # кроку. Реальне падіння CI сталося саме через це. Логіку з
-        # кирилицею тримаємо у файлах репозиторію (мають BOM), а `run:`
-        # лишається ASCII-only.
-        $ciRunBlockLines = @(
-            $ciWorkflowText -split '\r?\n' |
-                Where-Object { $_ -match '[Ѐ-ӿ]' } |
-                Where-Object { $_ -notmatch '^\s*#' } |
-                Where-Object { $_ -notmatch '^\s*-?\s*name:' }
-        )
-        Test-BRAVOCondition `
-            -Condition ($ciRunBlockLines.Count -eq 0) `
-            -Name "StaticAnalysis/CiRunBlocksAreAsciiOnly" `
-            -Failure "ci.yml: виконуваний рядок з кирилицею поза коментарем/name (GitHub Actions пише run: без BOM, PowerShell 5.1 ламається): $($ciRunBlockLines -join ' | ')"
     }
 
     # T015: статичний конструктор `[T]::new(...)` існує лише з PowerShell
@@ -198,21 +180,126 @@
         -Name "StaticAnalysis/NoStaticNewConstructorInProductionCode" `
         -Failure "production PowerShell-код не повинен викликати [T]::new() (потрібен PowerShell 5.0+, маніфести декларують 3.0) — використовуйте New-Object; знайдено: $(@($staticNewProductionFindings | ForEach-Object { '{0}:{1}: {2}' -f $_.Path, $_.Line, $_.Text }) -join ' | ')"
 
+    # --- Інваріанти, спільні для ВСІХ workflow (T022) ---------------------
+    # Раніше ASCII-only і pin на SHA перевірялися лише для ci.yml, тож
+    # порушення в інших workflow (release-artifact.yml мав кирилицю у
+    # `run:`) лишалося непоміченим: той workflow запускається лише від
+    # тега, і жоден PR-прогін його не виконує. Перелік файлів береться
+    # динамічно, щоб новий workflow потрапляв під ті самі правила без
+    # правки тесту. ci.yml-специфічні інваріанти (ExcludeRule,
+    # -RequiredVersion PSScriptAnalyzer, виклики ci\*.ps1) лишаються вище
+    # і нижче лише на ci.yml.
+    #
+    # GitHub Actions записує вміст `run:` у тимчасовий .ps1 БЕЗ BOM,
+    # і Windows PowerShell 5.1 читає його в системній ANSI-кодовій
+    # сторінці — не-ASCII там декодується в сміття, а окремі байти
+    # стають control-символами або типографськими лапками, які парсер
+    # сприймає як межу рядка. Реальне падіння CI сталося саме через це;
+    # гірший варіант — скрипт парситься без помилки, але з іншою
+    # структурою (зсунуті лапки ковтають `exit 1`). Логіку з кирилицею
+    # тримаємо у файлах репозиторію (мають BOM), а виконувані рядки
+    # workflow лишаються ASCII-only. Коментарі й `name:` не виконуються
+    # PowerShell-ом, тому їх дозволено.
+    $workflowGovFindNonAsciiLines = {
+        param([string]$WorkflowText)
+        $workflowLines = @($WorkflowText -split '\r?\n')
+        for ($lineIndex = 0; $lineIndex -lt $workflowLines.Count; $lineIndex++) {
+            $workflowLine = $workflowLines[$lineIndex]
+            if ($workflowLine -match '[^\x00-\x7F]' -and
+                $workflowLine -notmatch '^\s*#' -and
+                $workflowLine -notmatch '^\s*-?\s*name:') {
+                "{0}: {1}" -f ($lineIndex + 1), $workflowLine.Trim()
+            }
+        }
+    }
     # Аудит P3: сторонні actions зафіксовані на повний commit SHA, а не
     # на рухомий тег. Тег можна переписати — pin на SHA цього не
-    # дозволяє. Версія PSScriptAnalyzer теж зафіксована, інакше нове
-    # правило або зміна поведінки ламає CI без жодної зміни коду.
-    if (Test-Path -LiteralPath $ciWorkflowPath -PathType Leaf) {
-        $unpinnedActions = @(
-            [regex]::Matches($ciWorkflowText, 'uses:\s*(?<Ref>[^\r\n]+)') |
-                ForEach-Object { $_.Groups['Ref'].Value.Trim() } |
-                Where-Object { $_ -notmatch '@[0-9a-f]{40}\b' }
-        )
-        Test-BRAVOCondition `
-            -Condition ($unpinnedActions.Count -eq 0) `
-            -Name "StaticAnalysis/ActionsPinnedToCommitSha" `
-            -Failure "усі GitHub Actions мають бути зафіксовані на повний commit SHA; не закріплені: $($unpinnedActions -join ', ')"
+    # дозволяє.
+    $workflowGovFindUnpinnedActions = {
+        param([string]$WorkflowText)
+        [regex]::Matches($WorkflowText, 'uses:\s*(?<Ref>[^\r\n]+)') |
+            ForEach-Object { $_.Groups['Ref'].Value.Trim() } |
+            Where-Object { $_ -notmatch '@[0-9a-f]{40}\b' }
+    }
 
+    # Предикати мусять ловити порушення в будь-якому workflow, а не лише
+    # в уже відомих: синтетичний новий workflow з кирилицею в `run:` і
+    # action на рухомому тезі має бути знайдений, а коментар і `name:` з
+    # кирилицею — ні.
+    $workflowGovSyntheticText = (@(
+        'name: Synthetic new workflow',
+        'jobs:',
+        '  demo:',
+        '    runs-on: windows-latest',
+        '    steps:',
+        '      # коментар кирилицею дозволений',
+        '      - uses: actions/checkout@v4',
+        '      - name: Крок з кириличною назвою',
+        '        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1',
+        '      - shell: powershell',
+        '        run: |',
+        '          Write-Host "::error::тег не опублікований"',
+        '          exit 1'
+    ) -join "`r`n")
+    $workflowGovSyntheticNonAscii = @(& $workflowGovFindNonAsciiLines $workflowGovSyntheticText)
+    $workflowGovSyntheticUnpinned = @(& $workflowGovFindUnpinnedActions $workflowGovSyntheticText)
+    Test-BRAVOCondition `
+        -Condition (
+            $workflowGovSyntheticNonAscii.Count -eq 1 -and
+            $workflowGovSyntheticNonAscii[0] -like '12: Write-Host*' -and
+            $workflowGovSyntheticUnpinned.Count -eq 1 -and
+            $workflowGovSyntheticUnpinned[0] -eq 'actions/checkout@v4'
+        ) `
+        -Name "StaticAnalysis/WorkflowInvariantsCatchNewWorkflow" `
+        -Failure ("предикати workflow-інваріантів мусять ловити синтетичний новий workflow: не-ASCII рядки " +
+            "[$($workflowGovSyntheticNonAscii -join ' | ')] (очікується рівно рядок 12), не закріплені actions " +
+            "[$($workflowGovSyntheticUnpinned -join ', ')] (очікується рівно actions/checkout@v4)")
+
+    $workflowGovRoot = Join-Path $root ".github\workflows"
+    $workflowGovFiles = @(
+        if (Test-Path -LiteralPath $workflowGovRoot -PathType Container) {
+            Get-ChildItem -LiteralPath $workflowGovRoot -File |
+                Where-Object { $_.Extension -eq '.yml' -or $_.Extension -eq '.yaml' } |
+                Sort-Object Name
+        }
+    )
+    # Порожній перелік зробив би обидві перевірки нижче зеленими ні на
+    # чому. На момент T022 у репозиторії 4 workflow: ci.yml,
+    # config-parity.yml, config-v2-pilot-artifact.yml, release-artifact.yml.
+    $workflowGovNames = @($workflowGovFiles | ForEach-Object { $_.Name })
+    Test-BRAVOCondition `
+        -Condition (
+            $workflowGovFiles.Count -ge 4 -and
+            $workflowGovNames -contains 'ci.yml' -and
+            $workflowGovNames -contains 'release-artifact.yml'
+        ) `
+        -Name "StaticAnalysis/WorkflowEnumerationIsNotEmpty" `
+        -Failure "перелік .github\workflows\*.yml|*.yaml має містити щонайменше 4 файли, включно з ci.yml і release-artifact.yml; знайдено: $($workflowGovNames -join ', ')"
+
+    $workflowGovNonAsciiViolations = New-Object System.Collections.Generic.List[string]
+    $workflowGovUnpinnedViolations = New-Object System.Collections.Generic.List[string]
+    foreach ($workflowGovFile in $workflowGovFiles) {
+        $workflowGovText = [IO.File]::ReadAllText($workflowGovFile.FullName, [Text.Encoding]::UTF8)
+        foreach ($workflowGovLine in @(& $workflowGovFindNonAsciiLines $workflowGovText)) {
+            [void]$workflowGovNonAsciiViolations.Add("$($workflowGovFile.Name):$workflowGovLine")
+        }
+        foreach ($workflowGovRef in @(& $workflowGovFindUnpinnedActions $workflowGovText)) {
+            [void]$workflowGovUnpinnedViolations.Add("$($workflowGovFile.Name): $workflowGovRef")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($workflowGovFiles.Count -gt 0 -and $workflowGovNonAsciiViolations.Count -eq 0) `
+        -Name "StaticAnalysis/CiRunBlocksAreAsciiOnly" `
+        -Failure "workflow: виконуваний не-ASCII рядок поза коментарем/name (GitHub Actions пише run: без BOM, PowerShell 5.1 ламається): $($workflowGovNonAsciiViolations -join ' | ')"
+    Test-BRAVOCondition `
+        -Condition ($workflowGovFiles.Count -gt 0 -and $workflowGovUnpinnedViolations.Count -eq 0) `
+        -Name "StaticAnalysis/ActionsPinnedToCommitSha" `
+        -Failure "усі GitHub Actions в усіх workflow мають бути зафіксовані на повний commit SHA; не закріплені: $($workflowGovUnpinnedViolations -join ', ')"
+
+    # Версія PSScriptAnalyzer зафіксована, інакше нове правило або зміна
+    # поведінки ламає CI без жодної зміни коду. Аналізатор запускає лише
+    # ci.yml, тому інваріант — ci.yml-специфічний.
+    if (Test-Path -LiteralPath $ciWorkflowPath -PathType Leaf) {
         Test-BRAVOCondition `
             -Condition ($ciWorkflowText -match 'PSScriptAnalyzer\s+-RequiredVersion\s+\d+\.\d+') `
             -Name "StaticAnalysis/AnalyzerVersionPinned" `
