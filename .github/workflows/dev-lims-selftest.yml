@@ -1,0 +1,56 @@
+name: DEV-LIMS self-test
+
+# Ручний прогін повного BRAVO_SELF_TEST.ps1 на self-hosted раннері DEV-LIMS
+# (Windows PowerShell 5.1 на реальному цільовому хості, а не windows-latest).
+#
+# Безпека (репозиторій ПУБЛІЧНИЙ):
+# - Лише workflow_dispatch. Жодних pull_request / push тригерів: код із
+#   форків ніколи не потрапляє на DEV-LIMS, а запустити прогін може лише
+#   користувач із правом write.
+# - permissions: contents: read - токен задачі не може нічого змінити.
+# - Лог прогону НЕ вивантажується артефактом: він лишається на хості
+#   (LOGS\HELPERS у робочій теці раннера). Консольний вивід задачі у
+#   публічному репозиторії бачать усі, тому сюди не можна додавати кроки,
+#   що друкують конфігурацію, секрети чи внутрішні шляхи хоста.
+# - Не змінює -Suite: прогін завжди повний канонічний.
+#
+# Раннер обирається за мітками self-hosted + Windows + X64. Якщо з'явиться
+# інший self-hosted раннер, додайте DEV-LIMS окрему мітку (наприклад
+# dev-lims) і вкажіть її тут.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dev-lims-selftest
+  cancel-in-progress: false
+
+jobs:
+  self-test:
+    name: BRAVO_SELF_TEST.ps1 (DEV-LIMS)
+    if: github.repository == 'ekucher/BRAVO-Toolkit'
+    runs-on: [self-hosted, Windows, X64]
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          clean: true
+
+      - name: Host info (PowerShell version only)
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host ("PowerShell " + $PSVersionTable.PSVersion.ToString() + " / " + $PSVersionTable.PSEdition)
+
+      - name: Full self-test
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\BRAVO_SELF_TEST.ps1 -NoPause
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::error::BRAVO_SELF_TEST.ps1 exited with code $LASTEXITCODE"
+              exit 1
+          }
