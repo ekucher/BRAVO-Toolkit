@@ -953,6 +953,10 @@ $script:CriticalErrorsList = New-Object 'System.Collections.Generic.List[string]
 # Send-FinalReport не ескалював notification-severity WARNING до
 # "КРИТИЧНІ ПОМИЛКИ ОБСЛУГОВУВАННЯ"/CRITICAL (review finding #2).
 $script:NotificationAlertQueue = New-Object 'System.Collections.Generic.List[object]'
+# T006: імена архівів, що пройшли 7z t лише через legacy BOM-у-паролі
+# fallback (колектор Register-BRAVOLegacyBomPasswordFallback, BRAVO.ArchiveHelpers).
+# Один WARNING-запис у NotificationAlertQueue на прогін — перед Send-FinalReport.
+$script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
 $script:criticalErrorOccurred = $false
 # Лічильник WARNING для контракту кодів завершення: успіх без жодного
 # попередження -> 0, успіх із попередженнями -> 10 (Resolve-BRAVOExitCode).
@@ -6371,17 +6375,36 @@ function Test-BRAVOMaintenanceSevenZipArchiveIntegrity {
         [string]$ArchivePath
     )
 
+    # T006: fallback-успіх пише WARNING через цей самий Logger (Write-Log
+    # -> BRAVOWarningCount -> код 10) і реєструє ім'я архіву в колекторі
+    # прогону для одного сповіщення (Add-BRAVOMaintenanceLegacyBomFallbackAlert).
     $integrityValid = Test-SevenZipArchiveIntegrity `
         -SevenZipPath $SevenZipPath `
         -ArchivePath $ArchivePath `
         -Password $script:ArchivePassword `
         -TimeoutSeconds $SevenZipIntegrityTestTimeoutSeconds `
-        -Logger { param($Message, $Level) Write-Log $Message -Level $Level }
+        -Logger { param($Message, $Level) Write-Log $Message -Level $Level } `
+        -LegacyBomFallbackCollector $script:MaintenanceLegacyBomFallbackArchives
     if (-not $integrityValid) {
         $script:criticalErrorOccurred = $true
         $script:restoreIntegrityFailed = $true
     }
     return $integrityValid
+}
+
+function Add-BRAVOMaintenanceLegacyBomFallbackAlert {
+    # T006: РІВНО одне WARNING-сповіщення на прогін про архіви, відкриті
+    # лише через legacy BOM-у-паролі fallback — через наявну чергу
+    # Send-SlackAlert -Severity WARNING (NotificationAlertQueue), яку
+    # Send-FinalReport надсилає одним повідомленням. Код завершення тут не
+    # змінюється: WARNING-запис кожного такого архіву вже підняв
+    # BRAVOWarningCount (Get-BRAVOMaintenanceResolvedExitCode -> 10).
+    $archiveNames = @($script:MaintenanceLegacyBomFallbackArchives)
+    if ($archiveNames.Count -eq 0) {
+        return
+    }
+    $alertLines = @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames $archiveNames)
+    Send-SlackAlert -Message ($alertLines -join "`n") -Severity WARNING
 }
 
 # Функція архівації старих даних
@@ -10439,6 +10462,7 @@ $script:autoShutdownReachable = $true
 
 # Відправляємо фінальний звіт
 $script:currentMaintenanceOperation = 'Відправлення фінального звіту'
+Add-BRAVOMaintenanceLegacyBomFallbackAlert
 Send-FinalReport -LOG_FILE $LOG_FILE
 
 if (-not $script:criticalErrorOccurred) {

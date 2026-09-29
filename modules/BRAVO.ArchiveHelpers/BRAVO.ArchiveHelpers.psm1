@@ -48,6 +48,101 @@ function Remove-OldLogsByAge {
     return (-not $failed)
 }
 
+function Register-BRAVOLegacyBomPasswordFallback {
+    # T006 (рішення власника 2026-09-29): успіх 7-Zip ЛИШЕ через legacy
+    # BOM-у-паролі fallback (LegacyBomPasswordFallbackUsed=$true з
+    # Invoke-BRAVOSevenZipIntegrityTest/Invoke-BRAVOSevenZipExtraction,
+    # BRAVO.Compatibility) більше не мовчазний: WARNING у журнал з іменем
+    # архіву і реєстрація імені в явному колекторі прогону, з якого
+    # entrypoint надсилає ОДНЕ сповіщення на прогін і піднімає код
+    # завершення щонайменше до SuccessWithWarnings. Єдина канонічна точка
+    # цієї політики для integrity-тесту (Test-SevenZipArchiveIntegrity
+    # нижче) і для розпакування (викликачі Invoke-BRAVOSevenZipExtraction).
+    # Пароль сюди не передається взагалі — у журнал потрапляє лише ім'я
+    # файла архіву і текст Warning (він пароля не містить).
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]$Result,
+        [Parameter(Mandatory = $true)][string]$ArchivePath,
+        [AllowNull()][System.Collections.Generic.List[string]]$Collector,
+        [AllowNull()][scriptblock]$Logger
+    )
+
+    if ($null -eq $Result) { return $false }
+    $fallbackProperty = $Result.PSObject.Properties['LegacyBomPasswordFallbackUsed']
+    if ($null -eq $fallbackProperty -or -not [bool]$fallbackProperty.Value) {
+        return $false
+    }
+
+    $archiveLeafName = Split-Path -Path $ArchivePath -Leaf
+    $warningProperty = $Result.PSObject.Properties['Warning']
+    $warningText = if ($null -ne $warningProperty -and
+        -not [string]::IsNullOrWhiteSpace([string]$warningProperty.Value)) {
+        [string]$warningProperty.Value
+    } else {
+        'Архів відкрито лише через legacy BOM-у-паролі fallback.'
+    }
+    Write-BRAVOArchiveHelperLog `
+        -Logger $Logger `
+        -Message "Legacy BOM-пароль: ${archiveLeafName} — $warningText" `
+        -Level 'WARNING'
+
+    if ($null -ne $Collector) {
+        $alreadyCollected = $false
+        foreach ($collectedName in $Collector) {
+            if ([string]::Equals($collectedName, $archiveLeafName, [StringComparison]::OrdinalIgnoreCase)) {
+                $alreadyCollected = $true
+                break
+            }
+        }
+        if (-not $alreadyCollected) {
+            $Collector.Add($archiveLeafName)
+        }
+    }
+    return $true
+}
+
+function Get-BRAVOLegacyBomFallbackNotificationLines {
+    # Канонічний текст ОДНОГО сповіщення на прогін про архіви, відкриті
+    # лише через legacy BOM-у-паролі fallback: обмежений перелік імен +
+    # підказка оператору. Спільний для Archive/Maintenance/DataRestore/
+    # Restore Drill — кожен entrypoint лише вставляє ці рядки у свій
+    # наявний шлях сповіщення.
+    [CmdletBinding()]
+    [OutputType([string[]])]
+    param(
+        [AllowNull()][AllowEmptyCollection()][string[]]$ArchiveNames,
+        [ValidateRange(1, 100)][int]$MaximumListed = 10
+    )
+
+    $names = @($ArchiveNames | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) })
+    if ($names.Count -eq 0) {
+        # Порожній вивід; викликачі загортають результат у @(...).
+        return
+    }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $lines.Add(("Архіви, відкриті лише через legacy BOM-у-паролі fallback: {0}" -f $names.Count))
+    foreach ($name in @($names | Select-Object -First $MaximumListed)) {
+        $lines.Add(("- {0}" -f $name))
+    }
+    if ($names.Count -gt $MaximumListed) {
+        $lines.Add(("- … та ще {0} (повний перелік — у журналі)" -f ($names.Count - $MaximumListed)))
+    }
+    $lines.Add(
+        'Ці архіви зашифровано паролем із BOM-префіксом (U+FEFF): так пароль ' +
+        'передавали у 7-Zip версії BRAVO під UTF-8-консоллю (chcp 65001). ' +
+        'Дані читаються, але лише через сумісний fallback.'
+    )
+    $lines.Add(
+        'Що зробити: створіть нові резервні копії цих даних поточною ' +
+        'версією BRAVO (повторна архівація) і переконайтеся, що прогін, ' +
+        'який їх відкриває, завершується без цього попередження; старі ' +
+        'архіви не видаляйте, доки нова копія не пройде перевірку цілісності.'
+    )
+    return $lines.ToArray()
+}
+
 function Test-SevenZipArchiveIntegrity {
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
@@ -57,7 +152,12 @@ function Test-SevenZipArchiveIntegrity {
         [string]$ArchivePath,
         [string]$Password,
         [int]$TimeoutSeconds = 43200,
-        [AllowNull()][scriptblock]$Logger
+        [AllowNull()][scriptblock]$Logger,
+        # T006: необов'язковий колектор прогону (List[string]) для імен
+        # архівів, що пройшли лише через legacy BOM-у-паролі fallback.
+        # Bool-контракт повернення НЕ змінено; без колектора WARNING у
+        # журнал однаково пишеться (див. Register-BRAVOLegacyBomPasswordFallback).
+        [AllowNull()][System.Collections.Generic.List[string]]$LegacyBomFallbackCollector
     )
 
     Write-BRAVOArchiveHelperLog `
@@ -79,6 +179,11 @@ function Test-SevenZipArchiveIntegrity {
             -Logger $Logger `
             -Message "Цiлiснiсть архiву пiдтверджено 7-Zip (код: 0): $ArchivePath" `
             -Level "SUCCESS"
+        [void](Register-BRAVOLegacyBomPasswordFallback `
+            -Result $testResult `
+            -ArchivePath $ArchivePath `
+            -Collector $LegacyBomFallbackCollector `
+            -Logger $Logger)
         return $true
     }
 

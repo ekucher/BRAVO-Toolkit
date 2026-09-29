@@ -3018,7 +3018,9 @@ function New-BRAVOArchiveCreationResult {
         [string]$ArchivePath,
         [Nullable[int]]$ExitCode,
         [string]$ErrorStage,
-        [string]$Error
+        [string]$Error,
+        # T006: 7z t пройшов лише через legacy BOM-у-паролі fallback.
+        [bool]$LegacyBomFallbackUsed = $false
     )
 
     [pscustomobject]@{
@@ -3028,6 +3030,7 @@ function New-BRAVOArchiveCreationResult {
         ExitCode = $ExitCode
         ErrorStage = $ErrorStage
         Error = $Error
+        LegacyBomPasswordFallbackUsed = $LegacyBomFallbackUsed
     }
 }
 
@@ -3191,18 +3194,23 @@ function New-Archive {
 
         if ($process.ExitCode -eq 0) {
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено; виконується контроль цiлiсностi: $fullArchivePath" -Level "INFO"
+            # T006: fallback-успіх пише WARNING (-> код 10 через статистику
+            # журналу) і позначається в результаті для одного сповіщення на прогін.
+            $legacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
             if (Test-SevenZipArchiveIntegrity `
                 -SevenZipPath $ArcPath `
                 -ArchivePath $fullArchivePath `
                 -Password $script:archivePassword `
                 -TimeoutSeconds $integrityTestTimeoutSeconds `
-                -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level }) {
+                -Logger { param($Message, $Level) Write-BRAVOLog -Component 'ARCHIVE' -Message $Message -Level $Level } `
+                -LegacyBomFallbackCollector $legacyBomFallbackArchives) {
                 Write-BRAVOLog -Component 'ARCHIVE' -Message "Архiв створено та перевiрено: $fullArchivePath" -Level "SUCCESS"
                 return (New-BRAVOArchiveCreationResult `
                     -CreateSuccess $true `
                     -IntegritySuccess $true `
                     -ArchivePath $fullArchivePath `
-                    -ExitCode 0)
+                    -ExitCode 0 `
+                    -LegacyBomFallbackUsed ($legacyBomFallbackArchives.Count -gt 0))
             }
             Write-BRAVOLog -Component 'ARCHIVE' -Message "Пошкоджений або неперевiрений архiв не буде опублiковано як backup: $fullArchivePath" -Level "ERROR"
             $script:lastArchiveToolFailure = [pscustomobject]@{
@@ -3301,6 +3309,7 @@ function Invoke-BRAVOComponentBackup {
         SHA512 = $null
         ErrorStage = $null
         Error = $null
+        LegacyBomPasswordFallbackUsed = $false
     }
     $finalArchivePath = $null
     $finalHashPath = $null
@@ -3344,6 +3353,7 @@ function Invoke-BRAVOComponentBackup {
             -ArcParams $ArcParams
         $result.CreateSuccess = [bool]$creationResult.CreateSuccess
         $result.IntegritySuccess = [bool]$creationResult.IntegritySuccess
+        $result.LegacyBomPasswordFallbackUsed = [bool]$creationResult.LegacyBomPasswordFallbackUsed
         if (-not $result.CreateSuccess -or -not $result.IntegritySuccess) {
             $result.ErrorStage = ([string]$creationResult.ErrorStage).ToUpperInvariant()
             $result.Error = [string]$creationResult.Error
@@ -4540,6 +4550,67 @@ function global:Split-DiscordNotificationText {
     }
 
     return $chunks.ToArray()
+}
+
+function Send-BRAVOArchiveLegacyBomFallbackAlert {
+    # T006 (рішення власника 2026-09-29): РІВНО одне WARNING-сповіщення на
+    # прогін, якщо хоча б один опублікований архів пройшов 7z t лише через
+    # legacy BOM-у-паролі fallback. Перелік і підказка — канонічні
+    # (Get-BRAVOLegacyBomFallbackNotificationLines, BRAVO.ArchiveHelpers);
+    # маршрут/доставка — канонічна Send-BRAVONotification. Збій доставки
+    # лише логується і не змінює результат backup.
+    param([Parameter(Mandatory = $true)][hashtable]$Results)
+
+    $archiveNames = @(
+        $Results.Values |
+            Where-Object {
+                $_ -is [hashtable] -and
+                $_.ContainsKey('LegacyBomPasswordFallbackUsed') -and
+                [bool]$_.LegacyBomPasswordFallbackUsed -and
+                -not [string]::IsNullOrWhiteSpace([string]$_.ArchivePath)
+            } |
+            ForEach-Object { Split-Path -Path ([string]$_.ArchivePath) -Leaf } |
+            Sort-Object -Unique
+    )
+    if ($archiveNames.Count -eq 0) {
+        return
+    }
+    if ($NoSlack -or $script:notificationMode -eq 'none') {
+        Write-BRAVOLog -Component 'ARCHIVE' -Message 'Сповіщення про legacy BOM-пароль архівів вимкнено параметрами запуску або конфігурацією' -Level 'INFO'
+        return
+    }
+    try {
+        $archiveBuildIdText = if ([string]::IsNullOrWhiteSpace([string]$ScriptBuildId)) {
+            'невідома'
+        } else {
+            [string]$ScriptBuildId
+        }
+        $message = New-BRAVOOperatorNotificationMessage `
+            -Severity 'WARNING' `
+            -Operation 'BRAVO ARCHIVE — АРХІВИ З LEGACY BOM-ПАРОЛЕМ' `
+            -ActionText 'створити нові резервні копії перелічених даних поточною версією BRAVO.' `
+            -InstitutionName ([string]$backupMonitoring.InstitutionName) `
+            -InstitutionCode ([string]$backupMonitoring.InstitutionCode) `
+            -HostInformation (Get-HostInformation) `
+            -ResultLines @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames $archiveNames) `
+            -Timestamp (Get-Date) `
+            -ProductName 'BRAVO Archive' `
+            -Version ([string]$global:ScriptVersion) `
+            -BuildId $archiveBuildIdText `
+            -LogPath ([string]$script:logFile) `
+            -LogLabel 'Журнал'
+        [void](Send-BRAVONotification `
+            -Severity 'WARNING' `
+            -Message $message `
+            -Provider $script:notificationProvider `
+            -NotificationMode $script:notificationMode `
+            -RoutingTable $backupMonitoring.NotificationRouting `
+            -CredentialTargets $backupMonitoring.NotificationCredentialTargets `
+            -TimeoutSeconds $script:notificationRequestTimeoutSeconds)
+        Write-BRAVOLog -Component 'ARCHIVE' -Message "Сповіщення про $($archiveNames.Count) архів(и) з legacy BOM-паролем відправлено у $($script:notificationProviderDisplayName)" -Level 'INFO'
+    } catch {
+        Write-BRAVOLog -Component 'ARCHIVE' -Message "Не вдалося відправити сповіщення про архіви з legacy BOM-паролем: $(Protect-BRAVOLogSecret -Text $_.Exception.Message)" -Level 'WARNING'
+    }
 }
 
 function Send-BAZAIncompatibleNameAlert {
@@ -7503,6 +7574,9 @@ function Main {
                     }
                     $results[$archive.Type].Bytes = $createdArchiveSize
                     $results[$archive.Type].SizeAnomaly = $sizeAnomalyResult
+                    if ([bool]$componentResult.LegacyBomPasswordFallbackUsed) {
+                        $results[$archive.Type].LegacyBomPasswordFallbackUsed = $true
+                    }
                 }
             }
             $archiveStepStatus = if (-not $success) {
@@ -8290,6 +8364,11 @@ function Main {
             Write-BRAVOLog -Component 'SUMMARY' -Message "Не вдалося фіналізувати generation manifest: $($_.Exception.Message)" -Level 'ERROR'
         }
     }
+
+    # T006: одне WARNING-сповіщення на прогін про архіви, що пройшли 7z t
+    # лише через legacy BOM-у-паролі fallback. Код 10 уже забезпечено
+    # WARNING-записом кожного такого архіву (статистика журналу нижче).
+    Send-BRAVOArchiveLegacyBomFallbackAlert -Results $results
 
     # Секція health-check (якщо вона виконувалась) залишає компонент журналу
     # на "HEALTH" — без явного повернення на "SUMMARY" підсумковий рядок

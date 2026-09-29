@@ -277,6 +277,11 @@ $script:flagRestoreFailed = $false
 $script:flagSftpFailed = $false
 $script:flagInternalError = $false
 $script:dataRestoreWarningCount = 0
+# T006: імена архівів, відкритих (7z t / 7z x) лише через legacy
+# BOM-у-паролі fallback (колектор Register-BRAVOLegacyBomPasswordFallback,
+# BRAVO.ArchiveHelpers). Непорожній -> код щонайменше 10 і перелік у
+# ЄДИНОМУ фінальному сповіщенні прогону.
+$script:dataRestoreLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
 $script:dataRestoreComponentResults = New-Object System.Collections.ArrayList
 $script:dataRestoreOperationLock = $null
 $script:dataRestoreOperationLockPath = $null
@@ -3463,7 +3468,8 @@ try {
                 -ArchivePath $verifiedArchive.FullName `
                 -Password $script:archivePassword `
                 -TimeoutSeconds $script:effectiveSevenZipTimeoutSeconds `
-                -Logger { param($m, $l) Write-DataRestoreLog -Message $m -Level $l }
+                -Logger { param($m, $l) Write-DataRestoreLog -Message $m -Level $l } `
+                -LegacyBomFallbackCollector $script:dataRestoreLegacyBomFallbackArchives
             if (-not $integrityOk) {
                 Stop-BRAVODataRestoreRun -Category IntegrityTestFailed -Reason "component ${componentType}: 7za t (перевірка цілісності) не пройдено"
             }
@@ -3806,6 +3812,11 @@ try {
                 if (-not $extractionResult.Success) {
                     throw "розпакування не вдалося: $($extractionResult.Description)"
                 }
+                [void](Register-BRAVOLegacyBomPasswordFallback `
+                    -Result $extractionResult `
+                    -ArchivePath $componentArtifacts[$componentType].FullName `
+                    -Collector $script:dataRestoreLegacyBomFallbackArchives `
+                    -Logger { param($m, $l) Write-DataRestoreLog -Message $m -Level $l })
                 $verification = Test-BRAVODataRestoreExtractionResult `
                     -TargetDirectory $planComponent.TargetDirectory `
                     -Inventory $componentInventories[$componentType]
@@ -4083,7 +4094,7 @@ $dataRestoreExitCode = Resolve-BRAVOExitCode `
     -HashValidationFailed:$script:flagHashValidationFailed `
     -RestoreFailed:$script:flagRestoreFailed `
     -SftpFailed:$script:flagSftpFailed `
-    -HasWarnings:($script:dataRestoreWarningCount -gt 0)
+    -HasWarnings:($script:dataRestoreWarningCount -gt 0 -or $script:dataRestoreLegacyBomFallbackArchives.Count -gt 0)
 
 $summaryStatus = if ($dataRestoreExitCode -eq 0) {
     'УСПІШНО'
@@ -4179,6 +4190,8 @@ if ($notificationMode -ne 'none') {
     if (-not [string]::IsNullOrWhiteSpace([string]$script:dataRestoreAbortReason)) {
         $notificationLines += "Причина: $script:dataRestoreAbortReason"
     }
+    # T006: перелік legacy BOM-архівів іде в ТЕ САМЕ одне сповіщення прогону.
+    $notificationLines += @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames @($script:dataRestoreLegacyBomFallbackArchives))
     if ($dataRestoreExitCode -ge 20) {
         Send-BRAVODataRestoreNotification `
             -Severity 'CRITICAL' `

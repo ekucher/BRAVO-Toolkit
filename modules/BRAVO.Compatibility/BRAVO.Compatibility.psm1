@@ -1966,6 +1966,10 @@ function Invoke-BRAVOSevenZipIntegrityTest {
     # невдача класифікована як password-failure (Test-BRAVOSevenZipPasswordFailure)
     # — жодна інша причина відмови (пошкоджений архів, відсутній файл,
     # access denied) не отримує другої спроби.
+    # T006: такі архіви бувають не лише «до 5.2.0» — BOM-префікс під
+    # UTF-8-консоллю давали й 5.2.x. Fallback-успіх не мовчазний: споживачі
+    # реєструють його через Register-BRAVOLegacyBomPasswordFallback
+    # (BRAVO.ArchiveHelpers) — WARNING, код 10 і одне сповіщення на прогін.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
         'PSAvoidUsingPlainTextForPassword', 'Password',
         Justification = 'Пароль передається 7-Zip через redirected stdin (не в аргументи процесу); SecureString довелося б розгортати тут же.')]
@@ -2003,7 +2007,8 @@ function Invoke-BRAVOSevenZipIntegrityTest {
         $secondAttempt | Add-Member -MemberType NoteProperty -Name LegacyBomPasswordFallbackUsed -Value $true -Force
         $secondAttempt | Add-Member -MemberType NoteProperty -Name Warning -Value (
             "Архів відкрито лише через legacy BOM-у-паролі fallback (5.2.0 B2) — " +
-            "цей архів створено версією BRAVO до 5.2.0 під UTF-8-консоллю. " +
+            "його зашифровано паролем із BOM-префіксом (U+FEFF), як передавали пароль " +
+            "у 7-Zip версії BRAVO під UTF-8-консоллю (chcp 65001), зокрема й 5.2.x. " +
             "Рекомендовано після успішної перевірки/відновлення створити новий backup поточною версією."
         ) -Force
         return $secondAttempt
@@ -2181,7 +2186,8 @@ function Invoke-BRAVOSevenZipExtraction {
         $secondAttempt | Add-Member -MemberType NoteProperty -Name LegacyBomPasswordFallbackUsed -Value $true -Force
         $secondAttempt | Add-Member -MemberType NoteProperty -Name Warning -Value (
             "Архів відкрито лише через legacy BOM-у-паролі fallback (5.2.0 B2) — " +
-            "цей архів створено версією BRAVO до 5.2.0 під UTF-8-консоллю. " +
+            "його зашифровано паролем із BOM-префіксом (U+FEFF), як передавали пароль " +
+            "у 7-Zip версії BRAVO під UTF-8-консоллю (chcp 65001), зокрема й 5.2.x. " +
             "Рекомендовано після успішного відновлення створити новий backup поточною версією."
         ) -Force
         return $secondAttempt
