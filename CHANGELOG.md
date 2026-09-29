@@ -2,6 +2,18 @@
 
 ## Не випущено (developer)
 
+- **Походження бінарників у `Tools\TOOLS_MANIFEST.json` (BRAVO-T021).**
+  Для кожного інструмента маніфест тепер містить запис `provenance`: версію,
+  офіційне джерело пакета, SHA-256 пакета, шлях файлу в пакеті й дату завантаження.
+  7-Zip `26.02` (`7za.exe`, `7za.dll`, `7zxa.dll`) побайтово збігається з
+  `7z2602-extra.7z`, WinSCP `6.5.6` (`WinSCP.com`, `WinSCP.exe`) — з
+  `WinSCP-6.5.6-Portable.zip`, `WinSCPnet.dll` — з `WinSCP-6.5.6-Automation.zip`.
+  `DragExt64.dll` має версію `6.5.3`, не входить до пакетів 6.5.6 і позначений
+  `upstreamVerified = false`. `ci\Update-BRAVOToolsManifest.ps1 -Apply` відмовляє
+  (код `1`), доки для нового чи зміненого бінарника немає запису `provenance` з тим
+  самим `sha256`. Новий самотест `ToolManifest/EveryToolHasProvenance`. Runtime-перевірка
+  цілісності читає лише `tools`, тож поведінка серверів не змінюється.
+
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
   використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний

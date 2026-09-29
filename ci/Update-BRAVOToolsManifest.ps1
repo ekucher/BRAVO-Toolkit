@@ -81,6 +81,46 @@ if (-not $Apply) {
     exit 0
 }
 
+# BRAVO-T021: хеш без походження засвідчує лише "так було в коміті".
+# Тому -Apply відмовляє, доки для КОЖНОГО інструмента в provenance немає
+# запису з тим самим sha256 і полями, за якими рецензент незалежно
+# відтворить довіру (див. provenanceProcedure у самому маніфесті).
+$provenanceProblems = New-Object System.Collections.Generic.List[string]
+$provenanceByName = @{}
+if ($manifest.PSObject.Properties.Name -contains 'provenance' -and $null -ne $manifest.provenance) {
+    foreach ($property in $manifest.provenance.PSObject.Properties) {
+        $provenanceByName[$property.Name] = $property.Value
+    }
+}
+foreach ($name in $currentHashes.Keys) {
+    if (-not $provenanceByName.ContainsKey($name)) {
+        [void]$provenanceProblems.Add("$name — немає запису provenance")
+        continue
+    }
+    $entry = $provenanceByName[$name]
+    foreach ($field in @('sha256', 'version', 'upstreamUrl', 'retrievedAt', 'upstreamVerified')) {
+        if ($entry.PSObject.Properties.Name -notcontains $field -or
+            [string]::IsNullOrWhiteSpace([string]$entry.$field)) {
+            [void]$provenanceProblems.Add("$name — provenance без поля $field")
+        }
+    }
+    if (-not [string]::Equals([string]$entry.sha256, $currentHashes[$name], [System.StringComparison]::OrdinalIgnoreCase)) {
+        [void]$provenanceProblems.Add("$name — provenance.sha256 не дорівнює фактичному хешу $($currentHashes[$name])")
+    }
+}
+foreach ($name in $provenanceByName.Keys) {
+    if (-not $currentHashes.Contains($name)) {
+        [void]$provenanceProblems.Add("$name — запис provenance для інструмента, якого більше немає у Tools/")
+    }
+}
+if ($provenanceProblems.Count -gt 0) {
+    Write-Host ""
+    Write-Host "Нічого не записано: походження інструментів не зафіксовано (provenance у TOOLS_MANIFEST.json):" -ForegroundColor Red
+    $provenanceProblems | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
+    Write-Host "Додайте або оновіть запис provenance для кожного нового чи зміненого бінарника й повторіть -Apply." -ForegroundColor Red
+    exit 1
+}
+
 $manifest.tools = [pscustomobject]$currentHashes
 $json = $manifest | ConvertTo-Json -Depth 5
 [System.IO.File]::WriteAllText($manifestPath, ($json + [Environment]::NewLine), (New-Object System.Text.UTF8Encoding($false)))

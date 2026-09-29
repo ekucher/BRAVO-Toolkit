@@ -3063,6 +3063,51 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             -Failure "TOOLS_MANIFEST.json не відповідає реальним Tools у репозиторії: $($repositoryManifestRun.Message)"
     }
 
+    # BRAVO-T021 (аудит F012, частина 2): кожен еталонний хеш має запис
+    # походження з тим самим sha256 — інакше маніфест засвідчує лише
+    # "так було в коміті", а не "це офіційний бінарник". Той самий
+    # контракт, який ci\Update-BRAVOToolsManifest.ps1 вимагає на -Apply.
+    $repositoryToolManifestRaw = [IO.File]::ReadAllText(
+        (Join-Path $repositoryToolsDirectory "TOOLS_MANIFEST.json"), [Text.Encoding]::UTF8)
+    $repositoryToolManifest = $repositoryToolManifestRaw | ConvertFrom-Json
+    $toolProvenanceProblems = New-Object System.Collections.Generic.List[string]
+    $toolProvenanceByName = @{}
+    if (@($repositoryToolManifest.PSObject.Properties.Name) -contains 'provenance' -and $null -ne $repositoryToolManifest.provenance) {
+        foreach ($provenanceProperty in $repositoryToolManifest.provenance.PSObject.Properties) {
+            $toolProvenanceByName[$provenanceProperty.Name] = $provenanceProperty.Value
+        }
+    }
+    foreach ($toolProperty in $repositoryToolManifest.tools.PSObject.Properties) {
+        if (-not $toolProvenanceByName.ContainsKey($toolProperty.Name)) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): немає запису provenance")
+            continue
+        }
+        $toolProvenanceEntry = $toolProvenanceByName[$toolProperty.Name]
+        foreach ($provenanceField in @('sha256', 'version', 'upstreamUrl', 'retrievedAt', 'upstreamVerified')) {
+            if (@($toolProvenanceEntry.PSObject.Properties.Name) -notcontains $provenanceField -or
+                [string]::IsNullOrWhiteSpace([string]$toolProvenanceEntry.$provenanceField)) {
+                [void]$toolProvenanceProblems.Add("$($toolProperty.Name): немає поля $provenanceField")
+            }
+        }
+        if (-not [string]::Equals([string]$toolProvenanceEntry.sha256, [string]$toolProperty.Value, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): provenance.sha256 не дорівнює tools")
+        }
+        if ([string]$toolProvenanceEntry.upstreamVerified -eq 'True' -and (
+                @($toolProvenanceEntry.PSObject.Properties.Name) -notcontains 'packageSha256' -or
+                [string]$toolProvenanceEntry.packageSha256 -notmatch '^[0-9A-Fa-f]{64}$')) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): upstreamVerified=true без SHA-256 пакета (packageSha256)")
+        }
+    }
+    foreach ($provenanceName in $toolProvenanceByName.Keys) {
+        if (@($repositoryToolManifest.tools.PSObject.Properties.Name) -notcontains $provenanceName) {
+            [void]$toolProvenanceProblems.Add("${provenanceName}: provenance без запису в tools")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($toolProvenanceProblems.Count -eq 0) `
+        -Name "ToolManifest/EveryToolHasProvenance" `
+        -Failure "TOOLS_MANIFEST.json: походження інструментів неповне або не збігається з хешами: $($toolProvenanceProblems -join '; ')"
+
     # Маніфест шукається в тому самому каталозі, що й самі утиліти
     # (Tools\), а не поруч зі скриптом — BRAVO.config і всі три runtime
     # (fallback на випадок непридатної конфігурації) мають бути
