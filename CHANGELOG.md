@@ -2,6 +2,28 @@
 
 ## Не випущено (developer)
 
+- **BRAVO_ARCHIV передає пароль архіву 7-Zip без BOM (T005).** Щоденний
+  архів (`New-Archive`) був останньою production-точкою, що писала пароль у
+  stdin 7-Zip напряму (`StandardInput.WriteLine`). Коли кодова сторінка
+  вводу консолі — UTF-8 (chcp 65001), .NET Framework додавав перед паролем
+  BOM, і 7-Zip шифрував архів паролем «U+FEFF + пароль». Тепер пароль
+  передається канонічним `Write-BRAVOProcessInputText` (UTF-8 без BOM),
+  як уже роблять Maintenance, DataRestore і перевірки цілісності.
+
+  **Наслідок для наявних архівів.** Архіви BRAVO_ARCHIV, створені до цього
+  виправлення під UTF-8-консоллю, зашифровані паролем «U+FEFF + пароль»:
+  ручне розпакування 7-Zip звичайним паролем для них завершиться
+  «Wrong password». Штатні перевірка цілісності й розпакування BRAVO
+  (`Invoke-BRAVOSevenZipIntegrityTest` / `Invoke-BRAVOSevenZipExtraction` —
+  DataRestore, restore drill) мають одну повторну спробу з BOM-префіксом і
+  такі архіви відкривають. Подальша політика щодо цих архівів — окреме
+  рішення власника (T006).
+
+  **Валідація.** Нові перевірки self-test: точні байти stdin від
+  `Write-BRAVOProcessInputText` (без BOM, CRLF, EOF), канонічний виклик у
+  `New-Archive` і заборона прямого `StandardInput.Write`/`WriteLine` у
+  production-коді.
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися

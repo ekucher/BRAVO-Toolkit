@@ -3535,6 +3535,88 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Runtime/SevenZipPasswordUsesStdin" `
         -Failure "створення/перевірка зашифрованого архіву через stdin не працює: $sevenZipRuntimeFailure"
 
+    # T005: поведінкова перевірка канонічного Write-BRAVOProcessInputText —
+    # ЄДИНОГО дозволеного способу передати пароль 7-Zip у stdin (Archive,
+    # Maintenance, Compatibility, DataRestore). Дочірній процес (той самий
+    # PowerShell-хост) читає СИРІ байти stdin і повертає їх hex-рядком;
+    # очікуються рівно UTF-8 БЕЗ BOM + CRLF, після чого stdin закрито (EOF,
+    # інакше дочірній процес не завершився б). Пароль — явно фейковий
+    # (кирилиця — щоб перевірити саме UTF-8), у діагностику не потрапляє:
+    # лише довжини та ознака BOM.
+    $stdinHelperFakePassword = "BRAVO-FAKE-не-пароль-T005"
+    $stdinHelperProcess = $null
+    $stdinHelperCapture = $null
+    $stdinHelperPassed = $false
+    $stdinHelperFailure = ""
+    try {
+        $stdinHelperExpectedBytes = (New-Object Text.UTF8Encoding($false)).GetBytes($stdinHelperFakePassword + "`r`n")
+        $stdinHelperChildScript = (
+            '$s=[Console]::OpenStandardInput();' +
+            '$m=New-Object IO.MemoryStream;$s.CopyTo($m);' +
+            '[Console]::Out.Write([BitConverter]::ToString($m.ToArray()))'
+        )
+        $stdinHelperInfo = New-Object Diagnostics.ProcessStartInfo
+        $stdinHelperInfo.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $stdinHelperInfo.Arguments = "-NoProfile -NonInteractive -EncodedCommand " +
+            [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($stdinHelperChildScript))
+        $stdinHelperInfo.RedirectStandardInput = $true
+        $stdinHelperInfo.RedirectStandardOutput = $true
+        $stdinHelperInfo.RedirectStandardError = $true
+        $stdinHelperInfo.UseShellExecute = $false
+        $stdinHelperInfo.CreateNoWindow = $true
+        $stdinHelperProcess = New-Object Diagnostics.Process
+        $stdinHelperProcess.StartInfo = $stdinHelperInfo
+        $stdinHelperCapture = Start-BRAVOProcessOutputCapture -Process $stdinHelperProcess
+        Write-BRAVOProcessInputText -Process $stdinHelperProcess -Text $stdinHelperFakePassword
+        $stdinHelperCompleted = $stdinHelperProcess.WaitForExit(60000)
+        if (-not $stdinHelperCompleted) {
+            $stdinHelperProcess.Kill()
+            [void]$stdinHelperProcess.WaitForExit(5000)
+        }
+        $stdinHelperOutput = Complete-BRAVOProcessOutputCapture -Capture $stdinHelperCapture
+        $stdinHelperCapture = $null
+        $stdinHelperHex = ([string]$stdinHelperOutput.StandardOutput).Trim()
+        $stdinHelperReceivedBytes = @()
+        if ($stdinHelperHex.Length -gt 0) {
+            $stdinHelperReceivedBytes = @($stdinHelperHex.Split('-') | ForEach-Object { [Convert]::ToByte($_, 16) })
+        }
+        $stdinHelperHasBom = (
+            $stdinHelperReceivedBytes.Count -ge 3 -and
+            $stdinHelperReceivedBytes[0] -eq 0xEF -and
+            $stdinHelperReceivedBytes[1] -eq 0xBB -and
+            $stdinHelperReceivedBytes[2] -eq 0xBF
+        )
+        $stdinHelperPassed = (
+            $stdinHelperCompleted -and
+            -not $stdinHelperHasBom -and
+            $stdinHelperReceivedBytes.Count -eq $stdinHelperExpectedBytes.Length -and
+            ([BitConverter]::ToString([byte[]]$stdinHelperReceivedBytes) -eq [BitConverter]::ToString($stdinHelperExpectedBytes))
+        )
+        if (-not $stdinHelperPassed) {
+            $stdinHelperFailure = "exited=$stdinHelperCompleted; bom=$stdinHelperHasBom; bytes=$($stdinHelperReceivedBytes.Count); expected=$($stdinHelperExpectedBytes.Length)"
+        }
+    } catch {
+        $stdinHelperFailure = $_.Exception.Message
+    } finally {
+        if ($null -ne $stdinHelperCapture) {
+            try {
+                [void](Complete-BRAVOProcessOutputCapture -Capture $stdinHelperCapture)
+            } catch {
+                # Прибирання після тестового дочірнього процесу: результат
+                # уже зафіксовано в $stdinHelperFailure, помилка дренажу
+                # потоків не повинна підмінити причину провалу.
+                $stdinHelperFailure = "$stdinHelperFailure; drain: $($_.Exception.Message)"
+            }
+        }
+        if ($null -ne $stdinHelperProcess) {
+            $stdinHelperProcess.Dispose()
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition $stdinHelperPassed `
+        -Name "Secrets/ProcessInputTextWritesExactBomFreeBytes" `
+        -Failure "Write-BRAVOProcessInputText має передати в stdin рівно UTF-8 без BOM + CRLF і закрити потік: $stdinHelperFailure"
+
     Test-BRAVOCondition `
         -Condition (Test-BRAVOAccountIdentityEquivalent `
             -ExpectedAccount "SYSTEM" `
@@ -6836,6 +6918,56 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Secrets/SevenZipPasswordUsesStdin" `
         -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу (включно з BRAVO.DataRestore inventory, мігрованим на канонічну Get-BRAVOSevenZipArchiveEntries)"
+
+    # T005: Archive (New-Archive) був останньою production-точкою, що писала
+    # пароль 7-Zip прямим $process.StandardInput.WriteLine — під
+    # UTF-8-консоллю це "U+FEFF<пароль>". Той самий гейт, що вище для
+    # Compatibility/DataRestore, тепер (1) вимагає канонічний виклик у
+    # Archive і (2) AST-рівнем (коментарі не рахуються) забороняє будь-який
+    # прямий <...>.StandardInput.Write(...)/WriteLine(...) у production-коді
+    # (кореневі BRAVO_*.ps1 окрім self-test, modules\, deploy\). Дозволений
+    # шлях запису в stdin дочірнього процесу — лише Write-BRAVOProcessInputText
+    # (BaseStream, UTF-8 без BOM). Діагностика — лише файл:рядок.
+    $archiveStdinAst = [Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $archiveStdinHelperCalls = @($archiveStdinAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Write-BRAVOProcessInputText' -and
+            $node.Extent.Text -match '-Text\s+\$script:archivePassword\b'
+    }, $true))
+    Test-BRAVOCondition `
+        -Condition ($archiveStdinHelperCalls.Count -ge 1) `
+        -Name "Secrets/ArchivePasswordUsesBomFreeStdinHelper" `
+        -Failure "New-Archive має передавати пароль 7-Zip через канонічний Write-BRAVOProcessInputText -Text `$script:archivePassword (UTF-8 без BOM), а не прямим StandardInput.WriteLine"
+
+    $directStdinWriteFiles = @(
+        @(Get-ChildItem -LiteralPath $root -Filter 'BRAVO_*.ps1' -File |
+            Where-Object { $_.Name -notlike 'BRAVO_SELF_TEST*' }) +
+        @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File |
+            Where-Object { @('.ps1', '.psm1') -contains $_.Extension }) +
+        @(Get-ChildItem -LiteralPath (Join-Path $root 'deploy') -Recurse -File |
+            Where-Object { @('.ps1', '.psm1') -contains $_.Extension })
+    )
+    $directStdinWriteViolations = @()
+    foreach ($directStdinWriteFile in $directStdinWriteFiles) {
+        $directStdinFileAst = [Management.Automation.Language.Parser]::ParseFile(
+            $directStdinWriteFile.FullName, [ref]$null, [ref]$null)
+        $directStdinWriteViolations += @($directStdinFileAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                @('Write', 'WriteLine') -contains $node.Member.Value -and
+                $node.Expression -is [Management.Automation.Language.MemberExpressionAst] -and
+                $node.Expression.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Expression.Member.Value -eq 'StandardInput'
+        }, $true) | ForEach-Object {
+            "{0}:{1}" -f $directStdinWriteFile.FullName.Substring($root.Length).TrimStart('\', '/'), $_.Extent.StartLineNumber
+        })
+    }
+    Test-BRAVOCondition `
+        -Condition ($directStdinWriteFiles.Count -gt 0 -and $directStdinWriteViolations.Count -eq 0) `
+        -Name "Secrets/NoDirectStandardInputWriteInProduction" `
+        -Failure "production-код не повинен писати в stdin дочірнього процесу прямим StandardInput.Write/WriteLine (під UTF-8-консоллю додає BOM до пароля 7-Zip) — лише через Write-BRAVOProcessInputText: $($directStdinWriteViolations -join ', ')"
 
     # Реальний випадок: власний прогрес-бокс Test-NetConnection
     # ("Attempting TCP connect", "Waiting for response") усе одно

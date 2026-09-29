@@ -3120,8 +3120,12 @@ function New-Archive {
         # Сучасні ОС використовують ReadToEndAsync, Windows 7/.NET 4.0 —
         # сумісний подієвий механізм зі спільного модуля.
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($script:archivePassword)
-        $process.StandardInput.Close()
+        # Пароль пишеться канонічним BOM-free Write-BRAVOProcessInputText
+        # (BRAVO.Compatibility): вона ж закриває stdin (EOF). Прямий
+        # StandardInput.WriteLine кодує Console.InputEncoding і під UTF-8
+        # кодовою сторінкою вводу консолі (chcp 65001) додавав BOM перед
+        # паролем — архів шифрувався паролем "U+FEFF<пароль>".
+        Write-BRAVOProcessInputText -Process $process -Text $script:archivePassword
         $sevenZipProgressId = 2
         $progressActivity = "7-Zip — $ArchiveName"
         $archiveStarted = Get-Date
