@@ -628,10 +628,10 @@ $compatibilityScriptText = [IO.File]::ReadAllText(
 )
 $webhookStubText = @'
 function New-BRAVOFake429Exception {
-    param([string]$RetryAfter)
+    param([string]$RetryAfter, [int]$StatusCode = 429)
     $fakeHeaders = @{ 'Retry-After' = $RetryAfter }
-    $fakeResponse = [PSCustomObject]@{ StatusCode = 429; Headers = $fakeHeaders }
-    $exception = New-Object System.Exception('429 Too Many Requests (fake)')
+    $fakeResponse = [PSCustomObject]@{ StatusCode = $StatusCode; Headers = $fakeHeaders }
+    $exception = New-Object System.Exception("HTTP $StatusCode (fake)")
     Add-Member -InputObject $exception -MemberType NoteProperty -Name Response -Value $fakeResponse -Force
     return $exception
 }
@@ -647,7 +647,7 @@ function Invoke-WebRequest {
     )
     $script:BRAVOFakeWebRequestCallCount++
     if ($script:BRAVOFakeWebRequestCallCount -le $script:BRAVOFakeWebRequest429Count) {
-        throw (New-BRAVOFake429Exception -RetryAfter $script:BRAVOFakeWebRequestRetryAfter)
+        throw (New-BRAVOFake429Exception -RetryAfter $script:BRAVOFakeWebRequestRetryAfter -StatusCode $script:BRAVOFakeWebRequestStatusCode)
     }
     return [PSCustomObject]@{ StatusCode = 200; Content = '' }
 }
@@ -661,16 +661,20 @@ $webhookModule = New-BRAVOSelfTestRuntimeModule `
     -FunctionNames @('New-BRAVOFake429Exception', 'Invoke-WebRequest', 'Start-Sleep', 'Enable-BRAVOTls12', 'Send-BRAVOWebhookNotification')
 
 function Invoke-BRAVOWebhook429Scenario {
+    # -StatusCode: HTTP-статус, яким фейковий Invoke-WebRequest падає перші
+    # -FailCount викликів (за замовчуванням 429; T031 — також 5xx/4xx).
     param(
         [int]$FailCount,
-        [string]$RetryAfter
+        [string]$RetryAfter,
+        [int]$StatusCode = 429
     )
     return & $webhookModule {
-        param($FailCount, $RetryAfter)
+        param($FailCount, $RetryAfter, $StatusCode)
         Set-StrictMode -Version Latest
         $script:BRAVOFakeWebRequestCallCount = 0
         $script:BRAVOFakeWebRequest429Count = $FailCount
         $script:BRAVOFakeWebRequestRetryAfter = $RetryAfter
+        $script:BRAVOFakeWebRequestStatusCode = $StatusCode
         $script:BRAVOFakeSleepTotalMs = [long]0
         $threw = $false
         $errorMessage = $null
@@ -686,7 +690,7 @@ function Invoke-BRAVOWebhook429Scenario {
             CallCount = $script:BRAVOFakeWebRequestCallCount
             SleepTotalMs = $script:BRAVOFakeSleepTotalMs
         }
-    } $FailCount $RetryAfter
+    } $FailCount $RetryAfter $StatusCode
 }
 
 # --- 429 один раз, потім успіх -> рівно 2 спроби, БЕЗ помилки.
@@ -752,6 +756,63 @@ Test-BRAVOCondition `
     -Condition $webhookNon429Result `
     -Name "Notifications/DiscordNon429NotRetried" `
     -Failure "помилка, що НЕ є 429, має прокидатись одразу без retry-циклу"
+
+# ============================================================
+# T031: transient HTTP 5xx (500/502/503/504) ретраїться за тією самою
+# обмеженою політикою, що й 429 (макс. 4 спроби, фолбек 1с/2с/4с,
+# Retry-After з капом 30с для 503). 501/505 і 4xx (крім 429) — НЕ
+# transient: прокидаються одразу, 1 спроба, без сну. Мережа і сон
+# фейкові (stub Invoke-WebRequest/Start-Sleep вище) — детерміновано.
+# ============================================================
+$webhookSuccessFirstTry = Invoke-BRAVOWebhook429Scenario -FailCount 0 -RetryAfter ''
+Test-BRAVOCondition `
+    -Condition (-not $webhookSuccessFirstTry.Threw -and $webhookSuccessFirstTry.CallCount -eq 1 -and $webhookSuccessFirstTry.SleepTotalMs -eq 0) `
+    -Name "Notifications/WebhookSuccessFirstTryNoRetry" `
+    -Failure "успіх з першої спроби має давати рівно 1 виклик без сну; отримано Threw=$($webhookSuccessFirstTry.Threw) '$($webhookSuccessFirstTry.ErrorMessage)', CallCount=$($webhookSuccessFirstTry.CallCount), SleepTotalMs=$($webhookSuccessFirstTry.SleepTotalMs)"
+
+foreach ($transientStatusCode in @(500, 502, 503, 504)) {
+    $webhookTransientRecovered = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '' -StatusCode $transientStatusCode
+    Test-BRAVOCondition `
+        -Condition (-not $webhookTransientRecovered.Threw -and $webhookTransientRecovered.CallCount -eq 2 -and $webhookTransientRecovered.SleepTotalMs -eq 1250) `
+        -Name "Notifications/Webhook$($transientStatusCode)RetryThenSuccess" `
+        -Failure "HTTP $transientStatusCode на першій спробі має ретраїтись (2 виклики, фолбек-сон 1250мс) і завершитись успіхом; отримано Threw=$($webhookTransientRecovered.Threw) '$($webhookTransientRecovered.ErrorMessage)', CallCount=$($webhookTransientRecovered.CallCount), SleepTotalMs=$($webhookTransientRecovered.SleepTotalMs)"
+
+    $webhookTransientExhausted = Invoke-BRAVOWebhook429Scenario -FailCount 99 -RetryAfter '' -StatusCode $transientStatusCode
+    Test-BRAVOCondition `
+        -Condition ($webhookTransientExhausted.Threw -and $webhookTransientExhausted.CallCount -eq 4 -and
+            $webhookTransientExhausted.SleepTotalMs -eq 7750 -and
+            $webhookTransientExhausted.ErrorMessage -match "HTTP $transientStatusCode" -and
+            $webhookTransientExhausted.ErrorMessage -match '4\s*спроб') `
+        -Name "Notifications/Webhook$($transientStatusCode)RetryBoundedAndNamesStatus" `
+        -Failure "постійний HTTP $transientStatusCode має дати РІВНО 4 спроби (сон 1.25+2.25+4.25=7750мс) і помилку зі статусом та кількістю спроб; отримано Threw=$($webhookTransientExhausted.Threw), CallCount=$($webhookTransientExhausted.CallCount), SleepTotalMs=$($webhookTransientExhausted.SleepTotalMs), '$($webhookTransientExhausted.ErrorMessage)'"
+}
+
+# --- Retry-After на 503 враховується (1.5с -> сон 1750мс), на 500 —
+# ігнорується на користь фолбеку 1с (сон 1250мс): заголовок визначений
+# лише для 429/503.
+$webhook503RetryAfter = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '1.5' -StatusCode 503
+Test-BRAVOCondition `
+    -Condition (-not $webhook503RetryAfter.Threw -and $webhook503RetryAfter.SleepTotalMs -eq 1750) `
+    -Name "Notifications/Webhook503HonoursRetryAfter" `
+    -Failure "503 з Retry-After='1.5' має давати сон 1750мс; отримано Threw=$($webhook503RetryAfter.Threw), SleepTotalMs=$($webhook503RetryAfter.SleepTotalMs)"
+$webhook503LargeRetryAfter = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '1800' -StatusCode 503
+Test-BRAVOCondition `
+    -Condition (-not $webhook503LargeRetryAfter.Threw -and $webhook503LargeRetryAfter.SleepTotalMs -eq 30250) `
+    -Name "Notifications/Webhook503RetryAfterCappedAt30s" `
+    -Failure "503 з Retry-After=1800 має капатись до 30с (сон 30250мс); отримано SleepTotalMs=$($webhook503LargeRetryAfter.SleepTotalMs)"
+$webhook500RetryAfter = Invoke-BRAVOWebhook429Scenario -FailCount 1 -RetryAfter '1.5' -StatusCode 500
+Test-BRAVOCondition `
+    -Condition (-not $webhook500RetryAfter.Threw -and $webhook500RetryAfter.SleepTotalMs -eq 1250) `
+    -Name "Notifications/Webhook500UsesBackoffNotRetryAfter" `
+    -Failure "500 має використовувати фолбек 1с (сон 1250мс), а не Retry-After; отримано SleepTotalMs=$($webhook500RetryAfter.SleepTotalMs)"
+
+foreach ($nonTransientStatusCode in @(400, 404, 501, 505)) {
+    $webhookNonTransient = Invoke-BRAVOWebhook429Scenario -FailCount 99 -RetryAfter '0' -StatusCode $nonTransientStatusCode
+    Test-BRAVOCondition `
+        -Condition ($webhookNonTransient.Threw -and $webhookNonTransient.CallCount -eq 1 -and $webhookNonTransient.SleepTotalMs -eq 0) `
+        -Name "Notifications/Webhook$($nonTransientStatusCode)NotRetried" `
+        -Failure "HTTP $nonTransientStatusCode не є transient і має прокидатись одразу (1 виклик, без сну); отримано Threw=$($webhookNonTransient.Threw), CallCount=$($webhookNonTransient.CallCount), SleepTotalMs=$($webhookNonTransient.SleepTotalMs)"
+}
 
 # ============================================================
 # Регресія порядку виконання (P0, знайдено /code-review коміту 5803859):

@@ -93,6 +93,9 @@ $restoreSyntheticModule = New-BRAVOSelfTestRuntimeModule `
     $script:ArchivePassword = @('bravo', 'synthetic', 'selftest', 'fixture') -join '-'
     $script:NativeCommandTimeoutSeconds = 300
     $script:SevenZipIntegrityTestTimeoutSeconds = 300
+    # T006: Test-BRAVOMaintenanceSevenZipArchiveIntegrity передає колектор
+    # legacy BOM-fallback-у прогону (module-scope стан, як і в runtime).
+    $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
 }
 
 $restoreSyntheticRoot = Join-Path ([IO.Path]::GetTempPath()) `
