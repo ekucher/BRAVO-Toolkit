@@ -11748,6 +11748,12 @@ function Write-BRAVOLog {
     param([string]$Message, [string]$Level = 'INFO', [string]$Component, [switch]$Console)
     if ($Level -eq 'ERROR') { Add-ProbeEvent "LOG-ERROR $Message" }
 }
+# T019: gate рівня підтримки ОС (справжній Invoke-BRAVODataRestoreOSSupportGate
+# лишається в збірці) читає Get-BRAVOOSSupportTier з BRAVO.Compatibility, який
+# у дочірньому процесі проби не імпортується: стаб «Supported» не блокує прогін.
+function Get-BRAVOOSSupportTier {
+    return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = '0'; PowerShellVersion = '5.1'; DotNetRelease = '0'; Message = '' }
+}
 function Initialize-BRAVOConsole { }
 function Initialize-BRAVOProgress { param($Enabled) }
 function Write-BRAVOHeader { param($Title, $Institution, $InstitutionCode, $Mode) }
