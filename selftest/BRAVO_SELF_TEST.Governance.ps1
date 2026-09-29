@@ -844,6 +844,36 @@
         -Name "Documentation/ReadmeNeverAdvisesDeletingManifest" `
         -Failure "README.md не повинен радити видаляти маніфест цілісності — це вимикає перевірку, а не усуває причину"
 
+    # T026: README (розділ про оновлення з 5.2.2) після 5.2.4 обіцяв, що
+    # below-floor при достатній оцінці БЛОКУЄ архівацію причиною
+    # BelowFloorEstimateNotPeakSafe. Так поводилась лише 5.2.3; з 5.2.4
+    # Resolve-BRAVOArchiveSpaceDecision передає класифікатору
+    # RequirementPolicy='ArchivePeakSafe', і той самий вхід дає WARNING
+    # BelowHealthFloorButRequirementSatisfied без блокування (Archive/A24).
+    # Застаріла обіцянка блоку штовхає оператора знижувати поріг або
+    # звільняти місце без потреби. Перевірка прив'язана до коду: вона
+    # вимагає правильного опису лише доки production-виклик Archive
+    # лишається на ArchivePeakSafe.
+    $archiveRuntimeTextForDiskSpaceDoc = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    $archiveUsesPeakSafePolicy = [regex]::IsMatch(
+        $archiveRuntimeTextForDiskSpaceDoc,
+        "(?m)^\s*RequirementPolicy\s*=\s*'ArchivePeakSafe'\s*$"
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveUsesPeakSafePolicy -and
+            $readmeTextForDocFixes.Contains('BelowHealthFloorButRequirementSatisfied') -and
+            -not [regex]::IsMatch(
+                $readmeTextForDocFixes,
+                '(?i)блок[а-яіїєґ'']*[^.;]{0,200}BelowFloorEstimateNotPeakSafe'
+            )
+        ) `
+        -Name "Documentation/ReadmeArchiveBelowFloorMatchesPeakSafePolicy" `
+        -Failure "README.md має описувати below-floor при достатній вимозі як WARNING BelowHealthFloorButRequirementSatisfied (Archive на RequirementPolicy='ArchivePeakSafe'), а не обіцяти блок BelowFloorEstimateNotPeakSafe"
+
     # Зовнішнє рев'ю 2026-08-05, P1: SECURITY.md публікував порядок
     # повідомлення про вразливості із заглушками "[заповнити]" замість SLA.
     # Політика без строків не є політикою.

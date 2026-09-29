@@ -1052,11 +1052,12 @@ UAC — можливий подальший крок, якщо той самий
 запитуються і не перезаписуються. Завдання оновлюються відповідно до поточного
 `schedulerSettings`.
 
-### Оновлення до 5.2.3: перевірка `ExcludedDrives` і `MinimumFreeSpaceGB`
+### Оновлення з 5.2.2 і раніше: перевірка `ExcludedDrives` і `MinimumFreeSpaceGB`
 
-5.2.3 переводить перевірку вільного місця (`BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`)
-на operation-aware політику — детально в `CHANGELOG.md` (розділ 5.2.3-dev.1).
-Перед оновленням production-сервера перевірте:
+5.2.3 перевела перевірку вільного місця (`BRAVO_ARCHIV`/`BRAVO_MAINTENANCE`)
+на operation-aware політику, 5.2.4 скоригувала її для архівації — детально в
+`CHANGELOG.md` (розділи 5.2.3-dev.1 і 5.2.4-rc.1). Перед оновленням
+production-сервера перевірте:
 
 - Якщо `Maintenance.Limits.ExcludedDrives` містить диск, доданий саме як обхід
   старого false-positive блокування (мало вільного місця на непов'язаному
@@ -1066,11 +1067,22 @@ UAC — можливий подальший крок, якщо той самий
   (`ExcludedDrives` тепер придушує лише health-попередження, не operational
   block).
 - Сервери, де архівація проходила через below-floor relaxation
-  (`Merge-BRAVOArchiveSpaceCheckResults` у 5.2.1/5.2.2 — доступно трохи менше
-  за `MinimumFreeSpaceGB`, але розрахункова оцінка достатня), після 5.2.3
-  почнуть блокуватись на цьому кроці (`BelowFloorEstimateNotPeakSafe`) — це
-  свідоме посилення політики. Перевірте фактичне вільне місце на archive
-  destination відносно `MinimumFreeSpaceGB` заздалегідь.
+  (`Merge-BRAVOArchiveSpaceCheckResults` у 5.2.1/5.2.2 — доступно менше за
+  `MinimumFreeSpaceGB`, але розрахункова оцінка достатня), проходять і далі:
+  з 5.2.4 архівація використовує політику `ArchivePeakSafe`, і для archive
+  destination `MinimumFreeSpaceGB` — поріг здоров'я тому, а не гейт операції.
+  Якщо доведена вимога вміщається в доступне місце, прогін **не блокується**:
+  у лозі з'являється рядок `DiskSpace ... Status=Warning Blocks=False
+  Reason=BelowHealthFloorButRequirementSatisfied` і `WARNING` виду
+  `<шляхи>: BelowHealthFloorButRequirementSatisfied`, крок `Перевірка вільного
+  місця` лишається `OK`, а успішний прогін завершується кодом `10`
+  (`SuccessWithWarnings`). Через нестачу місця блокують (код `40`,
+  `LocalArchiveFailed`) лише невиконана вимога (`EstimatedRequirementNotMet`)
+  і archive destination без визначеної вимоги, залишок якого нижчий за поріг
+  (`BelowFallbackFloorNoEstimate`).
+  Причину `BelowFloorEstimateNotPeakSafe` видавала лише 5.2.3;
+  production-виклики 5.2.4 і новіших її не породжують — побачивши її в лозі,
+  перевірте, чи оновлення справді застосувалось.
 
 ## 11. Якщо вручну працює, а за розкладом — ні
 
