@@ -50,6 +50,7 @@ FAKE_CURL = r'''#!/usr/bin/env bash
 # Fake curl for the notifier tests: no network.
 set -u
 scenario="$FAKE_SCENARIO_DIR"
+ALLARGS="$*"
 url=""
 out=""
 writeout=""
@@ -66,6 +67,7 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 echo "$url" >> "$scenario/requests.log"
+echo "$url $ALLARGS" >> "$scenario/curl-args.log"
 case "$url" in
   https://api.telegram.org/bot*/sendMessage)
     count_file="$scenario/telegram.count"
@@ -204,6 +206,11 @@ def run_notifier(script, scenario_setup, extra_env=None, step="notify"):
         if os.path.exists(requests_log):
             with open(requests_log, "r", encoding="utf-8") as handle:
                 result["requests"] = handle.read().split()
+        args_log = os.path.join(workdir, "curl-args.log")
+        result["curl_args"] = []
+        if os.path.exists(args_log):
+            with open(args_log, "r", encoding="utf-8") as handle:
+                result["curl_args"] = [l.rstrip("\n") for l in handle if l.strip()]
         return result
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -376,6 +383,37 @@ def main():
     r = run_notifier(validate, push_only())
     check("K both secrets present -> validation passes, nothing printed",
           r["rc"] == 0 and TOKEN not in r["log"] and CHAT not in r["log"], r["log"])
+
+    # P2-1: Telegram sendMessage is non-idempotent -> zero automatic curl retries;
+    # GitHub GET polling is idempotent -> bounded retries stay.
+    r = run_notifier(notifier, with_pr())
+    tg_args = [l for l in r["curl_args"] if "api.telegram.org" in l.split(" ", 1)[0]]
+    gh_args = [l for l in r["curl_args"] if "api.github.com" in l.split(" ", 1)[0]]
+    check("M exactly one Telegram invocation", len(tg_args) == 1, str(tg_args))
+    check("M Telegram POST has no --retry / --retry-all-errors / --retry-delay",
+          len(tg_args) == 1 and "--retry" not in tg_args[0], "\n".join(tg_args))
+    check("M Telegram POST keeps timeouts, POST and status capture",
+          len(tg_args) == 1 and all(x in tg_args[0] for x in ("--connect-timeout", "--max-time", "--request POST", "--write-out")), "\n".join(tg_args))
+    check("M GitHub GET keeps bounded retries",
+          len(gh_args) > 0 and all("--retry 2" in l and "--retry-all-errors" in l for l in gh_args), "\n".join(gh_args))
+
+    # P2-2: waiting / requested are unfinished -> INCOMPLETE with the warning icon
+    for state in ("waiting", "requested"):
+        r = run_notifier(notifier, push_only({PUSH_CHECKS[3]: {"status": state}}))
+        text = text_of(r)
+        line = [l for l in text.split("\n") if PUSH_CHECKS[3] in l]
+        check("N push %s -> INCOMPLETE, warning icon, no failure icon" % state,
+              r["rc"] == 0 and "Result: INCOMPLETE" in text and len(line) == 1
+              and line[0].startswith("[WARN]") and "[FAIL]" not in line[0] and line[0].endswith(": " + state), text)
+        r = run_notifier(notifier, with_pr({PR_CHECKS[6]: {"status": state}}))
+        text = text_of(r)
+        line = [l for l in text.split("\n") if PR_CHECKS[6] in l]
+        check("N PR check %s -> INCOMPLETE, warning icon, no failure icon" % state,
+              r["rc"] == 0 and "Result: INCOMPLETE" in text and "pre-merge checks: 7/8" in text
+              and len(line) == 1 and line[0].startswith("[WARN]") and "[FAIL]" not in line[0], text)
+        r = run_notifier(notifier, push_only({PUSH_CHECKS[0]: {"conclusion": "failure"},
+                                              PUSH_CHECKS[3]: {"status": state}}))
+        check("N failure + %s -> FAILED (precedence kept)" % state, "Result: FAILED" in text_of(r), text_of(r))
 
     # L. static security invariants of the workflow (structure, not wording)
     with open(WORKFLOW, "r", encoding="utf-8") as handle:

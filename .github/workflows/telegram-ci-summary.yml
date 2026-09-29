@@ -161,7 +161,7 @@ jobs:
               neutral|skipped)
                 printf '%s' "$ICON_SKIP"
                 ;;
-              missing|queued|in_progress|pending|unknown)
+              missing|queued|in_progress|pending|waiting|requested|unknown)
                 printf '%s' "$ICON_WARN"
                 ;;
               *)
@@ -408,13 +408,12 @@ jobs:
             '{chat_id: $chat_id, text: $text}' \
             > "$payload_file"
 
+          # sendMessage is not idempotent: no automatic curl retry here.
+          # An ambiguous failure must fail the job, never send a duplicate.
           set +e
           http_status="$(curl \
             --silent \
             --show-error \
-            --retry 2 \
-            --retry-all-errors \
-            --retry-delay 2 \
             --connect-timeout 10 \
             --max-time 30 \
             --output "$response_file" \

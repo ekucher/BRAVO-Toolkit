@@ -2,6 +2,17 @@
 
 ## Не випущено (developer)
 
+- **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
+  `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
+  використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний
+  збій транспорту завершує job помилкою і не створює дубль повідомлення (один запуск
+  notifier — щонайбільше одна спроба `sendMessage`). Ідемпотентні GET-запити до
+  GitHub API зберігають обмежені повтори. Статуси `waiting` і `requested`
+  відображаються як незавершені (значок попередження), узгоджено з підсумком
+  `INCOMPLETE`; пріоритет `FAILED` > `INCOMPLETE` > `SUCCESS` не змінено. Тест
+  `ci/test_telegram_ci_summary.py` розширено перевіркою аргументів `curl` для Telegram і
+  для GitHub GET та сценаріями `waiting`/`requested`.
+
 - **GitHub CI для `developer` тепер формує один підсумок у Telegram після merge/push.**
   Окремий workflow `.github/workflows/telegram-ci-summary.yml` запускається лише на
   `push` у `developer`, не виконує checkout і не запускає код PR. Він чекає
