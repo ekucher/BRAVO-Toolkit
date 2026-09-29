@@ -11,6 +11,16 @@
   використовуються лише в trusted `push`-контексті; значення token/chat ID та
   відповідь Telegram API не журналюються.
 
+  Пріоритет результату: `FAILED` (є перевірка, що завершилась не успіхом) >
+  `INCOMPLETE` (перевірок бракує або вони ще виконуються після таймауту) >
+  `SUCCESS`; відома помилка не ховається за іншою незавершеною перевіркою.
+  Пов'язаний PR — лише той merged PR у `developer`, чий `merge_commit_sha`
+  дорівнює SHA пушу (інакше відкриті й пізніше злиті PR, гілки яких містять
+  комміт, дали б хибний PR); прямий push звітує `N/A`. Поведінку логіки
+  перевіряє `ci/test_telegram_ci_summary.py` (справжній скрипт із workflow,
+  fake curl, записані відповіді API) у workflow
+  `telegram-ci-summary-test.yml`.
+
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
