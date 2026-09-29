@@ -318,16 +318,18 @@ retention нового запуску шукають уже новий преф�
 критичну проблему. Рядки `PLAN` описують операції, які production-скрипт
 виконав би, але dry-run їх не запускає.
 
-## Operator notification UX
+## Операторські сповіщення (UX)
 
-Setup, Dry Run and Diagnose test notifications use the same operator summary
-style as production runtime notifications:
+Тестові сповіщення Setup, Dry Run і Diagnose мають той самий стиль
+операторського підсумку, що й сповіщення production-runtime:
 
 - ✅ success -> `Дій не потрібно`;
 - ⚠️ warning -> `Потрібна дія: ...`;
-- 🚨 critical -> backup, integrity, credentials or maintenance safety is at risk.
+- 🚨 critical -> під загрозою backup, цілісність, облікові дані або безпека
+  обслуговування.
 
-The notification is not a technical log dump. It shows institution `🏢`,
-compact host/IP, optional public IP only when available, version/build and a
-log reference. Backup health uses `Остання резервна копія` for SUCCESS and
-`Остання успішна резервна копія` for WARNING/ERROR.
+Сповіщення — не дамп технічного логу. Воно показує установу `🏢`, компактні
+host/IP, публічну IP-адресу (опційно й лише коли вона доступна),
+версію/збірку та посилання на лог. Для стану резервних копій
+використовується `Остання резервна копія` для SUCCESS і
+`Остання успішна резервна копія` для WARNING/ERROR.

@@ -2129,82 +2129,84 @@ Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcrip
 
 ---
 
-## Operator notification UX
+## Операторські сповіщення (UX)
 
-Slack/Discord messages are first-response summaries:
+Повідомлення Slack/Discord — підсумки для першої реакції:
 
-- ✅ SUCCESS means the operation/check passed and no action is required.
-- ⚠️ WARNING means BRAVO can continue, but the message names the concrete
-  operator action.
-- 🚨 CRITICAL means backup, integrity, credentials or maintenance safety is at
-  risk. Do not improvise around integrity failures; follow the relevant
-  runbook section and inspect the referenced log.
+- ✅ SUCCESS означає, що операцію/перевірку пройдено і дій не потрібно.
+- ⚠️ WARNING означає, що BRAVO може продовжувати роботу, але повідомлення
+  називає конкретну дію оператора.
+- 🚨 CRITICAL означає, що під загрозою backup, цілісність, облікові дані або
+  безпека обслуговування. Не імпровізуйте в обхід збоїв цілісності:
+  виконайте відповідний розділ runbook і перегляньте лог, на який посилається
+  повідомлення.
 
-Large diagnostic collections (hundreds of affected files/ranges) are
-summarized in operator notifications: the message carries the total count,
-up to 5 representative examples and an `…і ще N` remainder line. Complete
-per-item diagnostics remain available only in the local BRAVO-Toolkit log.
-The notification layer additionally enforces a transport-agnostic safe
-payload limit: an anomalously large message is truncated at a line boundary
-with an explicit `⚠️ Повідомлення скорочено` suffix (the log-path line is
-preserved) instead of being split into a series of messages.
+Великі діагностичні колекції (сотні зачеплених файлів/діапазонів)
+підсумовуються в операторських сповіщеннях: повідомлення містить загальну
+кількість, до 5 показових прикладів і рядок-залишок `…і ще N`. Повна
+поелементна діагностика доступна лише в локальному лозі BRAVO-Toolkit.
+Шар сповіщень додатково застосовує незалежний від транспорту безпечний ліміт
+розміру: аномально велике повідомлення обрізається по межі рядка з явним
+суфіксом `⚠️ Повідомлення скорочено` (рядок зі шляхом до логу зберігається),
+а не розбивається на серію повідомлень.
 
-The top of a warning/critical message contains the reason and action before
-server metadata. The log path at the bottom is the source for full technical
-evidence: long filenames, destination paths, thresholds and tool output remain
-there.
+На початку повідомлення рівня warning/critical — причина й дія, і лише потім
+метадані сервера. Шлях до логу внизу — джерело повних технічних доказів:
+довгі імена файлів, шляхи призначення, пороги й вивід інструментів
+лишаються там.
 
-### GENERAL vs ALERTS channels
+### Канали GENERAL і ALERTS
 
-`BRAVO.Notifications` routes messages by severity into two channels, so an
-operator can put routine status in a low-noise channel and problems in a
-channel that pages someone:
+`BRAVO.Notifications` маршрутизує повідомлення за рівнем серйозності у два
+канали, щоб оператор міг спрямувати рутинний статус у малошумний канал, а
+проблеми — у канал, який когось викликає:
 
-| Severity | Channel |
+| Рівень | Канал |
 |---|---|
 | SUCCESS | GENERAL |
 | WARNING / ERROR / CRITICAL | ALERTS |
 
-Routing also depends on `NotificationMode`: `none` sends nothing; `errors_only`
-sends only to ALERTS (SUCCESS is suppressed); `all` sends SUCCESS to GENERAL
-and everything else to ALERTS.
+Маршрутизація також залежить від `NotificationMode`: `none` не надсилає
+нічого; `errors_only` надсилає лише в ALERTS (SUCCESS пригнічується); `all`
+надсилає SUCCESS у GENERAL, а все інше — в ALERTS.
 
-Each provider has two Credential Manager targets —
-`BRAVO_DISCORD_GENERAL_URL`/`BRAVO_DISCORD_ALERTS_URL` and
-`BRAVO_SLACK_GENERAL_URL`/`BRAVO_SLACK_ALERTS_URL` — set up via
+Кожен провайдер має два цільові записи Credential Manager —
+`BRAVO_DISCORD_GENERAL_URL`/`BRAVO_DISCORD_ALERTS_URL` і
+`BRAVO_SLACK_GENERAL_URL`/`BRAVO_SLACK_ALERTS_URL`, — які налаштовуються через
 `BRAVO_CREDENTIALS_SETUP.ps1 -Component Discord` / `-Component Slack`
-(each provider group configures both route-specific credentials at once).
+(група кожного провайдера налаштовує обидва канальні записи одразу).
 
-Required topology depends on `NotificationMode`:
+Обов'язкова топологія залежить від `NotificationMode`:
 
-| Mode | Required credentials |
+| Режим | Обов'язкові облікові дані |
 |---|---|
-| `none` | none |
-| `errors_only` | ALERTS only |
+| `none` | немає |
+| `errors_only` | лише ALERTS |
 | `all` | GENERAL + ALERTS |
 
-**MIGRATION (5.2.1): legacy provider-wide webhooks are no longer supported.**
-`BRAVO_DISCORD_URL` and `BRAVO_SLACK_URL` are ignored by the runtime: each
-channel resolves exclusively through its own route-specific credential, with
-no provider-wide fallback and no GENERAL↔ALERTS fallback. An installation
-that only has the legacy record fails Dry Run / Setup with an explicit
-diagnostic ("Знайдено лише legacy … — він більше не підтримується").
-Migration command (run for both stores):
+**МІГРАЦІЯ (5.2.1): legacy webhook-и рівня провайдера більше не підтримуються.**
+`BRAVO_DISCORD_URL` і `BRAVO_SLACK_URL` runtime ігнорує: кожен канал
+розв'язується виключно через власний канальний запис, без fallback на запис
+рівня провайдера і без fallback GENERAL↔ALERTS. Інсталяція, що має лише
+legacy-запис, не проходить Dry Run / Setup з явною діагностикою
+("Знайдено лише legacy … — він більше не підтримується").
+Команда міграції (виконайте для обох сховищ):
 
 ```powershell
 .\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Discord -StoreFor Both
 .\BRAVO_CREDENTIALS_SETUP.ps1 -Action Ensure -Component Slack -StoreFor Both
 ```
 
-The old Credential Manager records are NOT deleted automatically and are not
-copied into the new channel records (one shared webhook does not identify
-which Discord/Slack channel it pointed to) — configure the new topology
-deliberately, then remove the legacy records manually after acceptance.
-Verify real delivery to both channels with `.\BRAVO_NOTIFICATION_TEST.ps1`
-(canonical pipeline; explicitly marked test messages; requires credentials
-for the account it runs under — repeat under SYSTEM for scheduled tasks).
+Старі записи Credential Manager НЕ видаляються автоматично й не копіюються в
+нові канальні записи (один спільний webhook не визначає, на який канал
+Discord/Slack він вказував) — налаштуйте нову топологію свідомо, а legacy-
+записи видаліть вручну після acceptance. Перевірте фактичну доставку в обидва
+канали за допомогою `.\BRAVO_NOTIFICATION_TEST.ps1` (канонічний конвеєр;
+явно позначені тестові повідомлення; потребує облікових даних для того
+облікового запису, під яким запускається, — повторіть під SYSTEM для
+запланованих задач).
 
-Backup health wording:
+Формулювання стану резервних копій:
 
 - SUCCESS: `Остання резервна копія`.
 - WARNING/ERROR: `Остання успішна резервна копія`.
