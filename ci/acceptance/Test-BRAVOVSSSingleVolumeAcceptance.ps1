@@ -52,7 +52,7 @@ if (-not (Test-Path -LiteralPath $powerShellPath -PathType Leaf)) {
 
 $resultPath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_VSS_ACCEPTANCE_{0}.json" -f [guid]::NewGuid().ToString('N'))
 
-$childArguments = [Collections.Generic.List[string]]::new()
+$childArguments = New-Object 'System.Collections.Generic.List[string]'
 $childArguments.AddRange([string[]]@('-NoLogo', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $dryRunScriptPath))
 if (-not [string]::IsNullOrWhiteSpace($ConfigPath)) {
     $childArguments.AddRange([string[]]@('-ConfigPath', $ConfigPath))

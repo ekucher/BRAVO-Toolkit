@@ -79,6 +79,80 @@ function Format-BRAVOSchedulerNextRun {
 }
 
 # ---------------------------------------------------------------------------
+# Атомарний запис текстового файлу машинного стану (%ProgramData%\BRAVO\State).
+#
+# Стан завдань (BRAVO_RESTORE_STATE.json, BRAVO_TASK_EXECUTION_STATE.json)
+# раніше перезаписувався на місці через [IO.File]::WriteAllText: файл
+# обрізався до нуля ДО запису нових байтів, тож kill/втрата живлення/збій
+# диска посеред запису лишали порожній або обірваний JSON — а пошкоджений
+# стан далі трактується як «стану немає» (тижнева квота реставрації,
+# дата останнього запуску). Тут нові байти спершу повністю пишуться в
+# тимчасовий файл у ТОМУ Ж каталозі (той самий том — інакше Replace/Move не
+# атомарні), і лише потім підміняють цільовий файл ([IO.File]::Replace,
+# або ::Move, коли цілі ще немає). Будь-який збій до підміни лишає
+# попередній файл недоторканим, а тимчасовий — прибирається.
+#
+# Кодування — UTF-8 БЕЗ BOM, як у всіх попередніх записувачів стану.
+# Семантика читання та поведінка при пошкодженому файлі — справа викликача;
+# ця функція їх не змінює.
+#
+# Той самий патерн уже повторено локально в кількох записувачах
+# (Write-BRAVOServiceQuiescenceState нижче, BRAVO.Status, BRAVO.Operations,
+# BRAVO.Discovery тощо); їхня міграція на цю функцію — окрема задача.
+# ---------------------------------------------------------------------------
+
+function Write-BRAVOStateTemporaryText {
+    # Приватний крок запису байтів у тимчасовий файл. Винесено окремо, щоб
+    # self-test міг змоделювати збій посеред запису (обірваний тимчасовий
+    # файл + виняток) і перевірити, що цільовий файл лишився попереднім.
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    [IO.File]::WriteAllText($Path, $Text, (New-Object Text.UTF8Encoding($false)))
+}
+
+function Write-BRAVOStateFileAtomic {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][string]$Path,
+        [Parameter(Mandatory = $true)][AllowEmptyString()][string]$Text
+    )
+
+    $directory = [IO.Path]::GetDirectoryName($Path)
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        throw "Write-BRAVOStateFileAtomic: шлях має містити каталог: $Path"
+    }
+    if (-not [IO.Directory]::Exists($directory)) {
+        [void][IO.Directory]::CreateDirectory($directory)
+    }
+
+    $leafName = [IO.Path]::GetFileName($Path)
+    $uniqueSuffix = [guid]::NewGuid().ToString('N')
+    $temporaryPath = [IO.Path]::Combine($directory, ('.{0}_{1}.tmp' -f $leafName, $uniqueSuffix))
+    $backupPath = [IO.Path]::Combine($directory, ('.{0}_{1}.bak' -f $leafName, $uniqueSuffix))
+    $replaced = $false
+    try {
+        Write-BRAVOStateTemporaryText -Path $temporaryPath -Text $Text
+        if ([IO.File]::Exists($Path)) {
+            # .NET Framework відхиляє null-backup у Replace — тому явний шлях.
+            [IO.File]::Replace($temporaryPath, $Path, $backupPath)
+            $replaced = $true
+        } else {
+            [IO.File]::Move($temporaryPath, $Path)
+        }
+    } finally {
+        if ([IO.File]::Exists($temporaryPath)) {
+            [IO.File]::Delete($temporaryPath)
+        }
+        if ($replaced -and [IO.File]::Exists($backupPath)) {
+            Remove-Item -LiteralPath $backupPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Ownership-маркер зупинки служб (BRAVO_SERVICE_QUIESCENCE.json).
 #
 # Проблема: якщо Maintenance/DataRestore зупинив служби і процес загинув
