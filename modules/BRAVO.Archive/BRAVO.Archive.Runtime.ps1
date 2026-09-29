@@ -25,7 +25,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.System', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -3123,8 +3123,12 @@ function New-Archive {
         # Сучасні ОС використовують ReadToEndAsync, Windows 7/.NET 4.0 —
         # сумісний подієвий механізм зі спільного модуля.
         $outputCapture = Start-BRAVOProcessOutputCapture -Process $process
-        $process.StandardInput.WriteLine($script:archivePassword)
-        $process.StandardInput.Close()
+        # Пароль пишеться канонічним BOM-free Write-BRAVOProcessInputText
+        # (BRAVO.Compatibility): вона ж закриває stdin (EOF). Прямий
+        # StandardInput.WriteLine кодує Console.InputEncoding і під UTF-8
+        # кодовою сторінкою вводу консолі (chcp 65001) додавав BOM перед
+        # паролем — архів шифрувався паролем "U+FEFF<пароль>".
+        Write-BRAVOProcessInputText -Process $process -Text $script:archivePassword
         $sevenZipProgressId = 2
         $progressActivity = "7-Zip — $ArchiveName"
         $archiveStarted = Get-Date
@@ -6182,7 +6186,7 @@ function Write-BRAVOBackupExecutionState {
     $state = @{}
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         try {
-            $previous = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $state.Maintenance = [string]$previous.Maintenance
             $state.Backup = [string]$previous.Backup
         } catch {
@@ -6197,7 +6201,7 @@ function Write-BRAVOBackupExecutionState {
         }
     }
     $state.Backup = ([datetime]::Now).ToString('o')
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json)
 }
 
 function Main {
@@ -8244,6 +8248,13 @@ function Main {
                 if ($backupMonitoring.NotifyOnSuccessAfterBackup -and
                     $backupNotificationMode.ToLowerInvariant() -eq "all") {
                     $healthParameters.NotifyOnSuccess = $true
+                }
+                # -NoSlack оператора діє на ВЕСЬ прогін, включно з вбудованим
+                # Health: без прокидання Health міг надіслати повідомлення,
+                # хоча запуск явно заборонив Slack. Передається лише коли
+                # прапорець встановлено — поведінка за замовчуванням незмінна.
+                if ($NoSlack) {
+                    $healthParameters.NoSlack = $true
                 }
                 $healthModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Health\BRAVO.Health.psd1'
                 if (-not (Test-Path -LiteralPath $healthModulePath -PathType Leaf)) {

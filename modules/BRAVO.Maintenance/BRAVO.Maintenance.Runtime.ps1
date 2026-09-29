@@ -110,12 +110,10 @@ If (-not $isLocalSystem -and -not $currentPrincipal.IsInRole([Security.Principal
 	Exit $elevatedProcess.ExitCode
 }
 
-# Примусово використовуємо TLS 1.2. Числове значення 3072 сумісне зі старими
-# .NET/PowerShell, у яких ім'я Tls12 може бути відсутнім у переліку enum.
-[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject(
-    [Net.SecurityProtocolType],
-    3072
-)
+# Вмикаємо TLS 1.2 АДИТИВНО (канонічний Enable-BRAVOTls12 з BRAVO.Compatibility,
+# імпортованого вище з -ErrorAction Stop): уже ввімкнені протоколи
+# (напр. Tls13, Tls11) зберігаються, а не затираються значенням 3072.
+Enable-BRAVOTls12
 [Net.ServicePointManager]::Expect100Continue = $false
 
 # Очистка терміналу
@@ -1298,6 +1296,45 @@ function Get-BRAVOMaintenanceFinalStatus {
     }
 }
 
+# Облік exit-коду дочірнього BRAVO_ARCHIV (архівація після maintenance).
+# Раніше будь-який ненульовий код, включно з 10 (SuccessWithWarnings —
+# архів створено, але з попередженнями), логувався як ERROR і виставляв
+# $script:criticalErrorOccurred, тож Maintenance завершувався кодом 60
+# (MaintenanceFailed) за успішної архівації. Класифікація — за назвою коду
+# з BRAVO.ExitCodes (Get-BRAVOExitCodeName), без власної числової таблиці:
+#   Success             -> SUCCESS, без деталей;
+#   SuccessWithWarnings -> WARNING (інкрементує $script:BRAVOWarningCount,
+#                          тож операція стає WARN, а прогін — 10), не critical;
+#   будь-що інше (і $null) -> ERROR + $script:criticalErrorOccurred, як і раніше.
+# Повертає текст Details для операції 'Архівація після maintenance' або $null.
+function Register-BRAVOMaintenanceArchiveChildResult {
+    param(
+        [Parameter(Mandatory = $true)]
+        [AllowNull()]
+        [object]$ExitCode
+    )
+
+    # $null не приводиться до [int] (це дало б 0 = Success): невідомий код
+    # дочірнього процесу лишається помилкою, як і в попередній перевірці -eq 0.
+    $exitCodeName = if ($null -eq $ExitCode) { $null } else { Get-BRAVOExitCodeName -Code ([int]$ExitCode) }
+    switch ($exitCodeName) {
+        'Success' {
+            Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 успішно виконано" -Level "SUCCESS"
+            return $null
+        }
+        'SuccessWithWarnings' {
+            $exitCodeText = "{0} — {1}" -f $ExitCode, $exitCodeName
+            Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з попередженнями (код $exitCodeText); деталі — у журналі BRAVO_ARCHIV" -Level "WARNING"
+            return "BRAVO_ARCHIV завершився з попередженнями (код $exitCodeText)"
+        }
+        default {
+            Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з кодом помилки: $ExitCode" -Level "ERROR"
+            $script:criticalErrorOccurred = $true
+            return "BRAVO_ARCHIV завершився з кодом $ExitCode"
+        }
+    }
+}
+
 # ЄДИНА канонічна точка обліку результату етапу — і лічильники підсумкового
 # блоку РЕЗУЛЬТАТ, і журнал для фінального сповіщення. Викликається з ОБОХ
 # рендерів: Write-BRAVOMaintenanceStep (пронумеровані [N/Total]) і
@@ -1780,7 +1817,7 @@ function Get-BRAVORestoreScheduledOccurrence {
 function Read-BRAVORestoreState {
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
+    try { return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
     catch { Write-Log -Message "Не вдалося прочитати restore state: $($_.Exception.Message)" -Level 'WARNING'; return $null }
 }
 
@@ -1877,7 +1914,7 @@ function Write-BRAVORestoreForcedOutcome {
         LastSuccessfulRestoreAt = $CompletedAt.ToString('o')
         UpdatedAt = ([datetime]::Now).ToString('o')
     }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json -Depth 3)
 }
 
 function Write-BRAVORestoreState {
@@ -1913,14 +1950,14 @@ function Write-BRAVORestoreState {
         LastSuccessfulRestoreAt = $(if ($null -ne $lastSuccessfulRestoreAt) { ([datetime]$lastSuccessfulRestoreAt).ToString('o') } else { $null })
         UpdatedAt = ([datetime]::Now).ToString('o')
     }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json -Depth 3)
 }
 
 function Get-BRAVOTaskExecutionState {
     $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
     try {
-        $state = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $state = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         return @{ Maintenance = [string]$state.Maintenance; Backup = [string]$state.Backup }
     } catch { return @{} }
 }
@@ -1933,7 +1970,7 @@ function Write-BRAVOTaskExecutionState {
     }
     $state = Get-BRAVOTaskExecutionState
     $state[$TaskName] = ([datetime]::Now).ToString('o')
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json)
 }
 
 
@@ -7062,7 +7099,7 @@ function Send-FinalReport {
     else {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
-            $completedCheckLines = [System.Collections.Generic.List[string]]::new()
+            $completedCheckLines = New-Object 'System.Collections.Generic.List[string]'
             $lastRestoreTime = $restoreCompletedAt
             # Персистована дата — джерело істини для ОБОХ шляхів: маркери
             # restore_done_*.marker бачать лише автоматичну реставрацію
@@ -10362,13 +10399,9 @@ if ($script:EnableArchiveAfterMaintenance) {
                 -PassThru `
                 -NoNewWindow
 
-            if ($archivProcess.ExitCode -eq 0) {
-                Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 успішно виконано" -Level "SUCCESS"
-            } else {
-                Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 завершено з кодом помилки: $($archivProcess.ExitCode)" -Level "ERROR"
-                $script:criticalErrorOccurred = $true
-                $archiveOperationDetail = "BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"
-            }
+            # 0 -> SUCCESS; 10 (SuccessWithWarnings) -> WARNING, не critical;
+            # інше -> ERROR + critical (див. Register-BRAVOMaintenanceArchiveChildResult).
+            $archiveOperationDetail = Register-BRAVOMaintenanceArchiveChildResult -ExitCode $archivProcess.ExitCode
         } else {
             Write-Log -Message "Скрипт BRAVO_ARCHIV.ps1 не знайдено за шляхом: $bravoArchivePath" -Level "ERROR"
             $script:criticalErrorOccurred = $true

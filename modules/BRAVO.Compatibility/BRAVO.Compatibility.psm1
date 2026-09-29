@@ -1283,6 +1283,113 @@ function ConvertFrom-BRAVOJson {
     }
 }
 
+function Invoke-BRAVOInputPreambleFreeStart {
+    # Приватне ядро Start-BRAVOProcessWithBomFreeInput (не експортується).
+    # Доступ до кодування консолі та сам запуск передаються scriptblock-ами,
+    # щоб кожну гілку рішення (запуск як є / тимчасова заміна кодування /
+    # fail-closed) і відновлення кодування у finally можна було
+    # детерміновано перевірити самотестом на будь-якому хості.
+    #
+    # [Console]::InputEncoding — процес-wide стан. Уся транзакція
+    # read -> set -> start -> restore серіалізована через Monitor на
+    # [System.Console] (той самий Type-об'єкт в усіх PowerShell-раншпейсах
+    # одного процесу): без цього два конкурентні виклики з різних
+    # раншпейсів могли б переплестись так, що другий отримав би BOM у
+    # stdin попри використання цього хелпера (виявлено review PR #249).
+    # BRAVO сьогодні не запускає ці процеси конкурентно (жодних
+    # Runspace/Start-Job/-Parallel навколо Start-BRAVOProcessOutputCapture
+    # у production-коді), тож лок не змінює наявну поведінку — це захист
+    # від майбутньої регресії, а не фікс живого дефекту.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$StartAction,
+        [Parameter(Mandatory = $true)][scriptblock]$GetInputEncoding,
+        [Parameter(Mandatory = $true)][scriptblock]$SetInputEncoding
+    )
+
+    $lockToken = [System.Console]
+    $lockTaken = $false
+    try {
+        [System.Threading.Monitor]::Enter($lockToken, [ref]$lockTaken)
+
+        $originalEncoding = & $GetInputEncoding
+        if ($null -eq $originalEncoding) {
+            throw "Запуск процесу з redirected stdin заблоковано: не вдалося визначити кодування вводу консолі."
+        }
+        if (@($originalEncoding.GetPreamble()).Count -eq 0) {
+            # Кодування без преамбули (cp866/cp1251/UTF-8 без BOM): StreamWriter
+            # stdin нічого не допише до першого запису — запуск без змін.
+            $null = & $StartAction
+            return
+        }
+
+        $encodingReplaced = $false
+        try {
+            $replaceError = $null
+            try {
+                & $SetInputEncoding (New-Object System.Text.UTF8Encoding($false))
+                $encodingReplaced = $true
+            } catch {
+                $replaceError = $_.Exception.Message
+            }
+            if (-not $encodingReplaced) {
+                # Замінити не вдалося (наприклад, процес без консолі). Безпечно
+                # лише якщо фактичне кодування вводу вже без преамбули; інакше
+                # дочірній процес отримав би BOM перед секретом — fail-closed.
+                $currentEncoding = & $GetInputEncoding
+                if ($null -eq $currentEncoding -or @($currentEncoding.GetPreamble()).Count -gt 0) {
+                    throw ("Запуск процесу з redirected stdin заблоковано (fail-closed): кодування вводу консолі " +
+                        "'$($originalEncoding.WebName)' має преамбулу (BOM), а тимчасово замінити його не вдалося: " +
+                        "$replaceError. Дочірній процес отримав би BOM перед даними stdin (зокрема паролем).")
+                }
+            }
+            $null = & $StartAction
+        } finally {
+            if ($encodingReplaced) {
+                & $SetInputEncoding $originalEncoding
+            }
+        }
+    } finally {
+        if ($lockTaken) {
+            [System.Threading.Monitor]::Exit($lockToken)
+        }
+    }
+}
+
+function Start-BRAVOProcessWithBomFreeInput {
+    # Канонічний запуск процесу, stdin якого перенаправлено: дочірній
+    # процес отримує в stdin РІВНО ті байти, які потім запише викликач,
+    # без BOM. Причина (.NET Framework 4.x, виведено з поведінки Process і
+    # StreamWriter та підтверджено Windows CI — 38 байт замість 35):
+    # Process.Start створює StandardInput як
+    # StreamWriter(pipe, Console.InputEncoding) і вмикає AutoFlush; сеттер
+    # AutoFlush викликає Flush, який ОДРАЗУ пише преамбулу кодування в
+    # pipe — ще до будь-якого запису викликача. Під UTF-8-консоллю
+    # (chcp 65001) Console.InputEncoding має преамбулу, тож BOM уже в pipe,
+    # і запис через BaseStream (Write-BRAVOProcessInputText) його не
+    # прибирає. ProcessStartInfo.StandardInputEncoding у .NET Framework 4.x
+    # немає (з'явився лише в .NET Core), тому на час Start() кодування
+    # вводу консолі тимчасово замінюється на UTF-8 без BOM (та сама кодова
+    # сторінка 65001) і відновлюється у finally. Якщо замінити не вдалося,
+    # а преамбула лишається, запуск відмовляє (fail-closed).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$Process
+    )
+
+    if (-not $Process.StartInfo.RedirectStandardInput) {
+        # StandardInput не створюється — кодування stdin не має значення.
+        [void]$Process.Start()
+        return
+    }
+
+    Invoke-BRAVOInputPreambleFreeStart `
+        -StartAction { [void]$Process.Start() } `
+        -GetInputEncoding { [Console]::InputEncoding } `
+        -SetInputEncoding { param($Encoding) [Console]::InputEncoding = $Encoding }
+}
+
 function Start-BRAVOProcessOutputCapture {
     [CmdletBinding()]
     param(
@@ -1313,7 +1420,7 @@ function Start-BRAVOProcessOutputCapture {
 
     if ($useModernApi) {
         try {
-            $Process.Start() | Out-Null
+            Start-BRAVOProcessWithBomFreeInput -Process $Process
         } catch {
             if ($winSCPProcessLock) { $winSCPProcessLock.Dispose() }
             throw
@@ -1360,7 +1467,7 @@ function Start-BRAVOProcessOutputCapture {
         }
 
     try {
-        $Process.Start() | Out-Null
+        Start-BRAVOProcessWithBomFreeInput -Process $Process
         $Process.BeginOutputReadLine()
         $Process.BeginErrorReadLine()
     } catch {
@@ -1655,13 +1762,17 @@ function ConvertTo-BRAVOWindowsCommandLineArgument {
 
 function Write-BRAVOProcessInputText {
     # Детермінований запис у stdin дочірнього процесу: UTF-8 БЕЗ BOM через
-    # BaseStream. У .NET Framework Process.StandardInput завжди використовує
-    # Console.InputEncoding, і під UTF-8-консоллю (chcp 65001) StreamWriter
-    # додає BOM перед ПЕРШИМ записом — 7-Zip тоді отримує "BOM+пароль":
+    # BaseStream, незалежно від кодування StreamWriter-а StandardInput
+    # (Console.InputEncoding у .NET Framework). Під UTF-8-консоллю
+    # (chcp 65001) BOM перед паролем означав для 7-Zip "BOM+пароль":
     # створення архіву «успішне», але зашифроване спотвореним паролем, а
     # додавання в існуючий архів падає з "Wrong password" (виявлено
-    # характеризацією Trace-MDZ під UTF-8-хостом). Кожен рядок завершується
-    # CRLF; потік закривається (EOF) — як і попередній WriteLine+Close.
+    # характеризацією Trace-MDZ під UTF-8-хостом). Цей хелпер гарантує
+    # лише власні байти: преамбулу, яку .NET Framework пише в pipe ще в
+    # Process.Start (AutoFlush), прибирає лише запуск через канонічний
+    # Start-BRAVOProcessWithBomFreeInput (його викликає
+    # Start-BRAVOProcessOutputCapture). Кожен рядок завершується CRLF;
+    # потік закривається (EOF) — як і попередній WriteLine+Close.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
@@ -2450,11 +2561,20 @@ function Send-BRAVOWebhookNotification {
     # щоб надсилання сповіщення не перекривало смугу прогресу BRAVO.
     $ProgressPreference = 'SilentlyContinue'
 
-    # HTTP 429 (Too Many Requests) обмежений retry з пріоритетом на
-    # Retry-After: максимум 4 спроби сумарно (1 первинна + 3 повтори).
-    # Будь-яка інша помилка (не 429) прокидається одразу — без ретраю, як і
-    # раніше. Успішна відповідь після retry вважається тим самим успішним
-    # відправленням цього chunk — виклик далі не знає про кількість спроб.
+    # Transient HTTP-статуси мають обмежений retry: максимум 4 спроби
+    # сумарно (1 первинна + 3 повтори). Transient = 429 (Too Many Requests)
+    # і 500/502/503/504 — тимчасові збої сервера/проміжного шлюзу (Discord/
+    # Slack/Cloudflare-фронт), які зазвичай минають за секунди. НЕ transient:
+    # 501 (Not Implemented) і 505 (HTTP Version Not Supported) — постійна
+    # властивість endpoint'а, повтор дасть той самий результат; решта 5xx
+    # (506-511 тощо) і всі 4xx, крім 429, так само прокидаються одразу, як і
+    # мережеві збої без HTTP-статусу. Retry-After (з капом 30с) враховується
+    # для 429 і 503 — саме для них RFC 6585/9110 визначають цей заголовок;
+    # для 500/502/504 — фолбек 1с/2с/4с. Успішна відповідь після retry
+    # вважається тим самим успішним відправленням цього chunk — виклик далі
+    # не знає про кількість спроб.
+    $transientWebhookStatusCodes = @(429, 500, 502, 503, 504)
+    $retryAfterWebhookStatusCodes = @(429, 503)
     $maxWebhookAttempts = 4
     $webhookAttempt = 0
     $response = $null
@@ -2469,17 +2589,23 @@ function Send-BRAVOWebhookNotification {
             if ($null -ne $webResponse) {
                 try { $statusCode = [int]$webResponse.StatusCode } catch { $statusCode = $null }
             }
-            if ($statusCode -ne 429) {
+            if ($null -eq $statusCode -or $transientWebhookStatusCodes -notcontains $statusCode) {
                 throw
             }
             if ($webhookAttempt -ge $maxWebhookAttempts) {
-                # Оператор має бачити, що це саме rate limit і скільки спроб
+                # Оператор має бачити конкретний HTTP-статус і скільки спроб
                 # зроблено, а не генеричну помилку webhook.
-                throw "Webhook $Provider`: HTTP 429 після $maxWebhookAttempts спроб (rate limit не знято): $($_.Exception.Message)"
+                $exhaustionReason = if ($statusCode -eq 429) {
+                    "rate limit не знято"
+                } else {
+                    "сервер webhook тимчасово недоступний"
+                }
+                throw "Webhook $Provider`: HTTP $statusCode після $maxWebhookAttempts спроб ($exhaustionReason): $($_.Exception.Message)"
             }
 
             $retryAfterSeconds = $null
-            if ($null -ne $webResponse -and $null -ne $webResponse.Headers) {
+            if ($retryAfterWebhookStatusCodes -contains $statusCode -and
+                $null -ne $webResponse -and $null -ne $webResponse.Headers) {
                 $retryAfterRaw = $webResponse.Headers["Retry-After"]
                 if (-not [string]::IsNullOrWhiteSpace($retryAfterRaw)) {
                     # InvariantCulture: на uk-UA (десяткова кома) дробове
@@ -2507,7 +2633,7 @@ function Send-BRAVOWebhookNotification {
                 $retryAfterSeconds = [math]::Min(10, [math]::Pow(2, $webhookAttempt - 1))
             }
             $delaySeconds = $retryAfterSeconds + 0.25
-            Write-Verbose "Webhook $Provider повернув 429 (спроба $webhookAttempt/$maxWebhookAttempts); повтор через $delaySeconds сек."
+            Write-Verbose "Webhook $Provider повернув HTTP $statusCode (спроба $webhookAttempt/$maxWebhookAttempts); повтор через $delaySeconds сек."
             Start-Sleep -Milliseconds ([int][math]::Ceiling($delaySeconds * 1000))
         }
     }
