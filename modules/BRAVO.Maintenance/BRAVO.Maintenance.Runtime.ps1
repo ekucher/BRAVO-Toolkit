@@ -1813,7 +1813,7 @@ function Get-BRAVORestoreScheduledOccurrence {
 function Read-BRAVORestoreState {
     $path = Join-Path $stateRoot 'BRAVO_RESTORE_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
-    try { return (Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
+    try { return (Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop) }
     catch { Write-Log -Message "Не вдалося прочитати restore state: $($_.Exception.Message)" -Level 'WARNING'; return $null }
 }
 
@@ -1910,7 +1910,7 @@ function Write-BRAVORestoreForcedOutcome {
         LastSuccessfulRestoreAt = $CompletedAt.ToString('o')
         UpdatedAt = ([datetime]::Now).ToString('o')
     }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json -Depth 3)
 }
 
 function Write-BRAVORestoreState {
@@ -1946,14 +1946,14 @@ function Write-BRAVORestoreState {
         LastSuccessfulRestoreAt = $(if ($null -ne $lastSuccessfulRestoreAt) { ([datetime]$lastSuccessfulRestoreAt).ToString('o') } else { $null })
         UpdatedAt = ([datetime]::Now).ToString('o')
     }
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json -Depth 3), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json -Depth 3)
 }
 
 function Get-BRAVOTaskExecutionState {
     $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return @{} }
     try {
-        $state = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        $state = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
         return @{ Maintenance = [string]$state.Maintenance; Backup = [string]$state.Backup }
     } catch { return @{} }
 }
@@ -1966,7 +1966,7 @@ function Write-BRAVOTaskExecutionState {
     }
     $state = Get-BRAVOTaskExecutionState
     $state[$TaskName] = ([datetime]::Now).ToString('o')
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json)
 }
 
 
