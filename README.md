@@ -83,7 +83,7 @@ runbook за кожним кодом завершення, із розділом
 > потрібен). Архітектурне рішення про підтримку багатотомних джерел без
 > `diskshadow.exe` (наприклад, через VSS COM API) — окреме, ще не ухвалене.
 
-Archive, Health і Maintenance визначають рівень при кожному запуску
+Archive, Health, Maintenance і DataRestore визначають рівень при кожному запуску
 (`Get-BRAVOOSSupportTier`, `modules\BRAVO.Compatibility`) і завжди пишуть у
 журнал точну версію ОС, build, PowerShell і .NET — незалежно від рівня. На
 `Legacy best-effort` запуск лише попереджає. На `Unsupported` production-запуск
