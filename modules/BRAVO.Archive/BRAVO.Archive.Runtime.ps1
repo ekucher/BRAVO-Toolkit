@@ -8171,6 +8171,13 @@ function Main {
                     $backupNotificationMode.ToLowerInvariant() -eq "all") {
                     $healthParameters.NotifyOnSuccess = $true
                 }
+                # -NoSlack оператора діє на ВЕСЬ прогін, включно з вбудованим
+                # Health: без прокидання Health міг надіслати повідомлення,
+                # хоча запуск явно заборонив Slack. Передається лише коли
+                # прапорець встановлено — поведінка за замовчуванням незмінна.
+                if ($NoSlack) {
+                    $healthParameters.NoSlack = $true
+                }
                 $healthModulePath = Join-Path $bravoScriptDirectory 'modules\BRAVO.Health\BRAVO.Health.psd1'
                 if (-not (Test-Path -LiteralPath $healthModulePath -PathType Leaf)) {
                     throw "Не знайдено модуль health-check: $healthModulePath"

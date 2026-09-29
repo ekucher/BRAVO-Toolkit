@@ -17622,6 +17622,112 @@ function Write-BRAVOLog {
         -Name 'Archive/EmbeddedHealthRemainsOneStep' `
         -Failure '''Перевірка резервних копій'' має рендеритись РІВНО один раз (один Write-BRAVOArchiveStep) незалежно від Invoke-BRAVOHealthCheck.Status — жодного вкладеного Health-виводу'
 
+    # --- Archive: -NoSlack прогону має доходити до вбудованого Health
+    # (T014). Поведінковий тест: РЕАЛЬНІ оператори з try-блоку Archive від
+    # `$healthParameters = @{` до виклику Invoke-BRAVOHealthCheck
+    # виконуються ізольовано (окремий New-Module) з підміненим
+    # Invoke-BRAVOHealthCheck, що фіксує фактично зв'язані параметри.
+    $archiveHealthNoSlackAst = [Management.Automation.Language.Parser]::ParseInput(
+        $archiveScriptText, [ref]$null, [ref]$null)
+    $archiveHealthTryAst = @(
+        $archiveHealthNoSlackAst.FindAll(
+            {
+                param($node)
+                $node -is [Management.Automation.Language.TryStatementAst] -and
+                $node.Body.Extent.Text.Contains('$healthParameters = @{') -and
+                $node.Body.Extent.Text.Contains('Invoke-BRAVOHealthCheck @healthParameters')
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    $archiveHealthBuildText = $null
+    if ($null -ne $archiveHealthTryAst) {
+        $archiveHealthBuildStatements = New-Object System.Collections.Generic.List[string]
+        $archiveHealthBuildStarted = $false
+        foreach ($archiveHealthStatement in $archiveHealthTryAst.Body.Statements) {
+            $archiveHealthStatementText = $archiveHealthStatement.Extent.Text
+            if ($archiveHealthStatementText.StartsWith('$healthParameters = @{')) {
+                $archiveHealthBuildStarted = $true
+            }
+            if ($archiveHealthBuildStarted) {
+                $archiveHealthBuildStatements.Add($archiveHealthStatementText)
+            }
+            if ($archiveHealthBuildStarted -and
+                $archiveHealthStatementText.Contains('Invoke-BRAVOHealthCheck @healthParameters')) {
+                break
+            }
+        }
+        if ($archiveHealthBuildStatements.Count -gt 0) {
+            $archiveHealthBuildText = $archiveHealthBuildStatements -join "`r`n"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $archiveHealthBuildText) `
+        -Name 'Archive/HealthParametersBlockFound' `
+        -Failure 'не знайдено try-блок Archive з `$healthParameters = @{ ... } і Invoke-BRAVOHealthCheck @healthParameters -- тест T014 потребує оновлення'
+    if ($null -ne $archiveHealthBuildText) {
+        $archiveHealthNoSlackScenarios = @(
+            @{ NoSlack = $true; Name = 'Archive/NoSlackPropagatedToEmbeddedHealth' }
+            @{ NoSlack = $false; Name = 'Archive/EmbeddedHealthDefaultWithoutNoSlackUnchanged' }
+        )
+        foreach ($archiveHealthNoSlackScenario in $archiveHealthNoSlackScenarios) {
+            $archiveHealthEvalModule = New-Module -ScriptBlock {}
+            $archiveHealthBound = & $archiveHealthEvalModule {
+                param($NoSlackValue, $BuildText)
+                $NoSlack = [switch]$NoSlackValue
+                $configPath = 'STUB-CONFIG-PATH'
+                $configPathWasExplicit = $false
+                $bravoScriptDirectory = 'STUB-RUNTIME-ROOT'
+                $backupMonitoring = @{ NotificationMode = 'errors_only'; NotifyOnSuccessAfterBackup = $false }
+                $transferResults = @{
+                    BAZA_APP = @{ Attempted = $false }
+                    BAZA_WWW = @{ Attempted = $false }
+                }
+                $script:bazaAppSyncResult = $null
+                $script:bazaWWWSyncResult = $null
+                $script:capturedHealthParameters = $null
+                function Test-Path { param([string]$LiteralPath, [string]$PathType) return $true }
+                function Import-Module { param([string]$Name, $ErrorAction) }
+                function Invoke-BRAVOHealthCheck {
+                    param(
+                        [string]$ConfigPath,
+                        [switch]$ForceNotification,
+                        [switch]$NotifyOnSuccess,
+                        [switch]$NoSlack,
+                        [switch]$SkipIfBackupTaskRunning,
+                        [string]$RuntimeRoot,
+                        [string]$EntryScriptPath,
+                        [hashtable]$BazaSyncResults,
+                        [bool]$ConfigPathWasExplicit = $false
+                    )
+                    $script:capturedHealthParameters = @{} + $PSBoundParameters
+                    return [pscustomobject]@{ Status = 'Healthy'; Notification = 'STUB' }
+                }
+                . ([scriptblock]::Create($BuildText))
+                return $script:capturedHealthParameters
+            } $archiveHealthNoSlackScenario.NoSlack $archiveHealthBuildText
+            Remove-Module -ModuleInfo $archiveHealthEvalModule -ErrorAction SilentlyContinue
+            if ($archiveHealthNoSlackScenario.NoSlack) {
+                $archiveHealthNoSlackOk = (
+                    $null -ne $archiveHealthBound -and
+                    $archiveHealthBound.ContainsKey('NoSlack') -and
+                    [bool]$archiveHealthBound['NoSlack']
+                )
+                $archiveHealthNoSlackFailure = 'Archive, запущений з -NoSlack, мусить передавати -NoSlack у Invoke-BRAVOHealthCheck -- інакше вбудований Health може надіслати повідомлення попри заборону оператора'
+            } else {
+                $archiveHealthNoSlackOk = (
+                    $null -ne $archiveHealthBound -and
+                    -not $archiveHealthBound.ContainsKey('NoSlack')
+                )
+                $archiveHealthNoSlackFailure = 'без -NoSlack Archive не має передавати NoSlack у Invoke-BRAVOHealthCheck -- поведінка за замовчуванням має лишитися незмінною'
+            }
+            Test-BRAVOCondition `
+                -Condition $archiveHealthNoSlackOk `
+                -Name $archiveHealthNoSlackScenario.Name `
+                -Failure $archiveHealthNoSlackFailure
+        }
+    }
+
     # --- Health: "План перевірок" рендериться ЛИШЕ у самостійному запуску
     # (не при SuppressHeader — вбудований виклик з Archive) і через
     # спільний Write-BRAVOPlan (Health не має права на raw Write-Host).
