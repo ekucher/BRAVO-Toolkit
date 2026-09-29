@@ -27,6 +27,28 @@
   прибирає напівзаписаний `.sha512`; застарілий `.sha512` поруч із архівом,
   що не пройшов 7z t, також видаляється. Класифікація
   `restoreIntegrityFailed`/`restoreArchiveFailed` лишається за call site.
+- **Runtime Archive загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1` тепер живе у
+  функції `Invoke-BRAVOArchive` з invocation guard наприкінці файлу — той
+  самий патерн, що `BRAVO.Health.Runtime.ps1` (`Invoke-BRAVOHealth`). Для
+  оператора нічого не змінилось: ті самі параметри, коди завершення
+  (зокрема наявні `exit 1`), пауза `-NoPause`, вивід і фінальна
+  Operations-подія. Єдина правка в тілі — початкове значення режиму
+  сумісності тепер явно пишеться в `$script:`, щоб рядок «Режим
+  сумiсностi» в журналі й надалі показував фактичний режим, визначений
+  перевіркою сумісності. Dot-source файлу тепер лише визначає функцію й
+  нічого не виконує — це передумова для оркестраційних тестів Archive.
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/ArchiveRuntimeWrappedInFunction` (AST: на верхньому рівні лише
+  обгортка й guard, кожен `exit` — усередині обгортки, guard передає рівно
+  параметри `param()` скрипта, тіло не пише без scope імен, які файл
+  використовує через `$script:`),
+  `Console/ArchiveRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/ArchiveRuntimeDirectInvocationRunsBody` (дочірній процес:
+  dot-source не виконує тіло; production-шлях
+  `Invoke-BRAVOArchiveEntrypoint` з явно вказаним відсутнім `-ConfigPath`
+  виконує тіло й повертає той самий код, що й раніше).
 - **Runtime DataRestore загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVODataRestore` з invocation guard наприкінці файлу —
