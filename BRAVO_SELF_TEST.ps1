@@ -4076,6 +4076,32 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     $discordChunks = @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $longDiscord))
     Test-BRAVOCondition -Condition ($discordChunks.Count -gt 1 -and @($discordChunks | Where-Object { $_.Length -gt 1900 }).Count -eq 0) -Name "Notifications/DiscordChunkingStillWorks" -Failure "long Discord notifications мають chunking (defense-in-depth під payload guard-ом)"
 
+    # BRAVO-T023 (аудит F024): чанкер Discord має ОДНУ реалізацію
+    # (BRAVO.Notifications). Раніше Archive runtime тінив експорт через
+    # function global:, і поведінка залежала від того, чи завантажено Archive.
+    $discordChunkLines = @(Split-DiscordNotificationText -Message ((("a" * 1000) + "`r`n") * 3) -MaximumLength 1900)
+    Test-BRAVOCondition `
+        -Condition (
+            $discordChunkLines.Count -eq 2 -and
+            @($discordChunkLines | Where-Object { $_.Contains("`r") }).Count -eq 0 -and
+            $discordChunkLines[0] -eq ("a" * 1000 + "`n" + "a" * 899)
+        ) `
+        -Name "Notifications/DiscordChunksJoinWithLineFeed" `
+        -Failure "частини Discord мають з'єднувати рядки LF (без CR) і заповнюватись до MaximumLength; отримано частин: $($discordChunkLines.Count)"
+    $discordChunkerDefinitions = New-Object System.Collections.Generic.List[string]
+    foreach ($productionScript in @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File -Include '*.ps1', '*.psm1')) {
+        $productionAst = [Management.Automation.Language.Parser]::ParseFile($productionScript.FullName, [ref]$null, [ref]$null)
+        foreach ($functionAst in @($productionAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+            if ($functionAst.Name -match '^(global:|script:)?Split-DiscordNotificationText$') {
+                [void]$discordChunkerDefinitions.Add("$($productionScript.Name): $($functionAst.Name)")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($discordChunkerDefinitions.Count -eq 1 -and $discordChunkerDefinitions[0] -eq 'BRAVO.Notifications.psm1: Split-DiscordNotificationText') `
+        -Name "Notifications/DiscordChunkerHasSingleDefinition" `
+        -Failure "Split-DiscordNotificationText має бути визначений лише в BRAVO.Notifications.psm1, без global:-тіні; знайдено: $($discordChunkerDefinitions -join '; ')"
+
     # ============================================================
     # Compact list summary + глобальний payload guard (compact alerts).
     # ============================================================

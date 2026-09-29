@@ -405,22 +405,56 @@ function ConvertTo-DiscordNotificationText {
     )
 }
 
+# BRAVO-T023 (аудит F024): єдина реалізація чанкера Discord. Раніше
+# BRAVO.Archive.Runtime.ps1 оголошував власну function global:
+# Split-DiscordNotificationText, яка після завантаження Archive тінила цей
+# експорт у всьому процесі: частини в Archive з'єднувались LF, а в інших
+# runtime — [Environment]::NewLine (CRLF на Windows). Канонічною лишається
+# поведінка Archive (LF, явні межі MaximumLength, порожнє повідомлення —
+# одна порожня частина); копію в Archive видалено.
 function Split-DiscordNotificationText {
+    [CmdletBinding()]
     param(
+        [Parameter(Mandatory = $false)]
+        [AllowEmptyString()]
         [string]$Message,
+
+        [ValidateRange(100, 2000)]
         [int]$MaximumLength = 1900
     )
 
     $chunks = New-Object 'System.Collections.Generic.List[string]'
+
+    if ($null -eq $Message) {
+        $Message = ""
+    }
+
+    if ($Message.Length -eq 0) {
+        $chunks.Add("")
+        return $chunks.ToArray()
+    }
+
+    $normalizedMessage = $Message -replace "`r`n", "`n"
+    $normalizedMessage = $normalizedMessage -replace "`r", "`n"
+
     $currentChunk = New-Object System.Text.StringBuilder
 
-    foreach ($line in ($Message -split "\r?\n")) {
+    foreach ($line in ($normalizedMessage -split "`n", 0, "SimpleMatch")) {
         $remainingLine = [string]$line
+
         do {
-            $availableLength = $MaximumLength - $currentChunk.Length
-            if ($currentChunk.Length -gt 0) {
-                $availableLength -= [Environment]::NewLine.Length
+            $newlineLength = if ($currentChunk.Length -gt 0) {
+                1
             }
+            else {
+                0
+            }
+
+            $availableLength = (
+                $MaximumLength -
+                $currentChunk.Length -
+                $newlineLength
+            )
 
             if ($availableLength -le 0) {
                 $chunks.Add($currentChunk.ToString())
@@ -428,24 +462,38 @@ function Split-DiscordNotificationText {
                 continue
             }
 
-            $partLength = [math]::Min($availableLength, $remainingLine.Length)
-            $linePart = $remainingLine.Substring(0, $partLength)
             if ($currentChunk.Length -gt 0) {
-                [void]$currentChunk.AppendLine()
+                [void]$currentChunk.Append("`n")
             }
-            [void]$currentChunk.Append($linePart)
-            $remainingLine = $remainingLine.Substring($partLength)
+
+            $partLength = [Math]::Min(
+                $availableLength,
+                $remainingLine.Length
+            )
+
+            if ($partLength -gt 0) {
+                [void]$currentChunk.Append(
+                    $remainingLine.Substring(0, $partLength)
+                )
+
+                $remainingLine = $remainingLine.Substring($partLength)
+            }
+            else {
+                $remainingLine = ""
+            }
 
             if ($remainingLine.Length -gt 0) {
                 $chunks.Add($currentChunk.ToString())
                 $null = $currentChunk.Clear()
             }
-        } while ($remainingLine.Length -gt 0)
+        }
+        while ($remainingLine.Length -gt 0)
     }
 
     if ($currentChunk.Length -gt 0 -or $chunks.Count -eq 0) {
         $chunks.Add($currentChunk.ToString())
     }
+
     return $chunks.ToArray()
 }
 
