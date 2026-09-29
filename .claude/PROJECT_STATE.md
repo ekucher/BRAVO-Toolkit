@@ -1,6 +1,6 @@
 # BRAVO-Toolkit — Current Project State
 
-Last verified: 2026-09-29 02:40 UTC
+Last verified: 2026-09-29 00:00 UTC
 
 ## Canonical branch
 
@@ -8,10 +8,12 @@ Last verified: 2026-09-29 02:40 UTC
 
 ## State baseline SHA
 
-`7aa167833fe0af0c733397f82b9ba67624991ceb`
+`28e6fcda731e1b71f1deaf3486a4d08ceee8ae22`
 
-(Only change since the previous baseline `cb44151`: PR #241, a docs-only `PROJECT_STATE.md` sync commit
-`e78f086`. No runtime behavior changed between the two SHAs.)
+(Change since the previous baseline `7aa1678`: PR #243 merged as `28e6fcd` — the 3 pilot-tool bug
+fixes + `RUNTIME_MANIFEST.json` regeneration described under "Issue #216 B5" below. Owner reviewed and
+merged directly, since the PR author and repo owner are the same account and GitHub does not permit
+self-review-request.)
 
 Before starting substantial work, verify:
 
@@ -404,8 +406,9 @@ evidence would itself break `SemanticParityZeroDiff`), then re-run `-Validate`/`
 `PILOT ACCEPTED` — not yet done.
 
 **Two real bugs found and fixed in the pilot tool itself** (this was its first-ever real-server
-execution). Fixed in a local worktree on branch `fix/config-v2-pilot-allowemptystring` (based on
-`origin/developer` `7aa1678`), **not committed/pushed**:
+execution). Fixed on branch `fix/config-v2-pilot-allowemptystring`, merged via **PR #243** as
+`28e6fcd` (owner reviewed and merged directly — self-review-request is not possible when PR author
+and repo owner are the same GitHub account):
 
 1. `deploy/BRAVOConfigV2Pilot.Runtime.ps1` — 4 mandatory `[string[]]` evidence-capture parameters
    (`Write-BRAVOPilotEvidenceText`, `Assert-BRAVOPilotTextSecretSafe`,
@@ -423,8 +426,8 @@ execution). Fixed in a local worktree on branch `fix/config-v2-pilot-allowemptys
    `@('Activated', 'Validated')`, contradicting its own idempotent-retry design comment; a failed
    `-Validate` had no retry path except `-Rollback`. Fixed by adding `'Failed'` to the allowed set.
 
-These are genuine tooling defects, not migration-safety issues — worth a small standalone PR before any
-further fleet rollout uses this tool.
+These are genuine tooling defects, not migration-safety issues. Now merged into `developer` — any
+further fleet rollout should pull this fix before running `deploy/Start-BRAVOConfigV2Pilot.ps1` again.
 
 **Operational footprint left on DEV-LIMS, not yet cleaned up:**
 
@@ -592,24 +595,24 @@ Do not declare Issue #216 complete while normal BRAVO 5.3 execution retains any 
 
 ## NEXT ACTION
 
-**Updated 2026-09-29 after the DEV-LIMS B5 pilot (see "Issue #216 B5 — DEV-LIMS pilot migration executed"
-above).** Uncommitted work exists: 2 real bugs fixed in `deploy/BRAVOConfigV2Pilot.Runtime.ps1` +
-`deploy/Start-BRAVOConfigV2Pilot.ps1`, in a local worktree on branch
-`fix/config-v2-pilot-allowemptystring` (based on `7aa1678`), not pushed, no PR open. Do not lose or
-re-derive this fix from scratch — locate that branch/worktree first.
+**Updated 2026-09-29 after PR #243 merged as `28e6fcd`, with explicit owner authorization for the
+merge (see "Issue #216 B5 — DEV-LIMS pilot migration executed" above).** No uncommitted work is
+pending and no PR is open. The pilot-tool fixes are now live in `developer` — the DEV-LIMS
+`C:\Temp\BRAVO_UPDATE\pilot-artifact\extracted\` copy already has them (patched in place during the
+pilot), but any *fresh* pilot artifact built from `developer` for another server will now include them
+too.
 
 The single executable next action is therefore:
 
 ```text
 Ask the owner which of the following to do first (all are ready to execute, none require
 further investigation):
-  (a) commit + push the fix/config-v2-pilot-allowemptystring worktree, open a PR;
-  (b) fix PublicIPLookupEnabled on DEV-LIMS separately, re-run -Validate/-Accept for a clean
+  (a) fix PublicIPLookupEnabled on DEV-LIMS separately, re-run -Validate/-Accept for a clean
       PILOT ACCEPTED;
-  (c) decide the fleet-rollout authorization model (per-server vs blanket) for the remaining
+  (b) decide the fleet-rollout authorization model (per-server vs blanket) for the remaining
       real servers;
-  (d) clean up the BRAVO-Agent-Runner Scheduled Task + stored credential on DEV-LIMS;
-  (e) pick an item from Block A (autonomous) or items 2-3 (owner-blocked) below instead.
+  (c) clean up the BRAVO-Agent-Runner Scheduled Task + stored credential on DEV-LIMS;
+  (d) pick an item from Block A (autonomous) or items 2-3 (owner-blocked) below instead.
 Do not repeat the DEV-LIMS diagnosis — it is fully recorded above.
 ```
 
@@ -661,14 +664,13 @@ item needs from the owner, so the question can be asked without re-deriving it:
    considered closed and fleet rollout can start:
    (a) fix `PublicIPLookupEnabled` on DEV-LIMS as a separate step, re-run `-Validate`/`-Accept` for a
        clean `PILOT ACCEPTED`;
-   (b) commit/push the 2 real pilot-tool bugs fixed in `fix/config-v2-pilot-allowemptystring` (based on
-       `7aa1678`) to `developer` before any other server uses this tool;
+   (b) DONE — the 2 real pilot-tool bugs are merged into `developer` via PR #243 (`28e6fcd`);
    (c) decide whether DEV-LIMS's own fleet-migration counts as sufficient precedent to proceed to other
        real servers, or whether each server needs its own owner go-ahead (this session treated DEV-LIMS
        as a one-server-at-a-time authorization, not a blanket one);
    (d) clean up the `BRAVO-Agent-Runner` Scheduled Task + stored credential on DEV-LIMS once no longer
        needed.
-   Until (a)-(c) are resolved, do NOT deploy current `developer` to any OTHER real fleet server — see the
+   Until (a) and (c) are resolved, do NOT deploy current `developer` to any OTHER real fleet server — see the
    operational-risk note under "Issue #216 Wave B — B4 part 2" above (silent loss of legacy `BRAVO.config`
    site overrides) for servers that have not been through their own pilot migration.
 2. B7 (v2-path regression matrix + Config parity promoted to a required status check): PR #238 (merged
