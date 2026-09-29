@@ -2,6 +2,15 @@
 
 ## Не випущено (developer)
 
+- **GitHub CI для `developer` тепер формує один підсумок у Telegram після merge/push.**
+  Окремий workflow `.github/workflows/telegram-ci-summary.yml` запускається лише на
+  `push` у `developer`, не виконує checkout і не запускає код PR. Він чекає
+  завершення п'яти post-merge перевірок поточного SHA, знаходить пов'язаний
+  merged PR і додає його вісім pre-merge checks (включно з Config parity,
+  Config V2 pilot artifact і GitGuardian) в одне повідомлення. Telegram secrets
+  використовуються лише в trusted `push`-контексті; значення token/chat ID та
+  відповідь Telegram API не журналюються.
+
 - **Runtime DataRestore загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVODataRestore` з invocation guard наприкінці файлу —
