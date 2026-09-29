@@ -35,9 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 50
     env:
-      GH_TOKEN: ${ github.token }}
-      TELEGRAM_BOT_TOKEN: ${ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${ secrets.TELEGRAM_CHAT_ID }}
+      GH_TOKEN: ${{ github.token }}
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
       ICON_OK: "\u2705"
       ICON_FAIL: "\u274C"
       ICON_WARN: "\u26A0\uFE0F"
