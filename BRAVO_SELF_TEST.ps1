@@ -13917,7 +13917,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     return "SEVERITY=$Severity|LINES=$($ResultLines -join ';')"
                 }
                 function Send-BRAVONotification {
-                    param($Severity, $Message, $Provider, $NotificationMode, $RoutingTable, $CredentialTargets, $TimeoutSeconds)
+                    param($Severity, $Message, $Provider, $NotificationMode, $RoutingTable, [hashtable]$CredentialTargets, $TimeoutSeconds)
                     $script:t006ArchiveSent.Add([pscustomobject]@{ Severity = [string]$Severity; Message = [string]$Message })
                 }
                 Send-BRAVOArchiveLegacyBomFallbackAlert -Results $ResultsInner
