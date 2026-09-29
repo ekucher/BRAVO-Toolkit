@@ -3566,3 +3566,147 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -Condition (-not $bazaReconcileScriptTextForStorageSwitch.Contains('storageEffective')) `
         -Name "DataRestore/BazaReconcileDoesNotDependOnGlobalStorageSwitch" `
         -Failure "BRAVO_BAZA_RECONCILE.ps1 (операторський, ручний виклик) не повинен посилатися на storageEffective — узгодження мутацій має лишатися доступним незалежно від componentSettings.SFTP.Enabled"
+
+    # --- DataRestore: gate рівня підтримки ОС (T019). До фіксу DataRestore
+    # взагалі не викликав Get-BRAVOOSSupportTier і на Unsupported ОС
+    # запускав відновлення без блокування та без override — всупереч
+    # Archive/Maintenance/Health і README (розділ 1). Поведінковий тест:
+    # реальна Invoke-BRAVODataRestoreOSSupportGate з runtime в ізольованому
+    # модулі; seam — стаб Get-BRAVOOSSupportTier (класифікацію саму
+    # покривають окремі Runtime/OSSupportTier* тести), журнал —
+    # стаб-перехоплювач Write-DataRestoreLog. Resolve-BRAVOExitCode —
+    # справжній (BRAVO.ExitCodes, імпортований кореневим self-test).
+    $dataRestoreOSGateStubs = @'
+function Write-DataRestoreLog {
+    param([AllowEmptyString()][string]$Message, [string]$Level = 'INFO', [switch]$Console)
+    if ($null -eq $script:BRAVOSelfTestOSGateLogs) { $script:BRAVOSelfTestOSGateLogs = New-Object System.Collections.ArrayList }
+    [void]$script:BRAVOSelfTestOSGateLogs.Add([pscustomobject]@{ Message = $Message; Level = $Level })
+}
+function Get-BRAVOOSSupportTier {
+    return $script:BRAVOSelfTestOSGateTier
+}
+'@
+    $dataRestoreOSGateModule = $null
+    $dataRestoreOSGateModuleError = ''
+    try {
+        $dataRestoreOSGateModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($dataRestoreRuntimeTextForTests + [Environment]::NewLine + $dataRestoreOSGateStubs) `
+            -FunctionNames @('Invoke-BRAVODataRestoreOSSupportGate', 'Write-DataRestoreLog', 'Get-BRAVOOSSupportTier') `
+            -PreferLastDefinitionOnDuplicate
+    } catch {
+        $dataRestoreOSGateModuleError = $_.Exception.Message
+    }
+
+    function Invoke-BRAVOSelfTestDataRestoreOSGate {
+        param([string]$Tier, [AllowNull()][string]$OverrideValue)
+        if ($null -eq $dataRestoreOSGateModule) {
+            return [pscustomobject]@{ Result = $null; Logs = @(); Error = "gate недоступний: $dataRestoreOSGateModuleError" }
+        }
+        $previousOverride = $env:BRAVO_ALLOW_UNSUPPORTED_OS
+        try {
+            if ($null -eq $OverrideValue) {
+                Remove-Item -Path Env:\BRAVO_ALLOW_UNSUPPORTED_OS -ErrorAction SilentlyContinue
+            } else {
+                $env:BRAVO_ALLOW_UNSUPPORTED_OS = $OverrideValue
+            }
+            return (& $dataRestoreOSGateModule {
+                param([string]$TierName)
+                $script:BRAVOSelfTestOSGateLogs = New-Object System.Collections.ArrayList
+                $script:BRAVOSelfTestOSGateTier = [pscustomobject]@{
+                    Tier = $TierName
+                    OperatingSystem = 'SELFTEST'
+                    OperatingSystemVersion = '0.0'
+                    Build = 0
+                    PowerShellVersion = '0.0'
+                    DotNetRelease = 0
+                    Message = "SELFTEST-OS-TIER-MESSAGE-$TierName"
+                }
+                $gateError = ''
+                $gateResult = $null
+                try {
+                    $gateResult = Invoke-BRAVODataRestoreOSSupportGate
+                } catch {
+                    $gateError = $_.Exception.Message
+                }
+                return [pscustomobject]@{ Result = $gateResult; Logs = @($script:BRAVOSelfTestOSGateLogs); Error = $gateError }
+            } $Tier)
+        } finally {
+            if ($null -eq $previousOverride) {
+                Remove-Item -Path Env:\BRAVO_ALLOW_UNSUPPORTED_OS -ErrorAction SilentlyContinue
+            } else {
+                $env:BRAVO_ALLOW_UNSUPPORTED_OS = $previousOverride
+            }
+        }
+    }
+
+    $osGateUnsupported = Invoke-BRAVOSelfTestDataRestoreOSGate -Tier 'Unsupported' -OverrideValue $null
+    $osGateUnsupportedNonOneOverride = Invoke-BRAVOSelfTestDataRestoreOSGate -Tier 'Unsupported' -OverrideValue 'true'
+    $osGateUnsupportedOverride = Invoke-BRAVOSelfTestDataRestoreOSGate -Tier 'Unsupported' -OverrideValue '1'
+    $osGateLegacy = Invoke-BRAVOSelfTestDataRestoreOSGate -Tier 'LegacyBestEffort' -OverrideValue $null
+    $osGateSupported = Invoke-BRAVOSelfTestDataRestoreOSGate -Tier 'Supported' -OverrideValue $null
+
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $osGateUnsupported.Result -and
+            $osGateUnsupported.Result.Blocked -eq $true -and
+            $osGateUnsupported.Result.ExitCode -eq (Resolve-BRAVOExitCode -InvalidConfiguration) -and
+            $osGateUnsupported.Result.ExitCode -eq 30 -and
+            @($osGateUnsupported.Logs | Where-Object { $_.Level -eq 'ERROR' -and $_.Message -eq 'SELFTEST-OS-TIER-MESSAGE-Unsupported' }).Count -eq 1 -and
+            @($osGateUnsupported.Logs | Where-Object { $_.Level -eq 'WARNING' }).Count -eq 0 -and
+            $null -ne $osGateUnsupportedNonOneOverride.Result -and
+            $osGateUnsupportedNonOneOverride.Result.Blocked -eq $true -and
+            $osGateUnsupportedNonOneOverride.Result.ExitCode -eq 30
+        ) `
+        -Name "DataRestore/UnsupportedOSBlocksWithInvalidConfiguration" `
+        -Failure "Invoke-BRAVODataRestoreOSSupportGate на Unsupported ОС без BRAVO_ALLOW_UNSUPPORTED_OS=1 (у т.ч. зі значенням 'true') має логувати ERROR і блокувати запуск кодом Resolve-BRAVOExitCode -InvalidConfiguration (30), як Archive/Maintenance. $($osGateUnsupported.Error)"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $osGateUnsupportedOverride.Result -and
+            $osGateUnsupportedOverride.Result.Blocked -eq $false -and
+            $osGateUnsupportedOverride.Result.HasWarning -eq $true -and
+            $null -eq $osGateUnsupportedOverride.Result.ExitCode -and
+            @($osGateUnsupportedOverride.Logs | Where-Object { $_.Level -eq 'WARNING' -and $_.Message.Contains('SELFTEST-OS-TIER-MESSAGE-Unsupported') -and $_.Message.Contains('BRAVO_ALLOW_UNSUPPORTED_OS=1') }).Count -eq 1 -and
+            @($osGateUnsupportedOverride.Logs | Where-Object { $_.Level -eq 'ERROR' }).Count -eq 0
+        ) `
+        -Name "DataRestore/UnsupportedOSOverrideContinuesWithWarning" `
+        -Failure "BRAVO_ALLOW_UNSUPPORTED_OS=1 на Unsupported ОС має дозволити DataRestore продовжити з WARNING (без ERROR і без блокування). $($osGateUnsupportedOverride.Error)"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $osGateLegacy.Result -and
+            $osGateLegacy.Result.Blocked -eq $false -and
+            $osGateLegacy.Result.HasWarning -eq $false -and
+            @($osGateLegacy.Logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message -eq 'SELFTEST-OS-TIER-MESSAGE-LegacyBestEffort' }).Count -eq 1 -and
+            @($osGateLegacy.Logs | Where-Object { $_.Level -eq 'WARNING' -or $_.Level -eq 'ERROR' }).Count -eq 0
+        ) `
+        -Name "DataRestore/LegacyOSContinuesWithInfo" `
+        -Failure "LegacyBestEffort ОС: DataRestore має продовжити й логувати повідомлення рівня як INFO (environmental-метрика, як в Archive/Maintenance), без WARNING/ERROR. $($osGateLegacy.Error)"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $osGateSupported.Result -and
+            $osGateSupported.Result.Blocked -eq $false -and
+            $osGateSupported.Result.HasWarning -eq $false -and
+            @($osGateSupported.Logs | Where-Object { $_.Level -eq 'INFO' -and $_.Message.StartsWith('Підтримка ОС: Supported') }).Count -eq 1 -and
+            @($osGateSupported.Logs | Where-Object { $_.Level -eq 'WARNING' -or $_.Level -eq 'ERROR' }).Count -eq 0
+        ) `
+        -Name "DataRestore/SupportedOSContinues" `
+        -Failure "Supported ОС: DataRestore має продовжити без WARNING/ERROR, записавши рівень підтримки ОС у журнал. $($osGateSupported.Error)"
+
+    # Головний потік мусить реально застосувати рішення gate — до режиму
+    # перегляду (-ListGenerations теж блокується, як BRAVO_HEALTH) і до
+    # захоплення operation lock/будь-якої мутації.
+    $osGateCallIndex = $dataRestoreRuntimeTextForTests.IndexOf('$osSupportGate = Invoke-BRAVODataRestoreOSSupportGate')
+    $osGateExitIndex = $dataRestoreRuntimeTextForTests.IndexOf('exit $osSupportGate.ExitCode')
+    $osGateListModeIndex = $dataRestoreRuntimeTextForTests.IndexOf('# ===== РЕЖИМ ПЕРЕГЛЯДУ =====')
+    $osGateLockIndex = $dataRestoreRuntimeTextForTests.IndexOf('$lockAcquisition = Enter-BRAVODataRestoreOperationLock')
+    Test-BRAVOCondition `
+        -Condition (
+            $osGateCallIndex -ge 0 -and
+            $osGateExitIndex -gt $osGateCallIndex -and
+            $osGateListModeIndex -gt $osGateExitIndex -and
+            $osGateLockIndex -gt $osGateExitIndex
+        ) `
+        -Name "DataRestore/OSSupportGateAppliedBeforeAnyAction" `
+        -Failure "Головний потік BRAVO.DataRestore.Runtime.ps1 має викликати Invoke-BRAVODataRestoreOSSupportGate і виходити з його ExitCode до режиму -ListGenerations і до захоплення operation lock"

@@ -2,6 +2,20 @@
 
 ## Не випущено (developer)
 
+- **`BRAVO_DATA_RESTORE` тепер блокується на непідтримуваній ОС так само,
+  як Archive, Health і Maintenance.** Раніше відновлення даних не
+  перевіряло рівень підтримки ОС узагалі: на `Unsupported` системі
+  (Windows 7/Server 2008 R2, PowerShell 3.x) воно запускалося без
+  блокування й без запису рівня в журнал, всупереч розділу 1 README.md.
+
+  Тепер на старті (до operation lock і будь-яких дій) DataRestore пише в
+  журнал рівень підтримки, версію ОС, build, PowerShell і .NET. На
+  `Unsupported` запуск завершується кодом `30` (InvalidConfiguration) —
+  зокрема й read-only `-ListGenerations`, як і Health; свідомий обхід —
+  `BRAVO_ALLOW_UNSUPPORTED_OS=1` (прогін продовжується з попередженням).
+  На `Legacy best-effort` (Server 2012 R2/2016) повідомлення лише
+  інформаційне й на код завершення не впливає.
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися
