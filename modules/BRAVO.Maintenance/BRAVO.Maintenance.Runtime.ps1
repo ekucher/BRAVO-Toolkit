@@ -22,6 +22,47 @@ param (
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
 )
 
+# Тіло runtime — одна функція, за зразком BRAVO.Health.Runtime.ps1
+# (Invoke-BRAVOHealth): прямий запуск файлу (& у BRAVO.Maintenance.psm1)
+# виконує тіло через invocation guard наприкінці файлу, а dot-source лише
+# визначає функцію й нічого не виконує. param() функції повторює param()
+# скрипта один в один (типи, атрибути, alias, ValidateSet, значення за
+# замовчуванням), а guard передає лише $PSBoundParameters скрипта: тіло
+# читає $PSBoundParameters.ContainsKey('AutoShutdown'/'ArchiveAfterMaintenance'),
+# тому всередині функції він мусить містити рівно ті ключі, які викликач
+# справді передав, а незадані параметри отримують ті самі значення за
+# замовчуванням з ідентичного param(). Функції runtime визначаються в scope
+# обгортки й, як і раніше, бачать змінні тіла через динамічний scope (усі
+# вони викликаються зсередини обгортки); стан, який читають через $script:
+# або Get-Variable -Scope Script, тіло пише явно через $script:, а exit
+# усередині функції завершує весь скрипт тим самим кодом.
+function Invoke-BRAVOMaintenance {
+    # PSSA PSAvoidUsingUsernameAndPasswordParams збирає параметри з УСІХ
+    # вкладених функцій обгортки разом: UserSid (Get-BRAVOMaintenanceExecutionMode)
+    # і ArchivePassword (Trace-функції) дають хибне спрацювання на самій
+    # Invoke-BRAVOMaintenance. Жодна окрема вкладена функція не має обох —
+    # це стереже Console/MaintenanceRuntimeNestedFunctionsNoUserAndPasswordParams.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingUsernameAndPasswordParams', '',
+        Justification = 'Хибне спрацювання від агрегації параметрів вкладених функцій; кожну вкладену функцію перевіряє окремий self-test.')]
+    param (
+        [switch]$ForceRestore,
+        [switch]$RunMissedRestoreOnly,
+        [switch]$DisableSizeCheck,
+        [switch]$EnableAllSlack,
+        [switch]$DisableAllSlack,
+        [ValidateSet("on", "off")]
+        [string]$AutoShutdown,
+        [Alias("ArchivLims")]
+        [ValidateSet("on", "off")]
+        [string]$ArchiveAfterMaintenance,
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit = $false,
+        [switch]$NoPause,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath
+    )
+
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
@@ -377,7 +418,13 @@ if ([string]::IsNullOrWhiteSpace($configuredNotificationMode) -and $MaintenanceC
     # Сумісність зі старим BRAVO.config.
     $configuredNotificationMode = [string]$MaintenanceConfig.Slack.Mode
 }
-$SlackMode = $configuredNotificationMode.ToLowerInvariant()
+# Явно $script: — до обгортання в Invoke-BRAVOMaintenance сирий і
+# ефективний режим були однією script-змінною: присвоєння
+# $script:SlackMode нижче перезаписувало сирий $SlackMode, і валідація
+# конфігурації нижче (-notin none/errors_only/all) читала вже ЕФЕКТИВНИЙ
+# режим. Некваліфіковане присвоєння всередині функції створило б окрему
+# локальну змінну з СИРИМ значенням і змінило б цю поведінку.
+$script:SlackMode = $configuredNotificationMode.ToLowerInvariant()
 
 # -EnableAllSlack/-DisableAllSlack обчислюється ТУТ, одразу після
 # сирого конфігураційного значення, а не лише пізніше перед основною
@@ -6902,11 +6949,20 @@ function Get-SHA512HashCompatible {
 }
 
 function Verify-Backup {
+    # Повна перевірка before/after-архіву моделі: канонічна перевірка
+    # цілісності 7-Zip (7z t через Test-BRAVOMaintenanceSevenZipArchiveIntegrity
+    # -> BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity — та сама, що в
+    # Archive) і лише для ПЕРЕВІРЕНОГО архіву — запис .sha512. Раніше функція
+    # лише рахувала SHA512 і повертала $true для будь-якого наявного файлу,
+    # а 7z t жив окремо на кожному call site; тепер «перевірено» означає
+    # саме перевірено, а пошкоджений архів / невірний пароль / збій чи
+    # відсутність 7-Zip дають $false (fail-closed) без .sha512.
     param(
+        [string]$SevenZipPath,
         [string]$ArchivePath
     )
     
-    Write-Log "Перевірка контрольних сум архіву: $([System.IO.Path]::GetFileName($ArchivePath))" -Level "INFO"
+    Write-Log "Перевірка архіву (7z t + SHA512): $([System.IO.Path]::GetFileName($ArchivePath))" -Level "INFO"
     
     if (-not (Test-Path $ArchivePath)) {
         $errorMsg = "Архів не знайдено: $ArchivePath"
@@ -6918,6 +6974,22 @@ function Verify-Backup {
 
     $shaFile = "$ArchivePath.sha512"
     $fileName = [System.IO.Path]::GetFileName($ArchivePath)
+
+    # Прапорці criticalErrorOccurred/restoreIntegrityFailed на збій 7z t
+    # виставляє сам Test-BRAVOMaintenanceSevenZipArchiveIntegrity (єдина
+    # політика Maintenance для всіх перевірок 7-Zip).
+    if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $ArchivePath)) {
+        Write-Log "ПОМИЛКА: Архів $fileName не пройшов перевірку цілісності 7-Zip; SHA512 не створено" -Level "ERROR"
+        # Застарілий .sha512 від попереднього прогону не має лишатися
+        # поруч із архівом, що не пройшов перевірку.
+        if (Test-Path -LiteralPath $shaFile -PathType Leaf) {
+            Remove-Item -LiteralPath $shaFile -Force -ErrorAction SilentlyContinue
+        }
+        return $false
+    }
+
     $valid = $true
 
     try {
@@ -6930,6 +7002,14 @@ function Verify-Backup {
     }
     catch {
         Write-Log "ПОМИЛКА: Помилка перевірки архіву $fileName - $($_.Exception.Message)" -Level "ERROR"
+        # 7z t пройшов, але SHA512 не пораховано чи не записано: архів не
+        # «перевірений» (контракт .sha512 лише для перевіреного архіву),
+        # тож напівзаписаний sidecar прибираємо, а збій позначаємо
+        # критичним і для прямого виклику (call sites виставляють його теж).
+        if (Test-Path -LiteralPath $shaFile -PathType Leaf) {
+            Remove-Item -LiteralPath $shaFile -Force -ErrorAction SilentlyContinue
+        }
+        $script:criticalErrorOccurred = $true
         $valid = $false
     }
 
@@ -7590,7 +7670,11 @@ if ($RunMissedRestoreOnly -and $missedDailyWork) {
 # Похідні файлові шляхи
 $ARCH_NAME1 = "${ArchivePrefix}_before_$NOW.mdz"
 $ARCH_NAME2 = "${ArchivePrefix}_after_$NOW.mdz"
-$LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"
+# Явно $script: — Invoke-BRAVOMaintenanceOwnLogUpload перевіряє
+# Get-Variable -Name LOG_FILE -Scope Script; некваліфіковане присвоєння
+# всередині Invoke-BRAVOMaintenance створило б локальну змінну, і upload
+# власного журналу мовчки перестав би працювати.
+$script:LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"
 $SIZES_FILE = "$LOG_DIR\file_sizes_before_$NOW.csv"
 # Каталог-дата спільний для всіх компонентів: нумерація журналів рахується
 # в межах конкретної дати, тому TraceSRV_1.out існує і сьогодні, і вчора —
@@ -8707,16 +8791,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true
                 $script:restoreArchiveFailed = $true
-            } elseif (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
-                    -SevenZipPath $ARC_PATH `
-                    -ArchivePath $beforeArchivePath)) {
-                $errorMsg = "Архів моделі перед реставрацією не пройшов перевірку 7-Zip. Реставрація скасована. Архів залишено для діагностики: $beforeArchivePath"
-                Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-                Send-SlackAlert -Message $errorMsg -IsCritical
-                $script:criticalErrorOccurred = $true
-                $script:restoreIntegrityFailed = $true
-            } elseif (-not (Verify-Backup -ArchivePath $beforeArchivePath)) {
-                $errorMsg = "Не вдалося створити SHA512 для перевіреного архіву перед реставрацією. Реставрація скасована: $beforeArchivePath"
+            } elseif (-not (Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $beforeArchivePath)) {
+                $errorMsg = "Архів моделі перед реставрацією не пройшов перевірку (7z t або SHA512). Реставрація скасована. Архів залишено для діагностики: $beforeArchivePath"
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true
@@ -8872,10 +8948,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             -StandardInputText $script:ArchivePassword
                         $afterArchiveReady = (
                             $exitCode -eq 0 -and
-                            (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
-                                -SevenZipPath $ARC_PATH `
-                                -ArchivePath $afterArchivePath) -and
-                            (Verify-Backup -ArchivePath $afterArchivePath)
+                            (Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $afterArchivePath)
                         )
                         if ($afterArchiveReady) {
                             Write-Log -Message "Архів моделі після реставрації створено та перевірено -> $afterArchivePath" -Level "SUCCESS"
@@ -10791,4 +10864,9 @@ exit $script:maintenanceRuntimeExitCode
     # WARNING) у консолі до паузи, а не після.
     Invoke-BRAVOMaintenanceOwnLogUpload
     Wait-BRAVOManualExit -NoPause:$NoPause
+}
+}
+# END BRAVO MAINTENANCE RUNTIME
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-BRAVOMaintenance @PSBoundParameters
 }

@@ -11,6 +11,85 @@
   використовуються лише в trusted `push`-контексті; значення token/chat ID та
   відповідь Telegram API не журналюються.
 
+- **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
+  у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
+  той самий патерн, що `BRAVO.Health.Runtime.ps1` (`Invoke-BRAVOHealth`).
+  Для оператора нічого не змінилось: ті самі параметри (включно з alias
+  `-ArchivLims`), коди завершення, кроки `[1/8]`…`[8/8]`, відновлення служб у
+  `finally`, пауза `-NoPause` і вивід. Guard передає функції лише справді
+  задані параметри (`$PSBoundParameters`), тож `-AutoShutdown` і
+  `-ArchiveAfterMaintenance` з командного рядка, як і раніше, мають
+  пріоритет над конфігурацією, а незадані беруться з неї. Дві правки в
+  тілі зберігають наявну поведінку: сирий режим повідомлень і шлях журналу
+  `$LOG_FILE` тепер явно пишуться в `$script:` — інакше валідація
+  конфігурації побачила б сирий замість ефективного режиму (з
+  `-DisableAllSlack`/`-EnableAllSlack`), а вивантаження власного журналу
+  Maintenance на SFTP мовчки перестало б працювати. Dot-source файлу тепер
+  лише визначає функцію й нічого не виконує.
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/MaintenanceRuntimeWrappedInFunction` (AST: на верхньому рівні
+  лише обгортка й guard, кожен `exit` — усередині обгортки, `param()`
+  функції тотожний `param()` скрипта, guard викликає
+  `Invoke-BRAVOMaintenance @PSBoundParameters`, тіло не пише без scope
+  імен, які файл використовує через `$script:` чи
+  `Get-Variable -Scope Script`),
+  `Console/MaintenanceRuntimeGuardForwardsBoundParametersOnly` (проба з
+  реального тексту файлу: до й після обгортання однакові ключі
+  `$PSBoundParameters` і значення параметрів),
+  `Console/MaintenanceRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/MaintenanceRuntimeDirectInvocationRunsBody` (дочірній процес).
+  Перевірку порядку
+  `Maintenance/LegacySweepDependencyFunctionsDefinedBeforeTopLevelInvocation`
+  оновлено: оператори обгортки вважаються верхнім рівнем тіла.
+- **Maintenance: перевірка before/after-архівів реставрації моделі тепер
+  зосереджена в одному місці й завжди включає 7z t (T004/F002).**
+  `Verify-Backup` раніше лише записував `.sha512` і повертав успіх для будь-
+  якого наявного файлу; перевірку цілісності 7-Zip окремо виконував кожен
+  call site. Тепер `Verify-Backup` сам виконує канонічну перевірку 7-Zip
+  (`Test-SevenZipArchiveIntegrity` з `BRAVO.ArchiveHelpers`, та сама, що в
+  Archive) і пише `.sha512` лише для перевіреного архіву; пошкоджений
+  архів, невірний пароль, збій або відсутність 7-Zip дають збій
+  (fail-closed) без `.sha512`.
+
+  **Для оператора.** Пошкоджений before/after-архів і раніше зупиняв
+  реставрацію / не давав маркера успіху — ця поведінка не змінилась, а
+  7z t, як і раніше, виконується один раз на архів (тривалість вікна
+  реставрації не зростає). Змінився лише текст ERROR/Slack-сповіщення
+  для архіву перед реставрацією: замість двох окремих повідомлень
+  («не пройшов перевірку 7-Zip» / «не вдалося створити SHA512») тепер
+  одне — «не пройшов перевірку (7z t або SHA512)»; точна причина — у
+  попередніх рядках журналу.
+  Додатково `Verify-Backup` тепер тримає контракт «`.sha512` лише для
+  перевіреного архіву» і при збої ПІСЛЯ успішного 7z t (не пораховано або
+  не записано SHA512): повертає збій, виставляє `criticalErrorOccurred`
+  (call sites виставляли його й раніше — для прямого виклику це нове) і
+  прибирає напівзаписаний `.sha512`; застарілий `.sha512` поруч із архівом,
+  що не пройшов 7z t, також видаляється. Класифікація
+  `restoreIntegrityFailed`/`restoreArchiveFailed` лишається за call site.
+- **Runtime Archive загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1` тепер живе у
+  функції `Invoke-BRAVOArchive` з invocation guard наприкінці файлу — той
+  самий патерн, що `BRAVO.Health.Runtime.ps1` (`Invoke-BRAVOHealth`). Для
+  оператора нічого не змінилось: ті самі параметри, коди завершення
+  (зокрема наявні `exit 1`), пауза `-NoPause`, вивід і фінальна
+  Operations-подія. Єдина правка в тілі — початкове значення режиму
+  сумісності тепер явно пишеться в `$script:`, щоб рядок «Режим
+  сумiсностi» в журналі й надалі показував фактичний режим, визначений
+  перевіркою сумісності. Dot-source файлу тепер лише визначає функцію й
+  нічого не виконує — це передумова для оркестраційних тестів Archive.
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/ArchiveRuntimeWrappedInFunction` (AST: на верхньому рівні лише
+  обгортка й guard, кожен `exit` — усередині обгортки, guard передає рівно
+  параметри `param()` скрипта, тіло не пише без scope імен, які файл
+  використовує через `$script:`),
+  `Console/ArchiveRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/ArchiveRuntimeDirectInvocationRunsBody` (дочірній процес:
+  dot-source не виконує тіло; production-шлях
+  `Invoke-BRAVOArchiveEntrypoint` з явно вказаним відсутнім `-ConfigPath`
+  виконує тіло й повертає той самий код, що й раніше).
 - **Runtime DataRestore загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVODataRestore` з invocation guard наприкінці файлу —
