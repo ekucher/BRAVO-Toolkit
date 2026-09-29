@@ -1238,6 +1238,101 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             )) `
         -Name "Compatibility/ImportHasNoConsoleSideEffects" `
         -Failure "імпорт Compatibility не повинен змінювати global OutputEncoding"
+
+    # --- T030: TLS 1.2 вмикається АДИТИВНО в усіх production-точках ---
+    # Регресія: Maintenance/DataRestore runtime і dry-run webhook-перевірка
+    # ПРИСВОЮВАЛИ SecurityProtocol = 3072, мовчки вимикаючи вже ввімкнені
+    # протоколи (напр. Tls13/Tls11, задані хостом або іншим кодом процесу). Поведінковий
+    # тест: попередній прапор (Tls11 = 768, числом — як і 3072, бо старі
+    # .NET не мають імен) виставляється перед РЕАЛЬНИМ кодом увімкнення, а
+    # після нього мусять стояти і він, і Tls12. Оригінальне значення
+    # процесу відновлюється у finally. Кодові точки беруться з AST реальних
+    # файлів, а не з переписаної копії.
+    $tls12Flag = [int]3072
+    $tls12PriorFlag = [int]768
+    $tls12EnablementResults = @()
+    $tls12OriginalProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $tls12EnablementSites = @()
+        $tls12EnablementSites += New-Object PSObject -Property @{
+            Label = 'BRAVO.Compatibility::Enable-BRAVOTls12'
+            Code = { Enable-BRAVOTls12 }
+        }
+        foreach ($tls12RuntimeRelativePath in @(
+                'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
+                'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1')) {
+            $tls12RuntimeParseErrors = $null
+            $tls12RuntimeAst = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $root $tls12RuntimeRelativePath), [ref]$null, [ref]$tls12RuntimeParseErrors)
+            # Лише виклик у тілі скрипта (не всередині функції): саме він
+            # виконується на старті runtime перед webhook-ами. Тіло runtime
+            # обгорнуте зовнішнім try/finally, тому шукаємо не лише серед
+            # statement-ів верхнього рівня.
+            $tls12RuntimeCall = @($tls12RuntimeAst.FindAll({
+                        param($candidate)
+                        if (-not ($candidate -is [Management.Automation.Language.CommandAst]) -or
+                            $candidate.GetCommandName() -ne 'Enable-BRAVOTls12') { return $false }
+                        for ($tls12Parent = $candidate.Parent; $null -ne $tls12Parent; $tls12Parent = $tls12Parent.Parent) {
+                            if ($tls12Parent -is [Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+                        }
+                        return $true
+                    }, $true)) | Select-Object -First 1
+            $tls12EnablementSites += New-Object PSObject -Property @{
+                Label = $tls12RuntimeRelativePath
+                Code = if ($null -ne $tls12RuntimeCall) { [scriptblock]::Create($tls12RuntimeCall.Extent.Text) } else { $null }
+            }
+        }
+        $tls12DryRunParseErrors = $null
+        $tls12DryRunAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [ref]$null, [ref]$tls12DryRunParseErrors)
+        $tls12DryRunFunction = @($tls12DryRunAst.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $candidate.Name -eq 'Send-TestWebhookNotification'
+                }, $true)) | Select-Object -First 1
+        $tls12DryRunAssignment = $null
+        if ($null -ne $tls12DryRunFunction) {
+            $tls12DryRunAssignment = @($tls12DryRunFunction.Body.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                        $candidate.Left.Extent.Text -match '(?i)ServicePointManager\]::SecurityProtocol$'
+                    }, $true)) | Select-Object -First 1
+        }
+        $tls12EnablementSites += New-Object PSObject -Property @{
+            Label = 'BRAVO_DRY_RUN.ps1::Send-TestWebhookNotification'
+            Code = if ($null -ne $tls12DryRunAssignment) { [scriptblock]::Create($tls12DryRunAssignment.Extent.Text) } else { $null }
+        }
+
+        foreach ($tls12Site in $tls12EnablementSites) {
+            [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], $tls12PriorFlag)
+            $tls12Before = [int][Net.ServicePointManager]::SecurityProtocol
+            $tls12After = $null
+            if ($null -ne $tls12Site.Code) {
+                & $tls12Site.Code
+                $tls12After = [int][Net.ServicePointManager]::SecurityProtocol
+            }
+            $tls12EnablementResults += New-Object PSObject -Property @{
+                Label = $tls12Site.Label
+                Found = ($null -ne $tls12Site.Code)
+                Before = $tls12Before
+                After = $tls12After
+                Passed = (
+                    $null -ne $tls12Site.Code -and
+                    $tls12Before -eq $tls12PriorFlag -and
+                    ($tls12After -band $tls12PriorFlag) -eq $tls12PriorFlag -and
+                    ($tls12After -band $tls12Flag) -eq $tls12Flag
+                )
+            }
+        }
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $tls12OriginalProtocol
+    }
+    $tls12FailedSites = @($tls12EnablementResults | Where-Object { -not $_.Passed })
+    Test-BRAVOCondition `
+        -Condition ($tls12EnablementResults.Count -eq 4 -and $tls12FailedSites.Count -eq 0) `
+        -Name "Compatibility/Tls12EnablementPreservesExistingProtocols" `
+        -Failure ("кожна production-точка ввімкнення TLS 1.2 (Enable-BRAVOTls12, старт Maintenance/DataRestore runtime, dry-run webhook) мусить ДОДАВАТИ Tls12 (-bor), не затираючи вже ввімкнені протоколи; порушено: " +
+            (@($tls12FailedSites | ForEach-Object { "$($_.Label) (знайдено=$($_.Found), до=$($_.Before), після=$($_.After))" }) -join '; '))
     $staleHotfix = [pscustomobject]@{ InstalledOn = (Get-Date).AddDays(-400) }
     $stalePatchLevel = Get-BRAVOWindowsPatchLevelRecommendation `
         -InstalledHotfixes @($staleHotfix) `
