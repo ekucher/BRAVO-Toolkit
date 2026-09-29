@@ -256,9 +256,11 @@ if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.I
     Exit $elevatedProcess.ExitCode
 }
 
-# Примусово TLS 1.2 для webhook-сповіщень. Числове значення 3072 сумісне зі
-# старими .NET/PowerShell, де ім'я Tls12 може бути відсутнім у переліку enum.
-[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)
+# TLS 1.2 для webhook-сповіщень вмикається АДИТИВНО (канонічний
+# Enable-BRAVOTls12 з BRAVO.Compatibility, імпортованого вище з
+# -ErrorAction Stop): уже ввімкнені протоколи (напр. Tls13, Tls11)
+# зберігаються, а не затираються значенням 3072.
+Enable-BRAVOTls12
 [Net.ServicePointManager]::Expect100Continue = $false
 
 # ===== СТАН ПРОГОНУ =====

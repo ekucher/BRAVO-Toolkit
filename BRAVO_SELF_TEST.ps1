@@ -1238,6 +1238,101 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             )) `
         -Name "Compatibility/ImportHasNoConsoleSideEffects" `
         -Failure "імпорт Compatibility не повинен змінювати global OutputEncoding"
+
+    # --- T030: TLS 1.2 вмикається АДИТИВНО в усіх production-точках ---
+    # Регресія: Maintenance/DataRestore runtime і dry-run webhook-перевірка
+    # ПРИСВОЮВАЛИ SecurityProtocol = 3072, мовчки вимикаючи вже ввімкнені
+    # протоколи (напр. Tls13/Tls11, задані хостом або іншим кодом процесу). Поведінковий
+    # тест: попередній прапор (Tls11 = 768, числом — як і 3072, бо старі
+    # .NET не мають імен) виставляється перед РЕАЛЬНИМ кодом увімкнення, а
+    # після нього мусять стояти і він, і Tls12. Оригінальне значення
+    # процесу відновлюється у finally. Кодові точки беруться з AST реальних
+    # файлів, а не з переписаної копії.
+    $tls12Flag = [int]3072
+    $tls12PriorFlag = [int]768
+    $tls12EnablementResults = @()
+    $tls12OriginalProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        $tls12EnablementSites = @()
+        $tls12EnablementSites += New-Object PSObject -Property @{
+            Label = 'BRAVO.Compatibility::Enable-BRAVOTls12'
+            Code = { Enable-BRAVOTls12 }
+        }
+        foreach ($tls12RuntimeRelativePath in @(
+                'modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1',
+                'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1')) {
+            $tls12RuntimeParseErrors = $null
+            $tls12RuntimeAst = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $root $tls12RuntimeRelativePath), [ref]$null, [ref]$tls12RuntimeParseErrors)
+            # Лише виклик у тілі скрипта (не всередині функції): саме він
+            # виконується на старті runtime перед webhook-ами. Тіло runtime
+            # обгорнуте зовнішнім try/finally, тому шукаємо не лише серед
+            # statement-ів верхнього рівня.
+            $tls12RuntimeCall = @($tls12RuntimeAst.FindAll({
+                        param($candidate)
+                        if (-not ($candidate -is [Management.Automation.Language.CommandAst]) -or
+                            $candidate.GetCommandName() -ne 'Enable-BRAVOTls12') { return $false }
+                        for ($tls12Parent = $candidate.Parent; $null -ne $tls12Parent; $tls12Parent = $tls12Parent.Parent) {
+                            if ($tls12Parent -is [Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+                        }
+                        return $true
+                    }, $true)) | Select-Object -First 1
+            $tls12EnablementSites += New-Object PSObject -Property @{
+                Label = $tls12RuntimeRelativePath
+                Code = if ($null -ne $tls12RuntimeCall) { [scriptblock]::Create($tls12RuntimeCall.Extent.Text) } else { $null }
+            }
+        }
+        $tls12DryRunParseErrors = $null
+        $tls12DryRunAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $root 'BRAVO_DRY_RUN.ps1'), [ref]$null, [ref]$tls12DryRunParseErrors)
+        $tls12DryRunFunction = @($tls12DryRunAst.FindAll({
+                    param($candidate)
+                    $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                    $candidate.Name -eq 'Send-TestWebhookNotification'
+                }, $true)) | Select-Object -First 1
+        $tls12DryRunAssignment = $null
+        if ($null -ne $tls12DryRunFunction) {
+            $tls12DryRunAssignment = @($tls12DryRunFunction.Body.FindAll({
+                        param($candidate)
+                        $candidate -is [Management.Automation.Language.AssignmentStatementAst] -and
+                        $candidate.Left.Extent.Text -match '(?i)ServicePointManager\]::SecurityProtocol$'
+                    }, $true)) | Select-Object -First 1
+        }
+        $tls12EnablementSites += New-Object PSObject -Property @{
+            Label = 'BRAVO_DRY_RUN.ps1::Send-TestWebhookNotification'
+            Code = if ($null -ne $tls12DryRunAssignment) { [scriptblock]::Create($tls12DryRunAssignment.Extent.Text) } else { $null }
+        }
+
+        foreach ($tls12Site in $tls12EnablementSites) {
+            [Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], $tls12PriorFlag)
+            $tls12Before = [int][Net.ServicePointManager]::SecurityProtocol
+            $tls12After = $null
+            if ($null -ne $tls12Site.Code) {
+                & $tls12Site.Code
+                $tls12After = [int][Net.ServicePointManager]::SecurityProtocol
+            }
+            $tls12EnablementResults += New-Object PSObject -Property @{
+                Label = $tls12Site.Label
+                Found = ($null -ne $tls12Site.Code)
+                Before = $tls12Before
+                After = $tls12After
+                Passed = (
+                    $null -ne $tls12Site.Code -and
+                    $tls12Before -eq $tls12PriorFlag -and
+                    ($tls12After -band $tls12PriorFlag) -eq $tls12PriorFlag -and
+                    ($tls12After -band $tls12Flag) -eq $tls12Flag
+                )
+            }
+        }
+    } finally {
+        [Net.ServicePointManager]::SecurityProtocol = $tls12OriginalProtocol
+    }
+    $tls12FailedSites = @($tls12EnablementResults | Where-Object { -not $_.Passed })
+    Test-BRAVOCondition `
+        -Condition ($tls12EnablementResults.Count -eq 4 -and $tls12FailedSites.Count -eq 0) `
+        -Name "Compatibility/Tls12EnablementPreservesExistingProtocols" `
+        -Failure ("кожна production-точка ввімкнення TLS 1.2 (Enable-BRAVOTls12, старт Maintenance/DataRestore runtime, dry-run webhook) мусить ДОДАВАТИ Tls12 (-bor), не затираючи вже ввімкнені протоколи; порушено: " +
+            (@($tls12FailedSites | ForEach-Object { "$($_.Label) (знайдено=$($_.Found), до=$($_.Before), після=$($_.After))" }) -join '; '))
     $staleHotfix = [pscustomobject]@{ InstalledOn = (Get-Date).AddDays(-400) }
     $stalePatchLevel = Get-BRAVOWindowsPatchLevelRecommendation `
         -InstalledHotfixes @($staleHotfix) `
@@ -3535,6 +3630,105 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -Name "Runtime/SevenZipPasswordUsesStdin" `
         -Failure "створення/перевірка зашифрованого архіву через stdin не працює: $sevenZipRuntimeFailure"
 
+    # T005: поведінкова перевірка канонічного Write-BRAVOProcessInputText —
+    # ЄДИНОГО дозволеного способу передати пароль 7-Zip у stdin (Archive,
+    # Maintenance, Compatibility, DataRestore). Дочірній процес (той самий
+    # PowerShell-хост) читає СИРІ байти stdin і повертає їх hex-рядком;
+    # очікуються рівно UTF-8 БЕЗ BOM + CRLF, після чого stdin закрито (EOF,
+    # інакше дочірній процес не завершився б). Пароль — явно фейковий
+    # (кирилиця — щоб перевірити саме UTF-8), у діагностику не потрапляє:
+    # лише довжини та ознака BOM.
+    $stdinHelperFakePassword = "BRAVO-FAKE-не-пароль-T005"
+    # Два випадки: непорожній не-ASCII текст (кирилиця — UTF-8 багатобайтово)
+    # і порожній рядок — для нього визначена поведінка: рівно CRLF (2 байти),
+    # без BOM, EOF. Діагностика — лише ім'я випадку, довжини й ознака BOM.
+    $stdinHelperCases = @(
+        @{ Name = "non-ascii"; Text = $stdinHelperFakePassword },
+        @{ Name = "empty"; Text = "" }
+    )
+    $stdinHelperCaseFailures = @()
+    foreach ($stdinHelperCaseEntry in $stdinHelperCases) {
+        $stdinHelperCase = $stdinHelperCaseEntry.Name
+        $stdinHelperText = [string]$stdinHelperCaseEntry.Text
+        $stdinHelperProcess = $null
+        $stdinHelperCapture = $null
+        $stdinHelperPassed = $false
+        $stdinHelperFailure = ""
+        try {
+            $stdinHelperExpectedBytes = (New-Object Text.UTF8Encoding($false)).GetBytes($stdinHelperText + "`r`n")
+            $stdinHelperChildScript = (
+                '$s=[Console]::OpenStandardInput();' +
+                '$m=New-Object IO.MemoryStream;$s.CopyTo($m);' +
+                '[Console]::Out.Write([BitConverter]::ToString($m.ToArray()))'
+            )
+            $stdinHelperInfo = New-Object Diagnostics.ProcessStartInfo
+            $stdinHelperInfo.FileName = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $stdinHelperInfo.Arguments = "-NoProfile -NonInteractive -EncodedCommand " +
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($stdinHelperChildScript))
+            $stdinHelperInfo.RedirectStandardInput = $true
+            $stdinHelperInfo.RedirectStandardOutput = $true
+            $stdinHelperInfo.RedirectStandardError = $true
+            $stdinHelperInfo.UseShellExecute = $false
+            $stdinHelperInfo.CreateNoWindow = $true
+            $stdinHelperProcess = New-Object Diagnostics.Process
+            $stdinHelperProcess.StartInfo = $stdinHelperInfo
+            $stdinHelperCapture = Start-BRAVOProcessOutputCapture -Process $stdinHelperProcess
+            Write-BRAVOProcessInputText -Process $stdinHelperProcess -Text $stdinHelperText
+            $stdinHelperCompleted = $stdinHelperProcess.WaitForExit(60000)
+            if (-not $stdinHelperCompleted) {
+                $stdinHelperProcess.Kill()
+                [void]$stdinHelperProcess.WaitForExit(5000)
+            }
+            $stdinHelperOutput = Complete-BRAVOProcessOutputCapture -Capture $stdinHelperCapture
+            $stdinHelperCapture = $null
+            $stdinHelperHex = ([string]$stdinHelperOutput.StandardOutput).Trim()
+            $stdinHelperReceivedBytes = @()
+            if ($stdinHelperHex.Length -gt 0) {
+                $stdinHelperReceivedBytes = @($stdinHelperHex.Split('-') | ForEach-Object { [Convert]::ToByte($_, 16) })
+            }
+            $stdinHelperHasBom = (
+                $stdinHelperReceivedBytes.Count -ge 3 -and
+                $stdinHelperReceivedBytes[0] -eq 0xEF -and
+                $stdinHelperReceivedBytes[1] -eq 0xBB -and
+                $stdinHelperReceivedBytes[2] -eq 0xBF
+            )
+            $stdinHelperPassed = (
+                $stdinHelperCompleted -and
+                -not $stdinHelperHasBom -and
+                $stdinHelperReceivedBytes.Count -eq $stdinHelperExpectedBytes.Length -and
+                ([BitConverter]::ToString([byte[]]$stdinHelperReceivedBytes) -eq [BitConverter]::ToString($stdinHelperExpectedBytes))
+            )
+            if (-not $stdinHelperPassed) {
+                $stdinHelperFailure = "case=$stdinHelperCase; exited=$stdinHelperCompleted; bom=$stdinHelperHasBom; bytes=$($stdinHelperReceivedBytes.Count); expected=$($stdinHelperExpectedBytes.Length)"
+            }
+        } catch {
+            $stdinHelperFailure = "case=$stdinHelperCase; $($_.Exception.Message)"
+        } finally {
+            if ($null -ne $stdinHelperCapture) {
+                try {
+                    [void](Complete-BRAVOProcessOutputCapture -Capture $stdinHelperCapture)
+                } catch {
+                    # Прибирання після тестового дочірнього процесу: результат
+                    # уже зафіксовано в $stdinHelperFailure, помилка дренажу
+                    # потоків не повинна підмінити причину провалу.
+                    $stdinHelperFailure = "$stdinHelperFailure; drain: $($_.Exception.Message)"
+                }
+            }
+            if ($null -ne $stdinHelperProcess) {
+                $stdinHelperProcess.Dispose()
+            }
+        }
+        if (-not $stdinHelperPassed) {
+            $stdinHelperCaseFailures += $stdinHelperFailure
+        }
+    }
+    $stdinHelperPassed = ($stdinHelperCaseFailures.Count -eq 0)
+    $stdinHelperFailure = $stdinHelperCaseFailures -join " | "
+    Test-BRAVOCondition `
+        -Condition $stdinHelperPassed `
+        -Name "Secrets/ProcessInputTextWritesExactBomFreeBytes" `
+        -Failure "Write-BRAVOProcessInputText має передати в stdin рівно UTF-8 без BOM + CRLF і закрити потік: $stdinHelperFailure"
+
     Test-BRAVOCondition `
         -Condition (Test-BRAVOAccountIdentityEquivalent `
             -ExpectedAccount "SYSTEM" `
@@ -5080,6 +5274,88 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Maintenance/SuccessWithWarningsRoutesToAlertsNotGeneral" `
         -Failure "'УСПІШНО З ПОПЕРЕДЖЕННЯМИ' (:warning:) має маршрутизуватись через notificationSeverity=WARNING на ALERTS webhook, а не через SUCCESS на GENERAL (review finding #1: routing severity мав завжди збігатися з фактичним final status)"
+
+    # --- Maintenance (T015): блок "Виконано" успішного сповіщення
+    # (NotificationMode=all) будується через New-Object List[string], а не
+    # [T]::new() (PowerShell 5.0+; маніфести декларують 3.0). Регресія
+    # семантики колекції під Set-StrictMode 2.0: 0/1/багато рядків від
+    # New-BRAVOMaintenanceCompletedLines мають дійти в -Details рівно тим
+    # самим набором і порядком. Сам заборонений виклик ловить
+    # StaticAnalysis/NoStaticNewConstructorInProductionCode (Governance).
+    $completedLinesModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceRuntimeSourceForSeverity `
+        -FunctionNames @('Send-FinalReport')
+    $completedLinesScenarios = @(
+        @{ Name = 'Zero'; Lines = @() },
+        @{ Name = 'One'; Lines = @('Виконано:') },
+        @{ Name = 'Many'; Lines = @('Виконано:', ':white_check_mark: Реставрація — за планом', ':floppy_disk: C: 100 ГБ') }
+    )
+    foreach ($completedLinesScenario in $completedLinesScenarios) {
+        $completedLinesCapture = & $completedLinesModule {
+            param([string[]]$ScenarioLines)
+            Set-StrictMode -Version 2.0
+            $script:SlackMode = "all"
+            $script:CriticalErrorsList = New-Object System.Collections.Generic.List[string]
+            $script:NotificationAlertQueue = New-Object System.Collections.Generic.List[object]
+            $script:NotificationWebhookUrls = @{ alerts = "STUB-ALERTS-URL"; general = "STUB-GENERAL-URL" }
+            $script:ScriptStartTime = Get-Date
+            $bravoSettings = @{ NotificationRouting = @{} }
+            $NotificationProviderDisplayName = "STUB"
+            $script:capturedDetails = $null
+            $script:deliveredCount = 0
+            $LOG_DIR = "STUB-LOG-DIR"
+            $BravoMaintenanceEnabled = $true
+            $CheckSize = $false
+            $RangeIdMonitoringEnabled = $false
+            $traceOutputProcessed = $false
+            $exchangAPILogsProcessedCount = 0
+            $restoreCompletedAt = Get-Date
+            $script:scenarioCompletedLines = @($ScenarioLines)
+
+            function Write-Log { param($Message, [string]$Level = 'INFO', [switch]$NoTimestamp, [switch]$NoConsole) }
+            function Get-BRAVOFiles { param($Path, $Filter) return @() }
+            function Get-MaintenanceMinimumFreeSpaceLines { return @() }
+            function Get-MaintenanceFreeSpaceInlineText { return ":floppy_disk: C: 100 ГБ · поріг: 20 ГБ" }
+            function New-BRAVOMaintenanceCompletedLines {
+                param($LastRestoreText, $FreeSpaceInlineText, $TraceCountText, $ExchangeCountText)
+                return $script:scenarioCompletedLines
+            }
+            function Format-BRAVOUkrainianCount { param([int]$Count, [string]$One, [string]$Few, [string]$Many) return "$Count" }
+            function Resolve-BRAVONotificationRoute {
+                param([string]$Severity, [string]$NotificationMode, $RoutingTable)
+                return "general"
+            }
+            function Invoke-NotificationWebhook {
+                param([string]$Message, [string]$WebhookUrl)
+                $script:deliveredCount++
+            }
+            function New-MaintenanceNotificationMessage {
+                param([string]$Title, [string]$TitleEmoji, $Duration, [string[]]$Details, [string]$LogPath, [string[]]$StatusLines, [string]$Severity)
+                $script:capturedDetails = @($Details)
+                return "TITLE=$Title"
+            }
+            function Get-BRAVOMaintenanceResolvedExitCode { return 0 }
+            function Get-BRAVOMaintenanceFinalStatus { param($ExitCode) return [pscustomobject]@{ Text = 'УСПІШНО' } }
+
+            Send-FinalReport -LOG_FILE "STUB-LOG-PATH"
+
+            [pscustomobject]@{
+                DeliveredCount = $script:deliveredCount
+                DetailsCount = @($script:capturedDetails).Count
+                DetailsJoined = (@($script:capturedDetails) -join '|')
+            }
+        } $completedLinesScenario.Lines
+        $expectedCompletedLines = @($completedLinesScenario.Lines)
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $completedLinesCapture -and
+                $completedLinesCapture.DeliveredCount -eq 1 -and
+                $completedLinesCapture.DetailsCount -eq $expectedCompletedLines.Count -and
+                $completedLinesCapture.DetailsJoined -eq ($expectedCompletedLines -join '|')
+            ) `
+            -Name "Maintenance/SuccessNotificationCompletedLines_$($completedLinesScenario.Name)" `
+            -Failure "успішне сповіщення (mode=all) мало передати в -Details $($expectedCompletedLines.Count) рядк(ів) '$($expectedCompletedLines -join '|')'; отримано: $(if ($null -eq $completedLinesCapture) { '<немає результату>' } else { '{0} доставлено, {1} рядк(ів) ''{2}''' -f $completedLinesCapture.DeliveredCount, $completedLinesCapture.DetailsCount, $completedLinesCapture.DetailsJoined })"
+    }
 
     # Модель release channel (P0.6 аудиту): developer -> development,
     # master/main -> stable. Перевірка навмисно не обов'язкова — release-пакет
@@ -6836,6 +7112,412 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         ) `
         -Name "Secrets/SevenZipPasswordUsesStdin" `
         -Failure "пароль 7-Zip не повинен потрапляти до командного рядка процесу (включно з BRAVO.DataRestore inventory, мігрованим на канонічну Get-BRAVOSevenZipArchiveEntries)"
+
+    # T005: Archive (New-Archive) був останньою production-точкою, що писала
+    # пароль 7-Zip прямим $process.StandardInput.WriteLine — під
+    # UTF-8-консоллю це "U+FEFF<пароль>". Той самий гейт, що вище для
+    # Compatibility/DataRestore, тепер (1) вимагає канонічний виклик у
+    # Archive і (2) AST-рівнем (коментарі не рахуються) забороняє будь-який
+    # прямий <...>.StandardInput.Write(...)/WriteLine(...) у production-коді
+    # (кореневі BRAVO_*.ps1 окрім self-test, modules\, deploy\). Дозволений
+    # шлях запису в stdin дочірнього процесу — лише Write-BRAVOProcessInputText
+    # (BaseStream, UTF-8 без BOM). Діагностика — лише файл:рядок.
+    $archiveStdinAst = [Management.Automation.Language.Parser]::ParseInput($archiveScriptText, [ref]$null, [ref]$null)
+    $archiveStdinHelperCalls = @($archiveStdinAst.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.CommandAst] -and
+            $node.GetCommandName() -eq 'Write-BRAVOProcessInputText' -and
+            $node.Extent.Text -match '-Text\s+\$script:archivePassword\b'
+    }, $true))
+    Test-BRAVOCondition `
+        -Condition ($archiveStdinHelperCalls.Count -ge 1) `
+        -Name "Secrets/ArchivePasswordUsesBomFreeStdinHelper" `
+        -Failure "New-Archive має передавати пароль 7-Zip через канонічний Write-BRAVOProcessInputText -Text `$script:archivePassword (UTF-8 без BOM), а не прямим StandardInput.WriteLine"
+
+    $directStdinWriteFiles = @(
+        @(Get-ChildItem -LiteralPath $root -Filter 'BRAVO_*.ps1' -File |
+            Where-Object { $_.Name -notlike 'BRAVO_SELF_TEST*' }) +
+        @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File |
+            Where-Object { @('.ps1', '.psm1') -contains $_.Extension }) +
+        @(Get-ChildItem -LiteralPath (Join-Path $root 'deploy') -Recurse -File |
+            Where-Object { @('.ps1', '.psm1') -contains $_.Extension })
+    )
+    $directStdinWriteViolations = @()
+    foreach ($directStdinWriteFile in $directStdinWriteFiles) {
+        $directStdinFileAst = [Management.Automation.Language.Parser]::ParseFile(
+            $directStdinWriteFile.FullName, [ref]$null, [ref]$null)
+        $directStdinWriteViolations += @($directStdinFileAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.InvokeMemberExpressionAst] -and
+                $node.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                @('Write', 'WriteLine') -contains $node.Member.Value -and
+                $node.Expression -is [Management.Automation.Language.MemberExpressionAst] -and
+                $node.Expression.Member -is [Management.Automation.Language.StringConstantExpressionAst] -and
+                $node.Expression.Member.Value -eq 'StandardInput'
+        }, $true) | ForEach-Object {
+            "{0}:{1}" -f $directStdinWriteFile.FullName.Substring($root.Length).TrimStart('\', '/'), $_.Extent.StartLineNumber
+        })
+    }
+    Test-BRAVOCondition `
+        -Condition ($directStdinWriteFiles.Count -gt 0 -and $directStdinWriteViolations.Count -eq 0) `
+        -Name "Secrets/NoDirectStandardInputWriteInProduction" `
+        -Failure "production-код не повинен писати в stdin дочірнього процесу прямим StandardInput.Write/WriteLine (під UTF-8-консоллю додає BOM до пароля 7-Zip) — лише через Write-BRAVOProcessInputText: $($directStdinWriteViolations -join ', ')"
+
+    # 5.3.0 (T005b): канонічний BOM-free stdin. У .NET Framework
+    # Process.Start створює StandardInput як StreamWriter(pipe,
+    # Console.InputEncoding) з AutoFlush — і преамбула кодування (BOM під
+    # UTF-8-консоллю, chcp 65001) потрапляє в pipe ДО першого запису
+    # викликача; Write-BRAVOProcessInputText через BaseStream її вже не
+    # прибере. Windows CI зафіксував 38 байт (EF BB BF + секрет + CRLF)
+    # замість 35. Запуск процесу з redirected stdin дозволено лише через
+    # Start-BRAVOProcessWithBomFreeInput (його викликає
+    # Start-BRAVOProcessOutputCapture).
+    function Get-BRAVOStdinProcessStartViolation {
+        # Governance-гард (AST): (1) інстансний .Start() без аргументів —
+        # лише всередині Start-BRAVOProcessWithBomFreeInput; (2) статичний
+        # [Process]::Start(...) — заборонений в області (функція або
+        # top-level інструкція), що вмикає RedirectStandardInput; (3) прямий
+        # .StandardInput.Write*/WriteLine — лише у Write-BRAVOProcessInputText
+        # або в явному allow-list. Застарілий запис allow-list теж порушення.
+        param(
+            [Parameter(Mandatory = $true)][string]$RootPath,
+            [Parameter(Mandatory = $true)][System.IO.FileInfo[]]$Files,
+            [string[]]$DirectStdinWriteAllowList = @()
+        )
+
+        $violations = New-Object System.Collections.Generic.List[string]
+        $usedAllowListEntries = @{}
+        foreach ($file in $Files) {
+            $relativePath = ($file.FullName.Substring($RootPath.Length).TrimStart('\', '/')) -replace '/', '\'
+            $parseTokens = $null
+            $parseErrors = $null
+            $fileAst = [Management.Automation.Language.Parser]::ParseFile(
+                $file.FullName,
+                [ref]$parseTokens,
+                [ref]$parseErrors
+            )
+            $memberCalls = @($fileAst.FindAll({
+                param($node)
+                $node -is [Management.Automation.Language.InvokeMemberExpressionAst]
+            }, $true))
+            foreach ($call in $memberCalls) {
+                $memberName = ([string]$call.Member.Extent.Text).Trim("'", '"')
+                $scopeNode = $call
+                $parentNode = $call.Parent
+                while ($null -ne $parentNode) {
+                    if ($parentNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                        $scopeNode = $parentNode
+                        break
+                    }
+                    if ($parentNode -is [Management.Automation.Language.NamedBlockAst] -and
+                        [object]::ReferenceEquals($parentNode.Parent, $fileAst)) {
+                        break
+                    }
+                    $scopeNode = $parentNode
+                    $parentNode = $parentNode.Parent
+                }
+                $scopeName = if ($scopeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    $scopeNode.Name
+                } else {
+                    '<script>'
+                }
+                $argumentCount = if ($null -eq $call.Arguments) { 0 } else { $call.Arguments.Count }
+                $location = "{0}:{1} ({2})" -f $relativePath, $call.Extent.StartLineNumber, $scopeName
+
+                if (-not $call.Static -and $memberName -eq 'Start' -and $argumentCount -eq 0 -and
+                    $scopeName -ne 'Start-BRAVOProcessWithBomFreeInput') {
+                    $violations.Add("$location — інстансний .Start() поза Start-BRAVOProcessWithBomFreeInput")
+                }
+                if ($call.Static -and $memberName -eq 'Start' -and
+                    $scopeNode.Extent.Text.Contains('RedirectStandardInput')) {
+                    $violations.Add("$location — статичний ::Start() в області з RedirectStandardInput")
+                }
+                if ($memberName -match '^Write(Line)?$' -and
+                    ([string]$call.Expression.Extent.Text) -match '\.StandardInput(\.BaseStream)?$' -and
+                    $scopeName -ne 'Write-BRAVOProcessInputText') {
+                    $allowKey = "{0}|{1}" -f $relativePath, $scopeName
+                    if ($DirectStdinWriteAllowList -contains $allowKey) {
+                        $usedAllowListEntries[$allowKey] = $true
+                    } else {
+                        $violations.Add("$location — прямий запис у StandardInput поза Write-BRAVOProcessInputText")
+                    }
+                }
+            }
+        }
+        foreach ($allowKey in $DirectStdinWriteAllowList) {
+            if (-not $usedAllowListEntries.ContainsKey($allowKey)) {
+                $violations.Add("застарілий запис allow-list (прибрати): $allowKey")
+            }
+        }
+        return $violations.ToArray()
+    }
+
+    $bomFreeProductionFiles = @(
+        @(Get-ChildItem -LiteralPath $root -File -Filter '*.ps1' |
+            Where-Object { $_.Name -ne 'BRAVO_SELF_TEST.ps1' })
+        @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File |
+            Where-Object { $_.Extension -in @('.ps1', '.psm1') })
+    )
+    # Allow-list прямих записів у StandardInput порожній: New-Archive (T005)
+    # мігровано на Write-BRAVOProcessInputText. Новий запис допустимий лише
+    # з обґрунтуванням; застарілий запис гард сам позначає як порушення.
+    $bomFreeDirectWriteAllowList = @()
+    $bomFreeViolations = @(Get-BRAVOStdinProcessStartViolation `
+        -RootPath $root -Files $bomFreeProductionFiles `
+        -DirectStdinWriteAllowList $bomFreeDirectWriteAllowList)
+
+    # Контроль невакуумності гарда: синтетичний файл з типовим
+    # порушенням (сирий .Start() + WriteLine) МАЄ дати порушення.
+    $bomFreeGuardProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_BOMFREE_GUARD_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    $bomFreeProbeViolations = @()
+    try {
+        [void][IO.Directory]::CreateDirectory($bomFreeGuardProbeRoot)
+        $bomFreeProbeFile = Join-Path $bomFreeGuardProbeRoot 'probe.ps1'
+        [IO.File]::WriteAllText($bomFreeProbeFile, (
+            "function Invoke-Probe {`r`n" +
+            "    `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "    `$psi.RedirectStandardInput = `$true`r`n" +
+            "    `$p = New-Object System.Diagnostics.Process`r`n" +
+            "    `$p.StartInfo = `$psi`r`n" +
+            "    [void]`$p.Start()`r`n" +
+            "    `$p.StandardInput.WriteLine('x')`r`n" +
+            "    [void][System.Diagnostics.Process]::Start(`$psi)`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeProbeViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeGuardProbeRoot -Files @(Get-Item -LiteralPath $bomFreeProbeFile) `
+            -DirectStdinWriteAllowList @('probe.ps1|Stale-Entry'))
+    } finally {
+        if (Test-Path -LiteralPath $bomFreeGuardProbeRoot) {
+            Remove-Item -LiteralPath $bomFreeGuardProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $bomFreeProductionFiles.Count -gt 0 -and
+            $bomFreeViolations.Count -eq 0 -and
+            $bomFreeProbeViolations.Count -eq 4
+        ) `
+        -Name "Secrets/StdinProcessStartOnlyViaBomFreeHelper" `
+        -Failure ("процес із redirected stdin має запускатися лише через Start-BRAVOProcessWithBomFreeInput, а stdin писатися лише через Write-BRAVOProcessInputText; порушення: {0}; контроль гарда (очікувано 4): {1}" -f
+            ($bomFreeViolations -join '; '), ($bomFreeProbeViolations -join '; '))
+
+    # Логіка рішення (детерміновано, будь-який хост): приватне ядро
+    # Invoke-BRAVOInputPreambleFreeStart з підставними get/set/start.
+    $bomFreeCompatibilityModule = Get-Module -Name 'BRAVO.Compatibility' | Select-Object -First 1
+    if ($null -eq $bomFreeCompatibilityModule) {
+        $bomFreeCompatibilityModule = Import-Module `
+            -Name (Join-Path $root "modules\BRAVO.Compatibility\BRAVO.Compatibility.psd1") `
+            -PassThru -ErrorAction Stop
+    }
+    $bomFreeCoreResult = & $bomFreeCompatibilityModule {
+        $withPreamble = New-Object System.Text.UTF8Encoding($true)
+        $withoutPreamble = New-Object System.Text.UTF8Encoding($false)
+        $outcome = @{}
+
+        # 1) Кодування без преамбули: запуск як є, кодування не чіпається.
+        $state = @{ Current = $withoutPreamble; SetCalls = 0; PreambleAtStart = -1 }
+        Invoke-BRAVOInputPreambleFreeStart `
+            -StartAction { $state.PreambleAtStart = $state.Current.GetPreamble().Length } `
+            -GetInputEncoding { $state.Current } `
+            -SetInputEncoding { param($Encoding) $state.SetCalls++; $state.Current = $Encoding }
+        $outcome.NoPreambleUntouched = ($state.SetCalls -eq 0 -and $state.PreambleAtStart -eq 0)
+
+        # 2) Преамбула: на час Start() — UTF-8 без BOM, потім оригінал.
+        $state = @{ Current = $withPreamble; SetCalls = 0; PreambleAtStart = -1 }
+        Invoke-BRAVOInputPreambleFreeStart `
+            -StartAction { $state.PreambleAtStart = $state.Current.GetPreamble().Length } `
+            -GetInputEncoding { $state.Current } `
+            -SetInputEncoding { param($Encoding) $state.SetCalls++; $state.Current = $Encoding }
+        $outcome.PreambleReplacedThenRestored = (
+            $state.PreambleAtStart -eq 0 -and $state.SetCalls -eq 2 -and
+            [object]::ReferenceEquals($state.Current, $withPreamble)
+        )
+
+        # 3) Start() кидає — оригінал усе одно відновлено, виняток не проковтнуто.
+        $state = @{ Current = $withPreamble; SetCalls = 0 }
+        $startError = $null
+        try {
+            Invoke-BRAVOInputPreambleFreeStart `
+                -StartAction { throw "bravo-probe-start-failure" } `
+                -GetInputEncoding { $state.Current } `
+                -SetInputEncoding { param($Encoding) $state.SetCalls++; $state.Current = $Encoding }
+        } catch {
+            $startError = $_.Exception.Message
+        }
+        $outcome.RestoredAfterStartThrows = (
+            [string]$startError -like '*bravo-probe-start-failure*' -and
+            $state.SetCalls -eq 2 -and
+            [object]::ReferenceEquals($state.Current, $withPreamble)
+        )
+
+        # 4) Замінити не вдалося (немає консолі), преамбула лишилась —
+        #    fail-closed: процес НЕ запускається.
+        $state = @{ Current = $withPreamble; Started = $false }
+        $failClosedError = $null
+        try {
+            Invoke-BRAVOInputPreambleFreeStart `
+                -StartAction { $state.Started = $true } `
+                -GetInputEncoding { $state.Current } `
+                -SetInputEncoding { param($Encoding) throw "bravo-probe-no-console" }
+        } catch {
+            $failClosedError = $_.Exception.Message
+        }
+        $outcome.FailsClosedWhenPreambleRemains = (
+            -not $state.Started -and
+            [string]$failClosedError -like '*fail-closed*' -and
+            [string]$failClosedError -like '*bravo-probe-no-console*'
+        )
+
+        # 5) Замінити не вдалося, але фактичне кодування вже без
+        #    преамбули — запуск безпечний і відбувається.
+        $state = @{ GetCalls = 0; Started = $false }
+        $safeError = $null
+        try {
+            Invoke-BRAVOInputPreambleFreeStart `
+                -StartAction { $state.Started = $true } `
+                -GetInputEncoding {
+                    $state.GetCalls++
+                    if ($state.GetCalls -eq 1) { $withPreamble } else { $withoutPreamble }
+                } `
+                -SetInputEncoding { param($Encoding) throw "bravo-probe-no-console" }
+        } catch {
+            $safeError = $_.Exception.Message
+        }
+        $outcome.StartsWhenReplaceFailsButNoPreamble = ($state.Started -and $null -eq $safeError)
+
+        return [pscustomobject]$outcome
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$bomFreeCoreResult.NoPreambleUntouched -and
+            [bool]$bomFreeCoreResult.PreambleReplacedThenRestored -and
+            [bool]$bomFreeCoreResult.RestoredAfterStartThrows
+        ) `
+        -Name "Runtime/BomFreeStdinStartReplacesAndRestoresEncoding" `
+        -Failure ("Start-BRAVOProcessWithBomFreeInput має на час Start() прибирати преамбулу кодування вводу і завжди відновлювати оригінал: NoPreamble={0}, Replaced={1}, RestoredAfterThrow={2}" -f
+            $bomFreeCoreResult.NoPreambleUntouched, $bomFreeCoreResult.PreambleReplacedThenRestored, $bomFreeCoreResult.RestoredAfterStartThrows)
+    Test-BRAVOCondition `
+        -Condition (
+            [bool]$bomFreeCoreResult.FailsClosedWhenPreambleRemains -and
+            [bool]$bomFreeCoreResult.StartsWhenReplaceFailsButNoPreamble
+        ) `
+        -Name "Runtime/BomFreeStdinStartFailsClosedWithoutConsole" `
+        -Failure ("якщо кодування вводу консолі замінити не вдалося, запуск дозволено лише коли преамбули немає, інакше — fail-closed: FailClosed={0}, SafeStart={1}" -f
+            $bomFreeCoreResult.FailsClosedWhenPreambleRemains, $bomFreeCoreResult.StartsWhenReplaceFailsButNoPreamble)
+
+    # Поведінковий байт-точний тест (реальний дочірній PowerShell) під
+    # ПРИМУСОВИМ UTF-8-з-BOM кодуванням вводу консолі — саме умова, за якої
+    # Windows CI побачив BOM. Якщо хост без консолі і примусити кодування
+    # не можна, тест перевіряє fail-closed/безпечну гілку, а не пропускається.
+    function Invoke-BRAVOBomFreeStdinProbe {
+        param(
+            [Parameter(Mandatory = $true)][string]$FileName,
+            [Parameter(Mandatory = $true)][string]$ChildScript,
+            [Parameter(Mandatory = $true)][string]$InputText
+        )
+        $probeProcess = $null
+        $probeCapture = $null
+        try {
+            $probeInfo = New-Object System.Diagnostics.ProcessStartInfo
+            $probeInfo.FileName = $FileName
+            $probeInfo.Arguments = "-NoProfile -NonInteractive -EncodedCommand " +
+                [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ChildScript))
+            $probeInfo.RedirectStandardInput = $true
+            $probeInfo.RedirectStandardOutput = $true
+            $probeInfo.RedirectStandardError = $true
+            $probeInfo.UseShellExecute = $false
+            $probeInfo.CreateNoWindow = $true
+            $probeProcess = New-Object System.Diagnostics.Process
+            $probeProcess.StartInfo = $probeInfo
+            $probeCapture = Start-BRAVOProcessOutputCapture -Process $probeProcess
+            Write-BRAVOProcessInputText -Process $probeProcess -Text $InputText
+            if (-not $probeProcess.WaitForExit(60000)) {
+                $probeProcess.Kill()
+                throw "дочірній процес не завершився за 60 с"
+            }
+            $probeCaptured = Complete-BRAVOProcessOutputCapture -Capture $probeCapture
+            $probeCapture = $null
+            return [pscustomobject]@{
+                Output = ([string]$probeCaptured.StandardOutput).Trim()
+                Error = $null
+            }
+        } catch {
+            return [pscustomobject]@{ Output = $null; Error = $_.Exception.Message }
+        } finally {
+            if ($null -ne $probeCapture) {
+                try {
+                    [void](Complete-BRAVOProcessOutputCapture -Capture $probeCapture)
+                } catch {
+                    Write-Verbose "збір виводу probe-процесу: $($_.Exception.Message)"
+                }
+            }
+            if ($null -ne $probeProcess) {
+                $probeProcess.Dispose()
+            }
+        }
+    }
+
+    # Фікстура-секрет зі складових (не справжній секрет).
+    $bomFreeFixtureSecret = ("Fx" + "t5b") + "-" + ("std" + "in") + "-" + [string](40 + 2)
+    $bomFreeExpectedHex = [BitConverter]::ToString(
+        (New-Object System.Text.UTF8Encoding($false)).GetBytes($bomFreeFixtureSecret + "`r`n")
+    )
+    $bomFreeChildScript = '$s=[Console]::OpenStandardInput();$m=New-Object IO.MemoryStream;$s.CopyTo($m);[Console]::Out.Write([BitConverter]::ToString($m.ToArray()))'
+    $bomFreeHostPath = (Get-Process -Id $PID).Path
+    $bomFreeOriginalInputEncoding = [Console]::InputEncoding
+    $bomFreeForced = $false
+    $bomFreeForceError = $null
+    $bomFreeActivePreambleLength = -1
+    $bomFreeProbe = $null
+    $bomFreePreambleAfterReturn = -1
+    $bomFreeMissingProbe = $null
+    $bomFreePreambleAfterThrow = -1
+    try {
+        try {
+            [Console]::InputEncoding = [Text.Encoding]::UTF8
+            $bomFreeForced = $true
+        } catch {
+            $bomFreeForceError = $_.Exception.Message
+        }
+        $bomFreeActivePreambleLength = [Console]::InputEncoding.GetPreamble().Length
+        $bomFreeProbe = Invoke-BRAVOBomFreeStdinProbe `
+            -FileName $bomFreeHostPath -ChildScript $bomFreeChildScript -InputText $bomFreeFixtureSecret
+        $bomFreePreambleAfterReturn = [Console]::InputEncoding.GetPreamble().Length
+        # Start() кидає (неіснуючий виконуваний файл) — кодування має
+        # бути відновлене й після винятку.
+        $bomFreeMissingProbe = Invoke-BRAVOBomFreeStdinProbe `
+            -FileName (Join-Path ([IO.Path]::GetTempPath()) ("bravo-missing-{0}.exe" -f [guid]::NewGuid().ToString("N"))) `
+            -ChildScript $bomFreeChildScript -InputText $bomFreeFixtureSecret
+        $bomFreePreambleAfterThrow = [Console]::InputEncoding.GetPreamble().Length
+    } finally {
+        if ($bomFreeForced) {
+            [Console]::InputEncoding = $bomFreeOriginalInputEncoding
+        }
+    }
+    $bomFreeExactBranch = ($bomFreeForced -or $bomFreeActivePreambleLength -eq 0)
+    $bomFreeBehaviourPassed = if ($bomFreeExactBranch) {
+        $null -eq $bomFreeProbe.Error -and $bomFreeProbe.Output -eq $bomFreeExpectedHex
+    } else {
+        [string]$bomFreeProbe.Error -like '*fail-closed*'
+    }
+    Test-BRAVOCondition `
+        -Condition ([bool]$bomFreeBehaviourPassed) `
+        -Name "Runtime/BomFreeStdinChildReceivesExactBytes" `
+        -Failure ("дочірній процес має отримати в stdin рівно UTF-8 без BOM (секрет + CRLF) або, якщо кодування консолі не можна замінити й преамбула лишається, запуск має відмовити fail-closed; forced={0} ({1}), preamble={2}, очікувано={3}, отримано={4}, помилка={5}" -f
+            $bomFreeForced, $bomFreeForceError, $bomFreeActivePreambleLength, $bomFreeExpectedHex, $bomFreeProbe.Output, $bomFreeProbe.Error)
+    Test-BRAVOCondition `
+        -Condition (
+            $bomFreePreambleAfterReturn -eq $bomFreeActivePreambleLength -and
+            $null -ne $bomFreeMissingProbe.Error -and
+            $bomFreePreambleAfterThrow -eq $bomFreeActivePreambleLength
+        ) `
+        -Name "Runtime/BomFreeStdinStartRestoresConsoleEncoding" `
+        -Failure ("після Start-BRAVOProcessWithBomFreeInput (успіх і виняток) кодування вводу консолі має бути відновлене: до={0}, після успіху={1}, після винятку={2}, виняток='{3}'" -f
+            $bomFreeActivePreambleLength, $bomFreePreambleAfterReturn, $bomFreePreambleAfterThrow, $bomFreeMissingProbe.Error)
+    # (кінець блоку T005b)
 
     # Реальний випадок: власний прогрес-бокс Test-NetConnection
     # ("Attempting TCP connect", "Waiting for response") усе одно
@@ -13453,7 +14135,10 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $compressPsi.UseShellExecute = $false
             $compressProcess = New-Object System.Diagnostics.Process
             $compressProcess.StartInfo = $compressPsi
-            [void]$compressProcess.Start()
+            # T005b: канонічний запуск — інакше під UTF-8-консоллю пароль
+            # фікстури отримав би BOM-префікс і розпакування пройшло б лише
+            # через legacy fallback.
+            Start-BRAVOProcessWithBomFreeInput -Process $compressProcess
             $compressProcess.StandardInput.WriteLine("RestoreDrillSelfTestPass")
             $compressProcess.StandardInput.Close()
             $compressProcess.WaitForExit()
@@ -13523,7 +14208,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $psi.UseShellExecute = $false
                     $proc = New-Object System.Diagnostics.Process
                     $proc.StartInfo = $psi
-                    [void]$proc.Start()
+                    # T005b: канонічний запуск — рівно ОДИН BOM (записаний
+                    # нижче явно) незалежно від кодування консолі хоста.
+                    Start-BRAVOProcessWithBomFreeInput -Process $proc
                     $effectivePassword = ([char]0xFEFF) + $Password
                     $bytes = (New-Object System.Text.UTF8Encoding($false)).GetBytes($effectivePassword + "`r`n")
                     $proc.StandardInput.BaseStream.Write($bytes, 0, $bytes.Length)
@@ -13591,7 +14278,9 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                 $b2NormalCreatePsi.UseShellExecute = $false
                 $b2NormalCreateProcess = New-Object System.Diagnostics.Process
                 $b2NormalCreateProcess.StartInfo = $b2NormalCreatePsi
-                [void]$b2NormalCreateProcess.Start()
+                # T005b: канонічний запуск — інакше під UTF-8-консоллю
+                # .NET Framework записав би BOM у stdin ще в Start().
+                Start-BRAVOProcessWithBomFreeInput -Process $b2NormalCreateProcess
                 Write-BRAVOProcessInputText -Process $b2NormalCreateProcess -Text "B2NormalPass"
                 [void]$b2NormalCreateProcess.StandardOutput.ReadToEnd()
                 [void]$b2NormalCreateProcess.StandardError.ReadToEnd()
@@ -15443,12 +16132,93 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Failure "успіх/помилка 'Архівація після maintenance' мають визначатись через Get-BRAVOMaintenanceStepStatus за тим самим `$script:criticalErrorOccurred, що дочірній процес уже виставляє"
     Test-BRAVOCondition `
         -Condition (
-            $archiveResultCallWindow.Contains('"BRAVO_ARCHIV завершився з кодом $($archivProcess.ExitCode)"') -and
+            $archiveResultCallWindow.Contains('$archiveOperationDetail = Register-BRAVOMaintenanceArchiveChildResult -ExitCode $archivProcess.ExitCode') -and
             $archiveResultCallWindow.Contains('"скрипт не знайдено: $bravoArchivePath"') -and
             $archiveResultCallWindow.Contains("archiveOperationDetail = 'перевірте LOG для деталей'")
         ) `
         -Name "Maintenance/ArchiveFailureRendersFail" `
         -Failure "FAIL 'Архівація після maintenance' (exit!=0/не знайдено/exception) має показувати конкретну коротку причину в Details"
+
+    # --- Archive after maintenance: exit-код дочірнього BRAVO_ARCHIV.
+    # Раніше будь-який ненульовий код, включно з 10 (SuccessWithWarnings),
+    # виставляв $script:criticalErrorOccurred, і Maintenance завершувався
+    # кодом 60 (MaintenanceFailed) за фактично успішної архівації.
+    # Поведінковий round-trip через РЕАЛЬНІ Register-BRAVOMaintenanceArchiveChildResult,
+    # Write-Log (лічильник попереджень), Get-BRAVOMaintenanceStepStatus і
+    # Get-BRAVOMaintenanceResolvedExitCode; коди — з BRAVO.ExitCodes.
+    $archiveChildExitTempFile = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_MAINT_ARCHIVE_CHILD_SELF_TEST_{0}.log" -f [guid]::NewGuid().ToString("N"))
+    $archiveChildExitModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $maintenanceScriptTextForManifestStorage `
+        -FunctionNames @(
+            'Write-Log',
+            'Write-BRAVOMaintenanceLogFile',
+            'Register-BRAVOMaintenanceArchiveChildResult',
+            'Get-BRAVOMaintenanceStepStatus',
+            'Get-BRAVOMaintenanceResolvedExitCode'
+        )
+    $archiveChildExitScenario = {
+        param($LogFilePath, $ChildExitCode)
+        $LOG_DIR = [IO.Path]::GetDirectoryName($LogFilePath)
+        $LOG_FILE = $LogFilePath
+        $script:LogLevel = 'INFO'
+        $script:BRAVOWarningCount = 0
+        $script:criticalErrorOccurred = $false
+        $script:restoreArchiveFailed = $false
+        $script:restoreIntegrityFailed = $false
+        $script:restoreFailed = $false
+        $detail = Register-BRAVOMaintenanceArchiveChildResult -ExitCode $ChildExitCode
+        [pscustomobject]@{
+            Detail = $detail
+            Critical = [bool]$script:criticalErrorOccurred
+            Warnings = [int]$script:BRAVOWarningCount
+            StepStatus = Get-BRAVOMaintenanceStepStatus -CriticalBefore $false -WarningsBefore 0
+            RunExitCode = [int](Get-BRAVOMaintenanceResolvedExitCode)
+        }
+    }
+    $archiveChildSuccessCode = Resolve-BRAVOExitCode
+    $archiveChildWarningsCode = Resolve-BRAVOExitCode -HasWarnings
+    $archiveChildFailureCode = Resolve-BRAVOExitCode -LocalArchiveFailed
+    $global:consoleSettings = @{ ConsoleLevel = 'FATAL'; ShowTimestampsInConsole = $false }
+    try {
+        $archiveChildSuccess = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $archiveChildSuccessCode
+        $archiveChildWarnings = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $archiveChildWarningsCode
+        $archiveChildFailure = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $archiveChildFailureCode
+        $archiveChildNull = & $archiveChildExitModule $archiveChildExitScenario $archiveChildExitTempFile $null
+    } finally {
+        $global:consoleSettings = $null
+        Remove-Item -LiteralPath $archiveChildExitTempFile -Force -ErrorAction SilentlyContinue
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            -not $archiveChildSuccess.Critical -and
+            $archiveChildSuccess.Warnings -eq 0 -and
+            $null -eq $archiveChildSuccess.Detail -and
+            $archiveChildSuccess.StepStatus -eq 'OK' -and
+            (Get-BRAVOExitCodeName -Code $archiveChildSuccess.RunExitCode) -eq 'Success'
+        ) `
+        -Name "Maintenance/ArchiveChildExitSuccessIsOk" `
+        -Failure "BRAVO_ARCHIV exit $archiveChildSuccessCode (Success) має давати OK без попереджень; отримано Critical=$($archiveChildSuccess.Critical) Warnings=$($archiveChildSuccess.Warnings) Step=$($archiveChildSuccess.StepStatus) Run=$($archiveChildSuccess.RunExitCode)"
+    Test-BRAVOCondition `
+        -Condition (
+            -not $archiveChildWarnings.Critical -and
+            $archiveChildWarnings.Warnings -eq 1 -and
+            $archiveChildWarnings.StepStatus -eq 'WARN' -and
+            (Get-BRAVOExitCodeName -Code $archiveChildWarnings.RunExitCode) -eq 'SuccessWithWarnings' -and
+            [string]$archiveChildWarnings.Detail -like '*попередженнями*SuccessWithWarnings*'
+        ) `
+        -Name "Maintenance/ArchiveChildExitSuccessWithWarningsIsNotCritical" `
+        -Failure "BRAVO_ARCHIV exit $archiveChildWarningsCode (SuccessWithWarnings) має давати WARN і прогін SuccessWithWarnings, а не critical/MaintenanceFailed; отримано Critical=$($archiveChildWarnings.Critical) Warnings=$($archiveChildWarnings.Warnings) Step=$($archiveChildWarnings.StepStatus) Run=$($archiveChildWarnings.RunExitCode) Detail='$($archiveChildWarnings.Detail)'"
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveChildFailure.Critical -and
+            $archiveChildFailure.StepStatus -eq 'FAIL' -and
+            (Get-BRAVOExitCodeName -Code $archiveChildFailure.RunExitCode) -eq 'MaintenanceFailed' -and
+            [string]$archiveChildFailure.Detail -eq "BRAVO_ARCHIV завершився з кодом $archiveChildFailureCode" -and
+            $archiveChildNull.Critical -and
+            $archiveChildNull.StepStatus -eq 'FAIL'
+        ) `
+        -Name "Maintenance/ArchiveChildExitFailureStaysCritical" `
+        -Failure "BRAVO_ARCHIV exit $archiveChildFailureCode (LocalArchiveFailed) чи невідомий (`$null) код має лишатись critical/FAIL/MaintenanceFailed; отримано Critical=$($archiveChildFailure.Critical) Step=$($archiveChildFailure.StepStatus) Run=$($archiveChildFailure.RunExitCode) Detail='$($archiveChildFailure.Detail)' NullCritical=$($archiveChildNull.Critical)"
 
     # --- AutoShutdown: SKIPPED/OK/FAIL wiring (Invoke-AutoShutdown реально
     # НЕ викликається в тесті — це системна команда shutdown; лише
@@ -17621,6 +18391,112 @@ function Write-BRAVOLog {
         ) `
         -Name 'Archive/EmbeddedHealthRemainsOneStep' `
         -Failure '''Перевірка резервних копій'' має рендеритись РІВНО один раз (один Write-BRAVOArchiveStep) незалежно від Invoke-BRAVOHealthCheck.Status — жодного вкладеного Health-виводу'
+
+    # --- Archive: -NoSlack прогону має доходити до вбудованого Health
+    # (T014). Поведінковий тест: РЕАЛЬНІ оператори з try-блоку Archive від
+    # `$healthParameters = @{` до виклику Invoke-BRAVOHealthCheck
+    # виконуються ізольовано (окремий New-Module) з підміненим
+    # Invoke-BRAVOHealthCheck, що фіксує фактично зв'язані параметри.
+    $archiveHealthNoSlackAst = [Management.Automation.Language.Parser]::ParseInput(
+        $archiveScriptText, [ref]$null, [ref]$null)
+    $archiveHealthTryAst = @(
+        $archiveHealthNoSlackAst.FindAll(
+            {
+                param($node)
+                $node -is [Management.Automation.Language.TryStatementAst] -and
+                $node.Body.Extent.Text.Contains('$healthParameters = @{') -and
+                $node.Body.Extent.Text.Contains('Invoke-BRAVOHealthCheck @healthParameters')
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    $archiveHealthBuildText = $null
+    if ($null -ne $archiveHealthTryAst) {
+        $archiveHealthBuildStatements = New-Object System.Collections.Generic.List[string]
+        $archiveHealthBuildStarted = $false
+        foreach ($archiveHealthStatement in $archiveHealthTryAst.Body.Statements) {
+            $archiveHealthStatementText = $archiveHealthStatement.Extent.Text
+            if ($archiveHealthStatementText.StartsWith('$healthParameters = @{')) {
+                $archiveHealthBuildStarted = $true
+            }
+            if ($archiveHealthBuildStarted) {
+                $archiveHealthBuildStatements.Add($archiveHealthStatementText)
+            }
+            if ($archiveHealthBuildStarted -and
+                $archiveHealthStatementText.Contains('Invoke-BRAVOHealthCheck @healthParameters')) {
+                break
+            }
+        }
+        if ($archiveHealthBuildStatements.Count -gt 0) {
+            $archiveHealthBuildText = $archiveHealthBuildStatements -join "`r`n"
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $archiveHealthBuildText) `
+        -Name 'Archive/HealthParametersBlockFound' `
+        -Failure 'не знайдено try-блок Archive з `$healthParameters = @{ ... } і Invoke-BRAVOHealthCheck @healthParameters -- тест T014 потребує оновлення'
+    if ($null -ne $archiveHealthBuildText) {
+        $archiveHealthNoSlackScenarios = @(
+            @{ NoSlack = $true; Name = 'Archive/NoSlackPropagatedToEmbeddedHealth' }
+            @{ NoSlack = $false; Name = 'Archive/EmbeddedHealthDefaultWithoutNoSlackUnchanged' }
+        )
+        foreach ($archiveHealthNoSlackScenario in $archiveHealthNoSlackScenarios) {
+            $archiveHealthEvalModule = New-Module -ScriptBlock {}
+            $archiveHealthBound = & $archiveHealthEvalModule {
+                param($NoSlackValue, $BuildText)
+                $NoSlack = [switch]$NoSlackValue
+                $configPath = 'STUB-CONFIG-PATH'
+                $configPathWasExplicit = $false
+                $bravoScriptDirectory = 'STUB-RUNTIME-ROOT'
+                $backupMonitoring = @{ NotificationMode = 'errors_only'; NotifyOnSuccessAfterBackup = $false }
+                $transferResults = @{
+                    BAZA_APP = @{ Attempted = $false }
+                    BAZA_WWW = @{ Attempted = $false }
+                }
+                $script:bazaAppSyncResult = $null
+                $script:bazaWWWSyncResult = $null
+                $script:capturedHealthParameters = $null
+                function Test-Path { param([string]$LiteralPath, [string]$PathType) return $true }
+                function Import-Module { param([string]$Name, $ErrorAction) }
+                function Invoke-BRAVOHealthCheck {
+                    param(
+                        [string]$ConfigPath,
+                        [switch]$ForceNotification,
+                        [switch]$NotifyOnSuccess,
+                        [switch]$NoSlack,
+                        [switch]$SkipIfBackupTaskRunning,
+                        [string]$RuntimeRoot,
+                        [string]$EntryScriptPath,
+                        [hashtable]$BazaSyncResults,
+                        [bool]$ConfigPathWasExplicit = $false
+                    )
+                    $script:capturedHealthParameters = @{} + $PSBoundParameters
+                    return [pscustomobject]@{ Status = 'Healthy'; Notification = 'STUB' }
+                }
+                . ([scriptblock]::Create($BuildText))
+                return $script:capturedHealthParameters
+            } $archiveHealthNoSlackScenario.NoSlack $archiveHealthBuildText
+            Remove-Module -ModuleInfo $archiveHealthEvalModule -ErrorAction SilentlyContinue
+            if ($archiveHealthNoSlackScenario.NoSlack) {
+                $archiveHealthNoSlackOk = (
+                    $null -ne $archiveHealthBound -and
+                    $archiveHealthBound.ContainsKey('NoSlack') -and
+                    [bool]$archiveHealthBound['NoSlack']
+                )
+                $archiveHealthNoSlackFailure = 'Archive, запущений з -NoSlack, мусить передавати -NoSlack у Invoke-BRAVOHealthCheck -- інакше вбудований Health може надіслати повідомлення попри заборону оператора'
+            } else {
+                $archiveHealthNoSlackOk = (
+                    $null -ne $archiveHealthBound -and
+                    -not $archiveHealthBound.ContainsKey('NoSlack')
+                )
+                $archiveHealthNoSlackFailure = 'без -NoSlack Archive не має передавати NoSlack у Invoke-BRAVOHealthCheck -- поведінка за замовчуванням має лишитися незмінною'
+            }
+            Test-BRAVOCondition `
+                -Condition $archiveHealthNoSlackOk `
+                -Name $archiveHealthNoSlackScenario.Name `
+                -Failure $archiveHealthNoSlackFailure
+        }
+    }
 
     # --- Health: "План перевірок" рендериться ЛИШЕ у самостійному запуску
     # (не при SuppressHeader — вбудований виклик з Archive) і через
