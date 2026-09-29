@@ -6902,11 +6902,20 @@ function Get-SHA512HashCompatible {
 }
 
 function Verify-Backup {
+    # Повна перевірка before/after-архіву моделі: канонічна перевірка
+    # цілісності 7-Zip (7z t через Test-BRAVOMaintenanceSevenZipArchiveIntegrity
+    # -> BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity — та сама, що в
+    # Archive) і лише для ПЕРЕВІРЕНОГО архіву — запис .sha512. Раніше функція
+    # лише рахувала SHA512 і повертала $true для будь-якого наявного файлу,
+    # а 7z t жив окремо на кожному call site; тепер «перевірено» означає
+    # саме перевірено, а пошкоджений архів / невірний пароль / збій чи
+    # відсутність 7-Zip дають $false (fail-closed) без .sha512.
     param(
+        [string]$SevenZipPath,
         [string]$ArchivePath
     )
     
-    Write-Log "Перевірка контрольних сум архіву: $([System.IO.Path]::GetFileName($ArchivePath))" -Level "INFO"
+    Write-Log "Перевірка архіву (7z t + SHA512): $([System.IO.Path]::GetFileName($ArchivePath))" -Level "INFO"
     
     if (-not (Test-Path $ArchivePath)) {
         $errorMsg = "Архів не знайдено: $ArchivePath"
@@ -6918,6 +6927,22 @@ function Verify-Backup {
 
     $shaFile = "$ArchivePath.sha512"
     $fileName = [System.IO.Path]::GetFileName($ArchivePath)
+
+    # Прапорці criticalErrorOccurred/restoreIntegrityFailed на збій 7z t
+    # виставляє сам Test-BRAVOMaintenanceSevenZipArchiveIntegrity (єдина
+    # політика Maintenance для всіх перевірок 7-Zip).
+    if (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
+            -SevenZipPath $SevenZipPath `
+            -ArchivePath $ArchivePath)) {
+        Write-Log "ПОМИЛКА: Архів $fileName не пройшов перевірку цілісності 7-Zip; SHA512 не створено" -Level "ERROR"
+        # Застарілий .sha512 від попереднього прогону не має лишатися
+        # поруч із архівом, що не пройшов перевірку.
+        if (Test-Path -LiteralPath $shaFile -PathType Leaf) {
+            Remove-Item -LiteralPath $shaFile -Force -ErrorAction SilentlyContinue
+        }
+        return $false
+    }
+
     $valid = $true
 
     try {
@@ -6930,6 +6955,14 @@ function Verify-Backup {
     }
     catch {
         Write-Log "ПОМИЛКА: Помилка перевірки архіву $fileName - $($_.Exception.Message)" -Level "ERROR"
+        # 7z t пройшов, але SHA512 не пораховано чи не записано: архів не
+        # «перевірений» (контракт .sha512 лише для перевіреного архіву),
+        # тож напівзаписаний sidecar прибираємо, а збій позначаємо
+        # критичним і для прямого виклику (call sites виставляють його теж).
+        if (Test-Path -LiteralPath $shaFile -PathType Leaf) {
+            Remove-Item -LiteralPath $shaFile -Force -ErrorAction SilentlyContinue
+        }
+        $script:criticalErrorOccurred = $true
         $valid = $false
     }
 
@@ -8707,16 +8740,8 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true
                 $script:restoreArchiveFailed = $true
-            } elseif (-not (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
-                    -SevenZipPath $ARC_PATH `
-                    -ArchivePath $beforeArchivePath)) {
-                $errorMsg = "Архів моделі перед реставрацією не пройшов перевірку 7-Zip. Реставрація скасована. Архів залишено для діагностики: $beforeArchivePath"
-                Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
-                Send-SlackAlert -Message $errorMsg -IsCritical
-                $script:criticalErrorOccurred = $true
-                $script:restoreIntegrityFailed = $true
-            } elseif (-not (Verify-Backup -ArchivePath $beforeArchivePath)) {
-                $errorMsg = "Не вдалося створити SHA512 для перевіреного архіву перед реставрацією. Реставрація скасована: $beforeArchivePath"
+            } elseif (-not (Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $beforeArchivePath)) {
+                $errorMsg = "Архів моделі перед реставрацією не пройшов перевірку (7z t або SHA512). Реставрація скасована. Архів залишено для діагностики: $beforeArchivePath"
                 Write-Log -Message "ПОМИЛКА: $errorMsg" -Level "ERROR"
                 Send-SlackAlert -Message $errorMsg -IsCritical
                 $script:criticalErrorOccurred = $true
@@ -8872,10 +8897,7 @@ if ($BravoMaintenanceEnabled -and $bravoStatus -ne "Running") {
                             -StandardInputText $script:ArchivePassword
                         $afterArchiveReady = (
                             $exitCode -eq 0 -and
-                            (Test-BRAVOMaintenanceSevenZipArchiveIntegrity `
-                                -SevenZipPath $ARC_PATH `
-                                -ArchivePath $afterArchivePath) -and
-                            (Verify-Backup -ArchivePath $afterArchivePath)
+                            (Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $afterArchivePath)
                         )
                         if ($afterArchiveReady) {
                             Write-Log -Message "Архів моделі після реставрації створено та перевірено -> $afterArchivePath" -Level "SUCCESS"
