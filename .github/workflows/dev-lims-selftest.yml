@@ -14,9 +14,12 @@ name: DEV-LIMS self-test
 #   що друкують конфігурацію, секрети чи внутрішні шляхи хоста.
 # - Не змінює -Suite: прогін завжди повний канонічний.
 #
-# Раннер обирається за мітками self-hosted + Windows + X64. Якщо з'явиться
-# інший self-hosted раннер, додайте DEV-LIMS окрему мітку (наприклад
-# dev-lims) і вкажіть її тут.
+# - Запуск дозволено лише власнику репозиторію (github.actor == ekucher):
+#   інші користувачі з правом write отримають skipped-задачу.
+#
+# Раннер обирається за окремою custom-міткою dev-lims (плюс стандартні
+# self-hosted, Windows, X64), тож задача ніколи не потрапить на інший
+# self-hosted раннер. Без мітки dev-lims на раннері задача чекатиме в черзі.
 
 on:
   workflow_dispatch: {}
@@ -31,8 +34,10 @@ concurrency:
 jobs:
   self-test:
     name: BRAVO_SELF_TEST.ps1 (DEV-LIMS)
-    if: github.repository == 'ekucher/BRAVO-Toolkit'
-    runs-on: [self-hosted, Windows, X64]
+    if: >
+      github.repository == 'ekucher/BRAVO-Toolkit' &&
+      github.actor == 'ekucher'
+    runs-on: [self-hosted, Windows, X64, dev-lims]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
