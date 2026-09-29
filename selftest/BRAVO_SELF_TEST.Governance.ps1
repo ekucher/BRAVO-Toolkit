@@ -2469,3 +2469,293 @@ Test-BRAVOCondition `
         -Name "Governance/ValidateOnlyMigratedDiscoveryBaselineGuardPatternIsMeaningful" `
         -Failure "перевірка вище не відрізняє захищений виклик Import-BRAVODiscoveryBaseline від незахищеного (patern занадто слабкий) — тест-негативний контроль провалився"
 }
+
+# =====================================================================
+# A5: канонічний guard binder-гейту @($List[object]) по всьому репозиторію
+# =====================================================================
+# `@($x)`, де $x тримає System.Collections.Generic.List[object],
+# створений через New-Object, кидає ArgumentException "Argument types do
+# not match" (PSToObjectArrayBinder) і в Windows PowerShell 5.1, і в
+# PowerShell 7 — незалежно від вмісту списку, включно з порожнім.
+# Тригер — PSObject-обгортка, яку дає вивід cmdlet-а New-Object; вона
+# переживає присвоєння, аліас, return ,$list і передачу в параметр без
+# типу або типу [object]. Параметр [object[]] чи [List[object]] обгортку
+# знімає, .ToArray() і [object[]]-каст безпечні.
+#
+# Раніше цей клас тримався точковими виправленнями й коментарями
+# ($probeGroupList, $generationResults, $emptyDirs, $model,
+# $pendingByKey, Timings) і точковим guard-ом
+# Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression. PR #225
+# знайшов ще три входження (stages в Archive і Health), яких точкові
+# guard-и не бачили. Тут — одна перевірка по AST усіх PowerShell-файлів
+# репозиторію (той самий перелік, що аналізує CI: Get-BRAVOAnalyzableFile).
+#
+# Ім'я змінної нормалізується через VariablePath.UserPath зі зрізанням
+# префікса scope ($script:X і X — одна змінна), а не через DriveName:
+# для $script:X DriveName порожній, і саме на цьому спроба загального
+# guard-а в PR #225 дала 2192 хибні спрацювання. Збіг лише за іменем
+# члена ($o.Items) навмисно не перевіряється — між непов'язаними файлами
+# він дає хибні спрацювання.
+& {
+    function Find-BRAVOObjectListArraySubexpression {
+        <#
+            Повертає рядки "<Name>:<рядок>: <вираз> (<причина>)" для кожного
+            @(<змінна>), де змінна тримає New-Object ...List[object] (у тому
+            самому scope, через аліас або через return ,$list), і для
+            @($Param), куди хоч один виклик передає такий список у параметр
+            без типу чи з типом [object]/[psobject].
+            -Source: об'єкти з властивостями Name і Text.
+        #>
+        param([Parameter(Mandatory = $true)][object[]]$Source)
+
+        $listTypePattern = '^(System\.)?(Collections\.)?(Generic\.)?List\[(System\.)?Object\]$'
+
+        $getNormalizedName = {
+            param([string]$UserPath)
+            ($UserPath -replace '^(script|global|local|private|using):', '').ToLowerInvariant()
+        }
+        $getScopeName = {
+            param($Node)
+            $parentNode = $Node.Parent
+            while ($null -ne $parentNode) {
+                if ($parentNode -is [System.Management.Automation.Language.FunctionDefinitionAst]) { return $parentNode.Name }
+                $parentNode = $parentNode.Parent
+            }
+            return '<script>'
+        }
+        $unwrapExpression = {
+            param($Node)
+            $current = $Node
+            while ($true) {
+                if ($current -is [System.Management.Automation.Language.PipelineAst] -and
+                    $current.PipelineElements.Count -eq 1 -and
+                    $current.PipelineElements[0] -is [System.Management.Automation.Language.CommandExpressionAst]) {
+                    $current = $current.PipelineElements[0].Expression
+                    continue
+                }
+                if ($current -is [System.Management.Automation.Language.CommandExpressionAst]) { $current = $current.Expression; continue }
+                if ($current -is [System.Management.Automation.Language.ParenExpressionAst]) { $current = $current.Pipeline; continue }
+                return $current
+            }
+        }
+        $isNewObjectList = {
+            param($Node)
+            $current = $Node
+            if ($current -is [System.Management.Automation.Language.PipelineAst] -and $current.PipelineElements.Count -eq 1) { $current = $current.PipelineElements[0] }
+            if ($current -is [System.Management.Automation.Language.CommandExpressionAst]) { $current = $current.Expression }
+            if ($current -is [System.Management.Automation.Language.ParenExpressionAst]) { return (& $isNewObjectList $current.Pipeline) }
+            if ($current -is [System.Management.Automation.Language.CommandAst] -and $current.GetCommandName() -eq 'New-Object') {
+                for ($elementIndex = 1; $elementIndex -lt $current.CommandElements.Count; $elementIndex++) {
+                    $element = $current.CommandElements[$elementIndex]
+                    if ($element -is [System.Management.Automation.Language.StringConstantExpressionAst] -and $element.Value -match $listTypePattern) { return $true }
+                }
+            }
+            return $false
+        }
+
+        # Прохід 1: розбір, джерела-змінні, аліаси, функції з return ,$list.
+        $units = New-Object System.Collections.Generic.List[object]
+        $wrappedListFunctions = @{}
+        foreach ($sourceItem in $Source) {
+            $unitAst = [System.Management.Automation.Language.Parser]::ParseInput([string]$sourceItem.Text, [ref]$null, [ref]$null)
+            $unitSources = @{}
+            $unitAssignments = @($unitAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true))
+            foreach ($assignment in $unitAssignments) {
+                if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                if (-not (& $isNewObjectList $assignment.Right)) { continue }
+                $leftPath = $assignment.Left.VariablePath.UserPath
+                $leftScope = if ($leftPath -match '^(script|global):') { '<script>' } else { & $getScopeName $assignment }
+                $unitSources[$leftScope + '|' + (& $getNormalizedName $leftPath)] = $true
+            }
+            [void]$units.Add([pscustomobject]@{ Name = [string]$sourceItem.Name; Ast = $unitAst; Sources = $unitSources; Assignments = $unitAssignments })
+        }
+        $propagateAliases = {
+            param($Unit)
+            do {
+                $aliasAdded = $false
+                foreach ($assignment in $Unit.Assignments) {
+                    if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                    $rightNode = & $unwrapExpression $assignment.Right
+                    if ($rightNode -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                    $rightScope = & $getScopeName $assignment
+                    $rightName = & $getNormalizedName $rightNode.VariablePath.UserPath
+                    if (-not ($Unit.Sources.ContainsKey($rightScope + '|' + $rightName) -or $Unit.Sources.ContainsKey('<script>|' + $rightName))) { continue }
+                    $leftPath = $assignment.Left.VariablePath.UserPath
+                    $leftScope = if ($leftPath -match '^(script|global):') { '<script>' } else { $rightScope }
+                    $aliasKey = $leftScope + '|' + (& $getNormalizedName $leftPath)
+                    if (-not $Unit.Sources.ContainsKey($aliasKey)) { $Unit.Sources[$aliasKey] = $true; $aliasAdded = $true }
+                }
+            } while ($aliasAdded)
+        }
+        foreach ($unit in $units) {
+            & $propagateAliases $unit
+            foreach ($commaNode in @($unit.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayLiteralAst] -and $n.Elements.Count -eq 1 }, $true))) {
+                $commaTarget = & $unwrapExpression $commaNode.Elements[0]
+                if ($commaTarget -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                $commaScope = & $getScopeName $commaNode
+                $commaName = & $getNormalizedName $commaTarget.VariablePath.UserPath
+                if ($commaScope -ne '<script>' -and ($unit.Sources.ContainsKey($commaScope + '|' + $commaName) -or $unit.Sources.ContainsKey('<script>|' + $commaName))) {
+                    $wrappedListFunctions[$commaScope.ToLowerInvariant()] = $true
+                }
+            }
+        }
+
+        # Прохід 2: $v = <функція з return ,$list>; таблиця типів параметрів.
+        $parameterTypes = @{}
+        foreach ($unit in $units) {
+            foreach ($assignment in $unit.Assignments) {
+                if ($assignment.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                $rightNode = $assignment.Right
+                if ($rightNode -is [System.Management.Automation.Language.PipelineAst] -and $rightNode.PipelineElements.Count -eq 1 -and
+                    $rightNode.PipelineElements[0] -is [System.Management.Automation.Language.CommandAst]) {
+                    $calledName = $rightNode.PipelineElements[0].GetCommandName()
+                    if ($calledName -and $wrappedListFunctions.ContainsKey($calledName.ToLowerInvariant())) {
+                        $unit.Sources[(& $getScopeName $assignment) + '|' + (& $getNormalizedName $assignment.Left.VariablePath.UserPath)] = $true
+                    }
+                }
+            }
+            & $propagateAliases $unit
+            foreach ($functionNode in @($unit.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+                $functionParameters = @()
+                if ($null -ne $functionNode.Body.ParamBlock) { $functionParameters += @($functionNode.Body.ParamBlock.Parameters) }
+                if ($null -ne $functionNode.Parameters) { $functionParameters += @($functionNode.Parameters) }
+                $typeTable = @{}
+                foreach ($parameterNode in $functionParameters) {
+                    $typeName = ''
+                    foreach ($attribute in $parameterNode.Attributes) {
+                        if ($attribute -is [System.Management.Automation.Language.TypeConstraintAst]) { $typeName = $attribute.TypeName.FullName; break }
+                    }
+                    $typeTable[(& $getNormalizedName $parameterNode.Name.VariablePath.UserPath)] = $typeName
+                }
+                $parameterTypes[$functionNode.Name.ToLowerInvariant()] = $typeTable
+            }
+        }
+
+        # Прохід 3: виклики, що передають список-джерело як аргумент.
+        $listArguments = New-Object System.Collections.Generic.List[object]
+        foreach ($unit in $units) {
+            foreach ($commandNode in @($unit.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true))) {
+                $commandName = $commandNode.GetCommandName()
+                if (-not $commandName) { continue }
+                $elements = $commandNode.CommandElements
+                for ($elementIndex = 1; $elementIndex -lt $elements.Count; $elementIndex++) {
+                    $element = $elements[$elementIndex]
+                    $argumentNode = $null
+                    $parameterName = '<pos>'
+                    if ($element -is [System.Management.Automation.Language.CommandParameterAst]) {
+                        $parameterName = $element.ParameterName.ToLowerInvariant()
+                        if ($null -ne $element.Argument) {
+                            $argumentNode = $element.Argument
+                        } elseif ($elementIndex + 1 -lt $elements.Count -and $elements[$elementIndex + 1] -isnot [System.Management.Automation.Language.CommandParameterAst]) {
+                            $argumentNode = $elements[$elementIndex + 1]
+                            $elementIndex++
+                        }
+                    } else {
+                        $argumentNode = $element
+                    }
+                    if ($null -eq $argumentNode) { continue }
+                    $argumentValue = & $unwrapExpression $argumentNode
+                    if ($argumentValue -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                    $argumentScope = & $getScopeName $commandNode
+                    $argumentName = & $getNormalizedName $argumentValue.VariablePath.UserPath
+                    if ($unit.Sources.ContainsKey($argumentScope + '|' + $argumentName) -or $unit.Sources.ContainsKey('<script>|' + $argumentName)) {
+                        [void]$listArguments.Add([pscustomobject]@{
+                            Callee = ($commandName -replace '^.*\\', '').ToLowerInvariant()
+                            Parameter = $parameterName
+                            Where = $unit.Name + ':' + $commandNode.Extent.StartLineNumber
+                        })
+                    }
+                }
+            }
+        }
+
+        # Прохід 4: sink-и @(<змінна>).
+        $findings = New-Object System.Collections.Generic.List[string]
+        foreach ($unit in $units) {
+            foreach ($arrayNode in @($unit.Ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.ArrayExpressionAst] }, $true))) {
+                $statements = $arrayNode.SubExpression.Statements
+                if ($statements.Count -ne 1) { continue }
+                $onlyStatement = $statements[0]
+                if ($onlyStatement -isnot [System.Management.Automation.Language.PipelineAst] -or
+                    $onlyStatement.PipelineElements.Count -ne 1 -or
+                    $onlyStatement.PipelineElements[0] -isnot [System.Management.Automation.Language.CommandExpressionAst]) { continue }
+                $wrappedNode = & $unwrapExpression $onlyStatement
+                if ($wrappedNode -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+                $sinkScope = & $getScopeName $arrayNode
+                $sinkName = & $getNormalizedName $wrappedNode.VariablePath.UserPath
+                $reason = $null
+                if ($unit.Sources.ContainsKey($sinkScope + '|' + $sinkName) -or $unit.Sources.ContainsKey('<script>|' + $sinkName)) {
+                    $reason = 'змінна тримає New-Object List[object]'
+                } elseif ($sinkScope -ne '<script>' -and $parameterTypes.ContainsKey($sinkScope.ToLowerInvariant()) -and
+                    $parameterTypes[$sinkScope.ToLowerInvariant()].ContainsKey($sinkName)) {
+                    $sinkParameterType = [string]$parameterTypes[$sinkScope.ToLowerInvariant()][$sinkName]
+                    if ($sinkParameterType -eq '' -or $sinkParameterType -match '^(System\.)?(Object|PSObject)$') {
+                        foreach ($listArgument in $listArguments) {
+                            if ($listArgument.Callee -ne $sinkScope.ToLowerInvariant()) { continue }
+                            if ($listArgument.Parameter -eq '<pos>' -or $sinkName.StartsWith($listArgument.Parameter)) {
+                                $reason = 'параметр без типу отримує New-Object List[object] з ' + $listArgument.Where
+                                break
+                            }
+                        }
+                    }
+                }
+                if ($null -ne $reason) {
+                    [void]$findings.Add($unit.Name + ':' + $arrayNode.Extent.StartLineNumber + ': ' + $arrayNode.Extent.Text + ' (' + $reason + ')')
+                }
+            }
+        }
+        return ,$findings.ToArray()
+    }
+
+    # --- Governance/GenericObjectListNeverWrappedInArraySubexpression ---
+    $binderGateFiles = & {
+        . (Join-Path $root 'ci\BRAVOAnalyzableFiles.ps1')
+        @(Get-BRAVOAnalyzableFile -Root $root | Where-Object { $_.Extension -in @('.ps1', '.psm1') })
+    }
+    $binderGateRootPrefix = $root.TrimEnd('\', '/')
+    $binderGateSources = New-Object System.Collections.Generic.List[object]
+    foreach ($binderGateFile in @($binderGateFiles)) {
+        [void]$binderGateSources.Add([pscustomobject]@{
+            Name = $binderGateFile.FullName.Substring($binderGateRootPrefix.Length).TrimStart('\', '/')
+            Text = [IO.File]::ReadAllText($binderGateFile.FullName, [Text.Encoding]::UTF8)
+        })
+    }
+    $binderGateFindings = Find-BRAVOObjectListArraySubexpression -Source $binderGateSources.ToArray()
+    Test-BRAVOCondition `
+        -Condition ($binderGateSources.Count -gt 0 -and $binderGateFindings.Count -eq 0) `
+        -Name "Governance/GenericObjectListNeverWrappedInArraySubexpression" `
+        -Failure ("@(<List[object] з New-Object>) кидає ArgumentException 'Argument types do not match' " +
+            "у Windows PowerShell 5.1 і PowerShell 7 — використовуйте .ToArray() або параметр [object[]]. " +
+            "Проскановано файлів: $($binderGateSources.Count); знахідки: " +
+            $(if ($binderGateFindings.Count -gt 0) { $binderGateFindings -join '; ' } else { '<немає>' }))
+
+    # --- Governance/GenericObjectListBinderGuardIsMeaningful ---
+    # Негативний контроль: шість форм, які під PowerShell дійсно кидають
+    # (локальна змінна, $script:, аліас, параметр без типу, return ,$list),
+    # мусять знаходитись, а безпечні форми (.ToArray(), параметр
+    # [object[]], список [psobject], сирий виклик @(Get-X)) — ні.
+    $binderGateFixture = @'
+$script:History = New-Object System.Collections.Generic.List[object]
+function Get-LocalForm { $items = New-Object System.Collections.Generic.List[object]; return @($items) }
+function Get-ScriptForm { return @($script:History) }
+function Get-AliasForm { $items = New-Object 'System.Collections.Generic.List[System.Object]'; $copy = $items; return @($copy) }
+function Get-UntypedParameterForm($Items) { return @($Items) }
+function Invoke-UntypedParameterForm { $items = New-Object System.Collections.Generic.List[object]; Get-UntypedParameterForm -Items $items }
+function Get-WrappedList { $items = New-Object System.Collections.Generic.List[object]; return ,$items }
+function Get-ReturnedForm { $returned = Get-WrappedList; return @($returned) }
+function Get-SafeToArray { $items = New-Object System.Collections.Generic.List[object]; return @($items.ToArray()) }
+function Get-SafeTypedParameter([object[]]$Items) { return @($Items) }
+function Invoke-SafeTypedParameter { $items = New-Object System.Collections.Generic.List[object]; Get-SafeTypedParameter -Items $items }
+function Get-SafePsObjectList { $items = New-Object System.Collections.Generic.List[psobject]; return @($items) }
+function Get-SafeCommand { return @(Get-LocalForm) }
+'@
+    $binderGateFixtureFindings = Find-BRAVOObjectListArraySubexpression -Source @(
+        [pscustomobject]@{ Name = 'fixture'; Text = $binderGateFixture })
+    $binderGateFixtureLines = @($binderGateFixtureFindings | ForEach-Object { [int](($_ -split ':')[1]) } | Sort-Object)
+    Test-BRAVOCondition `
+        -Condition (($binderGateFixtureLines -join ',') -eq '2,3,4,5,8') `
+        -Name "Governance/GenericObjectListBinderGuardIsMeaningful" `
+        -Failure ("detector binder-гейту має знаходити рівно рядки 2,3,4,5,8 синтетичної фікстури " +
+            "(небезпечні форми) і не знаходити безпечні; фактично: " +
+            $(if ($binderGateFixtureFindings.Count -gt 0) { $binderGateFixtureFindings -join '; ' } else { '<нічого>' }))
+}

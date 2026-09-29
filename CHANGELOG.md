@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Загортання `List[object]` у `@()` тепер ловить один guard на весь
+  репозиторій, а не точкові перевірки.** `@($x)`, де `$x` — список
+  `System.Collections.Generic.List[object]`, створений через `New-Object`,
+  кидає `ArgumentException "Argument types do not match"` і у Windows
+  PowerShell 5.1, і в PowerShell 7. У PR #225 саме так зведена
+  generation-подія Archive і дві health-події не доходили в Operations на
+  кожному прогоні. Раніше цей клас тримався коментарями біля окремих
+  змінних і одним точковим guard-ом, які нове входження не бачили.
+
+  Нова перевірка self-test `Governance/GenericObjectListNeverWrappedInArraySubexpression`
+  розбирає AST усіх PowerShell-файлів репозиторію (той самий перелік, що
+  аналізує CI) і падає з `файл:рядок` на `@(<такий список>)` — зокрема
+  через аліас, `$script:`-змінну, `return ,$list` і параметр без типу.
+  Перевірка `Governance/GenericObjectListBinderGuardIsMeaningful` тримає
+  її непорожньою на синтетичній фікстурі. На поточному дереві знахідок
+  немає; на знімку до виправлення PR #225 guard знаходить усі три
+  історичні входження. Поведінка рантайму не змінюється. Забороняюча
+  половина точкового `Archive/StepHistoryPayloadUsesToArrayNotArraySubexpression`
+  тепер надлишкова, але лишається до рішення власника.
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися
