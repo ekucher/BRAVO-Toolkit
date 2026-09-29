@@ -1,0 +1,401 @@
+name: Telegram CI summary
+
+# Sends one Telegram summary after a push to developer.
+#
+# Security model:
+# - push to developer only; repository secrets are never exposed to
+#   pull_request code.
+# - no checkout and no repository code execution.
+# - the workflow reads check-runs and associated pull-request metadata
+#   through the read-only GITHUB_TOKEN.
+# - Telegram secrets are never printed. The API response body is never
+#   printed because it can contain chat metadata.
+#
+# Summary model:
+# - wait for the five post-merge checks that ci.yml runs on developer;
+# - if the pushed commit is associated with a merged PR into developer,
+#   also read the eight pre-merge checks from that PR head SHA, including
+#   Config parity, Config v2 pilot artifact, and GitGuardian;
+# - send exactly one message with both layers clearly separated.
+#
+# All executable run-block lines are ASCII-only (T022).
+
+on:
+  push:
+    branches: [developer]
+
+permissions:
+  contents: read
+  checks: read
+  pull-requests: read
+
+jobs:
+  telegram-ci-summary:
+    name: Telegram CI summary
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    env:
+      GH_TOKEN: ${ github.token }}
+      TELEGRAM_BOT_TOKEN: ${ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${ secrets.TELEGRAM_CHAT_ID }}
+      ICON_OK: "\u2705"
+      ICON_FAIL: "\u274C"
+      ICON_WARN: "\u26A0\uFE0F"
+      ICON_SKIP: "\u23ED\uFE0F"
+      ICON_TEST: "\U0001F9EA"
+      ICON_LINK: "\U0001F517"
+      ICON_BRANCH: "\U0001F33F"
+      ICON_COMMIT: "\U0001F516"
+      ICON_USER: "\U0001F464"
+      ICON_PR: "\U0001F500"
+
+    steps:
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is missing or empty"
+            exit 1
+          fi
+
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID secret is missing or empty"
+            exit 1
+          fi
+
+      - name: Wait for checks and send one Telegram summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api_get() {
+            curl \
+              --silent \
+              --show-error \
+              --fail \
+              --retry 2 \
+              --retry-all-errors \
+              --retry-delay 2 \
+              --connect-timeout 10 \
+              --max-time 30 \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header "Accept: application/vnd.github+json" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              "$1"
+          }
+
+          latest_check_value() {
+            local json="$1"
+            local name="$2"
+            local field="$3"
+
+            jq -r \
+              --arg name "$name" \
+              --arg field "$field" \
+              '
+                [
+                  .check_runs[]
+                  | select(.name == $name)
+                ]
+                | sort_by(.started_at // "")
+                | if length == 0 then
+                    "missing"
+                  else
+                    .[-1]
+                    | if $field == "status" then
+                        (.status // "unknown")
+                      elif $field == "conclusion" then
+                        (.conclusion // "unknown")
+                      elif $field == "url" then
+                        (.details_url // "")
+                      else
+                        "unknown"
+                      end
+                  end
+              ' <<<"$json"
+          }
+
+          wait_for_checks() {
+            local sha="$1"
+            local timeout_seconds="$2"
+            shift 2
+            local names=("$@")
+            local deadline=$((SECONDS + timeout_seconds))
+
+            WAIT_JSON='{"check_runs":[]}'
+            WAIT_TIMED_OUT=false
+
+            while true; do
+              WAIT_JSON="$(api_get "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs?per_page=100")"
+
+              local all_completed=true
+              local name
+              for name in "${names[@]}"; do
+                local status
+                status="$(latest_check_value "$WAIT_JSON" "$name" status)"
+                if [ "$status" != "completed" ]; then
+                  all_completed=false
+                  break
+                fi
+              done
+
+              if [ "$all_completed" = true ]; then
+                return 0
+              fi
+
+              if [ "$SECONDS" -ge "$deadline" ]; then
+                WAIT_TIMED_OUT=true
+                return 0
+              fi
+
+              sleep 30
+            done
+          }
+
+          result_icon() {
+            case "$1" in
+              success)
+                printf '%s' "$ICON_OK"
+                ;;
+              neutral|skipped)
+                printf '%s' "$ICON_SKIP"
+                ;;
+              missing|queued|in_progress|pending|unknown)
+                printf '%s' "$ICON_WARN"
+                ;;
+              *)
+                printf '%s' "$ICON_FAIL"
+                ;;
+            esac
+          }
+
+          render_check_lines() {
+            local json="$1"
+            shift
+            local names=("$@")
+            local output=""
+            local name
+
+            for name in "${names[@]}"; do
+              local status
+              local conclusion
+              local effective
+
+              status="$(latest_check_value "$json" "$name" status)"
+              conclusion="$(latest_check_value "$json" "$name" conclusion)"
+
+              if [ "$status" = "completed" ]; then
+                effective="$conclusion"
+              else
+                effective="$status"
+              fi
+
+              output="${output}$(result_icon "$effective") ${name}: ${effective}"$'\n'
+            done
+
+            printf '%s' "${output%$'\n'}"
+          }
+
+          count_successes() {
+            local json="$1"
+            shift
+            local names=("$@")
+            local count=0
+            local name
+
+            for name in "${names[@]}"; do
+              local status
+              local conclusion
+
+              status="$(latest_check_value "$json" "$name" status)"
+              conclusion="$(latest_check_value "$json" "$name" conclusion)"
+
+              if [ "$status" = "completed" ] && [ "$conclusion" = "success" ]; then
+                count=$((count + 1))
+              fi
+            done
+
+            printf '%s' "$count"
+          }
+
+          all_successful() {
+            local json="$1"
+            shift
+            local names=("$@")
+            local name
+
+            for name in "${names[@]}"; do
+              local status
+              local conclusion
+
+              status="$(latest_check_value "$json" "$name" status)"
+              conclusion="$(latest_check_value "$json" "$name" conclusion)"
+
+              if [ "$status" != "completed" ] || [ "$conclusion" != "success" ]; then
+                return 1
+              fi
+            done
+
+            return 0
+          }
+
+          push_checks=(
+            "Parser / BOM / JSON (push)"
+            "PSScriptAnalyzer (push)"
+            "BRAVO_SELF_TEST.ps1 (push)"
+            "BRAVO_DATA_RESTORE_MATRIX_TEST.ps1 (push)"
+            "Secret scanning (gitleaks) (push)"
+          )
+
+          pr_checks=(
+            "Parser / BOM / JSON"
+            "PSScriptAnalyzer"
+            "BRAVO_SELF_TEST.ps1"
+            "BRAVO_DATA_RESTORE_MATRIX_TEST.ps1"
+            "Secret scanning (gitleaks)"
+            "Config parity (BRAVO_CONFIG_LOADER)"
+            "Build + verify + happy-path + rollback + failure-injection"
+            "GitGuardian Security Checks"
+          )
+
+          wait_for_checks "$GITHUB_SHA" 2700 "${push_checks[@]}"
+          push_json="$WAIT_JSON"
+          push_timed_out="$WAIT_TIMED_OUT"
+
+          push_success_count="$(count_successes "$push_json" "${push_checks[@]}")"
+          push_lines="$(render_check_lines "$push_json" "${push_checks[@]}")"
+
+          overall="SUCCESS"
+          overall_icon="$ICON_OK"
+
+          if ! all_successful "$push_json" "${push_checks[@]}"; then
+            overall="FAILED"
+            overall_icon="$ICON_FAIL"
+          fi
+
+          if [ "$push_timed_out" = true ]; then
+            overall="INCOMPLETE"
+            overall_icon="$ICON_WARN"
+          fi
+
+          pulls_json="$(api_get "https://api.github.com/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls?per_page=100")"
+
+          pr_object="$(jq -c '
+            [
+              .[]
+              | select(.base.ref == "developer")
+              | select(.merged_at != null)
+            ]
+            | sort_by(.merged_at)
+            | if length == 0 then empty else .[-1] end
+          ' <<<"$pulls_json")"
+
+          pr_section=""
+          pr_url=""
+          pr_number=""
+
+          if [ -n "$pr_object" ]; then
+            pr_number="$(jq -r '.number' <<<"$pr_object")"
+            pr_url="$(jq -r '.html_url' <<<"$pr_object")"
+            pr_head_sha="$(jq -r '.head.sha' <<<"$pr_object")"
+
+            wait_for_checks "$pr_head_sha" 600 "${pr_checks[@]}"
+            pr_json="$WAIT_JSON"
+            pr_timed_out="$WAIT_TIMED_OUT"
+
+            pr_success_count="$(count_successes "$pr_json" "${pr_checks[@]}")"
+            pr_lines="$(render_check_lines "$pr_json" "${pr_checks[@]}")"
+
+            if ! all_successful "$pr_json" "${pr_checks[@]}"; then
+              overall="FAILED"
+              overall_icon="$ICON_FAIL"
+            fi
+
+            if [ "$pr_timed_out" = true ]; then
+              overall="INCOMPLETE"
+              overall_icon="$ICON_WARN"
+            fi
+
+            pr_section="$(printf '\n\n%s PR #%s pre-merge checks: %s/%s\n%s' \
+              "$ICON_PR" \
+              "$pr_number" \
+              "$pr_success_count" \
+              "${#pr_checks[@]}" \
+              "$pr_lines")"
+          else
+            pr_section="$(printf '\n\n%s PR pre-merge checks: N/A (no merged PR associated with this push)' "$ICON_PR")"
+          fi
+
+          short_sha="${GITHUB_SHA:0:7}"
+          checks_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}/checks"
+
+          message="$(printf '%s BRAVO-Toolkit GitHub CI\n\n%s Branch: developer\nResult: %s\n%s Commit: %s\n%s Actor: %s\n\n%s Developer post-merge checks: %s/%s\n%s%s\n\n%s Commit checks:\n%s' \
+            "$overall_icon" \
+            "$ICON_BRANCH" \
+            "$overall" \
+            "$ICON_COMMIT" \
+            "$short_sha" \
+            "$ICON_USER" \
+            "$GITHUB_ACTOR" \
+            "$ICON_TEST" \
+            "$push_success_count" \
+            "${#push_checks[@]}" \
+            "$push_lines" \
+            "$pr_section" \
+            "$ICON_LINK" \
+            "$checks_url")"
+
+          if [ -n "$pr_url" ]; then
+            message="${message}"$'\n'"${ICON_LINK} PR #${pr_number}: ${pr_url}"
+          fi
+
+          if [ "$GITHUB_RUN_ATTEMPT" -gt 1 ]; then
+            message="${message}"$'\n'"Rerun attempt: ${GITHUB_RUN_ATTEMPT}"
+          fi
+
+          payload_file="$(mktemp)"
+          response_file="$(mktemp)"
+          trap 'rm -f "$payload_file" "$response_file"' EXIT
+
+          jq -n \
+            --arg chat_id "$TELEGRAM_CHAT_ID" \
+            --arg text "$message" \
+            '{chat_id: $chat_id, text: $text}' \
+            > "$payload_file"
+
+          set +e
+          http_status="$(curl \
+            --silent \
+            --show-error \
+            --retry 2 \
+            --retry-all-errors \
+            --retry-delay 2 \
+            --connect-timeout 10 \
+            --max-time 30 \
+            --output "$response_file" \
+            --write-out '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data "@$payload_file" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage")"
+          curl_rc=$?
+          set -e
+
+          if [ "$curl_rc" -ne 0 ]; then
+            echo "::error::Telegram API request failed"
+            exit 1
+          fi
+
+          if [ "$http_status" != "200" ]; then
+            echo "::error::Telegram API returned HTTP $http_status"
+            exit 1
+          fi
+
+          if ! jq -e '.ok == true' "$response_file" >/dev/null 2>&1; then
+            echo "::error::Telegram API did not confirm delivery"
+            exit 1
+          fi
+
+          echo "Telegram CI summary delivered successfully."
