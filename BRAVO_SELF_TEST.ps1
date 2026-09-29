@@ -10881,6 +10881,42 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Console/MaintenanceRuntimeGuardForwardsBoundParametersOnly" `
         -Failure "guard Maintenance.Runtime.ps1 має передавати в Invoke-BRAVOMaintenance рівно `$PSBoundParameters скрипта, а param() функції — давати ті самі значення незаданим параметрам; розбіжності: $(@($maintenanceWrapperProbeResults | Where-Object { -not $_.Same } | ForEach-Object { "до: $($_.Direct); після: $($_.Wrapped)" }) -join ' || ')"
 
+    # Точкове придушення PSAvoidUsingUsernameAndPasswordParams на обгортці
+    # охоплює extent усіх вкладених функцій, тож PSSA більше не побачить пару
+    # user/password в ОКРЕМІЙ вкладеній функції. Ця перевірка повертає це
+    # покриття: жодна вкладена функція не має водночас параметра з "user" і
+    # параметра з "pass" у назві, якщо пароль не SecureString/PSCredential.
+    $maintenanceNestedUserPasswordFunctions = @()
+    if ($null -ne $maintenanceWrapperCheck.Function) {
+        $maintenanceNestedUserPasswordFunctions = @($maintenanceWrapperCheck.Function.Body.FindAll({
+                    param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object {
+                $nestedFunctionAst = $_
+                $ownParameters = @($nestedFunctionAst.Body.FindAll({
+                            param($node)
+                            $node -is [System.Management.Automation.Language.ParameterAst]
+                        }, $true) | Where-Object {
+                        $owner = $_.Parent
+                        while ($null -ne $owner -and -not ($owner -is [System.Management.Automation.Language.FunctionDefinitionAst])) {
+                            $owner = $owner.Parent
+                        }
+                        $owner -eq $nestedFunctionAst
+                    })
+                $hasUser = @($ownParameters | Where-Object { $_.Name.VariablePath.UserPath -match 'user' }).Count -gt 0
+                $hasPlainPassword = @($ownParameters | Where-Object {
+                        $_.Name.VariablePath.UserPath -match 'pass' -and
+                        $_.StaticType -ne [System.Security.SecureString] -and
+                        $_.StaticType -ne [System.Management.Automation.PSCredential]
+                    }).Count -gt 0
+                $hasUser -and $hasPlainPassword
+            } | ForEach-Object { $_.Name })
+    }
+    Test-BRAVOCondition `
+        -Condition ($null -ne $maintenanceWrapperCheck.Function -and $maintenanceNestedUserPasswordFunctions.Count -eq 0) `
+        -Name "Console/MaintenanceRuntimeNestedFunctionsNoUserAndPasswordParams" `
+        -Failure "вкладені функції Invoke-BRAVOMaintenance мають водночас параметр user і plain-text pass: $($maintenanceNestedUserPasswordFunctions -join ', ')"
+
     # Поведінка обгортки — у дочірньому процесі (runtime імпортує модулі й
     # перемикає кодування консолі, це не повинно торкатися сесії самотесту).
     # RuntimeRoot — порожній тимчасовий каталог: перший же оператор тіла

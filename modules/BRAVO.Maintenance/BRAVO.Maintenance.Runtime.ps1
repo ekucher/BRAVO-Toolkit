@@ -37,6 +37,14 @@ param (
 # або Get-Variable -Scope Script, тіло пише явно через $script:, а exit
 # усередині функції завершує весь скрипт тим самим кодом.
 function Invoke-BRAVOMaintenance {
+    # PSSA PSAvoidUsingUsernameAndPasswordParams збирає параметри з УСІХ
+    # вкладених функцій обгортки разом: UserSid (Get-BRAVOMaintenanceExecutionMode)
+    # і ArchivePassword (Trace-функції) дають хибне спрацювання на самій
+    # Invoke-BRAVOMaintenance. Жодна окрема вкладена функція не має обох —
+    # це стереже Console/MaintenanceRuntimeNestedFunctionsNoUserAndPasswordParams.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+        'PSAvoidUsingUsernameAndPasswordParams', '',
+        Justification = 'Хибне спрацювання від агрегації параметрів вкладених функцій; кожну вкладену функцію перевіряє окремий self-test.')]
     param (
         [switch]$ForceRestore,
         [switch]$RunMissedRestoreOnly,
