@@ -22,6 +22,39 @@ param (
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
 )
 
+# Тіло runtime — одна функція, за зразком BRAVO.Health.Runtime.ps1
+# (Invoke-BRAVOHealth): прямий запуск файлу (& у BRAVO.Maintenance.psm1)
+# виконує тіло через invocation guard наприкінці файлу, а dot-source лише
+# визначає функцію й нічого не виконує. param() функції повторює param()
+# скрипта один в один (типи, атрибути, alias, ValidateSet, значення за
+# замовчуванням), а guard передає лише $PSBoundParameters скрипта: тіло
+# читає $PSBoundParameters.ContainsKey('AutoShutdown'/'ArchiveAfterMaintenance'),
+# тому всередині функції він мусить містити рівно ті ключі, які викликач
+# справді передав, а незадані параметри отримують ті самі значення за
+# замовчуванням з ідентичного param(). Функції runtime визначаються в scope
+# обгортки й, як і раніше, бачать змінні тіла через динамічний scope (усі
+# вони викликаються зсередини обгортки); стан, який читають через $script:
+# або Get-Variable -Scope Script, тіло пише явно через $script:, а exit
+# усередині функції завершує весь скрипт тим самим кодом.
+function Invoke-BRAVOMaintenance {
+    param (
+        [switch]$ForceRestore,
+        [switch]$RunMissedRestoreOnly,
+        [switch]$DisableSizeCheck,
+        [switch]$EnableAllSlack,
+        [switch]$DisableAllSlack,
+        [ValidateSet("on", "off")]
+        [string]$AutoShutdown,
+        [Alias("ArchivLims")]
+        [ValidateSet("on", "off")]
+        [string]$ArchiveAfterMaintenance,
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit = $false,
+        [switch]$NoPause,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath
+    )
+
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
@@ -379,7 +412,13 @@ if ([string]::IsNullOrWhiteSpace($configuredNotificationMode) -and $MaintenanceC
     # Сумісність зі старим BRAVO.config.
     $configuredNotificationMode = [string]$MaintenanceConfig.Slack.Mode
 }
-$SlackMode = $configuredNotificationMode.ToLowerInvariant()
+# Явно $script: — до обгортання в Invoke-BRAVOMaintenance сирий і
+# ефективний режим були однією script-змінною: присвоєння
+# $script:SlackMode нижче перезаписувало сирий $SlackMode, і валідація
+# конфігурації нижче (-notin none/errors_only/all) читала вже ЕФЕКТИВНИЙ
+# режим. Некваліфіковане присвоєння всередині функції створило б окрему
+# локальну змінну з СИРИМ значенням і змінило б цю поведінку.
+$script:SlackMode = $configuredNotificationMode.ToLowerInvariant()
 
 # -EnableAllSlack/-DisableAllSlack обчислюється ТУТ, одразу після
 # сирого конфігураційного значення, а не лише пізніше перед основною
@@ -7530,7 +7569,11 @@ if ($RunMissedRestoreOnly -and $missedDailyWork) {
 # Похідні файлові шляхи
 $ARCH_NAME1 = "${ArchivePrefix}_before_$NOW.mdz"
 $ARCH_NAME2 = "${ArchivePrefix}_after_$NOW.mdz"
-$LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"
+# Явно $script: — Invoke-BRAVOMaintenanceOwnLogUpload перевіряє
+# Get-Variable -Name LOG_FILE -Scope Script; некваліфіковане присвоєння
+# всередині Invoke-BRAVOMaintenance створило б локальну змінну, і upload
+# власного журналу мовчки перестав би працювати.
+$script:LOG_FILE = "$LOG_DIR\BRAVO_MAINTENANCE_$maintenanceLogRunId.log"
 $SIZES_FILE = "$LOG_DIR\file_sizes_before_$NOW.csv"
 # Каталог-дата спільний для всіх компонентів: нумерація журналів рахується
 # в межах конкретної дати, тому TraceSRV_1.out існує і сьогодні, і вчора —
@@ -10734,4 +10777,9 @@ exit $script:maintenanceRuntimeExitCode
     # WARNING) у консолі до паузи, а не після.
     Invoke-BRAVOMaintenanceOwnLogUpload
     Wait-BRAVOManualExit -NoPause:$NoPause
+}
+}
+# END BRAVO MAINTENANCE RUNTIME
+if ($MyInvocation.InvocationName -ne '.') {
+    Invoke-BRAVOMaintenance @PSBoundParameters
 }

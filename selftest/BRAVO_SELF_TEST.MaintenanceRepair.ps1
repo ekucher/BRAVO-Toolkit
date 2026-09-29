@@ -780,7 +780,10 @@ $orderingRemoveFn = @($orderingAst.FindAll(
 # Топ-рівневі виклики Invoke-BRAVOLegacySweep — CommandAst-и з цим
 # іменем команди, які НЕ вкладені у жоден FunctionDefinitionAst (тобто
 # виконуються одразу під час запуску скрипта, а не всередині означення
-# іншої функції).
+# іншої функції). Виняток — Invoke-BRAVOMaintenance: це обгортка всього
+# тіла runtime (T010), її оператори виконуються так само послідовно, як
+# раніше оператори рівня скрипта, тож вона — "верхній рівень" тіла, а не
+# "інша функція".
 $orderingTopLevelInvokeCalls = New-Object System.Collections.Generic.List[object]
 foreach ($orderingCandidate in @($orderingAst.FindAll(
     { param($node) $node -is [System.Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Invoke-BRAVOLegacySweep' },
@@ -789,7 +792,8 @@ foreach ($orderingCandidate in @($orderingAst.FindAll(
     $orderingInsideFunctionDef = $false
     $orderingAncestor = $orderingCandidate.Parent
     while ($null -ne $orderingAncestor) {
-        if ($orderingAncestor -is [System.Management.Automation.Language.FunctionDefinitionAst]) {
+        if ($orderingAncestor -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+            $orderingAncestor.Name -ne 'Invoke-BRAVOMaintenance') {
             $orderingInsideFunctionDef = $true
             break
         }
