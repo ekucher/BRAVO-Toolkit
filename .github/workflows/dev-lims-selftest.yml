@@ -103,6 +103,16 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Write-Host ("PowerShell " + $PSVersionTable.PSVersion.ToString() + " / " + $PSVersionTable.PSEdition)
           $logRoot = Join-Path $env:ProgramData 'BRAVO-DevLimsAcceptance'
+          if (-not (Test-Path -LiteralPath $logRoot)) {
+              [void][IO.Directory]::CreateDirectory($logRoot)
+              # Local log holds host details (user, computer, paths): only
+              # SYSTEM, Administrators and the runner account may read it.
+              & icacls.exe $logRoot /inheritance:r /grant:r '*S-1-5-18:(OI)(CI)F' '*S-1-5-32-544:(OI)(CI)F' ($env:USERNAME + ':(OI)(CI)F') | Out-Null
+              if ($LASTEXITCODE -ne 0) {
+                  Write-Host "::error::could not restrict ACL on the local log directory"
+                  exit 1
+              }
+          }
           $runDir = Join-Path $logRoot ("run-" + $env:GITHUB_RUN_ID + "-" + $env:GITHUB_RUN_ATTEMPT)
           [void][IO.Directory]::CreateDirectory($runDir)
           $stdoutPath = Join-Path $runDir 'selftest.stdout.log'
@@ -110,32 +120,62 @@ jobs:
           $selfTestPath = Join-Path (Get-Location).Path 'BRAVO_SELF_TEST.ps1'
           $started = Get-Date
           $process = Start-Process -FilePath (Join-Path $PSHOME 'powershell.exe') `
-              -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $selfTestPath + '"'), '-NoPause') `
+              -ArgumentList @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', ('"' + $selfTestPath + '"'), '-NoPause') `
               -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath `
-              -NoNewWindow -Wait -PassThru
+              -NoNewWindow -PassThru
+          $null = $process.Handle
+          $timedOut = -not $process.WaitForExit(110 * 60 * 1000)
+          if ($timedOut) {
+              & taskkill.exe /PID $process.Id /T /F | Out-Null
+              [void]$process.WaitForExit(60000)
+          }
           $duration = (Get-Date) - $started
           $exitCode = $process.ExitCode
           $helperLogs = Join-Path (Get-Location).Path 'LOGS\HELPERS'
           if (Test-Path -LiteralPath $helperLogs) {
               Copy-Item -Path (Join-Path $helperLogs '*') -Destination $runDir -Force
           }
-          $lines = @(Get-Content -LiteralPath $stdoutPath)
+          # The child shares this console, so its stdout uses the same OutputEncoding.
+          $lines = @([IO.File]::ReadAllLines($stdoutPath, [Console]::OutputEncoding))
           $passCount = @($lines | Where-Object { $_ -match '^\[PASS\] ' }).Count
           $failLines = @($lines | Where-Object { $_ -match '^\[FAIL\] ' })
-          Write-Host ("Tested SHA:   " + $env:EXPECTED_SHA)
-          Write-Host ("PASS count:   " + $passCount)
-          Write-Host ("FAIL count:   " + $failLines.Count)
-          foreach ($failLine in $failLines) {
-              $failName = ($failLine -replace '^\[FAIL\] ', '') -replace ':.*$', ''
-              if ($failName -match '^[A-Za-z0-9_./ -]{1,120}$') {
-                  Write-Host ("FAILED:       " + $failName)
-              } else {
-                  Write-Host "FAILED:       <name withheld: non-ASCII or unexpected format>"
-              }
+          # "[NEDOSTUPNO]" lines: count only, reasons describe host security posture.
+          $unavailableCount = @($lines | Where-Object { $_ -match '^\[\u041D\u0415\u0414\u041E\u0421\u0422\u0423\u041F\u041D\u041E\]' }).Count
+          $marker = '<none>'
+          foreach ($line in $lines) {
+              if ($line -match '^SELF-TEST (PASSED|FAILED: [0-9]+|PARTIAL)') { $marker = 'SELF-TEST ' + $Matches[1] }
           }
-          Write-Host ("Exit code:    " + $exitCode)
-          Write-Host ("Duration:     " + $duration.ToString('hh\:mm\:ss'))
+          $stopToken = [guid]::NewGuid().ToString('N')
+          Write-Host ("::stop-commands::" + $stopToken)
+          Write-Host ("Tested SHA:        " + $env:EXPECTED_SHA)
+          Write-Host ("Marker:            " + $marker)
+          Write-Host ("PASS count:        " + $passCount)
+          Write-Host ("FAIL count:        " + $failLines.Count)
+          Write-Host ("Unavailable count: " + $unavailableCount)
+          $printed = 0
+          foreach ($failLine in $failLines) {
+              if ($printed -ge 50) {
+                  Write-Host ("FAILED:            ... " + ($failLines.Count - $printed) + " more (see local log)")
+                  break
+              }
+              $failName = $failLine.Substring(7)
+              $separator = $failName.IndexOf(': ')
+              if ($separator -ge 0) { $failName = $failName.Substring(0, $separator) }
+              if ($failName -cmatch '^[A-Za-z0-9_./\[\]=()+ -]{1,120}$') {
+                  Write-Host ("FAILED:            " + $failName)
+              } else {
+                  Write-Host "FAILED:            <unparsed>"
+              }
+              $printed++
+          }
+          Write-Host ("Exit code:         " + $exitCode)
+          Write-Host ("Duration:          " + $duration.ToString('hh\:mm\:ss'))
           Write-Host "Full log is kept on the runner host only (ProgramData\BRAVO-DevLimsAcceptance)."
+          Write-Host ("::" + $stopToken + "::")
+          if ($timedOut) {
+              Write-Host "::error::self-test timed out and was terminated"
+              exit 1
+          }
           if ($null -eq $exitCode) {
               Write-Host "::error::self-test exit code unavailable"
               exit 1
@@ -144,7 +184,7 @@ jobs:
               Write-Host ("::error::BRAVO_SELF_TEST.ps1 exited with code " + $exitCode)
               exit 1
           }
-          if ($failLines.Count -gt 0 -or $passCount -eq 0) {
-              Write-Host "::error::self-test exit code 0 but FAIL lines present or no PASS lines parsed"
+          if ($failLines.Count -gt 0 -or $passCount -eq 0 -or $marker -ne 'SELF-TEST PASSED') {
+              Write-Host "::error::self-test exit code 0 but result markers are inconsistent"
               exit 1
           }
