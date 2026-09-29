@@ -21,8 +21,18 @@ name: DEV-LIMS self-test
 # self-hosted, Windows, X64), тож задача ніколи не потрапить на інший
 # self-hosted раннер. Без мітки dev-lims на раннері задача чекатиме в черзі.
 
+# Гілку для перевірки задає input ref (наприклад гілка PR). Сам workflow
+# при цьому береться з гілки, з якої його запущено (master після bootstrap),
+# тому гілкам PR не потрібно містити цей файл. Порожнє значення означає
+# ту саму гілку, з якої запущено workflow.
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Branch, tag or SHA to test (empty = the dispatch ref)'
+        required: false
+        default: ''
+        type: string
 
 permissions:
   contents: read
@@ -42,7 +52,16 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ inputs.ref }}
           clean: true
+
+      - name: Tested commit
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $sha = (git rev-parse HEAD)
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          Write-Host ("Tested commit: " + $sha)
 
       - name: Host info (PowerShell version only)
         shell: powershell
