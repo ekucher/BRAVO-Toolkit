@@ -6935,6 +6935,11 @@ function Verify-Backup {
             -SevenZipPath $SevenZipPath `
             -ArchivePath $ArchivePath)) {
         Write-Log "ПОМИЛКА: Архів $fileName не пройшов перевірку цілісності 7-Zip; SHA512 не створено" -Level "ERROR"
+        # Застарілий .sha512 від попереднього прогону не має лишатися
+        # поруч із архівом, що не пройшов перевірку.
+        if (Test-Path -LiteralPath $shaFile -PathType Leaf) {
+            Remove-Item -LiteralPath $shaFile -Force -ErrorAction SilentlyContinue
+        }
         return $false
     }
 
@@ -6950,6 +6955,14 @@ function Verify-Backup {
     }
     catch {
         Write-Log "ПОМИЛКА: Помилка перевірки архіву $fileName - $($_.Exception.Message)" -Level "ERROR"
+        # 7z t пройшов, але SHA512 не пораховано чи не записано: архів не
+        # «перевірений» (контракт .sha512 лише для перевіреного архіву),
+        # тож напівзаписаний sidecar прибираємо, а збій позначаємо
+        # критичним і для прямого виклику (call sites виставляють його теж).
+        if (Test-Path -LiteralPath $shaFile -PathType Leaf) {
+            Remove-Item -LiteralPath $shaFile -Force -ErrorAction SilentlyContinue
+        }
+        $script:criticalErrorOccurred = $true
         $valid = $false
     }
 

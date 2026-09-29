@@ -16613,7 +16613,8 @@ function Get-BRAVOMaintenanceSummaryResult {
         -FunctionNames @(
             'Verify-Backup', 'Get-SHA512HashCompatible',
             'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
-            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog'
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            'Register-BRAVOLegacyBomPasswordFallback'
         )
     $verifyBackupStubScriptText = {
         function Write-Log {
@@ -16623,6 +16624,7 @@ function Get-BRAVOMaintenanceSummaryResult {
         function Send-SlackAlert { param($Message, [switch]$IsCritical) }
         function Get-BRAVOFileHash {
             param([string]$Path, [string]$Algorithm)
+            if ($script:verifyBackupHashThrows) { throw 'fake SHA512 failure' }
             return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
         }
         function Invoke-BRAVOSevenZipIntegrityTest {
@@ -16648,7 +16650,9 @@ function Get-BRAVOMaintenanceSummaryResult {
                     StandardOutput = ''; StandardError = 'ERROR: fake tool failure'
                 }
             }
-            if ([IO.File]::ReadAllText($ArchivePath) -ne 'FAKE-7Z-INTACT-ARCHIVE') {
+            $verifyBackupArchiveText = [IO.File]::ReadAllText($ArchivePath)
+            $verifyBackupLegacyBom = ($verifyBackupArchiveText -ceq 'FAKE-7Z-LEGACY-BOM-ARCHIVE')
+            if ($verifyBackupArchiveText -ne 'FAKE-7Z-INTACT-ARCHIVE' -and -not $verifyBackupLegacyBom) {
                 return New-Object PSObject -Property @{
                     Success = $false; ExitCode = 2
                     Description = 'Fatal error'
@@ -16662,10 +16666,16 @@ function Get-BRAVOMaintenanceSummaryResult {
                     StandardOutput = ''; StandardError = 'ERROR: Wrong password'
                 }
             }
-            return New-Object PSObject -Property @{
+            $stubResult = New-Object PSObject -Property @{
                 Success = $true; ExitCode = 0; Description = 'No error'
                 StandardOutput = 'Everything is Ok'; StandardError = ''
             }
+            if ($verifyBackupLegacyBom) {
+                # T006: успіх лише через legacy BOM-у-паролі fallback.
+                $stubResult | Add-Member -NotePropertyName LegacyBomPasswordFallbackUsed -NotePropertyValue $true
+                $stubResult | Add-Member -NotePropertyName Warning -NotePropertyValue 'fixture: legacy BOM fallback'
+            }
+            return $stubResult
         }
     }.ToString()
     # Фікстурний пароль складається з частин (див. коментар у
@@ -16677,7 +16687,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     [void][IO.Directory]::CreateDirectory($verifyBackupRoot)
     $verifyBackupInvoke = {
         # Без [string]-обмеження: `$null означає «файл не створювати».
-        param([string]$Scenario, $ArchiveContent, $SevenZipContent, [string]$ArchiveSecret)
+        param([string]$Scenario, $ArchiveContent, $SevenZipContent, [string]$ArchiveSecret, [string]$Mode = '')
         $scenarioDir = Join-Path $verifyBackupRoot $Scenario
         [void][IO.Directory]::CreateDirectory($scenarioDir)
         $archiveName = "MODEL_before_20260101_0100.mdz"
@@ -16689,17 +16699,29 @@ function Get-BRAVOMaintenanceSummaryResult {
         if ($null -ne $SevenZipContent) {
             [IO.File]::WriteAllText($sevenZipPath, $SevenZipContent)
         }
+        $sidecarPath = "$archivePath.sha512"
+        if ($Mode -eq 'stalesidecar') {
+            [IO.File]::WriteAllText($sidecarPath, 'STALE-SHA512-FROM-PREVIOUS-RUN')
+        } elseif ($Mode -eq 'sidecarblocked') {
+            # Каталог на місці .sha512: запис sidecar гарантовано падає.
+            [void][IO.Directory]::CreateDirectory($sidecarPath)
+        }
         $outcome = & $verifyBackupModule {
-            param($SevenZip, $Archive, $ArchiveSecretText, $ExpectedSecretText, $StubScriptText)
+            param($SevenZip, $Archive, $ArchiveSecretText, $ExpectedSecretText, $StubScriptText, $HashThrows)
             Set-StrictMode -Version Latest
             . ([scriptblock]::Create($StubScriptText))
             $script:verifyBackupLogLines = New-Object System.Collections.ArrayList
             $script:verifyBackupSevenZipCalls = 0
+            $script:verifyBackupHashThrows = [bool]$HashThrows
+            # T006: колектор legacy BOM-fallback, який читає справжній
+            # Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
+            $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
             $script:verifyBackupExpectedPassword = $ExpectedSecretText
             $script:ArchivePassword = $ArchiveSecretText
             $script:SevenZipIntegrityTestTimeoutSeconds = 60
             $script:criticalErrorOccurred = $false
             $script:restoreIntegrityFailed = $false
+            $script:restoreArchiveFailed = $false
             $threw = $null
             $result = $null
             try {
@@ -16712,12 +16734,15 @@ function Get-BRAVOMaintenanceSummaryResult {
                 Threw = $threw
                 CriticalErrorOccurred = [bool]$script:criticalErrorOccurred
                 RestoreIntegrityFailed = [bool]$script:restoreIntegrityFailed
+                RestoreArchiveFailed = [bool]$script:restoreArchiveFailed
                 SevenZipCalls = [int]$script:verifyBackupSevenZipCalls
+                LegacyBomCollected = @($script:MaintenanceLegacyBomFallbackArchives)
                 LogText = (@($script:verifyBackupLogLines) -join "`n")
             }
-        } $sevenZipPath $archivePath $ArchiveSecret $verifyBackupPassword $verifyBackupStubScriptText
+        } $sevenZipPath $archivePath $ArchiveSecret $verifyBackupPassword $verifyBackupStubScriptText ($Mode -eq 'hashthrows')
         $hashPath = "$archivePath.sha512"
         $outcome | Add-Member -NotePropertyName HashExists -NotePropertyValue (Test-Path -LiteralPath $hashPath -PathType Leaf)
+        $outcome | Add-Member -NotePropertyName SidecarIsDirectory -NotePropertyValue (Test-Path -LiteralPath $hashPath -PathType Container)
         $outcome | Add-Member -NotePropertyName HashText -NotePropertyValue $(
             if ($outcome.HashExists) { [IO.File]::ReadAllText($hashPath) } else { $null })
         $outcome | Add-Member -NotePropertyName ArchiveHash -NotePropertyValue $(
@@ -16734,6 +16759,12 @@ function Get-BRAVOMaintenanceSummaryResult {
         $verifyBackupMissingArchive = & $verifyBackupInvoke 'missingarchive' $null 'FAKE-7Z-OK' $verifyBackupPassword
         $verifyBackupToolMissing = & $verifyBackupInvoke 'toolmissing' 'FAKE-7Z-INTACT-ARCHIVE' $null $verifyBackupPassword
         $verifyBackupToolFailure = & $verifyBackupInvoke 'toolfailure' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-BROKEN' $verifyBackupPassword
+        # 7z t успішний, але SHA512 не пораховано / sidecar не записано;
+        # застарілий sidecar поруч із архівом, що не пройшов 7z t.
+        $verifyBackupLegacyBom = & $verifyBackupInvoke 'legacybom' 'FAKE-7Z-LEGACY-BOM-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupHashThrows = & $verifyBackupInvoke 'hashthrows' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword 'hashthrows'
+        $verifyBackupSidecarBlocked = & $verifyBackupInvoke 'sidecarblocked' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword 'sidecarblocked'
+        $verifyBackupStaleSidecar = & $verifyBackupInvoke 'stalesidecar' 'truncated-or-corrupted-bytes' 'FAKE-7Z-OK' $verifyBackupPassword 'stalesidecar'
     } finally {
         if (Test-Path -LiteralPath $verifyBackupRoot) {
             Remove-Item -LiteralPath $verifyBackupRoot -Recurse -Force -ErrorAction SilentlyContinue
@@ -16760,6 +16791,29 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Maintenance/VerifyBackupValidArchivePassesAndWritesSha512" `
         -Failure ("цілий архів має пройти 7z t рівно один раз, повернути `$true без критичних прапорців і записати '<SHA512> *<ім'я>'; Result=$($verifyBackupValid.Result), 7z calls=$($verifyBackupValid.SevenZipCalls), hash='$($verifyBackupValid.HashText)', threw=$($verifyBackupValid.Threw)")
 
+    # T006 після merge: архів, відкритий лише через legacy BOM-у-паролі
+    # fallback, проходить Verify-Backup ($true, .sha512 записано, критичних
+    # прапорців немає), 7z t виконується РІВНО один раз (перевірка живе
+    # лише всередині Verify-Backup — call sites її не дублюють), а ім'я
+    # архіву реєструється в колекторі прогону один раз і WARNING
+    # пишеться один раз (одне сповіщення на прогін робить entrypoint).
+    $verifyBackupLegacyWarnings = @($verifyBackupLegacyBom.LogText -split "`n" |
+        Where-Object { $_.StartsWith('[WARNING]') -and $_.Contains('Legacy BOM-пароль') })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $verifyBackupLegacyBom.Threw -and
+            $verifyBackupLegacyBom.Result -eq $true -and
+            $verifyBackupLegacyBom.SevenZipCalls -eq 1 -and
+            -not $verifyBackupLegacyBom.CriticalErrorOccurred -and
+            -not $verifyBackupLegacyBom.RestoreIntegrityFailed -and
+            $verifyBackupLegacyBom.HashExists -and
+            @($verifyBackupLegacyBom.LegacyBomCollected).Count -eq 1 -and
+            $verifyBackupLegacyBom.LegacyBomCollected[0] -ceq $verifyBackupLegacyBom.ArchiveName -and
+            $verifyBackupLegacyWarnings.Count -eq 1
+        ) `
+        -Name "Maintenance/VerifyBackupLegacyBomFallbackWarnsOnceAndPasses" `
+        -Failure ("legacy BOM fallback: Verify-Backup має пройти ($true), 7z t один раз, одне WARNING і одне ім'я в колекторі; Result=$($verifyBackupLegacyBom.Result), 7z calls=$($verifyBackupLegacyBom.SevenZipCalls), warnings=$($verifyBackupLegacyWarnings.Count), collected=$(@($verifyBackupLegacyBom.LegacyBomCollected).Count), threw=$($verifyBackupLegacyBom.Threw)")
+
     # Негативні сценарії: жоден не може дати «перевірено», жоден не лишає
     # .sha512 (інакше артефакт виглядав би валідною точкою відновлення).
     foreach ($verifyBackupNegative in @(
@@ -16784,9 +16838,48 @@ function Get-BRAVOMaintenanceSummaryResult {
             -Failure ("$($verifyBackupNegative.What): Verify-Backup має повернути `$false (fail-closed) з ERROR у журналі, criticalErrorOccurred/restoreIntegrityFailed і без .sha512; Result=$($negativeOutcome.Result), critical=$($negativeOutcome.CriticalErrorOccurred), integrity=$($negativeOutcome.RestoreIntegrityFailed), sha512=$($negativeOutcome.HashExists), 7z calls=$($negativeOutcome.SevenZipCalls), threw=$($negativeOutcome.Threw)")
     }
 
+    # Збій ПІСЛЯ успішного 7z t (SHA512 не пораховано / sidecar не записано):
+    # $false, критичний прапорець (навіть при прямому виклику), таксономія
+    # restoreIntegrityFailed/restoreArchiveFailed лишається за call site,
+    # sidecar-а немає (і напівзаписаний не залишається; каталог на його
+    # місці НЕ видаляється), 7z t виконано рівно один раз.
+    foreach ($verifyBackupPostSevenZip in @(
+        @{ Outcome = $verifyBackupHashThrows; Name = 'Maintenance/VerifyBackupShaCalculationFailureFailsClosed'; ExpectSidecarDir = $false; What = 'збій обчислення SHA512 після успішного 7z t' },
+        @{ Outcome = $verifyBackupSidecarBlocked; Name = 'Maintenance/VerifyBackupSidecarWriteFailureFailsClosed'; ExpectSidecarDir = $true; What = 'збій запису .sha512 після успішного 7z t' }
+    )) {
+        $postOutcome = $verifyBackupPostSevenZip.Outcome
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $postOutcome.Threw -and
+                $postOutcome.Result -eq $false -and
+                $postOutcome.CriticalErrorOccurred -and
+                -not $postOutcome.RestoreIntegrityFailed -and
+                -not $postOutcome.RestoreArchiveFailed -and
+                -not $postOutcome.HashExists -and
+                $postOutcome.SevenZipCalls -eq 1 -and
+                $postOutcome.LogText.Contains('[ERROR]') -and
+                ($postOutcome.SidecarIsDirectory -eq $verifyBackupPostSevenZip.ExpectSidecarDir)
+            ) `
+            -Name $verifyBackupPostSevenZip.Name `
+            -Failure ("$($verifyBackupPostSevenZip.What): Verify-Backup має повернути `$false з ERROR, criticalErrorOccurred, без sidecar-файлу; Result=$($postOutcome.Result), critical=$($postOutcome.CriticalErrorOccurred), integrity=$($postOutcome.RestoreIntegrityFailed), archiveFailed=$($postOutcome.RestoreArchiveFailed), sha512=$($postOutcome.HashExists), dir=$($postOutcome.SidecarIsDirectory), 7z calls=$($postOutcome.SevenZipCalls), threw=$($postOutcome.Threw)")
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $verifyBackupStaleSidecar.Threw -and
+            $verifyBackupStaleSidecar.Result -eq $false -and
+            $verifyBackupStaleSidecar.CriticalErrorOccurred -and
+            $verifyBackupStaleSidecar.RestoreIntegrityFailed -and
+            -not $verifyBackupStaleSidecar.HashExists -and
+            $verifyBackupStaleSidecar.SevenZipCalls -eq 1
+        ) `
+        -Name "Maintenance/VerifyBackupRemovesStaleSidecarOnFailedArchive" `
+        -Failure "застарілий .sha512 поруч із архівом, що не пройшов 7z t, має бути прибраний; Result=$($verifyBackupStaleSidecar.Result), sha512=$($verifyBackupStaleSidecar.HashExists)"
+
     $verifyBackupAllLogText = @(
         $verifyBackupValid, $verifyBackupCorrupt, $verifyBackupWrongPassword,
-        $verifyBackupMissingArchive, $verifyBackupToolMissing, $verifyBackupToolFailure
+        $verifyBackupMissingArchive, $verifyBackupToolMissing, $verifyBackupToolFailure,
+        $verifyBackupHashThrows, $verifyBackupSidecarBlocked, $verifyBackupStaleSidecar,
+        $verifyBackupLegacyBom
     ) | ForEach-Object { $_.LogText }
     Test-BRAVOCondition `
         -Condition (-not (($verifyBackupAllLogText -join "`n").Contains($verifyBackupPassword))) `
