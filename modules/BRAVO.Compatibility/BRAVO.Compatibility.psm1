@@ -1289,6 +1289,17 @@ function Invoke-BRAVOInputPreambleFreeStart {
     # щоб кожну гілку рішення (запуск як є / тимчасова заміна кодування /
     # fail-closed) і відновлення кодування у finally можна було
     # детерміновано перевірити самотестом на будь-якому хості.
+    #
+    # [Console]::InputEncoding — процес-wide стан. Уся транзакція
+    # read -> set -> start -> restore серіалізована через Monitor на
+    # [System.Console] (той самий Type-об'єкт в усіх PowerShell-раншпейсах
+    # одного процесу): без цього два конкурентні виклики з різних
+    # раншпейсів могли б переплестись так, що другий отримав би BOM у
+    # stdin попри використання цього хелпера (виявлено review PR #249).
+    # BRAVO сьогодні не запускає ці процеси конкурентно (жодних
+    # Runspace/Start-Job/-Parallel навколо Start-BRAVOProcessOutputCapture
+    # у production-коді), тож лок не змінює наявну поведінку — це захист
+    # від майбутньої регресії, а не фікс живого дефекту.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][scriptblock]$StartAction,
@@ -1296,41 +1307,51 @@ function Invoke-BRAVOInputPreambleFreeStart {
         [Parameter(Mandatory = $true)][scriptblock]$SetInputEncoding
     )
 
-    $originalEncoding = & $GetInputEncoding
-    if ($null -eq $originalEncoding) {
-        throw "Запуск процесу з redirected stdin заблоковано: не вдалося визначити кодування вводу консолі."
-    }
-    if (@($originalEncoding.GetPreamble()).Count -eq 0) {
-        # Кодування без преамбули (cp866/cp1251/UTF-8 без BOM): StreamWriter
-        # stdin нічого не допише до першого запису — запуск без змін.
-        $null = & $StartAction
-        return
-    }
-
-    $encodingReplaced = $false
+    $lockToken = [System.Console]
+    $lockTaken = $false
     try {
-        $replaceError = $null
-        try {
-            & $SetInputEncoding (New-Object System.Text.UTF8Encoding($false))
-            $encodingReplaced = $true
-        } catch {
-            $replaceError = $_.Exception.Message
+        [System.Threading.Monitor]::Enter($lockToken, [ref]$lockTaken)
+
+        $originalEncoding = & $GetInputEncoding
+        if ($null -eq $originalEncoding) {
+            throw "Запуск процесу з redirected stdin заблоковано: не вдалося визначити кодування вводу консолі."
         }
-        if (-not $encodingReplaced) {
-            # Замінити не вдалося (наприклад, процес без консолі). Безпечно
-            # лише якщо фактичне кодування вводу вже без преамбули; інакше
-            # дочірній процес отримав би BOM перед секретом — fail-closed.
-            $currentEncoding = & $GetInputEncoding
-            if ($null -eq $currentEncoding -or @($currentEncoding.GetPreamble()).Count -gt 0) {
-                throw ("Запуск процесу з redirected stdin заблоковано (fail-closed): кодування вводу консолі " +
-                    "'$($originalEncoding.WebName)' має преамбулу (BOM), а тимчасово замінити його не вдалося: " +
-                    "$replaceError. Дочірній процес отримав би BOM перед даними stdin (зокрема паролем).")
+        if (@($originalEncoding.GetPreamble()).Count -eq 0) {
+            # Кодування без преамбули (cp866/cp1251/UTF-8 без BOM): StreamWriter
+            # stdin нічого не допише до першого запису — запуск без змін.
+            $null = & $StartAction
+            return
+        }
+
+        $encodingReplaced = $false
+        try {
+            $replaceError = $null
+            try {
+                & $SetInputEncoding (New-Object System.Text.UTF8Encoding($false))
+                $encodingReplaced = $true
+            } catch {
+                $replaceError = $_.Exception.Message
+            }
+            if (-not $encodingReplaced) {
+                # Замінити не вдалося (наприклад, процес без консолі). Безпечно
+                # лише якщо фактичне кодування вводу вже без преамбули; інакше
+                # дочірній процес отримав би BOM перед секретом — fail-closed.
+                $currentEncoding = & $GetInputEncoding
+                if ($null -eq $currentEncoding -or @($currentEncoding.GetPreamble()).Count -gt 0) {
+                    throw ("Запуск процесу з redirected stdin заблоковано (fail-closed): кодування вводу консолі " +
+                        "'$($originalEncoding.WebName)' має преамбулу (BOM), а тимчасово замінити його не вдалося: " +
+                        "$replaceError. Дочірній процес отримав би BOM перед даними stdin (зокрема паролем).")
+                }
+            }
+            $null = & $StartAction
+        } finally {
+            if ($encodingReplaced) {
+                & $SetInputEncoding $originalEncoding
             }
         }
-        $null = & $StartAction
     } finally {
-        if ($encodingReplaced) {
-            & $SetInputEncoding $originalEncoding
+        if ($lockTaken) {
+            [System.Threading.Monitor]::Exit($lockToken)
         }
     }
 }
