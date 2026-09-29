@@ -1,0 +1,119 @@
+name: Telegram integration test
+
+# Manual connectivity/secrets check for the Telegram notification channel.
+# This is NOT production notification architecture: it sends exactly one
+# fixed test message and nothing else. No repository code is executed and
+# no repository checkout is required.
+#
+# Security model:
+# - workflow_dispatch only; no pull_request/push triggers, so forked PRs
+#   never see this job and secrets are never exposed to untrusted refs.
+# - Only the repository owner may run it (github.actor and
+#   github.triggering_actor == ekucher); anyone else is skipped.
+# - permissions: contents: read limits the GITHUB_TOKEN only; it is not
+#   used by this job at all.
+# - Secrets are read once into env: at the job level and referenced only
+#   as environment variables inside run: blocks. The raw
+#   ${{ secrets.* }} expression is never interpolated directly into a
+#   shell command line, so it cannot end up echoed, globbed, or logged by
+#   GitHub's own command-echo behavior.
+# - The bot token and chat ID are never printed. The full Telegram API
+#   URL (which embeds the bot token) is never printed. curl diagnostics
+#   are suppressed; only the numeric HTTP status code and a boolean
+#   "delivered" result are written to the public log. The response body
+#   is never printed because it can contain chat metadata.
+# - No third-party Telegram action is referenced; no unpinned action
+#   reference exists in this file at all (there are no "uses" steps).
+#
+# Message encoding: T022 requires every executable run: line in every
+# workflow file to be ASCII-only (checked line-by-line across the whole
+# file, not just inside run: blocks). The test message below is not
+# ASCII (emoji plus Ukrainian text), so it is stored as a YAML
+# double-quoted scalar using standard \uXXXX / surrogate-pair escapes:
+# the committed file stays byte-for-byte ASCII, and GitHub's YAML parser
+# decodes it back to the real Unicode text before the job runs. jq then
+# emits correct UTF-8 JSON for the Telegram API; nothing here relies on
+# unsafe string concatenation for a payload that is now multi-line.
+#
+# Planned emoji convention for a future production notification design
+# (not implemented by this file - reference only):
+#   SUCCESS=check FAILURE=cross WARNING=triangle CANCELLED=stop
+#   IN_PROGRESS=hourglass RERUN=cycle RELEASE=rocket SECURITY=lock
+#   TEST=test-tube LINK=link BRANCH=leaf COMMIT/SHA=bookmark
+#   USER/ACTOR=person
+# This workflow only ever sends the fixed connectivity-test message
+# below; it does not implement that convention.
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-integration-test
+  cancel-in-progress: false
+
+jobs:
+  telegram-test:
+    name: Telegram sendMessage connectivity test
+    if: >
+      github.repository == 'ekucher/BRAVO-Toolkit' &&
+      github.actor == 'ekucher' &&
+      github.triggering_actor == 'ekucher'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      # Decodes to: checkmark BRAVO-Toolkit / blank line / test-tube
+      # GitHub Actions -> Telegram / Ukrainian: "Test message delivered
+      # successfully." See the "Message encoding" note above.
+      TELEGRAM_MESSAGE: "\u2705 BRAVO-Toolkit\n\n\U0001F9EA GitHub Actions \u2192 Telegram\n\u0422\u0435\u0441\u0442\u043e\u0432\u0435 \u043f\u043e\u0432\u0456\u0434\u043e\u043c\u043b\u0435\u043d\u043d\u044f \u0443\u0441\u043f\u0456\u0448\u043d\u043e \u0434\u043e\u0441\u0442\u0430\u0432\u043b\u0435\u043d\u043e."
+    steps:
+      - name: Validate required secrets are present
+        shell: bash
+        run: |
+          set -u
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is missing or empty; failing closed"
+            exit 1
+          fi
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID secret is missing or empty; failing closed"
+            exit 1
+          fi
+          echo "Both required secrets are present (values not printed)."
+
+      - name: Send single Telegram test message
+        shell: bash
+        run: |
+          set -u
+          payload_file="$(mktemp)"
+          response_file="$(mktemp)"
+          jq -n --arg chat_id "$TELEGRAM_CHAT_ID" --arg text "$TELEGRAM_MESSAGE" \
+            '{chat_id: $chat_id, text: $text}' > "$payload_file"
+
+          http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data "@$payload_file" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" 2>/dev/null || echo '000')"
+
+          rm -f "$payload_file"
+
+          echo "Telegram API HTTP status: $http_status"
+
+          delivered="false"
+          if [ "$http_status" = "200" ] && jq -e '.ok == true' "$response_file" >/dev/null 2>&1; then
+            delivered="true"
+          fi
+
+          rm -f "$response_file"
+
+          if [ "$delivered" != "true" ]; then
+            echo "::error::Telegram sendMessage did not confirm delivery (ok:true); failing closed. No response body is printed because it may contain chat metadata."
+            exit 1
+          fi
+
+          echo "Telegram delivery result: delivered=true"
