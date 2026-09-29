@@ -256,9 +256,11 @@ if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.I
     Exit $elevatedProcess.ExitCode
 }
 
-# Примусово TLS 1.2 для webhook-сповіщень. Числове значення 3072 сумісне зі
-# старими .NET/PowerShell, де ім'я Tls12 може бути відсутнім у переліку enum.
-[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)
+# TLS 1.2 для webhook-сповіщень вмикається АДИТИВНО (канонічний
+# Enable-BRAVOTls12 з BRAVO.Compatibility, імпортованого вище з
+# -ErrorAction Stop): уже ввімкнені протоколи (напр. Tls13, Tls11)
+# зберігаються, а не затираються значенням 3072.
+Enable-BRAVOTls12
 [Net.ServicePointManager]::Expect100Continue = $false
 
 # ===== СТАН ПРОГОНУ =====
@@ -2904,6 +2906,38 @@ function Send-BRAVODataRestoreNotification {
     }
 }
 
+function Invoke-BRAVODataRestoreOSSupportGate {
+    # Той самий gate рівня підтримки ОС, що в Archive/Maintenance/Health
+    # (канонічна класифікація — Get-BRAVOOSSupportTier, BRAVO.Compatibility;
+    # README, розділ 1): LegacyBestEffort — лише INFO (environmental-метрика,
+    # не результат операції); Unsupported — ERROR і блокування з кодом
+    # InvalidConfiguration, окрім явного BRAVO_ALLOW_UNSUPPORTED_OS=1
+    # (WARNING і продовження). Рішення повертається викликачу, а не
+    # виконується тут через exit: головний потік сам завершує прогін, а
+    # функція лишається придатною для ізольованого поведінкового тесту.
+    $osSupportTier = Get-BRAVOOSSupportTier
+    Write-DataRestoreLog -Message "Підтримка ОС: $($osSupportTier.Tier) — Windows $($osSupportTier.OperatingSystem) ($($osSupportTier.OperatingSystemVersion), build $($osSupportTier.Build)); PowerShell $($osSupportTier.PowerShellVersion); .NET release $($osSupportTier.DotNetRelease)" -Level 'INFO'
+    $isBlocked = $false
+    $hasWarning = $false
+    if ($osSupportTier.Tier -eq 'LegacyBestEffort') {
+        Write-DataRestoreLog -Message $osSupportTier.Message -Level 'INFO'
+    } elseif ($osSupportTier.Tier -eq 'Unsupported') {
+        if ($env:BRAVO_ALLOW_UNSUPPORTED_OS -eq '1') {
+            Write-DataRestoreLog -Message "$($osSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level 'WARNING'
+            $hasWarning = $true
+        } else {
+            Write-DataRestoreLog -Message $osSupportTier.Message -Level 'ERROR'
+            $isBlocked = $true
+        }
+    }
+    return [pscustomobject]@{
+        Tier = [string]$osSupportTier.Tier
+        Blocked = $isBlocked
+        HasWarning = $hasWarning
+        ExitCode = $(if ($isBlocked) { Resolve-BRAVOExitCode -InvalidConfiguration } else { $null })
+    }
+}
+
 # ===== ГОЛОВНИЙ ПОТІК =====
 
 Initialize-BRAVOConsole
@@ -2921,6 +2955,19 @@ Write-BRAVOHeader `
     -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
     -Mode $headerModeText
 Write-DataRestoreLog -Message "BRAVO Data Restore $script:ScriptVersion (build $script:ScriptBuildId): Mode=$Mode, Source=$Source, Component=$Component, GenerationId='$GenerationId', ListGenerations=$ListGenerations" -Level 'INFO'
+
+# Gate рівня підтримки ОС — до будь-яких дій (lock, credentials, staging,
+# розпакування). Застосовується рівномірно до всіх режимів, включно з
+# read-only -ListGenerations: так само блокується на Unsupported і
+# BRAVO_HEALTH (теж без мутацій), а README не робить винятків для режимів;
+# свідомий обхід — BRAVO_ALLOW_UNSUPPORTED_OS=1.
+$osSupportGate = Invoke-BRAVODataRestoreOSSupportGate
+if ($osSupportGate.Blocked) {
+    exit $osSupportGate.ExitCode
+}
+if ($osSupportGate.HasWarning) {
+    $script:dataRestoreWarningCount++
+}
 
 # Ранні інваріанти параметрів — до lock і будь-яких дій.
 if (-not [string]::IsNullOrWhiteSpace($GenerationId) -and
