@@ -2,6 +2,31 @@
 
 ## Не випущено (developer)
 
+- **Archive: поведінкові тести оркестрації Main (T011, аудит F010).**
+  Порядок фаз, звільнення ресурсів узгодженої копії й код завершення Archive
+  досі перевірялись лише структурно. Archive не зупиняє служб — узгодженість
+  дає один VSS Snapshot Set на generation, тому парні ресурси прогону тут —
+  VSS Snapshot Set (разом із файлом ownership state) і process lock. Нові
+  перевірки фрагмента `selftest/BRAVO_SELF_TEST.Archive.ps1` запускають у
+  дочірньому процесі runtime, зібраний з дослівного тексту
+  `BRAVO.Archive.Runtime.ps1` (справжні `Main`, зовнішній
+  `try`/`catch`/`finally` і фінальний `Exit`) через справжній
+  `Invoke-BRAVOArchiveEntrypoint`; VSS, 7-Zip, manifest, retention, Health,
+  статус-файл і Operations-подію замінюють стаби, що журналюють події.
+  Жодних VSS-знімків, служб чи мережі тест не чіпає.
+  `Archive/OrchestrationRunsPhasesInContractOrder` фіксує повну
+  послідовність фаз щасливого шляху (`[1/8]`…`[8/8]`, VSS до архівації й
+  видалення після неї, retention лише після manifest `COMPLETE`, lock
+  звільнено останнім) і код 0;
+  `Archive/OrchestrationReleasesSnapshotWhenComponentFails` — збій архівації
+  компонента: знімок видалено рівно раз, retention для `FAILED` generation
+  не запускається, код 40 (`LocalArchiveFailed`);
+  `Archive/OrchestrationReleasesSnapshotAndLockWhenPhaseThrows` —
+  необроблений виняток посеред фази архівації: знімок видалено у `finally`
+  до обробки винятку, пізніші фази не виконуються, код 90 (`InternalError`)
+  у процесі, статусі й Operations-події, lock звільнено останнім.
+  Production-код не змінено.
+
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
   використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний
