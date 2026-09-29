@@ -977,6 +977,11 @@ $script:restoreFailed = $false
 $script:modelIntegrityEstablished = $true
 
 function Enter-BRAVOMaintenanceOperationLock {
+    param(
+        # Задача Планувальника, у якій іде прогін: визначає ліміт очікування
+        # lock (Get-BRAVOOperationLockWaitBudget, BRAVO.System).
+        [Parameter(Mandatory = $true)][ValidateSet('Maintenance', 'Recovery')][string]$TaskType
+    )
     $lockPath = [string]$operationLockSettings.Path
     try {
         if ([string]::IsNullOrWhiteSpace($lockPath)) {
@@ -986,11 +991,16 @@ function Enter-BRAVOMaintenanceOperationLock {
         if (-not (Test-Path -LiteralPath $lockDirectory -PathType Container)) {
             [void](New-Item -ItemType Directory -Path $lockDirectory -Force -ErrorAction Stop)
         }
-        $waitMinutes = if ($null -ne $schedulerSettings -and
-            $schedulerSettings.Contains("OperationLockWaitMinutes")) {
-            [math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)
+        # T025: той самий канонічний бюджет, що й у Archive — очікування не
+        # довше за ExecutionTimeLimit задачі $TaskType мінус запас.
+        $lockWaitBudget = Get-BRAVOOperationLockWaitBudget `
+            -SchedulerSettings $schedulerSettings `
+            -TaskType $TaskType
+        $waitMinutes = $lockWaitBudget.EffectiveMinutes
+        $waitLimitDescription = if ($lockWaitBudget.Capped) {
+            " (OperationLockWaitMinutes=$($lockWaitBudget.ConfiguredMinutes) обмежено лімітом виконання задачі $($lockWaitBudget.TaskType) $($lockWaitBudget.TaskLimitMinutes) хв мінус запас $($lockWaitBudget.SafetyMarginMinutes) хв)"
         } else {
-            0
+            ''
         }
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $stream = $null
@@ -1051,7 +1061,7 @@ function Enter-BRAVOMaintenanceOperationLock {
             }
         } while ($null -eq $stream -and (Get-Date) -lt $deadline)
         if ($null -eq $stream) {
-            throw "lock не звільнився за $waitMinutes хв.: $lastLockError"
+            throw "lock не звільнився за $waitMinutes хв.$($waitLimitDescription): $lastLockError"
         }
         # JSON замість "Operation=...; PID=...; Started=..." (аудит P1.8):
         # той самий формат, що й у спільному lock з Archive.Runtime.ps1.
@@ -8088,7 +8098,8 @@ if ($missingDirs.Count -gt 0 -or $script:criticalErrorOccurred) {
 $directoryCreationFailed = $script:criticalErrorOccurred
 
 Write-BRAVOProgressPhase -Phase 'Зупинка служб' -PercentComplete 20
-$maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock
+$maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock `
+    -TaskType $(if ($RunMissedRestoreOnly) { 'Recovery' } else { 'Maintenance' })
 if (-not $maintenanceLockResult.Success) {
     Write-Log -Message (
         "Maintenance відкладено: BRAVO_ARCHIV або інший maintenance уже працює; " +

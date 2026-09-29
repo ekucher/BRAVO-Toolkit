@@ -667,3 +667,83 @@ function Get-BRAVOExpectedSchedulerPrincipal {
         RunLevel = 1
     }
 }
+
+function Get-BRAVOOperationLockWaitBudget {
+    # Канонічний бюджет очікування спільного операційного lock
+    # (BRAVO_OPERATION.lock) для прогону, що виконується як задача
+    # Планувальника типу $TaskType.
+    #
+    # Причина (T025): schedulerSettings.OperationLockWaitMinutes — один
+    # глобальний ліміт для всіх задач (типово 360 хв), а ExecutionTimeLimit
+    # задач різний (BAZASync = 2 год). BRAVO_ARCHIV -SyncBAZA, що впирався в
+    # lock довгої архівації, чекав до 6 год, і Планувальник примусово
+    # завершував процес на 2-й годині: без підсумку в журналі, без коду з
+    # контракту BRAVO.ExitCodes (лише "задачу зупинено" в історії задачі).
+    #
+    # Ліміт задачі береться з того самого schedulerSettings.<TaskType>.
+    # ExecutionTimeLimitHours, з якого BRAVO_TASKS_INSTALL.ps1 будує
+    # Settings.ExecutionTimeLimit — окремої таблиці лімітів тут немає.
+    #
+    # Запас (30 хв, $marginMinutes нижче) лишає
+    # час на роботу ПІСЛЯ захоплення lock і на штатне завершення з кодом
+    # SkippedLockBusy, якщо lock так і не звільнився:
+    #   - той самий запас уже закладено для задачі того самого 2-годинного
+    #     класу — Health.BusyWaitMinutes обмежено 0..90 хв при ліміті 2 год
+    #     (BRAVO_CONFIG_LOADER.ps1: "очікування мусить лишати запас");
+    #   - сам BAZASync на реальних серверах тримає lock ~16-17 хв (логи,
+    #     зафіксовані в BRAVO.Health.Runtime.ps1 біля BusyWaitMinutes) —
+    #     це вміщується в запас;
+    #   - цикл очікування перевіряє дедлайн з кроком Start-Sleep 30 с, тож
+    #     перевищення дедлайну циклом — секунди, а не хвилини.
+    #
+    # Без відомого ліміту задачі (legacy-конфіг без вузла/ключа, або
+    # нечислове чи недодатне значення) бюджет НЕ змінюється — зберігається
+    # попередня поведінка: обмежувати немає чим.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][System.Collections.IDictionary]$SchedulerSettings,
+        [Parameter(Mandatory = $true)][ValidateSet('Backup', 'Maintenance', 'Recovery', 'BAZASync')][string]$TaskType
+    )
+
+    $configuredMinutes = 0
+    if ($null -ne $SchedulerSettings -and $SchedulerSettings.Contains('OperationLockWaitMinutes')) {
+        $configuredMinutes = [math]::Max(0, [int]$SchedulerSettings.OperationLockWaitMinutes)
+    }
+
+    $taskLimitMinutes = $null
+    if ($null -ne $SchedulerSettings -and
+        $SchedulerSettings.Contains($TaskType) -and
+        $SchedulerSettings[$TaskType] -is [System.Collections.IDictionary] -and
+        $SchedulerSettings[$TaskType].Contains('ExecutionTimeLimitHours')) {
+        $limitHours = [double]0
+        if ([double]::TryParse(
+                [string]$SchedulerSettings[$TaskType].ExecutionTimeLimitHours,
+                [System.Globalization.NumberStyles]::Float,
+                [System.Globalization.CultureInfo]::InvariantCulture,
+                [ref]$limitHours) -and
+            $limitHours -gt 0 -and
+            -not [double]::IsInfinity($limitHours)) {
+            $taskLimitMinutes = [int][math]::Floor($limitHours * 60)
+        }
+    }
+
+    $marginMinutes = 30
+    $effectiveMinutes = $configuredMinutes
+    $capped = $false
+    if ($null -ne $taskLimitMinutes) {
+        $ceilingMinutes = [math]::Max(0, $taskLimitMinutes - $marginMinutes)
+        if ($configuredMinutes -gt $ceilingMinutes) {
+            $effectiveMinutes = $ceilingMinutes
+            $capped = $true
+        }
+    }
+
+    return [pscustomobject]@{
+        TaskType = $TaskType
+        ConfiguredMinutes = $configuredMinutes
+        TaskLimitMinutes = $taskLimitMinutes
+        SafetyMarginMinutes = $marginMinutes
+        EffectiveMinutes = [int]$effectiveMinutes
+        Capped = $capped
+    }
+}
