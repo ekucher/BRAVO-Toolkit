@@ -2,6 +2,26 @@
 
 ## Не випущено (developer)
 
+- **Runtime DataRestore загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1` тепер живе
+  у функції `Invoke-BRAVODataRestore` з invocation guard наприкінці файлу —
+  той самий патерн, що вже має `BRAVO.Health.Runtime.ps1`
+  (`Invoke-BRAVOHealth`). Для оператора нічого не змінилось: ті самі
+  параметри, коди завершення, пауза `-NoPause` і вивід. Dot-source файлу
+  тепер лише визначає функції й нічого не виконує — це передумова для
+  оркестраційних тестів DataRestore (відновлення служб і звільнення lock-а
+  при збої).
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/DataRestoreRuntimeWrappedInFunction` (AST: кожен `exit` і
+  зовнішній `try/finally` — усередині обгортки, guard передає рівно
+  параметри `param()` скрипта),
+  `Console/DataRestoreRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/DataRestoreRuntimeDirectInvocationRunsBody` (дочірній процес:
+  dot-source не виконує тіло; production-шлях
+  `Invoke-BRAVODataRestoreEntrypoint` з явно вказаним відсутнім
+  `-ConfigPath` повертає контрактний exit 30).
+
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
   у версії 5.3 `BRAVO.config` не повинен читатися, шукатися, виконуватися

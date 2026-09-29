@@ -10646,6 +10646,162 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
         -Name "Console/HealthPausesOnEveryExitPath" `
         -Failure "Health.Runtime.ps1 має чекати на клавішу у finally навколо обчислення exitCode — інакше -NoPause параметр приймається, але ніколи не використовується"
 
+    # DataRestore.Runtime.ps1: тіло runtime загорнуте в Invoke-BRAVODataRestore
+    # за зразком Invoke-BRAVOHealth. Структура (AST): єдина функція-обгортка
+    # на верхньому рівні, КОЖЕН exit і зовнішній try/finally з паузою —
+    # усередині неї, а останній верхньорівневий оператор — invocation guard,
+    # що передає функції рівно ті параметри, які оголошує param() скрипта
+    # (інакше забутий параметр мовчки перестав би доходити до тіла).
+    $dataRestoreRuntimePathForWrapper = Join-Path $root "modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1"
+    $dataRestoreWrapperParseErrors = $null
+    $dataRestoreWrapperAst = [Management.Automation.Language.Parser]::ParseFile(
+        $dataRestoreRuntimePathForWrapper, [ref]$null, [ref]$dataRestoreWrapperParseErrors)
+    $dataRestoreWrapperTopStatements = @($dataRestoreWrapperAst.EndBlock.Statements)
+    $dataRestoreWrapperFunctions = @($dataRestoreWrapperTopStatements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVODataRestore'
+        })
+    $dataRestoreWrapperFunction = $dataRestoreWrapperFunctions | Select-Object -First 1
+    $dataRestoreWrapperGuard = $dataRestoreWrapperTopStatements | Select-Object -Last 1
+    $dataRestoreWrapperExits = @($dataRestoreWrapperAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.ExitStatementAst]
+            }, $true))
+    $dataRestoreWrapperExitsOutside = @($dataRestoreWrapperExits | Where-Object {
+            $null -eq $dataRestoreWrapperFunction -or
+            $_.Extent.StartOffset -lt $dataRestoreWrapperFunction.Extent.StartOffset -or
+            $_.Extent.EndOffset -gt $dataRestoreWrapperFunction.Extent.EndOffset
+        })
+    $dataRestoreWrapperPauseInFinally = $false
+    $dataRestoreWrapperFunctionParameters = ''
+    if ($null -ne $dataRestoreWrapperFunction) {
+        $dataRestoreWrapperPauseInFinally = @($dataRestoreWrapperFunction.Body.EndBlock.Statements | Where-Object {
+                $_ -is [Management.Automation.Language.TryStatementAst] -and
+                $null -ne $_.Finally -and
+                $_.Finally.Extent.Text.Contains('Wait-BRAVOManualExit -NoPause:$NoPause')
+            }).Count -eq 1
+        $dataRestoreWrapperFunctionParameters = (@($dataRestoreWrapperFunction.Body.ParamBlock.Parameters |
+                    ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ','
+    }
+    $dataRestoreWrapperScriptParameters = (@($dataRestoreWrapperAst.ParamBlock.Parameters |
+                ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ','
+    $dataRestoreWrapperGuardIsInvocation = $false
+    $dataRestoreWrapperGuardSplatKeys = ''
+    if ($dataRestoreWrapperGuard -is [Management.Automation.Language.IfStatementAst] -and
+        @($dataRestoreWrapperGuard.Clauses).Count -eq 1 -and
+        $dataRestoreWrapperGuard.Clauses[0].Item1.Extent.Text -eq "`$MyInvocation.InvocationName -ne '.'") {
+        $dataRestoreWrapperGuardIsInvocation = @($dataRestoreWrapperGuard.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Invoke-BRAVODataRestore'
+                }, $true)).Count -eq 1
+        $dataRestoreWrapperGuardSplat = @($dataRestoreWrapperGuard.FindAll({
+                    param($node) $node -is [Management.Automation.Language.HashtableAst]
+                }, $true)) | Select-Object -First 1
+        if ($null -ne $dataRestoreWrapperGuardSplat) {
+            $dataRestoreWrapperGuardSplatKeys = (@($dataRestoreWrapperGuardSplat.KeyValuePairs |
+                        ForEach-Object { $_.Item1.Extent.Text }) | Sort-Object) -join ','
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($dataRestoreWrapperParseErrors).Count -eq 0 -and
+            $dataRestoreWrapperFunctions.Count -eq 1 -and
+            @($dataRestoreWrapperTopStatements | Where-Object { $_ -is [Management.Automation.Language.TryStatementAst] }).Count -eq 0 -and
+            $dataRestoreWrapperExits.Count -gt 0 -and
+            $dataRestoreWrapperExitsOutside.Count -eq 0 -and
+            $dataRestoreWrapperPauseInFinally -and
+            $dataRestoreWrapperGuardIsInvocation -and
+            -not [string]::IsNullOrEmpty($dataRestoreWrapperScriptParameters) -and
+            $dataRestoreWrapperFunctionParameters -eq $dataRestoreWrapperScriptParameters -and
+            $dataRestoreWrapperGuardSplatKeys -eq $dataRestoreWrapperScriptParameters
+        ) `
+        -Name "Console/DataRestoreRuntimeWrappedInFunction" `
+        -Failure "DataRestore.Runtime.ps1: тіло (усі exit і try/finally з Wait-BRAVOManualExit) має бути всередині єдиної функції Invoke-BRAVODataRestore, а останнім оператором — guard `$MyInvocation.InvocationName -ne '.', що передає рівно параметри param() скрипта (exit поза функцією: $($dataRestoreWrapperExitsOutside.Count); параметри функції: $dataRestoreWrapperFunctionParameters; splat guard: $dataRestoreWrapperGuardSplatKeys; param() скрипта: $dataRestoreWrapperScriptParameters)"
+
+    # Поведінка обгортки — у дочірньому процесі (runtime імпортує модулі й
+    # перемикає кодування консолі, це не повинно торкатися сесії самотесту).
+    # DotSource: dot-source лише визначає функції — тіло НЕ виконується (без
+    # guard-а воно б відпрацювало й завершило процес). Invoke: справжній
+    # production-шлях Invoke-BRAVODataRestoreEntrypoint -> & runtime -> guard
+    # -> тіло; явно вказаний відсутній -ConfigPath дає контрактний exit 30
+    # (InvalidConfiguration) з catch читання конфігурації ВСЕРЕДИНІ функції —
+    # тобто exit із функції як і раніше стає кодом завершення runtime.
+    # -ListGenerations обходить елевацію; до першого запису на диск тіло не
+    # доходить.
+    $dataRestoreWrapperProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_DATA_RESTORE_WRAPPER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($dataRestoreWrapperProbeRoot)
+        $dataRestoreWrapperProbeScript = @'
+param([string]$Mode, [string]$RuntimeRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeRuntimePath = Join-Path $RuntimeRoot 'modules\BRAVO.DataRestore\BRAVO.DataRestore.Runtime.ps1'
+$probeParameters = @{
+    RuntimeRoot = $RuntimeRoot
+    EntryScriptPath = (Join-Path $RuntimeRoot 'BRAVO_DATA_RESTORE.ps1')
+    ConfigPath = (Join-Path $ProbeRoot 'missing\BRAVO.config')
+    ConfigPathWasExplicit = $true
+    ListGenerations = $true
+    NoPause = $true
+}
+try {
+    if ($Mode -eq 'DotSource') {
+        . $probeRuntimePath @probeParameters
+        [pscustomobject]@{
+            DotSourceReturned = $true
+            FunctionDefined = [bool](Get-Command -Name 'Invoke-BRAVODataRestore' -CommandType Function -ErrorAction SilentlyContinue)
+            BodyStateAbsent = -not (Test-Path -LiteralPath 'variable:dataRestoreComponentResults')
+        } | ConvertTo-Json -Compress
+    } else {
+        Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.DataRestore\BRAVO.DataRestore.psd1') -Force
+        $probeExitCode = Invoke-BRAVODataRestoreEntrypoint -Parameters $probeParameters
+        [pscustomobject]@{ ExitCode = [int]$probeExitCode } | ConvertTo-Json -Compress
+    }
+} catch {
+    [pscustomobject]@{ ProbeError = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+}
+'@
+        $dataRestoreWrapperProbePath = Join-Path $dataRestoreWrapperProbeRoot 'probe.ps1'
+        [IO.File]::WriteAllText($dataRestoreWrapperProbePath, $dataRestoreWrapperProbeScript, (New-Object Text.UTF8Encoding($false)))
+        $dataRestoreWrapperHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $dataRestoreWrapperResults = @{}
+        foreach ($dataRestoreWrapperMode in @('DotSource', 'Invoke')) {
+            $dataRestoreWrapperOutput = & $dataRestoreWrapperHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $dataRestoreWrapperProbePath `
+                -Mode $dataRestoreWrapperMode -RuntimeRoot $root -ProbeRoot $dataRestoreWrapperProbeRoot
+            $dataRestoreWrapperJson = @($dataRestoreWrapperOutput) |
+                Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
+                Select-Object -Last 1
+            $dataRestoreWrapperResults[$dataRestoreWrapperMode] = if ([string]::IsNullOrWhiteSpace([string]$dataRestoreWrapperJson)) {
+                [pscustomobject]@{ ProbeError = "проба не повернула JSON (код виходу $LASTEXITCODE)" }
+            } else {
+                [string]$dataRestoreWrapperJson | ConvertFrom-Json
+            }
+        }
+        $dataRestoreWrapperDotSource = $dataRestoreWrapperResults['DotSource']
+        $dataRestoreWrapperInvoke = $dataRestoreWrapperResults['Invoke']
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $dataRestoreWrapperDotSource.PSObject.Properties['ProbeError'] -and
+                $dataRestoreWrapperDotSource.DotSourceReturned -eq $true -and
+                $dataRestoreWrapperDotSource.FunctionDefined -eq $true -and
+                $dataRestoreWrapperDotSource.BodyStateAbsent -eq $true
+            ) `
+            -Name "Console/DataRestoreRuntimeDotSourceDefinesWithoutRunning" `
+            -Failure "dot-source DataRestore.Runtime.ps1 має лише визначити Invoke-BRAVODataRestore, не виконуючи тіло; проба: $($dataRestoreWrapperDotSource | ConvertTo-Json -Compress)"
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $dataRestoreWrapperInvoke.PSObject.Properties['ProbeError'] -and
+                $dataRestoreWrapperInvoke.ExitCode -eq 30
+            ) `
+            -Name "Console/DataRestoreRuntimeDirectInvocationRunsBody" `
+            -Failure "Invoke-BRAVODataRestoreEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 30 з catch читання конфігурації; проба: $($dataRestoreWrapperInvoke | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $dataRestoreWrapperProbeRoot -PathType Container) {
+            Remove-Item -LiteralPath $dataRestoreWrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
     # Maintenance.Runtime.ps1: ~28 точок exit розкидані по всьому файлу
     # (config не знайдено, lock зайнятий, tool integrity тощо) — єдиний
     # безпечний спосіб охопити їх усі одразу без 28 окремих правок:

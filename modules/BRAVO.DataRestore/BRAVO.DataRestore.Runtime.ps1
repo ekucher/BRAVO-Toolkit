@@ -197,6 +197,36 @@ function ConvertTo-BRAVODataRestoreElevationArgument {
     return '"' + $escaped + '"'
 }
 
+# Тіло runtime — одна функція, за зразком BRAVO.Health.Runtime.ps1
+# (Invoke-BRAVOHealth): прямий запуск файлу (& у BRAVO.DataRestore.psm1)
+# виконує тіло через invocation guard наприкінці файлу, а dot-source лише
+# визначає функції. param() функції повторює param() скрипта один в один
+# (ті самі типи, ValidateSet, Mandatory): присвоєння $ConfigPath у тілі
+# лишаються типізованими так само, як на script-рівні. Стан, який читають
+# вкладені функції, тіло й далі пише явно через $script:/$global:, а exit
+# усередині функції завершує весь скрипт тим самим кодом.
+function Invoke-BRAVODataRestore {
+    param (
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit = $false,
+        [string]$GenerationId,
+        [ValidateSet("MODEL", "BLOG", "BRAVOEXCH", "All")]
+        [string]$Component = "All",
+        [ValidateSet("OutOfPlace", "InPlace")]
+        [string]$Mode = "OutOfPlace",
+        [string]$TargetPath,
+        [ValidateSet("Local", "SFTP")]
+        [string]$Source = "Local",
+        [string]$StagingPath,
+        [switch]$ListGenerations,
+        [switch]$Force,
+        [switch]$SkipHealthCheck,
+        [int]$TimeoutSeconds = 0,
+        [switch]$NoPause,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath
+    )
+
 # Один зовнішній try/finally: exit усередині try гарантовано проходить крізь
 # усі finally на своєму шляху, тому ручна пауза охоплює кожну точку виходу
 # (той самий принцип, що BRAVO_MAINTENANCE).
@@ -4154,4 +4184,26 @@ exit $dataRestoreExitCode
 
 } finally {
     Wait-BRAVOManualExit -NoPause:$NoPause
+}
+}
+# END BRAVO DATA RESTORE RUNTIME
+if ($MyInvocation.InvocationName -ne '.') {
+    $dataRestoreParameters = @{
+        ConfigPath = $ConfigPath
+        ConfigPathWasExplicit = $ConfigPathWasExplicit
+        GenerationId = $GenerationId
+        Component = $Component
+        Mode = $Mode
+        TargetPath = $TargetPath
+        Source = $Source
+        StagingPath = $StagingPath
+        ListGenerations = $ListGenerations
+        Force = $Force
+        SkipHealthCheck = $SkipHealthCheck
+        TimeoutSeconds = $TimeoutSeconds
+        NoPause = $NoPause
+        RuntimeRoot = $RuntimeRoot
+        EntryScriptPath = $EntryScriptPath
+    }
+    Invoke-BRAVODataRestore @dataRestoreParameters
 }
