@@ -15208,6 +15208,11 @@ function Get-BRAVOMaintenanceSummaryResult {
             return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
         }
         function Invoke-BRAVOSevenZipIntegrityTest {
+            # Stub процесного шару: ім'я -Password задане сигнатурою
+            # справжньої функції (викликається з -Password).
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSAvoidUsingPlainTextForPassword', 'Password',
+                Justification = 'Self-test stub: фікстурне значення, сигнатура справжнього Invoke-BRAVOSevenZipIntegrityTest.')]
             param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
             $null = $TimeoutSeconds
             $script:verifyBackupSevenZipCalls++
@@ -15254,7 +15259,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     [void][IO.Directory]::CreateDirectory($verifyBackupRoot)
     $verifyBackupInvoke = {
         # Без [string]-обмеження: `$null означає «файл не створювати».
-        param([string]$Scenario, $ArchiveContent, $SevenZipContent, [string]$ArchivePassword)
+        param([string]$Scenario, $ArchiveContent, $SevenZipContent, [string]$ArchiveSecret)
         $scenarioDir = Join-Path $verifyBackupRoot $Scenario
         [void][IO.Directory]::CreateDirectory($scenarioDir)
         $archiveName = "MODEL_before_20260101_0100.mdz"
@@ -15267,13 +15272,13 @@ function Get-BRAVOMaintenanceSummaryResult {
             [IO.File]::WriteAllText($sevenZipPath, $SevenZipContent)
         }
         $outcome = & $verifyBackupModule {
-            param($SevenZip, $Archive, $Password, $ExpectedPassword, $StubScriptText)
+            param($SevenZip, $Archive, $ArchiveSecretText, $ExpectedSecretText, $StubScriptText)
             Set-StrictMode -Version Latest
             . ([scriptblock]::Create($StubScriptText))
             $script:verifyBackupLogLines = New-Object System.Collections.ArrayList
             $script:verifyBackupSevenZipCalls = 0
-            $script:verifyBackupExpectedPassword = $ExpectedPassword
-            $script:ArchivePassword = $Password
+            $script:verifyBackupExpectedPassword = $ExpectedSecretText
+            $script:ArchivePassword = $ArchiveSecretText
             $script:SevenZipIntegrityTestTimeoutSeconds = 60
             $script:criticalErrorOccurred = $false
             $script:restoreIntegrityFailed = $false
@@ -15292,7 +15297,7 @@ function Get-BRAVOMaintenanceSummaryResult {
                 SevenZipCalls = [int]$script:verifyBackupSevenZipCalls
                 LogText = (@($script:verifyBackupLogLines) -join "`n")
             }
-        } $sevenZipPath $archivePath $ArchivePassword $verifyBackupPassword $verifyBackupStubScriptText
+        } $sevenZipPath $archivePath $ArchiveSecret $verifyBackupPassword $verifyBackupStubScriptText
         $hashPath = "$archivePath.sha512"
         $outcome | Add-Member -NotePropertyName HashExists -NotePropertyValue (Test-Path -LiteralPath $hashPath -PathType Leaf)
         $outcome | Add-Member -NotePropertyName HashText -NotePropertyValue $(
