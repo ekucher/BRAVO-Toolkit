@@ -2,6 +2,25 @@
 
 ## Не випущено (developer)
 
+- **Runtime DataRestore загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1` тепер живе
+  у функції `Invoke-BRAVODataRestore` з invocation guard наприкінці файлу —
+  той самий патерн, що вже має `BRAVO.Health.Runtime.ps1`
+  (`Invoke-BRAVOHealth`). Для оператора нічого не змінилось: ті самі
+  параметри, коди завершення, пауза `-NoPause` і вивід. Dot-source файлу
+  тепер лише визначає функції й нічого не виконує — це передумова для
+  оркестраційних тестів DataRestore (відновлення служб і звільнення lock-а
+  при збої).
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/DataRestoreRuntimeWrappedInFunction` (AST: кожен `exit` і
+  зовнішній `try/finally` — усередині обгортки, guard передає рівно
+  параметри `param()` скрипта),
+  `Console/DataRestoreRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/DataRestoreRuntimeDirectInvocationRunsBody` (дочірній процес:
+  dot-source не виконує тіло; production-шлях
+  `Invoke-BRAVODataRestoreEntrypoint` з явно вказаним відсутнім
+  `-ConfigPath` повертає контрактний exit 30).
 - **Архіви, що відкриваються лише через legacy BOM-fallback пароля, тепер
   дають попередження, а не тихий успіх.** Архів, зашифрований паролем із
   BOM-префіксом (U+FEFF), — так пароль потрапляв у 7-Zip під
