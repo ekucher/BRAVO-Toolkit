@@ -3505,13 +3505,17 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             # Провал реставрації, що потребував відкату, мапиться на
             # RestoreFailed (43) — окремо від збою СТВОРЕННЯ архіву (40).
             $maintenanceRuntimeTextForExitCodes.Contains('-RestoreFailed:$script:restoreFailed') -and
-            # 11 точок restoreArchiveFailed; 11 точок restoreIntegrityFailed.
+            # 11 точок restoreArchiveFailed; 10 точок restoreIntegrityFailed.
             # +1 integrity проти fix/repair-rollback-false-positive:
             # Invoke-BRAVOModelRestoreRecovery після успішного відкату повторно
             # валідує модель і, якщо вона ВСЕ ОДНО не консистентна, позначає
             # restoreIntegrityFailed (rollback=FAILED, служби гейтуються).
+            # -1 integrity (T004/F002): дві гілки before-архіву («не пройшов
+            # 7z t» / «не вдалося створити SHA512») злито в одну гілку
+            # Verify-Backup (7z t + SHA512); збій 7z t і далі виставляє
+            # restoreIntegrityFailed у Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
             ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreArchiveFailed = $true')).Count -eq 11) -and
-            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 11)
+            ([regex]::Matches($maintenanceRuntimeTextForExitCodes, [regex]::Escape('$script:restoreIntegrityFailed = $true')).Count -eq 10)
         ) `
         -Name "Runtime/MaintenanceDistinguishesArchiveVsIntegrityFailure" `
         -Failure "Maintenance має розрізняти локальну архівацію (40), перевірку цілісності (41) і провал реставрації з відкатом (43), а не зводити все до 60"
@@ -7233,8 +7237,32 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $scopeName -ne 'Start-BRAVOProcessWithBomFreeInput') {
                     $violations.Add("$location — інстансний .Start() поза Start-BRAVOProcessWithBomFreeInput")
                 }
+                # Область = сама функція БЕЗ тіл вкладених функцій: після T010
+                # тіло runtime є функцією-обгорткою, у якій вкладені функції
+                # (напр. запуск процесу зі stdin) мають власну область; їхній
+                # RedirectStandardInput не робить статичний ::Start() обгортки
+                # (напр. UAC-перезапуск з -Verb RunAs) порушенням.
+                $scopeOwnText = $scopeNode.Extent.Text
+                if ($scopeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    $nestedScopes = @($scopeNode.Body.FindAll({
+                        param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                    }, $true) | Sort-Object { $_.Extent.StartOffset })
+                    $maskedUntilOffset = -1
+                    $ownTextBuilder = New-Object System.Text.StringBuilder
+                    $ownTextCursor = 0
+                    foreach ($nestedScope in $nestedScopes) {
+                        if ($nestedScope.Extent.StartOffset -lt $maskedUntilOffset) { continue }
+                        $nestedStart = $nestedScope.Extent.StartOffset - $scopeNode.Extent.StartOffset
+                        $nestedLength = $nestedScope.Extent.EndOffset - $nestedScope.Extent.StartOffset
+                        [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor, $nestedStart - $ownTextCursor))
+                        $ownTextCursor = $nestedStart + $nestedLength
+                        $maskedUntilOffset = $nestedScope.Extent.EndOffset
+                    }
+                    [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor))
+                    $scopeOwnText = $ownTextBuilder.ToString()
+                }
                 if ($call.Static -and $memberName -eq 'Start' -and
-                    $scopeNode.Extent.Text.Contains('RedirectStandardInput')) {
+                    $scopeOwnText.Contains('RedirectStandardInput')) {
                     $violations.Add("$location — статичний ::Start() в області з RedirectStandardInput")
                 }
                 if ($memberName -match '^Write(Line)?$' -and
@@ -7299,11 +7327,54 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Remove-Item -LiteralPath $bomFreeGuardProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    # Область функції не включає вкладені функції (T010): статичний ::Start()
+    # у функції-обгортці без власного RedirectStandardInput дозволений, навіть
+    # якщо RedirectStandardInput є у ВКЛАДЕНІЙ функції; але статичний ::Start()
+    # у самій вкладеній функції з RedirectStandardInput усе одно порушення.
+    $bomFreeNestedProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_BOMFREE_NESTED_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    $bomFreeNestedAllowedViolations = @()
+    $bomFreeNestedForbiddenViolations = @()
+    try {
+        [void][IO.Directory]::CreateDirectory($bomFreeNestedProbeRoot)
+        $bomFreeNestedAllowedFile = Join-Path $bomFreeNestedProbeRoot 'wrapper.ps1'
+        [IO.File]::WriteAllText($bomFreeNestedAllowedFile, (
+            "function Invoke-Wrapper {`r`n" +
+            "    [void][System.Diagnostics.Process]::Start('elevated.exe')`r`n" +
+            "    function Get-Nested {`r`n" +
+            "        `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "        `$psi.RedirectStandardInput = `$true`r`n" +
+            "        return `$psi`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeNestedForbiddenFile = Join-Path $bomFreeNestedProbeRoot 'nested.ps1'
+        [IO.File]::WriteAllText($bomFreeNestedForbiddenFile, (
+            "function Invoke-Wrapper {`r`n" +
+            "    function Start-Nested {`r`n" +
+            "        `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "        `$psi.RedirectStandardInput = `$true`r`n" +
+            "        [void][System.Diagnostics.Process]::Start(`$psi)`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeNestedAllowedViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeNestedProbeRoot -Files @(Get-Item -LiteralPath $bomFreeNestedAllowedFile))
+        $bomFreeNestedForbiddenViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeNestedProbeRoot -Files @(Get-Item -LiteralPath $bomFreeNestedForbiddenFile))
+    } finally {
+        if (Test-Path -LiteralPath $bomFreeNestedProbeRoot) {
+            Remove-Item -LiteralPath $bomFreeNestedProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Test-BRAVOCondition `
         -Condition (
             $bomFreeProductionFiles.Count -gt 0 -and
             $bomFreeViolations.Count -eq 0 -and
-            $bomFreeProbeViolations.Count -eq 4
+            $bomFreeProbeViolations.Count -eq 4 -and
+            $bomFreeNestedAllowedViolations.Count -eq 0 -and
+            $bomFreeNestedForbiddenViolations.Count -eq 1
         ) `
         -Name "Secrets/StdinProcessStartOnlyViaBomFreeHelper" `
         -Failure ("процес із redirected stdin має запускатися лише через Start-BRAVOProcessWithBomFreeInput, а stdin писатися лише через Write-BRAVOProcessInputText; порушення: {0}; контроль гарда (очікувано 4): {1}" -f
@@ -12064,6 +12135,200 @@ try {
         ) `
         -Name "Console/MaintenanceAcceptsNoPauseParameter" `
         -Failure "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1 має приймати -NoPause у param()"
+
+    # Archive.Runtime.ps1: тіло runtime загорнуте в Invoke-BRAVOArchive за
+    # зразком Invoke-BRAVOHealth. Структура (AST): на верхньому рівні — лише
+    # функція-обгортка й invocation guard останнім оператором, КОЖЕН exit —
+    # усередині обгортки, guard передає функції рівно параметри param()
+    # скрипта (інакше забутий параметр мовчки перестав би доходити до тіла).
+    # Окремо — клас пасток обгортання: ім'я, яке тіло пише БЕЗ scope, а
+    # хтось у файлі читає/пише через $script:. До обгортання це була одна
+    # script-змінна; у функції некваліфіковане присвоєння створює локальну
+    # копію, що затінює $script:-значення для вкладених функцій (так було б
+    # із $compatibilityMode: Main показав би «ВИМКНЕНО» замість фактичного
+    # режиму, визначеного Test-Compatibility).
+    $archiveRuntimePathForWrapper = Join-Path $root "modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1"
+    $archiveWrapperParseErrors = $null
+    $archiveWrapperAst = [Management.Automation.Language.Parser]::ParseFile(
+        $archiveRuntimePathForWrapper, [ref]$null, [ref]$archiveWrapperParseErrors)
+    $archiveWrapperTopStatements = @($archiveWrapperAst.EndBlock.Statements)
+    $archiveWrapperFunctions = @($archiveWrapperTopStatements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOArchive'
+        })
+    $archiveWrapperFunction = $archiveWrapperFunctions | Select-Object -First 1
+    $archiveWrapperGuard = $archiveWrapperTopStatements | Select-Object -Last 1
+    $archiveWrapperExits = @($archiveWrapperAst.FindAll({
+                param($node) $node -is [Management.Automation.Language.ExitStatementAst]
+            }, $true))
+    $archiveWrapperExitsOutside = @($archiveWrapperExits | Where-Object {
+            $null -eq $archiveWrapperFunction -or
+            $_.Extent.StartOffset -lt $archiveWrapperFunction.Extent.StartOffset -or
+            $_.Extent.EndOffset -gt $archiveWrapperFunction.Extent.EndOffset
+        })
+    $archiveWrapperFunctionParameters = ''
+    $archiveWrapperShadowedScriptNames = @()
+    if ($null -ne $archiveWrapperFunction) {
+        $archiveWrapperFunctionParameters = (@($archiveWrapperFunction.Body.ParamBlock.Parameters |
+                    ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ','
+        $archiveWrapperScriptQualifiedNames = @{}
+        foreach ($archiveWrapperVariable in @($archiveWrapperAst.FindAll({
+                        param($node) $node -is [Management.Automation.Language.VariableExpressionAst]
+                    }, $true))) {
+            if ($archiveWrapperVariable.VariablePath.UserPath -match '^(?i)script:(.+)$') {
+                $archiveWrapperScriptQualifiedNames[$Matches[1].ToLowerInvariant()] = $true
+            }
+        }
+        $archiveWrapperBodyUnqualifiedNames = @{}
+        foreach ($archiveWrapperAssignment in @($archiveWrapperFunction.Body.FindAll({
+                        param($node) $node -is [Management.Automation.Language.AssignmentStatementAst]
+                    }, $true))) {
+            # Лише присвоєння рівня тіла обгортки: не у вкладеній функції й
+            # не у scriptblock-літералі (ті мають власний scope і до
+            # обгортання).
+            $archiveWrapperOwner = $archiveWrapperAssignment.Parent
+            while ($null -ne $archiveWrapperOwner -and
+                -not ($archiveWrapperOwner -is [Management.Automation.Language.FunctionDefinitionAst]) -and
+                -not ($archiveWrapperOwner -is [Management.Automation.Language.ScriptBlockExpressionAst])) {
+                $archiveWrapperOwner = $archiveWrapperOwner.Parent
+            }
+            if (-not [object]::ReferenceEquals($archiveWrapperOwner, $archiveWrapperFunction)) {
+                continue
+            }
+            $archiveWrapperTarget = $archiveWrapperAssignment.Left
+            if ($archiveWrapperTarget -is [Management.Automation.Language.ConvertExpressionAst]) {
+                $archiveWrapperTarget = $archiveWrapperTarget.Child
+            }
+            if ($archiveWrapperTarget -is [Management.Automation.Language.VariableExpressionAst] -and
+                $archiveWrapperTarget.VariablePath.IsUnqualified) {
+                $archiveWrapperBodyUnqualifiedNames[$archiveWrapperTarget.VariablePath.UserPath.ToLowerInvariant()] = $true
+            }
+        }
+        $archiveWrapperShadowedScriptNames = @($archiveWrapperBodyUnqualifiedNames.Keys | Where-Object {
+                $archiveWrapperScriptQualifiedNames.ContainsKey($_)
+            } | Sort-Object)
+    }
+    $archiveWrapperScriptParameters = (@($archiveWrapperAst.ParamBlock.Parameters |
+                ForEach-Object { $_.Name.VariablePath.UserPath }) | Sort-Object) -join ','
+    $archiveWrapperGuardIsInvocation = $false
+    $archiveWrapperGuardSplatKeys = ''
+    if ($archiveWrapperGuard -is [Management.Automation.Language.IfStatementAst] -and
+        @($archiveWrapperGuard.Clauses).Count -eq 1 -and
+        $archiveWrapperGuard.Clauses[0].Item1.Extent.Text -eq "`$MyInvocation.InvocationName -ne '.'") {
+        $archiveWrapperGuardIsInvocation = @($archiveWrapperGuard.FindAll({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and
+                    $node.GetCommandName() -eq 'Invoke-BRAVOArchive'
+                }, $true)).Count -eq 1
+        $archiveWrapperGuardSplat = @($archiveWrapperGuard.FindAll({
+                    param($node) $node -is [Management.Automation.Language.HashtableAst]
+                }, $true)) | Select-Object -First 1
+        if ($null -ne $archiveWrapperGuardSplat) {
+            $archiveWrapperGuardSplatKeys = (@($archiveWrapperGuardSplat.KeyValuePairs |
+                        ForEach-Object { $_.Item1.Extent.Text }) | Sort-Object) -join ','
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            @($archiveWrapperParseErrors).Count -eq 0 -and
+            $archiveWrapperFunctions.Count -eq 1 -and
+            $archiveWrapperTopStatements.Count -eq 2 -and
+            $archiveWrapperExits.Count -gt 0 -and
+            $archiveWrapperExitsOutside.Count -eq 0 -and
+            $archiveWrapperShadowedScriptNames.Count -eq 0 -and
+            $archiveWrapperGuardIsInvocation -and
+            -not [string]::IsNullOrEmpty($archiveWrapperScriptParameters) -and
+            $archiveWrapperFunctionParameters -eq $archiveWrapperScriptParameters -and
+            $archiveWrapperGuardSplatKeys -eq $archiveWrapperScriptParameters
+        ) `
+        -Name "Console/ArchiveRuntimeWrappedInFunction" `
+        -Failure "Archive.Runtime.ps1: на верхньому рівні мають бути лише функція Invoke-BRAVOArchive (з усіма exit) і останнім оператором guard `$MyInvocation.InvocationName -ne '.', що передає рівно параметри param() скрипта; тіло не повинно писати без scope імена, які файл використовує через `$script: (операторів верхнього рівня: $($archiveWrapperTopStatements.Count); exit поза функцією: $($archiveWrapperExitsOutside.Count); затінені `$script:-імена: $($archiveWrapperShadowedScriptNames -join ', '); параметри функції: $archiveWrapperFunctionParameters; splat guard: $archiveWrapperGuardSplatKeys; param() скрипта: $archiveWrapperScriptParameters)"
+
+    # Поведінка обгортки — у дочірньому процесі (runtime імпортує модулі й
+    # перемикає кодування консолі, це не повинно торкатися сесії самотесту).
+    # DotSource: dot-source лише визначає Invoke-BRAVOArchive — тіло НЕ
+    # виконується (без guard-а воно б відпрацювало й завершило процес, а
+    # функції runtime, як-от Main, лишилися б визначеними). Invoke: справжній
+    # production-шлях Invoke-BRAVOArchiveEntrypoint -> & runtime -> guard ->
+    # тіло; явно вказаний відсутній -ConfigPath дає exit 1 з catch
+    # завантаження конфігурації ВСЕРЕДИНІ функції (поточний код; те, що це
+    # 1, а не контрактний 30, — окремий відомий дефект, і його виправлення
+    # має оновити цю перевірку). $LASTEXITCODE перед викликом = 77, тож
+    # пропущене тіло не може випадково дати 1.
+    $archiveWrapperProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_ARCHIVE_WRAPPER_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($archiveWrapperProbeRoot)
+        $archiveWrapperProbeScript = @'
+param([string]$Mode, [string]$RuntimeRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeRuntimePath = Join-Path $RuntimeRoot 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'
+$probeParameters = @{
+    RuntimeRoot = $RuntimeRoot
+    EntryScriptPath = (Join-Path $RuntimeRoot 'BRAVO_ARCHIV.ps1')
+    ConfigPath = (Join-Path $ProbeRoot 'missing\BRAVO.config')
+    ConfigPathWasExplicit = $true
+    NoPause = $true
+}
+try {
+    if ($Mode -eq 'DotSource') {
+        . $probeRuntimePath @probeParameters
+        [pscustomobject]@{
+            DotSourceReturned = $true
+            FunctionDefined = [bool](Get-Command -Name 'Invoke-BRAVOArchive' -CommandType Function -ErrorAction SilentlyContinue)
+            BodyStateAbsent = (-not (Test-Path -LiteralPath 'variable:bravoScriptDirectory')) -and
+                (-not (Get-Command -Name 'Main' -CommandType Function -ErrorAction SilentlyContinue))
+        } | ConvertTo-Json -Compress
+    } else {
+        Import-Module -Name (Join-Path $RuntimeRoot 'modules\BRAVO.Archive\BRAVO.Archive.psd1') -Force
+        $global:LASTEXITCODE = 77
+        $probeExitCode = Invoke-BRAVOArchiveEntrypoint -Parameters $probeParameters
+        [pscustomobject]@{ ExitCode = [int]$probeExitCode } | ConvertTo-Json -Compress
+    }
+} catch {
+    [pscustomobject]@{ ProbeError = [string]$_.Exception.Message } | ConvertTo-Json -Compress
+}
+'@
+        $archiveWrapperProbePath = Join-Path $archiveWrapperProbeRoot 'probe.ps1'
+        [IO.File]::WriteAllText($archiveWrapperProbePath, $archiveWrapperProbeScript, (New-Object Text.UTF8Encoding($false)))
+        $archiveWrapperHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $archiveWrapperResults = @{}
+        foreach ($archiveWrapperMode in @('DotSource', 'Invoke')) {
+            $archiveWrapperOutput = & $archiveWrapperHost -NoLogo -NoProfile -NonInteractive `
+                -ExecutionPolicy Bypass -File $archiveWrapperProbePath `
+                -Mode $archiveWrapperMode -RuntimeRoot $root -ProbeRoot $archiveWrapperProbeRoot
+            $archiveWrapperJson = @($archiveWrapperOutput) |
+                Where-Object { $_ -is [string] -and $_.Trim().StartsWith('{') } |
+                Select-Object -Last 1
+            $archiveWrapperResults[$archiveWrapperMode] = if ([string]::IsNullOrWhiteSpace([string]$archiveWrapperJson)) {
+                [pscustomobject]@{ ProbeError = "проба не повернула JSON (код виходу $LASTEXITCODE)" }
+            } else {
+                [string]$archiveWrapperJson | ConvertFrom-Json
+            }
+        }
+        $archiveWrapperDotSource = $archiveWrapperResults['DotSource']
+        $archiveWrapperInvoke = $archiveWrapperResults['Invoke']
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveWrapperDotSource.PSObject.Properties['ProbeError'] -and
+                $archiveWrapperDotSource.DotSourceReturned -eq $true -and
+                $archiveWrapperDotSource.FunctionDefined -eq $true -and
+                $archiveWrapperDotSource.BodyStateAbsent -eq $true
+            ) `
+            -Name "Console/ArchiveRuntimeDotSourceDefinesWithoutRunning" `
+            -Failure "dot-source Archive.Runtime.ps1 має лише визначити Invoke-BRAVOArchive, не виконуючи тіло; проба: $($archiveWrapperDotSource | ConvertTo-Json -Compress)"
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveWrapperInvoke.PSObject.Properties['ProbeError'] -and
+                $archiveWrapperInvoke.ExitCode -eq 1
+            ) `
+            -Name "Console/ArchiveRuntimeDirectInvocationRunsBody" `
+            -Failure "Invoke-BRAVOArchiveEntrypoint з явно вказаним відсутнім -ConfigPath має виконати тіло через guard і повернути exit 1 з catch завантаження конфігурації; проба: $($archiveWrapperInvoke | ConvertTo-Json -Compress)"
+    } finally {
+        if (Test-Path -LiteralPath $archiveWrapperProbeRoot -PathType Container) {
+            Remove-Item -LiteralPath $archiveWrapperProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 
     # Кожен entrypoint має прокидати -NoPause у свій runtime, інакше сам
     # параметр command-line нічого не змінює.
@@ -16916,6 +17181,325 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Condition (-not $restoreCleanupRemainingThrew) `
         -Name "Maintenance/RestoreCleanupSingleRemainingFileDoesNotThrow" `
         -Failure ("коли після видалення лишається рівно один файл із префіксом, `$remainingFiles.Count не повинен кидати виняток під Set-StrictMode; кинуто: {0}" -f $restoreCleanupRemainingErrorMessage)
+
+    # ================================================================
+    # T004/F002: Verify-Backup (before/after-архіви реставрації моделі)
+    # мусить РЕАЛЬНО перевіряти архів, а не лише писати .sha512 і
+    # повертати $true для будь-якого наявного файлу. Реальні функції
+    # (AST-екстракція): Verify-Backup, Get-SHA512HashCompatible,
+    # Test-BRAVOMaintenanceSevenZipArchiveIntegrity (політика прапорців
+    # Maintenance) і канонічний BRAVO.ArchiveHelpers\Test-SevenZipArchiveIntegrity
+    # (рішення успіх/збій). Застабовано лише шар запуску процесу 7-Zip
+    # (Invoke-BRAVOSevenZipIntegrityTest) детермінованим fake-7z, що
+    # повертає той самий об'єкт результату: успіх лише для «цілого»
+    # вмісту архіву з правильним паролем; для відсутнього інструмента —
+    # ExitCode $null, як справжній Invoke-BRAVOSevenZipIntegrityTestCore;
+    # «зламаний» інструмент — ненульовий код. Справжній 7za.exe тут не
+    # предмет тесту (його покривають B2/* і RestoreSynthetic/*).
+    # ================================================================
+    $verifyBackupSourceText = (
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+            [Text.Encoding]::UTF8
+        ) + "`n" +
+        [IO.File]::ReadAllText(
+            (Join-Path $root "modules\BRAVO.ArchiveHelpers\BRAVO.ArchiveHelpers.psm1"),
+            [Text.Encoding]::UTF8
+        )
+    )
+    $verifyBackupModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText $verifyBackupSourceText `
+        -FunctionNames @(
+            'Verify-Backup', 'Get-SHA512HashCompatible',
+            'Test-BRAVOMaintenanceSevenZipArchiveIntegrity',
+            'Test-SevenZipArchiveIntegrity', 'Write-BRAVOArchiveHelperLog',
+            'Register-BRAVOLegacyBomPasswordFallback'
+        )
+    $verifyBackupStubScriptText = {
+        function Write-Log {
+            param($Message, [string]$Level = 'INFO')
+            [void]$script:verifyBackupLogLines.Add("[$Level] $Message")
+        }
+        function Send-SlackAlert { param($Message, [switch]$IsCritical) }
+        function Get-BRAVOFileHash {
+            param([string]$Path, [string]$Algorithm)
+            if ($script:verifyBackupHashThrows) { throw 'fake SHA512 failure' }
+            return (Get-FileHash -LiteralPath $Path -Algorithm $Algorithm)
+        }
+        function Invoke-BRAVOSevenZipIntegrityTest {
+            # Stub процесного шару: ім'я -Password задане сигнатурою
+            # справжньої функції (викликається з -Password).
+            [Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+                'PSAvoidUsingPlainTextForPassword', 'Password',
+                Justification = 'Self-test stub: фікстурне значення, сигнатура справжнього Invoke-BRAVOSevenZipIntegrityTest.')]
+            param($SevenZipPath, $ArchivePath, $Password, $TimeoutSeconds)
+            $null = $TimeoutSeconds
+            $script:verifyBackupSevenZipCalls++
+            if (-not (Test-Path -LiteralPath $SevenZipPath -PathType Leaf)) {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = $null
+                    Description = "7-Zip не знайдено: $SevenZipPath"
+                    StandardOutput = ''; StandardError = ''
+                }
+            }
+            if ([IO.File]::ReadAllText($SevenZipPath) -ne 'FAKE-7Z-OK') {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 8
+                    Description = 'Not enough memory for operation'
+                    StandardOutput = ''; StandardError = 'ERROR: fake tool failure'
+                }
+            }
+            $verifyBackupArchiveText = [IO.File]::ReadAllText($ArchivePath)
+            $verifyBackupLegacyBom = ($verifyBackupArchiveText -ceq 'FAKE-7Z-LEGACY-BOM-ARCHIVE')
+            if ($verifyBackupArchiveText -ne 'FAKE-7Z-INTACT-ARCHIVE' -and -not $verifyBackupLegacyBom) {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'
+                    StandardOutput = ''; StandardError = 'ERROR: Data Error'
+                }
+            }
+            if ($Password -cne $script:verifyBackupExpectedPassword) {
+                return New-Object PSObject -Property @{
+                    Success = $false; ExitCode = 2
+                    Description = 'Fatal error'
+                    StandardOutput = ''; StandardError = 'ERROR: Wrong password'
+                }
+            }
+            $stubResult = New-Object PSObject -Property @{
+                Success = $true; ExitCode = 0; Description = 'No error'
+                StandardOutput = 'Everything is Ok'; StandardError = ''
+            }
+            if ($verifyBackupLegacyBom) {
+                # T006: успіх лише через legacy BOM-у-паролі fallback.
+                $stubResult | Add-Member -NotePropertyName LegacyBomPasswordFallbackUsed -NotePropertyValue $true
+                $stubResult | Add-Member -NotePropertyName Warning -NotePropertyValue 'fixture: legacy BOM fallback'
+            }
+            return $stubResult
+        }
+    }.ToString()
+    # Фікстурний пароль складається з частин (див. коментар у
+    # RestoreSynthetic щодо entropy-евристики gitleaks); живе лише в
+    # межах прогону і нікуди не пишеться.
+    $verifyBackupPassword = @('verify', 'backup', 'selftest', 'fixture') -join '-'
+    $verifyBackupRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ("BRAVO_VERIFY_BACKUP_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    [void][IO.Directory]::CreateDirectory($verifyBackupRoot)
+    $verifyBackupInvoke = {
+        # Без [string]-обмеження: `$null означає «файл не створювати».
+        param([string]$Scenario, $ArchiveContent, $SevenZipContent, [string]$ArchiveSecret, [string]$Mode = '')
+        $scenarioDir = Join-Path $verifyBackupRoot $Scenario
+        [void][IO.Directory]::CreateDirectory($scenarioDir)
+        $archiveName = "MODEL_before_20260101_0100.mdz"
+        $archivePath = Join-Path $scenarioDir $archiveName
+        if ($null -ne $ArchiveContent) {
+            [IO.File]::WriteAllText($archivePath, $ArchiveContent)
+        }
+        $sevenZipPath = Join-Path $scenarioDir '7za.exe'
+        if ($null -ne $SevenZipContent) {
+            [IO.File]::WriteAllText($sevenZipPath, $SevenZipContent)
+        }
+        $sidecarPath = "$archivePath.sha512"
+        if ($Mode -eq 'stalesidecar') {
+            [IO.File]::WriteAllText($sidecarPath, 'STALE-SHA512-FROM-PREVIOUS-RUN')
+        } elseif ($Mode -eq 'sidecarblocked') {
+            # Каталог на місці .sha512: запис sidecar гарантовано падає.
+            [void][IO.Directory]::CreateDirectory($sidecarPath)
+        }
+        $outcome = & $verifyBackupModule {
+            param($SevenZip, $Archive, $ArchiveSecretText, $ExpectedSecretText, $StubScriptText, $HashThrows)
+            Set-StrictMode -Version Latest
+            . ([scriptblock]::Create($StubScriptText))
+            $script:verifyBackupLogLines = New-Object System.Collections.ArrayList
+            $script:verifyBackupSevenZipCalls = 0
+            $script:verifyBackupHashThrows = [bool]$HashThrows
+            # T006: колектор legacy BOM-fallback, який читає справжній
+            # Test-BRAVOMaintenanceSevenZipArchiveIntegrity.
+            $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
+            $script:verifyBackupExpectedPassword = $ExpectedSecretText
+            $script:ArchivePassword = $ArchiveSecretText
+            $script:SevenZipIntegrityTestTimeoutSeconds = 60
+            $script:criticalErrorOccurred = $false
+            $script:restoreIntegrityFailed = $false
+            $script:restoreArchiveFailed = $false
+            $threw = $null
+            $result = $null
+            try {
+                $result = Verify-Backup -SevenZipPath $SevenZip -ArchivePath $Archive
+            } catch {
+                $threw = $_.Exception.Message
+            }
+            [pscustomobject]@{
+                Result = $result
+                Threw = $threw
+                CriticalErrorOccurred = [bool]$script:criticalErrorOccurred
+                RestoreIntegrityFailed = [bool]$script:restoreIntegrityFailed
+                RestoreArchiveFailed = [bool]$script:restoreArchiveFailed
+                SevenZipCalls = [int]$script:verifyBackupSevenZipCalls
+                LegacyBomCollected = @($script:MaintenanceLegacyBomFallbackArchives)
+                LogText = (@($script:verifyBackupLogLines) -join "`n")
+            }
+        } $sevenZipPath $archivePath $ArchiveSecret $verifyBackupPassword $verifyBackupStubScriptText ($Mode -eq 'hashthrows')
+        $hashPath = "$archivePath.sha512"
+        $outcome | Add-Member -NotePropertyName HashExists -NotePropertyValue (Test-Path -LiteralPath $hashPath -PathType Leaf)
+        $outcome | Add-Member -NotePropertyName SidecarIsDirectory -NotePropertyValue (Test-Path -LiteralPath $hashPath -PathType Container)
+        $outcome | Add-Member -NotePropertyName HashText -NotePropertyValue $(
+            if ($outcome.HashExists) { [IO.File]::ReadAllText($hashPath) } else { $null })
+        $outcome | Add-Member -NotePropertyName ArchiveHash -NotePropertyValue $(
+            if (Test-Path -LiteralPath $archivePath -PathType Leaf) {
+                (Get-FileHash -LiteralPath $archivePath -Algorithm SHA512).Hash.ToUpperInvariant()
+            } else { $null })
+        $outcome | Add-Member -NotePropertyName ArchiveName -NotePropertyValue $archiveName
+        return $outcome
+    }
+    try {
+        $verifyBackupValid = & $verifyBackupInvoke 'valid' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupCorrupt = & $verifyBackupInvoke 'corrupt' 'truncated-or-corrupted-bytes' 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupWrongPassword = & $verifyBackupInvoke 'wrongpassword' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' 'not-the-archive-password'
+        $verifyBackupMissingArchive = & $verifyBackupInvoke 'missingarchive' $null 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupToolMissing = & $verifyBackupInvoke 'toolmissing' 'FAKE-7Z-INTACT-ARCHIVE' $null $verifyBackupPassword
+        $verifyBackupToolFailure = & $verifyBackupInvoke 'toolfailure' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-BROKEN' $verifyBackupPassword
+        # 7z t успішний, але SHA512 не пораховано / sidecar не записано;
+        # застарілий sidecar поруч із архівом, що не пройшов 7z t.
+        $verifyBackupLegacyBom = & $verifyBackupInvoke 'legacybom' 'FAKE-7Z-LEGACY-BOM-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword
+        $verifyBackupHashThrows = & $verifyBackupInvoke 'hashthrows' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword 'hashthrows'
+        $verifyBackupSidecarBlocked = & $verifyBackupInvoke 'sidecarblocked' 'FAKE-7Z-INTACT-ARCHIVE' 'FAKE-7Z-OK' $verifyBackupPassword 'sidecarblocked'
+        $verifyBackupStaleSidecar = & $verifyBackupInvoke 'stalesidecar' 'truncated-or-corrupted-bytes' 'FAKE-7Z-OK' $verifyBackupPassword 'stalesidecar'
+    } finally {
+        if (Test-Path -LiteralPath $verifyBackupRoot) {
+            Remove-Item -LiteralPath $verifyBackupRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    # Цілий архів: успіх, як і раніше, + .sha512 у тому самому форматі,
+    # який читає Remove-OldRestoreArchives ("<HASH> *<ім'я архіву>").
+    $verifyBackupValidHashMatch = if ($null -ne $verifyBackupValid.HashText) {
+        [regex]::Match($verifyBackupValid.HashText.Trim(), '^(?<Hash>[A-F0-9]{128}) \*(?<FileName>.+)$')
+    } else { $null }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $verifyBackupValid.Threw -and
+            $verifyBackupValid.Result -eq $true -and
+            $verifyBackupValid.SevenZipCalls -eq 1 -and
+            -not $verifyBackupValid.CriticalErrorOccurred -and
+            -not $verifyBackupValid.RestoreIntegrityFailed -and
+            $verifyBackupValid.HashExists -and
+            $null -ne $verifyBackupValidHashMatch -and $verifyBackupValidHashMatch.Success -and
+            $verifyBackupValidHashMatch.Groups['Hash'].Value -ceq $verifyBackupValid.ArchiveHash -and
+            $verifyBackupValidHashMatch.Groups['FileName'].Value -ceq $verifyBackupValid.ArchiveName
+        ) `
+        -Name "Maintenance/VerifyBackupValidArchivePassesAndWritesSha512" `
+        -Failure ("цілий архів має пройти 7z t рівно один раз, повернути `$true без критичних прапорців і записати '<SHA512> *<ім'я>'; Result=$($verifyBackupValid.Result), 7z calls=$($verifyBackupValid.SevenZipCalls), hash='$($verifyBackupValid.HashText)', threw=$($verifyBackupValid.Threw)")
+
+    # T006 після merge: архів, відкритий лише через legacy BOM-у-паролі
+    # fallback, проходить Verify-Backup ($true, .sha512 записано, критичних
+    # прапорців немає), 7z t виконується РІВНО один раз (перевірка живе
+    # лише всередині Verify-Backup — call sites її не дублюють), а ім'я
+    # архіву реєструється в колекторі прогону один раз і WARNING
+    # пишеться один раз (одне сповіщення на прогін робить entrypoint).
+    $verifyBackupLegacyWarnings = @($verifyBackupLegacyBom.LogText -split "`n" |
+        Where-Object { $_.StartsWith('[WARNING]') -and $_.Contains('Legacy BOM-пароль') })
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $verifyBackupLegacyBom.Threw -and
+            $verifyBackupLegacyBom.Result -eq $true -and
+            $verifyBackupLegacyBom.SevenZipCalls -eq 1 -and
+            -not $verifyBackupLegacyBom.CriticalErrorOccurred -and
+            -not $verifyBackupLegacyBom.RestoreIntegrityFailed -and
+            $verifyBackupLegacyBom.HashExists -and
+            @($verifyBackupLegacyBom.LegacyBomCollected).Count -eq 1 -and
+            $verifyBackupLegacyBom.LegacyBomCollected[0] -ceq $verifyBackupLegacyBom.ArchiveName -and
+            $verifyBackupLegacyWarnings.Count -eq 1
+        ) `
+        -Name "Maintenance/VerifyBackupLegacyBomFallbackWarnsOnceAndPasses" `
+        -Failure ("legacy BOM fallback: Verify-Backup має пройти ($true), 7z t один раз, одне WARNING і одне ім'я в колекторі; Result=$($verifyBackupLegacyBom.Result), 7z calls=$($verifyBackupLegacyBom.SevenZipCalls), warnings=$($verifyBackupLegacyWarnings.Count), collected=$(@($verifyBackupLegacyBom.LegacyBomCollected).Count), threw=$($verifyBackupLegacyBom.Threw)")
+
+    # Негативні сценарії: жоден не може дати «перевірено», жоден не лишає
+    # .sha512 (інакше артефакт виглядав би валідною точкою відновлення).
+    foreach ($verifyBackupNegative in @(
+        @{ Outcome = $verifyBackupCorrupt; Name = 'Maintenance/VerifyBackupCorruptedArchiveFailsClosed'; What = 'пошкоджений архів'; ExpectSevenZip = $true },
+        @{ Outcome = $verifyBackupWrongPassword; Name = 'Maintenance/VerifyBackupWrongPasswordFailsClosed'; What = 'невірний пароль архіву'; ExpectSevenZip = $true },
+        @{ Outcome = $verifyBackupMissingArchive; Name = 'Maintenance/VerifyBackupMissingArchiveFailsClosed'; What = 'відсутній архів'; ExpectSevenZip = $false },
+        @{ Outcome = $verifyBackupToolMissing; Name = 'Maintenance/VerifyBackupMissingSevenZipFailsClosed'; What = 'відсутній 7-Zip'; ExpectSevenZip = $true },
+        @{ Outcome = $verifyBackupToolFailure; Name = 'Maintenance/VerifyBackupSevenZipFailureFailsClosed'; What = 'ненульовий код 7-Zip'; ExpectSevenZip = $true }
+    )) {
+        $negativeOutcome = $verifyBackupNegative.Outcome
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $negativeOutcome.Threw -and
+                $negativeOutcome.Result -eq $false -and
+                $negativeOutcome.CriticalErrorOccurred -and
+                $negativeOutcome.RestoreIntegrityFailed -and
+                -not $negativeOutcome.HashExists -and
+                $negativeOutcome.LogText.Contains('[ERROR]') -and
+                (($negativeOutcome.SevenZipCalls -ge 1) -eq $verifyBackupNegative.ExpectSevenZip)
+            ) `
+            -Name $verifyBackupNegative.Name `
+            -Failure ("$($verifyBackupNegative.What): Verify-Backup має повернути `$false (fail-closed) з ERROR у журналі, criticalErrorOccurred/restoreIntegrityFailed і без .sha512; Result=$($negativeOutcome.Result), critical=$($negativeOutcome.CriticalErrorOccurred), integrity=$($negativeOutcome.RestoreIntegrityFailed), sha512=$($negativeOutcome.HashExists), 7z calls=$($negativeOutcome.SevenZipCalls), threw=$($negativeOutcome.Threw)")
+    }
+
+    # Збій ПІСЛЯ успішного 7z t (SHA512 не пораховано / sidecar не записано):
+    # $false, критичний прапорець (навіть при прямому виклику), таксономія
+    # restoreIntegrityFailed/restoreArchiveFailed лишається за call site,
+    # sidecar-а немає (і напівзаписаний не залишається; каталог на його
+    # місці НЕ видаляється), 7z t виконано рівно один раз.
+    foreach ($verifyBackupPostSevenZip in @(
+        @{ Outcome = $verifyBackupHashThrows; Name = 'Maintenance/VerifyBackupShaCalculationFailureFailsClosed'; ExpectSidecarDir = $false; What = 'збій обчислення SHA512 після успішного 7z t' },
+        @{ Outcome = $verifyBackupSidecarBlocked; Name = 'Maintenance/VerifyBackupSidecarWriteFailureFailsClosed'; ExpectSidecarDir = $true; What = 'збій запису .sha512 після успішного 7z t' }
+    )) {
+        $postOutcome = $verifyBackupPostSevenZip.Outcome
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $postOutcome.Threw -and
+                $postOutcome.Result -eq $false -and
+                $postOutcome.CriticalErrorOccurred -and
+                -not $postOutcome.RestoreIntegrityFailed -and
+                -not $postOutcome.RestoreArchiveFailed -and
+                -not $postOutcome.HashExists -and
+                $postOutcome.SevenZipCalls -eq 1 -and
+                $postOutcome.LogText.Contains('[ERROR]') -and
+                ($postOutcome.SidecarIsDirectory -eq $verifyBackupPostSevenZip.ExpectSidecarDir)
+            ) `
+            -Name $verifyBackupPostSevenZip.Name `
+            -Failure ("$($verifyBackupPostSevenZip.What): Verify-Backup має повернути `$false з ERROR, criticalErrorOccurred, без sidecar-файлу; Result=$($postOutcome.Result), critical=$($postOutcome.CriticalErrorOccurred), integrity=$($postOutcome.RestoreIntegrityFailed), archiveFailed=$($postOutcome.RestoreArchiveFailed), sha512=$($postOutcome.HashExists), dir=$($postOutcome.SidecarIsDirectory), 7z calls=$($postOutcome.SevenZipCalls), threw=$($postOutcome.Threw)")
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $verifyBackupStaleSidecar.Threw -and
+            $verifyBackupStaleSidecar.Result -eq $false -and
+            $verifyBackupStaleSidecar.CriticalErrorOccurred -and
+            $verifyBackupStaleSidecar.RestoreIntegrityFailed -and
+            -not $verifyBackupStaleSidecar.HashExists -and
+            $verifyBackupStaleSidecar.SevenZipCalls -eq 1
+        ) `
+        -Name "Maintenance/VerifyBackupRemovesStaleSidecarOnFailedArchive" `
+        -Failure "застарілий .sha512 поруч із архівом, що не пройшов 7z t, має бути прибраний; Result=$($verifyBackupStaleSidecar.Result), sha512=$($verifyBackupStaleSidecar.HashExists)"
+
+    $verifyBackupAllLogText = @(
+        $verifyBackupValid, $verifyBackupCorrupt, $verifyBackupWrongPassword,
+        $verifyBackupMissingArchive, $verifyBackupToolMissing, $verifyBackupToolFailure,
+        $verifyBackupHashThrows, $verifyBackupSidecarBlocked, $verifyBackupStaleSidecar,
+        $verifyBackupLegacyBom
+    ) | ForEach-Object { $_.LogText }
+    Test-BRAVOCondition `
+        -Condition (-not (($verifyBackupAllLogText -join "`n").Contains($verifyBackupPassword))) `
+        -Name "Maintenance/VerifyBackupDoesNotLogPassword" `
+        -Failure "пароль архіву не повинен потрапляти в журнал Verify-Backup ні на успіху, ні на збої"
+
+    # Додатковий структурний guard: обидва call sites before/after-архіву
+    # проходять саме через повну перевірку (з 7-Zip), а не через голий
+    # запис SHA512.
+    $verifyBackupRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $root "modules\BRAVO.Maintenance\BRAVO.Maintenance.Runtime.ps1"),
+        [Text.Encoding]::UTF8
+    )
+    Test-BRAVOCondition `
+        -Condition (
+            $verifyBackupRuntimeText.Contains('(Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $beforeArchivePath)') -and
+            $verifyBackupRuntimeText.Contains('(Verify-Backup -SevenZipPath $ARC_PATH -ArchivePath $afterArchivePath)') -and
+            -not $verifyBackupRuntimeText.Contains('Verify-Backup -ArchivePath')
+        ) `
+        -Name "Maintenance/BeforeAfterArchivesUseFullVerification" `
+        -Failure "before/after-архіви реставрації мають перевірятися через Verify-Backup -SevenZipPath `$ARC_PATH (7z t + SHA512)"
 
     # ================================================================
     # dev.16: operator-visibility pass — Migration/Cleanup/Archive/
