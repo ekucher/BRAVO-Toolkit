@@ -9319,6 +9319,207 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             }
         }
 
+        # --- Стан завдань: явне UTF-8 читання й атомарний запис (T017) ---
+        # BRAVO_RESTORE_STATE.json і BRAVO_TASK_EXECUTION_STATE.json пишуться
+        # UTF-8 без BOM, а Get-Content у Windows PowerShell 5.1 без -Encoding
+        # читає ANSI: кирилиця в Reason спотворювалась і з кожним
+        # read-modify-write спотворювалась далі. Запис на місці
+        # ([IO.File]::WriteAllText) обрізав файл ДО запису — збій посеред
+        # запису лишав обірваний JSON. Реальні функції через AST-екстракцію +
+        # реальний BRAVO.System; кожен сценарій — у власному тимчасовому
+        # $stateRoot. Політика поведінки на ПОШКОДЖЕНОМУ стані (T018) тут
+        # свідомо лише фіксується як незмінна.
+        $stateIoSystemModule = Import-Module -Name (Join-Path $root 'modules\BRAVO.System\BRAVO.System.psd1') -Force -PassThru -ErrorAction Stop
+        $stateIoArchiveText = [IO.File]::ReadAllText(
+            (Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'),
+            [Text.Encoding]::UTF8
+        )
+        $stateIoMaintenanceModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $maintenanceRestoreWindowText `
+            -FunctionNames @(
+                'Read-BRAVORestoreState',
+                'Get-BRAVORestoreForcedCoveredSlot',
+                'Get-BRAVORestoreLastSuccessfulAt',
+                'Write-BRAVORestoreState',
+                'Get-BRAVOTaskExecutionState',
+                'Write-BRAVOTaskExecutionState'
+            )
+        $stateIoArchiveModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText $stateIoArchiveText `
+            -FunctionNames @('Write-BRAVOBackupExecutionState')
+        $stateIoUtf8NoBom = New-Object Text.UTF8Encoding($false)
+        $stateIoRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_STATE_IO_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void](New-Item -ItemType Directory -Path $stateIoRoot -Force)
+
+            # 1. Перший запис (цілі ще немає) + заміна наявного: UTF-8 без
+            # BOM, байт-у-байт, без залишків .tmp/.bak.
+            $stateIoHelperDir = Join-Path $stateIoRoot 'Helper'
+            $stateIoHelperPath = Join-Path $stateIoHelperDir 'STATE.json'
+            $stateIoFirstText = '{"Reason":"перший запис"}'
+            $stateIoSecondText = '{"Reason":"заміна наявного стану"}'
+            Write-BRAVOStateFileAtomic -Path $stateIoHelperPath -Text $stateIoFirstText
+            $stateIoFirstBytes = [IO.File]::ReadAllBytes($stateIoHelperPath)
+            $stateIoFirstNames = @(Get-ChildItem -LiteralPath $stateIoHelperDir -Force | ForEach-Object { $_.Name })
+            Write-BRAVOStateFileAtomic -Path $stateIoHelperPath -Text $stateIoSecondText
+            $stateIoSecondBytes = [IO.File]::ReadAllBytes($stateIoHelperPath)
+            $stateIoSecondNames = @(Get-ChildItem -LiteralPath $stateIoHelperDir -Force | ForEach-Object { $_.Name })
+            Test-BRAVOCondition `
+                -Condition (
+                    [Convert]::ToBase64String($stateIoFirstBytes) -eq [Convert]::ToBase64String($stateIoUtf8NoBom.GetBytes($stateIoFirstText)) -and
+                    [Convert]::ToBase64String($stateIoSecondBytes) -eq [Convert]::ToBase64String($stateIoUtf8NoBom.GetBytes($stateIoSecondText)) -and
+                    $stateIoFirstNames.Count -eq 1 -and $stateIoFirstNames[0] -eq 'STATE.json' -and
+                    $stateIoSecondNames.Count -eq 1 -and $stateIoSecondNames[0] -eq 'STATE.json'
+                ) `
+                -Name "StateIO/AtomicWriteCreatesAndReplacesUtf8NoBomWithoutLeftovers" `
+                -Failure "Write-BRAVOStateFileAtomic має створити відсутній файл і замінити наявний точними UTF-8 байтами без BOM, не лишивши .tmp/.bak; файли після першого запису: $($stateIoFirstNames -join ', '); після другого: $($stateIoSecondNames -join ', ')"
+
+            # 2. Збій посеред запису тимчасового файлу (обірвані байти +
+            # виняток): попередній файл лишається байт-у-байт, тимчасовий
+            # прибрано, виняток доходить до викликача.
+            $stateIoFailureThrew = $false
+            try {
+                & $stateIoSystemModule {
+                    param($path, $text)
+                    function Write-BRAVOStateTemporaryText {
+                        param([string]$Path, [string]$Text)
+                        [IO.File]::WriteAllText($Path, $Text.Substring(0, 5), (New-Object Text.UTF8Encoding($false)))
+                        throw 'SELFTEST: імітований збій посеред запису тимчасового файлу'
+                    }
+                    Write-BRAVOStateFileAtomic -Path $path -Text $text
+                } $stateIoHelperPath '{"Reason":"цей запис має зірватися"}'
+            } catch {
+                $stateIoFailureThrew = ([string]$_.Exception.Message).Contains('SELFTEST: імітований збій')
+            }
+            $stateIoAfterFailureBytes = [IO.File]::ReadAllBytes($stateIoHelperPath)
+            $stateIoAfterFailureNames = @(Get-ChildItem -LiteralPath $stateIoHelperDir -Force | ForEach-Object { $_.Name })
+            Test-BRAVOCondition `
+                -Condition (
+                    $stateIoFailureThrew -and
+                    [Convert]::ToBase64String($stateIoAfterFailureBytes) -eq [Convert]::ToBase64String($stateIoSecondBytes) -and
+                    $stateIoAfterFailureNames.Count -eq 1 -and $stateIoAfterFailureNames[0] -eq 'STATE.json'
+                ) `
+                -Name "StateIO/AtomicWriteFailureKeepsPreviousFileAndNoTemp" `
+                -Failure "збій посеред запису має пробросити виняток, лишити попередній файл незмінним і не лишити тимчасових файлів; виняток=$stateIoFailureThrew файли: $($stateIoAfterFailureNames -join ', ')"
+
+            # 3. Кирилиця в стані реставрації переживає запис+читання. Default
+            # кодування Get-Content примусово не-UTF-8 (як ANSI у Windows
+            # PowerShell 5.1) — щоб перевірка була детермінованою на будь-якому
+            # хості: пройти її може лише ЯВНЕ -Encoding UTF8 у читачі.
+            $stateIoCyrillicReason = 'Вікно реставрації закривається — пауза'
+            $stateIoRoundTrip = & $stateIoMaintenanceModule {
+                param($stateDir, $reason)
+                $script:stateRoot = $stateDir
+                $PSDefaultParameterValues = @{ 'Get-Content:Encoding' = 'Ascii' }
+                function Write-Log { param([string]$Message, [string]$Level) }
+                Write-BRAVORestoreState -ScheduledOccurrence ([datetime]'2026-08-23 03:00:00') -Status 'Pending' -Reason $reason
+                # Другий read-modify-write: спотворення не має накопичуватись.
+                Write-BRAVORestoreState -ScheduledOccurrence ([datetime]'2026-08-23 03:00:00') -Status 'Pending' -Reason ([string](Read-BRAVORestoreState).Reason)
+                Read-BRAVORestoreState
+            } (Join-Path $stateIoRoot 'RoundTrip') $stateIoCyrillicReason
+            Test-BRAVOCondition `
+                -Condition ($null -ne $stateIoRoundTrip -and [string]$stateIoRoundTrip.Reason -ceq $stateIoCyrillicReason) `
+                -Name "StateIO/RestoreStateCyrillicRoundTripUtf8" `
+                -Failure "Read-BRAVORestoreState має читати стан явно як UTF-8: кирилиця в Reason після запису й повторного read-modify-write має лишитись незмінною; отримано: '$(if ($null -ne $stateIoRoundTrip) { $stateIoRoundTrip.Reason })'"
+
+            # 4. Запис стану НЕ перезаписує наявний файл на місці: жорстке
+            # посилання на попередній файл після запису має бачити СТАРИЙ
+            # вміст (нові байти підміняють запис каталогу атомарно). Запис на
+            # місці ([IO.File]::WriteAllText по цільовому шляху) обрізає той
+            # самий файл — саме це вікно давало обірваний JSON при збої.
+            $stateIoInPlaceFailures = New-Object System.Collections.ArrayList
+            $stateIoWriters = @(
+                @{ Label = 'Write-BRAVORestoreState'; File = 'BRAVO_RESTORE_STATE.json'; Module = $stateIoMaintenanceModule; Invoke = "Write-BRAVORestoreState -ScheduledOccurrence ([datetime]'2026-08-23 03:00:00') -Status 'Succeeded' -Reason 'нова'" }
+                @{ Label = 'Write-BRAVOTaskExecutionState'; File = 'BRAVO_TASK_EXECUTION_STATE.json'; Module = $stateIoMaintenanceModule; Invoke = "Write-BRAVOTaskExecutionState -TaskName 'Maintenance'" }
+                @{ Label = 'Write-BRAVOBackupExecutionState'; File = 'BRAVO_TASK_EXECUTION_STATE.json'; Module = $stateIoArchiveModule; Invoke = 'Write-BRAVOBackupExecutionState' }
+            )
+            foreach ($stateIoWriter in $stateIoWriters) {
+                $writerDir = Join-Path $stateIoRoot ('InPlace_' + $stateIoWriter.Label)
+                [void](New-Item -ItemType Directory -Path $writerDir -Force)
+                $writerTarget = Join-Path $writerDir $stateIoWriter.File
+                $writerOldText = '{"Maintenance":"2026-01-01T00:00:00","Backup":"2026-01-01T00:00:00","Reason":"попередній"}'
+                [IO.File]::WriteAllText($writerTarget, $writerOldText, $stateIoUtf8NoBom)
+                $writerLink = Join-Path $writerDir 'previous-state.link'
+                try {
+                    [void](New-Item -ItemType HardLink -Path $writerLink -Value $writerTarget -ErrorAction Stop)
+                } catch {
+                    [void]$stateIoInPlaceFailures.Add("$($stateIoWriter.Label): не вдалося створити жорстке посилання: $($_.Exception.Message)")
+                    continue
+                }
+                try {
+                    & $stateIoWriter.Module {
+                        param($stateDir, $invoke)
+                        $script:stateRoot = $stateDir
+                        function Write-Log { param([string]$Message, [string]$Level) }
+                        function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+                        # Рядок, а не scriptblock: так команда зв'язується з
+                        # session state модуля, де живуть витягнуті функції.
+                        . ([scriptblock]::Create($invoke))
+                    } $writerDir $stateIoWriter.Invoke
+                } catch {
+                    [void]$stateIoInPlaceFailures.Add("$($stateIoWriter.Label): запис кинув виняток: $($_.Exception.Message)")
+                    continue
+                }
+                $linkText = [IO.File]::ReadAllText($writerLink, [Text.Encoding]::UTF8)
+                $targetText = [IO.File]::ReadAllText($writerTarget, [Text.Encoding]::UTF8)
+                $writerNames = @(Get-ChildItem -LiteralPath $writerDir -Force | ForEach-Object { $_.Name } | Sort-Object)
+                if ($linkText -cne $writerOldText) {
+                    [void]$stateIoInPlaceFailures.Add("$($stateIoWriter.Label): наявний файл перезаписано на місці")
+                }
+                if ($targetText -ceq $writerOldText) {
+                    [void]$stateIoInPlaceFailures.Add("$($stateIoWriter.Label): новий стан не записано")
+                }
+                $writerExpectedNames = @(@($stateIoWriter.File, 'previous-state.link') | Sort-Object) -join '|'
+                if (($writerNames -join '|') -ne $writerExpectedNames) {
+                    [void]$stateIoInPlaceFailures.Add("$($stateIoWriter.Label): залишкові файли: $($writerNames -join ', ')")
+                }
+            }
+            Test-BRAVOCondition `
+                -Condition ($stateIoInPlaceFailures.Count -eq 0) `
+                -Name "StateIO/StateWritersNeverRewriteExistingFileInPlace" `
+                -Failure "записувачі стану завдань мають підміняти файл атомарно (тимчасовий файл + Replace), а не перезаписувати на місці: $($stateIoInPlaceFailures -join ' | ')"
+
+            # 5. Поведінка на ПОШКОДЖЕНОМУ стані (T018, рішення власника) —
+            # незмінна: читачі повертають «стану немає» ($null / порожню
+            # таблицю), а записувач Archive перезаписує файл лише своїм полем.
+            $stateIoCorruptDir = Join-Path $stateIoRoot 'Corrupt'
+            [void](New-Item -ItemType Directory -Path $stateIoCorruptDir -Force)
+            [IO.File]::WriteAllText((Join-Path $stateIoCorruptDir 'BRAVO_RESTORE_STATE.json'), '{"Status":"Succ', $stateIoUtf8NoBom)
+            [IO.File]::WriteAllText((Join-Path $stateIoCorruptDir 'BRAVO_TASK_EXECUTION_STATE.json'), '{"Maintenance":', $stateIoUtf8NoBom)
+            $stateIoCorruptRead = & $stateIoMaintenanceModule {
+                param($stateDir)
+                $script:stateRoot = $stateDir
+                $script:stateIoCorruptWarnings = 0
+                function Write-Log { param([string]$Message, [string]$Level) if ($Level -eq 'WARNING') { $script:stateIoCorruptWarnings++ } }
+                [pscustomobject]@{
+                    Restore = Read-BRAVORestoreState
+                    Task = Get-BRAVOTaskExecutionState
+                    Warnings = $script:stateIoCorruptWarnings
+                }
+            } $stateIoCorruptDir
+            & $stateIoArchiveModule {
+                param($stateDir)
+                $script:stateRoot = $stateDir
+                function Write-BRAVOLog { param([string]$Component, [string]$Message, [string]$Level) }
+                Write-BRAVOBackupExecutionState
+            } $stateIoCorruptDir
+            $stateIoCorruptAfterArchive = [IO.File]::ReadAllText((Join-Path $stateIoCorruptDir 'BRAVO_TASK_EXECUTION_STATE.json'), [Text.Encoding]::UTF8) | ConvertFrom-Json
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $stateIoCorruptRead.Restore -and
+                    $stateIoCorruptRead.Warnings -eq 1 -and
+                    $stateIoCorruptRead.Task -is [hashtable] -and $stateIoCorruptRead.Task.Count -eq 0 -and
+                    -not [string]::IsNullOrWhiteSpace([string]$stateIoCorruptAfterArchive.Backup) -and
+                    $null -eq $stateIoCorruptAfterArchive.PSObject.Properties['Maintenance']
+                ) `
+                -Name "StateIO/CorruptStateFallbackUnchanged" `
+                -Failure "поведінка на пошкодженому стані має лишатися попередньою (restore -> `$null + WARNING, task -> @{}, Archive перезаписує лише Backup); факт: Restore=$($stateIoCorruptRead.Restore) Warnings=$($stateIoCorruptRead.Warnings) TaskCount=$($stateIoCorruptRead.Task.Count)"
+        } finally {
+            if (Test-Path -LiteralPath $stateIoRoot) {
+                Remove-Item -LiteralPath $stateIoRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+
         # --- Семантика квоти (регресія інциденту 2026-08-26: -ForceRestore
         # увечері + звичайний прогін того ж вечора = ПОДВІЙНА реставрація):
         # покритий слот закриває СОБОЮ і всі попередні (<=), включно з

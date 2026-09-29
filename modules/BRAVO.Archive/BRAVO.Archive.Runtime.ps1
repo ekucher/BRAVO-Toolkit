@@ -25,7 +25,7 @@ param(
 $bravoScriptDirectory = $RuntimeRoot
 
 # Спільні PowerShell-модулі runtime.
-foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
+foreach ($moduleName in @('BRAVO.Compatibility', 'BRAVO.Credentials', 'BRAVO.ArchiveRuntime', 'BRAVO.BazaSync', 'BRAVO.Logging', 'BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Notifications', 'BRAVO.System', 'BRAVO.Status', 'BRAVO.DiskSpace', 'BRAVO.Operations')) {
     $modulePath = Join-Path $bravoScriptDirectory "modules\$moduleName\$moduleName.psd1"
     if (-not (Test-Path -LiteralPath $modulePath -PathType Leaf)) {
         throw "Не знайдено спільний PowerShell-модуль: $modulePath"
@@ -6111,7 +6111,7 @@ function Write-BRAVOBackupExecutionState {
     $state = @{}
     if (Test-Path -LiteralPath $path -PathType Leaf) {
         try {
-            $previous = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+            $previous = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
             $state.Maintenance = [string]$previous.Maintenance
             $state.Backup = [string]$previous.Backup
         } catch {
@@ -6126,7 +6126,7 @@ function Write-BRAVOBackupExecutionState {
         }
     }
     $state.Backup = ([datetime]::Now).ToString('o')
-    [System.IO.File]::WriteAllText($path, ($state | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
+    Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json)
 }
 
 function Main {
