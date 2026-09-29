@@ -8026,7 +8026,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
             $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
             $maintenanceScriptText.Contains("BRAVO.Notifications") -and
-            $notificationScriptText.Contains('$availableLength -= [Environment]::NewLine.Length')
+            $notificationScriptText.Contains('$newlineLength = if ($currentChunk.Length -gt 0) {')
         ) `
         -Name "Notifications/MaintenanceInactiveServices" `
         -Failure "maintenance має негайно сповіщати про початково зупинені служби"
