@@ -432,6 +432,10 @@ try {
         }
     }
 
+    # T006: архіви, відкриті лише через legacy BOM-у-паролі fallback
+    # (канонічний колектор BRAVO.ArchiveHelpers) -> один WARN-результат на
+    # прогін після циклу: код 10 і перелік у ЄДИНОМУ сповіщенні drill.
+    $legacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
     $restoreDrillStepCurrent = 0
     foreach ($archiveDefinition in $componentsToCheck) {
         $restoreDrillStepCurrent++
@@ -464,7 +468,8 @@ try {
                 -SevenZipPath $arcPath `
                 -ArchivePath $latestArchive.FullName `
                 -Password $archivePassword `
-                -TimeoutSeconds $TimeoutSeconds
+                -TimeoutSeconds $TimeoutSeconds `
+                -LegacyBomFallbackCollector $legacyBomFallbackArchives
             if (-not $integrityOk) {
                 $integrityDurationSeconds = ((Get-Date) - $startedAt).TotalSeconds
                 Add-RestoreDrillResult FAIL $componentName $latestArchive.Name (
@@ -500,6 +505,10 @@ try {
                 }
                 continue
             }
+            [void](Register-BRAVOLegacyBomPasswordFallback `
+                -Result $extractionResult `
+                -ArchivePath $latestArchive.FullName `
+                -Collector $legacyBomFallbackArchives)
 
             $extractedFiles = @(Get-ChildItem -LiteralPath $workingDirectory -Recurse -File -ErrorAction SilentlyContinue)
             $extractedDirectories = @(Get-ChildItem -LiteralPath $workingDirectory -Recurse -Directory -ErrorAction SilentlyContinue)
@@ -549,6 +558,11 @@ try {
                 Remove-Item -LiteralPath $workingDirectory -Recurse -Force -ErrorAction SilentlyContinue
             }
         }
+    }
+
+    if ($legacyBomFallbackArchives.Count -gt 0) {
+        Add-RestoreDrillResult WARN 'Legacy BOM-пароль' $null $null 0 0 (
+            @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames @($legacyBomFallbackArchives)) -join ' ')
     }
 
     # Стан верифікації (P1.1) пишеться ЗАВЖДИ — і scheduled, і ручний
