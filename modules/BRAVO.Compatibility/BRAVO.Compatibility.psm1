@@ -1283,6 +1283,92 @@ function ConvertFrom-BRAVOJson {
     }
 }
 
+function Invoke-BRAVOInputPreambleFreeStart {
+    # Приватне ядро Start-BRAVOProcessWithBomFreeInput (не експортується).
+    # Доступ до кодування консолі та сам запуск передаються scriptblock-ами,
+    # щоб кожну гілку рішення (запуск як є / тимчасова заміна кодування /
+    # fail-closed) і відновлення кодування у finally можна було
+    # детерміновано перевірити самотестом на будь-якому хості.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)][scriptblock]$StartAction,
+        [Parameter(Mandatory = $true)][scriptblock]$GetInputEncoding,
+        [Parameter(Mandatory = $true)][scriptblock]$SetInputEncoding
+    )
+
+    $originalEncoding = & $GetInputEncoding
+    if ($null -eq $originalEncoding) {
+        throw "Запуск процесу з redirected stdin заблоковано: не вдалося визначити кодування вводу консолі."
+    }
+    if (@($originalEncoding.GetPreamble()).Count -eq 0) {
+        # Кодування без преамбули (cp866/cp1251/UTF-8 без BOM): StreamWriter
+        # stdin нічого не допише до першого запису — запуск без змін.
+        $null = & $StartAction
+        return
+    }
+
+    $encodingReplaced = $false
+    try {
+        $replaceError = $null
+        try {
+            & $SetInputEncoding (New-Object System.Text.UTF8Encoding($false))
+            $encodingReplaced = $true
+        } catch {
+            $replaceError = $_.Exception.Message
+        }
+        if (-not $encodingReplaced) {
+            # Замінити не вдалося (наприклад, процес без консолі). Безпечно
+            # лише якщо фактичне кодування вводу вже без преамбули; інакше
+            # дочірній процес отримав би BOM перед секретом — fail-closed.
+            $currentEncoding = & $GetInputEncoding
+            if ($null -eq $currentEncoding -or @($currentEncoding.GetPreamble()).Count -gt 0) {
+                throw ("Запуск процесу з redirected stdin заблоковано (fail-closed): кодування вводу консолі " +
+                    "'$($originalEncoding.WebName)' має преамбулу (BOM), а тимчасово замінити його не вдалося: " +
+                    "$replaceError. Дочірній процес отримав би BOM перед даними stdin (зокрема паролем).")
+            }
+        }
+        $null = & $StartAction
+    } finally {
+        if ($encodingReplaced) {
+            & $SetInputEncoding $originalEncoding
+        }
+    }
+}
+
+function Start-BRAVOProcessWithBomFreeInput {
+    # Канонічний запуск процесу, stdin якого перенаправлено: дочірній
+    # процес отримує в stdin РІВНО ті байти, які потім запише викликач,
+    # без BOM. Причина (.NET Framework 4.x, виведено з поведінки Process і
+    # StreamWriter та підтверджено Windows CI — 38 байт замість 35):
+    # Process.Start створює StandardInput як
+    # StreamWriter(pipe, Console.InputEncoding) і вмикає AutoFlush; сеттер
+    # AutoFlush викликає Flush, який ОДРАЗУ пише преамбулу кодування в
+    # pipe — ще до будь-якого запису викликача. Під UTF-8-консоллю
+    # (chcp 65001) Console.InputEncoding має преамбулу, тож BOM уже в pipe,
+    # і запис через BaseStream (Write-BRAVOProcessInputText) його не
+    # прибирає. ProcessStartInfo.StandardInputEncoding у .NET Framework 4.x
+    # немає (з'явився лише в .NET Core), тому на час Start() кодування
+    # вводу консолі тимчасово замінюється на UTF-8 без BOM (та сама кодова
+    # сторінка 65001) і відновлюється у finally. Якщо замінити не вдалося,
+    # а преамбула лишається, запуск відмовляє (fail-closed).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Diagnostics.Process]$Process
+    )
+
+    if (-not $Process.StartInfo.RedirectStandardInput) {
+        # StandardInput не створюється — кодування stdin не має значення.
+        [void]$Process.Start()
+        return
+    }
+
+    Invoke-BRAVOInputPreambleFreeStart `
+        -StartAction { [void]$Process.Start() } `
+        -GetInputEncoding { [Console]::InputEncoding } `
+        -SetInputEncoding { param($Encoding) [Console]::InputEncoding = $Encoding }
+}
+
 function Start-BRAVOProcessOutputCapture {
     [CmdletBinding()]
     param(
@@ -1313,7 +1399,7 @@ function Start-BRAVOProcessOutputCapture {
 
     if ($useModernApi) {
         try {
-            $Process.Start() | Out-Null
+            Start-BRAVOProcessWithBomFreeInput -Process $Process
         } catch {
             if ($winSCPProcessLock) { $winSCPProcessLock.Dispose() }
             throw
@@ -1360,7 +1446,7 @@ function Start-BRAVOProcessOutputCapture {
         }
 
     try {
-        $Process.Start() | Out-Null
+        Start-BRAVOProcessWithBomFreeInput -Process $Process
         $Process.BeginOutputReadLine()
         $Process.BeginErrorReadLine()
     } catch {
@@ -1655,13 +1741,17 @@ function ConvertTo-BRAVOWindowsCommandLineArgument {
 
 function Write-BRAVOProcessInputText {
     # Детермінований запис у stdin дочірнього процесу: UTF-8 БЕЗ BOM через
-    # BaseStream. У .NET Framework Process.StandardInput завжди використовує
-    # Console.InputEncoding, і під UTF-8-консоллю (chcp 65001) StreamWriter
-    # додає BOM перед ПЕРШИМ записом — 7-Zip тоді отримує "BOM+пароль":
+    # BaseStream, незалежно від кодування StreamWriter-а StandardInput
+    # (Console.InputEncoding у .NET Framework). Під UTF-8-консоллю
+    # (chcp 65001) BOM перед паролем означав для 7-Zip "BOM+пароль":
     # створення архіву «успішне», але зашифроване спотвореним паролем, а
     # додавання в існуючий архів падає з "Wrong password" (виявлено
-    # характеризацією Trace-MDZ під UTF-8-хостом). Кожен рядок завершується
-    # CRLF; потік закривається (EOF) — як і попередній WriteLine+Close.
+    # характеризацією Trace-MDZ під UTF-8-хостом). Цей хелпер гарантує
+    # лише власні байти: преамбулу, яку .NET Framework пише в pipe ще в
+    # Process.Start (AutoFlush), прибирає лише запуск через канонічний
+    # Start-BRAVOProcessWithBomFreeInput (його викликає
+    # Start-BRAVOProcessOutputCapture). Кожен рядок завершується CRLF;
+    # потік закривається (EOF) — як і попередній WriteLine+Close.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
