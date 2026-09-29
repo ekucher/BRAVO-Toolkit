@@ -7233,8 +7233,32 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
                     $scopeName -ne 'Start-BRAVOProcessWithBomFreeInput') {
                     $violations.Add("$location — інстансний .Start() поза Start-BRAVOProcessWithBomFreeInput")
                 }
+                # Область = сама функція БЕЗ тіл вкладених функцій: після T010
+                # тіло runtime є функцією-обгорткою, у якій вкладені функції
+                # (напр. запуск процесу зі stdin) мають власну область; їхній
+                # RedirectStandardInput не робить статичний ::Start() обгортки
+                # (напр. UAC-перезапуск з -Verb RunAs) порушенням.
+                $scopeOwnText = $scopeNode.Extent.Text
+                if ($scopeNode -is [Management.Automation.Language.FunctionDefinitionAst]) {
+                    $nestedScopes = @($scopeNode.Body.FindAll({
+                        param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                    }, $true) | Sort-Object { $_.Extent.StartOffset })
+                    $maskedUntilOffset = -1
+                    $ownTextBuilder = New-Object System.Text.StringBuilder
+                    $ownTextCursor = 0
+                    foreach ($nestedScope in $nestedScopes) {
+                        if ($nestedScope.Extent.StartOffset -lt $maskedUntilOffset) { continue }
+                        $nestedStart = $nestedScope.Extent.StartOffset - $scopeNode.Extent.StartOffset
+                        $nestedLength = $nestedScope.Extent.EndOffset - $nestedScope.Extent.StartOffset
+                        [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor, $nestedStart - $ownTextCursor))
+                        $ownTextCursor = $nestedStart + $nestedLength
+                        $maskedUntilOffset = $nestedScope.Extent.EndOffset
+                    }
+                    [void]$ownTextBuilder.Append($scopeOwnText.Substring($ownTextCursor))
+                    $scopeOwnText = $ownTextBuilder.ToString()
+                }
                 if ($call.Static -and $memberName -eq 'Start' -and
-                    $scopeNode.Extent.Text.Contains('RedirectStandardInput')) {
+                    $scopeOwnText.Contains('RedirectStandardInput')) {
                     $violations.Add("$location — статичний ::Start() в області з RedirectStandardInput")
                 }
                 if ($memberName -match '^Write(Line)?$' -and
@@ -7299,11 +7323,54 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             Remove-Item -LiteralPath $bomFreeGuardProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
         }
     }
+    # Область функції не включає вкладені функції (T010): статичний ::Start()
+    # у функції-обгортці без власного RedirectStandardInput дозволений, навіть
+    # якщо RedirectStandardInput є у ВКЛАДЕНІЙ функції; але статичний ::Start()
+    # у самій вкладеній функції з RedirectStandardInput усе одно порушення.
+    $bomFreeNestedProbeRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_BOMFREE_NESTED_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    $bomFreeNestedAllowedViolations = @()
+    $bomFreeNestedForbiddenViolations = @()
+    try {
+        [void][IO.Directory]::CreateDirectory($bomFreeNestedProbeRoot)
+        $bomFreeNestedAllowedFile = Join-Path $bomFreeNestedProbeRoot 'wrapper.ps1'
+        [IO.File]::WriteAllText($bomFreeNestedAllowedFile, (
+            "function Invoke-Wrapper {`r`n" +
+            "    [void][System.Diagnostics.Process]::Start('elevated.exe')`r`n" +
+            "    function Get-Nested {`r`n" +
+            "        `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "        `$psi.RedirectStandardInput = `$true`r`n" +
+            "        return `$psi`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeNestedForbiddenFile = Join-Path $bomFreeNestedProbeRoot 'nested.ps1'
+        [IO.File]::WriteAllText($bomFreeNestedForbiddenFile, (
+            "function Invoke-Wrapper {`r`n" +
+            "    function Start-Nested {`r`n" +
+            "        `$psi = New-Object System.Diagnostics.ProcessStartInfo`r`n" +
+            "        `$psi.RedirectStandardInput = `$true`r`n" +
+            "        [void][System.Diagnostics.Process]::Start(`$psi)`r`n" +
+            "    }`r`n" +
+            "}`r`n"
+        ), (New-Object System.Text.UTF8Encoding($true)))
+        $bomFreeNestedAllowedViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeNestedProbeRoot -Files @(Get-Item -LiteralPath $bomFreeNestedAllowedFile))
+        $bomFreeNestedForbiddenViolations = @(Get-BRAVOStdinProcessStartViolation `
+            -RootPath $bomFreeNestedProbeRoot -Files @(Get-Item -LiteralPath $bomFreeNestedForbiddenFile))
+    } finally {
+        if (Test-Path -LiteralPath $bomFreeNestedProbeRoot) {
+            Remove-Item -LiteralPath $bomFreeNestedProbeRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
     Test-BRAVOCondition `
         -Condition (
             $bomFreeProductionFiles.Count -gt 0 -and
             $bomFreeViolations.Count -eq 0 -and
-            $bomFreeProbeViolations.Count -eq 4
+            $bomFreeProbeViolations.Count -eq 4 -and
+            $bomFreeNestedAllowedViolations.Count -eq 0 -and
+            $bomFreeNestedForbiddenViolations.Count -eq 1
         ) `
         -Name "Secrets/StdinProcessStartOnlyViaBomFreeHelper" `
         -Failure ("процес із redirected stdin має запускатися лише через Start-BRAVOProcessWithBomFreeInput, а stdin писатися лише через Write-BRAVOProcessInputText; порушення: {0}; контроль гарда (очікувано 4): {1}" -f
