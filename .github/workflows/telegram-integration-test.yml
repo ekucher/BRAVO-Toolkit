@@ -1,0 +1,95 @@
+name: Telegram integration test
+
+# Manual connectivity/secrets check for the Telegram notification channel.
+# This is NOT production notification architecture: it sends exactly one
+# fixed test message and nothing else. No repository code is executed and
+# no repository checkout is required.
+#
+# Security model:
+# - workflow_dispatch only; no pull_request/push triggers, so forked PRs
+#   never see this job and secrets are never exposed to untrusted refs.
+# - Only the repository owner may run it (github.actor and
+#   github.triggering_actor == ekucher); anyone else is skipped.
+# - permissions: contents: read limits the GITHUB_TOKEN only; it is not
+#   used by this job at all.
+# - Secrets are read once into env: at the job level and referenced only
+#   as environment variables inside run: blocks. The raw
+#   ${{ secrets.* }} expression is never interpolated directly into a
+#   shell command line, so it cannot end up echoed, globbed, or logged by
+#   GitHub's own command-echo behavior.
+# - The bot token and chat ID are never printed. The full Telegram API
+#   URL (which embeds the bot token) is never printed. curl diagnostics
+#   are suppressed; only the numeric HTTP status code and a boolean
+#   "delivered" result are written to the public log.
+# - No third-party Telegram action is referenced; no unpinned action
+#   reference exists in this file at all (there are no "uses" steps).
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-integration-test
+  cancel-in-progress: false
+
+jobs:
+  telegram-test:
+    name: Telegram sendMessage connectivity test
+    if: >
+      github.repository == 'ekucher/BRAVO-Toolkit' &&
+      github.actor == 'ekucher' &&
+      github.triggering_actor == 'ekucher'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    steps:
+      - name: Validate required secrets are present
+        shell: bash
+        run: |
+          set -u
+          if [ -z "${TELEGRAM_BOT_TOKEN:-}" ]; then
+            echo "::error::TELEGRAM_BOT_TOKEN secret is missing or empty; failing closed"
+            exit 1
+          fi
+          if [ -z "${TELEGRAM_CHAT_ID:-}" ]; then
+            echo "::error::TELEGRAM_CHAT_ID secret is missing or empty; failing closed"
+            exit 1
+          fi
+          echo "Both required secrets are present (values not printed)."
+
+      - name: Send single Telegram test message
+        shell: bash
+        run: |
+          set -u
+          message_text="BRAVO-Toolkit GitHub Actions Telegram test: SUCCESS"
+          payload_file="$(mktemp)"
+          response_file="$(mktemp)"
+          printf '{"chat_id":"%s","text":"%s"}' "$TELEGRAM_CHAT_ID" "$message_text" > "$payload_file"
+
+          http_status="$(curl -sS -o "$response_file" -w '%{http_code}' \
+            --request POST \
+            --header 'Content-Type: application/json' \
+            --data "@$payload_file" \
+            "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" 2>/dev/null || echo '000')"
+
+          rm -f "$payload_file"
+
+          echo "Telegram API HTTP status: $http_status"
+
+          delivered="false"
+          if [ "$http_status" = "200" ] && grep -q '"ok":true' "$response_file"; then
+            delivered="true"
+          fi
+
+          rm -f "$response_file"
+
+          if [ "$delivered" != "true" ]; then
+            echo "::error::Telegram sendMessage did not confirm delivery (ok:true); failing closed. No response body is printed because it may contain the chat id."
+            exit 1
+          fi
+
+          echo "Telegram delivery result: delivered=true"
