@@ -125,6 +125,61 @@
             -Failure "ci.yml має викликати ci\Invoke-BRAVOSecurityAnalysis.ps1 і ci\Test-BRAVOForbiddenPattern.ps1"
     }
 
+    # T015: статичний конструктор `[T]::new(...)` існує лише з PowerShell
+    # 5.0, а маніфести декларують PowerShellVersion = '3.0'. Реальний
+    # дефект: Maintenance будував блок успішного сповіщення
+    # (NotificationMode=all) через List[string]::new() — на 3.0/4.0 гілка
+    # падала б лише в момент надсилання. Той самий AST-детектор і той
+    # самий production-набір, що й CI-гейт ci\Test-BRAVOForbiddenPattern.ps1
+    # (обидва — з ci\BRAVOAnalyzableFiles.ps1), тож self-test і CI не
+    # можуть розійтись у визначенні.
+    . (Join-Path $root 'ci\BRAVOAnalyzableFiles.ps1')
+
+    # Детектор не повинен бути ні сліпим, ні шумним: згадка в коментарі,
+    # у рядковому літералі та в here-string — НЕ виклик; реальний виклик
+    # (включно з регістром 'New') — виклик.
+    $staticNewProbePath = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_STATIC_NEW_PROBE_{0}.ps1" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $staticNewProbeLines = @(
+            '# коментар: [Uri]::new($base, $relative)',
+            '$text = "[System.Text.StringBuilder]::new()"',
+            '$here = @''',
+            '[Collections.Generic.List[string]]::new()',
+            '''@',
+            '$list = New-Object ''System.Collections.Generic.List[string]''',
+            '$real = [System.Collections.Generic.List[string]]::New()',
+            '$other = [string]::Join(",", @("a"))'
+        )
+        [IO.File]::WriteAllText($staticNewProbePath, ($staticNewProbeLines -join "`r`n"), (New-Object System.Text.UTF8Encoding($true)))
+        $staticNewProbeFindings = @(Find-BRAVOStaticNewInvocation -LiteralPath $staticNewProbePath)
+        Test-BRAVOCondition `
+            -Condition (
+                $staticNewProbeFindings.Count -eq 1 -and
+                $staticNewProbeFindings[0].Line -eq 7
+            ) `
+            -Name "StaticAnalysis/StaticNewDetectorMatchesOnlyRealInvocations" `
+            -Failure "Find-BRAVOStaticNewInvocation мав знайти рівно один виклик (рядок 7) і пропустити коментар/рядок/here-string; знайдено: $(@($staticNewProbeFindings | ForEach-Object { '{0}:{1}' -f $_.Line, $_.Text }) -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $staticNewProbePath -Force -ErrorAction SilentlyContinue
+    }
+
+    $staticNewProductionFiles = @(Get-BRAVOProductionPowerShellFile -Root $root)
+    $staticNewProductionFindings = @(
+        foreach ($staticNewProductionFile in $staticNewProductionFiles) {
+            Find-BRAVOStaticNewInvocation -LiteralPath $staticNewProductionFile.FullName
+        }
+    )
+    $staticNewScopeNames = @($staticNewProductionFiles | ForEach-Object { $_.Name })
+    Test-BRAVOCondition `
+        -Condition (
+            $staticNewProductionFiles.Count -gt 0 -and
+            $staticNewScopeNames -contains 'BRAVO.Maintenance.Runtime.ps1' -and
+            $staticNewScopeNames -notcontains 'BRAVO_SELF_TEST.ps1' -and
+            $staticNewProductionFindings.Count -eq 0
+        ) `
+        -Name "StaticAnalysis/NoStaticNewConstructorInProductionCode" `
+        -Failure "production PowerShell-код не повинен викликати [T]::new() (потрібен PowerShell 5.0+, маніфести декларують 3.0) — використовуйте New-Object; знайдено: $(@($staticNewProductionFindings | ForEach-Object { '{0}:{1}: {2}' -f $_.Path, $_.Line, $_.Text }) -join ' | ')"
+
     # --- Інваріанти, спільні для ВСІХ workflow (T022) ---------------------
     # Раніше ASCII-only і pin на SHA перевірялися лише для ci.yml, тож
     # порушення в інших workflow (release-artifact.yml мав кирилицю у

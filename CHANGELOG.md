@@ -25,6 +25,24 @@
   endpoints сповіщень і Operations приймають лише TLS 1.2+, тож з'єднання
   все одно встановлюється по TLS 1.2. Щоб прибрати застарілі протоколи на
   такому хості, увімкніть `SchUseStrongCrypto` у реєстрі .NET Framework.
+- **Maintenance: успішне сповіщення (`NotificationMode=all`) більше не
+  залежить від PowerShell 5.0+.** Блок «Виконано» успішного звіту
+  будувався через статичний конструктор `[T]::new()`, якого немає в
+  PowerShell 3.0/4.0, хоча маніфести модулів декларують
+  `PowerShellVersion = '3.0'`. На такому хості обслуговування падало б
+  саме в момент надсилання успішного звіту — у рідкісній гілці, яку
+  звичайні прогони не зачіпають. Тепер використовується `New-Object`;
+  вміст і порядок рядків сповіщення не змінились. Те саме виправлено в
+  операторському acceptance-скрипті
+  `ci\acceptance\Test-BRAVOVSSSingleVolumeAcceptance.ps1`, що входить
+  у release-пакет.
+
+  **Захист від повернення.** `ci\Test-BRAVOForbiddenPattern.ps1` і
+  self-test (`StaticAnalysis/NoStaticNewConstructorInProductionCode`)
+  тепер відхиляють будь-який виклик `::new()` у production PowerShell-коді
+  (усе, крім self-test-набору). Пошук іде за синтаксичним деревом, тому
+  згадки в коментарях і рядках не спрацьовують. Питання мінімальної
+  підтримуваної версії PowerShell (3.0 чи 5.1) цим не вирішується.
 - **Governance-перевірки workflow охоплюють усі `.github/workflows`, а не лише
   `ci.yml`; `release-artifact.yml` більше не містить кирилиці у `run:`.**
   `StaticAnalysis/CiRunBlocksAreAsciiOnly` і `StaticAnalysis/ActionsPinnedToCommitSha`

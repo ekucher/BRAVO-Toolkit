@@ -7037,7 +7037,7 @@ function Send-FinalReport {
     else {
         # Немає критичних помилок - відправляємо тільки в режимі "all"
         if ($script:SlackMode -eq "all") {
-            $completedCheckLines = [System.Collections.Generic.List[string]]::new()
+            $completedCheckLines = New-Object 'System.Collections.Generic.List[string]'
             $lastRestoreTime = $restoreCompletedAt
             # Персистована дата — джерело істини для ОБОХ шляхів: маркери
             # restore_done_*.marker бачать лише автоматичну реставрацію
