@@ -1264,16 +1264,21 @@ $broken = Invoke-SuspensionScenario -LogPath (Join-Path $TestRoot 'broken.log') 
             $tls12RuntimeParseErrors = $null
             $tls12RuntimeAst = [Management.Automation.Language.Parser]::ParseFile(
                 (Join-Path $root $tls12RuntimeRelativePath), [ref]$null, [ref]$tls12RuntimeParseErrors)
-            # Лише виклик у тілі скрипта (не всередині функції): саме він
-            # виконується на старті runtime перед webhook-ами. Тіло runtime
+            # Лише виклик у тілі runtime (не всередині допоміжної функції): саме
+            # він виконується на старті runtime перед webhook-ами. Тіло runtime
             # обгорнуте зовнішнім try/finally, тому шукаємо не лише серед
-            # statement-ів верхнього рівня.
+            # statement-ів верхнього рівня. Після T010 тіло саме є функцією-
+            # обгорткою Invoke-BRAVO<X>, тож її самої функцією-хелпером не
+            # вважаємо; будь-яка ІНША охоплююча функція, як і раніше, виключає
+            # виклик.
+            $tls12RuntimeWrapperNames = @('Invoke-BRAVOMaintenance', 'Invoke-BRAVODataRestore')
             $tls12RuntimeCall = @($tls12RuntimeAst.FindAll({
                         param($candidate)
                         if (-not ($candidate -is [Management.Automation.Language.CommandAst]) -or
                             $candidate.GetCommandName() -ne 'Enable-BRAVOTls12') { return $false }
                         for ($tls12Parent = $candidate.Parent; $null -ne $tls12Parent; $tls12Parent = $tls12Parent.Parent) {
-                            if ($tls12Parent -is [Management.Automation.Language.FunctionDefinitionAst]) { return $false }
+                            if ($tls12Parent -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                                $tls12RuntimeWrapperNames -notcontains $tls12Parent.Name) { return $false }
                         }
                         return $true
                     }, $true)) | Select-Object -First 1
