@@ -20458,6 +20458,214 @@ function Get-BRAVOMaintenanceSummaryResult {
         -Name "Scheduler/ExpectedPrincipalFromConfig" `
         -Failure "expected principal (акаунт/LogonType/RunLevel) має братися з schedulerSettings, а не хардкодитися"
 
+    # --- T025: очікування спільного operation lock не довше за ліміт задачі ---
+    # schedulerSettings.OperationLockWaitMinutes (типово 360 хв) — один
+    # глобальний ліміт, а ExecutionTimeLimit задачі BAZASync = 2 год:
+    # BRAVO_ARCHIV -SyncBAZA, що чекав lock довгої архівації, Планувальник
+    # убивав на 2-й годині без підсумку й без коду з BRAVO.ExitCodes.
+    # Бюджет — Get-BRAVOOperationLockWaitBudget (BRAVO.System), ліміт — той
+    # самий schedulerSettings.<Task>.ExecutionTimeLimitHours, з якого
+    # BRAVO_TASKS_INSTALL будує Settings.ExecutionTimeLimit.
+    $lockBudgetCases = @()
+    $lockBudgetError = $null
+    try {
+        $lockBudgetCases = @(
+            # Ефективна конфігурація комплекту (типові 360 хв / BAZASync 2 год).
+            foreach ($lockBudgetTaskType in @('Backup', 'Maintenance', 'Recovery', 'BAZASync')) {
+                $lockBudgetLimitHours = [double]$schedulerSettings[$lockBudgetTaskType].ExecutionTimeLimitHours
+                $lockBudget = Get-BRAVOOperationLockWaitBudget -SchedulerSettings $schedulerSettings -TaskType $lockBudgetTaskType
+                [pscustomobject]@{
+                    Name = "effective:$lockBudgetTaskType"
+                    Ok = (
+                        $lockBudget.EffectiveMinutes -ge 0 -and
+                        $lockBudget.EffectiveMinutes -le [int]$schedulerSettings.OperationLockWaitMinutes -and
+                        $lockBudget.EffectiveMinutes -le ([math]::Floor($lockBudgetLimitHours * 60) - $lockBudget.SafetyMarginMinutes) -and
+                        $lockBudget.SafetyMarginMinutes -gt 0
+                    )
+                }
+            }
+            $lockBudgetBaza = Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{
+                OperationLockWaitMinutes = 360; BAZASync = @{ ExecutionTimeLimitHours = 2 } }
+            [pscustomobject]@{ Name = 'BAZASync 360/2h -> 90'; Ok = ($lockBudgetBaza.EffectiveMinutes -eq 90 -and $lockBudgetBaza.Capped -and $lockBudgetBaza.ConfiguredMinutes -eq 360 -and $lockBudgetBaza.TaskLimitMinutes -eq 120 -and $lockBudgetBaza.LimitDescription -ceq ' (OperationLockWaitMinutes=360 обмежено лімітом виконання задачі BAZASync 120 хв мінус запас 30 хв)') }
+            $lockBudgetBackup = Get-BRAVOOperationLockWaitBudget -TaskType 'Backup' -SchedulerSettings @{
+                OperationLockWaitMinutes = 360; Backup = @{ ExecutionTimeLimitHours = 30 } }
+            [pscustomobject]@{ Name = 'Backup 360/30h -> 360 (без змін)'; Ok = ($lockBudgetBackup.EffectiveMinutes -eq 360 -and -not $lockBudgetBackup.Capped -and $lockBudgetBackup.LimitDescription -ceq '') }
+            # Ліміт рівно на межі запасу (30 хв) і менший за нього -> 0: одна
+            # спроба без очікування, а не від'ємний дедлайн.
+            $lockBudgetEdge = Get-BRAVOOperationLockWaitBudget -TaskType 'Recovery' -SchedulerSettings @{
+                OperationLockWaitMinutes = 360; Recovery = @{ ExecutionTimeLimitHours = 0.5 } }
+            [pscustomobject]@{ Name = 'ліміт = запасу -> 0'; Ok = ($lockBudgetEdge.EffectiveMinutes -eq 0 -and $lockBudgetEdge.Capped -and $lockBudgetEdge.TaskLimitMinutes -eq 30) }
+            # Значення, з яким BRAVO_TASKS_INSTALL задачу не встановив би
+            # (нечислове, NaN, 0, від'ємне), або вузол задачі не словник ->
+            # ліміт невідомий, попередня поведінка без обмеження.
+            $lockBudgetInvalid = @(
+                foreach ($lockBudgetInvalidHours in @('два', 'NaN', 0, -1, $null)) {
+                    Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{
+                        OperationLockWaitMinutes = 360; BAZASync = @{ ExecutionTimeLimitHours = $lockBudgetInvalidHours } }
+                }
+                Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{ OperationLockWaitMinutes = 360; BAZASync = 'legacy' }
+            )
+            [pscustomobject]@{ Name = 'некоректний/нечисловий ліміт -> без змін'; Ok = (
+                    $lockBudgetInvalid.Count -eq 6 -and
+                    @($lockBudgetInvalid | Where-Object { $_.EffectiveMinutes -ne 360 -or $_.Capped -or $null -ne $_.TaskLimitMinutes }).Count -eq 0) }
+            $lockBudgetMaintenance = Get-BRAVOOperationLockWaitBudget -TaskType 'Maintenance' -SchedulerSettings @{
+                OperationLockWaitMinutes = 1440; Maintenance = @{ ExecutionTimeLimitHours = 18 } }
+            [pscustomobject]@{ Name = 'Maintenance 1440/18h -> 1050'; Ok = ($lockBudgetMaintenance.EffectiveMinutes -eq 1050 -and $lockBudgetMaintenance.Capped) }
+            $lockBudgetTiny = Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{
+                OperationLockWaitMinutes = 360; BAZASync = @{ ExecutionTimeLimitHours = 0.25 } }
+            [pscustomobject]@{ Name = 'ліміт < запасу -> 0'; Ok = ($lockBudgetTiny.EffectiveMinutes -eq 0 -and $lockBudgetTiny.Capped) }
+            $lockBudgetLegacy = Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{ OperationLockWaitMinutes = 360 }
+            [pscustomobject]@{ Name = 'без вузла задачі -> без змін'; Ok = ($lockBudgetLegacy.EffectiveMinutes -eq 360 -and -not $lockBudgetLegacy.Capped -and $null -eq $lockBudgetLegacy.TaskLimitMinutes) }
+            $lockBudgetNoKey = Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{ BAZASync = @{ ExecutionTimeLimitHours = 2 } }
+            [pscustomobject]@{ Name = 'без OperationLockWaitMinutes -> 0'; Ok = ($lockBudgetNoKey.EffectiveMinutes -eq 0 -and -not $lockBudgetNoKey.Capped) }
+        )
+    } catch {
+        $lockBudgetError = $_.Exception.Message
+    }
+    $lockBudgetFailed = @($lockBudgetCases | Where-Object { -not $_.Ok } | ForEach-Object { $_.Name })
+    Test-BRAVOCondition `
+        -Condition ($null -eq $lockBudgetError -and $lockBudgetCases.Count -eq 12 -and $lockBudgetFailed.Count -eq 0) `
+        -Name "Scheduler/OperationLockWaitBoundedByTaskLimit" `
+        -Failure "Get-BRAVOOperationLockWaitBudget має обмежувати OperationLockWaitMinutes лімітом ExecutionTimeLimitHours задачі мінус запас (BAZASync 360 хв/2 год -> 90 хв); помилка: $lockBudgetError; невдалі випадки: $($lockBudgetFailed -join ', ')"
+
+    # Культурна незалежність: ліміт годин (число з JSON) переводиться в
+    # рядок і розбирається InvariantCulture; результат не повинен залежати
+    # від CurrentCulture (кома як десятковий роздільник у de-DE/uk-UA).
+    $lockBudgetCultureResults = @{}
+    $lockBudgetCultureError = $null
+    $lockBudgetPriorCulture = [System.Threading.Thread]::CurrentThread.CurrentCulture
+    try {
+        foreach ($lockBudgetCultureName in @('en-US', 'uk-UA', 'de-DE')) {
+            [System.Threading.Thread]::CurrentThread.CurrentCulture = New-Object System.Globalization.CultureInfo($lockBudgetCultureName)
+            $lockBudgetCultureResults[$lockBudgetCultureName] = @(
+                foreach ($lockBudgetCultureHours in @(2, 18, 0.5, 0.25, '1.5')) {
+                    (Get-BRAVOOperationLockWaitBudget -TaskType 'BAZASync' -SchedulerSettings @{
+                        OperationLockWaitMinutes = 360; BAZASync = @{ ExecutionTimeLimitHours = $lockBudgetCultureHours } }).EffectiveMinutes
+                }
+            ) -join ','
+        }
+    } catch {
+        $lockBudgetCultureError = $_.Exception.Message
+    } finally {
+        [System.Threading.Thread]::CurrentThread.CurrentCulture = $lockBudgetPriorCulture
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $lockBudgetCultureError -and
+            $lockBudgetCultureResults['en-US'] -ceq '90,360,0,0,60' -and
+            $lockBudgetCultureResults['uk-UA'] -ceq $lockBudgetCultureResults['en-US'] -and
+            $lockBudgetCultureResults['de-DE'] -ceq $lockBudgetCultureResults['en-US']
+        ) `
+        -Name "Scheduler/OperationLockWaitBudgetIsCultureInvariant" `
+        -Failure "бюджет очікування lock не має залежати від поточної культури (ліміт 2/18/0.5/0.25/'1.5' год -> 90,360,0,0,60); помилка: $lockBudgetCultureError; en-US=$($lockBudgetCultureResults['en-US']), uk-UA=$($lockBudgetCultureResults['uk-UA']), de-DE=$($lockBudgetCultureResults['de-DE'])"
+
+    # Поведінково: справжні Enter-BRAVOArchiveProcessLock (-SyncBAZA) і
+    # Enter-BRAVOMaintenanceOperationLock при зайнятому lock і бюджеті 0
+    # (ліміт задачі = запасу) завершуються ОДРАЗУ штатною відмовою з
+    # поясненням обмеження — Start-Sleep підмінено на throw, тож 360-хв
+    # очікування без обмеження дало б іншу помилку замість зависання тесту.
+    $lockBudgetStubs = @'
+function Start-Sleep { param([int]$Seconds) throw "SELFTEST-SLEEP: очікування lock почалося попри нульовий бюджет" }
+function Write-BRAVOLog { param($Component, $Message, $Level) }
+function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
+'@
+    $lockBudgetRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_T025_LOCK_{0}" -f [guid]::NewGuid().ToString("N"))
+    $lockBudgetHolder = $null
+    $lockBudgetArchiveResult = $null
+    $lockBudgetMaintenanceResult = $null
+    $lockBudgetRunError = $null
+    # New-Module матеріалізує заглушки у Function:-drive цієї сесії (див.
+    # $script:BRAVOSelfTestOwnedRuntimeModules). Кидаючий Start-Sleep і
+    # німі Write-Log/Write-BRAVOLog не повинні пережити цей тест: інакше
+    # кожен наступний Start-Sleep у self-test падає з SELFTEST-SLEEP.
+    $lockBudgetStubNames = @('Start-Sleep', 'Write-BRAVOLog', 'Write-Log')
+    $lockBudgetPriorFunctions = @{}
+    foreach ($lockBudgetStubName in $lockBudgetStubNames) {
+        $lockBudgetPriorItem = Get-Item -LiteralPath "function:$lockBudgetStubName" -ErrorAction SilentlyContinue
+        if ($null -ne $lockBudgetPriorItem) {
+            $lockBudgetPriorFunctions[$lockBudgetStubName] = $lockBudgetPriorItem.ScriptBlock
+        }
+    }
+    $lockBudgetModule = $null
+    try {
+        [void](New-Item -ItemType Directory -Path $lockBudgetRoot -Force -ErrorAction Stop)
+        $lockBudgetLockPath = Join-Path $lockBudgetRoot 'BRAVO_OPERATION.lock'
+        $lockBudgetHolder = [System.IO.File]::Open(
+            $lockBudgetLockPath,
+            [System.IO.FileMode]::OpenOrCreate,
+            [System.IO.FileAccess]::ReadWrite,
+            [System.IO.FileShare]::None
+        )
+        $lockBudgetModule = New-BRAVOSelfTestRuntimeModule `
+            -SourceText ($lockBudgetStubs + "`n" + $archiveScriptText + "`n" + $maintenanceScriptText) `
+            -FunctionNames @('Start-Sleep', 'Write-BRAVOLog', 'Write-Log', 'Enter-BRAVOArchiveProcessLock', 'Enter-BRAVOMaintenanceOperationLock')
+        $lockBudgetResults = & $lockBudgetModule {
+            param($LockPath)
+            $script:operationLockSettings = @{ Path = $LockPath }
+            $script:schedulerSettings = @{
+                OperationLockWaitMinutes = 360
+                BAZASync = @{ ExecutionTimeLimitHours = 0.5 }
+                Recovery = @{ ExecutionTimeLimitHours = 0.5 }
+            }
+            $script:SyncBAZA = [switch]$true
+            $script:RunMissedRestoreOnly = [switch]$true
+            @(
+                (Enter-BRAVOArchiveProcessLock -TaskType 'BAZASync'),
+                (Enter-BRAVOMaintenanceOperationLock -TaskType 'Recovery')
+            )
+        } $lockBudgetLockPath
+        $lockBudgetArchiveResult = $lockBudgetResults[0]
+        $lockBudgetMaintenanceResult = $lockBudgetResults[1]
+    } catch {
+        $lockBudgetRunError = $_.Exception.Message
+    } finally {
+        if ($null -ne $lockBudgetHolder) { $lockBudgetHolder.Dispose() }
+        Remove-Item -LiteralPath $lockBudgetRoot -Recurse -Force -ErrorAction SilentlyContinue
+        if ($null -ne $lockBudgetModule) {
+            foreach ($lockBudgetStubName in $lockBudgetStubNames) {
+                $lockBudgetLeakedItem = Get-Item -LiteralPath "function:$lockBudgetStubName" -ErrorAction SilentlyContinue
+                if ($null -ne $lockBudgetLeakedItem -and $lockBudgetLeakedItem.ModuleName -eq $lockBudgetModule.Name) {
+                    Remove-Item -LiteralPath "function:$lockBudgetStubName" -Force -ErrorAction Stop
+                    if ($lockBudgetPriorFunctions.ContainsKey($lockBudgetStubName)) {
+                        Set-Item -LiteralPath "function:$lockBudgetStubName" -Value $lockBudgetPriorFunctions[$lockBudgetStubName]
+                    }
+                }
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $lockBudgetRunError -and
+            $null -ne $lockBudgetArchiveResult -and -not $lockBudgetArchiveResult.Success -and
+            [string]$lockBudgetArchiveResult.Error -match 'lock не звільнився за 0 хв\.' -and
+            [string]$lockBudgetArchiveResult.Error -match 'обмежено лімітом виконання задачі BAZASync 30 хв мінус запас 30 хв' -and
+            $null -ne $lockBudgetMaintenanceResult -and -not $lockBudgetMaintenanceResult.Success -and
+            [string]$lockBudgetMaintenanceResult.Error -match 'lock не звільнився за 0 хв\.' -and
+            [string]$lockBudgetMaintenanceResult.Error -match 'обмежено лімітом виконання задачі Recovery 30 хв мінус запас 30 хв'
+        ) `
+        -Name "Scheduler/OperationLockWaitTimeoutIsExplicitFailure" `
+        -Failure "зайнятий lock при вичерпаному бюджеті задачі має давати негайну відмову з поясненням обмеження (Archive -> SkippedLockBusy); помилка: $lockBudgetRunError; Archive: $($lockBudgetArchiveResult.Error); Maintenance: $($lockBudgetMaintenanceResult.Error)"
+
+    # Виклик-площини: кожен прогін передає СВОЮ задачу (-SyncBAZA ->
+    # BAZASync, -RunMissedRestoreOnly -> Recovery), Archive імпортує
+    # BRAVO.System, а старе необмежене читання OperationLockWaitMinutes не
+    # повернулось у жоден runtime.
+    Test-BRAVOCondition `
+        -Condition (
+            $archiveScriptText -match "foreach \(\`$moduleName in @\([^\)]*'BRAVO\.System'[^\)]*\)\) \{" -and
+            $archiveScriptText.Contains("Enter-BRAVOArchiveProcessLock ``") -and
+            $archiveScriptText.Contains("-TaskType `$(if (`$SyncBAZA) { 'BAZASync' } else { 'Backup' })") -and
+            $maintenanceScriptText.Contains("-TaskType `$(if (`$RunMissedRestoreOnly) { 'Recovery' } else { 'Maintenance' })") -and
+            -not $archiveScriptText.Contains('[math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)') -and
+            -not $maintenanceScriptText.Contains('[math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)') -and
+            $archiveScriptText -match '(?s)\$processLockResult = Enter-BRAVOArchiveProcessLock.{0,600}?\$script:processExitCode = Resolve-BRAVOExitCode -LockBusy' -and
+            $maintenanceScriptText -match '(?s)\$maintenanceLockResult = Enter-BRAVOMaintenanceOperationLock.{0,900}?exit \(Resolve-BRAVOExitCode -LockBusy\)' -and
+            $taskInstallerText.Contains('(ConvertTo-BRAVOSchedulerExecutionTimeLimit -Hours $TaskSettings.ExecutionTimeLimitHours)') -and
+            -not $taskInstallerText.Contains('[timespan]::FromHours([double]$TaskSettings.ExecutionTimeLimitHours)')
+        ) `
+        -Name "Scheduler/OperationLockWaitCallersUseTaskBudget" `
+        -Failure "Archive і Maintenance мають брати очікування lock з Get-BRAVOOperationLockWaitBudget для своєї задачі (-SyncBAZA -> BAZASync, -RunMissedRestoreOnly -> Recovery), а не напряму з OperationLockWaitMinutes; відмова lock має завершуватися кодом з Resolve-BRAVOExitCode -LockBusy, а BRAVO_TASKS_INSTALL — будувати ExecutionTimeLimit тією ж ConvertTo-BRAVOSchedulerExecutionTimeLimit"
+
     # --- Scheduler/InstallSummary*: actual INSTALL summary path must not read
     # Recovery-only StartupDelayMinutes for daily/repeating tasks.
     $systemSourceTextForScheduler = [IO.File]::ReadAllText(
