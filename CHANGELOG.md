@@ -7,8 +7,10 @@
   відсутня властивість кидала виняток, і за перевищеного порогу діапазонів ID нічний прогін
   завершувався exit `60` без Trace-архіву, cleanup, backup та підсумкового звіту. Тепер `time`
   читається через `PSObject.Properties` (як `file`/`filled`); наявне значення, як і раніше,
-  потрапляє в alert. Нова self-test перевірка:
-  `RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode`.
+  потрапляє в alert. Нові self-test перевірки:
+  `RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode`,
+  `RangeId/08-NullTimeAndPartialEntriesUnderStrictMode` (`time = null`, записи без
+  `file`/`filled`, поріг не перевищено).
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
