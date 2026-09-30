@@ -1,0 +1,33 @@
+name: Telegram summary logic test
+
+# Behavioural test of .github/workflows/telegram-ci-summary.yml. The real
+# run: script of the notifier is extracted and executed with a fake curl
+# and recorded API responses (see ci/test_telegram_ci_summary.py).
+#
+# Security model: pull_request with a path filter, permissions: contents:
+# read, no repository secrets, no network calls. The notifier itself keeps
+# running only on push to developer, where its Telegram secrets live.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/telegram-ci-summary.yml'
+      - '.github/workflows/telegram-ci-summary-test.yml'
+      - 'ci/test_telegram_ci_summary.py'
+
+permissions:
+  contents: read
+
+jobs:
+  telegram-summary-logic:
+    name: Telegram summary logic test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Run notifier behaviour tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ci/test_telegram_ci_summary.py
