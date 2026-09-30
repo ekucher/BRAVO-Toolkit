@@ -1539,13 +1539,14 @@ Test-BRAVOCondition `
 # Enforce. Негативний і позитивний випадки викликають функцію НАПРЯМУ
 # (той самий паттерн, що ToolIntegrityModeWeakenedBlocks вище), щоб
 # довести саму гілку, а не лише те, що derivation сьогодні її не досягає.
-$toolManifestProbeToolsPath = Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_T001_RUNTIME\Tools'
-$toolManifestProbeToolsLiteral = $toolManifestProbeToolsPath.Replace("'", "''")
+$toolManifestProbeRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_T001_RUNTIME'
+$toolManifestProbeRuntimeLiteral = $toolManifestProbeRuntimeRoot.Replace("'", "''")
 $toolManifestProbePrefix = (
     "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
     "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
     "`$global:requireAdministrator = `$true; " +
-    "`$global:toolsPath = '$toolManifestProbeToolsLiteral'; "
+    "`$global:runtimeRoot = '$toolManifestProbeRuntimeLiteral'; " +
+    "`$global:toolsPath = (Join-Path `$global:runtimeRoot 'Tools'); "
 )
 $toolManifestRedirectedProbeCommand = (
     $toolManifestProbePrefix +
@@ -1563,7 +1564,7 @@ Test-BRAVOCondition `
         $toolManifestRedirectedResult.Contains("toolIntegritySettings.ManifestPath = 'C:\Attacker\TOOLS_MANIFEST.json'")
     ) `
     -Name "ConfigLoader/ToolManifestPathRedirectionBlocks" `
-    -Failure "ефективний toolIntegritySettings.ManifestPath поза <toolsPath>\TOOLS_MANIFEST.json МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants; отримано: $toolManifestRedirectedResult"
+    -Failure "ефективний toolIntegritySettings.ManifestPath поза <RuntimeRoot>\Tools\TOOLS_MANIFEST.json МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants; отримано: $toolManifestRedirectedResult"
 
 $toolManifestCanonicalProbeCommand = (
     $toolManifestProbePrefix +
@@ -1579,22 +1580,36 @@ Test-BRAVOCondition `
     -Name "ConfigLoader/ToolManifestPathCanonicalAllowed" `
     -Failure "канонічний toolIntegritySettings.ManifestPath (<toolsPath>\TOOLS_MANIFEST.json) не повинен блокуватись; отримано: $toolManifestCanonicalResult"
 
-# Крайові випадки T001 в одному дочірньому процесі: порожній і
-# синтаксично зіпсований ManifestPath блокуються (fail-closed: жодне з них
-# derivation не виробляє); сегменти '..', що після GetFullPath дають той
-# самий канонічний файл, допускаються навмисно (це той самий шлях), а
-# '..', що виводить за межі Tools\, блокується.
+# Крайові випадки T001 в одному дочірньому процесі (якір довіри —
+# <RuntimeRoot>\Tools):
+#   empty/malformed — порожній і синтаксично зіпсований ManifestPath;
+#   dotCanonical    — '..', що після GetFullPath дає той самий канонічний
+#                     файл, допускається навмисно (це той самий шлях);
+#   dotEscape       — '..' за межі Tools\;
+#   caseVariant     — інший регістр імені файла (на NTFS із per-directory
+#                     case sensitivity це інший файл);
+#   coRedirected    — toolsPath і ManifestPath перенаправлено в один
+#                     сторонній каталог (звірка лише з toolsPath не помітила б);
+#   orderedDict     — перенаправлення в OrderedDictionary (споживачі
+#                     приймають будь-який IDictionary, не лише hashtable).
 $toolManifestEdgeProbeCommand = (
     $toolManifestProbePrefix +
+    "`$canonicalTools = `$global:toolsPath; " +
     "`$edgeCases = [ordered]@{ " +
-    "'empty' = ''; " +
-    "'malformed' = 'C:\bad:name|<>\TOOLS_MANIFEST.json'; " +
-    "'dotCanonical' = (Join-Path `$global:toolsPath '..\Tools\TOOLS_MANIFEST.json'); " +
-    "'dotEscape' = (Join-Path `$global:toolsPath '..\Other\TOOLS_MANIFEST.json') }; " +
+    "'empty' = @(`$canonicalTools, ''); " +
+    "'malformed' = @(`$canonicalTools, 'C:\bad:name|<>\TOOLS_MANIFEST.json'); " +
+    "'dotCanonical' = @(`$canonicalTools, (Join-Path `$canonicalTools '..\Tools\TOOLS_MANIFEST.json')); " +
+    "'dotEscape' = @(`$canonicalTools, (Join-Path `$canonicalTools '..\Other\TOOLS_MANIFEST.json')); " +
+    "'caseVariant' = @(`$canonicalTools, (Join-Path `$canonicalTools 'tools_manifest.json')); " +
+    "'coRedirected' = @('C:\Attacker\Tools', 'C:\Attacker\Tools\TOOLS_MANIFEST.json'); " +
+    "'orderedDict' = @(`$canonicalTools, 'C:\Attacker\TOOLS_MANIFEST.json') }; " +
     "`$edgeOutcomes = foreach (`$edgeName in @(`$edgeCases.Keys)) { " +
-    "`$global:toolIntegritySettings = @{ Mode = 'Enforce'; ManifestPath = `$edgeCases[`$edgeName] }; " +
+    "`$global:toolsPath = `$edgeCases[`$edgeName][0]; " +
+    "if (`$edgeName -eq 'orderedDict') { `$settings = New-Object System.Collections.Specialized.OrderedDictionary; `$settings['Mode'] = 'Enforce'; `$settings['ManifestPath'] = `$edgeCases[`$edgeName][1] } " +
+    "else { `$settings = @{ Mode = 'Enforce'; ManifestPath = `$edgeCases[`$edgeName][1] } }; " +
+    "`$global:toolIntegritySettings = `$settings; " +
     "try { Test-BRAVOEffectiveSecurityInvariants; `$edgeName + '=NO-THROW' } " +
-    "catch { if ([string]`$_.Exception.Message -like '*toolIntegritySettings.ManifestPath*') { `$edgeName + '=BLOCKED' } else { `$edgeName + '=OTHER' } } }; " +
+    "catch { `$edgeMessage = [string]`$_.Exception.Message; if (`$edgeMessage -like '*toolIntegritySettings.ManifestPath*' -or `$edgeMessage -like '*toolsPath = *') { `$edgeName + '=BLOCKED' } else { `$edgeName + '=OTHER' } } }; " +
     "`$edgeOutcomes -join ';' } catch { 'THREW: ' + `$_.Exception.Message }"
 )
 $toolManifestEdgeResult = [string](
@@ -1602,9 +1617,9 @@ $toolManifestEdgeResult = [string](
         -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestEdgeProbeCommand 2>&1 | Out-String
 ).Trim()
 Test-BRAVOCondition `
-    -Condition ($toolManifestEdgeResult -eq 'empty=BLOCKED;malformed=BLOCKED;dotCanonical=NO-THROW;dotEscape=BLOCKED') `
+    -Condition ($toolManifestEdgeResult -eq 'empty=BLOCKED;malformed=BLOCKED;dotCanonical=NO-THROW;dotEscape=BLOCKED;caseVariant=BLOCKED;coRedirected=BLOCKED;orderedDict=BLOCKED') `
     -Name "ConfigLoader/ToolManifestPathEdgeCasesFailClosed" `
-    -Failure "порожній і зіпсований ManifestPath та '..' за межі Tools\ мають блокуватись, а '..', що веде до канонічного файла, — ні; отримано: $toolManifestEdgeResult"
+    -Failure "порожній/зіпсований ManifestPath, '..' за межі Tools\, інший регістр імені, спільне перенаправлення toolsPath+ManifestPath і перенаправлення в OrderedDictionary мають блокуватись, а '..', що веде до канонічного файла, — ні; отримано: $toolManifestEdgeResult"
 
 # ============================================================
 # Issue #216, Wave 2 review-фікс: backupMonitoring.SFTP.BAZA.Mode/
