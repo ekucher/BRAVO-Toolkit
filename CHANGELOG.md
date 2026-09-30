@@ -2,6 +2,86 @@
 
 ## Не випущено (developer)
 
+- **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
+  Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
+  вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях
+  резолвився від `C:\Windows\System32`, і дані LIMS розпаковувались туди. Тепер
+  `-TargetPath` перевіряється тим самим `Test-BRAVODataRestoreFullyQualifiedWindowsPath`,
+  що й `-StagingPath`: до релаунчу (exit `30`) і в `Get-BRAVODataRestorePlan`.
+  Побічно префікси `\\?\` та `\\.\` для `-TargetPath` тепер теж відхиляються.
+  Нові self-test перевірки: `DataRestore/PlanRejectsDriveAndRootRelativeTargetPath`,
+  `DataRestore/TargetPathValidatedBeforeElevation`,
+  `DataRestore/TargetPathQualificationMatrix` (ACCEPT `C:\restore`, `D:\x\restore`,
+  UNC; REJECT `C:restore`, `\restore`, `.\restore`, `..\restore`, `\\?\`, `\\.\`).
+
+- **Fix: Maintenance не обривається, якщо в `range_id_log.json` немає поля `time` (#288).**
+  `Test-RangeIdUsage` читав `$rangeData.time` напряму; під `Set-StrictMode -Version 2.0`
+  відсутня властивість кидала виняток, і за перевищеного порогу діапазонів ID нічний прогін
+  завершувався exit `60` без Trace-архіву, cleanup, backup та підсумкового звіту. Тепер `time`
+  читається через `PSObject.Properties` (як `file`/`filled`); наявне значення, як і раніше,
+  потрапляє в alert. Нові self-test перевірки:
+  `RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode`,
+  `RangeId/08-NullTimeAndPartialEntriesUnderStrictMode` (`time = null`, записи без
+  `file`/`filled`, поріг не перевищено).
+
+- **Fix: Health не падає на хостах без `ServiceController.StartType` (#295).**
+  `Get-ManagedServiceHealthIssues` читав `$service.StartType` напряму; властивість
+  з'явилась лише в .NET 4.6.1, тож на Server 2012 R2 із .NET 4.5.x під
+  `Set-StrictMode -Version 2.0` кожен Health (зокрема post-backup) завершувався exit `90`
+  без сповіщення, а WMI-fallback на `StartMode` не виконувався. Тепер `StartType` читається
+  через `PSObject.Properties`, і за його відсутності тип запуску береться з WMI. Нові
+  self-test перевірки: `Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `Health/ManagedServiceStartTypePresentAndWmiFailureUnderStrictMode` (наявний `StartType`
+  має пріоритет над WMI; збій WMI не обриває Health). Аналогічні звернення поза Health
+  відстежуються в #319.
+
+- **Config V2 B7: heartbeat більше не виконує підкладений `BRAVO.config`; регресійна
+  матриця 5.3-шляху (#154).** `BRAVO_OPERATIONS_HEARTBEAT.ps1` (з'явився в PR #225,
+  після формування переліку AUTOEXEC-цілей) викликав `Import-BravoConfiguration`
+  без `-DisallowLegacyPrimaryAutoDetect`: `BRAVO.config`, що лежав поруч із
+  комплектом, виконувався як primary-шар без наміру оператора. Тепер heartbeat
+  передає прапорець так само, як інші операторські entrypoint-и (явний
+  `-ConfigPath` лишається авторитетним), і внесений до канонічного переліку
+  `Get-BRAVOProductionEntryPointRelativePath` (`ci\BRAVOConfigV2CutoverGates.ps1`).
+  Щоб наступний новий entrypoint не випав так само, додано окремий гейт
+  `CONFIG_LOADER_CALLER_COMPLETENESS` (`Test-BRAVOConfigLoaderCallerCompleteness`):
+  AST-перелік фактичних викликачів `Import-BravoConfiguration` серед кореневих
+  `*.ps1` і `modules\` мусить дорівнювати переліку AUTOEXEC-цілей плюс єдиному
+  санкціонованому винятку — тестовому harness-у `BRAVO_SELF_TEST.ps1`. Коментарі,
+  рядкові літерали й визначення функції викликом не вважаються; файл, який не
+  розібрав парсер, провалює гейт. Крім того, кожен AST-виклик у переліченому
+  production-entrypoint мусить прив'язувати `-DisallowLegacyPrimaryAutoDetect`:
+  другий виклик без прапорця, явний `:$false` чи splat без прапорця провалюють гейт
+  (текстовий `LEGACY_CONFIG_AUTOEXEC` бачить лише перший збіг у файлі). Непрямі
+  виклики (`& $name`, аліаси) і текст дочірніх процесів лишаються поза AST-гейтом
+  (#239); відомий такий випадок — дочірній процес Configurator (#320). Гейти `LEGACY_CONFIG_AUTOEXEC` і
+  `LEGACY_READER_ISOLATION` не змінено. Новий гейт виконують ті самі споживачі —
+  PR-workflow `config-parity.yml` і збірка release-артефакту.
+
+  Регресійна матриця B7 у self-test (усе через канонічний `Import-BravoConfiguration`,
+  знімок за `Get-BRAVOEffectiveConfigurationVariableName`, реальний
+  `deploy\Get-BRAVOConfigSiteDelta.ps1`; другої моделі конфігурації немає):
+  `ConfigLoader/B7CallSiteCanonicalSnapshot*` — точний виклик loader-а з Archive,
+  Maintenance, Health, DataRestore runtime-ів і heartbeat, узятий з AST, дає той
+  самий повний знімок, що й еталон, і не виконує підкладений `BRAVO.config`;
+  `ConfigLoader/B7LocalOverride*On53Path` — заміна масиву, явний `@()`, скаляри
+  зі збереженням типу, вкладений вузол зі збереженням сусідів без `BRAVO.config`;
+  `ConfigLoader/B7LocalConfigDenyClassLeavesRejectedEvenAtDefault` — кожен
+  `DENY_*`-лист реєстру авторизації відхиляється навіть із дефолтним значенням;
+  `ConfigLoader/B7LocalConfigDerivedSecurityKeysRejected` і
+  `...ToolIntegrityNodeRejected` — `toolIntegritySettings.ManifestPath`/`Mode`,
+  `toolsPath`, шляхи виконуваних файлів, `stateRoot`, шлях lock через
+  `BRAVO.local.config` відхиляються як невідомі ключі без часткового застосування
+  (закріплює твердження T001 вище тестом); `ConfigLoader/B7MalformedLocalConfig*`
+  і `B7UnknownLocalKeyNamesKeyAndConfigRootOn53Path` — діагностика називає файл або
+  ConfigRoot і ключ; `ConfigLoader/B7Migration*` — репрезентативний 5.2
+  `BRAVO.config` із site-перевизначеннями, мігрований реальним інструментом, дає
+  той самий повний ефективний знімок, дельта детермінована, повторна міграція вже
+  мігрованого сервера нічого не додає. У `BRAVO_SELF_TEST.Governance.ps1` —
+  `ReleaseGate/CallerCompleteness*`, `ReleaseGate/CutoverGatesEnforceCallerCompleteness`
+  і `ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget` (гейт на фактичному
+  вмісті кожної цілі). `RUNTIME_MANIFEST.json` оновлено для змінених файлів.
+
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
