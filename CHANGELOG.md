@@ -2,6 +2,60 @@
 
 ## Не випущено (developer)
 
+- **Fix: BRAVO_DATA_RESTORE відхиляє диск- і корінь-відносний `-TargetPath` (#304).**
+  Режим `OutOfPlace` перевіряв `-TargetPath` лише через `IsPathRooted`, який
+  вважає rooted і `C:restore`, і `\restore`; після UAC-релаунчу такий шлях
+  резолвився від `C:\Windows\System32`, і дані LIMS розпаковувались туди. Тепер
+  `-TargetPath` перевіряється тим самим `Test-BRAVODataRestoreFullyQualifiedWindowsPath`,
+  що й `-StagingPath`: до релаунчу (exit `30`) і в `Get-BRAVODataRestorePlan`.
+  Побічно префікси `\\?\` та `\\.\` для `-TargetPath` тепер теж відхиляються.
+  Нові self-test перевірки: `DataRestore/PlanRejectsDriveAndRootRelativeTargetPath`,
+  `DataRestore/TargetPathValidatedBeforeElevation`,
+  `DataRestore/TargetPathQualificationMatrix` (ACCEPT `C:\restore`, `D:\x\restore`,
+  UNC; REJECT `C:restore`, `\restore`, `.\restore`, `..\restore`, `\\?\`, `\\.\`).
+
+- **Fix: Maintenance не обривається, якщо в `range_id_log.json` немає поля `time` (#288).**
+  `Test-RangeIdUsage` читав `$rangeData.time` напряму; під `Set-StrictMode -Version 2.0`
+  відсутня властивість кидала виняток, і за перевищеного порогу діапазонів ID нічний прогін
+  завершувався exit `60` без Trace-архіву, cleanup, backup та підсумкового звіту. Тепер `time`
+  читається через `PSObject.Properties` (як `file`/`filled`); наявне значення, як і раніше,
+  потрапляє в alert. Нові self-test перевірки:
+  `RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode`,
+  `RangeId/08-NullTimeAndPartialEntriesUnderStrictMode` (`time = null`, записи без
+  `file`/`filled`, поріг не перевищено).
+
+- **Fix: Health не падає на хостах без `ServiceController.StartType` (#295).**
+  `Get-ManagedServiceHealthIssues` читав `$service.StartType` напряму; властивість
+  з'явилась лише в .NET 4.6.1, тож на Server 2012 R2 із .NET 4.5.x під
+  `Set-StrictMode -Version 2.0` кожен Health (зокрема post-backup) завершувався exit `90`
+  без сповіщення, а WMI-fallback на `StartMode` не виконувався. Тепер `StartType` читається
+  через `PSObject.Properties`, і за його відсутності тип запуску береться з WMI. Нові
+  self-test перевірки: `Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode`,
+  `Health/ManagedServiceStartTypePresentAndWmiFailureUnderStrictMode` (наявний `StartType`
+  має пріоритет над WMI; збій WMI не обриває Health). Аналогічні звернення поза Health
+  відстежуються в #319.
+- **Документація: операторські розділи про сповіщення перекладено
+  українською, виправлено латинські літери в українських словах (A10).**
+  Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
+  `OPERATIONS.md` (разом із каналами GENERAL/ALERTS і міграцією 5.2.1 з
+  legacy webhook-ів рівня провайдера) і `BRAVO_SETUP.md` були написані
+  англійською, хоча мовна політика документації вимагає української.
+  Перекладено лише прозу; назви записів Credential Manager, значення
+  `NotificationMode`, команди, severity-мітки й дослівні рядки сповіщень не
+  змінено. Заголовки розділів `docs/BRAVO_CONFIG_V2_PILOT_RUNBOOK.md` також
+  перекладено (разом із двома внутрішніми посиланнями на них); назви дій CLI
+  (`-Preflight`, `-Prepare`, `-Status` тощо) лишились як є.
+
+  Виправлено слова, у яких латинські літери стояли замість кириличних:
+  «моноліт» у `.claude/CLAUDE.md` і `.claude/rules/05-architecture.md`
+  (суто орфографія, без зміни змісту правил), «задане» в `README.md`,
+  слова в `docs/design/BRAVO_CONFIGURATOR_DESIGN.md`,
+  `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md` і двох runbook-ах.
+  Дослівні цитати рядків рантайму та історичні записи CHANGELOG, що самі
+  містять латинську `i`, навмисно не змінено: оператор шукає їх у логах
+  саме в такому вигляді. Runtime-код не змінювався;
+  `RUNTIME_MANIFEST.json` не зачеплено.
+
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
   ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
