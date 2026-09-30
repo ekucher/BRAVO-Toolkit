@@ -264,7 +264,8 @@ if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.I
         Write-Host "ПОМИЛКА: -GenerationId має недопустимий формат (yyyyMMdd_HHmmss, опційно з collision-safe суфіксом _N): '$GenerationId'" -ForegroundColor Red
         exit 30
     }
-    # -TargetPath, як і -StagingPath, до елевації має бути повністю
+    # -TargetPath перевіряється тим самим валідатором, що й -StagingPath
+    # (той — уже в елевованому процесі), але ДО елевації, бо має бути повністю
     # кваліфікованим: диск-відносне ('C:restore') і корінь-відносне
     # ('\restore') значення IsPathRooted вважає "rooted", але elevated-процес
     # стартує з C:\Windows\System32 і розпакував би дані LIMS туди.
@@ -432,8 +433,8 @@ $stagingRootPath = if ([string]::IsNullOrWhiteSpace($StagingPath)) {
     Join-Path $backupRootPath 'RESTORE_STAGING'
 } else {
     # Абсолютність вимагається явно (round-7 P2, посилено follow-up P2):
-    # на відміну від -TargetPath (Get-BRAVODataRestorePlan уже вимагає
-    # IsPathRooted), -StagingPath раніше йшов напряму в GetFullPath без цієї
+    # на відміну від -TargetPath (Get-BRAVODataRestorePlan вимагає
+    # повністю кваліфікований шлях, #304), -StagingPath раніше йшов напряму в GetFullPath без цієї
     # перевірки — відносне значення резолвилось відносно робочого каталогу
     # ЕЛЕВОВАНОГО процесу (типово системний/runtime каталог, не те, що
     # оператор мав на увазі), і SFTP-завантаження та рекурсивне очищення

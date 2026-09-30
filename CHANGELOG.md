@@ -10,7 +10,9 @@
   що й `-StagingPath`: до релаунчу (exit `30`) і в `Get-BRAVODataRestorePlan`.
   Побічно префікси `\\?\` та `\\.\` для `-TargetPath` тепер теж відхиляються.
   Нові self-test перевірки: `DataRestore/PlanRejectsDriveAndRootRelativeTargetPath`,
-  `DataRestore/TargetPathValidatedBeforeElevation`.
+  `DataRestore/TargetPathValidatedBeforeElevation`,
+  `DataRestore/TargetPathQualificationMatrix` (ACCEPT `C:\restore`, `D:\x\restore`,
+  UNC; REJECT `C:restore`, `\restore`, `.\restore`, `..\restore`, `\\?\`, `\\.\`).
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
