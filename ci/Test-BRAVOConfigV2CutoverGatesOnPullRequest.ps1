@@ -29,5 +29,5 @@ if (-not $result.Passed) {
     exit 1
 }
 
-Write-Host 'Config V2 cutover gates (LEGACY_CONFIG_REMOVED / LEGACY_CONFIG_AUTOEXEC): PASS.'
+Write-Host 'Config V2 cutover gates (LEGACY_CONFIG_REMOVED / LEGACY_CONFIG_AUTOEXEC / LEGACY_READER_ISOLATION / CONFIG_LOADER_CALLER_COMPLETENESS): PASS.'
 exit 0

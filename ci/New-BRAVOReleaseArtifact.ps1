@@ -226,6 +226,7 @@ if (-not $cutoverGateResult.Passed) {
 }
 Write-Host 'Гейт LEGACY_CONFIG_REMOVED (issue #216, B4-2): BRAVO.config відсутній у staged-комплекті.'
 Write-Host ("Гейт LEGACY_CONFIG_AUTOEXEC (issue #216): усі {0} production entrypoint(и) staged-комплекту блокують auto-detect BRAVO.config." -f $productionEntryPointGuardTargets.Count)
+Write-Host 'Гейт CONFIG_LOADER_CALLER_COMPLETENESS (issue #154, B7): кожен викликач Import-BravoConfiguration серед кореневих *.ps1 і modules\ staged-комплекту є в переліку AUTOEXEC-цілей.'
 
 # --- 4. release-manifest.json + SHA-256 ---------------------------------
 

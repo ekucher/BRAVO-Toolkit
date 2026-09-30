@@ -19,6 +19,11 @@
 # як бекар прапорця, хоча ефективно вимикає блокування auto-detect. Нижче —
 # фікс: перевіряється, що явна прив'язка (якщо вона є) не встановлює
 # протилежне значення.
+#
+# Issue #154 (B7): поруч — окремий гейт CONFIG_LOADER_CALLER_COMPLETENESS
+# (Test-BRAVOConfigLoaderCallerCompleteness): AST-доказ, що фіксований
+# перелік AUTOEXEC-цілей не пропускає жодного реального викликача
+# Import-BravoConfiguration серед кореневих *.ps1 і modules\.
 
 function Get-BRAVOProductionEntryPointRelativePath {
     <#
@@ -45,8 +50,207 @@ function Get-BRAVOProductionEntryPointRelativePath {
         'BRAVO_RESTORE_TEST.ps1',
         'BRAVO_TASKS_DIAGNOSE.ps1',
         'BRAVO_TASKS_INSTALL.ps1',
-        'BRAVO_TASKS_UNINSTALL.ps1'
+        'BRAVO_TASKS_UNINSTALL.ps1',
+        # Issue #154 (B7): операторський heartbeat (PR #225) з'явився ПІСЛЯ
+        # формування цього переліку й до B7 викликав Import-BravoConfiguration
+        # без прапорця — auto-derived BRAVO.config поруч виконувався як
+        # primary-шар. Щоб наступний новий entrypoint не випав так само,
+        # перелік тепер звіряється з фактичними викликачами AST-інваріантом
+        # повноти (Test-BRAVOConfigLoaderCallerCompleteness нижче).
+        'BRAVO_OPERATIONS_HEARTBEAT.ps1'
     )
+}
+
+function Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath {
+    <#
+        Issue #154 (B7): ЄДИНИЙ файл у межах сканування інваріанта повноти
+        (кореневі *.ps1 і modules\), якому дозволено викликати
+        Import-BravoConfiguration поза переліком
+        Get-BRAVOProductionEntryPointRelativePath. BRAVO_SELF_TEST.ps1 — не
+        production-entrypoint, а тестовий harness: він НАВМИСНО викликає
+        loader і з прапорцем, і без нього (контрольні прогони Proof B /
+        PostUpdateStaleConfig доводять, що без прапорця файл справді
+        читається). Migration/deploy-інструменти (deploy\*,
+        BRAVO_CONFIG_INTEGRATE.ps1) сюди не потрапляють: deploy\ поза
+        обсягом сканування, а BRAVO_CONFIG_INTEGRATE.ps1 містить ім'я
+        функції лише в рядкових літералах (AST-виклику немає).
+    #>
+    return @(
+        'BRAVO_SELF_TEST.ps1'
+    )
+}
+
+function Get-BRAVOConfigLoaderCallerRelativePath {
+    <#
+        Issue #154 (B7): AST-перелік файлів, що РЕАЛЬНО викликають
+        Import-BravoConfiguration (CommandAst.GetCommandName(), без
+        урахування регістру) — серед усіх кореневих *.ps1 і всіх
+        *.ps1/*.psm1 під modules\. Коментар, рядковий літерал чи
+        here-string з тим самим текстом викликом не є (на відміну від
+        текстового пошуку). Непрямий виклик (`& $name`, аліас, обчислене
+        ім'я) статичний AST не бачить — той самий свідомий межовий
+        випадок, що й у гейті LEGACY_READER_ISOLATION (#239).
+
+        Кожен AST-виклик додатково класифікується: FlaglessCall — виклик,
+        який НЕ прив'язує -DisallowLegacyPrimaryAutoDetect (відсутній або
+        явно :$false/:0), або splat-виклик, прапорець якого статично не
+        довести (fail closed). Формат елемента — '<відносний шлях>:<рядок>'.
+
+        Повертає [pscustomobject]@{ CallerRelativePath; FlaglessCall; ParseFailures }:
+        відносні шляхи нормалізовано до '\'-роздільника (форма переліку
+        Get-BRAVOProductionEntryPointRelativePath незалежно від ОС
+        прогону). Файл, який парсер не розібрав, НЕ пропускається мовчки —
+        він потрапляє в ParseFailures (fail closed у викликача).
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root
+    )
+
+    $resolvedRoot = (Get-Item -LiteralPath $Root).FullName
+    $candidateFiles = New-Object System.Collections.Generic.List[object]
+    foreach ($rootScript in @(Get-ChildItem -LiteralPath $resolvedRoot -File -ErrorAction SilentlyContinue |
+            Where-Object { $_.Extension -eq '.ps1' })) {
+        [void]$candidateFiles.Add($rootScript)
+    }
+    $modulesPath = Join-Path $resolvedRoot 'modules'
+    if (Test-Path -LiteralPath $modulesPath -PathType Container) {
+        # `-Include` разом із `-LiteralPath` на Windows PowerShell 5.1
+        # ненадійний — розширення фільтруються вручну (той самий прийом,
+        # що в гейті LEGACY_READER_ISOLATION).
+        foreach ($moduleScript in @(Get-ChildItem -LiteralPath $modulesPath -Recurse -File |
+                Where-Object { $_.Extension -eq '.ps1' -or $_.Extension -eq '.psm1' })) {
+            [void]$candidateFiles.Add($moduleScript)
+        }
+    }
+
+    $callers = New-Object System.Collections.Generic.List[string]
+    $flaglessCalls = New-Object System.Collections.Generic.List[string]
+    $parseFailures = New-Object System.Collections.Generic.List[string]
+    foreach ($candidateFile in $candidateFiles) {
+        $relativePath = $candidateFile.FullName.Substring($resolvedRoot.Length).TrimStart('\', '/').Replace('/', '\')
+        $candidateText = [IO.File]::ReadAllText($candidateFile.FullName, [Text.Encoding]::UTF8)
+        $candidateParseErrors = $null
+        $candidateAst = [System.Management.Automation.Language.Parser]::ParseInput(
+            $candidateText, [ref]$null, [ref]$candidateParseErrors
+        )
+        if ($candidateParseErrors -and $candidateParseErrors.Count -gt 0) {
+            [void]$parseFailures.Add("$relativePath ($($candidateParseErrors[0].Message))")
+            continue
+        }
+        $loaderCalls = @($candidateAst.FindAll({
+                    param($astNode)
+                    ($astNode -is [System.Management.Automation.Language.CommandAst]) -and
+                    [string]::Equals([string]$astNode.GetCommandName(), 'Import-BravoConfiguration', [StringComparison]::OrdinalIgnoreCase)
+                }, $true))
+        if ($loaderCalls.Count -gt 0) {
+            [void]$callers.Add($relativePath)
+        }
+        foreach ($loaderCall in $loaderCalls) {
+            $flagBound = $false
+            foreach ($callElement in @($loaderCall.CommandElements)) {
+                if ($callElement -is [System.Management.Automation.Language.CommandParameterAst] -and
+                    [string]::Equals($callElement.ParameterName, 'DisallowLegacyPrimaryAutoDetect', [StringComparison]::OrdinalIgnoreCase)) {
+                    $flagArgumentText = if ($null -ne $callElement.Argument) { [string]$callElement.Argument.Extent.Text } else { '' }
+                    $flagBound = -not ($flagArgumentText -match '^\$?(false|0)$')
+                }
+            }
+            # Splat без явного прапорця статично не довести — fail closed;
+            # явний прапорець поруч зі splat однозначний (дубль параметра
+            # у splat — помилка прив'язки, а не тихе :$false).
+            if (-not $flagBound) {
+                [void]$flaglessCalls.Add($relativePath + ':' + $loaderCall.Extent.StartLineNumber)
+            }
+        }
+    }
+
+    return [pscustomobject]@{
+        CallerRelativePath = @($callers.ToArray())
+        FlaglessCall       = @($flaglessCalls.ToArray())
+        ParseFailures      = @($parseFailures.ToArray())
+    }
+}
+
+function Test-BRAVOConfigLoaderCallerCompleteness {
+    <#
+        Issue #154 (B7): інваріант повноти для переліку AUTOEXEC-цілей.
+        Гейт LEGACY_CONFIG_AUTOEXEC перевіряє лише ФІКСОВАНИЙ перелік —
+        новий entrypoint, що викликає Import-BravoConfiguration без
+        -DisallowLegacyPrimaryAutoDetect і якого забули внести в перелік,
+        гейт не бачить узагалі (саме так BRAVO_OPERATIONS_HEARTBEAT.ps1
+        пройшов повз гейт після PR #225). Тут: кожен фактичний AST-викликач
+        (Get-BRAVOConfigLoaderCallerRelativePath) мусить бути або в переліку
+        AUTOEXEC-цілей, або в явному санкціонованому винятку
+        (Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath).
+
+        Окрема функція, а не розширення гейтів AUTOEXEC чи
+        LEGACY_READER_ISOLATION: ті гейти лишаються без змін (#239 — не
+        додавати до них евристик). Повертає [pscustomobject]@{ Passed;
+        Failures; CallerRelativePath } — НЕ кидає виняток.
+    #>
+    param(
+        [Parameter(Mandatory = $true)][string]$Root,
+        [string[]]$ProductionEntryPointRelativePath = (Get-BRAVOProductionEntryPointRelativePath),
+        [string[]]$SanctionedNonProductionCallerRelativePath = (Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath)
+    )
+
+    $failures = New-Object System.Collections.Generic.List[string]
+    $knownCallers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($knownRelativePath in @($ProductionEntryPointRelativePath) + @($SanctionedNonProductionCallerRelativePath)) {
+        if (-not [string]::IsNullOrWhiteSpace($knownRelativePath)) {
+            [void]$knownCallers.Add($knownRelativePath.Replace('/', '\'))
+        }
+    }
+
+    $callerScan = Get-BRAVOConfigLoaderCallerRelativePath -Root $Root
+    if ($callerScan.ParseFailures.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт CONFIG_LOADER_CALLER_COMPLETENESS (issue #154, B7): не вдалося розібрати AST ' + $callerScan.ParseFailures.Count +
+            ' файл(ів) — довести, що вони не викликають Import-BravoConfiguration поза переліком, неможливо: ' +
+            ([string]::Join(', ', $callerScan.ParseFailures))
+        )
+    }
+    $unlistedCallers = @($callerScan.CallerRelativePath | Where-Object { -not $knownCallers.Contains($_) })
+    if ($unlistedCallers.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт CONFIG_LOADER_CALLER_COMPLETENESS (issue #154, B7): ' + $unlistedCallers.Count +
+            ' файл(и) викликають Import-BravoConfiguration, але відсутні в переліку Get-BRAVOProductionEntryPointRelativePath ' +
+            '(ci\BRAVOConfigV2CutoverGates.ps1) — гейт LEGACY_CONFIG_AUTOEXEC їх не перевіряє, і auto-derived BRAVO.config поруч ' +
+            'міг би виконуватись без наміру оператора. Внесіть кожен у перелік (і передайте -DisallowLegacyPrimaryAutoDetect) ' +
+            'або, для НЕ-production тестового harness-у, у Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath з обґрунтуванням: ' +
+            ([string]::Join(', ', $unlistedCallers))
+        )
+    }
+
+    # Файл у переліку ще не означає, що КОЖЕН його виклик передає прапорець:
+    # гейт LEGACY_CONFIG_AUTOEXEC бачить лише перший текстовий збіг. Тут
+    # кожен AST-виклик у переліченому production-entrypoint мусить
+    # прив'язувати -DisallowLegacyPrimaryAutoDetect (санкціонований тестовий
+    # harness навмисно викликає loader і без прапорця).
+    # Неперелічений файл уже провалив гейт вище (одна знахідка на файл);
+    # тут — лише виклики в ПЕРЕЛІЧЕНИХ production-entrypoint-ах.
+    $listedProductionCallers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($productionRelativePath in @($ProductionEntryPointRelativePath)) {
+        if (-not [string]::IsNullOrWhiteSpace($productionRelativePath)) {
+            [void]$listedProductionCallers.Add($productionRelativePath.Replace('/', '\'))
+        }
+    }
+    $productionFlaglessCalls = @($callerScan.FlaglessCall | Where-Object {
+            $listedProductionCallers.Contains($_.Substring(0, $_.LastIndexOf(':')))
+        })
+    if ($productionFlaglessCalls.Count -gt 0) {
+        [void]$failures.Add(
+            'Гейт CONFIG_LOADER_CALLER_COMPLETENESS (issue #154, B7): ' + $productionFlaglessCalls.Count +
+            ' виклик(и) Import-BravoConfiguration у production-коді не прив''язують -DisallowLegacyPrimaryAutoDetect ' +
+            '(відсутній, явно :$false/:0 або splat, який статично не довести) — auto-derived BRAVO.config поруч виконався б: ' +
+            ([string]::Join(', ', $productionFlaglessCalls))
+        )
+    }
+
+    return [pscustomobject]@{
+        Passed             = ($failures.Count -eq 0)
+        Failures           = @($failures.ToArray())
+        CallerRelativePath = @($callerScan.CallerRelativePath)
+    }
 }
 
 function Test-BRAVOConfigV2CutoverGates {
@@ -482,6 +686,18 @@ function Test-BRAVOConfigV2CutoverGates {
             'напряму, минаючи guard Import-BravoConfiguration -DisallowLegacyPrimaryAutoDetect: ' +
             ([string]::Join(', ', $legacyReaderViolations.ToArray()))
         )
+    }
+
+    # --- Гейт 4: CONFIG_LOADER_CALLER_COMPLETENESS (issue #154, B7) ---
+    # Окрема AST-перевірка повноти переліку AUTOEXEC-цілей (гейти 2 і 3
+    # вище не змінюються). Той самий -ProductionEntryPointRelativePath, що
+    # й гейт 2, — перелік, який перевіряє гейт 2, і перелік, повноту якого
+    # доводить гейт 4, завжди один і той самий.
+    $callerCompleteness = Test-BRAVOConfigLoaderCallerCompleteness `
+        -Root $Root `
+        -ProductionEntryPointRelativePath $ProductionEntryPointRelativePath
+    foreach ($callerCompletenessFailure in $callerCompleteness.Failures) {
+        [void]$failures.Add($callerCompletenessFailure)
     }
 
     return [pscustomobject]@{
