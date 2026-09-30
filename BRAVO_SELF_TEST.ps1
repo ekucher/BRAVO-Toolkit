@@ -12717,6 +12717,590 @@ try {
         -Name "Health/BusyWinScpDefersSftpCheckAsWarning" `
         -Failure "зайнятий WinSCP.com має ВІДКЛАДАТИ SFTP health-check (WARNING + SKIPPED-кроки + SftpVerified=false), а не давати CRITICAL «ПОТРІБНА ДІЯ» — transient-конкуренція з іншою BRAVO-передачею не є збоєм SFTP"
 
+    # T011: оркестрація Health — поведінкові перевірки порядку секцій
+    # перевірок, незалежності перевірок одна від одної, розв'язання
+    # підсумкового коду завершення через Complete-BRAVOHealthResult,
+    # пропуску лише SFTP-гілки при порушенні цілісності інструментів (код 32,
+    # README) і придушення доставки сповіщень параметром -NoSlack.
+    # Наявні Health/* контракти вище — текстові (IndexOf/Contains); тут
+    # runtime справді виконується. Повний прогін Invoke-BRAVOHealth
+    # неможливий без реальної конфігурації, служб, Credential Manager і
+    # WinSCP, тому дочірній процес збирає runtime з ДОСЛІВНОГО тексту
+    # BRAVO.Health.Runtime.ps1 (AST): справжній param-блок, справжній
+    # початковий стан прогону (лічильники кроків, історія,
+    # $script:BRAVOToolManifest = $null), справжні функції кроків і
+    # Complete-BRAVOHealthResult, а також дослівна оркестрація від
+    # $script:BRAVOHealthLevelSeverity до кінця тіла (Initialize-BRAVOHealthSteps,
+    # усі перевірки, гейти сповіщень, кожен return Complete-BRAVOHealthResult)
+    # плюс справжній invocation guard (exit $script:healthRuntimeExitCode).
+    # Справжніми лишаються й Get-SFTPHealthIssues/Test-SFTPHealthConfiguration
+    # (саме там живе гейт цілісності), Write-HealthLog (лічильник
+    # попереджень -> код 10) і Resolve-BRAVOExitCode. Преамбулу (імпорт
+    # модулів, конфігурацію, облікові дані) замінює seed змінних, а самі
+    # перевірки, WinSCP, стан алертів, статус-файл і доставку сповіщень —
+    # стаби, що пишуть події у журнал. Зібраний runtime запускається через
+    # справжній Invoke-BRAVOHealthEntrypoint. Стаби живуть лише в дочірньому
+    # процесі; мережа, служби й реальні інструменти не чіпаються.
+    # Увесь блок — у ДОЧІРНЬОМУ scope (`& { ... }`): жодна з його змінних
+    # не лишається у script-scope цього flat-файлу (жорсткий ліміт 4096
+    # змінних, див. Framework/BootstrapIntegrityCheckedBeforeManifestCoveredImports).
+    & {
+        $healthOrchestrationRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_HEALTH_ORCHESTRATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($healthOrchestrationRoot)
+            $healthOrchestrationStubs = @'
+function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function New-ProbeIssue {
+    param([string]$Kind, [string]$Component, [string]$Reason, [string]$Location)
+    return [pscustomobject]@{ Kind = $Kind; Component = $Component; Reason = $Reason; FileName = 'немає даних'; LastWriteTime = $null; SizeBytes = $null; ActualSizeBytes = $null; Location = $Location; Details = @() }
+}
+function Write-BRAVOStepResult {
+    param([int]$Current, [int]$Total, [string]$Name, [string]$Status, [string]$Details, $Duration)
+    Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
+}
+function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
+function Get-BRAVORestoreGenerationManifest { param($BackupRoot) throw 'self-test: маніфест поколінь не потрібен' }
+function Get-BRAVORestoreVerifyStatePath { param($StateRoot) return 'self-test-restore-verify.json' }
+function Get-BRAVORestoreVerifyState { param($Path) return [pscustomobject]@{ Exists = $false; Corrupt = $false; State = $null } }
+function Get-BRAVOOSSupportTier { return [pscustomobject]@{ Tier = 'Supported'; OperatingSystem = 'self-test'; OperatingSystemVersion = '10.0'; Build = 0; PowerShellVersion = '5.1'; DotNetRelease = 0; Message = '' } }
+function Get-BRAVOToolIntegrityRecommendation { param($ToolPaths, $ManifestPath) return [pscustomobject]@{ HasIntegrityIssue = $false; Message = '' } }
+function Test-BRAVOToolManifestIntegrity {
+    param($ToolsDirectory, $ManifestPath, $Mode)
+    Add-ProbeEvent 'TOOL-MANIFEST'
+    if ($script:ProbeToolIntegrityViolation) {
+        return [pscustomobject]@{ IsValid = $false; ShouldBlock = $true; Message = 'self-test: хеш WinSCP.com не збігається з TOOLS_MANIFEST.json' }
+    }
+    return [pscustomobject]@{ IsValid = $true; ShouldBlock = $false; Message = '' }
+}
+function Test-BRAVOHealthEnvironmentPreflight {
+    param($LogPath, $TemporaryRoot)
+    Add-ProbeEvent 'PREFLIGHT'
+    if ($script:ProbePreflightPrivilegeFailure) { return [pscustomobject]@{ IsWritable = $false; FailedPath = 'LOGS'; ErrorMessage = 'self-test: Access denied'; IsPrivilegeFailure = $true } }
+    return [pscustomobject]@{ IsWritable = $true; FailedPath = $null; ErrorMessage = $null; IsPrivilegeFailure = $false }
+}
+function Get-HostInformation { return 'self-test-host' }
+function New-BRAVOOperatorNotificationMessage { param($Severity, $Operation, $ActionText, $ReasonLines, $InstitutionName, $InstitutionCode, $HostInformation, $ResultLines, $Timestamp, $ProductName, $Version, $BuildId, $LogPath) return 'self-test environment alert' }
+function Get-BRAVOHealthTemporaryRoot { return $script:ProbeTemporaryRoot }
+function Remove-BRAVOHealthTemporaryDirectory { param($Path) }
+function Invoke-BRAVOServiceQuiescenceWatchdog { Add-ProbeEvent 'CHECK watchdog'; return @() }
+function Get-ManagedServiceHealthIssues {
+    Add-ProbeEvent 'CHECK services'
+    if ($script:ProbeFailServices) { return @(New-ProbeIssue -Kind 'Service' -Component 'Служба BRAVO' -Reason 'self-test: служба зупинена' -Location 'BRAVO') }
+    return @()
+}
+function Get-BackupHealthIssues {
+    Add-ProbeEvent 'CHECK local'
+    $script:healthLatestArchives['MODEL'] = [pscustomobject]@{ FullName = $script:ProbeLocalArchivePath; LastWriteTime = (Get-Date); SizeBytes = 1; GenerationId = 'self-test' }
+    return @()
+}
+function Get-RestoreVerifyHealthIssues { Add-ProbeEvent 'CHECK restore-verify'; return @() }
+function Get-BAZALocalSyncHealthIssues { param([bool]$Enabled, $SourcePath, $DestinationPath, [string]$Label) Add-ProbeEvent "CHECK baza-local $Label"; return @() }
+function Get-SMBHealthIssues {
+    Add-ProbeEvent 'CHECK smb'
+    if ($script:ProbeFailSmb) { return @(New-ProbeIssue -Kind 'SMBConnection' -Component 'NAS/SMB' -Reason 'self-test: NAS недоступний' -Location '\\nas\backup') }
+    return @()
+}
+function Test-BRAVOWinSCPAvailable {
+    param($WinSCPPath)
+    Add-ProbeEvent 'WINSCP-AVAILABILITY'
+    if ($script:ProbeWinScpBusy) { return [pscustomobject]@{ Available = $false; ProcessIds = @(4242) } }
+    return [pscustomobject]@{ Available = $true; ProcessIds = @() }
+}
+function Get-BRAVOWinSCPBusyMessage { param($Availability, $Operation) return "self-test: WinSCP.com зайнятий ($Operation)" }
+function Get-SFTPRemoteArchiveChecksumResults { param($ArchiveChecks) Add-ProbeEvent 'WINSCP-CHECKSUM'; return @{} }
+function Invoke-WinSCPHealthSession { param($Commands) Add-ProbeEvent 'WINSCP-SESSION'; return [pscustomobject]@{ Success = $true; ExitCode = 0; Xml = $null; Error = $null } }
+function Get-WinSCPRemoteListings { param($Xml) return @([pscustomobject]@{ Destination = '/self-test/model'; Files = @() }) }
+function Get-WinSCPRemoteDownloads { param($Xml) return @() }
+function Resolve-DownloadedRemoteHashPath { param($ArchiveCheck, $Downloads) return [pscustomobject]@{ Path = 'self-test.sha512'; Error = $null } }
+function Test-SFTPArchiveCopy { param($ArchiveDefinition, $LocalArchive, $RemoteListing, $RemoteDirectory, $DownloadedRemoteHashPath, $RemoteArchiveChecksumResult) Add-ProbeEvent "WINSCP-COPY $($ArchiveDefinition.Type)"; return $null }
+function New-SlackAlertMessage {
+    param($Issues, $Duration)
+    foreach ($probeIssue in @($Issues)) { Add-ProbeEvent ("ALERT-ISSUE {0} | {1}" -f $probeIssue.Component, $probeIssue.Reason) }
+    return 'self-test alert'
+}
+function New-SlackSuccessMessage { param($Duration) return 'self-test success' }
+function Get-AlertFingerprint { param($Issues) return 'self-test-alert-fingerprint' }
+function Test-AlertSuppressed { param($Fingerprint) return $false }
+function Save-AlertState { param($Fingerprint) Add-ProbeEvent 'ALERT-STATE-SAVE' }
+function Clear-AlertState { Add-ProbeEvent 'ALERT-STATE-CLEAR' }
+function Get-BRAVOHealthOperationalState { return [pscustomobject]@{ RecoveryPending = $false } }
+function Save-BRAVOHealthOperationalState { param([bool]$RecoveryPending) Add-ProbeEvent "RECOVERY-PENDING $RecoveryPending" }
+function Get-BRAVOHealthSuccessFingerprint { param($DestinationSummary, $SftpDeferred, $EnabledCheckNames, $ArchiveIdentities) return ('0' * 64) }
+function Get-BRAVOHealthSuccessNotificationState { return $null }
+function Save-BRAVOHealthSuccessNotificationState { param($Fingerprint) Add-ProbeEvent 'SUCCESS-STATE-SAVE' }
+function Resolve-BRAVONotificationRoute { param($Severity, $NotificationMode, $RoutingTable) Add-ProbeEvent "NOTIFY-ROUTE $Severity"; if ($Severity -eq 'SUCCESS') { return 'general' } return 'alerts' }
+function ConvertTo-BRAVONotificationPayloadText { param($Provider, $Message) return @([string]$Message) }
+function Send-BRAVONotificationChunks {
+    param($Provider, $WebhookUrl, $MessageChunks, $TimeoutSeconds)
+    if ($script:ProbeNotificationThrows) { Add-ProbeEvent 'NOTIFY-FAIL'; throw 'self-test: webhook недоступний' }
+    Add-ProbeEvent ("NOTIFY-SEND {0} {1}" -f $WebhookUrl, (@($MessageChunks) -join '|'))
+}
+'@
+            $healthOrchestrationSeed = @'
+$global:ScriptVersion = 'self-test'
+$global:ScriptBuildId = 'self-test'
+$global:archiveDefinitions = @([pscustomobject]@{ Type = 'MODEL'; Enabled = $true })
+$archiveDefinitions = $global:archiveDefinitions
+$bravoScriptDirectory = $probeWorkRoot
+$ConfigPath = Join-Path $probeWorkRoot 'BRAVO.config'
+$healthCheckStarted = Get-Date
+$healthCheckStartedUtc = $healthCheckStarted.ToUniversalTime()
+$script:healthLatestArchives = @{}
+$backupMonitoring = [pscustomobject]@{
+    Enabled = $probeMonitoringEnabled
+    NotificationProvider = 'slack'
+    NotificationMode = $probeNotificationMode
+    NotificationRouting = $null
+    MaxBackupAgeHours = 26
+    InstitutionName = 'self-test'
+    InstitutionCode = 'SELFTEST'
+    SuccessDedupMinutes = 0
+    LogFileNameTemplate = 'BRAVO_ARCHIV_HEALTH_{0}.log'
+    SFTP = [pscustomobject]@{ Enabled = $true; CheckArchiveUploads = $true; CheckBAZASynchronization = $false; OperationTimeoutSeconds = 60; RemoteBackupMaxAgeHours = 26; VerifyRemoteArchiveHash = $false; BAZAPreviewOptions = '-preview'; DifferenceDetailLimit = 10 }
+    SMB = [pscustomobject]@{ Enabled = $true }
+}
+$componentSettings = [pscustomobject]@{ SFTP = [pscustomobject]@{ ArchiveUpload = $true } }
+$storageEffective = [pscustomobject]@{
+    SFTP = [pscustomobject]@{ Enabled = $true; DisabledReason = '' }
+    SMB = [pscustomobject]@{ Enabled = $true; DisabledReason = '' }
+}
+$bazaAppLocalHealthEnabled = $true
+$bazaWWWLocalHealthEnabled = $true
+$bazaAppSFTPHealthEnabled = $false
+$bazaWWWSFTPHealthEnabled = $false
+$bazaWWWDetection = [pscustomobject]@{ Success = $true; ServiceName = 'self-test'; Reason = '' }
+$bazaAppPaths = [pscustomobject]@{ Source = (Join-Path $probeWorkRoot 'baza_app'); Destination = (Join-Path $probeWorkRoot 'backup\BAZA_APP') }
+$bazaWWWPaths = [pscustomobject]@{ Source = (Join-Path $probeWorkRoot 'baza_www'); Destination = (Join-Path $probeWorkRoot 'backup\BAZA_WWW') }
+$logPath = Join-Path $probeWorkRoot 'logs'
+$healthLogFile = Join-Path $logPath 'health.log'
+$logTimestampFormat = 'yyyy-MM-dd HH:mm:ss'
+$logFileEncoding = 'UTF8'
+$credentialHelperLoaded = $true
+$credentialHelperError = $null
+$notificationCredentialError = $null
+$sftpCredentialError = $null
+$smbCredentialError = $null
+$script:smbCredential = $null
+$script:BRAVOWarningCount = 0
+$script:bravoHealthTemporaryRoot = $null
+$script:BRAVOHealthLogWritable = $true
+$NotificationProvider = 'slack'
+$NotificationMode = $probeNotificationMode
+$script:NotificationWebhookUrls = @{ alerts = $probeAlertsWebhook; general = 'https://self-test.invalid/general' }
+$script:Login = 'self-test'
+$script:resolvedSftpHost = 'self-test.invalid'
+$script:sftpUrl = 'sftp://self-test.invalid/'
+$sftpHostKey = 'ssh-ed25519 255 self-test'
+$sftpArchivesHealthEnabled = $true
+$sftpBazaAppHealthEnabled = $false
+$sftpBazaWWWHealthEnabled = $false
+$sftpCredentialRequired = $true
+$smbCredentialRequired = $true
+$NotificationRequestTimeoutSeconds = 5
+$NotificationProviderDisplayName = 'Slack'
+$consoleSettings = [pscustomobject]@{ ConsoleLevel = 'WARNING'; StepWidth = 58; ShowTimestampsInConsole = $false }
+$progressSettings = [pscustomobject]@{ Enabled = $false }
+$schedulerSettings = [pscustomobject]@{ TaskPath = '\'; Backup = [pscustomobject]@{ TaskName = 'self-test' }; Health = [pscustomobject]@{ BusyWaitMinutes = 0 }; RestoreVerify = [pscustomobject]@{ Enabled = $true } }
+$restoreVerifySettings = [pscustomobject]@{ MaxVerificationAgeHours = 200 }
+$bravoSettings = [pscustomobject]@{ InstitutionName = 'self-test'; InstitutionCode = 'SELFTEST' }
+$script:BRAVOCompatibility = [pscustomobject]@{ WindowsVersion = 'self-test'; PowerShellVersion = 'self-test'; WmiProvider = 'self-test'; JsonProvider = 'self-test'; TaskSchedulerProvider = 'self-test' }
+$script:BRAVOPowerShellUpdate = [pscustomobject]@{ IsUpdateRecommended = $false; Message = '' }
+$script:BRAVOWindowsPatchLevel = [pscustomobject]@{ IsUpdateRecommended = $false; Message = '' }
+$toolsPath = Join-Path $probeWorkRoot 'Tools'
+$arcPath = Join-Path $toolsPath '7za.exe'
+$winSCPPath = Join-Path $toolsPath 'WinSCP.com'
+$winSCPAssemblyPath = Join-Path $toolsPath 'WinSCPnet.dll'
+$toolIntegritySettings = $null
+$sftpDirectories = @{ MODEL = '/self-test/model' }
+$hashFileExtension = '.sha512'
+$sftpSynchronizationOptions = ''
+$sftpConnectionTimeoutSeconds = 15
+$stateRoot = Join-Path $probeWorkRoot 'state'
+$backupRootPath = Join-Path $probeWorkRoot 'backup'
+$credentialSettings = $null
+$operationsReportingSettings = $null
+'@
+            $healthOrchestrationProbeScript = @'
+param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeResultPath = Join-Path $ProbeRoot 'result.json'
+$probeUtf8 = New-Object Text.UTF8Encoding($false)
+try {
+    $probeRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $RepositoryRoot 'modules\BRAVO.Health\BRAVO.Health.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $probeParseErrors = $null
+    $probeAst = [Management.Automation.Language.Parser]::ParseInput($probeRuntimeText, [ref]$null, [ref]$probeParseErrors)
+    if (@($probeParseErrors).Count -gt 0) { throw "runtime не парситься: $($probeParseErrors[0].Message)" }
+    $probeTopStatements = @($probeAst.EndBlock.Statements)
+    $probeWrapper = @($probeTopStatements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOHealth'
+        }) | Select-Object -First 1
+    if ($null -eq $probeWrapper) { throw 'у runtime немає функції Invoke-BRAVOHealth' }
+    $probeGuard = @($probeTopStatements | Where-Object {
+            $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Extent.Text -match '^if \(\$MyInvocation\.InvocationName -ne ''\.''\)'
+        }) | Select-Object -First 1
+    if ($null -eq $probeGuard) { throw 'у runtime немає invocation guard' }
+    $probeStatements = @($probeWrapper.Body.EndBlock.Statements)
+    $probeRegionIndex = -1
+    $probeFirstFunctionIndex = -1
+    for ($probeIndex = 0; $probeIndex -lt $probeStatements.Count; $probeIndex++) {
+        if ($probeFirstFunctionIndex -lt 0 -and $probeStatements[$probeIndex] -is [Management.Automation.Language.FunctionDefinitionAst]) {
+            $probeFirstFunctionIndex = $probeIndex
+        }
+        if ($probeStatements[$probeIndex].Extent.Text -match '^\$script:BRAVOHealthLevelSeverity = @\{') {
+            $probeRegionIndex = $probeIndex
+            break
+        }
+    }
+    if ($probeRegionIndex -lt 0 -or $probeFirstFunctionIndex -lt 0) { throw 'у тілі Invoke-BRAVOHealth немає $script:BRAVOHealthLevelSeverity' }
+
+    $probeStubs = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'stubs.ps1'), [Text.Encoding]::UTF8)
+    $probeStubNames = @{}
+    foreach ($probeStubAst in @([Management.Automation.Language.Parser]::ParseInput($probeStubs, [ref]$null, [ref]$null).EndBlock.Statements)) {
+        if ($probeStubAst -is [Management.Automation.Language.FunctionDefinitionAst]) { $probeStubNames[$probeStubAst.Name] = $true }
+    }
+    # Дослівний стан прогону до першої функції (лічильники кроків, історія,
+    # $script:BRAVOToolManifest = $null) і справжні функції до регіону.
+    $probeLeadingTexts = New-Object System.Collections.Generic.List[string]
+    for ($probeIndex = 0; $probeIndex -lt $probeFirstFunctionIndex; $probeIndex++) {
+        $probeLeadingTexts.Add($probeStatements[$probeIndex].Extent.Text)
+    }
+    $probeFunctionTexts = New-Object System.Collections.Generic.List[string]
+    for ($probeIndex = 0; $probeIndex -lt $probeRegionIndex; $probeIndex++) {
+        $probeStatement = $probeStatements[$probeIndex]
+        if ($probeStatement -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            -not $probeStubNames.ContainsKey($probeStatement.Name)) {
+            $probeFunctionTexts.Add($probeStatement.Extent.Text)
+        }
+    }
+    # Дослівна оркестрація від рівнів журналу до кінця тіла: ініціалізація
+    # кроків, усі перевірки, сповіщення й кожен return Complete-BRAVOHealthResult.
+    # Затінені стабами визначення функцій у ній замінюються пробілами.
+    $probeRegionStart = $probeStatements[$probeRegionIndex].Extent.StartOffset
+    $probeRegionEnd = $probeStatements[$probeStatements.Count - 1].Extent.EndOffset
+    $probeRegion = New-Object Text.StringBuilder($probeRuntimeText.Substring($probeRegionStart, $probeRegionEnd - $probeRegionStart))
+    foreach ($probeDefinition in @($probeWrapper.Body.FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object {
+                $_.Extent.StartOffset -ge $probeRegionStart -and $probeStubNames.ContainsKey($_.Name)
+            })) {
+        $probeLength = $probeDefinition.Extent.EndOffset - $probeDefinition.Extent.StartOffset
+        [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
+        [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
+    }
+
+    $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
+    $probeTemporaryRoot = Join-Path $ProbeRoot 'TEMP'
+    $probeLocalArchivePath = Join-Path $ProbeRoot 'backup\MODEL\MODEL_self-test.7z'
+    foreach ($probeDirectory in @($probeTemporaryRoot, (Split-Path -Parent $probeLocalArchivePath), (Join-Path $ProbeRoot 'Tools'))) {
+        [void][IO.Directory]::CreateDirectory($probeDirectory)
+    }
+    [IO.File]::WriteAllText($probeLocalArchivePath, 'self-test', $probeUtf8)
+    [IO.File]::WriteAllText((Join-Path $ProbeRoot 'Tools\WinSCP.com'), 'self-test', $probeUtf8)
+    $probeFlag = { param([bool]$Value) if ($Value) { '$true' } else { '$false' } }
+    $probeScenarioSeed = @(
+        ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
+        ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
+        ('$script:ProbeTemporaryRoot = ''{0}''' -f $probeTemporaryRoot.Replace("'", "''")),
+        ('$script:ProbeLocalArchivePath = ''{0}''' -f $probeLocalArchivePath.Replace("'", "''")),
+        '$probeNotificationMode = ''all''',
+        ('$probeMonitoringEnabled = {0}' -f (& $probeFlag ($Scenario -ne 'MonitoringDisabled'))),
+        ('$probeAlertsWebhook = ''{0}''' -f $(if ($Scenario -eq 'InsecureWebhook') { 'http://self-test.invalid/alerts' } else { 'https://self-test.invalid/alerts' })),
+        ('$script:ProbeFailServices = {0}' -f (& $probeFlag ($Scenario -like 'Failures*' -or $Scenario -eq 'NotificationFailure'))),
+        ('$script:ProbeFailSmb = {0}' -f (& $probeFlag ($Scenario -like 'Failures*'))),
+        ('$script:ProbeNotificationThrows = {0}' -f (& $probeFlag ($Scenario -eq 'NotificationFailure'))),
+        ('$script:ProbePreflightPrivilegeFailure = {0}' -f (& $probeFlag ($Scenario -eq 'EnvironmentPrivilege'))),
+        ('$script:ProbeToolIntegrityViolation = {0}' -f (& $probeFlag ($Scenario -eq 'ToolIntegrity'))),
+        ('$script:ProbeWinScpBusy = {0}' -f (& $probeFlag ($Scenario -eq 'WinScpBusy')))
+    ) -join "`n"
+    $probeGenerated = @(
+        $probeAst.ParamBlock.Extent.Text,
+        'function Invoke-BRAVOHealth {',
+        $probeWrapper.Body.ParamBlock.Extent.Text,
+        'Set-StrictMode -Version 2.0',
+        ($probeLeadingTexts -join "`n"),
+        ($probeFunctionTexts -join "`n`n"),
+        $probeStubs,
+        $probeScenarioSeed,
+        [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        $probeRegion.ToString(),
+        '}',
+        $probeGuard.Extent.Text
+    ) -join "`n"
+    $probeGeneratedPath = Join-Path $ProbeRoot 'runtime.ps1'
+    [IO.File]::WriteAllText($probeGeneratedPath, $probeGenerated, (New-Object Text.UTF8Encoding($true)))
+
+    foreach ($probeModule in @('BRAVO.Console', 'BRAVO.ExitCodes', 'BRAVO.Logging', 'BRAVO.Health')) {
+        Import-Module -Name (Join-Path $RepositoryRoot "modules\$probeModule\$probeModule.psd1") -Force
+    }
+    & (Get-Module -Name 'BRAVO.Health') { param($Path) $script:runtimePath = $Path } $probeGeneratedPath
+    $probeParameters = @{
+        RuntimeRoot = $ProbeRoot
+        EntryScriptPath = (Join-Path $ProbeRoot 'BRAVO_HEALTH.ps1')
+        NoPause = $true
+    }
+    if ($Scenario -like '*NoSlack') { $probeParameters['NoSlack'] = $true }
+    if ($Scenario -like 'Happy*') { $probeParameters['NotifyOnSuccess'] = $true }
+    $global:LASTEXITCODE = 77
+    $probeErrors = $null
+    $ErrorActionPreference = 'Continue'
+    $probeExitCode = Invoke-BRAVOHealthEntrypoint -Parameters $probeParameters -ErrorVariable probeErrors 2>$null
+    $probeEvents = @()
+    if (Test-Path -LiteralPath $probeEventsPath -PathType Leaf) {
+        $probeEvents = @([IO.File]::ReadAllLines($probeEventsPath, [Text.Encoding]::UTF8))
+    }
+    $probeLogPath = Join-Path $ProbeRoot 'logs\health.log'
+    $probeLog = @()
+    if (Test-Path -LiteralPath $probeLogPath -PathType Leaf) {
+        $probeLog = @([IO.File]::ReadAllLines($probeLogPath, [Text.Encoding]::UTF8))
+    }
+    $probeResult = [pscustomobject]@{
+        ExitCode = [int]$probeExitCode
+        ExitCodeName = [string](Get-BRAVOExitCodeName -Code ([int]$probeExitCode))
+        Events = $probeEvents
+        Log = $probeLog
+        Errors = @(@($probeErrors) | ForEach-Object { [string]$_ })
+    }
+} catch {
+    $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
+}
+[IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+'@
+            $healthOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
+            [IO.File]::WriteAllText((Join-Path $healthOrchestrationRoot 'stubs.ps1'), $healthOrchestrationStubs, $healthOrchestrationUtf8)
+            [IO.File]::WriteAllText((Join-Path $healthOrchestrationRoot 'seed.ps1'), $healthOrchestrationSeed, $healthOrchestrationUtf8)
+            $healthOrchestrationProbePath = Join-Path $healthOrchestrationRoot 'probe.ps1'
+            [IO.File]::WriteAllText($healthOrchestrationProbePath, $healthOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
+            $healthOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $healthOrchestrationResults = @{}
+            foreach ($healthOrchestrationScenario in @(
+                    'Happy', 'HappyNoSlack', 'Failures', 'FailuresNoSlack', 'ToolIntegrity',
+                    'WinScpBusy', 'NotificationFailure', 'EnvironmentPrivilege', 'MonitoringDisabled', 'InsecureWebhook'
+                )) {
+                $healthOrchestrationScenarioRoot = Join-Path $healthOrchestrationRoot $healthOrchestrationScenario
+                [void][IO.Directory]::CreateDirectory($healthOrchestrationScenarioRoot)
+                $null = & $healthOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                    -ExecutionPolicy Bypass -File $healthOrchestrationProbePath `
+                    -Scenario $healthOrchestrationScenario -RepositoryRoot $root -ProbeRoot $healthOrchestrationScenarioRoot
+                $healthOrchestrationResultPath = Join-Path $healthOrchestrationScenarioRoot 'result.json'
+                $healthOrchestrationResults[$healthOrchestrationScenario] = if (Test-Path -LiteralPath $healthOrchestrationResultPath -PathType Leaf) {
+                    [IO.File]::ReadAllText($healthOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                } else {
+                    [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
+                }
+            }
+            # Події сценарію (порожньо, якщо проба впала — тоді кожна умова
+            # нижче також перевіряє відсутність ProbeError).
+            $healthOrchestrationEvents = {
+                param([string]$Scenario)
+                $probeOutcome = $healthOrchestrationResults[$Scenario]
+                if ($null -ne $probeOutcome.PSObject.Properties['ProbeError']) { return @() }
+                return @($probeOutcome.Events | ForEach-Object { [string]$_ })
+            }
+            $healthOrchestrationProbeOk = {
+                param([string]$Scenario)
+                return ($null -eq $healthOrchestrationResults[$Scenario].PSObject.Properties['ProbeError'])
+            }
+            $healthOrchestrationSelect = {
+                param([object[]]$Events, [string]$Pattern)
+                return ((@($Events | Where-Object { $_ -match $Pattern })) -join '|')
+            }
+            $healthOrchestrationIndex = {
+                param([object[]]$Events, [string]$Pattern)
+                for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                    if ([string]$Events[$eventIndex] -match $Pattern) { return $eventIndex }
+                }
+                return -1
+            }
+            # Очікувана послідовність секцій [1..8]/Total разом із викликами
+            # перевірок, які кожна секція рендерить: перевірка -> її крок ->
+            # наступна перевірка. Порядок узято з коду runtime (Write-BRAVOHealthStep).
+            $healthOrchestrationChecksPattern = '^(PREFLIGHT$|CHECK |WINSCP-SESSION$|STEP [1-8]/)'
+            $healthOrchestrationExpectedChecks = {
+                param([int]$Total, [string[]]$Status, [bool]$SftpSessionRan)
+                $expectedLines = @(
+                    'PREFLIGHT',
+                    "STEP 1/$Total Середовище й цілісність інструментів $($Status[0])",
+                    'CHECK watchdog',
+                    'CHECK services',
+                    "STEP 2/$Total Керовані служби $($Status[1])",
+                    'CHECK local',
+                    "STEP 3/$Total Локальні резервні копії $($Status[2])",
+                    'CHECK restore-verify',
+                    "STEP 4/$Total Відновлюваність (restore drill) $($Status[3])",
+                    'CHECK baza-local BAZA APP',
+                    "STEP 5/$Total BAZA_APP (локальна копія) $($Status[4])",
+                    'CHECK baza-local BAZA WWW',
+                    "STEP 6/$Total BAZA_WWW (локальна копія) $($Status[5])"
+                )
+                if ($SftpSessionRan) { $expectedLines += 'WINSCP-SESSION' }
+                $expectedLines += @(
+                    "STEP 7/$Total SFTP: резервні копії $($Status[6])",
+                    'CHECK smb',
+                    "STEP 8/$Total NAS/SMB $($Status[7])"
+                )
+                return ($expectedLines -join '|')
+            }
+            $healthOrchestrationAllOk = @('OK', 'OK', 'OK', 'OK', 'OK', 'OK', 'OK', 'OK')
+            $healthOrchestrationFailedStatuses = @('OK', 'ERROR', 'OK', 'OK', 'OK', 'OK', 'OK', 'ERROR')
+            $healthOrchestrationNotificationPattern = '^(NOTIFY-|ALERT-STATE-SAVE$|SUCCESS-STATE-SAVE$)'
+
+            # (1) Щасливий шлях: рівно 9 секцій у порядку коду — середовище й
+            # цілісність, керовані служби, локальні копії, відновлюваність,
+            # BAZA_APP/BAZA_WWW локально, SFTP (справжня Get-SFTPHealthIssues
+            # доходить до WinSCP-сесії), NAS/SMB, і лише після статус-файлу —
+            # "Сповіщення" з Complete-BRAVOHealthResult; кожна перевірка
+            # викликається рівно перед своїм кроком; код 0.
+            $healthHappy = $healthOrchestrationResults['Happy']
+            $healthHappyEvents = @(& $healthOrchestrationEvents 'Happy')
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'Happy') -and
+                    $healthHappy.ExitCode -eq 0 -and
+                    (& $healthOrchestrationSelect $healthHappyEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 9 $healthOrchestrationAllOk $true) -and
+                    (& $healthOrchestrationSelect $healthHappyEvents '^(NOTIFY-SEND |STATUS |STEP 9/)') -ceq 'NOTIFY-SEND https://self-test.invalid/general self-test success|STATUS 0|STEP 9/9 Сповіщення OK' -and
+                    $healthHappyEvents.Count -gt 0 -and
+                    $healthHappyEvents[$healthHappyEvents.Count - 1] -ceq 'STEP 9/9 Сповіщення OK'
+                ) `
+                -Name "Health/OrchestrationRunsChecksInContractOrder" `
+                -Failure "Health на щасливому шляху має виконати [1/9]..[9/9] у порядку коду (кожна перевірка — перед своїм кроком, 'Сповіщення' — останнім після статус-файлу) і завершитися кодом 0; проба: $($healthHappy | ConvertTo-Json -Compress -Depth 4)"
+
+            # (2) Збій двох незалежних перевірок (керовані служби, NAS/SMB) не
+            # ховає решту: усі наступні перевірки все одно виконуються (зокрема
+            # SFTP-сесія), їхні кроки OK, обидві проблеми потрапляють в ОДНЕ
+            # сповіщення CRITICAL, RecoveryPending фіксується ДО доставки, а
+            # підсумок — 70 (HealthCritical).
+            $healthFailures = $healthOrchestrationResults['Failures']
+            $healthFailuresEvents = @(& $healthOrchestrationEvents 'Failures')
+            $healthFailuresRecoveryPending = & $healthOrchestrationIndex $healthFailuresEvents '^RECOVERY-PENDING True$'
+            $healthFailuresSend = & $healthOrchestrationIndex $healthFailuresEvents '^NOTIFY-SEND '
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'Failures') -and
+                    $healthFailures.ExitCode -eq 70 -and
+                    $healthFailures.ExitCodeName -eq 'HealthCritical' -and
+                    (& $healthOrchestrationSelect $healthFailuresEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 9 $healthOrchestrationFailedStatuses $true) -and
+                    (& $healthOrchestrationSelect $healthFailuresEvents '^ALERT-ISSUE ') -ceq 'ALERT-ISSUE Служба BRAVO | self-test: служба зупинена|ALERT-ISSUE NAS/SMB | self-test: NAS недоступний' -and
+                    (& $healthOrchestrationSelect $healthFailuresEvents '^(NOTIFY-|ALERT-STATE-SAVE$|STATUS |STEP 9/)') -ceq 'NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test alert|ALERT-STATE-SAVE|STATUS 70|STEP 9/9 Сповіщення OK' -and
+                    $healthFailuresRecoveryPending -ge 0 -and
+                    $healthFailuresRecoveryPending -lt $healthFailuresSend
+                ) `
+                -Name "Health/OrchestrationFailedCheckDoesNotHideOtherChecks" `
+                -Failure "збій перевірки служб і NAS/SMB не має переривати решту перевірок: усі секції мають виконатися, обидві проблеми — потрапити в одне CRITICAL-сповіщення, а код — бути 70 (HealthCritical); проба: $($healthFailures | ConvertTo-Json -Compress -Depth 4)"
+
+            # (3) Порушення цілісності інструментів (README: пропускає всю
+            # SFTP-гілку й завершується кодом 32): жодного виклику WinSCP,
+            # SFTP-крок — ERROR із причиною гейту цілісності, а служби, локальні
+            # копії, відновлюваність, BAZA локально й NAS/SMB виконуються й
+            # проходять. Код 32 перекриває 70 від SFTP-проблеми. Контроль: у
+            # сценарії (1) та сама справжня Get-SFTPHealthIssues доходить до
+            # WINSCP-SESSION, тож відсутність сесії тут — ефект гейту.
+            $healthToolIntegrity = $healthOrchestrationResults['ToolIntegrity']
+            $healthToolIntegrityEvents = @(& $healthOrchestrationEvents 'ToolIntegrity')
+            $healthToolIntegrityAlerts = @($healthToolIntegrityEvents | Where-Object { $_ -like 'ALERT-ISSUE *' })
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'ToolIntegrity') -and
+                    $healthToolIntegrity.ExitCode -eq 32 -and
+                    $healthToolIntegrity.ExitCodeName -eq 'ToolIntegrityViolation' -and
+                    (& $healthOrchestrationSelect $healthToolIntegrityEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 9 @('ERROR', 'OK', 'OK', 'OK', 'OK', 'OK', 'ERROR', 'OK') $false) -and
+                    @($healthToolIntegrityEvents | Where-Object { $_ -match '^WINSCP-(SESSION|CHECKSUM|COPY)' }).Count -eq 0 -and
+                    $healthToolIntegrityAlerts.Count -eq 1 -and
+                    $healthToolIntegrityAlerts[0].StartsWith('ALERT-ISSUE SFTP | ') -and
+                    $healthToolIntegrityAlerts[0].Contains('SFTP-перевірки пропущено: не підтверджено цілісність інструментів') -and
+                    (& $healthOrchestrationSelect $healthToolIntegrityEvents '^STATUS ') -ceq 'STATUS 32'
+                ) `
+                -Name "Health/OrchestrationToolIntegritySkipsOnlySftp" `
+                -Failure "порушення цілісності інструментів має пропустити лише SFTP-гілку (без жодного виклику WinSCP), залишивши локальні перевірки виконаними, і завершити Health кодом 32 (ToolIntegrityViolation); проба: $($healthToolIntegrity | ConvertTo-Json -Compress -Depth 4)"
+
+            # (4) -NoSlack придушує лише доставку: ті самі перевірки з тими
+            # самими статусами й тим самим кодом (0 / 70), але без маршрутизації
+            # і відправлення сповіщень, без запису стану алерту/success-звіту й
+            # без кроку "Сповіщення" (Total 8). Контроль: сценарії (1) і (2) без
+            # -NoSlack фактично відправляють.
+            $healthHappyNoSlack = $healthOrchestrationResults['HappyNoSlack']
+            $healthHappyNoSlackEvents = @(& $healthOrchestrationEvents 'HappyNoSlack')
+            $healthFailuresNoSlack = $healthOrchestrationResults['FailuresNoSlack']
+            $healthFailuresNoSlackEvents = @(& $healthOrchestrationEvents 'FailuresNoSlack')
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'HappyNoSlack') -and
+                    (& $healthOrchestrationProbeOk 'FailuresNoSlack') -and
+                    $healthHappyNoSlack.ExitCode -eq 0 -and
+                    $healthFailuresNoSlack.ExitCode -eq 70 -and
+                    (& $healthOrchestrationSelect $healthHappyNoSlackEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 8 $healthOrchestrationAllOk $true) -and
+                    (& $healthOrchestrationSelect $healthFailuresNoSlackEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 8 $healthOrchestrationFailedStatuses $true) -and
+                    @($healthHappyNoSlackEvents + $healthFailuresNoSlackEvents | Where-Object { $_ -match $healthOrchestrationNotificationPattern -or $_ -match '^STEP \d+/\d+ Сповіщення ' }).Count -eq 0 -and
+                    (& $healthOrchestrationSelect $healthHappyNoSlackEvents '^STATUS ') -ceq 'STATUS 0' -and
+                    (& $healthOrchestrationSelect $healthFailuresNoSlackEvents '^STATUS ') -ceq 'STATUS 70' -and
+                    @($healthFailuresNoSlack.Log | Where-Object { ([string]$_).Contains('Відправлення повідомлення вимкнено параметром -NoSlack') }).Count -eq 1 -and
+                    @($healthHappyEvents | Where-Object { $_ -like 'NOTIFY-SEND *' }).Count -eq 1 -and
+                    @($healthFailuresEvents | Where-Object { $_ -like 'NOTIFY-SEND *' }).Count -eq 1
+                ) `
+                -Name "Health/OrchestrationNoSlackSuppressesNotificationOnly" `
+                -Failure "-NoSlack має придушувати лише доставку сповіщень (без маршруту, відправлення, стану алерту й кроку 'Сповіщення'), не змінюючи перевірок і коду завершення; проби: $($healthHappyNoSlack | ConvertTo-Json -Compress -Depth 4) || $($healthFailuresNoSlack | ConvertTo-Json -Compress -Depth 4)"
+
+            # (5) Решта підсумкових кодів із пізніх шляхів виходу:
+            # відкладена SFTP-перевірка (зайнятий WinSCP) — WARNING через
+            # справжній Write-HealthLog -> 10 (SuccessWithWarnings), SFTP-крок
+            # SKIPPED без WinSCP-сесії; збій доставки CRITICAL-сповіщення ->
+            # NotificationError -> 70, крок "Сповіщення" ERROR, стан алерту не
+            # записано (наступний прогін повторить).
+            $healthWinScpBusy = $healthOrchestrationResults['WinScpBusy']
+            $healthWinScpBusyEvents = @(& $healthOrchestrationEvents 'WinScpBusy')
+            $healthNotificationFailure = $healthOrchestrationResults['NotificationFailure']
+            $healthNotificationFailureEvents = @(& $healthOrchestrationEvents 'NotificationFailure')
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'WinScpBusy') -and
+                    (& $healthOrchestrationProbeOk 'NotificationFailure') -and
+                    $healthWinScpBusy.ExitCode -eq 10 -and
+                    $healthWinScpBusy.ExitCodeName -eq 'SuccessWithWarnings' -and
+                    (& $healthOrchestrationSelect $healthWinScpBusyEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 9 @('OK', 'OK', 'OK', 'OK', 'OK', 'OK', 'SKIPPED', 'OK') $false) -and
+                    (& $healthOrchestrationSelect $healthWinScpBusyEvents '^(NOTIFY-|STATUS |STEP 9/)') -ceq 'STATUS 10|STEP 9/9 Сповіщення SKIPPED' -and
+                    $healthNotificationFailure.ExitCode -eq 70 -and
+                    (& $healthOrchestrationSelect $healthNotificationFailureEvents $healthOrchestrationChecksPattern) -ceq (& $healthOrchestrationExpectedChecks 9 @('OK', 'ERROR', 'OK', 'OK', 'OK', 'OK', 'OK', 'OK') $true) -and
+                    (& $healthOrchestrationSelect $healthNotificationFailureEvents '^(NOTIFY-|ALERT-STATE-SAVE$|STATUS |STEP 9/)') -ceq 'NOTIFY-ROUTE CRITICAL|NOTIFY-FAIL|STATUS 70|STEP 9/9 Сповіщення ERROR'
+                ) `
+                -Name "Health/OrchestrationResolvesWarningAndDeliveryFailureCodes" `
+                -Failure "відкладена SFTP-перевірка має давати 10 (SuccessWithWarnings) зі SKIPPED SFTP-кроком, а збій доставки CRITICAL-сповіщення — 70 з кроком 'Сповіщення' ERROR і без запису стану алерту; проби: $($healthWinScpBusy | ConvertTo-Json -Compress -Depth 4) || $($healthNotificationFailure | ConvertTo-Json -Compress -Depth 4)"
+
+            # (6) Ранні шляхи виходу розв'язуються до перевірок: вимкнений
+            # моніторинг -> 0 і жодної перевірки; небезпечний (не https) webhook
+            # -> 30 (InvalidConfiguration) і жодної перевірки; недоступний LOGS
+            # через права -> 36 (PrivilegeRequired) після кроку середовища, без
+            # служб/копій/SFTP (жодного звернення навіть до перевірки зайнятості
+            # WinSCP), з CRITICAL-сповіщенням про середовище. Кожен вихід пише
+            # статус-файл із тим самим кодом.
+            $healthMonitoringDisabled = $healthOrchestrationResults['MonitoringDisabled']
+            $healthInsecureWebhook = $healthOrchestrationResults['InsecureWebhook']
+            $healthEnvironmentPrivilege = $healthOrchestrationResults['EnvironmentPrivilege']
+            $healthEnvironmentPrivilegeEvents = @(& $healthOrchestrationEvents 'EnvironmentPrivilege')
+            Test-BRAVOCondition `
+                -Condition (
+                    (& $healthOrchestrationProbeOk 'MonitoringDisabled') -and
+                    (& $healthOrchestrationProbeOk 'InsecureWebhook') -and
+                    (& $healthOrchestrationProbeOk 'EnvironmentPrivilege') -and
+                    $healthMonitoringDisabled.ExitCode -eq 0 -and
+                    ((& $healthOrchestrationEvents 'MonitoringDisabled') -join '|') -ceq 'STATUS 0' -and
+                    $healthInsecureWebhook.ExitCode -eq 30 -and
+                    $healthInsecureWebhook.ExitCodeName -eq 'InvalidConfiguration' -and
+                    ((& $healthOrchestrationEvents 'InsecureWebhook') -join '|') -ceq 'STATUS 30' -and
+                    $healthEnvironmentPrivilege.ExitCode -eq 36 -and
+                    $healthEnvironmentPrivilege.ExitCodeName -eq 'PrivilegeRequired' -and
+                    ($healthEnvironmentPrivilegeEvents -join '|') -ceq 'TOOL-MANIFEST|PREFLIGHT|STEP 1/9 Середовище й цілісність інструментів ERROR|NOTIFY-ROUTE CRITICAL|NOTIFY-SEND https://self-test.invalid/alerts self-test environment alert|STATUS 36'
+                ) `
+                -Name "Health/OrchestrationEarlyExitsSkipChecks" `
+                -Failure "ранні виходи Health мають завершуватися до перевірок: вимкнений моніторинг -> 0, небезпечний webhook -> 30, недоступний LOGS через права -> 36 без служб/копій/SFTP; проби: $($healthMonitoringDisabled | ConvertTo-Json -Compress -Depth 4) || $($healthInsecureWebhook | ConvertTo-Json -Compress -Depth 4) || $($healthEnvironmentPrivilege | ConvertTo-Json -Compress -Depth 4)"
+        } finally {
+            if (Test-Path -LiteralPath $healthOrchestrationRoot -PathType Container) {
+                Remove-Item -LiteralPath $healthOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     # CLAUDE_CODE_TZ_ARCHIV_LIMS_MONOLITH.md: автоматичний Discovery джерел
     # (BRAVO_ROOT/WEB_ROOT/MODEL/BLOG/BRAVOEXCH/BAZA_APP/BAZA_WWW) за
     # встановленою службою BRAVO і активним bravo.ini, з повним ручним
