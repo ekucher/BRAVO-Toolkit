@@ -2198,6 +2198,195 @@
 }
 
 # =====================================================================
+# ReleaseGate/CallerCompleteness* (issue #154, B7): AST-інваріант повноти
+# переліку AUTOEXEC-цілей (Test-BRAVOConfigLoaderCallerCompleteness у
+# ci\BRAVOConfigV2CutoverGates.ps1). Підстава — підтверджений дефект:
+# BRAVO_OPERATIONS_HEARTBEAT.ps1 (PR #225) викликав Import-BravoConfiguration
+# без -DisallowLegacyPrimaryAutoDetect і не був у фіксованому переліку, тож
+# гейт LEGACY_CONFIG_AUTOEXEC його не бачив. Синтетичні фікстури —
+# логіка інваріанта; два останні тести — фактичне дерево репозиторію
+# (обидва провалюються на heartbeat до B7).
+# =====================================================================
+& {
+    . (Join-Path $root 'ci\BRAVOConfigV2CutoverGates.ps1')
+
+    function New-BRAVOCallerCompletenessFixtureRoot {
+        # Hashtable «відносний шлях -> текст»; каталоги створюються за потреби.
+        param([hashtable]$File)
+        $fixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CALLERCOMPLETENESS_{0}" -f [guid]::NewGuid().ToString('N'))
+        [void][IO.Directory]::CreateDirectory($fixtureRoot)
+        foreach ($relativePath in @($File.Keys)) {
+            $filePath = Join-Path $fixtureRoot $relativePath
+            [void][IO.Directory]::CreateDirectory((Split-Path -Path $filePath -Parent))
+            [IO.File]::WriteAllText($filePath, [string]$File[$relativePath], (New-Object Text.UTF8Encoding($false)))
+        }
+        return $fixtureRoot
+    }
+
+    $callerCompletenessListedCall = 'Import-BravoConfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect'
+
+    # --- ReleaseGate/CallerCompletenessDetectsUnlistedRootCaller ---
+    $callerCompletenessRootFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'BRAVO_NEW_OPERATOR_TOOL.ps1' = 'Import-BravoConfiguration -ConfigRoot X'
+    }
+    try {
+        $callerCompletenessRootResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessRootFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $callerCompletenessRootResult.Passed -and
+                @($callerCompletenessRootResult.Failures | Where-Object { $_.Contains('CONFIG_LOADER_CALLER_COMPLETENESS') -and $_.Contains('BRAVO_NEW_OPERATOR_TOOL.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CallerCompletenessDetectsUnlistedRootCaller" `
+            -Failure "кореневий скрипт, що викликає Import-BravoConfiguration, але відсутній у переліку AUTOEXEC-цілей (клас дефекту heartbeat, PR #225), мусить провалювати CONFIG_LOADER_CALLER_COMPLETENESS; отримано Failures=$($callerCompletenessRootResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessRootFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CallerCompletenessDetectsUnlistedModuleCaller ---
+    $callerCompletenessModuleFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'modules\BRAVO.NewDomain\BRAVO.NewDomain.Runtime.ps1' = "function Invoke-X {`r`n    import-bravoconfiguration -ConfigRoot X -DisallowLegacyPrimaryAutoDetect`r`n}"
+    }
+    try {
+        $callerCompletenessModuleResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessModuleFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $callerCompletenessModuleResult.Passed -and
+                @($callerCompletenessModuleResult.Failures | Where-Object { $_.Contains('modules\BRAVO.NewDomain\BRAVO.NewDomain.Runtime.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CallerCompletenessDetectsUnlistedModuleCaller" `
+            -Failure "новий *.Runtime.ps1 під modules\, що викликає Import-BravoConfiguration (у будь-якому регістрі, усередині функції), мусить провалювати CONFIG_LOADER_CALLER_COMPLETENESS, доки його не внесено в перелік — навіть із прапорцем (гейт AUTOEXEC перевіряє лише перелічені файли); отримано Failures=$($callerCompletenessModuleResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessModuleFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CallerCompletenessIgnoresNonCallMentions ---
+    # Коментар, рядковий літерал, here-string і визначення функції з тим
+    # самим ім'ям — не виклик (реальні форми в дереві:
+    # BRAVO_CONFIG_INTEGRATE.ps1 — regex-рядок, BRAVO_CONFIG_LOADER.ps1 —
+    # визначення, BRAVO.Configurator.Effective.psm1 — текст дочірнього процесу).
+    $callerCompletenessNonCallFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'BRAVO_COMMENT_ONLY.ps1' = "# Import-BravoConfiguration -ConfigRoot X`r`n`$pattern = 'Import-BravoConfiguration\s+-ConfigRoot'`r`n`$child = @`"`r`nImport-BravoConfiguration -ConfigRoot X`r`n`"@`r`n"
+        'BRAVO_DEFINES_ONLY.ps1' = "function Import-BravoConfiguration { param(`$ConfigRoot) }"
+    }
+    try {
+        $callerCompletenessNonCallResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessNonCallFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition ($callerCompletenessNonCallResult.Passed -and @($callerCompletenessNonCallResult.CallerRelativePath).Count -eq 1) `
+            -Name "ReleaseGate/CallerCompletenessIgnoresNonCallMentions" `
+            -Failure "коментар/рядковий літерал/here-string/визначення функції Import-BravoConfiguration не є викликом і не сміють провалювати CONFIG_LOADER_CALLER_COMPLETENESS (AST, не текстовий пошук); отримано Callers=$(@($callerCompletenessNonCallResult.CallerRelativePath) -join ', ') Failures=$($callerCompletenessNonCallResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessNonCallFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CallerCompletenessAllowsSanctionedHarnessOnly ---
+    $callerCompletenessHarnessFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'BRAVO_SELF_TEST.ps1' = 'Import-BravoConfiguration -ConfigRoot X'
+    }
+    try {
+        $callerCompletenessHarnessResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessHarnessFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                $callerCompletenessHarnessResult.Passed -and
+                @(Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath).Count -eq 1 -and
+                @(Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath)[0] -eq 'BRAVO_SELF_TEST.ps1'
+            ) `
+            -Name "ReleaseGate/CallerCompletenessAllowsSanctionedHarnessOnly" `
+            -Failure "єдиний санкціонований НЕ-production викликач — тестовий harness BRAVO_SELF_TEST.ps1; розширення винятку потребує окремого обґрунтування; отримано Passed=$($callerCompletenessHarnessResult.Passed), виняток=$(@(Get-BRAVOConfigLoaderSanctionedNonProductionCallerRelativePath) -join ', ')"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessHarnessFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CallerCompletenessFailsClosedOnParseError ---
+    $callerCompletenessParseFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'BRAVO_BROKEN.ps1' = "if (`$true) {`r`n    Import-BravoConfiguration -ConfigRoot X`r`n"
+    }
+    try {
+        $callerCompletenessParseResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $callerCompletenessParseFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $callerCompletenessParseResult.Passed -and
+                @($callerCompletenessParseResult.Failures | Where-Object { $_.Contains('BRAVO_BROKEN.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CallerCompletenessFailsClosedOnParseError" `
+            -Failure "файл, який AST-парсер не розібрав, не можна довести безпечним — CONFIG_LOADER_CALLER_COMPLETENESS мусить відмовити явно, а не пропустити його; отримано Failures=$($callerCompletenessParseResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessParseFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CutoverGatesEnforceCallerCompleteness ---
+    # Спільна функція гейтів (release-artifact + PR-workflow) мусить
+    # застосовувати інваріант, а не лише мати його поруч.
+    $callerCompletenessCutoverFixture = New-BRAVOCallerCompletenessFixtureRoot -File @{
+        'entry.ps1' = $callerCompletenessListedCall
+        'BRAVO_NEW_OPERATOR_TOOL.ps1' = 'Import-BravoConfiguration -ConfigRoot X'
+    }
+    try {
+        $callerCompletenessCutoverResult = Test-BRAVOConfigV2CutoverGates -Root $callerCompletenessCutoverFixture -ProductionEntryPointRelativePath @('entry.ps1')
+        Test-BRAVOCondition `
+            -Condition (
+                -not $callerCompletenessCutoverResult.Passed -and
+                @($callerCompletenessCutoverResult.Failures | Where-Object { $_.Contains('CONFIG_LOADER_CALLER_COMPLETENESS') -and $_.Contains('BRAVO_NEW_OPERATOR_TOOL.ps1') }).Count -eq 1
+            ) `
+            -Name "ReleaseGate/CutoverGatesEnforceCallerCompleteness" `
+            -Failure "Test-BRAVOConfigV2CutoverGates (спільна для ci\New-BRAVOReleaseArtifact.ps1 і PR-workflow) мусить провалюватись на неперелічених викликачах Import-BravoConfiguration; отримано Failures=$($callerCompletenessCutoverResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $callerCompletenessCutoverFixture -Recurse -Force -ErrorAction SilentlyContinue
+    }
+
+    # --- ReleaseGate/CallerCompletenessHoldsOnRepositoryTree ---
+    # Фактичне дерево: кожен кореневий *.ps1 і кожен файл modules\, що
+    # викликає Import-BravoConfiguration, перелічений. До B7 провалювався
+    # на BRAVO_OPERATIONS_HEARTBEAT.ps1.
+    $callerCompletenessRepositoryResult = Test-BRAVOConfigLoaderCallerCompleteness -Root $root
+    Test-BRAVOCondition `
+        -Condition (
+            $callerCompletenessRepositoryResult.Passed -and
+            @($callerCompletenessRepositoryResult.CallerRelativePath | Where-Object { $_ -eq 'BRAVO_OPERATIONS_HEARTBEAT.ps1' }).Count -eq 1
+        ) `
+        -Name "ReleaseGate/CallerCompletenessHoldsOnRepositoryTree" `
+        -Failure "кожен фактичний викликач Import-BravoConfiguration серед кореневих *.ps1 і modules\ мусить бути в Get-BRAVOProductionEntryPointRelativePath (або в санкціонованому винятку); отримано Callers=$(@($callerCompletenessRepositoryResult.CallerRelativePath) -join ', ') Failures=$($callerCompletenessRepositoryResult.Failures -join ' | ')"
+
+    # --- ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget ---
+    # Гейт LEGACY_CONFIG_AUTOEXEC на ФАКТИЧНОМУ вмісті кожної цілі переліку.
+    # Копії цілей — у тимчасове дзеркало, а не -Root $root: на встановленому
+    # сервері поруч із комплектом законно може лежати застарілий BRAVO.config
+    # (Update-BRAVOServer.ps1 його не видаляє), і гейт LEGACY_CONFIG_REMOVED
+    # хибно провалив би self-test там, де він не про це. До B7 провалювався
+    # на BRAVO_OPERATIONS_HEARTBEAT.ps1 (виклик без прапорця).
+    $autoExecMirrorRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_AUTOEXEC_MIRROR_{0}" -f [guid]::NewGuid().ToString('N'))
+    try {
+        $autoExecMirrorFiles = @{}
+        foreach ($autoExecTargetRelativePath in @(Get-BRAVOProductionEntryPointRelativePath)) {
+            $autoExecTargetSourcePath = Join-Path $root $autoExecTargetRelativePath
+            if (Test-Path -LiteralPath $autoExecTargetSourcePath -PathType Leaf) {
+                $autoExecMirrorFiles[$autoExecTargetRelativePath] = [IO.File]::ReadAllText($autoExecTargetSourcePath, [Text.Encoding]::UTF8)
+            }
+        }
+        [void][IO.Directory]::CreateDirectory($autoExecMirrorRoot)
+        foreach ($autoExecMirrorRelativePath in @($autoExecMirrorFiles.Keys)) {
+            $autoExecMirrorPath = Join-Path $autoExecMirrorRoot $autoExecMirrorRelativePath
+            [void][IO.Directory]::CreateDirectory((Split-Path -Path $autoExecMirrorPath -Parent))
+            [IO.File]::WriteAllText($autoExecMirrorPath, [string]$autoExecMirrorFiles[$autoExecMirrorRelativePath], (New-Object Text.UTF8Encoding($false)))
+        }
+        $autoExecMirrorResult = Test-BRAVOConfigV2CutoverGates -Root $autoExecMirrorRoot
+        Test-BRAVOCondition `
+            -Condition (
+                $autoExecMirrorResult.Passed -and
+                $autoExecMirrorFiles.Count -eq @(Get-BRAVOProductionEntryPointRelativePath).Count
+            ) `
+            -Name "ReleaseGate/AutoExecGuardHoldsForEveryRepositoryTarget" `
+            -Failure "кожна ціль Get-BRAVOProductionEntryPointRelativePath мусить існувати в дереві й передавати ефективний -DisallowLegacyPrimaryAutoDetect; знайдено $($autoExecMirrorFiles.Count) з $(@(Get-BRAVOProductionEntryPointRelativePath).Count) цілей, Failures=$($autoExecMirrorResult.Failures -join ' | ')"
+    } finally {
+        Remove-Item -LiteralPath $autoExecMirrorRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+# =====================================================================
 # Health — Config V2 контракт (issue #216, §9 п.9): Health був єдиним
 # доменом без ЖОДНОГО прямого доказу дотримання Config V2 (лише
 # опосередковано — через свою присутність у канонічному списку 14

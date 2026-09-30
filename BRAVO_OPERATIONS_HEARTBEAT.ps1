@@ -117,11 +117,17 @@ try {
         throw "Configuration loader not found: $configurationLoaderPath"
     }
     . $configurationLoaderPath
+    # Issue #216 (Wave B) / #154 (B7): production operator entrypoint — не
+    # виконує BRAVO.config автоматично лише тому, що він опинився поруч на
+    # диску; див. коментар біля $DisallowLegacyPrimaryAutoDetect у
+    # BRAVO_CONFIG_LOADER.ps1. Явний -ConfigPath лишається авторитетним
+    # (-ConfigPathWasExplicit вище).
     Import-BravoConfiguration `
         -ConfigRoot $configRoot `
         -ConfigPath $ConfigPath `
         -RuntimeRoot $PSScriptRoot `
-        -ConfigPathWasExplicit:$configPathWasExplicit
+        -ConfigPathWasExplicit:$configPathWasExplicit `
+        -DisallowLegacyPrimaryAutoDetect
 
     if ($null -eq $global:credentialSettings -or
         $null -eq (Get-Command -Name Initialize-BRAVOCredentialManager -ErrorAction SilentlyContinue)) {
