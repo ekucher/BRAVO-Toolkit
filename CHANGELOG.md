@@ -127,6 +127,57 @@
   (вимкнений моніторинг `0`, небезпечний webhook `30`, недоступний `LOGS` через
   права `36`) завершуються до перевірок (`Health/OrchestrationEarlyExitsSkipChecks`).
   Продакшн-код не змінено.
+- **Maintenance: поведінкові тести оркестрації `Invoke-BRAVOMaintenance` (T011, аудит F010).**
+  Порядок кроків, відновлення служб і код завершення Maintenance досі
+  перевірялись лише текстово. Чотири нові перевірки `BRAVO_SELF_TEST.ps1` справді
+  виконують оркестрацію в дочірньому процесі: runtime збирається з дослівного тексту
+  `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` (AST) — справжні
+  функції тіла (зокрема `Invoke-ServiceStateChange`, `Write-BRAVOMaintenanceStep`,
+  `Get-BRAVOMaintenanceResolvedExitCode`), дослівна оркестрація від
+  `Initialize-BRAVOMaintenanceSteps -Total 8` до фінального `exit`, `try`/`finally`
+  служб, звільнення lock і зовнішній `finally` — і запускається через справжній
+  `Invoke-BRAVOMaintenanceEntrypoint`. Служби, lock, маркер quiescence, файлові
+  операції, статус-файл і мережу замінюють стаби, що пишуть події в журнал;
+  реальні служби не чіпаються. Перевірки фіксують: порядок `[1/8]`…`[8/8]`, маркер
+  до першої зупинки, зупинку між `[2/8]` і `[3/8]`, запуск між `[6/8]` і `[7/8]`,
+  статус-файл і код `0`, звільнення lock і зовнішній `finally` з `-NoPause`
+  (`Maintenance/OrchestrationRunsStepsInContractOrder`); необроблений виняток у
+  `[4/8]` проходить крізь `finally` служб — служби запущено, маркер прибрано, lock
+  звільнено, код `90` (`Maintenance/OrchestrationRestoresServicesWhenStepThrows`);
+  служба, зупинена ще до прогону, не зупиняється й не запускається
+  (`Maintenance/OrchestrationRestoreSkipsServicesStoppedBeforeRun`); контрольований
+  збій зупинки служби дає `[3/8]` `FAIL` без переривання порядку, служби, зупинені
+  прогоном, запускаються, статус-файл і код — `60`
+  (`Maintenance/OrchestrationRestoresServicesAfterControlledStopFailure`).
+  Продакшн-код не змінено.
+
+- **DataRestore: поведінкові тести оркестрації `Invoke-BRAVODataRestore` (T011, аудит F010).**
+  Порядок фаз InPlace, знімок і відновлення стану служб, прибирання у `finally` і код
+  завершення DataRestore досі перевірялись лише структурно. Нові перевірки фрагмента
+  `selftest/BRAVO_SELF_TEST.DataRestore.ps1` запускають у дочірньому процесі runtime,
+  зібраний з дослівного тексту `BRAVO.DataRestore.Runtime.ps1` (AST): справжні функції
+  знімка служб, quiescence, зупинки/запуску й контрольованого abort, головний потік від
+  `Initialize-BRAVOConsole` до `exit` (lock, pipeline, `catch`, `finally` відновлення
+  служб, `Resolve-BRAVOExitCode`, вибір severity сповіщення) і зовнішній `finally` —
+  через справжній `Invoke-BRAVODataRestoreEntrypoint`. Після BRAVO-T023 (PR #275)
+  обгортка `Send-BRAVODataRestoreNotification` і `New-BRAVOOperatorNotificationMessage`
+  виконуються справжні; стабовано лише транспорт `Send-BRAVONotification` із дослівним
+  param-блоком канонічної функції та мережевий `Get-HostInformation`. Служби, lock,
+  маркер quiescence, 7-Zip, move-aside/rollback і Health — стаби, що журналюють події;
+  реальні служби, мережа й webhook не чіпаються. Перевірки фіксують: повну послідовність
+  фаз щасливого InPlace і SUCCESS-сповіщення з рядком компонента, код `0`
+  (`DataRestore/OrchestrationInPlaceRunsPhasesInContractOrder`); відмову перевірки
+  архіву до деструктивної фази без жодної дії над службами, код `41`
+  (`DataRestore/OrchestrationFailureBeforeRestoreLeavesServicesUntouched`); відмову
+  move-aside після зупинки служб без rollback незміненого каталогу, із запуском служб,
+  код `43` (`DataRestore/OrchestrationMoveAsideFailureRestartsServicesWithoutRollback`);
+  виняток розпакування — rollback, запуск служб у `finally` до звільнення lock, код `43`
+  (`DataRestore/OrchestrationRestoresServicesWhenRestoreThrows`); службу, зупинену до
+  прогону, не запускають (`DataRestore/OrchestrationRestoreSkipsServicesStoppedBeforeRun`);
+  збій доставки сповіщення лишає код `0`
+  (`DataRestore/OrchestrationNotificationFailureKeepsRestoreResult`); OutOfPlace не
+  чіпає служб (`DataRestore/OrchestrationOutOfPlaceLeavesServicesUntouched`).
+  Продакшн-код не змінено.
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
@@ -158,6 +209,45 @@
   fake curl, записані відповіді API) у workflow
   `telegram-ci-summary-test.yml`.
 
+- **Синхронізація BAZA (`BRAVO_ARCHIV -SyncBAZA`) більше не чекає
+  операційний lock довше за ліміт своєї задачі (T025).** Раніше очікування
+  `BRAVO_OPERATION.lock` обмежувалось лише
+  `schedulerSettings.OperationLockWaitMinutes` (типово 360 хв), а задача
+  `BAZASync` має `ExecutionTimeLimit` 2 год: якщо lock тримала довга
+  архівація, Планувальник примусово завершував синхронізацію посеред
+  очікування — без підсумку в журналі та без коду завершення з контракту
+  BRAVO.
+
+  **Що бачить оператор тепер.** Очікування обмежене
+  `ExecutionTimeLimitHours` задачі, якій відповідає прогін, мінус запас
+  30 хв (для `BAZASync` із типовими налаштуваннями — 90 хв). Якщо lock не
+  звільнився, прогін завершується штатно: рядок `ERROR` у журналі з
+  поясненням обмеження та код `20` (`SkippedLockBusy`) замість
+  примусового зупинення задачі. Задачу визначає командний рядок:
+  `BRAVO_ARCHIV` — `Backup`, `BRAVO_ARCHIV -SyncBAZA` — `BAZASync`,
+  `BRAVO_MAINTENANCE` — `Maintenance`, `BRAVO_MAINTENANCE
+  -RunMissedRestoreOnly` — `Recovery`; ручний запуск з тим самим командним
+  рядком поводиться так само, як запуск Планувальником. За типових
+  налаштувань змінюється лише `BAZASync`: ліміти `Backup` (30 год),
+  `Maintenance` і `Recovery` (18 год) більші за 360 хв. Якщо ліміт задачі
+  не більший за запас, прогін робить одну спробу захопити lock без
+  очікування. Legacy-конфігурація без вузла задачі чи з некоректним
+  `ExecutionTimeLimitHours` зберігає попереднє очікування. Розклади й
+  ліміти задач не змінено; `BRAVO_DATA_RESTORE` (ручний інструмент без
+  задачі Планувальника) чекає, як і раніше, `OperationLockWaitMinutes`.
+
+  **Технічно.** Бюджет рахує одна функція `Get-BRAVOOperationLockWaitBudget`
+  (`BRAVO.System`, поруч з іншими визначеннями задач Планувальника), а ліміт
+  задачі читається тією самою `ConvertTo-BRAVOSchedulerExecutionTimeLimit`,
+  якою `BRAVO_TASKS_INSTALL.ps1` будує `Settings.ExecutionTimeLimit`
+  (культурно-незалежне приведення; XML задачі не змінюється). Відмова lock у
+  `BRAVO_MAINTENANCE` тепер бере код із `Resolve-BRAVOExitCode -LockBusy`
+  замість літерала `20` — значення те саме. Нові перевірки:
+  `Scheduler/OperationLockWaitBoundedByTaskLimit`,
+  `Scheduler/OperationLockWaitBudgetIsCultureInvariant`,
+  `Scheduler/OperationLockWaitTimeoutIsExplicitFailure`,
+  `Scheduler/OperationLockWaitCallersUseTaskBudget`,
+  `Archive/OrchestrationLockWaitTimeoutEndsWithSkippedLockBusy`.
 - **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
   Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
   у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
