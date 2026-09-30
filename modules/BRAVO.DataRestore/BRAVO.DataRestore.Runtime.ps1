@@ -197,6 +197,36 @@ function ConvertTo-BRAVODataRestoreElevationArgument {
     return '"' + $escaped + '"'
 }
 
+# Тіло runtime — одна функція, за зразком BRAVO.Health.Runtime.ps1
+# (Invoke-BRAVOHealth): прямий запуск файлу (& у BRAVO.DataRestore.psm1)
+# виконує тіло через invocation guard наприкінці файлу, а dot-source лише
+# визначає функції. param() функції повторює param() скрипта один в один
+# (ті самі типи, ValidateSet, Mandatory): присвоєння $ConfigPath у тілі
+# лишаються типізованими так само, як на script-рівні. Стан, який читають
+# вкладені функції, тіло й далі пише явно через $script:/$global:, а exit
+# усередині функції завершує весь скрипт тим самим кодом.
+function Invoke-BRAVODataRestore {
+    param (
+        [string]$ConfigPath,
+        [bool]$ConfigPathWasExplicit = $false,
+        [string]$GenerationId,
+        [ValidateSet("MODEL", "BLOG", "BRAVOEXCH", "All")]
+        [string]$Component = "All",
+        [ValidateSet("OutOfPlace", "InPlace")]
+        [string]$Mode = "OutOfPlace",
+        [string]$TargetPath,
+        [ValidateSet("Local", "SFTP")]
+        [string]$Source = "Local",
+        [string]$StagingPath,
+        [switch]$ListGenerations,
+        [switch]$Force,
+        [switch]$SkipHealthCheck,
+        [int]$TimeoutSeconds = 0,
+        [switch]$NoPause,
+        [Parameter(Mandatory = $true)][string]$RuntimeRoot,
+        [Parameter(Mandatory = $true)][string]$EntryScriptPath
+    )
+
 # Один зовнішній try/finally: exit усередині try гарантовано проходить крізь
 # усі finally на своєму шляху, тому ручна пауза охоплює кожну точку виходу
 # (той самий принцип, що BRAVO_MAINTENANCE).
@@ -256,9 +286,11 @@ if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.I
     Exit $elevatedProcess.ExitCode
 }
 
-# Примусово TLS 1.2 для webhook-сповіщень. Числове значення 3072 сумісне зі
-# старими .NET/PowerShell, де ім'я Tls12 може бути відсутнім у переліку enum.
-[Net.ServicePointManager]::SecurityProtocol = [Enum]::ToObject([Net.SecurityProtocolType], 3072)
+# TLS 1.2 для webhook-сповіщень вмикається АДИТИВНО (канонічний
+# Enable-BRAVOTls12 з BRAVO.Compatibility, імпортованого вище з
+# -ErrorAction Stop): уже ввімкнені протоколи (напр. Tls13, Tls11)
+# зберігаються, а не затираються значенням 3072.
+Enable-BRAVOTls12
 [Net.ServicePointManager]::Expect100Continue = $false
 
 # ===== СТАН ПРОГОНУ =====
@@ -275,6 +307,11 @@ $script:flagRestoreFailed = $false
 $script:flagSftpFailed = $false
 $script:flagInternalError = $false
 $script:dataRestoreWarningCount = 0
+# T006: імена архівів, відкритих (7z t / 7z x) лише через legacy
+# BOM-у-паролі fallback (колектор Register-BRAVOLegacyBomPasswordFallback,
+# BRAVO.ArchiveHelpers). Непорожній -> код щонайменше 10 і перелік у
+# ЄДИНОМУ фінальному сповіщенні прогону.
+$script:dataRestoreLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
 $script:dataRestoreComponentResults = New-Object System.Collections.ArrayList
 $script:dataRestoreOperationLock = $null
 $script:dataRestoreOperationLockPath = $null
@@ -2860,23 +2897,6 @@ function Send-BRAVODataRestoreNotification {
                 $notificationTimeoutSeconds = [int]$backupMonitoring.NotificationRequestTimeoutSeconds
             }
         }
-        # Рішення «слати чи ні» вже ухвалене на call-site (включно з
-        # DataRestore-специфічним SUCCESS для InPlace навіть під
-        # errors_only), тому routing викликається в режимі 'all' і вирішує
-        # лише канал доставки (GENERAL/ALERTS).
-        $notificationRoute = Resolve-BRAVONotificationRoute `
-            -Severity $Severity `
-            -NotificationMode 'all' `
-            -RoutingTable $notificationRouting
-        try {
-            $webhookUrl = Resolve-BRAVONotificationEndpoint `
-                -Provider $notificationProvider `
-                -Route $notificationRoute `
-                -CredentialTargets $notificationCredentialTargets
-        } catch {
-            Write-DataRestoreLog -Message "Webhook для '$notificationProvider/$notificationRoute' не налаштовано — сповіщення пропущено" -Level 'WARNING'
-            return
-        }
         $message = New-BRAVOOperatorNotificationMessage `
             -Severity $Severity `
             -Operation 'BRAVO DATA RESTORE — ВІДНОВЛЕННЯ ДАНИХ' `
@@ -2890,17 +2910,61 @@ function Send-BRAVODataRestoreNotification {
             -Version ([string]$script:ScriptVersion) `
             -BuildId ([string]$script:ScriptBuildId) `
             -LogPath ([string]$script:dataRestoreLogFile)
-        $messageChunks = ConvertTo-BRAVONotificationPayloadText `
+        # Рішення «слати чи ні» вже ухвалене на call-site (включно з
+        # DataRestore-специфічним SUCCESS для InPlace навіть під
+        # errors_only), тому конвеєр викликається в режимі 'all' і вирішує
+        # лише канал доставки (GENERAL/ALERTS). BRAVO-T023: маршрут,
+        # endpoint, payload і доставка — канонічна Send-BRAVONotification;
+        # ненастроєний webhook, як і раніше, — WARNING без зміни лічильника.
+        $delivery = Send-BRAVONotification `
+            -Severity $Severity `
+            -Message $message `
             -Provider $notificationProvider `
-            -Message $message
-        Send-BRAVONotificationChunks `
-            -Provider $notificationProvider `
-            -WebhookUrl $webhookUrl `
-            -MessageChunks $messageChunks `
-            -TimeoutSeconds $notificationTimeoutSeconds
+            -NotificationMode 'all' `
+            -RoutingTable $notificationRouting `
+            -CredentialTargets $notificationCredentialTargets `
+            -TimeoutSeconds $notificationTimeoutSeconds `
+            -SkipWhenEndpointUnavailable `
+            -PassThru
+        if ($null -ne $delivery -and -not $delivery.Sent -and $delivery.Reason -eq 'EndpointUnavailable') {
+            Write-DataRestoreLog -Message "Webhook для '$notificationProvider/$($delivery.Route)' не налаштовано — сповіщення пропущено" -Level 'WARNING'
+            return
+        }
     } catch {
         $script:dataRestoreWarningCount++
         Write-DataRestoreLog -Message "Не вдалося надіслати сповіщення: $($_.Exception.Message)" -Level 'WARNING'
+    }
+}
+
+function Invoke-BRAVODataRestoreOSSupportGate {
+    # Той самий gate рівня підтримки ОС, що в Archive/Maintenance/Health
+    # (канонічна класифікація — Get-BRAVOOSSupportTier, BRAVO.Compatibility;
+    # README, розділ 1): LegacyBestEffort — лише INFO (environmental-метрика,
+    # не результат операції); Unsupported — ERROR і блокування з кодом
+    # InvalidConfiguration, окрім явного BRAVO_ALLOW_UNSUPPORTED_OS=1
+    # (WARNING і продовження). Рішення повертається викликачу, а не
+    # виконується тут через exit: головний потік сам завершує прогін, а
+    # функція лишається придатною для ізольованого поведінкового тесту.
+    $osSupportTier = Get-BRAVOOSSupportTier
+    Write-DataRestoreLog -Message "Підтримка ОС: $($osSupportTier.Tier) — Windows $($osSupportTier.OperatingSystem) ($($osSupportTier.OperatingSystemVersion), build $($osSupportTier.Build)); PowerShell $($osSupportTier.PowerShellVersion); .NET release $($osSupportTier.DotNetRelease)" -Level 'INFO'
+    $isBlocked = $false
+    $hasWarning = $false
+    if ($osSupportTier.Tier -eq 'LegacyBestEffort') {
+        Write-DataRestoreLog -Message $osSupportTier.Message -Level 'INFO'
+    } elseif ($osSupportTier.Tier -eq 'Unsupported') {
+        if ($env:BRAVO_ALLOW_UNSUPPORTED_OS -eq '1') {
+            Write-DataRestoreLog -Message "$($osSupportTier.Message) Продовжено через BRAVO_ALLOW_UNSUPPORTED_OS=1." -Level 'WARNING'
+            $hasWarning = $true
+        } else {
+            Write-DataRestoreLog -Message $osSupportTier.Message -Level 'ERROR'
+            $isBlocked = $true
+        }
+    }
+    return [pscustomobject]@{
+        Tier = [string]$osSupportTier.Tier
+        Blocked = $isBlocked
+        HasWarning = $hasWarning
+        ExitCode = $(if ($isBlocked) { Resolve-BRAVOExitCode -InvalidConfiguration } else { $null })
     }
 }
 
@@ -2921,6 +2985,19 @@ Write-BRAVOHeader `
     -InstitutionCode ([string]$bravoSettings.InstitutionCode) `
     -Mode $headerModeText
 Write-DataRestoreLog -Message "BRAVO Data Restore $script:ScriptVersion (build $script:ScriptBuildId): Mode=$Mode, Source=$Source, Component=$Component, GenerationId='$GenerationId', ListGenerations=$ListGenerations" -Level 'INFO'
+
+# Gate рівня підтримки ОС — до будь-яких дій (lock, credentials, staging,
+# розпакування). Застосовується рівномірно до всіх режимів, включно з
+# read-only -ListGenerations: так само блокується на Unsupported і
+# BRAVO_HEALTH (теж без мутацій), а README не робить винятків для режимів;
+# свідомий обхід — BRAVO_ALLOW_UNSUPPORTED_OS=1.
+$osSupportGate = Invoke-BRAVODataRestoreOSSupportGate
+if ($osSupportGate.Blocked) {
+    exit $osSupportGate.ExitCode
+}
+if ($osSupportGate.HasWarning) {
+    $script:dataRestoreWarningCount++
+}
 
 # Ранні інваріанти параметрів — до lock і будь-яких дій.
 if (-not [string]::IsNullOrWhiteSpace($GenerationId) -and
@@ -3416,7 +3493,8 @@ try {
                 -ArchivePath $verifiedArchive.FullName `
                 -Password $script:archivePassword `
                 -TimeoutSeconds $script:effectiveSevenZipTimeoutSeconds `
-                -Logger { param($m, $l) Write-DataRestoreLog -Message $m -Level $l }
+                -Logger { param($m, $l) Write-DataRestoreLog -Message $m -Level $l } `
+                -LegacyBomFallbackCollector $script:dataRestoreLegacyBomFallbackArchives
             if (-not $integrityOk) {
                 Stop-BRAVODataRestoreRun -Category IntegrityTestFailed -Reason "component ${componentType}: 7za t (перевірка цілісності) не пройдено"
             }
@@ -3759,6 +3837,11 @@ try {
                 if (-not $extractionResult.Success) {
                     throw "розпакування не вдалося: $($extractionResult.Description)"
                 }
+                [void](Register-BRAVOLegacyBomPasswordFallback `
+                    -Result $extractionResult `
+                    -ArchivePath $componentArtifacts[$componentType].FullName `
+                    -Collector $script:dataRestoreLegacyBomFallbackArchives `
+                    -Logger { param($m, $l) Write-DataRestoreLog -Message $m -Level $l })
                 $verification = Test-BRAVODataRestoreExtractionResult `
                     -TargetDirectory $planComponent.TargetDirectory `
                     -Inventory $componentInventories[$componentType]
@@ -4036,7 +4119,7 @@ $dataRestoreExitCode = Resolve-BRAVOExitCode `
     -HashValidationFailed:$script:flagHashValidationFailed `
     -RestoreFailed:$script:flagRestoreFailed `
     -SftpFailed:$script:flagSftpFailed `
-    -HasWarnings:($script:dataRestoreWarningCount -gt 0)
+    -HasWarnings:($script:dataRestoreWarningCount -gt 0 -or $script:dataRestoreLegacyBomFallbackArchives.Count -gt 0)
 
 $summaryStatus = if ($dataRestoreExitCode -eq 0) {
     'УСПІШНО'
@@ -4132,6 +4215,8 @@ if ($notificationMode -ne 'none') {
     if (-not [string]::IsNullOrWhiteSpace([string]$script:dataRestoreAbortReason)) {
         $notificationLines += "Причина: $script:dataRestoreAbortReason"
     }
+    # T006: перелік legacy BOM-архівів іде в ТЕ САМЕ одне сповіщення прогону.
+    $notificationLines += @(Get-BRAVOLegacyBomFallbackNotificationLines -ArchiveNames @($script:dataRestoreLegacyBomFallbackArchives))
     if ($dataRestoreExitCode -ge 20) {
         Send-BRAVODataRestoreNotification `
             -Severity 'CRITICAL' `
@@ -4154,4 +4239,26 @@ exit $dataRestoreExitCode
 
 } finally {
     Wait-BRAVOManualExit -NoPause:$NoPause
+}
+}
+# END BRAVO DATA RESTORE RUNTIME
+if ($MyInvocation.InvocationName -ne '.') {
+    $dataRestoreParameters = @{
+        ConfigPath = $ConfigPath
+        ConfigPathWasExplicit = $ConfigPathWasExplicit
+        GenerationId = $GenerationId
+        Component = $Component
+        Mode = $Mode
+        TargetPath = $TargetPath
+        Source = $Source
+        StagingPath = $StagingPath
+        ListGenerations = $ListGenerations
+        Force = $Force
+        SkipHealthCheck = $SkipHealthCheck
+        TimeoutSeconds = $TimeoutSeconds
+        NoPause = $NoPause
+        RuntimeRoot = $RuntimeRoot
+        EntryScriptPath = $EntryScriptPath
+    }
+    Invoke-BRAVODataRestore @dataRestoreParameters
 }

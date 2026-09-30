@@ -2,24 +2,455 @@
 
 ## Не випущено (developer)
 
-- **Документація: операторські розділи про сповіщення перекладено
-  українською, виправлено латинські літери в українських словах (A10).**
-  Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
-  `OPERATIONS.md` (включно з каналами GENERAL/ALERTS і міграцією 5.2.1 з
-  legacy webhook-ів) і `BRAVO_SETUP.md` були англійською, хоча мовна
-  політика документації вимагає української. Тепер вони українською; назви
-  credential-записів, значення `NotificationMode`, команди й дослівні рядки
-  сповіщень не змінено. Заголовки `docs/BRAVO_CONFIG_V2_PILOT_RUNBOOK.md`
-  також перекладено; назви дій CLI (Prepare, Validate, Accept, Rollback,
-  Status) лишились як є.
+- **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
+  `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
+  ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
+  канонічного `<RuntimeRoot>\Tools\TOOLS_MANIFEST.json`, вважається послабленням захисту
+  і в режимі `Enforce` блокує запуск, як і `toolIntegritySettings.Mode`. Якір довіри —
+  `RuntimeRoot`: сам `toolsPath` теж має дорівнювати `<RuntimeRoot>\Tools`, тож спільне
+  перенаправлення каталогу інструментів і маніфесту не проходить. Порівняння шляхів
+  враховує регістр (на NTFS із per-directory case sensitivity інший регістр — інший
+  файл), а контейнер налаштувань перевіряється як будь-який `IDictionary`, як і в
+  runtime-споживачів. Сьогодні цей ключ
+  не можна перевизначити через конфігурацію (його завжди виводить
+  `Resolve-BRAVOConfigurationDerivation`), тому на наявних серверах поведінка не
+  змінюється; перевірка захищає від майбутньої регресії, за якої підмінений 7-Zip чи
+  WinSCP пройшов би перевірку цілісності проти чужого маніфесту. Нові self-test
+  перевірки: `ConfigLoader/ToolManifestPathRedirectionBlocks`,
+  `ConfigLoader/ToolManifestPathCanonicalAllowed`;
+  `ConfigLoader/ToolManifestPathEdgeCasesFailClosed` фіксує крайові випадки:
+  порожній і синтаксично зіпсований шлях, `..` за межі `Tools\`, інший регістр
+  імені файла, спільне перенаправлення `toolsPath` і маніфесту та перенаправлення в
+  `OrderedDictionary` блокуються, а `..`, що після нормалізації веде до того самого
+  канонічного файла, допускається.
+- **Походження бінарників у `Tools\TOOLS_MANIFEST.json` (BRAVO-T021).**
+  Для кожного інструмента маніфест тепер містить запис `provenance`: версію,
+  офіційне джерело пакета, SHA-256 пакета, шлях файлу в пакеті й дату завантаження.
+  7-Zip `26.02` (`7za.exe`, `7za.dll`, `7zxa.dll`) побайтово збігається з
+  `7z2602-extra.7z`, WinSCP `6.5.6` (`WinSCP.com`, `WinSCP.exe`) — з
+  `WinSCP-6.5.6-Portable.zip`, `WinSCPnet.dll` — з `WinSCP-6.5.6-Automation.zip`.
+  `DragExt64.dll` має версію `6.5.3`, не входить до пакетів 6.5.6 і позначений
+  `upstreamVerified = false`. `ci\Update-BRAVOToolsManifest.ps1 -Apply` відмовляє
+  (код `1`), доки для нового чи зміненого бінарника немає запису `provenance` з тим
+  самим `sha256`. Новий самотест `ToolManifest/EveryToolHasProvenance`, а
+  `ToolManifest/UpdaterApplyRequiresProvenance` запускає справжній updater на
+  тимчасовому корені: без `provenance`, із застарілим `sha256` і з записом для
+  видаленого інструмента `-Apply` завершується кодом `1` і не змінює маніфест. Гейт
+  спрацьовує й тоді, коли хеші в `tools` уже актуальні (перевірка стоїть до виходу
+  «розбіжностей немає»), а запис з `upstreamVerified = true` вимагає `packageSha256` і
+  непорожній `packageMember`, щоб перевірку можна було відтворити. Runtime-перевірка
+  цілісності читає лише `tools`, тож поведінка серверів не змінюється.
+- **Одна реалізація чанкера Discord (BRAVO-T023, крок 1).** `BRAVO.Archive.Runtime.ps1`
+  більше не оголошує власну `function global:Split-DiscordNotificationText`, яка тінила
+  експорт `BRAVO.Notifications` у всьому процесі. Канонічною стала поведінка з Archive:
+  рядки всередині частини з'єднуються LF (раніше модуль з'єднував через
+  `[Environment]::NewLine`, тобто CRLF на Windows), межі `MaximumLength` перевіряються, порожнє
+  повідомлення дає одну порожню частину. Для оператора змінюється лише те, що довгі
+  Discord-повідомлення поза Archive можуть ділитися на трохи менше частин. Нові самотести
+  `Notifications/DiscordChunksJoinWithLineFeed`, `Notifications/DiscordChunkerHasSingleDefinition` і
+  `Notifications/DiscordChunkerEdgeCases` (порожнє повідомлення, `$null`, межа `MaximumLength`,
+  відхилення `MaximumLength` поза 100..2000).
+- **DataRestore надсилає сповіщення через `Send-BRAVONotification` (BRAVO-T023, крок 2).**
+  `Send-BRAVODataRestoreNotification` більше не збирає власний ланцюжок
+  route → endpoint → payload → доставка, а викликає канонічну `Send-BRAVONotification`.
+  У неї додано перемикач `-SkipWhenEndpointUnavailable`: ненастроєний webhook
+  повертає `Sent = $false`, `Reason = 'EndpointUnavailable'` замість винятку. Тож
+  DataRestore, як і раніше, пише WARNING «не налаштовано — сповіщення пропущено» без
+  збільшення лічильника WARNING, а збій доставки лишається окремою подією. Інші
+  виклики `Send-BRAVONotification` без перемикача поводяться як раніше. Єдина
+  відмінність для оператора: відомості про хост для тексту сповіщення тепер
+  збираються й тоді, коли webhook не налаштовано. Нові самотести
+  `DataRestore/NotificationMissingEndpointSkipsWithoutWarningCount` і
+  `DataRestore/NotificationDeliveryFailureCountsWarning`: збій доставки при
+  налаштованому webhook, на відміну від ненастроєного, збільшує лічильник
+  WARNING рівно на 1 і не виходить за межі функції.
+- **Archive: статус-файл записується й на прогонах зі збоєм компонента.**
+  Під `Set-StrictMode -Version 2.0`, яку вмикає `BRAVO_CONFIG_LOADER.ps1`,
+  підсумок `totalCreatedBytes` для machine-readable статус-файла
+  (`BRAVO.Status`, ROADMAP P2.1) звертався до ключа `Bytes` кожного
+  результату компонента, а цей ключ є лише в опублікованих компонентів.
+  На будь-якому прогоні з невдалим компонентом (збій VSS, конфігурації,
+  access-probe, дрейф, збій архівації) звернення кидало виняток, fail-soft
+  catch лише писав його в журнал, і статус-файл лишався від попереднього
+  прогону — моніторинг бачив застарілий стан. Тепер ключ перевіряється
+  через `ContainsKey('Bytes')`. Код завершення й Operations-подія не
+  змінюються. Перевірка `Archive/OrchestrationReleasesSnapshotWhenComponentFails`
+  тепер вимагає запису статусу з кодом 40.
 
-  Виправлено слова, у яких латинські `i`/`e`/`a` тощо стояли замість
-  кириличних літер (наприклад, «моноліт» у `.claude/CLAUDE.md` і
-  `.claude/rules/05-architecture.md`; слова в `docs/design/` і кількох
-  runbook-ах). Дослівні цитати рядків рантайму, які самі містять латинську
-  `i` (наприклад, підсумковий рядок результату Archive), навмисно не змінено: оператор шукає
-  їх у логах саме в такому вигляді. Runtime-код і попередні записи
-  CHANGELOG не змінювались.
+- **Archive: поведінкові тести оркестрації Main (T011, аудит F010).**
+  Порядок фаз, звільнення ресурсів узгодженої копії й код завершення Archive
+  досі перевірялись лише структурно. Archive не зупиняє служб — узгодженість
+  дає один VSS Snapshot Set на generation, тому парні ресурси прогону тут —
+  VSS Snapshot Set (разом із файлом ownership state) і process lock. Нові
+  перевірки фрагмента `selftest/BRAVO_SELF_TEST.Archive.ps1` запускають у
+  дочірньому процесі runtime, зібраний з дослівного тексту
+  `BRAVO.Archive.Runtime.ps1` (справжні `Main`, зовнішній
+  `try`/`catch`/`finally` і фінальний `Exit`) через справжній
+  `Invoke-BRAVOArchiveEntrypoint`; VSS, 7-Zip, manifest, retention, Health,
+  статус-файл і Operations-подію замінюють стаби, що журналюють події.
+  Жодних VSS-знімків, служб чи мережі тест не чіпає.
+  `Archive/OrchestrationRunsPhasesInContractOrder` фіксує повну
+  послідовність фаз щасливого шляху (`[1/8]`…`[8/8]`, VSS до архівації й
+  видалення після неї, retention лише після manifest `COMPLETE`, lock
+  звільнено останнім) і код 0;
+  `Archive/OrchestrationReleasesSnapshotWhenComponentFails` — збій архівації
+  компонента: знімок видалено рівно раз, retention для `FAILED` generation
+  не запускається, код 40 (`LocalArchiveFailed`);
+  `Archive/OrchestrationReleasesSnapshotAndLockWhenPhaseThrows` —
+  необроблений виняток посеред фази архівації: знімок видалено у `finally`
+  до обробки винятку, пізніші фази не виконуються, код 90 (`InternalError`)
+  у процесі, статусі й Operations-події, lock звільнено останнім.
+  Production-код не змінено.
+- **Health: поведінкові тести оркестрації `Invoke-BRAVOHealth` (T011, аудит F010).**
+  Досі оркестрацію Health перевіряли лише текстові контракти (`IndexOf`/`Contains`
+  по тексту runtime). Шість нових перевірок `BRAVO_SELF_TEST.ps1` справді
+  виконують її в дочірньому процесі: runtime збирається з дослівного тексту
+  `modules/BRAVO.Health/BRAVO.Health.Runtime.ps1` (AST) — справжні
+  `Initialize-BRAVOHealthSteps`, кроки, гейти сповіщень,
+  `Get-SFTPHealthIssues`/`Test-SFTPHealthConfiguration`, `Write-HealthLog`,
+  `Complete-BRAVOHealthResult` і invocation guard з `exit` — і запускається через
+  справжній `Invoke-BRAVOHealthEntrypoint`. Преамбулу замінює seed змінних, а самі
+  перевірки, WinSCP, стан алертів, статус-файл і доставку сповіщень — стаби, що
+  пишуть події в журнал; служби, мережа й реальні інструменти не чіпаються.
+  Перевірки фіксують: порядок секцій `[1/9]`…`[9/9]` (кожна перевірка — перед своїм
+  кроком, «Сповіщення» — останнім)
+  (`Health/OrchestrationRunsChecksInContractOrder`); збій служб і NAS/SMB не
+  перериває решту перевірок, обидві проблеми йдуть в одне CRITICAL-сповіщення, код
+  `70` (`Health/OrchestrationFailedCheckDoesNotHideOtherChecks`); порушення
+  цілісності інструментів пропускає лише SFTP-гілку без жодного виклику WinSCP,
+  локальні перевірки виконуються, код `32` перекриває `70`
+  (`Health/OrchestrationToolIntegritySkipsOnlySftp`); `-NoSlack` прибирає лише
+  маршрутизацію й доставку сповіщень і крок «Сповіщення», не змінюючи перевірок і
+  коду (`Health/OrchestrationNoSlackSuppressesNotificationOnly`); відкладена
+  SFTP-перевірка дає `10`, а збій доставки — `70` з кроком «Сповіщення» `ERROR`
+  (`Health/OrchestrationResolvesWarningAndDeliveryFailureCodes`); ранні виходи
+  (вимкнений моніторинг `0`, небезпечний webhook `30`, недоступний `LOGS` через
+  права `36`) завершуються до перевірок (`Health/OrchestrationEarlyExitsSkipChecks`).
+  Продакшн-код не змінено.
+
+- **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
+  `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
+  використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний
+  збій транспорту завершує job помилкою і не створює дубль повідомлення (один запуск
+  notifier — щонайбільше одна спроба `sendMessage`). Ідемпотентні GET-запити до
+  GitHub API зберігають обмежені повтори. Статуси `waiting` і `requested`
+  відображаються як незавершені (значок попередження), узгоджено з підсумком
+  `INCOMPLETE`; пріоритет `FAILED` > `INCOMPLETE` > `SUCCESS` не змінено. Тест
+  `ci/test_telegram_ci_summary.py` розширено перевіркою аргументів `curl` для Telegram і
+  для GitHub GET та сценаріями `waiting`/`requested`.
+
+- **GitHub CI для `developer` тепер формує один підсумок у Telegram після merge/push.**
+  Окремий workflow `.github/workflows/telegram-ci-summary.yml` запускається лише на
+  `push` у `developer`, не виконує checkout і не запускає код PR. Він чекає
+  завершення п'яти post-merge перевірок поточного SHA, знаходить пов'язаний
+  merged PR і додає його вісім pre-merge checks (включно з Config parity,
+  Config V2 pilot artifact і GitGuardian) в одне повідомлення. Telegram secrets
+  використовуються лише в trusted `push`-контексті; значення token/chat ID та
+  відповідь Telegram API не журналюються.
+
+  Пріоритет результату: `FAILED` (є перевірка, що завершилась не успіхом) >
+  `INCOMPLETE` (перевірок бракує або вони ще виконуються після таймауту) >
+  `SUCCESS`; відома помилка не ховається за іншою незавершеною перевіркою.
+  Пов'язаний PR — лише той merged PR у `developer`, чий `merge_commit_sha`
+  дорівнює SHA пушу (інакше відкриті й пізніше злиті PR, гілки яких містять
+  комміт, дали б хибний PR); прямий push звітує `N/A`. Поведінку логіки
+  перевіряє `ci/test_telegram_ci_summary.py` (справжній скрипт із workflow,
+  fake curl, записані відповіді API) у workflow
+  `telegram-ci-summary-test.yml`.
+
+- **Runtime Maintenance загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` тепер живе
+  у функції `Invoke-BRAVOMaintenance` з invocation guard наприкінці файлу —
+  той самий патерн, що `BRAVO.Health.Runtime.ps1` (`Invoke-BRAVOHealth`).
+  Для оператора нічого не змінилось: ті самі параметри (включно з alias
+  `-ArchivLims`), коди завершення, кроки `[1/8]`…`[8/8]`, відновлення служб у
+  `finally`, пауза `-NoPause` і вивід. Guard передає функції лише справді
+  задані параметри (`$PSBoundParameters`), тож `-AutoShutdown` і
+  `-ArchiveAfterMaintenance` з командного рядка, як і раніше, мають
+  пріоритет над конфігурацією, а незадані беруться з неї. Дві правки в
+  тілі зберігають наявну поведінку: сирий режим повідомлень і шлях журналу
+  `$LOG_FILE` тепер явно пишуться в `$script:` — інакше валідація
+  конфігурації побачила б сирий замість ефективного режиму (з
+  `-DisableAllSlack`/`-EnableAllSlack`), а вивантаження власного журналу
+  Maintenance на SFTP мовчки перестало б працювати. Dot-source файлу тепер
+  лише визначає функцію й нічого не виконує.
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/MaintenanceRuntimeWrappedInFunction` (AST: на верхньому рівні
+  лише обгортка й guard, кожен `exit` — усередині обгортки, `param()`
+  функції тотожний `param()` скрипта, guard викликає
+  `Invoke-BRAVOMaintenance @PSBoundParameters`, тіло не пише без scope
+  імен, які файл використовує через `$script:` чи
+  `Get-Variable -Scope Script`),
+  `Console/MaintenanceRuntimeGuardForwardsBoundParametersOnly` (проба з
+  реального тексту файлу: до й після обгортання однакові ключі
+  `$PSBoundParameters` і значення параметрів),
+  `Console/MaintenanceRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/MaintenanceRuntimeDirectInvocationRunsBody` (дочірній процес).
+  Перевірку порядку
+  `Maintenance/LegacySweepDependencyFunctionsDefinedBeforeTopLevelInvocation`
+  оновлено: оператори обгортки вважаються верхнім рівнем тіла.
+- **Maintenance: перевірка before/after-архівів реставрації моделі тепер
+  зосереджена в одному місці й завжди включає 7z t (T004/F002).**
+  `Verify-Backup` раніше лише записував `.sha512` і повертав успіх для будь-
+  якого наявного файлу; перевірку цілісності 7-Zip окремо виконував кожен
+  call site. Тепер `Verify-Backup` сам виконує канонічну перевірку 7-Zip
+  (`Test-SevenZipArchiveIntegrity` з `BRAVO.ArchiveHelpers`, та сама, що в
+  Archive) і пише `.sha512` лише для перевіреного архіву; пошкоджений
+  архів, невірний пароль, збій або відсутність 7-Zip дають збій
+  (fail-closed) без `.sha512`.
+
+  **Для оператора.** Пошкоджений before/after-архів і раніше зупиняв
+  реставрацію / не давав маркера успіху — ця поведінка не змінилась, а
+  7z t, як і раніше, виконується один раз на архів (тривалість вікна
+  реставрації не зростає). Змінився лише текст ERROR/Slack-сповіщення
+  для архіву перед реставрацією: замість двох окремих повідомлень
+  («не пройшов перевірку 7-Zip» / «не вдалося створити SHA512») тепер
+  одне — «не пройшов перевірку (7z t або SHA512)»; точна причина — у
+  попередніх рядках журналу.
+  Додатково `Verify-Backup` тепер тримає контракт «`.sha512` лише для
+  перевіреного архіву» і при збої ПІСЛЯ успішного 7z t (не пораховано або
+  не записано SHA512): повертає збій, виставляє `criticalErrorOccurred`
+  (call sites виставляли його й раніше — для прямого виклику це нове) і
+  прибирає напівзаписаний `.sha512`; застарілий `.sha512` поруч із архівом,
+  що не пройшов 7z t, також видаляється. Класифікація
+  `restoreIntegrityFailed`/`restoreArchiveFailed` лишається за call site.
+- **Runtime Archive загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.Archive/BRAVO.Archive.Runtime.ps1` тепер живе у
+  функції `Invoke-BRAVOArchive` з invocation guard наприкінці файлу — той
+  самий патерн, що `BRAVO.Health.Runtime.ps1` (`Invoke-BRAVOHealth`). Для
+  оператора нічого не змінилось: ті самі параметри, коди завершення
+  (зокрема наявні `exit 1`), пауза `-NoPause`, вивід і фінальна
+  Operations-подія. Єдина правка в тілі — початкове значення режиму
+  сумісності тепер явно пишеться в `$script:`, щоб рядок «Режим
+  сумiсностi» в журналі й надалі показував фактичний режим, визначений
+  перевіркою сумісності. Dot-source файлу тепер лише визначає функцію й
+  нічого не виконує — це передумова для оркестраційних тестів Archive.
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/ArchiveRuntimeWrappedInFunction` (AST: на верхньому рівні лише
+  обгортка й guard, кожен `exit` — усередині обгортки, guard передає рівно
+  параметри `param()` скрипта, тіло не пише без scope імен, які файл
+  використовує через `$script:`),
+  `Console/ArchiveRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/ArchiveRuntimeDirectInvocationRunsBody` (дочірній процес:
+  dot-source не виконує тіло; production-шлях
+  `Invoke-BRAVOArchiveEntrypoint` з явно вказаним відсутнім `-ConfigPath`
+  виконує тіло й повертає той самий код, що й раніше).
+- **Runtime DataRestore загорнуто в одну функцію — поведінка не змінилась.**
+  Тіло `modules/BRAVO.DataRestore/BRAVO.DataRestore.Runtime.ps1` тепер живе
+  у функції `Invoke-BRAVODataRestore` з invocation guard наприкінці файлу —
+  той самий патерн, що вже має `BRAVO.Health.Runtime.ps1`
+  (`Invoke-BRAVOHealth`). Для оператора нічого не змінилось: ті самі
+  параметри, коди завершення, пауза `-NoPause` і вивід. Dot-source файлу
+  тепер лише визначає функції й нічого не виконує — це передумова для
+  оркестраційних тестів DataRestore (відновлення служб і звільнення lock-а
+  при збої).
+
+  **Валідація.** Нові перевірки `BRAVO_SELF_TEST.ps1`:
+  `Console/DataRestoreRuntimeWrappedInFunction` (AST: кожен `exit` і
+  зовнішній `try/finally` — усередині обгортки, guard передає рівно
+  параметри `param()` скрипта),
+  `Console/DataRestoreRuntimeDotSourceDefinesWithoutRunning` і
+  `Console/DataRestoreRuntimeDirectInvocationRunsBody` (дочірній процес:
+  dot-source не виконує тіло; production-шлях
+  `Invoke-BRAVODataRestoreEntrypoint` з явно вказаним відсутнім
+  `-ConfigPath` повертає контрактний exit 30).
+- **Архіви, що відкриваються лише через legacy BOM-fallback пароля, тепер
+  дають попередження, а не тихий успіх.** Архів, зашифрований паролем із
+  BOM-префіксом (U+FEFF), — так пароль потрапляв у 7-Zip під
+  UTF-8-консоллю (`chcp 65001`) не лише у версіях до 5.2.0, а й у 5.2.x —
+  відкривається сумісним fallback-ом. Раніше Archive, Maintenance,
+  Data Restore і Restore Drill при цьому завершувались кодом 0 без
+  жодного сліду для оператора.
+
+  **Що бачить оператор.** Для кожного такого архіву в журналі з'являється
+  WARNING з іменем файла (пароль не журналюється). Прогін завершується
+  кодом 10 (`SuccessWithWarnings`) — гірший код, якщо він уже є, не
+  знижується. Надсилається **одне** попередження на прогін (не на кожен
+  архів) з переліком архівів (до 10 імен, решта — у журналі) і підказкою.
+  У Restore Drill це окремий WARN-результат «Legacy BOM-пароль», тому
+  прогін із таким архівом не оновлює `LastVerifiedAt`. У Maintenance,
+  якщо прогін уже має критичні помилки, фінальне сповіщення лишається
+  критичним, а перелік таких архівів — лише в журналі.
+
+  **Що робити.** Дані в цих архівах читаються. Створіть нові резервні
+  копії цих даних поточною версією BRAVO і переконайтеся, що прогін, який
+  їх відкриває, завершується без цього попередження. Старі архіви не
+  видаляйте, доки нова копія не пройде перевірку цілісності.
+- **Стан реставрації та запусків завдань більше не спотворюється і не
+  обривається при збої запису.** `BRAVO_RESTORE_STATE.json` (Maintenance) і
+  `BRAVO_TASK_EXECUTION_STATE.json` (Maintenance і Archive) у
+  `%ProgramData%\BRAVO\State` тепер читаються явно як UTF-8: у Windows
+  PowerShell 5.1 вони читались у кодуванні ANSI, тож кирилиця в причині
+  реставрації (`Reason`) спотворювалась і з кожним наступним записом
+  спотворювалась далі. Запис тепер атомарний: новий вміст спершу
+  повністю пишеться в тимчасовий файл поруч і лише потім підміняє
+  попередній, тож kill процесу чи помилка запису (наприклад, брак місця)
+  посеред запису лишають попередній стан цілим замість порожнього чи
+  обірваного JSON (раніше такий файл далі трактувався як «стану немає», включно з
+  тижневою квотою реставрації). Кодування файлів (UTF-8 без BOM) і
+  поведінка на вже пошкодженому файлі не змінились. Примусового скидання
+  на диск (write-through) немає, тож від раптової втрати живлення
+  гарантія лише та, яку дає файлова система.
+- **`BRAVO_DATA_RESTORE` тепер блокується на непідтримуваній ОС так само,
+  як Archive, Health і Maintenance.** Раніше відновлення даних не
+  перевіряло рівень підтримки ОС узагалі: на `Unsupported` системі
+  (Windows 7/Server 2008 R2, PowerShell 3.x) воно запускалося без
+  блокування й без запису рівня в журнал, всупереч розділу 1 README.md.
+
+  Тепер на старті (до operation lock і будь-яких дій) DataRestore пише в
+  журнал рівень підтримки, версію ОС, build, PowerShell і .NET. На
+  `Unsupported` запуск завершується кодом `30` (InvalidConfiguration) —
+  зокрема й read-only `-ListGenerations`, як і Health; свідомий обхід —
+  `BRAVO_ALLOW_UNSUPPORTED_OS=1` (прогін продовжується з попередженням).
+  На `Legacy best-effort` (Server 2012 R2/2016) повідомлення лише
+  інформаційне й на код завершення не впливає.
+
+  **Наслідок для аварійного відновлення.** На `Unsupported` хості (старий
+  або тимчасовий замінний сервер із Windows 7/Server 2008 R2 чи
+  PowerShell 3.x) відновлення даних тепер не запуститься. Якщо відновлювати
+  треба саме там і іншого хоста немає, свідомо встановіть
+  `BRAVO_ALLOW_UNSUPPORTED_OS=1` у середовищі цього запуску й приберіть
+  після відновлення. Див. OPERATIONS.md, код `30`.
+- **Maintenance більше не ескалює SuccessWithWarnings (exit 10) від
+  BRAVO_ARCHIV у критичну помилку.** Раніше будь-який ненульовий код
+  дочірньої архівації після maintenance, включно з 10 (архів створено, але
+  з попередженнями), записувався як ERROR, і весь прогін Maintenance
+  завершувався кодом 60 (`MaintenanceFailed`) зі статусом «ПОМИЛКА».
+
+  Тепер код 10 фіксується як WARNING: операція «Архівація після
+  maintenance» показує WARN з поясненням «BRAVO_ARCHIV завершився з
+  попередженнями (код 10 — SuccessWithWarnings)», а прогін завершується
+  кодом 10 (`SuccessWithWarnings`), якщо інших помилок не було. Код 0 і
+  будь-який інший ненульовий код обробляються як і раніше.
+- **Пароль 7-Zip тепер доходить без BOM і на хостах з UTF-8-кодуванням
+  вводу консолі.** Гарантія 5.2.0 «пароль у stdin без BOM» на хостах, де
+  кодова сторінка вводу консолі — UTF-8 (`chcp 65001`), фактично не
+  виконувалась: .NET Framework записував BOM у stdin дочірнього процесу
+  ще в момент запуску, до самого пароля (Windows CI зафіксував
+  `EF BB BF` + пароль + CRLF). На хостах з cp866/cp1251 BOM не
+  з'являвся, і для них нічого не змінюється.
+
+  Тепер кожен процес BRAVO, що отримує дані через stdin (7-Zip для
+  створення, перевірки, розпакування й листингу архівів, архівація в
+  `BRAVO_MAINTENANCE.ps1`), запускається через канонічний
+  `Start-BRAVOProcessWithBomFreeInput` (`BRAVO.Compatibility`) і отримує
+  рівно передані байти. Якщо кодування вводу консолі має BOM і тимчасово
+  замінити його неможливо, запуск відмовляє з явною помилкою замість
+  передачі пароля з BOM.
+
+  Архіви, створені на таких хостах з BOM-префіксом у паролі (до 5.2.0 і
+  у 5.2.x), і далі відкриваються через наявний legacy BOM fallback
+  (`LegacyBomPasswordFallbackUsed`) — тепер уже як fallback, а не з
+  першої спроби, тож для них з'являтиметься його попередження. Поведінку
+  самого fallback не змінено; політика щодо нього — окреме рішення
+  власника (T006).
+
+- **BRAVO_ARCHIV передає пароль архіву 7-Zip без BOM (T005).** Щоденний
+  архів (`New-Archive`) був останньою production-точкою, що писала пароль у
+  stdin 7-Zip напряму (`StandardInput.WriteLine`). Коли кодова сторінка
+  вводу консолі — UTF-8 (chcp 65001), .NET Framework додавав перед паролем
+  BOM, і 7-Zip шифрував архів паролем «U+FEFF + пароль». Тепер пароль
+  передається канонічним `Write-BRAVOProcessInputText` (UTF-8 без BOM),
+  як уже роблять Maintenance, DataRestore і перевірки цілісності.
+
+  **Наслідок для наявних архівів.** Архіви BRAVO_ARCHIV, створені до цього
+  виправлення під UTF-8-консоллю, зашифровані паролем «U+FEFF + пароль»:
+  ручне розпакування 7-Zip звичайним паролем для них завершиться
+  «Wrong password». Штатні перевірка цілісності й розпакування BRAVO
+  (`Invoke-BRAVOSevenZipIntegrityTest` / `Invoke-BRAVOSevenZipExtraction` —
+  DataRestore, restore drill) мають одну повторну спробу з BOM-префіксом і
+  такі архіви відкривають. Подальша політика щодо цих архівів — окреме
+  рішення власника (T006).
+
+  **Валідація.** Нові перевірки self-test: точні байти stdin від
+  `Write-BRAVOProcessInputText` (без BOM, CRLF, EOF), канонічний виклик у
+  `New-Archive` і заборона прямого `StandardInput.Write`/`WriteLine` у
+  production-коді.
+
+- **`BRAVO_ARCHIV.ps1 -NoSlack` більше не дозволяє вбудованій перевірці
+  стану резервних копій надсилати повідомлення.** Раніше прапорець діяв лише
+  на повідомлення самого архіватора: крок «Перевірка резервних копій»
+  (Health) після бекапу запускався без нього й міг надіслати Slack-
+  повідомлення, хоча оператор явно заборонив їх для цього запуску. Тепер
+  `-NoSlack` поширюється і на цей крок. Запуск без `-NoSlack` поводиться
+  так само, як раніше.
+- **Сповіщення Slack/Discord більше не губляться через короткочасні збої
+  сервера webhook (T031).** Раніше обмежений повтор відправки працював лише
+  для HTTP 429 (rate limit), а тимчасові відповіді 500/502/503/504 (збій або
+  перевантаження Slack/Discord чи їхнього Cloudflare-фронту) одразу давали
+  помилку і сповіщення не доходило. Тепер ці статуси повторюються за тією
+  самою політикою, що й 429: максимум 4 спроби сумарно, пауза 1/2/4 с, а для
+  503 — `Retry-After` сервера (не більше 30 с).
+
+  501, 505, інші 5xx і всі 4xx, крім 429, як і раніше, не повторюються. Якщо
+  всі спроби вичерпано, помилка називає конкретний HTTP-статус і кількість
+  спроб (напр. `HTTP 503 після 4 спроб`).
+
+  **Свідомий компроміс.** POST вебхука не ідемпотентний: відповідь 502/504
+  від проміжного фронту може прийти вже після того, як Slack/Discord
+  прийняв повідомлення. Тоді повтор дає дубль цього повідомлення (для
+  довгих повідомлень — дубль окремої частини). Дубль сповіщення вважається
+  прийнятнішим за втрачене.
+- **TLS 1.2 більше не вимикає інші протоколи, дозволені хостом.** Старт
+  `BRAVO_MAINTENANCE` і `BRAVO_DATA_RESTORE`, а також перевірка webhook-ів
+  у `BRAVO_DRY_RUN.ps1` не перезаписують `SecurityProtocol` процесу
+  значенням «лише TLS 1.2», а ДОДАЮТЬ TLS 1.2 до вже явно ввімкнених
+  протоколів (наприклад, TLS 1.3) — так, як це вже робили інші компоненти
+  й deploy-скрипти (канонічний `Enable-BRAVOTls12`). Якщо в процесі вже
+  ввімкнено TLS 1.3, webhook-сповіщення цих компонентів більше не
+  обмежуються TLS 1.2.
+
+  Self-test поведінково перевіряє кожну точку ввімкнення (попередній
+  прапор зберігається, TLS 1.2 додається), а AST-guard
+  `StaticAnalysis/SecurityProtocolAssignmentsAreAdditive` блокує пряме
+  присвоєння `[Net.ServicePointManager]::SecurityProtocol` у production-коді.
+
+  **Обмеження (свідомо прийняте рішення власника).** Раніше ці два runtime
+  примусово залишали в процесі лише TLS 1.2. Тепер вони лише додають
+  TLS 1.2, тож протоколи, які хост уже вмикає за замовчуванням, лишаються
+  дозволеними. На старих хостах .NET 4.5/4.6 без `SchUseStrongCrypto`
+  дефолт — `Ssl3, Tls`, тому SSL 3.0 і TLS 1.0 там лишаються ввімкненими
+  для HTTPS-з'єднань Maintenance і DataRestore. Практичний ризик низький:
+  endpoints сповіщень і Operations приймають лише TLS 1.2+, тож з'єднання
+  все одно встановлюється по TLS 1.2. Щоб прибрати застарілі протоколи на
+  такому хості, увімкніть `SchUseStrongCrypto` у реєстрі .NET Framework.
+- **Maintenance: успішне сповіщення (`NotificationMode=all`) більше не
+  залежить від PowerShell 5.0+.** Блок «Виконано» успішного звіту
+  будувався через статичний конструктор `[T]::new()`, якого немає в
+  PowerShell 3.0/4.0, хоча маніфести модулів декларують
+  `PowerShellVersion = '3.0'`. На такому хості обслуговування падало б
+  саме в момент надсилання успішного звіту — у рідкісній гілці, яку
+  звичайні прогони не зачіпають. Тепер використовується `New-Object`;
+  вміст і порядок рядків сповіщення не змінились. Те саме виправлено в
+  операторському acceptance-скрипті
+  `ci\acceptance\Test-BRAVOVSSSingleVolumeAcceptance.ps1`, що входить
+  у release-пакет.
+
+  **Захист від повернення.** `ci\Test-BRAVOForbiddenPattern.ps1` і
+  self-test (`StaticAnalysis/NoStaticNewConstructorInProductionCode`)
+  тепер відхиляють будь-який виклик `::new()` у production PowerShell-коді
+  (усе, крім self-test-набору). Пошук іде за синтаксичним деревом, тому
+  згадки в коментарях і рядках не спрацьовують. Питання мінімальної
+  підтримуваної версії PowerShell (3.0 чи 5.1) цим не вирішується.
+- **Governance-перевірки workflow охоплюють усі `.github/workflows`, а не лише
+  `ci.yml`; `release-artifact.yml` більше не містить кирилиці у `run:`.**
+  `StaticAnalysis/CiRunBlocksAreAsciiOnly` і `StaticAnalysis/ActionsPinnedToCommitSha`
+  тепер перебирають кожен `*.yml`/`*.yaml` у `.github/workflows` (перелік
+  динамічний, порожній або неповний перелік — провал). Перевірка ASCII
+  ловить будь-який не-ASCII символ у виконуваному рядку, а не лише кирилицю:
+  у кодовій сторінці ANSI тире чи літера «є» стають типографськими лапками,
+  які PowerShell сприймає як межу рядка.
+
+  **Що було не так.** П'ять повідомлень у кроці «Прикріплення до GitHub
+  Release» `release-artifact.yml` були кирилицею. GitHub Actions пише `run:`
+  у файл без BOM, і Windows PowerShell 5.1 (`shell: powershell`) читає його в
+  ANSI; модельне декодування показує, що зсунуті лапки ковтали `exit 1` у
+  гілці «опублікований тег зібрано з іншими байтами» — тобто захист #151
+  міг не спрацювати. Workflow запускається лише від тега, тому жоден
+  PR-прогін цього не бачив. Тексти повідомлень переведено на ASCII (англійською);
+  логіка, умови, коди виходу й політика релізу не змінювались.
 
 - **Config V2 cutover: `BRAVO.config` прибрано з нормального production-
   runtime і з release-пакета (issue #216).** Owner-мандат (2026-09-24/26):
