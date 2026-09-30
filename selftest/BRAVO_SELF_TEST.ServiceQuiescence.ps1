@@ -726,6 +726,9 @@ function Get-Service {
     # Get-ManagedServiceHealthIssues під StrictMode 2.0: ServiceController без
     # StartType (.NET < 4.6.1) не має обривати Health винятком, а тип запуску
     # має братись із WMI-fallback (Disabled -> службу пропущено).
+    # ServiceControllerStatus (System.ServiceProcess) не завжди завантажений
+    # у процесі self-test; і stub, і production-порівняння Status його потребують.
+    Add-Type -AssemblyName System.ServiceProcess
     $startTypeStubs = @'
 function Write-HealthLog { param($Message, $Level) }
 function Get-Service {
