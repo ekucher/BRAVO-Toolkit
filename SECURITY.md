@@ -70,6 +70,10 @@ Slack/Discord webhook URL, секрети BSYSTEM Operations) runtime 5.3 чит
 **лише** з Windows Credential Manager — окремо для поточного адміністратора
 (ручні запуски) і для `NT AUTHORITY\SYSTEM` (заплановані завдання),
 `-StoreFor Both` при `BRAVO_CREDENTIALS_SETUP.ps1`/`BRAVO_SETUP.ps1`.
+Виняток за походженням — API-ключ BSYSTEM Operations: його видає бекенд
+Operations під час enrollment, runtime записує його в Credential Manager
+облікового запису процесу й далі читає звідти; оператор провізіонує лише
+bootstrap-секрет.
 Конфігурація (`BRAVO.local.config`) містить лише імена записів
 (`credentialSettings.Targets.*`); секрет у конфігураційний файл не
 записується і з нього не читається. Назва, код установи й префікс архівів

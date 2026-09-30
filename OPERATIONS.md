@@ -185,9 +185,11 @@ Manager з іменем target у консолі чи журналі.
 потрібного компонента — найчастіше він створений для адміністратора,
 але не для `SYSTEM`. Код `31` дають пароль архівів (`BRAVO_ARCHIV`,
 `BRAVO_MAINTENANCE`, `BRAVO_DATA_RESTORE`), webhook (`BRAVO_MAINTENANCE`,
-`BRAVO_NOTIFICATION_TEST`) і SFTP-облікові дані (`BRAVO_DATA_RESTORE`,
-`BRAVO_BAZA_RECONCILE`). Відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV`
-дають `30`, у `BRAVO_HEALTH` — `70`; повна таблиця — README.md, розділ 4,
+`BRAVO_NOTIFICATION_TEST`) і SFTP-облікові дані (`BRAVO_DATA_RESTORE`;
+`BRAVO_BAZA_RECONCILE` — лише під час прийняття мутацій через
+`-Accept`/`-AcceptAll`, перегляд без облікових даних завершується `0`).
+Відсутні SFTP/SMB-облікові дані в `BRAVO_ARCHIV` дають `30`, у
+`BRAVO_HEALTH` — `70`; повна таблиця — README.md, розділ 4,
 підрозділ «Джерела конфігурації та секретів у 5.3».
 
 **Чого не робити.** Не вписувати секрет у `BRAVO.local.config` чи legacy
