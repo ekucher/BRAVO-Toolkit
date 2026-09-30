@@ -1150,14 +1150,29 @@
         $satisfiedBelowFloorReason = $satisfiedBelowFloorMatches[0].Groups[1].Value
         $staleBlockPattern = '(?i)блок[а-яіїєґ'']*[^.;]{0,200}' + [regex]::Escape($blockingBelowFloorReason)
         $staleBootstrapPattern = '(?i)без\s+(валідної\s+)?історії[^.]{0,120}пропускається'
+        # Семантика, а не лише наявність назви: кожне ВИЗНАЧЕННЯ причини
+        # виконаної вимоги — рядок таблиці README чи пункт-визначення
+        # "- **`<причина>`**" в OPERATIONS — має описувати її як неблокуючу
+        # і не приписувати їй блокування; хоча б одне визначення мусить бути.
+        $satisfiedReasonToken = '`' + $satisfiedBelowFloorReason + '`'
+        $satisfiedDefinitionPattern = '(?m)^\|[^\r\n]*' + [regex]::Escape($satisfiedReasonToken) + '[^\r\n]*|^- \*\*' + [regex]::Escape($satisfiedReasonToken) + '\*\*(?:[^\r\n]*\r?\n(?!- |\r?\n))*[^\r\n]*'
+        $satisfiedClaimsBlockPattern = '(?i)(?<![Нн]е\s)(?<![Нн]е\s\*\*)\bблоку(є|ється|ють)\b|Blocks=True|\*\*зупиня'
+        $satisfiedStatesNonBlockingPattern = '(?i)не\s+блоку|Blocks=False'
         $diskSpaceDocsMatchCode = ($archiveRequirementPolicy -ne $blockingBelowFloorPolicy)
         foreach ($diskSpaceDocText in @($readmeTextForDocFixes, $operationsTextForDiskSpaceDoc)) {
             if (-not $diskSpaceDocText.Contains($archiveRequirementPolicy) -or
                 -not $diskSpaceDocText.Contains($satisfiedBelowFloorReason) -or
                 -not $diskSpaceDocText.Contains('EstimatedRequirementNotMet') -or
                 [regex]::IsMatch($diskSpaceDocText, $staleBlockPattern) -or
-                [regex]::IsMatch($diskSpaceDocText, $staleBootstrapPattern)) {
+                [regex]::IsMatch($diskSpaceDocText, $staleBootstrapPattern) -or
+                [regex]::Matches($diskSpaceDocText, $satisfiedDefinitionPattern).Count -eq 0) {
                 $diskSpaceDocsMatchCode = $false
+            }
+            foreach ($satisfiedDefinition in [regex]::Matches($diskSpaceDocText, $satisfiedDefinitionPattern)) {
+                if (-not [regex]::IsMatch($satisfiedDefinition.Value, $satisfiedStatesNonBlockingPattern) -or
+                    [regex]::IsMatch($satisfiedDefinition.Value, $satisfiedClaimsBlockPattern)) {
+                    $diskSpaceDocsMatchCode = $false
+                }
             }
         }
     }

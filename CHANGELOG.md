@@ -41,7 +41,11 @@
   `BRAVO.Archive.Runtime.ps1` і self-test виправлено; runtime-поведінка не
   змінювалась. Нова перевірка `Documentation/ReadmeArchiveBelowFloorMatchesPeakSafePolicy`
   витягує політику Archive, блокуючу below-floor політику та назви причин із
-  production-коду й падає, якщо README чи `OPERATIONS.md` розходяться з ними.
+  production-коду й падає, якщо README чи `OPERATIONS.md` розходяться з ними; кожне визначення
+  `BelowHealthFloorButRequirementSatisfied` (рядок таблиці README, пункт у
+  `OPERATIONS.md`) має описувати причину як неблокуючу. Для destination нижче порогу
+  документація веде до operational-рядка з будь-якою причиною, а не лише до
+  неблокуючої.
 
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє

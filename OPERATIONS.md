@@ -645,8 +645,11 @@ BRAVO-owned Shadow IDs і видаляє state після успіху. Не р�
   результат health-only огляду: архівація окремо оцінює за порогом усі
   локальні Fixed-диски, **включно з archive destination**. Тож ця причина
   не означає, що архівація на диск не пише: для destination нижче порогу
-  поряд буде й рядок `BelowHealthFloorButRequirementSatisfied` для шляхів
-  destination — діагностуйте за ним. `Limits.ExcludedDrives` придушує
+  поряд буде й operational-рядок для шляхів destination — діагностуйте за
+  ним, хоч би яка в нього причина: `BelowHealthFloorButRequirementSatisfied`
+  (відома вимога вміщається, не блокує), `EstimatedRequirementNotMet` (вимога
+  не вміщається) чи `BelowFallbackFloorNoEstimate` (вимога невідома, залишку
+  замало; обидві блокують). `Limits.ExcludedDrives` придушує
   health-only попередження, але не operational-причини.
 - **`BelowDegradedHealthFloorSmallVolume`** (`Warning`, не блокує) — те
   саме health-only попередження для тому, загальна ємність якого менша за

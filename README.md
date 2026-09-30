@@ -543,8 +543,11 @@ UNC-шлях і далі блокує (перевірка доступу йде 
 огляд оцінює лише поріг здоров'я: нестача дає `WARNING`
 `BelowHealthFloorNoFreeSpaceRequirement` для health-only запису тому (виду
 `D:\: BelowHealthFloorNoFreeSpaceRequirement`). Тому для destination нижче
-порогу в журналі може бути два рядки: цей health-only і
-`<шляхи destination>: BelowHealthFloorButRequirementSatisfied`. Сама причина
+порогу в журналі може бути два рядки: цей health-only і operational-рядок
+`<шляхи destination>: <причина>`. Його причина залежить від вимоги:
+`BelowHealthFloorButRequirementSatisfied`, якщо відома вимога вміщається
+(не блокує), або блокуючі `EstimatedRequirementNotMet` чи
+`BelowFallbackFloorNoEstimate`. Сама причина
 `BelowHealthFloorNoFreeSpaceRequirement` означає результат health-only
 огляду, а не те, що архівація на цей диск не пише.
 
