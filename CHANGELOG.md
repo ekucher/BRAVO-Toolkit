@@ -13,7 +13,10 @@
   дає `WARNING` `BelowHealthFloorButRequirementSatisfied` без блокування (код
   `10`). Блокують (код `40`) `EstimatedRequirementNotMet` і
   `BelowFallbackFloorNoEstimate` (вимогу визначити не вдалось, вільного менше за
-  поріг). Застарілі коментарі в `BRAVO.DiskSpace.psm1`,
+  поріг). Задокументовано два винятки: порожнє чи нульове джерело без історії
+  дає невідому вимогу (запасний гейт за порогом), а для archive destination
+  на UNC-шляху ємність не вимірюється — `CapacityUnknownRemote` без
+  блокування. Застарілі коментарі в `BRAVO.DiskSpace.psm1`,
   `BRAVO.Archive.Runtime.ps1` і self-test виправлено; runtime-поведінка не
   змінювалась. Нова перевірка `Documentation/ReadmeArchiveBelowFloorMatchesPeakSafePolicy`
   витягує політику Archive, блокуючу below-floor політику та назви причин із
