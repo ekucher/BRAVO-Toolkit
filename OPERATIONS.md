@@ -114,8 +114,7 @@ Get-Process -Id <pid> -ErrorAction SilentlyContinue | Select-Object Id, ProcessN
 облікові дані в `BRAVO_ARCHIV`, webhook у `BRAVO_HEALTH`, некоректні
 параметри установи — повна таблиця в README.md, розділ 4, підрозділ
 «Джерела конфігурації та секретів у 5.3». Якщо запуск іде з явним
-`-ConfigPath` на legacy `BRAVO.config` (або це `BRAVO_OPERATIONS_HEARTBEAT`,
-а `BRAVO.config` лежить у каталозі runtime), помилка може походити з нього — це
+`-ConfigPath` на legacy `BRAVO.config`, помилка може походити з нього — це
 сумісність на час міграції, а не джерело конфігурації 5.3 (там само,
 «Міграція — legacy `BRAVO.config`»).
 
