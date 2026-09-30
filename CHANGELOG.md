@@ -11,7 +11,10 @@
   `DragExt64.dll` має версію `6.5.3`, не входить до пакетів 6.5.6 і позначений
   `upstreamVerified = false`. `ci\Update-BRAVOToolsManifest.ps1 -Apply` відмовляє
   (код `1`), доки для нового чи зміненого бінарника немає запису `provenance` з тим
-  самим `sha256`. Новий самотест `ToolManifest/EveryToolHasProvenance`. Runtime-перевірка
+  самим `sha256`. Новий самотест `ToolManifest/EveryToolHasProvenance`, а
+  `ToolManifest/UpdaterApplyRequiresProvenance` запускає справжній updater на
+  тимчасовому корені: без `provenance`, із застарілим `sha256` і з записом для
+  видаленого інструмента `-Apply` завершується кодом `1` і не змінює маніфест. Runtime-перевірка
   цілісності читає лише `tools`, тож поведінка серверів не змінюється.
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
