@@ -300,6 +300,29 @@ function Stop-Process {
             -Name "DataRestore/PlanRejectsDriveAndRootRelativeTargetPath" `
             -Failure "Get-BRAVODataRestorePlan (OutOfPlace) має відхиляти диск-відносне 'C:restore' і корінь-відносне '\restore' -TargetPath (IsPathRooted їх пропускає)"
 
+        # Повна матриця #304: прийнятні форми -TargetPath і всі відносні /
+        # device-namespace форми, які мають відхилятися (і валідатором, і
+        # Get-BRAVODataRestorePlan).
+        $targetPathAcceptCases = @('C:\restore', 'D:\x\restore', '\\server\share\x')
+        $targetPathRejectCases = @('C:restore', '\restore', '.\restore', '..\restore', '\\?\C:\restore', '\\.\C:\restore')
+        $targetPathMatrixMismatches = New-Object System.Collections.Generic.List[string]
+        foreach ($acceptCase in $targetPathAcceptCases) {
+            $acceptResult = & $dataRestoreModule { param($v) Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $v } $acceptCase
+            if ($acceptResult -ne $true) { $targetPathMatrixMismatches.Add("ACCEPT очікувалось: $acceptCase") }
+        }
+        foreach ($rejectCase in $targetPathRejectCases) {
+            $rejectResult = & $dataRestoreModule { param($v) Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $v } $rejectCase
+            if ($rejectResult -ne $false) { $targetPathMatrixMismatches.Add("REJECT очікувалось (валідатор): $rejectCase") }
+            $rejectPlan = & $planInvoke $dataRestoreModule 'OutOfPlace' $rejectCase $planBackupRoot $planRuntimeRoot $planStagingRoot $planDefinitions
+            if ($rejectPlan.Success -or -not ([string]$rejectPlan.Error).Contains('повністю кваліфікованим')) {
+                $targetPathMatrixMismatches.Add("REJECT очікувалось (план): $rejectCase")
+            }
+        }
+        Test-BRAVOCondition `
+            -Condition ($targetPathMatrixMismatches.Count -eq 0) `
+            -Name "DataRestore/TargetPathQualificationMatrix" `
+            -Failure ("Матриця -TargetPath (#304) не збігається: " + ($targetPathMatrixMismatches.ToArray() -join '; '))
+
         # -TargetPath перевіряється ще ДО UAC-релаунчу, де робочий каталог —
         # C:\Windows\System32.
         $targetGuardIndex = $dataRestoreRuntimeTextForTests.IndexOf('Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value ([Environment]::ExpandEnvironmentVariables($TargetPath))')
