@@ -69,7 +69,8 @@ acceptance циклу 5.1.0 (rc.2/rc.4 PASS).
 
 Мета — унеможливити повторення прямого feature merge у `master` в обхід RC/acceptance.
 
-**Статус (2026-08-26): закрито.** PR #46 злито
+**Статус (2026-08-26): закрито для `master`; уточнення 2026-09-30 —
+захисту `developer` немає, один критерій нижче знову відкритий.** PR #46 злито
 (`ci/Test-BRAVOMasterMergePolicy.ps1` працює в CI). PR #92 додав
 семантичне порівняння stable-версій (`Test-BRAVOStableVersionPromotion`
 з регресіями, включно з кейсом `5.10.0 > 5.9.0`). Гілка
@@ -77,19 +78,25 @@ acceptance циклу 5.1.0 (rc.2/rc.4 PASS).
 (`Test-BRAVOMasterMergeSource`: PR у `master` приймається лише з
 `developer`/`hotfix/*` ЦЬОГО репозиторію; fork з однойменною гілкою —
 FAIL; невідомий head-репозиторій — fail-closed). Репозиторій став
-публічним, тож branch protection доступний без GitHub Pro: увімкнено
-для `master` і `developer` (PR-only, required checks, заборона force
-push/видалення, `enforce_admins` — admin-обхід на кшталт прецеденту
-PR #61 у вікні промоції 5.1.0 технічно заблоковано). Фактична
-конфігурація — `RELEASE_POLICY.md`, розділ 13.
+публічним, тож branch protection доступний без GitHub Pro.
+
+**Уточнення 2026-09-30 (перевірено через GitHub REST API, мусить бути
+перечитано перед рішенням).** Запис 2026-08-26 про protection на обох
+гілках для `developer` не підтверджується: `developer` **не protected**
+(ні класичного правила, ні ruleset). `master` protected із шістьма
+required checks (канон `RELEASE_POLICY.md` §13.3); `strict`,
+`enforce_admins` і заборону force push для `master` з автоматичної сесії
+не перевірено (HTTP 403). Бажана політика, live-стан і дія власника —
+`RELEASE_POLICY.md` §13.3–§13.4. Тому останній пункт критеріїв нижче
+знято з `[x]`.
 
 Критерії завершення:
 
 - [x] PR #46 доведено до merge після виправлення всіх review findings.
 - [x] Gate перевіряє дозволене джерело PR (`developer` або `hotfix/*`) і repository identity.
 - [x] Gate вимагає семантичне збільшення stable version, а не лише нерівність рядків. *(PR #92)*
-- [x] `master` не приймає feature/fix PR напряму. *(CI-гейт + branch protection з `enforce_admins`)*
-- [x] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(branch protection увімкнено на `master` і `developer`, 2026-08-26)*
+- [x] `master` не приймає feature/fix PR напряму. *(CI-гейт `ci/Test-BRAVOMasterMergePolicy.ps1` + branch protection `master` з required checks, live 2026-09-30; `enforce_admins` з автоматичної сесії не перевірено)*
+- [ ] Branch/repository settings максимально обмежують direct push, force push і випадковий merge настільки, наскільки це дозволяє поточний GitHub plan. *(`master` — protected, live 2026-09-30; `developer` — **не protected**: OWNER ACTION REQUIRED, `RELEASE_POLICY.md` §13.4)*
 
 ### P0.3 — Захист remote backup history
 
@@ -366,11 +373,19 @@ BRAVO.config (опційно) < BRAVO.local.config (опційно)`. Детал
 `BRAVO.config` не читається, не шукається й не виконується у
 нормальному production-виконанні взагалі — legacy `BRAVO.config`
 допускається лише для міграції 5.2→5.3, міграційних тестів/фікстур,
-доказів паритету й історичної документації. Це вже реалізовано в
-рантаймі: усі канонічні production-runtime і operator-entrypoint-и
-передають `-DisallowLegacyPrimaryAutoDetect` у `Import-BravoConfiguration`
+доказів паритету й історичної документації. Це реалізовано в рантаймі
+для фіксованого переліку 14 production-runtime і operator-entrypoint-ів
+(`Get-BRAVOProductionEntryPointRelativePath` у
+`ci/BRAVOConfigV2CutoverGates.ps1`): вони передають
+`-DisallowLegacyPrimaryAutoDetect` у `Import-BravoConfiguration`
 (`BRAVO_CONFIG_LOADER.ps1`, issue #216 Wave B), а кореневий `BRAVO.config`
-прибрано з release-пакета (issue #154 крок B4-2). Повний перелік
+прибрано з release-пакета (issue #154 крок B4-2). Відомий розрив
+(перевірено за кодом `developer` `4a54d34`, 2026-09-30):
+`BRAVO_OPERATIONS_HEARTBEAT.ps1`, доданий пізніше (PR #225), викликає
+`Import-BravoConfiguration` **без** цього прапорця й у фіксований перелік
+гейту `LEGACY_CONFIG_AUTOEXEC` не входить; виправлення й інваріант
+повноти переліку — частина B7 (#154). Реалізація рантайму — не те саме,
+що прийнята міграція парку (B5) чи завершене release-governance. Повний перелік
 залишкових gaps, історія D2-дизайну (B1–B3) і DoD regression matrix —
 `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md` (там же — банер про
 заміну D2 на початку документа).
