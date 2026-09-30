@@ -11,6 +11,27 @@
   Побічно префікси `\\?\` та `\\.\` для `-TargetPath` тепер теж відхиляються.
   Нові self-test перевірки: `DataRestore/PlanRejectsDriveAndRootRelativeTargetPath`,
   `DataRestore/TargetPathValidatedBeforeElevation`.
+- **Документація: операторські розділи про сповіщення перекладено
+  українською, виправлено латинські літери в українських словах (A10).**
+  Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
+  `OPERATIONS.md` (разом із каналами GENERAL/ALERTS і міграцією 5.2.1 з
+  legacy webhook-ів рівня провайдера) і `BRAVO_SETUP.md` були написані
+  англійською, хоча мовна політика документації вимагає української.
+  Перекладено лише прозу; назви записів Credential Manager, значення
+  `NotificationMode`, команди, severity-мітки й дослівні рядки сповіщень не
+  змінено. Заголовки розділів `docs/BRAVO_CONFIG_V2_PILOT_RUNBOOK.md` також
+  перекладено (разом із двома внутрішніми посиланнями на них); назви дій CLI
+  (`-Preflight`, `-Prepare`, `-Status` тощо) лишились як є.
+
+  Виправлено слова, у яких латинські літери стояли замість кириличних:
+  «моноліт» у `.claude/CLAUDE.md` і `.claude/rules/05-architecture.md`
+  (суто орфографія, без зміни змісту правил), «задане» в `README.md`,
+  слова в `docs/design/BRAVO_CONFIGURATOR_DESIGN.md`,
+  `docs/design/BRAVO_CONFIGURATION_V2_COMPLETION.md` і двох runbook-ах.
+  Дослівні цитати рядків рантайму та історичні записи CHANGELOG, що самі
+  містять латинську `i`, навмисно не змінено: оператор шукає їх у логах
+  саме в такому вигляді. Runtime-код не змінювався;
+  `RUNTIME_MANIFEST.json` не зачеплено.
 
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє

@@ -288,7 +288,7 @@ loader через Effective/Validation) уже покривають config-се�
 Independent review (Iteration 2, P0.1) підняв питання: якщо Кроки 8-9 не
 блокують Apply, чи не бракує GUI Apply "еквівалентної canonical blocking
 валідації", яку має `BRAVO_CONFIG_TEST.ps1`? Відповідь встановлена читанням
-коду й emпіричним прогоном, не інтерпретацією:
+коду й емпіричним прогоном, не інтерпретацією:
 
 `BRAVO_CONFIG_TEST.ps1` (весь файл — 89 рядків) не містить власної
 валідаційної логіки. Він робить рівно один виклик:
@@ -323,7 +323,7 @@ candidate (`thisRootDoesNotExist.BrokenLegacyField`) прогнаний чере
 **Висновок:** Option A ("reusable validation API, спільна для
 BRAVO_CONFIG_TEST і Configurator") вже виконана за конструкцією —
 `Import-BravoConfiguration` і Є тим спільним canonical validation API;
-`BRAVO_CONFIG_TEST.ps1` ніколи не мав окремої логіки, яку требa було б
+`BRAVO_CONFIG_TEST.ps1` ніколи не мав окремої логіки, яку треба було б
 "еквівалентно" відтворювати. Жодної зміни в production
 `BRAVO_CONFIG_TEST.ps1`/`BRAVO_CONFIG_LOADER.ps1` не знадобилося й не
 виконано. Єдине, чого Configurator НЕ відтворює (і навмисно) — це
@@ -402,7 +402,7 @@ Update-BRAVOConfiguratorEffective -> Preview -> Apply той самий шлях
 schema-дескриптор не має `Secret=$true`). Requirement-формула
 (`Get-BRAVOConfiguratorCredentialRequirement`) обчислюється з canonical
 `storageEffective`/`bazaSyncEffective`/`backupMonitoring` структур —
-ідентична вирazу в `BRAVO_CREDENTIALS_SETUP.ps1::Resolve-RequestedComponents`.
+ідентична виразу в `BRAVO_CREDENTIALS_SETUP.ps1::Resolve-RequestedComponents`.
 Ця формула НЕ винесена в спільну canonical функцію: `BRAVO_CREDENTIALS_SETUP.ps1`
 є executing entrypoint-скриптом (param() -> function defs -> top-level
 try{} з реальними записами/інтерактивними запитами), НЕ importable
@@ -495,7 +495,7 @@ targeted regression-тесту, що реально форсує кожен зб
   ВИКЛИКАЧА; коли ambient-значення виявлялось `'Continue'` (витік з
   іншого доменного фрагмента self-test-а в тому самому процесі —
   попередня, окрема, вже наявна крихкість, не в межах цього P2-A циклу),
-  файлова `IOException` НЕ termінувала `try`, `catch` ніколи не
+  файлова `IOException` НЕ переривала `try`, `catch` ніколи не
   спрацьовував, і `Invoke-BRAVOConfiguratorApply` МОВЧКИ повертав
   `Applied=$true, Stage='Complete'`, хоча запис фізично НЕ відбувся —
   §07 BRAVO Runtime Safety Invariants fail-closed порушення. Root-cause
@@ -676,7 +676,7 @@ Fixed-layout борг (`$form.Width=1150`/`Height=780`, `$rowPanel.Width=700`,
 - **Splitter-и**: `Panel1MinSize`/`Panel2MinSize` + чиста
   `Get-BRAVOConfiguratorUIClampedSplitterDistance` (headless-тестована) —
   `SplitterDistance` ніколи не призначається поза легальним діапазоном.
-  Реальний launch-крash (`SplitterDistance must be between Panel1MinSize
+  Реальний launch-crash (`SplitterDistance must be between Panel1MinSize
   and Width - Panel2MinSize`), спричинений призначенням `Panel1MinSize`/
   `Panel2MinSize` одразу після `New-Object SplitContainer` (до
   Dock-розміщення, коли контрол ще має дефолтний малий розмір) — знайдено
@@ -697,7 +697,7 @@ Fixed-layout борг (`$form.Width=1150`/`Height=780`, `$rowPanel.Width=700`,
 `Get-BRAVOConfiguratorUIStartupSize` (чиста функція) затискає стартовий
 розмір і головної форми, і Preview-діалогу до `Screen.WorkingArea` —
 ніколи не відкриває вікно більше за реальний робочий простір екрана;
-respectує практичний мінімум (1000×650 для головної форми) лише якщо
+дотримується практичного мінімуму (1000×650 для головної форми) лише якщо
 робоча область це дозволяє. `AutoScaleMode=Dpi` — framework-рівень DPI-
 масштабування (.NET Framework/WinForms), сумісний з Windows PowerShell
 5.1. `Application.SetHighDpiMode`/PerMonitorV2-специфічний P/Invoke
