@@ -10,5 +10,78 @@
     "WinSCP.com": "F1C35DA6C40B6A59A7C90AF257B06F725F71F329831214A9D752EFDB9AEAD3D6",
     "WinSCP.exe": "CF948EAF8429C582636953E8B6B82097C8BB0A55111EC57E5F890E27DBAB70D9",
     "WinSCPnet.dll": "3DF88E8C877BB20B8A6C65AEFC3D25DCAD272131B774D9F60CC046ECD6262ED3"
-  }
+  },
+  "provenance": {
+    "7za.dll": {
+      "sha256": "8105EAB695801F9C9FCC234C7963A7AC217378916821618DFB9D97B04562B82E",
+      "version": "26.02",
+      "upstreamUrl": "https://www.7-zip.org/a/7z2602-extra.7z",
+      "retrievedFrom": "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-extra.7z",
+      "packageSha256": "081DF9E9311DFD9C9E0E98C1C80180B99BB51E4CB24156B5F3057FE3C259D70A",
+      "packageMember": "x64/7za.dll",
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": true
+    },
+    "7za.exe": {
+      "sha256": "35D4D69D7CD6CB44558F208C3B1334268013F9DAF82D2DDA848893A1C30C59C2",
+      "version": "26.02",
+      "upstreamUrl": "https://www.7-zip.org/a/7z2602-extra.7z",
+      "retrievedFrom": "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-extra.7z",
+      "packageSha256": "081DF9E9311DFD9C9E0E98C1C80180B99BB51E4CB24156B5F3057FE3C259D70A",
+      "packageMember": "x64/7za.exe",
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": true
+    },
+    "7zxa.dll": {
+      "sha256": "E729E2F0188DA0A40EE065F1A26797278CB88E9507413080F0F5A4F7F4DB6C1E",
+      "version": "26.02",
+      "upstreamUrl": "https://www.7-zip.org/a/7z2602-extra.7z",
+      "retrievedFrom": "https://github.com/ip7z/7zip/releases/download/26.02/7z2602-extra.7z",
+      "packageSha256": "081DF9E9311DFD9C9E0E98C1C80180B99BB51E4CB24156B5F3057FE3C259D70A",
+      "packageMember": "x64/7zxa.dll",
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": true
+    },
+    "DragExt64.dll": {
+      "sha256": "65D215BBBA2387A23198E65FBF6F13EF9CF39FC6FB0ACFD69CFF2C3AC5932607",
+      "version": "6.5.3 (FileVersion 2.1.0.16364)",
+      "upstreamUrl": "https://winscp.net/download/WinSCP-6.5.3-Setup.exe",
+      "packageSha256": null,
+      "packageMember": null,
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": false,
+      "note": "Не знайдено в пакетах WinSCP 6.5.6 Portable/Automation: файл постачається лише інсталятором і має версію 6.5.3, старшу за решту WinSCP 6.5.6. Походження не перевірено; див. BRAVO-T034."
+    },
+    "WinSCP.com": {
+      "sha256": "F1C35DA6C40B6A59A7C90AF257B06F725F71F329831214A9D752EFDB9AEAD3D6",
+      "version": "6.5.6",
+      "upstreamUrl": "https://winscp.net/download/WinSCP-6.5.6-Portable.zip",
+      "retrievedFrom": "https://sourceforge.net/projects/winscp/files/WinSCP/6.5.6/WinSCP-6.5.6-Portable.zip/download",
+      "packageSha256": "DD91974A0E56B140846A816D730190E51F093418B6BF851120493CE4B6CB3121",
+      "packageMember": "WinSCP.com",
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": true
+    },
+    "WinSCP.exe": {
+      "sha256": "CF948EAF8429C582636953E8B6B82097C8BB0A55111EC57E5F890E27DBAB70D9",
+      "version": "6.5.6",
+      "upstreamUrl": "https://winscp.net/download/WinSCP-6.5.6-Portable.zip",
+      "retrievedFrom": "https://sourceforge.net/projects/winscp/files/WinSCP/6.5.6/WinSCP-6.5.6-Portable.zip/download",
+      "packageSha256": "DD91974A0E56B140846A816D730190E51F093418B6BF851120493CE4B6CB3121",
+      "packageMember": "WinSCP.exe",
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": true
+    },
+    "WinSCPnet.dll": {
+      "sha256": "3DF88E8C877BB20B8A6C65AEFC3D25DCAD272131B774D9F60CC046ECD6262ED3",
+      "version": "6.5.6 (FileVersion 1.16.0.16502)",
+      "upstreamUrl": "https://winscp.net/download/WinSCP-6.5.6-Automation.zip",
+      "retrievedFrom": "https://sourceforge.net/projects/winscp/files/WinSCP/6.5.6/WinSCP-6.5.6-Automation.zip/download",
+      "packageSha256": "49D1F193A52E7CB65FE503A30819956B88EE7D870F47E1026833FDA91CC26486",
+      "packageMember": "WinSCPnet.dll",
+      "retrievedAt": "2026-09-29",
+      "upstreamVerified": true
+    }
+  },
+  "provenanceProcedure": "Для кожного запису tools має існувати provenance з тим самим sha256: звідки взято пакет (upstreamUrl), SHA-256 самого пакета (packageSha256), шлях файлу в пакеті (packageMember) і дату завантаження (retrievedAt). Рецензент перевіряє довіру без довіри до коміту: завантажити пакет, звірити packageSha256, розпакувати packageMember і звірити sha256. upstreamVerified=false означає, що збіг з офіційним пакетом не підтверджено."
 }

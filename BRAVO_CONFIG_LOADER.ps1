@@ -820,6 +820,70 @@ function Test-BRAVOEffectiveSecurityInvariants {
             "(підмінений 7za.exe/WinSCP більше не блокує запуск)")
     }
 
+    # BRAVO-T001 (аудит 5.2.4, F001): toolIntegritySettings.ManifestPath —
+    # так само НЕ raw-configurable (Resolve-BRAVOConfigurationDerivation
+    # завжди виводить <RuntimeRoot>\Tools\TOOLS_MANIFEST.json), але Archive/
+    # Health/Maintenance/DataRestore беруть шлях еталонного маніфесту саме з
+    # цього ключа, а бінарники — з toolsPath. Перенаправлений маніфест тихо
+    # легітимізує підмінений бінарник навіть у Enforce, тому — той самий
+    # захисний canary, що Mode вище:
+    #   * якір довіри — RuntimeRoot, а не toolsPath: якщо регресія
+    #     перенаправить і toolsPath, і ManifestPath в один каталог, звірка
+    #     лише з toolsPath нічого б не помітила. Тому toolsPath сам має
+    #     дорівнювати <RuntimeRoot>\Tools (коли RuntimeRoot відомий; без
+    #     нього — точкові проби без повного завантаження — якорем лишається
+    #     toolsPath);
+    #   * споживачі приймають будь-який IDictionary, тож і тут перевіряється
+    #     IDictionary, а не лише [hashtable];
+    #   * порівняння ordinal (з урахуванням регістру): на NTFS із
+    #     per-directory case sensitivity 'tools_manifest.json' — інший файл,
+    #     а споживачі відкривають саме ефективний рядок. Повні шляхи
+    #     порівнюються без розв'язання посилань, тож псевдонім (UNC,
+    #     junction-шлях) не дорівнює канонічному й блокується.
+    $runtimeRootVariable = Get-Variable -Name 'runtimeRoot' -Scope Global -ErrorAction SilentlyContinue
+    $toolsPathVariable = Get-Variable -Name 'toolsPath' -Scope Global -ErrorAction SilentlyContinue
+    $trustedToolsPath = $null
+    if ($null -ne $runtimeRootVariable -and -not [string]::IsNullOrWhiteSpace([string]$runtimeRootVariable.Value)) {
+        $trustedToolsPath = [System.IO.Path]::GetFullPath((Join-Path ([string]$runtimeRootVariable.Value) 'Tools'))
+        $effectiveToolsPath = if ($null -ne $toolsPathVariable) { [string]$toolsPathVariable.Value } else { '' }
+        $effectiveToolsFullPath = $null
+        if (-not [string]::IsNullOrWhiteSpace($effectiveToolsPath)) {
+            try {
+                $effectiveToolsFullPath = [System.IO.Path]::GetFullPath($effectiveToolsPath)
+            } catch {
+                $effectiveToolsFullPath = $null
+            }
+        }
+        if ($null -eq $effectiveToolsFullPath -or
+            -not [string]::Equals($effectiveToolsFullPath, $trustedToolsPath, [System.StringComparison]::Ordinal)) {
+            [void]$weakened.Add(
+                "toolsPath = '$effectiveToolsPath' замість '$trustedToolsPath' " +
+                "(каталог інструментів перенаправлено з <RuntimeRoot>\Tools — перевірка цілісності втрачає якір довіри)")
+        }
+    } elseif ($null -ne $toolsPathVariable -and -not [string]::IsNullOrWhiteSpace([string]$toolsPathVariable.Value)) {
+        $trustedToolsPath = [System.IO.Path]::GetFullPath([string]$toolsPathVariable.Value)
+    }
+    if ($null -ne $trustedToolsPath -and
+        $global:toolIntegritySettings -is [System.Collections.IDictionary] -and
+        $global:toolIntegritySettings.Contains('ManifestPath')) {
+        $expectedToolManifestPath = Join-Path $trustedToolsPath 'TOOLS_MANIFEST.json'
+        $effectiveToolManifestPath = [string]$global:toolIntegritySettings['ManifestPath']
+        $effectiveToolManifestFullPath = $null
+        if (-not [string]::IsNullOrWhiteSpace($effectiveToolManifestPath)) {
+            try {
+                $effectiveToolManifestFullPath = [System.IO.Path]::GetFullPath($effectiveToolManifestPath)
+            } catch {
+                $effectiveToolManifestFullPath = $null
+            }
+        }
+        if ($null -eq $effectiveToolManifestFullPath -or
+            -not [string]::Equals($effectiveToolManifestFullPath, $expectedToolManifestPath, [System.StringComparison]::Ordinal)) {
+            [void]$weakened.Add(
+                "toolIntegritySettings.ManifestPath = '$effectiveToolManifestPath' замість '$expectedToolManifestPath' " +
+                "(еталонний маніфест інструментів перенаправлено — підмінений 7za.exe/WinSCP пройде перевірку)")
+        }
+    }
+
     # Wave 1B (Issue #216): requireAdministrator — той самий post-merge
     # ефективний контроль, що backupConsistency.Mode/toolIntegritySettings.Mode
     # вище. "Відсутній" не можна змоделювати спільним предикатом (він
