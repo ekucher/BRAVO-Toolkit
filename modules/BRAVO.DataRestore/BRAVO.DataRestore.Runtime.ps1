@@ -2897,23 +2897,6 @@ function Send-BRAVODataRestoreNotification {
                 $notificationTimeoutSeconds = [int]$backupMonitoring.NotificationRequestTimeoutSeconds
             }
         }
-        # Рішення «слати чи ні» вже ухвалене на call-site (включно з
-        # DataRestore-специфічним SUCCESS для InPlace навіть під
-        # errors_only), тому routing викликається в режимі 'all' і вирішує
-        # лише канал доставки (GENERAL/ALERTS).
-        $notificationRoute = Resolve-BRAVONotificationRoute `
-            -Severity $Severity `
-            -NotificationMode 'all' `
-            -RoutingTable $notificationRouting
-        try {
-            $webhookUrl = Resolve-BRAVONotificationEndpoint `
-                -Provider $notificationProvider `
-                -Route $notificationRoute `
-                -CredentialTargets $notificationCredentialTargets
-        } catch {
-            Write-DataRestoreLog -Message "Webhook для '$notificationProvider/$notificationRoute' не налаштовано — сповіщення пропущено" -Level 'WARNING'
-            return
-        }
         $message = New-BRAVOOperatorNotificationMessage `
             -Severity $Severity `
             -Operation 'BRAVO DATA RESTORE — ВІДНОВЛЕННЯ ДАНИХ' `
@@ -2927,14 +2910,26 @@ function Send-BRAVODataRestoreNotification {
             -Version ([string]$script:ScriptVersion) `
             -BuildId ([string]$script:ScriptBuildId) `
             -LogPath ([string]$script:dataRestoreLogFile)
-        $messageChunks = ConvertTo-BRAVONotificationPayloadText `
+        # Рішення «слати чи ні» вже ухвалене на call-site (включно з
+        # DataRestore-специфічним SUCCESS для InPlace навіть під
+        # errors_only), тому конвеєр викликається в режимі 'all' і вирішує
+        # лише канал доставки (GENERAL/ALERTS). BRAVO-T023: маршрут,
+        # endpoint, payload і доставка — канонічна Send-BRAVONotification;
+        # ненастроєний webhook, як і раніше, — WARNING без зміни лічильника.
+        $delivery = Send-BRAVONotification `
+            -Severity $Severity `
+            -Message $message `
             -Provider $notificationProvider `
-            -Message $message
-        Send-BRAVONotificationChunks `
-            -Provider $notificationProvider `
-            -WebhookUrl $webhookUrl `
-            -MessageChunks $messageChunks `
-            -TimeoutSeconds $notificationTimeoutSeconds
+            -NotificationMode 'all' `
+            -RoutingTable $notificationRouting `
+            -CredentialTargets $notificationCredentialTargets `
+            -TimeoutSeconds $notificationTimeoutSeconds `
+            -SkipWhenEndpointUnavailable `
+            -PassThru
+        if ($null -ne $delivery -and -not $delivery.Sent -and $delivery.Reason -eq 'EndpointUnavailable') {
+            Write-DataRestoreLog -Message "Webhook для '$notificationProvider/$($delivery.Route)' не налаштовано — сповіщення пропущено" -Level 'WARNING'
+            return
+        }
     } catch {
         $script:dataRestoreWarningCount++
         Write-DataRestoreLog -Message "Не вдалося надіслати сповіщення: $($_.Exception.Message)" -Level 'WARNING'

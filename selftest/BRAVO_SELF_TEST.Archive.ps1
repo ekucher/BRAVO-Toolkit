@@ -605,3 +605,483 @@ Test-BRAVOCondition -Condition (
     $bazaNameGatingResult.LastSeverity -eq 'WARNING'
 ) -Name 'Archive/BAZAIncompatibleNameAlertSendsOperationsEventEvenWhenNotificationGated' `
     -Failure "Send-BAZAIncompatibleNameAlert з `$NoSlack=`$true все одно МАЄ надіслати РІВНО 1 Operations-подію; отримано calls=$($bazaNameGatingResult.OperationsEventCalls) severity=$($bazaNameGatingResult.LastSeverity)"
+
+# ============================================================
+# T011 (F010): поведінкова перевірка оркестрації Main.
+#
+# Порядок фаз, звільнення ресурсів узгодженої копії та код завершення
+# досі перевірялися лише структурно. Archive НЕ зупиняє служб: узгодженість
+# дає ОДИН VSS Snapshot Set на generation (live-архівація заборонена), тому
+# парні ресурси прогону тут — VSS Snapshot Set (створення -> видалення у
+# finally циклу компонентів, разом із файлом ownership state) і process
+# lock (Enter-BRAVOArchiveProcessLock -> Dispose у зовнішньому finally).
+#
+# Повний прогін неможливий без конфігурації, VSS, 7-Zip і прав
+# адміністратора, тому дочірній процес збирає runtime з ДОСЛІВНОГО тексту
+# BRAVO.Archive.Runtime.ps1 (AST): усе тіло Invoke-BRAVOArchive від першого
+# визначення функції до кінця — справжні Main, New-BRAVOBackupGenerationState,
+# Write-BRAVOArchiveStep, зовнішній try { Main } catch -> 90 / finally і
+# фінальний Exit. Преамбулу (імпорт модулів, конфігурацію, елевацію,
+# креденшели) замінює seed змінних; VSS, lock, 7-Zip/SHA512, manifest,
+# retention, Health, статус-файл, Operations-подія і вивантаження власного
+# логу — стаби, що пишуть події у журнал. BRAVO.Console, BRAVO.Logging і
+# BRAVO.ExitCodes справжні (Resolve-BRAVOExitCode, статистика WARNING/ERROR).
+# Зібраний runtime запускається через справжній Invoke-BRAVOArchiveEntrypoint
+# (& runtime, $LASTEXITCODE). Стаби живуть лише в дочірньому процесі;
+# жодних VSS-знімків, служб чи мережі тест не чіпає.
+# ============================================================
+& {
+    $archiveOrchestrationRoot = Join-Path `
+        -Path ([IO.Path]::GetTempPath()) `
+        -ChildPath ("BRAVO_ARCHIVE_ORCHESTRATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+    try {
+        [void][IO.Directory]::CreateDirectory($archiveOrchestrationRoot)
+        $archiveOrchestrationStubs = @'
+function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
+function Test-Compatibility { return $true }
+function Enter-BRAVOArchiveProcessLock {
+    Add-ProbeEvent 'LOCK-ENTER'
+    $probeLockStream = [pscustomobject]@{ Path = 'self-test-lock' }
+    $probeLockStream | Add-Member -MemberType ScriptMethod -Name Dispose -Value { Add-ProbeEvent 'LOCK-RELEASE' }
+    return [pscustomobject]@{ Success = $true; Stream = $probeLockStream; Path = 'self-test-lock'; Error = $null }
+}
+function Get-BRAVOVSSOwnershipStatePath { return $script:ProbeVssStatePath }
+function Remove-BRAVOOwnedOrphanVSSResources {
+    param([string]$StatePath)
+    Add-ProbeEvent 'VSS-ORPHAN-CHECK'
+    return [pscustomobject]@{ Success = $true; Found = $false; Deleted = 0; Error = $null }
+}
+function Get-BRAVOArchiveFreeSpaceResult {
+    param($RootPath, $MinimumFreeSpaceGB, $ExcludedDrives)
+    return [pscustomobject]@{ Success = $true; CheckedDriveCount = 1; AllExcluded = $false; DriveStatus = @(); Problems = @() }
+}
+function Get-BRAVOArchiveEstimatedSpaceRequirement {
+    param($EnabledArchives, $ArchiveFileFilter, $HashFileExtension, $MarginPercent)
+    return [pscustomobject]@{ Success = $true; ComponentEstimates = @(); VolumeStatus = @(); Problems = @() }
+}
+function Resolve-BRAVOArchiveSpaceDecision {
+    param($EnabledArchives, $EstimatedResult, $MinimumFreeSpaceGB, $ExcludedDrives)
+    return [pscustomobject]@{ Success = $true; Results = @(); Warnings = @(); Problems = @() }
+}
+function Write-BRAVODiskSpaceDecisionLog { param($Results, $Logger) }
+function Get-BRAVOFiles { param($Path, $Filter) return @() }
+function Import-BRAVODiscoveryBaseline { param($StateRoot, $RuntimeRoot) return [pscustomobject]@{ Problems = @(); Baseline = $null; Source = 'self-test' } }
+function Test-BRAVODiscoveryComponentDrift { param($DiscoveryResult, $Baseline, $BaselineSourceKind, $EnabledComponents) return @() }
+function Test-PathWithLog { param($Path, $Description, $CreateIfMissing) return $true }
+function Show-PathCheckSummary { param($CheckedPaths, $AllPathsExist) }
+function Test-BRAVOFileSystemWriteProbe { param($Path) return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null } }
+function Test-BRAVOSourceReadProbe { param($Path) return [pscustomobject]@{ Success = $true; Path = $Path; Error = $null } }
+function Get-BRAVOCollisionSafeGenerationId { param($BaseGenerationId, $Archives, $ArchivePrefix, $HashExtension) return $BaseGenerationId }
+function New-BRAVOVSSSnapshotSet {
+    param([string[]]$SourcePaths)
+    Add-ProbeEvent 'VSS-CREATE'
+    return [pscustomobject]@{ SnapshotSetId = 'self-test-set'; Volumes = @(); UniqueVolumeCount = 1; CreatedAt = (Get-Date) }
+}
+function Save-BRAVOVSSOwnershipState {
+    param($StatePath, $SnapshotSet, $GenerationId)
+    [IO.File]::WriteAllText($StatePath, '{}')
+    Add-ProbeEvent 'VSS-OWNERSHIP-SAVE'
+    return $true
+}
+function Remove-BRAVOVSSSnapshotSet {
+    param($SnapshotSet)
+    Add-ProbeEvent 'VSS-REMOVE'
+    return $true
+}
+function Resolve-BRAVOSnapshotSourcePath { param($SnapshotSet, $OriginalPath) return $OriginalPath }
+function Invoke-BRAVOComponentBackup {
+    param($Component, $GenerationId, $OriginalSourcePath, $SourcePath, $DestinationDirectory, $ArchiveName, $ArcPath, $ArcParams)
+    Add-ProbeEvent "COMPONENT-BACKUP $Component"
+    if ($script:ProbeScenario -eq 'ComponentThrows') { throw 'self-test: імітований збій архівації компонента' }
+    $probeArchivePath = Join-Path $DestinationDirectory $ArchiveName
+    [IO.File]::WriteAllText($probeArchivePath, 'self-test')
+    return [pscustomobject]@{
+        Component = $Component; GenerationId = $GenerationId; OriginalSourcePath = $OriginalSourcePath
+        SnapshotSourcePath = $SourcePath; TemporaryArchivePath = $null; ArchivePath = $probeArchivePath
+        HashPath = ($probeArchivePath + '.sha512'); CreateSuccess = $true; IntegritySuccess = $true; HashSuccess = $true
+        ArchiveSize = 9; SHA512 = 'self-test'; ErrorStage = $null; Error = $null; LegacyBomPasswordFallbackUsed = $false
+    }
+}
+function Write-BRAVOConsoleDetail {
+    param([string]$Message)
+    if ($script:ProbeScenario -eq 'UnhandledThrow') { throw 'self-test: імітований неочікуваний збій після публікації компонента' }
+}
+function Write-BRAVOBackupGenerationManifest {
+    param($GenerationState, $BackupRoot)
+    Add-ProbeEvent ("MANIFEST-WRITE {0}" -f $GenerationState.Status)
+    return (Join-Path $BackupRoot 'self-test-manifest.json')
+}
+function Remove-BRAVOExpiredBackupGenerations {
+    param($BackupRoot, $CurrentGenerationId, $RetentionDays, [ref]$CleanupSectionShown, [ref]$RemovedGenerationCount)
+    Add-ProbeEvent 'RETENTION-CLEANUP'
+    return $true
+}
+function Invoke-BRAVOHealthCheck {
+    param($ConfigPath, $ConfigPathWasExplicit, [switch]$NotifyOnSuccess, [switch]$NoSlack, $RuntimeRoot, $EntryScriptPath, $BazaSyncResults)
+    Add-ProbeEvent 'HEALTH'
+    return [pscustomobject]@{ Status = 'Healthy'; Notification = 'self-test'; IssueCount = 0; Error = $null }
+}
+function Write-BRAVOBackupExecutionState { Add-ProbeEvent 'EXECUTION-STATE' }
+function Send-BRAVOArchiveLegacyBomFallbackAlert { param($Results) }
+function Write-BRAVOOperationStatus {
+    param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details)
+    Add-ProbeEvent "STATUS $ExitCode"
+}
+function Send-BRAVOOperationsEvent {
+    param($OperationsReportingSettings, $CredentialTargets, $InstitutionCode, $Category, $Severity, $Component, $Message, $Details)
+    Add-ProbeEvent ("OPS-EVENT {0} {1}" -f $Details['exitCode'], $Severity)
+}
+function Invoke-BRAVOArchiveOwnLogUpload { Add-ProbeEvent 'OWN-LOG-UPLOAD' }
+function Write-BRAVOStepResult {
+    param([int]$Current, [int]$Total, [string]$Name, [string]$Status, [string]$Details, $Duration)
+    Add-ProbeEvent ("STEP {0}/{1} {2} {3}" -f $Current, $Total, $Name, $Status)
+}
+'@
+        $archiveOrchestrationSeed = @'
+# Seed замість преамбули Invoke-BRAVOArchive: один компонент MODEL; SFTP,
+# SMB і BAZA-синхронізацію вимкнено; retention generation і post-backup
+# Health увімкнено, щоб їхнє місце в послідовності фаз теж перевірялось.
+$bravoScriptDirectory = $RuntimeRoot
+$runtimeRoot = $RuntimeRoot
+$configPath = Join-Path $probeWorkRoot 'BRAVO.config'
+$configPathWasExplicit = $false
+$ScriptVersion = 'self-test'
+$ScriptDate = 'self-test'
+$ScriptBuildId = 'self-test'
+$logPath = Join-Path $probeWorkRoot 'logs'
+$logFileNameTemplate = 'BRAVO_ARCHIV_{0}_PID{1}.log'
+$logFileFilter = 'BRAVO_ARCHIV_*.log'
+$logRetentionDays = 30
+$logTimestampFormat = 'yyyy-MM-dd HH:mm:ss'
+$durationFormat = 'hh\:mm\:ss'
+$defaultLogLevel = 'INFO'
+$logSeparatorLength = 100
+$LogLevel = 'INFO'
+$consoleSettings = @{ FileLevel = 'INFO'; ConsoleLevel = 'ERROR'; StepWidth = 58 }
+$progressSettings = @{ Enabled = $false; ShowOverallProgress = $false; Activity = 'self-test' }
+$bravoSettings = [pscustomobject]@{ InstitutionName = 'self-test'; InstitutionCode = 'SELFTEST' }
+$rootPath = Join-Path $probeWorkRoot 'lims'
+$backupRootPath = Join-Path $probeWorkRoot 'backup'
+$stateRoot = Join-Path $probeWorkRoot 'state'
+$arcPath = Join-Path $probeWorkRoot 'Tools\7za.exe'
+$archiveParams = 'a -t7z'
+$archivePrefix = 'SELFTEST'
+$hashFileExtension = '.sha512'
+$archiveFileFilter = '*.7z'
+$archiveDefinitions = @(
+    [pscustomobject]@{ Type = 'MODEL'; Enabled = $true; Source = (Join-Path $probeWorkRoot 'lims\Model'); Destination = (Join-Path $probeWorkRoot 'backup\MODEL'); NameTemplate = '{0}_MODEL_{1}.7z' }
+)
+$componentSettings = @{ Archive = @{ MODEL = $true; BLOG = $false; BRAVOEXCH = $false }; Synchronization = @{ BAZA_APP_LOCAL = $false; BAZA_WWW_LOCAL = $false } }
+$bazaSyncEffective = [pscustomobject]@{ Components = @(
+    [pscustomobject]@{ Name = 'BAZA_APP'; SftpEnabled = $false },
+    [pscustomobject]@{ Name = 'BAZA_WWW'; SftpEnabled = $false }
+) }
+$storageEffective = [pscustomobject]@{
+    SFTP = [pscustomobject]@{ Enabled = $false; ArchiveUpload = $false; DisabledReason = '' }
+    SMB = [pscustomobject]@{ Enabled = $false; ArchiveCopy = $false; DisabledReason = '' }
+}
+$backupConsistency = @{ Mode = 'VSS'; SnapshotContext = 'ClientAccessible' }
+$backupMonitoring = @{ Enabled = $true; RunAfterBackup = $true; NotificationMode = 'none'; SlackMode = 'none'; NotifyOnSuccessAfterBackup = $false; InstitutionCode = 'SELFTEST'; SizeSanity = @{ Enabled = $false } }
+$compatibilityMode = $false
+$enableArchiveDeletion = $true
+$enableFailedArchiveDeletion = $false
+$failedArchiveRetentionDays = 14
+$enableLunchArchiveCleanup = $false
+$enableOrphanTempCleanup = $false
+$archiveRetentionDays = 183
+$archiveMinimumFreeSpaceGB = 1
+$archiveFreeSpaceExcludedDrives = @()
+$archiveEstimatedSpaceMarginPercent = 25.0
+$baseRequiredPaths = @()
+$operationLockSettings = @{ Path = (Join-Path $probeWorkRoot 'lock\BRAVO_OPERATION.lock') }
+$bravoDiscoveryResult = [pscustomobject]@{ MODEL_SOURCE = (Join-Path $probeWorkRoot 'lims\Model'); BLOG_SOURCE = ''; Reasons = @{ MODEL = 'self-test'; BLOG = 'self-test'; BAZA_APP = 'self-test' } }
+$discoveryEnabledComponents = @('MODEL')
+$operationsReportingSettings = @{ Enabled = $true }
+$credentialSettings = @{ Targets = @{} }
+$script:archivePassword = 'self-test-placeholder'
+$script:archiveCredentialInitializationError = $null
+$script:smbCredential = $null
+'@
+        $archiveOrchestrationProbeScript = @'
+param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
+$ErrorActionPreference = 'Stop'
+$probeResultPath = Join-Path $ProbeRoot 'result.json'
+$probeUtf8 = New-Object Text.UTF8Encoding($false)
+try {
+    $probeRuntimeText = [IO.File]::ReadAllText(
+        (Join-Path $RepositoryRoot 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1'), [Text.Encoding]::UTF8)
+    $probeParseErrors = $null
+    $probeAst = [Management.Automation.Language.Parser]::ParseInput($probeRuntimeText, [ref]$null, [ref]$probeParseErrors)
+    if (@($probeParseErrors).Count -gt 0) { throw "runtime не парситься: $($probeParseErrors[0].Message)" }
+    $probeWrapper = @($probeAst.EndBlock.Statements | Where-Object {
+            $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Invoke-BRAVOArchive'
+        }) | Select-Object -First 1
+    if ($null -eq $probeWrapper) { throw 'у runtime немає функції Invoke-BRAVOArchive' }
+    $probeStatements = @($probeWrapper.Body.EndBlock.Statements)
+    $probeRegionStartIndex = -1
+    for ($probeIndex = 0; $probeIndex -lt $probeStatements.Count; $probeIndex++) {
+        if ($probeStatements[$probeIndex] -is [Management.Automation.Language.FunctionDefinitionAst]) {
+            $probeRegionStartIndex = $probeIndex
+            break
+        }
+    }
+    if ($probeRegionStartIndex -lt 0) { throw 'у тілі Invoke-BRAVOArchive немає визначень функцій' }
+    $probeOuterTry = @($probeStatements | Where-Object { $_ -is [Management.Automation.Language.TryStatementAst] }) | Select-Object -Last 1
+    if ($null -eq $probeOuterTry -or $null -eq $probeOuterTry.Finally -or $probeOuterTry.Body.Extent.Text -notmatch '^\{\s*Main\s*\}$') {
+        throw 'у тілі немає зовнішнього try { Main } ... finally'
+    }
+    if (-not ($probeStatements | Where-Object { $_ -is [Management.Automation.Language.FunctionDefinitionAst] -and $_.Name -eq 'Main' })) {
+        throw 'у тілі немає функції Main'
+    }
+
+    $probeStubs = [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'stubs.ps1'), [Text.Encoding]::UTF8)
+    $probeStubNames = @{}
+    foreach ($probeStubAst in @([Management.Automation.Language.Parser]::ParseInput($probeStubs, [ref]$null, [ref]$null).EndBlock.Statements)) {
+        if ($probeStubAst -is [Management.Automation.Language.FunctionDefinitionAst]) { $probeStubNames[$probeStubAst.Name] = $true }
+    }
+    # Дослівний текст тіла від першого визначення функції (після преамбули:
+    # імпорт модулів, конфігурація, елевація, креденшели, консоль) до кінця
+    # (Main, зовнішній try/catch/finally, фінальний Exit). Затінені стабами
+    # визначення функцій замінюються пробілами, інакше вони перевизначили б
+    # стаб під час виконання.
+    $probeRegionStart = $probeStatements[$probeRegionStartIndex].Extent.StartOffset
+    $probeRegionEnd = $probeStatements[$probeStatements.Count - 1].Extent.EndOffset
+    $probeRegion = New-Object Text.StringBuilder($probeRuntimeText.Substring($probeRegionStart, $probeRegionEnd - $probeRegionStart))
+    foreach ($probeDefinition in @($probeWrapper.Body.FindAll({
+                    param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst]
+                }, $true) | Where-Object {
+                $_.Extent.StartOffset -ge $probeRegionStart -and $probeStubNames.ContainsKey($_.Name)
+            })) {
+        $probeLength = $probeDefinition.Extent.EndOffset - $probeDefinition.Extent.StartOffset
+        [void]$probeRegion.Remove($probeDefinition.Extent.StartOffset - $probeRegionStart, $probeLength)
+        [void]$probeRegion.Insert($probeDefinition.Extent.StartOffset - $probeRegionStart, (' ' * $probeLength))
+    }
+
+    $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
+    $probeVssStatePath = Join-Path $ProbeRoot 'state\BRAVO_VSS_OWNERSHIP.json'
+    foreach ($probeDirectory in @('logs', 'state', 'lims\Model', 'backup\MODEL', 'Tools', 'modules\BRAVO.Health')) {
+        [void][IO.Directory]::CreateDirectory((Join-Path $ProbeRoot $probeDirectory))
+    }
+    # Import-Module справжнього Main потребує валідного маніфесту BRAVO.Health
+    # під RuntimeRoot; сам Invoke-BRAVOHealthCheck затінює стаб.
+    [IO.File]::WriteAllText((Join-Path $ProbeRoot 'modules\BRAVO.Health\BRAVO.Health.psm1'), '', $probeUtf8)
+    [IO.File]::WriteAllText((Join-Path $ProbeRoot 'modules\BRAVO.Health\BRAVO.Health.psd1'), "@{ ModuleVersion = '1.0'; RootModule = 'BRAVO.Health.psm1'; FunctionsToExport = @() }", $probeUtf8)
+    $probeScenarioSeed = @(
+        ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
+        ('$script:ProbeVssStatePath = ''{0}''' -f $probeVssStatePath.Replace("'", "''")),
+        ('$script:ProbeScenario = ''{0}''' -f $Scenario.Replace("'", "''")),
+        ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''"))
+    ) -join "`n"
+    $probeGenerated = @(
+        $probeAst.ParamBlock.Extent.Text,
+        'function Invoke-BRAVOArchiveOrchestrationProbe {',
+        'Set-StrictMode -Version 2.0',
+        $probeStubs,
+        $probeScenarioSeed,
+        [IO.File]::ReadAllText((Join-Path (Split-Path -Parent $ProbeRoot) 'seed.ps1'), [Text.Encoding]::UTF8),
+        $probeRegion.ToString(),
+        '}',
+        'Invoke-BRAVOArchiveOrchestrationProbe'
+    ) -join "`n"
+    $probeGeneratedPath = Join-Path $ProbeRoot 'runtime.ps1'
+    [IO.File]::WriteAllText($probeGeneratedPath, $probeGenerated, (New-Object Text.UTF8Encoding($true)))
+
+    foreach ($probeModule in @('BRAVO.Console', 'BRAVO.Logging', 'BRAVO.ExitCodes', 'BRAVO.Archive')) {
+        Import-Module -Name (Join-Path $RepositoryRoot "modules\$probeModule\$probeModule.psd1") -Force
+    }
+    & (Get-Module -Name 'BRAVO.Archive') { param($Path) $script:runtimePath = $Path } $probeGeneratedPath
+    $global:LASTEXITCODE = 77
+    $probeErrors = $null
+    $ErrorActionPreference = 'Continue'
+    $probeExitCode = Invoke-BRAVOArchiveEntrypoint -Parameters @{
+        RuntimeRoot = $ProbeRoot
+        EntryScriptPath = (Join-Path $ProbeRoot 'BRAVO_ARCHIV.ps1')
+        NoPause = $true
+    } -ErrorVariable probeErrors 2>$null
+    $probeEvents = @()
+    if (Test-Path -LiteralPath $probeEventsPath -PathType Leaf) {
+        $probeEvents = @([IO.File]::ReadAllLines($probeEventsPath, [Text.Encoding]::UTF8))
+    }
+    $probeLogLines = @()
+    foreach ($probeLogFile in @(Get-ChildItem -LiteralPath (Join-Path $ProbeRoot 'logs') -Filter '*.log' -ErrorAction SilentlyContinue)) {
+        $probeLogLines += @([IO.File]::ReadAllLines($probeLogFile.FullName, [Text.Encoding]::UTF8) | Where-Object { $_ -match '\b(ERROR|WARNING|FATAL)\b' })
+    }
+    $probeResult = [pscustomobject]@{
+        ExitCode = [int]$probeExitCode
+        ExitCodeName = [string](Get-BRAVOExitCodeName -Code ([int]$probeExitCode))
+        Events = $probeEvents
+        VssOwnershipStateLeft = [IO.File]::Exists($probeVssStatePath)
+        LogProblems = $probeLogLines
+        Errors = @(@($probeErrors) | ForEach-Object { [string]$_ })
+    }
+} catch {
+    $probeResult = [pscustomobject]@{ ProbeError = [string]$_.Exception.Message }
+}
+[IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
+'@
+        $archiveOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
+        [IO.File]::WriteAllText((Join-Path $archiveOrchestrationRoot 'stubs.ps1'), $archiveOrchestrationStubs, $archiveOrchestrationUtf8)
+        [IO.File]::WriteAllText((Join-Path $archiveOrchestrationRoot 'seed.ps1'), $archiveOrchestrationSeed, $archiveOrchestrationUtf8)
+        $archiveOrchestrationProbePath = Join-Path $archiveOrchestrationRoot 'probe.ps1'
+        [IO.File]::WriteAllText($archiveOrchestrationProbePath, $archiveOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
+        $archiveOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $archiveOrchestrationResults = @{}
+        foreach ($archiveOrchestrationScenario in @('Happy', 'ComponentThrows', 'UnhandledThrow')) {
+            $archiveOrchestrationScenarioRoot = Join-Path $archiveOrchestrationRoot $archiveOrchestrationScenario
+            [void][IO.Directory]::CreateDirectory($archiveOrchestrationScenarioRoot)
+            # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
+            # не дозволяє нових Bypass-місць): дочірній процес успадковує
+            # політику батьківського прогону self-test — через
+            # PSExecutionPolicyPreference, коли її задано -ExecutionPolicy,
+            # або ту саму машинну політику, за якою вже виконуються локальні
+            # непідписані фрагменти й модулі цього прогону.
+            $null = & $archiveOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                -File $archiveOrchestrationProbePath `
+                -Scenario $archiveOrchestrationScenario -RepositoryRoot $root -ProbeRoot $archiveOrchestrationScenarioRoot
+            $archiveOrchestrationResultPath = Join-Path $archiveOrchestrationScenarioRoot 'result.json'
+            $archiveOrchestrationResults[$archiveOrchestrationScenario] = if (Test-Path -LiteralPath $archiveOrchestrationResultPath -PathType Leaf) {
+                [IO.File]::ReadAllText($archiveOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+            } else {
+                [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
+            }
+        }
+        $archiveOrchestrationEvents = {
+            param($Result)
+            if ($null -ne $Result.PSObject.Properties['ProbeError']) { return @() }
+            return @($Result.Events | ForEach-Object { [string]$_ })
+        }
+        $archiveOrchestrationIndex = {
+            param([object[]]$Events, [string]$Pattern)
+            for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                if ([string]$Events[$eventIndex] -match $Pattern) { return $eventIndex }
+            }
+            return -1
+        }
+
+        # (1) Щасливий шлях: рівно та послідовність фаз, яку задає Main.
+        # Lock і прибирання orphan VSS — до першого етапу; п'ять етапів
+        # перевірок до створення знімка; VSS Snapshot Set створено й
+        # ownership state збережено ДО архівації компонента, видалено ПІСЛЯ
+        # неї й ДО manifest; retention лише після manifest COMPLETE; Health
+        # після retention; фінальний manifest, стан виконання, Operations-
+        # подія і статус-файл із кодом 0; вивантаження власного логу, і lock
+        # звільнено останнім. Файл ownership state прибрано.
+        $archiveHappy = $archiveOrchestrationResults['Happy']
+        $archiveHappyEvents = @(& $archiveOrchestrationEvents $archiveHappy)
+        $archiveHappyExpected = @(
+            'LOCK-ENTER',
+            'VSS-ORPHAN-CHECK',
+            'STEP 1/8 Перевірка вільного місця OK',
+            'STEP 2/8 Очищення старих журналів SKIPPED',
+            'STEP 3/8 Перевірка середовища OK',
+            'STEP 4/8 Перевірка складу джерел OK',
+            'STEP 5/8 Перевірка шляхів OK',
+            'VSS-CREATE',
+            'VSS-OWNERSHIP-SAVE',
+            'COMPONENT-BACKUP MODEL',
+            'STEP 6/8 Архівація MODEL OK',
+            'VSS-REMOVE',
+            'MANIFEST-WRITE COMPLETE',
+            'RETENTION-CLEANUP',
+            'STEP 7/8 Очищення старих backup generation SKIPPED',
+            'HEALTH',
+            'STEP 8/8 Перевірка резервних копій OK',
+            'MANIFEST-WRITE COMPLETE',
+            'EXECUTION-STATE',
+            'OPS-EVENT 0 SUCCESS',
+            'STATUS 0',
+            'OWN-LOG-UPLOAD',
+            'LOCK-RELEASE'
+        )
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveHappy.PSObject.Properties['ProbeError'] -and
+                $archiveHappy.ExitCode -eq 0 -and
+                $archiveHappy.ExitCodeName -eq 'Success' -and
+                ($archiveHappyEvents -join '|') -ceq ($archiveHappyExpected -join '|') -and
+                -not [bool]$archiveHappy.VssOwnershipStateLeft -and
+                @($archiveHappy.LogProblems).Count -eq 0
+            ) `
+            -Name 'Archive/OrchestrationRunsPhasesInContractOrder' `
+            -Failure "Main на щасливому шляху має пройти фази в затвердженому порядку (lock -> перевірки [1/8]..[5/8] -> VSS -> архівація -> видалення VSS -> manifest -> retention -> Health -> статус -> lock звільнено останнім) і завершитися кодом 0 без WARNING/ERROR; проба: $($archiveHappy | ConvertTo-Json -Compress -Depth 4)"
+
+        # (2) Збій архівації компонента (виняток усередині
+        # Invoke-BRAVOComponentBackup) обробляється локально: VSS Snapshot Set
+        # усе одно видаляється рівно раз і лише після спроби компонента, а
+        # ownership state прибрано; generation FAILED, тому retention
+        # (видалення старих generation) НЕ запускається й стан виконання не
+        # пишеться; код завершення — 40 (LocalArchiveFailed) і в процесі, і в
+        # Operations-події, а machine-readable статус-файл записано з кодом 40
+        # (ключ Bytes відсутній у невдалого компонента); lock звільнено
+        # останнім.
+        $archiveComponent = $archiveOrchestrationResults['ComponentThrows']
+        $archiveComponentEvents = @(& $archiveOrchestrationEvents $archiveComponent)
+        $archiveComponentBackup = & $archiveOrchestrationIndex $archiveComponentEvents '^COMPONENT-BACKUP MODEL$'
+        $archiveComponentStep = & $archiveOrchestrationIndex $archiveComponentEvents '^STEP 6/8 Архівація MODEL ERROR$'
+        $archiveComponentVssRemove = & $archiveOrchestrationIndex $archiveComponentEvents '^VSS-REMOVE$'
+        $archiveComponentManifest = & $archiveOrchestrationIndex $archiveComponentEvents '^MANIFEST-WRITE '
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveComponent.PSObject.Properties['ProbeError'] -and
+                $archiveComponent.ExitCode -eq 40 -and
+                $archiveComponent.ExitCodeName -eq 'LocalArchiveFailed' -and
+                $archiveComponentBackup -ge 0 -and
+                $archiveComponentStep -gt $archiveComponentBackup -and
+                $archiveComponentVssRemove -gt $archiveComponentStep -and
+                $archiveComponentManifest -gt $archiveComponentVssRemove -and
+                @($archiveComponentEvents | Where-Object { $_ -eq 'VSS-REMOVE' }).Count -eq 1 -and
+                [string]$archiveComponentEvents[$archiveComponentManifest] -eq 'MANIFEST-WRITE FAILED' -and
+                @($archiveComponentEvents | Where-Object { $_ -eq 'RETENTION-CLEANUP' -or $_ -eq 'EXECUTION-STATE' }).Count -eq 0 -and
+                @($archiveComponentEvents | Where-Object { $_ -eq 'OPS-EVENT 40 ERROR' }).Count -eq 1 -and
+                @($archiveComponentEvents | Where-Object { $_ -eq 'STATUS 40' }).Count -eq 1 -and
+                -not [bool]$archiveComponent.VssOwnershipStateLeft -and
+                $archiveComponentEvents.Count -gt 1 -and
+                $archiveComponentEvents[$archiveComponentEvents.Count - 1] -eq 'LOCK-RELEASE' -and
+                $archiveComponentEvents[$archiveComponentEvents.Count - 2] -eq 'OWN-LOG-UPLOAD' -and
+                @($archiveComponentEvents | Where-Object { $_ -eq 'LOCK-RELEASE' }).Count -eq 1
+            ) `
+            -Name 'Archive/OrchestrationReleasesSnapshotWhenComponentFails' `
+            -Failure "збій архівації компонента має лишити VSS Snapshot Set видаленим (рівно раз, після спроби), не запускати retention для FAILED generation, дати код 40 (LocalArchiveFailed) і звільнити lock останнім; проба: $($archiveComponent | ConvertTo-Json -Compress -Depth 4)"
+
+        # (3) Необроблений виняток посеред фази архівації (після публікації
+        # компонента, поза локальним catch компонента) проходить крізь
+        # finally циклу: VSS Snapshot Set видалено й ownership state
+        # прибрано ДО обробки винятку; жодна пізніша фаза (manifest,
+        # retention, Health, [7/8], [8/8]) не виконується; зовнішній catch
+        # дає 90 (InternalError), пише статус 90 і діагностику в журнал;
+        # зовнішній finally надсилає Operations-подію з 90, вивантажує
+        # власний лог і звільняє lock останнім.
+        $archiveThrow = $archiveOrchestrationResults['UnhandledThrow']
+        $archiveThrowEvents = @(& $archiveOrchestrationEvents $archiveThrow)
+        $archiveThrowBackup = & $archiveOrchestrationIndex $archiveThrowEvents '^COMPONENT-BACKUP MODEL$'
+        $archiveThrowVssRemove = & $archiveOrchestrationIndex $archiveThrowEvents '^VSS-REMOVE$'
+        $archiveThrowStatus = & $archiveOrchestrationIndex $archiveThrowEvents '^STATUS 90$'
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveThrow.PSObject.Properties['ProbeError'] -and
+                $archiveThrow.ExitCode -eq 90 -and
+                $archiveThrow.ExitCodeName -eq 'InternalError' -and
+                $archiveThrowBackup -ge 0 -and
+                $archiveThrowVssRemove -gt $archiveThrowBackup -and
+                $archiveThrowStatus -gt $archiveThrowVssRemove -and
+                @($archiveThrowEvents | Where-Object { $_ -eq 'VSS-REMOVE' }).Count -eq 1 -and
+                @($archiveThrowEvents | Where-Object {
+                        $_ -like 'MANIFEST-WRITE*' -or $_ -eq 'RETENTION-CLEANUP' -or $_ -eq 'HEALTH' -or
+                        $_ -eq 'EXECUTION-STATE' -or $_ -match '^STEP [78]/8 '
+                    }).Count -eq 0 -and
+                @($archiveThrowEvents | Where-Object { $_ -eq 'OPS-EVENT 90 ERROR' }).Count -eq 1 -and
+                @($archiveThrow.LogProblems | Where-Object { ([string]$_).Contains('self-test: імітований неочікуваний збій після публікації компонента') }).Count -gt 0 -and
+                -not [bool]$archiveThrow.VssOwnershipStateLeft -and
+                $archiveThrowEvents.Count -gt 1 -and
+                $archiveThrowEvents[$archiveThrowEvents.Count - 1] -eq 'LOCK-RELEASE' -and
+                $archiveThrowEvents[$archiveThrowEvents.Count - 2] -eq 'OWN-LOG-UPLOAD' -and
+                @($archiveThrowEvents | Where-Object { $_ -eq 'LOCK-RELEASE' }).Count -eq 1
+            ) `
+            -Name 'Archive/OrchestrationReleasesSnapshotAndLockWhenPhaseThrows' `
+            -Failure "необроблений виняток у фазі архівації має пройти крізь finally: VSS Snapshot Set видалено до обробки винятку, пізніші фази не виконуються, код 90 (InternalError) у процесі, статусі й Operations-події, lock звільнено останнім; проба: $($archiveThrow | ConvertTo-Json -Compress -Depth 4)"
+    } finally {
+        if (Test-Path -LiteralPath $archiveOrchestrationRoot -PathType Container) {
+            Remove-Item -LiteralPath $archiveOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
