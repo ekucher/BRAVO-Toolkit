@@ -640,7 +640,13 @@ Test-BRAVOCondition -Condition (
 function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
 function Test-Compatibility { return $true }
 function Enter-BRAVOArchiveProcessLock {
-    Add-ProbeEvent 'LOCK-ENTER'
+    param([string]$TaskType)
+    Add-ProbeEvent "LOCK-ENTER $TaskType"
+    if ($script:ProbeScenario -eq 'LockBusy') {
+        # Штатна відмова справжньої функції, коли бюджет очікування
+        # (Get-BRAVOOperationLockWaitBudget) вичерпано, а lock досі зайнятий.
+        return [pscustomobject]@{ Success = $false; Stream = $null; Path = 'self-test-lock'; Error = 'lock не звільнився за 0 хв. (self-test)' }
+    }
     $probeLockStream = [pscustomobject]@{ Path = 'self-test-lock' }
     $probeLockStream | Add-Member -MemberType ScriptMethod -Name Dispose -Value { Add-ProbeEvent 'LOCK-RELEASE' }
     return [pscustomobject]@{ Success = $true; Stream = $probeLockStream; Path = 'self-test-lock'; Error = $null }
@@ -926,7 +932,7 @@ try {
         [IO.File]::WriteAllText($archiveOrchestrationProbePath, $archiveOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
         $archiveOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $archiveOrchestrationResults = @{}
-        foreach ($archiveOrchestrationScenario in @('Happy', 'ComponentThrows', 'UnhandledThrow')) {
+        foreach ($archiveOrchestrationScenario in @('Happy', 'ComponentThrows', 'UnhandledThrow', 'LockBusy')) {
             $archiveOrchestrationScenarioRoot = Join-Path $archiveOrchestrationRoot $archiveOrchestrationScenario
             [void][IO.Directory]::CreateDirectory($archiveOrchestrationScenarioRoot)
             # Без -ExecutionPolicy Bypass навмисно (ci\Test-BRAVOForbiddenPattern.ps1
@@ -969,7 +975,7 @@ try {
         $archiveHappy = $archiveOrchestrationResults['Happy']
         $archiveHappyEvents = @(& $archiveOrchestrationEvents $archiveHappy)
         $archiveHappyExpected = @(
-            'LOCK-ENTER',
+            'LOCK-ENTER Backup',
             'VSS-ORPHAN-CHECK',
             'STEP 1/8 Перевірка вільного місця OK',
             'STEP 2/8 Очищення старих журналів SKIPPED',
@@ -1079,6 +1085,28 @@ try {
             ) `
             -Name 'Archive/OrchestrationReleasesSnapshotAndLockWhenPhaseThrows' `
             -Failure "необроблений виняток у фазі архівації має пройти крізь finally: VSS Snapshot Set видалено до обробки винятку, пізніші фази не виконуються, код 90 (InternalError) у процесі, статусі й Operations-події, lock звільнено останнім; проба: $($archiveThrow | ConvertTo-Json -Compress -Depth 4)"
+
+        # (4) T025: lock не захоплено за бюджет очікування (зайнятий lock,
+        # бюджет задачі вичерпано). Main завершується ШТАТНО з кодом 20
+        # (SkippedLockBusy з BRAVO.ExitCodes) — у процесі й Operations-події
+        # (WARNING), з ERROR-рядком у журналі, а зовнішній finally ще
+        # вивантажує власний лог. Жодна фаза під lock (orphan VSS, перевірки,
+        # VSS Snapshot Set, архівація, manifest, статус-файл) не запускається
+        # і нічого не звільняється, бо нічого не захоплено — фіксується
+        # точна послідовність подій. Звичайний запуск (без -SyncBAZA) передає
+        # задачу Backup.
+        $archiveLockBusy = $archiveOrchestrationResults['LockBusy']
+        $archiveLockBusyEvents = @(& $archiveOrchestrationEvents $archiveLockBusy)
+        Test-BRAVOCondition `
+            -Condition (
+                $null -eq $archiveLockBusy.PSObject.Properties['ProbeError'] -and
+                $archiveLockBusy.ExitCode -eq 20 -and
+                $archiveLockBusy.ExitCodeName -eq 'SkippedLockBusy' -and
+                ($archiveLockBusyEvents -join '|') -ceq 'LOCK-ENTER Backup|OPS-EVENT 20 WARNING|OWN-LOG-UPLOAD' -and
+                @($archiveLockBusy.LogProblems | Where-Object { ([string]$_) -match '\bERROR\b' -and ([string]$_).Contains('lock не звільнився за 0 хв. (self-test)') }).Count -gt 0
+            ) `
+            -Name 'Archive/OrchestrationLockWaitTimeoutEndsWithSkippedLockBusy' `
+            -Failure "вичерпане очікування операційного lock має завершити Main штатно кодом 20 (SkippedLockBusy) у процесі й Operations-події (WARNING), з ERROR у журналі, без жодної фази під lock і без звільнення незахопленого lock; задача звичайного запуску — Backup; проба: $($archiveLockBusy | ConvertTo-Json -Compress -Depth 4)"
     } finally {
         if (Test-Path -LiteralPath $archiveOrchestrationRoot -PathType Container) {
             Remove-Item -LiteralPath $archiveOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue

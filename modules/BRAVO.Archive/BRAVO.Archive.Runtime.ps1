@@ -5997,6 +5997,11 @@ function Write-BRAVOArchivePreflightFailureSummary {
 function Enter-BRAVOArchiveProcessLock {
     # Спільний lock для BRAVO_ARCHIV і BRAVO_MAINTENANCE. Він не дозволяє
     # maintenance зупиняти служби або змінювати джерела під час backup.
+    param(
+        # Задача Планувальника, у якій іде прогін: визначає ліміт очікування
+        # lock (Get-BRAVOOperationLockWaitBudget, BRAVO.System).
+        [Parameter(Mandatory = $true)][ValidateSet('Backup', 'BAZASync')][string]$TaskType
+    )
     $lockPath = [string]$operationLockSettings.Path
     try {
         if ([string]::IsNullOrWhiteSpace($lockPath)) {
@@ -6011,12 +6016,16 @@ function Enter-BRAVOArchiveProcessLock {
                 -ErrorAction Stop |
                 Out-Null
         }
-        $waitMinutes = if ($null -ne $schedulerSettings -and
-            $schedulerSettings.Contains("OperationLockWaitMinutes")) {
-            [math]::Max(0, [int]$schedulerSettings.OperationLockWaitMinutes)
-        } else {
-            0
-        }
+        # T025: очікування обмежене ExecutionTimeLimit задачі $TaskType
+        # (-SyncBAZA = задача BAZASync, 2 год; інакше — Backup) мінус запас.
+        # Інакше Планувальник убивав -SyncBAZA посеред 6-год очікування
+        # без підсумку й без коду з контракту BRAVO.ExitCodes;
+        # тепер вичерпане очікування — штатний SkippedLockBusy (20) з ERROR.
+        $lockWaitBudget = Get-BRAVOOperationLockWaitBudget `
+            -SchedulerSettings $schedulerSettings `
+            -TaskType $TaskType
+        $waitMinutes = $lockWaitBudget.EffectiveMinutes
+        $waitLimitDescription = [string]$lockWaitBudget.LimitDescription
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $lockStream = $null
         $lastLockError = $null
@@ -6071,7 +6080,7 @@ function Enter-BRAVOArchiveProcessLock {
             }
         } while ($null -eq $lockStream -and (Get-Date) -lt $deadline)
         if ($null -eq $lockStream) {
-            throw "lock не звільнився за $waitMinutes хв.: $lastLockError"
+            throw "lock не звільнився за $waitMinutes хв.$($waitLimitDescription): $lastLockError"
         }
         # JSON замість "PID=...; Started=..." (аудит P1.8): processStartTime і
         # hostname дають змогу відрізнити той самий PID, перевикористаний
@@ -6215,7 +6224,8 @@ function Main {
         -Mode $(if ($NoPause) { 'SCHEDULED' } else { 'MANUAL' }) `
         -StartedAt $scriptStartTime
 
-    $processLockResult = Enter-BRAVOArchiveProcessLock
+    $processLockResult = Enter-BRAVOArchiveProcessLock `
+        -TaskType $(if ($SyncBAZA) { 'BAZASync' } else { 'Backup' })
     if (-not $processLockResult.Success) {
         Write-Log (
             "Запуск скасовано: інший екземпляр BRAVO_ARCHIV уже працює " +

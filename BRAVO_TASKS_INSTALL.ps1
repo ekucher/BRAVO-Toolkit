@@ -319,8 +319,10 @@ function New-BRAVOTaskDefinition {
         -not [bool]$schedulerSettings.DontStopIfGoingOnBatteries
     $definition.Settings.MultipleInstances = ConvertTo-BRAVOMultipleInstancesPolicy `
         -Value ([string]$schedulerSettings.MultipleInstances)
+    # Та сама конверсія, з якої Get-BRAVOOperationLockWaitBudget бере ліміт
+    # задачі для очікування операційного lock (T025, BRAVO.System).
     $definition.Settings.ExecutionTimeLimit = [System.Xml.XmlConvert]::ToString(
-        [timespan]::FromHours([double]$TaskSettings.ExecutionTimeLimitHours)
+        (ConvertTo-BRAVOSchedulerExecutionTimeLimit -Hours $TaskSettings.ExecutionTimeLimitHours)
     )
     if ([int]$schedulerSettings.RestartCount -gt 0) {
         $definition.Settings.RestartCount = [int]$schedulerSettings.RestartCount
