@@ -223,17 +223,19 @@ function Test-BRAVOConfigLoaderCallerCompleteness {
 
     # Файл у переліку ще не означає, що КОЖЕН його виклик передає прапорець:
     # гейт LEGACY_CONFIG_AUTOEXEC бачить лише перший текстовий збіг. Тут
-    # кожен AST-виклик у production-entrypoint (санкціонований тестовий
-    # harness навмисно викликає loader і без прапорця) мусить прив'язувати
-    # -DisallowLegacyPrimaryAutoDetect.
-    $sanctionedCallers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-    foreach ($sanctionedRelativePath in @($SanctionedNonProductionCallerRelativePath)) {
-        if (-not [string]::IsNullOrWhiteSpace($sanctionedRelativePath)) {
-            [void]$sanctionedCallers.Add($sanctionedRelativePath.Replace('/', '\'))
+    # кожен AST-виклик у переліченому production-entrypoint мусить
+    # прив'язувати -DisallowLegacyPrimaryAutoDetect (санкціонований тестовий
+    # harness навмисно викликає loader і без прапорця).
+    # Неперелічений файл уже провалив гейт вище (одна знахідка на файл);
+    # тут — лише виклики в ПЕРЕЛІЧЕНИХ production-entrypoint-ах.
+    $listedProductionCallers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($productionRelativePath in @($ProductionEntryPointRelativePath)) {
+        if (-not [string]::IsNullOrWhiteSpace($productionRelativePath)) {
+            [void]$listedProductionCallers.Add($productionRelativePath.Replace('/', '\'))
         }
     }
     $productionFlaglessCalls = @($callerScan.FlaglessCall | Where-Object {
-            -not $sanctionedCallers.Contains($_.Substring(0, $_.LastIndexOf(':')))
+            $listedProductionCallers.Contains($_.Substring(0, $_.LastIndexOf(':')))
         })
     if ($productionFlaglessCalls.Count -gt 0) {
         [void]$failures.Add(
