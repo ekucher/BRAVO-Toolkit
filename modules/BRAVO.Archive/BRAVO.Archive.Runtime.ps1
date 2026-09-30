@@ -17,6 +17,7 @@ param(
     [switch]$NotifyOnSuccess,
     [switch]$NoSlack,
     [switch]$SkipIfBackupTaskRunning,
+    [switch]$CatchUpMissedBackup,
     [switch]$NoPause,
     [Parameter(Mandatory = $true)][string]$RuntimeRoot,
     [Parameter(Mandatory = $true)][string]$EntryScriptPath
@@ -42,6 +43,7 @@ function Invoke-BRAVOArchive {
         [switch]$NotifyOnSuccess,
         [switch]$NoSlack,
         [switch]$SkipIfBackupTaskRunning,
+        [switch]$CatchUpMissedBackup,
         [switch]$NoPause,
         [Parameter(Mandatory = $true)][string]$RuntimeRoot,
         [Parameter(Mandatory = $true)][string]$EntryScriptPath
@@ -6157,6 +6159,34 @@ function Write-BRAVOBackupExecutionState {
     Write-BRAVOStateFileAtomic -Path $path -Text ($state | ConvertTo-Json)
 }
 
+function Read-BRAVOBackupLastSuccess {
+    # Час останньої COMPLETE-копії з BRAVO_TASK_EXECUTION_STATE.json (його
+    # пише Write-BRAVOBackupExecutionState вище). $null = запису немає або
+    # файл пошкоджений; для -CatchUpMissedBackup це «копії не було».
+    $path = Join-Path $stateRoot 'BRAVO_TASK_EXECUTION_STATE.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    try {
+        $state = Get-Content -LiteralPath $path -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-BRAVOLog `
+            -Component 'STATE' `
+            -Message "Не вдалося прочитати стан завдань ($path): $($_.Exception.Message)" `
+            -Level "INFO"
+        return $null
+    }
+    $property = $state.PSObject.Properties['Backup']
+    if ($null -eq $property -or [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+        return $null
+    }
+    [datetime]$lastSuccess = [datetime]::MinValue
+    if (-not [datetime]::TryParse([string]$property.Value, [ref]$lastSuccess)) {
+        return $null
+    }
+    return $lastSuccess
+}
+
 function Main {
     # Ініціалізація
     $scriptStartTime = Get-Date
@@ -6234,6 +6264,36 @@ function Main {
     }
     $script:archiveProcessLock = $processLockResult.Stream
     $script:archiveProcessLockPath = $processLockResult.Path
+
+    if ($CatchUpMissedBackup -and -not $SyncBAZA) {
+        # Boot-завдання BackupCatchUp. Рішення — ПІСЛЯ lock: якщо в цей
+        # момент ішла звичайна нічна копія, ми дочекались її й бачимо вже
+        # свіжий стан, тож другої копії не буде.
+        $catchUpDecision = Get-BRAVOBackupCatchUpDecision `
+            -Now (Get-Date) `
+            -DailyAt ([string]$schedulerSettings.Backup.DailyAt) `
+            -LastSuccess (Read-BRAVOBackupLastSuccess)
+        if (-not $catchUpDecision.Run) {
+            Write-Log "Підхоплення пропущеної копії не потрібне: $($catchUpDecision.Reason)" -Level "INFO"
+            # Це не прогін архівації: без Operations-події й без
+            # вивантаження власного журналу, статус-файл лишається від
+            # останнього справжнього прогону.
+            $script:archiveCatchUpSkipped = $true
+            $script:archiveFinalOperationsEventSent = $true
+            $script:processExitCode = 0
+            $catchUpMetrics = New-Object System.Collections.Specialized.OrderedDictionary
+            $catchUpMetrics.Add('Операція', 'Підхоплення пропущеної нічної копії')
+            $catchUpMetrics.Add('Рішення', 'не потрібне')
+            $catchUpMetrics.Add('Причина', [string]$catchUpDecision.Reason)
+            Write-BRAVOSummary `
+                -Result 'УСПІШНО' `
+                -Duration ((Get-Date) - $scriptStartTime) `
+                -Metrics $catchUpMetrics `
+                -LogFile $script:logFile
+            return
+        }
+        Write-Log "Підхоплення пропущеної копії після старту сервера: $($catchUpDecision.Reason)" -Level "INFO"
+    }
 
     # A hard process termination skips PowerShell finally blocks. Persisted
     # ownership lets the next lock owner remove only the exact VSS Shadow IDs
@@ -8677,6 +8737,7 @@ $script:archiveProcessLock = $null
 $script:archiveProcessLockPath = $null
 $script:archiveFinalOperationsEventSent = $false
 $script:archiveFinalOperationsEventContext = $null
+$script:archiveCatchUpSkipped = $false
 
 function Send-BRAVOArchiveFinalOperationsEvent {
     <#
@@ -8836,7 +8897,9 @@ try {
     # успішного/ERROR footer, ніколи не маскуючи $fatalErrorRecord і не
     # змінюючи $script:processExitCode (функція сама best-effort/
     # ізольована try/catch).
-    Invoke-BRAVOArchiveOwnLogUpload
+    if (-not $script:archiveCatchUpSkipped) {
+        Invoke-BRAVOArchiveOwnLogUpload
+    }
     if ($script:archiveProcessLock) {
         $script:archiveProcessLock.Dispose()
         $script:archiveProcessLock = $null
@@ -8867,6 +8930,7 @@ if ($MyInvocation.InvocationName -ne '.') {
         NotifyOnSuccess = $NotifyOnSuccess
         NoSlack = $NoSlack
         SkipIfBackupTaskRunning = $SkipIfBackupTaskRunning
+        CatchUpMissedBackup = $CatchUpMissedBackup
         NoPause = $NoPause
         RuntimeRoot = $RuntimeRoot
         EntryScriptPath = $EntryScriptPath

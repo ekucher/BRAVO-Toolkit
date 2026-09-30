@@ -20853,6 +20853,71 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
         -Name "Scheduler/RecoveryNextRunIsBootOnly" `
         -Failure "Recovery (5.2.0) — лише boot-trigger: Format-BRAVOSchedulerNextRun не повинен мати параметрів DailyWindowStart/HasBootTrigger і не повинен згадувати щоденний розклад"
 
+    # --- Scheduler/BackupCatchUp* (#322): пропущена нічна копія робиться
+    # boot-завданням BRAVO_ARCHIV_CATCHUP через кілька хвилин після старту ОС
+    # (рішення власника 2026-09-30: 5-10 хв), і лише якщо слот справді
+    # пропущено.
+    $catchUpCases = @(
+        @{ Name = 'already-done'; Now = [datetime]'2026-10-01T08:00:00'; Last = [datetime]'2026-09-30T23:05:00'; Run = $false; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'missed'; Now = [datetime]'2026-10-01T08:00:00'; Last = [datetime]'2026-09-29T23:05:00'; Run = $true; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'no-state'; Now = [datetime]'2026-10-01T08:00:00'; Last = $null; Run = $true; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'next-slot-soon'; Now = [datetime]'2026-09-30T22:30:00'; Last = [datetime]'2026-09-28T23:05:00'; Run = $false; Slot = [datetime]'2026-09-29T23:00:00' }
+        @{ Name = 'boot-after-slot'; Now = [datetime]'2026-09-30T23:10:00'; Last = [datetime]'2026-09-29T23:05:00'; Run = $true; Slot = [datetime]'2026-09-30T23:00:00' }
+        @{ Name = 'boundary-equal'; Now = [datetime]'2026-10-01T08:00:00'; Last = [datetime]'2026-09-30T23:00:00'; Run = $false; Slot = [datetime]'2026-09-30T23:00:00' }
+    )
+    $catchUpFailures = @()
+    foreach ($catchUpCase in $catchUpCases) {
+        try {
+            $catchUpResult = Get-BRAVOBackupCatchUpDecision `
+                -Now $catchUpCase.Now `
+                -DailyAt '23:00' `
+                -LastSuccess $catchUpCase.Last
+            if ([bool]$catchUpResult.Run -ne [bool]$catchUpCase.Run -or
+                $catchUpResult.PreviousSlot -ne $catchUpCase.Slot -or
+                [string]::IsNullOrWhiteSpace([string]$catchUpResult.Reason)) {
+                $catchUpFailures += "$($catchUpCase.Name): Run=$($catchUpResult.Run) Slot=$($catchUpResult.PreviousSlot)"
+            }
+        } catch {
+            $catchUpFailures += "$($catchUpCase.Name): $($_.Exception.Message)"
+        }
+    }
+    $catchUpInvalidThrows = $false
+    try {
+        [void](Get-BRAVOBackupCatchUpDecision -Now ([datetime]'2026-10-01T08:00:00') -DailyAt 'nonsense' -LastSuccess $null)
+    } catch {
+        $catchUpInvalidThrows = $true
+    }
+    Test-BRAVOCondition `
+        -Condition ($catchUpFailures.Count -eq 0 -and $catchUpInvalidThrows) `
+        -Name "Scheduler/BackupCatchUpDecision" `
+        -Failure ("Get-BRAVOBackupCatchUpDecision: копія лише коли остання COMPLETE старша за останній слот DailyAt і до наступного слоту більше 60 хв; невалідний DailyAt кидає. Збої: " + ($catchUpFailures -join '; '))
+
+    $catchUpNextRun = Format-BRAVOSchedulerNextRun -TaskType 'BackupCatchUp' -NextRunTime ([datetime]'1899-12-30T00:00:00') -StartupDelayMinutes 7
+    Test-BRAVOCondition `
+        -Condition ($catchUpNextRun -like '*старту Windows*' -and $catchUpNextRun -like '*затримка 7 хв.*' -and $catchUpNextRun -notmatch '1899') `
+        -Name "Scheduler/BackupCatchUpNextRunIsBoot" `
+        -Failure "BackupCatchUp — boot-trigger: next-run має показувати старт Windows і затримку, а не 30.12.1899"
+
+    $catchUpInstallerText = Get-Content -LiteralPath (Join-Path $root 'BRAVO_TASKS_INSTALL.ps1') -Raw -Encoding UTF8
+    $catchUpDiagnoseText = Get-Content -LiteralPath (Join-Path $root 'BRAVO_TASKS_DIAGNOSE.ps1') -Raw -Encoding UTF8
+    $catchUpUninstallText = Get-Content -LiteralPath (Join-Path $root 'BRAVO_TASKS_UNINSTALL.ps1') -Raw -Encoding UTF8
+    $catchUpArchiveText = Get-Content -LiteralPath (Join-Path $root 'modules\BRAVO.Archive\BRAVO.Archive.Runtime.ps1') -Raw -Encoding UTF8
+    $catchUpMainIndex = $catchUpArchiveText.IndexOf('function Main {')
+    $catchUpLockIndex = if ($catchUpMainIndex -ge 0) { $catchUpArchiveText.IndexOf('$processLockResult = Enter-BRAVOArchiveProcessLock', $catchUpMainIndex) } else { -1 }
+    $catchUpDecisionIndex = if ($catchUpMainIndex -ge 0) { $catchUpArchiveText.IndexOf('Get-BRAVOBackupCatchUpDecision', $catchUpMainIndex) } else { -1 }
+    Test-BRAVOCondition `
+        -Condition (
+            $catchUpInstallerText.Contains('if ($TaskType -eq "Recovery" -or $TaskType -eq "BackupCatchUp") {') -and
+            $catchUpInstallerText.Contains('$actionArguments += " -CatchUpMissedBackup"') -and
+            $catchUpInstallerText.Contains('[pscustomobject]@{ Type = "BackupCatchUp"; Settings = $backupCatchUpSettings }') -and
+            $catchUpDiagnoseText.Contains("BackupCatchUp = @('-NoPause', '-CatchUpMissedBackup')") -and
+            $catchUpUninstallText.Contains('$schedulerSettings.BackupCatchUp.TaskName') -and
+            $catchUpLockIndex -gt 0 -and
+            $catchUpDecisionIndex -gt $catchUpLockIndex
+        ) `
+        -Name "Scheduler/BackupCatchUpBootTaskWiring" `
+        -Failure "BackupCatchUp: boot-trigger і -CatchUpMissedBackup в інсталяторі, очікувані аргументи в Diagnose, ім'я в Uninstall; рішення в Archive — після отримання lock"
+
     # --- Deploy/RuntimeRootConfigRootSeparation: runtime-ресурси з RuntimeRoot ---
     $separateConfigRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_CFGROOT_" + [guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $separateConfigRoot -Force | Out-Null
@@ -20882,6 +20947,24 @@ function Write-Log { param([Parameter(Position = 0)]$Message, $Level) }
             -Condition ([bool]$global:schedulerSettings.BAZASync.Enabled -eq [bool]$global:bazaSyncEffective.ScheduledSftpSyncRequired) `
             -Name "Deploy/BazaSyncEnabledFromEffective" `
             -Failure "schedulerSettings.BAZASync.Enabled має дорівнювати bazaSyncEffective.ScheduledSftpSyncRequired"
+        $catchUpSettings = $null
+        if ($global:schedulerSettings.Contains('BackupCatchUp')) {
+            $catchUpSettings = $global:schedulerSettings.BackupCatchUp
+        }
+        $catchUpExpectedEnabled = [bool]$global:schedulerSettings.Backup.Enabled -and
+            -not [bool]$global:schedulerSettings.Recovery.Enabled
+        Test-BRAVOCondition `
+            -Condition (
+                $null -ne $catchUpSettings -and
+                [string]$catchUpSettings.TaskName -eq 'BRAVO_ARCHIV_CATCHUP' -and
+                [int]$catchUpSettings.StartupDelayMinutes -ge 5 -and
+                [int]$catchUpSettings.StartupDelayMinutes -le 10 -and
+                [string]$catchUpSettings.ScriptPath -like '*BRAVO_ARCHIV.ps1' -and
+                ([string]$catchUpSettings.ScriptPath).StartsWith($runtimePrefix, [StringComparison]::OrdinalIgnoreCase) -and
+                [bool]$catchUpSettings.Enabled -eq $catchUpExpectedEnabled
+            ) `
+            -Name "Config/BackupCatchUpDerived" `
+            -Failure "schedulerSettings.BackupCatchUp: TaskName BRAVO_ARCHIV_CATCHUP, затримка 5-10 хв, ScriptPath BRAVO_ARCHIV.ps1, Enabled = Backup.Enabled і не Recovery.Enabled"
     } finally {
         Remove-Item -LiteralPath $separateConfigRoot -Recurse -Force -ErrorAction SilentlyContinue
         # Відновити ізольований стан без залежності від служби BRAVO на CI runner.
