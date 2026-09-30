@@ -1418,7 +1418,10 @@
         $broken = New-Object Collections.Generic.List[string]
         # Заголовок посилання — у "…", '…' або (…), як і в reference-визначенні.
         $titlePattern = '("[^"]*"|''[^'']*''|\([^)]*\))'
-        $linkPattern = '!?\[(?:[^\]\[]|\[[^\]]*\])*\]\(\s*(<[^>]*>|[^)\s]+)(?:\s+' + $titlePattern + ')?\s*\)'
+        # Ціль без <…> може містити екрановані \( \) і один рівень
+        # збалансованих дужок: [x](docs/spec(v2).md) — ціль docs/spec(v2).md.
+        $destinationPattern = '(?:[^()\s\\]|\\.|\((?:[^()\s\\]|\\.)*\))+'
+        $linkPattern = '!?\[(?:[^\]\[]|\[[^\]]*\])*\]\(\s*(<[^>]*>|' + $destinationPattern + ')(?:\s+' + $titlePattern + ')?\s*\)'
         $refPattern = '^\s{0,3}\[([^\]]+)\]:\s*(<[^>]*>|\S+)(\s+' + $titlePattern + ')?\s*$'
         # Використання reference-посилання: [текст][мітка] або [мітка][].
         # Коротку форму [мітка] не перевіряємо: її не відрізнити від
@@ -1456,6 +1459,7 @@
 
                 foreach ($item in $targets) {
                     $target = $item.Target.Trim('<', '>')
+                    $target = [regex]::Replace($target, '\\([()])', '$1')
                     # Схема (https:, mailto:) або protocol-relative //хост — зовнішнє.
                     # Одинарний / на GitHub — корінь репозиторію, перевіряється нижче.
                     if ($target -match '^[A-Za-z][A-Za-z0-9+.-]*:' -or $target.StartsWith('//')) { continue }
@@ -1930,9 +1934,10 @@
                     '`modules\BRAVO.Fixture\BRAVO.Fixture.psm1 -Verbose` `ci\Missing.ps1 -Apply` `VERSION.json` `MISSING.json`',
                     '`Get-BRAVOStubOnly`, `Get-BRAVOHereStringOnly`.',
                     'Див. `docs/guide.md`, розділи 1 і 7; розділи 2, 9 `docs/guide.md`.',
-                    '```inline``` [bad-after-inline](docs/missing-inline.md)'
+                    '```inline``` [bad-after-inline](docs/missing-inline.md)',
+                    '[ok-balanced](docs/spec(v2).md) [ok-escaped](docs/spec\(v2\).md) [bad-balanced](docs/missing(v2).md)'
                 ) -join "`n"), $utf8NoBom)
-        $docFixtureKnown = @('README.md', 'VERSION.json', 'docs/guide.md', 'modules/BRAVO.Fixture/BRAVO.Fixture.psm1',
+        $docFixtureKnown = @('README.md', 'VERSION.json', 'docs/guide.md', 'docs/spec(v2).md', 'modules/BRAVO.Fixture/BRAVO.Fixture.psm1',
             'selftest/BRAVO_SELF_TEST.Fixture.ps1')
 
         $linkFixtureResult = @(Find-BRAVOBrokenDocLink -Root $docFixtureRoot -MarkdownPath @('README.md', 'docs/guide.md') -KnownPath $docFixtureKnown)
@@ -1944,6 +1949,7 @@
             'README.md:25: файл не існує -> docs/missing-paren.md',
             'README.md:26: якір не існує -> docs/guide.md#пункт',
             'README.md:39: файл не існує -> docs/missing-inline.md',
+            'README.md:40: файл не існує -> docs/missing(v2).md',
             'README.md:26: reference-визначення не існує -> [missing-label]'
         )
         Test-BRAVOCondition `
