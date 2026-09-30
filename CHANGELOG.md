@@ -2,6 +2,27 @@
 
 ## Не випущено (developer)
 
+- **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
+  `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
+  ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
+  канонічного `<RuntimeRoot>\Tools\TOOLS_MANIFEST.json`, вважається послабленням захисту
+  і в режимі `Enforce` блокує запуск, як і `toolIntegritySettings.Mode`. Якір довіри —
+  `RuntimeRoot`: сам `toolsPath` теж має дорівнювати `<RuntimeRoot>\Tools`, тож спільне
+  перенаправлення каталогу інструментів і маніфесту не проходить. Порівняння шляхів
+  враховує регістр (на NTFS із per-directory case sensitivity інший регістр — інший
+  файл), а контейнер налаштувань перевіряється як будь-який `IDictionary`, як і в
+  runtime-споживачів. Сьогодні цей ключ
+  не можна перевизначити через конфігурацію (його завжди виводить
+  `Resolve-BRAVOConfigurationDerivation`), тому на наявних серверах поведінка не
+  змінюється; перевірка захищає від майбутньої регресії, за якої підмінений 7-Zip чи
+  WinSCP пройшов би перевірку цілісності проти чужого маніфесту. Нові self-test
+  перевірки: `ConfigLoader/ToolManifestPathRedirectionBlocks`,
+  `ConfigLoader/ToolManifestPathCanonicalAllowed`;
+  `ConfigLoader/ToolManifestPathEdgeCasesFailClosed` фіксує крайові випадки:
+  порожній і синтаксично зіпсований шлях, `..` за межі `Tools\`, інший регістр
+  імені файла, спільне перенаправлення `toolsPath` і маніфесту та перенаправлення в
+  `OrderedDictionary` блокуються, а `..`, що після нормалізації веде до того самого
+  канонічного файла, допускається.
 - **Походження бінарників у `Tools\TOOLS_MANIFEST.json` (BRAVO-T021).**
   Для кожного інструмента маніфест тепер містить запис `provenance`: версію,
   офіційне джерело пакета, SHA-256 пакета, шлях файлу в пакеті й дату завантаження.
