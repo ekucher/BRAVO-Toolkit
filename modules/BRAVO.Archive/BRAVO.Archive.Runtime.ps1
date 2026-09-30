@@ -8677,6 +8677,11 @@ function Main {
 # НІКОЛИ не змінює $script:processExitCode (другорядний/телеметричний
 # ефект).
 function Invoke-BRAVOArchiveOwnLogUpload {
+    # Boot-підхоплення (-CatchUpMissedBackup), яке вирішило, що копія не
+    # потрібна, нічого не архівувало — його короткий лог не вивантажується.
+    if ($script:archiveCatchUpSkipped) {
+        return
+    }
     # Увесь блок — в одному try/catch (а не лише сам transfer, як було
     # раніше): якщо крах стався ДО завантаження конфігурації,
     # componentSettings/storageEffective/sftpUrl тощо ще не існують, і
@@ -8897,9 +8902,7 @@ try {
     # успішного/ERROR footer, ніколи не маскуючи $fatalErrorRecord і не
     # змінюючи $script:processExitCode (функція сама best-effort/
     # ізольована try/catch).
-    if (-not $script:archiveCatchUpSkipped) {
-        Invoke-BRAVOArchiveOwnLogUpload
-    }
+    Invoke-BRAVOArchiveOwnLogUpload
     if ($script:archiveProcessLock) {
         $script:archiveProcessLock.Dispose()
         $script:archiveProcessLock = $null

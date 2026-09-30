@@ -20172,7 +20172,7 @@ function Get-BRAVOMaintenanceSummaryResult {
     # визначення могло б оголошуватись invalid у Diagnose.
     Test-BRAVOCondition `
         -Condition (
-            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify")') -and
+            $tasksDiagnoseTextForRuntime.Contains('@("Backup", "Maintenance", "Health", "Recovery", "BAZASync", "RestoreVerify", "BackupCatchUp")') -and
             $tasksDiagnoseTextForRuntime.Contains('function Test-BRAVOScheduledTaskDefinition') -and
             $tasksDiagnoseTextForRuntime.Contains('BAZASync      = @(''-NoPause'', ''-SyncBAZA'')') -and
             $tasksDiagnoseTextForRuntime.Contains('Recovery      = @(''-NoPause'', ''-RunMissedRestoreOnly'')') -and
