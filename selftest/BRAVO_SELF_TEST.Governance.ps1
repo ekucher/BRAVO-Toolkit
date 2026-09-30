@@ -1301,12 +1301,12 @@
     #     відступу контейнера не знімається; лінивий рядок абзацу з меншим
     #     відступом закриває пункт; нумерований пункт з номером ≠ 1 теж
     #     вважається початком блоку (у CommonMark він не перериває абзац);
-    #   - HTML-заголовки (`<h2 id>`, `<span id>`) — якорів не створюють
-    #     (явний id рахується лише в `<a>`);
+    #   - номер розділу в заголовку-версії `## [5.2.4]` не рахується
+    #     (у репозиторії такого стилю немає; `5)` і `3\.` рахуються);
     #   - HTML-блоки, крім коментарів (`<div>`, `<table>`), — вміст
     #     розбирається як Markdown; таблиці — як абзаци (`\|` у коді
     #     не обробляється);
-    #   - виноски, autolink-и `<https://…>`, `href` в inline-HTML,
+    #   - autolink-и `<https://…>`, `href` в inline-HTML,
     #     посилання з переносом рядка всередині цілі й коротка форма
     #     reference-посилання `[мітка]` — не перевіряються;
     #   - Setext-заголовок, чий абзац починається з `<` чи `|`, не
@@ -1548,6 +1548,7 @@
         }
         [void]$protected.Append($Text.Substring($cursor))
         $t = [regex]::Replace($protected.ToString(), '!?\[([^\]]*)\]\([^)]*\)', '$1')
+        $t = [regex]::Replace($t, '!?\[([^\]]*)\]\[[^\]]*\]', '$1')
         $t = [regex]::Replace($t, '<[^>]+>', '')
         # Сутності (`&amp;`, `&#x41;`) — як у рендері; у коді вони літеральні.
         $t = [Net.WebUtility]::HtmlDecode($t)
@@ -1615,7 +1616,10 @@
             # `---` під пунктом списку (менший відступ) — лінія, як у GitHub.
             if ($entry.Kind -eq 'Break') {
                 if ($paragraph.Count -gt 0 -and $key -eq $paragraphKey -and $entry.Block -match '^(=+|-+)\s*$') {
-                    $headings.Add((($paragraph.ToArray()) -join ' '))
+                    # Рядки багаторядкового Setext GitHub з'єднує переносом,
+                    # який slug відкидає: «Multi line / setext» →
+                    # multi-linesetext.
+                    $headings.Add((($paragraph.ToArray()) -join "`n"))
                 }
                 $paragraph.Clear()
                 continue
@@ -1639,7 +1643,8 @@
     # (github-slugger): дубль отримує перший вільний суфікс -1, -2, …,
     # причому «вільний» — серед УСІХ уже виданих якорів, тож заголовки
     # `Foo`, `Foo-1`, `Foo` дають foo, foo-1, foo-2. Explicit — явні
-    # `<a name|id=…>` поза кодом і коментарями: будь-який порядок
+    # `id=…` будь-якого тегу (`<h2 id>`, `<span id>`) і `<a name=…>` поза
+    # кодом і коментарями: будь-який порядок
     # атрибутів, лапки "…", '…' або без лапок, регістр імен тегу й
     # атрибута не важить; значення зберігається дослівно.
     function Get-BRAVODocLinkAnchorSet {
@@ -1658,9 +1663,11 @@
         }
         $explicit = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
         foreach ($paragraph in (Get-BRAVODocParagraphs -FullPath $FullPath)) {
-            foreach ($tag in [regex]::Matches($paragraph.Masked, '(?i)<a(?=[\s/>])[^>]*>')) {
-                foreach ($attr in [regex]::Matches($tag.Value, '(?i)(?<=\s)(?:name|id)\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s"''=<>`]+))')) {
-                    $value = $attr.Groups[1].Value + $attr.Groups[2].Value + $attr.Groups[3].Value
+            foreach ($tag in [regex]::Matches($paragraph.Masked, '(?i)<([a-z][a-z0-9-]*)(?=[\s/>])[^>]*>')) {
+                $isAnchorTag = ($tag.Groups[1].Value -eq 'a')
+                foreach ($attr in [regex]::Matches($tag.Value, '(?i)(?<=\s)(name|id)\s*=\s*(?:"([^"]*)"|''([^'']*)''|([^\s"''=<>`]+))')) {
+                    if ($attr.Groups[1].Value -eq 'name' -and -not $isAnchorTag) { continue }
+                    $value = $attr.Groups[2].Value + $attr.Groups[3].Value + $attr.Groups[4].Value
                     if ($value.Length -gt 0) { [void]$explicit.Add($value) }
                 }
             }
@@ -1680,6 +1687,81 @@
             }
         }
         return ,$known
+    }
+
+    # Ціль посилання як URL відносно документа $MdPath: <…> і
+    # backslash-екранування знято; схема чи //хост — External; шлях з `/`
+    # — від кореня репозиторію (як на GitHub), інакше від каталогу
+    # документа; ?запит відкидається, #фрагмент повертається окремо;
+    # порожній шлях — сам документ. Спільне для навігаційних посилань і
+    # назви документа-посилання в посиланні на розділ.
+    function Resolve-BRAVODocLinkTarget {
+        param([string]$MdPath, [string]$Target)
+        $clean = $Target.Trim('<', '>')
+        $clean = [regex]::Replace($clean, '\\([!-/:-@\[-`{-~])', '$1')
+        $result = New-Object PSObject -Property @{ Target = $clean; External = $false; HasPath = $false; Resolved = $MdPath; Escapes = $false; Fragment = '' }
+        if ($clean -match '^[A-Za-z][A-Za-z0-9+.-]*:' -or $clean.StartsWith('//')) { $result.External = $true; return $result }
+        $pathPart = $clean
+        $hashIndex = $clean.IndexOf('#')
+        if ($hashIndex -ge 0) {
+            $pathPart = $clean.Substring(0, $hashIndex)
+            $result.Fragment = $clean.Substring($hashIndex + 1)
+        }
+        $queryIndex = $pathPart.IndexOf('?')
+        if ($queryIndex -ge 0) { $pathPart = $pathPart.Substring(0, $queryIndex) }
+        $pathPart = [Uri]::UnescapeDataString($pathPart)
+        if ($pathPart.Length -eq 0) { return $result }
+        $result.HasPath = $true
+        $mdDir = ''
+        if ($MdPath.Contains('/')) { $mdDir = $MdPath.Substring(0, $MdPath.LastIndexOf('/')) }
+        $combined = $pathPart.TrimStart('/')
+        if (-not $pathPart.StartsWith('/') -and $mdDir.Length -gt 0) { $combined = $mdDir + '/' + $pathPart }
+        $segments = New-Object Collections.Generic.List[string]
+        foreach ($segment in $combined.Split('/')) {
+            if ($segment -eq '' -or $segment -eq '.') { continue }
+            if ($segment -eq '..') {
+                if ($segments.Count -eq 0) { $result.Escapes = $true; break }
+                $segments.RemoveAt($segments.Count - 1)
+                continue
+            }
+            $segments.Add($segment)
+        }
+        $result.Resolved = ($segments.ToArray() -join '/')
+        return $result
+    }
+
+    # Позиції `[`, чия парна `]` (стек, один лінійний прохід) одразу
+    # продовжується `(` або `[` — лише звідти може початися посилання.
+    # Регулярний вираз посилання запускається тільки з цих позицій
+    # (\G), тож довгий ряд незбалансованих `[` не дає квадратичного
+    # перебору.
+    function Get-BRAVODocBracketStart {
+        param([string]$Text)
+        $starts = New-Object Collections.Generic.List[int]
+        $stack = New-Object Collections.Generic.Stack[int]
+        foreach ($bracket in [regex]::Matches($Text, '[\[\]]')) {
+            if ($bracket.Value -eq '[') { $stack.Push($bracket.Index); continue }
+            if ($stack.Count -eq 0) { continue }
+            $open = $stack.Pop()
+            $next = $bracket.Index + 1
+            if ($next -lt $Text.Length -and ($Text[$next] -eq [char]'(' -or $Text[$next] -eq [char]'[')) { $starts.Add($open) }
+        }
+        $starts.Sort()
+        return ,$starts
+    }
+
+    # Збіги якірного виразу з позицій-кандидатів зліва направо без
+    # перекриття — як [regex]::Matches, але без спроб з кожного символу.
+    function Find-BRAVODocAnchoredMatch {
+        param([string]$Text, $Start, [regex]$Pattern)
+        $found = New-Object Collections.Generic.List[object]
+        $end = -1
+        foreach ($s in $Start) {
+            if ($s -lt $end) { continue }
+            $m = $Pattern.Match($Text, $s)
+            if ($m.Success) { $found.Add($m); $end = $m.Index + $m.Length }
+        }
+        return ,$found
     }
 
     # Рід 1. Повертає масив "файл:рядок: причина -> ціль" (порожній = OK).
@@ -1703,16 +1785,19 @@
         $destinationPattern = '(?:[^()\s\\]|\\.|\((?:[^()\s\\]|\\.)*\))+'
         # Текст посилання — з довільною вкладеністю збалансованих дужок
         # ([outer [inner [detail]]](x.md)): балансувальна група .NET.
-        $linkTextPattern = '(?>[^\[\]]|\[(?<bracket>)|\](?<-bracket>))*(?(bracket)(?!))'
+        # Серії без дужок поглинаються атомарно цілими, тож незбалансований
+        # ряд `[` не дає квадратичного перебору посимвольно.
+        $linkTextPattern = '(?>[^\[\]]+|\[(?<bracket>)|\](?<-bracket>))*(?(bracket)(?!))'
         $linkPattern = '!?\[' + $linkTextPattern + '\]\(\s*(<[^>]*>|' + $destinationPattern + ')(?:\s+' + $titlePattern + ')?\s*\)'
-        $refPattern = '^\s{0,3}\[([^\]]+)\]:\s*(<[^>]*>|\S+)(\s+' + $titlePattern + ')?\s*$'
+        # [^1]: — визначення виноски, не посилання.
+        $refPattern = '^\s{0,3}\[(?!\^)([^\]]+)\]:\s*(<[^>]*>|\S+)(\s+' + $titlePattern + ')?\s*$'
         # Використання reference-посилання: [текст][мітка] або [мітка][].
         # Коротку форму [мітка] не перевіряємо: її не відрізнити від
         # звичайного тексту в квадратних дужках.
         $refUsePattern = '!?\[(' + $linkTextPattern + ')\]\[([^\]]*)\]'
+        $anchoredLinkRegex = New-Object regex ('\G' + $linkPattern)
+        $anchoredRefUseRegex = New-Object regex ('\G' + $refUsePattern)
         foreach ($mdPath in $MarkdownPath) {
-            $mdDir = ''
-            if ($mdPath.Contains('/')) { $mdDir = $mdPath.Substring(0, $mdPath.LastIndexOf('/')) }
             # Мітки нормалізуються як у CommonMark: регістр і пробіли не важать.
             $refDefined = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
             $refUsed = New-Object Collections.Generic.List[object]
@@ -1721,64 +1806,53 @@
                 # Синтаксис — у Masked (без коду, коментарів, екранувань),
                 # значення — з сирого тексту за тією самою позицією.
                 $blockText = $paragraph.Masked
-                foreach ($m in [regex]::Matches($blockText, $linkPattern)) {
+                $bracketStarts = Get-BRAVODocBracketStart -Text $blockText
+                $inlineLinkMatches = Find-BRAVODocAnchoredMatch -Text $blockText -Start $bracketStarts -Pattern $anchoredLinkRegex
+                $refUseMatches = Find-BRAVODocAnchoredMatch -Text $blockText -Start $bracketStarts -Pattern $anchoredRefUseRegex
+                foreach ($m in $inlineLinkMatches) {
                     $lineNumber = Get-BRAVODocParagraphLineNumber -Paragraph $paragraph -Index $m.Groups[1].Index
                     $targets.Add((New-Object PSObject -Property @{ Number = $lineNumber; Target = $paragraph.Text.Substring($m.Groups[1].Index, $m.Groups[1].Length) }))
                 }
-                foreach ($m in [regex]::Matches($blockText, $refUsePattern)) {
+                foreach ($m in $refUseMatches) {
+                    $linkText = $paragraph.Text.Substring($m.Groups[1].Index, $m.Groups[1].Length)
                     $label = $paragraph.Text.Substring($m.Groups[2].Index, $m.Groups[2].Length)
-                    if ($label.Trim().Length -eq 0) { $label = $paragraph.Text.Substring($m.Groups[1].Index, $m.Groups[1].Length) }
+                    if ($label.Trim().Length -eq 0) { $label = $linkText }
+                    # CommonMark: [текст][мітка] без визначення рендериться як
+                    # звичайний текст, тож дужки в прозі (`$m[0][1]`,
+                    # `[A-Z][a-z]+`) не є посиланням. Биттям вважаємо лише те,
+                    # що схоже на задум автора: мітка без regex-метасимволів
+                    # і зі словом (дві літери поспіль) або числова мітка при
+                    # тексті зі словом ([посібник][1]). Виноска `[^1]` має
+                    # метасимвол `^` і теж не є reference-посиланням.
+                    if ($label -match '[\\^$*+?{}|()]' -or
+                        -not ($label -match '\p{L}{2}' -or ($label -match '^\s*\d+\s*$' -and $linkText -match '\p{L}{2}'))) { continue }
                     $lineNumber = Get-BRAVODocParagraphLineNumber -Paragraph $paragraph -Index $m.Index
                     $refUsed.Add((New-Object PSObject -Property @{ Number = $lineNumber; Label = $label }))
                 }
-                # Reference-визначення валідні лише на початку абзацу.
+                # Reference-визначення валідні лише на початку абзацу —
+                # зокрема в цитаті чи пункті списку (`> [x]: ціль`,
+                # `- [x]: ціль`): префікс контейнера знімається.
                 for ($k = 0; $k -lt $paragraph.Lines.Count; $k++) {
                     $entry = $paragraph.Lines[$k]
                     $lineOffset = $paragraph.Offsets[$k].Offset
-                    $ref = [regex]::Match($blockText.Substring($lineOffset, $entry.Text.Length), $refPattern)
+                    $prefix = 0
+                    if ($null -ne $entry.Block -and $entry.Text.EndsWith($entry.Block)) { $prefix = $entry.Text.Length - $entry.Block.Length }
+                    $ref = [regex]::Match($blockText.Substring($lineOffset + $prefix, $entry.Text.Length - $prefix), $refPattern)
                     if (-not $ref.Success) { break }
-                    $refLabel = $entry.Text.Substring($ref.Groups[1].Index, $ref.Groups[1].Length)
+                    $refLabel = $entry.Text.Substring($prefix + $ref.Groups[1].Index, $ref.Groups[1].Length)
                     [void]$refDefined.Add(([regex]::Replace($refLabel.Trim(), '\s+', ' ')).ToLowerInvariant())
-                    $targets.Add((New-Object PSObject -Property @{ Number = $entry.Number; Target = $entry.Text.Substring($ref.Groups[2].Index, $ref.Groups[2].Length) }))
+                    $targets.Add((New-Object PSObject -Property @{ Number = $entry.Number; Target = $entry.Text.Substring($prefix + $ref.Groups[2].Index, $ref.Groups[2].Length) }))
                 }
 
                 foreach ($item in $targets) {
-                    $target = $item.Target.Trim('<', '>')
-                    $target = [regex]::Replace($target, '\\([!-/:-@\[-`{-~])', '$1')
-                    # Схема (https:, mailto:) або protocol-relative //хост — зовнішнє.
-                    # Одинарний / на GitHub — корінь репозиторію, перевіряється нижче.
-                    if ($target -match '^[A-Za-z][A-Za-z0-9+.-]*:' -or $target.StartsWith('//')) { continue }
-                    $hashIndex = $target.IndexOf('#')
-                    $pathPart = $target
-                    $fragment = ''
-                    if ($hashIndex -ge 0) {
-                        $pathPart = $target.Substring(0, $hashIndex)
-                        $fragment = $target.Substring($hashIndex + 1)
-                    }
-                    # ?запит не є частиною шляху файлу (README.md?plain=1).
-                    $queryIndex = $pathPart.IndexOf('?')
-                    if ($queryIndex -ge 0) { $pathPart = $pathPart.Substring(0, $queryIndex) }
-                    $pathPart = [Uri]::UnescapeDataString($pathPart)
-                    $resolved = $mdPath
-                    if ($pathPart.Length -gt 0) {
-                        $segments = New-Object Collections.Generic.List[string]
-                        $escapesRoot = $false
-                        $combined = $pathPart.TrimStart('/')
-                        if (-not $pathPart.StartsWith('/') -and $mdDir.Length -gt 0) { $combined = $mdDir + '/' + $pathPart }
-                        foreach ($segment in $combined.Split('/')) {
-                            if ($segment -eq '' -or $segment -eq '.') { continue }
-                            if ($segment -eq '..') {
-                                if ($segments.Count -eq 0) { $escapesRoot = $true; break }
-                                $segments.RemoveAt($segments.Count - 1)
-                                continue
-                            }
-                            $segments.Add($segment)
-                        }
-                        $resolved = ($segments.ToArray() -join '/')
-                        if ($escapesRoot -or $resolved.Length -eq 0 -or -not $known.Contains($resolved)) {
-                            $broken.Add(('{0}:{1}: файл не існує -> {2}' -f $mdPath, $item.Number, $target))
-                            continue
-                        }
+                    $link = Resolve-BRAVODocLinkTarget -MdPath $mdPath -Target $item.Target
+                    if ($link.External) { continue }
+                    $target = $link.Target
+                    $resolved = $link.Resolved
+                    $fragment = $link.Fragment
+                    if ($link.HasPath -and ($link.Escapes -or $resolved.Length -eq 0 -or -not $known.Contains($resolved))) {
+                        $broken.Add(('{0}:{1}: файл не існує -> {2}' -f $mdPath, $item.Number, $target))
+                        continue
                     }
                     if ($fragment.Length -gt 0 -and $resolved.EndsWith('.md') -and
                         (Test-Path -LiteralPath (Join-Path $Root $resolved) -PathType Leaf)) {
@@ -1850,8 +1924,16 @@
         # слово — явне рішення, а мертвий запис ловить перевірка реєстру.
         $functionCandidateFile = @{}
         $parsedFunctionSet = @{}
+        # Назви модулів: каталог modules/<назва> або вкладений файл модуля
+        # modules/…/<назва>.ps1|psm1|psd1 (BRAVO.Configuration.Schema).
+        $moduleNames = New-Object 'Collections.Generic.HashSet[string]' ([StringComparer]::Ordinal)
         foreach ($p in $KnownPath) {
             $parts = $p.Split('/')
+            if ($parts.Length -gt 2 -and $parts[0] -eq 'modules') {
+                [void]$moduleNames.Add($parts[1])
+                $moduleFile = [regex]::Match($parts[$parts.Length - 1], '^(.+)\.ps(?:m|d)?1$')
+                if ($moduleFile.Success) { [void]$moduleNames.Add($moduleFile.Groups[1].Value) }
+            }
             [void]$baseNames.Add($parts[$parts.Length - 1])
             if ($parts.Length -gt 1) { [void]$topDirs.Add($parts[0]) }
             if ($p -match '\.ps(m)?1$' -and $p -notmatch '^(selftest/|BRAVO_SELF_TEST)|(^|/)tests/') {
@@ -1895,7 +1977,19 @@
                     $lineNumber = Get-BRAVODocParagraphLineNumber -Paragraph $paragraph -Index $span.Index
                     $token = $span.Content.Trim()
                     if ($token.Length -eq 0) { continue }
-                    $firstWord = ($token -split '\s+')[0]
+                    # Виклик через оператор (`& Fn`, `. .\x.ps1`) чи хост
+                    # (`pwsh -File шлях`, `powershell.exe -File шлях`) —
+                    # перевіряється викликане, а не оператор чи хост.
+                    $words = @($token -split '\s+')
+                    $firstWord = $words[0]
+                    if (($firstWord -eq '&' -or $firstWord -eq '.') -and $words.Length -gt 1) { $firstWord = $words[1] }
+                    elseif ($firstWord -match '^(?i)(pwsh|powershell)(\.exe)?$') {
+                        $firstWord = ''
+                        for ($w = 1; $w -lt $words.Length - 1; $w++) {
+                            if ($words[$w] -match '^(?i)-File$') { $firstWord = $words[$w + 1]; break }
+                        }
+                        if ($firstWord.Length -eq 0) { continue }
+                    }
                     if ($firstWord -cmatch '^[A-Z][a-z]+(?:[A-Z][a-z]+)*-[A-Za-z][A-Za-z0-9]*$') {
                         if (& $isDefined $firstWord) { continue }
                         if ($exceptionByTarget.ContainsKey($firstWord)) { [void]$usedException.Add([string]$exceptionByTarget[$firstWord].Target); continue }
@@ -1921,8 +2015,7 @@
                     # Модуль — BRAVO.Назва з будь-якою кількістю компонентів
                     # (`BRAVO.DataRestore.MatrixTest`); `BRAVO.X.psm1` — файл.
                     if ($path -cmatch '^BRAVO(?:\.[A-Z][A-Za-z0-9]+)+$') {
-                        $modulePath = 'modules/' + $path
-                        if ($known.Contains($modulePath)) { continue }
+                        if ($moduleNames.Contains($path)) { continue }
                         if ($exceptionByTarget.ContainsKey($path)) { [void]$usedException.Add([string]$exceptionByTarget[$path].Target); continue }
                         $problems.Add(('{0}:{1}: модуля не існує в modules/ -> {2}' -f $mdPath, $lineNumber, $token))
                         continue
@@ -1948,7 +2041,7 @@
                 continue
             }
             if ($kind -ne 'Cmdlet' -and $kind -ne 'RuntimeGenerated') {
-                $exists = (& $isDefined $target) -or $known.Contains($target) -or $known.Contains('modules/' + $target) -or
+                $exists = (& $isDefined $target) -or $known.Contains($target) -or $moduleNames.Contains($target) -or
                     ($target.IndexOf('/') -lt 0 -and $baseNames.Contains($target))
                 if ($exists) {
                     $stale.Add(('{0} ({1}): ціль тепер існує в репозиторії — це вже звичайне посилання, прибрати з реєстру' -f $target, $kind))
@@ -1969,7 +2062,8 @@
         param([string]$FullPath)
         $counts = @{}
         foreach ($headingText in (Get-BRAVODocHeadingText -FullPath $FullPath)) {
-            $heading = [regex]::Match($headingText, '^(`?)(\d+(?:\.\d+)*)\1\.?(?:\s|$)')
+            # `5)` і екранований `3\.` рендеряться як «5)» / «3.».
+            $heading = [regex]::Match(($headingText -replace '^(\d+(?:\.\d+)*)\\([.)])', '$1$2'), '^(`?)(\d+(?:\.\d+)*)\1[.)]?(?:\s|$)')
             if (-not $heading.Success) { continue }
             $number = $heading.Groups[2].Value
             $seen = 0
@@ -1989,10 +2083,19 @@
         $known = Get-BRAVODocKnownPathSet -KnownPath $KnownPath
         $sectionCache = @{}
         $problems = New-Object Collections.Generic.List[string]
-        # Назва документа: `X.md`, X.md або посилання [X.md](ціль) /
-        # [`X.md`](ціль) — перевіряється названий документ.
+        # Назва документа: `X.md`, X.md (від кореня репозиторію) або
+        # посилання [X.md](ціль) / [`X.md`](ціль) — тоді перевіряється ЦІЛЬ,
+        # розібрана як у навігаційному посиланні (від каталогу документа).
         $docName = '(?<doc>(?:[A-Za-z0-9_.-]+/)*[A-Za-z0-9_.-]+\.md)'
-        $doc = '(?:\[`?' + $docName + '`?\]\([^)\s]*\)|`?' + $docName + '`?)'
+        $doc = '(?:\[`?' + $docName + '`?\]\((?<dest>[^)\s]*)\)|`?' + $docName + '`?)'
+        $docOf = {
+            param($Match)
+            if (-not $Match.Groups['dest'].Success) { return $Match.Groups['doc'].Value }
+            $link = Resolve-BRAVODocLinkTarget -MdPath $mdPath -Target $Match.Groups['dest'].Value
+            if ($link.External) { return $null }
+            if ($link.Escapes) { return '' }
+            return $link.Resolved
+        }
         $word = '(?:[Рр]озділ[а-яіїєґ]*|§)'
         # Номер або перелік/діапазон номерів до того самого документа:
         # «розділи 2 і 5.3», «розділи 3–7», «§1, 2». Перевіряється кожен
@@ -2017,11 +2120,15 @@
                 $claimed = New-Object 'Collections.Generic.HashSet[int]'
                 foreach ($m in [regex]::Matches($text, $docThenNumber)) {
                     [void]$claimed.Add($m.Groups['num'].Index)
-                    $refs.Add((New-Object PSObject -Property @{ Index = $m.Index; Doc = $m.Groups['doc'].Value; Number = $m.Groups['num'].Value; Text = $m.Value }))
+                    $refDoc = & $docOf $m
+                    if ($null -eq $refDoc) { continue }
+                    $refs.Add((New-Object PSObject -Property @{ Index = $m.Index; Doc = $refDoc; Number = $m.Groups['num'].Value; Text = $m.Value }))
                 }
                 foreach ($m in [regex]::Matches($text, $numberThenDoc)) {
                     if (-not $claimed.Add($m.Groups['num'].Index)) { continue }
-                    $refs.Add((New-Object PSObject -Property @{ Index = $m.Index; Doc = $m.Groups['doc'].Value; Number = $m.Groups['num'].Value; Text = $m.Value }))
+                    $refDoc = & $docOf $m
+                    if ($null -eq $refDoc) { continue }
+                    $refs.Add((New-Object PSObject -Property @{ Index = $m.Index; Doc = $refDoc; Number = $m.Groups['num'].Value; Text = $m.Value }))
                 }
                 foreach ($m in [regex]::Matches($text, $nameThenSign)) {
                     if (-not $claimed.Add($m.Groups['num'].Index)) { continue }
@@ -2198,7 +2305,10 @@
     # URL-и, абсолютні шляхи й #якір в inline-шляху; модулі з кількома
     # крапками; вкладені дужки в тексті посилання; заголовки в цитаті й
     # пункті; кореневий fence із відступом 2; бектик, що не з'єднується
-    # через межу пункту чи цитати.
+    # через межу пункту чи цитати; вкладений файл модуля; ціль посилання
+    # як документ розділу (docs/sections.md); визначення в `>`/`- `;
+    # виноски; дужки в прозі; id на будь-якому тезі; багаторядковий
+    # Setext; `& Fn` і `pwsh -File`; заголовки `5)` і `3\.`.
     $docFixtureRoot = Join-Path ([IO.Path]::GetTempPath()) ("BRAVO_DOCREF_{0}" -f [guid]::NewGuid().ToString('N'))
     try {
         $utf8NoBom = New-Object Text.UTF8Encoding($false)
@@ -2206,6 +2316,7 @@
         [void][IO.Directory]::CreateDirectory((Join-Path $docFixtureRoot 'modules\BRAVO.Fixture'))
         [void][IO.Directory]::CreateDirectory((Join-Path $docFixtureRoot 'modules\BRAVO.Fixture.Sub'))
         [IO.File]::WriteAllText((Join-Path $docFixtureRoot 'modules\BRAVO.Fixture.Sub\BRAVO.Fixture.Sub.psm1'), "# fixture`n", $utf8NoBom)
+        [IO.File]::WriteAllText((Join-Path $docFixtureRoot 'modules\BRAVO.Fixture\BRAVO.Fixture.Nested.psm1'), "# fixture`n", $utf8NoBom)
         [void][IO.Directory]::CreateDirectory((Join-Path $docFixtureRoot 'selftest'))
         # Оголошення в here-string робочого модуля і stub у self-test-і не
         # визначають функцію.
@@ -2256,7 +2367,29 @@
                     '',
                     '## A &amp; B',
                     '',
-                    '## Код `&amp;`'
+                    '## Код `&amp;`',
+                    '',
+                    '<h2 id="html-h2">Html</h2> <span id="span-id">x</span> <span name="span-name">y</span>',
+                    '',
+                    'Багато рядків',
+                    'заголовок Setext',
+                    '===',
+                    '',
+                    '## Посилання [ref-text][r] тут',
+                    '',
+                    '[r]: ../README.md'
+                ) -join "`n"), $utf8NoBom)
+        # Посилання на розділи з документа в підкаталозі: ціль посилання —
+        # від каталогу документа; заголовки `5)` і `3\.`.
+        [IO.File]::WriteAllText((Join-Path $docFixtureRoot 'docs\sections.md'), (@(
+                    'Див. розділ 1 [guide.md](guide.md) і [README.md](../README.md), розділ 3; розділ 1 [README.md](README.md); [guide.md](/docs/guide.md), розділ 9.',
+                    '',
+                    '## 5) Дужка',
+                    '',
+                    '3\. Екранований',
+                    '---------------',
+                    '',
+                    'Тут §5, §3 і §6.'
                 ) -join "`n"), $utf8NoBom)
         [IO.File]::WriteAllText((Join-Path $docFixtureRoot 'README.md'), (@(
                     '[ok-file](docs/guide.md)',
@@ -2363,10 +2496,27 @@
                     '- [bad-list-after-tick](docs/missing-list-after-tick.md) `',
                     '',
                     'Ще непарний `',
-                    '> [bad-quote-after-tick](docs/missing-quote-after-tick.md) `'
+                    '> [bad-quote-after-tick](docs/missing-quote-after-tick.md) `',
+                    '',
+                    '`BRAVO.Fixture.Nested` `BRAVO.Fixture.Absent` `& Remove-BRAVOAmpGone` `& Get-BRAVOFixtureDefined` `pwsh -File ci\MissingHost.ps1` `powershell.exe -File modules\BRAVO.Fixture\BRAVO.Fixture.psm1` `pwsh -Command x`',
+                    '[README.md](docs/guide.md), розділ 3.',
+                    '',
+                    '[in-quote-def][qd] [in-item-def][ld]',
+                    '> [qd]: docs/missing-quote-def.md',
+                    '',
+                    '- [ld]: docs/guide.md',
+                    '',
+                    'Виноска[^1] тут.',
+                    '',
+                    '[^1]: Примітка.',
+                    '',
+                    '$m[0][1] і [A-Z][a-z]+ у прозі; [посібник][1] і [guide][missing-word].',
+                    '[ok-h2](docs/guide.md#html-h2) [ok-span](docs/guide.md#span-id) [bad-span-name](docs/guide.md#span-name)',
+                    '[ok-multi-setext](docs/guide.md#багато-рядківзаголовок-setext) [bad-multi-setext](docs/guide.md#багато-рядків-заголовок-setext) [ok-ref-heading](docs/guide.md#посилання-ref-text-тут)'
                 ) -join "`n"), $utf8NoBom)
         $docFixtureKnown = @('README.md', 'VERSION.json', 'docs/guide.md', 'docs/spec(v2).md', 'modules/BRAVO.Fixture/BRAVO.Fixture.psm1',
-            'modules/BRAVO.Fixture.Sub/BRAVO.Fixture.Sub.psm1', 'selftest/BRAVO_SELF_TEST.Fixture.ps1')
+            'modules/BRAVO.Fixture.Sub/BRAVO.Fixture.Sub.psm1', 'modules/BRAVO.Fixture/BRAVO.Fixture.Nested.psm1', 'docs/sections.md',
+            'selftest/BRAVO_SELF_TEST.Fixture.ps1')
 
         $linkFixtureResult = @(Find-BRAVOBrokenDocLink -Root $docFixtureRoot -MarkdownPath @('README.md', 'docs/guide.md') -KnownPath $docFixtureKnown)
         $linkFixtureExpected = @(
@@ -2398,7 +2548,12 @@
             'README.md:99: файл не існує -> docs/missing-after-root-fence.md',
             'README.md:102: файл не існує -> docs/missing-list-after-tick.md',
             'README.md:105: файл не існує -> docs/missing-quote-after-tick.md',
-            'README.md:26: reference-визначення не існує -> [missing-label]'
+            'README.md:111: файл не існує -> docs/missing-quote-def.md',
+            'README.md:120: якір не існує -> docs/guide.md#span-name',
+            'README.md:121: якір не існує -> docs/guide.md#багато-рядків-заголовок-setext',
+            'README.md:26: reference-визначення не існує -> [missing-label]',
+            'README.md:119: reference-визначення не існує -> [1]',
+            'README.md:119: reference-визначення не існує -> [missing-word]'
         )
         Test-BRAVOCondition `
             -Condition (($linkFixtureResult -join '|') -eq ($linkFixtureExpected -join '|')) `
@@ -2436,7 +2591,10 @@
             'README.md:71: функцію не визначено -> Normalize-SFTPPath',
             'README.md:84: шлях не існує в репозиторії -> docs/missing-frag.md#x',
             'README.md:92: функцію не визначено -> ConvertTo-FixtureGone',
-            'README.md:92: модуля не існує в modules/ -> BRAVO.Fixture.Gone'
+            'README.md:92: модуля не існує в modules/ -> BRAVO.Fixture.Gone',
+            'README.md:107: модуля не існує в modules/ -> BRAVO.Fixture.Absent',
+            'README.md:107: функцію не визначено -> Remove-BRAVOAmpGone',
+            'README.md:107: шлях не існує в репозиторії -> pwsh -File ci\MissingHost.ps1'
         )
         $staleFixtureExpected = @(
             'Get-BRAVOFixtureDefined (Historical): ціль тепер існує в репозиторії — це вже звичайне посилання, прибрати з реєстру',
@@ -2457,7 +2615,7 @@
             -Name "Documentation/InlineReferenceExceptionsCheckIsMeaningful" `
             -Failure ("історичний виняток із наявною ціллю мав бути мертвим, отримано [{0}]" -f (@($revivedFixture.StaleExceptions) -join ' | '))
 
-        $sectionFixtureResult = @(Find-BRAVODocSectionReferenceProblem -Root $docFixtureRoot -MarkdownPath @('README.md') -KnownPath $docFixtureKnown)
+        $sectionFixtureResult = @(Find-BRAVODocSectionReferenceProblem -Root $docFixtureRoot -MarkdownPath @('README.md', 'docs/sections.md') -KnownPath $docFixtureKnown)
         $sectionFixtureExpected = @(
             'README.md:22: розділу 4 немає в docs/guide.md -> Розділ 4 `docs/guide.md`',
             'README.md:22: номер розділу 2 неоднозначний (2 заголовки в docs/guide.md) -> `docs/guide.md`, розділ 2',
@@ -2469,7 +2627,11 @@
             'README.md:70: розділу 4 немає в docs/guide.md -> `docs/guide.md`, розділ `4`',
             'README.md:70: розділу 9 немає в docs/guide.md -> `docs/guide.md`, розділи `1` і `9`',
             'README.md:83: розділу 11 немає в docs/guide.md -> Розділ 11 [docs/guide.md](docs/guide.md)',
-            'README.md:83: розділу 13 немає в docs/guide.md -> [docs/guide.md](docs/guide.md) розділ 13'
+            'README.md:83: розділу 13 немає в docs/guide.md -> [docs/guide.md](docs/guide.md) розділ 13',
+            'README.md:108: розділу 3 немає в docs/guide.md -> [README.md](docs/guide.md), розділ 3',
+            'docs/sections.md:1: документа не існує -> розділ 1 [README.md](README.md)',
+            'docs/sections.md:1: розділу 9 немає в docs/guide.md -> [guide.md](/docs/guide.md), розділ 9',
+            'docs/sections.md:8: розділу 6 немає в docs/sections.md -> §6'
         )
         Test-BRAVOCondition `
             -Condition (($sectionFixtureResult -join '|') -eq ($sectionFixtureExpected -join '|')) `
