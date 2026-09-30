@@ -50,6 +50,20 @@
   `Notifications/DiscordChunksJoinWithLineFeed`, `Notifications/DiscordChunkerHasSingleDefinition` і
   `Notifications/DiscordChunkerEdgeCases` (порожнє повідомлення, `$null`, межа `MaximumLength`,
   відхилення `MaximumLength` поза 100..2000).
+- **DataRestore надсилає сповіщення через `Send-BRAVONotification` (BRAVO-T023, крок 2).**
+  `Send-BRAVODataRestoreNotification` більше не збирає власний ланцюжок
+  route → endpoint → payload → доставка, а викликає канонічну `Send-BRAVONotification`.
+  У неї додано перемикач `-SkipWhenEndpointUnavailable`: ненастроєний webhook
+  повертає `Sent = $false`, `Reason = 'EndpointUnavailable'` замість винятку. Тож
+  DataRestore, як і раніше, пише WARNING «не налаштовано — сповіщення пропущено» без
+  збільшення лічильника WARNING, а збій доставки лишається окремою подією. Інші
+  виклики `Send-BRAVONotification` без перемикача поводяться як раніше. Єдина
+  відмінність для оператора: відомості про хост для тексту сповіщення тепер
+  збираються й тоді, коли webhook не налаштовано. Нові самотести
+  `DataRestore/NotificationMissingEndpointSkipsWithoutWarningCount` і
+  `DataRestore/NotificationDeliveryFailureCountsWarning`: збій доставки при
+  налаштованому webhook, на відміну від ненастроєного, збільшує лічильник
+  WARNING рівно на 1 і не виходить за межі функції.
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
