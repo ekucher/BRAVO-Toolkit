@@ -742,10 +742,30 @@ function Get-BRAVOExpectedSchedulerPrincipal {
     }
 }
 
+function ConvertTo-BRAVOSchedulerExecutionTimeLimit {
+    # Канонічна конверсія schedulerSettings.<Task>.ExecutionTimeLimitHours у
+    # тривалість. Нею BRAVO_TASKS_INSTALL.ps1 будує Settings.ExecutionTimeLimit
+    # задачі Планувальника, і нею ж Get-BRAVOOperationLockWaitBudget читає той
+    # самий ліміт — тож бюджет очікування lock і фактичний ліміт задачі не
+    # можуть розійтися через різне тлумачення одного значення.
+    #
+    # Приведення [double] у PowerShell не залежить від CurrentCulture
+    # (InvariantCulture і в Windows PowerShell 5.1, і в 7.x): 0.5 -> 30 хв на
+    # сервері з uk-UA/de-DE так само, як з en-US. Нечислове значення, NaN чи
+    # нескінченність — виняток, як і раніше в інсталяторі.
+    [CmdletBinding()]
+    [OutputType([timespan])]
+    param(
+        [Parameter(Mandatory = $true)][AllowNull()][object]$Hours
+    )
+
+    return [timespan]::FromHours([double]$Hours)
+}
+
 function Get-BRAVOOperationLockWaitBudget {
     # Канонічний бюджет очікування спільного операційного lock
-    # (BRAVO_OPERATION.lock) для прогону, що виконується як задача
-    # Планувальника типу $TaskType.
+    # (BRAVO_OPERATION.lock) для прогону, що відповідає задачі Планувальника
+    # типу $TaskType.
     #
     # Причина (T025): schedulerSettings.OperationLockWaitMinutes — один
     # глобальний ліміт для всіх задач (типово 360 хв), а ExecutionTimeLimit
@@ -753,16 +773,17 @@ function Get-BRAVOOperationLockWaitBudget {
     # lock довгої архівації, чекав до 6 год, і Планувальник примусово
     # завершував процес на 2-й годині: без підсумку в журналі, без коду з
     # контракту BRAVO.ExitCodes (лише "задачу зупинено" в історії задачі).
+    # Тепер вичерпаний бюджет — штатна відмова викликача (SkippedLockBusy).
     #
-    # Ліміт задачі береться з того самого schedulerSettings.<TaskType>.
-    # ExecutionTimeLimitHours, з якого BRAVO_TASKS_INSTALL.ps1 будує
-    # Settings.ExecutionTimeLimit — окремої таблиці лімітів тут немає.
+    # Ліміт задачі — той самий schedulerSettings.<TaskType>.
+    # ExecutionTimeLimitHours і та сама конверсія
+    # (ConvertTo-BRAVOSchedulerExecutionTimeLimit), з яких BRAVO_TASKS_INSTALL
+    # будує Settings.ExecutionTimeLimit — окремої таблиці лімітів тут немає.
     #
-    # Запас (30 хв, $marginMinutes нижче) лишає
-    # час на роботу ПІСЛЯ захоплення lock і на штатне завершення з кодом
-    # SkippedLockBusy, якщо lock так і не звільнився:
-    #   - той самий запас уже закладено для задачі того самого 2-годинного
-    #     класу — Health.BusyWaitMinutes обмежено 0..90 хв при ліміті 2 год
+    # Запас 30 хв лишає час на роботу ПІСЛЯ захоплення lock і на штатне
+    # завершення з SkippedLockBusy, якщо lock так і не звільнився:
+    #   - та сама політика вже діє для задачі того самого 2-годинного класу:
+    #     Health.BusyWaitMinutes обмежено 0..90 хв при ліміті 2 год
     #     (BRAVO_CONFIG_LOADER.ps1: "очікування мусить лишати запас");
     #   - сам BAZASync на реальних серверах тримає lock ~16-17 хв (логи,
     #     зафіксовані в BRAVO.Health.Runtime.ps1 біля BusyWaitMinutes) —
@@ -770,9 +791,20 @@ function Get-BRAVOOperationLockWaitBudget {
     #   - цикл очікування перевіряє дедлайн з кроком Start-Sleep 30 с, тож
     #     перевищення дедлайну циклом — секунди, а не хвилини.
     #
+    # Ліміт задачі не більший за запас: бюджет 0 — рівно одна спроба
+    # захоплення без очікування; якщо lock зайнятий, прогін одразу
+    # завершується штатною відмовою, а не чекає, доки його вб'є Планувальник.
+    #
+    # Бюджет не залежить від того, чи прогін запущено Планувальником, чи
+    # вручну: надійної ознаки запуску Планувальником немає (-NoPause так само
+    # передають і ручні/скриптові запуски), а однаковий командний рядок
+    # мусить поводитися однаково. Для ручного запуску це лише коротше
+    # очікування з тим самим штатним SkippedLockBusy.
+    #
     # Без відомого ліміту задачі (legacy-конфіг без вузла/ключа, або
-    # нечислове чи недодатне значення) бюджет НЕ змінюється — зберігається
-    # попередня поведінка: обмежувати немає чим.
+    # значення, яке не конвертується чи недодатне) бюджет НЕ змінюється —
+    # зберігається попередня поведінка: з такою конфігурацією
+    # BRAVO_TASKS_INSTALL задачу не встановив би, тож обмежувати немає чим.
     [CmdletBinding()]
     param(
         [Parameter(Mandatory = $true)][AllowNull()][System.Collections.IDictionary]$SchedulerSettings,
@@ -789,15 +821,13 @@ function Get-BRAVOOperationLockWaitBudget {
         $SchedulerSettings.Contains($TaskType) -and
         $SchedulerSettings[$TaskType] -is [System.Collections.IDictionary] -and
         $SchedulerSettings[$TaskType].Contains('ExecutionTimeLimitHours')) {
-        $limitHours = [double]0
-        if ([double]::TryParse(
-                [string]$SchedulerSettings[$TaskType].ExecutionTimeLimitHours,
-                [System.Globalization.NumberStyles]::Float,
-                [System.Globalization.CultureInfo]::InvariantCulture,
-                [ref]$limitHours) -and
-            $limitHours -gt 0 -and
-            -not [double]::IsInfinity($limitHours)) {
-            $taskLimitMinutes = [int][math]::Floor($limitHours * 60)
+        try {
+            $taskLimit = ConvertTo-BRAVOSchedulerExecutionTimeLimit -Hours $SchedulerSettings[$TaskType].ExecutionTimeLimitHours
+            if ($taskLimit.Ticks -gt 0) {
+                $taskLimitMinutes = [int][math]::Floor($taskLimit.TotalMinutes)
+            }
+        } catch {
+            $taskLimitMinutes = $null
         }
     }
 
@@ -812,6 +842,13 @@ function Get-BRAVOOperationLockWaitBudget {
         }
     }
 
+    # Єдиний операторський текст про обмеження — обидва викликачі
+    # (Archive, Maintenance) дописують його до повідомлення про тайм-аут.
+    $limitDescription = ''
+    if ($capped) {
+        $limitDescription = " (OperationLockWaitMinutes=$configuredMinutes обмежено лімітом виконання задачі $TaskType $taskLimitMinutes хв мінус запас $marginMinutes хв)"
+    }
+
     return [pscustomobject]@{
         TaskType = $TaskType
         ConfiguredMinutes = $configuredMinutes
@@ -819,5 +856,6 @@ function Get-BRAVOOperationLockWaitBudget {
         SafetyMarginMinutes = $marginMinutes
         EffectiveMinutes = [int]$effectiveMinutes
         Capped = $capped
+        LimitDescription = $limitDescription
     }
 }

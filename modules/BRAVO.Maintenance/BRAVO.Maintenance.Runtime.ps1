@@ -1046,11 +1046,7 @@ function Enter-BRAVOMaintenanceOperationLock {
             -SchedulerSettings $schedulerSettings `
             -TaskType $TaskType
         $waitMinutes = $lockWaitBudget.EffectiveMinutes
-        $waitLimitDescription = if ($lockWaitBudget.Capped) {
-            " (OperationLockWaitMinutes=$($lockWaitBudget.ConfiguredMinutes) обмежено лімітом виконання задачі $($lockWaitBudget.TaskType) $($lockWaitBudget.TaskLimitMinutes) хв мінус запас $($lockWaitBudget.SafetyMarginMinutes) хв)"
-        } else {
-            ''
-        }
+        $waitLimitDescription = [string]$lockWaitBudget.LimitDescription
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $stream = $null
         $lastLockError = $null
@@ -8250,7 +8246,10 @@ if (-not $maintenanceLockResult.Success) {
         "lock=$($maintenanceLockResult.Path); $($maintenanceLockResult.Error)"
     ) -Level "ERROR"
     Complete-BRAVOProgress
-    exit 20
+    # Код з канонічного контракту BRAVO.ExitCodes (SkippedLockBusy = 20),
+    # а не літерал: ця ж гілка тепер завершує й вичерпаний бюджет очікування
+    # lock (T025) замість примусового зупинення задачі Планувальником.
+    exit (Resolve-BRAVOExitCode -LockBusy)
 }
 $script:maintenanceOperationLock = $maintenanceLockResult.Stream
 $script:maintenanceOperationLockPath = $maintenanceLockResult.Path

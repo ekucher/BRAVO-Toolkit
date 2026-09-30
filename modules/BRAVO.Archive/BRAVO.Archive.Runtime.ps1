@@ -6023,11 +6023,7 @@ function Enter-BRAVOArchiveProcessLock {
             -SchedulerSettings $schedulerSettings `
             -TaskType $TaskType
         $waitMinutes = $lockWaitBudget.EffectiveMinutes
-        $waitLimitDescription = if ($lockWaitBudget.Capped) {
-            " (OperationLockWaitMinutes=$($lockWaitBudget.ConfiguredMinutes) обмежено лімітом виконання задачі $($lockWaitBudget.TaskType) $($lockWaitBudget.TaskLimitMinutes) хв мінус запас $($lockWaitBudget.SafetyMarginMinutes) хв)"
-        } else {
-            ''
-        }
+        $waitLimitDescription = [string]$lockWaitBudget.LimitDescription
         $deadline = (Get-Date).AddMinutes($waitMinutes)
         $lockStream = $null
         $lastLockError = $null
