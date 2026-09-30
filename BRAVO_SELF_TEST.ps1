@@ -4088,6 +4088,27 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         ) `
         -Name "Notifications/DiscordChunksJoinWithLineFeed" `
         -Failure "частини Discord мають з'єднувати рядки LF (без CR) і заповнюватись до MaximumLength; отримано частин: $($discordChunkLines.Count)"
+    # Крайові випадки єдиного чанкера: порожнє повідомлення і $null дають
+    # рівно одну порожню частину (виклик без повідомлення не губить
+    # надсилання); рядок довжиною рівно MaximumLength — одна частина, на
+    # один символ довший — дві, і жодна не перевищує межі; MaximumLength
+    # поза 100..2000 відхиляється, а не тихо ламає розбиття.
+    $discordEmptyChunks = @(Split-DiscordNotificationText -Message '')
+    $discordNullChunks = @(Split-DiscordNotificationText -Message $null)
+    $discordExactChunks = @(Split-DiscordNotificationText -Message ('b' * 1900) -MaximumLength 1900)
+    $discordOverChunks = @(Split-DiscordNotificationText -Message ('b' * 1901) -MaximumLength 1900)
+    $discordRangeRejected = $false
+    try { [void](Split-DiscordNotificationText -Message 'x' -MaximumLength 99) } catch { $discordRangeRejected = $true }
+    Test-BRAVOCondition `
+        -Condition (
+            $discordEmptyChunks.Count -eq 1 -and $discordEmptyChunks[0] -eq '' -and
+            $discordNullChunks.Count -eq 1 -and $discordNullChunks[0] -eq '' -and
+            $discordExactChunks.Count -eq 1 -and $discordExactChunks[0].Length -eq 1900 -and
+            $discordOverChunks.Count -eq 2 -and $discordOverChunks[0].Length -eq 1900 -and $discordOverChunks[1] -eq 'b' -and
+            $discordRangeRejected
+        ) `
+        -Name "Notifications/DiscordChunkerEdgeCases" `
+        -Failure "чанкер Discord: порожнє/null -> одна порожня частина, рівно MaximumLength -> одна частина, +1 символ -> дві, MaximumLength < 100 відхиляється; отримано: empty=$($discordEmptyChunks.Count) null=$($discordNullChunks.Count) exact=$($discordExactChunks.Count) over=$($discordOverChunks.Count) rangeRejected=$discordRangeRejected"
     $discordChunkerDefinitions = New-Object System.Collections.Generic.List[string]
     foreach ($productionScript in @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File -Include '*.ps1', '*.psm1')) {
         $productionAst = [Management.Automation.Language.Parser]::ParseFile($productionScript.FullName, [ref]$null, [ref]$null)

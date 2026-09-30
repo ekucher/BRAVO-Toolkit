@@ -9,7 +9,9 @@
   `[Environment]::NewLine`, тобто CRLF на Windows), межі `MaximumLength` перевіряються, порожнє
   повідомлення дає одну порожню частину. Для оператора змінюється лише те, що довгі
   Discord-повідомлення поза Archive можуть ділитися на трохи менше частин. Нові самотести
-  `Notifications/DiscordChunksJoinWithLineFeed` і `Notifications/DiscordChunkerHasSingleDefinition`.
+  `Notifications/DiscordChunksJoinWithLineFeed`, `Notifications/DiscordChunkerHasSingleDefinition` і
+  `Notifications/DiscordChunkerEdgeCases` (порожнє повідомлення, `$null`, межа `MaximumLength`,
+  відхилення `MaximumLength` поза 100..2000).
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
