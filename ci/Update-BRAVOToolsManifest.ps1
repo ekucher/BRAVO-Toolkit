@@ -67,24 +67,13 @@ foreach ($name in $recorded.Keys) {
     }
 }
 
-if ($changes.Count -eq 0) {
-    Write-Host "TOOLS_MANIFEST.json актуальний: розбіжностей немає (файлів: $($currentHashes.Count))." -ForegroundColor Green
-    exit 0
-}
-
-Write-Host "Розбіжності між Tools/ і TOOLS_MANIFEST.json:" -ForegroundColor Yellow
-$changes | ForEach-Object { Write-Host "  $_" }
-
-if (-not $Apply) {
-    Write-Host ""
-    Write-Host "Нічого не записано. Якщо ці зміни свідомі (ви самі замінили бінарник з офіційного джерела), запустіть з -Apply." -ForegroundColor Yellow
-    exit 0
-}
-
 # BRAVO-T021: хеш без походження засвідчує лише "так було в коміті".
 # Тому -Apply відмовляє, доки для КОЖНОГО інструмента в provenance немає
 # запису з тим самим sha256 і полями, за якими рецензент незалежно
 # відтворить довіру (див. provenanceProcedure у самому маніфесті).
+# Перевірка стоїть ДО виходу "розбіжностей немає": інакше -Apply
+# звітував би успіх для маніфесту, у якому provenance видалили,
+# застарів чи досі описує видалений інструмент, а хеші в tools збігаються.
 $provenanceProblems = New-Object System.Collections.Generic.List[string]
 $provenanceByName = @{}
 if ($manifest.PSObject.Properties.Name -contains 'provenance' -and $null -ne $manifest.provenance) {
@@ -107,18 +96,45 @@ foreach ($name in $currentHashes.Keys) {
     if (-not [string]::Equals([string]$entry.sha256, $currentHashes[$name], [System.StringComparison]::OrdinalIgnoreCase)) {
         [void]$provenanceProblems.Add("$name — provenance.sha256 не дорівнює фактичному хешу $($currentHashes[$name])")
     }
+    # Для upstreamVerified=true рецензент мусить мати змогу відтворити
+    # перевірку: завантажити пакет (packageSha256) і знайти в ньому саме
+    # цей файл (packageMember).
+    if ([string]$entry.upstreamVerified -eq 'True') {
+        if ($entry.PSObject.Properties.Name -notcontains 'packageSha256' -or
+            [string]$entry.packageSha256 -notmatch '^[0-9A-Fa-f]{64}$') {
+            [void]$provenanceProblems.Add("$name — upstreamVerified=true без SHA-256 пакета (packageSha256)")
+        }
+        if ($entry.PSObject.Properties.Name -notcontains 'packageMember' -or
+            [string]::IsNullOrWhiteSpace([string]$entry.packageMember)) {
+            [void]$provenanceProblems.Add("$name — upstreamVerified=true без шляху файлу в пакеті (packageMember)")
+        }
+    }
 }
 foreach ($name in $provenanceByName.Keys) {
     if (-not $currentHashes.Contains($name)) {
         [void]$provenanceProblems.Add("$name — запис provenance для інструмента, якого більше немає у Tools/")
     }
 }
-if ($provenanceProblems.Count -gt 0) {
+if ($Apply -and $provenanceProblems.Count -gt 0) {
     Write-Host ""
     Write-Host "Нічого не записано: походження інструментів не зафіксовано (provenance у TOOLS_MANIFEST.json):" -ForegroundColor Red
     $provenanceProblems | ForEach-Object { Write-Host "  $_" -ForegroundColor Red }
     Write-Host "Додайте або оновіть запис provenance для кожного нового чи зміненого бінарника й повторіть -Apply." -ForegroundColor Red
     exit 1
+}
+
+if ($changes.Count -eq 0) {
+    Write-Host "TOOLS_MANIFEST.json актуальний: розбіжностей немає (файлів: $($currentHashes.Count))." -ForegroundColor Green
+    exit 0
+}
+
+Write-Host "Розбіжності між Tools/ і TOOLS_MANIFEST.json:" -ForegroundColor Yellow
+$changes | ForEach-Object { Write-Host "  $_" }
+
+if (-not $Apply) {
+    Write-Host ""
+    Write-Host "Нічого не записано. Якщо ці зміни свідомі (ви самі замінили бінарник з офіційного джерела), запустіть з -Apply." -ForegroundColor Yellow
+    exit 0
 }
 
 $manifest.tools = [pscustomobject]$currentHashes

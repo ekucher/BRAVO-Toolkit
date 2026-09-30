@@ -3097,6 +3097,11 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                 [string]$toolProvenanceEntry.packageSha256 -notmatch '^[0-9A-Fa-f]{64}$')) {
             [void]$toolProvenanceProblems.Add("$($toolProperty.Name): upstreamVerified=true без SHA-256 пакета (packageSha256)")
         }
+        if ([string]$toolProvenanceEntry.upstreamVerified -eq 'True' -and (
+                @($toolProvenanceEntry.PSObject.Properties.Name) -notcontains 'packageMember' -or
+                [string]::IsNullOrWhiteSpace([string]$toolProvenanceEntry.packageMember))) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): upstreamVerified=true без шляху файлу в пакеті (packageMember)")
+        }
     }
     foreach ($provenanceName in $toolProvenanceByName.Keys) {
         if (@($repositoryToolManifest.tools.PSObject.Properties.Name) -notcontains $provenanceName) {
@@ -3114,11 +3119,15 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
     # корені: без запису provenance, з застарілим provenance.sha256 і з
     # provenance для видаленого інструмента він мусить завершитися кодом 1
     # і НЕ змінити маніфест; з повним provenance — записати новий хеш.
+    # NoChangeStaleProvenance: хеші в tools уже актуальні, але provenance
+    # застарів — -Apply однаково мусить відмовити (код 1), а не звітувати
+    # "розбіжностей немає". VerifiedWithoutPackageMember: upstreamVerified=true
+    # без packageMember не дає відтворити перевірку — відмова.
     & {
         $updaterScript = Join-Path $root 'ci\Update-BRAVOToolsManifest.ps1'
         $updaterHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
         $updaterOutcomes = New-Object System.Collections.Generic.List[string]
-        foreach ($updaterScenario in @('MissingProvenance', 'StaleProvenanceHash', 'DeletedToolProvenance', 'CompleteProvenance')) {
+        foreach ($updaterScenario in @('MissingProvenance', 'StaleProvenanceHash', 'DeletedToolProvenance', 'NoChangeStaleProvenance', 'VerifiedWithoutPackageMember', 'CompleteProvenance')) {
             $updaterRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_T021_UPDATER_{0}' -f [guid]::NewGuid().ToString('N'))
             try {
                 $updaterTools = Join-Path $updaterRoot 'Tools'
@@ -3132,6 +3141,7 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                     retrievedAt = '2026-09-30'; upstreamVerified = $false
                 }
                 $updaterProvenance = @{}
+                $updaterRecordedTools = @{}
                 switch ($updaterScenario) {
                     'MissingProvenance' { }
                     'StaleProvenanceHash' { $updaterEntry.sha256 = ('0' * 64); $updaterProvenance['fixture.exe'] = $updaterEntry }
@@ -3142,10 +3152,18 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                             retrievedAt = '2026-09-30'; upstreamVerified = $false
                         }
                     }
+                    'NoChangeStaleProvenance' {
+                        $updaterRecordedTools['fixture.exe'] = $updaterToolHash
+                        $updaterEntry.sha256 = ('0' * 64); $updaterProvenance['fixture.exe'] = $updaterEntry
+                    }
+                    'VerifiedWithoutPackageMember' {
+                        $updaterEntry.upstreamVerified = $true; $updaterEntry.packageSha256 = ('A' * 64)
+                        $updaterProvenance['fixture.exe'] = $updaterEntry
+                    }
                     'CompleteProvenance' { $updaterProvenance['fixture.exe'] = $updaterEntry }
                 }
                 $updaterManifestPath = Join-Path $updaterTools 'TOOLS_MANIFEST.json'
-                $updaterManifestText = (@{ schemaVersion = 1; tools = @{}; provenance = $updaterProvenance } | ConvertTo-Json -Depth 5)
+                $updaterManifestText = (@{ schemaVersion = 1; tools = $updaterRecordedTools; provenance = $updaterProvenance } | ConvertTo-Json -Depth 5)
                 [IO.File]::WriteAllText($updaterManifestPath, $updaterManifestText, (New-Object Text.UTF8Encoding($false)))
                 $null = & $updaterHost -NoLogo -NoProfile -NonInteractive -File $updaterScript -Root $updaterRoot -Apply 2>&1
                 $updaterExitCode = $LASTEXITCODE
@@ -3164,9 +3182,11 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
                 'MissingProvenance:exit=1:unchanged=True:recorded=False;' +
                 'StaleProvenanceHash:exit=1:unchanged=True:recorded=False;' +
                 'DeletedToolProvenance:exit=1:unchanged=True:recorded=False;' +
+                'NoChangeStaleProvenance:exit=1:unchanged=True:recorded=True;' +
+                'VerifiedWithoutPackageMember:exit=1:unchanged=True:recorded=False;' +
                 'CompleteProvenance:exit=0:unchanged=False:recorded=True')) `
             -Name "ToolManifest/UpdaterApplyRequiresProvenance" `
-            -Failure "ci\Update-BRAVOToolsManifest.ps1 -Apply має відмовляти (код 1, маніфест без змін) без provenance, із застарілим provenance.sha256 і з provenance для видаленого інструмента, а з повним provenance — записувати хеш; отримано: $updaterSummary"
+            -Failure "ci\Update-BRAVOToolsManifest.ps1 -Apply має відмовляти (код 1, маніфест без змін) без provenance, із застарілим provenance.sha256 (також коли хеші tools уже актуальні), з provenance для видаленого інструмента й з upstreamVerified=true без packageMember, а з повним provenance — записувати хеш; отримано: $updaterSummary"
     }
 
     # Маніфест шукається в тому самому каталозі, що й самі утиліти
