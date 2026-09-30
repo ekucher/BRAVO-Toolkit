@@ -128,6 +128,34 @@
   права `36`) завершуються до перевірок (`Health/OrchestrationEarlyExitsSkipChecks`).
   Продакшн-код не змінено.
 
+- **DataRestore: поведінкові тести оркестрації `Invoke-BRAVODataRestore` (T011, аудит F010).**
+  Порядок фаз InPlace, знімок і відновлення стану служб, прибирання у `finally` і код
+  завершення DataRestore досі перевірялись лише структурно. Нові перевірки фрагмента
+  `selftest/BRAVO_SELF_TEST.DataRestore.ps1` запускають у дочірньому процесі runtime,
+  зібраний з дослівного тексту `BRAVO.DataRestore.Runtime.ps1` (AST): справжні функції
+  знімка служб, quiescence, зупинки/запуску й контрольованого abort, головний потік від
+  `Initialize-BRAVOConsole` до `exit` (lock, pipeline, `catch`, `finally` відновлення
+  служб, `Resolve-BRAVOExitCode`, вибір severity сповіщення) і зовнішній `finally` —
+  через справжній `Invoke-BRAVODataRestoreEntrypoint`. Після BRAVO-T023 (PR #275)
+  обгортка `Send-BRAVODataRestoreNotification` і `New-BRAVOOperatorNotificationMessage`
+  виконуються справжні; стабовано лише транспорт `Send-BRAVONotification` із дослівним
+  param-блоком канонічної функції та мережевий `Get-HostInformation`. Служби, lock,
+  маркер quiescence, 7-Zip, move-aside/rollback і Health — стаби, що журналюють події;
+  реальні служби, мережа й webhook не чіпаються. Перевірки фіксують: повну послідовність
+  фаз щасливого InPlace і SUCCESS-сповіщення з рядком компонента, код `0`
+  (`DataRestore/OrchestrationInPlaceRunsPhasesInContractOrder`); відмову перевірки
+  архіву до деструктивної фази без жодної дії над службами, код `41`
+  (`DataRestore/OrchestrationFailureBeforeRestoreLeavesServicesUntouched`); відмову
+  move-aside після зупинки служб без rollback незміненого каталогу, із запуском служб,
+  код `43` (`DataRestore/OrchestrationMoveAsideFailureRestartsServicesWithoutRollback`);
+  виняток розпакування — rollback, запуск служб у `finally` до звільнення lock, код `43`
+  (`DataRestore/OrchestrationRestoresServicesWhenRestoreThrows`); службу, зупинену до
+  прогону, не запускають (`DataRestore/OrchestrationRestoreSkipsServicesStoppedBeforeRun`);
+  збій доставки сповіщення лишає код `0`
+  (`DataRestore/OrchestrationNotificationFailureKeepsRestoreResult`); OutOfPlace не
+  чіпає служб (`DataRestore/OrchestrationOutOfPlaceLeavesServicesUntouched`).
+  Продакшн-код не змінено.
+
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
   використовує `--retry`, `--retry-all-errors` і `--retry-delay`: неоднозначний
