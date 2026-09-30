@@ -389,7 +389,7 @@ actual SFTP endpoint, без залежності від `google.com` або gen
 Ручне перевизначення будь-якого поля лишається можливим через
 `$global:discoverySettings` у `BRAVO.config` (`Sources.MODEL`,
 `Sources.BLOG`, `Sources.BRAVOEXCH`, `BravoRoot`, `WebRoot`,
-`BravoIniPath` тощо) — заданe вручну значення завжди має пріоритет над
+`BravoIniPath` тощо) — задане вручну значення завжди має пріоритет над
 автоматично знайденим і ніколи не перезаписується.
 
 Щоб побачити, які джерела буде визначено на конкретному сервері, і чи
@@ -1474,29 +1474,29 @@ checks, acceptance) — у `RELEASE_POLICY.md` у корені репозито�
   факт і час запуску backup — вимкніть `PublicIPLookupEnabled` свідомо
   (`$false`), якщо ця зовнішня залежність небажана.
 
-## 15. Operator notification UX
+## 15. Операторські сповіщення (UX)
 
-Slack/Discord notifications are short operator summaries. The detailed
-technical evidence stays in the referenced log file.
+Сповіщення Slack/Discord — короткі операторські підсумки. Детальні технічні
+докази лишаються у лог-файлі, на який посилається сповіщення.
 
-- ✅ SUCCESS: operation/check passed; the message says `Дій не потрібно`.
-- ⚠️ WARNING: BRAVO can continue, but the message gives a concrete
-  `Потрібна дія: ...`.
-- 🚨 CRITICAL: backup, integrity, credentials or maintenance safety is at
-  risk, with the reason and action at the top.
+- ✅ SUCCESS: операцію/перевірку пройдено; повідомлення містить `Дій не потрібно`.
+- ⚠️ WARNING: BRAVO може продовжувати роботу, але повідомлення називає
+  конкретну дію (`Потрібна дія: ...`).
+- 🚨 CRITICAL: під загрозою backup, цілісність, облікові дані або безпека
+  обслуговування; причина й дія — на початку повідомлення.
 
-Host information is compact: `🖥️ SERVER · 192.0.2.102`. Public IP is shown
-only when lookup is enabled and a valid address is returned. Institution lines
-use `🏢`.
+Інформація про хост компактна: `🖥️ SERVER · 192.0.2.102`. Публічна IP-адреса
+показується лише тоді, коли її пошук увімкнено й повернуто валідну адресу.
+Рядки установи позначаються `🏢`.
 
-Large diagnostic collections are summarized: the notification carries the
-total count, up to 5 representative examples and an `…і ще N` line; complete
-diagnostics remain in the local BRAVO-Toolkit log. A transport-agnostic safe
-payload limit truncates anomalously large messages (with an explicit suffix
-and the preserved log path) instead of splitting one event into a series of
-messages.
+Великі діагностичні колекції підсумовуються: сповіщення містить загальну
+кількість, до 5 показових прикладів і рядок `…і ще N`; повна діагностика
+лишається в локальному лозі BRAVO-Toolkit. Незалежний від транспорту
+безпечний ліміт розміру повідомлення обрізає аномально великі повідомлення
+(з явним суфіксом і збереженим шляхом до логу), а не розбиває одну подію на
+серію повідомлень.
 
-Backup health terminology:
+Термінологія стану резервних копій:
 
 - SUCCESS: `Остання резервна копія`.
 - WARNING/ERROR: `Остання успішна резервна копія`.
