@@ -723,6 +723,50 @@ function Get-Service {
         -Name "ServiceQuiescence/DataRestoreMarkerIsSuppressedFromCreation" `
         -Failure "маркер DataRestore має писатися одразу з -RestartSuppressed: автостарт поверх невизначеної live filesystem заборонено навіть після жорсткого kill"
 
+    # Get-ManagedServiceHealthIssues під StrictMode 2.0: ServiceController без
+    # StartType (.NET < 4.6.1) не має обривати Health винятком, а тип запуску
+    # має братись із WMI-fallback (Disabled -> службу пропущено).
+    $startTypeStubs = @'
+function Write-HealthLog { param($Message, $Level) }
+function Get-Service {
+    param($Name, $DisplayName, $ErrorAction)
+    $svc = [pscustomobject]@{ Name = [string]$Name; Status = [System.ServiceProcess.ServiceControllerStatus]::Stopped }
+    Add-Member -InputObject $svc -MemberType ScriptMethod -Name Refresh -Value { } -Force
+    return $svc
+}
+function Get-BRAVOWmiInstance {
+    param($ClassName)
+    return @(
+        [pscustomobject]@{ Name = 'BravoDisabled'; StartMode = 'Disabled' },
+        [pscustomobject]@{ Name = 'BravoAuto'; StartMode = 'Auto' }
+    )
+}
+'@
+    $startTypeModule = New-BRAVOSelfTestRuntimeModule `
+        -SourceText ($startTypeStubs + "`n" + $healthRuntimeTextForQuiescence) `
+        -FunctionNames @('Write-HealthLog', 'Get-Service', 'Get-BRAVOWmiInstance', 'Test-BRAVOSettingEnabled', 'Get-ManagedServiceHealthIssues')
+    $startTypeProbe = {
+        param($ServiceName)
+        Set-StrictMode -Version 2.0
+        $script:backupMonitoring = @{ CheckManagedServices = $true }
+        $script:maintenanceSettings = [pscustomobject]@{
+            Services = [pscustomobject]@{ BravoName = $ServiceName; ExchangeApiName = ''; BravoWebEnabled = $false; BravoWebCandidates = @() }
+        }
+        $thrown = $null
+        $issues = @()
+        try { $issues = @(Get-ManagedServiceHealthIssues) } catch { $thrown = $_.Exception.Message }
+        [pscustomobject]@{ Thrown = $thrown; IssueCount = @($issues).Count }
+    }
+    $startTypeDisabled = & $startTypeModule $startTypeProbe 'BravoDisabled'
+    $startTypeAuto = & $startTypeModule $startTypeProbe 'BravoAuto'
+    Test-BRAVOCondition `
+        -Condition (
+            $null -eq $startTypeDisabled.Thrown -and $startTypeDisabled.IssueCount -eq 0 -and
+            $null -eq $startTypeAuto.Thrown -and $startTypeAuto.IssueCount -eq 1
+        ) `
+        -Name "Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode" `
+        -Failure "Get-ManagedServiceHealthIssues має читати StartType через PSObject.Properties: ServiceController без StartType (.NET < 4.6.1) не повинен кидати виняток під StrictMode 2.0, а тип запуску має братись із WMI (Disabled -> пропуск, Auto -> проблема). Отримано: Disabled(Thrown='$($startTypeDisabled.Thrown)', Issues=$($startTypeDisabled.IssueCount)), Auto(Thrown='$($startTypeAuto.Thrown)', Issues=$($startTypeAuto.IssueCount))"
+
     $healthWatchdogInvokeIndex = $healthRuntimeTextForQuiescence.IndexOf('$quiescenceWatchdogIssues = @(Invoke-BRAVOServiceQuiescenceWatchdog)')
     $healthManagedServicesIndex = $healthRuntimeTextForQuiescence.IndexOf('$serviceHealthIssues = @($quiescenceWatchdogIssues) + @(Get-ManagedServiceHealthIssues)')
     Test-BRAVOCondition `

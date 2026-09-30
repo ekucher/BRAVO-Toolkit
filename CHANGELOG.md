@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Fix: Health не падає на хостах без `ServiceController.StartType` (#295).**
+  `Get-ManagedServiceHealthIssues` читав `$service.StartType` напряму; властивість
+  з'явилась лише в .NET 4.6.1, тож на Server 2012 R2 із .NET 4.5.x під
+  `Set-StrictMode -Version 2.0` кожен Health (зокрема post-backup) завершувався exit `90`
+  без сповіщення, а WMI-fallback на `StartMode` не виконувався. Тепер `StartType` читається
+  через `PSObject.Properties`, і за його відсутності тип запуску береться з WMI. Нова
+  self-test перевірка: `Health/ManagedServiceStartTypeMissingDoesNotThrowUnderStrictMode`.
+
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
   ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
