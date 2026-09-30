@@ -1,4 +1,4 @@
-# BRAVO Configuration v2 — controlled real-pilot runbook
+# BRAVO Configuration v2 — runbook керованого реального пілота
 
 **Задача:** #154, крок 2 «Remaining work» (автоматизований pilot-артефакт).
 **Дата підготовки:** 2026-09-16.
@@ -15,25 +15,25 @@
 acceptance → rollback) — цей документ не суперечить попередньому, а
 формалізує його як CLI.
 
-## Purpose
+## Мета
 
 Довести на **одному** реальному сервері, керовано й з повним evidence-
 пакетом, що перенесення site-значень із `BRAVO.config` у
 `BRAVO.local.config` **не змінює ефективної конфігурації**, і зробити цей
 доказ відтворюваним/автоматизованим замість ручного виконання команд.
 
-## Scope
+## Обсяг
 
 - Один сервер, явно вказаний через `-InstallRoot`.
 - Config-міграція; **не** оновлення самого BRAVO-Toolkit (це передумова,
-  не частина цієї процедури — див. «Prerequisites»).
+  не частина цієї процедури — див. «Передумови»).
 - **Не** fleet migration, **не** видалення `BRAVO.config` фізично з
   пакета (лише з активного шляху завантаження на цьому кроці — тобто цей
   крок узагалі не видаляє файл; runbook `..._20260916.md` документує
   окремий, суворо ручний, деструктивний Крок 6, який цей автоматизований
   інструмент НЕ виконує і не збирається виконувати автоматично).
 
-## Safety invariants
+## Інваріанти безпеки
 
 - **NO CONFIG LOSS** — backup обов'язковий і перевіряється (SHA-256) до
   будь-якого запису `BRAVO.local.config`.
@@ -49,7 +49,7 @@ acceptance → rollback) — цей документ не суперечить �
   незмінним.
 - `BRAVO.config` **НЕ видаляється** цим інструментом на жодному кроці.
 
-## Prerequisites
+## Передумови
 
 1. `-InstallRoot` — уже встановлений комплект BRAVO-Toolkit версії, що
    містить Configuration v2 (перевіряється `-Preflight`:
@@ -70,7 +70,7 @@ acceptance → rollback) — цей документ не суперечить �
 8. Заплановане архівування **поза** вікном pilot (`-Preflight` best-effort
    перевіряє `Get-ScheduledTask` — WARN, не FAIL, якщо не визначено).
 
-## Artifact verification
+## Перевірка артефакту
 
 Перед будь-якою операцією:
 
@@ -83,19 +83,19 @@ acceptance → rollback) — цей документ не суперечить �
 маніфесті, обов'язкові файли присутні, усі `.ps1` парсяться. Будь-яка
 розбіжність — **не використовуйте цей артефакт**, отримайте новий.
 
-## Maintenance window requirements
+## Вимоги до вікна обслуговування
 
 Мінімум: час на Preflight+Prepare (read-only, кілька хвилин) + review
 (людський, без обмеження) + Backup+Activate+Validate (`BRAVO_SELF_TEST.ps1`
 — історично до ~8 хвилин) + резерв на повний Rollback (та сама тривалість
 ще раз). Плануйте вікно не коротше 45 хвилин.
 
-## Procedure
+## Процедура
 
 Нижче `$Kit` = `-InstallRoot` (каталог встановленого комплекту на
 сервері), `$Art` = каталог розпакованого pilot-артефакту.
 
-### 0. Preflight (read-only)
+### 0. Preflight (лише читання)
 
 ```powershell
 .\Start-BRAVOConfigV2Pilot.ps1 -Preflight -InstallRoot $Kit
@@ -108,7 +108,7 @@ acceptance → rollback) — цей документ не суперечить �
 (найчастіше: сервер ще не оновлений до версії з Configuration v2,
 відсутній `BRAVO.config`, недостатньо прав) перед продовженням.
 
-### 1. Prepare — baseline + delta
+### 1. Prepare — базова лінія + delta
 
 ```powershell
 .\Start-BRAVOConfigV2Pilot.ps1 -Prepare -InstallRoot $Kit
@@ -127,7 +127,7 @@ acceptance → rollback) — цей документ не суперечить �
 лишається зі станом `Failed` або незавершеним; перезапустіть `-Prepare`
 (новий каталог створюється щоразу).
 
-### 2. Human review gate
+### 2. Обов'язковий ручний перегляд (gate)
 
 Відкрийте `delta.preview.txt` у виведеному `EvidenceDir`. **Це не
 механічний крок** — те саме попередження, що й у ручному runbook: рядок у
@@ -191,7 +191,7 @@ Health (порівняння нових `[CRITICAL]`/`[FAIL]`/`[ERROR]`-рядк
 .\Start-BRAVOConfigV2Pilot.ps1 -Accept -EvidenceDir $EvidenceDir
 ```
 
-Звіряє всі критерії (нижче, «Exit criteria») з фактично зібраним evidence
+Звіряє всі критерії (нижче, «Критерії завершення») з фактично зібраним evidence
 і записує `acceptance.json` з результатом `PILOT ACCEPTED` або
 `PILOT NOT ACCEPTED` (з переліком незадоволених критеріїв).
 
@@ -212,13 +212,13 @@ Health (порівняння нових `[CRITICAL]`/`[FAIL]`/`[ERROR]`-рядк
 що не пройшли, — сервер потребує ручного втручання, не вважайте pilot
 завершеним.
 
-### 7. Status (у будь-який момент, read-only)
+### 7. Status (у будь-який момент, лише читання)
 
 ```powershell
 .\Start-BRAVOConfigV2Pilot.ps1 -Status -EvidenceDir $EvidenceDir
 ```
 
-## Evidence collection
+## Збирання доказів
 
 Каталог `<EvidenceRoot>\<server>-<timestamp>\` (типово
 `%ProgramData%\BRAVO\ConfigV2PilotEvidence\`) містить усі файли, перелічені
@@ -227,7 +227,7 @@ Health (порівняння нових `[CRITICAL]`/`[FAIL]`/`[ERROR]`-рядк
 перевіркою `Assert-BRAVOPilotEvidenceSecretSafe` перед кожним записом
 (fail closed, якщо безпеку не можна гарантувати).
 
-## Troubleshooting
+## Усунення несправностей
 
 | Симптом | Причина | Дія |
 | --- | --- | --- |
@@ -237,7 +237,7 @@ Health (порівняння нових `[CRITICAL]`/`[FAIL]`/`[ERROR]`-рядк
 | `-Validate` FAIL на self-test із `[НЕДОСТУПНО]` | AppLocker/Constrained Language Mode на хості | задокументуйте причину окремо; це НЕ автоматично прийнятний результат |
 | `-Rollback` завершується `ROLLBACK INCOMPLETE` | один з пост-restore доказів не пройшов | сервер потребує ручного втручання — НЕ вважайте pilot завершеним, ескалюйте власнику |
 
-## Post-pilot observation
+## Спостереження після пілота
 
 Технічне acceptance (`PILOT ACCEPTED`) — **не** те саме, що готовність до
 fleet migration. Після acceptance:
@@ -252,7 +252,7 @@ fleet migration. Після acceptance:
 Точна тривалість спостереження узгоджується з існуючою операційною
 моделлю BRAVO — цей runbook не вигадує нового SLA.
 
-## Pilot ≠ fleet acceptance
+## Пілот ≠ acceptance парку
 
 `PILOT ACCEPTED` означає: **один** сервер технічно підтвердив
 BEFORE==AFTER semantic parity. Це НЕ:
@@ -265,7 +265,7 @@ BEFORE==AFTER semantic parity. Це НЕ:
 
 Кожен наступний сервер — окрема, явно авторизована операція.
 
-## Exit criteria
+## Критерії завершення
 
 - [ ] `Test-BRAVOConfigV2PilotArtifact.ps1` — `[SUCCESS]`;
 - [ ] `-Preflight` — `PASSED`;
