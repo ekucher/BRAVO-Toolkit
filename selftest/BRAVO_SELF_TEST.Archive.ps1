@@ -1011,7 +1011,9 @@ try {
         # ownership state прибрано; generation FAILED, тому retention
         # (видалення старих generation) НЕ запускається й стан виконання не
         # пишеться; код завершення — 40 (LocalArchiveFailed) і в процесі, і в
-        # Operations-події; lock звільнено останнім.
+        # Operations-події, а machine-readable статус-файл записано з кодом 40
+        # (ключ Bytes відсутній у невдалого компонента); lock звільнено
+        # останнім.
         $archiveComponent = $archiveOrchestrationResults['ComponentThrows']
         $archiveComponentEvents = @(& $archiveOrchestrationEvents $archiveComponent)
         $archiveComponentBackup = & $archiveOrchestrationIndex $archiveComponentEvents '^COMPONENT-BACKUP MODEL$'
@@ -1031,6 +1033,7 @@ try {
                 [string]$archiveComponentEvents[$archiveComponentManifest] -eq 'MANIFEST-WRITE FAILED' -and
                 @($archiveComponentEvents | Where-Object { $_ -eq 'RETENTION-CLEANUP' -or $_ -eq 'EXECUTION-STATE' }).Count -eq 0 -and
                 @($archiveComponentEvents | Where-Object { $_ -eq 'OPS-EVENT 40 ERROR' }).Count -eq 1 -and
+                @($archiveComponentEvents | Where-Object { $_ -eq 'STATUS 40' }).Count -eq 1 -and
                 -not [bool]$archiveComponent.VssOwnershipStateLeft -and
                 $archiveComponentEvents.Count -gt 1 -and
                 $archiveComponentEvents[$archiveComponentEvents.Count - 1] -eq 'LOCK-RELEASE' -and

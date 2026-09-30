@@ -8446,8 +8446,11 @@ function Main {
         $statusComponentsSucceeded = @($results.Values | Where-Object { [bool]$_.ArchiveSuccess }).Count
         $statusTotalCreatedBytes = [long]0
         foreach ($statusComponentResult in $results.Values) {
-            if ($null -ne $statusComponentResult.Bytes) {
-                $statusTotalCreatedBytes += [long]$statusComponentResult.Bytes
+            # Ключ Bytes є лише в опублікованих компонентів; під StrictMode
+            # 2.0 звернення до відсутнього ключа hashtable кидає виняток,
+            # і статус-файл не записувався б на прогонах зі збоєм компонента.
+            if ($statusComponentResult.ContainsKey('Bytes') -and $null -ne $statusComponentResult['Bytes']) {
+                $statusTotalCreatedBytes += [long]$statusComponentResult['Bytes']
             }
         }
         Write-BRAVOOperationStatus `
