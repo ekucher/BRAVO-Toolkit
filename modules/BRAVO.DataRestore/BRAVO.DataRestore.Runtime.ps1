@@ -264,6 +264,16 @@ if (-not $ListGenerations -and -not $isLocalSystem -and -not $currentPrincipal.I
         Write-Host "ПОМИЛКА: -GenerationId має недопустимий формат (yyyyMMdd_HHmmss, опційно з collision-safe суфіксом _N): '$GenerationId'" -ForegroundColor Red
         exit 30
     }
+    # -TargetPath перевіряється тим самим валідатором, що й -StagingPath
+    # (той — уже в елевованому процесі), але ДО елевації, бо має бути повністю
+    # кваліфікованим: диск-відносне ('C:restore') і корінь-відносне
+    # ('\restore') значення IsPathRooted вважає "rooted", але elevated-процес
+    # стартує з C:\Windows\System32 і розпакував би дані LIMS туди.
+    if (-not [string]::IsNullOrWhiteSpace($TargetPath) -and
+        -not (Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value ([Environment]::ExpandEnvironmentVariables($TargetPath)))) {
+        Write-Host "ПОМИЛКА: -TargetPath має бути повністю кваліфікованим шляхом (буква-диска:\ або UNC \\сервер\ресурс): $TargetPath" -ForegroundColor Red
+        exit 30
+    }
     $elevatedArguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", (ConvertTo-BRAVODataRestoreElevationArgument -Value $EntryScriptPath))
     if (-not [string]::IsNullOrWhiteSpace($GenerationId)) { $elevatedArguments += @("-GenerationId", (ConvertTo-BRAVODataRestoreElevationArgument -Value $GenerationId)) }
     # Component/Mode/Source — типізовано обмежені [ValidateSet] у param()
@@ -423,8 +433,8 @@ $stagingRootPath = if ([string]::IsNullOrWhiteSpace($StagingPath)) {
     Join-Path $backupRootPath 'RESTORE_STAGING'
 } else {
     # Абсолютність вимагається явно (round-7 P2, посилено follow-up P2):
-    # на відміну від -TargetPath (Get-BRAVODataRestorePlan уже вимагає
-    # IsPathRooted), -StagingPath раніше йшов напряму в GetFullPath без цієї
+    # на відміну від -TargetPath (Get-BRAVODataRestorePlan вимагає
+    # повністю кваліфікований шлях, #304), -StagingPath раніше йшов напряму в GetFullPath без цієї
     # перевірки — відносне значення резолвилось відносно робочого каталогу
     # ЕЛЕВОВАНОГО процесу (типово системний/runtime каталог, не те, що
     # оператор мав на увазі), і SFTP-завантаження та рекурсивне очищення
@@ -1157,8 +1167,10 @@ function Get-BRAVODataRestorePlan {
             return [pscustomobject]@{ Success = $false; Error = 'для режиму OutOfPlace обов''язковий параметр -TargetPath'; TargetRoot = $null; Components = @() }
         }
         $expandedTarget = [Environment]::ExpandEnvironmentVariables($RequestedTargetPath)
-        if (-not [System.IO.Path]::IsPathRooted($expandedTarget)) {
-            return [pscustomobject]@{ Success = $false; Error = "-TargetPath має бути абсолютним шляхом: $RequestedTargetPath"; TargetRoot = $null; Components = @() }
+        # IsPathRooted вважає 'C:restore' і '\restore' rooted, хоча вони
+        # резолвяться відносно поточного каталогу/диска процесу.
+        if (-not (Test-BRAVODataRestoreFullyQualifiedWindowsPath -Value $expandedTarget)) {
+            return [pscustomobject]@{ Success = $false; Error = "-TargetPath має бути повністю кваліфікованим шляхом (буква-диска:\ або UNC \\сервер\ресурс): $RequestedTargetPath"; TargetRoot = $null; Components = @() }
         }
         try {
             $targetRoot = [System.IO.Path]::GetFullPath($expandedTarget)
