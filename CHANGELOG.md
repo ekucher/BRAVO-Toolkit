@@ -2,6 +2,14 @@
 
 ## Не випущено (developer)
 
+- **Fix: Maintenance не обривається, якщо в `range_id_log.json` немає поля `time` (#288).**
+  `Test-RangeIdUsage` читав `$rangeData.time` напряму; під `Set-StrictMode -Version 2.0`
+  відсутня властивість кидала виняток, і за перевищеного порогу діапазонів ID нічний прогін
+  завершувався exit `60` без Trace-архіву, cleanup, backup та підсумкового звіту. Тепер `time`
+  читається через `PSObject.Properties` (як `file`/`filled`); наявне значення, як і раніше,
+  потрапляє в alert. Нова self-test перевірка:
+  `RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode`.
+
 - **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
   `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
   ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
