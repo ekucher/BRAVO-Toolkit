@@ -1530,6 +1530,97 @@ Test-BRAVOCondition `
     -Name "ConfigLoader/ToolIntegrityModeWeakenedBlocks" `
     -Failure "ефективний `$global:toolIntegritySettings.Mode = 'Warn' (замість 'Enforce') МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants навіть якщо ця canary-гілка сьогодні недосяжна звичайним raw-override-шляхом; отримано: $toolIntegrityWeakenedResult"
 
+# --- ConfigLoader/ToolManifestPathRedirectionBlocks та
+# ConfigLoader/ToolManifestPathCanonicalAllowed (BRAVO-T001, аудит F001):
+# toolIntegritySettings.ManifestPath, як і Mode, виводиться канонічно
+# (<toolsPath>\TOOLS_MANIFEST.json) і не є raw-configurable. Canary-гілка
+# Test-BRAVOEffectiveSecurityInvariants блокує будь-яке інше значення —
+# перенаправлений маніфест тихо легітимізував би підмінений бінарник у
+# Enforce. Негативний і позитивний випадки викликають функцію НАПРЯМУ
+# (той самий паттерн, що ToolIntegrityModeWeakenedBlocks вище), щоб
+# довести саму гілку, а не лише те, що derivation сьогодні її не досягає.
+$toolManifestProbeRuntimeRoot = Join-Path ([IO.Path]::GetTempPath()) 'BRAVO_T001_RUNTIME'
+$toolManifestProbeRuntimeLiteral = $toolManifestProbeRuntimeRoot.Replace("'", "''")
+$toolManifestProbePrefix = (
+    "try { . '$root\BRAVO_CONFIG_LOADER.ps1'; " +
+    "`$global:backupConsistency = @{ Mode = 'VSS' }; " +
+    "`$global:requireAdministrator = `$true; " +
+    "`$global:runtimeRoot = '$toolManifestProbeRuntimeLiteral'; " +
+    "`$global:toolsPath = (Join-Path `$global:runtimeRoot 'Tools'); "
+)
+$toolManifestRedirectedProbeCommand = (
+    $toolManifestProbePrefix +
+    "`$global:toolIntegritySettings = @{ Mode = 'Enforce'; ManifestPath = 'C:\Attacker\TOOLS_MANIFEST.json' }; " +
+    "Test-BRAVOEffectiveSecurityInvariants; 'NO-THROW' } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolManifestRedirectedResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestRedirectedProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition (
+        $toolManifestRedirectedResult.StartsWith('THREW') -and
+        $toolManifestRedirectedResult.Contains('ПОСЛАБЛЮЄ ЗАХИСТ') -and
+        $toolManifestRedirectedResult.Contains("toolIntegritySettings.ManifestPath = 'C:\Attacker\TOOLS_MANIFEST.json'")
+    ) `
+    -Name "ConfigLoader/ToolManifestPathRedirectionBlocks" `
+    -Failure "ефективний toolIntegritySettings.ManifestPath поза <RuntimeRoot>\Tools\TOOLS_MANIFEST.json МАЄ БЛОКУВАТИ через Test-BRAVOEffectiveSecurityInvariants; отримано: $toolManifestRedirectedResult"
+
+$toolManifestCanonicalProbeCommand = (
+    $toolManifestProbePrefix +
+    "`$global:toolIntegritySettings = @{ Mode = 'Enforce'; ManifestPath = (Join-Path `$global:toolsPath 'TOOLS_MANIFEST.json') }; " +
+    "Test-BRAVOEffectiveSecurityInvariants; 'NO-THROW' } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolManifestCanonicalResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestCanonicalProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition ($toolManifestCanonicalResult -eq 'NO-THROW') `
+    -Name "ConfigLoader/ToolManifestPathCanonicalAllowed" `
+    -Failure "канонічний toolIntegritySettings.ManifestPath (<toolsPath>\TOOLS_MANIFEST.json) не повинен блокуватись; отримано: $toolManifestCanonicalResult"
+
+# Крайові випадки T001 в одному дочірньому процесі (якір довіри —
+# <RuntimeRoot>\Tools):
+#   empty/malformed — порожній і синтаксично зіпсований ManifestPath;
+#   dotCanonical    — '..', що після GetFullPath дає той самий канонічний
+#                     файл, допускається навмисно (це той самий шлях);
+#   dotEscape       — '..' за межі Tools\;
+#   caseVariant     — інший регістр імені файла (на NTFS із per-directory
+#                     case sensitivity це інший файл);
+#   coRedirected    — toolsPath і ManifestPath перенаправлено в один
+#                     сторонній каталог (звірка лише з toolsPath не помітила б);
+#   orderedDict     — перенаправлення в OrderedDictionary (споживачі
+#                     приймають будь-який IDictionary, не лише hashtable).
+$toolManifestEdgeProbeCommand = (
+    $toolManifestProbePrefix +
+    "`$canonicalTools = `$global:toolsPath; " +
+    "`$edgeCases = [ordered]@{ " +
+    "'empty' = @(`$canonicalTools, ''); " +
+    "'malformed' = @(`$canonicalTools, 'C:\bad:name|<>\TOOLS_MANIFEST.json'); " +
+    "'dotCanonical' = @(`$canonicalTools, (Join-Path `$canonicalTools '..\Tools\TOOLS_MANIFEST.json')); " +
+    "'dotEscape' = @(`$canonicalTools, (Join-Path `$canonicalTools '..\Other\TOOLS_MANIFEST.json')); " +
+    "'caseVariant' = @(`$canonicalTools, (Join-Path `$canonicalTools 'tools_manifest.json')); " +
+    "'coRedirected' = @('C:\Attacker\Tools', 'C:\Attacker\Tools\TOOLS_MANIFEST.json'); " +
+    "'orderedDict' = @(`$canonicalTools, 'C:\Attacker\TOOLS_MANIFEST.json') }; " +
+    "`$edgeOutcomes = foreach (`$edgeName in @(`$edgeCases.Keys)) { " +
+    "`$global:toolsPath = `$edgeCases[`$edgeName][0]; " +
+    "if (`$edgeName -eq 'orderedDict') { `$settings = New-Object System.Collections.Specialized.OrderedDictionary; `$settings['Mode'] = 'Enforce'; `$settings['ManifestPath'] = `$edgeCases[`$edgeName][1] } " +
+    "else { `$settings = @{ Mode = 'Enforce'; ManifestPath = `$edgeCases[`$edgeName][1] } }; " +
+    "`$global:toolIntegritySettings = `$settings; " +
+    "try { Test-BRAVOEffectiveSecurityInvariants; `$edgeName + '=NO-THROW' } " +
+    "catch { `$edgeMessage = [string]`$_.Exception.Message; if (`$edgeMessage -like '*toolIntegritySettings.ManifestPath*' -or `$edgeMessage -like '*toolsPath = *') { `$edgeName + '=BLOCKED' } else { `$edgeName + '=OTHER' } } }; " +
+    "`$edgeOutcomes -join ';' } catch { 'THREW: ' + `$_.Exception.Message }"
+)
+$toolManifestEdgeResult = [string](
+    & (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+        -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $toolManifestEdgeProbeCommand 2>&1 | Out-String
+).Trim()
+Test-BRAVOCondition `
+    -Condition ($toolManifestEdgeResult -eq 'empty=BLOCKED;malformed=BLOCKED;dotCanonical=NO-THROW;dotEscape=BLOCKED;caseVariant=BLOCKED;coRedirected=BLOCKED;orderedDict=BLOCKED') `
+    -Name "ConfigLoader/ToolManifestPathEdgeCasesFailClosed" `
+    -Failure "порожній/зіпсований ManifestPath, '..' за межі Tools\, інший регістр імені, спільне перенаправлення toolsPath+ManifestPath і перенаправлення в OrderedDictionary мають блокуватись, а '..', що веде до канонічного файла, — ні; отримано: $toolManifestEdgeResult"
+
 # ============================================================
 # Issue #216, Wave 2 review-фікс: backupMonitoring.SFTP.BAZA.Mode/
 # .MutationPolicy — owner-decision листи, для яких DENY_SECURITY_CONTROL
