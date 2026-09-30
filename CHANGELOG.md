@@ -13,6 +13,7 @@
   `DataRestore/TargetPathValidatedBeforeElevation`,
   `DataRestore/TargetPathQualificationMatrix` (ACCEPT `C:\restore`, `D:\x\restore`,
   UNC; REJECT `C:restore`, `\restore`, `.\restore`, `..\restore`, `\\?\`, `\\.\`).
+
 - **Fix: Maintenance не обривається, якщо в `range_id_log.json` немає поля `time` (#288).**
   `Test-RangeIdUsage` читав `$rangeData.time` напряму; під `Set-StrictMode -Version 2.0`
   відсутня властивість кидала виняток, і за перевищеного порогу діапазонів ID нічний прогін
@@ -22,6 +23,7 @@
   `RangeId/07-MissingTimeFieldDoesNotThrowUnderStrictMode`,
   `RangeId/08-NullTimeAndPartialEntriesUnderStrictMode` (`time = null`, записи без
   `file`/`filled`, поріг не перевищено).
+
 - **Документація: операторські розділи про сповіщення перекладено
   українською, виправлено латинські літери в українських словах (A10).**
   Розділи про операторські сповіщення Slack/Discord у `README.md` (§15),
