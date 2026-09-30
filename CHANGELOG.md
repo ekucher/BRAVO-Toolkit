@@ -2,6 +2,54 @@
 
 ## Не випущено (developer)
 
+- **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
+  `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
+  ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
+  канонічного `<RuntimeRoot>\Tools\TOOLS_MANIFEST.json`, вважається послабленням захисту
+  і в режимі `Enforce` блокує запуск, як і `toolIntegritySettings.Mode`. Якір довіри —
+  `RuntimeRoot`: сам `toolsPath` теж має дорівнювати `<RuntimeRoot>\Tools`, тож спільне
+  перенаправлення каталогу інструментів і маніфесту не проходить. Порівняння шляхів
+  враховує регістр (на NTFS із per-directory case sensitivity інший регістр — інший
+  файл), а контейнер налаштувань перевіряється як будь-який `IDictionary`, як і в
+  runtime-споживачів. Сьогодні цей ключ
+  не можна перевизначити через конфігурацію (його завжди виводить
+  `Resolve-BRAVOConfigurationDerivation`), тому на наявних серверах поведінка не
+  змінюється; перевірка захищає від майбутньої регресії, за якої підмінений 7-Zip чи
+  WinSCP пройшов би перевірку цілісності проти чужого маніфесту. Нові self-test
+  перевірки: `ConfigLoader/ToolManifestPathRedirectionBlocks`,
+  `ConfigLoader/ToolManifestPathCanonicalAllowed`;
+  `ConfigLoader/ToolManifestPathEdgeCasesFailClosed` фіксує крайові випадки:
+  порожній і синтаксично зіпсований шлях, `..` за межі `Tools\`, інший регістр
+  імені файла, спільне перенаправлення `toolsPath` і маніфесту та перенаправлення в
+  `OrderedDictionary` блокуються, а `..`, що після нормалізації веде до того самого
+  канонічного файла, допускається.
+- **Походження бінарників у `Tools\TOOLS_MANIFEST.json` (BRAVO-T021).**
+  Для кожного інструмента маніфест тепер містить запис `provenance`: версію,
+  офіційне джерело пакета, SHA-256 пакета, шлях файлу в пакеті й дату завантаження.
+  7-Zip `26.02` (`7za.exe`, `7za.dll`, `7zxa.dll`) побайтово збігається з
+  `7z2602-extra.7z`, WinSCP `6.5.6` (`WinSCP.com`, `WinSCP.exe`) — з
+  `WinSCP-6.5.6-Portable.zip`, `WinSCPnet.dll` — з `WinSCP-6.5.6-Automation.zip`.
+  `DragExt64.dll` має версію `6.5.3`, не входить до пакетів 6.5.6 і позначений
+  `upstreamVerified = false`. `ci\Update-BRAVOToolsManifest.ps1 -Apply` відмовляє
+  (код `1`), доки для нового чи зміненого бінарника немає запису `provenance` з тим
+  самим `sha256`. Новий самотест `ToolManifest/EveryToolHasProvenance`, а
+  `ToolManifest/UpdaterApplyRequiresProvenance` запускає справжній updater на
+  тимчасовому корені: без `provenance`, із застарілим `sha256` і з записом для
+  видаленого інструмента `-Apply` завершується кодом `1` і не змінює маніфест. Гейт
+  спрацьовує й тоді, коли хеші в `tools` уже актуальні (перевірка стоїть до виходу
+  «розбіжностей немає»), а запис з `upstreamVerified = true` вимагає `packageSha256` і
+  непорожній `packageMember`, щоб перевірку можна було відтворити. Runtime-перевірка
+  цілісності читає лише `tools`, тож поведінка серверів не змінюється.
+- **Одна реалізація чанкера Discord (BRAVO-T023, крок 1).** `BRAVO.Archive.Runtime.ps1`
+  більше не оголошує власну `function global:Split-DiscordNotificationText`, яка тінила
+  експорт `BRAVO.Notifications` у всьому процесі. Канонічною стала поведінка з Archive:
+  рядки всередині частини з'єднуються LF (раніше модуль з'єднував через
+  `[Environment]::NewLine`, тобто CRLF на Windows), межі `MaximumLength` перевіряються, порожнє
+  повідомлення дає одну порожню частину. Для оператора змінюється лише те, що довгі
+  Discord-повідомлення поза Archive можуть ділитися на трохи менше частин. Нові самотести
+  `Notifications/DiscordChunksJoinWithLineFeed`, `Notifications/DiscordChunkerHasSingleDefinition` і
+  `Notifications/DiscordChunkerEdgeCases` (порожнє повідомлення, `$null`, межа `MaximumLength`,
+  відхилення `MaximumLength` поза 100..2000).
 - **DataRestore надсилає сповіщення через `Send-BRAVONotification` (BRAVO-T023, крок 2).**
   `Send-BRAVODataRestoreNotification` більше не збирає власний ланцюжок
   route → endpoint → payload → доставка, а викликає канонічну `Send-BRAVONotification`.

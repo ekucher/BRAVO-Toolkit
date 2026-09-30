@@ -3063,6 +3063,132 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
             -Failure "TOOLS_MANIFEST.json не відповідає реальним Tools у репозиторії: $($repositoryManifestRun.Message)"
     }
 
+    # BRAVO-T021 (аудит F012, частина 2): кожен еталонний хеш має запис
+    # походження з тим самим sha256 — інакше маніфест засвідчує лише
+    # "так було в коміті", а не "це офіційний бінарник". Той самий
+    # контракт, який ci\Update-BRAVOToolsManifest.ps1 вимагає на -Apply.
+    $repositoryToolManifestRaw = [IO.File]::ReadAllText(
+        (Join-Path $repositoryToolsDirectory "TOOLS_MANIFEST.json"), [Text.Encoding]::UTF8)
+    $repositoryToolManifest = $repositoryToolManifestRaw | ConvertFrom-Json
+    $toolProvenanceProblems = New-Object System.Collections.Generic.List[string]
+    $toolProvenanceByName = @{}
+    if (@($repositoryToolManifest.PSObject.Properties.Name) -contains 'provenance' -and $null -ne $repositoryToolManifest.provenance) {
+        foreach ($provenanceProperty in $repositoryToolManifest.provenance.PSObject.Properties) {
+            $toolProvenanceByName[$provenanceProperty.Name] = $provenanceProperty.Value
+        }
+    }
+    foreach ($toolProperty in $repositoryToolManifest.tools.PSObject.Properties) {
+        if (-not $toolProvenanceByName.ContainsKey($toolProperty.Name)) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): немає запису provenance")
+            continue
+        }
+        $toolProvenanceEntry = $toolProvenanceByName[$toolProperty.Name]
+        foreach ($provenanceField in @('sha256', 'version', 'upstreamUrl', 'retrievedAt', 'upstreamVerified')) {
+            if (@($toolProvenanceEntry.PSObject.Properties.Name) -notcontains $provenanceField -or
+                [string]::IsNullOrWhiteSpace([string]$toolProvenanceEntry.$provenanceField)) {
+                [void]$toolProvenanceProblems.Add("$($toolProperty.Name): немає поля $provenanceField")
+            }
+        }
+        if (-not [string]::Equals([string]$toolProvenanceEntry.sha256, [string]$toolProperty.Value, [System.StringComparison]::OrdinalIgnoreCase)) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): provenance.sha256 не дорівнює tools")
+        }
+        if ([string]$toolProvenanceEntry.upstreamVerified -eq 'True' -and (
+                @($toolProvenanceEntry.PSObject.Properties.Name) -notcontains 'packageSha256' -or
+                [string]$toolProvenanceEntry.packageSha256 -notmatch '^[0-9A-Fa-f]{64}$')) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): upstreamVerified=true без SHA-256 пакета (packageSha256)")
+        }
+        if ([string]$toolProvenanceEntry.upstreamVerified -eq 'True' -and (
+                @($toolProvenanceEntry.PSObject.Properties.Name) -notcontains 'packageMember' -or
+                [string]::IsNullOrWhiteSpace([string]$toolProvenanceEntry.packageMember))) {
+            [void]$toolProvenanceProblems.Add("$($toolProperty.Name): upstreamVerified=true без шляху файлу в пакеті (packageMember)")
+        }
+    }
+    foreach ($provenanceName in $toolProvenanceByName.Keys) {
+        if (@($repositoryToolManifest.tools.PSObject.Properties.Name) -notcontains $provenanceName) {
+            [void]$toolProvenanceProblems.Add("${provenanceName}: provenance без запису в tools")
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($toolProvenanceProblems.Count -eq 0) `
+        -Name "ToolManifest/EveryToolHasProvenance" `
+        -Failure "TOOLS_MANIFEST.json: походження інструментів неповне або не збігається з хешами: $($toolProvenanceProblems -join '; ')"
+
+    # BRAVO-T021: поведінкова перевірка самого гейту -Apply у
+    # ci\Update-BRAVOToolsManifest.ps1 (а не лише вмісту маніфесту).
+    # Справжній скрипт запускається в дочірньому процесі на тимчасовому
+    # корені: без запису provenance, з застарілим provenance.sha256 і з
+    # provenance для видаленого інструмента він мусить завершитися кодом 1
+    # і НЕ змінити маніфест; з повним provenance — записати новий хеш.
+    # NoChangeStaleProvenance: хеші в tools уже актуальні, але provenance
+    # застарів — -Apply однаково мусить відмовити (код 1), а не звітувати
+    # "розбіжностей немає". VerifiedWithoutPackageMember: upstreamVerified=true
+    # без packageMember не дає відтворити перевірку — відмова.
+    & {
+        $updaterScript = Join-Path $root 'ci\Update-BRAVOToolsManifest.ps1'
+        $updaterHost = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $updaterOutcomes = New-Object System.Collections.Generic.List[string]
+        foreach ($updaterScenario in @('MissingProvenance', 'StaleProvenanceHash', 'DeletedToolProvenance', 'NoChangeStaleProvenance', 'VerifiedWithoutPackageMember', 'CompleteProvenance')) {
+            $updaterRoot = Join-Path ([IO.Path]::GetTempPath()) ('BRAVO_T021_UPDATER_{0}' -f [guid]::NewGuid().ToString('N'))
+            try {
+                $updaterTools = Join-Path $updaterRoot 'Tools'
+                [void](New-Item -ItemType Directory -Path $updaterTools -Force)
+                [IO.File]::WriteAllText((Join-Path $updaterRoot 'BRAVO_SELF_TEST.ps1'), '# fixture', (New-Object Text.UTF8Encoding($false)))
+                $updaterToolPath = Join-Path $updaterTools 'fixture.exe'
+                [IO.File]::WriteAllBytes($updaterToolPath, [byte[]](0x4D, 0x5A, 0x01, 0x02))
+                $updaterToolHash = (Get-FileHash -LiteralPath $updaterToolPath -Algorithm SHA256).Hash.ToUpperInvariant()
+                $updaterEntry = @{
+                    sha256 = $updaterToolHash; version = '1.0'; upstreamUrl = 'https://example.invalid/fixture'
+                    retrievedAt = '2026-09-30'; upstreamVerified = $false
+                }
+                $updaterProvenance = @{}
+                $updaterRecordedTools = @{}
+                switch ($updaterScenario) {
+                    'MissingProvenance' { }
+                    'StaleProvenanceHash' { $updaterEntry.sha256 = ('0' * 64); $updaterProvenance['fixture.exe'] = $updaterEntry }
+                    'DeletedToolProvenance' {
+                        $updaterProvenance['fixture.exe'] = $updaterEntry
+                        $updaterProvenance['removed.exe'] = @{
+                            sha256 = ('1' * 64); version = '1.0'; upstreamUrl = 'https://example.invalid/removed'
+                            retrievedAt = '2026-09-30'; upstreamVerified = $false
+                        }
+                    }
+                    'NoChangeStaleProvenance' {
+                        $updaterRecordedTools['fixture.exe'] = $updaterToolHash
+                        $updaterEntry.sha256 = ('0' * 64); $updaterProvenance['fixture.exe'] = $updaterEntry
+                    }
+                    'VerifiedWithoutPackageMember' {
+                        $updaterEntry.upstreamVerified = $true; $updaterEntry.packageSha256 = ('A' * 64)
+                        $updaterProvenance['fixture.exe'] = $updaterEntry
+                    }
+                    'CompleteProvenance' { $updaterProvenance['fixture.exe'] = $updaterEntry }
+                }
+                $updaterManifestPath = Join-Path $updaterTools 'TOOLS_MANIFEST.json'
+                $updaterManifestText = (@{ schemaVersion = 1; tools = $updaterRecordedTools; provenance = $updaterProvenance } | ConvertTo-Json -Depth 5)
+                [IO.File]::WriteAllText($updaterManifestPath, $updaterManifestText, (New-Object Text.UTF8Encoding($false)))
+                $null = & $updaterHost -NoLogo -NoProfile -NonInteractive -File $updaterScript -Root $updaterRoot -Apply 2>&1
+                $updaterExitCode = $LASTEXITCODE
+                $updaterManifestAfter = [IO.File]::ReadAllText($updaterManifestPath)
+                $updaterRecordedProperty = (ConvertFrom-Json $updaterManifestAfter).tools.PSObject.Properties['fixture.exe']
+                $updaterRecordedHash = if ($null -ne $updaterRecordedProperty) { [string]$updaterRecordedProperty.Value } else { '' }
+                $updaterOutcomes.Add(('{0}:exit={1}:unchanged={2}:recorded={3}' -f
+                    $updaterScenario, $updaterExitCode, ($updaterManifestAfter -eq $updaterManifestText), ($updaterRecordedHash -eq $updaterToolHash)))
+            } finally {
+                if (Test-Path -LiteralPath $updaterRoot) { Remove-Item -LiteralPath $updaterRoot -Recurse -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        $updaterSummary = $updaterOutcomes -join ';'
+        Test-BRAVOCondition `
+            -Condition ($updaterSummary -eq (
+                'MissingProvenance:exit=1:unchanged=True:recorded=False;' +
+                'StaleProvenanceHash:exit=1:unchanged=True:recorded=False;' +
+                'DeletedToolProvenance:exit=1:unchanged=True:recorded=False;' +
+                'NoChangeStaleProvenance:exit=1:unchanged=True:recorded=True;' +
+                'VerifiedWithoutPackageMember:exit=1:unchanged=True:recorded=False;' +
+                'CompleteProvenance:exit=0:unchanged=False:recorded=True')) `
+            -Name "ToolManifest/UpdaterApplyRequiresProvenance" `
+            -Failure "ci\Update-BRAVOToolsManifest.ps1 -Apply має відмовляти (код 1, маніфест без змін) без provenance, із застарілим provenance.sha256 (також коли хеші tools уже актуальні), з provenance для видаленого інструмента й з upstreamVerified=true без packageMember, а з повним provenance — записувати хеш; отримано: $updaterSummary"
+    }
+
     # Маніфест шукається в тому самому каталозі, що й самі утиліти
     # (Tools\), а не поруч зі скриптом — BRAVO.config і всі три runtime
     # (fallback на випадок непридатної конфігурації) мають бути
@@ -4075,6 +4201,53 @@ if ($r.StateUpdated -and -not [IO.File]::Exists($PassedPath)) { exit 0 } else { 
         -BuildId "testbuild"
     $discordChunks = @(Split-DiscordNotificationText -Message (ConvertTo-DiscordNotificationText -Message $longDiscord))
     Test-BRAVOCondition -Condition ($discordChunks.Count -gt 1 -and @($discordChunks | Where-Object { $_.Length -gt 1900 }).Count -eq 0) -Name "Notifications/DiscordChunkingStillWorks" -Failure "long Discord notifications мають chunking (defense-in-depth під payload guard-ом)"
+
+    # BRAVO-T023 (аудит F024): чанкер Discord має ОДНУ реалізацію
+    # (BRAVO.Notifications). Раніше Archive runtime тінив експорт через
+    # function global:, і поведінка залежала від того, чи завантажено Archive.
+    $discordChunkLines = @(Split-DiscordNotificationText -Message ((("a" * 1000) + "`r`n") * 3) -MaximumLength 1900)
+    Test-BRAVOCondition `
+        -Condition (
+            $discordChunkLines.Count -eq 2 -and
+            @($discordChunkLines | Where-Object { $_.Contains("`r") }).Count -eq 0 -and
+            $discordChunkLines[0] -eq ("a" * 1000 + "`n" + "a" * 899)
+        ) `
+        -Name "Notifications/DiscordChunksJoinWithLineFeed" `
+        -Failure "частини Discord мають з'єднувати рядки LF (без CR) і заповнюватись до MaximumLength; отримано частин: $($discordChunkLines.Count)"
+    # Крайові випадки єдиного чанкера: порожнє повідомлення і $null дають
+    # рівно одну порожню частину (виклик без повідомлення не губить
+    # надсилання); рядок довжиною рівно MaximumLength — одна частина, на
+    # один символ довший — дві, і жодна не перевищує межі; MaximumLength
+    # поза 100..2000 відхиляється, а не тихо ламає розбиття.
+    $discordEmptyChunks = @(Split-DiscordNotificationText -Message '')
+    $discordNullChunks = @(Split-DiscordNotificationText -Message $null)
+    $discordExactChunks = @(Split-DiscordNotificationText -Message ('b' * 1900) -MaximumLength 1900)
+    $discordOverChunks = @(Split-DiscordNotificationText -Message ('b' * 1901) -MaximumLength 1900)
+    $discordRangeRejected = $false
+    try { [void](Split-DiscordNotificationText -Message 'x' -MaximumLength 99) } catch { $discordRangeRejected = $true }
+    Test-BRAVOCondition `
+        -Condition (
+            $discordEmptyChunks.Count -eq 1 -and $discordEmptyChunks[0] -eq '' -and
+            $discordNullChunks.Count -eq 1 -and $discordNullChunks[0] -eq '' -and
+            $discordExactChunks.Count -eq 1 -and $discordExactChunks[0].Length -eq 1900 -and
+            $discordOverChunks.Count -eq 2 -and $discordOverChunks[0].Length -eq 1900 -and $discordOverChunks[1] -eq 'b' -and
+            $discordRangeRejected
+        ) `
+        -Name "Notifications/DiscordChunkerEdgeCases" `
+        -Failure "чанкер Discord: порожнє/null -> одна порожня частина, рівно MaximumLength -> одна частина, +1 символ -> дві, MaximumLength < 100 відхиляється; отримано: empty=$($discordEmptyChunks.Count) null=$($discordNullChunks.Count) exact=$($discordExactChunks.Count) over=$($discordOverChunks.Count) rangeRejected=$discordRangeRejected"
+    $discordChunkerDefinitions = New-Object System.Collections.Generic.List[string]
+    foreach ($productionScript in @(Get-ChildItem -LiteralPath (Join-Path $root 'modules') -Recurse -File -Include '*.ps1', '*.psm1')) {
+        $productionAst = [Management.Automation.Language.Parser]::ParseFile($productionScript.FullName, [ref]$null, [ref]$null)
+        foreach ($functionAst in @($productionAst.FindAll({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] }, $true))) {
+            if ($functionAst.Name -match '^(global:|script:)?Split-DiscordNotificationText$') {
+                [void]$discordChunkerDefinitions.Add("$($productionScript.Name): $($functionAst.Name)")
+            }
+        }
+    }
+    Test-BRAVOCondition `
+        -Condition ($discordChunkerDefinitions.Count -eq 1 -and $discordChunkerDefinitions[0] -eq 'BRAVO.Notifications.psm1: Split-DiscordNotificationText') `
+        -Name "Notifications/DiscordChunkerHasSingleDefinition" `
+        -Failure "Split-DiscordNotificationText має бути визначений лише в BRAVO.Notifications.psm1, без global:-тіні; знайдено: $($discordChunkerDefinitions -join '; ')"
 
     # ============================================================
     # Compact list summary + глобальний payload guard (compact alerts).
@@ -8000,7 +8173,7 @@ $results['E_SnapshotNulled'] = ($null -eq $snapshotsE[0].SecureSecret)
             $maintenanceScriptText.Contains("Send-InactiveServiceWarning") -and
             $maintenanceScriptText.Contains("СЛУЖБИ НЕ ЗАПУЩЕНІ ПЕРЕД MAINTENANCE") -and
             $maintenanceScriptText.Contains("BRAVO.Notifications") -and
-            $notificationScriptText.Contains('$availableLength -= [Environment]::NewLine.Length')
+            $notificationScriptText.Contains('$newlineLength = if ($currentChunk.Length -gt 0) {')
         ) `
         -Name "Notifications/MaintenanceInactiveServices" `
         -Failure "maintenance має негайно сповіщати про початково зупинені служби"
