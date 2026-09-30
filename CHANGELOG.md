@@ -2,6 +2,105 @@
 
 ## Не випущено (developer)
 
+- **Security: перенаправлений маніфест інструментів тепер блокує запуск (BRAVO-T001).**
+  `Test-BRAVOEffectiveSecurityInvariants` (`BRAVO_CONFIG_LOADER.ps1`) перевіряє
+  ефективний `toolIntegritySettings.ManifestPath`: будь-яке значення, відмінне від
+  канонічного `<RuntimeRoot>\Tools\TOOLS_MANIFEST.json`, вважається послабленням захисту
+  і в режимі `Enforce` блокує запуск, як і `toolIntegritySettings.Mode`. Якір довіри —
+  `RuntimeRoot`: сам `toolsPath` теж має дорівнювати `<RuntimeRoot>\Tools`, тож спільне
+  перенаправлення каталогу інструментів і маніфесту не проходить. Порівняння шляхів
+  враховує регістр (на NTFS із per-directory case sensitivity інший регістр — інший
+  файл), а контейнер налаштувань перевіряється як будь-який `IDictionary`, як і в
+  runtime-споживачів. Сьогодні цей ключ
+  не можна перевизначити через конфігурацію (його завжди виводить
+  `Resolve-BRAVOConfigurationDerivation`), тому на наявних серверах поведінка не
+  змінюється; перевірка захищає від майбутньої регресії, за якої підмінений 7-Zip чи
+  WinSCP пройшов би перевірку цілісності проти чужого маніфесту. Нові self-test
+  перевірки: `ConfigLoader/ToolManifestPathRedirectionBlocks`,
+  `ConfigLoader/ToolManifestPathCanonicalAllowed`;
+  `ConfigLoader/ToolManifestPathEdgeCasesFailClosed` фіксує крайові випадки:
+  порожній і синтаксично зіпсований шлях, `..` за межі `Tools\`, інший регістр
+  імені файла, спільне перенаправлення `toolsPath` і маніфесту та перенаправлення в
+  `OrderedDictionary` блокуються, а `..`, що після нормалізації веде до того самого
+  канонічного файла, допускається.
+- **Походження бінарників у `Tools\TOOLS_MANIFEST.json` (BRAVO-T021).**
+  Для кожного інструмента маніфест тепер містить запис `provenance`: версію,
+  офіційне джерело пакета, SHA-256 пакета, шлях файлу в пакеті й дату завантаження.
+  7-Zip `26.02` (`7za.exe`, `7za.dll`, `7zxa.dll`) побайтово збігається з
+  `7z2602-extra.7z`, WinSCP `6.5.6` (`WinSCP.com`, `WinSCP.exe`) — з
+  `WinSCP-6.5.6-Portable.zip`, `WinSCPnet.dll` — з `WinSCP-6.5.6-Automation.zip`.
+  `DragExt64.dll` має версію `6.5.3`, не входить до пакетів 6.5.6 і позначений
+  `upstreamVerified = false`. `ci\Update-BRAVOToolsManifest.ps1 -Apply` відмовляє
+  (код `1`), доки для нового чи зміненого бінарника немає запису `provenance` з тим
+  самим `sha256`. Новий самотест `ToolManifest/EveryToolHasProvenance`, а
+  `ToolManifest/UpdaterApplyRequiresProvenance` запускає справжній updater на
+  тимчасовому корені: без `provenance`, із застарілим `sha256` і з записом для
+  видаленого інструмента `-Apply` завершується кодом `1` і не змінює маніфест. Гейт
+  спрацьовує й тоді, коли хеші в `tools` уже актуальні (перевірка стоїть до виходу
+  «розбіжностей немає»), а запис з `upstreamVerified = true` вимагає `packageSha256` і
+  непорожній `packageMember`, щоб перевірку можна було відтворити. Runtime-перевірка
+  цілісності читає лише `tools`, тож поведінка серверів не змінюється.
+- **Одна реалізація чанкера Discord (BRAVO-T023, крок 1).** `BRAVO.Archive.Runtime.ps1`
+  більше не оголошує власну `function global:Split-DiscordNotificationText`, яка тінила
+  експорт `BRAVO.Notifications` у всьому процесі. Канонічною стала поведінка з Archive:
+  рядки всередині частини з'єднуються LF (раніше модуль з'єднував через
+  `[Environment]::NewLine`, тобто CRLF на Windows), межі `MaximumLength` перевіряються, порожнє
+  повідомлення дає одну порожню частину. Для оператора змінюється лише те, що довгі
+  Discord-повідомлення поза Archive можуть ділитися на трохи менше частин. Нові самотести
+  `Notifications/DiscordChunksJoinWithLineFeed`, `Notifications/DiscordChunkerHasSingleDefinition` і
+  `Notifications/DiscordChunkerEdgeCases` (порожнє повідомлення, `$null`, межа `MaximumLength`,
+  відхилення `MaximumLength` поза 100..2000).
+- **DataRestore надсилає сповіщення через `Send-BRAVONotification` (BRAVO-T023, крок 2).**
+  `Send-BRAVODataRestoreNotification` більше не збирає власний ланцюжок
+  route → endpoint → payload → доставка, а викликає канонічну `Send-BRAVONotification`.
+  У неї додано перемикач `-SkipWhenEndpointUnavailable`: ненастроєний webhook
+  повертає `Sent = $false`, `Reason = 'EndpointUnavailable'` замість винятку. Тож
+  DataRestore, як і раніше, пише WARNING «не налаштовано — сповіщення пропущено» без
+  збільшення лічильника WARNING, а збій доставки лишається окремою подією. Інші
+  виклики `Send-BRAVONotification` без перемикача поводяться як раніше. Єдина
+  відмінність для оператора: відомості про хост для тексту сповіщення тепер
+  збираються й тоді, коли webhook не налаштовано. Нові самотести
+  `DataRestore/NotificationMissingEndpointSkipsWithoutWarningCount` і
+  `DataRestore/NotificationDeliveryFailureCountsWarning`: збій доставки при
+  налаштованому webhook, на відміну від ненастроєного, збільшує лічильник
+  WARNING рівно на 1 і не виходить за межі функції.
+- **Archive: статус-файл записується й на прогонах зі збоєм компонента.**
+  Під `Set-StrictMode -Version 2.0`, яку вмикає `BRAVO_CONFIG_LOADER.ps1`,
+  підсумок `totalCreatedBytes` для machine-readable статус-файла
+  (`BRAVO.Status`, ROADMAP P2.1) звертався до ключа `Bytes` кожного
+  результату компонента, а цей ключ є лише в опублікованих компонентів.
+  На будь-якому прогоні з невдалим компонентом (збій VSS, конфігурації,
+  access-probe, дрейф, збій архівації) звернення кидало виняток, fail-soft
+  catch лише писав його в журнал, і статус-файл лишався від попереднього
+  прогону — моніторинг бачив застарілий стан. Тепер ключ перевіряється
+  через `ContainsKey('Bytes')`. Код завершення й Operations-подія не
+  змінюються. Перевірка `Archive/OrchestrationReleasesSnapshotWhenComponentFails`
+  тепер вимагає запису статусу з кодом 40.
+
+- **Archive: поведінкові тести оркестрації Main (T011, аудит F010).**
+  Порядок фаз, звільнення ресурсів узгодженої копії й код завершення Archive
+  досі перевірялись лише структурно. Archive не зупиняє служб — узгодженість
+  дає один VSS Snapshot Set на generation, тому парні ресурси прогону тут —
+  VSS Snapshot Set (разом із файлом ownership state) і process lock. Нові
+  перевірки фрагмента `selftest/BRAVO_SELF_TEST.Archive.ps1` запускають у
+  дочірньому процесі runtime, зібраний з дослівного тексту
+  `BRAVO.Archive.Runtime.ps1` (справжні `Main`, зовнішній
+  `try`/`catch`/`finally` і фінальний `Exit`) через справжній
+  `Invoke-BRAVOArchiveEntrypoint`; VSS, 7-Zip, manifest, retention, Health,
+  статус-файл і Operations-подію замінюють стаби, що журналюють події.
+  Жодних VSS-знімків, служб чи мережі тест не чіпає.
+  `Archive/OrchestrationRunsPhasesInContractOrder` фіксує повну
+  послідовність фаз щасливого шляху (`[1/8]`…`[8/8]`, VSS до архівації й
+  видалення після неї, retention лише після manifest `COMPLETE`, lock
+  звільнено останнім) і код 0;
+  `Archive/OrchestrationReleasesSnapshotWhenComponentFails` — збій архівації
+  компонента: знімок видалено рівно раз, retention для `FAILED` generation
+  не запускається, код 40 (`LocalArchiveFailed`);
+  `Archive/OrchestrationReleasesSnapshotAndLockWhenPhaseThrows` —
+  необроблений виняток посеред фази архівації: знімок видалено у `finally`
+  до обробки винятку, пізніші фази не виконуються, код 90 (`InternalError`)
+  у процесі, статусі й Operations-події, lock звільнено останнім.
+  Production-код не змінено.
 - **Health: поведінкові тести оркестрації `Invoke-BRAVOHealth` (T011, аудит F010).**
   Досі оркестрацію Health перевіряли лише текстові контракти (`IndexOf`/`Contains`
   по тексту runtime). Шість нових перевірок `BRAVO_SELF_TEST.ps1` справді

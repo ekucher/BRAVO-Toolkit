@@ -3409,6 +3409,23 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             $true
         )
     ) | Select-Object -First 1
+    # BRAVO-T023: DataRestore шле через канонічну Send-BRAVONotification —
+    # вона теж береться справжньою (AST модуля); її внутрішні виклики
+    # нижчих стадій потрапляють у заглушки нижче.
+    $composedFunctionAstForDataRestore = @(
+        $routingAstForDataRestore.FindAll(
+            {
+                param($candidate)
+                $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and
+                $candidate.Name -eq 'Send-BRAVONotification'
+            },
+            $true
+        )
+    ) | Select-Object -First 1
+    Test-BRAVOCondition `
+        -Condition ($null -ne $composedFunctionAstForDataRestore) `
+        -Name "DataRestore/NotificationComposedFunctionAvailable" `
+        -Failure "Send-BRAVONotification не знайдено в modules\BRAVO.Notifications\BRAVO.Notifications.psm1"
     Test-BRAVOCondition `
         -Condition ($null -ne $routeFunctionAstForDataRestore) `
         -Name "DataRestore/NotificationRoutingCanonicalFunctionAvailable" `
@@ -3422,15 +3439,17 @@ function Invoke-BRAVODataRestoreWinSCPScript {
         -SourceText $dataRestoreRuntimeTextForTests `
         -FunctionNames @('Send-BRAVODataRestoreNotification')
 
-    $dataRestoreNotificationProbe = if ($null -eq $routeFunctionAstForDataRestore) {
-        [pscustomobject]@{ ResolvedEndpointRoutes = @(); SentBatches = @(); WarningCount = -1; Logs = @() }
+    $dataRestoreNotificationProbe = if ($null -eq $routeFunctionAstForDataRestore -or $null -eq $composedFunctionAstForDataRestore) {
+        [pscustomobject]@{ ResolvedEndpointRoutes = @(); SentBatches = @(); WarningCount = -1; Logs = @(); MissingEndpoint = $null; DeliveryFailure = $null }
     } else {
         & $dataRestoreNotificationModule {
-            param([string]$RoutingDefinition)
+            param([string]$RoutingDefinition, [string]$ComposedDefinition)
 
-            # Реальний Resolve-BRAVONotificationRoute у scope модуля разом з
-            # module-scope дефолтною таблицею, на яку він посилається.
+            # Реальні Resolve-BRAVONotificationRoute і Send-BRAVONotification
+            # у scope модуля разом з module-scope дефолтною таблицею, на яку
+            # посилається routing.
             . ([scriptblock]::Create($RoutingDefinition))
+            . ([scriptblock]::Create($ComposedDefinition))
             $script:BRAVODefaultNotificationRouting = @{
                 SUCCESS = 'general'; WARNING = 'alerts'; ERROR = 'alerts'; CRITICAL = 'alerts'
             }
@@ -3467,9 +3486,13 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             function Get-HostInformation {
                 [pscustomobject]@{ MachineName = 'TEST-HOST'; LocalIP = '127.0.0.1'; PublicIP = 'вимкнено' }
             }
+            $script:endpointMissing = $false
             function Resolve-BRAVONotificationEndpoint {
                 param([string]$Provider, [string]$Route, [hashtable]$CredentialTargets)
                 [void]$script:resolvedEndpointRoutes.Add("$Provider/$Route")
+                if ($script:endpointMissing) {
+                    throw "Webhook для $Provider/$Route не налаштовано в Credential Manager"
+                }
                 return "https://example.invalid/$Route"
             }
             function New-BRAVOOperatorNotificationMessage {
@@ -3485,8 +3508,12 @@ function Invoke-BRAVODataRestoreWinSCPScript {
                 param([string]$Provider, [string]$Message)
                 return @($Message)
             }
+            $script:deliveryFails = $false
             function Send-BRAVONotificationChunks {
                 param([string]$Provider, [string]$WebhookUrl, [string[]]$MessageChunks, [int]$TimeoutSeconds)
+                if ($script:deliveryFails) {
+                    throw 'self-test: імітований збій транспорту webhook'
+                }
                 [void]$script:sentChunkBatches.Add([pscustomobject]@{
                     WebhookUrl = $WebhookUrl
                     ChunkCount = @($MessageChunks).Count
@@ -3509,14 +3536,78 @@ function Invoke-BRAVODataRestoreWinSCPScript {
             Send-BRAVODataRestoreNotification -Severity 'CRITICAL' -ResultLines @('Відновлення завершилось помилкою (код 43).') -ActionText 'перевірити журнал'
             Send-BRAVODataRestoreNotification -Severity 'SUCCESS' -ResultLines @('Відновлення завершено успішно.')
 
-            [pscustomobject]@{
-                ResolvedEndpointRoutes = $script:resolvedEndpointRoutes.ToArray()
-                SentBatches = $script:sentChunkBatches.ToArray()
+            $resolvedEndpointRoutesSnapshot = $script:resolvedEndpointRoutes.ToArray()
+            $sentChunkBatchesSnapshot = $script:sentChunkBatches.ToArray()
+            $warningCountSnapshot = $script:dataRestoreWarningCount
+            $logsSnapshot = $script:BRAVOSelfTestNotificationLogs.ToArray()
+
+            # BRAVO-T023: ненастроєний webhook — штатний пропуск (WARNING у
+            # журналі), не збій доставки: лічильник WARNING не зростає і
+            # нічого не надсилається.
+            $script:endpointMissing = $true
+            $script:BRAVOSelfTestNotificationLogs.Clear()
+            $sentBeforeMissing = $script:sentChunkBatches.Count
+            Send-BRAVODataRestoreNotification -Severity 'WARNING' -ResultLines @('Відновлення завершено з попередженнями.')
+            $missingEndpointResult = [pscustomobject]@{
+                SentDelta = $script:sentChunkBatches.Count - $sentBeforeMissing
                 WarningCount = $script:dataRestoreWarningCount
                 Logs = $script:BRAVOSelfTestNotificationLogs.ToArray()
             }
-        } $routeFunctionAstForDataRestore.Extent.Text
+
+            # Збій доставки (endpoint є, транспорт кидає) — на відміну від
+            # ненастроєного webhook — лишається збоєм: лічильник WARNING
+            # зростає рівно на 1, журнал містить причину, а виняток не
+            # виходить за межі функції (сповіщення не валить відновлення).
+            $script:endpointMissing = $false
+            $script:deliveryFails = $true
+            $script:BRAVOSelfTestNotificationLogs.Clear()
+            $warningBeforeDeliveryFailure = $script:dataRestoreWarningCount
+            $deliveryFailureEscaped = $false
+            try {
+                Send-BRAVODataRestoreNotification -Severity 'CRITICAL' -ResultLines @('Відновлення завершилось помилкою.')
+            } catch {
+                $deliveryFailureEscaped = $true
+            }
+            $deliveryFailureResult = [pscustomobject]@{
+                WarningDelta = $script:dataRestoreWarningCount - $warningBeforeDeliveryFailure
+                Escaped = $deliveryFailureEscaped
+                LastRoute = $script:resolvedEndpointRoutes[$script:resolvedEndpointRoutes.Count - 1]
+                Logs = $script:BRAVOSelfTestNotificationLogs.ToArray()
+            }
+            $script:deliveryFails = $false
+
+            [pscustomobject]@{
+                ResolvedEndpointRoutes = $resolvedEndpointRoutesSnapshot
+                SentBatches = $sentChunkBatchesSnapshot
+                WarningCount = $warningCountSnapshot
+                Logs = $logsSnapshot
+                MissingEndpoint = $missingEndpointResult
+                DeliveryFailure = $deliveryFailureResult
+            }
+        } $routeFunctionAstForDataRestore.Extent.Text $composedFunctionAstForDataRestore.Extent.Text
     }
+
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $dataRestoreNotificationProbe.MissingEndpoint -and
+            $dataRestoreNotificationProbe.MissingEndpoint.SentDelta -eq 0 -and
+            $dataRestoreNotificationProbe.MissingEndpoint.WarningCount -eq 0 -and
+            @($dataRestoreNotificationProbe.MissingEndpoint.Logs | Where-Object { $_ -eq "WARNING|Webhook для 'discord/alerts' не налаштовано — сповіщення пропущено" }).Count -eq 1
+        ) `
+        -Name "DataRestore/NotificationMissingEndpointSkipsWithoutWarningCount" `
+        -Failure "ненастроєний webhook має давати один WARNING 'не налаштовано — сповіщення пропущено' без зростання лічильника WARNING і без відправлення; отримано: $(@($dataRestoreNotificationProbe.MissingEndpoint.Logs) -join ' || ')"
+
+    Test-BRAVOCondition `
+        -Condition (
+            $null -ne $dataRestoreNotificationProbe.DeliveryFailure -and
+            $dataRestoreNotificationProbe.DeliveryFailure.WarningDelta -eq 1 -and
+            -not [bool]$dataRestoreNotificationProbe.DeliveryFailure.Escaped -and
+            $dataRestoreNotificationProbe.DeliveryFailure.LastRoute -eq 'discord/alerts' -and
+            @($dataRestoreNotificationProbe.DeliveryFailure.Logs | Where-Object { $_ -like 'WARNING|Не вдалося надіслати сповіщення:*імітований збій транспорту*' }).Count -eq 1 -and
+            @($dataRestoreNotificationProbe.DeliveryFailure.Logs | Where-Object { $_ -like '*не налаштовано*' }).Count -eq 0
+        ) `
+        -Name "DataRestore/NotificationDeliveryFailureCountsWarning" `
+        -Failure "збій доставки (endpoint налаштовано, транспорт кидає) має збільшити лічильник WARNING рівно на 1, записати причину й не виходити за межі функції — і не плутатися з ненастроєним webhook; отримано: $($dataRestoreNotificationProbe.DeliveryFailure | ConvertTo-Json -Compress -Depth 3)"
 
     Test-BRAVOCondition `
         -Condition (
