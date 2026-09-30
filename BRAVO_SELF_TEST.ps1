@@ -12314,14 +12314,19 @@ try {
     # бачить номер і назву, які обчислила справжня
     # Write-BRAVOMaintenanceStep). Зібраний runtime запускається через
     # справжній Invoke-BRAVOMaintenanceEntrypoint (& runtime, $LASTEXITCODE,
-    # catch -> 90). Стаби живуть лише в дочірньому процесі й не можуть
-    # просочитися в сесію самотесту; реальні служби не чіпаються.
-    $maintenanceOrchestrationRoot = Join-Path `
-        -Path ([IO.Path]::GetTempPath()) `
-        -ChildPath ("BRAVO_MAINTENANCE_ORCHESTRATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
-    try {
-        [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationRoot)
-        $maintenanceOrchestrationStubs = @'
+    # catch -> 90). Сценарії: щасливий шлях, необроблений виняток у кроці
+    # [4/8] і контрольований збій зупинки служби (код 60). Стаби живуть лише
+    # в дочірньому процесі й не можуть просочитися в сесію самотесту;
+    # реальні служби не чіпаються. Увесь блок — у ДОЧІРНЬОМУ scope
+    # (`& { ... }`): жодна з його змінних не лишається у script-scope цього
+    # flat-файлу (ліміт змінних на область, див. #163 на початку файлу).
+    & {
+        $maintenanceOrchestrationRoot = Join-Path `
+            -Path ([IO.Path]::GetTempPath()) `
+            -ChildPath ("BRAVO_MAINTENANCE_ORCHESTRATION_SELF_TEST_{0}" -f [guid]::NewGuid().ToString("N"))
+        try {
+            [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationRoot)
+            $maintenanceOrchestrationStubs = @'
 function Add-ProbeEvent { param([string]$Text) [IO.File]::AppendAllText($script:ProbeEventsPath, $Text + "`n", (New-Object Text.UTF8Encoding($false))) }
 function Get-Service {
     param([string]$Name, $ErrorAction)
@@ -12337,6 +12342,9 @@ function Start-Service {
 }
 function Stop-Service {
     param([string]$Name, [switch]$Force, $WarningAction, $ErrorAction, $ErrorVariable)
+    # Служба, що «не зупиняється»: стан лишається Running, тож справжній
+    # Invoke-ServiceStateChange дочекається таймауту й поверне Success=$false.
+    if (@($script:ProbeStopFailures) -contains $Name) { Add-ProbeEvent "STOP-FAIL $Name"; return }
     Add-ProbeEvent "STOP $Name"
     $script:ProbeServices[$Name] = 'Stopped'
 }
@@ -12397,10 +12405,10 @@ function Send-FinalReport { param($LOG_FILE) Add-ProbeEvent 'FINAL-REPORT' }
 function Send-BRAVOMaintenanceOperationsEvent { param($ExitCode, $ElapsedTime) }
 function Write-BRAVOTaskExecutionState { param($TaskName) }
 function Write-BRAVOOperationStatus { param($StateRoot, $Operation, $ExitCode, $ExitCodeName, $StartedAt, $FinishedAt, $Details) Add-ProbeEvent "STATUS $ExitCode" }
-function Invoke-BRAVOMaintenanceOwnLogUpload { }
-function Wait-BRAVOManualExit { param([switch]$NoPause) }
+function Invoke-BRAVOMaintenanceOwnLogUpload { Add-ProbeEvent 'OWNLOG-UPLOAD' }
+function Wait-BRAVOManualExit { param([switch]$NoPause) Add-ProbeEvent ("MANUAL-EXIT NoPause={0}" -f [bool]$NoPause) }
 '@
-        $maintenanceOrchestrationSeed = @'
+            $maintenanceOrchestrationSeed = @'
 $global:ScriptVersion = 'self-test'
 $script:ScriptVersion = 'self-test'
 $script:ScriptStartTime = Get-Date
@@ -12510,7 +12518,7 @@ $SevenZipIntegrityTestTimeoutSeconds = 1
 $script:MaintenanceLegacyBomFallbackArchives = New-Object 'System.Collections.Generic.List[string]'
 $RAW_SOURCE_GRACE_DAYS = 1
 '@
-        $maintenanceOrchestrationProbeScript = @'
+            $maintenanceOrchestrationProbeScript = @'
 param([string]$Scenario, [string]$RepositoryRoot, [string]$ProbeRoot)
 $ErrorActionPreference = 'Stop'
 $probeResultPath = Join-Path $ProbeRoot 'result.json'
@@ -12570,7 +12578,7 @@ try {
     }
 
     $probeEventsPath = Join-Path $ProbeRoot 'events.txt'
-    $probeServiceTable = if ($Scenario -eq 'Happy') {
+    $probeServiceTable = if ($Scenario -ne 'ThrowInSizeCheck') {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Running'; 'BravoWeb' = 'Running' }"
     } else {
         "@{ 'BRAVO' = 'Running'; 'exchangAPI' = 'Stopped'; 'BravoWeb' = 'Running' }"
@@ -12579,7 +12587,8 @@ try {
         ('$script:ProbeEventsPath = ''{0}''' -f $probeEventsPath.Replace("'", "''")),
         ('$probeWorkRoot = ''{0}''' -f $ProbeRoot.Replace("'", "''")),
         ('$script:ProbeServices = {0}' -f $probeServiceTable),
-        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' }))
+        ('$script:ProbeThrowInSizeCheck = {0}' -f $(if ($Scenario -eq 'ThrowInSizeCheck') { '$true' } else { '$false' })),
+        ('$script:ProbeStopFailures = {0}' -f $(if ($Scenario -eq 'StopFailure') { "@('BravoWeb')" } else { '@()' }))
     ) -join "`n"
     $probeGenerated = @(
         $probeAst.ParamBlock.Extent.Text,
@@ -12625,136 +12634,192 @@ try {
 }
 [IO.File]::WriteAllText($probeResultPath, ($probeResult | ConvertTo-Json -Compress -Depth 4), $probeUtf8)
 '@
-        $maintenanceOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
-        [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'stubs.ps1'), $maintenanceOrchestrationStubs, $maintenanceOrchestrationUtf8)
-        [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'seed.ps1'), $maintenanceOrchestrationSeed, $maintenanceOrchestrationUtf8)
-        $maintenanceOrchestrationProbePath = Join-Path $maintenanceOrchestrationRoot 'probe.ps1'
-        [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
-        $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-        $maintenanceOrchestrationResults = @{}
-        foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck')) {
-            $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
-            [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
-            $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
-                -ExecutionPolicy Bypass -File $maintenanceOrchestrationProbePath `
-                -Scenario $maintenanceOrchestrationScenario -RepositoryRoot $root -ProbeRoot $maintenanceOrchestrationScenarioRoot
-            $maintenanceOrchestrationResultPath = Join-Path $maintenanceOrchestrationScenarioRoot 'result.json'
-            $maintenanceOrchestrationResults[$maintenanceOrchestrationScenario] = if (Test-Path -LiteralPath $maintenanceOrchestrationResultPath -PathType Leaf) {
-                [IO.File]::ReadAllText($maintenanceOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
-            } else {
-                [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
+            $maintenanceOrchestrationUtf8 = New-Object Text.UTF8Encoding($false)
+            [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'stubs.ps1'), $maintenanceOrchestrationStubs, $maintenanceOrchestrationUtf8)
+            [IO.File]::WriteAllText((Join-Path $maintenanceOrchestrationRoot 'seed.ps1'), $maintenanceOrchestrationSeed, $maintenanceOrchestrationUtf8)
+            $maintenanceOrchestrationProbePath = Join-Path $maintenanceOrchestrationRoot 'probe.ps1'
+            [IO.File]::WriteAllText($maintenanceOrchestrationProbePath, $maintenanceOrchestrationProbeScript, (New-Object Text.UTF8Encoding($true)))
+            $maintenanceOrchestrationHost = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+            $maintenanceOrchestrationResults = @{}
+            foreach ($maintenanceOrchestrationScenario in @('Happy', 'ThrowInSizeCheck', 'StopFailure')) {
+                $maintenanceOrchestrationScenarioRoot = Join-Path $maintenanceOrchestrationRoot $maintenanceOrchestrationScenario
+                [void][IO.Directory]::CreateDirectory($maintenanceOrchestrationScenarioRoot)
+                $null = & $maintenanceOrchestrationHost -NoLogo -NoProfile -NonInteractive `
+                    -ExecutionPolicy Bypass -File $maintenanceOrchestrationProbePath `
+                    -Scenario $maintenanceOrchestrationScenario -RepositoryRoot $root -ProbeRoot $maintenanceOrchestrationScenarioRoot
+                $maintenanceOrchestrationResultPath = Join-Path $maintenanceOrchestrationScenarioRoot 'result.json'
+                $maintenanceOrchestrationResults[$maintenanceOrchestrationScenario] = if (Test-Path -LiteralPath $maintenanceOrchestrationResultPath -PathType Leaf) {
+                    [IO.File]::ReadAllText($maintenanceOrchestrationResultPath, [Text.Encoding]::UTF8) | ConvertFrom-Json
+                } else {
+                    [pscustomobject]@{ ProbeError = "проба не записала result.json (код виходу $LASTEXITCODE)" }
+                }
             }
-        }
-        $maintenanceOrchestrationStepPattern = '^STEP (\d+)/(\d+) (.+) (OK|SKIPPED|WARN|FAIL)$'
-        $maintenanceOrchestrationEventIndex = {
-            param([object[]]$Events, [string]$Pattern)
-            for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
-                if ([string]$Events[$eventIndex] -match $Pattern) { return $eventIndex }
+            $maintenanceOrchestrationStepPattern = '^STEP (\d+)/(\d+) (.+) (OK|SKIPPED|WARN|FAIL)$'
+            $maintenanceOrchestrationEventIndex = {
+                param([object[]]$Events, [string]$Pattern)
+                for ($eventIndex = 0; $eventIndex -lt $Events.Count; $eventIndex++) {
+                    if ([string]$Events[$eventIndex] -match $Pattern) { return $eventIndex }
+                }
+                return -1
             }
-            return -1
-        }
+            # Хвіст журналу в БУДЬ-якому сценарії: lock звільняє finally
+            # операційного блоку, а за ним — лише справжній зовнішній finally
+            # (call site №2 вивантаження власного логу й Wait-BRAVOManualExit з
+            # -NoPause, переданим через Invoke-BRAVOMaintenanceEntrypoint).
+            $maintenanceOrchestrationFinallyTail = {
+                param([object[]]$Events)
+                $tailCount = $Events.Count
+                return ($tailCount -ge 3 -and
+                    [string]$Events[$tailCount - 3] -ceq 'LOCK-EXIT' -and
+                    [string]$Events[$tailCount - 2] -ceq 'OWNLOG-UPLOAD' -and
+                    [string]$Events[$tailCount - 1] -ceq 'MANUAL-EXIT NoPause=True' -and
+                    @($Events | Where-Object { $_ -ceq 'LOCK-EXIT' }).Count -eq 1 -and
+                    @($Events | Where-Object { $_ -ceq 'LOCK-ENTER' }).Count -eq 1)
+            }
 
-        # (1) Щасливий шлях: рівно 8 кроків у затвердженому порядку [1/8]..[8/8];
-        # маркер quiescence до першої зупинки, зупинки — між кроками 2 і 3,
-        # старти — між кроками 6 і 7 (finally), маркер прибрано до кроку 7,
-        # lock звільнено останнім; код завершення 0 (Success).
-        $maintenanceHappy = $maintenanceOrchestrationResults['Happy']
-        $maintenanceHappyEvents = @()
-        $maintenanceHappyStepLabels = @()
-        if ($null -eq $maintenanceHappy.PSObject.Properties['ProbeError']) {
-            $maintenanceHappyEvents = @($maintenanceHappy.Events | ForEach-Object { [string]$_ })
-            $maintenanceHappyStepLabels = @($maintenanceHappyEvents | Where-Object { $_ -match $maintenanceOrchestrationStepPattern } | ForEach-Object {
-                    [void]($_ -match $maintenanceOrchestrationStepPattern)
-                    "[{0}/{1}] {2}" -f $Matches[1], $Matches[2], $Matches[3]
-                })
-        }
-        $maintenanceExpectedStepLabels = @(
-            '[1/8] Перевірка вільного місця',
-            '[2/8] Створення необхідних директорій',
-            '[3/8] Зупинка служб',
-            '[4/8] Перевірка розмірів .md',
-            '[5/8] Реставрація моделі',
-            '[6/8] Обробка trace і логів',
-            '[7/8] Відновлення стану служб',
-            '[8/8] Контроль діапазонів ID'
-        )
-        $maintenanceOrchestrationHappyStep2 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 2/8 '
-        $maintenanceOrchestrationHappyStep3 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 3/8 '
-        $maintenanceOrchestrationHappyStep6 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 6/8 '
-        $maintenanceOrchestrationHappyStep7 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 7/8 '
-        $maintenanceOrchestrationHappyMarkerWrite = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^MARKER-WRITE '
-        $maintenanceOrchestrationHappyMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^MARKER-CLEAR$'
-        $maintenanceOrchestrationHappyStops = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents ('^STOP {0}$' -f $maintenanceOrchestrationServiceName) })
-        $maintenanceOrchestrationHappyStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
-        Test-BRAVOCondition `
-            -Condition (
-                $null -eq $maintenanceHappy.PSObject.Properties['ProbeError'] -and
-                $maintenanceHappy.ExitCode -eq 0 -and
-                ($maintenanceHappyStepLabels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|') -and
-                @($maintenanceHappyEvents | Where-Object { $_ -match '^STEP .* FAIL$' }).Count -eq 0 -and
-                $maintenanceOrchestrationHappyMarkerWrite -ge 0 -and $maintenanceOrchestrationHappyMarkerWrite -gt $maintenanceOrchestrationHappyStep2 -and
-                @($maintenanceOrchestrationHappyStops | Where-Object { $_ -le $maintenanceOrchestrationHappyMarkerWrite -or $_ -ge $maintenanceOrchestrationHappyStep3 }).Count -eq 0 -and
-                @($maintenanceOrchestrationHappyStarts | Where-Object { $_ -le $maintenanceOrchestrationHappyStep6 -or $_ -ge $maintenanceOrchestrationHappyStep7 }).Count -eq 0 -and
-                $maintenanceOrchestrationHappyMarkerClear -gt ($maintenanceOrchestrationHappyStarts | Measure-Object -Maximum).Maximum -and
-                $maintenanceOrchestrationHappyMarkerClear -lt $maintenanceOrchestrationHappyStep7 -and
-                $maintenanceHappyEvents.Count -gt 0 -and
-                $maintenanceHappyEvents[$maintenanceHappyEvents.Count - 1] -eq 'LOCK-EXIT'
-            ) `
-            -Name "Maintenance/OrchestrationRunsStepsInContractOrder" `
-            -Failure "Maintenance на щасливому шляху має виконати рівно [1/8]..[8/8] у затвердженому порядку (зупинка служб між 2 і 3, старт між 6 і 7, маркер до першої зупинки й прибраний до [7/8], lock звільнено останнім) і завершитися кодом 0; проба: $($maintenanceHappy | ConvertTo-Json -Compress -Depth 4)"
+            # (1) Щасливий шлях: рівно 8 кроків у затвердженому порядку [1/8]..[8/8];
+            # маркер quiescence до першої зупинки, зупинки — між кроками 2 і 3,
+            # старти — між кроками 6 і 7 (finally), маркер прибрано до кроку 7,
+            # статус-файл записано з кодом 0, далі lock і зовнішній finally;
+            # код завершення 0 (Success).
+            $maintenanceHappy = $maintenanceOrchestrationResults['Happy']
+            $maintenanceHappyEvents = @()
+            $maintenanceHappyStepLabels = @()
+            if ($null -eq $maintenanceHappy.PSObject.Properties['ProbeError']) {
+                $maintenanceHappyEvents = @($maintenanceHappy.Events | ForEach-Object { [string]$_ })
+                $maintenanceHappyStepLabels = @($maintenanceHappyEvents | Where-Object { $_ -match $maintenanceOrchestrationStepPattern } | ForEach-Object {
+                        [void]($_ -match $maintenanceOrchestrationStepPattern)
+                        "[{0}/{1}] {2}" -f $Matches[1], $Matches[2], $Matches[3]
+                    })
+            }
+            $maintenanceExpectedStepLabels = @(
+                '[1/8] Перевірка вільного місця',
+                '[2/8] Створення необхідних директорій',
+                '[3/8] Зупинка служб',
+                '[4/8] Перевірка розмірів .md',
+                '[5/8] Реставрація моделі',
+                '[6/8] Обробка trace і логів',
+                '[7/8] Відновлення стану служб',
+                '[8/8] Контроль діапазонів ID'
+            )
+            $maintenanceOrchestrationHappyStep2 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 2/8 '
+            $maintenanceOrchestrationHappyStep3 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 3/8 '
+            $maintenanceOrchestrationHappyStep6 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 6/8 '
+            $maintenanceOrchestrationHappyStep7 = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^STEP 7/8 '
+            $maintenanceOrchestrationHappyMarkerWrite = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^MARKER-WRITE '
+            $maintenanceOrchestrationHappyMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents '^MARKER-CLEAR$'
+            $maintenanceOrchestrationHappyStops = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents ('^STOP {0}$' -f $maintenanceOrchestrationServiceName) })
+            $maintenanceOrchestrationHappyStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceHappyEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $maintenanceHappy.PSObject.Properties['ProbeError'] -and
+                    $maintenanceHappy.ExitCode -eq 0 -and
+                    ($maintenanceHappyStepLabels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|') -and
+                    @($maintenanceHappyEvents | Where-Object { $_ -match '^STEP .* FAIL$' }).Count -eq 0 -and
+                    $maintenanceOrchestrationHappyMarkerWrite -ge 0 -and $maintenanceOrchestrationHappyMarkerWrite -gt $maintenanceOrchestrationHappyStep2 -and
+                    @($maintenanceOrchestrationHappyStops | Where-Object { $_ -le $maintenanceOrchestrationHappyMarkerWrite -or $_ -ge $maintenanceOrchestrationHappyStep3 }).Count -eq 0 -and
+                    @($maintenanceOrchestrationHappyStarts | Where-Object { $_ -le $maintenanceOrchestrationHappyStep6 -or $_ -ge $maintenanceOrchestrationHappyStep7 }).Count -eq 0 -and
+                    $maintenanceOrchestrationHappyMarkerClear -gt ($maintenanceOrchestrationHappyStarts | Measure-Object -Maximum).Maximum -and
+                    $maintenanceOrchestrationHappyMarkerClear -lt $maintenanceOrchestrationHappyStep7 -and
+                    (@($maintenanceHappyEvents | Where-Object { $_ -like 'STATUS *' }) -join '|') -ceq 'STATUS 0' -and
+                    (& $maintenanceOrchestrationFinallyTail $maintenanceHappyEvents)
+                ) `
+                -Name "Maintenance/OrchestrationRunsStepsInContractOrder" `
+                -Failure "Maintenance на щасливому шляху має виконати рівно [1/8]..[8/8] у затвердженому порядку (зупинка служб між 2 і 3, старт між 6 і 7, маркер до першої зупинки й прибраний до [7/8], статус-файл з кодом 0, потім звільнення lock і зовнішній finally) і завершитися кодом 0; проба: $($maintenanceHappy | ConvertTo-Json -Compress -Depth 4)"
 
-        # (2) Виняток у кроці [4/8]: finally служб усе одно відновлює служби
-        # (крок 'Відновлення стану служб'), маркер прибрано, lock звільнено;
-        # кроки 4–6 і 8 не рендеряться, а виняток доходить до catch
-        # Invoke-BRAVOMaintenanceEntrypoint -> 90 (InternalError). Номер кроку
-        # відновлення тут не фіксується: лічильник кроків послідовний, тому
-        # після пропущених 4–6 він показує не 7.
-        $maintenanceThrow = $maintenanceOrchestrationResults['ThrowInSizeCheck']
-        $maintenanceThrowEvents = @()
-        if ($null -eq $maintenanceThrow.PSObject.Properties['ProbeError']) {
-            $maintenanceThrowEvents = @($maintenanceThrow.Events | ForEach-Object { [string]$_ })
-        }
-        $maintenanceOrchestrationThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^SIZE-CHECK$'
-        $maintenanceOrchestrationThrowRestoreStep = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^STEP \d+/8 Відновлення стану служб (OK|WARN)$'
-        $maintenanceOrchestrationThrowStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
-        $maintenanceOrchestrationThrowMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^MARKER-CLEAR$'
-        $maintenanceOrchestrationThrowLockExit = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^LOCK-EXIT$'
-        Test-BRAVOCondition `
-            -Condition (
-                $null -eq $maintenanceThrow.PSObject.Properties['ProbeError'] -and
-                $maintenanceThrow.ExitCode -eq 90 -and
-                $maintenanceThrow.ExitCodeName -eq 'InternalError' -and
-                @($maintenanceThrow.Errors | Where-Object { ([string]$_).Contains('self-test: імітований збій кроку перевірки розмірів .md') }).Count -gt 0 -and
-                $maintenanceOrchestrationThrowSizeCheck -ge 0 -and
-                $maintenanceOrchestrationThrowRestoreStep -gt $maintenanceOrchestrationThrowSizeCheck -and
-                @($maintenanceOrchestrationThrowStarts | Where-Object { $_ -le $maintenanceOrchestrationThrowSizeCheck -or $_ -ge $maintenanceOrchestrationThrowRestoreStep }).Count -eq 0 -and
-                $maintenanceOrchestrationThrowMarkerClear -gt ($maintenanceOrchestrationThrowStarts | Measure-Object -Maximum).Maximum -and
-                $maintenanceOrchestrationThrowMarkerClear -lt $maintenanceOrchestrationThrowRestoreStep -and
-                $maintenanceOrchestrationThrowLockExit -gt $maintenanceOrchestrationThrowRestoreStep -and
-                @($maintenanceThrowEvents | Where-Object {
-                        $_ -match '^STEP \d+/8 (Перевірка розмірів \.md|Реставрація моделі|Обробка trace і логів|Контроль діапазонів ID) ' -or
-                        $_ -eq 'FINAL-REPORT'
-                    }).Count -eq 0
-            ) `
-            -Name "Maintenance/OrchestrationRestoresServicesWhenStepThrows" `
-            -Failure "виняток у кроці [4/8] має пройти крізь finally служб: служби, зупинені прогоном, запущено, маркер прибрано, lock звільнено, а Invoke-BRAVOMaintenanceEntrypoint повертає 90 (InternalError); проба: $($maintenanceThrow | ConvertTo-Json -Compress -Depth 4)"
+            # (2) Виняток у кроці [4/8]: finally служб усе одно відновлює служби
+            # (крок 'Відновлення стану служб'), маркер прибрано, lock звільнено;
+            # кроки 4–6 і 8 не рендеряться, а виняток доходить до catch
+            # Invoke-BRAVOMaintenanceEntrypoint -> 90 (InternalError). Номер кроку
+            # відновлення тут не фіксується: лічильник кроків послідовний, тому
+            # після пропущених 4–6 він показує не 7.
+            $maintenanceThrow = $maintenanceOrchestrationResults['ThrowInSizeCheck']
+            $maintenanceThrowEvents = @()
+            if ($null -eq $maintenanceThrow.PSObject.Properties['ProbeError']) {
+                $maintenanceThrowEvents = @($maintenanceThrow.Events | ForEach-Object { [string]$_ })
+            }
+            $maintenanceOrchestrationThrowSizeCheck = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^SIZE-CHECK$'
+            $maintenanceOrchestrationThrowRestoreStep = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^STEP \d+/8 Відновлення стану служб (OK|WARN)$'
+            $maintenanceOrchestrationThrowStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'BravoWeb')) { & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
+            $maintenanceOrchestrationThrowMarkerClear = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^MARKER-CLEAR$'
+            $maintenanceOrchestrationThrowLockExit = & $maintenanceOrchestrationEventIndex $maintenanceThrowEvents '^LOCK-EXIT$'
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $maintenanceThrow.PSObject.Properties['ProbeError'] -and
+                    $maintenanceThrow.ExitCode -eq 90 -and
+                    $maintenanceThrow.ExitCodeName -eq 'InternalError' -and
+                    @($maintenanceThrow.Errors | Where-Object { ([string]$_).Contains('self-test: імітований збій кроку перевірки розмірів .md') }).Count -gt 0 -and
+                    $maintenanceOrchestrationThrowSizeCheck -ge 0 -and
+                    $maintenanceOrchestrationThrowRestoreStep -gt $maintenanceOrchestrationThrowSizeCheck -and
+                    @($maintenanceOrchestrationThrowStarts | Where-Object { $_ -le $maintenanceOrchestrationThrowSizeCheck -or $_ -ge $maintenanceOrchestrationThrowRestoreStep }).Count -eq 0 -and
+                    $maintenanceOrchestrationThrowMarkerClear -gt ($maintenanceOrchestrationThrowStarts | Measure-Object -Maximum).Maximum -and
+                    $maintenanceOrchestrationThrowMarkerClear -lt $maintenanceOrchestrationThrowRestoreStep -and
+                    $maintenanceOrchestrationThrowLockExit -gt $maintenanceOrchestrationThrowRestoreStep -and
+                    (& $maintenanceOrchestrationFinallyTail $maintenanceThrowEvents) -and
+                    @($maintenanceThrowEvents | Where-Object {
+                            $_ -match '^STEP \d+/8 (Перевірка розмірів \.md|Реставрація моделі|Обробка trace і логів|Контроль діапазонів ID) ' -or
+                            $_ -eq 'FINAL-REPORT' -or $_ -like 'STATUS *'
+                        }).Count -eq 0
+                ) `
+                -Name "Maintenance/OrchestrationRestoresServicesWhenStepThrows" `
+                -Failure "виняток у кроці [4/8] має пройти крізь finally служб: служби, зупинені прогоном, запущено, маркер прибрано, lock звільнено, зовнішній finally виконано, а Invoke-BRAVOMaintenanceEntrypoint повертає 90 (InternalError); проба: $($maintenanceThrow | ConvertTo-Json -Compress -Depth 4)"
 
-        # (3) Служба, що була зупинена ДО прогону (exchangAPI), не потрапляє
-        # в маркер, не зупиняється й не запускається відновленням; решта
-        # запускається рівно по одному разу.
-        Test-BRAVOCondition `
-            -Condition (
-                $null -eq $maintenanceThrow.PSObject.Properties['ProbeError'] -and
-                (@($maintenanceThrowEvents | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,BravoWeb' -and
-                (@($maintenanceThrowEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb' -and
-                (@($maintenanceThrowEvents | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb' -and
-                (@($maintenanceHappyEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI'
-            ) `
-            -Name "Maintenance/OrchestrationRestoreSkipsServicesStoppedBeforeRun" `
-            -Failure "відновлення служб має запускати лише служби, що працювали до прогону (зупинена exchangAPI не запускається); події: $($maintenanceThrowEvents -join ' || ')"
-    } finally {
-        if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
-            Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+            # (3) Служба, що була зупинена ДО прогону (exchangAPI), не потрапляє
+            # в маркер, не зупиняється й не запускається відновленням; решта
+            # запускається рівно по одному разу.
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $maintenanceThrow.PSObject.Properties['ProbeError'] -and
+                    (@($maintenanceThrowEvents | Where-Object { $_ -like 'MARKER-WRITE *' }) -join '|') -ceq 'MARKER-WRITE BRAVO,BravoWeb' -and
+                    (@($maintenanceThrowEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb' -and
+                    (@($maintenanceThrowEvents | Where-Object { $_ -like 'STOP *' } | Sort-Object) -join '|') -ceq 'STOP BRAVO|STOP BravoWeb' -and
+                    (@($maintenanceHappyEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START BravoWeb|START exchangAPI'
+                ) `
+                -Name "Maintenance/OrchestrationRestoreSkipsServicesStoppedBeforeRun" `
+                -Failure "відновлення служб має запускати лише служби, що працювали до прогону (зупинена exchangAPI не запускається); події: $($maintenanceThrowEvents -join ' || ')"
+
+            # (4) Контрольований збій: служба BravoWeb «не зупиняється» (справжній
+            # Invoke-ServiceStateChange дочекався таймауту, справжня обробка
+            # позначила критичну помилку). Прогін не переривається: усі 8 кроків
+            # у тому самому порядку, [3/8] — FAIL, служби, які прогін таки
+            # зупинив (BRAVO, exchangAPI), запускаються у finally між [6/8] і
+            # [7/8], BravoWeb (лишилась Running) повторно не стартує; статус-файл
+            # і код завершення — 60 (MaintenanceFailed), не 0 і не 90.
+            $maintenanceStopFailure = $maintenanceOrchestrationResults['StopFailure']
+            $maintenanceStopFailureEvents = @()
+            $maintenanceStopFailureStepLabels = @()
+            if ($null -eq $maintenanceStopFailure.PSObject.Properties['ProbeError']) {
+                $maintenanceStopFailureEvents = @($maintenanceStopFailure.Events | ForEach-Object { [string]$_ })
+                $maintenanceStopFailureStepLabels = @($maintenanceStopFailureEvents | Where-Object { $_ -match $maintenanceOrchestrationStepPattern } | ForEach-Object {
+                        [void]($_ -match $maintenanceOrchestrationStepPattern)
+                        "[{0}/{1}] {2}" -f $Matches[1], $Matches[2], $Matches[3]
+                    })
+            }
+            $maintenanceOrchestrationStopFailureStep3 = & $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents '^STEP 3/8 Зупинка служб FAIL$'
+            $maintenanceOrchestrationStopFailureStep6 = & $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents '^STEP 6/8 '
+            $maintenanceOrchestrationStopFailureStep7 = & $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents '^STEP 7/8 Відновлення стану служб OK$'
+            $maintenanceOrchestrationStopFailureStarts = @(foreach ($maintenanceOrchestrationServiceName in @('BRAVO', 'exchangAPI')) { & $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents ('^START {0}$' -f $maintenanceOrchestrationServiceName) })
+            Test-BRAVOCondition `
+                -Condition (
+                    $null -eq $maintenanceStopFailure.PSObject.Properties['ProbeError'] -and
+                    $maintenanceStopFailure.ExitCode -eq 60 -and
+                    $maintenanceStopFailure.ExitCodeName -eq 'MaintenanceFailed' -and
+                    ($maintenanceStopFailureStepLabels -join '|') -ceq ($maintenanceExpectedStepLabels -join '|') -and
+                    (@($maintenanceStopFailureEvents | Where-Object { $_ -match '^STEP .* FAIL$' }) -join '|') -ceq 'STEP 3/8 Зупинка служб FAIL' -and
+                    $maintenanceOrchestrationStopFailureStep3 -gt (& $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents '^STOP-FAIL BravoWeb$') -and
+                    @($maintenanceOrchestrationStopFailureStarts | Where-Object { $_ -le $maintenanceOrchestrationStopFailureStep6 -or $_ -ge $maintenanceOrchestrationStopFailureStep7 }).Count -eq 0 -and
+                    (@($maintenanceStopFailureEvents | Where-Object { $_ -like 'START *' } | Sort-Object) -join '|') -ceq 'START BRAVO|START exchangAPI' -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents '^MARKER-CLEAR$') -gt ($maintenanceOrchestrationStopFailureStarts | Measure-Object -Maximum).Maximum -and
+                    (& $maintenanceOrchestrationEventIndex $maintenanceStopFailureEvents '^MARKER-CLEAR$') -lt $maintenanceOrchestrationStopFailureStep7 -and
+                    (@($maintenanceStopFailureEvents | Where-Object { $_ -like 'STATUS *' }) -join '|') -ceq 'STATUS 60' -and
+                    (& $maintenanceOrchestrationFinallyTail $maintenanceStopFailureEvents)
+                ) `
+                -Name "Maintenance/OrchestrationRestoresServicesAfterControlledStopFailure" `
+                -Failure "контрольований збій зупинки BravoWeb має дати [3/8] FAIL без переривання порядку [1/8]..[8/8], запуск у finally зупинених прогоном BRAVO й exchangAPI, прибраний маркер quiescence, статус-файл і код 60 (MaintenanceFailed), звільнений lock і зовнішній finally; проба: $($maintenanceStopFailure | ConvertTo-Json -Compress -Depth 4)"
+        } finally {
+            if (Test-Path -LiteralPath $maintenanceOrchestrationRoot -PathType Container) {
+                Remove-Item -LiteralPath $maintenanceOrchestrationRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
     }
 

@@ -127,6 +127,29 @@
   (вимкнений моніторинг `0`, небезпечний webhook `30`, недоступний `LOGS` через
   права `36`) завершуються до перевірок (`Health/OrchestrationEarlyExitsSkipChecks`).
   Продакшн-код не змінено.
+- **Maintenance: поведінкові тести оркестрації `Invoke-BRAVOMaintenance` (T011, аудит F010).**
+  Порядок кроків, відновлення служб і код завершення Maintenance досі
+  перевірялись лише текстово. Чотири нові перевірки `BRAVO_SELF_TEST.ps1` справді
+  виконують оркестрацію в дочірньому процесі: runtime збирається з дослівного тексту
+  `modules/BRAVO.Maintenance/BRAVO.Maintenance.Runtime.ps1` (AST) — справжні
+  функції тіла (зокрема `Invoke-ServiceStateChange`, `Write-BRAVOMaintenanceStep`,
+  `Get-BRAVOMaintenanceResolvedExitCode`), дослівна оркестрація від
+  `Initialize-BRAVOMaintenanceSteps -Total 8` до фінального `exit`, `try`/`finally`
+  служб, звільнення lock і зовнішній `finally` — і запускається через справжній
+  `Invoke-BRAVOMaintenanceEntrypoint`. Служби, lock, маркер quiescence, файлові
+  операції, статус-файл і мережу замінюють стаби, що пишуть події в журнал;
+  реальні служби не чіпаються. Перевірки фіксують: порядок `[1/8]`…`[8/8]`, маркер
+  до першої зупинки, зупинку між `[2/8]` і `[3/8]`, запуск між `[6/8]` і `[7/8]`,
+  статус-файл і код `0`, звільнення lock і зовнішній `finally` з `-NoPause`
+  (`Maintenance/OrchestrationRunsStepsInContractOrder`); необроблений виняток у
+  `[4/8]` проходить крізь `finally` служб — служби запущено, маркер прибрано, lock
+  звільнено, код `90` (`Maintenance/OrchestrationRestoresServicesWhenStepThrows`);
+  служба, зупинена ще до прогону, не зупиняється й не запускається
+  (`Maintenance/OrchestrationRestoreSkipsServicesStoppedBeforeRun`); контрольований
+  збій зупинки служби дає `[3/8]` `FAIL` без переривання порядку, служби, зупинені
+  прогоном, запускаються, статус-файл і код — `60`
+  (`Maintenance/OrchestrationRestoresServicesAfterControlledStopFailure`).
+  Продакшн-код не змінено.
 
 - **Telegram-підсумок CI: post-merge посилення доставки (два P2 з PR #270).**
   `sendMessage` не ідемпотентний, тому виклик `curl` для Telegram більше не
